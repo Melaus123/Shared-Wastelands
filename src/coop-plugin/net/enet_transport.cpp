@@ -492,8 +492,8 @@ public:
         }
         SbEdgeLog();
     }
-    /* T-1118 (b): THE LIVE-FIRST MODE'S CLOCK AND BUDGET. The drain rate is what ENet let go (acknowledged) per second while record
-       pieces waited; ENet holds a reliable packet until it is acknowledged, so the budget covers a round trip plus 100 ms of it. */
+    /* T-1118 (b): THE LIVE-FIRST MODE'S CLOCK AND BUDGET. The drain rate is what ENet let go (acknowledged) per second while any frame
+       waited in the send line (task 6; it was: record pieces); ENet holds a reliable packet until it is acknowledged, so the budget covers a round trip plus 100 ms of it. */
     static double LfNow()
     {
         LARGE_INTEGER c, f; ::QueryPerformanceCounter(&c); ::QueryPerformanceFrequency(&f);
@@ -504,7 +504,7 @@ public:
         if (!box_.LiveFirst()) return;
         const double now = LfNow();
         box_.SetNow(now);
-        lfRate_.Note(now, netq_.freedBytes, box_.RestWaiting());
+        lfRate_.Note(now, netq_.freedBytes, livefirst::GameDrainBusy(box_.RestWaiting(), box_.Count()));   /* task 6: measured while ANY frame waits */
         box_.SetBudget(lfRate_.Budget(peer_ != 0 ? (double)peer_->roundTripTime / 1000.0 : 0.0));
     }
     /* What a live message handed over now waits behind in ENet: the bytes ENet has not put on the wire for this link (both of its

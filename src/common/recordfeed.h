@@ -45,7 +45,7 @@
 
 namespace coopfeed {
 
-const unsigned int kFeedProtocol = 133;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+const unsigned int kFeedProtocol = 134;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
 
 
 

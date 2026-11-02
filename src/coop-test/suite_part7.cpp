@@ -8346,4 +8346,80 @@ void t_t943_npc_list()
 }
 
 
+/* Contributor task 5 (0.4.0 brief): a paid conversation never takes the money and gives nothing (talkrefund.h, talkwire.h END unrun).
+   The refund amount; the book (once, forgotten, other conversations / players untouched, cap, expiry); the END's unrun list on the
+   wire, old and new; and every end path the design note names, walked on the pure parts. */
+namespace
+{
+struct T5Same { bool operator()(unsigned int a, unsigned int b) const { return a == b; } };
+}
+void t_task5_paid_refund()
+{
+    using namespace cooptalk;
+    std::vector<int> ty, va;
+    ty.push_back(8); va.push_back(500);   /* TAKE_MONEY 500 (a bribe) */
+    /* the amount */
+    if (TalkRefundAmount(1, 2000, 1500, ty, va) != 500) Fail("task 5: a 500 bribe taken is 500 owed back");
+    if (TalkRefundAmount(1, 2000, 1800, ty, va) != 200) Fail("task 5: never more than the purse dropped");
+    if (TalkRefundAmount(1, 9000, 1000, ty, va) != 500) Fail("task 5: never more than the line's TAKE_MONEY");
+    if (TalkRefundAmount(0, 2000, 1500, ty, va) != 0) Fail("task 5: a refused ACT took nothing");
+    if (TalkRefundAmount(1, -1, 1500, ty, va) != 0 || TalkRefundAmount(1, 2000, -1, ty, va) != 0) Fail("task 5: an unread purse books nothing");
+    if (TalkRefundAmount(1, 2000, 2000, ty, va) != 0 || TalkRefundAmount(1, 2000, 2500, ty, va) != 0) Fail("task 5: no drop, nothing owed");
+    { std::vector<int> t2, v2; t2.push_back(9); v2.push_back(500);
+      if (TalkRefundAmount(1, 2000, 1500, t2, v2) != 0) Fail("task 5: a line without TAKE_MONEY books nothing"); }
+    { std::vector<int> t2(ty), v2(va); t2.push_back(8); v2.push_back(300);
+      if (TalkRefundAmount(1, 2000, 1200, t2, v2) != 800) Fail("task 5: two TAKE_MONEY in one line add up"); }
+
+    /* the book */
+    TalkRefundBook b;
+    const T5Same same;
+    std::vector<unsigned int> unrun;
+    std::vector<TalkPaid> due;
+    if (b.Note(7, 11, 1, 500, 1000, same) != 1 || b.Note(7, 11, 1, 500, 1000, same) != 0) Fail("task 5: an ACT is booked once (a repeated ACT never twice)");
+    if (b.Note(7, 11, 2, 0, 1000, same) != 0) Fail("task 5: nothing taken, nothing booked");
+    b.Note(7, 11, 3, 200, 1000, same); b.Note(7, 12, 1, 50, 1000, same); b.Note(8, 11, 1, 70, 1000, same);
+    /* timeout / lost ACT_RESULT: A's END lists seq 1 (held, unrun); seq 3's NPC part ran (its answer came) */
+    unrun.push_back(1);
+    b.OnEnd(7, 11, unrun, &due, same);
+    if (due.size() != 1 || due[0].seq != 1 || due[0].amount != 500) Fail("task 5: the END's unrun seq is refunded, the ran one is not");
+    /* a repeated END, a repeated ACT_RESULT, a reconnect: nothing left for that conversation */
+    due.clear(); b.OnEnd(7, 11, unrun, &due, same);
+    if (!due.empty()) Fail("task 5: a refund is never paid twice (repeated END)");
+    /* other conversations and other players untouched */
+    if (b.rows.size() != 2) Fail("task 5: the other conversation / player's rows stay");
+    due.clear(); unrun.clear(); unrun.push_back(1); b.OnEnd(8, 12, unrun, &due, same);
+    if (!due.empty() || b.rows.size() != 2) Fail("task 5: an END from another player for another's conversation refunds nothing");
+    /* normal case: the answer came in time - the END lists nothing - nothing refunded, the rows forgotten */
+    due.clear(); unrun.clear(); b.OnEnd(7, 12, unrun, &due, same);
+    if (!due.empty() || b.rows.size() != 1) Fail("task 5: a normal end refunds nothing and forgets the conversation");
+    /* a lost link: no END ever comes - forgotten after kMaxAgeMs, nothing refunded */
+    b.Expire(1000 + TalkRefundBook::kMaxAgeMs - 1);
+    if (b.rows.size() != 1) Fail("task 5: not expired early");
+    b.Expire(1000 + TalkRefundBook::kMaxAgeMs);
+    if (!b.rows.empty() || b.expired != 1) Fail("task 5: a row no END named is forgotten");
+    /* bounded */
+    for (unsigned int s = 1; s <= TalkRefundBook::kMax + 5; ++s) b.Note(1, 1, s, 1, 0, same);
+    if (b.rows.size() != TalkRefundBook::kMax || b.evicted != 5 || b.rows[0].seq != 6) Fail("task 5: the book is bounded, the oldest goes");
+
+    /* the wire: END carries the unrun list; an END without it (protocol 187's shape) names none */
+    TalkMsg e; e.kind = kTalkEnd; e.convId = 11; e.npcUid = 3; e.targetUid = 4; e.reason = kTalkEndTimeout;
+    e.unrun.push_back(1); e.unrun.push_back(0xFFFFFFFFu);
+    std::vector<char> w;
+    if (!EncodeTalk(&w, e)) Fail("task 5: END with unrun encodes");
+    TalkMsg d;
+    if (DecodeTalk(&w[0], w.size(), &d) != kTalkDecodeOk || d.unrun.size() != 2 || d.unrun[0] != 1 || d.unrun[1] != 0xFFFFFFFFu || d.reason != kTalkEndTimeout)
+        Fail("task 5: END's unrun round-trips");
+    { TalkMsg o(e); o.unrun.clear(); std::vector<char> w2; EncodeTalk(&w2, o);   /* nothing unrun: the 20-byte END it always was */
+      TalkMsg d2; d2.unrun.push_back(9);
+      if (w2.size() != 20 || DecodeTalk(&w2[0], w2.size(), &d2) != kTalkDecodeOk || !d2.unrun.empty()) Fail("task 5: an END without the list names no unrun seq"); }
+    { TalkMsg o(e); o.unrun.assign(kTalkMaxUnrun + 1, 5); std::vector<char> w2;
+      if (EncodeTalk(&w2, o)) Fail("task 5: more than kTalkMaxUnrun seqs are not encoded"); }
+    { std::vector<char> w2(w); w2[w2.size() - 9] = (char)(kTalkMaxUnrun + 1);   /* the count byte (2 seqs = 8 bytes after it) */
+      TalkMsg d2;
+      if (DecodeTalk(&w2[0], w2.size(), &d2) != kTalkDecodeTooMany) Fail("task 5: a count over the cap is refused"); }
+    { std::vector<char> w2(w); w2.pop_back();
+      TalkMsg d2;
+      if (DecodeTalk(&w2[0], w2.size(), &d2) == kTalkDecodeOk) Fail("task 5: a cut unrun list is refused"); }
+}
+
 }   /* namespace suite */

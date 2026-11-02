@@ -7,7 +7,7 @@
  *   u8 kind | u32 convId | u32 npcUid | u32 targetUid | the kind's fields:
  *     1 PROMPT  u8 event | s16 lineSid | s16 npcText | u8 n (<= 10) | n x (s16 replyId | s16 replyText) | u32 deadlineMs
  *     2 ANSWER  u8 result | i32 index | s16 replyId | i32 purse (the talker's purse on its own game, -1 unknown)
- *     3 END     u8 reason
+ *     3 END     u8 reason   (... P25 fields; protocol 188, contributor task 5: u8 count | count x u32 unrun ACT seq - talkrefund.h)
  *     4 ACT, 5 ACT_RESULT - P26 stage 5 (protocol 103), below the END reasons
  *     6 REQUEST - P25 (protocol 109), below; P25 also appends u32 reqId to PROMPT and u32 reqId | u8 why | u8 endsType to END
  *     7 CURSOR_ASK, 8 CURSOR_ANSWER - T-737, the talk cursor (talkcursor.h), below REQUEST
@@ -27,6 +27,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "talkrefund.h"   /* contributor task 5: kTalkMaxUnrun, the END's unrun list */
 
 namespace cooptalk {
 
@@ -355,6 +356,8 @@ struct TalkMsg
     int endsType;                               /* P25: END - 1 TRADE / 11 CHARACTER_EDITOR: the talker's game opens that window */
     unsigned int carriedUid;                    /* ACT: the person the addressed character carries on the sender's game, 0 none */
     int purse;                                  /* REQUEST / ANSWER: the talker's purse on its own game, -1 unknown - the NPC's game answers its money condition with it */
+    std::vector<unsigned int> unrun;            /* END (game protocol 188, contributor task 5 - talkrefund.h): the ACT seqs whose NPC-side part
+                                                   this end leaves unrun; the talker's game refunds what it took for them. <= kTalkMaxUnrun */
     TalkMsg() : kind(0), convId(0), npcUid(0), targetUid(0), event(0), deadlineMs(0), result(0), index(-1), reason(0),
                 seq(0), detail(0), moneyBefore(-1), moneyAfter(-1), applied(0), unsupported(0), anyApplied(0),
                 reqId(0), why(0), endsType(0), carriedUid(0), purse(-1) {}
@@ -531,6 +534,12 @@ inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
         TalkPut32(&b, m.reqId);   /* P25: END - reqId | why | endsType */
         TalkPut8(&b, (unsigned int)m.why);
         TalkPut8(&b, (unsigned int)m.endsType);
+        if (m.unrun.size() > (size_t)kTalkMaxUnrun) return false;   /* task 5: u8 count | count x u32 seq - only when there is one, so */
+        if (!m.unrun.empty())                                        /* an END with nothing unrun is the 20-byte END it always was */
+        {
+            TalkPut8(&b, (unsigned int)m.unrun.size());
+            for (size_t i = 0; i < m.unrun.size(); ++i) TalkPut32(&b, m.unrun[i]);
+        }
     }
     out->insert(out->end(), b.begin(), b.end());
     return true;
@@ -677,6 +686,18 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
         unsigned int w = 0, et = 0;   /* P25: END - reqId | why | endsType */
         if (!TalkGet8(&r, &v) || !TalkGet32(&r, &t.reqId) || !TalkGet8(&r, &w) || !TalkGet8(&r, &et)) return r.err;
         t.reason = (int)v; t.why = (int)w; t.endsType = (int)et;
+        if (r.at < r.n)   /* task 5 (protocol 188): the unrun ACT seqs; an END without them names none */
+        {
+            unsigned int cnt = 0;
+            if (!TalkGet8(&r, &cnt)) return r.err;
+            if (cnt > kTalkMaxUnrun) return kTalkDecodeTooMany;
+            for (unsigned int i = 0; i < cnt; ++i)
+            {
+                unsigned int s = 0;
+                if (!TalkGet32(&r, &s)) return r.err;
+                t.unrun.push_back(s);
+            }
+        }
     }
     *m = t;
     return kTalkDecodeOk;

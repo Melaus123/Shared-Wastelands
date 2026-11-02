@@ -178,6 +178,7 @@ struct UiNames
     std::string ourBtn, panel, modeHost, modeJoin, hostGroup, joinGroup;
     std::string portLabel, portEdit, nbMineTick, nbMineLabel, nbFarTick, nbFarLabel, nbAddrEdit;
     std::string joinLabel, joinEdit, pasteBtn;
+    std::string joinPortLabel, joinPortEdit;   /* JOIN BY ADDRESS's PORT row (contributor task 1) */
     std::string friendList, friendEmpty, friendRefreshBtn, joinByAddrLabel;   /* JOIN GAME's friends list, its line, REFRESH, JOIN BY ADDRESS */
     std::string steamLabel, steamLine, inviteOpenBtn;   /* HOSTING's STEAM row: its label, its line, INVITE FRIENDS */
     std::string inviteGroup, inviteList, inviteEmpty, inviteSendBtn;     /* INVITE FRIENDS: its group, list, the line in its place, INVITE */
@@ -213,6 +214,7 @@ struct UiNames
           nbFarTick("CoopNotebookFarTick"), nbFarLabel("CoopNotebookFarLabel"),
           nbAddrEdit("CoopNotebookAddrEdit"),
           joinLabel("CoopJoinAddrLabel"), joinEdit("CoopJoinAddrEdit"), pasteBtn("CoopPasteBtn"),
+          joinPortLabel("CoopJoinPortLabel"), joinPortEdit("CoopJoinPortEdit"),
           worldLabel("CoopWorldLabel"), worldEdit("CoopWorldEdit"),
           slotLabel("CoopSlotLabel"), slotEdit("CoopSlotEdit"),
           status("CoopStatusText"),
@@ -636,6 +638,24 @@ static std::string g_panelNameHintShown;       /* mp1: the line under Your name 
 static long        g_panelTryShown      = -1;  /* mp1: whether Try again was last shown (-1 = not yet) */
 static int         g_panelJoinGaveUp    = 0;   /* mp1: coopui::PanelJoinGaveUp at the last status build */
 static std::string g_fPort, g_fNotebookAddr, g_fJoinAddr, g_fWorld, g_fSlot;
+static std::string g_fJoinPort;   /* JOIN BY ADDRESS's PORT box (contributor task 1); coopui::kPanelDefaultGamePort until changed */
+/* ADDRESS text that carries its own port ("host:7778", "[::1]:7778") hands the number to PORT - coopcfg::CfgJoinTakePort.  True when
+   it moved something.  Never a steam:<id> or a bare IPv6 literal. */
+static bool PanelJoinMovePort()
+{
+    std::string host, port;
+    if (!coopcfg::CfgJoinTakePort(g_fJoinAddr, &host, &port)) return false;
+    g_fJoinAddr = host;
+    g_fJoinPort = port;
+    return true;
+}
+static std::string PanelDefaultJoinPort()
+{
+    char b[8];
+    _snprintf(b, 7, "%d", coopui::kPanelDefaultGamePort);
+    b[7] = 0;
+    return std::string(b);
+}
 /* The address the current JOIN dials, and the line a press shows: Starting "<world>"... for HOST, Connecting to <address>... for a typed
    address, Connecting... for a friend's game (no name, no id). */
 static std::string PanelJoinDialAddr() { return g_friendJoinId != 0 ? relaybridge::SteamAddressText(g_friendJoinId) : g_fJoinAddr; }
@@ -1240,6 +1260,7 @@ static void PanelDefaults()
     g_fPort         = "7777";   /* ui5d: coopui::kPanelDefaultGamePort - change together */
     g_fNotebookAddr = "127.0.0.1:27016";
     g_fJoinAddr     = "";
+    g_fJoinPort     = PanelDefaultJoinPort();   /* contributor task 1: PORT starts at the default game port */
     g_fWorld        = ConfigFileWorld(); if (g_fWorld.empty()) g_fWorld = coopworld::kDefaultWorld;   /* owner decision 249 a: "New World" */   /* W3-f (review-w3 item 4, M5): the FILE's world, not ConfigWorldKey() - a world adopted from a WELCOME is never written into shared_wastelands.cfg by a panel save */
     g_fSlot.clear();   /* T-201 PP5 fold (L2): the panel has no save-name box - HOST and JOIN write no slot= and every multiplayer save goes to
                           the profile's own folder (store.cpp), so a profile folder's long name is never copied here to fail the 16-character check */
@@ -1272,6 +1293,7 @@ static void PanelDefaults()
             g_fPort = b;
         }
     }
+    PanelJoinMovePort();   /* a remembered "address:port" shows as ADDRESS and PORT */
     PanelIntro();
 }
 
@@ -2367,6 +2389,10 @@ static void PanelLayout(MyGUI::Gui* gui)
         PanelPlace(gui, n.joinLabel, jr.labelX, jr.top, jr.labelW, jr.h);
         PanelPlace(gui, n.joinEdit,  jr.boxX,   jr.top, jr.boxW,   jr.h);
         PanelPlace(gui, n.pasteBtn,  W - sideW, jr.top, sideW,     jr.h);
+        const coopui::PanelPairRect jp = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(lay, coopui::kSlotPortRow, rowH),
+                                                                 coopui::PanelPortBoxW(W), 0);
+        PanelPlace(gui, n.joinPortLabel, jp.labelX, jp.top, jp.labelW, jp.h);
+        PanelPlace(gui, n.joinPortEdit,  jp.boxX,   jp.top, jp.boxW,   jp.h);
     }
     g_layShown = lay;
     g_layAddrShown = addr;
@@ -2392,6 +2418,16 @@ static int PanelHostingGamePort()
 }
 
 static bool PanelHostingNow();   /* defined with the press code below */
+/* PORT is greyed while ADDRESS holds a steam:<id> or a friend is picked: the Steam route dials no port (contributor task 1). */
+static void PanelJoinPortLit(MyGUI::Gui* gui)
+{
+    const UiNames& n = NM();
+    const bool lit = g_friendJoinId == 0 && !coopcfg::CfgJoinIsSteam(g_fJoinAddr);
+    MyGUI::Widget* w = UiFind(gui, n.joinPortEdit);
+    if (w) w->setEnabled(lit);
+    UiGreyText(w, lit);
+    UiGreyText(UiFind(gui, n.joinPortLabel), lit);
+}
 static void PanelPush(MyGUI::Gui* gui)
 {
     const UiNames& n = NM();
@@ -2406,7 +2442,10 @@ static void PanelPush(MyGUI::Gui* gui)
         MyGUI::Button* pb = UiBtn(gui, n.hostProfChangeBtn);
         if (pb) pb->setEnabled(picked != 0 && g_pressBusy == 0 && g_loadStage == 0);
     }
+    PanelJoinMovePort();
     e = UiEdit(gui, n.joinEdit);   if (e) e->setCaption(MyGUI::UString(g_fJoinAddr.c_str()));
+    e = UiEdit(gui, n.joinPortEdit); if (e) e->setCaption(MyGUI::UString(g_fJoinPort.c_str()));
+    PanelJoinPortLit(gui);
     e = UiEdit(gui, n.nameEdit);   if (e) e->setCaption(MyGUI::UString(g_fName.c_str()));
     /* mp3: the world and save boxes are gone from the screen (the world is picked from the list, the save folder is
        named automatically), and so are the helper's two ticks and address box (always this computer's own). */
@@ -2566,10 +2605,22 @@ static void PanelMirror(MyGUI::Gui* gui, int force)
     const UiNames& n = NM();
     MyGUI::EditBox* e;
     e = UiEdit(gui, n.portEdit);   if (e) g_fPort         = UiTextOf(e, coopcfg::kCfgPortFieldMax);
-    {   /* typing in IP ADDRESS drops a picked friend: JOIN then dials the typed address */
+    {   /* typing in ADDRESS drops a picked friend: JOIN then dials the typed address */
         const std::string before = g_fJoinAddr;
         e = UiEdit(gui, n.joinEdit);   if (e) g_fJoinAddr     = UiTextOf(e, coopcfg::kCfgAddrFieldMax);
+        MyGUI::EditBox* pe = UiEdit(gui, n.joinPortEdit);
+        if (pe) g_fJoinPort = UiTextOf(pe, coopcfg::kCfgPortFieldMax);
+        /* contributor task 1: "host:port" typed into ADDRESS hands its number to PORT - once the player has left ADDRESS, so a port
+           half-typed is never split off under the cursor (the JOIN press reads a port still in ADDRESS the same way) */
+        MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+        const bool typing = e != 0 && im != 0 && im->getKeyFocusWidget() == e;
+        if (!typing && PanelJoinMovePort())
+        {
+            if (e) e->setCaption(MyGUI::UString(g_fJoinAddr.c_str()));
+            if (pe) pe->setCaption(MyGUI::UString(g_fJoinPort.c_str()));
+        }
         if (g_fJoinAddr != before) PanelDropFriendPick(gui);
+        PanelJoinPortLit(gui);
     }
     e = UiEdit(gui, n.dlgNameEdit); if (e) g_fNewWorld    = UiTextOf(e, coopcfg::kCfgWorldFieldMax);   /* mp3: the New world box */
     e = UiEdit(gui, n.hostPwEdit);  if (e) g_fHostPw      = UiPlainTextOf(e, coopui::kPanelPwFieldMax);   /* T-290: in password mode getCaption is the typed text, not the stars */
@@ -2611,6 +2662,12 @@ static void PanelPaste(MyGUI::Gui* gui)
         return;
     }
     g_fJoinAddr = coopcfg::CfgSanitiseTyped(got, coopcfg::kCfgAddrFieldMax);
+    PanelJoinMovePort();   /* contributor task 1: a pasted "host:port" fills ADDRESS and PORT */
+    {
+        const UiNames& n = NM();
+        MyGUI::EditBox* pe = UiEdit(gui, n.joinPortEdit);
+        if (pe) pe->setCaption(MyGUI::UString(g_fJoinPort.c_str()));
+    }
     PanelDropFriendPick(gui);   /* a pasted address drops a picked friend, as typing does */
     ::InterlockedIncrement64(&g_panelPasted);
     PanelSetStatus(std::string());   /* the address shows in its box; an older paste line goes */
@@ -4094,7 +4151,7 @@ static void PanelGo()
     }
     else
     {
-        if (!coopcfg::CfgAddrFieldOk(PanelJoinDialAddr(), "address", &f.hostAddr, &f.hostPort, &why))   /* a picked friend: steam:<id> */
+        if (!coopcfg::CfgJoinAddrOk(PanelJoinDialAddr(), g_fJoinPort, &f.hostAddr, &f.hostPort, &why))   /* a picked friend: steam:<id>, no port */
         {
             ::InterlockedIncrement64(&g_panelInvalid);
             PanelSetStatus(why);
@@ -5379,6 +5436,10 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         Mk(jg, n.typeText,   n.skinCaption, jr.labelX, jr.top, jr.labelW, jr.h, n.joinLabel);
         Mk(jg, n.typeEdit,   n.skinEdit,    jr.boxX,   jr.top, jr.boxW,   jr.h, n.joinEdit);
         Mk(jg, n.typeButton, n.skinBtn1,    W - sideW, jr.top, sideW,     jr.h, n.pasteBtn);
+        const coopui::PanelPairRect jp = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(coopui::kLayJoin, coopui::kSlotPortRow, rowH),
+                                                                 coopui::PanelPortBoxW(W), 0);
+        Mk(jg, n.typeText,   n.skinCaption, jp.labelX, jp.top, jp.labelW, jp.h, n.joinPortLabel);
+        Mk(jg, n.typeEdit,   n.skinEdit,    jp.boxX,   jp.top, jp.boxW,   jp.h, n.joinPortEdit);
     }
 
     /* T-201 N1b (owner 166): PLAYER NAME - ONE box, its label and its hint - the top row of HOST GAME and JOIN GAME.  Made on the
@@ -5432,6 +5493,7 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     MyGUI::EditBox* e;
     e = UiEdit(gui, n.portEdit);   if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgPortFieldMax); }
     e = UiEdit(gui, n.joinEdit);   if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgAddrFieldMax); }
+    e = UiEdit(gui, n.joinPortEdit); if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgPortFieldMax); }
     e = UiEdit(gui, n.dlgNameEdit); if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgWorldFieldMax); }   /* mp3: 48, the World box's limit */
     /* T-290: the PASSWORD boxes show stars - the engine's own password mode (EditBox::setEditPassword, imported from MyGUIEngine_x64
        like the calls above). */
@@ -5472,7 +5534,8 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     w = UiFind(gui, n.homeAddrLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("LOCAL ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }   /* ui5 */
     w = UiFind(gui, n.netAddrLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("INTERNET ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }   /* T-510 */
     w = UiFind(gui, n.dlgNameLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("WORLD NAME")); else ::InterlockedIncrement64(&g_panelCastNull); }
-    w = UiFind(gui, n.joinLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("IP ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }
+    w = UiFind(gui, n.joinLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }
+    w = UiFind(gui, n.joinPortLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("PORT")); else ::InterlockedIncrement64(&g_panelCastNull); }
     w = UiFind(gui, n.nameLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("PLAYER NAME")); else ::InterlockedIncrement64(&g_panelCastNull); }
     w = UiFind(gui, n.resetKeepLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString(coopui::kResetKeepLabel)); else ::InterlockedIncrement64(&g_panelCastNull); }
     w = UiFind(gui, n.keepLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString(keeprun::kKeepLabel)); else ::InterlockedIncrement64(&g_panelCastNull); }
@@ -5480,7 +5543,7 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
        in it here - Kenshi_TextboxPaintedText / StandardText carry no vertical align of their own.  TextBox::setTextAlign is
        the call ui3's title row already made (no new import). */
     {
-        const std::string* const labs[] = { &n.nameLabel, &n.portLabel, &n.joinLabel, &n.dlgNameLabel, &n.homeAddrLabel, &n.homeAddr,
+        const std::string* const labs[] = { &n.nameLabel, &n.portLabel, &n.joinLabel, &n.joinPortLabel, &n.dlgNameLabel, &n.homeAddrLabel, &n.homeAddr,
                                             &n.hostProfLabel, &n.hostProfValue, &n.netAddrLabel, &n.netAddr,
                                             &n.vpnAddrLabel, &n.vpnAddr, &n.hostPwLabel,   /* T-201 PP6'; T-510; T-631; T-290 */
                                             &n.joinByAddrLabel, &n.steamLabel,   /* JOIN GAME's JOIN BY ADDRESS; HOSTING's STEAM */

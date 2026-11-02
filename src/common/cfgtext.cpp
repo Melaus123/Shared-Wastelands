@@ -5,6 +5,7 @@
 #include "worlddir.h"    /* W1w: coopworld::DisplayNameOk - the playername key's one rule */
 #include "areaclaim.h"   /* B13: coopstore::PlayerIdOk - the notebook refuses a malformed id too, so the shape rule lives in ONE place */
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace coopcfg {
@@ -160,6 +161,55 @@ bool CfgAddrFieldOk(const std::string& text, const char* what,
     if (addr != 0) *addr = a;
     if (port != 0) *port = p;
     return true;
+}
+
+const char* const kCfgJoinPortWhy = "Port must be a number from 1 to 65535.";
+
+bool CfgJoinIsSteam(const std::string& addrText)
+{
+    return relaybridge::SplitSteamValue(CfgTrim(addrText), 0, 0);
+}
+
+bool CfgJoinTakePort(const std::string& addrText, std::string* host, std::string* port)
+{
+    const std::string t = CfgTrim(addrText);
+    if (CfgJoinIsSteam(t)) return false;
+    const std::string::size_type c = t.find_last_of(':');
+    if (c == std::string::npos || c == 0 || c + 1 >= t.size()) return false;
+    const std::string tail = t.substr(c + 1), head = t.substr(0, c);
+    for (std::string::size_type i = 0; i < tail.size(); ++i)
+        if (tail[i] < '0' || tail[i] > '9') return false;
+    if (head[0] == '[') { if (head[head.size() - 1] != ']') return false; }   /* [v6]:port */
+    else if (head.find(':') != std::string::npos) return false;              /* a bare IPv6 literal: its last colon is not a port */
+    if (host != 0) *host = head;
+    if (port != 0) *port = tail;
+    return true;
+}
+
+bool CfgJoinPortOk(const std::string& portText, unsigned short* port, std::string* why)
+{
+    if (CfgPortTextOk(CfgTrim(portText), port)) return true;
+    if (why != 0) *why = kCfgJoinPortWhy;
+    return false;
+}
+
+bool CfgJoinAddrOk(const std::string& addrText, const std::string& portText,
+                   std::string* addr, unsigned short* port, std::string* why)
+{
+    const std::string t = CfgTrim(addrText);
+    if (t.empty() || CfgJoinIsSteam(t)) return CfgAddrFieldOk(t, "address", addr, port, why);   /* steam: dials no port; empty says so */
+    std::string host = t, portPart = portText;
+    CfgJoinTakePort(t, &host, &portPart);   /* ADDRESS still carrying its own port: that port wins, as the window would have moved it */
+    const std::string::size_type colons = std::count(host.begin(), host.end(), ':');
+    if (host[0] != '[' && colons == 1)
+    {   /* one colon and a tail that is not a port: the address itself is wrong, in the existing sentence */
+        if (why != 0) *why = "\"" + t + "\" isn't a valid address.";
+        return false;
+    }
+    unsigned short p = 0;
+    if (!CfgJoinPortOk(portPart, &p, why)) return false;
+    if (host[0] != '[' && colons > 1) host = "[" + host + "]";   /* a bare IPv6 literal, bracketed as the address form wants */
+    return CfgAddrFieldOk(host + ":" + NumText(p), "address", addr, port, why);
 }
 
 bool CfgNameFieldOk(const std::string& text, const char* what, size_t maxLen, std::string* why)

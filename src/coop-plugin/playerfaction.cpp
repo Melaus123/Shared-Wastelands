@@ -682,6 +682,7 @@ struct WorldFacAnswer { int pending, verdict; unsigned num; std::string asked, n
 WorldFacAnswer g_worldFac;
 std::string g_worldFacReported;   /* the FACTION answer (verdict, asked, name) last reported back with a load report - reported once only */
 long long g_worldFacApplied = 0, g_worldFacDropped = 0, g_worldFacRecordTaken = 0, g_worldFacStandInMoved = 0, g_facBoxShown = 0, g_facBoxFailed = 0;
+long long g_facLineShown = 0, g_facLineFailed = 0;   /* contributor task 2: the faction-name message line (case B) */
 
 /* T-368 - THE FACTION TAB (FactionsScreen's name box, 1.0.65 0x491940, F995): on Enter (eventEditSelectAccept) or when the box loses
    focus (0x491D40) it asks FactionDirectory::findFactionByName for the typed name and, when a faction is found, shows Kenshi's own
@@ -818,7 +819,13 @@ void ApplyWorldFactionName(::Faction* mine)
     RelationsSendSnapshot();          /* the other games learn the name now */
     coop::TagsCaptionsDirty();
     if (how == coopprof::kFacApplyBackBox) ShowFactionBox(coopui::FactionBackText(a.asked, a.name));
-    else if (how == coopprof::kFacApplyMovedBox) ShowFactionBox(coopui::FactionMovedText(a.asked, a.name));
+    else if (how == coopprof::kFacApplyMovedLine)
+    {   /* contributor task 2, case B: Kenshi's message line, not a box (cases A and D apply silently) */
+        const std::string line = coopui::FactionMovedLineText(a.asked, a.name);
+        const int r = coop::StoreShowPlayerLine(line);
+        if (r == 1) { ++g_facLineShown; DebugLog("[PF] message line shown: '" + line + "'"); }
+        else { ++g_facLineFailed; ErrorLog("[PF] the faction-name message line was NOT shown (" + std::string(r == 0 ? "no message system" : "the engine's message call FAULTED") + "): '" + line + "'"); }
+    }
 }
 
 // review-p3r H1: Faction::setName 0x385670 has NO call sites in the engine's .text (inlined everywhere; T176 saw only the plugin's
@@ -940,7 +947,7 @@ void ReportPlayerFaction()
     ::Faction* mine = LocalPlayerFactionImpl();
     DebugLog("[PF] REPORT names: mine='" + (mine != 0 ? mine->getName() : std::string("-")) + "' tab[calls,refused]=" + S(g_tabCalls) + "," + S(g_tabRefused)
              + " world[applied,dropped,recordTaken]=" + S(g_worldFacApplied) + "," + S(g_worldFacDropped) + "," + S(g_worldFacRecordTaken)
-             + " boxes[shown,failed]=" + S(g_facBoxShown) + "," + S(g_facBoxFailed) + " owed[load,rename]=" + S(g_facLoadPending ? 1 : 0) + "," + S(g_facRenamePending ? 1 : 0) + " standInMoved=" + S(g_worldFacStandInMoved)
+             + " boxes[shown,failed]=" + S(g_facBoxShown) + "," + S(g_facBoxFailed) + " lines[shown,failed]=" + S(g_facLineShown) + "," + S(g_facLineFailed) + " owed[load,rename]=" + S(g_facLoadPending ? 1 : 0) + "," + S(g_facRenamePending ? 1 : 0) + " standInMoved=" + S(g_worldFacStandInMoved)
              + " taken=" + coop::StoreTakenFactionsText());
 }
 }

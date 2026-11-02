@@ -189,6 +189,8 @@
 #include "savesquadforeign.h"   /* T-710: whose characters a save squad file holds; the fence for this game's own record */
 #include "ownrec.h"       /* mmo1: the own-squad record writer's names, index line, write decisions and pacing */
 #include "handrec.h"      /* T-889 step 2: the hand-over record pp.handover, its decisions and MSG_ITEM_HANDOVER */
+#include "hovground.h"    /* task 3 (0.4.0 brief): which ground item a hand-over line may remove */
+#include "pathparents.h"  /* task 4 (0.4.0 brief): every parent folder of a file path, top first */
 #include "permdelete.h"   /* the permanent delete's path-inside check and which saves go */
 #include "copybody.h"     /* crash2: the animal copy body-rebuild skip rule */
 #include "kolook.h"       /* a copy met while its owner says knocked out is dressed before its knockdown */
@@ -451,6 +453,8 @@ void t_p97_announce_nomap_refuses_every_slot();
 void t_cfg_write_round_trips_through_the_parser();
 void t_cfg_addr_rule();
 void t_cfg_panel_field_validators();
+void t_cfg_join_addr_port();   /* contributor task 1 */
+void t_task5_paid_refund();   /* contributor task 5 */
 void t_cfg_sanitise_typed();
 void t_cfg_incomplete_reason();
 void t_pp3_datadir_choose();
@@ -649,6 +653,7 @@ void t_names2a_faction_row();
 void t_h068_default_faction_numbers();
 void t_h069_freed_names_are_free();
 void t_t368_unique_names();
+void t_task2_faction_reload();   /* contributor task 2 */
 void t_t368_format_owed_reply();
 void t_t368_names_all_typed();
 void t_names1_name_wire();
@@ -1774,6 +1779,9 @@ void t_t889f2_parked_consumed();
 void t_t889f3_char_id();
 void t_t889f3_placed();
 void t_t889f3_ground_order();
+void t_task3_ground_exact_item();
+void t_task4_parent_dirs();
+void t_task6_rate_any_frame();
 void t_t889f3_search_before_rebuild();
 void t_t889f4_late_take_line();
 void t_t889f4_holder_look();

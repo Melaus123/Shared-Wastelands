@@ -289,7 +289,7 @@ enum PanelSlotId
     kSlotNetAddr,                                         /* T-510: HOSTING's INTERNET ADDRESS row, under LOCAL ADDRESS */
     kSlotVpnAddr,                                         /* T-631: HOSTING's RADMIN / HAMACHI ADDRESS row, between the two */
     kSlotPwRow,                                           /* T-290: HOST GAME's PASSWORD row (label, box, SHOW / HIDE), above PORT */
-    kSlotJoinByAddr,                                      /* JOIN BY ADDRESS: JOIN GAME's line between the friends list and IP ADDRESS */
+    kSlotJoinByAddr,                                      /* JOIN BY ADDRESS: JOIN GAME's line between the friends list and ADDRESS */
     kSlotSteamRow,                                        /* HOSTING's STEAM row: its label, INVITE FRIENDS at the right and, without Steam, its line */
     kSlotDlgTick,                                         /* RESET WORLD?'s keep-buildings tick box and its label, between its text and its last paragraph */
     kSlotDlgTail,                                         /* RESET WORLD?'s last paragraph, under the tick box (PanelLive::tail) */
@@ -360,14 +360,15 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
                                           { kSlotListBtns, 2 }, { kSlotPwRow, 2 }, { kSlotPortRow, 2 },
                                           { kSlotProfRow, 2 }, { kSlotKeepTick, 2 }, { kSlotKeepNote, 3 }, { kSlotStatus, 3 }, { kSlotButtons, 2 } };
     /* JOIN GAME's rows: PLAYER NAME, the friends list (its heads and rows, or the line in its place - kSlotList) with REFRESH under it at
-       the right (kSlotListBtns), JOIN BY ADDRESS, IP ADDRESS, then the status area.  Thirteen rows hold them with the list at 5
+       the right (kSlotListBtns), JOIN BY ADDRESS, ADDRESS, PORT (contributor task 1: the PORT row took the half-row gap that sat
+       above the status area, so the window keeps its 26 half-rows), then the status area.  Thirteen rows hold them with the list at 5
        half-rows; with the name's hint up the status ceiling is 7 - the opening line alone, JOIN is greyed while the hint shows.
        No gap row between the status area and BACK / JOIN: the status area's own spare under its last line is that gap, so the
        help line sits one gap above the bottom row and the window is no taller than its rows. */
     static const PanelSlot join[]     = { { kSlotNameRow, 2 }, { kSlotList, 5 }, { kSlotListBtns, 2 }, { kSlotJoinByAddr, 2 },
-                                          { kSlotAddrRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 9 }, { kSlotButtons, 2 } };
+                                          { kSlotAddrRow, 2 }, { kSlotPortRow, 2 }, { kSlotStatus, 9 }, { kSlotButtons, 2 } };
     static const PanelSlot joinHint[] = { { kSlotNameRow, 2 }, { kSlotNameHint, 2 }, { kSlotList, 5 }, { kSlotListBtns, 2 },
-                                          { kSlotJoinByAddr, 2 }, { kSlotAddrRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 7 },
+                                          { kSlotJoinByAddr, 2 }, { kSlotAddrRow, 2 }, { kSlotPortRow, 2 }, { kSlotStatus, 7 },
                                           { kSlotButtons, 2 } };
     static const PanelSlot nameDlg[]  = { { kSlotDlgText, 3 }, { kSlotGap, 1 }, { kSlotDlgName, 2 }, { kSlotGap, 1 },
                                           { kSlotButtons, 2 } };

@@ -61,7 +61,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 133;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
+const unsigned int kProtocol = 134;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
                                                  list, kBrFlagUndos, and its ledger, kBrFlagLedger) */
 
 

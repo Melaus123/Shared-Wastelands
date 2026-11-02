@@ -212,6 +212,22 @@ bool CfgAddrFieldOk(const std::string& text, const char* what,
                     std::string* addr, unsigned short* port, std::string* why);
 bool CfgNameFieldOk(const std::string& text, const char* what, size_t maxLen, std::string* why);
 
+/* JOIN BY ADDRESS's two boxes, ADDRESS and PORT (contributor task 1, approved mock-up).  The settings file keeps its own
+   address:port line and CfgSplitAddr; these rules are the window's only.
+   CfgJoinIsSteam:   a steam:<id> in ADDRESS - the Steam route dials no port, so PORT is greyed and ignored.
+   CfgJoinTakePort:  ADDRESS text that carries its own port ("host:7778", "[::1]:7778") - *host gets the host half and *port the
+                     digits, so the window can move them into PORT (typing and PASTE).  No for steam:, for a bare IPv6 literal
+                     ("::1" - its last colon is not a port) and for a tail that is not all digits.  Writes nothing on a no.
+   CfgJoinPortOk:    the PORT box: 1..65535, digits only; anything else (empty included) is kCfgJoinPortWhy, word for word.
+   CfgJoinAddrOk:    the JOIN press: ADDRESS (with its own port if it still carries one) and PORT, checked as one address -
+                     the address half by CfgAddrFieldOk's rules and sentences, a bare IPv6 literal bracketed first. */
+extern const char* const kCfgJoinPortWhy;
+bool CfgJoinIsSteam(const std::string& addrText);
+bool CfgJoinTakePort(const std::string& addrText, std::string* host, std::string* port);
+bool CfgJoinPortOk(const std::string& portText, unsigned short* port, std::string* why);
+bool CfgJoinAddrOk(const std::string& addrText, const std::string& portText,
+                   std::string* addr, unsigned short* port, std::string* why);
+
 /* ------------------------------------------------------------------------------------------------
    THE PARSER.  ConfigLoad reads the file into a string (bounded by kCfgMaxReadBytes) and calls this.
    notes receives one entry per line the old loop logged; lines, unknownKeys and badLines are the same

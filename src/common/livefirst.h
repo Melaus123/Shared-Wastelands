@@ -42,7 +42,7 @@
 
 namespace livefirst {
 
-const unsigned int kProtocol = 133;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
+const unsigned int kProtocol = 134;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
 
 const unsigned int kMsgChunk = 88;      /* CHUNK - one piece of a frame too big to go whole; either way, world-server link only */
 const size_t kFrameHeader = 5;          /* the transport's frame header: type u8 | payload length u32 */
@@ -375,6 +375,13 @@ private:
     double m_rate;
     bool m_busy;
 };
+
+/* task 6 (0.4.0 contributor brief): WHEN THE GAME'S WORLD-SERVER LINK MEASURES ITS DRAIN RATE. Rate::Note measures only in windows in
+   which `busy` was true. The game used to pass "record pieces wait", so a burst of introductions and live frames after entering an area
+   (no record pieces) kept the last, low rate: the budget sat at kBudgetMin and live updates waited behind the introductions for ~2 s. The
+   game now passes "any frame waits in the send line" (record, live, introduction, BULK, held or unreliable - the outbox's own count).
+   Rate itself is unchanged, so the world server's call (store_main.cpp, record pieces only) gives the same results as before. */
+inline bool GameDrainBusy(bool restWaiting, long long framesWaiting) { return restWaiting || framesWaiting > 0; }
 
 /* The record bytes a link's network queue may hold at a drain rate of `bytesPerSec`: rate x (aheadSec + kAheadSec), between kBudgetMin
    and kBudgetMax. A Steam link knows its rate (the send rate it set on Steam) and counts only bytes Steam has not sent: aheadSec 0. */

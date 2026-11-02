@@ -59,7 +59,7 @@
 
 namespace piecerec {
 
-const unsigned int kProtocol = 133;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5) */
+const unsigned int kProtocol = 134;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5) */
 
 
 

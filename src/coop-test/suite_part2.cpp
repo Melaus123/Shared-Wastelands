@@ -1675,7 +1675,9 @@ void t_names2a_faction_row()
     { Row a; a.person = P; a.num = 3; a.name = "Three"; a.faction = "Three"; a.active = 0; rows.push_back(a); }
     { Row a; a.person = Q; a.num = 1; a.name = "Q"; a.faction = "Q"; rows.push_back(a); }
     int i = -1;
-    if (FactionDecide(rows, P + ".2", 2, "GapThree", &i, &f) != kFacSet || i != 1 || f != "GapThree") Fail("names2a: profile 2 sets its own row");
+    /* contributor task 2: a LOAD with another name keeps the row's own (case A); a RENAME sets it - the row rules here are a rename's */
+    if (FactionDecide(rows, P + ".2", 2, "GapThree", &i, &f) != kFacKeep || i != 1 || f != "Two") Fail("names2a: a load keeps profile 2's row name (task 2 A)");
+    if (FactionDecide(rows, P + ".2", 2, "GapThree", &i, &f, 1) != kFacSet || i != 1 || f != "GapThree") Fail("names2a: profile 2 sets its own row");
     if (FactionDecide(rows, P, 1, "One ", &i, &f) != kFacSame || i != 0) Fail("names2a: an unchanged name (after trimming) is SAME");
     if (FactionDecide(rows, P + ".2", 1, "GapThree", &i, &f) != kFacRefusedSender) Fail("names2a: profile 2 may not write profile 1's row");
     if (FactionDecide(rows, P, 2, "GapThree", &i, &f) != kFacRefusedSender) Fail("names2a: profile 1 may not write profile 2's row");
@@ -1684,7 +1686,7 @@ void t_names2a_faction_row()
     if (FactionDecide(rows, P + ".3", 3, "GapThree", &i, &f) != kFacRefusedUnknown) Fail("names2a: a deleted profile's row is not written");
     if (FactionDecide(rows, P + ".4", 4, "GapThree", &i, &f) != kFacRefusedUnknown) Fail("names2a: a profile with no row is refused");
     if (FactionDecide(rows, Q, 1, "   ", &i, &f) != kFacRefusedName || rows[3].faction != "Q") Fail("names2a: an empty name is refused, the row unchanged");
-    if (FactionDecide(rows, Q, 1, long30, &i, &f) != kFacSet || f.size() != 24) Fail("names2a: a long name is set cut to 24");
+    if (FactionDecide(rows, Q, 1, long30, &i, &f, 1) != kFacSet || f.size() != 24) Fail("names2a: a long name is set cut to 24");
 }
 
 /* H068 (owner 471): Kenshi's default "Nameless" at a load becomes each profile's own "Nameless <n>" - the operator's and every joiner's, played
@@ -1787,6 +1789,64 @@ void t_h069_freed_names_are_free()
     }
 }
 
+/* Contributor task 2 (0.4.0 brief): a player faction's name on reload, cases A-D, in the order Kenshi default (C), the row's own name
+   (A), a clash (B / D); the game's side of each; the message-line words; the new verdict on the wire. */
+void t_task2_faction_reload()
+{
+    using namespace coopprof;
+    const std::string P(32, 'p'), Q(32, 'q'), R(32, 'r');
+    std::vector<Row> rows;
+    { Row a; a.person = P; a.num = 1; a.name = "Pia"; a.faction = "Sand Fleas"; a.created = 100; a.played = 1; rows.push_back(a); }
+    { Row a; a.person = Q; a.num = 1; a.name = "Quin"; a.faction = "Hub Rats"; a.created = 200; a.played = 1; rows.push_back(a); }
+    { Row a; a.person = R; a.num = 1; a.name = "Rae"; a.faction = ""; a.created = 300; a.played = 0; rows.push_back(a); }
+    int i = -1; std::string f;
+    /* A: row Sand Fleas, the save loads a FREE older name - the row keeps its name, the game takes it, nothing shown */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Dust Bandits", &i, &f, 0) != kFacKeep || f != "Sand Fleas" || i != 0) Fail("task 2 A: the world's newer name wins");
+    if (FactionApplyDecide(kFacKeep, "Dust Bandits", "Dust Bandits", "Sand Fleas") != kFacApplySilent) Fail("task 2 A: applied silently");
+    if (FactionApplyDecide(kFacKeep, "Sand Fleas", "Dust Bandits", "Sand Fleas") != kFacApplyHave) Fail("task 2 A: already carried");
+    /* A: a save whose name another profile holds - the row's own name still wins (A before B) */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Hub Rats", &i, &f, 0) != kFacKeep || f != "Sand Fleas") Fail("task 2 A: the row's own name before a clash");
+    /* A: the same name in another case or spacing is a re-case, as today */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "sand fleas", &i, &f, 0) != kFacSet || f != "sand fleas") Fail("task 2 A: the row's name re-cased");
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Sand Fleas", &i, &f, 0) != kFacSame) Fail("task 2 A: the same name");
+    /* A: an empty row takes the save's name, as today */
+    if (FactionDecide(rows, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet || f != "Dust Bandits") Fail("task 2 A: an empty row takes the save's name");
+    /* audit 3 (T2-1): a placeholder the world gave the row - a new profile's "Nameless <n>", an adopted slot's "Profile <n>" - never wins
+       over the save's name: a free name is set, a taken one moved (B), as before task 2 */
+    { std::vector<Row> r4(rows); r4[2].faction = "Nameless 2";
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet || f != "Dust Bandits") Fail("task 2 A: a new profile's Nameless <n> takes the save's name");
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved) Fail("task 2 A: a new profile's Nameless <n> with a taken name is moved");
+      r4[2].faction = "Profile 1";
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet || f != "Dust Bandits") Fail("task 2 A: an adopted Profile <n> takes the save's name");
+      r4[2].faction = "Profile 7";
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacKeep || f != "Profile 7") Fail("task 2 A: Profile <another number> is a chosen name"); }
+    /* A: a row not holding its name by right (a row made earlier holds it too) is judged by the clash rule */
+    { std::vector<Row> r2(rows); r2[1].faction = "Sand Fleas";
+      if (FactionDecide(r2, SlotKey(Q, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet) Fail("task 2 A: a row holding a name made earlier by another does not keep it");
+      if (FactionDecide(r2, SlotKey(Q, 1), 1, "Sand Fleas", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("task 2: two rows, one name - the later is moved"); }
+    /* renames keep today's behaviour */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Dust Bandits", &i, &f, 1) != kFacSet || f != "Dust Bandits") Fail("task 2: a rename to a free name is set");
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Hub Rats", &i, &f, 1) != kFacBack || f != "Sand Fleas") Fail("task 2: a rename to a taken name goes back (box, as today)");
+    if (FactionApplyDecide(kFacBack, "Hub Rats", "Hub Rats", "Sand Fleas") != kFacApplyBackBox) Fail("task 2: the Back box stays");
+    /* B: a load with a name another holds, from a row with no name of its own - moved, said on the message line */
+    if (FactionDecide(rows, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("task 2 B: a real clash is moved");
+    if (FactionApplyDecide(kFacMoved, "Hub Rats", "Hub Rats", "Nameless 1") != kFacApplyMovedLine) Fail("task 2 B: the message line, no box");
+    if (coopui::FactionMovedLineText("Hub Rats", "Nameless 1") != "The faction name \"Hub Rats\" is already taken in this world. Your faction is now called \"Nameless 1\".")
+        Fail("task 2 B: the approved message-line words");
+    /* C: Kenshi's default Nameless at a load - the profile's Nameless <n>, nothing shown */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("task 2 C: Kenshi's Nameless takes a Nameless number");
+    if (FactionApplyDecide(kFacDefault, "Nameless", "Nameless", "Nameless 1") != kFacApplySilent) Fail("task 2 C: nothing shown");
+    /* D: the save's automatic Nameless <n> found taken, moved to another - nothing shown */
+    if (FactionApplyDecide(kFacMoved, "Nameless 4", "Nameless 4", "Nameless 1") != kFacApplySilent) Fail("task 2 D: an automatic Nameless <n> moved silently");
+    if (FactionApplyDecide(kFacMoved, "Nameless", "Nameless", "Nameless 1") != kFacApplyMovedLine) Fail("task 2 D: plain Nameless is not an automatic number");
+    /* the new verdict on the wire, owed until acknowledged, named in logs */
+    FactionAnswer fa; fa.verdict = kFacKeep; fa.num = 1; fa.asked = "Dust Bandits"; fa.name = "Sand Fleas";
+    std::vector<char> w; EncodeFactionAnswer(&w, fa); FactionAnswer fb;
+    if (!DecodeFactionAnswer(w, &fb) || fb.verdict != kFacKeep || fb.asked != "Dust Bandits" || fb.name != "Sand Fleas") Fail("task 2: kFacKeep round-trips");
+    if (FactionOwedAfter(kFacKeep) != kFacOwedReplace || std::string(FactionVerdictName(kFacKeep)) != "worldNameKept") Fail("task 2: kFacKeep owed and named");
+    w[1] = (char)9; if (DecodeFactionAnswer(w, &fb)) Fail("task 2: an unknown verdict is refused");
+}
+
 /* T-368 (owner 265-270, 472): player names and faction names unique per world, connected or not; a new player's faction "Nameless <n>". */
 void t_t368_unique_names()
 {
@@ -1824,7 +1884,11 @@ void t_t368_unique_names()
     int i = -1; std::string f;
     if (FactionDecide(rows, P, 1, "Sand Fleas", &i, &f, 1) != kFacSet || f != "Sand Fleas") Fail("T-368: a rename to a deleted profile's faction name is taken");
     if (FactionDecide(rows, P, 1, "nameless 3", &i, &f, 1) != kFacBack || f != "Hub Rats" || i != 0) Fail("T-368: a rename to a taken name goes back to the row's own");
-    if (FactionDecide(rows, P, 1, "Nameless 3", &i, &f, 0) != kFacMoved || f != "Nameless 2") Fail("T-368: a load with a taken name takes the lowest free Nameless number");
+    /* contributor task 2: a row holding a name by right keeps it at a load (case A, kFacKeep) - before a clash is judged; a row with no
+       name of its own still takes the lowest free Nameless number for a taken name (D) */
+    if (FactionDecide(rows, P, 1, "Nameless 3", &i, &f, 0) != kFacKeep || f != "Hub Rats") Fail("task 2 A: a load with an older name keeps the row's name");
+    { std::vector<Row> r3(rows); r3[0].faction = "";
+      if (FactionDecide(r3, P, 1, "Nameless 3", &i, &f, 0) != kFacMoved || f != "Nameless 2") Fail("T-368: a load with a taken name takes the lowest free Nameless number"); }
     if (FactionDecide(rows, P, 1, "hub rats", &i, &f, 1) != kFacSet || f != "hub rats") Fail("T-368: a profile may re-case its own faction name");
     if (FactionDecide(rows, Q, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("T-368: a never-played profile's new game keeps its row's Nameless number");
     if (FactionDecide(rows, R, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 3" || i != 3)
@@ -1844,7 +1908,8 @@ void t_t368_unique_names()
     if (FactionDecide(rows, Q + ".2", 2, "Hub Rats", &i, &f, 0) != kFacRefusedUnknown) Fail("T-368: a deleted profile's row is not judged");
     /* what the game does with the world's answer */
     if (FactionApplyDecide(kFacBack, "Nameless 3", "Nameless 3", "Hub Rats") != kFacApplyBackBox) Fail("T-368: back - the change-back box");
-    if (FactionApplyDecide(kFacMoved, "Nameless 3", "Nameless 3", "Nameless 2") != kFacApplyMovedBox) Fail("T-368: moved - the load box");
+    if (FactionApplyDecide(kFacMoved, "Nameless 3", "Nameless 3", "Nameless 2") != kFacApplySilent) Fail("task 2 D: an automatic Nameless <n> moved - nothing shown");
+    if (FactionApplyDecide(kFacMoved, "Sand Fleas", "Sand Fleas", "Nameless 2") != kFacApplyMovedLine) Fail("task 2 B: moved - the message line");
     if (FactionApplyDecide(kFacDefault, "Nameless", "Nameless", "Nameless 2") != kFacApplySilent) Fail("T-368: Kenshi's default name takes the profile's Nameless number - no box");
     if (FactionApplyDecide(kFacBack, "Other", "Nameless 3", "Hub Rats") != kFacApplyDrop) Fail("T-368: an answer about a name the faction no longer has is dropped");
     if (FactionApplyDecide(kFacDefault, "Hub Rats", "Hub Rats", "Nameless 2") != kFacApplyDrop) Fail("T-368: a Nameless number is applied only to Kenshi's Nameless");
@@ -1852,7 +1917,7 @@ void t_t368_unique_names()
     /* the words */
     if (std::string(coopui::kFactionBoxTitle) != "Faction Name"
         || coopui::FactionBackText("Hub Rats", "Sand Fleas") != "Your faction name \"Hub Rats\" is already taken in this world, so it was changed back to \"Sand Fleas\"."
-        || coopui::FactionMovedText("Hub Rats", "Sand Fleas") != "Another player in this world already uses the faction name \"Hub Rats\". Your faction is now called \"Sand Fleas\".")
+        || coopui::FactionMovedLineText("Hub Rats", "Nameless 2") != "The faction name \"Hub Rats\" is already taken in this world. Your faction is now called \"Nameless 2\".")
         Fail("T-368: the approved Faction Name box words (owner 270 a)");
     /* the wire */
     std::vector<char> w; int kind = 0; unsigned num = 0; std::string nm;
@@ -1898,7 +1963,8 @@ void t_t368_format_owed_reply()
     }
     /* 2: an accepted judgement clears what was owed; a changed name is owed instead; a refusal keeps it */
     if (FactionOwedAfter(kFacSet) != kFacOwedClear || FactionOwedAfter(kFacSame) != kFacOwedClear) Fail("T-368: an accepted name clears the owed answer");
-    if (FactionOwedAfter(kFacBack) != kFacOwedReplace || FactionOwedAfter(kFacMoved) != kFacOwedReplace || FactionOwedAfter(kFacDefault) != kFacOwedReplace)
+    if (FactionOwedAfter(kFacBack) != kFacOwedReplace || FactionOwedAfter(kFacMoved) != kFacOwedReplace || FactionOwedAfter(kFacDefault) != kFacOwedReplace
+        || FactionOwedAfter(kFacKeep) != kFacOwedReplace)
         Fail("T-368: a changed name's answer is owed in place of the old one");
     if (FactionOwedAfter(kFacRefusedSender) != kFacOwedKeep || FactionOwedAfter(kFacRefusedUnknown) != kFacOwedKeep || FactionOwedAfter(kFacRefusedName) != kFacOwedKeep)
         Fail("T-368: a refusal leaves the owed answer");
@@ -1918,10 +1984,10 @@ void t_t368_format_owed_reply()
         Fail("T-368: an old answer is neither acknowledged nor reported");
     if (FactionReplyDecide(kFacApplyHave, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplyHave, true, true) != kFacReplySeen)
         Fail("T-368: an answer the faction carries is acknowledged");
-    if (FactionReplyDecide(kFacApplyMovedBox, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplySilent, false, true) != kFacReplySeen)
+    if (FactionReplyDecide(kFacApplyMovedLine, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplySilent, false, true) != kFacReplySeen)
         Fail("T-368: an applied answer is acknowledged");
     if (FactionReplyDecide(kFacApplyBackBox, true, false) != kFacReplyReport) Fail("T-368: a record holding the name - the kept name is reported back");
-    if (FactionReplyDecide(kFacApplyMovedBox, true, true) != kFacReplyNone) Fail("T-368: the same answer is reported back once only");
+    if (FactionReplyDecide(kFacApplyMovedLine, true, true) != kFacReplyNone) Fail("T-368: the same answer is reported back once only");
 }
 void t_t368_names_all_typed()
 {
@@ -2000,7 +2066,7 @@ void t_t368_names_all_typed()
     {
         const std::string long30("ABCDEFGHIJKLMNOPQRSTUVWXYZ1234");
         if (FactionApplyDecide(kFacBack, "  " + long30 + " ", long30.substr(0, 24), "Old") != kFacApplyBackBox) Fail("T-368: an answer judged on the row's cut of a long name applies");
-        if (FactionApplyDecide(kFacMoved, " Hub Rats ", "Hub Rats", "Nameless 2") != kFacApplyMovedBox) Fail("T-368: an answer applies through edge spaces");
+        if (FactionApplyDecide(kFacMoved, " Hub Rats ", "Hub Rats", "Nameless 2") != kFacApplyMovedLine) Fail("T-368: an answer applies through edge spaces");
         if (FactionApplyDecide(kFacMoved, "Nameless 2", "Nameless 2", "Nameless 2") != kFacApplyHave) Fail("T-368: an answer naming the name it has is had already");
     }
     /* the answers on the wire */

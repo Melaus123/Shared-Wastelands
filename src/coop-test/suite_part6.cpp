@@ -2642,7 +2642,7 @@ void t_steamfriends_list_line()
     if (std::string(steamfriends::SourceWord(steamfriends::kFromList)) != "list" || std::string(steamfriends::SourceWord(steamfriends::kFromCallback)) != "callback"
         || std::string(steamfriends::SourceWord(steamfriends::kFromLaunch)) != "launch" || std::string(steamfriends::SourceWord(steamfriends::kFromLever)) != "lever")
         Fail("the join request's source words");
-    /* JOIN GAME's rows fit the panel: the list, REFRESH and JOIN BY ADDRESS between PLAYER NAME and IP ADDRESS, the bands in that order */
+    /* JOIN GAME's rows fit the panel: the list, REFRESH and JOIN BY ADDRESS between PLAYER NAME and ADDRESS / PORT, the bands in that order */
     const int lays[] = { coopui::kLayJoin, coopui::kLayJoinHint };
     for (int k = 0; k < 2; ++k)
     {
@@ -2652,9 +2652,10 @@ void t_steamfriends_list_line()
         const coopui::PanelBand kb = coopui::PanelSlotBand(lays[k], coopui::kSlotListBtns, 24);
         const coopui::PanelBand ab = coopui::PanelSlotBand(lays[k], coopui::kSlotJoinByAddr, 24);
         const coopui::PanelBand rb = coopui::PanelSlotBand(lays[k], coopui::kSlotAddrRow, 24);
-        if (lb.h <= 0 || kb.h <= 0 || ab.h <= 0 || rb.h <= 0) Fail("a JOIN GAME row is missing, layout " + I(lays[k]));
-        if (!(nb.top < lb.top && lb.top + lb.h == kb.top && kb.top + kb.h == ab.top && ab.top + ab.h == rb.top))
-            Fail("JOIN GAME's rows are not name, list, REFRESH, JOIN BY ADDRESS, IP ADDRESS in order, layout " + I(lays[k]));
+        const coopui::PanelBand pb = coopui::PanelSlotBand(lays[k], coopui::kSlotPortRow, 24);   /* contributor task 1 */
+        if (lb.h <= 0 || kb.h <= 0 || ab.h <= 0 || rb.h <= 0 || pb.h <= 0) Fail("a JOIN GAME row is missing, layout " + I(lays[k]));
+        if (!(nb.top < lb.top && lb.top + lb.h == kb.top && kb.top + kb.h == ab.top && ab.top + ab.h == rb.top && rb.top + rb.h == pb.top))
+            Fail("JOIN GAME's rows are not name, list, REFRESH, JOIN BY ADDRESS, ADDRESS, PORT in order, layout " + I(lays[k]));
     }
 }
 
