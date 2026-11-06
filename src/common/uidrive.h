@@ -61,6 +61,7 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "tagcharacterlabel", kDriveButton, "SWMultiplayerTagCharacterLabel", 0 },
         { "tagfactionlabel",   kDriveButton, "SWMultiplayerTagFactionLabel",   0 },
         { "tagsdone",          kDriveButton, "SWMultiplayerDone",              0 },
+        { "mpgameoptions",     kDriveButton, "SWMultiplayerGameOptions",       0 },   /* GAME OPTIONS, left of DONE: screen 6 for this world */
         { "hostaddrcopy",  kDriveButton, "SWNetAddrCopyBtn",      0 },
         { "hostvpncopy",   kDriveButton, "SWVpnAddrCopyBtn",      0 },   /* T-631: the RADMIN / HAMACHI ADDRESS row's COPY */
         { "hostpwshow",    kDriveButton, "SWHostPwShowBtn",       0 },   /* T-290: HOST GAME's PASSWORD row SHOW / HIDE (one button) */
@@ -125,6 +126,9 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "optincg",       kDriveButton, "CoopOptInc6",           0 },
         { "optinch",       kDriveButton, "CoopOptInc7",           0 },
         { "optinci",       kDriveButton, "CoopOptInc8",           0 },
+        /* T-1202: the tenth row (the MULTIPLAYER tab's IMPORT INCLUDES RESEARCH) - its < and > (ui.cpp kActOptDec9 / kActOptInc9) */
+        { "optdecj",       kDriveButton, "CoopOptDec9",           0 },
+        { "optincj",       kDriveButton, "CoopOptInc9",           0 },
         /* T-556: each shown row's tick box (rows a..i as above; MULTIPLAYER's RESURRECTION is row e) */
         { "optticka",      kDriveButton, "CoopOptTick0",          0 },
         { "opttickb",      kDriveButton, "CoopOptTick1",          0 },
@@ -135,6 +139,7 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "opttickg",      kDriveButton, "CoopOptTick6",          0 },
         { "opttickh",      kDriveButton, "CoopOptTick7",          0 },
         { "optticki",      kDriveButton, "CoopOptTick8",          0 },
+        { "opttickj",      kDriveButton, "CoopOptTick9",          0 },   /* T-1202: the tenth row's tick box */
         /* T-220: the panel's two close routes that are not a button of ours - the title-bar X and the Escape key */
         { "close",         kDriveWindowClose, "CoopPanel",         0 },
         { "escape",        kDriveEscape,      "CoopPanel",         0 },
@@ -147,6 +152,7 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "name",          kDriveEdit,   "CoopNameEdit",          0 },   /* T-201 N1b: PLAYER NAME - ONE box, on HOST GAME and JOIN GAME */
         { "address",       kDriveEdit,   "CoopJoinAddrEdit",      0 },
         { "port",          kDriveEdit,   "CoopHostPortEdit",      0 },
+        { "joinport",      kDriveEdit,   "CoopJoinPortEdit",      0 },   /* T-793: JOIN BY ADDRESS's PORT box */
         { "worldname",     kDriveEdit,   "CoopDlgNameEdit",       0 },
         { "profilename",   kDriveEdit,   "CoopDlgNameEdit",       0 },
         { "fee",           kDriveEdit,   "SWOptFeeEdit",          0 },   /* T-556: GAME OPTIONS' RESURRECTION FEE box */

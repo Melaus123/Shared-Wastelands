@@ -120,6 +120,14 @@ const unsigned int kInnerFightChoice = 83;
    takes it only for a character the receiving game does not run, from the game that runs it (RemoteMayWrite). net/transport.h
    number; store.cpp asserts it. */
 const unsigned int kInnerHand = 84;
+/* T-1061: BOX_LOCK - a chest's pick asked of the box's writer (ASK, to the area's holder by slot) or its refusal (NO, back to the
+   asker); its handler takes an ASK only as the box's writer and a NO only for an ask of its own (items.cpp BoxLockNote).
+   net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerBoxLock = 85;
+/* T-1242: RESEARCH_BOOK - a research's Books asked of the teammate whose bench holds them (ASK), its ANSWER, and the asker's GIVEBACK /
+   DONE (src/common/bookshare.h); to one player by slot; its handler takes an ASK only from a current teammate and an ANSWER only for
+   this game's own hold (store.cpp BookNote). net/transport.h number; store.cpp asserts it. (86 / 87 are held by effort/t1122a.) */
+const unsigned int kInnerResearchBook = 88;
 
 struct LiveUp
 {
@@ -427,6 +435,8 @@ inline bool LiveInnerAccepted(unsigned int t)
         || t == kInnerShotFired   /* taken only for a copy of the shooter, from the game that runs it (combat.cpp) */
         || t == kInnerHand   /* taken only for a copy of the character, from the game that runs it (combat.cpp) */
         || t == kInnerSwingEnd   /* the relayed-owner gate, as SWING */
+        || t == kInnerBoxLock   /* T-1061: an ASK taken only by the box's writer, a NO only for this game's own ask (items.cpp) */
+        || t == kInnerResearchBook   /* T-1242: an ASK taken only from a current teammate, an ANSWER only for this game's own hold (store.cpp) */
         || t == kInnerFightChoice;   /* the relayed-owner gate, as SWING; applied only to a copy here (combat.cpp) */
 }
 
@@ -443,7 +453,9 @@ inline bool LiveInnerWaitsForWorld(unsigned int t)
         || t == kInnerName || t == kInnerSlave || t == kInnerHire   /* a name and a slave state are kept pending, a HIRE queued, as on the session link */
         || t == kInnerPrison || t == kInnerTreat   /* a caging / treatment request waits for the owner's new world, as on the session link */
         || t == kInnerTownPrices   /* a town table is filed after the load, not lost to it */
-        || t == kInnerItemHandover;   /* T-889 step 2: a hand-over's QUERY / VERDICT / CLOSED waits like the other item messages */
+        || t == kInnerItemHandover   /* T-889 step 2: a hand-over's QUERY / VERDICT / CLOSED waits like the other item messages */
+        || t == kInnerBoxLock   /* T-1061: a chest's ASK / NO waits for the world its box is in, as the item messages do */
+        || t == kInnerResearchBook;   /* T-1242: a Books ASK / ANSWER waits for the world its bench is in */
 }
 
 /* A repeating refusal line: the first 5, then every 100th. `count` is the refusal's own counter, already incremented. */

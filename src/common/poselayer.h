@@ -13,6 +13,9 @@
       jog / limp states and layer 2 overlays ('breathing noarms', 'head turning', 'hand2shoulder' at weight 1.00) - picked,
       they would become poses whenever the layer-1 state fades; layer 1 holds the held action ('medic', 'idle_stand_normal').
       A NaN weight never counts.
+      T-890 TURRET (T1871, Confirmed): the one exception to 'layer 1 only' - a manned turret's gunner holds no layer-1 state;
+      the turret-manning job plays 'combatstance' on LAYER 2 (weight 1.00, looped). A layer-2 state is taken when the turret
+      job's code started it (State::turret, TurretStarted); every other layer-2 state (the overlays above) stays refused.
    2. SETTLE (CandStep): a picked name counts only after it has stayed the pick for kSettleMs - a blend between two states
       (a stop, an action ending) is never sent as a pose. A different name, or no pick, starts over.
 
@@ -44,6 +47,7 @@ namespace poselayer {
 
 const unsigned int kStrMax = 48;              /* as the pose wire's kPoseStrMax: a longer name is not a pose */
 const unsigned int kLayerMask = 1u << 1;      /* the layers a pose may come from: layer 1 (see 1 above) */
+const unsigned int kTurretLayerMask = 1u << 2; /* T-890 TURRET: the layer the turret job's state may also come from (see 1) */
 const int kLayers = 3;                        /* the layer table's layers the reader may visit: 0-2 */
 const int kStateCap = 32;                     /* states read per character per frame, all layers together */
 const unsigned int kLayerCountMax = 4096;     /* a layer state count above this is not plausible: its states are not read */
@@ -97,6 +101,30 @@ inline int FirstGameFrameKind(const unsigned long long* frames, int n, unsigned 
 /* 1 a layer state with this caller type may be sent as a pose (owner decision 1236 a): a listed task's, or any other game
    code's (unknown: an unlisted task, a mod's task); a refuse-list starter's (kCallerController) or none (no note) never */
 inline int LayerStartSendable(int kind) { return (kind == kCallerTask || kind == kCallerUnknown) ? 1 : 0; }
+
+/* T-890 TURRET (owner decisions 251, 1375): a manned turret's gunner pose is shown. The turret-manning job (task row
+   AnimTaskCombatStance, 1.0.65 0x347490 / 1.0.68 0x3474F0 - T1854 install line 'layer play caller 0x3474F0 task') plays
+   'combatstance' only in the layer table, the action slot empty (decomp_347490.txt:53-60). The pose road's name filter
+   (spawn.cpp PoseActionExcluded) refuses any name holding 'combat' or 'stance' - the fight stances, which T-1101 and the
+   stance buttons send. 1 the name filter is skipped for this layer pick: a listed task's state whose starter's return
+   address (startRva, image offset) lies in the turret job's code (turret[0..nTurret), image addresses), or - a busy frame
+   kept the settled pick without its starter (kind none, startRva 0) - keptIsSent: the kept name is the action the owner
+   already sends. Anything else 0: the filter decides as before (a fight job's 'combatstance' is refused by name; a
+   refuse-list starter's never reaches here - LayerStartSendable). */
+/* T-890 TURRET (T1871): 1 a layer state's starter is the turret-manning job - a listed task's note whose return address
+   (startRva, image offset) lies in the turret job's code pieces (turret[0..nTurret), image addresses); else 0 */
+inline int TurretStarted(int kind, unsigned int startRva, unsigned long long imageBegin, const Range* turret, int nTurret)
+{
+    return (kind == kCallerTask && startRva != 0) ? InRanges(imageBegin + startRva, turret, nTurret) : 0;
+}
+
+inline int LayerNameFilterSkipped(int kind, unsigned int startRva, unsigned long long imageBegin, const Range* turret,
+                                  int nTurret, int keptIsSent)
+{
+    if (kind == kCallerTask && startRva != 0) return TurretStarted(kind, startRva, imageBegin, turret, nTurret);
+    if (kind == kCallerNone && startRva == 0) return keptIsSent != 0 ? 1 : 0;
+    return 0;
+}
 
 /* THE REFUSE LIST (owner decision 1236 a). The five table rows AnimCtl* (spawn.cpp: idle chooser, walk / run blend, head
    turn, 0x5F0C10 - role unread, kept as background -, the main-slot fill, whose action the main-slot road sends) and these
@@ -383,15 +411,19 @@ struct State
     int layer;
     float weight;
     int looped;
+    int turret;   /* T-890 TURRET: 1 the turret-manning job started it (TurretStarted); read only for a kTurretLayerMask layer */
 };
 
-/* the index of the state to use, -1 none */
+/* the index of the state to use, -1 none. A state on a layerMask layer, or - T-890 TURRET - one on a kTurretLayerMask layer
+   that the turret job started; then repeating and at least minWeight, as before */
 inline int LayerPick(const State* s, int n, unsigned int layerMask, float minWeight)
 {
     int best = -1;
     for (int i = 0; i < n; ++i)
     {
-        if (s[i].layer < 0 || s[i].layer > 31 || (layerMask & (1u << s[i].layer)) == 0) continue;
+        if (s[i].layer < 0 || s[i].layer > 31) continue;
+        const unsigned int bit = 1u << s[i].layer;
+        if ((layerMask & bit) == 0 && !(s[i].turret != 0 && (kTurretLayerMask & bit) != 0)) continue;
         if (s[i].looped == 0) continue;
         const float w = s[i].weight;
         if (!(w >= minWeight)) continue;   /* NaN fails */

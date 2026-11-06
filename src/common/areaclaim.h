@@ -269,50 +269,6 @@ inline int AreasLineParse(const std::string& line, int* x, int* y, std::string* 
     return 1;
 }
 
-/* ---- owner.txt: the operator's id and where it was learned (decision 49) ---- */
-enum OwnerSource
-{
-    kOwnerSourceNone     = 0,   /* nobody is the operator yet */
-    kOwnerSourceArg      = 1,   /* --owner on the command line: the panel or the harness started this notebook FOR that player */
-    kOwnerSourceFirst    = 2,   /* no --owner was ever given, so the first game to talk to this notebook after its WELCOME became the operator (W3-f; before it, the first HELLO) */
-    kOwnerSourceRestored = 3    /* owner.txt said so - which is the whole reason the file exists */
-};
-
-/* W3-f (review-w3 item 2): WHEN A WORLD WITH NO OPERATOR APPOINTS ONE - at a game's first message AFTER its WELCOME,
-   never at its HELLO: a game that then refuses this notebook's world (or protocol) sends nothing more, because every send
-   of the plugin is behind LinkUp(). senderAdmitted = the sender's HELLO was let in (it has an id, a slot and a WELCOME). */
-inline bool OwnerAppointOnMessage(bool haveOwner, bool senderAdmitted, bool msgIsHello)
-{
-    return !haveOwner && senderAdmitted && !msgIsHello;
-}
-
-inline const char* OwnerSourceName(int src)
-{
-    if (src == kOwnerSourceArg)      return "arg";
-    if (src == kOwnerSourceFirst)    return "first";
-    if (src == kOwnerSourceRestored) return "restored";
-    return "none";
-}
-
-inline std::string OwnerLineFormat(const std::string& ownerId, int source)
-{
-    return "v1\t" + ownerId + "\t" + std::string(OwnerSourceName(source));
-}
-
-/* The source comes back as RESTORED whatever the file says it was, because reading it out of the file is how
-   this process learned it - recording "arg" for a run that was given no argument would be a number that reads
-   as one thing and reports another (the clock's seed state made exactly that mistake in P7u). */
-inline int OwnerLineParse(const std::string& line, std::string* ownerId, int* source)
-{
-    std::vector<std::string> f;
-    AcFields(line, &f);
-    if (f.size() < 2 || f[0] != "v1") return 0;
-    if (!PlayerIdOk(f[1])) return 0;
-    *ownerId = f[1];
-    *source = kOwnerSourceRestored;
-    return 1;
-}
-
 /* P5t (T418): WHO THE NOTEBOOK GIVES AN UNCLAIMED AREA TO. Each game's own ring-1 tie-break (zones.cpp
    MayInventFromView / MySlotLower) lets the LOWER slot invent when both players stand within one area of it; the
    notebook used to name whichever game's loaded report arrived first (T418: B stepped aside, A invented, and B's

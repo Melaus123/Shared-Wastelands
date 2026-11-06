@@ -43,6 +43,11 @@ bool StatsApplyOwn(void* character, const unsigned int* raw44, int* rcOut);
 // recalculated (refused, no stats object, or the vftable not an expected one), -1 / -2 a fault.
 int StatsRecalcCopy(unsigned int uid, void* character);
 
+// T-1205 /heal, MAIN THREAD (the K2 safe point). The same recalculation on a character THIS game drives, its stat values untouched
+// and its blood NOT kept: MedicalSystem::updateStats 0x644840 sets blood to the engine's own maximum, as for a brought-back
+// character (StatsApplyOwn). Refused for another game's character and while EngineWritesBlocked(). The codes are StatsRecalcCopy's.
+int StatsRecalcOwned(unsigned int uid, void* character);
+
 // MAIN THREAD, from the command-channel pump. The owner's sender: a character whose values changed (a whole
 // number, or by 0.05 or more) or were last sent 30 s ago goes out as MSG_STATS, at most kStatsMaxPerTick a tick.
 // Does nothing while EngineWritesBlocked() (load / teardown), counted statsTickBlocked.

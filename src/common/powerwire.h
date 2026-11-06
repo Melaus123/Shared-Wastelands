@@ -31,6 +31,30 @@ namespace powerwire {
 const unsigned char kPowerState = 16;        /* pieces no player owns: a player's power piece rides its piece record (piecerec.h format 2) */
 const unsigned char kPowerAsk = 17;
 const unsigned char kAskSwitch = 1;          /* POWER_ASK's what: the only one there is */
+/* T-1192 (game-to-game protocol 193): A RECIPE ASKED OF A CRAFTING BENCH'S WRITER. The crafting window's add (0x2B9730 -> CraftQueueAdd
+   0x2B5C60) on a game that does not write the bench adds nothing there: it is asked of the writer's game (CRAFT_ASK, to that slot alone),
+   which adds it through its own CraftQueueAdd - the list then reaches every game on the bench's piece record (piecerec.h craft part). The
+   writer answers the asker alone (CRAFT_ANSWER): accepted, or refused with a reason. An ask with no answer after kCraftAskLapseMs has
+   lapsed. The same road carries the window's other two changes to the list (review fold): an entry removed (kCraftOpRemove - the
+   window's entry click / drop, removeCraft 0x2B69E0 - named by its place AND its product and row ids, refused when the writer's entry
+   there is another) and the repeat flag (kCraftOpRepeat - the window's repeat button 0x2B4FC0 - the value wanted, not a toggle).
+   CRAFT_ASK: kind | key | u32 seq | u8 op 0..kCraftOpMax | u8 n + the product's record id | u8 n + the row record's id | u8 mode | u32 index
+   (CraftAskShapeOk: add - product 1..kCraftSidMax, row 0..kCraftSidMax, mode 0..2, index 0; remove - product and row as add, mode 0,
+   index 0..kCraftIndexMax; repeat - no ids, mode = the repeat wanted 0 / 1, index 0). CRAFT_ANSWER: kind | key | u32 seq | u8 verdict
+   0..kCraftVerdictMax. */
+const unsigned char kCraftAsk = 19;
+const unsigned char kCraftAnswer = 20;
+const unsigned int  kCraftSidMax = 64;
+const unsigned char kCraftModeMax = 2;
+const unsigned char kCraftOpAdd = 0, kCraftOpRemove = 1, kCraftOpRepeat = 2, kCraftOpMax = 2;
+const unsigned int  kCraftIndexMax = 65535;   /* a removed entry's place (piecerec.h kPrCraftTotalMax) */
+/* review fold: kCraftRefusedListChanged - the writer's entry at the removed place is not the one named (its list moved first);
+   kCraftRefusedNotRecipe - the product (with its row record) is not in the bench's own recipe list there, as its window lists it */
+const unsigned char kCraftAccepted = 0, kCraftRefusedNotWriter = 1, kCraftRefusedNoBench = 2, kCraftRefusedNoRecord = 3,
+                    kCraftRefusedNotAllowed = 4, kCraftRefusedFault = 5, kCraftRefusedListChanged = 6, kCraftRefusedNotRecipe = 7,
+                    kCraftVerdictMax = 7;
+const unsigned int  kCraftAskLapseMs = 10000; /* an ask unanswered this long has lapsed (the writer answers within one drain) */
+const unsigned int  kCraftAskCap = 32;        /* asks waiting for an answer here; and asks waiting at the writer */
 const unsigned char kFlagOn = 1, kFlagGets = 2;
 const unsigned int  kPowerMaxKey = 63;
 const unsigned int  kPowerMaxStocks = 16;    /* a piece's input records; a bigger message is refused, never truncated */
@@ -49,7 +73,12 @@ struct PowerMsg
     std::vector<float> stock;
     unsigned char what;         /* POWER_ASK */
     float value;
-    PowerMsg() : kind(0), on(0), gets(0), battery(0.0f), what(0), value(0.0f) {}
+    unsigned int seq;           /* T-1192 CRAFT_ASK / CRAFT_ANSWER: the asker's number for the ask */
+    std::string sid, extra;     /* CRAFT_ASK: the product's and the row record's ids */
+    unsigned char mode, verdict;   /* CRAFT_ASK's mode (kCraftOpRepeat: the repeat wanted); CRAFT_ANSWER's verdict */
+    unsigned char op;           /* CRAFT_ASK: kCraftOp* */
+    unsigned int index;         /* CRAFT_ASK kCraftOpRemove: the entry's place in the list */
+    PowerMsg() : kind(0), on(0), gets(0), battery(0.0f), what(0), value(0.0f), seq(0), mode(0), verdict(0), op(0), index(0) {}
 };
 
 /* MSG_BUILD's kind byte: 1 = a power kind (decoded here), 0 = not */
@@ -57,10 +86,18 @@ inline int IsPowerKind(const char* p, size_t size)
 {
     if (p == 0 || size < 1) return 0;
     const unsigned char k = (unsigned char)p[0];
-    return (k == kPowerState || k == kPowerAsk) ? 1 : 0;
+    return (k == kPowerState || k == kPowerAsk || k == kCraftAsk || k == kCraftAnswer) ? 1 : 0;
 }
 
 inline bool PowerValueOk(float v) { return v == v && v >= 0.0f && v <= kPowerValueLimit; }
+/* T-1192 review fold: a CRAFT_ASK's fields in range for its op (the wire comment above) */
+inline bool CraftAskShapeOk(unsigned int op, size_t sidLen, size_t extraLen, unsigned int mode, unsigned int index)
+{
+    if (op == kCraftOpAdd) return sidLen >= 1 && sidLen <= kCraftSidMax && extraLen <= kCraftSidMax && mode <= kCraftModeMax && index == 0;
+    if (op == kCraftOpRemove) return sidLen >= 1 && sidLen <= kCraftSidMax && extraLen <= kCraftSidMax && mode == 0 && index <= kCraftIndexMax;
+    if (op == kCraftOpRepeat) return sidLen == 0 && extraLen == 0 && mode <= 1 && index == 0;
+    return false;
+}
 
 inline bool PowerEncodable(const PowerMsg& m)
 {
@@ -72,6 +109,8 @@ inline bool PowerEncodable(const PowerMsg& m)
         return true;
     }
     if (m.kind == kPowerAsk) return m.what == kAskSwitch && (m.value == 0.0f || m.value == 1.0f);
+    if (m.kind == kCraftAsk) return CraftAskShapeOk(m.op, m.sid.size(), m.extra.size(), m.mode, m.index);
+    if (m.kind == kCraftAnswer) return m.verdict <= kCraftVerdictMax;
     return false;
 }
 
@@ -86,6 +125,17 @@ inline bool EncodePower(std::vector<char>* b, const PowerMsg& m)
     b->push_back((char)(unsigned char)m.key.size());
     b->insert(b->end(), m.key.begin(), m.key.end());
     if (m.kind == kPowerAsk) { b->push_back((char)m.what); PowerPutF(b, m.value); return true; }
+    if (m.kind == kCraftAsk || m.kind == kCraftAnswer)
+    {   /* T-1192 */
+        char t[4]; std::memcpy(t, &m.seq, 4); b->insert(b->end(), t, t + 4);
+        if (m.kind == kCraftAnswer) { b->push_back((char)m.verdict); return true; }
+        b->push_back((char)m.op);
+        b->push_back((char)(unsigned char)m.sid.size()); b->insert(b->end(), m.sid.begin(), m.sid.end());
+        b->push_back((char)(unsigned char)m.extra.size()); b->insert(b->end(), m.extra.begin(), m.extra.end());
+        b->push_back((char)m.mode);
+        std::memcpy(t, &m.index, 4); b->insert(b->end(), t, t + 4);
+        return true;
+    }
     b->push_back((char)(unsigned char)((m.on != 0 ? kFlagOn : 0) | (m.gets != 0 ? kFlagGets : 0)));
     PowerPutF(b, m.battery);
     b->push_back((char)(unsigned char)m.stock.size());
@@ -105,6 +155,38 @@ inline int DecodePower(const char* p, size_t size, PowerMsg* out)
     if (kl == 0 || kl > kPowerMaxKey) return kPowerDecodeBadKey;
     if (size - off < kl) return kPowerDecodeTooShort;
     m.key.assign(p + off, kl); off += kl;
+    if (m.kind == kCraftAsk || m.kind == kCraftAnswer)
+    {   /* T-1192: exactly one ask or answer */
+        if (size - off < 4) return kPowerDecodeTooShort;
+        std::memcpy(&m.seq, p + off, 4); off += 4;
+        if (m.kind == kCraftAnswer)
+        {
+            if (size - off < 1) return kPowerDecodeTooShort;
+            if (size - off > 1) return kPowerDecodeBadValue;
+            m.verdict = (unsigned char)p[off];
+            if (m.verdict > kCraftVerdictMax) return kPowerDecodeBadValue;
+            *out = m;
+            return kPowerDecodeOk;
+        }
+        if (size - off < 1) return kPowerDecodeTooShort;
+        m.op = (unsigned char)p[off]; ++off;
+        if (m.op > kCraftOpMax) return kPowerDecodeBadValue;
+        for (int part = 0; part < 2; ++part)
+        {
+            if (size - off < 1) return kPowerDecodeTooShort;
+            const unsigned int n = (unsigned char)p[off]; ++off;
+            if (n > kCraftSidMax) return kPowerDecodeBadValue;
+            if (size - off < n) return kPowerDecodeTooShort;
+            (part == 0 ? m.sid : m.extra).assign(p + off, n); off += n;
+        }
+        if (size - off < 5) return kPowerDecodeTooShort;
+        if (size - off > 5) return kPowerDecodeBadValue;
+        m.mode = (unsigned char)p[off]; ++off;
+        std::memcpy(&m.index, p + off, 4);
+        if (!CraftAskShapeOk(m.op, m.sid.size(), m.extra.size(), m.mode, m.index)) return kPowerDecodeBadValue;
+        *out = m;
+        return kPowerDecodeOk;
+    }
     if (m.kind == kPowerAsk)
     {
         if (size - off < 5) return kPowerDecodeTooShort;
@@ -132,6 +214,87 @@ inline int DecodePower(const char* p, size_t size, PowerMsg* out)
     }
     *out = m;
     return kPowerDecodeOk;
+}
+
+/* T-1192: WHERE THE CRAFTING WINDOW'S ADD GOES on the game it was clicked on. A lone game (single) and the bench's writer add it there
+   (kCraftRouteRun); a game another game writes the bench for asks that game (kCraftRouteAsk); with no writer named nothing is added and
+   nothing asked (kCraftRouteNone - the click ends there, said in the log). writer: coopfarm::kProdWriterHere / Other / None (1 / 2 / 0). */
+const int kCraftRouteRun = 0, kCraftRouteAsk = 1, kCraftRouteNone = 2;
+inline int CraftClickRoute(int single, int writer)
+{
+    if (single != 0 || writer == 1) return kCraftRouteRun;
+    return writer == 2 ? kCraftRouteAsk : kCraftRouteNone;
+}
+/* T-1192: the writer's verdict on a CRAFT_ASK: it writes the bench, the bench is here and is a crafting bench, the product's record (and a
+   row record named) exists here, and the asker is the bench owner's game or a teammate's (POWER_ASK's rule) */
+inline unsigned char CraftAskVerdict(int writerHere, int benchHere, int recordsHere, int askerOk)
+{
+    if (writerHere == 0) return kCraftRefusedNotWriter;
+    if (benchHere == 0) return kCraftRefusedNoBench;
+    if (askerOk == 0) return kCraftRefusedNotAllowed;
+    if (recordsHere == 0) return kCraftRefusedNoRecord;
+    return kCraftAccepted;
+}
+/* T-1192: an answer ends the asker's ask only when it names a waiting ask's number and comes from the slot it was asked of */
+inline int CraftAnswerMatches(int waiting, unsigned int askSeq, int askSlot, unsigned int seq, int fromSlot)
+{
+    return (waiting != 0 && askSeq == seq && askSlot >= 0 && askSlot == fromSlot) ? 1 : 0;
+}
+inline int CraftAskLapsed(unsigned int ageMs) { return ageMs >= kCraftAskLapseMs ? 1 : 0; }
+/* T-1192 review fold: WHAT THE WRITER'S SERVE OF AN ACCEPTED ASK ENDED IN (items.cpp CraftAskServe) as the answer's verdict */
+const int kCraftServeNoBench = 0, kCraftServeDone = 1, kCraftServeNoRecord = 2, kCraftServeNotRecipe = 3, kCraftServeListChanged = 4,
+          kCraftServeFault = -1;
+inline unsigned char CraftServeVerdict(int served)
+{
+    switch (served)
+    {
+    case kCraftServeDone:        return kCraftAccepted;
+    case kCraftServeNoBench:     return kCraftRefusedNoBench;
+    case kCraftServeNoRecord:    return kCraftRefusedNoRecord;
+    case kCraftServeNotRecipe:   return kCraftRefusedNotRecipe;
+    case kCraftServeListChanged: return kCraftRefusedListChanged;
+    default:                     return kCraftRefusedFault;
+    }
+}
+/* T-1192 review fold: 1 = an ask like this one already waits for its answer here (the same bench key and op; for an add the same
+   product, for a removal the same product at the same place; any repeat ask), so a repeated click is not sent again until that ask
+   ends (accepted / refused / lapsed) */
+inline int CraftAskDuplicate(const std::string& waitKey, unsigned int waitOp, const std::string& waitSid, unsigned int waitIndex,
+                             const std::string& key, unsigned int op, const std::string& sid, unsigned int index)
+{
+    if (waitKey != key || waitOp != op) return 0;
+    if (op == kCraftOpRepeat) return 1;
+    if (waitSid != sid) return 0;
+    return (op != kCraftOpRemove || waitIndex == index) ? 1 : 0;
+}
+/* T-1192 review fold (finding 4): the writer adds a product only when the bench's own recipe list - the pairs (product, row record) its
+   window lists, read through the engine's own 0x2BBCE0 - holds that exact pair. read = 1 when the list was read; hits = pairs matched */
+inline int CraftRecipeAllowed(int read, int hits) { return (read != 0 && hits > 0) ? 1 : 0; }
+/* T-1192 crash T1884: A COPY'S CURRENT-ORDER SLOT (bench +0x448, its first float the progress) against its list (count +0x4B8). The
+   engine's window update (vt+0x598, 1.0.68 0x2B6110) reads the list's entry 0 unchecked when the slot is set with progress < 1.0, so a slot
+   left so over an empty list reads nothing (the crash). The engine never leaves it: a finished order sets the slot's progress 1.0 (0x2BCA80)
+   and its next update frees the slot. Leave: as it is. Close: write progress 1.0 (the engine's finished state; vt+0x598 takes its no-order
+   path). Set: hand entry 0 to setProductionItem (a different record, no slot, or a closed slot over a list filled again) */
+const int kCraftSlotLeave = 0, kCraftSlotClose = 1, kCraftSlotSet = 2;
+inline int CraftSlotPlan(int slotSet, float slotProg, long long listCount, int sameRecord)
+{
+    if (listCount <= 0) return (slotSet != 0 && slotProg < 1.0f) ? kCraftSlotClose : kCraftSlotLeave;
+    return (slotSet != 0 && sameRecord != 0 && slotProg < 1.0f) ? kCraftSlotLeave : kCraftSlotSet;
+}
+inline const char* CraftVerdictWhy(unsigned char v)
+{
+    switch (v)
+    {
+    case kCraftAccepted:          return "accepted";
+    case kCraftRefusedNotWriter:  return "refused: that game does not write the bench";
+    case kCraftRefusedNoBench:    return "refused: no crafting bench at that key there";
+    case kCraftRefusedNoRecord:   return "refused: the product's or row's record is not there";
+    case kCraftRefusedNotAllowed: return "refused: the asker is not the bench owner's game or a teammate's";
+    case kCraftRefusedFault:      return "refused: the change faulted there";
+    case kCraftRefusedListChanged: return "refused: the writer's entry at that place is another (its list changed first)";
+    case kCraftRefusedNotRecipe:  return "refused: the product is not in that bench's recipe list there";
+    default:                      return "?";
+    }
 }
 
 /* the writer's send rule for one piece: the first look, a switch or gets-battery change, or countDiffers (a change in the number

@@ -106,6 +106,7 @@
 #include "fallentab.h"       // FallenTabCommand - `resurrect tab ...`
 #include "../common/nametag.h"
 #include "../common/fallenwire.h"
+#include "../common/admintool.h"   // FallenPick - /revive's row by name (the world server counts by the same rule)
 #include "../common/resurrectfee.h"
 #include "../common/statswire.h"
 #include <Windows.h>
@@ -1218,15 +1219,18 @@ void ResurrectOptionsMapEnd(bool complete)
 // THE BRING-BACK ROAD (the TEST lever's `resurrect <n> ...` and the FALLEN tab): row n of this game's copy comes back beside the
 // character besideUid, or else the first living member of this player's squad `want`. src names the caller in the log lines
 // ("TEST" for the lever). expectPrice >= 0: refused when the price read now differs. *out: the result the tab shows.
+// adminJob 1: an admin's /revive (ResurrectAdminRevive only) - free, and the host's resurrection option does not refuse it
+// (fallentab.h OffRefuses, PriceToPay; owner 1394, 1398).
 static std::string BringBack(const char* src, const std::string& args, int n, int want, unsigned int besideUid, long long expectPrice, BringBackOut* out,
-                             int here = 0)   /* 1: the camera road */
+                             int here = 0,       /* 1: the camera road */
+                             int adminJob = 0)
 {
     *out = BringBackOut();
-    if (n >= 0 && n < (int)g_list.size()) out->name = g_list[(size_t)n].name.empty() ? g_list[(size_t)n].templateName : g_list[(size_t)n].name;
+    if (n >= 0 && n < (int)g_list.size()) out->name = swfallen::FallenName(g_list[(size_t)n]);
     const std::string tag = std::string("bring-back (") + src + ") ";
     int ref = swtab::kRefNone;
     const char* why = 0;
-    if (!g_optOn) { why = "resurrection is off in the host options"; ref = swtab::kRefOff; ++g_feeRefusedOff; }
+    if (swtab::OffRefuses(g_optOn, adminJob)) { why = "resurrection is off in the host options"; ref = swtab::kRefOff; ++g_feeRefusedOff; }
     else if (EngineWritesBlocked()) { why = "the world is loading or closing"; ref = swtab::kRefNoWorld; }
     else if (StoreWelcomedThisLink() == 0) { why = "no world-server link (the list and the bring-back are the world server's)"; ref = swtab::kRefNoWorld; }
     else if (n < 0 || n >= (int)g_list.size()) { why = "no such entry on the fallen list"; ref = swtab::kRefFailed; }
@@ -1338,6 +1342,7 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     {
         cnt = AliveNow();
         fee = swfee::PriceFor(g_optAmount, g_optGrowth, cnt.alive);
+        fee.price = swtab::PriceToPay(fee.price, adminJob);   /* an admin's /revive: nothing is taken */
         g_feeLast = cnt; g_feeLastPrice = fee.price;
         purse = PursePod();
         moneyRead = PurseMoneyPod(purse, &moneyBefore);
@@ -1527,6 +1532,7 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
         + " | TAKE (new serial " + N(newSerial) + ") " + (takeSent ? "sent to the world server - final once this game's save has it" : "NOT sent (no link) - sent when the link is up")
         + " list=" + N((long long)g_list.size()) + uniqueWords
         + " | fee " + FeeWords(fee, cnt) + " money " + N(moneyBefore) + " -> " + N(moneyAfter)
+        + (adminJob ? std::string(" | an admin's /revive: free, the host's resurrection option not applied") : std::string())
         + (inCam ? " | CAMERA ROAD: at the spot " + F1(pos.x) + "," + F1(pos.y) + "," + F1(pos.z) + " (terrain height " + F1(pos.y)
                    + "; no water level is read) " + spotDetail + " in a new squad " + X(squad) + camDropped : std::string());
     if (inCam) ++g_camBack;
@@ -1691,11 +1697,58 @@ BringBackOut ResurrectBringBackHere(unsigned int deadUid, long long expectPrice)
     return out;
 }
 
+int ResurrectAdminRevive(const std::string& name, BringBackOut* out)
+{
+    *out = BringBackOut();
+    std::vector<std::string> names;
+    for (size_t i = 0; i < g_list.size(); ++i) names.push_back(swfallen::FallenName(g_list[i]));
+    const int n = admintool::FallenPick(names, name);
+    if (n < 0)
+    {
+        DebugLog("[FALLEN] bring-back (admin) /revive: no row of that name on this game's copy of the list (" + N((long long)g_list.size()) + " row(s))");
+        return 0;
+    }
+    const unsigned int deadUid = g_list[(size_t)n].uid;
+    out->name = names[(size_t)n];
+    std::vector<FallenMate> mates;
+    ResurrectFreeMates(&mates);
+    std::vector<int> selected;
+    for (size_t i = 0; i < mates.size(); ++i) selected.push_back(mates[i].selected);
+    const std::vector<int> order = swtab::AdminMateOrder(selected);
+    if (order.empty())
+    {
+        out->refusal = swtab::kRefNoMate;
+        DebugLog("[FALLEN] bring-back (admin) /revive row uid=" + N(deadUid) + " refused: no free living character of this player to come back beside | tab words: noMate");
+        return 1;
+    }
+    for (size_t k = 0; k < order.size(); ++k)
+    {
+        const FallenMate& m = mates[(size_t)order[k]];
+        int row = -1;   /* a refused try leaves the list as it was; looked up again all the same */
+        for (size_t i = 0; i < g_list.size(); ++i) if (g_list[i].uid == deadUid) { row = (int)i; break; }
+        if (row < 0) { const std::string keep = out->name; *out = BringBackOut(); out->name = keep; out->refusal = swtab::kRefFailed; break; }
+        BringBack("admin", "/revive row uid=" + N(deadUid) + " beside " + N(m.uid) + " (squadmate " + N((long long)k + 1) + " of " + N((long long)order.size()) + ")",
+                  row, -1, m.uid, -1, out, 0, 1);
+        if (out->ok || !swtab::NextMateAfter(out->refusal)) break;
+    }
+    return 1;
+}
+
 int ResurrectCameraRoadOffered()
 {
     std::vector<swfallen::SquadRow> rows; std::vector< ::Character*> chars; int alive = 0, dead = 0;
     OwnFactionRows(&rows, &chars, &alive, &dead);
     return swtab::CameraRoadOffered(alive);
+}
+
+/* T-1135 review fold 1 (hire.cpp GiveTakeAll): this game's own living characters of its player faction (OwnFactionRows - the count
+   BRING BACK judges the limit by) and the game's character limit as the engine's recruit reads it (CharacterLimitPod; the TEST cap is
+   BRING BACK's own and is not applied). 1 the limit read, 0 not. MAIN THREAD. */
+int OwnLivingAndLimit(int* alive, int* limit)
+{
+    std::vector<swfallen::SquadRow> rows; std::vector< ::Character*> chars; int dead = 0;
+    OwnFactionRows(&rows, &chars, alive, &dead);
+    return CharacterLimitPod(limit);
 }
 
 void ResurrectTabRead(FallenTabRead* out)

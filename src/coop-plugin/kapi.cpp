@@ -1,5 +1,6 @@
 /* kapi.cpp - per-race rules, plugin side. See kapi.h and src/common/kapirules.h. Ported from the third public pull request
-   (author: MassDivide), reworked: the rules travel as the world's race.* options, the hooks sit on address-table rows.
+   (author: MassDivide), reworked: the rules travel as the world's race.* options, the hooks sit on address-table rows. T-1209 (owner
+   1414 d): the world's rows come from the world's own kenshi_api.cfg (the world server reads it); no game sends race rows.
 
    THE HOOKS (installed at start, whatever the rules say; each acts only for a race the active rules name):
      InventorySection::isLimitedSlotCompatible (row InventorySection_isLimitedSlotCompatible) - block_slot and
@@ -28,7 +29,7 @@
 #include "command_channel.h"    /* PathNextToDll */
 #include "u8file.h"             /* U8fopen: the DLL's folder may hold non-ANSI letters */
 #include "hooks.h"              /* AddHook */
-#include "store.h"              /* StoreSendOptions, StoreIsWorldAuthority, StoreLinkGen */
+#include "store.h"              /* StoreLinkGen, StoreWelcomedThisLink, StoreLinkIsUp */
 #include "config.h"             /* RoleIsSingle */
 
 class Character;
@@ -36,8 +37,6 @@ namespace coop
 {
     int KapiSectionOwner(void* sec, void** character, char* name, size_t cap);   /* items.cpp */
     int KapiRaceSidOf(::Character* c, char* out, int cap);                        /* appearance.cpp */
-    bool SettingsRulesAuthority();                                                /* settings.cpp: this game's values are the world's rules */
-    bool SettingsKeepsRecord();                                                   /* settings.cpp: a rule-setter that joined following the world's record keeps it */
 }
 
 namespace
@@ -64,14 +63,9 @@ namespace
 
     kapi::Rows  g_mapRows;                  /* MAIN THREAD: the race.* rows of the map being read */
     long long   g_mapBadRows = 0;
-    /* T-1157 review fold: the world's rules belong to the link they came on, and the authority compares with that link's map */
+    /* T-1157 review fold: the world's rules belong to the link they came on */
     int         g_activeGen = -1;           /* MAIN THREAD: the link generation a world set (kSrcWorld) was taken on */
-    kapi::Rows  g_worldRows;                /* MAIN THREAD: the race.* rows of the last COMPLETE options map */
-    int         g_worldRowsGen = -1;        /* MAIN THREAD: the link generation g_worldRows came on; -1 = none yet */
-    kapi::AskBound g_ask;                   /* MAIN THREAD: the authority's resend bound, for link g_askGen */
-    int         g_askGen = -1, g_askHeldSaidGen = -1, g_matchSaidGen = -1;
-    int         g_authGen = -1, g_authWas = 0;   /* MAIN THREAD: the authority bit last seen, and the link it was seen on */
-    long long   g_sends = 0, g_sendFails = 0, g_resends = 0, g_sendsHeld = 0, g_authChanges = 0, g_worldDropped = 0;
+    long long   g_worldDropped = 0;
 
     int g_slotHookOn = 0, g_xpHookOn = 0, g_taskHookOn = 0;
     volatile LONG64 g_slotRefused[kapi::kSlotCount];
@@ -106,6 +100,7 @@ namespace
             DebugLog("[KAPI] rule applied: race " + kapi::Rules::Describe(next->RaceAt(i)));
     }
 
+    /* this game's own file: solo play's rules, and the file HOST hands the world server (--host-rules, ui.cpp) for a NEW world */
     void LoadOwnFile()
     {
         const std::string path = coop::PathNextToDll(kRulesFile);
@@ -347,61 +342,6 @@ namespace
         return 1;
     }
 
-    /* MAIN THREAD, on the authority: the world's race rows are made this game's file's rows. T-1157 review fold: asked at every
-       COMPLETE options map and at the world server's AUTH, against THIS link's last complete map, so rows the world did not
-       store (a refused write, a row the deferred merge brought back, the 32-row limit) are asked for again - within
-       kapi::AskBound, so the same request is never sent in a loop. The authority is the world's operator (decision 49:
-       the person in the world server's owner.txt); a change of the bit within a link is logged here. */
-    void AuthoritySend(const char* why)
-    {
-        const int gen = coop::StoreLinkGen();
-        const int auth = coop::SettingsRulesAuthority() ? 1 : 0;   /* the rule-setter: an admin now (the owner's own game, or logged in), never the steward flag alone */
-        if (gen != g_authGen) { g_authGen = gen; g_authWas = auth; }
-        else if (auth != g_authWas)
-        {
-            g_authWas = auth;
-            ++g_authChanges;
-            DebugLog(std::string("[KAPI] this game ") + (auth != 0 ? "now sets" : "no longer sets")
-                     + " the world's rules on this link (" + why + ") - the world's race rows now come from "
-                     + (auth != 0 ? std::string("this game's ") + kRulesFile : std::string("the rule-setter's game")));
-        }
-        if (auth == 0 || g_worldRowsGen != gen) return;   /* only against THIS link's complete map */
-        if (coop::SettingsKeepsRecord()) return;   /* a rule-setter that joined following the world's record keeps the world's race rows: its own file is not pushed over them */
-        if (g_askGen != gen) { g_askGen = gen; g_ask.Reset(); }
-        const kapi::Rows send = kapi::RowsToSend(g_worldRows, g_ownRows);
-        if (send.empty())
-        {
-            if (g_matchSaidGen != gen)
-            {
-                g_matchSaidGen = gen;
-                DebugLog(std::string("[KAPI] authority: the world's race rules match this game's ") + kRulesFile + " (" + why + ") - nothing sent");
-            }
-            return;
-        }
-        const std::string ask = kapi::RowsText(g_worldRows) + "|" + kapi::RowsText(send);
-        char l[320];
-        if (!g_ask.Allowed(ask))
-        {
-            ++g_sendsHeld;
-            if (g_askHeldSaidGen != gen)
-            {
-                g_askHeldSaidGen = gen;
-                _snprintf_s(l, sizeof(l), _TRUNCATE, "[KAPI] authority: the world's race rows still differ from %s after %d request(s) on this link"
-                            " - NOT asked again until the next link (the world server refused or did not store them; its log says which)",
-                            kRulesFile, g_ask.asks);
-                ErrorLog(l);
-            }
-            return;
-        }
-        int removals = 0;
-        for (size_t i = 0; i < send.size(); ++i) if (send[i].second.empty()) ++removals;
-        const bool ok = coop::StoreSendOptions(send);
-        if (ok) { if (g_ask.asks > 0) ++g_resends; g_ask.Sent(ask); ++g_sends; g_matchSaidGen = -1; } else ++g_sendFails;
-        _snprintf_s(l, sizeof(l), _TRUNCATE, "[KAPI] authority: %s %d race row(s) of %s to the world (%d set, %d removed; %s; request %d on this link)%s",
-                    ok ? "sent" : "could NOT send", (int)send.size(), kRulesFile, (int)send.size() - removals, removals, why, g_ask.asks,
-                    ok ? " - every game applies them from the map the world server sends back" : " - tried again at the next options map");
-        if (ok) DebugLog(l); else ErrorLog(l);
-    }
 }
 
 namespace coop
@@ -444,15 +384,9 @@ namespace coop
     void KapiOptionsMapEnd(bool complete)
     {
         if (!complete) return;
-        const int gen = StoreLinkGen();
-        g_worldRows = g_mapRows;
-        g_worldRowsGen = gen;
         ApplyRows(g_mapRows, kSrcWorld, "the world's options map");
-        g_activeGen = gen;   /* this set is this link's: a world load not on this welcomed link drops it (KapiWorldLoadBegan) */
-        AuthoritySend("an options map");
+        g_activeGen = StoreLinkGen();   /* this set is this link's: a world load not on this welcomed link drops it (KapiWorldLoadBegan) */
     }
-
-    void KapiAuthorityChanged(const char* why) { AuthoritySend(why); }
 
     /* T-1157 review fold: a world set is kept only for a load on the welcomed link it came on. Any other load (another
        world, or no link) starts with no rules; the E38 load gate, which runs after this, pumps the link and the new world's
@@ -475,15 +409,15 @@ namespace coop
         char l[768];
         _snprintf_s(l, sizeof(l), _TRUNCATE,
                     "[KAPI] REPORT source=%s races=%d hooks[slot,xp,task]=%d,%d,%d refused[weapon,armour,pants,shirt,boots,helmet,backpack,belt]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
-                    " refusedNoWeapon=%lld xpScaled=%lld taskScaled=%lld xpSkipped=%lld applies=%lld fileRead=%d fileRows=%d mapBadRows=%lld sends=%lld sendFails=%lld"
-                    " copyLeft=%lld ownerUnread[slot,xp]=%lld,%lld raceUnread[slot,xp]=%lld,%lld resends=%lld sendsHeld=%lld authChanges=%lld worldDropped=%lld",
+                    " refusedNoWeapon=%lld xpScaled=%lld taskScaled=%lld xpSkipped=%lld applies=%lld fileRead=%d fileRows=%d mapBadRows=%lld"
+                    " copyLeft=%lld ownerUnread[slot,xp]=%lld,%lld raceUnread[slot,xp]=%lld,%lld worldDropped=%lld",
                     SrcName(g_activeSrc), rules != 0 ? rules->RaceCount() : 0, g_slotHookOn, g_xpHookOn, g_taskHookOn,
                     (long long)g_slotRefused[0], (long long)g_slotRefused[1], (long long)g_slotRefused[2], (long long)g_slotRefused[3],
                     (long long)g_slotRefused[4], (long long)g_slotRefused[5], (long long)g_slotRefused[6], (long long)g_slotRefused[7],
                     (long long)g_slotRefusedNoWeapon, (long long)g_xpScaled, (long long)g_taskScaled, (long long)g_xpSkipped, g_applies,
-                    g_ownRead, (int)g_ownRows.size(), g_mapBadRows, g_sends, g_sendFails,
+                    g_ownRead, (int)g_ownRows.size(), g_mapBadRows,
                     (long long)g_slotCopy, (long long)g_slotOwnerUnread, (long long)g_xpOwnerUnread, (long long)g_slotRaceUnread,
-                    (long long)g_xpRaceUnread, g_resends, g_sendsHeld, g_authChanges, g_worldDropped);
+                    (long long)g_xpRaceUnread, g_worldDropped);
         DebugLog(l);
     }
 }

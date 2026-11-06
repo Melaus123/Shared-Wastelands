@@ -254,6 +254,106 @@ float EffectiveSpeedFrom(const std::vector<void*>& order,
     }
 }
 
+int TimeModeOfWire(const char* wire)
+{
+    if (wire == 0) return -1;
+    if (std::strcmp(wire, "fixed") == 0) return kTimeModeAdmin;
+    if (std::strcmp(wire, "consensus") == 0) return kTimeModeSlowest;
+    if (std::strcmp(wire, "vote") == 0) return kTimeModeAgree;
+    if (std::strcmp(wire, "locked") == 0) return kTimeModeNormal;
+    return -1;
+}
+
+const char* TimeModeWire(int mode)
+{
+    if (mode == kTimeModeAdmin) return "fixed";
+    if (mode == kTimeModeSlowest) return "consensus";
+    if (mode == kTimeModeAgree) return "vote";
+    if (mode == kTimeModeNormal) return "locked";
+    return "";
+}
+
+static int SpeedListHas(const std::vector<void*>& list, void* p)
+{
+    for (std::size_t i = 0; i < list.size(); ++i) if (list[i] == p) return 1;
+    return 0;
+}
+
+float WorldSpeedFor(int mode, const std::vector<void*>& inWorld, const std::vector<void*>& admins,
+                    const std::map<void*, float>& votes, const std::map<void*, long long>& voteSeq, float lastRealSpeed)
+{
+    /* nobody in the world: the clock holds (the caller's own test) and the published speed stays the last real one */
+    if (inWorld.empty()) return lastRealSpeed;
+    if (mode == kTimeModeSlowest) return EffectiveSpeedFrom(inWorld, votes, 1, lastRealSpeed);
+    /* owner 1351 a: PAUSE IS A SPEED. Normal speed only has one speed, so nobody can pause it; under Everyone agrees a pause is
+       compared like any other choice, so the world pauses only when every game in it paused. */
+    if (mode == kTimeModeNormal) return 1.0f;
+    if (mode == kTimeModeAgree)
+    {
+        float agreed = -1.0f;
+        int same = 1;
+        for (std::size_t i = 0; i < inWorld.size(); ++i)
+        {
+            std::map<void*, float>::const_iterator it = votes.find(inWorld[i]);
+            const float v = (it == votes.end()) ? 1.0f : it->second;   /* a game that never chose is at 1x */
+            if (agreed < 0.0f) agreed = v;
+            else if (v != agreed) same = 0;
+        }
+        if (!same || agreed < 0.0f) return 1.0f;
+        return agreed;
+    }
+    /* Admin only (and a byte no mode has, which the world server never stores): the latest choice an admin in the world made
+       while an admin */
+    {
+        float speed = 1.0f;
+        long long latest = 0;
+        int found = 0;
+        for (std::size_t i = 0; i < inWorld.size(); ++i)
+        {
+            void* const p = inWorld[i];
+            if (!SpeedListHas(admins, p)) continue;
+            std::map<void*, float>::const_iterator vit = votes.find(p);
+            if (vit == votes.end()) continue;
+            std::map<void*, long long>::const_iterator sit = voteSeq.find(p);
+            if (sit == voteSeq.end()) continue;   /* no choice made while an admin: the world server keeps voteSeq only for an admin's press */
+            const long long at = sit->second;
+            if (!found || at > latest) { found = 1; latest = at; speed = vit->second; }
+        }
+        return speed;
+    }
+}
+
+int TimeModePressCounts(int mode, int adminNow, float speed)
+{
+    (void)speed;   /* owner 1351 a: a pause is answered like any speed in every mode, so the value no longer decides */
+    if (mode == kTimeModeSlowest || mode == kTimeModeAgree) return 1;
+    if (mode == kTimeModeNormal) return 0;   /* one speed, pause included: no press moves it */
+    if (mode == kTimeModeAdmin) return adminNow ? 1 : 0;
+    return 0;
+}
+
+int SpeedPressAnswer(float chosen, float worldSpeed, long long clocksSinceSend)
+{
+    if (clocksSinceSend < 1) return kSpeedPressWait;
+    if (std::fabs(chosen - worldSpeed) < 0.001f) return kSpeedPressTaken;
+    return (clocksSinceSend >= 2) ? kSpeedPressNotTaken : kSpeedPressWait;
+}
+
+const char* SpeedNotTakenLine(int mode)
+{
+    if (mode == kTimeModeAdmin) return "Only an admin can change the game speed.";
+    if (mode == kTimeModeNormal) return "This world always runs at normal speed.";
+    if (mode == kTimeModeAgree) return "The speed changes when every player picks the same one.";
+    if (mode == kTimeModeSlowest) return "The slowest speed picked is used.";
+    return "";
+}
+
+int SpeedLineDue(int saidBefore, unsigned int lastSaidMs, unsigned int nowMs)
+{
+    if (!saidBefore) return 1;
+    return (nowMs - lastSaidMs >= kSpeedLineGapMs) ? 1 : 0;
+}
+
 int DialoguePauseLetThrough(int site, int linked, int* suppressed)
 {
     if (suppressed == 0) return 1;
@@ -268,6 +368,69 @@ int DialoguePauseLetThrough(int site, int linked, int* suppressed)
         return 1;
     }
     return 1;
+}
+
+int MenuPauseDecide(int site, int linked, int inWorld, int mode, MenuPauseState* st)
+{
+    if (st == 0) return kMenuPass;
+    if (site == kMenuSiteMenuOpen || site == kMenuSiteBuildEnter)
+    {
+        int* const mine = (site == kMenuSiteMenuOpen) ? &st->menuSkipped : &st->buildSkipped;
+        if (!linked || !inWorld) { *mine = 0; return kMenuPass; }
+        *mine = 1;
+        if (site == kMenuSiteBuildEnter && mode == kTimeModeSlowest && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
+        return kMenuSkip;
+    }
+    if (site == kMenuSiteMenuClose || site == kMenuSiteBuildLeave)
+    {
+        int* const mine = (site == kMenuSiteMenuClose) ? &st->menuSkipped : &st->buildSkipped;
+        if (*mine == 0) return kMenuPass;
+        *mine = 0;
+        if (site == kMenuSiteBuildLeave && st->voteHeld && st->menuOpen == 0 && st->talkOpen == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
+        return kMenuSkip;
+    }
+    return kMenuPass;
+}
+
+int MenuPauseNoteGameMenu(int open, int linked, int inWorld, int mode, MenuPauseState* st)
+{
+    if (st == 0) return kMenuPass;
+    if (open && linked && inWorld)
+    {
+        st->menuOpen = 1;
+        if (mode == kTimeModeSlowest && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
+        return kMenuPass;
+    }
+    {
+        const int was = st->menuOpen;
+        st->menuOpen = 0;
+        if (was && st->voteHeld && st->buildSkipped == 0 && st->talkOpen == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
+    }
+    return kMenuPass;
+}
+
+int MenuPauseNoteTalkWindow(int open, int linked, int inWorld, int mode, MenuPauseState* st)
+{
+    if (st == 0) return kMenuPass;
+    if (open && linked && inWorld)
+    {
+        if (st->talkOpen) return kMenuPass;   /* polled every frame: only the opening edge votes */
+        st->talkOpen = 1;
+        if (mode == kTimeModeSlowest && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
+        return kMenuPass;
+    }
+    {
+        const int was = st->talkOpen;
+        st->talkOpen = 0;
+        if (was && st->voteHeld && st->buildSkipped == 0 && st->menuOpen == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
+    }
+    return kMenuPass;
+}
+void MenuPauseNotePress(MenuPauseState* st) { if (st != 0) st->voteHeld = 0; }
+void MenuPauseNoteWorldClosed(MenuPauseState* st)
+{
+    if (st == 0) return;
+    st->menuSkipped = 0; st->buildSkipped = 0; st->voteHeld = 0; st->menuOpen = 0; st->talkOpen = 0;
 }
 
 }   /* namespace coopclock */

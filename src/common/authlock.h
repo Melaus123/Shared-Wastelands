@@ -1,8 +1,8 @@
 /* src/common/authlock.h - TOO MANY WRONG PASSWORDS: the world server's per-player wait. PURE: no Windows.h, no clock of its own (every
    call takes `now` in seconds), so the offline suite checks exactly what the world server compiles.
 
-   A player is keyed by its Steam id when the world server believed one (STEAM_ID), by 'host' for the host's own game (it proved
-   HOST_TOKEN), else by the connection's address (none is ever logged). kWrongMax wrong passwords in a row lock that key for kLockSec
+   A player is keyed by its Steam id when the world server believed one (STEAM_ID), by 'bridged' for a Steam connection whose id
+   was not believed, else by the connection's address (none is ever logged). kWrongMax wrong passwords in a row lock that key for kLockSec
    from the last of them; while locked, a password is not even checked. A right password clears the count. The lock ends by itself;
    the count starts again from 0 after it. A count with no lock is forgotten kForgetSec after its last wrong password. */
 #ifndef SW_AUTHLOCK_H

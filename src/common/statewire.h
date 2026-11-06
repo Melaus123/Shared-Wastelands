@@ -13,6 +13,8 @@
  *                                              bit 18 = it was read: WithAim below)
  *                                             (latchBits bits 19-20 = the owner's character reloading its crossbow / bow,
  *                                              bit 20 = it was read: WithReload below)
+ *                                             (latchBits bits 21-22 = the owner's character has god mode (T-1205 /god),
+ *                                              bit 22 = it was carried: WithGod below)
  *     | koTimer f32                             (H029 - optional: absent = -1, "not carried")
  *     | carryingUid u32                         (K1, session protocol 47 - optional: absent = 0, flagged)
  *     | restHas u8 | restX f32 | restY f32 | restZ f32   (R3, session protocol 48 - optional: absent = no rest)
@@ -24,6 +26,11 @@
  *                                             Without hunger a single 0 byte stands in the hunger block's place first,
  *                                             so the block's position never depends on hunger; absent or malformed =
  *                                             not carried, the copy's limbs are left as they are)
+ *     | toolLen u8 | tool bytes                (T-890 WORK TOOL, session 190 - optional: written when the pose names the
+ *                                             work tool the owner's machine job hangs in its hands. Without limbs a
+ *                                             single 0 byte stands in the limb block's place first (after the hunger
+ *                                             block or its own 0 byte), so the tool's position never depends on them;
+ *                                             absent, cut or over kPoseStrMax = no tool)
  *
  * The ACTPOSE block (POSE, read-poses 2026-09-23, user T262) is the owner's IN-PLACE pose: kind 0 none, 1 an action the
  * engine replays every tick (sleep on floor, a seat, machine / crafting work - AnimationClass +0x210 name), 2 bed mode
@@ -70,12 +77,13 @@ struct PoseWire
     char action[kPoseStrMax + 1];      /* NUL-terminated; may be empty (a bed with no action) */
     char bedKey[kPoseStrMax + 1];      /* NUL-terminated; the bed's P7n building key, kind 2 only */
     char outerKey[kPoseStrMax + 1];    /* BED1 (51): NUL-terminated; the key of the building whose layout made the bed, or empty */
+    char tool[kPoseStrMax + 1];        /* T-890 (190): NUL-terminated; the item sid of the work tool the owner's machine job hangs in its hands, or empty */
 };
 
 inline void PoseClear(PoseWire* p)
 {
     if (p == 0) return;
-    p->kind = kPoseNone; p->action[0] = 0; p->bedKey[0] = 0; p->outerKey[0] = 0;
+    p->kind = kPoseNone; p->action[0] = 0; p->bedKey[0] = 0; p->outerKey[0] = 0; p->tool[0] = 0;
 }
 
 inline size_t PoseStrLen(const char* s)
@@ -89,7 +97,41 @@ inline size_t PoseStrLen(const char* s)
 inline bool PoseEqual(const PoseWire& a, const PoseWire& b)
 {
     return a.kind == b.kind && std::strcmp(a.action, b.action) == 0 && std::strcmp(a.bedKey, b.bedKey) == 0
-        && std::strcmp(a.outerKey, b.outerKey) == 0;
+        && std::strcmp(a.outerKey, b.outerKey) == 0 && std::strcmp(a.tool, b.tool) == 0;
+}
+
+/* T-890 WORK TOOL: true = an RTTI type name (".?AV<Class>@@", policy.h PolicyClassNamePod) names the engine's operate-machine
+   task - the job whose start makes its building's "special tool" and keeps it at the task's +0x88 (decomp_35b3d0:75-89). The
+   name is matched whole: another task class's +0x88 is not a tool. */
+inline bool PoseToolTaskClass(const char* rttiName)
+{
+    return rttiName != 0 && std::strcmp(rttiName, ".?AVTask_OperateMachine@@") == 0;
+}
+
+/* T-890 review folds 1-3 (copy side): whether a put-on goes ahead now. ownJobTool = the tool the copy's own operate-machine job
+   holds (1 a tool, 0 none, -1 not read); check = the copy's own pre-check that the job's start asks before it hangs its tool
+   (vtable +0x30: 1 refuses, 0 allows, -1 not read). This mod never hangs its tool beside a job's own (the take-off goes by the
+   slot's name and could not tell the two apart), nor where the job's start would not hang one. Both waits are tried again later. */
+const int kPoseToolGo = 0, kPoseToolWaitJob = 1, kPoseToolWaitRefused = 2;
+inline int PoseToolPutOnGate(int ownJobTool, int check)
+{
+    if (ownJobTool != 0) return kPoseToolWaitJob;
+    if (check != 0) return kPoseToolWaitRefused;
+    return kPoseToolGo;
+}
+
+/* the take-off goes by the slot's name, so it would remove a job's own tool: it is made unless such a tool is seen (an unread
+   field does not stop it - a copy runs no job of its own, and a copy this game takes over has the tool taken off before its AI
+   runs) */
+inline bool PoseToolTakeOffAllowed(int ownJobTool) { return ownJobTool != 1; }
+
+/* review fold 2: the tool hangs on copy c only when c is the address it was hung on AND c's handle ids read now (handNowRead)
+   equal those read then (handSet) - an engine destroy and a later SPAWN can put another copy at the same address */
+inline bool PoseToolSameCopy(const void* on, const void* c, bool handSet, const unsigned int* handThen, int handNowRead,
+                             const unsigned int* handNow)
+{
+    return c != 0 && c == on && handSet && handNowRead != 0 && handThen != 0 && handNow != 0
+        && std::memcmp(handThen, handNow, 5 * sizeof(unsigned int)) == 0;
 }
 
 struct StateMsg
@@ -169,6 +211,19 @@ inline void EncodeState(std::vector<char>* b, unsigned int uid, const float* par
     {
         if (hunger == 0) b->push_back((char)0);
         cooplimb::EncodeLimbs(b, *limbs);
+    }
+    /* T-890 WORK TOOL (190): the pose's work tool after the limb block; without limbs one 0 byte stands in the limb block's
+       place first (and, without hunger too, the hunger block's 0 byte before it). An empty tool writes nothing. */
+    const size_t tl = PoseStrLen(pw->tool);
+    if (tl > 0)
+    {
+        if (limbs == 0)
+        {
+            if (hunger == 0) b->push_back((char)0);
+            b->push_back((char)0);
+        }
+        b->push_back((char)(unsigned char)tl);
+        b->insert(b->end(), pw->tool, pw->tool + tl);
     }
 }
 
@@ -264,7 +319,22 @@ inline int DecodeState(const char* p, size_t size, unsigned int maxParts, unsign
                         size_t l = size;
                         if (m->hungerHas == 1) l = e + 9;
                         else if (size - e >= 1 && p[e] == 0) l = e + 1;
-                        if (l < size && cooplimb::DecodeLimbs(p, size, l, &m->limbs, 0)) m->limbsHas = 1;
+                        size_t le = size;
+                        if (l < size && cooplimb::DecodeLimbs(p, size, l, &m->limbs, &le)) m->limbsHas = 1;
+                        /* T-890 WORK TOOL (190): after a carried limb block, or after the limb block's single 0 byte; a
+                           cut block or a length over kPoseStrMax reads as no tool. */
+                        size_t t = size;
+                        if (m->limbsHas == 1) t = le;
+                        else if (l < size && p[l] == 0) t = l + 1;
+                        if (t < size)
+                        {
+                            const size_t tl = (unsigned char)p[t];
+                            if (tl > 0 && tl <= kPoseStrMax && size - t - 1 >= tl)
+                            {
+                                std::memcpy(m->pose.tool, p + t + 1, tl);
+                                m->pose.tool[tl] = 0;
+                            }
+                        }
                     }
                     else { PoseClear(&m->pose); m->poseAbsent = true; }
                 }
@@ -374,6 +444,25 @@ inline int ReloadCarried(unsigned int latchBits)
 {
     if ((latchBits & kReloadReadBit) == 0) return -1;
     return (latchBits & kReloadBit) != 0 ? 1 : 0;
+}
+/* latchBits bit 21: the owner's character has god mode (T-1205 /god, mockups-t1205.md section 12 - the owning game's memory,
+   medical.cpp's god table); bit 22 (kGodReadBit): carried - clear = not carried, and the copy keeps its last word. Every other
+   game's AI reads it to leave that character alone (peace.cpp). Bits 0-20 are not touched. */
+const unsigned int kGodBit     = 1u << 21;
+const unsigned int kGodReadBit = 1u << 22;
+const unsigned int kGodMask    = kGodBit | kGodReadBit;
+/* latchBits with its god bits replaced: 1 (any positive) god mode on, 0 off, negative = not known (not carried) */
+inline unsigned int WithGod(unsigned int latchBits, int god)
+{
+    const unsigned int b = latchBits & ~kGodMask;
+    if (god < 0) return b;
+    return b | kGodReadBit | (god != 0 ? kGodBit : 0u);
+}
+/* the owner's god mode a STATE carries: 1 on, 0 off, -1 not carried */
+inline int GodCarried(unsigned int latchBits)
+{
+    if ((latchBits & kGodReadBit) == 0) return -1;
+    return (latchBits & kGodBit) != 0 ? 1 : 0;
 }
 /* the copy's side: a copy whose ranged mode was written ON in safe-point pass onPass (0 = none) fires only from a later pass
    passNow - the gun it fires with is the one the engine's ranged update stores after the write. */

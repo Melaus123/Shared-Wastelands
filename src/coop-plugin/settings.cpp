@@ -32,7 +32,7 @@
 #include <utility>
 #include "coop_log.h"
 #include "hooks.h"     /* coop::AddHook (own MinHook) (settings2 S2) */
-#include <mygui/MyGUI_Widget.h>    /* settings3 S3: the "Set by the host." note */
+#include <mygui/MyGUI_Widget.h>    /* settings3 S3: the "Set by the host or an admin." note */
 #include <mygui/MyGUI_TextBox.h>
 #include "../common/gpoptions.h"   /* settings2 S2: the gp.* keys, offsets and ranges - the SAME table the notebook checks */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
@@ -43,6 +43,7 @@
 #include "config.h"  /* settings5 S5: ConfigModFingerprintSalt */
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 #include "admin.h"   /* AdminNow: the rule-setter is an admin now */
+#include "ui.h"      /* T-1055: UiNewGameStartNote - the start name BEGIN committed, for the [WORLD] started line */
 #include "../common/stewardrules.h"   /* KeepsWorldRules: a game made the steward mid-world keeps the world's rules */
 
 namespace coop {
@@ -1073,7 +1074,7 @@ int NgNote(void* mainW, int allLocked, int host)
         MyGUI::TextBox* tb = x != 0 ? x->castType<MyGUI::TextBox>(false) : 0;
         if (tb == 0) return 0;
         if (host) tb->setCaption(MyGUI::UString("Set by the world's game options."));   /* ui2: owner 2026-09-27 wording */
-        else tb->setCaption(MyGUI::UString(allLocked ? "Set by the host." : "Set by the host - changes here won't be used."));
+        else tb->setCaption(MyGUI::UString(allLocked ? "Set by the host or an admin." : "Set by the host - changes here won't be used."));
         tb->setVisible(true);
         return 1;
     }
@@ -1170,6 +1171,7 @@ unsigned long long detour_smNewGame(void* self, void* a2, void* a3, void* a4)
         DebugLog("[SETTINGS] New Game commit: global rewritten from the world (changed=" + I(changed) + ")");
     }
     else DebugLog("[SETTINGS] New Game commit: this game's own advanced options stand (" + why + ")");
+    UiNewGameStartNote();   /* T-1055: the NEW GAME window's start name, read (not changed) for the [WORLD] started line */
     return orig_smNewGame(self, a2, a3, a4);
 }
 
@@ -1190,7 +1192,9 @@ int g_hostChoicesSent = 0;
    MAIN THREAD. */
 std::vector<std::pair<std::string, std::string> > g_hcAwait, g_hcStored;
 std::string g_hcStoredWorld;
-std::map<std::string, std::string> g_worldVals;   /* MAIN THREAD: every value of the OPTIONS map being read (stewardrules.h NoteWorldValue) - what g_hcAwait is checked against */
+std::map<std::string, std::string> g_worldVals;   /* MAIN THREAD: every value of the last complete OPTIONS map that held a record (stewardrules.h NoteWorldValue) - what g_hcAwait is checked against and what GAME OPTIONS in a world shows */
+std::map<std::string, std::string> g_worldValsReading;   /* MAIN THREAD: the OPTIONS map being read; it replaces g_worldVals only when complete and not a refusal */
+long g_worldValsGen = 0;   /* MAIN THREAD: one more each time a complete OPTIONS map replaces the shown values (GAME OPTIONS in a world follows it) */
 volatile LONGLONG g_hcWritten = 0;
 long long g_hcSends = 0;
 
@@ -1282,8 +1286,7 @@ void HostChoicesClear(const char* at)
 
 } // namespace
 
-/* this game's own values are the world's rules (RulesAuthority) - for the other rule senders (kapi.cpp's race rows). MAIN THREAD. */
-bool SettingsRulesAuthority() { return RulesAuthority(); }
+/* a rule-setter that joined following the world's record keeps it (ui.cpp). MAIN THREAD. */
 bool SettingsKeepsRecord() { return KeepsRecord(); }
 bool SettingsFirstHosting() { return FirstHosting(); }
 
@@ -1442,9 +1445,10 @@ void InstallSettings()
     else ErrorLog("[SETTINGS] S2: GameplayOptions::load post-hook NOT installed - the world's advanced options are applied only on OPTIONS arrival and the world-live edge");
 }
 
-void SettingsWorldOptionsBegin() { g_recPending.clear(); g_worldVals.clear(); }
+void SettingsWorldOptionsBegin() { g_recPending.clear(); g_worldValsReading.clear(); }
+long SettingsWorldValuesGen() { return g_worldValsGen; }
 void SettingsWorldOption(const std::string& key, const std::string& value) { g_recPending[key] = value; }
-void SettingsWorldValue(const std::string& key, const std::string& value) { stewardrules::NoteWorldValue(&g_worldVals, key, value); }
+void SettingsWorldValue(const std::string& key, const std::string& value) { stewardrules::NoteWorldValue(&g_worldValsReading, key, value); }
 void SettingsWorldOptionsEnd(bool complete)
 {
     if (!complete) { DebugLog("[SETTINGS] an OPTIONS map was cut short - the world record is left as it was"); return; }
@@ -1459,6 +1463,7 @@ void SettingsWorldOptionsEnd(bool complete)
         return;
     }
     s_refusedEpisode = 0;
+    g_worldVals.swap(g_worldValsReading); ++g_worldValsGen;   /* a refusal or a cut-short map leaves the shown values as they were */
     { RecLock l; g_rec = g_recPending; g_recKnown = 1; }
     if (!g_hcAwait.empty())   /* the HOST screen's rows this world's complete map now holds at those values (any key, not only gp.* / gt.*): stored, so they have gone */
     {
@@ -1593,6 +1598,34 @@ int SettingsHostChoices(const std::vector<std::pair<std::string, std::string> >&
     const int sent = g_hostChoicesSent;
     if (sent && live) HostChoicesClear("Game options screen (world live)");
     return sent;
+}
+
+/* GAME OPTIONS' DONE in a running world (ui.cpp PanelOptDoneInWorld). The rows go in the OPTIONS message the HOST screen's rows use; the
+   world server takes them only from an admin, stores them in rules.txt, says them in every game's chat and sends the stored rules to every
+   game, this one too. Sent now or dropped: nothing is kept for a later send (a held row could undo a newer change by another admin), nothing
+   is written over this game's live values, and the HOST screen's rows waiting to go (g_hostChoices, g_hcAwait) are not touched. */
+int SettingsWorldChange(const std::vector<std::pair<std::string, std::string> >& kv)
+{
+    std::vector<std::pair<std::string, std::string> > keep;
+    std::string what;
+    for (size_t k = 0; k < kv.size(); ++k)
+    {
+        const std::string& key = kv[k].first;
+        const bool gp = key.compare(0, 3, "gp.") == 0, gt = key.compare(0, 3, "gt.") == 0;
+        if ((gp && !coopgp::GpValueOk(key, kv[k].second, 0)) || (gt && !coopgp::GtValueOk(key, kv[k].second))) { ErrorLog("[SETTINGS] GAME OPTIONS in the world: " + key + "='" + kv[k].second + "' is out of range - dropped"); continue; }
+        keep.push_back(kv[k]);
+        what += " " + key + "=" + kv[k].second;
+    }
+    if (keep.empty()) return 0;
+    if (!RulesAuthority())
+    {
+        DebugLog("[SETTINGS] GAME OPTIONS in the world: this game is not an admin now - " + I((long long)keep.size()) + " change(s) dropped, nothing held:" + what);
+        return 0;
+    }
+    const bool ok = StoreSendOptions(keep);
+    DebugLog(std::string("[SETTINGS] GAME OPTIONS in the world: ") + (ok ? "sent " : "could NOT send (no world server link) - dropped, nothing held: ")
+             + I((long long)keep.size()) + " change(s) to the world record:" + what);
+    return ok ? 1 : 0;
 }
 
 int SettingsHostRowsStored(const std::string& worldFolder, std::vector<std::pair<std::string, std::string> >* out)

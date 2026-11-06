@@ -206,6 +206,36 @@ inline int GiveMergeAction(int rowClosed, int isBox, int boxMine, int lineGone, 
     if (room < builtQty) return kMgNoRoom;
     return kMgMerge;
 }
+/* T-932: A GIVE INTO A BOX THIS GAME HOLDS THAT FINDS NO FREE SQUARE. The engine's own add puts a stackable item onto a matching
+   stack; the owner's give placed only on an empty square (ItPlaceRule never merges), so a box whose squares are all taken by a stack of
+   that same item with room refused it (placeFailed) - a hauler at another player's full ore box never filled it. Now the box give
+   merges the whole given quantity onto one matching stack (every field the same, ItGiveSameItem) with room for all of it under the
+   engine's stack limit; the row then names that stack and the units merged, so a REVOKE takes exactly those units back off it.
+   Asked only on the box road and only when no square took the item. kFmMerge: merge; the rest refuse as before (the giver keeps its
+   own copy): kFmPack a pack (never stacked), kFmUnread the built item's fields did not read, kFmNoStack no matching stack, kFmNoRoom
+   no stack with room for every unit (a give is whole or nothing: the giver removes all it gave on a yes). */
+const int kFmMerge = 0, kFmPack = 1, kFmUnread = 2, kFmNoStack = 3, kFmNoRoom = 4;
+inline int GiveFullAction(int isPack, int fieldsRead, int stackFound, int room, int qty)
+{
+    if (isPack != 0) return kFmPack;
+    if (fieldsRead == 0) return kFmUnread;
+    if (stackFound == 0) return kFmNoStack;
+    if (qty <= 0 || room < qty) return kFmNoRoom;
+    return kFmMerge;
+}
+/* T-932: what the engine's merge-add did, read off the target stack's size before and after (readOk 0: a size did not read).
+   kFeMerged: it rose by exactly the given units - the give stands; kFeNone: it did not rise - refused as before, nothing changed;
+   kFeUndo: it rose by part only - those units are taken back off it and the give is refused, so neither game gains or loses a unit;
+   kFeUnknown: unread or any other change - refused (the giver keeps its copy) and logged, never booked as merged. */
+const int kFeMerged = 0, kFeNone = 1, kFeUndo = 2, kFeUnknown = 3;
+inline int GiveFullEnd(int qty, int readOk, int before, int after)
+{
+    if (readOk == 0 || qty <= 0 || before < 0 || after < 0) return kFeUnknown;
+    const int d = after - before;
+    if (d == qty) return kFeMerged;
+    if (d == 0) return kFeNone;
+    return (d > 0 && d < qty) ? kFeUndo : kFeUnknown;
+}
 /* A FAULT INSIDE THE MERGE. removed: the built stack was already out of the box (its removal published) when the fault came; left: the
    units it still holds (-1 unread); placed: the put-back into its square or a free one (1 placed, 0 refused, -1 faulted or not tried).
    kMfNothing: the fault came before the removal - nothing changed; kMfMerged: the stack had already gone into its target (the caller

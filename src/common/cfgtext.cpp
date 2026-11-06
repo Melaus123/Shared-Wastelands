@@ -4,7 +4,9 @@
 #include "names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "worlddir.h"    /* W1w: coopworld::DisplayNameOk - the playername key's one rule */
 #include "areaclaim.h"   /* B13: coopstore::PlayerIdOk - the notebook refuses a malformed id too, so the shape rule lives in ONE place */
+#include "adminauth.h"   /* PasswordOk: the TEST-ONLY ownerpw= takes a login password's one rule */
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace coopcfg {
@@ -160,6 +162,56 @@ bool CfgAddrFieldOk(const std::string& text, const char* what,
     if (addr != 0) *addr = a;
     if (port != 0) *port = p;
     return true;
+}
+
+/* T-793 (decision 960; pull request 4 task 1): JOIN BY ADDRESS's ADDRESS and PORT boxes - see cfgtext.h. */
+const char* const kCfgJoinPortWhy = "Port must be a number from 1 to 65535.";   /* decision 960, word for word */
+
+bool CfgJoinIsSteam(const std::string& addrText)
+{
+    return relaybridge::SplitSteamValue(CfgTrim(addrText), 0, 0);
+}
+
+bool CfgJoinTakePort(const std::string& addrText, std::string* host, std::string* port)
+{
+    const std::string t = CfgTrim(addrText);
+    if (CfgJoinIsSteam(t)) return false;
+    const std::string::size_type c = t.find_last_of(':');
+    if (c == std::string::npos || c == 0 || c + 1 >= t.size()) return false;
+    const std::string tail = t.substr(c + 1), head = t.substr(0, c);
+    for (std::string::size_type i = 0; i < tail.size(); ++i)
+        if (tail[i] < '0' || tail[i] > '9') return false;
+    if (head[0] == '[') { if (head[head.size() - 1] != ']') return false; }   /* [v6]:port */
+    else if (head.find(':') != std::string::npos) return false;              /* a bare IPv6 literal: its last colon is not a port */
+    if (host != 0) *host = head;
+    if (port != 0) *port = tail;
+    return true;
+}
+
+bool CfgJoinPortOk(const std::string& portText, unsigned short* port, std::string* why)
+{
+    if (CfgPortTextOk(CfgTrim(portText), port)) return true;
+    if (why != 0) *why = kCfgJoinPortWhy;
+    return false;
+}
+
+bool CfgJoinAddrOk(const std::string& addrText, const std::string& portText,
+                   std::string* addr, unsigned short* port, std::string* why)
+{
+    const std::string t = CfgTrim(addrText);
+    if (t.empty() || CfgJoinIsSteam(t)) return CfgAddrFieldOk(t, "address", addr, port, why);   /* steam: dials no port; empty says so */
+    std::string host = t, portPart = portText;
+    CfgJoinTakePort(t, &host, &portPart);   /* ADDRESS still carrying its own port (PORT may be empty): that port wins, as the window would have moved it */
+    const std::string::size_type colons = (std::string::size_type)std::count(host.begin(), host.end(), ':');
+    if (host[0] != '[' && colons == 1)
+    {   /* one colon and a tail that is not a port: the address itself is wrong, in the existing sentence */
+        if (why != 0) *why = "\"" + t + "\" isn't a valid address.";
+        return false;
+    }
+    unsigned short p = 0;
+    if (!CfgJoinPortOk(portPart, &p, why)) return false;
+    if (host[0] != '[' && colons > 1) host = "[" + host + "]";   /* a bare IPv6 literal, bracketed as the address form wants */
+    return CfgAddrFieldOk(host + ":" + NumText(p), "address", addr, port, why);
 }
 
 bool CfgNameFieldOk(const std::string& text, const char* what, size_t maxLen, std::string* why)
@@ -451,6 +503,15 @@ void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>*
             {
                 ++bad;
                 if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "hosttoken= is not 64 hexadecimal digits - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "ownerpw")   /* TEST ONLY - see CfgFields::ownerPw; a login password's rule (adminauth::PasswordOk); the value is never put in a note */
+        {
+            if (adminauth::PasswordOk(val)) f.ownerPw = val;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "ownerpw= is not 1-128 bytes without a control byte - ignored"; notes->push_back(nt); }
             }
         }
         else if (key == "sweepskip")   /* TEST ONLY - see CfgFields::sweepSkip; 0-64 printable characters, no space; empty = off */

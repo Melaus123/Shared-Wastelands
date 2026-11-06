@@ -149,9 +149,15 @@ struct CfgFields
     int            benchCapKbs;
     int            netRateLog;
     /* TEST ONLY, no writer carries it: hosttoken=<64 lowercase hex digits> - the hosting secret the bench started this game's world
-       server with, read only from the bench's test file and only by a host (config.cpp), so a bench-started world's own game proves
-       HOST_TOKEN without the HOST panel. Never logged. Empty = absent = off. */
+       server with, read only from the bench's test file and only by a host (config.cpp), so a bench-started world's own game's Steam
+       bridge shows it in each STEAM_ID without the HOST panel. Never logged. Empty = absent = off. */
     std::string    hostToken;
+    /* T-1158 - TEST ONLY, no writer carries it: ownerpw=<password> - the owner password the bench wrote into the world's rules.txt
+       before it started this game's world server, read only from the bench's test file and only by a host (config.cpp), so a
+       bench-started host's game holds the owner password its HOST press would have read or made there and proves it at the world's
+       door with nothing typed (store.cpp g_hostOwnerPassword). The rule is a login password's (adminauth::PasswordOk: 1-128 bytes, no
+       control byte); a cfg line cannot carry '#' or ';' (the comment marks). Never logged, never put in a note. Empty = absent = off. */
+    std::string    ownerPw;
     /* T-1118 f - TEST ONLY, no writer carries them: steamfakelag=<ms> (0-1000) / steamfakeloss=<percent> (0-50) - Steam's global fake
        lag / loss on this game's sends, set when its first Steam link comes UP (net/steam_transport.cpp), for a proving run on a real
        game's Steam link (relaylag= / relayloss= act only inside the echo test). 0 = absent = nothing is set. */
@@ -211,6 +217,23 @@ bool CfgPortFieldOk(const std::string& text, unsigned short* port, std::string* 
 bool CfgAddrFieldOk(const std::string& text, const char* what,
                     std::string* addr, unsigned short* port, std::string* why);
 bool CfgNameFieldOk(const std::string& text, const char* what, size_t maxLen, std::string* why);
+
+/* T-793 (decision 960, the approved join window; pull request 4 task 1): JOIN BY ADDRESS's two boxes, ADDRESS and PORT.  The
+   settings file keeps its own address:port line and CfgSplitAddr; these rules are the window's only.
+   CfgJoinIsSteam:   a steam:<id> in ADDRESS - the Steam route dials no port, so PORT is greyed and ignored.
+   CfgJoinTakePort:  ADDRESS text that carries its own port ("host:7778", "[::1]:7778") - *host gets the host half and *port the
+                     digits, so the window can move them into PORT (on leaving ADDRESS, and on PASTE).  No for steam:, for a bare
+                     IPv6 literal ("::1" - its last colon is not a port) and for a tail that is not all digits.  Writes nothing on a no.
+   CfgJoinPortOk:    the PORT box: 1..65535, digits only; anything else (empty included) is kCfgJoinPortWhy, word for word.
+   CfgJoinAddrOk:    the JOIN press: ADDRESS (with its own port if it still carries one - that port wins, PORT empty or not) and
+                     PORT, checked as one address - the address half by CfgAddrFieldOk's rules and sentences, a bare IPv6 literal
+                     bracketed first.  An address with no port of its own dials PORT's number (7777 unless the player changed it). */
+extern const char* const kCfgJoinPortWhy;
+bool CfgJoinIsSteam(const std::string& addrText);
+bool CfgJoinTakePort(const std::string& addrText, std::string* host, std::string* port);
+bool CfgJoinPortOk(const std::string& portText, unsigned short* port, std::string* why);
+bool CfgJoinAddrOk(const std::string& addrText, const std::string& portText,
+                   std::string* addr, unsigned short* port, std::string* why);
 
 /* ------------------------------------------------------------------------------------------------
    THE PARSER.  ConfigLoad reads the file into a string (bounded by kCfgMaxReadBytes) and calls this.

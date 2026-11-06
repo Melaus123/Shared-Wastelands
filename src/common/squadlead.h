@@ -472,4 +472,38 @@ inline bool DecodeKeeperRestock(const char* p, size_t n, KeeperRestockMsg* out)
     return true;
 }
 
+/* ---- T-478 step 5 (T2017: B's selling confirm stayed disabled - the slaver's squad money below the price) ---- */
+/* TEST-ONLY lever `npcmoney <amount> <uid | name:<Name> | spawned:<Template>[#k]>` (DEV build, items.cpp NpcMoneyCommand): the
+   money of the NPC squad that character is in (its squad pot) becomes <amount> on the game that runs the squad's formal leader - the
+   game whose MSG_SQUAD_LEAD carries the pot to every copy. Refused, in this order: an amount outside 0..kNpcMoneyMax; no live
+   character here; a copy (the runner's game must set it); a squad whose formal leader another game runs (that game announces the
+   pot and would write this one back); a pot that does not read as an NPC squad's (a player faction's purse, a stand-in, no squad -
+   KeeperPot's own refusals); a keeper squad whose money a shop record carries (the record sets the pot back - keepermoney's road). */
+const int kNpcMoneyOk = 0, kNpcMoneyBadAmount = 1, kNpcMoneyNotHere = 2, kNpcMoneyCopy = 3, kNpcMoneyLeaderCopy = 4,
+          kNpcMoneyNoPot = 5, kNpcMoneyShopRecord = 6;
+const long long kNpcMoneyMax = 2000000000LL;
+inline int NpcMoneyGate(long long amount, int live, int namedMine, int leaderMine, int potRead, int shopRecorded)
+{
+    if (amount < 0 || amount > kNpcMoneyMax) return kNpcMoneyBadAmount;
+    if (live == 0) return kNpcMoneyNotHere;
+    if (namedMine == 0) return kNpcMoneyCopy;
+    if (leaderMine == 0) return kNpcMoneyLeaderCopy;
+    if (potRead == 0) return kNpcMoneyNoPot;
+    if (shopRecorded != 0) return kNpcMoneyShopRecord;
+    return kNpcMoneyOk;
+}
+inline const char* NpcMoneyWhy(int g)
+{
+    switch (g)
+    {
+    case kNpcMoneyOk:         return "set";
+    case kNpcMoneyBadAmount:  return "the amount is outside 0..2000000000";
+    case kNpcMoneyNotHere:    return "no live character with that uid on this game";
+    case kNpcMoneyCopy:       return "a copy here - the game that runs it must set it";
+    case kNpcMoneyLeaderCopy: return "another game runs the squad's formal leader - that game announces the squad's money and must set it";
+    case kNpcMoneyNoPot:      return "the squad's money does not read as an NPC squad's (a player's faction, a stand-in or no squad)";
+    case kNpcMoneyShopRecord: return "a shop record carries this keeper squad's money - use keepermoney";
+    default:                  return "?";
+    }
+}
 }   /* namespace coopsquad */

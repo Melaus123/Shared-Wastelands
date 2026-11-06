@@ -938,7 +938,9 @@ bool DeserialiseGarments(const std::vector<char>& b, size_t at, GarmentSet* out)
    Nothing is called from the STATE handler: OnState records the owner's latest block per copy, and LimbSafePointDrain
    applies it at the K2 safe point with the AI worker paused - amputate grows the wound list (MedicalSystem +0x178) and
    setRobotLimbItem swaps the limb pointers that the worker's medical tick reads.
-   Left alone and counted: whole on the owner but not here (the engine has no road back to flesh), crushed (crushLimb
+   a whole limb     - a stump or crushed limb here, whole on the owner (an admin's /restore): RobotLimbs::setLimb(limb, whole,
+                        no item), the call /restore makes on the owner (LimbRegrowCall, T-1205).
+   Left alone and counted: whole on the owner but a robotic limb here (no road from a fitted limb straight to flesh), crushed (crushLimb
    0x6430C0 is an empty function in this build and nothing calls setLimb with crushed), a fitted item with no name.
    A copy's own amputation is refused by the gate below unless the mod's own limb apply (the K2 safe point) is making the call. */
 const size_t kLimbMedical     = 0x458;   // Character -> MedicalSystem (medical.cpp kMedicalOffset)
@@ -956,6 +958,7 @@ LimbAmputateFn orig_limbAmputate = 0;
 volatile LONG  g_limbApplyThread = 0;   // the thread inside the mod's own amputate / setRobotLimbItem call (0 = none)
 
 volatile LONG64 g_copyAmputateRefused  = 0;   // a copy's own amputate refused: its limbs come from its owner
+volatile LONG64 g_godAmputateRefused   = 0;   // T-1205 /god: this game's own god character's amputate refused
 volatile LONG64 g_copyAmputateApplying = 0;   // a copy's amputate let through: ApplyOwnerLimbs is applying the owner's word
 volatile LONG64 g_copyAmputatePassed   = 0;   // amputate on a character this game drives, or not replicated: original ran
 long long g_limbCarried = 0, g_limbReadFault = 0, g_limbAbsent = 0, g_limbRefusedMine = 0, g_limbNoCopy = 0, g_limbDeferredRebuild = 0;
@@ -1045,6 +1048,66 @@ static int LimbSetRobotCall(void* med, int limb, void* item)
     InterlockedExchange(&g_limbApplyThread, prevThread);
     ItemApplyingLeave(prevItems);
     return rc;
+}
+
+/* T-1205 /RESTORE AND A COPY'S GROW-BACK (kLimbStepRegrow): a lost (stump) or crushed limb back to flesh. The engine has no call of
+   its own for it; its limb-slot writer RobotLimbs::setLimb(limb, state, item) (Steam 1.0.65 0xCFD90, 1.0.68 0xCFDD0: the call
+   setRobotLimbItem makes at +0x85 and amputate at +0xC6 in both builds; build/decomp_cfd90.txt) takes LIMB_ORIGINAL with no item:
+   it destroys the stump's own item when the slot was a stump (the 'limb replacement' it made at the loss), writes the slot whole and
+   takes that limb's attachment off the body. What amputate did besides the slot (the blood it took, its wound, its stat change) is
+   not undone by it. MAIN THREAD, the K2 safe point (the AI worker paused: the worker's medical tick reads the slots). 1 done,
+   -1 faulted, -2 no RobotLimbs_setLimb row, 0 no RobotLimbs record (all four whole). */
+unsigned long long kLimbSetLimbRva = 0; static AddrReg kLimbSetLimbRva_reg("RobotLimbs_setLimb", &kLimbSetLimbRva);   /* Steam_1.0.65 0xCFD90 */
+typedef void (*LimbSetLimbFn)(void* robotLimbs, int limb, int state, void* item);
+long long g_limbRegrown = 0, g_limbRegrowFault = 0, g_limbRegrowNoRow = 0;
+long long g_limbRegrowWait = 0;   /* T-1205 review fold 8: a grow-back left until the owner says whole twice in a row (cooplimb::LimbRegrowSure) */
+static int LimbSetWholePod(void* c, int limb)
+{
+    const unsigned long long fn = AddrAbs(kLimbSetLimbRva);
+    if (kLimbSetLimbRva == 0 || fn == 0) return -2;
+    __try
+    {
+        void* rl = *(void**)((char*)c + kLimbMedical + kLimbMedRobot);
+        if (rl == 0) return 0;
+        ((LimbSetLimbFn)fn)(rl, limb, (int)cooplimb::kLimbOriginal, 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int LimbRegrowCall(void* c, int limb)
+{
+    const long prevItems = ItemApplyingEnter();
+    const LONG prevThread = InterlockedExchange(&g_limbApplyThread, (LONG)::GetCurrentThreadId());
+    const int rc = LimbSetWholePod(c, limb);
+    InterlockedExchange(&g_limbApplyThread, prevThread);
+    ItemApplyingLeave(prevItems);
+    if (rc == 1) ++g_limbRegrown; else if (rc == -2) ++g_limbRegrowNoRow; else if (rc == -1) ++g_limbRegrowFault;
+    return rc;
+}
+int LimbRegrowOwned(void* character, int* grown, int* robot, unsigned* grownMask)
+{
+    *grown = 0; *robot = 0; *grownMask = 0;
+    int st[cooplimb::kLimbCount]; void* it[cooplimb::kLimbCount];
+    if (ReadLimbsPod(character, st, it) < 0) return -1;
+    int need = 0;
+    for (unsigned int i = 0; i < cooplimb::kLimbCount; ++i)
+    {
+        const int s = cooplimb::RestoreLimbStep(st[i]);
+        if (s == cooplimb::kRestoreRobotKept) ++*robot;
+        if (s == cooplimb::kRestoreRegrow) ++need;
+    }
+    if (need == 0) return 1;
+    if (kLimbSetLimbRva == 0 || AddrAbs(kLimbSetLimbRva) == 0) { ++g_limbRegrowNoRow; return -1; }
+    bool all = true;
+    for (unsigned int i = 0; i < cooplimb::kLimbCount; ++i)
+    {
+        if (cooplimb::RestoreLimbStep(st[i]) != cooplimb::kRestoreRegrow) continue;
+        const int rc = LimbRegrowCall(character, (int)i);
+        if (rc == 1) { ++*grown; *grownMask |= 1u << i; }
+        else all = false;
+        DebugLog("[LIMBS] /restore " + std::string(cooplimb::LimbName(i)) + " (was " + S((long long)st[i]) + ") -> " + (rc == 1 ? "grown back" : rc == -1 ? "setLimb faulted" : "not grown"));
+    }
+    return all ? 1 : 0;
 }
 
 /* A robotic limb item from its sid, made as the kit makes a worn item, with the owner's quality. level >= 0 goes into the record
@@ -1159,8 +1222,13 @@ void LimbOwnWatchTick()
 
 /* The owner's latest limb block per copy uid, recorded by OnState and applied by LimbSafePointDrain. A newer STATE
    replaces an older one (STATE carries no sequence number; the latest to arrive wins). MAIN THREAD only. */
-struct LimbWant { cooplimb::LimbsWire w; unsigned int fromPeer; };
+struct LimbWant { cooplimb::LimbsWire w; unsigned int fromPeer; unsigned int regrowSure; };   /* regrowSure: cooplimb::LimbRegrowSure */
 static std::map<unsigned int, LimbWant> s_limbWant;
+/* The owner's limb states in the last STATE that came for each copy uid (T-1205 review fold 8: a grow-back needs two in a row).
+   Bounded: past kLimbSeenMax uids it starts again (a grow-back then waits one STATE more). MAIN THREAD. */
+struct LimbSeen { unsigned char state[cooplimb::kLimbCount]; };
+static std::map<unsigned int, LimbSeen> s_limbSeen;
+const size_t kLimbSeenMax = 4096;
 const size_t kLimbWantMax = 512;
 
 /* Per copy limb (key uid << 2 | limb): the owner sid that made no item here, or made one that is not a robotic limb - not
@@ -1180,6 +1248,14 @@ void ApplyOwnerLimbs(unsigned int uid, int has, const cooplimb::LimbsWire& w, un
 {
     if (has == 0) { ++g_limbAbsent; return; }
     if (net::IsUidMine(uid)) { ++g_limbRefusedMine; return; }
+    std::map<unsigned int, LimbSeen>::iterator seen = s_limbSeen.find(uid);
+    const unsigned int sure = cooplimb::LimbRegrowSure(seen != s_limbSeen.end(), seen != s_limbSeen.end() ? seen->second.state : 0, w.state);
+    if (seen == s_limbSeen.end())
+    {
+        if (s_limbSeen.size() >= kLimbSeenMax) s_limbSeen.clear();
+        seen = s_limbSeen.insert(std::make_pair(uid, LimbSeen())).first;
+    }
+    std::memcpy(seen->second.state, w.state, sizeof(seen->second.state));
     std::map<unsigned int, LimbWant>::iterator at = s_limbWant.find(uid);
     if (at == s_limbWant.end())
     {
@@ -1188,12 +1264,14 @@ void ApplyOwnerLimbs(unsigned int uid, int has, const cooplimb::LimbsWire& w, un
     }
     at->second.w = w;
     at->second.fromPeer = fromPeer;
+    at->second.regrowSure = sure;
     ++g_limbQueued;
 }
 
 void LimbsForgetUid(unsigned int uid)
 {
     if (s_limbWant.erase(uid) != 0) ++g_limbForgot;
+    s_limbSeen.erase(uid);
     for (unsigned int i = 0; i < cooplimb::kLimbCount; ++i)
     {
         const unsigned long long key = ((unsigned long long)uid << 2) | i;
@@ -1209,6 +1287,7 @@ void LimbsWorldTeardown()
     s_limbOwnCursor = 0;
     g_limbForgot += (long long)s_limbWant.size();
     s_limbWant.clear();
+    s_limbSeen.clear();
     s_limbBadSid.clear();
     s_limbQualityTried.clear();
     s_limbNoEffectTried.clear();
@@ -1222,6 +1301,188 @@ static void LimbDestroyItem(void* item, const char* why)
     const long prev = ItemApplyingEnter();
     if (KitDestroyPod((Item*)item, why) != 1) ++g_limbItemDestroyFault;
     ItemApplyingLeave(prev);
+}
+
+/* ---- T-890 WORK TOOL ------------------------------------------------------------------------------------------------------
+   The engine's operate-machine job (a mine, a farm) makes its building's "special tool" with the item factory, keeps it at the
+   task's +0x88 and hangs it in the character's "hands" slot with the character's own attach (vtable +0x198) - decomp_35b3d0:75-100.
+   The attach hangs it on the model and marks the item; nothing goes into an inventory (decomp_5db2f0:56, :84). The job's end takes
+   it off (vtable +0x1A0) and destroys it (decomp_3472f0:32-38). The owner reads the tool's sid from the job; a copy, which runs no
+   job, gets an item made from that sid by the limb road's factory call (LimbMakeItem) and hung and taken off the same way. Every
+   engine call on the copy's tool is made with the item sync's marker up (ItemApplyingEnter), so the sync neither books nor
+   publishes the item: it never reaches an inventory, the ground or a box. */
+const size_t kToolCharBodyOff = 0x648;   /* Character -> CharBody (combat.cpp kCharBodyOff) */
+const size_t kToolCurTaskOff  = 0x68;    /* CharBody -> the current task (combat.cpp kCurrentTaskOff) */
+const size_t kToolTaskItemOff = 0x88;    /* the operate-machine task's tool item: cleared at the start (decomp_35b3d0:43), set (:88), cleared at the end (decomp_3472f0:37) */
+const size_t kCharAttachVt    = 0x198;   /* Character vtable: hang an item in a named slot (0x5DB2F0) */
+const size_t kCharDetachVt    = 0x1A0;   /* Character vtable: take it off (humans 0x5DBAD0, vtable_CharacterHuman.txt) */
+const size_t kCharToolCheckVt = 0x30;    /* Character vtable: the check the job's start makes before it hangs the tool - nonzero = no tool (decomp_35b3d0:93, 0x5C9380) */
+typedef void (*ToolSlotFn)(void* c, const std::string& slot, void* item);
+typedef char (*ToolCheckFn)(void* c);
+static unsigned int s_toolTaskVt = 0;                 /* the operate-machine task's vtable RVA, once its class name matched */
+static std::set<unsigned int> s_toolOtherVt;          /* task vtables already found to be another class */
+long long g_toolOtherClassLogged = 0;
+
+/* c's current task (0 none). 1 read, -1 faulted. */
+static int ToolCurrentTaskPod(const void* c, void** task)
+{
+    *task = 0;
+    __try
+    {
+        const char* body = *(const char* const*)((const char*)c + kToolCharBodyOff);
+        if (body != 0) *task = *(void* const*)(body + kToolCurTaskOff);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *task = 0; return -1; }
+}
+
+/* the operate-machine task's tool word. 1 read, -1 faulted. */
+static int ToolTaskItemPod(const void* task, void** item)
+{
+    *item = 0;
+    __try { *item = *(void* const*)((const char*)task + kToolTaskItemOff); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *item = 0; return -1; }
+}
+
+/* the character's own attach (kCharAttachVt) or detach (kCharDetachVt) of `item` in the slot named *slot. 1 called, -1 faulted. */
+static int ToolSlotPod(void* c, size_t vtOff, const std::string* slot, void* item)
+{
+    __try
+    {
+        void* const* vt = *(void* const* const*)c;
+        if (vt == 0) return -1;
+        ((ToolSlotFn)vt[vtOff / sizeof(void*)])(c, *slot, item);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* the sid of an item's record into out[cap]. 1 a sid; 0 no record, or a sid empty or longer than out takes; -1 a read faulted.
+   T-890 review fold 4: the record and its id are read under SEH, so a stale item word faults here instead of in the game. */
+static int ToolItemSidPod(void* item, char* out, int cap)
+{
+    out[0] = 0;
+    __try
+    {
+        ::GameData* gd = ((Item*)item)->getRecordDirect();
+        if (!Obj(gd)) return 0;
+        const std::string& sid = gd->stringID;
+        const size_t n = sid.size();
+        if (n == 0 || n >= (size_t)cap) return 0;
+        std::memcpy(out, sid.c_str(), n);
+        out[n] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return -1; }
+}
+
+/* c's own pre-check before a job hangs its tool (kCharToolCheckVt, 0x5C9380). 1 refuses, 0 allows, -1 faulted. */
+static int ToolCheckPod(void* c)
+{
+    __try
+    {
+        void* const* vt = *(void* const* const*)c;
+        if (vt == 0) return -1;
+        return ((ToolCheckFn)vt[kCharToolCheckVt / sizeof(void*)])(c) != 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* MAIN THREAD: the tool c's own operate-machine job holds now (*item; 0 none). The job's own field is read, not the model's
+   "hands" slot: the engine writes it at the job's start and clears it at the job's end, so it is exactly the tool the engine
+   shows, and no other item hung in the hands is mistaken for one. 1 a tool; 0 none (no task, another task class, an empty
+   field); -1 a read faulted. The owner reads it for the tool it sends (PoseWorkToolOf). A copy reads it (T-890 review fold 1) so
+   that this mod never hangs its tool beside the job's own nor takes one off while the job's own is there: the take-off goes by
+   the slot's name (decomp_5db880 detaches by name, not by item), so it would remove whichever item hangs there. */
+static int ToolJobItemOf(::Character* c, void** item)
+{
+    *item = 0;
+    if (!Obj(c)) return 0;
+    void* task = 0;
+    if (ToolCurrentTaskPod(c, &task) < 0) return -1;
+    if (!Obj(task)) return 0;
+    const unsigned int vt = PolicyVtableRvaPod(task);
+    if (vt == 0) return 0;
+    if (vt != s_toolTaskVt)
+    {
+        if (s_toolOtherVt.find(vt) != s_toolOtherVt.end()) return 0;
+        char cls[96];
+        cls[0] = 0;
+        if (PolicyClassNamePod(vt, cls, (int)sizeof cls) == 0) return 0;
+        if (!coopstate::PoseToolTaskClass(cls))
+        {
+            s_toolOtherVt.insert(vt);
+            if (g_toolOtherClassLogged < 16)
+            {
+                ++g_toolOtherClassLogged;
+                DebugLog(std::string("[POSE] work tool: a character's current task is class '") + cls
+                         + "', not the operate-machine task - no tool is read from it (one line per class)");
+            }
+            return 0;
+        }
+        s_toolTaskVt = vt;
+    }
+    void* it = 0;
+    if (ToolTaskItemPod(task, &it) < 0) return -1;
+    if (!Obj(it)) return 0;
+    *item = it;
+    return 1;
+}
+
+/* OWNER SIDE, MAIN THREAD, AI worker idle (PoseWatchTick): the sid of the tool c's operate-machine job holds now (ToolJobItemOf),
+   into out[cap]. 1 a tool; 0 none (another task, no tool, a sid longer than the wire takes); -1 a read faulted. */
+int PoseWorkToolOf(::Character* c, char* out, int cap)
+{
+    if (out == 0 || cap < 2) return 0;
+    out[0] = 0;
+    void* item = 0;
+    const int t = ToolJobItemOf(c, &item);
+    if (t <= 0) return t;
+    return ToolItemSidPod(item, out, cap);
+}
+
+/* COPY SIDE, MAIN THREAD (PoseApplyTick): an item made from `sid` and hung in c's hands. 0 = none: *outcome 1 the sid made no
+   item here (nothing is left behind), 2 the attach faulted (the item is left alone: whether the model holds it is not known),
+   3 c's own pre-check refuses a tool now or faulted (review fold 3: the check the job's start asks first), 4 c's own job holds a
+   tool or that read faulted (review fold 1: ours would hang beside it). For 3 and 4 nothing is made; the caller tries later. */
+void* PoseToolPutOn(::Character* c, const char* sid, int* outcome)
+{
+    *outcome = 1;
+    if (!Obj(c) || sid == 0 || sid[0] == 0) return 0;
+    void* own = 0;
+    const int job = ToolJobItemOf(c, &own);
+    const int check = job == 0 ? ToolCheckPod(c) : 0;
+    const int gate = coopstate::PoseToolPutOnGate(job, check);
+    if (gate == coopstate::kPoseToolWaitJob) { *outcome = 4; return 0; }
+    if (gate == coopstate::kPoseToolWaitRefused) { *outcome = 3; return 0; }
+    const std::string slot("hands");
+    const long prev = ItemApplyingEnter();
+    Item* item = LimbMakeItem(c, sid, -1.0f, -1);   /* -1, -1: the record's own quality and level, as the job's factory call leaves them */
+    int r = 0;
+    if (item != 0) r = ToolSlotPod(c, kCharAttachVt, &slot, item);
+    ItemApplyingLeave(prev);
+    if (item == 0) return 0;
+    if (r != 1) { *outcome = 2; return 0; }
+    *outcome = 0;
+    return item;
+}
+
+/* COPY SIDE, MAIN THREAD: the item PoseToolPutOn hung on c taken off and destroyed, as the job's end does. 1 done; -1 the detach
+   faulted (the item is not destroyed: the model may still hold it); -2 taken off, but the destroy was refused or faulted;
+   -3 nothing touched (review fold 1): c's own job holds a tool, and the take-off, which goes by the slot's name, would remove
+   that one instead of ours. */
+int PoseToolTakeOff(::Character* c, void* item)
+{
+    if (item == 0) return 1;
+    if (!Obj(c)) return -1;
+    void* own = 0;
+    if (!coopstate::PoseToolTakeOffAllowed(ToolJobItemOf(c, &own))) return -3;
+    const std::string slot("hands");
+    const long prev = ItemApplyingEnter();
+    int r = ToolSlotPod(c, kCharDetachVt, &slot, item);
+    if (r == 1 && KitDestroyPod((Item*)item, "work tool taken off a copy (T-890)") != 1) r = -2;
+    ItemApplyingLeave(prev);
+    return r;
 }
 
 /* true = the item's complete-object class is the engine's robotic limb item; `cls` gets the RTTI name ("" = unreadable). */
@@ -1243,7 +1504,7 @@ static int LimbCarryingPod(const void* c)
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
-static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, unsigned int fromPeer)
+static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, unsigned int fromPeer, unsigned int regrowSure)
 {
     if (net::IsUidMine(uid)) { ++g_limbRefusedMine; return; }
     if (!net::RemoteMayWriteStill(uid, fromPeer)) { ++g_limbWriterChanged; return; }   /* another game drives it since the STATE */
@@ -1279,6 +1540,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
         if (step == cooplimb::kLimbStepCannotRegrow) { ++g_limbCannotRegrow; continue; }
         if (step == cooplimb::kLimbStepNoCrushRoad) { ++g_limbNoCrushRoad; continue; }
         if (step == cooplimb::kLimbStepUnnamed) { ++g_limbUnnamed; continue; }
+        if (step == cooplimb::kLimbStepRegrow && (regrowSure & (1u << i)) == 0) { ++g_limbRegrowWait; continue; }   /* the next STATE asks again */
         const bool sameItem = step == cooplimb::kLimbStepRefit && here[0] != 0 && std::strcmp(here, w.sid[i]) == 0;
         if (sameItem)
         {
@@ -1315,6 +1577,16 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
                 const int rc = LimbAmputateCall(med, (int)i, false, true);
                 if (rc == 1) { ++g_limbAmputated; outcome = "amputated"; changed = true; }
                 else { clear = false; if (rc == -2) { ++g_limbNoRow; outcome = "no MedicalSystem_amputate row"; } else { ++g_limbCallFault; outcome = "amputate faulted"; } }
+            }
+        }
+        if (step == cooplimb::kLimbStepRegrow)
+        {
+            if (dead) { clear = false; ++g_limbDeadSkip; outcome = "left: the copy is dead (or its dead flag is unreadable)"; }
+            else
+            {
+                const int rc = LimbRegrowCall(c, (int)i);
+                if (rc == 1) { outcome = "grown back"; changed = true; }
+                else { clear = false; if (rc == -2) { ++g_limbNoRow; outcome = "no RobotLimbs_setLimb row"; } else { ++g_limbCallFault; outcome = rc == 0 ? "no RobotLimbs record" : "setLimb faulted"; } }
             }
         }
         if (step == cooplimb::kLimbStepUnfit)
@@ -1534,7 +1806,7 @@ void LimbSafePointDrain()
     std::map<unsigned int, LimbWant> q;
     q.swap(s_limbWant);
     for (std::map<unsigned int, LimbWant>::const_iterator i = q.begin(); i != q.end(); ++i)
-        ApplyOwnerLimbsNow(i->first, i->second.w, i->second.fromPeer);
+        ApplyOwnerLimbsNow(i->first, i->second.w, i->second.fromPeer, i->second.regrowSure);
 }
 
 std::string LimbTestLever(const std::string& args)
@@ -1603,6 +1875,7 @@ void detour_limbAmputate(void* med, int limb, bool createSeveredItem, const floa
         }
         InterlockedIncrement64(&g_copyAmputateApplying);
     }
+    else if (uid != 0 && GodOn(uid)) { InterlockedIncrement64(&g_godAmputateRefused); return; }   /* T-1205 /god: no lost limbs */
     else InterlockedIncrement64(&g_copyAmputatePassed);
     orig_limbAmputate(med, limb, createSeveredItem, force);
 }
@@ -1634,9 +1907,10 @@ static void ReportLimbCounters()
              + " safePoint[queued,queueFull,blockedDropped,notBuilt,deadSkip,implausible,forgot]=" + S(g_limbQueued) + "," + S(g_limbQueueFull) + ","
              + S(g_limbDrainBlocked) + "," + S(g_limbNotBuilt) + "," + S(g_limbDeadSkip) + "," + S(g_limbImplausible) + "," + S(g_limbForgot)
              + " fitNotRobot=" + S(g_limbFitNotRobot) + " noEffectKept=" + S(g_limbNoEffectKept) + " qualityRefit=" + S(g_limbQualityRefit) + " limbtestRuns=" + S(g_limbTestRuns)
+             + " regrow[done,fault,noRow]=" + S(g_limbRegrown) + "," + S(g_limbRegrowFault) + "," + S(g_limbRegrowNoRow) + " regrowWait=" + S(g_limbRegrowWait)
              + " levelRefit=" + S(g_limbLevelRefit) + " statsRecalc[done,not]=" + S(g_limbStatsRecalc) + "," + S(g_limbStatsRecalcNot)
              + " gate[refused,applying,passed]=" + S((long long)g_copyAmputateRefused) + "," + S((long long)g_copyAmputateApplying) + ","
-             + S((long long)g_copyAmputatePassed));
+             + S((long long)g_copyAmputatePassed) + " godRefused=" + S((long long)g_godAmputateRefused));
 }
 
 void ReportClothingCounters()

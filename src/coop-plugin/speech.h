@@ -41,11 +41,29 @@ void CrimeTestDrain();
    "talk[started,withCopy,withMine,windowWouldOpen,...]=... talkByEvent=[..] sendEventWouldBlockByEvent=[..] talkHooks=..". */
 std::string TalkTestArm(const std::string& arg);
 std::string TalkTestPeerArm(const std::string& arg);   /* `talktest nearestpeer [<radius>]` (TEST-ONLY, T-1152): the speaker is the nearest character of another player (speech.cpp) */
+#ifdef SW_DEV_BUILD
+/* T-978 TEST-ONLY lever npcsay (DEV build, owner 1463 a): `npcsay <Name>[#k] [| <text>]` - the NPC of that name THIS game runs (own,
+   living, non-player, nearest within 5000 units of this game's first own player character) says one line as a speech bubble at the
+   next K2 safe point through the engine's own Dialogue::say (detour_say then sends it as MSG_SAY, as any line of this game's NPC).
+   Text default 'Test line.', at most 200 characters. [TALK] T-978 npcsay lines. MAIN THREAD (speech.cpp). */
+std::string NpcSayArm(const std::string& arg);
+#endif
 void TalkTestDrain();
 std::string TalkCountsString();
 /* T-831: before this mod removes character c - a conversation the dialogue window shows whose owner, target or stored
    character is c ends first through the engine's endDialogue (src/common/dlgwinguard.h). MAIN THREAD; elsewhere a no-op. */
 void TalkWindowBeforeRemove(void* c);
+/* T-1230: before GameWorld::destroy destroys obj (the engine's area unload, another engine removal, or this mod's own removal -
+   modRemoval 1): an open trade window whose trader is obj closes first, while obj is whole (src/common/tradewinguard.h).
+   reason: the engine's debug string, for the line. MAIN THREAD acts; elsewhere the safe point's check closes it. */
+void TradeWindowBeforeDestroy(void* obj, int unload, int modRemoval, const char* reason);
+/* T-978 (owner 1445 a, C): 1 = this game's conversation window shows a conversation now; store.cpp's ClockTick polls it for the
+   Slowest wins pause vote (src/common/clockmath.h MenuPauseNoteTalkWindow). Any thread. */
+int TalkWindowOpenNow();
+/* T-978 A (owner 1445 a): the frozen NPC's hold goes when the engine destroys it (spawn.cpp NotifyDespawn), and the slot is forgotten
+   at the world teardown (store.cpp, beside AiSpikeWorldTeardown). MAIN THREAD. */
+void TalkFreezeForgetObject(const void* obj);
+void TalkFreezeWorldTeardown();
 /* P26 stage 6 talksight (TEST-ONLY levers, speech.cpp 'TALKSIGHT LEVER'). MAIN THREAD (the command channel).
    TalkSightArm: `talksight <npcUid | nearest <dialogueName>> <targetUid> [seconds] [walkover]` - checks and arms; TalkTestDrain tries
    Dialogue::sendEvent(event 3) at every K2 safe point. When the NPC is not loaded yet (the uid is not here / no carrier near the
@@ -68,7 +86,8 @@ std::string TalkCarriersCommand(float x, float z, float radius);
    uid (crimetest bountyset's person, koself name); kLeverPickAny: any (crimetest bountyset's law NPC); kLeverPickDowned: living
    and down (prone or ragdoll), either game's (capturetest carry name); kLeverPickDead: dead, either game's (cursortest
    deadname:). *uid (0 = not replicated), *dist, *name = its display
-   name; 0 = none (*why says so in words). */
+   name; 0 = none (*why says so in words). T-1218: only when exactly ONE such character is within maxDist, or nameKey ends in
+   `#<k>` (the k-th nearest); several -> 0 with *why = the refusal naming the count and the five nearest (leverpick.h). */
 const int kLeverPickOwnLiving = 0, kLeverPickAny = 1, kLeverPickDowned = 2, kLeverPickDead = 3;
 std::string TalkCarriersActCommand(float x, float z, float radius, int ev, int act);
 ::Character* LeverNearestNamed(const std::string& nameKey, int pick, ::Character* from, float maxDist, unsigned int* uid, float* dist,
@@ -81,6 +100,8 @@ int TalkWaitTick(float* x, float* z, unsigned long* waitedMs);
    re-checked by TalkWaitTick), then exactly `talktest <uid> <target> <event>`. `playerteleport near name <npc name> <units>
    [maxdy <n>]` goes through TalkNearPoint. */
 std::string TalkTestNameArm(const std::string& arg);
+std::string TalkTestCarrierArm(const std::string& arg);   /* T-858 TEST-ONLY: `talktest nearestcarrier <act> <targetUid> [event] [copy | mine]` (speech.cpp) */
+std::string TalkActResultDropArm();   /* T-858 TEST-ONLY: `talktest actresultdrop` - the next paid line's ACT_RESULT dropped once on the NPC's game (speech.cpp) */
 
 /* P26 stages 1-3 (.modding/investigations/p26-npc-dialogue.md Q3; speech.cpp 'P26 STAGES 1-3'): an NPC's conversation with the
    OTHER player's character opens THAT player's own dialogue window - MSG_TALK PROMPT / ANSWER / END.
@@ -95,6 +116,7 @@ const unsigned int kTalkAllPeers = 0xFFFFFFFFu;
 /* P26s1 fold 1 M3: hire.cpp's Dialogue::_doActions hook state (1 installed) - B shows a PROMPT only with it (the line's actions
    are skipped through it; without it they would run a second time). Defined in hire.cpp, namespace coop. */
 int HireDoActionsHookState();
+int HireBuyConfirmHookState();   /* T-478 step 6 (hire.cpp): 1 = the slave and animal buying confirms are hooked and their reads are here */
 bool TalkSkipDoActions(void* dlg);
 /* P26 stage 4: hire.cpp detour_doActions (MAIN THREAD) - true = a line of a conversation this game forwards to the other player
    carries a TARGET-side part - P26 stage 5: THE ROUTER (cooptalk::TalkActSide): its NPC-side part runs here, its target-side part
@@ -133,6 +155,12 @@ void TalkCursorHoverLeave(unsigned long prevTid, void* prevWho, int prevKind);
    (TkPlayerSpeaker: a copy in a player's stand-in faction, an old save's stand-in record included), 0 = not or unreadable. policy.cpp's
    showContextMenu detour hides Talk on it when it is not a teammate's. ANY THREAD. Defined in speech.cpp. */
 int TalkPlayerCharacter(void* who);
+/* T-980 (speech.cpp): FreedRaiseEvent - the prisoner's owner raises the unlock event 0xD on its own prisoner (a Character*) with its
+   copy of the freeing player's character (a Character*) as the freer; 1 taken, 0 refused by the engine, -1 fault, -2 no Dialogue,
+   -3 not in the address table; logs one line (locks: the freed message's byte, the locks the freer's game read open, 1 shackles,
+   2 cage). FreedSendReportToken - the freer's game's counters. MAIN THREAD. */
+int FreedRaiseEvent(void* prisoner, void* freer, unsigned int prisonerUid, unsigned int freerUid, int locks);
+std::string FreedSendReportToken();
 void TalkCursorFaultReset();
 void TalkCursorCopyReady(unsigned int uid);
 void TalkCursorForgetNpc(unsigned int uid);

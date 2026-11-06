@@ -802,21 +802,22 @@ static int GroundSetWalkPod(const void* content, void** out, int cap, int writte
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
-int LoadedGroundItems(void** out, int cap, int* zonesSeen, int* truncated)
+int LoadedGroundItems(void** out, int cap, int* zonesSeen, int* truncated, int* unread)
 {
     if (zonesSeen != 0) *zonesSeen = 0;
     if (truncated != 0) *truncated = 0;
+    if (unread != 0) *unread = 0;
     if (out == 0 || cap <= 0) return 0;
     void* zm = ZoneManagerPtr();
-    if (!PlausiblePod(zm)) return 0;
+    if (!PlausiblePod(zm)) { if (unread != 0) *unread = 1; return 0; }   /* T-1039 fold 1: no zone list is not "no items" */
     static lektor<void*> zones; zones.clear();
-    if (!FillActiveZonesPod(zm, &zones)) return 0;
+    if (!FillActiveZonesPod(zm, &zones)) { if (unread != 0) *unread = 1; return 0; }
     if (truncated != 0 && zones.size() > 64) *truncated = 1;
     int written = 0;
     for (unsigned i = 0; i < zones.size() && i < 64; ++i)
     {
         if (zonesSeen != 0) ++(*zonesSeen);
-        void* content = ContentOfZonePod(zones[i]); if (!PlausiblePod(content)) continue;
+        void* content = ContentOfZonePod(zones[i]); if (!PlausiblePod(content)) { if (unread != 0) ++*unread; continue; }   /* T-1039 fold 1 */
         const int w = GroundSetWalkPod(content, out, cap, written, truncated);   /* review-inv5p0 M: guarded (the set may grow off-thread) */
         if (w < 0) { if (truncated != 0) *truncated = 1; continue; }
         written = w;

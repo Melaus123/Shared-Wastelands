@@ -204,6 +204,8 @@ long long g_relSkipOffThread = 0, g_relSkipUnread = 0, g_relSkipPlayer = 0, g_re
 static std::map<unsigned int, int> g_sameIdWd;
 static const size_t kSameIdWdCap = 512;
 static long long g_relSkipYield = 0, g_relSkipReload = 0, g_relFlightSameId = 0, g_sameIdWdMarked = 0, g_sameIdWdFull = 0;
+/* the TEST-ONLY clearnear lever's marks (kSameIdClearNear): its removed squads' put-aways not offered to another game */
+static long long g_relSkipClearNear = 0;
 /* the receiver side: offers read and each member's verdict; REVOKEs read and what they did */
 long long g_relInOffers = 0, g_relInAdopted = 0, g_relInDup = 0, g_relInDropped = 0, g_relInStale = 0, g_relInDeferred = 0;
 long long g_relInRevokes = 0, g_relInPuppeted = 0, g_relInRemoved = 0, g_relInRevokeIgnored = 0;
@@ -2099,6 +2101,10 @@ void SameIdWithdrawDone()
         if (HandoffPendingHas(it->first) && !Plaus(FindSpawned(it->first))) ++it; else g_sameIdWd.erase(it++);
     }
 }
+/* the TEST-ONLY clearnear lever: a squad it removes leaves the world - its own-uid people are marked before its platoonwipe, so their
+   put-away is unloaded and never offered (the lever calls SameIdWithdrawDone right after) */
+void SameIdWithdrawMarkClearNear(const unsigned int* uids, int n) { SameIdWithdrawMark(uids, n, kSameIdClearNear); }
+long long SameIdClearNearUnoffered() { return g_relSkipClearNear; }
 void ReleaseOnPutAway(unsigned int uid, const void* obj, int objWhole)
 {
     ReleaseForgetDrain();
@@ -2107,7 +2113,7 @@ void ReleaseOnPutAway(unsigned int uid, const void* obj, int objWhole)
     const int padRoad = cooplo::PutAwayRoad(sw != g_sameIdWd.end() ? 1 : 0, HandoffPendingHas(uid) ? 1 : 0);
     if (padRoad == cooplo::kPadUnloadSameId)
     {   /* a same-id retire withdrew it: the other game runs this person - unloaded, never offered */
-        if (sw->second == kSameIdReload) ++g_relSkipReload; else ++g_relSkipYield;
+        if (sw->second == kSameIdReload) ++g_relSkipReload; else if (sw->second == kSameIdClearNear) ++g_relSkipClearNear; else ++g_relSkipYield;
         return;
     }
     if (padRoad == cooplo::kPadLeaveToAck) { ++g_relSkipInFlight; return; }
@@ -2319,7 +2325,8 @@ void ReportHandoff()
              + "," + N(g_keepReadFailForced) + "," + N(g_keepForcedListed)
              + " releaseSkip[inFlight,offThread,unread,player,notAnnounced,yield,reloadRetire]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer)
              + "," + N(g_relSkipNotAnnounced) + "," + N(g_relSkipYield) + "," + N(g_relSkipReload)
-             + " release[sent,adopted,asleep]=" + N(g_relSent) + "," + N(g_relAdopted) + "," + N(g_relAsleep) + " releaseOpen=" + N((long long)g_release.size()));
+             + " release[sent,adopted,asleep]=" + N(g_relSent) + "," + N(g_relAdopted) + "," + N(g_relAsleep) + " releaseOpen=" + N((long long)g_release.size())
+             + " releaseClearNear=" + N(g_relSkipClearNear));
     SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_report" + q + "," + q + "xferOut" + q + ":" + N(g_xferOut) + "," + q + "ackIn" + q + ":" + N(g_ackIn) + "," + q + "released" + q + ":" + N(g_released)
              + "," + q + "abandoned" + q + ":" + N(g_xferAbandoned) + "," + q + "xferIn" + q + ":" + N(g_xferIn) + "," + q + "taken" + q + ":" + N(g_taken) + "," + q + "ackOut" + q + ":" + N(g_ackOut) + "," + q + "pending" + q + ":" + N((long long)g_pending.size()) + "}");
 }
@@ -2627,6 +2634,31 @@ bool PlayerTeleportGround()
     float x = 0, y = 0, z = 0;
     if (!Plaus(pc) || !ReadPos(pc, &x, &y, &z)) return false;
     return PlayerTeleportAbsY(x, z, true, 0.0f);
+}
+// T-1205 THE ADMIN TOOLBOX'S MOVES (admin.cpp /bring /tp /goto /home /jail): ONE character this game owns to the map position x, z,
+// through the engine's own whole-character teleport (Character::teleport, the same call PlayerTeleport makes), at the terrain's
+// height there (GroundTerrainHeightAt), else at `y` when haveY (a height the position was read at), else refused. A knocked-out
+// (downed) character is refused (2): the engine's teleport leaves its ragdoll behind and it snaps back (T1338 / T1342). focus: the
+// camera goes to the destination as PlayerTeleport's does (the moved character is this player's lead), so the area there loads.
+// The other games' copies follow through this game's own move records. 1 moved (*yOut = the height), 0 refused or faulted, 2 down.
+// MAIN THREAD, engine writes allowed (the K2 safe point).
+int AdminMoveCharacter(::Character* c, float x, float z, bool haveY, float y, bool focus, float* yOut)
+{
+    float cx = 0, cy = 0, cz = 0;
+    if (!Plaus(c) || !ReadPos(c, &cx, &cy, &cz)) { DebugLog("[ADMIN] move refused: the character's position did not read"); return 0; }
+    if (IsDownedCharacter(c)) return 2;
+    float th = 0.0f, ty = y;
+    const int tr = GroundTerrainHeightAt(x, z, &th);
+    if (tr == 1) ty = th;
+    else if (!haveY) { DebugLog("[ADMIN] move refused: no ground height read at " + F1(x) + "," + F1(z) + " and no height given"); return 0; }
+    if (!Teleport(c, x, ty, z)) { ErrorLog("[ADMIN] move FAILED: the engine's teleport faulted (to " + F1(x) + "," + F1(ty) + "," + F1(z) + ")"); return 0; }
+    ++g_teleports;
+    const int cam = focus ? FocusCameraPod(x, ty, z) : 0;
+    if (focus && cam != 1) DebugLog("[ADMIN] camera focus " + std::string(cam == 0 ? "skipped (no PlayerInterface)" : "FAULTED"));
+    DebugLog("[ADMIN] moved from " + F1(cx) + "," + F1(cy) + "," + F1(cz) + " to " + F1(x) + "," + F1(ty) + "," + F1(z) + " (sector "
+             + SectorString(SectorOf(x, z)) + ") height " + (tr == 1 ? "the terrain's" : "the one given") + (focus ? ", camera followed" : ""));
+    *yOut = ty;
+    return 1;
 }
 // T-1 B0 (TEST LEVER). `playerteleport peer`: the watched player (GetTarget, the character PlayerTeleport moves) to about 5 m
 // from this game's COPY of the other player's lead character. A copy = a mirror slot whose uid this game does not own

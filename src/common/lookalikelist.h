@@ -21,7 +21,8 @@
 namespace lalist {
 
 const unsigned kMsgLookalike = 90;
-const unsigned kProtocol = 133;          /* the world-server protocol that carries LOOKALIKE */
+const unsigned kProtocol = 145;          /* the world-server protocol that carries LOOKALIKE */
+
 const unsigned kOpList = 1, kOpAdd = 2;
 const unsigned kMaxIds = 256;            /* ids in one message; a longer list goes as one LIST and then ADD messages */
 const char* const kListFile = "lookalike_list.txt";   /* the world server's file, in the world's folder */

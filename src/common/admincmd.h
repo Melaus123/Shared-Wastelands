@@ -2,24 +2,44 @@
    and bans.txt. Pure: no Windows.h, no disk, no clock, no engine; the world server (store_main.cpp), the game and the offline suite
    compile it. C++03 (VS2010 v100). Ported in part from public pull request 3 (author MassDivide) and changed for this project.
 
-   MESSAGES (world-server protocol 132). 96-103 are kept for the admin work; this build uses 97, 100, 101 and 103 (adminauth.h).
-     97 ADMIN_REQ (game -> server):  {u32 req, u32 verb, u32 flags, str8 target, str8 extra}
-     100 ADMIN_REPLY (server -> game): {u32 req, u32 verb, u32 code, u32 num, str8 name}
-   str8 = u8 n + n bytes; u32 little-endian. req is the game's own number for the request, echoed in its reply (0 = a reply that
-   answers no request). The reply carries a CODE (kRep*), never words: the game shows the approved words for each code, with `name`
-   (the player it concerns, cleaned) and `num` where a code says so.
+   MESSAGES. 96-103 are kept for the admin work; this build uses 97-101 and 103 (98 and 99: the toolbox's jobs, admintool.h; 101 and
+   103: adminauth.h).
+     97 ADMIN_REQ (game -> server):  {u32 req, u32 verb, u32 flags, str8 target, str8 extra, f32 x, f32 z}
+     100 ADMIN_REPLY (server -> game): {u32 req, u32 verb, u32 code, u32 num, str8 name, f32 x, f32 z, str8 place, u32 num2,
+                                       u8 n + n str8 others}
+   str8 = u8 n + n bytes; u32 and f32 little-endian. req is the game's own number for the request, echoed in its reply (0 = a reply
+   that answers no request; a request answered by several games gets one reply per game). The reply carries a CODE (kRep*), never
+   words: the game shows the approved words for each code, with `name` (the player it concerns, cleaned), `num`, the map position
+   x, z and `place` (a town's record name), a second number `num2` and the `others` (further names: the players whose characters a
+   name also names, at most kOthersMax; a squad move's characters, at most kNamesMax) where a code says so. ADMIN_REQ's x, z: /tp's
+   typed map position (0 for every other verb).
 
    VERBS AND THEIR FIELDS
      kVerbKick        target = a player's name, or (kFlagSlot) a slot number in decimal       extra = unused
      kVerbBan         as kick                                                                 extra = the reason (may be empty)
      kVerbUnban       target = a player id, or a name as bans.txt has it                       extra = unused
      kVerbStop        no target - the world stops cleanly (WORLD_STOPPING to every game, then the final save)
-     kVerbMakeAdmin   target = (kFlagSlot) the player's slot number                              owner's game only
-     kVerbRemoveAdmin target = (kFlagSlot) the player's slot number, or a listed player id       owner's game only
-     kVerbSetPassword extra = the new admin password (at least adminauth::kPasswordMinChars)     owner's game only
-   WHO MAY (Decide): kick, ban, unban and stop need an admin now - the owner's game that proved the hosting's secret, or a logged-in
-   admin. MAKE ADMIN, REMOVE ADMIN and the password: the owner's game that proved the hosting's secret alone. Nobody kicks or bans
-   themself or the owner; an admin kicks or bans another admin only when the asker is that owner's game.
+     kVerbMakeAdmin   target = (kFlagSlot) the player's slot number                              the owner only
+     kVerbRemoveAdmin target = (kFlagSlot) the player's slot number, or a listed player id       the owner only
+     kVerbSetPassword extra = the new admin password (adminauth::PasswordOk; no minimum length)      the owner only
+     kVerbWhere       target = a player's name ("" = every player in the world); kFlagPickPlayer when typed as @name
+     kVerbMedic       target = a player's or a character's name (admintool.h); kFlagPickPlayer for @name, kFlagPickChar for #name
+     kVerbHeal          (extra = the player of #name@player); kFlagAll: target = a player whose whole squad is healed
+     kVerbRestore       (/restore: /heal, and every lost limb grown back - a robotic limb is left on)
+     kVerbAddItem     target = the item's record id (the admin's game found it by name), extra = the count in decimal (1-99); the
+                      admin's own game adds it to its own lead character
+     kVerbBring       target, flags and extra as /medic (no kFlagAll): the character goes to the admin's lead character
+     kVerbTp            the same, and x, z = the map position typed
+     kVerbGoto          the same: the admin's lead character goes to the character
+     kVerbSetHome     no target: the admin's lead character's position is kept as the admin's home (homes.txt)
+     kVerbHome        no target: the admin's lead character's squad goes home
+     kVerbJail        target = a player's name (kFlagPickPlayer when typed as @name); extra = the jail spot's word ("" = at random)
+     kVerbRevive      target = a fallen character's name; kFlagPickChar for #name (extra = the player of #name@player)
+     kVerbGod         target, flags and extra as /bring (no kFlagAll); kFlagGodOn = /god <name> on, without it = off
+   WHO MAY (Decide): kick, ban, unban, stop and the toolbox's verbs need an admin now - the owner (a connection logged in with the owner password,
+   owner 1369 b) or a logged-in admin. MAKE ADMIN, REMOVE ADMIN and the password: the owner alone, so admins cannot remove each
+   other. Nobody kicks or bans themself or the owner; an admin kicks or bans another admin only when the asker is the owner. A
+   player id alone never makes anyone the owner.
 
    admins.txt (the world folder): one player id per line (32 lowercase hex); '#' starts a comment; blank lines are skipped; any other
    line is counted bad and kept as written when the server edits the file. bans.txt: "<player id> <name> <reason...>" per line, the
@@ -37,13 +57,22 @@ namespace admincmd {
 
 const unsigned kMsgAdminReq = 97;
 const unsigned kMsgAdminReply = 100;
-const unsigned kMsgReservedFirst = 96, kMsgReservedLast = 103;   /* 96, 98, 99, 102 stay unused until their own reviews */
+const unsigned kMsgReservedFirst = 96, kMsgReservedLast = 103;   /* 96 and 102 stay unused until their own reviews */
 
 enum Verb { kVerbNone = 0, kVerbKick = 1, kVerbBan = 2, kVerbUnban = 3, kVerbStop = 4, kVerbMakeAdmin = 5, kVerbRemoveAdmin = 6,
-            kVerbSetPassword = 7, kVerbCount = 8 };
+            kVerbSetPassword = 7, kVerbWhere = 8, kVerbMedic = 9, kVerbHeal = 10, kVerbAddItem = 11, kVerbBring = 12, kVerbTp = 13,
+            kVerbGoto = 14, kVerbSetHome = 15, kVerbHome = 16, kVerbJail = 17, kVerbRevive = 18, kVerbRestore = 19, kVerbGod = 20,
+            kVerbCount = 21 };
 const unsigned kFlagSlot = 1u;          /* target is a slot number in decimal */
-const unsigned kFlagsKnown = kFlagSlot;
-const size_t kTargetMax = 64, kExtraMax = 128;
+const unsigned kFlagPickPlayer = 2u;    /* target was typed as @name: a player only (admintool.h kPickPlayer) */
+const unsigned kFlagPickChar = 4u;      /* target was typed as #name: a character only; extra = the player of #name@player */
+const unsigned kFlagAll = 8u;           /* /medic all <player>, /heal all <player>, /restore all <player>: every character of that player's squad */
+const unsigned kFlagGodOn = 16u;        /* /god <name> on (without it: /god <name> off) */
+const unsigned kFlagsKnown = kFlagSlot | kFlagPickPlayer | kFlagPickChar | kFlagAll | kFlagGodOn;
+const size_t kTargetMax = 128, kExtraMax = 128;   /* a name of 32 characters is at most 128 bytes */
+const size_t kOthersMax = 8;            /* a name's owners in ADMIN_REPLY's further names */
+const size_t kNamesMax = 64;            /* ADMIN_REPLY's further names on the wire (a squad move's characters: kSquadNamesMax each list) */
+const float kPosMax = 1.0e7f;           /* ADMIN_REQ's x, z: a number, and not past this */
 const size_t kIdLen = 32;
 
 /* reply codes - the game shows the approved words for each */
@@ -59,11 +88,53 @@ enum Rep { kRepOk = 0,              /* done: kick / ban / unban (name = who), st
            kRepWriteFailed = 8,     /* the world folder's file could not be written: nothing changed */
            kRepUnreadable = 9,      /* the world folder's file is there but could not be read: nothing changed */
            kRepAlready = 10,        /* already so: already an admin, already banned (still kicked) */
-           kRepPasswordShort = 11,  /* the admin password is shorter than adminauth::kPasswordMinChars characters (or has a control byte) */
+           kRepPasswordBad = 11,    /* the admin password is not adminauth::PasswordOk (empty, too long, or a control byte - the game's box makes none) */
            kRepBadRequest = 12,     /* the request could not be read, or names no verb this server knows */
            kRepNotListed = 13,      /* REMOVE ADMIN: that player is not on the admin list */
            kRepNoId = 14,           /* the player's game named no player id the server can keep */
-           kRepCount = 15 };
+           kRepWhereAt = 15,        /* /where: name = the player, x, z = their lead character's map position, place = the town near it ("" none) */
+           kRepWhereNoAnswer = 16,  /* /where: name = the player whose game did not answer in time */
+           kRepNoSuchName = 17,     /* a toolbox command: no player or character by that name */
+           kRepNotInWorld = 18,     /* a toolbox command: name = a player whose game is here but not in the world now */
+           kRepLapsed = 19,         /* a toolbox job: no answer came in time - it may or may not have happened */
+           kRepFailedOnGame = 20,   /* a toolbox job: name = the player on whose game it did not work; nothing changed */
+           kRepPlayerAndChar = 21,  /* a toolbox name: name = a player's name that is also a character of others[0]'s - nothing done */
+           kRepManyChars = 22,      /* a toolbox name: name = a character's name on several games (others = their players, one per
+                                       player, those with one character of that name first: the hint names others[0]) - nothing done */
+           kRepDead = 23,           /* /medic, /heal, /restore: name = the character, who is dead - nothing done */
+           kRepHealedOut = 24,      /* /medic, /heal, /restore: name = the character, healed and still knocked out */
+           kRepSquadHealed = 25,    /* /medic all, /heal all, /restore all: name = the player, num = the characters healed, num2 = the dead left */
+           kRepBrought = 26,        /* /bring: name = the character moved, others[0] = the admin's lead character it went to */
+           kRepMovedTo = 27,        /* /tp: name = the character moved, x, z = where */
+           kRepWent = 28,           /* /goto: name = the admin's lead character, others[0] = the character it went to */
+           kRepHomeSet = 29,        /* /sethome: x, z = the home, place = the town near it ("" none) */
+           kRepNoHome = 30,         /* /home: this admin has no home kept */
+           kRepWentHome = 31,       /* /home: others = the characters moved (the first num) then those knocked out who stayed; num2 = the dead who stayed */
+           kRepJailed = 32,         /* /jail: name = the player, place = the spot's word, others as kRepWentHome */
+           kRepJailNotice = 33,     /* /jail, to every game in the world (req 0): name = the player, place = the spot's word */
+           kRepStillDown = 34,      /* a move: name = the character, knocked out - not moved */
+           kRepRevived = 35,        /* /revive: name = the character brought back, others[0] = the character it came back beside (free) */
+           kRepNoFallen = 36,       /* /revive: no fallen character by that name */
+           kRepReviveNoMate = 37,   /* /revive: name = the player, others[0] = the fallen character - the player has no living character
+                                       for it to come back beside; nothing done */
+           kRepSquadFull = 38,      /* /revive: name = the player, whose squad is already full (the game's character limit); nothing done */
+           kRepNotRevived = 39,     /* /revive: name = the character, not brought back for any other reason; nothing done */
+           kRepBroughtHealed = 40,  /* /bring: as kRepBrought, and the character was knocked out, so it was healed first */
+           kRepGodOn = 41,          /* /god: name = the character, god mode is on now */
+           kRepGodOff = 42,         /* /god: name = the character, god mode is off now */
+           kRepGodAlready = 43,     /* /god on: name = the character, it had god mode on already - nothing changed */
+           kRepGodNotOn = 44,       /* /god off: name = the character, it did not have god mode on - nothing changed */
+           kRepGodDead = 45,        /* /god on: name = the character, dead - nothing changed */
+           kRepManyInSquad = 46,    /* a toolbox name: name = the character, others[0] = the one player whose squad has more than one
+                                       character of that name - nothing done (mockups-t1205.md section 14) */
+           kRepWhereNoChar = 47,    /* /where: name = the player, whose game has no character in the world now (section 14) */
+           kRepNoCharSelected = 48, /* /additem: the admin's own game has no character selected (section 14) */
+           kRepAskerNotInWorld = 49,/* a move or /additem: the admin's OWN game is not in the world now (name = the admin) (section 15) */
+           kRepWhereNobody = 50,    /* /where for everyone: no player is in the world now (section 15) */
+           kRepCount = 51 };
+/* kRepOk for a toolbox verb: /medic, /heal and /restore name = the character healed (/restore: num = the lost limbs grown back,
+   num2 = the robotic limbs left on); /additem name = the admin's lead character and num = the
+   items that went in (the admin's game knows the item and the count it asked) */
 
 /* ---- the typed line (the game's): "/kick <name>", "/ban <name> [reason]", "/unban <name or id>", "/stop" ---- */
 inline bool IsSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
@@ -96,6 +167,19 @@ inline const char* VerbName(int v)
     case kVerbMakeAdmin: return "make-admin";
     case kVerbRemoveAdmin: return "remove-admin";
     case kVerbSetPassword: return "set-admin-password";
+    case kVerbWhere: return "/where";
+    case kVerbMedic: return "/medic";
+    case kVerbHeal: return "/heal";
+    case kVerbAddItem: return "/additem";
+    case kVerbBring: return "/bring";
+    case kVerbTp: return "/tp";
+    case kVerbGoto: return "/goto";
+    case kVerbSetHome: return "/sethome";
+    case kVerbHome: return "/home";
+    case kVerbJail: return "/jail";
+    case kVerbRevive: return "/revive";
+    case kVerbRestore: return "/restore";
+    case kVerbGod: return "/god";
     default: return "unknown";
     }
 }
@@ -146,8 +230,12 @@ inline int Parse(const std::string& typed, Cmd* out)
 }
 
 /* ---- the wire ---- */
-struct Req { unsigned req, verb, flags; std::string target, extra; Req() : req(0), verb(0), flags(0) {} };
-struct Reply { unsigned req, verb, code, num; std::string name; Reply() : req(0), verb(0), code(0), num(0) {} };
+struct Req { unsigned req, verb, flags; std::string target, extra; float x, z; Req() : req(0), verb(0), flags(0), x(0.0f), z(0.0f) {} };
+struct Reply
+{
+    unsigned req, verb, code, num; std::string name; float x, z; std::string place; unsigned num2; std::vector<std::string> others;
+    Reply() : req(0), verb(0), code(0), num(0), x(0.0f), z(0.0f), num2(0) {}
+};
 inline void PutU32(std::vector<char>* b, unsigned v) { for (int i = 0; i < 4; ++i) b->push_back((char)(unsigned char)(v >> (8 * i))); }
 inline bool GetU32(const char* p, size_t n, size_t* at, unsigned* v)
 {
@@ -155,6 +243,8 @@ inline bool GetU32(const char* p, size_t n, size_t* at, unsigned* v)
     *v = 0; for (int i = 0; i < 4; ++i) *v |= (unsigned)(unsigned char)p[*at + i] << (8 * i);
     *at += 4; return true;
 }
+inline void PutF32(std::vector<char>* b, float f) { unsigned v = 0; std::memcpy(&v, &f, 4); PutU32(b, v); }
+inline bool GetF32(const char* p, size_t n, size_t* at, float* f) { unsigned v = 0; if (!GetU32(p, n, at, &v)) return false; std::memcpy(f, &v, 4); return true; }
 inline bool PutStr8(std::vector<char>* b, const std::string& s, size_t cap)
 {
     if (s.size() > cap || s.size() > 255) return false;
@@ -174,7 +264,9 @@ inline bool GetStr8(const char* p, size_t n, size_t* at, size_t cap, std::string
 inline bool EncodeReq(const Req& r, std::vector<char>* b)
 {
     b->clear(); PutU32(b, r.req); PutU32(b, r.verb); PutU32(b, r.flags);
-    return PutStr8(b, r.target, kTargetMax) && PutStr8(b, r.extra, kExtraMax);
+    if (!PutStr8(b, r.target, kTargetMax) || !PutStr8(b, r.extra, kExtraMax)) return false;
+    PutF32(b, r.x); PutF32(b, r.z);
+    return true;
 }
 /* the whole payload, nothing left over; a verb this build knows; known flags only; no control byte in either text */
 inline bool DecodeReq(const char* p, size_t n, Req* r)
@@ -183,20 +275,34 @@ inline bool DecodeReq(const char* p, size_t n, Req* r)
     if (p == 0 && n != 0) return false;
     if (!GetU32(p, n, &at, &r->req) || !GetU32(p, n, &at, &r->verb) || !GetU32(p, n, &at, &r->flags)) return false;
     if (!GetStr8(p, n, &at, kTargetMax, &r->target) || !GetStr8(p, n, &at, kExtraMax, &r->extra)) return false;
+    if (!GetF32(p, n, &at, &r->x) || !GetF32(p, n, &at, &r->z)) return false;
+    if (!(r->x == r->x) || !(r->z == r->z) || r->x > kPosMax || r->x < -kPosMax || r->z > kPosMax || r->z < -kPosMax) return false;
     if (at != n || r->verb == kVerbNone || r->verb >= (unsigned)kVerbCount || (r->flags & ~kFlagsKnown) != 0) return false;
     return true;
 }
 inline bool EncodeReply(const Reply& r, std::vector<char>* b)
 {
     b->clear(); PutU32(b, r.req); PutU32(b, r.verb); PutU32(b, r.code); PutU32(b, r.num);
-    return PutStr8(b, r.name, kTargetMax);
+    if (!PutStr8(b, r.name, kTargetMax)) return false;
+    PutF32(b, r.x); PutF32(b, r.z);
+    if (!PutStr8(b, r.place, kTargetMax)) return false;
+    PutU32(b, r.num2);
+    if (r.others.size() > kNamesMax) return false;
+    b->push_back((char)(unsigned char)r.others.size());
+    for (size_t i = 0; i < r.others.size(); ++i) if (!PutStr8(b, r.others[i], kTargetMax)) return false;
+    return true;
 }
 inline bool DecodeReply(const char* p, size_t n, Reply* r)
 {
     size_t at = 0;
     if (p == 0 && n != 0) return false;
     if (!GetU32(p, n, &at, &r->req) || !GetU32(p, n, &at, &r->verb) || !GetU32(p, n, &at, &r->code) || !GetU32(p, n, &at, &r->num)) return false;
-    if (!GetStr8(p, n, &at, kTargetMax, &r->name)) return false;
+    if (!GetStr8(p, n, &at, kTargetMax, &r->name) || !GetF32(p, n, &at, &r->x) || !GetF32(p, n, &at, &r->z) || !GetStr8(p, n, &at, kTargetMax, &r->place)) return false;
+    if (!GetU32(p, n, &at, &r->num2) || at >= n) return false;
+    const size_t k = (size_t)(unsigned char)p[at]; ++at;
+    if (k > kNamesMax) return false;
+    r->others.assign(k, std::string());
+    for (size_t i = 0; i < k; ++i) if (!GetStr8(p, n, &at, kTargetMax, &r->others[i])) return false;
     return at == n && r->code < (unsigned)kRepCount;
 }
 /* a slot number in decimal (kFlagSlot): 1 to 4 digits */
@@ -209,43 +315,44 @@ inline bool SlotText(const std::string& t, int* slot)
 }
 
 /* ---- who may ---- */
-struct Asker { bool ownerToken; bool loggedIn; Asker() : ownerToken(false), loggedIn(false) {} };
-/* ownerToken = the target is a connection that proved HOST_TOKEN (the owner's own game); owner = the target's game names the owner's
-   player id without being that connection */
-struct Target { bool self, owner, admin, ownerToken; Target() : self(false), owner(false), admin(false), ownerToken(false) {} };
-/* is the asker an admin now (the owner's token, or logged in) */
-inline bool AdminNow(const Asker& a) { return a.ownerToken || a.loggedIn; }
+/* owner = the asker's connection is logged in with the owner password; loggedIn = logged in with the admin password */
+struct Asker { bool owner; bool loggedIn; Asker() : owner(false), loggedIn(false) {} };
+/* owner = the target's connection is logged in with the owner password; ownerPerson = the target's game names the person of a
+   connection logged in as the owner (a ban would put the owner's own id in bans.txt); admin = its person is listed in admins.txt */
+struct Target { bool self, owner, ownerPerson, admin; Target() : self(false), owner(false), ownerPerson(false), admin(false) {} };
+/* is the asker an admin now (the owner, or logged in) */
+inline bool AdminNow(const Asker& a) { return a.owner || a.loggedIn; }
 /* may this asker do this verb at all (before the target is known): kRepOk, kRepNotAdmin, kRepOwnerOnly, kRepBadRequest */
 inline int MayAsk(int verb, const Asker& a)
 {
     if (verb <= kVerbNone || verb >= kVerbCount) return kRepBadRequest;
-    if (verb == kVerbMakeAdmin || verb == kVerbRemoveAdmin || verb == kVerbSetPassword) return a.ownerToken ? kRepOk : (a.loggedIn ? kRepOwnerOnly : kRepNotAdmin);
+    if (verb == kVerbMakeAdmin || verb == kVerbRemoveAdmin || verb == kVerbSetPassword) return a.owner ? kRepOk : (a.loggedIn ? kRepOwnerOnly : kRepNotAdmin);
     return AdminNow(a) ? kRepOk : kRepNotAdmin;
 }
-/* kick / ban on a player: kRepOk, kRepNotYourself, kRepProtected. The owner's own game (the connection that proved HOST_TOKEN) is
-   never kicked or banned. A game naming the owner's player id on another connection is protected from every admin but the owner's own
-   game, which may kick it - never ban it, since that would put the owner's own id in bans.txt. Another admin only by the owner's
-   own game. */
+/* kick / ban on a player: kRepOk, kRepNotYourself, kRepProtected. The owner (a connection logged in with the owner password) is
+   never kicked or banned. Another game naming the owner's person is protected from every admin but the owner, who may kick it -
+   never ban it, since that would put the owner's own id in bans.txt. Another admin only by the owner. */
 inline int MayActOn(int verb, const Asker& a, const Target& t)
 {
     const int m = MayAsk(verb, a);
     if (m != kRepOk) return m;
     if (verb != kVerbKick && verb != kVerbBan) return kRepOk;
     if (t.self) return kRepNotYourself;
-    if (t.ownerToken) return kRepProtected;
-    if (t.owner && (!a.ownerToken || verb == kVerbBan)) return kRepProtected;
-    if (t.admin && !a.ownerToken) return kRepProtected;
+    if (t.owner) return kRepProtected;
+    if (t.ownerPerson && (!a.owner || verb == kVerbBan)) return kRepProtected;
+    if (t.admin && !a.owner) return kRepProtected;
     return kRepOk;
 }
 
 /* ---- the PLAYERS roster's op bits (joinstage.h RosterRow.op) ---- */
 const unsigned kOpSteward = 1u, kOpAdmin = 2u, kOpOwner = 4u, kOpBits = 7u;
-/* one row's bits for one recipient: the steward bit for everyone; the admin-list and owner bits only in the copy of the owner's own
-   game (it alone may MAKE / REMOVE ADMIN), so nobody else learns who is listed. A login is never marked. */
-inline unsigned RosterOp(bool steward, bool listedAdmin, bool owner, bool recipientOwnerToken)
+/* one row's bits for one recipient: the steward bit for everyone; the admin-list and owner bits (owner = that connection is logged
+   in with the owner password) only in the copy of the owner (it alone may MAKE / REMOVE ADMIN), so nobody else learns who is
+   listed. An admin login is never marked. */
+inline unsigned RosterOp(bool steward, bool listedAdmin, bool owner, bool recipientOwner)
 {
     unsigned op = steward ? kOpSteward : 0u;
-    if (recipientOwnerToken) { if (listedAdmin) op |= kOpAdmin; if (owner) op |= kOpOwner; }
+    if (recipientOwner) { if (listedAdmin) op |= kOpAdmin; if (owner) op |= kOpOwner; }
     return op;
 }
 
@@ -411,14 +518,70 @@ inline bool ReadPieceKeep(std::string* out, const char* buf, size_t got, size_t 
      makeadmin <slot> | removeadmin <slot>     the PLAYERS tab's MAKE ADMIN / REMOVE ADMIN road
      type login right | type login wrong | type logout | type kick <slot> | type ban <slot> | type ban nobody | type unban <slot>
        | type stop                             that line through the road a typed chat line starting with '/' takes (AdminTyped),
-                                               the player's name looked up from the slot ---- */
+                                               the player's name looked up from the slot
+     typeline <word> [<word> ..]               (T-1205) any line through that road - see TestLineJoin below ---- */
 static const char kTestPassword[] = "sample-admin";        /* 12 characters, made up: the test admin password (never logged) */
 static const char kTestWrongPassword[] = "sample-wrong";   /* 12 characters, made up: not the test admin password */
 static const char kTestNobody[] = "Nobody-Here";           /* a made-up name for "no player by that name" */
-enum { kTestNone = 0, kTestSetPw = 1, kTestMakeAdmin = 2, kTestRemoveAdmin = 3, kTestType = 4 };
+enum { kTestNone = 0, kTestSetPw = 1, kTestMakeAdmin = 2, kTestRemoveAdmin = 3, kTestType = 4, kTestTypeLine = 5 };
 enum { kTypeNone = 0, kTypeLoginRight = 1, kTypeLoginWrong = 2, kTypeLogout = 3, kTypeKick = 4, kTypeBan = 5, kTypeBanNobody = 6,
        kTypeUnban = 7, kTypeStop = 8 };
-struct TestAsk { int kind, type, slot; TestAsk() : kind(kTestNone), type(kTypeNone), slot(-1) {} };
+/* ---- `admintest typeline <words>` (TEST-ONLY, T-1205): ANY line typed through the road a typed chat line starting with '/' takes
+   (AdminTyped, the same call the chat box's Enter makes) - "/" + the words, one space between them. A run's command line cannot hold
+   '/', '"', '#' or a name the run does not know, so four word forms are filled in by the game it is sent to:
+     name:<uid>      that loaded character's name, quoted when it holds a space (a name with a quote mark: no line)
+     player:<slot>   that slot's player name on this link's roster, quoted the same way
+     q:<text>        '"' + text: an opening quote with no closing one (the typing mistake)
+     hash:<text>     '#' + text (a character picked by name: #name or #name@player)
+   Any other word is typed as it is. A first word that already starts with '/' gets no second one. ---- */
+enum { kLineWordPlain = 0, kLineWordChar = 1, kLineWordPlayer = 2 };
+struct LineWord { int kind; std::string text; unsigned num; LineWord() : kind(kLineWordPlain), num(0) {} };
+struct TestAsk { int kind, type, slot; std::vector<LineWord> words; TestAsk() : kind(kTestNone), type(kTypeNone), slot(-1) {} };
+/* a uid word: 1 to 10 digits, 1 .. 4294967295 */
+inline bool UidText(const std::string& t, unsigned* uid)
+{
+    if (t.empty() || t.size() > 10) return false;
+    unsigned long long v = 0;
+    for (size_t i = 0; i < t.size(); ++i) { if (t[i] < '0' || t[i] > '9') return false; v = v * 10 + (unsigned)(t[i] - '0'); }
+    if (v == 0 || v > 0xFFFFFFFFull) return false;
+    *uid = (unsigned)v; return true;
+}
+/* one typeline word: false = a name:/player: word without its number, or a q:/hash: word with nothing after it */
+inline bool LineWordOf(const std::string& w, LineWord* out)
+{
+    *out = LineWord();
+    if (w.compare(0, 5, "name:") == 0) { out->kind = kLineWordChar; return UidText(w.substr(5), &out->num); }
+    if (w.compare(0, 7, "player:") == 0)
+    {
+        int slot = -1;
+        if (!SlotText(w.substr(7), &slot)) return false;
+        out->kind = kLineWordPlayer; out->num = (unsigned)slot; return true;
+    }
+    if (w.compare(0, 2, "q:") == 0) { if (w.size() == 2) return false; out->text = "\"" + w.substr(2); return true; }
+    if (w.compare(0, 5, "hash:") == 0) { if (w.size() == 5) return false; out->text = "#" + w.substr(5); return true; }
+    out->text = w;
+    return true;
+}
+/* the typeline's line: `names[i]` fills word i where it is a name:/player: word (quoted when it holds a space). "" = no line (a name
+   needed and empty, or one with a quote mark in it) */
+inline std::string TestLineJoin(const std::vector<LineWord>& words, const std::vector<std::string>& names)
+{
+    std::string line;
+    for (size_t i = 0; i < words.size(); ++i)
+    {
+        std::string w = words[i].text;
+        if (words[i].kind != kLineWordPlain)
+        {
+            if (i >= names.size() || names[i].empty() || names[i].find('"') != std::string::npos) return std::string();
+            w = names[i];
+            if (w.find(' ') != std::string::npos || w.find('\t') != std::string::npos) w = "\"" + w + "\"";
+        }
+        if (i > 0) line += ' ';
+        else if (w.empty() || w[0] != '/') line += '/';
+        line += w;
+    }
+    return line;
+}
 inline std::vector<std::string> TestWords(const std::string& s)
 {
     std::vector<std::string> w;
@@ -444,6 +607,13 @@ inline bool TestParse(const std::string& args, TestAsk* out)
     {
         if (w.size() != 2 || !SlotText(w[1], &slot)) return false;
         out->kind = w[0] == "makeadmin" ? kTestMakeAdmin : kTestRemoveAdmin; out->slot = slot;
+        return true;
+    }
+    if (w[0] == "typeline")
+    {   /* at most 16 words after it; each one a form LineWordOf takes */
+        if (w.size() < 2 || w.size() > 17) return false;
+        for (size_t i = 1; i < w.size(); ++i) { LineWord lw; if (!LineWordOf(w[i], &lw)) { out->words.clear(); return false; } out->words.push_back(lw); }
+        out->kind = kTestTypeLine;
         return true;
     }
     if (w[0] != "type" || w.size() < 2) return false;

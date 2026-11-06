@@ -5,7 +5,7 @@
    and race skill bonuses are capped at +-20% and do not stack. These rules can.
 
    PURE: no Windows.h, no engine, no globals, no I/O. Compiled into the plugin (src/coop-plugin/kapi.cpp), the world server
-   (src/coop-store/store_main.cpp OptionValueOk / OnOptions) and the offline suite (src/coop-test), so the three cannot hold
+   (src/coop-store/store_main.cpp through worldrace.h) and the offline suite (src/coop-test), so the three cannot hold
    different ideas of the file, the keys or their values.
 
    THE FILE, one rule per line, # starts a comment (outside quotes), blank lines are ignored:
@@ -24,7 +24,8 @@
    A line that does not parse is SKIPPED and counted (Report().skipped, the first kMaxWhy with their reason); it never
    stops the file being read.
 
-   THE WORLD'S COPY. The session authority's game turns its file into option rows, one per race:
+   THE WORLD'S COPY (T-1209, owner 1414 d): the world's own kenshi_api.cfg, in its folder beside rules.txt, is read by the world
+   server (src/common/worldrace.h) and turned into option rows, one per race:
        key    race.<string id, ASCII lower case>          (1..kMaxSidLen bytes of id; no control character, no tab)
        value  parts in this order, joined by ';', each present only when the race has that rule:
                 s<bits>                 blocked slots, bit (1 << Slot), 1..255
@@ -34,7 +35,7 @@
                 a<mult100>              anim_speed x100 (5..1000)
               integers in decimal with no '+' and no leading zero; at most kMaxValueLen bytes. Example: s63;w;x11:4000,16:-9900
    Every game builds its rules from the world's rows alone; solo play builds them from its own file's rows - one road.
-   An empty value sent for a race key asks the world server to remove that race's row. At most kMaxRaceKeys race rows.
+   A game never sets them: the world server refuses a race row a game sends. At most kMaxRaceKeys race rows.
 
    C++03 (VS2010 v100). Header-only. */
 #pragma once
@@ -356,7 +357,7 @@ typedef bool (*VerbFn)(RaceRules* r, const std::vector<std::string>& args, std::
 
 inline bool VerbBlockSlot(RaceRules* r, const std::vector<std::string>& args, std::string* why)
 {
-    if (args.empty()) { *why = "block_slot needs at least one slot"; return false; }
+    if (args.empty()) { *why = "\"block_slot\" needs at least one equipment slot"; return false; }
     unsigned bits = 0;
     for (size_t i = 0; i < args.size(); ++i)
     {
@@ -369,55 +370,55 @@ inline bool VerbBlockSlot(RaceRules* r, const std::vector<std::string>& args, st
             if (!part.empty())
             {
                 const int s = SlotFromName(part);
-                if (s < 0) { *why = "unknown slot '" + part + "'"; return false; }
+                if (s < 0) { *why = "\"" + part + "\" is not an equipment slot"; return false; }
                 bits |= (1u << s);
             }
             if (bar == std::string::npos) break;
             start = bar + 1;
         }
     }
-    if (bits == 0) { *why = "block_slot needs at least one slot"; return false; }
+    if (bits == 0) { *why = "\"block_slot\" needs at least one equipment slot"; return false; }
     r->blockedSlots |= bits;
     return true;
 }
 
 inline bool VerbNoWeaponInHand(RaceRules* r, const std::vector<std::string>& args, std::string* why)
 {
-    if (!args.empty()) { *why = "no_weapon_in_hand takes no arguments"; return false; }
+    if (!args.empty()) { *why = "\"no_weapon_in_hand\" takes nothing after it"; return false; }
     r->noWeaponInHand = true;
     return true;
 }
 
 inline bool VerbSkillXp(RaceRules* r, const std::vector<std::string>& args, std::string* why)
 {
-    if (args.size() != 2) { *why = "skill_xp needs <skill> <percent>"; return false; }
+    if (args.size() != 2) { *why = "\"skill_xp\" needs a skill and a percent"; return false; }
     const int sk = SkillFromName(args[0]);
-    if (sk < 0) { *why = "unknown skill '" + args[0] + "'"; return false; }
+    if (sk < 0) { *why = "\"" + args[0] + "\" is not a skill"; return false; }
     double pct = 0;
-    if (!ParseNumber(args[1], true, &pct)) { *why = "skill_xp percent '" + args[1] + "' is not a number"; return false; }
-    if (pct < -100.0 || pct > 1000.0) { *why = "skill_xp percent out of range -100..+1000"; return false; }
+    if (!ParseNumber(args[1], true, &pct)) { *why = "\"" + args[1] + "\" is not a number"; return false; }
+    if (pct < -100.0 || pct > 1000.0) { *why = "\"" + args[1] + "\" is outside -100 to 1000"; return false; }
     r->SetXp(sk, Steps(pct, 100.0));
     return true;
 }
 
 inline bool VerbStatCap(RaceRules* r, const std::vector<std::string>& args, std::string* why)
 {
-    if (args.size() != 2) { *why = "stat_cap needs <skill> <max>"; return false; }
+    if (args.size() != 2) { *why = "\"stat_cap\" needs a skill and a highest value"; return false; }
     const int sk = SkillFromName(args[0]);
-    if (sk < 0) { *why = "unknown skill '" + args[0] + "'"; return false; }
+    if (sk < 0) { *why = "\"" + args[0] + "\" is not a skill"; return false; }
     double v = 0;
-    if (!ParseNumber(args[1], false, &v)) { *why = "stat_cap max '" + args[1] + "' is not a number"; return false; }
-    if (v < 0.0 || v > 1000.0) { *why = "stat_cap max out of range 0..1000"; return false; }
+    if (!ParseNumber(args[1], false, &v)) { *why = "\"" + args[1] + "\" is not a number"; return false; }
+    if (v < 0.0 || v > 1000.0) { *why = "\"" + args[1] + "\" is outside 0 to 1000"; return false; }
     r->SetCap(sk, Steps(v, 10.0));
     return true;
 }
 
 inline bool VerbAnimSpeed(RaceRules* r, const std::vector<std::string>& args, std::string* why)
 {
-    if (args.size() != 1) { *why = "anim_speed needs <multiplier>"; return false; }
+    if (args.size() != 1) { *why = "\"anim_speed\" needs a number"; return false; }
     double v = 0;
-    if (!ParseNumber(args[0], false, &v)) { *why = "anim_speed '" + args[0] + "' is not a number"; return false; }
-    if (v < 0.05 || v > 10.0) { *why = "anim_speed out of range 0.05..10"; return false; }
+    if (!ParseNumber(args[0], false, &v)) { *why = "\"" + args[0] + "\" is not a number"; return false; }
+    if (v < 0.05 || v > 10.0) { *why = "\"" + args[0] + "\" is outside 0.05 to 10"; return false; }
     r->SetAnim(Steps(v, 100.0));
     return true;
 }
@@ -573,24 +574,10 @@ inline int TrimRaceKeys(std::map<std::string, std::string>* m)
     }
     return cut;
 }
-/* THE WORLD SERVER'S STEP for one race row the authority sent, on its candidate map (store_main.cpp OnOptions): an empty
-   value removes the row (the authority's kenshi_api.cfg no longer names that race); any other value must be canonical
-   (OptionValueOk) and find room (RaceKeyRoom). T-1157 review fold: one pure step, so the offline suite tests what the server does. */
-enum { kRowUnchanged = 0, kRowChanged = 1, kRowBadValue = -1, kRowNoRoom = -2 };
-inline int RaceRowStep(std::map<std::string, std::string>* m, const std::string& k, const std::string& v)
-{
-    if (v.empty()) return m->erase(k) != 0 ? kRowChanged : kRowUnchanged;
-    if (!OptionValueOk(k, v)) return kRowBadValue;
-    if (!RaceKeyRoom(*m, k)) return kRowNoRoom;
-    std::map<std::string, std::string>::const_iterator have = m->find(k);
-    if (have != m->end() && have->second == v) return kRowUnchanged;
-    (*m)[k] = v;
-    return kRowChanged;
-}
 /* THE WORLD SERVER'S DEFERRED MERGE (store_main.cpp OptionsDeferredRetry): the changes held while options.txt could not be
    read are laid on the rows the file holds (an empty value for a race key takes that row out), then the race rows past the
-   first kMaxRaceKeys are trimmed. A race row the file holds and the authority never removed comes back here; the authority
-   sees it in the map that follows and asks for its removal. Returns how many race rows were trimmed. */
+   first kMaxRaceKeys are trimmed. Returns how many race rows were trimmed. (T-1209: rules.txt holds no race rows and a game's are
+   refused, so on the world server this lays only the other rules.) */
 inline int MergeHeldChanges(std::map<std::string, std::string>* merged, const std::map<std::string, std::string>& held)
 {
     for (std::map<std::string, std::string>::const_iterator it = held.begin(); it != held.end(); ++it)
@@ -610,11 +597,11 @@ public:
     bool ParseLine(const std::string& line, std::string* why)
     {
         std::vector<std::string> t;
-        if (!Tokenize(line, &t)) { *why = "unclosed quote"; return false; }
+        if (!Tokenize(line, &t)) { *why = "a quote mark is not closed"; return false; }
         if (t.empty()) return true;
-        if (!IEquals(t[0], "race")) { *why = "a rule starts with 'race'"; return false; }
-        if (t.size() < 3) { *why = "needs race <race> <verb> ..."; return false; }
-        if (!SidOk(t[1])) { *why = "the race string ID is empty, too long or holds a control character"; return false; }
+        if (!IEquals(t[0], "race")) { *why = "a rule must start with \"race\""; return false; }
+        if (t.size() < 3) { *why = "a rule needs a race and what to set: race <race> <rule> ..."; return false; }
+        if (!SidOk(t[1])) { *why = "the race id is empty, too long or holds a character that cannot be printed"; return false; }
         int n = 0;
         const VerbRow* v = Verbs(&n);
         for (int i = 0; i < n; ++i)
@@ -626,7 +613,7 @@ public:
             *Ensure(t[1], true) = scratch;
             return true;
         }
-        *why = "unknown verb '" + t[2] + "'";
+        *why = "\"" + t[2] + "\" is not a rule this file can set";
         return false;
     }
 
@@ -788,27 +775,6 @@ private:
     Report                 m_report;
 };
 
-/* WHAT THE AUTHORITY SENDS so the world's race rows become exactly `own`: first an empty value for every world race row `own`
-   does not have (removals first, so the world server's kMaxRaceKeys room is free for the new rows), then every row of `own` the
-   world lacks or holds with another value. Empty = the world already matches. At most 2 x kMaxRaceKeys pairs. */
-inline Rows RowsToSend(const Rows& world, const Rows& own)
-{
-    Rows out;
-    for (size_t i = 0; i < world.size(); ++i)
-    {
-        if (!IsOptionKey(world[i].first)) continue;
-        bool kept = false;
-        for (size_t j = 0; j < own.size() && !kept; ++j) if (own[j].first == world[i].first) kept = true;
-        if (!kept) out.push_back(std::make_pair(world[i].first, std::string()));
-    }
-    for (size_t j = 0; j < own.size(); ++j)
-    {
-        bool same = false;
-        for (size_t i = 0; i < world.size() && !same; ++i) if (world[i].first == own[j].first && world[i].second == own[j].second) same = true;
-        if (!same) out.push_back(own[j]);
-    }
-    return out;
-}
 
 /* the race rows of a set in one text, sorted by key - two sets with the same text hold the same rules */
 inline std::string RowsText(const Rows& rows)
@@ -819,20 +785,5 @@ inline std::string RowsText(const Rows& rows)
     for (std::map<std::string, std::string>::const_iterator it = m.begin(); it != m.end(); ++it) t += it->first + "=" + it->second + "\n";
     return t;
 }
-
-/* THE AUTHORITY'S RESEND BOUND on one link. An ask is the world's race rows and the request made against them, in one text.
-   The authority asks again only while the world's rows still differ from its file's: the same request against the same world
-   rows at most kMaxSameAsk times (one retry covers a refused write and a map that crossed the send), and at most
-   kMaxAsksPerLink requests in all, so a world that keeps answering with other rows cannot make it send in a loop. */
-enum { kMaxSameAsk = 2, kMaxAsksPerLink = 8 };
-struct AskBound
-{
-    std::string last;
-    int same, asks;
-    AskBound() : same(0), asks(0) {}
-    void Reset() { last.clear(); same = 0; asks = 0; }
-    bool Allowed(const std::string& ask) const { return asks < kMaxAsksPerLink && !(ask == last && same >= kMaxSameAsk); }
-    void Sent(const std::string& ask) { if (ask == last) ++same; else { last = ask; same = 1; } ++asks; }
-};
 
 }   /* namespace kapi */

@@ -289,7 +289,7 @@ enum MsgType
     // SWING_END (game-to-game protocol 185; the owner's game -> its character's area, on SWING's road and lane, so it never
     // overtakes its SWING): one of this game's characters that sent SWING left the attack state - the owner's swing is over. The
     // copy drops the swing credit it did not spend in time (src/common/swinggate.h OwnerEnd). RELIABLE.
-    //   uid u32 | targetUid u32 (the target its SWING named)   (src/common/hitwire.h)
+    //   uid u32 | targetUid u32 (the target its SWING named) | end u8 (what the swing met there)   (src/common/hitwire.h)
     MSG_SWING_END = 81,
     // SHOT_FIRED (game-to-game protocol 186; the game that runs the shooter -> every game in the shooter's area, on the character
     // stream's road; taken only for a copy of the shooter, from the game that runs it): its engine fired one bolt at that target.
@@ -308,7 +308,18 @@ enum MsgType
     // names it, or bare hands - sent once per change. That game's copy draws the same item from its own section through the
     // engine's draw, or puts its held item away (combat.cpp HandApplyDrain). RELIABLE.
     //   uid u32 | has u8 | when has = 1: secLen u8 | section | x i32 | y i32 | sidLen u8 | sid   (src/common/handwire.h)
-    MSG_HAND = 84
+    MSG_HAND = 84,
+    // BOX_LOCK (T-1061, game-to-game protocol 207): a chest's lock. ASK (the picker's game -> the box's writer, the area's holder): this
+    // game's pick opened its copy of the box; the writer opens its own and writes the box's record (its lock block), or answers NO
+    // (writer -> the picker) with its lock, which the picker lays back. RELIABLE.
+    //   kind u8 (1 ASK, 2 NO) | u32 len + the box's position key | locked u8 | broken u8 | level i32 | hardness f32   (src/common/boxrec.h)
+    MSG_BOX_LOCK = 85,
+    // RESEARCH_BOOK (T-1242, game-to-game protocol 211; 86 / 87 are held by effort/t1122a): a research's Books in a teammate's bench.
+    // ASK (the researcher's game -> the bench owner's game, by slot): take these counts from these benches of yours; ANSWER (back): yes
+    // with what was taken, or no; GIVEBACK / DONE (the researcher's game -> the bench owner's): put back what you took / forget it. RELIABLE.
+    //   u8 op | u32 reqId | u16 askerSlot | u8 why | u8 len + tech sid | u8 n | n x (u8 len + bench key | u8 len + item sid | i32 count)
+    //   (src/common/bookshare.h)
+    MSG_RESEARCH_BOOK = 88
 };
 
 enum Channel
@@ -481,6 +492,9 @@ ITransport* CreateTransport(BackendId which);
 /* One [NET] TRAFFIC REPORT line per kind of link that carried a message since the last call (src/common/typetally.h), then a new
    window. MAIN THREAD. Defined in net/enet_transport.cpp. */
 void TrafficReportTick();
+/* T-1168 (owner 1425 a) TEST-ONLY, the command verb `netthrottle off|on` (src/common/netthrottle.h's Mode): every live ENet link of this
+   game gets the mode's ENet throttle terms, with one [NET] line; answers the status text. MAIN THREAD. Defined in net/enet_transport.cpp. */
+std::string NetThrottleSet(int mode);
 
 const char* MsgTypeName(MsgType t);
 const char* LinkStateName(LinkState s);

@@ -74,6 +74,11 @@ std::string PolicyReport();   // the " basePolicy[...]" tokens for the [STORE] R
 // getDefaultTask and getMouseCursor called through the engine's dispatch, so the hooks answer and count - plus the request
 // gate's judgement, not counted; one [TEAM] access line. MAIN THREAD. Returns the status.
 std::string PolicyTeamAccessProbe(int ownerSlot, const std::string& cls);
+// T-1241 (decision 1487 a) TEST-ONLY, READ-ONLY: the cursor this game's hover would show on `building` (any class), with its
+// owner faction, whether the mod answers it as this player's own (the OwnedByAPlayerFaction hook at the hover's sites) and the
+// engine's reads (swaccess::BoxHoverCursor). Nothing is called that writes; no counter moves. false = not read (*text says why).
+// MAIN THREAD.
+bool PolicyBoxHoverRead(void* building, std::string* text);
 // T-546 step 4b: MAIN THREAD - this game's teammates' factions (at most 16; 0 / n = 0 = none) for the box stub, which lets a
 // teammate's box clicked as this player's own take the loot road in PlayerInterface::buildingSelected's inline owner test. Each cell
 // is written only when it changes.
@@ -81,6 +86,10 @@ void PolicyTeammateFactions(void* const* facs, int n);
 // T-923: the near-town owner stub's hits (a teammate's town forgotten by the build cursor's "too close to another town" rule as
 // a player's own), -1 while the stub is not patched; *why (may be 0) gets the install answer. Any thread.
 long long PolicyNearTownHits(const char** why);
+// T-1240 (T2039 LEG R): the house owner stub's teammate-match count, -1 while it is not patched (*why, may be 0, the install
+// answer); and the factions its cells hold now (at most cap, the count returned). Any thread.
+long long PolicyHouseOwnerHits(const char** why);
+int PolicyHouseOwnerCells(void** out, int cap);
 // T-968: MAIN THREAD - every other player's faction on this game (the stand-in table, an old save's coop-peer and each coop-p<n>
 // record the loaded world carries for another slot; 0 / n = 0 = none) for the foliage stub, which keeps near another player's
 // outpost copy the avoid-towns world objects the owner's game keeps. Called at each change; a faction keeps its cell while it
@@ -101,6 +110,9 @@ int PolicyTeammateSlotIsMate(int slot);
 // T-923: this game's current teammates' factions (the cells PolicyTeammateFactions keeps, each checked again with
 // PolicyTeammateSlot), at most cap; 0 while this game's player is in no team. MAIN THREAD (the cells are written there).
 int PolicyTeammateFactionList(void** out, int cap);
+// T-1242: 1 = a research bench (its vtable +0x4B0 slot is ResearchBuilding::operate, row ResearchOperate, one E9 stub followed), 0 = not,
+// -1 unreadable / no row. Read-only. ANY THREAD.
+int PolicyIsResearchBench(void* b);
 // T-546 step 4b: the `team click <slot> [class]` lever - a real click (the engine's own buildingSelected) on that player's nearest
 // loaded building; one [TEAM] click line with the hook counters that moved. MAIN THREAD. Returns the status.
 std::string PolicyTeamClick(int ownerSlot, const std::string& cls);
@@ -108,6 +120,17 @@ std::string PolicyTeamClick(int ownerSlot, const std::string& cls);
 // goes to whatever this player has selected). 1 called (*answer = its bool, *byteWas = the click byte before), 0 the call faulted,
 // -1 no world / no address row / not a readable object, -2 no player interface, -3 the building's position unread. MAIN THREAD.
 int PolicyClickBuilding(void* building, int* answer, int* byteWas);
+// T-1191 TEST-ONLY: the player's LEFT click on a named building, as the game makes it - buildingSelected with the left-release byte
+// (+0x2F1) set and the right-release byte (+0x2F3) clear for the call, both put back (its tail hands the building to the select call
+// 0x7F8460; the building's select virtual opens its own inventory window when its faction has a player interface). 1 called
+// (*answer = its bool), 0 faulted, -1 / -2 / -3 as PolicyClickBuilding. *leftWas / *rightWas: the two bytes before; *selected: the
+// building is the interface's selected object afterwards (-1 unread); *gate: built and its faction has a player interface (the
+// select virtual's own test, -1 unread). MAIN THREAD.
+int PolicyLeftClickBuilding(void* building, int* answer, int* leftWas, int* rightWas, int* selected, int* gate);
+// T-1191 TEST-ONLY: what the building's faction reads on this game, as one piece of text (rcgive::BFacText): its name and id, its own
+// faction field set or empty ("nofac"), this game's player faction or not, its player-controller field, its stand-in slot, the
+// finished byte, and the select gate's answer from those two inputs. Reads only. MAIN THREAD.
+std::string PolicyBuildingFactionText(void* building);
 // T-546 step 7: the `team orders <slot>` lever - for this game's own first character and that player's first character: the engine's
 // PlayerInterface::isEnemy, the interaction menu the engine builds on it (the list made and the list shown) and the right-click
 // handler as a hover; one [TEAM] orders line. MAIN THREAD. Returns the status.
@@ -123,5 +146,14 @@ void PolicyKitTick();
 // T-942: the class of `faction` in the kit table (swaccess::Who: own by its PlayerInterface, else the table's row, else not a
 // player). ANY THREAD.
 int PolicyKitClassOf(void* faction);
+// T-1222 (owner 1444): 1 when the live building is a world resource node (an ore rock: coopown::WorldNodeOf on its own reads, no
+// build record), else 0. Defined in build.cpp (BdWorldNodeLive). Guarded reads only - ANY THREAD.
+int WorldNodeLiveAnyThread(void* b);
+#ifdef SW_DEV_BUILD
+// T-1222 TEST-ONLY lever claimskip (DEV build): 0 = off (the claim skip does not act - the engine claims a mined rock for the
+// miner's faction, as single player), 1 = on (normal), -1 = show. One [MINE] claimskip line; returns 1 while the skip acts.
+// Defined in build.cpp. MAIN THREAD.
+int ClaimSkipLever(int set);
+#endif
 
 }

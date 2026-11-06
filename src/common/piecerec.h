@@ -27,7 +27,18 @@
  *       power values (switch, gets battery, battery, stocks, bar). T-1047 step 5 (world-server protocol 116): flags bit 5
        (kPrLiveFlagTown) adds, after everything else, u32 outpost id 1..townkeep::kOutpostIdMax - the outpost (the world server's
        id, townkeep.h) its owner's game links the piece to; a part without bit 5 leaves the link NOT KNOWN (a new outpost's pieces
-       are seeded before its first report). An older peer refuses a part with bit 5 (an unknown bit). A format-1 record carries no LIVE
+       are seeded before its first report). An older peer refuses a part with bit 5 (an unknown bit).
+       Flags bit 6 (kPrLiveFlagFarm, world-server protocol 132) adds, after the outpost link, a player farm's crop: f32 growth (+0x518)
+       | f32 death (+0x51C) | f32 plant start (+0x524, the growth its last planting started from) | u32 plants harvested (+0x528)
+       0..kPrLiveFarmMaxHarvested | u32 the world clock's minute the crop was read (the count the farm's own load reads, 0xE3DA0 / 0x66C070:
+       (hour + day x 24) x 60 + minute; 0 = not known) - the farm save's own numbers, its save time as that minute; the floats finite and under kPrLiveFarmLimit in size.
+       A part without bit 6 leaves the crop NOT KNOWN. A peer before protocol 132 refuses a part with bit 6 (an unknown bit).
+       T-1192 (world-server protocol 141): flags bit 7 (kPrLiveFlagCraft) adds, after the crop, a crafting bench's craft part: u32 flags
+       (kPrCraftRepeat | kPrCraftOutOn | kPrCraftOutHas) | u32 input sections 0..kPrCraftMaxInputs | u32 their switches (bit i = input i on)
+       | u32 the list's size 0..kPrCraftTotalMax | u32 n entries carried 0..kPrCraftMax (the list's first ones; fewer than the size only
+       when n is kPrCraftMax) | n x (u32 length + the product's record id 1..kPrCraftSidMax | u32 length + the row record's id 0..
+       kPrCraftSidMax | f32 progress | u32 mode 0..kPrCraftModeMax). A part without bit 7 leaves the list NOT KNOWN; a peer before 141
+       refuses a part with bit 7, and a work state of 3. A format-1 record carries no LIVE
  *       part: its live values are NOT KNOWN (never "off"). A removal mark is always format 1.
  *   BODY, a removal mark: u32 reason (buildwire.h kBuildReasonDismantled / kBuildReasonDestroyed) and nothing else.
  *   Nothing may follow the body. The whole record is at most kPrMaxBytes.
@@ -59,7 +70,8 @@
 
 namespace piecerec {
 
-const unsigned int kProtocol = 133;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5) */
+const unsigned int kProtocol = 145;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
+
 
 
 
@@ -69,16 +81,35 @@ const unsigned int kPrMarker = 0x31454350u;       /* 'P','C','E','1' little-endi
 const unsigned int kPrFormat = 1u;                /* a record with no LIVE part */
 const unsigned int kPrFormatLive = 2u;            /* a live piece's record with its LIVE part (switch, gets battery, battery, input stocks) */
 const unsigned int kPrLiveMaxStocks = 16u;        /* a piece's input records carried (powerwire.h kPowerMaxStocks) */
-const unsigned int kPrLiveFlagOn = 1u, kPrLiveFlagGets = 2u, kPrLiveFlagBar = 4u, kPrLiveFlagDoors = 8u, kPrLiveFlagNoPower = 16u, kPrLiveFlagTown = 32u, kPrLiveFlagsAll = 63u;   /* bit 2 = the bar and work state follow the stocks; bit 3 = the doors part follows them; bit 4 = no power values (else they are the piece's); bit 5 = the outpost link ends the part (T-1047 step 5) */
+const unsigned int kPrLiveFlagOn = 1u, kPrLiveFlagGets = 2u, kPrLiveFlagBar = 4u, kPrLiveFlagDoors = 8u, kPrLiveFlagNoPower = 16u, kPrLiveFlagTown = 32u, kPrLiveFlagFarm = 64u, kPrLiveFlagCraft = 128u, kPrLiveFlagsAll = 255u;   /* bit 2 = the bar and work state follow the stocks; bit 3 = the doors part follows them; bit 4 = no power values (else they are the piece's); bit 5 = the outpost link ends the part (T-1047 step 5) */
 const unsigned int kPrLiveFlagsBeforeTown = 31u;  /* the bits a peer before T-1047 step 5 (protocol 115) reads: it refuses any other */
+const unsigned int kPrLiveFlagsBeforeFarm = 63u;  /* the bits a peer before protocol 132 reads: it refuses a part with a farm's crop */
+const unsigned int kPrLiveFlagsBeforeCraft = 127u; /* T-1192: the bits a peer before protocol 141 reads: it refuses a part with a crafting bench's list */
+/* T-1192: A CRAFTING BENCH'S CRAFT PART (flag bit 7, after everything else): the bench's craft list (+0x498, count +0x4B8), its repeat flag
+   +0x4CC and the on/off byte (+0xD0) of each input section (+0x480 count, +0x488 records, stride 0x20, section +0x18) and of the output
+   section (+0x470) - what the bench's own save 0x2B8400 and load 0x2B8A70 keep and switch, read on the bench's writer */
+const unsigned int kPrCraftMax = 16u;              /* entries carried: the list's first ones (craftTotal says how many it holds). A copy holds
+                                                      only these: if it becomes the bench's writer, entries past the 16th are not in its list
+                                                      (review fold, finding 6 - the record is not widened for it) */
+const unsigned int kPrCraftSidMax = 64u;           /* a carried record id's length (the save's "current" / "currentExtraData" words) */
+const unsigned int kPrCraftMaxInputs = 16u;        /* input sections whose switch is carried */
+const unsigned int kPrCraftTotalMax = 65535u;      /* a list's size carried */
+const unsigned int kPrCraftRepeat = 1u, kPrCraftOutOn = 2u, kPrCraftOutHas = 4u, kPrCraftFlagsAll = 7u;   /* repeat; the output section on; there is one */
+const int kPrCraftModeMax = 2;                     /* an entry's mode +0x64 as the save writes it: 0, 1, else 2 */
+const unsigned int kPrCraftFixedBytes = 20u;       /* flags | inputs | input switches | total | entries */
+const unsigned int kPrCraftEntryMaxBytes = 4u + kPrCraftSidMax + 4u + kPrCraftSidMax + 8u;
+const float kPrLiveFarmLimit = 1000.0f;           /* a crop's growth, death and plant start: finite and under this in size (farmwire.h kFarmAgeLimit) */
+const int kPrLiveFarmMaxHarvested = 512;          /* plants harvested carried: 0..this (farmwire.h kFarmMaxPlants) */
+const int kPieceLiveFarmBands = 100;              /* THE STEP COUNT: a growing crop's record is written at each hundredth (1%) of its growth, and of its death (a player farm's crop travels on its record alone) */
 const unsigned int kPrTownIdMax = 0x7FFFFFFFu;    /* = townkeep::kOutpostIdMax: an outpost id 1..this */
 const unsigned int kPrLiveMaxDoors = 16u;         /* a piece's doors carried, by index in its door list */
 const unsigned int kPrLiveDoorBroken = 1u, kPrLiveDoorLockBroken = 2u, kPrLiveDoorHasLock = 4u, kPrLiveDoorFlagsAll = 7u;   /* a door's flags word */
 const int kPrLiveLockLevelMax = 100;              /* a lock level carried: 0..100 */
-const unsigned int kPrLiveMaxBytes = 12u + 4u * kPrLiveMaxStocks + 8u + 4u + 12u * kPrLiveMaxDoors + 4u;
+const unsigned int kPrLiveMaxBytes = 12u + 4u * kPrLiveMaxStocks + 8u + 4u + 12u * kPrLiveMaxDoors + 4u + 20u
+                                    + kPrCraftFixedBytes + kPrCraftMax * kPrCraftEntryMaxBytes;   /* 20: a farm's crop and its clock minute; then a bench's craft part */
 const int kPieceLiveDoorBands = 20;               /* a door's health is written when it crosses a twentieth of its max */
 const float kPrLiveBarLimit = 2.0f;               /* T-1047 step 2b: a production bar carried: [0, 2] */
-const int kPrLiveStateMax = 2;                    /* T-1047 step 2b: a work state +0x468 carried: 0..2 (2 working, 1 blocked) */
+const int kPrLiveStateMax = 3;                    /* T-1047 step 2b: a work state +0x468 carried: 0..3 (2 working, 1 blocked; T-1192: 3 a crafting bench with an empty list, 0x2B5640) */
 const float kPrLiveValueLimit = 1000000.0f;       /* battery and stock: [0, 1e6] (powerwire.h's range) */
 const float kPrLiveEps = 0.0001f;                 /* a level or stock change smaller than this is not a change */
 const int kPieceLiveBatteryBands = 20;            /* the battery and each stock are written when they cross a twentieth (5%) of full */
@@ -88,7 +119,9 @@ const int kPieceLiveBarBandsIdle = 4;             /* T-1047 step 2b: else when i
 const unsigned int kPieceLiveStateHoldMs = 1000u; /* T-1047 step 2b review fold 2: a work-state-only change is written once the state has
                                                      held this long - MINE_STATE's own gap (farmwire.h kMineStateGapMs) */
 const unsigned int kPrMaxBytes = 4096u;           /* one pp.build row is a few hundred bytes (ownrec.h kBuildRecMaxBytes) */
-const unsigned int kPrFlagSeed = 1u, kPrFlagRemoved = 2u, kPrFlagsAll = 3u;
+const unsigned int kPrFlagSeed = 1u, kPrFlagRemoved = 2u, kPrFlagHanded = 4u, kPrFlagsAll = 7u;   /* T-23 (world-server protocol 144): kPrFlagHanded = a HAND-OVER SEED -
+                                                   the placer's first record of a piece it placed in another player's outpost or house, naming that player
+                                                   (not the sender) the owner; only with kPrFlagSeed (PieceHandSeedOk) */
 const unsigned int kPrKeyMax = coopbuild::kBuildMaxKey;   /* the build messages' key room */
 const unsigned int kPrFixedBytes = 24u;           /* marker, format, generation, writer, owner, key length */
 const unsigned int kPrHeaderMaxBytes = kPrFixedBytes + kPrKeyMax + 12u;   /* the longest header: what the server reads back from a file */
@@ -118,6 +151,15 @@ struct PieceHeader
 /* a piece's own live values (the LIVE part); have 0 = not known. hasPower 1 (the default) = the power values (on, gets, battery, stocks,
    bar) are the piece's; 0 = the part carries none (doors only - nothing is applied to the piece's power; written as flag bit 4). T-1047 step 2b: hasBar 1 = a production
    machine's bar and work state are known (bar, state); 0 = not known (a LIVE part without flag bit 2) */
+/* T-1192: one craft list entry as the bench's save keeps it: the product's record id (the entry's item, vt+0x18 -> +0x58), the row record's
+   (the item's +0xC8; empty = none), the progress +0x0C and the mode +0x64 (0, 1, else 2) */
+struct PieceCraftEntry
+{
+    std::string sid, extra;
+    float prog;
+    int mode;
+    PieceCraftEntry() : prog(0.0f), mode(0) {}
+};
 struct PieceLive
 {
     int have, hasPower, on, gets, n;
@@ -131,7 +173,17 @@ struct PieceLive
     unsigned int doorFlags[kPrLiveMaxDoors];  /* kPrLiveDoorBroken | kPrLiveDoorLockBroken | kPrLiveDoorHasLock */
     int hasTown;                              /* T-1047 step 5: 1 = the outpost link is known (flag bit 5) */
     unsigned int town;                        /* T-1047 step 5: the outpost id the piece is linked to (1..kPrTownIdMax; 0 with hasTown 0) */
-    PieceLive() : have(0), hasPower(1), on(0), gets(0), n(0), battery(0.0f), hasBar(0), state(0), bar(0.0f), hasDoors(0), nd(0), hasTown(0), town(0u)
+    int hasFarm;                              /* 1 = a player farm's crop is known (flag bit 6): the four values below; 0 = not known (all zero) */
+    float farmGrowth, farmDeath, farmStart;   /* growth +0x518, death +0x51C, plant start +0x524 */
+    int farmHarvested;                        /* plants harvested +0x528 */
+    unsigned int farmAt;                      /* the world clock's minute the crop was read (0 = not known) */
+    int hasCraft;                             /* T-1192: 1 = a crafting bench's craft part is known (flag bit 7): the five below */
+    unsigned int craftFlags, craftInOn;       /* kPrCraftRepeat | kPrCraftOutOn | kPrCraftOutHas; bit i = input section i switched on */
+    int craftIn, craftTotal;                  /* the input sections; the entries the bench holds (the first kPrCraftMax carried) */
+    std::vector<PieceCraftEntry> craft;
+    PieceLive() : have(0), hasPower(1), on(0), gets(0), n(0), battery(0.0f), hasBar(0), state(0), bar(0.0f), hasDoors(0), nd(0), hasTown(0), town(0u),
+                  hasFarm(0), farmGrowth(0.0f), farmDeath(0.0f), farmStart(0.0f), farmHarvested(0), farmAt(0u),
+                  hasCraft(0), craftFlags(0u), craftInOn(0u), craftIn(0), craftTotal(0)
     {
         for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) stock[i] = 0.0f;
         for (unsigned int i = 0; i < kPrLiveMaxDoors; ++i) { doorHealth[i] = 0.0f; doorLevel[i] = 0; doorFlags[i] = 0u; }
@@ -153,6 +205,8 @@ inline bool PrLiveValueOk(float v) { return v == v && v >= 0.0f && v <= kPrLiveV
 /* T-1047 step 2b: a production bar in [0, kPrLiveBarLimit] (not a number, or infinite, refused) and a work state 0..kPrLiveStateMax */
 inline bool PrLiveBarOk(float bar, int state) { return bar == bar && bar >= 0.0f && bar <= kPrLiveBarLimit && state >= 0 && state <= kPrLiveStateMax; }
 /* a door carried: health in [0, kPrLiveValueLimit] (not a number refused), lock level 0..kPrLiveLockLevelMax, no unknown flag bit */
+/* a crop's float: a number, finite, and under kPrLiveFarmLimit in size */
+inline bool PrLiveFarmFloatOk(float v) { return v == v && v > -kPrLiveFarmLimit && v < kPrLiveFarmLimit; }
 inline bool PrLiveDoorOk(float health, int level, unsigned int flags)
 {
     return PrLiveValueOk(health) && level >= 0 && level <= kPrLiveLockLevelMax && (flags & ~kPrLiveDoorFlagsAll) == 0u;
@@ -160,6 +214,33 @@ inline bool PrLiveDoorOk(float health, int level, unsigned int flags)
 /* not known is valid (no LIVE part); known: the switch and gets battery 0 / 1, at most kPrLiveMaxStocks stocks, every value in range;
    T-1047 step 2b: hasBar 0 / 1, and a known bar carries a bar and a work state in range (PrLiveBarOk). hasPower 0 / 1; a part with no
    power values carries them as zero (switch and gets battery off, battery 0, no stocks, no bar) */
+/* T-1192: a carried record id: 1..kPrCraftSidMax bytes (empty allowed where `empty` says), no control byte */
+inline bool PrCraftSidOk(const std::string& s, int empty)
+{
+    if (s.empty()) return empty != 0;
+    if (s.size() > kPrCraftSidMax) return false;
+    for (size_t i = 0; i < s.size(); ++i) if ((unsigned char)s[i] < 0x20u || (unsigned char)s[i] == 0x7Fu) return false;
+    return true;
+}
+/* T-1192: not known carries nothing; known: flags known (the output on only where there is one), at most kPrCraftMaxInputs inputs with no
+   switch past them, a total in range, at most kPrCraftMax entries and no more than the total - fewer than the total only when full - each
+   with a product id, a row id or none, a progress in [0, kPrLiveValueLimit] and a mode 0..kPrCraftModeMax */
+inline bool PieceCraftValid(const PieceLive& l)
+{
+    if (l.hasCraft == 0) return l.craftFlags == 0u && l.craftInOn == 0u && l.craftIn == 0 && l.craftTotal == 0 && l.craft.empty();
+    if (l.hasCraft != 1 || (l.craftFlags & ~kPrCraftFlagsAll) != 0u) return false;
+    if ((l.craftFlags & kPrCraftOutOn) != 0u && (l.craftFlags & kPrCraftOutHas) == 0u) return false;
+    if (l.craftIn < 0 || l.craftIn > (int)kPrCraftMaxInputs || (l.craftInOn >> (unsigned int)l.craftIn) != 0u) return false;
+    if (l.craftTotal < 0 || l.craftTotal > (int)kPrCraftTotalMax) return false;
+    const size_t n = l.craft.size();
+    if (n > kPrCraftMax || n > (size_t)l.craftTotal || (n < (size_t)l.craftTotal && n != kPrCraftMax)) return false;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const PieceCraftEntry& e = l.craft[i];
+        if (!PrCraftSidOk(e.sid, 0) || !PrCraftSidOk(e.extra, 1) || !PrLiveValueOk(e.prog) || e.mode < 0 || e.mode > kPrCraftModeMax) return false;
+    }
+    return true;
+}
 inline bool PieceLiveValid(const PieceLive& l)
 {
     if (l.have == 0) return true;
@@ -177,13 +258,21 @@ inline bool PieceLiveValid(const PieceLive& l)
     }
     if (l.hasTown != 0 && l.hasTown != 1) return false;
     if (l.hasTown != 0 ? (l.town == 0u || l.town > kPrTownIdMax) : (l.town != 0u)) return false;   /* T-1047 step 5: a known link names an outpost */
-    return true;
+    if (l.hasFarm != 0 && l.hasFarm != 1) return false;
+    if (l.hasFarm != 0)
+    {   /* a known crop: every float finite and in range, plants harvested 0..kPrLiveFarmMaxHarvested */
+        if (!PrLiveFarmFloatOk(l.farmGrowth) || !PrLiveFarmFloatOk(l.farmDeath) || !PrLiveFarmFloatOk(l.farmStart)) return false;
+        if (l.farmHarvested < 0 || l.farmHarvested > kPrLiveFarmMaxHarvested) return false;
+    }
+    else if (l.farmGrowth != 0.0f || l.farmDeath != 0.0f || l.farmStart != 0.0f || l.farmHarvested != 0 || l.farmAt != 0u) return false;   /* not known: nothing carried */
+    return PieceCraftValid(l);
 }
 inline void PrPutF32(std::vector<char>* b, float v) { unsigned int u = 0; std::memcpy(&u, &v, 4); coopbrec::BrPutU32(b, u); }
 inline void PieceLivePut(std::vector<char>* out, const PieceLive& l)
 {
     coopbrec::BrPutU32(out, (l.on != 0 ? kPrLiveFlagOn : 0u) | (l.gets != 0 ? kPrLiveFlagGets : 0u) | (l.hasBar != 0 ? kPrLiveFlagBar : 0u)
-                            | (l.hasDoors != 0 ? kPrLiveFlagDoors : 0u) | (l.hasPower == 0 ? kPrLiveFlagNoPower : 0u) | (l.hasTown != 0 ? kPrLiveFlagTown : 0u));
+                            | (l.hasDoors != 0 ? kPrLiveFlagDoors : 0u) | (l.hasPower == 0 ? kPrLiveFlagNoPower : 0u) | (l.hasTown != 0 ? kPrLiveFlagTown : 0u)
+                            | (l.hasFarm != 0 ? kPrLiveFlagFarm : 0u) | (l.hasCraft != 0 ? kPrLiveFlagCraft : 0u));
     PrPutF32(out, l.battery);
     coopbrec::BrPutU32(out, (unsigned int)l.n);
     for (int i = 0; i < l.n; ++i) PrPutF32(out, l.stock[i]);
@@ -197,7 +286,25 @@ inline void PieceLivePut(std::vector<char>* out, const PieceLive& l)
             PrPutF32(out, l.doorHealth[i]); coopbrec::BrPutU32(out, (unsigned int)l.doorLevel[i]); coopbrec::BrPutU32(out, l.doorFlags[i]);
         }
     }
-    if (l.hasTown != 0) coopbrec::BrPutU32(out, l.town);   /* T-1047 step 5: the outpost link ends the part */
+    if (l.hasTown != 0) coopbrec::BrPutU32(out, l.town);   /* T-1047 step 5: the outpost link */
+    if (l.hasFarm != 0)
+    {   /* a player farm's crop ends the part */
+        PrPutF32(out, l.farmGrowth); PrPutF32(out, l.farmDeath); PrPutF32(out, l.farmStart); coopbrec::BrPutU32(out, (unsigned int)l.farmHarvested);
+        coopbrec::BrPutU32(out, l.farmAt);
+    }
+    if (l.hasCraft != 0)
+    {   /* T-1192: a crafting bench's craft part ends the part */
+        const size_t n = (l.craft.size() > kPrCraftMax) ? kPrCraftMax : l.craft.size();
+        coopbrec::BrPutU32(out, l.craftFlags); coopbrec::BrPutU32(out, (unsigned int)l.craftIn); coopbrec::BrPutU32(out, l.craftInOn);
+        coopbrec::BrPutU32(out, (unsigned int)l.craftTotal); coopbrec::BrPutU32(out, (unsigned int)n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            const PieceCraftEntry& e = l.craft[i];
+            coopbrec::BrPutU32(out, (unsigned int)e.sid.size()); out->insert(out->end(), e.sid.begin(), e.sid.end());
+            coopbrec::BrPutU32(out, (unsigned int)e.extra.size()); out->insert(out->end(), e.extra.begin(), e.extra.end());
+            PrPutF32(out, e.prog); coopbrec::BrPutU32(out, (unsigned int)e.mode);
+        }
+    }
 }
 /* 1 = the bytes are exactly one LIVE part in range (into *out, have 1); 0 = refused, *out untouched. T-1047 step 2b: flag bit 2 adds the
    bar (f32) and the work state (i32) after the stocks; a part without it reads with the bar not known (hasBar 0); any other unknown bit,
@@ -212,9 +319,13 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
     if (!coopbrec::BrGet4(p, size, &at, &fl) || !coopbrec::BrGet4(p, size, &at, &l.battery) || !coopbrec::BrGet4(p, size, &at, &n)) return 0;
     const size_t tail = ((fl & kPrLiveFlagBar) != 0) ? 8u : 0u;
     const size_t doorsAt = ((fl & kPrLiveFlagDoors) != 0) ? 4u : 0u;   /* the doors' count; the doors themselves are measured once it is read */
-    const size_t townAt = ((fl & kPrLiveFlagTown) != 0) ? 4u : 0u;     /* T-1047 step 5: the outpost link, last */
+    const size_t townAt0 = ((fl & kPrLiveFlagTown) != 0) ? 4u : 0u;    /* T-1047 step 5: the outpost link */
+    const size_t farmAt = ((fl & kPrLiveFlagFarm) != 0) ? 20u : 0u;    /* a player farm's crop and its clock minute, last */
+    const size_t craftAt = ((fl & kPrLiveFlagCraft) != 0) ? (size_t)kPrCraftFixedBytes : 0u;   /* T-1192: a bench's craft part, last (its entries measured as read) */
+    const size_t townAt = townAt0 + farmAt + craftAt;                  /* the bytes after the doors (at least, with a craft part) */
     if ((fl & ~kPrLiveFlagsAll) != 0 || n > kPrLiveMaxStocks) return 0;
-    if (doorsAt == 0 ? (size - at != (size_t)n * 4u + tail + townAt) : (size - at < (size_t)n * 4u + tail + doorsAt + townAt)) return 0;
+    if (doorsAt == 0 ? (craftAt == 0 ? (size - at != (size_t)n * 4u + tail + townAt) : (size - at < (size_t)n * 4u + tail + townAt))
+                     : (size - at < (size_t)n * 4u + tail + doorsAt + townAt)) return 0;
     for (unsigned int i = 0; i < n; ++i) if (!coopbrec::BrGet4(p, size, &at, &l.stock[i])) return 0;
     if (tail != 0)
     {
@@ -225,7 +336,8 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
     if (doorsAt != 0)
     {   /* the doors: exactly nd x (health, lock level, flags) to the end */
         unsigned int nd = 0;
-        if (!coopbrec::BrGet4(p, size, &at, &nd) || nd > kPrLiveMaxDoors || size - at != (size_t)nd * 12u + townAt) return 0;
+        if (!coopbrec::BrGet4(p, size, &at, &nd) || nd > kPrLiveMaxDoors) return 0;
+        if (craftAt == 0 ? (size - at != (size_t)nd * 12u + townAt) : (size - at < (size_t)nd * 12u + townAt)) return 0;
         for (unsigned int i = 0; i < nd; ++i)
         {
             unsigned int lv = 0;
@@ -234,10 +346,37 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
         }
         l.hasDoors = 1; l.nd = (int)nd;
     }
-    if (townAt != 0)
+    if (townAt0 != 0)
     {   /* T-1047 step 5: the outpost link (0 or past kPrTownIdMax refused by PieceLiveValid below) */
         if (!coopbrec::BrGet4(p, size, &at, &l.town)) return 0;
         l.hasTown = 1;
+    }
+    if (farmAt != 0)
+    {   /* a player farm's crop (out of range refused by PieceLiveValid below) */
+        unsigned int hv = 0;
+        if (!coopbrec::BrGet4(p, size, &at, &l.farmGrowth) || !coopbrec::BrGet4(p, size, &at, &l.farmDeath) || !coopbrec::BrGet4(p, size, &at, &l.farmStart)
+            || !coopbrec::BrGet4(p, size, &at, &hv) || !coopbrec::BrGet4(p, size, &at, &l.farmAt)) return 0;
+        l.hasFarm = 1; l.farmHarvested = (hv <= (unsigned int)kPrLiveFarmMaxHarvested) ? (int)hv : -1;   /* -1: refused by PieceLiveValid below */
+    }
+    if (craftAt != 0)
+    {   /* T-1192: a bench's craft part: each entry's ids measured as read (out of range refused here or by PieceLiveValid below) */
+        unsigned int cf = 0, ci = 0, con = 0, tot = 0, cn = 0;
+        if (!coopbrec::BrGet4(p, size, &at, &cf) || !coopbrec::BrGet4(p, size, &at, &ci) || !coopbrec::BrGet4(p, size, &at, &con)
+            || !coopbrec::BrGet4(p, size, &at, &tot) || !coopbrec::BrGet4(p, size, &at, &cn)) return 0;
+        if (cn > kPrCraftMax || ci > kPrCraftMaxInputs || tot > kPrCraftTotalMax) return 0;
+        for (unsigned int i = 0; i < cn; ++i)
+        {
+            PieceCraftEntry e;
+            unsigned int len = 0, md = 0;
+            if (!coopbrec::BrGet4(p, size, &at, &len) || len > kPrCraftSidMax || size - at < (size_t)len) return 0;
+            e.sid.assign(p + at, len); at += len;
+            if (!coopbrec::BrGet4(p, size, &at, &len) || len > kPrCraftSidMax || size - at < (size_t)len) return 0;
+            e.extra.assign(p + at, len); at += len;
+            if (!coopbrec::BrGet4(p, size, &at, &e.prog) || !coopbrec::BrGet4(p, size, &at, &md)) return 0;
+            e.mode = (md <= (unsigned int)kPrCraftModeMax) ? (int)md : -1;   /* -1: refused by PieceLiveValid below */
+            l.craft.push_back(e);
+        }
+        l.hasCraft = 1; l.craftFlags = cf; l.craftIn = (int)ci; l.craftInOn = con; l.craftTotal = (int)tot;
     }
     if (at != size) return 0;
     l.have = 1; l.hasPower = (fl & kPrLiveFlagNoPower) != 0 ? 0 : 1; l.on = (fl & kPrLiveFlagOn) != 0 ? 1 : 0; l.gets = (fl & kPrLiveFlagGets) != 0 ? 1 : 0; l.n = (int)n;
@@ -246,6 +385,55 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
     return 1;
 }
 
+/* T-1192: 1 = the craft lists name the same entries in the same order (product, row record, mode; the progress not compared) */
+inline int PieceCraftListSame(const std::vector<PieceCraftEntry>& a, const std::vector<PieceCraftEntry>& b)
+{
+    if (a.size() != b.size()) return 0;
+    for (size_t i = 0; i < a.size(); ++i) if (a[i].sid != b[i].sid || a[i].extra != b[i].extra || a[i].mode != b[i].mode) return 0;
+    return 1;
+}
+/* T-1192: 1 = the craft parts are the same: both not known, or both known with the same switches, repeat, total and list (progress not
+   compared: a change of it alone is no write of its own - it rides the next one) */
+inline int PieceCraftSameOf(const PieceLive& a, const PieceLive& b)
+{
+    if ((a.hasCraft != 0) != (b.hasCraft != 0)) return 0;
+    if (a.hasCraft == 0) return 1;
+    if (a.craftFlags != b.craftFlags || a.craftIn != b.craftIn || a.craftInOn != b.craftInOn || a.craftTotal != b.craftTotal) return 0;
+    return PieceCraftListSame(a.craft, b.craft);
+}
+inline void PieceCraftClear(PieceLive* l)
+{
+    if (l == 0) return;
+    l->hasCraft = 0; l->craftFlags = 0u; l->craftInOn = 0u; l->craftIn = 0; l->craftTotal = 0; l->craft.clear();
+}
+/* T-1192: WHAT A GAME DOES WITH A RECORD'S CRAFT PART (build.cpp PwCraftApply). The bench's writer runs its work from its own list - the
+   part's one source - and never takes it back (kPcpNone); so is a part not known on either side (here: the bench here unreadable). Any
+   other game: its list names the record's carried entries and holds no more of them (here.craftTotal = what it holds) - the progress,
+   switches and repeat are written (kPcpKeep); else its list is emptied and made again from the record's entries (kPcpRebuild) */
+const int kPcpNone = 0, kPcpKeep = 1, kPcpRebuild = 2;
+inline int PieceCraftApplyPlan(int runnerHere, const PieceLive& rec, const PieceLive& here)
+{
+    if (runnerHere != 0 || rec.hasCraft == 0 || here.hasCraft == 0) return kPcpNone;
+    if (here.craftTotal == (int)here.craft.size() && PieceCraftListSame(rec.craft, here.craft) != 0) return kPcpKeep;
+    return kPcpRebuild;
+}
+/* T-1192 review fold: the record's craft part with only the entries whose ids are records on this game (known[i] != 0) - what a copy can
+   hold, so a missing id is not a difference at every record (the total less the entries left out) */
+inline PieceLive PieceCraftKnownOnly(const PieceLive& rec, const std::vector<int>& known)
+{
+    PieceLive o = rec;
+    o.craft.clear();
+    int dropped = 0;
+    for (size_t i = 0; i < rec.craft.size(); ++i)
+    {
+        if (i < known.size() && known[i] != 0) o.craft.push_back(rec.craft[i]);
+        else ++dropped;
+    }
+    o.craftTotal = (rec.craftTotal - dropped >= (int)o.craft.size()) ? rec.craftTotal - dropped : (int)o.craft.size();
+    return o;
+}
+/* T-1192: an entry's mode as the bench's save writes it (0x2B8400): 0, 1, any other value 2 */
+inline int PieceCraftModeOf(int raw) { return raw == 0 ? 0 : (raw == 1 ? 1 : 2); }
 /* 1 = the doors parts are the same: both not known, or both known with the same doors - lock levels and flags equal, health equal
    (eps 1: within kPrLiveEps) */
 inline int PieceDoorsSameOf(const PieceLive& a, const PieceLive& b, int eps)
@@ -342,7 +530,8 @@ inline int PieceRecPosOf(const std::string& id, float* x, float* y, float* z)
 inline bool PrSlotOk(int slot) { return slot >= 0 && slot <= kPrMaxSlot; }
 inline bool PieceHeaderValid(const PieceHeader& h)
 {
-    return (h.format == kPrFormat || (h.format == kPrFormatLive && (h.flags & kPrFlagRemoved) == 0)) && (h.flags & ~kPrFlagsAll) == 0 && PrSlotOk(h.writerSlot) && PrSlotOk(h.ownerSlot) && !MakePieceRecId(h.key).empty();
+    return (h.format == kPrFormat || (h.format == kPrFormatLive && (h.flags & kPrFlagRemoved) == 0)) && (h.flags & ~kPrFlagsAll) == 0 && PrSlotOk(h.writerSlot) && PrSlotOk(h.ownerSlot) && !MakePieceRecId(h.key).empty()
+        && ((h.flags & kPrFlagHanded) == 0 || ((h.flags & kPrFlagSeed) != 0 && (h.flags & kPrFlagRemoved) == 0 && h.ownerSlot != h.writerSlot));   /* T-23: a hand-over seed names another player */
 }
 /* the body's own test against its header: a removal mark carries one known reason; a live piece a PLACE of the header's key and
    placement number and a STATE of the same key, each decoding whole */
@@ -485,10 +674,32 @@ inline int PieceSeedPlaceOk(int senderSlot, int holderSlot, int ownerSlot, int o
 {
     return (PieceMayWrite(senderSlot, holderSlot, ownerSlot, ownerLoaded) != 0 || holderSlot < 0) ? 1 : 0;
 }
+/* T-23 (owner 1460 a): A HAND-OVER SEED - the placer's first record of a piece it placed in another player's outpost or house (handed to
+   that player at its placement, decision 967 a), naming that player (ownerSlot, never the sender) the owner. Taken while the sender is
+   the piece's one writer by the box rule (the owner's game away and the sender the area's holder), while nobody holds the area, or
+   while the sender's own game has the area loaded (senderLoaded) - the placement itself, as an owner's own seed is taken while its game
+   has the area loaded (PieceSeedPlaceOk); with the owner's game here that is the only road the piece has to it. A piece with no record
+   has no other writer; every later write is the one writer's (PieceMayWrite: the owner while its game has the area loaded, else the
+   area's holder). */
+inline int PieceHandSeedOk(int senderSlot, int holderSlot, int ownerSlot, int ownerLoaded, int senderLoaded)
+{
+    if (senderSlot < 0 || ownerSlot < 0 || ownerSlot > kPrMaxSlot || ownerSlot == senderSlot) return 0;
+    if (PieceMayWrite(senderSlot, holderSlot, ownerSlot, ownerLoaded) != 0 || holderSlot < 0) return 1;
+    return senderLoaded != 0 ? 1 : 0;
+}
+/* handed / senderLoaded (T-23): the write is a hand-over seed (kPrFlagHanded); the sender's game has the area loaded */
 inline int PieceAcceptRule(int exists, unsigned int storedGen, int storedOwner, int storedOwnerLoaded, int storedRemoved, int sameBytes,
-                           int seed, int removed, unsigned int gen, int sentOwner, int sentOwnerLoaded, int senderSlot, int holderSlot)
+                           int seed, int removed, unsigned int gen, int sentOwner, int sentOwnerLoaded, int senderSlot, int holderSlot,
+                           int handed = 0, int senderLoaded = 0)
 {
     if (exists != 0 && gen == storedGen && sameBytes != 0) return kPrRepeat;   /* the very same bytes again: nothing to write */
+    if (seed != 0 && handed != 0)
+    {   /* T-23: a hand-over seed - the same placement rules as an owner's seed, the owner another player */
+        if (sentOwner == senderSlot || sentOwner < 0 || senderSlot < 0) return kPrRefuseSeedNotOwner;
+        if (exists != 0 && storedRemoved == 0) return kPrRefuseSeedExists;
+        if (exists != 0 && gen <= storedGen) return kPrRefuseOlder;   /* over a removal mark: a higher generation only */
+        return PieceHandSeedOk(senderSlot, holderSlot, sentOwner, sentOwnerLoaded, senderLoaded) != 0 ? kPrAccept : kPrRefuseSeedNotLoaded;
+    }
     if (seed != 0)
     {
         if (sentOwner != senderSlot || senderSlot < 0) return kPrRefuseSeedNotOwner;   /* no game seeds another player's piece */
@@ -520,7 +731,8 @@ inline int PieceJudgeWrite(const std::string& id, const char* p, size_t size, in
     if (senderSlot < 0 || h.writerSlot != senderSlot) return kPrRefuseWriter;
     return PieceAcceptRule(exists, storedGen, storedOwner, coopbrec::BrSlotIn(loadedSlots, storedOwner), storedRemoved, sameBytes,
                            (h.flags & kPrFlagSeed) != 0 ? 1 : 0, (h.flags & kPrFlagRemoved) != 0 ? 1 : 0, h.generation, h.ownerSlot,
-                           coopbrec::BrSlotIn(loadedSlots, h.ownerSlot), senderSlot, holderSlot);
+                           coopbrec::BrSlotIn(loadedSlots, h.ownerSlot), senderSlot, holderSlot,
+                           (h.flags & kPrFlagHanded) != 0 ? 1 : 0, coopbrec::BrSlotIn(loadedSlots, senderSlot));   /* T-23: a hand-over seed, and the sender's own loaded bit */
 }
 inline const char* PieceRefuseWhy(int why)
 {
@@ -607,7 +819,15 @@ inline int PieceRefuseNext(int reason, unsigned int storedGen, int* haveSent, un
         *haveSent = 1;
         return kPwrRaise;
     }
-    if (reason == kPrRefuseNotWriter || reason == kPrRefuseOwnerChange || reason == kPrRefuseSeedNotLoaded) return kPwrRetry;
+    if (reason == kPrRefuseSeedNotLoaded)
+    {   /* T-23 review fold 1: a seed refused - no live record is stored (a live one is refused as kPrRefuseSeedExists first): none
+           (storedGen 0) or a removal mark (storedGen). The next write is a seed again (PieceSeedDecide): with none stored nothing of
+           this game's is stored either; over a removal mark it goes above that mark's generation */
+        if (storedGen == 0u) { *haveSent = 0; *sentGen = 0; }
+        else { if (*haveSent == 0 || storedGen > *sentGen) *sentGen = storedGen; *haveSent = 1; }
+        return kPwrRetry;
+    }
+    if (reason == kPrRefuseNotWriter || reason == kPrRefuseOwnerChange) return kPwrRetry;
     return kPwrNone;
 }
 
@@ -657,6 +877,11 @@ inline void PieceRefuseLearn(int reason, unsigned int storedGen, PieceSrvView* v
     if (reason == kPrRefuseSeedExists) { v->have = 1; v->gen = storedGen; v->removed = 0; }
     else if (reason == kPrRefuseOverRemoval) { v->have = 1; v->gen = storedGen; v->removed = 1; }
     else if (reason == kPrRefuseNoRecord) { v->have = 0; v->gen = 0; v->removed = 0; }
+    else if (reason == kPrRefuseSeedNotLoaded)
+    {   /* T-23 review fold 1: a refused seed - none stored (storedGen 0), else a removal mark at storedGen */
+        if (storedGen == 0u) { v->have = 0; v->gen = 0; v->removed = 0; }
+        else if (v->have == 0 || storedGen >= v->gen) { v->have = 1; v->gen = storedGen; v->removed = 1; }
+    }
     else if (reason == kPrRefuseOlder || reason == kPrRefuseSameGen)
     {
         if (v->have == 0) v->removed = 0;
@@ -865,6 +1090,71 @@ inline void PieceRetryGen(int haveSent, unsigned int* sentGen, unsigned int refu
 /* ---- fold 4 (review): the inputs mirrored exactly, and turns only from events ---- */
 /* no area map on this link: the holder is not known - never read as 'nobody holds it' (PieceSeedPlaceOk's holderSlot < 0) */
 const int kPieceHolderUnknown = 0x7FFFFFFF;
+/* T-23: the hand-over seed's send gate - the world server's PieceHandSeedOk over this game's own answers (myLoaded: the loaded report this
+   game sent, PieceReportLoaded) */
+inline int PieceHandSeedWriterRule(int mySlot, int ownerSlot, int ownerLoaded, int myLoaded, int holderSlot)
+{
+    return PieceHandSeedOk(mySlot, holderSlot, ownerSlot, ownerLoaded, myLoaded);
+}
+/* T-23 review fold 5: A HAND-OVER THAT OUTLIVES A RELOAD. A piece this game placed in another player's outpost and handed to that
+   player keeps a 'handed here' bit on its copy-list row in pp.build (coopbuild::BuildCopyRec::handed) until the world server is SEEN
+   to hold a record of that placement. Asked on each drain for every such row (a registry of these rows - never a sweep) from the real
+   fact: the world server's record of the piece's key, read only once the area's record list is complete. rowHere: 0 no registry row
+   at the key, 1 this game's hand-over copy row (handed 1), 2 any other row (the owner's PLACE made a copy here, or an own piece).
+   haveRecord / recRemoved / recPlacement: the newest stored record this game knows (kept, or the world server's answer to its own
+   write); nonce: the row's placement (0 = unknown). livePiece: the save's piece found at the key. */
+const int kPhlWait = 0;      /* nothing known yet (the area's list is not complete, or its piece not found yet): asked again */
+const int kPhlLanded = 1;    /* the world server holds this placement's record (live, or its removal): the bit is cleared */
+const int kPhlOther = 2;     /* another road owns the key now (the owner's copy, an own piece): the bit is cleared */
+const int kPhlSession = 3;   /* this game's own hand-over row is here: its hand-over seed road writes it; watched until it lands */
+const int kPhlRemake = 4;    /* after a reload: no record of the placement - the hand-over row is made again and its seed written */
+inline int PieceHandLoadChoice(int rowHere, int listDone, int haveRecord, int recRemoved, unsigned int recPlacement, unsigned int nonce, int livePiece)
+{
+    if (rowHere == 2) return kPhlOther;
+    if (listDone == 0) return kPhlWait;
+    /* a live record, or a removal mark of THIS placement (or of a placement not known - this row's, or the mark's: a remover whose row
+       carries placement 0, e.g. an adopted copy): the hand-over landed - never seeded again over a removal (that would bring back a
+       piece its owner took down) */
+    if (haveRecord != 0 && (recRemoved == 0 || nonce == 0u || recPlacement == 0u || recPlacement == nonce)) return kPhlLanded;
+    if (rowHere == 1) return kPhlSession;
+    return livePiece != 0 ? kPhlRemake : kPhlWait;
+}
+/* T-23: the game a helper's work on another player's piece goes to - the piece's one writer: its owner while the owner's game has the
+   area loaded (ownerLoaded: the area map's bit), else the area's holder; the owner when no holder is known (nobody, or the unknown mark):
+   the work then waits for the owner's game, as before */
+inline int PieceWriterSlotOf(int ownerSlot, int ownerLoaded, int holderSlot)
+{
+    if (ownerLoaded != 0 || holderSlot < 0 || holderSlot == kPieceHolderUnknown) return ownerSlot;
+    return holderSlot;
+}
+/* T-23: another player's piece this game writes (its owner's game away): its state after a build step is written at a change a player
+   notices - progress crossing a tenth of needed (PieceWriteDue), finished, ruined - and at the first step noted (haveLast 0) */
+inline int PieceWorkWriteDue(int haveLast, float lastP, int lastC, int lastD, float p, int c, int d, float needed)
+{
+    if (haveLast == 0 || c != lastC || d != lastD) return 1;
+    return PieceWriteDue(lastP, p, needed, kPeProgress);
+}
+/* T-23 review fold 4: the writer's work noted between those changes (owed 1: a build step on this game's copy since its last work
+   write) is written when the piece's area unloads here (PieceStopMoment), as an own piece's BUILD STOPPED - so a writer that leaves
+   loses none of it. copyRow: another player's piece this game holds a copy of; gone: removed or dismantled since */
+inline int PieceWorkFlushDue(int moment, int owed, int copyRow, int gone)
+{
+    return (PieceStopMoment(moment) != 0 && owed != 0 && copyRow != 0 && gone == 0) ? 1 : 0;
+}
+/* T-23 review fold 4: 1 = that flush goes with no piece here to ask the box rule (its area unloaded: flush 1, piece 0) - the world
+   server's writer rule judges it (PcrWriterNow first, as for any write) */
+inline int PieceWorkFlushNoPiece(int flush, int pieceHere)
+{
+    return (flush != 0 && pieceHere == 0) ? 1 : 0;
+}
+/* T-23 re-check fold: 1 = the writer's owed work (owed 1) is still this game's to flush - writerNow: the world server's writer rule over
+   the newest area map (PieceWriterRule; no piece asked, as at the unload flush). 0 once this game is no longer the writer (the owner's
+   game came back while the area stays loaded here): the owed work is dropped as a LIVE change is (the owner's game writes the record
+   from its own looks), never flushed at a later unload over what the owner wrote meanwhile */
+inline int PieceWorkOweKeep(int owed, int writerNow)
+{
+    return (owed != 0 && writerNow != 0) ? 1 : 0;
+}
 /* the owner an update is judged against on the world server is the STORED record's (PieceJudgeWrite's storedOwner): the kept copy's
    when it is the newest stored record this game knows, else this game's own taken write (itself). Not known here: a record another
    game wrote after the newest one this game was fed. */
@@ -1178,6 +1468,7 @@ inline int PieceLiveDue(const PieceLive& sent, const float* peak, float capacity
 {
     if (now.have == 0 || now.hasPower == 0) return 0;
     if (sent.have == 0 || sent.hasPower == 0) return 1;
+    if (now.hasCraft != 0 && PieceCraftSameOf(sent, now) == 0) return 1;   /* T-1192: a bench's list, switches or repeat changed */
     if ((sent.on != 0) != (now.on != 0) || (sent.gets != 0) != (now.gets != 0)) return 1;
     if (sentGrid >= 0 && nowGrid >= 0 && (sentGrid != 0) != (nowGrid != 0)) return 1;
     if (now.hasBar != 0)
@@ -1221,6 +1512,7 @@ inline int PieceLiveSame(const PieceLive& a, const PieceLive& b)
     if ((a.hasBar != 0) != (b.hasBar != 0)) return 0;   /* T-1047 step 2b: the bar known on one side only */
     if (a.hasBar != 0 && (a.state != b.state || std::fabs(a.bar - b.bar) > kPrLiveEps)) return 0;
     if (PieceDoorsSameOf(a, b, 1) == 0) return 0;   /* the doors known on one side only, or different */
+    if (PieceCraftSameOf(a, b) == 0) return 0;      /* T-1192: a bench's craft part known on one side only, or different */
     return 1;
 }
 /* 1 = exactly the same LIVE part (both not known counts as the same) - the bytes a record would carry */
@@ -1234,6 +1526,10 @@ inline int PieceLiveEqual(const PieceLive& a, const PieceLive& b)
     if ((a.hasBar != 0) != (b.hasBar != 0)) return 0;   /* T-1047 step 2b */
     if (a.hasBar != 0 && (a.bar != b.bar || a.state != b.state)) return 0;
     if (PieceDoorsSameOf(a, b, 0) == 0) return 0;
+    if ((a.hasFarm != 0) != (b.hasFarm != 0)) return 0;   /* a player farm's crop */
+    if (a.hasFarm != 0 && (a.farmGrowth != b.farmGrowth || a.farmDeath != b.farmDeath || a.farmStart != b.farmStart || a.farmHarvested != b.farmHarvested)) return 0;
+    if (PieceCraftSameOf(a, b) == 0) return 0;   /* T-1192: a bench's craft part, its progress exactly */
+    for (size_t i = 0; a.hasCraft != 0 && i < a.craft.size(); ++i) if (a.craft[i].prog != b.craft[i].prog) return 0;
     return 1;
 }
 /* THE WRITER SIDE, at each power look. engineHere: this game runs the piece's engine steps (items.cpp ProdWriterDecide) - only it notes
@@ -1427,7 +1723,7 @@ inline int PieceDoorsSame(const PieceLive& a, const PieceLive& b) { return Piece
    outpost (baseshow.h: every game has one) - never over the owner's own engine link on the owner's game - BEFORE the record's LIVE
    power values are written onto the piece, and the relink's power cycle (a switched-on power piece switched off and on, to leave the
    old town's grid and join the new one) is never taken for a player's switch change. PieceLiveSame / PieceLiveEqual compare the power
-   and doors values only: the link is written and compared by the steps below. */
+   and doors values only (PieceLiveEqual the crop too): the link is written and compared by the steps below. */
 inline void PieceTownSet(PieceLive* l, unsigned int id)
 {
     if (l == 0) return;
@@ -1446,6 +1742,24 @@ inline unsigned int PieceTownWriteId(int writerIsOwner, unsigned int engineId, u
 inline int PieceTownMarkDue(int ownerHere, int writerHere, unsigned int engineId, unsigned int keptId, unsigned int markedId)
 {
     return (ownerHere != 0 && writerHere != 0 && engineId != 0u && engineId != keptId && engineId != markedId) ? 1 : 0;
+}
+/* T-1158 step 6 (D3, run T1823): A RELEASED PIECE'S RECORD LETS GO OF ITS DEAD OUTPOST. A rebuilt piece whose lost outpost never came
+   back is released from its wait (townkeep.h RestoredWaitStep) still standing in no outpost; nothing else writes a link of 0
+   (PieceTownMarkDue wants a known engine id, PieceTownWriteId carries the stored id), so its record would name the dead id for ever
+   and the world server keep that outpost's row and send it back at every new link. droppedId: the dead id noted at the release;
+   keptId: the id the stored record names now; engineId: the outpost id of the town the engine links the piece to here (0 = none
+   known); townLive: that town is a live town of this player whose id is not known here yet (or the town list did not read).
+   kTdForget: the record names something else now (rewritten - nothing more to do); kTdHold: not the owner's game or not the piece's
+   writer now (kept, tried at the next own-piece check); kTdEngine: the engine knows a real outpost - the ordinary mark writes that id;
+   kTdWait: a live town whose id is not known yet (its SAY and SHOW come first); kTdWriteNone: the write carries no outpost */
+const int kTdForget = 0, kTdHold = 1, kTdEngine = 2, kTdWait = 3, kTdWriteNone = 4;
+inline int PieceTownDropDue(int ownerHere, int writerHere, unsigned int engineId, int townLive, unsigned int keptId, unsigned int droppedId)
+{
+    if (droppedId == 0u || keptId != droppedId) return kTdForget;
+    if (ownerHere == 0 || writerHere == 0) return kTdHold;
+    if (engineId != 0u) return kTdEngine;
+    if (townLive != 0) return kTdWait;
+    return kTdWriteNone;
 }
 /* THE APPLY STEP for one piece's record on one game */
 const int kTlNone = 0, kTlUnknown = 1, kTlOwn = 2, kTlInside = 3, kTlNoTown = 4, kTlSame = 5, kTlRelink = 6, kTlStepMax = 6;
@@ -1485,6 +1799,136 @@ inline int PieceTownCycleStep(int cycle, int recordPowerKnown)
 {
     if (cycle != kCycleFailed) return kCycleStepNothing;
     return recordPowerKnown != 0 ? kCycleStepRecordSwitch : kCycleStepLeftOff;
+}
+
+/* ---- A PLAYER FARM'S CROP ON ITS RECORD ----
+   A player farm's growth, death, plant start and plants harvested ride its piece record's LIVE part (flag bit 6): its ONE source for a game
+   entering its area. The writer is the farm's writer (items.cpp FarmWriterHere, the box rule's ladder); it writes at each clear event - a
+   harvest, a replant (resetFarm 0xE48A0: a new plant start, growth back to it, death and harvested to 0), the crop starting to die - and
+   at each kPieceLiveFarmBands step of growth or death by the band rule power on player pieces uses (PieceLiveBandLeftOf, full 1). Every
+   other game lays the record's crop onto its farm at the area's apply and at each newer record. Between records a non-writer's farm does
+   not grow on its own: its growth tick is held (farm.cpp detour_update). The live FARM carries no player farm's crop (farmwire.h
+   FarmPublishDueOf / FarmApplyCrop): the record is its one road, on every game. */
+inline void PieceFarmClear(PieceLive* l)
+{
+    if (l == 0) return;
+    l->hasFarm = 0; l->farmGrowth = 0.0f; l->farmDeath = 0.0f; l->farmStart = 0.0f; l->farmHarvested = 0; l->farmAt = 0u;
+}
+/* the crop of from into *to (everything else of *to kept) */
+inline void PieceFarmCopy(PieceLive* to, const PieceLive& from)
+{
+    if (to == 0) return;
+    PieceFarmClear(to);
+    if (from.hasFarm == 0) return;
+    to->hasFarm = 1; to->farmGrowth = from.farmGrowth; to->farmDeath = from.farmDeath; to->farmStart = from.farmStart; to->farmHarvested = from.farmHarvested;
+    to->farmAt = from.farmAt;
+}
+/* the crop as a farm reads it into *l: 1 = in range and set (hasFarm 1, its clock minute not known: the caller sets farmAt), 0 = refused
+   (*l's crop not known) */
+inline int PieceFarmSet(PieceLive* l, float growth, float death, float start, int harvested)
+{
+    if (l == 0) return 0;
+    PieceFarmClear(l);
+    if (!PrLiveFarmFloatOk(growth) || !PrLiveFarmFloatOk(death) || !PrLiveFarmFloatOk(start) || harvested < 0 || harvested > kPrLiveFarmMaxHarvested) return 0;
+    l->hasFarm = 1; l->farmGrowth = growth; l->farmDeath = death; l->farmStart = start; l->farmHarvested = harvested;
+    return 1;
+}
+/* the clear events between the crop written (sent) and the crop now: always a write */
+const int kPfeNone = 0, kPfeHarvest = 1, kPfeReplant = 2, kPfeDying = 3, kPfeFirst = 4;
+inline const char* PieceFarmEventName(int e)
+{
+    return e == kPfeHarvest ? "harvest" : e == kPfeReplant ? "replant" : e == kPfeDying ? "dying" : e == kPfeFirst ? "first" : "step";
+}
+/* kPfeFirst: nothing written yet; kPfeReplant: the engine's replant (resetFarm 0xE48A0, the only writer of plant start besides the load:
+   every plant's age drawn anew as random x -0.2, plant start their lowest, plants harvested 0) - a new plant start or fewer plants
+   harvested; kPfeHarvest: more plants harvested; kPfeDying: death started (from 0) - else kPfeNone. Death falling (a watered crop
+   recovering, update 0xE5540: death under 0.6 falls each frame) and growth falling are no event: the band rule writes them */
+inline int PieceFarmEvent(const PieceLive& sent, const PieceLive& now)
+{
+    if (now.hasFarm == 0) return kPfeNone;
+    if (sent.hasFarm == 0) return kPfeFirst;
+    if (now.farmStart != sent.farmStart || now.farmHarvested < sent.farmHarvested) return kPfeReplant;
+    if (now.farmHarvested > sent.farmHarvested) return kPfeHarvest;
+    if (!(sent.farmDeath > kPrLiveEps) && now.farmDeath > kPrLiveEps) return kPfeDying;
+    return kPfeNone;
+}
+/* growth's band rule: under ripe (1) against full 1; at or past ripe both, the growth past 1 in its own hundredths from 1 - the update
+   (0xE5540) grows a ripe crop on from 1 to its rot point (2, where death starts), so the record carries the real value */
+inline int PieceFarmGrowthLeft(float s, float v)
+{
+    if (s >= 1.0f && v >= 1.0f) return PieceLiveBandLeftOf(s - 1.0f, v - 1.0f, 1.0f, kPieceLiveFarmBands);
+    return PieceLiveBandLeftOf(s, v, 1.0f, kPieceLiveFarmBands);
+}
+/* 1 = the crop now is a change to write against the crop written (sent): a clear event (PieceFarmEvent), or growth (PieceFarmGrowthLeft)
+   or death leaving its written band of kPieceLiveFarmBands, up or down (reaching full or empty at once, any other band half a band past
+   its edge). A crop not known now: no write */
+inline int PieceFarmDue(const PieceLive& sent, const PieceLive& now)
+{
+    if (now.hasFarm == 0) return 0;
+    if (PieceFarmEvent(sent, now) != kPfeNone) return 1;
+    if (PieceFarmGrowthLeft(sent.farmGrowth, now.farmGrowth) != 0) return 1;
+    if (PieceLiveBandLeftOf(sent.farmDeath, now.farmDeath, 1.0f, kPieceLiveFarmBands) != 0) return 1;
+    return 0;
+}
+/* 1 = exactly the same crop (both not known counts as the same) */
+inline int PieceFarmSame(const PieceLive& a, const PieceLive& b)
+{
+    if ((a.hasFarm != 0) != (b.hasFarm != 0)) return 0;
+    if (a.hasFarm == 0) return 1;
+    return (a.farmGrowth == b.farmGrowth && a.farmDeath == b.farmDeath && a.farmStart == b.farmStart && a.farmHarvested == b.farmHarvested) ? 1 : 0;
+}
+/* THE APPLY SIDE: 1 = a record's crop is laid onto this game's farm - the record carries one (recHasFarm), and either it is the area's
+   first apply here (firstAfterLoad: the record outranks the area save's crop on every game, the writer's too) or this game does not write
+   the farm (writerHere 0: a newer record moves a held farm; the writer's own engine is never fought). seenSkip: a generation this game
+   is already past */
+inline int PieceFarmApplyRule(int recHasFarm, int seenSkip, int firstAfterLoad, int writerHere)
+{
+    if (recHasFarm == 0 || seenSkip != 0) return 0;
+    return (firstAfterLoad != 0 || writerHere == 0) ? 1 : 0;
+}
+/* the generation order of the crop laid on a farm here: 1 = a record of generation gen is newer than the last laid (lastGen; haveLast 0 =
+   none laid this load) and may be laid; 0 = the same or older (never laid over a newer one) */
+inline int PieceFarmGenNewer(int haveLast, unsigned int lastGen, unsigned int gen)
+{
+    return (haveLast == 0 || gen > lastGen) ? 1 : 0;
+}
+/* A GAME TAKING THE WRITER ROLE (build.cpp PieceRecFarmNote, on the farm's writer, before any write): 1 = the stored record's crop is
+   laid on the farm first - the record carries a crop (recHasFarm) another game wrote (recWriterOther) of a generation newer than the
+   last laid here this load (haveLaid 0: none laid), unless it is the very crop this game last wrote (sameAsMine: another game's write
+   of the piece carried it on unchanged). 0 = the farm already shows it, or the crop is this game's own */
+inline int PieceFarmTakeLay(int recHasFarm, int recWriterOther, int sameAsMine, int haveLaid, unsigned int laidGen, unsigned int recGen)
+{
+    if (recHasFarm == 0 || recWriterOther == 0 || sameAsMine != 0) return 0;
+    return (haveLaid == 0 || recGen > laidGen) ? 1 : 0;
+}
+/* THE LOAD CATCH-UP FROM THE RECORD (farm.cpp FarmRecordLay at the area's first lay). The farm's load (0xE3DA0) runs the engine's
+   catch-up (timeSkip 0xDF6A0) for the hours since the farm's SAVE: the clock's minute count (0x66C070) / 60 (its divisor, 0x141688854)
+   less the save time, only when that is over 1 hour (0x14167B308). Once the record's crop is laid, the catch-up owed is the hours
+   since the RECORD's minute recAt: 1 = run it for *hours (the same floor); 0 = none (the record's minute not known, not past, or at or
+   under the floor) */
+const float kFarmClockMinutesPerHour = 60.0f;   /* 0xE3DA0's divisor of the clock's minute count */
+const float kFarmCatchUpFloorHours = 1.0f;      /* 0xE3DA0: no catch-up for this many hours or fewer */
+inline int PieceFarmCatchUp(unsigned int recAt, unsigned int nowMin, float* hours)
+{
+    if (hours != 0) *hours = 0.0f;
+    if (recAt == 0u || nowMin <= recAt) return 0;
+    const float h = (float)(nowMin - recAt) / kFarmClockMinutesPerHour;
+    if (!(h > kFarmCatchUpFloorHours)) return 0;
+    if (hours != 0) *hours = h;
+    return 1;
+}
+/* THE WAIT OF A FARM'S HELD LOAD CATCH-UP (build.cpp PieceRecFarmLayOwed, farm.cpp FarmDrain): 1 = it waits; 0 = it may run (where
+   this game writes the farm). single: a single-player game (nothing waits). areaDone: the farm's area has all its records here and
+   they are applied (build.cpp g_pcaDone, set once StoreAreaDoneSec answers for the area); haveSlot: a world-server link (none: no
+   records come, nothing waits for them). pending: its record's crop is queued to be laid. recHasFarm: the stored record carries a crop
+   (not removed); laidThisLoad: a crop is laid on it since its area loaded. listFull: the laid list or the lay queue is full - whether
+   it was laid is not kept then, so the area's records alone answer */
+inline int PieceFarmLayOwed(int single, int haveSlot, int areaDone, int pending, int recHasFarm, int laidThisLoad, int listFull)
+{
+    if (single != 0) return 0;
+    if (areaDone == 0) return (haveSlot != 0) ? 1 : 0;
+    if (pending != 0) return 1;
+    return (recHasFarm != 0 && laidThisLoad == 0 && listFull == 0) ? 1 : 0;
 }
 
 }   /* namespace piecerec */

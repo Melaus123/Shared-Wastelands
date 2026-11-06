@@ -135,7 +135,8 @@ void ApplyRemoteSwing(unsigned int uid, unsigned int targetUid, const char* move
 
 // MSG_SWING_END (MAIN THREAD): the owner's swing of uid ended on its game - its copy here drops every swing credit it still holds
 // (swinggate.h OwnerEnd) and the retry of its start on arrival stops. targetUid: the target the SWING named (not used here).
-void ApplyRemoteSwingEnd(unsigned int uid, unsigned int targetUid);
+// end: what the owner's swing met on its game (hitwire.h kSwingEnd*), for the copy's pause after its own swing.
+void ApplyRemoteSwingEnd(unsigned int uid, unsigned int targetUid, unsigned char end);
 
 // T-1101 design (c) - MSG_FIGHT_CHOICE (MAIN THREAD, session.cpp OnFightChoice): the owner's fight decide step chose for its player
 // character uid (src/common/fightchoice.h). Kept for this game's copy of uid, which takes it at its own decide step; refusal != 0 =

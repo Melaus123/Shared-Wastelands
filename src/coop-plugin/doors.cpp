@@ -8,6 +8,7 @@
 #include "store.h"          /* EngineWritesBlocked - the one predicate every engine write asks */
 #include "net/session.h"    /* SendDoorState, SessionLinked */
 #include "../common/doorsync.h"   /* P8n: the last-actor rule, the terminal-state test, the churn give-up and the first-sighting rule - PURE, and swept by src/coop-test/test_main.cpp */
+#include "../common/doorrec.h"   /* a world door as one world-server record - its id, bytes and the write, lay and removal rules */
 #include "coop_log.h"
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
 #include "zones.h"   /* T-160: NearestBuildingWhere - the `doortest nearest` lever */
@@ -16,8 +17,12 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include <map>
+#include <vector>
 
 namespace coop {
+int BuildBuildingIsPlayers(void* building);   /* build.cpp: 1 = a player owns the building (its doors are its piece record's), -1 unreadable */
+void BuildDoorEngineRoads(unsigned long long* hitRva, unsigned long long* repairRva);   /* build.cpp: the hooked door hit / repair step, 0 = not hooked */
 namespace {
 
 /* ============================ THE ENGINE, ALL OF IT IN ONE BLOCK ============================
@@ -147,6 +152,7 @@ long long g_doorRecBrokenOpened = 0;         /* broken doors the record's apply 
 long long g_doorRecBreak = 0, g_doorRecMend = 0, g_doorRecLevel = 0, g_doorRecLockBroken = 0, g_doorRecHealth = 0;   /* the record's apply, per value written */
 long long g_doorRecMendReArmed = 0;          /* doors the record mended whose row takes the holder's word again (DoorsRecApply) */
 long long g_doorSnapped = 0;                 /* applies made by setDoorState (the other SPAN): played + snapped = doorApplied */
+long long g_doorAppliedRecord = 0;           /* engine writes made from a door's laid world-server record (a SPAN of doorApplied) */
 long long g_doorPlayRefused = 0;             /* openDoor / closeDoor left the door unmoved - snapped instead */
 long long g_doorPlayLanded = 0;              /* played swings that reached the holder's state */
 long long g_doorPlayInterrupted = 0;         /* played swings another writer moved before they landed */
@@ -163,7 +169,6 @@ long long g_doorLockNoLockObject = 0;        /* lock disagreements on a door wit
 long long g_doorLockNoCall = 0;              /* lock disagreements needing lockDoor / unlockDoor whose prologue did not match - once per event */
 long long g_doorLockUnseenLocal = 0;         /* a live lock word no detour saw and this game did not write - its own world's, reported or adopted */
 long long g_doorPlayLandReported = 0;        /* played swings that landed with a change of this game's own inside them - reported at the landing */
-long long g_doorRepublishedOnLink = 0;       /* rows re-offered at the session link-up edge */
 long long g_doorRowRecycled = 0;             /* a registry row whose key no longer rebuilds - freed, never written */
 long long g_doorMsgMalformed = 0;
 long long g_doorOffThread = 0;               /* funnel calls that were not on the main thread */
@@ -253,31 +258,24 @@ volatile LONG g_doorLockSweepPending = 0;    /* some row's lockSweep is set (det
 volatile LONG g_dirty = 0;                   /* the tick's whole pre-check: nothing to do while this is 0 */
 volatile LONG g_gen = 0;                     /* this game's monotonic publish generation */
 /* What a (re)loading game's doors cost and get, printed on the reload[...] report line:
-   firstSightingOffered - a door seen for the first time, queued as a re-offer instead of an actor report;
-   sectorAsks / sectorServed - sectors named by the catch-up asks this game answered, and doors queued as re-offers in them;
-   loadWriteOffered - a known door written by an engine load-time writer, queued as a re-offer instead of an actor report;
+   firstSightingKept - a door seen for the first time: this game's load, not published (its record is laid instead);
+   loadWriteKept - a known door written by an engine load-time writer: this game's load, not published;
    genForgotten - held newest-wins records forgotten because their publisher entered the world;
    genRefused - door messages refused as not newer than the record kept for their publisher (DoorGenStale);
    giveUpReArmed - rows given up on ineffective corrections, tried again on a new accepted word;
    heldEvicted - held-table entries taken for a new key while the table was full. */
-long long g_doorFirstSightingOffered = 0, g_doorSectorAsks = 0, g_doorSectorServed = 0, g_doorGenForgotten = 0;
+long long g_doorFirstSightingKept = 0, g_doorGenForgotten = 0;
 long long g_doorGiveUpReArmed = 0, g_doorHeldEvicted = 0;
 long long g_doorGenRefused = 0;
-long long g_doorLoadWriteOffered = 0;
+long long g_doorLoadWriteKept = 0;
 /* A holder word on this game, on the reload line as word[...]: storedNoRow - a word stored for a door with no row here;
    droppedWithRow - a row whose door has a stored word, dropped by the active-zone check; reFindAsked / reFound / reFindMissed - such
    a word's door looked up again through its building when the word was next due, and whether it was found; linesSuppressed - the
    holder-word lines past their key's own budget or the session total (DoorWordLine). */
 long long g_doorWordStoredNoRow = 0, g_doorWordDroppedWithRow = 0;
 long long g_doorWordReFindAsked = 0, g_doorWordReFound = 0, g_doorWordReFindMissed = 0, g_doorWordLinesSuppressed = 0;
-/* A catch-up ask's doors, on the reload line as serve[...]: noRow - a door of an asked sector this game knows only by key (a held
-   entry, no row here), marked to be looked up through its building; reFound / missed - such a door found (or with a row again) when
-   its mark was taken, and then re-offered if it rests, or not found; overflow - a re-offer the full send queue refused (sectorServed
-   counts only the queued ones). */
-long long g_doorServeNoRow = 0, g_doorServeReFound = 0, g_doorServeMissed = 0, g_doorServeOverflow = 0;
 volatile LONG g_doorWordLines = 0;
 unsigned long g_doorHeldStamp = 0;           /* the held table's use counter (DoorHeldRow::lastUse) */
-volatile LONG g_doorServeLines = 0;          /* the sector-serve line's budget */
 /* B12-a / B12 (decision 52): THE DOOR ROAD'S OWN NO-NOTEBOOK NUMBERS, which did not exist before this
    build - the verdict was collapsed into "nobody holds it" and an actor report went out anyway.
    queued is a change written into the outage journal; payloadRefused is one the journal would not take, and
@@ -328,9 +326,8 @@ const unsigned long kDoorClockStepCapMs = 1000;
 const int kDoorKeyCap  = 64;
 const int kDoorRows    = 256;
 const int kDoorHeldCap = 256;
-/* AS WIDE AS THE REGISTRY, deliberately: the link-up re-offer queues every row this game has seen
-   in one pass, and a mailbox narrower than the registry would drop most of them the moment a peer
-   joined - which is exactly the case the re-offer exists for.  An overflow is still counted. */
+/* AS WIDE AS THE REGISTRY: room for a queued change of every registered door at once.  An overflow is
+   still counted (overflow[out]). */
 const int kDoorOutCap  = 256;
 
 struct DoorRow
@@ -378,6 +375,19 @@ struct DoorRow
     volatile long lockGaveUp;     /* this row is not lock-corrected until the two games agree about its lock */
     volatile long lockStuck;      /* this lock disagreement could not be applied and has been counted - once per event */
     volatile long lockSweep;      /* a close that did nothing on this door: the next tick compares its lock word */
+    /* ---- the door's world-server record ---- */
+    volatile long recLaid;        /* its record was laid on this door (or seeded from it, or its own is shown) since the row was made */
+    volatile long recDirty;       /* the engine's hit or a repair flipped this door's broken flag: the next tick writes its record */
+    volatile long recChange;      /* a stored fact was written straight into this door (its lock level): the next tick writes or holds it as a change */
+    volatile long recHeld;        /* a change of this door was held before its record was laid: the lay writes the facts it moved (recHeldMask) */
+    volatile long recOwn;         /* laid showing its own (no record; another game or nobody held the area): seeded if this game takes it */
+    volatile long recWait;        /* its lay waits: 1 for a stored record or this game's seed's confirmation (the arrival lays it again), 2 for
+                                     the holder answer (the area map's next change or the area picture settling lays it again) */
+    volatile long recLines;       /* record lines spent on this door (DrLine's per-door budget) */
+    volatile long recHeldMask;    /* the stored facts (doorrec kDrCh* bits) the held changes moved: the lay takes only these from the door */
+    long recBaseHave;             /* MAIN THREAD: recBase* are the door's stored facts before any held change (taken while it is not laid) */
+    long recBaseState, recBaseLock, recBaseBroken, recBaseHasLock, recBaseLevel, recBaseLockBroken;
+    float recBaseHardness;
 };
 DoorRow g_rows[kDoorRows];
 
@@ -397,16 +407,15 @@ struct DoorHeldRow
     volatile long actorLocked;   /* the reporting game's lock word - it becomes `locked` only if this game adopts the report */
     volatile long lastUse;       /* g_doorHeldStamp when this key was last looked up - the eviction order */
     volatile long reFind;        /* 1 = the row of this word's door was dropped by the active-zone check: look the door up again */
-    volatile long serveFind;     /* 1 = a catch-up ask named this key's sector while it had no row here: look the door up, re-offer it */
     volatile long wordLines;     /* holder-word lines spent on THIS key (DoorWordLine's per-key budget) */
+    volatile long recWord;       /* the held word was laid from the door's record and not yet applied (the apply's record reason) */
 };
 DoorHeldRow g_held[kDoorHeldCap];
 
-/* P8n: `reportIfNotHolder` is what tells an ordinary local change from the link-up re-offer.  An
-   ordinary change on a door this game does not hold is SENT to the holder as an actor report - that
-   is the whole last-actor rule.  A re-offer is the weather pattern's "tell the late joiner what I
-   hold" and must stay refused when this game is not the holder, or a joining game would push its own
-   stale local states at the holder and win. */
+/* P8n: `reportIfNotHolder` tells an ordinary local change (1) from the holder's republish after it adopted another game's report (0).
+   An ordinary change on a door this game does not hold is SENT to the holder as an actor report - that is the whole last-actor rule;
+   the republish is the holder's own answer and is refused once this game no longer holds the door.  Every local change and adopted
+   report has its door record written by the holder of the key's area (DrWriteRow asks it). */
 struct DoorOutRow { volatile long used; char key[kDoorKeyCap]; long state, locked, reportIfNotHolder;
                     long retries; unsigned long firstFailMs; };   /* M7b slice 4 fold 1 (F8): a failed actor report's retries */
 DoorOutRow g_out[kDoorOutCap];
@@ -685,7 +694,9 @@ DoorRow* RowFor(void* door, const char* keyIfNew, int gate, void* owner)
         g_rows[i].reportAbandoned = 0; g_rows[i].refusedLogged = 0;
         g_rows[i].playTarget = -1; g_rows[i].playStartMs = 0; g_rows[i].lockIneffective = 0; g_rows[i].lockGaveUp = 0; g_rows[i].lockStuck = 0;
         g_rows[i].lockSweep = 0;
+        g_rows[i].recLaid = 0; g_rows[i].recDirty = 0; g_rows[i].recChange = 0; g_rows[i].recHeld = 0; g_rows[i].recOwn = 0; g_rows[i].recWait = 0; g_rows[i].recLines = 0; g_rows[i].recHeldMask = 0; g_rows[i].recBaseHave = 0;
         ::InterlockedExchange(&g_rows[i].ready, 1);
+        ::InterlockedExchange(&g_dirty, 1);   /* a door registering in an area whose records are laid is laid on the next tick */
         return &g_rows[i];
     }
     ::InterlockedIncrement64(&g_doorRowsOverflow);
@@ -747,7 +758,7 @@ DoorHeldRow* HeldFor(const char* key, int makeIt)
     g_held[i].state = -1; g_held[i].locked = -1; g_held[i].gen = -1; g_held[i].fromPeer = -1;
     g_held[i].pendingActor = 0; g_held[i].actorState = -1; g_held[i].actorLocked = -1;
     g_held[i].reFind = 0;
-    g_held[i].serveFind = 0; g_held[i].wordLines = 0;
+    g_held[i].wordLines = 0; g_held[i].recWord = 0;
     g_held[i].lastUse = (long)++g_doorHeldStamp;
     g_held[i].used = 1;
     return &g_held[i];
@@ -1040,7 +1051,7 @@ void NoteDoor(void* door, uintptr_t retRva, const char* where, int ours)
                        booked that as a local writer - so an apply that was this game hearing about the
                        door for the first time was attributed to "a local writer moved it". ---- */
                     /* WHO MADE THE CHANGE decides what it is (coopdoor::DoorChangeReportsIfNotHolder): a write by an engine
-                       load-time writer, or a first sighting, is this game's load - a re-offer and not a local writer; a call
+                       load-time writer, or a first sighting, is this game's load - never published and not a local writer; a call
                        into openDoor / closeDoor / lockButton is an act on the door - an actor report and a local write, even
                        on a row that is new. */
                     const int rep = coopdoor::DoorChangeReportsIfNotHolder(was, DoorRetIsLoadWriter(retRva),
@@ -1061,16 +1072,15 @@ void NoteDoor(void* door, uintptr_t retRva, const char* where, int ours)
                        derives them.  Only a terminal state is queued, and under the last-actor rule
                        that queued change is ALSO the actor report a non-holder sends to the holder:
                        the drain asks who holds the door at the moment it sends. */
-                    /* A change that is this game's load (rep 0, above) goes as a re-offer, published only if this game
-                       holds the door. */
-                    if (state == 0 || state == 1)
+                    /* A change that is this game's load (rep 0, above) is not published: a door's world facts come from its
+                       world-server record, laid when its area's records are here, and an ordinary door's resting swing is each
+                       game's own. */
+                    if ((state == 0 || state == 1) && rep != 0) QueueOut(key, state, word, rep);
+                    else if (state == 0 || state == 1)
                     {
-                        if (rep == 0)
-                        {
-                            if (was < 0) ::InterlockedIncrement64(&g_doorFirstSightingOffered);
-                            else ::InterlockedIncrement64(&g_doorLoadWriteOffered);
-                        }
-                        QueueOut(key, state, word, rep);
+                        if (was < 0) ::InterlockedIncrement64(&g_doorFirstSightingKept);
+                        else ::InterlockedIncrement64(&g_doorLoadWriteKept);
+                        ::InterlockedExchange(&g_dirty, 1);
                     }
                     else ::InterlockedExchange(&g_dirty, 1);
                 }
@@ -1195,7 +1205,7 @@ DoorHeldRow* HeldPeek(const char* key)
     return 0;
 }
 /* WHAT HAPPENS TO A HOLDER WORD ON THIS GAME, one line per event naming the door.  THE BUDGET IS PER KEY, as P060's is: a key with a
-   held entry prints at most kDoorWordLinePerKey lines, so one catch-up's doors cannot spend the line a gate needs; a key naming a gate
+   held entry prints at most kDoorWordLinePerKey lines, so one town's doors cannot spend the line a gate needs; a key naming a gate
    (coopdoor::DoorKeyNamesGate) prints within that budget whatever the session total says and does not spend the total; every other
    line also needs room in the session total of kDoorWordLineBudget (coopdoor::DoorWordLinePrints).  What is refused is counted
    (word[...linesSuppressed] on the reload line).  The call is claimed as the give-up line's is, because DebugLog is not thread-safe. */
@@ -1510,6 +1520,7 @@ void DoorLockSweepRow(DoorRow* r)
     }
     ::InterlockedExchange(&r->locked, (long)word);
     ::InterlockedExchange(&r->localWrite, 1);
+    if (r->recLaid == 0) r->recBaseHave = 0;   /* a lock word found before the door's lay is engine work: taken into its facts before any held change (DoorsTick's record step, before the drain), never held */
     ++g_doorLockUnseenLocal;
     QueueOut(r->key, state, word, 1);
 }
@@ -1694,6 +1705,7 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                    entitled to its own fifteen seconds.  Nothing else clears it, which is what makes
                    "a door nobody holds does not report for ever" true rather than claimed. */
                 ::InterlockedExchange(&r->reportAbandoned, 0);
+                ::InterlockedExchange(&h->recWord, 0);   /* the record's word is on the door */
                 return 0;
             }
             if (act == coopdoor::kDoorActWaitMidSwing)
@@ -1846,10 +1858,13 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
         ++g_doorApplied;
         if (reason == 2) ++g_doorReapplyAfterForcedOpen;
         else if (reason == 3) ++g_doorAppliedHolderWord;
+        else if (reason == 4) ++g_doorAppliedRecord;
         else ++g_doorAppliedOnArrival;
+        if (h != 0) ::InterlockedExchange(&h->recWord, 0);
         DoorWordLine(r->key, (h != 0) ? (int)h->state : -1,
                      reason == 2 ? "applied to its door (after a forced open)"
-                                 : (reason == 3 ? "applied to its door (a new holder word)" : "applied to its door (the door registered here)"));
+                                 : (reason == 3 ? "applied to its door (a new holder word)"
+                                                : (reason == 4 ? "applied to its door (its world-server record)" : "applied to its door (the door registered here)")));
         ::InterlockedIncrement(&r->applies);
         /* P8n: THE CORRECTION IS NOW ON THE RECORD AS A CORRECTION.  If a non-self writer moves this
            door before the two games agree, NoteDoor consumes this flag and counts an `undone` - which
@@ -1861,6 +1876,449 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
         ::InterlockedExchange(&r->reportPending, 0);   /* P8n-b (L-6): the holder's word landed */
         return 1;
     }
+}
+
+/* ============================ A WORLD DOOR'S RECORD ON THE WORLD SERVER ============================
+   Each door of a building no player owns has one record (src/common/doorrec.h): a gate's open / closed state, the lock word, broken,
+   the lock's level, hardness and broken flag, and the door's health. The holder of the door key's area writes it once per change -
+   the drain for every local change and adopted report it sends, DoorsTick when the engine's hit or a repair flips (after the lay)
+   the door's broken flag (an ordinary door's swing moves none of its facts and writes nothing) - and seeds it at its lay of the area
+   when the door has none, or once it holds an area whose door it showed as its own. A change made before the lay, while the holder is
+   not known, or while a refused seed's stored record or this game's own seed's confirmation is awaited is held with the stored facts
+   it moved, and the lay writes only those over the record it has then. Every
+   game lays the record on the door when the area's record list is complete (DoorsRecAreaLay, from build.cpp's per-area apply), for a
+   door that registers later in a laid area, and when a newer record arrives for a laid area. A ruined building's door records and a
+   rebuilt town's records that name no live door are removed by the area's holder, queued until the area's list is complete here and the
+   removal is sent. Nothing here runs on a clock: a waiting lay is tried again by the event that ends its wait (the stored record's
+   arrival, the area map's change, the area picture settling). A player's piece's doors are its piece record's (build.cpp) and get no
+   door record.
+   MAIN THREAD, all of it, except DoorsRecNoteBrokenChanged. */
+struct DoorRecKept
+{
+    doorrec::DoorRec r;
+    int have;                 /* r is a record this game received or wrote */
+    unsigned int floorGen;    /* the highest stored generation a refusal named */
+    int rewrites;             /* writes made again after a refusal, since the last arrival */
+    int pending;              /* r is this game's write, sent and not confirmed (the world server's answer) or taken back by an arrival since */
+    long long sentStamp;      /* the stamp the pending write was sent with: the world server's answer names it (DoorRecordEcho) */
+    doorrec::DoorRec conf;    /* the confirmed copy: the last record that arrived from the world server, or this game's write it took - a refused write puts it back */
+    int confHave;
+    int awaitStored;          /* this door's seed was refused (a record exists): nothing of it is written until the stored record arrives */
+    DoorRecKept() : have(0), floorGen(0), rewrites(0), pending(0), sentStamp(0), confHave(0), awaitStored(0) {}
+};
+std::map<std::string, DoorRecKept> g_drec;   /* door record id -> the record */
+unsigned char g_drAreaLaid[64 * 64];         /* build.cpp's area index (sx * 64 + sy): this area's records are laid on this load */
+unsigned char g_drRebuilt[64 * 64];          /* 1 = the area's town was rebuilt here and the area is not laid since; 2 = laid since: swept at the lay or the next area map */
+long long g_drWritten = 0, g_drSeeded = 0, g_drLaidN = 0, g_drOwnShown = 0, g_drRecNoDoor = 0, g_drHeld = 0, g_drNoChange = 0, g_drNotHolder = 0;
+long long g_drSendFailed = 0, g_drArrived = 0, g_drArrivedOlder = 0, g_drBad = 0, g_drRefused = 0, g_drRewrites = 0, g_drRemoved = 0;
+long long g_drPlayerPiece = 0, g_drGone = 0, g_drBrokenNoted = 0;
+long long g_drHeldWritten = 0, g_drLayWaited = 0, g_drOwnReseeded = 0, g_drKeyClash = 0, g_drUndone = 0, g_drGoneQueued = 0, g_drGoneDropped = 0;
+long long g_drLinesSuppressed = 0;
+long long g_drConfirmed = 0;                 /* this game's writes the world server's answer confirmed (DoorRecordEcho) */
+LONG g_drConfirmLines = 0;
+const LONG kDrConfirmLineCap = 16;           /* the "confirmed" lines' session total (past it they are counted, linesSuppressed) */
+/* a queued removal of a door record: its id and the area of its key */
+struct DrGone { std::string id; int c; };
+std::vector<DrGone> g_drGoneQ;               /* removals not sent yet (DrGoneFlush) */
+std::vector<DrGone> g_drRuin;                /* the door records of the building whose ruin flip is running (DoorsRecRuinBefore) */
+void* g_drRuinBuilding = 0;
+unsigned char g_drWaitSaid[64 * 64];         /* the area's "holder not known" line was printed (DrWaitSay) */
+LONG g_drWaitLines = 0;
+const LONG kDrWaitLineCap = 8;
+const LONG kDrLineBudget = 60;               /* the record lines' session total (a gate's lines do not spend it) */
+const LONG kDrLinePerKey = 4;                /* ... and each door's own budget */
+volatile LONG g_drLines = 0;
+const size_t kDoorLockHardness = 0x04;   /* the DoorLock's hardness (float), after its level at +0 (the lock layout build.cpp reads: +0 level, +4 hardness, +0x20 locked, +0x21 broken) */
+/* POD ONLY (C2712) */
+int DrHardnessPod(void* door, float* out)
+{
+    __try
+    {
+        const char* lk = *(const char* const*)((const char*)door + kDoorLockPtr);
+        *out = (lk != 0) ? *(const float*)(lk + kDoorLockHardness) : 0.0f;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int DrHardnessWritePod(void* door, float v)
+{
+    __try
+    {
+        char* lk = *(char* const*)((const char*)door + kDoorLockPtr);
+        if (lk != 0) *(float*)(lk + kDoorLockHardness) = v;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the area index of a door key (its "@x,y@" field); -1 when its area square is off the grid */
+int DrSecOfKey(const char* key)
+{
+    return doorrec::DrKeyArea(key);
+}
+/* The record road's holder answer for area c: the holder of the key's area, as the world server judges a door record (its id's area),
+   asked through items.cpp's settled verdict at the area's centre point - not at the door's own position, which can lie across an area
+   line from its key. 1 this game, 0 another game or nobody, -1 not known yet (coopdoor::DoorAreaHoldAnswer). */
+int DrHoldOfArea(int c)
+{
+    if (c < 0 || c >= 64 * 64) return -1;
+    Sector s;
+    s.x = c / 64; s.y = c % 64;
+    float p[3] = { 0.0f, 0.0f, 0.0f };
+    SectorCentrePointTS(s, p);
+    return coopdoor::DoorAreaHoldAnswer(AreaVerdictForDoorSettled(p));
+}
+int DrHoldOfKey(const char* key)
+{
+    return DrHoldOfArea(DrSecOfKey(key));
+}
+/* One record line about the door of row r: at most kDrLinePerKey per door and kDrLineBudget in all (a gate's within its own budget
+   whatever the total), the holder-word lines' rule (coopdoor::DoorWordLinePrints); what is refused is counted (linesSuppressed). */
+void DrLine(DoorRow* r, const std::string& text)
+{
+    const int isGate = (r != 0 && r->gate != 0) ? 1 : 0;
+    const long keyLines = (r != 0) ? (long)::InterlockedIncrement(&r->recLines) : 0;
+    const long total = (r != 0 && isGate != 0) ? 0 : (long)::InterlockedIncrement(&g_drLines);
+    if (coopdoor::DoorWordLinePrints((r != 0) ? 1 : 0, keyLines, total, isGate, kDrLinePerKey, kDrLineBudget) == 0) { ++g_drLinesSuppressed; return; }
+    DebugLog("[DOORREC] " + text);
+}
+/* the door's live values as a record (no generation, writer or flags); 0 = a read faulted */
+int DrReadLive(DoorRow* r, doorrec::DoorRec* out)
+{
+    int s = 0, d = 0, l = 0, w = 0, b = 0, br = 0, hl = 0, lv = 0, lb = 0;
+    float h = 0.0f, mx = 0.0f, hd = 0.0f;
+    if (DoorReadPod(r->door, &s, &d, &l, &w, &b) == 0 || DoorsRecReadPod(r->door, &h, &mx, &br, &hl, &lv, &lb) == 0 || DrHardnessPod(r->door, &hd) == 0) return 0;
+    out->key = r->key;
+    out->gate = (r->gate != 0) ? 1 : 0;
+    out->state = (s == coopdoor::kDoorOpen || s == coopdoor::kDoorOpening) ? 1 : 0;
+    out->lockWord = coopdoor::DoorLockWord(l, w);
+    out->broken = br; out->hasLock = hl; out->lockLevel = lv; out->lockBroken = lb; out->hardness = hd; out->health = h;
+    return 1;
+}
+std::string DrRecText(const doorrec::DoorRec& r)
+{
+    char b[240];
+    _snprintf(b, 239, "gate=%d state=%d lockWord=%d broken=%d hasLock=%d level=%d hardness=%.3f lockBroken=%d health=%.1f gen=%u writer=%d%s",
+              r.gate, r.state, r.lockWord, r.broken, r.hasLock, r.lockLevel, (double)r.hardness, r.lockBroken, (double)r.health, r.generation,
+              r.writerSlot, (r.flags & doorrec::kDrFlagSeed) != 0 ? " (seed)" : "");
+    b[239] = 0;
+    return std::string(b);
+}
+/* the door hangs on a player's piece (its facts are its piece record's), or its building could not be read - no door record either way.
+   The building is read off the live door (a gate's gateway building, else its parent), never the row's recorded owner */
+int DrPlayerDoor(DoorRow* r)
+{
+    void* parent = 0;
+    void* gate = DoorGatePod(r->door);
+    void* b = (gate != 0) ? gate : ((DoorParentPod(r->door, &parent) != 0) ? parent : 0);
+    return (b == 0 || BuildBuildingIsPlayers(b) != 0) ? 1 : 0;
+}
+/* The record written by this game, sent as a RECORD at the door's position. Kept here at once as the newest (the next change is measured
+   and numbered from it); the world server's answer naming its stamp confirms it (DoorRecordEcho), and a refusal of a pending write
+   puts back the confirmed copy (DoorRecRefuseArrive). 1 = sent. */
+int DrSend(const std::string& id, doorrec::DoorRec rec, const float* pos, int seed, const std::string& what)
+{
+    const int me = StoreMySlot();
+    if (me < 0) { ++g_drSendFailed; return 0; }
+    DoorRecKept& k = g_drec[id];
+    rec.flags = (seed != 0) ? doorrec::kDrFlagSeed : 0u;
+    rec.generation = doorrec::DoorRecNextGen(k.have, k.r.generation, k.floorGen);
+    rec.writerSlot = me;
+    std::vector<char> b;
+    if (!doorrec::EncodeDoorRec(&b, rec)) { ++g_drBad; ErrorLog("[DOORREC] write " + id + " NOT made: the record does not encode (" + DrRecText(rec) + ")"); return 0; }
+    long long stamp = 0;
+    if (!StoreSendDoorRecord(id, pos[0], pos[1], pos[2], b, &stamp))
+    {
+        ++g_drSendFailed;
+        DebugLog("[DOORREC] write " + id + " not sent (no world-server link): " + what);
+        return 0;
+    }
+    k.pending = 1;
+    k.sentStamp = stamp;   /* the world server's answer names it: that confirms this write (DoorRecordEcho) */
+    k.r = rec; k.have = 1;
+    if (seed != 0) ++g_drSeeded; else ++g_drWritten;
+    DebugLog(std::string("[DOORREC] ") + (seed != 0 ? "seeded " : "written ") + id + " key='" + rec.key + "' " + what + " - " + DrRecText(rec));
+    return 1;
+}
+/* The door's stored facts before any held change: taken while the row is not laid and has none (DoorsTick's record step, which runs
+   before the drain). Engine work before the lay (a repair step at load, a lock word the lock sweep finds) is taken into them, never
+   held. A change seen before they were first taken becomes part of them, so the record wins that one. */
+void DrBaseTake(DoorRow* r, const doorrec::DoorRec& live)
+{
+    r->recBaseState = live.state; r->recBaseLock = live.lockWord; r->recBaseBroken = live.broken; r->recBaseHasLock = live.hasLock;
+    r->recBaseLevel = live.lockLevel; r->recBaseLockBroken = live.lockBroken; r->recBaseHardness = live.hardness;
+    r->recBaseHave = 1;
+}
+void DrBaseRetake(DoorRow* r)
+{
+    if (r == 0 || DoorRowStillActive(r) == 0 || DoorPlausible(r->door) == 0) return;
+    doorrec::DoorRec live;
+    if (DrReadLive(r, &live) != 0) DrBaseTake(r, live);
+}
+/* the facts before any held change as a record (key, gate and health from live) */
+doorrec::DoorRec DrBaseRec(const DoorRow* r, const doorrec::DoorRec& live)
+{
+    doorrec::DoorRec b = live;
+    b.state = (int)r->recBaseState; b.lockWord = (int)r->recBaseLock; b.broken = (int)r->recBaseBroken; b.hasLock = (int)r->recBaseHasLock;
+    b.lockLevel = (int)r->recBaseLevel; b.lockBroken = (int)r->recBaseLockBroken; b.hardness = r->recBaseHardness;
+    return b;
+}
+/* One line per area (kDrWaitLineCap in all) saying its doors wait for the holder answer - a world with no notebook can leave it not
+   known for good; the rows wait on the area map and the area picture settling, never on a clock. */
+void DrWaitSay(int c)
+{
+    if (c < 0 || c >= 64 * 64 || g_drWaitSaid[c] != 0) return;
+    g_drWaitSaid[c] = 1;
+    if (++g_drWaitLines > kDrWaitLineCap) { ++g_drLinesSuppressed; return; }
+    char b[320];
+    _snprintf(b, 319, "[DOORREC] area %d,%d: the holder of the area is not known here (no settled area map; a world with no notebook can stay"
+              " so) - its doors' lays and held changes wait for the next area map or the area picture settling", c / 64, c % 64);
+    b[319] = 0;
+    DebugLog(b);
+}
+/* A change on the door of row r: its record is written, held for the lay, or not written, as doorrec::DoorRecWriteDecide says. st / lk:
+   the state and lock word the change published (the drain's entry), -1 = read off the door. The holder asked is the holder of the key's
+   area (DrHoldOfKey), the one the world server judges the write by. A laid door's change is measured from its record, a door not laid
+   from its facts before any held change - so only a stored fact the change moved is held (an ordinary door's swing moves none).
+   tickMoved: the facts moved between the entries of one tick merged into this one write (doorrec::DoorRecTickMerge), named in its line. */
+void DrWriteRow(DoorRow* r, int st, int lk, int tickMoved = 0)
+{
+    if (r == 0 || DoorRowStillActive(r) == 0 || DoorPlausible(r->door) == 0) return;
+    if (DrPlayerDoor(r) != 0) { ++g_drPlayerPiece; return; }
+    doorrec::DoorRec live;
+    if (DrReadLive(r, &live) == 0) { ++g_doorReadFault; return; }
+    if (st == coopdoor::kDoorClosed || st == coopdoor::kDoorOpen) live.state = st;
+    if (lk >= 0 && coopdoor::DoorLockWordValid(lk) != 0) live.lockWord = lk;
+    const std::string id = doorrec::MakeDoorRecId(r->key);
+    if (id.empty()) return;
+    std::map<std::string, DoorRecKept>::const_iterator k = g_drec.find(id);
+    const int kept = doorrec::DoorRecKeptFor((k != g_drec.end() && k->second.have != 0) ? 1 : 0, (k != g_drec.end() && k->second.r.key == r->key) ? 1 : 0);
+    const int have = (kept == doorrec::kDrKeptSame) ? 1 : 0;
+    const int await = (k != g_drec.end() && doorrec::DoorRecAwaitWrite(k->second.awaitStored, k->second.pending, k->second.r.flags) != 0) ? 1 : 0;
+    const int laid = (r->recLaid != 0) ? 1 : 0;
+    if (laid == 0 && r->recBaseHave == 0) DrBaseTake(r, live);
+    const int mask = (laid != 0) ? doorrec::DoorRecChangeMask(have, have != 0 ? k->second.r : live, live)
+                                 : doorrec::DoorRecChangeMask(1, DrBaseRec(r, live), live);
+    const int weHold = DrHoldOfKey(r->key);
+    const int v = doorrec::DoorRecWriteDecide(weHold, laid, mask, await, (kept == doorrec::kDrKeptClash) ? 1 : 0);
+    if (v == doorrec::kDrSkipKeyClash)
+    {
+        ++g_drKeyClash;
+        DrLine(r, "change of '" + std::string(r->key) + "' NOT written: record " + id + " is kept for another key ('" + k->second.r.key + "')");
+        return;
+    }
+    if (v == doorrec::kDrHoldUntilLaid)
+    {   /* the lay writes the facts this change moved over the record it lays (DrLayRow, doorrec::DoorRecHeldMerge) */
+        ++g_drHeld;
+        const long before = (r->recHeld != 0) ? (long)r->recHeldMask : 0;
+        ::InterlockedExchange(&r->recHeldMask, before | (long)mask);
+        ::InterlockedExchange(&r->recHeld, 1);
+        if (laid != 0)
+        {   /* laid, but the holder is not known or a stored record or this game's seed's confirmation is awaited: laid again, and a
+               later change is measured from the door as it is now */
+            ::InterlockedExchange(&r->recLaid, 0);
+            DrBaseTake(r, live);
+        }
+        if (await != 0) ::InterlockedExchange(&r->recWait, 1);
+        else if (weHold < 0) { ::InterlockedExchange(&r->recWait, 2); DrWaitSay(DrSecOfKey(r->key)); }
+        ::InterlockedExchange(&g_dirty, 1);
+        DrLine(r, "change of " + id + " held until the lay:" + doorrec::DoorRecChangeWords(mask)
+                  + (await != 0 ? " (a stored record or this game's seed's confirmation is awaited)" : (weHold < 0 ? " (the holder of its area is not known yet)" : "")));
+        return;
+    }
+    if (v == doorrec::kDrSkipNoChange) { ++g_drNoChange; return; }
+    if (v == doorrec::kDrSkipNotHolder) { ++g_drNotHolder; return; }
+    if (v != doorrec::kDrWrite) return;
+    float pos[3] = { 0.0f, 0.0f, 0.0f };
+    if (DoorPosPod(r->door, pos) == 0) return;
+    DrSend(id, live, pos, 0, "changed:" + doorrec::DoorRecChangeWords(doorrec::DoorRecTickWords(mask, tickMoved, live.gate)));
+}
+/* The lay of one door whose area's record list is complete (doorrec::DoorRecLayDecide): its record onto the door - the held word the
+   door road applies (a gate's state, the lock word) and the record's broken, lock level, hardness and lock broken written now (its
+   health only with a broken flag that differs, DoorRecLayHealth); or, on the holder with a change held for the row, the facts the held
+   change moved written over the record (DoorRecHeldMerge) and that laid; or, with no record, the holder's seed from its own door. 1 laid, 2 seeded, 3 its
+   own shown (no record and another game or nobody holds the area, a player's piece, no id, a key clash, a send that failed), 4 the
+   held change written, 0 not now (the row went, a read faulted, or it waits for the holder answer or a stored record). */
+int DrLayRow(DoorRow* r)
+{
+    if (DoorRowStillActive(r) == 0) { ++g_doorDroppedInactive; DropRowKeepWord(r); return 0; }
+    if (DoorPlausible(r->door) == 0) return 0;
+    {
+        char again[kDoorKeyCap];
+        int gate = 0;
+        again[0] = 0;
+        if (DoorKeyBuild(r->door, again, kDoorKeyCap, &gate, 0) == 0 || std::strcmp(again, r->key) != 0) { ++g_doorRowRecycled; DropRow(r); return 0; }
+    }
+    ::InterlockedExchange(&r->recLaid, 1);
+    ::InterlockedExchange(&r->recOwn, 0);
+    ::InterlockedExchange(&r->recWait, 0);
+    if (DrPlayerDoor(r) != 0) { ++g_drPlayerPiece; ::InterlockedExchange(&r->recHeld, 0); return 3; }
+    const std::string id = doorrec::MakeDoorRecId(r->key);
+    if (id.empty()) { ::InterlockedExchange(&r->recHeld, 0); return 3; }
+    doorrec::DoorRec live;
+    float pos[3] = { 0.0f, 0.0f, 0.0f };
+    if (DrReadLive(r, &live) == 0 || DoorPosPod(r->door, pos) == 0) { ++g_doorReadFault; ::InterlockedExchange(&r->recLaid, 0); return 0; }
+    std::map<std::string, DoorRecKept>::const_iterator k = g_drec.find(id);
+    const int kept = doorrec::DoorRecKeptFor((k != g_drec.end() && k->second.have != 0) ? 1 : 0, (k != g_drec.end() && k->second.r.key == r->key) ? 1 : 0);
+    if (kept == doorrec::kDrKeptClash)
+    {
+        ++g_drKeyClash;
+        ::InterlockedExchange(&r->recHeld, 0);
+        DrLine(r, "door '" + std::string(r->key) + "' NOT laid: record " + id + " is kept for another key ('" + k->second.r.key + "')");
+        return 3;
+    }
+    const int haveRec = (kept == doorrec::kDrKeptSame) ? 1 : 0;
+    const int await = (k != g_drec.end() && doorrec::DoorRecAwaitWrite(k->second.awaitStored, k->second.pending, k->second.r.flags) != 0) ? 1 : 0;
+    const int held = (r->recHeld != 0) ? 1 : 0;
+    /* the holder is asked only where its answer decides the lay */
+    const int weHold = ((haveRec != 0 && held == 0) || await != 0) ? 0 : DrHoldOfKey(r->key);
+    const int what = doorrec::DoorRecLayDecide(haveRec, weHold, held, await);
+    if (what == doorrec::kDrLayWait)
+    {
+        ++g_drLayWaited;
+        ::InterlockedExchange(&r->recLaid, 0);
+        ::InterlockedExchange(&r->recWait, (await != 0) ? 1 : 2);   /* laid again by the arrival, or by the area map / the picture settling */
+        if (await == 0) DrWaitSay(DrSecOfKey(r->key));
+        return 0;
+    }
+    const int heldMask = (int)r->recHeldMask;
+    ::InterlockedExchange(&r->recHeld, 0);
+    ::InterlockedExchange(&r->recHeldMask, 0);
+    r->recBaseHave = 0;   /* laid: a later change is measured from the record (the facts before a held change are taken again if it is laid again) */
+    if (what == doorrec::kDrLaySeed)
+        return DrSend(id, live, pos, 1, (held != 0) ? std::string("at this game's lay of the area (the door had no record; a change made before the lay rides with it)")
+                                                    : std::string("at this game's lay of the area (the door had no record)")) != 0 ? 2 : 3;
+    if (what == doorrec::kDrLayOwn) { ++g_drOwnShown; ::InterlockedExchange(&r->recOwn, 1); return 3; }   /* seeded if this game takes the area (DoorsRecMapEvent) */
+    doorrec::DoorRec rec = k->second.r;
+    int heldWritten = 0;
+    if (what == doorrec::kDrLayWriteHeld)
+    {   /* only the stored facts the held changes moved are this game's (doorrec::DoorRecHeldMerge); every other fact stays the
+           record's, so the save's lock, level or health never ride above the world's record */
+        const doorrec::DoorRec merged = doorrec::DoorRecHeldMerge(rec, live, heldMask);
+        const int mask = doorrec::DoorRecChangeMask(1, rec, merged);
+        if (mask != 0)
+        {
+            DrLine(r, "held change written at the lay: " + id + " key='" + r->key + "' -" + doorrec::DoorRecChangeWords(mask) + " over " + DrRecText(rec));
+            if (DrSend(id, merged, pos, 0, "a change made before the lay, written at the lay:" + doorrec::DoorRecChangeWords(mask)) == 0)
+            {   /* not sent: the door keeps its own and the change is written at the area's next lay */
+                ::InterlockedExchange(&r->recHeld, 1);
+                ::InterlockedExchange(&r->recHeldMask, (long)heldMask);
+                return 3;
+            }
+            ++g_drHeldWritten;
+            heldWritten = 1;
+            rec = k->second.r;   /* the record just written (DrSend keeps it): laid below, so every fact not held is the world's */
+        }
+    }
+    DoorHeldRow* h = HeldFor(r->key, 1);
+    if (h != 0)
+    {   /* the held word is the door road's cache of the area's word: it takes the laid value, so the apply below and every later
+           comparison start from the record and not from this game's save */
+        ::InterlockedExchange(&h->state, (long)doorrec::DoorRecLayState(rec.gate, rec.state, (int)h->state, live.state));
+        ::InterlockedExchange(&h->locked, (long)rec.lockWord);
+        ::InterlockedExchange(&h->recWord, 1);
+    }
+    ::InterlockedExchange(&r->localWrite, 0);
+    ::InterlockedExchange(&r->holderWord, 1);
+    ::InterlockedExchange(&r->lockGaveUp, 0);
+    ::InterlockedExchange(&r->lockStuck, 0);
+    const int wrote = DoorsRecApply(r->door, doorrec::DoorRecLayHealth(rec.broken, live.broken, rec.health, live.health), rec.broken, rec.hasLock,
+                                    rec.lockLevel, rec.lockBroken);
+    if (rec.hasLock != 0 && live.hasLock != 0 && live.hardness != rec.hardness) DrHardnessWritePod(r->door, rec.hardness);
+    ::InterlockedExchange(&g_dirty, 1);
+    ++g_drLaidN;
+    DrLine(r, "laid " + id + " key='" + r->key + "' " + DrRecText(rec) + (wrote > 0 ? " - broken, lock or health written on the door" : ""));
+    return (heldWritten != 0) ? 4 : 1;
+}
+/* the records of area c this game holds whose door has no row here - a key that drifted, or a door gone with its building */
+int DrRecNoDoor(int c)
+{
+    int n = 0;
+    for (std::map<std::string, DoorRecKept>::const_iterator it = g_drec.begin(); it != g_drec.end(); ++it)
+    {
+        int sx = -1, sy = -1;
+        if (it->second.have == 0 || doorrec::DoorRecIdParse(it->first, &sx, &sy) == 0 || doorrec::DrAreaIndex(sx, sy) != c) continue;
+        if (RowByKey(it->second.r.key.c_str()) == 0) ++n;
+    }
+    return n;
+}
+/* the removal of door record id (c: the area of its key) is queued, once */
+void DrGoneQueue(const std::string& id, int c)
+{
+    for (size_t i = 0; i < g_drGoneQ.size(); ++i)
+        if (g_drGoneQ[i].id == id) return;
+    DrGone g;
+    g.id = id; g.c = c;
+    g_drGoneQ.push_back(g);
+    ++g_drGoneQueued;
+}
+/* The queued removals of area c (c < 0: of every area), each as doorrec::DoorRecGoneDecide says: sent and forgotten here, kept (the
+   area's list not complete here, the holder not known, the link down), or dropped. Returns the removals sent. */
+int DrGoneFlush(int c)
+{
+    int sent = 0;
+    size_t i = 0;
+    while (i < g_drGoneQ.size())
+    {
+        const DrGone g = g_drGoneQ[i];
+        if (c >= 0 && g.c != c) { ++i; continue; }
+        const int listDone = (g.c >= 0 && g.c < 64 * 64 && g_drAreaLaid[g.c] != 0) ? 1 : 0;
+        const int weHold = (listDone != 0) ? DrHoldOfArea(g.c) : -1;
+        std::map<std::string, DoorRecKept>::const_iterator k = g_drec.find(g.id);
+        const int v = doorrec::DoorRecGoneDecide(listDone, weHold, (k != g_drec.end() && k->second.have != 0) ? 1 : 0);
+        if (v == doorrec::kDrGoneWait) { ++i; continue; }
+        if (v == doorrec::kDrGoneSend)
+        {
+            if (!StoreSendDoorGone(g.id)) { ++i; continue; }   /* not sent: tried again at the area's next lay or the next area map */
+            g_drec.erase(g.id);
+            ++sent; ++g_drRemoved;
+            DebugLog("[DOORREC] removed " + g.id + " from the world server");
+        }
+        else ++g_drGoneDropped;
+        g_drGoneQ.erase(g_drGoneQ.begin() + i);
+    }
+    return sent;
+}
+/* Whether door key `key` names a live door here: doorrec::kDrResolveFound (a row, or the walk finds the door - DoorResolveByKey then
+   makes its row), kDrResolveNoDoor (a complete walk of the loaded buildings finds no door for it), kDrResolveUnsure (no building
+   listed, a check refused or a full registry - DoorResolveByKey's own exit counters say which). */
+int DrKeyResolve(const char* key)
+{
+    if (RowByKey(key) != 0) return doorrec::kDrResolveFound;
+    if (ObjectActiveBuildingCount() <= 0) return doorrec::kDrResolveUnsure;
+    const long long noDoor = (long long)g_doorResolveMissedNoDoor, noBuilding = (long long)g_doorResolveMissedNoBuilding;
+    if (DoorResolveByKey(key) != 0) return doorrec::kDrResolveFound;
+    return ((long long)g_doorResolveMissedNoDoor != noDoor || (long long)g_doorResolveMissedNoBuilding != noBuilding) ? doorrec::kDrResolveNoDoor : doorrec::kDrResolveUnsure;
+}
+/* Area c's town was rebuilt here and the area is laid since (g_drRebuilt 2): its holder queues the removal of the area's door records
+   whose key names no live door here (DrKeyResolve, doorrec::DoorRecRebuiltRemoveList - a registry row missing is not enough: a walk
+   that cannot tell keeps the record); another game drops the mark; with the holder not known it waits for the next area map. Run from
+   the lay and the area map event (DoorsRecMapEvent), never on a clock. */
+void DrRebuiltSweep(int c)
+{
+    if (c < 0 || c >= 64 * 64 || g_drRebuilt[c] == 0) return;
+    const int laid = (g_drRebuilt[c] == 2 && g_drAreaLaid[c] != 0) ? 1 : 0;
+    const int v = doorrec::DoorRecRebuiltDecide(laid, (laid != 0) ? DrHoldOfArea(c) : -1);
+    if (v == doorrec::kDrRebuiltWait) return;
+    g_drRebuilt[c] = 0;
+    if (v != doorrec::kDrRebuiltSweep) return;
+    std::vector<std::string> ids, keys;
+    for (std::map<std::string, DoorRecKept>::const_iterator it = g_drec.begin(); it != g_drec.end(); ++it)
+    {
+        int sx = -1, sy = -1;
+        if (it->second.have == 0 || doorrec::DoorRecIdParse(it->first, &sx, &sy) == 0 || doorrec::DrAreaIndex(sx, sy) != c) continue;
+        ids.push_back(it->first);
+        keys.push_back(it->second.r.key);
+    }
+    std::vector<int> rs;
+    for (size_t i = 0; i < keys.size(); ++i) rs.push_back(DrKeyResolve(keys[i].c_str()));
+    const std::vector<std::string> gone = doorrec::DoorRecRebuiltRemoveList(ids, rs);
+    for (size_t i = 0; i < gone.size(); ++i) DrGoneQueue(gone[i], c);
+    char b[260];
+    _snprintf(b, 259, "[DOORREC] area %d,%d: its town was rebuilt here - %d door record(s) that name no live door here are removed, %d kept"
+              " (a live door answers, or the walk could not tell)", c / 64, c % 64, (int)gone.size(), (int)(ids.size() - gone.size()));
+    b[259] = 0;
+    DebugLog(b);
+    DrGoneFlush(c);
 }
 
 /* ============ P8n-c (review-p8n-b M-3): THE RE-ARM CLOCK, ON ITS OWN CADENCE ============
@@ -1943,18 +2401,272 @@ void DoorsForgetOwner(void* building)
     }
 }
 
+/* ============================ A WORLD DOOR'S RECORD: THE PUBLIC HALF (see doors.h) ============================ */
+void DoorsRecAreaLay(int c)
+{
+    if (c < 0 || c >= 64 * 64 || g_drAreaLaid[c] != 0) return;
+    g_drAreaLaid[c] = 1;
+    int laid = 0, seeded = 0, own = 0, heldWritten = 0, waiting = 0;
+    if (!EngineWritesBlocked())
+    {
+        for (int i = 0; i < kDoorRows; ++i)
+        {
+            if (g_rows[i].door == 0 || g_rows[i].ready == 0 || g_rows[i].recLaid != 0 || DrSecOfKey(g_rows[i].key) != c) continue;
+            const int v = DrLayRow(&g_rows[i]);
+            if (v == 1) ++laid; else if (v == 2) ++seeded; else if (v == 3) ++own; else if (v == 4) ++heldWritten;
+            else if (g_rows[i].recWait != 0) ++waiting;
+        }
+    }
+    ::InterlockedExchange(&g_dirty, 1);   /* a door of the area that registers later (or one a blocked tick left) is laid by DoorsTick */
+    if (g_drRebuilt[c] == 1) g_drRebuilt[c] = 2;   /* a rebuilt town's area: swept now, its buildings scanned and its doors laid (DrRebuiltSweep) */
+    if (!EngineWritesBlocked()) DrRebuiltSweep(c);   /* else at the next area map */
+    const int removed = DrGoneFlush(c);
+    const int noDoor = DrRecNoDoor(c);
+    g_drRecNoDoor += noDoor;
+    char b[420];
+    _snprintf(b, 419, "[DOORREC] area %d,%d records laid: %d door(s) laid from their record, %d seeded, %d held change(s) written over their record,"
+              " %d showing their own (no record and another game or nobody holds the area, or a player's piece), %d waiting for the holder"
+              " answer or a stored record, %d record(s) with no door here, %d queued removal(s) sent", c / 64, c % 64, laid, seeded, heldWritten,
+              own, waiting, noDoor, removed);
+    b[419] = 0;
+    DebugLog(b);
+}
+void DoorsRecAreaLeft(int c)
+{
+    if (c < 0 || c >= 64 * 64) return;
+    g_drAreaLaid[c] = 0;
+    if (g_drRebuilt[c] == 2) g_drRebuilt[c] = 1;   /* swept after the area's next lay */
+    for (int i = 0; i < kDoorRows; ++i)
+        if (g_rows[i].door != 0 && g_rows[i].ready != 0 && DrSecOfKey(g_rows[i].key) == c)
+        {
+            ::InterlockedExchange(&g_rows[i].recLaid, 0);
+            ::InterlockedExchange(&g_rows[i].recWait, 0);
+        }
+}
+void DoorsRecLinkReset()
+{
+    std::memset(g_drAreaLaid, 0, sizeof(g_drAreaLaid));
+    for (int c = 0; c < 64 * 64; ++c)
+        if (g_drRebuilt[c] == 2) g_drRebuilt[c] = 1;
+    /* the area's record list on the new link says whether a record exists: a refused seed's wait ends with it */
+    for (std::map<std::string, DoorRecKept>::iterator it = g_drec.begin(); it != g_drec.end(); ++it) it->second.awaitStored = 0;
+    /* every row is laid again; a change held for a row stays held, and its lay writes it */
+    for (int i = 0; i < kDoorRows; ++i)
+        if (g_rows[i].door != 0 && g_rows[i].ready != 0)
+        {
+            ::InterlockedExchange(&g_rows[i].recLaid, 0);
+            ::InterlockedExchange(&g_rows[i].recWait, 0);
+        }
+}
+void DoorsRecAreaRebuilt(int c)
+{
+    if (c < 0 || c >= 64 * 64) return;
+    g_drRebuilt[c] = (g_drAreaLaid[c] != 0) ? 2 : 1;   /* laid already: swept at the next area map (DoorsRecMapEvent) */
+    char b[200];
+    _snprintf(b, 199, "[DOORREC] area %d,%d: its town was rebuilt here - its holder removes the area's door records that name no live door, at the area's lay or (laid already) the next area map",
+              c / 64, c % 64);
+    b[199] = 0;
+    DebugLog(b);
+}
+void DoorsRecMapEvent(const std::set<int>* newly)
+{
+    if (EngineWritesBlocked()) return;
+    int asked = 0, reseeded = 0;
+    std::map<int, int> hold;
+    for (int i = 0; i < kDoorRows; ++i)
+    {
+        DoorRow* r = &g_rows[i];
+        if (r->door == 0 || r->ready == 0) continue;
+        if (r->recWait == 2) { ::InterlockedExchange(&r->recWait, 0); ++asked; continue; }   /* its lay asks the holder answer again */
+        if (newly == 0 || r->recOwn == 0 || r->recLaid == 0) continue;
+        const int c = DrSecOfKey(r->key);
+        if (c < 0 || newly->find(c) == newly->end()) continue;
+        std::map<int, int>::const_iterator a = hold.find(c);
+        const int w = (a != hold.end()) ? a->second : (hold[c] = DrHoldOfArea(c));
+        std::map<std::string, DoorRecKept>::const_iterator k = g_drec.find(doorrec::MakeDoorRecId(r->key));
+        if (doorrec::DoorRecOwnRecheck(1, (k != g_drec.end() && k->second.have != 0) ? 1 : 0, w) == 0) continue;
+        ++g_drOwnReseeded; ++reseeded;
+        ::InterlockedExchange(&r->recOwn, 0);
+        ::InterlockedExchange(&r->recLaid, 0);   /* laid again on the next tick, which seeds it */
+    }
+    if (asked != 0 || reseeded != 0) ::InterlockedExchange(&g_dirty, 1);
+    for (int c = 0; c < 64 * 64; ++c)
+        if (g_drRebuilt[c] == 2) DrRebuiltSweep(c);
+    if (!g_drGoneQ.empty()) DrGoneFlush(-1);
+}
+void DoorsRecNoteBrokenChanged(void* door)
+{
+    DoorRow* r = (door != 0) ? RowByDoor(door) : 0;
+    if (r == 0) return;
+    ::InterlockedIncrement64(&g_drBrokenNoted);
+    ::InterlockedExchange(&r->recDirty, 1);
+    ::InterlockedExchange(&g_dirty, 1);
+}
+int DoorsRecNoteChanged(void* door)
+{
+    DoorRow* r = (door != 0) ? RowByDoor(door) : 0;
+    if (r == 0) return 0;
+    ::InterlockedExchange(&r->recChange, 1);
+    ::InterlockedExchange(&g_dirty, 1);
+    return 1;
+}
+void DoorRecordArrive(const std::string& id, const std::vector<char>& bytes)
+{
+    ++g_drArrived;
+    doorrec::DoorRec r;
+    const int d = bytes.empty() ? doorrec::kDrShort : doorrec::DecodeDoorRec(&bytes[0], bytes.size(), &r);
+    if (d != doorrec::kDrOk || doorrec::MakeDoorRecId(r.key) != id)
+    {
+        ++g_drBad;
+        if (g_drBad <= 20)
+            ErrorLog("[DOORREC] record " + id + " received but NOT kept: " + (d != doorrec::kDrOk ? std::string(doorrec::DoorDecodeWhy(d)) : std::string("its key makes another id")));
+        return;
+    }
+    DoorRecKept& k = g_drec[id];
+    if (doorrec::DoorRecArrivalTakes(k.have, k.r.generation, r.generation) == 0) { ++g_drArrivedOlder; return; }
+    const int awaited = k.awaitStored;
+    const int seedWas = doorrec::DoorRecSeedUnconfirmed(k.pending, k.r.flags);
+    k.r = r; k.have = 1; k.rewrites = 0; k.pending = 0; k.awaitStored = 0;
+    k.conf = r; k.confHave = 1;   /* the confirmed copy a refused write puts back */
+    /* another game's write, the stored record a refused seed waited for, or this game's seed confirmed, for a door with a row here (or a
+       row waiting on a stored record): laid again on the next tick when its area is laid, which writes a change held meanwhile */
+    DoorRow* row = RowByKey(r.key.c_str());
+    if (row != 0 && (r.writerSlot != StoreMySlot() || awaited != 0 || seedWas != 0 || row->recWait == 1))
+    {
+        ::InterlockedExchange(&row->recLaid, 0);
+        ::InterlockedExchange(&row->recWait, 0);
+        ::InterlockedExchange(&g_dirty, 1);
+    }
+}
+void DoorRecordGone(const std::string& id)
+{
+    if (g_drec.erase(id) != 0) { ++g_drGone; DebugLog("[DOORREC] record " + id + " removed on the world server - forgotten here"); }
+}
+/* The world server took this game's write of door record id: its RECORD_SEQ answer names the stamp the write was sent with (the record
+   itself goes to every other game, never back here). The pending write sent with that stamp is confirmed - the kept copy (what was
+   sent) becomes the confirmed copy - and a row whose change was held only for this game's seed's confirmation is laid again on the
+   next tick, which writes the held change once over the record (DrLayRow, doorrec::DoorRecHeldMerge). */
+void DoorRecordEcho(const std::string& id, int hasStamp, long long stamp)
+{
+    std::map<std::string, DoorRecKept>::iterator it = g_drec.find(id);
+    if (it == g_drec.end()) return;
+    DoorRecKept& k = it->second;
+    if (doorrec::DoorRecEchoConfirms(k.pending, k.sentStamp, hasStamp, stamp) == 0) return;
+    k.pending = 0; k.sentStamp = 0; k.rewrites = 0;
+    k.conf = k.r; k.confHave = 1;   /* the confirmed copy a later refused write puts back */
+    ++g_drConfirmed;
+    if (::InterlockedIncrement(&g_drConfirmLines) <= kDrConfirmLineCap)
+    {
+        char b[32];
+        _snprintf(b, 31, " gen=%u", k.r.generation);
+        b[31] = 0;
+        DebugLog("[DOORREC] confirmed " + id + b);
+    }
+    else ++g_drLinesSuppressed;
+    DoorRow* row = RowByKey(k.r.key.c_str());
+    if (row != 0 && row->recWait == 1)
+    {   /* its lay waited on this confirmation (or a stored record, which it waits on again): laid again on the next tick */
+        ::InterlockedExchange(&row->recLaid, 0);
+        ::InterlockedExchange(&row->recWait, 0);
+        ::InterlockedExchange(&g_dirty, 1);
+    }
+}
+void DoorRecRefuseArrive(const std::string& id, int reason, unsigned int storedGen, unsigned int sentGen)
+{
+    ++g_drRefused;
+    DoorRecKept& k = g_drec[id];
+    if (storedGen > k.floorGen) k.floorGen = storedGen;
+    const int next = doorrec::DoorRecRefuseNext(reason, k.rewrites);
+    const int undo = doorrec::DoorRecRefuseRestores(k.pending, k.confHave, k.conf.generation, sentGen);
+    const doorrec::DoorRec sent = k.r;
+    if (undo != 0) { k.r = k.conf; k.have = k.confHave; k.pending = 0; ++g_drUndone; }
+    char b[96];
+    _snprintf(b, 95, " (stored generation %u, sent %u)", storedGen, sentGen);
+    b[95] = 0;
+    DebugLog("[DOORREC] write " + id + " REFUSED - " + coopbrec::BoxRefuseWhy(reason) + b
+             + (undo != 0 ? " - the kept copy is put back to the last one that arrived from the world server" : "")
+             + (next == doorrec::kDrRefuseRewrite ? " - written again above it" : (next == doorrec::kDrRefuseTakeStored ? " - the stored record wins and is laid when it arrives" : " - dropped")));
+    if (next == doorrec::kDrRefuseTakeStored)
+    {
+        {   /* the world server sends the stored record after this refusal: it is laid, and nothing of this door is written before it -
+               whether or not a copy was put back */
+            k.awaitStored = 1;
+            DoorRow* wr = RowByKey(sent.key.c_str());
+            if (wr != 0)
+            {
+                ::InterlockedExchange(&wr->recLaid, 0);
+                ::InterlockedExchange(&wr->recWait, 1);   /* laid again by the arrival */
+            }
+        }
+        return;
+    }
+    if (doorrec::DoorRecRefuseShowsOwn(reason, k.have) != 0)
+    {   /* seeded again once the area map names this game the holder (T1819: seeds sent on the presumption were refused, never retried) */
+        DoorRow* ow = RowByKey(sent.key.c_str());
+        if (ow != 0) { ::InterlockedExchange(&ow->recOwn, 1); ++g_drOwnShown; }
+        return;
+    }
+    if (next != doorrec::kDrRefuseRewrite || undo == 0) return;   /* only the pending write is written again */
+    ++k.rewrites;
+    DoorRow* row = RowByKey(sent.key.c_str());
+    float pos[3] = { 0.0f, 0.0f, 0.0f };
+    if (row != 0 && DoorRowStillActive(row) != 0 && DoorPlausible(row->door) != 0 && DoorPosPod(row->door, pos) != 0)
+    {
+        ++g_drRewrites;
+        DrSend(id, sent, pos, 0, std::string("written again above the generation a refusal named"));
+    }
+}
+void DoorsRecRuinBefore(void* building)
+{
+    g_drRuin.clear();
+    g_drRuinBuilding = building;
+    void* elems[kDoorArrayMax];
+    int cnt = 0, raw = 0;
+    if (building == 0 || DoorArrayPod(building, elems, kDoorArrayMax, &cnt, &raw) == 0) return;
+    for (int i = 0; i < cnt; ++i)
+    {
+        char key[kDoorKeyCap];
+        int gate = 0;
+        key[0] = 0;
+        if (DoorPlausible(elems[i]) == 0 || DoorKeyBuild(elems[i], key, kDoorKeyCap, &gate, 0) == 0) continue;
+        const std::string id = doorrec::MakeDoorRecId(key);
+        if (id.empty()) continue;
+        DrGone g;
+        g.id = id; g.c = DrSecOfKey(key);
+        g_drRuin.push_back(g);
+    }
+}
+void DoorsRecRuinAfter(void* building, int ruined)
+{
+    if (building != g_drRuinBuilding || ruined == 0) { g_drRuin.clear(); g_drRuinBuilding = 0; return; }
+    for (size_t i = 0; i < g_drRuin.size(); ++i) DrGoneQueue(g_drRuin[i].id, g_drRuin[i].c);
+    const int sent = DrGoneFlush(-1);
+    if (!g_drRuin.empty())
+    {
+        char b[260];
+        _snprintf(b, 259, "[DOORREC] ruin: %d door record removal(s) of the building queued, %d removal(s) sent now (the rest wait for their"
+                  " area's record list or the link, or are dropped where another game holds the area or no record exists)", (int)g_drRuin.size(), sent);
+        b[259] = 0;
+        DebugLog(b);
+    }
+    g_drRuin.clear();
+    g_drRuinBuilding = 0;
+}
+
 /* ---- A PICKED LOCK ON THE DOOR ROAD ----
    The lock pick's tick 0x297E10 (lock, skill difference, amount), called each tick by the pick-lock job, writes only the lock's locked
    byte (+0x20 = 0) when it succeeds - none of the door road's hooks sees that until the door next moves. Hooked: after the engine's
    tick, a lock that went from locked to unlocked and belongs to a door (the lock's owner +0x08 is a door whose DoorLock +0x370 is this
    lock and whose parent lists it) is noted, so the door road carries the unlock - every door, a town's too. Cages, boxes and shackles
-   use the same routine and are left alone (coopdoor::LockPickedRule). */
+   use the same routine and are left to their own roads (coopdoor::LockPickedRule); T-1061: every other lock it opened is handed to
+   items.cpp (BoxLockPickNote), which takes a box's and leaves a cage's (the prisoner road) and shackles' (no box). */
 unsigned long long kLockPickTickRva = 0; static coop::AddrReg kLockPickTickRva_reg("LockPickTick", &kLockPickTickRva);   /* Steam_1.0.65 0x297E10, 1.0.68 0x297E50 */
 const unsigned char kPrologueLockPick[8] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0xF3, 0x0F };
 const size_t kLockOwner = 0x08;   /* DoorLock+0x08: the object the lock belongs to (0x297E10 calls its vt+0x228 on success) */
 typedef unsigned char (*LockPickTickFn)(void* lock, float skillDiff, float amount);
 LockPickTickFn orig_lockPickTick = 0;
 volatile LONG64 g_doorPicked = 0, g_lockPickedNotDoor = 0;
+void BoxLockPickNote(void* lock, void* owner);   /* items.cpp, this namespace (T-1061): a box's lock the pick tick opened - ANY THREAD, queued for the main thread */
 /* the lock's locked byte and its owner, in one guarded frame. POD ONLY (C2712) */
 int LockPickReadPod(void* lock, int* locked, void** owner)
 {
@@ -1991,7 +2703,11 @@ unsigned char detour_lockPickTick(void* lock, float skillDiff, float amount)
             DebugLog(t);
         }
     }
-    else if (l0 != 0 && l1 == 0) ::InterlockedIncrement64(&g_lockPickedNotDoor);
+    else if (l0 != 0 && l1 == 0)
+    {
+        ::InterlockedIncrement64(&g_lockPickedNotDoor);
+        BoxLockPickNote(lock, own);   /* T-1061: a chest's pick goes to the box's record road (items.cpp tells a box from a cage or shackles) */
+    }
     return rc;
 }
 
@@ -2120,6 +2836,13 @@ void DoorsWorldTeardown()
     ::InterlockedExchange(&g_doorLockSweepPending, 0);
     ::InterlockedExchange(&g_doorPurgePending, 0);   /* the rows it would have swept are gone with the world */
     ::InterlockedExchange(&g_doorChurnWatch, 0);     /* P8n-c: and no row survives to be re-armed */
+    g_drec.clear();   /* the door records name doors of the world being destroyed; the next world's arrive with its feed */
+    std::memset(g_drAreaLaid, 0, sizeof(g_drAreaLaid));
+    g_drRuin.clear(); g_drRuinBuilding = 0;
+    g_drGoneQ.clear();
+    std::memset(g_drRebuilt, 0, sizeof(g_drRebuilt));
+    std::memset(g_drWaitSaid, 0, sizeof(g_drWaitSaid));
+    g_drWaitLines = 0;
 }
 
 /* ============ B12 (decision 52): ONE DOOR CHANGE, SAVED AND READ BACK ============
@@ -2190,91 +2913,9 @@ int DoorsQueueReplay(const std::vector<char>& payload)
     ++g_doorPublished;
     DebugLog("[DOOR] outage queue: re-published '" + f[1] + "' state=" + f[2] + " lockWord=" + f[3]
              + " with a fresh generation - it was refused while the notebook was unreachable and is written"
-             " now (decision 52)");
+             " now (decision 52); the door's record is written with it when the change moves one of its facts");
+    DrWriteRow(RowByKey(f[1].c_str()), (f[2] == "1") ? coopdoor::kDoorOpen : coopdoor::kDoorClosed, (int)(f[3][0] - '0'));
     return 1;
-}
-
-void DoorsOnLinkUp()
-{
-    /* The weather pattern's other half: a game that joins late has been told nothing.  Every door
-       this game has seen in a terminal state is re-offered; the drain refuses the ones this game
-       does not hold, so a non-holder's re-offer costs one counter and no traffic. */
-    for (int i = 0; i < kDoorRows; ++i)
-    {
-        if (g_rows[i].door == 0 || g_rows[i].ready == 0) continue;
-        if (g_rows[i].state != 0 && g_rows[i].state != 1) continue;
-        /* P8n: reportIfNotHolder = 0.  A re-offer is "here is what I hold", never "here is what my
-           own world did" - a joining game must not push its stale local states at the holder. */
-        QueueOut(g_rows[i].key, (int)g_rows[i].state, (int)g_rows[i].locked, 0);
-        ++g_doorRepublishedOnLink;
-    }
-}
-
-/* A DOOR A CATCH-UP ASK NAMED WHILE IT HAD NO ROW HERE, and now with one (DoorsTick, serveFind): re-offered once, as DoorsServeCatchup
-   re-offers a registered door.  A row the resolver has just made has no state yet (RowFor writes -1), so for freshRow the door's own
-   state and lock word are read - DoorPlausible first, then a guarded plain read, no virtual call.  MAIN THREAD.  1 = queued; 0 = not
-   resting, unreadable, or the send queue was full (serve[...overflow]). */
-int DoorServeReOffer(DoorRow* r, int freshRow)
-{
-    int st = (int)r->state, lk = (int)r->locked;
-    if (freshRow != 0)
-    {
-        int s = 0, d = 0, l = 0, w = 0, b = 0;
-        if (DoorPlausible(r->door) == 0 || DoorReadPod(r->door, &s, &d, &l, &w, &b) == 0) return 0;
-        st = s; lk = coopdoor::DoorLockWord(l, w);
-    }
-    if (coopdoor::DoorStateIsTerminal(st) == 0) return 0;
-    if (QueueOut(r->key, st, lk, 0) == 0) { ++g_doorServeOverflow; return 0; }
-    ++g_doorSectorServed;
-    return 1;
-}
-
-/* THE CATCH-UP ANSWER'S DOORS.  The world server asks the games that have these sectors LOADED to catch up a game that has just come
-   to have them in its delivery area - so the area's holder is asked, and from this moment the asker is in the sectors' delivery set.
-   Every registered door of those sectors in a resting state is re-offered once (reportIfNotHolder 0): the drain publishes it, routed
-   by the door's sector so it reaches the asker, only if this game holds the door when it sends.  The asker stores the word and
-   applies it to its own copy of the door - the holder's state wins after any (re)load.  A re-offer the full send queue refuses is
-   counted as overflow, not as served.  A door of those sectors this game knows only by key - a held entry with no row here, its row
-   dropped by the active-zone check, the purge or the full registry while the engine has not moved it since - is MARKED (serveFind):
-   DoorsTick looks it up through its building out of its one-look-up-per-tick allowance and re-offers it if found.  Only the asked
-   sectors' keys, once per ask; no door that is not loaded is searched.  MAIN THREAD (worldsync.cpp's catch-up answer); it only reads
-   the registry and the held table, marks and queues. */
-void DoorsServeCatchup(const int* sx, const int* sy, int n, int askerSlot, unsigned int askNo)
-{
-    int served = 0, overflow = 0, noRow = 0;
-    if (!g_on || sx == 0 || sy == 0 || n <= 0) return;
-    g_doorSectorAsks += n;
-    for (int i = 0; i < kDoorRows; ++i)
-    {
-        int rx = -1, ry = -1, parsed;
-        if (g_rows[i].door == 0 || g_rows[i].ready == 0) continue;
-        parsed = coopdoor::DoorKeySector(g_rows[i].key, &rx, &ry);
-        if (coopdoor::DoorServesCatchup(parsed, rx, ry, sx, sy, n, (int)g_rows[i].state) == 0) continue;
-        if (QueueOut(g_rows[i].key, (int)g_rows[i].state, (int)g_rows[i].locked, 0) != 0) ++served; else ++overflow;
-    }
-    for (int k = 0; k < kDoorHeldCap; ++k)
-    {
-        int hx = -1, hy = -1, inAsk;
-        if (g_held[k].used == 0) continue;
-        inAsk = coopdoor::DoorKeyInAsk(coopdoor::DoorKeySector(g_held[k].key, &hx, &hy), hx, hy, sx, sy, n);
-        if (inAsk == 0) continue;
-        if (coopdoor::DoorServeMarksHeld(inAsk, RowByKey(g_held[k].key) != 0 ? 1 : 0) == 0) continue;
-        ::InterlockedExchange(&g_held[k].serveFind, 1);
-        ++noRow;
-    }
-    if (noRow > 0) ::InterlockedExchange(&g_dirty, 1);
-    g_doorSectorServed += served;
-    g_doorServeOverflow += overflow;
-    g_doorServeNoRow += noRow;
-    if ((served > 0 || overflow > 0 || noRow > 0) && ::InterlockedIncrement(&g_doorServeLines) <= 64)
-    {
-        char b[384];
-        _snprintf(b, 383, "[DOOR] catch-up #%u for slot %d: %d sector(s), %d door(s) re-offered, %d not queued (send queue full), %d known"
-                  " by key only marked to be looked up through their building - published as the holder's word only where this game"
-                  " holds them (the first 64 are logged; the totals are on the reload line)", askNo, askerSlot, n, served, overflow, noRow);
-        b[383] = 0;
-        DebugLog(b);
-    }
 }
 
 /* A PLAYER ENTERED THE WORLD: the newest-wins record kept for its door messages is forgotten, so a restarted game's new counter
@@ -2400,6 +3041,7 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
             if (what == coopdoor::kDoorWordStoreLoading) ++g_doorHolderWordStoredLoading;
             else if (what == coopdoor::kDoorWordStoreUnanswerable) ++g_doorHolderWordStoredUnanswerable;
             h->state = state;
+            ::InterlockedExchange(&h->recWord, 0);   /* a newer holder word than the laid record */
             if (rr != 0)
             {
                 ::InterlockedExchange(&rr->localWrite, 0);
@@ -2427,16 +3069,14 @@ void DoorsTick()
     ::InterlockedExchangePointer((void* volatile*)&g_playLandedDoor, 0);
     DoorClockAdvance();
     if (!g_on) return;
-    /* THE LINK-UP EDGE IS ABOVE THE IDLE GATE, because a re-offer is exactly the work that has to
-       happen when nothing local has changed - the peer has just arrived and has been told nothing. */
+    /* THE ARRIVAL EDGE IS ABOVE THE IDLE GATE: a player entering the world restarts its door messages' counter, so the newest-wins
+       record kept for it is forgotten even when nothing local has changed.  Nothing is re-offered: a door's world facts reach an
+       arriving game through its world-server record. */
     {
-        static long s_arrCursor = 0;   /* M11 C2: a player ENTERING THE WORLD (the old link's up edge is the session peer's) - every door re-offered */
+        static long s_arrCursor = 0;   /* M11 C2: a player ENTERING THE WORLD (the old link's up edge is the session peer's) */
         int arrivedSlot = -1;
         if (StoreArrivalsSince(kArrServeDoors, &s_arrCursor, &arrivedSlot) > 0)
-        {
             DoorsForgetPublisherGen(arrivedSlot);
-            DoorsOnLinkUp();
-        }
     }
     /* ---- P8n-c (review-p8n-b M-3, MANAGER RULING): THE CHURN RE-ARM CLOCK, JUDGED ONCE A SECOND.
        It sits ABOVE the idle gate because a row that has given up produces no events at all - that is
@@ -2457,6 +3097,8 @@ void DoorsTick()
             }
         }
     }
+    /* THE DOOR RECORDS run on events (DoorsRecAreaLay, DoorsRecMapEvent, DoorRecordArrive), never on a clock: a waiting lay is
+       tried again by the event that ends its wait. */
     /* THE IDLE COST IS THEN ONE INTERLOCKED READ.  Every event that could need work sets the flag -
        a change at a detour, a forced open, an arriving state, the link edge above - so this is
        events over timers rather than a sweep looking for something to do. */
@@ -2507,7 +3149,37 @@ void DoorsTick()
                 DoorLockSweepRow(&g_rows[q]);
     }
 
-    /* ---- 1. PUBLISH.  The holder, and only the holder, puts a change on the wire. ---- */
+    /* ---- THE DOOR RECORDS: a broken flag the engine's hit or a repair flipped is written for a laid door (by the holder of the key's
+       area only, DrWriteRow); before the door's lay it is engine work (a repair step at load) and is taken into the door's facts
+       before any held change, never held. A door not laid gets those facts taken (before the drain below, so a lock word the lock
+       sweep just found is taken too), and a door that registered in an area whose records are laid is laid now (a row waiting for the
+       holder answer or a stored record is left to the event that ends its wait).  Left while engine writes are blocked.
+       A stored fact written straight into a door (its lock level) is a change of its own, written or held like a lock change.
+       The writes these ask for join the tick's changes and are made after the publish, one per door (drTick). ---- */
+    std::vector<doorrec::DoorRecTickEntry> drTick;
+    if (!EngineWritesBlocked())
+    {
+        for (int q = 0; q < kDoorRows; ++q)
+        {
+            DoorRow* rq = &g_rows[q];
+            if (rq->door == 0 || rq->ready == 0) continue;
+            if (rq->recDirty != 0 && ::InterlockedExchange(&rq->recDirty, 0) != 0)
+            {
+                if (rq->recLaid != 0) drTick.push_back(doorrec::DoorRecTickMake(std::string(rq->key), -1, -1)); else DrBaseRetake(rq);
+            }
+            if (rq->recChange != 0 && ::InterlockedExchange(&rq->recChange, 0) != 0)
+                drTick.push_back(doorrec::DoorRecTickMake(std::string(rq->key), -1, -1));
+            if (rq->door == 0 || rq->ready == 0) continue;
+            if (rq->recLaid == 0 && rq->recBaseHave == 0) DrBaseRetake(rq);
+            if (rq->recLaid == 0 && rq->recWait == 0)
+            {
+                const int c = DrSecOfKey(rq->key);
+                if (c >= 0 && g_drAreaLaid[c] != 0) DrLayRow(rq);
+            }
+        }
+    }
+
+    /* ---- 1. PUBLISH.  The holder, and only the holder, puts a change on the wire - and writes the door's record for a change. ---- */
     for (int i = 0; i < kDoorOutCap; ++i)
     {
         if (g_out[i].used == 0) continue;
@@ -2552,9 +3224,9 @@ void DoorsTick()
                        game-to-game message from a non-holder to the holder (M7b slice 4: on the character
                        stream's road), it is not a durable write, and it must keep flowing whether or not there is one. B12-a
                        suppressed it and was wrong to; that arm is retired. */
-                    /* B12-d (recheck-b12): ONLY A REAL LOCAL CHANGE IS JOURNALED (rep != 0). A re-offer
-                       (DoorsOnLinkUp's QueueOut with reportIfNotHolder = 0) is not a change and must never
-                       push stale local state at the holder through the journal either; and whether this game
+                    /* B12-d (recheck-b12): ONLY A REAL LOCAL CHANGE IS JOURNALED (rep != 0). The holder's
+                       republish after an adopt (reportIfNotHolder = 0) is not this game's change and is not
+                       journaled either; and whether this game
                        may publish the entry is asked AGAIN at the replay, where the notebook is back (the
                        no-notebook verdict here says nothing about who holds the door). */
                     if (verdict == coopdoor::kDoorAreaNoNotebook && rep != 0)
@@ -2585,6 +3257,10 @@ void DoorsTick()
                         }
                     }
                     const int weHoldIt = (verdict == 1) ? 1 : 0;
+                    /* every real local change (rep) and every adopted report this game publishes as the holder has its record written -
+                       by the holder of the key's area, which DrWriteRow asks, whoever holds the door's position - once per door after
+                       this loop, from the door's final values (two landings of one engine update are one change) */
+                    if (rep != 0 || verdict == 1) drTick.push_back(doorrec::DoorRecTickMake(std::string(key), (int)st, (int)lk));
                     const int how = coopdoor::DoorDrainDecide(weHoldIt, (int)rep);
                     if (how == coopdoor::kDoorSendRefuse) { ++g_doorPublishNotHolder; continue; }
                     /* P8n-b (review-p8n M-5): THE OTHER HALF OF THE OPEN POINT, as far as this game can
@@ -2602,7 +3278,7 @@ void DoorsTick()
                             else ++g_doorPublished;
                         }
                         else
-                        {   /* not sent: an actor report is kept for a while, a re-offer until it is sent (coopdoor::DoorUnsentDecide) */
+                        {   /* not sent: an actor report is kept for a while, an adopt's republish until it is sent (coopdoor::DoorUnsentDecide) */
                             const int how = coopdoor::DoorUnsentDecide(origin, (int)rep);
                             if (how != coopdoor::kDoorUnsentDrop) DoorOutRetry(key, st, lk, rep, outTries, outFirstFail, how);
                         }
@@ -2610,6 +3286,13 @@ void DoorsTick()
                 }
             }
         }
+    }
+
+    /* ---- THE TICK'S DOOR RECORDS: one write per door the tick changed, from its final state and lock word, naming every fact the
+       tick's changes moved (doorrec::DoorRecTickMerge).  A door changed again on a later tick writes again. ---- */
+    {
+        const std::vector<doorrec::DoorRecTickWrite> drw = doorrec::DoorRecTickMerge(drTick);
+        for (size_t i = 0; i < drw.size(); ++i) DrWriteRow(RowByKey(drw[i].key.c_str()), drw[i].state, drw[i].lockWord, drw[i].moved);
     }
 
     /* ---- 2. APPLY.  Every door this game has that the holder has spoken about. ---- */
@@ -2628,17 +3311,10 @@ void DoorsTick()
         if (g_held[i].used == 0) continue;
         /* P8n: a row whose holder state is still unknown is visited ONLY when it carries an actor
            report waiting to be adopted - which is the ordinary first event on a door the holder has
-           never published about, and which the old gate would have left pending for ever.  It is also
-           visited for a catch-up mark (serveFind), and then only to look its door up and re-offer it. */
-        if (coopdoor::DoorHeldVisited((long)g_held[i].state, (int)g_held[i].pendingActor, (int)g_held[i].serveFind) == 0) continue;
+           never published about, and which the old gate would have left pending for ever. */
+        if (coopdoor::DoorHeldVisited((long)g_held[i].state, (int)g_held[i].pendingActor) == 0) continue;
         {
             DoorRow* r = RowByKey(g_held[i].key);
-            /* A CATCH-UP MARK ON AN ENTRY WHOSE DOOR HAS A ROW AGAIN: the mark is taken and the door re-offered from its row. */
-            if (r != 0 && g_held[i].serveFind != 0 && ::InterlockedExchange(&g_held[i].serveFind, 0) != 0)
-            {
-                ++g_doorServeReFound;
-                DoorServeReOffer(r, 0);
-            }
             /* P8o (T236g): BEFORE GIVING UP ON THE NAME, ASK THE PARENT BUILDING.  A row is created by
                this game's own setDoorState detours, so a reloaded zone leaves the holder unable to
                name a door its peer keeps reporting - 24 reports dropped here and about 100 s of
@@ -2650,9 +3326,8 @@ void DoorsTick()
                later one tries them.  The pending-report consume below is what bounds a key to one
                attempt per report, so no latch is needed (review-p8o L-1). */
             /* A STORED HOLDER WORD WHOSE ROW THE ACTIVE-ZONE CHECK DROPPED (reFind, DropRowKeepWord) is looked up the same way,
-               once per drop, out of the same one-per-tick budget; a look-up deferred by the budget keeps its mark.  So is a key a
-               catch-up ask marked (serveFind, DoorsServeCatchup), once per ask; a door found for it is re-offered once (DoorServeReOffer). */
-            if (r == 0 && coopdoor::DoorHeldLookupDue((int)g_held[i].pendingActor, (int)g_held[i].reFind, (int)g_held[i].serveFind) != 0)
+               once per drop, out of the same one-per-tick budget; a look-up deferred by the budget keeps its mark. */
+            if (r == 0 && coopdoor::DoorHeldResolveDue((int)g_held[i].pendingActor, (int)g_held[i].reFind) != 0)
             {
                 const int reFinding = (g_held[i].pendingActor == 0) ? 1 : 0;
                 if (resolvedThisTick != 0)
@@ -2664,7 +3339,6 @@ void DoorsTick()
                 resolvedThisTick = 1;
                 s_heldCursor = (i + 1) % kDoorHeldCap;   /* P8o-c: next tick starts past this slot */
                 const long hadReFind = ::InterlockedExchange(&g_held[i].reFind, 0);
-                const long hadServe = ::InterlockedExchange(&g_held[i].serveFind, 0);
                 r = DoorResolveByKey(g_held[i].key);
                 if (reFinding != 0 && hadReFind != 0)
                 {
@@ -2674,17 +3348,8 @@ void DoorsTick()
                                  r != 0 ? "its door was found again through its building"
                                         : "its door was not found among the loaded buildings - the word waits for the door to register");
                 }
-                if (hadServe != 0)
-                {
-                    if (r != 0) { ++g_doorServeReFound; DoorServeReOffer(r, 1); } else ++g_doorServeMissed;
-                    DoorWordLine(g_held[i].key, (int)g_held[i].state,
-                                 r != 0 ? "a catch-up ask named its sector while it had no row here - its door was found again through its"
-                                          " building and is re-offered if it rests"
-                                        : "a catch-up ask named its sector while it had no row here - its door was not found among the"
-                                          " loaded buildings");
-                }
             }
-            /* An entry visited only for its catch-up mark (no holder word, no actor report) has nothing to apply. */
+            /* An entry with no holder word and no actor report has nothing to apply. */
             if (g_held[i].state < 0 && g_held[i].pendingActor == 0) continue;
             if (r == 0)
             {
@@ -2699,10 +3364,11 @@ void DoorsTick()
                    beats everything (it is the F633 mechanism); otherwise a state the HOLDER published
                    has arrived since the last agreement and this game follows it; and a disagreement
                    with neither of those behind it is this game hearing about the door for the first
-                   time.  P8n retired the old third arm ("a local writer moved a door this game does
+                   time.  A word laid from the door's world-server record (recWord) is the fourth, and a forced open
+                   outranks it too.  P8n retired the old third arm ("a local writer moved a door this game does
                    not hold, and we put it back"): under the last-actor rule the applier never reverts
                    an engine writer, so that arm could no longer fire at all. */
-                const int reason = (r->forcedOpen != 0) ? 2 : ((r->holderWord != 0) ? 3 : 1);
+                const int reason = (r->forcedOpen != 0) ? 2 : ((g_held[i].recWord != 0) ? 4 : ((r->holderWord != 0) ? 3 : 1));
                 ApplyToRow(r, &g_held[i], reason);
             }
         }
@@ -2711,6 +3377,19 @@ void DoorsTick()
 
 void ReportDoors()
 {
+    {
+        char rb[768];
+        _snprintf(rb, 767, "[DOORREC] report: written=%lld seeded=%lld laid=%lld ownShown=%lld recordNoDoor=%lld heldBeforeLay=%lld heldWritten=%lld"
+                  " layWaited=%lld ownReseeded=%lld noChange=%lld notHolder=%lld keyClash=%lld sendFailed=%lld arrived=%lld arrivedOlder=%lld bad=%lld"
+                  " confirmed=%lld refused=%lld undone=%lld rewrites=%lld removed=%lld goneQueued=%lld goneDropped=%lld goneWaiting=%u gone=%lld playerPiece=%lld"
+                  " brokenNoted=%lld appliedRecord=%lld linesSuppressed=%lld kept=%u",
+                  g_drWritten, g_drSeeded, g_drLaidN, g_drOwnShown, g_drRecNoDoor, g_drHeld, g_drHeldWritten,
+                  g_drLayWaited, g_drOwnReseeded, g_drNoChange, g_drNotHolder, g_drKeyClash, g_drSendFailed, g_drArrived, g_drArrivedOlder, g_drBad,
+                  g_drConfirmed, g_drRefused, g_drUndone, g_drRewrites, g_drRemoved, g_drGoneQueued, g_drGoneDropped, (unsigned int)g_drGoneQ.size(), g_drGone, g_drPlayerPiece,
+                  (long long)g_drBrokenNoted, g_doorAppliedRecord, g_drLinesSuppressed, (unsigned int)g_drec.size());
+        rb[767] = 0;
+        DebugLog(rb);
+    }
     long long keyUnbuildable = 0, keyHashed = 0;
     ObjectKeyDoorCounts(&keyUnbuildable, &keyHashed);
     {
@@ -2720,7 +3399,7 @@ void ReportDoors()
             " applySpans[onArrival,reapplyAfterForcedOpen,appliedHolderWord]=%lld,%lld,%lld"
             " doorKeyUnbuildable=%lld keyBuilderRefusals=%lld keySidHashed=%lld"
             " seenChanges=%lld suppressedSameState=%lld selfWrite=%lld offThread=%lld readFault=%lld retUnreadable=%lld"
-            " publish[notHolder,noLink,republishedOnLink]=%lld,%lld,%lld"
+            " publish[notHolder,noLink]=%lld,%lld"
             " apply[noSetter,blocked,unresolved,ineffective,gaveUp,rowRecycled]=%lld,%lld,%lld,%lld,%lld,%lld"
             " overflow[rows,held,out]=%lld,%lld,%lld msgMalformed=%lld p060Suppressed=%lld"
             " droppedInactive=%lld activeVia[door,owner]=%lld,%lld zoneDeactivations=%lld purgeSweeps=%lld"
@@ -2738,7 +3417,7 @@ void ReportDoors()
             g_doorAppliedOnArrival, g_doorReapplyAfterForcedOpen, g_doorAppliedHolderWord,
             g_doorKeyUnbuildable, keyUnbuildable, keyHashed,
             g_doorSeenChanges, g_doorSuppressedSameState, g_doorSelfWrite, g_doorOffThread, g_doorReadFault, g_doorRetUnreadable,
-            g_doorPublishNotHolder, g_doorPublishNoLink, g_doorRepublishedOnLink,
+            g_doorPublishNotHolder, g_doorPublishNoLink,
             g_doorApplyNoSetter, g_doorApplyBlocked, g_doorApplyUnresolved, g_doorApplyIneffective,
             g_doorGaveUp, g_doorRowRecycled,
             g_doorRowsOverflow, g_doorHeldOverflow, g_doorOutOverflow,
@@ -2765,15 +3444,13 @@ void ReportDoors()
     }
     {
         char t0[896];
-        _snprintf(t0, 895, "[DOOR] reload[firstSightingOffered,sectorAsks,sectorServed,genForgotten,giveUpReArmed,heldEvicted]"
-                  "=%lld,%lld,%lld,%lld,%lld,%lld loadWriteOffered=%lld genRefused=%lld"
-                  " word[storedNoRow,droppedWithRow,reFindAsked,reFound,reFindMissed,linesSuppressed]=%lld,%lld,%lld,%lld,%lld,%lld"
-                  " serve[noRow,reFound,missed,overflow]=%lld,%lld,%lld,%lld",
-                  g_doorFirstSightingOffered, g_doorSectorAsks, g_doorSectorServed, g_doorGenForgotten,
-                  g_doorGiveUpReArmed, g_doorHeldEvicted, g_doorLoadWriteOffered, g_doorGenRefused,
+        _snprintf(t0, 895, "[DOOR] reload[firstSightingKept,genForgotten,giveUpReArmed,heldEvicted]"
+                  "=%lld,%lld,%lld,%lld loadWriteKept=%lld genRefused=%lld"
+                  " word[storedNoRow,droppedWithRow,reFindAsked,reFound,reFindMissed,linesSuppressed]=%lld,%lld,%lld,%lld,%lld,%lld",
+                  g_doorFirstSightingKept, g_doorGenForgotten,
+                  g_doorGiveUpReArmed, g_doorHeldEvicted, g_doorLoadWriteKept, g_doorGenRefused,
                   g_doorWordStoredNoRow, g_doorWordDroppedWithRow, g_doorWordReFindAsked, g_doorWordReFound,
-                  g_doorWordReFindMissed, g_doorWordLinesSuppressed,
-                  g_doorServeNoRow, g_doorServeReFound, g_doorServeMissed, g_doorServeOverflow);
+                  g_doorWordReFindMissed, g_doorWordLinesSuppressed);
         t0[895] = 0;
         DebugLog(t0);
     }
@@ -2973,6 +3650,13 @@ int DoorOpenStatePod(void* door, int* state, int* openTenths)
        written directly (wantsToLock untouched) - a lock no detour sees.  Its Character_Lock sound is not played.
    doortest show <nearest|next|last|key|held>  - a read: the door's state, open amount and lock word; `held` lists
        every holder word this game has received, beside the live state of its door here.
+   doortest break <target>  - the engine's door hit (DoorStuff vt+0x1F0, 0x29D650 - what the bash-door step calls) through the door's
+       vtable, so detour_doorHit runs it and notices the broken flag it flips, until the door reads broken (at most kDoorTestHitCalls).
+   doortest mend <target>  - the engine's repair step (addConstructionProgress, vt+0x230, 0x558B10 - setBroken(0) once health is above
+       0) through the vtable, so detour_progress runs it and notices the flip, until the door reads mended (at most kDoorTestMendCalls).
+       Neither writes the record: the mod's own noticing does, on the next door tick. Both are refused where that noticing would not
+       write it once (coopdoor::DoorTestRecRefusal) and on a building found by distance beyond kDoorTestNearMax.
+   `gate` = the door of the gate nearest the watched player (kDoorTestNearMax); open / close on it is an NPC's use of the gate.
    `nearest` = a door of the building nearest the watched player that has one (zones.cpp NearestBuildingWhere); `next`
    = the same, skipping the building of the door the previous doortest named; `last` = the door the previous doortest
    named, found again by its key in this game's active zones (as a key target is), never by a stored pointer.  MAIN
@@ -2999,6 +3683,112 @@ void* DoorTestFirstDoor(void* building)
 }
 int DoorTestHasDoor(void* building) { return (DoorTestFirstDoor(building) != 0) ? 1 : 0; }
 int DoorTestHasOtherDoor(void* building) { return (building != g_testSkipBuilding && DoorTestHasDoor(building) != 0) ? 1 : 0; }
+/* a building whose first door is a gate's (isGate through the door answers about its gateway) */
+int DoorTestHasGate(void* building)
+{
+    void* d = DoorTestFirstDoor(building);
+    return (d != 0 && DoorGatePod(d) != 0) ? 1 : 0;
+}
+const double kDoorTestNearMax = 3000.0;    /* world units: a building found by distance for break / mend / gate is at most this far from the watched player */
+const int kDoorTestHitCalls = 200;         /* break: the engine's hit is called until the door reads broken, at most this many times */
+const int kDoorTestMendCalls = 300;        /* mend: the engine's repair step is called until the door reads mended, at most this many times */
+const float kDoorTestHitCut = 100.0f, kDoorTestHitBlunt = 100.0f;   /* each hit's cut and blunt (the engine weighs and clamps them) */
+const float kDoorTestRepairAmount = 10.0f;   /* each repair step's amount (the engine scales it by the door's repair rate) */
+const size_t kVtDoorHit = 0x1F0, kVtDoorRepair = 0x230;
+struct DoorTestDamage { float f0, f4, f8, fC; unsigned long long q10, q18; };   /* the hit's damage: cut +0, blunt +4, the rest zero (build.cpp BdHitDamage) */
+typedef unsigned long long (*DoorTestHitFn)(void* t, unsigned long long one, void* dmg, void* attacker, unsigned long long five, unsigned long long six);
+typedef void (*DoorTestRepairFn)(void* b, float amount);
+/* POD ONLY (C2712): the routine the door's vtable slot at off reaches, 0 = unreadable. The game's vtable slots hold short
+   jump stubs (E9 rel32), so the stubs are followed - at most 4 - until the address equals target (the hooked routine, whose own
+   first bytes are the hook's jump and must not be followed) or the bytes are not a jump. */
+unsigned long long DoorTestSlotPod(void* door, size_t off, unsigned long long target)
+{
+    __try
+    {
+        unsigned long long a = (unsigned long long)(uintptr_t)((*(void***)door)[off / 8]);
+        for (int i = 0; i < 4 && a != 0 && a != target; ++i)
+        {
+            const unsigned char* p = (const unsigned char*)(uintptr_t)a;
+            if (p[0] != 0xE9) break;
+            a = a + 5 + (unsigned long long)(long long)*(const int*)(p + 1);
+        }
+        return a;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* one engine hit as the bash-door step makes it: (door, 1, &damage, attacker 0, 0, 1). POD ONLY */
+int DoorTestHitPod(void* door)
+{
+    __try
+    {
+        DoorTestDamage d;
+        std::memset(&d, 0, sizeof d);
+        d.f0 = kDoorTestHitCut;
+        d.f4 = kDoorTestHitBlunt;
+        ((DoorTestHitFn)((*(void***)door)[kVtDoorHit / 8]))(door, 1ULL, &d, 0, 0ULL, 1ULL);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* one engine repair step on the door. POD ONLY */
+int DoorTestRepairPod(void* door)
+{
+    __try { ((DoorTestRepairFn)((*(void***)door)[kVtDoorRepair / 8]))(door, kDoorTestRepairAmount); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* MAIN THREAD: `doortest break|mend` on one door - refused where the mod's own noticing would not write its record once; else the engine
+   routine is called until the broken flag flips. The record write is left to the noticing and the next door tick. */
+std::string DoorTestBreakMend(int opc, void* door, const std::string& key, double dist)
+{
+    const int isBreak = (opc == coopdoor::kDoorTestOpBreak) ? 1 : 0;
+    const std::string opw = (isBreak != 0) ? "break" : "mend";
+    unsigned long long hitRva = 0, repRva = 0;
+    BuildDoorEngineRoads(&hitRva, &repRva);
+    const unsigned long long want = (isBreak != 0) ? hitRva : repRva;
+    const size_t off = (isBreak != 0) ? kVtDoorHit : kVtDoorRepair;
+    const unsigned long long slot = (want != 0 && g_base != 0) ? DoorTestSlotPod(door, off, (unsigned long long)g_base + want) : 0;
+    const int roadReady = (want != 0 && g_base != 0 && slot == (unsigned long long)g_base + want) ? 1 : 0;
+    float h0 = 0.0f, mx = 0.0f;
+    int b0 = 0, hl = 0, lv = 0, lb = 0;
+    if (DoorsRecReadPod(door, &h0, &mx, &b0, &hl, &lv, &lb) == 0) return "error doortest " + opw + ": the door's health and broken flag did not read";
+    DoorRow* r = RowByDoor(door);
+    const int player = (r != 0) ? DrPlayerDoor(r) : 0;
+    const int hold = DrHoldOfKey(key.c_str());
+    const int laid = (r != 0 && r->recLaid != 0) ? 1 : 0;
+    const int gate = DoorKeyIsGate(key.c_str());
+    char dw[32];
+    if (dist >= 0.0) _snprintf(dw, 31, "%.0f", dist); else _snprintf(dw, 31, "-");
+    dw[31] = 0;
+    const int why = coopdoor::DoorTestRecRefusal(opc, (r != 0) ? 1 : 0, player, roadReady, b0, hold, laid);
+    char o[700];
+    if (why != coopdoor::kDoorTestRecOk)
+    {
+        _snprintf(o, 699, "[DOORTEST] TEST LEVER %s REFUSED key=%s gate=%d dist=%s broken=%d hold=%d laid=%d: %s", opw.c_str(), key.c_str(), gate, dw,
+                  b0, hold, laid, coopdoor::DoorTestRecWhy(why));
+        o[699] = 0;
+        DebugLog(o);
+        return "error " + std::string(o);
+    }
+    const long long noted0 = g_drBrokenNoted;
+    const int limit = (isBreak != 0) ? kDoorTestHitCalls : kDoorTestMendCalls;
+    int calls = 0, fault = 0, b1 = b0;
+    float h1 = h0;
+    while (calls < limit && ((isBreak != 0) ? (b1 == 0) : (b1 != 0)))
+    {
+        if (((isBreak != 0) ? DoorTestHitPod(door) : DoorTestRepairPod(door)) == 0) { fault = 1; break; }
+        ++calls;
+        if (DoorsRecReadPod(door, &h1, &mx, &b1, &hl, &lv, &lb) == 0) { fault = 1; break; }
+    }
+    const int flipped = ((b1 != 0) != (b0 != 0)) ? 1 : 0;
+    const char* res = (fault != 0) ? "FAULTED" : (flipped != 0 ? "CALLED" : "NOT DONE");
+    _snprintf(o, 699, "[DOORTEST] TEST LEVER %s %s key=%s gate=%d dist=%s: the engine's %s (vt+0x%X -> 0x%llX) called %d time(s)%s - health %.2f -> %.2f of %.2f,"
+              " broken %d -> %d; brokenNoted +%lld (the next door tick writes its record: [DOORREC] written ... changed:)",
+              opw.c_str(), res, key.c_str(), gate, dw, (isBreak != 0) ? "door hit" : "repair step", (unsigned)off, want, calls,
+              (flipped == 0 && fault == 0) ? " and the flag did not flip" : "", (double)h0, (double)h1, (double)mx, b0, b1, g_drBrokenNoted - noted0);
+    o[699] = 0;
+    DebugLog(o);
+    return std::string((fault == 0 && flipped != 0) ? "ok " : "error ") + o;
+}
 /* The live row of a key in this game's active zones: the row the funnel made, or the parent-building walk's
    (DoorResolveByKey); 0 when neither names it or its zone is no longer active. */
 DoorRow* DoorTestRowByKey(const char* key)
@@ -3034,8 +3824,9 @@ std::string DoorTestCommand(const std::string& argIn)
         target = (sp == std::string::npos) ? std::string() : argIn.substr(sp + 1);
         while (!target.empty() && target[0] == ' ') target.erase(0, 1);
     }
-    if (op != "open" && op != "close" && op != "lock" && op != "npclock" && op != "show")
-        return "error doortest: usage `doortest open|close|lock|npclock|show <nearest|next|last|key>` or `doortest show held`";
+    int opc = 0, tgt = 0, keyAt = 0;
+    if (coopdoor::DoorTestParse(argIn.c_str(), &opc, &tgt, &keyAt) == 0)
+        return "error doortest: usage `doortest open|close|lock|npclock|show|break|mend <nearest|next|last|gate|key>` or `doortest show held`";
     if (::GetCurrentThreadId() != g_mainThread) return "error doortest: not on the main thread";
     if (EngineWritesBlocked()) return "error doortest: engine writes blocked (a load or a teardown)";
     if (op == "show" && target == "held")
@@ -3060,14 +3851,26 @@ std::string DoorTestCommand(const std::string& argIn)
     }
     void* door = 0;
     std::string key;
+    double nearDist = -1;
     if (target == "nearest")
     {
         std::string err;
         double dist = -1;
         void* b = NearestBuildingWhere(&DoorTestHasDoor, &dist, &err);
         if (b == 0) return "error doortest nearest: " + err;
+        nearDist = dist;
         door = DoorTestFirstDoor(b);
         if (door == 0) return "error doortest nearest: the building's door did not read back";
+    }
+    else if (target == "gate")
+    {
+        std::string err;
+        double dist = -1;
+        void* b = NearestBuildingWhere(&DoorTestHasGate, &dist, &err);
+        if (b == 0) return "error doortest gate: no gate in this game's active zones (" + err + ")";
+        nearDist = dist;
+        door = DoorTestFirstDoor(b);
+        if (door == 0) return "error doortest gate: the gate's door did not read back";
     }
     else if (target == "next")
     {
@@ -3080,6 +3883,7 @@ std::string DoorTestCommand(const std::string& argIn)
         b = NearestBuildingWhere(&DoorTestHasOtherDoor, &dist, &err);
         g_testSkipBuilding = 0;
         if (b == 0) return "error doortest next: " + err;
+        nearDist = dist;
         door = DoorTestFirstDoor(b);
         if (door == 0) return "error doortest next: the building's door did not read back";
     }
@@ -3093,6 +3897,14 @@ std::string DoorTestCommand(const std::string& argIn)
         key = r->key;
     }
     if (DoorPlausible(door) == 0) return "error doortest: the door is not plausible";
+    if (coopdoor::DoorTestNearRadiusApplies(opc, tgt) != 0 && nearDist > kDoorTestNearMax)
+    {
+        char rb[200];
+        _snprintf(rb, 199, "error doortest %s %s: the nearest building is %.0f units from the watched player, beyond the lever's %.0f",
+                  op.c_str(), target.c_str(), nearDist, kDoorTestNearMax);
+        rb[199] = 0;
+        return std::string(rb);
+    }
     {
         char kb[kDoorKeyCap];
         int gate = 0;
@@ -3105,9 +3917,18 @@ std::string DoorTestCommand(const std::string& argIn)
     g_testKey[kDoorKeyCap - 1] = 0;
     if (op == "show")
     {
-        const std::string line = DoorTestLine("[DOORTEST] show", door, key.c_str());
+        const std::string rid = doorrec::MakeDoorRecId(key);
+        std::map<std::string, DoorRecKept>::const_iterator kr = g_drec.find(rid);
+        const std::string rec = rid.empty() ? std::string(" | record: the key makes no door id")
+                              : ((kr != g_drec.end() && kr->second.have != 0) ? " | record " + rid + ": " + DrRecText(kr->second.r) : " | record " + rid + ": none here");
+        const std::string line = DoorTestLine("[DOORTEST] show", door, key.c_str()) + rec;
         DebugLog(line);
         return "ok " + line;
+    }
+    if (opc == coopdoor::kDoorTestOpBreak || opc == coopdoor::kDoorTestOpMend)
+    {
+        (void)DoorTestRowByKey(key.c_str());   /* a door the road has not seen yet gets its row as NoteDoor makes it (DoorResolveByKey) */
+        return DoorTestBreakMend(opc, door, key, nearDist);
     }
     {
         const std::string before = DoorTestLine("before", door, key.c_str());

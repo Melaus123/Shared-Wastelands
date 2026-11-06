@@ -11,8 +11,8 @@ namespace modversion {
 
 const int kMajor = 0;
 const int kMinor = 4;
-const int kPatch = 0;
-const char* const kName = "0.4.0";   /* kMajor.kMinor.kPatch as text */
+const int kPatch = 1;
+const char* const kName = "0.4.1";   /* kMajor.kMinor.kPatch as text */
 
 /* The Workshop upload tool's number for this version. */
 inline int UploadNumber() { return kMajor * 10000 + kMinor * 100 + kPatch; }

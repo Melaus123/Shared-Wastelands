@@ -49,7 +49,7 @@ bool IsStandInFaction(::Faction* f);          // stand1 fold (2b), ANY THREAD: I
 void NoteHeldForSlot();                        // stand1 fold (1d), ANY THREAD: a co-op send waited because this game has no slot yet (released by PlayerFactionTick)
 ::Faction* PeerFactionForTest(const std::string& name);
 std::string PeerFactionDisplayName();   /* tags1, MAIN THREAD: the peer faction's name as this game shows it ("" when there is none) */
-void PlayerFactionWorldAnswer(int verdict, unsigned num, const std::string& asked, const std::string& name);   // T-368, MAIN THREAD: the world gave profile num's faction another name (coopprof::kFacBack / kFacMoved / kFacDefault) - applied (and acknowledged) by PlayerFactionTick
+void PlayerFactionWorldAnswer(int verdict, unsigned num, const std::string& asked, const std::string& name);   // T-368, MAIN THREAD: the world gave profile num's faction another name (coopprof::kFacBack / kFacMoved / kFacDefault / kFacKeep) - applied (and acknowledged) by PlayerFactionTick
 void PlayerFactionWorldAnswerForget();   // T-368, MAIN THREAD: a new pick or a leave drops an answer not applied yet
 void InstallFactionNameHooks();   // T-368: the FACTION tab's name box refuses a name another profile of this world holds (Kenshi's own box)
 bool RenameMyFaction(const std::string& name);              // 'renamemyfaction <name>': Faction::setName + renameRecord on this game's player faction   // the 'peerfaction <name>' verb: create/rename it without a peer (T159)

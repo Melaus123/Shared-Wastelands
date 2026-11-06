@@ -42,12 +42,14 @@
  *     unlisted workers while the set's count plus the counted spots reaches the limit); the asker re-asks a granted spot every
  *     kSpotKeepMs and a counted spot not asked for kSpotCountedForgetMs is freed; any spot the runner frees but for a release
  *     is answered kSpotRevoked.
+ *     T-1192 (d): crafting benches and furnaces take the same road (SpotTakeOf) - the same messages, rows and endings.
  *
  * Pure: no engine memory, no Windows; the offline suite hits the same bytes and the same decisions. C++03 (VS2010 v100).
  */
 #pragma once
 
 #include <cstring>
+#include "poskey.h"   /* FarmTsSameFarm: the key's spot and the match every key search uses */
 #include <string>
 #include <vector>
 
@@ -242,6 +244,93 @@ inline int FarmGate(int single, int linked, int verdict)
     if (single != 0 || linked == 0) return kFarmRun;
     return (verdict == 1) ? kFarmRun : kFarmHold;
 }
+/* THE ENGINE'S LOAD CATCH-UP (farm.cpp detour_timeskip / FmHoldTs: timeSkip, run inside the farm's load for the hours since the
+   area save). In a multiplayer world it is kept in the farm's row whatever the writer verdict, until the farm's area has all its
+   records here and a stored crop for it is laid (each lay re-times it: FarmCatchUpAtLay); then it runs once where this game writes the
+   farm and is dropped where another game does (that game's record carries the growth). A single-player game runs it as the engine
+   does; a farm with no row (haveRow 0) runs it now. kFarmTsHoldUndecided: held, no writer named (tsPend 1); kFarmTsHoldWriter: held,
+   this game writes it (tsPend 2: due at the drain once nothing is owed); kFarmTsDrop: another game writes it */
+const int kFarmTsRun = 0, kFarmTsHoldUndecided = 1, kFarmTsHoldWriter = 2, kFarmTsDrop = 3;
+inline int FarmTsHold(int single, int haveRow, int verdict)
+{
+    if (single != 0 || haveRow == 0) return kFarmTsRun;
+    if (verdict == 0) return kFarmTsHoldUndecided;
+    return (verdict == 1) ? kFarmTsHoldWriter : kFarmTsDrop;
+}
+/* A CROP LAID ON A FARM WHOSE LOAD CATCH-UP IS HELD (farm.cpp FarmRecordLay, at every lay): the held catch-up always counts from the
+   minute of the newest crop laid here - kFarmCuRetime: to the hours since that crop's minute (catchUp 1, piecerec::PieceFarmCatchUp);
+   kFarmCuDrop: none is owed from it (its minute not known, not older than this game's clock, or within the engine's 1-hour floor);
+   kFarmCuNone: nothing is held */
+const int kFarmCuNone = 0, kFarmCuRetime = 1, kFarmCuDrop = 2;
+inline int FarmCatchUpAtLay(int held, int catchUp)
+{
+    if (held == 0) return kFarmCuNone;
+    return (catchUp != 0) ? kFarmCuRetime : kFarmCuDrop;
+}
+/* THE LOAD CATCH-UP'S FARM (farm.cpp FmLooseKeep / FmLooseFindLocked). Inside the farm's load, where the engine runs the catch-up, the
+   farm reads a height of 0, so the key read there is not the key its row, its piece record and its lay carry (they end in its real
+   height). The catch-up is kept with the farm's object and that key; a later read of the farm takes it when it is the SAME object
+   AND its key names the same record in the same sector within poskey::kTwinDrift tenths on x and on z (poskey::SameSpotSameRecord,
+   the match every key search uses). The height is not compared: it is the part the load misreads. The object tells two farms
+   stacked at one x, z apart; the spot refuses an object whose memory another farm has taken since. 1 the same farm, 0 not. */
+struct FarmTsSpot { char sid[64]; int sx, sy; long x10, z10; int ok; };   /* a key's record and spot, read once (ok 0 = not a key) */
+inline int FarmTsSpotOf(const char* key, FarmTsSpot* sp)
+{
+    memset(sp, 0, sizeof(*sp));
+    sp->ok = poskey::ParseKeySpot(key, sp->sid, (int)sizeof(sp->sid), &sp->sx, &sp->sy, &sp->x10, &sp->z10);
+    return sp->ok;
+}
+inline int FarmTsSameFarmAt(const void* heldObj, const FarmTsSpot& held, const void* liveObj, const FarmTsSpot& live)
+{
+    if (heldObj == 0 || heldObj != liveObj || held.ok == 0 || live.ok == 0) return 0;
+    return poskey::SameSpotSameRecord(live.sid, live.sx, live.sy, live.x10, live.z10, held.sid, held.sx, held.sy, held.x10, held.z10,
+                                      poskey::kTwinDrift);
+}
+inline int FarmTsSameFarm(const void* heldObj, const char* heldKey, const void* liveObj, const char* liveKey)
+{
+    FarmTsSpot h, l;
+    FarmTsSpotOf(heldKey, &h);
+    FarmTsSpotOf(liveKey, &l);
+    return FarmTsSameFarmAt(heldObj, h, liveObj, l);
+}
+/* KEEPING A LOAD CATCH-UP LOOSE (farm.cpp FmLooseKeep). sameObjWaiting: an entry for the same object still waits - that object's
+   memory now holds a farm being loaded, so the farm that entry was for is gone (freed before any read took it) and the newer one
+   replaces it (the replaced one counted dropped); freeSlot: the list has room. */
+const int kFarmLooseReplace = 1, kFarmLooseNew = 2, kFarmLooseListFull = 3;
+inline int FarmLooseOnKeep(int sameObjWaiting, int freeSlot)
+{
+    if (sameObjWaiting != 0) return kFarmLooseReplace;
+    return (freeSlot != 0) ? kFarmLooseNew : kFarmLooseListFull;
+}
+/* A READ OF THE FARM WITH ITS REAL KEY (farm.cpp FmLooseAdopt, FarmRecordLay). matched: a waiting entry is this farm's
+   (FarmTsSameFarmAt); haveRow: the farm has a row; tableFull: the read could make no row (the farm table is full - the farm is held,
+   nobody grows it here). kFarmLooseAdopt: the row takes it; kFarmLooseHeldFull: dropped as a farm past a full table is;
+   kFarmLooseWait: it waits for the read that has a row. */
+const int kFarmLooseWait = 0, kFarmLooseAdopt = 1, kFarmLooseHeldFull = 2;
+inline int FarmLooseOnRead(int matched, int haveRow, int tableFull)
+{
+    if (matched == 0) return kFarmLooseWait;
+    if (haveRow != 0) return kFarmLooseAdopt;
+    return (tableFull != 0) ? kFarmLooseHeldFull : kFarmLooseWait;
+}
+/* TEST-ONLY `buildtest farm water <key> <amount>`: the amount as the farm's water store holds it - input record 0's stock, 0 (dry)
+   to 1 (full; the engine's rain fills it and caps it at 1). Plain digits with an optional '.' and fraction, no sign, no exponent.
+   1 = *out holds it; 0 = not such a number in [0, 1] */
+inline int FarmWaterArg(const char* s, float* out)
+{
+    if (s == 0 || out == 0) return 0;
+    double v = 0.0, scale = 1.0;
+    int digits = 0, frac = 0;
+    const char* p = s;
+    for (; *p >= '0' && *p <= '9'; ++p) { if (++digits > 6) return 0; v = v * 10.0 + (double)(*p - '0'); }
+    if (*p == '.')
+        for (++p; *p >= '0' && *p <= '9'; ++p) { if (++frac > 6) return 0; scale *= 10.0; v = v * 10.0 + (double)(*p - '0'); }
+    if (*p != 0 || digits + frac == 0) return 0;
+    v /= scale;
+    if (!(v >= 0.0 && v <= 1.0)) return 0;
+    *out = (float)v;
+    return 1;
+}
 
 /* T-853 #7. A FARM THE LADDER LEAVES UNDECIDED is held on every game (FarmGate) for at most kFarmUndecidedMs; past that the game
    that holds the farm's area (the relay map's holder of its sector - one map, so one game on every game's reading) grows it and
@@ -291,6 +380,29 @@ inline int FarmPublishDue(const FarmMsg& last, const FarmMsg& cur, int everSent,
     if (changed) return 1;
     return (msSince >= kFarmKeepMs) ? 2 : 0;
 }
+
+/* A PLAYER'S FARM: ITS CROP TRAVELS ON ITS PIECE RECORD ALONE (piecerec.h kPrLiveFlagFarm, written at each 1% of growth and of death
+   and at each harvest, replant and the crop starting to die). Its crop is growth (grown), death (died), plant start (growStart), plants
+   harvested (harvested) and every plant's age (the farm builds the ages from those: keptwire.h KeptFarmAges). For a player's farm
+   (playerFarm 1) a crop change is never a reason to send a FARM and there is no keep-alive: a FARM goes only when what is left moves -
+   the cleared value, the work state, the harvest bar, the work spot or the water - at most every kFarmMinGapMs, as before. The FARM's
+   layout is unchanged, so its crop fields still hold the writer's numbers, but a game never writes them onto a player's farm
+   (FarmApplyCrop). playerFarm 0 (a farm no player owns): FarmPublishDue, crop and keep-alive as before. */
+inline void FarmCropFrom(FarmMsg* to, const FarmMsg& from)
+{
+    to->grown = from.grown; to->died = from.died; to->growStart = from.growStart; to->harvested = from.harvested; to->ages = from.ages;
+}
+inline int FarmPublishDueOf(const FarmMsg& last, const FarmMsg& cur, int everSent, unsigned int msSince, int playerFarm)
+{
+    if (playerFarm == 0) return FarmPublishDue(last, cur, everSent, msSince);
+    FarmMsg c = cur;
+    if (everSent != 0) FarmCropFrom(&c, last);   /* the crop as last sent: its moves are not measured */
+    const int due = FarmPublishDue(last, c, everSent, msSince);
+    return (due == 2) ? 0 : due;
+}
+/* 1 = a FARM's crop (growth, death, plant start, plants harvested, every plant's age) is written onto this game's copy of the farm: a
+   farm no player owns; 0 = a player's farm - its crop comes from its piece record alone, the rest of the FARM is written */
+inline int FarmApplyCrop(int playerFarm) { return (playerFarm != 0) ? 0 : 1; }
 
 /* HOW MANY PLANTS A FARM MESSAGE MAY WRITE on a copy that has `local` plants. -1 = wait (the copy's plants are not made yet);
    a count that differs is written up to the smaller count and booked as a mismatch by the caller. */
@@ -372,6 +484,81 @@ inline int MineOpAccept(int writer)
     return kMineAccWait;
 }
 
+/* T-1192: THE WORK STEPS THE GATE COVERS, by the function a building's work slot (vtable +0x4B0) leads to (build/vtable_*.txt,
+   1.0.65; 1.0.68 +0x40): ProductionBuilding::operate 0x2986C0 (production machines, generators, rain collectors, torture
+   buildings), the crafting bench's step 0x2B5A00 (CraftingBuilding) and the furnace's step 0x299F60 (FurnaceBuilding). The three
+   take (building, worker, amount) and are gated alike: a worker's step runs on the building's writer and is sent there as MINE_OP
+   from any other game; a step with no worker runs on the holder only. MINE_OP work is run through the step of the building's own
+   class. 0 (kStepNone) = none of them - a farm's own step, an address not known, a zero slot. */
+const int kStepNone = 0, kStepProduction = 1, kStepCrafting = 2, kStepFurnace = 3;
+inline int WorkStepKind(unsigned long long slotFn, unsigned long long prodFn, unsigned long long craftFn, unsigned long long furnaceFn)
+{
+    if (slotFn == 0) return kStepNone;
+    if (slotFn == prodFn) return kStepProduction;
+    if (slotFn == craftFn) return kStepCrafting;
+    if (slotFn == furnaceFn) return kStepFurnace;
+    return kStepNone;
+}
+
+/* T-1192: THE TORTURE BUILDING'S OUTPUT. Its update 0x29AF50 calls the output step 0x298470 (its vtable +0x5C0) itself when its
+   occupant is done, outside the gated work step, so every game that runs the update would make the product. The gate of an update
+   (single = a lone game; writer = the three-way answer above): kTortRun on a lone game or the writer - the output is made there;
+   kTortSkip on a game another game writes the building for - an output call made inside that update is skipped; kTortOwe when no
+   writer is named at that moment - the output is not made, it is OWED on that building (items.cpp TortOwedNote). Re-check fold
+   (finding 2): "no writer" is no answer to run on - off the main thread a player-owned building is "no writer" on EVERY game, the
+   true writer's included, and on the main thread it is also the hand-back, a stale ownership map or a load hold; running there made
+   the product on every game. The output is ONE call on one frame, so it is kept, not skipped: the main thread runs an owed output
+   later only when this game is then the building's writer (TortureOwedDecide). */
+const int kTortRun = 0, kTortSkip = 1, kTortOwe = 2;
+inline int TortureUpdateHeld(int single, int writer)
+{
+    if (single != 0 || writer == kProdWriterHere) return kTortRun;
+    return (writer == kProdWriterOther) ? kTortSkip : kTortOwe;
+}
+/* An owed output, asked on the main thread: stillThere = the building is still the one its key names (gone, or the world unloaded:
+   dropped); single / writer = the gate's answer NOW. Run on a lone game or the writer; dropped when another game writes it (it runs
+   its own owed one); kept while nobody is named, for kTortOwedKeepMs at most (bounded: kTortOwedCap rows). */
+const int kTortOwedKeep = 0, kTortOwedRun = 1, kTortOwedDrop = 2;
+const unsigned int kTortOwedCap = 8;
+const unsigned long kTortOwedKeepMs = 60000;
+inline int TortureOwedDecide(int stillThere, int single, int writer, unsigned long ageMs)
+{
+    if (stillThere == 0) return kTortOwedDrop;
+    if (single != 0 || writer == kProdWriterHere) return kTortOwedRun;
+    if (writer == kProdWriterOther) return kTortOwedDrop;
+    return (ageMs < kTortOwedKeepMs) ? kTortOwedKeep : kTortOwedDrop;
+}
+inline int TortureOutputSkip(const void* heldBuilding, const void* building)
+{
+    return (heldBuilding != 0 && heldBuilding == building) ? 1 : 0;
+}
+
+/* T-1192 (e): THE TORTURE BUILDING'S CHANGES TO ITS OCCUPANT. The same update 0x29AF50 changes the character in it: each limb's
+   health (LimbApplyHurt 0x643FE0, two calls), its medical state - unconscious, the fall, dead - (MedicalSystem_evaluate 0x648890),
+   a limb cut off (MedicalSystem::amputate 0x64E330, already refused on a copy everywhere - clothing.cpp) and its worn armour taken
+   off one piece at a time (CharacterHuman::dropItem 0x5C9CB0 - a copy's drop of its own item is already refused, items.cpp
+   GrCharDrop - then GameWorld::destroy 0x798F50). Those calls run only on the game that owns the occupant; the building's own
+   state (its timer, flags, bar and output) is the update's as before. The call is known by its return address inside the update
+   (a TortureSite); occupantCopy = the occupant is a replicated character this game does not own (items.cpp ItCcIsCopy, the
+   test the drop refusal uses); itemStillHeld = the item the destroy is given is still listed in the occupant's own inventory,
+   which is exactly when that drop was refused - an item the drop let go is on the ground and the destroy runs as the engine's. */
+const int kTortSiteNone = 0, kTortSiteHurt = 1, kTortSiteEvaluate = 2, kTortSiteDestroy = 3;
+inline int TortureSite(unsigned long long retRva, unsigned long long hurt1, unsigned long long hurt2, unsigned long long evaluate,
+                       unsigned long long destroy)
+{
+    if (retRva == 0) return kTortSiteNone;
+    if (retRva == hurt1 || retRva == hurt2) return kTortSiteHurt;
+    if (retRva == evaluate) return kTortSiteEvaluate;
+    if (retRva == destroy) return kTortSiteDestroy;
+    return kTortSiteNone;
+}
+inline int TortureOccupantSkip(int site, int occupantCopy, int itemStillHeld)
+{
+    if (site == kTortSiteNone || occupantCopy == 0) return 0;
+    if (site == kTortSiteDestroy) return (itemStillHeld != 0) ? 1 : 0;
+    return 1;
+}
+
 /* Kept work whose writer has stayed unnamed `undecidedMs` is dropped (0 = not waiting). */
 const unsigned int kMinePendMs = 60000;
 inline int MineHoldExpired(unsigned int undecidedMs) { return (undecidedMs > kMinePendMs) ? 1 : 0; }
@@ -420,6 +607,99 @@ inline int SpotTakeStep(int single, int linked, int listed, int writer, int stat
     if (state == kSpotAsked) return (msSince > kSpotAskGiveUpMs) ? kSpotAskNow : kSpotWait;
     if (state == kSpotRefused) return (msSince > kSpotRetryMs) ? kSpotAskNow : kSpotWait;
     return kSpotAskNow;
+}
+
+/* T-1192 (run T1894): A TAKE THAT IS NOT ASKED AGAIN. A prisoner put into a torture building (the put-in order, task 108 -> the
+   prison put-in 0x3305C0) calls the take ONCE; a new row's runner was filled only on the next frame (T-912), so that one take was
+   always refused and the prisoner left lying with no building. The take now reads the runner in the same call: writerNow = that
+   read (kProdWriter*; kProdWriterNone = not read or no answer). A row whose runner is not known takes "this game runs it" at once
+   (its take then passes, SpotTakeStep); another game's runner or no answer leaves the row as it was - refused and asked. */
+inline int SpotWriterForTake(int rowWriter, int writerNow)
+{
+    return (rowWriter == kProdWriterNone && writerNow == kProdWriterHere) ? kProdWriterHere : rowWriter;
+}
+/* Off the main thread the runner ladder has no answer for a player-owned building (its owner is read on the main thread only): the
+   main thread's last keyed runner answer for the building is used while it is at most this old (older = no answer). */
+const unsigned int kSpotRunnerFreshMs = 1000;
+inline int SpotRunnerBooked(int found, int booked, unsigned int ageMs)
+{
+    return (found != 0 && ageMs <= kSpotRunnerFreshMs) ? booked : kProdWriterNone;
+}
+/* how the take's runner was read: on the main thread by the ladder; off it by the ladder's off-main road, by the main thread's
+   booked answer, with no booked answer, or with one too old */
+const int kRunReadMain = 0, kRunReadOffLadder = 1, kRunReadOffBooked = 2, kRunReadOffNone = 3, kRunReadOffStale = 4, kRunReadKinds = 5;
+
+/* ---- T-1125: THE TORTURE BUILDING'S TAKE AND ITS OCCUPANT, SAID (release lines; they change nothing in the game) ----
+   The take guard (farm.cpp SpTakeGate) decides a torture building's take on one of these roads: a single-player game, the hand
+   unreadable or the null hand, the worker already in the building's worker list, no position key, no room (counted spots), a
+   character no other game can name, a copy of another game's character, the row's verdict pass / ask / wait. */
+const int kTortTakeLone = 0, kTortTakeHandless = 1, kTortTakeListed = 2, kTortTakeNoKey = 3, kTortTakeRoomFull = 4, kTortTakeNoUid = 5,
+          kTortTakeCopy = 6, kTortTakePass = 7, kTortTakeAsk = 8, kTortTakeWait = 9,
+          kTortTakePutInCopy = 10, kTortTakePutInOwed = 11, kTortTakePutInFull = 12, kTortTakeKinds = 13;   /* T-1211: the put-in's roads */
+/* 1 = the engine's own take runs on this road, 0 = refused */
+inline int TortTakeAllowed(int kind)
+{
+    return (kind == kTortTakeRoomFull || kind == kTortTakeCopy || kind == kTortTakeAsk || kind == kTortTakeWait
+            || kind == kTortTakePutInOwed || kind == kTortTakePutInFull) ? 0 : 1;
+}
+/* T-1211: the line's final answer - allowed, refused, or owed (a put-in the safe-point round finishes or ends) */
+inline const char* TortTakeWord(int kind)
+{
+    if (kind == kTortTakePutInOwed || kind == kTortTakePutInFull) return "owed";
+    return (TortTakeAllowed(kind) != 0) ? "allowed" : "refused";
+}
+inline const char* TortTakeWhy(int kind)
+{
+    switch (kind)
+    {
+    case kTortTakeLone:     return "a single-player game - the engine's own take";
+    case kTortTakeHandless: return "the hand is unreadable or the null hand - the engine's own take";
+    case kTortTakeListed:   return "already in the building's worker list";
+    case kTortTakeNoKey:    return "the building has no position key - the engine's own take";
+    case kTortTakeRoomFull: return "no room - the list's count plus the spots counted for other games' workers reach the limit";
+    case kTortTakeNoUid:    return "a character no other game can name - the engine's own take";
+    case kTortTakeCopy:     return "a copy of another game's character - its own game asks the runner";
+    case kTortTakePass:     return "this game runs the building, or the runner granted the spot";
+    case kTortTakeAsk:      return "another game runs the building or no runner answer - refused, the runner asked";
+    case kTortTakeWait:     return "an ask or a full answer is out - refused this step";
+    case kTortTakePutInCopy: return "a copy of another game's prisoner at the put-in - passed, its own game is asked to cage it";
+    case kTortTakePutInOwed: return "this game's own prisoner refused at the put-in - the put-in is owed (redone once the runner answers, else taken out)";
+    case kTortTakePutInFull: return "no room at the put-in (counted spots) - owed as full, the prisoner is taken out";
+    default: break;
+    }
+    return "unknown road";
+}
+/* A said line's cap: one per (building key hash, occupant uid, kind). 1 = say it (recorded), 0 = said before, -1 = the table is
+   full (not said; the caller counts it) */
+struct TortSeen { unsigned int keyHash; unsigned int uid; int kind; };
+inline int TortSayFirst(TortSeen* rows, int* n, int cap, unsigned int keyHash, unsigned int uid, int kind)
+{
+    for (int i = 0; i < *n; ++i)
+        if (rows[i].keyHash == keyHash && rows[i].uid == uid && rows[i].kind == kind) return 0;
+    if (*n >= cap) return -1;
+    rows[*n].keyHash = keyHash; rows[*n].uid = uid; rows[*n].kind = kind;
+    ++*n;
+    return 1;
+}
+/* a building key's hash for the cap and the occupant watch; never 0 (0 = no building) */
+inline unsigned int TortKeyHash(const char* k)
+{
+    unsigned int h = 2166136261u;
+    for (; k != 0 && *k != 0; ++k) { h ^= (unsigned char)*k; h *= 16777619u; }
+    return (h == 0) ? 1u : h;
+}
+/* THE OCCUPANT WATCH (spawn.cpp CageOccupantWatch, main thread, every 500 ms): a character's inSomething (+0x2F8; 2 = a cage,
+   which a torture building is) and the building its hand names (key hash, 0 = none resolves), against the last pass. In = it went
+   in (or now names another building); Out = it left; Gone = still in but the building it was in no longer resolves (taken down or
+   unloaded with it inside). A character first seen inside counts as going in. */
+const int kCageEvNone = 0, kCageEvIn = 1, kCageEvOut = 2, kCageEvGone = 3;
+inline int CageWatchEvent(int prevIns, unsigned int prevKey, int ins, unsigned int key)
+{
+    if (prevIns != 2) return (ins == 2) ? kCageEvIn : kCageEvNone;
+    if (ins != 2) return kCageEvOut;
+    if (prevKey != 0 && key == 0) return kCageEvGone;
+    if (key != 0 && key != prevKey) return kCageEvIn;
+    return kCageEvNone;
 }
 
 /* A granted spot the runner no longer holds: a revoke (T-853 #5), or a full answer to the granted row's keep-alive ask - the runner
@@ -474,6 +754,142 @@ inline int SpotGrantUnused(int state, int listed, unsigned int msSinceGrant)
     return (state == kSpotGranted && listed == 0 && msSinceGrant > kSpotGrantUseMs) ? 1 : 0;
 }
 
+/* T-1212 (runs T1891 / T1908 / T1910 / T1915): A CLICK ORDER THE TAKE REFUSED IS GIVEN AGAIN. A player's click on a rock, machine,
+   bench, furnace, generator, rain collector or torture building starts its job through the job start (1.0.65 0x35B3D0; its take call
+   returns to row JobStartTakeRet); a refused take there ENDS the click order (decomp_35b3d0.txt:64-67) - a standing job is restarted
+   by the game, a click order is not. The take is refused when the row's runner is not known yet (a new row off the main thread) or
+   another game runs the building and its yes has not come. The refusal at the job start leaves a re-order OWED on the worker's row;
+   once the real answer is in (this game runs it, or the spot is granted) the main thread gives the same click order again.
+   A refusal is owed only at the job start (callerJobStart; a prisoner's put-in is not a click order) and not within
+   kSpotReorderLoopMs of this row's last re-give (everGiven / msSinceGiven): a re-given order refused again is never given a third
+   time. */
+const unsigned int kSpotReorderWindowMs = 3000;            /* a re-give is due only this long after the refusal */
+const unsigned int kSpotReorderSettleMs = 250;             /* bug class 319: the ended click order may still sit in the order list */
+const unsigned int kSpotReorderLoopMs = kSpotGrantUseMs;   /* a refusal this soon after a re-give is not owed again */
+typedef char kSpotReorderBeforeGrantRelease[(kSpotReorderWindowMs < kSpotGrantUseMs) ? 1 : -1];   /* lands before an unused grant is released */
+inline int SpotReorderOwe(int callerJobStart, int everGiven, unsigned int msSinceGiven)
+{
+    if (callerJobStart == 0) return 0;
+    return (everGiven != 0 && msSinceGiven <= kSpotReorderLoopMs) ? 0 : 1;
+}
+/* T-1212 review MEDIUM 1: the NEWEST click wins - a refusal owed on one row clears the owed re-order on every other row of the same
+   character (the player replaced that click; giving it first would make the newer one's re-give see it as "a newer order").
+   rows[0..n) are the worker rows (fields used, uid, roOwed); keep = the row just owed. Returns the rows cleared. */
+template <class Row> inline int SpotReorderKeepNewest(Row* rows, int n, int keep)
+{
+    int cleared = 0;
+    if (keep < 0 || keep >= n) return 0;
+    for (int j = 0; j < n; ++j)
+        if (j != keep && rows[j].used != 0 && rows[j].roOwed != 0 && rows[j].uid == rows[keep].uid) { rows[j].roOwed = 0; ++cleared; }
+    return cleared;
+}
+/* The answer an owed re-order waits for (the worker's row as the main thread reads it): none yet, this game runs it, granted, or
+   (review LOW 2) the runner answered full - the spot will not come inside the window. */
+const int kSpotReorderNoAnswer = 0, kSpotReorderRunsHere = 1, kSpotReorderGranted = 2, kSpotReorderFull = 3;
+inline int SpotReorderAnswer(int writer, int state)
+{
+    if (writer == kProdWriterHere) return kSpotReorderRunsHere;
+    if (state == kSpotGranted) return kSpotReorderGranted;
+    return (state == kSpotRefused) ? kSpotReorderFull : kSpotReorderNoAnswer;
+}
+/* THE DUE CHECK (main thread, every frame while a re-order is owed). owed = the row holds one; answer = SpotReorderAnswer;
+   msSinceRefusal = since the refusal; found = the character (by uid, this game's own) and the building (by key) were found again
+   and the character's order lists read; queued / pending / standing = its order queue, pending orders and standing jobs.
+   Bug class 495: a player's newer order or a standing job drops the re-order for good (it is never given after that order ends);
+   a queued order in the first kSpotReorderSettleMs may be the ended click order itself, so it waits. A runner's full answer drops it.
+   A run proving this fix must see the REPORT's givenHere / givenGrant move (an order actually re-given), not only droppedNewer -
+   a drop alone shows the guard, not the re-give. */
+const int kSpotReorderNone = 0, kSpotReorderWait = 1, kSpotReorderGive = 2, kSpotReorderDropNewer = 3, kSpotReorderDropTimeout = 4,
+          kSpotReorderDropNotFound = 5, kSpotReorderDropFull = 6;
+inline int SpotReorderDue(int owed, int answer, unsigned int msSinceRefusal, int found, long long queued, int pending, int standing)
+{
+    if (owed == 0) return kSpotReorderNone;
+    if (msSinceRefusal > kSpotReorderWindowMs) return kSpotReorderDropTimeout;
+    if (found == 0) return kSpotReorderDropNotFound;
+    if (answer == kSpotReorderFull) return kSpotReorderDropFull;
+    if (standing != 0) return kSpotReorderDropNewer;
+    if (queued != 0 || pending != 0) return (msSinceRefusal < kSpotReorderSettleMs) ? kSpotReorderWait : kSpotReorderDropNewer;
+    return (answer == kSpotReorderRunsHere || answer == kSpotReorderGranted) ? kSpotReorderGive : kSpotReorderWait;
+}
+
+/* T-1211: A PRISONER PUT INTO A TORTURE BUILDING ANOTHER GAME RUNS. The put-in (Task_PutInSomething 0x358610 -> setPrisonMode
+   0x3305C0) sets "in something" (+0x2F8 = 2) and then calls the building's take ONCE (its return is row PrisonTakeRet); a refusal
+   just returns, leaving the prisoner lying pinned with no building, and the engine never calls that take again
+   (decomp_3305c0:83-92). So the game whose prisoner it is finishes its own put-in once the building's game answers (design D2,
+   .modding/investigations/t1211-putin-design-2026-11-04.md): no new message.
+   WHO MAY PASS: a copy of another game's prisoner (whoCopy, WorkerIsCopy) passes the take at the put-in (putIn = the take came from
+   setPrisonMode) - this game's engine then holds the copy in the building, so its own game is sent the existing "please cage it"
+   (MSG_PRISON IN, spawn.cpp PrisonTick). Anywhere else a copy is still refused (T-610). 1 = pass. */
+inline int SpotPutInCopyPass(int putIn, int whoCopy)
+{
+    return (putIn != 0 && whoCopy != 0) ? 1 : 0;
+}
+/* OWED: this game's own prisoner whose put-in take was refused (act = the take step, kSpot*) is owed one redo; a refusal of the
+   redo itself (redoing = the row's one redo is running now) is never owed again - it is taken out instead. 1 = owe. */
+inline int SpotPutInOwe(int putIn, int act, int redoing)
+{
+    return (putIn != 0 && act != kSpotPass && redoing == 0) ? 1 : 0;
+}
+/* THE HOLD (spawn.cpp PrisonSafePointDrain): the owner caging its own character for another game's guard (ownOp) whose take there
+   was refused and is now owed does not send the refusal at once; the owed put-in's outcome sends it (or the caging). 1 = hold. */
+inline int SpotPutInHold(int ownOp, int owed)
+{
+    return (ownOp != 0 && owed != 0) ? 1 : 0;
+}
+/* THE REDO / GIVE-UP DECISION (the K2 safe point, every frame while a put-in is owed), from live reads: linked = the farm link is up
+   (unlinked, the take guard passes, so the redo completes as a lone game); found = the prisoner found again; mine = it is still
+   this game's own; pinned = it still lies "in something" with no building (+0x2F8 == 2, no hand); building = the building found
+   again by its key; answer = SpotReorderAnswer of the worker row (this game runs it / granted / full / none); asks = the asks
+   made for it so far, msSinceAsk = since the last one. *why = kPutInWhy*. Events over timers: the redo waits for the answer;
+   the 3-ask limit is only the fallback when no answer ever comes (an unanswered ask is asked again every kSpotAskGiveUpMs). */
+const int kSpotPutInWait = 0, kSpotPutInRedo = 1, kSpotPutInAskAgain = 2, kSpotPutInTakeOut = 3, kSpotPutInDrop = 4;
+const int kPutInWhyNone = 0, kPutInWhyGranted = 1, kPutInWhyRunsHere = 2, kPutInWhyLinkDown = 3, kPutInWhyFull = 4,
+          kPutInWhyBuildingGone = 5, kPutInWhyNoAnswer = 6, kPutInWhyPrisonerGone = 7, kPutInWhyNotMine = 8, kPutInWhyNotPinned = 9;
+const int kSpotPutInAsksMax = 3;
+inline int SpotPutInDue(int linked, int found, int mine, int pinned, int building, int answer, int asks, unsigned int msSinceAsk, int* why)
+{
+    *why = kPutInWhyNone;
+    if (found == 0) { *why = kPutInWhyPrisonerGone; return kSpotPutInDrop; }
+    if (mine == 0) { *why = kPutInWhyNotMine; return kSpotPutInDrop; }       /* another game's to write now */
+    if (pinned == 0) { *why = kPutInWhyNotPinned; return kSpotPutInDrop; }   /* caged or out by another road: nothing owed */
+    if (building == 0) { *why = kPutInWhyBuildingGone; return kSpotPutInTakeOut; }
+    if (linked == 0) { *why = kPutInWhyLinkDown; return kSpotPutInRedo; }
+    if (answer == kSpotReorderRunsHere) { *why = kPutInWhyRunsHere; return kSpotPutInRedo; }
+    if (answer == kSpotReorderGranted) { *why = kPutInWhyGranted; return kSpotPutInRedo; }
+    if (answer == kSpotReorderFull) { *why = kPutInWhyFull; return kSpotPutInTakeOut; }
+    if (msSinceAsk <= kSpotAskGiveUpMs) return kSpotPutInWait;
+    if (asks >= kSpotPutInAsksMax) { *why = kPutInWhyNoAnswer; return kSpotPutInTakeOut; }
+    return kSpotPutInAskAgain;
+}
+/* review fold 1: the answer an owed put-in judges - a put-in this game refused because the building's spots are full (the counted
+   spots it holds for other games' workers; roomFull) is "full" whoever runs it, so it is taken out at once instead of lying pinned. */
+inline int SpotPutInAnswer(int roomFull, int writer, int state)
+{
+    return (roomFull != 0) ? kSpotReorderFull : SpotReorderAnswer(writer, state);
+}
+/* review fold 4: the worker row's runner just before the redo - the round's live "this game runs it" (liveHere) is written onto the
+   row, so the take guard (which reads the row, refreshed only every 500 ms by SpSendRound) passes the redo instead of refusing it. */
+inline int SpotPutInRedoWriter(int rowWriter, int liveHere)
+{
+    return (liveHere != 0) ? kProdWriterHere : rowWriter;
+}
+inline const char* SpotPutInWhyText(int why)
+{
+    switch (why)
+    {
+    case kPutInWhyGranted:      return "the building's game said yes";
+    case kPutInWhyRunsHere:     return "this game runs the building now";
+    case kPutInWhyLinkDown:     return "the link is down (a lone game)";
+    case kPutInWhyFull:         return "the building's game answered full";
+    case kPutInWhyBuildingGone: return "the building is gone";
+    case kPutInWhyNoAnswer:     return "no answer after 3 asks (fallback)";
+    case kPutInWhyPrisonerGone: return "the prisoner is gone";
+    case kPutInWhyNotMine:      return "the prisoner is not (or no longer) this game's";
+    case kPutInWhyNotPinned:    return "the prisoner no longer lies pinned (caged or out by another road)";
+    default:                    return "-";
+    }
+}
+
 /* T-853 #3. A yes that changed no row (SpotAnswerApply left it): the runner took a spot nobody here will use - released at once.
    Only for this game's own worker (ownWorker), since every game hears every answer and a row may exist here for another game's
    worker; then released unless this game's row already holds that grant (rowFound, state: a keep-alive's yes). */
@@ -509,6 +925,23 @@ inline int SpotRunnerFreeRow(int released, int counted, int copyGone, unsigned i
     const int gone = (counted != 0) ? ((msSinceAsk > kSpotCountedForgetMs) ? 1 : 0) : copyGone;
     return SpotRunnerFree(released, gone, runsHere);
 }
+
+/* T-1192 (d). THE BUILDINGS WHOSE WORKER SPOTS THEIR RUNNER COUNTS, by the work step their work slot leads to (WorkStepKind above):
+   production machines and torture buildings (T-674), crafting benches and furnaces. All of them keep the worker set +0x3D0, its
+   count +0x3E0 and the limit +0x3AC. The take (vtable +0x4F8) is Building's 0xF7FF0 for all but the crafting bench, whose own take
+   0x2B5BB0 (build/vtable_CraftingBuilding.txt; 1.0.68 0x2B5BF0) answers 0 when its vt+0x4E8 test holds, then tests the same set
+   against the same limit and adds the hand through the same 0xF7D50 (build/decomp_2b5bb0.txt). kSpotTakeNone: not counted (a farm,
+   any other building) - its take passes as before. */
+const int kSpotTakeNone = 0, kSpotTakeBuilding = 1, kSpotTakeBench = 2;
+inline int SpotTakeOf(int stepKind)
+{
+    if (stepKind == kStepCrafting) return kSpotTakeBench;
+    if (stepKind == kStepProduction || stepKind == kStepFurnace) return kSpotTakeBuilding;
+    return kSpotTakeNone;
+}
+/* A take detour gates the call only when the building's own take is the one it sits on (take = SpotTakeOf of the building, hooked =
+   the take the detour is on); any other building through it passes to the engine as before. */
+inline int SpotTakeGated(int take, int hooked) { return (take != kSpotTakeNone && take == hooked) ? 1 : 0; }
 
 /* par16 fold #3. A plant whose age is below kFarmHiddenAge is drawn by nobody (updatePlantInstance 0xDF320 returns at once),
    so its parts' scale must be zeroed the way destroyAPlant 0xE47C0 does or the ripe plant stays on screen. */

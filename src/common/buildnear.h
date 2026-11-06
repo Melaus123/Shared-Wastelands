@@ -274,5 +274,57 @@ inline int OwnZoneAt(const ZoneAnchor* a, int n, float x, float z)
     }
     return best;
 }
+// T-1240 TEST-ONLY `buildtest cursor <sid> abs <x> <z> [commit]`: the word after <z> - 0 none, 1 `commit`, -1 anything else (usage)
+inline int CursorCommitWord(const char* w)
+{
+    if (w == 0 || w[0] == 0) return 0;
+    const char* c = "commit";
+    int i = 0;
+    for (; c[i] != 0; ++i) if (w[i] != c[i]) return -1;
+    return w[i] == 0 ? 1 : -1;
+}
+// T-1240: the build click's own refusal checks (1.0.65 0x4E1D50, decomp_4e1d50.txt:352-549, Read), asked in the click's order
+// of the preview on the cursor after its update; each fact is asked only when the click would reach it (a vtable call is made only then).
+// Facts: kF* below; ask returns 0 / non-zero. The answer is kClickOk (the click's placing road, LAB_1404e2b46: vt+0xC0) or a refusal
+// whose on-screen text ClickRefusalText gives - the strings the click shows.
+const int kFInterior = 0, kFTown90 = 1, kFHostD0 = 2, kFHostD8 = 3, kFValid = 4, kFRes100 = 5, kFB8b = 6, kFHostComplete = 7, kFB7c = 8,
+          kFVt28 = 9, kFVt60 = 10, kFVt78 = 11, kFB89 = 12, kFVt80 = 13, kFVt90 = 14, kFVt68 = 15, kFVt88 = 16, kFB8c = 17, kFCount = 18;
+const int kClickOk = 0, kClickTooCloseTown = 1, kClickDontOwn = 2, kClickNoResources = 3, kClickCrop = 4, kClickMustInside = 5,
+          kClickMustOutside = 6, kClickIncompleteHost = 7, kClickBlueNodes = 8, kClickNoUsage = 9, kClickTooCloseBuilding = 10,
+          kClickCharacters = 11, kClickBlocksUse = 12, kClickInvalidGround = 13, kClickFloor = 14, kClickLevel = 15, kClickCount = 16;
+typedef int (*ClickAskFn)(void* ctx, int fact);
+inline int ClickRefusal(ClickAskFn ask, void* c)
+{
+    const int interior = ask(c, kFInterior);   /* PlayerInterface+0x298 */
+    if (interior == 0 && ask(c, kFTown90) != 0)   /* preview+0x90: the town (or host) the place test 0x4DAFB0 left */
+        return (ask(c, kFHostD8) == 0 && ask(c, kFHostD0) == 0) ? kClickTooCloseTown : kClickDontOwn;
+    if (ask(c, kFValid) == 0 && interior == 0) return ask(c, kFRes100) == 0 ? kClickNoResources : kClickCrop;   /* vt+0x10; +0x100 */
+    if (ask(c, kFB8b) == 0)
+    {
+        if (ask(c, kFHostD8) != 0 && ask(c, kFHostComplete) == 0) return kClickIncompleteHost;   /* *(+0xD8)->vt+0x228 */
+        return ask(c, kFB7c) == 0 ? kClickMustInside : kClickMustOutside;
+    }
+    if (ask(c, kFVt28) == 0) return kClickBlueNodes;
+    if (interior != 0) return kClickOk;
+    if (ask(c, kFVt60) == 0) return ask(c, kFVt78) == 0 ? kClickNoUsage : kClickTooCloseBuilding;
+    if (ask(c, kFB89) == 0) return kClickCharacters;
+    if (ask(c, kFVt80) != 0) return kClickBlocksUse;
+    if (ask(c, kFVt90) == 0) return kClickInvalidGround;
+    if (ask(c, kFVt68) == 0) return kClickFloor;
+    if (ask(c, kFVt88) == 0 || ask(c, kFB8c) == 0) return kClickLevel;
+    return kClickOk;
+}
+inline const char* ClickRefusalText(int r)
+{
+    static const char* const k[kClickCount] = {
+        "allowed (the click's placing road)", "Can't build too close to another town.", "Can't place in a building you don't own.",
+        "No resources at this location, mining would be pointless.", "This crop will not grow in this environment.",
+        "Must be placed inside a building.", "Must be placed outside or on a roof.", "Cannot build inside incomplete buildings.",
+        "Can only be placed on certain locations (marked by blue nodes).", "No valid usage nodes.", "Too close to another building.",
+        "There are characters in the way.", "The building blocks another building use nodes.",
+        "The building has one or more parts on invalid ground.",
+        "Invalid placing floor number. Change to the correct floor to place it in that position.", "Ground needs to be more level." };
+    return (r >= 0 && r < kClickCount) ? k[r] : "?";
+}
 }   // namespace buildnear
 #endif

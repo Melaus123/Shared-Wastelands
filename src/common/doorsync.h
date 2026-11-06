@@ -83,8 +83,8 @@ inline int DoorRecvDecide(int origin, int weHold)
 /* ============================ THE PUBLISH DRAIN ============================
    weHold: 1 = this game holds the door's patch of map, 0 = it does not, -1 = the question could not
    be answered.  reportIfNotHolder: 1 for an ordinary local change (the actor report the new rule
-   rests on), 0 for the link-up re-offer, which is the weather pattern's "tell the late joiner what
-   I hold" and must NOT push a joiner's own stale local states at the holder. */
+   rests on), 0 for the holder's republish after it adopted another game's report - the holder's own
+   answer, refused once this game no longer holds the door. */
 const int kDoorSendHolder = 0;
 const int kDoorSendActor  = 1;
 const int kDoorSendRefuse = 2;
@@ -113,9 +113,8 @@ inline int DoorDrainDecide(int weHold, int reportIfNotHolder)
     return (reportIfNotHolder != 0) ? kDoorSendActor : kDoorSendRefuse;
 }
 /* WHAT BECOMES OF A PUBLISH THE DRAIN COULD NOT SEND (the road open, the send refused). An actor report is queued again and tried
-   until it is kDoorReportRetryMs old. A holder's publish queued with reportIfNotHolder 0 - its RE-OFFER when another player entered the world,
-   and its republish after adopting another game's report (doors.cpp, the adopt) - is queued again until it is sent: dropping the
-   re-offer would leave the newcomer told nothing about the door, dropping the republish would leave the reporter unanswered.
+   until it is kDoorReportRetryMs old. A holder's publish queued with reportIfNotHolder 0 - its republish after adopting another game's
+   report (doors.cpp, the adopt) - is queued again until it is sent: dropping it would leave the reporter unanswered.
    A holder's own change publish is dropped, as before. */
 const int kDoorUnsentDrop = 0;
 const int kDoorUnsentRetryTimed = 1;
@@ -533,12 +532,12 @@ const int kDoorLockStuckGaveUp = 3;   /* kDoorLockGiveUpN ineffective visits */
    town would close on the holder's screen every door its load built closed.  So a change is an actor report only when an actor
    made it:
      - a write by one of the engine's load-time door writers (loadWriter, told by the caller's return address) is the load, not an
-       actor, whatever the row knew before: a re-offer;
+       actor, whatever the row knew before: 0;
      - otherwise a call into openDoor / closeDoor / lockButton (actionEntry) is somebody acting on the door: an actor report, even
        on a door whose row is new;
-     - otherwise a first sighting (wasState -1) is a re-offer and a change from a known state is an actor report.
-   A re-offer is published if this game holds the door and refused if it does not.  The value is the reportIfNotHolder argument of
-   the queue. */
+     - otherwise a first sighting (wasState -1) is the load (0) and a change from a known state is an actor report.
+   A change that is the load (0) is not published at all (doors.cpp: a door's world facts come from its world-server record); 1 is the
+   reportIfNotHolder argument of the queue. */
 inline int DoorChangeReportsIfNotHolder(int wasState, int loadWriter, int actionEntry)
 {
     if (loadWriter != 0) return 0;
@@ -591,25 +590,6 @@ inline int DoorKeySector(const char* key, int* sx, int* sy)
     return 1;
 }
 
-/* ANOTHER GAME HAS JUST LOADED A SECTOR AND ASKED THIS GAME, ITS HOLDER, TO CATCH IT UP (the world server's catch-up ask).  Every door this
-   game has registered in that sector, in a resting state, is re-offered as the holder's word; the asker applies it when its own copy
-   of the door registers, so after any (re)load the holder's doors win.  1 = re-offer this row. */
-inline int DoorServesSectorAsk(int keyParsed, int rowSx, int rowSy, int askSx, int askSy, int state)
-{
-    if (keyParsed == 0) return 0;
-    if (rowSx != askSx || rowSy != askSy) return 0;
-    return (state == kDoorClosed || state == kDoorOpen) ? 1 : 0;
-}
-/* ONE CATCH-UP ASK NAMES SEVERAL SECTORS (askX[i], askY[i] are one sector): a resting door of any of them is re-offered. */
-inline int DoorServesCatchup(int keyParsed, int rowSx, int rowSy, const int* askX, const int* askY, int n, int state)
-{
-    int i;
-    if (askX == 0 || askY == 0) return 0;
-    for (i = 0; i < n; ++i)
-        if (DoorServesSectorAsk(keyParsed, rowSx, rowSy, askX[i], askY[i], state) != 0) return 1;
-    return 0;
-}
-
 /* A PLAYER WHO ENTERS THE WORLD MAY BE A RESTARTED GAME, whose door counter starts again from 1.  The newest-wins record this game
    keeps per door would refuse every door message from that player until its new counter passed the old one, so the record is
    forgotten when the player enters.  arrivedSlot -1 = the arrival names no single player: every publisher's record is forgotten
@@ -637,8 +617,7 @@ inline int DoorWordReArmsGiveUp(int accepted, int gaveUp)
 }
 
 /* THE HELD TABLE IS FULL.  An entry may be taken for a new key only when no live door here carries its key and no report waits on
-   it: its stored word is then for a door this game has not loaded, and the holder sends it again when this game loads that sector
-   (DoorServesSectorAsk).  1 = evictable. */
+   it: its stored word is then for a door this game has not loaded.  1 = evictable. */
 inline int DoorHeldEvictable(int used, int hasLiveRow, int pendingActor)
 {
     return (used != 0 && hasLiveRow == 0 && pendingActor == 0) ? 1 : 0;
@@ -670,32 +649,18 @@ inline int DoorHeldResolveDue(int pendingActor, int reFind)
 {
     return (pendingActor != 0 || reFind != 0) ? 1 : 0;
 }
-/* A CATCH-UP ASK NAMES SECTORS (askX[i], askY[i] are one sector).  1 = the sector a door key names (DoorKeySector) is one of them. */
-inline int DoorKeyInAsk(int keyParsed, int sx, int sy, const int* askX, const int* askY, int n)
+/* THE APPLY LOOP VISITS a held entry that holds the holder's word or carries an actor report.  1 = visit. */
+inline int DoorHeldVisited(long heldState, int pendingActor)
 {
-    int i;
-    if (keyParsed == 0 || askX == 0 || askY == 0) return 0;
-    for (i = 0; i < n; ++i)
-        if (sx == askX[i] && sy == askY[i]) return 1;
-    return 0;
+    return (heldState >= 0 || pendingActor != 0) ? 1 : 0;
 }
-/* A DOOR THIS GAME KNOWS ONLY BY KEY - a held entry with no row here (the row dropped by the active-zone check, the purge or the full
-   registry, and the engine has not moved the door since) - in a sector a catch-up ask names: the entry is marked, and the tick looks
-   its door up through its building (doors.cpp DoorResolveByKey, one look-up per tick) and re-offers it if found.  1 = mark. */
-inline int DoorServeMarksHeld(int inAsk, int hasRow)
+/* THE DOOR RECORD'S HOLDER ANSWER from items.cpp's settled area verdict (AreaVerdictForDoorSettled): 1 this game holds the area, 0
+   another game or nobody does, -1 not known yet (the area picture still loading, no notebook, unanswerable) - asked again later. */
+inline int DoorAreaHoldAnswer(int area)
 {
-    return (inAsk != 0 && hasRow == 0) ? 1 : 0;
-}
-/* A held entry with no row here is looked up through its building when a report waits on it, its word is marked (DoorDropMarksReFind)
-   or a catch-up ask marked it (DoorServeMarksHeld).  1 = look it up. */
-inline int DoorHeldLookupDue(int pendingActor, int reFind, int serveFind)
-{
-    return (DoorHeldResolveDue(pendingActor, reFind) != 0 || serveFind != 0) ? 1 : 0;
-}
-/* THE APPLY LOOP VISITS a held entry that holds the holder's word, carries an actor report or carries a catch-up mark.  1 = visit. */
-inline int DoorHeldVisited(long heldState, int pendingActor, int serveFind)
-{
-    return (heldState >= 0 || pendingActor != 0 || serveFind != 0) ? 1 : 0;
+    if (area == kDoorAreaMine) return 1;
+    if (area == kDoorAreaOther || area == kDoorAreaNobody) return 0;
+    return -1;
 }
 /* DOES A DOOR KEY NAME A GATE, for the holder-word line budget: the word "gate" anywhere in the key, in any case.  1 = it does. */
 inline int DoorKeyNamesGate(const char* key)
@@ -716,7 +681,7 @@ inline int DoorKeyNamesGate(const char* key)
     return 0;
 }
 /* THE HOLDER-WORD LINE BUDGET (doors.cpp DoorWordLine).  A key with a held entry has its own budget of perKeyCap lines, so one
-   catch-up's doors cannot spend the line a gate needs; a gate key's lines print within that budget whatever the session total says;
+   town's doors cannot spend the line a gate needs; a gate key's lines print within that budget whatever the session total says;
    every other line also needs room in the session total (claimed by the caller, totalCap).  hasSlot 0 = the key has no held entry,
    and only the session total applies.  1 = print. */
 inline int DoorWordLinePrints(int hasSlot, long keyLines, long totalLines, int isGate, long perKeyCap, long totalCap)
@@ -739,5 +704,90 @@ inline int LockPickedRule(int lockedBefore, int lockedAfter, int lockOfDoor)
 inline int DoorBrokenKeeps(int broken, int holderState)
 {
     return (broken != 0 && holderState != kDoorOpen && holderState != kDoorOpening) ? 1 : 0;
+}
+
+/* THE doortest LEVER'S WORDS (doors.cpp DoorTestCommand, TEST-ONLY): `doortest <op> <target>` - op one of open close lock npclock show
+   break mend; target one of nearest next last gate, held (show only), or else a door key (the rest of the line). The op ends at the
+   first space; the target starts at the first non-space after it. 1 = usable: *op, *target and *keyAt (the target's offset in arg). */
+const int kDoorTestOpOpen = 1, kDoorTestOpClose = 2, kDoorTestOpLock = 3, kDoorTestOpNpcLock = 4, kDoorTestOpShow = 5,
+          kDoorTestOpBreak = 6, kDoorTestOpMend = 7;
+const int kDoorTestTgtNearest = 1, kDoorTestTgtNext = 2, kDoorTestTgtLast = 3, kDoorTestTgtGate = 4, kDoorTestTgtHeld = 5,
+          kDoorTestTgtKey = 6;
+/* 1 = p[0..n) is exactly the word w */
+inline int DoorTestWordIs(const char* p, int n, const char* w)
+{
+    for (int i = 0; i < n; ++i) if (w[i] == 0 || w[i] != p[i]) return 0;
+    return (w[n] == 0) ? 1 : 0;
+}
+inline int DoorTestParse(const char* arg, int* op, int* target, int* keyAt)
+{
+    *op = 0; *target = 0; *keyAt = -1;
+    if (arg == 0) return 0;
+    int n = 0;
+    while (arg[n] != 0 && arg[n] != ' ') ++n;
+    int o = 0;
+    if (DoorTestWordIs(arg, n, "open")) o = kDoorTestOpOpen;
+    else if (DoorTestWordIs(arg, n, "close")) o = kDoorTestOpClose;
+    else if (DoorTestWordIs(arg, n, "lock")) o = kDoorTestOpLock;
+    else if (DoorTestWordIs(arg, n, "npclock")) o = kDoorTestOpNpcLock;
+    else if (DoorTestWordIs(arg, n, "show")) o = kDoorTestOpShow;
+    else if (DoorTestWordIs(arg, n, "break")) o = kDoorTestOpBreak;
+    else if (DoorTestWordIs(arg, n, "mend")) o = kDoorTestOpMend;
+    else return 0;
+    int at = n;
+    while (arg[at] == ' ') ++at;
+    if (arg[at] == 0) return 0;
+    const char* p = arg + at;
+    int m = 0;
+    while (p[m] != 0) ++m;
+    int g = kDoorTestTgtKey;
+    if (DoorTestWordIs(p, m, "nearest")) g = kDoorTestTgtNearest;
+    else if (DoorTestWordIs(p, m, "next")) g = kDoorTestTgtNext;
+    else if (DoorTestWordIs(p, m, "last")) g = kDoorTestTgtLast;
+    else if (DoorTestWordIs(p, m, "gate")) g = kDoorTestTgtGate;
+    else if (DoorTestWordIs(p, m, "held")) g = kDoorTestTgtHeld;
+    if (g == kDoorTestTgtHeld && o != kDoorTestOpShow) return 0;
+    *op = o; *target = g; *keyAt = at;
+    return 1;
+}
+/* the lever's radius is asked of a building found by distance (nearest, next, gate) when the op is break or mend, or the target is the
+   nearest gate - those must act on a door beside this game's player character. 1 = asked */
+inline int DoorTestNearRadiusApplies(int op, int target)
+{
+    const int byDistance = (target == kDoorTestTgtNearest || target == kDoorTestTgtNext || target == kDoorTestTgtGate) ? 1 : 0;
+    return (byDistance != 0 && (op == kDoorTestOpBreak || op == kDoorTestOpMend || target == kDoorTestTgtGate)) ? 1 : 0;
+}
+/* break / mend run only where the mod's own noticing writes the door's record once: the door has a live row here (the noticing finds
+   the door by it), is no player's piece's, the engine routine is hooked (the hook is what notices the flip), the flip is still to make,
+   this game holds the door's area (only the holder writes a door record) and its record is laid here (a change before the lay is held).
+   Any other op: kDoorTestRecOk. hold: 1 this game, 0 another game or nobody, -1 not known. */
+const int kDoorTestRecOk = 0, kDoorTestRecNoRow = 1, kDoorTestRecPlayer = 2, kDoorTestRecNoRoad = 3, kDoorTestRecAlready = 4,
+          kDoorTestRecHolderUnknown = 5, kDoorTestRecNotHolder = 6, kDoorTestRecNotLaid = 7;
+inline int DoorTestRecRefusal(int op, int haveRow, int playerPiece, int roadReady, int broken, int hold, int laid)
+{
+    if (op != kDoorTestOpBreak && op != kDoorTestOpMend) return kDoorTestRecOk;
+    if (haveRow == 0) return kDoorTestRecNoRow;
+    if (playerPiece != 0) return kDoorTestRecPlayer;
+    if (roadReady == 0) return kDoorTestRecNoRoad;
+    if ((op == kDoorTestOpBreak && broken != 0) || (op == kDoorTestOpMend && broken == 0)) return kDoorTestRecAlready;
+    if (hold < 0) return kDoorTestRecHolderUnknown;
+    if (hold == 0) return kDoorTestRecNotHolder;
+    if (laid == 0) return kDoorTestRecNotLaid;
+    return kDoorTestRecOk;
+}
+inline const char* DoorTestRecWhy(int why)
+{
+    switch (why)
+    {
+    case kDoorTestRecOk: return "ok";
+    case kDoorTestRecNoRow: return "the door road has no live row for this door here, so nothing would notice its broken flag";
+    case kDoorTestRecPlayer: return "a player's piece's door (or its owner did not read): its facts are its piece record's and it has no door record (use buildtest hit)";
+    case kDoorTestRecNoRoad: return "the engine routine is not hooked here, or the door's vtable slot is not it, so the mod would not notice the flip";
+    case kDoorTestRecAlready: return "the door already reads that way (break: broken; mend: not broken)";
+    case kDoorTestRecHolderUnknown: return "the holder of the door's area is not known here yet";
+    case kDoorTestRecNotHolder: return "this game does not hold the door's area and only the area's holder writes a door record - run it on the holder's game";
+    case kDoorTestRecNotLaid: return "the door's record is not laid here yet (its area's records are not complete): the change would be held until the lay";
+    }
+    return "?";
 }
 }   /* namespace coopdoor */

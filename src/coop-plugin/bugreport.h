@@ -26,4 +26,10 @@ int BugReportTakesEscape();
 // told); a part joins the answer to this game's own ask. MAIN THREAD; touches no widget and no engine state.
 void BugReportLiveIn(unsigned int innerType, unsigned int originSlot, const char* data, size_t len);
 
+// TEST-ONLY (the command channel's `bugpack`): packs a bug report on a worker thread exactly as SEND packs one - every file it
+// would carry, cut to the same limit - but asks no nearby game, shows nothing and SENDS NOTHING; the worker writes one
+// [BUGREPORT] TEST PACK line naming every file in the zip with its sizes. 1 = started, 0 = one is still being made or no worker
+// thread. MAIN THREAD.
+int BugReportTestPack();
+
 }

@@ -60,6 +60,17 @@ inline int CapSlaveGate(bool isChain, bool ownerIsSlaver, int chained, int shack
     return kCapGateRefuse;
 }
 
+/* T-478: the surrender line's count of our own characters setChainedMode chained, each character ONCE - equipping the shackles
+   calls it a second time with an empty hand (d_5db2f0:55 - Read). uids[0..cap) holds the first cap distinct uids; a uid already
+   held, or 0, is not counted again. Returns the new count (past cap a repeat cannot be seen and counts again). */
+inline int CapChainCountAdd(unsigned int* uids, int n, int cap, unsigned int uid)
+{
+    if (uid == 0 || uids == 0) return n;
+    for (int i = 0; i < n && i < cap; ++i) if (uids[i] == uid) return n;
+    if (n >= 0 && n < cap) uids[n] = uid;
+    return n + 1;
+}
+
 /* P11 f6: the captor's send order - a before b in the order the records became ready (wrap-safe). */
 inline bool CapSeqBefore(long a, long b) { return (long)((unsigned long)a - (unsigned long)b) < 0; }
 /* Sorts idx[0..n) (with seq alongside) by seq, stable; 1 when the order changed. */

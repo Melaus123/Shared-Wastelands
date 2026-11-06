@@ -127,7 +127,14 @@ public:
         std::memset(s_, 0, sizeof(s_));
         for (int i = 0; i < kRing; ++i) s_[i].state = kFree;
         Restart(Now());
+        // PROBE-START: P223
+        p223On = false; p223N = 0; p223Lost = 0;
+        // PROBE-END: P223
     }
+    // PROBE-START: P223 - waits of 300 ms or more closed since the caller last emptied the list (the world server's links only). LOG ONLY.
+    enum { kP223Keep = 64 };
+    bool p223On; int p223N; long long p223Lost; Slow p223Slow[kP223Keep];
+    // PROBE-END: P223
     // A live message handed over at t0: its stamp (-1 = the ring is full; counted noSlot). ahead = bytes it waits behind.
     int Open(double t0, unsigned int type, unsigned int inner, long long ahead)
     {
@@ -285,6 +292,9 @@ private:
         if (ms > max_) max_ = ms;
         if (ms > kSlowMs) ++over_;
         Slow w; w.ms = ms; w.ahead = s_[i].ahead; w.seq = ++seq_; w.t0 = s_[i].t0; w.type = s_[i].type; w.inner = s_[i].inner;
+        // PROBE-START: P223 - a slow wait kept for the world server's P223 line (only where the caller turned it on; it empties the list after each walk)
+        if (p223On && ms >= 300) { if (p223N < kP223Keep) p223Slow[p223N++] = w; else ++p223Lost; }
+        // PROBE-END: P223
         if (ms >= kBigMs) { ++over500_; if (bigN_ < kKeepBig) big_[bigN_++] = w; }
         if (topN_ < kTopSlow || ms > top_[topN_ - 1].ms)
         {

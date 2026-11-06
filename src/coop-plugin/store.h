@@ -43,6 +43,9 @@ void StorePumpCapSet(int n);                 // TEST-ONLY (verb pumpcap): n > 0 
 // multiplayer world (SaveRedirectWanted). Every hand-save road asks this one function (store.cpp: the save funnel, the quickload
 // hook, the new-game pump refusal; ui.cpp: the pause menu greying). MAIN THREAD.
 bool HandSaveBlocked();
+// T-927: the game menu's show or hide has just run; `visible` is its panel read then (UiPauseMenuPanelVisible: 1 shown, anything
+// else taken as closed). Under Slowest wins, in a session, in a world, an open game menu is this player's pause vote. MAIN THREAD.
+void ClockGameMenuVisible(int visible);
 // review-session S6: the session peer's link went down. Logs what the store keeps and why; resets
 // nothing, because nothing it holds is a fact about the peer (see the definition).
 void StorePeerGone();
@@ -123,6 +126,8 @@ int PlatoonSessionMemberUids(void* platoon, unsigned int* out, int cap);   /* in
 int StorePlatoonMineMembers(void* platoon);   /* M7a3f4 item 1 [m7a3f4-sh0]: live members this game runs (retired-before-destroy rows too); -1 = unreadable */
 int StoreArHoldPeople(void* platoon);   /* T-1084 step 3: 1 = a save's group held pending (its area's records not all here yet) - its people are not adopted until it is settled; the first sight of a group loaded awake is decided here when the sweep sees it first. MAIN THREAD */
 int StoreIsWakeDup(void* platoon);   /* 1 = a save copy whose wake was refused beside this game's live copy of the squad (its people are not adopted; it is destroyed); MAIN THREAD */
+void StoreCtxSleptForget(void* platoon);   /* T-1229 fold 1: the platoon reused for the other game's live announcement - its last sleep's take-back answer (g_ctxSleptMine and the counts) no longer holds; MAIN THREAD */
+int StoreCtxSleptCounts(void* platoon, int* chars, int* known, int* mine);   /* T-1229: 1 = a context platoon whose last sleep here held a person this game runs (the wake rule's g_ctxSleptMine), with that sleep's member counts (0s if not kept); 0 = not; MAIN THREAD */
 int PlatoonHasSessionMembers(void* platoon);                          // section 13: 1 if any live member is a session uid
 int StoreIdOriginSlot(void* faction, const std::string& worldId, const void* skip, int* mySlot, int* numberBlock, int* why);   /* the squad's origin slot (squadorigin.h: its number's block, or for a save squad the game that runs it now; -1 = no answer); skip = a platoon not to read; *mySlot = this game's slot (-1 = no relay); *numberBlock = the number's own block; *why = the source that decided it (sqorigin::kBy...) */
 int StorePlatoonCopyOrigin(void* platoon, void* faction, const std::string& worldId);   /* sameidpair.h kCopyLive / kCopyFromRecord / kCopyFromSave: where this game's platoon of the squad came from. MAIN THREAD */
@@ -198,6 +203,8 @@ bool StoreProfilePickFromPanel(unsigned num);   /* PLAY: ProfilePick(num), the s
    the link's channel - true = reliable (channel 0), false = unreliable and unsequenced (channel 1, the latest-wins MOVE and
    STATE, exactly as on the session link); the world server forwards a LIVE with the reliability it arrived with. */
 bool StoreLiveReady();
+/* T-978 BUBBLE: 1 = the conversation window now open had its opening pause skipped (T-288's g_dlgPauseSuppressed). MAIN THREAD. */
+int StoreDlgPauseSkipped();
 bool StoreSendLive(unsigned int route, unsigned int target, unsigned int innerType, const std::vector<char>& inner, bool reliable);
 long StoreLiveGen();
 /* MAIN THREAD: what the link to the world server still holds undelivered (net::ITransport::SendQueued) - a bulk sender that
@@ -231,6 +238,9 @@ moneyw::Ledger* StoreMoneyLedger();
 int  StoreMoneyRead(int* money);
 int  StoreMoneyTake(int amount);
 int  StoreMoneyAdjust(int delta);
+// T-478 TEST-ONLY (the `money` lever): StoreMoneyPay - the game's own Ownerships::takeMoney with ANY amount (a negative amount is a
+// gift): 1 taken or given, 0 refused (short), -1 no purse or a fault. MAIN THREAD.
+int  StoreMoneyPay(int amount);
 bool StoreMoneyWriteNow(unsigned long long* seq);
 bool StoreMoneyOnDisk(unsigned long long seq);
 bool StoreSendMoney(unsigned type, const std::vector<char>& payload);
@@ -244,6 +254,8 @@ long long StoreMoneyBaseReads();
 bool StoreSendWorldRel(const std::vector<char>& payload);   /* par24: MAIN THREAD - an encoded WORLD_REL (SEED or CHANGE) to the notebook; false = the link is down */
 bool StoreSendTownVer(const std::vector<char>& b);   /* MAIN THREAD - an encoded TOWN_VER WRITE to the world server; false = the link is down */
 bool StoreTownVerLinkUp();                           /* MAIN THREAD - the world-server link is up and speaks this protocol */
+bool StoreSendCamp(const std::vector<char>& b);      /* T-929, MAIN THREAD - an encoded CAMP message to the world server; false = the link is down */
+bool StoreCampLinkUp();                              /* T-929, MAIN THREAD - the world-server link is up and speaks this protocol */
 bool StoreSendTownBar(const std::vector<char>& payload);   /* refill1: MAIN THREAD - encoded TOWN_BAR rows to the notebook; false = the link is down */
 bool StoreSendOwed(const std::vector<char>& payload);   /* T-581: MAIN THREAD - one encoded OWED up message (src/common/owedpop.h); false = the link is down */
 bool StoreSendTownLoss(const std::vector<char>& payload);   /* MAIN THREAD - one encoded TOWN_LOSS up message (REFILLED, src/common/townrefill.h); false = the link is down */
@@ -298,20 +310,25 @@ int  StorePlayerReachable(int slot);     // 1 = a send meant for that player (-1
 int  StoreArrivalRoundTarget(int to, int owedOrActive);   // whom a round owed for an arrival goes to: `to`, or -1 = every game (mparrive::RoundTarget)
 int StoreRefusedReason();                      // mp1, MAIN THREAD: why the notebook refuses this game (coopstore::StoreRefuseReason), -1 = not refused
 void SetHostPassword(const std::string& password);       // MAIN THREAD: the password this game hosts with ("" = none) - memory only, never logged
+bool HostPasswordBlank(const std::string& box);           // T-1255 (re-check #1): the PASSWORD box's text is no password once trimmed, as SetHostPassword takes it
 int  StoreHostHasPassword();                             // MAIN THREAD: 1 = SetHostPassword's password is not empty (whether, never what)
 void SetJoinPassword(const std::string& password);       // MAIN THREAD: the password for the current join ("" = none) - memory only, never logged; a password refusal's stop ends
-bool StoreWriteWorldAuth(const std::string& worldDir);   // MAIN THREAD, before the world server starts: auth.txt from SetHostPassword's password (removed for none)
+int StoreWorldPwHas(const std::string& worldDir);   // MAIN THREAD, T-1255 D (owner 1515): the world in worldDir has a world password of its own - 1 (its line, or a saved lock that applies), 0 none, -1 not known (rules.txt or auth.txt could not be read); reads both files - once per pick, never per frame
+bool StoreWriteWorldPassword(const std::string& worldDir, const std::string& worldName, bool writeWorld, const std::vector<std::pair<std::string, std::string> >& firstRows, bool keepTicked);   // MAIN THREAD, at HOST (T-1255 A, owner 1516 a: keepTicked = the KEEP RUNNING box at the press; ticked with an empty PASSWORD box the world keeps the world password it has, worldpw::HostWritesWorld): SetHostPassword's password after "world password =" (writeWorld) and, when that line is empty, a long random owner password after "owner password =" in the world's rules.txt (owner 1369 b / 1371); T-1202: firstRows = the host's GAME OPTIONS rows for a world's first start (rulesfile::FirstStartRows; empty = none), written in the same step
+bool StoreLoginPasswordForLink(std::string* out);   // MAIN THREAD: the owner or admin password this game logs in with by itself on this link (the host's owner password from rules.txt, else the one remembered for this world at this link's place - owner 1380 / 1379); false = none. Never logged.
+void StoreLoginPasswordRemember(const std::string& worldId, const std::string& password);   // MAIN THREAD: after a typed /login this world's server took as the owner or an admin, the password is remembered for that world at the place this link dialled (owner 1380). Never logged.
+bool StoreLoginPasswordForget(const std::string& worldId);   // MAIN THREAD: a remembered login the world server answered as a wrong password is forgotten for this link's place and that world (never on the host's game); true = it is gone. Never logged.
+int StoreDoorLoginSentThisLink();                  // MAIN THREAD: 1 = this link's door answer carried a login proof (the world server logs this game in at its admission when it is right)
 bool StoreNewHostToken(std::string* hex);                // MAIN THREAD, before the world server starts: this hosting's new secret, as hex for its --host-token - never logged
-bool StoreHostToken(unsigned char out[32]);              // MAIN THREAD: this hosting's secret (HOST_TOKEN / the bridge's STEAM_ID); false = this game started no world server
-// THE ADMIN ROAD (admin.cpp). StoreOwnerTokenThisLink: this game showed this hosting's secret (HOST_TOKEN) ahead of the HELLO of
-// the link that is up and welcomed now - the world server then counts it as the owner's own game, an admin with no password.
-// StoreSendAdmin: one ADMIN_LOGIN / ADMIN_REQ up (false = the link is down or not welcomed). StoreLinkWorldId: the world id
+bool StoreHostToken(unsigned char out[32]);              // MAIN THREAD: this hosting's secret (the Steam bridge shows it in each STEAM_ID); false = this game started no world server
+// THE ADMIN ROAD (admin.cpp). StoreSendAdmin: one ADMIN_LOGIN / ADMIN_REQ up (false = the link is down or not welcomed). StoreLinkWorldId: the world id
 // this link's WELCOME named ("" = none) - the admin proof is bound to it. MAIN THREAD.
-bool StoreOwnerTokenThisLink();
 bool StoreSendAdmin(unsigned type, const std::vector<char>& payload);
 std::string StoreLinkWorldId();
 std::string StoreAccessTest(const std::string& args);    // TEST-ONLY `accesstest`: the hosting game writes its world's access.txt
+std::string StoreNetThrottle(const std::string& word);   // T-1168 TEST-ONLY `netthrottle off|on`: this game's ENet links, and (hosting) netthrottle.request for its world server
 int  StoreMySlot();                                      // decision 32: my slot in the relay's order (-1 unknown)
+void OwnGiveSaveArm(const std::string& why);             // T-1135, MAIN THREAD: a character was given or received - the save after character creation's road is armed (it starts as soon as the leave save is wanted)
 void* StoreLookalikeEnsure(const std::string& copySid);  // T-1096 (owner 1234 e), MAIN THREAD: the look-alike record a copy id ('<original id>~i<slot>') names - found, or made from its original; 0 = none
 void* StoreLookalikeAtBuild(const std::string& copySid); // T-1096, MAIN THREAD: the look-alike a squad member's build needs (worldstate.cpp detour_loadInstance) - found, or made now; 0 = none
 void StoreLookalikeLeftOut(const char* copySid, void* activePlatoon);         // T-1096, ANY THREAD: a member of the build's group (its ActivePlatoon) on this look-alike was left out of its build (counted with its squad; its copy is made at the next tick)
@@ -386,8 +403,16 @@ std::string StoreTopDir();
    on this computer, its joined folder for a world joined - one per world; made by the record index read, EnsureStoreDirs); "" before a
    world is set */
 std::string StoreDataDir();
+/* T-1020 re-check (LOW 2), MAIN THREAD: StoreDataDir() is final for this link - the notebook's WELCOME set it (StoreArmWorldIndex("storeLink")
+   names the folder with the link's world id, then LoadIndex sets g_indexLoaded, never cleared; a later WELCOME does not move it). Before
+   that it is this computer's same-name folder, which a joining game must not write into (nor make). */
+bool StoreDataDirFinal();
 /* every missing folder level of d made (EnsureDir) */
 void StoreEnsureDir(const std::string& d);
+/* T-1020: the folder that will hold `file`, every missing level made (coopdir::EnsureFileDir on the real disk). 0 = there;
+   1 = could not be made, counted in *failed, log it now (first time for *said); 2 = could not be made, counted, already said.
+   *bad = the level that could not be made. */
+int StoreEnsureFileDir(const std::string& file, long long* failed, int* said, std::string* bad);
 /* MAIN THREAD (the title panel): a deleted world's saves on this computer, deleted for good - every save folder in Kenshi's
    save root whose key file carries worldId whatever world name it carries, or names worldName with no id (saves from before world
    ids; swdel::WorldDeleteFind) and
@@ -449,6 +474,11 @@ const char* BasePolicyNameOf(int v);
 // under `consensus`, and only from the host under `fixed`), not a local pause. false = NaN, negative or above
 // kClockSpeedMax.
 bool SpeedVoteCommand(float speed);
+// T-927 TEST-ONLY lever, MAIN THREAD: `buildmode enter` runs the main bar's BUILD button's own handler (row MainBarBuildButton),
+// `buildmode leave` the Esc key's build-mode cancel (row BuildModeCancel) - the engine's own roads to the two build-mode
+// togglePause calls. Logs `[TIME] T-927 TEST-ONLY buildmode ..` with the engine's build-mode flag before / after. false = refused,
+// faulted, or build mode did not change. Definition and the Read: store.cpp.
+bool BuildModeCommand(const std::string& args);
 // A test-only lever, MAIN THREAD: `gamespeed <x>` writes x straight into the engine's speed global as a speed mod
 // does (no button, key or setter call); *was = the value before. 0 written, -1 no speed global, -2 faulted.
 int GameSpeedTestWrite(float speed, float* was);
@@ -456,10 +486,13 @@ int GameSpeedTestWrite(float speed, float* was);
 int GameSpeedTestSweep(float from, float to, float step, unsigned int everyMs);
 // MAIN THREAD, from the clock tick: the sweep's next write, when it is due.
 void GameSpeedSweepTick();
-// E40 / decision 45, MAIN THREAD: "fixed", "consensus", or "unknown (no notebook clock yet)". The value is the
+// E40 / decision 45, MAIN THREAD: "fixed", "consensus", "vote", "locked", or "unknown (no notebook clock yet)". The value is the
 // mode byte carried in the notebook's CLOCK message, which the notebook derives from its own options.txt row -
 // one authority for the rule, never two that can disagree.
 const char* TimeModeName();
+// MAIN THREAD: the same rule in GAME OPTIONS' words ("Admin only", "Slowest wins", "Everyone agrees", "Normal speed only"); "" until
+// a CLOCK has said it. The PLAYERS tab's GAME SPEED line.
+std::string TimeModeWords();
 // MAIN THREAD: ask the notebook process to store an option. The relay accepts it only from the game it calls
 // the authority and broadcasts the stored map back to everyone; false here means only that it could not be
 // SENT (no relay link), never that it was refused - a refusal is the relay's to log and to not broadcast.
@@ -551,6 +584,10 @@ bool StoreOwnRestorePending();
 /* 1 = this world load's own pp.build rows were read and handed to the restore (own records on, the row record readable or absent); 0 =
    not (own records off, unreadable, refused, disarmed, an import). Meaningful once StoreOwnRestorePending() is false. MAIN THREAD. */
 int StoreOwnBuildRowsRead();
+/* T-1240: 1 = this world load's own-record restore was armed as a whole for "no-record" (coopown::kRsWhyAllNoRecord: the records
+   store has no record yet for this world and profile - at a load's overlay or at a reset world's import), read from the store's own
+   reason; 0 = any other load. Meaningful once StoreOwnRestorePending() is false. MAIN THREAD. */
+int StoreOwnRestoreNoRecord();
 /* T-546 step 6 (shared research; team.cpp, src/common/teamresearch.h). MAIN THREAD unless said.
    StoreResearchTakeOwnFinished: the techs (stringIDs) the Research::setResearched hook saw finished on this game since the last
    take - this game's own player's finishes - and how many were dropped past the list's cap.
@@ -581,6 +618,14 @@ int StoreResearchApply(const std::string& sid, bool asOwn, std::string* name, st
 bool StoreResearchOff();
 bool StoreResearchQueue(std::vector<std::pair<std::string, float> >* q, std::string* text, std::string* why);
 std::string StoreResearchQueueTech(const std::string& sid, std::string* name, std::string* detail);
+// T-1242 (src/common/bookshare.h): one RESEARCH_BOOK (an ASK from a teammate's game, its ANSWER, a GIVEBACK or DONE, an ACK), fromPeer =
+// the sender; StoreBookTick: a hold's end by time or by a holder that left, the owed GIVEBACK / DONE sent again (a WELCOME, a holder back
+// in the world). StoreBookTakeNeed: the engine's take 0x82DA30's need, lowered by the teammates' share while this game queues with their
+// Books (items.cpp detour_researchConsume). StoreBookWorldTeardown: this world's hold and holder records go (TeardownBroadcast). MAIN THREAD.
+void StoreBookNote(const char* p, size_t n, unsigned int fromPeer);
+void StoreBookTick();
+int StoreBookTakeNeed(void* data, int need);
+void StoreBookWorldTeardown();
 std::string StoreResearchNameOf(const std::string& sid);
 /* T-928: research progress shared with teammates. StoreResearchTakeWork: this game's own steps per topic (teamwire.h WORK:
    the progress each Research::addProgress call added to the front entry) and each topic's latest level (the front's progress
@@ -668,6 +713,8 @@ void StoreNoteRecordEngineTouchNoWorld(const char* what);
 int StoreQueueWrite(int family, const std::string& recordKey, const std::vector<char>& payload);
 bool StoreSendGroundRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-697 step 2, MAIN THREAD: the area holder's ground record as a RECORD at the area centre; false = no link (nothing queued) */
 bool StoreSendPieceRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* MAIN THREAD: a piece's record as a RECORD at the piece's position (the stamp sent, which RECORD_SEQ carries back); false = no link (nothing queued) */
+bool StoreSendDoorRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* MAIN THREAD: a world door's record (doors.cpp) as a RECORD at the door's position; false = no link (nothing queued) */
+bool StoreSendDoorGone(const std::string& id);   /* MAIN THREAD: a door record's removal (RECORD_GONE) - a ruined building's doors; false = not a door record id, or not sent */
 bool StoreSendBoxAsk(const std::vector<std::string>& ids);   /* MAIN THREAD: BOX_ASK (81) for the boxes whose writes the link lost; false = not sent */
 
 bool StoreSendBoxRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut = 0);   /* T-823, MAIN THREAD: a box writer's record as a RECORD at the box's position; false = no link (nothing queued); *stampOut = the stamp the world server's RECORD_SEQ echo carries back */

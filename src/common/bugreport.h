@@ -673,7 +673,9 @@ inline void JoinPack(const LogPack& p, size_t first, std::vector<unsigned char>*
    The result says, per part, how many leading segments go and whether the part goes whole; PartLeftOut says whether
    nothing of a part is left.
    ------------------------------------------------------------------------------------------------------------------ */
-enum { kOrderOlderLog = 0, kOrderPrevLog = 1, kOrderNearby = 2, kOrderServerLog = 3, kOrderThisLog = 4, kOrderCrash = 5, kOrderKeep = 9 };
+/* kOrderKeptCrash: a file of a launch that did not quit normally, kept in the mod's crashes folder (src/common/crashkeep.h) -
+   below every other order, so it is cut before any other part loses a byte, and SetBudgetFloors gives it no floor. */
+enum { kOrderKeptCrash = -1, kOrderOlderLog = 0, kOrderPrevLog = 1, kOrderNearby = 2, kOrderServerLog = 3, kOrderThisLog = 4, kOrderCrash = 5, kOrderKeep = 9 };
 /* The budget order of kept earlier launch `launch`'s log (1 = the previous launch, 2 = the one before it), given which of them
    the attached crash file ended (`crashLaunch` 1, 2, or 0 = none): the crashed launch's log is cut after the other one; with no
    crash, or a crash that ended launch 1, the log from two launches ago is cut first. */

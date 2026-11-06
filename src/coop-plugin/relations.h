@@ -37,6 +37,9 @@ int RelationsTheirSideRaw(::Faction* theirs, ::Faction* mine, float* v, unsigned
 // ANY THREAD: a count bumped each time a standing with this game's player faction on either side may have moved (a hooked
 // changer, a write from the wire, a put-back) - the PLAYERS tab rebuilds its rows when it moves.
 long long RelationsPlayerPairEpoch();
+// T-947 fold 1, MAIN THREAD: player `slot`'s own side towards this game's player was written from the wire (a snapshot, a live
+// change, a team write) in this world - cleared at world teardown (RelationsForgetQueue). Before it the standing is a save's.
+bool RelationsTheirSideIn(int slot);
 ::Faction* RelationsFactionFromWire(const std::string& sid);
 // MSG_CRIME kind 2. A by-event standing change this game's engine made on a world faction towards ANOTHER player's stand-in
 // (FactionRelations::affectRelations 0x6B29D0; this game still puts that pair back - it is the other player's) goes to that

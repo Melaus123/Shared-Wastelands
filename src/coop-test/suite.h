@@ -46,6 +46,7 @@
 #include "../common/squadevent.h"   /* T-1084: a world squad's events mark its record due on the heartbeat's early road - the same header the plugin compiles */
 #include "panelstatus.h" /* U2: every sentence the MULTIPLAYER panel's status area can say */
 #include "doorsync.h"  /* P8n: the door road's last-actor rule, terminal-state test and churn give-up */
+#include "doorrec.h"   /* a world door as one world-server record: its id, bytes and rules */
 #include "retirewithdraw.h"   /* P8m (H-ghost): the pending-withdraw set as pure transitions */
 #include "uidtable.h"         /* mirror1 (crash T487): the uid table's decisions */
 #include "uidslots.h"         /* the per-copy word tables' slot bookkeeping (medical.cpp: hunger, knocked out, dead) */
@@ -179,6 +180,7 @@
 #include "walkdrop.h"     /* T-609 part 2 (H4): a dismantled building leaves the memoised building list */
 #include "holdwire.h"     /* P105 build 2: HOLD / LAND - the trailers, the absorb rule, where a LAND goes, the answers */
 #include "ownpick.h"      /* P105: an own pickup out of a container this game writes - its removal published at once */
+#include "wanderspawn.h"  /* T-1235: the [SPAWN] wander line - distances to every player's characters, the cap */
 #include "rcgive.h"       /* T-1079: a give made without the cursor - the drain's pairing by record and units */
 #include "showmove.h"     /* T-164 non-shop road: the show-at-once decisions */
 #include "ownerwire.h"    /* inv6: the stolen mark as an identity - the OWN1 block, the journal b2 fields, the D5-2 choice */
@@ -189,6 +191,7 @@
 #include "savesquadforeign.h"   /* T-710: whose characters a save squad file holds; the fence for this game's own record */
 #include "ownrec.h"       /* mmo1: the own-squad record writer's names, index line, write decisions and pacing */
 #include "handrec.h"      /* T-889 step 2: the hand-over record pp.handover, its decisions and MSG_ITEM_HANDOVER */
+#include "hovground.h"    /* T-1039: which ground item a hand-over line may remove */
 #include "permdelete.h"   /* the permanent delete's path-inside check and which saves go */
 #include "copybody.h"     /* crash2: the animal copy body-rebuild skip rule */
 #include "kolook.h"       /* a copy met while its owner says knocked out is dressed before its knockdown */
@@ -199,6 +202,8 @@
 #include "squadwriter.h" /* T-1 B1: one writer per NPC squad - follow-leader, the receiver's squad-position take, copy-squad keep-awake */
 #include "squadwriterreg.h" /* T-1084 step 5: the world server's per-squad writer register */
 #include "townverwire.h" /* TOWN_VER: one town version per placed town, the revision rule, the key, owner decision 260 */
+#include "campwire.h" /* T-929: CAMP - the world's camp list */
+#include "campgame.h" /* T-929 part 1: the game's side of the camp list */
 #include "squadlead.h"   /* T-1 B1 restructure: MSG_SQUAD_LEAD wire and the book of the other game's announcements */
 #include "removalreason.h"   /* M7a3: the engine's removal reason - an unload is never sent as a death */
 /* T-1 B3 restructure (protocol 89): keeperwire.h retired - the squad's money is tested through squadlead.h */
@@ -221,6 +226,7 @@
 #include "bugreport.h"   /* T-461: REPORT A BUG - words, scrub, compressor, budget, zip, the nearby-log messages */
 #include "portraitdefer.h"   /* T-804: the dialogue window's portrait refresh, held off the AI thread */
 #include "dlgwinguard.h"     /* T-831: the dialogue window never calls through a removed character */
+#include "tradewinguard.h"   /* T-1230: the trade window never calls through a freed trader */
 #include "twinsleep.h"       /* T-761: a save-born non-player twin no game drives here - put to sleep or taken */
 #include "editorstate.h"     /* the editorstate verb's argument and the editor's per-recruit body test */
 #include "teamwire.h"   /* T-546 step 3: the player-faction membership table and TEAM (60) */
@@ -234,6 +240,7 @@
 #include "fallenwire.h"   /* T-556: the fallen list - snapshot byte form, list trimming, squad choice, road */
 #include "moneywire.h"   /* T-810: money between players - the wire, the pp.money record, the ledgers */
 #include "resurrectfee.h"   /* T-556: the resurrection fee and its host options */
+#include "optionvalue.h"   /* T-1202 fold: the world server's check of a rule row (store_main.cpp OptionValueOk's body) */
 #include "fallentab.h"   /* T-556: the FALLEN tab - its words and states */
 #include "relside.h"   /* T-563: the entry a faction-relations changer wrote */
 #include "titleart.h"   /* T-513: the mod's title art - the cover crop and the note's place on it */
@@ -428,6 +435,9 @@ void t_clock_shared_hours_interpolates_and_refuses_a_stale_reading();
 void t_clock_decide_dead_band_and_join_jump_precedence();
 void t_clock_forward_set_never_below_current();
 void t_clock_dialogue_pause_suppressed_in_a_session_only();
+void t_clock_menu_pause_by_mode_site_session();
+void t_clock_menu_pause_world_close_clears_marks();
+void t_clock_menu_pause_game_menu_follows_state();
 void t_clock_relink_no_jump();
 void t_clock_pull_converges();
 void t_worldgen_bump_once_per_load();
@@ -451,6 +461,7 @@ void t_p97_announce_nomap_refuses_every_slot();
 void t_cfg_write_round_trips_through_the_parser();
 void t_cfg_addr_rule();
 void t_cfg_panel_field_validators();
+void t_cfg_join_addr_port();   /* T-793 */
 void t_cfg_sanitise_typed();
 void t_cfg_incomplete_reason();
 void t_pp3_datadir_choose();
@@ -465,6 +476,7 @@ void t_pp3b_store_root_default();
 void t_pp3_player_cfg_round_trip();
 void t_pp3_cfg_datadir_key();
 void t_cfg_hosttoken_key();
+void t_cfg_ownerpw_key();
 void t_pp3_test_keys_layered();
 void t_cfg_roots_absent_is_unchanged();
 void t_cfg_roots_parse_refuse_and_round_trip();
@@ -648,6 +660,7 @@ void t_prof1_profiles();
 void t_names2a_faction_row();
 void t_h068_default_faction_numbers();
 void t_h069_freed_names_are_free();
+void t_t717_faction_reload();   /* T-717: a faction name on reload, cases A-D (pull request 4 task 2) */
 void t_t368_unique_names();
 void t_t368_format_owed_reply();
 void t_t368_names_all_typed();
@@ -730,7 +743,6 @@ void t_p87f1_tombstones();
 void t_par13_owed_remove();
 void t_house2_task_gate();
 void t_house2_late_place();
-void t_house2_owed_merge();
 void t_house2_place_nonce_wire();
 void t_build1d_remove_wire();
 void t_crime5_bounty_wire_and_additions();
@@ -758,6 +770,16 @@ void t_t737_talk_cursor_decisions_wire_and_rate();
 void t_t737f1_talk_cursor_ask_click_and_fresh_hover();
 void t_p25_talkwire_request_and_new_fields();
 void t_p25_intercept_request_order_and_local_windows();
+void t_t478_bail_end();   /* T-478 step 3 */
+void t_t478_surrender();   /* T-478 step 4 */
+void t_t478_sell();   /* T-478 step 5 */
+void t_t478_buy();    /* T-478 step 6 */
+void t_t1242_books_wire();   /* T-1242 */
+void t_t1242_books_plan();
+void t_t1242_books_hold();
+void t_t1242_books_holder();
+void t_t1242_books_owed();
+void t_t1242_books_wiring();
 void t_p25f2_click_event_and_not_started_why();
 void t_t719_copy_own_end_action_every_branch();
 void t_t726_talk_order_log_due_outcome_and_nth();
@@ -815,6 +837,7 @@ void t_inv5_ground_key_p1();
 void t_t497_ground_tell_except_requester();
 void t_t497_ground_recent_keys();
 void t_p2p3p4_ground_route();
+void t_t931_spill_wait();
 void t_inv5_ground_key();
 void t_carry_sums();
 void t_t832_item_tail();
@@ -852,6 +875,7 @@ void t_t802_real_squad_files();
 void t_mmo1c_compare_due();
 void t_mmo1_ownrec();
 void t_tickwait_dir_levels();
+void t_t1020_save_folder_every_level();   /* T-1020: a save's folder made, every level; a failure counted once */
 void t_orphan1_orphan_purge();
 void t_inv7a_standin_purge();
 void t_inv7a2_purge_triggers_and_id_carry();
@@ -1082,6 +1106,9 @@ void t_p105b3_split_count_publish();
 void t_p105b3_scenario_carries();
 void t_p105b3_split_drop_road();
 void t_p105b3_merged_give_split();
+void t_t1184_own_lift_in_air();
+void t_t1184_lift_holds_record();
+void t_t1184_edge_place_road();
 void t_t1079_units_moved();
 void t_t1079_applies();
 void t_t1079_give_whole_stack();
@@ -1102,6 +1129,10 @@ void t_t1079_net_split_take();
 void t_t1079_net_merge_give();
 void t_t1079_net_not_paired();
 void t_t1079_net_grouping();
+void t_t932_net_split_give();
+void t_t932_net_split_not();
+void t_t932_review_fold();
+void t_t932_recheck_fold();
 void t_t1079_net_job_role();
 void t_t1079_net_refusal_units();
 void t_p105b3_scenario_split_give();
@@ -1535,15 +1566,13 @@ void t_t595_stale_keep();
 void t_t595_fresh_sample();
 void t_t596_first_sighting();
 void t_t596_key_sector();
-void t_t596_sector_serve();
+void t_t1141_door_events();
 void t_t596_gen_forget();
 void t_t596_giveup_rearm();
 void t_t596_held_evict();
 void t_t596_reload_sequence();
 void t_t596_report_decision();
-void t_t596_catchup_serve();
 void t_t596_word_refind();
-void t_t596_serve_norow();
 void t_t596_word_line_budget();
 void t_t596_held_victim();
 void t_t593_position_key();
@@ -1635,6 +1664,7 @@ void t_t657_return_check();
 void t_t668_unload_route();
 void t_t607_cage_ask_step();
 void t_t607_prison_in_keeps_first_at();
+void t_t2051_cage_own_word_on_hand_over();
 void t_t724_bed_own_step();
 void t_t607_treat_ask_step();
 void t_t607_treat_confirmed_by();
@@ -1732,6 +1762,7 @@ void t809_lever_window_pick();
 void t1170_spawncontainer_word();
 void t809_editorstate();
 void t_t831_window_guard();
+void t_t1230_trade_window_guard();
 void t_t761_twin_sleep();
 void t642_deleted_mark_floor();
 void t642q_writer_lift_and_new_faction_block();
@@ -1763,6 +1794,9 @@ void t_t889_freeze();
 void t_t889_writer_hold();
 void t_t889_actions();
 void t_t889_file_cap();
+void t_t1181_unread_side();
+void t_t1181_handtest_lever();
+void t_t1181_busy_bound();
 void t_t889f1_holder_state();
 void t_t889f1_settle_retry();
 void t_t889f1_parks();
@@ -1774,6 +1808,7 @@ void t_t889f2_parked_consumed();
 void t_t889f3_char_id();
 void t_t889f3_placed();
 void t_t889f3_ground_order();
+void t_t1039_ground_exact_item();   /* T-1039: a ground hand-over line removes only its own item (hovground.h) */
 void t_t889f3_search_before_rebuild();
 void t_t889f4_late_take_line();
 void t_t889f4_holder_look();
@@ -1913,6 +1948,41 @@ void t_t943_npc_sites();
 void t_t943_npc_stub();
 void t_t943_npc_call();
 void t_t943_npc_list();
+void t_t947_base_colours();          /* T-947 */
+void t_t947_base_colour_sources();
+void t_t947_fold1();                 /* T-947 fold 1 */
+void t_t947_t1925_name();            /* T-947 T1925 fix 1 */
+
+void t_t858_paid_refund();   /* T-858: a paid conversation never takes the money and gives nothing */
+void t_t23_absent_owner_rules();   /* T-23 */
+void t_t23_wiring();   /* T-23 */
+void t_t1061_lock_record();   /* T-1061: a chest's lock on its box record */
+void t_t1061_lock_rules();
+void t_t1061_lock_msg();
+void t_t1061_wiring();
+void t_t23_review_fold();   /* T-23 review fold */
+void t_t23_review_fold5();   /* T-23 review fold 5 */
+void t_t23_help_fix();   /* T-23 fix (T1963) */
+void t_t23_review_help_retire();   /* T-23 review fold: the retire's work from the saved help, kept on a failed completion, counted once */
+void t_t858_end_paths();   /* T-858 fold (T1914): every end path sends END with the unrun list, also when the talker closed */
+void t_t1222_claim_skip();   /* T-1222: the job set-up's claim of a world node is skipped, nothing else */
+void t_t1222_gate_answers();   /* T-1222: a rock opens for anyone; machines under each base-access option as before */
+void t_t1222_wiring();   /* T-1222: the row, the detour's skip, the three gates */
+void t_t1222_left_open();   /* T-1222: a left click on a built rock the engine opened nothing for opens its window; nothing else does */
+void t_t1222_left_wiring();   /* T-1222: the two rows, the select virtual's hook, the order in the detour, the install, the report */
+void t_t1222_steal_take();   /* T-1222: a rock's window against this player's own is no theft; every other pair keeps its answer */
+void t_t1222_claimskip_lever();   /* T-1222 TEST-ONLY claimskip: the claim skip is bypassed only while the DEV switch is off */
+void t_t1222_steal_wiring();   /* T-1222: the stealing decision's world-node rule before the kit table's early return, its counter */
+void t_t1191_beside_spot();
+void t_t1191_bfac_text();
+void t_t1077_copy_may_ask();   /* T-1077: the hover's filter on another game's NPC - the copy's greeting list is not a refusal */
+void t_t1077_wiring();   /* T-1077: TcHover's copy filter, the NPC's game's full test, the preload and the show lever */
+void t_t1187_hold_end();   /* T-1187: the end waits for any held line (as TkHoldEndFor calls it); which held lines a lost answer or a run that did not happen lists as unrun */
+void t_t1235_wander_line();   /* T-1235: the [SPAWN] wander line's distances, cap and wandering-call test, and its wiring in towngen.cpp */
+void t_t1235_keepaway();   /* T-1235 (owner 1478 b): a new wandering group kept 1382.4 on the ground from every live player character and out of other players' bases; the stale snapshot refuses; its wiring */
+void t_t1240_cursor_commit();   /* T-1240: `buildtest cursor ... commit` - the commit word, the click's own refusal checks in its order (the engine's texts), the place-then-PlacementCommit wiring */
+void t_t1187_wiring();   /* T-1187: TkHoldEndFor's decision, the unrun list and cap drop through TalkHoldMayListUnrun, the fold-2 note, the held run's [TALK] line */
+void t_t1078_town_mismatch();   /* T-1078: the [BUILD] town mismatch decision, its link word, the session cap, once per piece per state; the line's sites in build.cpp */
 
 }   /* namespace suite */
 

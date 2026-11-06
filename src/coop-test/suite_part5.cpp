@@ -2067,6 +2067,22 @@ void t_a1b2f3_fold3()
     if (coopsquad::ContextSleepDrop(1, 0) != 1) Fail("H067 (T954 A 234.737): a player's emptied squad copy went to sleep and was kept - the engine wakes it every 5 s");
     if (coopsquad::ContextSleepDrop(1, 1) != 0) Fail("H067: a context platoon holding a person this game runs (a take-back) was removed");
     if (coopsquad::ContextSleepDrop(0, 0) != 0) Fail("H067: a squad that is not a context platoon was removed at its sleep");
+    /* T-1229 (run T1944 A 597.915): the adoption sweep's answer for a rebuilt body of a context platoon */
+    if (coopsquad::ContextSweepAdopt(0, 0, 0, 0, 0) != coopsquad::kCtxSweepGo) Fail("T-1229: a squad that is not a context platoon - the sweep's rules as before");
+    if (coopsquad::ContextSweepAdopt(1, 0, 5, 5, 0) != coopsquad::kCtxSweepRefuse) Fail("T-1229: a context platoon of another game's people - its rebuilt body adopted (a second copy)");
+    if (coopsquad::ContextSweepAdopt(1, 1, 5, 5, 5) != coopsquad::kCtxSweepTakeBack) Fail("T-1229 (T1944 A 371.546 known=5 mine=5): a taken-over group slept here holding only this game's people - its rebuilt people refused on return");
+    if (coopsquad::ContextSweepAdopt(1, 1, 5, 5, 1) != coopsquad::kCtxSweepRefuse) Fail("T-1229: a mixed sleep (one of this game's, four of another's) - every rebuilt body adopted, a second copy of the other game's people");
+    if (coopsquad::ContextSweepAdopt(1, 1, 5, 4, 4) != coopsquad::kCtxSweepRefuse) Fail("T-1229: a sleep with a member whose uid did not resolve - adopted as all this game's");
+    if (coopsquad::ContextSweepAdopt(1, 1, 0, 0, 0) != coopsquad::kCtxSweepRefuse) Fail("T-1229: no counts kept for the sleep - adopted");
+    if (coopsquad::ContextSweepAdopt(1, 0, 5, 5, 5) != coopsquad::kCtxSweepRefuse) Fail("T-1229: counts without the wake rule's held-mine fact - adopted");
+    /* a take-back at the sweep is always a platoon the wake rule lets wake and the sleep rule keeps */
+    for (int i = 0; i < 4; ++i)
+    {
+        const int heldMine = coopsquad::ContextSleepWrite(1, 0, sleeps[i][0], sleeps[i][1]) == coopsquad::kCtxSleepGoContextWithMine ? 1 : 0;
+        if (coopsquad::ContextSweepAdopt(1, heldMine, sleeps[i][0], sleeps[i][0], sleeps[i][1]) == coopsquad::kCtxSweepTakeBack
+            && (coopsquad::ContextWake(1, heldMine, 1) != coopsquad::kCtxWakeGo || coopsquad::ContextSleepDrop(1, heldMine) != 0))
+            Fail("T-1229: the sweep takes back a context platoon the wake rule refuses or the sleep removes");
+    }
     using namespace coopsquad;
     if (ContextDropStep(0, 0, 1, 0, 1, 0) != kCtxDropCancel) Fail("H067: a platoon no longer in the context map (superseded, retired, hired from) was removed");
     if (ContextDropStep(1, 1, 1, 0, 1, 0) != kCtxDropCancel) Fail("H067: a context platoon whose last sleep held a person this game runs was removed");
@@ -6772,7 +6788,10 @@ void t_t556_fee_options()
     if (kDefaultGrowth != kGrowthSteep || kDefaultAmount != 1000) Fail("the defaults: steep, 1000");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp"), rs = T313ReadFile("../coop-plugin/resurrect.cpp");
     if (plugin.empty() || server.empty() || rs.empty()) { Fail("could not read store.cpp, store_main.cpp or resurrect.cpp"); return; }
-    if (server.find("if (swfee::IsOptionKey(key)) return swfee::OptionValueOk(key, value);") == std::string::npos) Fail("the world server's OptionValueOk does not accept the resurrection keys");
+    const std::string ov = T313ReadFile("../common/optionvalue.h");   /* T-1202 fold: OptionValueOk's body is the shared check */
+    if (ov.find("if (swfee::IsOptionKey(key)) return swfee::OptionValueOk(key, value);") == std::string::npos || server.find("return worldopt::ValueOk(key, value);") == std::string::npos
+        || !worldopt::ValueOk("resurrect", "on") || !worldopt::ValueOk("resurrectfee", "250") || worldopt::ValueOk("resurrectgrowth", "flat"))
+        Fail("the world server's OptionValueOk does not accept the resurrection keys");
     if (plugin.find("if (coop::ResurrectOption(ok2, ov)) continue;") == std::string::npos || plugin.find("coop::ResurrectOptionsMapEnd(gpComplete && !rcRefusal);") == std::string::npos)
         Fail("the game's OPTIONS drain does not hand the resurrection keys to resurrect.cpp");
     if (rs.find("int g_optOn = 0,") == std::string::npos) Fail("resurrection is not off until the host's map says on");

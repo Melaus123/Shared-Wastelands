@@ -10,11 +10,20 @@
        proof = HMAC-SHA256(key, nonce || kProofLabel)
    The nonce is new for every connection, so a proof seen on one connection is worth nothing on another. The proof is compared in
    constant time.
+   THE OWNER AND THE ADMINS AT THE DOOR (owner 1369 b / 1379 / 1380): when the world's rules.txt holds an owner or an admin password,
+   the challenge is sent even to a world with no world password, and it also carries the login keys' salt and rounds (the owner and
+   admin keys share them, worldpw.h) and the world's id. A game that knows a login password for that world (the host's game the
+   owner password from rules.txt; any game the one its last owner or admin /login succeeded with on a link to the same place, LoginFind) adds a login proof:
+       login key   = the admin road's key (adminauth.h DeriveKey with that salt and those rounds)
+       login proof = HMAC-SHA256(login key, nonce || kLoginDoorLabel)
+   The server checks it against the owner key, then the admin key. A right owner proof is the owner's own game: no world password,
+   access.txt, bans.txt or unreadable file keeps it out (DoorJudge). A right admin proof keeps every door check; it logs a listed
+   admin in at its admission. A changed password simply fails the proof.
    THIS HOSTING'S SECRET (the token): 32 random bytes the host's game makes each time it starts its world server and passes on that
-   server's command line; neither side ever logs it. The host's own game shows it in HOST_TOKEN ahead of its HELLO (that connection
-   is the world's owner), and the host's Steam bridge in each STEAM_ID, which tells the world server which Steam-checked account a
-   bridged connection is. Where a connection comes from proves nothing (a port forwarder on the host's PC makes any outside player
-   look local); the token does (accessrule.h decides what is believed). */
+   server's command line; neither side ever logs it. The host's Steam bridge shows it in each STEAM_ID, which tells the world server
+   which Steam-checked account a bridged connection is. It proves nothing about any game: the owner is proven by the owner password
+   alone. Where a connection comes from proves nothing either (a port forwarder on the host's PC makes any outside player look
+   local); accessrule.h decides what is believed. */
 #ifndef SW_AUTHPROOF_H
 #define SW_AUTHPROOF_H
 
@@ -25,12 +34,13 @@
 
 namespace authproof {
 
-/* ---- the four messages (world-server protocol 92; store_main.cpp and store.cpp check these numbers at compile time) ---- */
-const unsigned int kMsgAuthChallenge = 65;   /* server -> game: nonce (16) | salt (16) - 32 bytes */
-const unsigned int kMsgAuthProof     = 66;   /* game -> server: proof (32) */
+/* ---- the three messages (world-server protocol 92; store_main.cpp and store.cpp check these numbers at compile time) ---- */
+const unsigned int kMsgAuthChallenge = 65;   /* server -> game: nonce (16) | world salt (16) | u8 asks | login salt (16) | u32 login rounds | u8 world id length | world id */
+const unsigned int kMsgAuthProof     = 66;   /* game -> server: u8 has | world proof (32) | login proof (32) - 65 bytes */
 const unsigned int kMsgSteamId       = 67;   /* host's bridge -> server: token (32) | u64 Steam id, little-endian (8) - 40 bytes; id 0 = a bridged link whose id Steam did not check */
-const unsigned int kMsgHostToken     = 68;   /* host's own game -> server, ahead of its HELLO: token (32) */
-const unsigned int kProtocol         = 133;   /* the world-server protocol that carries the four */
+/* 68 is unused: HOST_TOKEN, the host's own game's door pass by this hosting's secret, was removed in T-1158 step 7b (owner 1369 b) */
+const unsigned int kProtocol         = 145;   /* the world-server protocol that carries the three */
+
 
 
 
@@ -39,10 +49,16 @@ const unsigned int kProtocol         = 133;   /* the world-server protocol that 
 
 const size_t kSaltBytes = 16, kNonceBytes = 16, kKeyBytes = 32, kProofBytes = 32;
 const size_t kTokenBytes = 32;              /* this hosting's secret */
-const size_t kChallengeBytes = kNonceBytes + kSaltBytes, kSteamIdBytes = kTokenBytes + 8, kHostTokenBytes = kTokenBytes;
+const size_t kSteamIdBytes = kTokenBytes + 8;
+const size_t kChallengeFixed = kNonceBytes + kSaltBytes + 1 + kSaltBytes + 4 + 1;   /* everything but the world id */
+const size_t kDoorProofBytes = 1 + kProofBytes + kProofBytes;
+const size_t kWorldIdMax = 255;
+enum { kAskWorld = 1, kAskLogin = 2 };   /* a challenge's asks: the world password; the owner or an admin password */
+enum { kHasWorld = 1, kHasLogin = 2 };   /* a proof's parts */
 const unsigned int kIterations = 10000;
 const unsigned int kAuthFormat = 1;          /* auth.txt's format number */
 static const char kProofLabel[] = "SW-AUTH-1";
+static const char kLoginDoorLabel[] = "SW-LOGIN-DOOR-1";
 static const char kAuthFile[] = "auth.txt";
 
 /* ---- SHA-256 (FIPS 180-4) ---- */
@@ -217,18 +233,73 @@ inline bool ProofMatches(const unsigned char key[kKeyBytes], const unsigned char
     return SameBytes(want, proof, kProofBytes);
 }
 
-/* ---- the AUTH_CHALLENGE payload ---- */
-inline void ChallengeEncode(const unsigned char nonce[kNonceBytes], const unsigned char salt[kSaltBytes], std::vector<char>* out)
+/* the login proof at the door: an owner or admin key (the admin road's, made with the challenge's login salt and rounds) over the nonce */
+inline void LoginDoorProof(const unsigned char key[kKeyBytes], const unsigned char nonce[kNonceBytes], unsigned char proof[kProofBytes])
 {
-    out->assign((const char*)nonce, (const char*)nonce + kNonceBytes);
-    out->insert(out->end(), (const char*)salt, (const char*)salt + kSaltBytes);
+    HmacKey hk;
+    HmacPrepare(&hk, key, kKeyBytes);
+    HmacWith(hk, nonce, kNonceBytes, kLoginDoorLabel, sizeof(kLoginDoorLabel) - 1, proof);
+}
+inline bool LoginDoorProofMatches(const unsigned char key[kKeyBytes], const unsigned char nonce[kNonceBytes], const unsigned char proof[kProofBytes])
+{
+    unsigned char want[kProofBytes];
+    LoginDoorProof(key, nonce, want);
+    return SameBytes(want, proof, kProofBytes);
 }
 
-inline bool ChallengeDecode(const std::vector<char>& p, unsigned char nonce[kNonceBytes], unsigned char salt[kSaltBytes])
+/* ---- the AUTH_CHALLENGE payload ---- */
+struct Challenge
 {
-    if (p.size() != kChallengeBytes) return false;
-    std::memcpy(nonce, &p[0], kNonceBytes);
-    std::memcpy(salt, &p[kNonceBytes], kSaltBytes);
+    unsigned char nonce[kNonceBytes];
+    unsigned char salt[kSaltBytes];        /* the world password's salt (zeros when it is not asked) */
+    unsigned asks;                         /* kAskWorld | kAskLogin */
+    unsigned char ownerSalt[kSaltBytes];   /* the login keys' salt and rounds (zeros when no login is asked) */
+    unsigned ownerRounds;
+    std::string worldId;                   /* the world's id: a remembered login is shown only when it and the place dialled both match (LoginFind) */
+    Challenge() : asks(0), ownerRounds(0) { std::memset(nonce, 0, sizeof nonce); std::memset(salt, 0, sizeof salt); std::memset(ownerSalt, 0, sizeof ownerSalt); }
+};
+inline void ChallengeEncode(const Challenge& c, std::vector<char>* out)
+{
+    out->assign((const char*)c.nonce, (const char*)c.nonce + kNonceBytes);
+    out->insert(out->end(), (const char*)c.salt, (const char*)c.salt + kSaltBytes);
+    out->push_back((char)(unsigned char)(c.asks & 3u));
+    out->insert(out->end(), (const char*)c.ownerSalt, (const char*)c.ownerSalt + kSaltBytes);
+    for (size_t i = 0; i < 4; ++i) out->push_back((char)(unsigned char)(c.ownerRounds >> (8 * i)));
+    const size_t n = c.worldId.size() > kWorldIdMax ? kWorldIdMax : c.worldId.size();
+    out->push_back((char)(unsigned char)n);
+    out->insert(out->end(), c.worldId.begin(), c.worldId.begin() + (std::ptrdiff_t)n);
+}
+inline bool ChallengeDecode(const std::vector<char>& p, Challenge* c)
+{
+    if (p.size() < kChallengeFixed) return false;
+    size_t at = 0;
+    std::memcpy(c->nonce, &p[at], kNonceBytes); at += kNonceBytes;
+    std::memcpy(c->salt, &p[at], kSaltBytes); at += kSaltBytes;
+    c->asks = (unsigned char)p[at++];
+    if ((c->asks & ~3u) != 0) return false;
+    std::memcpy(c->ownerSalt, &p[at], kSaltBytes); at += kSaltBytes;
+    c->ownerRounds = 0;
+    for (size_t i = 0; i < 4; ++i) c->ownerRounds |= (unsigned)(unsigned char)p[at + i] << (8 * i);
+    at += 4;
+    const size_t n = (unsigned char)p[at++];
+    if (p.size() != at + n) return false;
+    c->worldId.assign(p.begin() + (std::ptrdiff_t)at, p.end());
+    return true;
+}
+
+/* ---- the AUTH_PROOF payload: u8 has | world proof (32) | login proof (32); a part not given is zeros ---- */
+inline void DoorProofEncode(unsigned has, const unsigned char world[kProofBytes], const unsigned char owner[kProofBytes], std::vector<char>* out)
+{
+    out->assign(1, (char)(unsigned char)(has & 3u));
+    for (size_t i = 0; i < kProofBytes; ++i) out->push_back((has & kHasWorld) ? (char)world[i] : (char)0);
+    for (size_t i = 0; i < kProofBytes; ++i) out->push_back((has & kHasLogin) ? (char)owner[i] : (char)0);
+}
+inline bool DoorProofDecode(const std::vector<char>& p, unsigned* has, unsigned char world[kProofBytes], unsigned char owner[kProofBytes])
+{
+    if (p.size() != kDoorProofBytes || ((unsigned char)p[0] & ~3u) != 0) return false;
+    *has = (unsigned char)p[0];
+    std::memcpy(world, &p[1], kProofBytes);
+    std::memcpy(owner, &p[1 + kProofBytes], kProofBytes);
     return true;
 }
 
@@ -246,19 +317,6 @@ inline bool SteamIdDecode(const std::vector<char>& p, unsigned char token[kToken
     unsigned long long v = 0;
     for (size_t i = 0; i < 8; ++i) v |= (unsigned long long)(unsigned char)p[kTokenBytes + i] << (8 * i);
     *id = v;
-    return true;
-}
-
-/* ---- the HOST_TOKEN payload: token (32) ---- */
-inline void HostTokenEncode(const unsigned char token[kTokenBytes], std::vector<char>* out)
-{
-    out->assign((const char*)token, (const char*)token + kTokenBytes);
-}
-
-inline bool HostTokenDecode(const std::vector<char>& p, unsigned char token[kTokenBytes])
-{
-    if (p.size() != kHostTokenBytes) return false;
-    std::memcpy(token, &p[0], kTokenBytes);
     return true;
 }
 
@@ -332,6 +390,109 @@ inline int AuthTextParse(const std::string& text, unsigned char salt[kSaltBytes]
     if (badLines != 0) *badLines = bad;
     if (bad > 0) return kAuthBad;
     return found ? kAuthKey : kAuthNone;
+}
+
+/* THE DOOR'S VERDICT on a connection's proof (pure; store_main.cpp OnAuthProof). The owner password first: a right owner proof is the
+   owner's own game - in, whatever the world password, access.txt or bans.txt say or whether they can be read - unless the login
+   road's wait for this connection's address is running (ownerLocked: the login proof is then not looked at). Anyone else is judged on the
+   world password (worldState: kAuthNone / kAuthKey / kAuthBad = not known, rules.txt unread): none = in (access.txt and bans.txt
+   still apply, DoorListsApply); this connection's wait running = locked; not known = refused; no world proof = it needs one; else
+   right or wrong. */
+enum DoorVerdict { kDoorOwner = 0, kDoorIn = 1, kDoorLocked = 2, kDoorBadFile = 3, kDoorNeeded = 4, kDoorWrong = 5 };
+inline int DoorJudge(bool ownerAsked, bool ownerGiven, bool ownerLocked, bool ownerMatch, int worldState, bool worldGiven, bool worldLocked, bool worldMatch)
+{
+    if (ownerAsked && ownerGiven && !ownerLocked && ownerMatch) return kDoorOwner;
+    if (worldState == kAuthNone) return kDoorIn;
+    if (worldLocked) return kDoorLocked;
+    if (worldState != kAuthKey) return kDoorBadFile;
+    if (!worldGiven) return kDoorNeeded;
+    return worldMatch ? kDoorIn : kDoorWrong;
+}
+/* a login proof that is neither the owner's nor an admin's counts toward the login road's wait (the one /login keeps for the address) */
+inline bool LoginTryWrong(bool loginAsked, bool loginGiven, bool loginLocked, bool anyMatch) { return loginAsked && loginGiven && !loginLocked && !anyMatch; }
+/* access.txt and bans.txt apply to every connection but one that proved the owner password at its door: a ban on the owner's player
+   id keeps out anyone else carrying it, never the owner's own proven game */
+inline bool DoorListsApply(bool ownerProven) { return !ownerProven; }
+/* what the challenge asks for: the world password when it is set or not known yet, a login when the owner or the admin password is
+   set; 0 = no challenge (every line empty: nobody is the owner or an admin and nobody needs a password) */
+inline unsigned DoorAsks(int worldState, bool loginSet) { return (worldState != kAuthNone ? (unsigned)kAskWorld : 0u) | (loginSet ? (unsigned)kAskLogin : 0u); }
+
+/* ---- THE LOGIN PASSWORDS A GAME REMEMBERS (login-passwords.txt beside the plugin; store.cpp StoreLoginRemembered) ----
+   One line per place and world: "<place>\t<world id>\t<password>". The place is where the game dialled (LoginPlace): the address and
+   port it was given for an address join, "steam:<the host's Steam id>" and port for a Steam join (Valve's relay connects to that
+   account alone) - never anything a world server says. A remembered password is shown only on a link to the same place whose
+   challenge names the same world id, so a server elsewhere that names this world's id (every challenge shows it) gets no proof to
+   pass on and none to guess the password from. A line of any other shape is never shown and is dropped at the next write. */
+inline void WipeText(std::string* s)
+{
+    volatile char* p = s->empty() ? 0 : &(*s)[0];
+    for (size_t i = 0; i < s->size(); ++i) p[i] = 0;
+    s->clear();
+}
+inline std::string LoginPlace(const std::string& address, unsigned port)
+{
+    if (address.empty() || port == 0 || address.find_first_of("\t\r\n") != std::string::npos) return std::string();
+    char d[12]; size_t n = 0;
+    for (unsigned v = port; v != 0; v /= 10) d[n++] = (char)('0' + v % 10);
+    std::string out = address + ":";
+    while (n > 0) out += d[--n];
+    return out;
+}
+/* the place a remembered login is looked up under (T-1158, T1870): "" with no connection; before this connection's WELCOME - the
+   world server's door, which asks before it - the place this game dialled (`dialAddr`, `dialPort`, as SetStoreServer was given them);
+   after the WELCOME the link's place (`linkPlace`, "" while the link is not a link: another world, another protocol) */
+inline std::string LoginLookupPlace(bool connected, bool welcomed, const std::string& dialAddr, unsigned dialPort, const std::string& linkPlace)
+{
+    if (!connected) return std::string();
+    return welcomed ? linkPlace : LoginPlace(dialAddr, dialPort);
+}
+/* one remembered line: false = not three tab-separated fields with the place and the world given */
+inline bool LoginLineSplit(const std::string& line, std::string* place, std::string* world, std::string* password)
+{
+    const size_t a = line.find('\t');
+    if (a == std::string::npos || a == 0) return false;
+    const size_t b = line.find('\t', a + 1);
+    if (b == std::string::npos || b == a + 1) return false;
+    *place = line.substr(0, a); *world = line.substr(a + 1, b - a - 1); *password = line.substr(b + 1);
+    return true;
+}
+/* the next line of `text` from *at, its \r dropped; false = none left */
+inline bool LoginNextLine(const std::string& text, size_t* at, std::string* line)
+{
+    if (*at >= text.size()) return false;
+    size_t nl = text.find('\n', *at);
+    if (nl == std::string::npos) nl = text.size();
+    *line = text.substr(*at, nl - *at); *at = nl + 1;
+    if (!line->empty() && (*line)[line->size() - 1] == '\r') line->erase(line->size() - 1);
+    return true;
+}
+/* the password remembered for `place` and `world` in the file's text; "" = none (either is empty, or no line names both) */
+inline std::string LoginFind(const std::string& text, const std::string& place, const std::string& world)
+{
+    std::string found, line, p, w, pw;
+    if (place.empty() || world.empty()) return found;
+    size_t at = 0;
+    while (LoginNextLine(text, &at, &line))
+    {
+        if (LoginLineSplit(line, &p, &w, &pw) && p == place && w == world && !pw.empty()) { WipeText(&found); found = pw; }
+        WipeText(&line); WipeText(&pw);
+    }
+    return found;
+}
+/* the file's text with the line for `place` and `world` replaced by one with `password` (an empty `password` forgets it); every
+   other well-formed line kept as it was. An empty place or world changes nothing. */
+inline std::string LoginPut(const std::string& text, const std::string& place, const std::string& world, const std::string& password)
+{
+    if (place.empty() || world.empty()) return text;
+    std::string out, line, p, w, pw;
+    size_t at = 0;
+    while (LoginNextLine(text, &at, &line))
+    {
+        if (LoginLineSplit(line, &p, &w, &pw) && !(p == place && w == world)) { out += line; out += "\r\n"; }
+        WipeText(&line); WipeText(&pw);
+    }
+    if (!password.empty()) { out += place; out += '\t'; out += world; out += '\t'; out += password; out += "\r\n"; }
+    return out;
 }
 
 }   /* namespace authproof */

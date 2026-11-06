@@ -57,6 +57,8 @@ bool NameSetOwn(::Character* c, const std::string& name);
 // T-1153 TEST-ONLY levers: the first character of the player's selection (0 = none / no world / a fault), and `renametest <name> [uid]`
 // - the loaded character <uid> or, with none, that character, when it is this game's own, renamed through NameSetOwn ("ok renametest uid=.. name=.. was=.." or "error ..."). MAIN THREAD.
 void* FirstSelectedCharacter();
+// T-1135: the characters of the player's selection (the same read), up to cap, into out; -1 = no world or a read faulted. MAIN THREAD.
+int SelectedCharacters(void** out, int cap);
 std::string RenameTestCommand(const std::string& arg);
 // P11: what `tasks <uid>` prints, handed back - the adopted goal and hasPendingOrders (-1 = unreadable). False = not readable here.
 bool TaskGoalOf(unsigned int uid, std::string* goal, int* hasPendingOrders);
@@ -118,7 +120,7 @@ int  CreateLastRefusal();
 bool SendContextFor(unsigned int uid, ::Character* c);
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth, unsigned int peerOriginWire);   // + where the sender's copy came from (sameidpair.h WireOfOrigin, 0xFFFFFFFF unknown); + the squad's birth flag (squadbirth.h, -1 unknown). P1: + the sender's platoon id; + the age of the sender's current world load in ms (squadorigin.h kLoadAgeUnknown unknown); + the sending game's seat (-1 unknown)
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth, unsigned int peerOriginWire, const std::string& campKey);   // + the home camp's world camp list key (T-929 part 6, "" none); + where the sender's copy came from (sameidpair.h WireOfOrigin, 0xFFFFFFFF unknown); + the squad's birth flag (squadbirth.h, -1 unknown). P1: + the sender's platoon id; + the age of the sender's current world load in ms (squadorigin.h kLoadAgeUnknown unknown); + the sending game's seat (-1 unknown)
 // M-B / H026 - `context on|off`, DEFAULT OFF: when on, a SPAWN whose CONTEXT arrived first creates the copy the way
 // the engine creates a town NPC (npc-context.md section 6): a platoon from the same squad template, the same
 // SquadType, home town and home building, the copy created INTO that platoon with that home, then the same
@@ -347,6 +349,8 @@ bool KnownUidRetired(unsigned int uid);
 long long LostUidOverflowCount();   // F342: the lost-uid ring dropped this many, 0 = it did not
 
 int  MirrorCapacity();
+// T-1125, MAIN THREAD (FarmTick, every 500 ms inside): the [CAGED] in / out / building gone lines - reads only
+void CageOccupantWatch();
 int  MirrorUsed();
 // mirror1 (crash T487): release every row whose identity is finished (`destroyed`), forgetting its
 // uid's map entry and puppet without a dereference. MAIN THREAD, never inside a walk of the puppet
@@ -427,6 +431,11 @@ void ReportTask(unsigned int uid);
 // MAIN THREAD (levers): " orders[queued,pending]=q,p jobSwitch=0|1 standingJobs=n standingTaskTypes=.." - the order system's three lists
 // and its job switch (+0x35), read in place.
 std::string OrderListWords(::Character* c);
+/* T-1212: its three counts - the order queue, the pending orders, the standing jobs. 1 read, 0 not. MAIN THREAD. */
+int OrderListCounts(::Character* c, long long* queued, int* pending, int* standing);
+/* T-932 (items.cpp): the job the TEST-ONLY `jobtest work` lever last gave this character - " jobTarget='<building key>' at=x,y,z
+   dist=<n>" from (x,y,z), or empty when the lever gave it none. Names the haul target on the tasks line. */
+std::string JobTargetWords(unsigned int uid, double x, double y, double z);
 
 // PROBE P009 (diagnostic only, H006): print a character's embedded `hand` - the engine's
 // own toString/bool/explainState - for a spawned uid and for the captured player
@@ -490,9 +499,12 @@ std::string CarryTestCommand(const std::string& arg);
 /* TEST-ONLY lever: `bedtest <carrierUid> <bodyUid | name <name>> [bedKeySubstring] [type=<n>]` - this game's own carrier is given
    the engine's put-in-bed order on the nearest free bed; `bedtest list [radius] [nearUid]` reads the beds nearby. MAIN THREAD. */
 std::string BedTestCommand(const std::string& arg);
-/* P43 TEST LEVER `cagetest <copyUid> nearest`: this game's engine cages the other game's character's copy in the nearest free cage
-   (setPrisonMode at the K2 safe point, as a guard's task does); PrisonWatchCopies then tells the owner. [ARREST] cagetest lines. */
+/* P43 TEST LEVER `cagetest <copyUid> nearest [faction=<name>] [hours=<n>]`: this game's engine cages the other game's character's copy in
+   the nearest free cage (of that faction - the jailing faction is the cage's; T-478) (setPrisonMode at the K2 safe point, as a guard's
+   task does) and starts its sentence (notifyStartPrisonSentence, then n game hours, default 24); PrisonWatchCopies then tells the
+   owner. [ARREST] cagetest lines. */
 std::string CageTestCommand(const std::string& arg);
+std::string CageOrderTestCommand(const std::string& arg);   /* T-980 `capturetest cage ...` (TEST-ONLY): the carrier's put-in-cage order */
 /* TEST LEVER `treattest <copyUid> <part|all> <bandage 0..1>`: raises the other game's character's copy's bandage values at the K2 safe
    point as a medic's work does; TreatTick then sends MSG_TREAT to the owner. [HEAL] treattest lines. */
 std::string TreatTestCommand(const std::string& arg);
@@ -503,6 +515,34 @@ std::string KitGiveCommand(const std::string& arg);
    point (setSlaveState 0 inside the bail context, clearBounty with no faction, the walk-out order 0x85; no money taken), then the
    owner is told as after a real bail. [PRISON] bailtest lines. MAIN THREAD. */
 std::string BailTestCommand(const std::string& arg);
+/* T-478 step 3 review fold (manager 2026-11-03): would a bail paid HERE free this prisoner (prisonwire.h BailRowFreeable)? And,
+   before this game's bail window opens, the caged copies of other games' characters near (x, z) - *found, returned: those that
+   fail it, *first the first one. MAIN THREAD. */
+bool BailRowFreeableHere(unsigned int uid);
+int BailRowsLeftOutNear(float x, float z, int* found, unsigned int* first);
+/* T-478 step 5: the selling window this game opens for a slaver another game runs (speech.cpp TkSellOpenLocal). MAIN THREAD.
+   SellConfirmHookState: the selling confirm's hook (1 armed). SellRowsNotOwnNear: this game's own character's squad members within
+   cooptalk::kTalkSellRowNearUnits (x, z) of the slaver - this game's own ones go to listed[] (*nListed, at most cap); returned:
+   how many are not (another game's copy, or no uid), *firstOut the first one's uid; -1 the squad does not read. SellWindowArm:
+   before the case runs - the slaver copy's address and uid, the seller and the own rows listed; the confirm runs only for that
+   buyer while the copy is live and the session up (spawn.cpp detour_sellConfirm). SellWindowDisarm: the case did not run.
+   SellWindowBind (review fold 2026-11-04): right after the case opened the window - binds the note to the engine's current trading
+   window and its handler; returned cooptalk::TalkSellBindOutcome - TIED 1, NO WINDOW 0 (the note is cleared), UNTIED 2 (the note is
+   kept refusing every confirm of that window; no fall-back to the buyer's address, re-check fold) - the caller refuses the open
+   unless TIED; the note is cleared when that window ends without a sale (SlaveTick, one [TALK] line). SellConfirmHookState: -3 = the
+   hook is armed but the address table has no TradingWindowCurrent row (the window's end could not be seen); -4 = that row's global
+   does not read (re-check fold). */
+const int kSellRowsCap = 64;
+int SellConfirmHookState();
+int SellWindowBind(void* npc);
+int SellRowsNotOwnNear(::Character* own, float x, float z, unsigned int* listed, int cap, int* nListed, unsigned int* firstOut);
+void SellWindowArm(void* npc, unsigned int npcUid, unsigned int sellerUid, const unsigned int* rows, int n);
+void SellWindowDisarm();
+/* T-478 step 5 (T2017): the selling window's money as this game reads it, for B's END line. *money = the slaver copy's squad pot
+   (KeeperPot; -1 unread). With the window bound (SellWindowBind TIED): the buyer the window's refresh checks (0x727690: handler +0x18
+   == 0 ? +8 : +0x10) - *buyerIsSlaver 1 when it is that copy, 0 another, -1 unread - *rows the handler's row count and *cheapest the
+   lowest row price (cooptalk::TalkSellCheapest; -1 none or unread). Reads only. Returned: 1 the pot read, 0 not. MAIN THREAD. */
+int SellWindowMoneyRead(void* npc, int* money, int* cheapest, long long* rows, int* buyerIsSlaver);
 /* TEST LEVER `slavetest <uid> <state 0..3>`: the engine's setSlaveState on that character through the hooked entry, as a task
    would call it - our own character: MSG_SLAVE follows; a copy: refused here and the owner asked when this game runs its area.
    [SLAVE] slavetest line. MAIN THREAD. */
@@ -594,6 +634,23 @@ void PrisonTick();
 // arrest2 (engine read 1): MAIN THREAD, worker paused - the K2 safe point (combat.cpp detour_tsRagdollUpdates). The queued
 // cage-ins / cage-outs: isFreeSlot, setPrisonMode, and for this game's own character the cage lock and the sentence.
 void PrisonSafePointDrain();
+// T-1211, the K2 safe point (farm.cpp SpPutInRound): an owed put-in's live read of the prisoner (-1 unreadable, 0 not in prison mode,
+// 1 lying pinned with no building, 2 in a building), its one redo / take-out through setPrisonMode (building 0 = out; 1 called,
+// -1 faulted, 0 not called), and its outcome for an own caging held for another game's guard (0 none held, 1 caged, 2 refusal sent).
+int PrisonPutInPinned(::Character* c);
+int PrisonPutInCall(::Character* c, void* building);
+int PrisonPutInOutcome(unsigned int uid);
+// T-980, MAIN THREAD (speech.cpp FreedSendDrain): the lock watch's check of one character run now - a copy's lock-open requests
+// for its shackles and cage are sent to the owner before the freed message that follows on the same road. Returns the locks that
+// read found open (cooprison::kFreedLock* bits) - the freed message's lock byte.
+unsigned char RestraintCheckNow(unsigned int uid);
+// T-980, ANY THREAD (speech.cpp FreedNoteEvent, at the engine's unlock event): the character's cage as the event finds it - its
+// in-something field and its +0x300 hand's five id fields (20 bytes into hand), plain reads only. 1 in a cage, 0 not, -1 unreadable.
+int FreedCageFactsPod(const void* c, unsigned char* hand);
+// T-980, MAIN THREAD (speech.cpp FreedSendDrain): the lock of the cage the unlock event found the copy in (FreedCageFactsPod's
+// answer and hand), read now; when it reads open and openNow (RestraintCheckNow's byte) has no cage, the cage's open request is
+// sent to the owner ahead of the freed message. Returns the freed message's lock byte; *cageAtEvent a cooprison::kFreedCage* value.
+unsigned char FreedCageAtEventSend(unsigned int uid, int cagedAtEvent, const unsigned char* hand, unsigned char openNow, int* cageAtEvent);
 // " arrest2[...]" for the [P014] REPORT line.
 std::string PrisonReportToken();
 // arrest3 TEST-ONLY lever (`crimetest sentence <hours>`): the sentence of every copy THIS game's guard jailed that is still in
@@ -723,6 +780,7 @@ void ListTemplates(const std::string& filter, int maxCount);
 
 } // namespace coop
 namespace coop { void ForgetContextPlatoons(); void ForgetContextPlatoon(void* platoon); }
+namespace coop { void CampHomeBuilt(const std::string& campKey, void* town); std::string CtxCampHomeToken(); }   /* T-929 part 6, MAIN THREAD: camp.cpp CpRegSet / CampReportToken - the groups owed their home camp */
 namespace coop { std::string ContextWorldIdOfCopy(unsigned int uid); }   /* the world id of the context platoon a registered copy stands in now, "" = none (net/session.cpp's roster withdrawal). MAIN THREAD */
 namespace coop { void* ContextPlatoonForActive(void* active); int SlaveStateOfCharacter(const void* c); int IsContextPlatoon(void* platoon); }   /* M7a2 [m7a2-cx2]: IsContextPlatoon - the store's load, wake and sleep hooks (MAIN THREAD) */   /* recruit1 fold: hire.cpp */   // review-p3b: called from the store's world-teardown hook
 // review-p3o H2: drop every engine pointer this module caches (g_spawned, the uid mirror and its

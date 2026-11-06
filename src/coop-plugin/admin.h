@@ -23,24 +23,36 @@ void AdminArrive(unsigned type, const std::vector<char>& payload);
 // game's admin standing (the world server ends a login with its connection). MAIN THREAD.
 void AdminTick();
 
+// THE TOOLBOX'S JOBS THAT CHANGE A CHARACTER (/medic, /heal, /additem): done here, at the K2 safe point (combat.cpp
+// detour_tsRagdollUpdates, the AI worker paused), on this game's own characters only; each job's ADMIN_DONE goes up from here.
+// MAIN THREAD.
+void AdminSafePointDrain();
+
 // THIS GAME IS AN ADMIN NOW (decision 1294 a): the world server's last ADMIN_STANDING on this link says owner (its connection
-// proved this hosting's secret, HOST_TOKEN) or a logged-in admin. A new link is not an admin until its first standing. Only such a
+// proved the owner password, at its door or by /login) or a logged-in admin. A new link is not an admin until its first standing. Only such a
 // game sets the world's rules (settings.cpp RulesAuthority). MAIN THREAD.
 bool AdminNow();
+
+// THIS PLAYER LOGGED OUT THIS VISIT (owner 1412 b): a /logout was typed in the world this game is in now. Until this game leaves that
+// world (store.cpp StoreWorldLoadBegan moves the world-load generation) its remembered login is neither tried by itself (AdminTick)
+// nor shown at the world's door on a reconnect (store.cpp StoreAuthAnswer); the password is kept and a typed /login works. MAIN THREAD.
+bool AdminLogoutHolds();
 
 // One admin command up, for a button (the PLAYERS tab's MAKE / REMOVE ADMIN, the MULTIPLAYER window's admin password):
 // verb = admincmd::Verb, flags = admincmd::kFlagSlot when target is a slot number. The answer comes as this player's chat line.
 // `extra` (the new password for kVerbSetPassword) is wiped here once sent. 1 = sent, 0 = not linked, -1 = the request would not
 // encode (a text too long). MAIN THREAD.
 int AdminRequest(unsigned verb, const std::string& target, unsigned flags, std::string* extra);
+/* the same with a map position (/tp's typed x, z) */
+int AdminRequestAt(unsigned verb, const std::string& target, unsigned flags, std::string* extra, float x, float z);
 
 // THIS GAME IS THE OWNER'S OWN GAME NOW: the world server's last ADMIN_STANDING on this link says owner. Only then are the MULTIPLAYER
 // window's ADMIN PASSWORD part and the PLAYERS tab's admin row shown. MAIN THREAD.
 bool AdminOwnerNow();
 
 // The MULTIPLAYER window's DONE with the ADMIN PASSWORD box's text (and the TEST-ONLY lever's sample, the same road): *pw is wiped
-// here in every case and never logged. adminwords::kPwKeep (empty: nothing sent), kPwShort (under 8 characters: nothing sent, the
-// window says so), kPwBad (nothing sent), kPwSend (sent; not linked: said in the chat). MAIN THREAD.
+// here in every case and never logged. adminwords::kPwKeep (empty: nothing sent), kPwBad (nothing sent), kPwSend (sent; not linked:
+// said in the chat). No minimum length (owner 1368). MAIN THREAD.
 int AdminSetPassword(std::string* pw, const char* from);
 
 // The PLAYERS tab's MAKE ADMIN (make) / REMOVE ADMIN for the player in `slot`, sent at once; the world server's answer is said in the

@@ -8,7 +8,7 @@
    (coopworld::WorldTxtAfterReset) and only what ResetWorldGets gives it. Each entry at the top of a world folder is one of:
      KEEP    - the players and the host's choices: world.txt, format.txt, slots.txt, profiles.txt, aliases.txt, owner.txt, options.txt,
                mods.txt, uid_seats.txt (each seat's highest uid: going back could hand a kept character's uid out again), fallen.txt,
-               teams.txt, own_high.txt, world.gen (a number it has seen is never issued again), auth.txt (the world's password),
+               teams.txt, own_high.txt, world.gen (a number it has seen is never issued again), auth.txt (the world password's lock), admin-auth.txt (0.4.0's admin password lock),
                access.txt (who may enter), lookalike_list.txt (the world's look-alike copy ids: a kept profile's characters are built from them), the world lock, the logs, server-refused.txt and a keep-buildings-<time>\ folder (the area
                records an earlier build's reset kept). A ".1" backup or a ".tmp" leftover is what its file is. The old world keeps each; the
                reset world gets a copy of each but world.txt (written new) and the world lock (made by its first start).
@@ -117,11 +117,11 @@ inline int ResetClassify(const std::string& name, int isDir)
     if (worldkeep::EndsWith(l, ".log") || worldkeep::EndsWith(b, ".log")) return kResetKeep;
     static const char* const keep[] = { "world.txt", "format.txt", "slots.txt", "profiles.txt", "aliases.txt", "owner.txt", "options.txt", "rules.txt",
                                         "mods.txt", "uid_seats.txt", "fallen.txt", "teams.txt", "own_high.txt", "world.gen", "server.lock",
-                                        "auth.txt", "access.txt", "lookalike_list.txt", worldkeep::kRefusedFile };   /* authproof::kAuthFile, accessrule::kAccessFile, lalist::kListFile */
+                                        "auth.txt", "admin-auth.txt", "access.txt", "lookalike_list.txt", worldkeep::kRefusedFile };   /* authproof::kAuthFile, adminauth::kAuthFile (T-1255 F), accessrule::kAccessFile, lalist::kListFile */
     static const char* const move[] = { "uniques.txt", "world_relations.txt", "town_losses.txt", "town_bars.txt", "owed_people.txt",
                                         "owed_done.txt", "owed_meta.txt", "research_boxes.txt", "research_takes.txt", "clock.txt", "areas.txt", "pendingpos.txt", "repair.txt",
                                         "queue.txt", "kept-pieces.txt", "kept-state.txt", "player-towns.txt", "kept-towns.txt",
-                                        "recorded_areas.txt", "area_holders.txt", "town_versions.txt" };   /* town_versions.txt: the old world's town versions (store_main.cpp TownVersFile); T-1084 step 3: the area-recorded marks (store_main.cpp RecordedAreasFile) and the holder history (AreaHoldersFile) belong to the old world's records */
+                                        "recorded_areas.txt", "area_holders.txt", "town_versions.txt", "camps.txt" };   /* town_versions.txt: the old world's town versions (store_main.cpp TownVersFile); camps.txt: the old world's camp list (T-929, campwire.h); T-1084 step 3: the area-recorded marks (store_main.cpp RecordedAreasFile) and the holder history (AreaHoldersFile) belong to the old world's records */
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); ++i) if (b == keep[i]) return kResetKeep;
     for (size_t i = 0; i < sizeof(move) / sizeof(move[0]); ++i) if (b == move[i]) return kResetMove;
     if (b.size() > 13 && b.compare(0, 8, "deleted.") == 0 && worldkeep::EndsWith(b, ".bits")) return kResetMove;

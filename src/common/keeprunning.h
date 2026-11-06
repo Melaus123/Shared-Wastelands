@@ -1,8 +1,8 @@
 /* keeprunning.h - "KEEP THIS WORLD RUNNING": the world server's pure decisions for a world that outlives its host's game
    (SharedWastelandsServer.exe --keep-running), and the plain words its window shows. Pure: no I/O, no globals.
 
-   Without --keep-running every answer here is "as before": the host's game closing is forwarded, --parent is obeyed, no
-   password is required and the window shows the whole technical log. */
+   Without --keep-running every answer here is "as before": the host's game closing is forwarded, --parent is obeyed and the
+   window shows the whole technical log. */
 #ifndef SW_KEEPRUNNING_H
 #define SW_KEEPRUNNING_H
 
@@ -15,14 +15,15 @@ namespace keeprun {
 
 const char* const kStopFile = "stop.request";            /* in the world folder: its arrival stops the world (the game's STOP WORLD, a service, Linux) */
 const char* const kStopFileAside = "stop.request.taken"; /* where an acted-on or stale stop file is renamed to (never deleted) */
-const int kExitNoPassword = 8;                           /* the exit code of a kept world refused for having no world password */
+const int kExitRulesUnreadable = 36;                     /* the exit code of a kept world whose rules.txt could not be read */
 
-/* START: a kept world needs a world password (auth.txt holding a readable key), because anyone who knows the address could
-   otherwise walk in while its host is away. passwordSet = auth.txt was read and holds a key line. */
-enum StartVerdict { kStartServe = 0, kStartNoPassword = 1 };
+/* START (owner 1508 b, 2026-11-05, in place of owner 1274): a kept world with a world password (the `world password =` line of its
+   rules file, not empty) serves as before; one without serves OPEN - anyone who knows its address can join while its host is away -
+   and its window says so once (OpenLine). passwordSet = rules.txt was read and its world password is not empty. */
+enum StartVerdict { kStartServe = 0, kStartOpen = 1, kStartUnreadable = 2 };   /* kStartUnreadable: worldpw::KeptStart */
 inline int StartDecide(bool keepRunning, bool passwordSet)
 {
-    return keepRunning && !passwordSet ? (int)kStartNoPassword : (int)kStartServe;
+    return keepRunning && !passwordSet ? (int)kStartOpen : (int)kStartServe;
 }
 
 /* WORLD_STOPPING (91, down only; world-server protocol 131): a kept world server tells every admitted game it is stopping (the stop
@@ -114,7 +115,11 @@ inline std::string TitleLine(const std::string& world) { return "Shared Wastelan
 inline std::string HeaderLine() { return "Shared Wastelands world server"; }
 inline std::string WorldLine(const std::string& world) { return "World: " + world; }
 inline std::string PortLine(unsigned port) { return "Port: " + NumberWord(port); }
-inline std::string RunningLine() { return "The world is running. Players join by address with the world's password."; }
+/* owner 1514 a (1): hasPassword = the world has a world password (one from rules.txt or a carried 0.4.0 lock, owner 1513 a) */
+inline std::string RunningLine(bool hasPassword)
+{
+    return hasPassword ? "The world is running. Players join by address with the world's password." : "The world is running. Players join by address.";
+}
 inline std::string HowToStopLine() { return "To stop the world, close this window, or type stop and press Enter."; }
 inline std::string JoinedLine(const std::string& shown) { return shown + " joined the world."; }
 inline std::string LeftLine(const std::string& shown) { return shown + " left the world. The world keeps running."; }
@@ -122,7 +127,28 @@ inline std::string PausedLine() { return "Nobody is in the world. The world is p
 inline std::string SavingLine() { return "Saving the world..."; }
 inline std::string StoppedLine() { return "The world has stopped."; }
 inline std::string TypeStopLine() { return "Type stop and press Enter to stop the world."; }
-inline std::string NoPasswordLine() { return "A world kept running needs a password."; }
+/* owner 1508 b / 1509: a world that starts with no world password says so once - a kept world in its window, any other in its log */
+inline std::string OpenLine() { return "This world has no password: anyone who knows its address can join."; }
+/* owner 1374 (2) / 1510 a: a world kept running whose world password line is emptied (or whose rules.txt is deleted) keeps its
+   password until it is started again (words: owner 1514 a (2)) */
+inline std::string KeepsPasswordLine()
+{
+    return "The world password line was emptied. The world keeps its password until it is started again; started with the line empty, it will have no password.";
+}
+/* A REFUSED START KEEPS ITS WINDOW (T-1254, owner 1512 a): after a kept world's refusal lines and the rules file's full path, the window
+   says this and waits for Enter - only when it can be seen and is this process's own (visibleWindow: the console has a window that
+   is shown; ownConsole: no other process shares it; consoleInput: stdin is that console). A world server started hidden, or by a
+   test harness with no window, never waits. */
+inline std::string PressEnterLine() { return "Press Enter to close this window."; }
+inline bool RefusedWindowHolds(bool visibleWindow, bool ownConsole, bool consoleInput) { return visibleWindow && ownConsole && consoleInput; }
+/* T-1255 C (review #2): a world server started minimized or hidden never waits for Enter - the game starts a kept world so
+   (STARTUPINFO STARTF_USESHOWWINDOW, SW_SHOWMINNOACTIVE 7) and reads its exit code, and the test tools start it with Start-Process
+   -WindowStyle Minimized (SW_SHOWMINIMIZED 2). useShowWindow: STARTF_USESHOWWINDOW set; showWindow: wShowWindow - SW_HIDE 0,
+   SW_SHOWMINIMIZED 2, SW_MINIMIZE 6, SW_SHOWMINNOACTIVE 7 or SW_FORCEMINIMIZE 11 is "minimized or hidden". */
+inline bool StartedMinimized(bool useShowWindow, unsigned showWindow)
+{
+    return useShowWindow && (showWindow == 0u || showWindow == 2u || showWindow == 6u || showWindow == 7u || showWindow == 11u);
+}
 
 /* THE ROUTER LINES: a world kept running asks the home router itself to let players from the internet in on its port (UPnP,
    src/coop-plugin/upnp.cpp), and closes that opening when it stops. One line for each note (src/common/upnpplan.h kNote*);

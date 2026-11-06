@@ -28,6 +28,7 @@ std::string P072ReportToken();                  /* PROBE P072: counters for the 
 #include "../common/removalreason.h"   /* M7a3: the engine's removal reason - an unload is never sent as a death */
 #include "towngen.h"      /* T-392 (owner 335 a): TownGenResidentsGate - the residents gate */
 #include "townver.h"      /* TownVerChoose / TownVerInstall / TownVerReportToken */
+#include "camp.h"         /* T-929: CampInstall / CampReportToken */
 #include "../common/townreoffer.h"   /* T-438: PopulateMode - the SAME header the offline suite compiles */
 #include "handoff.h"      /* PROBE P116: ReadSquadAt - the guarded squad read */
 #include "speech.h"       /* T-831: TalkWindowBeforeRemove - a shown conversation naming the object ends before it goes */
@@ -442,6 +443,9 @@ bool detour_destroy(GameWorld* self, RootObject* obj, bool justUnloaded, const c
     // game's character (run T674: B's copy of A's corpse, eaten by an animal A never had) is refused and answered FALSE, the
     // engine's own 'postponed' answer; every other reason goes through (RefuseEngineDestroyOfCopy says why). Any thread.
     if (uid != 0 && coop::RefuseEngineDestroyOfCopy(obj, uid, debugInfo)) return false;
+    /* T-1230: an open trade window whose trader is obj closes now, while obj is whole (the game's own area unload freed the trader
+       under an open window in run T1965). Address compare first; MAIN THREAD acts, elsewhere the safe point's check closes it. */
+    coop::TradeWindowBeforeDestroy((void*)obj, justUnloaded ? 1 : 0, 0, debugInfo);
 
     // F334 - **AND SPLIT UNLOAD FROM DEATH.** The hooked signature is
     // `destroy(RootObject*, bool justUnloaded, const char*)` and this detour ignored that parameter
@@ -629,6 +633,7 @@ bool DestroyLocalObject(void* obj)
     // T-831 - the dialogue window keeps a character of the conversation it shows and calls it every frame; a conversation
     // that names this object ends first, while the object still exists (address compares; nothing happens otherwise).
     TalkWindowBeforeRemove(obj);
+    TradeWindowBeforeDestroy(obj, 0, 1, "this mod removes it (DestroyLocalObject)");   /* T-1230: a trade window with this character closes first */
     ModRemovalNote(obj);   /* T-1080: the squad this removal empties keeps its record */
     // F337 - the layout fact this line rests on, stated rather than warned about. (F336 put a
     // warning here about a "properly typed conversion" applying a base-class offset; that hazard is
@@ -680,7 +685,7 @@ void ReportWorldGen()
              + " charCreated=" + S(g_charCreated)
              + " charForBuilding=" + S(g_charForBld)
              + " populateBuilding=" + S(g_populateBld)
-             + " repopulateTown=" + S(g_repopTown) + " repopForced=" + S(g_repopForced) + " " + coop::TownVerReportToken()
+             + " repopulateTown=" + S(g_repopTown) + " repopForced=" + S(g_repopForced) + " " + coop::TownVerReportToken() + " " + coop::CampReportToken()
              + " | blockedChar=" + S(g_blkChar) + " charPlayerPass=" + S(g_charPlayerPass)
              + " leafArea[allowed,gatedHeld,gatedNotMine,leafRefusedNoMap,allowedSingle,gatedTeardown]=" + S(g_leafAllowedArea)
              + "," + S(g_leafGatedHeld) + "," + S(g_leafGatedOtherLoaded) + "," + S(g_leafGatedNoMap)
@@ -824,6 +829,7 @@ void InstallWorldGen()
     }
     else ErrorLog("[P032] checkForRepopulateTown resolved to 0");
     coop::TownVerInstall();   /* the town-version world-state hooks */
+    coop::CampInstall();      /* T-929: the camp pass, its two pickers and the build */
 
 #ifdef SW_DEV_BUILD
     P072Install((unsigned long long)imgBase);   /* PROBE P072 (test build only, T-879 E) */

@@ -13,32 +13,35 @@
 namespace spimport {
 
 /* ---- the host's options (the world server's options.txt; OptionValueOk) ---- */
-const char* const kKeyMode     = "spimport";           /* IMPORT FROM SINGLE PLAYER: "all" / "host" / "off" (absent = "all") */
+const char* const kKeyMode     = "spimport";           /* IMPORT FROM SINGLE PLAYER: "all" / "owner" / "off" (absent = "all"; "host", the old word, is "owner") */
 const char* const kKeyMoney    = "spimportmoney";      /* IMPORT INCLUDES MONEY: "yes" / "no" (absent = "yes") */
 const char* const kKeyResearch = "spimportresearch";   /* IMPORT INCLUDES RESEARCH: "yes" / "no" (absent = "yes") */
-enum Mode { kModeAll = 0, kModeHost = 1, kModeOff = 2 };
+enum Mode { kModeAll = 0, kModeOwner = 1, kModeOff = 2 };
 
 inline bool IsOptionKey(const std::string& k) { return k == kKeyMode || k == kKeyMoney || k == kKeyResearch; }
 inline bool OptionValueOk(const std::string& k, const std::string& v)
 {
-    if (k == kKeyMode) return v == "all" || v == "host" || v == "off";
+    if (k == kKeyMode) return v == "all" || v == "owner" || v == "host" || v == "off";
     if (k == kKeyMoney || k == kKeyResearch) return v == "yes" || v == "no";
     return false;
 }
 /* The mode an option value stands for: absent (or a value no build stores - OptionValueOk refuses it) is the default, everyone. */
-inline int ModeOf(const std::string& v) { return v == "host" ? kModeHost : v == "off" ? kModeOff : kModeAll; }
-inline const char* ModeName(int m) { return m == kModeHost ? "host" : m == kModeOff ? "off" : "all"; }
+inline int ModeOf(const std::string& v) { return (v == "owner" || v == "host") ? kModeOwner : v == "off" ? kModeOff : kModeAll; }
+inline const char* ModeName(int m) { return m == kModeOwner ? "owner" : m == kModeOff ? "off" : "all"; }
+/* the value stored for a mode value given: the old "host" is stored as "owner" (owner 1383) */
+inline std::string ModeValue(const std::string& v) { return ModeName(ModeOf(v)); }
 /* An "includes" option: only "no" turns it off (absent = yes). */
 inline bool IncludesOf(const std::string& v) { return v != "no"; }
 /* GAME OPTIONS: the two "includes" rows are greyed and cannot be changed while import is Not allowed. Their values are kept. */
 inline bool IncludesRowLit(const std::string& modeValue) { return ModeOf(modeValue) != kModeOff; }
 
 /* ---- who may import (the world server's check at the profile request; the screens show the same answer) ----
-   The host (the world's authority) always may, unless import is Not allowed; a joining player only while it is Allowed for everyone. */
-inline bool ImportAllowed(int mode, bool isHost)
+   The owner and the admins (logged in, or proven at their door - owner 1379) always may, unless import is Not allowed; anyone else
+   only while it is Allowed for everyone. A player id never decides it. */
+inline bool ImportAllowed(int mode, bool isStaff)
 {
     if (mode == kModeOff) return false;
-    return isHost || mode == kModeAll;
+    return isStaff || mode == kModeAll;
 }
 
 /* ---- the switch word Kenshi's import is posted with (worldreset.h): always the crew (the screen's own 0x02) and the fixed import

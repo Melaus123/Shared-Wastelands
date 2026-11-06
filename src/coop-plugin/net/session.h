@@ -8,6 +8,7 @@ namespace cooplimb { struct LimbsWire; }   /* LIMBS: src/common/limbwire.h */
 namespace coopcrime { struct CrimeState; struct CrimeRelEvent; }   /* crime3: src/common/crimewire.h */
 namespace coopbounty { struct BountyEntry; }   /* crime5: src/common/bountywire.h */
 namespace cooprison { struct PrisonMsg; }   /* arrest2: src/common/prisonwire.h */
+namespace swgive { struct GiveMsg; }     /* T-1135: src/common/givewire.h */
 namespace cooptreat { struct TreatMsg; }    /* heal1: src/common/treatwire.h */
 namespace coopbuild { struct BuildMsg; }    /* build1-b: src/common/buildwire.h */
 namespace hitwire { struct Blow; }          /* T-1101: src/common/hitwire.h - the decided blow on HIT */
@@ -165,10 +166,11 @@ unsigned int CopyGenOf(unsigned int uid);
 unsigned int GenForTake(unsigned int uid, unsigned int giverGen);
 int PeerSlotOfKey(unsigned int key);
 int OwnerSlotOf(unsigned int uid);
+int OwnerMovedClaimed(unsigned int uid);   /* T-1135 review fold 6: 1 when an OWNER_MOVED word named another game the owner of a character this game runs (or the note list overflowed) */
 void SessionCatchupApplyTick();   /* M7a2 fold 1 [m7a2f-ap3]: MAIN THREAD, CommandChannelTick right after coop::InQueueDrain() - the catch-up's engine writes */
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire, unsigned int originWire);   // + where the sender's copy came from (sameidpair.h WireOfOrigin); + the squad's birth flag (squadbirth.h WireOfBirth). M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id); + the age of the sender's current world load in ms (squadorigin.h OwnIdLiftedByLoadAge)
+                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire, unsigned int originWire, const std::string& campKey);   // + the home camp's world camp list key (T-929 part 6, "" = none); + where the sender's copy came from (sameidpair.h WireOfOrigin); + the squad's birth flag (squadbirth.h WireOfBirth). M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id); + the age of the sender's current world load in ms (squadorigin.h OwnIdLiftedByLoadAge)
 bool SendRelSync();   // ask the peer to re-send its owned standings (after my world was rebuilt)
 bool SessionPeerRelayOk();   // M5a fold 1, MAIN THREAD: the session peer is KNOWN reachable through the notebook (a relayed standing stamped with its slot arrived on this session link and this welcomed notebook link)
 void SetRecordTownLookup(std::string (*fn)(const std::string&));   /* decision 34: the store supplies each note's home town to the encoder */
@@ -233,6 +235,7 @@ bool SendName(unsigned int uid, const std::string& name, bool afterSpawn = false
 bool SendTalk(const cooptalk::TalkMsg& m);   // P26 stages 1-3: MSG_TALK PROMPT/ANSWER/END, by SLOT to the other side's owner. False when the character stream's road is closed, that owner is unknown or not in the world, or it does not encode. MAIN THREAD
 const unsigned int kHireNoAsker = 0xFFFFFFFFu;   // SendHire's toPeer when there is none: a REQ goes to the person's owner, a DONE to every game
 bool SendHire(const coophire::HireMsg& m, unsigned int toPeer);   // recruit1: MSG_HIRE REQ/OK/NO/DONE; OK / NO / DONE to toPeer (the asker's key). False when no road or no player to address (not encodable: dropped, reads as sent)
+bool SendGive(const swgive::GiveMsg& m, int toSlot);   // T-1135: a give OFFER / ANSWER / RESULT on MSG_HIRE, to the player in toSlot (the character stream's road, as SendTalk). False when that road is closed, the player is not in the world, or it does not encode. MAIN THREAD
 bool SendCapture(const char* p, size_t n, unsigned int victimUid);       // P11: MSG_CAPTURE - an encoded capturewire.h request (items.cpp); M7b: to the victim's owner
 bool SendCaptureDone(const char* p, size_t n, unsigned int askerPeer);   // P11: MSG_CAPTURE_DONE - an encoded capturewire.h answer (items.cpp); M7b: back to the asker
 bool SendCapturePlaced(const char* p, size_t n, unsigned int victimUid);   // P11 f3: MSG_CAPTURE_PLACED - which taken rows landed (items.cpp); M7b: to the victim's owner
@@ -312,7 +315,8 @@ bool SendSwing(unsigned int uid, unsigned int targetUid, const char* move = 0); 
 
 // MSG_SWING_END: our character uid, whose swing start sent SWING at targetUid, left the attack state - its swing is over. On
 // SWING's road and lane (CharSend, RELIABLE), so it never overtakes its SWING. False: no road, or not encodable (hitwire.h).
-bool SendSwingEnd(unsigned int uid, unsigned int targetUid);
+// end: what the swing met on this game (hitwire.h kSwingEnd*), for the copies' pause after it.
+bool SendSwingEnd(unsigned int uid, unsigned int targetUid, unsigned char end);
 
 // T-1101 design (c) - MSG_FIGHT_CHOICE: our player character uid's fight decide step chose (src/common/fightchoice.h: state 3 with
 // next move 0 / 1 / 5 / 6, state 9, or state 10 with 10; seq = this game's choice number). On SWING's road and lane (CharSend,
@@ -408,6 +412,11 @@ bool SendParityReq(const std::vector<char>& bytes, int sx, int sy, int toSlot = 
 bool SendTownPrices(const std::vector<char>& bytes);   /* T-619: one town's local trade multipliers, the price source -> its session peer (session link, RELIABLE); false = not sent */
 int  SendTownPricesLive(const std::vector<char>& bytes);   /* the same through the world server to every other admitted game but the session peer; 0 = not sent, 1 = WORLD, 2 = WORLD_EXCEPT the session peer */
 bool SendParityBox(const std::vector<char>& bytes, unsigned int askerKey);
+// T-1061: BOX_LOCK - an ASK to the writer of the box's area (sx, sy); a NO back to the asker's key. false = not sent.
+bool SendBoxLockAsk(const std::vector<char>& bytes, int sx, int sy);
+bool SendBoxLockNo(const std::vector<char>& bytes, unsigned int askerKey);
+// T-1242: RESEARCH_BOOK (src/common/bookshare.h) to one player by slot. false = not sent. MAIN THREAD.
+bool SendResearchBook(const std::vector<char>& body, int toSlot);
 bool SendParityPush(const std::vector<char>& bytes, int sx, int sy);
 
 // E22b / decision 38 part (2): ASK the owner to make a move we are not allowed to make ourselves, and the

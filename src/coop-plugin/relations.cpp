@@ -123,6 +123,7 @@ long long g_relNotices = 0, g_relNoticesEngine = 0;   /* sentences shown here fo
 long long g_relTeamQuiet = 0;   /* another player's changes not shown: the team's own pin, unpin or restore writes */
 playerstab::NoticeBook g_noticeBook;   /* what this player has been told about each other player's side towards them (MAIN THREAD) */
 volatile LONG64 g_playerPairEpoch = 0;   /* RelationsPlayerPairEpoch */
+std::set<int> g_theirSideIn;   /* T-947 fold 1 (RelationsTheirSideIn): the slots whose own side towards this player was written from the wire this world (MAIN THREAD) */
 // stand1 (docs/design-profiles1.md s2 Required 2): the wire name of a faction. A PLAYER faction travels by notebook SLOT - mine
 // as "@slot:<my slot>:<my faction's name>" (the name lets the other game follow a rename), a stand-in - met this session, or the
 // coop-p<n> faction the save carries - as "@slot:<its slot>", and every other faction by its stringID. Slots are absolute, so one pair has one name on both games (protocol 67's
@@ -1007,7 +1008,7 @@ long long RelationsEvAppliedCount() { return g_evApplied; }
 void SetRelationsOn(bool on) { g_on = on; DebugLog(std::string("[REL] ") + (on ? "ON" : "OFF")); }
 void RelationsSendSnapshot() { Snapshot(); }
 void RelationsNoteRelayedDropped() { g_relSyncOwed = true; ++g_relDroppedResync; }   /* M5a fold 1 (#2b) */
-void RelationsForgetQueue() { RelationsTeamForgetBase(); g_noticeBook.Clear(); g_wrApplyAll = true; g_wrTableApplied = false; g_wrSeedState = 0; g_wrSeedOut.clear(); g_wrDirty.clear(); g_wrPending.clear(); g_wrPendingChange.clear(); g_wrSent.Clear();   /* par24: the next world writes the notebook's whole table (g_wr is kept - the notebook's truth, not a pointer) and re-owes its walk */ if (!g_queueLockInit) return; ::EnterCriticalSection(&g_queueLock); g_queue.clear(); g_revertQueue.clear(); g_wrOffQueue.clear(); ::LeaveCriticalSection(&g_queueLock); }   // review-p3r M4: g_ownerValues (sids -> values) stays - the owner's truth, not a pointer   // review-p3o M3: old-world entries must not be re-resolved against the new world   // an event (a rename) - the owned entries carry "@player:<new name>"
+void RelationsForgetQueue() { g_theirSideIn.clear();   /* T-947 fold 1: the next world's standings are a save's until the wire's come */ RelationsTeamForgetBase(); g_noticeBook.Clear(); g_wrApplyAll = true; g_wrTableApplied = false; g_wrSeedState = 0; g_wrSeedOut.clear(); g_wrDirty.clear(); g_wrPending.clear(); g_wrPendingChange.clear(); g_wrSent.Clear();   /* par24: the next world writes the notebook's whole table (g_wr is kept - the notebook's truth, not a pointer) and re-owes its walk */ if (!g_queueLockInit) return; ::EnterCriticalSection(&g_queueLock); g_queue.clear(); g_revertQueue.clear(); g_wrOffQueue.clear(); ::LeaveCriticalSection(&g_queueLock); }   // review-p3r M4: g_ownerValues (sids -> values) stays - the owner's truth, not a pointer   // review-p3o M3: old-world entries must not be re-resolved against the new world   // an event (a rename) - the owned entries carry "@player:<new name>"
 
 void ApplyRemoteRelation(const std::string& ownerSid, const std::string& otherSid, float relation, float trust, float trustNeg,
                          unsigned int flags, unsigned int reason)
@@ -1054,6 +1055,13 @@ void ApplyRemoteRelation(const std::string& ownerSid, const std::string& otherSi
     g_applying = true;
     const int w = WriteEntry(rel, other, e);
     g_applying = false;
+    if (w == 1 && coop::IsPlayerFaction(other) && OtherPlayersFaction(owner))
+    {   /* T-947 fold 1: that player's own side towards this player came from the wire in this world - its standing is now theirs, not a
+           save's (marked before the event below, which the map's show step follows) */
+        int ts = coop::StandInSlotOf(owner);
+        if (ts < 0) ts = coop::StandInRecordSlot(owner);
+        if (ts >= 0) g_theirSideIn.insert(ts);
+    }
     if (w == 1) TagNoteRelation(owner, other);
     /* Another player's side towards this player. The engine prints its sentences only on the game whose engine moved the standing
        (its changers -> 0x6B25A0), fights included; this write is a plain store, so a live change is announced here in the engine's
@@ -1121,6 +1129,7 @@ int RelationsTagLevel(::Faction* mine, ::Faction* theirs, int* reads)
 }
 
 long long RelationsPlayerPairEpoch() { return (long long)g_playerPairEpoch; }
+bool RelationsTheirSideIn(int slot) { return slot >= 0 && g_theirSideIn.count(slot) != 0; }   /* T-947 fold 1 */
 
 int RelationsTheirSideRaw(::Faction* theirs, ::Faction* mine, float* v, unsigned* flags)
 {

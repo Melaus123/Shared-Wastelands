@@ -34,6 +34,11 @@ inline int CageAskStep(bool copyCaged, bool ownerSaysCaged, bool refused, int ow
     return kCageAskGiveUp;
 }
 
+/* The handing-over side (run T2051): a character this game hands to another game while it sits in a cage here (inSomething 2)
+   is recorded as caged on the new owner's word, so this game's cage scan does not report that cage as its own guard's arrest.
+   The new owner's game still decides: its word taking the character out takes the copy out as for any copy. */
+inline bool CageOwnWordOnHandOver(int inSomething) { return inSomething == 2; }
+
 /* The owner's side: a request arriving while one waits keeps the waiting one's first-arrival time when it is the same game asking
    about the same cage (a resend), so the owner's own give-up limit is not restarted by resends. */
 inline bool PrisonInKeepsFirstAt(bool prevExists, bool samePeer, bool sameKey)

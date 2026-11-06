@@ -271,6 +271,21 @@ inline int ContextSleepDrop(int isContext, int heldMine)
 {
     return (isContext != 0 && heldMine == 0) ? 1 : 0;
 }
+/* T-1229 (run T1944 A 597.915): the ADOPTION SWEEP's answer for a body in a context platoon that is not a registered copy (a person rebuilt
+   by this game's engine from the platoon's sleeping data). Refused (kCtxSweepRefuse) - another game's person: adopting it would SPAWN a
+   second copy of that game's person under a fresh uid. Except a TAKE-BACK (kCtxSweepTakeBack): the platoon's last sleep here held a person
+   this game runs (lastSleepHeldMine - the same fact ContextWake reads) AND every person of that sleep was this game's (sleptChars > 0,
+   sleptKnown == sleptChars, sleptMine == sleptKnown): e.g. a town's group this game took over when the other game left, slept here and
+   woken again on return - its rebuilt people are this game's own and go on to the existing rules. The sleep keeps only counts, not which
+   person was whose, so a MIXED sleep (some of another game's people, or a member whose uid did not resolve) stays refused: one of its
+   rebuilt bodies may be another game's person. Not a context platoon: kCtxSweepGo (the existing rules). */
+enum { kCtxSweepGo = 0, kCtxSweepRefuse = 1, kCtxSweepTakeBack = 2 };
+inline int ContextSweepAdopt(int isContext, int lastSleepHeldMine, int sleptChars, int sleptKnown, int sleptMine)
+{
+    if (isContext == 0) return kCtxSweepGo;
+    if (lastSleepHeldMine != 0 && sleptChars > 0 && sleptKnown == sleptChars && sleptMine == sleptKnown) return kCtxSweepTakeBack;
+    return kCtxSweepRefuse;
+}
 /* One step of a queued removal, from fresh reads. stillContext: the context map still holds the platoon (an announcement that superseded,
    retired or hired from it has taken it out); sleptMine: its last sleep here held a person this game runs; readable: its state and faction
    were read; awake: it is awake (a wake the rule refused, or an announcement that reused it); asleepListed: asleep and found in its own

@@ -252,6 +252,23 @@ int StatsRecalcCopy(unsigned int uid, void* character)
     return rc;
 }
 
+int StatsRecalcOwned(unsigned int uid, void* character)
+{
+    if (character == 0 || !net::IsUidMine(uid) || EngineWritesBlocked()) return 0;   /* only for a character this game drives */
+    if (kCharStatsVftRva == 0 || kMedicalVftRva == 0) return 0;
+    char* s = StatsObjPod(character);
+    if (!PlausibleHeap(s)) { InterlockedIncrement64(&g_statsFault); return 0; }
+    int animal = 0, bloodKept = 0;
+    float bloodBefore = 0.0f, bloodAfterPush = 0.0f;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const int rc = StatsRecalcPod(s, base + (uintptr_t)kCharStatsVftRva,
+                                  kCharStatsAnimalVftRva != 0 ? base + (uintptr_t)kCharStatsAnimalVftRva : 0,
+                                  base + (uintptr_t)kMedicalVftRva, &animal, 0, &bloodBefore, &bloodAfterPush, &bloodKept);
+    if (rc == -1) InterlockedIncrement64(&g_statsFault);
+    if (rc == -2) InterlockedIncrement64(&g_statsMedFault);
+    return rc;
+}
+
 bool ApplyRemoteStats(unsigned int uid, const unsigned int* raw44, const char* why)
 {
     if (raw44 == 0) return false;

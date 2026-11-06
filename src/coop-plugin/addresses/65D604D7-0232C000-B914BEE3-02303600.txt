@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 651
+!count 719
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -39,6 +39,7 @@ AITaskSytem_describeCurrentGoal               code 0050E930 0050E930 40574881ECE
 AiThreadBusy                                   code 0025C690 0025C690 4883EC284C8BC14885C9746F80794500
 AllyRet1                                       ret  00608ED3 00608ECD FF90F0030000
 AllyRet2                                       ret  0059F112 0059F10C FF90F0030000
+AnimalBuyingConfirm                            code 006AB410 006AB410 488BC4554154415541564157488DA8B8
 AnimalDropItem                                 code 005C9A10 005C9A10 48895C24104889742418574883EC70F3
 AnimationClass_blocksWaypointMovement   code 0051BDE0 0051BDE0 40534883EC204883B92802000000488B
 AnimationClass_applySpeedCap                 code 0051BED0 0051BED0 F30F108178010000F30F11899C010000
@@ -159,7 +160,9 @@ DialogueSendEvent                              code 00683F00 00683F00 4489442418
 DialogueSetConversationReplyGUI                code 006736E0 006736E0 40574883EC6048C7442428FEFFFFFF48
 DialogueSetInDialog                            code 00673C10 00673C10 48895C2408574883EC20488BD9488B0D
 DialogueSetResponesGUI                         code 006735E0 006735E0 40534883EC20488BD9488B0D5002AC01
+DialogueClearResponsesGUI                      code 006734F0 006734F0 40534883EC20488BD9488B0D4003AC01
 DialogueStartConversation                      code 00683500 00683500 405657415441564883EC38458BE1498B
+DialogueTriggerNextLine                        code 00683C90 00683C90 48895C241048896C2418565741544883
 DialogueStartPlayerConversation                code 00683890 00683890 488BC457415441554883EC7048C74424
 DialogueUpdateSayRet                           ret  0068472E 00684729 E8ECEB9BFF
 DialogueWindowGlobal                           var  02132770 02132770 -
@@ -167,6 +170,9 @@ DialogueWindowHide                             code 007213F0 007213F0 40534883EC
 DialogueWindowHidePauseRet                     ret  0072141B 00721416 E828DA8FFF
 DialogueWindowRefreshPortrait                  code 007223C0 007223C0 488BC4574881ECB000000048C7442428
 DialogueWindowShowPauseRet                     ret  00726D4A 00726D45 E8F9808FFF
+DialogueWindowStep                             code 00726FF0 00726FF0 488BC455574154488DA828FEFFFF4881
+InputLeftReleasedFlag                          var  02132419 02132419 -
+InputLeftDownFlag                              var  02132413 02132413 -
 DismantleRefund                                code 0029DBD0 0029DBD0 488BC4554154415541564157488DA808
 DistributeArtifacts                            code 00930BC0 00930BC0 40554154415541564157488DAC2410EB
 DoorCursor                                     code 00547010 00547010 40534883EC20488B01488BD9FF900803
@@ -215,6 +221,8 @@ GameDataReference_copy                         code 0009DCA0 0009DCA0 48895C2408
 GameDataReference_ctor                         code 0009C6C0 0009C6C0 40534883EC20418B00488BD94883C110
 GameDataReference_dtor                         code 00069580 00069580 40534883EC204883792810488BD97209
 GameFrameDt                                    var  02132734 02132734 -
+GameMenuHidePauseRet                           ret  009161B0 009161AB E84FB473FF
+GameMenuShowPauseRet                           ret  0091329B 00913296 E864E373FF
 GameplayOptionsGlobal                          var  02132528 02132528 -
 GameplayOptionsLoad                            code 003EEDE0 003EEDE0 405556574154415541564157488BEC48
 LockButton                                     code 005465D0 005465D0 48895C2408574883EC4080B984030000
@@ -299,7 +307,11 @@ LoadGameMenu_ctor                              code 004802E0 004802E0 488BC45541
 MainBarChangeSpeed                             code 00723DF0 00723DF0 4883EC28488D4A70B201E8D48F8EFF48
 MainMenuPopup_get                              code 0047A0B0 0047A0B0 4883EC3848C7442420FEFFFFFF8B05F1
 MainMenuPopup_show                             code 00913250 00913250 40574883EC40488BF9488D0DF0F48101
+MainMenuPopup_hide                             code 00916190 00916190 40534883EC4080B9E800000000488BD9
 MapPtr                                         var  0212DAF0 0212DAF0 -
+MapWindow_frame                                code 0049AC50 0049AC50 40534883EC20488BD9488B4908FF15AD
+MapMarkerScaleX                                var  0213278C 0213278C -
+MapMarkerScaleY                                var  02132790 02132790 -
 MedApplyFirstAid                                code 0064CD70 0064CD70 48895C2420564881EC8000000080B964
 MedTreatParts                                   code 00648F70 00648F70 4056574881EC9800000080B964010000
 MedicalSystem_amputate                         code 0064E330 0064E330 83FA040F842F050000488BC455535657
@@ -308,11 +320,13 @@ MedicalSystem_countBodyParts                     code 002AA5B0 002AA5B0 8B819801
 MedicalSystem_knockout                         code 00643EF0 00643EF0 40534883EC40F30F1005D6EEAE01488B
 MedicalSystem_healthTick                    code 00651570 00651570 488BC4488958205556574881ECD00000
 MedicalSystem_setRobotLimbItem                 code 00644C00 00644C00 40565741544883EC3048C7442420FEFF
+RobotLimbs_setLimb                             code 000CFD90 000CFD90 405556574154415541564157488D6C24
 MedicalSystem_beginKnockout               code 00643D40 00643D40 40534883EC50488B81A8010000F30F10
 MedicalSystem_clampHealth             code 00644B10 00644B10 4883EC1833D24C8BC13991980100000F
 MedicalSystem_vftable                          ptr  016F8BE8 016F8BF0 0004011F
 MedicTaskBody                                    code 0034E240 0034E240 4C8BDC56574154415541564883EC7048
 MessageShow                                    code 00723ED0 00723ED0 488B89E0040000E9BAA992FFCCCCCCCC
+MouseClearItem                                 code 0070CE50 0070CE50 48895C2408574883EC20488BD9488B49
 MouseGiveToObject                              code 007118C0 007118C0 4055415441564883EC304D8BF0488BEA
 MouseInvPtr                                    var  02131B18 02131B18 -
 MousePutBackItem                               code 0070CC90 0070CC90 4885D20F84A0010000488BC457415441
@@ -380,6 +394,10 @@ RelationsSetupPhase1                           code 006B3C30 006B3C30 4C8BDC5657
 RemoveDontDest                                 code 00749E10 00749E10 48895C2418555641544883EC2080BAD8
 RenderHolderPtr                                var  021322B8 021322B8 -
 ResearchAddToQueue                             code 008339D0 008339D0 4C8BDC565741544881EC9000000048C7
+ResearchBenchList                              code 0082D880 0082D880 48895C2408574881EC80000000488B0D
+ResearchCanPay                                 code 00831F80 00831F80 48895C2410564883EC30488BDA488BF1
+ResearchHasItems                               code 0082D940 0082D940 41544883EC4048C7442420FEFFFFFF48
+ResearchPay                                    code 008334F0 008334F0 405556574881EC8002000048C7442420
 ResearchConsume                                code 0082DA30 0082DA30 4154415541564883EC4048C7442420FE
 ResearchGetItemRet1                            ret  0082DAE8 0082DAE3 E84ED67DFF
 ResearchGetItemRet2                            ret  0082DB17 0082DB12 E81FD67DFF
@@ -409,6 +427,7 @@ SaveManager_anySavesExist                         code 0036B540 0036B540 4057488
 SaveManagerNewGame                             code 0047A930 0047A930 40534883EC2048833DD27FCB0100488B
 SaveManagerRequestPump                         code 0047BAA0 0047BAA0 488BC455574154488DA868FAFFFF4881
 SaveManagerSave                                code 0047B0B0 0047B0B0 40574881EC0001000048C7442420FEFF
+SlaveBuyingConfirm                             code 006AE510 006AE510 488BC4554154415541564157488D68A1
 StealthKoChance                                code 00884420 00884420 48895C24085556574881EC8000000048
 StealthKoChanceRet                             ret  0034D02B 0034D026 E883D9CEFF
 StealthKoFailAlert                             code 00684BD0 00684BD0 48895C240848896C2410488974241857
@@ -450,6 +469,7 @@ ShopTraderCache                                var  0212E9F8 0212E9F8 -
 ShowInventory                                  code 006E6080 006E6080 48895C2420555657415641574883EC50
 ShowTraderInventory                            code 006E6350 006E6350 488BC45741544155415641574883EC40
 ShowTradeWindow                                code 00790D00 00790D00 4885D20F841D02000053574154415548
+SlaveSellingConfirm                            code 006A7F30 006A7F30 4C8BDC57415441554881EC8000000048
 SlaveStatePeriodic                             code 005A44C0 005A44C0 4889742420574883EC6033F6488BF940
 SlaveStateSet                                  code 005A3EB0 005A3EB0 488BC4574881ECA002000048C7442420
 SpawnTheBarFlies                               code 009FBE50 009FBE50 488BC4554154415541564157488D6C24
@@ -465,6 +485,7 @@ TitleExit                                      code 009142B0 009142B0 4883EC48E8
 TitleScreen_closePanels                  code 00913BC0 00913BC0 40574883EC3048C7442420FEFFFFFF48
 TitleScreen_ctor                               code 00918020 00918020 488BC4554154415541564157488DA818
 TitleScreen_update                             code 009129B0 009129B0 40574883EC5048C7442420FEFFFFFF48
+TogglePause                                    code 00787200 00787200 48895C24084889742410574883EC500F
 TownFoundPlayer                                code 00933F40 00933F40 4C8BDC5556574881EC9000000048C744
 TownWake                                       code 0092CCE0 0092CCE0 4889542410574883EC508B81D8000000
 TownHand                                       var  01F38690 01F38690 -
@@ -472,6 +493,7 @@ TownInitialiseResidentData                     code 00935F90 00935F90 488BC45548
 TownList                                       var  021330A0 021330A0 -
 TownPeriodicUpdate                             code 0092BE50 0092BE50 40534883EC20F30F108948010000488B
 TradeRangeCheck                                code 0070C6C0 0070C6C0 48896C2420574883EC50410FB6F8488B
+TradingWindowCurrent                           var  02131BE0 02131BE0 -
 TradeResultMessage                             code 0070EC10 0070EC10 4055488DAC2410F5FFFF4881ECF00B00
 TradingForMoney                                code 00710240 00710240 4883EC2848833D5419A20102730733C0
 UniqueStateUpdate                              code 005CE9E0 005CE9E0 40574883EC20488BF9E84DE9A4FF84C0
@@ -557,6 +579,8 @@ WorkerSetErase                                 code 0028D400 0028D400 48895C2410
 SoundPostEvent                                 code 00A860C0 00A860C0 48895C240848896C241048897C241841
 SoundSetSwitch                                 code 00A82010 00A82010 48895C24084889742410574883EC2049
 BuildingUpgrade                                code 002A49A0 002A49A0 488BC4554154415541564157488BEC48
+BuildModeEnterPauseRet                         ret  004E5B7D 004E5B78 E882BAB6FF
+BuildModeLeavePauseRet                         ret  004D0E43 004D0E3E E8BC07B8FF
 BuildingDowngrade                              code 002A4D70 002A4D70 40574883EC7048C7442430FEFFFFFF48
 PowerBatteryCharge                             code 00299460 00299460 40534883EC400F297C2420488BD9E866
 ProductionUpdateInputs                         code 0029A330 0029A330 488BC455415441554883EC604533ED44
@@ -655,6 +679,7 @@ BuildingItemSpot_loadFromSave                  code 005562A0 005562A0 4055565741
 RangedAimAnim                                  code 0051DA50 0051DA50 488BC45557415441554156488D68A148
 RangedReloadTime                               code 00435C70 00435C70 4883EC480F29742430F30F1071280F28
 RangedReloadSkill                              code 00884E10 00884E10 488BC448895808574883EC60C640D001
+DialogLineTest                                 code 006784A0 006784A0 44884C24204889542410574154415541
 FightReadyTime                                 code 00883120 00883120 85D27509F30F1005602BE100C383FA01
 InventorySection_isLimitedSlotCompatible       code 0074B0F0 0074B0F0 48895C24084889742410574883EC2048
 Kapi_SkillXpGain                               code 008C4F20 008C4F20 40534883EC30F30F1005DA63DB000F29
@@ -662,3 +687,46 @@ Kapi_SkillXpTask                               code 008C5260 008C5260 4885D20F84
 ResearchAddProgress                            code 00835CA0 00835CA0 40534883EC70488BD98B89740100000F
 ResearchFrontFraction                          code 0082E1C0 0082E1C0 40534883EC60488BDA4885D275534839
 ResearchWindowRedrawFront                      code 0048B720 0048B720 40534883EC20488B8138010000488BD9
+CraftQueueAdd                                  code 002B5C60 002B5C60 488BC4535556574154415541564881EC
+CraftWorkStep                                  code 002B5A00 002B5A00 48895C2418574883EC4080B960010000
+FurnaceWorkStep                                code 00299F60 00299F60 40564883EC6080B960010000000F297C
+TortureUpdate                                  code 0029AF50 0029AF50 488BC45556574154415541564157488D
+ProductionOutput                               code 00298470 00298470 4C8BDC564881ECB00000004883B94804
+CraftListClear                                 code 002D0E10 002D0E10 48895C24084889742410574883EC2033
+CraftWindowAdd                                 code 002B9730 002B9730 4C8BDC5556574881ECB000000048C744
+CraftTakeWorkSpot                              code 002B5BB0 002B5BB0 40534883EC30488B0148897424504863
+LimbApplyHurt                                  code 00643FE0 00643FE0 F30F104A08F30F100583EEAE01F30F10
+MedicalSystem_evaluate                         code 00648890 00648890 488BC4554154415541564157488D68A1
+TortureLimbHurtRet1                            ret  0029B143 0029B13E E84F40DBFF
+TortureLimbHurtRet2                            ret  0029B219 0029B214 E8793FDBFF
+TortureEvaluateRet                             ret  0029B239 0029B234 E8EAB4D9FF
+TortureDestroyItemRet                          ret  0029B40C 0029B407 E8D00CDBFF
+CraftWindowRedraw                              code 002B9540 002B9540 40564883EC6083795800488BF17C1448
+CraftRemove                                    code 002B69E0 002B69E0 48895C2408574881EC80000000488B81
+CraftWindowRepeat                              code 002B4FC0 002B4FC0 40534883EC2083796800488D5160488B
+CraftRecipeList                                code 002BBCE0 002BBCE0 405556574154415541564157488D6C24
+CraftSelectedBuilding                          code 009F8050 009F8050 40534883EC20488B01488BDAFF502048
+CraftSelectionGlobal                           var  02132F50 02132F50 -
+MainBarBuildButton                             code 00720450 00720450 4883EC3848C7442420FEFFFFFF8B05E1
+BuildModeCancel                                code 004D3890 004D3890 48895C2410564883EC2033D2488BD948
+CraftOpenFor                                   code 002B5050 002B5050 40534883EC3048C7442420FEFFFFFF48
+OverviewShow                                   code 0049B780 0049B780 48895C24084889742410574883EC4048
+OverviewWindowGlobal                           var  0212E4E8 0212E4E8 -
+CampSpawnPass                                  code 008F6440 008F6440 488BC455574154488D6C24904881EC70
+CampSpotPick                                   code 008F5480 008F5480 488BC4554154415541564157488D68A1
+GameDataRandomReference                        code 0057F880 0057F880 48895C240848896C2410488974241857
+CampLimitScale                                 var  02132538 02132538 -
+CampViewDistance                               ro   0172F4F0 0172F4F0 CDCCAC44
+CampNestCheckRet                               ret  008F51EB 008F51E6 E8F4E172FF
+CampDebrisPlace                                code 00937570 00937570 488BC455535657415441554156415748
+BuildingItemSpot_makeItem                      code 00547440 00547440 4889742410574883EC204883B9C00000
+JobStartTakeRet                                ret  0035B4AC 0035B4A6 FF93F8040000
+BuildingItemSpot_update                        code 005493D0 005493D0 40534883EC30488B01488BD9FF90F800
+JobClaimSetFactionRet                          ret  0035B9E4 0035B9DE FF93A0000000
+BuildingOnSelect                               code 0054FA10 0054FA10 4C8BDC574881EC8000000048C7442440
+ForgottenGuiBuildingWindow                     code 006E5EA0 006E5EA0 48895C241048896C2418488974242057
+PrisonTakeRet                                  ret  00330732 0033072C FF90F8040000
+HaulStoreSearchOwnerTest                       code 0059A39A 0059A39A 4883B850020000000F84BC0000004D85
+HaulCandidatesGather                           code 008CAFD0 008CAFD0 488BC45741544155415641574883EC70
+OwnershipsMayUse                               code 006207A0 006207A0 48895C24084889742410574883EC2048
+HaulSearchGatherRet                            ret  0059A2C7 0059A2C2 E85B4FA7FF

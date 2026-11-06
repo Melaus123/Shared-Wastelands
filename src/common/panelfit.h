@@ -265,7 +265,8 @@ enum PanelLayoutId
     kLayResetWorld = 15,   /* RESET WORLD?: HOST GAME's reset confirm - its text, the keep-buildings tick box, the last paragraph, CANCEL / RESET WORLD */
     kLayNewProfileHint = 16,   /* T-1096 part 3: NEW PROFILE with the hint line under START WITH */
     kLaySpImport = 17,         /* T-1096 part 3: IMPORT FROM SINGLE PLAYER - PROFILES' third dialog (kProfDlgImport) */
-    kLayCount = 18
+    kLayOptionsWorld = 18,     /* GAME OPTIONS in a running world: GAME OPTIONS' rows with a full row for the admin line over DEFAULTS / DONE */
+    kLayCount = 19
 };
 /* Screen 4 (the world dialog) is RESET WORLD? while its dialog number (PanelLayoutOf's profDlg on that screen) is this, else DELETE WORLD?. */
 const int kWorldDlgReset = 3;
@@ -289,7 +290,7 @@ enum PanelSlotId
     kSlotNetAddr,                                         /* T-510: HOSTING's INTERNET ADDRESS row, under LOCAL ADDRESS */
     kSlotVpnAddr,                                         /* T-631: HOSTING's RADMIN / HAMACHI ADDRESS row, between the two */
     kSlotPwRow,                                           /* T-290: HOST GAME's PASSWORD row (label, box, SHOW / HIDE), above PORT */
-    kSlotJoinByAddr,                                      /* JOIN BY ADDRESS: JOIN GAME's line between the friends list and IP ADDRESS */
+    kSlotJoinByAddr,                                      /* JOIN BY ADDRESS: JOIN GAME's line between the friends list and ADDRESS */
     kSlotSteamRow,                                        /* HOSTING's STEAM row: its label, INVITE FRIENDS at the right and, without Steam, its line */
     kSlotDlgTick,                                         /* RESET WORLD?'s keep-buildings tick box and its label, between its text and its last paragraph */
     kSlotDlgTail,                                         /* RESET WORLD?'s last paragraph, under the tick box (PanelLive::tail) */
@@ -298,7 +299,8 @@ enum PanelSlotId
     kSlotImpBoxes,                                        /* T-1096 part 3: IMPORT FROM SINGLE PLAYER's COMES ALONG / STAYS BEHIND, side by side */
     kSlotImpArrival,                                      /* T-1096 part 3: its arrival line */
     kSlotKeepTick,                                        /* HOST GAME's "Keep this world running for others" tick box and its label */
-    kSlotKeepNote                                         /* its note under the label - and, ticked, the home-network warning (PanelLive::keep) */
+    kSlotKeepNote,                                        /* its note under the label - and, ticked, the home-network warning (PanelLive::keep) */
+    kSlotOptNote                                          /* GAME OPTIONS in a running world: "Only an admin can change these." over DEFAULTS / DONE */
 };
 struct PanelSlot { int slot; int halves; };
 const int kPanelMaxHalves = kPanelRows * 2;
@@ -306,8 +308,10 @@ const int kPanelMaxHalves = kPanelRows * 2;
 /* The layout a screen shows: the panel's screen number (ui.cpp g_panelScreen: 0 MULTIPLAYER, 1 HOST GAME, 2 JOIN GAME,
    3 NEW WORLD, 4 DELETE WORLD?, 5 HOSTING, 6 GAME OPTIONS, 7 PROFILES, 8 PASSWORD REQUIRED) and, on PROFILES, which of its
    dialogs is up. */
-inline int PanelLayoutOf(int screen, int profDlg, int nameHint = 0, int vpnRow = 0)
+/* inWorld 1 = GAME OPTIONS is the running world's (ui.cpp g_optInWorld): screen 6 takes kLayOptionsWorld. */
+inline int PanelLayoutOf(int screen, int profDlg, int nameHint = 0, int vpnRow = 0, int inWorld = 0)
 {
+    if (screen == 6 && inWorld != 0) return kLayOptionsWorld;
     if (screen == 7)   /* T-1096 part 3: on NEW PROFILE nameHint is START WITH's hint line */
         return profDlg == 1 ? (nameHint != 0 ? kLayNewProfileHint : kLayNewProfile) : profDlg == 2 ? kLayDeleteProfile
              : profDlg == kProfDlgImport ? kLaySpImport : kLayProfiles;
@@ -360,14 +364,16 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
                                           { kSlotListBtns, 2 }, { kSlotPwRow, 2 }, { kSlotPortRow, 2 },
                                           { kSlotProfRow, 2 }, { kSlotKeepTick, 2 }, { kSlotKeepNote, 3 }, { kSlotStatus, 3 }, { kSlotButtons, 2 } };
     /* JOIN GAME's rows: PLAYER NAME, the friends list (its heads and rows, or the line in its place - kSlotList) with REFRESH under it at
-       the right (kSlotListBtns), JOIN BY ADDRESS, IP ADDRESS, then the status area.  Thirteen rows hold them with the list at 5
+       the right (kSlotListBtns), JOIN BY ADDRESS, ADDRESS, PORT (T-793, decision 960: the PORT row took the half-row gap that sat
+       above the status area, so the window is the 26 half-rows HOST GAME's is; the status area's first line sits under the PORT
+       box's bottom edge, never over it), then the status area.  Thirteen rows hold them with the list at 5
        half-rows; with the name's hint up the status ceiling is 7 - the opening line alone, JOIN is greyed while the hint shows.
        No gap row between the status area and BACK / JOIN: the status area's own spare under its last line is that gap, so the
        help line sits one gap above the bottom row and the window is no taller than its rows. */
     static const PanelSlot join[]     = { { kSlotNameRow, 2 }, { kSlotList, 5 }, { kSlotListBtns, 2 }, { kSlotJoinByAddr, 2 },
-                                          { kSlotAddrRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 9 }, { kSlotButtons, 2 } };
+                                          { kSlotAddrRow, 2 }, { kSlotPortRow, 2 }, { kSlotStatus, 9 }, { kSlotButtons, 2 } };
     static const PanelSlot joinHint[] = { { kSlotNameRow, 2 }, { kSlotNameHint, 2 }, { kSlotList, 5 }, { kSlotListBtns, 2 },
-                                          { kSlotJoinByAddr, 2 }, { kSlotAddrRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 7 },
+                                          { kSlotJoinByAddr, 2 }, { kSlotAddrRow, 2 }, { kSlotPortRow, 2 }, { kSlotStatus, 7 },
                                           { kSlotButtons, 2 } };
     static const PanelSlot nameDlg[]  = { { kSlotDlgText, 3 }, { kSlotGap, 1 }, { kSlotDlgName, 2 }, { kSlotGap, 1 },
                                           { kSlotButtons, 2 } };
@@ -387,6 +393,9 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
     static const PanelSlot invite[]   = { { kSlotList, 8 }, { kSlotGap, 1 }, { kSlotStatus, 3 }, { kSlotButtons, 2 } };
     static const PanelSlot options[]  = { { kSlotTabs, 2 }, { kSlotGap, 1 }, { kSlotOptRows, 20 }, { kSlotGap, 1 },
                                           { kSlotButtons, 2 } };
+    /* GAME OPTIONS in a running world: the same window height, the two half-row gaps given to one full row for the admin line, so its
+       words have a whole row (Kenshi's line height fits it at every row height the panel allows) under the tenth option row. */
+    static const PanelSlot optionsWorld[] = { { kSlotTabs, 2 }, { kSlotOptRows, 20 }, { kSlotOptNote, 2 }, { kSlotButtons, 2 } };
     static const PanelSlot profiles[] = { { kSlotList, 8 }, { kSlotGap, 1 }, { kSlotListBtns, 2 }, { kSlotGap, 1 },
                                           { kSlotStatus, 8 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
     static const PanelSlot delProf[]  = { { kSlotDlgText, 4 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
@@ -423,6 +432,7 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
     case kLayDeleteWorld:   s = delWorld; n = (int)(sizeof(delWorld) / sizeof(delWorld[0])); break;
     case kLayHosting:       s = hosting;  n = (int)(sizeof(hosting) / sizeof(hosting[0]));   break;
     case kLayOptions:       s = options;  n = (int)(sizeof(options) / sizeof(options[0]));   break;
+    case kLayOptionsWorld:  s = optionsWorld; n = (int)(sizeof(optionsWorld) / sizeof(optionsWorld[0])); break;
     case kLayProfiles:      s = profiles; n = (int)(sizeof(profiles) / sizeof(profiles[0])); break;
     case kLayDeleteProfile: s = delProf;  n = (int)(sizeof(delProf) / sizeof(delProf[0]));   break;
     case kLayHostHint:      s = hostHint; n = (int)(sizeof(hostHint) / sizeof(hostHint[0])); break;   /* T-201 N1b */

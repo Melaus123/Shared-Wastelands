@@ -19,6 +19,8 @@
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "../common/modversion.h"   /* the mod's version, the log's first line */
 #include "../common/linekeep.h"   /* T-910: the [KEEPER] lines kept in memory for the bug report */
+#include "../common/crashkeep.h"   /* a launch that did not quit normally, kept in the crashes folder at the next start */
+#include <vector>
 
 namespace
 {
@@ -86,6 +88,14 @@ namespace
     int  g_rotateDone = 0;
     char g_rotateNote[320];
     int  g_versionSaid = 0;   /* guarded by g_lock: the version line is this log's first line */
+    /* guarded by g_lock: the start-up's [CRASHKEEP] line (src/common/crashkeep.h), written into the new log after the version line */
+    char g_crashNote[640];
+    /* the start-up's crash keep, handed from the rotation (log lock held) to the first log line that has let the lock go:
+       0 nothing to do, 1 waiting, 2 claimed by one thread. Plain arrays: a log call may come before any constructor has run. */
+    volatile LONG g_ckState = 0;
+    wchar_t g_ckFolder[2048];
+    wchar_t g_ckName[2048];
+    int g_ckPrevMoved = 0;
 
     /* The file part of a path, each wchar_t truncated to a char (the names here are ASCII). Allocates nothing. */
     void NarrowFilePart(const std::wstring& path, char* out, size_t outSize)
@@ -134,6 +144,322 @@ namespace
         if (v == NULL) { ::CloseHandle(m); return &g_ownShared; }
         *created = err != ERROR_ALREADY_EXISTS;   /* a new mapping is zero-filled */
         return (LogShared*)v;   /* m and the view are deliberately never closed: the other copy must find the same block */
+    }
+
+    /* ---- A LAUNCH THAT DID NOT QUIT NORMALLY, KEPT (src/common/crashkeep.h). Runs with no lock held (RunCrashKeepOnce), so no
+       thread's log line waits for the reading and copying; nothing here logs - its line goes to g_crashNote (SetCrashNote). ---- */
+
+    long long CkFileTimeSec(const FILETIME& ft) { return (long long)((((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10000000ull); }
+
+    std::wstring CkWiden(const std::string& s)   /* the names here are ASCII */
+    {
+        std::wstring w;
+        for (size_t i = 0; i < s.size(); ++i) w += (wchar_t)(unsigned char)s[i];
+        return w;
+    }
+
+    /* Up to `want` bytes of an open file from byte `at` (fewer at its end). False on a read error. */
+    bool CkReadAt(HANDLE h, unsigned long long at, unsigned long long want, std::string* out)
+    {
+        out->clear();
+        LARGE_INTEGER p;
+        p.QuadPart = (LONGLONG)at;
+        if (!::SetFilePointerEx(h, p, NULL, FILE_BEGIN)) return false;
+        out->resize((size_t)want);
+        size_t got = 0;
+        while (got < out->size())
+        {
+            const size_t left = out->size() - got;
+            DWORD n = 0;
+            if (!::ReadFile(h, &(*out)[got], (DWORD)(left > (1u << 20) ? (1u << 20) : left), &n, NULL)) return false;
+            if (n == 0) break;
+            got += n;
+        }
+        out->resize(got);
+        return true;
+    }
+
+    /* `text` in the first (head) or the newest (!head) `bytes` of the file at `path`: 1 yes, 0 no, -1 the file is not there,
+       -2 it could not be read (*err). */
+    int CkFileHas(const std::wstring& path, bool head, unsigned long long bytes, const char* text, DWORD* err)
+    {
+        HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            const DWORD e = ::GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return -1;
+            *err = e;
+            return -2;
+        }
+        std::string buf;
+        LARGE_INTEGER sz;
+        bool ok = ::GetFileSizeEx(h, &sz) != 0;
+        if (ok)
+        {
+            const unsigned long long n = (unsigned long long)sz.QuadPart;
+            ok = CkReadAt(h, (head || n <= bytes) ? 0 : n - bytes, bytes, &buf);
+        }
+        if (!ok) *err = ::GetLastError();
+        ::CloseHandle(h);
+        if (!ok) return -2;
+        return swcrashkeep::HasText(buf.data(), buf.size(), text) ? 1 : 0;
+    }
+
+    /* Reads launch 1's log for the judgement (swcrashkeep::Judge): returns swcrashkeep::kLog*, with whether the exit hook's install
+       line and a quit route line are there, and the newest part's size. `part` = launch 1's parts (cooplogrot::kPart*). */
+    int CkReadPrevious(const std::wstring part[], bool* hook, bool* route, unsigned long long* size, DWORD* err)
+    {
+        *hook = false; *route = false; *size = 0; *err = 0;
+        /* no write sharing: a game still writing this log holds it open for writing, and the open then fails with a sharing
+           violation - a game that is still running, not a crash */
+        HANDLE h = ::CreateFileW(part[cooplogrot::kPartCurrent].c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            *err = ::GetLastError();
+            if (*err == ERROR_FILE_NOT_FOUND || *err == ERROR_PATH_NOT_FOUND) return swcrashkeep::kLogMissing;
+            return *err == ERROR_SHARING_VIOLATION ? swcrashkeep::kLogHeld : swcrashkeep::kLogUnreadable;
+        }
+        bool tailRead = false, tailRoute = false;
+        int headHas = -2;
+        LARGE_INTEGER sz;
+        std::string buf;
+        if (::GetFileSizeEx(h, &sz))
+        {
+            const unsigned long long n = (unsigned long long)sz.QuadPart;
+            const unsigned long long tail = swcrashkeep::kRouteTailBytes;
+            *size = n;
+            tailRead = CkReadAt(h, n > tail ? n - tail : 0, tail, &buf);
+            if (tailRead) tailRoute = swcrashkeep::HasText(buf.data(), buf.size(), swcrashkeep::kRouteText);
+            if (tailRead && CkReadAt(h, 0, swcrashkeep::kHeadBytes, &buf)) headHas = swcrashkeep::HasText(buf.data(), buf.size(), swcrashkeep::kHookOkText) ? 1 : 0;
+        }
+        if (!tailRead || headHas == -2) *err = ::GetLastError();
+        ::CloseHandle(h);
+        DWORD e2 = 0;
+        const int startHas = CkFileHas(part[cooplogrot::kPartStart], true, swcrashkeep::kHeadBytes, swcrashkeep::kHookOkText, &e2);
+        const int prevHas = tailRoute ? 0 : CkFileHas(part[cooplogrot::kPartPrev], false, swcrashkeep::kRouteTailBytes, swcrashkeep::kRouteText, &e2);
+        if (*err == 0) *err = e2;
+        return swcrashkeep::ReadState(tailRead, tailRoute, startHas, headHas, prevHas, hook, route);
+    }
+
+    /* Kenshi's crash file that ended the previous launch, looked for in each of `folders` (swcrashkeep::CrashFolders): one
+       coopbug::CrashFromLastLaunch places in that launch (written within kCrashNearSec of copy 1's last write, and before this
+       launch began), at most 4 MB, a .zip before a .dmp, the newest first - as the bug report picks it. Its full path, or empty. */
+    std::wstring CkFindCrashFile(const std::vector<std::wstring>& folders, long long prevLogEnd, std::wstring* fileName)
+    {
+        fileName->clear();
+        if (prevLogEnd <= 0) return std::wstring();
+        FILETIME ct, et, kt, ut;
+        if (!::GetProcessTimes(::GetCurrentProcess(), &ct, &et, &kt, &ut)) return std::wstring();
+        const long long launch = CkFileTimeSec(ct);
+        std::wstring best;
+        int bestKind = 0;
+        long long bestAt = 0;
+        for (size_t d = 0; d < folders.size(); ++d)
+        {
+            WIN32_FIND_DATAW fd;
+            HANDLE f = ::FindFirstFileW((folders[d] + L"crashDump*").c_str(), &fd);
+            if (f == INVALID_HANDLE_VALUE) continue;
+            do
+            {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                char narrow[MAX_PATH];
+                NarrowFilePart(std::wstring(fd.cFileName), narrow, sizeof(narrow));
+                const int kind = coopbug::CrashFileKind(narrow);
+                const unsigned long long size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                const long long t = CkFileTimeSec(fd.ftLastWriteTime);
+                if (kind == 0 || size > (4ull << 20) || !coopbug::CrashFromLastLaunch(t, prevLogEnd, launch)) continue;
+                if (best.empty() || kind > bestKind || (kind == bestKind && t > bestAt))
+                { best = folders[d] + fd.cFileName; *fileName = fd.cFileName; bestKind = kind; bestAt = t; }
+            } while (::FindNextFileW(f, &fd));
+            ::FindClose(f);
+        }
+        return best;
+    }
+
+    /* Removes one entry's folder whole: every file in it, then the folder. 0, or the first Windows error. */
+    DWORD CkRemoveFolder(const std::wstring& dir)
+    {
+        DWORD first = 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE f = ::FindFirstFileW((dir + L"\\*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                const std::wstring p = dir + L"\\" + fd.cFileName;
+                ::SetFileAttributesW(p.c_str(), FILE_ATTRIBUTE_NORMAL);   /* a read-only copy goes too */
+                if (!::DeleteFileW(p.c_str()) && first == 0) first = ::GetLastError();
+            } while (::FindNextFileW(f, &fd));
+            ::FindClose(f);
+        }
+        if (!::RemoveDirectoryW(dir.c_str()) && first == 0) first = ::GetLastError();
+        return first;
+    }
+
+    /* The previous launch did not quit normally: every part of its log (`part`, launch 1's) and Kenshi's crash file that ended it
+       go into a new entry of <folder>crashes\, built under its ".part" name and renamed when every file is in; then only the
+       newest swcrashkeep::kKeepEntries entries stay (older ones, and a ".part" a cut-off copy left, are removed whole). Returns
+       the [CRASHKEEP] line. */
+    std::string CkKeep(const std::wstring& folder, const std::wstring part[], unsigned long long logBytes)
+    {
+        using namespace swcrashkeep;
+        /* Kenshi's crash file is paired now, while it is there: a later crash writes the same file name again */
+        std::wstring program;
+        {
+            wchar_t p[2048];
+            const DWORD n = ::GetModuleFileNameW(NULL, p, 2048);
+            if (n != 0 && n < 2048)
+            {
+                const std::wstring s(p, n);
+                const std::wstring::size_type k = s.find_last_of(L"\\/");
+                if (k != std::wstring::npos) program = s.substr(0, k + 1);
+            }
+        }
+        long long prevEnd = 0;
+        WIN32_FILE_ATTRIBUTE_DATA ad;
+        if (::GetFileAttributesExW(part[cooplogrot::kPartCurrent].c_str(), GetFileExInfoStandard, &ad)) prevEnd = CkFileTimeSec(ad.ftLastWriteTime);
+        std::wstring crashFileName;
+        const std::wstring crashFile = CkFindCrashFile(CrashFolders(program, folder), prevEnd, &crashFileName);
+
+        const std::wstring root = folder + kFolderW;
+        if (!::CreateDirectoryW(root.c_str(), NULL))
+        {
+            const DWORD e = ::GetLastError();
+            if (e != ERROR_ALREADY_EXISTS) return NoteLine(kVerdictCrashed, true, e, "", 0, "", "", 0, "");
+        }
+        SYSTEMTIME t;
+        ::GetSystemTime(&t);
+        std::string entry;
+        std::wstring building;
+        DWORD err = ERROR_ALREADY_EXISTS;
+        for (int attempt = 0; attempt < 10; ++attempt)
+        {
+            const std::string e = EntryName(t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, (unsigned long)::GetCurrentProcessId(), attempt);
+            const std::wstring w = root + L"\\" + CkWiden(e);
+            if (::GetFileAttributesW(w.c_str()) != INVALID_FILE_ATTRIBUTES) continue;   /* that name is an entry already */
+            const std::wstring b = w + CkWiden(kPartialSuffix);
+            if (::CreateDirectoryW(b.c_str(), NULL)) { entry = e; building = b; break; }
+            err = ::GetLastError();
+            if (err != ERROR_ALREADY_EXISTS) break;
+        }
+        if (entry.empty()) return NoteLine(kVerdictCrashed, true, err, "", 0, "", "", 0, "");
+        /* the log's parts under the names a launch's own parts have, then the crash file under its own */
+        err = 0;
+        std::string parts;
+        const std::wstring base(swnames::kLogW);
+        for (int k = 0; k < (int)cooplogrot::kPartKinds && err == 0; ++k)
+        {
+            const std::wstring to = building + L"\\" + cooplogrot::PartName(base, 0, k);
+            if (::CopyFileW(part[k].c_str(), to.c_str(), TRUE))
+            {
+                if (!parts.empty()) parts += "+";
+                parts += k == (int)cooplogrot::kPartStart ? "start" : k == (int)cooplogrot::kPartPrev ? "prev" : "newest";
+                continue;
+            }
+            const DWORD e = ::GetLastError();
+            /* a log under 2 MB has no .start part and one that was never cut twice no .prev part */
+            if (k != (int)cooplogrot::kPartCurrent && (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)) continue;
+            err = e;
+        }
+        std::string crashName;
+        if (err == 0 && !crashFile.empty())
+        {
+            if (::CopyFileW(crashFile.c_str(), (building + L"\\" + crashFileName).c_str(), TRUE))
+            {
+                char nb[MAX_PATH];
+                NarrowFilePart(crashFileName, nb, sizeof(nb));
+                crashName = nb;
+            }
+            else err = ::GetLastError();
+        }
+        if (err == 0 && !::MoveFileExW(building.c_str(), (root + L"\\" + CkWiden(entry)).c_str(), 0)) err = ::GetLastError();
+        if (err != 0)
+        {
+            CkRemoveFolder(building);   /* never half an entry */
+            return NoteLine(kVerdictCrashed, true, err, "", 0, "", "", 0, "");
+        }
+
+        std::vector<std::string> names, partial;
+        WIN32_FIND_DATAW fd;
+        HANDLE f = ::FindFirstFileW((root + L"\\*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                char nb[MAX_PATH];
+                NarrowFilePart(std::wstring(fd.cFileName), nb, sizeof(nb));
+                if (IsEntryName(nb)) names.push_back(nb);
+                else if (IsPartialName(nb)) partial.push_back(nb);
+            } while (::FindNextFileW(f, &fd));
+            ::FindClose(f);
+        }
+        const std::vector<std::string> old = EntriesToRemove(names, kKeepEntries);
+        int kept = (int)names.size();
+        std::string removed;
+        for (size_t i = 0; i < old.size(); ++i)
+        {
+            const DWORD e = CkRemoveFolder(root + L"\\" + CkWiden(old[i]));
+            if (!removed.empty()) removed += ", ";
+            removed += old[i];
+            if (e == 0) { --kept; continue; }
+            char b[64];
+            _snprintf_s(b, sizeof(b), _TRUNCATE, " (not removed: Windows error %lu)", (unsigned long)e);
+            removed += b;
+        }
+        for (size_t i = 0; i < partial.size(); ++i) CkRemoveFolder(root + L"\\" + CkWiden(partial[i]));
+        return NoteLine(kVerdictCrashed, false, 0, entry, logBytes, parts, crashName, kept, removed);
+    }
+
+    /* The [CRASHKEEP] line, for the next log line to write (under the log lock: the line is read under it). */
+    void SetCrashNote(const char* text)
+    {
+        EnsureLock();
+        ::EnterCriticalSection(&g_lock);
+        _snprintf_s(g_crashNote, sizeof(g_crashNote), _TRUNCATE, "%s", text);
+        ::LeaveCriticalSection(&g_lock);
+    }
+
+    /* After the start-up rotation: the previous launch's newest part became copy 1 (prevMoved 1), was not there (0) or did not
+       move (-1, so copy 1 is an older launch's, judged at an earlier start). Judges copy 1 (swcrashkeep::Judge) and keeps it when
+       that launch did not quit normally (CkKeep). The outcome goes to g_crashNote. Never throws. No lock held. */
+    void KeepCrashedLaunch(const std::wstring& folder, const std::wstring& name, int prevMoved)
+    {
+        try
+        {
+            std::wstring part[cooplogrot::kPartKinds];
+            for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k) part[k] = cooplogrot::PartName(name, 1, k);
+            int verdict = prevMoved < 0 ? (int)swcrashkeep::kVerdictNotMoved : (int)swcrashkeep::kVerdictNoLog;
+            bool hook = false, route = false;
+            unsigned long long logBytes = 0;
+            DWORD err = 0;
+            if (prevMoved > 0)
+            {   /* the reading first, then the judgement: a call's arguments have no set order, so hook and route passed beside the
+                   reading in one call were copied before it filled them in (T1815: every launch judged "not all marked") */
+                const int logState = CkReadPrevious(part, &hook, &route, &logBytes, &err);
+                verdict = swcrashkeep::Judge(logState, hook, route);
+            }
+            const std::string line = verdict == swcrashkeep::kVerdictCrashed ? CkKeep(folder, part, logBytes)
+                                                                             : swcrashkeep::NoteLine(verdict, false, err, "", 0, "", "", 0, "");
+            SetCrashNote(line.c_str());
+        }
+        catch (...)
+        {
+            SetCrashNote("[CRASHKEEP] stopped: out of memory - nothing kept");
+        }
+    }
+
+    /* The start-up's crash keep, once per copy of this DLL that rotated, run by the first log line after the rotation once that
+       line has let the log lock go (WriteLine). Any thread; the first to claim it runs it. Its line is written by the next log
+       line. */
+    void RunCrashKeepOnce()
+    {
+        if (g_ckState != 1 || ::InterlockedCompareExchange(&g_ckState, 2, 1) != 1) return;
+        try { KeepCrashedLaunch(std::wstring(g_ckFolder), std::wstring(g_ckName), g_ckPrevMoved); }
+        catch (...) { SetCrashNote("[CRASHKEEP] stopped: out of memory - nothing kept"); }
     }
 
     /* Caller holds g_lock. ONCE PER COPY OF THIS DLL, BEFORE THE LOG IS OPENED: the earlier launches' logs move one place
@@ -199,6 +525,7 @@ namespace
         }
 
         const int last = (int)cooplogrot::kLogKeep - 1;
+        int prevMoved = 0;   /* the previous launch's newest part: 1 moved to copy 1, 0 not there, -1 its move failed */
         for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k)
         {
             if (::DeleteFileW(names[last][k].c_str())) continue;
@@ -211,12 +538,28 @@ namespace
         for (int n = last - 1; n >= 0; --n)
             for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k)
             {
-                if (::MoveFileExW(names[n][k].c_str(), names[n + 1][k].c_str(), MOVEFILE_REPLACE_EXISTING)) continue;
+                const bool prevPart = n == 0 && k == (int)cooplogrot::kPartCurrent;
+                if (::MoveFileExW(names[n][k].c_str(), names[n + 1][k].c_str(), MOVEFILE_REPLACE_EXISTING)) { if (prevPart) prevMoved = 1; continue; }
                 err = ::GetLastError();
-                if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) NoteRotateStep("rename", names[n][k], &names[n + 1][k], err);
+                if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+                {
+                    NoteRotateStep("rename", names[n][k], &names[n + 1][k], err);
+                    if (prevPart) prevMoved = -1;
+                }
             }
         ::ReleaseMutex(m);
         /* m is deliberately never closed: a later copy's CreateMutexW must find it */
+        /* copy 1 is the previous launch now: it is judged, and kept in the crashes folder when it did not quit normally - but not
+           here, where the caller holds the log lock (g_lock) and every thread's log line would wait for the reading and copying
+           (up to about 18 MB). It is handed to the first log line that has let the lock go (RunCrashKeepOnce). Only this copy of
+           the DLL rotated, so nothing else here moves copy 1 meanwhile. */
+        if (folder.size() < 2048 && name.size() < 2048)
+        {
+            wcscpy_s(g_ckFolder, 2048, folder.c_str());
+            wcscpy_s(g_ckName, 2048, name.c_str());
+            g_ckPrevMoved = prevMoved;
+            ::InterlockedExchange(&g_ckState, 1);
+        }
     }
 
     /* Caller holds g_lock. Opens the file if it is not open yet. A failed attempt is NOT remembered: the next
@@ -466,6 +809,14 @@ namespace
                 g_rotateNote[0] = 0;
                 WriteCounted(note, (DWORD)strlen(note));
             }
+            if (g_fileState == 1 && g_crashNote[0])
+            {
+                /* the start-up's judgement of the previous launch, said once (src/common/crashkeep.h) */
+                char note[sizeof(g_crashNote) + 64];
+                _snprintf_s(note, sizeof(note), _TRUNCATE, "%s KenshiCoop: %s\r\n", timeStr, g_crashNote);
+                g_crashNote[0] = 0;
+                WriteCounted(note, (DWORD)strlen(note));
+            }
             if (g_fileState == 1)
             {
                 char prefix[kPrefixGap + 1];
@@ -486,6 +837,7 @@ namespace
             /* out of memory while opening the file: the line is dropped, the next line tries again */
         }
         ::LeaveCriticalSection(&g_lock);
+        RunCrashKeepOnce();   /* the start-up's crash keep, once, with no lock held */
     }
 
     /* wide -> narrow: each wchar_t truncated to a char. */

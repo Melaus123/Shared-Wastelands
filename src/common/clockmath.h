@@ -88,6 +88,9 @@ double ClockSharedHoursAt(double srvHours, double srvAtMs, double nowMs,
    ONE predicate, used by store.cpp's vote note, the speedvote lever and the world server's OnSpeedVote. */
 const float kClockSpeedMax = 50.0f;
 int ClockSpeedIsValid(float speed);
+/* A SPEEDVOTE of this value is not a speed: the sending game's world closed, and the world server drops that game's choice as it
+   does at a disconnect (world-server protocol 136). ClockSpeedIsValid refuses it, so it can never be read as a choice. */
+const float kSpeedVoteWithdrawn = -1.0f;
 /* 1 for the four speeds the engine's own buttons set (0, 1, 2, 5) - for log text only; nothing is refused by it. */
 int ClockSpeedIsBuiltIn(float speed);
 
@@ -114,7 +117,7 @@ void LiveSpeedNoteApplied(LiveSpeedMemo* m, float seenAfter, float srv);
 /* A speed-mod value arrived inside the adoption gap: it is kept as the value the next adoption sends. */
 void LiveSpeedNoteWaited(LiveSpeedMemo* m, float live);
 /* An adoption was made at nowMs; `seenNow` is the global at that moment. It is HELD (left on the engine until the world
-   answers) only when this game's vote counts (`voteCounts`: consensus, or this game is the authority under fixed) and no
+   answers) only when this game's vote counts (`voteCounts`: TimeModePressCounts for the world's GAME SPEED CONTROL) and no
    other hold began within kClockSpeedRevoteMs. */
 void LiveSpeedNoteAdopted(LiveSpeedMemo* m, float seenNow, unsigned int nowMs, int voteCounts);
 /* The value an adoption sends: the global itself when it holds a speed-mod change nothing accounts for, else the kept one. */
@@ -202,6 +205,51 @@ float EffectiveSpeedFrom(const std::vector<void*>& order,
                          const std::map<void*, float>& votes,
                          int consensus, float lastRealSpeed);
 
+/* THE GAME SPEED CONTROL RULE (the world's `timemode`) as the CLOCK's mode byte carries it. rules.txt and GAME OPTIONS name
+   the four by their words (rulesfile.h Words): fixed "Admin only", consensus "Slowest wins", vote "Everyone agrees",
+   locked "Normal speed only". */
+const int kTimeModeAdmin   = 0;   /* `fixed`: the last speed an admin in the world chose; no admin in the world = 1x */
+const int kTimeModeSlowest = 1;   /* `consensus`: the slowest choice among the games in the world */
+const int kTimeModeAgree   = 2;   /* `vote`: the speed every game in the world chose; any disagreement = 1x */
+const int kTimeModeNormal  = 3;   /* `locked`: always 1x */
+const int kTimeModeCount   = 4;
+/* "fixed" / "consensus" / "vote" / "locked" -> the mode byte; -1 for any other text */
+int TimeModeOfWire(const char* wire);
+/* the mode byte -> its `timemode` value; "" for a byte no mode has */
+const char* TimeModeWire(int mode);
+
+/* THE WORLD'S SPEED under `mode`. `inWorld` = the games in the world now, in connection order (a game connected but at the
+   title screen or loading is not one); `admins` = the games that are an admin now (only those also in the world count);
+   `votes` = each game's latest choice (0 = paused); `voteSeq` = when each choice was made (larger = later), present only for
+   a choice made while that game was an admin. With no game in
+   the world the world rests and `lastRealSpeed` is kept, as EffectiveSpeedFrom does.
+     Admin only         the choice with the largest voteSeq among the admins in the world (a game with no voteSeq made its
+                        latest choice while not an admin and is skipped); no admin in the world, or none of them has a
+                        choice made as an admin = 1x.
+     Slowest wins       EffectiveSpeedFrom over the games in the world (a game that never chose is not counted).
+     Everyone agrees    the speed every game in the world chose, a pause being one (owner 1351 a: the world pauses only
+                        when every game in it paused), a game that never chose counting as 1x; any disagreement = 1x.
+     Normal speed only  1x; nobody can pause (owner 1351 a). */
+float WorldSpeedFor(int mode, const std::vector<void*>& inWorld, const std::vector<void*>& admins,
+                    const std::map<void*, float>& votes, const std::map<void*, long long>& voteSeq, float lastRealSpeed);
+
+/* 1 = this game's own choice (`speed`; 0 is a pause) can move the world's speed under `mode`, 0 = it never can. A game that is
+   not an admin now cannot under Admin only (its pause included); under Normal speed only none can, a pause included. Under Slowest wins
+   and Everyone agrees every choice counts, and the other games' choices decide whether it is used. */
+int TimeModePressCounts(int mode, int adminNow, float speed);
+
+/* A SPEED PRESS THE WORLD DID NOT USE. After a press went up the world server's CLOCKs are compared with the choice; the first
+   CLOCK may have left the world server before the press arrived, so a difference counts from the second one on.
+   `clocksSinceSend` = CLOCKs received since the press went up. */
+const int kSpeedPressWait = 0, kSpeedPressTaken = 1, kSpeedPressNotTaken = 2;
+int SpeedPressAnswer(float chosen, float worldSpeed, long long clocksSinceSend);
+/* the grey chat line that says why (mock-up 8), to the pressing player only and at most once per kSpeedLineGapMs; "" for a
+   byte no mode has */
+const unsigned int kSpeedLineGapMs = 30000;
+const char* SpeedNotTakenLine(int mode);
+/* 1 = the line may be said now: never said yet, or said kSpeedLineGapMs ago or more (an unsigned difference: the tick count wraps) */
+int SpeedLineDue(int saidBefore, unsigned int lastSaidMs, unsigned int nowMs);
+
 /* T-288 (owner rule 2026-09-29, industry standard): a conversation window must not pause a multiplayer session.
    DialogueWindow::show calls GameWorld::userPause(true) and DialogueWindow::hide calls userPause(false). `site` is
    1 for show's call, 2 for hide's, anything else = not a conversation call. `linked` is 1 while this game is in a
@@ -210,6 +258,54 @@ float EffectiveSpeedFrom(const std::vector<void*>& order,
    REAL pause, lowers it, and its closing unpause passes through and lifts it. Returns 1 = let the call through to
    the engine (today's behaviour), 0 = skip it. */
 int DialoguePauseLetThrough(int site, int linked, int* suppressed);
+
+/* T-927 (owner rules 2026-10-19 'Menus never stop the world in multiplayer' and 2026-10-30 'Menu pause only with
+   slowest time wins'): the game menu (Esc) and build mode stop nobody's world in a session. Each reaches the engine
+   through GameWorld::togglePause from one call site: the menu's show pauses (only when the game was running), its
+   hide unpauses (only when its show paused), build mode's entry pauses, its exit always unpauses. `site` names the
+   call; anything else is kMenuSiteNone and always passes. */
+const int kMenuSiteNone = 0, kMenuSiteMenuOpen = 1, kMenuSiteMenuClose = 2, kMenuSiteBuildEnter = 3, kMenuSiteBuildLeave = 4;
+const int kMenuSiteCount = 5;
+/* the answer: pass the call to the engine (today's behaviour); skip it; skip it and cast this player's pause vote;
+   skip it and give this player back the speed choice they had before the menu's vote */
+const int kMenuPass = 0, kMenuSkip = 1, kMenuSkipVote = 2, kMenuSkipRestore = 3;
+/* `menuSkipped` / `buildSkipped`: that menu's opening pause was skipped, so only its closing unpause is skipped too
+   (an opening pause outside a session is a REAL pause, and its closing unpause passes through and lifts it - T-288's
+   pairing). `voteHeld`: a menu's pause vote stands for this player and is owed back when the last menu holding it
+   closes. `menuOpen`: the game menu is open in a session, in a world - its vote follows this, not its togglePause
+   calls, because the menu's show calls togglePause only when the game is running (an Esc opened over a world another
+   player's vote has paused makes no call, and neither does its hide). `talkOpen` (T-978, owner decision 1445 a): an NPC
+   conversation window is open in a session, in a world - under Slowest wins it is this player's pause vote like the menus;
+   the vote is given back only when the game menu, build mode and the conversation window are all closed. */
+struct MenuPauseState { int menuSkipped; int buildSkipped; int voteHeld; int menuOpen; int talkOpen; };
+/* `linked` = this game is in a session (a host alone included); `inWorld` = a world is running here (the title
+   screen is not one); `mode` = the world's GAME SPEED CONTROL (kTimeMode*). In a session, in a world: an opening
+   call is skipped; build mode's entry under Slowest wins is also this player's pause vote (one vote however many
+   menus are open - the game menu's vote is cast by MenuPauseNoteGameMenu instead); a closing call is skipped when
+   its opening call was, and build mode's exit gives the vote back when neither the game menu nor the conversation window
+   is open (whatever the mode is by then). Anywhere else the call passes. A null state passes. */
+int MenuPauseDecide(int site, int linked, int inWorld, int mode, MenuPauseState* st);
+/* the game menu's own state after its show or hide ran (`open` = its panel is visible). Opened in a session, in a
+   world, under Slowest wins with no vote standing: kMenuSkipVote (cast this player's pause vote). Closed (or shown
+   outside a session) after a session open, with the vote standing and neither build mode nor the conversation window
+   holding it: kMenuSkipRestore
+   (give the older choice back). Otherwise kMenuPass (nothing to do). Nothing here skips an engine call; the answers
+   name only their vote half. A null state passes. */
+int MenuPauseNoteGameMenu(int open, int linked, int inWorld, int mode, MenuPauseState* st);
+/* the player chose a speed (a key, a button, a speed mod) while a menu's vote stood: that choice is theirs now, and
+   closing the menu does not give back the older one */
+void MenuPauseNotePress(MenuPauseState* st);
+/* T-978 (owner decision 1445 a, rule 'Conversations and the world clock'): the conversation window's state, polled every
+   frame (`open` = the window shows a conversation). Only a change acts: opened in a session, in a world, under Slowest wins
+   with no vote standing: kMenuSkipVote; closed (or no longer in a session or a world) after it counted as open, with the
+   vote standing and neither the game menu nor build mode holding it: kMenuSkipRestore; otherwise kMenuPass. Being called
+   again while open never casts the vote twice - a speed the player chose with the window open (MenuPauseNotePress) stands.
+   Under any other mode nothing is voted (host-controlled speed: nothing changes). A null state passes. */
+int MenuPauseNoteTalkWindow(int open, int linked, int inWorld, int mode, MenuPauseState* st);
+/* this game's world closed: its standing vote was reset with it, so nothing is owed back; and no menu mark outlives
+   it - a world can close with a menu open by a road that never runs the menu's hide, and a mark left set would swallow
+   the next session's vote give-back or skip a single-player unpause */
+void MenuPauseNoteWorldClosed(MenuPauseState* st);
 
 }   /* namespace coopclock */
 

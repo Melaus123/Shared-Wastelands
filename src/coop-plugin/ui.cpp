@@ -101,6 +101,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "settings.h"                     /* mp5: SettingsHostChoices / SettingsLiveValue - the Game options screen */
 #include "../common/rulesfile.h"          /* rules.txt: the world's rules as GAME OPTIONS opens on them */
+#include "../common/optionvalue.h"        /* T-1202: the world server's own check of a row (store_main.cpp OptionValueOk's body) */
 #include "../common/stewardrules.h"       /* FirstHostingPress: only a world's first hosting puts this game's values in its rules */
 #include "command_channel.h"              /* U2: PathNextToDll - where SharedWastelandsServer.exe and the mod folder are */
 #include "../common/panelfit.h"           /* P8i-b: the size refusal as a pure, swept decision */
@@ -143,7 +144,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
-extern unsigned char g_hostToken[];   /* store.cpp: this hosting's secret (HOST_TOKEN, the bridge's STEAM_ID) - a re-join takes host.key's */
+extern unsigned char g_hostToken[];   /* store.cpp: this hosting's secret (the Steam bridge shows it in each STEAM_ID) - a re-join takes host.key's */
 extern bool g_hostTokenSet;
 void MakeFolderTree(const std::string& dir);   /* config.cpp (F1033): every missing level of a folder */
 
@@ -178,6 +179,7 @@ struct UiNames
     std::string ourBtn, panel, modeHost, modeJoin, hostGroup, joinGroup;
     std::string portLabel, portEdit, nbMineTick, nbMineLabel, nbFarTick, nbFarLabel, nbAddrEdit;
     std::string joinLabel, joinEdit, pasteBtn;
+    std::string joinPortLabel, joinPortEdit;   /* T-793: JOIN BY ADDRESS's PORT row (decision 960) */
     std::string friendList, friendEmpty, friendRefreshBtn, joinByAddrLabel;   /* JOIN GAME's friends list, its line, REFRESH, JOIN BY ADDRESS */
     std::string steamLabel, steamLine, inviteOpenBtn;   /* HOSTING's STEAM row: its label, its line, INVITE FRIENDS */
     std::string inviteGroup, inviteList, inviteEmpty, inviteSendBtn;     /* INVITE FRIENDS: its group, list, the line in its place, INVITE */
@@ -213,6 +215,7 @@ struct UiNames
           nbFarTick("CoopNotebookFarTick"), nbFarLabel("CoopNotebookFarLabel"),
           nbAddrEdit("CoopNotebookAddrEdit"),
           joinLabel("CoopJoinAddrLabel"), joinEdit("CoopJoinAddrEdit"), pasteBtn("CoopPasteBtn"),
+          joinPortLabel("CoopJoinPortLabel"), joinPortEdit("CoopJoinPortEdit"),
           worldLabel("CoopWorldLabel"), worldEdit("CoopWorldEdit"),
           slotLabel("CoopSlotLabel"), slotEdit("CoopSlotEdit"),
           status("CoopStatusText"),
@@ -636,6 +639,17 @@ static std::string g_panelNameHintShown;       /* mp1: the line under Your name 
 static long        g_panelTryShown      = -1;  /* mp1: whether Try again was last shown (-1 = not yet) */
 static int         g_panelJoinGaveUp    = 0;   /* mp1: coopui::PanelJoinGaveUp at the last status build */
 static std::string g_fPort, g_fNotebookAddr, g_fJoinAddr, g_fWorld, g_fSlot;
+static std::string g_fJoinPort;   /* T-793: JOIN BY ADDRESS's PORT box (decision 960); coopui::kPanelDefaultGamePort until changed */
+/* T-793: ADDRESS text that carries its own port ("host:7778", "[::1]:7778") hands the number to PORT - coopcfg::CfgJoinTakePort.  True
+   when it moved something.  Never a steam:<id> or a bare IPv6 literal. */
+static bool PanelJoinMovePort()
+{
+    std::string host, port;
+    if (!coopcfg::CfgJoinTakePort(g_fJoinAddr, &host, &port)) return false;
+    g_fJoinAddr = host;
+    g_fJoinPort = port;
+    return true;
+}
 /* The address the current JOIN dials, and the line a press shows: Starting "<world>"... for HOST, Connecting to <address>... for a typed
    address, Connecting... for a friend's game (no name, no id). */
 static std::string PanelJoinDialAddr() { return g_friendJoinId != 0 ? relaybridge::SteamAddressText(g_friendJoinId) : g_fJoinAddr; }
@@ -667,6 +681,7 @@ static std::vector<int> g_worldRunning;        /* parallel to g_worlds: 1 = "run
 static std::string      g_keepPickFolder;      /* the picked world while it runs now ("" = it does not), with its host.key's secret and port */
 static std::string      g_keepPickToken;
 static unsigned int     g_keepPickPort = 0;
+static int              g_keepPickPwHas = -1;  /* T-1255 D (owner 1515): the picked world has a world password of its own (StoreWorldPwHas: 1 yes, 0 no, -1 not known) - read at each push of the worlds list (events, never per frame) */
 static std::string      g_keepPortBefore;      /* the PORT box's text before a running-now pick showed the saved port; given back when the pick moves */
 static int              g_keepPortSwapped = 0;
 static std::string      g_keepStopFolder, g_keepStopName;   /* STOP WORLD confirmed: the world whose lock is watched until it is released */
@@ -675,6 +690,12 @@ static std::string      g_keepShownSig;        /* the keep widgets' state last p
 static void PanelKeepPickRefresh();
 static void PanelKeepCheck(MyGUI::Gui* gui);
 static int PanelKeepPickRunning() { return (!g_keepPickFolder.empty() && g_keepPickFolder == g_worldSel) ? 1 : 0; }
+/* T-1254 B1 (keeprun::OlderRunningMark / OlderRunningNow): the run of a world running now whose world server answered a HOST press with
+   the version refusal - its folder and host.key secret. While that run is the pick, HOST writes no password line into its rules.txt
+   and HOST GAME's status line says keeprun::kOlderRunningLine. g_pressKeepFolder / g_pressKeepToken: the running-now world the HOST
+   press in progress joins ("" = none). */
+static std::string g_keepOlderFolder, g_keepOlderToken, g_pressKeepFolder, g_pressKeepToken;
+static int PanelKeepPickOlder() { return keeprun::OlderRunningNow(PanelKeepPickRunning(), g_keepOlderFolder, g_keepOlderToken, g_keepPickFolder, g_keepPickToken); }
 static int PanelWorldRunningAt(size_t k) { return (k < g_worldRunning.size() && g_worldRunning[k] != 0) ? 1 : 0; }
 static HANDLE          g_resetProc = 0;        /* the world server running --reset-world for this panel (0 = none) */
 static std::string     g_resetName;            /* the world it resets */
@@ -718,6 +739,16 @@ static std::vector<std::pair<std::string, std::string> > g_optChosen;   /* ... a
 static std::string g_optHandedWorld;                              /* the world the last hand-over (a HOST press, a Done while hosting) was for */
 static std::vector<std::pair<std::string, std::string> > g_optHanded;   /* ... and the rows (key and value) that went with it */
 static volatile LONG64 g_optOpened = 0, g_optDoneCount = 0, g_optHandedOver = 0, g_optFileRead = 0;
+/* Screen 6 IN A RUNNING WORLD (mockups-t1158.md screen 6), opened from the pause menu's MULTIPLAYER window and shown in the HOSTING
+   window's place over the pause menu (UiOptWorldOpen). MAIN THREAD (the in-world pump's tail). */
+static int         g_optInWorld = 0;      /* 1 = screen 6 shows the running world's rules (not a title-screen world's) */
+static std::string g_optWorldTitle;       /* the running world's name, for the window's title */
+static int         g_optWorldDone = 0;    /* 1 = its DONE was pressed: the window closes */
+static int         g_optCtlShown = -1;    /* the controls' state the rows were last pushed with (1 lit, 0 greyed) */
+static long        g_optWorldGen = 0;     /* the world's OPTIONS map the rows were last read from (SettingsWorldValuesGen) */
+static const char* const kOptAdminLineName = "SWOptAdminOnlyLine";   /* "Only an admin can change these." over DEFAULTS and DONE */
+static int UiOptAdminNow() { return (g_optInWorld != 0 && AdminNow()) ? 1 : 0; }
+static int UiOptControlsLit() { return coopui::OptControlsLit(g_optInWorld, UiOptAdminNow()); }
 static std::string g_panelStatus;
 static long long   g_panelStatusSeq   = 0;
 static long long   g_panelStatusShown = -1;
@@ -959,6 +990,7 @@ static int UiCloseFromEngine(int engineClosed)
    coop::TitleScreen if the include above ever moved, and that is the C2668 class this project keeps
    hitting. */
 static bool (*orig_titleCloseOtherBits)(::TitleScreen*) = 0;
+static int g_escGateOn = 0;   /* InstallUiTitleClose hooked it (UiTitleEscGateOn) */
 
 static bool detour_titleCloseOtherBits(::TitleScreen* thisptr)
 {
@@ -968,7 +1000,13 @@ static bool detour_titleCloseOtherBits(::TitleScreen* thisptr)
     bool engine = false;
     if (orig_titleCloseOtherBits != 0) engine = orig_titleCloseOtherBits(thisptr);
     const int ours = UiCloseFromEngine(engine ? 1 : 0);
-    return engine || ours != 0;
+    const bool closed = engine || ours != 0;
+    /* nothing closed and Escape is down: this is the ESC arm, which raises Kenshi's quit byte as soon as this returns (the
+       decompile above) - a normal quit, marked for the next launch's crash judgement (src/common/crashkeep.h). Inside the ESC arm
+       the key is still down and no mouse-driven caller has it down (UiCloseFromEngine's note); the EXIT button's own call is
+       marked by store.cpp's title-exit hook. */
+    if (!closed && (::GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) DebugLog("[EXIT] quit route: title-escape");
+    return closed;
 }
 
 void InstallUiTitleClose()
@@ -991,7 +1029,10 @@ void InstallUiTitleClose()
        << (st == coop::SUCCESS ? "SUCCESS - ESC closes the panel instead of quitting"
                                     : "FAILED - ESC still quits with the panel open");
     if (st == coop::SUCCESS) DebugLog(ss.str()); else ErrorLog(ss.str());
+    g_escGateOn = (st == coop::SUCCESS) ? 1 : 0;
 }
+
+int UiTitleEscGateOn() { return g_escGateOn; }
 
 // ------------------------------------------------------------------------------------------------
 // LOOKUPS.  Every one is by name, on the frame that uses it, with the NON-THROWING cast and a null test.
@@ -1106,6 +1147,7 @@ static int         g_profPrefillDone = 0;   /* JOIN: the NEW PROFILE box opened 
 /* T-1096 part 3 (owner 1224; the approved page): NEW PROFILE's START WITH row and IMPORT FROM SINGLE PLAYER. TITLE PUMP ONLY. */
 static int         g_profStartImport = 0;   /* START WITH: 1 = "Import from single player" picked */
 static spimport::StartRowState g_startState;   /* whether import may be picked here, and the host's money / research options */
+static bool PanelRulesNamed(const std::string& folder);   /* below: the world's rules.txt names a rule */
 static std::string g_startWorld;   /* the world folder whose rules.txt g_startState was last read from ("" = none) */
 static std::string g_startHintShown;        /* the hint line under the row ("" = none) - PanelLayout's NEW PROFILE layout follows it */
 static std::string g_impName;               /* the new profile's name NEXT carried to the picker */
@@ -1145,6 +1187,10 @@ static std::string g_noticeTitle;           /* T-201 N1: the error box's title w
 static int g_prepPhase = coopui::kPrepNone;
 static int g_prepMode = 0;        /* 1 HOST, 2 JOIN */
 static int g_prepUnreadSaid = 0;  /* the unreadable-request line, once per press */
+/* T-1055 (owner 1363): kept for the [WORLD] started line only (UiWorldStartFacts) - the preparation the first in-world tail ended,
+   and the start name the NEW GAME window showed when BEGIN committed it ("" = not noted since the last world started) */
+static int g_prepAtWorldPhase = coopui::kPrepNone, g_prepAtWorldMode = 0;
+static std::string g_ngStartName;
 static DWORD g_prepAtMs = 0;      /* kPrepWindowWait: when the press opened the NEW GAME window */
 static volatile LONG64 g_prepArmed = 0, g_prepSeen = 0, g_prepCancelled = 0;
 static int UiNewGameWindowShown(MyGUI::Gui* gui);
@@ -1240,6 +1286,7 @@ static void PanelDefaults()
     g_fPort         = "7777";   /* ui5d: coopui::kPanelDefaultGamePort - change together */
     g_fNotebookAddr = "127.0.0.1:27016";
     g_fJoinAddr     = "";
+    g_fJoinPort     = coopui::PanelNum((long long)coopui::kPanelDefaultGamePort);   /* T-793: PORT starts at the default game port (7777) */
     g_fWorld        = ConfigFileWorld(); if (g_fWorld.empty()) g_fWorld = coopworld::kDefaultWorld;   /* owner decision 249 a: "New World" */   /* W3-f (review-w3 item 4, M5): the FILE's world, not ConfigWorldKey() - a world adopted from a WELCOME is never written into shared_wastelands.cfg by a panel save */
     g_fSlot.clear();   /* T-201 PP5 fold (L2): the panel has no save-name box - HOST and JOIN write no slot= and every multiplayer save goes to
                           the profile's own folder (store.cpp), so a profile folder's long name is never copied here to fail the 16-character check */
@@ -1272,6 +1319,7 @@ static void PanelDefaults()
             g_fPort = b;
         }
     }
+    PanelJoinMovePort();   /* T-793: a remembered "address:port" shows as ADDRESS and PORT */
     PanelIntro();
 }
 
@@ -1499,11 +1547,11 @@ static void PanelPushStatus(MyGUI::Gui* gui, int force)
     if (g_panelScreen == 5) text = PanelHostingStatus(gui);   /* mp4: the live block above still ran (the verdict state) */
     if (g_panelScreen == 7) text = PanelProfStatus();   /* prof3: the cap line and the world's answers */
     if (g_panelScreen == 9) text = g_inviteSay;   /* INVITE FRIENDS: the last invite's answer */
-    if (g_panelScreen == 1)   /* HOST GAME: a picked world running now, or the keep-running box ticked with no password, says so */
+    if (g_panelScreen == 1)   /* HOST GAME: a picked world running now says so; the keep-running box ticked with no password says the world will be open */
     {
         const coopworld::WorldRow* kr = PanelPickedRow();
-        text = keeprun::KeepStatusPick(g_pressBusy != 0 ? 1 : 0, PanelKeepPickRunning(), g_keepTicked, g_fHostPw.empty() ? 1 : 0,
-                                       kr != 0 ? kr->name : std::string(), text);
+        text = keeprun::KeepStatusPick(g_pressBusy != 0 ? 1 : 0, PanelKeepPickRunning(), g_keepTicked, keeprun::KeepOpenPick(HostPasswordBlank(g_fHostPw) ? 1 : 0, g_keepPickPwHas),   /* T-1255 D: only a world really open */
+                                       kr != 0 ? kr->name : std::string(), text, PanelKeepPickOlder());   /* T-1254 B1: an older version still running says so */
     }
     s->setCaption(MyGUI::UString(text.c_str()));
     g_panelStatusCaption = text;
@@ -1523,8 +1571,7 @@ static bool PanelGoAllowed()
 {
     const bool joinedLive = (g_panelMode == 1 && g_panelScreen == 2 && ConfigRole() == kRoleClient && StoreWelcomedThisLink() != 0 && StoreLinkIsUp());
     return g_pressBusy == 0 && !joinedLive
-        && (g_panelScreen != 1 || coopui::WorldButtonLit(g_worldSel.empty() ? 0 : 1, g_resetProc != 0 ? 1 : 0) != 0)
-        && (g_panelScreen != 1 || keeprun::KeepHostLit(PanelKeepPickRunning(), g_keepTicked, g_fHostPw.empty() ? 1 : 0) != 0);   /* keep-running needs a password */
+        && (g_panelScreen != 1 || coopui::WorldButtonLit(g_worldSel.empty() ? 0 : 1, g_resetProc != 0 ? 1 : 0) != 0);   /* the keep-running box asks no password (owner 1508 b) */
 }
 static void PanelNameCheck(MyGUI::Gui* gui)
 {
@@ -1627,6 +1674,7 @@ static void PanelSetTextBox(MyGUI::Gui* gui, const std::string& name, const std:
 }
 static std::string PanelOptWorldName()
 {
+    if (g_optInWorld != 0) return g_optWorldTitle;   /* in a running world: that world's name */
     for (size_t k = 0; k < g_worlds.size(); ++k) if (g_worlds[k].folder == g_optWorld) return g_worlds[k].name;
     return g_optWorld;
 }
@@ -1640,7 +1688,7 @@ static void UiGreyText(MyGUI::Widget* w, bool lit)
 }
 /* HOST GAME's keep-running widgets, touched only when their state changed: the tick box as g_keepTicked, the note (and, ticked, the
    warning) under it, PASSWORD and PORT greyed with PORT showing the saved port while the picked world runs now (the box's own text
-   comes back when the pick moves), and HOST lit by PanelGoAllowed (keeprun::KeepHostLit). The status line follows on the next push. */
+   comes back when the pick moves), and HOST lit by PanelGoAllowed. The status line follows on the next push. */
 static void PanelKeepPush(MyGUI::Gui* gui)
 {
     if (gui == 0) return;
@@ -1650,8 +1698,8 @@ static void PanelKeepPush(MyGUI::Gui* gui)
     std::string port = g_fPort;
     if (running != 0) port = keeprun::KeyPortText(g_keepPickPort);
     else if (g_keepPortSwapped != 0) { port = g_keepPortBefore; g_keepPortSwapped = 0; }
-    const std::string sig = std::string(running != 0 ? "R" : "r") + (g_keepTicked != 0 ? "T" : "t") + (g_fHostPw.empty() ? "E" : "e")
-                          + (g_pressBusy != 0 ? "B" : "b") + (g_panelNameOkShown > 0 ? "N" : "n") + g_keepPickFolder + "|" + port;
+    const std::string sig = std::string(running != 0 ? "R" : "r") + (g_keepTicked != 0 ? "T" : "t") + (HostPasswordBlank(g_fHostPw) ? "E" : "e")
+                          + (g_pressBusy != 0 ? "B" : "b") + (g_panelNameOkShown > 0 ? "N" : "n") + (g_keepPickPwHas > 0 ? "P" : g_keepPickPwHas == 0 ? "p" : "?") + g_keepPickFolder + "|" + port;
     if (sig == g_keepShownSig && port == g_fPort) return;
     g_keepShownSig = sig;
     if (port != g_fPort) { g_fPort = port; MyGUI::EditBox* pe = UiEdit(gui, n.portEdit); if (pe) pe->setCaption(MyGUI::UString(g_fPort.c_str())); }
@@ -1676,6 +1724,8 @@ static void PanelPushOptions(MyGUI::Gui* gui)
 {
     const UiNames& n = NM();
     MyGUI::Button* b;
+    const int adm = UiOptAdminNow();
+    const int ctl = coopui::OptControlsLit(g_optInWorld, adm);   /* in a running world only an admin's controls work */
     for (int t = 0; t < coopui::kOptTabCount; ++t) { b = UiBtn(gui, n.optTab[t]); if (b) b->setStateSelected(t == (int)g_optTab); }
     for (int r = 0; r < coopui::kOptRowsShown; ++r)
     {
@@ -1685,13 +1735,21 @@ static void PanelPushOptions(MyGUI::Gui* gui)
         const bool typed = on && coopui::OptDefs()[i].kind == coopui::kOptKindAmount;   /* T-556: the fee box stands in the value's place */
         const bool step = on && !tick && !typed;
         const bool lit = on && coopui::OptRowLit(i, g_optVal);   /* T-556: a row that depends on RESURRECTION greys with it */
+        const bool can = on && coopui::OptRowChangeable(i, g_optVal, ctl);
         PanelSetTextBox(gui, n.optLabel[r], on ? std::string(coopui::OptDefs()[i].label) : std::string(), on);
         PanelSetTextBox(gui, n.optVal[r], step ? coopui::OptShown(i, g_optVal[i]) : std::string(), step);
         MyGUI::Widget* w = UiFind(gui, n.optLabel[r]); if (w) { w->setEnabled(lit || !on); UiGreyText(w, lit || !on); }
         w = UiFind(gui, n.optVal[r]);                  if (w) { w->setEnabled(lit || !on); UiGreyText(w, lit || !on); }
-        b = UiBtn(gui, n.optDec[r]);  if (b) { b->setVisible(step); b->setEnabled(step && lit && coopui::OptCanStep(i, g_optVal[i], -1)); }
-        b = UiBtn(gui, n.optInc[r]);  if (b) { b->setVisible(step); b->setEnabled(step && lit && coopui::OptCanStep(i, g_optVal[i], 1)); }
-        b = UiBtn(gui, n.optTick[r]); if (b) { b->setVisible(tick); b->setStateSelected(coopui::OptTickOn(i, on ? g_optVal[i] : std::string())); }
+        b = UiBtn(gui, n.optDec[r]);  if (b) { b->setVisible(step); b->setEnabled(step && can && coopui::OptCanStep(i, g_optVal[i], -1)); UiGreyText(b, ctl != 0); }
+        b = UiBtn(gui, n.optInc[r]);  if (b) { b->setVisible(step); b->setEnabled(step && can && coopui::OptCanStep(i, g_optVal[i], 1)); UiGreyText(b, ctl != 0); }
+        b = UiBtn(gui, n.optTick[r]);
+        if (b)
+        {
+            b->setVisible(tick);
+            if (g_optInWorld != 0) b->setEnabled(tick && can);   /* the title screen's tick boxes are never switched off */
+            UiGreyText(b, ctl != 0);
+            b->setStateSelected(coopui::OptTickOn(i, on ? g_optVal[i] : std::string()));
+        }
     }
     MyGUI::EditBox* e;
     /* T-556: the RESURRECTION FEE box - shown on the tab that holds it, greyed with its row; its text is set only when it
@@ -1702,10 +1760,14 @@ static void PanelPushOptions(MyGUI::Gui* gui)
     {
         const bool shown = coopui::OptDefs()[fee].tab == (int)g_optTab;
         e->setVisible(shown);
-        e->setEnabled(shown && coopui::OptRowLit(fee, g_optVal));
-        UiGreyText(e, coopui::OptRowLit(fee, g_optVal));
+        e->setEnabled(shown && coopui::OptRowChangeable(fee, g_optVal, ctl));
+        UiGreyText(e, coopui::OptRowChangeable(fee, g_optVal, ctl));
         if (UiTextOf(e, 64) != g_optFeeTyped) e->setCaption(MyGUI::UString(g_optFeeTyped.c_str()));
     }
+    b = UiBtn(gui, n.optDefaultsBtn); if (b) { b->setEnabled(ctl != 0); UiGreyText(b, ctl != 0); }
+    const std::string only = coopui::OptAdminOnlyLine(g_optInWorld, adm);
+    PanelSetTextBox(gui, std::string(kOptAdminLineName), only, !only.empty());
+    g_optCtlShown = ctl;
 }
 
 /* prof3 (design-mpmenu1 section 8) - [F] PROFILES (words1; was YOUR PROFILES IN THIS WORLD).  Shown after a connection this panel started, when
@@ -2153,7 +2215,7 @@ static void PanelLayout(MyGUI::Gui* gui)
     if (g.rowH <= 0) return;
     const int lay  = coopui::PanelLayoutOf((int)g_panelScreen, PanelDlgSub(),
                                            g_panelScreen == 7 ? (g_startHintShown.empty() ? 0 : 1) : (g_panelNameHintShown.empty() ? 0 : 1),   /* T-1096 part 3: NEW PROFILE's hint line */
-                                           g_hostVpnKind != coopui::kGameVpnNone ? 1 : 0);   /* ui5b; T-631: the VPN row */
+                                           g_hostVpnKind != coopui::kGameVpnNone ? 1 : 0, g_optInWorld);   /* ui5b; T-631: the VPN row; GAME OPTIONS in a world */
     const int addr = g_hostHomeAddr.empty() ? 0 : 1;
     const int W = g.innerW;   /* the rows' width: the panel's, on every screen */
     coopui::PanelLive live(PanelLiveTextHalves(gui, lay, W, g.rowH));   /* ui5c: -1 = no text area on this screen */
@@ -2367,6 +2429,10 @@ static void PanelLayout(MyGUI::Gui* gui)
         PanelPlace(gui, n.joinLabel, jr.labelX, jr.top, jr.labelW, jr.h);
         PanelPlace(gui, n.joinEdit,  jr.boxX,   jr.top, jr.boxW,   jr.h);
         PanelPlace(gui, n.pasteBtn,  W - sideW, jr.top, sideW,     jr.h);
+        const coopui::PanelPairRect jp = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(lay, coopui::kSlotPortRow, rowH),
+                                                                 coopui::PanelPortBoxW(W), 0);   /* T-793: PORT under ADDRESS */
+        PanelPlace(gui, n.joinPortLabel, jp.labelX, jp.top, jp.labelW, jp.h);
+        PanelPlace(gui, n.joinPortEdit,  jp.boxX,   jp.top, jp.boxW,   jp.h);
     }
     g_layShown = lay;
     g_layAddrShown = addr;
@@ -2392,6 +2458,16 @@ static int PanelHostingGamePort()
 }
 
 static bool PanelHostingNow();   /* defined with the press code below */
+/* T-793 (decision 960): PORT is greyed while ADDRESS holds a steam:<id> or a friend's game is picked - the Steam route dials no port. */
+static void PanelJoinPortLit(MyGUI::Gui* gui)
+{
+    const UiNames& n = NM();
+    const bool lit = g_friendSelId == 0 && g_friendJoinId == 0 && !coopcfg::CfgJoinIsSteam(g_fJoinAddr);
+    MyGUI::Widget* w = UiFind(gui, n.joinPortEdit);
+    if (w) w->setEnabled(lit);
+    UiGreyText(w, lit);
+    UiGreyText(UiFind(gui, n.joinPortLabel), lit);
+}
 static void PanelPush(MyGUI::Gui* gui)
 {
     const UiNames& n = NM();
@@ -2406,7 +2482,10 @@ static void PanelPush(MyGUI::Gui* gui)
         MyGUI::Button* pb = UiBtn(gui, n.hostProfChangeBtn);
         if (pb) pb->setEnabled(picked != 0 && g_pressBusy == 0 && g_loadStage == 0);
     }
+    PanelJoinMovePort();
     e = UiEdit(gui, n.joinEdit);   if (e) e->setCaption(MyGUI::UString(g_fJoinAddr.c_str()));
+    e = UiEdit(gui, n.joinPortEdit); if (e) e->setCaption(MyGUI::UString(g_fJoinPort.c_str()));   /* T-793 */
+    PanelJoinPortLit(gui);
     e = UiEdit(gui, n.nameEdit);   if (e) e->setCaption(MyGUI::UString(g_fName.c_str()));
     /* mp3: the world and save boxes are gone from the screen (the world is picked from the list, the save folder is
        named automatically), and so are the helper's two ticks and address box (always this computer's own). */
@@ -2566,16 +2645,28 @@ static void PanelMirror(MyGUI::Gui* gui, int force)
     const UiNames& n = NM();
     MyGUI::EditBox* e;
     e = UiEdit(gui, n.portEdit);   if (e) g_fPort         = UiTextOf(e, coopcfg::kCfgPortFieldMax);
-    {   /* typing in IP ADDRESS drops a picked friend: JOIN then dials the typed address */
+    {   /* typing in ADDRESS drops a picked friend: JOIN then dials the typed address */
         const std::string before = g_fJoinAddr;
         e = UiEdit(gui, n.joinEdit);   if (e) g_fJoinAddr     = UiTextOf(e, coopcfg::kCfgAddrFieldMax);
+        MyGUI::EditBox* pe = UiEdit(gui, n.joinPortEdit);
+        if (pe) g_fJoinPort = UiTextOf(pe, coopcfg::kCfgPortFieldMax);
+        /* T-793 (decision 960): "host:port" typed into ADDRESS hands its number to PORT - once the player has left ADDRESS, so a port
+           half-typed is never split off under the cursor (the JOIN press reads a port still in ADDRESS the same way, PORT empty or not) */
+        MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+        const bool typing = e != 0 && im != 0 && im->getKeyFocusWidget() == e;
+        if (!typing && PanelJoinMovePort())
+        {
+            if (e) e->setCaption(MyGUI::UString(g_fJoinAddr.c_str()));
+            if (pe) pe->setCaption(MyGUI::UString(g_fJoinPort.c_str()));
+        }
         if (g_fJoinAddr != before) PanelDropFriendPick(gui);
+        PanelJoinPortLit(gui);
     }
     e = UiEdit(gui, n.dlgNameEdit); if (e) g_fNewWorld    = UiTextOf(e, coopcfg::kCfgWorldFieldMax);   /* mp3: the New world box */
     e = UiEdit(gui, n.hostPwEdit);  if (e) g_fHostPw      = UiPlainTextOf(e, coopui::kPanelPwFieldMax);   /* T-290: in password mode getCaption is the typed text, not the stars */
     e = UiEdit(gui, n.nameEdit);   if (e) g_fName         = UiTextOf(e, coopcfg::kCfgPlayerNameFieldMax);
     PanelNameCheck(gui);
-    PanelKeepCheck(gui);   /* HOST GAME's keep-running box: HOST greyed while ticked with an empty PASSWORD box; a stopped world's lock */
+    PanelKeepCheck(gui);   /* HOST GAME's keep-running box: its note and the status line follow the box and the PASSWORD box; a stopped world's lock */
 }
 
 /* PASTE.  design-ui-panel 5.3: Ctrl+V into a MyGUI EditBox in Kenshi is Read twice over and observed
@@ -2611,6 +2702,11 @@ static void PanelPaste(MyGUI::Gui* gui)
         return;
     }
     g_fJoinAddr = coopcfg::CfgSanitiseTyped(got, coopcfg::kCfgAddrFieldMax);
+    PanelJoinMovePort();   /* T-793 (decision 960): a pasted "host:port" fills ADDRESS and PORT */
+    {
+        MyGUI::EditBox* pe = UiEdit(gui, NM().joinPortEdit);
+        if (pe) pe->setCaption(MyGUI::UString(g_fJoinPort.c_str()));
+    }
     PanelDropFriendPick(gui);   /* a pasted address drops a picked friend, as typing does */
     ::InterlockedIncrement64(&g_panelPasted);
     PanelSetStatus(std::string());   /* the address shows in its box; an older paste line goes */
@@ -2760,13 +2856,7 @@ static int PanelStartNotebook(unsigned short port)
         g_nbProc = 0;
         g_nbStopFailedKept = 0;
     }
-    const int keep = g_keepTicked;   /* the keep-running box as it reads at this press */
-    if (keep != 0 && g_fHostPw.empty())   /* HOST is greyed then, and a kept world server refuses to start without a password */
-    {
-        g_nbState = coopui::kNbSpawnFailed;
-        ErrorLog("[UI] the world's notebook was NOT started: the keep-running box is ticked and the PASSWORD box is empty. NOTHING was launched.");
-        return 0;
-    }
+    const int keep = g_keepTicked;   /* the keep-running box as it reads at this press; with an empty PASSWORD box the world kept running keeps the password it has and is open only when it has none (owner 1508 b / 1516 a) */
     g_nbPort = (int)port;
 
     const std::string exe = PathNextToDll(swnames::kServerExe);
@@ -2795,19 +2885,12 @@ static int PanelStartNotebook(unsigned short port)
        names; the command line goes over wide (CreateProcessW below), so both name the same folder under any user or world name */
     const std::string rootArg = StoreTopDir();
 
-    /* B13 (decision 49) - THE NOTEBOOK IS STARTED FOR A PLAYER, AND IT IS TOLD WHICH ONE. The relay's
-       authority was g_order[0] - whoever CONNECTED first - so a relay killed and restarted handed the
-       authority to whichever game dialled first, and OPTIONS and WEATHER with it. The player who pressed
-       this button is the operator: --owner names them, the relay writes the name into owner.txt, and a
-       restart reads it back. An install with no id yet (no settings file read) passes no --owner at all,
-       and the relay then takes the first HELLO as the operator and persists that instead. */
-    const std::string ownerId = ConfigPlayerId();
-    std::string ownerArg;
-    if (!ownerId.empty()) ownerArg = " --owner " + ownerId;
+    /* T-1158 step 7b (owner 1369 b): no player is named on the command line - the world's owner is whoever proves the owner password
+       in its rules.txt (this game shows it at the door, StoreAuthAnswer), so a world started here and one started by hand work alike. */
 
     /* CreateProcessW MUTATES lpCommandLine, so it is never a string literal and never a c_str().
-       B13-b (review-b13, LOW): the line grew by --owner's 42 characters, and a TRUNCATED command line is
-       worse than none - it would start the notebook on the wrong world, or without its operator, and the
+       B13-b (review-b13, LOW): a TRUNCATED command line is
+       worse than none - it would start the notebook on the wrong world, or without its secret, and the
        run would then look like a different fault entirely. _snwprintf returns negative when it did not fit,
        and this refuses in words instead of launching something it cannot describe. */
     wchar_t cmd[1024];
@@ -2815,8 +2898,8 @@ static int PanelStartNotebook(unsigned short port)
        lock goes with the process) when this Kenshi is gone, crashed or not, so a crash never leaves the lock and the port held. */
     /* each piece converted on its own: exe and dir (this DLL's folder, from PathNextToDll), the world name and the top folder are
        all UTF-8 - U8W reads well-formed UTF-8 as UTF-8 (anything else in the ANSI code page, counted as g_u8AnsiFallback) */
-    /* --host-token: this hosting's secret, new for each start - the world server believes HOST_TOKEN (this game, its owner) and STEAM_ID
-       (this game's Steam bridge) only with it. It is in this command line and in memory, and in no log line. */
+    /* --host-token: this hosting's secret, new for each start - the world server believes a STEAM_ID (this game's Steam bridge) only
+       with it; it grants this game nothing (owner 1369 b). It is in this command line and in memory, and in no log line. */
     std::string tokenHex;
     if (!StoreNewHostToken(&tokenHex))
     {
@@ -2826,17 +2909,31 @@ static int PanelStartNotebook(unsigned short port)
         return 0;
     }
     const std::wstring wToken = U8W(tokenHex.c_str());
-    const std::wstring wExe = U8W(exe.c_str()), wDir = U8W(dir.c_str()), wWorld = U8W(worldArg.c_str()), wRoot = U8W(rootArg.c_str()), wOwner = U8W(ownerArg.c_str());
+    const std::wstring wExe = U8W(exe.c_str()), wDir = U8W(dir.c_str()), wWorld = U8W(worldArg.c_str()), wRoot = U8W(rootArg.c_str());
     /* the keep-running box: --keep-running and no --parent - the world server outlives this game and ends on its own stop (its window,
        or stop.request in the world folder); unticked, the line with --parent */
     /* a world kept running asks the home router for its own port (coopupnp::MapOwner); routerport=0 in this game's settings file
        is passed on as --no-router, so test runs leave the home router alone there too */
     const wchar_t* const wRouterOff = (ConfigRouterPort() == 0) ? L" --no-router" : L"";
-    const int cmdLen = keep != 0
-        ? _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --keep-running%ls --host-token %ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(), wOwner.c_str(),
-                     wRouterOff, wToken.c_str())
-        : _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --parent %lu --host-token %ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(), wOwner.c_str(),
-                     (unsigned long)::GetCurrentProcessId(), wToken.c_str());
+    /* T-1209 (owner 1417 a): this game's own kenshi_api.cfg (beside the DLL), when it has one - the world server copies it into a NEW
+       world's folder that has none, and says so in its window; an existing world keeps what its folder holds */
+    const std::string ownRules = PathNextToDll("kenshi_api.cfg");
+    const std::wstring wHostRules = U8GetFileAttributes(ownRules.c_str()) != INVALID_FILE_ATTRIBUTES ? L" --host-rules \"" + std::wstring(U8W(ownRules.c_str())) + L"\"" : std::wstring();
+    /* the line is made with --host-rules first; when that path makes it too long, it is made again without it - the world starts with
+       what its folder holds (no copy) and this log says why, instead of HOST failing over an optional file */
+    int cmdLen = -1;
+    for (int withRules = wHostRules.empty() ? 0 : 1; withRules >= 0 && cmdLen < 0; --withRules)
+    {
+        const wchar_t* const hr = withRules != 0 ? wHostRules.c_str() : L"";
+        cmdLen = keep != 0
+            ? _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --keep-running%ls --host-token %ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(),
+                         hr, wRouterOff, wToken.c_str())
+            : _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --parent %lu --host-token %ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(),
+                         hr, (unsigned long)::GetCurrentProcessId(), wToken.c_str());
+        if (cmdLen < 0 && withRules != 0)
+            ErrorLog("[UI] HOST: this game's kenshi_api.cfg (" + ownRules + ") is NOT handed to the world server - with its path the command line does"
+                     " not fit 1024 characters (a very long folder name is the usual cause). The world starts with the race rules its own folder holds.");
+    }
     cmd[sizeof(cmd) / sizeof(cmd[0]) - 1] = 0;
     if (cmdLen < 0)
     {
@@ -2854,13 +2951,33 @@ static int PanelStartNotebook(unsigned short port)
        started - and nowhere else, so a refused press, or one that rings a world server already running, never changes the password this
        game answers its world server with */
     SetHostPassword(g_fHostPw);
-    DebugLog(std::string("[UI] HOST: ") + (g_fHostPw.empty() ? "no password (the PASSWORD box is empty)" : "the world's password is the one in the PASSWORD box"));
-    /* the world's password as its salted key in auth.txt (or no auth.txt for none), before the world server can read the folder */
-    if (!StoreWriteWorldAuth(sdir))
+    DebugLog(std::string("[UI] HOST: ") + (HostPasswordBlank(g_fHostPw) ? "no password (the PASSWORD box is empty)" : "the world's password is the one in the PASSWORD box"));
+    /* the world's password after "world password =" in the world's rules.txt (owner 1371: as a person would write it by hand),
+       before the world server can read the folder; --world names the same world, so the file's header names it as the server would.
+       T-1202: at the world's FIRST hosting (decided by this press before this call - SettingsHostFirstWorld) every GAME OPTIONS row the
+       host chose for it goes into the same file in the same write: the rows this press carries as the world's first settings
+       (stewardrules::HostPressRows, as PanelOptHandOver; none when GAME OPTIONS' Done was not pressed for this world), each at a value
+       the world server's own check takes (rulesfile::FirstStartRows with worldopt::ValueOk, store_main.cpp OptionValueOk's body). The
+       world server then decides what it decides before this game's Game options can reach it - a first import asked from the menu,
+       NEW PROFILE's answer and its profile cap - from the host's choice. */
+    std::vector<std::pair<std::string, std::string> > firstRows;
+    {
+        std::vector<std::pair<std::string, std::string> > pressRows;
+        const int how = stewardrules::HostPressRows(SettingsFirstHosting(), !g_optChosenWorld.empty() && g_optChosenWorld == g_worldSel, g_optChosen,
+                                                    std::vector<std::pair<std::string, std::string> >(), &pressRows);
+        const std::map<std::string, std::string> chosenRows = rulesfile::FirstStartRows(how == stewardrules::kPressSendsHostSettings, pressRows, worldopt::ValueOk);
+        for (std::map<std::string, std::string>::const_iterator it = chosenRows.begin(); it != chosenRows.end(); ++it) firstRows.push_back(*it);
+        if (SettingsFirstHosting())
+            DebugLog("[UI] T-1202 HOST: world '" + g_worldSel + "'s first hosting - " + coopui::PanelNum((long long)firstRows.size())
+                     + " GAME OPTIONS row(s) the host chose go into its rules.txt before the world server starts"
+                     + (firstRows.empty() ? std::string(" (none chosen for this world: the world server's defaults)") : std::string())
+                     + (pressRows.size() > firstRows.size() ? " (" + coopui::PanelNum((long long)(pressRows.size() - firstRows.size())) + " row(s) the world server would refuse left out)" : std::string()));
+    }
+    if (!StoreWriteWorldPassword(sdir, worldArg, true, firstRows, keep != 0))
     {
         g_nbState = coopui::kNbSpawnFailed;
-        ErrorLog("[UI] the world's notebook was NOT started: the world's password could not be written as its key (the [AUTH] line above"
-                 " says why). NOTHING was launched, because the world would otherwise open with another password than the one typed.");
+        ErrorLog("[UI] the world's notebook was NOT started: the world's password could not be written into its rules.txt (the [AUTH] line"
+                 " above says why). NOTHING was launched, because the world would otherwise open with another password than the one typed.");
         return 0;
     }
 
@@ -3192,6 +3309,7 @@ static void PanelKeepPickRefresh()
     g_keepPickFolder = running != 0 ? g_worldSel : std::string();
     g_keepPickToken  = running != 0 ? tok : std::string();
     g_keepPickPort   = running != 0 ? port : 0;
+    g_keepPickPwHas  = g_worldSel.empty() ? -1 : StoreWorldPwHas(StoreTopDir() + "\\" + g_worldSel);   /* T-1255 D: whether the picked world has a password of its own - read here, at each push of the worlds list, never per frame */
     for (size_t k = 0; k < g_worlds.size() && k < g_worldRunning.size(); ++k)
         if (g_worlds[k].folder == g_worldSel && g_worldRunning[k] != running) { g_worldRunning[k] = running; ++g_worldListGen; }
 }
@@ -3663,6 +3781,7 @@ static void PressCancel(const char* how)
     const int mode = g_pressBusy;
     g_pressBusy = 0;
     g_pressWaitStop = 0;
+    g_pressKeepFolder.clear(); g_pressKeepToken.clear();   /* T-1254 B1 */
     ::InterlockedIncrement64(&g_pressCancelled);
     DebugLog(std::string("[UI] T-201 N1: CANCEL (") + how + ") - the " + (mode == 1 ? "HOST" : "JOIN") + " in progress is stopped after "
              + coopui::PanelNum((long long)(DWORD)(::GetTickCount() - g_pressAtMs)) + " ms; back to the screen's opening line");
@@ -3728,12 +3847,22 @@ static int PressTick()
                               : std::string("in the host's world: the world server answered"))
                  + (p.notebookUp != 0 ? std::string(" (WELCOME)")
                                       : " with its profile lobby on link generation " + coopui::PanelNum((long long)p.linkGen) + " - the WELCOME follows a profile pick (T552)"));
+        g_pressKeepFolder.clear(); g_pressKeepToken.clear();   /* T-1254 B1 */
         if (mode == 1) { g_fHostPw.clear(); g_hostPwShown = 0; }   /* T-290: hosting started - the box empties (store.cpp keeps this hosting's password) */
         if (mode == 1) LoadBegin(1);   /* T-201 PP6': no HOSTING screen - Starting "<world>"... stays up while the profile is picked and admitted */
         if (mode == 2) PanelSetStatus(std::string());   /* T-201 N1 fold (finding 5): Connecting comes down, CANCEL is BACK again, JOIN greys while linked (PanelPush); PROFILES follows when its list arrives */
         return 1;
     }
     ::InterlockedIncrement64(&g_pressFailed);
+    /* T-1254 B1: HOST on a world running now answered with the version refusal - an older version's world server runs it (0.4.0 kept
+       worlds write the same host.key); that run is marked (keeprun::OlderRunningMark) */
+    if (mode == 1 && keeprun::OlderRunningMark(g_pressKeepFolder.empty() ? 0 : 1, coopui::RefusalIsVersion(p.refusal) ? 1 : 0) != 0)
+    {
+        g_keepOlderFolder = g_pressKeepFolder; g_keepOlderToken = g_pressKeepToken;
+        DebugLog("[UI] T-1254: HOST on '" + g_keepOlderFolder + "', running now, was answered with the version refusal (" + coopui::PanelNum((long long)p.refusal)
+                 + ") - an older version's world server runs it; while this run is picked HOST writes no password line into its rules.txt and HOST GAME says so");
+    }
+    g_pressKeepFolder.clear(); g_pressKeepToken.clear();
     {   /* T-290: a JOIN refused because the world needs a password (8) or the one given was wrong (9) shows PASSWORD REQUIRED in place
            of the CAN'T JOIN box - the join is left as for any failure, and that screen's JOIN makes JOIN GAME's press again */
         const int ask = coopui::PressPasswordAsk(p.mode, p.refusal);
@@ -4050,6 +4179,8 @@ static void PanelGo()
         /* KEEP-RUNNING: the picked world runs now (its lock held, its host.key whole) - this press joins it on this computer at the saved
            port, as its owner, and starts no world server */
         keepJoin = (PanelKeepPickRunning() != 0 && coopworld::WorldFolderName(g_fWorld) == g_keepPickFolder) ? 1 : 0;
+        g_pressKeepFolder = keepJoin != 0 ? g_keepPickFolder : std::string();   /* T-1254 B1: this press's running-now world, for its answer */
+        g_pressKeepToken  = keepJoin != 0 ? g_keepPickToken : std::string();
         if (keepJoin != 0) { port = (unsigned short)g_keepPickPort; g_fPort = keeprun::KeyPortText(g_keepPickPort); }
         /* a world whose lock cannot be checked may be running in another process: no second world server is started on it */
         if (keepJoin == 0 && g_panelNotebookMine != 0 && PanelWorldLockHeld(coopworld::WorldFolderName(g_fWorld)) < 0)
@@ -4094,7 +4225,8 @@ static void PanelGo()
     }
     else
     {
-        if (!coopcfg::CfgAddrFieldOk(PanelJoinDialAddr(), "address", &f.hostAddr, &f.hostPort, &why))   /* a picked friend: steam:<id> */
+        /* T-793: ADDRESS and PORT as one address - an address with no port of its own dials PORT's (7777 unless changed) */
+        if (!coopcfg::CfgJoinAddrOk(PanelJoinDialAddr(), g_fJoinPort, &f.hostAddr, &f.hostPort, &why))   /* a picked friend: steam:<id>, no port */
         {
             ::InterlockedIncrement64(&g_panelInvalid);
             PanelSetStatus(why);
@@ -4132,7 +4264,7 @@ static void PanelGo()
         g_pressBusy = (f.role == coopcfg::kCfgHost) ? 1 : 2;
         g_pressWaitStop = 1;
         g_pressAtMs = ::GetTickCount();
-        PanelSetStatus(PanelPressLine(g_pressBusy, g_fWorld, coopcfg::CfgTrim(g_fJoinAddr)));   /* a friend's game: "Connecting..." */
+        PanelSetStatus(PanelPressLine(g_pressBusy, g_fWorld, g_pressBusy == 1 ? coopcfg::CfgTrim(g_fJoinAddr) : relaybridge::AddrPortForPlayer(f.hostAddr, f.hostPort)));   /* a friend's game: "Connecting..."; T-793: address:port */
         DebugLog(std::string("[UI] ") + (g_pressBusy == 1 ? "HOST" : "JOIN") + " pressed - the world server this game is stopping has not ended yet;"
                  " the press waits for it, then goes on by itself");
         return;
@@ -4158,7 +4290,7 @@ static void PanelGo()
         const std::string folder = coopworld::WorldFolderName(coopworld::WorldOrDefault(f.world, 0));
         const std::string wdir = StoreTopDir() + "\\" + folder + "\\";
         const bool first = stewardrules::FirstHostingPress(f.role == coopcfg::kCfgHost, keepJoin == 0 && g_panelNotebookMine != 0,
-                                                           U8GetFileAttributes((wdir + rulesfile::kFile).c_str()) != INVALID_FILE_ATTRIBUTES,
+                                                           PanelRulesNamed(folder),   /* a rules.txt of only the password lines HOST wrote holds no stored rule */
                                                            U8GetFileAttributes((wdir + rulesfile::kOldFile).c_str()) != INVALID_FILE_ATTRIBUTES);
         SettingsHostFirstWorld(first ? folder : std::string());
     }
@@ -4169,14 +4301,23 @@ static void PanelGo()
        keeps the head start the old comment claimed.  Host only, and only when the player asked. */
     if (f.role == coopcfg::kCfgHost && keepJoin != 0)
     {
-        /* the saved secret becomes this hosting's: HOST_TOKEN ahead of the HELLO (store.cpp) shows the world server - started with it -
-           the same proof a game that started its own world server gives */
+        /* the saved secret becomes this hosting's: this game's Steam bridge shows it in each STEAM_ID (relay_bridge.cpp), as a game that
+           started its own world server does */
         unsigned char tok[32];
         if (keeprun::KeyTokenBytes(g_keepPickToken, tok, (unsigned int)sizeof tok)) { memcpy(g_hostToken, tok, sizeof tok); g_hostTokenSet = true; }
         else g_hostTokenSet = false;
         g_nbState = coopui::kNbNotOurs;
+        /* the owner password this game logs in with by itself (owner 1369 b): rules.txt's, or a long random one written there now when
+           its line is empty - the running world server reads it within seconds, like any edit of the file; the world password line
+           is left as it is */
+        /* T-1254 B1 (owner 1508 b): a run that answered an earlier HOST with the version refusal is an older version's - no password line is
+           written into its rules.txt, so a 0.4.0 world's password lock stays for the world server of this version */
+        const bool older = PanelKeepPickOlder() != 0;
+        const bool ownerPw = !older && StoreWriteWorldPassword(StoreTopDir() + "\\" + g_keepPickFolder, g_fWorld, false, std::vector<std::pair<std::string, std::string> >(), false);   /* a running world: never a first start */
         DebugLog("[UI] HOST joins '" + g_fWorld + "', running now on this computer at port " + coopui::PanelNum((long long)f.storePort)
-                 + ", as its owner (the secret from its " + keeprun::kKeyFile + ") - no world server started");
+                 + " (the secret from its " + keeprun::kKeyFile + ") - no world server started; "
+                 + (older ? std::string("its world server answered an earlier HOST with the version refusal (an older version runs it): no password line written into its rules.txt (T-1254)")
+                    : ownerPw ? std::string("this game logs in as its owner with the owner password in its rules.txt") : std::string("its rules.txt's owner password could not be taken (the [AUTH] line above says why), so this game is not logged in as its owner")));
     }
     else if (f.role == coopcfg::kCfgHost && g_panelNotebookMine != 0)
     {
@@ -4200,7 +4341,9 @@ static void PanelGo()
     DebugLog(std::string("[UI] ") + (g_prepMode == 1 ? "HOST" : "JOIN") + " prepares: the role is armed for the world's answer and kept only into a world;"
              " back at the title without one, it is cancelled (prepArmed " + coopui::PanelNum((long long)g_prepArmed) + ")");
     /* T-201 N1: the screen stays up, greyed, with CANCEL, saying Starting "<world>"... / Connecting to <address>... until PressTick decides. */
-    PressBegin(f.role == coopcfg::kCfgHost ? 1 : 2, g_fWorld, coopcfg::CfgTrim(PanelJoinDialAddr()));
+    /* T-793 (review note b): Connecting to <address>:<port>... - the port the press dials, not only ADDRESS's text */
+    PressBegin(f.role == coopcfg::kCfgHost ? 1 : 2, g_fWorld,
+               f.role == coopcfg::kCfgHost ? coopcfg::CfgTrim(PanelJoinDialAddr()) : relaybridge::AddrPortForPlayer(f.hostAddr, f.hostPort));
 }
 
 /* T-201 N1 fold (finding 1b): the picked world is the one this game hosts, on the port in the field. */
@@ -4226,17 +4369,31 @@ static bool PanelReadWorldFile(const std::string& folder, const char* file, std:
     return true;
 }
 static bool PanelReadProfilesFile(const std::string& folder, std::string* out) { return PanelReadWorldFile(folder, "profiles.txt", out); }
+/* The world's rules.txt names a rule (rulesfile::NamesARule): a file of only the password lines HOST writes is a world whose rules no
+   world server has stored yet; a file that is there and cannot be read counts as naming one (never taken for none). */
+static bool PanelRulesNamed(const std::string& folder)
+{
+    std::string text;
+    if (PanelReadWorldFile(folder, rulesfile::kFile, &text)) return rulesfile::NamesARule(text);
+    return U8GetFileAttributes((StoreTopDir() + "\\" + folder + "\\" + rulesfile::kFile).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
 /* The world's rules as GAME OPTIONS and the profile rows read them: rules.txt, the world's rule record, else options.txt (a world no
-   world server of this build has opened yet). 2 = rules.txt read, 1 = options.txt, 0 = neither (or rules.txt made there before and
-   gone: the defaults), -1 = rules.txt is there and could not be read - nothing read, and never the old options.txt. */
+   world server of this build has opened yet, its rules.txt absent or naming no rule - only the password lines HOST wrote). 2 =
+   rules.txt read, 1 = options.txt, 0 = neither (or rules.txt made there before and gone: the defaults), -1 = rules.txt is there and
+   could not be read - nothing read, and never the old options.txt. */
 static int PanelReadWorldRules(const std::string& folder, std::map<std::string, std::string>* out)
 {
     out->clear();
     std::string text;
     const std::string wdir = StoreTopDir() + "\\" + folder + "\\";
-    if (PanelReadWorldFile(folder, rulesfile::kFile, &text)) { *out = rulesfile::Parse(text, 0).rules; return 2; }
-    if (U8GetFileAttributes((wdir + rulesfile::kFile).c_str()) != INVALID_FILE_ATTRIBUTES) return -1;
-    if (!rulesfile::MigrateFromOld(false, U8GetFileAttributes((wdir + rulesfile::kMadeFile).c_str()) != INVALID_FILE_ATTRIBUTES)) return 0;
+    const bool read = PanelReadWorldFile(folder, rulesfile::kFile, &text);
+    if (read && rulesfile::NamesARule(text)) { *out = rulesfile::Parse(text, 0).rules; return 2; }
+    if (!read && U8GetFileAttributes((wdir + rulesfile::kFile).c_str()) != INVALID_FILE_ATTRIBUTES) return -1;
+    if (!rulesfile::MigrateFromOld(false, U8GetFileAttributes((wdir + rulesfile::kMadeFile).c_str()) != INVALID_FILE_ATTRIBUTES))
+    {   /* the world server made or read a rules.txt here: one naming no rule is the world's record of no rule */
+        if (read) { *out = rulesfile::Parse(text, 0).rules; return 2; }
+        return 0;
+    }
     if (PanelReadWorldFile(folder, rulesfile::kOldFile, &text)) { coopui::OptParseFile(text, out); return 1; }
     return 0;
 }
@@ -4382,6 +4539,86 @@ static void PanelOptOpen()
     DebugLog("[UI] mp5: Game options for world '" + g_optWorld + "' - " + (read == 2 ? "rules.txt " : "options.txt ") + (have ? "read, " + coopui::PanelNum(fromWorld) + " of the screen's rows recorded" : std::string("absent"))
              + (shownChosen ? ", " + coopui::PanelNum(shownChosen) + " earlier choice(s) shown" : std::string()));
 }
+/* Screen 6 in a running world: the world's CURRENT rules - the world server's last OPTIONS map (SettingsWorldValueOf, the world this game's
+   record index is of), else this game's own live value for a Kenshi row, else the row's default. Nothing chosen on the title screen
+   is shown on top. Returns how many rows came from the world's map. */
+static std::string PanelOptWorldValue(int i, const std::string& folder, int* fromWorld)
+{
+    const coopui::OptDef& d = coopui::OptDefs()[i];
+    std::string v = folder.empty() ? std::string() : coopui::OptCanon(i, SettingsWorldValueOf(folder, d.key));
+    if (!v.empty() && fromWorld != 0) ++*fromWorld;
+    if (v.empty() && d.tab != coopui::kOptTabCoop) v = coopui::OptCanon(i, SettingsLiveValue(d.key));
+    if (v.empty()) v = coopui::OptCanon(i, d.dflt);
+    return v;
+}
+static int PanelOptOpenInWorld()
+{
+    const std::string folder = StoreIndexWorld();
+    int fromWorld = 0;
+    for (int i = 0; i < coopui::kOptCount; ++i)
+    {
+        const std::string v = PanelOptWorldValue(i, folder, &fromWorld);
+        g_optBase[i] = v;
+        g_optVal[i] = v;
+    }
+    g_optWorldGen = SettingsWorldValuesGen();
+    const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);
+    if (fee >= 0) { g_optFeeOpened = g_optVal[fee]; g_optFeeTyped = g_optVal[fee]; }
+    g_optTab = coopui::kOptTabDifficulty;
+    g_optInWorld = 1;
+    g_optWorldDone = 0;
+    g_optCtlShown = -1;
+    g_optWorldTitle = ConfigWorldKey();
+    if (g_optWorldTitle.empty()) g_optWorldTitle = folder;
+    g_panelScreen = 6;
+    ::InterlockedIncrement64(&g_optOpened);
+    return fromWorld;
+}
+/* The world's rules moved while screen 6 is up (another admin's change, a rules.txt edit): a row this player has not changed shows the
+   new value; a changed row keeps the player's choice, which DONE then measures against the world's new value. 1 = a row moved. */
+static int PanelOptWorldRefresh()
+{
+    const long gen = SettingsWorldValuesGen();
+    if (gen == g_optWorldGen) return 0;
+    g_optWorldGen = gen;
+    const std::string folder = StoreIndexWorld();
+    const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);
+    const bool feeAsOpened = fee >= 0 && g_optFeeTyped == g_optFeeOpened;
+    int moved = 0;
+    std::string what;
+    for (int i = 0; i < coopui::kOptCount; ++i)
+    {
+        const std::string v = PanelOptWorldValue(i, folder, 0);
+        if (v == g_optBase[i]) continue;
+        if (g_optVal[i] == g_optBase[i] && (i != fee || feeAsOpened)) g_optVal[i] = v;
+        g_optBase[i] = v;
+        what += " " + std::string(coopui::OptDefs()[i].key) + "=" + v;
+        ++moved;
+    }
+    if (feeAsOpened && g_optVal[fee] != g_optFeeOpened) { g_optFeeOpened = g_optVal[fee]; g_optFeeTyped = g_optVal[fee]; }
+    if (moved != 0)
+        DebugLog("[UI] GAME OPTIONS in the world: the world's rules changed while the screen is up -" + what + " (a row this player changed keeps its choice)");
+    return moved != 0 ? 1 : 0;
+}
+/* DONE in a running world: an admin's changed rows go to the world server now (settings.cpp SettingsWorldChange - the OPTIONS message
+   the HOST screen's rows use: stored, said in every game's chat, played by every game) or are dropped with a log line; a game that is
+   not an admin now sends nothing. The window then closes. */
+static void PanelOptDoneInWorld()
+{
+    const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);   /* an empty fee box goes back to the value it opened with */
+    if (fee >= 0) { g_optVal[fee] = coopui::OptFeeBoxValue(g_optFeeTyped, g_optFeeOpened); g_optFeeTyped = g_optVal[fee]; }
+    const int admin = AdminNow() ? 1 : 0;   /* asked again: the standing may have ended while the screen was up */
+    std::vector<std::pair<std::string, std::string> > ch;
+    if (admin != 0) ch = coopui::OptChanged(g_optVal, g_optBase);
+    std::string what;
+    for (size_t k = 0; k < ch.size(); ++k) what += " " + ch[k].first + "=" + ch[k].second;
+    const int sent = ch.empty() ? 0 : SettingsWorldChange(ch);
+    ::InterlockedIncrement64(&g_optDoneCount);
+    DebugLog("[UI] GAME OPTIONS DONE in the world '" + g_optWorldTitle + "': admin=" + coopui::PanelNum((long long)admin)
+             + " changes sent " + coopui::PanelNum((long long)ch.size()) + (what.empty() ? std::string(" (none)") : ":" + what)
+             + (ch.empty() ? std::string() : sent ? std::string(" - to the world server now") : std::string(" - NOT sent: dropped, nothing held")));
+    g_optWorldDone = 1;   /* the screen stays 6 until the window closes at this tick's end (UiHostingWorldBody) */
+}
 /* The rows that already went (g_optHanded) are only those the world STORED (settings.cpp SettingsHostRowsStored): a press or Done whose
    rows never reached the world leaves them chosen, and the next press sends them again. */
 static void PanelOptTakeStored()
@@ -4466,7 +4703,12 @@ static void PanelOptAction(int act)
     if (act == kActGameOptions) { if (g_panelScreen == 1) PanelOptOpen(); return; }
     if (g_panelScreen != 6) return;
     if (act >= kActOptTab0 && act < kActOptTab0 + coopui::kOptTabCount) { g_optTab = act - kActOptTab0; return; }
-    if (act == kActOptDone) { PanelOptDone(); return; }
+    if (act == kActOptDone) { if (g_optInWorld != 0) PanelOptDoneInWorld(); else PanelOptDone(); return; }
+    if (UiOptControlsLit() == 0)   /* in a running world a game that is not an admin now changes nothing here (its controls are greyed) */
+    {
+        DebugLog("[UI] GAME OPTIONS in the world: a change refused - this game is not an admin now (action " + coopui::PanelNum((long long)act) + ")");
+        return;
+    }
     if (act == kActOptDefaults)
     {
         /* The open tab only.  Attacks on your base and limb loss have no fixed default here: they go back to this
@@ -5318,9 +5560,10 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     {
         MyGUI::Widget* og = Mk(c, n.typeWidget, n.skinPanel, 0, 0, W, H, n.optGroup);
         if (og == 0) { PanelBuildFailed(gui, raw, "the Game options screen's group could not be created"); return; }
-        const coopui::PanelBand tb = coopui::PanelSlotBand(coopui::kLayOptions, coopui::kSlotTabs, rowH);
-        const coopui::PanelBand rb = coopui::PanelSlotBand(coopui::kLayOptions, coopui::kSlotOptRows, rowH);
-        const coopui::PanelBand bb = coopui::PanelSlotBand(coopui::kLayOptions, coopui::kSlotButtons, rowH);
+        const int optLay = g_optInWorld != 0 ? coopui::kLayOptionsWorld : coopui::kLayOptions;   /* in a running world: a row for the admin line */
+        const coopui::PanelBand tb = coopui::PanelSlotBand(optLay, coopui::kSlotTabs, rowH);
+        const coopui::PanelBand rb = coopui::PanelSlotBand(optLay, coopui::kSlotOptRows, rowH);
+        const coopui::PanelBand bb = coopui::PanelSlotBand(optLay, coopui::kSlotButtons, rowH);
         for (int t = 0; t < coopui::kOptTabCount; ++t)
             Mk(og, n.typeButton, n.skinBtn1, t * (thirdW + gap), tb.top, thirdW, tb.h, n.optTab[t]);
         const int stepW = (W * 8) / 100;
@@ -5348,6 +5591,13 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         }
         Mk(og, n.typeButton, n.skinBtn1, 0,        bb.top, btnW, bb.h,                                   n.optDefaultsBtn);
         Mk(og, n.typeButton, n.skinBtn1, W - btnW, bb.top, btnW, bb.h,                                   n.optDoneBtn);
+        {   /* in a running world, for a game that is not an admin now: the line in its own row over DEFAULTS and DONE (PanelPushOptions);
+               on the title screen the layout has no such row and the line is never shown */
+            const coopui::PanelBand nb = coopui::PanelSlotBand(optLay, coopui::kSlotOptNote, rowH);
+            MyGUI::Widget* aw = Mk(og, n.typeText, std::string("Kenshi_TextboxStandardText"), 0, nb.h > 0 ? nb.top : rb.top + rb.h, W, nb.h > 0 ? nb.h : bb.top - rb.top - rb.h, std::string(kOptAdminLineName));
+            MyGUI::TextBox* at = aw != 0 ? aw->castType<MyGUI::TextBox>(false) : 0;
+            if (at != 0) { at->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); at->setVisible(false); }
+        }
     }
 
     /* [9] PROFILES: the list (NAME / FACTION / LAST PLAYED - its own highlight marks the pick), NEW PROFILE and DELETE
@@ -5379,6 +5629,10 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         Mk(jg, n.typeText,   n.skinCaption, jr.labelX, jr.top, jr.labelW, jr.h, n.joinLabel);
         Mk(jg, n.typeEdit,   n.skinEdit,    jr.boxX,   jr.top, jr.boxW,   jr.h, n.joinEdit);
         Mk(jg, n.typeButton, n.skinBtn1,    W - sideW, jr.top, sideW,     jr.h, n.pasteBtn);
+        const coopui::PanelPairRect jp = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(coopui::kLayJoin, coopui::kSlotPortRow, rowH),
+                                                                 coopui::PanelPortBoxW(W), 0);   /* T-793: PORT under ADDRESS */
+        Mk(jg, n.typeText,   n.skinCaption, jp.labelX, jp.top, jp.labelW, jp.h, n.joinPortLabel);
+        Mk(jg, n.typeEdit,   n.skinEdit,    jp.boxX,   jp.top, jp.boxW,   jp.h, n.joinPortEdit);
     }
 
     /* T-201 N1b (owner 166): PLAYER NAME - ONE box, its label and its hint - the top row of HOST GAME and JOIN GAME.  Made on the
@@ -5432,6 +5686,7 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     MyGUI::EditBox* e;
     e = UiEdit(gui, n.portEdit);   if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgPortFieldMax); }
     e = UiEdit(gui, n.joinEdit);   if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgAddrFieldMax); }
+    e = UiEdit(gui, n.joinPortEdit); if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgPortFieldMax); }   /* T-793 */
     e = UiEdit(gui, n.dlgNameEdit); if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopcfg::kCfgWorldFieldMax); }   /* mp3: 48, the World box's limit */
     /* T-290: the PASSWORD boxes show stars - the engine's own password mode (EditBox::setEditPassword, imported from MyGUIEngine_x64
        like the calls above). */
@@ -5472,7 +5727,8 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     w = UiFind(gui, n.homeAddrLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("LOCAL ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }   /* ui5 */
     w = UiFind(gui, n.netAddrLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("INTERNET ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }   /* T-510 */
     w = UiFind(gui, n.dlgNameLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("WORLD NAME")); else ::InterlockedIncrement64(&g_panelCastNull); }
-    w = UiFind(gui, n.joinLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("IP ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }
+    w = UiFind(gui, n.joinLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("ADDRESS")); else ::InterlockedIncrement64(&g_panelCastNull); }   /* T-793: decision 960's words */
+    w = UiFind(gui, n.joinPortLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("PORT")); else ::InterlockedIncrement64(&g_panelCastNull); }   /* T-793 */
     w = UiFind(gui, n.nameLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("PLAYER NAME")); else ::InterlockedIncrement64(&g_panelCastNull); }
     w = UiFind(gui, n.resetKeepLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString(coopui::kResetKeepLabel)); else ::InterlockedIncrement64(&g_panelCastNull); }
     w = UiFind(gui, n.keepLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString(keeprun::kKeepLabel)); else ::InterlockedIncrement64(&g_panelCastNull); }
@@ -5480,7 +5736,7 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
        in it here - Kenshi_TextboxPaintedText / StandardText carry no vertical align of their own.  TextBox::setTextAlign is
        the call ui3's title row already made (no new import). */
     {
-        const std::string* const labs[] = { &n.nameLabel, &n.portLabel, &n.joinLabel, &n.dlgNameLabel, &n.homeAddrLabel, &n.homeAddr,
+        const std::string* const labs[] = { &n.nameLabel, &n.portLabel, &n.joinLabel, &n.joinPortLabel, &n.dlgNameLabel, &n.homeAddrLabel, &n.homeAddr,
                                             &n.hostProfLabel, &n.hostProfValue, &n.netAddrLabel, &n.netAddr,
                                             &n.vpnAddrLabel, &n.vpnAddr, &n.hostPwLabel,   /* T-201 PP6'; T-510; T-631; T-290 */
                                             &n.joinByAddrLabel, &n.steamLabel,   /* JOIN GAME's JOIN BY ADDRESS; HOSTING's STEAM */
@@ -6591,9 +6847,12 @@ static void UiRefusedTipDrop(MyGUI::Gui* gui)
     if (tip != 0) gui->destroyWidget(tip);
     UiRectForget(g_rectRefuseTip);
 }
-/* A hover note's inside, in `tip` (a fresh thin panel `W` wide): one centred line `text` in the message box's text colour
-   (widget `textName`), the panel sized to the measured text plus the inset and the skin's frame. It takes no mouse. Null, with
-   the panel destroyed, when any step fails. */
+/* A hover note's inside, in `tip` (a fresh thin panel `W` wide): the text `text` in the message box's text colour (widget
+   `textName`), the panel sized to the measured text plus the line's own margins, the inset and the skin's frame. It takes no mouse. Null, with
+   the panel destroyed, when any step fails.
+   TWO-LINE NOTES (T-1198): a '\n' in `text` starts a new line. MyGUI's text layout (TextView::update, given the box's
+   alignment) breaks at it and gives each line its own centring offset (LineInfo::offset) under Align::Center, and
+   getTextSize answers the widest line by the lines' total height, so the measuring below fits both lines unchanged. */
 static MyGUI::Widget* UiHoverTipFill(MyGUI::Gui* gui, MyGUI::Widget* tip, int W, const char* textName, const char* text)
 {
     const UiNames& n = NM();
@@ -6607,12 +6866,17 @@ static MyGUI::Widget* UiHoverTipFill(MyGUI::Gui* gui, MyGUI::Widget* tip, int W,
     tb->setCaption(MyGUI::UString(text));
     const MyGUI::IntSize ts = tb->getTextSize();
     if (ts.width <= 0 || ts.height <= 0) { gui->destroyWidget(tip); return 0; }
-    /* the skin's frame, if it has a client area: the panel is the text + inset + that frame, nothing more */
+    /* the line's own skin draws a frame and keeps its text inside margins (its text region is smaller than the box): the box is
+       the text plus those margins, or the frame eats the text and the note shows as a thin unreadable strip */
+    const MyGUI::IntCoord tr = tb->getTextRegion();
+    const int mw = (tr.width > 0 && tr.width <= tw->getWidth()) ? tw->getWidth() - tr.width : 0;
+    const int mh = (tr.height > 0 && tr.height <= tw->getHeight()) ? tw->getHeight() - tr.height : 0;
+    /* the panel's skin frame, if it has a client area: the panel is the line's box + inset + that frame, nothing more */
     MyGUI::Widget* client = tip->getClientWidget();
     const int fw = (client != 0) ? tip->getWidth() - client->getWidth() : 0;
     const int fh = (client != 0) ? tip->getHeight() - client->getHeight() : 0;
-    tip->setSize(MyGUI::IntSize(ts.width + 2 * kHoverTipPadX + fw, ts.height + 2 * kHoverTipPadY + fh));
-    tw->setCoord(MyGUI::IntCoord(kHoverTipPadX, kHoverTipPadY, ts.width, ts.height));
+    tip->setSize(MyGUI::IntSize(ts.width + mw + 2 * kHoverTipPadX + fw, ts.height + mh + 2 * kHoverTipPadY + fh));
+    tw->setCoord(MyGUI::IntCoord(kHoverTipPadX, kHoverTipPadY, ts.width + mw, ts.height + mh));
     return tip;
 }
 /* A hover note under `parent` (on its own layer node, so it draws over the parent's other widgets' text): the thin panel
@@ -6688,11 +6952,11 @@ static void UiRefusedTipTick(MyGUI::Gui* gui, MyGUI::Widget* btn)
     }
 }
 
-/* GAME OPTIONS' HOVER NOTES. What NESTS AND CAMPS (Difficulty tab), RESURRECTION FEE and FEE GROWTH (MULTIPLAYER tab) mean is
-   shown only while the mouse is over the row's label or its control: coopui::OptHoverText - the nests note, and for both
-   fee rows the same note (the price list, or that it is free at an amount of 0; none while RESURRECTION is not ticked).
+/* GAME OPTIONS' HOVER NOTES. What every row means (T-1198: the approved page, version 2) is shown only while the mouse is
+   over the row's label or its control (its arrows, its value, its tick box or the fee box): coopui::OptHoverText - for some
+   rows the note of the value now set; none on a greyed fee row.
    The refused button's mechanism and look: the pointer is polled every title tick (a greyed row's widgets are disabled, and
-   MyGUI sends a disabled widget no mouse or tooltip event), and the note is the same thin panel with one measured line,
+   MyGUI sends a disabled widget no mouse or tooltip event), and the note is the same thin panel with one or two measured lines,
    below-right of the pointer and kept inside the panel. A child of the MULTIPLAYER panel window, so it goes with the panel;
    down whenever the panel, the screen or the tab is not the row's, or the pointer is elsewhere; rebuilt when its text
    changes under the pointer (a fee typed while the box is hovered). */
@@ -6746,7 +7010,7 @@ static int UiOptHovered(MyGUI::Gui* gui, MyGUI::IntPoint* at)
             if (w != 0 && UiPointerOver(w, at)) return i;
             continue;
         }
-        const std::string* const parts[] = { &n.optDec[r], &n.optVal[r], &n.optInc[r] };
+        const std::string* const parts[] = { &n.optDec[r], &n.optVal[r], &n.optInc[r], &n.optTick[r] };   /* a hidden one is never over */
         for (size_t k = 0; k < sizeof(parts) / sizeof(parts[0]); ++k)
         {
             MyGUI::Widget* w = UiFind(gui, *parts[k]);
@@ -6803,8 +7067,10 @@ static void UiOptTipTick(MyGUI::Gui* gui, MyGUI::Widget* panel)
     if (built != 0)
     {
         UiRectForget(g_rectOptTip);
-        /* harness screenshots: where it went up, once per showing - "nestsnote" for NESTS AND CAMPS, "feenote" for the fee rows */
-        UiLogRect(std::string(coopui::OptDefs()[i].key) == "gp.nnm" ? "nestsnote" : "feenote", tip, g_rectOptTip);
+        /* harness screenshots: where it went up, once per showing - "nestsnote" for NESTS AND CAMPS, "feenote" for the fee rows,
+           "optnote" for every other row */
+        const std::string key = coopui::OptDefs()[i].key;
+        UiLogRect(key == "gp.nnm" ? "nestsnote" : (key == swfee::kKeyAmount || key == swfee::kKeyGrowth) ? "feenote" : "optnote", tip, g_rectOptTip);
     }
 }
 
@@ -8909,10 +9175,13 @@ static bool UiDriveState(MyGUI::Gui* gui)
             const std::string t = coopui::OptHoverText(i, g_optVal);
             if (!t.empty()) notes += (notes.empty() ? "" : ";") + std::string(coopui::OptDefs()[i].key) + "=" + t;
         }
+        std::string shownNote = g_optTipText;
+        for (size_t k = 0; k < notes.size(); ++k) if (notes[k] == '\n') notes[k] = '|';   /* T-1198: a two-line note's break, kept on the one log line */
+        for (size_t k = 0; k < shownNote.size(); ++k) if (shownNote[k] == '\n') shownNote[k] = '|';
         line += " feebox='" + (fe ? UiTextOf(fe, 64) : std::string("?")) + "' feeboxShown=" + (fe && fe->getVisible() ? "1" : "0")
               + " feeboxLit=" + (fe && fe->getEnabled() ? "1" : "0")
               + " feeboxAlpha=" + (fe ? std::to_string((long long)(fe->getAlpha() * 100.0f + 0.5f)) : std::string("?"))
-              + " rownotes='" + notes + "' hovernote='" + g_optTipText + "'";
+              + " rownotes='" + notes + "' hovernote='" + shownNote + "'";
     }
     if (g_panelScreen == 8) line += " pwline='" + g_dlgText + "'";   /* T-290: PASSWORD REQUIRED's line (never the box's text) */
     line += " reset='" + g_resetSay + "' resetBusy=" + (g_resetProc != 0 ? "1" : "0") + " resetLit=" + (PanelResetLit() != 0 ? "1" : "0")
@@ -9029,6 +9298,7 @@ static int UiMenuShowPod(uintptr_t fn, void* panel)
    joiner's and a single-player menu are unchanged.  Its click is one interlocked write; the in-world
    tick (UiHostingWorldTick) opens the HOSTING window. */
 static volatile LONG g_hostingAsk = 0;
+static volatile LONG g_optWorldAsk = 0;   /* the MULTIPLAYER window's GAME OPTIONS: screen 6 opens in the HOSTING window's place (UiOptWorldOpen) */
 static void OnHostingRowClicked(MyGUI::Widget* /*sender*/) { ::InterlockedExchange(&g_hostingAsk, 1); }
 static MyGUI::Widget* UiPauseHostingMake(MyGUI::Widget* pp, MyGUI::Widget* options)
 {
@@ -9071,6 +9341,7 @@ static MyGUI::Widget* g_pmPanel = 0;          /* the MainMenuPopupPanel whose Ke
 static pausemenu::KenshiRows g_pmKenshi;
 static pausemenu::Placement g_pmLast;         /* the last placement applied, for the log line */
 static void* (*orig_pauseMenuShow)(void*) = 0;
+static int g_pauseMenuShowHooked = 0;   /* T-927: 1 = AddHook on the menu's show succeeded (UiPauseMenuShowHooked) */
 /* Result bits: 1 a multiplayer world (the three hidden), 2 REPORT A BUG on the panel, 4 every row placed, 8 * (found of the three,
    0..3), 32 HOSTING on the panel, 64 MULTIPLAYER on the panel. < 0: -3 the panel holds no widget, -1 a MyGUI throw, -2 a fault. */
 static int UiPauseArrangeBody(void* panel)
@@ -9204,11 +9475,13 @@ int UiPauseMenuArrange(void* panel)
     UiPauseArrangeLog(r);
     return r;
 }
+static int UiMenuVisiblePod(void* panel);
 static void* detour_pauseMenuShow(void* panel)
 {
     if (panel != 0 && ChatTakesEscape() != 0) return 0;   /* ESC while the chat is open closes the chat (its tick), and the ESC that just closed it is the chat's too: the menu stays shut */
     void* ret = orig_pauseMenuShow(panel);
     if (panel == 0) return ret;
+    ClockGameMenuVisible(UiMenuVisiblePod(panel));   /* T-927: the menu's pause vote follows its own state (store.cpp); its show may have declined (its guard) */
     if (HandSaveBlocked()) ++g_hiddenOpens;
     BugReportPauseMenuShown(panel);   /* T-461: REPORT A BUG on its own row (its own SEH frame); it arranges the menu when it adds the row */
     UiPauseMenuArrange(panel);
@@ -9225,7 +9498,8 @@ void InstallUiPauseMenuArrange()
         return;
     }
     const coop::HookStatus st = coop::AddHook((void*)target, (void*)&detour_pauseMenuShow, (void**)&orig_pauseMenuShow);
-    if (st == coop::SUCCESS && orig_pauseMenuShow != 0)
+    g_pauseMenuShowHooked = (st == coop::SUCCESS && orig_pauseMenuShow != 0) ? 1 : 0;
+    if (g_pauseMenuShowHooked)
         DebugLog("[UI] T-514 hook installed: MainMenuPopup_show 0x913250 - the pause menu's NEW GAME / SAVE GAME / LOAD GAME are hidden in a multiplayer world");
     else
         ErrorLog("[UI] T-514 pause menu arranging=not-installed: AddHook on MainMenuPopup_show 0x913250 FAILED - SAVE GAME / LOAD GAME /"
@@ -9242,6 +9516,8 @@ static int UiMenuVisiblePod(void* panel)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+int UiPauseMenuPanelVisible(void* panel) { return panel != 0 ? UiMenuVisiblePod(panel) : -2; }
+int UiPauseMenuShowHooked() { return g_pauseMenuShowHooked; }
 /* T-461: the in-game pause menu, read and opened again through the engine's own getter and show (the in-game ESC route, the same
    calls as `uimenu ingame` below), for the REPORT A BUG window that sits over it: the engine's ESC closes the menu, and the
    window's ESC (its CANCEL) must leave the menu open. Visible: 1 open, 0 closed, -1 / -2 as UiMenuVisiblePod, -3 no rows / no
@@ -9328,6 +9604,10 @@ static MyGUI::Widget* UiHostingRootMake(MyGUI::Gui* gui, int vw, int vh)
 }
 static void UiHostingWorldClose(MyGUI::Gui* gui, MyGUI::Widget* panel, MyGUI::Widget* root, const char* how)
 {
+    const int opts = g_optInWorld;
+    if (opts != 0) UiOptTipDrop(gui);   /* GAME OPTIONS' hover note is the panel's child: its state goes with it */
+    g_optInWorld = 0;
+    g_optWorldDone = 0;
     if (panel != 0) PanelDestroy(gui, panel);
     if (root != 0) gui->destroyWidget(root);
     ::InterlockedExchange(&g_panelWanted, 0);
@@ -9336,7 +9616,8 @@ static void UiHostingWorldClose(MyGUI::Gui* gui, MyGUI::Widget* panel, MyGUI::Wi
     g_hwSettleMs = 0;
     UiRectForget(g_rectHosting);
     ::InterlockedIncrement64(&g_hostingWorldClosed);
-    DebugLog(std::string("[UI] T-524: the HOSTING window closed (") + how + (g_hwAtTitle != 0 ? ") - this game is at the title" : ") - the pause menu is under it"));
+    DebugLog(std::string(opts != 0 ? "[UI] GAME OPTIONS closed in the world (" : "[UI] T-524: the HOSTING window closed (") + how
+             + (g_hwAtTitle != 0 ? ") - this game is at the title" : ") - the pause menu is under it"));
 }
 static void UiHostingWorldOpen()
 {
@@ -9356,6 +9637,29 @@ static void UiHostingWorldOpen()
     ::InterlockedIncrement64(&g_hostingWorldOpened);
     DebugLog("[UI] T-524: HOSTING pressed on the pause menu - the HOSTING window opens over it (the game stays paused)");
 }
+/* GAME OPTIONS from the MULTIPLAYER window (mockups-t1158.md screens 3 and 6): screen 6 on the running world's rules, built over the pause
+   menu as the HOSTING window is (the same layer, the same close by DONE, the X or ESC). Every player's game opens it; only an admin's
+   controls work (PanelPushOptions). */
+static void UiOptWorldOpen()
+{
+    if (!HandSaveBlocked() || UiPauseMenuVisible() != 1)
+    {
+        DebugLog("[UI] GAME OPTIONS pressed, but this game is not in a multiplayer world now or the pause menu is closed - nothing opened");
+        return;
+    }
+    PanelDefaults();
+    g_panelFailStreak = 0;
+    g_profDlg = 0;
+    ::InterlockedExchange(&g_uiAction, (LONG)kActNone);
+    const int fromWorld = PanelOptOpenInWorld();
+    ::InterlockedExchange(&g_panelWanted, 1);
+    g_panelWorld = 1;
+    UiRectForget(g_rectHosting);
+    const int admin = UiOptAdminNow();
+    DebugLog("[UI] GAME OPTIONS opened in the world '" + g_optWorldTitle + "': admin=" + coopui::PanelNum((long long)admin) + ", "
+             + coopui::PanelNum((long long)fromWorld) + " of " + coopui::PanelNum((long long)coopui::kOptCount) + " rows from the world's rules"
+             + (admin != 0 ? std::string(" - the controls work; a change goes at DONE") : std::string(" - every arrow, tick box and DEFAULTS greyed, the admin line shown")));
+}
 static void UiHostingWorldBody()
 {
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
@@ -9363,6 +9667,7 @@ static void UiHostingWorldBody()
     if (g_hwAtTitle != 0)   /* this game left its world with the window open (a drop to the title): the window closes, nothing more */
     {
         ::InterlockedExchange(&g_hostingAsk, 0);
+        ::InterlockedExchange(&g_optWorldAsk, 0);
         g_hwServerGone = 0;
         MyGUI::Widget* root0 = gui->findWidgetT(std::string(kHostingRootName), false);
         MyGUI::Widget* panel0 = gui->findWidgetT(NM().panel, false);
@@ -9372,6 +9677,7 @@ static void UiHostingWorldBody()
         /* no HOSTING panel on its layer: a panel the title built for itself is the title's and stays; only the layer goes */
         if (root0 != 0) gui->destroyWidget(root0);
         g_panelWorld = 0;
+        g_optInWorld = 0;
         g_hwSettleMs = 0;
         UiRectForget(g_rectHosting);
         ::InterlockedIncrement64(&g_hostingWorldClosed);
@@ -9379,6 +9685,11 @@ static void UiHostingWorldBody()
         return;
     }
     if (::InterlockedExchange(&g_hostingAsk, 0) != 0 && g_panelWorld == 0) UiHostingWorldOpen();
+    if (::InterlockedExchange(&g_optWorldAsk, 0) != 0)
+    {
+        if (g_panelWorld == 0) UiOptWorldOpen();
+        else DebugLog("[UI] GAME OPTIONS pressed, but the panel's window is already open over the pause menu - nothing more opened");
+    }
     if (g_panelWorld == 0) return;
     const UiNames& n = NM();
     const LONG act = ::InterlockedExchange(&g_uiAction, (LONG)kActNone);
@@ -9402,7 +9713,11 @@ static void UiHostingWorldBody()
     if ((act == kActBack && g_panelScreen != 9) || act == kActClose) { UiHostingWorldClose(gui, panel, root, act == kActBack ? "BACK" : "the window's X or ESC"); return; }   /* INVITE FRIENDS' BACK returns to HOSTING */
     if (panel != 0) PanelMirror(gui, act != kActNone ? 1 : 0);
     if (act != kActNone) { ::InterlockedIncrement64(&g_uiActionsRun); PanelApply(gui, (int)act, panel != 0 ? 1 : 0); }
-    if (::InterlockedCompareExchange(&g_panelWanted, 0, 0) == 0 || (g_panelScreen != 5 && g_panelScreen != 9)) { UiHostingWorldClose(gui, panel, root, "it left the HOSTING screen"); return; }
+    if (::InterlockedCompareExchange(&g_panelWanted, 0, 0) == 0 || (g_optInWorld != 0 ? (g_panelScreen != 6 || g_optWorldDone != 0) : (g_panelScreen != 5 && g_panelScreen != 9)))
+    {
+        UiHostingWorldClose(gui, panel, root, g_optInWorld == 0 ? "it left the HOSTING screen" : g_optWorldDone != 0 ? "DONE" : "it left the GAME OPTIONS screen");
+        return;
+    }
     if (panel != 0 && !built) { PanelDestroy(gui, panel); panel = 0; }
     int vw = 1280, vh = 720;
     MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
@@ -9444,7 +9759,18 @@ static void UiHostingWorldBody()
     if (panel != 0)
     {
         PanelPushStatus(gui, act != kActNone ? 1 : 0);
-        UiLogRect("hosting-window", panel, g_rectHosting);
+        if (g_optInWorld != 0)
+        {
+            if (PanelOptWorldRefresh() != 0) PanelPushOptions(gui);   /* another admin's change reached this game: the untouched rows follow */
+            if (UiOptControlsLit() != g_optCtlShown)   /* the admin standing changed while the screen is up: the controls follow it */
+            {
+                const int was = g_optCtlShown;
+                PanelPushOptions(gui);
+                if (was >= 0) DebugLog(std::string("[UI] GAME OPTIONS in the world: admin=") + (g_optCtlShown != 0 ? "1 - the controls work now" : "0 - the controls are greyed now"));
+            }
+            UiOptTipTick(gui, panel);   /* the rows' hover notes, as on the title screen */
+        }
+        UiLogRect(g_optInWorld != 0 ? "options-window" : "hosting-window", panel, g_rectHosting);
     }
 }
 static int UiHostingWorldCatching()
@@ -9490,9 +9816,10 @@ static void UiHostingWorldTick(int atTitle)
     if (g_hwOff != 0)
     {
         if (::InterlockedExchange(&g_hostingAsk, 0) != 0) DebugLog("[UI] T-524: HOSTING pressed, but the HOSTING window is off after a fault this game - nothing opened");
+        if (::InterlockedExchange(&g_optWorldAsk, 0) != 0) DebugLog("[UI] GAME OPTIONS pressed, but the panel's window over the pause menu is off after a fault this game - nothing opened");
         return;
     }
-    if (g_panelWorld == 0 && g_hwServerGone == 0 && ::InterlockedCompareExchange(&g_hostingAsk, 0, 0) == 0) return;
+    if (g_panelWorld == 0 && g_hwServerGone == 0 && ::InterlockedCompareExchange(&g_hostingAsk, 0, 0) == 0 && ::InterlockedCompareExchange(&g_optWorldAsk, 0, 0) == 0) return;
     const int r = UiHostingWorldGuarded();
     if (r == 0) return;
     const unsigned long code = (unsigned long)(LONG)g_uiLastCode;
@@ -9502,6 +9829,7 @@ static void UiHostingWorldTick(int atTitle)
     ::InterlockedExchange(&g_panelWanted, 0);
     g_panelWorld = 0;
     g_panelScreen = 0;
+    g_optInWorld = 0;
     (void)UiHostingWorldDropGuarded();
     if (g_hwFaults >= 3) g_hwOff = 1;
     char b[240];
@@ -9532,17 +9860,19 @@ static const char* const kMpTickName[3]  = { "SWMultiplayerTagPlayer", "SWMultip
 static const char* const kMpLabelName[3] = { "SWMultiplayerTagPlayerLabel", "SWMultiplayerTagCharacterLabel", "SWMultiplayerTagFactionLabel" };
 static const char* const kMpLabelText[3] = { "Player name", "Character name", "Faction or team name" };
 /* ADMIN PASSWORD (mockups-t1158.md screen 3), on the owner's own game only: its heading, the box (stars unless SHOW is down), SHOW,
-   and the line under the box ("At least 8 characters." in its place after a DONE with too short a password). DONE sends a typed
+   and the line under the box (the hint; no minimum length, owner 1368). DONE sends a typed
    password through admin.cpp AdminSetPassword; the box's text is read only there, taken out of the box at once and wiped once sent,
    and never logged. An empty box leaves the password as it is. ESC closes without sending. */
 static const char* const kMpPwHeadName = "SWMultiplayerAdminPwHead";
 static const char* const kMpPwEditName = "SWMultiplayerAdminPwEdit";
 static const char* const kMpPwShowName = "SWMultiplayerAdminPwShow";
 static const char* const kMpPwNoteName = "SWMultiplayerAdminPwNote";
+static const char* const kMpOptsName   = "SWMultiplayerGameOptions";   /* GAME OPTIONS, left of DONE, on every player's game: screen 6 */
 static volatile LONG g_mpToggle[3] = { 0, 0, 0 };   /* a tick box clicked (its handler); taken by the tick */
 static volatile LONG g_mpClose = 0;                 /* ESC heard by the window */
 static volatile LONG g_mpDone = 0;                  /* DONE pressed */
 static volatile LONG g_mpPwShow = 0;                /* SHOW pressed */
+static volatile LONG g_mpOpts = 0;                  /* GAME OPTIONS pressed */
 static int g_mpPwPart = 0, g_mpPwShown = 0;         /* the window was built with ADMIN PASSWORD; its text shown (SHOW down) */
 static int g_mpOpen = 0, g_mpCfgRead = 0, g_mpFaults = 0, g_mpOff = 0;
 static tagcfg::Parts g_mpParts = tagcfg::Defaults();   /* what the tags show now, and what tags.cfg was last written with */
@@ -9551,6 +9881,7 @@ static void OnMpTickCharacter(MyGUI::Widget* /*sender*/) { ::InterlockedExchange
 static void OnMpTickFaction(MyGUI::Widget* /*sender*/)   { ::InterlockedExchange(&g_mpToggle[2], 1); }
 static void OnMpDone(MyGUI::Widget* /*sender*/)          { ::InterlockedExchange(&g_mpDone, 1); }
 static void OnMpPwShow(MyGUI::Widget* /*sender*/)        { ::InterlockedExchange(&g_mpPwShow, 1); }
+static void OnMpOpts(MyGUI::Widget* /*sender*/)          { ::InterlockedExchange(&g_mpOpts, 1); }
 static void OnMpKey(MyGUI::Widget* /*sender*/, MyGUI::KeyCode key, MyGUI::Char /*ch*/) { if (key == MyGUI::KeyCode::Escape) ::InterlockedExchange(&g_mpClose, 1); }
 static int UiMpClamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static bool UiMpPart(const tagcfg::Parts& p, int i) { return i == 0 ? p.player : (i == 1 ? p.character : p.faction); }
@@ -9614,20 +9945,15 @@ static void UiMpPwTake(MyGUI::EditBox* e, std::string* out)
     if (w < out->size()) { ::SecureZeroMemory(&(*out)[w], out->size() - w); out->resize(w); }
     e->setCaption(MyGUI::UString(""));
 }
-/* DONE with the ADMIN PASSWORD part: false = too short (the line under the box says so, the window stays open) */
-static bool UiMpPwDone(MyGUI::Gui* gui)
+/* DONE with the ADMIN PASSWORD part: the box's text sent (an empty box leaves the password as it is) */
+static void UiMpPwDone(MyGUI::Gui* gui)
 {
     MyGUI::EditBox* e = UiEdit(gui, std::string(kMpPwEditName));
-    if (e == 0) return true;
+    if (e == 0) return;
     std::string pw;
     UiMpPwTake(e, &pw);
-    const int done = AdminSetPassword(&pw, "the MULTIPLAYER window's DONE");   /* wipes pw */
+    AdminSetPassword(&pw, "the MULTIPLAYER window's DONE");   /* wipes pw */
     if (!pw.empty()) ::SecureZeroMemory(&pw[0], pw.size());
-    if (done != adminwords::kPwShort) return true;
-    MyGUI::Widget* nw = UiFind(gui, std::string(kMpPwNoteName));
-    MyGUI::TextBox* n = nw != 0 ? nw->castType<MyGUI::TextBox>(false) : 0;
-    if (n != 0) n->setCaption(MyGUI::UString(adminwords::PasswordShortLine()));
-    return false;
 }
 static void UiMpWindowClose(MyGUI::Gui* gui, const char* how)
 {
@@ -9644,6 +9970,7 @@ static void UiMpWindowClose(MyGUI::Gui* gui, const char* how)
     ::InterlockedExchange(&g_mpClose, 0);
     ::InterlockedExchange(&g_mpDone, 0);
     ::InterlockedExchange(&g_mpPwShow, 0);
+    ::InterlockedExchange(&g_mpOpts, 0);
     g_mpPwPart = 0; g_mpPwShown = 0;
     for (int i = 0; i < 3; ++i) ::InterlockedExchange(&g_mpToggle[i], 0);
     DebugLog(std::string("[UI] T-1153: the MULTIPLAYER window closed (") + how + (HandSaveBlocked() ? ") - the pause menu is under it" : ") - not in a multiplayer world now"));
@@ -9765,6 +10092,18 @@ static bool UiMpWindowBuild(MyGUI::Gui* gui)
         done->eventKeyButtonPressed += MyGUI::newDelegate(OnMpKey);
     }
     else ok = false;
+    {   /* GAME OPTIONS (mockups-t1158.md screen 3) on DONE's row at the left: the world's rules (screen 6) */
+        const int optsW = UiMpClamp(innerW * 2 / 5, btnW, innerW - btnW - pad);
+        MyGUI::Widget* ow = Mk(cl, "Button", "Kenshi_Button1", pad, btnY, optsW, btnH, kMpOptsName);
+        MyGUI::Button* ob = ow != 0 ? ow->castType<MyGUI::Button>(false) : 0;
+        if (ob != 0)
+        {
+            ob->setCaption(MyGUI::UString("GAME OPTIONS"));
+            ob->eventMouseButtonClick += MyGUI::newDelegate(OnMpOpts);
+            ob->eventKeyButtonPressed += MyGUI::newDelegate(OnMpKey);
+        }
+        else ok = false;
+    }
     if (!ok) { gui->destroyWidget(raw); return false; }
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
     if (im != 0) { im->addWidgetModal(raw); im->setKeyFocusWidget(raw); }
@@ -9788,6 +10127,7 @@ static void UiMpWindowBody()
         ::InterlockedExchange(&g_mpClose, 0);
         ::InterlockedExchange(&g_mpDone, 0);
         ::InterlockedExchange(&g_mpPwShow, 0);
+        ::InterlockedExchange(&g_mpOpts, 0);
         for (int i = 0; i < 3; ++i) ::InterlockedExchange(&g_mpToggle[i], 0);
         if (!UiMpWindowBuild(gui))
         {
@@ -9810,9 +10150,15 @@ static void UiMpWindowBody()
         return;
     }
     if (::InterlockedExchange(&g_mpClose, 0) != 0) { UiMpWindowClose(gui, "ESC"); return; }
+    if (::InterlockedExchange(&g_mpOpts, 0) != 0)   /* GAME OPTIONS: this window closes (a password typed and not sent goes, as at ESC) and screen 6 opens */
+    {
+        UiMpWindowClose(gui, "GAME OPTIONS");
+        ::InterlockedExchange(&g_optWorldAsk, 1);
+        return;
+    }
     if (::InterlockedExchange(&g_mpDone, 0) != 0)
     {
-        if (g_mpPwPart != 0 && !UiMpPwDone(gui)) { DebugLog("[UI] the MULTIPLAYER window's DONE: the admin password under 8 characters - the window stays, the line under the box says so"); return; }
+        if (g_mpPwPart != 0) UiMpPwDone(gui);
         UiMpWindowClose(gui, "DONE");
         return;
     }
@@ -10061,6 +10407,43 @@ static int UiNewGameWindowShown(MyGUI::Gui* gui)
     }
     return shown;
 }
+/* T-1055 (owner 1363) - THE START NAME BEGIN COMMITTED. MAIN THREAD, from settings.cpp's SaveManager::newGame pre-hook (the BEGIN
+   press): the NEW GAME window's TitleTextBox, the BeginButton's sibling in Kenshi_NewGamePanel.layout, read as it shows. "?" when the
+   button or the box is not found. Reads only; kept for the [WORLD] started line. */
+void UiNewGameStartNote()
+{
+    g_ngStartName = "?";
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    MyGUI::Widget* begin = gui != 0 ? UiDriveEngine(gui, "BeginButton", 0, 0) : 0;
+    MyGUI::Widget* panel = begin != 0 ? begin->getParent() : 0;
+    if (panel == 0) return;
+    const size_t n = panel->getChildCount();
+    for (size_t i = 0; i < n; ++i)
+    {
+        MyGUI::Widget* w = panel->getChildAt(i);
+        if (w == 0 || !NameCarriesLayoutSuffix(w->getName(), "TitleTextBox")) continue;
+        MyGUI::TextBox* tb = w->castType<MyGUI::TextBox>(false);
+        const char* cap = tb != 0 ? tb->getCaption().asUTF8_c_str() : 0;
+        if (cap != 0) g_ngStartName = cap;
+        return;
+    }
+}
+/* T-1055: the [WORLD] started line's start and prepared fields, said once per world (store.cpp ClockNoteEpoch, the world-live edge):
+   start = the name BEGIN committed when this world is a new game ('-' otherwise, '?' when no BEGIN was noted); prepared = the HOST /
+   JOIN preparation still standing, or the one the first in-world tail ended. Both are cleared here for the next world. */
+std::string UiWorldStartFacts(int newGame)
+{
+    const int phase = g_prepPhase != coopui::kPrepNone ? g_prepPhase : g_prepAtWorldPhase;
+    const int mode = g_prepPhase != coopui::kPrepNone ? g_prepMode : g_prepAtWorldMode;
+    const std::string start = newGame == 0 ? std::string("-") : (g_ngStartName.empty() ? std::string("?") : g_ngStartName);
+    g_ngStartName.clear();
+    g_prepAtWorldPhase = coopui::kPrepNone; g_prepAtWorldMode = 0;
+    std::string prep = "none";
+    if (phase != coopui::kPrepNone)
+        prep = std::string(mode == 1 ? "HOST" : "JOIN") + (phase == coopui::kPrepArmed ? " (armed)" : phase == coopui::kPrepWindowWait ? " (NEW GAME window opening)"
+               : phase == coopui::kPrepWindowSeen ? " (NEW GAME window seen)" : " (its load posted)");
+    return "start='" + start + "' prepared=" + prep;
+}
 /* atTitle: 1 = after the title's own update (coop.cpp's title hook), 0 = the in-world tail - which never posts: the title that decided is gone. */
 static void LoadTailAct(int atTitle)
 {
@@ -10133,6 +10516,7 @@ void UiDriveEngineClickFlush(int atTitle)
                                       a multiplayer world there (HandSaveBlocked false), so a window left open from the world closes and nothing opens */
     try { LoadTailAct(atTitle); }
     catch (...) { DebugLog("[AUTOLOAD] a C++ exception at the end of the frame; nothing more done"); }
+    if (atTitle == 0 && g_prepPhase != coopui::kPrepNone) { g_prepAtWorldPhase = g_prepPhase; g_prepAtWorldMode = g_prepMode; }   /* T-1055: for the [WORLD] started line */
     if (atTitle == 0) g_prepPhase = coopui::kPrepNone;   /* in a world: the press's preparation is over */
     try { UiDriveCloseWindowRecheck(); }   /* T-906: the second read of a window closed at the previous pump's tail (before any new fire) */
     catch (...) { g_closeWinRecheck.clear(); }

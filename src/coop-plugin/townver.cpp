@@ -65,6 +65,7 @@
 #include "../common/townverwire.h"
 #include "../common/townrefill.h"   /* SameWorld: the world the records belong to */
 #include "zones.h"
+#include "doors.h"   /* DoorsRecAreaRebuilt - a rebuilt town's stale door records */
 #include "store.h"
 #include "addresses.h"
 #include "hooks.h"
@@ -439,6 +440,11 @@ bool TownVerChoose(void* zm, void* town, TvChooserFn orig)
         else ++g_tvKeptSame;
     }
     if (noteFresh) g_tvBook.Built(pl.key, r ? 1 : 0, hasNote, noteVer, fin.repl);
+    if (r)
+    {   /* the town's saved buildings were replaced: the area's door records that name no door are removed by its holder (doors.cpp) */
+        const Sector ts = SectorOf(pl.x, pl.z);
+        DoorsRecAreaRebuilt(ts.x * 64 + ts.y);
+    }
     return r;
 }
 

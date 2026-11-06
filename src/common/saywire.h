@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "leverpick.h"   /* T-1218: a `#<k>` selector after a nearest <dialogueName> is kept through the key */
+
 namespace coopsay {
 
 const unsigned int kSayMaxText = 512;   /* bytes; a longer line is not sent (sayTooLong) */
@@ -275,6 +277,18 @@ inline int TalkSplit(const std::string& arg, std::string* tok, int cap)
    nearest: *npcUid = 0 and *npcKey = TalkNameKey(name) (never empty); uids non-zero; seconds 1..3600, default 120; walkover = keep
    trying past a started conversation whose line does not walk over. */
 const int kTalkSightDefaultSeconds = 120, kTalkSightMaxSeconds = 3600;
+/* T-1218 (TEST-ONLY): a `nearest <dialogueName>` token keyed as TalkNameKey, with a `#<k>` selector (leverpick::SplitSelector) kept
+   after the key so the pick (speech.cpp TsNearestCarrier) can take the k-th nearest; a malformed selector is kept raw, so the pick
+   refuses it in words. */
+inline std::string TalkNameKeySel(const std::string& tok)
+{
+    std::string base; int k = 0;
+    const int r = leverpick::SplitSelector(tok, &base, &k);
+    if (r == 0) return TalkNameKey(tok);
+    if (r > 0) return TalkNameKey(base) + "#" + leverpick::Num(k);
+    const std::string::size_type h = tok.rfind('#');
+    return TalkNameKey(tok.substr(0, h)) + tok.substr(h);
+}
 inline int TalkSightParse(const std::string& arg, unsigned int* npcUid, std::string* npcKey, unsigned int* targetUid, int* seconds, int* untilWalk)
 {
     *npcUid = 0; npcKey->clear(); *targetUid = 0; *seconds = kTalkSightDefaultSeconds; *untilWalk = 0;
@@ -285,7 +299,7 @@ inline int TalkSightParse(const std::string& arg, unsigned int* npcUid, std::str
     unsigned long long v = 0;
     if (tok[0] == "nearest")
     {
-        *npcKey = TalkNameKey(tok[1]);
+        *npcKey = TalkNameKeySel(tok[1]);   /* T-1218: `#<k>` kept */
         if (npcKey->empty()) return 0;
         k = 2;
     }
@@ -324,7 +338,7 @@ inline int TalkTeleportNearParseDy(const std::string& arg, unsigned int* uid, st
     if (tok[0] == "nearest")
     {
         if (n < 3) return 0;
-        *key = TalkNameKey(tok[1]);
+        *key = TalkNameKeySel(tok[1]);   /* T-1218: `#<k>` kept */
         if (key->empty()) return 0;
         k = 2;
     }
@@ -430,6 +444,28 @@ inline int TalkTestFactionParse(const std::string& arg, std::string* name, unsig
         return 0;
     }
     return TalkTestNameParse("nearestname" + arg.substr(at + w.size()), name, targetUid, ev, own);
+}
+
+/* T-858: `talktest nearestcarrier <act> <targetUid> [event] [copy | mine]` (TEST-ONLY): 1 parsed, 0 malformed. act 0..255 (a
+   dialogue action type), target non-zero, event 0..255 (decimal or 0x hex, default 1), a last word copy (*own = 0) or mine (*own =
+   1), else *own = -1 (any). */
+inline int TalkTestCarrierParse(const std::string& arg, int* act, unsigned int* targetUid, int* ev, int* own)
+{
+    *act = -1; *targetUid = 0; *ev = kEvPlayerTalkToMe; *own = -1;
+    std::string tok[kTalkNameMaxTokens];
+    const int n = TalkSplit(arg, tok, kTalkNameMaxTokens);
+    if (n < 3 || tok[0] != "nearestcarrier") return 0;
+    unsigned long long v = 0;
+    if (!TalkParseNumber(tok[1], &v) || v > 255) return 0;
+    const int a = (int)v;
+    if (!TalkParseNumber(tok[2], &v) || v == 0 || v > 0xFFFFFFFFull) return 0;
+    const unsigned int tu = (unsigned int)v;
+    int k = 3, e = kEvPlayerTalkToMe, o = -1;
+    if (k < n && TalkParseNumber(tok[k], &v)) { if (v > 255) return 0; e = (int)v; ++k; }
+    if (k < n && (tok[k] == "copy" || tok[k] == "mine")) { o = (tok[k] == "mine") ? 1 : 0; ++k; }
+    if (k != n) return 0;
+    *act = a; *targetUid = tu; *ev = e; *own = o;
+    return 1;
 }
 
 /* P25 T729: `playerteleport near name <npc name> <units> [maxdy <n>]` (TEST-ONLY): 1 parsed, 0 malformed. The name as

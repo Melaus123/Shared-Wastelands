@@ -469,7 +469,7 @@ bool Mp5NotebookOk(const std::string& k, const std::string& v)
     if (k.compare(0, 3, "gt.") == 0) return coopgp::GtValueOk(k, v);
     if (k == "recruitmult") return coopr::RecruitMultValueOk(v);
     if (k == "basepolicy") return v == "shared" || v == "owner" || v == "locked";
-    if (k == "timemode") return v == "fixed" || v == "consensus";
+    if (k == "timemode") return coopclock::TimeModeOfWire(v.c_str()) >= 0;
     if (k == "profilecap") return coopprof::CapValueOk(v) != 0;   /* ui5: store_main.cpp OptionValueOk's own check */
     if (swfee::IsOptionKey(k)) return swfee::OptionValueOk(k, v);   /* T-556: the world server's own check */
     if (spimport::IsOptionKey(k)) return spimport::OptionValueOk(k, v);   /* T-1096: the world server's own check */
@@ -515,7 +515,7 @@ void t_mp5_game_options_rows()
         else if (k == "gt.limbloss") { wantLow = "0"; wantHigh = "2"; wantN = 3; }
         else if (k == "recruitmult") { wantLow = "auto"; wantHigh = "4"; wantN = 5; }
         else if (k == "basepolicy") { wantLow = "shared"; wantHigh = "locked"; wantN = 3; }
-        else if (k == "timemode") { wantLow = "fixed"; wantHigh = "consensus"; wantN = 2; }
+        else if (k == "timemode") { wantLow = "fixed"; wantHigh = "locked"; wantN = 4; }
         else if (k == "profilecap") { wantLow = "1"; wantHigh = "16"; wantN = 16; }   /* ui5 */
         else if (k == "spimport") { wantLow = "all"; wantHigh = "off"; wantN = 3; }   /* T-1096 */
         else if (k == "spimportmoney" || k == "spimportresearch") { wantLow = "yes"; wantHigh = "no"; wantN = 2; }   /* T-1096 */
@@ -578,16 +578,16 @@ void t_t556f_fee_rows()
     if (coopui::OptMoneyText(0) != "c.0" || coopui::OptMoneyText(999) != "c.999" || coopui::OptMoneyText(1000) != "c.1,000"
         || coopui::OptMoneyText(16000) != "c.16,000" || coopui::OptMoneyText(999999) != "c.999,999" || coopui::OptMoneyText(15999984000000LL) != "c.15,999,984,000,000")
         Fail("money text: " + coopui::OptMoneyText(1000));
-    /* the fee rows' hover note, word for word */
-    if (coopui::OptFeeNoteText("on", "1000", "steep") != "PRICES: free, c.1,000, c.4,000, c.9,000, c.16,000 ...")
+    /* RESURRECTION FEE's hover note, word for word (T-1198: the approved page, version 2) */
+    if (coopui::OptFeeNoteText("on", "1000", "steep") != "Price: free, then c.1,000, c.4,000, c.9,000 ...\nRises with brought-back characters still alive.")
         Fail("the Steep note: " + coopui::OptFeeNoteText("on", "1000", "steep"));
-    if (coopui::OptFeeNoteText("on", "1000", "steady") != "PRICES: free, c.1,000, c.2,000, c.3,000, c.4,000 ...")
+    if (coopui::OptFeeNoteText("on", "1000", "steady") != "Price: free, then c.1,000, c.2,000, c.3,000 ...\nRises with brought-back characters still alive.")
         Fail("the Steady note: " + coopui::OptFeeNoteText("on", "1000", "steady"));
     if (coopui::OptFeeNoteText("on", "0", "steep") != "Bringing back a fallen character is free." || coopui::OptFeeNoteText("on", "000", "steady") != "Bringing back a fallen character is free.")
         Fail("the amount-0 note");
     if (coopui::OptFeeNoteText("off", "1000", "steep") != "" || coopui::OptFeeNoteText("", "1000", "steep") != "") Fail("no note while RESURRECTION is not ticked");
-    if (coopui::OptFeeNoteText("on", "2500", "steep") != "PRICES: free, c.2,500, c.10,000, c.22,500, c.40,000 ..."
-        || coopui::OptFeeNoteText("on", "999999", "steep") != "PRICES: free, c.999,999, c.3,999,996, c.8,999,991, c.15,999,984 ...")
+    if (coopui::OptFeeNoteText("on", "2500", "steep") != "Price: free, then c.2,500, c.10,000, c.22,500 ...\nRises with brought-back characters still alive."
+        || coopui::OptFeeNoteText("on", "999999", "steep") != "Price: free, then c.999,999, c.3,999,996, c.8,999,991 ...\nRises with brought-back characters still alive.")
         Fail("the typed amount is filled in: " + coopui::OptFeeNoteText("on", "999999", "steep"));
     /* greying */
     std::string v[coopui::kOptCount];
@@ -599,25 +599,25 @@ void t_t556f_fee_rows()
     if (!coopui::OptRowLit(fee, v) || !coopui::OptRowLit(gr, v)) Fail("on: both lit");
     v[fee] = "0";
     if (!coopui::OptRowLit(fee, v) || coopui::OptRowLit(gr, v)) Fail("amount 0: FEE GROWTH greys, the box stays lit");
-    /* the hover notes: ANIMAL NESTS its own; RESURRECTION FEE and FEE GROWTH the same note (free at 0, the prices otherwise,
-       none while RESURRECTION is not ticked); no other row has one */
+    /* the hover notes (T-1198: every row has one; the words themselves are pinned by t1198_option_hover_notes): RESURRECTION
+       FEE free at 0, its prices otherwise; FEE GROWTH greyed at 0 and so without one; none on a fee row while RESURRECTION is
+       not ticked */
     {
         std::string h[coopui::kOptCount];
         for (int i = 0; i < coopui::kOptCount; ++i) h[i] = v[i];   /* RESURRECTION ticked, amount 0, Steep */
         const int nests = coopui::OptIndexOfKey("gp.nnm");
         if (nests < 0 || coopui::OptDefs()[nests].tab != coopui::kOptTabDifficulty) Fail("ANIMAL NESTS is a Difficulty row");
-        for (int i = 0; i < coopui::kOptCount; ++i)
-            if (coopui::OptHasHoverNote(i) != (i == fee || i == gr || i == nests) || (!coopui::OptHasHoverNote(i) && coopui::OptHoverText(i, h) != ""))
-                Fail(std::string("a hover note on the wrong row: ") + coopui::OptDefs()[i].key);
-        if (coopui::OptHoverText(nests, h) != "Nests and camps: only affects areas not yet visited.") Fail("the NESTS AND CAMPS note");
-        if (coopui::OptHoverText(fee, h) != "Bringing back a fallen character is free." || coopui::OptHoverText(gr, h) != coopui::OptHoverText(fee, h))
-            Fail("amount 0: both fee rows note that it is free");
+        for (int i = 0; i < coopui::kOptCount; ++i) if (!coopui::OptHasHoverNote(i)) Fail(std::string("a row without a hover note: ") + coopui::OptDefs()[i].key);
+        if (coopui::OptHoverText(fee, h) != "Bringing back a fallen character is free." || coopui::OptHoverText(gr, h) != "")
+            Fail("amount 0: the fee box notes that it is free, the greyed FEE GROWTH has no note");
         h[fee] = "1000"; h[gr] = "steady";
-        if (coopui::OptHoverText(gr, h) != "PRICES: free, c.1,000, c.2,000, c.3,000, c.4,000 ..." || coopui::OptHoverText(fee, h) != coopui::OptHoverText(gr, h))
-            Fail("an amount: both fee rows note the prices: " + coopui::OptHoverText(gr, h));
+        if (coopui::OptHoverText(fee, h) != "Price: free, then c.1,000, c.2,000, c.3,000 ...\nRises with brought-back characters still alive."
+            || coopui::OptHoverText(gr, h) != "The price rises evenly with each one currently reanimated.")
+            Fail("an amount: the fee box notes the prices, FEE GROWTH its own: " + coopui::OptHoverText(fee, h));
+        const std::string nestsNote = coopui::OptHoverText(nests, h);
         h[on] = "off";
         if (coopui::OptHoverText(fee, h) != "" || coopui::OptHoverText(gr, h) != "") Fail("no fee note while RESURRECTION is not ticked");
-        if (coopui::OptHoverText(nests, h) != "Nests and camps: only affects areas not yet visited.") Fail("the NESTS AND CAMPS note does not depend on RESURRECTION");
+        if (nestsNote.empty() || coopui::OptHoverText(nests, h) != nestsNote) Fail("the NESTS AND CAMPS note does not depend on RESURRECTION");
         if (coopui::OptHoverText(-1, h) != "" || coopui::OptHoverText(coopui::kOptCount, h) != "" || coopui::OptHasHoverNote(-1) || coopui::OptHasHoverNote(coopui::kOptCount))
             Fail("no note off the list");
     }
@@ -1162,12 +1162,15 @@ void t_t246_fold_notice()
     if (ModWarnNoticeText(1, 0, ModDiff()) != plain) Fail("fold 2: no world list to compare with gets the plain notice");
     if (ModWarnNoticeText(1, 1, ModListDiff(w, mi)) != ModWarnText(ModListDiff(w, mi))) Fail("fold 2: a readable list names what it can");
     if (ModsHelloDecidePolicy(0, 1, 0, 0, kModsMismatchPolicyNow) != kModsHelloAdmitUnreadable) Fail("fold 2: the shipped constant admits an unreadable list");
-    /* 8: no operator named yet - the first game in is not warned */
-    if (ModsHelloDecideWorld(1, 1, 0, 0, kModsMismatchWarn, 0) != kModsHelloProvisional) Fail("fold 8: with no operator yet a differing game is provisional, not warned");
-    if (ModsHelloDecideWorld(0, 1, 0, 0, kModsMismatchWarn, 0) != kModsHelloAdmitUnchecked) Fail("fold 8: with no operator yet an unreadable list is let in unchecked");
-    if (ModsHelloDecideWorld(1, 1, 0, 0, kModsMismatchWarn, 1) != kModsHelloAdmitDiffers || ModsHelloDecideWorld(1, 1, 0, 1, kModsMismatchWarn, 0) != kModsHelloMatch)
-        Fail("fold 8: with an operator a differing game is warned; a match is a match either way");
-    if (ModsHelloDecideWorld(1, 1, 0, 0, kModsMismatchRefuse, 0) != kModsHelloRefuseDiffers) Fail("fold 8: the refuse policy is untouched");
+    /* T-1158 step 7b (owner 1369 b): the saved list decides; none saved = the first game's list is saved; the owner's list replaces it */
+    if (ModsHelloDecideWorld(1, 0, 0, 0, kModsMismatchWarn) != kModsHelloRecord) Fail("7b: with no list saved the first game's list is not saved");
+    if (ModsHelloDecideWorld(0, 0, 0, 0, kModsMismatchWarn) != kModsHelloAdmitUnchecked) Fail("7b: an unreadable list with none saved is not let in unchecked");
+    if (ModsHelloDecideWorld(1, 1, 0, 0, kModsMismatchWarn) != kModsHelloAdmitDiffers) Fail("7b: a differing non-owner game is not judged against the saved list");
+    if (ModsHelloDecideWorld(1, 1, 0, 1, kModsMismatchWarn) != kModsHelloMatch || ModsHelloDecideWorld(1, 1, 1, 1, kModsMismatchWarn) != kModsHelloMatch) Fail("7b: a match is a match");
+    if (ModsHelloDecideWorld(1, 1, 1, 0, kModsMismatchWarn) != kModsHelloRecord) Fail("7b: the owner's differing list does not replace the saved one");
+    if (ModsHelloDecideWorld(1, 1, 0, 0, kModsMismatchRefuse) != kModsHelloRefuseDiffers) Fail("7b: the refuse policy is untouched");
+    if (ModsOwnerLoginWrites(1, 1, 0) != 1 || ModsOwnerLoginWrites(1, 0, 0) != 1) Fail("7b: an owner login does not write its differing list");
+    if (ModsOwnerLoginWrites(1, 1, 1) != 0 || ModsOwnerLoginWrites(0, 1, 0) != 0) Fail("7b: an owner login rewrote the same list, or wrote an unreadable one");
     /* 7: the admit line and count only once admitted */
     if (ModsCountAdmittedDiffers(kModsHelloAdmitDiffers, 0) != 0 || ModsCountAdmittedDiffers(kModsHelloAdmitUnreadable, 0) != 0) Fail("fold 7: not counted before admission");
     if (ModsCountAdmittedDiffers(kModsHelloAdmitDiffers, 1) != 1 || ModsCountAdmittedDiffers(kModsHelloAdmitUnreadable, 1) != 1) Fail("fold 7: counted once admitted");
@@ -1209,12 +1212,12 @@ void t_t246_fold_notice()
     /* item 1: the operator (host) is never given a verdict that shows the notice */
     for (int lk = 0; lk < 2; ++lk) for (int hr = 0; hr < 2; ++hr) for (int sm = 0; sm < 2; ++sm)
     {
-        const int v = ModsHelloDecideWorld(lk, hr, 1, (hr && lk) ? sm : 0, kModsMismatchWarn, 1);
-        if (v == kModsHelloAdmitDiffers || v == kModsHelloAdmitUnreadable) Fail("fold 2 item 1: the operator is never warned");
+        const int v = ModsHelloDecideWorld(lk, hr, 1, (hr && lk) ? sm : 0, kModsMismatchWarn);
+        if (v == kModsHelloAdmitDiffers || v == kModsHelloAdmitUnreadable) Fail("fold 2 item 1: the owner is never warned");
     }
-    if (ModsHelloDecideWorld(0, 1, 1, 0, kModsMismatchPolicyNow, 1) != kModsHelloOperatorUnreadable) Fail("fold 2 item 1: the operator's unreadable list is let in silently");
+    if (ModsHelloDecideWorld(0, 1, 1, 0, kModsMismatchPolicyNow) != kModsHelloOperatorUnreadable) Fail("fold 2 item 1: the owner's unreadable list is let in silently");
     if (ModsCountAdmittedDiffers(kModsHelloOperatorUnreadable, 1) != 0) Fail("fold 2 item 1: the operator is not counted as let in with differing mods");
-    if (ModsHelloDecideWorld(0, 1, 0, 0, kModsMismatchWarn, 1) != kModsHelloAdmitUnreadable) Fail("fold 2 item 1: a joiner's unreadable list still gets the notice");
+    if (ModsHelloDecideWorld(0, 1, 0, 0, kModsMismatchWarn) != kModsHelloAdmitUnreadable) Fail("fold 2 item 1: a joiner's unreadable list still gets the notice");
     if (ModsHelloDecidePolicy(0, 1, 1, 0, kModsMismatchRefuse) != kModsHelloRefuseUnreadable) Fail("fold 2 item 1: the refuse policy is untouched (T-247)");
     /* item 2: the re-check of a provisional game at the first operator, written or not */
     {
@@ -2405,6 +2408,29 @@ void t_t497_ground_recent_keys()
 /* inv5 phase 0 (P090): the ground key (design section 2) - its text, its round trip, the hash fallback, the refusals, the
    near-miss rule (0.5 units, sector not compared) and the bag match (quantity, then quality, then any). */
 /* P2/P3/P4 (inv5 phase 2): the one drop road's decision for every engine road onto the ground */
+/* T-931: a box window's drop is spilled before it leaves the inventory - it waits for the removal, is noted once, and is given up
+   when the removal never comes */
+void t_t931_spill_wait()
+{
+    using namespace coopground;
+    if (GroundSpillWaitsRemoval(1, 1) != 1) Fail("a spilled item physical in the world but still flagged in an inventory must wait for its removal");
+    if (GroundSpillWaitsRemoval(1, 0) != 0) Fail("an item already out of the inventory is noted at once (a destroyed box's contents)");
+    if (GroundSpillWaitsRemoval(0, 1) != 0 || GroundSpillWaitsRemoval(0, 0) != 0) Fail("an item not physical in the world never waits");
+    GroundSpillWait w = { 0, 0 };
+    if (GroundSpillWaitTake(&w, 0x1000) != 0) Fail("nothing waiting: a removal must not note anything");
+    if (GroundSpillWaitClear(&w) != 0) Fail("nothing waiting: nothing to give up");
+    GroundSpillWaitPut(&w, 0x1000);
+    if (w.set != 1) Fail("a spill must be remembered");
+    if (GroundSpillWaitTake(&w, 0x2000) != 0 || w.set != 1) Fail("another item's removal must leave the waiting drop waiting");
+    if (GroundSpillWaitTake(&w, 0) != 0 || w.set != 1) Fail("a null removal must leave the waiting drop waiting");
+    if (GroundSpillWaitTake(&w, 0x1000) != 1 || w.set != 0) Fail("the waiting item's removal must note it and empty the slot");
+    if (GroundSpillWaitTake(&w, 0x1000) != 0) Fail("a drop must never be noted twice");
+    GroundSpillWaitPut(&w, 0x3000);
+    if (GroundSpillWaitClear(&w) != 1 || w.set != 0) Fail("a drop whose removal never came must be given up once");
+    if (GroundSpillWaitTake(&w, 0x3000) != 0) Fail("a given-up drop must not be noted by a later removal");
+    GroundSpillWaitPut(&w, 0);
+    if (w.set != 0) Fail("a null item must not wait");
+}
 void t_p2p3p4_ground_route()
 {
     using namespace coopground;
@@ -6098,6 +6124,67 @@ void t_tickwait_dir_levels()
     if (v.size() != 2 || v[0] != "\\top" || v[1] != "\\top\\sub") Fail("tickwait: current-drive root");
     coopdir::DirLevels("rel\\dir", &v);
     if (v.size() != 2 || v[0] != "rel" || v[1] != "rel\\dir") Fail("tickwait: relative path");
+}
+
+/* T-1020 (ported from pull request 4, task 4): a save's folder - every missing level made, shortest first, before the file is
+   written (a joining PC's world folder); a level that cannot be made fails the save, counted once and said once. */
+namespace {
+struct T1020Disk
+{
+    std::vector<std::string> there, refuse, made, files, unaskable;   /* files: a level that is a FILE; unaskable: a level whose query fails */
+    mutable std::vector<std::string> asked;
+    static bool Has(const std::vector<std::string>& v, const std::string& d) { for (size_t i = 0; i < v.size(); ++i) if (v[i] == d) return true; return false; }
+    bool Exists(const std::string& d) const { asked.push_back(d); return Has(there, d) && !Has(unaskable, d); }   /* a FILE is not in `there`: no folder */
+    bool Make(const std::string& d) { if (Has(refuse, d) || Has(files, d) || Has(unaskable, d)) return false; there.push_back(d); made.push_back(d); return true; }
+};
+}
+void t_t1020_save_folder_every_level()
+{
+    T1020Disk fs;
+    fs.there.push_back("C:\\Kenshi"); fs.there.push_back("C:\\Kenshi\\save");
+    long long failed = 0; int said = 0; std::string bad;
+    const std::string f = "C:\\Kenshi\\save\\SW\\worlds\\World One\\build_handoffs_owed_ab12.txt";
+    if (coopdir::EnsureFileDir(f, fs, &failed, &said, &bad) != coopdir::kDirReady) Fail("t1020: a nested missing folder is made");
+    if (fs.made.size() != 3 || fs.made[0] != "C:\\Kenshi\\save\\SW" || fs.made[1] != "C:\\Kenshi\\save\\SW\\worlds"
+        || fs.made[2] != "C:\\Kenshi\\save\\SW\\worlds\\World One") Fail("t1020: every missing level, shortest first, never the file");
+    if (failed != 0 || said != 0 || !bad.empty()) Fail("t1020: a made folder counts no failure");
+    fs.made.clear();
+    if (coopdir::EnsureFileDir(f, fs, &failed, &said, &bad) != coopdir::kDirReady || !fs.made.empty()) Fail("t1020: a folder already there is left alone");
+
+    T1020Disk g;
+    g.refuse.push_back("D:\\x\\y");
+    const std::string h = "D:\\x\\y\\z\\f.txt";
+    if (coopdir::EnsureFileDir(h, g, &failed, &said, &bad) != coopdir::kDirFailSay) Fail("t1020: the first failure is said");
+    if (failed != 1 || said != 1 || bad != "D:\\x\\y") Fail("t1020: a failure is counted once and names its level");
+    if (g.made.size() != 1 || g.made[0] != "D:\\x") Fail("t1020: nothing below a failed level is tried");
+    if (coopdir::EnsureFileDir(h, g, &failed, &said, &bad) != coopdir::kDirFailQuiet) Fail("t1020: a second failure is not said again");
+    if (failed != 2) Fail("t1020: every failed save still counts, once each");
+
+    T1020Disk u;
+    if (coopdir::EnsureFileDir("\\\\nas\\games\\w\\f.txt", u, &failed, &said, &bad) != coopdir::kDirReady
+        || u.made.size() != 1 || u.made[0] != "\\\\nas\\games\\w") Fail("t1020: a share's server and share are never made");
+    T1020Disk r;
+    if (coopdir::EnsureFileDir("C:\\f.txt", r, &failed, &said, &bad) != coopdir::kDirReady || coopdir::EnsureFileDir("f.txt", r, &failed, &said, &bad) != coopdir::kDirReady
+        || !r.made.empty() || failed != 2) Fail("t1020: a drive root or a bare name needs no folder");
+
+    /* T-1020 fold (review LOW 1): the deepest level first - a folder already there costs one check and nothing else */
+    fs.asked.clear(); fs.made.clear();
+    if (coopdir::EnsureFileDir(f, fs, &failed, &said, &bad) != coopdir::kDirReady || fs.asked.size() != 1
+        || fs.asked[0] != "C:\\Kenshi\\save\\SW\\worlds\\World One" || !fs.made.empty()) Fail("t1020 fold: a folder there is asked once, the deepest level");
+    T1020Disk m;   /* a middle level that cannot be queried never refuses a folder that is there */
+    m.there.push_back("E:\\a"); m.there.push_back("E:\\a\\b"); m.there.push_back("E:\\a\\b\\c"); m.unaskable.push_back("E:\\a\\b");
+    if (coopdir::EnsureFileDir("E:\\a\\b\\c\\f.txt", m, &failed, &said, &bad) != coopdir::kDirReady || !m.made.empty() || failed != 2)
+        Fail("t1020 fold: an unqueryable middle level does not refuse a folder that is there");
+    T1020Disk s;   /* forward slashes: the same levels, the same order */
+    s.there.push_back("C:/K");
+    if (coopdir::EnsureFileDir("C:/K/save/w/f.txt", s, &failed, &said, &bad) != coopdir::kDirReady || s.made.size() != 2
+        || s.made[0] != "C:/K/save" || s.made[1] != "C:/K/save/w" || s.asked.size() != 4 || s.asked[0] != "C:/K/save/w")
+        Fail("t1020 fold: forward slashes - deepest asked first, then every missing level shortest first");
+    T1020Disk fl;   /* review LOW 2: a level that is a FILE is no folder - the save fails, counted once, named, said by its own *said */
+    fl.there.push_back("F:\\w"); fl.files.push_back("F:\\w\\x");
+    int said2 = 0; std::string bad2;
+    if (coopdir::EnsureFileDir("F:\\w\\x\\y\\f.txt", fl, &failed, &said2, &bad2) != coopdir::kDirFailSay || failed != 3 || said2 != 1
+        || bad2 != "F:\\w\\x" || !fl.made.empty()) Fail("t1020 fold: a level that is a file fails the save, counted once and named");
 }
 
 void t_orphan1_orphan_purge()

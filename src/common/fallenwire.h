@@ -109,6 +109,8 @@ struct Fallen
     Fallen() : uid(0), unique(0), animal(0), age(0.0f), statsHave(0), x(0.0f), y(0.0f), z(0.0f), diedUnix(0), cause(0),
                handIndex(0), handSerial(0), day(-1), why(kWhyUnknown) { std::memset(stats, 0, sizeof(stats)); }
 };
+/* the name a row goes by (the FALLEN tab's NAME, /revive's name): its own name, else its template's */
+inline std::string FallenName(const Fallen& f) { return f.name.empty() ? f.templateName : f.name; }
 
 /* ---- the byte form ---- */
 inline void PutU8(std::vector<char>* b, unsigned int v) { b->push_back((char)(v & 0xFF)); }

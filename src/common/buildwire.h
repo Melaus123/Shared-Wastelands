@@ -26,7 +26,7 @@
 #include <cstring>
 #include <cstdlib>    /* strtod: the into lever's offset (BuildIntoOffsetParse) */
 #include <string>
-#include <map>        /* house2 fold: BuildOwedMergeRow */
+#include <map>
 #include <set>        /* house2 fold 2: the keys erased while the owed file was unread */
 #include <vector>
 #include <algorithm>  /* help1 fold 2: BuildHelpResync sorts */
@@ -1094,17 +1094,6 @@ inline bool BuildLatePlaceRefused(unsigned short ownerSlot, unsigned int nonce, 
     if (ownerSlot == kBuildOwnerSender) return false;
     return (nonce != 0) ? (exactListed != 0) : (keyListed != 0);
 }
-/* house2 fold (review-house2 MED1): an owed-file read that finally succeeds MERGES the file's rows into the map - a row recorded in
-   memory meanwhile wins over the file's row for the same key. fold 2 (recheck-house2): a key whose row a REMOVE ended while the file
-   was unread (`erased`, may be 0) is never merged back. 1 = the file row was taken, 0 = the in-memory row kept, 2 = dropped (erased). */
-template <class Row>
-inline int BuildOwedMergeRow(std::map<std::string, Row>* mem, const std::set<std::string>* erased, const std::string& key, const Row& fileRow)
-{
-    if (erased != 0 && erased->find(key) != erased->end()) return 2;
-    if (mem->find(key) != mem->end()) return 0;
-    (*mem)[key] = fileRow;
-    return 1;
-}
 /* house2 fold 2 (recheck-house2): a row the load scan rebuilt has no nonce (0); a hand-over PLACE re-sent for it carrying a nonce gives
    the row that nonce, so a later removal lists the real (key, nonce). A row that has a nonce keeps it. */
 inline unsigned int BuildAdoptNonce(unsigned int rowNonce, unsigned short ownerSlot, unsigned int placeNonce)
@@ -1172,6 +1161,13 @@ inline int BuildHelpRowVerdict(int rowExists, int own, int copyHere, int removed
     if (rowExists == 0) return goneListed != 0 ? kBuildHelpRowGone : kBuildHelpRowUnknown;
     if (removed != 0 || dismantled != 0 || own == 0 || copyHere != 0) return kBuildHelpRowGone;
     return kBuildHelpRowOk;
+}
+/* T-23 (owner 1460 a): the same verdict on a game that WRITES another player's piece (its owner's game away; writerHere = this game is
+   the piece's one writer and the row its copy): the work is applied there as on the owner's own piece */
+inline int BuildHelpRowVerdictW(int rowExists, int own, int copyHere, int writerHere, int removed, int dismantled, int goneListed)
+{
+    if (rowExists != 0 && copyHere != 0 && writerHere != 0) return BuildHelpRowVerdict(1, 1, 0, removed, dismantled, goneListed);
+    return BuildHelpRowVerdict(rowExists, own, copyHere, removed, dismantled, goneListed);
 }
 /* help1 fold 4 (re-check #1): the owner's own row after a restart - the load scan registers the save's piece with nonce 0; its placement
    nonce comes back from the pp.build PLACE record of that key (whichever of the two runs first). A row that has a nonce keeps it; a copy
@@ -1344,6 +1340,52 @@ inline float BuildHelpCopyCap(float progress, float needed, int ruin, int* cappe
     if (progress > cap) { *capped = 1; return cap; }
     return progress;
 }
+/* T-23: 1 = a step on another player's piece is help (needed raised for the step, the copy capped, the work sent to the piece's writer);
+   0 on the piece's writer (its owner's game away, this game the area's holder) - the step is the piece's own there and finishes it */
+inline int BuildHelpCapsCopy(int writerHere) { return writerHere != 0 ? 0 : 1; }
+/* T-23 fix: a copy that already shows its piece's record (the record apply leaves it standing and never reaches the STATE road) takes
+   the help numbers the record's STATE carries - the owner's last applied work from this game, landed and live, the fact a real STATE
+   gives - when this session has not read them yet: 1 = take them. A copy row only (never an own piece), the record standing (no
+   removal mark) with a STATE that decoded, of the copy's placement (or one of the two numbers unknown) */
+inline int BuildHelpTailFromRecord(int copyRow, int own, int removed, int body, int tailKnown, unsigned int recPlacement, unsigned int rowPlacement)
+{
+    if (copyRow == 0 || own != 0 || removed != 0 || body == 0 || tailKnown != 0) return 0;
+    if (recPlacement != 0u && rowPlacement != 0u && recPlacement != rowPlacement) return 0;
+    return 1;
+}
+/* T-23 fix: this game became the writer of a piece it was helping build, with work its copy does not show because of the help cap
+   (overCap: the work recorded above the copy's cap since the owner's last STATE on it). 1 = the copy's progress and that work reach
+   needed - the piece completes through the engine's own complete-now path before its record is written. A copy below its cap shows
+   all of its work (an overCap is then stale and never counted); never on a finished piece, a ruin or an unread needed */
+inline int BuildHelpRetireCompletes(float copyP, float needed, float overCap, int complete, int ruin)
+{
+    if (complete != 0 || ruin != 0 || !(needed > 0.0f) || !(overCap > 0.0f)) return 0;
+    if (copyP < needed * 0.999f * 0.9995f) return 0;   /* below its cap (BuildHelpCopyCap): every step shows on the copy */
+    return (copyP + overCap >= needed) ? 1 : 0;
+}
+/* T-23 review fold 4: the work one step put above the copy's cap - only the new extra: from the copy's progress before the step when
+   that already stood above the cap (the cap's write skipped - no update address, a dismantled piece), else from the cap */
+inline float BuildHelpCapExtra(float p0, float p1, float capTo)
+{
+    if (!BuildFloatOk(p0) || !BuildFloatOk(p1) || !BuildFloatOk(capTo)) return 0.0f;
+    const float from = (p0 > capTo) ? p0 : capTo;
+    return (p1 > from) ? p1 - from : 0.0f;
+}
+/* T-23 review fold 2: the work over the copy's cap at the retire, decided from the saved help work: the owner's progress in the last
+   STATE (or record) the copy took (baseP, baseKnown) plus this game's help the owner has not applied (savedP: the pending work and the
+   owed entries not applied - the owed file keeps them over a reload) beyond what the copy shows (copyP). The in-memory count (memOver,
+   0 on a re-made copy) stands when larger, or when no base is known or the saved work is none */
+inline float BuildHelpRetireOver(float memOver, int baseKnown, float baseP, float savedP, float copyP)
+{
+    const float o = (BuildFloatOk(memOver) && memOver > 0.0f) ? memOver : 0.0f;
+    if (baseKnown == 0 || !BuildFloatOk(baseP) || !BuildFloatOk(savedP) || !BuildFloatOk(copyP) || !(savedP > 0.0f)) return o;
+    const float d = baseP + savedP - copyP;
+    return (d > o && d <= kBuildHelpMax) ? d : o;
+}
+/* T-23 review fold 3: a retire whose completion did not finish the piece keeps the work and tries again (as a HELP the owner's game
+   could not apply is sent again) - at most kBuildHelpRetireTries times, then the work retires as the copy shows it. 1 = try again */
+const int kBuildHelpRetireTries = 5;
+inline int BuildHelpRetireRetry(int fails) { return (fails < kBuildHelpRetireTries) ? 1 : 0; }
 /* the helper: whole items owed back = the owner's cumulative refused amount (whole units) less those already returned */
 inline int BuildHelpRefundOwed(float excessTotal, int refunded)
 {
@@ -1727,6 +1769,24 @@ inline BuildHelpAck* BuildHelpAckFor(std::vector<BuildHelpAck>* acks, unsigned s
     acks->push_back(a);
     return &acks->back();
 }
+/* T-23 (step 4): the helpers' last applied work numbers a piece record carries (written by the piece's writer while its owner's game was
+   away) raised into a game's own rows: per helper the higher number wins, with its refused tail; a row's number never goes down. A
+   STATE tail's live number counts as applied. Returns how many rows rose. */
+inline int BuildHelpAcksRaise(std::vector<BuildHelpAck>* acks, const std::vector<BuildHelpAck>& rec)
+{
+    int n = 0;
+    for (size_t i = 0; i < rec.size(); ++i)
+    {
+        const unsigned int seq = (rec[i].live > rec[i].seq) ? rec[i].live : rec[i].seq;
+        if (seq == 0 || rec[i].slot > kBuildOwnerSlotMax) continue;
+        BuildHelpAck* a = BuildHelpAckFor(acks, rec[i].slot, 1);
+        if (a == 0 || seq <= a->seq) continue;
+        *a = rec[i];
+        a->seq = seq; a->live = 0;
+        ++n;
+    }
+    return n;
+}
 
 /* help1 fold 3 (finding 4): a HELP_GONE's refused tail - per material the whole items still owed (the cumulative refused amount less
    those already handed back, BuildHelpRefundOwed - the STATE's rule); owe[] gets each (0 past n), returns their total */
@@ -1879,7 +1939,10 @@ struct BuildCopyRec
     int removed;             /* P87 rf1 (STATE destroyed bit) */
     int emptyLoads;          /* P87 rf1 (STATE progress) */
     int alias;               /* P87 rf1 (STATE complete bit) */
-    BuildCopyRec() : slot(-1), nonce(0), hostForm(0), floor(0), outside(0), removed(0), emptyLoads(0), alias(0)
+    int handed;              /* T-23 review fold 5 (STATE broken bit): THIS game placed the piece and handed it to slot at its placement,
+                                and has not yet seen the world server hold its record (piecerec::PieceHandLoadChoice). A row written
+                                before the bit reads 0 = not handed; a build before the bit ignores it. Same row size. */
+    BuildCopyRec() : slot(-1), nonce(0), hostForm(0), floor(0), outside(0), removed(0), emptyLoads(0), alias(0), handed(0)
     {
         for (int i = 0; i < 3; ++i) pos[i] = 0.0f;
         rot[0] = 1.0f; rot[1] = 0.0f; rot[2] = 0.0f; rot[3] = 0.0f;
@@ -1920,7 +1983,7 @@ inline bool BuildCopyRecSame(const BuildCopyRec& a, const BuildCopyRec& b)
 {
     if (a.key != b.key || a.sid != b.sid || a.hostKey != b.hostKey || a.slot != b.slot || a.nonce != b.nonce) return false;
     if (a.hostForm != b.hostForm || a.floor != b.floor || a.outside != b.outside) return false;
-    if (a.removed != b.removed || a.emptyLoads != b.emptyLoads || a.alias != b.alias) return false;   /* P87 rf1 */
+    if (a.removed != b.removed || a.emptyLoads != b.emptyLoads || a.alias != b.alias || a.handed != b.handed) return false;   /* P87 rf1; T-23 fold 5 */
     for (int i = 0; i < 3; ++i) if (a.pos[i] != b.pos[i]) return false;
     for (int i = 0; i < 4; ++i) if (a.rot[i] != b.rot[i]) return false;
     return true;
@@ -1938,6 +2001,7 @@ inline bool BuildCopyRowMake(const BuildCopyRec& c, std::string* rowKey, std::ve
     BuildMsg st;
     st.kind = kBuildState; st.key = c.key;
     st.destroyed = (unsigned char)(c.removed != 0 ? 1 : 0); st.complete = (unsigned char)(c.alias != 0 ? 1 : 0);   /* P87 rf1 */
+    st.broken = (unsigned char)(c.handed != 0 ? 1 : 0);   /* T-23 review fold 5: 'handed here' - the same byte, no size change */
     st.progress = (float)(c.emptyLoads < 0 ? 0 : (c.emptyLoads > 255 ? 255 : c.emptyLoads));
     place->clear(); state->clear();
     if (!BuildEncodable(m) || !BuildEncodable(st) || !EncodeBuild(place, m) || !EncodeBuild(state, st)) { place->clear(); state->clear(); return false; }
@@ -1960,6 +2024,7 @@ inline bool BuildCopyRowRead(const std::string& rowKey, const std::string& place
     if (!m.hostKey.empty()) { c.hostKey = m.hostKey; c.hostForm = m.hostForm; c.floor = m.floor; c.outside = m.outside; }
     c.removed = st.destroyed != 0 ? 1 : 0;   /* P87 rf1: a pre-rf1 row carries 0 / 0 / 0 */
     c.alias = st.complete != 0 ? 1 : 0;
+    c.handed = st.broken != 0 ? 1 : 0;   /* T-23 review fold 5: a row written before the bit reads 0 (not handed) */
     c.emptyLoads = (st.progress >= 0.0f && st.progress <= 255.0f) ? (int)st.progress : 0;
     *out = c;
     return true;
@@ -2045,6 +2110,17 @@ inline int BuildOwnerChangeAct(int onMain, int modWrite, int depth, int wasMine,
     if (wasMine != 0) return kBuildOcWasMine;
     return kBuildOcRegister;
 }
+/* T-1222 (owner 1444: a rock is never owned). The engine's job set-up for a worker (1.0.65 0x35B3D0) claims a building whose "is
+   foliage" byte (+0xC0) is set for the worker's faction when that faction is a player's and the building's owner is not
+   (setFaction through vt+0xA0, off the main thread; the call returns to the row JobClaimSetFactionRet - run T1923 Confirmed). The
+   job and the ore yield do not need the claim (setupMiningResourceLevel 0x29C630 reads no owner for a foliage piece). For a world
+   resource node (coopown::WorldNodeOf) the claim is skipped - nothing is written, so the rock stays nobody's on every game; any
+   other setFaction (a zone loading, a purchase, the mod's own write, the claim of a building that is no world node) runs as before.
+   ret: the detour's return address; claimRet: the row's address in the running image (0 = no address: nothing is skipped - a missing
+   row in fact stops the mod at load, addresses.cpp, so the hook is never installed);
+   worldNode: 1 = the building is a world resource node. Only reads and compares - safe on any thread. */
+inline int BuildIsClaimSite(unsigned long long ret, unsigned long long claimRet) { return (claimRet != 0 && ret == claimRet) ? 1 : 0; }
+inline int BuildClaimSkip(int claimSite, int worldNode) { return (claimSite == 1 && worldNode == 1) ? 1 : 0; }
 /* P18: a queued change at the tick. hold: engine writes blocked, this world's copy list unread, or no player faction - wait (no try spent);
    tries / maxTries: ticks spent waiting for the key to resolve; live: the key resolves; nowMine: still this game's player's; rowOwn /
    rowCopy: the registry already holds the key as this game's own piece / as another game's piece. */
@@ -2952,6 +3028,31 @@ inline int BuildDeadHandlesIgnore(const BuildDeadHandleIn& x)
     if (x.setAge < kBuildDeadHandleWait) return 0;                                                     /* (d) (-1 fails too) */
     if (x.regRow != 0 || x.copyListRow != 0 || x.removedMark != 0) return 0;                          /* (e) */
     return 1;
+}
+/* T-1240: which pending entry may use BuildDeadHandlesIgnore. A copy (restore 0): always (T-903). A restore keeps the hold - a dead
+   handle can be this very saved piece, not loaded yet (never an empty twin) - except a piece another game wrote into this game's
+   ownership and never made here, when ALL hold: made from its piece record (recMake 1); this load's own pp.build rows read
+   (ownRowsState > 0; -1 = not yet, 0 = not read); no own pp.build row of the key read at this world load (ownRowKnown 0); not placed
+   by this game (madeHere 0). 1 = the entry may use the rule; 0 = the hold stays. */
+inline int BuildDeadHandlesEntryOk(int restore, int recMake, int ownRowsState, int ownRowKnown, int madeHere)
+{
+    if (restore == 0) return 1;
+    if (recMake == 0) return 0;
+    if (ownRowsState <= 0) return 0;
+    if (ownRowKnown != 0) return 0;
+    if (madeHere != 0) return 0;
+    return 1;
+}
+/* T-1240 (T2039 LEG F): the own-rows answer BuildDeadHandlesEntryOk takes for a restore. pending 1 = this load's restore edge has
+   not run (-1); rowsRead 1 = its own pp.build rows were read and handed (1); noRecord 1 = the whole restore was armed as "no-record" -
+   the records store had no record yet, at a load's overlay or at a reset world's import: nothing of this game's own could be
+   restored, so a handed restore is not one of its own rows (1); else 0 (own records off, unreadable, refused for identity, single,
+   claim-busy). Only the dead-handle gate reads it: the make road's rows-read (piecerec::PieceOwnMakeMats) keeps PcaOwnRowsState. */
+inline int BuildHandedRowsState(int pending, int rowsRead, int noRecord)
+{
+    if (pending != 0) return -1;
+    if (rowsRead != 0) return 1;
+    return noRecord != 0 ? 1 : 0;
 }
 /* the dead set's signature: each dead handle's (container, index, serial) as "c/i/s", sorted and joined by ';' - the order the list
    was read in does not change it; any handle added, gone or changed does */

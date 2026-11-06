@@ -64,6 +64,7 @@ namespace coop { std::string ItemsKeeperRepairToken(); }   /* T-910: items.cpp (
 #include "farm.h"                          /* ReportFarm - the [FARM] / [MINE] totals go into the log a report packs */
 #include "net/session.h"                   /* SessionProtocolVersion */
 #include "../common/bugreport.h"
+#include "../common/crashkeep.h"            /* the launches that did not quit normally, kept in the mod's crashes folder */
 #include "../common/titleart.h"          /* PlaceTitleNote */
 #include "../common/pausemenu.h"   /* T-514: REPORT A BUG's button name, shared with ui.cpp's arranging */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
@@ -186,6 +187,8 @@ Shared g_sh;
 /* a report's stop flag, by generation: CANCEL raises it, the worker reads it between segments and between upload chunks */
 volatile long g_stop[64];
 volatile long* StopOf(long gen) { return &g_stop[(unsigned long)gen % 64u]; }
+volatile long g_testStop = 0;   /* the TEST-ONLY bugpack lever's stop flag: never raised, a test pack runs to its end */
+volatile long g_testBusy = 0;   /* 1 while a test pack is being made */
 
 /* ---- the nearby players' answers to this game's ask: MAIN THREAD ---- */
 struct Collect
@@ -292,38 +295,42 @@ std::wstring GameFolder()
     const std::wstring::size_type k = s.find_last_of(L"\\/");
     return k == std::wstring::npos ? std::wstring() : s.substr(0, k + 1);
 }
-/* Kenshi's crash file in the game folder that ended one of the two kept earlier launches (coopbug::CrashLaunch): launch 1's
-   before launch 2's, then a .zip before a .dmp, the newest first. Returns the launch it ended (1 = the previous launch, 2 = the
-   one before it), or 0 when none is attached. `log1End` / `log2End`: the kept copies' last-write times, 0 = that copy is absent. */
-int FindCrash(const std::wstring& folder, long long log1End, long long log2End, std::string* name, std::vector<unsigned char>* bytes)
+/* Kenshi's crash file that ended one of the two kept earlier launches (coopbug::CrashLaunch), looked for in each of `folders`
+   (swcrashkeep::CrashFolders: the running program's folder and the main game folder): launch 1's before launch 2's, then a .zip
+   before a .dmp, the newest first. Returns the launch it ended (1 = the previous launch, 2 = the one before it), or 0 when none
+   is attached. `log1End` / `log2End`: the kept copies' last-write times, 0 = that copy is absent. */
+int FindCrash(const std::vector<std::wstring>& folders, long long log1End, long long log2End, std::string* name, std::vector<unsigned char>* bytes)
 {
-    if (folder.empty()) return 0;
+    if (folders.empty()) return 0;
     FILETIME ct, et, kt, ut;
     if (!::GetProcessTimes(::GetCurrentProcess(), &ct, &et, &kt, &ut)) return 0;
     const long long launch = FileTimeSec(ct);
-    WIN32_FIND_DATAW fd;
-    HANDLE f = ::FindFirstFileW((folder + L"crashDump*").c_str(), &fd);
-    if (f == INVALID_HANDLE_VALUE) return 0;
-    std::wstring best; int bestKind = 0, bestLaunch = 0; long long bestAt = 0;
-    do
+    std::wstring best, bestName; int bestKind = 0, bestLaunch = 0; long long bestAt = 0;
+    for (size_t d = 0; d < folders.size(); ++d)
     {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        const int kind = coopbug::CrashFileKind(Narrow(fd.cFileName));
-        const long long t = FileTimeSec(fd.ftLastWriteTime);
-        const unsigned long long size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-        /* Kenshi's own file is about 0.3-0.6 MB; anything far bigger is not it (367 a: no Windows full dumps) */
-        if (kind == 0 || size > (4ull << 20)) continue;
-        const int ended = coopbug::CrashLaunch(t, launch, log1End, log2End);
-        if (ended == 0) continue;
-        if (bestLaunch == 0 || ended < bestLaunch
-            || (ended == bestLaunch && (kind > bestKind || (kind == bestKind && t > bestAt))))
-        { best = fd.cFileName; bestKind = kind; bestLaunch = ended; bestAt = t; }
-    } while (::FindNextFileW(f, &fd));
-    ::FindClose(f);
+        WIN32_FIND_DATAW fd;
+        HANDLE f = ::FindFirstFileW((folders[d] + L"crashDump*").c_str(), &fd);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            const int kind = coopbug::CrashFileKind(Narrow(fd.cFileName));
+            const long long t = FileTimeSec(fd.ftLastWriteTime);
+            const unsigned long long size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            /* Kenshi's own file is about 0.3-0.6 MB; anything far bigger is not it (367 a: no Windows full dumps) */
+            if (kind == 0 || size > (4ull << 20)) continue;
+            const int ended = coopbug::CrashLaunch(t, launch, log1End, log2End);
+            if (ended == 0) continue;
+            if (bestLaunch == 0 || ended < bestLaunch
+                || (ended == bestLaunch && (kind > bestKind || (kind == bestKind && t > bestAt))))
+            { best = folders[d] + fd.cFileName; bestName = fd.cFileName; bestKind = kind; bestLaunch = ended; bestAt = t; }
+        } while (::FindNextFileW(f, &fd));
+        ::FindClose(f);
+    }
     if (bestLaunch == 0) return 0;
     std::string raw; unsigned long long total = 0, dropped = 0;
-    if (!ReadTail(folder + best, 4ull << 20, &raw, &total, &dropped, 0) || dropped != 0) return 0;
-    *name = Narrow(best);
+    if (!ReadTail(best, 4ull << 20, &raw, &total, &dropped, 0) || dropped != 0) return 0;
+    *name = Narrow(bestName);
     bytes->assign(raw.begin(), raw.end());
     return bestLaunch;
 }
@@ -448,12 +455,15 @@ struct Job
     std::string desc;       /* the player's words, as typed (MyGUI's tags removed) */
     std::string info;       /* one line: game, fingerprint, protocol, where */
     std::string where;
-    std::wstring log0, log1, log2, gameFolder;
+    std::wstring log0, log1, log2;
+    std::vector<std::wstring> crashFolders;   /* where Kenshi's crash file is looked for (swcrashkeep::CrashFolders) */
     std::wstring logStart[3], logMiddle[3];   /* each launch's opening (.start) and middle (.prev) parts, when its log grew past
                                                  2 MB (the 10 MB ceiling, coop_log.cpp); index = launch, 0 = this one */
     std::wstring serverLog;  /* the log of the world server this game started (UiServerLogPath); empty = none */
     std::string keeperHead;  /* T-910: report.txt's empty-shop repairs line */
     std::string keeperText;  /* T-910: every [KEEPER] line of this launch (LogKeeperLinesText), for keeper-lines.txt */
+    std::wstring crashFolder;   /* <mod folder>\crashes\ (src/common/crashkeep.h); empty = the mod folder could not be read */
+    int testPack;               /* 1 = the TEST-ONLY bugpack lever: packed as a report is, listed in the log, never sent */
 };
 const char* const kKeeperLinesFile = "keeper-lines.txt";   /* T-910 */
 struct ZipPart
@@ -464,7 +474,104 @@ struct ZipPart
     const std::vector<unsigned char>* raw;  /* a file stored as it is (the crash file) */
     std::string what;                       /* report.txt's words for it */
     int cutFirst;                           /* coopbug::BudgetPart::cutFirst (0 when left out of the initialiser) */
+    int keptAge, keptKind;                  /* a kept launch's file (order kOrderKeptCrash): its entry's age (0 = newest) and
+                                               swcrashkeep::kKind* - the budget part is swcrashkeep::KeptLogPart / KeptFilePart */
 };
+/* ONE LAUNCH THAT DID NOT QUIT NORMALLY, kept in the crashes folder (src/common/crashkeep.h; coop_log.cpp keeps it at the next
+   start). state: 0 read, 1 not repeated (its log is the same file as copy 1 or 2, which the report carries anyway), 2 nothing in
+   it could be read, 3 left out because its newest log part is missing or could not be read (`why`): without it the entry cannot
+   be checked against copy 1 and 2. crashState: 0 no Kenshi crash file in it, 1 read, 2 could not be read (crashErr), 3 over
+   4 MB. `note`: its other log parts that are there but could not be read. */
+struct KeptLaunch
+{
+    std::string entry;
+    int state;
+    std::string sameAs;
+    coopbug::LogPack part[cooplogrot::kPartKinds];
+    bool have[cooplogrot::kPartKinds];
+    std::string crashName;
+    std::vector<unsigned char> crash;
+    int crashState;
+    unsigned long crashErr;
+    std::string why, note;
+    KeptLaunch() : state(0), crashState(0), crashErr(0) { for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k) have[k] = false; }
+};
+/* Every entry of `folder` (<mod folder>\crashes\), newest first: each log part read and packed as a log is (the same scrub), its
+   crash file whole (at most 4 MB). `size1`/`end1`, `size2`/`end2`: copy 1's and copy 2's size and last write (0 = absent).
+   False = the report was stopped. */
+bool ReadKept(const std::wstring& folder, unsigned long long size1, long long end1, unsigned long long size2, long long end2,
+              volatile long* stop, std::vector<KeptLaunch>* out)
+{
+    out->clear();
+    if (folder.empty()) return true;
+    std::vector<std::string> names;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = ::FindFirstFileW((folder + L"*").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        do { if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) names.push_back(Narrow(fd.cFileName)); } while (::FindNextFileW(f, &fd));
+        ::FindClose(f);
+    }
+    const std::vector<std::string> entries = swcrashkeep::EntriesNewestFirst(names);
+    out->resize(entries.size());   /* filled in place: the report's parts point into it */
+    const std::string base(swnames::kLog);
+    std::string raw;
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        KeptLaunch& e = (*out)[i];
+        e.entry = entries[i];
+        const std::wstring dir = folder + Widen(entries[i]) + L"\\";
+        bool any = false;
+        for (int k = 0; k < (int)cooplogrot::kPartKinds && e.state == 0; ++k)   /* the newest part first: it decides the repeat */
+        {
+            long long end = 0;
+            coopbug::LogPack& p = e.part[k];
+            const std::wstring path = dir + Widen(cooplogrot::PartName(base, 0, k));
+            e.have[k] = ReadTail(path, coopbug::kRawLogWindow, &raw, &p.rawTotal, &p.rawDropped, &end);
+            if (!e.have[k])
+            {
+                const DWORD rerr = ::GetLastError();
+                const bool missing = ::GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+                if (k == (int)cooplogrot::kPartCurrent)
+                {
+                    e.state = 3;
+                    e.why = missing ? std::string("its newest log part is missing") : "its newest log part could not be read (Windows error " + Num(rerr) + ")";
+                }
+                else if (!missing)
+                    e.note += std::string("; its ") + (k == (int)cooplogrot::kPartStart ? "opening" : "middle") + " log part could not be read (Windows error " + Num(rerr) + ")";
+                continue;   /* a missing opening or middle part: a log under 2 MB has none, one never cut twice no middle part */
+            }
+            any = true;
+            if (k == (int)cooplogrot::kPartCurrent && swcrashkeep::SameLog(p.rawTotal, end, size1, end1)) { e.state = 1; e.sameAs = swnames::kLogPrev; }
+            else if (k == (int)cooplogrot::kPartCurrent && swcrashkeep::SameLog(p.rawTotal, end, size2, end2)) { e.state = 1; e.sameAs = swnames::kLogPrev2; }
+            else if (!coopbug::PackLog(raw, &p, stop)) return false;
+        }
+        if (e.state != 0)
+        {
+            for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k) { e.have[k] = false; e.part[k] = coopbug::LogPack(); }
+            continue;
+        }
+        HANDLE c = ::FindFirstFileW((dir + L"crashDump*").c_str(), &fd);
+        if (c != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || coopbug::CrashFileKind(Narrow(fd.cFileName)) == 0) continue;
+                unsigned long long total = 0, dropped = 0;
+                e.crashName = Narrow(fd.cFileName);
+                if (!ReadTail(dir + fd.cFileName, 4ull << 20, &raw, &total, &dropped, 0)) { e.crashState = 2; e.crashErr = ::GetLastError(); continue; }
+                if (dropped != 0) { e.crashState = 3; continue; }
+                e.crash.assign(raw.begin(), raw.end());
+                e.crashState = 1;
+                any = true;
+                break;
+            } while (::FindNextFileW(c, &fd));
+            ::FindClose(c);
+        }
+        if (!any) e.state = 2;
+    }
+    return true;
+}
 std::string UtcNow()
 {
     SYSTEMTIME t; ::GetSystemTime(&t);
@@ -492,7 +599,7 @@ void RunJob(Job& j)
     else
     {
         QuietLogFlush(false);   /* the quiet gates' held counts into this launch's log before it is read */
-        volatile long* stop = StopOf(j.gen);
+        volatile long* stop = j.testPack ? &g_testStop : StopOf(j.gen);
         coopbug::LogPack cur, prev, older;
         std::string raw;
         long long prevEnd = 0, olderEnd = 0;
@@ -520,12 +627,18 @@ void RunJob(Job& j)
         }
         raw.clear();
         std::string crashName; std::vector<unsigned char> crash;
-        const int crashLaunch = FindCrash(j.gameFolder, havePrev ? prevEnd : 0, haveOlder ? olderEnd : 0, &crashName, &crash);
+        const int crashLaunch = FindCrash(j.crashFolders, havePrev ? prevEnd : 0, haveOlder ? olderEnd : 0, &crashName, &crash);
         const bool haveCrash = crashLaunch != 0;
+        /* the launches that did not quit normally, kept in the crashes folder, newest first; one whose log is copy 1 or 2 is not
+           repeated (that log is in the report already) */
+        std::vector<KeptLaunch> kept;
+        if (!ReadKept(j.crashFolder, havePrev ? prev.rawTotal : 0, havePrev ? prevEnd : 0, haveOlder ? older.rawTotal : 0, haveOlder ? olderEnd : 0,
+                      stop, &kept)) return;
         /* the nearby players' logs: the main thread hands them over when its wait is over (coopbug::NearbyWaitOver) */
         std::vector<NearbyLog> nearby;
         std::string nearbyNote;
-        for (;;)
+        if (j.testPack) nearbyNote = "none asked (a test pack asks no nearby game)";
+        else for (;;)
         {
             if (*stop != 0) return;
             {
@@ -598,6 +711,29 @@ void RunJob(Job& j)
                           coopbug::kOrderNearby, &nearby[k].pack, 0, nearby[k].name + "'s current mod log (a nearby player, slot " + Num(nearby[k].slot) + ")" };
             parts.push_back(p);
         }
+        /* the kept launches' files, under crashes/<entry>/ - the lowest order, so they are cut first */
+        for (size_t i = 0; i < kept.size(); ++i)
+        {
+            if (kept[i].state != 0) continue;
+            const std::string dir = std::string(swcrashkeep::kFolder) + "/" + kept[i].entry + "/";
+            const std::string words = "a launch that did not quit normally, kept at its next start (" + kept[i].entry + ")";
+            for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k)
+            {
+                if (!kept[i].have[k]) continue;
+                const bool opening = k == (int)cooplogrot::kPartStart, middle = k == (int)cooplogrot::kPartPrev;
+                ZipPart p = { dir + cooplogrot::PartName(std::string(swnames::kLog), 0, k), coopbug::kOrderKeptCrash, &kept[i].part[k], 0,
+                              words + (opening ? ", its mod log's opening part" : middle ? ", its mod log's part before its newest one" : ", its mod log"),
+                              0, (int)i,
+                              opening ? (int)swcrashkeep::kKindOpening : middle ? (int)swcrashkeep::kKindMiddle : (int)swcrashkeep::kKindNewest };
+                parts.push_back(p);
+            }
+            if (!kept[i].crash.empty())
+            {
+                ZipPart p = { dir + kept[i].crashName, coopbug::kOrderKeptCrash, 0, &kept[i].crash, words + ", Kenshi's crash file that ended it",
+                              0, (int)i, (int)swcrashkeep::kKindCrashFile };
+                parts.push_back(p);
+            }
+        }
         /* T-910: every [KEEPER] line of this launch, kept in memory (coop_log.h LogKeeperLinesText); its IP addresses removed as a log's are; never cut */
         std::string keeperClean;
         coopbug::ScrubIps(j.keeperText, &keeperClean);
@@ -611,6 +747,19 @@ void RunJob(Job& j)
         std::vector<coopbug::BudgetPart> bp(parts.size() + 1);
         for (size_t k = 0; k < parts.size(); ++k)
         {
+            if (parts[k].order == coopbug::kOrderKeptCrash)
+            {
+                /* a kept launch's file: cut before every other part and given no floor; its crash file whole or not at all */
+                const unsigned long long over = coopbug::ZipEntryOverhead(parts[k].name);
+                if (parts[k].pack != 0)
+                {
+                    std::vector<unsigned long long> segs;
+                    for (size_t s = 0; s < parts[k].pack->segs.size(); ++s) segs.push_back(parts[k].pack->segs[s].bytes.size());
+                    bp[k] = swcrashkeep::KeptLogPart(over, segs, parts[k].keptAge, parts[k].keptKind);
+                }
+                else bp[k] = swcrashkeep::KeptFilePart(over, parts[k].raw->size(), parts[k].keptAge);
+                continue;
+            }
             bp[k].order = parts[k].order;
             bp[k].cutFirst = parts[k].cutFirst;
             bp[k].cutFromEnd = parts[k].cutFirst == 1;   /* a launch's opening part keeps its first bytes */
@@ -671,6 +820,24 @@ void RunJob(Job& j)
         if (!havePrev) m += std::string(swnames::kLogPrev) + ": there is no previous launch's mod log\r\n";
         if (!haveOlder) m += std::string(swnames::kLogPrev2) + ": there is no mod log from two launches ago\r\n";
         if (!haveCrash) m += "No Kenshi crash file from the last two launches.\r\n";
+        /* one line per kept launch that did not quit normally */
+        if (kept.empty()) m += std::string("No kept launch that did not quit normally (") + swcrashkeep::kFolder + "/).\r\n";
+        for (size_t i = 0; i < kept.size(); ++i)
+        {
+            const std::string at = std::string(swcrashkeep::kFolder) + "/" + kept[i].entry + "/";
+            if (kept[i].state == 1) m += at + ": a launch that did not quit normally - not repeated, it is " + kept[i].sameAs + " above\r\n";
+            else if (kept[i].state == 2) m += at + ": a launch that did not quit normally - nothing in it could be read\r\n";
+            else if (kept[i].state == 3) m += at + ": a launch that did not quit normally - left out: " + kept[i].why + ", so it could not be checked against "
+                                              + swnames::kLogPrev + " and " + swnames::kLogPrev2 + "\r\n";
+            else
+            {
+                std::string c;
+                if (kept[i].crashState == 0) c = " (no Kenshi crash file was kept with it)";
+                else if (kept[i].crashState == 2) c = " (its Kenshi crash file " + kept[i].crashName + " could not be read, Windows error " + Num(kept[i].crashErr) + ")";
+                else if (kept[i].crashState == 3) c = " (its Kenshi crash file " + kept[i].crashName + " is over 4 MB and is not included)";
+                m += at + ": a launch that did not quit normally, kept at its next start - its files are listed above" + c + kept[i].note + "\r\n";
+            }
+        }
         m += "\r\nNearby players: " + nearbyNote + "\r\n";
         es[0] = coopbug::StoredEntry("report.txt", m);
         SYSTEMTIME lt; ::GetLocalTime(&lt);
@@ -678,6 +845,17 @@ void RunJob(Job& j)
         char seed[64]; _snprintf(seed, 63, "----SharedWastelandsReport%08lX%08lX", (unsigned long)::GetTickCount(), (unsigned long)j.gen); seed[63] = 0;
         boundary = coopbug::PickBoundary(seed, j.desc, j.info, zip);
         body = coopbug::BuildMultipart(boundary, j.desc, j.info, zip);
+        if (j.testPack)
+        {
+            /* the TEST-ONLY bugpack lever: the files the report would carry, and nothing is sent */
+            std::string list, out;
+            for (size_t k = 0; k < es.size(); ++k) list += (k == 0 ? "" : ", ") + es[k].name + " " + Num(es[k].data.size()) + "/" + Num(es[k].rawLen);
+            for (size_t k = 0; k < parts.size(); ++k) if (coopbug::PartLeftOut(bp, cut, k)) out += (out.empty() ? "" : ", ") + parts[k].name;
+            DebugLog("[BUGREPORT] TEST PACK zip " + Num(zip.size()) + " bytes (limit " + Num(coopbug::kPackLimit) + ", "
+                     + (cut.fits ? "within it" : "STILL OVER it") + "), " + Num(es.size()) + " files (name zip-bytes/raw-bytes): " + list
+                     + "; left out: " + (out.empty() ? std::string("none") : out) + "; NOT SENT");
+            return;
+        }
         DebugLog("[BUG] report packed: zip " + Num(zip.size()) + " bytes (limit " + Num(coopbug::kPackLimit) + "), " + Num(es.size()) + " files, "
                  + (cut.fits ? "within the limit" : "STILL OVER the limit after every cut") + "; nearby: " + nearbyNote);
         Lock l;
@@ -701,6 +879,15 @@ unsigned __stdcall JobMain(void* arg)
     try { RunJob(*j); }
     catch (...) { Finish(j->gen, 0, coopbug::kFailOther, 0); DebugLog("[BUG] the report's worker stopped on a C++ exception"); }
     delete j;
+    return 0;
+}
+unsigned __stdcall TestPackMain(void* arg)
+{
+    Job* j = (Job*)arg;
+    try { RunJob(*j); }
+    catch (...) { DebugLog("[BUGREPORT] TEST PACK stopped on a C++ exception"); }
+    delete j;
+    ::InterlockedExchange(&g_testBusy, 0);
     return 0;
 }
 
@@ -865,6 +1052,33 @@ std::string WhereNow()
     if (!GameplayRunning()) return "the title screen";
     return StoreLiveReady() ? "a multiplayer world" : "a single-player world";
 }
+/* The folder of a path, with its trailing backslash; empty when it has none. */
+std::wstring FolderOfPath(const std::wstring& path)
+{
+    const std::wstring::size_type k = path.find_last_of(L"\\/");
+    return k == std::wstring::npos ? std::wstring() : path.substr(0, k + 1);
+}
+/* What a report reads, gathered on the main thread: its info line, where it is made, the [KEEPER] lines, every file's path. */
+void FillJob(Job* j)
+{
+    j->testPack = 0;
+    const std::string table = AddrTableName(), fp = AddrExeFingerprint();
+    j->where = WhereNow();
+    j->info = std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
+              + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
+    {
+        /* T-910: the empty-shop repairs and every [KEEPER] line of this launch go into the report (report.txt's header, keeper-lines.txt) */
+        unsigned long long keeperSeen = 0;
+        j->keeperText = LogKeeperLinesText(&keeperSeen);
+        j->keeperHead = "Empty-shop repairs this launch: " + coop::ItemsKeeperRepairToken() + "; [KEEPER] lines this launch: " + Num(keeperSeen)
+                        + (j->keeperText.empty() ? std::string() : std::string(" (") + kKeeperLinesFile + ")");
+    }
+    j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->crashFolders = swcrashkeep::CrashFolders(GameFolder(), FolderOfPath(j->log0));
+    for (int L = 0; L < 3; ++L) { j->logStart[L] = LogPartPath(L, cooplogrot::kPartStart); j->logMiddle[L] = LogPartPath(L, cooplogrot::kPartPrev); }
+    j->serverLog = Widen(UiServerLogPath());
+    const std::wstring modFolder = FolderOfPath(j->log0);
+    j->crashFolder = modFolder.empty() ? std::wstring() : modFolder + swcrashkeep::kFolderW + L"\\";
+}
 void StartJob(const std::string& desc, int sendOnly)
 {
     const long gen = ++g_genNext;
@@ -880,20 +1094,7 @@ void StartJob(const std::string& desc, int sendOnly)
     }
     Job* j = new Job;
     j->gen = gen; j->sendOnly = sendOnly; j->desc = desc;
-    const std::string table = AddrTableName(), fp = AddrExeFingerprint();
-    j->where = WhereNow();
-    j->info = std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
-              + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
-    {
-        /* T-910: the empty-shop repairs and every [KEEPER] line of this launch go into the report (report.txt's header, keeper-lines.txt) */
-        unsigned long long keeperSeen = 0;
-        j->keeperText = LogKeeperLinesText(&keeperSeen);
-        j->keeperHead = "Empty-shop repairs this launch: " + coop::ItemsKeeperRepairToken() + "; [KEEPER] lines this launch: " + Num(keeperSeen)
-                        + (j->keeperText.empty() ? std::string() : std::string(" (") + kKeeperLinesFile + ")");
-    }
-    j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->gameFolder = GameFolder();
-    for (int L = 0; L < 3; ++L) { j->logStart[L] = LogPartPath(L, cooplogrot::kPartStart); j->logMiddle[L] = LogPartPath(L, cooplogrot::kPartPrev); }
-    j->serverLog = Widen(UiServerLogPath());
+    FillJob(j);
     if (!sendOnly) { coop::ReportDoors(); coop::ReportFarm(); }   /* the door totals, reload[...] and the [FARM] / [MINE] totals go into the log this report packs */
     const uintptr_t t = _beginthreadex(NULL, 0, &JobMain, j, 0, NULL);
     if (t == 0)
@@ -1706,6 +1907,30 @@ void BugReportLiveIn(unsigned int innerType, unsigned int originSlot, const char
         }
     }
     catch (...) { DebugLog("[BUG] a C++ exception reading a nearby log message; it is dropped"); }
+}
+
+int BugReportTestPack()
+{
+    CsInit();
+    if (::InterlockedCompareExchange(&g_testBusy, 1, 0) != 0) return 0;
+    Job* j = new Job;
+    j->gen = 0;
+    j->sendOnly = 0;
+    j->desc = "(a TEST PACK made by the bugpack lever, not a player's report - nothing is sent)";
+    FillJob(j);
+    j->testPack = 1;
+    coop::ReportDoors(); coop::ReportFarm();   /* as a report does: their totals go into the log it packs */
+    const uintptr_t t = _beginthreadex(NULL, 0, &TestPackMain, j, 0, NULL);
+    if (t == 0)
+    {
+        delete j;
+        ::InterlockedExchange(&g_testBusy, 0);
+        ErrorLog("[BUGREPORT] TEST PACK: the worker thread could not start");
+        return 0;
+    }
+    ::CloseHandle((HANDLE)t);
+    DebugLog("[BUGREPORT] TEST PACK started from " + WhereNow() + " - packed as SEND packs a report; nothing will be sent");
+    return 1;
 }
 
 }   // namespace coop

@@ -312,6 +312,70 @@ void MoneyArrive(unsigned type, const std::vector<char>& payload)
     }
 }
 
+std::string MoneyTestCommand(const std::string& args)
+{
+    int target = 0;
+    const int k = moneyw::TestLeverParse(args, &target);
+    if (k == moneyw::kLeverBad)
+    {
+        DebugLog("[TEST] money REFUSED: not a whole number 0.." + N(moneyw::kLeverMax) + " - nothing set");
+        return "error money: usage money [<amount 0.." + N(moneyw::kLeverMax) + ">] - nothing set";
+    }
+    int before = 0;
+    if (coop::StoreMoneyRead(&before) != 1)
+    {
+        DebugLog("[TEST] money REFUSED: this game's money is not readable (no world, or no player faction purse) - nothing set");
+        return "error money no-purse";
+    }
+    if (k == moneyw::kLeverShow)
+    {
+        DebugLog(moneyw::TestLeverLine(before, before));
+        return "ok money before=" + N(before) + " after=" + N(before);
+    }
+    EdgeSync();
+    std::string why;
+    if (coop::StoreMoneyReady(&why) != 1)
+    {
+        DebugLog("[TEST] money " + N(target) + " REFUSED: money may not change now (" + why + ") - nothing set, money " + N(before));
+        return "error money not-now " + why;
+    }
+    BaseSync();
+    const long long pay = (long long)before - (long long)target;   /* the take that leaves `target`: a negative take is a gift */
+    if (pay > 2147483647LL || pay < -2147483647LL)
+    {
+        DebugLog("[TEST] money " + N(target) + " REFUSED: the change from " + N(before) + " does not fit one take - nothing set");
+        return "error money too-far";
+    }
+    if (pay != 0)
+    {
+        const int t = coop::StoreMoneyPay((int)pay);
+        if (t != 1)
+        {
+            DebugLog("[TEST] money " + N(target) + " REFUSED: the game's take of " + N(pay) + (t == 0 ? " was refused" : " could not be made") + " - money " + N(before));
+            return t == 0 ? "error money take-refused" : "error money take-fault";
+        }
+    }
+    int after = before;
+    coop::StoreMoneyRead(&after);
+    unsigned long long seq = 0;
+    const bool wrote = coop::StoreMoneyWriteNow(&seq);
+    if (!wrote)
+    {
+        if (after == before || coop::StoreMoneyPay(after - before) == 1)
+        {
+            int back = before;
+            coop::StoreMoneyRead(&back);
+            DebugLog("[TEST] money " + N(target) + " REFUSED: pp.money could not be written - put back, " + moneyw::TestLeverLine(before, back));
+            return "error money not-written";
+        }
+        g_owed = true;   /* the purse could not be put back: the change stands, its pp.money write owed (PayOwed, next tick) */
+    }
+    DebugLog(moneyw::TestLeverLine(before, after));
+    DebugLog("[TEST] money " + N(target) + ": the game's Ownerships::takeMoney(" + N(pay) + ")" + (after == target ? std::string() : " - NOT the asked " + N(target))
+             + (wrote ? ", pp.money written (seq " + U(seq) + ")" : std::string(", its pp.money write owed (could not be made nor put back)")) + " (TEST-ONLY, T-478)");
+    return "ok money before=" + N(before) + " after=" + N(after);
+}
+
 int MoneyHave(int* money) { return coop::StoreMoneyRead(money) == 1 ? 1 : 0; }
 
 int MoneySend(int slot, const std::string& name, const std::string& typed, std::string* hint)

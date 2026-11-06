@@ -19,7 +19,8 @@
  *     u32 length + the full position key (1..kBrKeyMax bytes, no control byte, height included as the writer had it) |
  *     u32 flags (kBrFlagSeed: built from the writer's own box, not from a stored record; kBrFlagRetired: a bit games of protocol 116
  *     and earlier set, read and ignored, never written; kBrFlagUndos: an undo list follows the body, a shop's record only;
- *     kBrFlagLedger: the box's ledger follows the body and any undo list) | u32 body length
+ *     kBrFlagLedger: the box's ledger follows the body and any undo list; kBrFlagLock: the box's LOCK BLOCK ends the record) |
+ *     u32 body length
  *   BODY (body length bytes): one PARITY_BOX answer (paritywire.h EncodeParityBox) with status CONTENTS and the header's key -
  *     the item rows with their stolen marks, uniforms, crafters and backpacks' contents. At most kBrMaxRows items.
  *   UNDO LIST (only with kBrFlagUndos): u32 count (1..kBrUndoMax) + count x {u32 asker | u32 epoch | u32 request id}, no key twice -
@@ -27,13 +28,17 @@
  *     as the undo's change to the box and is carried by every later write of the box until the shop record has the undo stored done,
  *     so a game that loads an older save (the box's stock then comes from this record) never applies the undo a second time.
  *   LEDGER (only with kBrFlagLedger): THE BOX'S LEDGER below ('BJLD' ...), after the undo list when both are there.
+ *   LOCK BLOCK (only with kBrFlagLock, T-1061, world-server protocol 145): the box's lock as its writer's engine holds it - u8 locked |
+ *     u8 broken | i32 lock level (0..kBrLockLevelMax) | f32 hardness (finite) - after the undo list and the ledger. A box with no
+ *     lock object, and a cage (its lock is the prisoner road's, prisonwire.h), carries none. A record written before it existed has
+ *     none: each game keeps its own lock until the writer next writes the box.
  *   Nothing else may follow. A record with neither is byte for byte the form written before either existed. The whole record is at
  *   most kBrMaxBytes.
  *
  * A record that is cut short, carries an unknown marker, format, flag, kind or slot, names a key that is not a position key, holds
  * a body that is not one whole CONTENTS answer for that key or whose digest is not its items' own, has more items than the cap,
  * carries an undo list that is empty, over its cap, names a key twice or is on a record not a shop's, carries a ledger flag with no
- * whole ledger, or has bytes after its body (after its undo list, after its ledger) DECODES TO REFUSED: the caller gets no header and no item - never part of the box. The encoder writes
+ * whole ledger, carries a lock flag with no whole valid lock block or on a cage's record, or has bytes after its body (after its undo list, after its ledger) DECODES TO REFUSED: the caller gets no header and no item - never part of the box. The encoder writes
  * a box whole or not at all (a box missing some of its items would be the loss this record exists to end).
  *
  * THE WORLD SERVER'S RULE (BoxAcceptRule): ONE WRITER at a time, as boxowner.h. While the box's owner player's game has the box's
@@ -61,7 +66,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 133;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
+const unsigned int kProtocol = 145;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
                                                  list, kBrFlagUndos, and its ledger, kBrFlagLedger) */
 
 
@@ -81,6 +86,12 @@ const unsigned int kBrFlagUndos = 4u;         /* an undo list follows the body (
 const unsigned int kBrUndoMax = 64u;          /* undo keys one record carries (twice the shop record's owed cap, shoprec kSrOwedCap) */
 const unsigned int kBrFlagLedger = 8u;        /* the record ends with its ledger (THE BOX'S LEDGER below), after any undo list: set by the
                                                  encoder exactly when it is given one */
+const unsigned int kBrFlagLock = 16u;         /* T-1061: the record ends with the box's lock block (A CHEST'S LOCK below), after any undo list
+                                                 and ledger: set by the encoder exactly when the header says hasLock. A reader of protocol 144
+                                                 refuses the flag (BoxHeaderValid) - the protocol 145 bump keeps such a reader out */
+const unsigned int kBrLockBytes = 10u;        /* u8 locked | u8 broken | i32 level | f32 hardness */
+const int kBrLockLevelMax = 100000;           /* as doorrec.h kDrLevelMax: the engine clamps a new lock to 0..100, a save may hold more */
+const float kBrLockNumMax = 1.0e7f;
 const unsigned int kBrKeyMax = (unsigned int)cooppar::kParityStrMax;   /* the body carries the key behind a u8 length */
 const unsigned int kBrFixedBytes = 25u;       /* marker, format, generation, writer, kind, owner, key length */
 const unsigned int kBrHeaderMaxBytes = kBrFixedBytes + kBrKeyMax + 8u;   /* the longest header: what the server reads back from a file */
@@ -92,7 +103,7 @@ const int kBrNumDigitsMax = 9;                /* a tenth of a world unit past 1e
 
 /* decode results: anything but kBrOk is a refused record */
 const int kBrOk = 0, kBrShort = 1, kBrBadMarker = 2, kBrBadFormat = 3, kBrBadHeader = 4, kBrOverCap = 5, kBrBadBody = 6,
-          kBrTrailing = 7, kBrTooBig = 8, kBrBadDigest = 9, kBrBadUndos = 10, kBrDecodeMax = 10;
+          kBrTrailing = 7, kBrTooBig = 8, kBrBadDigest = 9, kBrBadUndos = 10, kBrBadLock = 11, kBrDecodeMax = 11;
 
 /* the world server's answers */
 const int kBrAccept = 0, kBrRefuseBadId = 1, kBrRefuseUnreadable = 2, kBrRefuseWrongBox = 3, kBrRefuseWriter = 4,
@@ -109,6 +120,13 @@ inline int BoxUndoHas(const std::vector<BoxUndoKey>& v, unsigned int asker, unsi
     for (size_t i = 0; i < v.size(); ++i) if (v[i].asker == asker && v[i].epoch == epoch && v[i].id == id) return 1;
     return 0;
 }
+/* T-1061: a box's lock (the engine's DoorLock of the box: +0x20 locked, +0x21 broken, +0x00 level, +0x04 hardness) */
+struct BoxLock
+{
+    int locked, broken, level;
+    float hardness;
+    BoxLock() : locked(0), broken(0), level(0), hardness(0.0f) {}
+};
 struct BoxHeader
 {
     unsigned int format, flags, generation;
@@ -116,7 +134,9 @@ struct BoxHeader
     std::string key;                 /* the full position key, height included */
     unsigned int bodyBytes;          /* filled by the decoder */
     std::vector<BoxUndoKey> undos;   /* the undo list (kBrFlagUndos), oldest first; empty = none */
-    BoxHeader() : format(kBrFormat), flags(0), generation(0), writerSlot(0), kind(kBrKindBox), ownerSlot(-1), bodyBytes(0) {}
+    int hasLock;                     /* T-1061: the record carries the lock block (kBrFlagLock); filled by DecodeBoxRecord, read by the encoder */
+    BoxLock lock;
+    BoxHeader() : format(kBrFormat), flags(0), generation(0), writerSlot(0), kind(kBrKindBox), ownerSlot(-1), bodyBytes(0), hasLock(0) {}
 };
 
 /* the parts of a position key */
@@ -280,8 +300,9 @@ inline int BoxIsPlayerRec(int kind, int ownerSlot) { return (kind == kBrKindBox 
 inline bool BrSlotOk(int slot) { return slot >= 0 && slot <= kBrMaxSlot; }
 inline bool BoxHeaderValid(const BoxHeader& h)
 {
-    return h.format == kBrFormat && (h.flags & ~(kBrFlagSeed | kBrFlagRetired | kBrFlagUndos | kBrFlagLedger)) == 0 && BrSlotOk(h.writerSlot)
+    return h.format == kBrFormat && (h.flags & ~(kBrFlagSeed | kBrFlagRetired | kBrFlagUndos | kBrFlagLedger | kBrFlagLock)) == 0 && BrSlotOk(h.writerSlot)
         && (h.ownerSlot == -1 || BrSlotOk(h.ownerSlot)) && h.kind >= 0 && h.kind <= kBrKindMax && ((h.flags & kBrFlagUndos) == 0 || h.kind == kBrKindShop)
+        && ((h.flags & kBrFlagLock) == 0 || h.kind != kBrKindCage)
         && !MakeBoxRecIdFor(h.key, BoxIsPlayerRec(h.kind, h.ownerSlot)).empty();
 }
 /* an undo list a record may carry: at most kBrUndoMax keys, none twice, and only on a shop's record */
@@ -599,6 +620,142 @@ inline int TakeAskTail(const char* p, size_t size, AskTail* t, size_t* len)
     return 1;
 }
 
+/* ---- A CHEST'S LOCK (T-1061, design A): the record's lock block, and the BOX_LOCK message ----
+   A box's lock (locked, broken, level, hardness) rides the box's record: its writer reads it from its engine at each write and every
+   game lays it onto its box at the area's load (the record beats the save's copy, as doorrec.h's lock does); a game that does not
+   write the box lays only the lock (never the rest of the record) as soon as the record arrives. A pick that opens the box on a game
+   that does not write it is sent to the writer as BOX_LOCK ASK; the writer opens its own and writes the record, or answers NO with its
+   lock, which the picker lays. One record per box, one writer: the lock has no second source. */
+const unsigned int kGameProtocolBoxLock = 207u;   /* the game-to-game protocol that carries BOX_LOCK (net/session.cpp asserts it) */
+const unsigned int kMsgBoxLock = 85u;             /* net/transport.h MSG_BOX_LOCK, liveenvelope.h kInnerBoxLock (store.cpp asserts) */
+const int kBlmAsk = 1, kBlmNo = 2;
+inline bool BoxLockValid(const BoxLock& l)
+{
+    return (l.locked == 0 || l.locked == 1) && (l.broken == 0 || l.broken == 1) && l.level >= 0 && l.level <= kBrLockLevelMax
+        && l.hardness == l.hardness && l.hardness <= kBrLockNumMax && l.hardness >= -kBrLockNumMax;
+}
+inline bool BoxLockSame(const BoxLock& a, const BoxLock& b)
+{
+    return a.locked == b.locked && a.broken == b.broken && a.level == b.level && a.hardness == b.hardness;
+}
+inline void BoxLockPut(std::vector<char>* b, const BoxLock& l)
+{
+    b->push_back((char)(unsigned char)(l.locked != 0 ? 1 : 0));
+    b->push_back((char)(unsigned char)(l.broken != 0 ? 1 : 0));
+    BrPutU32(b, (unsigned int)l.level);
+    unsigned int f = 0;
+    std::memcpy(&f, &l.hardness, 4);
+    BrPutU32(b, f);
+}
+/* the block at *off: true with *out filled and *off past it; false = cut short or not a valid lock (*out and *off untouched) */
+inline bool BoxLockGet(const char* p, size_t size, size_t* off, BoxLock* out)
+{
+    if (p == 0 || *off > size || size - *off < (size_t)kBrLockBytes) return false;
+    BoxLock l;
+    l.locked = (unsigned char)p[*off]; l.broken = (unsigned char)p[*off + 1];
+    size_t o = *off + 2;
+    unsigned int lv = 0, f = 0;
+    BrGet4(p, size, &o, &lv); BrGet4(p, size, &o, &f);
+    l.level = (int)lv;
+    std::memcpy(&l.hardness, &f, 4);
+    if (!BoxLockValid(l)) return false;
+    *off = o;
+    if (out) *out = l;
+    return true;
+}
+
+/* WHAT A GAME DOES WITH A RECORD'S LOCK AT ITS APPLY (items.cpp BoxApplyOne). hasBlock: the record carries a lock block; liveHasLock:
+   the box here has a lock object; liveSame: its lock is the block already; writer: this game writes the box; needed: (the writer) the
+   record is newer than this game's own box (BoxApplyNeeded); askPending: (not the writer) this game's own pick of the box waits for the
+   writer's answer. kBlkLay = lay the block onto the box (every game but a writer whose own box is newer: the record beats the save's
+   copy); kBlkMark = the writer's own box differs from its record (a lock change of its own not yet written, or a record from before
+   the lock block): the box is marked, so its next write carries its lock; kBlkNothing otherwise. */
+const int kBlkNothing = 0, kBlkLay = 1, kBlkMark = 2;
+inline int BoxLockApplyRule(int hasBlock, int liveHasLock, int liveSame, int writer, int needed, int askPending)
+{
+    if (liveHasLock == 0) return kBlkNothing;
+    if (writer == 0)
+    {
+        if (hasBlock == 0 || liveSame != 0 || askPending != 0) return kBlkNothing;
+        return kBlkLay;
+    }
+    if (hasBlock != 0 && liveSame != 0) return kBlkNothing;
+    if (hasBlock != 0 && needed != 0) return kBlkLay;
+    return (needed == 0) ? kBlkMark : kBlkNothing;
+}
+
+/* A NEW RECORD RE-ARMS THE LOCK LAY (T-1061 fold 3; items.cpp BoxLockRecordIn, at the record's arrival). A game whose apply of the box
+   is over at this load (applyDone: kBasDone - it wrote the box, or found it the record) looks at the box again only when its area
+   unloads; if writing passed to another game while this one keeps the area loaded, that writer's records must still lay their lock
+   here. hasBlock: the arrived record carries a lock block; recWriter: its writer's slot (-1 none); mySlot: this game's; haveMine /
+   mineGen: the record generation this game's box holds (BoxRecW). 1 = the lock alone is laid at the next apply scan (the apply stays
+   done); 0 = nothing (this game's own write coming back, no block, the box already that record or newer, or the apply not done - the
+   ordinary apply lays it). */
+inline int BoxLockRearm(int hasBlock, int recWriter, int mySlot, int applyDone, int haveMine, unsigned int mineGen, unsigned int gen)
+{
+    if (hasBlock == 0 || applyDone == 0) return 0;
+    if (recWriter < 0 || recWriter == mySlot) return 0;
+    return (haveMine == 0 || gen > mineGen) ? 1 : 0;
+}
+
+/* WHERE A PICK THAT OPENED A BOX HERE GOES (doors.cpp's pick tick hands it over; items.cpp BoxLockPickDrain). verdict: ItBoxWriterAt's
+   answer for the box - 1 this game writes it, 2 another game does, 3 nobody does, 4 no answer yet, anything else not a box; linked:
+   this game is in a world with other games (a writer to tell); sent: this pick's ASK is out; waitedMs / capMs: since the pick, and the
+   longest wait for a writer. kBlrWrite: the box is marked - its record carries the open lock; kBlrAsk: BOX_LOCK ASK to the area's
+   writer (the lock stays open here); kBlrWait: looked at again next tick; kBlrRelock: no writer took it - the lock is laid back from
+   the record, as a refusal; kBlrDone: the ASK is out and its wait is over (the writer's record or its NO decides from here);
+   kBlrNothing: nothing of the record's (not a box, or no other game). */
+const int kBlrNothing = 0, kBlrWrite = 1, kBlrAsk = 2, kBlrWait = 3, kBlrRelock = 4, kBlrDone = 5;
+inline int BoxLockPickRoute(int verdict, int linked, int sent, unsigned long waitedMs, unsigned long capMs)
+{
+    if (verdict < 1 || verdict > 4) return kBlrNothing;
+    if (verdict == 1) return kBlrWrite;
+    if (linked == 0) return kBlrNothing;
+    if (sent != 0) return (waitedMs >= capMs) ? kBlrDone : kBlrWait;
+    if (verdict == 2) return kBlrAsk;
+    return (waitedMs >= capMs) ? kBlrRelock : kBlrWait;   /* nobody to ask yet */
+}
+
+/* THE WRITER'S ANSWER TO AN ASK (items.cpp BoxLockNote). mine: ItBoxWriterAt says this game writes the box; found: the box is loaded
+   here with a lock object. 1 = take it: the box's lock opens (locked = 0, the pick tick's own write) and the box is marked for a write;
+   0 = refuse: NO with this game's lock (or the asker's own, locked, when this game has no box), which the asker lays. */
+inline int BoxLockAskTake(int mine, int found) { return (mine != 0 && found != 0) ? 1 : 0; }
+
+/* BOX_LOCK: u8 kind (kBlmAsk / kBlmNo) | u32 length + the box's position key (1..kBrKeyMax, height included, a key BoxKeyParse reads) |
+   the lock block (ASK: the picker's lock after the pick, locked 0; NO: the writer's lock, which the picker lays). Nothing follows. */
+struct BoxLockMsg
+{
+    int kind;
+    std::string key;
+    BoxLock lock;
+    BoxLockMsg() : kind(0) {}
+};
+inline bool EncodeBoxLockMsg(std::vector<char>* out, const BoxLockMsg& m)
+{
+    if (out == 0) return false;
+    out->clear();
+    BoxKeyParts kp;
+    if ((m.kind != kBlmAsk && m.kind != kBlmNo) || !BrTextOk(m.key, kBrKeyMax) || BoxKeyParse(m.key, &kp) == 0 || !BoxLockValid(m.lock)) return false;
+    out->push_back((char)(unsigned char)m.kind);
+    BrPutStr(out, m.key);
+    BoxLockPut(out, m.lock);
+    return true;
+}
+inline bool DecodeBoxLockMsg(const char* p, size_t size, BoxLockMsg* out)
+{
+    if (p == 0 || size < 1) return false;
+    BoxLockMsg m;
+    m.kind = (unsigned char)p[0];
+    if (m.kind != kBlmAsk && m.kind != kBlmNo) return false;
+    size_t off = 1;
+    if (!BrGetStr(p, size, &off, kBrKeyMax, &m.key) || !BrTextOk(m.key, kBrKeyMax)) return false;
+    BoxKeyParts kp;
+    if (BoxKeyParse(m.key, &kp) == 0) return false;
+    if (!BoxLockGet(p, size, &off, &m.lock) || off != size) return false;
+    if (out) *out = m;
+    return true;
+}
+
 /* The record for header `h` (its flags, generation, slots, kind, key and undo list - kBrFlagUndos is set from the list) and `items`,
    into *out (replaced). false = nothing written (*out emptied): the header is out of range, an item is not valid, there are more than
    kBrMaxRows items, the item list will not encode as a PARITY_BOX answer, the undo list is not one a record may carry, or the record
@@ -610,9 +767,14 @@ inline bool EncodeBoxRecord(std::vector<char>* out, const BoxHeader& h, const st
     out->clear();
     BoxHeader hh = h;
     hh.format = kBrFormat;
-    hh.flags &= ~(kBrFlagLedger | kBrFlagUndos);
+    hh.flags &= ~(kBrFlagLedger | kBrFlagUndos | kBrFlagLock);
     if (led != 0 && led->line != 0ULL) hh.flags |= kBrFlagLedger;
     if (!hh.undos.empty()) hh.flags |= kBrFlagUndos;
+    if (hh.hasLock != 0)
+    {   /* T-1061: the lock block - only a valid lock, never on a cage (BoxHeaderValid) */
+        if (!BoxLockValid(hh.lock)) return false;
+        hh.flags |= kBrFlagLock;
+    }
     if ((hh.flags & kBrFlagRetired) != 0 || !BoxHeaderValid(hh) || !BoxItemsValid(items) || !BoxUndoListValid(hh.undos, hh.kind)) return false;
     cooppar::ParityBox m;
     m.status = cooppar::kParityStatusContents;
@@ -641,6 +803,7 @@ inline bool EncodeBoxRecord(std::vector<char>* out, const BoxHeader& h, const st
         for (size_t i = 0; i < hh.undos.size(); ++i) { BrPutU32(&b, hh.undos[i].asker); BrPutU32(&b, hh.undos[i].epoch); BrPutU32(&b, hh.undos[i].id); }
     }
     b.insert(b.end(), lb.begin(), lb.end());
+    if ((hh.flags & kBrFlagLock) != 0) BoxLockPut(&b, hh.lock);
     if (b.size() > (size_t)kBrMaxBytes) return false;
     out->swap(b);
     return true;
@@ -719,6 +882,11 @@ inline int DecodeBoxRecord(const char* p, size_t size, BoxHeader* hOut, std::vec
             if (ur != kBrOk) return ur;
         }
         if ((h.flags & kBrFlagLedger) != 0 && !BoxLedgerGet(p, size, &lo, &led)) return kBrTrailing;
+        if ((h.flags & kBrFlagLock) != 0)
+        {   /* T-1061: the lock block ends the record */
+            if (!BoxLockGet(p, size, &lo, &h.lock)) return kBrBadLock;
+            h.hasLock = 1;
+        }
         if (lo != size) return kBrTrailing;
     }
     if (h.bodyBytes == 0) return kBrBadBody;
@@ -739,7 +907,8 @@ inline const char* BoxDecodeWhy(int why)
          : why == kBrBadFormat ? "an unknown format" : why == kBrBadHeader ? "a header out of range" : why == kBrOverCap ? "more items than the cap"
          : why == kBrBadBody ? "a body that is not one whole item list for its key" : why == kBrTrailing ? "bytes after the body (or a ledger that does not read whole)"
          : why == kBrTooBig ? "larger than the byte cap" : why == kBrBadDigest ? "a body whose digest is not its items' own"
-         : why == kBrBadUndos ? "an undo list that is empty, over its cap or names a key twice" : "malformed";
+         : why == kBrBadUndos ? "an undo list that is empty, over its cap or names a key twice"
+         : why == kBrBadLock ? "a lock block that is cut short or out of range" : "malformed";
 }
 
 /* THE UNDO LIST A WRITE OF A SHOP'S BOX CARRIES: the kept record's list, then the keys this game's own undos put into this box that

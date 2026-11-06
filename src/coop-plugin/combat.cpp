@@ -60,6 +60,7 @@ namespace coop { void SquadCatsSafePointDrain(); }   /* T-1 B3 restructure: hand
 namespace coop { void LimbSafePointDrain(); }   /* LIMBS: clothing.cpp - the owner's limbs onto its copies, and the limbtest lever */
 namespace coop { int AiWorkerBusyNow(); }   /* T-1101 step 3: coop.cpp - the engine's own AI-worker busy test: 1 running, 0 idle, -1 cannot be told. MAIN THREAD */
 namespace coop { void BoxTakeDrain(); }      /* loot2c: items.cpp - the `boxtake` lever's move runs at this same safe point */
+namespace coop { void AdminSafePointDrain(); }   /* T-1205: admin.cpp - the admin toolbox's /medic, /heal and /additem on this game's own characters */
 
 #include "coop_log.h"
 namespace { swlogbudget::Gate g_qM6State, g_qNcOpen, g_qNcClose, g_qM6Sent, g_qM6Unknown, g_qM6NoTarget; }   /* T-910: g_qM6Sent, g_qM6Unknown; T-879: g_qM6NoTarget */   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
@@ -575,6 +576,10 @@ volatile LONG g_readyNoteW = 0;   /* producer: the AI worker (the hit detour) */
 volatile LONG g_readyNoteR = 0;   /* consumer: the main thread, at the K2 safe point */
 volatile LONG64 g_frRingFull = 0;   /* notes (AI worker) or results (main thread) refused because their ring was full */
 long long g_frWritten = 0, g_frAdded = 0, g_frLate = 0, g_frNoContact = 0, g_frOtherVictim = 0, g_frNoBlow = 0;   /* MAIN THREAD */
+long long g_frCopyWritten = 0, g_frCopyLate = 0, g_frCopyContact = 0, g_frCopyResult = 0, g_frCopyUntouched = 0, g_frCopyUnknown = 0;   /* MAIN THREAD: the copy's side */
+long long g_frCopyNoSwing = 0, g_frCopyLines = 0;   /* MAIN THREAD: a SWING_END word with no copy swing to take it; copy lines written */
+long long g_frCopyNotPc = 0;   /* MAIN THREAD: a SWING_END word for a uid not (yet) known here as a player's character */
+long long g_frCopyOther = 0;   /* MAIN THREAD: a copy write refused because something other than the countdown changed its timer */
 
 // The attacker's fight object flag +0x144 at the hit call: 0x60CC10 counts +0x148 down only while it is set
 // (decomp_60cc10.txt:149-157). The fight object is Character +0x648 -> +8 (getCombat, F205), the rbx of 0x609860's store.
@@ -641,6 +646,172 @@ static void ReadyResultQueue(unsigned int auid, unsigned int vuid, int comboId, 
     r.attacker = auid; r.victim = vuid; r.combo = comboId; r.result = blow->result;
 }
 
+// MAIN THREAD (the K2 safe point, and the owner's swing end): the contact notes onto their attackers' rows, stamped with the
+// swing number now. The notes ring's only reader.
+static void ReadyNotesDrain()
+{
+    while (g_readyNoteR != g_readyNoteW)
+    {
+        const ReadyNote n = g_readyNote[(unsigned int)g_readyNoteR & kReadyNoteMask];
+        InterlockedExchange(&g_readyNoteR, g_readyNoteR + 1);
+        ReadyRow* row = ReadyRowFor(n.attacker);
+        row->last.have = 1;
+        row->last.victim = n.victim;
+        row->last.combo = n.combo;
+        row->last.suppressed = n.suppressed;
+        row->last.flag = n.flag;
+        row->last.swing = row->swing;
+        row->last.resolved = 0;
+    }
+}
+
+// MAIN THREAD (the owner's swing end, as SWING_END goes out): what the swing of this own player character that just ended met,
+// for SWING_END's end word (hitwire.h): from its row, its last contact in this swing and whether a result came for it (matched
+// already, or queued for the next safe point). Unknown when it is not a player character here or its row was taken over.
+static unsigned char ReadySwingEndWord(unsigned int uid)
+{
+    if (uid == 0 || IsUidPlayerCharAnyThread(uid) != 1) return hitwire::kSwingEndUnknown;
+    ReadyNotesDrain();   /* a contact noted since the last safe point belongs to this swing */
+    const ReadyRow* row = 0;
+    for (int i = 0; i < kReadyRows && row == 0; ++i)
+        if (g_readyRow[i].uid == uid) row = &g_readyRow[i];
+    if (row == 0) return hitwire::kSwingEndUnknown;
+    const fightready::Contact& c = row->last;
+    if (!c.have || c.swing != row->swing) return hitwire::kSwingEndUntouched;
+    if (!c.suppressed || c.resolved) return hitwire::kSwingEndResult;
+    for (int i = 0; i < g_readyResultCount; ++i)
+        if (g_readyResult[i].attacker == uid && g_readyResult[i].victim == c.victim && g_readyResult[i].combo == c.combo)
+            return hitwire::kSwingEndResult;   /* arrived: the next safe point writes it */
+    return hitwire::kSwingEndNoResult;
+}
+
+// T-890, THE COPY'S PAUSE AFTER A SWING THAT GOT NO RESULT ON ITS OWNER'S GAME. When the owner's swing touches another player's
+// copy there and the victim's game (which decides the blow) saw no contact, no HIT comes: the owner's engine keeps its no-hit
+// value (0.2 s, the lookup's index 6), while the copy here touched nothing and keeps decide's no-contact value (0.5 s). The
+// owner's SWING_END carries what its swing met (hitwire.h end word). Here, per copy of another game's player character, one slot
+// notes its swing start (detour_sgAttackStart), any contact (detour_hitByMelee) and its swing's end (detour_ccUpdate: the fight
+// object's +0x1F0 leaves the attack state 0; the timer it held in the attack is where the countdown starts); after the end the
+// same detour keeps following the timer, call by call, until the decision or until the countdown flag clears (fightready.h
+// CopyFollow: only the countdown's own steps may touch it); SWING_END's word lands on the same slot (main thread). A short spin
+// lock, no engine call and no log under it. Once the swing has ended AND the word has arrived, in either order, the K2 safe point
+// writes the no-hit value less what the countdown already ran, when the record shows nothing else touched the timer
+// (CopyReadySafePoint; fightready.h CopyDecide / CopyAfter). A new swing start of the copy resets its slot, so a word or an end
+// of the older swing never reaches the new one.
+struct CopyReadySlot { const void* cc; unsigned int uid; fightready::CopySwing s; };
+const int kCopyReadySlots = 32;
+CopyReadySlot g_crSlot[kCopyReadySlots];
+int g_crNext = 0;               /* under g_crLock: the slot taken over next when none is free */
+long long g_crTaken = 0;        /* under g_crLock: a slot taken over while its copy's swing still waited */
+volatile LONG g_crLock = 0;
+volatile LONG g_crActive = 0;   /* slots whose swing is running or followed after its end (CopyTracked): read unlocked, the detours' cheap filter */
+
+static void CrLock()
+{
+    int spins = 0;
+    while (InterlockedCompareExchange(&g_crLock, 1, 0) != 0)
+    {
+        if (++spins < 64) YieldProcessor();
+        else { spins = 0; ::SwitchToThread(); }
+    }
+}
+static void CrUnlock() { InterlockedExchange(&g_crLock, 0); }
+static CopyReadySlot* CrFindLocked(unsigned int uid)
+{
+    for (int i = 0; i < kCopyReadySlots; ++i)
+        if (g_crSlot[i].uid == uid) return &g_crSlot[i];
+    return 0;
+}
+
+// ANY THREAD (detour_sgAttackStart, after the attack start answered yes for a copy of another game's player character): a new
+// swing of that copy on fight object cc.
+static void CopyReadyStart(const void* cc, unsigned int uid)
+{
+    if (cc == 0 || uid == 0) return;
+    CrLock();
+    CopyReadySlot* s = CrFindLocked(uid);
+    for (int i = 0; i < kCopyReadySlots && s == 0; ++i)
+        if (g_crSlot[i].uid == 0) s = &g_crSlot[i];
+    if (s == 0)
+    {
+        s = &g_crSlot[g_crNext];
+        g_crNext = (g_crNext + 1) % kCopyReadySlots;
+        if (s->s.phase != fightready::kCopyIdle && s->s.phase != fightready::kCopyDone) ++g_crTaken;
+    }
+    if (fightready::CopyTracked(s->s)) InterlockedDecrement(&g_crActive);
+    s->cc = cc;
+    s->uid = uid;
+    fightready::CopyStart(&s->s);
+    InterlockedIncrement(&g_crActive);
+    CrUnlock();
+}
+
+// AI WORKER (detour_hitByMelee, any hit): the copy whose swing it is touched someone here - its engine set its own timer.
+static void CopyReadyContact(unsigned int auid)
+{
+    if (auid == 0) return;
+    CrLock();
+    CopyReadySlot* s = CrFindLocked(auid);
+    if (s != 0) fightready::CopyContact(&s->s);
+    CrUnlock();
+}
+
+// AI WORKER (detour_ccUpdate): a followed copy's fight object around the fight routine. +0x1F0 the state (0 = in the attack),
+// +0x148 the getting-ready timer, +0x144 its countdown flag. 1 read. POD, __try (C2712).
+struct CopyReadyUpd { int have, st, flag; float timer; };
+static int CrReadCc(const void* cc, int* st, float* timer, int* flag)
+{
+    *st = -1; *timer = 0.0f; *flag = -1;
+    __try
+    {
+        const char* b = (const char*)cc;
+        *st = *(const int*)(b + 0x1F0);
+        *timer = *(const float*)(b + 0x148);
+        *flag = (*(const unsigned char*)(b + 0x144) != 0) ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void CopyReadyBefore(const void* cc, CopyReadyUpd* u)
+{
+    u->have = 0;
+    if (g_crActive == 0 || cc == 0) return;
+    int followed = 0;
+    for (int i = 0; i < kCopyReadySlots && !followed; ++i)   /* unlocked: a stale read only costs one call */
+        if (g_crSlot[i].cc == cc && fightready::CopyTracked(g_crSlot[i].s)) followed = 1;
+    if (followed) u->have = CrReadCc(cc, &u->st, &u->timer, &u->flag);
+}
+// frame: the fight routine's frame-time argument, the amount its countdown takes off +0x148 in one call.
+static void CopyReadyAfter(const void* cc, const CopyReadyUpd* u, float frame)
+{
+    int st = -1, flag = -1;
+    float timer = 0.0f;
+    if (!CrReadCc(cc, &st, &timer, &flag)) return;
+    CrLock();
+    for (int i = 0; i < kCopyReadySlots; ++i)
+    {
+        CopyReadySlot& s = g_crSlot[i];
+        if (s.cc != cc || !fightready::CopyTracked(s.s)) continue;
+        if (fightready::CopyRunning(s.s)) fightready::CopyStep(&s.s, u->st, u->timer, st, timer, flag, frame);
+        else fightready::CopyFollow(&s.s, u->timer, u->flag, timer, flag, frame);
+        if (!fightready::CopyTracked(s.s)) InterlockedDecrement(&g_crActive);
+        break;
+    }
+    CrUnlock();
+}
+
+// MAIN THREAD (ApplyRemoteSwingEnd): the owner's word for the swing of its copy uid here. No copy swing to take it (the copy
+// never threw this swing, or its swing already had a word) is counted noSwing.
+static void CopyReadyOwnerEnd(unsigned int uid, unsigned char end)
+{
+    if (uid == 0) return;
+    if (IsUidPlayerCharAnyThread(uid) != 1) { ++g_frCopyNotPc; return; }
+    CrLock();
+    CopyReadySlot* s = CrFindLocked(uid);
+    const int took = (s != 0) ? fightready::CopyOwnerEnd(&s->s, (int)end) : 0;
+    CrUnlock();
+    if (!took) ++g_frCopyNoSwing;
+}
+
 static std::string FrF3(float v)
 {
     if (_finite((double)v) == 0) return "nan";
@@ -668,11 +839,18 @@ static std::string FightReadyText(const fightlog::Event& e)
 // added = a result added to a counting pause; late = a result matched its contact but wrote nothing (timerDone, newSwing,
 // noFight, loading); noContact / otherVictim = a result matched no unanswered contact / another one; noBlow = a result with no
 // readable blow; ringFull = contact notes or results dropped because their queue was full (counted nowhere else).
+// copy*: the copy's pause after a swing (CopyReadySafePoint): written / late (why on its line); contact = the copy's own swing
+// touched; result = the owner's swing got its result; untouched / unknown = the owner's touched nothing / could not tell;
+// noSwing = a SWING_END word with no copy swing to take it; notPc = a word for a uid not known here as a player's character;
+// other = the late ones refused because something other than the countdown changed the timer (otherWriter, also in late);
+// taken = a waiting copy slot taken over.
 static std::string FightReadyToken()
 {
     return " fightReady[written=" + N3(g_frWritten) + ",added=" + N3(g_frAdded) + ",late=" + N3(g_frLate)
          + ",noContact=" + N3(g_frNoContact) + ",otherVictim=" + N3(g_frOtherVictim) + ",noBlow=" + N3(g_frNoBlow)
-         + ",ringFull=" + N3((long long)g_frRingFull) + "]";
+         + ",ringFull=" + N3((long long)g_frRingFull) + ",copyWritten=" + N3(g_frCopyWritten) + ",copyLate=" + N3(g_frCopyLate)
+         + ",copyContact=" + N3(g_frCopyContact) + ",copyResult=" + N3(g_frCopyResult) + ",copyUntouched=" + N3(g_frCopyUntouched)
+         + ",copyUnknown=" + N3(g_frCopyUnknown) + ",copyNoSwing=" + N3(g_frCopyNoSwing) + ",copyNotPc=" + N3(g_frCopyNotPc) + ",copyOther=" + N3(g_frCopyOther) + ",copyTaken=" + N3(g_crTaken) + "]";
 }
 
 // Any thread, right after a swing really started (the attack start answered yes): the move it stored at CombatClass +0x150.
@@ -860,6 +1038,7 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
     InterlockedIncrement64(&g_hitsSeen);
     if (g_hitThreadId == 0)
         InterlockedExchange(&g_hitThreadId, (LONG)::GetCurrentThreadId());
+    if (g_crActive != 0 && attacker != 0) CopyReadyContact(UidOf(attacker));   /* T-890: a followed copy's swing touched someone */
 
     // A hit we are applying on the authority's behalf: run it, but never re-emit it.
     if (g_applyingRemote)
@@ -3198,19 +3377,7 @@ static void FightReadyLine(const ReadyResult& r, int why, float before, float af
 // Never waits for a result; a contact with no result keeps the engine's no-hit pause.
 static void FightReadySafePoint()
 {
-    while (g_readyNoteR != g_readyNoteW)
-    {
-        const ReadyNote n = g_readyNote[(unsigned int)g_readyNoteR & kReadyNoteMask];
-        InterlockedExchange(&g_readyNoteR, g_readyNoteR + 1);
-        ReadyRow* row = ReadyRowFor(n.attacker);
-        row->last.have = 1;
-        row->last.victim = n.victim;
-        row->last.combo = n.combo;
-        row->last.suppressed = n.suppressed;
-        row->last.flag = n.flag;
-        row->last.swing = row->swing;
-        row->last.resolved = 0;
-    }
+    ReadyNotesDrain();
     if (g_readyResultCount == 0) return;
     const bool blocked = EngineWritesBlocked();
     const FrLookupFn look = (kFrLookupRva != 0) ? (FrLookupFn)((unsigned long long)::GetModuleHandleA(0) + kFrLookupRva) : 0;
@@ -3254,9 +3421,83 @@ static void FightReadySafePoint()
     g_readyResultCount = 0;
 }
 
+// K2 safe point (MAIN THREAD, worker paused): each copy swing that has ended here and whose owner's SWING_END word has arrived.
+// The write is the owner's own-character write (FrTimerWrite on the fight object found live from the uid, the value from the
+// engine's lookup) with the own-character limit lifted for this case. Safe on a copy as on an own character: the worker that runs
+// the fight routine is paused, the fight object is the same engine object (Character +0x648 -> +8) checked to be the one the
+// swing was followed on, the value is the engine's own no-hit value, the write only shortens a countdown the engine already
+// runs (CopyAfter refuses a new swing, an ended countdown and a value not below the held one), and nothing on a copy is sent from
+// its timer. What the countdown ran is the swing's record, not held less the live timer: from the swing's end the detour follows
+// the timer call by call, and any change other than the countdown's own step (another engine routine rewriting +0x148 or its
+// flag, between calls or inside one), or a live timer here that is not the one the last followed call left, refuses the write
+// (otherWriter) - such a timer may be a fresh pause of the engine's own.
+static void CopyReadyLine(unsigned int uid, const char* touched, const std::string& tail)
+{
+    if (g_frCopyLines >= 400) return;   /* the copy lines' cap a launch; the counters go on */
+    ++g_frCopyLines;
+    DebugLog("[FIGHT] ready copy uid=" + N3((long long)uid) + " swing ended (" + touched + "): " + tail);
+}
+static void CopyReadySafePoint()
+{
+    const bool blocked = EngineWritesBlocked();
+    const FrLookupFn look = (kFrLookupRva != 0) ? (FrLookupFn)((unsigned long long)::GetModuleHandleA(0) + kFrLookupRva) : 0;
+    for (int i = 0; i < kCopyReadySlots; ++i)
+    {
+        CrLock();
+        const CopyReadySlot c = g_crSlot[i];
+        const int due = (c.uid != 0) ? fightready::CopyDue(c.s) : 0;
+        if (due)
+        {
+            const int tracked = fightready::CopyTracked(g_crSlot[i].s);
+            g_crSlot[i].s.phase = fightready::kCopyDone;   /* one decision per swing; its following stops */
+            if (tracked) InterlockedDecrement(&g_crActive);
+        }
+        CrUnlock();
+        if (!due) continue;
+        const int d = fightready::CopyDecide(c.s.ownerEnd, c.s.contact);
+        if (d == fightready::kCopyKeepContact) { ++g_frCopyContact; continue; }
+        if (d == fightready::kCopyKeepResult) { ++g_frCopyResult; continue; }
+        if (d == fightready::kCopyKeepUnknown) { ++g_frCopyUnknown; continue; }
+        if (d == fightready::kCopyKeepUntouched)
+        {
+            ++g_frCopyUntouched;
+            CopyReadyLine(c.uid, "touched nothing on the owner's game", "timer kept (the owner's engine keeps its no-contact pause too)");
+            continue;
+        }
+        float before = 0.0f, after = 0.0f, ran = 0.0f, noHit = 0.0f;
+        int flag = 0;
+        void* obj = 0;
+        const void* cc = 0;
+        int why = blocked ? fightready::kWhyLoading : fightready::kWhyNone;
+        if (why == fightready::kWhyNone)
+        {
+            ::Character* ch = net::IsUidMine(c.uid) ? 0 : FindSpawned(c.uid);
+            cc = (ch != 0) ? FightCombatOf(ch) : 0;
+            if (look == 0 || cc == 0 || cc != c.cc || !FrLiveRead(cc, &before, &flag, &obj)
+                || !FrLookupPod(look, obj, fightready::kIndexNoHit, &noHit))
+                why = fightready::kWhyNoFight;
+        }
+        if (why == fightready::kWhyNone) why = fightready::CopyAfter(c.s, before, flag, noHit, &after, &ran);
+        if (why == fightready::kWhyNone && !FrTimerWrite(cc, after)) why = fightready::kWhyNoFight;
+        if (why == fightready::kWhyNone)
+        {
+            ++g_frCopyWritten;
+            CopyReadyLine(c.uid, "touched with no result on the owner's game", "timer " + FrF3(before) + " -> " + FrF3(after) + " (ran " + FrF3(ran) + ")");
+        }
+        else
+        {
+            ++g_frCopyLate;
+            if (why == fightready::kWhyOtherWriter) ++g_frCopyOther;
+            CopyReadyLine(c.uid, "touched", std::string("late why=") + fightready::WhyName(why) + " timer " + FrF3(before)
+                                            + " held " + FrF3(c.s.held) + " ran " + FrF3(c.s.ran) + " last " + FrF3(c.s.last));
+        }
+    }
+}
+
 void MeleeSafePointDrain()
 {
     FightReadySafePoint();   /* T-890: the owner's getting-ready timer from its blows' real results, worker paused */
+    CopyReadySafePoint();    /* T-890: a copy's pause after a swing that got no result on its owner's game */
     if (g_meleeInQ.empty()) return;
     std::vector<MeleeIn> q;
     q.swap(g_meleeInQ);
@@ -5643,6 +5884,7 @@ static unsigned long long detour_sgAttackStart(void* state, void* target)
         swinggate::After(&g_sg, uid, tgt, (unsigned int)::GetTickCount(), (r & 0xFF) != 0 ? 1 : 0);
         SgUnlock();
     }
+    if ((r & 0xFF) != 0 && uid != 0 && !mine && pc == 1) CopyReadyStart(FightPtrAt(state, 8), uid);   /* T-890: a copy's swing began here */
     if ((r & 0xFF) != 0 && uid != 0 && g_fight.accepted < fightlog::kCap)
     {
         /* a player character's swing really started: name the move initialiseAttack stored (its CombatClass is AttackState +8) */
@@ -7356,7 +7598,10 @@ void detour_ccUpdate(CombatClassAI* self, float frameTIME)
     }
     if (!found) InterlockedIncrement64(&g_updUnknown);
 
+    CopyReadyUpd cru;   /* T-890: a followed copy's swing state and timer around the fight routine */
+    CopyReadyBefore(self, &cru);
     orig_ccUpdate(self, frameTIME);
+    if (cru.have) CopyReadyAfter(self, &cru, frameTIME);
 }
 
 // Main thread ONLY. Returns the slot for this object, claiming a free one on first sight, and
@@ -10165,7 +10410,7 @@ void CombatModeTick()
                 if (w->swingEndOwed && w->lastState == SWORD_SWING && st != SWORD_SWING)
                 {
                     w->swingEndOwed = 0;
-                    if (mine && net::SendSwingEnd(uid, w->swingEndTarget)) ++g_sgEndSent;
+                    if (mine && net::SendSwingEnd(uid, w->swingEndTarget, ReadySwingEndWord(uid))) ++g_sgEndSent;
                 }
 
                 w->lastState = st;
@@ -11402,13 +11647,14 @@ void ApplyRemoteSwing(unsigned int uid, unsigned int targetUid, const char* move
 // or an older one (the owner throws one swing at a time), so all are dropped (counted ownerEndDrop - owner blows the copy did
 // not throw, blows that do no damage), and a pending start-on-arrival intent of that copy expires at its next service (its
 // retry would have no credit to start on: the gate reads the credit at the engine's attack start, detour_sgAttackStart).
-// MAIN THREAD ONLY.
-void ApplyRemoteSwingEnd(unsigned int uid, unsigned int targetUid)
+// The end word (what the owner's swing met) goes to the copy's pause after its own swing (CopyReadyOwnerEnd). MAIN THREAD ONLY.
+void ApplyRemoteSwingEnd(unsigned int uid, unsigned int targetUid, unsigned char end)
 {
     (void)targetUid;
     ++g_sgEndRecv;
     if (uid == 0 || net::IsUidMine(uid)) return;
     SwingCreditEnd(uid);
+    CopyReadyOwnerEnd(uid, end);   /* T-890: the owner's word for its copy's pause after this swing */
     if (FindSpawned(uid) == 0) return;
     CombatWatch* w = CombatWatchFor(uid);
     if (w != 0 && w->swingIntent && w->swingIntentGated) w->swingIntentEnded = 1;
@@ -13781,6 +14027,7 @@ void detour_tsRagdollUpdates(void* gameWorld)
     coop::SquadLeaderSafePointDrain();   /* T-1 B1: ActivePlatoon::setSquadLeader on a copy squad, with the worker paused (1 Hz inside) */
     coop::SquadCatsSafePointDrain();   /* T-1 B3 restructure: copy pots written, taken squads adopted, with the worker paused */
     coop::BoxTakeDrain();           /* loot2c (test-only lever): one shown research copy moved from the open box into this player's first character */
+    coop::AdminSafePointDrain();    /* T-1205: the admin toolbox's /medic, /heal and /additem on this game's own characters, with the worker paused */
     {
         /* While the engine's ragdoll pass runs, no copy's body is rebuilt (appearance.cpp, the copy body-rebuild guard): the
            get-up blend's last update reaches AppearanceBase::update from inside the pass. The depth goes back to its saved value

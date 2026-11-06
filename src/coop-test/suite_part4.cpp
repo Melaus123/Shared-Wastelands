@@ -22,11 +22,11 @@ void t_t609_build_farm_kinds_apart()
         coopbuild::BuildMsg bm;
         const int isBuild = (coopbuild::DecodeBuild(&b, 1, &bm) != coopbuild::kBuildDecodeBadKind) ? 1 : 0;
         const int isFarm = (coopfarm::IsFarmKind(&b, 1) != 0) ? 1 : 0;
-        const int isPower = (powerwire::IsPowerKind(&b, 1) != 0) ? 1 : 0;   /* P47: the third table (16, 17), peeked first */
+        const int isPower = (powerwire::IsPowerKind(&b, 1) != 0) ? 1 : 0;   /* P47: the third table (16, 17; T-1192: 19, 20), peeked first */
         nBuild += isBuild; nFarm += isFarm; nPower += isPower;
         if (isBuild + isFarm + isPower > 1) Fail("T-609 / P47: MSG_BUILD kind " + I(k) + " is in more than one table (building " + I(isBuild) + ", farm " + I(isFarm) + ", power " + I(isPower) + ")");
     }
-    if (nPower != 2) Fail("P47: the kind walk saw " + I(nPower) + " power kinds, not 2");
+    if (nPower != 4) Fail("P47 / T-1192: the kind walk saw " + I(nPower) + " power kinds, not 4 (16, 17 and CRAFT_ASK / CRAFT_ANSWER 19, 20)");
     const char p16 = (char)powerwire::kPowerState, p17 = (char)powerwire::kPowerAsk;
     if (coopfarm::IsFarmKind(&p16, 1) != 0 || coopfarm::IsFarmKind(&p17, 1) != 0) Fail("P47: the farm peek takes kind 16 or 17");
     /* the walk saw both tables: 8 building kinds (1-5, 8, 9, 12) and 7 farm kinds (6, 7, 10, 11, 13-15) today - more is fine */
@@ -679,6 +679,48 @@ void t_par16_farm()
         if (SpotTakeStep(0, 1, 0, kProdWriterOther, kSpotGranted, 0) != kSpotPass) Fail("T-674: a granted spot was refused");
         if (SpotTakeStep(0, 1, 0, kProdWriterOther, kSpotRefused, kSpotRetryMs) != kSpotWait) Fail("T-674: a full answer was not held");
         if (SpotTakeStep(0, 1, 0, kProdWriterOther, kSpotRefused, kSpotRetryMs + 1) != kSpotAskNow) Fail("T-674: a full answer was never asked again");
+        /* T-1192 (run T1894): a one-shot take (a prisoner's put-in) on a new row decides the runner in the same call */
+        if (SpotTakeStep(0, 1, 0, SpotWriterForTake(kProdWriterNone, kProdWriterHere), kSpotNone, 0) != kSpotPass)
+            Fail("T-1192: a new row at this game's own building was refused (the put-in is never retried)");
+        if (SpotTakeStep(0, 1, 0, SpotWriterForTake(kProdWriterNone, kProdWriterOther), kSpotNone, 0) != kSpotAskNow)
+            Fail("T-1192: a new row at another game's building was not refused and asked");
+        if (SpotTakeStep(0, 1, 0, SpotWriterForTake(kProdWriterNone, kProdWriterNone), kSpotNone, 0) != kSpotAskNow)
+            Fail("T-1192: a new row whose runner is unknown was not refused and asked");
+        if (SpotWriterForTake(kProdWriterOther, kProdWriterHere) != kProdWriterOther) Fail("T-1192: a take's read overrode the main thread's runner");
+        if (SpotWriterForTake(kProdWriterHere, kProdWriterNone) != kProdWriterHere) Fail("T-1192: an unread take cleared a known runner");
+        if (SpotRunnerBooked(1, kProdWriterHere, kSpotRunnerFreshMs) != kProdWriterHere) Fail("T-1192: a fresh booked runner was not used");
+        if (SpotRunnerBooked(1, kProdWriterHere, kSpotRunnerFreshMs + 1) != kProdWriterNone) Fail("T-1192: a stale booked runner was used");
+        if (SpotRunnerBooked(0, kProdWriterHere, 0) != kProdWriterNone) Fail("T-1192: a runner never booked was used");
+        if (SpotRunnerBooked(1, kProdWriterOther, 0) != kProdWriterOther) Fail("T-1192: a booked other-game runner was not kept");
+        /* T-1125: the torture building's take lines and the occupant watch */
+        {
+            const int refused[] = { kTortTakeRoomFull, kTortTakeCopy, kTortTakeAsk, kTortTakeWait };
+            const int allowed[] = { kTortTakeLone, kTortTakeHandless, kTortTakeListed, kTortTakeNoKey, kTortTakeNoUid, kTortTakePass };
+            for (int i = 0; i < 4; ++i) if (TortTakeAllowed(refused[i]) != 0) Fail("T-1125: a refused take road said allowed");
+            for (int i = 0; i < 6; ++i) if (TortTakeAllowed(allowed[i]) != 1) Fail("T-1125: an allowed take road said refused");
+            for (int i = 0; i < kTortTakeKinds; ++i)
+            {
+                if (std::strcmp(TortTakeWhy(i), "unknown road") == 0) Fail("T-1125: a take road has no reason text");
+                for (int j = 0; j < i; ++j) if (std::strcmp(TortTakeWhy(i), TortTakeWhy(j)) == 0) Fail("T-1125: two take roads share a reason text");
+            }
+            if (std::strcmp(TortTakeWhy(kTortTakeKinds), "unknown road") != 0) Fail("T-1125: an unknown road got a reason");
+            TortSeen rows[3];
+            int n = 0;
+            if (TortSayFirst(rows, &n, 3, 7, 100, kTortTakeAsk) != 1) Fail("T-1125: the first line of a kind was not said");
+            if (TortSayFirst(rows, &n, 3, 7, 100, kTortTakeAsk) != 0) Fail("T-1125: a repeated line was said again (the cap)");
+            if (TortSayFirst(rows, &n, 3, 7, 100, kTortTakePass) != 1) Fail("T-1125: another road for the same occupant was not said");
+            if (TortSayFirst(rows, &n, 3, 7, 101, kTortTakeAsk) != 1) Fail("T-1125: another occupant was not said");
+            if (TortSayFirst(rows, &n, 3, 8, 100, kTortTakeAsk) != -1 || n != 3) Fail("T-1125: a full table took a row");
+            if (TortSayFirst(rows, &n, 3, 7, 101, kTortTakeAsk) != 0) Fail("T-1125: a full table said a line already said");
+            if (TortKeyHash("") == 0 || TortKeyHash(0) == 0 || TortKeyHash("a@1,2") == TortKeyHash("a@1,3")) Fail("T-1125: the key hash");
+            if (CageWatchEvent(0, 0, 2, 5) != kCageEvIn || CageWatchEvent(0, 0, 2, 0) != kCageEvIn) Fail("T-1125: going in not seen");
+            if (CageWatchEvent(1, 0, 2, 5) != kCageEvIn) Fail("T-1125: from a bed into a cage not seen");
+            if (CageWatchEvent(2, 5, 0, 0) != kCageEvOut || CageWatchEvent(2, 0, 1, 0) != kCageEvOut) Fail("T-1125: leaving not seen");
+            if (CageWatchEvent(2, 5, 2, 0) != kCageEvGone) Fail("T-1125: the building gone with the occupant inside not seen");
+            if (CageWatchEvent(2, 5, 2, 6) != kCageEvIn || CageWatchEvent(2, 0, 2, 6) != kCageEvIn) Fail("T-1125: a new building not seen");
+            if (CageWatchEvent(2, 5, 2, 5) != kCageEvNone || CageWatchEvent(2, 0, 2, 0) != kCageEvNone || CageWatchEvent(0, 0, 0, 0) != kCageEvNone
+                || CageWatchEvent(1, 0, 1, 0) != kCageEvNone) Fail("T-1125: a still state said an event");
+        }
         if (SpotAnswerApply(kSpotAsked, kSpotYes) != kSpotGranted) Fail("T-674: yes did not grant");
         if (SpotAnswerApply(kSpotAsked, kSpotFull) != kSpotRefused || SpotAnswerApply(kSpotAsked, kSpotNoCopy) != kSpotRefused) Fail("T-674: full / no copy did not refuse");
         if (SpotAnswerApply(kSpotNone, kSpotYes) != kSpotNone || SpotAnswerApply(kSpotRefused, kSpotFull) != kSpotRefused) Fail("T-674: an answer with no ask out changed a row");
@@ -691,6 +733,16 @@ void t_par16_farm()
         if (SpotReleaseDue(kSpotGranted, 0) != 0 || SpotReleaseDue(kSpotAsked, 1) != 0 || SpotReleaseDue(kSpotNone, 1) != 0) Fail("T-674: a release went out for no granted spot");
         if (SpotRunnerFree(1, 0, 1) != 1 || SpotRunnerFree(0, 1, 1) != 1 || SpotRunnerFree(0, 0, 0) != 1) Fail("T-674: a runner spot was not freed");
         if (SpotRunnerFree(0, 0, 1) != 0) Fail("T-674: a runner spot in use was freed");
+        /* T-1192 (d): crafting benches and furnaces counted too, each through its own take */
+        if (SpotTakeOf(kStepCrafting) != kSpotTakeBench) Fail("T-1192 d: a crafting bench's spots not taken through its own take");
+        if (SpotTakeOf(kStepFurnace) != kSpotTakeBuilding || SpotTakeOf(kStepProduction) != kSpotTakeBuilding)
+            Fail("T-1192 d: a furnace's or a machine's spots not taken through the building's take");
+        if (SpotTakeOf(kStepNone) != kSpotTakeNone || SpotTakeOf(99) != kSpotTakeNone) Fail("T-1192 d: a building of no counted kind was counted");
+        if (SpotTakeGated(kSpotTakeBench, kSpotTakeBench) != 1 || SpotTakeGated(kSpotTakeBuilding, kSpotTakeBuilding) != 1)
+            Fail("T-1192 d: a counted building's own take was not gated");
+        if (SpotTakeGated(kSpotTakeBench, kSpotTakeBuilding) != 0 || SpotTakeGated(kSpotTakeBuilding, kSpotTakeBench) != 0
+            || SpotTakeGated(kSpotTakeNone, kSpotTakeBuilding) != 0 || SpotTakeGated(kSpotTakeNone, kSpotTakeNone) != 0)
+            Fail("T-1192 d: a take gated on a building whose own take it is not (or one not counted)");
         /* T-853 */
         if (SpotAnswerApply(kSpotGranted, kSpotRevoked) != kSpotAsked) Fail("T-853 #5: a revoke did not send a granted row back to asked");
         if (SpotAnswerApply(kSpotAsked, kSpotRevoked) != kSpotAsked || SpotAnswerApply(kSpotNone, kSpotRevoked) != kSpotNone
@@ -4491,10 +4543,34 @@ void t_p105g_settle_action()
     if (SettleAction(0, kGroundReasonNotFound, 1, 1, 0, 0) != kSgReask) Fail("P105g: gone while our PUT is in flight - ask again");
     if (SettleAction(0, kGroundReasonNotHolder, 0, 0, 0, 50) != kSgReask) Fail("P105g: not holder - always asked again, never capped");
     if (SettleAction(0, kGroundReasonNotHolder, 0, 0, 1, 0) != kSgHeldHere) Fail("P105g: not holder and ours now - the pickup stands");
-    if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 50) != kSgReask) Fail("P105g: busy - always asked again");
+    if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 50) != kSgReask) Fail("P105g: busy - asked again whatever the tries (T-1181: its own bound)");
     if (SettleAction(0, kGroundReasonUnreadable, 0, 0, 0, kReaskMax - 1) != kSgReask) Fail("P105g: unreadable under the cap - asked again");
     if (SettleAction(0, kGroundReasonUnreadable, 0, 0, 0, kReaskMax) != kSgKeepStop) Fail("P105g: unreadable at the cap - kept, counted");
     if (SettleAction(0, 0, 0, 0, 0, kReaskMax) != kSgKeepStop) Fail("P105g: an unnamed refusal at the cap - kept, counted");
+}
+/* T-1181: a pickup whose holder answers "busy" without end (a full kept table, a claim never released) ends after kBusyMax busy
+   answers as a GONE ends it - the units back out of the picker (and onto this game's ground) - never kept with the picker */
+void t_t1181_busy_bound()
+{
+    using namespace coopgshow;
+    using namespace coopground;
+    if (kBusyMax != 12) Fail("T-1181: twelve busy answers end a pickup");
+    for (int n = 1; n < kBusyMax; ++n)
+        if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, n, n) != kSgReask) { Fail("T-1181: busy answers 1..11 - asked again"); break; }
+    if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 11, 11) != kSgReask) Fail("T-1181: the 11th busy - asked again");
+    if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 12, 12) != kSgRemove) Fail("T-1181: the 12th busy - the pickup ends as a GONE (kSgRemove)");
+    if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 40, kBusyMax + 3) != kSgRemove) Fail("T-1181: past the bound - removed");
+    if (SettleAction(0, kGroundReasonBusy, 1, 1, 1, kReaskMax, kBusyMax) == kSgKeepStop) Fail("T-1181: a busy pickup never ends kept with the picker");
+    if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 0, 0) != kSgReask) Fail("T-1181: no busy count known - asked again (the old road)");
+    /* the other refusals do not read the busy count */
+    if (SettleAction(0, kGroundReasonNotHolder, 0, 0, 0, 0, kBusyMax) != kSgReask) Fail("T-1181: not holder ignores the busy count");
+    if (SettleAction(0, kGroundReasonUnreadable, 0, 0, 0, 0, kBusyMax) != kSgReask) Fail("T-1181: unreadable ignores the busy count");
+    if (SettleAction(1, kGroundReasonBusy, 0, 0, 0, 0, kBusyMax) != kSgGranted) Fail("T-1181: a yes is a yes");
+    if (CapCounts(kGroundReasonBusy) != 0) Fail("T-1181: busy still never counts toward kReaskMax");
+    /* about four minutes of re-asks before the bound (the delay after each of the first 11 busy answers) */
+    unsigned int total = 0u;
+    for (int t = 1; t < kBusyMax; ++t) total += ReaskDelayMs(t);
+    if (total < 180000u || total > 300000u) Fail("T-1181: the busy bound is about four minutes of re-asks");
 }
 void t_p105g_reask_and_due()
 {
@@ -4902,6 +4978,69 @@ void t_t1079_give_part_stack()
     if (Decide(units, 3, un, pc, count, same) != kPair || pc[0].gain != 3) Fail("T-1079 give part stack: 3 of 10 - a give of 3");
     if (PieceRoad(1, 0, 3, 3) != kPrSplit) Fail("T-1079 give part stack: the units go back onto our stack before the ask");
 }
+/* T-1184: this game's own lifted item while it is on the cursor (ownpick.h - the headers items.cpp's ItOwnLiftHoldsRecord and HdEdge call) */
+void t_t1184_own_lift_in_air()
+{
+    using namespace ownpick;
+    if (OwnLiftInAir(1, 1, 0, 1) != 1) Fail("T-1184: our own item, its row standing and the cursor naming it - in the air");
+    if (OwnLiftInAir(1, 1, 0, 0) != 0) Fail("T-1184: the cursor no longer names it (landed or destroyed) - never trust the row alone");
+    if (OwnLiftInAir(0, 1, 0, 1) != 0) Fail("T-1184: no held row (ended by a landing or the world's teardown) - nothing in the air");
+    if (OwnLiftInAir(1, 0, 0, 1) != 0) Fail("T-1184: lifted out of a container another game writes - not ours to hold or put back");
+    if (OwnLiftInAir(1, 1, 1, 1) != 0) Fail("T-1184: a HOLD went to the writer - the hold roads put it back, not this one");
+}
+void t_t1184_lift_holds_record()
+{
+    using namespace ownpick;
+    if (LiftHoldsRecord(1, 1) != 1) Fail("T-1184: the character it was lifted off - its squad record waits");
+    if (LiftHoldsRecord(1, 0) != 0) Fail("T-1184: another character's squad - its record is written");
+    if (LiftHoldsRecord(0, 1) != 0) Fail("T-1184: the item is not in the air - the record is written");
+    if (LiftHoldSay(1, 0) != 1 || LiftHoldSay(1, 1) != 0 || LiftHoldSay(0, 0) != 0) Fail("T-1184: the wait is said once per hold, never for no wait");
+    if (LiftFromThis(1, 1, 0, 0, 0) != 1 || LiftFromThis(1, 0, 0, 1, 1) != 0) Fail("T-1184: lifted off a character - that character only, never by a pack");
+    if (LiftFromThis(0, 0, 1, 1, 1) != 1 || LiftFromThis(0, 0, 1, 1, 0) != 0) Fail("T-1184: out of a pack - the member wearing it, not the others");
+    if (LiftFromThis(0, 0, 1, 0, 0) != 1) Fail("T-1184: out of a pack, packs not walked (off the main thread) - every member waits");
+    if (LiftFromThis(0, 1, 0, 1, 1) != 0) Fail("T-1184: a box's item is no squad's");
+    if (HoldLongestS(0, 1000, 4500) != 3 || HoldLongestS(7, 1000, 4500) != 7 || HoldLongestS(0, 0xFFFFF000u, 0x00001000u) != 8)
+        Fail("T-1184: the longest hold in whole seconds, across a tick wrap");
+    /* one hold walked write by write: each step is what one squad write sees (row, mine, HOLD asked, cursor, kind, member, packs walked,
+       wears); held = what the step must answer. The endings (put back, dropped, destroyed, the world gone, another member, another
+       game's item) must each answer differently from the step before them. */
+    struct Step { const char* name; int row, mine, asked, cursor, isChar, sameChar, isBag, walked, wears, held; };
+    const Step st[] = {
+        { "lifted off our bull, first write", 1, 1, 0, 1, 1, 1, 0, 0, 0, 1 },
+        { "still on the cursor, second write", 1, 1, 0, 1, 1, 1, 0, 0, 0, 1 },
+        { "another member of the squad", 1, 1, 0, 1, 1, 0, 0, 0, 0, 0 },
+        { "put back: the cursor lets it go, the row not yet ended", 1, 1, 0, 0, 1, 1, 0, 0, 0, 0 },
+        { "lifted out of the bull's pack", 1, 1, 0, 1, 0, 0, 1, 1, 1, 1 },
+        { "destroyed while held: the cursor is empty", 1, 1, 0, 0, 0, 0, 1, 1, 1, 0 },
+        { "lifted again, held", 1, 1, 0, 1, 1, 1, 0, 0, 0, 1 },
+        { "the world closed: the row ended at teardown", 0, 1, 0, 1, 1, 1, 0, 0, 0, 0 },
+        { "lifted out of another game's box: a HOLD asked", 1, 0, 1, 1, 1, 1, 0, 0, 0, 0 },
+    };
+    int said = 0, lines = 0, prevHeld = 0;
+    for (size_t i = 0; i < sizeof(st) / sizeof(st[0]); ++i)
+    {
+        const Step& p = st[i];
+        if (p.row == 0 || p.cursor == 0) said = 0;   /* a new hold starts with a fresh row (items.cpp clears recHoldSaid at the lift) */
+        const int h = LiftHoldsRecord(OwnLiftInAir(p.row, p.mine, p.asked, p.cursor), LiftFromThis(p.isChar, p.sameChar, p.isBag, p.walked, p.wears));
+        if (h != p.held) Fail(std::string("T-1184 hold walk: ") + p.name);
+        if (LiftHoldSay(h, said) != 0) { said = 1; ++lines; }
+        prevHeld = h;
+    }
+    if (lines != 3) Fail("T-1184 hold walk: said once for each of its three holds");
+    if (prevHeld != 0) Fail("T-1184 hold walk: it ends released");
+}
+/* T-1184 (owner 1467 a): an edge's own lifted item when the engine's return did not take (ownpick::EdgePlaceRoad, items.cpp
+   ItOwnLiftEdgePlace) */
+void t_t1184_edge_place_road()
+{
+    using namespace ownpick;
+    if (EdgePlaceRoad(1, 1, 0) != kEpInv) Fail("T-1184 edge: room in its container - placed there, the cursor emptied");
+    if (EdgePlaceRoad(1, 0, 1) != kEpGround) Fail("T-1184 edge: no room - on the ground at the character's feet");
+    if (EdgePlaceRoad(1, 0, 0) != kEpLeft) Fail("T-1184 edge: no room and no drop - left on the cursor, never emptied into nowhere");
+    if (EdgePlaceRoad(0, 1, 1) != kEpLeft) Fail("T-1184 edge: the cursor cannot be emptied - nothing placed (never on the cursor and in an inventory)");
+    if (EdgePlaceRoad(1, -1, 1) != kEpLeft) Fail("T-1184 edge: the put faulted - it may be placed already: never dropped as well");
+    if (EdgePlaceRoad(1, 0, -1) != kEpLeft) Fail("T-1184 edge: the drop faulted - the cursor is not emptied");
+}
 void t_t1079_give_onto_stack()
 {
     using namespace rcgive;
@@ -5225,6 +5364,168 @@ void t_t1079_net_not_paired()
     if (NetLoss(2, 3, 0) != -1 || NetLoss(2, 5, 4) != -1 || NetLoss(2, 3, 4) != 1 || NetLoss(0, 3, 0) != -1)
         Fail("T-1079 net: a fall needs the count before it; a rise or an add is no loss");
 }
+/* T-932 (rcgive.h NetSplitGive / GiveLetGoForOthers - items.cpp ItRcNetSplit and the drain's let-go pass): a hauler empties several of
+   our objects into their box in one pass. */
+void t_t932_net_split_give()
+{
+    using namespace rcgive;
+    NetPlan p;
+    /* T1866 B 383.769: seven of our objects (x1 each) merged onto their stack of 1 (1 -> 8), each rise tied to one of them */
+    NetChange h[14];
+    for (int i = 0; i < 7; ++i)
+    {
+        h[2 * i] = NetC(kSideOurs, 1, 0x10 + i, 1, 1, 0, 0);
+        h[2 * i + 1] = NetC(kSideTheirs, 2, 0x50, 2, 2 + i, 1 + i, 0x10 + i);
+    }
+    if (NetDecide(h, 14, 32, &p) != kNetUnbalanced) Fail("T-932: the hauler's seven objects are not one pair (the T1866 refusal)");
+    int part[14];
+    if (NetSplitGive(h, 14, 32, part) != 7) { Fail("T-932: the hauler's dump splits into one give per object"); return; }
+    for (int q = 0; q < 7; ++q)
+    {
+        NetChange sub[2]; int sn = 0;
+        for (int i = 0; i < 14; ++i) if (part[i] == q) sub[sn++] = h[i];
+        if (sn != 2 || NetDecide(sub, sn, 32, &p) != kNetPair || p.give != 1 || p.units != 1 || p.gone != 1 || p.srcObj != (unsigned long long)(0x10 + q))
+            Fail("T-932: each part is one give of its own object's one unit");
+    }
+    /* each part undoes only its unit off their stack (rebuilt by the part before), the last the one unit left whole */
+    if (PieceRoad(1, 1, 8, 1) != kPrMergedGive || PieceRoad(1, 1, 2, 1) != kPrMergedGive || PieceRoad(1, 1, 1, 1) != kPrWhole)
+        Fail("T-932: each part takes back its own unit; their stack is rebuilt for the next");
+    /* T1866 leg 3 shape (their box empty): our first object filed there (op 1 + op 0, the pointer pair, let go) and three merged onto it */
+    if (GiveLetGoForOthers(1, 1, 3) != 1) Fail("T-932: a give that took in three more of our objects is let go to the net");
+    const NetChange e[8] = { NetC(kSideOurs, 1, 0x31, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0x31, 0, 1, 0, 0),
+                             NetC(kSideOurs, 1, 0x32, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0x31, 2, 2, 1, 0x32),
+                             NetC(kSideOurs, 1, 0x33, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0x31, 2, 3, 2, 0x33),
+                             NetC(kSideOurs, 1, 0x34, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0x31, 2, 4, 3, 0x34) };
+    int pe[8];
+    if (NetSplitGive(e, 8, 32, pe) != 4 || pe[0] != 0 || pe[1] != 0 || pe[3] != 1 || pe[7] != 3)
+        Fail("T-932: the first object's own landing is its part; each merge goes to the object it took in");
+    else
+    {
+        const NetChange first[2] = { e[0], e[1] };
+        if (NetDecide(first, 2, 32, &p) != kNetPair || p.units != 1 || PieceRoad(1, p.gone, 4, 1) != kPrMergedGive)
+            Fail("T-932: the first object asks for its one unit and leaves the three merged onto it in their box");
+    }
+    /* units split off our stack (op 3 handing back 0x41) and a whole object, onto their stack */
+    const NetChange s2[4] = { NetC(kSideOurs, 1, 0x40, 3, 2, 0, 0x41), NetC(kSideTheirs, 2, 0x50, 2, 6, 4, 0x41),
+                              NetC(kSideOurs, 1, 0x42, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0x50, 2, 7, 6, 0x42) };
+    int ps[4];
+    if (NetSplitGive(s2, 4, 32, ps) != 2 || ps[1] != 0 || ps[3] != 1) Fail("T-932: a split's units and a whole object are two gives");
+}
+void t_t932_net_split_not()
+{
+    using namespace rcgive;
+    int part[8];
+    /* one object only - NetDecide's own road */
+    const NetChange one[2] = { NetC(kSideOurs, 1, 0x10, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0x50, 2, 2, 1, 0x10) };
+    /* an object of ours with no gain (it went elsewhere - eaten, dropped) */
+    const NetChange lone[3] = { NetC(kSideOurs, 1, 0x10, 1, 1, 0, 0), NetC(kSideOurs, 1, 0x11, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0x50, 2, 2, 1, 0x10) };
+    /* a gain tied to none of our objects */
+    const NetChange untied[4] = { NetC(kSideOurs, 1, 0x10, 1, 1, 0, 0), NetC(kSideOurs, 1, 0x11, 1, 1, 0, 0),
+                                  NetC(kSideTheirs, 2, 0x50, 2, 2, 1, 0x10), NetC(kSideTheirs, 2, 0x50, 2, 3, 2, 0x99) };
+    /* a loss on their side (a take, or a swap) */
+    const NetChange take[4] = { NetC(kSideOurs, 1, 0x10, 1, 1, 0, 0), NetC(kSideOurs, 1, 0x11, 1, 1, 0, 0),
+                                NetC(kSideTheirs, 2, 0x50, 2, 2, 1, 0x10), NetC(kSideTheirs, 2, 0x51, 1, 1, 0, 0) };
+    /* a gain the engine tied to two of our objects (our split handed back an object we also lost whole) */
+    const NetChange two[4] = { NetC(kSideOurs, 1, 0x10, 3, 1, 0, 0x11), NetC(kSideOurs, 1, 0x11, 1, 1, 0, 0),
+                               NetC(kSideTheirs, 2, 0x50, 2, 2, 1, 0x11), NetC(kSideTheirs, 2, 0x50, 2, 3, 2, 0x11) };
+    NetChange pack[4] = { NetC(kSideOurs, 1, 0x10, 1, 1, 0, 0), NetC(kSideOurs, 1, 0x11, 1, 1, 0, 0),
+                          NetC(kSideTheirs, 2, 0x50, 2, 2, 1, 0x10), NetC(kSideTheirs, 2, 0x50, 2, 3, 2, 0x11) };
+    pack[1].inPack = 1;
+    if (NetSplitGive(one, 2, 32, part) != 0 || NetSplitGive(lone, 3, 32, part) != 0 || NetSplitGive(untied, 4, 32, part) != 0
+        || NetSplitGive(take, 4, 32, part) != 0 || NetSplitGive(two, 4, 32, part) != 0 || NetSplitGive(pack, 4, 32, part) != 0)
+        Fail("T-932: only several of our objects, each landing tied to exactly one of them, are split");
+    pack[1].inPack = 0;
+    if (NetSplitGive(pack, 4, 32, part) != 2 || NetSplitGive(pack, 4, 1, part) != 0) Fail("T-932: the split respects the job cap");
+    /* the drop's own merge (the stack already in their square folded into ours), a take, a lone add: never let go */
+    if (GiveLetGoForOthers(1, 1, 0) != 0 || GiveLetGoForOthers(0, 1, 3) != 0 || GiveLetGoForOthers(1, 0, 3) != 0)
+        Fail("T-932: only a give that took in other objects of ours is let go");
+}
+/* T-932 re-check folds (rcgive.h NetSplitOrder / NetSplitDrop / PutBackRoad - items.cpp ItRcNetSplit, ItRevert's kept result and
+   ItCrossTransfer's kept road). */
+void t_t932_recheck_fold()
+{
+    using namespace rcgive;
+    /* (a) the let-go part goes first, the others keep drain order; no let-go part: drain order */
+    const int want[4] = { 2, 0, 1, 3 };
+    for (int pos = 0; pos < 4; ++pos)
+        if (NetSplitOrder(4, 2, pos) != want[pos]) Fail("T-932 re-check (a): the let-go part (2 of 4) takes its job first, then 0, 1, 3");
+    for (int pos = 0; pos < 4; ++pos)
+        if (NetSplitOrder(4, -1, pos) != pos || NetSplitOrder(4, 0, pos) != pos) Fail("T-932 re-check (a): no let-go part, or part 0 - drain order");
+    if (NetSplitOrder(4, 2, 4) != -1 || NetSplitOrder(4, 2, -1) != -1 || NetSplitOrder(3, 7, 1) != 1)
+        Fail("T-932 re-check (a): a position past the parts is none; a let-go part out of range is ignored");
+    int seen[5] = { 0, 0, 0, 0, 0 };
+    for (int pos = 0; pos < 5; ++pos) { const int q = NetSplitOrder(5, 4, pos); if (q >= 0 && q < 5) ++seen[q]; }
+    for (int q = 0; q < 5; ++q) if (seen[q] != 1) Fail("T-932 re-check (a): every part is taken exactly once");
+    /* the let-go part failing drops the whole split; a later part failing, or no let-go part, does not */
+    if (NetSplitDrop(0, 2, 0) != 1) Fail("T-932 re-check (a): the let-go part not taken drops the whole group");
+    if (NetSplitDrop(0, 2, 1) != 0 || NetSplitDrop(1, 2, 0) != 0 || NetSplitDrop(0, -1, 0) != 0)
+        Fail("T-932 re-check (a): a taken let-go part, a later part refused or a split with no let-go pair is not dropped");
+    /* (b) the put-back's result: kept stands only on a give */
+    if (PutBackRoad(1, 1) != kUndoBack || PutBackRoad(1, 0) != kUndoBack) Fail("T-932 re-check (b): put back - today's ask");
+    if (PutBackRoad(2, 1) != kUndoKept) Fail("T-932 re-check (b): a give kept in their square stands and the holder is asked to add it");
+    if (PutBackRoad(2, 0) != kUndoFailed || PutBackRoad(0, 1) != kUndoFailed || PutBackRoad(0, 0) != kUndoFailed || PutBackRoad(-1, 1) != kUndoFailed)
+        Fail("T-932 re-check (b): a take never stands as kept; a failed put-back is revertFailed");
+}
+
+/* T-932 review fold (rcgive.h LetGoOtherRise / LetGoRestore / NetSplitBatch / PieceSquareFallback / ReaskSlot, kNetSplitMax - items.cpp
+   the drain's let-go pass and its restore after the net, ItRcNetSplit, ItRcPieceEntry, ItParityAskOne). */
+void t_t932_review_fold()
+{
+    using namespace rcgive;
+    /* the let-go's 'others': T1866 leg 3 - our 0x31 filed in their empty square, 0x32..0x34 merged onto it, plus the drop's own merge */
+    const unsigned long long give = 0x31;
+    const int rOp[4] = { 2, 2, 2, 2 };
+    const unsigned long long rRel[4] = { 0x32, 0x33, 0x34, 0x31 };
+    const int oOp[4] = { 1, 1, 3, 1 };
+    const unsigned long long oObj[4] = { 0x32, 0x33, 0x40, 0x31 };
+    const unsigned long long oRel[4] = { 0, 0, 0x34, 0 };
+    int others = 0;
+    for (int k = 0; k < 4; ++k)
+        for (int k2 = 0; k2 < 4; ++k2)
+            if (LetGoOtherRise(rOp[k], 1, rRel[k], give, oOp[k2], oObj[k2], oRel[k2]) != 0) { ++others; break; }
+    if (others != 3) Fail("T-932 fold: the let-go counts each of our other objects merged onto the landed one (a split's hand-back too)");
+    if (LetGoOtherRise(2, 0, 0x32, give, 1, 0x32, 0) != 0 || LetGoOtherRise(2, 1, 0x31, give, 1, 0x31, 0) != 0
+        || LetGoOtherRise(0, 1, 0x32, give, 1, 0x32, 0) != 0 || LetGoOtherRise(2, 1, 0, give, 1, 0, 0) != 0
+        || LetGoOtherRise(2, 1, 0x32, give, 3, 0x50, 0) != 0 || LetGoOtherRise(2, 1, 0x32, give, 2, 0x32, 0) != 0)
+        Fail("T-932 fold: a rise off the landed object, the drop's own merge, an untied rise or a change that did not leave us is not counted");
+    if (GiveLetGoForOthers(1, 1, others) != 1) Fail("T-932 fold: that give is let go");
+    /* the restore: a let-go pair the net took (either half) stays let go; one it did not is paired again */
+    if (LetGoRestore(1, 0, 0) != 1 || LetGoRestore(1, 1, 0) != 0 || LetGoRestore(1, 0, 1) != 0 || LetGoRestore(1, 1, 1) != 0
+        || LetGoRestore(0, 0, 0) != 0)
+        Fail("T-932 fold: only a let-go pair no net row took is paired again");
+    /* the batch: parts take the jobs left, in drain order */
+    if (NetSplitBatch(7, 0, 160) != 7 || NetSplitBatch(7, 157, 160) != 3 || NetSplitBatch(7, 160, 160) != 0 || NetSplitBatch(7, 170, 160) != 0
+        || NetSplitBatch(0, 0, 160) != 0 || NetSplitBatch(200, 0, 160) != 160)
+        Fail("T-932 fold: a split's parts take the jobs that are left, never none because the last would not fit");
+    /* the bound: a dump of 33 objects (32 was the old cap, all lost) and of a full character (111 squares) splits whole */
+    if (kNetSplitMax < 111 || kNetGroupMax < 4 * 111) Fail("T-932 fold: the split covers a character's 111 squares");
+    static NetChange big[2 * 130];
+    static int part[2 * 130];
+    const int sizes[3] = { 33, 111, kNetSplitMax };
+    for (int s = 0; s < 3; ++s)
+    {
+        const int m = sizes[s];
+        for (int i = 0; i < m; ++i)
+        {
+            big[2 * i] = NetC(kSideOurs, 1, 0x1000 + i, 1, 1, 0, 0);
+            big[2 * i + 1] = NetC(kSideTheirs, 2, 0x50, 2, 2 + i, 1 + i, 0x1000 + i);
+        }
+        if (NetSplitGive(big, 2 * m, kNetSplitMax, part) != m || part[2 * m - 1] != m - 1) Fail("T-932 fold: a large dump splits into one give per object");
+    }
+    for (int i = 0; i < kNetSplitMax + 1; ++i)
+    {
+        big[2 * i] = NetC(kSideOurs, 1, 0x1000 + i, 1, 1, 0, 0);
+        big[2 * i + 1] = NetC(kSideTheirs, 2, 0x50, 2, 2 + i, 1 + i, 0x1000 + i);
+    }
+    if (NetSplitGive(big, 2 * (kNetSplitMax + 1), kNetSplitMax, part) != 0) Fail("T-932 fold: past the bound nothing is split (counted)");
+    /* the part-row fallback: only a split part reads the square's object, and only one of the row's record */
+    if (PieceSquareFallback(1, 1, 1, 1) != 1 || PieceSquareFallback(0, 1, 1, 1) != 0 || PieceSquareFallback(1, 0, 1, 1) != 0
+        || PieceSquareFallback(1, 1, 0, 1) != 0 || PieceSquareFallback(1, 1, 1, 0) != 0)
+        Fail("T-932 fold: a part reads the rebuilt stack in its square only when it is of the row's record");
+    /* the re-ask target: the writer when the owner rule decides a box another game holds; else the area's holder (-1) */
+    if (ReaskSlot(1, 1, 1, 3) != 3 || ReaskSlot(1, 1, 0, 3) != -1 || ReaskSlot(1, 0, 1, 3) != -1 || ReaskSlot(0, 1, 1, 3) != -1)
+        Fail("T-932 fold: a box's re-ask goes to its writer when the owner rule decides it");
+}
 void t_t1079_net_grouping()
 {
     using namespace rcgive;
@@ -5428,6 +5729,7 @@ void t_p105g_f1_own_drop_and_cap()
     if (LeftoverRemove(0, 0, 0) != 0) Fail("P105g f1: a GONE of a whole readable pickup removes nothing");
     /* p105g-r1 (re-check MED): the holder's full kept table answers BUSY - re-asked at any try count, never toward the cap */
     if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 99) != kSgReask) Fail("P105g r1: a busy (kept table full) refusal is asked again however many tries");
+    if (SettleAction(0, kGroundReasonBusy, 0, 0, 0, 99, kBusyMax - 1) != kSgReask) Fail("T-1181: the tries never end a busy pickup - only kBusyMax busy answers");
     if (PickTook(1, 10, -1) != 0) Fail("P105g r1: an unreadable quantity after the pickup is not counted as taken");
 }
 void t_p105g_f1_take_back_rank()
@@ -5653,6 +5955,8 @@ void t_m7b2f1_items_wait_for_world()
             || t == 51 || t == 52 || t == 55   /* NAME, SLAVE, HIRE wait too */
             || t == 75   /* TOWN_PRICES waits too */
             || t == 79   /* T-889 step 2: ITEM_HANDOVER waits too - a CLOSED / VERDICT arriving during a load is kept, not lost */
+            || t == 85   /* T-1061: BOX_LOCK waits too */
+            || t == 88   /* T-1242: RESEARCH_BOOK waits too */
             || t == 48 || t == 49;   /* PRISON and TREAT wait too */
         if (!item && cooplive::LiveInnerWaitsForWorld(t)) { Fail("a non-item relayed type now waits for a world"); break; }
     }
@@ -7033,7 +7337,7 @@ void t_m6_road_local_inner_types()
     for (unsigned int t = 0; t < 256; ++t)
     {
         const bool local = cooplive::LiveInnerRoadLocal(t);
-        if (local != (t == 200 || t == 201 || t == 202 || t == 3 || t == 4 || t == 56 || t == 203 || t == 204 || t == 205)) { Fail("the notebook road's own inner types are not exactly 200, 201, OWNER_MOVED 202, PING 3, PONG 4, SESSION_CLOSING 56, LOG_ASK 203, LOG_PART 204 and CHAT 205"); break; }
+        if (local != (t == 200 || t == 201 || t == 202 || t == 3 || t == 4 || t == 56 || t == 203 || t == 204 || t == 205 || t == 206)) { Fail("the notebook road's own inner types are not exactly 200, 201, OWNER_MOVED 202, PING 3, PONG 4, SESSION_CLOSING 56, LOG_ASK 203, LOG_PART 204, CHAT 205 and MAP_DOTS 206"); break; }
         if (local && cooplive::LiveInnerAccepted(t)) { Fail("a road-local inner type would also be dispatched to the session layer"); break; }
     }
 }
@@ -7842,15 +8146,10 @@ void t_m11a_live_proto_decide()
     if (LiveProtoDecide(106u, mixed, &theirs) != kLiveProtoRefuseDiffers || theirs != 107u) Fail("a world holding another number let the joiner in");
     if (LiveProtoDecide(0u, none, &theirs) != kLiveProtoRefuseUnreadable) Fail("a HELLO with no readable live protocol was admitted");
     if (LiveProtoDecide(106u, same, 0) != kLiveProtoAdmit) Fail("a null out-pointer broke the decision");
-    /* S1 fold (review M2): the host's version wins */
-    std::vector<unsigned> w106(1, 106u), t107(1, 107u);
-    if (LiveProtoJudge(106u, true, 0u, none, t107, &theirs) != kLiveProtoAdmit) Fail("the operator was refused by an out-of-date game at the title");
-    if (LiveProtoJudge(0u, true, 0u, none, none, &theirs) != kLiveProtoRefuseUnreadable) Fail("an operator with no readable live protocol was admitted");
-    if (LiveProtoJudge(107u, false, 106u, none, t107, &theirs) != kLiveProtoRefuseDiffers || theirs != 106u) Fail("a joiner was not judged against the operator's number");
-    if (LiveProtoJudge(106u, false, 106u, none, t107, &theirs) != kLiveProtoAdmit) Fail("a joiner matching the operator was refused over a game at the title");
-    if (LiveProtoJudge(107u, false, 0u, w106, t107, &theirs) != kLiveProtoRefuseDiffers || theirs != 106u) Fail("with no operator in, a joiner was not judged against the games in the world");
-    if (LiveProtoJudge(107u, false, 0u, none, t107, &theirs) != kLiveProtoAdmit) Fail("with nobody in the world, a joiner matching the title games was refused");
-    if (LiveProtoJudge(106u, false, 0u, none, t107, &theirs) != kLiveProtoRefuseDiffers || theirs != 107u) Fail("with nobody in the world, a joiner differing from the title games was admitted");
+    /* T-1158 step 7b (owner 1378): every game is judged against the world server's own built-in number - no game is an exception */
+    if (LiveProtoJudge(106u, 106u, &theirs) != kLiveProtoAdmit) Fail("a game speaking the server's own number was refused");
+    if (LiveProtoJudge(107u, 106u, &theirs) != kLiveProtoRefuseDiffers || theirs != 106u) Fail("a game differing from the server's own number was admitted (or named wrong)");
+    if (LiveProtoJudge(0u, 106u, &theirs) != kLiveProtoRefuseUnreadable) Fail("a game with no readable live protocol was admitted");
     /* S1 fold (review L6): the unreadable tail has its own sentence, and the differing one is unchanged */
     if (coopstore::StoreRefuseReasonText((unsigned)coopstore::kRefuseLiveProtocol, 61u, 61u, 106u, 0u).find("no readable game-to-game protocol") == std::string::npos) Fail("an unreadable live protocol was named as protocol 0");
     if (coopstore::StoreRefuseReasonText((unsigned)coopstore::kRefuseLiveProtocol, 61u, 61u, 106u, 107u).find("speaks game-to-game protocol 107") == std::string::npos) Fail("the differing live protocol sentence changed");
@@ -8294,6 +8593,161 @@ void t_t985_feed_held_once()
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
     if (plugin.find("coopfeed::FeedHeldEncodeAll(") == std::string::npos) Fail("the game does not send its HELD list");
     if (server.find("coopfeed::FeedHeldCoversKey(") == std::string::npos || server.find("coopfeed::IsFeedHeldKind(") == std::string::npos) Fail("the world server does not read HELD or judge a record held");
+}
+
+/* T-1039 (ported from pull request 4, outside contributor, task 3; review folds 2026-11-03): a ground hand-over line put back after a
+   restart takes only its own item (hovground.h) - by its stored name, its key, the line's own spot, then the ONLY same stack within
+   0.1 units flat; two or more wait (bounded); "not here" (the only answer that lets the holder rebuild) only with every ground item
+   walked. The regressing cases: a name made on another game (another height), a key drifted one tenth on reload, two identical stacks
+   in range, one in range, none; the key compared parsed, not as text; then the holder's action on each answer, and the wiring. */
+hovrec::GroundCand T1039Cand(float x, float z, float y, int named, int fields)
+{
+    hovrec::GroundCand c;
+    T693Key(x, z, y, &c.cur);
+    c.named = named; c.fields = fields;
+    return c;
+}
+void t_t1039_ground_exact_item()
+{
+    using namespace hovrec;
+    coopground::GroundKeyParts np;
+    /* the stored name: made on the dropper's game - this game's copy settled 1.3 units lower (GrFind's note: heights differ per game) */
+    const std::string nm = T693Key(5460.0f, -9360.0f, 10.0f, &np);
+    const long spot[3] = { 54600, -93600, 87 };   /* the line's spot, read on THIS game at the take: x, z, y tenths */
+    int idx = 9, how = 9, nearN = 9, other = 9;
+    {   /* 1. a name from another game: the exact name misses (the old exact-only lookup's regress), the spot finds it */
+        GroundCand c[1] = { T1039Cand(5460.0f, -9360.0f, 8.7f, 0, 1) };
+        if (coopground::GroundKeySame(c[0].cur, np) != 0) Fail("T-1039: the setup - this game's copy is not at the name's height");
+        if (GroundLineFind(c, 1, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfFound || idx != 0 || how != kGfBySpot)
+            Fail("T-1039: a name made on another game - found at the line's own spot");
+        if (GroundLineFind(c, 1, np, 1, 0, 1, &idx, &how, &nearN, &other) != kGfFound || how != kGfNear || nearN != 1)
+            Fail("T-1039: a name made on another game, no spot - the only same stack flat under the name is taken");
+    }
+    {   /* 2. a key drifted one tenth on reload */
+        GroundCand c[1] = { T1039Cand(5460.1f, -9360.0f, 8.7f, 0, 1) };
+        if (GroundLineFind(c, 1, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfFound || idx != 0 || how != kGfNear)
+            Fail("T-1039: a key drifted 0.1 - the only same stack within 0.1 flat is taken");
+    }
+    {   /* 3. two identical stacks in range, neither exact - WAIT, bounded */
+        GroundCand c[2] = { T1039Cand(5460.0f, -9360.0f, 9.0f, 0, 1), T1039Cand(5460.1f, -9360.0f, 8.5f, 0, 1) };
+        if (GroundLineFind(c, 2, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfWait || idx != -1 || nearN != 2)
+            Fail("T-1039: two identical stacks in range - wait, nothing taken");
+        if (GroundLookAnswer(kGfWait, 0) != kGaWait || GroundLookAnswer(kGfWait, kGroundWaitMax - 1) != kGaWait || GroundLookAnswer(kGfWait, kGroundWaitMax) != kGaUnsure)
+            Fail("T-1039: the wait is bounded at kGroundWaitMax");
+        /* the holder on each answer (hs unknown: the ground's own state): waiting keeps the line; unsure never rebuilds, never removes */
+        if (HolderAction(kStHeld, kVNot, 0, kHsUnknown, GroundLookReturn(kGaWait, 0)) != kActKeep
+            || HolderAction(kStHeld, kVHolds, 0, kHsUnknown, GroundLookReturn(kGaWait, 0)) != kActKeep)
+            Fail("T-1039: a wait neither closes nor rebuilds");
+        if (HolderAction(kStHeld, kVNot, 0, kHsUnknown, GroundLookReturn(kGaUnsure, 0)) != kActCloseNoRebuild)
+            Fail("T-1039: unsure after the bound - no rebuild over it");
+        if (HolderAction(kStHeld, kVHolds, 0, kHsUnknown, GroundLookReturn(kGaUnsure, 0)) != kActRemoveThenClose || GroundLookReturn(kGaUnsure, 1) != 0)
+            Fail("T-1039: unsure after the bound - the removal removes nothing (the line closes)");
+    }
+    {   /* 4. the line's stack gone, another player's identical one 0.3 away (the original T-1039 case): not taken; with it there, it is ours */
+        GroundCand c[2] = { T1039Cand(5460.3f, -9360.0f, 8.7f, 0, 1), T1039Cand(5460.0f, -9360.0f, 8.7f, 0, 1) };
+        if (GroundLineFind(c, 1, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfAbsent || nearN != 0)
+            Fail("T-1039: the identical neighbour 0.3 away is never taken for the line's item");
+        if (GroundLineFind(c, 2, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfFound || idx != 1 || how != kGfBySpot)
+            Fail("T-1039: with both there, the line's own stack is taken, not the neighbour");
+        if (GroundLineFind(c, 1, np, 1, spot, 0, &idx, &how, &nearN, &other) != kGfWait)
+            Fail("T-1039: a cut-short ground list never proves the item absent");
+    }
+    {   /* 5. none - absent (the rebuild's one door); an item of other fields at the spot is not it (lookNoMatch) */
+        if (GroundLineFind(0, 0, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfAbsent) Fail("T-1039: nothing there - absent");
+        if (HolderAction(kStHeld, kVNot, 0, kHsUnknown, GroundLookReturn(GroundLookAnswer(kGfAbsent, 0), 0)) != kActRebuild)
+            Fail("T-1039: absent (every item walked) lets the holder rebuild");
+        GroundCand c[1] = { T1039Cand(5460.0f, -9360.0f, 8.7f, 0, 0) };
+        if (GroundLineFind(c, 1, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfAbsent || other != 1)
+            Fail("T-1039: another stack size / quality at the spot is not the line's item");
+    }
+    {   /* 6. names: the stored name first; another name never */
+        GroundCand c[2] = { T1039Cand(5460.0f, -9360.0f, 8.7f, 2, 1), T1039Cand(5470.0f, -9360.0f, 8.7f, 1, 1) };
+        if (GroundLineFind(c, 1, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfAbsent)
+            Fail("T-1039: an item carrying another name is never the line's item, even at its spot");
+        if (GroundLineFind(c, 2, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfFound || idx != 1 || how != kGfByName)
+            Fail("T-1039: the item carrying the stored name is taken first");
+    }
+    {   /* 7. the key compared parsed, never as text: "-0" names the same place as "0" */
+        coopground::GroundKeyParts zp, sp;
+        const std::string zk = T693Key(0.0f, -9360.0f, 10.0f, &zp);
+        std::string txt = zk;
+        const size_t at = txt.rfind("@0,");
+        if (at == std::string::npos) Fail("T-1039: the setup - a key with x 0");
+        else txt.replace(at, 3, "@-0,");
+        std::memset(&sp, 0, sizeof sp);
+        if (txt == zk || coopground::GroundKeyParse(txt.c_str(), &sp) != 1) Fail("T-1039: the setup - \"-0\" parses");
+        GroundCand c[1];
+        c[0].cur = zp; c[0].named = 0; c[0].fields = 1;
+        if (GroundLineFind(c, 1, sp, 1, 0, 1, &idx, &how, &nearN, &other) != kGfFound || how != kGfByKey)
+            Fail("T-1039: a stored key written \"-0\" still finds its item by its key");
+    }
+    {   /* 8. (fold 2) per axis: a one-tenth step on BOTH axes (0.14 as a distance) is still the only same stack near the spot; 0.2 is not */
+        GroundCand c[1] = { T1039Cand(5460.1f, -9359.9f, 9.0f, 0, 1) };
+        if (GroundFlatNear(c[0].cur, 54600, -93600) != 1 || GroundFlatNear(c[0].cur, 54600, -93602) != 0 || GroundFlatNear(c[0].cur, 54598, -93600) != 0)
+            Fail("T-1039 fold 2: GroundFlatNear is |dx| <= 1 and |dz| <= 1 tenth");
+        if (GroundLineFind(c, 1, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfFound || idx != 0 || how != kGfNear || nearN != 1)
+            Fail("T-1039 fold 2: a one-tenth step on both axes - the only same stack near the spot is taken");
+        GroundCand f[1] = { T1039Cand(5460.2f, -9360.0f, 9.0f, 0, 1) };
+        if (GroundLineFind(f, 1, np, 1, spot, 1, &idx, &how, &nearN, &other) != kGfAbsent || nearN != 0)
+            Fail("T-1039 fold 2: a stack two tenths off is not the line's");
+    }
+    {   /* 9. (fold 1) a walk that is not whole - spot's zone not loaded, cut short, an unreadable zone list / zone / item, at the cap, a
+           keyless match - never proves absence: the line waits, and after the bound is "here" (no rebuild), never "absent" */
+        if (GroundWalkComplete(1, 0, 0, 10, 4096, 0) != 1) Fail("T-1039 fold 1: a whole walk of a loaded spot is complete");
+        const int bad[6][6] = { { 0, 0, 0, 10, 4096, 0 }, { 1, 1, 0, 10, 4096, 0 }, { 1, 0, 1, 0, 4096, 0 }, { 1, 0, 2, 10, 4096, 0 },
+                                { 1, 0, 0, 4096, 4096, 0 }, { 1, 0, 0, 10, 4096, 1 } };
+        for (int k = 0; k < 6; ++k)
+        {
+            const int cpl = GroundWalkComplete(bad[k][0], bad[k][1], bad[k][2], bad[k][3], bad[k][4], bad[k][5]);
+            const char* why = GroundWalkCutWhy(bad[k][0], bad[k][1], bad[k][2], bad[k][3], bad[k][4], bad[k][5]);
+            if (cpl != 0 || std::string(why) == "complete") Fail("T-1039 fold 1: a walk not whole counted complete, case " + std::to_string((long long)k));
+            /* the empty list (an unreadable zone list gives 0 items) and the neighbour-only list: wait, never absent */
+            GroundCand c[1] = { T1039Cand(5460.3f, -9360.0f, 8.7f, 0, 1) };
+            for (int n = 0; n < 2; ++n)
+            {
+                const int fd = GroundLineFind(n == 0 ? 0 : c, n, np, 1, spot, cpl, &idx, &how, &nearN, &other);
+                if (fd != kGfWait) Fail("T-1039 fold 1: a walk not whole yielded something other than WAIT, case " + std::to_string((long long)k));
+                for (int w = 0; w <= kGroundWaitMax + 2; ++w)
+                {
+                    const int ans = GroundLookAnswer(fd, w);
+                    if (ans == kGaAbsent || GroundLookReturn(ans, 0) == 0
+                        || HolderAction(kStHeld, kVNot, 0, kHsUnknown, GroundLookReturn(ans, 0)) == kActRebuild)
+                        Fail("T-1039 fold 1: a walk not whole led to absent / a rebuild, case " + std::to_string((long long)k));
+                }
+            }
+        }
+    }
+    if (GroundLookReturn(kGaFound, 0) != 1 || GroundLookReturn(kGaAbsent, 1) != 0 || GroundLookReturn(kGaWait, 1) != -1)
+        Fail("T-1039: HovLiveCopy's returns");
+
+    /* the wiring: the holder's ground look walks the ground (GrLineCands) and decides in hovground.h; the exact-only name lookup and the old
+       near lookup are gone from it; the counters are reported */
+    const std::string itx = T313ReadFile("../coop-plugin/items.cpp");
+    if (itx.find("GrLineCands(pos, stored, np, nameOk, cf, qty, &cands, &citems, &complete, &cutWhy);") == std::string::npos
+        || itx.find("const int find = hovrec::GroundLineFind(") == std::string::npos
+        || itx.find("hovrec::GroundLookAnswer(find, wt != g_hovGroundWaits.end() ? wt->second.n : 0)") == std::string::npos)
+        Fail("T-1039: the hand-over's ground look is not GrLineCands + GroundLineFind + the bounded wait");
+    if (itx.find("GrFind(l.where.c_str() + 2") != std::string::npos || itx.find("GrFindName(stored,") != std::string::npos)
+        Fail("T-1039: the hand-over's ground look still uses a name / near lookup");
+    if (itx.find("lookNoMatch,groundNear,groundWait,groundUnsure,groundAbsent,groundByKey,groundBySpot]=") == std::string::npos
+        || itx.find("+ \",\" + N(g_hovGroundNear) + \",\" + N(g_hovGroundWait) + \",\" + N(g_hovGroundUnsure) + \",\" + N(g_hovGroundAbsent)") == std::string::npos
+        || itx.find("+ \",\" + N(g_hovGroundByKey) + \",\" + N(g_hovGroundBySpot)") == std::string::npos)
+        Fail("T-1039: the T-1039 counters are not on the REPORT line beside lookNoMatch");
+    /* fold 1 wiring: the spot's zone loaded (both tests), the unread zones / items counted, the walk's completeness decided in hovground.h */
+    if (itx.find("const int spotLoaded = (ItLoadedHereLive(pos, kAreaForGround) != 0 && GrZoneLoadedAt(pos) != 0) ? 1 : 0;") == std::string::npos
+        || itx.find("GpCollect(0.0f, pos, &rows, &walked, &zones, &trunc, &unread);") == std::string::npos
+        || itx.find("*complete = hovrec::GroundWalkComplete(spotLoaded, trunc, unread, walked, 4096, keyless);") == std::string::npos
+        || itx.find("if (og != 1) { if (og < 0 && unread != 0) ++*unread; continue; }") == std::string::npos
+        || itx.find("if (ItBoxPosPodRaw(row.item, row.pos) == 0) { if (unread != 0) ++*unread; continue; }") == std::string::npos)
+        Fail("T-1039 fold 1: the ground look's completeness is not the loaded spot + the whole, readable walk");
+    const std::string ztx = T313ReadFile("../coop-plugin/zones.cpp");
+    if (ztx.find("if (!PlausiblePod(zm)) { if (unread != 0) *unread = 1; return 0; }") == std::string::npos
+        || ztx.find("if (!FillActiveZonesPod(zm, &zones)) { if (unread != 0) *unread = 1; return 0; }") == std::string::npos
+        || ztx.find("if (!PlausiblePod(content)) { if (unread != 0) ++*unread; continue; }") == std::string::npos)
+        Fail("T-1039 fold 1: LoadedGroundItems does not report an unreadable zone list / zone");
+    /* fold 3: finds by key and by spot counted and said */
+    if (itx.find("how == hovrec::kGfByKey ? &g_hovGroundByKey") == std::string::npos || itx.find("how == hovrec::kGfBySpot ? &g_hovGroundBySpot") == std::string::npos)
+        Fail("T-1039 fold 3: finds by key / by spot are not counted");
 }
 
 }   /* namespace suite */

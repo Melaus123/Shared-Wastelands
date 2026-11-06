@@ -30,7 +30,8 @@
 namespace moneyw {
 
 /* ---- message numbers and the world-server protocol (store_main.cpp and store.cpp check these at compile time) ---- */
-const unsigned kProtocol = 133;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
+const unsigned kProtocol = 145;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
+
 
 
 
@@ -140,6 +141,34 @@ inline int ParseAmount(const std::string& s, int have, int* out)
     if (v > 2147483647LL || v > (long long)(have < 0 ? 0 : have)) return kAmtTooMuch;
     *out = (int)v;
     return kAmtOk;
+}
+
+/* ---- T-478 (owner 1447 b) TEST-ONLY: the command-file lever `money [<amount>]` (money.cpp MoneyTestCommand) ----
+   kLeverShow: nothing after the verb - the money is printed; kLeverSet: *amount 0..kLeverMax; kLeverBad: anything else. */
+enum TestLever { kLeverBad = -1, kLeverShow = 0, kLeverSet = 1 };
+const long long kLeverMax = 2000000000LL;
+inline int TestLeverParse(const std::string& args, int* amount)
+{
+    *amount = 0;
+    size_t b = 0, e = args.size();
+    while (b < e && (args[b] == ' ' || args[b] == '\t')) ++b;
+    while (e > b && (args[e - 1] == ' ' || args[e - 1] == '\t' || args[e - 1] == '\r' || args[e - 1] == '\n')) --e;
+    if (b == e) return kLeverShow;
+    long long v = 0;
+    for (size_t i = b; i < e; ++i)
+    {
+        if (args[i] < '0' || args[i] > '9') return kLeverBad;
+        if (v <= kLeverMax) v = v * 10 + (args[i] - '0');
+    }
+    if (v > kLeverMax) return kLeverBad;
+    *amount = (int)v;
+    return kLeverSet;
+}
+/* the lever's one line, read back from the purse before and after */
+inline std::string TestLeverLine(long long before, long long after)
+{
+    std::ostringstream o; o << "[TEST] money before=" << before << " after=" << after;
+    return o.str();
 }
 
 /* ---- the words (owner 861: the box and the two chat lines exactly as approved; the refusal hints and the line for money that

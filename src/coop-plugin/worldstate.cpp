@@ -1408,6 +1408,7 @@ int WsDupDestroyPod(::Character* c)   // the engine's own (hooked) destroy; 1 ca
     ::GameWorld* w = coop::GameWorldPtr();
     if (!WsPlaus(w)) return 0;
     TalkWindowBeforeRemove(c);   // T-831: a conversation the dialogue window shows that names c ends first
+    TradeWindowBeforeDestroy(c, 0, 1, coopremoval::kDuplicateNamedRemoved);   // T-1230: a trade window with c closes first
     __try { w->destroy((RootObject*)c, false, coopremoval::kDuplicateNamedRemoved); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
@@ -2130,8 +2131,10 @@ std::string WorldStateBroughtBack(const std::string& sid)
     return line;
 }
 
+void PrisonOnHandedOver(unsigned int uid);   /* spawn.cpp (run T2051): a character handed over while caged here */
 void WorldStateOnOwnershipReleased(unsigned int uid, const void* character)
 {
+    if (uid != 0) PrisonOnHandedOver(uid);   /* every release road passes here: the cage scan must not take its cage as an arrest */
     void* gd = 0;
     if (uid != 0)
     {

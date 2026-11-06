@@ -22,6 +22,7 @@
 #include "resurrect.h"   /* T-556: ResurrectTick and the TEST-ONLY `resurrect` lever */
 #include "fallentab.h"   /* T-556: ReportFallenTab */
 #include "store.h"
+#include "money.h"   /* T-478: the TEST-ONLY `money` lever */
 #include "policy.h"   /* T-942: PolicyKitTick */
 #include "ownstore.h"   /* mmo1: ownsave verb, [OWNSAVE] report */
 #include "playerfaction.h"
@@ -29,6 +30,7 @@
 #include "relations.h"
 #include "playerstab.h"   /* T-545: the TEST-ONLY playerstab lever, [PLAYERS] REPORT */
 #include "chat.h"   /* the TEST-ONLY chat lever */
+#include "bugreport.h"   /* the TEST-ONLY bugpack lever */
 #include "admin.h"   /* the TEST-ONLY admintest lever */
 #include "peace.h"
 #include "towngen.h"
@@ -40,6 +42,7 @@
 #include "worldgen.h"
 #include "worldstate.h"
 #include "townver.h"   /* TownVerTick */
+#include "camp.h"      /* T-929: CampTick */
 #include "items.h"
 namespace coop { std::string RangedTestLever(const std::string& args); }   /* P104: combat.cpp */
 namespace coop { std::string GroundLineLever(const std::string& args); std::string GroundFindLever(const std::string& args); }   /* T-310: combat.cpp */
@@ -565,6 +568,7 @@ void CommandChannelTick()
     coop::WorldStateTick();    /* E5: drains the unique-NPC state changes the writers' detours queued */
     coop::StoreTick();       // P1 persistence (1 Hz inside)
     coop::TownVerTick();     /* stored town versions onto towns whose area is not loaded here; old-world seeds */
+    coop::CampTick();        /* T-929: a drawn camp proposed (or answered here in single player); the camp pass's build results */
     coop::RelationsTick();   // P3 piece 2 (link-up snapshot; live changes; the queue drain)
     coop::PlayerFactionTick(); // a rename of my faction is a state change seen here (review-p3r H1)
     coop::TownGenTick();       // P4c: the main thread id, captured here
@@ -834,13 +838,44 @@ void CommandChannelTick()
         const bool absGoal = (first == "abs");
         if (absGoal) is >> dx >> dz >> absY;
         else { std::istringstream fs(first); fs.imbue(std::locale::classic()); fs >> dx; is >> dz; }
+        // moveorder <dx> <dz> [squad] name <Name>   TEST-ONLY (T-478 T1998, owner 1464 a). The same order, but for the loaded
+        // character on THIS game whose name keys as <Name> (coopsay::TalkPersonKey; the name runs to the end of the line;
+        // `<Name>#<k>` = the k-th nearest), nearest at any distance to this game's first own player character (speech.cpp
+        // LeverNearestNamed, kLeverPickAny) - an NPC such as a captor - and with `squad` every other living member of its squad,
+        // each to its own position + (dx, dz). Refused unless this game drives that character (net::IsUidMine): another game's
+        // copy is never ordered. The pick is logged ([cmd] moveorder name), then the same lines.
         std::string mode;
         if (!absGoal) is >> mode;
         const bool squad = (mode == "squad");
-        ::Character* c = coop::GetTarget();
+        std::string nameWord = mode;
+        if (squad) is >> nameWord;
+        const bool byName = !absGoal && (nameWord == "name");
+        ::Character* c = 0;
+        bool nameRefused = false;
+        if (byName)
+        {
+            std::string words, w;
+            while (is >> w) { if (!words.empty()) words += " "; words += w; }
+            const std::string nameKey = coopsay::TalkPersonKey(words);
+            unsigned int nu = 0; float nd = -1.0f; std::string nn, why;
+            ::Character* nc = nameKey.empty() ? 0 : coop::LeverNearestNamed(nameKey, coop::kLeverPickAny, 0, 1.0e30f, &nu, &nd, &nn, &why);
+            if (nameKey.empty()) why = "usage: moveorder <dx> <dz> [squad] name <Name>   ('_' = a space)";
+            else if (nc != 0 && nu == 0) why = "the nearest such character ('" + nn + "') has no uid on this game";
+            else if (nc != 0 && !net::IsUidMine(nu)) why = "the nearest such character ('" + nn + "') is not driven by this game";
+            std::ostringstream pk;
+            pk << "[cmd] moveorder name '" << nameKey << "'";
+            if (nc != 0 && why.empty())
+            {
+                c = nc;
+                pk << " -> uid=" << nu << " '" << nn << "' dist=" << (int)nd << " (nearest to this game's first own player character)";
+            }
+            else { nameRefused = true; pk << " refused: " << why; }
+            DebugLog(pk.str());
+        }
+        else c = coop::GetTarget();
         std::vector< ::Character*> who;
         int squadCount = -1, dead = 0, deadUnread = 0;
-        if (c == 0) DebugLog("[cmd] moveorder: no target captured");
+        if (c == 0) { if (!nameRefused) DebugLog("[cmd] moveorder: no target captured"); }   /* T1998: a refused name pick has no character - nothing is ordered */
         else
         {
             who.push_back(c);
@@ -977,6 +1012,8 @@ void CommandChannelTick()
         //      |ban nobody|unban <slot>|stop   - TEST-ONLY (admin.cpp AdminTestCommand, the forms admincmd.h TestParse): the admin
         // password set to a fixed made-up sample through the MULTIPLAYER window's DONE road, the PLAYERS tab's MAKE / REMOVE ADMIN
         // road, or one fixed command line through the road a typed '/' chat line takes. No free text; the password is never logged.
+        // T-1205: admintest typeline <words> - ANY line through that same road (AdminTyped, as the chat box's Enter), name:<uid> /
+        // player:<slot> / q:<text> / hash:<text> words filled in (admincmd.h LineWordOf); the line is logged, a /login line's is not.
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::AdminTestCommand(rest));
         finished = true;
@@ -1280,6 +1317,12 @@ void CommandChannelTick()
     {
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::StoreAccessTest(Trim(rest)));
+        finished = true;
+    }
+    else if (verb == "netthrottle")   /* T-1168 (owner 1425 a) TEST-ONLY: netthrottle off|on - off = every live ENet link of this game keeps ENet's packet throttle at its full value (acceleration 32, deceleration 0, the throttle set to its limit), on = ENet's default terms back (src/common/netthrottle.h); the hosting game also writes netthrottle.request for its world server (store.cpp StoreNetThrottle) */
+    {
+        std::string w; is >> w;
+        WriteStatus(coop::StoreNetThrottle(w));
         finished = true;
     }
     else if (verb == "worldaway")   /* T-546 step 8 TEST verb: worldaway <seconds 5-600> - this game's world-server link closed here and the
@@ -1670,6 +1713,15 @@ void CommandChannelTick()
         std::string rest; std::getline(is, rest); rest = Trim(rest);
         WriteStatus(coop::PlatoonKill(rest) ? "ok platoonkill" : "error platoonkill"); finished = true;
     }
+    else if (verb == "bugpack")
+    {
+        // bugpack   - TEST-ONLY: a bug report packed exactly as SEND packs one (this launch's logs and the two before, Kenshi's
+        // crash file, the world server's log, the launches kept in the crashes folder), but asking no nearby game and sent to
+        // nobody; the worker thread writes one [BUGREPORT] TEST PACK line naming every file in the zip with its sizes. Nothing on
+        // screen. (The UI driver's bugreport / bugsend really post a report.)
+        WriteStatus(coop::BugReportTestPack() ? "ok bugpack" : "error bugpack (a test pack is still being made, or no worker thread - see the log)");
+        finished = true;
+    }
     else if (verb == "uipreview")
     {
         // uipreview <what>   - TEST-ONLY (uishot, owner 2026-09-27): show one co-op screen for a harness screenshot, through
@@ -1704,6 +1756,16 @@ void CommandChannelTick()
         // title screen. Then `uiclick engine:SaveGameButton` reaches the real Save window.
         std::string rest; std::getline(is, rest); rest = Trim(rest);
         WriteStatus(coop::UiMenuCommand(rest) ? "ok uimenu" : "error uimenu");
+        finished = true;
+    }
+    else if (verb == "buildmode")
+    {
+        // buildmode enter | buildmode leave   - TEST-ONLY (T-927): build mode entered through the main bar's BUILD button's own
+        // handler and left through the Esc key's own build-mode cancel (store.cpp BuildModeCommand), no injected input (F010) -
+        // the roads that reach build mode's two togglePause calls. Refused with no world, enter with build mode on, leave with it
+        // off. Logs `[TIME] T-927 TEST-ONLY buildmode ..` with the engine's build-mode flag before and after.
+        std::string rest; std::getline(is, rest); rest = Trim(rest);
+        WriteStatus(coop::BuildModeCommand(rest) ? "ok buildmode" : "error buildmode");
         finished = true;
     }
     else if (verb == "chat")
@@ -1797,6 +1859,10 @@ void CommandChannelTick()
         /* T-1079: `itemtest rcgive <boxKeyPart|peer> <sid|any> [all] [take]` - TEST-ONLY: a give / take without the cursor, through the engine's right-click;
            `itemtest rcgive <boxKeyPart> <sid|any> [<n>|all] [take] click` - the box opened by a real click order, the calls made as the shift-click loop makes them. */
         const bool rcGive = (rest.compare(0, 6, "rcgive") == 0 && (rest.size() == 6 || rest[6] == ' '));
+        /* T-1191: `itemtest lclick <boxKeyPart> <uid|near> [pack] [<d>]` - TEST-ONLY: the character moved beside the box, then the player's left click on it. */
+        const bool lClick = (rest.compare(0, 6, "lclick") == 0 && (rest.size() == 6 || rest[6] == ' '));
+        /* T-1191: `itemtest bfac <boxKeyPart>` - TEST-ONLY, read-only: the faction the box carries on this game. */
+        const bool bFac = (rest.compare(0, 4, "bfac") == 0 && (rest.size() == 4 || rest[4] == ' '));
         /* T-1079: `itemtest stackgive <boxKeyPart> <sid> <n>` - TEST-ONLY: n units off our character onto the box's stack of that record, no window. */
         const bool stackGive = (rest.compare(0, 9, "stackgive") == 0 && (rest.size() == 9 || rest[9] == ' '));
         std::vector<std::string> tok; std::string t;
@@ -1836,6 +1902,8 @@ void CommandChannelTick()
         else if (ownDrift) WriteStatus(coop::ItemTestDriftCommand(Trim(rest.substr(5))));   /* T-172 disp */
         else if (ownerFull) WriteStatus(coop::ItemTestOwnerFullCommand(Trim(rest.substr(9))));   /* T-608 (c) */
         else if (rcGive) WriteStatus(coop::ItemTestRcGiveCommand(Trim(rest.substr(6))));   /* T-1079 */
+        else if (lClick) WriteStatus(coop::ItemTestLClickCommand(Trim(rest.substr(6))));   /* T-1191 */
+        else if (bFac) WriteStatus(coop::ItemTestBFacCommand(Trim(rest.substr(4))));   /* T-1191 */
         else if (stackGive) WriteStatus(coop::ItemTestStackGiveCommand(Trim(rest.substr(9))));   /* T-1079 */
         else WriteStatus(coop::ItemTest(nm, sid, cnt) ? "ok itemtest" : "error itemtest");
         finished = true;
@@ -2099,6 +2167,19 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::ItemRefuseCommand(Trim(arg))); finished = true;
     }
+    else if (verb == "handtest")
+    {
+        // handtest fill <otherSlot> <n 1-256> [dst|src]   - T-1181 TEST-ONLY lever: n open hand-over lines naming that other player are
+        // written to pp.handover through the real write, so the caps apply (64 open lines per other player - peerFull; 256 lines - lineFull).
+        // The lines name holder slot 7357 (no real hand-over does): they stay open and no item is ever built from them. dst (default) =
+        // receiver `in` lines, src = holder `held` lines. A slot no player holds counts as well (never asked about).
+        // handtest unread <n 1-256>   - n lines this build cannot read appended to pp.handover; the load path then moves them to
+        // pp.handover.unread at once (unreadMoved). handtest count   - both files' lines by role, state and other player (read only).
+        // handtest clear-test   - the lever's own lines taken out of both files. Refused with no records store open. One [HAND] handtest
+        // line each (coop::HandTestCommand).
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::HandTestCommand(Trim(arg))); finished = true;
+    }
     else if (verb == "platoonwipe")
     {
         std::string rest; std::getline(is, rest); rest = Trim(rest);
@@ -2290,6 +2371,14 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BoxInfoCommand(Trim(arg))); finished = true;
     }
+    else if (verb == "boxput")
+    {
+        // boxput <buildingKeyPart> <item sid> [count 1..100]   - T-1242 TEST-ONLY (decision 1492 a; items.cpp BoxPutCommand): items
+        // put straight into this game's own building's storage (furniture too) by the engine's own add - no window, no character;
+        // the mod's own sync carries them. Prints the full key, the owner and the items before / after.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::BoxPutCommand(Trim(arg))); finished = true;
+    }
     else if (verb == "restocknow")
     {
         // restocknow <x>,<y>   - par2 TEST-ONLY lever (docs/design-loot2.md rev 2, 4A "PAR-2 push"): at the next K2 safe
@@ -2306,6 +2395,8 @@ void CommandChannelTick()
         // wandering trader caravan (vanilla squad template 'Caravan' 1161-gamedata.base) is made `dist` world units (default 300,
         // about 30 m) beside this game's player through the engine's own RootObjectFactory::createRandomSquad 0x582F80, so its
         // members and its first stocking run through the mod's own hooks. [TRADER] spawn / spawn MISSED lines.
+        // traderspawn [dist] animals - T-478 TEST-ONLY: the same with the Nomads' animal seller squad 'Merchant Nomads'
+        // 63537-rebirth.mod (leader 'Nomad Animal Trader', its animals) instead of the caravan (items.cpp kTraderSpawnAnimalsTemplateSid).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::TraderSpawnCommand(Trim(arg))); finished = true;
     }
@@ -2335,6 +2426,8 @@ void CommandChannelTick()
         //                                        (vt +0x38 -> CharacterHuman::dropItem 0x5C9CB0), so the real detour fires.
         // groundtest dropsid <sid>            - the same, for the first item of that base sid anywhere in the inventory.
         // groundtest pick <sid> [<r>]         - a PICKUP (TaskType 3) order on the nearest ground item of that sid within r (default 10).
+        // groundtest work <ownUid> <sid> <task> [<r>] - T-1150 TEST lever: own character <ownUid> gets the engine's order of that task
+        //                                        type (1..300) on the nearest ground item of that sid within r (default 30) of it.
         // groundtest takedelay <s 0..60> [<n 1..8>] - p105g T799 TEST lever: as the area's holder, the next n ground TAKEs
         //                                        another game sends are held s seconds unprocessed, then served (0 = off).
         // groundtest animaldrop <uid> [<sid>|- [<r>]] - ground5 fold 2 TEST lever: the nearest animal this game owns within r (default
@@ -2344,6 +2437,45 @@ void CommandChannelTick()
         //                                        giveItem(dropOnFail) until its full inventory refuses one - the overflow road.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::GroundTestCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "areaholder")
+    {
+        // areaholder <x>,<y>   - T-1221 (TEST-ONLY, read-only): who holds that area as this game's area map says. Reply exactly
+        //   ok areaholder sector=<x>,<y> mine=<1|0|-1> holderSlot=<n> fresh=<0|1>
+        // mine (zones.cpp MineHeldTS): 1 = the map's owner column for that area is THIS game's slot; 0 = it is another slot or
+        //   nobody, or the area is frozen (MineHeldTS answers -2 when the holder is a player not in the world - so not this game);
+        //   -1 = no fresh map (none received, or the last is older than 5 s).
+        // holderSlot (zones.cpp AreaHolderSlotAgeTS): the slot the map names as the area's holder; -1 = unknown (no fresh map, no row,
+        //   or the row names nobody); -2 = frozen (the holder is a player who is not in the world).
+        // fresh (AreaHolderSlotAgeTS's mapFresh): 1 = the map is no older than 5 s; 0 = stale or none (holderSlot -1 then means
+        //   "unknown", not "nobody").
+        // The two are read under two separate takes of the area lock (the holder first), so a map arriving between them can make
+        //   one reply disagree with itself once. x and y are each 0..63; anything else -> `error areaholder`.
+        std::string arg; std::getline(is, arg); arg = Trim(arg);
+        int ax = -1, ay = -1;
+        {   /* <x>,<y>: one or two digits each, nothing else */
+            const std::string::size_type comma = arg.find(',');
+            const std::string xs = (comma == std::string::npos) ? std::string() : arg.substr(0, comma);
+            const std::string ys = (comma == std::string::npos) ? std::string() : arg.substr(comma + 1);
+            int okDigits = (!xs.empty() && xs.size() <= 2 && !ys.empty() && ys.size() <= 2) ? 1 : 0;
+            for (size_t i = 0; okDigits != 0 && i < xs.size(); ++i) if (xs[i] < '0' || xs[i] > '9') okDigits = 0;
+            for (size_t i = 0; okDigits != 0 && i < ys.size(); ++i) if (ys[i] < '0' || ys[i] > '9') okDigits = 0;
+            if (okDigits != 0) { ax = std::atoi(xs.c_str()); ay = std::atoi(ys.c_str()); }
+        }
+        if (ax < 0 || ax > 63 || ay < 0 || ay > 63)
+            WriteStatus("error areaholder: usage areaholder <x>,<y> (each 0..63)");
+        else
+        {
+            coop::Sector sec; sec.x = ax; sec.y = ay;
+            int fresh = 0;
+            const int holder = coop::AreaHolderSlotAgeTS(sec, &fresh);
+            const int m = coop::MineHeldTS(sec);
+            const int mine = (m == 1) ? 1 : ((m == -1) ? -1 : 0);
+            std::ostringstream ab;
+            ab << "ok areaholder sector=" << ax << "," << ay << " mine=" << mine << " holderSlot=" << holder << " fresh=" << (fresh != 0 ? 1 : 0);
+            WriteStatus(ab.str());
+        }
+        finished = true;
     }
     else if (verb == "addrreuse")
     {
@@ -2383,6 +2515,10 @@ void CommandChannelTick()
         // the body's own game keeps or breaks the carry (MSG_CARRY_BREAK). `carried` reads one character's carry state.
         // capturetest carry <carrierUid> name <name>   - TEST-ONLY: the body picked by name (a down character within 300 units of
         // the carrier, this game's own allowed); the same pickupObject.
+        // capturetest cage <carrierUid> [near | <cageKeySubstring>] [type=<n>]   - T-980 TEST-ONLY lever (spawn.cpp
+        // CageOrderTestCommand): this game's own carrier gets the engine's right-click put-in-cage order (task 108 PUT_IN_CAGE)
+        // on the nearest cage with a free slot (or the one whose key holds the substring); logs the body, the cage and whether
+        // the cage's owner faction IS this game's player faction. [ARREST] capturetest cage lines.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::CaptureTestArm(Trim(arg))); finished = true;
     }
@@ -2427,7 +2563,8 @@ void CommandChannelTick()
            here); near NPC = the nearest living non-player character with a Dialogue. Logs what started; nothing else. */
         std::string arg; std::getline(is, arg);
         /* P25 T729: `talktest nearestname <npc name> <targetUid> [event] [copy | mine]` (P25 T729b) - the NPC picked by name when the command runs
-           (speech.cpp TalkTestNameArm; waits up to 60 s for it to load) */
+           (speech.cpp TalkTestNameArm; waits up to 60 s for it to load); with a last word `walk` the target (this game's own
+           character) is given the engine's own Talk order on the NPC and walks there, instead of a direct sendEvent */
         const std::string ta = Trim(arg);
         const bool byName = (ta == "nearestname" || ta.compare(0, 12, "nearestname ") == 0 || ta.compare(0, 12, "nearestname\t") == 0
                              || ta == "nearestfaction" || ta.compare(0, 15, "nearestfaction ") == 0 || ta.compare(0, 15, "nearestfaction\t") == 0);   /* nearestfaction: the same pick by faction name */
@@ -2435,7 +2572,14 @@ void CommandChannelTick()
            player's stand-in faction, speech.cpp TkPlayerSpeaker) within <radius> (default 3000) of this game's first own player
            character, the target that own character, event 1 - the call a click on that character makes (speech.cpp TalkTestPeerArm) */
         const bool byPeer = (ta == "nearestpeer" || ta.compare(0, 12, "nearestpeer ") == 0 || ta.compare(0, 12, "nearestpeer\t") == 0);
-        WriteStatus(byPeer ? coop::TalkTestPeerArm(ta) : (byName ? coop::TalkTestNameArm(ta) : coop::TalkTestArm(ta))); finished = true;
+        /* T-858: `talktest nearestcarrier <act> <targetUid> [event] [copy | mine]` - the nearest NPC whose talk holds a line with that
+           dialogue action, an NPC-side action and no hire (speech.cpp TalkTestCarrierArm); `talktest actresultdrop` - on the NPC's
+           game the next paid line's ACT_RESULT is dropped once (speech.cpp TalkActResultDropArm). Both TEST-ONLY. */
+        const bool byCarrier = (ta == "nearestcarrier" || ta.compare(0, 15, "nearestcarrier ") == 0 || ta.compare(0, 15, "nearestcarrier\t") == 0);
+        if (ta == "actresultdrop") WriteStatus(coop::TalkActResultDropArm());
+        else if (byCarrier) WriteStatus(coop::TalkTestCarrierArm(ta));
+        else WriteStatus(byPeer ? coop::TalkTestPeerArm(ta) : (byName ? coop::TalkTestNameArm(ta) : coop::TalkTestArm(ta)));
+        finished = true;
     }
     else if (verb == "talksight")
     {
@@ -2462,7 +2606,7 @@ void CommandChannelTick()
     }
     else if (verb == "talkprompt")
     {
-        /* talkprompt [npcUid|near] [targetUid|near] [lineSid|auto] | talkprompt answer <0..9> | talkprompt close   - TEST-ONLY
+        /* talkprompt [npcUid|near|name:<Name>[#k]] [targetUid|near] [lineSid|auto] | talkprompt answer <0..9> | talkprompt close   - TEST-ONLY
            lever (P26 stages 1-3, speech.cpp): at the K2 safe point the engine's own Dialogue::startPlayerConversation 0x683890 is
            called THROUGH its hook (the stage-2 intercept) for an NPC this game owns toward the other player's character (a copy
            here); on the addressed game `answer k` clicks reply k of the mirrored window through the engine's replyClicked entry
@@ -2511,6 +2655,15 @@ void CommandChannelTick()
            the test every hire road refuses by) within <radius> (default 3000) of my first player character, then the same hire road. */
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::HireTestArm(Trim(arg))); finished = true;
+    }
+    else if (verb == "givetest")
+    {
+        /* givetest offer <slot> <uid> [<uid>..] | givetest answer accept|refuse | givetest show [<slot>]   - TEST-ONLY lever (T-1135,
+           hire.cpp): the offer the PLAYERS tab's GIVE box sends (the button's own live checks), the offer box's ACCEPT / REFUSE on the
+           first offer waiting here, and [GIVE] show lines (the button for <slot>, the offers in and out). Armed here, run at the K2
+           safe point. */
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::GiveTestArm(Trim(arg))); finished = true;
     }
     else if (verb == "buildtest")
     {
@@ -2614,6 +2767,14 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::ShopRestockDueCommand(Trim(arg))); finished = true;
     }
+    else if (verb == "money")
+    {
+        // money [<amount>]   - TEST-ONLY (T-478, owner 1447 b): with an amount, THIS game's player faction's money becomes <amount>
+        // through the game's own Ownerships::takeMoney on the T-810 money road (only when money may change; pp.money written at
+        // once); alone, the money is printed. One line [TEST] money before=<n> after=<n> (money.cpp MoneyTestCommand). Main thread.
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::MoneyTestCommand(Trim(rest))); finished = true;
+    }
     else if (verb == "keepermoney")
     {
         // keepermoney <homeKey> <squad> <amount>   - TEST: on the holder of the shop's area, the money of a keeper squad of that shop
@@ -2667,13 +2828,20 @@ void CommandChannelTick()
         // jobtest stop <characterUid>   - T-610 TEST-ONLY: this game's own character's orders dropped (dropAllOrders 0x506A10), its order
         // target reset (0x506AA0), its standing jobs dropped (0x5067F0) and its current task ended (the task's end flag); ok only when
         // the order list and the standing job list both read empty after.
+        // jobtest craft <buildingKey> <productSid> [count]   - T-1192 TEST-ONLY: that product added `count` times (default 1) to a
+        // crafting bench's craft list as the crafting window's recipe click does (CraftQueueAdd 0x2B5C60, which sets the recipe
+        // and switches its inputs on when none is set); the list count, recipe, state, each section's on/off byte and item count
+        // before and after; refused when the building is not a CraftingBuilding or the sid is no record here.
+        // jobtest click <characterUid> <buildingKey> [near=<x>,<z>]   - T-1191 TEST-ONLY: this game's own character gets the DIRECT
+        // order a player's right click on the building gives (the building's own task rule, giveOrder without Shift, old orders
+        // cleared), so it walks there and works; [JOB] jobtest click line with the task, the click point and the character's position.
         // Each prints the machine's name, product, inputs and sections. [JOB] lines.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::JobTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "cagetest")
     {
-        // cagetest <copyUid> nearest   - P43 TEST-ONLY lever (spawn.cpp CageTestCommand): this game's engine cages the other game's
+        // cagetest <copyUid> nearest [faction=<name>] [hours=<n>]   - P43 / T-478 TEST-ONLY lever (spawn.cpp CageTestCommand): this game's engine cages the other game's
         // character's copy in the nearest free cage at the K2 safe point (setPrisonMode, as a guard's task); PrisonWatchCopies then
         // sends the owner MSG_PRISON IN as for a guard's caging. [ARREST] cagetest lines.
         std::string arg; std::getline(is, arg);
@@ -2732,6 +2900,7 @@ void CommandChannelTick()
     else if (verb == "renametest")
     {
         // renametest <name> [uid]   - TEST-ONLY (T-1153, spawn.cpp RenameTestCommand): this game's own character <uid> (none given:
+        // T-1228: `renametest <name> bought` = the newest character a T478 animal / slave buy put in this game's player faction;
         // the first selected one) renamed
         // through Character::setName's hooked entry (NameSetOwn), the setter the name sync hooks; the other games apply it
         // (NameApplyToCopy). One `[NAME] ok renametest uid=.. name=.. was=..` line.
@@ -2762,7 +2931,9 @@ void CommandChannelTick()
     }
     else if (verb == "locktest")
     {
-        // locktest read <uid> | locktest open|close <uid> shackles|cage | locktest escape <uid>   - P42 TEST-ONLY lever (spawn.cpp
+        // locktest read <uid|near> | locktest open|close <uid|near> shackles|cage | locktest escape <uid|near>   - P42 TEST-ONLY lever
+        // (spawn.cpp; near = the nearest living caged character this game runs within 300 units of its player character, its uid and
+        // name in the answer)
         // LockTestCommand): read a prisoner's shackle and cage locks here (and the owner's word known here); open or close one as a
         // pick's result at the K2 safe point (on a copy: a rescuer's pick, asked of the owner); order our caged character to escape
         // (GET_OUT_OF_CAGE_ESCAPE). [LOCK] lines.
@@ -2778,8 +2949,10 @@ void CommandChannelTick()
     }
     else if (verb == "doortest")
     {
-        // doortest open|close|lock|npclock|show <nearest|last|key> | doortest show held   - T-160 (TEST-ONLY): this game moves one door
-        // the way its own world would (openDoor / closeDoor / the lock button / the NPC lock action), or reads one; doors.cpp
+        // doortest open|close|lock|npclock|show|break|mend <nearest|next|last|gate|key> | doortest show held   - T-160 / T-1141
+        // (TEST-ONLY): this game moves one door the way its own world would (openDoor / closeDoor - an NPC's use of a gate too - the
+        // lock button, the NPC lock action, the engine's door hit until it breaks, the engine's repair step until it mends), or reads
+        // one; `gate` = the nearest gate. break / mend only where the mod's own noticing writes the door's record. doors.cpp
         // DoorTestCommand. [DOORTEST] lines.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::DoorTestCommand(Trim(arg))); finished = true;
@@ -2846,14 +3019,14 @@ void CommandChannelTick()
     }
     else if (verb == "timemode")
     {
-        // timemode [fixed|consensus] - E40 / decision 45. The hosting option that decides whose speed setting
+        // timemode [fixed|admin|consensus|vote|locked] - E40 / decision 45. The hosting option that decides whose speed setting
         // sets the world's pace. Kept by the notebook process in options.txt beside `basepolicy`, accepted only
         // from the game the notebook calls the session authority, and handed back to every game - so a value
         // takes effect here only after it has been stored there, and there is one enforcement point that
         // outlives any single game. With no argument this reports what the notebook's CLOCK last said.
         std::string mode; is >> mode;
         if (mode.empty()) WriteStatus(std::string("ok timemode ") + coop::TimeModeName());
-        else if (mode != "fixed" && mode != "admin" && mode != "consensus") WriteStatus("error timemode: admin|fixed|consensus");   /* admin: GAME SPEED CONTROL Admin only, stored as fixed */
+        else if (mode != "fixed" && mode != "admin" && mode != "consensus" && mode != "vote" && mode != "locked") WriteStatus("error timemode: admin|fixed|consensus|vote|locked");   /* admin: GAME SPEED CONTROL Admin only, stored as fixed */
         else if (!coop::StoreSendOption("timemode", mode == "admin" ? std::string("fixed") : mode)) WriteStatus("error timemode: no notebook link - the option is kept by SharedWastelandsServer.exe, not by this game");
         else WriteStatus("ok timemode sent");
         finished = true;
@@ -3227,11 +3400,52 @@ void CommandChannelTick()
     }
     else if (verb == "tasks")
     {
+        // tasks <uid>  - the character's goal, position, order lists and animation ([M1] tasks line). Read-only.
+        // tasks name <Name>  - TEST-ONLY (T-478 T1998): the uid is the loaded character on THIS game whose name keys as <Name>
+        // (coopsay::TalkPersonKey: case-insensitive, '_' and a space alike; the name runs to the end of the line; `<Name>#<k>` =
+        // the k-th nearest), nearest at any distance to this game's first own player character (speech.cpp LeverNearestNamed,
+        // kLeverPickAny: own or another game's copy, standing, down or dead), because a captor's or a slave's uid changes each run.
+        // The pick is logged ([M1] tasks name), then the same [M1] tasks line. Read-only.
+        std::string rest; std::getline(is, rest);
+        std::istringstream ws(rest);
+        std::string w0;
+        ws >> w0;
         unsigned int uid = 0;
-        is >> uid;
-        if (uid == 0)
+        if (w0 != "name") { std::istringstream us(w0); us >> uid; }
+        if (w0 == "name")
         {
-            DebugLog("[cmd] usage: tasks <uid>");
+            std::string words, w;
+            while (ws >> w) { if (!words.empty()) words += " "; words += w; }
+            const std::string nameKey = coopsay::TalkPersonKey(words);
+            float nd = -1.0f; std::string nn, why;
+            if (nameKey.empty())
+            {
+                DebugLog("[cmd] usage: tasks <uid> | tasks name <Name>   ('_' = a space)");
+                WriteStatus("error tasks usage");
+            }
+            else if (coop::LeverNearestNamed(nameKey, coop::kLeverPickAny, 0, 1.0e30f, &uid, &nd, &nn, &why) == 0)
+            {
+                DebugLog("[M1] tasks name '" + nameKey + "' refused: " + why);
+                WriteStatus("error tasks name: " + why);
+            }
+            else if (uid == 0)
+            {
+                DebugLog("[M1] tasks name '" + nameKey + "' refused: the nearest such character ('" + nn + "') has no uid on this game");
+                WriteStatus("error tasks name: the character has no uid");
+            }
+            else
+            {
+                std::ostringstream pk;
+                pk << "[M1] tasks name '" << nameKey << "' -> uid=" << uid << " '" << nn << "' dist=" << (int)nd
+                   << " (nearest to this game's first own player character)";
+                DebugLog(pk.str());
+                coop::ReportTask(uid);
+                WriteStatus("ok tasks");
+            }
+        }
+        else if (uid == 0)
+        {
+            DebugLog("[cmd] usage: tasks <uid> | tasks name <Name>");
             WriteStatus("error tasks usage");
         }
         else
@@ -3846,6 +4060,46 @@ void CommandChannelTick()
                 WriteStatus("ok camfollow");
             }
         }
+        finished = true;
+    }
+    else if (verb == "claimskip")
+    {
+        /* TEST-ONLY lever (DEV build, T-1222 elimination run): claimskip off | on | show - off = the setFaction detour's claim skip does
+           not act, so the worker job set-up's claim of a world rock runs as in single player (the rock becomes the miner's faction's);
+           on = normal (the default); show = the state. One [MINE] claimskip line each (build.cpp ClaimSkipLever). */
+        std::string a;
+        is >> a;
+        if (a == "off" || a == "on" || a == "show")
+        {
+            const int on = coop::ClaimSkipLever(a == "off" ? 0 : (a == "on" ? 1 : -1));
+            WriteStatus(std::string("ok claimskip ") + (on == 1 ? "on" : "off"));
+        }
+        else
+        {
+            DebugLog("[MINE] claimskip refused: usage claimskip off | on | show");
+            WriteStatus("error claimskip: usage claimskip off | on | show");
+        }
+        finished = true;
+    }
+    else if (verb == "npcsay")
+    {
+        /* T-978 TEST-ONLY lever npcsay (DEV build, owner 1463 a): npcsay <Name>[#k] [| <text>] - the NPC of that name this game
+           runs says one line as a speech bubble at the next safe point, through the engine's own Dialogue::say (the call the game
+           makes for an NPC's ambient lines); the line goes to the other game as any of this game's NPC lines does. Refused on a
+           game that holds the NPC as a copy. [TALK] T-978 npcsay lines (speech.cpp NpcSayArm / NpcSayDrain). */
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::NpcSayArm(Trim(arg)));
+        finished = true;
+    }
+    else if (verb == "npcmoney")
+    {
+        /* T-478 step 5 TEST-ONLY lever npcmoney (DEV build, T2017): npcmoney <amount> <uid | name:<Name> | spawned:<Template>[#k]> - the
+           money of the NPC squad that character is in becomes <amount> on the game that runs the squad's formal leader (a copy is
+           refused: the runner's game sets it); the squad's announcement carries it to the other game's copy. [TEST] npcmoney line
+           (items.cpp NpcMoneyCommand). */
+        long long amount = -1;
+        if (!(is >> amount)) WriteStatus("error npcmoney: usage npcmoney <amount> <uid | name:<Name> | spawned:<Template>[#k]> - nothing set");
+        else { std::string rest; std::getline(is, rest); WriteStatus(coop::NpcMoneyCommand(amount, Trim(rest))); }
         finished = true;
     }
 #endif

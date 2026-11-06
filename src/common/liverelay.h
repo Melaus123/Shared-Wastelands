@@ -224,13 +224,18 @@ const unsigned int kInnerLogAsk = 203, kInnerLogPart = 204;
    per other member in the world), src/common/chatwire.h. Read by the receiving game's store layer and handed to chat.cpp;
    it touches no engine state. */
 const unsigned int kInnerChat = 205;
+/* T-930 (game-to-game protocol 198, shipped at 201 after the merge with main): teammates' characters on the world map - OPEN / CLOSE from the viewer, DOTS from each
+   teammate, every one route SLOT (src/common/mapdots.h). Read by the receiving game's store layer and handed to mapdots.cpp;
+   it touches no engine state. */
+const unsigned int kInnerMapDots = 206;
 inline bool LiveInnerRoadLocal(unsigned int innerType)
 {
     return innerType == kInnerLiveProbe || innerType == kInnerCatchupEnd
         || innerType == kInnerPing || innerType == kInnerPong || innerType == kInnerHostClosing   /* M11a S3 */
         || innerType == kInnerOwnerMoved   /* M7a2 item 3 [m7a2-lr2] */
         || innerType == kInnerLogAsk || innerType == kInnerLogPart   /* T-461 */
-        || innerType == kInnerChat;
+        || innerType == kInnerChat
+        || innerType == kInnerMapDots;   /* T-930 */
 }
 
 /* M7a (T-197 piece 7a; game-to-game protocol 108; owner decisions 54(a), 57) - THE CHARACTER STREAM ON THE NOTEBOOK ROAD.

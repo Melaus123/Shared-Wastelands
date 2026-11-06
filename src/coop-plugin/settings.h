@@ -22,6 +22,11 @@ int SettingsModList(coopmods::ModList* out);
 // moment this game is the world's authority with the record in hand, and written over the host's live values at its
 // load (after the S2 apply) and world-live edge. Returns 1 when sent now, 0 when kept for later.
 int SettingsHostChoices(const std::vector<std::pair<std::string, std::string> >& kv);
+// GAME OPTIONS' DONE in a running world: an admin's changed rows to the world server NOW as one OPTIONS message, or dropped (logged) -
+// never held for a later send, never written over this game's live values, the HOST screen's waiting rows untouched. 1 = sent.
+int SettingsWorldChange(const std::vector<std::pair<std::string, std::string> >& kv);
+// Moves each time an OPTIONS map from the world server starts (SettingsWorldOptionsBegin): GAME OPTIONS in a world reads the rules again.
+long SettingsWorldValuesGen();
 // The HOST screen's rows the world (worldFolder) has STORED since the last call - an OPTIONS map from it held them at those values -
 // handed out once (stewardrules.h TakeStored). Only these count as rows that already went. MAIN THREAD. Returns how many.
 int SettingsHostRowsStored(const std::string& worldFolder, std::vector<std::pair<std::string, std::string> >* out);

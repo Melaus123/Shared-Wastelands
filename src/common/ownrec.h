@@ -1913,10 +1913,11 @@ inline std::string LeaveSaveTarget(const std::string& profileFolder)
 struct CreatedSave
 {
     int open, mode, pending, running, waitLogged, tries;   /* tries (T-251 review fold L1): not-accepted give-ups since the arm */
+    int fresh;   /* T-1135 review fold 4: armed by a give - it starts a save of its own, never joins one already running */
     unsigned long long win;
     long worldAtOpen, worldArmed;
     long long endSeen;   /* the leave save's end count when this trigger started or joined a save */
-    CreatedSave() : open(0), mode(0), pending(0), running(0), waitLogged(0), tries(0), win(0ULL), worldAtOpen(0), worldArmed(0), endSeen(0) {}
+    CreatedSave() : open(0), mode(0), pending(0), running(0), waitLogged(0), tries(0), fresh(0), win(0ULL), worldAtOpen(0), worldArmed(0), endSeen(0) {}
 };
 /* T-251 review fold L2: aiOff is 1 / 0, or -1 when the AI-off byte could not be read (the PlayerInterface pointer unreadable
    while the editor window read fine). An unknown AI-off at a new-game close in the same world is NOT YET: the close is not
@@ -1948,6 +1949,10 @@ inline int CreatedPendingStep(const CreatedSave& s, long world, bool stopping, b
     if (stopping) return kCrDropStopping;
     return wanted ? kCrStartNow : kCrWait;
 }
+/* T-1135 review fold 4: an arm that must be saved by a save STARTED after it (a character given or received - fresh) does not join a
+   leave save already running: that save's records may be older than the hand-over. It waits for that save to end, then starts its
+   own. 1 wait, 0 start (or join) now. */
+inline int CreatedJoinWaits(const CreatedSave& s, int saveRunning) { return (s.fresh != 0 && saveRunning != 0) ? 1 : 0; }
 /* THE END of the save it started or joined (why = the leave save's reason): completed -> done; another save held the
    engine's save slot past the 30 s bound (not-accepted) -> RE-ARMED (manager 2026-09-29 decision 1); world-changed /
    stopping -> dropped; any other give-up (refused, not-finished, failed, stale) ends it - a re-arm there would repeat a save
@@ -2633,6 +2638,9 @@ inline const char* RestoreWhyName(int w)
       change and releases the hold (it is newer progress); the next load decides again. A FINAL refusal (the record is not
       newer, absent, of another world, a lone game, or unusable) writes as before. */
 const unsigned int kHoldGraceMs = 60000;
+/* T-1240: the reason a whole load's restore is armed with when the records store has no record yet for this world and profile
+   (OwnRestoreArmAll: the overlay at a load, the import of a reset world) - the same word the edge reports per category */
+const char* const kRsWhyAllNoRecord = "no-record";
 inline bool RestoreRefusalFinal(const std::string& why)
 {
     return why == "older-than-save" || why == "no-record" || why == "identity" || why == "single" || why == "record-crc"

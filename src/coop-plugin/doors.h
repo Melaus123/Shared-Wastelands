@@ -38,6 +38,8 @@
 // DoorLockStep.
 #pragma once
 #include <string>
+#include <vector>
+#include <set>
 namespace coop {
 
 // PRELOAD, MAIN THREAD: the five detours (the funnel, openDoor, closeDoor, lockDoor, lockButton), each PROLOGUE-CHECKED
@@ -59,13 +61,40 @@ void DoorsWorldTeardown();
 // door's position, which is a virtual call through a stored pointer, so it waits for DoorsTick.
 void ApplyDoorState(const std::string& key, int state, int locked, unsigned int gen, unsigned int fromPeer,
                     int origin);
-// The session link came up: a game that joins late has been told nothing, so the holder re-offers
-// what it has (the weather pattern's "at WELCOME and on change").  Called from DoorsTick's own edge.
-void DoorsOnLinkUp();
-// MAIN THREAD. The world server asked this game to catch up another game (slot askerSlot) that has just come to have these n
-// sectors (sx[i], sy[i]) in its delivery area - worldsync.cpp's catch-up answer: every registered door of those sectors in a resting
-// state is re-offered once, and DoorsTick publishes it, routed by the door's sector, only where this game holds the door.  Queues only.
-void DoorsServeCatchup(const int* sx, const int* sy, int n, int askerSlot, unsigned int askNo);
+// A WORLD DOOR'S RECORD ON THE WORLD SERVER (src/common/doorrec.h; doors.cpp keeps the door table). MAIN THREAD unless said.
+// build.cpp's per-area apply: area c (sx * 64 + sy) has its whole record list on this load - every door of the area is laid from its
+// record (a change held for it before the lay is written over the record by the holder), seeded by the area's holder when it has
+// none, or left as it is; a door registering later in the area is laid by DoorsTick; the area's queued record removals are sent.
+void DoorsRecAreaLay(int c);
+// ... area c left this game's loaded areas (its doors are laid again at its next load); a new world-server link lays every area again.
+void DoorsRecAreaLeft(int c);
+void DoorsRecLinkReset();
+// townver.cpp: area c's town was rebuilt here (its saved buildings replaced) - at the area's lay (or, laid already, the next area map)
+// its holder removes the area's door records whose key names no live door here.
+void DoorsRecAreaRebuilt(int c);
+/* MAIN THREAD. The events a door record's waiting lay is tried again on (never a clock): store.cpp's applied area map
+   (KeptRecordSweepTick; newly = the areas this game newly holds, where a door shown as its own with no record is seeded) and the area
+   picture leaving loading (newly 0). Rows waiting for the holder answer are laid again, a rebuilt town's area laid since is swept, the
+   queued removals are tried. */
+void DoorsRecMapEvent(const std::set<int>* newly);
+// ANY THREAD (build.cpp's door hit and repair step): the door's broken flag flipped (a break or a mend) - DoorsTick writes the record of
+// a laid door of a building no player owns (a player's piece's door is skipped there); before the door's lay the flip is engine work
+// (a repair step at load) and is taken into the door's facts, never held.
+void DoorsRecNoteBrokenChanged(void* door);
+// ANY THREAD: a stored fact was written straight into the door (its lock level) - DoorsTick measures it as a change of its own and
+// writes the door's record (or holds the change until the lay). 1 = noted; 0 = the door has no row here, nothing noted.
+int DoorsRecNoteChanged(void* door);
+// store.cpp's record dispatch: a door record arrived / was removed on the world server. items.cpp's BOX_REFUSE: this game's write of
+// one was refused.
+void DoorRecordArrive(const std::string& id, const std::vector<char>& bytes);
+void DoorRecordGone(const std::string& id);
+void DoorRecRefuseArrive(const std::string& id, int reason, unsigned int storedGen, unsigned int sentGen);
+// store.cpp's RECORD_SEQ: the world server took this game's door record write sent with that stamp (its pending write is confirmed).
+void DoorRecordEcho(const std::string& id, int hasStamp, long long stamp);
+// build.cpp's ruin flip: the door records of the building's doors are read before the flip (the doors still live); after a flip that
+// made a ruin their removals are queued and sent by the holder of their area once its record list is complete here.
+void DoorsRecRuinBefore(void* building);
+void DoorsRecRuinAfter(void* building, int ruined);
 // ANY THREAD, inside the engine's own zone teardown: items.cpp's ZoneMapContent::deactivate detour
 // fans out to this (one hook, two subscribers).  It makes two interlocked integer writes and nothing
 // else - no walk, no log, no allocation - and the next main-thread DoorsTick drops every registry row

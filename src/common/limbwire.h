@@ -151,9 +151,11 @@ const int kLimbStepAmputate      = 1;   /* whole (or crushed) here, a stump on t
 const int kLimbStepUnfit         = 2;   /* a robotic limb here, a stump on the owner: setRobotLimbItem(limb, 0), the old item destroyed */
 const int kLimbStepFit           = 3;   /* the owner has a robotic limb fitted, none here: make the item, setRobotLimbItem(limb, item) */
 const int kLimbStepRefit         = 4;   /* both fitted, different items: unfit then fit */
-const int kLimbStepCannotRegrow  = 5;   /* whole on the owner, not here: the engine has no road back to flesh - left, counted */
+const int kLimbStepCannotRegrow  = 5;   /* whole on the owner, a robotic limb here: no road from a fitted limb straight to flesh - left, counted */
 const int kLimbStepNoCrushRoad   = 6;   /* crushed on the owner: the engine's crushLimb is an empty function - left, counted */
 const int kLimbStepUnnamed       = 7;   /* fitted on the owner, but its item has no name on the wire - left, counted */
+const int kLimbStepRegrow        = 8;   /* whole on the owner, a stump or crushed here: RobotLimbs::setLimb(limb, whole, no item) - the
+                                           call an admin's /restore makes on the owner (clothing.cpp LimbRegrowCall) */
 
 inline int PlanLimb(unsigned char copyState, const char* copySid, unsigned char ownerState, const char* ownerSid)
 {
@@ -165,12 +167,23 @@ inline int PlanLimb(unsigned char copyState, const char* copySid, unsigned char 
         if (copySid != 0 && std::strcmp(copySid, ownerSid) == 0) return kLimbStepNone;
         return kLimbStepRefit;
     }
-    if (ownerState == kLimbOriginal) return kLimbStepCannotRegrow;
+    if (ownerState == kLimbOriginal) return (copyState == kLimbReplaced) ? kLimbStepCannotRegrow : kLimbStepRegrow;
     if (ownerState == kLimbCrushed) return kLimbStepNoCrushRoad;
     if (ownerState == kLimbStump) return (copyState == kLimbReplaced) ? kLimbStepUnfit : kLimbStepAmputate;
     /* ownerState == kLimbReplaced */
     if (!ownerNamed) return kLimbStepUnnamed;
     return (copyState == kLimbReplaced) ? kLimbStepRefit : kLimbStepFit;
+}
+
+/* T-1205 review fold 8: STATE carries no sequence number, so an older STATE that arrives late can say "whole" about a limb its owner
+   has lost since - and a copy would grow it back. A copy grows a limb back (kLimbStepRegrow) only when the owner said whole for it in
+   two STATEs in a row: bit (1 << limb) of the answer. prevKnown false = no earlier STATE recorded for the character: none is sure. */
+inline unsigned int LimbRegrowSure(bool prevKnown, const unsigned char prev[kLimbCount], const unsigned char now[kLimbCount])
+{
+    unsigned int m = 0;
+    if (!prevKnown || prev == 0 || now == 0) return 0;
+    for (unsigned int i = 0; i < kLimbCount; ++i) if (prev[i] == kLimbOriginal && now[i] == kLimbOriginal) m |= 1u << i;
+    return m;
 }
 
 /* A same-item quality difference worth a refit: both qualities read (a number, 0 or more, under 100000) and more than
@@ -285,8 +298,36 @@ inline const char* LimbStepName(int step)
     case kLimbStepCannotRegrow: return "cannotRegrow";
     case kLimbStepNoCrushRoad:  return "noCrushRoad";
     case kLimbStepUnnamed:      return "unnamed";
+    case kLimbStepRegrow:       return "regrow";
     default:                    return "?";
     }
+}
+
+/* /restore on the owner, per limb from its state: a stump or a crushed limb grows back, a robotic limb is left on (never replaced) */
+const int kRestoreNone = 0, kRestoreRegrow = 1, kRestoreRobotKept = 2;
+inline int RestoreLimbStep(int state)
+{
+    if (state == (int)kLimbStump || state == (int)kLimbCrushed) return kRestoreRegrow;
+    if (state == (int)kLimbReplaced) return kRestoreRobotKept;
+    return kRestoreNone;
+}
+/* The limb (0 left arm .. 3 right leg) a health part is, from its kind (HealthPartStatus +0x08) and side (+0x20): the engine's own
+   part-of-limb lookup (MedicalSystem 0x656B00 in Steam 1.0.65, build/decomp_656b00.txt - kind 2 an arm, kind 1 a leg, side 1 left;
+   setRobotLimbItem calls it for the limb's part); -1 = not a limb (head, chest, stomach). */
+inline int LimbOfPart(int kind, int side)
+{
+    if (kind == 2) return side == 1 ? 0 : 1;
+    if (kind == 1) return side == 1 ? 2 : 3;
+    return -1;
+}
+/* A regrown limb's part maximum (maxHealthBase): the one the character was made with, read from its parts that are never lost or
+   fitted (head, chest, stomach) - HealthPartStatus::setup gives every part the same maximum (F143: all seven alike in every case
+   measured). The largest such number, a number above 0; -1 = none (the part is left as it is). */
+inline float RegrownLimbMax(const float* bodyMaxes, int n)
+{
+    float best = -1.0f;
+    for (int i = 0; i < n; ++i) if (bodyMaxes[i] == bodyMaxes[i] && bodyMaxes[i] > 0.0f && bodyMaxes[i] < 1.0e6f && bodyMaxes[i] > best) best = bodyMaxes[i];
+    return best;
 }
 
 inline const char* LimbName(unsigned int i)

@@ -182,6 +182,8 @@ inline int RowOfSlot(const std::vector<RowView>& rows, int slot)
 
 /* the line under the table and whether the buttons show */
 const char* const kSelectLine = "";   /* nothing selected: no line */
+/* the line under the table (mock-up 7): the world's GAME SPEED CONTROL in GAME OPTIONS' words; "" (no line) until the world said it */
+inline std::string GameSpeedLine(const std::string& words) { return words.empty() ? std::string() : std::string("GAME SPEED: ") + words; }
 inline std::string Upper(const std::string& s)
 {
     std::string o(s);

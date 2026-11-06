@@ -25,6 +25,7 @@
 #include "worldsync.h"   // H030: AnnouncedToPeer
 #include "playerfaction.h"   // E25: PeerFaction - whose copies are the OTHER PLAYER's own characters
 #include "spawn.h"
+#include "medical.h"   /* T-1235: CopyOwnerSaysDead - a copy whose owner says it died */
 #include "../common/livechar.h"   /* DropPuppet: the reason a stored pointer is not written through */
 #include "stats.h"   // T-189 runboost: RunCeilingRead / RunCeilingWrite / RunCeilingRestore
 #include "zones.h"   // review-r2 item 7: IsPositionLoadedHere - the far snap never places a copy into an area this game has not loaded
@@ -5284,13 +5285,15 @@ bool IntentResendOwned(unsigned int uid)
     return net::SendIntent(uid, t, s, x, y, z, pr);
 }
 bool ReadAuthorityFacing(::Character* c, float* fx, float* fz) { return AuthorityFacing(c, fx, fz); }
+void PoseToolOffForOwnership(unsigned int uid, ::Character* c);   // T-890 review fold 1 (spawn.cpp)
 // M-D - the new owner un-puppets a copy: drop the drive row (restores the engine's own speed, closes a window),
 // then release the AI gate. The caller has already taken ownership so the streams flip with it.
+// T-890 review fold 1: a work tool this mod hung on the copy comes off first, while no job of the character's own can hold one.
 void UnpuppetForOwnership(unsigned int uid)
 {
     ::Character* c = FindSpawned(uid);
     DropPuppet(uid, true);
-    if (PlausibleObj(c)) SuppressCharacter(c, false);
+    if (PlausibleObj(c)) { PoseToolOffForOwnership(uid, c); SuppressCharacter(c, false); }
 }
 
 /* P25 fold 2: items.cpp (declared in items.h, namespace coop) - the P7n position key of a building, and the building a key names */
@@ -6570,7 +6573,9 @@ bool AttackLocal(unsigned int attackerUid, unsigned int victimUid, int taskType)
             SW_DEVLOG(std::string("[P010] attacker uid=") + N2(attackerUid)
                      + " considers victim uid=" + N2(victimUid)
                      + (enemy ? " an ENEMY (attack is plannable)"
-                              : " NOT an enemy (H007: GOAP requirement would fail)"));
+                              : " NOT an enemy (H007: GOAP requirement would fail)")
+                     + " (peace may answer: T-1194, this call goes through the peace lever's planner hook, which says"
+                       " NOT an enemy for a covered player pair while peace is on)");
         }
         else
         {
@@ -6992,6 +6997,47 @@ int PeerPlayerSectors(int* xs, int* ys, int cap, double maxAgeSec)
         for (int k = 0; k < n; ++k) if (xs[k] == q.x && ys[k] == q.y) { have = 1; break; }
         if (have == 0) { xs[n] = q.x; ys[n] = q.y; ++n; }
     }
+    return n;
+}
+
+/* T-1235: see replicate.h - every player's characters here, for the [SPAWN] wander line. This game's own (net::OwnedUidsSnapshot,
+   kept when in this game's player faction - P093PcRebuild's test) with slot mySlot, own 1; the copies of the other players'
+   player-faction characters (g_puppets rows PeerFactionPod answers 1 for) with their recorded owner's slot (net::OwnerSlotOf), own 0.
+   Position: the engine's own position read (SafeReadPosition). Dead (T-1235's keep-away ignores the dead): the engine's own
+   Character::hasDied, and for a copy also its owner's latest word (CopyOwnerSaysDead); a read that faults counts as alive (kept).
+   ORDER (T-1235 review fold 1): the other players' copies FIRST, then this game's own - a full list leaves out this game's own
+   characters, never the other players' (each player's own game keeps its own camera rule). MAIN THREAD. */
+static int WsDiedPod(::Character* c)
+{
+    __try { return c->hasDied() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int PlayerCharSpots(float* xs, float* zs, int* slots, int* owns, int* deads, int cap, int mySlot, int* leftOut)
+{
+    int n = 0, lost = 0;
+    for (std::map<unsigned int, Puppet>::const_iterator it = g_puppets.begin(); it != g_puppets.end(); ++it)
+    {
+        const Puppet& q = it->second;
+        if (!PlausibleObj(q.ch) || IsRetiredObject(q.ch) || PeerFactionPod(q.ch) != 1) continue;
+        Ogre::Vector3 v;
+        if (!SafeReadPosition(q.ch, &v)) continue;
+        if (n >= cap) { ++lost; continue; }
+        xs[n] = v.x; zs[n] = v.z; slots[n] = net::OwnerSlotOf(it->first); owns[n] = 0;
+        if (deads != 0) deads[n] = (WsDiedPod(q.ch) != 0 || CopyOwnerSaysDead(it->first)) ? 1 : 0;
+        ++n;
+    }
+    std::vector<unsigned int> own;
+    net::OwnedUidsSnapshot(&own);
+    for (size_t i = 0; i < own.size(); ++i)
+    {
+        ::Character* c = FindSpawned(own[i]);
+        if (!PlausibleObj(c) || IsRetiredObject(c) || P093OwnPlayerPod(c) != 1) continue;
+        Ogre::Vector3 v;
+        if (!SafeReadPosition(c, &v)) continue;
+        if (n >= cap) { ++lost; continue; }
+        xs[n] = v.x; zs[n] = v.z; slots[n] = mySlot; owns[n] = 1; if (deads != 0) deads[n] = WsDiedPod(c); ++n;
+    }
+    if (leftOut != 0) *leftOut = lost;
     return n;
 }
 

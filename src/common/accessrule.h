@@ -15,9 +15,9 @@
    - the block list applies to the Steam route only;
    - under allow-list mode an address joiner is not let in;
    - under open mode an address joiner is let in.
-   The world's owner is the connection that proved this hosting's secret in HOST_TOKEN (HostTokenProves) - the host's own game. It
-   has no Steam id, so no entry can name it: it is let in under both modes and is never blocked. Where a connection comes from (this
-   PC or another) decides nothing. */
+   The world's owner is the connection that proved the owner password at its door (authproof.h DoorJudge, owner 1369 b): access.txt
+   is not asked for it at all (authproof::DoorListsApply), so no entry can keep it out. Where a connection comes from (this PC or
+   another) decides nothing. */
 #ifndef SW_ACCESSRULE_H
 #define SW_ACCESSRULE_H
 
@@ -152,8 +152,7 @@ inline int Find(const Rules& r, int kind, unsigned long long id)
     return 0;
 }
 
-/* THE DECISION AT ADMISSION. The owner (it proved HOST_TOKEN, and the world server never believes a STEAM_ID on the same
-   connection) is let in first: it has no Steam id, so it is never blocked. A block entry wins over every Steam joiner; a blocked or
+/* THE DECISION AT ADMISSION. The owner (it proved the owner password at its door) is let in first: no entry keeps it out. A block entry wins over every Steam joiner; a blocked or
    listed account is only ever a Steam joiner (hasSteamId). Under allow-list mode the owner and listed Steam accounts are let in and
    nobody else is. *entryNo is the entry that decided (0 = none did). */
 inline int Decide(const Rules& r, bool hasSteamId, unsigned long long id, bool isOwner, int* entryNo)
@@ -173,21 +172,14 @@ inline int Decide(const Rules& r, bool hasSteamId, unsigned long long id, bool i
 }
 
 /* STEAM_ID IS BELIEVED ONLY FROM THE HOST'S OWN BRIDGE: with this hosting's secret, as the connection's first message, alone (not
-   inside a bundle), and on a connection that is neither bridged already nor the owner. The bridge sends it before the joiner can
+   inside a bundle), and on a connection that is not bridged already. The bridge sends it before the joiner can
    send anything, so one that comes any later is not the bridge's way: the world server closes that connection. One without the
    secret may be any program claiming any account: counted and ignored. The connection's address is no input. */
 enum SteamIdVerdict { kSteamIdBelieve = 0, kSteamIdWrongToken = 1, kSteamIdLate = 2 };
-inline int SteamIdJudge(bool tokenMatches, bool firstMessage, bool insideBundle, bool alreadyBridgedOrOwner)
+inline int SteamIdJudge(bool tokenMatches, bool firstMessage, bool insideBundle, bool alreadyBridged)
 {
-    if (!firstMessage || insideBundle || alreadyBridgedOrOwner) return kSteamIdLate;
+    if (!firstMessage || insideBundle || alreadyBridged) return kSteamIdLate;
     return tokenMatches ? kSteamIdBelieve : kSteamIdWrongToken;
-}
-
-/* HOST_TOKEN PROVES THE OWNER: this hosting's secret, on a connection that is not bridged, before its HELLO. The connection's address
-   and the player id its HELLO names are no input. */
-inline bool HostTokenProves(bool tokenMatches, bool bridged, bool afterHello)
-{
-    return tokenMatches && !bridged && !afterHello;
 }
 
 /* ---- TEST-ONLY: the accesstest verb's edits ---- */

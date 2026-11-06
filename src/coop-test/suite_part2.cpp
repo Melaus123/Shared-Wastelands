@@ -5,6 +5,8 @@
  * than one file uses is in suite.h. New tests go in test_main.cpp.
  */
 #include "suite.h"
+#include <new>   /* placement new: a batch made over leftover memory */
+#include "playerstab.h"   /* T-717: EscapeHash - the faction-name message line is shown escaped */
 
 namespace suite {
 
@@ -414,7 +416,16 @@ void t_t600_bail_and_slave_ask()
 
     /* the sender: only a copy, only a change, not inside the bail, not an enslavement, only from the game that runs the area */
     using namespace coopslave;
-    if (SlaveAskSenderDecide(true, false, 1, 2, 0, 0) != kAskSend) Fail("the area's runner did not ask the owner about an escape");
+    /* T-1225: ESCAPING is never asked (T2019: A's copy had no owner); 0 -> 2 is still the enslavement answer */
+    if (SlaveAskSenderDecide(true, false, 1, 2, 0, 0) != kAskEscaping) Fail("T-1225: the area's runner asked the owner about an escape");
+    if (SlaveAskSenderDecide(true, false, 3, 2, 0, 0) != kAskEscaping) Fail("T-1225: the area's runner asked an ex-slave's escape");
+    if (SlaveAskSenderDecide(true, false, 0, 2, 0, 0) != kAskEnslave) Fail("T-1225: 0 -> 2 did not give the enslavement answer (sender)");
+    /* T-1225 design C: an escape's end (2 -> 3) is the slave's own engine's (it made the escape and keeps its clock) - never asked */
+    if (SlaveAskSenderDecide(true, false, 2, 3, 0, 0) != kAskEscapeEnd) Fail("T-1225: the area's runner asked about an escape's end (2 -> 3)");
+    if (SlaveAskSenderDecide(true, false, 2, 3, 1, 0) != kAskEscapeEnd || SlaveAskSenderDecide(true, false, 2, 3, -1, 0) != kAskEscapeEnd)
+        Fail("T-1225: an escape's end was not refused as such whoever runs the area");
+    if (SlaveAskSenderDecide(true, false, 2, 0, 0, 0) != kAskSend) Fail("the area's runner did not ask about an escaping slave's freeing (2 -> 0)");
+    if (SlaveAskSenderDecide(true, false, 1, 0, 0, 0) != kAskSend) Fail("the area's runner did not ask about a freeing (1 -> 0)");
     if (SlaveAskSenderDecide(true, false, 1, 3, 0, 0) != kAskSend) Fail("the area's runner did not ask about a freeing");
     if (SlaveAskSenderDecide(true, false, 3, 0, 0, 0) != kAskSend) Fail("the area's runner did not ask about an ex-slave's end");
     if (SlaveAskSenderDecide(true, false, 2, 1, 0, 0) != kAskEnslave) Fail("a recapture (2 -> 1) was asked outside the capture road");
@@ -423,8 +434,8 @@ void t_t600_bail_and_slave_ask()
     if (SlaveAskSenderDecide(true, false, 1, 1, 0, 0) != kAskSame) Fail("no change was asked");
     if (SlaveAskSenderDecide(true, true, 1, 0, 0, 0) != kAskBail) Fail("the bail's own slave change was asked separately");
     if (SlaveAskSenderDecide(true, false, 0, 1, 0, 0) != kAskEnslave) Fail("an enslavement was asked outside the capture road");
-    if (SlaveAskSenderDecide(true, false, 1, 2, 1, 0) != kAskNotRunner) Fail("a game that does not run the area asked");
-    if (SlaveAskSenderDecide(true, false, 1, 2, -1, 0) != kAskNoMap || SlaveAskSenderDecide(true, false, 1, 2, 0, -1) != kAskNoMap)
+    if (SlaveAskSenderDecide(true, false, 1, 3, 1, 0) != kAskNotRunner) Fail("a game that does not run the area asked");
+    if (SlaveAskSenderDecide(true, false, 1, 3, -1, 0) != kAskNoMap || SlaveAskSenderDecide(true, false, 1, 3, 0, -1) != kAskNoMap)
         Fail("an unknown area runner was taken as this game");
     if (SlaveAskSenderDecide(true, false, 1, 4, 0, 0) != kAskBad || SlaveAskSenderDecide(true, false, -1, 2, 0, 0) != kAskBad)
         Fail("a bad slave state was asked");
@@ -436,35 +447,153 @@ void t_t600_bail_and_slave_ask()
     if (!SlaveAskDue(true, 1, 100u, 2)) Fail("a different ask was held");
 
     /* the owner: ours, a real change from the copy's state, not an enslavement, from the game that runs the area */
-    if (SlaveAskOwnerDecide(true, 1, 1, 2, 0, 0) != kAskApply) Fail("the owner did not apply the area runner's escape");
+    /* T-1225, run T2019 (Confirmed): A runs the area, A's copy of B's slave has no owner on A, A's engine sets 1 -> 2 and asks B;
+       B's owner is present. B refuses: only the slave's own engine marks it escaping. */
+    if (SlaveAskOwnerDecide(true, 1, 1, 2, 0, 0) != kAskOwnerEscaping) Fail("T-1225: the owner applied the area runner's ESCAPING (T2019)");
+    if (SlaveAskOwnerDecide(true, 3, 3, 2, 0, 0) != kAskOwnerEscaping) Fail("T-1225: an ex-slave was made escaping from the ask road");
+    if (SlaveAskOwnerDecide(true, 1, 1, 2, -1, 0) != kAskOwnerEscaping) Fail("T-1225: an escaping ask was not refused as escaping with no area map");
+    if (SlaveAskOwnerDecide(true, 0, 0, 2, 0, 0) != kAskOwnerEnslave) Fail("T-1225: 0 -> 2 did not give the enslavement answer (owner)");
+    if (SlaveAskWhy(kAskEscaping, false)[0] == '?') Fail("the sender's escaping answer has no reason text");
+    /* T-1225 design C: an escape's end (2 -> 3) is never applied from the ask road (older peers still ask it) */
+    if (SlaveAskOwnerDecide(true, 2, 2, 3, 0, 0) != kAskOwnerEscapeEnd) Fail("T-1225: the owner applied the area runner's end of an escape (2 -> 3)");
+    if (SlaveAskOwnerDecide(true, 2, 2, 3, 0, 1) != kAskOwnerEscapeEnd || SlaveAskOwnerDecide(true, 2, 2, 3, -1, 0) != kAskOwnerEscapeEnd)
+        Fail("T-1225: an escape's end ask was not refused as such");
+    if (SlaveAskOwnerDecide(true, 3, 2, 3, 0, 0) != kAskAlready) Fail("an escape's end already made by the owner's engine was not 'already so'");
+    if (SlaveAskWhy(kAskEscapeEnd, false)[0] == '?' || SlaveAskWhy(kAskOwnerEscapeEnd, true)[0] == '?') Fail("an escape's end answer has no reason text");
+    /* the legitimate changes the runner's engine still decides: a freeing (1 -> 3, 1 -> 0, 2 -> 0), an ex-slave's end (3 -> 0) */
+    if (SlaveAskOwnerDecide(true, 1, 1, 3, 0, 0) != kAskApply) Fail("the owner did not apply the area runner's freeing (1 -> 3)");
+    if (SlaveAskOwnerDecide(true, 1, 1, 0, 0, 0) != kAskApply) Fail("the owner did not apply the area runner's freeing (1 -> 0)");
+    if (SlaveAskOwnerDecide(true, 2, 2, 0, 0, 0) != kAskApply) Fail("the owner did not apply the area runner's freeing (2 -> 0)");
+    if (SlaveAskOwnerDecide(true, 3, 3, 0, 0, 0) != kAskApply) Fail("the owner did not apply the area runner's ex-slave end (3 -> 0)");
+    if (SlaveAskOwnerDecide(true, 1, 1, 3, 1, 0) != kAskSenderNotHolder) Fail("a freeing from a game that does not run the area was applied");
+    if (SlaveAskWhy(kAskOwnerEscaping, true)[0] == '?') Fail("the escaping refusal has no reason text");
+    if (kAskOwnerEscaping >= kAskCodeCount || kAskEscaping >= kAskCodeCount || kAskSenderNotHolder >= kAskCodeCount || kAskNotRunner >= kAskCodeCount
+        || kAskEscapeEnd >= kAskCodeCount || kAskOwnerEscapeEnd >= kAskCodeCount)
+        Fail("a decision code is outside the counter arrays");
     if (SlaveAskOwnerDecide(false, 1, 1, 2, 0, 0) != kAskNotOwner) Fail("an ask about another game's character was applied");
     if (SlaveAskOwnerDecide(true, 2, 1, 2, 0, 0) != kAskAlready) Fail("an ask already so was applied again");
     if (SlaveAskOwnerDecide(true, 3, 1, 2, 0, 0) != kAskStale) Fail("a stale ask was applied");
     if (SlaveAskOwnerDecide(true, 0, 0, 1, 0, 0) != kAskOwnerEnslave) Fail("an enslavement was applied from the ask road");
     if (SlaveAskOwnerDecide(true, 3, 3, 1, 0, 0) != kAskOwnerEnslave || SlaveAskOwnerDecide(true, 2, 2, 1, 0, 0) != kAskOwnerEnslave)
         Fail("a re-enslavement of an escaping or freed character was applied from the ask road");
-    if (SlaveAskOwnerDecide(true, 2, 2, 3, 0, 1) != kAskSenderNotHolder) Fail("the owner took an ask while it runs the area itself");
-
-    /* one decider: while another game runs the area the owner's own periodic update defers */
-    if (!SlaveOwnEngineDefers(0, 1) || SlaveOwnEngineDefers(1, 1) || SlaveOwnEngineDefers(-1, 1) || SlaveOwnEngineDefers(0, -1))
-        Fail("the owner's engine deferred to the wrong game");
-    /* two engines that disagree: the runner's wants ESCAPING (2) until step 6 then EX_SLAVE (3); the owner's own periodic update
-       wants EX_SLAVE from step 3. With the owner deferring, the owner's state changes twice and settles; without, it flips. */
-    for (int defer = 0; defer <= 1; ++defer)
-    {
-        int own = 1, copy = 1, changes = 0;
-        for (int step = 0; step < 20; ++step)
+    if (SlaveAskOwnerDecide(true, 1, 1, 3, 0, 1) != kAskSenderNotHolder) Fail("the owner took an ask while it runs the area itself");
+    /* nothing is ever asked to IS_SLAVE (1) or ESCAPING (2), from any state, whoever runs the area */
+    for (int cur = 0; cur <= kSlaveStateMax; ++cur)
+        for (int runner = -1; runner <= 1; ++runner)
         {
-            const int runnerWants = step < 6 ? 2 : 3;
-            if (copy != runnerWants && SlaveAskSenderDecide(true, false, copy, runnerWants, 0, 0) == kAskSend
-                && SlaveAskOwnerDecide(true, own, copy, runnerWants, 0, 0) == kAskApply)
-            { own = runnerWants; ++changes; }
-            const bool ownDefers = defer != 0 && SlaveOwnEngineDefers(0, 1);
-            if (!ownDefers && step >= 3 && own == 2) { own = 3; ++changes; }
+            if (cur != 1 && SlaveAskSenderDecide(true, false, cur, 1, runner, 0) == kAskSend) Fail("a change to IS_SLAVE was asked from " + I(cur));
+            if (cur != 2 && SlaveAskSenderDecide(true, false, cur, 2, runner, 0) == kAskSend) Fail("a change to ESCAPING was asked from " + I(cur));
+            if (cur != 1 && SlaveAskOwnerDecide(true, cur, cur, 1, runner, 0) == kAskApply) Fail("a change to IS_SLAVE was applied from " + I(cur));
+            if (cur != 2 && SlaveAskOwnerDecide(true, cur, cur, 2, runner, 0) == kAskApply) Fail("a change to ESCAPING was applied from " + I(cur));
+        }
+    /* only the area's game asks the kept changes (1 -> 3, 1 -> 0, 2 -> 0, 3 -> 0): another game's, or an unknown runner, asks nothing */
+    {
+        const int kept[4][2] = { { 1, 3 }, { 1, 0 }, { 2, 0 }, { 3, 0 } };
+        for (int k = 0; k < 4; ++k)
+        {
+            if (SlaveAskSenderDecide(true, false, kept[k][0], kept[k][1], 0, 0) != kAskSend
+                || SlaveAskOwnerDecide(true, kept[k][0], kept[k][0], kept[k][1], 0, 0) != kAskApply)
+                Fail("the area's game's " + I(kept[k][0]) + " -> " + I(kept[k][1]) + " is no longer asked and applied");
+            if (SlaveAskSenderDecide(true, false, kept[k][0], kept[k][1], 1, 0) != kAskNotRunner
+                || SlaveAskSenderDecide(true, false, kept[k][0], kept[k][1], -1, 0) != kAskNoMap)
+                Fail("a game that does not run the area asked " + I(kept[k][0]) + " -> " + I(kept[k][1]));
+        }
+    }
+
+    /* T-1225 review fold 1: the area is this game's only when a fresh map names this game; another game's slot, -1 (no map, a
+       stale map, a row naming nobody) and kAreaFrozen -2 are not, and neither is any answer while this game's slot is unknown */
+    if (!SlaveAreaKnownHere(1, 1) || SlaveAreaKnownHere(0, 1) || SlaveAreaKnownHere(-1, 1) || SlaveAreaKnownHere(-2, 1)
+        || SlaveAreaKnownHere(1, -1) || SlaveAreaKnownHere(-1, -1))
+        Fail("T-1225: this game was taken to run the area wrongly");
+    /* T-1225 review fold 3: 'owner here' as the engine's own routines resolve it, per hand type. ch = hand::getCharacter 0x7974F0
+       (types 1 and 0x5b), sq = hand::asActiveSquad 0x791D20 (types 1 and 0x22, AI::updateStateBroadcast's lookup); 1 found,
+       0 none, -1 the lookup could not run. A lookup that never resolves the type does not count, even when it could not run. */
+    struct OwnerCase { int type; int ch; int sq; int want; const char* what; };
+    const OwnerCase oc[] = {
+        { -1, 1, 1, kOwnerUnreadable, "an unreadable hand type" },
+        { kSlaveHandNone, 0, 0, kOwnerEmpty, "the empty hand" },
+        { kSlaveHandNone, -1, -1, kOwnerEmpty, "the empty hand with no lookups" },
+        { kSlaveHandChar, 1, 1, kOwnerHere, "a character hand, owner and squad here" },
+        { kSlaveHandChar, 1, 0, kOwnerHere, "a character hand resolving to a character only" },
+        { kSlaveHandChar, 0, 1, kOwnerHere, "a character hand resolving to its squad only" },
+        { kSlaveHandChar, -1, 1, kOwnerHere, "a character hand: squad here, getCharacter faulted" },
+        { kSlaveHandChar, 0, 0, kOwnerNotHere, "a character hand naming nobody here" },
+        { kSlaveHandChar, -1, 0, kOwnerLookupFault, "a character hand whose getCharacter could not run" },
+        { kSlaveHandChar, 0, -1, kOwnerLookupFault, "a character hand whose squad lookup could not run" },
+        { kSlaveHandSquad, 0, 1, kOwnerHere, "a squad hand whose squad resolves" },
+        { kSlaveHandSquad, 0, 0, kOwnerNotHere, "a squad hand naming no squad here" },
+        { kSlaveHandSquad, -1, 0, kOwnerNotHere, "a squad hand: getCharacter (never resolves 0x22) faulted" },
+        { kSlaveHandSquad, 0, -1, kOwnerLookupFault, "a squad hand whose squad lookup could not run" },
+        { kSlaveHandOther, 1, 0, kOwnerHere, "a 0x5b hand getCharacter resolves (as 0x5A44C0's 0x790A60)" },
+        { kSlaveHandOther, 0, 0, kOwnerNotHere, "a 0x5b hand resolving to nobody" },
+        { kSlaveHandOther, 0, -1, kOwnerNotHere, "a 0x5b hand: the squad lookup (never resolves 0x5b) faulted" },
+        { kSlaveHandOther, -1, 0, kOwnerLookupFault, "a 0x5b hand whose getCharacter could not run" },
+        { 3, 1, 1, kOwnerNotHere, "a hand type neither routine resolves" },
+        { 0, 0, 0, kOwnerNotHere, "hand type 0" },
+    };
+    const int nOc = (int)(sizeof(oc) / sizeof(oc[0]));
+    for (int k = 0; k < nOc; ++k)
+        if (SlaveOwnerHereOf(oc[k].type, oc[k].ch, oc[k].sq) != oc[k].want)
+            Fail("T-1225: owner here wrong for " + std::string(oc[k].what) + ": " + I(SlaveOwnerHereOf(oc[k].type, oc[k].ch, oc[k].sq)));
+    /* T-1225 review fold 5: the decision detour_setSlaveState makes (SlaveOwnEscapeDecide), over every area answer and hand case:
+       refused only for 1 -> 2, only while this game is not known to run the area, and only for the empty, unresolved or
+       unreadable hand; every other change on the slave's own game passes, whoever runs the area. */
+    {
+        const int area[5][2] = { { 1, 1 }, { 0, 1 }, { -1, 1 }, { -2, 1 }, { 1, -1 } };   /* here, elsewhere, unknown, frozen, own slot unknown */
+        for (int a = 0; a < 5; ++a)
+            for (int k = 0; k < nOc; ++k)
+            {
+                int oh = 99;
+                const bool ref = SlaveOwnEscapeDecide(1, 2, area[a][0], area[a][1], oc[k].type, oc[k].ch, oc[k].sq, &oh);
+                const bool expect = a != 0 && (oc[k].want == kOwnerEmpty || oc[k].want == kOwnerNotHere || oc[k].want == kOwnerUnreadable);
+                if (oh != oc[k].want) Fail("T-1225: the detour's owner answer differs for " + std::string(oc[k].what));
+                if (ref != expect)
+                    Fail("T-1225: the slave's own 1 -> 2 was " + std::string(ref ? "refused" : "let through") + " for " + oc[k].what + " (area case " + I(a) + ")");
+                for (int cur = 0; cur <= kSlaveStateMax; ++cur)
+                    for (int want = 0; want <= kSlaveStateMax; ++want)
+                        if (!(cur == 1 && want == 2) && SlaveOwnEscapeDecide(cur, want, area[a][0], area[a][1], oc[k].type, oc[k].ch, oc[k].sq, 0))
+                            Fail("T-1225: the slave's own " + I(cur) + " -> " + I(want) + " was refused (" + oc[k].what + ")");
+            }
+    }
+    /* the named cases. T2019 (B's slave, A runs the area, B lacks the owner): refused. The map gap / the other player's loading /
+       a reload before the first map (fold 1): refused too. This game runs the area: the engine decides as alone. An unshared NPC
+       slaver standing on this game (uid 0, its hand resolves), a 0x5b owner, a lookup that could not run: the escape goes through. */
+    if (!SlaveOwnEscapeDecide(1, 2, 0, 1, kSlaveHandChar, 0, 0, 0)) Fail("T-1225: the T2019 case (owner not on B, A runs the area) went through");
+    if (!SlaveOwnEscapeDecide(1, 2, -1, 1, kSlaveHandChar, 0, 0, 0) || !SlaveOwnEscapeDecide(1, 2, -2, 1, kSlaveHandNone, -1, -1, 0))
+        Fail("T-1225: an unknown or frozen area map let a 1 -> 2 through with the owner missing");
+    if (SlaveOwnEscapeDecide(1, 2, 1, 1, kSlaveHandChar, 0, 0, 0) || SlaveOwnEscapeDecide(1, 2, 1, 1, kSlaveHandNone, 0, 0, 0))
+        Fail("T-1225: the slave's own 1 -> 2 was refused in this game's own area");
+    if (SlaveOwnEscapeDecide(1, 2, 0, 1, kSlaveHandChar, 1, 1, 0)) Fail("T-1225: an owner present with no uid blocked a real escape");
+    if (SlaveOwnEscapeDecide(1, 2, 0, 1, kSlaveHandOther, 1, 0, 0)) Fail("T-1225: a 0x5b owner the engine resolves blocked a real escape");
+    if (SlaveOwnEscapeDecide(1, 2, -1, 1, kSlaveHandChar, -1, 0, 0)) Fail("T-1225: a lookup that could not run blocked a real escape");
+    /* two engines, through the shipped decisions only. A runs the area (B's map unknown for the first 5 steps); B owns the
+       slave. A's copy engine wants ESCAPING from step 2 (no owner on A, T2019), EX_SLAVE once it reads ESCAPING (its own clock)
+       and NOT_SLAVE once it reads EX_SLAVE; B's engine wants ESCAPING from step 4, EX_SLAVE 3 steps after its escape and
+       NOT_SLAVE 6 steps after that. B's owner hand (a character) resolves to nobody until step 9, then to a character.
+       A's copy follows B by MSG_SLAVE. It must never loop: B changes at most 1 -> 2 -> 3 -> 0 (3 changes), and stays 1 while
+       its owner is unknown. */
+    {
+        int own = 1, copy = 1, changes = 0, escAt = -1, exAt = -1;
+        for (int step = 0; step < 60; ++step)
+        {
+            const int copyWants = copy == 1 && step >= 2 ? 2 : (copy == 2 ? 3 : (copy == 3 ? 0 : copy));
+            if (copyWants != copy && SlaveAskSenderDecide(true, false, copy, copyWants, 0, 0) == kAskSend
+                && SlaveAskOwnerDecide(true, own, copy, copyWants, 0, 0) == kAskApply)
+            { own = copyWants; ++changes; }
+            const int runnerOnB = step < 5 ? -1 : 0;
+            const int ownerChar = step < 9 ? 0 : 1;
+            const int ownWants = (own == 1 && step >= 4) ? 2 : (own == 2 && step >= escAt + 3) ? 3 : (own == 3 && step >= exAt + 6) ? 0 : own;
+            if (ownWants != own && !SlaveOwnEscapeDecide(own, ownWants, runnerOnB, 1, kSlaveHandChar, ownerChar, ownerChar, 0))
+            {
+                if (ownWants == 2) escAt = step;
+                if (ownWants == 3) exAt = step;
+                own = ownWants; ++changes;
+            }
+            if (step < 9 && own != 1) Fail("T-1225: B's slave left IS_SLAVE while its owner hand resolved to nobody on B: own=" + I(own) + " step " + I(step));
             copy = own;
         }
-        if (defer != 0 && (own != 3 || changes != 2)) Fail("two engines did not settle with the owner deferring: own=" + I(own) + " changes=" + I(changes));
-        if (defer == 0 && changes <= 2) Fail("the disagreeing-engines model did not show the flip it guards against: changes=" + I(changes));
+        if (own != 0 || changes != 3 || escAt != 9) Fail("T-1225: the two-engine model did not end 1 -> 2 -> 3 -> 0 on B's own engine: own=" + I(own)
+                                                            + " changes=" + I(changes) + " escAt=" + I(escAt));
     }
 
     /* the bail from the area's runner only, and its resend loop */
@@ -481,8 +610,8 @@ void t_t600_bail_and_slave_ask()
     if (cooprison::BailPendingStep(true, true, true, cooprison::kBailResendMs, 1) != cooprison::kBailResend) Fail("a pending bail was not sent again");
     if (cooprison::BailPendingStep(true, true, true, cooprison::kBailResendMs, cooprison::kBailTriesMax) != cooprison::kBailGiveUp)
         Fail("a bail the owner never shows was sent without end");
-    if (SlaveAskOwnerDecide(true, 1, 1, 2, 1, 0) != kAskSenderNotHolder) Fail("an ask from a game that does not run the area was applied");
-    if (SlaveAskOwnerDecide(true, 1, 1, 2, -1, 0) != kAskHolderUnknown || SlaveAskOwnerDecide(true, 1, 1, 2, 0, -1) != kAskHolderUnknown)
+    if (SlaveAskOwnerDecide(true, 1, 1, 3, 1, 0) != kAskSenderNotHolder) Fail("an ask from a game that does not run the area was applied");
+    if (SlaveAskOwnerDecide(true, 1, 1, 3, -1, 0) != kAskHolderUnknown || SlaveAskOwnerDecide(true, 1, 1, 3, 0, -1) != kAskHolderUnknown)
         Fail("an ask with the area runner unknown was applied");
     if (SlaveAskOwnerDecide(true, -1, 1, 2, 0, 0) != kAskOwnerBad || SlaveAskOwnerDecide(true, 1, 1, 1, 0, 0) != kAskOwnerBad)
         Fail("an unreadable state or a no-change ask was applied");
@@ -525,7 +654,7 @@ void t_arrest2_prison_wire()
         Fail("a prison message with no outer key did not survive");
     for (size_t n = 0; n < b.size(); ++n)
         if (cooprison::DecodePrison(&b[0], n, &o) == cooprison::kPrisonDecodeOk) { Fail("a cut prison message decoded at " + I((int)n)); break; }
-    std::vector<char> k(b); k[4] = 10;
+    std::vector<char> k(b); k[4] = 13;   /* T-980: 10-12 are FREED / JOIN ASK / JOIN NO */
     if (cooprison::DecodePrison(&k[0], k.size(), &o) != cooprison::kPrisonDecodeBadKind) Fail("a bad prison kind was accepted");
     std::vector<char> e(b); e[5] = 0;
     if (cooprison::DecodePrison(&e[0], e.size(), &o) != cooprison::kPrisonDecodeBadKey) Fail("an empty cage key was accepted");
@@ -564,8 +693,8 @@ void t_arrest2_prison_wire()
             || ro.uid != 79u || ro.kind != cooprison::kPrisonDeath || ro.cageKey != "deathCheck" || !ro.outerKey.empty())
             Fail("a prison DEATH request did not survive");
     }
-    std::vector<char> bk(b); bk[4] = 10;   /* P42: 7 and 8 are SHACKLE LOCK / CAGE LOCK; 9 is SLAVE ASK */
-    if (cooprison::DecodePrison(&bk[0], bk.size(), &o) != cooprison::kPrisonDecodeBadKind) Fail("prison kind 10 was accepted");
+    std::vector<char> bk(b); bk[4] = 13;   /* P42: 7 and 8 are SHACKLE LOCK / CAGE LOCK; 9 is SLAVE ASK; T-980: 10-12 FREED / JOIN ASK / JOIN NO */
+    if (cooprison::DecodePrison(&bk[0], bk.size(), &o) != cooprison::kPrisonDecodeBadKind) Fail("prison kind 13 was accepted");
 }
 
 /* P42: MSG_PRISON kinds SHACKLE LOCK (7) / CAGE LOCK (8) and the restraint-lock decisions (prisonwire.h). */
@@ -1675,7 +1804,10 @@ void t_names2a_faction_row()
     { Row a; a.person = P; a.num = 3; a.name = "Three"; a.faction = "Three"; a.active = 0; rows.push_back(a); }
     { Row a; a.person = Q; a.num = 1; a.name = "Q"; a.faction = "Q"; rows.push_back(a); }
     int i = -1;
-    if (FactionDecide(rows, P + ".2", 2, "GapThree", &i, &f) != kFacSet || i != 1 || f != "GapThree") Fail("names2a: profile 2 sets its own row");
+    /* T-717: these rows hold their player name as faction name - the form NEW wrote before T-368, a placeholder the world gave (second
+       review LOW 1) - so a LOAD with another name sets it (no case A), as a RENAME does; the row rules here are a rename's */
+    if (FactionDecide(rows, P + ".2", 2, "GapThree", &i, &f) != kFacSet || i != 1 || f != "GapThree") Fail("names2a: a load replaces profile 2's legacy row name (T-717 review LOW 1)");
+    if (FactionDecide(rows, P + ".2", 2, "GapThree", &i, &f, 1) != kFacSet || i != 1 || f != "GapThree") Fail("names2a: profile 2 sets its own row");
     if (FactionDecide(rows, P, 1, "One ", &i, &f) != kFacSame || i != 0) Fail("names2a: an unchanged name (after trimming) is SAME");
     if (FactionDecide(rows, P + ".2", 1, "GapThree", &i, &f) != kFacRefusedSender) Fail("names2a: profile 2 may not write profile 1's row");
     if (FactionDecide(rows, P, 2, "GapThree", &i, &f) != kFacRefusedSender) Fail("names2a: profile 1 may not write profile 2's row");
@@ -1684,7 +1816,7 @@ void t_names2a_faction_row()
     if (FactionDecide(rows, P + ".3", 3, "GapThree", &i, &f) != kFacRefusedUnknown) Fail("names2a: a deleted profile's row is not written");
     if (FactionDecide(rows, P + ".4", 4, "GapThree", &i, &f) != kFacRefusedUnknown) Fail("names2a: a profile with no row is refused");
     if (FactionDecide(rows, Q, 1, "   ", &i, &f) != kFacRefusedName || rows[3].faction != "Q") Fail("names2a: an empty name is refused, the row unchanged");
-    if (FactionDecide(rows, Q, 1, long30, &i, &f) != kFacSet || f.size() != 24) Fail("names2a: a long name is set cut to 24");
+    if (FactionDecide(rows, Q, 1, long30, &i, &f, 1) != kFacSet || f.size() != 24) Fail("names2a: a long name is set cut to 24");
 }
 
 /* H068 (owner 471): Kenshi's default "Nameless" at a load becomes each profile's own "Nameless <n>" - the operator's and every joiner's, played
@@ -1787,6 +1919,121 @@ void t_h069_freed_names_are_free()
     }
 }
 
+/* T-717 (pull request 4 task 2): a player faction's name on reload, cases A-D, in the order Kenshi default (C), the row's own name
+   (A), a clash (B / D); the game's side of each; the message-line words; the new verdict on the wire. */
+void t_t717_faction_reload()
+{
+    using namespace coopprof;
+    const std::string P(32, 'p'), Q(32, 'q'), R(32, 'r');
+    std::vector<Row> rows;
+    { Row a; a.person = P; a.num = 1; a.name = "Pia"; a.faction = "Sand Fleas"; a.created = 100; a.played = 1; rows.push_back(a); }
+    { Row a; a.person = Q; a.num = 1; a.name = "Quin"; a.faction = "Hub Rats"; a.created = 200; a.played = 1; rows.push_back(a); }
+    { Row a; a.person = R; a.num = 1; a.name = "Rae"; a.faction = ""; a.created = 300; a.played = 0; rows.push_back(a); }
+    int i = -1; std::string f;
+    /* A: row Sand Fleas, the save loads a FREE older name - the row keeps its name, the game takes it, nothing shown */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Dust Bandits", &i, &f, 0) != kFacKeep || f != "Sand Fleas" || i != 0) Fail("T-717 A: the world's newer name wins");
+    if (FactionApplyDecide(kFacKeep, "Dust Bandits", "Dust Bandits", "Sand Fleas") != kFacApplySilent) Fail("T-717 A: applied silently");
+    if (FactionApplyDecide(kFacKeep, "Sand Fleas", "Dust Bandits", "Sand Fleas") != kFacApplyHave) Fail("T-717 A: already carried");
+    /* A: a save whose name another profile holds - the row's own name still wins (A before B) */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Hub Rats", &i, &f, 0) != kFacKeep || f != "Sand Fleas") Fail("T-717 A: the row's own name before a clash");
+    /* A: the same name in another case or spacing is a re-case, as today */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "sand fleas", &i, &f, 0) != kFacSet || f != "sand fleas") Fail("T-717 A: the row's name re-cased");
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Sand Fleas", &i, &f, 0) != kFacSame) Fail("T-717 A: the same name");
+    /* A: an empty row takes the save's name, as today */
+    if (FactionDecide(rows, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet || f != "Dust Bandits") Fail("T-717 A: an empty row takes the save's name");
+    /* audit 3 (T2-1): a placeholder the world gave the row - a new profile's "Nameless <n>", an adopted slot's "Profile <n>" - never wins
+       over the save's name: a free name is set, a taken one moved (B), as before T-717 */
+    { std::vector<Row> r4(rows); r4[2].faction = "Nameless 2";
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet || f != "Dust Bandits") Fail("T-717 A: a new profile's Nameless <n> takes the save's name");
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved) Fail("T-717 A: a new profile's Nameless <n> with a taken name is moved");
+      r4[2].faction = "Profile 1";
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet || f != "Dust Bandits") Fail("T-717 A: an adopted Profile <n> takes the save's name");
+      r4[2].faction = "Profile 7";
+      if (FactionDecide(r4, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacKeep || f != "Profile 7") Fail("T-717 A: Profile <another number> is a chosen name"); }
+    /* A: a row not holding its name by right (a row made earlier holds it too) is judged by the clash rule */
+    { std::vector<Row> r2(rows); r2[1].faction = "Sand Fleas";
+      if (FactionDecide(r2, SlotKey(Q, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet) Fail("T-717 A: a row holding a name made earlier by another does not keep it");
+      if (FactionDecide(r2, SlotKey(Q, 1), 1, "Sand Fleas", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("T-717: two rows, one name - the later is moved"); }
+    /* renames keep today's behaviour */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Dust Bandits", &i, &f, 1) != kFacSet || f != "Dust Bandits") Fail("T-717: a rename to a free name is set");
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Hub Rats", &i, &f, 1) != kFacBack || f != "Sand Fleas") Fail("T-717: a rename to a taken name goes back (box, as today)");
+    if (FactionApplyDecide(kFacBack, "Hub Rats", "Hub Rats", "Sand Fleas") != kFacApplyBackBox) Fail("T-717: the Back box stays");
+    /* B: a load with a name another holds, from a row with no name of its own - moved, said on the message line */
+    if (FactionDecide(rows, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("T-717 B: a real clash is moved");
+    if (FactionApplyDecide(kFacMoved, "Hub Rats", "Hub Rats", "Nameless 1") != kFacApplyMovedLine) Fail("T-717 B: the message line, no box");
+    if (coopui::FactionMovedLineText("Hub Rats", "Nameless 1") != "The faction name \"Hub Rats\" is already taken in this world. Your faction is now called \"Nameless 1\".")
+        Fail("T-717 B: the approved message-line words");
+    /* C: Kenshi's default Nameless at a load - the profile's Nameless <n>, nothing shown */
+    if (FactionDecide(rows, SlotKey(P, 1), 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("T-717 C: Kenshi's Nameless takes a Nameless number");
+    if (FactionApplyDecide(kFacDefault, "Nameless", "Nameless", "Nameless 1") != kFacApplySilent) Fail("T-717 C: nothing shown");
+    /* D: the save's automatic Nameless <n> found taken, moved to another - nothing shown */
+    if (FactionApplyDecide(kFacMoved, "Nameless 4", "Nameless 4", "Nameless 1") != kFacApplySilent) Fail("T-717 D: an automatic Nameless <n> moved silently");
+    if (FactionApplyDecide(kFacMoved, "Nameless", "Nameless", "Nameless 1") != kFacApplyMovedLine) Fail("T-717 D: plain Nameless is not an automatic number");
+    /* the new verdict on the wire, owed until acknowledged, named in logs */
+    FactionAnswer fa; fa.verdict = kFacKeep; fa.num = 1; fa.asked = "Dust Bandits"; fa.name = "Sand Fleas";
+    std::vector<char> w; EncodeFactionAnswer(&w, fa); FactionAnswer fb;
+    if (!DecodeFactionAnswer(w, &fb) || fb.verdict != kFacKeep || fb.asked != "Dust Bandits" || fb.name != "Sand Fleas") Fail("T-717: kFacKeep round-trips");
+    if (FactionOwedAfter(kFacKeep) != kFacOwedReplace || std::string(FactionVerdictName(kFacKeep)) != "worldNameKept") Fail("T-717: kFacKeep owed and named");
+    w[1] = (char)9; if (DecodeFactionAnswer(w, &fb)) Fail("T-717: an unknown verdict is refused");
+    /* review LOW 1: a clash is told once per change. The save still carries the clashing name (the player has not saved since the
+       move), so the load is judged Moved again to the very name the row took; after the game acknowledged that move it is kept silently */
+    { std::vector<Row> r5(rows); r5[2].faction = "Nameless 1";
+      if (FactionDecide(r5, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("T-717 LOW 1: the repeat load is judged Moved to the row's own name");
+      const std::string told = FactionToldKey("Hub Rats", "Nameless 1");
+      if (FactionToldOnce(kFacMoved, "Nameless 1", "Hub Rats", "Nameless 1", told) != kFacKeep) Fail("T-717 LOW 1: the same clash again is kept, not told again");
+      if (FactionApplyDecide(kFacKeep, "Hub Rats", "Hub Rats", "Nameless 1") != kFacApplySilent) Fail("T-717 LOW 1: the repeat is applied with no line");
+      if (FactionToldOnce(kFacMoved, "Nameless 1", "Hub Rats", "Nameless 1", "") != kFacMoved) Fail("T-717 LOW 1: a clash never acknowledged is told");
+      if (FactionToldOnce(kFacMoved, "", "Hub Rats", "Nameless 1", told) != kFacMoved) Fail("T-717 LOW 1: a clash that changes the row is told");
+      if (FactionToldOnce(kFacMoved, "Nameless 1", "Sand Fleas", "Nameless 1", told) != kFacMoved) Fail("T-717 LOW 1: another clash is told");
+      if (FactionToldOnce(kFacMoved, "Nameless 2", "Hub Rats", "Nameless 2", told) != kFacMoved) Fail("T-717 LOW 1: a move to another name is told");
+      if (FactionToldOnce(kFacSet, "Nameless 1", "Hub Rats", "Nameless 1", told) != kFacSet
+          || FactionToldOnce(kFacDefault, "Nameless 1", "Hub Rats", "Nameless 1", told) != kFacDefault) Fail("T-717 LOW 1: other verdicts pass through"); }
+    {   /* the world server applies it: remembered at the game's acknowledgement of a Moved answer, forgotten with a deleted profile */
+        const std::string server = T313ReadFile("../coop-store/store_main.cpp");
+        if (server.find("coopprof::FactionToldOnce(v, g_profiles[(size_t)i].faction, a0, fac, t->second)") == std::string::npos
+            || server.find("if (it->second.verdict == coopprof::kFacMoved) g_facTold[key] = coopprof::FactionToldKey(it->second.asked, it->second.name);") == std::string::npos
+            || server.find("g_facTold.erase(coopprof::SlotKey(person, num));") == std::string::npos)
+            Fail("T-717 LOW 1: the world server does not tell a clash once per change");
+    }
+    /* review LOW 2: the line is shown escaped - a '#' in a faction name is doubled, never read as a colour code */
+    if (playerstab::EscapeHash(coopui::FactionMovedLineText("#ff0000Rats", "Nameless 1"))
+        != "The faction name \"##ff0000Rats\" is already taken in this world. Your faction is now called \"Nameless 1\".")
+        Fail("T-717 LOW 2: a '#' in the message line is doubled");
+    {
+        const std::string pf = T313ReadFile("../coop-plugin/playerfaction.cpp");
+        if (pf.find("const std::string line = coopui::FactionMovedLineText(a.asked, a.name);") == std::string::npos
+            || pf.find("coop::StoreShowPlayerLine(playerstab::EscapeHash(line))") == std::string::npos || pf.find("FactionMovedText(") != std::string::npos)
+            Fail("T-717 LOW 2: the game does not show the faction-name line escaped on the message line");
+    }
+    /* second review LOW 1: a row whose faction name equals its player name (what NEW wrote before T-368) is a placeholder the world gave
+       it - never kept over the save's name (case A), even when marked played; a free name is set, a taken one moved */
+    { std::vector<Row> r6(rows); r6[2].faction = "Rae"; r6[2].played = 1;
+      if (!FactionIsPlaceholder(r6[2])) Fail("T-717 review LOW 1: faction = player name is a placeholder");
+      if (FactionDecide(r6, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet || f != "Dust Bandits") Fail("T-717 review LOW 1: a legacy row takes the save's free name");
+      if (FactionDecide(r6, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("T-717 review LOW 1: a legacy row with a taken save name is moved");
+      r6[2].faction = "rae";
+      if (FactionDecide(r6, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacSet) Fail("T-717 review LOW 1: the player name in another case is a placeholder too");
+      r6[2].faction = "Rae Clan";
+      if (FactionIsPlaceholder(r6[2]) || FactionDecide(r6, SlotKey(R, 1), 1, "Dust Bandits", &i, &f, 0) != kFacKeep || f != "Rae Clan")
+          Fail("T-717 review LOW 1: a name the player gave is still kept (A)"); }
+    /* second review LOW 3: a clash moves the row to its own "Nameless <n>" while no other profile holds it, else the lowest free one */
+    { std::vector<Row> r7(rows); r7[2].faction = "Nameless 3";
+      if (FactionDecide(r7, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved || f != "Nameless 3") Fail("T-717 review LOW 3: Moved reuses the row's own Nameless number");
+      r7[1].faction = "Nameless 3";
+      if (FactionDecide(r7, SlotKey(R, 1), 1, "Sand Fleas", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("T-717 review LOW 3: a Nameless number another holds is not reused");
+      r7[1].faction = "Hub Rats"; r7[2].faction = "Nameless 1"; r7[0].faction = "Nameless 1"; r7[0].created = 400;
+      if (FactionDecide(r7, SlotKey(R, 1), 1, "Hub Rats", &i, &f, 0) != kFacMoved || f != "Nameless 2") Fail("T-717 review LOW 3: a shared Nameless number is not reused"); }
+    /* second review LOW 2: the told-once memory is forgotten when the row's faction name changes, kept when it does not */
+    { std::map<std::string, std::string> told; told["k"] = FactionToldKey("Hub Rats", "Nameless 1"); told["j"] = "x";
+      FactionToldAfterRow(&told, "k", "Nameless 1", "Nameless 1");
+      if (told.find("k") == told.end()) Fail("T-717 review LOW 2: an unchanged row keeps its told memory");
+      FactionToldAfterRow(&told, "k", "Nameless 1", "Dust Bandits");
+      if (told.find("k") != told.end() || told.find("j") == told.end()) Fail("T-717 review LOW 2: a changed row forgets only its own told memory");
+      const std::string server = T313ReadFile("../coop-store/store_main.cpp");
+      if (server.find("coopprof::FactionToldAfterRow(&g_facTold, key, old, r.faction);") == std::string::npos)
+          Fail("T-717 review LOW 2: the world server does not forget the told memory when the row changes"); }
+}
+
 /* T-368 (owner 265-270, 472): player names and faction names unique per world, connected or not; a new player's faction "Nameless <n>". */
 void t_t368_unique_names()
 {
@@ -1824,7 +2071,11 @@ void t_t368_unique_names()
     int i = -1; std::string f;
     if (FactionDecide(rows, P, 1, "Sand Fleas", &i, &f, 1) != kFacSet || f != "Sand Fleas") Fail("T-368: a rename to a deleted profile's faction name is taken");
     if (FactionDecide(rows, P, 1, "nameless 3", &i, &f, 1) != kFacBack || f != "Hub Rats" || i != 0) Fail("T-368: a rename to a taken name goes back to the row's own");
-    if (FactionDecide(rows, P, 1, "Nameless 3", &i, &f, 0) != kFacMoved || f != "Nameless 2") Fail("T-368: a load with a taken name takes the lowest free Nameless number");
+    /* T-717: a row holding a name by right keeps it at a load (case A, kFacKeep) - before a clash is judged; a row with no
+       name of its own still takes the lowest free Nameless number for a taken name (D) */
+    if (FactionDecide(rows, P, 1, "Nameless 3", &i, &f, 0) != kFacKeep || f != "Hub Rats") Fail("T-717 A: a load with an older name keeps the row's name");
+    { std::vector<Row> r3(rows); r3[0].faction = "";
+      if (FactionDecide(r3, P, 1, "Nameless 3", &i, &f, 0) != kFacMoved || f != "Nameless 2") Fail("T-368: a load with a taken name takes the lowest free Nameless number"); }
     if (FactionDecide(rows, P, 1, "hub rats", &i, &f, 1) != kFacSet || f != "hub rats") Fail("T-368: a profile may re-case its own faction name");
     if (FactionDecide(rows, Q, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("T-368: a never-played profile's new game keeps its row's Nameless number");
     if (FactionDecide(rows, R, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 3" || i != 3)
@@ -1844,7 +2095,8 @@ void t_t368_unique_names()
     if (FactionDecide(rows, Q + ".2", 2, "Hub Rats", &i, &f, 0) != kFacRefusedUnknown) Fail("T-368: a deleted profile's row is not judged");
     /* what the game does with the world's answer */
     if (FactionApplyDecide(kFacBack, "Nameless 3", "Nameless 3", "Hub Rats") != kFacApplyBackBox) Fail("T-368: back - the change-back box");
-    if (FactionApplyDecide(kFacMoved, "Nameless 3", "Nameless 3", "Nameless 2") != kFacApplyMovedBox) Fail("T-368: moved - the load box");
+    if (FactionApplyDecide(kFacMoved, "Nameless 3", "Nameless 3", "Nameless 2") != kFacApplySilent) Fail("T-717 D: an automatic Nameless <n> moved - nothing shown");
+    if (FactionApplyDecide(kFacMoved, "Sand Fleas", "Sand Fleas", "Nameless 2") != kFacApplyMovedLine) Fail("T-717 B: moved - the message line");
     if (FactionApplyDecide(kFacDefault, "Nameless", "Nameless", "Nameless 2") != kFacApplySilent) Fail("T-368: Kenshi's default name takes the profile's Nameless number - no box");
     if (FactionApplyDecide(kFacBack, "Other", "Nameless 3", "Hub Rats") != kFacApplyDrop) Fail("T-368: an answer about a name the faction no longer has is dropped");
     if (FactionApplyDecide(kFacDefault, "Hub Rats", "Hub Rats", "Nameless 2") != kFacApplyDrop) Fail("T-368: a Nameless number is applied only to Kenshi's Nameless");
@@ -1852,7 +2104,7 @@ void t_t368_unique_names()
     /* the words */
     if (std::string(coopui::kFactionBoxTitle) != "Faction Name"
         || coopui::FactionBackText("Hub Rats", "Sand Fleas") != "Your faction name \"Hub Rats\" is already taken in this world, so it was changed back to \"Sand Fleas\"."
-        || coopui::FactionMovedText("Hub Rats", "Sand Fleas") != "Another player in this world already uses the faction name \"Hub Rats\". Your faction is now called \"Sand Fleas\".")
+        || coopui::FactionMovedLineText("Hub Rats", "Nameless 2") != "The faction name \"Hub Rats\" is already taken in this world. Your faction is now called \"Nameless 2\".")
         Fail("T-368: the approved Faction Name box words (owner 270 a)");
     /* the wire */
     std::vector<char> w; int kind = 0; unsigned num = 0; std::string nm;
@@ -1898,7 +2150,8 @@ void t_t368_format_owed_reply()
     }
     /* 2: an accepted judgement clears what was owed; a changed name is owed instead; a refusal keeps it */
     if (FactionOwedAfter(kFacSet) != kFacOwedClear || FactionOwedAfter(kFacSame) != kFacOwedClear) Fail("T-368: an accepted name clears the owed answer");
-    if (FactionOwedAfter(kFacBack) != kFacOwedReplace || FactionOwedAfter(kFacMoved) != kFacOwedReplace || FactionOwedAfter(kFacDefault) != kFacOwedReplace)
+    if (FactionOwedAfter(kFacBack) != kFacOwedReplace || FactionOwedAfter(kFacMoved) != kFacOwedReplace || FactionOwedAfter(kFacDefault) != kFacOwedReplace
+        || FactionOwedAfter(kFacKeep) != kFacOwedReplace)
         Fail("T-368: a changed name's answer is owed in place of the old one");
     if (FactionOwedAfter(kFacRefusedSender) != kFacOwedKeep || FactionOwedAfter(kFacRefusedUnknown) != kFacOwedKeep || FactionOwedAfter(kFacRefusedName) != kFacOwedKeep)
         Fail("T-368: a refusal leaves the owed answer");
@@ -1918,10 +2171,10 @@ void t_t368_format_owed_reply()
         Fail("T-368: an old answer is neither acknowledged nor reported");
     if (FactionReplyDecide(kFacApplyHave, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplyHave, true, true) != kFacReplySeen)
         Fail("T-368: an answer the faction carries is acknowledged");
-    if (FactionReplyDecide(kFacApplyMovedBox, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplySilent, false, true) != kFacReplySeen)
+    if (FactionReplyDecide(kFacApplyMovedLine, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplySilent, false, true) != kFacReplySeen)
         Fail("T-368: an applied answer is acknowledged");
     if (FactionReplyDecide(kFacApplyBackBox, true, false) != kFacReplyReport) Fail("T-368: a record holding the name - the kept name is reported back");
-    if (FactionReplyDecide(kFacApplyMovedBox, true, true) != kFacReplyNone) Fail("T-368: the same answer is reported back once only");
+    if (FactionReplyDecide(kFacApplyMovedLine, true, true) != kFacReplyNone) Fail("T-368: the same answer is reported back once only");
 }
 void t_t368_names_all_typed()
 {
@@ -2000,7 +2253,7 @@ void t_t368_names_all_typed()
     {
         const std::string long30("ABCDEFGHIJKLMNOPQRSTUVWXYZ1234");
         if (FactionApplyDecide(kFacBack, "  " + long30 + " ", long30.substr(0, 24), "Old") != kFacApplyBackBox) Fail("T-368: an answer judged on the row's cut of a long name applies");
-        if (FactionApplyDecide(kFacMoved, " Hub Rats ", "Hub Rats", "Nameless 2") != kFacApplyMovedBox) Fail("T-368: an answer applies through edge spaces");
+        if (FactionApplyDecide(kFacMoved, " Hub Rats ", "Hub Rats", "Nameless 2") != kFacApplyMovedLine) Fail("T-368: an answer applies through edge spaces");
         if (FactionApplyDecide(kFacMoved, "Nameless 2", "Nameless 2", "Nameless 2") != kFacApplyHave) Fail("T-368: an answer naming the name it has is had already");
     }
     /* the answers on the wire */
@@ -2366,6 +2619,15 @@ void t_p11f6_slave_gate()
     int id3[2] = { 0, 1 }; long sq3[2] = { (-2147483647L - 1), 2147483647L };   /* slot 0 became ready AFTER the counter wrapped */
     if (coopcapture::CapOrderBySeq(id3, sq3, 2) != 1 || id3[0] != 1 || id3[1] != 0) Fail("the send order is not wrap-safe");
     if (coopcapture::CapOrderBySeq(id3, sq3, 0) != 0) Fail("an empty set reports a reorder");
+    /* T-478: the surrender line counts each chained character once (the shackles' second setChainedMode call is not counted) */
+    unsigned int cu[3] = { 0, 0, 0 }; int cn = 0;
+    cn = coopcapture::CapChainCountAdd(cu, cn, 3, 11u); cn = coopcapture::CapChainCountAdd(cu, cn, 3, 11u);
+    if (cn != 1 || cu[0] != 11u || cu[1] != 0u) Fail("a character chained then shackled is counted twice");
+    cn = coopcapture::CapChainCountAdd(cu, cn, 3, 12u); cn = coopcapture::CapChainCountAdd(cu, cn, 3, 0u);
+    if (cn != 2 || cu[1] != 12u) Fail("a second character is not counted, or uid 0 is");
+    cn = coopcapture::CapChainCountAdd(cu, cn, 3, 13u); cn = coopcapture::CapChainCountAdd(cu, cn, 3, 14u);
+    if (cn != 4 || cu[2] != 13u) Fail("past the list's room a new character is not counted, or overwrote the list");
+    if (coopcapture::CapChainCountAdd(cu, cn, 3, 12u) != 4) Fail("a listed character is counted again past the list's room");
     /* M7b (T750): the captor's block after an answer, and when it lets a processing request through */
     const int BN = coopcapture::kCapBlockNone, BS = coopcapture::kCapBlockSet, BR = coopcapture::kCapBlockRetarget;
     if (coopcapture::CapBlockOnAnswer(false, coopcapture::kCapApplied, 0, false) != BS) Fail("an applied processing answer set no block");
@@ -6201,21 +6463,6 @@ void t_house2_late_place()
     if (coopbuild::BuildAdoptNonce(0, 3, 0) != 0) Fail("house2 fold 2: a no-nonce PLACE changed the row");
 }
 
-/* house2 fold (MED1): a retry that finally reads the owed file merges it - an in-memory row for the same key wins */
-void t_house2_owed_merge()
-{
-    std::map<std::string, int> mem;
-    std::set<std::string> erased;
-    erased.insert("k3");   /* fold 2: a REMOVE ended k3's row while the file was unread */
-    mem["k1"] = 1;   /* recorded in memory while the file could not be read */
-    if (coopbuild::BuildOwedMergeRow(&mem, &erased, std::string("k1"), 2) != 0 || mem["k1"] != 1) Fail("house2 fold: the file's row replaced an in-memory row for the same key");
-    if (coopbuild::BuildOwedMergeRow(&mem, &erased, std::string("k2"), 3) != 1 || mem["k2"] != 3) Fail("house2 fold: a file row for a key not in memory was not merged");
-    if (coopbuild::BuildOwedMergeRow(&mem, &erased, std::string("k3"), 4) != 2 || mem.find("k3") != mem.end())
-        Fail("house2 fold 2: a file row a REMOVE ended while the file was unread came back at the merge");
-    if (coopbuild::BuildOwedMergeRow(&mem, (const std::set<std::string>*)0, std::string("k4"), 5) != 1) Fail("house2 fold 2: a merge with no erased set refused a row");
-    if (mem.size() != 3) Fail("house2 fold: the merged map does not hold exactly the kept and merged rows");
-}
-
 /* house2 fold (protocol 76): the PLACE nonce - written only when non-zero, absent = 0 (an old sender), one encoding */
 void t_house2_place_nonce_wire()
 {
@@ -6959,6 +7206,22 @@ void t_p25_name_levers_parse()
     if (!TalkTestNameParse("nearestname Very Long Named Guard Of The Hub 7 3", &nm, &t, &ev, &own) || nm != "very long named guard of the hub" || ev != 3)
         Fail("a seven-word name must parse");
     if (TalkTestNameParse("nearestname 4 1", &nm, &t, &ev, &own)) Fail("no name must be refused");
+    {   /* T-858: talktest nearestcarrier <act> <targetUid> [event] [copy | mine] */
+        int ca = 0, ce = 0, co = 0; unsigned int ct = 0;
+        if (!TalkTestCarrierParse("nearestcarrier 8 4194305 1 mine", &ca, &ct, &ce, &co) || ca != 8 || ct != 4194305 || ce != 1 || co != 1)
+            Fail("nearestcarrier with act, target, event and mine must parse");
+        if (!TalkTestCarrierParse("  nearestcarrier 8 0x10 ", &ca, &ct, &ce, &co) || ca != 8 || ct != 16 || ce != 1 || co != -1)
+            Fail("nearestcarrier with no event must default to 1, any owner");
+        if (!TalkTestCarrierParse("nearestcarrier 8 5 copy", &ca, &ct, &ce, &co) || ce != 1 || co != 0) Fail("nearestcarrier copy without an event must parse");
+        if (!TalkTestCarrierParse("nearestcarrier 2 5 0x3", &ca, &ct, &ce, &co) || ca != 2 || ce != 3) Fail("a hex event must parse");
+        if (TalkTestCarrierParse("nearestcarrier 8", &ca, &ct, &ce, &co) || ca != -1) Fail("no target must be refused (outputs reset)");
+        if (TalkTestCarrierParse("nearestcarrier 8 0 1", &ca, &ct, &ce, &co)) Fail("target 0 must be refused");
+        if (TalkTestCarrierParse("nearestcarrier 256 5", &ca, &ct, &ce, &co)) Fail("an act over 255 must be refused");
+        if (TalkTestCarrierParse("nearestcarrier 8 5 256", &ca, &ct, &ce, &co)) Fail("an event over 255 must be refused");
+        if (TalkTestCarrierParse("nearestcarrier 8 5 1 mine extra", &ca, &ct, &ce, &co)) Fail("a word after the owner must be refused");
+        if (TalkTestCarrierParse("nearestcarrier money 5", &ca, &ct, &ce, &co)) Fail("a word for the act must be refused");
+        if (TalkTestCarrierParse("nearestname 8 5", &ca, &ct, &ce, &co)) Fail("another verb must be refused");
+    }
     if (TalkTestNameParse("nearestname Bar Thug", &nm, &t, &ev, &own)) Fail("no target must be refused");
     if (TalkTestNameParse("nearestname Bar Thug 0 1", &nm, &t, &ev, &own)) Fail("target 0 must be refused");
     if (TalkTestNameParse("nearestname Bar Thug 5 256", &nm, &t, &ev, &own)) Fail("event 256 must be refused");
@@ -7075,9 +7338,9 @@ void t_p26s1_talkwire_round_trip_caps_and_refusals()
     e.kind = kTalkEnd; e.convId = 9; e.npcUid = 3; e.targetUid = 4; e.reason = kTalkEndAnswered;
     std::vector<char> eb;
     TalkMsg qe;
-    if (!EncodeTalk(&eb, e) || eb.size() != 20 || DecodeTalk(&eb[0], eb.size(), &qe) != kTalkDecodeOk || qe.kind != kTalkEnd
+    if (!EncodeTalk(&eb, e) || eb.size() != 22 || DecodeTalk(&eb[0], eb.size(), &qe) != kTalkDecodeOk || qe.kind != kTalkEnd
         || qe.reason != kTalkEndAnswered || qe.convId != 9)
-        Fail("an END must be 20 bytes (P25: + reqId, why, endsType) and round-trip");
+        Fail("an END must be 22 bytes (P25: + reqId, why, endsType; T-478: + an empty line id) and round-trip");
     TalkMsg big = p;
     big.npcText = std::string(513, 'a');
     std::vector<char> bb;
@@ -7242,8 +7505,8 @@ void t_p26s5_talkwire_act_round_trip_caps_and_side_table()
         || std::string(TalkActResultName(kTalkActHireNotAsked)) != "HIRE_NOT_ASKED" || std::string(TalkActResultName(kTalkActNoCarry)) != "NO_CARRY"
         || std::string(TalkActResultName(99)) != "?")
         Fail("the stage-5 names must read as the log shows them");
-    const int apply[] = { 4, 5, 8, 9, 13, 14, 23, 25, 32, 35, 49, 53 };
-    const int refuse[] = { 1, 11, 24, 41, 42, 43, 44, 45, 46, 47, 48 };
+    const int apply[] = { 4, 5, 8, 9, 13, 14, 23, 25, 32, 35, 47, 49, 53 };   /* T-478 step 4: 47 SURRENDER joined */
+    const int refuse[] = { 1, 11, 24, 44, 45, 46 };   /* T-478 step 3: 43 left (kTalkSideEnds); step 4: 47 left (APPLY); step 5: 41 left (kTalkSideEnds); step 6: 42 / 48 left (kTalkSideEnds) */
     const int carried[] = { 10, 30, 40 };
     const int npc[] = { 0, 2, 6, 7, 12, 15, 16, 17, 19, 20, 21, 22, 28, 29, 33, 34, 36, 52, 54, 55, 56, 57, 58, 59, -1, 999 };
     for (size_t i = 0; i < sizeof(apply) / sizeof(apply[0]); ++i) if (TalkActSide(apply[i]) != kTalkSideApply) Fail("an APPLY type is not on the target's owner");
@@ -7251,9 +7514,25 @@ void t_p26s5_talkwire_act_round_trip_caps_and_side_table()
     for (size_t i = 0; i < sizeof(carried) / sizeof(carried[0]); ++i) if (TalkActSide(carried[i]) != kTalkSideCarried) Fail("a carried-person type is not CARRIED");
     for (size_t i = 0; i < sizeof(npc) / sizeof(npc[0]); ++i) if (TalkActSide(npc[i]) != kTalkSideNpc) Fail("an NPC-side type is not on the NPC's owner");
     if (TalkActSide(3) != kTalkSideHire || TalkActSide(18) != kTalkSideHire) Fail("3 / 18 must take the hire road");
-    int sides[5] = { 0, 0, 0, 0, 0 };
+    {   /* T-858: talktest nearestcarrier's line test - the act with an NPC-side action, no hire or carried-person action */
+        const int bribe[] = { 8, 36 };          /* a drug bust bribe: pay, the dialogue locked */
+        const int starver[] = { 8, 4, 20 };     /* a starving bandit paid: relations, temporary ally */
+        const int moneyOnly[] = { 8 };          /* the NPC does nothing: never held, never listed */
+        const int withNone[] = { 8, 0 };        /* NONE is no NPC action */
+        const int hire[] = { 8, 3, 7 };         /* a hire's price is taken later */
+        const int carry[] = { 8, 10, 7 };
+        const int noAct[] = { 4, 36 };
+        if (!TalkCarrierLineFits(bribe, 2, 8) || !TalkCarrierLineFits(starver, 3, 8)) Fail("a paid line with an NPC-side action must fit");
+        if (TalkCarrierLineFits(moneyOnly, 1, 8) || TalkCarrierLineFits(withNone, 2, 8)) Fail("a paid line with no NPC-side action must not fit");
+        if (TalkCarrierLineFits(hire, 3, 8) || TalkCarrierLineFits(carry, 3, 8)) Fail("a hire or carried-person line must not fit");
+        if (TalkCarrierLineFits(noAct, 2, 8) || TalkCarrierLineFits(bribe, 0, 8)) Fail("a line without the act must not fit");
+        const int npcAct[] = { 7, 36 };
+        if (TalkCarrierLineFits(npcAct, 1, 7) || !TalkCarrierLineFits(npcAct, 2, 7)) Fail("an NPC-side act needs another NPC-side action beside it");
+    }
+    int sides[6] = { 0, 0, 0, 0, 0, 0 };
     for (int ty = 0; ty < 59; ++ty) ++sides[TalkActSide(ty)];
-    if (sides[kTalkSideApply] != 12 || sides[kTalkSideHire] != 2 || sides[kTalkSideRefuse] != 11 || sides[kTalkSideCarried] != 3 || sides[kTalkSideNpc] != 31)
+    if (sides[kTalkSideApply] != 13 || sides[kTalkSideHire] != 2 || sides[kTalkSideRefuse] != 6 || sides[kTalkSideCarried] != 3 || sides[kTalkSideNpc] != 31
+        || sides[kTalkSideEnds] != 4)   /* T-478 step 6: 42 / 48 moved from REFUSE to ENDS */
         Fail("the table's counts over DA_NONE..DA_KNOCKOUT changed");
     {   /* the carried-person types and the conversation-enders, exactly */
         int car = 0, ends = 0;
@@ -7261,10 +7540,11 @@ void t_p26s5_talkwire_act_round_trip_caps_and_side_table()
         {
             car += TalkActCarried(ty); ends += TalkActEndsTalk(ty);
             if (TalkActCarried(ty) && TalkActSide(ty) != kTalkSideCarried) Fail("a carried-person type is not CARRIED in the table");
-            if (TalkActEndsTalk(ty) && TalkActSide(ty) != kTalkSideRefuse) Fail("an ending type is not REFUSE");
+            if (TalkActEndsTalk(ty) && TalkActSide(ty) != kTalkSideRefuse && TalkActSide(ty) != kTalkSideEnds) Fail("an ending type is not REFUSE / ENDS");
         }
         if (car != 3 || !TalkActCarried(10) || !TalkActCarried(30) || !TalkActCarried(40)) Fail("exactly 10 / 30 / 40 act on the carried person");
-        if (ends != 2 || !TalkActEndsTalk(1) || !TalkActEndsTalk(11)) Fail("1 / 11 must end the conversation");
+        if (ends != 6 || !TalkActEndsTalk(1) || !TalkActEndsTalk(11) || !TalkActEndsTalk(41) || !TalkActEndsTalk(42) || !TalkActEndsTalk(43) || !TalkActEndsTalk(48))
+            Fail("1 / 11 / 41 / 42 / 43 / 48 must end the conversation");
     }
 }
 
@@ -7542,7 +7822,7 @@ void t_p25_talkwire_request_and_new_fields()
     e.kind = kTalkEnd; e.convId = 0; e.npcUid = 1; e.targetUid = 2; e.reason = kTalkEndNotStarted; e.reqId = 77; e.why = kTalkWhyFar;
     std::vector<char> eb;
     TalkMsg qe;
-    if (!EncodeTalk(&eb, e) || eb.size() != 20 || DecodeTalk(&eb[0], eb.size(), &qe) != kTalkDecodeOk || qe.reason != kTalkEndNotStarted
+    if (!EncodeTalk(&eb, e) || eb.size() != 22 || DecodeTalk(&eb[0], eb.size(), &qe) != kTalkDecodeOk || qe.reason != kTalkEndNotStarted
         || qe.reqId != 77 || qe.why != kTalkWhyFar || qe.endsType != 0 || qe.convId != 0)
         Fail("P25: END NOT_STARTED must carry its reqId and why");
     for (size_t n = 13; n < eb.size(); ++n)
@@ -7599,8 +7879,8 @@ void t_p25_intercept_request_order_and_local_windows()
     if (TalkP25RequestWhy(1, 1, 0, 1, 1, 0, 1) != kTalkWhyBusy) Fail("P25: busy comes before far");
     if (TalkP25RequestWhy(1, 1, 0, 1, 0, 0, 1) != kTalkWhyFar) Fail("P25: a talker beyond the talk gate of the NPC is far");
     if (TalkEndsLocal(1) != kTalkLocalTrade || TalkEndsLocal(11) != kTalkLocalEditor || TalkEndsLocal(0) != kTalkLocalNone
-        || TalkEndsLocal(4) != kTalkLocalNone)
-        Fail("P25: END endsType 1 opens the trade window, 11 the editor, anything else nothing");
+        || TalkEndsLocal(4) != kTalkLocalNone || TalkEndsLocal(43) != kTalkLocalBail || TalkEndsLocal(42) != kTalkLocalBuy || TalkEndsLocal(44) != kTalkLocalNone)
+        Fail("P25: END endsType 1 opens the trade window, 11 the editor, 43 the bail window, 42 the buying window (T-478), anything else nothing");
     if (TalkActSide(1) == kTalkSideNpc || TalkActSide(18) == kTalkSideNpc || TalkActSide(4) == kTalkSideNpc)
         Fail("P25: the first-line hold needs 1 / 18 / 4 to be target-side");
 }
@@ -7663,8 +7943,8 @@ void t_t726_talk_order_log_due_outcome_and_nth()
         Fail("T-726: an outcome the click's road wrote stands");
     if (TalkOrderOutcome(0, 0, 0, 0) != kTalkOrderNotReached || TalkOrderOutcome(0, 0, 1, 1) != kTalkOrderNotReached)
         Fail("T-726: not reached is the engine's refusal before choosing a line, whatever else was written");
-    if (kTalkOrderLineNotStarted != 7 || kTalkOrderPlayerSpeaker != 8 || kTalkOrderKinds != 9)
-        Fail("T-726: a busy copy is not an outcome of its own; another player's character as the speaker is (9 kinds)");
+    if (kTalkOrderLineNotStarted != 7 || kTalkOrderPlayerSpeaker != 8 || kTalkOrderWindowBusy != 9 || kTalkOrderKinds != 10)
+        Fail("T-726: a busy copy is not an outcome of its own; another player's character as the speaker is, and (T-978 B2) a window showing another conversation is (10 kinds)");
     if (TalkOrderOutcome(kTalkOrderPlayerSpeaker, 1, 1, 0) != kTalkOrderPlayerSpeaker || TalkOrderOutcome(kTalkOrderPlayerSpeaker, 1, 0, 0) != kTalkOrderPlayerSpeaker)
         Fail("T-726: a start refused for another player's character as the speaker is told apart");
     if (TalkOrderOutcome(0, 1, 1, 1) != kTalkOrderStarted) Fail("T-726: a start that returned true started here");
@@ -7770,6 +8050,23 @@ void t_p26s1_talkprompt_parse()
     if (TalkPromptParse("1 2 3 4", &mode, &n, &t, &sid, &idx)) Fail("four arguments must be refused");
     if (TalkPromptParse("near 4294967296", &mode, &n, &t, &sid, &idx)) Fail("a uid above 32 bits must be refused");
     if (TalkPromptParse("near near " + std::string(129, 's'), &mode, &n, &t, &sid, &idx)) Fail("a 129-byte line sid must be refused");
+    {   /* T-478: the name form `name:<Name>[#k] [targetUid|near] [lineSid|auto]` */
+        std::string nm = "x", rest = "x";
+        if (TalkPromptNameForm("12 near", &nm, &rest) != 0 || !nm.empty()) Fail("a uid NPC is not the name form");
+        if (TalkPromptNameForm("near near", &nm, &rest) != 0) Fail("near is not the name form");
+        if (TalkPromptNameForm("answer 3", &nm, &rest) != 0) Fail("answer is not the name form");
+        if (TalkPromptNameForm(" name:Slaver_Boss#1  4194305 18900-gamedata.base", &nm, &rest) != 1 || nm != "Slaver_Boss#1"
+            || rest != "4194305 18900-gamedata.base")
+            Fail("name:Slaver_Boss#1 with a target and a line must parse");
+        if (TalkPromptNameForm("name:Nomad_Animal_Trader", &nm, &rest) != 1 || nm != "Nomad_Animal_Trader" || !rest.empty())
+            Fail("name: alone must parse (near auto)");
+        if (TalkPromptNameForm("name:", &nm, &rest) != -1) Fail("an empty name must be refused");
+        if (TalkPromptNameForm("name:#1 near", &nm, &rest) != -1) Fail("a selector with no name must be refused");
+        if (TalkPromptNameForm("name:{npc} near", &nm, &rest) != -1) Fail("an unresolved placeholder must be refused");
+        if (TalkPromptNameForm("name:Slaver_Boss answer 3", &nm, &rest) != -1) Fail("a rest that is not a start form must be refused");
+        if (TalkPromptNameForm("name:Slaver_Boss 1 2 3", &nm, &rest) != -1) Fail("too many words after the name must be refused");
+        if (TalkPromptNameForm("name:Slaver_Boss 0", &nm, &rest) != -1) Fail("target uid 0 must be refused");
+    }
 }
 
 /* P3-b (review-p3 HIGH). The say() decision table: our apply first, then off-thread, then no uid, then a handled
@@ -8084,5 +8381,377 @@ void t_t1038_editor_reset_population()
     if (std::string(kEditorResetRefusedText) != "Reset Population is turned off in a multiplayer world. It deletes your own squad, and the other players would keep the old townspeople.")
         Fail("editor reset: the hover note's words are not the approved text");
 }
+
+/* T-478 step 3: the bail line (43) - the NPC's game ends the conversation with END endsType 43 and the line's id; the talker's game
+   runs the engine's own case on its own mirrored conversation. The other window actions stay refused (later steps). */
+void t_t478_bail_end()
+{
+    using namespace cooptalk;
+    if (TalkActSide(43) != kTalkSideEnds || !TalkActEndsTalk(43) || TalkActSide(43) == kTalkSideNpc)
+        Fail("T-478: 43 must be an ending, target-side type (never run on the NPC's game, never refused)");
+    const int still[] = { 24 };   /* step 4: 47 SURRENDER is APPLY (t_t478_surrender); step 5: 41 SELL SLAVES ends (t_t478_sell); step 6: 42 / 48 BUY end (t_t478_buy) */
+    for (size_t i = 0; i < sizeof(still) / sizeof(still[0]); ++i)
+        if (TalkActSide(still[i]) != kTalkSideRefuse || TalkActEndsTalk(still[i])) Fail("T-478: 24 stays refused");
+    /* B's gate: the line named, the mirrored conversation still here, our own character in it */
+    if (TalkEndsOpenOk(43, "line1", 1, 1) != 1) Fail("T-478: a named line on a live mirror with our character opens the bail window");
+    if (TalkEndsOpenOk(43, "", 1, 1) != 0) Fail("T-478: an END with no line id opens nothing");
+    if (TalkEndsOpenOk(43, "line1", 0, 1) != 0) Fail("T-478: no mirrored conversation (it closed late) opens nothing");
+    if (TalkEndsOpenOk(43, "line1", 1, 0) != 0) Fail("T-478: another character in the conversation opens nothing");
+    if (TalkEndsOpenOk(1, "line1", 1, 1) != 0 || TalkEndsOpenOk(0, "line1", 1, 1) != 0) Fail("T-478: a trade or no END type opens no bail window");
+    /* the wire (protocol 199): END carries the line id after endsType, before T-858's optional unrun list */
+    TalkMsg e;
+    e.kind = kTalkEnd; e.convId = 7; e.npcUid = 3; e.targetUid = 4; e.reason = kTalkEndEngine; e.endsType = 43; e.lineSid = "bail-line";
+    std::vector<char> b;
+    TalkMsg q;
+    if (!EncodeTalk(&b, e) || b.size() != 22 + 9 || DecodeTalk(&b[0], b.size(), &q) != kTalkDecodeOk || q.endsType != 43
+        || q.lineSid != "bail-line" || q.reason != kTalkEndEngine || q.convId != 7)
+        Fail("T-478: END endsType 43 must round-trip with its line id");
+    if (DecodeTalk(&b[0], b.size() - 11, &q) == kTalkDecodeOk) Fail("T-478: a 197-shaped END (no line id field) must not decode");
+    {   /* merge with T-858: the line id and the unrun list together, in that order */
+        TalkMsg eu = e; eu.unrun.push_back(5); eu.unrun.push_back(6);
+        std::vector<char> bu; TalkMsg qu;
+        if (!EncodeTalk(&bu, eu) || bu.size() != 22 + 9 + 1 + 8 || DecodeTalk(&bu[0], bu.size(), &qu) != kTalkDecodeOk
+            || qu.lineSid != "bail-line" || qu.unrun.size() != 2 || qu.unrun[0] != 5 || qu.unrun[1] != 6)
+            Fail("T-478: END with a line id and an unrun list must round-trip both");
+    }
+    TalkMsg big = e;
+    big.lineSid = std::string(kTalkMaxId + 1, 'x');
+    std::vector<char> bb;
+    if (EncodeTalk(&bb, big)) Fail("T-478: an END line id over 128 bytes must not encode");
+    /* review fold (manager 2026-11-03): the window holds only prisoners the payment frees; payer slot 1 (B) throughout */
+    using cooprison::BailRowFreeable;
+    if (!BailRowFreeable(0, false, -1, 1, -1)) Fail("T-478: a prisoner that is not replicated is the engine's own (freed here)");
+    if (!BailRowFreeable(0x400005u, true, 0, 1, 1)) Fail("T-478: the payer's own character is freed here, whoever runs the area");
+    if (!BailRowFreeable(0x5u, false, 0, 1, 0)) Fail("T-478: two players - owner A runs the prison's area: A takes B's @bail");
+    if (!BailRowFreeable(0x5u, false, 1, 1, 0)) Fail("T-478: two players - payer B runs the area: owner A takes B's @bail");
+    if (BailRowFreeable(0x800005u, false, 0, 1, 2)) Fail("T-478: three players - area run by A, payer B, owner C: C refuses - row left out");
+    if (BailRowFreeable(0x5u, false, -1, 1, 0)) Fail("T-478: the area's runner unknown - the owner refuses: row left out");
+    if (BailRowFreeable(0x5u, false, 0, 1, -1)) Fail("T-478: the owner unknown - row left out");
+    if (BailRowFreeable(0x5u, false, 0, -1, 0)) Fail("T-478: this game's own slot unknown - the owner's rule refuses an unknown sender: row left out");
+    if (!cooprison::BailWindowOk(0) || cooprison::BailWindowOk(1) || cooprison::BailWindowOk(-1)) Fail("T-478: the window opens only with no row left out");
+}
+
+/* T-478 step 5 (design read 2026-11-04, D1 + a live check at the confirm): the selling line (41) - the slaver's game ends the talk
+   with END endsType 41 and the line's id; the seller's game opens its own selling window over its own characters only, and its
+   confirm runs only for that window's slaver while the slaver's copy is live and the session is up. */
+void t_t478_sell()
+{
+    using namespace cooptalk;
+    /* the side: an ending, target-side type - never sent in an ACT, never run on the slaver's game, never refused */
+    if (TalkActSide(41) != kTalkSideEnds || !TalkActEndsTalk(41) || TalkActSide(41) == kTalkSideNpc || TalkActSide(41) == kTalkSideRefuse)
+        Fail("T-478 sell: 41 must be an ending, target-side type");
+    if (TalkActSide(42) != kTalkSideEnds || !TalkActEndsTalk(42) || TalkActSide(48) != kTalkSideEnds) Fail("T-478 sell: slave buy 42 / animal buy 48 end the talk (step 6)");
+    /* the end code names its line (41 and 43 only) and the window kind */
+    if (!TalkEndCarriesLine(41) || !TalkEndCarriesLine(43) || TalkEndCarriesLine(1) || TalkEndCarriesLine(11) || !TalkEndCarriesLine(42) || TalkEndCarriesLine(0))
+        Fail("T-478 sell: only 41 / 42 / 43 / 48 carry the line id on END");
+    if (TalkEndsLocal(41) != kTalkLocalSell || kTalkLocalSell == kTalkLocalBail || kTalkLocalSell == kTalkLocalTrade || kTalkLocalSell == kTalkLocalEditor
+        || kTalkLocalSell == kTalkLocalNone || TalkEndsLocal(43) != kTalkLocalBail || TalkEndsLocal(42) != kTalkLocalBuy || kTalkLocalSell == kTalkLocalBuy)
+        Fail("T-478 sell: END endsType 41 is the seller's own selling window, a kind of its own");
+    /* who may open: the line named, the mirror live, the seller's own character in it; 41 or 43 only */
+    if (TalkEndsOpenOk(41, "sell-line", 1, 1) != 1) Fail("T-478 sell: a named line on a live mirror with our character opens the selling window");
+    if (TalkEndsOpenOk(41, "", 1, 1) != 0 || TalkEndsOpenOk(41, "sell-line", 0, 1) != 0 || TalkEndsOpenOk(41, "sell-line", 1, 0) != 0)
+        Fail("T-478 sell: no line, no mirror or another character in it opens nothing");
+    if (TalkEndsOpenOk(1, "sell-line", 1, 1) != 0 || TalkEndsOpenOk(44, "sell-line", 1, 1) != 0) Fail("T-478 sell: 1 / 44 open no window here");
+    /* the whole window is refused when any member it could list is not this game's own */
+    if (!TalkSellWindowOk(0) || TalkSellWindowOk(1) || TalkSellWindowOk(3)) Fail("T-478 sell: the window opens only when every listed member is our own");
+    if (!(kTalkSellRowNearUnits >= 300.0f)) Fail("T-478 sell: the listed range must cover the engine's own 300 units");
+    /* the confirm gate */
+    const unsigned long long npc = 0x7FF612340000ull, other = 0x7FF612350000ull;
+    if (TalkSellConfirmGate(1, npc, npc, 9, 9, 0, 1) != kTalkSellRun) Fail("T-478 sell: the armed window, its slaver's copy live and another game's, the session up - the sale runs");
+    if (TalkSellConfirmGate(1, npc, npc, 9, 0, 0, 1) != kTalkSellCopyGone) Fail("T-478 sell: a retired slaver copy (no uid at that address) - refused");
+    if (TalkSellConfirmGate(1, npc, npc, 9, 12, 0, 1) != kTalkSellCopyGone) Fail("T-478 sell: that address now another copy - refused");
+    if (TalkSellConfirmGate(1, npc, npc, 0, 0, 0, 1) != kTalkSellCopyGone) Fail("T-478 sell: an armed window with no slaver uid - refused");
+    if (TalkSellConfirmGate(1, npc, other, 9, 9, 0, 1) != kTalkSellCopyGone) Fail("T-478 sell: the armed window's buyer is not the noted slaver - refused");
+    if (TalkSellConfirmGate(1, npc, npc, 9, 9, 0, 0) != kTalkSellNoLink) Fail("T-478 sell: the session down - refused");
+    if (TalkSellConfirmGate(1, npc, npc, 9, 0, 0, 0) != kTalkSellCopyGone) Fail("T-478 sell: a retired copy is named before the link");
+    /* review fold: the slaver's owner is read live at the confirm - a slaver this game now runs is the engine's own sale */
+    if (TalkSellConfirmGate(1, npc, npc, 9, 9, 1, 1) != kTalkSellNowOurs || TalkSellConfirmGate(1, npc, npc, 9, 9, 1, 0) != kTalkSellNowOurs)
+        Fail("T-478 sell: a slaver this game now runs (the other player left) is the engine's own sale, link or not");
+    if (TalkSellConfirmGate(1, npc, npc, 9, 0, 1, 1) != kTalkSellCopyGone) Fail("T-478 sell: a retired copy is refused before the owner is asked");
+    if (TalkSellConfirmGate(0, npc, npc, 9, 9, 0, 1) != kTalkSellNotOurs || TalkSellConfirmGate(0, npc, other, 9, 9, 0, 1) != kTalkSellNotOurs
+        || TalkSellConfirmGate(0, 0, 0, 0, 0, 0, 1) != kTalkSellNotOurs)
+        Fail("T-478 sell: a confirm that is not the armed window's is the engine's own, unchanged");
+    /* re-check fold: a refusing note's window (the open could not be tied) is refused whatever the slaver's state or the link */
+    if (TalkSellConfirmGate(2, npc, npc, 9, 9, 0, 1) != kTalkSellUntied || TalkSellConfirmGate(2, npc, npc, 9, 9, 1, 1) != kTalkSellUntied
+        || TalkSellConfirmGate(2, npc, other, 9, 0, 0, 0) != kTalkSellUntied || TalkSellConfirmGate(2, 0, 0, 0, 0, 0, 1) != kTalkSellUntied)
+        Fail("T-478 sell: a confirm of a window that could not be tied to the note is refused");
+    const int gates[] = { kTalkSellNotOurs, kTalkSellRun, kTalkSellCopyGone, kTalkSellNoLink, kTalkSellNowOurs, kTalkSellUntied };
+    for (size_t i = 0; i < 6; ++i)
+        for (size_t j = i + 1; j < 6; ++j)
+            if (gates[i] == gates[j] || std::string(TalkSellGateName(gates[i])) == TalkSellGateName(gates[j])) Fail("T-478 sell: the gate's answers and names are distinct");
+    /* review fold: which confirm is the armed window's - its handler while the window is still the engine's current one */
+    const unsigned long long win = 0x22220000ull, win2 = 0x22230000ull, hd = 0x33330000ull, hd2 = 0x33340000ull;
+    if (TalkSellArmedWindow(win, hd, win, hd, npc, 0) != 1) Fail("T-478 sell: the armed window's own handler while it is current is the armed confirm");
+    if (TalkSellArmedWindow(win, hd, win2, hd, npc, 0) != 0 || TalkSellArmedWindow(win, hd, 0, hd, npc, 0) != 0)
+        Fail("T-478 sell: a note whose window ended (another window current, or none) arms no confirm - a stale note never turns a sale away");
+    if (TalkSellArmedWindow(win, hd, win, hd2, npc, 0) != 0) Fail("T-478 sell: another handler is not the armed window's");
+    if (TalkSellArmedWindow(win, 0, win, 0, npc, 0) != 0) Fail("T-478 sell: a bound note with no handler arms nothing");
+    if (TalkSellArmedWindow(0, 0, win, hd, npc, 0) != 0) Fail("T-478 sell: re-check fold - a note not tied to its window never falls back to the buyer's address");
+    if (TalkSellArmedWindow(win, hd, win, hd, 0, 0) != 0 || TalkSellArmedWindow(0, 0, 0, 0, 0, 0) != 0 || TalkSellArmedWindow(win, 0, win, hd, 0, 1) != 0)
+        Fail("T-478 sell: no note, no armed confirm");
+    /* re-check fold: a refusing note covers every confirm while its window is current (or, with no window read, until it ends) */
+    if (TalkSellArmedWindow(win, 0, win, hd, npc, 1) != 2 || TalkSellArmedWindow(win, 0, win, hd2, npc, 1) != 2 || TalkSellArmedWindow(0, 0, win2, hd, npc, 1) != 2)
+        Fail("T-478 sell: a refusing note covers its window's confirm");
+    if (TalkSellArmedWindow(win, 0, win2, hd, npc, 1) != 0 || TalkSellArmedWindow(win, 0, 0, hd, npc, 1) != 0)
+        Fail("T-478 sell: a refusing note whose window ended covers no later window");
+    /* re-check fold: the note's tie right after the case - the open is refused unless TIED */
+    if (TalkSellBindOutcome(1, win, 1, hd, 1, npc, npc, npc) != kTalkSellBindTied) Fail("T-478 sell: the current window's handler sells to the slaver's copy - tied");
+    if (TalkSellBindOutcome(1, 0, 1, 0, 1, 0, npc, npc) != kTalkSellBindNoWindow || TalkSellBindOutcome(1, win, 1, 0, 1, 0, npc, npc) != kTalkSellBindNoWindow
+        || TalkSellBindOutcome(1, win, 1, hd, 1, other, npc, npc) != kTalkSellBindNoWindow)
+        Fail("T-478 sell: no window, no handler or another buyer - no window sells to this copy: no window (the open is refused, the note cleared)");
+    if (TalkSellBindOutcome(0, 0, 1, 0, 1, 0, npc, npc) != kTalkSellBindUntied || TalkSellBindOutcome(1, win, 0, 0, 1, 0, npc, npc) != kTalkSellBindUntied
+        || TalkSellBindOutcome(1, win, 1, hd, 0, 0, npc, npc) != kTalkSellBindUntied)
+        Fail("T-478 sell: a faulted read of the window, its handler or its buyer - untied (the open is refused, the note kept refusing)");
+    if (TalkSellBindOutcome(1, win, 1, hd, 1, npc, npc, other) != kTalkSellBindUntied || TalkSellBindOutcome(1, win, 1, hd, 1, npc, 0, 0) != kTalkSellBindUntied)
+        Fail("T-478 sell: a note naming another slaver (or none) is untied");
+    if (kTalkSellBindTied == kTalkSellBindNoWindow || kTalkSellBindTied == kTalkSellBindUntied || kTalkSellBindNoWindow == kTalkSellBindUntied)
+        Fail("T-478 sell: the tie's answers are distinct");
+    /* review fold: the note is cleared on every end of its window - the window no longer current (closed, cancelled, replaced), the
+       world gone - and NOT on a link drop (the open window's confirm must still be refused) */
+    if (TalkSellNoteEnded(npc, win, win, 0) != 0) Fail("T-478 sell: the note stays while its window is open");
+    if (TalkSellNoteEnded(npc, win, 0, 0) != 1 || TalkSellNoteEnded(npc, win, win2, 0) != 1) Fail("T-478 sell: a closed / cancelled / replaced window clears the note");
+    if (TalkSellNoteEnded(npc, win, win, 1) != 1 || TalkSellNoteEnded(npc, 0, 0, 1) != 1) Fail("T-478 sell: the world's end clears the note");
+    if (TalkSellNoteEnded(npc, 0, win2, 0) != 0) Fail("T-478 sell: an unbound note is kept (no window to watch) until the world ends or the next window");
+    if (TalkSellNoteEnded(0, win, 0, 1) != 0) Fail("T-478 sell: no note, nothing to clear");
+    /* review fold (wiring, CRLF-safe): the talk's end opens the selling window before the close; the confirm hook decides before it
+       calls the engine's sale; both address tables carry the two rows; the note clears on each end road and the clear is logged */
+    {
+        std::string sp = T313ReadFile("../coop-plugin/speech.cpp"), sw = T313ReadFile("../coop-plugin/spawn.cpp");
+        std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt");
+        std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
+        sp.erase(std::remove(sp.begin(), sp.end(), '\r'), sp.end());
+        sw.erase(std::remove(sw.begin(), sw.end(), '\r'), sw.end());
+        if (sp.empty() || sw.empty() || t65.empty() || t68.empty()) Fail("T-478 sell: a source file does not read");
+        const size_t mi = sp.find("    const TkMirror mi = g_tkMirror;\n    if (cooptalk::TalkEndsLocal(m.endsType) == cooptalk::kTalkLocalBail) TkBailOpenLocal(mi, m);");
+        const size_t op = sp.find("    if (cooptalk::TalkEndsLocal(m.endsType) == cooptalk::kTalkLocalSell) TkSellOpenLocal(mi, m);   /* T-478 step 5: before the close */");
+        if (mi == std::string::npos || op == std::string::npos || op < mi || op - mi > 400) Fail("T-478 sell: the END's 41 does not open the selling window before the close (TkApplyEnd)");
+        const size_t arm = sp.find("SellWindowArm(npc, mi.npcUid, mi.targetUid, listed, nListed);"), run = sp.find("ran = TkRunViewPod(mi.dlg, line, keep, 1, 2);", arm);
+        const size_t bind = sp.find("bound = SellWindowBind(npc);", run == std::string::npos ? 0 : run);
+        if (arm == std::string::npos || run == std::string::npos || bind == std::string::npos || bind - run > 500)
+            Fail("T-478 sell: the note is armed before the case and bound to its window right after it");
+        const size_t noWin = sp.find("if (bound == cooptalk::kTalkSellBindNoWindow)", bind == std::string::npos ? 0 : bind);
+        const size_t untied = sp.find("else if (bound != cooptalk::kTalkSellBindTied)", noWin == std::string::npos ? 0 : noWin);
+        if (bind == std::string::npos || noWin == std::string::npos || untied == std::string::npos || untied - bind > 700)
+            Fail("T-478 sell: re-check fold - a window not tied to the note refuses the open (no fall-back to the buyer's address)");
+        const size_t d0 = sw.find("unsigned long long detour_sellConfirm(void* self)\n{");
+        const size_t d1 = (d0 == std::string::npos) ? d0 : sw.find("\n}\n", d0);
+        if (d0 == std::string::npos || d1 == std::string::npos) Fail("T-478 sell: detour_sellConfirm not found");
+        else
+        {
+            const std::string body = sw.substr(d0, d1 - d0);
+            const size_t gate = body.find("cooptalk::TalkSellConfirmGate(armedWindow,"), orig = body.find("g_sellOrig(self)");
+            const size_t live = body.find("SellTradingWindowNow(&winOk)"), own = body.find("net::IsUidMine(arm.npcUid)"), clr = body.find("std::memset(&g_sellArm, 0, sizeof(g_sellArm));");
+            if (gate == std::string::npos || orig == std::string::npos || gate > orig) Fail("T-478 sell: the confirm hook must decide before it calls the engine's sale");
+            if (live == std::string::npos || live > gate || own == std::string::npos || own > gate) Fail("T-478 sell: the window and the slaver's owner are read live before the gate");
+            if (clr == std::string::npos || clr < gate || clr > body.find("++g_sellNowOurs;") || clr > body.find("++g_sellRan;")) Fail("T-478 sell: the armed confirm clears the note before anything of it runs");
+            if (body.find("return 1;") == std::string::npos) Fail("T-478 sell: a refused confirm answers 1 (the engine's caller then closes the window)");
+        }
+        if (t65.find("SlaveSellingConfirm                            code 006A7F30 006A7F30") == std::string::npos
+            || t68.find("SlaveSellingConfirm                            code 006A7740 006A7740") == std::string::npos
+            || t65.find("TradingWindowCurrent                           var  02131BE0 02131BE0 -") == std::string::npos
+            || t68.find("TradingWindowCurrent                           var  02132C30 02132C30 -") == std::string::npos)
+            Fail("T-478 sell: an address table lacks the selling confirm or the trading window row");
+        if (t65.find("!count 719") == std::string::npos || t68.find("!count 719") == std::string::npos) Fail("T-478 sell: both address tables declare 719 rows (T-1150: + HaulStoreSearchOwnerTest, HaulCandidatesGather, OwnershipsMayUse, HaulSearchGatherRet; T-1242: + ResearchBenchList, ResearchCanPay, ResearchHasItems, ResearchPay; T-478 step 6: + the two buying confirms)");
+        if (sw.find("AddrReg kSellConfirmRva_reg(\"SlaveSellingConfirm\"") == std::string::npos || sw.find("AddrReg kTradingWindowRva_reg(\"TradingWindowCurrent\"") == std::string::npos)
+            Fail("T-478 sell: spawn.cpp does not bind the two rows");
+        const size_t tk = sw.find("void SellWindowTick()\n{"), tkEnd = (tk == std::string::npos) ? tk : sw.find("\n}\n", tk);
+        if (tk == std::string::npos || tkEnd == std::string::npos) Fail("T-478 sell: SellWindowTick not found");
+        else
+        {
+            const std::string t = sw.substr(tk, tkEnd - tk);
+            if (t.find("coop::GameWorldPtr() == 0 || StoreTearingDown() != 0") == std::string::npos || t.find("cooptalk::TalkSellNoteEnded(") == std::string::npos
+                || t.find("std::memset(&g_sellArm, 0, sizeof(g_sellArm));") == std::string::npos || t.find("DebugLog(\"[TALK] T478 sell window ended without a sale") == std::string::npos)
+                Fail("T-478 sell: the note's clear on a window end (closed / cancelled / replaced / world gone) and its line are missing");
+        }
+        const size_t st = sw.find("void SlaveTick()\n{\n    SellWindowTick();"), blk = sw.find("    if (EngineWritesBlocked()) return;   // marks wait", st == std::string::npos ? 0 : st);
+        if (st == std::string::npos || blk == std::string::npos) Fail("T-478 sell: SlaveTick must run SellWindowTick first, before its blocked-world return");
+        if (sp.find("SellWindowDisarm();\n            ++g_t478SellFault;") == std::string::npos) Fail("T-478 sell: a case that did not run clears the note");
+    }
+    /* the wire: END endsType 41 round-trips with its line id */
+    TalkMsg e;
+    e.kind = kTalkEnd; e.convId = 8; e.npcUid = 3; e.targetUid = 4; e.reason = kTalkEndEngine; e.endsType = 41; e.lineSid = "sell-line";
+    std::vector<char> b;
+    TalkMsg q;
+    if (!EncodeTalk(&b, e) || DecodeTalk(&b[0], b.size(), &q) != kTalkDecodeOk || q.endsType != 41 || q.lineSid != "sell-line" || q.convId != 8)
+        Fail("T-478 sell: END endsType 41 must round-trip with its line id");
+}
+
+/* T-478 step 4: the surrender line (47) - the talker's game runs the engine's own case on its own characters (APPLY); the NPC's game
+   sends it in the ACT and never runs it; the chained characters reach the other games through MSG_SLAVE (state 1, the NPC as owner). */
+void t_t478_surrender()
+{
+    using namespace cooptalk;
+    if (TalkActSide(47) != kTalkSideApply || TalkActEndsTalk(47) || TalkActCarried(47))
+        Fail("T-478 step 4: 47 must be APPLY - run on the talker's game, sent in the ACT, ending nothing");
+    if (!TalkActChainsTalkers(47)) Fail("T-478 step 4: 47 chains the talker's characters");
+    for (int ty = -1; ty < 60; ++ty)
+        if (ty != 47 && TalkActChainsTalkers(ty)) Fail("T-478 step 4: only 47 chains the talker's characters");
+    /* a surrender line with NPC-side actions beside it: the ACT's target part is 47 alone, the rest runs on the NPC's game at the answer */
+    const int line[] = { 47, 19, 29 };
+    int tgt = 0, npc = 0;
+    for (int i = 0; i < 3; ++i) { if (TalkActSide(line[i]) == kTalkSideNpc) ++npc; else if (TalkActSide(line[i]) == kTalkSideApply) ++tgt; }
+    if (tgt != 1 || npc != 2) Fail("T-478 step 4: a surrender line splits into 47 on the talker's game and its NPC-side actions on the NPC's game");
+    /* wiring (CRLF-safe): B keeps 47 in the view it runs and counts what the engine chained; the capture hook passes an own character
+       through and marks MSG_SLAVE; the slave message carries the owner, applied on the copy with changeSlaveOwner */
+    std::string sp = T313ReadFile("../coop-plugin/speech.cpp");
+    std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    std::string sw = T313ReadFile("../coop-plugin/spawn.cpp");
+    sp.erase(std::remove(sp.begin(), sp.end(), '\r'), sp.end());
+    it.erase(std::remove(it.begin(), it.end(), '\r'), it.end());
+    sw.erase(std::remove(sw.begin(), sw.end(), '\r'), sw.end());
+    if (sp.empty() || it.empty() || sw.empty()) Fail("T-478 step 4: a source file does not read");
+    if (sp.find("            if (side == cooptalk::kTalkSideApply)\n            {\n                g_tkActView[nKeep++] = v.acts[i];\n"
+                "                if (cooptalk::TalkActChainsTalkers(v.types[i])) ++surrender;") == std::string::npos)
+        Fail("T-478 step 4: B's ACT road does not keep an APPLY action (47) in the view it runs");
+    if (sp.find("            if (surrender) CapChainCountBegin();\n            ran = TkRunViewPod(dlg, line, g_tkActView, nKeep, 1);\n            if (surrender)\n") == std::string::npos
+        || sp.find("const int nCh = CapChainCountEnd(su, 8);") == std::string::npos)
+        Fail("T-478 step 4: B does not count the characters the surrender case chains around its run");
+    if (sp.find("else if (side == cooptalk::kTalkSideRefuse) { ++unsupported;") == std::string::npos)
+        Fail("T-478 step 4: B still answers UNSUPPORTED for the refused actions");
+    if (it.find("    if (vu == 0)\n    {   // ours: MSG_SLAVE carries it\n        g_capChainOrig(c, on, hand); CapInc(&g_chainPassOwned); SlaveMarkDirtyAny(uid);\n") == std::string::npos
+        || it.find("if (on && g_chainCountTid != 0 && (DWORD)g_chainCountTid == ::GetCurrentThreadId())") == std::string::npos)
+        Fail("T-478 step 4: the capture hook must run an own character's chaining and mark MSG_SLAVE (counted on the run's thread only)");
+    if (sw.find("const unsigned int ownerNow = CaptureOwnerUidOf(c);") == std::string::npos
+        || sw.find("if (CaptureApplyOwnerToCopy(uid, c, wantOwner) == 1) g_slaveOwnerApplied[uid] = wantOwner;") == std::string::npos)
+        Fail("T-478 step 4: MSG_SLAVE must carry the owner and apply it on the copy");
+    /* review folds (2026-11-04): each character the case left out is listed; every chain call on the run's thread is counted by
+       branch; a 47 the router did not forward is counted on the NPC's game */
+    if (sp.find("const int skipped = CapSurrenderSkips((void*)npc, (void*)tgt, su, nCh, head);") == std::string::npos
+        || sp.find("if (++g_t478SurrNotForwardedA <= 8)") == std::string::npos)
+        Fail("T-478 step 4 review: B must list the skipped characters and A must count an unforwarded surrender");
+    if (it.find("if (uid == 0) { if (counting) ++g_chainCountUnrep;") == std::string::npos
+        || it.find("if (on) { ++g_chainCountHeld; if (net::IsUidMineAnyThread(uid)) ++g_chainCountHeldMine; }") == std::string::npos)
+        Fail("T-478 step 4 review: every chain call on the run's thread must be counted by branch");
+}
+
+/* T-478 step 6 (design C, 2026-11-05): buying a slave (42) or an animal (48) from a trader another game runs - the trader's game ends
+   the talk with END endsType 42 / 48 and the line's id; the buyer's game opens its own buying window; its confirm is held and each
+   ticked row another game runs is asked of that game on the hire road (join types 42 / 48); the engine's purchase runs once, only when
+   every owner said yes. */
+void t_t478_buy()
+{
+    using namespace cooptalk;
+    /* the acts open locally: ending, target-side types whose END carries the line; the buyer's game opens a buying window */
+    if (TalkActSide(42) != kTalkSideEnds || TalkActSide(48) != kTalkSideEnds || !TalkActEndsTalk(42) || !TalkActEndsTalk(48))
+        Fail("T-478 buy: 42 / 48 must be ending, target-side types (never refused, never run on the trader's game)");
+    if (!TalkEndCarriesLine(42) || !TalkEndCarriesLine(48) || !TalkActBuys(42) || !TalkActBuys(48) || TalkActBuys(41) || TalkActBuys(43) || TalkActBuys(47))
+        Fail("T-478 buy: the END of 42 / 48 names its line; only 42 / 48 buy");
+    if (TalkEndsLocal(42) != kTalkLocalBuy || TalkEndsLocal(48) != kTalkLocalBuy || kTalkLocalBuy == kTalkLocalSell || kTalkLocalBuy == kTalkLocalBail
+        || kTalkLocalBuy == kTalkLocalNone || kTalkLocalBuy == kTalkLocalTrade || kTalkLocalBuy == kTalkLocalEditor)
+        Fail("T-478 buy: END endsType 42 / 48 is the buyer's own buying window, a kind of its own");
+    if (TalkEndsOpenOk(42, "buy-line", 1, 1) != 1 || TalkEndsOpenOk(48, "buy-line", 1, 1) != 1) Fail("T-478 buy: a named line on a live mirror with our character opens the buying window");
+    if (TalkEndsOpenOk(48, "", 1, 1) != 0 || TalkEndsOpenOk(48, "buy-line", 0, 1) != 0 || TalkEndsOpenOk(48, "buy-line", 1, 0) != 0)
+        Fail("T-478 buy: no line, no mirror or another character in it opens nothing");
+    /* the rows */
+    if (TalkBuyRowClass(0, 5, 0, 0) != kTalkBuyRowGone || TalkBuyRowClass(1, 0, 0, 0) != kTalkBuyRowNoUid || TalkBuyRowClass(1, 5, 1, 0) != kTalkBuyRowOwn
+        || TalkBuyRowClass(1, 5, 1, 1) != kTalkBuyRowReserved || TalkBuyRowClass(1, 5, 0, 0) != kTalkBuyRowOther || TalkBuyRowClass(1, 5, 0, 1) != kTalkBuyRowOther)
+        Fail("T-478 buy: a row is gone / no uid / own / promised to another buyer / another game's");
+    /* the confirm: all rows owned -> the engine's own purchase; another game's row -> asked */
+    if (TalkBuyConfirmGate(0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1) != kTalkBuyEngine) Fail("T-478 buy: every row our own runs the engine's purchase");
+    if (TalkBuyConfirmGate(0, 0, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0) != kTalkBuyEngine)
+        Fail("T-478 buy: single player (no uids, no link, no session) runs the engine's purchase unchanged");
+    /* re-check fold: a row with no character is refused even when the session reads 0 (a dropped link whose cleanup removed
+       the other game's characters and their uids leaves no sign of the session) */
+    if (TalkBuyConfirmGate(0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0) != kTalkBuyUnread || TalkBuyConfirmGate(0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0) != kTalkBuyUnread)
+        Fail("T-478 buy: a ticked row with no character is refused with the session unread, never charged for nobody");
+    /* review fold 1: a missing row with no other game's row (B's copy of A's slave removed while B's window lists it) - alone, or
+       beside B's own rows - is refused in a session before the own-rows verdict: the engine would charge it for nobody */
+    if (TalkBuyConfirmGate(0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1) != kTalkBuyUnread || TalkBuyConfirmGate(0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1) != kTalkBuyUnread)
+        Fail("T-478 buy: a missing row alone is refused in a session, link up or down");
+    if (TalkBuyConfirmGate(0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1) != kTalkBuyUnread || TalkBuyConfirmGate(0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1) != kTalkBuyUnread)
+        Fail("T-478 buy: a missing or uid-less row beside this game's own rows is refused, not charged");
+    if (TalkBuyConfirmGate(0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0) != kTalkBuyUnread) Fail("T-478 buy: another game's row makes it a session even with the flag unread");
+    if (TalkBuyConfirmGate(0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1) != kTalkBuyReserved) Fail("T-478 buy: a promised row is refused first, as before");
+    /* review fold 2: a mixed batch's own row that joined in the confirm gets its DONE; one already in, one not joined, or another game's row does not */
+    if (TalkBuyOwnRowDone(kTalkBuyRowOwn, 0, 1) != 1 || TalkBuyOwnRowDone(kTalkBuyRowOwn, 1, 1) != 0 || TalkBuyOwnRowDone(kTalkBuyRowOwn, 0, 0) != 0
+        || TalkBuyOwnRowDone(kTalkBuyRowOther, 0, 1) != 0 || TalkBuyOwnRowDone(kTalkBuyRowReserved, 0, 1) != 0)
+        Fail("T-478 buy: only an own row that joined in the confirm is announced (DONE joined 1)");
+    if (TalkBuyConfirmGate(0, 0, 1, 2, 0, 0, 0, 1, 1, 1, 1, 1) != kTalkBuyAsk) Fail("T-478 buy: another game's rows are asked of their owners");
+    /* a row missing (no character / no uid) beside another game's row: refused */
+    if (TalkBuyConfirmGate(0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1) != kTalkBuyUnread || TalkBuyConfirmGate(0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1) != kTalkBuyUnread)
+        Fail("T-478 buy: a missing row beside another game's row is refused (the engine would charge it)");
+    if (TalkBuyConfirmGate(0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1) != kTalkBuyRowsUnread) Fail("T-478 buy: unread rows are refused");
+    /* the link down: refused */
+    if (TalkBuyConfirmGate(0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1) != kTalkBuyNoLink) Fail("T-478 buy: with the link down the purchase is refused");
+    /* a second buyer: the owner's own purchase of a row promised to another game is refused; the other game's ask gets NO reserved */
+    if (TalkBuyConfirmGate(0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1) != kTalkBuyReserved || TalkBuyConfirmGate(0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1) != kTalkBuyReserved)
+        Fail("T-478 buy: a row promised to another buyer is refused");
+    if (TalkBuyBatchVerdict(2, 1, 1, 0) != kTalkBuyFailed) Fail("T-478 buy: one owner's NO (the second buyer's) refuses the whole purchase");
+    /* no double charge: a second click while asking, and a click on a window whose purchase already ran */
+    if (TalkBuyConfirmGate(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1) != kTalkBuyAsking) Fail("T-478 buy: a second click while the owners are asked asks nobody again");
+    if (TalkBuyConfirmGate(1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1) != kTalkBuySpent) Fail("T-478 buy: a window whose purchase ran is never charged again");
+    if (TalkBuyConfirmGate(0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1) != kTalkBuyUntied || TalkBuyConfirmGate(0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1) != kTalkBuyNoHirer
+        || TalkBuyConfirmGate(0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 1) != kTalkBuyNoRoom || TalkBuyConfirmGate(0, 0, 1, 1, 0, 0, 0, 1, 1, 1, -1, 1) != kTalkBuyAsk)
+        Fail("T-478 buy: untied window / no buyer / no room refuse; an unread limit is left to the engine");
+    for (int g = kTalkBuyEngine; g <= kTalkBuyNoRoom; ++g) if (std::string(TalkBuyGateName(g)) == "?") Fail("T-478 buy: every verdict has its log words");
+    /* the owners' answers */
+    if (TalkBuyBatchVerdict(2, 2, 0, 0) != kTalkBuyAllOk || TalkBuyBatchVerdict(2, 1, 0, 0) != kTalkBuyWait || TalkBuyBatchVerdict(2, 1, 0, 1) != kTalkBuyFailed
+        || TalkBuyBatchVerdict(0, 0, 0, 0) != kTalkBuyFailed)
+        Fail("T-478 buy: all OK runs, an open ask waits, a lost ask (the link dropped) or nothing asked refuses");
+    /* just before the take */
+    if (TalkBuyRunGate(1, 1, 1, 1, 1) != kTalkBuyRunGo || TalkBuyRunGate(0, 1, 1, 1, 1) != kTalkBuyRunWindowGone || TalkBuyRunGate(1, 0, 1, 1, 1) != kTalkBuyRunRowsChanged
+        || TalkBuyRunGate(1, 1, 0, 1, 1) != kTalkBuyRunNoLink || TalkBuyRunGate(1, 1, 1, 0, 1) != kTalkBuyRunDown || TalkBuyRunGate(1, 1, 1, 1, 0) != kTalkBuyRunNoRoom
+        || TalkBuyRunGate(1, 1, 1, 1, -1) != kTalkBuyRunGo)
+        Fail("T-478 buy: the take runs only on the same window and rows, the road open, everyone up and room");
+    std::vector<unsigned int> a, b;
+    a.push_back(7); a.push_back(3); b.push_back(3); b.push_back(7);
+    if (!TalkBuyUidsSame(a, b)) Fail("T-478 buy: the same rows in another order are the same");
+    b.push_back(9);
+    if (TalkBuyUidsSame(a, b)) Fail("T-478 buy: a newly ticked row is a change");
+    {   /* run T2051: a reset batch reads active=0 (VS2010 left the plain fields of `BuyBatch()` as they were) */
+        TalkBuyBatch bb; bb.active = 1; bb.joinType = 48; bb.handler = &bb; bb.win = &bb; bb.hirerUid = 15; bb.nRows = 2;
+        TalkBuyRow row; std::memset(&row, 0, sizeof(row)); row.uid = 7; bb.rows.push_back(row);
+        bb.Reset();
+        if (bb.active != 0 || bb.joinType != 0 || bb.handler != 0 || bb.win != 0 || bb.hirerUid != 0 || bb.nRows != 0 || !bb.rows.empty())
+            Fail("T-478 buy: a reset batch reads active=0, no buyer, no rows");
+        double raw[(sizeof(TalkBuyBatch) + sizeof(double) - 1) / sizeof(double)];
+        std::memset(raw, 0xCD, sizeof(raw));
+        TalkBuyBatch* fresh = new (raw) TalkBuyBatch();
+        if (fresh->active != 0 || fresh->joinType != 0 || fresh->handler != 0 || fresh->win != 0 || fresh->hirerUid != 0 || fresh->nRows != 0 || !fresh->rows.empty())
+            Fail("T-478 buy: a new batch over leftover memory reads active=0");
+        fresh->~TalkBuyBatch();
+    }
+    /* the join types in the hire message */
+    for (int jt = 0; jt < 60; ++jt)
+    {
+        coophire::HireMsg m; m.kind = coophire::kHireReq; m.reqId = 3; m.uid = 0x0102u; m.hirerUid = 9; m.price = 450; m.joinType = jt; m.faction = "Slave Traders";
+        const bool want = (jt == 3 || jt == 18 || jt == 42 || jt == 48);
+        if (coophire::HireFieldsValid(m) != want) Fail("T-478 buy: the hire message takes join types 3, 18, 42 and 48 only");
+        if (!want) continue;
+        std::vector<char> w;
+        coophire::HireMsg o;
+        if (!coophire::EncodeHire(&w, m) || coophire::DecodeHire(&w[0], w.size(), &o) != coophire::kHireDecodeOk || o.joinType != jt || o.price != 450 || o.uid != 0x0102u)
+            Fail("T-478 buy: a REQ with join type 42 / 48 must round-trip");
+    }
+    /* the protocol */
+    if (hovrec::kGameProtocol != 213u) Fail("T-478 buy: the game-to-game protocol is 213");
+    /* the address rows (1.0.68 from tools/gen_table_1068.py, forward and --reverse 'same'; signatures regenerated and proven) */
+    {
+        std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt");
+        std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
+        if (t65.find("SlaveBuyingConfirm                             code 006AE510 006AE510 488BC4554154415541564157488D68A1") == std::string::npos
+            || t65.find("AnimalBuyingConfirm                            code 006AB410 006AB410 488BC4554154415541564157488DA8B8") == std::string::npos
+            || t68.find("SlaveBuyingConfirm                             code 006ADD20 006ADD20 488BC4554154415541564157488D68A1") == std::string::npos
+            || t68.find("AnimalBuyingConfirm                            code 006AAC20 006AAC20 488BC4554154415541564157488DA8B8") == std::string::npos)
+            Fail("T-478 buy: an address table lacks a buying confirm row");
+    }
+    /* wiring (CRLF-safe) */
+    std::string hi = T313ReadFile("../coop-plugin/hire.cpp");
+    std::string sp = T313ReadFile("../coop-plugin/speech.cpp");
+    hi.erase(std::remove(hi.begin(), hi.end(), '\r'), hi.end());
+    sp.erase(std::remove(sp.begin(), sp.end(), '\r'), sp.end());
+    if (hi.empty() || sp.empty()) Fail("T-478 buy: a source file does not read");
+    if (hi.find("    ++g_ownRecruitDepth;   /* this file's own road: the recruit guard sends no DONE of its own for the animals the engine recruits */\n"
+                "    const unsigned long long res = BuyOrigPod(BuyOrigOf(b.joinType), b.handler, &fault);\n    --g_ownRecruitDepth;") == std::string::npos)
+        Fail("T-478 buy: the engine's confirm runs inside the own-road depth (one DONE per row, the hire road's)");
+    if (hi.find("    if (p.joinType == 42 || p.joinType == 48)   /* T-478 step 6: the buying road's OK") == std::string::npos
+        || hi.find("    if (joinType == 42 || joinType == 48) { BuyNoSeen(m); return; }") == std::string::npos
+        || hi.find("        BuyDrain(blocked);") == std::string::npos)
+        Fail("T-478 buy: OK / NO of the buying road go to the batch, and the batch is drained every frame");
+    if (sp.find("    if (cooptalk::TalkEndsLocal(m.endsType) == cooptalk::kTalkLocalBuy) TkBuyOpenLocal(mi, m);") == std::string::npos
+        || sp.find("    else if (HireBuyConfirmHookState() != 1)") == std::string::npos || sp.find("if (++g_t478BuyNotForwarded <= 8)") == std::string::npos)
+        Fail("T-478 buy: the buyer's game opens its window only with the confirms hooked; an unforwarded buy is logged");
+}
+
 
 }   /* namespace suite */

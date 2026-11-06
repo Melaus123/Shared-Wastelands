@@ -17,6 +17,7 @@
 // every prior spike from turning a wrong offset into a crash (F051).
 
 #include "handoff.h"   /* T-1 B1: SquadActivePlatoonOf - the verified squad reader */
+#include "../common/leverpick.h"   /* T-1218: TEST-ONLY picks by key - exactly one, or `#<k>` */
 #include "../common/squadwriter.h"   /* M7a3f3 T-425 [m7a3f3-sc0]: SupersedeOwnIdAfterHandover */
 #include "../common/squadorigin.h"   /* the same-id supersede: OwnIdLiftedByLoadAge */
 #include "../common/sameidpair.h"   /* one live platoon per world squad id: the same-id copy yield and its twin step */
@@ -33,10 +34,14 @@
 #include "../common/aimstamp.h"   /* T-330: the owner's aim stamp, its word and the copy's step */
 #include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
+#include "money.h"   // T-478 step 5: MoneyHave - the purse around the selling confirm
+#include "camp.h"    // T-929 part 6: a group's home camp by the world's camp list key
+#include "../common/campgame.h"   // CampHomeWay
 #include "../common/squadevent.h"   // T-1084: sqevent::HomeChanged - a home hand that changed marks the squad's record due
 #include "../common/squadbirth.h"   // CONTEXT's birth word
 #include "../common/spawnage.h"   // the spawncontainer modes (kSpawnContainer*)
 namespace coop { void LimbsForgetUid(unsigned int uid); void LimbsWorldTeardown(); }   /* LIMBS: clothing.cpp */
+namespace coop { int PoseWorkToolOf(::Character* c, char* out, int cap); void* PoseToolPutOn(::Character* c, const char* sid, int* outcome); int PoseToolTakeOff(::Character* c, void* item); }   /* T-890 WORK TOOL: clothing.cpp */
 namespace coop { void LiveMemoForgetAddress(const void* obj); }   /* beside LiveCharacter: a registered address is asked afresh */
 namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* combat.cpp: the terrain height at (x,z) - 1 a height, 0 no terrain, -1 not read */
 namespace coop { bool EffectKoHoldsKnockdown(unsigned int victimUid); }   /* effect.cpp: a sneak knockout of the copy awaits its verdict */
@@ -60,6 +65,7 @@ namespace coop { void P210NoteMade(unsigned int uid, int kind); void P210CopyDes
 #include "ai_spike.h"
 #include "soak.h"
 #include "medical.h"
+#include "../common/statewire.h"   // T-1205 /god: WithGod - the owner's god mode in its STATE
 #include "stats.h"          // S1: ApplyRemoteStats at the end of both ApplyRemoteSpawn branches
 #include "../common/prisonwire.h"   /* arrest2: MSG_PRISON */
 #include "../common/treatwire.h"    /* heal1: MSG_TREAT */
@@ -94,6 +100,9 @@ namespace coop { void P210NoteMade(unsigned int uid, int kind); void P210CopyDes
 #include "towngen.h"        // P8a: TownGenMadeThisPlatoon - the roster's spawnCause=towngen
 #include "tags.h"           // tags1: a label per copy of the other player's characters
 #include "items.h"          // POSE (read-poses): ObjectPositionKey / ObjectByPositionKey - the bed's building key
+#include "farm.h"           // T-1125: FarmWorkerListedPod - the occupant in the torture building's worker list
+#include "policy.h"         // T-1125: PolicyVtableRvaPod / PolicyClassNamePod - the building's class on the [CAGED] lines
+#include "../common/farmwire.h"   // T-1125: coopfarm::CageWatchEvent / TortSayFirst / TortKeyHash
 
 #include "coop_log.h"
 namespace { swlogbudget::Gate g_qM1IntoNull, g_qM1IntoRef, g_qM1IntoCtx, g_qCtxRenamed, g_qCtxKeptHire, g_qCtxKeptLoad, g_qCtxSent; }   /* T-910: the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
@@ -2450,6 +2459,7 @@ void NotifyDespawn(unsigned int uid, const void* obj, bool justUnloaded, const c
     }
 
     ForgetTarget(obj);   // H030: the engine destroyed the watched player (death, quit) - clear the watch before any read
+    TalkFreezeForgetObject(obj);   // T-978 A: a frozen NPC talked to loses its hold by address (the object is not touched)
 
     // F332/F334 - OUR OWN CALL, COMING BACK ROUND, identified by the object rather than by a
     // window. Everything this function would do has already been done by `ApplyRemoteDespawn`: the
@@ -3459,8 +3469,10 @@ void ApplyRemoteUnload(unsigned int uid, int kind)
 // H030 forbids destroying this one.
 // keepMedical: the owner's medical words for the uid are kept - a stale copy retired so the same SPAWN makes the copy again,
 // whose flags OnSpawn has just written (CopyNoteSpawnFlags) and whose looks read the knocked-out word (crash1b).
+void PoseToolOffForRemoval(unsigned int uid, ::Character* c);   // T-890 WORK TOOL (the POSE block below)
 static int RemoveLocalCopy(unsigned int uid, ::Character* c, const char* what, bool keepMedical = false)
 {
+    PoseToolOffForRemoval(uid, c);         // T-890: a work tool this mod hung on the copy comes off while the copy is whole
     DropPuppet(uid);                       // 1
     MirrorRetire(c);                       // 2
     g_spawned.erase(uid);
@@ -3582,6 +3594,7 @@ int DropPeerOwnedCopy(unsigned int uid, int departed)
             && twinsleep::WithdrawBranch(IsTwinUid(uid) ? 1 : 0, player ? 1 : 0, twinsleep::kKindNeverTake, -1) != twinsleep::kUnchanged;
         if (twinQueued) TwinSleepQueue(uid, twinsleep::kKindNeverTake);
         else UnpuppetForOwnership(uid);   // the local AI has it again, as after a handoff
+        GodForgetCopy(uid);   // T-1205 review fold 10: the god mode was the gone game's word - it does not outlive it here
         ++g_peerGoneWithdrawn;
         DebugLog("[M1] peer gone: uid=" + S(uid)
                  + (player ? " - the watched player / a player-faction character" : (twinQueued ? " - a shared-save twin, queued for the twin sleep (T-1007 (J2): a departure - put to sleep)" : " - a shared-save twin"))
@@ -5435,6 +5448,7 @@ int SnapshotState(unsigned int uid, float* parts, int maxParts, float* blood,
     if (GetupIsRagdoll(c) != 0) bits |= coopgetup::kStateOwnerRagdollBit;
     bits = coopsneak::WithSneak(bits, SneakRead(c));   // the stealth mode rides as bit 7 (sneakwire.h); unreadable = not sneaking
     bits |= StanceStateBits(c);   // the six stance buttons ride as bits 8-13, bit 14 = read (statewire.h WithStance); the ranged mode as bits 15-16 (WithRangedMode), the aim as bits 17-18 (WithAim), the reload as bits 19-20 (WithReload)
+    bits = coopstate::WithGod(bits, coop::GodOn(uid) ? 1 : 0);   // T-1205 /god: the owner's god mode rides as bit 21, bit 22 = carried (statewire.h WithGod)
     if (latchBits)  *latchBits  = bits;
     if (nextKnockoutAt) *nextKnockoutAt = nk;
     if (koTimer)    *koTimer    = kt;
@@ -7539,6 +7553,10 @@ unsigned long long kSetPrisonModeRva = 0; static coop::AddrReg kSetPrisonModeRva
 bool RestraintCageRescue(unsigned int uid, bool sawCaged, bool oursOut, bool guardFresh, bool guardArrest, bool pardonLookOver);
 void RestraintApplyRemote(const cooprison::PrisonMsg& m, unsigned int fromPeer);
 void RestraintSafePointDrain();
+void FreedRecv(const cooprison::PrisonMsg& m, unsigned int fromPeer);   /* T-980: a copy's game's freeing of our prisoner, below RestraintSafePointDrain */
+void FreedInDrain();
+void HireJoinAskRecv(unsigned int uid, unsigned int freerUid, unsigned int fromPeer);              /* T-980: hire.cpp */
+void HireJoinNoRecv(unsigned int uid, unsigned int freerUid, int reason, unsigned int fromPeer);   /* T-980: hire.cpp */
 void RestraintForget(unsigned int uid);
 void RestraintWatch();
 std::string RestraintReportToken();
@@ -7580,7 +7598,8 @@ const int kPoseLayoutCap          = 512;   /* BED1: interior pieces one walk rea
 
 // POSE-b (review-pose): only a LOOPED action of an owner standing still is a pose; a one-off is never sent (v1). Of the
 // looped ones these are never mirrored (case-insensitive substrings): fighting stances, K1's carry lifts / pickups, G1's
-// get-ups, and manning a turret (v1). A stumble is refused by its own flag.
+// get-ups, and any name holding 'turret'. The turret-manning job's own layer pose 'combatstance' is the exception: its
+// starter skips this list (T-890, poselayer.h LayerNameFilterSkipped). A stumble is refused by its own flag.
 const char* const kPoseExcluded[] = { "combat", "stance", "block", "shoulder", "pickup", "standing up", "getting up", "turret" };
 // ... and the idle fidgets: a name that STARTS with 'idle' ('sitting idle', 'kneeling hostage idle' are held poses).
 const char* const kPoseIdlePrefix = "idle";
@@ -7618,6 +7637,11 @@ long long g_poseBedViaLayout = 0;    // BED1 copy: a bed found among the outer b
 long long g_poseBedOuterMissing = 0; // BED1 copy: the outer building's key named nothing here yet (once per want; retried)
 long long g_poseBedLayoutMiss = 0;   // BED1 copy: the outer building was here and no interior piece matched (once per want)
 long long g_poseMissLogged = 0;
+long long g_poseToolOn = 0, g_poseToolOff = 0, g_poseToolNotMade = 0, g_poseToolFault = 0, g_poseToolLost = 0;   // T-890 WORK TOOL (copy)
+long long g_poseToolWaitJob = 0, g_poseToolWaitRefused = 0;   // T-890 review folds 1/3: put-on passes that waited (the copy's own job holds a tool / its own pre-check refuses)
+long long g_poseToolReadFault = 0;   // T-890 WORK TOOL (owner): the job's tool read faulted
+long long g_poseToolLogged = 0;
+const long long kPoseToolLogLimit = 200;
 
 struct PoseOwn
 {
@@ -7652,6 +7676,9 @@ poselayer::Range g_layerTaskRanges[poselayer::kRangeCap];
 int g_layerTaskRangeCount = 0;
 poselayer::Range g_layerCtlRanges[poselayer::kRangeCap];
 int g_layerCtlRangeCount = 0;
+const int kLayerTurretTask = 10;        // T-890 TURRET: g_layerTaskRva's turret-manning job row (AnimTaskCombatStance)
+poselayer::Range g_layerTurretRanges[kAimRangeCap];   // its code pieces (MAIN THREAD: written at install, read by PoseWatchTick)
+int g_layerTurretRangeCount = 0;
 unsigned long long g_layerImageBegin = 0, g_layerImageEnd = 0;
 long long g_layerCallsMain = 0;         // detour: layer-play calls on the main thread (only that thread writes it)
 long long g_layerCallsOffMain = 0;      // detour: ... off the main thread (interlocked)
@@ -7846,8 +7873,25 @@ struct PoseWant
     unsigned int outerHand[5];
     DWORD dropAt;         // a limp copy's getDropped posted at (0 = none waiting); the bed follows on a later try
     bool dropGaveUp;      // its request was not carried out in time: no bed for this want while it stays limp
+    // T-890 WORK TOOL: the item this mod hung in the copy's hands for this want (0 none), the copy it hangs on and that copy's
+    // handle ids then, its sid; toolBad = the tool sid that made no item or whose attach faulted (not retried for this want)
+    void* toolItem;
+    ::Character* toolOn;
+    unsigned int toolHand[5];
+    bool toolHandSet;
+    char toolSid[coopstate::kPoseStrMax + 1];
+    char toolBad[coopstate::kPoseStrMax + 1];
 };
 std::map<unsigned int, PoseWant> g_poseWant;
+// T-890 WORK TOOL: a tool whose copy stopped resolving - the copy's address and handle ids when the tool was hung
+struct PoseToolLeft
+{
+    ::Character* on;
+    void* item;
+    unsigned int hand[5];
+    char sid[coopstate::kPoseStrMax + 1];
+};
+std::map<unsigned int, PoseToolLeft> g_poseToolLeft;
 
 // POD reads under SEH (no object with a destructor here - C2712).
 int PoseReadPod(const void* c, int* inSomething, unsigned char* hand, char* act, int* actLong, int* stumble, int* looped,
@@ -7895,7 +7939,8 @@ int PoseStrPod(const char* p, char* out, size_t outBytes)
     __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
 }
 
-// T-307: the layer table's held state (common/poselayer.h - the layers it allows, at most kStateCap states, the pick):
+// T-307: the layer table's held state (common/poselayer.h - the layers it allows, at most kStateCap states, the pick; T-890
+// TURRET: layer 2 too, for a state the turret job started):
 // 1 a pick, its name in out, its AnimationClass in *animOut and its AnimationData in *recOut (the start table's key);
 // 0 none; -1 a fault part way. POD only (C2712). MAIN THREAD, the AI worker idle.
 int PoseLayerReadPod(const void* c, char* out, size_t outBytes, const void** animOut, const void** recOut)
@@ -7914,7 +7959,9 @@ int PoseLayerReadPod(const void* c, char* out, size_t outBytes, const void** ani
         if (table == 0) return 0;
         for (int L = 0; L < poselayer::kLayers && n < poselayer::kStateCap; ++L)
         {
-            if ((poselayer::kLayerMask & (1u << L)) == 0) continue;
+            const bool turretLayer = (poselayer::kTurretLayerMask & (1u << L)) != 0;   // T-890 TURRET: layer 2, the turret job's state only
+            if ((poselayer::kLayerMask & (1u << L)) == 0 && !turretLayer) continue;
+            if (turretLayer && (g_layerStartOn != 1 || g_layerTurretRangeCount <= 0)) continue;   // no starter notes: nothing to take there
             const char* layer = table[L];
             if (layer == 0) continue;
             const unsigned int cnt = *(const unsigned int*)(layer + kPoseLayerCountOff);
@@ -7928,6 +7975,13 @@ int PoseLayerReadPod(const void* c, char* out, size_t outBytes, const void** ani
                 s[n].weight = *(const float*)(st + kPoseStateWeightOff);
                 s[n].looped = (*(const unsigned char*)(st + kPoseStateLoopedOff) != 0) ? 1 : 0;
                 data[n] = *(const char* const*)(st + kPoseStateDataOff);
+                s[n].turret = 0;
+                if (turretLayer && s[n].looped != 0 && s[n].weight >= poselayer::kFullWeight && data[n] != 0)
+                {
+                    unsigned int rv = 0;   // T-890 TURRET (T1871): the turret job's 'combatstance' plays on layer 2, layer 1 empty
+                    const int kind = poselayer::StartFind(&g_layerStarts, anim, data[n], &rv);
+                    s[n].turret = poselayer::TurretStarted(kind, rv, g_layerImageBegin, g_layerTurretRanges, g_layerTurretRangeCount);
+                }
                 ++n;
             }
         }
@@ -8395,10 +8449,154 @@ void* PoseCurrentBedObject(::Character* c)
     return P11CageFromPoseHand(hd);
 }
 
+// T-890 WORK TOOL (copy side, MAIN THREAD). The owner's operate-machine job hangs its building's work tool (a mine's pickaxe, a
+// farm's hoe) in the character's hands and takes it off and destroys it at the job's end; a copy runs no job and only plays the
+// animation, so the tool its owner's pose names is made and hung here (clothing.cpp PoseToolPutOn) while the copy shows that pose,
+// and taken off and destroyed (PoseToolTakeOff) as soon as it does not: the pose ends, changes or loses its tool, is undone or
+// expires, the copy changes hands, is carried, limp or dead, or is removed (RemoveLocalCopy). A copy that stops resolving keeps
+// its record in g_poseToolLeft, and the item is touched again only on that same copy (same address, same handle).
+void PoseToolLog(unsigned int uid, const char* what, const char* sid, const char* why)
+{
+    if (g_poseToolLogged >= kPoseToolLogLimit) return;
+    ++g_poseToolLogged;
+    DebugLog("[POSE] work tool " + std::string(what) + " #" + S(g_poseToolLogged) + " uid=" + S((long long)uid) + " sid='"
+             + std::string(sid != 0 ? sid : "") + "' (" + std::string(why) + ")");
+}
+
+// the want's tool, whose copy no longer resolves to the object it hangs on, kept by uid; never touched unless that copy resolves again
+void PoseToolLeave(unsigned int uid, PoseWant& w)
+{
+    if (w.toolItem == 0) return;
+    if (uid != 0 && w.toolHandSet)
+    {
+        std::map<unsigned int, PoseToolLeft>::iterator old = g_poseToolLeft.find(uid);
+        if (old != g_poseToolLeft.end())
+        {
+            ++g_poseToolLost;
+            PoseToolLog(uid, "forgotten", old->second.sid, "a later tool of this uid left its copy too; the older item is not touched");
+        }
+        PoseToolLeft l;
+        l.on = w.toolOn;
+        l.item = w.toolItem;
+        std::memcpy(l.hand, w.toolHand, sizeof(l.hand));
+        std::memcpy(l.sid, w.toolSid, sizeof(l.sid));
+        g_poseToolLeft[uid] = l;
+        PoseToolLog(uid, "left with its copy", w.toolSid, "the copy no longer resolves here; taken off if the same copy comes back");
+    }
+    else
+    {
+        ++g_poseToolLost;
+        PoseToolLog(uid, "forgotten", w.toolSid, "the copy no longer resolves and its handle was not read; the item is not touched");
+    }
+    w.toolItem = 0; w.toolOn = 0; w.toolHandSet = false; w.toolSid[0] = 0;
+}
+
+// T-890 review fold 2: the want's tool still hangs on c - c is the address it was hung on AND c's handle ids now are those read
+// then. An engine destroy and a later SPAWN can put another copy at the same address; its hands are not ours to touch.
+bool PoseToolOnSameCopy(::Character* c, const PoseWant& w)
+{
+    unsigned int hd[5];
+    std::memset(hd, 0, sizeof(hd));
+    const int read = (c != 0 && c == w.toolOn) ? ObjectHandIds(c, hd) : 0;
+    return coopstate::PoseToolSameCopy(w.toolOn, c, w.toolHandSet, w.toolHand, read, hd);
+}
+
+// the want's tool taken off c and destroyed; c is the live copy PoseApplyTick resolved for uid. Another copy at that address
+// (review fold 2) leaves the record untouched (PoseToolLeave); c's own job holding a tool (review fold 1) forgets it untouched.
+void PoseToolOff(unsigned int uid, ::Character* c, PoseWant& w, const char* why)
+{
+    if (w.toolItem == 0) return;
+    if (!PoseToolOnSameCopy(c, w)) { PoseToolLeave(uid, w); return; }
+    const int r = PoseToolTakeOff(c, w.toolItem);
+    if (r == 1) { ++g_poseToolOff; PoseToolLog(uid, "removed", w.toolSid, why); }
+    else if (r == -3) { ++g_poseToolLost; PoseToolLog(uid, "left on (not touched)", w.toolSid, "the character's own job holds a tool in its hands; a take-off by the slot's name would remove that one"); }
+    else { ++g_poseToolFault; PoseToolLog(uid, r == -1 ? "take-off faulted (the item is left on the model)" : "taken off, destroy refused", w.toolSid, why); }
+    w.toolItem = 0; w.toolOn = 0; w.toolHandSet = false; w.toolSid[0] = 0;
+}
+
+// once per PoseApplyTick pass for the live copy c of uid: the tool its owner's pose names is on exactly while the copy shows that
+// action pose (played and not undone, standing on its own); otherwise it is off. Review folds: the copy's handle ids are read
+// before the put-on (no tool is hung on a copy that could not be told apart from a later one at its address); the put-on waits,
+// and is tried again on a later pass, while the copy's own job holds a tool or its own pre-check refuses one.
+void PoseToolStep(unsigned int uid, ::Character* c, PoseWant& w)
+{
+    const bool want = w.pw.kind == coopstate::kPoseAction && w.pw.tool[0] != 0 && w.applied == 1
+                   && !BeingCarried(c) && !RagdollActive(c) && !c->hasDied();
+    if (w.toolItem != 0 && (!want || !PoseToolOnSameCopy(c, w) || std::strcmp(w.toolSid, w.pw.tool) != 0))
+        PoseToolOff(uid, c, w, !want ? "the copy no longer shows the work pose" : "the owner's tool changed");
+    if (!want || w.toolItem != 0 || std::strcmp(w.toolBad, w.pw.tool) == 0) return;
+    unsigned int hd[5];
+    if (ObjectHandIds(c, hd) == 0)
+    {
+        std::memcpy(w.toolBad, w.pw.tool, sizeof(w.toolBad));
+        ++g_poseToolFault;
+        PoseToolLog(uid, "not hung", w.pw.tool, "the copy's handle ids were not read, so a later copy at its address could not be told apart; not retried for this want");
+        return;
+    }
+    int outcome = 0;
+    void* item = PoseToolPutOn(c, w.pw.tool, &outcome);
+    if (item == 0)
+    {
+        if (outcome == 3 || outcome == 4)
+        {
+            long long& n = outcome == 4 ? g_poseToolWaitJob : g_poseToolWaitRefused;
+            if (++n % 1000 == 1)
+                PoseToolLog(uid, "waits", w.pw.tool, outcome == 4 ? "the character's own job holds a tool in its hands (one line per 1000 waits)"
+                                                                  : "the character's own check refuses a tool now, as the job's start would (one line per 1000 waits)");
+            return;
+        }
+        std::memcpy(w.toolBad, w.pw.tool, sizeof(w.toolBad));
+        if (outcome == 2) { ++g_poseToolFault; PoseToolLog(uid, "attach faulted (the item is left alone)", w.pw.tool, "not retried for this want"); }
+        else { ++g_poseToolNotMade; PoseToolLog(uid, "not made", w.pw.tool, "the sid makes no item here; not retried for this want"); }
+        return;
+    }
+    w.toolItem = item;
+    w.toolOn = c;
+    std::memcpy(w.toolHand, hd, sizeof(w.toolHand));
+    w.toolHandSet = true;
+    std::memcpy(w.toolSid, w.pw.tool, sizeof(w.toolSid));
+    ++g_poseToolOn;
+    PoseToolLog(uid, "attached", w.toolSid, "in the copy's hands");
+}
+
+// a tool left on a copy that stopped resolving: taken off when the same copy (address and handle) resolves again; forgotten
+// untouched when the uid resolves to another object (the old copy is gone)
+void PoseToolLeftTick()
+{
+    std::map<unsigned int, PoseToolLeft>::iterator it = g_poseToolLeft.begin();
+    while (it != g_poseToolLeft.end())
+    {
+        ::Character* c = FindSpawned(it->first);
+        if (c == 0) { ++it; continue; }
+        unsigned int hd[5];
+        const bool same = c == it->second.on && PlausibleObject(c) && ObjectHandIds(c, hd) != 0
+                       && std::memcmp(hd, it->second.hand, sizeof(hd)) == 0;
+        if (same)
+        {
+            const int r = PoseToolTakeOff(c, it->second.item);
+            if (r == 1) { ++g_poseToolOff; PoseToolLog(it->first, "removed", it->second.sid, "its copy resolved again"); }
+            else if (r == -3) { ++g_poseToolLost; PoseToolLog(it->first, "left on (not touched)", it->second.sid, "its copy resolved again, and the character's own job holds a tool in its hands"); }
+            else
+            {
+                ++g_poseToolFault;
+                PoseToolLog(it->first, r == -1 ? "take-off faulted (the item is left on the model)" : "taken off, destroy refused",
+                            it->second.sid, "its copy resolved again");
+            }
+        }
+        else
+        {
+            ++g_poseToolLost;
+            PoseToolLog(it->first, "forgotten", it->second.sid, "the uid names another object now; the old copy's item is not touched");
+        }
+        g_poseToolLeft.erase(it++);
+    }
+}
+
 // review-arrest2 MEDIUM: a cage comes off only when the OWNER left it (its want changed) - never on a handoff (the character
 // is ours now, a real prisoner) nor on an expiry (a link hiccup must not free a prisoner).
 void PoseUndo(::Character* c, PoseWant& w, bool cageOut = true)
 {
+    PoseToolOff(FindSpawnedUid(c), c, w, "the pose was undone");   // T-890 WORK TOOL
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     if (w.applied == 1 && PoseStopPod((StopActionFn)(base + kStopActionRva), c) < 0) ++g_poseBedFaulted;
     if (PoseInSomethingPod(c) == 1 && PoseBedPod((SetBedModeFn)(base + kSetBedModeRva), c, false, 0) < 0) ++g_poseBedFaulted;
@@ -8686,6 +8884,66 @@ void PoseApplyCage(unsigned int uid, ::Character* c, PoseWant& w, DWORD now)
 
 }   // namespace (POSE private)
 
+// run T2051: this game hands uid to another game (every release road passes WorldStateOnOwnershipReleased). A character sitting
+// in a cage here is recorded as caged on the new owner's word, so PrisonWatchCopies does not report that cage as this game's own
+// arrest (the scan's record of the owner's word was fed only by received POSEs, so it was empty for a character owned here until
+// now). The new owner's word still decides: a release in it takes the copy out (PoseApplyCage), and the copy leaving the cage
+// drops the mark (PrisonWatchCopies).
+void PrisonOnHandedOver(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !PlausibleObject(c)) return;
+    const int ins = PoseInSomethingPod(c);
+    if (!cageask::CageOwnWordOnHandOver(ins)) return;
+    g_poseCaged[uid] = true;
+    DebugLog("[PRISON] handed over uid=" + S((long long)uid) + " while caged here: recorded as caged on the new owner's word - not reported as this game's arrest");
+}
+
+// T-890 WORK TOOL: the tool records of uid on its live copy c taken off and destroyed now - the want's, and one left when the
+// copy stopped resolving - each only on that same copy (address and handle ids). MAIN THREAD.
+static void PoseToolOffWhole(unsigned int uid, ::Character* c, const char* why)
+{
+    if (c == 0) return;
+    std::map<unsigned int, PoseWant>::iterator it = g_poseWant.find(uid);
+    if (it != g_poseWant.end() && it->second.toolItem != 0 && it->second.toolOn == c) PoseToolOff(uid, c, it->second, why);
+    std::map<unsigned int, PoseToolLeft>::iterator l = g_poseToolLeft.find(uid);
+    if (l == g_poseToolLeft.end() || l->second.on != c) return;
+    unsigned int hd[5];
+    if (ObjectHandIds(c, hd) == 0 || std::memcmp(hd, l->second.hand, sizeof(hd)) != 0) return;
+    const int r = PoseToolTakeOff(c, l->second.item);
+    if (r == 1) ++g_poseToolOff; else if (r == -3) ++g_poseToolLost; else ++g_poseToolFault;
+    PoseToolLog(uid, r == 1 ? "removed" : (r == -3 ? "left on (not touched: the character's own job holds a tool)" : "take-off failed"), l->second.sid, why);
+    g_poseToolLeft.erase(l);
+}
+
+// T-890 WORK TOOL: RemoveLocalCopy's first step - a tool this mod hung on copy c comes off and is destroyed while c is whole.
+// MAIN THREAD.
+void PoseToolOffForRemoval(unsigned int uid, ::Character* c) { PoseToolOffWhole(uid, c, "the copy is removed"); }
+
+// T-890 review fold 1: a copy this game takes over (replicate.cpp UnpuppetForOwnership) - its tool comes off BEFORE its AI gate
+// opens. Once its own AI runs, an operate-machine job may hang the engine's own tool in the same "hands" slot, and the take-off,
+// which goes by the slot's name, could then remove that one; PoseApplyTick's changed-hands step comes only on its next pass.
+// Engine writes blocked: left to that step. MAIN THREAD.
+void PoseToolOffForOwnership(unsigned int uid, ::Character* c)
+{
+    if (c == 0 || EngineWritesBlocked()) return;
+    PoseToolOffWhole(uid, c, "the copy is taken over by this game, before its AI runs");
+}
+
+// T-890 WORK TOOL: world teardown - every copy of this world is gone; the tool records go without touching an item. MAIN THREAD.
+void PoseToolWorldTeardown()
+{
+    g_poseToolLost += (long long)g_poseToolLeft.size();
+    g_poseToolLeft.clear();
+    for (std::map<unsigned int, PoseWant>::iterator it = g_poseWant.begin(); it != g_poseWant.end(); ++it)
+    {
+        PoseWant& w = it->second;
+        if (w.toolItem == 0) continue;
+        ++g_poseToolLost;
+        w.toolItem = 0; w.toolOn = 0; w.toolHandSet = false; w.toolSid[0] = 0;
+    }
+}
+
 bool PoseOfOwned(unsigned int uid, coopstate::PoseWire* out)
 {
     if (out == 0) return false;
@@ -8815,7 +9073,11 @@ void PoseWatchTick()
 
         coopstate::PoseWire pw;
         coopstate::PoseClear(&pw);
-        const bool excluded = act[0] != 0 && (stumble != 0 || PoseActionExcluded(act));
+        // T-890 TURRET: the turret-manning job's layer pose skips the name filter (poselayer.h LayerNameFilterSkipped)
+        const bool nameFree = fromLayer && poselayer::LayerNameFilterSkipped(layerStartKind, layerStartRva, g_layerImageBegin,
+            g_layerTurretRanges, g_layerTurretRangeCount, (it != g_poseOwn.end() && it->second.pw.kind == coopstate::kPoseAction
+                                                           && std::strcmp(it->second.pw.action, act) == 0) ? 1 : 0) != 0;
+        const bool excluded = act[0] != 0 && (stumble != 0 || (!nameFree && PoseActionExcluded(act)));
         // POSE-b (review-pose item 1): a pose is a LOOPED action of an owner standing still; a one-off is not sent (v1).
         // The bed below is as before (its fallback action follows the same rule).
         const bool oneOff = act[0] != 0 && !excluded && looped == 0;
@@ -8838,6 +9100,16 @@ void PoseWatchTick()
         {
             std::memcpy(pw.action, act, sizeof(pw.action));
             if (pw.kind == coopstate::kPoseNone) pw.kind = coopstate::kPoseAction;
+        }
+        // T-890 WORK TOOL: an action pose also names the work tool the owner's operate-machine job hung in the character's
+        // hands (clothing.cpp PoseWorkToolOf: the job's own tool field). Read only while the AI worker is idle - the job starts
+        // and ends on it; a busy frame keeps the last read for the same action, so a busy frame never drops a tool.
+        if (pw.kind == coopstate::kPoseAction)
+        {
+            if (layerBusy == 2) layerBusy = AiWorkerBusyNow();
+            if (layerBusy == 0) { if (PoseWorkToolOf(c, pw.tool, (int)sizeof(pw.tool)) < 0) ++g_poseToolReadFault; }
+            else if (it != g_poseOwn.end() && std::strcmp(it->second.pw.action, pw.action) == 0)
+                std::memcpy(pw.tool, it->second.pw.tool, sizeof(pw.tool));
         }
         if (pw.kind == coopstate::kPoseNone) { pw.bedKey[0] = 0; pw.outerKey[0] = 0; }   /* a key only travels with a bed (BED1: both keys) */
 
@@ -8863,6 +9135,8 @@ void PoseWatchTick()
             }
             continue;
         }
+        if (std::strcmp(pw.tool, was.tool) != 0)   // T-890 WORK TOOL: one line when the tool an owned character's pose names changes
+            PoseToolLog(uid, pw.tool[0] != 0 ? "sent" : "no longer sent", pw.tool[0] != 0 ? pw.tool : was.tool, "the owner's machine job");
         if (excluded) ++g_poseExcludedSeen;
         else if (oneOff) ++g_poseOneOffSeen;
         else if (moving) ++g_poseOwnerMovingSeen;
@@ -8925,6 +9199,8 @@ void NotePoseWant(unsigned int uid, const coopstate::PoseWire& pose, unsigned in
         w.bedMiss = false; w.bedMissCounted = false; w.refusedNow = false; w.bedAt = 0;
         w.approachCounted = false; w.confirmedAt = ::GetTickCount();
         w.playedBefore = false; w.afterUpdate = false;   /* T-890 */
+        w.toolItem = 0; w.toolOn = 0; w.toolHandSet = false; w.toolSid[0] = 0; w.toolBad[0] = 0;   /* T-890 WORK TOOL */
+        std::memset(w.toolHand, 0, sizeof(w.toolHand));
         PoseWantResetBed(w);   /* BED1 */
         g_poseWant[uid] = w;
         return;
@@ -8938,10 +9214,12 @@ void NotePoseWant(unsigned int uid, const coopstate::PoseWire& pose, unsigned in
     w.pw = pose; w.action = pose.action; w.counted = false; w.approachCounted = false;
     w.bedMiss = false; w.bedMissCounted = false; w.refusedNow = false; w.bedAt = 0;
     PoseWantResetBed(w);   /* BED1: a changed want (another bed, another outer building) walks afresh */
+    w.toolBad[0] = 0;      /* T-890 WORK TOOL: a changed want tries its tool afresh */
 }
 
 void PoseApplyTick()
 {
+    if (!g_poseToolLeft.empty() && !EngineWritesBlocked()) PoseToolLeftTick();   // T-890 WORK TOOL: tools on copies that stopped resolving
     if (g_poseWant.empty()) return;
     if (EngineWritesBlocked()) return;
     if (kSetBedModeRva == 0 || kPlayActionByNameRva == 0 || kStopActionRva == 0) return;
@@ -8957,12 +9235,13 @@ void PoseApplyTick()
         const unsigned int uid = it->first;
         PoseWant& w = it->second;
         ::Character* c = FindSpawned(uid);
-        if (c == 0 || !PlausibleObject(c)) { PrisonForgetCopy(uid); g_poseWant.erase(it++); continue; }
+        if (c == 0 || !PlausibleObject(c)) { PoseToolLeave(uid, w); PrisonForgetCopy(uid); g_poseWant.erase(it++); continue; }
         // The wish was authorised when its STATE arrived; a handoff since may have made us the owner - then the
         // engine runs the character and nothing here touches it.
         // POSE-b item 4: what we applied is undone first - from here the engine (or the new owner's STATE) runs it.
         if (net::IsUidMine(uid) || !net::RemoteMayWriteStill(uid, w.peer))
         {
+            PoseToolOff(uid, c, w, "the copy changed hands");   // T-890 WORK TOOL
             if (w.applied != 0) { PoseUndo(c, w, false); ++g_poseUndoneHandoff; }
             PrisonForgetCopy(uid);   // review-arrest3 M1
             g_poseWant.erase(it++); continue;
@@ -8970,6 +9249,7 @@ void PoseApplyTick()
         // POSE-b item 6: STATE is unordered and unreliable; a pose no STATE re-confirmed for 10 s is undone and dropped.
         if (now - w.confirmedAt >= kPoseConfirmMs)
         {
+            PoseToolOff(uid, c, w, "the pose expired");   // T-890 WORK TOOL
             if (w.applied != 0) PoseUndo(c, w, false);
             ++g_poseExpired;
             g_poseWant.erase(it++); continue;
@@ -8977,10 +9257,12 @@ void PoseApplyTick()
 
         if (w.pw.kind == coopstate::kPoseNone)
         {
+            PoseToolOff(uid, c, w, "the owner's pose ended");   // T-890 WORK TOOL
             if (w.applied != 0) { PoseUndo(c, w); ++g_poseCleared; }
             g_releaseHold.erase(uid);   // arrest3
             g_poseWant.erase(it++); continue;
         }
+        PoseToolStep(uid, c, w);   // T-890 WORK TOOL: on while the copy shows the work pose (as of the last pass), otherwise off
         w.held = false;
         // only copies that stand on their own: not carried, not a ragdoll (knocked out), not dead. arrest2: a cage takes a
         // knocked-out body too (the guard's own Task_PutInSomething cages it limp), so only carried / dead wait for a cage.
@@ -9195,6 +9477,9 @@ std::string PoseReportToken()
          + " poseOneOffSeen=" + S(g_poseOneOffSeen) + " poseOwnerMovingSeen=" + S(g_poseOwnerMovingSeen)
          + " posePendingApproach=" + S(g_posePendingApproach) + " poseUndoneHandoff=" + S(g_poseUndoneHandoff)
          + " poseExpired=" + S(g_poseExpired)
+         + " poseTool[on,off,notMade,fault,lost,readFault,waitJob,waitRefused]=" + S(g_poseToolOn) + "," + S(g_poseToolOff) + "," + S(g_poseToolNotMade)
+         + "," + S(g_poseToolFault) + "," + S(g_poseToolLost) + "," + S(g_poseToolReadFault)   /* T-890 WORK TOOL */
+         + "," + S(g_poseToolWaitJob) + "," + S(g_poseToolWaitRefused)   /* T-890 review folds 1/3 */
          + " poseBedViaLayout=" + S(g_poseBedViaLayout) + " poseBedOuterMissing=" + S(g_poseBedOuterMissing)
          + " poseBedLayoutMiss=" + S(g_poseBedLayoutMiss)
          + " poseAppliedCage=" + S(g_poseAppliedCage) + " poseCageHeld=" + S(g_poseCageHeld)   // arrest2
@@ -9301,6 +9586,8 @@ void InstallPoseLayerStart()
         g_layerTaskRangeCount = nTask;
         for (int i = 0; i < nCtl; ++i) g_layerCtlRanges[i] = ctlRanges[i];
         g_layerCtlRangeCount = nCtl;
+        const int tp = (task[kLayerTurretTask] != 0) ? AimRangesPod(task[kLayerTurretTask], g_layerTurretRanges, kAimRangeCap) : 0;
+        g_layerTurretRangeCount = (tp > 0) ? tp : 0;   /* T-890 TURRET: none found = the turret pose stays refused by name */
         if (coop::AddHook((void*)(base + kAnimLayerPlayRva), (void*)&detour_animLayerPlay, (void**)&g_layerPlayOrig) != coop::SUCCESS
             || g_layerPlayOrig == 0)
             why = "AddHook on the layer play failed";
@@ -9308,7 +9595,8 @@ void InstallPoseLayerStart()
     const std::string counts = S((long long)nCallers) + " calling functions (" + S((long long)unknownFns) + " unknown, "
         + S((long long)unplaced) + " call sites in no function), " + S((long long)nTask) + " task and " + S((long long)nCtl)
         + " controller code ranges, listed tasks without a row " + S((long long)tasksMissing) + ", without a call "
-        + S((long long)tasksSilent) + ", stack walk " + (g_layerCapture != 0 ? "found" : "MISSING");
+        + S((long long)tasksSilent) + ", turret job code pieces " + S((long long)g_layerTurretRangeCount)
+        + ", stack walk " + (g_layerCapture != 0 ? "found" : "MISSING");
     if (why.empty())
     {
         g_layerStartOn = 1;
@@ -9371,6 +9659,109 @@ void* P11CageFromPoseHand(const unsigned char* id)   /* the object the pose hand
     void* bld = (void*)h.asBuilding();
     return (bld != 0 && PlausibleObject(bld)) ? bld : 0;
 }
+int CageInsPod(const void* c, int* ins)   /* T-1125: the character's inSomething (+0x2F8: 1 a bed, 2 a cage or torture building) */
+{
+    __try { *ins = *(const int*)((const char*)c + kPoseInSomethingOff); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ins = 0; return 0; }
+}
+}   // namespace (the arrest2 block; reopened below - T-1125)
+
+/* T-1125: THE OCCUPANT WATCH (release lines; reads only). Every 500 ms on the main thread (FarmTick) each loaded character's
+   inSomething and the building its hand +0x300 names are compared with the last pass (coopfarm::CageWatchEvent): `[CAGED] in`
+   when one goes into a cage or torture building (the building, its class, whether the character is in its worker list - the list a
+   torture building works on), `[CAGED] out` when it leaves, `[CAGED] building gone` when the building it is in no longer resolves
+   with it still inside. One line per (character, building, event) for the session (coopfarm::TortSayFirst). */
+struct CageOccSeen { int ins; unsigned int keyHash; unsigned int pass; char key[64]; char bname[64]; };
+void CageOccupantWatch()
+{
+    static DWORD at = 0;
+    static unsigned int pass = 0;
+    static std::map<unsigned int, CageOccSeen> seen;
+    static coopfarm::TortSeen capRows[256];
+    static int capN = 0;
+    static long long notSaid = 0;
+    const DWORD now = ::GetTickCount();
+    if (now - at < 500) return;
+    at = now;
+    ++pass;
+    for (int i = 0; i < MirrorCapacity(); ++i)
+    {
+        unsigned int uid = 0;
+        ::Character* c = 0;
+        if (!MirrorSlot(i, &uid, &c) || uid == 0 || !PlausibleObject(c)) continue;
+        int ins = 0;
+        unsigned char hd[kHandIdBytes];
+        if (CageInsPod(c, &ins) == 0 || PoseHandPod(c, hd) == 0) continue;
+        std::map<unsigned int, CageOccSeen>::iterator it = seen.find(uid);
+        if (it == seen.end())
+        {
+            CageOccSeen z;
+            std::memset(&z, 0, sizeof(z));
+            it = seen.insert(std::make_pair(uid, z)).first;
+        }
+        CageOccSeen& o = it->second;
+        o.pass = pass;
+        void* bld = (ins == 2) ? P11CageFromPoseHand(hd) : 0;
+        char key[64];
+        key[0] = 0;
+        if (bld != 0 && ObjectPositionKey(bld, key, (int)sizeof(key), 0, 3, 0) == 0) std::strcpy(key, "(no key)");
+        const unsigned int kh = (bld != 0) ? coopfarm::TortKeyHash(key) : 0u;
+        const int ev = coopfarm::CageWatchEvent(o.ins, o.keyHash, ins, kh);
+        if (ev != coopfarm::kCageEvNone)
+        {
+            const int say = coopfarm::TortSayFirst(capRows, &capN, 256, ev == coopfarm::kCageEvIn ? kh : o.keyHash, uid, ev);
+            if (say < 0) ++notSaid;
+            if (say > 0)
+            {
+                std::string nm;
+                if (!NameOf(c, &nm) || nm.empty()) nm = "?";
+                const char* whose = net::IsUidMine(uid) ? "this game's own character" : "another game's character, a copy here";
+                char t[900];
+                if (ev == coopfarm::kCageEvIn)
+                {
+                    char bn[64], cls[96];
+                    bn[0] = 0; cls[0] = 0;
+                    if (bld != 0 && ObjRecordNamePod(bld, bn, (int)sizeof(bn)) == 0) std::strcpy(bn, "?");
+                    const unsigned int vt = (bld != 0) ? PolicyVtableRvaPod(bld) : 0u;
+                    if (vt == 0 || PolicyClassNamePod(vt, cls, (int)sizeof(cls)) == 0) std::strcpy(cls, "?");
+                    const int listed = (bld != 0) ? FarmWorkerListedPod(bld, c) : -1;
+                    unsigned int f[5];
+                    std::memcpy(f, hd, sizeof(f));
+                    if (bld != 0)
+                        _snprintf_s(t, sizeof(t), _TRUNCATE, "[CAGED] in: uid %u '%s' (%s) is in building %s '%s' class %s; in its worker list %s;"
+                                    " lines not said so far %lld", uid, nm.c_str(), whose, key, bn, cls,
+                                    listed == 1 ? "yes" : listed == 0 ? "NO" : "unreadable", notSaid);
+                    else
+                        _snprintf_s(t, sizeof(t), _TRUNCATE, "[CAGED] in: uid %u '%s' (%s) is in something (2, a cage) but its hand names NO building"
+                                    " (hand type %u container %u stamp %u index %u serial %u); lines not said so far %lld",
+                                    uid, nm.c_str(), whose, f[0], f[1], f[2], f[3], f[4], notSaid);
+                }
+                else if (ev == coopfarm::kCageEvOut)
+                    _snprintf_s(t, sizeof(t), _TRUNCATE, "[CAGED] out: uid %u '%s' (%s) left building %s '%s' (inSomething now %d); lines not said so far %lld",
+                                uid, nm.c_str(), whose, o.key[0] != 0 ? o.key : "(none)", o.bname[0] != 0 ? o.bname : "?", ins, notSaid);
+                else
+                    _snprintf_s(t, sizeof(t), _TRUNCATE, "[CAGED] building gone: uid %u '%s' (%s) is still in something (2) but building %s '%s' no longer"
+                                " resolves - taken down or unloaded with it inside; lines not said so far %lld",
+                                uid, nm.c_str(), whose, o.key, o.bname[0] != 0 ? o.bname : "?", notSaid);
+                DebugLog(std::string(t));
+            }
+        }
+        o.ins = ins;
+        o.keyHash = kh;
+        if (bld != 0)
+        {
+            std::strncpy(o.key, key, sizeof(o.key) - 1); o.key[sizeof(o.key) - 1] = 0;
+            if (ObjRecordNamePod(bld, o.bname, (int)sizeof(o.bname)) == 0) o.bname[0] = 0;
+        }
+        else if (ins != 2) { o.key[0] = 0; o.bname[0] = 0; }
+    }
+    for (std::map<unsigned int, CageOccSeen>::iterator it = seen.begin(); it != seen.end();)
+    {
+        if (it->second.pass != pass) seen.erase(it++);
+        else ++it;
+    }
+}
+namespace {   /* the same unnamed namespace, reopened (T-1125) */
 int P11ArrestSentencePod(const void* c, void* cage)   /* kPrisonSentenceYes / No; Unknown without the row or a cage, or on a fault */
 {
     if (kP11BountyRva == 0 || c == 0 || cage == 0) return cooprison::kPrisonSentenceUnknown;
@@ -11114,8 +11505,32 @@ std::string BedTestCommand(const std::string& arg)
     std::vector<BedTestRow> rows;
     if (!BedTestCollect(from, kBedTestRadius, &rows)) return "error bedtest: a zone was unloaded during the walk - try again";
     int pick = -1;
+    int lpPick = -1;
+    if (!sub.empty())
+    {   /* T-1218: with a key text, the ONE bed with a free slot whose key holds it (an equal key wins), or `#<k>` in the bed walk's
+           order (BedTestCollect's); several -> refused naming them */
+        std::string base, lpWhy; int k = 0;
+        if (leverpick::SplitSelector(sub, &base, &k) < 0) lpWhy = leverpick::BadSelector(sub);
+        else
+        {
+            leverpick::Picker<int> pk(k);
+            for (size_t i = 0; i < rows.size(); ++i)
+            {
+                const std::string lk = BedTestLower(rows[i].key);
+                if (lk.find(base) != std::string::npos && PrisonFreeSlotPod(rows[i].bed, bc) == 1) pk.Add((int)i, lk == base ? 0 : 1, 0.0, "'" + rows[i].key + "'");
+            }
+            pk.Decide(&lpPick, "beds with a free slot within " + F1(kBedTestRadius) + " whose key holds '" + base + "'", "bed walk order", &lpWhy);
+        }
+        if (!lpWhy.empty())
+        {
+            DebugLog("[BED] bedtest REFUSED carrier=" + S((long long)carrier) + " body=" + S((long long)body) + ": error bedtest: " + lpWhy);
+            return "error bedtest: " + lpWhy;
+        }
+    }
     for (size_t i = 0; i < rows.size() && pick < 0; ++i)
     {
+        if (lpPick >= 0 && (int)i != lpPick) continue;   /* T-1218: the one picked */
+        if (!sub.empty() && lpPick < 0) continue;        /* T-1218: a key text that matched no free bed - none */
         if (!sub.empty() && BedTestLower(rows[i].key).find(sub) == std::string::npos) continue;
         if (PrisonFreeSlotPod(rows[i].bed, bc) == 1) pick = (int)i;   // the engine's own slot test for this body
     }
@@ -11354,11 +11769,64 @@ void BedHandoffDrain()
    test). The command only lists the cage candidates (items.cpp CageCandidatesNear) and queues; CageTestSafePointDrain makes the
    engine calls at the K2 safe point with the AI worker paused, asking each cage's isFreeSlot first, nearest first. Nothing here
    tells the owner: PrisonWatchCopies finds a copy in a cage that no cage POSE of its owner put there and sends MSG_PRISON IN with
-   this engine's bounty verdict - the message a guard's caging sends. */
+   this engine's bounty verdict - the message a guard's caging sends.
+   T-478 (owner 1446 b; hand session 2026-11-03: a copy caged with sentence=2 hours=-1.0 was freed by the town's police ~2 s later):
+   a real arrest is held by two things, both Read. (1) THE JAILING FACTION is no stored field: GetBountyFaction 0x851140 resolves a
+   caged prisoner (+0x2F8 == 2) through its own cage hand +0x300 to the cage's faction (vt+0x58), reduced to faction+0x38 (its law
+   faction) or the faction itself when +0x40 (851140:9-12, 24-31) - so `faction=<name>` picks a cage OF that faction. (2) THE
+   SENTENCE is Character +0x188 (double, start, = bm+0x98) and +0x190 (float, hours, = bm+0xA0); its one engine writer is
+   notifyStartPrisonSentence 0x853A80 (start = now, hours from the bounty, 16 with none - 853a80:9-21), and a guard frees a prisoner
+   when isPrisonSentenceOver 0x5C9470 (now > start + hours) is true (findPrisonerFreeToGo 0x8CE4F0, answers-arrest3 1). The old
+   lever started no sentence when the copy had no bounty (the task's own test), so start 0 = over at once. Now the lever always
+   calls notifyStartPrisonSentence and then writes the hours asked (the engine itself only stores that float raw, in 0x853A80). */
 namespace {
 const int kCageTestCand = 8;
-struct CageTestPend { unsigned int uid; int n; void* cand[kCageTestCand]; float dist[kCageTestCand]; std::string key[kCageTestCand]; std::string name[kCageTestCand]; };
+struct CageTestPend { unsigned int uid; int n; void* cand[kCageTestCand]; float dist[kCageTestCand]; std::string key[kCageTestCand]; std::string name[kCageTestCand];
+                      std::string facAsked; int hours; };
 std::vector<CageTestPend> g_cageTestPend;
+
+/* T-478: a cage's faction (RootObjectBase vt+0x58) and the key GetBountyFaction 0x851140 reduces it to (851140:24-31: faction+0x38
+   when set, else the faction itself when +0x40 isALawEnforcementFaction, else none). 1 read, -1 faulted. */
+int CageTestFactionPod(void* cage, void** facOut, void** lawOut)
+{
+    *facOut = 0; *lawOut = 0;
+    __try
+    {
+        void** vt = *(void***)cage;
+        void* fac = ((GetFactionVtFn)vt[0x58 / 8])(cage);
+        *facOut = fac;
+        if (fac != 0)
+        {
+            void* law = *(void**)((char*)fac + 0x38);
+            *lawOut = (law != 0) ? law : ((*((const unsigned char*)fac + 0x40) != 0) ? fac : 0);
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-478 read-back after the caging: GetBountyFaction(bm, 0) - with +0x2F8 == 2 it resolves the prisoner's own cage (851140:9-12),
+   the faction the engine keys the sentence and the bounty to - and GetActualBounty 0x8531B0 under it (-1 without the row). 1 read,
+   0 no address, -1 faulted. */
+int CageTestJailKeyPod(::Character* c, void** keyOut, int* bountyOut)
+{
+    *keyOut = 0; *bountyOut = -1;
+    if (kGetBountyFactionPrRva == 0) return 0;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    __try
+    {
+        void* bm = (char*)c + kCharBountyMgrOff;
+        void* key = ((GetBountyFactionFn)(base + kGetBountyFactionPrRva))(bm, 0);
+        *keyOut = key;
+        if (key != 0 && kP11BountyRva != 0) *bountyOut = ((P11BountyFn)(base + (uintptr_t)kP11BountyRva))(bm, key);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+std::string CageTestFacText(void* f)
+{
+    if (f == 0 || !PlausibleObject(f)) return "none";
+    return ((::Faction*)f)->getName() + "|" + FactionKey((::Faction*)f);
+}
 
 void CageTestSafePointDrain()
 {
@@ -11392,18 +11860,35 @@ void CageTestSafePointDrain()
         const int ins = PoseInSomethingPod(c);
         const int hd = PrisonHandSetPod(c);
         const bool ok = (r == 1 && ins == 2 && hd == 1);
-        int lk = 0, sn = 0;
-        float hours = -1.0f;
+        int lk = 0, sn = 0, hs = 0, fr = 0, jr = 0, bounty = -1;
+        float engineHours = -1.0f;
+        GuardArrest back = GuardArrestReadPod(c);   /* T-478: replaced below once the sentence is written */
+        void* cageFac = 0;
+        void* cageLaw = 0;
+        void* jailKey = 0;
         if (ok)
         {
             lk = PrisonLockPod(cage);
-            sn = PrisonSentencePod(c, cage, &hours, cooprison::kPrisonSentenceUnknown);
+            /* T-478: started whatever the bounty (verdict Yes skips the task's bounty test) - start = now, the engine's hours */
+            sn = PrisonSentencePod(c, cage, &engineHours, cooprison::kPrisonSentenceYes);
+            if (sn == 1) hs = PrisonSentenceSetPod(c, (float)p.hours);
+            back = GuardArrestReadPod(c);
+            fr = CageTestFactionPod(cage, &cageFac, &cageLaw);
+            jr = CageTestJailKeyPod(c, &jailKey, &bounty);
         }
+        const bool held = ok && sn == 1 && hs == 1 && GuardSentenceSane(back);
         DebugLog("[ARREST] cagetest uid=" + S((long long)p.uid) + " cage='" + p.key[pick] + "' ok=" + S((long long)(ok ? 1 : 0))
                  + " name='" + p.name[pick] + "' dist=" + F1(p.dist[pick]) + " setPrisonMode=" + S((long long)r) + " inSomething=" + S((long long)ins)
-                 + " cageHand=" + S((long long)hd) + " lock=" + S((long long)lk) + " sentence=" + S((long long)sn) + " hours=" + F1(hours)
+                 + " cageHand=" + S((long long)hd) + " lock=" + S((long long)lk) + " sentence=" + S((long long)sn) + " engineHours=" + F1(engineHours)
+                 + " hoursAsked=" + S((long long)p.hours) + " hoursSet=" + S((long long)hs)
+                 + " hours=" + F1(back.known ? back.hours : -1.0f) + " start=" + F1(back.known ? (float)back.start : -1.0f)
+                 + " factionAsked='" + p.facAsked + "' cageFaction='" + CageTestFacText(cageFac) + "' cageLaw='" + CageTestFacText(cageLaw)
+                 + "' factionRead=" + S((long long)fr) + " jailFaction='" + CageTestFacText(jailKey) + "' jailRead=" + S((long long)jr)
+                 + " bounty=" + S((long long)bounty) + " held=" + S((long long)(held ? 1 : 0))
                  + " isFreeSlot=" + rooms
-                 + (ok ? " - this engine caged the copy; PrisonWatchCopies tells its owner (MSG_PRISON IN, this engine's bounty verdict)"
+                 + (ok ? (held ? " - this engine caged the copy and started its sentence (sentence 1 called, -1 faulted, 0 no address; hours/start read back,"
+                                 " game hours); PrisonWatchCopies tells its owner (MSG_PRISON IN, this engine's bounty verdict)"
+                               : " - caged, but the sentence is NOT held (sentence 1 called, -1 faulted, 0 no address; hoursSet 1 written) - a guard may free it")
                        : " - NOT caged (setPrisonMode 1 called, -1 faulted, 0 no address; inSomething 2 = caged; cageHand 1 = the cage took it)"));
     }
     g_cageTestPend.clear();
@@ -11413,7 +11898,10 @@ void CageTestSafePointDrain()
 std::string CageTestCommand(const std::string& arg)
 {
     unsigned int uid = 0;
-    if (!joblever::CageTestParse(arg, &uid)) return "error cagetest: usage cagetest <copyUid> nearest";
+    std::string facAsked;
+    int hours = joblever::kCageTestDefaultHours;
+    if (!joblever::CageTestParse(arg, &uid, &facAsked, &hours))
+        return "error cagetest: usage cagetest <copyUid> nearest [faction=<name or stringID>] [hours=<1.." + S((long long)joblever::kCageTestMaxHours) + ">]";
     if (EngineWritesBlocked()) return "error cagetest: engine writes are blocked - try again";
     if (kSetPrisonModeRva == 0) return "error cagetest: SetPrisonMode is not in the address table";
     if (net::IsUidMine(uid)) return "error cagetest: uid " + S((long long)uid) + " is this game's own - the lever cages the other game's character's copy";
@@ -11423,10 +11911,19 @@ std::string CageTestCommand(const std::string& arg)
     if (PoseInSomethingPod(c) != 0) return "error cagetest: the copy is in a bed or cage already";
     if (BeingCarried(c)) return "error cagetest: the copy is carried - put it down first";
     if (g_cageTestPend.size() >= 8) return "error cagetest: 8 already wait for the safe point";
+    ::Faction* want = 0;
+    if (!facAsked.empty())   /* T-478: the jailing faction = the cage's - a cage OF this faction is picked */
+    {
+        want = FindFactionByKey(facAsked);
+        if (want == 0 || !PlausibleObject(want))
+            return "error cagetest: faction '" + facAsked + "' names no faction on this game (by stringID, by name or by record name)";
+    }
     const Ogre::Vector3 pos = c->worldPosition();
     const float from[3] = { pos.x, pos.y, pos.z };
     CageTestPend p;
     p.uid = uid;
+    p.facAsked = facAsked;
+    p.hours = hours;
     long long scanned = 0, named = 0;
     std::string otherClass;
     p.n = CageCandidatesNear(from, p.cand, p.dist, p.key, p.name, kCageTestCand, &scanned, &named, &otherClass);
@@ -11438,9 +11935,137 @@ std::string CageTestCommand(const std::string& arg)
         DebugLog(miss);
         return "error " + miss.substr(9);
     }
+    if (want != 0)   /* T-478: keep only the candidates whose faction, or the law faction it reduces to, is the one asked */
+    {
+        int keep = 0;
+        std::string seen;
+        for (int k = 0; k < p.n; ++k)
+        {
+            void* cf = 0;
+            void* cl = 0;
+            const int fr = PlausibleObject(p.cand[k]) ? CageTestFactionPod(p.cand[k], &cf, &cl) : -1;
+            seen += (k != 0 ? "; " : "") + p.key[k] + "=" + (fr == 1 ? CageTestFacText(cf) : std::string("unreadable"));
+            if (fr != 1 || (cf != (void*)want && cl != (void*)want)) continue;
+            if (keep != k)
+            {
+                p.cand[keep] = p.cand[k]; p.dist[keep] = p.dist[k]; p.key[keep] = p.key[k]; p.name[keep] = p.name[k];
+            }
+            ++keep;
+        }
+        if (keep == 0)
+        {
+            const std::string miss = "[ARREST] cagetest uid=" + S((long long)uid) + " cage='' ok=0 - none of the " + S((long long)p.n)
+                + " nearest cages belongs to faction '" + CageTestFacText(want) + "' (cage=faction: " + seen + ")" + counts;
+            DebugLog(miss);
+            return "error " + miss.substr(9);
+        }
+        p.n = keep;
+    }
     g_cageTestPend.push_back(p);
     const std::string line = "[ARREST] cagetest uid=" + S((long long)uid) + " queued candidates=" + S((long long)p.n) + " nearest='" + p.key[0]
-        + "' nearestName='" + p.name[0] + "' dist=" + F1(p.dist[0]) + counts + " - caged at the next safe point (TEST-ONLY)";
+        + "' nearestName='" + p.name[0] + "' dist=" + F1(p.dist[0]) + " factionAsked='" + (want != 0 ? CageTestFacText(want) : std::string())
+        + "' hours=" + S((long long)hours) + counts + " - caged at the next safe point, its sentence started (TEST-ONLY)";
+    DebugLog(line);
+    return "ok " + line.substr(9);
+}
+
+/* T-980 TEST-ONLY lever (command file only - `capturetest cage`, items.cpp CaptureTestArm). MAIN THREAD (the command pump, as
+   bedtest). capturetest cage <carrierUid> [near | <cageKeySubstring>] [type=<n>]: this game's OWN character <carrierUid>, already
+   carrying someone (`koself` then `capturetest carry`), is given the order the engine's own right-click on a cage gives a carrier -
+   task 108 PUT_IN_CAGE on the cage (addOrderSelectedCharacters 0x7F9280, decomp_7f9280.txt:185-197: a carrier clicking a building
+   whose function is 8 gets 0x6C) - through the same order-system issueOrder(task, the cage's hand, the cage's position) bedtest
+   uses; the carried body is not in the order, the engine's task takes it from the carrier. The cage: the nearest loaded cage
+   (items.cpp CageCandidatesNear, as cagetest) whose key holds the substring when given and whose isFreeSlot takes the body. Logs
+   what it chose - the body's uid / name, the cage's key and its owner (class, and whether it IS this game's player faction, the
+   test dialogue condition 0x7 makes) - so a run can then talk to the prisoner in the player's own cage. type=<n> gives another
+   task (112 FIND_CAGE_AND_PUT_IN is the guard's). The rest is the engine's. [ARREST] capturetest cage lines. */
+std::string CageOrderTestCommand(const std::string& arg)
+{
+    const std::string usage = "error capturetest cage: usage capturetest cage <carrierUid> [near | <cageKeySubstring>] [type=<n>]";
+    unsigned int carrier = 0;
+    std::string sub;
+    int type = joblever::kCageOrderDefaultType;
+    if (!joblever::CageOrderParse(arg, &carrier, &sub, &type)) return usage;
+    if (EngineWritesBlocked()) return "error capturetest cage: engine writes are blocked - try again";
+    if (!net::IsUidMine(carrier)) return "error capturetest cage: carrier uid " + S((long long)carrier) + " is not this game's own character";
+    ::Character* cc = FindSpawned(carrier);
+    if (cc == 0 || !PlausibleObject(cc)) return "error capturetest cage: the carrier is not here";
+    if (!CarryFlag(cc)) return "error capturetest cage: the carrier carries nobody (koself, then capturetest carry first)";
+    const unsigned int body = CarryingUidOf(carrier);
+    ::Character* bc = (body != 0) ? FindSpawned(body) : 0;
+    if (bc == 0 || !PlausibleObject(bc)) return "error capturetest cage: the carried body (uid " + S((long long)body) + ") is not here";
+    std::string bodyName;
+    if (!NameOf(bc, &bodyName)) bodyName = "?";
+    Ogre::Vector3 at;
+    if (!SafeReadPosition(cc, &at)) return "error capturetest cage: the carrier's position is unreadable";
+    const float from[3] = { at.x, at.y, at.z };
+    void* cand[kCageTestCand];
+    float dist[kCageTestCand];
+    std::string key[kCageTestCand], name[kCageTestCand];
+    long long scanned = 0, named = 0;
+    std::string otherClass;
+    const int n = CageCandidatesNear(from, cand, dist, key, name, kCageTestCand, &scanned, &named, &otherClass);
+    std::string lowSub = BedTestLower(sub);
+    std::string rooms;
+    int pick = -1;
+    int lpPick = -1;
+    if (!lowSub.empty())
+    {   /* T-1218: with a key text, the ONE cage with a free slot whose key holds it (an equal key wins), or `#<k>` nearest first
+           (CageCandidatesNear's order); several -> refused naming them */
+        std::string base, lpWhy; int sk = 0;
+        if (leverpick::SplitSelector(lowSub, &base, &sk) < 0) lpWhy = leverpick::BadSelector(sub);
+        else
+        {
+            leverpick::Picker<int> pk(sk);
+            for (int k = 0; k < n; ++k)
+            {
+                const std::string lk = BedTestLower(key[k]);
+                if (lk.find(base) != std::string::npos && PlausibleObject(cand[k]) && PrisonFreeSlotPod(cand[k], bc) == 1)
+                    pk.Add(k, lk == base ? 0 : 1, (double)dist[k], "'" + key[k] + "' " + F1(dist[k]) + "u");
+            }
+            pk.Decide(&lpPick, "cages with a free slot whose key holds '" + base + "'", "nearest first", &lpWhy);
+            lowSub = base;
+        }
+        if (!lpWhy.empty())
+        {
+            DebugLog("[ARREST] capturetest cage REFUSED carrier=" + S((long long)carrier) + " body=" + S((long long)body) + ": error capturetest cage: " + lpWhy);
+            return "error capturetest cage: " + lpWhy;
+        }
+    }
+    for (int k = 0; k < n && pick < 0; ++k)
+    {
+        if (lpPick >= 0 && k != lpPick) continue;   /* T-1218: the one picked */
+        if (!lowSub.empty() && BedTestLower(key[k]).find(lowSub) == std::string::npos) continue;
+        const int r = PlausibleObject(cand[k]) ? PrisonFreeSlotPod(cand[k], bc) : -2;
+        rooms += (rooms.empty() ? "" : ",") + S((long long)r);
+        if (r == 1) pick = k;   // the engine's own slot test for this body
+    }
+    const std::string who = "carrier=" + S((long long)carrier) + " body=" + S((long long)body) + " bodyName='" + bodyName + "' bodyOwn="
+        + S((long long)(net::IsUidMine(body) ? 1 : 0)) + " type=" + S((long long)type);
+    if (pick < 0)
+    {
+        const std::string miss = "[ARREST] capturetest cage REFUSED " + who + ": no cage with a free slot" + (sub.empty() ? std::string() : " matching '" + sub + "'")
+            + " (candidates " + S((long long)n) + ", isFreeSlot " + (rooms.empty() ? std::string("-") : rooms) + "; buildingsScanned=" + S(scanned)
+            + " namedCage=" + S(named) + (otherClass.empty() ? std::string() : " firstNamedNotUseable='" + otherClass + "'") + ")";
+        DebugLog(miss);
+        return "error " + miss.substr(9);
+    }
+    void* cage = cand[pick];
+    float cp[3];
+    if (BedTestPosPod(cage, cp) == 0) return "error capturetest cage: the cage's position is unreadable";
+    int ownSlot = -1;
+    const int ownCls = BuildingOwnerClass(cage, &ownSlot);
+    const int ownMine = BuildingOwnerIsLocalPlayer(cage);
+    void* ai = GetCharacterAI(cc);
+    if (!PlausibleObject(ai)) return "error capturetest cage: the carrier has no AI";
+    AITaskSytem* orders = *(AITaskSytem**)((char*)ai + 0x20);
+    if (!PlausibleObject(orders)) return "error capturetest cage: the carrier has no order system";
+    const hand& ch = *(const hand*)((const char*)cage + kCharHandOff);   // RootObjectBase::getHandle is this+0x58 (F099)
+    orders->issueOrder((TaskType)type, ch, Ogre::Vector3(cp[0], cp[1], cp[2]), true, false);
+    const std::string line = "[ARREST] capturetest cage order " + who + " cage='" + key[pick] + "' cageName='" + name[pick] + "' dist=" + F1(dist[pick])
+        + " cageOwnerClass=" + S((long long)ownCls) + " cageOwnerSlot=" + S((long long)ownSlot) + " cageOwnerIsMyPlayer=" + S((long long)ownMine)
+        + " isFreeSlot=" + rooms + " (TEST-ONLY: the engine's own put-in-cage order on this game's carrier, target = the cage's hand;"
+        " ownerClass 1 = this game's player, 2 another player; captlist shows the result)";
     DebugLog(line);
     return "ok " + line.substr(9);
 }
@@ -11583,6 +12208,30 @@ std::string KitGiveCommand(const std::string& arg)
 void BailTestSafePointDrain();                     /* the TEST-ONLY bailtest, at this safe point (slave1 block below) */
 bool SlaveSetOwnedState(void* c, int s);           /* slave1 block below: the hooked setter on OUR character */
 int SlaveStateOfCharacter(const void* c);          /* slave1 block below: -1 unreadable */
+namespace {
+struct PutInHold { unsigned int peer; int sentence; };
+std::map<unsigned int, PutInHold> g_putInHold;
+long long g_putInHeld = 0, g_putInHeldCaged = 0, g_putInHeldRefused = 0;
+}   // namespace (T-1211)
+/* the owner's own character caged for another game's guard: the cage lock, the sentence, the line and a STATE at once (the
+   safe point's caging, and T-1211's owed put-in finished later - PrisonPutInOutcome) */
+void PrisonOwnCagedTail(unsigned int uid, ::Character* c, void* cage, int sentence, const char* note)
+{
+    ++g_prisonCaged;
+    const int lk = PrisonLockPod(cage);
+    if (lk == 1) ++g_prisonLocked;
+    float hours = -1.0f;
+    const int sn = PrisonSentencePod(c, cage, &hours, sentence);
+    if (sn == 1) ++g_prisonSentenced; else if (sn == 2) ++g_prisonNoBounty; else ++g_prisonSentenceFailed;   /* P11: 2 = no bounty with the cage's faction */
+    if (sn == 1 && hours >= 0.0f)   // user decision 2026-09-25: the guard's game (the arrest) frees first; this clock is the fallback
+    {
+        if (PrisonSentenceAddPod(c, kOwnSentenceMarginHours) == 1) { ++g_ownSentenceMargin; hours += kOwnSentenceMarginHours; }
+    }
+    PrisonLog("<- PRISON uid=" + S((long long)uid) + " caged (lock=" + S((long long)lk) + " sentence=" + S((long long)sn)
+              + " hours=" + S((long long)hours) + ") - the other game's guard put its copy there" + std::string(note));
+    StatePush(uid);   // a STATE at once; the cage itself travels in the next frame's POSE push (PoseWatchTick)
+}
+int FarmPutInHold(int ownOp, unsigned int uid);   /* farm.cpp (T-1211) */
 void PrisonSafePointDrain()
 {
     StandinPurgeCageOutDrain();   /* inv7a: a stand-in leaving its cage before the purge destroys it */
@@ -11594,6 +12243,7 @@ void PrisonSafePointDrain()
     TreatTestSafePointDrain();    /* treattest: the lever's bandage raise, at this same safe point */
     KitGiveSafePointDrain();      /* kitgive: the lever's items, at this same safe point */
     RestraintSafePointDrain();    /* P42: restraint lock writes (a copy taking its owner's word, the owner opening on a request) */
+    FreedInDrain();               /* T-980: a copy's game's freeing raised on our prisoner - after the lock-open requests queued before it */
     if (g_prisonOps.empty()) return;
     if (EngineWritesBlocked())
     {
@@ -11696,6 +12346,14 @@ void PrisonSafePointDrain()
             if (op.own) { ++g_prisonFailed; PrisonSendRefused(op.uid, op.peer); } else { ++g_poseBedFaulted; g_cageQueued.erase(op.uid); }
             continue;
         }
+        if (PrisonHandSetPod(c) != 1 && FarmPutInHold(op.own ? 1 : 0, op.uid) != 0)
+        {   /* T-1211: the building's take refused it (another game runs that building) and farm.cpp owes the put-in - the refusal waits
+               for the owed put-in's outcome (PrisonPutInOutcome: caged then, or the refusal sent) */
+            PutInHold h; h.peer = op.peer; h.sentence = op.sentence;
+            g_putInHold[op.uid] = h;
+            ++g_putInHeld;
+            continue;
+        }
         if (PrisonHandSetPod(c) != 1)   // tryOperate refused: in the cage mode with no cage - no lock, no sentence
         {
             ++g_prisonNoHand;
@@ -11719,26 +12377,53 @@ void PrisonSafePointDrain()
             }
             continue;
         }
-        ++g_prisonCaged;
-        const int lk = PrisonLockPod(op.cage);
-        if (lk == 1) ++g_prisonLocked;
-        float hours = -1.0f;
-        const int sn = PrisonSentencePod(c, op.cage, &hours, op.sentence);
-        if (sn == 1) ++g_prisonSentenced; else if (sn == 2) ++g_prisonNoBounty; else ++g_prisonSentenceFailed;   /* P11: 2 = no bounty with the cage's faction */
-        if (sn == 1 && hours >= 0.0f)   // user decision 2026-09-25: the guard's game (the arrest) frees first; this clock is the fallback
-        {
-            if (PrisonSentenceAddPod(c, kOwnSentenceMarginHours) == 1) { ++g_ownSentenceMargin; hours += kOwnSentenceMarginHours; }
-        }
-        PrisonLog("<- PRISON uid=" + S((long long)op.uid) + " caged (lock=" + S((long long)lk) + " sentence=" + S((long long)sn)
-                  + " hours=" + S((long long)hours) + ") - the other game's guard put its copy there");
-        StatePush(op.uid);   // a STATE at once; the cage itself travels in the next frame's POSE push (PoseWatchTick)
+        PrisonOwnCagedTail(op.uid, c, op.cage, op.sentence, "");
     }
     g_prisonOps.clear();
+}
+
+/* T-1211: an own character's caging for another game's guard whose take was refused at a building another game runs, held while
+   farm.cpp owes its put-in (FarmPutInHold); the owed put-in's outcome (PrisonPutInOutcome) finishes it or sends the refusal. */
+int PrisonPutInPinned(::Character* c)
+{
+    if (c == 0 || !PlausibleObject(c)) return -1;
+    const int ins = PoseInSomethingPod(c);
+    if (ins < 0) return -1;
+    if (ins != 2) return 0;
+    const int h = PrisonHandSetPod(c);
+    return (h < 0) ? -1 : (h == 1) ? 2 : 1;
+}
+int PrisonPutInCall(::Character* c, void* building)
+{
+    if (c == 0 || !PlausibleObject(c)) return 0;
+    return PosePrisonPod(c, building != 0, building);
+}
+int PrisonPutInOutcome(unsigned int uid)
+{
+    std::map<unsigned int, PutInHold>::iterator it = g_putInHold.find(uid);
+    if (it == g_putInHold.end()) return 0;
+    const PutInHold h = it->second;
+    g_putInHold.erase(it);
+    ::Character* c = FindSpawned(uid);
+    void* cage = (c != 0 && PlausibleObject(c) && net::IsUidMine(uid) && PrisonPutInPinned(c) == 2) ? PrisonCageOf(c) : 0;
+    if (cage != 0)
+    {
+        ++g_putInHeldCaged;
+        PrisonOwnCagedTail(uid, c, cage, h.sentence, " (after its owed put-in)");
+        return 1;
+    }
+    ++g_putInHeldRefused; ++g_prisonFailed;
+    PrisonSendRefused(uid, h.peer);
+    PrisonLog("<- PRISON uid=" + S((long long)uid) + " NOT caged: the building's take refused it and its owed put-in was given up");
+    return 2;
 }
 
 void SlaveAskRecv(unsigned int uid, int from, int want, unsigned int fromPeer);   /* slave1 block below */
 void ApplyRemotePrison(const cooprison::PrisonMsg& m, unsigned int fromPeer)
 {
+    if (m.kind == cooprison::kPrisonFreed) { FreedRecv(m, fromPeer); return; }   // T-980: a copy's game freed our prisoner
+    if (m.kind == cooprison::kPrisonJoinAsk) { HireJoinAskRecv(m.uid, m.freerUid, fromPeer); return; }   // T-980: hire the prisoner our character freed
+    if (m.kind == cooprison::kPrisonJoinNo) { HireJoinNoRecv(m.uid, m.freerUid, (int)m.joinNo, fromPeer); return; }   // T-980: the freer's game did not
     if (m.kind == cooprison::kPrisonSlaveAsk) { SlaveAskRecv(m.uid, m.slaveFrom, m.slaveWant, fromPeer); return; }   // a copy's slave-state change
     if (cooprison::PrisonIsLockKind(m.kind)) { RestraintApplyRemote(m, fromPeer); return; }   // P42: a restraint lock (word or request)
     if (m.kind == cooprison::kPrisonBedRefused)   // the owner could not put it in the bed - our copy comes out at the next scan
@@ -12240,10 +12925,13 @@ std::string NameReportLine()
 // g_slaveApplyTid, which the setter detour lets through.
 static unsigned long long kSlaveSetRva = 0; static AddrReg kSlaveSetRva_reg("SlaveStateSet", &kSlaveSetRva);   /* Steam_1.0.65 0x5A3EB0 StateBroadcastData::setSlaveState */
 static unsigned long long kSlavePeriodicRva = 0; static AddrReg kSlavePeriodicRva_reg("SlaveStatePeriodic", &kSlavePeriodicRva);   /* Steam_1.0.65 0x5A44C0 StateBroadcastData::periodicUpdate */
+static unsigned long long kSellConfirmRva = 0; static AddrReg kSellConfirmRva_reg("SlaveSellingConfirm", &kSellConfirmRva);   /* Steam_1.0.65 0x6A7F30 (1.0.68 0x6A7740): CharacterTrading_SlaveSelling's vtable entry 0, the selling confirm (T-478 step 5) */
+static unsigned long long kTradingWindowRva = 0; static AddrReg kTradingWindowRva_reg("TradingWindowCurrent", &kTradingWindowRva);   /* Steam_1.0.65 0x2131BE0 (1.0.68 0x2132C30): CharacterTradingWindow* - the engine's one current trading window (set 729d50:99-105, cleared 727550:13); T-478 review fold */
 static unsigned long long kBailConfirmRva = 0; static AddrReg kBailConfirmRva_reg("BailoutConfirm", &kBailConfirmRva);   /* Steam_1.0.65 0x6AE960 (1.0.68 0x6AE170): CharacterTrading_PrisonerBailout's vtable entry 0, the bail confirm */
 /* P11 (items.cpp capture block, namespace coop): */
 void CaptureNoteState(unsigned int uid, int want);                                 // ANY THREAD: H4 - inside a slaver's processing
 unsigned int CaptureOwnerUidOf(const void* c);                                     // MAIN THREAD: the slave-owner hand's uid
+void CaptureOwnerHandFacts(const void* c, int* handType, int* charRes, int* squadRes);   // ANY THREAD: the owner hand's type and the engine's two lookups of it (slavewire.h SlaveOwnerHereOf)
 int CaptureApplyOwnerToCopy(unsigned int uid, ::Character* c, unsigned int ownerUid);   // K2 safe point: the owner's hand; 1 applied or already so
 
 namespace {
@@ -12276,8 +12964,11 @@ struct SlaveAskSentRow { int want; DWORD at; };
 std::map<unsigned int, SlaveAskSentRow> g_slaveAskSentTo;   // copy uid -> the last ask sent (MAIN THREAD)
 struct SlaveAskInRow { int from; int want; int slot; };
 std::map<unsigned int, SlaveAskInRow> g_slaveAskIn;         // OWN uid -> the latest ask received, applied at the K2 safe point
-long long g_slaveAskBy[8] = { 0 };       // sender decisions (coopslave::kAsk*)
-long long g_slaveAskOwnerBy[8] = { 0 };  // owner decisions (coopslave::kAsk* owner codes)
+long long g_slaveAskBy[coopslave::kAskCodeCount] = { 0 };       // sender decisions (coopslave::kAsk*)
+long long g_slaveAskOwnerBy[coopslave::kAskCodeCount] = { 0 };  // owner decisions (coopslave::kAsk* owner codes)
+std::set<unsigned long long> g_slaveAskEscLogged;   // T-1225: (uid, asker slot, from) of the escaping asks refused and logged (MAIN THREAD)
+int g_slaveAskEscLines = 0;                         // T-1225: those lines, capped at kSlaveLogCap
+std::set<unsigned long long> g_slaveAskEscNotAsked;  // T-1225: (copy uid, wanted state) of the escaping / escape-end changes not asked and logged (MAIN THREAD)
 long long g_slaveAskGone = 0, g_slaveAskSent = 0, g_slaveAskSendFailed = 0, g_slaveAskRepeat = 0, g_slaveAskRecv = 0;
 long long g_slaveAskRecvNotMine = 0, g_slaveAskOwnerGone = 0, g_slaveAskApplyFailed = 0;
 int g_slaveAskLogged = 0, g_slaveAskOwnerLogged = 0;
@@ -12300,22 +12991,45 @@ void SlaveAskNote(unsigned int uid, int from, int to)   // ANY THREAD
     ::InterlockedIncrement64(&g_slaveAskFull);   // the engine repeats a refused change: noted again once a slot is free
 }
 
-// slavewire.h SlaveOwnEngineDefers on the owner: OWN uids (not NOT_SLAVE) whose area another game runs, rebuilt by SlaveTick every
-// kSlaveElseRefreshMs (MAIN THREAD writes, the AI worker reads), and a TLS mark for "inside this thread's periodicUpdate"
-// (TlsAlloc, not __declspec(thread): the DLL is loaded after the process started).
-const int   kSlaveElseCap = 32;
-const DWORD kSlaveElseRefreshMs = 500;
-volatile LONG g_slaveElse[kSlaveElseCap];
-DWORD g_slavePerTls = TLS_OUT_OF_INDEXES;
-volatile LONG64 g_slaveOwnSetHeld = 0, g_slaveOwnDirectHeld = 0;
-long long g_slaveElseFull = 0;
-bool SlaveRunElsewhere(unsigned int uid)   // ANY THREAD
+// T-1225 design C, review fold: the facts of slavewire.h SlaveOwnEscapeDecide are read at the moment of the change, in the setter
+// detour (no list rebuilt on the main thread, so no slave is missed while a list is rebuilt or before a slave is first sent).
+// The slave's position: the engine's own getPosition, which the engine's periodicUpdate 0x5A44C0 itself calls for the slave and
+// its owner on that same AI worker (decomp_5a44c0.txt:100-104, Read). 1 read, 0 faulted.
+int SlavePosPod(const void* c, float* x, float* z)
 {
-    if (uid == 0) return false;
-    for (int i = 0; i < kSlaveElseCap; ++i) if ((unsigned int)g_slaveElse[i] == uid) return true;
-    return false;
+    __try { const Ogre::Vector3 p = ((::Character*)c)->worldPosition(); *x = p.x; *z = p.z; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
-bool InPeriodicHere() { return g_slavePerTls != TLS_OUT_OF_INDEXES && ::TlsGetValue(g_slavePerTls) != 0; }
+int SlaveAreaRunnerNow(const void* c)   // ANY THREAD: the slot the fresh area map names for the slave's area (-1 unknown, -2 frozen)
+{
+    float x = 0.0f, z = 0.0f;
+    return (c != 0 && SlavePosPod(c, &x, &z) != 0) ? AreaHolderSlotTS(SectorOf(x, z)) : -1;
+}
+int SlaveOwnerHereNow(const void* c)   // ANY THREAD: slavewire.h SlaveOwnerHereOf over this game's lookups
+{
+    int t = -1, ch = -1, sq = -1;
+    CaptureOwnerHandFacts(c, &t, &ch, &sq);
+    return coopslave::SlaveOwnerHereOf(t, ch, sq);
+}
+// T-1225 design C: this game's own 1 -> 2 refused (slavewire.h SlaveOwnEscapeRefused) - every refusal counted, the first one of
+// each slave kept in a fixed slot (kSlaveLogCap in all) for SlaveTick to log. ANY THREAD writer, no allocation, no lock.
+struct SlaveOwnEscRow { volatile LONG uid; volatile LONG owner; volatile LONG runner; volatile LONG ready; };   // owner: SlaveOwnerHereOf's answer; runner: the area map's slot
+SlaveOwnEscRow g_slaveOwnEscRow[kSlaveLogCap];
+volatile LONG  g_slaveOwnEscClaimed = 0;
+volatile LONG64 g_slaveOwnEscRefused = 0;
+volatile LONG64 g_slaveOwnEscMapUnknown = 0;   // of those, refused with the area map unknown, stale or frozen (no slot named)
+int g_slaveOwnEscPrinted = 0;
+void SlaveNoteOwnEscRefused(unsigned int uid, int ownerHere, int runner)
+{
+    ::InterlockedIncrement64(&g_slaveOwnEscRefused);
+    if (runner < 0) ::InterlockedIncrement64(&g_slaveOwnEscMapUnknown);
+    const LONG claimed = g_slaveOwnEscClaimed;
+    for (LONG i = 0; i < claimed && i < kSlaveLogCap; ++i) if ((unsigned int)g_slaveOwnEscRow[i].uid == uid) return;
+    const LONG i = ::InterlockedIncrement(&g_slaveOwnEscClaimed) - 1;
+    if (i < 0 || i >= kSlaveLogCap) return;
+    g_slaveOwnEscRow[i].uid = (LONG)uid; g_slaveOwnEscRow[i].owner = (LONG)ownerHere; g_slaveOwnEscRow[i].runner = (LONG)runner;
+    ::InterlockedExchange(&g_slaveOwnEscRow[i].ready, 1);
+}
 
 // The bail context: while CharacterTrading_PrisonerBailout's confirm runs on this thread, each prisoner it frees passes
 // setSlaveState(.., 0) once (Read, 1.0.65 0x6AE960: per ticked row, before the walk-out order 0x85), and the setter detour
@@ -12338,6 +13052,43 @@ void BailNoteRow(unsigned int uid)
     if (g_bailRowsN >= kBailRowsCap) { ++g_bailRowsOver; return; }
     g_bailRows[g_bailRowsN++] = uid;
 }
+// T-478 step 3 review fold (manager 2026-11-03; three-player bail is T-680): would paying HERE free this prisoner? (prisonwire.h
+// BailRowFreeable: this game's own / not replicated - yes; another game's copy - only when its owner takes this game's "@bail",
+// judged by the owner's own rule from this game's area map, spawn.cpp's PrisonReleaseIn side). MAIN THREAD.
+long long g_bailRowsOwnerRefuses = 0;
+bool BailRowFreeableLocal(unsigned int uid)
+{
+    const bool mine = net::IsUidMine(uid);
+    if (!cooprison::BailTellsOwner(uid, mine)) return true;
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !PlausibleObject(c)) return false;
+    const Ogre::Vector3 pos = c->worldPosition();
+    return cooprison::BailRowFreeable(uid, mine, AreaHolderSlotTS(SectorOf(pos.x, pos.z)), coop::StoreMySlot(), net::OwnerSlotOf(uid));
+}
+// The payer's game, before its bail window opens (speech.cpp TkBailOpenLocal): the caged copies of other games' characters (the
+// owner's word says caged) within cooprison::kBailRowNearUnits (x, z) of the police NPC - *found of them, the return value of
+// them failing BailRowFreeableLocal (their uids in *first, the first one). The engine's own list is not readable (its builder is
+// inside the dialogue case), so these are the rows it COULD hold. MAIN THREAD.
+int BailRowsLeftOutNearLocal(float x, float z, int* found, unsigned int* first)
+{
+    int n = 0, f = 0;
+    const float r2 = cooprison::kBailRowNearUnits * cooprison::kBailRowNearUnits;
+    for (std::map<unsigned int, PoseWant>::const_iterator it = g_poseWant.begin(); it != g_poseWant.end(); ++it)
+    {
+        if (it->second.pw.kind != coopstate::kPoseCage || net::IsUidMine(it->first)) continue;
+        ::Character* c = FindSpawned(it->first);
+        if (c == 0 || !PlausibleObject(c)) continue;
+        const Ogre::Vector3 pos = c->worldPosition();
+        const float dx = pos.x - x, dz = pos.z - z;
+        if (dx * dx + dz * dz > r2) continue;
+        ++f;
+        if (BailRowFreeableLocal(it->first)) continue;
+        if (n == 0 && first != 0) *first = it->first;
+        ++n;
+    }
+    if (found != 0) *found = f;
+    return n;
+}
 void BailRowsPaid(const char* why)   // MAIN THREAD: after the confirm (or the lever) freed the recorded rows
 {
     const DWORD now = ::GetTickCount();
@@ -12345,6 +13096,7 @@ void BailRowsPaid(const char* why)   // MAIN THREAD: after the confirm (or the l
     {
         const unsigned int uid = g_bailRows[i];
         if (!cooprison::BailTellsOwner(uid, net::IsUidMine(uid))) { ++g_bailRowsOwn; continue; }
+        if (!BailRowFreeableLocal(uid)) ++g_bailRowsOwnerRefuses;   // T-478 review fold: paid but its owner will refuse the "@bail" (a leak; counted)
         PrisonNoteBailedHere(uid, now, why);
     }
     g_bailRowsN = 0;
@@ -12363,6 +13115,137 @@ unsigned long long detour_bailConfirm(void* self)
     const unsigned long long r = BailConfirmOrigPod(self);
     if ((r & 0xFF) == 1) { ++g_bailPaid; BailRowsPaid("the bail confirm"); }
     else g_bailRowsN = 0;
+    return r;
+}
+
+// T-478 step 5 (design read 2026-11-04, D1 + a live check at the confirm): the selling confirm, CharacterTrading_SlaveSelling's
+// vtable entry 0 (1.0.65 0x6A7F30 / 1.0.68 0x6A7740, row SlaveSellingConfirm). Read (decomp_6a7f30): for each ticked row it adds the
+// row's price, finds the character (0x723C60), chains it to the window's buyer (+8, setChainedMode with the buyer's hand +0x58),
+// gives it a memory and makes two relation changes; then the LOCAL player's purse goes up by the total; it returns 1. The buyer is a
+// raw pointer the window keeps. For a window this game opened for a slaver another game runs (speech.cpp TkSellOpenLocal arms it),
+// the buyer is this game's copy of that slaver, which a link drop or the slaver's game leaving the area retires - the confirm would
+// then call through freed memory (class F459). So such a confirm runs only while the registry still maps the buyer's address to the
+// slaver's uid (no dereference) and the session is up (the direct link or the world road - the 'reachable' class); otherwise none
+// of it runs (no money, nobody chained) and the detour returns 1, the engine's own only answer. The caller (CharacterTradingWindow's
+// confirm button 0x725CA0, Read 2026-11-04) then destroys the handler (0x6A71C0: its own strings and rows only) and closes the
+// window (0x725D00 -> destructor 0x727550); neither reads the buyer (+8), so a refused confirm touches no freed slaver copy.
+// Any other confirm is a sale to an NPC this game runs (single player's road): unchanged. Review fold: the note names its window
+// (SellWindowBind) and is cleared when that window ends without a sale (SellWindowTick) or at this confirm.
+// MAIN THREAD (the window's button).
+typedef unsigned long long (*SellConfirmFn)(void* self);
+SellConfirmFn g_sellOrig = 0;
+int           g_sellHook = 0;   // 1 armed, -1 AddHook failed, -2 no table address
+struct SellArm { void* npc; void* win; void* handler; unsigned int npcUid, sellerUid; int n; int refusing; unsigned int rows[kSellRowsCap]; };   // refusing: re-check fold (TalkSellBindOutcome UNTIED)
+SellArm       g_sellArm;        // the window this game opened for another game's slaver (npc 0 = none); one confirm per window
+long long     g_sellCalls = 0, g_sellLocal = 0, g_sellRan = 0, g_sellRefusedGone = 0, g_sellRefusedLink = 0, g_sellChained = 0,
+              g_sellPaid = 0, g_sellStateSent = 0, g_sellNowOurs = 0, g_sellEnded = 0, g_sellUnbound = 0;
+const int     kSellSentWatchCap = 64;
+unsigned int  g_sellSentWatch[kSellSentWatchCap];   // sold here: the next slave-state message for each is logged once
+int           g_sellSentWatchN = 0;
+
+void* SellBuyerPod(void* self, int* ok)   // the window's buyer (+8); no C++ object (C2712)
+{
+    __try { *ok = 1; return *(void**)((char*)self + 8); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ok = 0; return 0; }
+}
+void* SellReadPtrPod(const void* at, int* ok)   // one pointer; no C++ object (C2712)
+{
+    __try { *ok = 1; return *(void* const*)at; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ok = 0; return 0; }
+}
+// The engine's current trading window (row TradingWindowCurrent); 0 with *ok 0 when the row is missing or does not read.
+void* SellTradingWindowNow(int* ok)
+{
+    *ok = 0;
+    if (kTradingWindowRva == 0) return 0;
+    return SellReadPtrPod((const void*)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kTradingWindowRva), ok);
+}
+// MAIN THREAD (SlaveTick, every frame, before its blocked-world return): the note of a selling window that ended without a sale
+// (its cancel button, a hide, a newer trading window, the world's end) is cleared here - one line each.
+void SellWindowTick()
+{
+    if (g_sellArm.npc == 0) return;
+    const int worldGone = (coop::GameWorldPtr() == 0 || StoreTearingDown() != 0) ? 1 : 0;
+    int ok = 0;
+    void* const now = SellTradingWindowNow(&ok);
+    if (!cooptalk::TalkSellNoteEnded((unsigned long long)(uintptr_t)g_sellArm.npc, (unsigned long long)(uintptr_t)g_sellArm.win,
+                                     (unsigned long long)(uintptr_t)(ok ? now : 0), worldGone))
+        return;
+    ++g_sellEnded;
+    DebugLog("[TALK] T478 sell window ended without a sale: slaver npc uid=" + S((long long)g_sellArm.npcUid) + " seller uid="
+             + S((long long)g_sellArm.sellerUid) + " ownNear=" + S((long long)g_sellArm.n)
+             + (worldGone ? " (the world is gone)" : " (closed, cancelled or replaced - no longer the engine's trading window)")
+             + " - the sale note is cleared; nobody sold, no money moved");
+    std::memset(&g_sellArm, 0, sizeof(g_sellArm));
+}
+// SlaveSendFor, after a slave-state message went out: the release line for a character sold here to another game's slaver.
+void SellNoteStateSent(unsigned int uid, int st, unsigned int ownerUid)
+{
+    for (int i = 0; i < g_sellSentWatchN; ++i)
+    {
+        if (g_sellSentWatch[i] != uid) continue;
+        g_sellSentWatch[i] = g_sellSentWatch[--g_sellSentWatchN];
+        ++g_sellStateSent;
+        DebugLog("[TALK] T478 sell: slave state sent uid=" + S((long long)uid) + " slave=" + S((long long)st) + " ownerUid=" + S((long long)ownerUid)
+                 + " (sold here to a slaver another game runs; that game puts its copy in the real slaver's slave list)");
+        return;
+    }
+}
+unsigned long long detour_sellConfirm(void* self)
+{
+    ++g_sellCalls;
+    int ok = 0;
+    void* const buyer = (self != 0) ? SellBuyerPod(self, &ok) : 0;
+    const SellArm arm = g_sellArm;
+    int winOk = 0;
+    void* const winNow = SellTradingWindowNow(&winOk);
+    const int armedWindow = cooptalk::TalkSellArmedWindow((unsigned long long)(uintptr_t)arm.win, (unsigned long long)(uintptr_t)arm.handler,
+                                                          (unsigned long long)(uintptr_t)(winOk ? winNow : 0), (unsigned long long)(uintptr_t)self,
+                                                          (unsigned long long)(uintptr_t)arm.npc, arm.refusing);
+    const unsigned int uidNow = (armedWindow && buyer != 0) ? FindSpawnedUid(buyer) : 0;
+    const int slaverOurs = (armedWindow && arm.npcUid != 0 && net::IsUidMine(arm.npcUid)) ? 1 : 0;   /* review fold: read live here */
+    const int linked = (net::SessionLinked() || StoreLiveReady()) ? 1 : 0;
+    const int g = cooptalk::TalkSellConfirmGate(armedWindow, (unsigned long long)(uintptr_t)arm.npc, (unsigned long long)(uintptr_t)buyer, arm.npcUid, uidNow,
+                                                slaverOurs, linked);
+    if (g == cooptalk::kTalkSellNotOurs) { ++g_sellLocal; return g_sellOrig(self); }
+    std::memset(&g_sellArm, 0, sizeof(g_sellArm));
+    if (g == cooptalk::kTalkSellNowOurs)
+    {
+        ++g_sellNowOurs;
+        DebugLog("[TALK] T478 sell confirm slaver npc uid=" + S((long long)arm.npcUid) + " seller uid=" + S((long long)arm.sellerUid)
+                 + " ownNear=" + S((long long)arm.n) + " ENGINE'S OWN: " + cooptalk::TalkSellGateName(g) + " - the sale note is cleared");
+        return g_sellOrig(self);
+    }
+    if (g != cooptalk::kTalkSellRun)
+    {
+        if (g == cooptalk::kTalkSellCopyGone) ++g_sellRefusedGone; else if (g == cooptalk::kTalkSellNoLink) ++g_sellRefusedLink;
+        ErrorLog("[TALK] T478 sell confirm slaver npc uid=" + S((long long)arm.npcUid) + " seller uid=" + S((long long)arm.sellerUid)
+                 + " ownNear=" + S((long long)arm.n) + " REFUSED: " + cooptalk::TalkSellGateName(g) + " (buyer uid here now " + S((long long)uidNow)
+                 + ") - nothing of the sale runs: no money, nobody chained; the window ends as after a confirm");
+        return 1;
+    }
+    ++g_sellRan;
+    int before = -1, after = -1;
+    if (!MoneyHave(&before)) before = -1;
+    const unsigned long long r = g_sellOrig(self);
+    if (!MoneyHave(&after)) after = -1;
+    if (before >= 0 && after >= before) g_sellPaid += (long long)(after - before);
+    g_sellSentWatchN = 0;
+    int chained = 0;
+    std::string sold;
+    for (int i = 0; i < arm.n && i < kSellRowsCap; ++i)
+    {
+        ::Character* const c = FindSpawned(arm.rows[i]);
+        if (c == 0 || CaptureOwnerUidOf(c) != arm.npcUid) continue;
+        ++chained;
+        sold += (sold.empty() ? "" : ",") + S((long long)arm.rows[i]);
+        if (g_sellSentWatchN < kSellSentWatchCap) g_sellSentWatch[g_sellSentWatchN++] = arm.rows[i];
+    }
+    g_sellChained += chained;
+    DebugLog("[TALK] T478 sell confirm slaver npc uid=" + S((long long)arm.npcUid) + " seller uid=" + S((long long)arm.sellerUid)
+             + " ownNear=" + S((long long)arm.n) + " RAN: chained=" + S((long long)chained) + " [" + sold + "] purse " + S((long long)before)
+             + " -> " + S((long long)after) + " (paid " + (before >= 0 && after >= 0 ? S((long long)(after - before)) : std::string("unread"))
+             + ") - each sold character's slave state and owner go to the slaver's game");
     return r;
 }
 int g_slaveRefusalPrinted = 0;
@@ -12434,6 +13317,7 @@ void SlaveNoteRefusal(unsigned int uid, int from, int to, int how)   // ANY THRE
     ::InterlockedExchange(&g_slaveRefusal[i].ready, 1);
 }
 
+
 // StateBroadcastData::setSlaveState 0x5A3EB0 - AI worker (updateStateBroadcast / periodicUpdate) or main (tasks, dialogue).
 void detour_setSlaveState(void* sb, int s)
 {
@@ -12451,7 +13335,25 @@ void detour_setSlaveState(void* sb, int s)
     if (uid == 0) { g_slaveSetOrig(sb, s); return; }   // not a replicated character: the engine's own business
     if (net::IsUidMineAnyThread(uid))
     {
-        if (InPeriodicHere() && SlaveRunElsewhere(uid)) { ::InterlockedIncrement64(&g_slaveOwnSetHeld); return; }   // the area's runner decides
+        int cur = -1;
+        if (s == 2 && SlaveReadPod(sb, &cur, 0) && cur == 1)   // T-1225 design C: 1 -> 2 (0x5A44C0 or 0x5A4050) - slavewire.h SlaveOwnEscapeDecide
+        {
+            const int runner = SlaveAreaRunnerNow(c);
+            int handType = -1, charRes = -1, squadRes = -1, ownerHere = 0;
+            CaptureOwnerHandFacts(c, &handType, &charRes, &squadRes);   // the engine's own lookups, at the moment of the change
+            if (coopslave::SlaveOwnEscapeDecide(cur, s, runner, MySlotForWire(), handType, charRes, squadRes, &ownerHere))
+            {
+                /* Refused: the setter is not run, so no state, stamp or 250 countdown (decomp_5a3eb0.txt). Left as it is (review
+                   finding 2, Read): 0x5A4050 still sends the slave's own dialogue event after its setter call (0x684BD0
+                   sendEventOverride on the slave's Dialogue, decomp_5a4050.txt:158-168). A refused change comes only from its
+                   branches where no owner squad resolved (with one, SlaveOwnerHereOf answers kOwnerHere), and those send event
+                   0x37 with NO target (plVar8 = 0); sendEventOverride starts a conversation only when the Dialogue's current
+                   event differs (+0x188, decomp_684bd0.txt:18), so the repeat is at most one monologue of the slave, aimed at
+                   nobody. Stopping it needs a new detour on sendEventOverride, which every character's dialogue passes - not small. */
+                SlaveNoteOwnEscRefused(uid, ownerHere, runner);
+                return;
+            }
+        }
         g_slaveSetOrig(sb, s);
         SlaveMarkDirty(uid);                            // SlaveTick sends it when it differs from the last value sent
         return;
@@ -12470,10 +13372,7 @@ void detour_sbPeriodicUpdate(void* sb)
     int before = -1;
     double tsBefore = 0.0;
     if (!SlaveReadPod(sb, &before, &tsBefore) || before <= 0) { g_slavePerOrig(sb); return; }
-    const bool tls = g_slavePerTls != TLS_OUT_OF_INDEXES;
-    if (tls) ::TlsSetValue(g_slavePerTls, (void*)1);   // its setter call (1 -> 2) is seen as periodicUpdate's
-    g_slavePerOrig(sb);
-    if (tls) ::TlsSetValue(g_slavePerTls, 0);
+    g_slavePerOrig(sb);   // its 1 -> 2 is the setter's (detour_setSlaveState)
     if (before <= 1) return;
     int after = -1;
     if (!SlaveReadPod(sb, &after, 0) || after == before) return;
@@ -12481,13 +13380,7 @@ void detour_sbPeriodicUpdate(void* sb)
     const void* c = SlaveMeOfPod(sb);
     const unsigned int uid = (c != 0) ? FindSpawnedUid(c) : 0;
     if (uid == 0) return;
-    if (net::IsUidMineAnyThread(uid))
-    {
-        if (!SlaveRunElsewhere(uid)) { SlaveMarkDirty(uid); return; }
-        if (SlaveRestorePod(sb, before, tsBefore)) ::InterlockedIncrement64(&g_slaveOwnDirectHeld);   // the area's runner decides
-        else ::InterlockedIncrement64(&g_slaveRestoreFault);
-        return;
-    }
+    if (net::IsUidMineAnyThread(uid)) { SlaveMarkDirty(uid); return; }   // T-1225 design C: 2 -> 3, 2/3 -> 0 are this game's own, wherever it stands
     if (SlaveRestorePod(sb, before, tsBefore)) { SlaveNoteRefusal(uid, before, after, 2); SlaveAskNote(uid, before, after); }
     else ::InterlockedIncrement64(&g_slaveRestoreFault);
 }
@@ -12512,6 +13405,7 @@ void SlaveSendFor(unsigned int uid, const void* c, bool force, const char* why)
     ++g_slaveSent;
     g_slaveLastSent[uid] = st;
     g_slaveLastOwner[uid] = ownerNow;
+    if (g_sellSentWatchN > 0) SellNoteStateSent(uid, st, ownerNow);   /* T-478 step 5: a character sold here */
     if (g_slaveSentLogged < 20 && (!force || st != 0))
     {
         ++g_slaveSentLogged;
@@ -12563,7 +13457,6 @@ int SlaveStateOfCharacter(const void* c)
 void InstallSlaves()
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
-    if (g_slavePerTls == TLS_OUT_OF_INDEXES) g_slavePerTls = ::TlsAlloc();
     if (kSlaveSetRva == 0) g_slaveSetHook = -2;
     else
     {
@@ -12581,6 +13474,11 @@ void InstallSlaves()
     const std::string bl = "[PRISON] hooks: bail confirm (CharacterTrading_PrisonerBailout entry 0)=" + S((long long)g_bailHook)
         + " (1 armed, -1 AddHook failed, -2 no table address); its prisoners are read through setSlaveState=" + S((long long)g_slaveSetHook);
     if (g_bailHook == 1 && g_slaveSetHook == 1) DebugLog(bl); else ErrorLog(bl + " - a bail paid here does not free another player's character");
+    if (kSellConfirmRva == 0) g_sellHook = -2;
+    else g_sellHook = (coop::AddHook((void*)(base + (uintptr_t)kSellConfirmRva), (void*)&detour_sellConfirm, (void**)&g_sellOrig) == coop::SUCCESS) ? 1 : -1;
+    const std::string sl = "[TALK] hooks: selling confirm (CharacterTrading_SlaveSelling entry 0)=" + S((long long)g_sellHook)
+        + " (1 armed, -1 AddHook failed, -2 no table address); trading window row=" + (kTradingWindowRva != 0 ? "yes" : "NO (no selling window opens)");
+    if (g_sellHook == 1 && kTradingWindowRva != 0) DebugLog(sl); else ErrorLog(sl + " - a slave cannot be sold to a slaver another game runs (the window is refused)");
 }
 
 // MAIN THREAD (SlaveTick): each change refused on a copy since the last frame - the owner is asked when this game runs the
@@ -12601,7 +13499,15 @@ void SlaveAskDrain()
         const Ogre::Vector3 pos = c->worldPosition();
         const int runner = AreaHolderSlotTS(SectorOf(pos.x, pos.z));
         const int d = coopslave::SlaveAskSenderDecide(!net::IsUidMine(uid), false, from, want, runner, mySlot);
-        if (d >= 0 && d < 8) ++g_slaveAskBy[d];
+        if (d >= 0 && d < coopslave::kAskCodeCount) ++g_slaveAskBy[d];
+        if (d == coopslave::kAskEscaping || d == coopslave::kAskEscapeEnd)   // T-1225: the engine repeats it - one line per copy and change, kSlaveLogCap in all
+        {
+            if ((int)g_slaveAskEscNotAsked.size() < kSlaveLogCap && g_slaveAskEscNotAsked.insert(((unsigned long long)uid << 8) | (unsigned long long)(want & 0xFF)).second)
+                DebugLog("[SLAVE] ask uid=" + S((long long)uid) + " copy change " + S((long long)from) + " -> " + S((long long)want)
+                         + " NOT asked: " + coopslave::SlaveAskWhy(d, false) + " (area run by slot " + S((long long)runner) + ", this game slot "
+                         + S((long long)mySlot) + "; T-1225)");
+            continue;
+        }
         if (d != coopslave::kAskSend)
         {
             if (g_slaveAskLogged < 20 && d != coopslave::kAskSame && d != coopslave::kAskNotCopy)
@@ -12630,29 +13536,6 @@ void SlaveAskDrain()
     }
 }
 
-// MAIN THREAD (SlaveTick): the owner's list of its characters whose slave state another game's engine decides.
-void SlaveElseRefresh()
-{
-    static DWORD s_at = 0;
-    const DWORD now = ::GetTickCount();
-    if (s_at != 0 && now - s_at < kSlaveElseRefreshMs) return;
-    s_at = now | 1u;
-    const int mySlot = MySlotForWire();
-    int n = 0;
-    for (std::map<unsigned int, int>::iterator it = g_slaveLastSent.begin(); it != g_slaveLastSent.end(); ++it)
-    {
-        const unsigned int uid = it->first;
-        if (!net::IsUidMine(uid)) continue;
-        ::Character* c = FindSpawned(uid);
-        if (c == 0 || !PlausibleObject(c) || SlaveStateOfCharacter(c) <= 0) continue;
-        const Ogre::Vector3 pos = c->worldPosition();
-        if (!coopslave::SlaveOwnEngineDefers(AreaHolderSlotTS(SectorOf(pos.x, pos.z)), mySlot)) continue;
-        if (n >= kSlaveElseCap) { ++g_slaveElseFull; break; }
-        ::InterlockedExchange(&g_slaveElse[n++], (LONG)uid);
-    }
-    for (int i = n; i < kSlaveElseCap; ++i) ::InterlockedExchange(&g_slaveElse[i], 0);
-}
-
 // MAIN THREAD (dispatch): an ask about OUR character, kept for the K2 safe point (latest wins).
 void SlaveAskRecv(unsigned int uid, int from, int want, unsigned int fromPeer)
 {
@@ -12676,9 +13559,23 @@ void SlaveAskApplyOwn()
         const Ogre::Vector3 pos = c->worldPosition();
         const int holder = AreaHolderSlotTS(SectorOf(pos.x, pos.z));
         const int d = coopslave::SlaveAskOwnerDecide(net::IsUidMine(uid), cur, a.from, a.want, holder, a.slot);
-        if (d >= 0 && d < 8) ++g_slaveAskOwnerBy[d];
+        if (d >= 0 && d < coopslave::kAskCodeCount) ++g_slaveAskOwnerBy[d];
         bool ok = false;
         if (d == coopslave::kAskApply) { ok = SlaveSetOwnedState(c, a.want); if (!ok) ++g_slaveAskApplyFailed; }
+        if (d == coopslave::kAskOwnerEscaping || d == coopslave::kAskOwnerEscapeEnd)   // T-1225: one line per slave, asking game and transition (kSlaveLogCap in all)
+        {
+            const unsigned long long key = ((unsigned long long)uid << 32) | ((unsigned long long)(a.slot & 0xFFFF) << 8) | (unsigned long long)(a.from & 0xFF);
+            if (g_slaveAskEscLines < kSlaveLogCap && g_slaveAskEscLogged.insert(key).second)
+            {
+                ++g_slaveAskEscLines;
+                char nm[128];
+                const std::string name = ReadStdStringPod((const char*)c + 0x18, nm, (int)sizeof(nm)) ? std::string(nm) : std::string("?");
+                DebugLog("[SLAVE] ask REFUSED uid=" + S((long long)uid) + " '" + name + "' slave " + S((long long)a.from) + " -> " + S((long long)a.want)
+                         + " asked by the game of slot " + S((long long)a.slot) + ": " + coopslave::SlaveAskWhy(d, true)
+                         + " - ours stays " + S((long long)cur) + " (area run by slot " + S((long long)holder) + "; T-1225)");
+            }
+            continue;
+        }
         if (g_slaveAskOwnerLogged < 20)
         {
             ++g_slaveAskOwnerLogged;
@@ -12692,6 +13589,7 @@ void SlaveAskApplyOwn()
 
 void SlaveTick()
 {
+    SellWindowTick();   /* T-478 review fold: a selling window that ended without a sale clears its note (a read; before the blocked return) */
     while (g_slaveRefusalPrinted < kSlaveLogCap && g_slaveRefusal[g_slaveRefusalPrinted].ready != 0)
     {
         const SlaveRefusal& r = g_slaveRefusal[g_slaveRefusalPrinted];
@@ -12701,7 +13599,22 @@ void SlaveTick()
                  + (r.how == 1 ? " (setSlaveState on a copy not owned here)" : " (periodicUpdate's direct write on a copy, put back)"));
     }
     if (EngineWritesBlocked()) return;   // marks wait
-    SlaveElseRefresh();
+    while (g_slaveOwnEscPrinted < kSlaveLogCap && g_slaveOwnEscRow[g_slaveOwnEscPrinted].ready != 0)   // T-1225 design C
+    {
+        const SlaveOwnEscRow& r = g_slaveOwnEscRow[g_slaveOwnEscPrinted];
+        ++g_slaveOwnEscPrinted;
+        const unsigned int uid = (unsigned int)r.uid;
+        ::Character* c = FindSpawned(uid);
+        const int runner = (int)r.runner;   // as read at the refusal
+        char nm[128];
+        std::string name = "?";
+        if (c != 0 && PlausibleObject(c) && ReadStdStringPod((const char*)c + 0x18, nm, (int)sizeof(nm))) name = nm;
+        DebugLog("[SLAVE] own change REFUSED uid=" + S((long long)uid) + " '" + name + "' slave 1 -> 2: "
+                 + (runner >= 0 ? std::string("another game runs its area") : std::string("who runs its area is not known (no fresh area map, or frozen)"))
+                 + " (slot " + S((long long)runner) + ", this game slot " + S((long long)MySlotForWire()) + ") and its slave-owner hand resolves to nobody here (hand="
+                 + (r.owner == coopslave::kOwnerEmpty ? std::string("empty") : (r.owner == coopslave::kOwnerNotHere ? std::string("names somebody not here") : std::string("unreadable")))
+                 + ") - the engine's next 1 -> 2 goes through once the owner is known or the area map names this game (T-1225)");
+    }
     SlaveAskDrain();
     for (int i = 0; i < kSlaveDirtyCap; ++i)
     {
@@ -12809,17 +13722,25 @@ std::string SlaveReportLine()
          + S(g_slaveAskApplyFailed) + "," + S(g_slaveAskOwnerBy[coopslave::kAskAlready]) + "," + S(g_slaveAskOwnerBy[coopslave::kAskStale]) + ","
          + S(g_slaveAskOwnerBy[coopslave::kAskOwnerEnslave]) + "," + S(g_slaveAskOwnerBy[coopslave::kAskHolderUnknown]) + ","
          + S(g_slaveAskOwnerBy[coopslave::kAskSenderNotHolder])
-         + " ownHeld[setter,direct,listFull]=" + S((long long)g_slaveOwnSetHeld) + "," + S((long long)g_slaveOwnDirectHeld) + "," + S(g_slaveElseFull);
+         + " askInEscapingRefused=" + S(g_slaveAskOwnerBy[coopslave::kAskOwnerEscaping])
+         + " askEscapingNotSent=" + S(g_slaveAskBy[coopslave::kAskEscaping])
+         + " askInEscapeEndRefused=" + S(g_slaveAskOwnerBy[coopslave::kAskOwnerEscapeEnd])
+         + " askEscapeEndNotSent=" + S(g_slaveAskBy[coopslave::kAskEscapeEnd])
+         + " ownEscapingRefused=" + S((long long)g_slaveOwnEscRefused) + " ownEscapingRefusedMapUnknown=" + S((long long)g_slaveOwnEscMapUnknown);
 }
 
 // " bail[...]" for the [P014] prison token.
 std::string BailReportToken()
 {
-    return " bail[hook,calls,paid,rowsSeen,rowsOwn,rowsOver,nested,sent,sendFailed]=" + S((long long)g_bailHook) + "," + S(g_bailCalls) + ","
+    return " sell[hook,calls,local,ran,refusedGone,refusedLink,chained,paid,stateSent,nowOurs,ended,unbound]=" + S((long long)SellConfirmHookState()) + "," + S(g_sellCalls) + ","
+         + S(g_sellLocal) + "," + S(g_sellRan) + "," + S(g_sellRefusedGone) + "," + S(g_sellRefusedLink) + "," + S(g_sellChained) + ","
+         + S(g_sellPaid) + "," + S(g_sellStateSent) + "," + S(g_sellNowOurs) + "," + S(g_sellEnded) + "," + S(g_sellUnbound)   // T-478 step 5 (+ review folds)
+         + " bail[hook,calls,paid,rowsSeen,rowsOwn,rowsOver,nested,sent,sendFailed]=" + S((long long)g_bailHook) + "," + S(g_bailCalls) + ","
          + S(g_bailPaid) + "," + S(g_bailRowsSeen) + "," + S(g_bailRowsOwn) + "," + S(g_bailRowsOver) + "," + S(g_bailNested) + ","
          + S(g_bailReleaseSent) + "," + S(g_bailReleaseSendFailed)
          + " bailPending[now,resent,done,gone,gaveUp,notRunner]=" + S((long long)g_bailPending.size()) + "," + S(g_bailResent) + ","
-         + S(g_bailDone) + "," + S(g_bailGone) + "," + S(g_bailGaveUp) + "," + S(g_bailNotRunner);
+         + S(g_bailDone) + "," + S(g_bailGone) + "," + S(g_bailGaveUp) + "," + S(g_bailNotRunner)
+         + " bailOwnerRefuses=" + S(g_bailRowsOwnerRefuses);   // T-478 review fold: rows paid whose owner refuses the "@bail" (want 0)
 }
 
 // TEST-ONLY lever `bailtest <copyUid>`: the bail confirm's own steps for one caged copy of another game's character, at the
@@ -12898,13 +13819,18 @@ std::string SlaveTestCommand(const std::string& arg)
     const bool mine = net::IsUidMine(uid);
     const int before = SlaveStateOfCharacter(c);
     const long long refusedBefore = (long long)g_slaveRefusedSetter;
+    const long long ownRefusedBefore = (long long)g_slaveOwnEscRefused;
+    const unsigned int ownerUid = CaptureOwnerUidOf(c);
+    const int ownerHere = SlaveOwnerHereNow(c);
     const bool ok = SlaveCallSetterPod(sb, s);
     const int after = SlaveStateOfCharacter(c);
     const Ogre::Vector3 pos = c->worldPosition();
     const int runner = AreaHolderSlotTS(SectorOf(pos.x, pos.z));
     const std::string line = "[SLAVE] slavetest uid=" + S((long long)uid) + " own=" + S((long long)(mine ? 1 : 0)) + " before=" + S((long long)before)
         + " set=" + S((long long)s) + " after=" + S((long long)after) + " setter=" + S((long long)(ok ? 1 : 0))
-        + " refusedHere=" + S((long long)((long long)g_slaveRefusedSetter > refusedBefore ? 1 : 0)) + " areaRunBy=" + S((long long)runner)
+        + " refusedHere=" + S((long long)((long long)g_slaveRefusedSetter > refusedBefore ? 1 : 0))
+        + " ownRefused=" + S((long long)((long long)g_slaveOwnEscRefused > ownRefusedBefore ? 1 : 0)) + " ownerUid=" + S((long long)ownerUid) + " ownerHere=" + S((long long)ownerHere)
+        + " areaRunBy=" + S((long long)runner)
         + " thisSlot=" + S((long long)MySlotForWire()) + " - TEST-ONLY: the engine's setSlaveState as a task would call it";
     DebugLog(line);
     return "ok " + line;
@@ -12952,8 +13878,9 @@ struct RestraintSide
 };
 struct RestraintRec { RestraintSide sh, cage; };
 std::map<unsigned int, RestraintRec> g_restraint;
-const int kRestraintOpWrite = 0, kRestraintOpRequest = 1, kRestraintOpLeverOpen = 2, kRestraintOpLeverClose = 3, kRestraintOpLeverEscape = 4;
-struct RestraintOp { unsigned int uid; unsigned char kind; int op; unsigned char flags; int level; std::string key; };
+const int kRestraintOpWrite = 0, kRestraintOpRequest = 1, kRestraintOpLeverOpen = 2, kRestraintOpLeverClose = 3, kRestraintOpLeverEscape = 4,
+          kRestraintOpLeverPick = 5, kRestraintOpLeverRelease = 6;
+struct RestraintOp { unsigned int uid; unsigned char kind; int op; unsigned char flags; int level; std::string key; unsigned int by; };   // by: the picker (pick / release)
 std::vector<RestraintOp> g_restraintOps;
 const size_t kRestraintOpsMax = 64;
 const DWORD kRestraintScanMs = 1000;
@@ -13012,7 +13939,9 @@ int CageLockPtrPod(const void* cage, void** out)   // 1 read (0 = the cage has n
     __try { *out = *(void* const*)((const char*)cage + kUseableDoorLockOff); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
-int EscapeOrderPod(::Character* c)   // GET_OUT_OF_CAGE_ESCAPE as a player's order (PrisonWalkOutPod's call): 1 ordered, 0 no address, -1 faulted
+// The engine's issueOrder as a player's right-click (shift 0, the old orders replaced - PlayerOrderGivePod's call in medical.cpp):
+// task on target (0 = none). 1 ordered, 0 no address, -1 faulted.
+static int AddOrderPod(::Character* c, int task, void* target)
 {
     if (kAddOrderRva == 0 || kAddOrderArgGlobalRva == 0) return 0;
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -13020,10 +13949,14 @@ int EscapeOrderPod(::Character* c)   // GET_OUT_OF_CAGE_ESCAPE as a player's ord
     __try
     {
         const unsigned long long a7 = *(const unsigned long long*)(base + kAddOrderArgGlobalRva);
-        fn(c, 0, kTaskGetOutOfCageEscape, 0, 0, 1, a7);
+        fn(c, 0, task, target, 0, 1, a7);
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int EscapeOrderPod(::Character* c)   // GET_OUT_OF_CAGE_ESCAPE as a player's order (PrisonWalkOutPod's call): 1 ordered, 0 no address, -1 faulted
+{
+    return AddOrderPod(c, kTaskGetOutOfCageEscape, 0);
 }
 
 // One restraint of `c`: 1 read (its key, the cage's outer key, the lock and its bits), 0 none (no shackles worn / not in a cage /
@@ -13071,12 +14004,14 @@ bool RestraintSend(unsigned int uid, unsigned char kind, const std::string& key,
 bool RestraintQueue(unsigned int uid, unsigned char kind, int op, unsigned char flags, int level, const std::string& key)
 {
     if (g_restraintOps.size() >= kRestraintOpsMax) { ++g_rsOpsDropped; return false; }
-    RestraintOp o; o.uid = uid; o.kind = kind; o.op = op; o.flags = flags; o.level = level; o.key = key;
+    RestraintOp o; o.uid = uid; o.kind = kind; o.op = op; o.flags = flags; o.level = level; o.key = key; o.by = 0;
     g_restraintOps.push_back(o);
     return true;
 }
 
-void RestraintWatchOne(unsigned int uid, ::Character* c, bool mine, unsigned char kind, RestraintSide& s, DWORD now)
+// One restraint of one character as the watch handles it. Returns RestraintRead's answer: 1 read (s.openHere is this read's),
+// 0 none worn / not caged, -1 unreadable.
+int RestraintWatchOne(unsigned int uid, ::Character* c, bool mine, unsigned char kind, RestraintSide& s, DWORD now)
 {
     std::string key, outer;
     void* lock = 0;
@@ -13090,45 +14025,68 @@ void RestraintWatchOne(unsigned int uid, ::Character* c, bool mine, unsigned cha
         // the seen-equal mark, the ask and the open reading - a cage it left open here and in the word stays a rescue for a moment
         if (r == 0)
         {
-            if (mine) { s.word = false; return; }
-            if (!s.seen && !s.openHere && s.ask == cooprison::kRestraintAskNone) return;
+            if (mine) { s.word = false; return r; }
+            if (!s.seen && !s.openHere && s.ask == cooprison::kRestraintAskNone) return r;
             if (cooprison::RestraintLeftOpenRescue(kind == cooprison::kPrisonCageLock, s.word, s.openHere, s.wFlags, s.wLevel))
                 s.rescueUntil = (now + kRestraintRescueMs) | 1u;
             s.seen = false; s.openHere = false; s.ask = cooprison::kRestraintAskNone; s.askAt = 0;
             ++g_rsDropped;
         }
-        return;
+        return r;
     }
     s.openHere = cooprison::LockOpen(f, lv);
     if (!mine) s.rescueUntil = 0;   // restrained again: no rescue window
     if (mine)
     {
-        if (!cooprison::RestraintWordDue(s.word, s.wKey == key, s.wFlags, s.wLevel, f, lv, (unsigned int)(now - s.wAt), kRestraintResendMs)) return;
-        if (!RestraintSend(uid, kind, key, outer, f, lv)) { ++g_rsWordSendFailed; return; }
+        if (!cooprison::RestraintWordDue(s.word, s.wKey == key, s.wFlags, s.wLevel, f, lv, (unsigned int)(now - s.wAt), kRestraintResendMs)) return r;
+        if (!RestraintSend(uid, kind, key, outer, f, lv)) { ++g_rsWordSendFailed; return r; }
         const bool change = !s.word || s.wKey != key || s.wFlags != f || s.wLevel != lv;
         s.word = true; s.wFlags = f; s.wLevel = lv; s.wKey = key; s.wAt = now;
         ++g_rsWordSent;
         if (change) RestraintLog("-> word uid=" + S((long long)uid) + " " + RestraintName(kind) + " '" + key + "' " + LockBitsText(f, lv) + " - our prisoner's lock, to every game");
-        return;
+        return r;
     }
-    if (!s.word || s.wKey != key) return;   // no word yet about THIS restraint (other shackles, another cage)
+    if (!s.word || s.wKey != key) return r;   // no word yet about THIS restraint (other shackles, another cage)
     if (s.ask == cooprison::kRestraintAskFresh && now - s.askAt >= kRestraintAskMs) s.ask = cooprison::kRestraintAskStale;
     const int d = cooprison::RestraintCopyDecide(true, s.wFlags, s.wLevel, f, lv, s.seen, s.ask);
     if (d == cooprison::kRestraintKeep)
     {
         if (f == s.wFlags && lv == s.wLevel) { s.seen = true; s.ask = cooprison::kRestraintAskNone; }
-        return;
+        return r;
     }
     if (d == cooprison::kRestraintAsk)
     {
-        if (!RestraintSend(uid, kind, key, outer, f, lv)) return;   // the link is down: asked again at the next scan
+        if (!RestraintSend(uid, kind, key, outer, f, lv)) return r;   // the link is down: asked again at the next scan
         s.ask = cooprison::kRestraintAskFresh; s.askAt = now;
         ++g_rsAskSent;
         RestraintLog("-> ask uid=" + S((long long)uid) + " " + RestraintName(kind) + " '" + key + "' opened here " + LockBitsText(f, lv)
                      + " while the owner's word is " + LockBitsText(s.wFlags, s.wLevel) + " - the owner is asked to open its own");
-        return;
+        return r;
     }
     RestraintQueue(uid, kind, kRestraintOpWrite, s.wFlags, s.wLevel, key);
+    return r;
+}
+
+// One replicated character's shackles and cage lock as the watch reads them (a record is made only for a character that wears
+// shackles or sits in a cage): on the owner's game its word sent; on a copy's game a lock-open request sent, or the owner's word taken.
+// Returns the locks this read found open (cooprison::kFreedLock* bits; one not worn, not caged or unreadable is not in it).
+unsigned char RestraintWatchChar(unsigned int uid, ::Character* c, DWORD now)
+{
+    const bool mine = net::IsUidMine(uid);
+    std::map<unsigned int, RestraintRec>::iterator it = g_restraint.find(uid);
+    if (it == g_restraint.end())
+    {
+        std::string key, outer; void* lock = 0; unsigned char f = 0; int lv = 0;
+        if (RestraintRead(c, cooprison::kPrisonShackleLock, &key, &outer, &lock, &f, &lv) != 1
+            && RestraintRead(c, cooprison::kPrisonCageLock, &key, &outer, &lock, &f, &lv) != 1) return 0;
+        it = g_restraint.insert(std::make_pair(uid, RestraintRec())).first;
+    }
+    unsigned char open = 0;
+    if (RestraintWatchOne(uid, c, mine, cooprison::kPrisonShackleLock, it->second.sh, now) == 1 && it->second.sh.openHere)
+        open = (unsigned char)(open | cooprison::kFreedLockShackles);
+    if (RestraintWatchOne(uid, c, mine, cooprison::kPrisonCageLock, it->second.cage, now) == 1 && it->second.cage.openHere)
+        open = (unsigned char)(open | cooprison::kFreedLockCage);
+    return open;
 }
 }   // namespace (P42)
 
@@ -13194,18 +14152,7 @@ void RestraintWatch()
         unsigned int uid = 0;
         ::Character* c = 0;
         if (!MirrorSlot(i, &uid, &c) || uid == 0 || !PlausibleObject(c)) continue;
-        const bool mine = net::IsUidMine(uid);
-        std::map<unsigned int, RestraintRec>::iterator it = g_restraint.find(uid);
-        if (it == g_restraint.end())
-        {
-            // nothing known yet: a record only for a character that wears shackles or sits in a cage
-            std::string key, outer; void* lock = 0; unsigned char f = 0; int lv = 0;
-            if (RestraintRead(c, cooprison::kPrisonShackleLock, &key, &outer, &lock, &f, &lv) != 1
-                && RestraintRead(c, cooprison::kPrisonCageLock, &key, &outer, &lock, &f, &lv) != 1) continue;
-            it = g_restraint.insert(std::make_pair(uid, RestraintRec())).first;
-        }
-        RestraintWatchOne(uid, c, mine, cooprison::kPrisonShackleLock, it->second.sh, now);
-        RestraintWatchOne(uid, c, mine, cooprison::kPrisonCageLock, it->second.cage, now);
+        RestraintWatchChar(uid, c, now);
     }
     ::QueryPerformanceCounter(&t1);
     ::QueryPerformanceFrequency(&fq);
@@ -13214,8 +14161,247 @@ void RestraintWatch()
     if (g_rsScanUsLast > g_rsScanUsMax) g_rsScanUsMax = g_rsScanUsLast;
 }
 
+// T-980, MAIN THREAD (speech.cpp FreedSendDrain): the watch's own check of one character, run now rather than at its next pass,
+// so a lock-open request it makes for a copy's shackles or cage goes to the owner ahead of the freed message sent right after it
+// on the same road (both MSG_PRISON to the prisoner's owner). Returns the locks this read found open (the freed message's byte).
+unsigned char RestraintCheckNow(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !PlausibleObject(c)) return 0;
+    return RestraintWatchChar(uid, c, ::GetTickCount());
+}
+
+typedef char FreedCageHandBytesMatch[(cooprison::kPrisonNoteHandBytes == (int)kHandIdBytes) ? 1 : -1];   // the note carries a whole hand id
+
+// T-980, ANY THREAD (speech.cpp FreedNoteEvent, from the engine's unlock event): plain reads under SEH, no engine call and no table.
+// The cage the hand names is resolved later on the main thread (FreedCageAtEventSend): resolving a hand reads the engine's object
+// tables, which this plugin reads on the main thread only.
+int FreedCageFactsPod(const void* c, unsigned char* hand)
+{
+    std::memset(hand, 0, kHandIdBytes);
+    __try
+    {
+        const int ins = *(const int*)((const char*)c + kPoseInSomethingOff);
+        std::memcpy(hand, (const char*)c + kPoseBedHandIdOff, kHandIdBytes);
+        return ins == 2 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// T-980, MAIN THREAD (speech.cpp FreedSendDrain): the release task 0x357040 opens the cage's lock, raises the unlock event, then
+// takes the prisoner out of the cage, so the watch's check just before this (RestraintCheckNow) no longer finds the copy caged and
+// makes no request for the cage. The cage the event's hand names is read here instead - its key as RestraintRead builds it, its
+// lock's bits now (nothing on this game locks that cage again while the copy is out of it: the watch writes the owner's word only
+// to a cage the copy sits in) - and a cage open at the event has its open request sent now, on the road the freed message takes
+// right after it, as the watch's own requests do.
+unsigned char FreedCageAtEventSend(unsigned int uid, int cagedAtEvent, const unsigned char* hand, unsigned char openNow, int* cageAtEvent)
+{
+    int lockRead = -1;
+    unsigned char f = 0;
+    int lv = 0;
+    char k[coopstate::kPoseStrMax + 1], o[coopstate::kPoseStrMax + 1];
+    k[0] = 0; o[0] = 0;
+    if (cagedAtEvent == 1)
+    {
+        void* const cage = P11CageFromPoseHand(hand);
+        void* lock = 0;
+        if (cage != 0 && PoseBedKeyFromHand(hand, k, (int)sizeof(k), o, (int)sizeof(o)) != 0 && CageLockPtrPod(cage, &lock) == 1)
+        {
+            if (lock == 0) lockRead = 0;
+            else if (PlausiblePtr(lock) && LockBitsReadPod(lock, &f, &lv) == 1) lockRead = 1;
+        }
+    }
+    *cageAtEvent = cooprison::FreedCageAtEvent(cagedAtEvent, lockRead, cooprison::LockOpen(f, lv));
+    bool send = false;
+    const unsigned char locks = cooprison::FreedLocksAtEvent(openNow, *cageAtEvent, &send);
+    if (send)
+    {
+        const bool ok = RestraintSend(uid, cooprison::kPrisonCageLock, k, o, f, lv);
+        if (ok) ++g_rsAskSent;
+        RestraintLog("-> ask uid=" + S((long long)uid) + " cage '" + k + "' " + LockBitsText(f, lv)
+                     + (ok ? " - open at the unlock event, the copy since taken out of it; the owner is asked to open its own"
+                           : " NOT sent: no road to the prisoner's owner (open at the unlock event)"));
+    }
+    return locks;
+}
+
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+/* PROBE P214: the characters speech.cpp's P214 watches - each prisoner a locktest pick|release order was given on this launch
+   (freed 1), then each restraint record (a replicated character seen in shackles or a cage this launch). MAIN THREAD. */
+const int kP214FreedMax = 32;
+unsigned int g_p214Freed[kP214FreedMax];
+int g_p214FreedN = 0;
+void P214NoteFreed(unsigned int uid)
+{
+    for (int k = 0; k < g_p214FreedN; ++k) if (g_p214Freed[k] == uid) return;
+    if (g_p214FreedN < kP214FreedMax) g_p214Freed[g_p214FreedN++] = uid;
+}
+int P214WatchList(void** out, int* freed, int cap)
+{
+    int n = 0;
+    for (int k = 0; k < g_p214FreedN && n < cap; ++k)
+    {
+        ::Character* c = FindSpawned(g_p214Freed[k]);
+        if (c != 0 && PlausibleObject(c)) { out[n] = c; freed[n] = 1; ++n; }
+    }
+    for (std::map<unsigned int, RestraintRec>::const_iterator it = g_restraint.begin(); it != g_restraint.end() && n < cap; ++it)
+    {
+        ::Character* c = FindSpawned(it->first);
+        if (c == 0 || !PlausibleObject(c)) continue;
+        int dup = 0;
+        for (int k = 0; k < n; ++k) if (out[k] == (void*)c) dup = 1;
+        if (!dup) { out[n] = c; freed[n] = 0; ++n; }
+    }
+    return n;
+}
+// PROBE-END: P214
+#endif
+
+// P42 TEST-ONLY lever `locktest pick|release`, MAIN THREAD: why the picker may not be given the order on the prisoner, "" none. The
+// picker must be this game's own player-faction character, the prisoner another character sitting in a cage (in-something 2), and
+// the engine's order call must be in the address table.
+static std::string LockTestPickRefusal(::Character* picker, unsigned int pickerUid, ::Character* prisoner, unsigned int prisonerUid)
+{
+    if (picker == 0 || !PlausibleObject(picker)) return "the picker uid=" + S((long long)pickerUid) + " is not on this game";
+    if (pickerUid == 0 || !net::IsUidMine(pickerUid)) return "the picker is not this game's own character";
+    if (IsPlayerFactionPod(picker) != 1) return "the picker is not in this game's player faction";
+    if (prisoner == 0 || !PlausibleObject(prisoner)) return "the prisoner uid=" + S((long long)prisonerUid) + " is not on this game";
+    if (prisoner == picker) return "the picker and the prisoner are one character";
+    const int ins = PoseInSomethingPod(prisoner);
+    if (ins != 2) return "the prisoner is not caged (in-something=" + S((long long)ins) + ")";
+    if (kAddOrderRva == 0 || kAddOrderArgGlobalRva == 0) return "the engine's order call is not in the address table (AddOrder / AddOrderArgGlobal)";
+    return std::string();
+}
+
+// P42 TEST-ONLY lever, K2 SAFE POINT (RestraintSafePointDrain): the checks read again, then the picker is given the engine's own
+// order on the caged character - PICK_LOCK 76 or RELEASE_PRISONER 110, as a player's right-click. The engine's task then raises the
+// prisoner's dialogue event 0xD itself (a pick that ends with the lock open; a release by a player faction's character).
+static void LockTestPickRun(const RestraintOp& op)
+{
+    const bool pick = op.op == kRestraintOpLeverPick;
+    const int task = pick ? cooprison::kLockTaskPick : cooprison::kLockTaskRelease;
+    ::Character* const picker = FindSpawned(op.by);
+    ::Character* const prisoner = FindSpawned(op.uid);
+    const std::string why = LockTestPickRefusal(picker, op.by, prisoner, op.uid);
+    void* const cage = why.empty() ? PrisonCageOf(prisoner) : 0;
+    const int given = why.empty() ? AddOrderPod(picker, task, prisoner) : 0;
+    if (given == 1) ++g_rsLever;
+    char cs[32];
+    _snprintf_s(cs, sizeof(cs), _TRUNCATE, "%p", cage);
+    RestraintLog(std::string("locktest ") + (pick ? "pick" : "release") + ": picker uid=" + S((long long)op.by) + " prisoner uid="
+                 + S((long long)op.uid) + " cage=" + cs + " task=" + S((long long)task) + " given=" + S((long long)given)
+                 + (why.empty() ? std::string() : " REFUSED (" + why + ")") + " - TEST-ONLY lever P42");
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+    if (given == 1) P214NoteFreed(op.uid);   /* PROBE P214: this prisoner's dialogue events are traced for the rest of the launch */
+// PROBE-END: P214
+#endif
+}
+
 // P42, K2 SAFE POINT (PrisonSafePointDrain): the queued lock writes - a copy taking its owner's word, the owner opening its own on
 // a copy's game's request, and the TEST-ONLY lever's writes and escape order. Each is read again here first.
+namespace {
+/* T-980: kPrisonFreed messages for our own prisoners, waiting for the safe point in arrival order. MAIN THREAD. */
+struct FreedIn { unsigned int uid; unsigned int freerUid; unsigned int peer; DWORD at; unsigned char locks; };   // locks: the message's kFreedLock* byte
+std::vector<FreedIn> g_freedIn;
+const size_t kFreedInMax = 16;
+long long g_fdRecv = 0, g_fdReplaced = 0, g_fdFull = 0, g_fdBlocked = 0, g_fdRaised = 0, g_fdEngineRefused = 0, g_fdNotRaised = 0,
+          g_fdLockShut = 0, g_fdNotOurs = 0, g_fdGone = 0, g_fdNoFreer = 0, g_fdNotSender = 0;
+/* True when `c`'s shackles (or its cage's lock) read locked now; none worn, not caged or unreadable reads as not locked. */
+bool RestraintLockedHere(::Character* c, unsigned char kind)
+{
+    std::string key, outer;
+    void* lock = 0;
+    unsigned char fl = 0;
+    int lv = 0;
+    return RestraintRead(c, kind, &key, &outer, &lock, &fl, &lv) == 1 && !cooprison::LockOpen(fl, lv);
+}
+}   // namespace (T-980)
+
+/* T-980, MAIN THREAD (ApplyRemotePrison): another game's engine raised the unlock event on its copy of `m.uid` with that game's
+   character `m.freerUid` as the freer. Queued; a second one for the same prisoner before the safe point takes the newer freer. */
+void FreedRecv(const cooprison::PrisonMsg& m, unsigned int fromPeer)
+{
+    ++g_fdRecv;
+    const std::string who = "uid=" + S((long long)m.uid) + " freer=" + S((long long)m.freerUid) + " from game " + S((long long)fromPeer)
+                          + " readOpen=" + S((long long)m.freedLocks);
+    for (size_t i = 0; i < g_freedIn.size(); ++i)
+        if (g_freedIn[i].uid == m.uid)
+        {
+            g_freedIn[i].freerUid = m.freerUid; g_freedIn[i].peer = fromPeer; g_freedIn[i].locks = m.freedLocks;
+            ++g_fdReplaced;
+            DebugLog("[PRISON] <- freed " + who + " - one already waits for this prisoner; the newer freer kept");
+            return;
+        }
+    if (g_freedIn.size() >= kFreedInMax)
+    {
+        ++g_fdFull;
+        ErrorLog("[PRISON] <- freed " + who + " DROPPED: " + S((long long)kFreedInMax) + " already wait for the safe point");
+        return;
+    }
+    FreedIn f; f.uid = m.uid; f.freerUid = m.freerUid; f.peer = fromPeer; f.at = ::GetTickCount(); f.locks = m.freedLocks;
+    g_freedIn.push_back(f);
+    DebugLog("[PRISON] <- freed " + who + " - the unlock event is raised on our own prisoner at the safe point");
+}
+
+/* T-980, MAIN THREAD at the K2 safe point (PrisonSafePointDrain, after RestraintSafePointDrain): each freeing checked
+   (cooprison::FreedOwnerDecide) and raised on our own prisoner at once (speech.cpp FreedRaiseEvent), or refused - every refusal
+   logged and counted. The freer's game's lock-open requests for the prisoner came before the freed message on the same road and
+   were applied just above (RestraintSafePointDrain); a lock the message names as open on that game's copy that still reads
+   locked here refuses the raise. */
+void FreedInDrain()
+{
+    if (g_freedIn.empty()) return;
+    if (EngineWritesBlocked())
+    {
+        for (size_t i = 0; i < g_freedIn.size(); ++i)
+        {
+            ++g_fdBlocked;
+            DebugLog("[PRISON] freed uid=" + S((long long)g_freedIn[i].uid) + " freer=" + S((long long)g_freedIn[i].freerUid)
+                     + " NOT raised: the world is loading or tearing down");
+        }
+        g_freedIn.clear();
+        return;
+    }
+    std::vector<FreedIn> batch;
+    batch.swap(g_freedIn);
+    for (size_t i = 0; i < batch.size(); ++i)
+    {
+        const FreedIn& f = batch[i];
+        ::Character* const c = FindSpawned(f.uid);
+        const bool here = c != 0 && PlausibleObject(c);
+        ::Character* const fr = FindSpawned(f.freerUid);
+        const bool frHere = fr != 0 && PlausibleObject(fr);
+        // each lock the freer's game read open on its copy as it sent the message, read here now
+        const bool shShut = here && (f.locks & cooprison::kFreedLockShackles) != 0 && RestraintLockedHere(c, cooprison::kPrisonShackleLock);
+        const bool cageShut = here && (f.locks & cooprison::kFreedLockCage) != 0 && RestraintLockedHere(c, cooprison::kPrisonCageLock);
+        const unsigned char lockedHere = (unsigned char)((shShut ? cooprison::kFreedLockShackles : 0) | (cageShut ? cooprison::kFreedLockCage : 0));
+        const int v = cooprison::FreedOwnerDecide(net::IsUidMine(f.uid), here, frHere, net::IsUidMine(f.freerUid), net::UidOwnedByPeer(f.freerUid, f.peer),
+                                                  f.locks, lockedHere);
+        if (v == cooprison::kFreedRaise)
+        {
+            const int rc = FreedRaiseEvent(c, fr, f.uid, f.freerUid, f.locks);
+            if (rc == 1) ++g_fdRaised; else if (rc == 0) ++g_fdEngineRefused; else ++g_fdNotRaised;
+            continue;
+        }
+        const char* why = "?";
+        if (v == cooprison::kFreedNotOurs) { ++g_fdNotOurs; why = "the prisoner is not ours"; }
+        else if (v == cooprison::kFreedGone) { ++g_fdGone; why = "our prisoner is gone"; }
+        else if (v == cooprison::kFreedNoFreer) { ++g_fdNoFreer; why = "no copy of the freer here"; }
+        else if (v == cooprison::kFreedLockShut)
+        {
+            ++g_fdLockShut;
+            why = (shShut && cageShut) ? "our shackles and cage still read locked though the freer's game read them open (its lock requests were refused or lost)"
+                : shShut ? "our shackles still read locked though the freer's game read them open (its lock request was refused or lost)"
+                         : "our cage still reads locked though the freer's game read it open (its lock request was refused or lost)";
+        }
+        else { ++g_fdNotSender; why = "the freer is not the sending game's character"; }
+        ErrorLog("[PRISON] freed uid=" + S((long long)f.uid) + " freer=" + S((long long)f.freerUid) + " from game " + S((long long)f.peer)
+                 + " REFUSED: " + why + " - the unlock event is not raised");
+    }
+}
+
 void RestraintSafePointDrain()
 {
     if (g_restraintOps.empty()) return;
@@ -13225,6 +14411,7 @@ void RestraintSafePointDrain()
     for (size_t i = 0; i < ops.size(); ++i)
     {
         const RestraintOp& op = ops[i];
+        if (op.op == kRestraintOpLeverPick || op.op == kRestraintOpLeverRelease) { LockTestPickRun(op); continue; }   // its own checks and [LOCK] line
         ::Character* c = FindSpawned(op.uid);
         if (c == 0 || !PlausibleObject(c)) { ++g_rsGone; continue; }
         const bool mine = net::IsUidMine(op.uid);
@@ -13288,26 +14475,136 @@ std::string RestraintReportToken()
          + S(g_rsAskRecv) + "," + S(g_rsAccepted) + "," + S(g_rsRefused) + "," + S(g_rsRewritten) + "," + S(g_rsWriteFailed) + ","
          + S(g_rsGone) + "," + S(g_rsKeyMismatch) + "," + S(g_rsOpsDropped) + "," + S(g_rsLever) + "," + S(g_cageRescueSent) + ","
          + S((long long)g_restraint.size()) + "," + S(g_rsDropped)
-         + " restraintScan[passes,usLast,usMax]=" + S(g_rsScans) + "," + S(g_rsScanUsLast) + "," + S(g_rsScanUsMax);
+         + " restraintScan[passes,usLast,usMax]=" + S(g_rsScans) + "," + S(g_rsScanUsLast) + "," + S(g_rsScanUsMax)
+         + " freedIn[recv,replaced,full,blocked,raised,engineRefused,notRaised,lockShut,notOurs,gone,noFreer,notSender,waiting]="
+         + S(g_fdRecv) + "," + S(g_fdReplaced) + "," + S(g_fdFull) + "," + S(g_fdBlocked) + "," + S(g_fdRaised) + "," + S(g_fdEngineRefused) + ","
+         + S(g_fdNotRaised) + "," + S(g_fdLockShut) + "," + S(g_fdNotOurs) + "," + S(g_fdGone) + "," + S(g_fdNoFreer) + "," + S(g_fdNotSender) + ","
+         + S((long long)g_freedIn.size())
+         + FreedSendReportToken();
 }
 
-// P42 TEST-ONLY lever `locktest`:
-//   locktest read <uid>                         - one [LOCK] line: the character's shackles and cage lock here, and the word known
-//   locktest open|close <uid> shackles|cage     - the lock opened (locked cleared) / closed (locked set, broken cleared) at the safe
-//                                                 point, as a pick's result; on a copy that is a rescuer's pick (asked of the owner)
-//   locktest escape <uid>                       - our caged character is ordered GET_OUT_OF_CAGE_ESCAPE at the safe point
+
+/* P42 lever's `near` target (TEST-ONLY, MAIN THREAD): the nearest living character this game runs (its uid is this game's) that
+   sits in a cage (in-something 2) within kLockTestNearRadius of this game's player character (GetTarget), not that character
+   itself. Its uid, 0 none (*why says so in words); *out the character, *dist its distance. */
+const float kLockTestNearRadius = 300.0f;
+static unsigned int LockTestNearCaged(::Character** out, float* dist, std::string* why, int anyRunner, int shacklesOpen = 0)
+{
+    *out = 0; *dist = 0.0f;
+    ::Character* const pc = GetTarget();
+    Ogre::Vector3 at;
+    if (pc == 0 || !PlausibleObject(pc) || !SafeReadPosition(pc, &at)) { *why = "no player character with a readable position"; return 0; }
+    unsigned int best = 0;
+    float bd = 0.0f;
+    const float r2 = kLockTestNearRadius * kLockTestNearRadius;
+    for (int i = 0; i < MirrorCapacity(); ++i)
+    {
+        unsigned int u = 0;
+        ::Character* c = 0;
+        if (!MirrorSlot(i, &u, &c) || u == 0 || c == 0 || c == pc || (!anyRunner && !net::IsUidMine(u)) || !PlausibleObject(c)) continue;   /* anyRunner: a prisoner another game runs too */
+        if (PoseInSomethingPod(c) != 2 || StoreIsDeadPod(c) != 0) continue;   /* in a cage, and alive (unreadable counts as not) */
+        if (shacklesOpen)
+        {   /* nearopen: only a prisoner whose shackles read open here, so a release aims at the one an earlier open unlocked */
+            std::string sk, so; void* sl = 0; unsigned char sf = 0; int slv = 0;
+            if (RestraintRead(c, cooprison::kPrisonShackleLock, &sk, &so, &sl, &sf, &slv) != 1 || !cooprison::LockOpen(sf, slv)) continue;
+        }
+        Ogre::Vector3 v;
+        if (!SafeReadPosition(c, &v)) continue;
+        const float dx = v.x - at.x, dy = v.y - at.y, dz = v.z - at.z;
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > r2 || (best != 0 && d2 >= bd)) continue;
+        best = u; bd = d2; *out = c;
+    }
+    if (best == 0) { *why = (shacklesOpen ? "no living caged character with open shackles within " : anyRunner ? "no living caged character within " : "no living caged character this game runs within ") + S((long long)kLockTestNearRadius) + " units of the player character"; return 0; }
+    *dist = sqrtf(bd);
+    return best;
+}
+
+// P42 TEST-ONLY lever `locktest pick|release <pickerUid|me> <prisonerUid|near|nearopen>`, MAIN THREAD: checked now and queued for the safe
+// point, where LockTestPickRun checks again and gives the order. `me` = this game's player character (GetTarget, the character the
+// `near` form measures from); `near` = LockTestNearCaged's choice.
+static std::string LockTestPickCommand(int mode, unsigned int pickerUid, int pickerMe, unsigned int prisonerUid, int prisonerNear)
+{
+    const std::string m = (mode == cooprison::kLockTestPick) ? "pick" : "release";
+    const int task = cooprison::LockTestPickTask(mode);
+    ::Character* picker = 0;
+    std::string why, chosen;
+    if (pickerMe)
+    {
+        picker = GetTarget();
+        pickerUid = (picker != 0 && PlausibleObject(picker)) ? FindSpawnedUid(picker) : 0;
+        if (pickerUid == 0) why = "me: no player character with a uid on this game";
+    }
+    else picker = FindSpawned(pickerUid);
+    ::Character* prisoner = 0;
+    if (prisonerNear)
+    {
+        float d = 0.0f;
+        std::string nw;
+        prisonerUid = LockTestNearCaged(&prisoner, &d, &nw, 1, prisonerNear == 2 ? 1 : 0);
+        if (prisonerUid == 0) { if (why.empty()) why = "near: " + nw; }
+        else chosen = " near: dist=" + S((long long)(d + 0.5f)) + " (radius " + S((long long)kLockTestNearRadius) + ")";
+    }
+    else prisoner = FindSpawned(prisonerUid);
+    if (why.empty()) why = LockTestPickRefusal(picker, pickerUid, prisoner, prisonerUid);
+    const std::string who = "picker uid=" + S((long long)pickerUid) + " prisoner uid=" + S((long long)prisonerUid) + " task=" + S((long long)task);
+    if (!why.empty())
+    {
+        RestraintLog("locktest " + m + " REFUSED (" + why + "): " + who + " - TEST-ONLY lever P42");
+        return "error locktest " + m + ": " + why;
+    }
+    if (!RestraintQueue(prisonerUid, 0, mode == cooprison::kLockTestPick ? kRestraintOpLeverPick : kRestraintOpLeverRelease, 0, 0, std::string()))
+    {
+        RestraintLog("locktest " + m + " REFUSED (queue full): " + who + " - TEST-ONLY lever P42");
+        return "error locktest " + m + ": queue full";
+    }
+    g_restraintOps.back().by = pickerUid;
+    RestraintLog("locktest " + m + " queued for the safe point: " + who + chosen + " - TEST-ONLY lever P42");
+    return "ok locktest " + m + " queued: " + who + chosen;
+}
+
+// P42 TEST-ONLY lever `locktest` (the target is a typed uid, or `near`: the nearest living caged character this game runs within
+// kLockTestNearRadius = 300 units of this game's player character, named with its uid in the answer and the [LOCK] line):
+//   locktest read <uid|near>                         - one [LOCK] line: the character's shackles and cage lock here, and the word known
+//   locktest open|close <uid|near> shackles|cage     - the lock opened (locked cleared) / closed (locked set, broken cleared) at the
+//                                                      safe point, as a pick's result; on a copy that is a rescuer's pick (asked of the owner)
+//   locktest escape <uid|near>                       - our caged character is ordered GET_OUT_OF_CAGE_ESCAPE at the safe point
+//   locktest pick|release <pickerUid|me> <prisonerUid|near>
+//                                                    - our own character is given the engine's PICK_LOCK 76 / RELEASE_PRISONER 110
+//                                                      order on the caged character at the safe point (LockTestPickCommand)
 std::string LockTestCommand(const std::string& arg)
 {
     if (coop::GameWorldPtr() == 0) return "error locktest: no GameWorld";
     if (EngineWritesBlocked()) return "error locktest: engine writes are blocked (world loading or tearing down) - try again";
-    char mode[16]; mode[0] = 0;
-    char what[16]; what[0] = 0;
+    {
+        unsigned int pu = 0, qu = 0;
+        int pm = 0, qn = 0;
+        const int pickMode = cooprison::LockTestPickArgs(arg, &pu, &pm, &qu, &qn);
+        if (pickMode != 0) return LockTestPickCommand(pickMode, pu, pm, qu, qn);
+    }
     unsigned int uid = 0;
-    const int got = sscanf_s(arg.c_str(), "%15s %u %15s", mode, (unsigned)sizeof(mode), &uid, what, (unsigned)sizeof(what));
-    if (got < 2 || uid == 0) return "error locktest usage: read <uid> | open|close <uid> shackles|cage | escape <uid>";
+    int nearForm = 0;
+    unsigned char lockKind = 0;
+    const int mode = cooprison::LockTestArgs(arg, &uid, &nearForm, &lockKind);
+    if (mode == 0) return "error locktest usage: read <uid|near> | open|close <uid|near> shackles|cage | escape <uid|near> | pick|release <pickerUid|me> <prisonerUid|near>";
+    static const char* const kModeName[5] = { "?", "read", "open", "close", "escape" };
+    const std::string m(kModeName[mode]);
+    const char* const what = (lockKind == cooprison::kPrisonShackleLock) ? "shackles" : "cage";
+    std::string pick;   /* the near form's choice, in the answer and the [LOCK] line */
+    if (nearForm)
+    {
+        ::Character* nc = 0;
+        float d = 0.0f;
+        std::string why;
+        uid = LockTestNearCaged(&nc, &d, &why, 0);
+        if (uid == 0) { RestraintLog("locktest " + m + " near REFUSED (" + why + ")"); return "error locktest near: " + why; }
+        std::string nm;
+        if (!NameOf(nc, &nm)) nm = "?";
+        pick = " near: uid=" + S((long long)uid) + " name='" + nm + "' dist=" + S((long long)(d + 0.5f)) + " (radius "
+             + S((long long)kLockTestNearRadius) + ")";
+    }
     ::Character* c = FindSpawned(uid);
-    if (c == 0 || !PlausibleObject(c)) { RestraintLog("locktest " + std::string(mode) + " uid=" + S((long long)uid) + " REFUSED (not on this game)"); return "error locktest: not on this game"; }
-    const std::string m(mode);
+    if (c == 0 || !PlausibleObject(c)) { RestraintLog("locktest " + m + " uid=" + S((long long)uid) + " REFUSED (not on this game)"); return "error locktest: not on this game"; }
     if (m == "read")
     {
         std::string line = "locktest read uid=" + S((long long)uid) + " mine=" + S((long long)(net::IsUidMine(uid) ? 1 : 0))
@@ -13322,22 +14619,23 @@ std::string LockTestCommand(const std::string& arg)
             const RestraintSide* s = (it == g_restraint.end()) ? 0 : (k == 0 ? &it->second.sh : &it->second.cage);
             line += std::string(" word=") + ((s != 0 && s->word) ? "'" + s->wKey + "':" + LockBitsText(s->wFlags, s->wLevel) : std::string("none"));
         }
+        line += pick;
         RestraintLog(line);
         return "ok " + line;
     }
     if (m == "escape")
     {
         if (!RestraintQueue(uid, 0, kRestraintOpLeverEscape, 0, 0, std::string())) return "error locktest: queue full";
-        return "ok locktest escape queued";
+        if (!pick.empty()) RestraintLog("locktest escape uid=" + S((long long)uid) + " queued for the safe point -" + pick + " - TEST-ONLY lever P42");
+        return "ok locktest escape queued" + pick;
     }
-    if ((m == "open" || m == "close") && (std::string(what) == "shackles" || std::string(what) == "cage"))
+    if ((m == "open" || m == "close") && lockKind != 0)
     {
-        const unsigned char kind = (std::string(what) == "shackles") ? cooprison::kPrisonShackleLock : cooprison::kPrisonCageLock;
-        if (!RestraintQueue(uid, kind, m == "open" ? kRestraintOpLeverOpen : kRestraintOpLeverClose, 0, 0, std::string())) return "error locktest: queue full";
-        RestraintLog("locktest " + m + " uid=" + S((long long)uid) + " " + what + " queued for the safe point - TEST-ONLY lever P42");
-        return "ok locktest " + m + " queued";
+        if (!RestraintQueue(uid, lockKind, m == "open" ? kRestraintOpLeverOpen : kRestraintOpLeverClose, 0, 0, std::string())) return "error locktest: queue full";
+        RestraintLog("locktest " + m + " uid=" + S((long long)uid) + " " + what + " queued for the safe point" + pick + " - TEST-ONLY lever P42");
+        return "ok locktest " + m + " queued" + pick;
     }
-    return "error locktest usage: read <uid> | open|close <uid> shackles|cage | escape <uid>";
+    return "error locktest usage: read <uid|near> | open|close <uid|near> shackles|cage | escape <uid|near> | pick|release <pickerUid|me> <prisonerUid|near>";
 }
 
 void PrisonTick()
@@ -13420,6 +14718,9 @@ void PrisonWorldTeardown()
         if (op.bed) BedSendRefused(op.uid, op.peer, std::string(op.bedKey), false, "the world is being torn down");
         else if (op.own && op.on && !op.release) { ++g_prisonFailed; ++g_prisonOpsLoadRefused; PrisonSendRefused(op.uid, op.peer); }
     }
+    for (std::map<unsigned int, PutInHold>::const_iterator ph = g_putInHold.begin(); ph != g_putInHold.end(); ++ph)
+    { ++g_prisonFailed; ++g_putInHeldRefused; PrisonSendRefused(ph->first, ph->second.peer); }   /* T-1211 review fold 3: answered, as the ops above */
+    g_putInHold.clear();
     g_poseCaged.clear(); g_cageOutQueued.clear(); g_cageQueued.clear(); g_releaseHold.clear(); g_guardCaged.clear();
     g_outNoPardon.clear(); g_prisonIn.clear(); g_prisonReported.clear(); g_prisonReleaseIn.clear(); g_prisonReleaseFrom.clear(); g_prisonOps.clear(); g_bailPending.clear();
     g_bedAsk.clear(); g_bedCarriedAt.clear(); g_bedRefusedKey.clear(); g_bedIn.clear(); g_bedOutForCarry.clear();
@@ -13441,6 +14742,7 @@ std::string PrisonReportToken()
          + S(g_prisonNoSlot) + "," + S(g_prisonStillCarried) + "," + S(g_prisonFailed) + "," + S(g_prisonLocked) + ","
          + S((long long)g_prisonIn.size()) + "," + S(g_prisonSentenced) + "," + S(g_prisonSentenceFailed) + "," + S(g_prisonOpsDropped)
          + "," + S(g_prisonNoHand) + "," + S(g_poseCageInExec)
+         + " T-1211 putInHold[held,caged,refused,open]=" + S(g_putInHeld) + "," + S(g_putInHeldCaged) + "," + S(g_putInHeldRefused) + "," + S((long long)g_putInHold.size())
          + " arrest3[releaseSent,releaseSendFailed,releaseRecv,released,releaseNotCaged,releaseFailed,refusedSent,refusedRecv,refusedApplied,releaseHoldNow]="
          + S(g_prisonReleaseSent) + "," + S(g_prisonReleaseSendFailed) + "," + S(g_prisonReleaseRecv) + "," + S(g_prisonReleased)
          + "," + S(g_prisonReleaseNotCaged) + "," + S(g_prisonReleaseFailed) + "," + S(g_prisonRefusedSent) + ","
@@ -13646,7 +14948,7 @@ void ReportTask(unsigned int uid)
     Ogre::Vector3 p = c->worldPosition();
     DebugLog("[M1] tasks uid=" + S(uid) + " goal='" + ts->describeCurrentGoal() + "'"
              + " pos=" + F1(p.x) + "," + F1(p.y) + "," + F1(p.z)
-             + " hasOrders=" + S(ts->hasPendingOrders() ? 1 : 0) + OrderListWords(c) + TaskAnimWords(c));
+             + " hasOrders=" + S(ts->hasPendingOrders() ? 1 : 0) + OrderListWords(c) + JobTargetWords(uid, p.x, p.y, p.z) + TaskAnimWords(c));
 }
 
 /* The order system's three lists, read in place (POD, SEH-guarded). The order system is the AI's +0x20. Its ORDER QUEUE is the
@@ -13690,6 +14992,19 @@ std::string OrderListWords(::Character* c)
     for (int i = 0; i < typeN; ++i) t += (i != 0 ? "," : "") + S((long long)types[i]);
     return " orders[queued,pending]=" + S(queued) + "," + S((long long)pending) + " jobSwitch=" + S((long long)jobSwitch) + " standingJobs=" + S((long long)standing)
          + (standing > 0 ? " standingTaskTypes=" + t + (standing > typeN ? ",.." : "") : std::string());
+}
+/* T-1212: the three counts OrderListWords prints. 1 read, 0 not (no character, AI or order system, or a fault). MAIN THREAD. */
+int OrderListCounts(::Character* c, long long* queued, int* pending, int* standing)
+{
+    *queued = -1; *pending = -1; *standing = -1;
+    if (c == 0 || !PlausibleObject(c)) return 0;
+    void* ai = GetCharacterAI(c);
+    if (!PlausibleObject(ai)) return 0;
+    void* ts = *(void**)((char*)ai + 0x20);
+    if (!PlausibleObject(ts)) return 0;
+    int types[1];
+    int typeN = 0, jobSwitch = -1;
+    return OrderListsPod(ts, queued, pending, standing, types, 0, &typeN, &jobSwitch) != 0 ? 1 : 0;
 }
 
 /* P11: ReportTask's reads, handed back (capturetest's read-back). */
@@ -13855,7 +15170,7 @@ void* BuildingGetTown(void* building)
 }
 long long g_ctxSent = 0, g_ctxSendFailed = 0, g_ctxRecv = 0;
 // M-B / H026 - the apply side.
-struct PendingContext { std::string squadSid, townSid, platoonId; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; unsigned int peerLoadAgeMs; unsigned long recvMs; int peerSlot; int birth; int peerOrigin; };   /* birth: the squad's birth flag (squadbirth.h), -1 unknown; peerOrigin: where the sender's copy came from (sameidpair.h, kCopyUnknown unknown) */   /* peerLoadAgeMs: the age of the sender's current world load at send (squadorigin.h kLoadAgeUnknown unknown); recvMs: GetTickCount at receipt; peerSlot: the seat of the game it came from (-1 unknown) */
+struct PendingContext { std::string squadSid, townSid, platoonId, campKey; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; unsigned int peerLoadAgeMs; unsigned long recvMs; int peerSlot; int birth; int peerOrigin; };   /* birth: the squad's birth flag (squadbirth.h), -1 unknown; peerOrigin: where the sender's copy came from (sameidpair.h, kCopyUnknown unknown) */   /* peerLoadAgeMs: the age of the sender's current world load at send (squadorigin.h kLoadAgeUnknown unknown); recvMs: GetTickCount at receipt; peerSlot: the seat of the game it came from (-1 unknown) */
 std::map<unsigned int, PendingContext> g_pendingCtx;
 bool PendingCtxHasUid(unsigned int uid) { return g_pendingCtx.find(uid) != g_pendingCtx.end(); }   // M4 fold: AllocateUid's row check (declared above it, same namespace)
 std::map<std::string, void*> g_ctxPlatoons;   // key: id|<squad id>|<faction> (ctxkey.h, CtxIdKey); older senders: squadSid|hand index:serial|townSid -> Platoon*
@@ -13863,13 +15178,35 @@ std::map<std::string, int> g_ctxPlatoonSlot;  // the same key -> the slot of the
 long long g_twinAdopted = 0, g_twinLookupFailed = 0, g_twinPlaced = 0;   // H027
 double g_twinPlacedDist = 0.0;
 long long g_ctxApplied = 0, g_ctxApplyNoContext = 0, g_ctxApplyNoSquad = 0, g_ctxApplyNoFaction = 0, g_ctxPlatoonsCreated = 0, g_ctxPlatoonsReused = 0,
-          g_ctxPlatoonCreateFailed = 0, g_ctxMemberTypeSet = 0, g_ctxTownFromBuilding = 0, g_ctxTownFromSid = 0, g_ctxNoTown = 0;
+          g_ctxPlatoonCreateFailed = 0, g_ctxMemberTypeSet = 0, g_ctxTownFromBuilding = 0, g_ctxTownFromSid = 0, g_ctxNoTown = 0, g_ctxTownFromCampKey = 0, g_ctxCampKeyNotHere = 0;
 unsigned long long kSetSquadTypeRva = 0; static coop::AddrReg kSetSquadTypeRva_reg("SetSquadType", &kSetSquadTypeRva);   /* P8h: the address table fills this. Steam_1.0.65 0x9C35E0 */   // void Platoon::setSquadType(SquadType)
 unsigned long long kSetHomeTownRva = 0; static coop::AddrReg kSetHomeTownRva_reg("SetHomeTown", &kSetHomeTownRva);   /* P8h: the address table fills this. Steam_1.0.65 0x7EBD30 */   // void Ownerships::setHomeTown(TownBase*, SquadType)
 unsigned long long kSetHomeBuildingRva = 0; static coop::AddrReg kSetHomeBuildingRva_reg("SetHomeBuilding", &kSetHomeBuildingRva);   /* P8h: the address table fills this. Steam_1.0.65 0x7EBE40 */  // void Ownerships::setHomeBuilding(const hand&, SquadType)
 typedef void (*SetSquadTypeFn)(void* platoon, int st);
 typedef void (*SetHomeTownFn)(void* ownerships, void* town, int st);
 typedef void (*SetHomeBuildingFn)(void* ownerships, const hand& h, int st);
+/* T-929 part 6 - GROUPS OWED THEIR HOME CAMP (campgame.h CampHomeOwe): a copy built with a camp key whose camp is not built here (the key
+   map is empty until the first match; part 7 holds camps near the view back). Given its home town when that key's camp is BUILT or
+   matched here (camp.cpp CpRegSet -> CampHomeBuilt); an entry leaves when its group goes (ForgetContextPlatoon, or no longer the context
+   platoon of its key) or the world unloads (ForgetContextPlatoons). MAIN THREAD. */
+struct CtxCampOwed { std::string ctxKey, campKey; int st; };
+std::map<void*, CtxCampOwed> g_ctxCampOwed;
+long long g_ctxCampOwedAdded = 0, g_ctxCampOwedGiven = 0, g_ctxCampOwedGone = 0, g_ctxCampOwedFull = 0, g_ctxCampOwedFailed = 0, g_ctxCampKeyUnknownIn = 0, g_ctxCampBuildingDropped = 0;
+int SetHomeTownPod(void* platoon, void* town, int st)
+{
+    if (platoon == 0 || town == 0 || kSetHomeTownRva == 0) return 0;
+    __try { ((SetHomeTownFn)((uintptr_t)::GetModuleHandleA(0) + kSetHomeTownRva))((char*)platoon + 0x148, town, st); return 1; }   /* the embedded Ownerships, as ConfigurePlatoonPod */
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void CtxCampHomeOwe(void* platoon, const std::string& ctxKey, const std::string& campKey, int st, int homeWay, void* town)
+{
+    const int v = campg::CampHomeOwe(homeWay, town != 0 ? 1 : 0, (unsigned int)g_ctxCampOwed.size());
+    if (v == campg::kOweNo) return;
+    if (v == campg::kOweFull) { ++g_ctxCampOwedFull; if (g_ctxCampOwedFull <= 5) DebugLog("[CTX] campKey='" + campKey + "': the owed-home-camp list is full - the group stays without a home town here (campHomeFull=" + S(g_ctxCampOwedFull) + ")"); return; }
+    CtxCampOwed o; o.ctxKey = ctxKey; o.campKey = campKey; o.st = st;
+    g_ctxCampOwed[platoon] = o; ++g_ctxCampOwedAdded;
+    if (g_ctxCampOwedAdded <= 40) DebugLog("[CTX] platoon " + P(platoon) + " campKey='" + campKey + "': its camp is not built here - home town owed until it is built or matched (campHomeOwed=" + S((long long)g_ctxCampOwed.size()) + ", first 40 lines)");
+}
 /* T-1084: A SQUAD'S HOME BUILDING SET BY THE ENGINE MARKS ITS WORLD RECORD DUE. Ownerships::setHomeBuilding is hooked (InstallHomeWatch);
    the 28 bytes of the pot's home hand (+0x38) are copied before and after the engine's call, and only a change is noted
    (sqevent::HomeChanged; the engine fills only an empty home). The copies read the pot this call was handed, on the calling thread,
@@ -14414,6 +15751,7 @@ bool SendContextFor(unsigned int uid, ::Character* c)
     char sq[128], tn[128];
     std::string squadSid = ReadGameDataSid(squadGd, sq, 128) ? std::string(sq) : std::string();
     std::string townSid  = ReadObjectSid(town, tn, 128) ? std::string(tn) : std::string();
+    const std::string campKey = town != 0 ? coop::CampListKeyOfTown(town) : std::string();   /* T-929 part 6: a camp of the list is named by its key ("?": a camp this game names no key for) */
     float bx = 0, by = 0, bz = 0;
     void* bld = ResolveBuilding(hraw);
     if (bld == 0 || !ObjectPosition(bld, &bx, &by, &bz)) { bx = by = bz = 0.0f; }
@@ -14428,10 +15766,10 @@ bool SendContextFor(unsigned int uid, ::Character* c)
     /* where this game's copy came from, read from its own state (built from the record, from the save, or running here): a receiver's
        copy from a record or a save gives way to a running one (sameidpair.h YieldOrder) */
     const int copyOrigin = (PlausibleObject(platoon) && !platoonId.empty()) ? coop::StorePlatoonOwnCopyOrigin(platoon, platoonId) : sameid::kCopyUnknown;
-    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs, birthWire, sameid::WireOfOrigin(copyOrigin))) { ++g_ctxSendFailed; return false; }
+    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs, birthWire, sameid::WireOfOrigin(copyOrigin), campKey)) { ++g_ctxSendFailed; return false; }
     ++g_ctxSent;
     SW_QUIETLOG(g_qCtxSent, "[CTX] ->", 0, 0, "[CTX] -> uid=" + std::string(S(uid)) + " squad='" + squadSid + "' squadType=" + S(squadType) + " town='" + townSid
-             + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType) + " loadAgeMs=" + (loadAgeMs == sqorigin::kLoadAgeUnknown ? std::string("unknown") : S((long long)loadAgeMs)) + " origin=" + sameid::OriginWord(copyOrigin));
+             + "' campKey='" + campKey + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType) + " loadAgeMs=" + (loadAgeMs == sqorigin::kLoadAgeUnknown ? std::string("unknown") : S((long long)loadAgeMs)) + " origin=" + sameid::OriginWord(copyOrigin));
     return true;
 }
 
@@ -14580,12 +15918,16 @@ void WorldRosterFull(int page)
 
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth, unsigned int peerOriginWire)
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth, unsigned int peerOriginWire, const std::string& campKey)
 {
     ::Character* twin = RawHandIsEmpty(charRaw32) ? 0 : SafeHandToCharacter(LocalHandFromRaw(charRaw32));   // H027
     ++g_ctxRecv;
     int how = 0;
-    void* town = ResolveTown(townSid, &how);
+    /* T-929 part 6: a home camp of the list by its key (this game's own camp of it); the "camp, key unknown" marker: none; else the town
+       by its sid */
+    const int homeWay = campg::CampHomeWay(campKey.empty() ? 0 : 1, campKey == campg::kCampKeyUnknown ? 1 : 0, townSid.empty() ? 0 : 1);
+    void* town = homeWay == campg::kHomeByCampKey ? coop::CampTownOfListKey(campKey) : homeWay == campg::kHomeCampUnknown ? 0 : ResolveTown(townSid, &how);
+    if (!campKey.empty()) how = 3;
     if (town) ++g_ctxTownOk; else if (!townSid.empty()) ++g_ctxTownMiss;
     void* bld = (bx != 0.0f || bz != 0.0f) ? ResolveBuilding(handRaw32) : 0;
     float rx = 0, ry = 0, rz = 0; float delta = -1.0f;
@@ -14597,13 +15939,13 @@ void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squad
     static unsigned int s_verdictContextLines = 0;   /* T-910: the release build's first 10 */
     SW_FIRSTLOG(s_verdictContextLines, 10, "[VERDICT] {" + q + "ev" + q + ":" + q + "context" + q
              + "," + q + "uid" + q + ":" + S(uid)
-             + "," + q + "townSid" + q + ":" + q + townSid + q + "," + q + "townResolved" + q + ":" + (town ? "1" : "0") + "," + q + "townHow" + q + ":" + S(how)
+             + "," + q + "townSid" + q + ":" + q + townSid + q + "," + q + "campKey" + q + ":" + q + campKey + q + "," + q + "townResolved" + q + ":" + (town ? "1" : "0") + "," + q + "townHow" + q + ":" + S(how)
              + "," + q + "buildingSent" + q + ":" + ((bx != 0.0f || bz != 0.0f) ? "1" : "0") + "," + q + "buildingResolved" + q + ":" + (bld ? "1" : "0")
              + "," + q + "buildingPosDelta" + q + ":" + F1(delta)
              + "," + q + "squadSid" + q + ":" + q + squadSid + q + "," + q + "squadFound" + q + ":" + (squadGd ? "1" : "0")
              + "," + q + "squadType" + q + ":" + S(squadType) + "," + q + "memberType" + q + ":" + S(memberType)
              + "," + q + "twinLocal" + q + ":" + (PlausibleObject(twin) ? "1" : "0") + "}");
-    PendingContext pc; pc.squadSid = squadSid; pc.townSid = townSid; pc.platoonId = platoonId; pc.squadType = squadType; pc.memberType = memberType;
+    PendingContext pc; pc.squadSid = squadSid; pc.townSid = townSid; pc.campKey = campKey; pc.platoonId = platoonId; pc.squadType = squadType; pc.memberType = memberType;
     std::memcpy(pc.hand, handRaw32, 32); std::memcpy(pc.chand, charRaw32, 32); pc.bx = bx; pc.by = by; pc.bz = bz; pc.peerLoadAgeMs = peerLoadAgeMs; pc.recvMs = ::GetTickCount(); pc.peerSlot = senderSlot; pc.birth = birth; pc.peerOrigin = sameid::OriginOfWire(peerOriginWire);
     g_pendingCtx[uid] = pc;
     /* T-1 B1 restructure (protocol 85): CONTEXT's member type is no longer read as the squad leader - MSG_SQUAD_LEAD carries it (handoff.cpp ApplyRemoteSquadLead). */
@@ -14673,9 +16015,30 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
     if (!PlausibleObject(faction)) { ++g_ctxApplyNoFaction; return false; }
     const bool haveBuilding = (pc.bx != 0.0f || pc.bz != 0.0f);
     void* building = haveBuilding ? ResolveBuilding(pc.hand) : 0;
-    void* town = BuildingGetTown(building);
-    if (town) ++g_ctxTownFromBuilding;
-    else { int how = 0; town = ResolveTown(pc.townSid, &how); if (town) ++g_ctxTownFromSid; else ++g_ctxNoTown; }
+    void* town = 0;
+    const int homeWay = campg::CampHomeWay(pc.campKey.empty() ? 0 : 1, pc.campKey == campg::kCampKeyUnknown ? 1 : 0, pc.townSid.empty() ? 0 : 1);
+    const unsigned char* noteHand = pc.hand;   /* the handle the owed-home note keeps (none on the key path once its building is dropped) */
+    static const unsigned char kNoHand[32] = { 0 };
+    if (homeWay == campg::kHomeByCampKey || homeWay == campg::kHomeCampUnknown)
+    {   /* T-929 part 6: the camp of that key on this game - never the first camp of its kind; none while it is not built here (owed below,
+           given when it is built or matched here: CampHomeBuilt); the sender's "camp, key unknown" marker: none, and none owed. The home
+           building only when the engine's own town of it is that camp (campgame.h CampHomeBuildingKept), else none - the owed-home check
+           then gives it by its position key, never by the sent handle */
+        town = homeWay == campg::kHomeByCampKey ? coop::CampTownOfListKey(pc.campKey) : 0;
+        if (homeWay == campg::kHomeCampUnknown) { ++g_ctxCampKeyUnknownIn; ++g_ctxNoTown; }
+        else if (town) ++g_ctxTownFromCampKey; else { ++g_ctxCampKeyNotHere; ++g_ctxNoTown; }
+        if (!campg::CampHomeBuildingKept(1, building != 0 ? 1 : 0, (town != 0 && BuildingGetTown(building) == town) ? 1 : 0))
+        {
+            if (building != 0 && ++g_ctxCampBuildingDropped <= 20) { DebugLog("[CTX] campKey='" + pc.campKey + "': the building the sent handle names here is not in that camp - not used (campBldDropped=" + S(g_ctxCampBuildingDropped) + ", first 20 lines)"); }
+            building = 0; noteHand = kNoHand;
+        }
+    }
+    else
+    {
+        town = BuildingGetTown(building);
+        if (town) ++g_ctxTownFromBuilding;
+        else { int how = 0; town = ResolveTown(pc.townSid, &how); if (town) ++g_ctxTownFromSid; else ++g_ctxNoTown; }
+    }
     const unsigned int* hw = (const unsigned int*)pc.hand;   // vtbl(8) type(4) container(4) containerStamp(4) index(4) serial(4)
     // P1: one local platoon per announced squad id AND faction when the id is known (older senders: the M-B template|building|town key)
     const std::string key = !pc.platoonId.empty() ? CtxIdKey(faction, pc.platoonId)
@@ -14888,7 +16251,7 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
         else if (DestroyPlatoonPod(oldF, old) == 1) { ++g_ctxSupersededAsleep; DebugLog("[CTX] platoon " + P(old) + " key='" + key + "' was ASLEEP here (the peer took the squad over) - destroyed, superseded by the live announcement (P1b)"); }
         else { ++g_ctxSupersedeFailed; ErrorLog("[CTX] platoon " + P(old) + " key='" + key + "' asleep - removeSquad FAULTED; creating a fresh one anyway"); }
     }
-    if (pit != g_ctxPlatoons.end() && PlausibleObject(pit->second)) { platoon = pit->second; ++g_ctxPlatoonsReused; g_ctxPlatoonSlot[key] = net::OwnerSlotOf(uid); }
+    if (pit != g_ctxPlatoons.end() && PlausibleObject(pit->second)) { platoon = pit->second; ++g_ctxPlatoonsReused; g_ctxPlatoonSlot[key] = net::OwnerSlotOf(uid); StoreCtxSleptForget(platoon); }   /* T-1229 fold 1: the other game runs the squad again - a take-back answer from its last sleep here must not adopt a later rebuilt body */
     else
     {
         platoon = faction->spawnEmptySquad(squadGd, false, pos);
@@ -14904,7 +16267,8 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
         if (IsStandInFaction(faction) || IsPlayerFaction(faction)) CopySquadIdCheck(faction, platoon, engineId, &copyId, "context");
         if (!pc.platoonId.empty() && !IsPlayerFaction(faction) && !IsPeerFaction(faction)) CarryPeerPlatoonId(faction, platoon, pc.platoonId);   /* inv7e: before the bind, so the clash test sees only OTHER squads */
         if (!pc.platoonId.empty()) StoreBindPlatoon(platoon, pc.platoonId, pc.birth);   // P1: world id + the kept byte its birth flag says
-        StoreNoteCopyHome(platoon, pc.platoonId, pc.hand, haveBuilding ? 1 : 0, building != 0 ? 1 : 0);   /* a building sent that is not loaded here: the copy's home is owed and given by the store's once-a-second owed-home check once that building is loaded [t755-copyhome-call] */
+        StoreNoteCopyHome(platoon, pc.platoonId, noteHand, haveBuilding ? 1 : 0, building != 0 ? 1 : 0);   /* a building sent that is not loaded here: the copy's home is owed and given by the store's once-a-second owed-home check once that building is loaded [t755-copyhome-call] */
+        CtxCampHomeOwe(platoon, key, pc.campKey, pc.squadType, homeWay, town);   /* T-929: a home camp not built here - its town owed */
         if (homePH != 0)
         {
             ++g_ctxHomePlayerHouse;
@@ -15030,6 +16394,32 @@ namespace coop {
 void ForgetContextPlatoon(void* platoon)   // review-p3o H1: a single platoon freed through Faction::removeSquad
 {
     for (std::map<std::string, void*>::iterator it = g_ctxPlatoons.begin(); it != g_ctxPlatoons.end(); ) { if (it->second == platoon) { g_ctxPlatoonSlot.erase(it->first); g_ctxPlatoons.erase(it++); } else ++it; }
+    if (g_ctxCampOwed.erase(platoon) != 0) ++g_ctxCampOwedGone;   /* T-929: its owed home camp goes with it (the address can be reused) */
+}
+/* T-929 part 6: the camp of list key `campKey` is now this game's `town` (BUILT, or named by a match): each group owed that camp gets it
+   as its home town, when it is still the context platoon of its key. MAIN THREAD (camp.cpp CpRegSet). */
+void CampHomeBuilt(const std::string& campKey, void* town)
+{
+    if (g_ctxCampOwed.empty() || town == 0 || campKey.empty()) return;
+    for (std::map<void*, CtxCampOwed>::iterator it = g_ctxCampOwed.begin(); it != g_ctxCampOwed.end(); )
+    {
+        if (it->second.campKey != campKey) { ++it; continue; }
+        void* const p = it->first;
+        const std::map<std::string, void*>::const_iterator c = g_ctxPlatoons.find(it->second.ctxKey);
+        if (c == g_ctxPlatoons.end() || c->second != p || !PlausibleObject(p)) { ++g_ctxCampOwedGone; g_ctxCampOwed.erase(it++); continue; }
+        const int ok = SetHomeTownPod(p, town, it->second.st);
+        if (ok) ++g_ctxCampOwedGiven; else ++g_ctxCampOwedFailed;
+        if (g_ctxCampOwedGiven + g_ctxCampOwedFailed <= 40)
+            DebugLog("[CTX] platoon " + P(p) + " campKey='" + campKey + "': home town " + (ok ? "given now that its camp is built or matched here" : "NOT given - the engine call faulted")
+                     + " (campHomeGiven=" + S(g_ctxCampOwedGiven) + " campHomeFailed=" + S(g_ctxCampOwedFailed) + ", first 40 lines)");
+        g_ctxCampOwed.erase(it++);
+    }
+}
+/* the owed-home-camp counts for the camps[...] REPORT token */
+std::string CtxCampHomeToken()
+{
+    return " campHomeOwed=" + S((long long)g_ctxCampOwed.size()) + "/" + S(g_ctxCampOwedAdded) + " campHomeGiven=" + S(g_ctxCampOwedGiven) + " campHomeGone=" + S(g_ctxCampOwedGone)
+           + " campHomeFull=" + S(g_ctxCampOwedFull) + " campHomeFailed=" + S(g_ctxCampOwedFailed) + " campKeyUnknownIn=" + S(g_ctxCampKeyUnknownIn) + " campBldDropped=" + S(g_ctxCampBuildingDropped);
 }
 /* recruit1 fold (review-recruit1 2a): the context map and the store bind hold the Platoon; getSquad() answers the
    ActivePlatoon at Platoon+0x1D8. The Platoon of this map whose +0x1D8 is `active`, or 0 when the map holds none. */
@@ -15067,6 +16457,7 @@ void ForgetContextPlatoons()
 {
     const size_t n = g_ctxPlatoons.size();
     g_ctxPlatoons.clear(); g_ctxPlatoonSlot.clear(); g_ctxAwakeSameIdSeen.clear();
+    g_ctxCampOwedGone += (long long)g_ctxCampOwed.size(); g_ctxCampOwed.clear();   /* T-929: the owed home camps are world state */
     DebugLog("[CTX] world teardown: forgot " + S((long long)n) + " context platoons");
 }
 
@@ -15206,6 +16597,7 @@ void SpawnWorldTeardown()
     g_spawned.clear();
     TagsWorldTeardown();   // tags1: every label is destroyed on the next main-thread tick
     coop::LimbsWorldTeardown();   // LIMBS: recorded limb blocks and per-limb marks name this world's copies
+    PoseToolWorldTeardown();      // T-890 WORK TOOL: the tool records name this world's copies (no item is touched)
     MedicalForgetAllCopies();   // the owner's medical words per copy: every copy of this world is gone
     DeadlookForgetAllCopies();  // the per-copy look marks (first look taken, dead-copy holds, createBody guard) go with them
     g_knockHold.clear();        // and the knockdowns held for those copies' looks
@@ -15608,17 +17000,36 @@ void* FirstSelectedCharacter()
     void* sel[1] = { 0 };
     return P140SelectionPod(pi, sel, 1) == 1 ? sel[0] : 0;
 }
+/* T-1135 (the PLAYERS tab's GIVE button): every character of the player's selection, as 0x7F9280 walks them (P140SelectionPod), up to
+   `cap`; the PlayerInterface read at GameWorld+0x580 as FirstSelectedCharacter reads it. -1 = no world or a read faulted. MAIN THREAD. */
+int SelectedCharacters(void** out, int cap)
+{
+    if (out == 0 || cap <= 0) return 0;
+    void* pi = 0;
+    __try
+    {
+        void* gw = (void*)GameWorldPtr();
+        if (gw == 0) return -1;
+        pi = *(void**)((char*)gw + 0x580);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    if (pi == 0) return -1;
+    return P140SelectionPod(pi, out, cap);
+}
 /* TEST-ONLY `renametest <name> [uid]` (command_channel): the loaded character <uid> (the last word, when it is a number 1..4294967295;
+   T-1228: or the word `bought` - the newest uid a T478 buy's BOUGHT confirm put in this game's player faction, hire.cpp HireLastBoughtUid;
    so a name whose last word is a number needs the uid after it) or, with none, the first selected character - when it is this
    game's own - renamed through
    Character::setName's hooked entry (NameSetOwn) - the setter the name sync hooks: detour_setName marks the uid, NameTick sends
    MSG_NAME, and the other games run NameApplyToCopy (which rebuilds their name tags). One [NAME] line. MAIN THREAD. */
+unsigned int HireLastBoughtUid();   /* hire.cpp (namespace coop, as here) */
 std::string RenameTestCommand(const std::string& arg)
 {
     std::string name = arg;
     while (!name.empty() && (name[0] == ' ' || name[0] == '\t')) name.erase(0, 1);
     while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t' || name[name.size() - 1] == '\r')) name.erase(name.size() - 1);
     unsigned int want = 0;   /* the optional last word: the character's uid */
+    bool bought = false;     /* T-1228: the last word `bought` = the newest animal or slave a T478 buy put in this game's player faction */
     const size_t sp = name.find_last_of(" \t");
     if (sp != std::string::npos)
     {
@@ -15631,6 +17042,19 @@ std::string RenameTestCommand(const std::string& arg)
             want = (unsigned int)v;
             name.erase(sp);
             while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t')) name.erase(name.size() - 1);
+        }
+        else if (w == "bought")
+        {
+            bought = true;
+            want = HireLastBoughtUid();
+            name.erase(sp);
+            while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t')) name.erase(name.size() - 1);
+            if (want == 0)
+            {
+                const std::string r = "error renametest bought: no T478 buy put a character in this game's player faction this session";
+                DebugLog("[NAME] " + r);
+                return r;
+            }
         }
     }
     bool clean = !name.empty() && name.size() <= (size_t)coopname::kNameMax;
@@ -15660,7 +17084,7 @@ std::string RenameTestCommand(const std::string& arg)
     }
     std::string now;
     if (!NameOf(c, &now)) now = "?";
-    const std::string r = "ok renametest uid=" + S((long long)uid) + " name=" + now + " was=" + was;
+    const std::string r = "ok renametest uid=" + S((long long)uid) + " name=" + now + " was=" + was + (bought ? " (bought: the newest T478 buy)" : "");
     DebugLog("[NAME] " + r);
     return r;
 }
@@ -15978,5 +17402,97 @@ std::string HandleSkewLever(unsigned int uid, bool refuse)
                              + " - the next liveness check of the copy meets a handle that is not the stored one";
     DebugLog(line);
     return line;
+}
+// T-478 step 3 review fold: spawn.h's names for the bail row check (the helpers live beside the bail confirm, above)
+bool BailRowFreeableHere(unsigned int uid) { return BailRowFreeableLocal(uid); }
+int BailRowsLeftOutNear(float x, float z, int* found, unsigned int* first) { return BailRowsLeftOutNearLocal(x, z, found, first); }
+// T-478 step 5: spawn.h's names for the selling window (the confirm and its state live beside the bail confirm, above)
+int SellConfirmHookState()
+{
+    if (g_sellHook != 1) return g_sellHook;
+    if (kTradingWindowRva == 0) return -3;
+    int ok = 0;
+    (void)SellTradingWindowNow(&ok);
+    return ok ? 1 : -4;   /* re-check fold: the current-window global must read before a window is opened */
+}
+int SellWindowBind(void* npc)
+{
+    int winOk = 0, handlerOk = 1, buyerOk = 1;
+    void* const win = SellTradingWindowNow(&winOk);
+    void* handler = 0;
+    if (winOk && win != 0) handler = SellReadPtrPod((const char*)win + 0xD0, &handlerOk);   /* CharacterTradingWindow +0xD0: its handler (725ca0:8-15) */
+    void* buyer = 0;
+    if (winOk && win != 0 && handlerOk && handler != 0) buyer = SellReadPtrPod((const char*)handler + 8, &buyerOk);
+    const int b = cooptalk::TalkSellBindOutcome(winOk, (unsigned long long)(uintptr_t)win, handlerOk, (unsigned long long)(uintptr_t)handler, buyerOk,
+                                                (unsigned long long)(uintptr_t)buyer, (unsigned long long)(uintptr_t)npc, (unsigned long long)(uintptr_t)g_sellArm.npc);
+    if (b == cooptalk::kTalkSellBindTied) { g_sellArm.win = win; g_sellArm.handler = handler; g_sellArm.refusing = 0; return b; }
+    ++g_sellUnbound;
+    if (b == cooptalk::kTalkSellBindNoWindow) { std::memset(&g_sellArm, 0, sizeof(g_sellArm)); return b; }
+    g_sellArm.win = winOk ? win : 0; g_sellArm.handler = 0; g_sellArm.refusing = 1;   /* UNTIED: every confirm of that window is refused */
+    return b;
+}
+void SellWindowArm(void* npc, unsigned int npcUid, unsigned int sellerUid, const unsigned int* rows, int n)
+{
+    std::memset(&g_sellArm, 0, sizeof(g_sellArm));
+    g_sellArm.npc = npc; g_sellArm.npcUid = npcUid; g_sellArm.sellerUid = sellerUid;
+    for (int i = 0; i < n && i < kSellRowsCap; ++i) g_sellArm.rows[g_sellArm.n++] = rows[i];
+}
+void SellWindowDisarm() { std::memset(&g_sellArm, 0, sizeof(g_sellArm)); }
+/* T-478 step 5 (T2017): the bound window's buyer and row prices, as its refresh (0x727690) reads them. No C++ object (C2712).
+   1 read; -1 faulted. */
+int SellRowsPod(const void* handler, void** buyer, int* prices, int cap, int* nRead, long long* total)
+{
+    *buyer = 0; *nRead = 0; *total = 0;
+    __try
+    {
+        const char* const h = (const char*)handler;
+        *buyer = (*(const unsigned char*)(h + 0x18) == 0) ? *(void* const*)(h + 0x8) : *(void* const*)(h + 0x10);
+        const char* const rows = *(const char* const*)(h + 0x20);
+        const unsigned long long n = *(const unsigned long long*)(h + 0x28);
+        *total = (n > 0x7FFFFFFFull) ? -1 : (long long)n;
+        for (unsigned long long i = 0; rows != 0 && i < n && *nRead < cap; ++i) prices[(*nRead)++] = *(const int*)(rows + i * 0x68 + 0x20);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int SellWindowMoneyRead(void* npc, int* money, int* cheapest, long long* rows, int* buyerIsSlaver)
+{
+    *money = -1; *cheapest = -1; *rows = -1; *buyerIsSlaver = -1;
+    void* own = 0; int cats = 0;
+    const int have = (npc != 0 && KeeperPot(npc, &own, &cats) == 1) ? 1 : 0;
+    if (have != 0) *money = cats;
+    if (g_sellArm.handler != 0 && g_sellArm.npc == npc && g_sellArm.refusing == 0)
+    {
+        void* buyer = 0; int prices[kSellRowsCap]; int n = 0; long long total = 0;
+        if (SellRowsPod(g_sellArm.handler, &buyer, prices, kSellRowsCap, &n, &total) == 1)
+        {
+            *rows = total;
+            *buyerIsSlaver = (buyer == npc) ? 1 : 0;
+            *cheapest = cooptalk::TalkSellCheapest(prices, n);
+        }
+    }
+    return have;
+}
+int SellRowsNotOwnNear(::Character* own, float x, float z, unsigned int* listed, int cap, int* nListed, unsigned int* firstOut)
+{
+    *nListed = 0;
+    if (own == 0) return -1;
+    SquadView sv;
+    if (ReadSquadOf(own, &sv) != 1 || sv.stored < sv.count) return -1;
+    const float r2 = cooptalk::kTalkSellRowNearUnits * cooptalk::kTalkSellRowNearUnits;
+    int notOwn = 0;
+    for (int i = 0; i < sv.stored; ++i)
+    {
+        ::Character* const m = sv.members[i];
+        if (m == 0 || !PlausibleObject(m)) continue;
+        const Ogre::Vector3 pos = m->worldPosition();
+        const float dx = pos.x - x, dz = pos.z - z;
+        if (dx * dx + dz * dz > r2) continue;
+        const unsigned int uid = FindSpawnedUid(m);
+        if (uid != 0 && net::IsUidMine(uid)) { if (*nListed < cap) listed[(*nListed)++] = uid; continue; }
+        if (notOwn == 0 && firstOut != 0) *firstOut = uid;
+        ++notOwn;
+    }
+    return notOwn;
 }
 }   /* namespace coop */

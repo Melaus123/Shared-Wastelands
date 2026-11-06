@@ -259,18 +259,18 @@ inline int ModsHelloDecidePolicy(int listKnown, int haveRecord, int isOperator, 
     if (v == kModsHelloRefuseUnreadable) return isOperator ? kModsHelloOperatorUnreadable : kModsHelloAdmitUnreadable;   /* T-246 fold (owner 201); fold 2: the host is never shown the notice */
     return v;
 }
-/* T-246 fold (review item 8): the notebook's verdict when it may not know its operator yet. With no operator named (no --owner,
-   no owner.txt) the first game to talk after its WELCOME becomes the operator and its list replaces mods.txt
-   (AppointFirstOperator) - so under the warn policy a game joining then is not warned against the old list: a readable list
-   is PROVISIONAL (re-checked when the operator's list is written) and an unreadable one is let in unchecked. The refuse
-   policy is untouched (T-247). */
-inline int ModsHelloDecideWorld(int listKnown, int haveRecord, int isOperator, int sameAsRecord, int policy, int operatorKnown)
+/* T-1158 step 7b (owner 1369 b): WHO WRITES THE WORLD'S LIST. The world's saved mods.txt decides; with none saved, the first game's
+   readable list is saved; a game that proved the owner password at its door has its list written over the saved one (the owner's
+   mods are the world's). A player id never decides it. */
+inline int ModsHelloDecideWorld(int listKnown, int haveRecord, int isOwner, int sameAsRecord, int policy)
 {
-    const int v = ModsHelloDecidePolicy(listKnown, haveRecord, isOperator, sameAsRecord, policy);
-    if (operatorKnown || policy != kModsMismatchWarn) return v;
-    if (v == kModsHelloAdmitDiffers) return kModsHelloProvisional;
-    if (v == kModsHelloAdmitUnreadable) return kModsHelloAdmitUnchecked;
-    return v;
+    return ModsHelloDecidePolicy(listKnown, haveRecord, (isOwner || !haveRecord) ? 1 : 0, sameAsRecord, policy);
+}
+/* the owner logging in after its HELLO (/login with the owner password): 1 = the list its greeting carried is written over the
+   saved one, and the games already in are re-checked against it as after every write */
+inline int ModsOwnerLoginWrites(int listKnown, int haveRecord, int sameAsRecord)
+{
+    return (listKnown && (!haveRecord || !sameAsRecord)) ? 1 : 0;
 }
 /* T-246 fold (review item 7): the "differs, let in" line and modsAdmittedDiffers count only a game actually admitted (after
    the lobby, the profile pick and the lifetime limit). */

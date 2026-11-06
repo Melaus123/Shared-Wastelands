@@ -42,6 +42,7 @@
 #include "../../common/crimewire.h"  /* crime3: the MSG_CRIME payload */
 #include "../../common/bountywire.h" /* crime5: the MSG_BOUNTY payload */
 #include "../../common/prisonwire.h" /* arrest2: the MSG_PRISON payload */
+#include "../../common/givewire.h" /* T-1135: the give kinds that ride MSG_HIRE */
 #include "../../common/treatwire.h"  /* heal1: the MSG_TREAT payload */
 #include "../../common/insidewire.h"   /* P25 fold 2: the MSG_INSIDE payload */
 #include "../../common/namewire.h"   /* names1: the MSG_NAME payload */
@@ -51,6 +52,8 @@
 #include "../../common/blockpick.h"   /* T-1101 step 5: the MSG_BLOCK_PICK payload */
 #include "../../common/shotgate.h"   /* the MSG_SHOT_FIRED payload */
 #include "../../common/handwire.h"   /* the MSG_HAND payload */
+#include "../../common/boxrec.h"   /* T-1061: BOX_LOCK and its game-to-game protocol */
+#include "../../common/bookshare.h"   /* T-1242: RESEARCH_BOOK and its game-to-game protocol */
 #include "../../common/hitwire.h"   /* T-1101: the decided blow on HIT, the attack move on SWING */
 #include "../../common/fightchoice.h"   /* T-1101 design (c): the MSG_FIGHT_CHOICE payload */
 #include "../../common/squadbirth.h"   /* CONTEXT's birth word */
@@ -185,7 +188,9 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 187;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 213;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02). 195 (T-1205): STATE's latch bits 21-22 (god mode) and a "whole" limb now grows a copy's lost limb back (194 is taken by unmerged effort/t858a). 197 (T-858, main): END's unrun list and reason TALKER_CLOSED. 199 (T-478 step 3; 198 is taken by unmerged effort/t1214a, t930a, t947a): END carries the line id after endsType (before T-858's optional unrun list), and endsType 43 BAIL makes the talker's game open its own bail window. 201 (merge of T-930 / T-947 with main's 199; 200 is held by unmerged effort/t1122a): T-930: the new MAP_DOTS inner type 206 - teammates' characters on the world map, src/common/mapdots.h (196 and 197 are held by unmerged effort/t478b and effort/t858a). 203 (T-1214 design D1; 200-202 are taken by unmerged effort/t1122a, t947a, t478c; 201 then by main's T-930 / T-947): ITEM_MOVE op 0 carries the SPT1 building item spot block, and a game that is not the area's ground holder withholds its spot roll and gives the holder's item to the spot. 204 (T-23; 202 / 203 held by other efforts): a piece placed in a teammate's outpost or house travels in its piece record (a hand-over seed naming the owner) - the hand-over PLACE and HAND_ACK are gone - and help work goes to the piece's writer (the owner while its game has the area loaded, else the area's holder). 207 (T-1061; 205 is retired, 206 is held by another effort): BOX_LOCK (85) - a chest's pick asked of the box's writer, or its NO; a box record may carry its lock block (world-server protocol 145). 208 (T-478 step 5): END endsType 41 SELL SLAVES carries its line id and makes the talker's game open its own selling window (an older talker's game would read 41 as no window and close the talk silently). 211 (T-1242; 209 / 210 are held by effort/t478e / effort/t1122a): RESEARCH_BOOK (88) - a research's Books in a teammate's bench asked of that teammate's game, its answer, give back and done (src/common/bookshare.h). 209 (T-478 step 6): END endsType 42 BUY SLAVES / 48 BUY ANIMALS carries its line id and makes the buyer's game open its own buying window, and MSG_HIRE carries join types 42 / 48 (the buying confirm asks each row's owner game; an older game refuses those join types as a bad field). 213 (merge of T-478 step 6 (209) with main's T-1242 (211); 212 is held by effort/t1122a): both sides' wire changes */
+typedef char BoxLockProtocolAgrees[(kProtocolVersion >= coopbrec::kGameProtocolBoxLock) ? 1 : -1];   /* T-1061: BOX_LOCK */
+typedef char ResearchBookProtocolAgrees[(kProtocolVersion >= bookshare::kGameProtocolBooks && (unsigned int)MSG_RESEARCH_BOOK == bookshare::kMsgResearchBook) ? 1 : -1];   /* T-1242 */
 typedef char PieceFeedProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolRecordFeed) ? 1 : -1];   /* PLACE / STATE / REMOVE / ROSTER_REQUEST are no longer sent */
 typedef char PieceLiveBarProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveBar) ? 1 : -1];   /* T-1047 step 2b (175): a player's power piece's production bar and work state ride its record's LIVE part - no MINE_STATE for it */
 typedef char PieceLiveProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveRecord) ? 1 : -1];   /* a player's power piece: no POWER_STATE, its record's LIVE part */
@@ -692,19 +697,21 @@ void OnSwing(const Message& m)
 }
 
 // SWING_END (hitwire.h): the owner's swing of uid ended on its game; the copy here drops the swing credit it did not spend in
-// time (combat.cpp ApplyRemoteSwingEnd). Refused whole when it does not decode. A relayed one passes SWING's relayed-owner gate
-// (liverelay.h CharStreamNeedsOwnerGate); ApplyRemoteSwingEnd refuses a uid this game runs.
+// time, and the end word (what the swing met there) sets the copy's pause after its own swing (combat.cpp ApplyRemoteSwingEnd).
+// Refused whole when it does not decode. A relayed one passes SWING's relayed-owner gate (liverelay.h CharStreamNeedsOwnerGate);
+// ApplyRemoteSwingEnd refuses a uid this game runs.
 void OnSwingEnd(const Message& m)
 {
     unsigned int uid = 0, targetUid = 0;
-    const int dc = hitwire::DecodeSwingEnd(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &uid, &targetUid);
+    unsigned char end = hitwire::kSwingEndUnknown;
+    const int dc = hitwire::DecodeSwingEnd(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &uid, &targetUid, &end);
     if (dc != hitwire::kDecodeOk)
     {
         ErrorLog("[net] malformed SWING_END (decode " + N((long long)dc) + ", " + N((long long)m.payload.size()) + " bytes) from peer "
                  + N((long long)m.peer) + " - ignored");
         return;
     }
-    coop::ApplyRemoteSwingEnd(uid, targetUid);
+    coop::ApplyRemoteSwingEnd(uid, targetUid, end);
 }
 
 // FIGHT_CHOICE (fightchoice.h): the owner's fight decide step chose for its own player character; the copy here follows it at its own
@@ -804,16 +811,20 @@ void OnContext(const Message& m)
     std::string squadSid(&m.payload[off + 4], sl); off += 4 + sl;
     if (!GetU32(m.payload, off, &tl) || m.payload.size() < off + 4 + tl) { ErrorLog("[net] malformed CONTEXT (town sid) - ignored"); return; }
     std::string townSid(&m.payload[off + 4], tl); off += 4 + tl;
-    std::string platoonId; unsigned int pl = 0; unsigned int peerLoadAgeMs = 0xFFFFFFFFu; unsigned int birthWire = sqbirth::kWireBirthUnknown; unsigned int originWire = 0xFFFFFFFFu;
+    std::string platoonId, campKey; unsigned int pl = 0; unsigned int peerLoadAgeMs = 0xFFFFFFFFu; unsigned int birthWire = sqbirth::kWireBirthUnknown; unsigned int originWire = 0xFFFFFFFFu;
     if (GetU32(m.payload, off, &pl) && m.payload.size() >= off + 4 + pl)
     {
         platoonId.assign(&m.payload[off + 4], pl); off += 4 + pl;   // P1 (older senders: empty)
         { unsigned int bw = sqbirth::kWireBirthUnknown; if (GetU32(m.payload, off + 4, &bw)) birthWire = bw; }   /* the squad's birth flag after the load age (squadbirth.h); absent = unknown */
         { unsigned int age = 0; if (GetU32(m.payload, off, &age)) peerLoadAgeMs = age; }   /* the age of the sender's current world load in ms (0xFFFFFFFF unknown, also when absent) */
         { unsigned int ow = 0xFFFFFFFFu; if (GetU32(m.payload, off + 8, &ow)) originWire = ow; }   /* where the sender's copy came from, after the birth flag (sameidpair.h WireOfOrigin); absent = unknown */
+        {   /* the home camp's list key after the origin (campgame.h CampHomeWay); absent or unreadable = none (the town sid decides) */
+            unsigned int kl = 0;
+            if (GetU32(m.payload, off + 12, &kl) && kl > 0u && kl <= 512u && m.payload.size() >= off + 16 + kl) campKey.assign(&m.payload[off + 16], kl);   /* an empty key: no address taken (it may be the payload's end) */
+        }
     }
     const int senderSlot = PeerSlotOfKey(m.peer);   /* the seat of the game this CONTEXT came from (the link it arrived on), -1 unknown */
-    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId, peerLoadAgeMs, senderSlot, sqbirth::BirthOfWire(birthWire), originWire);
+    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId, peerLoadAgeMs, senderSlot, sqbirth::BirthOfWire(birthWire), originWire, campKey);
 }
 
 void OnIntent(const Message& m)
@@ -961,6 +972,7 @@ void OnState(const Message& m)
     coop::ApplyOwnerHunger(uid, sm.hungerHas, sm.hunger, sm.fed);   /* par5 (parity P5): the copy's hunger is the owner's */
     coop::ApplyOwnerLimbs(uid, sm.limbsHas, sm.limbs, m.peer);   /* LIMBS (P38 / P39): the copy's lost and robotic limbs are the owner's */
     coop::ApplyOwnerDeath(uid, dead);   /* par6 (parity P6): the owner's death kills the copy through the engine's path; a copy's own is refused */
+    coop::ApplyOwnerGod(uid, latchBits);   /* T-1205 /god: the copy's god mode is its owner's - this game's AI leaves it alone */
     if (changed)
     {
         // F126: a peer pulled back out of a KO its authority never entered. LOUD, because
@@ -1294,6 +1306,19 @@ void SessionOwnerMovedAnnounce(unsigned int uid, bool prevKnown, unsigned int pr
 /* the people this game ran and released to another game (every ReleaseLocalOwner: a hand-over's acknowledgement, a release's adoption,
    a dual run's yield, a revoke, a hire away); a person taken back or set as this game's again leaves it. Asked by the store's sleep and
    heartbeat gate (BlockSquadWrite): a squad holding such a person is this game's own squad handed over in place. MAIN THREAD. */
+/* T-1135 review fold 6: characters this game runs that an OWNER_MOVED word named ANOTHER game the owner of (OwnerMovedDecide's
+   kOwnerMovedMine, otherwise only counted). A give's receiver announces its take with that word before its hire DONE, so a giver whose
+   DONE was lost still sees the take here and keeps that character's promise (hire.cpp GiveKeptRelease). Forgotten when this game takes
+   or releases the character; past kMovedClaimMax notes every character reads as claimed (a missing note must never read as "unclaimed"). */
+const size_t kMovedClaimMax = 4096;
+std::set<unsigned int> g_movedClaim;
+bool g_movedClaimFull = false;
+static void MovedClaimNote(unsigned int uid)
+{
+    if (g_movedClaim.size() >= kMovedClaimMax && g_movedClaim.find(uid) == g_movedClaim.end()) { g_movedClaimFull = true; return; }
+    g_movedClaim.insert(uid);
+}
+int OwnerMovedClaimed(unsigned int uid) { return (g_movedClaimFull || g_movedClaim.find(uid) != g_movedClaim.end()) ? 1 : 0; }
 std::set<unsigned int> g_releasedHere;
 bool IsUidReleasedHere(unsigned int uid) { return uid != 0 && g_releasedHere.find(uid) != g_releasedHere.end(); }
 void MarkReleasedHere(unsigned int uid) { if (uid != 0) g_releasedHere.insert(uid); }   /* a body of this game's own world registered in place as another game's copy (spawn.cpp AdoptExistingTwin) */
@@ -1304,6 +1329,7 @@ void ReleaseLocalOwner(unsigned int uid, unsigned int toPeer, unsigned int gen)
     const unsigned int newGen = gen != 0 ? gen : cooplo::GenTake(MineGenOf(uid));
     g_mineGen.erase(uid); g_copyGen[uid] = newGen;
     g_localOwned.erase(uid); g_releasedHere.insert(uid);
+    g_movedClaim.erase(uid);   /* T-1135 review fold 6: released - an older claim note is void */
     coopown::OwnedMirrorErase(&g_ownedMirror, uid);   /* O1: beside the set, always */
     g_owner[uid] = OwnerKeyOf(toPeer);   /* M5b: the new owner as a player key */
     g_departedPending.erase(uid);   /* M8: a hand-over after a departure supersedes it */
@@ -1320,6 +1346,7 @@ void TakeLocalOwner(unsigned int uid, unsigned int gen)
     g_mineGen[uid] = gen != 0 ? gen : cooplo::GenReadopt(MineGenOf(uid), CopyGenOf(uid));   /* M7a A1 build 1 [a1b1-sp5]: the gen the XFER / hire named + 1; 0 = out-rank every record here */
     g_copyGen.erase(uid);
     g_localOwned.insert(uid); g_releasedHere.erase(uid);
+    g_movedClaim.erase(uid);   /* T-1135 review fold 6: this game runs it afresh - an older claim note is void */
     coopown::OwnedMirrorInsert(&g_ownedMirror, uid);   /* O1: beside the set, always */
     coop::MedicalForgetCopy(uid);   /* this game drives it now (marked above first, so no detour sees it as a copy with no words): the old owner's medical words for its copy go */
     g_owner[uid] = g_myPeerId;
@@ -1339,6 +1366,7 @@ void SetLocalOwner(unsigned int uid)
     g_mineGen[uid] = cooplo::GenReadopt(MineGenOf(uid), CopyGenOf(uid));
     g_copyGen.erase(uid);
     g_localOwned.insert(uid); g_releasedHere.erase(uid);
+    g_movedClaim.erase(uid);   /* T-1135 review fold 6: this game runs it afresh - an older claim note is void */
     coopown::OwnedMirrorInsert(&g_ownedMirror, uid);   /* O1: beside the set, always */
     coop::MedicalForgetCopy(uid);   /* as TakeLocalOwner: after the marks, and no copy's medical words outlive this game taking the character */
     g_owner[uid] = g_myPeerId;
@@ -1782,7 +1810,12 @@ static void SessionOwnerMovedApply(unsigned int peer, const std::vector<char>& p
     const int d = cooplive::OwnerMovedDecide(mine, known, known && OwnerMatch(o->second, peer), newIsSender,
                                              known && OwnerMatch(o->second, cooplive::RelayPeerId(prev)), known && OwnerMatch(o->second, cooplive::RelayPeerId(slot)));
     if (d == cooplive::kOwnerMovedUnknown) { ++g_ownerMovedUnknown; return; }   /* no copy here - its first SPAWN, from the new owner, is a first SPAWN */
-    if (d == cooplive::kOwnerMovedMine) { ++g_ownerMovedMine; return; }   /* this game took it (the XFER's receiver) */
+    if (d == cooplive::kOwnerMovedMine)   /* this game took it (the XFER's receiver) */
+    {
+        ++g_ownerMovedMine;
+        if (slot != (unsigned int)coop::StoreMySlot()) MovedClaimNote(uid);   /* T-1135 review fold 6: another game says it runs it now */
+        return;
+    }
     if (d == cooplive::kOwnerMovedNoop) { ++g_ownerMovedNoop; if (gen > CopyGenHere(uid)) g_copyGen[uid] = gen; return; }   /* fold 1 item 2: the other word of the same hand-over (A1: its gen stamps the copy) */
     if (d == cooplive::kOwnerMovedTake && cooplo::OwnerMovedStale(CopyGenHere(uid), gen))   /* M7a A1 build 1 [a1b1-sp24]: a later owner is known here */
     {
@@ -2855,11 +2888,11 @@ bool SendSwing(unsigned int uid, unsigned int targetUid, const char* move)
     return CharSend(MSG_SWING, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* M7a */
 }
 
-bool SendSwingEnd(unsigned int uid, unsigned int targetUid)
+bool SendSwingEnd(unsigned int uid, unsigned int targetUid, unsigned char end)
 {
     if (!CharRoadOpen()) return false;
     std::vector<char> b;
-    if (!hitwire::EncodeSwingEnd(&b, uid, targetUid)) return false;
+    if (!hitwire::EncodeSwingEnd(&b, uid, targetUid, end)) return false;
     return CharSend(MSG_SWING_END, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* SWING's road and lane: never ahead of its SWING */
 }
 
@@ -2923,9 +2956,10 @@ bool SendHand(unsigned int uid, int has, const char* section, int x, int y, cons
 //   | platoonIdLen(u32) platoonId | loadAgeMs(u32: ms since the sender's current world load finished, 0xFFFFFFFF unknown; squadorigin.h OwnIdLiftedByLoadAge)
 //   | birth(u32: the squad's birth flag, squadbirth.h WireOfBirth - 1 kept, 0 not kept, 0xFFFFFFFF unknown)
 //   | origin(u32: where the sender's copy of the squad came from, sameidpair.h WireOfOrigin - 0 running, 1 from the record, 2 from the save, 0xFFFFFFFF unknown)
+//   | campKeyLen(u32) campKey (the home camp's world camp list key, <= 512 bytes, empty when the home is not a camp of the list, "?" when it is a camp the sender names no key for - campgame.h CampHomeWay)
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire, unsigned int originWire)
+                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire, unsigned int originWire, const std::string& campKey)
 {
     if (!CharRoadOpen()) return false;   /* M7a: the notebook road, or the session link while it is down */
     std::vector<char> b;
@@ -2940,6 +2974,8 @@ bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, c
     PutU32(&b, loadAgeMs);   /* the age of this game's current world load; a receiver weighs it against its own (squadorigin.h OwnIdLiftedByLoadAge) */
     PutU32(&b, birthWire);   /* the squad's birth flag (squadbirth.h WireOfBirth): the receiver's copy takes its kept byte from it */
     PutU32(&b, originWire);  /* where this game's copy came from (sameidpair.h WireOfOrigin): a receiver's copy from a record or a save gives way to a running one */
+    const std::string key = campKey.size() <= 512u ? campKey : std::string();
+    PutU32(&b, (unsigned int)key.size()); b.insert(b.end(), key.begin(), key.end());   /* the home camp's list key: the receiver finds its own camp of it */
     return CharSend(MSG_CONTEXT, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* M7a */
 }
 
@@ -3270,6 +3306,9 @@ static bool ItemMoveBytes(const coop::ItemMoveMsg& m, std::vector<char>& b, bool
         ownSent = (os == 1); bagSent = (bs == 1);
         if (gs != 0 || gd != 0) coop::ItemGearNoteSent(gs, gd);
         if (os < 0) coop::ItemOwnerNoteBadBlock();
+        /* T-1214 (protocol 203): a GROUND ADD of an item spot's item ends this tail with the SPT1 block (the spot's position); one that
+           will not encode is dropped - the item goes as a plain ADD (counted) */
+        if (m.spot.has != 0) coop::GroundSpotNoteWire(spotsync::EncodeSpot(&b, m.spot), 0);
     }
     /* items9 (protocol 78): op 4 CHARGES ends with the uses left and the item's base sid; one that will not encode is not sent. */
     if (m.op == 4 && !coopistat::EncodeChargesTail(&b, m.charges, m.baseSid)) return false;
@@ -3398,6 +3437,33 @@ bool SendParityPush(const std::vector<char>& bytes, int sx, int sy)
     if (bytes.empty()) return true;
     return ItemSendArea(MSG_PARITY_BOX, cooplive::AreaKey(sx, sy), -1, &bytes[0], bytes.size());
 }
+/* T-1061: BOX_LOCK. An ASK goes to the writer of the box's area, as a PARITY_REQ does; a NO goes back to the asker */
+bool SendBoxLockAsk(const std::vector<char>& bytes, int sx, int sy)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return false;
+    if (bytes.empty()) return false;
+    const int holder = coop::ItemAreaWriterSlot(sx, sy);
+    const int to = cooplive::ItemAddrDecide(cooplive::kItemToArea, false, 0u, holder, false, 0u, coop::LinkPeerSlot());
+    const bool ok = ItemSendTo(MSG_BOX_LOCK, to, &bytes[0], bytes.size(), 0u, 0);
+    if (ok) AddrCount(MSG_BOX_LOCK, kAddrColToOwner);
+    return ok;
+}
+bool SendBoxLockNo(const std::vector<char>& bytes, unsigned int askerKey)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return false;
+    if (bytes.empty()) return false;
+    return ItemSendTo(MSG_BOX_LOCK, ItemToAsker(true, askerKey), &bytes[0], bytes.size(), 0u, 0);
+}
+/* decoded and acted on in items.cpp (BoxLockNote), which refuses a malformed payload whole */
+void OnBoxLock(const Message& m) { coop::BoxLockNote(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), m.peer); }
+/* T-1242: RESEARCH_BOOK to one player by slot (an encoded bookshare::Msg). RELIABLE; false = no road to that player now. */
+bool SendResearchBook(const std::vector<char>& body, int toSlot)
+{
+    if (toSlot < 0 || body.empty() || CharRoadNow() == cooplive::kCharRoadNone) return false;
+    return ItemSendTo(MSG_RESEARCH_BOOK, toSlot, &body[0], body.size(), 0u, 0);
+}
+/* decoded and acted on in store.cpp (StoreBookNote), which refuses a malformed payload whole */
+void OnResearchBook(const Message& m) { coop::StoreBookNote(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), m.peer); }
 /* par1: decoded, counted and acted on in items.cpp (ParityNoteReq / ParityNoteBox), which refuses a malformed payload whole. */
 void OnParityReq(const Message& m) { coop::ParityNoteReq(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), m.peer); }   /* M7b slice 2: the asker, for the answers */
 void OnParityBox(const Message& m) { coop::ParityNoteBox(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), m.peer); }   /* fold 1: the sender - a box replacement only from its writer */
@@ -3482,9 +3548,10 @@ static void OnItemMoveBody(const Message& m, const coophold::ReqTag* hdTag)
     if (im.op == 0 && at < m.payload.size())
     {
         size_t te = 0;
-        const int tw = coopistat::DecodeAddTail(&m.payload[0], m.payload.size(), at, &im.bag, &im.owner, &im.gear, &te);
+        const int tw = coopistat::DecodeAddTail(&m.payload[0], m.payload.size(), at, &im.bag, &im.owner, &im.gear, &im.spot, &te);   /* T-1214: and the SPT1 block */
         if (tw != coopistat::kTailOk)
         {
+            if (tw == coopistat::kTailBadSpot) coop::GroundSpotNoteWire(0, 1);
             if (tw == coopistat::kTailBadOwner) coop::ItemOwnerNoteBadRecv();
             if (tw == coopistat::kTailBadGear) coop::ItemGearNoteBadRecv();
             if (tw == coopistat::kTailBadNest) coop::ItemBagNestNoteBadRecv();   /* the backpack rows' pack-inside-pack tail (ITEM_MOVE add) */
@@ -4007,6 +4074,10 @@ bool SendPrison(const cooprison::PrisonMsg& m, unsigned int askerPeer)
     if (!cooprison::EncodePrison(&b, m)) return true;   /* not encodable: dropped, never retried forever */
     /* M7b slice 1: REFUSED and BED REFUSED answer the game that asked; IN, RELEASE, DEATH and BED IN go to the character's owner */
     if (m.kind == cooprison::kPrisonRefused || m.kind == cooprison::kPrisonBedRefused) return ReplyTo(askerPeer, MSG_PRISON, &b[0], b.size());
+    /* T-980: JOIN NO answers the prisoner's owner that asked; JOIN ASK goes to the game that runs the freer (the prisoner is the
+       sender's own); FREED goes to the prisoner's owner below */
+    if (m.kind == cooprison::kPrisonJoinNo) return ReplyTo(askerPeer, MSG_PRISON, &b[0], b.size());
+    if (m.kind == cooprison::kPrisonJoinAsk) return SendToOwner(MSG_PRISON, m.freerUid, &b[0], b.size());
     /* P42: SHACKLE LOCK / CAGE LOCK about our own character is its owner's word - to every other game, on the character stream's
        road; about another game's character it is a request to that owner */
     if (cooprison::PrisonIsLockKind(m.kind) && g_localOwned.find(m.uid) != g_localOwned.end())
@@ -4076,6 +4147,15 @@ bool SendHire(const coophire::HireMsg& m, unsigned int toPeer)
     if (cooplive::SideRouteOf(cooplive::kInnerHire, toPeer == kHireNoAsker ? 1 : 0, false) == cooplive::kSideRouteWorld)
         return SideSendWorld(MSG_HIRE, &b[0], b.size());
     return ReplyTo(toPeer, MSG_HIRE, &b[0], b.size());
+}
+/* T-1135.  Reliable: one give OFFER / ANSWER / RESULT (hire.cpp) on MSG_HIRE, to the player in `toSlot` - by slot on the character
+   stream's road, as an addressed item message goes (the session peer on the session link, any other game through the world server). */
+bool SendGive(const swgive::GiveMsg& m, int toSlot)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return false;   /* the character stream's road */
+    std::vector<char> b;
+    if (!swgive::EncodeGive(&b, m)) return false;
+    return ItemSendTo(MSG_HIRE, toSlot, &b[0], b.size(), 0u, 0);
 }
 /* P26 stages 1-3.  Reliable: one MSG_TALK (speech.cpp; a conversation step is an event). False when the character stream's road is closed, the other side's owner is unknown or not in the world, or it does
    not encode (the caller counts and ends its side). */
@@ -5091,6 +5171,19 @@ void OnEffect(const Message& m)
 /* recruit1 - MSG_HIRE: refused whole when it does not decode; queued in arrival order, applied at the K2 safe point (hire.cpp). */
 void OnHire(const Message& m)
 {
+    if (!m.payload.empty() && swgive::IsGiveKind((int)(unsigned char)m.payload[0]))   /* T-1135: a give offer / answer / result rides this message */
+    {
+        swgive::GiveMsg g;
+        const int gr = swgive::DecodeGive(&m.payload[0], m.payload.size(), &g);
+        if (gr != swgive::kGiveDecodeOk)
+        {
+            coop::HireNoteBad();
+            DebugLog("[net] <- GIVE malformed (reason " + N((long long)gr) + ") - ignored");
+            return;
+        }
+        coop::GiveNoteRecv(g, m.peer);
+        return;
+    }
     coophire::HireMsg h;
     const int r = m.payload.empty() ? coophire::kHireDecodeTooShort : coophire::DecodeHire(&m.payload[0], m.payload.size(), &h);
     if (r != coophire::kHireDecodeOk)
@@ -5985,6 +6078,8 @@ void SessionDispatchOne(const Message& m)
     case MSG_SWING_END:  OnSwingEnd(m);   break;   /* the owner's swing ended: its copy drops the credit it did not spend */
     case MSG_FIGHT_CHOICE: OnFightChoice(m); break;   /* T-1101 design (c): the owner's fight choice, for its copy's decide step */
     case MSG_HAND:       OnHand(m);       break;   /* the owner's hand item, for our copy of its character */
+    case MSG_BOX_LOCK:   OnBoxLock(m);    break;   /* T-1061: a chest's pick asked of its writer, or the writer's NO */
+    case MSG_RESEARCH_BOOK: OnResearchBook(m); break;   /* T-1242: a research's Books asked of a teammate's game, its answer, give back, done */
     case MSG_SHOT_FIRED: OnShotFired(m);  break;   /* the shooter's game's fire: our copy of the shooter fires that bolt */
     case MSG_XFER:       OnXfer(m);       break;
     case MSG_XFER_ACK:   OnXferAck(m);    break;

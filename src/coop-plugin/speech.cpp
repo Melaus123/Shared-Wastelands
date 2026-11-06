@@ -39,9 +39,11 @@
    The std::string argument is only ever read by reference, and no function here that has __try holds a
    C++ object (C2712). */
 #include "speech.h"
+#include "../common/leverpick.h"   /* T-1218: TEST-ONLY name picks refuse unless exactly one matches; `#<k>` picks the k-th nearest */
 #include "crime.h"   /* par20: BountyTestClearArm (crimetest bountyclear) */
 #include "addresses.h"      /* P8h: the three RVAs below come from the address table */
 #include "spawn.h"          /* FindSpawned / FindSpawnedUid */
+#include "money.h"          /* T-478 step 5: MoneyHave - the seller's purse when the selling window opens */
 #include "store.h"          /* StoreMainThreadId */
 #include "net/session.h"    /* IsUidMine, UidOwnedByPeer, SendSay */
 #include "net/transport.h"  /* TrafficReportTick */
@@ -58,8 +60,22 @@
 #include "ai_spike.h"   /* P26 stage 0 fold 1: EngineThreadNameOf - which engine thread the off-thread starts run on */
 #include "../common/talkwire.h"     /* P26 stages 1-3: MSG_TALK */
 #include "../common/talkcursor.h"   /* T-737: the talk cursor's decisions */
+#include "../common/prisonwire.h"   /* T-980: kPrisonFreed and the freeing's decisions */
 #include "../common/portraitdefer.h"   /* T-804: the dialogue window's portrait refresh, held off the AI thread */
 #include "../common/dlgwinguard.h"     /* T-831: the dialogue window never calls through a removed character */
+#include "../common/tradewinguard.h"   /* T-1230: the trade window never calls through a freed trader */
+#include "../common/talklog.h"        /* T-978 (owner 1410 c): the conversation window log's lines and cap */
+#include "../common/talkonewin.h"     /* T-978 (owner 1445 a): one conversation in the window at a time (B2 / B1) */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+#include "../common/p213trace.h"      /* PROBE P213: one tested condition, the conditions field, the print cap */
+// PROBE-END: P213
+#endif
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+namespace coop { int P214WatchList(void** out, int* freed, int cap); }   /* PROBE P214: spawn.cpp - the characters P214 watches */
+// PROBE-END: P214
+#endif
 #include "soak.h"                     /* T-737: MainLoopFrames - the frame a hover was seen on */
 #include "../common/liveenvelope.h" /* P25 fold re-check: cooplive::SamePlayer (a waiting request's owner key vs the PROMPT/END sender) */
 #include "game/GameData.h"          /* P26 stages 1-3: a dialogue line's GameData string id */
@@ -79,9 +95,19 @@
 #pragma intrinsic(_ReturnAddress)
 
 namespace coop {
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+static int TkLineActsPod(const void* line, int* types, int* values, int cap, int* items);   /* PROBE P214: defined below in namespace coop (P26 stage 4) */
+// PROBE-END: P214
+#endif
 int GroundTerrainHeightAt(float x, float z, float* out);   /* P26lvl maxdy: combat.cpp - the terrain height at (x,z) (groundline's SEH-wrapped getTerrainHeightFast): 1 height, 0 no terrain (-99), -1 no row / faulted. MAIN THREAD */
 int GroundAnimalAppPod(::Character* c);   /* P26f3: appearance.cpp - the P10 class test (appearance vtable == AppearanceAnimalVt): 1 animal, 0 not, -1 unreadable. MAIN THREAD */
+void CapChainCountBegin();   /* T-478 step 4: items.cpp - count the own characters setChainedMode chains on this thread. MAIN THREAD */
+int CapChainCountEnd(unsigned int* uids, int cap);   /* T-478 step 4: items.cpp - the count since Begin, up to cap (<= 8) uids; stops counting */
+std::string CapChainCountSplit();   /* T-478 step 4 review fold 3: items.cpp - every chain call of the last counted run, by branch */
+int CapSurrenderSkips(void* npc, void* target, const unsigned int* chained, int nChained, const std::string& head);   /* fold 2: items.cpp. MAIN THREAD */
 int AiWorkerBusyNow();   /* T-804: coop.cpp - the engine's own AI-worker busy test (0x25C690 on GameWorld+0x790): 1 running, 0 idle, -1 unreadable. MAIN THREAD */
+static void* WgTargetNow(void* dlg, int* named);   /* below, beside the window guard (in coop, outside the anonymous namespace, where it is defined) */
 namespace {
 
 unsigned long long kDialogueSayRva = 0; static coop::AddrReg kDialogueSayRva_reg("DialogueSay", &kDialogueSayRva);   /* Steam_1.0.65 0x67F2F0 */
@@ -427,13 +453,36 @@ static void TkArrNote(void* dlg, void* who, int what, bool r, void* ret)
    started, or refused by this game's camera gate) and TkP25Intercept / TkP25Queue (taken for the NPC's game as a REQUEST, the click
    ring full, the same click already waiting). After the call the plain values go into a fixed lock-free ring (no lock, no
    allocation, no log) and the K2 safe point writes one throttled line per order (TalkOrderDrain). */
-struct TkOrderCtx { void* dlg; int set; int reached; int hadLine; int started; float gateDist; };   /* set: a cooptalk::kTalkOrder* the road wrote, 0 none */
+struct TkOrderCtx { void* dlg; int set; int reached; int hadLine; int started; float gateDist;   /* set: a cooptalk::kTalkOrder* the road wrote, 0 none */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    LONG p213Order;   /* PROBE P213: this order's number - its traced lines are matched on it, so a dropped order's lines never join the next one */
+// PROBE-END: P213
+#endif
+};
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+volatile LONG g_p213OrderSeq = 0;   /* PROBE P213: the last talk order number given (this game's player's orders and the other player's P25 requests) */
+// PROBE-END: P213
+#endif
 volatile DWORD g_tkOrderTls = TLS_OUT_OF_INDEXES;
 const LONG kTkOrderRing = 32;   /* a power of two */
 struct TkOrderEntry { volatile LONG state; void* dlg; void* me; void* who; unsigned int nuid, tuid; unsigned long tid;
-                      int set, reached, hadLine, started, busyCopy, convEv; float gateDist; unsigned long long site; };   /* state: 0 free, 1 writing, 2 ready */
+                      int set, reached, hadLine, started, busyCopy, convEv; float gateDist; unsigned long long site;   /* state: 0 free, 1 writing, 2 ready */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+                      LONG p213Order;   /* PROBE P213: the order's number (TkOrderCtx) */
+// PROBE-END: P213
+#endif
+};
 struct TkOrderItem { void* dlg; void* me; void* who; unsigned int nuid, tuid; unsigned long tid;
-                     int set, reached, hadLine, started, busyCopy, convEv; float gateDist; unsigned long long site; };   /* one drained entry (MAIN THREAD) */
+                     int set, reached, hadLine, started, busyCopy, convEv; float gateDist; unsigned long long site;   /* one drained entry (MAIN THREAD) */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+                     LONG p213Order;   /* PROBE P213: the order's number (TkOrderCtx) */
+// PROBE-END: P213
+#endif
+};
 TkOrderEntry g_tkOrderRing[kTkOrderRing];
 volatile LONG g_tkOrderHead = 0, g_tkOrderPending = 0;
 volatile LONG64 g_tkOrders = 0, g_tkOrderDropped = 0;
@@ -524,6 +573,13 @@ static bool SendEventRun(void* dlg, void* who, int what, void* arrRet)
     return r;
 }
 
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+void P214NoteEvent(void* dlg, void* who, int what);   /* PROBE P214: below, after P213 */
+void P214NoteStart(int player, void* dlg, void* who, void* line, int ev, unsigned long long ret, int off);
+// PROBE-END: P214
+#endif
+
 /* T-726: a talk order of this game's player runs with this thread's order context set and ALWAYS restored (__finally: a fault inside
    the engine's call propagates exactly as before and never leaves the slot pointing at a dead stack frame); its plain values go to
    the ring after the call. ANY THREAD; no C++ object (C2712); the thread's last error kept. */
@@ -531,6 +587,11 @@ static bool SendEventOrder(void* dlg, void* who, int what, void* arrRet)
 {
     TkOrderCtx oc;
     oc.dlg = dlg; oc.set = 0; oc.reached = 0; oc.hadLine = 0; oc.started = 0; oc.gateDist = -1.0f;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    oc.p213Order = ::InterlockedIncrement(&g_p213OrderSeq);   /* the order's number, given as its scope opens */
+// PROBE-END: P213
+#endif
     const DWORD ti = g_tkOrderTls;
     const DWORD le0 = ::GetLastError();
     void* const prevOc = ::TlsGetValue(ti);
@@ -548,10 +609,109 @@ static bool SendEventOrder(void* dlg, void* who, int what, void* arrRet)
     return r;
 }
 
+/* T-980: A COPY FREED BY THIS GAME'S CHARACTER. The engine raises the unlock event 0xD on a prisoner when a release or a pick ends
+   (the release task 0x357040, the pick task 0x359100), usually on its AI thread. The release task opens the cage's lock before it
+   raises the event and takes the prisoner out of the cage after it; the event's own handling opens no lock. On a COPY (a prisoner
+   another game runs) the event still runs here as before - the copy's line is dropped at say(), and the escape its line may give
+   is not carried out by the copy (the copy gate skips a copy's AI decisions, ai_spike.cpp) - so without this the
+   prisoner's owner never learns of the freeing. FreedNoteEvent (ANY THREAD) keeps the event, the prisoner's uid and the freer's as
+   plain numbers in a ring under one leaf lock; FreedSendDrain (MAIN THREAD, the K2 safe point) sends each to the prisoner's owner as
+   kPrisonFreed, and the owner raises the event on its own prisoner (spawn.cpp FreedInDrain -> FreedRaiseEvent). */
+cooprison::PrisonNoteRing g_freedRing;   /* under g_freedLock */
+SRWLOCK g_freedLock = SRWLOCK_INIT;
+volatile LONG64 g_freedNoted = 0;
+long long g_freedSent = 0, g_freedSendFailed = 0, g_freedStale = 0, g_freedBlocked = 0, g_freedLostLogged = 0;   /* MAIN THREAD */
+
+/* ANY THREAD, from detour_sendEvent before the engine's call: address compares (FindSpawnedUid), the lock-free owned mirror and
+   plain field reads of the copy under SEH (FreedCageFactsPod: whether it sits in a cage, and the hand naming the cage - the release
+   task takes it out of the cage before the main thread sends) only; the thread's last error kept. */
+void FreedNoteEvent(void* dlg, void* who, int what)
+{
+    if (what != cooprison::kPrisonEvUnlock || dlg == 0 || who == 0) return;
+    const DWORD le = ::GetLastError();
+    void* const spk = SayReadPtr(dlg, kDlgMe);
+    const unsigned int su = (spk != 0) ? FindSpawnedUid(spk) : 0u;
+    const unsigned int fu = FindSpawnedUid(who);
+    if (cooprison::FreedForward(what, su, su != 0 && net::IsUidMineAnyThread(su), fu, fu != 0 && net::IsUidMineAnyThread(fu)))
+    {
+        cooprison::PrisonNote n;
+        n.ev = what; n.uid = su; n.freerUid = fu; n.nActs = 0; n.actTotal = 0;
+        n.cagedAtEvent = FreedCageFactsPod(spk, n.cageHand);   /* su != 0: spk is the copy */
+        ::AcquireSRWLockExclusive(&g_freedLock);
+        const bool ok = cooprison::PrisonNotePush(&g_freedRing, n);
+        ::ReleaseSRWLockExclusive(&g_freedLock);
+        if (ok) ::InterlockedIncrement64(&g_freedNoted);
+    }
+    ::SetLastError(le);
+}
+
+/* MAIN THREAD, the K2 safe point (TalkTestDrain): each noted freeing checked again on the main thread's own tables (still a copy
+   here, the freer still this game's) and sent to the prisoner's owner. Every record not sent is counted and logged. Before each,
+   the lock watch's check of that copy runs now (spawn.cpp RestraintCheckNow): any lock-open request it makes for the copy's
+   shackles or cage goes to the owner first on the same road, so the owner applies it before it applies the freeing; the locks
+   that check read open go in the message's lock byte, and the owner raises only when each of them reads open there too. A cage
+   the event found the copy in, with its lock open, is added after that check (spawn.cpp FreedCageAtEventSend): by now the release
+   task has taken the copy out of the cage, so the check no longer sees it. */
+void FreedSendDrain()
+{
+    cooprison::PrisonNote batch[cooprison::kPrisonNoteCap];
+    ::AcquireSRWLockExclusive(&g_freedLock);
+    const int n = cooprison::PrisonNoteTake(&g_freedRing, batch, cooprison::kPrisonNoteCap);
+    const long long lost = g_freedRing.lost;
+    ::ReleaseSRWLockExclusive(&g_freedLock);
+    if (lost != g_freedLostLogged)
+    {
+        char e[200];
+        _snprintf_s(e, sizeof(e), _TRUNCATE, "[PRISON] freed: %lld unlock event(s) on a copy were not kept (ring full, %d) - not sent to the prisoner's owner",
+                    lost - g_freedLostLogged, cooprison::kPrisonNoteCap);
+        ErrorLog(std::string(e));
+        g_freedLostLogged = lost;
+    }
+    if (n == 0) return;
+    const bool blocked = EngineWritesBlocked();
+    for (int i = 0; i < n; ++i)
+    {
+        const cooprison::PrisonNote& x = batch[i];
+        char b[300];
+        if (blocked)
+        {
+            ++g_freedBlocked;
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[PRISON] freed uid=%u freer=%u NOT sent: the world is loading or tearing down", x.uid, x.freerUid);
+            DebugLog(std::string(b));
+            continue;
+        }
+        if (FindSpawned(x.uid) == 0 || net::IsUidMine(x.uid) || !net::IsUidMine(x.freerUid))
+        {
+            ++g_freedStale;
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[PRISON] freed uid=%u freer=%u NOT sent: the prisoner is no longer another game's copy here, or the freer is no longer ours",
+                        x.uid, x.freerUid);
+            DebugLog(std::string(b));
+            continue;
+        }
+        const unsigned char openNow = RestraintCheckNow(x.uid);   /* this copy's lock-open requests first, on the same road; the locks read open now */
+        int cageAtEvent = cooprison::kFreedCageNone;
+        const unsigned char open = FreedCageAtEventSend(x.uid, x.cagedAtEvent, x.cageHand, openNow, &cageAtEvent);   /* the cage the event found */
+        cooprison::PrisonMsg m;
+        m.uid = x.uid; m.kind = cooprison::kPrisonFreed; m.freerUid = x.freerUid; m.freedLocks = open;
+        const bool ok = net::SendPrison(m);
+        if (ok) ++g_freedSent; else ++g_freedSendFailed;
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "[PRISON] freed uid=%u freer=%u ev=0x%X readOpen[shackles,cage]=%d,%d cageAtEvent=%s locks[shackles,cage]=%d,%d %s",
+                    x.uid, x.freerUid, (unsigned int)x.ev, openNow & 1, (openNow >> 1) & 1, cooprison::FreedCageName(cageAtEvent), open & 1, (open >> 1) & 1,
+                    ok ? "sent to the prisoner's owner (the engine's unlock event on our copy)" : "NOT sent: no road to the prisoner's owner");
+        if (ok) DebugLog(std::string(b)); else ErrorLog(std::string(b));
+    }
+}
+
 bool detour_sendEvent(void* dlg, void* who, int what)
 {
     void* const arrRet = _ReturnAddress();   /* P26s6 arrival probe: the engine call site (the thunk is a plain jmp) */
     coop::CrimeNoteWitnessEvent(what, who);   /* [CRIME] REPORT witnessEvents: the crime witness events this game's engine raises */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+    P214NoteEvent(dlg, who, what);   /* log only: event 0xD, or an event on a watched character, noted for the main thread */
+// PROBE-END: P214
+#endif
+    FreedNoteEvent(dlg, who, what);   /* T-980: an unlock event on a copy, freed by this game's character - for the prisoner's owner */
     if (what == 1 && dlg != 0 && who != 0 && g_tkOrderTls != TLS_OUT_OF_INDEXES && TkOrderIsMine(who))   /* T-726: this game's player's talk order */
         return SendEventOrder(dlg, who, what, arrRet);
     return SendEventRun(dlg, who, what, arrRet);
@@ -645,6 +805,11 @@ static void CopyOwnRequeue(const CopyOwnEntry& e)
    start is queued for the safe point's end (CopyOwnQueue). */
 void TalkNote(int player, void* dlg, void* who, void* line, int ev, unsigned long long ret)
 {
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+    P214NoteStart(player, dlg, who, line, ev, ret, 0);   /* log only: a start on a watched character or with event 0xD */
+// PROBE-END: P214
+#endif
     const int started = (ret & 0xFF) != 0 ? 1 : 0;
     ++g_talkCalls;
     if (!started)
@@ -693,6 +858,11 @@ void TalkNote(int player, void* dlg, void* who, void* line, int ev, unsigned lon
    Only a STARTED call is queued for the main thread; a full slot is counted (dropped), never waited on. */
 void TalkOffNote(int player, void* dlg, void* who, void* line, int ev, unsigned long long ret)
 {
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+    P214NoteStart(player, dlg, who, line, ev, ret, 1);   /* log only: a start on a watched character or with event 0xD */
+// PROBE-END: P214
+#endif
     const unsigned long tid = ::GetCurrentThreadId();
     ::InterlockedIncrement64(&g_talkOffThread);
     ::InterlockedCompareExchange(&g_talkOffTid, (LONG)tid, 0);
@@ -769,10 +939,13 @@ void TalkOffNote(int player, void* dlg, void* who, void* line, int ev, unsigned 
 unsigned long long kDialogueSetInDialogRva = 0; static coop::AddrReg kDialogueSetInDialogRva_reg("DialogueSetInDialog", &kDialogueSetInDialogRva);   /* Steam_1.0.65 0x673C10: void Dialogue::setInDialog(bool on) */
 unsigned long long kDialogueReplyClickedRva = 0; static coop::AddrReg kDialogueReplyClickedRva_reg("DialogueReplyClicked", &kDialogueReplyClickedRva);   /* Steam_1.0.65 0x683360: void Dialogue::replyClicked(int index) */
 unsigned long long kDialogueSayLineRva = 0; static coop::AddrReg kDialogueSayLineRva_reg("DialogueSayLine", &kDialogueSayLineRva);   /* P26 stage 4: Steam_1.0.65 0x682F10: bool Dialogue::sayLine(DialogLineData*) - triggerNextLine 0x683C90's call for the next line (Read decomp_683c90) */
+unsigned long long kTalkLogNextLineRva = 0; static coop::AddrReg kTalkLogNextLineRva_reg("DialogueTriggerNextLine", &kTalkLogNextLineRva);   /* T-978 conversation window log: Steam_1.0.65 0x683C90 / 1.0.68 0x684720: void Dialogue::triggerNextLine(DialogLineData*) - Dialogue::update 0x684600 calls it when the speech timers +0x230 / +0x234 ran out (decomp_684600:98-122) */
+unsigned long long kTalkLogPauseByteRva = 0; static coop::AddrReg kTalkLogPauseByteRva_reg("PauseByte", &kTalkLogPauseByteRva);   /* T-978 conversation window log: Steam_1.0.65 0x2133969: the byte update tests before it counts the timers down (decomp_684600:100) - doors.cpp binds the same row */
 unsigned long long kTkEndDialogueRva = 0; static coop::AddrReg kTkEndDialogueRva_reg("DialogueEndDialogue", &kTkEndDialogueRva);   /* Steam_1.0.65 0x673DA0: void Dialogue::endDialogue(bool) - hire.cpp binds the same row */
 unsigned long long kDialogDataGetDataRva = 0; static coop::AddrReg kDialogDataGetDataRva_reg("DialogDataManagerGetData", &kDialogDataGetDataRva);   /* Steam_1.0.65 0x6AE090: static DialogLineData* DialogDataManager::getData(GameData*) - a hash lookup, 0 when absent */
 unsigned long long kDlgSetConvReplyGuiRva = 0; static coop::AddrReg kDlgSetConvReplyGuiRva_reg("DialogueSetConversationReplyGUI", &kDlgSetConvReplyGuiRva);   /* P26s1 fold 1: Steam_1.0.65 0x6736E0: void Dialogue::setConversationReplyGUI() - DialogueWindow::setNPCText 0x721F00 on the ONE window (0x2132770) with +0x278; off the main thread it queues itself as op 6 (+0x80) and is replayed through the same entry (callers 0x683122 sayLine, 0x6846A0 update) */
 unsigned long long kDlgSetResponsesGuiRva = 0; static coop::AddrReg kDlgSetResponsesGuiRva_reg("DialogueSetResponesGUI", &kDlgSetResponsesGuiRva);   /* P26s1 fold 1: Steam_1.0.65 0x6735E0: void Dialogue::setResponesGUI() - DialogueWindow::setResponses 0x722EB0 on the ONE window with +0x258; op 5 off the main thread (callers 0x67FA5B listPlayerReplies, 0x684696 update) */
+unsigned long long kDlgClearResponsesGuiRva = 0; static coop::AddrReg kDlgClearResponsesGuiRva_reg("DialogueClearResponsesGUI", &kDlgClearResponsesGuiRva);   /* T-978 B1: Steam_1.0.65 0x6734F0 / 1.0.68 0x673F80: the Dialogue's reply-list clear (`this` only) - with the AI thread not busy it clears the ONE window's buttons (0x721FF0 on 0x2132770, button count +0x168 -> 0); otherwise it queues itself as op 4 (+0x80) and is replayed through the same entry by update (0x684600:36); runs at the start of every reply listing (0x67F6A0:47). It writes nothing of the Dialogue itself (Read, decomp_6734f0) */
 unsigned long long kDialogueWindowRva = 0; static coop::AddrReg kDialogueWindowRva_reg("DialogueWindowGlobal", &kDialogueWindowRva);   /* P26s1 fold 1: Steam_1.0.65 0x2132770: DialogueWindow* - the one dialogue window (setInDialog 0x673D50 / 0x673D77 load it) */
 unsigned long long kDlgWinHideRva = 0; static coop::AddrReg kDlgWinHideRva_reg("DialogueWindowHide", &kDlgWinHideRva);   /* T-831: Steam_1.0.65 0x7213F0 / 1.0.68 0x721F20: void DialogueWindow::hide(Dialogue* dlg) - when +0xD0 == dlg: +0xF0 = 0, userPause(false), +0xD0 = 0, the root widget hidden; dlg is only compared, never read */
 unsigned long long kDlgWinPortraitRva = 0; static coop::AddrReg kDlgWinPortraitRva_reg("DialogueWindowRefreshPortrait", &kDlgWinPortraitRva);   /* T-804: Steam_1.0.65 0x7223C0 / 1.0.68 0x722EF0: void (DialogueWindow*, Character* who, char slot) - renders that slot's portrait at once (Ogre); reached through a jump stub from 0x6709A0 (slot 0) and 0x670EA0 (slot 1), both with the window global in rcx */
@@ -789,6 +962,134 @@ int g_setInDialogHook = 0, g_replyClickedHook = 0, g_endDialogueHook = 0;   /* 1
 typedef void (*DlgGuiFn)(void* dlg);   /* P26s1 fold 1: setConversationReplyGUI / setResponesGUI - `this` only (0x6736E0 / 0x6735E0, Read) */
 DlgGuiFn orig_setConvReplyGui = 0, orig_setResponsesGui = 0;
 int g_convReplyGuiHook = 0, g_responsesGuiHook = 0;   /* same states */
+DlgGuiFn orig_clearResponsesGui = 0;   /* T-978 B1: the reply-list clear 0x6734F0 */
+int g_clearResponsesGuiHook = 0;       /* same states */
+/* T-978 (owner 1445 a) B2 / B1 - ONE CONVERSATION IN THE WINDOW AT A TIME (src/common/talkonewin.h). B2 refuses a second start
+   toward this game's player while the window shows a live conversation and keeps the newest refused (NPC, player character) pair
+   in one slot; TalkOneWinDrain sends it again at a safe point once the window is empty. B1 skips another conversation's writes
+   into the window on the main thread. Counters on the [TALK] REPORT (talkOneWin[...]). */
+volatile LONG64 g_owRefused = 0, g_owRefusedOrder = 0, g_owQueued = 0, g_owQueueReplaced = 0;   /* B2, any thread */
+volatile LONG64 g_owSkipText = 0, g_owSkipReplies = 0, g_owSkipClear = 0;                      /* B1 (main thread; interlocked anyway) */
+long long g_owResent = 0, g_owResentOpened = 0, g_owDropOld = 0, g_owDropGone = 0, g_owDropBlocked = 0, g_owLogged = 0;   /* MAIN THREAD */
+/* review 2026-11-03: dropOwner = the NPC changed hands since the refusal; linePutBack / lineNewer = the walk-over's parked line put
+   back for the re-send / left (the engine parked a newer one); openRefused = a second start's window open refused on the main thread
+   (two starts in one frame), openEnded / openEndFull = that conversation ended at the safe point / no room to remember it;
+   skipPortrait = another conversation's portrait refresh skipped (B1's fourth writer) */
+long long g_owDropOwner = 0, g_owLinePutBack = 0, g_owLineNewer = 0, g_owOpenRefused = 0, g_owOpenEnded = 0, g_owOpenEndFull = 0, g_owOpenEndNewer = 0;   /* MAIN THREAD */
+volatile LONG64 g_owSkipPortrait = 0;
+volatile LONG g_owQLock = 0;   /* the slot's spin flag: plain stores or loads inside it - no allocation, no call */
+talkonewin::Queued g_owQ = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+const size_t kDlgParkedLine = 0xC8;   /* Dialogue: the parked line a walk-over's talk starts from (67fad0:367-369 writes it; sendEvent's event 1
+                                         passes it to startPlayerConversation 0x684221 and zeroes it after, started or refused, 0x684238 - Read) */
+/* the newest start toward this game's player that passed B2 (two starts in one frame: its window open may yet be refused) */
+void* g_owStartDlg = 0; void* g_owStartWho = 0; void* g_owStartLine = 0;   /* under g_owQLock */
+
+/* B2: keeps the newest refused pair with both ids, the NPC's game and the parked line (0 none). ANY THREAD: the uid index and the
+   any-thread owned mirror are lock-free reads. */
+void OwQueueKeep(void* npc, void* who, void* line)
+{
+    const unsigned int ms = (unsigned int)::GetTickCount();
+    const unsigned int nu = (npc != 0) ? FindSpawnedUid(npc) : 0, wu = (who != 0) ? FindSpawnedUid(who) : 0;
+    const int mine = (nu != 0 && net::IsUidMineAnyThread(nu)) ? 1 : 0;
+    while (::InterlockedCompareExchange(&g_owQLock, 1, 0) != 0) YieldProcessor();
+    const int replaced = talkonewin::QueueKeep(&g_owQ, npc, who, line, nu, wu, mine, ms);
+    ::InterlockedExchange(&g_owQLock, 0);
+    ::InterlockedIncrement64(&g_owQueued);
+    if (replaced) ::InterlockedIncrement64(&g_owQueueReplaced);
+}
+
+/* B2: a copy of the slot into *out; 0 = empty. With `clearIf` set instead, the slot is emptied - only if it still holds that same
+   entry (a newer refusal written meanwhile stays); 1 = emptied. ANY THREAD. */
+int OwQueueRead(talkonewin::Queued* out, const talkonewin::Queued* clearIf)
+{
+    while (::InterlockedCompareExchange(&g_owQLock, 1, 0) != 0) YieldProcessor();
+    int r = 0;
+    if (clearIf != 0)
+    {
+        if (g_owQ.set && g_owQ.npc == clearIf->npc && g_owQ.who == clearIf->who && g_owQ.ms == clearIf->ms) { g_owQ.set = 0; r = 1; }
+    }
+    else if (g_owQ.set && out != 0) { *out = g_owQ; r = 1; }
+    ::InterlockedExchange(&g_owQLock, 0);
+    return r;
+}
+
+/* B2: the window-empty clock of the slot's entry `same` (unchanged when a newer refusal replaced it). ANY THREAD. */
+void OwQueueSetEmpty(const talkonewin::Queued* same, unsigned int emptyMs)
+{
+    while (::InterlockedCompareExchange(&g_owQLock, 1, 0) != 0) YieldProcessor();
+    if (g_owQ.set && g_owQ.npc == same->npc && g_owQ.who == same->who && g_owQ.ms == same->ms) g_owQ.emptyMs = emptyMs;
+    ::InterlockedExchange(&g_owQLock, 0);
+}
+
+/* B2: the slot and the start record emptied (the world's teardown or a load: the addresses belong to the freed world). */
+void OwQueueForget()
+{
+    while (::InterlockedCompareExchange(&g_owQLock, 1, 0) != 0) YieldProcessor();
+    g_owQ.set = 0; g_owStartDlg = 0; g_owStartWho = 0; g_owStartLine = 0;
+    ::InterlockedExchange(&g_owQLock, 0);
+}
+
+/* Two starts in one frame: the newest start toward this game's player that passed B2, with its kept line. ANY THREAD. */
+void OwStartNote(void* dlg, void* who, void* line)
+{
+    while (::InterlockedCompareExchange(&g_owQLock, 1, 0) != 0) YieldProcessor();
+    g_owStartDlg = dlg; g_owStartWho = who; g_owStartLine = line;
+    ::InterlockedExchange(&g_owQLock, 0);
+}
+/* 1 = the start record names dlg: *who / *line its talker and kept line. The record is emptied when it names dlg (re-check
+   2026-11-03: it is used once - at that conversation's window open, let through or refused - so an old record never names a later
+   conversation on a reused Dialogue). ANY THREAD. */
+int OwStartTake(void* dlg, void** who, void** line)
+{
+    while (::InterlockedCompareExchange(&g_owQLock, 1, 0) != 0) YieldProcessor();
+    const int r = (dlg != 0 && g_owStartDlg == dlg) ? 1 : 0;
+    if (r) { *who = g_owStartWho; *line = g_owStartLine; g_owStartDlg = 0; g_owStartWho = 0; g_owStartLine = 0; }
+    ::InterlockedExchange(&g_owQLock, 0);
+    return r;
+}
+
+/* Two starts in one frame: conversations whose window open was refused, ended at the next safe point (OwEndLaterDrain). MAIN THREAD. */
+struct OwEndLater { void* dlg; void* me; unsigned int tgt[5]; };   /* tgt: the refused conversation's target - that character's hand id dwords (re-check 2026-11-03) */
+const int kOwEndLaterSlots = 4;
+OwEndLater g_owEndLater[kOwEndLaterSlots];   /* static storage: empty */
+
+/* T-978 D and A (owner 1445 a; src/common/talkonewin.h). D: a reply click whose press began before the conversation window showed
+   that conversation is dropped (detour_dlgWinStep arms, detour_replyClicked drops). A: this game's own NPC being talked to stops
+   deciding (coop::SuppressCharacter) while the window shows the conversation; every end road releases it (OwFrzRoad). */
+unsigned long long kDlgWinStepRva = 0; static coop::AddrReg kDlgWinStepRva_reg("DialogueWindowStep", &kDlgWinStepRva);   /* T-978 D: Steam_1.0.65 0x726FF0 / 1.0.68 0x727B20: the dialogue window's per-frame step (`this` = the window; its only reference is a vtable slot, .rdata 0x1707F78 via the stub 0x356AC). With +0xD0 (the shown Dialogue) set: 0 buttons (+0x168) -> endDialogue(shown,1); else each button is tested for the mouse over it (0x6E2A30 on 0x2132750) and, when the left-released byte 0x2132419 is set, replyClicked(shown, i) 0x683360 runs for the hovered one (Read, decomp_726ff0) */
+unsigned long long kInputLeftReleasedRva = 0; static coop::AddrReg kInputLeftReleasedRva_reg("InputLeftReleasedFlag", &kInputLeftReleasedRva);   /* T-978 D: Steam_1.0.65 0x2132419 / 1.0.68 0x2133469: byte, 1 on the frame the left mouse button was let go - its only writer 0x82AAF0 (0x82ADB4) sets it when the left-down byte 0x2132413 is 0 and last frame's copy 0x2132415 is not (0x82B4D1 copies 413 -> 415 each frame); 0x2132417 is the left-pressed edge, 0x2132414 / 416 / 418 / 41A the same for the right button (418 is the move-order click's 'Demo Limitation' test in 0x7FF6B0) - Read, disassembly of 0x82AD80-0x82ADE8 */
+unsigned long long kInputLeftDownRva = 0; static coop::AddrReg kInputLeftDownRva_reg("InputLeftDownFlag", &kInputLeftDownRva);   /* T-978 D (review 2026-11-03): Steam_1.0.65 0x2132413 / 1.0.68 0x2133463: byte, the game's own 'left mouse button down now' - 0x82AAF0 reads it (0x82AD8E / 1.0.68 0x82B9AD) to make the released byte, and 0x82B4D1 copies it to last frame's 0x2132415 each frame (1.0.68 0x82C307 -> 0x2133465) - Read, disassembly of both exes */
+typedef void (*DlgWinStepFn)(void* win);
+DlgWinStepFn orig_dlgWinStep = 0;
+int g_dlgWinStepHook = 0;   /* same states as the other hooks */
+talkonewin::HeldClick g_owHeld = { 0, 0, 0 };   /* D, MAIN THREAD */
+int g_owInStep = 0;                              /* D, MAIN THREAD: 1 while the window step's original runs */
+volatile LONG g_owHeldNew = 0;                   /* D, any thread: the window log opened a new record (TalkLogOpen) */
+long long g_owHeldArmed = 0, g_owHeldDropped = 0, g_owHeldDisarmed = 0, g_owHeldDisarmedUp = 0, g_owHeldLogged = 0;   /* D, MAIN THREAD */
+volatile LONG64 g_owHeldStepOff = 0;             /* D: window steps seen off the main thread (passed unchanged) */
+talkonewin::Frozen g_frz = { 0, 0, 0, 0 };      /* A, MAIN THREAD: the one frozen conversation */
+void* volatile g_frzDlgAny = 0;                  /* A: g_frz.dlg for an off-main road's compare */
+volatile LONG g_frzAsk = 0;                      /* A: an off-main road's ask, road + 1, for the safe point */
+void* volatile g_frzAskDlg = 0;
+volatile LONG64 g_frzWhy[talkonewin::kFrzWhys] = { 0 };   /* A: each freeze test's answer */
+long long g_frzRel[talkonewin::kRelRoads] = { 0 };       /* A, MAIN THREAD: releases per road */
+long long g_frzGateRefused = 0, g_frzForgot = 0, g_frzFreed = 0, g_frzLogged = 0;   /* A, MAIN THREAD */
+volatile LONG64 g_frzAskOff = 0;
+void OwFrzRoad(int road, void* dlg, const void* obj);   /* A: below, beside detour_setInDialog */
+/* A, FORWARDED (review 2026-11-03): this game's own NPC talking to the other player's character stops deciding while the forwarded
+   conversation is open (OwFwdAfterForward); every road that ends it releases it (OwFwdRoad; the back-stop in OwFrzDrain). */
+const int kFrzFwdSlots = 8;
+talkonewin::Frozen g_frzFwd[kFrzFwdSlots];   /* MAIN THREAD; static storage: empty */
+volatile LONG64 g_fwdWhy[talkonewin::kFrzWhys] = { 0 };   /* each forwarded freeze test's answer */
+long long g_fwdFull = 0, g_fwdGateRefused = 0, g_fwdFreed = 0, g_fwdForgot = 0, g_fwdBackstop = 0;   /* MAIN THREAD */
+void OwFwdRoad(int road, void* dlg, const void* obj);   /* below, beside OwFrzRoad */
+static void OwFrzLetGo(const talkonewin::Frozen& f, int road, int fwd);
+void OwFwdAfterForward(void* dlg, void* npc, unsigned int uid);
+/* T-978 BUBBLE (talkonewin::BubbleHold, attempt 2, run T1949): the window's conversation's bubble timer held, and the forwarded ones' (one
+   slot per forwarded conversation). MAIN THREAD. */
+talkonewin::BubbleHold g_bhWin = { 0, 0.0f, 0, 0 };
+talkonewin::BubbleHold g_bhFwd[kFrzFwdSlots];   /* static storage: empty */
+long long g_bhWinHeld = 0, g_bhWinWrites = 0, g_bhFwdHeld = 0, g_bhFwdWrites = 0, g_bhFwdFull = 0, g_bhReadFail = 0, g_bhWriteFail = 0, g_bhLogged = 0;
 int g_tkOn = 0;   /* A's side runs only with startPlayerConversation, setInDialog, endDialogue and (fold 1) both window writers hooked */
 
 const size_t kDlgReplyTextBegin = 0x258;   /* Dialogue: std::vector<std::string> reply texts (replyClicked 0x683399 reads +0x258 / +0x260) */
@@ -797,8 +1098,13 @@ const size_t kDlgNpcText        = 0x278;   /* Dialogue: the NPC line's final tex
 const size_t kLineGameData      = 0x1D8;   /* DialogLineData::data, GameData* */
 const size_t kRootFaction       = 0x10;    /* RootObject -> Faction* (hire.cpp kCharFactionOff) */
 const size_t kDlgTargetHand     = 0x158;   /* P26s1 fold 1: Dialogue's conversation target, a hand: startPlayerConversation 0x683AA4 -> hand::operator=(RootObject*) 0x791A70 copies who +0x60..+0x70 to hand +0x8..+0x18 */
+const size_t kDlgSpeakerHand3   = 0x1C8;   /* T-978 re-check 2026-11-03: Dialogue's speaker hands for line speaker types 3 / 4 / 5 (the line's +0x31C): the speaker setter 0x6709A0 writes the speaker there (hand::operator= via the stub 0xA0C4 -> 0x791A70) before it refreshes the window's slot-0 portrait (Read, disassembly 0x6709A0-0x670A1F; decomp_679630:96-114) */
+const size_t kDlgSpeakerHand4   = 0x1E8;
+const size_t kDlgSpeakerHand5   = 0x208;
 const size_t kDlgConvEvent      = 0x188;   /* P26s1 fold 1: Dialogue's current conversation event (int): the starters write it (0x683996 = 1), endDialogue clears it (0x674163) */
 const size_t kDlgEnded          = 0x148;   /* P26s1 fold 2 N2: Dialogue's 'ended' flag (char) - the engine's own busy test reads it first (0x683890:25 / 0x684B30:10); +0x188 is not cleared by every end */
+const size_t kDlgBubble         = 0x228;   /* T-978 BUBBLE: Dialogue's speech bubble panel (0 = none): say 0x67F2F0 makes it; endDialogue deletes it (decomp_673da0:108-114); Dialogue::update counts the timers below only while it is set (decomp_684600:95) */
+const size_t kDlgBubbleTimer    = 0x230;   /* T-978 BUBBLE: float, the bubble's text timer: say writes 2.0 + 0.12 x the text's length (decomp_67f2f0:90-122); Dialogue::update subtracts the frame's step when the pause byte is clear and, with it and +0x234 both below 0, ends the conversation or advances the line (decomp_684600:96-122) */
 const size_t kWinDialogue       = 0xD0;    /* P26s1 fold 1: DialogueWindow's Dialogue: show writes it (0x726D4A), hide(dlg) clears it only when it is dlg (0x7213F9 / 0x72141F) */
 const size_t kWinShownChar      = 0xF0;    /* DialogueWindow's stored character: show writes the Dialogue's speaker 1 (getSpeaker(dlg, 1), 0x726CF0), the portrait refresh can set it, hide(dlg) clears it; the per-frame update 0x726FF0 calls its virtual +0x1B8 every frame while +0xD0 is set */
 const long long kTkFailLogCap = 40;       /* P26s1 fold 1 L5: 'NOT forwarded' / 'NOT shown' lines */
@@ -845,23 +1151,46 @@ unsigned int g_tkActSeq = 0;             /* A, MAIN THREAD: the last ACT's seq (
 long long g_tkActSent = 0, g_tkActSendFail = 0, g_tkActNpcRan = 0, g_tkActNpcFault = 0, g_tkActResOk = 0, g_tkActResRefused = 0,
           g_tkActRecv = 0, g_tkActApplied = 0, g_tkActRefused = 0, g_tkActFault = 0, g_tkActHires = 0, g_tkActUnsupported = 0,
           g_tkActLinesRun = 0;
+long long g_tkActHoldEndOnly = 0;   /* T-1187: A, MAIN THREAD - held runs with no NPC-side action (only the line's parts and its end call 0x2732F0) */
+long long g_tkActHeldRunUnrun = 0;  /* T-1187 fold 2: A, MAIN THREAD - held runs that did not happen after APPLIED (fault / unavailable), noted as unrun for the END */
 void* g_tkActView[cooptalk::kTalkMaxActs];   /* MAIN THREAD: the action pointers of one viewed _doActions call */
 /* P26s5 fold 1 - A, MAIN THREAD: a line's NPC-side part HELD until the other game answers its ACT (by seq) */
 struct TkActHold { unsigned int seq, convId, peer, n; void* dlg; void* me; void* line; void* acts[cooptalk::kTalkMaxActs];
                    int endsTalk, endsType;
                    int endHeld, endReason; const char* endWhy;   /* P26s5 fold 2: the conversation's end held until this answer - its END reason and why (literals) */
-                   int takeOrders; unsigned int npcUid, carriedUid; };   /* a carried-person line (10 / 30 / 40): takeOrders 1 = after APPLIED this
+                   int takeOrders; unsigned int npcUid, carriedUid;
+                   int aiRef; };   /* T-1187 fold 1: the line's 'change AI' / 'AI contract' lists (TkLineAiRefPod: 1 one not empty, 0 none, -1 unread) */
+/* takeOrders: a carried-person line (10 / 30 / 40): takeOrders 1 = after APPLIED this
                    game gives its NPC (npcUid) the take and cage orders itself, on the person (carriedUid) the other player's character carries here */
 /* P26s5 fold 2: TkActHold.line is the engine's SHARED DialogLineData (DialogDataManager's, never written or freed here - endDialogue
    0x673DA0 only clears the Dialogue's +0x198); the private 0x320 copy is made at run time inside TkRunViewPod (g_tkLineCopy). */
 const size_t kTkActHoldCap = 16;
 std::vector<TkActHold> g_tkActHolds;
+/* T-858 (talkrefund.h), A: a held line dropped at the cap never runs its NPC-side part - its seq is still listed on its
+   conversation's END so the talker's game refunds what it took (bounded: the oldest goes; that peer's go with its link). MAIN THREAD. */
+struct TkUnrunDrop { unsigned int peer, convId, seq; };
+std::vector<TkUnrunDrop> g_tkUnrunDropped;
+const size_t kTkUnrunDroppedCap = 32;
+/* T-858, B: the paid ACTs this game applied (talkrefund.h) and the refunds an END made due, paid when the money may move
+   (StoreMoneyReady). A booked row lives until its conversation's END or the link's end (TalkForgetPeer) - no clock. MAIN THREAD. */
+cooptalk::TalkRefundBook g_tkRefundBook;
+struct TkRefundDue { unsigned int convId, seq; int amount; long long base; int tries; };   /* base: StoreMoneyBaseReads when the money was taken */
+const int kTkRefundTries = 600;   /* "no purse" or an unwritable pp.money at pay time: retried each tick, at most this many times */
+std::vector<TkRefundDue> g_tkRefundDue;
+long long g_tkPaidBooked = 0, g_tkRefunds = 0, g_tkRefundMoney = 0, g_tkRefundFailed = 0, g_tkUnrunListed = 0, g_tkRefundStale = 0;
+/* T-858 review LOW 2 / 3: every drop path counted - A's dropped-line notes lost at their cap, unrun seqs past an END's 16, B's
+   waiting refunds lost at kTalkRefundDueCap (the first such loss logged once) */
+long long g_tkUnrunNoteLost = 0, g_tkUnrunOverflow = 0, g_tkRefundDueLost = 0;
+struct TkSamePlayer { bool operator()(unsigned int a, unsigned int b) const { return cooplive::SamePlayer(a, b, coop::LinkPeerSlot()); } };
 long long g_tkActHeld = 0, g_tkActHoldRefused = 0, g_tkActHoldLost = 0, g_tkActHoldDropped = 0, g_tkActCarriedNone = 0,
           g_tkAct28Refused = 0, g_tkActEndsTalk = 0, g_tkNotices = 0;
 /* carried-person lines: A - sent, the engine's case run here (this game owns the person), take orders given / not given / faulted;
    B - applied (hand-over marked), the engine's case run on our own character, refused NO_CARRY */
 long long g_tkCarriedSent = 0, g_tkCarriedNpcEngine = 0, g_tkTakeOrders = 0, g_tkTakeRefused = 0, g_tkTakeFault = 0,
           g_tkCarriedApplied = 0, g_tkCarriedTalkerEngine = 0, g_tkCarriedNoCarry = 0;
+long long g_t478SurrRan = 0, g_t478SurrChained = 0;   /* T-478 step 4, B: surrender (47) lines run on our own characters; characters they chained */
+long long g_t478SurrSkipped = 0, g_t478SurrHeld = 0;   /* review folds 2 / 3, B: characters of the talker's faction the case did not chain; chains held as copies */
+long long g_t478SurrNotForwardedA = 0;   /* review fold 1: a line holding 47 the engine runs here in a conversation the router did not forward */
 long long g_tkEndHeld = 0, g_tkEndHeldRan = 0, g_tkEndHeldNotRun = 0, g_tkEndHeldRepeat = 0, g_tkAnsWhileHeld = 0;   /* P26s5 fold 2 */
 volatile LONG64 g_tkEndReused = 0;   /* P26s5 fold 4: a new startConversation on a Dialogue whose forwarded conversation the engine had ended (any thread) */
 long long g_tkEndKept = 0, g_tkEndReEnd = 0;   /* P26s5 fold 3: engine ends inside an applied answer that kept this game's side open; the engine's later ends of it passed */
@@ -1177,6 +1506,34 @@ std::string TkLineSid(const void* line)
     return n > 0 ? std::string(b, (size_t)n) : std::string();
 }
 
+/* T-1187 review fold 1: does a DialogLineData's GameData (+0x1D8) carry a non-empty 'change AI' or 'AI contract' reference list - the
+   two lists the end call 0x2732F0 / 0x272700 puts on the NPC's squad (Read, build/decomp_2732f0.txt:28-55, 127-163; F1051)? The list
+   map at GameData+0x2B8 is walked as T2TownHasVersionsPod (towngen.cpp) walks it: count +0x20, first node from the buckets +0x38 at
+   +0x18; node: next +0, name +0x10, entries +0x38..+0x40. 1 one is not empty, 0 neither, -1 unreadable. No C++ object (C2712). */
+static int TkLineAiRefPod(const void* line)
+{
+    if (line == 0) return -1;
+    __try
+    {
+        const char* gd = *(const char* const*)((const char*)line + kLineGameData);
+        if (gd == 0) return -1;
+        const char* m = gd + 0x2B8;
+        if (*(const unsigned long long*)(m + 0x20) == 0) return 0;
+        const char* node = *(const char* const*)(*(const char* const*)(m + 0x38) + *(const long long*)(m + 0x18) * 8);
+        int guard = 0;
+        for (; node != 0 && guard < 4096; ++guard, node = *(const char* const*)node)
+        {
+            const char* s = node + 0x10;
+            const unsigned long long len = *(const unsigned long long*)(s + 0x10), cap = *(const unsigned long long*)(s + 0x18);
+            const char* txt = (cap > 15) ? *(const char* const*)s : s;
+            const int named = (len == 9 && std::memcmp(txt, "change AI", 9) == 0) || (len == 11 && std::memcmp(txt, "AI contract", 11) == 0);
+            if (named && *(const char* const*)(node + 0x40) != *(const char* const*)(node + 0x38)) return 1;
+        }
+        return guard >= 4096 ? -1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
 /* A Character's Dialogue when it reads as one (me == c), else 0 (TalkDialogueOf's test). */
 void* TkDialogueOf(void* c)
 {
@@ -1219,16 +1576,43 @@ std::string TkNameStr(void* c) { char n[48]; TalkName((::Character*)c, n); retur
 
 void TkPurseTalkEnded(unsigned int uid);   /* below, with the purse table */
 
+/* T-858, A: the ACT seqs of conversation convId whose NPC-side part has not run - its held lines (and lines dropped at the hold
+   cap) - listed on its END, so the talker's game gives back what it took for them (talkrefund.h). A line whose ACT_RESULT came and
+   ran is no longer held, so it is never listed; a late ACT_RESULT for a listed line finds its conversation gone and runs nothing
+   (TkApplyActResult's live test). A held carried-person line (takeOrders) is never listed: a late APPLIED still takes the person
+   (TkTakeCarried), so it is never both refunded and taken. MAIN THREAD. */
+static std::vector<unsigned int> TkUnrunFor(unsigned int convId)
+{
+    std::vector<unsigned int> out;
+    for (size_t k = 0; k < g_tkActHolds.size(); ++k)
+        if (g_tkActHolds[k].convId == convId && g_tkActHolds[k].takeOrders == 0
+            && cooptalk::TalkHoldMayListUnrun(g_tkActHolds[k].n, g_tkActHolds[k].aiRef))   /* T-1187: also n 0 with a 'change AI' / 'AI contract' (the end call 0x2732F0's hire contract has not run); a talker-only line never (fold 1) */
+            cooptalk::TalkUnrunAdd(&out, g_tkActHolds[k].seq, &g_tkUnrunOverflow);   /* past 16: counted (review LOW 2) */
+    for (size_t k = 0; k < g_tkUnrunDropped.size();)
+    {
+        if (g_tkUnrunDropped[k].convId != convId) { ++k; continue; }
+        cooptalk::TalkUnrunAdd(&out, g_tkUnrunDropped[k].seq, &g_tkUnrunOverflow);
+        g_tkUnrunDropped.erase(g_tkUnrunDropped.begin() + (long)k);
+    }
+    g_tkUnrunListed += (long long)out.size();
+    return out;
+}
+
 /* A, MAIN THREAD: end THIS game's side of a forwarded (or not-forwarded) conversation. The mark is kept through the engine's
    endDialogue (so its setInDialog(false) leaves the window alone), then dropped; END goes to the peer when sendReason != 0 and
    the conversation had been forwarded. callEnd 0 = the engine has already ended it. */
-void TkEndOwn(void* dlg, void* me, int sendReason, const char* why, int callEnd, int endsType = 0)   /* P25: endsType on the END (1 / 11) */
+/* T-478 step 3, A: counters for the bail line (43) - the conversation ended with END endsType 43 (sent / its line id unreadable) */
+long long g_t478BailEndSent = 0, g_t478BailEndNoLine = 0;
+long long g_t478SellEndSent = 0, g_t478SellEndNoLine = 0;   /* T-478 step 5, A: the same for the selling line (41) */
+void TkEndOwn(void* dlg, void* me, int sendReason, const char* why, int callEnd, int endsType = 0,
+              const std::string& endsLine = std::string())   /* P25: endsType on the END (1 / 11); T-478 step 3: 43 and its line's id */
 {
     std::map<void*, TkConv>::iterator it = g_tkConvs.find(dlg);
     TkConv c;
     std::memset(&c, 0, sizeof(c));
     int had = 0;
     if (it != g_tkConvs.end()) { c = it->second; had = 1; g_tkConvs.erase(it); }
+    if (had) OwFwdRoad(talkonewin::kRelFwdEnded, dlg, 0);   /* T-978 A forwarded: the NPC decides again (END, CLOSED, the mark's release) */
     if (had) TkPurseTalkEnded(c.targetUid);   /* a later talk never judges money replies by this talk's purse */
     if (had && c.engineEnded) callEnd = 0;   /* P26s5 fold 3: the engine already ended it - not again */
     if (me == 0 && had) me = c.me;
@@ -1243,12 +1627,21 @@ void TkEndOwn(void* dlg, void* me, int sendReason, const char* why, int callEnd,
         cooptalk::TalkMsg e;
         e.kind = cooptalk::kTalkEnd; e.convId = c.convId; e.npcUid = c.npcUid; e.targetUid = c.targetUid; e.reason = sendReason;
         e.endsType = endsType;   /* P25 step 5: the other game opens that window itself */
+        if (cooptalk::TalkEndCarriesLine(endsType)) e.lineSid = endsLine;   /* T-478 steps 3 / 5: the talker's game runs that line's case itself */
+        e.unrun = TkUnrunFor(c.convId);   /* T-858: the paid lines this end leaves unrun - the other game refunds them */
         sent = net::SendTalk(e) ? 1 : 0;
         if (sent) ++g_tkEndSent;
+        if (sent && endsType == 43) { if (endsLine.empty()) ++g_t478BailEndNoLine; else ++g_t478BailEndSent; }
+        if (sent && endsType == 41) { if (endsLine.empty()) ++g_t478SellEndNoLine; else ++g_t478SellEndSent; }
+        if (endsType == 41)
+            TkLog("[TALK] T478 A sell END conv=" + TkU(c.convId) + " slaver npc uid=" + TkU(c.npcUid) + " -> seller uid=" + TkU(c.targetUid)
+                  + " endsType=41 line=" + (endsLine.empty() ? std::string("(unreadable - the seller's game opens nothing)") : endsLine)
+                  + (sent ? " sent: the seller's game opens its own selling window" : " NOT sent (link down): no window opens"));
     }
     if (!had && ended != 1) return;   /* a not-forwarded start whose Dialogue is gone: counted by the caller only */
     TkLog("[TALK] A end conv=" + TkU(c.convId) + " npc uid=" + TkU(c.npcUid) + " -> target uid=" + TkU(c.targetUid)
-          + " why=" + why + " endDialogue=" + TkI(ended) + " END=" + (sent < 0 ? std::string("not sent")
+          + " why=" + why + (endsType != 0 ? " endsType=" + TkI(endsType) + (cooptalk::TalkEndCarriesLine(endsType) ? " line=" + endsLine : std::string("")) : std::string(""))
+          + " endDialogue=" + TkI(ended) + " END=" + (sent < 0 ? std::string("not sent")
           : (sent ? std::string("sent ") + cooptalk::TalkEndName(sendReason) : std::string("FAILED (link down)"))));
 }
 
@@ -1288,19 +1681,40 @@ void TkRelease(void* dlg)
     }
 }
 
-/* P26s1 fold 1 L3: 1 = the Dialogue's conversation target (the hand at +0x158) names who - the five id dwords at hand +0x8..+0x18
-   equal who's own hand's (Character +0x58, H027; hand::operator=(RootObject*) 0x791A70 copies who +0x60..+0x70). No C++ object. */
-int TkHandIs(void* dlg, void* who)
+/* T-978 re-check 2026-11-03: 1 = the hand at dlg + off names who (TkHandIs for any of the Dialogue's hands). No C++ object. */
+int TkHandAtIs(void* dlg, size_t off, void* who)
 {
     if (dlg == 0 || who == 0) return 0;
     __try
     {
-        const unsigned int* a = (const unsigned int*)((const char*)dlg + kDlgTargetHand + 8);
+        const unsigned int* a = (const unsigned int*)((const char*)dlg + off + 8);
         const unsigned int* b = (const unsigned int*)((const char*)who + kCharHand + 8);
         for (int k = 0; k < 5; ++k) if (a[k] != b[k]) return 0;
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* P26s1 fold 1 L3: 1 = the Dialogue's conversation target (the hand at +0x158) names who - the five id dwords at hand +0x8..+0x18
+   equal who's own hand's (Character +0x58, H027; hand::operator=(RootObject*) 0x791A70 copies who +0x60..+0x70). No C++ object. */
+int TkHandIs(void* dlg, void* who)
+{
+    return TkHandAtIs(dlg, kDlgTargetHand, who);
+}
+
+/* T-978 re-check 2026-11-03: the five id dwords of the hand at p + off (+0x8..+0x18) copied to w; 1 = read, 0 = unreadable (w
+   zeroed). No C++ object. */
+int TkHandWordsPod(const void* p, size_t off, unsigned int* w)
+{
+    for (int k = 0; k < 5; ++k) w[k] = 0;
+    if (p == 0) return 0;
+    __try
+    {
+        const unsigned int* a = (const unsigned int*)((const char*)p + off + 8);
+        for (int k = 0; k < 5; ++k) w[k] = a[k];
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { for (int k = 0; k < 5; ++k) w[k] = 0; return 0; }
 }
 
 /* P26s1 fold 1: an int at base + off, 0 when unreadable. No C++ object here (C2712). */
@@ -1363,6 +1777,11 @@ void TkOrderFinish(const TkOrderCtx* oc, void* dlg, void* who, void* ret)
     e.set = oc->set; e.reached = oc->reached; e.hadLine = oc->hadLine; e.started = oc->started; e.busyCopy = busyCopy;
     e.convEv = TkReadIntPod(dlg, kDlgConvEvent); e.gateDist = oc->gateDist;
     e.site = (g_base != 0 && (uintptr_t)ret > g_base) ? (unsigned long long)((uintptr_t)ret - g_base) : 0;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    e.p213Order = oc->p213Order;
+// PROBE-END: P213
+#endif
     ::InterlockedExchange(&e.state, 2);   /* a full barrier: the fields above are visible before 'ready' */
     ::InterlockedIncrement(&g_tkOrderPending);
     ::SetLastError(le);
@@ -1411,9 +1830,11 @@ void TkAfterStart(void* dlg, void* who, int started, int ev, int mark, int creat
         const TkConv o = old->second;
         oldTarget = o.targetUid;
         g_tkConvs.erase(old);
+        OwFwdRoad(talkonewin::kRelFwdEnded, dlg, 0);   /* T-978 A forwarded: the replaced conversation's hold goes (a forwarded new start takes it again) */
         ++g_tkRestarted;
         cooptalk::TalkMsg e;
         e.kind = cooptalk::kTalkEnd; e.convId = o.convId; e.npcUid = o.npcUid; e.targetUid = o.targetUid; e.reason = cooptalk::kTalkEndRestarted;
+        e.unrun = TkUnrunFor(o.convId);   /* T-858 */
         if (net::SendTalk(e)) ++g_tkEndSent;
         TkLog("[TALK] A conv=" + TkU(o.convId) + " replaced by a new start on the same Dialogue - END RESTARTED");
     }
@@ -1474,6 +1895,7 @@ void TkAfterStart(void* dlg, void* who, int started, int ev, int mark, int creat
     }
     c.line = SayReadPtr(dlg, kDlgCurLine); c.seq = 1; c.sentTick = ::GetTickCount(); c.ev = p.event;   /* P26 stage 4 */
     g_tkConvs[dlg] = c;
+    OwFwdAfterForward(dlg, me, nuid);   /* T-978 A forwarded: the NPC stops deciding while the other player's window shows it */
     if (oldTarget != 0 && oldTarget != c.targetUid) TkPurseTalkEnded(oldTarget);   /* after the new talk is in the table: the replaced target's purse */
     ++g_tkPromptSent;
     std::string rs;
@@ -1576,6 +1998,638 @@ void TkMirrorAnswer(int index)
           + " id=" + a.replyId + " - the reply runs on the NPC's game; the window stays until its next line (PROMPT) or its END");
 }
 
+/* THE CONVERSATION WINDOW LOG (owner decision 1410 c, T-978). For a report like "my character answered an NPC by itself": every
+   conversation THIS game's own dialogue window shows (only this game's own player's conversations) - when it opens and by what,
+   each line the game's own next-line step says in it (Dialogue::triggerNextLine, which Dialogue::update calls when the speech
+   timers run out; those count down only while the pause byte is clear, decomp_684600:98-122) with the replies the window offered
+   as the step began and whether a reply was clicked since the line before, each reply click and where it came from (this window,
+   a window copying another game's conversation, or the mod's own call), the conversation's ends, and the close with how long the
+   window was open. The update step can end the window's conversation and step the OTHER speaker's object (decomp_684600:141-148),
+   and a line is said on its speaker's object (decomp_683c90:68-78): a step on this game's own character's object in the window's
+   conversation prints as obj=partner; other steps while the window is up are counted (otherNextLines). Every line carries the
+   pause byte. Line forms, the cap and the step sorting: src/common/talklog.h (at most 200 lines a launch, then one cap line).
+   LOG ONLY: every hook calls the original unchanged; nothing is written to the game. ANY THREAD: the window record sits behind a
+   spin lock held only for field copies (never across an engine call or a log write); every game read is an SEH-guarded helper.
+   A record whose object the window no longer shows (freed or swapped without setInDialog(false)) closes as by=gone at the next
+   step or hook that sees it, so a reused address never logs against it.
+   HOOKS, each failing closed: the next-line step (row DialogueTriggerNextLine) is hooked here - no row or a failed hook = no
+   NEXTLINE lines, said once in the install line, the game unaffected; OPEN / CLICK / END / CLOSE ride on the existing talk hooks
+   setInDialog / replyClicked / endDialogue (their states are in the same install line). No pause byte row = paused=-1.
+   COST: the next-line step runs for every conversation in the world (NPC chatter, a few a second in a crowd). With no window up
+   it adds two guarded pointer reads, one uncontended interlocked lock and compares; while a window is up, a step on another
+   object adds up to four guarded reads (and the owner test only when one of them matches). */
+const char* TalkHookState(int s);   /* below */
+typedef void (*TalkLogNextLineFn)(void* dlg, void* line);
+TalkLogNextLineFn orig_talkLogNextLine = 0;
+int g_talkLogNextLineHook = 0;               /* 1 installed, -1 AddHook FAILED, -2 no table address */
+/* T-978 (owner 1445 a): the character a Dialogue's conversation is with is NOT a pointer field: it is the hand at +0x158
+   (kDlgTargetHand; sayLine resolves it through the hand lookups, decomp_682f10:46-66; startPlayerConversation fills it through
+   hand::operator=(RootObject*) 0x791A70). +0x190 (read here before) is the dialog package, which endDialogue clears - a pointer
+   compare there never matched, so obj=partner never printed. TalkLogPartner compares hands (TkHandIs). */
+volatile LONG g_talkLogLines = 0;            /* lines written this launch (talklog::CapStep) */
+volatile LONG g_talkLogLock = 0;             /* the spin lock around g_talkLogWin */
+/* the window's record: its Dialogue, when it opened, its number, its counts; clickSince = a click seen since the last line;
+   lastMs = when the last line, click or the open was */
+struct TalkLogWin { void* dlg; DWORD openMs; DWORD lastMs; LONG n; LONG steps; LONG partner; LONG other; LONG clicks; LONG ends; LONG clickSince; };
+TalkLogWin g_talkLogWin = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+LONG g_talkLogOpens = 0;
+PVOID volatile g_talkLogStartDlg = 0;        /* the newest startPlayerConversation's Dialogue and `who` (any thread): OPEN's talker */
+PVOID volatile g_talkLogStartWho = 0;
+
+void TalkLogLock() { while (::InterlockedCompareExchange(&g_talkLogLock, 1, 0) != 0) ::SwitchToThread(); }
+void TalkLogUnlock() { ::InterlockedExchange(&g_talkLogLock, 0); }
+
+/* 1 paused, 0 running, -1 unreadable / no row. No C++ object (C2712). */
+int TalkLogPaused()
+{
+    if (kTalkLogPauseByteRva == 0 || g_base == 0) return -1;
+    __try { return (*(volatile const unsigned char*)(g_base + (uintptr_t)kTalkLogPauseByteRva) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int TalkLogMain() { return SayOnMainThread() != 0 ? 1 : 0; }
+
+/* 1 = the mod itself is calling the engine on this Dialogue (copying another game's conversation; g_tkApplyDlg is main-thread only) */
+int TalkLogByMod(void* dlg) { return (dlg != 0 && SayOnMainThread() != 0 && dlg == g_tkApplyDlg) ? 1 : 0; }
+
+void TalkLogLine(const std::string& s)
+{
+    const int step = talklog::CapStep((long)::InterlockedIncrement(&g_talkLogLines));
+    if (step == 0) return;
+    DebugLog(s);
+    if (step == 2) DebugLog(talklog::CapLine());
+}
+
+/* 1 = this game's dialogue window shows dlg now, 0 = it does not, -1 = the window's address is not in the table */
+int TalkLogIsWindow(void* dlg)
+{
+    void* const w = TkWindowDlg();
+    if (w == (void*)1) return -1;
+    return (dlg != 0 && w == dlg) ? 1 : 0;
+}
+
+std::string TalkLogSince(DWORD ms) { return talklog::Sec((unsigned int)::GetTickCount(), (unsigned int)ms); }
+
+/* the start's Dialogue and talker are forgotten once that conversation ends or closes */
+void TalkLogForgetStart(void* dlg)
+{
+    if (dlg != 0 && ::InterlockedCompareExchangePointer(&g_talkLogStartDlg, 0, dlg) == dlg) ::InterlockedExchangePointer(&g_talkLogStartWho, 0);
+}
+
+/* the window record ends (caller holds no lock): one CLOSE line */
+void TalkLogCloseLine(const TalkLogWin& w, const char* by)
+{
+    TalkLogForgetStart(w.dlg);
+    TalkLogLine(talklog::CloseLine((long)w.n, by, TalkLogSince(w.openMs), (long)w.steps, (long)w.partner, (long)w.other, (long)w.clicks,
+                                   (long)w.ends, TalkLogPaused(), TalkLogMain()));
+}
+
+/* the record of dlg (if it is the open one) ends: one CLOSE line. by: a literal. */
+void TalkLogDrop(void* dlg, const char* by)
+{
+    TalkLogWin w; w.dlg = 0;
+    TalkLogLock();
+    if (dlg != 0 && g_talkLogWin.dlg == dlg) { w = g_talkLogWin; g_talkLogWin.dlg = 0; }
+    TalkLogUnlock();
+    if (w.dlg != 0) TalkLogCloseLine(w, by);
+}
+
+/* the window shows dlg: a new record (the one before it, if another Dialogue, is closed as replaced). by: a literal. */
+void TalkLogOpen(void* dlg, const char* by)
+{
+    TalkLogWin old; old.dlg = 0;
+    LONG n = 0;
+    TalkLogLock();
+    if (g_talkLogWin.dlg == dlg) { TalkLogUnlock(); return; }
+    if (g_talkLogWin.dlg != 0) old = g_talkLogWin;
+    n = ++g_talkLogOpens;
+    g_talkLogWin.dlg = dlg; g_talkLogWin.openMs = ::GetTickCount(); g_talkLogWin.lastMs = g_talkLogWin.openMs; g_talkLogWin.n = n;
+    g_talkLogWin.steps = 0; g_talkLogWin.partner = 0; g_talkLogWin.other = 0; g_talkLogWin.clicks = 0; g_talkLogWin.ends = 0;
+    g_talkLogWin.clickSince = 0;
+    TalkLogUnlock();
+    ::InterlockedExchange(&g_owHeldNew, 1);   /* T-978 D: a new conversation in the window - the next window step judges a held button */
+    if (old.dlg != 0) TalkLogCloseLine(old, "replaced");
+    if (old.dlg != 0) OwFrzRoad(talkonewin::kRelReplaced, old.dlg, 0);   /* T-978 A */
+    void* const npc = SayReadPtr(dlg, kDlgMe);
+    void* const sd = g_talkLogStartDlg;
+    void* const who = (sd == dlg) ? (void*)g_talkLogStartWho : 0;
+    TalkLogLine(talklog::OpenLine((long)n, by, TkNameStr(npc), who != 0 ? TkNameStr(who) : std::string(), who != 0 ? (TkOrderIsMine(who) ? 1 : 0) : -1,
+                                  TalkLogByMod(dlg), TalkLogPaused(), TalkLogMain()));
+}
+
+/* the window's record for dlg: 1 = it is the open record and the window still shows dlg (*w filled), else 0. A record whose
+   object the window no longer shows is closed here (by=gone). */
+int TalkLogTracked(void* dlg, TalkLogWin* w)
+{
+    if (dlg == 0) return 0;
+    int r = 0;
+    TalkLogLock();
+    if (g_talkLogWin.dlg == dlg) { *w = g_talkLogWin; r = 1; }
+    TalkLogUnlock();
+    if (r && TalkLogIsWindow(dlg) == 0) { TalkLogDrop(dlg, "gone"); return 0; }
+    return r;
+}
+
+/* the tracked window (dlg) or, when the window shows dlg with no record yet, a record opened now (by). 1 = tracked (*w). */
+int TalkLogTrackOrOpen(void* dlg, TalkLogWin* w, const char* by)
+{
+    if (TalkLogTracked(dlg, w)) return 1;
+    if (dlg == 0 || TalkLogIsWindow(dlg) != 1) return 0;
+    TalkLogOpen(dlg, by);
+    return TalkLogTracked(dlg, w);
+}
+
+/* 1 = dlg's owner is this game's own character in the conversation the window shows (shown): shown's target hand (+0x158)
+   names dlg's owner, or dlg's target hand names shown's owner. Hand compares first (five id dwords each); the owner test only on
+   a match. Any thread, guarded reads. */
+int TalkLogPartner(void* dlg, void* shown)
+{
+    void* const me = SayReadPtr(dlg, kDlgMe);
+    if (me == 0 || shown == 0) return 0;
+    if (!TkHandIs(shown, me) && !TkHandIs(dlg, SayReadPtr(shown, kDlgMe))) return 0;
+    return TkOrderIsMine(me) ? 1 : 0;
+}
+
+void detour_talkLogNextLine(void* dlg, void* line)
+{
+    void* const shown = TkWindowDlg();
+    TalkLogLock();
+    void* const rec = g_talkLogWin.dlg;
+    TalkLogUnlock();
+    int kind = talklog::StepKind(dlg, shown, rec, 0);
+    if (kind == talklog::kStepOther && TalkLogPartner(dlg, shown)) kind = talklog::kStepPartner;
+    if (kind == talklog::kStepGone) TalkLogDrop(rec, "gone");
+    if (kind == talklog::kStepOther)
+    {
+        TalkLogLock();
+        if (g_talkLogWin.dlg == rec) ++g_talkLogWin.other;
+        TalkLogUnlock();
+    }
+    TalkLogWin w;
+    const int partner = (kind == talklog::kStepPartner) ? 1 : 0;
+    void* const win = partner ? shown : dlg;   /* the window's own object: its record and its replies */
+    if ((kind != talklog::kStepWindow && !partner) || !TalkLogTrackOrOpen(win, &w, "nextLine")) { orig_talkLogNextLine(dlg, line); return; }
+    const int paused = TalkLogPaused(), mod = (TalkLogByMod(win) || TalkLogByMod(dlg)) ? 1 : 0, onMain = TalkLogMain();   /* as the step began */
+    std::vector<std::string> ids;
+    const int offered = TkReadStrVec(win, kDlgReplyBegin, kDlgReplyEnd, &ids, 16, 8);   /* the replies the window offered as the step began */
+    orig_talkLogNextLine(dlg, line);
+    ids.clear();
+    const int replies = TkReadStrVec(win, kDlgReplyBegin, kDlgReplyEnd, &ids, 16, 8);
+    LONG clicked = 0;
+    DWORD last = w.lastMs;
+    int same = 0;
+    TalkLogLock();
+    if (g_talkLogWin.dlg == win && g_talkLogWin.n == w.n)
+    {
+        same = 1;
+        clicked = g_talkLogWin.clickSince; last = g_talkLogWin.lastMs;
+        if (partner) ++g_talkLogWin.partner; else ++g_talkLogWin.steps;
+        g_talkLogWin.clickSince = 0; g_talkLogWin.lastMs = ::GetTickCount();
+    }
+    TalkLogUnlock();
+    if (!same) return;   /* the window moved on to another conversation during the step: that one has its own record */
+    TalkLogLine(talklog::NextLineLine((long)w.n, TalkLogSince(w.openMs), partner, mod, clicked != 0 ? 1 : 0, TalkLogSince(last), (long)offered,
+                                      TkStr((const char*)dlg + kDlgNpcText, 80), replies, TkReadBytePod(dlg, kDlgEnded) != 0 ? 1 : 0,
+                                      TalkLogIsWindow(win), paused, onMain));
+}
+
+void TalkLogClick(void* dlg, int index)
+{
+    TalkLogWin w;
+    if (!TalkLogTrackOrOpen(dlg, &w, "click")) return;
+    TalkLogLock();
+    if (g_talkLogWin.dlg == dlg && g_talkLogWin.n == w.n) { ++g_talkLogWin.clicks; g_talkLogWin.clickSince = 1; g_talkLogWin.lastMs = ::GetTickCount(); }
+    TalkLogUnlock();
+    std::vector<std::string> texts;
+    const int replies = TkReadStrVec(dlg, kDlgReplyTextBegin, kDlgReplyTextEnd, &texts, 16, 60);
+    const std::string rt = (index >= 0 && (size_t)index < texts.size()) ? texts[(size_t)index] : std::string("?");
+    TalkLogLine(talklog::ClickLine((long)w.n, TalkLogSince(w.openMs), index, replies, rt, TalkLogByMod(dlg), dlg == g_tkMirrorDlgAny ? 1 : 0,
+                                   TalkLogPaused(), TalkLogMain()));
+}
+
+void TalkLogEnd(void* dlg, bool fin)
+{
+    TalkLogWin w;
+    if (!TalkLogTracked(dlg, &w)) return;
+    TalkLogForgetStart(dlg);   /* only the window's own conversation: a start may end the same object's earlier chatter first */
+    TalkLogLock();
+    if (g_talkLogWin.dlg == dlg && g_talkLogWin.n == w.n) ++g_talkLogWin.ends;
+    TalkLogUnlock();
+    TalkLogLine(talklog::EndLine((long)w.n, TalkLogSince(w.openMs), fin ? 1 : 0, TalkLogByMod(dlg), TalkLogPaused(), TalkLogMain()));
+}
+
+void TalkLogClose(void* dlg)
+{
+    TalkLogForgetStart(dlg);
+    TalkLogDrop(dlg, "setInDialog(false)");
+}
+
+/* After the setInDialog / endDialogue / replyClicked hooks (InstallTalkStarters): the next-line hook and one install line. */
+void TalkLogInstall()
+{
+    if (kTalkLogNextLineRva == 0) g_talkLogNextLineHook = -2;
+    else g_talkLogNextLineHook = (coop::AddHook((void*)(g_base + kTalkLogNextLineRva), (void*)&detour_talkLogNextLine,
+                                                (void**)&orig_talkLogNextLine) == coop::SUCCESS) ? 1 : -1;
+    char b[400];
+    std::sprintf(b, "[TALKLOG] install (log only): nextLine 0x%llX=%s setInDialog=%s replyClicked=%s endDialogue=%s pauseByte=%s"
+                 " - at most %ld conversation window lines a launch",
+                 kTalkLogNextLineRva, TalkHookState(g_talkLogNextLineHook), TalkHookState(g_setInDialogHook), TalkHookState(g_replyClickedHook),
+                 TalkHookState(g_endDialogueHook), kTalkLogPauseByteRva != 0 ? "row" : "noAddress", talklog::kCap);
+    if (g_talkLogNextLineHook == 1 && g_setInDialogHook == 1 && g_replyClickedHook == 1 && g_endDialogueHook == 1 && kTalkLogPauseByteRva != 0)
+        DebugLog(std::string(b));
+    else ErrorLog(std::string(b));
+}
+
+/* T-978 A: the frozen NPC's speed as the hold begins (a walk already under way is not stopped by the hold - the run shows it).
+   SEH-guarded, no C++ object. -1 = unreadable. */
+static float OwSpeedPod(void* c)
+{
+    float v = -1.0f;
+    if (c == 0) return v;
+    __try { v = ((::Character*)c)->currentMoveSpeed(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { v = -1.0f; }
+    return v;
+}
+
+static const char* OwRoadName(int road)
+{
+    switch (road)
+    {
+    case talkonewin::kRelSetInDialogOff: return "the window closed (setInDialog(false))";
+    case talkonewin::kRelEndDialogue:    return "the conversation ended (endDialogue - an attack's break-off too)";
+    case talkonewin::kRelReplaced:       return "another conversation took the window";
+    case talkonewin::kRelDestroyed:      return "the NPC was destroyed";
+    case talkonewin::kRelLinkDropped:    return "the link to the other game dropped";
+    case talkonewin::kRelTeardown:       return "the world is torn down or loading";
+    case talkonewin::kRelFwdEnded:       return "the forwarded conversation ended (END, CLOSED, the mark's release or a restart)";
+    default:                             return "the window no longer shows it";
+    }
+}
+
+/* T-978 A: one road the frozen conversation ends by (talkonewin::ReleaseMatches / ReleaseAction). MAIN THREAD; called off it, a
+   road naming the frozen conversation is asked of the next safe point (OwFrzDrain). The hold goes by the character's ADDRESS
+   (ReleaseGateForObject: the object is not touched); a character handed over meanwhile (no longer this game's own) keeps its hold -
+   it is the copy gate's now. */
+void OwFrzRoad(int road, void* dlg, const void* obj)
+{
+    if (SayOnMainThread() == 0)
+    {
+        void* const fd = g_frzDlgAny;
+        if (fd == 0) return;
+        if ((road == talkonewin::kRelSetInDialogOff || road == talkonewin::kRelEndDialogue || road == talkonewin::kRelReplaced) && dlg != fd) return;
+        ::InterlockedExchangePointer(&g_frzAskDlg, fd);
+        ::InterlockedExchange(&g_frzAsk, (LONG)road + 1);
+        ::InterlockedIncrement64(&g_frzAskOff);
+        return;
+    }
+    OwFwdRoad(road, dlg, obj);   /* the forwarded conversations' holds: the roads that apply to them (talkonewin::FwdRoad) */
+    if (!talkonewin::ReleaseMatches(&g_frz, road, dlg, obj)) return;
+    const talkonewin::Frozen f = g_frz;
+    g_frz.set = 0; g_frz.dlg = 0; g_frz.npc = 0; g_frz.uid = 0;
+    ::InterlockedExchangePointer(&g_frzDlgAny, 0);
+    OwFrzLetGo(f, road, 0);
+}
+
+/* T-978 A: a slot's hold let go by one road (the slot already emptied). By the character's ADDRESS (ReleaseGateForObject: the
+   object is not touched); a character handed over meanwhile (no longer this game's own) keeps its hold - the copy gate's now.
+   fwd = a forwarded conversation's slot. MAIN THREAD. */
+static void OwFrzLetGo(const talkonewin::Frozen& f, int road, int fwd)
+{
+    int stillMine = 0;
+    if (road != talkonewin::kRelTeardown && road != talkonewin::kRelDestroyed)
+        stillMine = (f.uid != 0 && FindSpawnedUid(f.npc) == f.uid && net::IsUidMine(f.uid)) ? 1 : 0;
+    const int act = talkonewin::ReleaseAction(road, stillMine);
+    int freed = 0;
+    if (act == talkonewin::kActRelease) { freed = ReleaseGateForObject(f.npc); if (fwd) g_fwdFreed += freed; else g_frzFreed += freed; }
+    else if (fwd) ++g_fwdForgot; else ++g_frzForgot;
+    ++g_frzRel[road];
+    if (++g_frzLogged <= 40)
+    {
+        char b[360];
+        std::sprintf(b, "[TALK] T-978 A: the NPC (uid %u) talked to%s decides again - %s; %s", f.uid,
+                     fwd ? " (its conversation forwarded to the other player)" : "", OwRoadName(road),
+                     act == talkonewin::kActRelease ? (freed > 0 ? "its hold released" : "no hold was left to release")
+                     : (road == talkonewin::kRelTeardown ? "the world's own teardown freed every hold" : "no longer this game's own: its hold is left to the copy gate"));
+        DebugLog(std::string(b));
+    }
+}
+
+/* T-978 A forwarded: one road for the forwarded conversations' holds - each slot it names is released. MAIN THREAD only (off it
+   the forwarded table's erase at the safe point and the back-stop cover the road). */
+void OwFwdRoad(int road, void* dlg, const void* obj)
+{
+    if (SayOnMainThread() == 0 || !talkonewin::FwdRoad(road)) return;
+    for (int k = 0; k < kFrzFwdSlots; ++k)
+    {
+        if (!talkonewin::ReleaseMatches(&g_frzFwd[k], road, dlg, obj)) continue;
+        const talkonewin::Frozen f = g_frzFwd[k];
+        g_frzFwd[k].set = 0; g_frzFwd[k].dlg = 0; g_frzFwd[k].npc = 0; g_frzFwd[k].uid = 0;
+        OwFrzLetGo(f, road, 1);
+    }
+}
+
+/* 1 = a forwarded conversation's slot holds obj. MAIN THREAD. */
+static int OwFwdHolds(const void* obj)
+{
+    for (int k = 0; k < kFrzFwdSlots; ++k) if (g_frzFwd[k].set && g_frzFwd[k].npc == obj) return 1;
+    return 0;
+}
+
+/* T-978 A forwarded: after a conversation of this game's own NPC with the other player's character was forwarded (g_tkConvs holds
+   it) - the NPC stops deciding while it is open, as the window's own conversation does. The same test (FreezeWhy, 'shown' = the
+   forwarded conversation is open). MAIN THREAD (TkAfterStart). */
+void OwFwdAfterForward(void* dlg, void* npc, unsigned int uid)
+{
+    const int onMain = SayOnMainThread();
+    /* T-978: as OwFrzAfterOpen - off the main thread the session test is not made (StoreLiveReady runs the main-thread-only LinkUp);
+       FreezeWhy answers offMain */
+    const int linked = !onMain ? 1 : ((net::SessionLinked() || coop::StoreLiveReady()) ? 1 : 0);   /* in a session by either road: the session link or the world server's (T1940: a world-door game has no session link) */
+    const int open = (onMain && dlg != 0 && g_tkConvs.find(dlg) != g_tkConvs.end()) ? 1 : 0;
+    int slotHolds = 0, freeSlot = -1;
+    for (int k = 0; k < kFrzFwdSlots && onMain; ++k)
+    {
+        if (g_frzFwd[k].set && g_frzFwd[k].dlg == dlg) slotHolds = 1;
+        else if (!g_frzFwd[k].set && freeSlot < 0) freeSlot = k;
+    }
+    int present = 0, mine = 0, player = 0, held = 0;
+    if (linked && open && !slotHolds)
+    {
+        present = (npc != 0 && TkLiveChar(npc)) ? 1 : 0;
+        mine = (present && uid != 0 && FindSpawnedUid(npc) == uid && net::IsUidMine(uid)) ? 1 : 0;
+        player = (present && TkOrderIsMine(npc)) ? 1 : 0;
+        held = (present && mine && !player && IsSuppressed((::Character*)npc)) ? 1 : 0;
+    }
+    const int why = talkonewin::FreezeWhy(linked, onMain, open, present, mine, player, held, slotHolds);
+    ::InterlockedIncrement64(&g_fwdWhy[why]);
+    if (why != talkonewin::kFrzFreeze) return;
+    char nn[48];
+    TalkName((::Character*)npc, nn);
+    if (freeSlot < 0)
+    {
+        ++g_fwdFull;
+        if (++g_frzLogged <= 40) DebugLog(std::string("[TALK] T-978 A: the NPC '") + nn + "' in a forwarded conversation is not held - every forwarded slot is in use; it keeps deciding");
+        return;
+    }
+    SuppressCharacter((::Character*)npc, true);
+    if (!IsSuppressed((::Character*)npc))   /* the gate refused: nothing to release later */
+    {
+        ++g_fwdGateRefused;
+        if (++g_frzLogged <= 40) DebugLog(std::string("[TALK] T-978 A: the NPC '") + nn + "' in a forwarded conversation could not be held (the decisions gate refused) - it keeps deciding");
+        return;
+    }
+    g_frzFwd[freeSlot].dlg = dlg; g_frzFwd[freeSlot].npc = npc; g_frzFwd[freeSlot].uid = uid; g_frzFwd[freeSlot].set = 1;
+    if (++g_frzLogged <= 40)
+    {
+        char b[320];
+        std::sprintf(b, "[TALK] T-978 A: the NPC '%s' (uid %u) stops deciding while its conversation with the other player's character is open"
+                     " (forwarded; that player's window shows it)", nn, uid);
+        DebugLog(std::string(b));
+    }
+}
+
+/* T-978 A forwarded, MAIN THREAD at the K2 safe point: the back-stop - a slot whose conversation is no longer in the forwarded
+   table (an end this file did not see), or the link gone. A blocked world waits: the teardown road forgets the slots. */
+static void OwFwdDrain()
+{
+    if (EngineWritesBlocked()) return;
+    const int linked = (net::SessionLinked() || coop::StoreLiveReady()) ? 1 : 0;   /* in a session by either road: the session link or the world server's (T1940: a world-door game has no session link) */
+    for (int k = 0; k < kFrzFwdSlots; ++k)
+    {
+        if (!g_frzFwd[k].set) continue;
+        if (!linked) { OwFwdRoad(talkonewin::kRelLinkDropped, 0, 0); return; }
+        void* const d = const_cast<void*>(g_frzFwd[k].dlg);
+        if (g_tkConvs.find(d) != g_tkConvs.end()) continue;
+        ++g_fwdBackstop;
+        OwFwdRoad(talkonewin::kRelFwdEnded, d, 0);
+    }
+}
+
+/* T-978 A: after setInDialog(dlg, true) and the window log - the NPC of the conversation the window now shows stops deciding, when
+   this game is in a session, the NPC is this game's own (not a player character) and nothing already holds it. MAIN THREAD. */
+static void OwFrzAfterOpen(void* dlg)
+{
+    const int onMain = SayOnMainThread();
+    /* T-978 (run T1944, offMain=4): off the main thread the session test is not made - StoreLiveReady runs LinkUp, which is main-thread
+       only (store.cpp, review-p5b CRASH-2), and SessionLinked reads the transport the main thread deletes (CRASH-1). linked=1 there so
+       FreezeWhy answers offMain (counted); the engine queues an off-main setInDialog(on) and replays it on the main thread, where
+       the hold is taken (T1944: frozen=4 for offMain=4). */
+    const int linked = !onMain ? 1 : ((net::SessionLinked() || coop::StoreLiveReady()) ? 1 : 0);   /* in a session by either road: the session link or the world server's (T1940: a world-door game has no session link) */
+    const int shows = (onMain && dlg != 0 && TalkLogIsWindow(dlg) == 1) ? 1 : 0;
+    const int slotHolds = (onMain && g_frz.set && g_frz.dlg == dlg) ? 1 : 0;
+    void* npc = 0; unsigned int uid = 0;
+    int present = 0, mine = 0, player = 0, held = 0;
+    if (linked && shows && !slotHolds)
+    {
+        npc = SayReadPtr(dlg, kDlgMe);
+        present = (npc != 0 && TkLiveChar(npc)) ? 1 : 0;
+        uid = present ? FindSpawnedUid(npc) : 0;
+        mine = (uid != 0 && net::IsUidMine(uid)) ? 1 : 0;
+        player = (present && TkOrderIsMine(npc)) ? 1 : 0;
+        held = (present && mine && !player && IsSuppressed((::Character*)npc)) ? 1 : 0;
+    }
+    const int why = talkonewin::FreezeWhy(linked, onMain, shows, present, mine, player, held, slotHolds);
+    ::InterlockedIncrement64(&g_frzWhy[why]);
+    if (why != talkonewin::kFrzFreeze) return;
+    if (g_frz.set) OwFrzRoad(talkonewin::kRelReplaced, const_cast<void*>(g_frz.dlg), 0);   /* a slot whose end was not seen: released first */
+    const float spd = OwSpeedPod(npc);
+    SuppressCharacter((::Character*)npc, true);
+    char nn[48];
+    TalkName((::Character*)npc, nn);
+    if (!IsSuppressed((::Character*)npc))   /* the gate refused (no slot left, or its brain did not read): nothing to release later */
+    {
+        ++g_frzGateRefused;
+        if (++g_frzLogged <= 40) DebugLog(std::string("[TALK] T-978 A: the NPC '") + nn + "' talked to could not be held (the decisions gate refused) - it keeps deciding");
+        return;
+    }
+    g_frz.dlg = dlg; g_frz.npc = npc; g_frz.uid = uid; g_frz.set = 1;
+    ::InterlockedExchangePointer(&g_frzDlgAny, dlg);
+    if (++g_frzLogged <= 40)
+    {
+        char b[320];
+        std::sprintf(b, "[TALK] T-978 A: the NPC '%s' (uid %u) being talked to stops deciding while the window shows the conversation"
+                     " (speed as the hold began %.2f; a walk already under way is not stopped)", nn, uid, (double)spd);
+        DebugLog(std::string(b));
+    }
+}
+
+/* T-978 A, MAIN THREAD at the K2 safe point: an off-main road's ask, then the back-stops - the link gone, or the window no longer
+   showing the frozen conversation (a road this file does not see). A blocked world waits: the teardown road forgets the slot. */
+static void OwFrzDrain()
+{
+    OwFwdDrain();   /* the forwarded conversations' back-stop */
+    const LONG ask = ::InterlockedExchange(&g_frzAsk, 0);
+    void* const askDlg = ::InterlockedExchangePointer(&g_frzAskDlg, 0);
+    if (ask > 0 && g_frz.set && askDlg == g_frz.dlg) OwFrzRoad((int)ask - 1, askDlg, 0);
+    if (!g_frz.set || EngineWritesBlocked()) return;
+    if (!net::SessionLinked() && !coop::StoreLiveReady()) { OwFrzRoad(talkonewin::kRelLinkDropped, 0, 0); return; }   /* no road left to the other games */
+    if (TkWindowDlg() != g_frz.dlg) OwFrzRoad(talkonewin::kRelWindowMoved, 0, 0);
+}
+
+/* T-978 BUBBLE: the bubble timer (+0x230) read (write 0) or written (write 1) under __try; 0 = unreadable. No C++ object (C2712). */
+static int OwBubbleTimerPod(void* dlg, float* io, int write)
+{
+    if (dlg == 0 || io == 0) return 0;
+    __try
+    {
+        float* const t = (float*)((char*)dlg + kDlgBubbleTimer);
+        if (write) *t = *io; else *io = *t;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* T-978 BUBBLE: 1 = the hold applies to dlg now (talkonewin::BubbleHoldOn: a live conversation with a bubble - a player conversation
+   only when needEvent1); *now = its timer, *ev = its conversation event (+0x188). shown = the window shows dlg, or its forwarded
+   conversation is open. MAIN THREAD. */
+static int OwBubbleOnNow(void* dlg, int shown, int inSession, int needEvent1, float* now, int* ev)
+{
+    *now = 0.0f;
+    *ev = 0;
+    if (!shown || dlg == 0) return 0;
+    *ev = TkReadIntPod(dlg, kDlgConvEvent);
+    const int on = talkonewin::BubbleHoldOn(inSession, SayOnMainThread(), shown, needEvent1, *ev, TkReadBytePod(dlg, kDlgEnded),
+                                            (SayReadPtr(dlg, kDlgBubble) != 0) ? 1 : 0);
+    if (on && !OwBubbleTimerPod(dlg, now, 0)) { ++g_bhReadFail; return 0; }
+    return on;
+}
+
+/* T-978 BUBBLE: one slot's step (talkonewin::BubbleHoldStep) and its write, counted; the first write of a hold is logged. fwd = a
+   forwarded conversation's slot. MAIN THREAD. */
+static void OwBubbleApply(talkonewin::BubbleHold* h, void* dlg, int on, float now, int ev, int fwd)
+{
+    float put = 0.0f;
+    if (!talkonewin::BubbleHoldStep(h, dlg, on, now, &put)) return;
+    if (!OwBubbleTimerPod(dlg, &put, 1)) { ++g_bhWriteFail; return; }
+    if (fwd) ++g_bhFwdWrites; else ++g_bhWinWrites;
+    if (h->wrote) return;
+    h->wrote = 1;
+    if (fwd) ++g_bhFwdHeld; else ++g_bhWinHeld;
+    if (++g_bhLogged <= 20)
+    {
+        char nn[48];
+        TalkName((::Character*)SayReadPtr(dlg, kDlgMe), nn);
+        char b[360];
+        std::sprintf(b, "[TALK] T-978 bubble: the speech bubble '%s' said before this conversation no longer ends it - its timer (%.2f s left) is held"
+                     " at %.2f s (conversation event %d) while %s", nn, (double)now, (double)put, ev,
+                     fwd ? "its conversation is forwarded to the other player's window" : "this game's window shows the conversation");
+        DebugLog(std::string(b));
+    }
+}
+
+/* T-978 BUBBLE (attempt 2, run T1949), MAIN THREAD at every K2 safe point: while this game's window shows a live conversation (any event)
+   that has a speech bubble, the bubble's timer does not run out (the single-player window pause did this; T-288 skips that pause in
+   a session); the same for each open forwarded conversation of this game's own NPC (the other player's window shows it, and its end
+   here ends that window). Stops the moment the conversation is not shown, ended or bubble-less (its end deletes the bubble). */
+static void OwBubbleHoldTick()
+{
+    if (SayOnMainThread() == 0 || EngineWritesBlocked()) return;
+    void* const w = TkWindowDlg();
+    const int shows = talkonewin::ShownReal(w);
+    int anyFwd = g_tkConvs.empty() ? 0 : 1;
+    for (int k = 0; k < kFrzFwdSlots && !anyFwd; ++k) if (g_bhFwd[k].set) anyFwd = 1;
+    if (!shows && !g_bhWin.set && !anyFwd) return;
+    const int linked = (net::SessionLinked() || coop::StoreLiveReady()) ? 1 : 0;   /* in a session by either road (as OwFrzAfterOpen) */
+    /* the window: also while its opening pause was skipped (T-288) - a link dropped mid-window leaves the world running, unpaused */
+    const int winSession = (linked || coop::StoreDlgPauseSkipped()) ? 1 : 0;
+    float now = 0.0f;
+    int ev = 0;
+    const int on = OwBubbleOnNow(shows ? w : 0, shows, winSession, 0, &now, &ev);
+    OwBubbleApply(&g_bhWin, shows ? w : 0, on, now, ev, 0);
+    for (int k = 0; k < kFrzFwdSlots; ++k)   /* a slot whose conversation left the forwarded table: the hold stops */
+    {
+        if (!g_bhFwd[k].set) continue;
+        void* const d = const_cast<void*>(g_bhFwd[k].dlg);
+        if (g_tkConvs.find(d) == g_tkConvs.end()) OwBubbleApply(&g_bhFwd[k], d, 0, 0.0f, 0, 1);
+    }
+    for (std::map<void*, TkConv>::iterator it = g_tkConvs.begin(); it != g_tkConvs.end(); ++it)
+    {
+        void* const d = it->first;
+        const int fon = OwBubbleOnNow(d, 1, linked, 1, &now, &ev);   /* a forwarded player conversation only (event 1) */
+        int slot = -1, freeSlot = -1;
+        for (int k = 0; k < kFrzFwdSlots; ++k)
+        {
+            if (g_bhFwd[k].set && g_bhFwd[k].dlg == d) slot = k;
+            else if (!g_bhFwd[k].set && freeSlot < 0) freeSlot = k;
+        }
+        if (slot < 0 && !fon) continue;
+        if (slot < 0 && freeSlot < 0) { ++g_bhFwdFull; continue; }
+        OwBubbleApply(&g_bhFwd[slot >= 0 ? slot : freeSlot], d, fon, now, ev, 1);
+    }
+}
+
+/* T-978 D (review 2026-11-03): 1 = the game's own 'left button down now' byte is set (InputLeftDownFlag; not GetAsyncKeyState, which
+   reads the device even while the game takes no input). No row: 0 (a release on the first step still arms). Guarded read. */
+static int OwLeftDown()
+{
+    if (kInputLeftDownRva == 0 || g_base == 0) return 0;
+    return TkReadBytePod((const void*)(g_base + (uintptr_t)kInputLeftDownRva), 0) > 0 ? 1 : 0;
+}
+
+/* T-978 D: 1 = the game's 'left button released this frame' byte is set. Guarded read. */
+static int OwLeftReleased()
+{
+    if (kInputLeftReleasedRva == 0 || g_base == 0) return 0;
+    return TkReadBytePod((const void*)(g_base + (uintptr_t)kInputLeftReleasedRva), 0) > 0 ? 1 : 0;
+}
+
+/* T-978 D: the dialogue window's per-frame step. Before it: a NEW conversation in the window arms when the left button reads down
+   (the game's own left-down byte, OwLeftDown) or its release lands on this step; the step's own reply click is
+   dropped while armed (detour_replyClicked); after it: the release (or kHeldUpSteps steps up) disarms. Off the main thread it passes
+   unchanged (counted). */
+void detour_dlgWinStep(void* win)
+{
+    if (SayOnMainThread() == 0) { ::InterlockedIncrement64(&g_owHeldStepOff); orig_dlgWinStep(win); return; }
+    void* const shown = SayReadPtr(win, kWinDialogue);
+    const int down = OwLeftDown();
+    const int rel = OwLeftReleased();
+    const int forceNew = (::InterlockedExchange(&g_owHeldNew, 0) != 0) ? 1 : 0;
+    if (talkonewin::HeldBegin(&g_owHeld, shown, forceNew, down, rel)) ++g_owHeldArmed;
+    g_owInStep = 1;
+    orig_dlgWinStep(win);
+    g_owInStep = 0;
+    const int e = talkonewin::HeldEnd(&g_owHeld, rel, down);
+    if (e == 1) ++g_owHeldDisarmed;
+    else if (e == 2) ++g_owHeldDisarmedUp;
+}
+
+/* T-978 two starts in one frame (review 2026-11-03): 1 = setInDialog(dlg, true), replayed on the main thread, is refused - the window
+   shows ANOTHER live conversation (or the mirrored one) and dlg's is toward this game's own player character: two starts on the AI
+   thread in one frame both passed B2 (the window opens only here). dlg's conversation is queued like a refused start (its kept line
+   when the start record names it) and ended at the next safe point the engine's own way (OwEndLaterDrain); B1 skips its writes
+   until then. MAIN THREAD. */
+static int OwRefuseOpen(void* dlg)
+{
+    if (dlg == 0) return 0;
+    void* recWho = 0; void* recLine = 0;
+    const int rec = OwStartTake(dlg, &recWho, &recLine);   /* re-check 2026-11-03: used once - this open is let through or refused below */
+    void* const shown = TkWindowDlg();
+    if (!talkonewin::ShownReal(shown) || shown == dlg) return 0;
+    void* const me = SayReadPtr(dlg, kDlgMe);
+    int named = -1;
+    void* who = TkLiveOwner(dlg, me) ? WgTargetNow(dlg, &named) : 0;
+    if (who == 0 && rec) who = recWho;
+    const int mine = (who != 0 && TkOrderIsMine(who)) ? 1 : 0;
+    if (!talkonewin::RefuseOpen(dlg, shown, TkDlgBusy(shown), (shown == g_tkMirrorDlgAny) ? 1 : 0, mine, 1, (dlg == g_tkMirrorDlgAny) ? 1 : 0))
+        return 0;
+    ++g_owOpenRefused;
+    OwQueueKeep(me, who, (rec && recWho == who) ? recLine : 0);
+    int k = 0;
+    for (; k < kOwEndLaterSlots; ++k) if (g_owEndLater[k].dlg == dlg || g_owEndLater[k].dlg == 0) break;
+    if (k < kOwEndLaterSlots) { g_owEndLater[k].dlg = dlg; g_owEndLater[k].me = me; TkHandWordsPod(who, kCharHand, g_owEndLater[k].tgt); }
+    else ++g_owOpenEndFull;
+    if (++g_owLogged <= 40)
+    {
+        char nn[48], wn[48], b[360];
+        TalkName((::Character*)me, nn);
+        TalkName((::Character*)who, wn);
+        std::sprintf(b, "[TALK] T-978: a second conversation's window open is refused (npc '%s' -> '%s'): the window shows another live conversation"
+                     " (two starts in one frame) - it is queued and %s", nn, wn,
+                     k < kOwEndLaterSlots ? "ends at the next safe point" : "NOT ended (no room to remember it; B1 keeps it out of the window)");
+        DebugLog(std::string(b));
+    }
+    return 1;
+}
+
 /* A: a start toward the other player's character keeps THIS game's window shut. */
 void detour_setInDialog(void* dlg, bool on)
 {
@@ -1584,8 +2638,13 @@ void detour_setInDialog(void* dlg, bool on)
         ::InterlockedIncrement64(on ? &g_tkSuppressOn : &g_tkSuppressOff);
         return;
     }
+    if (on && SayOnMainThread() != 0 && OwRefuseOpen(dlg)) return;   /* T-978: two starts in one frame - the later one's window stays shut */
+    if (!on) TalkLogClose(dlg);   /* T-978: the conversation window log */
+    if (!on && SayOnMainThread() != 0) OwFrzRoad(talkonewin::kRelSetInDialogOff, dlg, 0);   /* T-978 A (off the main thread the engine queues it and replays it here) */
     if (!on && dlg != 0 && dlg == g_tkMirrorDlgAny) TkMirrorClosed(dlg, "setInDialog(false)");   /* B */
     orig_setInDialog(dlg, on);
+    if (on && TalkLogIsWindow(dlg) == 1) TalkLogOpen(dlg, "setInDialog");   /* T-978: the conversation window log */
+    if (on) OwFrzAfterOpen(dlg);   /* T-978 A: after the window opened and the log ran */
 }
 
 /* P26s5 fold 2 - A, MAIN THREAD: the index of the newest held line of dlg's forwarded conversation convId, -1 none; *npcParts =
@@ -1608,6 +2667,9 @@ static int TkHoldLast(void* dlg, unsigned int convId, unsigned int* npcParts)
    _doActions reads +0x190 for the line's locks and DA_LOCK_THIS_DIALOG 36 (67fad0:187, 1204) and writes +0xC8 (67fad0:367).
    The held end starts the conversation's 30 s ACT_RESULT clock (P26s5 fold 5: endClock; TkTimeouts then ends it with nothing run); link loss, the liveness
    sweep, a restart and an off-thread end still end it at once (the held line then finds no conversation and runs nothing).
+   T-1187: held for EVERY held line, also one with no NPC-side action (parts 0): _doActions ends every line with 0x2732F0 (the line's
+   'change AI' / 'AI contract' on the NPC's squad, the talker as the contract's party - Read, build/decomp_2732f0.txt) and the line's
+   locks / unlocks, which the held run makes; ending first lost them (T1979: a hire took the money and nobody joined).
    1 = held (the caller must NOT end it now), 0 = end it as before. why: a literal (kept in the hold). */
 static int TkHoldEndFor(void* dlg, int reason, const char* why, const char* whose)
 {
@@ -1615,21 +2677,23 @@ static int TkHoldEndFor(void* dlg, int reason, const char* why, const char* whos
     if (it == g_tkConvs.end() || SayOnMainThread() == 0) return 0;
     unsigned int parts = 0;
     const int hh = TkHoldLast(dlg, it->second.convId, &parts);
-    if (hh < 0) return 0;
+    const int decide = cooptalk::TalkHoldEndDecide(hh >= 0 ? 1 : 0, hh >= 0 ? g_tkActHolds[(size_t)hh].endHeld : 0);   /* T-1187 */
+    if (decide == 0) return 0;   /* no held line: the end runs now, as before */
     TkActHold& h = g_tkActHolds[(size_t)hh];
-    if (h.endHeld) { ++g_tkEndHeldRepeat; return 1; }   /* asked again (Dialogue::update 0x684600:115 / 153): already held */
-    if (parts == 0) return 0;   /* nothing of the NPC's side waits: the end runs now, as before */
+    if (decide == 2) { ++g_tkEndHeldRepeat; return 1; }   /* asked again (Dialogue::update 0x684600:115 / 153): already held */
     h.endHeld = 1; h.endReason = reason; h.endWhy = why;
     it->second.endClock = 1; it->second.endTick = ::GetTickCount();   /* P26s5 fold 5: the held end's ACT_RESULT clock - the only clock left (decision 229) */
     ++g_tkEndHeld;
     TkLog("[TALK] A conv=" + TkU(h.convId) + " " + whose + " - end held until the answer to ACT seq=" + TkU(h.seq) + ": its NPC-side part ("
-          + TkU(parts) + " action(s)) runs first, then the conversation ends (single-player order); no ACT_RESULT within 30 s - nothing runs");   /* P26s5 fold 5 */
+          + TkU(parts) + " action(s)) and the line's end call (0x2732F0: its AI change / contract) run first, then the conversation ends (single-player order); no ACT_RESULT within 30 s - nothing runs");   /* P26s5 fold 5, T-1187 */
     return 1;
 }
 
 /* A: an open forwarded conversation the engine ends sends END. B: the mirrored window's end is ANSWER CLOSED. */
 void detour_endDialogue(void* dlg, bool fin)
 {
+    TalkLogEnd(dlg, fin);   /* T-978: the conversation window log */
+    OwFrzRoad(talkonewin::kRelEndDialogue, dlg, 0);   /* T-978 A: the frozen NPC decides again (an attack's break-off 0x684B30 ends it here too) */
     const int i = g_tkOn ? TkMarkFind(dlg) : -1;
     const LONG st = (i >= 0) ? g_tkMarks[i].state : 0;
     if (dlg != 0 && dlg == g_tkMirrorDlgAny) TkMirrorClosed(dlg, "endDialogue");
@@ -1682,12 +2746,47 @@ void detour_endDialogue(void* dlg, bool fin)
 /* B: a reply clicked in the mirrored window goes back as ANSWER instead of running here. */
 void detour_replyClicked(void* dlg, int index)
 {
+    if (g_owInStep && SayOnMainThread() != 0 && talkonewin::HeldDrop(&g_owHeld, 1))   /* T-978 D: the window step's click of a press older than the window */
+    {
+        ++g_owHeldDropped;
+        if (++g_owHeldLogged <= 20)
+        {
+            char b[240];
+            std::sprintf(b, "[TALK] T-978 D: a reply click (reply %d) whose press began before the conversation window showed this conversation"
+                         " is ignored - the window stays open", index);
+            DebugLog(std::string(b));
+        }
+        return;
+    }
+    TalkLogClick(dlg, index);   /* T-978: the conversation window log (before the mirror check: its clicks are logged too) */
     if (SayOnMainThread() != 0 && g_tkMirror.active && dlg == g_tkMirror.dlg && dlg != g_tkApplyDlg)
     {
         TkMirrorAnswer(index);
         return;
     }
     orig_replyClicked(dlg, index);
+}
+
+/* T-978 B1 (owner 1445 a; src/common/talkonewin.h): 1 = this write into the window by dlg's conversation is skipped - on the main
+   thread, while the window shows ANOTHER conversation. A write while the window shows nothing passes (that is how a window opens),
+   and setInDialog(other, true) is never skipped. Off the main thread the engine queues these writes and replays them through the
+   same entry on the main thread, where this runs; the window state is read only there. No C++ object. */
+int OwSkipWrite(void* dlg)
+{
+    if (SayOnMainThread() == 0) return 0;
+    return talkonewin::SkipWrite(dlg, TkWindowDlg(), 1);
+}
+
+/* T-978 B1's portrait refresh (review 2026-11-03): 1 = a refresh of the window's portrait for `who` is skipped - the window shows
+   `shown`, a LIVE conversation (or the mirrored one), and who is neither its NPC, nor its target, nor a speaker the shown
+   conversation's speaker setter named (re-check 2026-11-03: a squad-mate or bystander speaking a line in it; talkonewin.h).
+   A refresh while the shown conversation has ended passes (a new conversation is taking the window). MAIN THREAD. */
+int OwSkipPortraitOn(void* shown, void* who)
+{
+    if (SayOnMainThread() == 0 || !talkonewin::ShownReal(shown) || who == 0) return 0;
+    if (!TkDlgBusy(shown) && shown != g_tkMirrorDlgAny) return 0;
+    const int speaks = (TkHandAtIs(shown, kDlgSpeakerHand3, who) || TkHandAtIs(shown, kDlgSpeakerHand4, who) || TkHandAtIs(shown, kDlgSpeakerHand5, who)) ? 1 : 0;
+    return talkonewin::SkipPortrait(shown, who, SayReadPtr(shown, kDlgMe) == who ? 1 : 0, TkHandIs(shown, who), speaks);
 }
 
 /* P26s1 fold 1 H2: sayLine's setConversationReplyGUI 0x6736E0 (setNPCText on the ONE window) and listPlayerReplies'
@@ -1698,13 +2797,23 @@ void detour_replyClicked(void* dlg, int index)
 void detour_setConvReplyGui(void* dlg)
 {
     if (g_tkOn && TkMarkSuppresses(dlg)) { ::InterlockedIncrement64(&g_tkGuiSkipped); return; }
+    if (OwSkipWrite(dlg)) { ::InterlockedIncrement64(&g_owSkipText); return; }   /* T-978 B1 */
     orig_setConvReplyGui(dlg);
 }
 
 void detour_setResponsesGui(void* dlg)
 {
     if (g_tkOn && TkMarkSuppresses(dlg)) { ::InterlockedIncrement64(&g_tkGuiSkipped); return; }
+    if (OwSkipWrite(dlg)) { ::InterlockedIncrement64(&g_owSkipReplies); return; }   /* T-978 B1 */
     orig_setResponsesGui(dlg);
+}
+
+/* T-978 B1: the reply-list clear (row DialogueClearResponsesGUI) - the third writer T1930 saw a second NPC's conversation run on
+   the open window (its text, this clear, then its own buttons). */
+void detour_clearResponsesGui(void* dlg)
+{
+    if (OwSkipWrite(dlg)) { ::InterlockedIncrement64(&g_owSkipClear); return; }
+    orig_clearResponsesGui(dlg);
 }
 
 unsigned long long detour_startConv(void* dlg, void* who, void* line, int ev, char force)
@@ -1920,6 +3029,8 @@ unsigned long long detour_startPlayerConv(void* dlg, void* who, void* line)
        player would be offered another player's character, and that character would speak lines this game chose. Players talk by
        chat. 0 is the engine's own "not started". Any thread: guarded reads and pointer compares, no C++ object. The talk order (T-726)
        is marked reached first, so the refusal is logged as its own outcome (kTalkOrderPlayerSpeaker). */
+    ::InterlockedExchangePointer(&g_talkLogStartWho, who);   /* T-978: the conversation window log's OPEN talker */
+    ::InterlockedExchangePointer(&g_talkLogStartDlg, dlg);
     TkOrderCtx* const oc = TkOrderCur();   /* T-726: this game's player's talk order on this Dialogue reached the start, with a line or not */
     if (oc != 0 && oc->dlg == dlg && !oc->reached) { oc->reached = 1; oc->hadLine = (line != 0) ? 1 : 0; }
     if (dlg != 0 && TkPlayerSpeaker(SayReadPtr(dlg, kDlgMe)))
@@ -1927,6 +3038,32 @@ unsigned long long detour_startPlayerConv(void* dlg, void* who, void* line)
         ::InterlockedIncrement64(&g_tkPeerSpeakerRefused);
         TkOrderSetFor(dlg, cooptalk::kTalkOrderPlayerSpeaker, -1.0f);
         return 0;
+    }
+    /* T-978 B2 (owner 1445 a; src/common/talkonewin.h): while this game's window shows a live conversation (or the mirrored one), a
+       start of ANOTHER conversation toward this game's player - an NPC's talk, or the player's own Talk order to a second NPC - is
+       refused with the engine's own 'not started' before anything is written (T1930: a second NPC's talk wrote into the open window
+       and took it over). A start toward the other player's character is marked below and never opens this window: not refused here.
+       Checked BEFORE the mark block, so a refused start does not first release another conversation's mark. The engine's talk
+       arrival ignores sendEvent's answer (decomp_34be10:43), so a refused Talk order ends as the engine's own refusals do. The
+       newest refused talk with a line is kept and sent again when the window is empty (TalkOneWinDrain), with the walk-over's parked
+       line (+0xC8, which sendEvent wipes after this start whatever it answers) kept to put back. Only a start toward this game's own
+       player character (review 2026-11-03). Any thread: guarded reads, pointer compares, interlocked counters and the slot's spin
+       flag - no allocation. */
+    if (dlg != 0)
+    {
+        void* const shown = TkWindowDlg();
+        const int other = (talkonewin::ShownReal(shown) && shown != dlg) ? 1 : 0;
+        const int towardMine = TkOrderIsMine(who);
+        void* const kept = const_cast<void*>(talkonewin::KeptLine(line, SayReadPtr(dlg, kDlgParkedLine)));
+        if (other && talkonewin::RefuseStart(dlg, shown, TkDlgBusy(shown), (shown == g_tkMirrorDlgAny) ? 1 : 0, towardMine))
+        {
+            ::InterlockedIncrement64(&g_owRefused);
+            if (oc != 0 && oc->dlg == dlg) ::InterlockedIncrement64(&g_owRefusedOrder);
+            TkOrderSetFor(dlg, cooptalk::kTalkOrderWindowBusy, -1.0f);
+            if (talkonewin::QueueWorthy(line != 0 ? 1 : 0, towardMine)) OwQueueKeep(SayReadPtr(dlg, kDlgMe), who, kept);
+            return 0;
+        }
+        if (towardMine) OwStartNote(dlg, who, kept);   /* two starts in one frame: its window open may yet be refused (OwRefuseOpen) */
     }
     /* P26 stages 1-3: a start toward the OTHER player's character is marked FIRST (any thread), so this game's window stays shut;
        with no free mark the start is refused (the NPC simply does not start - never a window for the other player's character) */
@@ -2221,18 +3358,559 @@ bool TkS6MoneyCond(void* dlg, int cmp, int val, void* target, void* convTarget, 
     return ans;
 }
 
-/* P26s6 S6-1 (any thread, hot): the original always runs with the same arguments; two conditions asked by an NPC this game drives
-   toward the other player's character are answered for that player: DC_IS_PLAYER (as for a player) and the money condition (by
-   that player's saved purse, TkS6MoneyCond). */
+/* T-980: the caged-prisoner re-pick's listener (TcCagedRepick, the talk cursor part below). While it runs on a thread, _chooseDialog
+   has this game's own player character as the listener only so that a line's target-faction test sees a player's faction; every
+   condition the engine asks there about that stand-in is asked about the character actually talking (detour_s6CheckCond). Set and
+   cleared by TcChooseScopedPod around its one call; the thread id is written last and cleared first. Ported from the third public
+   pull request (eb042a1) by MassDivide, with the listener fixed. */
+volatile DWORD g_tcSubTid = 0;           /* the thread inside the re-pick now, 0 none */
+void* volatile g_tcSubStandIn = 0;       /* ... this game's character given to _chooseDialog as the listener */
+void* volatile g_tcSubTalker = 0;        /* ... the character actually talking (the other player's character) */
+volatile LONG64 g_tcSubCondSwapped = 0;  /* conditions asked about the talker in place of the stand-in */
+
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213 (T-980) - for a player's talk order on an NPC, every line the engine's line test 0x6784A0 (1.0.68 0x678F30;
+// decomp_6784a0.txt) was asked about and its answer, with each condition the test asked (_checkCondition 0x675EC0, seen through
+// detour_s6CheckCond) and the speaker's cage state and faction, so a talk that ends with no line shows which test refused each line.
+// LOG ONLY: the detour calls the engine's test once with its own four arguments and returns its answer unchanged. Nothing here calls
+// the line test or a condition itself (both write the Dialogue's state) and nothing writes game memory.
+// Scope: only while this thread runs a talk order of this game's player (TkOrderCur, set by SendEventOrder around sendEvent event 1;
+// who=own), or while the main thread starts the other player's P25 request on an NPC this game runs (TkApplyRequest around its
+// sendEvent; who=peer); every other call passes straight through. Each order gets a number as its scope opens (g_p213OrderSeq) and
+// its traced lines are matched on that number, so the lines of an order whose own record was dropped never join a later one.
+// The test is handed the SPEAKER's Dialogue (_chooseDialog passes the speaker's +0x280,
+// decomp_679630:58), which is the talk order's own Dialogue only when the NPC itself speaks (own=1); a line spoken by someone else
+// (a squad mate, the listener) is traced too, with own=0. repick=1: inside the caged-prisoner re-pick (g_tcSubTid).
+// Reading a line: the fixed tests (a-o of the read, decomp_6784a0:51-466) come before the conditions, and the first condition that
+// answers 0 ends the test (:467-482). So result=0 with every listed condition answering 1 (or none asked) is a fixed test's refusal.
+// ans is the answer the line test got: for another player's character the mod answers two conditions again (money 0x2,
+// DC_IS_PLAYER 0x24, detour_s6CheckCond); an answer the mod changed carries '*' (the engine had said the other). ncond is the
+// line's own condition count (+0x1F8): ncond>0 with no condition listed is a refusal before the conditions.
+// Both hooks run on whatever thread runs the order: each tested line goes into a fixed ring there (no lock, no allocation, no log);
+// the main thread writes the lines in TalkOrderDrain, beside the talk order's own line.
+//   [PROBE] P213 install: line test 0x.. hook ON|OFF (<why>) (PROBE P213)                                  once, at install
+//   [PROBE] P213 LINE order=<n> who=own|peer sid=<line string id> kind=<speaker kind +0x31C> result=<0|1> own=<0|1> repick=<0|1>
+//           afterStart=<0|1> ncond=<n, -1 unreadable> conds=<type:cmp:val:speaker|listener=ans[*],..|none>
+//           speaker[cage(+0x2F8)=<n> +0x308=<n> faction=<name>] (PROBE P213)
+//                                one per line tested, kP213LineCap a launch
+//   [PROBE] P213 TALK order=<n> who=own|peer talker=<uid> npc=<uid> lines=<n> passed=<n> condCalls=<n> ringLost=<n since the last
+//           TALK line> (PROBE P213)
+//                                one per talk order that tested a line or ended with no line, kP213TalkCap a launch
+//   [H054] REPORT probeP213[..] (PROBE P213)                                                                every 30 s once a line was traced
+const int   kP213Ring = 256;          /* a power of two */
+const int   kP213Conds = 12;          /* conditions kept per line; the rest are counted */
+const int   kP213SidCap = 95;
+const long  kP213LineCap = 300, kP213TalkCap = 100;
+const DWORD kP213StaleMs = 5000;      /* a traced line no talk order took by then is dropped, counted */
+struct P213Work
+{
+    void* odlg; void* spk; unsigned long tid; DWORD t; LONG seq; LONG order;
+    int own, repick, afterStart, kind, result, nc, more, cage, s308, sidLen, peer, ncond;
+    char sid[kP213SidCap + 1];
+    char fac[48];
+    coopprobe::P213Cond c[kP213Conds];
+};
+struct P213Slot { volatile LONG state; P213Work w; };   /* state: 0 free, 1 a writer fills it, 2 ready for the main thread */
+P213Slot g_p213Ring[kP213Ring];
+volatile LONG g_p213Next = 0, g_p213Pending = 0;
+volatile DWORD g_p213Tls = TLS_OUT_OF_INDEXES;   /* this thread's line being tested (a P213Work on the detour's stack), 0 none */
+void* volatile g_p213PeerDlg = 0;                /* the other player's P25 request being started now (MAIN THREAD writes) ... */
+volatile LONG g_p213PeerOrder = 0;               /* ... its order number ... */
+volatile DWORD g_p213PeerTid = 0;                /* ... and the thread starting it, 0 none */
+typedef bool (*P213LineTestFn)(void* line, void* dlg, void* listener, char flag);
+P213LineTestFn g_p213Orig = 0;
+int g_p213On = 0;
+unsigned long long kP213LineTestRva = 0; static coop::AddrReg kP213LineTestRva_reg("DialogLineTest", &kP213LineTestRva);   /* Steam_1.0.65 0x6784A0, 1.0.68 0x678F30: bool (DialogLineData* line, Dialogue* speakerDlg, Character* listener, bool) - hooked (PROBE P213) */
+volatile LONG64 g_p213Lines = 0, g_p213Passed = 0, g_p213CondCalls = 0, g_p213CondsLost = 0, g_p213RingLost = 0;
+long long g_p213Stale = 0, g_p213LineCapped = 0, g_p213TalkCapped = 0;   /* MAIN THREAD */
+long g_p213LinePrints = 0, g_p213TalkPrints = 0;                         /* MAIN THREAD */
+long long g_p213LostAtTalk = 0;                                          /* MAIN THREAD: g_p213RingLost at the last TALK line */
+DWORD g_p213ReportAt = 0;
+
+/* ANY THREAD: the speaker of the line test's Dialogue (+0x150), read before the call so a condition can be told speaker or listener */
+void* P213SpeakerPod(void* dlg)
+{
+    __try { return dlg != 0 ? *(void* const*)((const char*)dlg + kDlgMe) : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* ANY THREAD, after the engine's call: the line's speaker kind +0x31C, condition count +0x1F8 and string id, the speaker's +0x2F8 /
+   +0x308 and its faction's
+   name (vt+0x58, the faction the conditions read, decomp_675ec0:339). No C++ object (SEH). */
+void P213ReadPod(void* line, P213Work* w)
+{
+    typedef void* (*P213FacFn)(void* self);
+    w->kind = -1; w->cage = -1; w->s308 = -1; w->ncond = -1;
+    std::strcpy(w->fac, "-");
+    __try { if (line != 0) w->kind = *(const int*)((const char*)line + 0x31C); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { w->kind = -1; }
+    __try { if (line != 0) w->ncond = *(const int*)((const char*)line + 0x1F8); }   /* the line's condition count */
+    __except (EXCEPTION_EXECUTE_HANDLER) { w->ncond = -1; }
+    w->sidLen = TkLineSidPod(line, w->sid, kP213SidCap);
+    if (w->sidLen > 0) w->sid[w->sidLen] = 0; else std::strcpy(w->sid, "?");
+    if (w->spk == 0) return;
+    __try
+    {
+        const char* s = (const char*)w->spk;
+        w->cage = *(const int*)(s + 0x2F8);
+        w->s308 = *(const int*)(s + 0x308);
+        ::Faction* const f = (::Faction*)(*(const P213FacFn*)(*(const char* const*)s + 0x58))(w->spk);
+        if (f != 0)
+        {
+            const std::string& n = f->getName();
+            size_t k = n.size();
+            if (k > sizeof(w->fac) - 1) k = sizeof(w->fac) - 1;
+            if (k > 0) std::memcpy(w->fac, n.data(), k);
+            w->fac[k] = 0;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { std::strcpy(w->fac, "?"); }
+}
+/* ANY THREAD: the tested line into the ring (up to 8 slots tried), else counted lost */
+void P213Push(const P213Work* w)
+{
+    for (int tries = 0; tries < 8; ++tries)
+    {
+        const LONG i = ::InterlockedIncrement(&g_p213Next);
+        P213Slot& x = g_p213Ring[i & (kP213Ring - 1)];
+        if (::InterlockedCompareExchange(&x.state, 1, 0) != 0) continue;
+        x.w = *w;
+        x.w.seq = i;
+        ::InterlockedExchange(&x.state, 2);
+        ::InterlockedIncrement(&g_p213Pending);
+        return;
+    }
+    ::InterlockedIncrement64(&g_p213RingLost);
+}
+/* ANY THREAD (hot: every line test of every conversation): outside a talk order of this game's player the engine's test runs
+   untouched (the other player's P25 request on the main thread too, g_p213PeerTid); inside one, the line being tested is this
+   thread's for the call (the conditions land on it), then goes into the ring.
+   The thread's TLS slot is always restored (__finally); the thread's last error kept. No C++ object (C2712). */
+bool detour_p213LineTest(void* line, void* dlg, void* listener, char flag)
+{
+    TkOrderCtx* const oc = (g_p213On != 0) ? TkOrderCur() : 0;
+    void* odlg = 0;
+    LONG order = 0;
+    int peer = 0, after = 0;
+    if (oc != 0 && oc->dlg != 0) { odlg = oc->dlg; order = oc->p213Order; after = oc->reached ? 1 : 0; }
+    else if (g_p213On != 0 && g_p213PeerTid != 0 && g_p213PeerTid == ::GetCurrentThreadId())
+    { odlg = g_p213PeerDlg; order = g_p213PeerOrder; peer = 1; after = g_p25StartSeen ? 1 : 0; }
+    if (odlg == 0) return g_p213Orig(line, dlg, listener, flag);
+    P213Work w;
+    std::memset(&w, 0, sizeof(w));
+    w.odlg = odlg;
+    w.order = order;
+    w.peer = peer;
+    w.own = (dlg == odlg) ? 1 : 0;
+    w.afterStart = after;
+    w.tid = ::GetCurrentThreadId();
+    w.t = ::GetTickCount();
+    w.repick = (g_tcSubTid != 0 && g_tcSubTid == w.tid) ? 1 : 0;
+    w.spk = P213SpeakerPod(dlg);
+    w.result = -1;
+    const DWORD ti = g_p213Tls;
+    const DWORD le0 = ::GetLastError();
+    void* const prev = ::TlsGetValue(ti);
+    ::TlsSetValue(ti, &w);
+    ::SetLastError(le0);
+    bool r = false;
+    __try { r = g_p213Orig(line, dlg, listener, flag); }
+    __finally
+    {
+        const DWORD le1 = ::GetLastError();
+        ::TlsSetValue(ti, prev);
+        ::SetLastError(le1);
+    }
+    const DWORD le2 = ::GetLastError();
+    w.result = r ? 1 : 0;
+    ::InterlockedIncrement64(&g_p213Lines);
+    if (r) ::InterlockedIncrement64(&g_p213Passed);
+    P213ReadPod(line, &w);
+    P213Push(&w);
+    ::SetLastError(le2);
+    return r;
+}
+/* ANY THREAD, from detour_s6CheckCond with the engine's answer (raw) and the one it returns to the line test (ans, after the mod's
+   own answer for another player's character): the condition onto the line this thread is testing, if any */
+void P213NoteCond(int cond, int cmp, int val, void* target, bool raw, bool ans)
+{
+    if (g_p213On == 0) return;
+    const DWORD le = ::GetLastError();
+    P213Work* const w = (P213Work*)::TlsGetValue(g_p213Tls);
+    ::SetLastError(le);
+    if (w == 0) return;
+    ::InterlockedIncrement64(&g_p213CondCalls);
+    if (w->nc >= kP213Conds) { ++w->more; ::InterlockedIncrement64(&g_p213CondsLost); return; }
+    coopprobe::P213Cond& c = w->c[w->nc++];
+    c.type = cond; c.cmp = cmp; c.val = val; c.who = (target != 0 && target == w->spk) ? 1 : 0; c.ans = ans ? 1 : 0;
+    c.rep = (raw != ans) ? 1 : 0;
+}
+/* MAIN THREAD, TkApplyRequest around its sendEvent: the other player's P25 request's line pick traced (who=peer); its order number */
+LONG P213PeerOpen(void* dlg)
+{
+    if (g_p213On == 0) return 0;
+    g_p213PeerDlg = dlg;
+    g_p213PeerOrder = ::InterlockedIncrement(&g_p213OrderSeq);
+    ::InterlockedExchange((volatile LONG*)&g_p213PeerTid, (LONG)::GetCurrentThreadId());   /* the scope opens after its fields */
+    return g_p213PeerOrder;
+}
+void P213PeerClose()
+{
+    ::InterlockedExchange((volatile LONG*)&g_p213PeerTid, 0);
+    g_p213PeerDlg = 0;
+    g_p213PeerOrder = 0;
+}
+/* once, from InstallTalkStarters after the condition hook (g_base is set) */
+void P213Install()
+{
+    char why[96];
+    strcpy_s(why, sizeof(why), "no table row DialogLineTest");
+    if (kP213LineTestRva != 0 && g_base != 0)
+    {
+        if (g_p213Tls == TLS_OUT_OF_INDEXES) g_p213Tls = ::TlsAlloc();
+        if (g_p213Tls == TLS_OUT_OF_INDEXES) strcpy_s(why, sizeof(why), "TlsAlloc failed");
+        else if (g_s6CondHook != 1) strcpy_s(why, sizeof(why), "the condition hook is not installed, so no condition would be seen");
+        else if (coop::AddHook((void*)(g_base + (uintptr_t)kP213LineTestRva), (void*)&detour_p213LineTest, (void**)&g_p213Orig) == coop::SUCCESS
+                 && g_p213Orig != 0) { g_p213On = 1; strcpy_s(why, sizeof(why), "hooked"); }
+        else strcpy_s(why, sizeof(why), "AddHook failed");
+    }
+    char line[300];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[PROBE] P213 install: line test 0x%llX hook %s (%s) (PROBE P213)",
+                kP213LineTestRva, g_p213On != 0 ? "ON" : "OFF", why);
+    DebugLog(line);
+}
+/* MAIN THREAD, from TalkOrderDrain for each drained talk order of this game's player (before its line throttle; peer 0) and from
+   TkApplyRequest after the other player's P25 request (peer 1): the order's tested lines (matched on its number) in the order they
+   were tested, then its TALK line */
+void P213DrainOrder(LONG order, void* dlg, unsigned int talker, unsigned int npc, int noLine, int peer)
+{
+    if (g_p213On == 0 || order == 0) return;
+    static int idx[kP213Ring];
+    int m = 0;
+    if (g_p213Pending != 0)
+        for (int s = 0; s < kP213Ring; ++s)
+        {
+            const P213Slot& x = g_p213Ring[s];
+            if (x.state != 2 || x.w.order != order || x.w.odlg != dlg) continue;
+            int j = m++;
+            while (j > 0 && g_p213Ring[idx[j - 1]].w.seq > x.w.seq) { idx[j] = idx[j - 1]; --j; }
+            idx[j] = s;
+        }
+    if (m == 0 && noLine == 0) return;
+    long long passed = 0, conds = 0;
+    for (int k = 0; k < m; ++k)
+    {
+        P213Slot& x = g_p213Ring[idx[k]];
+        const P213Work w = x.w;
+        ::InterlockedExchange(&x.state, 0);
+        ::InterlockedDecrement(&g_p213Pending);
+        if (w.result == 1) ++passed;
+        conds += w.nc + w.more;
+        if (!coopprobe::P213PrintDue(g_p213LinePrints, kP213LineCap)) { ++g_p213LineCapped; continue; }
+        ++g_p213LinePrints;
+        char cs[720];
+        coopprobe::P213FormatConds(w.c, w.nc, w.more, cs, (int)sizeof(cs));
+        char line[1100];
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[PROBE] P213 LINE order=%ld who=%s sid=%s kind=%d result=%d own=%d repick=%d afterStart=%d ncond=%d conds=%s speaker[cage(+0x2F8)=%d +0x308=%d faction=%s] (PROBE P213)",
+                    (long)w.order, w.peer ? "peer" : "own", w.sid, w.kind, w.result, w.own, w.repick, w.afterStart, w.ncond, cs, w.cage, w.s308, w.fac);
+        DebugLog(line);
+    }
+    if (!coopprobe::P213PrintDue(g_p213TalkPrints, kP213TalkCap)) { ++g_p213TalkCapped; return; }
+    ++g_p213TalkPrints;
+    const long long lost = (long long)g_p213RingLost;
+    char sum[300];
+    _snprintf_s(sum, sizeof(sum), _TRUNCATE,
+                "[PROBE] P213 TALK order=%ld who=%s talker=%u npc=%u lines=%d passed=%lld condCalls=%lld ringLost=%lld (PROBE P213)",
+                (long)order, peer ? "peer" : "own", talker, npc, m, passed, conds, lost - g_p213LostAtTalk);
+    g_p213LostAtTalk = lost;
+    DebugLog(sum);
+}
+/* MAIN THREAD, at the top of TalkOrderDrain: traced lines no talk order took within kP213StaleMs are dropped (counted); the REPORT
+   every 30 s once a line was traced */
+void P213Tick()
+{
+    if (g_p213On == 0) return;
+    const DWORD now = ::GetTickCount();
+    if (g_p213Pending != 0)
+        for (int s = 0; s < kP213Ring; ++s)
+        {
+            P213Slot& x = g_p213Ring[s];
+            if (x.state != 2 || now - x.w.t < kP213StaleMs) continue;
+            ::InterlockedExchange(&x.state, 0);
+            ::InterlockedDecrement(&g_p213Pending);
+            ++g_p213Stale;
+        }
+    if (g_p213Lines == 0) return;
+    if (g_p213ReportAt == 0) { g_p213ReportAt = now; return; }
+    if (now - g_p213ReportAt < 30000) return;
+    g_p213ReportAt = now;
+    char rep[500];
+    _snprintf_s(rep, sizeof(rep), _TRUNCATE,
+                "[H054] REPORT probeP213[hook,lines,passed,condCalls,condsNotKept,linePrints,talkPrints,lineCapped,talkCapped,ringLost,stale]"
+                "=%d,%lld,%lld,%lld,%lld,%ld,%ld,%lld,%lld,%lld,%lld (PROBE P213)",
+                g_p213On, (long long)g_p213Lines, (long long)g_p213Passed, (long long)g_p213CondCalls, (long long)g_p213CondsLost,
+                g_p213LinePrints, g_p213TalkPrints, g_p213LineCapped, g_p213TalkCapped, (long long)g_p213RingLost, g_p213Stale);
+    DebugLog(rep);
+}
+// PROBE-END: P213
+#endif
+
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+/* PROBE P214 (T-980) - the caged slave's road to joining a player: every dialogue event and conversation start on a character this
+   probe watches, the line the engine picked with its actions, and every line carrying act 18 (join the squad) run off the main thread.
+   Watched (P214Tick refreshes the list every second from spawn.cpp P214WatchList): watch=1 a prisoner a `locktest pick|release`
+   order was given on this launch; watch=2 a replicated character seen in shackles or a cage this launch (spawn.cpp's restraint
+   records). Event 0xD (the unlock event the pick task 0x359100 and the release task 0x357040 send) is traced on anyone (watch=0).
+   The 'slave escaped' event's number was not found in the decompiles or the game-data notes, so EVERY event on a watch=1 character
+   is printed: the escape's end event is among them.
+   LOG ONLY: nothing is called or written; the engine's calls run exactly as before. Any thread: plain values into a fixed ring (no
+   lock, no allocation, no log; the thread's last error kept); the main thread prints them in TalkOrderDrain, in the order they came.
+     [PROBE] P214 EVENT ev=0x<n> speaker uid=<u> target uid=<t> own=<0|1> watch=<0|1|2> thread=main|off (PROBE P214)
+          sendEvent 0x683F00 with event 0xD or on a watch=1 character (noted before the engine's call); for a watch=2 character
+          only when the event reaches a conversation start, printed just before that start's PICK line
+     [PROBE] P214 PICK ev=0x<n>|direct sid=<line string id|-> acts=<type:value,..|none|?> started=<0|1> player=<0|1>
+          speaker uid=<u> target uid=<t> watch=<0|1|2> thread=main|off (PROBE P214)
+          each conversation start (startConversation / startPlayerConversation, after the engine's call) on a watched character or
+          with event 0xD; a watch=2 start with no line that did not start (the common sight-event miss) is left out
+     [PROBE] P214 ACT18 OFF-MAIN sid=<line string id> acts=<type:value,..> speaker uid=<u> (PROBE P214)
+          each line carrying act 18 (DA_JOIN_SQUAD_FAST) that runs off the main thread, where the hire check is skipped
+     [H054] REPORT probeP214[events,starts,act18Off,watched,prints,capped,ringLost,blocked] (PROBE P214)   every 30 s once one was noted
+   own = the speaker is a character this game runs. kP214PrintCap lines a launch (EVENT, PICK and ACT18 together). */
+const int  kP214Ring = 128;          /* a power of two */
+const int  kP214Watch = 64;
+const int  kP214SidCap = 95;
+const int  kP214Acts = 12;
+const long kP214PrintCap = 200;
+const int  kP214EvUnlock = 0xD;
+const int  kP214ActJoin = 18;        /* DA_JOIN_SQUAD_FAST */
+const int  kP214KindEvent = 0, kP214KindStart = 1, kP214KindAct18 = 2;
+struct P214Work
+{
+    int kind, ev, tier, started, player, off, sidLen, nActs;
+    void* spk; void* tgt; LONG seq;
+    char sid[kP214SidCap + 1];
+    int types[kP214Acts], values[kP214Acts];
+};
+struct P214Slot { volatile LONG state; P214Work w; };   /* state: 0 free, 1 a writer fills it, 2 ready for the main thread */
+P214Slot g_p214Ring[kP214Ring];
+volatile LONG g_p214Next = 0;
+void* volatile g_p214Watch[kP214Watch];          /* MAIN THREAD writes (P214Tick), any thread compares */
+volatile LONG g_p214WatchTier[kP214Watch];
+volatile LONG g_p214WatchN = 0;
+volatile LONG64 g_p214Events = 0, g_p214Starts = 0, g_p214Act18 = 0, g_p214RingLost = 0;
+long g_p214Prints = 0;                            /* MAIN THREAD */
+long long g_p214Capped = 0, g_p214Blocked = 0;    /* MAIN THREAD */
+DWORD g_p214WatchAt = 0, g_p214ReportAt = 0;
+
+/* ANY THREAD: the character's watch tier (1 freed by the lever, 2 restrained), 0 not watched - pointer compares only */
+int P214Tier(const void* c)
+{
+    if (c == 0) return 0;
+    const LONG n = g_p214WatchN;
+    int t = 0;
+    for (LONG k = 0; k < n && k < kP214Watch; ++k)
+        if (g_p214Watch[k] == c) { const int x = (int)g_p214WatchTier[k]; if (t == 0 || x < t) t = x; }
+    return t;
+}
+int P214Best(int a, int b) { return (a == 0) ? b : ((b == 0 || a < b) ? a : b); }
+/* ANY THREAD: one record into the ring (up to 8 slots tried), else counted lost */
+void P214Push(const P214Work* w)
+{
+    for (int tries = 0; tries < 8; ++tries)
+    {
+        const LONG i = ::InterlockedIncrement(&g_p214Next);
+        P214Slot& x = g_p214Ring[i & (kP214Ring - 1)];
+        if (::InterlockedCompareExchange(&x.state, 1, 0) != 0) continue;
+        x.w = *w;
+        x.w.seq = i;
+        ::InterlockedExchange(&x.state, 2);
+        return;
+    }
+    ::InterlockedIncrement64(&g_p214RingLost);
+}
+/* ANY THREAD: the line's string id and actions ('-' / 0 actions: no line; nActs -1 unreadable). No C++ object. */
+void P214ReadLine(void* line, P214Work* w)
+{
+    w->nActs = 0;
+    std::strcpy(w->sid, "-");
+    if (line == 0) return;
+    w->sidLen = TkLineSidPod(line, w->sid, kP214SidCap);
+    if (w->sidLen > 0) w->sid[w->sidLen] = 0; else std::strcpy(w->sid, "?");
+    int items = 0;
+    w->nActs = TkLineActsPod(line, w->types, w->values, kP214Acts, &items);
+}
+/* ANY THREAD (hot: every sendEvent), from detour_sendEvent before the engine's call */
+void P214NoteEvent(void* dlg, void* who, int what)
+{
+    if (dlg == 0 || (what != kP214EvUnlock && g_p214WatchN == 0)) return;
+    const DWORD le = ::GetLastError();
+    void* const spk = SayReadPtr(dlg, kDlgMe);
+    const int ts = P214Tier(spk), tw = P214Tier(who);
+    if (what == kP214EvUnlock || ts == 1 || tw == 1)
+    {
+        P214Work w;
+        std::memset(&w, 0, sizeof(w));
+        w.kind = kP214KindEvent; w.ev = what; w.spk = spk; w.tgt = who; w.tier = P214Best(ts, tw);
+        w.off = (SayOnMainThread() == 0) ? 1 : 0;
+        ::InterlockedIncrement64(&g_p214Events);
+        P214Push(&w);
+    }
+    ::SetLastError(le);
+}
+/* ANY THREAD, from TalkNote (off 0) / TalkOffNote (off 1) after the engine's start ran: ev -1 = a direct start */
+void P214NoteStart(int player, void* dlg, void* who, void* line, int ev, unsigned long long ret, int off)
+{
+    if (dlg == 0 || (ev != kP214EvUnlock && g_p214WatchN == 0)) return;
+    const DWORD le = ::GetLastError();
+    void* const spk = SayReadPtr(dlg, kDlgMe);
+    const int tier = P214Best(P214Tier(spk), P214Tier(who));
+    const int started = (ret & 0xFF) != 0 ? 1 : 0;
+    if ((ev == kP214EvUnlock || tier != 0) && !(tier == 2 && ev != kP214EvUnlock && line == 0 && started == 0))
+    {
+        P214Work w;
+        std::memset(&w, 0, sizeof(w));
+        w.kind = kP214KindStart; w.ev = ev; w.tier = tier; w.started = started; w.player = player; w.off = off; w.spk = spk; w.tgt = who;
+        P214ReadLine(line, &w);
+        ::InterlockedIncrement64(&g_p214Starts);
+        P214Push(&w);
+    }
+    ::SetLastError(le);
+}
+/* ANY THREAD, from TalkNoteOffMainActs (a line run off the main thread) with its read actions: a line carrying act 18 noted */
+void P214NoteOffAct18(void* dlg, void* line, const int* types, int n)
+{
+    int has = 0;
+    for (int i = 0; i < n; ++i) if (types[i] == kP214ActJoin) has = 1;
+    if (has == 0) return;
+    const DWORD le = ::GetLastError();
+    P214Work w;
+    std::memset(&w, 0, sizeof(w));
+    w.kind = kP214KindAct18; w.ev = -1; w.off = 1; w.spk = (dlg != 0) ? SayReadPtr(dlg, kDlgMe) : 0;
+    P214ReadLine(line, &w);
+    ::InterlockedIncrement64(&g_p214Act18);
+    P214Push(&w);
+    ::SetLastError(le);
+}
+void P214FormatActs(const P214Work& w, char* out, size_t cap)
+{
+    if (w.nActs < 0) { strcpy_s(out, cap, "?"); return; }
+    if (w.nActs == 0) { strcpy_s(out, cap, "none"); return; }
+    size_t at = 0;
+    out[0] = 0;
+    for (int i = 0; i < w.nActs && i < kP214Acts && at < cap; ++i)
+    {
+        const int r = _snprintf_s(out + at, cap - at, _TRUNCATE, "%s%d:%d", i != 0 ? "," : "", w.types[i], w.values[i]);
+        if (r < 0) return;
+        at += (size_t)r;
+    }
+}
+void P214Print(const char* line)
+{
+    if (g_p214Prints >= kP214PrintCap) { ++g_p214Capped; return; }
+    ++g_p214Prints;
+    DebugLog(line);
+}
+/* MAIN THREAD, at the top of TalkOrderDrain: the watch list refreshed every second, the noted records printed in order, the REPORT
+   every 30 s once one was noted */
+void P214Tick()
+{
+    const DWORD now = ::GetTickCount();
+    const bool blocked = EngineWritesBlocked();
+    if (g_p214WatchAt == 0 || now - g_p214WatchAt >= 1000)
+    {
+        g_p214WatchAt = now;
+        void* list[kP214Watch];
+        int freed[kP214Watch];
+        const int n = blocked ? 0 : coop::P214WatchList(list, freed, kP214Watch);
+        if (n < (int)g_p214WatchN) ::InterlockedExchange(&g_p214WatchN, (LONG)n);
+        for (int k = 0; k < n; ++k) { g_p214Watch[k] = list[k]; g_p214WatchTier[k] = freed[k] ? 1 : 2; }
+        ::InterlockedExchange(&g_p214WatchN, (LONG)n);
+    }
+    static int idx[kP214Ring];
+    int m = 0;
+    for (int s = 0; s < kP214Ring; ++s) if (g_p214Ring[s].state == 2) idx[m++] = s;
+    for (int a = 1; a < m; ++a)
+    {
+        const int v = idx[a];
+        int c = a - 1;
+        while (c >= 0 && g_p214Ring[idx[c]].w.seq - g_p214Ring[v].w.seq > 0) { idx[c + 1] = idx[c]; --c; }
+        idx[c + 1] = v;
+    }
+    for (int k = 0; k < m; ++k)
+    {
+        P214Slot& x = g_p214Ring[idx[k]];
+        const P214Work w = x.w;
+        ::InterlockedExchange(&x.state, 0);
+        if (blocked) { ++g_p214Blocked; continue; }   /* loading / tearing down: the uids are not looked up */
+        const unsigned int su = (w.spk != 0) ? FindSpawnedUid(w.spk) : 0;
+        const unsigned int tu = (w.tgt != 0) ? FindSpawnedUid(w.tgt) : 0;
+        const int own = (su != 0 && net::IsUidMine(su)) ? 1 : 0;
+        const char* const th = w.off ? "off" : "main";
+        char evs[16], acts[200], b[600];
+        if (w.ev < 0) strcpy_s(evs, sizeof(evs), "direct"); else _snprintf_s(evs, sizeof(evs), _TRUNCATE, "0x%X", (unsigned int)w.ev);
+        if (w.kind == kP214KindEvent || (w.kind == kP214KindStart && w.tier == 2 && w.ev >= 0 && w.ev != kP214EvUnlock))
+        {
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[PROBE] P214 EVENT ev=%s speaker uid=%u target uid=%u own=%d watch=%d thread=%s (PROBE P214)",
+                        evs, su, tu, own, w.tier, th);
+            P214Print(b);
+        }
+        if (w.kind == kP214KindEvent) continue;
+        P214FormatActs(w, acts, sizeof(acts));
+        if (w.kind == kP214KindStart)
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[PROBE] P214 PICK ev=%s sid=%s acts=%s started=%d player=%d speaker uid=%u target uid=%u watch=%d thread=%s (PROBE P214)",
+                        evs, w.sid, acts, w.started, w.player, su, tu, w.tier, th);
+        else
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[PROBE] P214 ACT18 OFF-MAIN sid=%s acts=%s speaker uid=%u (PROBE P214)", w.sid, acts, su);
+        P214Print(b);
+    }
+    if (g_p214Events + g_p214Starts + g_p214Act18 == 0) return;
+    if (g_p214ReportAt == 0) { g_p214ReportAt = now; return; }
+    if (now - g_p214ReportAt < 30000) return;
+    g_p214ReportAt = now;
+    char rep[400];
+    _snprintf_s(rep, sizeof(rep), _TRUNCATE,
+                "[H054] REPORT probeP214[events,starts,act18Off,watched,prints,capped,ringLost,blocked]=%lld,%lld,%lld,%ld,%ld,%lld,%lld,%lld (PROBE P214)",
+                (long long)g_p214Events, (long long)g_p214Starts, (long long)g_p214Act18, (long)g_p214WatchN, g_p214Prints, g_p214Capped,
+                (long long)g_p214RingLost, g_p214Blocked);
+    DebugLog(rep);
+}
+// PROBE-END: P214
+#endif
+
+/* P26s6 S6-1 (any thread, hot): the original runs with the engine's arguments, except inside the T-980 re-pick on this thread, where
+   the stand-in listener is replaced by the character actually talking; two conditions asked by an NPC this game drives toward the
+   other player's character are answered for that player: DC_IS_PLAYER (as for a player) and the money condition (by that player's
+   saved purse, TkS6MoneyCond). */
 bool detour_s6CheckCond(void* dlg, int cond, int cmp, int val, void* target, void* convTarget)
 {
+    if (g_tcSubTid != 0 && g_tcSubTid == ::GetCurrentThreadId())
+    {
+        void* const standIn = g_tcSubStandIn;
+        void* const talker = g_tcSubTalker;
+        void* const asked = cooptalk::TalkCagedCondTarget(standIn, talker, target);
+        if (asked != target) { target = asked; ::InterlockedIncrement64(&g_tcSubCondSwapped); }
+        convTarget = cooptalk::TalkCagedCondTarget(standIn, talker, convTarget);
+    }
     const bool r = orig_s6CheckCond(dlg, cond, cmp, val, target, convTarget);
-    if (cond == kS6DcMoney && g_s6On) return TkS6MoneyCond(dlg, cmp, val, target, convTarget, r);
-    if (cond != kS6DcIsPlayer || !g_s6On || !TkPeerTarget(target)) return r;
-    const int own = TkS6NpcOurs(dlg);   /* P26s6 fold 1: -1 no uid, counted apart */
-    if (own != 1) { ::InterlockedIncrement64(own < 0 ? &g_s6NoUid : &g_s6CondNotOurs); return r; }
-    ::InterlockedIncrement64(&g_s6CondPeer);
-    return 0 < val;   /* the engine's answer for a player target: (isPlayer != 0) == (0 < val) (675ec0:66, :412) */
+    bool out = r;   /* one return, so the P213 note below sees the answer the line test gets */
+    if (cond == kS6DcMoney && g_s6On) out = TkS6MoneyCond(dlg, cmp, val, target, convTarget, r);
+    else if (cond == kS6DcIsPlayer && g_s6On && TkPeerTarget(target))
+    {
+        const int own = TkS6NpcOurs(dlg);   /* P26s6 fold 1: -1 no uid, counted apart */
+        if (own != 1) ::InterlockedIncrement64(own < 0 ? &g_s6NoUid : &g_s6CondNotOurs);
+        else
+        {
+            ::InterlockedIncrement64(&g_s6CondPeer);
+            out = 0 < val;   /* the engine's answer for a player target: (isPlayer != 0) == (0 < val) (675ec0:66, :412) */
+        }
+    }
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    P213NoteCond(cond, cmp, val, target, r, out);   /* the engine's answer and the one returned, onto the line this thread is testing in a traced talk order */
+// PROBE-END: P213
+#endif
+    return out;
 }
 
 /* P26s6 S6-2 (any thread): T_TARGET_IF_PLAYER that found no player resolves to the other player's character when the conversation
@@ -2287,6 +3965,7 @@ void InstallTalkStarters()
     if (kDialogueReplyClickedRva == 0) g_replyClickedHook = -2;
     else g_replyClickedHook = (coop::AddHook((void*)(g_base + kDialogueReplyClickedRva), (void*)&detour_replyClicked,
                                              (void**)&orig_replyClicked) == coop::SUCCESS) ? 1 : -1;
+    TalkLogInstall();   /* T-978: the conversation window log (its next-line hook and install line) */
     /* P26s1 fold 1 H2 */
     if (kDlgSetConvReplyGuiRva == 0) g_convReplyGuiHook = -2;
     else g_convReplyGuiHook = (coop::AddHook((void*)(g_base + kDlgSetConvReplyGuiRva), (void*)&detour_setConvReplyGui,
@@ -2294,6 +3973,12 @@ void InstallTalkStarters()
     if (kDlgSetResponsesGuiRva == 0) g_responsesGuiHook = -2;
     else g_responsesGuiHook = (coop::AddHook((void*)(g_base + kDlgSetResponsesGuiRva), (void*)&detour_setResponsesGui,
                                              (void**)&orig_setResponsesGui) == coop::SUCCESS) ? 1 : -1;
+    if (kDlgClearResponsesGuiRva == 0) g_clearResponsesGuiHook = -2;   /* T-978 B1 */
+    else g_clearResponsesGuiHook = (coop::AddHook((void*)(g_base + kDlgClearResponsesGuiRva), (void*)&detour_clearResponsesGui,
+                                                  (void**)&orig_clearResponsesGui) == coop::SUCCESS) ? 1 : -1;
+    if (kDlgWinStepRva == 0 || kInputLeftReleasedRva == 0) g_dlgWinStepHook = -2;   /* T-978 D: needs both rows */
+    else g_dlgWinStepHook = (coop::AddHook((void*)(g_base + kDlgWinStepRva), (void*)&detour_dlgWinStep,
+                                           (void**)&orig_dlgWinStep) == coop::SUCCESS) ? 1 : -1;
     g_tkOn = (g_startPlayerConvHook == 1 && g_setInDialogHook == 1 && g_endDialogueHook == 1
               && g_convReplyGuiHook == 1 && g_responsesGuiHook == 1) ? 1 : 0;
     {
@@ -2322,6 +4007,11 @@ void InstallTalkStarters()
     else g_s6SpkHook = (coop::AddHook((void*)(g_base + kS6GetSpeakerRva), (void*)&detour_s6GetSpeaker,
                                       (void**)&orig_s6GetSpeaker) == coop::SUCCESS) ? 1 : -1;
     g_s6On = (g_tkOn && g_s6CondHook == 1 && g_s6SpkHook == 1) ? 1 : 0;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    P213Install();   /* the line test's log-only hook; needs the condition hook above */
+// PROBE-END: P213
+#endif
     {
         const int rows = (kS6SquadLeaderRva != 0 && kS6GetPlatoonRva != 0 && kS6AddOrderRva != 0 && kS6AddOrderArgRva != 0) ? 1 : 0;
         const std::string s6 = std::string("[TALK] P26s6 hooks: _checkCondition 0x675EC0=") + TalkHookState(g_s6CondHook)
@@ -2395,6 +4085,7 @@ void detour_dlgWinPortrait(void* win, void* who, char slot)
     const int onMain = SayOnMainThread();
     if (cooppd::CallNow(onMain, onMain ? coop::AiWorkerBusyNow() : -1))
     {
+        if (OwSkipPortraitOn(TkWindowDlg(), who)) { ::InterlockedIncrement64(&g_owSkipPortrait); return; }   /* T-978 B1: another conversation's portrait */
         ::InterlockedIncrement64(&g_prCalledNow);
         PrLock();
         const int superseded = cooppd::Drop(&g_prHeld, (int)(unsigned char)slot);   /* the older held request must not repaint it */
@@ -2840,6 +4531,16 @@ static int g_talkTestNearCopy = 0;   /* P25: `talktest nearcopy ...` - the near 
 static int g_talkTestPeer = 0;   /* T-1152 `talktest nearestpeer`: the speaker is the nearest character of another player (TkPlayerSpeaker) */
 static float g_talkTestPeerR = kTalkNearMax;   /* nearestpeer: the search radius around this game's first own player character */
 static long long g_talkTestArmed = 0, g_talkTestRan = 0, g_talkTestSkipped = 0, g_talkTestFaulted = 0;
+/* talktest nearestname|nearestfaction ... walk (TEST-ONLY): 1 = the armed request gives the target (this game's own character) the
+   engine's own Talk order on the NPC (issueOrder, TaskType PLAYER_TALK_TO 12 -> Task_PlayerTalkto, whose arrival step 0x34BE10
+   sends event 1 itself) instead of calling sendEvent directly - the walk in loads the inside of the NPC's building, which the
+   engine's indoors test needs. g_ttWalk: the watch of the NPC's "where are you?" answer while the walker goes. MAIN THREAD. */
+static int g_talkTestWalk = 0;
+struct TtWalkWatch { int on; unsigned int npcUid; unsigned int walkerUid; DWORD startMs; DWORD lastMs; };
+static TtWalkWatch g_ttWalk = { 0, 0, 0, 0, 0 };
+static const int kTtTaskPlayerTalkTo = 12;      /* TaskType PLAYER_TALK_TO: the factory 0x32EB90's index table entry 11 = 7, Task_PlayerTalkto */
+static const DWORD kTtWalkWaitMs = 30000;       /* the watch gives up after 30 s */
+static const DWORD kTtWalkPeriodMs = 250;       /* one read of the NPC's answer per 250 ms */
 
 std::string TalkTestArm(const std::string& arg)
 {
@@ -2847,6 +4548,7 @@ std::string TalkTestArm(const std::string& arg)
     if (!coopsay::TalkTestParse(arg, &n, &t, &ev, &nc))   /* P25: nearcopy */
         return "error talktest: usage talktest [npcUid|near|nearcopy] [targetUid|near] [event 0..255, default 1]";
     g_talkTestNpcUid = n; g_talkTestTargetUid = t; g_talkTestEvent = ev; g_talkTestNearCopy = nc; g_talkTestPeer = 0;   /* replaces a pending nearestpeer */
+    g_talkTestWalk = 0;   /* a direct sendEvent; TsArmPicked sets walk after this for `... walk` */
     ::InterlockedExchange(&g_talkTestPending, 1);
     ++g_talkTestArmed;
     char b[200];
@@ -2878,6 +4580,7 @@ std::string TalkTestPeerArm(const std::string& arg)
         r = (float)v;
     }
     g_talkTestNpcUid = 0; g_talkTestTargetUid = 0; g_talkTestEvent = 1; g_talkTestNearCopy = 0; g_talkTestPeer = 1; g_talkTestPeerR = r;
+    g_talkTestWalk = 0;
     ::InterlockedExchange(&g_talkTestPending, 1);
     ++g_talkTestArmed;
     char b[200];
@@ -3396,7 +5099,8 @@ static void TkAfterApply(void* dlg, const TkConv& c, int called)
    _doActions 0x67FAD0 and sayLine 0x682F10 of the next NPC line chosen among its children, decomp_683170 / decomp_683c90) with the
    index of B's reply id in this game's reply list (+0x238): the NPC answers exactly as for a local player. A reply id that is not in
    the list (0x683170 would go on from the CURRENT line - Read) or a current line that is no longer the prompted one ends this side,
-   END NOT_FORWARDABLE. CLOSED / BUSY / NO_CHAR / SHOW_FAILED end this side (no END: B's side is gone already). MAIN THREAD, K2 safe
+   END NOT_FORWARDABLE. CLOSED / BUSY / NO_CHAR / SHOW_FAILED end this side and send END (T-858, T1914: TALKER_CLOSED - B's window
+   is gone already, but the END carries the unrun list, so B refunds a paid line whose NPC-side part never ran). MAIN THREAD, K2 safe
    point, the world not blocked. */
 static void TkApplyAnswer(const cooptalk::TalkMsg& m, unsigned int peer)
 {
@@ -3426,9 +5130,11 @@ static void TkApplyAnswer(const cooptalk::TalkMsg& m, unsigned int peer)
     {
         if (m.result == cooptalk::kTalkAnsClosed) ++g_tkAnsClosed; else ++g_tkAnsOther;
         TkLog("[TALK] A ANSWER " + std::string(cooptalk::TalkAnswerName(m.result)) + " conv=" + TkU(c.convId) + " seq=" + TkU(c.seq) + " - this game ends its side");
-        /* P26s4 fold 1 M2: SHOW_FAILED for a NEXT line (seq > 1: the other game had the window open) also sends END, so that
-           window closes even where its game could not close it (an END for a window already closed is ignored there) */
-        const int endB = (m.result == cooptalk::kTalkAnsShowFailed && c.seq > 1) ? cooptalk::kTalkEndEngine : 0;
+        /* P26s4 fold 1 M2: SHOW_FAILED for a NEXT line (seq > 1: the other game had the window open) sends END ENGINE, so that
+           window closes even where its game could not close it (an END for a window already closed is ignored there).
+           T-858 (T1914): every other non-REPLY answer now sends END TALKER_CLOSED with the unrun list - before, none went, and a
+           paid line whose ACT_RESULT was lost stayed booked on B and was never refunded (B lost 200 cats) */
+        const int endB = cooptalk::TalkEndForAnswer(m.result, c.seq);
         TkEndOwn(dlg, c.me, endB, cooptalk::TalkAnswerName(m.result), 1);
         return;
     }
@@ -3554,10 +5260,12 @@ static std::string TkGdSid(const void* gd)
    meanwhile reads the untouched shared line. Pointers inside the copy (lists, strings, the relation table) still point at the
    line's own storage - read only, never freed here.
      side 0 (A, the NPC's owner): givesItem (+0xB0) and factionRelationEffects (+0x2F0) emptied - they are the target's.
+     side 2 (T-478 step 3, B: one listed action alone - the bail case run from an END): both of the above emptied.
      side 1 (B, the target's owner): the dialogue's own parts emptied - locks / unlocks (+0x288 / +0x2A0 / +0x2B8, 67fad0:158-283),
        campaignTriggers (+0x28, 67fad0:675), crowdTrigger (+0x2C8, 67fad0:577) and playerInterruptionDialog (+0x310, 67fad0:367);
-       A ran them. The tail call (the NPC squad's note of the said line, +0x1D8, 67fad0:1786) runs on B's copy of the NPC too
-       (Inferred harmless: the copy's AI is A's to decide).
+       A ran them. The tail call 0x2732F0 (67fad0:1786; Read, build/decomp_2732f0.txt: the line's GameData (+0x1D8) 'change AI' and
+       'AI contract' references put on the NPC squad's blackboard, the dialogue's target +0x158 as the contract's party; nothing for a
+       player-faction squad) runs on B's copy of the NPC too (T1979: the copy stayed 'Aimless' - the copy's AI is A's to decide).
    MAIN THREAD. 1 ran, 0 no trampoline, -1 the engine faulted, -2 the line did not read / nesting too deep. */
 static int TkRunViewPod(void* dlg, void* line, void** keep, unsigned int nKeep, int side)
 {
@@ -3569,8 +5277,8 @@ static int TkRunViewPod(void* dlg, void* line, void** keep, unsigned int nKeep, 
         std::memcpy(C, line, kTkLineSize);
         *(unsigned int*)(C + 0x210) = nKeep;
         *(void**)(C + 0x218) = (void*)keep;
-        if (side == 0) { *(unsigned int*)(C + 0xB0) = 0; *(unsigned long long*)(C + 0x2F0) = 0; }
-        else
+        if (side == 0 || side == 2) { *(unsigned int*)(C + 0xB0) = 0; *(unsigned long long*)(C + 0x2F0) = 0; }
+        if (side != 0)
         {
             *(unsigned int*)(C + 0x288) = 0; *(unsigned int*)(C + 0x2A0) = 0; *(unsigned int*)(C + 0x2B8) = 0;
             *(void**)(C + 0x2C8) = 0; *(void**)(C + 0x310) = 0; *(unsigned long long*)(C + 0x28) = 0;
@@ -3635,6 +5343,73 @@ static std::string TkPairsStr(const std::vector<std::string>& sid, const std::ve
     return s;
 }
 
+/* T-858, B: pay the refunds an END made due - the talker's purse moved back by what this game took for the unrun lines, once each
+   (the book forgot them when it made them due). Waits while the money may not move (StoreMoneyReady: a save, a restore, no world);
+   retried from TkTimeouts. Never paid into another ledger than the one the money was taken from. MAIN THREAD. */
+static void TkRefundPay()
+{
+    if (g_tkRefundDue.empty()) return;
+    std::string why;
+    if (coop::StoreMoneyReady(&why) != 1) return;
+    const long long base = coop::StoreMoneyBaseReads();
+    std::vector<TkRefundDue> later;
+    for (size_t k = 0; k < g_tkRefundDue.size(); ++k)
+    {
+        const TkRefundDue& d = g_tkRefundDue[k];
+        const std::string what = " conv=" + TkU(d.convId) + " ACT seq=" + TkU(d.seq) + " amount=" + TkI(d.amount);
+        if (d.base != base)   /* another world, store or profile was taken since the money was taken: never paid into that one */
+        {
+            ++g_tkRefundStale;
+            TkLog("[TALK] B refund DROPPED" + what + " - the money ledger was taken anew since (another world, store or profile)");
+            continue;
+        }
+        /* money.cpp's order: the purse moved, then pp.money written; a write that cannot be made takes it back out and the refund
+           waits for the next tick */
+        const int r = coop::StoreMoneyAdjust(d.amount);
+        if (r == -1 && d.tries + 1 < kTkRefundTries) { TkRefundDue w = d; ++w.tries; later.push_back(w); continue; }   /* no purse now: next tick */
+        if (r != 1)
+        {
+            ++g_tkRefundFailed;
+            TkLogFail("[TALK] B refund FAILED" + what + (r == 0 ? std::string(" - the purse would pass an int") : std::string(" - no purse, after retries")));
+            continue;
+        }
+        unsigned long long seq = 0;
+        if (!coop::StoreMoneyWriteNow(&seq))
+        {
+            if (coop::StoreMoneyAdjust(-d.amount) == 1)   /* nothing changed: tried again next tick, at most kTkRefundTries times */
+            {
+                if (d.tries + 1 < kTkRefundTries) { TkRefundDue w = d; ++w.tries; later.push_back(w); continue; }
+                ++g_tkRefundFailed;
+                TkLogFail("[TALK] B refund FAILED" + what + " - pp.money could not be written, after retries (the money was taken back out)");
+                continue;
+            }
+            TkLogFail("[TALK] B refund" + what + " is in the purse but pp.money could not be written nor the money taken back - the next money write carries it");
+        }
+        ++g_tkRefunds; g_tkRefundMoney += d.amount;
+        TkLog("[TALK] B refund" + what + " - paid back: the NPC's part of that line never ran on its game (pp.money write " + TkU((unsigned int)seq) + ")");
+    }
+    g_tkRefundDue.swap(later);
+}
+/* T-858, B: an END from the NPC's game - the paid lines it lists as unrun are refunded once; the conversation's other booked lines
+   ran there and are forgotten. Before the END's window checks: a window already closed here does not lose a refund. MAIN THREAD. */
+static void TkRefundOnEnd(const cooptalk::TalkMsg& m, unsigned int peer)
+{
+    std::vector<cooptalk::TalkPaid> due;
+    g_tkRefundBook.OnEnd(peer, m.convId, m.unrun, &due, TkSamePlayer());
+    for (size_t k = 0; k < due.size(); ++k)
+    {
+        TkRefundDue d; d.convId = due[k].convId; d.seq = due[k].seq; d.amount = due[k].amount; d.base = due[k].base; d.tries = 0;
+        const long long lostBefore = g_tkRefundDueLost;
+        if (cooptalk::TalkPushCapped(&g_tkRefundDue, d, cooptalk::kTalkRefundDueCap, &g_tkRefundDueLost) && lostBefore == 0)   /* review LOW 3 */
+            TkLogFail("[TALK] B refund LOST: " + TkI((int)cooptalk::kTalkRefundDueCap) + " refunds were already waiting for the money to be movable - the oldest went unpaid"
+                      " (logged once; talkRefund dueLost counts every one)");
+    }
+    if (!due.empty() || !m.unrun.empty())
+        TkLog("[TALK] B END conv=" + TkU(m.convId) + " lists " + TkI((int)m.unrun.size()) + " unrun ACT seq(s); " + TkI((int)due.size())
+              + " of them took money here - refunds due");
+    TkRefundPay();
+}
+
 /* P26 stage 5: B - an ACT: the TARGET-side part of one line of the mirrored conversation, applied to this game's own character with
    the engine's own code - _doActions on THIS game's copy of the same line (looked up by its string id), viewed down to exactly the
    ACT's parts (TkRunViewPod side 1), on the NPC copy's Dialogue, whose conversation target is this game's character while the
@@ -3671,7 +5446,7 @@ static void TkApplyAct(const cooptalk::TalkMsg& m, unsigned int peer)
     TkLineView v;
     v.n = 0; v.nItems = 0; v.nRels = 0;
     if (why.empty() && TkLineViewPod(line, &v) < 0) { r.result = cooptalk::kTalkActNoLine; why = "this game's copy of the line does not read"; }
-    int hireType = 0, take = 0, unsupported = 0, firstUnsup = 0, carried = 0, noCarry = 0, carriedType = 0, carriedEngine = 0;
+    int hireType = 0, take = 0, unsupported = 0, firstUnsup = 0, carried = 0, noCarry = 0, carriedType = 0, carriedEngine = 0, surrender = 0;
     unsigned int nKeep = 0, ownCarried = 0;
     if (why.empty())
     {
@@ -3700,7 +5475,11 @@ static void TkApplyAct(const cooptalk::TalkMsg& m, unsigned int peer)
             const int side = cooptalk::TalkActSide(v.types[i]);
             if (side == cooptalk::kTalkSideNpc || cooptalk::TalkActEndsTalk(v.types[i])) continue;   /* P26s5 fold 1 */
             if (v.types[i] == 8) { take += v.values[i]; if (hireType != 0) continue; }   /* with a hire in the line it is the price (HoldLine's rule) */
-            if (side == cooptalk::kTalkSideApply) g_tkActView[nKeep++] = v.acts[i];
+            if (side == cooptalk::kTalkSideApply)
+            {
+                g_tkActView[nKeep++] = v.acts[i];
+                if (cooptalk::TalkActChainsTalkers(v.types[i])) ++surrender;   /* T-478 step 4: 47 runs here, on our own characters */
+            }
             else if (side == cooptalk::kTalkSideRefuse) { ++unsupported; if (firstUnsup == 0) firstUnsup = v.types[i]; }
             else if (side == cooptalk::kTalkSideCarried)
             {   /* the person our own character carries must be the one the NPC's game saw it carry */
@@ -3734,7 +5513,26 @@ static void TkApplyAct(const cooptalk::TalkMsg& m, unsigned int peer)
     {
         if (nKeep > 0 || v.nItems > 0 || v.nRels > 0)
         {
+            if (surrender) CapChainCountBegin();
             ran = TkRunViewPod(dlg, line, g_tkActView, nKeep, 1);
+            if (surrender)
+            {   /* T-478 step 4: the engine's case chained our characters in range with this game's copy of the NPC as owner; each one's
+                   MSG_SLAVE (state 1, ownerUid = the NPC) is marked by the capture hook and brings the NPC's game's copies to it */
+                unsigned int su[8] = { 0 };
+                const int nCh = CapChainCountEnd(su, 8);
+                const std::string split = CapChainCountSplit();
+                std::string list;
+                for (int k = 0; k < nCh && k < 8; ++k) list += (list.empty() ? "" : ",") + TkU(su[k]);
+                ++g_t478SurrRan;
+                g_t478SurrChained += nCh;
+                const std::string head = "[TALK] T478 B surrender (47) line=" + m.lineSid;
+                const int skipped = CapSurrenderSkips((void*)npc, (void*)tgt, su, nCh, head);   /* fold 2: one SKIPPED line each */
+                if (skipped > 0) g_t478SurrSkipped += skipped;
+                if (split.find(" held=0 ") == std::string::npos) ++g_t478SurrHeld;
+                TkLog(head + " ran=" + TkI(ran) + " on our own characters: chained=" + TkI(nCh)
+                      + " uids=[" + list + "] owner npcUid=" + TkU(m.npcUid) + " chainCalls[" + split + "] skippedListed=" + TkI(skipped)
+                      + (nCh == 0 ? std::string(" - nothing of ours chained (each skipped character is listed above)") : std::string(" - MSG_SLAVE carries each to the other games")));
+            }
             if (ran != 1)
             {
                 r.result = cooptalk::kTalkActFault;
@@ -3770,6 +5568,14 @@ static void TkApplyAct(const cooptalk::TalkMsg& m, unsigned int peer)
     if (r.result == cooptalk::kTalkActFault) ++g_tkActFault;
     if (hired) ++g_tkActHires;
     g_tkActUnsupported += unsupported;
+    {   /* T-858: a line that took money is booked, so an END listing it as unrun gives it back (talkrefund.h) */
+        const int owed = cooptalk::TalkRefundAmount(r.result == cooptalk::kTalkActApplied, r.moneyBefore, r.moneyAfter, m.actTypes, m.actValues);
+        const int noted = owed > 0 ? g_tkRefundBook.Note(peer, m.convId, m.seq, owed, coop::StoreMoneyBaseReads(), TkSamePlayer()) : 0;
+        if (noted >= 1) ++g_tkPaidBooked;
+        if (noted == 2)   /* review LOW 1: an older booking with the same numbers (the other game restarted without a link end) - the newest payment wins */
+            TkLog("[TALK] B ACT seq=" + TkU(m.seq) + " conv=" + TkU(m.convId) + " booked OVER an older booking with the same numbers (the other game restarted?) - the newest payment ("
+                  + TkI(owed) + ") is the one refunded");
+    }
     const int sent = net::SendTalk(r) ? 1 : 0;
     TkLog("[TALK] B ACT seq=" + TkU(m.seq) + " conv=" + TkU(m.convId) + " line=" + m.lineSid + " acts=[" + TkActsStr(m.actTypes, m.actValues)
           + "] items=[" + TkPairsStr(m.itemSids, m.itemValues) + "] rels=[" + TkPairsStr(m.relSids, m.relValues) + "] -> "
@@ -3819,6 +5625,21 @@ static void TkTakeCarried(unsigned int npcUid, unsigned int personUid, unsigned 
                          : " - NO take orders: " + why));
 }
 
+/* T-858 TEST-ONLY lever `talktest actresultdrop` (TalkActResultDropArm): 1 = the NEXT ACT_RESULT for a paid line (APPLIED, the
+   talker's purse down) is thrown away here, once - its held NPC-side part stays held, so the conversation's END lists it as unrun
+   and the talker's game refunds it. MAIN THREAD. */
+static int g_tkActResDropArmed = 0;
+static long long g_tkActResDropped = 0;
+static int TkActResDropTake(const cooptalk::TalkMsg& m, unsigned int peer)
+{
+    if (!g_tkActResDropArmed || m.result != cooptalk::kTalkActApplied || m.moneyBefore < 0 || m.moneyAfter < 0 || m.moneyAfter >= m.moneyBefore) return 0;
+    g_tkActResDropArmed = 0;
+    ++g_tkActResDropped;
+    TkLog("[TALK] A ACT_RESULT seq=" + TkU(m.seq) + " conv=" + TkU(m.convId) + " from peer " + TkU(peer) + " their purse " + TkI(m.moneyBefore) + " -> "
+          + TkI(m.moneyAfter) + " DROPPED by talktest actresultdrop (TEST-ONLY, one-shot): the line's NPC-side part stays held - the END lists it as unrun");
+    return 1;
+}
+
 /* P26 stage 5: A - the other game's answer to an ACT.
    P26s5 fold 1: the line's NPC-side part was HELD (TalkDeferTargetActs) until this answer. APPLIED runs it now through the engine's
    own _doActions (TkRunViewPod side 0) - and a line with TRADE / CHARACTER_EDITOR (1 / 11) then ends the conversation; ANY refusal
@@ -3856,7 +5677,22 @@ static void TkApplyActResult(const cooptalk::TalkMsg& m, unsigned int peer)
     {
         const int ran = TkRunViewPod(h.dlg, h.line, h.acts, h.n, 0);
         if (ran == 1) ++g_tkActNpcRan; else ++g_tkActNpcFault;
-        what = "the held NPC-side part ran here=" + TkI(ran)
+        if (h.n == 0)   /* T-1187: only the line's own parts and its end call ran - a hire's contract is made here */
+        {
+            ++g_tkActHoldEndOnly;
+            TkLog("[TALK] A conv=" + TkU(h.convId) + " ACT seq=" + TkU(h.seq) + " line=" + TkLineSid(h.line) + " held run with no NPC-side action ran here="
+                  + TkI(ran) + " aiRef=" + TkI(h.aiRef) + ": the line's end call (0x2732F0: its AI change / AI contract on the NPC's squad, the talker as the contract's party) ran on this game");
+        }
+        std::string unrunNote;
+        if (cooptalk::TalkHeldRunUnrun(ran, h.n, h.aiRef, h.takeOrders))   /* T-1187 fold 2: the run did not happen - the END lists it, the talker's game refunds */
+        {
+            ++g_tkActHeldRunUnrun;
+            TkUnrunDrop d; d.peer = h.peer; d.convId = h.convId; d.seq = h.seq;
+            unrunNote = cooptalk::TalkPushCapped(&g_tkUnrunDropped, d, kTkUnrunDroppedCap, &g_tkUnrunNoteLost)
+                ? std::string(" - NOT RUN: noted as unrun for the conversation's END (the oldest dropped-line note went at its cap: that line is not refunded)")
+                : std::string(" - NOT RUN: noted as unrun for the conversation's END, the other game refunds it");
+        }
+        what = "the held NPC-side part ran here=" + TkI(ran) + unrunNote
              + (h.endsTalk ? std::string("; TRADE / CHARACTER_EDITOR in the line: the conversation ends; the other game opens that window itself (P25)")
                            : (h.endHeld ? std::string(" - then the conversation's held end runs")   /* P26s5 fold 2 */
                                         : std::string(" - the conversation goes on")));
@@ -3880,7 +5716,8 @@ static void TkApplyActResult(const cooptalk::TalkMsg& m, unsigned int peer)
     if (h.endsTalk && g_tkConvs.find(h.dlg) != g_tkConvs.end())   /* not already ended by the NPC part itself */
     {
         ++g_tkActEndsTalk;   /* P25 step 5 (manager decision 2): the END carries the type - the other game opens its OWN window */
-        TkEndOwn(h.dlg, h.me, cooptalk::kTalkEndEngine, "a TRADE / CHARACTER_EDITOR line ends the conversation (the other game opens that window)", 1, h.endsType);
+        TkEndOwn(h.dlg, h.me, cooptalk::kTalkEndEngine, "a TRADE / CHARACTER_EDITOR / BAIL / SELL SLAVES line ends the conversation (the other game opens that window)", 1, h.endsType,
+                 cooptalk::TalkEndCarriesLine(h.endsType) ? TkLineSid(h.line) : std::string());
     }
     if (h.endHeld && g_tkConvs.find(h.dlg) != g_tkConvs.end())   /* P26s5 fold 2: not already ended by the NPC part or 1 / 11 */
     {
@@ -3924,7 +5761,7 @@ static int TkP25EditorPod(void* own)
 static void TkP25OpenLocal(const TkMirror& mi, int endsType)
 {
     const int kind = cooptalk::TalkEndsLocal(endsType);
-    if (kind == cooptalk::kTalkLocalNone) return;
+    if (kind == cooptalk::kTalkLocalNone || kind == cooptalk::kTalkLocalBail || kind == cooptalk::kTalkLocalSell || kind == cooptalk::kTalkLocalBuy) return;   /* T-478 steps 3 / 5 / 6: ran before the close */
     ::Character* const npc = FindSpawned(mi.npcUid);
     ::Character* const own = FindSpawned(mi.targetUid);
     std::string why;
@@ -3943,6 +5780,218 @@ static void TkP25OpenLocal(const TkMirror& mi, int endsType)
     TkLog("[TALK] P25 B END endsType=" + TkI(endsType) + " conv=" + TkU(mi.convId) + " npc uid=" + TkU(mi.npcUid) + " -> "
           + (kind == cooptalk::kTalkLocalTrade ? "trade window" : "character editor")
           + (why.empty() ? std::string(" OPENED here (this game's own window, own character)") : " NOT opened: " + why));
+}
+
+/* T-478 step 3 (manager 2026-11-03), B: the NPC's game ended the conversation on a line with 43 BAIL (END endsType 43 + the line's
+   id). This game runs the engine's own case 43 (67fad0:959-1052) ALONE, from its own copy of that line, on its still-mirrored
+   conversation - before the close, since the case reads the conversation's target (this game's own character): the engine lists the
+   prisoners of its copy of the NPC's town that this character may bail and opens its own bail window (0x6AC080) here. Paying is
+   the engine's confirm on this game (spawn.cpp detour_bailConfirm): the ticked rows' prices taken once from this game's money, its
+   own prisoners freed by the engine, a freed copy of another game's character sent to its owner as "@bail". The single-player order
+   (the window opens, then the conversation ends) is kept. Nothing opens on the NPC's game. MAIN THREAD (the K2 drain). */
+/* Review fold (manager 2026-11-03; three-player bail is T-680): the window may hold only prisoners the payment can free - this
+   game's own characters, and another game's character whose owner takes this game's "@bail" (prisonwire.h BailRowFreeable). The
+   engine builds the list inside its own case and charges every ticked row in its confirm; no row can be dropped before the charge
+   here (the list's builder and the window's constructor 0x6AC080 are not in the address table). So when a prisoner near the
+   police NPC fails it, the WHOLE window is refused before the case runs (no money moves) and counted (g_t478BailRefused).
+   The engine reads the NPC's town itself and opens nothing when it does not resolve (67fad0:969-975): that is not readable here,
+   so the log names it unread; the confirm's own counters (bail[...calls,paid...]) show a window that was used. */
+long long g_t478BailOpened = 0, g_t478BailNotOpened = 0, g_t478BailFault = 0, g_t478BailRefused = 0, g_t478BailRowsLeftOut = 0,
+          g_t478BailStartSkipped = 0;   /* A: a second P25-start line with a bail action, not run (TalkDeferTargetActs) */
+static void TkBailOpenLocal(const TkMirror& mi, const cooptalk::TalkMsg& m)
+{
+    ::Character* const npc = FindSpawned(mi.npcUid);
+    ::Character* const own = FindSpawned(mi.targetUid);
+    const int live = (npc != 0 && (void*)npc == mi.me && TkDialogueOf(mi.me) == mi.dlg) ? 1 : 0;
+    const int handOwn = (live && own != 0 && net::IsUidMine(mi.targetUid) && TkHandIs(mi.dlg, own)) ? 1 : 0;
+    std::string why;
+    void* line = 0;
+    void* keep[1] = { 0 };
+    if (!cooptalk::TalkEndsOpenOk(m.endsType, m.lineSid, live, handOwn))
+        why = m.lineSid.empty() ? "the END names no line" : (!live ? "the mirrored conversation is gone here" : "this game's own character is not the one in it");
+    else if (kDialogDataGetDataRva == 0 || g_base == 0 || HireDoActionsHookState() != 1)
+        why = "DialogDataManager::getData or hire.cpp's _doActions trampoline is not available here";
+    else
+    {
+        ::GameData* gd = (coop::GameWorldPtr() != 0) ? coop::GameWorldPtr()->gamedata.getData(m.lineSid) : 0;
+        if (gd != 0) line = TkGetLinePod((DlgGetDataFn)(g_base + (uintptr_t)kDialogDataGetDataRva), gd);
+        TkLineView v;
+        v.n = 0; v.nItems = 0; v.nRels = 0;
+        if (line == 0) why = "the line " + m.lineSid + " is not in this game's dialogue data";
+        else if (TkLineViewPod(line, &v) < 0) why = "this game's copy of the line does not read";
+        else { for (int i = 0; i < v.n && keep[0] == 0; ++i) if (v.types[i] == 43) keep[0] = v.acts[i]; }
+        if (why.empty() && keep[0] == 0) why = "this game's copy of the line has no bail action (43)";
+    }
+    int found = -1, leftOut = -1;
+    unsigned int firstOut = 0;
+    if (why.empty())
+    {
+        const Ogre::Vector3 at = npc->worldPosition();
+        leftOut = BailRowsLeftOutNear(at.x, at.z, &found, &firstOut);
+        if (!cooprison::BailWindowOk(leftOut))
+        {
+            ++g_t478BailRefused; g_t478BailRowsLeftOut += leftOut;
+            why = TkI(leftOut) + " prisoner(s) near the police (first uid " + TkU(firstOut) + ") whose owner would refuse this game's \"@bail\""
+                  " (three or more players, T-680): the whole window is refused before any money";
+        }
+    }
+    int ran = 0;
+    if (why.empty())
+    {
+        ran = TkRunViewPod(mi.dlg, line, keep, 1, 2);
+        if (ran != 1) { ++g_t478BailFault; why = std::string("the engine's _doActions ") + (ran == -1 ? "faulted" : (ran == 0 ? "has no trampoline" : "could not view the line")); }
+    }
+    if (why.empty()) ++g_t478BailOpened; else ++g_t478BailNotOpened;
+    TkLog("[TALK] T478 B END endsType=43 conv=" + TkU(mi.convId) + " npc uid=" + TkU(mi.npcUid) + " line=" + m.lineSid
+          + " town=unread (the engine's own lookup; it opens nothing when the town does not resolve) otherGamesPrisonersNear=" + TkI(found)
+          + " leftOut=" + TkI(leftOut) + " -> bail window "
+          + (why.empty() ? std::string("OPENED here (the engine's own case 43 on this game's own character; paying is this game's confirm)")
+                         : "NOT opened: " + why + " - no money moves, nobody is freed"));
+}
+
+/* T-478 step 5 (design read 2026-11-04, D1), B - the seller's game: the slaver's game ended the conversation on a line with 41 SELL
+   SLAVES (END endsType 41 + the line's id). This game runs the engine's own case 41 (67fad0:897-951) ALONE, from its own copy of that
+   line, on its still-mirrored conversation - before the close, as bail: the engine lists this game's own character's squad members
+   near its copy of the slaver and opens its own selling window (0x6A7740) here; the prices come from this game's own characters.
+   The confirm is this game's (spawn.cpp detour_sellConfirm): the ticked rows' prices go into this game's purse and each one is
+   chained to the slaver copy, whose capture hook marks MSG_SLAVE (state + the slaver as owner) for the slaver's game. The slaver's
+   purse is never read (6a7f30, Read), so no money crosses games. The engine sells every ticked row and no row can be dropped
+   before it, so the WHOLE window is refused when a squad member near the slaver is not this game's own (TalkSellWindowOk).
+   MAIN THREAD (the K2 drain). */
+long long g_t478SellOpened = 0, g_t478SellNotOpened = 0, g_t478SellFault = 0, g_t478SellRefused = 0;
+static void TkSellOpenLocal(const TkMirror& mi, const cooptalk::TalkMsg& m)
+{
+    ::Character* const npc = FindSpawned(mi.npcUid);
+    ::Character* const own = FindSpawned(mi.targetUid);
+    const int live = (npc != 0 && (void*)npc == mi.me && TkDialogueOf(mi.me) == mi.dlg) ? 1 : 0;
+    const int handOwn = (live && own != 0 && net::IsUidMine(mi.targetUid) && TkHandIs(mi.dlg, own)) ? 1 : 0;
+    std::string why;
+    void* line = 0;
+    void* keep[1] = { 0 };
+    if (!cooptalk::TalkEndsOpenOk(m.endsType, m.lineSid, live, handOwn))
+        why = m.lineSid.empty() ? "the END names no line" : (!live ? "the mirrored conversation is gone here" : "this game's own character is not the one in it");
+    else if (kDialogDataGetDataRva == 0 || g_base == 0 || HireDoActionsHookState() != 1)
+        why = "DialogDataManager::getData or hire.cpp's _doActions trampoline is not available here";
+    else if (SellConfirmHookState() != 1)
+        why = "the selling confirm's hook or the trading window's address row is not here, or that row does not read (a sale could not be checked at the confirm)";
+    else
+    {
+        ::GameData* gd = (coop::GameWorldPtr() != 0) ? coop::GameWorldPtr()->gamedata.getData(m.lineSid) : 0;
+        if (gd != 0) line = TkGetLinePod((DlgGetDataFn)(g_base + (uintptr_t)kDialogDataGetDataRva), gd);
+        TkLineView v;
+        v.n = 0; v.nItems = 0; v.nRels = 0;
+        if (line == 0) why = "the line " + m.lineSid + " is not in this game's dialogue data";
+        else if (TkLineViewPod(line, &v) < 0) why = "this game's copy of the line does not read";
+        else { for (int i = 0; i < v.n && keep[0] == 0; ++i) if (v.types[i] == 41) keep[0] = v.acts[i]; }
+        if (why.empty() && keep[0] == 0) why = "this game's copy of the line has no selling action (41)";
+    }
+    unsigned int listed[kSellRowsCap];
+    int nListed = 0, notOwn = -1;
+    unsigned int firstOut = 0;
+    if (why.empty())
+    {
+        const Ogre::Vector3 at = npc->worldPosition();
+        notOwn = SellRowsNotOwnNear(own, at.x, at.z, listed, kSellRowsCap, &nListed, &firstOut);
+        if (notOwn < 0) why = "this game's own character's squad does not read";
+        else if (!cooptalk::TalkSellWindowOk(notOwn))
+        {
+            ++g_t478SellRefused;
+            why = TkI(notOwn) + " squad member(s) near the slaver (first uid " + TkU(firstOut) + ") not this game's own character:"
+                  " the whole window is refused before any sale";
+        }
+    }
+    int ran = 0, bound = -1;
+    if (why.empty())
+    {
+        SellWindowArm(npc, mi.npcUid, mi.targetUid, listed, nListed);   /* before the case: the window opens inside it */
+        ran = TkRunViewPod(mi.dlg, line, keep, 1, 2);
+        if (ran != 1)
+        {
+            SellWindowDisarm();
+            ++g_t478SellFault; why = std::string("the engine's _doActions ") + (ran == -1 ? "faulted" : (ran == 0 ? "has no trampoline" : "could not view the line"));
+        }
+        else
+        {
+            bound = SellWindowBind(npc);   /* review fold: the note names the window the case just opened; cleared when it ends */
+            if (bound == cooptalk::kTalkSellBindNoWindow)   /* re-check fold: no fall-back to the buyer's address - the open is refused */
+                why = "the engine's case left no trading window selling to this slaver's copy (none current, or another buyer) - the open is refused";
+            else if (bound != cooptalk::kTalkSellBindTied)
+                why = "the window could not be tied to the sale note (a read of the window, its handler or its buyer faulted) - the open is refused:"
+                      " every confirm of that window is refused until it ends";
+        }
+    }
+    int purse = -1;
+    if (why.empty() && !MoneyHave(&purse)) purse = -1;
+    /* T2017: the confirm is enabled only when the ticked rows' total is within the slaver's squad money (0x727690) - the money as this
+       game's copy reads it, the bound window's row count, its cheapest row's price and whether its buyer is that copy */
+    int slaverMoney = -1, cheapest = -1, buyerIsSlaver = -1;
+    long long rowsN = -1;
+    const int haveSlaverMoney = (npc != 0) ? SellWindowMoneyRead(npc, &slaverMoney, &cheapest, &rowsN, &buyerIsSlaver) : 0;
+    std::string uids;
+    for (int i = 0; i < nListed && i < kSellRowsCap; ++i) uids += (uids.empty() ? "" : ",") + TkU(listed[i]);
+    if (why.empty()) ++g_t478SellOpened; else ++g_t478SellNotOpened;
+    const std::string head = "[TALK] T478 B END endsType=41 conv=" + TkU(mi.convId) + " slaver npc uid=" + TkU(mi.npcUid) + " line=" + m.lineSid
+                             + " seller uid=" + TkU(mi.targetUid) + " ownNear=" + TkI(nListed) + " [" + uids + "] notOwnNear=" + TkI(notOwn)
+                             + " slaverMoney=" + (haveSlaverMoney != 0 ? TkI(slaverMoney) : std::string("unread")) + " rows=" + TkI(rowsN)
+                             + " cheapestPrice=" + TkI(cheapest) + " buyerIsSlaver=" + TkI(buyerIsSlaver)
+                             + " (" + cooptalk::TalkSellMoneyWord(haveSlaverMoney, slaverMoney, cheapest) + ")";
+    if (why.empty())
+        TkLog(head + " purse=" + TkI(purse) + " bound=" + TkI(bound) + " -> selling window OPENED here (the engine's own case 41 on this game's own characters;"
+              " the prices are the engine's, from these characters; the sale is this game's confirm)");
+    else
+        TkLogFail(head + " -> selling window NOT opened: " + why + " - nobody is sold, no money moves");
+}
+
+/* T-478 step 6 (design C, 2026-11-05), B - the buyer's game: the trader's game ended the conversation on a line with 42 BUY SLAVES or
+   48 BUY ANIMALS (END endsType 42 / 48 + the line's id). This game runs the engine's own case ALONE, from its own copy of that line, on
+   its still-mirrored conversation - before the close, as bail and selling: the engine lists its view of the trader's slaves / animals
+   and opens its own buying window here, for this game's own character. The confirm is this game's and is held (hire.cpp BuyConfirm):
+   each ticked row another game runs is asked of that game on the hire road first; the engine's purchase (this game's purse, its
+   recruit / release) runs once, only when every owner said yes and this game took them. The window does not open when the buying
+   confirms are not hooked here (an unhooked confirm would charge for copies). MAIN THREAD (the K2 drain). */
+long long g_t478BuyOpened = 0, g_t478BuyNotOpened = 0, g_t478BuyFault = 0, g_t478BuyNotForwarded = 0;
+static void TkBuyOpenLocal(const TkMirror& mi, const cooptalk::TalkMsg& m)
+{
+    ::Character* const npc = FindSpawned(mi.npcUid);
+    ::Character* const own = FindSpawned(mi.targetUid);
+    const int live = (npc != 0 && (void*)npc == mi.me && TkDialogueOf(mi.me) == mi.dlg) ? 1 : 0;
+    const int handOwn = (live && own != 0 && net::IsUidMine(mi.targetUid) && TkHandIs(mi.dlg, own)) ? 1 : 0;
+    std::string why;
+    void* line = 0;
+    void* keep[1] = { 0 };
+    if (!cooptalk::TalkEndsOpenOk(m.endsType, m.lineSid, live, handOwn))
+        why = m.lineSid.empty() ? "the END names no line" : (!live ? "the mirrored conversation is gone here" : "this game's own character is not the one in it");
+    else if (kDialogDataGetDataRva == 0 || g_base == 0 || HireDoActionsHookState() != 1)
+        why = "DialogDataManager::getData or hire.cpp's _doActions trampoline is not available here";
+    else if (HireBuyConfirmHookState() != 1)
+        why = "the buying confirms' hooks or their address rows are not here (state " + TkI(HireBuyConfirmHookState()) + "): a purchase could not be asked of the owners";
+    else
+    {
+        ::GameData* gd = (coop::GameWorldPtr() != 0) ? coop::GameWorldPtr()->gamedata.getData(m.lineSid) : 0;
+        if (gd != 0) line = TkGetLinePod((DlgGetDataFn)(g_base + (uintptr_t)kDialogDataGetDataRva), gd);
+        TkLineView v;
+        v.n = 0; v.nItems = 0; v.nRels = 0;
+        if (line == 0) why = "the line " + m.lineSid + " is not in this game's dialogue data";
+        else if (TkLineViewPod(line, &v) < 0) why = "this game's copy of the line does not read";
+        else { for (int i = 0; i < v.n && keep[0] == 0; ++i) if (v.types[i] == m.endsType) keep[0] = v.acts[i]; }
+        if (why.empty() && keep[0] == 0) why = "this game's copy of the line has no buying action (" + TkI(m.endsType) + ")";
+    }
+    int ran = 0;
+    if (why.empty())
+    {
+        ran = TkRunViewPod(mi.dlg, line, keep, 1, 2);
+        if (ran != 1) { ++g_t478BuyFault; why = std::string("the engine's _doActions ") + (ran == -1 ? "faulted" : (ran == 0 ? "has no trampoline" : "could not view the line")); }
+    }
+    int purse = -1;
+    if (why.empty() && !MoneyHave(&purse)) purse = -1;
+    if (why.empty()) ++g_t478BuyOpened; else ++g_t478BuyNotOpened;
+    const std::string head = "[TALK] T478 B END endsType=" + TkI(m.endsType) + " conv=" + TkU(mi.convId) + " trader npc uid=" + TkU(mi.npcUid) + " line=" + m.lineSid
+                             + " buyer uid=" + TkU(mi.targetUid);
+    if (why.empty())
+        TkLog(head + " purse=" + TkI(purse) + " -> " + (m.endsType == 42 ? "slave" : "animal") + " buying window OPENED here (the engine's own case on this game's"
+              " own character; its confirm asks each row's owner game before any money)");
+    else
+        TkLogFail(head + " -> buying window NOT opened: " + why + " - nobody is bought, no money moves");
 }
 
 /* B: the END - the mirrored window closes. */
@@ -3964,13 +6013,27 @@ static void TkApplyEnd(const cooptalk::TalkMsg& m, unsigned int peer)
         }
         return;
     }
+    TkRefundOnEnd(m, peer);   /* T-858 */
     if (!g_tkMirror.active || !cooplive::SamePlayer(g_tkMirror.peer, peer, coop::LinkPeerSlot()) || g_tkMirror.convId != m.convId)
     {
+        if (cooptalk::TalkEndExpectsNoWindow(m.reason))   /* T-858 (T1914): this game closed (or never opened) that window itself */
+        {
+            TkLog("[TALK] B END TALKER_CLOSED conv=" + TkU(m.convId) + " lists " + TkI((int)m.unrun.size())
+                  + " unrun ACT seq(s) - this game had closed that window first; the conversation's bookings are settled");
+            return;
+        }
         ++g_tkEndUnknown;
         TkLog("[TALK] B END " + std::string(cooptalk::TalkEndName(m.reason)) + " conv=" + TkU(m.convId) + " names no mirrored window here - ignored");
         return;
     }
     const TkMirror mi = g_tkMirror;
+    if (cooptalk::TalkEndsLocal(m.endsType) == cooptalk::kTalkLocalBail) TkBailOpenLocal(mi, m);   /* T-478 step 3: before the close */
+    if (cooptalk::TalkEndsLocal(m.endsType) == cooptalk::kTalkLocalSell) TkSellOpenLocal(mi, m);   /* T-478 step 5: before the close */
+    if (cooptalk::TalkEndsLocal(m.endsType) == cooptalk::kTalkLocalBuy) TkBuyOpenLocal(mi, m);     /* T-478 step 6: before the close */
+    /* Review fold (MED): the end call below stays. Read: endDialogue (decomp_673da0) touches only the conversation's own state and
+       its own +0x228 object; the bail window is a separate object the case builds and shows (67fad0:1043-1055) and keeps nowhere
+       in the conversation, so ending the conversation does not reach it. Closing first is not an option: the case reads the
+       conversation's target. Single player leaves the conversation open under the window (no end call); the run shows the rest. */
     TkMirrorOff();
     int ended = 0;
     if (FindSpawned(mi.npcUid) == (::Character*)mi.me && TkDialogueOf(mi.me) == mi.dlg)
@@ -3982,6 +6045,16 @@ static void TkApplyEnd(const cooptalk::TalkMsg& m, unsigned int peer)
     ++g_tkEndRecv;
     TkLog("[TALK] B END " + std::string(cooptalk::TalkEndName(m.reason)) + " conv=" + TkU(m.convId) + " - window closed (endDialogue=" + TkI(ended) + ")");
     if (m.endsType != 0) TkP25OpenLocal(mi, m.endsType);   /* P25 step 5: this game's own trade window / editor */
+}
+
+/* T-980: the engine's own "down" for a talk start (Dialogue::sendEvent refuses event 1 for it, decomp_683f00; TkOrderGates reads the
+   same two bytes): Character +0x5B9 unconscious or +0x5BC dead, either byte non-zero (cooptalk::TalkKnockedOutOrDead). 1 down, 0 not,
+   -1 unreadable. No C++ object. */
+static int TkKnockedOutOrDeadPod(const void* me)
+{
+    if (me == 0) return -1;
+    __try { const unsigned char* const p = (const unsigned char*)me; return cooptalk::TalkKnockedOutOrDead(p[0x5B9], p[0x5BC]); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
 /* P25: A - END NOT_STARTED for a REQUEST (counted by why, logged). MAIN THREAD. */
@@ -4010,7 +6083,10 @@ static void TkApplyRequest(const cooptalk::TalkMsg& m, unsigned int peer)
     ::Faction* nf = 0;
     const int npcOurs = (npc != 0 && dlg != 0 && net::IsUidMine(m.npcUid) && !TkPeerTarget(npc) && CrimeFactionOf(npc, &nf) && nf != 0
                          && !IsPlayerFaction(nf)) ? 1 : 0;
-    const int down = (npcOurs && (CrimeIsDead(npc) != 0 || IsDownedCharacter(npc))) ? 1 : 0;
+    /* T-980: "down" is the engine's own talk-start refusal - knocked out or dead (TkKnockedOutOrDeadPod; unreadable counts as down),
+       not the prone / ragdoll pose, which a caged or shackled prisoner lies in awake. Ported from the third public pull request
+       (eb042a1) by MassDivide. */
+    const int down = (npcOurs && (CrimeIsDead(npc) != 0 || TkKnockedOutOrDeadPod(npc) != 0)) ? 1 : 0;
     const int copyOk = (cp != 0 && cdlg != 0 && net::UidOwnedByPeer(m.targetUid, peer) && TkPeerTarget(cp)) ? 1 : 0;
     void* const win = TkWindowDlg();
     const int busy = ((dlg != 0 && (TkDlgBusy(dlg) || win == dlg || TkMarkFind(dlg) >= 0)) || (cdlg != 0 && TkDlgBusy(cdlg))) ? 1 : 0;
@@ -4035,7 +6111,17 @@ static void TkApplyRequest(const cooptalk::TalkMsg& m, unsigned int peer)
     const long long gateRef0 = (long long)g_p25GateRefused;
     int res = 0;
     TkPurseNote(m.targetUid, m.purse, peer);   /* the first line's money replies are judged by the talker's purse */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    const LONG p213n = P213PeerOpen(dlg);   /* the request's line pick traced as the other player's talk order (who=peer) */
+// PROBE-END: P213
+#endif
     const int called = TalkSendPod((SendEventFn)(g_base + (uintptr_t)kDialogueSendEventRva), dlg, cp, 1, &res);   /* its start is scoped (detour_startPlayerConv) */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    P213PeerClose();   /* TalkSendPod catches a fault inside, so this always runs */
+// PROBE-END: P213
+#endif
     g_p25StartDlg = 0; g_p25ReqIdNow = 0;
     g_talkCurEvent = -1;   /* a fault inside would have skipped detour_sendEvent's restore */
     void* const first = g_p25FirstLine;
@@ -4043,6 +6129,11 @@ static void TkApplyRequest(const cooptalk::TalkMsg& m, unsigned int peer)
     const int subst = (g_p25CamDist >= 0.0f) ? 1 : 0;   /* this start's own substitution (main thread) */
     std::map<void*, TkConv>::iterator it = g_tkConvs.find(dlg);
     const int started = (called && g_tkPromptSent > promptBefore && it != g_tkConvs.end() && it->second.targetUid == m.targetUid) ? 1 : 0;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    P213DrainOrder(p213n, dlg, m.targetUid, m.npcUid, (!started && called && g_p25StartSeen && !g_p25StartHadLine) ? 1 : 0, 1);   /* reached with no line = noLine */
+// PROBE-END: P213
+#endif
     char vb[200];
     std::sprintf(vb, "view point answered as the NPC=%d (the camera was %.0f u from the talker; gate %.0f)", subst, g_p25CamDist, gate);
     if (!started)
@@ -4747,6 +6838,7 @@ static void TkSweep()
 static void TkTimeouts()
 {
     const unsigned long now = ::GetTickCount();
+    TkRefundPay();   /* T-858: refunds that waited for the money to be movable */
     std::vector<TkLater> late;
     for (std::map<void*, TkConv>::iterator it = g_tkConvs.begin(); it != g_tkConvs.end(); ++it)
         if (it->second.endClock && (unsigned long)(now - it->second.endTick) >= (unsigned long)kTkHeldEndWaitMs)
@@ -4833,7 +6925,7 @@ static void TkSafePoint()
         else if (m.kind == cooptalk::kTalkAnswer) TkApplyAnswer(m, in[k].peer);
         else if (m.kind == cooptalk::kTalkEnd) TkApplyEnd(m, in[k].peer);
         else if (m.kind == cooptalk::kTalkAct) TkApplyAct(m, in[k].peer);               /* P26 stage 5: B */
-        else if (m.kind == cooptalk::kTalkActResult) TkApplyActResult(m, in[k].peer);   /* P26 stage 5: A */
+        else if (m.kind == cooptalk::kTalkActResult) { if (!TkActResDropTake(m, in[k].peer)) TkApplyActResult(m, in[k].peer); }   /* P26 stage 5: A; T-858 test drop */
         else if (m.kind == cooptalk::kTalkRequest) TkApplyRequest(m, in[k].peer);       /* P25: A */
         else if (m.kind == cooptalk::kTalkCursorAsk) TalkCursorApplyAsk(m, in[k].peer);         /* T-737: the NPC's game */
         else if (m.kind == cooptalk::kTalkCursorAnswer) TalkCursorApplyAnswer(m, in[k].peer);   /* T-737: the asker */
@@ -4932,7 +7024,22 @@ static std::string TkCountsString()
                  (long long)g_p25MineMiss, g_p25MineMissConfirmed, g_p25StalePrompt, g_p25ThirdOwner,   /* [p25f1-repa] */
                  (long long)g_p25StartUnwound, (long long)g_p25NestedCleared,
                  TalkHookState(g_p25ViewHook), g_p25On);
-    return std::string(b) + f + g + s4 + s5 + s5f2 + car + s5f4 + s6 + p25;
+    char t478[640];   /* T-478 step 3: the bail line; step 4: the surrender line; step 5: the selling line (under 250 literal bytes + 19 numbers of at most 20 + NUL) */
+    _snprintf_s(t478, sizeof(t478), _TRUNCATE, " talkBail[endSentA,endNoLineA,openedB,notOpenedB,faultB,refusedB,rowsLeftOutB,startSkippedA]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " talkSurrender[ranB,chainedB,skippedB,heldB,notForwardedA]=%lld,%lld,%lld,%lld,%lld"
+                 " talkSell[endSentA,endNoLineA,openedB,notOpenedB,faultB,refusedB]=%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_t478BailEndSent, g_t478BailEndNoLine, g_t478BailOpened, g_t478BailNotOpened, g_t478BailFault,
+                 g_t478BailRefused, g_t478BailRowsLeftOut, g_t478BailStartSkipped, g_t478SurrRan, g_t478SurrChained,
+                 g_t478SurrSkipped, g_t478SurrHeld, g_t478SurrNotForwardedA,
+                 g_t478SellEndSent, g_t478SellEndNoLine, g_t478SellOpened, g_t478SellNotOpened, g_t478SellFault, g_t478SellRefused);
+    char rf[512];   /* T-858: under 160 literal bytes + 12 commas + 13 numbers of at most 20 + NUL < 512 */
+    _snprintf_s(rf, sizeof(rf), _TRUNCATE, " talkRefund[unrunListed,paidBooked,refunds,refundMoney,refundFailed,stale,due,linkDropped,evicted,replaced,noteLost,unrunOver,dueLost]"
+                 "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_tkUnrunListed, g_tkPaidBooked, g_tkRefunds, g_tkRefundMoney, g_tkRefundFailed, g_tkRefundStale, (long long)g_tkRefundDue.size(), g_tkRefundBook.dropped,
+                 g_tkRefundBook.evicted, g_tkRefundBook.replaced, g_tkUnrunNoteLost, g_tkUnrunOverflow, g_tkRefundDueLost);
+    char td[64];   /* T-858 TEST-ONLY lever talktest actresultdrop */
+    _snprintf_s(td, sizeof(td), _TRUNCATE, " talkActResDrop[armed,dropped]=%d,%lld", g_tkActResDropArmed, g_tkActResDropped);
+    return std::string(b) + f + g + s4 + s5 + s5f2 + car + s5f4 + s6 + p25 + t478 + rf + td;
 }
 
 /* M7b slice 4 fold 1 (review 2026-10-02 F1): a stored TALK sender is the id it arrived with (the session link's raw id, or the
@@ -5067,6 +7174,15 @@ void TalkS6LeaderOrder(void* dlg, void* target)
 /* P25: 1 = the line has a part the P26 router does not run on this game as it stands - a target-side action (APPLY / HIRE / REFUSE /
    CARRIED, incl. 1 / 11 / 10 / 30 / 40), a givesItem or a factionRelationEffects entry; unreadable or over the caps = 1 (held: the router then
    fails closed). MAIN THREAD. */
+/* T-478 review fold (LOW): does this line list a bail action (43) - or, T-478 step 5, a selling action (41)? Both open a window
+   over the conversation's target on the game that runs them. Unreadable = no (the line then runs as before). */
+static int TkLineHasBailPod(const void* line)
+{
+    TkLineView v;
+    if (TkLineViewPod(line, &v) < 0) return 0;
+    for (int i = 0; i < v.n; ++i) if (cooptalk::TalkEndCarriesLine(v.types[i])) return 1;
+    return 0;
+}
 static int TkP25LineHasTargetPart(const void* line)
 {
     TkLineView v;
@@ -5104,11 +7220,48 @@ bool TalkDeferTargetActs(void* dlg, void* line)
     if (g_p25StartDlg != 0 && dlg == g_p25StartDlg && dlg == g_tkStartingDlg && line != 0 && SayOnMainThread() != 0)
     {
         if (g_p25FirstLine == 0 && TkP25LineHasTargetPart(line)) { g_p25FirstLine = line; ++g_p25FirstLineHeld; return true; }
+        if (g_p25FirstLine != 0 && TkLineHasBailPod(line))
+        {   /* T-478 review fold (LOW): a SECOND line of the same start would run vanilla here - its bail case would open this game's
+               window for the other player's copy. Fails closed (the stage-4 hold's shape): nothing of that line runs on this game. */
+            ++g_t478BailStartSkipped;
+            TkLog("[TALK] T478 A P25 start: a second line " + TkLineSid(line) + " holds a bail (43), selling (41) or buying (42 / 48) action - not run here (nothing of it)");
+            return true;
+        }
         return false;
     }
     if (!g_tkOn || dlg == 0 || line == 0 || SayOnMainThread() == 0 || dlg == g_tkStartingDlg || !TkMarkSuppresses(dlg)) return false;
     std::map<void*, TkConv>::iterator it = g_tkConvs.find(dlg);
-    if (it == g_tkConvs.end()) return false;   /* P26s4 fold 1 M4: not a forwarded conversation - the engine runs the line */
+    if (it == g_tkConvs.end())
+    {   /* P26s4 fold 1 M4: not a forwarded conversation - the engine runs the line. T-478 step 4 review fold 1: a surrender (47) here
+           runs the engine's case over THIS game's view of the target's faction - on another player's copies each chain becomes a
+           CHAIN request its owner refuses as NOT_DOWN (items.cpp CaptureApplyRequest) - counted and logged, never changed */
+        TkLineView v0;
+        v0.n = 0; v0.nItems = 0; v0.nRels = 0;
+        if (TkLineViewPod(line, &v0) >= 0)
+            for (int i = 0; i < v0.n; ++i)
+                if (cooptalk::TalkActChainsTalkers(v0.types[i]))
+                {
+                    if (++g_t478SurrNotForwardedA <= 8)
+                        TkLog("[TALK] T478 surrender (47) line=" + TkLineSid(line) + " runs HERE in a conversation the router did not forward"
+                              " (the engine's case over this game's characters; a chained copy is asked of its owner, who refuses unless it is down)");
+                    break;
+                }
+        /* T-478 step 6: a buying line (42 / 48) here opens the engine's buying window on THIS game over its view of the trader's slaves
+           / animals (another game's copies when that game runs the trader). Its confirm is the same held one as a forwarded talk's
+           (hire.cpp BuyConfirm): a copy is never bought here - it is asked of its owner first, and nothing is charged unless every
+           owner says yes. Counted and logged. */
+        if (TkLineViewPod(line, &v0) >= 0)
+            for (int i = 0; i < v0.n; ++i)
+                if (cooptalk::TalkActBuys(v0.types[i]))
+                {
+                    if (++g_t478BuyNotForwarded <= 8)
+                        TkLog("[TALK] T478 buy (" + TkI(v0.types[i]) + ") line=" + TkLineSid(line) + " runs HERE in a conversation the router did not forward"
+                              " (the engine's window opens on this game; its confirm asks each row's owner game before any money, buy hooks="
+                              + TkI(HireBuyConfirmHookState()) + ")");
+                    break;
+                }
+        return false;
+    }
     const TkConv c = it->second;
     TkLineView v;
     const int k = TkLineViewPod(line, &v);
@@ -5203,11 +7356,12 @@ bool TalkDeferTargetActs(void* dlg, void* line)
         if (ran == 1) ++g_tkActNpcRan; else ++g_tkActNpcFault;
         TkLog("[TALK] A conv=" + TkU(c.convId) + " line=" + TkLineSid(line) + " no target-side part to send; NPC-side [" + npcActs + "] ran here=" + TkI(ran) + note28
               + (ends.empty() ? std::string(" - the conversation goes on")
-                              : "; TRADE / CHARACTER_EDITOR [" + ends + "]: the conversation ends; the other game opens that window itself (P25)"));
+                              : "; TRADE / CHARACTER_EDITOR / BAIL / SELL SLAVES [" + ends + "]: the conversation ends; the other game opens that window itself (P25, T-478)"));
         if (!ends.empty() && g_tkConvs.find(dlg) != g_tkConvs.end())
         {
             ++g_tkActEndsTalk;   /* P25 step 5 (manager decision 2): the END carries the type - the other game opens its OWN window */
-            TkEndOwn(dlg, c.me, cooptalk::kTalkEndEngine, "a TRADE / CHARACTER_EDITOR line ends the conversation (the other game opens that window)", 1, endsType);
+            TkEndOwn(dlg, c.me, cooptalk::kTalkEndEngine, "a TRADE / CHARACTER_EDITOR / BAIL / SELL SLAVES line ends the conversation (the other game opens that window)", 1, endsType,
+                     cooptalk::TalkEndCarriesLine(endsType) ? TkLineSid(line) : std::string());
         }
         return true;
     }
@@ -5231,6 +7385,7 @@ bool TalkDeferTargetActs(void* dlg, void* line)
     std::memset(&h, 0, sizeof(h));
     h.seq = a.seq; h.convId = c.convId; h.peer = c.peer; h.n = nKeep; h.dlg = dlg; h.me = c.me; h.line = line;
     h.takeOrders = takeOrders; h.npcUid = c.npcUid; h.carriedUid = a.carriedUid;
+    h.aiRef = TkLineAiRefPod(line);   /* T-1187 fold 1: may a lost answer list it as not run (TalkHoldMayListUnrun) */
     for (unsigned int i = 0; i < nKeep; ++i) h.acts[i] = keep[i];
     h.endsTalk = ends.empty() ? 0 : 1; h.endsType = endsType;
     {   /* P26s5 fold 2: a held end moves to the conversation's newest held line - it runs after the last NPC-side part (fold 4: before the cap drop) */
@@ -5251,6 +7406,15 @@ bool TalkDeferTargetActs(void* dlg, void* line)
         {
             ++g_tkEndHeldNotRun;
             dropped += " (it held conv=" + TkU(g_tkActHolds[0].convId) + "'s end: that conversation ends on its 30 s clock, nothing run)";
+        }
+        /* T-858: its END still lists it - a dropped carried-person line is never taken (TkApplyActResult finds no hold), so it is refunded too;
+           T-1187: also a line with no NPC-side action (n 0) whose 'change AI' / 'AI contract' the end call (0x2732F0, a hire's contract) never
+           makes either; a talker-only line is not listed (fold 1: the talker's game applies it whenever its answer comes) */
+        if (cooptalk::TalkHoldMayListUnrun(g_tkActHolds[0].n, g_tkActHolds[0].aiRef))
+        {
+            TkUnrunDrop d; d.peer = g_tkActHolds[0].peer; d.convId = g_tkActHolds[0].convId; d.seq = g_tkActHolds[0].seq;
+            if (cooptalk::TalkPushCapped(&g_tkUnrunDropped, d, kTkUnrunDroppedCap, &g_tkUnrunNoteLost))   /* review LOW 2: counted */
+                dropped += " (the oldest dropped-line note went at its cap of " + TkI((int)kTkUnrunDroppedCap) + ": that line is not refunded)";
         }
         g_tkActHolds.erase(g_tkActHolds.begin());
     }
@@ -5276,6 +7440,7 @@ void TalkForgetPeer(unsigned int peer)
        gone) also ends the not-forwarded ones still waiting */
     const int blocked = EngineWritesBlocked() ? 1 : 0;
     const int all = (peer == kTalkAllPeers) ? 1 : 0;
+    if (all) OwFrzRoad(talkonewin::kRelLinkDropped, 0, 0);   /* T-978 A: the link is gone - the frozen NPC decides again */
     TalkCursorForgetPeer(peer);   /* T-737: that player's talk-cursor answers */
     for (int i = 0; i < kTkPurseSlots; ++i)   /* that player's reported purses are not used again */
         if (::InterlockedCompareExchange64(&g_tkPurse[i].v, 0, 0) != 0
@@ -5299,6 +7464,15 @@ void TalkForgetPeer(unsigned int peer)
         }
         g_tkActHoldLost += (long long)(g_tkActHolds.size() - keepH.size());
         g_tkActHolds.swap(keepH);
+    }
+    {   /* T-858: that peer's conversations send no END any more - A's dropped-line notes and B's paid bookings for them go (nothing
+           refunded for a lost link, owner 1404). A restart need NOT end the link first (the world server's 10 s PLAYER_GONE hold): an
+           old booking meeting the new launch's numbers is overwritten by the new one (talkrefund.h Note, review LOW 1) */
+        std::vector<TkUnrunDrop> keepU;
+        for (size_t k = 0; k < g_tkUnrunDropped.size(); ++k)
+            if (!all && !cooplive::SamePlayer(g_tkUnrunDropped[k].peer, peer, coop::LinkPeerSlot())) keepU.push_back(g_tkUnrunDropped[k]);
+        g_tkUnrunDropped.swap(keepU);
+        g_tkRefundBook.ForgetPeer(peer, all, TkSamePlayer());
     }
     std::vector<TkLater> own;
     for (std::map<void*, TkConv>::iterator it = g_tkConvs.begin(); it != g_tkConvs.end(); ++it)
@@ -5325,6 +7499,7 @@ void TalkForgetPeer(unsigned int peer)
         {   /* the mark stays (window shut) and TkLinkLaterRun ends it; the talk is gone from the table now, so its purse goes now */
             const unsigned int tuid = lk != g_tkConvs.end() ? lk->second.targetUid : 0;
             g_tkConvs.erase(own[k].dlg); g_tkLinkLaterA.push_back(own[k]); ++g_tkLinkLater;
+            OwFwdRoad(talkonewin::kRelFwdEnded, own[k].dlg, 0);   /* T-978 A forwarded */
             if (tuid != 0) TkPurseTalkEnded(tuid);
         }
         else TkEndOwn(own[k].dlg, own[k].me, 0, "the link to the other game was lost", 1);
@@ -5354,13 +7529,47 @@ void TalkForgetPeer(unsigned int peer)
     }
 }
 
-std::string TalkPromptArm(const std::string& arg)
+/* T-478 (TEST-ONLY): `talkprompt name:<Name>[#k] ...` picks the NPC by display name now, at the command (MAIN THREAD, as talkcursor's
+   TcNamePick): LeverNearestNamed, kLeverPickOwnLiving (this game's own living non-player characters with a uid - the only NPCs the
+   lever takes), at any distance, measured from the talk's target when it is given by uid and loaded here, else from this game's
+   first own player character (a trader walks; the run puts the target beside him); several matches without `#k` are refused in
+   words. (LeverNameUid's `name:` is not used: it looks only 1000 units from this game's own player and takes copies.) The pick is
+   logged with its uid, name and distance; the lever then runs with that uid as an explicit NPC uid. */
+std::string TalkPromptArm(const std::string& argIn)
 {
     int mode = 0, idx = -1;
     unsigned int n = 0, t = 0;
     std::string sid;
+    const char* usage = "error talkprompt: usage talkprompt [npcUid|near|name:<Name>[#k]] [targetUid|near] [lineSid|auto] | talkprompt answer <0..9> | talkprompt answer act <type 0..255> | talkprompt joinact <type 0..255> | talkprompt close";
+    std::string arg = argIn, nmText, nmRest;
+    const int nf = cooptalk::TalkPromptNameForm(argIn, &nmText, &nmRest);
+    if (nf < 0) return usage;
+    if (nf > 0)
+    {
+        const std::string key = coopsay::TalkPersonKey(nmText);
+        unsigned int nu = 0;
+        float nd = -1.0f;
+        std::string nn, why;
+        ::Character* from = 0;
+        if (cooptalk::TalkPromptParse("1 " + nmRest, &mode, &n, &t, &sid, &idx) && t != 0)
+        {
+            from = FindSpawned(t);
+            if (from != 0 && SayPlausiblePtr(from) == 0) from = 0;
+        }
+        if (LeverNearestNamed(key, kLeverPickOwnLiving, from, 1.0e30f, &nu, &nd, &nn, &why) == 0 || nu == 0)
+        {
+            if (why.empty()) why = "the character has no uid";
+            DebugLog("[TALK] talkprompt name '" + key + "' REFUSED: " + why + " - nothing armed");
+            return "error talkprompt name: " + why;
+        }
+        char d[32];
+        std::sprintf(d, "%.1f", nd);
+        DebugLog("[TALK] talkprompt name '" + key + "' -> npc uid=" + TkU(nu) + " '" + nn + "' dist=" + d + " (this game's own living NPC, nearest to "
+                 + (from != 0 ? "the target uid=" + TkU(t) : std::string("this game's first own player character")) + ")");
+        arg = TkU(nu) + " " + nmRest;
+    }
     if (!cooptalk::TalkPromptParse(arg, &mode, &n, &t, &sid, &idx))
-        return "error talkprompt: usage talkprompt [npcUid|near] [targetUid|near] [lineSid|auto] | talkprompt answer <0..9> | talkprompt answer act <type 0..255> | talkprompt joinact <type 0..255> | talkprompt close";
+        return usage;
     g_tkLeverMode = mode; g_tkLeverIndex = idx; g_tkLeverNpc = n; g_tkLeverTarget = t; g_tkLeverSid = sid;
     ::InterlockedExchange(&g_tkLeverPending, 1);
     ++g_tkLeverArmed;
@@ -5577,36 +7786,47 @@ static int TsWalkOvers(::Character* ch, const std::string& key, TsDlgInfo* out, 
     return k;
 }
 
-/* a living, conscious non-player character with a Dialogue (talktest near's filters). */
+/* a living, conscious non-player character with a Dialogue (talktest near's filters). T-980: "conscious" is the engine's own
+   talk-start test (TkKnockedOutOrDeadPod; unreadable counts as down), not the prone / ragdoll pose, which a caged or shackled
+   prisoner lies in awake - so talkcarriers and talktest nearestname / nearestfaction find caged prisoners. */
 static int TsCandidate(::Character* ch)
 {
     ::Faction* f = 0;
     if (ch == 0 || SayPlausiblePtr(ch) == 0 || !CrimeFactionOf(ch, &f) || f == 0) return 0;
     if (IsPlayerFaction(f) || IsPeerFaction(f)) return 0;
-    if (CrimeIsDead(ch) != 0 || IsDownedCharacter(ch)) return 0;
+    if (CrimeIsDead(ch) != 0 || TkKnockedOutOrDeadPod(ch) != 0) return 0;
     return TalkDialogueOf(ch) != 0 ? 1 : 0;
 }
 
-/* the nearest candidate within kTalkNearMax (2D) of (x,z) carrying the walk-over dialogue `key`; 0 none. */
-static ::Character* TsNearestCarrier(const std::string& key, float x, float z, float* dist)
+/* the candidate within kTalkNearMax (2D) of (x,z) carrying the walk-over dialogue `key`; 0 none. T-1218: only when exactly one
+   carries it, or `key#<k>` names the k-th nearest; otherwise 0 with *amb = the refusal (the count and the first five, nearest first). */
+static ::Character* TsNearestCarrier(const std::string& keyIn, float x, float z, float* dist, std::string* amb)
 {
-    *dist = -1.0f;
+    *dist = -1.0f; amb->clear();
+    std::string key; int selK = 0;
+    if (leverpick::SplitSelector(keyIn, &key, &selK) < 0) { *amb = leverpick::BadSelector(keyIn); return 0; }
     if (coop::GameWorldPtr() == 0) return 0;
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
     if (all.size() > 20000) return 0;
-    ::Character* best = 0; float bd = kTalkNearMax;
+    leverpick::Picker<std::pair< ::Character*, float> > pk(selK);
+    char nn[48];
     for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
     {
         ::Character* ch = *it; Ogre::Vector3 q;
         if (!TsCandidate(ch) || !SafeReadPosition(ch, &q)) continue;
         const float dx = q.x - x, dz = q.z - z, d = sqrtf(dx * dx + dz * dz);
-        if (d >= bd) continue;
+        if (d >= kTalkNearMax) continue;
         TsDlgInfo one[1];
         if (TsWalkOvers(ch, key, one, 1) == 0) continue;
-        bd = d; best = ch;
+        TalkName(ch, nn);
+        char lb[96];
+        std::sprintf(lb, "'%.40s' uid=%u %.0fu", nn, FindSpawnedUid(ch), d);
+        pk.Add(std::make_pair(ch, d), 0, d, lb);
     }
-    if (best != 0) *dist = bd;
-    return best;
+    std::pair< ::Character*, float> got((::Character*)0, -1.0f);
+    if (pk.Decide(&got, "characters within 3000 units carrying the walk-over dialogue '" + key + "'", "nearest first", amb) != leverpick::kOne) return 0;
+    *dist = got.second;
+    return got.first;
 }
 
 static const char* TsOwnerName(int own) { return own == 1 ? "mine" : (own == 0 ? "copy" : "noUid"); }
@@ -5650,19 +7870,29 @@ static int TsLineActKidsPod(const void* line, int act, int* has, void** kids)
     __except (EXCEPTION_EXECUTE_HANDLER) { *has = 0; *kids = 0; return 0; }
 }
 
+/* T-858 TEST-ONLY (talktest nearestcarrier): 1 = the line's own actions fit cooptalk::TalkCarrierLineFits (act with an NPC-side
+   action, no hire or carried-person action) - read through TkLineViewPod. */
+static int TsLineFits(const void* line, int act)
+{
+    TkLineView v;
+    if (TkLineViewPod(line, &v) <= 0) return 0;
+    return cooptalk::TalkCarrierLineFits(v.types, v.n, act);
+}
+
 /* talkcarriers ev/act: the first line in the subtree under line (inclusive) whose actions hold type act, 0 none - within the
-   walk-over scan's depth and node caps (*nodes counts the lines read). */
-static void* TsScanAct(void* line, int depth, int act, int* nodes)
+   walk-over scan's depth and node caps (*nodes counts the lines read). T-858: fit = 1 (talktest nearestcarrier) only a line that
+   also fits TsLineFits. */
+static void* TsScanAct(void* line, int depth, int act, int* nodes, int fit = 0)
 {
     if (line == 0 || depth > kTsScanDepthCap || *nodes >= kTsScanNodeCap) return 0;
     ++*nodes;
     int has = 0; void* kids = 0;
     if (!TsLineActKidsPod(line, act, &has, &kids)) return 0;
-    if (has) return line;
+    if (has && (!fit || TsLineFits(line, act))) return line;
     const int nk = TkChoiceCountPod(kids);
     for (int j = 0; j < nk; ++j)
     {
-        void* hit = TsScanAct(TkChoiceAtPod(kids, j), depth + 1, act, nodes);
+        void* hit = TsScanAct(TkChoiceAtPod(kids, j), depth + 1, act, nodes, fit);
         if (hit != 0) return hit;
     }
     return 0;
@@ -5975,7 +8205,9 @@ static std::string TsSightCheck(const std::string& arg)
     }
     else
     {
-        npc = TsNearestCarrier(key, tp.x, tp.z, &nd);
+        std::string amb;
+        npc = TsNearestCarrier(key, tp.x, tp.z, &nd, &amb);
+        if (npc == 0 && !amb.empty()) return TsRefuse(amb);   /* T-1218: several carry it, or #k past them - refused, not waited for */
         if (npc == 0) return TsNotLoaded("no living non-player character within 3000 units of the target carries a walk-over dialogue keyed '" + key + "'");
     }
     const unsigned int npcUid = FindSpawnedUid(npc);
@@ -6184,13 +8416,24 @@ static ::Character* TsOwnPlayer(Ogre::Vector3* pos)
    uid and whose display name keys as nameKey (coopsay::TalkPersonKey), within maxDist (2D) of (x,z); 0 none. *count = how many
    loaded candidates carry the name at any distance. P25 T729b: own = 1 only this game's own, 0 only a copy the other game drives,
    -1 any (TkS6Owner). MAIN THREAD. */
-static ::Character* TsNearestNamed(const std::string& nameKey, float x, float z, float maxDist, int own, float* dist, int* count)
+/* T-1218: the pick of TsNearestNamed / TsNearestFaction - only exactly one candidate within maxDist, or `#<k>` the k-th nearest;
+   otherwise 0 with *amb = the refusal (the count and the first five, nearest first). */
+static ::Character* TsPickNearest(const leverpick::Picker<std::pair< ::Character*, float> >& pk, const std::string& what, float* dist, std::string* amb)
 {
-    *dist = -1.0f; *count = 0;
+    std::pair< ::Character*, float> got((::Character*)0, -1.0f);
+    if (pk.Decide(&got, what, "nearest first", amb) != leverpick::kOne) return 0;
+    *dist = got.second;
+    return got.first;
+}
+static ::Character* TsNearestNamed(const std::string& nameKeyIn, float x, float z, float maxDist, int own, float* dist, int* count, std::string* amb)
+{
+    *dist = -1.0f; *count = 0; amb->clear();
+    std::string nameKey; int selK = 0;
+    if (leverpick::SplitSelector(nameKeyIn, &nameKey, &selK) < 0) { *amb = leverpick::BadSelector(nameKeyIn); return 0; }
     if (coop::GameWorldPtr() == 0 || nameKey.empty()) return 0;
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
     if (all.size() > 20000) return 0;
-    ::Character* best = 0; float bd = maxDist;
+    leverpick::Picker<std::pair< ::Character*, float> > pk(selK);
     char nn[48];
     for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
     {
@@ -6200,22 +8443,26 @@ static ::Character* TsNearestNamed(const std::string& nameKey, float x, float z,
         if (coopsay::TalkPersonKey(nn) != nameKey || !SafeReadPosition(ch, &q)) continue;
         ++*count;
         const float dx = q.x - x, dz = q.z - z, d = sqrtf(dx * dx + dz * dz);
-        if (d >= bd) continue;
-        bd = d; best = ch;
+        if (d >= maxDist) continue;
+        char lb[96];
+        std::sprintf(lb, "'%.40s' uid=%u %.0fu", nn, FindSpawnedUid(ch), d);
+        pk.Add(std::make_pair(ch, d), 0, d, lb);
     }
-    if (best != 0) *dist = bd;
-    return best;
+    return TsPickNearest(pk, "living, conscious non-player characters named '" + nameKey + "'", dist, amb);
 }
 
 /* TEST-ONLY (talktest nearestfaction): as TsNearestNamed, matched on the candidate's faction name (its TalkPersonKey) instead of its
    own name - bar recruits carry random names. MAIN THREAD. */
-static ::Character* TsNearestFaction(const std::string& facKey, float x, float z, float maxDist, int own, float* dist, int* count)
+static ::Character* TsNearestFaction(const std::string& facKeyIn, float x, float z, float maxDist, int own, float* dist, int* count, std::string* amb)
 {
-    *dist = -1.0f; *count = 0;
+    *dist = -1.0f; *count = 0; amb->clear();
+    std::string facKey; int selK = 0;
+    if (leverpick::SplitSelector(facKeyIn, &facKey, &selK) < 0) { *amb = leverpick::BadSelector(facKeyIn); return 0; }
     if (coop::GameWorldPtr() == 0 || facKey.empty()) return 0;
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
     if (all.size() > 20000) return 0;
-    ::Character* best = 0; float bd = maxDist;
+    leverpick::Picker<std::pair< ::Character*, float> > pk(selK);
+    char nn[48];
     for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
     {
         ::Character* ch = *it; Ogre::Vector3 q; ::Faction* f = 0;
@@ -6224,20 +8471,24 @@ static ::Character* TsNearestFaction(const std::string& facKey, float x, float z
         if (coopsay::TalkPersonKey(f->getName()) != facKey || !SafeReadPosition(ch, &q)) continue;
         ++*count;
         const float dx = q.x - x, dz = q.z - z, d = sqrtf(dx * dx + dz * dz);
-        if (d >= bd) continue;
-        bd = d; best = ch;
+        if (d >= maxDist) continue;
+        TalkName(ch, nn);
+        char lb[96];
+        std::sprintf(lb, "'%.40s' uid=%u %.0fu", nn, FindSpawnedUid(ch), d);
+        pk.Add(std::make_pair(ch, d), 0, d, lb);
     }
-    if (best != 0) *dist = bd;
-    return best;
+    return TsPickNearest(pk, "living, conscious non-player characters of the faction '" + facKey + "'", dist, amb);
 }
 
 /* The carried hand-in fixture's TEST-ONLY name pick (crimetest bountyset, koself name, capturetest carry name) - see speech.h.
    MAIN THREAD. */
-::Character* LeverNearestNamed(const std::string& nameKey, int pick, ::Character* from, float maxDist, unsigned int* uid, float* dist,
+::Character* LeverNearestNamed(const std::string& nameKeyIn, int pick, ::Character* from, float maxDist, unsigned int* uid, float* dist,
                                std::string* name, std::string* why)
 {
     *uid = 0; *dist = -1.0f; name->clear(); why->clear();
     if (coop::GameWorldPtr() == 0 || EngineWritesBlocked()) { *why = "no world"; return 0; }
+    std::string nameKey; int selK = 0;   /* T-1218: `<name>#<k>` = the k-th nearest */
+    if (leverpick::SplitSelector(nameKeyIn, &nameKey, &selK) < 0) { *why = leverpick::BadSelector(nameKeyIn); return 0; }
     if (nameKey.empty()) { *why = "an empty name"; return 0; }
     Ogre::Vector3 o;
     if (from != 0) { if (!SafeReadPosition(from, &o)) { *why = "the reference character's position does not read"; return 0; } }
@@ -6245,6 +8496,7 @@ static ::Character* TsNearestFaction(const std::string& facKey, float x, float z
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
     if (all.size() > 20000) { *why = "the character update list has an implausible size"; return 0; }
     ::Character* best = 0; float bd = maxDist; int named = 0;
+    leverpick::Picker<std::pair< ::Character*, float> > pk(selK);   /* T-1218: every match within maxDist, nearest first */
     char nn[48];
     for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
     {
@@ -6270,14 +8522,25 @@ static ::Character* TsNearestFaction(const std::string& facKey, float x, float z
         if (!SafeReadPosition(ch, &q)) continue;
         ++named;
         const float dx = q.x - o.x, dz = q.z - o.z, d = sqrtf(dx * dx + dz * dz);
-        if (d >= bd) continue;
-        bd = d; best = ch;
+        if (d >= maxDist) continue;
+        char lb[96];
+        std::sprintf(lb, "'%.40s' uid=%u %.0fu", nn, FindSpawnedUid(ch), d);
+        pk.Add(std::make_pair(ch, d), 0, d, lb);
+    }
+    char dt[40];
+    if (maxDist > 1.0e9f) std::strcpy(dt, "anywhere");
+    else std::sprintf(dt, "within %.0f units", maxDist);
+    {   /* T-1218: exactly one match within maxDist, or #k; several -> refused naming the count and the five nearest */
+        std::pair< ::Character*, float> got((::Character*)0, -1.0f);
+        const int v = pk.Decide(&got, std::string(pick == kLeverPickOwnLiving ? "own living non-player" : (pick == kLeverPickDowned ? "down (knocked-out)"
+                                      : (pick == kLeverPickDead ? "dead" : "loaded"))) + " characters named '" + nameKey + "' " + dt,
+                                "nearest first", why);
+        if (v != leverpick::kOne && v != leverpick::kNone) return 0;
+        if (v == leverpick::kOne) { best = got.first; bd = got.second; }
     }
     if (best == 0)
     {
-        char dt[40], b[260];
-        if (maxDist > 1.0e9f) std::strcpy(dt, "anywhere");
-        else std::sprintf(dt, "within %.0f units", maxDist);
+        char b[260];
         std::sprintf(b, "no %s character named '%.60s' %s (%d such loaded at any distance)",
                      pick == kLeverPickOwnLiving ? "own living non-player" : (pick == kLeverPickDowned ? "down (knocked-out)"
                      : (pick == kLeverPickDead ? "dead" : "loaded")),
@@ -6314,7 +8577,9 @@ static bool TsNearCheck(const std::string& arg, float* x, float* z, std::string*
     {
         /* P25 T729: the nearest character with that name within the carrier search's radius; none -> wait (not loaded yet) */
         int named = 0;
-        ch = TsNearestNamed(nameKey, pp.x, pp.z, kTalkNearMax, -1, &nd, &named);
+        std::string amb;
+        ch = TsNearestNamed(nameKey, pp.x, pp.z, kTalkNearMax, -1, &nd, &named, &amb);
+        if (ch == 0 && !amb.empty()) { *why = amb; return false; }   /* T-1218: several within 3000 units, or #k past them - refused, not waited for */
         if (ch == 0)
         {
             std::sprintf(nb, " (%d loaded with that name farther away)", named);
@@ -6326,7 +8591,9 @@ static bool TsNearCheck(const std::string& arg, float* x, float* z, std::string*
     }
     else
     {
-        ch = TsNearestCarrier(key, pp.x, pp.z, &nd);
+        std::string amb;
+        ch = TsNearestCarrier(key, pp.x, pp.z, &nd, &amb);
+        if (ch == 0 && !amb.empty()) { *why = amb; return false; }   /* T-1218: several, or #k past them - refused, not waited for */
         if (ch == 0) { *why = "no living non-player character within 3000 units of this game's player carries a walk-over dialogue keyed '" + key + "'"; g_tsNotLoaded = 1; return false; }
         uid = FindSpawnedUid(ch);
     }
@@ -6400,6 +8667,20 @@ int TalkNearPoint(const std::string& arg, float* x, float* z, std::string* why)
     return 2;
 }
 
+/* talktest nearestname|nearestfaction: 1 = the last word is `walk` (*rest = the argument without it), else 0 (*rest = arg). The
+   word before it is a number or copy / mine, so a name never ends in it. */
+static int g_tsPickWalk = 0;   /* MAIN THREAD: the walk word of the last TsNameCheck */
+static int TsStripWalk(const std::string& arg, std::string* rest)
+{
+    size_t e = arg.find_last_not_of(" \t\r\n");
+    *rest = arg;
+    if (e == std::string::npos || e < 4) return 0;
+    const size_t s = e - 3;
+    if (arg.compare(s, 4, "walk") != 0 || (arg[s - 1] != ' ' && arg[s - 1] != '\t')) return 0;
+    *rest = arg.substr(0, s);
+    return 1;
+}
+
 /* The lever's verb as the command named it: nearestfaction, else nearestname. */
 static const char* TsVerb(const std::string& arg)
 {
@@ -6410,12 +8691,17 @@ static const char* TsVerb(const std::string& arg)
 /* P25 T729 (TEST-ONLY): `talktest nearestname <npc name> <targetUid> [event]` - the check. 1 = picked: *armArg = "<uid> <target>
    <event>" for TalkTestArm and the pick (uid, owner, where, how far from the target) is logged; 0 = refused (*why); g_tsNotLoaded
    = 1 when no such character is loaded yet. No distance limit (talktest by uid has none). MAIN THREAD (the command channel). */
-static int TsNameCheck(const std::string& arg, std::string* armArg, std::string* why)
+static int TsNameCheck(const std::string& argIn, std::string* armArg, std::string* why)
 {
+    std::string arg;
+    const int walk = TsStripWalk(argIn, &arg);
+    g_tsPickWalk = walk;
     std::string nameKey; unsigned int tu = 0; int ev = 1, own = -1;
     const bool byFac = coopsay::TalkTestFactionParse(arg, &nameKey, &tu, &ev, &own) != 0;   /* nearestfaction: the same pick by faction name */
     if (!byFac && !coopsay::TalkTestNameParse(arg, &nameKey, &tu, &ev, &own))   /* P25 T729b: [copy | mine] */
-    { *why = "usage talktest nearestname|nearestfaction <npc name | faction name: the words up to the first number, '_' = a space> <targetUid> [event 0..255, default 1] [copy | mine]"; return 0; }
+    { *why = "usage talktest nearestname|nearestfaction <npc name | faction name: the words up to the first number, '_' = a space> <targetUid> [event 0..255, default 1] [copy | mine] [walk]"; return 0; }
+    if (walk && ev != 1) { *why = "walk: the engine's own Talk order sends event 1 only - give no event or 1"; return 0; }
+    if (walk && !net::IsUidMine(tu)) { *why = "walk: the target is the one who walks, so it must be this game's own character"; return 0; }
     if (coop::GameWorldPtr() == 0 || EngineWritesBlocked()) { *why = "no world"; return 0; }
     char b[400];
     ::Character* tc = FindSpawned(tu);
@@ -6423,8 +8709,10 @@ static int TsNameCheck(const std::string& arg, std::string* armArg, std::string*
     if (tc == 0 || SayPlausiblePtr(tc) == 0 || !SafeReadPosition(tc, &tp))
     { std::sprintf(b, "the target uid %u is not here (or its position is unreadable)", tu); *why = b; return 0; }
     float d = -1.0f; int named = 0;
-    ::Character* ch = byFac ? TsNearestFaction(nameKey, tp.x, tp.z, 1.0e30f, own, &d, &named)
-                            : TsNearestNamed(nameKey, tp.x, tp.z, 1.0e30f, own, &d, &named);
+    std::string amb;
+    ::Character* ch = byFac ? TsNearestFaction(nameKey, tp.x, tp.z, 1.0e30f, own, &d, &named, &amb)
+                            : TsNearestNamed(nameKey, tp.x, tp.z, 1.0e30f, own, &d, &named, &amb);
+    if (ch == 0 && !amb.empty()) { *why = amb; return 0; }   /* T-1218: several loaded, or #k past them - refused, not waited for */
     if (ch == 0)
     {
         *why = std::string("no living, conscious non-player character ") + (byFac ? "of the faction '" : "named '") + nameKey + "'" + (own == 0 ? " that is a copy the other game drives" : (own == 1 ? " that is this game's own" : "")) + " is loaded";   /* P25 T729b */
@@ -6440,10 +8728,27 @@ static int TsNameCheck(const std::string& arg, std::string* armArg, std::string*
     std::sprintf(b, "[TALK] talktest %s: picked uid=%u %s '%s' at %.0f,%.0f = %.0f units from target uid=%u at %.0f,%.0f (%d loaded with that %s) ev=0x%X",
                  byFac ? "nearestfaction" : "nearestname", uid, TsOwnerName(TkS6Owner(ch)), nn, cp.x, cp.z, d, tu, tp.x, tp.z, named,
                  byFac ? "faction" : "name", (unsigned int)ev);
-    DebugLog(std::string(b) + (byFac ? " faction='" : " name='") + nameKey + "'" + (own == 0 ? " only=copy" : (own == 1 ? " only=mine" : "")));   /* P25 T729b */
+    DebugLog(std::string(b) + (byFac ? " faction='" : " name='") + nameKey + "'" + (own == 0 ? " only=copy" : (own == 1 ? " only=mine" : ""))
+             + (walk ? " walk" : ""));   /* P25 T729b */
     std::sprintf(b, "%u %u %d", uid, tu, ev);
     *armArg = b;
     return 1;
+}
+
+/* MAIN THREAD. Arms the picked request (TalkTestArm); with the walk word of the pick, the request gives the engine's Talk order
+   instead of the direct sendEvent (logged ARMED). */
+static std::string TsArmPicked(const std::string& armArg)
+{
+    const int walk = g_tsPickWalk;
+    const std::string r = TalkTestArm(armArg);
+    if (walk && g_talkTestPending != 0)
+    {
+        g_talkTestWalk = 1;
+        DebugLog("[TALK] talktest walk ARMED: at the next safe point the target (this game's own character) is given the engine's own Talk order"
+                 " on the NPC (issueOrder PLAYER_TALK_TO 12) instead of a direct sendEvent");
+        return r + " (walk)";
+    }
+    return r;
 }
 
 /* P25 T729: MAIN THREAD (the command channel). Picks the NPC and arms `talktest <uid> <target> <event>` (TalkTestArm, its own ARMED
@@ -6459,7 +8764,7 @@ std::string TalkTestNameArm(const std::string& arg)
     }
     g_tsNotLoaded = 0;
     std::string armArg, why;
-    if (TsNameCheck(arg, &armArg, &why)) return TalkTestArm(armArg);
+    if (TsNameCheck(arg, &armArg, &why)) return TsArmPicked(armArg);
     if (!g_tsNotLoaded)
     {
         DebugLog("[TALK] talktest " + verb + " REFUSED: " + why);
@@ -6469,6 +8774,83 @@ std::string TalkTestNameArm(const std::string& arg)
     g_twName.on = 1; g_twName.arg = arg; g_twName.startMs = now; g_twName.waitMs = kTwNearMs; g_twName.lastTryMs = now;
     DebugLog("[TALK] talktest " + verb + " WAITING: " + why + " - re-checking every 500 ms for up to 60 s");
     return "ok talktest " + verb + ": waiting up to 60 s for the NPC to load";
+}
+
+/* T-858 TEST-ONLY: `talktest nearestcarrier <act> <targetUid> [event] [copy | mine]` - the nearest candidate (TsCandidate, with a uid,
+   the owner filter) within kTalkNearMax of the target whose event-<event> conversation list holds a line carrying dialogue action
+   <act> with an NPC-side action and no hire (TsScanAct fit = 1, TalkCarrierLineFits) is picked and `talktest <uid> <target> <event>`
+   armed (TalkTestArm). Logs the pick (name, uid, dialogue, line, the line's actions) or "none in range". No wait. MAIN THREAD. */
+std::string TalkTestCarrierArm(const std::string& arg)
+{
+    int act = -1, ev = 1, own = -1; unsigned int tu = 0;
+    if (!coopsay::TalkTestCarrierParse(arg, &act, &tu, &ev, &own))
+        return "error talktest nearestcarrier: usage talktest nearestcarrier <act 0..255> <targetUid> [event 0..255, default 1] [copy | mine]";
+    if (coop::GameWorldPtr() == 0 || EngineWritesBlocked()) { DebugLog("[TALK] talktest nearestcarrier REFUSED: no world"); return "error talktest nearestcarrier: no world"; }
+    ::Character* tc = FindSpawned(tu);
+    Ogre::Vector3 tp;
+    if (tc == 0 || SayPlausiblePtr(tc) == 0 || !SafeReadPosition(tc, &tp))
+    {
+        DebugLog("[TALK] talktest nearestcarrier REFUSED: the target uid " + TkU(tu) + " is not here (or its position is unreadable)");
+        return "error talktest nearestcarrier: the target is not here";
+    }
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() > 20000) return "error talktest nearestcarrier: the character update list has an implausible size";
+    ::Character* best = 0; void* bestRoot = 0; void* bestHit = 0; float bd = kTalkNearMax; int carriers = 0, looked = 0;
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+    {
+        ::Character* ch = *it; Ogre::Vector3 q;
+        if (ch == tc || !TsCandidate(ch) || FindSpawnedUid(ch) == 0 || (own >= 0 && TkS6Owner(ch) != own) || !SafeReadPosition(ch, &q)) continue;
+        const float dx = q.x - tp.x, dz = q.z - tp.z, d = sqrtf(dx * dx + dz * dz);
+        if (d >= kTalkNearMax) continue;
+        ++looked;
+        long long mapSize = 0;
+        void* list = TkConvListPod(TalkDialogueOf(ch), ev, &mapSize);
+        const int n = TkChoiceCountPod(list);
+        for (int i = 0; i < n; ++i)
+        {
+            void* root = TkChoiceAtPod(list, i);
+            int nodes = 0;
+            void* hit = TsScanAct(root, 0, act, &nodes, 1);
+            if (hit == 0) continue;
+            ++carriers;
+            if (d < bd) { bd = d; best = ch; bestRoot = root; bestHit = hit; }
+            break;
+        }
+    }
+    char b[360];
+    if (best == 0)
+    {
+        std::sprintf(b, "[TALK] talktest nearestcarrier act=%d ev=%d: none in range - no %sliving, conscious non-player character within %.0f units of target uid=%u"
+                     " holds a line with action %d, an NPC-side action and no hire (%d looked at)", act, ev, own == 1 ? "own " : (own == 0 ? "copy " : ""),
+                     (double)kTalkNearMax, tu, act, looked);
+        DebugLog(std::string(b));
+        return "error talktest nearestcarrier: none in range";
+    }
+    const unsigned int uid = FindSpawnedUid(best);
+    TkLineView v;
+    std::string acts;
+    if (TkLineViewPod(bestHit, &v) > 0)
+        for (int i = 0; i < v.n; ++i) acts += (i ? "," : "") + TkI(v.types[i]) + ":" + TkI(v.values[i]);
+    char nn[48];
+    TalkName(best, nn);
+    std::sprintf(b, "[TALK] talktest nearestcarrier act=%d ev=%d: picked uid=%u %s '%s' %.0f units from target uid=%u (%d carrier(s) of %d in range)",
+                 act, ev, uid, TsOwnerName(TkS6Owner(best)), nn, (double)bd, tu, carriers, looked);
+    DebugLog(std::string(b) + " dialogue='" + TsName(bestRoot) + "' sid=" + TkLineSid(bestRoot) + " line=" + TkLineSid(bestHit) + " acts=[" + acts + "]"
+             + (own == 0 ? " only=copy" : (own == 1 ? " only=mine" : "")));
+    std::sprintf(b, "%u %u %d", uid, tu, ev);
+    g_tsPickWalk = 0;
+    return TalkTestArm(std::string(b));
+}
+
+/* T-858 TEST-ONLY: `talktest actresultdrop` - on the NPC's game, the next ACT_RESULT for a paid line is thrown away once
+   (TkActResDropTake). MAIN THREAD. */
+std::string TalkActResultDropArm()
+{
+    const int was = g_tkActResDropArmed;
+    g_tkActResDropArmed = 1;
+    DebugLog(std::string("[TALK] talktest actresultdrop ARMED") + (was ? " (it already was)" : "")
+             + ": the next ACT_RESULT for a paid line (APPLIED, the talker's purse down) is dropped once; dropped so far " + TkI(g_tkActResDropped));
+    return "ok talktest actresultdrop armed";
 }
 
 /* MAIN THREAD (the command channel). T718: the talksight check; when it fails only because the NPC is not loaded yet, a wait of
@@ -6566,7 +8948,7 @@ int TalkWaitTick(float* x, float* z, unsigned long* waitedMs)
             char b[96];
             std::sprintf(b, "[TALK] talktest %s: picked after %lu ms of waiting", TsVerb(g_twName.arg), (unsigned long)waited);
             DebugLog(std::string(b));
-            TalkTestArm(armArg);
+            TsArmPicked(armArg);
         }
         else if (!g_tsNotLoaded) { g_twName.on = 0; TwLogEnd(("[TALK] talktest " + std::string(TsVerb(g_twName.arg)) + " REFUSED").c_str(), waited, why); }
         else if (waited >= g_twName.waitMs)
@@ -6787,8 +9169,9 @@ static std::string CopyOwnCountsString()
    constant, 0.0 in the 1.0.65 exe); died = hasDied(me), the byte +0x5BC (the Character_hasDied row's whole body is that read);
    leadBusy = no current conversation (+0x190), no parked interrupt (+0xC8), and the conversation master (hand +0x2A0) a character
    whose own Dialogue (+0x280) has not ended (conversationHasEnded 0x6711D0 replayed); down = unconscious (+0x5B9) or dead (+0x5BC);
-   indoorsTest = the indoors test refuses (the hand type at +0x88 not 0xB, and not inside a building whose interior +0x1F0 -> +0x10
-   is set). busy = a current conversation (+0x190): NOT a refusal of its own - when set it only switches the lead test off. Not
+   indoorsTest = the indoors test refuses: the engine's own "where are you?" (the speaker's vt+0x1D8 - for a caged prisoner the place
+   the cage stands in, decomp_5cd590) answers a hand whose type (+8) is not 0xB, and not a building (type 0) whose interior
+   +0x1F0 -> +0x10 is loaded (TkOrdWhere). busy = a current conversation (+0x190): NOT a refusal of its own - when set it only switches the lead test off. Not
    read: the war-campaign test 0x9C3CC0(who) (no address row; it runs only when +0xC8 is empty). -1 = unreadable. MAIN THREAD
    (hand lookups); no C++ object (C2712). */
 static int TkOrdRd(const void* base, size_t off, void* out, size_t n)
@@ -6807,6 +9190,52 @@ static void* TkOrdHandBuilding(const void* h)
     __try { return (void*)((const ::hand*)h)->asBuilding(); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* 1 = p lies inside this exe's image (the game's vtables and functions do). */
+static int TkOrdInImage(const void* p)
+{
+    static uintptr_t s_size = 0;
+    if (g_base == 0) return 0;
+    if (s_size == 0)
+    {
+        DWORD lf = 0, sz = 0;
+        if (!TkOrdRd((const void*)g_base, 0x3C, &lf, 4) || lf == 0 || lf > 0x1000 || !TkOrdRd((const void*)g_base, (size_t)lf + 0x50, &sz, 4) || sz == 0) return 0;
+        s_size = (uintptr_t)sz;
+    }
+    return ((uintptr_t)p >= g_base && (uintptr_t)p < g_base + s_size) ? 1 : 0;
+}
+typedef void* (*TkWhereFn)(void* self);
+static void* TkOrdCallWhere(void* fn, void* me)
+{
+    __try { return ((TkWhereFn)fn)(me); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* The engine's indoors test for a speaker (Dialogue::sendEvent, decomp_683f00), asked as the engine asks it: the speaker's own
+   "where are you?" (vt+0x1D8; a character's is 0x5CD590, which for a caged prisoner answers the place the cage stands in) gives a
+   hand; it passes when the hand's type (+8) is 0xB (no building), or 0 (a building) whose interior (+0x1F0) is loaded (its +0x10
+   set). 0 = passes, 1 = refuses, -1 = unreadable (*type -1 when no answer was read). The vtable and the function must lie in the
+   exe's image before the call. MAIN THREAD (the engine calls it there). No C++ object (C2712). */
+static int TkOrdWhere(void* me, int* type, void** bld, void** inside, void** loaded)
+{
+    *type = -1; *bld = 0; *inside = 0; *loaded = 0;
+    void* vt = 0; void* fn = 0;
+    if (me == 0 || !TkOrdRd(me, 0, &vt, 8) || !TkOrdInImage(vt) || !TkOrdRd(vt, 0x1D8, &fn, 8) || !TkOrdInImage(fn)) return -1;
+    void* const h = TkOrdCallWhere(fn, me);
+    if (h == 0 || !TkOrdRd(h, 0x8, type, 4)) { *type = -1; return -1; }
+    if (*type == 0)
+    {
+        *bld = TkOrdHandBuilding(h);
+        if (*bld != 0 && TkOrdRd(*bld, 0x1F0, inside, 8) && *inside != 0) TkOrdRd(*inside, 0x10, loaded, 8);
+    }
+    return (*type == 0xB || (*type == 0 && *bld != 0 && *inside != 0 && *loaded != 0)) ? 0 : 1;
+}
+static void TkOrdWhereStr(int r, int type, const void* bld, const void* inside, const void* loaded, char* out)   /* out: 200 chars */
+{
+    std::sprintf(out, "where[vt+0x1D8 type=%d building=%p inside(+0x1F0)=%p loaded(+0x10)=%p indoorsTest=%d]", type, bld, inside, loaded, r);
+}
+static int g_tkWhereType = -1;   /* MAIN THREAD: the last TkOrderGates answer, for its refusal line */
+static void* g_tkWhereBld = 0;
+static void* g_tkWhereIn = 0;
+static void* g_tkWhereLoaded = 0;
 /* conversationHasEnded 0x6711D0 replayed on a Dialogue: 1 ended, 0 running, -1 unreadable. */
 static int TkOrdEnded(const void* d)
 {
@@ -6855,17 +9284,9 @@ static void TkOrderGates(void* dlg, void* me, int* repeat, float* repeatT, int* 
     const int leadEnded = (lead != 0 && TkOrdRd(lead, 0x280, &leadDlg, 8) && leadDlg != 0) ? TkOrdEnded(leadDlg) : -2;
     *leadBusy = (*busy < 0 || !intrOk) ? -1 : ((cur == 0 && intr == 0 && lead != 0 && leadEnded == 0) ? 1 : 0);
     unsigned char ko = 0xFF, dead = 0xFF;
-    *down = (me != 0 && TkOrdRd(me, 0x5B9, &ko, 1) && TkOrdRd(me, 0x5BC, &dead, 1)) ? ((ko == 1 || dead == 1) ? 1 : 0) : -1;
+    *down = (me != 0 && TkOrdRd(me, 0x5B9, &ko, 1) && TkOrdRd(me, 0x5BC, &dead, 1)) ? cooptalk::TalkKnockedOutOrDead(ko, dead) : -1;
     *died = (me != 0 && TkOrdRd(me, 0x5BC, &dead, 1)) ? (dead != 0 ? 1 : 0) : -1;   /* hasDied: the byte non-zero */
-    int inType = -1;
-    if (me == 0 || !TkOrdRd(me, 0x88, &inType, 4)) { *indoors = -1; return; }
-    void* bld = 0; void* b1f0 = 0; void* b10 = 0;
-    if (inType == 0)
-    {
-        bld = TkOrdHandBuilding((const char*)me + 0x80);
-        if (bld != 0 && TkOrdRd(bld, 0x1F0, &b1f0, 8) && b1f0 != 0) TkOrdRd(b1f0, 0x10, &b10, 8);
-    }
-    *indoors = (inType != 0xB && (inType != 0 || bld == 0 || b1f0 == 0 || b10 == 0)) ? 1 : 0;   /* event 1 is not one of the exempt events 0x27 / 6 / 0xB */
+    *indoors = TkOrdWhere(me, &g_tkWhereType, &g_tkWhereBld, &g_tkWhereIn, &g_tkWhereLoaded);   /* event 1 is not one of the exempt events 0x27 / 6 / 0xB */
 }
 
 /* T-726: the talk orders of this game's player, at the K2 safe point after TkSafePoint (so a click sent on as a REQUEST at this safe
@@ -6879,6 +9300,16 @@ long long g_tkOrderByOutcome[cooptalk::kTalkOrderKinds];
 long long g_tkOrderNotReachedBusy = 0;   /* not reached while the copy was also busy in its own conversation */
 static void TalkOrderDrain()
 {
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+    P213Tick();   /* stale traced lines dropped, the REPORT */
+// PROBE-END: P213
+#endif
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+    P214Tick();   /* the watch list, the noted events and starts printed, the REPORT */
+// PROBE-END: P214
+#endif
     if (g_tkOrderPending == 0) return;
     TkOrderItem got[kTkOrderRing];
     int n = 0;
@@ -6889,6 +9320,11 @@ static void TalkOrderDrain()
         TkOrderItem& o = got[n++];
         o.dlg = e.dlg; o.me = e.me; o.who = e.who; o.nuid = e.nuid; o.tuid = e.tuid; o.tid = e.tid; o.set = e.set; o.reached = e.reached;
         o.hadLine = e.hadLine; o.started = e.started; o.busyCopy = e.busyCopy; o.convEv = e.convEv; o.gateDist = e.gateDist; o.site = e.site;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+        o.p213Order = e.p213Order;
+// PROBE-END: P213
+#endif
         ::InterlockedExchange(&e.state, 0);
     }
     ::InterlockedExchangeAdd(&g_tkOrderPending, -(LONG)n);
@@ -6900,6 +9336,11 @@ static void TalkOrderDrain()
     {
         const TkOrderItem& o = got[k];
         const int outcome = cooptalk::TalkOrderOutcome(o.set, o.reached, o.hadLine, o.started);
+#ifdef SW_DEV_BUILD
+// PROBE-START: P213
+        P213DrainOrder(o.p213Order, o.dlg, o.tuid, o.nuid, outcome == cooptalk::kTalkOrderNoLine ? 1 : 0, 0);   /* its tested lines and TALK line, before the throttle */
+// PROBE-END: P213
+#endif
         if (outcome >= 0 && outcome < cooptalk::kTalkOrderKinds) ++g_tkOrderByOutcome[outcome];
         if (outcome == cooptalk::kTalkOrderNotReached && o.busyCopy) ++g_tkOrderNotReachedBusy;
         const int liveNpc = TkLiveOwner(o.dlg, o.me);
@@ -6956,15 +9397,22 @@ static void TalkOrderDrain()
         case cooptalk::kTalkOrderDup: std::strcpy(res, "NOT started: the same click already waits to be sent (duplicate)"); break;
         case cooptalk::kTalkOrderLineNotStarted: std::strcpy(res, "NOT started: the NPC had a line, the camera gate passed, and the engine still did not start it"); break;
         case cooptalk::kTalkOrderPlayerSpeaker: std::strcpy(res, "NOT started: the speaker is another player's character"); break;
+        case cooptalk::kTalkOrderWindowBusy: std::strcpy(res, "NOT started: the conversation window shows another conversation (T-978)"); break;
         default:
         {
             int gb = -1, gl = -1, gd = -1, gi = -1, gr = -1, gx = -1;
             float rt = 0.0f;
+            g_tkWhereType = -1; g_tkWhereBld = 0; g_tkWhereIn = 0; g_tkWhereLoaded = 0;
             if (liveNpc) TkOrderGates(o.dlg, o.me, &gr, &rt, &gx, &gb, &gl, &gd, &gi);
             char rs[32];
             if (gr > 0) std::sprintf(rs, "%.3g", (double)rt); else std::strcpy(rs, gr == 0 ? "none" : "?");
             std::sprintf(res, "NOT started: the engine refused before choosing a line (repeatTimer=%s died=%d leadBusy=%d down=%d indoorsTest=%d currentConv=%d warCampaign=unread)",
                          rs, gx, gl, gd, gi, gb);
+            {
+                char wb[200];
+                TkOrdWhereStr(gi, g_tkWhereType, g_tkWhereBld, g_tkWhereIn, g_tkWhereLoaded, wb);
+                if (std::strlen(res) + 1 + std::strlen(wb) < sizeof(res)) { std::strcat(res, " "); std::strcat(res, wb); }
+            }
             if (o.busyCopy)
             {
                 char cb[96];
@@ -6988,10 +9436,10 @@ static std::string TalkOrderCountsString()
     const long long* o = g_tkOrderByOutcome;
     char b[600];
     std::sprintf(b, " talkOrder[orders,dropped,drained,blocked,stale,logged]=%lld,%lld,%lld,%lld,%lld,%u"
-                 " talkOrderBy[notReached,started,noLine,request,gate,ringFull,dup,lineNotStarted,playerSpeaker]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " talkOrderBy[notReached,started,noLine,request,gate,ringFull,dup,lineNotStarted,playerSpeaker,windowBusy]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                  " talkOrderNotReachedCopyBusy=%lld",
                  (long long)g_tkOrders, (long long)g_tkOrderDropped, g_tkOrderDrained, g_tkOrderBlocked, g_tkOrderStale, g_tkOrderLogged,
-                 o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8], g_tkOrderNotReachedBusy);
+                 o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8], o[9], g_tkOrderNotReachedBusy);
     return std::string(b);
 }
 
@@ -7030,6 +9478,7 @@ static void PortraitDrain()
         const int shown = (win != 0) ? DlgWinShownPod(win) : -1;
         const int v = cooppd::ReplayVerdict(win, shown, dlgNow, e.dlgAtHold, e.hadWho, whoNow);
         int ran = 0;
+        if (v == cooppd::kApply && OwSkipPortraitOn(dlgNow, whoNow)) { ::InterlockedIncrement64(&g_owSkipPortrait); continue; }   /* T-978 B1 */
         if (v == cooppd::kApply)
         {
             ran = PortraitCallPod(orig_dlgWinPortrait, win, whoNow, (char)e.slot);
@@ -7212,8 +9661,37 @@ static void DlgWinGuard()
           "a character of the shown conversation is gone (window guard)");
 }
 
+/* T-978 (owner 1445 a, C): 1 = this game's conversation window shows a conversation now (TkWindowDlg not 0 and not 'no address');
+   store.cpp's ClockTick polls it for the Slowest wins pause vote. Two guarded reads - any thread. */
+int TalkWindowOpenNow()
+{
+    return talkonewin::ShownReal(TkWindowDlg());
+}
+
 /* Before this mod removes character c (DestroyLocalObject, the duplicate removal): a conversation the window shows whose
    owner, target or stored character is c ends first, while c still exists. MAIN THREAD; elsewhere nothing is done. */
+/* T-978 A: the engine destroyed obj (spawn.cpp NotifyDespawn, MAIN THREAD): a frozen NPC at that address loses its hold by address. */
+void TalkFreezeForgetObject(const void* obj)
+{
+    if (obj != 0 && ((g_frz.set && obj == g_frz.npc) || OwFwdHolds(obj))) OwFrzRoad(talkonewin::kRelDestroyed, 0, obj);   /* the window's slot and the forwarded ones */
+}
+
+/* T-978 A: the world is torn down - leaving to the title, or another load (store.cpp, beside AiSpikeWorldTeardown, MAIN THREAD): the
+   slots are forgotten (the window's and the forwarded ones) - the teardown frees every hold, and the next world may reuse the
+   address. D's held click is forgotten too, and B2's queued talk, its start record and the refused opens still to end (review
+   2026-11-03: they name characters and Dialogues of the freed world). */
+void TalkFreezeWorldTeardown()
+{
+    ::InterlockedExchange(&g_frzAsk, 0);
+    ::InterlockedExchangePointer(&g_frzAskDlg, 0);
+    OwFrzRoad(talkonewin::kRelTeardown, 0, 0);
+    g_owHeld.last = 0; g_owHeld.armed = 0; g_owHeld.upSteps = 0;
+    OwQueueForget();
+    for (int k = 0; k < kOwEndLaterSlots; ++k) { g_owEndLater[k].dlg = 0; g_owEndLater[k].me = 0; }
+    g_bhWin.set = 0; g_bhWin.dlg = 0; g_bhWin.wrote = 0;   /* T-978 BUBBLE: an address may be reused by the next world */
+    for (int k = 0; k < kFrzFwdSlots; ++k) { g_bhFwd[k].set = 0; g_bhFwd[k].dlg = 0; g_bhFwd[k].wrote = 0; }
+}
+
 void TalkWindowBeforeRemove(void* c)
 {
     if (c == 0 || SayOnMainThread() == 0) return;
@@ -7232,6 +9710,104 @@ void TalkWindowBeforeRemove(void* c)
           "before this mod removes the character", "a character of the shown conversation is being removed by this mod (window guard)");
 }
 
+/* T-1230: THE TRADE WINDOW NEVER CALLS THROUGH A FREED TRADER (the rule: src/common/tradewinguard.h). The trade window's per-frame
+   update calls through the trader its ShopTrader keeps (+0xC0); in a session the window does not pause the game, and the game's
+   own area unload can destroy that trader (a copy of another game's character) while the window shows it (run T1965).
+   TradeWindowBeforeDestroy closes the window when GameWorld::destroy is about to destroy that trader (before the free);
+   TradeWinGuard (each safe point, beside DlgWinGuard) is the backstop: the trader is checked by ADDRESS against this mod's
+   registry and the engine's character lists (TkLiveChar - the same test DlgWinGuard makes of the window's stored character), never
+   read, and a trader in neither closes the window. The close: items.cpp ItTradeWinClose (before the free the cursor item is put back
+   first; on the backstop road it is left to the close's own put-back; then the engine's closeAllInventories). One line per close.
+   MAIN THREAD. */
+int ItTradeWinRead(void** st, void** trader, int* facade, int* busy);   /* items.cpp (declared in items.h) */
+int ItTradeWinClose(int putBack, int* cursorRoad, int* cursorBack);
+std::string ItTradeWinCounts();
+static long long g_twgClosed = 0, g_twgCloseFailed = 0, g_twgUnload = 0, g_twgEngineRemoval = 0, g_twgModRemoval = 0, g_twgBackstop = 0;
+static long long g_twgCursorBack = 0, g_twgCursorKept = 0, g_twgLogged = 0;
+static volatile LONG64 g_twgWaited = 0;          /* the trader doomed while the moment was wrong (off the main thread / inside a window change) */
+static const long long kTwgLogCap = 200;         /* a close is rare: the first 200 are logged, the rest only counted */
+static void* g_twgSeenTrader = 0;                /* the open window's trader last seen live at a check (an address, never read) */
+static unsigned int g_twgSeenUid = 0;            /* ... and its uid then - the line's uid once the trader is gone */
+static int g_twgIn = 0;                          /* inside a close: a destroy the close itself causes acts on nothing */
+
+static const char* TwgRoadName(int road)
+{
+    return (road == tradewinguard::kRoadUnload) ? "the game's area unload is destroying the trader"
+         : (road == tradewinguard::kRoadEngineRemoval) ? "the game is destroying the trader"
+         : (road == tradewinguard::kRoadModRemoval) ? "this mod is removing the trader"
+         : "backstop check: the trader is in neither this mod's registry nor the engine's character lists";
+}
+
+static void TwgClose(int road, unsigned int uid, const char* reason)
+{
+    int cur = tradewinguard::kCurNone, back = -1;
+    g_twgIn = 1;
+    const int closed = ItTradeWinClose((road == tradewinguard::kRoadBackstop) ? 0 : 1, &cur, &back);   /* review fold 2: no put-back of ours once the trader may be freed */
+    g_twgIn = 0;
+    if (closed) ++g_twgClosed; else ++g_twgCloseFailed;
+    if (road == tradewinguard::kRoadUnload) ++g_twgUnload;
+    else if (road == tradewinguard::kRoadEngineRemoval) ++g_twgEngineRemoval;
+    else if (road == tradewinguard::kRoadModRemoval) ++g_twgModRemoval;
+    else ++g_twgBackstop;
+    if (back == 1) ++g_twgCursorBack; else if (back == 0) ++g_twgCursorKept;
+    g_twgSeenTrader = 0; g_twgSeenUid = 0;
+    if (g_twgLogged >= kTwgLogCap) return;
+    ++g_twgLogged;
+    const char* const curText = (cur == tradewinguard::kCurNone) ? "none held"
+                              : (back == 1) ? ((cur == tradewinguard::kCurShopCopy) ? "returned (the shop's copy, back to the shop unbought, under the shop guard)"
+                                                                                    : "returned (put back to the window it came from)")
+                              : (back == -2) ? "left to closeAllInventories' own put-back (the backstop road: the trader may already be freed)"
+                              : "NOT returned (still on the cursor after the put-back - the close puts it back again or destroys it)";
+    char b[512];
+    std::sprintf(b, " - the window %s; trader uid=%u; cursor item: %s (logged %lldx of %lld; tradeWinGuard[...] on the talk REPORT line)",
+                 closed ? "closed through closeAllInventories" : "close FAILED (no CloseInventories row, or it faulted)", uid, curText,
+                 g_twgLogged, kTwgLogCap);
+    DebugLog(std::string("[SHOP] trade window guard: ") + TwgRoadName(road)
+             + ((reason != 0 && reason[0] != 0) ? std::string(" (reason='") + reason + "')" : std::string()) + b);
+}
+
+/* MAIN THREAD, AI worker paused (TalkTestDrain at the K2 safe point), every safe point while a trade window is open. */
+static void TradeWinGuard()
+{
+    if (g_twgIn != 0 || EngineWritesBlocked()) return;
+    void* st = 0; void* tr = 0;
+    int facade = -1, busy = 0;
+    if (!ItTradeWinRead(&st, &tr, &facade, &busy)) { g_twgSeenTrader = 0; g_twgSeenUid = 0; return; }
+    const int live = (tr != 0 && TkLiveChar(tr)) ? 1 : 0;
+    if (live == 1 && tr != g_twgSeenTrader) { g_twgSeenTrader = tr; g_twgSeenUid = FindSpawnedUid(tr); }
+    const int v = tradewinguard::Verdict(1, facade, live, busy);
+    if (v == tradewinguard::kKeep) return;
+    if (v == tradewinguard::kWait) { ::InterlockedIncrement64(&g_twgWaited); return; }
+    TwgClose(tradewinguard::kRoadBackstop, (tr != 0 && tr == g_twgSeenTrader) ? g_twgSeenUid : 0u, 0);
+}
+
+void TradeWindowBeforeDestroy(void* obj, int unload, int modRemoval, const char* reason)
+{
+    if (obj == 0 || g_twgIn != 0) return;
+    void* st = 0; void* tr = 0;
+    int facade = -1, busy = 0;
+    if (!ItTradeWinRead(&st, &tr, &facade, &busy) || tr != obj) return;   /* the common case: no window, or another object */
+    const int onMain = SayOnMainThread();
+    /* review fold 3: EngineWritesBlocked is NOT a reason to wait here - waiting turns a close before the free into one after it. The
+       engine's world teardown is no case of it: TeardownBroadcast -> ItemsWorldTeardown clears the record before the engine frees
+       anything (store.cpp detour_worldTeardown / detour_resetGame), so ItTradeWinRead answers 0 above. */
+    const int v = tradewinguard::BeforeDestroy(1, facade, obj, tr, onMain, (busy != 0) ? 1 : 0);
+    if (v == tradewinguard::kKeep) return;
+    if (v == tradewinguard::kWait) { ::InterlockedIncrement64(&g_twgWaited); return; }
+    unsigned int uid = FindSpawnedUid(obj);
+    if (uid == 0 && obj == g_twgSeenTrader) uid = g_twgSeenUid;
+    TwgClose(tradewinguard::DestroyRoad(unload, modRemoval), uid, reason);
+}
+
+static std::string TradeWinGuardCountsString()
+{
+    char b[300];
+    std::sprintf(b, " tradeWinGuard[closed,closeFailed,unload,engineRemoval,modRemoval,backstop,waited,cursorBack,cursorKept]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_twgClosed, g_twgCloseFailed, g_twgUnload, g_twgEngineRemoval, g_twgModRemoval, g_twgBackstop, (long long)g_twgWaited,
+                 g_twgCursorBack, g_twgCursorKept);
+    return std::string(b) + " tradeWinRecord[recorded,noShop,closedByEngine]=" + ItTradeWinCounts();
+}
+
 static std::string WinGuardCountsString()
 {
     char b[360];
@@ -7239,7 +9815,7 @@ static std::string WinGuardCountsString()
                  "beforeRemove]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
                  g_wgEnded, g_wgEndFailed, g_wgOwnerGone, g_wgHidden, g_wgHideFailed, g_wgNoHideRow, g_wgShownCleared, g_wgGoneOwner,
                  g_wgGoneTarget, g_wgGoneShown, g_wgBeforeRemove);
-    return std::string(b);
+    return std::string(b) + TradeWinGuardCountsString();   /* T-1230 */
 }
 
 /* ANOTHER ROAD FROM THE AI THREAD TO A WINDOW (log-only, nothing changed). Dialogue::sendEvent -> startConversation 0x683500 ->
@@ -7275,6 +9851,11 @@ void TalkNoteOffMainActs(void* dlg, void* line)
     const DWORD le = ::GetLastError();
     int types[32], values[32], items = 0;
     const int n = TkLineActsPod(line, types, values, 32, &items);
+#ifdef SW_DEV_BUILD
+// PROBE-START: P214
+    P214NoteOffAct18(dlg, line, types, n);   /* log only: a line carrying act 18 run off the main thread */
+// PROBE-END: P214
+#endif
     if (n < 0) { ::InterlockedIncrement64(&g_offActUnread); ::SetLastError(le); return; }
     unsigned int mask = 0;
     for (int i = 0; i < n; ++i)
@@ -7342,18 +9923,426 @@ std::string OffMainActsCountsString()
     return std::string(b);
 }
 
+/* The engine's own Talk order: issueOrder(walker, no building, PLAYER_TALK_TO 12, npc, playerOrder 1, replace the walker's orders
+   1, issueOrder's own seventh argument). 1 given, 0 faulted. No C++ object (C2712). */
+static int TtWalkOrderPod(void* walker, void* npc)
+{
+    const S6AddOrderFn ao = (S6AddOrderFn)(g_base + (uintptr_t)kS6AddOrderRva);
+    __try
+    {
+        const unsigned long long a7 = *(const unsigned long long*)(g_base + (uintptr_t)kS6AddOrderArgRva);
+        ao(walker, 0, kTtTaskPlayerTalkTo, npc, 1, 1, a7);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* talktest ... walk (TEST-ONLY), MAIN THREAD at the K2 safe point (TalkTestDrain): the target walks to the NPC on the engine's
+   own Talk order; the arrival's event 1 is the engine's (detour_sendEvent and the talk order line log it). Arms the watch. */
+static void TalkTestWalkStart(::Character* npc, unsigned int nuid, int nk, const char* nn, ::Character* walker, unsigned int wuid, int wk,
+                              const char* wn, const Ogre::Vector3& wpos)
+{
+    if (!net::IsUidMine(wuid)) { TalkTestSkip("walk: the target (the one who walks) is not this game's own character"); return; }
+    if (g_talkTestEvent != 1) { TalkTestSkip("walk: the engine's own Talk order sends event 1 only"); return; }
+    if (g_base == 0 || kS6AddOrderRva == 0 || kS6AddOrderArgRva == 0) { TalkTestSkip("walk: issueOrder is not in this game's address table"); return; }
+    char b[700], wb[200];
+    if (g_ttWalk.on)
+    {
+        g_ttWalk.on = 0;
+        std::sprintf(b, "[TALK] talktest walk: the watch of npc uid=%u is REPLACED by a new walk", g_ttWalk.npcUid);
+        DebugLog(std::string(b));
+    }
+    int ty = -1; void* bl = 0; void* in = 0; void* ld = 0;
+    const int r = TkOrdWhere(npc, &ty, &bl, &in, &ld);
+    TkOrdWhereStr(r, ty, bl, in, ld, wb);
+    Ogre::Vector3 np;
+    float d = -1.0f;
+    if (SafeReadPosition(npc, &np)) { const float dx = np.x - wpos.x, dz = np.z - wpos.z; d = sqrtf(dx * dx + dz * dz); }
+    const int ok = TtWalkOrderPod(walker, npc);
+    ++g_talkTestRan;
+    if (!ok) ++g_talkTestFaulted;
+    std::sprintf(b, "[TALK] talktest walk %s: walker uid=%u %s '%s' -> npc uid=%u %s '%s' dist=%.1f (issueOrder PLAYER_TALK_TO 12 playerOrder=1"
+                 " replace=1: the engine's own Talk order; its arrival sends event 1 itself) the NPC's place now %s host=%d%s",
+                 ok ? "ORDERED" : "FAULTED", wuid, coopsay::TalkTargetName(wk), wn, nuid, coopsay::TalkTargetName(nk), nn, d, wb,
+                 net::SessionIsHost() ? 1 : 0, ok ? " - watching it for up to 30 s" : "");
+    DebugLog(std::string(b));
+    if (!ok) return;
+    const DWORD now = ::GetTickCount();
+    g_ttWalk.on = 1; g_ttWalk.npcUid = nuid; g_ttWalk.walkerUid = wuid; g_ttWalk.startMs = now; g_ttWalk.lastMs = now;
+}
+
+/* talktest ... walk: every 250 ms at the K2 safe point while a walk runs, the NPC's "where are you?" answer (TkOrdWhere); one line
+   when it passes the indoors test (LOADED), when 30 s pass (TIMEOUT), or when the world or the NPC goes (ENDED). MAIN THREAD. */
+static void TalkTestWalkTick()
+{
+    if (!g_ttWalk.on) return;
+    const DWORD now = ::GetTickCount();
+    if ((DWORD)(now - g_ttWalk.lastMs) < kTtWalkPeriodMs) return;
+    g_ttWalk.lastMs = now;
+    const unsigned long waited = (unsigned long)(DWORD)(now - g_ttWalk.startMs);
+    char b[400], wb[200];
+    if (EngineWritesBlocked() || coop::GameWorldPtr() == 0)
+    {
+        g_ttWalk.on = 0;
+        std::sprintf(b, "[TALK] talktest walk ENDED after %lu ms: the world is gone, loading or tearing down", waited);
+        DebugLog(std::string(b));
+        return;
+    }
+    ::Character* const npc = FindSpawned(g_ttWalk.npcUid);
+    if (npc == 0 || SayPlausiblePtr(npc) == 0)
+    {
+        g_ttWalk.on = 0;
+        std::sprintf(b, "[TALK] talktest walk ENDED after %lu ms: npc uid=%u is not here any more", waited, g_ttWalk.npcUid);
+        DebugLog(std::string(b));
+        return;
+    }
+    int ty = -1; void* bl = 0; void* in = 0; void* ld = 0;
+    const int r = TkOrdWhere(npc, &ty, &bl, &in, &ld);
+    if (r != 0 && waited < kTtWalkWaitMs) return;
+    g_ttWalk.on = 0;
+    TkOrdWhereStr(r, ty, bl, in, ld, wb);
+    if (r == 0)
+        std::sprintf(b, "[TALK] talktest walk LOADED after %lu ms: npc uid=%u walker uid=%u %s - the indoors test passes for event 1 now",
+                     waited, g_ttWalk.npcUid, g_ttWalk.walkerUid, wb);
+    else
+        std::sprintf(b, "[TALK] talktest walk TIMEOUT after %lu ms (30 s): npc uid=%u walker uid=%u %s - the NPC's place still refuses",
+                     waited, g_ttWalk.npcUid, g_ttWalk.walkerUid, wb);
+    DebugLog(std::string(b));
+}
+
+/* T-980: where a character stands as Dialogue::sendEvent's building test reads it (decomp_683f00:77-84): the hand type at +0x88
+   (0 = a building), the building (hand::asBuilding of the hand at +0x80), its inside (+0x1F0) and the inside's switched-on field
+   (+0x10). -1 / 0 = not read. No C++ object (C2712). */
+static void FreedPlaceOf(void* c, int* type, void** bld, void** inside, void** on)
+{
+    *type = -1; *bld = 0; *inside = 0; *on = 0;
+    if (c == 0 || SayPlausiblePtr(c) == 0) return;
+    __try
+    {
+        *type = *(const int*)((const char*)c + 0x88);
+        if (*type != 0) return;
+        *bld = (void*)((const ::hand*)((const char*)c + 0x80))->asBuilding();
+        if (*bld == 0) return;
+        *inside = *(void* const*)((const char*)*bld + 0x1F0);
+        if (*inside == 0) return;
+        *on = *(void* const*)((const char*)*inside + 0x10);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *type = -1; }
+}
+
+/* T-980, the prisoner's owner, MAIN THREAD at the K2 safe point (spawn.cpp FreedInDrain): the unlock event 0xD raised on this game's
+   own prisoner with this game's copy of the freeing player's character as the freer, through the engine's own entry (hooked, so it
+   is noted like any engine call), so this game's engine picks the prisoner's line from the prisoner's real state. The engine refuses
+   the event when the prisoner stands in a building whose inside is not switched on; the line names the place so such a refusal can
+   be told apart. 1 the engine took the event, 0 it refused it, -1 the call faulted, -2 no Dialogue, -3 not in the address table.
+   locks (for the line): the freed message's lock byte - the locks the freer's game read open, 1 shackles, 2 cage. */
+int FreedRaiseEvent(void* prisoner, void* freer, unsigned int prisonerUid, unsigned int freerUid, int locks)
+{
+    int rc = -3;
+    if (kDialogueSendEventRva != 0 && g_base != 0)
+    {
+        void* const dlg = TalkDialogueOf((::Character*)prisoner);
+        if (dlg == 0) rc = -2;
+        else
+        {
+            int res = 0;
+            rc = (TalkSendPod((SendEventFn)(g_base + (uintptr_t)kDialogueSendEventRva), dlg, freer, cooprison::kPrisonEvUnlock, &res) == 1) ? res : -1;
+        }
+    }
+    int type = -1; void* bld = 0; void* inside = 0; void* on = 0;
+    FreedPlaceOf(prisoner, &type, &bld, &inside, &on);
+    const char* const what = (rc == 1) ? "taken by the engine" : (rc == 0) ? "REFUSED by the engine" : (rc == -1) ? "FAULT in the engine's call"
+                           : (rc == -2) ? "NOT raised: no Dialogue" : "NOT raised: Dialogue::sendEvent not in the address table";
+    char b[400];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, "[PRISON] freed raise ev=0xD uid=%u freer=%u result=%d (%s) place[type,building,inside,on]=%d,%p,%p,%p readOpen[shackles,cage]=%d,%d",
+                prisonerUid, freerUid, rc, what, type, bld, inside, on, locks & 1, (locks >> 1) & 1);
+    if (rc == 1) DebugLog(std::string(b)); else ErrorLog(std::string(b));
+    return rc;
+}
+
+/* T-980: the freer's game's counters for the [PRISON] REPORT (spawn.cpp RestraintReportToken). MAIN THREAD. */
+std::string FreedSendReportToken()
+{
+    char b[200];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, " freedOut[noted,sent,sendFailed,stale,blocked,ringLost]=%lld,%lld,%lld,%lld,%lld,%lld",
+                (long long)g_freedNoted, g_freedSent, g_freedSendFailed, g_freedStale, g_freedBlocked, g_freedLostLogged);
+    return std::string(b);
+}
+
+/* T-978 two starts in one frame: a conversation whose window open was refused (OwRefuseOpen) ends here the engine's own way - the
+   hooked endDialogue entry, as the window guard ends one - while its owner is live, it is still in a conversation and the window
+   does not show it. Re-check 2026-11-03: only while it is still THAT conversation - not forwarded (no mark) and its target hand
+   still names the refused target; if the refused one finished and the NPC started another before this point, the new one is left
+   alone (counted openEndNewer). MAIN THREAD, at the K2 safe point (the AI worker paused); a blocked world forgets them. */
+static void OwEndLaterDrain()
+{
+    for (int k = 0; k < kOwEndLaterSlots; ++k)
+    {
+        void* const dlg = g_owEndLater[k].dlg;
+        void* const me = g_owEndLater[k].me;
+        if (dlg == 0) continue;
+        unsigned int tgt[5], now[5];
+        for (int w = 0; w < 5; ++w) tgt[w] = g_owEndLater[k].tgt[w];
+        g_owEndLater[k].dlg = 0; g_owEndLater[k].me = 0;
+        if (EngineWritesBlocked() || kTkEndDialogueRva == 0 || g_base == 0) continue;
+        if (TkWindowDlg() == dlg || !TkLiveOwner(dlg, me) || !TkDlgBusy(dlg)) continue;   /* shown now, gone, or ended on its own */
+        int same = TkHandWordsPod(dlg, kDlgTargetHand, now);
+        for (int w = 0; w < 5; ++w) if (now[w] != tgt[w]) same = 0;
+        if (tgt[3] == 0 && tgt[4] == 0) same = 0;   /* the refused target's hand was never read: it cannot be told */
+        if (TkMarkFind(dlg) >= 0 || !same)
+        { ++g_owOpenEndNewer; continue; }   /* re-check 2026-11-03: the NPC is in a newer conversation - not ended */
+        if (TkEndEntryPod((TkEndDialogueFn)(g_base + (uintptr_t)kTkEndDialogueRva), dlg)) ++g_owOpenEnded;
+    }
+}
+
+/* T-978 B2's queue (owner 1445 a; src/common/talkonewin.h): the newest talk refused while the window showed another conversation is
+   sent again through the engine's own talk event (Dialogue::sendEvent(npc, player character, 1), as a walk-over's arrival sends it)
+   once the window is empty - while both characters are here (re-found by their replicated ids; the NPC alive and conscious), the NPC
+   is still run by the game that ran it at the refusal, it is not in a conversation, and the window emptied under 30 s ago (review
+   2026-11-03: the 30 s count from the window closing, so a conversation of any length waits); otherwise it waits, or is dropped. A
+   walk-over's parked line is put back on the NPC's Dialogue first (sendEvent starts with it, as the refused start did), unless the
+   engine parked a newer one. The engine's own checks (its distance gate) still apply. MAIN THREAD, at the K2 safe point (the AI
+   worker paused). */
+static void TalkOneWinDrain()
+{
+    OwEndLaterDrain();
+    talkonewin::Queued q;
+    if (!OwQueueRead(&q, 0)) return;
+    if (EngineWritesBlocked() || kDialogueSendEventRva == 0 || g_base == 0) { if (OwQueueRead(0, &q)) ++g_owDropBlocked; return; }
+    void* const npc = (q.npcUid != 0) ? (void*)FindSpawned(q.npcUid) : (void*)q.npc;
+    void* const who = (q.whoUid != 0) ? (void*)FindSpawned(q.whoUid) : (void*)q.who;
+    const int npcHere = (npc != 0 && TkLiveChar(npc) && CrimeIsDead((::Character*)npc) == 0 && TkKnockedOutOrDeadPod(npc) == 0) ? 1 : 0;
+    void* const ndlg = npcHere ? TkDialogueOf(npc) : 0;
+    const int whoHere = (who != 0 && TkLiveChar(who) && CrimeIsDead((::Character*)who) == 0 && TkOrderIsMine(who)) ? 1 : 0;
+    const int busy = (ndlg != 0 && (TkDlgBusy(ndlg) || TkMarkFind(ndlg) >= 0)) ? 1 : 0;
+    const int same = talkonewin::OwnerSame(q.npcUid, q.npcMine, (q.npcUid != 0 && net::IsUidMine(q.npcUid)) ? 1 : 0);
+    const int empty = (TkWindowDlg() == 0) ? 1 : 0;
+    const unsigned int now = (unsigned int)::GetTickCount();
+    const unsigned int em = talkonewin::EmptySince(q.emptyMs, empty, now);
+    if (em != q.emptyMs) { OwQueueSetEmpty(&q, em); q.emptyMs = em; }
+    const int step = talkonewin::ResendStep(1, now, em, empty, (npcHere && ndlg != 0) ? 1 : 0, whoHere, busy, same);
+    if (step == talkonewin::kResendWait) return;
+    if (!OwQueueRead(0, &q)) return;   /* a newer refusal replaced it meanwhile: that one is judged at the next safe point */
+    char nn[48], wn[48];
+    TalkName(npcHere ? (::Character*)npc : 0, nn);
+    TalkName(whoHere ? (::Character*)who : 0, wn);
+    char b[480];
+    const double ago = (double)(unsigned int)(now - q.ms) / 1000.0;
+    const double emptyFor = (em != 0) ? (double)(unsigned int)(now - em) / 1000.0 : 0.0;
+    if (step != talkonewin::kResendNow)
+    {
+        if (step == talkonewin::kResendDropOld) ++g_owDropOld; else if (step == talkonewin::kResendDropOwner) ++g_owDropOwner; else ++g_owDropGone;
+        std::sprintf(b, "[TALK] T-978: a talk refused while the window showed another conversation is dropped (npc '%s' uid %u -> '%s', refused %.1f s ago): %s",
+                     nn, q.npcUid, wn, ago, step == talkonewin::kResendDropOld ? "the window has been empty 30 s or more"
+                     : step == talkonewin::kResendDropOwner ? "the NPC changed hands since (the other game runs it now, or this one does)"
+                     : "a character of it is gone, dead or knocked out");
+    }
+    else
+    {
+        const int ls = talkonewin::ParkedLineStep(q.line, SayReadPtr(ndlg, kDlgParkedLine));
+        int put = 0;
+        if (ls == talkonewin::kLinePutBack) { put = SayWritePtr(ndlg, kDlgParkedLine, const_cast<void*>(q.line)); if (put) ++g_owLinePutBack; }
+        else if (ls == talkonewin::kLineNewer) ++g_owLineNewer;
+        int res = 0;
+        const int called = TalkSendPod((SendEventFn)(g_base + (uintptr_t)kDialogueSendEventRva), ndlg, who, 1, &res);
+        g_talkCurEvent = -1;   /* a fault inside would have skipped detour_sendEvent's restore */
+        const int opened = (called && TkWindowDlg() == ndlg) ? 1 : 0;
+        ++g_owResent;
+        if (opened) ++g_owResentOpened;
+        std::sprintf(b, "[TALK] T-978: a talk refused while the window showed another conversation is sent again (npc '%s' uid %u -> '%s', refused %.1f s ago,"
+                     " the window empty %.1f s; line=%s): sendEvent=%s window=%s", nn, q.npcUid, wn, ago, emptyFor,
+                     ls == talkonewin::kLineNone ? "the engine's own choice" : ls == talkonewin::kLineNewer ? "a newer parked line (left)"
+                     : ls == talkonewin::kLineThere ? "its parked line (still parked)" : (put ? "its parked line (put back)" : "its parked line (the write FAULTED)"),
+                     called ? (res ? "true" : "false") : "FAULTED", opened ? "opened" : "not opened (the engine's own checks)");
+    }
+    if (++g_owLogged <= 40) DebugLog(std::string(b));
+}
+
+static std::string TalkOneWinCountsString()
+{
+    char b[640];
+    std::sprintf(b, " talkOneWin[refused,refusedOrder,queued,queueReplaced,resent,resentOpened,dropOld,dropGone,dropBlocked,skipText,skipReplies,skipClear]="
+                 "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld talkOneWinHooks=clear:%s",
+                 (long long)g_owRefused, (long long)g_owRefusedOrder, (long long)g_owQueued, (long long)g_owQueueReplaced, g_owResent,
+                 g_owResentOpened, g_owDropOld, g_owDropGone, g_owDropBlocked, (long long)g_owSkipText, (long long)g_owSkipReplies,
+                 (long long)g_owSkipClear, TalkHookState(g_clearResponsesGuiHook));
+    char d[1000];   /* T-978 D (talkHeldClick) and A (talkFreeze; why = talkonewin::kFrz*, rel = talkonewin::kRel* in order) */
+    std::sprintf(d, ",step:%s talkHeldClick[armed,dropped,disarmed,disarmedUp,stepOffMain]=%lld,%lld,%lld,%lld,%lld"
+                 " talkFreeze[frozen,notLinked,offMain,notShown,noNpc,notMine,player,alreadyHeld,alreadyFrozen,gateRefused]="
+                 "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " talkFreezeRel[windowClosed,ended,replaced,destroyed,linkDropped,teardown,windowMoved,freed,forgot,askedOffMain]="
+                 "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld frozenNow=%d",
+                 TalkHookState(g_dlgWinStepHook), g_owHeldArmed, g_owHeldDropped, g_owHeldDisarmed, g_owHeldDisarmedUp, (long long)g_owHeldStepOff,
+                 (long long)g_frzWhy[talkonewin::kFrzFreeze], (long long)g_frzWhy[talkonewin::kFrzNotLinked], (long long)g_frzWhy[talkonewin::kFrzOffMain],
+                 (long long)g_frzWhy[talkonewin::kFrzNotShown], (long long)g_frzWhy[talkonewin::kFrzNoNpc], (long long)g_frzWhy[talkonewin::kFrzNotMine],
+                 (long long)g_frzWhy[talkonewin::kFrzPlayer], (long long)g_frzWhy[talkonewin::kFrzAlreadyHeld],
+                 (long long)g_frzWhy[talkonewin::kFrzAlreadyFrozen], g_frzGateRefused,
+                 g_frzRel[talkonewin::kRelSetInDialogOff], g_frzRel[talkonewin::kRelEndDialogue], g_frzRel[talkonewin::kRelReplaced],
+                 g_frzRel[talkonewin::kRelDestroyed], g_frzRel[talkonewin::kRelLinkDropped], g_frzRel[talkonewin::kRelTeardown],
+                 g_frzRel[talkonewin::kRelWindowMoved], g_frzFreed, g_frzForgot, (long long)g_frzAskOff, g_frz.set ? 1 : 0);
+    int fwdNow = 0;
+    for (int k = 0; k < kFrzFwdSlots; ++k) if (g_frzFwd[k].set) ++fwdNow;
+    char e[700];   /* review 2026-11-03: the fold's counters (talkOneWin2; talkFreezeFwd: why = talkonewin::kFrz* in order) */
+    std::sprintf(e, " talkOneWin2[dropOwner,linePutBack,lineNewer,openRefused,openEnded,openEndFull,skipPortrait,openEndNewer]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " talkFreezeFwd[frozen,notLinked,offMain,notOpen,noNpc,notMine,player,alreadyHeld,alreadyFrozen,full,gateRefused,fwdEnded,backstop,freed,forgot]="
+                 "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld fwdFrozenNow=%d",
+                 g_owDropOwner, g_owLinePutBack, g_owLineNewer, g_owOpenRefused, g_owOpenEnded, g_owOpenEndFull, (long long)g_owSkipPortrait, g_owOpenEndNewer,
+                 (long long)g_fwdWhy[talkonewin::kFrzFreeze], (long long)g_fwdWhy[talkonewin::kFrzNotLinked], (long long)g_fwdWhy[talkonewin::kFrzOffMain],
+                 (long long)g_fwdWhy[talkonewin::kFrzNotShown], (long long)g_fwdWhy[talkonewin::kFrzNoNpc], (long long)g_fwdWhy[talkonewin::kFrzNotMine],
+                 (long long)g_fwdWhy[talkonewin::kFrzPlayer], (long long)g_fwdWhy[talkonewin::kFrzAlreadyHeld],
+                 (long long)g_fwdWhy[talkonewin::kFrzAlreadyFrozen], g_fwdFull, g_fwdGateRefused, g_frzRel[talkonewin::kRelFwdEnded], g_fwdBackstop,
+                 g_fwdFreed, g_fwdForgot, fwdNow);
+    int bhNow = g_bhWin.set ? 1 : 0;
+    for (int k = 0; k < kFrzFwdSlots; ++k) if (g_bhFwd[k].set) ++bhNow;
+    char f[400];   /* T-978 BUBBLE: holds begun (a first write) and timer writes, for the window and the forwarded conversations */
+    std::sprintf(f, " talkBubbleHold[windowHeld,windowWrites,fwdHeld,fwdWrites,fwdFull,readFail,writeFail]=%lld,%lld,%lld,%lld,%lld,%lld,%lld bubbleSlotsNow=%d",
+                 g_bhWinHeld, g_bhWinWrites, g_bhFwdHeld, g_bhFwdWrites, g_bhFwdFull, g_bhReadFail, g_bhWriteFail, bhNow);
+    return std::string(b) + d + e + f;
+}
+
+#ifdef SW_DEV_BUILD
+/* T-978 TEST-ONLY lever npcsay (DEV build, owner 1463 a): `npcsay <Name>[#k] [| <text>]` - the NPC named <Name> that THIS game runs
+   (LeverNearestNamed, kLeverPickOwnLiving: this game's own, living, non-player, with a uid, within kNpcSayNear of this game's first
+   own player character; `#k` = the k-th nearest) says one line as a speech bubble at the next K2 safe point, through the engine's own
+   Dialogue::say (row DialogueSay, Steam_1.0.65 0x67F2F0 / 1.0.68 0x67FD80 - the call that shows an NPC's ambient lines). It is
+   called at its entry, so detour_say treats it as the NPC's own line: shown here and sent to the other game as MSG_SAY, as any line
+   this game's NPC says (no new message). The text defaults to kNpcSayDefault. It lets a run put a bubble on an NPC while a
+   conversation window is open on it (this game's own, or the other player's forwarded one) - the premise of the T-978 bubble hold.
+   One [TALK] T-978 npcsay line per arm and per say (cap kNpcSayLogCap). MAIN THREAD. */
+namespace {
+const float kNpcSayNear = 5000.0f;
+const size_t kNpcSayMaxText = 200;
+const char* const kNpcSayDefault = "Test line.";
+const long long kNpcSayLogCap = 60;
+unsigned int g_npcSayUid = 0;   /* armed by the verb, said at the next K2 safe point (NpcSayDrain); 0 = none. MAIN THREAD */
+std::string g_npcSayText;
+long long g_npcSayArmed = 0, g_npcSaid = 0, g_npcSayRefused = 0, g_npcSayLogged = 0;
+
+void NpcSayLog(const std::string& s) { if (++g_npcSayLogged <= kNpcSayLogCap) DebugLog(s); }
+
+/* the engine's own say at its entry (through the hook, so detour_say classifies the line); 1 called, 0 faulted. No C++ object
+   (C2712). */
+int NpcSayCallPod(void* dlg, const std::string* text)
+{
+    __try
+    {
+        ((SayFn)(g_base + (uintptr_t)kDialogueSayRva))(dlg, *text, 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+}   /* anonymous namespace */
+
+std::string NpcSayArm(const std::string& arg)
+{
+    std::string namePart = arg, text;
+    const size_t bar = arg.find('|');
+    if (bar != std::string::npos)
+    {
+        namePart = arg.substr(0, bar);
+        text = arg.substr(bar + 1);
+        while (!text.empty() && (text[0] == ' ' || text[0] == '\t')) text.erase(0, 1);
+        while (!text.empty() && (text[text.size() - 1] == ' ' || text[text.size() - 1] == '\t')) text.erase(text.size() - 1);
+        if (text.empty()) { ++g_npcSayRefused; return "error npcsay usage: npcsay <Name>[#k] [| <text>] - the text after '|' is empty"; }
+    }
+    if (text.empty()) text = kNpcSayDefault;
+    if (text.size() > kNpcSayMaxText) { ++g_npcSayRefused; return "error npcsay: the text is longer than 200 characters"; }
+    const std::string nameKey = coopsay::TalkPersonKey(namePart);
+    if (nameKey.empty()) { ++g_npcSayRefused; return "error npcsay usage: npcsay <Name>[#k] [| <text>]"; }
+    if (kDialogueSayRva == 0 || g_base == 0)
+    {
+        ++g_npcSayRefused;
+        NpcSayLog("[TALK] T-978 npcsay refused (TEST-ONLY): Dialogue::say has no address row");
+        return "error npcsay: Dialogue::say has no address row";
+    }
+    unsigned int nu = 0;
+    float nd = -1.0f;
+    std::string nn, why;
+    if (LeverNearestNamed(nameKey, kLeverPickOwnLiving, 0, kNpcSayNear, &nu, &nd, &nn, &why) == 0)
+    {
+        ++g_npcSayRefused;
+        NpcSayLog("[TALK] T-978 npcsay refused (TEST-ONLY): name '" + nameKey + "': " + why);
+        return "error npcsay: " + why;
+    }
+    const unsigned int was = g_npcSayUid;
+    g_npcSayUid = nu;
+    g_npcSayText = text;
+    ++g_npcSayArmed;
+    char b[360];
+    std::sprintf(b, "[TALK] T-978 npcsay armed (TEST-ONLY): npc uid=%u '%.40s' name '%.40s' dist=%.0f, %u chars%s - said at the next safe point",
+                 nu, nn.c_str(), nameKey.c_str(), (double)nd, (unsigned int)text.size(), was != 0 ? " (replaces an armed line not said yet)" : "");
+    NpcSayLog(std::string(b) + " text='" + text.substr(0, 120) + "'");
+    return "ok npcsay armed npc uid=" + TkU(nu) + " '" + nn + "'";
+}
+
+/* the armed line said, at the K2 safe point (TalkTestDrain, before the bubble hold's tick). MAIN THREAD. */
+static void NpcSayDrain()
+{
+    if (g_npcSayUid == 0) return;
+    const unsigned int u = g_npcSayUid;
+    g_npcSayUid = 0;
+    std::string why;
+    ::Character* c = 0;
+    void* dlg = 0;
+    if (EngineWritesBlocked()) why = "engine writes are blocked (world loading or tearing down)";
+    else if (kDialogueSayRva == 0 || g_base == 0) why = "Dialogue::say has no address row";
+    else if ((c = FindSpawned(u)) == 0 || !TkLiveChar(c)) why = "it is not a loaded character any more";
+    else if (!net::IsUidMine(u)) why = "this game no longer runs it";
+    else
+    {
+        dlg = SayReadPtr(c, kCharDialogue);
+        if (dlg == 0 || SayPlausiblePtr(dlg) == 0 || SayReadPtr(dlg, kDlgMe) != (void*)c) { dlg = 0; why = "its Dialogue does not read"; }
+    }
+    if (dlg == 0)
+    {
+        ++g_npcSayRefused;
+        NpcSayLog("[TALK] T-978 npcsay NOT said (TEST-ONLY): npc uid=" + TkU(u) + " - " + why);
+        return;
+    }
+    const int fwd = (g_tkConvs.find(dlg) != g_tkConvs.end()) ? 1 : 0;
+    const int shown = (TkWindowDlg() == dlg) ? 1 : 0;
+    const int ev = TkReadIntPod(dlg, kDlgConvEvent);
+    const int ok = NpcSayCallPod(dlg, &g_npcSayText);
+    if (ok) ++g_npcSaid; else ++g_npcSayRefused;
+    const int bubble = (SayReadPtr(dlg, kDlgBubble) != 0) ? 1 : 0;
+    const int parked = (SayReadPtr(dlg, kDlgParkedLen) != 0) ? 1 : 0;
+    float t = 0.0f;
+    char tb[32];
+    if (OwBubbleTimerPod(dlg, &t, 0)) std::sprintf(tb, "%.2f s", (double)t);
+    else std::strcpy(tb, "unreadable");
+    char nn[48];
+    TalkName(c, nn);
+    char b[640];
+    std::sprintf(b, "[TALK] T-978 npcsay %s (TEST-ONLY): '%s' (uid %u) - the engine's own Dialogue::say, %u chars; after it bubble=%d"
+                 " timer=%s parked=%d; its conversation (event %d): forwarded to the other player's window=%d, this game's window shows"
+                 " it=%d; npcSay[armed,said,refused]=%lld,%lld,%lld",
+                 ok ? "said" : "FAULTED", nn, u, (unsigned int)g_npcSayText.size(), bubble, tb, parked, ev, fwd, shown,
+                 g_npcSayArmed, g_npcSaid, g_npcSayRefused);
+    NpcSayLog(std::string(b) + " text='" + g_npcSayText.substr(0, 120) + "'");
+}
+#endif
+
 void TalkTestDrain()
 {
     DlgWinGuard();     /* T-831: a shown conversation with a removed character ends before the window's next update calls through it */
+    TradeWinGuard();   /* T-1230: an open trade window whose trader is gone closes before its next update calls through it */
     PortraitDrain();   /* T-804: the portrait refreshes held since the last safe point, before anything below changes the window */
     OffMainActsDrain();   /* log-only: window-opening actions run off the main thread */
     TalkOffDrain();   /* P26 stage 0 fold 1: the off-thread starts, every K2 safe point */
+    FreedSendDrain();   /* T-980: a copy's unlock event, freed by this game's character, to the prisoner's owner */
     CopyOwnEndDrain();   /* T-719: a copy's own conversation ends here (before an arrived PROMPT looks at its Dialogue) */
     TalkCursorDrain();   /* T-737: the talk cursor's preloads and queued ASKs (it tests teardown and a blocked world itself) */
     TkSafePoint();    /* P26 stages 1-3: every K2 safe point */
     TalkOrderDrain();   /* T-726: this game's player's talk orders (after TkP25Drain, so a click sent as a REQUEST names its req) */
     TalkSightTick();  /* P26 stage 6 talksight: one try per K2 safe point while armed */
     TkArrWatchTick(); /* P26s6 arrival probe: the leader's walk and the event-1 arrival */
+    TalkTestWalkTick();   /* talktest ... walk: the NPC's place while the walker goes */
+    TalkOneWinDrain();   /* T-978 B2: the newest talk refused while the window was busy, sent again once it is empty */
+    OwFrzDrain();   /* T-978 A: an off-main end road's ask, the link gone, the window moved on */
+#ifdef SW_DEV_BUILD
+    NpcSayDrain();   /* T-978 TEST-ONLY npcsay: the armed line said before the hold's tick, so a forwarded or shown conversation's hold takes it at once */
+#endif
+    OwBubbleHoldTick();   /* T-978 BUBBLE: a bubble said before the window opened does not end its conversation */
     if (::InterlockedExchange(&g_talkTestPending, 0) == 0) return;
     if (EngineWritesBlocked()) { TalkTestSkip("engine writes are blocked (world loading or tearing down)"); return; }
     if (kDialogueSendEventRva == 0 || g_base == 0) { TalkTestSkip("DialogueSendEvent is not in the address table"); return; }
@@ -7468,6 +10457,7 @@ void TalkTestDrain()
     char nn[48], tn[48];
     TalkName(npc, nn);
     TalkName(target, tn);
+    if (g_talkTestWalk) { g_talkTestWalk = 0; TalkTestWalkStart(npc, nuid, nk, nn, target, tuid, tk, tn, tpos); return; }   /* the engine's Talk order, no sendEvent here */
     const long long s0 = g_talkStarted, p0 = g_talkPlayerStarts, w0 = g_talkWindow, c0 = g_talkCalls;
     const SendEventFn fn = (SendEventFn)(g_base + (uintptr_t)kDialogueSendEventRva);   /* the engine's entry (hooked: counted like any call) */
     { char p114[2048]; P114GateLine(dlg, npc, target, nuid, (int)g_talkTestEvent, p114); DebugLog(std::string(p114)); }   /* PROBE P114 */
@@ -7535,7 +10525,11 @@ static std::string TalkOffCountsString()
 //   TalkHoverScope) and only for an
 //   NPC whose click would become a P25 REQUEST (the road on; another game drives it; not a player's character; a talker of this game's
 //   own player faction with a uid - otherwise the click runs here and the engine's own answer stands, localKept):
-//   - it never talks now (no event-1 list, dead, a player faction - 0x679FC0's own tests, read): false, nothing sent (filteredNever);
+//   - it never talks now (dead, a player faction - 0x679FC0's own tests, read on the copy): false, nothing sent (filteredNever).
+//     T-1077: the copy's own event-1 list is NOT a refusal here (cooptalk::TalkCursorCopyMayAsk) - the engine hands a new
+//     character its dialogue set by birth order in its squad, and copies are built in spawn-message order, so a trader's copy can
+//     lack the greeting list the trader has on its own game; that game answers from its own NPC. (The preload below still asks
+//     only for copies that have the list - the hover asks for the rest.)
 //   - the talker is the speaker the engine itself picks: 0x679FC0 runs with a capture set, and its _chooseDialog call 0x679630 hands
 //     the speaker back and picks nothing; a copy holding a parked line answers before that pick - then the talker the last hover
 //     used (else the first own player-faction character) is asked about;
@@ -7633,6 +10627,193 @@ int TcChoosePod(void* dlg, void* list, void* who, void** line)
     __except (EXCEPTION_EXECUTE_HANDLER) { *line = 0; return 0; }
 }
 
+/* T-980: THE LINE A CAGED PRISONER THIS GAME DRIVES HAS FOR ANOTHER PLAYER'S CHARACTER. A line can name the factions it is for
+   (DialogLineData +0x80 count, +0x88 list): _chooseDialog gives it +2 when the listener's faction is listed (0x671120), and the line
+   test 0x6784A0 refuses it unless the listener's own faction, or that of a squad mate the NPC can see, is listed (decomp_6784a0). A
+   recruit-the-prisoner line is for the player's faction; the other player's character here is in its stand-in faction, so the pick
+   for it finds nothing. Then the pick is made once more with this game's own player character nearest the NPC as the listener, for
+   that faction test only: every condition the engine asks about it is asked about the character actually talking
+   (detour_s6CheckCond, g_tcSub*), and the line found is kept only when it is one of the list's own lines and nothing else in it
+   reads the listener (TcInTopListPod, TcLineListenerReadsPod). The re-pick is made only for the talk cursor's question or for a
+   conversation this game passes on to the other game (TcConvPassedOn), never when a line in the list or in a list nested under one
+   names the listener's squad mates (TcListSquadReadsPod), and never with a knocked-out or dead stand-in. The line is then said to
+   the talker as any other (the P25 / P26 road). Ported from the third public pull
+   request (eb042a1) by MassDivide, with the listener fixed: there, the whole pick read this game's nearest character. MAIN THREAD
+   (MirrorSlot); any other case returns the first pick. */
+long long g_tcSubTried = 0, g_tcSubPicked = 0, g_tcSubNoStandIn = 0, g_tcSubLineRefused = 0;   /* MAIN THREAD */
+long long g_tcSubNotForwarded = 0, g_tcSubSquadSkip = 0;   /* MAIN THREAD: not made - a conversation not passed on / a squad-mate line */
+
+/* 1 = the line reads the listener past its faction (decomp_6784a0): +0xF8 the characters it is for (the listener's vt+0x58), +0x158
+   and +0x1B0 / +0x1C0 the listener's squad mates, +0x1E4 > 0 a value of the listener's own (+0x1A0 -> +0xDC); 0 none; -1 unreadable.
+   No C++ object. */
+static int TcLineListenerReadsPod(const void* line)
+{
+    if (line == 0) return -1;
+    __try
+    {
+        const char* const p = (const char*)line;
+        return cooptalk::TalkCagedListenerReads(*(const unsigned long long*)(p + 0xF8), *(const int*)(p + 0x158), *(const int*)(p + 0x1B0),
+                                                *(const int*)(p + 0x1C0), *(const int*)(p + 0x1E4));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* A line list as _chooseDialog walks it (decomp_679630): +0x8 the count (unsigned), +0x10 the line pointers; a line's +0x1E8 is the
+   list nested under it, searched with the same listener once the line passed (decomp_679630:117). */
+const size_t kTcListCount = 0x8, kTcListLines = 0x10, kTcLineNested = 0x1E8;
+const int kTcWalkDepth = 16, kTcWalkLines = 4096;
+
+/* 1 = a line in list, or in a list nested under one of its lines (any depth), names the listener's squad mates
+   (cooptalk::TalkCagedSquadReads); 0 none; -1 unreadable, nested deeper than kTcWalkDepth or more than kTcWalkLines lines in all
+   (*budget counts them down). No C++ object. */
+static int TcListSquadReadsPod(const void* list, int depth, int* budget)
+{
+    if (list == 0) return 0;
+    if (depth > kTcWalkDepth) return -1;
+    __try
+    {
+        const char* const l = (const char*)list;
+        const unsigned int n = *(const unsigned int*)(l + kTcListCount);
+        const char* const* const a = *(const char* const* const*)(l + kTcListLines);
+        if (n != 0 && a == 0) return -1;
+        for (unsigned int i = 0; i < n; ++i)
+        {
+            if (--*budget < 0) return -1;
+            const char* const p = a[i];
+            if (p == 0) continue;
+            if (cooptalk::TalkCagedSquadReads(*(const int*)(p + 0x158), *(const int*)(p + 0x1B0), *(const int*)(p + 0x1C0), *(const int*)(p + 0x80)) == 1) return 1;
+            const int r = TcListSquadReadsPod(*(const void* const*)(p + kTcLineNested), depth + 1, budget);
+            if (r != 0) return r;
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* 1 = line is one of list's own lines, not one from a list nested under a line (whose parent passed the engine's test with the
+   stand-in as the listener); 0 not; -1 unreadable. No C++ object. */
+static int TcInTopListPod(const void* list, const void* line)
+{
+    if (list == 0 || line == 0) return -1;
+    __try
+    {
+        const char* const l = (const char*)list;
+        const unsigned int n = *(const unsigned int*)(l + kTcListCount);
+        const void* const* const a = *(const void* const* const*)(l + kTcListLines);
+        if (n != 0 && a == 0) return -1;
+        for (unsigned int i = 0; i < n; ++i) if (a[i] == line) return 1;
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* 1 = dlg's conversation with talker is one this game passes on to the other game: its open forwarded conversation (g_tkConvs) is
+   with talker, or dlg is the Dialogue a REQUEST's own start runs on now (g_p25StartDlg; that start is marked and forwarded); 0
+   otherwise - a line found then would run its actions on this game only. MAIN THREAD. */
+static int TcConvPassedOn(void* dlg, void* talker)
+{
+    if (dlg == 0 || talker == 0) return 0;
+    if (dlg == g_p25StartDlg) return 1;
+    std::map<void*, TkConv>::const_iterator it = g_tkConvs.find(dlg);
+    if (it == g_tkConvs.end()) return 0;
+    const unsigned int tu = FindSpawnedUid((::Character*)talker);
+    return (tu != 0 && it->second.targetUid == tu) ? 1 : 0;
+}
+
+/* this game's own character of its player faction nearest pos that is not knocked out or dead (a knocked-out or dead stand-in has
+   no squad for the line test to read), 0 none. MAIN THREAD (MirrorSlot). */
+static ::Character* TcOwnPlayerCharNear(const Ogre::Vector3& pos)
+{
+    ::Faction* const mine = LocalPlayerFaction();
+    if (mine == 0) return 0;
+    ::Character* best = 0;
+    float bd = 0.0f;
+    const int cap = MirrorCapacity();
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int u = 0;
+        ::Character* c = 0;
+        ::Faction* f = 0;
+        if (!MirrorSlot(i, &u, &c) || u == 0 || c == 0 || !net::IsUidMine(u)) continue;
+        if (!CrimeFactionOf(c, &f) || f != mine) continue;
+        if (TkKnockedOutOrDeadPod(c) != 0) continue;   /* down or unreadable */
+        Ogre::Vector3 v;
+        if (!SafeReadPosition(c, &v)) continue;
+        const float dx = v.x - pos.x, dy = v.y - pos.y, dz = v.z - pos.z;
+        const float d = dx * dx + dy * dy + dz * dz;
+        if (best == 0 || d < bd) { best = c; bd = d; }
+    }
+    return best;
+}
+
+/* the one re-pick call inside its listener scope (g_tcSub*, read by detour_s6CheckCond). No C++ object. */
+static void* TcChooseScopedPod(TcChooseFn fn, void* dlg, void* list, void* standIn, void* talker, char flag)
+{
+    void* line = 0;
+    g_tcSubStandIn = standIn;
+    g_tcSubTalker = talker;
+    g_tcSubTid = ::GetCurrentThreadId();
+    __try { line = fn(dlg, list, standIn, flag); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { line = 0; }
+    g_tcSubTid = 0;
+    g_tcSubStandIn = 0;
+    g_tcSubTalker = 0;
+    return line;
+}
+
+/* the pick for talker made once more (see above) when the engine's own pick (first) found nothing; else first. cursorAsk 1 = the
+   talk cursor's question from the other game (a pick only), 0 = the engine's own pick (its line runs here) */
+static void* TcCagedRepick(void* dlg, void* list, void* talker, char flag, void* first, int cursorAsk)
+{
+    if (first != 0 || dlg == 0 || talker == 0 || g_base == 0) return first;
+    const TcChooseFn fn = (orig_tcChoose != 0) ? orig_tcChoose : (kTcChooseRva != 0 ? (TcChooseFn)(g_base + (uintptr_t)kTcChooseRva) : 0);
+    /* read in this order so another thread pays one test */
+    const int onMain = (SayOnMainThread() != 0) ? 1 : 0;
+    const int talkerPeer = (onMain && TkPeerTarget(talker)) ? 1 : 0;
+    void* const npc = talkerPeer ? SayReadPtr(dlg, kDlgMe) : 0;
+    const int npcOwner = (npc != 0) ? TkS6Owner(npc) : 0;
+    ::Faction* nf = 0;
+    const int npcPlayer = (npcOwner == 1) ? ((CrimeFactionOf((::Character*)npc, &nf) && nf != 0) ? (IsPlayerFaction(nf) ? 1 : 0) : 1) : 0;
+    const int inSomething = (npcOwner == 1) ? CrimeInSomethingPod((::Character*)npc) : -1;
+    if (!cooptalk::TalkCagedRepickDecide(0, talkerPeer, onMain, (g_s6CondHook == 1 && fn != 0) ? 1 : 0, g_tcSubTid != 0 ? 1 : 0,
+                                         npcOwner, npcPlayer, inSomething))
+        return first;
+    if (!cooptalk::TalkCagedRepickRoad(cursorAsk, g_tkOn ? 1 : 0, TcConvPassedOn(dlg, talker))) { ++g_tcSubNotForwarded; return first; }
+    Ogre::Vector3 p;
+    if (!SafeReadPosition((::Character*)npc, &p)) return first;
+    ::Character* const standIn = TcOwnPlayerCharNear(p);
+    if (standIn == 0) { ++g_tcSubNoStandIn; return first; }
+    const unsigned int nu = FindSpawnedUid((::Character*)npc), tu = FindSpawnedUid((::Character*)talker);
+    int budget = kTcWalkLines;
+    const int squadReads = TcListSquadReadsPod(list, 0, &budget);
+    if (squadReads != 0)
+    {
+        if (++g_tcSubSquadSkip <= 20)
+            DebugLog("[TALK] caged NPC uid=" + TkU(nu) + ": not picked again for talker uid=" + TkU(tu) + " - "
+                     + (squadReads > 0 ? std::string("a line names the listener's squad mates (its test can add a character to the talker's side)")
+                                       : std::string("the line lists are unreadable or too large"))
+                     + " (#" + TkI(g_tcSubSquadSkip) + ")");
+        return first;
+    }
+    ++g_tcSubTried;
+    void* const line = TcChooseScopedPod(fn, dlg, list, standIn, talker, flag);
+    if (line == 0) return first;
+    const int reads = TcLineListenerReadsPod(line), top = TcInTopListPod(list, line);
+    if (!cooptalk::TalkCagedLineKeep(reads, top))
+    {
+        if (++g_tcSubLineRefused <= 20)
+            DebugLog("[TALK] caged NPC uid=" + TkU(nu) + ": line " + TkLineSid(line) + " found for talker uid=" + TkU(tu) + " - not used: "
+                     + (top != 1 ? std::string("not one of the list's own lines") : std::string("it reads more of the listener than its faction"))
+                     + " (refused #" + TkI(g_tcSubLineRefused) + ")");
+        return first;
+    }
+    if (++g_tcSubPicked <= 20)
+        DebugLog("[TALK] caged NPC uid=" + TkU(nu) + ": line " + TkLineSid(line) + " for talker uid=" + TkU(tu)
+                 + " - its faction test answered as this game's player faction, its conditions asked about the talker (picked #"
+                 + TkI(g_tcSubPicked) + ")");
+    return line;
+}
+
 /* the speaker capture for one 0x679FC0 call on this thread, cleared on every exit */
 struct TcCapScope
 {
@@ -7723,7 +10904,7 @@ bool TcHover(void* dlg, void* npc)
     int hasList = 0, dead = 0, pf = 0;
     void* list = 0;
     if (!TcNeverPod(dlg, npc, &hasList, &list, &dead, &pf)) { ::InterlockedIncrement64(&g_tcLocalKept); return orig_tcCanTalk(dlg); }
-    if (!cooptalk::TalkCursorMayTalk(hasList, dead, pf)) { ++g_tcFilteredNever; return false; }
+    if (!cooptalk::TalkCursorCopyMayAsk(hasList, dead, pf)) { ++g_tcFilteredNever; return false; }   /* T-1077: the copy's list is not asked */
     void* talker = 0;
     const unsigned int tu = TcEngineSpeaker(dlg, &talker) ? TcOwnUid(talker) : TcPreloadTalker();
     if (tu == 0) { ::InterlockedIncrement64(&g_tcLocalKept); return orig_tcCanTalk(dlg); }   /* the click would run here: the engine's own answer */
@@ -7753,7 +10934,8 @@ bool detour_tcCanTalk(void* dlg)
 }
 
 /* _chooseDialog 0x679630 (ANY THREAD): inside a capture on this thread for its Dialogue it hands back the speaker and picks nothing;
-   every other call is the engine's. */
+   every other call is the engine's, made once more by TcCagedRepick (T-980) when it found nothing for another player's character
+   on a caged NPC this game drives. */
 void* detour_tcChoose(void* dlg, void* list, void* speaker, char flag)
 {
     if (g_tcCapTid != 0 && g_tcCapTid == ::GetCurrentThreadId() && dlg == g_tcCapDlg)
@@ -7762,7 +10944,8 @@ void* detour_tcChoose(void* dlg, void* list, void* speaker, char flag)
         g_tcCapHit = 1;
         return 0;
     }
-    return orig_tcChoose(dlg, list, speaker, flag);
+    void* const first = orig_tcChoose(dlg, list, speaker, flag);
+    return TcCagedRepick(dlg, list, speaker, flag, first, 0);
 }
 
 void TcForgetAll()
@@ -7935,6 +11118,7 @@ void TalkCursorApplyAsk(const cooptalk::TalkMsg& m, unsigned int peer)
             {
                 if (m.purse >= 0) TkPurseNote(m.targetUid, m.purse, peer);   /* the money condition is answered by the talker's purse */
                 called = TcChoosePod(dlg, list, cp, &line);
+                if (called && line == 0) line = TcCagedRepick(dlg, list, cp, 0, 0, 1);   /* T-980: a caged prisoner's line for this talker */
                 TkPurseTalkEnded(m.targetUid);   /* kept only while a conversation with that character is open here */
             }
             if (called) answer = cooptalk::TalkCursorNpcAnswer(parked, hasList, dead, pf, line != 0 ? 1 : 0);
@@ -8036,7 +11220,7 @@ std::string TalkCursorShow(const std::string& arg)
     int hasList = 0, dead = 0, pf = 0;
     void* list = 0;
     const int read = (dlg != 0 && TcNeverPod(dlg, npc, &hasList, &list, &dead, &pf)) ? 1 : 0;
-    const int may = read ? cooptalk::TalkCursorMayTalk(hasList, dead, pf) : 0;
+    const int may = read ? ((own == 0 && !player) ? cooptalk::TalkCursorCopyMayAsk(hasList, dead, pf) : cooptalk::TalkCursorMayTalk(hasList, dead, pf)) : 0;   /* T-1077: as TcHover */
     const unsigned int tu = TcPreloadTalker();
     std::map<unsigned long long, TcEntry>::const_iterator it = g_tcCache.find(cooptalk::TalkCursorKey(nu, tu));
     const int have = (it != g_tcCache.end()) ? 1 : 0;
@@ -8144,7 +11328,11 @@ std::string TalkCursorCountsString()
                  g_tcFilteredNever, (long long)g_tcLocalKept, g_tcQueuedMax, TalkHookState(g_tcCanHook), TalkHookState(g_tcChooseHook), g_tcOn);
     char c[96];
     std::sprintf(c, " talkCursor2[clickEngine,sendSkipped]=%lld,%lld", g_tcClickEngine, g_tcSendSkipped);
-    return std::string(b) + c;
+    char d[200];   /* T-980 */
+    std::sprintf(d, " cagedRepick[tried,picked,noStandIn,lineRefused,condSwapped,notForwarded,squadSkip]=%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_tcSubTried, g_tcSubPicked, g_tcSubNoStandIn, g_tcSubLineRefused, (long long)g_tcSubCondSwapped, g_tcSubNotForwarded,
+                 g_tcSubSquadSkip);
+    return std::string(b) + c + d;
 }
 
 std::string TalkCountsString()
@@ -8166,7 +11354,8 @@ std::string TalkCountsString()
            + TalkCursorCountsString()   /* T-737 */
            + PortraitCountsString()   /* T-804 */
            + OffMainActsCountsString()
-           + WinGuardCountsString();   /* T-831 */
+           + WinGuardCountsString()   /* T-831 */
+           + TalkOneWinCountsString();   /* T-978 B2 / B1 */
 }
 
 /* T-726: a [TALK] REPORT line every 60 s in this game's own log while a world runs (not while loading or tearing down), so a bug

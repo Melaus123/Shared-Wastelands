@@ -309,6 +309,21 @@ public:
     long long AnnounceCount() const { return (long long)m_announce.size(); }   /* announcements waiting on the ANNOUNCE line */
     long long HeldCount() const { return (long long)m_held.size(); }           /* live frames held behind an announcement or a BULK frame */
     long long BulkCount() const { return (long long)m_bulk.size(); }           /* T-1118 (c): frames waiting on the BULK line */
+    // PROBE-START: P223 - the bytes still to go on each list (walks every list; the caller limits how often). LOG ONLY.
+    void P223Bytes(long long* rest, long long* announce, long long* held, long long* live, long long* bulk) const
+    {
+        const int which[5] = { kListRest, kListAnnounce, kListHeld, kListLive, kListBulk };
+        long long* out[5] = { rest, announce, held, live, bulk };
+        for (int k = 0; k < 5; ++k)
+        {
+            const std::list<Entry>& q = const_cast<Outbox*>(this)->ListOf(which[k]);
+            long long b = 0;
+            for (std::list<Entry>::const_iterator i = q.begin(); i != q.end(); ++i) b += (long long)(i->it.bytes.size() - i->sent);
+            if (k == 0) { const std::list<Entry>& l = m_loose; for (std::list<Entry>::const_iterator i = l.begin(); i != l.end(); ++i) b += (long long)(i->it.bytes.size() - i->sent); }
+            *out[k] = b;
+        }
+    }
+    // PROBE-END: P223
     /* T-1118 (c): the last Direct that answered true sent a BULK frame (a guaranteed live frame moved off the LIVE line): the caller
        does not time it as a live frame. */
     bool LastDirectBulk() const { return m_lastDirectBulk; }

@@ -12,9 +12,15 @@
 //   Faction+0x250 is the PlayerInterface*, non-zero for a player faction. Faction+0x78 is FactionRelations.
 //   FactionRelations::getRelationData 0x6B4910 returns the entry; entry+0x00 ally flag, +0x02 atWar, +0x04 relation.
 //
-// DELIBERATELY NOT HOOKED: AI::treatsAsEnemy(RootObjectBase*) 0x5993A0. It does not route through isEnemyOf; it is the
-// GOAP state predicate an attack task must satisfy before a plan is produced, and it has exactly one caller
-// (AI::isTargetEnemy 0x59ACD0). Hooking it would disable the harness's own attack verb (F101/F102).
+// T-1194 - THE THIRD HOOK: AI::treatsAsEnemy(RootObjectBase*) 0x5993A0 (table row AI_treatsAsEnemy; 1.0.68 0x599E30). It does
+// not route through isEnemyOf; it is the GOAP state predicate an attack task must satisfy before a plan is produced
+// ("relation below -1", one caller, AI::isTargetEnemy 0x59ACD0). It was left unhooked until T-1194, and runs T1804 and T1943
+// showed why that was a hole: an attack ordered by another road (a bandit's "Intruders!" conversation gives the speaker a direct
+// attack order, build/decomp_67fad0.txt giveOrder 0x5D1640 task 0x65) passes only this test, so it still ran under peace.
+// While the lever is on it now answers "not an enemy" for a pair PeaceGate covers, exactly as the first hook does; every other
+// pair, and every call while the lever is off, gets the engine's own answer. THE COST, STATED: the harness's own `attack`
+// verb (F101/F102) needs this test too, so under PLAIN peace an `attack` with a player-side character on either side whose
+// relation the engine read as hostile is no longer plannable (Inferred from the read, not seen in a run); the fight form leaves two player-side characters and the exempt opponent to the engine, as before.
 //
 // NOT SHIPPED: the optional third hook, BountyManager::getPercievedBounty 0x853100, which would close the two
 // bounty-driven arrest routes isEnemyOf does not cover (build/read-hostility.md section 4.3). read-hostility.md
@@ -34,6 +40,7 @@
 #include "game/Faction.h"
 #include "game/FactionRelations.h"
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
+#include "medical.h"   /* T-1205 /god: GodCharacterAnyThread - enemies ignore a god character */
 #include <Windows.h>
 #include <intrin.h>   /* _ReturnAddress: WHICH caller is asking the ally question (F619, the kClickRets pattern) */
 #include <cstring>
@@ -46,6 +53,10 @@ namespace {
 
 unsigned long long kIsEnemyRva = 0; static coop::AddrReg kIsEnemyRva_reg("IsEnemy", &kIsEnemyRva);   /* P8h: the address table fills this. Steam_1.0.65 0x79BDB0 */   // Character::isEnemyOf, vtable +0x3E8
 unsigned long long kIsAllyRva = 0; static coop::AddrReg kIsAllyRva_reg("IsAlly", &kIsAllyRva);   /* P8h: the address table fills this. Steam_1.0.65 0x791830 */   // Character::isAllyOf,  vtable +0x3F0
+/* T-1194: the planner's attack test, AI::treatsAsEnemy(RootObjectBase*). The same row replicate.cpp's P010 reads (a name
+   registered twice is strict when either registration is). Steam_1.0.65 0x5993A0, 1.0.68 0x599E30. */
+unsigned long long kPlanEnemyRva = 0; static coop::AddrReg kPlanEnemyRva_reg("AI_treatsAsEnemy", &kPlanEnemyRva);
+const unsigned  kAiCharacterOff = 0x170;   /* AI+0x170 = the AI's own character: the original's first read (mov rdi,[rcx+170h]) */
 unsigned long long kGetRelDataRva = 0; static coop::AddrReg kGetRelDataRva_reg("GetRelData", &kGetRelDataRva);   /* P8h: the address table fills this. Steam_1.0.65 0x6B4910 */   // FactionRelations::getRelationData (the call relations.cpp wraps)
 const unsigned  kGetFactionSlot = 0x58 / 8;   // RootObjectBase::getOwnerFaction, vtable +0x58
 const float     kEnemyRelation  = -30.0f;     // the engine's own cut-off, .rdata 0x16CBCFC
@@ -104,11 +115,13 @@ const LONG64    kVanillaProbeCap = 200000;
 
 typedef char  (*IsEnemyFn)(void* self, void* who, char factorInDisguises);
 typedef char  (*IsAllyFn) (void* self, void* who, char factorInDisguises);
+typedef char  (*PlanEnemyFn)(void* ai, void* other);   /* T-1194: bool AI::treatsAsEnemy(RootObjectBase*), answer in al */
 typedef void* (*GetFactionFn)(void* self);
 typedef void* (*GetRelDataFn)(void* self, ::Faction* other);
 
 IsEnemyFn orig_isEnemy = 0;
 IsAllyFn  orig_isAlly  = 0;
+PlanEnemyFn orig_planEnemy = 0;
 
 /* THE GATE. 0 = the engine answers, unmodified. Written only by SetPeaceOn (main thread), read by the two
    detours on the AI worker thread. */
@@ -182,6 +195,28 @@ int PeaceAllyRetAnswered(const void* ret)
 void* volatile g_teamCells[swteamally::kCells];
 volatile LONG g_teamHeld = 0;
 volatile LONG64 g_teamAlly = 0, g_teamNotEnemy = 0, g_teamDoubt = 0, g_teamWrites = 0;
+volatile LONG64 g_godNotEnemy = 0, g_godAlly = 0;   /* T-1205 /god: answers given for a god character */
+/* T-1194: the third hook's counters. asked = planner attack tests the ENGINE answered "enemy" while the lever was on (the only
+   ones it can change); suppressed = of those, answered "not an enemy" (the answers it CHANGED); doubt = the AI's character or a
+   faction would not read, so the engine's answer stood. asked - suppressed - doubt = pairs the gate did not cover. */
+volatile LONG64 g_planAsked = 0, g_planSuppressed = 0, g_planDoubt = 0;
+/* T-1194 (T2029): a talk line's attack results (hire.cpp detour_doActions, any thread). asked = lines carrying action 6 / 55 / 57
+   seen while the lever was on; dropped = of those, the results dropped (the pair covered); doubt = a read gave doubt, the line ran;
+   asked - dropped - doubt = pairs the gate did not cover (the line ran); unread = lines whose actions would not read while the
+   lever was on (the line ran). offMain = dropped lines that ran on a thread other than the main one. The first kTalkNoteCap
+   lines are kept for PeaceTalkDrain (lock-free: a slot is claimed by an interlocked index, written, then marked ready). */
+volatile LONG64 g_talkAsked = 0, g_talkDropped = 0, g_talkDoubt = 0, g_talkUnread = 0, g_talkOffMain = 0;
+const int kTalkNoteCap = 16, kTalkNoteActs = 8;
+struct TalkNote
+{
+    volatile LONG ready;   /* 1 once every field below is written (written last) */
+    int logged;            /* MAIN THREAD */
+    int dropped, gate, offMain, n, total;
+    unsigned su, tu;
+    int types[kTalkNoteActs], values[kTalkNoteActs];
+};
+volatile LONG g_talkNoteN = 0;   /* slots claimed (may pass the cap; only the first kTalkNoteCap are kept) */
+TalkNote g_talkNotes[kTalkNoteCap];
 
 /* The owner faction of a character through its own vtable slot +0x58 - the call isAllyOf / isEnemyOf make first. 1 read, 0 a
    fault. AI-THREAD SAFE: no allocation, no string, no lock. */
@@ -211,7 +246,7 @@ int TeamPairPod(void* self, void* who)
 }
 
 bool g_installed = false;
-int  g_enemyHook = -1, g_allyHook = -1;     /* -1 install not reached, 0 NOT installed, 1 prologue verified and patched */
+int  g_enemyHook = -1, g_allyHook = -1, g_planHook = -1;     /* -1 install not reached, 0 NOT installed, 1 prologue verified and patched */
 long long g_onEdges = 0, g_offEdges = 0, g_walks = 0, g_walkNoWorld = 0;
 
 template <class T> std::string S(const T& v) { std::ostringstream o; o << v; return o.str(); }
@@ -286,6 +321,7 @@ char detour_isEnemy(void* self, void* who, char disguises)
        and while the bypass is up this detour is a pass-through as well - otherwise the probe would measure an
        engine we are still modifying, which is the very thing it exists to escape. */
     if (PeaceHooksBypassedHere() != 0) return orig_isEnemy(self, who, disguises);
+    if (coop::GodCharacterAnyThread(who)) { ::InterlockedIncrement64(&g_godNotEnemy); return 0; }   /* T-1205 /god: a god character is nobody's enemy */
     if (g_teamHeld != 0)
     {
         /* T-546 (owner 512): a team pair is answered as the engine answers one faction - not an enemy, before anything else */
@@ -337,6 +373,11 @@ char detour_isAlly(void* self, void* who, char disguises)
     /* THE RETURN ADDRESS IS TAKEN FIRST, before anything else can disturb the frame. */
     const void* const ret = _ReturnAddress();
     if (PeaceHooksBypassedHere() != 0) return orig_isAlly(self, who, disguises);
+    if (PeaceAllyRetAnswered(ret) != 0 && coop::GodCharacterAnyThread(who))
+    {   /* T-1205 /god: the two fight pickers take a god character as an ally, so no fight is picked with it */
+        ::InterlockedIncrement64(&g_godAlly);
+        return 1;
+    }
     if (g_teamHeld != 0)
     {
         /* T-546 (owner 512): a team pair is answered as the engine answers one faction - an ally, before anything else, for
@@ -362,6 +403,41 @@ char detour_isAlly(void* self, void* who, char disguises)
             if (engine == 0) ::InterlockedIncrement64(&g_allyForced);
             return 1;                                              /* an ally */
         }
+    }
+}
+
+/* T-1194: the AI's own character, AI+0x170. 1 read, 0 a fault or an implausible pointer. AI-THREAD SAFE. */
+int AiCharacterPod(void* ai, void** ch)
+{
+    *ch = 0;
+    __try
+    {
+        if (ai == 0 || ((uintptr_t)ai & 7) != 0) return 0;
+        void* c = *(void**)((char*)ai + kAiCharacterOff);
+        if (!PlausiblePtrPod(c)) return 0;
+        *ch = c;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* T-1194: THE PLANNER'S ATTACK TEST. The engine answers first (it does the reads; the original runs on every call), and only an
+   "enemy" answer while the lever is on is looked at: the same PeaceGate the other two detours ask, with the AI's own character
+   as the first side and the target as the second. swpeacegate::PlanEnemyAnswer is the decision. */
+char detour_planEnemy(void* ai, void* other)
+{
+    const char engine = orig_planEnemy(ai, other);
+    if (engine == 0 || g_peaceOn == 0) return engine;
+    const int bypassed = PeaceHooksBypassedHere();
+    if (bypassed != 0) return engine;
+    ::InterlockedIncrement64(&g_planAsked);
+    {
+        void* self = 0;
+        const int gate = (AiCharacterPod(ai, &self) != 0) ? PeaceGate(self, other) : -1;
+        if (gate < 0) ::InterlockedIncrement64(&g_planDoubt);
+        const int answer = swpeacegate::PlanEnemyAnswer(1, bypassed, 1, gate);
+        if (answer == 0) ::InterlockedIncrement64(&g_planSuppressed);
+        return (char)answer;
     }
 }
 
@@ -509,6 +585,27 @@ void InstallHooks()
         coop::AddHook((void*)aAlly, (void*)&detour_isAlly, (void**)&orig_isAlly);
         g_allyHook = (ReadBytesPod((const void*)aAlly, post, 16) != 0 && std::memcmp(pre, post, 8) != 0) ? 1 : 0;
     }
+    /* T-1194: the third hook, the planner's attack test, beside the two above and under the same prologue rule. Read 2026-11-04 out
+       of build/bin/kenshi_x64.exe (1.0.65 0x5993A0) and kenshi_x64_vanilla.exe (1.0.68 0x599E30), the same bytes in both:
+         48 89 5C 24 08  mov [rsp+8],rbx / 57 push rdi / 48 83 EC 20 sub rsp,20 / 48 8B B9 70 01 00 00 mov rdi,[rcx+170h]
+       ten bytes of ordinary non-relative frame setup before the first read, and the body (to 0x5993F8) never jumps back into
+       them, so MinHook can relocate them. */
+    {
+        const unsigned char sigPlan[10] = { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20 };
+        const uintptr_t aPlan = base + kPlanEnemyRva;
+        if (kPlanEnemyRva == 0 || ReadBytesPod((const void*)aPlan, pre, 16) == 0 || std::memcmp(pre, sigPlan, 10) != 0)
+        {
+            g_planHook = 0;
+            ErrorLog("[PEACE] treatsAsEnemy (planner) hook=NOT-INSTALLED at row AI_treatsAsEnemy: the prologue is not the"
+                     " 48 89 5C 24 08 57 48 83 EC 20 this build was read against. An attack ordered by another road (a"
+                     " bandit's conversation, T1804 / T1943) will still be carried out under peace.");
+        }
+        else
+        {
+            coop::AddHook((void*)aPlan, (void*)&detour_planEnemy, (void**)&orig_planEnemy);
+            g_planHook = (ReadBytesPod((const void*)aPlan, post, 16) != 0 && std::memcmp(pre, post, 8) != 0) ? 1 : 0;
+        }
+    }
     /* P8a (F639): verify the two call sites before anything claims the allowlist is armed. */
     {
         unsigned int i = 0; int okSites = 0;
@@ -543,8 +640,9 @@ void InstallHooks()
              " from where it parked them, so it is a decision and not a default.");
     DebugLog("[PEACE] hooks: isEnemyOf 0x79BDB0=" + S((long long)g_enemyHook)
              + " isAllyOf 0x791830=" + S((long long)g_allyHook)
+             + " treatsAsEnemy(planner) 0x5993A0=" + S((long long)g_planHook)
              + " (1 = the prologue matched the bytes this patch was read against AND the bytes changed after"
-               " AddHook; 0 = NOT installed). The lever is OFF by default and both detours pass every call"
+               " AddHook; 0 = NOT installed). The lever is OFF by default and all three detours pass every call"
                " straight to the engine until the peace verb turns it on.");
 }
 }   // namespace
@@ -572,7 +670,54 @@ int PeaceTeamPairOfCharacters(void* a, void* b)
 std::string PeaceTeamTokens()
 {
     return " team[held,ally,notEnemy,doubt,writes]=" + S((long long)g_teamHeld) + "," + S((long long)g_teamAlly) + "," + S((long long)g_teamNotEnemy)
-         + "," + S((long long)g_teamDoubt) + "," + S((long long)g_teamWrites);
+         + "," + S((long long)g_teamDoubt) + "," + S((long long)g_teamWrites)
+         + " god[notEnemy,ally]=" + S((long long)g_godNotEnemy) + "," + S((long long)g_godAlly);
+}
+
+bool PeaceOnAnyThread()
+{
+    return g_peaceOn != 0;
+}
+
+int PeaceGateAnyThread(void* speaker, void* target)
+{
+    return PeaceGate(speaker, target);
+}
+
+void PeaceTalkNote(int dropped, int gate, int unread, unsigned speakerUid, unsigned targetUid, const int* types, const int* values,
+                   int n, int total, int offMain)
+{
+    if (unread != 0) { ::InterlockedIncrement64(&g_talkUnread); return; }
+    ::InterlockedIncrement64(&g_talkAsked);
+    if (gate < 0) ::InterlockedIncrement64(&g_talkDoubt);
+    if (dropped == 0) return;   /* only a dropped line is logged: a line the engine ran is in the counters */
+    ::InterlockedIncrement64(&g_talkDropped);
+    if (offMain != 0) ::InterlockedIncrement64(&g_talkOffMain);
+    const LONG at = ::InterlockedIncrement(&g_talkNoteN) - 1;
+    if (at < 0 || at >= kTalkNoteCap) return;
+    TalkNote& e = g_talkNotes[at];
+    e.dropped = dropped; e.gate = gate; e.offMain = offMain; e.total = total; e.su = speakerUid; e.tu = targetUid;
+    e.n = (n < kTalkNoteActs) ? n : kTalkNoteActs;
+    if (e.n < 0) e.n = 0;
+    for (int i = 0; i < e.n; ++i) { e.types[i] = types[i]; e.values[i] = values[i]; }
+    ::InterlockedExchange(&e.ready, 1);
+}
+
+void PeaceTalkDrain()
+{
+    if (g_talkNoteN == 0) return;   /* nothing dropped yet: one load per frame */
+    for (int i = 0; i < kTalkNoteCap; ++i)
+    {
+        TalkNote& e = g_talkNotes[i];
+        if (e.ready != 1 || e.logged) continue;
+        e.logged = 1;
+        std::string acts;
+        for (int k = 0; k < e.n; ++k) acts += (k ? "," : "") + S((long long)e.types[k]) + ":" + S((long long)e.values[k]);
+        DebugLog("[PEACE] talk attack dropped uid=" + S((unsigned long long)e.su) + " target=" + S((unsigned long long)e.tu)
+                 + " acts=[" + acts + "] total=" + S((long long)e.total) + " thread=" + (e.offMain ? "off-main" : "main")
+                 + " - the line's results did not run (peace covers the pair); the talk goes on as the engine leads it"
+                   " (logged " + S((long long)(i + 1)) + " of " + S((long long)kTalkNoteCap) + "; talk[...] on the REPORT line)");
+    }
 }
 
 void InstallPeace()
@@ -657,9 +802,9 @@ static void SetPeaceOnImpl(bool on)
     if (on)
     {
         if (!was) ++g_onEdges;
-        if (g_enemyHook != 1 || g_allyHook != 1)
-            ErrorLog("[PEACE] the peace verb was accepted but a hook is NOT armed (treatsAsEnemy=" + S((long long)g_enemyHook)
-                     + " isAlly=" + S((long long)g_allyHook) + "): the flag is set and it will change nothing"
+        if (g_enemyHook != 1 || g_allyHook != 1 || g_planHook != 1)
+            ErrorLog("[PEACE] the peace verb was accepted but a hook is NOT armed (isEnemyOf=" + S((long long)g_enemyHook)
+                     + " isAllyOf=" + S((long long)g_allyHook) + " treatsAsEnemy(planner)=" + S((long long)g_planHook) + "): the flag is set and it will change nothing"
                      " through the missing hook. Read the [PEACE] hooks line at start-up.");
         PeaceWalk();
     }
@@ -687,11 +832,23 @@ void ReportPeace()
              + " vanillaProbeCalls=" + S((long long)g_vanillaProbeCalls)
              + " vanillaProbeCapped=" + S((long long)g_vanillaProbeCapped)
              + " hooks(treatsAsEnemy,isAlly)=" + S((long long)g_enemyHook) + "," + S((long long)g_allyHook)
+             + " plan[hook,asked,suppressed,doubt]=" + S((long long)g_planHook) + "," + S((long long)g_planAsked)
+             + "," + S((long long)g_planSuppressed) + "," + S((long long)g_planDoubt)
+             + " talk[asked,dropped,doubt,unread,offMain]=" + S((long long)g_talkAsked) + "," + S((long long)g_talkDropped)
+             + "," + S((long long)g_talkDoubt) + "," + S((long long)g_talkUnread) + "," + S((long long)g_talkOffMain)
              + " onEdges=" + S(g_onEdges) + " offEdges=" + S(g_offEdges) + " walks=" + S(g_walks)
              + " walksWithNoWorld=" + S(g_walkNoWorld)
              + " fight[on,exempt,players,exemptPairs,edges]=" + S((long long)(g_peaceFight != 0 ? 1 : 0)) + "," + S((long long)g_peaceExemptHeld)
              + "," + S((long long)g_fightPlayers) + "," + S((long long)g_fightExempt) + "," + S(g_fightEdges)
              + PeaceTeamTokens()
+             + "  |  plan[...]: T-1194, the planner's attack test AI::treatsAsEnemy 0x5993A0 (relation below -1), which an attack"
+               " ordered by another road (a bandit's conversation) passes without asking isEnemyOf; asked = its 'enemy' answers while the"
+               " lever was on, suppressed = of those, turned to 'not an enemy' (the answers changed), doubt = a read failed and the"
+               " engine's answer stood. hooks(treatsAsEnemy,...) names isEnemyOf, an older label."
+             + "  |  talk[...]: T-1194 (T2029), a talk line carrying attack action 6 / 55 / 57 (a direct attack order that never asks the"
+               " planner test) while the lever was on; dropped = its results did not run (the speaker / target pair covered), doubt = a"
+               " read failed and the line ran, asked - dropped - doubt = pairs not covered (the line ran), unread = a line whose actions"
+               " would not read (the line ran), offMain = dropped lines run off the main thread. The talk itself is not ended."
              + "  |  fight[...]: the TEST-ONLY fight form (owner 1205 a); players and exemptPairs are gate answers 'not covered' for two"
                " player-side characters and for a pair whose non-player side is exempt - both are inside neitherSidePlayer."
              + "  |  team[...]: this game's player faction and its teammates' factions are answered ally / not-enemy for each other"

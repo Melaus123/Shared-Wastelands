@@ -97,4 +97,107 @@ inline const char* EngineRecruitWhy(int verdict)
     }
 }
 
+/* T-1228: the kEngineRecruitNotMine line names the road that recruited another game's character here (a copy's buy the person's
+   runner never hears of). Its words are below; the plugin (hire.cpp EngineRecruitSettle) reads the facts.
+
+   HexWord: 0x<upper-case hex>, no leading zeros. */
+inline std::string HexWord(unsigned long long v)
+{
+    static const char kDigits[] = "0123456789ABCDEF";
+    char b[17];
+    int n = 16;
+    b[16] = 0;
+    do { b[--n] = kDigits[(int)(v & 0xF)]; v >>= 4; } while (v != 0 && n > 0);
+    return std::string("0x") + (b + n);
+}
+
+/* DecWord: the decimal digits of v. */
+inline std::string DecWord(unsigned long long v)
+{
+    char b[21];
+    int n = 20;
+    b[20] = 0;
+    do { b[--n] = (char)('0' + (int)(v % 10)); v /= 10; } while (v != 0 && n > 0);
+    return std::string(b + n);
+}
+
+/* The engine's call site: exe+0x<rva> when the return address lies inside the game's image [lo, hi), else the raw address; 0 = "?". */
+inline std::string CallerWords(unsigned long long ret, unsigned long long lo, unsigned long long hi)
+{
+    if (ret == 0) return "?";
+    if (lo != 0 && ret >= lo && ret < hi) return "exe+" + HexWord(ret - lo);
+    return HexWord(ret);
+}
+
+/* A name for the line: control bytes and the quote become '?', at most maxBytes bytes, never cut inside a UTF-8 character; empty = "?". */
+inline std::string LogWord(const std::string& s, size_t maxBytes)
+{
+    std::string o;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        const unsigned char c = (unsigned char)s[i];
+        o += (c < 0x20 || c == 0x7F || c == '\'') ? '?' : (char)c;
+    }
+    if (o.size() > maxBytes)
+    {
+        size_t n = maxBytes;
+        while (n > 0 && (((unsigned char)o[n]) & 0xC0) == 0x80) --n;   /* o[n] is the first byte left out: step back to a character's start */
+        o.resize(n);
+    }
+    return o.empty() ? std::string("?") : o;
+}
+
+/* The cap: one line per (uid, caller) pair, at most kNotMineLineCap lines a session; repeats and lines over the cap are counted. */
+const int kNotMineLineCap = 50;
+const int kNotMineLineRepeat = 0;
+const int kNotMineLineWrite  = 1;
+const int kNotMineLineOverCap = 2;
+struct NotMineLineSeen
+{
+    unsigned int uid[kNotMineLineCap];
+    unsigned long long caller[kNotMineLineCap];
+    int n;
+    long long repeats, overCap;
+    NotMineLineSeen() : n(0), repeats(0), overCap(0) {}
+};
+inline int NotMineLineTake(NotMineLineSeen* s, unsigned int uid, unsigned long long caller)
+{
+    for (int i = 0; i < s->n; ++i)
+        if (s->uid[i] == uid && s->caller[i] == caller) { ++s->repeats; return kNotMineLineRepeat; }
+    if (s->n >= kNotMineLineCap) { ++s->overCap; return kNotMineLineOverCap; }
+    s->uid[s->n] = uid; s->caller[s->n] = caller; ++s->n;
+    return kNotMineLineWrite;
+}
+
+/* The facts the NotMine line names. mainThread 1 the recruit ran on the main thread, 0 another thread (settled at the safe point).
+   ownerSlot: the slot of the game that runs the person, -1 unknown. talkOpen / tradeOpen: 1 open, 0 closed, -1 unreadable.
+   tradeWithUid: the uid of the trade window's other side when it is a character this game knows, else 0. squad 0 = none. */
+struct NotMineFacts
+{
+    std::string caller, name, race, templateSid, wasFac;
+    int mainThread, ownerSlot, talkOpen, tradeOpen;
+    unsigned long long squad;
+    unsigned int tradeWithUid;
+    NotMineFacts() : mainThread(-1), ownerSlot(-1), talkOpen(-1), tradeOpen(-1), squad(0), tradeWithUid(0) {}
+};
+
+inline const char* OpenWord(int v) { return v == 1 ? "open" : (v == 0 ? "closed" : "unreadable"); }
+
+/* The words appended to the NotMine line. */
+inline std::string NotMineTail(const NotMineFacts& f)
+{
+    std::string s = " | caller=" + (f.caller.empty() ? std::string("?") : f.caller);
+    s += std::string(" thread=") + (f.mainThread == 1 ? "main" : (f.mainThread == 0 ? "other" : "?"));
+    s += " name='" + LogWord(f.name, 48) + "' race='" + LogWord(f.race, 48) + "' template='" + LogWord(f.templateSid, 64) + "'";
+    s += " wasFac='" + LogWord(f.wasFac, 64) + "'";
+    s += " squad=" + (f.squad != 0 ? HexWord(f.squad) : std::string("none"));
+    if (f.ownerSlot >= 0) s += " runBy=slot" + DecWord((unsigned long long)f.ownerSlot);
+    else s += " runBy=unknown";
+    s += std::string(" talkWindow=") + OpenWord(f.talkOpen);
+    s += std::string(" tradeWindow=") + OpenWord(f.tradeOpen);
+    if (f.tradeOpen == 1)
+        s += " tradeWith=" + (f.tradeWithUid != 0 ? "uid" + DecWord(f.tradeWithUid) : std::string("not a known character"));
+    return s;
+}
+
 } // namespace recruitguard

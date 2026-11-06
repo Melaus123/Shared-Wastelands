@@ -329,6 +329,28 @@ inline int GroundCharDropFrom(int animal, int wasInOwnInv)
     if (wasInOwnInv == 0) return kGroundFromOverflow;
     return animal != 0 ? kGroundFromAnimal : kGroundFromPlayer;
 }
+/* T-931: a drag out of a box / cart / machine / campfire window onto the ground. The window's Inventory::dropItem 0x745250 calls the
+   building's dropItem 0x54DBA0 (the spill road) FIRST and removes the item (0x749E10, which clears "in an inventory" +0xD8) AFTER
+   (decomp_745250:6,10). 1 = the spill left the item physical in the world but still flagged in an inventory: it waits for that
+   removal; 0 = noted at once, as before. */
+inline int GroundSpillWaitsRemoval(int physical, int inInv) { return (physical == 1 && inInv != 0) ? 1 : 0; }
+/* the one spill waiting for its removal (main thread; one window drop at a time). Take: 1 = the removal of THE waiting item - the slot
+   is emptied, so the drop is noted once; any other item leaves it waiting. Clear: 1 = an entry was waiting and is given up (the next
+   spill, or the next ground drain, came before its removal). */
+struct GroundSpillWait { unsigned long long item; int set; };
+inline void GroundSpillWaitPut(GroundSpillWait* w, unsigned long long item) { w->item = item; w->set = (item != 0) ? 1 : 0; }
+inline int GroundSpillWaitTake(GroundSpillWait* w, unsigned long long item)
+{
+    if (w->set == 0 || item == 0 || w->item != item) return 0;
+    w->set = 0; w->item = 0;
+    return 1;
+}
+inline int GroundSpillWaitClear(GroundSpillWait* w)
+{
+    const int was = w->set;
+    w->set = 0; w->item = 0;
+    return was;
+}
 /* the one route. holderMine: this game holds the item's area. own: the source is this game's own (its own character; a building
    its player faction owns). selfApply: the item was spilled by a copy (ground5 fold 1 F3: during the mod's own apply of another
    game's change or not) - the owner's game spills the real one and routes it, so this game's spill is removed here and never

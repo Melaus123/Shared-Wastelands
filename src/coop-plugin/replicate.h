@@ -88,6 +88,11 @@ bool PeerPlayerPosition(float* x, float* y, float* z, double* ageSec);
 // maxAgeSec old: every copy is looked at and each area kept once, at most cap distinct areas into xs / ys. Returns how many. MAIN
 // THREAD (the zone tick).
 int PeerPlayerSectors(int* xs, int* ys, int cap, double maxAgeSec);
+/* T-1235: every player's characters here - this game's own player-faction characters (slot mySlot, own 1) and the copies of the
+   other players' player-faction characters (their recorded owner's slot, own 0), each one's ground position, at most cap (the rest
+   in *leftOut, may be 0; the copies are listed first, so a full list leaves out this game's own). deads (may be 0): 1 = the character has died (the engine's hasDied; for a copy also its owner's word).
+   Returns how many. MAIN THREAD (towngen.cpp's [SPAWN] wander snapshot). */
+int PlayerCharSpots(float* xs, float* zs, int* slots, int* owns, int* deads, int cap, int mySlot, int* leftOut);
 // E25: 1 = the character is in the peer player's own faction, 0 = not, -1 = the read faulted. tags1 labels only the 1s.
 int PeerFactionPod(::Character* c);
 

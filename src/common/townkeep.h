@@ -28,12 +28,16 @@
      no outposts, while that slot has rows on file, is taken only as the kEmptyWholeToClear-th SAY in a row on one link with no
      outposts and its town list read whole (EmptyWholeRun, EmptySayIgnored); the game marks no SAY whole before its player has been
      in the world it loaded for a while.
-   WIRE (little-endian, as every world-server message): u32 op (SAY 1 up, LIST 2 down, SHOW KEYS 3 down - protocol 101), u32 flags,
+   WIRE (little-endian, as every world-server message): u32 op (SAY 1 up, LIST 2 down, SHOW KEYS 3 down - protocol 101, HEARD 4 down -
+   protocol 137), u32 flags,
    u32 count 0..kMaxTownsMsg, count x TOWN
      flags LIST: 1 = the list starts again with this message (0 or 1). SAY: kSayFirst (this message starts a SAY), kSayMore (more
            messages of this SAY follow), kSayWhole (the game read its whole town list); a SAY that would pass kTownsMsgBytes is
            split between its rows (EncodeTownsSay). SHOW KEYS: kSayFirst (the key list starts again with this message), kSayMore
-           (more messages of it follow); split as a SAY is (EncodeShowKeys)
+           (more messages of it follow); split as a SAY is (EncodeShowKeys). LIST: split as a SAY is too (ListParts, protocol 137)
+     HEARD (T-1158 step 6, protocol 137): sent after every SAY the world server took (the SAY's last message read), after any LIST and
+           SHOW that SAY caused, so it comes behind them on the one ordered road; no rows; flags: kSayWhole when that SAY was read whole.
+           The game counts the whole SAYs answered (build.cpp g_townSaysHeard; townkeep.h RestoredWaitStep)
      SHOW KEYS (owner 936 / 937, 2026-10-17): sent right after every SHOW (baseshow.h) - per teammate outpost the SHOW carries, its
            owner slot, centre, name, size level and the said keys of its linked pieces with the cut flag, and (T-924) the handle
            words its owner's game said for it - an identity a game matches its copy by, never a town on another game (until T-924
@@ -79,6 +83,7 @@ namespace townkeep {
 
 const unsigned kMsgTowns = 70;
 const unsigned kOpSay = 1, kOpList = 2, kOpShowKeys = 3;   /* SHOW KEYS (3): world-server protocol 101 */
+const unsigned kOpHeard = 4;   /* T-1158 step 6 (world-server protocol 137): HEARD down - the world server took a SAY (no rows; flags: its kSayWhole) */
 const size_t kMaxTownsMsg = 32;        /* outposts in one TOWNS */
 const size_t kMaxTownsPerSlot = 32;    /* outposts one player's SAY is kept with */
 const size_t kMaxTownKeys = 512;       /* kept pieces one outpost row names */
@@ -138,7 +143,7 @@ inline bool RowOk(const TownRow& t, unsigned op)
 {
     if (op == kOpSay) { if (t.owner != -1) return false; }
     else if (op == kOpList || op == kOpShowKeys) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
-    else return false;
+    else return false;   /* HEARD carries no rows */
     if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.level < 0 || t.level > kLevelMax || t.id > kOutpostIdMax) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(t.pos[j])) return false;
     if (t.anchored != 0 && (!keptwire::FloatOk(t.anchor[0]) || !keptwire::FloatOk(t.anchor[1]))) return false;   /* T-940 */
@@ -149,14 +154,15 @@ inline bool RowOk(const TownRow& t, unsigned op)
 }
 
 /* ---- the wire ---- */
-/* the flags word: LIST 0 or 1; SAY any of kSayFirst, kSayMore, kSayWhole; SHOW KEYS any of kSayFirst, kSayMore */
+/* the flags word: LIST 0 or 1; SAY any of kSayFirst, kSayMore, kSayWhole; SHOW KEYS any of kSayFirst, kSayMore; HEARD kSayWhole or 0 */
 inline bool FlagsOk(unsigned op, unsigned f)
 {
     if (op == kOpSay) return (f & ~(kSayFirst | kSayMore | kSayWhole)) == 0;
     if (op == kOpShowKeys) return (f & ~(kSayFirst | kSayMore)) == 0;
+    if (op == kOpHeard) return (f & ~kSayWhole) == 0;
     return f <= 1;
 }
-inline bool OpKnown(unsigned op) { return op == kOpSay || op == kOpList || op == kOpShowKeys; }
+inline bool OpKnown(unsigned op) { return op == kOpSay || op == kOpList || op == kOpShowKeys || op == kOpHeard; }
 struct TkReader
 {
     const unsigned char* p; size_t n, at; bool bad;
@@ -176,7 +182,7 @@ struct TkReader
     }
     bool Done() const { return !bad && at == n; }
 };
-/* SAY, LIST or SHOW KEYS: 0..kMaxTownsMsg rows, every one valid for the op (nothing written for a refused one) */
+/* SAY, LIST, SHOW KEYS or HEARD: 0..kMaxTownsMsg rows, every one valid for the op (HEARD: none; nothing written for a refused one) */
 inline bool EncodeTowns(std::vector<char>* out, unsigned op, int first, const std::vector<TownRow>& rows)
 {
     out->clear();
@@ -282,6 +288,25 @@ inline bool EncodeShowKeys(std::vector<std::vector<char> >* msgs, const std::vec
         msgs->push_back(m);
     }
     return true;
+}
+/* T-1158 step 6 (protocol 137): A LIST AS PARTS - the rows in order, a part closed before a row that would take its message past
+   kTownsMsgBytes or kMaxTownsMsg rows (as EncodeTownsSay splits a SAY); no rows: one empty part (the first LIST message starts the
+   game's list again even when it names nothing). A row too big for a message alone is left out and counted in *tooBig (a LIST row
+   holds at most kMaxTownKeys keys of at most kKeyMax bytes: one always fits) */
+inline std::vector<std::vector<TownRow> > ListParts(const std::vector<TownRow>& rows, size_t* tooBig)
+{
+    std::vector<std::vector<TownRow> > parts(1);
+    if (tooBig) *tooBig = 0;
+    size_t bytes = 12;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        const size_t b = TownBytes(rows[i]);
+        if (12 + b > kTownsMsgBytes) { if (tooBig) ++*tooBig; continue; }
+        if (!parts.back().empty() && (parts.back().size() >= kMaxTownsMsg || bytes + b > kTownsMsgBytes)) { parts.push_back(std::vector<TownRow>()); bytes = 12; }
+        parts.back().push_back(rows[i]);
+        bytes += b;
+    }
+    return parts;
 }
 /* THE WORLD SERVER'S SIDE OF A SPLIT SAY, one per link: kSayFirst starts it again, each message's rows are added (at most
    kMaxTownsPerSlot; past it the SAY is taken as not read whole), and the message without kSayMore ends it */
@@ -577,12 +602,15 @@ inline unsigned SaidRowId(const TownRow& t, int slot, int at, const std::vector<
 }
 /* T-1047 step 5: nextId (one past the highest id on file, NextOutpostId) mints the id of a said row that inherits no outpost (SaidRowId;
    0 = no minting: such a row keeps id 0); carried: the outposts a reset carried (kept-towns.txt), whose ids a row of their owner takes
-   before a new one is minted */
+   before a new one is minted. T-1158 step 6 (Lost Post): took (when not 0) gets one flag per row of *all as passed - 1 = a row of the
+   slot a said row took over (at its centre or, failing that, by one of its keys); a row a said row only names a key of while taking
+   over another is not taken */
 inline void ReplaceSlotTowns(std::vector<TownRow>* all, int slot, const std::vector<TownRow>& said, int whole = 1, unsigned* nextId = 0,
-                             const std::vector<TownRow>* carried = 0)
+                             const std::vector<TownRow>* carried = 0, std::vector<int>* took = 0)
 {
     std::vector<TownRow> o, old;
-    for (size_t i = 0; i < all->size(); ++i) { if ((*all)[i].owner != slot) o.push_back((*all)[i]); else old.push_back((*all)[i]); }
+    std::vector<size_t> oldAt;   /* old[j]'s place in *all */
+    for (size_t i = 0; i < all->size(); ++i) { if ((*all)[i].owner != slot) o.push_back((*all)[i]); else { old.push_back((*all)[i]); oldAt.push_back(i); } }
     TownKeyFinder oldKeys;
     for (size_t j = 0; j < old.size(); ++j) for (size_t k = 0; k < old[j].keys.size(); ++k) oldKeys.Add(slot, old[j].keys[k], j);
     std::vector<int> used(old.size(), 0), carriedUsed;
@@ -617,6 +645,11 @@ inline void ReplaceSlotTowns(std::vector<TownRow>* all, int slot, const std::vec
     }
     if (whole == 0)
         for (size_t j = 0; j < old.size() && mine < kMaxTownsPerSlot; ++j) if (used[j] == 0) { o.push_back(old[j]); ++mine; }
+    if (took != 0)
+    {
+        took->assign(all->size(), 0);
+        for (size_t j = 0; j < old.size(); ++j) if (used[j] != 0) (*took)[oldAt[j]] = 1;
+    }
     all->swap(o);
 }
 struct KeptTownStats
@@ -1251,6 +1284,303 @@ inline int PendingStep(int standing, int dead, int rowOk)
     if (standing == 0) return kPendGone;
     if (dead != 0) return kPendDead;
     return rowOk != 0 ? kPendTry : kPendGone;
+}
+
+/* ---- T-1158 step 6 (owner 1272: crash-safe towns on hosted worlds too): AN OUTPOST IS NOT LOST WITH A GAME THAT DIED BEFORE IT SAVED ----
+   A player founds an outpost and builds in it; the world server holds the outpost's row (player-towns.txt, with its outpost id) and
+   every piece's record, and each record names its outpost by that id (piecerec.h PieceTownOf). The game is killed before Kenshi saves:
+   on reload its save has no such town, the pieces are rebuilt from their records with no town, and the game's first whole SAY leaves
+   the outpost out - which would let the row go. Instead, a row of the slot no said row took over (ReplaceSlotTowns) is KEPT while its
+   outpost id still has live pieces of that player (OutpostPieces: the world server's registry, fed by every stored piece record, a
+   removal mark too), and sent back to that game on the LIST it already reads (ListWithOwn), so the game takes or founds the town at the
+   row's centre and its rebuilt pieces are linked to it. A row whose id has no live piece of its player left is let go as before (the
+   player really gave it up, or removed every building). No distance enters the decision (07-bug-classes.md "matched by distance"): a
+   piece counts for an outpost only when its own record names that outpost's id; a record with no id yet counts for none. One road
+   whatever the world (hosted, kept running) and the player count: there is no switch. */
+/* THE REGISTRY: piece record id -> its owner slot and the outpost id its record names, for live records that name one; the count of
+   such pieces per (owner, outpost id), and (T-1158 step 6, D2) their piece keys (the record header's key; empty: none kept). Note is
+   called for each stored record (a removal mark, a record naming no outpost or a record that does not read takes the piece out) and
+   once for each record on disk at the world server's start. */
+class OutpostPieces
+{
+public:
+    void Note(const std::string& recId, int owner, unsigned outpost, int live, const std::string& key = std::string())
+    {
+        std::map<std::string, std::pair<int, unsigned> >::iterator was = byPiece_.find(recId);
+        if (was != byPiece_.end())
+        {
+            std::map<std::pair<int, unsigned>, int>::iterator c = count_.find(was->second);
+            if (c != count_.end() && --c->second <= 0) count_.erase(c);
+            std::map<std::string, std::string>::iterator wk = keyOf_.find(recId);
+            if (wk != keyOf_.end())
+            {
+                std::map<std::pair<int, unsigned>, std::set<std::string> >::iterator ks = keys_.find(was->second);
+                if (ks != keys_.end()) { ks->second.erase(wk->second); if (ks->second.empty()) keys_.erase(ks); }
+                keyOf_.erase(wk);
+            }
+            byPiece_.erase(was);
+        }
+        if (live == 0 || owner < 0 || outpost == 0) return;
+        const std::pair<int, unsigned> at(owner, outpost);
+        byPiece_[recId] = at;
+        ++count_[at];
+        if (!key.empty()) { keyOf_[recId] = key; keys_[at].insert(key); }
+    }
+    /* the live pieces of `owner` whose records name outpost id `outpost` */
+    int Count(int owner, unsigned outpost) const
+    {
+        std::map<std::pair<int, unsigned>, int>::const_iterator c = count_.find(std::make_pair(owner, outpost));
+        return c == count_.end() ? 0 : c->second;
+    }
+    /* T-1158 step 6 (D2): the keys of those pieces, in key order, at most cap */
+    std::vector<std::string> KeysOf(int owner, unsigned outpost, size_t cap) const
+    {
+        std::vector<std::string> o;
+        std::map<std::pair<int, unsigned>, std::set<std::string> >::const_iterator ks = keys_.find(std::make_pair(owner, outpost));
+        if (ks == keys_.end()) return o;
+        for (std::set<std::string>::const_iterator k = ks->second.begin(); k != ks->second.end() && o.size() < cap; ++k) o.push_back(*k);
+        return o;
+    }
+    size_t Pieces() const { return byPiece_.size(); }
+private:
+    std::map<std::string, std::pair<int, unsigned> > byPiece_;
+    std::map<std::pair<int, unsigned>, int> count_;
+    std::map<std::string, std::string> keyOf_;   /* piece record id -> its key (live pieces with a key only) */
+    std::map<std::pair<int, unsigned>, std::set<std::string> > keys_;
+};
+/* 1 = the said rows hold on-file row t: a said outpost stands at its centre (TownStands) or names one of its pieces (TownKeysSame) */
+inline int SaidHolds(const std::vector<TownRow>& said, const TownRow& t)
+{
+    for (size_t i = 0; i < said.size(); ++i) if (TownStands(said[i].pos, t) != 0) return 1;
+    TownKeyFinder keys;
+    for (size_t j = 0; j < t.keys.size(); ++j) keys.Add(0, t.keys[j], j);
+    for (size_t i = 0; i < said.size(); ++i)
+        for (size_t k = 0; k < said[i].keys.size(); ++k) if (keys.Find(0, said[i].keys[k], 0) != 0) return 1;
+    return 0;
+}
+/* the slot's rows on file a whole SAY (said) does not hold - 0 = none (the caller then needs no registry look) */
+inline size_t RowsUnheld(const std::vector<TownRow>& all, int slot, const std::vector<TownRow>& said)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < all.size(); ++i) if (all[i].owner == slot && SaidHolds(said, all[i]) == 0) ++n;
+    return n;
+}
+/* THE ROWS KEPT FOR THE SLOT: its rows on file the whole SAY does not hold while their outpost id still has live pieces of the slot
+   (live.Count), in their order (owner = slot); *counts (when not 0) gets each kept row's live piece count beside it. A row with no id
+   (none minted yet) is never kept. Empty = the SAY is taken as it always was. took (when not 0, T-1158 step 6 Lost Post): the rows of
+   `all` a said row took over (ReplaceSlotTowns) - only they are held by the SAY, a said row naming a row's key holds nothing */
+inline std::vector<TownRow> LostWhileLinked(const std::vector<TownRow>& all, int slot, const std::vector<TownRow>& said, const OutpostPieces& live,
+                                            std::vector<int>* counts, const std::vector<int>* took = 0)
+{
+    std::vector<TownRow> o;
+    if (counts != 0) counts->clear();
+    for (size_t i = 0; i < all.size(); ++i)
+    {
+        if (all[i].owner != slot || all[i].id == 0) continue;
+        if (took != 0 ? (i < took->size() && (*took)[i] != 0) : SaidHolds(said, all[i]) != 0) continue;
+        const int n = live.Count(slot, all[i].id);
+        if (n <= 0) continue;
+        o.push_back(all[i]);
+        if (counts != 0) counts->push_back(n);
+    }
+    return o;
+}
+/* after ReplaceSlotTowns took the SAY: the kept rows back on file (their ids with them), behind the said ones, while the slot has
+   fewer than kMaxTownsPerSlot; a kept row the slot's rows already hold (its id or its centre - a SAY not read whole keeps the rows it
+   does not name) is not put on file twice. A said row that only names one of its pieces does not hold it (T-1158 step 6, Lost Post:
+   a piece moved into another outpost; the kept row stays while live pieces name its id) */
+inline void KeepLostRows(std::vector<TownRow>* all, int slot, const std::vector<TownRow>& lost)
+{
+    size_t mine = 0;
+    for (size_t i = 0; i < all->size(); ++i) if ((*all)[i].owner == slot) ++mine;
+    for (size_t i = 0; i < lost.size() && mine < kMaxTownsPerSlot; ++i)
+    {
+        int same = 0;
+        for (size_t j = 0; j < all->size() && same == 0; ++j)
+        {
+            if ((*all)[j].owner != slot) continue;
+            if ((lost[i].id != 0 && (*all)[j].id == lost[i].id) || TownStands((*all)[j].pos, lost[i]) != 0) same = 1;
+        }
+        if (same != 0) continue;
+        TownRow t = lost[i]; t.owner = slot;
+        all->push_back(t); ++mine;
+    }
+}
+/* THE LIST A GAME IS SENT: the reset's kept outposts, then the kept rows of its own player (owner = its slot, size level 0 as a LIST
+   row carries it) that no kept outpost already stands for; rows a LIST cannot carry are counted in *bad */
+inline std::vector<TownRow> ListWithOwn(const std::vector<TownRow>& kept, const std::vector<TownRow>& own, int slot, size_t* bad)
+{
+    std::vector<TownRow> o;
+    if (bad) *bad = 0;
+    for (size_t i = 0; i < kept.size(); ++i) { if (RowOk(kept[i], kOpList)) o.push_back(kept[i]); else if (bad) ++*bad; }
+    const size_t keptN = o.size();
+    for (size_t i = 0; i < own.size(); ++i)
+    {
+        TownRow t = own[i]; t.owner = slot; t.level = 0;
+        int dup = 0;
+        for (size_t j = 0; j < keptN && dup == 0; ++j) if (o[j].owner == slot && TownStands(t.pos, o[j]) != 0) dup = 1;
+        if (dup != 0) continue;
+        if (RowOk(t, kOpList)) o.push_back(t); else if (bad) ++*bad;
+    }
+    return o;
+}
+/* THE WORLD SERVER'S ORDER FOR ONE SAY OF `slot` (store_main.cpp OnTowns), one pure step. said = the rows on file; rows = the SAY;
+   emptyRun = EmptyWholeRun after it; live = the registry; lastSent = the outpost ids this link was last sent back. The whole SAY
+   holds a row only when a said row took it over (ReplaceSlotTowns' took - T-1158 step 6, Lost Post: a new outpost naming a moved
+   piece's key held the piece's old row by that key, so the row was neither kept nor let go and was dropped with no line). held: the
+   slot's rows the whole SAY does not hold while live pieces name their ids (LostWhileLinked; heldN their counts); unheld: the slot's
+   rows the whole SAY does not hold and nothing keeps (let go). ignored = 1: an empty SAY not taken (EmptySayIgnored) - the file
+   stays as it is, the held rows on it. Else next = the file after ReplaceSlotTowns and KeepLostRows. back: the held rows the file keeps after
+   this SAY (by id - KeepLostRows stops at kMaxTownsPerSlot; capped counts the held rows it left out), the only rows sent back;
+   send = 1 when their ids differ from lastSent (a list that reads the same is not sent again); forget = 1: a whole SAY that leaves
+   nothing to send back - the link's sent record is cleared, so a later loss is sent again */
+struct SayKeep
+{
+    std::vector<TownRow> held, unheld, next, back;
+    std::vector<int> heldN;
+    std::set<unsigned> backIds;
+    int ignored, send, forget;
+    size_t capped;
+    SayKeep() : ignored(0), send(0), forget(0), capped(0) {}
+};
+inline void SayKeepStep(SayKeep* o, const std::vector<TownRow>& said, int slot, const std::vector<TownRow>& rows, int whole, int emptyRun,
+                        const OutpostPieces& live, const std::set<unsigned>& lastSent, unsigned* nextId, const std::vector<TownRow>* carried)
+{
+    *o = SayKeep();
+    std::vector<TownRow> after(said);
+    std::vector<int> took;
+    unsigned mint = nextId != 0 ? *nextId : 0;   /* the ids minted count only when the SAY is taken */
+    ReplaceSlotTowns(&after, slot, rows, whole, nextId != 0 ? &mint : 0, carried, &took);
+    if (whole != 0)
+    {
+        o->held = LostWhileLinked(said, slot, rows, live, &o->heldN, &took);
+        for (size_t i = 0; i < said.size(); ++i)
+        {
+            const TownRow& t = said[i];
+            if (t.owner != slot || took[i] != 0) continue;
+            int kept = 0;
+            for (size_t j = 0; j < o->held.size() && kept == 0; ++j) if (t.id != 0 && o->held[j].id == t.id) kept = 1;
+            if (kept == 0) o->unheld.push_back(t);
+        }
+    }
+    o->next = said;
+    o->ignored = EmptySayIgnored(said, slot, rows.size(), emptyRun);
+    if (o->ignored != 0) o->unheld.clear();   /* nothing is let go by a SAY not taken */
+    else
+    {
+        o->next.swap(after);
+        if (nextId != 0) *nextId = mint;
+        if (!o->held.empty()) KeepLostRows(&o->next, slot, o->held);
+    }
+    for (size_t i = 0; i < o->held.size(); ++i)
+    {
+        int on = 0;
+        for (size_t j = 0; j < o->next.size() && on == 0; ++j) if (o->next[j].owner == slot && o->next[j].id == o->held[i].id) on = 1;
+        if (on != 0) { o->back.push_back(o->held[i]); o->backIds.insert(o->held[i].id); }
+        else ++o->capped;
+    }
+    o->send = (!o->backIds.empty() && o->backIds != lastSent) ? 1 : 0;
+    o->forget = (whole != 0 && o->backIds.empty()) ? 1 : 0;
+}
+/* T-1158 step 6 (D2, run T1823): A KEPT ROW SENT BACK WITH ITS LIVE PIECES' KEYS. A row the world server keeps for a game that died
+   can name no keys (the outpost was founded and built in before the game's next SAY): the game's kept-outpost look then has nothing to
+   found it by. At send time only (player-towns.txt is not changed), each row of `slot` with an id gets the keys of the live pieces
+   whose own records name that id (keysById: OutpostPieces::KeysOf, asked for kMaxTownKeys + 1 so a longer list shows), each once in
+   its wire form (poskey::WireForm - a key of kKeyCap..63 characters by its hash, as a SAY names it), behind the keys it has, while it
+   has fewer than kMaxTownKeys. A row that had to leave a key out (the cap, a key with no wire form) is marked cut. Returns the keys
+   added */
+
+inline size_t FillKeptKeys(std::vector<TownRow>* rows, int slot, const std::map<unsigned, std::vector<std::string> >& keysById)
+{
+    size_t added = 0;
+    for (size_t i = 0; i < rows->size(); ++i)
+    {
+        TownRow& t = (*rows)[i];
+        if (t.owner != slot || t.id == 0) continue;
+        std::map<unsigned, std::vector<std::string> >::const_iterator ks = keysById.find(t.id);
+        if (ks == keysById.end()) continue;
+        std::set<std::string> have(t.keys.begin(), t.keys.end());
+        for (size_t k = 0; k < ks->second.size(); ++k)
+        {   /* review MED-1: a record header's key is up to 63 characters; the wire names a long one by its hashed form, as a SAY does */
+            char wf[poskey::kKeyCap];
+            if (poskey::WireForm(ks->second[k].c_str(), wf, poskey::kKeyCap) == 0) { t.cut = 1; continue; }
+            const std::string key(wf);
+            if (have.count(key) != 0) continue;
+            if (!keptwire::TextOk(key, keptwire::kKeyMax, false)) { t.cut = 1; continue; }
+            if (t.keys.size() >= kMaxTownKeys) { t.cut = 1; break; }
+            t.keys.push_back(key); have.insert(key); ++added;
+        }
+    }
+    return added;
+}
+/* the player's rows on file (said) a link was last sent back (ids), in file order - what that link's next LIST carries again */
+inline std::vector<TownRow> HeldRowsOf(const std::vector<TownRow>& said, int slot, const std::set<unsigned>& ids)
+{
+    std::vector<TownRow> o;
+    for (size_t i = 0; i < said.size(); ++i) if (said[i].owner == slot && said[i].id != 0 && ids.count(said[i].id) != 0) o.push_back(said[i]);
+    return o;
+}
+/* THE GAME'S SIDE (build.cpp TlRestoredTick): A REBUILT PIECE'S WAIT FOR ITS LOST OUTPOST ENDS. While a piece rebuilt from its own
+   record waits, its record keeps the outpost id it names (TlOwnMark and PcrTownFill hold it), so it must not wait for a town that
+   will not come here (the row's key matched no piece, its founding failed, or the look took another town of the player). keysSettled
+   = every key of the kept row that stands for the id is settled here (linked, failed or given up), or no kept row of this player is
+   open when none stands for it - counted only once a whole SAY has been answered on this link (heardWhole > 0; run T1835: armed at
+   sent 0 before any LIST row came, then released on SAY 1's answer before the next SAY's SHOW named the rebuilt outpost; the world
+   server sends a SAY's LIST and SHOW before its HEARD, so by then the kept rows and the ids are read). Settled with no town of the id
+   here ARMS the wait at sentWhole, the count of whole SAYs this game has SENT on this link. Sending a SAY is not its answer (run
+   T1823: a SAY sent, then the release in the same drain, 13 ms before the kept row came back): the wait ends only when heardWhole - the whole SAYs the world server has ANSWERED with HEARD (protocol 137), each
+   after any LIST that SAY caused - passes the armed count, so a whole SAY sent after the arm has been answered and still no town of
+   that id stands here; the piece's record then follows the town the game really put it in. A SAY lost on the way leaves heardWhole
+   one behind: the release comes one answered SAY later. Keys open again, or no SAY answered yet: the arm is dropped (and every LIST
+   read drops all arms: build.cpp BuildTownsNote). A town of the id here: the look links the piece (no step). No timer. All three
+   counts are of one link (a new link starts them again). */
+const int kRsWait = 0, kRsArm = 1, kRsDisarm = 2, kRsRelease = 3;
+inline int RestoredWaitStep(int townHere, int keysSettled, long long sentWhole, long long heardWhole, long long armedAt)
+{
+    if (townHere != 0) return kRsWait;
+    if (keysSettled == 0 || heardWhole <= 0) return armedAt >= 0 ? kRsDisarm : kRsWait;   /* no SAY answered yet: no row is settled */
+    if (armedAt < 0) return kRsArm;
+    if (heardWhole > sentWhole) return kRsWait;   /* counts of two links: not read as an answer */
+    return heardWhole > armedAt ? kRsRelease : kRsWait;
+}
+/* T-1078 (owner 1475 b): THE GAME'S [BUILD] town mismatch LINE (build.cpp BdTwm*) - a piece of this player's own base whose town is not
+   one of its owner's own towns. top: 1 a top-level building, 0 one standing inside a building (it keeps its host's town), -1 unread
+   (looked at as top-level). linkKind: what its own town words name (kLinkNone / kLinkOtherLive / kLinkOwnLive, -1 unread); linkNull:
+   its words are the null handle (0xB). lookupOwn: the engine's town lookup (the name the game shows - a piece whose own link names no
+   live town takes the nearest town's) reads a live town of the owner's faction. Answer: kTmNone, or which mismatch (the line's link=
+   word comes from TmLinkWord). A link that did not read with an own lookup is not a mismatch (a read fault is not the bug). */
+const int kTmNone = 0, kTmNullLink = 1, kTmDeadLink = 2, kTmOtherLink = 3, kTmLookup = 4, kTmHostLookup = 5;
+inline int TmMismatch(int top, int linkKind, int linkNull, int lookupOwn)
+{
+    if (top == 0) return lookupOwn != 0 ? kTmNone : kTmHostLookup;
+    if (linkNull != 0) return kTmNullLink;
+    if (linkKind == kLinkNone) return kTmDeadLink;
+    if (linkKind == kLinkOtherLive) return kTmOtherLink;
+    return lookupOwn != 0 ? kTmNone : kTmLookup;   /* an own link (or an unread one) with a foreign / no lookup town */
+}
+inline const char* TmLinkWord(int linkKind, int linkNull)
+{
+    if (linkNull != 0) return "null";
+    if (linkKind == kLinkNone) return "dead";
+    if (linkKind == kLinkOtherLive) return "other";
+    if (linkKind == kLinkOwnLive) return "own";
+    return "unread";
+}
+/* the line's session cap: kTmSay = print it, kTmSayLast = print it and then the cap line, kTmHold = only counted. said = lines printed
+   before this one */
+const int kTmSay = 0, kTmSayLast = 1, kTmHold = 2;
+const long long kTmCap = 60;
+inline int TmCapStep(long long said, long long cap)
+{
+    if (said >= cap) return kTmHold;
+    return said + 1 == cap ? kTmSayLast : kTmSay;
+}
+/* once per piece per state change: a piece is printed again only when its state (mismatch, lookup town, link town) differs from the
+   one it was last printed with; a piece back in an own town forgets its state, so going wrong again prints again */
+inline bool TmChanged(const std::map<std::string, unsigned long long>& last, const std::string& key, unsigned long long sig)
+{
+    std::map<std::string, unsigned long long>::const_iterator it = last.find(key);
+    return it == last.end() || it->second != sig;
 }
 
 }   /* namespace townkeep */

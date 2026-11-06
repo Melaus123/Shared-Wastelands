@@ -28,7 +28,8 @@
 namespace areafresh {
 
 const unsigned int kMsgAreaFresh = 89u;   /* 28-87 are taken on the world-server link (store_main.cpp's enum and constants); 88 is CHUNK on effort/t1118f / t1118g (part 3) */
-const unsigned int kProtocol = 133u;      /* the world-server protocol that carries AREA_FRESH (127 since part 3 moved it to 89) */
+const unsigned int kProtocol = 145u;      /* the world-server protocol that carries AREA_FRESH (127 since part 3 moved it to 89) */
+
 
 enum { kAsk = 1, kWrite = 2, kCant = 3, kFresh = 4 };
 const size_t kMsgSize = 20;

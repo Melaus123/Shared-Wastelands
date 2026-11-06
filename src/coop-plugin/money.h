@@ -23,4 +23,9 @@ void MoneyArrive(unsigned type, const std::vector<char>& payload);
 int MoneyHave(int* money);
 int MoneySend(int slot, const std::string& name, const std::string& typed, std::string* hint);
 
+// T-478 (owner 1447 b) TEST-ONLY: the command-file lever `money [<amount>]` - with an amount, this game's player faction's money
+// becomes <amount> through the game's own Ownerships::takeMoney, on this file's road (only when StoreMoneyReady, pp.money written at
+// once, undone when it cannot be); alone, the money is printed. Logs [TEST] money before=<n> after=<n>. The status line. MAIN THREAD.
+std::string MoneyTestCommand(const std::string& args);
+
 }

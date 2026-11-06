@@ -107,8 +107,11 @@ struct ItemMoveMsg
     int rqtHas;
     unsigned int rqtId;
     int rqtSlot;
+    // T-1214 (protocol 203, src/common/spotsync.h): ADD only - the building item spot that holds this item on the area's holder (an
+    // 'SPT1' block after GEM1); has 0 = not a spot item, nothing on the wire. The receiver gives the item to its own spot there.
+    spotsync::SpotMark spot;
     ItemMoveMsg() : uid(0), op(0), x(0), y(0), quantity(0), quality(0.0f), charges(0.0f),
-                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0), made(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); gearLocal = 0; gearLocalUniform = 0; }
+                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0), made(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); gearLocal = 0; gearLocalUniform = 0; spotsync::SpotMarkClear(&spot); }
 };
 
 // E22b / decision 38 part (2). A player touched an inventory this game does NOT own. The local half of the
@@ -293,11 +296,24 @@ int ItemRefuseNextFires(int kind, unsigned int id);   /* 1 = the lever was armed
    [ITEMS] itemrefuse fired take, and turns the lever off - the take is then refused on its ordinary road. 0 = not armed or not a take. */
 int ItemRefuseTakeFires(const ItemRequestMsg& r, unsigned int fromPeer);
 std::string ItemRefuseCommand(const std::string& arg);
+/* T-1181 TEST-ONLY `handtest fill <otherSlot> <n> [dst|src] | unread <n> | count | clear-test` (command channel), MAIN THREAD: open
+   hand-over lines naming one other player written through the real write (the 64-per-player and 256 caps apply - peerFull / lineFull),
+   lines this build cannot read added to pp.handover and moved by the load path (unreadMoved), both files counted (read only), or the
+   lever's own lines taken out of both files - so a run can reach the T-1181 limits (hovrec::kHandTestSlot names the lever's lines).
+   Refused with no records store open. Returns the status line; one [HAND] handtest line. Not a game feature. */
+std::string HandTestCommand(const std::string& arg);
 // E22a TEST LEVER, MAIN THREAD, command channel only: give `count` of the item named by `baseSid` to the
 // first LOADED character whose name contains `needle` AND whose uid this game owns, through the engine
 // own add - so the transfer hook fires here and the other game ghost gains the item. Not a game feature.
 bool ItemTest(const std::string& needle, const std::string& baseSid, int count);
 int ItemsGiveMaterial(void* character, const std::string& sid, int qty, int* unitsOut);   /* help1: a refused construction material back to an own character - 1 taken, 0 not, -1 faulted; T-447: *unitsOut = the units placed (on 0, those placed before the refusal) */
+/* T-1205 /additem, MAIN THREAD: the game's item records (GameData type ITEM, 4) whose names start with `typed` (any ASCII case), as
+   (name, record id) rows, at most 4096. false = the game's records could not be read (no world). */
+bool ItemsNamed(const std::string& typed, std::vector<std::pair<std::string, std::string> >* rows);
+/* T-1205 /additem, MAIN THREAD at the K2 safe point: `qty` of the item record `sid` (an item, weapon, armour or crossbow) made with
+   the record's defaults and put into `character`'s inventory. 1 all went in; 0 some or none (*unitsOut = those that did); -1 the
+   engine's add faulted; -2 not made (*why). */
+int ItemsAdminMake(void* character, const std::string& sid, int qty, int* unitsOut, std::string* why);
 // E34 TEST LEVER, MAIN THREAD, command channel only: take the item at (`section`, x, y) out of the first
 // LOADED character whose name contains `needle` - ANY owner, the point being a character this game does NOT
 // own - and put it into the local player's FIRST player-faction character, through the engine's own transfer
@@ -334,6 +350,11 @@ bool BoxTestIn(const std::string& needle, const std::string& baseSid, int count,
    (any case, one or more words); show and work take the first such match, or with near= the one nearest that x,z.
    [JOB] lines. MAIN THREAD, command channel only. */
 std::string JobTestCommand(const std::string& arg);
+/* T-1212: the click order a refused take ended, given again - this game's own character `who` gets the order a player's right click
+   on `building` gives: the building's own task rule (vtable +0x418, *task) through the engine's giveOrder (row AddOrder), Shift 0,
+   old orders cleared. 1 given, 0 no AddOrder row, -1 the order call faulted, -2 no work task (storage-class piece, no task, no
+   character), -3 reading the rule faulted. MAIN THREAD (farm.cpp's FarmTick). */
+int JobClickReorder(void* who, void* building, int* task);
 /* P43 TEST LEVER cagetest's candidates: up to `cap` loaded buildings (flat walk and furniture rows) whose record name says cage
    and whose class is UseableStuff, nearest to `from` first, with their position keys and names. Counts what was scanned, how
    many were named like a cage, and the first named one of another class. MAIN THREAD. */
@@ -377,6 +398,7 @@ std::string BoxListCommand(const std::string& arg);
    holder queues the asked rows and answers kParityServeBudget per ItemsTick; the asker swaps a CONTENTS answer in at once. */
 void TownPricesNote(const char* p, size_t n, unsigned int fromPeer);   /* T-619, MAIN THREAD: a TOWN_PRICES payload, by the session link or relayed by the world server (fromPeer a relay key) */
 void ParityNoteReq(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2: fromPeer = the asker, the answers go back to it
+void BoxLockNote(const char* p, size_t n, unsigned int fromPeer);   // T-1061, MAIN THREAD: one BOX_LOCK (boxrec.h); fromPeer = the sender, for a NO
 void ParityNoteBox(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2 fold 1: a box's contents are taken only from its writer (parityBoxNotWriter)
 void ShopPendAskedGone(int slot, int linkLoss);   // T-1007 (J) MAIN THREAD (session.cpp): every pending shop request asked of that player (slot < 0: none by slot), and with linkLoss 1 every one asked over the session link before its latest edge (T-1007 (J2) coopshop::PendOnGone), is settled as the lapse settles one - a late answer is still handled
 void ShopAppliedForgetGame(int slot);   // T-1007 (J1) MAIN THREAD (session.cpp OnPlayerGone): that player's applied shop records are dropped - it can never ack or revoke them
@@ -387,8 +409,22 @@ void SweepNumberNext(void* ap);   // T-1007 (J) MAIN THREAD (worldsync.cpp): a t
 void ItParityForgetAsker(int slot);   // MAIN THREAD: that player's link ended - its recorded sector asks no longer route fill pushes to it (slot -1: every game's)
 std::string BoxDigestCommand(const std::string& arg);   /* par1: `boxdigest [<x>,<y>|ring|all]` - read-only: [PARITY] box key=.. items=.. digest=.. per box (flat + furniture) and a total */
 std::string BoxInfoCommand(const std::string& arg);   /* TEST `boxinfo <boxKey> [sid]` - read-only: each section's size, accepts list, used / free squares, and whether a sid's kind is allowed */
+/* T-1242 TEST-ONLY `boxput <buildingKeyPart> <item sid> [count 1..100]` (decision 1492 a): items made and put straight into this game's
+   OWN building's storage by the engine's own add; prints the full key, the owner and the items before / after. MAIN THREAD. */
+std::string BoxPutCommand(const std::string& arg);
+/* T-1242 (store.cpp's research-books block): the bench reads and writes it needs. MAIN THREAD. */
+typedef int (*ItBenchKeepFn)(void* b, int facIndex, void* ctx);   /* 1 = keep (counts toward the cap), 0 = skip */
+int ItBenchesOwnedBy(void* const* facs, int nf, ItBenchKeepFn keep, void* ctx, int cap);   /* the ones `keep` takes (filtered before the cap) of the loaded buildings / furniture with an inventory owned by one of facs */
+bool ItBenchKey(void* b, std::string* key);                       /* the bench's position key */
+void* ItBenchByKey(const std::string& key, int* several);          /* the one loaded bench with exactly that key, 0 none / several */
+long long ItBenchCount(void* b, const std::string& sid);          /* its total of sid, -1 unreadable */
+int ItBenchIsMine(void* b);                                        /* 1 this game's own player faction's, 0 not, -1 unreadable */
+bool ItGdSidOf(void* gd, std::string* sid);                        /* a GameData's stringID */
+void* ItGdOfSid(const std::string& sid);                           /* the GameData of a stringID, 0 unknown */
+int ItBenchGiveBack(void* b, const std::string& sid, int count, std::string* why);   /* the engine's own add, one by one; the number added */
+int ItResearchConsumeCall(void* research, void* data, int need);   /* the engine's take 0x82DA30 through its hooked entry: 1 ran, 0 no row, -1 fault */
 std::string RestockNowCommand(const std::string& arg);   /* par2: TEST-ONLY `restocknow <x>,<y>` - arms the lever; holder squads only. T-1 B2: `restocknow wander near` */
-std::string TraderSpawnCommand(const std::string& arg);   /* T-1 TEST-ONLY `traderspawn [dist]` - arms the lever: one wandering trader caravan beside this game's player through the engine's own createRandomSquad */
+std::string TraderSpawnCommand(const std::string& arg);   /* T-1 TEST-ONLY `traderspawn [dist] [animals]` (T-478: animals = the Nomads' animal seller squad) - arms the lever: one wandering trader caravan beside this game's player through the engine's own createRandomSquad */
 std::string BoxOpenCommand(const std::string& arg);      /* parity3: TEST-ONLY `boxopen <n>` - opens the n nearest non-player boxes one after another through the engine's loot open, then closes them */
 void RestockNowDrain();                                   /* par2: the lever itself, at the K2 safe point (combat.cpp) */
 void ItWanderRestockNote(void* ap);   /* T-1 B2: MAIN THREAD - note a wandering squad's packs and wearers around this game's restock of it */
@@ -407,6 +443,11 @@ void ResearchModeMapEnd(bool complete);
 std::string ResearchModeStatus();                           /* loot2b: `researchmode` with no argument */
 /* loot2c (docs/design-loot2.md section 2 steps 3-5, 4A row "L2c' show/take"; T362): per-player research copies in BOXES */
 void ResearchNoteTakes(const std::vector<char>& payload);   /* MAIN THREAD - a RESEARCH_TAKE from the notebook (take rows; this player's own hide its copies) */
+/* T-1230 (src/common/tradewinguard.h): the open trade window's ShopTrader and the trader it keeps (+0xC0, a value never
+   dereferenced), and its close through closeAllInventories with the cursor item put back first. MAIN THREAD (items.cpp). */
+int ItTradeWinRead(void** st, void** trader, int* facade, int* busy);
+int ItTradeWinClose(int putBack, int* cursorRoad, int* cursorBack);   /* putBack 0 on the backstop road (the trader may be freed) */
+std::string ItTradeWinCounts();
 void ItemsLootNoteDestroy(const void* obj, int justUnloaded);                 /* ANY THREAD - GameWorld::destroy 0x798F50 is about to free obj: a LIVE copy is touched (main thread, outside the engine's brackets) or retired (inside them) - pointer compare only */
 /* loot2c part A (user decision 2026-09-26, "yours on first touch"): the touch routes, stamped on a copy by the engine-call detour that saw it */
 const int kLootTouchRemove = 1, kLootTouchSplit = 2, kLootTouchQuantity = 3, kLootTouchMergedAway = 4, kLootTouchPartial = 5, kLootTouchDestroyed = 6,
@@ -506,6 +547,13 @@ int  ShopRepairAsk(void* ap);
 int  ShopHolderExact(const float* pos);
 std::string ShopRestockDueCommand(const std::string& homeKey);
 std::string ShopKeeperMoneyCommand(const std::string& homeKey, const std::string& squad, int amount);
+/* T-478 step 5 (T2017): KeeperPot - an NPC squad member's squad pot (the leader's getOwnerships()->money; 1 read, 0 refused: a
+   player faction's purse, a stand-in, no squad, or a faulted read) - also read by spawn.cpp's selling window line.
+   NpcMoneyCommand: the TEST-ONLY lever `npcmoney <amount> <uid | name:<Name> | spawned:<Template>[#k]>` (DEV build) - the money of
+   the NPC squad that character is in becomes <amount> on the game that runs the squad's formal leader; its announcement carries it
+   to the other game's copy. One [TEST] npcmoney line. MAIN THREAD. */
+int KeeperPot(void* character, void** ownOut, int* catsOut);
+std::string NpcMoneyCommand(long long amount, const std::string& who);
 std::string ShopReport();
 void ShopRecWorldTeardown();
 /* Trades through the shop record: ApRecorded / KeeperRecorded (character; countIt 1 = counted as an announcement skipped) /
@@ -560,6 +608,8 @@ std::string ItemTestConfirmDelayCommand(const std::string& arg);   /* give1: TES
    `itemtest givestolen <peer|name>` (GIVE the remembered stolen stack through the itemgive lever). [OWN] lines. */
 std::string ItemTestStealCommand(const std::string& arg);
 std::string ItemTestRcGiveCommand(const std::string& arg);   /* T-1079 TEST-ONLY: a give / take through the engine's right-click */
+std::string ItemTestLClickCommand(const std::string& arg);   /* T-1191 TEST-ONLY: a named character beside a named box, then the player's left click on it */
+std::string ItemTestBFacCommand(const std::string& arg);     /* T-1191 TEST-ONLY, read-only: the faction a named box carries on this game */
 std::string ItemTestStackGiveCommand(const std::string& arg);   /* T-1079 TEST-ONLY: units off our character onto a box's stack, no window */
 std::string ItemTestStolenCommand(const std::string& arg);
 std::string ItemTestGiveStolenCommand(const std::string& arg);
@@ -591,6 +641,7 @@ int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string&
 void ItemGearNoteSent(int blocks, unsigned int dropped);   /* session.cpp: GEM1 blocks written, fields that went empty */
 void ItemGearNoteBadRecv();   /* session.cpp: a RECEIVED GEM1 block that was malformed */
 void ItemBagNestNoteBadRecv();   /* session.cpp / clothing.cpp: a RECEIVED pack-row BAGN tail that was malformed */
+void GroundSpotNoteWire(int sent, int bad);   /* T-1214, session.cpp: an ADD's SPT1 block - sent 1 written / -1 would not encode (the item went without it); bad 1 a received one malformed */
 void ItemOwnParkNoteUid(unsigned int uid);   /* spawn.cpp, ANY THREAD: a uid registered here - stolen marks parked for it are tried at the next ItemsTick */
 void ItemOwnParkFrameStart();   /* command_channel.cpp, MAIN THREAD, first in the frame: a fresh park entry left from the last frame is dropped unread */
 void BoxTakeDrain();                                        /* the boxtake move itself, at the K2 safe point (combat.cpp) */
@@ -667,6 +718,9 @@ int  ObjectPositionKey(void* obj, char* out, int cap, const char* suffix, int co
 /* build1h H1, MAIN THREAD: a building's owner class (src/common/boxowner.h kOwn*) and its owner's slot - items.cpp's
    ItFactionOwnerClass, for the placement hand-off in build.cpp */
 int  BuildingOwnerClass(void* bld, int* slot);
+/* T-980, MAIN THREAD: 1 = the building's owner faction IS this game's player faction (pointer equality, as dialogue condition 0x7
+   tests it), 0 = another or none, -1 = unreadable or this game's faction not known */
+int  BuildingOwnerIsLocalPlayer(void* bld);
 /* par16 (parity P16), MAIN THREAD: who grows and harvests this farm - the production machines' writer (ItProdHolder's ladder:
    the owner's game while it is online and holds the area, else the area holder; the owner's hand-back gate). 1 this game,
    2 another game, 0 no answer (then nobody is held: both engines run as before). */
@@ -686,11 +740,46 @@ int  ProdWriterDecide(void* pb, int* slot);
    owner's game while it is online and holds the area, else the area holder), kept per building key for 250 ms:
    coopfarm::kProdWriterHere 1 this game, kProdWriterOther 2 another game, kProdWriterNone 0 no answer yet. */
 int  ProdStepWriterHere(void* pb);
+/* T-1192 (run T1894), ANY THREAD: the runner for a take that is not asked again (a prisoner's put-in) - on the main thread
+   ProdStepWriterHere; off it the ladder's off-main road, else the main thread's last keyed answer while coopfarm::kSpotRunnerFreshMs
+   fresh. *how = coopfarm::kRunRead*. */
+int  ProdRunnerForTake(void* pb, int* how);
 /* ANY THREAD: 1 when the building's operate slot is ProductionBuilding::operate (a mining node or a production machine). */
 int  ProductionBuildingIs(const void* b);
 /* MAIN THREAD (farm.cpp, MINE_OP work): the engine's own ProductionBuilding::operate(who, amount), unhooked, in a
    fault guard. 1 ran; 0 not (the hook is not installed, or the engine faulted). */
 int  ProdOperateRun(void* pb, void* who, float amount);
+/* T-1192: 1 when a building's work slot leads to one of the gated steps (production, crafting bench, furnace - coopfarm::WorkStepKind) */
+int  WorkStepBuildingIs(const void* b);
+int  ObjRecordNamePod(const void* obj, char* out, int cap);   /* T-1125: a building's record name (the game data's name), any thread; 1 read */
+int  WorkStepKindOf(const void* b);   /* T-1192: coopfarm::WorkStepKind of the building's work slot (kStepNone when unreadable) */
+/* T-1192, MAIN THREAD: A CRAFTING BENCH'S CRAFT PART (piecerec.h). CraftPartRead: the bench's switches, repeat and first craft list entries into
+   *lv's craft part (hasCraft 1); 1 read, 0 not a crafting bench or unreadable (the craft part cleared). CraftPartApply: a record's craft part
+   written onto this game's bench (a game that does not run it - the caller decides): the list made again through the bench's own clear
+   and CraftQueueAdd when it names other entries (the old entries' items destroyed: they are in no inventory), else the progress written;
+   then the input / output sections' switches through setEnabled and the repeat flag; all behind the applying guard. Returns the plan
+   (piecerec::kPcp*), -1 when the bench here is unreadable. */
+struct CraftApplyOut
+{
+    int plan, made, missing, dropped, progSet, secSet, repeatSet, fault, recipeSet;   /* recipeSet: the recipe switched to the first entry's (review fold) */
+    CraftApplyOut() : plan(0), made(0), missing(0), dropped(0), progSet(0), secSet(0), repeatSet(0), fault(0), recipeSet(0) {}
+};
+}   /* namespace coop: piecerec is a namespace of its own (src/common/piecerec.h) */
+namespace piecerec { struct PieceLive; }
+namespace coop {
+int  CraftPartRead(void* b, piecerec::PieceLive* lv);
+int  CraftPartApply(void* b, const piecerec::PieceLive& rec, CraftApplyOut* out);
+/* T-1192 (c), MAIN THREAD: 1 = a crafting bench (its work slot leads to the crafting step). CraftAskServe: the change a CRAFT_ASK names, made
+   on this game's bench the engine's own way (op powerwire::kCraftOp*): add - a recipe in the bench's own recipe list (0x2BBCE0) through its
+   CraftQueueAdd (progress 0, the asker's mode); remove - the entry at `index` through removeCraft 0x2B69E0 when it names that product and
+   row; repeat - the repeat flag +0x4CC set to `mode`. Returns powerwire::kCraftServe* (done, no bench, no record, not in the recipe list,
+   the list changed, fault) */
+int  CraftBenchIs(const void* b);
+int  CraftAskServe(void* b, int op, const std::string& sid, const std::string& extra, int mode, unsigned int index);
+/* T-1192 review fold, MAIN THREAD: the crafting window, when this game has seen it (a click on it) and the world stands, redrawn through
+   its own redraw 0x2B9540 - after an ask ends and after a record changed a copy's list. `why` names the moment in the counter line */
+void CraftWindowRedrawNow(const char* why);
+void CraftWindowForget();   /* world teardown: the window seen is forgotten */
 /* lever2 (TEST LEVER ONLY, buildtest farm): the farm's own box (ItBoxInventory) read the way ItParityContents reads a box:
    *stacks = the items in it, *quantity = their summed quantity. MAIN THREAD. 1 read; 0 not read (both -1). */
 int  FarmBoxItemCount(void* b, int* stacks, int* quantity);
@@ -836,5 +925,8 @@ int ItemLinkUnderMouse(const void* widget, const char* widgetName, int absLeft, 
    that uid / no character selected, kLinkEmpty = it carries nothing. *usedUid (when given) = that character's uid (0 = none / not
    in the uid table). MAIN THREAD. */
 int ItemLinkFirstOfCharacter(ItemLinkFacts* out, unsigned int uid, unsigned int* usedUid);
+/* T-1228: is a money trade window open now? 1 yes (*side = the non-player side the engine names, 0 when not plausible), 0 no, -1 the
+   question could not be asked. Reads only (InventoryGUI::isTradingForMoney_static 0x710240 under a guard). MAIN THREAD. */
+int TradeWindowSideNow(void** side);
 
 }

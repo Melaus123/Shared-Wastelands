@@ -722,8 +722,9 @@ bool ConfigWritePlayerName(const std::string& name, std::string* err)
    ConfigLoad and ConfigRearmFromFile are the two callers.  A second reader beside it would be the
    two-things-kept-in-step-by-hand shape 6a lesson 11 names, and the thing kept in step would be the
    meaning of the settings file. */
-extern unsigned char g_hostToken[];   /* store.cpp: this hosting's secret (HOST_TOKEN, the bridge's STEAM_ID) - a bench host takes the test file's hosttoken= */
+extern unsigned char g_hostToken[];   /* store.cpp: this hosting's secret (the Steam bridge shows it in each STEAM_ID) - a bench host takes the test file's hosttoken= */
 extern bool g_hostTokenSet;
+extern std::string g_hostOwnerPassword;   /* store.cpp: the owner password this host's game shows at its world's door - a bench host takes the test file's ownerpw= */
 static int ConfigReadFileInto(std::string* whyOut)
 {
     /* PP3: THE TEST FILE FIRST. The DLL-side shared_wastelands.cfg names the data folder (datadir=) and the bench folders, and its
@@ -901,7 +902,7 @@ static int ConfigReadFileInto(std::string* whyOut)
     g_joinViaWorld = fields.joinViaWorld;   /* M11a S1 */
     const int wanted = fields.role;
     /* TEST ONLY: a host the bench armed at start, whose world server the bench started with --host-token, holds that secret from the
-       bench's test file (tf - never session.cfg), so it proves HOST_TOKEN as a game that started its own world server does. A real
+       bench's test file (tf - never session.cfg), so its Steam bridge shows it as a game that started its own world server does. A real
        host gets the secret from its own world-server start or the HOST panel's host.key. The value is never logged. */
     if (atStart && haveTestEff && wanted == kRoleHost && !tf.hostToken.empty())
     {
@@ -914,6 +915,17 @@ static int ConfigReadFileInto(std::string* whyOut)
         }
         SecureZeroMemory(tok, sizeof tok);
     }
+    /* T-1158 TEST ONLY: a host the bench armed at start, whose world's rules.txt the bench wrote an owner password into before it
+       started the world server, holds that password from the bench's test file (tf - never session.cfg) as the one its HOST press would
+       have read or made there (StoreWriteWorldPassword), so it proves it at the world's door and logs in as the owner by itself, as
+       after HOST. A real host's game gets it only from its HOST press. A later HOST press replaces it. The value is never logged. */
+    if (atStart && haveTestEff && wanted == kRoleHost && !tf.ownerPw.empty())
+    {
+        if (!g_hostOwnerPassword.empty()) SecureZeroMemory(&g_hostOwnerPassword[0], g_hostOwnerPassword.size());
+        g_hostOwnerPassword = tf.ownerPw;
+        DebugLog("[CFG] TEST ONLY: ownerpw= - this game holds the owner password the bench wrote into its world's rules.txt, as a HOST press would (not logged)");
+    }
+    if (!tf.ownerPw.empty()) SecureZeroMemory(&tf.ownerPw[0], tf.ownerPw.size());
 
     ::InterlockedExchange(&g_role, (long)wanted);
     if (atStart && haveTestEff && wanted != kRoleSingle)   /* T-202: only the harness's test file can do this */

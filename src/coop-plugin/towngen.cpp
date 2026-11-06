@@ -35,6 +35,11 @@
 #include "../common/townrefill.h"   /* each town's recorded losses, the record tally and the one-refill decision - the SAME header the world server and the offline suite compile */
 #include "../common/emptytown.h"   /* the unexplained-empty-town facts, verdict, once-per-town rule and line - the SAME header the offline suite compiles */
 #include "../common/areadrop.h"    /* the area map's frozen answer (kAreaFrozen), told apart from "not held" */
+#include "../common/wanderspawn.h"   /* T-1235: the [SPAWN] wander line's distances and cap - the SAME header the offline suite compiles */
+#include "replicate.h"   /* T-1235: PlayerCharSpots - every player's characters here */
+#include "camp.h"        /* T-1235: CampViewPoint - this game's view point and the engine's spot distance */
+#include "playerstab.h"  /* T-1235: PlayersTabPlayerWords - a player's name by slot */
+#include "game/Faction.h"   /* T-1235: Faction::getName (main thread) */
 
 namespace coop {
 /* T-392 (owner 335 a): items.cpp's position key and its resolver (items.h declares the same three) - a building set aside
@@ -46,6 +51,7 @@ int  BoxKeyCap();   /* T-392 fold (review H1): items.cpp's kBoxKeyCap - the reso
 int  PlatoonSetHomeBuildingPod(void* platoon, void* building);   /* spawn.cpp: Ownerships::setHomeBuilding for a group, guarded - 1 called, 0 no address or a fault */
 int  BuildRowPendingFor(void* building);   /* build.cpp: another game's PLACE or STATE for this piece still waits here - 1 yes, 0 no, -1 key unreadable */
 int  BuildKeyPlayerPiece(const char* key);   /* build.cpp, MAIN THREAD: the build records name a player as the owner of the piece at this key - 1 yes, 0 no, -1 not asked */
+int  BdStandInBasesPod(float* xs, float* zs, float* rs, int* slots, int cap, int* leftOut);   /* build.cpp, MAIN THREAD: T-1235 - every other player's base town here (centre, radius, slot); -1 the list did not read */
 namespace {
 
 unsigned long long kCreateRandomUnloadedSquadRva = 0; static coop::AddrReg kCreateRandomUnloadedSquadRva_reg("CreateRandomUnloadedSquad", &kCreateRandomUnloadedSquadRva);   /* P8h: the address table fills this. Steam_1.0.65 0x57EA30 */   // RootObjectFactory::createRandomUnloadedSquad(Faction*, Vector3, ..., TownBase* home (param 4), ..., SquadType (param 13))
@@ -372,6 +378,7 @@ int SpawnPosPod(const void* pos, float* out)
 }
 int TownSidPod(void* town, char* out, int cap)
 {
+    if (town == 0) return 0;   /* T-929: a group with no home town (towngen gate) - no record to read */
     __try
     {
         void* gd = ((RootObjectBase*)town)->getRecord();
@@ -462,6 +469,261 @@ static bool BarPendOwes(void* town) { return BarPendHas(town) || OwedBarHasTown(
 static void T515AsideState(void* b, void* tmpl, const char* road);   /* T-515: defined beside the set-aside entries */
 static void T515RefusedState(void* b, void* tmpl, int teardown, const char* road);
 static int T591PendingAside(const char* sid, const char* holder);   /* defined after the residents gate */
+/* T-1235: THE [SPAWN] wander LINE (release; the line itself touches no game state; nothing is sent - the keep-away refusal is below). For each WANDERING group this game makes (the
+   holder's grant below; wanderspawn::IsWanderCreation - ZoneManager 0x8F7190's call, the spawn region's record as param 9): its
+   template, faction, spot, area, this game's camera distance and the distance to the nearest character of EVERY player.
+   THREADS. The creation runs on the engine's threaded spawn check (ZoneManager::spawnChecksUpdateThreaded 0x8F8370) - the caller
+   line reads `thread=other` for it (runs T2002-T2010, caller rva 0x8F85B6). So the hook reads only what is safe on any thread: its
+   own argument (the spot, SpawnPosPod), the area (SectorOf), the template's record strings (a GameData record never freed while the
+   game runs; guarded reads) and the faction pointer, kept as a number. Everything else is read on the MAIN THREAD by WanderDrain
+   (TownGenTick, the next frame): the faction's name, every player's characters (PlayerCharSpots), the camera (CampViewPoint),
+   the players' names - then the distances, the cap and the line. A full queue is a count (queueLost), never a wait. */
+struct WanderRow { float x, y, z; int sx, sy; void* faction; unsigned long long rva; int off; DWORD at; char tName[64], tSid[64];
+                   int verdict; float nearest; int nSlot, nOwn; float baseR; DWORD snapAge; };   /* T-1235 keep-away: verdict wanderspawn::k*, set for a refusal only */
+const int kWanderQueueCap = 64;
+WanderRow g_wanderQ[kWanderQueueCap]; int g_wanderQN = 0;   /* under g_tgLock */
+volatile LONG64 g_wanderMade = 0, g_wanderQueueLost = 0, g_wanderNoSpot = 0;   /* any thread */
+long long g_wanderPrinted = 0, g_wanderNearOverCap = 0, g_wanderFar = 0, g_wanderNoChar = 0, g_wanderMainN = 0, g_wanderOffN = 0,
+          g_wanderInsideView = 0, g_wanderNoView = 0;   /* main thread (WanderDrain) */
+float g_wanderMinNear = -1.0f, g_wanderMinOther = -1.0f;   /* main thread: the smallest nearest distance, and the smallest to another player's character */
+/* T-1235 THE KEEP-AWAY (wanderspawn.h; owner decision 1478 b): every live player character's ground spot and every other player's base,
+   filled by the MAIN THREAD every frame (WanderSnapFill; the bases once a second) and read by the creation hook on ANY THREAD - both
+   under g_tgLock; the hook never calls into an engine object for it. g_wsFilled 0 until the first fill. */
+wanderspawn::Pc g_wsPcs[wanderspawn::kMaxPcs]; int g_wsPcN = 0, g_wsPcLost = 0;
+wanderspawn::Base g_wsBases[wanderspawn::kMaxBases]; int g_wsBaseN = 0, g_wsBaseLost = 0, g_wsBaseUnread = 0;
+int g_wsFilled = 0, g_wsBaseOnce = 0; DWORD g_wsPcAt = 0, g_wsBaseAt = 0;   /* under g_tgLock */
+volatile LONG64 g_wanderRefusedNear = 0, g_wanderRefusedBase = 0, g_wanderRefusedStale = 0, g_wanderBaseSkipped = 0;   /* any thread (the hook) */
+volatile LONG g_wanderStaleWhy = 0;   /* any thread: the last stale-snapshot refusal's wanderspawn::kStale* */
+long long g_wanderRefusedPrinted = 0, g_wanderRefusedOverCap = 0;   /* main thread (WanderDrain) */
+long long g_wsFullFrames = 0; int g_wsFullMost = 0, g_wsStaleLines = 0;   /* main thread: frames whose character list was full, the most left out; stale-run lines */
+wanderspawn::StaleRun g_wsStaleRun;   /* main thread */
+/* MAIN THREAD (WanderSnapFill): one line when stale-snapshot refusals start and one when they stop (wanderspawn::StaleEdge; capped) */
+static void WanderStaleEdge(DWORD now)
+{
+    const long long cur = (long long)::InterlockedCompareExchange64(&g_wanderRefusedStale, 0, 0);
+    const int ev = wanderspawn::StaleEdge(&g_wsStaleRun, cur, (unsigned long)now);
+    if (ev == 0 || g_wsStaleLines >= wanderspawn::kStaleLineCap) return;
+    ++g_wsStaleLines;
+    const LONG why = ::InterlockedCompareExchange(&g_wanderStaleWhy, 0, 0);
+    char b[400];
+    if (ev == 1)
+        _snprintf(b, 399, "[SPAWN] wander stale snapshot: refusals STARTED - new wandering groups are refused until the snapshot is usable again (last cause: %s) line %d/%d",
+                  why == wanderspawn::kStaleNever ? "never filled" : (why == wanderspawn::kStaleOld ? "characters older than 2000 ms" : (why == wanderspawn::kStaleNoLive ? "no live player character" : "?")),
+                  g_wsStaleLines, wanderspawn::kStaleLineCap);
+    else
+        _snprintf(b, 399, "[SPAWN] wander stale snapshot: refusals STOPPED - %lld refused over %.1f s (none in the last %.0f s) line %d/%d",
+                  g_wsStaleRun.seen - g_wsStaleRun.startN, (double)(g_wsStaleRun.lastAt - g_wsStaleRun.startAt) / 1000.0, (double)wanderspawn::kStaleQuietMs / 1000.0,
+                  g_wsStaleLines, wanderspawn::kStaleLineCap);
+    b[399] = 0;
+    DebugLog(b);
+}
+/* MAIN THREAD (TownGenTick, every frame, before WanderDrain): the snapshot. The engine reads happen here, outside the lock; the lock is
+   held only for the copy in. */
+static void WanderSnapFill()
+{
+    static float xs[wanderspawn::kMaxPcs], zs[wanderspawn::kMaxPcs]; static int sl[wanderspawn::kMaxPcs], ow[wanderspawn::kMaxPcs], dd[wanderspawn::kMaxPcs];
+    int pcLost = 0;
+    const int np = PlayerCharSpots(xs, zs, sl, ow, dd, wanderspawn::kMaxPcs, StoreMySlot(), &pcLost);
+    const DWORD now = ::GetTickCount();
+    if (pcLost > 0) { ++g_wsFullFrames; if (pcLost > g_wsFullMost) g_wsFullMost = pcLost; }
+    WanderStaleEdge(now);
+    static DWORD baseAt = 0; static int baseOnce = 0;
+    static float bx[wanderspawn::kMaxBases], bz[wanderspawn::kMaxBases], br[wanderspawn::kMaxBases]; static int bs[wanderspawn::kMaxBases];
+    int nb = -2, bLost = 0;
+    if (baseOnce == 0 || now - baseAt >= 1000) { nb = BdStandInBasesPod(bx, bz, br, bs, wanderspawn::kMaxBases, &bLost); baseAt = now; baseOnce = 1; }
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    g_wsPcN = 0;
+    for (int i = 0; i < np && i < wanderspawn::kMaxPcs; ++i)
+    { wanderspawn::Pc& c = g_wsPcs[g_wsPcN++]; c.x = xs[i]; c.z = zs[i]; c.slot = sl[i]; c.own = ow[i]; c.dead = dd[i]; }
+    g_wsPcLost = pcLost; g_wsPcAt = now; g_wsFilled = 1;
+    if (nb >= 0)
+    {
+        g_wsBaseN = 0;
+        for (int k = 0; k < nb && k < wanderspawn::kMaxBases; ++k) { wanderspawn::Base& b = g_wsBases[g_wsBaseN++]; b.x = bx[k]; b.z = bz[k]; b.r = br[k]; b.slot = bs[k]; }
+        g_wsBaseLost = bLost; g_wsBaseAt = now; g_wsBaseOnce = 1;
+    }
+    else if (nb == -1) ++g_wsBaseUnread;   /* the town list did not read: the last bases are kept and age (stale after kStaleMs) */
+    ::LeaveCriticalSection(&g_tgLock);
+}
+/* ANY THREAD (the creation hook): THE DECISION for a new wandering group at tp, from the snapshot only (wanderspawn::SpotVerdictEx).
+   Staleness is the CHARACTERS' age alone; a base list not usable skips only the base check (counted: baseCheckSkipped). Out: the
+   nearest live character's distance, slot and own/copy, or the base's radius and slot; ageOut = the characters' age. */
+static int WanderJudge(const float* tp, float* nearest, int* nSlot, int* nOwn, float* baseR, DWORD* ageOut)
+{
+    int idx = -1, v = wanderspawn::kRefuseStale, filled = 0;
+    *nSlot = -1; *nOwn = 0; *baseR = 0.0f; *nearest = -1.0f;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    const DWORD now = ::GetTickCount();   /* read inside the lock: a fill landing between a clock read outside it and the lock would make
+                                             the age wrap to ~49 days (07-bug-classes "now | 1u stamp" shape) */
+    const DWORD age = now - g_wsPcAt, ageBase = now - g_wsBaseAt;
+    filled = g_wsFilled;
+    const int basesOk = wanderspawn::BasesUsable(g_wsBaseOnce, (unsigned long)ageBase);
+    int skipped = 0;
+    v = wanderspawn::SpotVerdictEx(g_wsPcs, g_wsPcN, g_wsBases, g_wsBaseN, basesOk, filled, (unsigned long)age, tp[0], tp[2], nearest, &idx, &skipped);
+    if (v == wanderspawn::kRefuseStale)
+        ::InterlockedExchange(&g_wanderStaleWhy, (LONG)wanderspawn::StaleWhy(filled, (unsigned long)age, wanderspawn::LiveCount(g_wsPcs, g_wsPcN)));
+    if (skipped != 0) ::InterlockedIncrement64(&g_wanderBaseSkipped);
+    if (v == wanderspawn::kRefuseNear && idx >= 0 && idx < g_wsPcN) { *nSlot = g_wsPcs[idx].slot; *nOwn = g_wsPcs[idx].own; }
+    else if (v == wanderspawn::kRefuseBase && idx >= 0 && idx < g_wsBaseN) { *nSlot = g_wsBases[idx].slot; *baseR = g_wsBases[idx].r; }
+    ::LeaveCriticalSection(&g_tgLock);
+    *ageOut = filled != 0 ? age : 0xFFFFFFFFUL;
+    return v;
+}
+static int WanderGdStrPod(const void* gd, size_t off, char* out, int cap)
+{
+    out[0] = 0;
+    if (gd == 0) return 0;
+    __try
+    {
+        const char* s = (const char*)gd + off;   /* std::string, VS2010 layout (TownSidPod) */
+        const size_t size = *(const size_t*)(s + 0x10), res = *(const size_t*)(s + 0x18);
+        if (size == 0 || size >= (size_t)cap) return 0;
+        const char* p = (res >= 16) ? *(const char* const*)s : s;
+        if (p == 0) return 0;
+        std::memcpy(out, p, size); out[size] = 0; return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+static int WanderFacNamePod(void* f, char* out, int cap)   /* MAIN THREAD */
+{
+    out[0] = 0;
+    if (f == 0) return 0;
+    __try
+    {
+        const std::string& n = ((::Faction*)f)->getName();
+        const size_t size = n.size();
+        if (size == 0 || size >= (size_t)cap) return 0;
+        std::memcpy(out, n.c_str(), size); out[size] = 0; return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+/* ANY THREAD (the creation hook): one wandering group this game made */
+static void WanderNote(const float* tp, int haveSpot, const Sector& s, void* faction, void* tmpl, unsigned long long rva, int off)
+{
+    ::InterlockedIncrement64(&g_wanderMade);
+    if (!haveSpot) { ::InterlockedIncrement64(&g_wanderNoSpot); return; }
+    WanderRow r;
+    r.x = tp[0]; r.y = tp[1]; r.z = tp[2]; r.sx = s.x; r.sy = s.y; r.faction = faction; r.rva = rva; r.off = off; r.at = ::GetTickCount();
+    r.verdict = wanderspawn::kAllow; r.nearest = -1.0f; r.nSlot = -1; r.nOwn = 0; r.baseR = 0.0f; r.snapAge = 0;
+    if (!WanderGdStrPod(tmpl, 0x28, r.tName, (int)sizeof r.tName)) std::strcpy(r.tName, "?");   /* GameData::name */
+    if (!WanderGdStrPod(tmpl, 0x58, r.tSid, (int)sizeof r.tSid)) std::strcpy(r.tSid, "?");     /* GameData::stringID */
+    bool lost = false;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    if (g_wanderQN < kWanderQueueCap) g_wanderQ[g_wanderQN++] = r; else lost = true;
+    ::LeaveCriticalSection(&g_tgLock);
+    if (lost) ::InterlockedIncrement64(&g_wanderQueueLost);
+}
+/* ANY THREAD (the creation hook): one wandering group this game REFUSED (T-1235 keep-away) - counted here; a character or base refusal
+   is queued for its line (WanderDrain), a stale-snapshot refusal only counted */
+static void WanderRefuseNote(int verdict, const float* tp, const Sector& s, void* faction, void* tmpl, unsigned long long rva, int off,
+                             float nearest, int nSlot, int nOwn, float baseR, DWORD age)
+{
+    ::InterlockedIncrement64(verdict == wanderspawn::kRefuseNear ? &g_wanderRefusedNear : (verdict == wanderspawn::kRefuseBase ? &g_wanderRefusedBase : &g_wanderRefusedStale));
+    if (verdict == wanderspawn::kRefuseStale) return;
+    WanderRow r;
+    r.x = tp[0]; r.y = tp[1]; r.z = tp[2]; r.sx = s.x; r.sy = s.y; r.faction = faction; r.rva = rva; r.off = off; r.at = ::GetTickCount();
+    r.verdict = verdict; r.nearest = nearest; r.nSlot = nSlot; r.nOwn = nOwn; r.baseR = baseR; r.snapAge = age;
+    if (!WanderGdStrPod(tmpl, 0x28, r.tName, (int)sizeof r.tName)) std::strcpy(r.tName, "?");
+    if (!WanderGdStrPod(tmpl, 0x58, r.tSid, (int)sizeof r.tSid)) std::strcpy(r.tSid, "?");
+    bool lost = false;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    if (g_wanderQN < kWanderQueueCap) g_wanderQ[g_wanderQN++] = r; else lost = true;
+    ::LeaveCriticalSection(&g_tgLock);
+    if (lost) ::InterlockedIncrement64(&g_wanderQueueLost);
+}
+/* MAIN THREAD (TownGenTick): the queued groups' lines */
+static void WanderDrain()
+{
+    static WanderRow rows[kWanderQueueCap]; int n = 0;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    if (g_wanderQN > 0) { n = g_wanderQN; std::memcpy(rows, g_wanderQ, sizeof(WanderRow) * (size_t)n); g_wanderQN = 0; }
+    ::LeaveCriticalSection(&g_tgLock);
+    if (n == 0) return;
+    /* the live player characters of the snapshot WanderSnapFill filled this frame (T-1235: the dead are left out) */
+    static wanderspawn::Pc pcs[wanderspawn::kMaxPcs];
+    int np = 0, pcLost = 0;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    for (int i = 0; i < g_wsPcN; ++i) if (g_wsPcs[i].dead == 0) pcs[np++] = g_wsPcs[i];
+    pcLost = g_wsPcLost;
+    ::LeaveCriticalSection(&g_tgLock);
+    float vp[3] = { 0, 0, 0 }, vdist = 0.0f;
+    const int haveView = CampViewPoint(vp, &vdist);
+    const DWORD now = ::GetTickCount();
+    for (int k = 0; k < n; ++k)
+    {
+        const WanderRow& r = rows[k];
+        if (r.verdict != wanderspawn::kAllow)   /* T-1235: a refused spot's line (capped) */
+        {
+            if (g_wanderRefusedPrinted >= (long long)wanderspawn::kRefusePrintCap) { ++g_wanderRefusedOverCap; continue; }
+            ++g_wanderRefusedPrinted;
+            char facR[64]; if (!WanderFacNamePod(r.faction, facR, (int)sizeof facR)) std::strcpy(facR, "?");
+            char why[96];
+            if (r.verdict == wanderspawn::kRefuseBase) _snprintf(why, 95, "inside the base of slot %d (radius %.0f)", r.nSlot, r.baseR);
+            else _snprintf(why, 95, "a player character within %.1f", wanderspawn::kKeepDist);
+            why[95] = 0;
+            char bR[640];
+            _snprintf(bR, 639, "[SPAWN] wander refused: group='%s' (%s) faction='%s' at %.0f,%.0f,%.0f area %d,%d nearest=%.0f (slot %d %s) - %s; snapshotAgeMs=%lu thread=%s rva=0x%llX line %lld/%ld%s",
+                      r.tName, r.tSid, facR, r.x, r.y, r.z, r.sx, r.sy, r.nearest, r.verdict == wanderspawn::kRefuseNear ? r.nSlot : -1,
+                      r.verdict == wanderspawn::kRefuseNear ? (r.nOwn ? "own" : "copy") : "-", why, (unsigned long)r.snapAge, r.off ? "other" : "main", r.rva,
+                      g_wanderRefusedPrinted, wanderspawn::kRefusePrintCap,
+                      g_wanderRefusedPrinted == (long long)wanderspawn::kRefusePrintCap ? " - CAP REACHED: later refusals are counted in [SPAWN] wander REPORT" : "");
+            bR[639] = 0;
+            DebugLog(bR);
+            continue;
+        }
+        if (r.off) ++g_wanderOffN; else ++g_wanderMainN;
+        int slots[wanderspawn::kMaxSlots], owns[wanderspawn::kMaxSlots]; float dists[wanderspawn::kMaxSlots];
+        float nearest = -1.0f; int nearRow = -1, slotsLost = 0;
+        const int nr = wanderspawn::NearestByPlayer(pcs, np, r.x, r.z, slots, owns, dists, wanderspawn::kMaxSlots, &nearest, &nearRow, &slotsLost);
+        if (nearest >= 0.0f && (g_wanderMinNear < 0.0f || nearest < g_wanderMinNear)) g_wanderMinNear = nearest;
+        for (int q = 0; q < nr; ++q) if (owns[q] == 0 && (g_wanderMinOther < 0.0f || dists[q] < g_wanderMinOther)) g_wanderMinOther = dists[q];
+        const float spot[3] = { r.x, r.y, r.z };
+        const float cam = haveView ? wanderspawn::Dist3(vp, spot) : -1.0f;
+        if (!haveView) ++g_wanderNoView; else if (cam < vdist) ++g_wanderInsideView;
+        const int dec = wanderspawn::Decide(nearest, (long)g_wanderPrinted);
+        if (dec == wanderspawn::kNearOverCap) { ++g_wanderNearOverCap; continue; }
+        if (dec == wanderspawn::kFar) { ++g_wanderFar; continue; }
+        if (dec == wanderspawn::kNoCharacter) { ++g_wanderNoChar; continue; }
+        ++g_wanderPrinted;
+        char fac[64]; if (!WanderFacNamePod(r.faction, fac, (int)sizeof fac)) std::strcpy(fac, "?");
+        std::string players;
+        for (int q = 0; q < nr; ++q)
+        {
+            std::string nm, fw;
+            if (!PlayersTabPlayerWords(slots[q], &nm, &fw) || nm.empty()) nm = "?";
+            char pb[160]; _snprintf(pb, 159, "%sslot %d '%s' %s=%.0f", q == 0 ? "" : "; ", slots[q], nm.c_str(), owns[q] ? "own" : "copy", dists[q]); pb[159] = 0;
+            players += pb;
+        }
+        if (slotsLost != 0) players += "; +" + N((long long)slotsLost) + " more";
+        char b[700];
+        _snprintf(b, 699, "[SPAWN] wander made: group='%s' (%s) faction='%s' at %.0f,%.0f,%.0f area %d,%d camera=%.0f (engine keeps %.1f from it) nearest=%.0f (slot %d %s) players: %s chars=%d%s thread=%s rva=0x%llX lagMs=%lu line %lld/%ld%s",
+                  r.tName, r.tSid, fac, r.x, r.y, r.z, r.sx, r.sy, cam, haveView ? vdist : -1.0f, nearest,
+                  nearRow >= 0 ? slots[nearRow] : -1, nearRow >= 0 ? (owns[nearRow] ? "own" : "copy") : "-", players.c_str(), np,
+                  pcLost != 0 ? " (list full)" : "", r.off ? "other" : "main", r.rva, (unsigned long)(now - r.at), g_wanderPrinted, wanderspawn::kPrintCap,
+                  g_wanderPrinted == (long long)wanderspawn::kPrintCap ? " - CAP REACHED: later near groups are counted in [SPAWN] wander REPORT" : "");
+        b[699] = 0;
+        DebugLog(b);
+    }
+}
+static std::string WanderReportLine()   /* MAIN THREAD (ReportTownGen) */
+{
+    /* the other players' bases the snapshot holds now (at most 4 named) */
+    std::string bases; int nb = 0;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    nb = g_wsBaseN;
+    for (int k = 0; k < g_wsBaseN && k < 4; ++k)
+    { char bb[96]; _snprintf(bb, 95, "%sslot %d at %.0f,%.0f r=%.0f", k == 0 ? "" : "; ", g_wsBases[k].slot, g_wsBases[k].x, g_wsBases[k].z, g_wsBases[k].r); bb[95] = 0; bases += bb; }
+    ::LeaveCriticalSection(&g_tgLock);
+    char b[1200];
+    _snprintf(b, 1199, "[SPAWN] wander REPORT made=%lld refused=%lld refusedBase=%lld staleSnapshot=%lld baseCheckSkipped=%lld snapshotFull=%lld (most left out %d of the %d kept) bases=%d [%s] (kept %.1f from every live player character, out of other players' bases; refused lines printed=%lld overCap=%lld) printed=%lld nearOverCap=%lld far=%lld noCharacter=%lld noSpot=%lld queueLost=%lld thread[main,other]=%lld,%lld insideCameraDistance=%lld noCamera=%lld nearestMin=%.0f nearestOtherPlayerMin=%.0f baseListUnread=%d (a group within %.0f of any player character prints, at most %ld lines)",
+              (long long)g_wanderMade, (long long)g_wanderRefusedNear, (long long)g_wanderRefusedBase, (long long)g_wanderRefusedStale,
+              (long long)g_wanderBaseSkipped, g_wsFullFrames, g_wsFullMost, wanderspawn::kMaxPcs, nb, bases.c_str(), wanderspawn::kKeepDist,
+              g_wanderRefusedPrinted, g_wanderRefusedOverCap,
+              g_wanderPrinted, g_wanderNearOverCap, g_wanderFar, g_wanderNoChar, (long long)g_wanderNoSpot, (long long)g_wanderQueueLost,
+              g_wanderMainN, g_wanderOffN, g_wanderInsideView, g_wanderNoView, g_wanderMinNear, g_wanderMinOther, g_wsBaseUnread, wanderspawn::kNearDist, wanderspawn::kPrintCap);
+    b[1199] = 0;
+    return b;
+}
 void* detour_create(void* self, void* faction, void* pos, void* town, unsigned long long p5, void* p6, void* p7,
                     unsigned long long p8, unsigned long long p9, unsigned char p10, void* p11, unsigned long long p12, unsigned int squadType)
 {
@@ -481,7 +743,13 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
         if (inserted) { char b[160]; _snprintf(b, 159, "[TOWN] creation caller rva=0x%llX town=%d type=%u thread=%s (first only per caller+town+thread)", (unsigned long long)rva, town != 0 ? 1 : 0, squadType, offThread ? "other" : "main"); b[159] = 0; DebugLog(b); }
     }
     if (!g_on) { ::InterlockedIncrement64(&g_leverOff); return CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10); }
-    if (town == 0) { ::InterlockedIncrement64(&g_noTown); return CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10); }
+    /* T-929 (owner 1377): A GROUP WITH NO HOME TOWN (a roaming group) TAKES THE PATROLS' ROAD. It used to be made here by every game
+       for itself, so each game had its own roaming groups. It now falls through to the same gates as a town's squads and is judged
+       by where it APPEARS (T-392: its spawn position's area) - only the game holding that area makes it, and the squad record road
+       shares it like a patrol; a lone game (role=single) still makes it at the unlinked arm. Every town-keyed step below reads a
+       null town as 'no town' (TownSidPod answers 0, the key is '?'); with no readable spawn position it meets the read-fault arm,
+       as a patrol does. noTown counts these groups, no longer a pass-through. */
+    if (town == 0) ::InterlockedIncrement64(&g_noTown);
     /* T-438: inside a populateBuilding whose residents the gate SET ASIDE (this thread's building-sector context, with the flag
        raised), the squad is refused as SET ASIDE - before any other gate, so it is never booked as a not-holder, no-map,
        no-notebook or pending refusal. It is judged by the building's context, never by its own spawn point (area edge). */
@@ -593,6 +861,25 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
        bounded-wait lowest-slot grant; P97 retired the wait itself). */
     if (may == 1)   /* T-392 (owner 337 a): the notebook naming this game the holder is the only grant */
     {
+        /* T-1235 (owner decision 1478 b): THE KEEP-AWAY. A new wandering group whose spot is within 1382.4 (on the ground) of any live
+           player character - this game's own or another player's copy - or inside another player's base, or judged on a snapshot that
+           is not usable, is refused here, before it is made, as the no-map arm refuses (return 0). Only the snapshot is read
+           (WanderJudge; wanderspawn.h). WHAT THE SPAWNER DOES NEXT: ZoneManager 0x8F7190 ignores the creation's answer and returns 1
+           (decomp_8f7190.txt:222-225), so its caller 0x8F8370 ends this round (decomp_8f8370.txt:212-213 loops only on 0) - the
+           spawner asks again at its next round. (The engine's own refusal of a spot inside a player town returns 0 from 0x8F7190
+           itself, :215 and :227-229, and the caller then tries ANOTHER spawn region in the same round.) A spot that did not read (fromSpawn 0)
+           is not judged - it is counted as noSpot by WanderNote as before. */
+        if (fromSpawn != 0 && wanderspawn::IsWanderCreation((p6 != 0 || inBuilding != 0) ? 1 : 0, p9 != 0 ? 1 : 0) != 0)
+        {
+            float wsNear = -1.0f, wsBaseR = 0.0f; int wsSlot = -1, wsOwn = 0; DWORD wsAge = 0;
+            const int wsV = WanderJudge(tp, &wsNear, &wsSlot, &wsOwn, &wsBaseR, &wsAge);
+            if (wsV != wanderspawn::kAllow)
+            {
+                WanderRefuseNote(wsV, tp, s, faction, p7, (unsigned long long)((uintptr_t)_ReturnAddress() - (uintptr_t)::GetModuleHandleA(0)), offThread ? 1 : 0,
+                                 wsNear, wsSlot, wsOwn, wsBaseR, wsAge);
+                return 0;
+            }
+        }
         // PROBE-START: P025
         if (::InterlockedIncrement(&g_p025Allowed) <= 3)
         {
@@ -610,6 +897,9 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
         ::InterlockedIncrement64(&g_allowed); if (offThread) ::InterlockedIncrement64(&g_allowedOff);
         if (may == 1) ::InterlockedIncrement64(&g_holderGenerated);   /* DECISION 48 (P8a): this game HOLDS the area and generated - NOT the F666 fallback, which has its own number */
         void* np = CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10);
+        /* T-1235: a wandering group this game made - its [SPAWN] wander line (WanderNote / WanderDrain) */
+        if (np != 0 && wanderspawn::IsWanderCreation((p6 != 0 || inBuilding != 0) ? 1 : 0, p9 != 0 ? 1 : 0) != 0)
+            WanderNote(tp, fromSpawn, s, faction, p7, (unsigned long long)((uintptr_t)_ReturnAddress() - (uintptr_t)::GetModuleHandleA(0)), offThread ? 1 : 0);
         /* PROBE-START: P085 */
         if (np != 0 && s.x >= 0 && s.x < 64 && s.y >= 0 && s.y < 64)
         { ::InterlockedIncrement(&g_p085Squads[s.x * 64 + s.y]); if (squadType == 2) ::InterlockedIncrement(&g_p085Residents[s.x * 64 + s.y]); }
@@ -4847,7 +5137,7 @@ int TownGenMadeThisPlatoon(const char* platoonId)
     return hit;
 }
 void TownGenTick() { ::InterlockedExchange(&g_linkedCached, ((StoreWelcomedThisLink() != 0) && StoreRelayLinked() && StoreWelcomePushDone() != 0) ? 1 : 0);   /* T-581: and the opening push is in - the owed rows are known before anything is made */   /* F665: THE NOTEBOOK LINK */
-                     if (!g_mainThreadFromTick) { g_mainThread = ::GetCurrentThreadId(); g_mainThreadFromTick = true; DebugLog("[TOWN] main thread = " + N((long long)g_mainThread) + " (captured on the first tick)"); } RecruitDrainLines(); /* refill1 */ RefillTick(); /* towns2 */ Towns2Tick(); OwedTick(); /* the empty-town refill: a few buildings per frame, REFILLED sent */ TownRefillTick(); }
+                     if (!g_mainThreadFromTick) { g_mainThread = ::GetCurrentThreadId(); g_mainThreadFromTick = true; DebugLog("[TOWN] main thread = " + N((long long)g_mainThread) + " (captured on the first tick)"); } RecruitDrainLines(); /* refill1 */ RefillTick(); /* towns2 */ Towns2Tick(); OwedTick(); /* the empty-town refill: a few buildings per frame, REFILLED sent */ TownRefillTick(); WanderSnapFill(); WanderDrain(); /* T-1235 */ }
 static long long RefusedTownsCount() { TgLockInit(); ::EnterCriticalSection(&g_tgLock); const long long n = (long long)g_refusedTowns.size(); ::LeaveCriticalSection(&g_tgLock); return n; }
 static long long TownGenCreatedIdCount() { TgLockInit(); ::EnterCriticalSection(&g_tgLock); const long long n = (long long)g_tgCreatedIds.size(); ::LeaveCriticalSection(&g_tgLock); return n; }
 static std::string PerTownCounts()
@@ -4867,6 +5157,7 @@ void ReportTownGen()
     RecruitReport();   /* recruit3: [RECRUIT] REPORT */
     RefillReport();   /* refill1: [REFILL] REPORT */
     Towns2Report();   /* towns2: [TOWNS2] REPORT */
+    DebugLog(WanderReportLine());   /* T-1235: [SPAWN] wander REPORT - the final count */
     DebugLog("[TG] towngen=" + std::string(g_on ? "on" : "off")
              + " towngenHolderGenerated=" + N(g_holderGenerated)
              + " towngenRefusedNotHolder=" + N(g_refusedNotHolder)

@@ -1186,6 +1186,7 @@ void TeamTick()
     WorkTick();
     LevelTick();
     CellsTick();
+    StoreBookTick();   /* T-1242: a held research start's end by time or by a holder that left */
     const int gen = StoreLinkGen();
     if (g_tableGen == gen || g_askedGen == gen || StoreWelcomedThisLink() == 0) return;
     g_askedGen = gen;   /* once per link and per clearing, sent or not: a new link's WELCOME brings the table anyway */

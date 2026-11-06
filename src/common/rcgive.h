@@ -1,4 +1,6 @@
 #pragma once
+#include <cmath>   /* T-1191: BesideSpot */
+#include <string>  /* T-1191: BFacText */
 /* A MOVE MADE WITHOUT THE CURSOR ACROSS THE AUTHORITY LINE (T-1079): the player's right-click on an item with two inventory windows
    open - InventoryGUI::RClickAutoTrade 0x713150; shift-click repeats it while it answers OK (0x713D60). Each call moves ONE unit
    (decomp_713150):
@@ -341,6 +343,148 @@ inline int NetDecide(const NetChange* c, int n, int pieceCap, NetPlan* out)
     return kNetPair;
 }
 
+/* T-932: SEVERAL OF OUR OBJECTS GIVEN IN ONE PASS. A hauler (the hauling job) empties its inventory into their box: each of our objects
+   of the record leaves (an op 1, or units split off it, an op 3) and lands there as an object (op 0) or merged onto a stack (an op 2
+   rise tied to it). NetDecide refuses losses on two objects (kNetUnbalanced); this splits such a group - called only then, so it has
+   one container on each side - into one part per object we lost, each gain going to the one object the engine's own call tied it to
+   (the object itself for an op 0, the object merged in for an op 2 rise, or the object a split of it handed back). part[i]: change i's
+   part (0..). Returns the parts (2 or more), or 0 when the group is not that shape: a change on another side, a change that is not a
+   loss of ours or a gain of theirs, a change inside a pack, a gain tied to none or to two of our objects, an object of ours with no
+   gain, or more than cap parts. Each part is then judged by NetDecide on its own, and becomes its own give. */
+/* T-932 review fold 2: THE SPLIT'S BOUND. kNetSplitMax: our objects one split gives. Every object a hauler's dump moves left one of its
+   character's own grids (a pack's changes are not the net's), and those hold 111 squares (main 8x10, belt 2x2, hip 7x1, the backpack
+   slot 5x4: the sections' dimensions read in a run, findings), one object a square at least; 128 covers them. kNetGroupMax: the
+   changes one group holds - four an object (its loss, a split's hand-back landing, its rise, the drop's own merge). */
+const int kNetSplitMax = 128;
+const int kNetGroupMax = 4 * kNetSplitMax;
+inline int NetSplitGive(const NetChange* c, int n, int cap, int* part)
+{
+    unsigned long long src[kNetSplitMax];
+    int ns = 0;
+    if (cap > kNetSplitMax) cap = kNetSplitMax;
+    for (int i = 0; i < n; ++i)
+    {
+        part[i] = -1;
+        if (c[i].inPack != 0 || c[i].obj == 0) return 0;
+        if (c[i].side == kSideOurs)
+        {
+            if (NetLoss(c[i].op, c[i].quantity, c[i].qtyBefore) <= 0) return 0;
+            int j = 0;
+            while (j < ns && src[j] != c[i].obj) ++j;
+            if (j == ns)
+            {
+                if (ns >= cap) return 0;
+                src[ns++] = c[i].obj;
+            }
+            part[i] = j;
+        }
+        else if (c[i].side != kSideTheirs || EntryGain(c[i].op, c[i].quantity, c[i].qtyBefore) <= 0) return 0;
+    }
+    if (ns < 2) return 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (c[i].side != kSideTheirs) continue;
+        const unsigned long long tie = (c[i].op == 0) ? c[i].obj : c[i].rel;
+        int owner = -1;
+        for (int k = 0; k < n && tie != 0; ++k)
+        {
+            if (c[k].side != kSideOurs) continue;
+            if (c[k].obj != tie && !(c[k].op == 3 && c[k].rel != 0 && c[k].rel == tie)) continue;
+            if (owner >= 0 && owner != part[k]) return 0;
+            owner = part[k];
+        }
+        if (owner < 0) return 0;
+        part[i] = owner;
+    }
+    for (int q = 0; q < ns; ++q)
+    {
+        int gained = 0;
+        for (int i = 0; i < n && gained == 0; ++i) if (c[i].side == kSideTheirs && part[i] == q) gained = 1;
+        if (gained == 0) return 0;
+    }
+    return ns;
+}
+
+/* T-932: A POINTER-PAIRED GIVE THAT TOOK IN OTHER OBJECTS OF OURS. A hauler's dump into an empty square of their box files our first
+   object there (its op 1 and op 0 pair by pointer) and merges the rest of our objects onto it (op 2 rises on it, each tied to one of
+   them). Left paired, the pair's put-back would carry those units with it and the drop's merge (HdMergedAt) would swallow their rises:
+   asked for one object's units, the rest lost. 1 = the pair is let go, so the net takes the whole pass and each of our objects is asked
+   for on its own. give: our character's object into a container another game writes, removed then added; othersMerged: unclaimed op 2
+   rises on the landed object tied to another object that left that same character in this pass. The drop's own merge (the stack
+   already in their square folded into ours) never counts: that object was not ours. */
+inline int GiveLetGoForOthers(int give, int removeThenAdd, int othersMerged)
+{
+    return (give != 0 && removeThenAdd != 0 && othersMerged > 0) ? 1 : 0;
+}
+
+/* T-932 review fold: ONE RISE THE LET-GO COUNTS (GiveLetGoForOthers' othersMerged). rise: an op 2 on the pair's landed object
+   (riseOnLanded), tied to riseRel - not the pair's own object (giveObj): that is the drop's own merge, never ours. other: a change
+   that left our character in the same pass - an op 1 of that very object, or an op 3 whose hand-back is it. 1 = counted. */
+inline int LetGoOtherRise(int riseOp, int riseOnLanded, unsigned long long riseRel, unsigned long long giveObj, int otherOp,
+                          unsigned long long otherObj, unsigned long long otherRel)
+{
+    if (riseOp != 2 || riseOnLanded == 0 || riseRel == 0 || riseRel == giveObj) return 0;
+    return ((otherOp == 1 && otherObj == riseRel) || (otherOp == 3 && otherRel != 0 && otherRel == riseRel)) ? 1 : 0;
+}
+
+/* T-932 review fold 1: A LET-GO PAIR THE NET DID NOT TAKE (its split refused - a change that is not a loss of ours beside it, a gain
+   tied to none - or no job left for its first part): neither its remove nor its add claimed by a net row. 1 = it is paired again, so its
+   first object keeps the asked road it had before the let-go, not the lone change's that loses it. */
+inline int LetGoRestore(int letGo, int removeTaken, int addTaken)
+{
+    return (letGo != 0 && removeTaken == 0 && addTaken == 0) ? 1 : 0;
+}
+
+/* T-932 review fold 2: how many of a split's parts take a net job now - one job a part, in drain order, while jobs are left (jobsUsed
+   of jobCap taken). A part left over keeps today's road and is counted full; the parts taken are given, not all of them refused. */
+inline int NetSplitBatch(int parts, int jobsUsed, int jobCap)
+{
+    const int left = jobCap - jobsUsed;
+    if (parts <= 0 || left <= 0) return 0;
+    return (parts < left) ? parts : left;
+}
+
+/* T-932 re-check LOW (a): THE ORDER A SPLIT'S PARTS TAKE JOBS. lead: the part holding the let-go pair (-1: none) - its landed object
+   is the stack the other parts merged onto. The lead goes first, then the others in drain order. The part at position pos (-1: none). */
+inline int NetSplitOrder(int parts, int lead, int pos)
+{
+    if (pos < 0 || pos >= parts) return -1;
+    if (lead < 0 || lead >= parts) return pos;
+    if (pos == 0) return lead;
+    return (pos <= lead) ? pos - 1 : pos;
+}
+/* 1 = the whole split is dropped: the lead part (pos 0, the let-go pair's) did not become a job. The pair is then paired again
+   (LetGoRestore) and its put-back carries the whole landed stack, so no later part may take a job against that stack. */
+inline int NetSplitDrop(int pos, int lead, int taken)
+{
+    return (pos == 0 && lead >= 0 && taken == 0) ? 1 : 0;
+}
+/* T-932 re-check LOW (b): what a put-back's result (ItRevert: 1 put back, 2 kept, 0 failed) means to the move. Kept: a merged give whose
+   stack could not be rebuilt went back into their square whole, so our units are only in our copy of their box. kUndoBack: today's ask;
+   kUndoKept (a give only): the give stands - our pack's loss is published and the box's holder is asked to add our units; kUndoFailed:
+   revertFailed, nothing sent. */
+const int kUndoFailed = 0, kUndoBack = 1, kUndoKept = 2;
+inline int PutBackRoad(int undone, int give)
+{
+    if (undone == 2) return (give != 0) ? kUndoKept : kUndoFailed;
+    return (undone == 1) ? kUndoBack : kUndoFailed;
+}
+
+/* T-932: A SPLIT PART'S PIECE NOT FOUND AS ITS OBJECT (ItRcPieceEntry). An earlier part of the same pass put its units back through the
+   merged put-back, which rebuilt the stack as a new object in the same square; a part (part) reads that square's object (cellOk: the
+   square is in the section and read; plausible: an object is there; sameRecord: of the row's record). 1 = read it there. */
+inline int PieceSquareFallback(int part, int cellOk, int plausible, int sameRecord)
+{
+    return (part != 0 && cellOk != 0 && plausible != 0 && sameRecord != 0) ? 1 : 0;
+}
+
+/* T-932: WHOM A BOX'S RE-ASK GOES TO (ItParityAskOne), as the open ask: the writer's slot when the box resolves here, its writer verdict
+   is held by another game and the owner rule decided it (a player's box another game writes); else -1, the holder of the box's area. */
+inline int ReaskSlot(int resolved, int held, int byOwner, int writerSlot)
+{
+    return (resolved != 0 && held != 0 && byOwner != 0) ? writerSlot : -1;
+}
+
 /* What one change in a row's window is to the row's job. handled: another road has it; inWindow: rung between the row's first and
    last change; isSrcObj / onSrc / onDst: the row's source object / in the source's container / in the destination's; listed: its
    object is already one of the job's pieces; kindRead / kindSame: its record read, and the row's. A click's source rings only the
@@ -369,6 +513,57 @@ inline int BackRun(int units, const int* gain, const int* ok, int pieces, BackMo
         lacking -= move(ctx, p, BackWant(gain[p], lacking));
     }
     return lacking;
+}
+
+/* T-1191 (the `itemtest lclick` lever): the spot `d` units from a building's centre (bx, bz) on the line towards where the character
+   stands now (cx, cz) - ground plane, x and z only, as the trade check 0x70C6C0 measures. A character on the centre itself is put
+   on the +x side. 0 when d is not above 0. */
+inline int BesideSpot(float bx, float bz, float cx, float cz, float d, float* tx, float* tz)
+{
+    if (!(d > 0.0f)) return 0;
+    float dx = cx - bx, dz = cz - bz;
+    const float len2 = dx * dx + dz * dz;
+    if (!(len2 > 1e-6f)) { dx = 1.0f; dz = 0.0f; }
+    else { const float len = std::sqrt(len2); dx /= len; dz /= len; }
+    *tx = bx + dx * d; *tz = bz + dz * d;
+    return 1;
+}
+
+/* T-1191 (the `itemtest bfac` / `lclick` levers): what a building's faction reads on this game. own: the building's own faction
+   field (RootObject +0x10) is set (1), empty (0; the faction getter then hands back the shared "nofac", decomp_593bb0:18-24), unread
+   (-1); resolved: the getter (vtable +0x58) gave a faction; local: it is this game's own player faction (pointer compare); controller:
+   its player-controller field +0x250 is set; built: the building's finished byte (vtable +0x228); standIn: the player slot whose
+   stand-in it is (-1 none). The gate's two inputs are built and controller (decomp_54fa10:34-39). -1 = unread throughout. */
+struct BFac
+{
+    int own, resolved, local, controller, built, standIn;
+    std::string id, name;
+    BFac() : own(-1), resolved(-1), local(-1), controller(-1), built(-1), standIn(-1) {}
+};
+/* a name or id for the line: at most 48 characters, quotes and control characters as '?' */
+inline std::string BFacClean(const std::string& s)
+{
+    std::string o;
+    for (size_t i = 0; i < s.size() && o.size() < 48; ++i)
+    {
+        const unsigned char ch = (unsigned char)s[i];
+        o += (ch < 0x20 || ch == '\'' || ch == '"' || ch == 0x7F) ? '?' : (char)ch;
+    }
+    return o;
+}
+/* nofac: the own field empty and the getter gave a faction (1), the own field set (0), unknown (-1) */
+inline int BFacNofac(const BFac& f) { return (f.own == 0 && f.resolved == 1) ? 1 : ((f.own == 1) ? 0 : -1); }
+/* the gate's answer from its inputs: 1 both, 0 either one 0, -1 an input unread */
+inline int BFacGateIn(const BFac& f)
+{
+    if (f.built == 0 || f.controller == 0 || f.resolved == 0) return 0;
+    return (f.built == 1 && f.controller == 1) ? 1 : -1;
+}
+inline std::string BFacText(const BFac& f)
+{
+    return "faction '" + BFacClean(f.name) + "' id '" + BFacClean(f.id) + "' own=" + std::to_string((long long)f.own) + " nofac=" + std::to_string((long long)BFacNofac(f))
+        + " resolved=" + std::to_string((long long)f.resolved) + " localPlayer=" + std::to_string((long long)f.local) + " controller=" + std::to_string((long long)f.controller) + " standIn=" + std::to_string((long long)f.standIn)
+        + " built=" + std::to_string((long long)f.built) + " gateIn=" + std::to_string((long long)BFacGateIn(f));
 }
 
 }   /* namespace rcgive */

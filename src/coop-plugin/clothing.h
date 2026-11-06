@@ -113,6 +113,13 @@ const cooplimb::LimbsWire* LimbsOfOwned(unsigned int uid);
 // from the STATE handler. has 0 = not carried: nothing is recorded.
 void ApplyOwnerLimbs(unsigned int uid, int has, const cooplimb::LimbsWire& w, unsigned int fromPeer);
 
+// T-1205 /restore (medical.cpp AdminHealOwned) on a character THIS game drives: every lost (stump) or crushed limb grown back through
+// the engine's limb-slot writer RobotLimbs::setLimb (whole, no item); a robotic limb is left on. *grown = the limbs grown back (bit i
+// of *grownMask = limb i, limbwire.h order), *robot = the robotic limbs left on. 1 every limb that needed it grown back; 0 a call
+// faulted (the others done); -1 the limbs unreadable, or no RobotLimbs_setLimb row while a limb needs it (nothing done). The caller
+// pushes the STATE. MAIN THREAD, the K2 safe point.
+int LimbRegrowOwned(void* character, int* grown, int* robot, unsigned* grownMask);
+
 // LIMBS. MAIN THREAD, the K2 safe point (combat.cpp detour_tsRagdollUpdates, after the engine's ragdoll pass, AI worker
 // paused): each recorded block onto its copy through the engine's own calls, a limb at a time and only where they differ;
 // then the limbtest lever's one armed request.

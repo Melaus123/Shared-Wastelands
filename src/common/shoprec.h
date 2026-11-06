@@ -41,7 +41,8 @@
 
 namespace shoprec {
 
-const unsigned int kProtocol = 133;            /* the world-server protocol that carries shop records */
+const unsigned int kProtocol = 145;            /* the world-server protocol that carries shop records */
+
 
 
 

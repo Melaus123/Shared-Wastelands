@@ -17,6 +17,19 @@ const unsigned char kResearchTestOrig[10] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00
 const int kResearchTestLen = 8;     /* the test the stub re-does; the je after it stays */
 const int kResearchOrigLen = 10;
 
+/* T-1150 (owner 1491 a): the engine's 'nearest finished building that takes item kind X' search (1.0.65 0x59A240 / 1.0.68
+ * 0x59ACD0; hauling 0x997A80 at 0x997B17 / 0x997B9A and the orders object's 0x5A2200 / 0x5A4F10 call it) takes, for a searcher that counts as the
+ * player, a building of another faction only when that faction is a player faction: at 1.0.65 0x59A39A / 1.0.68 0x59AE2A
+ * `cmp qword [rax+0x250], 0` (rax = the building's faction, building vt+0x58) then `je` (0F 84 rel32, +0xBC) to the skip.
+ * The same 10 bytes as the research bench's tests; checked separately so either can change alone. The stub replaces the 8-byte
+ * test and returns to the je at site + 8. */
+const unsigned char kHaulSearchTestOrig[10] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x0F, 0x84 };
+const int kHaulSearchTestLen = 8;   /* the test the stub re-does; the je after it stays */
+const int kHaulSearchOrigLen = 10;
+/* the je's rel32 at both builds (0xBC: to 1.0.65 0x59A464 / 1.0.68 0x59AEF4, the search loop's 'next building'); the 16-byte table
+ * rows hold it, the patch does not check it (only the test and the je's opcode) */
+const int kHaulSearchSkipRel = 0xBC;
+
 /* The teammate cells of one stub (cell k at cells[k], cap cells) set to the first n factions in facs, the rest 0; a cell is written
  * only when it changes (a stub on another thread reads them). Returns the number of non-zero factions held. */
 inline int MateCellsWrite(void* volatile* cells, int cap, void* const* facs, int n)
@@ -29,6 +42,24 @@ inline int MateCellsWrite(void* volatile* cells, int cap, void* const* facs, int
         if (cells[k] != want) cells[k] = want;
     }
     return held;
+}
+
+/* 1 when fac is non-zero and held in one of the cap cells (any thread: each cell is read once, as the stubs read them) */
+inline int MateCellsHas(void* const volatile* cells, int cap, const void* fac)
+{
+    if (fac == 0 || cells == 0) return 0;
+    for (int k = 0; k < cap; ++k) { void* c = cells[k]; if (c != 0 && c == fac) return 1; }
+    return 0;
+}
+
+/* T-1150 second gate: the engine's 'may this searcher use this building' owner filter (1.0.65 0x6207A0 / 1.0.68 0x621230) drops,
+ * before the patched compare at 0x59A39A ever sees it, any other faction's building that has an inventory - a teammate's box too.
+ * The answer the hooked filter gives: the engine's own when it keeps the building; otherwise kept only while the storage search's
+ * candidate gather runs on this thread (inSearch) and the building's owner faction is a teammate's (mate). */
+inline int HaulPoolPass(int engineKeeps, int inSearch, int mate)
+{
+    if (engineKeeps != 0) return 1;
+    return (inSearch != 0 && mate != 0) ? 1 : 0;
 }
 
 }   /* namespace teamstub */

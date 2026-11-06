@@ -37,7 +37,9 @@
 #include "net/session.h"
 #include "addresses.h"   // C2-b: kApplyDamageRva / kApplyDamageHitRetRva come from the address table
 #include "appearance.h"   // crash1c (R2c): CopyRebuildInFlightAny
-#include "clothing.h"     // LIMBS: LimbsOfOwned (the limb block of every STATE), InstallCopyAmputateGate
+#include "clothing.h"     // LIMBS: LimbsOfOwned (the limb block of every STATE), InstallCopyAmputateGate; T-1205 LimbRegrowOwned
+#include "../common/limbwire.h"   // T-1205 /restore: LimbOfPart, RegrownLimbMax
+#include "../common/statewire.h"  // T-1205 /god: GodCarried - a copy's god mode from its owner's STATE
 #include "tags.h"         // tags1: the [TAGS] REPORT line rides the report
 #include "store.h"        // par6 (parity P6): StoreDeclareDeadPod - Character::declareDead 0x7A5660 under SEH, MAIN THREAD
 #include "../common/spawnage.h"     // T-303: kSpawnFlagDead / kSpawnFlagKo - the SPAWN's owner flags
@@ -195,6 +197,59 @@ template <class S> void SlotClearAll(S* t, int slots)
     }
 }
 
+// T-1205 /god (mockups-t1205.md section 12) - GOD MODE: enemies ignore the character, and it takes no damage, knockouts, hunger or
+// lost limbs. THE SOURCE is the owning game's memory: a row here for one of its own characters, set and cleared on the main thread
+// only by the /god job (admin.cpp), never saved, gone when this game leaves the world (session end and world teardown clear the
+// table, MedicalForgetAllCopies) or the character's ownership moves (MedicalForgetCopy). The owning game sends it in the
+// character's STATE (statewire.h kGodBit, spawn.cpp SnapshotState, pushed at once by the job); every other game keeps a row for
+// its copy from that STATE (ApplyOwnerGod), released with the copy. THE GATES - existing detours, lock-free reads:
+//   this game's own god character - medicalUpdate puts back any drop in its hunger; the hit path's applyDamage is skipped (no
+//     damage, and no hit knockout or lost limb, which happen inside it); startKnockoutTimer / knockout are refused; clothing.cpp's
+//     amputate gate refuses it (GodOn);
+//   any god character, own or a copy - peace.cpp: isEnemyOf answers "not an enemy" and the two fight-picking isAllyOf callers "an
+//     ally" when it is the one asked about, on whichever game runs the asker's AI (GodCharacterAnyThread).
+// A copy's damage, knockouts, hunger and limbs already come only from its owner (C2-b, C2, par5, LIMBS), so on the other games only
+// the targeting gate reads the row.
+volatile LONG g_godOn = 0;   // rows with god mode on: 0 = every gate is one compare
+struct GodSlot
+{
+    volatile LONG uid; volatile LONG on;
+    void ClearValues() { if (InterlockedExchange(&on, 0) != 0) InterlockedDecrement(&g_godOn); }
+};
+const int kGodSlots = 256;   // power of two
+const int kGodProbe = 64;
+GodSlot g_god[kGodSlots];
+volatile LONG64 g_godDamageSkipped = 0;   // own god character: the hit path's applyDamage skipped
+volatile LONG64 g_godKoRefused     = 0;   // own god character: startKnockoutTimer / knockout refused
+volatile LONG64 g_godHungerHeld    = 0;   // own god character: a drop in hunger put back
+volatile LONG64 g_godTableFull     = 0;
+// ANY THREAD: god mode on for uid
+bool GodOnUid(unsigned int uid)
+{
+    if (g_godOn == 0 || uid == 0) return false;
+    const int s = SlotOf(g_god, kGodSlots, kGodProbe, uid);
+    if (s < 0) return false;
+    const bool on = g_god[s].on != 0;
+    return on && (unsigned int)g_god[s].uid == uid;   // the key read again: a slot released or reused meanwhile reads off
+}
+// MAIN THREAD: 1 changed, 0 already so, -1 no slot (counted)
+int GodWrite(unsigned int uid, bool on)
+{
+    if (!on)
+    {
+        const int s = SlotOf(g_god, kGodSlots, kGodProbe, uid);
+        if (s < 0 || g_god[s].on == 0) return 0;
+        SlotRelease(g_god, kGodSlots, kGodProbe, uid);   // ClearValues: off, the count down
+        return 1;
+    }
+    const int s = SlotClaim(g_god, kGodSlots, kGodProbe, uid);
+    if (s < 0) { InterlockedIncrement64(&g_godTableFull); return -1; }
+    if (g_god[s].on != 0) return 0;
+    InterlockedExchange(&g_god[s].on, 1);
+    InterlockedIncrement(&g_godOn);
+    return 1;
+}
+
 // par5 (parity P5; parity-audit-characters row 28) - A COPY'S HUNGER IS ITS OWNER'S.
 //
 // Hunger (MedicalSystem::hunger +0x60) and `fed` (+0x64) never travelled: each copy ran its own hunger clock inside
@@ -286,7 +341,17 @@ void detour_medicalUpdate(MedicalSystem* self, float frameTime)
     unsigned int uid = FindSpawnedUid(owner);
     if (uid != 0)
     {
-        if (net::IsUidMineAnyThread(uid)) InterlockedIncrement64(&g_medCallsOurs);   /* O1: the medical detour's thread is not measured to be main */
+        if (net::IsUidMineAnyThread(uid))
+        {
+            InterlockedIncrement64(&g_medCallsOurs);   /* O1: the medical detour's thread is not measured to be main */
+            if (GodOnUid(uid))
+            {   /* T-1205 /god: no hunger - the engine's tick runs, and any drop in hunger it made is put back */
+                const float hunger = self->hunger;
+                orig_medicalUpdate(self, frameTime);
+                if (self->hunger < hunger) { self->hunger = hunger; InterlockedIncrement64(&g_godHungerHeld); }
+                return;
+            }
+        }
         else
         {
             InterlockedIncrement64(&g_medCallsTheirs);
@@ -401,6 +466,11 @@ bool PuppetKoAllowed(MedicalSystem* self, int fn, float arg, unsigned long long 
 {
     const void* owner = (const void*)((const char*)self - kMedicalOffset);
     unsigned int uid = FindSpawnedUid(owner);
+    if (uid != 0 && net::IsUidMineAnyThread(uid) && GodOnUid(uid))
+    {   // T-1205 /god: this game's own god character is never knocked out
+        InterlockedIncrement64(&g_godKoRefused);
+        return false;
+    }
     if (uid == 0 || net::IsUidMineAnyThread(uid)) return true;   // ours, or not replicated at all (a lone game). O1-b: any thread
     // crash1c (review-crash1b R2c): never while a body rebuild is in flight on this copy - the rebuild would then run on the
     // limp body (T293 / T323). Checked before both allow branches; the owner's knockout still arrives by STATE, held by
@@ -516,6 +586,11 @@ void detour_applyDamage(MedicalSystem* self, void* part, float* dmg, char a4, ch
     if (uid != 0 && !net::IsUidMineAnyThread(uid))   /* O1-b: hits and ranged hits can run on an AI worker */
     {
         InterlockedIncrement64(&g_copyDamageSkipped);   /* its health arrives from the owner instead */
+        return;
+    }
+    if (GodOnUid(uid))
+    {   /* T-1205 /god: this game's own god character takes no damage (a copy returned above) */
+        InterlockedIncrement64(&g_godDamageSkipped);
         return;
     }
     InterlockedIncrement64(&g_copyDamagePassedMine);
@@ -846,6 +921,90 @@ std::string HungerSetOwned(unsigned int uid, float value)
     return "ok hungerset uid=" + N(uid) + " hunger=" + F2(med->hunger) + " pushed=" + N(pushed ? 1 : 0);
 }
 
+// T-1205 THE ADMIN TOOLBOX'S /medic, /heal AND /restore (admin.cpp), on a character THIS game drives - the owning game alone changes it; the
+// other games get the change through its STATE (MSG_STATE 14, pushed here at once). Ported in part from public pull request 3
+// (author MassDivide) and changed for this project.
+//   /medic (full false): every body part's flesh up to the ceiling the engine clamps against (age * maxHealthBase * healthScale -
+//     limbWear), its stun damage 0, each part recomputed by the engine's own HealthPartStatus::recomputeHealth, then
+//     MedicalSystem::clampHealth; the bleed rate 0; the low-health knockout latch cleared (its health is back).
+//   /heal (full true): first every part's limb wear 0 (a crippled limb whole: its ceiling is the part's full one); then as /medic;
+//     then the engine's own recalculation (stats.cpp StatsRecalcOwned: MedicalSystem::updateStats sets blood to its maximum) and
+//     the blood-loss shock latch cleared; hunger up to at least kAdminHungerFull.
+//   /restore (level kAdminRestore): first every lost (stump) or crushed limb grown back (clothing.cpp LimbRegrowOwned: the engine's
+//     limb-slot writer RobotLimbs::setLimb with a whole limb), a robotic limb left on; each grown limb's health part given the
+//     maximum the character was made with (limbwire.h RegrownLimbMax, from the parts never lost: a part whose robotic limb was taken
+//     off was left at 5 by setRobotLimbItem, build/decomp_644c00.txt); then as /heal. The limbs ride the same STATE (LimbsOfOwned) and
+//     each copy grows them back through the same call (clothing.cpp kLimbStepRegrow).
+// A knockout's clock is left to run: a knocked-out character gets up when it ends (mockups-t1205.md section 4).
+// 1 healed (*stillOut = knocked out after it), -2 dead (nothing done), -1 not driven here / no character / unreadable / the writes
+// blocked. MAIN THREAD, the K2 safe point (combat.cpp: the AI worker paused).
+const float kAdminHungerFull = 300.0f;   /* a full stomach (the pull request's value; Inferred, not read from the engine) */
+int AdminHealOwned(unsigned int uid, int level, int* stillOut, int* grown, int* robot)
+{
+    *stillOut = 0; *grown = 0; *robot = 0;
+    const bool full = level >= kAdminHeal;
+    if (!net::IsUidMine(uid) || EngineWritesBlocked()) return -1;
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !PlausiblePtr(c)) return -1;
+    MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
+    if (!PlausiblePtr(med)) return -1;
+    if (med->dead) return -2;
+    const int count = med->countBodyParts();
+    if (count <= 0 || count > 32) return -1;
+    for (int i = 0; i < count; ++i) if (!PlausiblePtr(med->partAt((unsigned __int64)i))) return -1;   /* all or nothing */
+    unsigned grownMask = 0;
+    if (level == kAdminRestore)
+    {
+        const int g = LimbRegrowOwned(c, grown, robot, &grownMask);
+        if (g < 0) return -1;   /* the limbs unreadable, or no road on this build: nothing done */
+        if (g == 0) ErrorLog("[ADMIN] /restore uid=" + N(uid) + ": a limb's grow-back call faulted - " + N(*grown) + " grown back, the others left");
+        if (grownMask != 0)
+        {
+            float bodyMax[32]; int nb = 0;
+            for (int i = 0; i < count; ++i)
+            {
+                MedicalSystem::HealthPartStatus* p = med->partAt((unsigned __int64)i);
+                if (cooplimb::LimbOfPart((int)p->partKind, (int)p->side) < 0) bodyMax[nb++] = p->maxHealthBase;
+            }
+            const float whole = cooplimb::RegrownLimbMax(bodyMax, nb);
+            for (int i = 0; whole > 0.0f && i < count; ++i)
+            {
+                MedicalSystem::HealthPartStatus* p = med->partAt((unsigned __int64)i);
+                const int l = cooplimb::LimbOfPart((int)p->partKind, (int)p->side);
+                if (l >= 0 && (grownMask & (1u << l)) != 0) p->maxHealthBase = whole;
+            }
+            DebugLog("[ADMIN] /restore uid=" + N(uid) + " limbs grown back mask=" + N(grownMask) + " part maximum " + F2(whole) + (whole > 0.0f ? std::string() : std::string(" (none read - the parts left as they were)")));
+        }
+    }
+    const float bloodWas = med->blood, hungerWas = med->hunger;
+    for (int i = 0; i < count; ++i)
+    {
+        MedicalSystem::HealthPartStatus* p = med->partAt((unsigned __int64)i);
+        if (full) p->limbWear = 0.0f;
+        const float ceil = p->age * p->maxHealthBase * p->healthScale - p->limbWear;
+        if (ceil == ceil && ceil > p->flesh) p->flesh = ceil;
+        p->stunDamage = 0.0f;
+        p->recomputeHealth();
+    }
+    med->clampHealth();
+    med->bleedRate = 0.0f;
+    med->lowHealthKnockout = false;
+    int statsRc = 0;
+    if (full)
+    {
+        statsRc = StatsRecalcOwned(uid, c);
+        med->bloodLossShock = false;
+        if (med->hunger == med->hunger && med->hunger < kAdminHungerFull) med->hunger = kAdminHungerFull;
+    }
+    *stillOut = med->unconcious ? 1 : 0;
+    const bool pushed = StatePush(uid);
+    DebugLog("[ADMIN] " + std::string(level == kAdminRestore ? "/restore" : full ? "/heal" : "/medic") + " uid=" + N(uid) + " parts=" + N(count) + " blood " + F2(bloodWas) + " -> " + F2(med->blood)
+             + (full ? " (recalc rc=" + N(statsRc) + ")" : std::string()) + " hunger " + F2(hungerWas) + " -> " + F2(med->hunger)
+             + " knockedOut=" + N(*stillOut) + (level == kAdminRestore ? " grown=" + N(*grown) + " robotKept=" + N(*robot) : std::string())
+             + " pushed=" + N(pushed ? 1 : 0));
+    return 1;
+}
+
 // P10 TEST-ONLY lever (`bodydown`, appearance.cpp BodyDownLever): knock out a character this game drives with the
 // engine's own knockout, through the C2 gate (it lets an owned character through), and push its STATE, so the copy's
 // own engine on the other game follows it down (ApplyLatch writes unconcious / knockoutClock, F439) - the T424 road.
@@ -939,7 +1098,14 @@ void MedicalForgetCopy(unsigned int uid)
     SlotRelease(g_ownerHunger, kOwnerHungerSlots, kOwnerHungerProbe, uid);
     SlotRelease(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
     SlotRelease(g_ownerDead, kOwnerDeadSlots, kOwnerDeadProbe, uid);
+    SlotRelease(g_god, kGodSlots, kGodProbe, uid);   /* T-1205 /god: a copy's row, or an own character's whose ownership moved */
     g_deathMissed.erase(uid);
+}
+
+void GodForgetCopy(unsigned int uid)
+{
+    if (uid == 0) return;
+    if (GodWrite(uid, false) > 0) DebugLog("[GOD] uid=" + N(uid) + " god mode off - its owning game is gone and the character stays here (withdrawn, not destroyed)");
 }
 
 // Every copy's words are forgotten: world teardown (spawn.cpp SpawnWorldTeardown) and session end (net/session.cpp
@@ -949,8 +1115,26 @@ void MedicalForgetAllCopies()
     SlotClearAll(g_ownerHunger, kOwnerHungerSlots);
     SlotClearAll(g_ownerKo, kOwnerKoSlots);
     SlotClearAll(g_ownerDead, kOwnerDeadSlots);
+    SlotClearAll(g_god, kGodSlots);   /* T-1205 /god: memory only - this game's god modes end when it leaves the world */
     g_deathMissed.clear();
     g_deathDueN = 0;
+}
+
+// T-1205 /god - see the god table above.
+bool GodOn(unsigned int uid) { return GodOnUid(uid); }
+int GodSet(unsigned int uid, bool on) { return GodWrite(uid, on); }
+bool GodCharacterAnyThread(const void* character)
+{
+    if (g_godOn == 0 || character == 0) return false;
+    return GodOnUid(FindSpawnedUid(character));
+}
+void ApplyOwnerGod(unsigned int uid, unsigned int latchBits)
+{
+    const int g = coopstate::GodCarried(latchBits);
+    if (uid == 0 || g < 0 || net::IsUidMine(uid)) return;   /* not carried, or a STATE for a character this game drives */
+    const int w = GodWrite(uid, g != 0);
+    if (w > 0) DebugLog("[GOD] copy uid=" + N(uid) + " god mode " + (g != 0 ? "on" : "off") + " (its owner's STATE)");
+    else if (w < 0) ErrorLog("[GOD] copy uid=" + N(uid) + " god mode on NOT kept here - the god table is full");
 }
 
 // par6 (parity P6) - see the table above. ANY THREAD (the medical tick's AI worker, or a lever on the main thread).
@@ -1739,6 +1923,8 @@ void ReportMedical()
        << " copyDamageSkipped=" << N(g_copyDamageSkipped)          // C2-b (read-damage)
        << " copyDamagePassedMine=" << N(g_copyDamagePassedMine)
        << " copyDamagePassedOtherCaller=" << N(g_copyDamagePassedOtherCaller)
+       << " god[on,damage,ko,hunger,tableFull]=" << N((long long)g_godOn) << "," << N(g_godDamageSkipped) << "," << N(g_godKoRefused)
+       << "," << N(g_godHungerHeld) << "," << N(g_godTableFull)   /* T-1205 /god */
        << " deathApplied=" << N(g_deathApplied)          /* par6 (parity P6) */
        << " deathAlready=" << N(g_deathAlready)
        << " deathDeferred=" << N(g_deathDeferred)

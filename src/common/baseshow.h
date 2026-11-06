@@ -56,12 +56,14 @@
 #include <map>
 #include <cstring>
 #include <cstdio>
+#include "nametag.h"    /* T-947: the name tags' levels and colours - another player's base on the map in the same colour */
 #include "townkeep.h"   /* the said outposts (TownRow), keptwire's PutU32 / PutStr / TextOk / FloatOk / NearXZ */
 
 namespace baseshow {
 
 const unsigned kMsgShow = 78;
-const unsigned kProtocol = 133;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+const unsigned kProtocol = 145;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+
 
 
 
@@ -498,6 +500,71 @@ inline int MarkerColourSlotOf(unsigned long long colour, unsigned long long slot
 }
 /* the slot the map draws (0x48F280): the pick when the town's name is shown, else the neutral slot */
 inline int MarkerDrawnSlot(int nameShown, int picked) { return nameShown != 0 ? picked : kMarkerNeutral; }
+/* ---- T-947 (decision 968 a, owner 1437 a): ANOTHER PLAYER'S BASE IN THE NAME TAG'S COLOUR OF THIS PLAYER'S STANDING WITH THEM ----
+   A copy of another player's outpost is drawn on the map in the colour that player's name tag has here (nametag.h): a teammate's
+   team blue, a friendly player's green, a neutral player's yellow, an enemy's red. This player's own towns keep the engine's colour
+   (no copy is made of them). The map hook (build.cpp detour_mapMarkerColour) answers the address of one of four static colours, side
+   by side kMarkerColourBytes apart in this order and filled by ColourRgba, for a town that is one of the shown copies; every other
+   map item goes to the engine's own pick unchanged. A town whose name is not known yet is drawn neutral by the marker refresh
+   without asking the pick (MarkerDrawnSlot) - an unnamed far-seen base looks like an unnamed town of anyone. */
+const int kColourTeam = 0, kColourFriendly = 1, kColourNeutral = 2, kColourEnemy = 3;
+const int kColourClasses = 4;
+/* the colour of a copy from the standing (nametag::Level - the worse of both directions, the team folded in) and the team table:
+   a teammate team blue whatever the standing reads; a level not read (kUnknown) neutral, as the name tag */
+inline int ColourOfStanding(int level, int teammate)
+{
+    if (teammate != 0) return kColourTeam;
+    return level == nametag::kFriendly ? kColourFriendly : level == nametag::kHostile ? kColourEnemy : kColourNeutral;
+}
+/* the colour's 4 floats as the map reads them (red, green, blue, alpha 1): the name tag's colour of that class */
+inline void ColourRgba(int cls, float* rgba)
+{
+    const nametag::Rgb c = cls == kColourTeam ? nametag::TeamColour()
+                         : nametag::LevelColour(cls == kColourFriendly ? nametag::kFriendly : cls == kColourEnemy ? nametag::kHostile : nametag::kNeutral);
+    rgba[0] = c.r; rgba[1] = c.g; rgba[2] = c.b; rgba[3] = 1.0f;
+}
+inline const char* ColourName(int cls)
+{
+    return cls == kColourTeam ? "team" : cls == kColourFriendly ? "friendly" : cls == kColourNeutral ? "neutral" : cls == kColourEnemy ? "enemy" : "?";
+}
+/* which of the mod's four colours a colour pointer is (-1 = none of them, or no base address) */
+inline int ColourOfPointer(unsigned long long colour, unsigned long long base)
+{
+    if (base == 0 || colour < base) return -1;
+    const unsigned long long d = colour - base;
+    if (d % kMarkerColourBytes != 0 || d / kMarkerColourBytes >= (unsigned long long)kColourClasses) return -1;
+    return (int)(d / kMarkerColourBytes);
+}
+/* the [TEAMBASE] line's name of the colour the pick answered: one of the mod's four (team / friendly / neutral / enemy), else one of
+   the engine's five (ally / neutral / enemy / own / own-selected), else "?" */
+inline const char* PickColourName(unsigned long long colour, unsigned long long slots, unsigned long long modBase)
+{
+    const int m = ColourOfPointer(colour, modBase);
+    if (m >= 0) return ColourName(m);
+    const int e = MarkerColourSlotOf(colour, slots);
+    return e >= 0 ? MarkerColourName(e) : "?";
+}
+/* the level the hide step is given (HideStep / NoteDiscovered): a teammate by the team table counts as friendly - on the map at once */
+inline int HideLevel(int level, int teammate) { return teammate != 0 ? nametag::kFriendly : level; }
+/* T-947 fold 1: a FRIENDLY reading counts for the show / remember step only once that player's own side towards this player came
+   from the wire in this world (theirsIn: relations.cpp RelationsTheirSideIn) - a reload restores the save's old standing before the
+   real one arrives, and a friendly base once shown stays shown (owner 1437 a). Before that a friendly reading counts as unknown (the
+   neutral rule: hidden until discovered); neutral and enemy readings count as they are. A teammate by the table is not gated
+   (HideLevel after this). */
+inline int ReceivedLevel(int level, int theirsIn) { return (level == nametag::kFriendly && theirsIn == 0) ? (int)nametag::kUnknown : level; }
+/* T-947 fold 1: the owners whose shown bases are stepped again at a standing event - those whose hide level (now: owner -> level,
+   each owner of a shown base of another player) differs from the one their bases were last stepped with (*last), or that are new;
+   *last becomes now (an owner with no shown base is dropped). Ascending owner order */
+inline void StandingStepOwners(std::map<int, int>* last, const std::map<int, int>& now, std::vector<int>* due)
+{
+    due->clear();
+    for (std::map<int, int>::const_iterator it = now.begin(); it != now.end(); ++it)
+    {
+        const std::map<int, int>::const_iterator was = last->find(it->first);
+        if (was == last->end() || was->second != it->second) due->push_back(it->first);
+    }
+    *last = now;
+}
 const unsigned long kShowRetryMs = 30000;   /* a base that could not be taken out is tried again this long after */
 /* a shown base no row names is taken out only when the list came whole */
 inline bool RemoveAllowed(unsigned flags) { return (flags & kFlagCut) == 0; }
@@ -710,23 +777,40 @@ inline void PlanApply(const std::vector<Shown>& shown, const std::vector<ShowRow
    discovery tick 0x92E7E0 calls vt+0x330(1) for a town not yet discovered when a player character is within its type's radius, and
    vt+0x348(1) + vt+0x330(1) nearer still - with "Discovered {1}"). The step for one shown base at an apply or a look:
    kind: its row's kind; madeNow: its town was founded or taken up by this apply; discovered: the town's vt+0x328 (1 yes, 0 no, -1 not
-   read); remembered: this player discovered the outpost id earlier (in this save: the discovered set). */
+   read); remembered: this player discovered the outpost id earlier (in this save: the discovered set). T-947 (decision 968 a): level -
+   this player's live standing with the owner (nametag::Level through HideLevel: a teammate by the team table counts as friendly;
+   kUnknown = not given, the rule as before): a FRIENDLY player's outpost is on the map at once, as a teammate's. */
 const int kHideNone = 0, kHideHide = 1, kHideShow = 2, kHideNoted = 3;
-inline int HideStep(int kind, int madeNow, int discovered, int remembered)
+inline int HideStep(int kind, int madeNow, int discovered, int remembered, int level = nametag::kUnknown)
 {
     if (kind == kShowMate) return discovered == 0 ? kHideShow : kHideNone;   /* a teammate's outpost is on the map at once */
     if (kind != kShowOther || discovered < 0) return kHideNone;
+    if (level == nametag::kFriendly) return discovered == 0 ? kHideShow : kHideNone;   /* T-947: a friendly player's too */
     if (madeNow != 0) return remembered != 0 ? (discovered == 0 ? kHideShow : kHideNone) : (discovered != 0 ? kHideHide : kHideNone);
     return (discovered == 1 && remembered == 0) ? kHideNoted : kHideNone;   /* discovered by the engine's rule since: remembered */
+}
+/* T-947 (run T1925: B drew teammate A's base neutral grey - the game had discovered it before the team formed): the engine's
+   discovery tick marks a town discovered (vt+0x330) from farther away than it marks its name known (vt+0x348, read back by vt+0x340),
+   and the map draws a town whose name is not known in the neutral colour without asking the colour pick (0x48F280) - so the mod's
+   colour of the standing never shows. 1 = the show step sets the name mark too: another player's copy (a teammate's or not, every
+   standing) discovered here (discovered 1) whose name mark is not set (named 0; -1 not read = left as it is), unless this step
+   hides it (kHideHide) or puts it on the map (kHideShow - that write sets both marks) */
+inline int NameStep(int kind, int discovered, int named, int step)
+{
+    if (kind != kShowMate && kind != kShowOther) return 0;
+    if (discovered != 1 || named != 0 || step == kHideHide || step == kHideShow) return 0;
+    return 1;
 }
 const size_t kDiscoveredCap = 4096;   /* outpost ids remembered as discovered */
 /* T-1047 step 5 fold 1: 1 = the outpost id is noted as discovered by this player now - another player's copy the engine marked
    discovered (its own rule), or a teammate's outpost (on the map at once: seen - so an ex-teammate's stays shown, manager call
-   2026-10-25); not when already remembered, nor the player's own (kind kShowOwn: no copy), nor with no id or a mark not read */
-inline int NoteDiscovered(int kind, unsigned id, int discovered, int remembered)
+   2026-10-25); not when already remembered, nor the player's own (kind kShowOwn: no copy), nor with no id or a mark not read.
+   T-947 (owner 1437 a): a FRIENDLY player's outpost (level, as HideStep) is seen too - it stays shown if the standing later falls */
+inline int NoteDiscovered(int kind, unsigned id, int discovered, int remembered, int level = nametag::kUnknown)
 {
     if (id == 0 || remembered != 0) return 0;
     if (kind == kShowMate) return 1;
+    if (kind == kShowOther && level == nametag::kFriendly) return 1;   /* T-947 */
     return (kind == kShowOther && discovered == 1) ? 1 : 0;
 }
 /* T-1047 step 5 fold 1: the read made BEFORE a copy is taken out (a save, its row gone, a re-found): the discovered mark of its town
@@ -804,6 +888,15 @@ inline unsigned IdOfHand(const std::vector<IdTown>& t, const int* w, int teamOnl
     if (w == 0 || !townkeep::HandKnown(w)) return 0;
     for (size_t i = 0; i < t.size(); ++i)
         if (t[i].id != 0 && townkeep::HandSame(t[i].hand, w)) return (teamOnly != 0 && t[i].team == 0) ? 0u : t[i].id;
+    return 0;
+}
+/* T-23 review fold 2: the id of the town whose words are w only when that outpost is owner's (the player a piece placed in it was
+   handed to: the hand-over seed carries the outpost the piece was placed in, read from the town the piece got here); 0 = none */
+inline unsigned IdOfHandOwnedBy(const std::vector<IdTown>& t, const int* w, int owner)
+{
+    if (w == 0 || owner < 0 || !townkeep::HandKnown(w)) return 0;
+    for (size_t i = 0; i < t.size(); ++i)
+        if (t[i].id != 0 && t[i].going == 0 && townkeep::HandSame(t[i].hand, w)) return t[i].owner == owner ? t[i].id : 0u;
     return 0;
 }
 /* 1 = the town at w is a non-teammate's copy (an IdTown that is not team) */

@@ -85,7 +85,7 @@ inline int AddrGroupOf(unsigned int innerType)
     case kInnerCapture: case kInnerCaptureDone: case kInnerCapturePlaced: return kAddrGroupCapture;
     case kInnerCarryBreak: return kAddrGroupCarry;
     case kInnerItemMove: case kInnerItemRequest: case kInnerItemConfirm: case kInnerItemPlaced: case kInnerItemRevoke:
-    case kInnerParityReq: case kInnerParityBox: case kInnerItemHandover: return kAddrGroupItem;   /* M7b slice 2; T-889 step 2 */
+    case kInnerParityReq: case kInnerParityBox: case kInnerItemHandover: case kInnerBoxLock: return kAddrGroupItem;   /* M7b slice 2; T-889 step 2; T-1061 */
     case kInnerSay: return kAddrGroupSay;   /* M7b slice 4 + DOOR_STATE: the side messages */
     case kInnerStats: return kAddrGroupStats;
     case kInnerCrime: return kAddrGroupCrime;

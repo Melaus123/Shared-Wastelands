@@ -251,6 +251,9 @@ inline std::string PanelStatusText(const PanelLinkFacts& f, const std::string& a
     return s;
 }
 
+/* the world server's exit code for a start refused because its rules.txt could not be read (keeprun::kExitRulesUnreadable; the
+   offline suite ties the two) */
+const long kServerExitRulesUnreadable = 36;
 /* The notebook process's own line, kept apart from the link's so a host reads two independent facts
    rather than one sentence that has to be true of both. */
 inline std::string PanelNotebookText(int state, int port, long exitCode)
@@ -272,6 +275,8 @@ inline std::string PanelNotebookText(int state, int port, long exitCode)
             if (exitCode == swformat::kServerExitWorldLocked)   /* the world's lock is held: another world server runs this world */
                 return "Couldn't host: this world is already running in another program on this computer (another Kenshi, or one left"
                        " over after a crash).";
+            if (exitCode == kServerExitRulesUnreadable)   /* T-1254 D (owner 1512 a): its rules.txt could not be read */
+                return "The world couldn't start: its rules.txt could not be read. Close any program that has it open and try again.";
             return "The world couldn't start (error " + PanelNum((long long)exitCode)
                  + "). Port " + PanelNum((long long)port) + " may be in use.";
         case kNbNoExe:
@@ -315,6 +320,20 @@ inline std::string PanelRefusalText(int reason, const std::string& modsText, int
         case 15: return "An admin removed you from the world.";   /* kRefuseKicked (mock-up t1159 screen 13) */
         case 16: return "You are banned from this world.";        /* kRefuseBanned: the JOIN status line too (screen 13) */
         default: return "Version mismatch: this multiplayer mod is a different version from the one running the world.";   /* words1b: host-neutral - the host's own game can see it too */
+    }
+}
+
+/* the refusals PanelRefusalText says with the "Version mismatch" sentence: the protocol refusal (0) and every reason it does not name
+   (T-1254 B1: a world running now whose world server answers so is an older version's, keeprun::OlderRunningMark) */
+inline bool RefusalIsVersion(int reason)
+{
+    switch (reason)
+    {
+        case -1: case 1: case 2: case 3: case 4: case 5: case 6: case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15:
+        case 16: case 100:
+            return false;
+        default:
+            return true;
     }
 }
 
@@ -994,14 +1013,16 @@ inline int BoxBlockStrips(int pw, int ph, int l, int t, int w, int h, int* out)
 /* PP6b - the name-taken box (title CAN'T JOIN by NoticeTitle). */
 inline std::string NameTakenText(const std::string& name)
 { return "The name \"" + name + "\" is already taken in this world."; }   /* T-201 N1: double quotes */
-/* T-368 (owner 270 a, exact words): the two boxes about this player's faction name, shown in the game world in Kenshi's own message box
-   with Kenshi's own "Faction Name" title and one OK. Back = a rename another player made at the same moment won the name; Moved = the
-   world loaded with a name another player of this world already uses. */
+/* T-368 (owner 270 a, exact words): the box about this player's faction name, shown in the game world in Kenshi's own message box with
+   Kenshi's own "Faction Name" title and one OK. Back = a rename another player made at the same moment won the name. (A load whose name
+   another player uses is said on the message line since T-717: FactionMovedLineText.) */
 const char* const kFactionBoxTitle = "Faction Name";
 inline std::string FactionBackText(const std::string& asked, const std::string& old)
 { return "Your faction name \"" + asked + "\" is already taken in this world, so it was changed back to \"" + old + "\"."; }
-inline std::string FactionMovedText(const std::string& asked, const std::string& now)
-{ return "Another player in this world already uses the faction name \"" + asked + "\". Your faction is now called \"" + now + "\"."; }
+/* T-717, case B (owner 677 A, exact words): a load whose faction name another player of this world holds is said on Kenshi's message
+   line, not in a box. old = the name the save loaded with, now = the name the world gave. Shown escaped (playerstab::EscapeHash). */
+inline std::string FactionMovedLineText(const std::string& old, const std::string& now)
+{ return "The faction name \"" + old + "\" is already taken in this world. Your faction is now called \"" + now + "\"."; }
 /* PP6 - after PLAY on PROFILES: a played profile loads, a never-played one opens Kenshi's NEW GAME. */
 inline std::string ProfLoadingText(const std::string& name)     { return "Loading \"" + name + "\"..."; }   /* T-201 N1: double quotes */
 const char* const kImportMovingText = "Importing from single player...";   /* T-1096 part 3: that line while the profile starts from a single-player save (the same road) */
@@ -1215,7 +1236,7 @@ inline const OptDef* OptDefs()
     return d;
 }
 struct OptChoice { const char* key; const char* wire; const char* shown; };
-const int kOptChoiceCount = 44;   /* ui5: + profilecap 1..16; T-556: + resurrectgrowth; T-1096: + the import rows */
+const int kOptChoiceCount = 46;   /* ui5: + profilecap 1..16; T-556: + resurrectgrowth; T-1096: + the import rows; + timemode vote and locked */
 inline const OptChoice* OptChoices()
 {
     static const OptChoice c[kOptChoiceCount] = {
@@ -1226,12 +1247,13 @@ inline const OptChoice* OptChoices()
         { "recruitmult", "4", "4" },
         { "basepolicy", "shared", "Everyone" }, { "basepolicy", "owner", "Owner only" }, { "basepolicy", "locked", "Locked" },
         { "timemode", "fixed", "Admin only" }, { "timemode", "consensus", "Slowest wins" },
+        { "timemode", "vote", "Everyone agrees" }, { "timemode", "locked", "Normal speed only" },
         { "profilecap", "1", "1" }, { "profilecap", "2", "2" }, { "profilecap", "3", "3" }, { "profilecap", "4", "4" },
         { "profilecap", "5", "5" }, { "profilecap", "6", "6" }, { "profilecap", "7", "7" }, { "profilecap", "8", "8" },
         { "profilecap", "9", "9" }, { "profilecap", "10", "10" }, { "profilecap", "11", "11" }, { "profilecap", "12", "12" },
         { "profilecap", "13", "13" }, { "profilecap", "14", "14" }, { "profilecap", "15", "15" }, { "profilecap", "16", "16" },
         { "resurrectgrowth", "steady", "Steady" }, { "resurrectgrowth", "steep", "Steep" },
-        { "spimport", "all", "Allowed for everyone" }, { "spimport", "host", "Host only" }, { "spimport", "off", "Not allowed" },
+        { "spimport", "all", "Allowed for everyone" }, { "spimport", "owner", "Owner and admins only" }, { "spimport", "off", "Not allowed" },
         { "spimportmoney", "yes", "Yes" }, { "spimportmoney", "no", "No" },
         { "spimportresearch", "yes", "Yes" }, { "spimportresearch", "no", "No" } };
     return c;
@@ -1321,9 +1343,9 @@ inline std::string OptMoneyText(long long v)
     }
     return "c." + out;
 }
-/* The hover note of RESURRECTION FEE and FEE GROWTH: the prices a player pays with none to four of their brought-back
-   characters alive, the host's amount and growth filled in - or, at an amount of 0, that it is free. Empty while
-   RESURRECTION is not ticked. */
+/* The hover note of RESURRECTION FEE (T-1198, the approved page version 2): the prices a player pays with none to three of
+   their brought-back characters alive, the host's amount and growth filled in, and on a second line what makes it rise -
+   or, at an amount of 0, that it is free. Empty while RESURRECTION is not ticked. */
 inline std::string OptFeeNoteText(const std::string& on, const std::string& amount, const std::string& growth)
 {
     if (on != "on") return std::string();
@@ -1332,9 +1354,9 @@ inline std::string OptFeeNoteText(const std::string& on, const std::string& amou
     for (size_t k = 0; k < a.size(); ++k) n = n * 10 + (a[k] - '0');
     if (n == 0) return "Bringing back a fallen character is free.";
     const int g = swfee::GrowthCode(growth) == swfee::kGrowthSteady ? swfee::kGrowthSteady : swfee::kGrowthSteep;
-    std::string s = "PRICES: free";
-    for (int alive = 1; alive <= 4; ++alive) s += ", " + OptMoneyText(swfee::PriceFor(n, g, alive).price);
-    return s + " ...";
+    std::string s = "Price: free, then ";
+    for (int alive = 1; alive <= 3; ++alive) s += (alive > 1 ? ", " : "") + OptMoneyText(swfee::PriceFor(n, g, alive).price);
+    return s + " ...\nRises with brought-back characters still alive.";
 }
 /* Whether row i is lit (not greyed) with the screen's values `vals` (indexed like OptDefs): RESURRECTION FEE and FEE GROWTH
    grey while RESURRECTION is not ticked; FEE GROWTH also greys at an amount of 0 (always free). Their values are kept. */
@@ -1354,23 +1376,86 @@ inline bool OptRowLit(int i, const std::string* vals)
     const int am = OptIndexOfKey(swfee::kKeyAmount);
     return am >= 0 && OptFeeCanon(vals[am]) != "0";
 }
-/* Whether row i has a hover note on GAME OPTIONS (shown only while the mouse is over its label or its control): ANIMAL
-   NESTS, RESURRECTION FEE and FEE GROWTH. */
-inline bool OptHasHoverNote(int i)
+/* GAME OPTIONS IN A RUNNING WORLD (mockups-t1158.md screen 6, decision 6 a): every player sees the world's rules; only a game the
+   world server counts an admin now changes them. On the title screen (inWorld 0) the screen is the host's own and always works.
+   1 = the arrows, the tick boxes, the RESURRECTION FEE box and DEFAULTS work. */
+inline int OptControlsLit(int inWorld, int adminNow) { return (inWorld == 0 || adminNow != 0) ? 1 : 0; }
+/* The line over DEFAULTS and DONE while the controls are greyed, else "". */
+inline std::string OptAdminOnlyLine(int inWorld, int adminNow)
 {
-    if (i < 0 || i >= kOptCount) return false;
-    const std::string k = OptDefs()[i].key;
-    return k == "gp.nnm" || k == swfee::kKeyAmount || k == swfee::kKeyGrowth;
+    return OptControlsLit(inWorld, adminNow) != 0 ? std::string() : std::string("Only an admin can change these.");
 }
-/* Row i's hover note with the screen's values `vals` (indexed like OptDefs), or "" for none: NESTS AND CAMPS' note, and for
-   both RESURRECTION FEE and FEE GROWTH the same OptFeeNoteText. */
+/* Whether row i's own control (its arrows, its tick box or the fee box) can change it: the controls work and the row is lit. */
+inline bool OptRowChangeable(int i, const std::string* vals, int controlsLit) { return controlsLit != 0 && OptRowLit(i, vals); }
+/* Whether row i can have a hover note on GAME OPTIONS (shown only while the mouse is over its label or its control): every
+   row since T-1198. Whether it has one NOW is OptHoverText's answer (a greyed fee row has none). */
+inline bool OptHasHoverNote(int i) { return i >= 0 && i < kOptCount; }
+/* Row i's hover note with the screen's values `vals` (indexed like OptDefs), or "" for none. T-1198 (the approved page,
+   version 2, owner 2026-11-02): the words are the page's exactly; a '\n' starts the note's second line. EXTRA RECRUITS IN
+   BARS, BASE ACCESS, GAME SPEED CONTROL, RESURRECTION FEE and FEE GROWTH say what the value now set means; RESURRECTION FEE
+   names the real prices (OptFeeNoteText). A greyed fee row (RESURRECTION not ticked; FEE GROWTH also at an amount of 0) has
+   none, and so has a value outside the choices of EXTRA RECRUITS IN BARS, BASE ACCESS or GAME SPEED CONTROL. No note holds a '#' (MyGUI reads it as a colour code). */
 inline std::string OptHoverText(int i, const std::string* vals)
 {
     if (!OptHasHoverNote(i)) return std::string();
-    if (std::string(OptDefs()[i].key) == "gp.nnm") return "Nests and camps: only affects areas not yet visited.";
-    const int on = OptIndexOfKey(swfee::kKeyOn), am = OptIndexOfKey(swfee::kKeyAmount), gr = OptIndexOfKey(swfee::kKeyGrowth);
-    if (on < 0 || am < 0 || gr < 0) return std::string();
-    return OptFeeNoteText(vals[on], vals[am], vals[gr]);
+    const std::string k = OptDefs()[i].key;
+    const std::string v = vals[i];
+    if (k == "gp.gdm") return "How hard every hit lands, yours and enemies'.";
+    if (k == "gp.cod") return "Chance a knocked-out character dies, your squad too.";
+    if (k == "gp.ht") return "How long food lasts. Higher means less hunger.";
+    if (k == "gp.bs") return "How fast buildings go up.";
+    if (k == "gp.rs") return "How fast research finishes.";
+    if (k == "gp.ps") return "How fast benches and machines make things.";
+    if (k == "gp.nnm") return "How many animal nests and bandit camps.\nOnly changes areas nobody has visited yet.";
+    if (k == "gp.bl") return "Bandits strip the characters they knock out.";
+    if (k == "gp.ep") return "Good resource spots are easier to find.";
+    if (k == "gt.pop") return "How many people roam the world.\nOnly new arrivals - people already out stay.";
+    if (k == "gt.squad") return "How many people travel in each roaming squad.\nOnly new squads change.";
+    if (k == "gt.raidsize") return "How many attackers come in a raid.";
+    if (k == "gt.raidfreq") return "How often raids come.";
+    if (k == "gt.attacks") return "How often factions attack player bases.";
+    if (k == "gt.limbloss") return "How easily a bad wound costs an arm or a leg.";
+    if (k == "recruitmult")
+    {
+        if (v == "1") return "Bars offer the usual recruits.";
+        if (v == "2") return "Bars offer twice the usual recruits.";
+        if (v == "3") return "Bars offer three times the usual recruits.";
+        if (v == "4") return "Bars offer four times the usual recruits.";
+        if (v == "auto") return "Bars offer one set of recruits per player, up to 4.";
+        return std::string();
+    }
+    if (k == "basepolicy")
+    {
+        const char* const both = "\nChests only. Teammates always share your whole base.";
+        if (v == "shared") return std::string("Any player can open your chests.") + both;
+        if (v == "owner") return std::string("Only you and your teammates can open your chests.") + both;
+        if (v == "locked") return std::string("Other players must pick your chests' locks.") + both;
+        return std::string();
+    }
+    if (k == "timemode")
+    {
+        if (v == "fixed") return "An admin sets the speed. No admin online: normal speed.";
+        if (v == "consensus") return "The slowest player's choice is used.\nOne player pausing pauses everyone.";
+        if (v == "vote") return "The speed changes only when every player picks it.";
+        if (v == "locked") return "Always normal speed. Nobody can pause.";
+        return std::string();
+    }
+    if (k == "profilecap") return "Most profiles one player can have here.";
+    if (k == swfee::kKeyOn) return "Fallen characters can be brought back (FALLEN tab).\nThey return without their gear.";
+    if (k == swfee::kKeyAmount || k == swfee::kKeyGrowth)
+    {
+        if (!OptRowLit(i, vals)) return std::string();
+        if (k == swfee::kKeyGrowth)
+            return swfee::GrowthCode(v) == swfee::kGrowthSteady ? "The price rises evenly with each one currently reanimated."
+                                                                : "The price climbs fast with each one currently reanimated.";
+        const int on = OptIndexOfKey(swfee::kKeyOn), gr = OptIndexOfKey(swfee::kKeyGrowth);
+        if (on < 0 || gr < 0) return std::string();
+        return OptFeeNoteText(vals[on], v, vals[gr]);
+    }
+    if (k == "spimport") return "Start a profile with a single-player save's squad.\nOnly the squad comes - no buildings.";
+    if (k == "spimportmoney") return "Whether an imported squad keeps its save's money.";
+    if (k == "spimportresearch") return "Whether an imported squad keeps its finished research.";
+    return std::string();
 }
 /* The notebook's float text: the same %.9g of a float that settings.cpp writes, so the texts compare equal. */
 inline std::string OptFloatText(double d)

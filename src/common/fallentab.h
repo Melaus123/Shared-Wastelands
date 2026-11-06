@@ -155,7 +155,7 @@ inline Row RowFor(const swfallen::Fallen& f)
 {
     Row r;
     r.uid = f.uid;
-    r.name = f.name.empty() ? f.templateName : f.name;
+    r.name = swfallen::FallenName(f);
     r.setoOrBigBo = SetoOrBigBo(f.unique, f.templateName, f.name);
     r.cell[0] = r.name;
     r.cell[1] = (f.race.empty() || f.race == "?") ? f.templateName : f.race;
@@ -310,6 +310,26 @@ inline std::string RefusalWords(int code, const std::string& name, const std::st
 }
 /* the road's placement refusal (fallenwire.h kBeside*) as the tab says it */
 inline int RefusalOfBeside(int besideCode) { return besideCode == swfallen::kBesideEnemyNear ? kRefEnemy : kRefMateGone; }
+
+/* ---- T-1205 /revive: an admin's job (admin.cpp kOpRevive, from the world server only) takes this same road. It is free (owner 1394)
+   and the host's resurrection option does not refuse it (owner 1398); the FALLEN tab and the TEST lever (adminJob 0) keep both. ---- */
+/* 1 = the road refuses with kRefOff */
+inline int OffRefuses(int on, int adminJob) { return (on == 0 && adminJob == 0) ? 1 : 0; }
+/* the price the road takes */
+inline long long PriceToPay(long long price, int adminJob) { return adminJob != 0 ? 0 : price; }
+/* the order /revive tries the free squadmates in (selected[i]: 1 when squadmate i is selected in the game): the one the tab's
+   drop-down starts on (StartMate), then the rest in the list's order */
+inline std::vector<int> AdminMateOrder(const std::vector<int>& selected)
+{
+    std::vector<int> o;
+    const int first = StartMate(selected);
+    if (first < 0) return o;
+    o.push_back(first);
+    for (int i = 0; i < (int)selected.size(); ++i) if (i != first) o.push_back(i);
+    return o;
+}
+/* a refusal that is about the squadmate (enemies near it, it can no longer be picked): /revive tries the next one */
+inline int NextMateAfter(int refusal) { return (refusal == kRefEnemy || refusal == kRefMateGone) ? 1 : 0; }
 
 /* ---- the camera road: a player with no living character comes back where the camera is looking ----
    Offered only while this player has no living character at all (the people and animals of the player's faction this game

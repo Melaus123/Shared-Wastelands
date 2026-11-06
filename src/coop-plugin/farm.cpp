@@ -25,7 +25,8 @@
 //     0x746320). Its ONLY caller is 0xE401E inside the farm's LOAD routine 0xE3DA0 (reads harvested, growth, "save time",
 //     elapsed = now - save time, then timeSkip when elapsed > a minimum and +0x160 is set; flag = (vt+0x58(farm))+0x250 == 0):
 //     it runs when the farm loads, before any update and before FarmTick has decided a writer - so a held catch-up is almost
-//     always an UNDECIDED one, and it is kept (per farm, in its table row) until FarmTick decides.
+//     always an UNDECIDED one. It is kept loose at first (the farm reads a height of 0 inside its load, so the key read there
+//     is not the farm's - FmLooseKeep), then in the row of the farm's real key until FarmTick decides (FmLooseAdoptLocked).
 //   The input records (lektor count +0x480, data +0x488, stride 0x20): stock +0, use rate +4, inventory +0x18 (_updateInputs
 //     0xDF480; the rain branch of update adds to record 0's stock) - the farm's WATER (par16 fold #7).
 //   updatePlantInstance 0xDF320 draws nothing for age < -1 (DAT_141683fcc) and reads +0x508; updateMaterial 0xE4500 reads
@@ -39,6 +40,7 @@
 // operate for a request, the lever) happen at the K2 safe point (FarmDrain). Farms are re-found by key every time through
 // this file's own hint (ObjectByPositionKeyHint: the pointer is re-proved each drain, never trusted across frames).
 #include "farm.h"
+#include "../common/leverpick.h"   /* T-1218: TEST-ONLY picks by key - exactly one, or `#<k>` */
 #include "addresses.h"      /* AddrReg - the names below come from the address table */
 #include "config.h"         /* RoleIsSingle */
 #include "items.h"          /* ObjectPositionKey, ObjectByPositionKeyHint, FarmWriterHere */
@@ -50,7 +52,9 @@
 #include "../common/keptwire.h"   /* KEPT: the kept farm's plant ages (FarmKeptLay) */
 #include "coop_log.h"
 #include "hooks.h"     /* coop::AddHook (own MinHook) */
+#include "policy.h"    /* T-1125: PolicyVtableRvaPod / PolicyClassNamePod - the torture building's class */
 #include <Windows.h>
+#include <intrin.h>      /* _ReturnAddress: the take's caller on the first-take refusal line (T-1192, T1894) */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,12 +70,16 @@ static unsigned long long kFarmOperateRva = 0;  static AddrReg kFarmOperateRva_r
 static unsigned long long kFarmPlantRva = 0;    static AddrReg kFarmPlantRva_reg("FarmUpdatePlantInstance", &kFarmPlantRva);   /* Steam_1.0.65 0xDF320 */
 static unsigned long long kFarmMaterialRva = 0; static AddrReg kFarmMaterialRva_reg("FarmUpdateMaterial", &kFarmMaterialRva);  /* Steam_1.0.65 0xE4500 */
 static unsigned long long kFarmTimeSkipRva = 0; static AddrReg kFarmTimeSkipRva_reg("FarmTimeSkip", &kFarmTimeSkipRva);    /* Steam_1.0.65 0xDF6A0 (fold #6) */
+static unsigned long long kFarmClockRva = 0; static AddrReg kFarmClockRva_reg("ClockOwnerPtr", &kFarmClockRva);    /* a POINTER VARIABLE, Steam_1.0.65 0x212F3C0: the clock the farm's load reads (0xE3DA0 passes it to 0x66C070) */
 static unsigned long long kFarmYieldRva = 0;    static AddrReg kFarmYieldRva_reg("FarmYieldChance", &kFarmYieldRva);      /* Steam_1.0.65 0xDFDD0 (fold #1) */
 static unsigned long long kGetStatRva = 0;      static AddrReg kGetStatRva_reg("CharStatsGetStat", &kGetStatRva);         /* Steam_1.0.65 0x883BF0 (fold #1) */
 static unsigned long long kGameDtRva = 0;       static AddrReg kGameDtRva_reg("GameFrameDt", &kGameDtRva);                /* Steam_1.0.65 0x2132734, a float var (fold #2) */
 static unsigned long long kTakeSpotRva = 0;     static AddrReg kTakeSpotRva_reg("BuildingTakeWorkSpot", &kTakeSpotRva);   /* Steam_1.0.65 0xF7FF0, 1.0.68 0xF8030 (T-674) */
 static unsigned long long kSetEraseRva = 0;     static AddrReg kSetEraseRva_reg("WorkerSetErase", &kSetEraseRva);         /* Steam_1.0.65 0x28D400, 1.0.68 0x28D440 (T-674) */
 static unsigned long long kSpHandCharRva = 0;   static AddrReg kSpHandCharRva_reg("Hand_asCharacter", &kSpHandCharRva);   /* Steam_1.0.65 0x7974F0 hand::getCharacter (T-674) */
+static unsigned long long kCraftTakeRva = 0;    static AddrReg kCraftTakeRva_reg("CraftTakeWorkSpot", &kCraftTakeRva);     /* Steam_1.0.65 0x2B5BB0, 1.0.68 0x2B5BF0 - the crafting bench's take (T-1192 d) */
+static unsigned long long kJobStartTakeRet = 0; static AddrReg kJobStartTakeRet_reg("JobStartTakeRet", &kJobStartTakeRet); /* ret: the job start's take call (1.0.65 0x35B3D0, call [rbx+0x4F8]) - T-1212 */
+static unsigned long long kPrisonTakeRet = 0;  static AddrReg kPrisonTakeRet_reg("PrisonTakeRet", &kPrisonTakeRet);     /* ret: setPrisonMode's take call (1.0.65 0x3305C0 +0x16C, call [rax+0x4F8]; 1.0.68 0x330772) - the put-in, T-1211 */
 
 namespace {
 
@@ -126,7 +134,7 @@ volatile DWORD g_yOverThread = 0;
 volatile float g_yOverVal = 0.0f;
 
 volatile LONG64 g_upSeen = 0, g_upRan = 0, g_upHeld = 0, g_upNoKey = 0, g_opHeld = 0, g_opLocal = 0, g_opNoEntry = 0, g_fmFull = 0,
-                g_tailFault = 0, g_tsSeen = 0, g_tsRan = 0, g_tsHeld = 0, g_tsHeldUndecided = 0, g_tsReplayed = 0,
+                g_tailFault = 0, g_tsSeen = 0, g_tsRan = 0, g_tsHeld = 0, g_tsHeldUndecided = 0, g_tsHeldWriter = 0, g_tsReplayed = 0,
                 g_tsDropped = 0, g_tsLate = 0, g_opMerged = 0, g_skillRead = 0,
                 g_skillFault = 0, g_dtMissing = 0, g_yieldOverridden = 0, g_opZeroWork = 0, g_opCopySkipped = 0;
 long long g_pubSent = 0, g_pubKeep = 0, g_pubFail = 0, g_readFail = 0, g_recvState = 0, g_recvOp = 0, g_applied = 0, g_applyWait = 0,
@@ -136,7 +144,10 @@ long long g_pubSent = 0, g_pubKeep = 0, g_pubFail = 0, g_readFail = 0, g_recvSta
           g_opPaused = 0, g_opWithCopy = 0, g_opWithSkill = 0, g_opNoWorker = 0, g_opHandedToSelf = 0, g_opDroppedStale = 0,
           g_opDroppedLink = 0, g_blocked = 0, g_opFault = 0,
           g_verdictMine = 0, g_verdictOther = 0, g_verdictNone = 0, g_testRuns = 0, g_testRefused = 0,
-          g_applyRefusedSender = 0, g_applyWaitSender = 0, g_applyKeptProven = 0;   /* M3 */
+          g_applyRefusedSender = 0, g_applyWaitSender = 0, g_applyKeptProven = 0,   /* M3 */
+          g_pubKeepSkipped = 0, g_pubPlayerFarm = 0, g_recLaid = 0, g_tsRecordDropped = 0,   /* a player farm: no keep-alive (its record carries its crop) */
+          g_pubCropSkipped = 0, g_applyCropKept = 0,   /* a player farm: a FARM not sent for a crop move alone; a FARM written without its crop */
+          g_tsRecordRetimed = 0, g_tsWaitLay = 0;   /* a player farm's load catch-up: re-timed to its record's minute; looks it waited for the record's lay */
 int g_said = 0;   /* [FARM] lines this world (64 max) */
 int g_saidFull = 0, g_saidNoWorker = 0;
 
@@ -438,13 +449,22 @@ void MnMerge(MnIn* in, unsigned int uid, float amount, float work)
    (no hand in the set, g_spCt) and its own take detour refuses its own unlisted workers while the set's count plus the counted
    spots reaches the limit; the asker re-asks a granted spot every coopfarm::kSpotKeepMs, and a counted spot not asked for
    coopfarm::kSpotCountedForgetMs is freed. T-853 #5: any spot the runner frees but for a release is told to the asker
-   (kSpotRevoked), which asks again; a granted row whose runner's slot changes is asked again of the new runner. */
+   (kSpotRevoked), which asks again; a granted row whose runner's slot changes is asked again of the new runner.
+   T-1192 (d): crafting benches and furnaces are counted the same way (coopfarm::SpotTakeOf - before, the class test was the
+   production operate slot only, so each game put the limit's worth of workers on the same bench or furnace). A furnace's take is
+   0xF7FF0 (the detour above it); a crafting bench's is its own 0x2B5BB0, detoured the same (detour_craftTake), and the runner takes
+   a bench spot through that one (SpTakeRun). The set, its erase, the count and the limit are the same offsets. */
 typedef unsigned long long (*SpTakeFn)(void* b, void* hand);
 typedef long long (*SpEraseFn)(void* set, void* hand);
 typedef void* (*SpHandCharFn)(const void* hand);
 SpTakeFn  orig_take = 0;
+SpTakeFn  orig_craftTake = 0;        /* T-1192 (d): the crafting bench's take 0x2B5BB0; 0 = not hooked */
 SpEraseFn orig_erase = 0;
-int g_hkTake = 0, g_hkErase = 0;
+int g_hkTake = 0, g_hkErase = 0, g_hkCraftTake = 0;
+volatile LONG64 g_spBenchSeen = 0;   /* T-1192 (d): bench takes seen by detour_craftTake while linked */
+
+/* ANY THREAD: coopfarm::SpotTakeOf for the building (its work slot's step kind) */
+int SpTakeOfBuilding(const void* b) { return coopfarm::SpotTakeOf(WorkStepKindOf(b)); }
 const size_t kBldWorkerSet = 0x3D0;  /* std::set<hand>: head +8, count +0x10 */
 const size_t kObjHandle = 0x58;      /* RootObjectBase::handle (items.cpp kObjHandleIds +0x60 are its ids) */
 const size_t kHandBytes = 0x20;
@@ -453,13 +473,25 @@ const int    kSpRunCap = 256;        /* spots a runner keeps for other games' wo
 const size_t kSpInCap = 1024;        /* received asks / releases waiting for K2 */
 struct SpRow { char key[64]; unsigned int hash; unsigned int uid; unsigned int ids[4]; int used; int state; DWORD at; DWORD seenAt;
                int writer; int askDue; int releaseDue;
-               int grantSlot; DWORD askAt; };   /* T-853: grantSlot = the slot that answered yes (-1 none); askAt = the last ask sent */
+               int grantSlot; DWORD askAt;      /* T-853: grantSlot = the slot that answered yes (-1 none); askAt = the last ask sent */
+               int roOwed; DWORD roAt; int roGiven; DWORD roGivenAt; };   /* T-1212: a click order's re-give owed since the job start's
+                                                                                   refusal at roAt; roGiven / roGivenAt = this row's last re-give */
 SpRow g_sp[kSpCap];
 int g_spHigh = 0;                    /* under g_fmcs */
 volatile LONG g_spGrantedN = 0;      /* rows in kSpotGranted: the erase detour reads nothing while 0 */
 volatile LONG g_spNewDue = 0;        /* a worker row was made since the last runner read: FarmTick reads the runners on its next frame */
 volatile LONG64 g_spSeen = 0, g_spPassListed = 0, g_spPassed = 0, g_spRefused = 0, g_spAsked = 0, g_spNoKey = 0, g_spNoUid = 0,
                 g_spFull = 0, g_spLeft = 0, g_spLeftNoRow = 0, g_spHandFault = 0;
+/* T-1192 (run T1894): the take's runner read in the same call (a row with no runner known): this game / another game / no answer,
+   how it was read (coopfarm::kRunRead*), rows that took "this game" at once, and a NEW row's take refused - a one-shot caller (a
+   prisoner's put-in) is not asked again, so each is a put-in (or a worker's first step) that did not happen here */
+volatile LONG64 g_spNowHere = 0, g_spNowOther = 0, g_spNowUnknown = 0, g_spFirstRefused = 0;
+volatile LONG64 g_spRunRead[coopfarm::kRunReadKinds] = { 0, 0, 0, 0, 0 };
+long long g_spNowAdopted = 0;        /* under g_fmcs */
+struct SpFirstLine { char key[64]; unsigned int uid; int writerNow; int how; unsigned long long callerRva; };
+const int kSpFirstLinesCap = 5;      /* the first refusals are said (FarmTick, main thread) */
+SpFirstLine g_spFirstLines[kSpFirstLinesCap];
+int g_spFirstQueued = 0, g_spFirstSaid = 0;   /* under g_fmcs */
 long long g_spGiveUp = 0;            /* under g_fmcs */
 long long g_spAskSent = 0, g_spAskFail = 0, g_spAnsRecv = 0, g_spAnsYes = 0, g_spAnsFull = 0, g_spAnsNoCopy = 0, g_spAnsStray = 0,
           g_spRelSent = 0, g_spRelFail = 0, g_spInDropped = 0,
@@ -468,6 +500,70 @@ long long g_spAskSent = 0, g_spAskFail = 0, g_spAnsRecv = 0, g_spAnsYes = 0, g_s
 long long g_spAnsRevoked = 0, g_spAnsKeep = 0, g_spStrayRel = 0, g_spUnusedRel = 0, g_spRegrant = 0, g_spKeepAsk = 0, g_srCounted = 0,
           g_srCountedFull = 0, g_srRevokeSent = 0, g_srRevokeFail = 0, g_srFreedCounted = 0, g_msRefusedSender = 0, g_msWaitSender = 0,
           g_verdictFallback = 0;   /* T-853 */
+/* T-1212: click re-orders - owed (job start refusals, under g_fmcs), a refusal right after a re-give not owed again (under g_fmcs),
+   given by the runner read / by a grant, dropped (a newer order or standing job / no answer in time / not found), failed (no task or
+   the call failed); g_spReorderAny = an owed row may exist (set under g_fmcs, cleared by the main thread's round under it) */
+long long g_roOwed = 0, g_roLoopRefused = 0, g_roGivenHere = 0, g_roGivenGrant = 0, g_roDropNewer = 0, g_roDropTimeout = 0,
+          g_roDropNotFound = 0, g_roFailed = 0, g_roDropFull = 0, g_roSuperseded = 0;   /* review: full answers; older owed clicks cleared */
+volatile LONG g_spReorderAny = 0;
+/* T-1211: put-ins owed - this game's own prisoner whose put-in take (row PrisonTakeRet) was refused, finished by SpPutInRound at K2.
+   POD under g_fmcs (the take detour marks them on the put-in's thread). Kept apart from g_sp, which an unlink clears: a link drop is
+   itself one of the answers (the redo completes as a lone game). */
+struct SpPiRow { char key[64]; unsigned int hash; unsigned int uid; int used; int redoing; int redoRefused; int asks; int said;
+                 DWORD at; DWORD askAt; int full; };   /* full: refused because the building's (counted) spots are full - review fold 1 */
+const int kSpPiCap = 32;
+SpPiRow g_pi[kSpPiCap];
+int g_piHigh = 0;                    /* under g_fmcs */
+volatile LONG g_piN = 0;             /* used rows: the round (and FarmDrain's early return) reads nothing more while 0 */
+volatile LONG64 g_piCopyPass = 0;    /* takes at the put-in passed for a copy of another game's prisoner (its own game cages it) */
+long long g_piOwed = 0, g_piCapFull = 0, g_piRedoRefused = 0, g_piFullRefused = 0;   /* under g_fmcs */
+long long g_piSaidOwed = 0, g_piRedone = 0, g_piGivenUp = 0, g_piAskAgain = 0;   /* main thread (SpPutInRound) */
+/* under g_fmcs: the owed put-in row of (key, uid), -1 none */
+int SpPiFindLocked(const char* key, unsigned int h, unsigned int uid)
+{
+    for (int i = 0; i < g_piHigh; ++i)
+        if (g_pi[i].used != 0 && g_pi[i].hash == h && g_pi[i].uid == uid && std::strcmp(g_pi[i].key, key) == 0) return i;
+    return -1;
+}
+/* ANY THREAD: 1 = this take came from the put-in (setPrisonMode's take call, row PrisonTakeRet) */
+int SpPutInCaller(unsigned long long caller)
+{
+    const unsigned long long base = (unsigned long long)(uintptr_t)::GetModuleHandleA(0);
+    return (kPrisonTakeRet != 0 && caller > base && caller - base == kPrisonTakeRet) ? 1 : 0;
+}
+/* ANY THREAD (the take detour): this game's own prisoner's take at the put-in returned `act` - a refusal owes one redo
+   (coopfarm::SpotPutInOwe); a refusal of the row's own redo is only flagged (the round then takes the prisoner out). No log here
+   (maybe not the main thread): the round says it. */
+void SpPutInOweNote(const char* key, unsigned int uid, int act, int full)
+{
+    const unsigned int h = FmHash(key);
+    const DWORD now = ::GetTickCount();
+    ::EnterCriticalSection(&g_fmcs);
+    int free = -1;
+    for (int j = 0; j < g_piHigh; ++j) if (g_pi[j].used == 0) { free = j; break; }
+    const int i = SpPiFindLocked(key, h, uid);
+    const int redoing = (i >= 0) ? g_pi[i].redoing : 0;
+    if (full != 0) ++g_piFullRefused;
+    if (redoing != 0 && act != coopfarm::kSpotPass) { g_pi[i].redoRefused = 1; ++g_piRedoRefused; }
+    else if (i >= 0 && full != 0) g_pi[i].full = 1;
+    else if (i < 0 && coopfarm::SpotPutInOwe(1, act, redoing) != 0)
+    {
+        if (free < 0 && g_piHigh < kSpPiCap) free = g_piHigh;
+        if (free < 0) ++g_piCapFull;   /* past the cap the prisoner is left as before (counted) */
+        else
+        {
+            SpPiRow& r = g_pi[free];
+            std::memset(&r, 0, sizeof(r));
+            std::strncpy(r.key, key, sizeof(r.key) - 1);
+            r.key[sizeof(r.key) - 1] = 0;
+            r.hash = h; r.uid = uid; r.used = 1; r.asks = 1; r.at = now | 1u; r.askAt = now; r.full = full;   /* the refusal's own ask is the first */
+            if (free >= g_piHigh) g_piHigh = free + 1;
+            ::InterlockedIncrement(&g_piN);
+            ++g_piOwed;
+        }
+    }
+    ::LeaveCriticalSection(&g_fmcs);
+}
 int g_spSaid = 0;
 void SpSay(const std::string& s) { if (g_spSaid < 24) { ++g_spSaid; DebugLog(s); } }
 struct SpIn { unsigned char kind; std::string key; unsigned int uid; };
@@ -534,6 +630,15 @@ void* SpCharOf(const void* hand)
     if (kSpHandCharRva == 0) return 0;
     __try { return ((SpHandCharFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kSpHandCharRva))(hand); }
     __except (EXCEPTION_EXECUTE_HANDLER) { ::InterlockedIncrement64(&g_spHandFault); return 0; }
+}
+
+/* ANY THREAD (review fold 1): a put-in refused because the building's counted spots are full - owed as "full", so the round takes the
+   prisoner out at once with its line (before, it lay pinned for good and nothing was said) */
+void SpPutInFullNote(const char* key, void* hand)
+{
+    void* who = SpCharOf(hand);
+    const unsigned int uid = (who != 0) ? FindSpawnedUid(who) : 0u;
+    if (uid != 0) SpPutInOweNote(key, uid, coopfarm::kSpotWait, 1);
 }
 
 /* MAIN THREAD (T-853 #4): d counted spots more (or fewer) for the building at `key` */
@@ -613,8 +718,53 @@ void SpSetState(SpRow& r, int st, DWORD now)
 }
 
 /* ANY THREAD: the take step's verdict for (key, uid) - coopfarm::SpotTakeStep on the worker's row, made here when new */
-int SpTakeDecide(const char* key, unsigned int uid, const unsigned int* ids)
+/* ANY THREAD: the runner a worker's row holds now (kProdWriter*), -1 = no row yet */
+int SpRowWriterPeek(const char* key, unsigned int uid)
 {
+    const unsigned int h = FmHash(key);
+    ::EnterCriticalSection(&g_fmcs);
+    const int i = SpFindLocked(key, h, uid);
+    const int w = (i >= 0) ? g_sp[i].writer : -1;
+    ::LeaveCriticalSection(&g_fmcs);
+    return w;
+}
+/* ANY THREAD: a new row's take refused - counted, and the first kSpFirstLinesCap queued for FarmTick to say (no log off the main thread) */
+void SpFirstRefusedNote(const char* key, unsigned int uid, int writerNow, int how, unsigned long long caller)
+{
+    ::InterlockedIncrement64(&g_spFirstRefused);
+    ::EnterCriticalSection(&g_fmcs);
+    if (g_spFirstQueued < kSpFirstLinesCap)
+    {
+        SpFirstLine& l = g_spFirstLines[g_spFirstQueued++];
+        std::strncpy(l.key, key, sizeof(l.key) - 1);
+        l.key[sizeof(l.key) - 1] = 0;
+        l.uid = uid; l.writerNow = writerNow; l.how = how;
+        l.callerRva = caller - (unsigned long long)(uintptr_t)::GetModuleHandleA(0);
+    }
+    ::LeaveCriticalSection(&g_fmcs);
+}
+/* MAIN THREAD (FarmTick): the queued first-take refusals said */
+void SpFirstRefusedSay()
+{
+    SpFirstLine say[kSpFirstLinesCap];
+    int n = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    while (g_spFirstSaid < g_spFirstQueued) say[n++] = g_spFirstLines[g_spFirstSaid++];
+    ::LeaveCriticalSection(&g_fmcs);
+    for (int k = 0; k < n; ++k)
+    {
+        char t[512];   /* T-1213 (T1908): the line runs past 300 characters with a long building key */
+        _snprintf_s(t, sizeof(t), _TRUNCATE, "[SPOT] first take refused (a put-in is not asked again): building %s worker uid %u, runner read now %d"
+                     " (1 this game, 2 another game, 0 no answer) via %d (0 main thread, 1 off-main ladder, 2 off-main booked, 3 none booked,"
+                     " 4 booked too old), caller rva 0x%llX", say[k].key, say[k].uid, say[k].writerNow, say[k].how, say[k].callerRva);
+        DebugLog(std::string(t));
+    }
+}
+/* ANY THREAD: the take step's verdict for (key, uid). T-1192 (T1894): writerNow = the runner read in this call
+   (coopfarm::SpotWriterForTake), *isNew = the row was made here */
+int SpTakeDecide(const char* key, unsigned int uid, const unsigned int* ids, int writerNow, int jobStart, int* isNew)
+{
+    *isNew = 0;
     const unsigned int h = FmHash(key);
     const DWORD now = ::GetTickCount();
     int act = coopfarm::kSpotPass;
@@ -635,6 +785,7 @@ int SpTakeDecide(const char* key, unsigned int uid, const unsigned int* ids)
             r.grantSlot = -1;
             if (free >= g_spHigh) g_spHigh = free + 1;
             i = free;
+            *isNew = 1;
             ::InterlockedExchange(&g_spNewDue, 1);
         }
     }
@@ -643,6 +794,9 @@ int SpTakeDecide(const char* key, unsigned int uid, const unsigned int* ids)
         SpRow& r = g_sp[i];
         for (int k = 0; k < 4; ++k) r.ids[k] = ids[k];
         r.seenAt = now;
+        const int w0 = r.writer;
+        r.writer = coopfarm::SpotWriterForTake(r.writer, writerNow);   /* T-1192 (T1894): this game runs it - the take passes now */
+        if (r.writer != w0) ++g_spNowAdopted;
         act = coopfarm::SpotTakeStep(0, 1, 0, r.writer, r.state, (unsigned int)(now - r.at));
         if (act == coopfarm::kSpotAskNow)
         {
@@ -650,47 +804,219 @@ int SpTakeDecide(const char* key, unsigned int uid, const unsigned int* ids)
             SpSetState(r, coopfarm::kSpotAsked, now);
             r.askDue = 1;
         }
+        if (act != coopfarm::kSpotPass && jobStart != 0)
+        {   /* T-1212: the job start ends a click order whose take is refused - its re-give is owed until the real answer is in */
+            if (coopfarm::SpotReorderOwe(jobStart, r.roGiven, (unsigned int)(now - r.roGivenAt)) != 0)
+            {
+                if (r.roOwed == 0) ++g_roOwed;
+                r.roOwed = 1; r.roAt = now;
+                g_roSuperseded += coopfarm::SpotReorderKeepNewest(g_sp, g_spHigh, i);   /* review MEDIUM 1: the newest click wins */
+                ::InterlockedExchange(&g_spReorderAny, 1);
+            }
+            else if (r.roOwed == 0) ++g_roLoopRefused;   /* refused again soon after its re-give: never given a third time */
+        }
     }
     ::LeaveCriticalSection(&g_fmcs);
     if (i < 0) ::InterlockedIncrement64(&g_spFull);
     return act;
 }
 
-/* ANY THREAD: the work step's take on a production building (vt+0x4F8 = 0xF7FF0). Listed workers, a lone game, a building this
-   game runs and a granted spot run the engine's own take; any other worker's step is refused until the runner answers. T-853 #4:
-   while this game counts spots for other games' workers it has no copy of, its own unlisted worker is refused once the set's
-   count plus those spots reaches the limit (the engine's own take does not know them). */
-unsigned long long detour_take(void* b, void* hand)
+/* T-1125: THE TORTURE BUILDING'S TAKE, SAID. Each decision of the take guard for a torture building (class TortureBuilding - the
+   Peeler Machine) is queued here on the take's thread, capped once per (building, occupant, road) (coopfarm::TortSayFirst), and
+   said by FarmTick on the main thread (`[TORTURE] take ..`). Reads only; nothing in the game changes. */
+struct TtLine { char key[64]; char bname[64]; unsigned int uid; int kind; int whose; int writer; int how; int jobStart; unsigned long long callerRva; };
+const int kTtSeenCap = 256, kTtQCap = 16;
+coopfarm::TortSeen g_ttSeen[kTtSeenCap];
+int g_ttSeenN = 0;                           /* under g_fmcs */
+TtLine g_ttQ[kTtQCap];
+int g_ttQN = 0;                              /* under g_fmcs */
+long long g_ttDropped = 0;                   /* under g_fmcs: lines not said (the cap table or the queue full) */
+volatile LONG g_ttVt = 0;                    /* the torture building's vtable rva once seen */
+volatile LONG g_ttNotVt[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };   /* other gated classes' vtable rvas seen (no RTTI walk again) */
+volatile LONG g_ttDue = 0;
+/* ANY THREAD (in the take detour, the building live): 1 = a torture building */
+int TortBuildingIs(void* b)
 {
-    if (RoleIsSingle() || ::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0 || hand == 0 || ProductionBuildingIs(b) == 0) return orig_take(b, hand);
-    ::InterlockedIncrement64(&g_spSeen);
+    const unsigned int vt = PolicyVtableRvaPod(b);
+    if (vt == 0) return 0;
+    if ((unsigned int)::InterlockedCompareExchange(&g_ttVt, 0, 0) == vt) return 1;
+    for (int i = 0; i < 8; ++i) if ((unsigned int)::InterlockedCompareExchange(&g_ttNotVt[i], 0, 0) == vt) return 0;
+    char cls[96];
+    if (PolicyClassNamePod(vt, cls, (int)sizeof(cls)) == 0) return 0;
+    if (std::strcmp(cls, ".?AVTortureBuilding@@") == 0) { ::InterlockedExchange(&g_ttVt, (LONG)vt); return 1; }
+    for (int i = 0; i < 8; ++i) if (::InterlockedCompareExchange(&g_ttNotVt[i], (LONG)vt, 0) == 0) break;
+    return 0;
+}
+/* ANY THREAD: a torture building's take decided on road `kind` - queued once per (key, uid, kind). key 0 = read it here; uid 0 =
+   read it from the hand */
+void TortTakeNote(void* b, const char* key, void* hand, unsigned int uid, int kind, int writer, int how, unsigned long long caller,
+                  int jobStart)
+{
+    char k[64];
+    k[0] = 0;
+    if (key != 0) { std::strncpy(k, key, sizeof(k) - 1); k[sizeof(k) - 1] = 0; }
+    else if (kind != coopfarm::kTortTakeNoKey && ObjectPositionKey(b, k, (int)sizeof(k), 0, 3, 0) == 0) k[0] = 0;
+    if (uid == 0 && hand != 0 && kind != coopfarm::kTortTakeHandless)
+    {
+        void* who = SpCharOf(hand);
+        uid = (who != 0) ? FindSpawnedUid(who) : 0u;
+    }
+    const int whose = (uid == 0) ? 0 : (net::IsUidMineAnyThread(uid) ? 1 : 2);
+    char bn[64];
+    if (ObjRecordNamePod(b, bn, (int)sizeof(bn)) == 0) std::strcpy(bn, "?");
+    const unsigned long long base = (unsigned long long)(uintptr_t)::GetModuleHandleA(0);
+    ::EnterCriticalSection(&g_fmcs);
+    const int say = coopfarm::TortSayFirst(g_ttSeen, &g_ttSeenN, kTtSeenCap, coopfarm::TortKeyHash(k), uid, kind);
+    if (say < 0 || (say > 0 && g_ttQN >= kTtQCap)) ++g_ttDropped;
+    else if (say > 0)
+    {
+        TtLine& l = g_ttQ[g_ttQN++];
+        std::memcpy(l.key, k, sizeof(l.key));
+        std::memcpy(l.bname, bn, sizeof(l.bname));
+        l.uid = uid; l.kind = kind; l.whose = whose; l.writer = writer; l.how = how; l.jobStart = jobStart;
+        l.callerRva = (caller > base) ? caller - base : 0ull;
+        ::InterlockedExchange(&g_ttDue, 1);
+    }
+    ::LeaveCriticalSection(&g_fmcs);
+}
+/* MAIN THREAD (FarmTick): the queued [TORTURE] take lines said */
+void TortTakeSay()
+{
+    if (::InterlockedExchange(&g_ttDue, 0) == 0) return;
+    TtLine say[kTtQCap];
+    int n = 0;
+    long long dropped = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    for (; n < g_ttQN; ++n) say[n] = g_ttQ[n];
+    g_ttQN = 0;
+    dropped = g_ttDropped;
+    ::LeaveCriticalSection(&g_fmcs);
+    for (int i = 0; i < n; ++i)
+    {
+        const TtLine& l = say[i];
+        std::string cn = "?";
+        ::Character* c = (l.uid != 0) ? FindSpawned(l.uid) : 0;
+        if (c == 0 || !NameOf(c, &cn) || cn.empty()) cn = "?";
+        char t[768];
+        _snprintf_s(t, sizeof(t), _TRUNCATE, "[TORTURE] take %s (%s): building %s '%s' occupant uid %u '%s' (%s), runner read %d"
+                    " (1 this game, 2 another game, 0 no answer, -1 not read) via %d, caller rva 0x%llX (%s); lines not said so far %lld",
+                    coopfarm::TortTakeWord(l.kind), coopfarm::TortTakeWhy(l.kind),
+                    l.key[0] != 0 ? l.key : "(no key)", l.bname, l.uid, cn.c_str(),
+                    l.whose == 1 ? "this game's own character" : l.whose == 2 ? "another game's character, a copy here" : "no shared uid",
+                    l.writer, l.how, l.callerRva, l.jobStart != 0 ? "the job start" : "not the job start", dropped);
+        DebugLog(std::string(t));
+    }
+}
+
+/* ANY THREAD: the work step's take on a counted building (vt+0x4F8: 0xF7FF0, or a crafting bench's 0x2B5BB0 - `orig` is the one
+   this call came through, `hooked` its coopfarm::kSpotTake*). Listed workers, a lone game, a building this game runs and a granted
+   spot run the engine's own take; any other worker's step is refused until the runner answers. T-853 #4: while this game counts
+   spots for other games' workers it has no copy of, its own unlisted worker is refused once the set's count plus those spots
+   reaches the limit (the engine's own take does not know them). */
+unsigned long long SpTakeGate(SpTakeFn orig, int hooked, void* b, void* hand, unsigned long long caller)
+{
+    if (hand == 0 || coopfarm::SpotTakeGated(SpTakeOfBuilding(b), hooked) == 0) return orig(b, hand);
+    /* T-1125: a torture building's take is said on every road below (TortTakeNote: once per building, occupant and road) */
+    const int tort = (hooked == coopfarm::kSpotTakeBuilding) ? TortBuildingIs(b) : 0;
+    /* T-1212: this take is the job start's (a click order or a standing job starting) - a refusal there ends a click order */
+    const unsigned long long base = (unsigned long long)(uintptr_t)::GetModuleHandleA(0);
+    const int jobStart = (kJobStartTakeRet != 0 && caller > base && caller - base == kJobStartTakeRet) ? 1 : 0;
+    if (RoleIsSingle() || ::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0)
+    {
+        if (tort != 0) TortTakeNote(b, 0, hand, 0, coopfarm::kTortTakeLone, -1, -1, caller, jobStart);
+        return orig(b, hand);
+    }
+    ::InterlockedIncrement64(hooked == coopfarm::kSpotTakeBench ? &g_spBenchSeen : &g_spSeen);
     unsigned int ids[4];
     int isNull = 0;
-    if (SpHandIds(hand, ids, &isNull) == 0 || isNull != 0) return orig_take(b, hand);
-    if (SpListed(b, ids) != 0) { ::InterlockedIncrement64(&g_spPassListed); return orig_take(b, hand); }
+    if (SpHandIds(hand, ids, &isNull) == 0 || isNull != 0)
+    {
+        if (tort != 0) TortTakeNote(b, 0, hand, 0, coopfarm::kTortTakeHandless, -1, -1, caller, jobStart);
+        return orig(b, hand);
+    }
+    if (SpListed(b, ids) != 0)
+    {
+        ::InterlockedIncrement64(&g_spPassListed);
+        if (tort != 0) TortTakeNote(b, 0, hand, 0, coopfarm::kTortTakeListed, -1, -1, caller, jobStart);
+        return orig(b, hand);
+    }
     char key[64];
-    if (ObjectPositionKey(b, key, (int)sizeof(key), 0, 3, 0) == 0) { ::InterlockedIncrement64(&g_spNoKey); return orig_take(b, hand); }
+    if (ObjectPositionKey(b, key, (int)sizeof(key), 0, 3, 0) == 0)
+    {
+        ::InterlockedIncrement64(&g_spNoKey);
+        if (tort != 0) TortTakeNote(b, "", hand, 0, coopfarm::kTortTakeNoKey, -1, -1, caller, jobStart);
+        return orig(b, hand);
+    }
+    const int putIn = SpPutInCaller(caller);   /* T-1211: the put-in's take (row PrisonTakeRet) - called once, never retried */
     if (::InterlockedCompareExchange(&g_spCtN, 0, 0) != 0)
     {   /* T-853 #4: counted spots for this building - the limit counts them too */
         const int ct = SpCtCount(key);
         unsigned long long cnt = 0;
         int lim = 0;
-        if (ct > 0 && SpRoomRead(b, &cnt, &lim) != 0 && coopfarm::SpotRoomLeft(cnt, ct, lim) == 0) { ::InterlockedIncrement64(&g_spCtRefused); return 0; }
+        if (ct > 0 && SpRoomRead(b, &cnt, &lim) != 0 && coopfarm::SpotRoomLeft(cnt, ct, lim) == 0)
+        {
+            ::InterlockedIncrement64(&g_spCtRefused);
+            if (putIn != 0) SpPutInFullNote(key, hand);   /* T-1211 review fold 1: owed as full - taken out with its line */
+            if (tort != 0) TortTakeNote(b, key, hand, 0, putIn != 0 ? coopfarm::kTortTakePutInFull : coopfarm::kTortTakeRoomFull, -1, -1, caller, jobStart);
+            return 0;
+        }
     }
     void* who = SpCharOf(hand);
     const unsigned int uid = (who != 0) ? FindSpawnedUid(who) : 0u;
-    if (uid == 0) { ::InterlockedIncrement64(&g_spNoUid); return orig_take(b, hand); }   /* a worker no other game can name: as before */
+    if (uid == 0)
+    {   /* a worker no other game can name: as before */
+        ::InterlockedIncrement64(&g_spNoUid);
+        if (tort != 0) TortTakeNote(b, key, 0, 0, coopfarm::kTortTakeNoUid, -1, -1, caller, jobStart);
+        return orig(b, hand);
+    }
     /* T-610: a copy of another game's character takes no spot here - its own game asks the runner, and the runner takes the spot
        with its copy through SpTakeRun (no detour), so that copy is listed above. Before, on the runner such a copy's own take
        passed (the writer is here) and its step ran here as well as on its own game. Any-thread owner test (O1). */
+    /* T-1211: the put-in's take (setPrisonMode, row PrisonTakeRet) is called once and never again. A copy of another game's prisoner
+       passes there: this game holds the copy in the building, so its own game is sent "please cage it" (MSG_PRISON IN, PrisonTick). */
+    if (putIn != 0 && coopfarm::SpotPutInCopyPass(putIn, coopfarm::WorkerIsCopy(uid, net::IsUidMineAnyThread(uid) ? 1 : 0,
+                                                                                net::OwnedMirrorExactAnyThread() ? 1 : 0)) != 0)
+    {
+        ::InterlockedIncrement64(&g_piCopyPass);
+        if (tort != 0) TortTakeNote(b, key, 0, uid, coopfarm::kTortTakePutInCopy, -1, -1, caller, jobStart);
+        return orig(b, hand);
+    }
     if (coopfarm::SpotCopyRefused(0, 1, 0, coopfarm::WorkerIsCopy(uid, net::IsUidMineAnyThread(uid) ? 1 : 0,
                                                                   net::OwnedMirrorExactAnyThread() ? 1 : 0)) != 0)
-    { ::InterlockedIncrement64(&g_spCopyRefused); return 0; }
-    const int act = SpTakeDecide(key, uid, ids);
-    if (act == coopfarm::kSpotPass) { ::InterlockedIncrement64(&g_spPassed); return orig_take(b, hand); }
+    {
+        ::InterlockedIncrement64(&g_spCopyRefused);
+        if (tort != 0) TortTakeNote(b, key, 0, uid, coopfarm::kTortTakeCopy, -1, -1, caller, jobStart);
+        return 0;
+    }
+    /* T-1192 (run T1894): a row with no runner known reads it NOW - a prisoner's put-in calls the take once and is never retried,
+       so a "this game runs it" answer passes the take in this call. Another game's runner, or no answer, is refused and asked as
+       before (the no-double-work guard). */
+    int writerNow = coopfarm::kProdWriterNone, how = -1;
+    const int rowW = SpRowWriterPeek(key, uid);
+    if (rowW < 0 || rowW == coopfarm::kProdWriterNone)
+    {
+        writerNow = ProdRunnerForTake(b, &how);
+        if (how >= 0 && how < coopfarm::kRunReadKinds) ::InterlockedIncrement64(&g_spRunRead[how]);
+        ::InterlockedIncrement64(writerNow == coopfarm::kProdWriterHere ? &g_spNowHere
+                                 : writerNow == coopfarm::kProdWriterOther ? &g_spNowOther : &g_spNowUnknown);
+    }
+    int isNew = 0;
+    const int act = SpTakeDecide(key, uid, ids, writerNow, jobStart, &isNew);
+    if (tort != 0)
+        TortTakeNote(b, key, 0, uid, act == coopfarm::kSpotPass ? coopfarm::kTortTakePass : putIn != 0 ? coopfarm::kTortTakePutInOwed
+                     : act == coopfarm::kSpotAskNow ? coopfarm::kTortTakeAsk : coopfarm::kTortTakeWait, writerNow, how, caller, jobStart);
+    if (act == coopfarm::kSpotPass) { ::InterlockedIncrement64(&g_spPassed); return orig(b, hand); }
     ::InterlockedIncrement64(act == coopfarm::kSpotAskNow ? &g_spAsked : &g_spRefused);
+    if (isNew != 0) SpFirstRefusedNote(key, uid, writerNow, how, caller);
+    if (putIn != 0) SpPutInOweNote(key, uid, act, 0);   /* T-1211: this game's own prisoner refused at the put-in - one redo owed */
     return 0;
 }
+/* the two takes the gate sits on: Building 0xF7FF0 (production machines, torture buildings, furnaces) and the crafting bench's 0x2B5BB0;
+   the caller's return address goes to the first-take refusal line (which call site: a work step or a put-in) */
+unsigned long long detour_take(void* b, void* hand)
+{ return SpTakeGate(orig_take, coopfarm::kSpotTakeBuilding, b, hand, (unsigned long long)_ReturnAddress()); }
+unsigned long long detour_craftTake(void* b, void* hand)
+{ return SpTakeGate(orig_craftTake, coopfarm::kSpotTakeBench, b, hand, (unsigned long long)_ReturnAddress()); }
 
 /* ANY THREAD: a worker left a building's worker set here (`erased` entries); a spot the runner granted is released (FarmTick) */
 void SpNoteLeft(const char* key, const unsigned int* ids, long long erased)
@@ -712,13 +1038,13 @@ void SpNoteLeft(const char* key, const unsigned int* ids, long long erased)
 }
 
 /* ANY THREAD: the worker set's erase (0x28D400). The hand's ids are read BEFORE the engine's erase (the hand may be the node's own
-   value, freed by it); only a production building's set (+0x3D0) and only while a granted spot exists here. */
+   value, freed by it); only a counted building's set (+0x3D0, SpTakeOfBuilding) and only while a granted spot exists here. */
 long long detour_erase(void* set, void* hand)
 {
     unsigned int ids[4];
     int isNull = 0, have = 0;
     if (::InterlockedCompareExchange(&g_spGrantedN, 0, 0) != 0 && set != 0 && hand != 0
-        && ProductionBuildingIs((const char*)set - kBldWorkerSet) != 0 && SpHandIds(hand, ids, &isNull) != 0 && isNull == 0) have = 1;
+        && SpTakeOfBuilding((const char*)set - kBldWorkerSet) != coopfarm::kSpotTakeNone && SpHandIds(hand, ids, &isNull) != 0 && isNull == 0) have = 1;
     const long long n = orig_erase(set, hand);
     if (have == 0 || n <= 0) return n;
     char key[64];
@@ -728,10 +1054,16 @@ long long detour_erase(void* set, void* hand)
 }
 
 /* MAIN THREAD, K2, crash-guarded: the engine's own take / erase on this game's building for a hand (bypassing the detours).
-   Take: 1 taken, 0 full, -1 faulted. Erase: the entries erased, -1 faulted. */
+   Take: 1 taken, 0 full, -1 faulted (or no take known). Erase: the entries erased, -1 faulted. T-1192 (d): a crafting bench is taken
+   through its own take 0x2B5BB0 (the unhooked entry when its detour is not installed). */
 int SpTakeRun(void* b, void* hand)
 {
-    __try { return (orig_take(b, hand) & 0xFF) != 0 ? 1 : 0; }
+    SpTakeFn f = orig_take;
+    if (SpTakeOfBuilding(b) == coopfarm::kSpotTakeBench)
+        f = (orig_craftTake != 0) ? orig_craftTake
+          : ((kCraftTakeRva != 0) ? (SpTakeFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kCraftTakeRva) : (SpTakeFn)0);
+    if (f == 0) return -1;
+    __try { return (f(b, hand) & 0xFF) != 0 ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 long long SpEraseRun(void* b, void* hand)
@@ -880,6 +1212,81 @@ void SpRevokeSend(const std::string& key, unsigned int uid)
     if (net::SendFarm(m)) ++g_srRevokeSent; else ++g_srRevokeFail;   /* not sent: the asker's keep-alive ask is answered full */
 }
 
+/* T-1212, MAIN THREAD (FarmTick, every frame while g_spReorderAny): each owed click re-order judged by coopfarm::SpotReorderDue - the
+   character found again by uid (this game's own), the building by its key, the character's order lists read. A due one is given once
+   (the row is marked given BEFORE the engine call, so a refusal of the re-given order is not owed again); a dropped one says why.
+   The lines are capped (the first 10 of each kind, then every 100th). */
+int SpReorderSayDue(long long n) { return (n >= 1 && (n <= 10 || n % 100 == 0)) ? 1 : 0; }
+void SpReorderRound(DWORD now)
+{
+    static SpRow ro[kSpCap];
+    static int roAns[kSpCap];
+    int n = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    for (int j = 0; j < g_spHigh && n < kSpCap; ++j)
+        if (g_sp[j].used != 0 && g_sp[j].roOwed != 0) { ro[n] = g_sp[j]; roAns[n] = coopfarm::SpotReorderAnswer(g_sp[j].writer, g_sp[j].state); ++n; }
+    if (n == 0) ::InterlockedExchange(&g_spReorderAny, 0);   /* set again under the same lock by the next owed refusal */
+    ::LeaveCriticalSection(&g_fmcs);
+    for (int k = 0; k < n; ++k)
+    {
+        const SpRow& o = ro[k];
+        const unsigned int ms = (unsigned int)(now - o.roAt);
+        ::Character* c = net::IsUidMine(o.uid) ? FindSpawned(o.uid) : 0;
+        void* b = (c != 0) ? FmResolve(std::string(o.key)) : 0;
+        long long queued = -1;
+        int pending = -1, standing = -1;
+        const int found = (c != 0 && b != 0 && OrderListCounts(c, &queued, &pending, &standing) != 0) ? 1 : 0;
+        const int d = coopfarm::SpotReorderDue(1, roAns[k], ms, found, queued, pending, standing);
+        if (d == coopfarm::kSpotReorderWait || d == coopfarm::kSpotReorderNone) continue;
+        int mine = 0;
+        ::EnterCriticalSection(&g_fmcs);
+        const int j = SpFindLocked(o.key, o.hash, o.uid);
+        if (j >= 0 && g_sp[j].roOwed != 0 && g_sp[j].roAt == o.roAt)
+        {
+            g_sp[j].roOwed = 0;
+            if (d == coopfarm::kSpotReorderGive) { g_sp[j].roGiven = 1; g_sp[j].roGivenAt = now; }
+            mine = 1;
+        }
+        ::LeaveCriticalSection(&g_fmcs);
+        if (mine == 0) continue;   /* a newer refusal replaced it (judged on the next frame), or the row went */
+        char t[400];
+        if (d == coopfarm::kSpotReorderGive)
+        {
+            int task = -1;
+            const int r = JobClickReorder(c, b, &task);
+            const char* by = (roAns[k] == coopfarm::kSpotReorderRunsHere) ? "this game runs it" : "granted";
+            if (r == 1)
+            {
+                if (roAns[k] == coopfarm::kSpotReorderRunsHere) ++g_roGivenHere; else ++g_roGivenGrant;
+                if (SpReorderSayDue(g_roGivenHere + g_roGivenGrant) == 0) continue;
+                _snprintf_s(t, sizeof(t), _TRUNCATE, "[SPOT] click order re-given uid=%u key=%s after %u ms (%s) task=%d", o.uid, o.key, ms, by, task);
+            }
+            else
+            {
+                ++g_roFailed;
+                if (SpReorderSayDue(g_roFailed) == 0) continue;
+                _snprintf_s(t, sizeof(t), _TRUNCATE, "[SPOT] click order re-give FAILED uid=%u key=%s after %u ms (%s) task=%d: %s", o.uid, o.key, ms, by, task,
+                            r == 0 ? "no AddOrder row" : r == -1 ? "the order call faulted" : r == -3 ? "reading the building's task rule faulted"
+                                                                                                   : "the building's rule gave no work task");
+            }
+        }
+        else
+        {
+            long long* cnt = (d == coopfarm::kSpotReorderDropNewer) ? &g_roDropNewer : (d == coopfarm::kSpotReorderDropTimeout) ? &g_roDropTimeout
+                           : (d == coopfarm::kSpotReorderDropFull) ? &g_roDropFull : &g_roDropNotFound;
+            ++*cnt;
+            if (SpReorderSayDue(*cnt) == 0) continue;
+            _snprintf_s(t, sizeof(t), _TRUNCATE, "[SPOT] click order re-give dropped uid=%u key=%s after %u ms: %s (window %u ms) orders[queued,pending]=%lld,%d standingJobs=%d",
+                        o.uid, o.key, ms,
+                        d == coopfarm::kSpotReorderDropNewer ? "a newer order or a standing job (the player's own choice is kept)"
+                        : d == coopfarm::kSpotReorderDropTimeout ? "no answer in time"
+                        : d == coopfarm::kSpotReorderDropFull ? "the runner answered full (no spot free)" : "the character or the building was not found again",
+                        coopfarm::kSpotReorderWindowMs, queued, pending, standing);
+        }
+        DebugLog(std::string(t));
+    }
+}
+
 /* K2 (T-853 #3), the asking game: a granted spot whose worker is not in the building's set coopfarm::kSpotGrantUseMs after the grant
    is released - the worker walked off before the yes came, left the set by a road the erase detour does not see, or the building is
    not loaded here any more. Once a second, only while a grant exists; the set walk runs here, where the AI worker is idle. */
@@ -910,6 +1317,129 @@ void SpUnusedSweep(DWORD now)
     }
 }
 
+/* T-1211, K2 (SpDrain: the AI worker and the physics thread idle - the same safe point as spawn.cpp PrisonSafePointDrain, whose
+   setPrisonMode calls run there): each owed put-in judged from LIVE reads by coopfarm::SpotPutInDue - the prisoner found again,
+   still this game's, still lying pinned; the building found by its key; the worker row's answer (and this game running it now).
+   WHY A CHECK AT EVERY SAFE POINT, not an event: the engine calls the put-in's take once and never retries it (decomp_3305c0:83-92),
+   and what unblocks it - the building's game's yes, this game becoming the runner, the link dropping - arrives by roads that never
+   call that take again. So while (and only while) a put-in is owed (g_piN) the live state is re-read here; the 3-ask limit is the
+   fallback for an answer that never comes. Redo: setPrisonMode(prisoner, 1, building) once, the engine's own put-in / take road
+   (the row is marked redoing BEFORE the call, so a refusal of the redo is never owed again). Give-up: setPrisonMode(prisoner, 0, 0),
+   the engine's own way out. An own character spawn.cpp was caging for another game's guard gets the outcome (PrisonPutInOutcome:
+   its caging finished, or the refusal sent). The lines are capped (SpReorderSayDue: the first 10 of each, then every 100th). */
+void SpPutInRound(DWORD now)
+{
+    if (::InterlockedCompareExchange(&g_piN, 0, 0) == 0) return;
+    static SpPiRow pi[kSpPiCap];
+    int n = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    for (int j = 0; j < g_piHigh && n < kSpPiCap; ++j) if (g_pi[j].used != 0) pi[n++] = g_pi[j];
+    ::LeaveCriticalSection(&g_fmcs);
+    const int linked = (!RoleIsSingle() && ::InterlockedCompareExchange(&g_fmLinked, 0, 0) != 0) ? 1 : 0;
+    for (int k = 0; k < n; ++k)
+    {
+        const SpPiRow& o = pi[k];
+        const unsigned int ms = (unsigned int)(now - o.at);
+        ::Character* c = FindSpawned(o.uid);
+        const int mine = (c != 0 && net::IsUidMine(o.uid)) ? 1 : 0;
+        const int pin = (c != 0) ? PrisonPutInPinned(c) : -1;
+        void* b = FmResolve(std::string(o.key));
+        int writer = coopfarm::kProdWriterNone, state = coopfarm::kSpotNone;
+        ::EnterCriticalSection(&g_fmcs);
+        const int w = SpFindLocked(o.key, o.hash, o.uid);
+        if (w >= 0) { writer = g_sp[w].writer; state = g_sp[w].state; }
+        ::LeaveCriticalSection(&g_fmcs);
+        const int liveHere = (b != 0 && ProdStepWriterHere(b) == coopfarm::kProdWriterHere) ? 1 : 0;
+        if (liveHere != 0) writer = coopfarm::kProdWriterHere;
+        const int ans = coopfarm::SpotPutInAnswer(o.full, writer, state);
+        int why = coopfarm::kPutInWhyNone;
+        const int d = coopfarm::SpotPutInDue(linked, c != 0 ? 1 : 0, mine, pin == 1 ? 1 : 0, b != 0 ? 1 : 0, ans, o.asks,
+                                             (unsigned int)(now - o.askAt), &why);
+        char t[512];
+        const char* whose = (mine != 0) ? "this game's own" : (c != 0) ? "another game's" : "not found here";   /* who runs the prisoner, read now */
+        if (o.said == 0)
+        {
+            ::EnterCriticalSection(&g_fmcs);
+            const int i = SpPiFindLocked(o.key, o.hash, o.uid);
+            if (i >= 0 && g_pi[i].at == o.at) g_pi[i].said = 1;
+            ::LeaveCriticalSection(&g_fmcs);
+            if (SpReorderSayDue(++g_piSaidOwed) != 0)
+            {
+                _snprintf_s(t, sizeof(t), _TRUNCATE, "[SPOT] put-in owed: building %s prisoner uid %u (%s) - the building's take refused it"
+                            " (runner %s); finished once the building's game answers; owed=%lld", o.key, o.uid, whose,
+                            o.full != 0 ? "its spots are full" : writer == coopfarm::kProdWriterOther ? "another game, asked"
+                            : "not known yet, asked", g_piSaidOwed);
+                DebugLog(std::string(t));
+            }
+        }
+        if (d == coopfarm::kSpotPutInWait) continue;
+        if (d == coopfarm::kSpotPutInAskAgain)
+        {   /* no answer to the last ask: asked again (the worker row is kept alive while the put-in is owed) */
+            ::EnterCriticalSection(&g_fmcs);
+            const int i = SpPiFindLocked(o.key, o.hash, o.uid);
+            if (i >= 0 && g_pi[i].at == o.at) { ++g_pi[i].asks; g_pi[i].askAt = now; }
+            const int j = SpFindLocked(o.key, o.hash, o.uid);
+            if (j >= 0) { SpSetState(g_sp[j], coopfarm::kSpotAsked, now); g_sp[j].askDue = 1; g_sp[j].seenAt = now; }
+            ::LeaveCriticalSection(&g_fmcs);
+            ++g_piAskAgain;
+            continue;
+        }
+        int owned = 0;
+        ::EnterCriticalSection(&g_fmcs);
+        const int i = SpPiFindLocked(o.key, o.hash, o.uid);
+        if (i >= 0 && g_pi[i].at == o.at)
+        {
+            owned = 1;
+            if (d == coopfarm::kSpotPutInRedo) g_pi[i].redoing = 1;
+            else { g_pi[i].used = 0; ::InterlockedDecrement(&g_piN); }
+            /* review fold 4: the guard reads the row's runner (SpSendRound refreshes it every 500 ms) - the live answer read above is
+               written onto the row first, so a redo inside that window passes instead of being refused and taken out */
+            const int jw = SpFindLocked(o.key, o.hash, o.uid);
+            if (d == coopfarm::kSpotPutInRedo && jw >= 0) g_sp[jw].writer = coopfarm::SpotPutInRedoWriter(g_sp[jw].writer, liveHere);
+        }
+        ::LeaveCriticalSection(&g_fmcs);
+        if (owned == 0) continue;   /* the row went meanwhile */
+        int redone = 0, out = 0;
+        const char* cause = coopfarm::SpotPutInWhyText(why);
+        if (d == coopfarm::kSpotPutInRedo)
+        {
+            const int r = PrisonPutInCall(c, b);
+            const int pin2 = PrisonPutInPinned(c);
+            int refusedAgain = 0;
+            ::EnterCriticalSection(&g_fmcs);
+            const int i2 = SpPiFindLocked(o.key, o.hash, o.uid);
+            if (i2 >= 0 && g_pi[i2].at == o.at) { refusedAgain = g_pi[i2].redoRefused; g_pi[i2].used = 0; ::InterlockedDecrement(&g_piN); }
+            ::LeaveCriticalSection(&g_fmcs);
+            redone = (r == 1 && pin2 == 2) ? 1 : 0;
+            if (redone == 0)
+            {
+                cause = (r != 1) ? "the redo call faulted" : (refusedAgain != 0) ? "the redo's take was refused again" : "the redo left it unplaced";
+                if (pin2 == 1) out = (PrisonPutInCall(c, 0) == 1) ? 1 : -1;
+            }
+        }
+        else if (d == coopfarm::kSpotPutInTakeOut) out = (PrisonPutInCall(c, 0) == 1) ? 1 : -1;
+        const int held = PrisonPutInOutcome(o.uid);   /* 0 no guard's request held; 1 caged for it; 2 its refusal sent */
+        const char* guard = held == 1 ? "; the other game's guard's caging finished" : held == 2 ? "; the other game's guard was sent the refusal" : "";
+        if (redone != 0)
+        {
+            ++g_piRedone;
+            if (SpReorderSayDue(g_piRedone) == 0) continue;
+            _snprintf_s(t, sizeof(t), _TRUNCATE, "[SPOT] put-in redone: building %s prisoner uid %u (this game's own) after %u ms, %d asks - %s%s; redone=%lld",
+                        o.key, o.uid, ms, o.asks, cause, guard, g_piRedone);
+        }
+        else
+        {
+            ++g_piGivenUp;
+            if (SpReorderSayDue(g_piGivenUp) == 0) continue;
+            _snprintf_s(t, sizeof(t), _TRUNCATE, "[SPOT] put-in given up: building %s prisoner uid %u (%s) after %u ms, %d asks - %s; %s%s; givenUp=%lld",
+                        o.key, o.uid, whose, ms, o.asks, cause,
+                        out == 1 ? "taken out by the engine's own road (setPrisonMode off)" : out < 0 ? "the take-out call FAULTED" : "nothing taken out",
+                        guard, g_piGivenUp);
+        }
+        DebugLog(std::string(t));
+    }
+}
+
 /* MAIN THREAD: the runner's row of (key, uid), -1 none */
 int SrFind(const std::string& key, unsigned int uid)
 {
@@ -923,13 +1453,14 @@ int SrFind(const std::string& key, unsigned int uid)
 void SpDrain(DWORD now)
 {
     SpUnusedSweep(now);
+    SpPutInRound(now);   /* T-1211: owed put-ins redone or given up */
     std::vector<SpIn> in;
     in.swap(g_inSpot);
     for (size_t k = 0; k < in.size(); ++k)
     {
         const SpIn& x = in[k];
         void* b = FmResolve(x.key);
-        const int runs = (b != 0 && ProductionBuildingIs(b) != 0 && ProdStepWriterHere(b) == coopfarm::kProdWriterHere) ? 1 : 0;
+        const int runs = (b != 0 && SpTakeOfBuilding(b) != coopfarm::kSpotTakeNone && ProdStepWriterHere(b) == coopfarm::kProdWriterHere) ? 1 : 0;
         const int row = SrFind(x.key, x.uid);
         if (x.kind == coopfarm::kSpotRelease)
         {
@@ -1036,6 +1567,144 @@ void FmTail(void* f)
     __except (EXCEPTION_EXECUTE_HANDLER) { ::InterlockedIncrement64(&g_tailFault); }
 }
 
+/* under g_fmcs. The engine's load catch-up (elapsed t, flag) into row i, by coopfarm::FarmTsHold on the row's writer verdict:
+   kFarmTsHoldUndecided (tsPend 1: FarmTick names the writer), kFarmTsHoldWriter (tsPend 2: due at FarmDrain, which runs it once the
+   farm's area has all its records here and its stored crop is laid - PieceRecFarmLayOwed); kFarmTsDrop: another game writes the farm.
+   One per farm: a newer catch-up for the same farm replaces the kept one (the replaced one counted dropped). The hold is counted. */
+int FmHoldTsLocked(int i, float t, char flag)
+{
+    const int r = coopfarm::FarmTsHold(0, 1, g_fm[i].verdict);
+    if (r == coopfarm::kFarmTsHoldUndecided || r == coopfarm::kFarmTsHoldWriter)
+    {
+        FmEntry& e = g_fm[i];
+        if (e.tsPend != 0) ::InterlockedIncrement64(&g_tsDropped);
+        e.tsPend = (r == coopfarm::kFarmTsHoldWriter) ? 2 : 1; e.tsT = t; e.tsFlag = flag; e.tsAt = ::GetTickCount(); e.tsLate = 0;
+    }
+    if (r == coopfarm::kFarmTsHoldUndecided) ::InterlockedIncrement64(&g_tsHeldUndecided);
+    else if (r == coopfarm::kFarmTsHoldWriter) { ::InterlockedIncrement64(&g_tsHeldWriter); ::InterlockedExchange(&g_tsDue, 1); }
+    else ::InterlockedIncrement64(&g_tsHeld);
+    return r;
+}
+
+/* THE LOAD CATCH-UP KEPT LOOSE. The engine runs a farm's catch-up inside the farm's load, where the farm reads a height of 0: the key
+   read there is not the key of the farm's row, its piece record or its lay (they end in its real height). So detour_timeskip keeps the
+   catch-up here, with the farm's object and that key's record and spot (read once), and no row is made for the load's key; the farm's
+   row takes it at the first read that has the real key and a row - the update detour, or the lay of its stored crop (FarmRecordLay,
+   which re-times it in place while no row is made yet). The match is coopfarm::FarmTsSameFarmAt: the same object, the same record and
+   sector within kTwinDrift tenths on x and z, the height not compared.
+   It has no time limit: a paused game reads no farm for as long as it likes and the catch-up is still owed. It ends only with its
+   farm - taken by the farm's row; dropped by a lay that owes none; dropped when the farm's first read finds the table full (as a held
+   farm's is); replaced when the same object is loaded again (the farm it was for is gone); run on this game when the world turns
+   single-player (FmLoosePromoteSingle, as a held row is); dropped when the world is forgotten. Under g_fmcs; ANY THREAD, POD only. */
+const int kFmLooseCap = kFmCap;
+struct FmLoose { void* obj; char key[64]; coopfarm::FarmTsSpot spot; float t; char flag; int due; int used; };   /* due 1: run at the next drain (single-player) */
+FmLoose g_tl[kFmLooseCap];
+int g_tlHigh = 0;                    /* under g_fmcs: one past the highest loose slot ever used */
+volatile LONG g_tlN = 0;             /* loose catch-ups kept now: the update detour looks for its farm's only while this is above 0 */
+volatile LONG64 g_tlKept = 0, g_tlAdopted = 0, g_tlReplaced = 0, g_tlFull = 0, g_tlSingle = 0;
+
+void FmLooseFreeLocked(int j)
+{
+    g_tl[j].used = 0;
+    ::InterlockedDecrement(&g_tlN);
+}
+
+/* under g_fmcs: the waiting loose catch-up of the farm `obj` read now with key `key`, -1 when none. The object is compared first;
+   the key is read only for an entry of the same object */
+int FmLooseFindLocked(void* obj, const char* key)
+{
+    coopfarm::FarmTsSpot live;
+    int read = 0;
+    for (int j = 0; j < g_tlHigh; ++j)
+    {
+        if (g_tl[j].used == 0 || g_tl[j].due != 0 || g_tl[j].obj != obj) continue;
+        if (read == 0) { coopfarm::FarmTsSpotOf(key, &live); read = 1; }
+        if (coopfarm::FarmTsSameFarmAt(g_tl[j].obj, g_tl[j].spot, obj, live) != 0) return j;
+    }
+    return -1;
+}
+
+/* under g_fmcs: row i takes loose catch-up j (the hold its verdict makes, FmHoldTsLocked) */
+int FmLooseAdoptLocked(int i, int j)
+{
+    const int r = FmHoldTsLocked(i, g_tl[j].t, g_tl[j].flag);
+    FmLooseFreeLocked(j);
+    ::InterlockedIncrement64(&g_tlAdopted);
+    return r;
+}
+
+/* ANY THREAD (detour_timeskip). 1 kept loose; 2 not kept, the list is full (held: nobody runs it here); 0 the table is not up (the
+   engine runs it). An entry still waiting for the same object is replaced (coopfarm::FarmLooseOnKeep): that memory now holds a farm
+   being loaded, so the farm the old entry was for was freed before any read took it. */
+int FmLooseKeep(void* obj, const char* key, float t, char flag)
+{
+    if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return 0;
+    coopfarm::FarmTsSpot sp;
+    coopfarm::FarmTsSpotOf(key, &sp);
+    int r = 2;
+    ::EnterCriticalSection(&g_fmcs);
+    int same = -1, freeSlot = -1;
+    for (int k = 0; k < g_tlHigh; ++k)
+        if (g_tl[k].used != 0 && g_tl[k].due == 0 && g_tl[k].obj == obj) { same = k; break; }
+    if (same < 0)
+        for (int k = 0; k < kFmLooseCap; ++k)
+            if (g_tl[k].used == 0) { freeSlot = k; break; }
+    const int act = coopfarm::FarmLooseOnKeep(same >= 0 ? 1 : 0, freeSlot >= 0 ? 1 : 0);
+    int j = -1;
+    if (act == coopfarm::kFarmLooseReplace) { j = same; ::InterlockedIncrement64(&g_tlReplaced); ::InterlockedIncrement64(&g_tsDropped); }
+    else if (act == coopfarm::kFarmLooseNew) { j = freeSlot; ::InterlockedIncrement(&g_tlN); }
+    if (j >= 0)
+    {
+        FmLoose& e = g_tl[j];
+        e.obj = obj;
+        std::strncpy(e.key, key, sizeof(e.key) - 1);
+        e.key[sizeof(e.key) - 1] = 0;
+        e.spot = sp;
+        e.t = t; e.flag = flag; e.due = 0; e.used = 1;
+        if (j >= g_tlHigh) g_tlHigh = j + 1;
+        ::InterlockedIncrement64(&g_tlKept);
+        r = 1;
+    }
+    else ::InterlockedIncrement64(&g_tlFull);
+    ::LeaveCriticalSection(&g_fmcs);
+    return r;
+}
+
+/* ANY THREAD (detour_update): the farm `obj` read with its real key - a catch-up its load kept loose goes into its row; with no row
+   because the table is full (tableFull) it is dropped as a held farm's is (coopfarm::FarmLooseOnRead) */
+void FmLooseAdopt(void* obj, const char* key, int tableFull)
+{
+    const unsigned int h = FmHash(key);
+    ::EnterCriticalSection(&g_fmcs);
+    const int j = FmLooseFindLocked(obj, key);
+    if (j >= 0)
+    {
+        const int i = FmFindLocked(key, h);
+        const int act = coopfarm::FarmLooseOnRead(1, i >= 0 ? 1 : 0, tableFull);
+        if (act == coopfarm::kFarmLooseAdopt) FmLooseAdoptLocked(i, j);
+        else if (act == coopfarm::kFarmLooseHeldFull)
+        {
+            FmLooseFreeLocked(j);
+            ::InterlockedIncrement64(&g_tlFull);
+            ::InterlockedIncrement64(&g_tsHeld);
+        }
+    }
+    ::LeaveCriticalSection(&g_fmcs);
+}
+
+/* MAIN THREAD (FarmTick, a single-player world): every farm runs its own engine - a waiting loose catch-up is due on this game, as a
+   held row's is (FarmDrain runs it on the farm its key resolves to, only when that is the same object) */
+void FmLoosePromoteSingle()
+{
+    if (::InterlockedCompareExchange(&g_tlN, 0, 0) == 0) return;
+    int any = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    for (int j = 0; j < g_tlHigh; ++j)
+        if (g_tl[j].used != 0 && g_tl[j].due == 0) { g_tl[j].due = 1; any = 1; ::InterlockedIncrement64(&g_tlSingle); }
+    ::LeaveCriticalSection(&g_fmcs);
+    if (any != 0) ::InterlockedExchange(&g_tsDue, 1);
+}
+
 void detour_update(void* f)
 {
     ::InterlockedIncrement64(&g_upSeen);
@@ -1043,53 +1712,28 @@ void detour_update(void* f)
     char key[64];
     if (ObjectPositionKey(f, key, (int)sizeof(key), 0, 3, 0) == 0) { ::InterlockedIncrement64(&g_upNoKey); orig_update(f); return; }
     const int v = FmSeen(key);
+    if (::InterlockedCompareExchange(&g_tlN, 0, 0) != 0) FmLooseAdopt(f, key, v == coopfarm::kFarmVerdictFull ? 1 : 0);   /* a catch-up its load kept loose: into this row */
     if (coopfarm::FarmGate(0, 1, v) == coopfarm::kFarmHold) { ::InterlockedIncrement64(&g_upHeld); FmTail(f); return; }
     ::InterlockedIncrement64(&g_upRan);
     orig_update(f);
 }
 
-/* ANY THREAD (par16 re-check #1). An undecided farm's catch-up (elapsed t, flag) kept in its row: 1 held, 2 the verdict
-   turned "other game" meanwhile (dropped), 0 run it now (this game writes it, or the row is gone). One per farm: a newer
-   catch-up for the same farm replaces the kept one (the replaced one counted dropped). */
-int FmHoldTs(const char* key, float t, char flag)
-{
-    const unsigned int h = FmHash(key);
-    int r = 0;
-    ::EnterCriticalSection(&g_fmcs);
-    const int i = FmFindLocked(key, h);
-    if (i >= 0)
-    {
-        FmEntry& e = g_fm[i];
-        if (e.verdict == 0)
-        {
-            if (e.tsPend != 0) ::InterlockedIncrement64(&g_tsDropped);
-            e.tsPend = 1; e.tsT = t; e.tsFlag = flag; e.tsAt = ::GetTickCount(); e.tsLate = 0;
-            r = 1;
-        }
-        else if (coopfarm::FarmGate(0, 1, e.verdict) == coopfarm::kFarmHold) r = 2;
-    }
-    ::LeaveCriticalSection(&g_fmcs);
-    return r;
-}
-
 /* fold #6: the catch-up growth is the writer's too - a held copy skips it whole (it would grow the copy and take its water
-   items). par16 re-check #1: an UNDECIDED farm (the usual case - timeSkip runs inside the farm's load, before FarmTick) holds
-   it too and keeps (elapsed, flag); FarmTick decides: this game writes it -> replayed at the K2 safe point (FarmDrain), another
-   game writes it -> dropped. The engine's fourth register is not an argument (see THE READ): the replay passes 0. */
+   items). In a multiplayer world every farm's load catch-up is kept whatever the writer verdict - loose
+   at first (FmLooseKeep: inside its load the farm reads a height of 0, so the key read here is not the farm's), then in the row of the
+   farm's real key (FmLooseAdoptLocked, coopfarm::FarmTsHold) - and before FarmTick has first run: the farm shows the area save's crop at its load, and a stored crop laid over it
+   (FarmRecordLay) re-times the kept catch-up to that crop's minute. FarmDrain runs it once on the game that writes the farm, after
+   its area's records are here; elsewhere it is dropped. A single-player game runs it as the engine does. The engine's fourth register
+   is not an argument (see THE READ): the replay passes 0. */
 void detour_timeskip(void* f, float t, char flag, void* p4)
 {
     ::InterlockedIncrement64(&g_tsSeen);
-    if (RoleIsSingle() || ::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0) { orig_timeskip(f, t, flag, p4); return; }
+    if (RoleIsSingle()) { orig_timeskip(f, t, flag, p4); return; }
     char key[64];
     if (ObjectPositionKey(f, key, (int)sizeof(key), 0, 3, 0) == 0) { orig_timeskip(f, t, flag, p4); return; }
-    const int v = FmSeen(key);
-    if (v == 0)
-    {   /* H3: undecided - kept for the writer FarmTick names; 0 back = this game was named the writer meanwhile: run */
-        const int held = FmHoldTs(key, t, flag);
-        if (held == 1) { ::InterlockedIncrement64(&g_tsHeldUndecided); return; }
-        if (held == 2) { ::InterlockedIncrement64(&g_tsHeld); return; }
-    }
-    else if (coopfarm::FarmGate(0, 1, v) == coopfarm::kFarmHold) { ::InterlockedIncrement64(&g_tsHeld); return; }
+    const int kept = FmLooseKeep(f, key, t, flag);
+    if (kept == 1) return;   /* the farm's row takes it at the first read with the farm's real key (FmLooseAdopt, FarmRecordLay) */
+    if (kept == 2) { ::InterlockedIncrement64(&g_tsHeld); return; }   /* the loose list is full: held, as a farm past a full table is */
     ::InterlockedIncrement64(&g_tsRan);
     orig_timeskip(f, t, flag, p4);
 }
@@ -1130,7 +1774,7 @@ float detour_yield(void* f, float skill01)
     return orig_yield(f, skill01);
 }
 
-struct FmTsDue { char key[64]; float t; char flag; };   /* MAIN THREAD: a held catch-up due (re-check #1) */
+struct FmTsDue { char key[64]; float t; char flag; void* obj; };   /* MAIN THREAD: a held catch-up due; obj: a loose one's farm (0 for a row's) */
 
 /* MAIN THREAD, K2 (par16 re-check #1): a held catch-up replayed on the farm the key resolved to. 1 ran, 0 faulted. */
 int FmReplayTs(void* b, float t, char flag)
@@ -1221,8 +1865,9 @@ int FmReadPod(void* b, FmPod* p)
 /* Writes `n` ages and the state and the water, zeroes the parts of every hidden plant the way destroyAPlant does (fold #3),
    then - only while the engine's own guards hold (+0x160 built, +0x508 mesh, +0x4D0 material: fold #4) - the engine's own
    visual refresh (updatePlantInstance per plant, updateMaterial - what update's own growth branch calls, 0xE5540 lines
-   121-128). 1 done, 2 written without the refresh, 0 faulted. */
-int FmWritePod(void* b, const FmPod* p, int n, int* hidden, int* water)
+   121-128). crop 0 (a player's farm: its crop comes from its piece record alone, farmwire.h FarmApplyCrop): the plant ages, growth,
+   death, plant start and plants harvested are left as they are; the rest is written. 1 done, 2 written without the refresh, 0 faulted. */
+int FmWritePod(void* b, const FmPod* p, int n, int* hidden, int* water, int crop)
 {
     int refreshed = 0;
     __try
@@ -1232,6 +1877,7 @@ int FmWritePod(void* b, const FmPod* p, int n, int* hidden, int* water)
         char* data = *(char**)(c + kFmPlantData);
         if (data == 0 || local <= 0) return 0;
         if (n > local) n = local;
+        if (crop == 0) n = 0;   /* the ages are the crop's: none written */
         for (int i = 0; i < n; ++i)
         {
             char* plant = data + (size_t)i * kFmPlantStride;
@@ -1248,11 +1894,14 @@ int FmWritePod(void* b, const FmPod* p, int n, int* hidden, int* water)
             }
             if (hidden) ++*hidden;
         }
-        *(float*)(c + kFmGrown) = p->grown;
-        *(float*)(c + kFmDied) = p->died;
+        if (crop != 0)
+        {
+            *(float*)(c + kFmGrown) = p->grown;
+            *(float*)(c + kFmDied) = p->died;
+            *(float*)(c + kFmGrowStart) = p->growStart;
+            *(int*)(c + kFmHarvested) = (p->harvested > local) ? local : p->harvested;
+        }
         *(float*)(c + kFmCleared) = p->cleared;
-        *(float*)(c + kFmGrowStart) = p->growStart;
-        *(int*)(c + kFmHarvested) = (p->harvested > local) ? local : p->harvested;
         *(int*)(c + kFmProdState) = p->prodState;
         float* bar = *(float**)(c + kFmBar);
         if (bar != 0 && p->hasBar != 0) *bar = p->bar;
@@ -1399,20 +2048,23 @@ void FmOpMerge(FmOpIn* in, unsigned int uid, float skill, float work)
     in->w.push_back(x);
 }
 
-/* the lever's farm: `min` = the smallest decided key (both games that load the same farms pick the same one), else the one
-   key containing the substring. "" = none / ambiguous (the reason in *why). */
-std::string FmPick(const std::string& sub, std::string* why)
+/* the lever's farm: `min` = the smallest decided key (both games that load the same farms pick the same one), else the ONE key
+   containing the substring (T-1218: a key equal to it wins; `<sub>#<k>` = the k-th in the farm snapshot's order; several are
+   refused naming the count and the first five). "" = none / refused (the reason in *why). */
+std::string FmPick(const std::string& subIn, std::string* why)
 {
     const int n = FmSnapshot(g_cp);
-    std::string best;
-    int hits = 0;
+    std::string best, sub = subIn;
+    int lpK = 0;
+    if (subIn != "min" && leverpick::SplitSelector(subIn, &sub, &lpK) < 0) { *why = leverpick::BadSelector(subIn); return ""; }
+    leverpick::Picker<std::string> pk(lpK);
     for (int i = 0; i < n; ++i)
     {
         const std::string k(g_cp[i].key);
         if (sub == "min") { if (g_cp[i].verdict != 0 && (best.empty() || k < best)) best = k; continue; }
-        if (k.find(sub) != std::string::npos) { best = k; ++hits; }
+        if (k.find(sub) != std::string::npos) pk.Add(k, k == sub ? 0 : 1, 0.0, "'" + k + "'");
     }
-    if (sub != "min" && hits > 1) { *why = "ambiguous (" + std::string(1, (char)('0' + (hits > 9 ? 9 : hits))) + "+ keys)"; return ""; }
+    if (sub != "min" && pk.Decide(&best, "farms seen here whose key contains '" + sub + "'", "load order", why) > leverpick::kOne) return "";
     if (best.empty()) *why = "no farm seen here matches";
     return best;
 }
@@ -1460,6 +2112,28 @@ int FmGateOpen(const FmPod& p, float deathLimit)
     return (p.hasBar != 0 && p.grown >= 1.0f && p.died < deathLimit && p.harvested < p.n && p.prodState != 1) ? 1 : 0;
 }
 
+/* TEST-ONLY (`buildtest farm water`). The farm's water as the engine's own rain fills it (FarmBuilding::update 0xE5540, the rain
+   branch: input record 0's stock, *(+0x488)+0, raised and capped at 1.0) - a plain field write, there is no engine call that sets it;
+   the farm's update then draws on it (_updateInputs 0xDF480) as on rain. *was / *now: record 0's stock before and after; *inputs: the
+   farm's input record count. 1 written, 0 not (no input record, or the read faulted). No C++ object here (C2712). */
+int FmWaterWrite(void* b, float v, float* was, float* now, int* inputs)
+{
+    *was = -1.0f; *now = -1.0f; *inputs = 0;
+    __try
+    {
+        char* c = (char*)b;
+        const unsigned int ni = *(const unsigned int*)(c + kFmInCount);
+        float* in = *(float**)(c + kFmInData);
+        *inputs = (int)ni;
+        if (ni == 0 || ni > coopfarm::kFarmMaxInputs || in == 0) return 0;
+        *was = in[0];
+        in[0] = (v > 1.0f) ? 1.0f : (v < 0.0f ? 0.0f : v);
+        *now = in[0];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 1;
+}
+
 void FmRunLever()
 {
     const int kind = g_ftKind; g_ftKind = 0;
@@ -1474,6 +2148,24 @@ void FmRunLever()
     if (b == 0) { ++g_testRefused; DebugLog("[FARM] farmtest REFUSED key=" + key + ": does not resolve here"); return; }
     if (FmReadPod(b, &g_pod) == 0) { ++g_testRefused; DebugLog("[FARM] farmtest REFUSED key=" + key + ": farm unreadable"); return; }
     const int hBefore = g_pod.harvested;
+    if (kind == 3)
+    {   /* water: only on the game that writes the farm (its update grows the crop; the others lay the writer's crop) */
+        const int w = FarmWriterHere(b);
+        if (w != 1)
+        {
+            ++g_testRefused;
+            DebugLog("[FARM] farmtest water REFUSED key=" + key + ": this game does not write that farm (writer " + FmVerdictWord(w == 2 ? 2 : 0)
+                     + ") - run it on the writer's game");
+            return;
+        }
+        float was = -1.0f, nowW = -1.0f;
+        int inputs = 0;
+        const int ok = FmWaterWrite(b, g_ftVal, &was, &nowW, &inputs);
+        std::sprintf(h, "[FARM] farmtest water key=%s water=%.3f was=%.3f inputs=%d grown=%.3f written=%d", key.c_str(), nowW, was, inputs,
+                     g_pod.grown, ok);
+        DebugLog(std::string(h));
+        return;
+    }
     if (kind == 1)
     {
         const int w = FarmWriterHere(b);
@@ -1487,7 +2179,7 @@ void FmRunLever()
         const float age = (g_ftVal > 1.0f) ? 1.0f : g_ftVal;
         for (int i = 0; i < g_pod.n; ++i) if (i >= g_pod.harvested) g_pod.ages[i] = age;
         g_pod.grown = g_ftVal; g_pod.died = 0.0f;
-        const int ok = FmWritePod(b, &g_pod, g_pod.n, 0, 0);
+        const int ok = FmWritePod(b, &g_pod, g_pod.n, 0, 0, 1);
         std::sprintf(h, "[FARM] farmtest grow key=%s age=%.3f grown=%.3f plants=%d harvested=%d written=%d", key.c_str(), age, g_ftVal,
                      g_pod.n, g_pod.harvested, ok);
         DebugLog(std::string(h));
@@ -1602,11 +2294,15 @@ void InstallFarm()
         : ((coop::AddHook((void*)(base + (uintptr_t)kSetEraseRva), (void*)&detour_erase, (void**)&orig_erase) == coop::SUCCESS) ? 1 : -1);
     g_hkTake = (g_hkErase != 1) ? -3 : (kTakeSpotRva == 0) ? -2
         : ((coop::AddHook((void*)(base + (uintptr_t)kTakeSpotRva), (void*)&detour_take, (void**)&orig_take) == coop::SUCCESS) ? 1 : -1);
-    char sh[300];
-    std::sprintf(sh, "[SPOT] T-674 hooks: worker-set erase %d, take a work spot %d (1 installed; -1 failed; -2 no address; -3 skipped), hand::getCharacter %s",
-                 g_hkErase, g_hkTake, kSpHandCharRva != 0 ? "bound" : "MISSING");
-    if (g_hkTake == 1 && kSpHandCharRva != 0) DebugLog(std::string(sh));
-    else ErrorLog(std::string(sh) + " - a machine's worker spots are counted per game (limit x games workers)");
+    /* T-1192 (d): the crafting bench's own take, behind the same erase */
+    g_hkCraftTake = (g_hkErase != 1) ? -3 : (kCraftTakeRva == 0) ? -2
+        : ((coop::AddHook((void*)(base + (uintptr_t)kCraftTakeRva), (void*)&detour_craftTake, (void**)&orig_craftTake) == coop::SUCCESS) ? 1 : -1);
+    if (g_hkCraftTake != 1) orig_craftTake = 0;
+    char sh[360];
+    std::sprintf(sh, "[SPOT] T-674 hooks: worker-set erase %d, take a work spot %d, a crafting bench's take %d (1 installed; -1 failed; -2 no address; -3 skipped), hand::getCharacter %s",
+                 g_hkErase, g_hkTake, g_hkCraftTake, kSpHandCharRva != 0 ? "bound" : "MISSING");
+    if (g_hkTake == 1 && g_hkCraftTake == 1 && kSpHandCharRva != 0) DebugLog(std::string(sh));
+    else ErrorLog(std::string(sh) + " - a machine's, furnace's or crafting bench's worker spots are counted per game (limit x games workers)");
 }
 
 /* ANY THREAD, crash-guarded: a production building's bar *(+0x448) and state +0x468 (as FmReadPod reads a farm's) */
@@ -1815,9 +2511,22 @@ void MnSendRound(DWORD now)
     }
 }
 
+/* T-1125, ANY THREAD, crash-guarded: 1 = the character is in the building's worker list (the list a torture building's occupant is
+   taken into), 0 = not, -1 = unreadable */
+int FarmWorkerListedPod(const void* b, const void* c)
+{
+    if (b == 0 || c == 0) return -1;
+    unsigned int ids[4];
+    int isNull = 0;
+    if (SpHandIds((const char*)c + kObjHandle, ids, &isNull) == 0 || isNull != 0) return -1;
+    return SpListed(b, ids);
+}
+
 void FarmTick()
 {
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
+    TortTakeSay();          /* T-1125: the torture building's take lines */
+    CageOccupantWatch();    /* T-1125: who goes into or out of a cage / torture building, and the building going with one inside (spawn.cpp) */
     /* g_fmLinked = THIS GAME IS IN A MULTIPLAYER WORLD (not a single-player game): every farm and machine takes the writer road -
        the writer verdict, a worker's step relayed to the writer (to this game itself when it writes), the writer's publish -
        whether this game is alone in the world or not. A single-player game runs every farm's own engine. */
@@ -1846,9 +2555,11 @@ void FarmTick()
             ::LeaveCriticalSection(&g_fmcs);
             g_last.clear(); g_hint.clear(); g_inMineState.clear();
         }
+        FmLoosePromoteSingle();   /* a catch-up kept loose (its farm's row never took it): this game's own now, as a held row's is */
         return;
     }
     const DWORD now = ::GetTickCount();
+    if (::InterlockedCompareExchange64(&g_spFirstRefused, 0, 0) != 0) SpFirstRefusedSay();   /* T-1192 (T1894): the first few said */
     if (now - g_tickAt < 500)
     {   /* a new worker row: its runner read now rather than at the next round, so its steps are not refused until then */
         if (::InterlockedCompareExchange(&g_spNewDue, 0, 0) != 0 && !EngineWritesBlocked())
@@ -1856,6 +2567,8 @@ void FarmTick()
             ::InterlockedExchange(&g_spNewDue, 0);
             SpSendRound(now);
         }
+        /* T-1212: an owed click re-order is judged every frame - after the runner read above, so "this game runs it" re-gives it now */
+        if (::InterlockedCompareExchange(&g_spReorderAny, 0, 0) != 0 && !EngineWritesBlocked()) SpReorderRound(now);
         return;
     }
     g_tickAt = now;
@@ -1871,6 +2584,7 @@ void FarmTick()
     MsSendRound(now);
     ::InterlockedExchange(&g_spNewDue, 0);
     SpSendRound(now);
+    if (::InterlockedCompareExchange(&g_spReorderAny, 0, 0) != 0) SpReorderRound(now);   /* T-1212: as on the frames between rounds */
     const int n = FmSnapshot(g_cp);
     for (int i = 0; i < n; ++i)
     {
@@ -1925,6 +2639,12 @@ void FarmTick()
                     else if (nv == 2) { e.tsPend = 0; ::InterlockedIncrement64(&g_tsDropped); }
                     else if (now - e.tsAt > kFmPendMs && e.tsLate == 0) { e.tsLate = 1; ::InterlockedIncrement64(&g_tsLate); }
                 }
+                else if (e.tsPend == 2 && nv != 1)
+                {   /* held for this game as the writer, and now another game writes it (dropped: its record carries the growth) or no
+                       writer is named (held undecided again) */
+                    if (nv == 2) { e.tsPend = 0; ::InterlockedIncrement64(&g_tsDropped); }
+                    else e.tsPend = 1;
+                }
                 if (nv == 2 || nv == 1)
                 {   /* 2: sent to the writer; 1 (fold #9): this game IS the writer now - the work runs here, never dropped */
                     int keep = 0;
@@ -1967,36 +2687,65 @@ void FarmTick()
     }
 }
 
+/* T-1211, MAIN THREAD (spawn.cpp PrisonSafePointDrain): 1 = hold the refusal of an own character's caging (ownOp) for another
+   game's guard - its put-in is owed here and not being redone now (coopfarm::SpotPutInHold) */
+int FarmPutInHold(int ownOp, unsigned int uid)
+{
+    int owed = 0;
+    if (::InterlockedCompareExchange(&g_piN, 0, 0) != 0)
+    {
+        ::EnterCriticalSection(&g_fmcs);
+        for (int j = 0; j < g_piHigh; ++j) if (g_pi[j].used != 0 && g_pi[j].uid == uid && g_pi[j].redoing == 0) { owed = 1; break; }
+        ::LeaveCriticalSection(&g_fmcs);
+    }
+    return coopfarm::SpotPutInHold(ownOp, owed);
+}
+
 void FarmDrain()
 {
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
     if (g_ftKind == 0 && g_inFarm.empty() && g_inOp.empty() && g_inMine.empty() && g_inMineState.empty() && ::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0
         && ::InterlockedCompareExchange(&g_tsDue, 0, 0) == 0 && g_inSpot.empty() && g_spRun.empty()
-        && ::InterlockedCompareExchange(&g_spGrantedN, 0, 0) == 0) return;
+        && ::InterlockedCompareExchange(&g_spGrantedN, 0, 0) == 0 && ::InterlockedCompareExchange(&g_piN, 0, 0) == 0) return;
     if (EngineWritesBlocked()) { ++g_blocked; return; }
     FmRunLever();
     const DWORD now = ::GetTickCount();
-    /* 0. (par16 re-check #1) the catch-up growth held at load while the writer was undecided, now due on this game: the
+    /* 0. (par16 re-check #1) the catch-up growth held at load (FmHoldTsLocked, or loose: FmLoosePromoteSingle), now due on this game (it writes the farm): the
        engine's own timeSkip with the kept arguments on the farm the key resolves to - dropped when it no longer resolves or
        another game has become its writer since FarmTick decided. */
     if (::InterlockedExchange(&g_tsDue, 0) != 0)
     {
         std::vector<FmTsDue> due;
         ::EnterCriticalSection(&g_fmcs);
+        int waitLay = 0;
         for (int i = 0; i < g_fmHigh; ++i)
             if (g_fm[i].used != 0 && g_fm[i].tsPend == 2)
             {
+                /* a farm whose area's records are not all here and applied yet, or whose stored crop is not laid yet this load: its
+                   catch-up waits (each lay re-times it to the laid crop's minute: FarmRecordLay) - never run on the save's crop a lay
+                   then writes over */
+                if (PieceRecFarmLayOwed(std::string(g_fm[i].key)) != 0) { waitLay = 1; continue; }
                 FmTsDue d;
-                std::memcpy(d.key, g_fm[i].key, sizeof(d.key)); d.t = g_fm[i].tsT; d.flag = g_fm[i].tsFlag;
+                std::memcpy(d.key, g_fm[i].key, sizeof(d.key)); d.t = g_fm[i].tsT; d.flag = g_fm[i].tsFlag; d.obj = 0;
                 due.push_back(d);
                 g_fm[i].tsPend = 0;
             }
+        for (int j = 0; j < g_tlHigh; ++j)   /* loose ones due (a single-player world): run on the farm they were kept for */
+            if (g_tl[j].used != 0 && g_tl[j].due != 0)
+            {
+                FmTsDue d;
+                std::memcpy(d.key, g_tl[j].key, sizeof(d.key)); d.t = g_tl[j].t; d.flag = g_tl[j].flag; d.obj = g_tl[j].obj;
+                due.push_back(d);
+                FmLooseFreeLocked(j);
+            }
         ::LeaveCriticalSection(&g_fmcs);
+        if (waitLay != 0) { ++g_tsWaitLay; ::InterlockedExchange(&g_tsDue, 1); }   /* looked at again next drain */
         const bool linkedNow = ::InterlockedCompareExchange(&g_fmLinked, 0, 0) != 0;
         for (size_t i = 0; i < due.size(); ++i)
         {
             void* b = FmResolve(due[i].key);
-            if (b == 0 || orig_timeskip == 0 || (linkedNow && FmWriterNow(due[i].key, b, 0) == 2)) { ::InterlockedIncrement64(&g_tsDropped); continue; }
+            if (b == 0 || orig_timeskip == 0 || (due[i].obj != 0 && b != due[i].obj) || (linkedNow && FmWriterNow(due[i].key, b, 0) == 2))
+            { ::InterlockedIncrement64(&g_tsDropped); continue; }
             if (FmReplayTs(b, due[i].t, due[i].flag) == 0)
             {
                 ::InterlockedIncrement64(&g_tsDropped);
@@ -2054,7 +2803,11 @@ void FarmDrain()
         if (cnt != (int)it->second.m.ages.size() || cnt != g_pod.n) ++g_applyMismatch;
         FmMsgToPod(it->second.m, &g_pod);
         int hidden = 0, water = 0;
-        const int wr = FmWritePod(b, &g_pod, cnt, &hidden, &water);
+        /* a player's farm: its crop is laid from its piece record alone (build.cpp PcfDrain) - the FARM's water, bar, work state, cleared
+           value and work spot are written, its crop is not */
+        const int crop = coopfarm::FarmApplyCrop(PieceRecFarmIsPlayer(it->first));
+        if (crop == 0) ++g_applyCropKept;
+        const int wr = FmWritePod(b, &g_pod, cnt, &hidden, &water, crop);
         if (wr != 0)
         {
             if (g_applied == 0)
@@ -2135,10 +2888,11 @@ void FarmDrain()
         if (ws.empty()) g_inOp.erase(it++);
         else { it->second.at = now; ++it; }   /* past the per-drain call cap: the rest runs next drain */
     }
-    /* MINE_OP: the writer runs a worker's step it was sent through the engine's own ProductionBuilding::operate, at most one
+    /* MINE_OP: the writer runs a worker's step it was sent through the engine's own step of the building's class, at most one
        sender's call amount per call at this game's frame (updateOutput makes at most one item a call), at most kFmCallsPerDrain
        calls per building per drain; a game another game's writer holds refuses it; with no writer named it waits kFmPendMs
-       (as FARM_OP); a key that resolves to something that is not a production building is refused. */
+       (as FARM_OP); a key that resolves to something whose work slot is none of the gated steps is refused (T-1192: production,
+       crafting bench, furnace - each run through its own class's step, ProdOperateRun). */
     const float mdt = FmDt();
     for (std::map<std::string, MnIn>::iterator it = g_inMine.begin(); it != g_inMine.end(); )
     {
@@ -2149,7 +2903,7 @@ void FarmDrain()
             else ++it;
             continue;
         }
-        if (ProductionBuildingIs(b) == 0)
+        if (WorkStepBuildingIs(b) == 0)   /* T-1192: a crafting bench's or a furnace's worker step is sent here too */
         {
             ++g_mnNotProduction;
             MnSay("[MINE] MINE_OP refused key=" + it->first + ": that key names no production building here");
@@ -2282,11 +3036,24 @@ void FarmDrain()
         void* b = FmResolve(key);
         if (b == 0) continue;
         if (FmReadPod(b, &g_pod) == 0) { ++g_readFail; continue; }
+        /* a player's farm: its crop is noted for its piece record (written at a clear event or each 1% band step) - the record is its
+           crop's one road; its FARM goes only when the rest of it moves (no crop move, no keep-alive: farmwire.h FarmPublishDueOf) */
+        const int playerFarm = (PieceRecFarmNote(key, b, g_pod.grown, g_pod.died, g_pod.growStart, g_pod.harvested) != 0) ? 1 : 0;
+        if (playerFarm != 0) ++g_pubPlayerFarm;
         coopfarm::FarmMsg cur;
         FmPodToMsg(g_pod, key, &cur);
         FmLast& last = g_last[key];
-        const int due = coopfarm::FarmPublishDue(last.m, cur, last.ever, now - last.at);
-        if (due == 0) continue;
+        const int due = coopfarm::FarmPublishDueOf(last.m, cur, last.ever, now - last.at, playerFarm);
+        if (due == 0)
+        {
+            if (playerFarm != 0)
+            {
+                const int plain = coopfarm::FarmPublishDue(last.m, cur, last.ever, now - last.at);
+                if (plain == 2) ++g_pubKeepSkipped;
+                else if (plain == 1) ++g_pubCropSkipped;
+            }
+            continue;
+        }
         ++sent;
         if (net::SendFarm(cur))
         {
@@ -2308,6 +3075,10 @@ void FarmForgetWorld()
     for (int i = 0; i < g_fmHigh; ++i) if (g_fm[i].used != 0 && g_fm[i].tsPend != 0) ::InterlockedIncrement64(&g_tsDropped);
     std::memset(g_fm, 0, sizeof(g_fm));
     g_fmHigh = 0;
+    for (int j = 0; j < g_tlHigh; ++j) if (g_tl[j].used != 0) ::InterlockedIncrement64(&g_tsDropped);   /* loose catch-ups: their farms went with the world */
+    std::memset(g_tl, 0, sizeof(g_tl));
+    g_tlHigh = 0;
+    ::InterlockedExchange(&g_tlN, 0);
     std::memset(g_mn, 0, sizeof(g_mn));
     g_mnHigh = 0;
     std::memset(g_ms, 0, sizeof(g_ms));
@@ -2318,6 +3089,9 @@ void FarmForgetWorld()
     std::memset(g_spCt, 0, sizeof(g_spCt));   /* T-853 #4: the counted spots went with the world's buildings */
     g_spCtHigh = 0;
     ::InterlockedExchange(&g_spCtN, 0);
+    std::memset(g_pi, 0, sizeof(g_pi));   /* T-1211 review fold 3: the owed put-ins went with the world's characters and buildings */
+    g_piHigh = 0;
+    ::InterlockedExchange(&g_piN, 0);
     ::LeaveCriticalSection(&g_fmcs);
     ::InterlockedExchange(&g_fmFullFlag, 0);
     ::InterlockedExchange(&g_tsDue, 0);
@@ -2382,7 +3156,74 @@ int FarmKeptLay(void* b, float growth, float death, float start, int harvested, 
     g_pod.grown = growth; g_pod.died = death; g_pod.growStart = start;
     g_pod.harvested = harvested < 0 ? 0 : (harvested > g_pod.n ? g_pod.n : harvested);
     int hidden = 0, water = 0;
-    return FmWritePod(b, &g_pod, g_pod.n, &hidden, &water) != 0 ? 1 : 0;
+    return FmWritePod(b, &g_pod, g_pod.n, &hidden, &water, 1) != 0 ? 1 : 0;
+}
+/* K2 (build.cpp PcfDrain / PieceRecFarmNote): a player farm's crop from its piece record laid onto this game's farm, as a kept farm is
+   (FarmKeptLay). The engine's load catch-up held for the farm (timeSkip, its elapsed time from the area SAVE, with the engine's own
+   water flag; FmLooseKeep / FmHoldTsLocked) is for the crop the farm showed before: at EVERY lay while it is held it is re-timed from the laid crop's
+   minute (coopfarm::FarmCatchUpAtLay) - catchUp 1: to catchUpHours (the hours since that minute, piecerec::PieceFarmCatchUp);
+   catchUp 0: none is owed from it (dropped). It still runs once, only where this game writes the farm (FarmDrain); the one held
+   catch-up is re-timed, never added to. 1 laid, 0 not (*plants 0: no plants yet, or the read faulted) */
+int FarmRecordLay(void* b, float growth, float death, float start, int harvested, int catchUp, float catchUpHours, int* plants)
+{
+    const int r = FarmKeptLay(b, growth, death, start, harvested, plants);
+    if (r == 0) return 0;
+    ++g_recLaid;
+    char key[64];
+    if (::InterlockedCompareExchange(&g_fmInit, 0, 0) != 0 && ObjectPositionKey(b, key, (int)sizeof(key), 0, 3, 0) != 0)
+    {
+        ::EnterCriticalSection(&g_fmcs);
+        const int i = FmFindLocked(key, FmHash(key));
+        /* a catch-up this farm's load kept loose: its row takes it now; while the farm has no row yet it is re-timed (or dropped) loose */
+        const int j = (::InterlockedCompareExchange(&g_tlN, 0, 0) != 0) ? FmLooseFindLocked(b, key) : -1;
+        if (j >= 0 && i >= 0) FmLooseAdoptLocked(i, j);
+        const int heldRow = (i >= 0 && g_fm[i].tsPend != 0) ? 1 : 0;
+        const int heldLoose = (i < 0 && j >= 0) ? 1 : 0;
+        const int act = coopfarm::FarmCatchUpAtLay((heldRow != 0 || heldLoose != 0) ? 1 : 0, catchUp);
+        if (act == coopfarm::kFarmCuRetime)
+        {
+            if (heldRow != 0) { g_fm[i].tsT = catchUpHours; if (g_fm[i].tsPend == 2) ::InterlockedExchange(&g_tsDue, 1); }
+            else g_tl[j].t = catchUpHours;
+        }
+        else if (act == coopfarm::kFarmCuDrop)
+        {
+            if (heldRow != 0) g_fm[i].tsPend = 0;
+            else FmLooseFreeLocked(j);
+        }
+        ::LeaveCriticalSection(&g_fmcs);
+        if (act == coopfarm::kFarmCuRetime)
+        {
+            ++g_tsRecordRetimed;
+            char hb[32];
+            std::sprintf(hb, "%.2f", catchUpHours);
+            FmSay(std::string("[FARM] catch-up growth re-timed key=") + key + " hours=" + hb + " - from the laid crop's minute, over its crop");
+        }
+        else if (act == coopfarm::kFarmCuDrop)
+        {
+            ++g_tsRecordDropped;
+            FmSay(std::string("[FARM] catch-up growth dropped key=") + key + " - the piece record's crop is laid (no catch-up owed from its minute)");
+        }
+    }
+    return 1;
+}
+/* ANY THREAD, read-only: the world clock's minute count as the farm's load reads it (0x66C070 on the clock behind ClockOwnerPtr:
+   (hour +0 + day +8 x 24) x 60 + minute +4). 1 read, 0 not (the row unbound, a fault, or a count below 0). No C++ object here (C2712). */
+int FarmClockMinute(unsigned int* m)
+{
+    *m = 0u;
+    const unsigned long long at = (kFarmClockRva != 0) ? AddrAbs(kFarmClockRva) : 0;
+    if (at == 0) return 0;
+    long long v = -1;
+    __try
+    {
+        const int* clk = *(const int* const*)(uintptr_t)at;
+        if (clk == 0) return 0;
+        v = ((long long)clk[0] + (long long)clk[2] * 24) * 60 + (long long)clk[1];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (v < 0 || v > 0xFFFFFFFFLL) return 0;
+    *m = (unsigned int)v;
+    return 1;
 }
 /* KEPT / TEST-ONLY bldstate, read-only: a farm's growth, death, start, plants harvested and plant count. 1 read, 0 not */
 int FarmKeptRead(void* b, float* growth, float* death, float* start, int* harvested, int* plants)
@@ -2397,7 +3238,7 @@ std::string FarmTestArm(const std::string& arg)
     std::istringstream is(arg);
     std::string sub, a1, a2;
     is >> sub >> a1 >> a2;
-    const char* usage = "error buildtest farm: usage buildtest farm list | grow <key-substring|min> <age> | harvest <key-substring|min> [crops 1-64, default 1]";
+    const char* usage = "error buildtest farm: usage buildtest farm list | grow <key-substring|min> <age> | harvest <key-substring|min> [crops 1-64, default 1] | water <key-substring|min> <amount 0-1>";
     if (sub == "list")
     {
         const int n = FmSnapshot(g_cp);
@@ -2428,6 +3269,12 @@ std::string FarmTestArm(const std::string& arg)
         if (!(v >= 0.0f && v <= 3.0f)) return "error buildtest farm: age must be in [0, 3] (1 = ripe)";
         g_ftVal = v; g_ftSub = a1; g_ftKind = 1;
     }
+    else if (sub == "water")
+    {
+        float v = 0.0f;
+        if (coopfarm::FarmWaterArg(a2.c_str(), &v) == 0) return "error buildtest farm: water must be a number in [0, 1] (1 = full)";
+        g_ftVal = v; g_ftSub = a1; g_ftKind = 3;
+    }
     else if (sub == "harvest")
     {
         const int v = a2.empty() ? 1 : std::atoi(a2.c_str());   /* lever2: CROPS (plants harvested), not an operate amount */
@@ -2441,6 +3288,17 @@ std::string FarmTestArm(const std::string& arg)
 
 void ReportFarm()
 {
+    {   /* a player farm's crop on its piece record (build.cpp PieceRecFarmNote / PcfDrain) */
+        char rb[420];
+        std::sprintf(rb, "[FARM] REPORT recordRoad[playerFarmLooks,keepAliveSkipped,cropSendSkipped,applyCropKept,recordLaid,catchUpDropped,catchUpRetimed,catchUpWaitLay,catchUpHeldWriter]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                     g_pubPlayerFarm, g_pubKeepSkipped, g_pubCropSkipped, g_applyCropKept, g_recLaid, g_tsRecordDropped, g_tsRecordRetimed, g_tsWaitLay,
+                     (long long)g_tsHeldWriter);
+        DebugLog(std::string(rb));
+        std::sprintf(rb, "[FARM] REPORT catchUpLoose[kept,adopted,replaced,full,single,waiting]=%lld,%lld,%lld,%lld,%lld,%ld",
+                     (long long)g_tlKept, (long long)g_tlAdopted, (long long)g_tlReplaced, (long long)g_tlFull, (long long)g_tlSingle,
+                     (long)::InterlockedCompareExchange(&g_tlN, 0, 0));
+        DebugLog(std::string(rb));
+    }
     int used = 0, high = 0;
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) != 0)
     {
@@ -2507,22 +3365,32 @@ void ReportFarm()
                  " ask[sent,fail,giveUp]=%lld,%lld,%lld answer[recv,yes,full,noCopy,stray]=%lld,%lld,%lld,%lld,%lld"
                  " left[noted,noRow]=%lld,%lld release[sent,fail]=%lld,%lld inDropped=%lld rows[used,granted]=%d,%d"
                  " runner[askRecv,notRunner,yes,full,noCopy,ansFail,relRecv,relNoRow,freedRel,freedGone,freedNotRunner,freedUnloaded,fault,capFull,held]"
-                 "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d hooks[erase,take]=%d,%d"
-                 " farmSender[refused,wait,keptProven]=%lld,%lld,%lld copyRefused=%lld",
+                 "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d hooks[erase,take,benchTake]=%d,%d,%d"
+                 " farmSender[refused,wait,keptProven]=%lld,%lld,%lld copyRefused=%lld benchSeen=%lld",
                  (long long)g_spSeen, (long long)g_spPassListed, (long long)g_spPassed, (long long)g_spRefused, (long long)g_spAsked,
                  (long long)g_spNoKey, (long long)g_spNoUid, (long long)g_spFull, (long long)g_spHandFault,
                  g_spAskSent, g_spAskFail, giveUp, g_spAnsRecv, g_spAnsYes, g_spAnsFull, g_spAnsNoCopy, g_spAnsStray,
                  (long long)g_spLeft, (long long)g_spLeftNoRow, g_spRelSent, g_spRelFail, g_spInDropped, spUsed, spGranted,
                  g_srAskRecv, g_srNotRunner, g_srYes, g_srFull, g_srNoCopy, g_srAnsFail, g_srRelRecv, g_srRelNoRow, g_srFreedRel, g_srFreedGone,
-                 g_srFreedNotRunner, g_srFreedUnloaded, g_srFault, g_srCapFull, (int)g_spRun.size(), g_hkErase, g_hkTake,
-                 g_applyRefusedSender, g_applyWaitSender, g_applyKeptProven, (long long)g_spCopyRefused);
+                 g_srFreedNotRunner, g_srFreedUnloaded, g_srFault, g_srCapFull, (int)g_spRun.size(), g_hkErase, g_hkTake, g_hkCraftTake,
+                 g_applyRefusedSender, g_applyWaitSender, g_applyKeptProven, (long long)g_spCopyRefused, (long long)g_spBenchSeen);
     DebugLog(std::string(sb));
     std::sprintf(sb, "[SPOT] REPORT T-853 asker[revoked,keepYes,strayReleased,unusedReleased,regrant,keepAsk]=%lld,%lld,%lld,%lld,%lld,%lld"
                  " runner[counted,countedFull,freedCounted,revokeSent,revokeFail,countedHeld,ownRefusedByCounted]=%lld,%lld,%lld,%lld,%lld,%ld,%lld"
-                 " mineState[refusedSender,waitSender]=%lld,%lld farm[fallback]=%lld",
+                 " mineState[refusedSender,waitSender]=%lld,%lld farm[fallback]=%lld"
+                 " T-1192 takeNow[here,other,unknown,adopted,firstRefused]=%lld,%lld,%lld,%lld,%lld"
+                 " runRead[main,offLadder,offBooked,offNone,offStale]=%lld,%lld,%lld,%lld,%lld"
+                 " T-1212 reorder[owed,givenHere,givenGrant,droppedNewer,droppedTimeout,droppedNotFound,failed,loopRefused,droppedFull,superseded]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " T-1211 putIn[owed,saidOwed,redone,givenUp,askAgain,copyPass,capFull,redoRefused,fullRefused,open]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%ld",
                  g_spAnsRevoked, g_spAnsKeep, g_spStrayRel, g_spUnusedRel, g_spRegrant, g_spKeepAsk,
                  g_srCounted, g_srCountedFull, g_srFreedCounted, g_srRevokeSent, g_srRevokeFail, (long)::InterlockedCompareExchange(&g_spCtN, 0, 0),
-                 (long long)g_spCtRefused, g_msRefusedSender, g_msWaitSender, g_verdictFallback);
+                 (long long)g_spCtRefused, g_msRefusedSender, g_msWaitSender, g_verdictFallback,
+                 (long long)g_spNowHere, (long long)g_spNowOther, (long long)g_spNowUnknown, g_spNowAdopted, (long long)g_spFirstRefused,
+                 (long long)g_spRunRead[0], (long long)g_spRunRead[1], (long long)g_spRunRead[2], (long long)g_spRunRead[3],
+                 (long long)g_spRunRead[4], g_roOwed, g_roGivenHere, g_roGivenGrant, g_roDropNewer, g_roDropTimeout, g_roDropNotFound,
+                 g_roFailed, g_roLoopRefused, g_roDropFull, g_roSuperseded,
+                 g_piOwed, g_piSaidOwed, g_piRedone, g_piGivenUp, g_piAskAgain, (long long)g_piCopyPass, g_piCapFull, g_piRedoRefused,
+                 g_piFullRefused, (long)::InterlockedCompareExchange(&g_piN, 0, 0));
     DebugLog(std::string(sb));
 }
 

@@ -1,13 +1,15 @@
 /* worldroles.h - WHO HOLDS WHICH PART OF A WORLD'S AUTHORITY on the world server. Pure: no I/O, no globals.
 
-   OWNER   - the player the world server was started for (--owner, owner.txt, or the first game to talk after its WELCOME).
-   ADMIN   - may change the world's rules (OPTIONS) and set the speed under `fixed`. The owner is always an admin; `named` holds
-             the other admins' person ids.
+   OWNER   - a connection logged in with the owner password from the world's rules.txt (adminauth.h, owner 1369 b; at its door or by
+             /login): admin without the admin password, the admin list, the admin password, never kicked or banned. A player id
+             alone never makes anyone the owner - it is self-reported - and an empty owner password line means no owner at all.
+   ADMIN   - may change the world's rules (OPTIONS) and set the speed under `fixed`: a game logged in with the owner password, or
+             one whose person is in `named` (admins.txt) logged in with the admin password. `named` holds the admins' person ids.
    STEWARD - runs the technical duties (weather, faction relations, save numbering, sleeping squads, the AUTH flag) and sets no
-             rules. While the duties are not handed over (handOver false) the steward is the owner, connected or not - the one
-             operator every world had before the split. With hand-over (a world kept running, --keep-running): the owner while in
-             the world, else the steward in post while still connected, else the first game in the world, else the owner while
-             connected (still loading: the host is the first steward), else nobody (an empty string).
+             rules. Whoever is in the world holds them, the same way in a world started from the game's HOST and one started by
+             hand (owner 1381: nobody waits for the owner): the owner while in the world, else the steward in post while in the
+             world, else the first game in the world, else - nobody in the world yet - the first admitted game (it is loading, or
+             at the title), else nobody (an empty string).
    Every id here is a PERSON id (profiles.h PersonOfKey), never a profile key. */
 #ifndef COOP_WORLDROLES_H
 #define COOP_WORLDROLES_H
@@ -20,19 +22,18 @@ namespace worldroles {
 const int kSlotUnknown = -1;   /* a role is held, but the holder's slot is not known yet */
 const int kSlotNone = -2;      /* nobody holds the role */
 
-inline bool IsAdmin(const std::string& person, const std::string& owner, const std::vector<std::string>& named)
+/* LISTED: a person in admins.txt - who may log in with the admin password. The owner's person id is never listed by itself. */
+inline bool IsListed(const std::string& person, const std::vector<std::string>& named)
 {
     if (person.empty()) return false;
-    if (person == owner) return true;
     for (size_t i = 0; i < named.size(); ++i) if (named[i] == person) return true;
     return false;
 }
 
-/* every admin once: the owner first, then the named admins in their order (an empty id and a repeat are skipped) */
-inline std::vector<std::string> AdminList(const std::string& owner, const std::vector<std::string>& named)
+/* every listed admin once, in their order (an empty id and a repeat are skipped) */
+inline std::vector<std::string> AdminList(const std::vector<std::string>& named)
 {
     std::vector<std::string> out;
-    if (!owner.empty()) out.push_back(owner);
     for (size_t i = 0; i < named.size(); ++i)
     {
         if (named[i].empty()) continue;
@@ -45,35 +46,29 @@ inline std::vector<std::string> AdminList(const std::string& owner, const std::v
 
 struct StewardState
 {
-    std::string owner;          /* the owner; empty = no owner yet */
-    bool ownerInWorld;          /* a connection of the owner is in the world */
-    bool ownerConnected;        /* a connection of the owner is admitted (in the world or not) */
-    std::string current;        /* the steward in post; empty = vacant */
-    bool currentConnected;      /* a connection of the steward in post is still admitted */
-    std::string firstInWorld;   /* the first game in the world in connection order, a leaving one excluded; empty = none */
-    bool handOver;              /* the duties may pass to another player while the owner is away */
-    StewardState() : ownerInWorld(false), ownerConnected(false), currentConnected(false), handOver(false) {}
+    std::string owner;            /* the person of a connection logged in with the owner password and in the world; empty = none */
+    std::string current;          /* the steward in post; empty = vacant */
+    bool currentInWorld;          /* a connection of the steward in post is in the world */
+    std::string firstInWorld;     /* the first game in the world in connection order, a leaving one excluded; empty = none */
+    std::string firstConnected;   /* the first admitted game in connection order (any stage), a leaving one excluded; empty = none */
+    StewardState() : currentInWorld(false) {}
 };
 
-/* who holds the duties now (the pull request's StewardMoveDecide, with the owner first, and last while nobody is in the world) */
+/* who holds the duties now: the owner in the world first, then whoever is in the world (the one in post keeps them), and while
+   nobody is in the world the first admitted game - so a world's first game seeds it as it loads, whoever it is */
 inline std::string StewardFor(const StewardState& s)
 {
-    if (!s.handOver) return s.owner;
-    if (!s.owner.empty() && s.ownerInWorld) return s.owner;
-    if (!s.current.empty() && s.currentConnected) return s.current;
+    if (!s.owner.empty()) return s.owner;
+    if (!s.current.empty() && s.currentInWorld) return s.current;
     if (!s.firstInWorld.empty()) return s.firstInWorld;
-    if (!s.owner.empty() && s.ownerConnected) return s.owner;   /* nobody in the world yet: the owner's game, still loading, holds them */
-    return std::string();
+    return s.firstConnected;
 }
 
-/* A KEPT WORLD NOBODY WILL OPEN AGAIN UNLESS A JOINER MAY LOAD IN: with hand-over, the post vacant (StewardFor gave nobody - no game
-   in the world, the owner not connected) after the owner's game was here once. The roster says so (joinstage.h opVacant) and a
-   joiner's load does not wait for an operator; the first game in the world then takes the duties. Without hand-over (hosted,
-   world door) the steward is always the owner, so this is never true and a joiner waits for the owner as before; a kept world
-   whose owner's game has not arrived yet waits for it too. */
-inline bool JoinWaitsForNobody(bool handOver, const std::string& steward, bool ownerEverHere)
+/* A JOINER NEVER WAITS FOR THE OWNER (owner 1381): the roster says the post is open (joinstage.h opVacant) whenever the steward is
+   not in the world, so a joiner's load goes ahead; the first game in the world then holds the duties (StewardFor). */
+inline bool JoinWaitsForNobody(bool stewardInWorld)
 {
-    return handOver && steward.empty() && ownerEverHere;
+    return !stewardInWorld;
 }
 
 inline std::string SlotWord(int slot)

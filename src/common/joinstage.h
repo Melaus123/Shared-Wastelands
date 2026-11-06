@@ -9,8 +9,7 @@
        stream (kRelayCarriesLiveStream), the operator in the world;
      - LiveProtoDecide: the game-to-game protocol the STORE_HELLO carries, refused when it differs from the games already
        admitted (an empty world accepts the first) - manager decision 1(a);
-     - LiveProtoJudge (S1 fold, review M2): THE HOST'S VERSION WINS - the operator is never refused for differing, and the others
-       are judged against its number while it is admitted (else against the games in the world, else those at the title);
+     - LiveProtoJudge (T-1158 step 7b, owner 1378): every game is judged against the world server's own built-in number;
      - the wires: the STORE_HELLO's tail {u32 live protocol, u32 road, u32 len + name, f32 view distance} (after the profile
        u32), PLAYERS (54, down) {u32 n, n x {u32 slot, u32 stage, u32 operator, u32 len + name, f32 view distance}} and
        JOIN_STAGE (55, up) {u32 stage: LOADING or IN_WORLD}.
@@ -155,19 +154,13 @@ inline int LiveProtoDecide(unsigned mine, const std::vector<unsigned>& admitted,
         if (admitted[i] != mine) { if (theirs) *theirs = admitted[i]; return kLiveProtoRefuseDiffers; }
     return kLiveProtoAdmit;
 }
-/* S1 fold (review M2) - THE HOST'S VERSION WINS. isOperator: this HELLO is the world's operator's. The operator is never refused for
-   differing - its number is the one the others are judged by, so one out-of-date game idling at the title cannot lock the operator
-   out of its own world. An unreadable number is still refused, operator or not: nothing could be judged against it. Anyone else is
-   judged against operatorProto while the operator is admitted (non-zero), else against the admitted games in the world, else
-   against the admitted games at the title (or loading); an empty world accepts the first. */
-inline int LiveProtoJudge(unsigned mine, bool isOperator, unsigned operatorProto, const std::vector<unsigned>& inWorld,
-                          const std::vector<unsigned>& notInWorld, unsigned* theirs)
+/* T-1158 step 7b (owner 1378) - THE WORLD SERVER'S OWN VERSION DECIDES. Every game is judged against the game-to-game protocol the
+   world server was built with (handrec.h kGameProtocol - the same build's number the game sends), never against another game's: no
+   player's game is an exception, and no arrival changes who may stay. An unreadable number is refused: nothing could be judged
+   against it. *theirs = the server's number. */
+inline int LiveProtoJudge(unsigned mine, unsigned serverProto, unsigned* theirs)
 {
-    std::vector<unsigned> against;
-    if (isOperator) {}
-    else if (operatorProto != 0) against.push_back(operatorProto);
-    else against = inWorld.empty() ? notInWorld : inWorld;
-    return LiveProtoDecide(mine, against, theirs);
+    return LiveProtoDecide(mine, std::vector<unsigned>(1, serverProto), theirs);
 }
 
 /* ---- the wires ---- */

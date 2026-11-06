@@ -46,6 +46,9 @@ struct FallenTabRead
     FallenTabRead() : on(0), growth(0), moneyRead(0), atLimit(-1), amount(0), price(0), money(0) {}
 };
 void ResurrectTabRead(FallenTabRead* out);
+// T-1135 review fold 1 (hire.cpp GiveTakeAll), MAIN THREAD: this game's own living characters of its player faction (*alive) and the
+// game's character limit (*limit) the engine's recruit compares them with. 1 the limit read, 0 not.
+int OwnLivingAndLimit(int* alive, int* limit);
 // The characters a fallen one may come back beside: this game's own living characters of this player's faction that the
 // placement rules call free (fallenwire.h BesideVerdict: not knocked out, carried, caged, chained or enslaved), grouped by squad
 // in the order each squad's first one is driven here. squad: the squad's name ("" unread).
@@ -63,6 +66,12 @@ struct BringBackOut
     BringBackOut() : ok(0), refusal(0), price(0), money(0), paid(0) {}
 };
 BringBackOut ResurrectBringBackFor(unsigned int deadUid, unsigned int besideUid, long long expectPrice);
+// T-1205 /revive, MAIN THREAD: an admin's job only (admin.cpp, an ADMIN_DO kOpRevive the world server sends for a logged-in admin's
+// command). The newest row called `name` on this game's copy of the list comes back on the bring-back road beside this player's
+// free living characters, tried in swtab::AdminMateOrder while the refusal is about the squadmate (swtab::NextMateAfter) - free, and
+// not refused by the host's resurrection option (owner 1394, 1398). 0 = no row of that name; 1 = *out is the road's result (ok, or
+// refusal kRefNoMate when no squadmate is free).
+int ResurrectAdminRevive(const std::string& name, BringBackOut* out);
 // THE CAMERA ROAD (src/common/fallentab.h CameraRoadOffered): 1 while this player has no living character (the people and
 // animals of the player's faction this game drives) - the tab then brings a character back where the camera is looking; 0 with
 // one alive (the squadmate road). MAIN THREAD.

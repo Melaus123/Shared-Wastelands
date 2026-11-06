@@ -3,8 +3,9 @@
  * then says what happened (DONE). An owner's own local hire also sends DONE {taken 0, joined 1} so the other game re-files
  * its copy.
  *
- *   kind u8 (1 REQ, 2 OK, 3 NO, 4 DONE) | reqId u32 | uid u32 | hirerUid u32 | price i32 | joinType u8 (3 or 18)
+ *   kind u8 (1 REQ, 2 OK, 3 NO, 4 DONE) | reqId u32 | uid u32 | hirerUid u32 | price i32 | joinType u8 (3, 18, 42 or 48)
  *   | reason u8 | taken u8 (0/1) | joined u8 (0/1) | len u8 (<= 64) + the person's faction name as the hirer saw it
+ *   | gen u32 | [giveId u32 - T-1135: only on a given character's DONE, never 0 when present]
  *
  * Pure: no engine memory, no Windows; the offline suite hits the same bytes. C++03 (VS2010 v100).
  */
@@ -29,19 +30,21 @@ const int kNoDowned   = 3;   /* dead, knocked out or otherwise down */
 const int kNoFaction  = 4;   /* already in a player / peer faction, or not the faction the hirer saw */
 const int kNoCombat   = 5;   /* in combat mode */
 const int kNoReserved = 6;   /* already promised to an earlier request */
-const int kNoCaged    = 7;   /* in a cage / prison mode (Character+0x2F8 inSomething == 2) */
-const int kNoSlave    = 8;   /* slave state != 0 (slave1's reader) */
+const int kNoCaged    = 7;   /* the cage / prison mode field (Character+0x2F8 inSomething) cannot be read; a caged person is not refused:
+                                 the game's own lines recruit some people through the bars */
+const int kNoSlave    = 8;   /* the slave state cannot be read (slave1's reader); a slave is not refused: a freed slave joins its freer */
 const int kNoBlocked  = 9;   /* reserved: the owner could not write (never sent in R0-a - it holds instead) */
 const int kNoReasonMax = 9;
 
 const size_t kHireFixedSize = 1 + 4 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1;   /* 22 */
 const size_t kHireNameMax = 64;
 const size_t kHireGenSize = 4;   /* M7a A1 build 1 [a1b1-hw4]: the trailing u32 gen */
+const size_t kHireGiveSize = 4;  /* T-1135: the u32 offer id after the gen, present only when it is not 0 */
 
 const int kHireDecodeOk        = 0;
 const int kHireDecodeTooShort  = 1;
 const int kHireDecodeBadKind   = 2;
-const int kHireDecodeBadField  = 3;   /* joinType not 3/18, reason above max, taken/joined above 1 */
+const int kHireDecodeBadField  = 3;   /* joinType not 3/18/42/48, reason above max, taken/joined above 1 */
 const int kHireDecodeBadLength = 4;   /* name length over the max, or past the end */
 
 struct HireMsg
@@ -56,14 +59,17 @@ struct HireMsg
     int          taken;
     int          joined;
     std::string  faction;
-    unsigned int gen;   /* M7a A1 build 1 [a1b1-hw0] (protocol 118): OK - the owner's generation for uid; DONE taken=1 - the hirer's (it holds max(OK's, its copy record) + 1); else 0 */
-    HireMsg() : kind(0), reqId(0), uid(0), hirerUid(0), price(0), joinType(18), reason(0), taken(0), joined(0), gen(0) {}
+    unsigned int gen;   /* M7a A1 build 1 [a1b1-hw0] (protocol 118): OK - the owner's generation for uid; DONE taken=1 - the hirer's (it holds max(OK's, its copy record) + 1); a give's DONE taken=0 for a character handed back - the gen the receiver released it at (T-1135 review fold 1); else 0 */
+    unsigned int giveId;   /* T-1135 (protocol 191): DONE of a character given by its player - the offer id (src/common/givewire.h); else 0 */
+    HireMsg() : kind(0), reqId(0), uid(0), hirerUid(0), price(0), joinType(18), reason(0), taken(0), joined(0), gen(0), giveId(0) {}
 };
 
 inline bool HireFieldsValid(const HireMsg& m)
 {
     if (m.kind < kHireReq || m.kind > kHireDone) return false;
-    if (m.joinType != 3 && m.joinType != 18) return false;
+    /* 3 / 18: a dialogue hire; 42 / 48 (T-478 step 6, protocol 209): a slave / animal bought in the buyer's own buying window -
+       the owner reserves the character, the buyer takes it and runs the engine's own confirm (hire.cpp BuyConfirm) */
+    if (m.joinType != 3 && m.joinType != 18 && m.joinType != 42 && m.joinType != 48) return false;
     if (m.reason < 0 || m.reason > kNoReasonMax) return false;
     if (m.taken < 0 || m.taken > 1 || m.joined < 0 || m.joined > 1) return false;
     return m.faction.size() <= kHireNameMax;
@@ -74,7 +80,7 @@ inline bool EncodeHire(std::vector<char>* b, const HireMsg& m)
 {
     if (b == 0 || !HireFieldsValid(m)) return false;
     const size_t at = b->size();
-    b->resize(at + kHireFixedSize + m.faction.size() + kHireGenSize);   /* [a1b1-hw1]: + the u32 gen tail */
+    b->resize(at + kHireFixedSize + m.faction.size() + kHireGenSize + (m.giveId != 0 ? kHireGiveSize : 0));   /* [a1b1-hw1]: + the u32 gen tail; T-1135: + the offer id when there is one */
     char* p = &(*b)[at];
     p[0] = (char)(unsigned char)m.kind;
     std::memcpy(p + 1, &m.reqId, 4);
@@ -88,6 +94,7 @@ inline bool EncodeHire(std::vector<char>* b, const HireMsg& m)
     p[21] = (char)(unsigned char)m.faction.size();
     if (!m.faction.empty()) std::memcpy(p + kHireFixedSize, m.faction.data(), m.faction.size());
     std::memcpy(p + kHireFixedSize + m.faction.size(), &m.gen, 4);   /* [a1b1-hw2] */
+    if (m.giveId != 0) std::memcpy(p + kHireFixedSize + m.faction.size() + kHireGenSize, &m.giveId, 4);   /* T-1135 */
     return true;
 }
 
@@ -116,9 +123,11 @@ inline int DecodeHire(const char* p, size_t size, HireMsg* out)
     m.taken = (int)(unsigned char)p[19];
     m.joined = (int)(unsigned char)p[20];
     const size_t len = (size_t)(unsigned char)p[21];
-    if (len > kHireNameMax || kHireFixedSize + len + kHireGenSize != size) return kHireDecodeBadLength;   /* [a1b1-hw3]: exactly the name and the gen tail */
+    const size_t base = kHireFixedSize + len + kHireGenSize;
+    if (len > kHireNameMax || (base != size && base + kHireGiveSize != size)) return kHireDecodeBadLength;   /* [a1b1-hw3]: exactly the name and the gen tail; T-1135: and the offer id when present */
     m.faction.assign(p + kHireFixedSize, len);
     std::memcpy(&m.gen, p + kHireFixedSize + len, 4);
+    if (base + kHireGiveSize == size) { std::memcpy(&m.giveId, p + base, 4); if (m.giveId == 0) return kHireDecodeBadField; }   /* T-1135: a present offer id is never 0 */
     if (!HireFieldsValid(m)) return kHireDecodeBadField;
     *out = m;
     return kHireDecodeOk;

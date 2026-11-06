@@ -26,10 +26,14 @@ void ReleaseOnPutAway(unsigned int uid, const void* obj, int objWhole);
    reloaded-copy retire): SameIdWithdrawMark before StoreRetireLocalCopy names the squad's own-uid people (kind kSameIdYield /
    kSameIdReload); their put-away is not offered (ReleaseOnPutAway, releaseSkip yield / reloadRetire) and, put away while their XFER
    flew and not taken, their held UNLOAD goes (ReleaseOpenFromFlight, releaseFlight sameIdUnload). SameIdWithdrawDone after the
-   retire's withdrawals drops every entry no XFER flight holds; the flight's end drops the rest; the world teardown clears all. */
-enum { kSameIdYield = 1, kSameIdReload = 2 };
+   retire's withdrawals drops every entry no XFER flight holds; the flight's end drops the rest; the world teardown clears all.
+   kSameIdClearNear: the TEST-ONLY clearnear lever (store.cpp ClearNearLever) marks the own-uid people of a squad it removes, around its
+   platoonwipe, the same way - the removed squad leaves the world and is never offered to another game (releaseClearNear). */
+enum { kSameIdYield = 1, kSameIdReload = 2, kSameIdClearNear = 3 };
 void SameIdWithdrawMark(const unsigned int* uids, int n, int kind);
 void SameIdWithdrawDone();
+void SameIdWithdrawMarkClearNear(const unsigned int* uids, int n);   /* SameIdWithdrawMark with kind kSameIdClearNear */
+long long SameIdClearNearUnoffered();   /* the clearnear-marked put-aways not offered so far (releaseClearNear) */
 bool ReleasePendingHas(unsigned int uid);
 void ApplyRemoteRelease(const cooplo::ReleaseMsg& m, unsigned int fromPeer);
 void ApplyRemoteReleaseAck(const cooplo::ReleaseAckMsg& a, unsigned int fromPeer);
@@ -72,6 +76,9 @@ bool PlayerTeleportAbs(float x, float z);   // to an absolute world x,z (y kept)
 // when there is none). MAIN THREAD. PlayerTeleportGround = the same at the player's own x,z.
 bool PlayerTeleportAbsY(float x, float z, bool ground, float y);
 bool PlayerTeleportGround();
+// T-1205 the admin toolbox's moves: one character this game owns to x, z (the terrain's height there, else y when haveY), focus = the
+// camera follows. 1 moved (*yOut = the height), 0 refused or faulted, 2 knocked out (not moved). MAIN THREAD, engine writes allowed.
+int AdminMoveCharacter(::Character* c, float x, float z, bool haveY, float y, bool focus, float* yOut);
 // T-1 B0 (TEST LEVER): `playerteleport peer` - the watched player to about 5 m from this game's copy of the other player's lead
 // character (the copy that is its own squad's leader, else the lowest uid). 1 done (*out = "target uid=.. lead=.. dist=.."),
 // 0 refused (*out = why), 2 no copy of the other player's characters loaded yet (the command waits and retries).

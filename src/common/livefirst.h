@@ -42,7 +42,8 @@
 
 namespace livefirst {
 
-const unsigned int kProtocol = 133;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
+const unsigned int kProtocol = 145;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
+
 
 const unsigned int kMsgChunk = 88;      /* CHUNK - one piece of a frame too big to go whole; either way, world-server link only */
 const size_t kFrameHeader = 5;          /* the transport's frame header: type u8 | payload length u32 */
@@ -54,6 +55,8 @@ const long long kBudgetMin = 16384;     /* record bytes the network may always h
 const long long kBudgetMax = 1048576;   /* = coopsb::kNetBytesMax: never more than the old bound */
 const double kAheadSec = 0.100;         /* the most a live message should wait behind record pieces already handed over */
 const double kRateWindowSec = 0.250;    /* the drain rate is measured over windows of at least this long */
+const double kRttBucketSec = 15.0;      /* T-1168 (c) review LOW 2: the lowest round trip is the smallest of this bucket and the one before */
+const double kRaiseMax = 2.0;           /* T-1168: a window with no record pieces waiting raises the rate to at most this x the rate */
 
 enum { kDirUp = 0, kDirDown = 1 };      /* = coopsb::kDirUp / kDirDown: a game's frames to the world server / the world server's to a game */
 enum { kLineRest = 0, kLineLive = 1, kLineAnnounce = 2, kLineBulk = 3 };
@@ -348,32 +351,90 @@ private:
    per second, over windows of at least kRateWindowSec in which record pieces waited (a quiet link keeps the last rate, so the next file
    starts at the speed the last one reached). Budget(aheadSec): the record bytes the network may hold - rate x (aheadSec + kAheadSec),
    between kBudgetMin and kBudgetMax; aheadSec is the round trip when the caller's count keeps bytes until they are acknowledged
-   (the game's ENet link), 0 when it counts only bytes not yet sent (the world server's). */
+   (the game's ENet link), 0 when it counts only bytes not yet sent (a Steam link). T-1168 design (c): both ENet ends now count bytes
+   until acknowledged and take BudgetLowest (the lowest round trip, not the current one); the world server counts with Confirmed.
+   T-1168 (pull request 4 task 6): THE GAME'S LINK ALSO MEASURES WHILE OTHER FRAMES WAIT. After a player walks into a new area the game
+   sends a burst of introductions and live frames with no record pieces; measured only while record pieces waited, the rate kept its last
+   low value, the budget sat at kBudgetMin and live updates waited ~2 s behind the introductions. Note's 4th argument `othersWait` (the
+   game passes "any frame waits in its send line") counts a window too, but such a window may only RAISE the rate: the bytes a link
+   drained are a floor on what it can drain, while a window that merely had a frame wait for a moment (a short spike on an idle link,
+   light traffic between files) drains little and would pull the rate down. Only a window in which record pieces waited lowers it, as
+   before. The 3-argument Note (the world server's call) never sets othersWait: its results are unchanged.
+   Review MED-1: a window can be misread high (ENet counts unreliable packets it dropped under congestion as gone; acknowledgements
+   arrive in a bunch after a stall), and with no record pieces waiting nothing would bring it down. So such a window raises the rate to
+   at most kRaiseMax x the rate it had (when it had one), and the first record window after such a raise takes the smaller of its own
+   measurement and the smoothed value - a misread high comes straight down in one window instead of halving over ~1-1.5 s. */
 class Rate
 {
 public:
-    Rate() : m_at(-1.0), m_left(0), m_rate(0.0), m_busy(false) {}
-    void Note(double now, long long leftTotal, bool busy)
+    Rate() : p223WinAt(-1.0), p223WinDt(0.0), p223WinBytes(0), p223WinKind(0), m_at(-1.0), m_left(0), m_rate(0.0), m_busy(false), m_others(false), m_raised(false), m_rttAt(-1.0), m_rttCur(0.0), m_rttPrev(0.0) {}
+    void Note(double now, long long leftTotal, bool busy) { Note(now, leftTotal, busy, false); }
+    void Note(double now, long long leftTotal, bool busy, bool othersWait)
     {
-        if (m_at < 0.0 || now < m_at || leftTotal < m_left) { m_at = now; m_left = leftTotal; m_busy = busy; return; }
+        if (m_at < 0.0 || now < m_at || leftTotal < m_left) { m_at = now; m_left = leftTotal; m_busy = busy; m_others = othersWait; return; }
         m_busy = m_busy || busy;
+        m_others = m_others || othersWait;
         const double dt = now - m_at;
         if (dt < kRateWindowSec) return;
         const long long d = leftTotal - m_left;
-        if (m_busy && d > 0)
+        // PROBE-START: P223 - the window just closed: its bytes, length and kind (1 record pieces waited, 2 only other frames, 0 neither). LOG ONLY.
+        p223WinAt = now; p223WinDt = dt; p223WinBytes = d; p223WinKind = m_busy ? 1 : (m_others ? 2 : 0);
+        // PROBE-END: P223
+        if ((m_busy || m_others) && d > 0)
         {
             const double r = (double)d / dt;
-            m_rate = m_rate <= 0.0 ? r : 0.5 * m_rate + 0.5 * r;
+            if (m_busy)
+            {
+                const double s = m_rate <= 0.0 ? r : 0.5 * m_rate + 0.5 * r;
+                m_rate = (m_raised && r < s) ? r : s;   /* MED-1: after an others-only raise, the record window's own measurement if smaller */
+                m_raised = false;
+            }
+            else if (r > m_rate)   /* T-1168: an others-only window only raises it, by at most kRaiseMax x (MED-1) */
+            {
+                double s = m_rate <= 0.0 ? r : 0.5 * m_rate + 0.5 * r;
+                if (m_rate > 0.0 && s > kRaiseMax * m_rate) s = kRaiseMax * m_rate;
+                m_rate = s;
+                m_raised = true;
+            }
         }
-        m_at = now; m_left = leftTotal; m_busy = busy;
+        m_at = now; m_left = leftTotal; m_busy = busy; m_others = othersWait;
     }
     double BytesPerSec() const { return m_rate; }
     long long Budget(double aheadSec) const;
+    /* T-1168 design (c): THE LINK'S LOWEST ROUND TRIP (seconds) over a SLIDING WINDOW - the smallest round trip noted in the current
+       kRttBucketSec bucket and the one before it (ENet's smoothed roundTripTime, read each tick at `now`, seconds). The current round
+       trip grows with the queue during a catch-up and would grow the budget with it; a catch-up is shorter than the window, so its
+       rise is not followed. Review LOW 2: a LASTING rise (a slower route, 30 -> 230 ms) is followed within one to two buckets
+       (15-30 s) instead of sinking the allowance to its floor until a reconnect; a brief dip is kept as long. A clock that goes back
+       (a wrap) starts a new bucket and keeps the old one as the previous; a gap of two buckets or more forgets the old one.
+       0 = none noted yet; a value of 0 or less is not one. ForgetRoundTrip at a new connection. */
+    void NoteRoundTrip(double now, double sec)
+    {
+        if (!(sec > 0.0)) return;
+        if (m_rttAt < 0.0) { m_rttAt = now; m_rttCur = sec; m_rttPrev = 0.0; return; }
+        const bool back = now < m_rttAt;
+        if (back || now - m_rttAt >= kRttBucketSec)
+        {
+            m_rttPrev = (back || now - m_rttAt < 2.0 * kRttBucketSec) ? m_rttCur : 0.0;
+            m_rttCur = sec; m_rttAt = now;
+            return;
+        }
+        if (sec < m_rttCur) m_rttCur = sec;
+    }
+    double LowestRoundTrip() const { return (m_rttPrev > 0.0 && m_rttPrev < m_rttCur) ? m_rttPrev : m_rttCur; }
+    void ForgetRoundTrip() { m_rttAt = -1.0; m_rttCur = 0.0; m_rttPrev = 0.0; }
+    long long BudgetLowest() const;   /* BudgetOf(rate, lowest round trip) */
+    // PROBE-START: P223 - the last closed window (read by the world server's P223 lines). LOG ONLY.
+    double p223WinAt, p223WinDt; long long p223WinBytes; int p223WinKind;
+    // PROBE-END: P223
 private:
     double m_at;
     long long m_left;
     double m_rate;
     bool m_busy;
+    bool m_others;   /* T-1168: some frame other than (or besides) record pieces waited in this window */
+    bool m_raised;   /* MED-1: an others-only window raised the rate since the last measured record window (never set by the 3-argument Note) */
+    double m_rttAt, m_rttCur, m_rttPrev;   /* T-1168 (c): the current bucket's start (-1 = none) and lowest, the previous bucket's lowest (s, 0 = none) */
 };
 
 /* The record bytes a link's network queue may hold at a drain rate of `bytesPerSec`: rate x (aheadSec + kAheadSec), between kBudgetMin
@@ -388,6 +449,37 @@ inline long long BudgetOf(double bytesPerSec, double aheadSec)
     return (long long)b;
 }
 inline long long Rate::Budget(double aheadSec) const { return BudgetOf(m_rate, aheadSec); }
+/* T-1168 design (c): THE ALLOWANCE OF BOTH ENET ENDS - the confirmed drain rate x (the link's LOWEST round trip + kAheadSec), between
+   kBudgetMin and kBudgetMax; both ends count bytes until the far end acknowledges them, so a round trip of them is in flight. */
+inline long long Rate::BudgetLowest() const { return BudgetOf(m_rate, LowestRoundTrip()); }
+
+/* T-1168 design (c) - THE BYTES A LINK'S FAR END HAS CONFIRMED, the world server's count for Rate (the game counts ENet's packet free
+   callback instead, enet_transport.cpp SbOnPacketFree; a packet the server shares between games is freed once for all of them, so the
+   server cannot count that way): every byte handed to ENet for the link less what ENet still holds for it - not yet sent (`unsent`:
+   both outgoing lists' fragment lengths, plus open bundles) or sent and not yet acknowledged (`inTransit`: ENet's reliableDataInTransit).
+   A resend moves a command out of the in-transit count and back into an outgoing list (protocol.c 1388-1392), so the sum holds. The
+   count NEVER GOES BACK (Rate::Note restarts its window when it does): the largest value seen is kept - a bundle sealed into ENet carries
+   a few header bytes the hand-over count did not have, which would read as a step back until acknowledged. ENet's in-transit count is a
+   32-bit unsigned number; a read past 2^31 (a wrap under zero) is not believed and leaves the count as it was. */
+class Confirmed
+{
+public:
+    Confirmed() : m_total(0) {}
+    static bool Wrapped(unsigned int inTransit) { return inTransit > 0x7FFFFFFFu; }
+    long long Note(long long handed, long long unsent, unsigned int inTransit)
+    {
+        if (Wrapped(inTransit)) return m_total;
+        const long long c = handed - unsent - (long long)inTransit;
+        if (c > m_total) m_total = c;
+        return m_total;
+    }
+    long long Total() const { return m_total; }
+private:
+    long long m_total;
+};
+/* What ENet holds for a link until acknowledged (the world server's budget count, as the game's netq_.bytes): unsent plus in transit;
+   a wrapped in-transit read counts as nothing in transit. */
+inline long long HeldBytes(long long unsent, unsigned int inTransit) { return unsent + (Confirmed::Wrapped(inTransit) ? 0 : (long long)inTransit); }
 
 /* T-1118 (b) stage 2 - A LINK THAT HANDS PIECES ON (the host's Steam bridge: from the world server to a Steam joiner and back). The
    bridge never sees a cut frame whole, so it cannot read a barrier's type from the CHUNK it hands on; this remembers the type from

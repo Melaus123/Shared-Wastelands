@@ -47,4 +47,16 @@ bool PeaceTeamPairAnyThread(const void* a, const void* b);
 int PeaceTeamPairOfCharacters(void* a, void* b);
 // The " team[held,ally,notEnemy,doubt,writes]=" tokens.
 std::string PeaceTeamTokens();
+// T-1194 (T2029): A TALK LINE'S ATTACK RESULTS (hire.cpp detour_doActions, both thread branches, before the line runs).
+// ANY THREAD: the lever's flag - one aligned 32-bit load, nothing else. Off = the talk check costs only this.
+bool PeaceOnAnyThread();
+// ANY THREAD: the lever's own gate (PeaceGate, the rule the other three hooks use) for a speaker and the conversation's target:
+// 1 covered, 0 not covered, -1 doubt. Interlocked counters only, no allocation, no log.
+int PeaceGateAnyThread(void* speaker, void* target);
+// ANY THREAD: one line carrying an attack action (6 / 55 / 57) seen while the lever was on. dropped 1 = its results were dropped;
+// gate as above; unread 1 = the line's actions would not read. The first kept notes are logged by PeaceTalkDrain. No allocation.
+void PeaceTalkNote(int dropped, int gate, int unread, unsigned speakerUid, unsigned targetUid, const int* types, const int* values,
+                   int n, int total, int offMain);
+// MAIN THREAD (hire.cpp HireSafePointDrain, every frame): one '[PEACE] talk attack dropped ...' line per kept note, capped.
+void PeaceTalkDrain();
 }

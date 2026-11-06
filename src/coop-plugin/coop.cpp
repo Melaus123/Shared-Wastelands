@@ -37,6 +37,7 @@
 #include "playerstab.h" /* T-545: the PLAYERS tab, other players' factions on the FACTION tab */
 #include "fallentab.h"   /* T-556: the FALLEN tab */
 #include "chat.h"        /* in-game text chat */
+#include "teammap.h"     /* T-930: teammates' characters on the world map */
 #include "money.h"       /* T-810: money between players */
 #include "admin.h"       /* the admin login and the admin commands */
 #include "kapi.h"        /* per-race rules: kenshi_api.cfg, the world's race.* options, the equip and XP hooks */
@@ -265,6 +266,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::UiEditorResetTick();   /* the Level Editor's Reset Population: greyed with its hover note in a multiplayer world */
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
+    coop::TeamMapTick();      /* T-930: this player's characters to teammates whose world map is open; the map's close when its frame stopped */
     coop::MoneyTick();        /* T-810: money between players - given back, added, acknowledged, sent once on disk */
     coop::AdminTick();        /* the admin login: an unused typed password wiped; a link that ended ends this game's admin standing */
     coop::UiDriveEngineClickFlush(0);   /* pp1b: a queued `uiclick engine:` fires at the tail of the in-world pump; T-201 PP6': never the one-press load */
@@ -871,6 +873,7 @@ static void startPluginOn(const char* road)
     coop::InstallHire();       /* recruit1 R0-a: Dialogue::_doActions 0x67FAD0, LOG ONLY */
     coop::InstallWorldGen();
     coop::InstallKapi();       /* per-race rules: the equip check and the two XP hooks, kenshi_api.cfg read */
+    coop::InstallTeamMap();    /* T-930: the world map window's frame 0x49AC50 - teammates' characters as dots on the map */
     logHookCounts();   /* mig1: every install above went through coop::AddHook (hooks.cpp, our own MinHook) */
     LARGE_INTEGER t1;
     ::QueryPerformanceCounter(&t1);

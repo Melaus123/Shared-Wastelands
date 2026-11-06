@@ -32,6 +32,8 @@
 #include "../common/moneywire.h"   /* T-810: GIVE MONEY's words */
 #include "../common/chatwire.h"   /* MESSAGE's word */
 #include "admin.h"   /* the owner's admin row: AdminOwnerNow, AdminListChange */
+#include "hire.h"   /* T-1135 GIVE: GiveButtonRead, GiveOfferArm, the offer box's offer */
+#include "../common/givewire.h"   /* T-1135 GIVE: the button, the boxes' words */
 #include "../common/adminwords.h"   /* the admin row's words */
 #include "../common/teamscreens.h"   /* the faction screens: the bottom line's actions, the boxes' words */
 #include "soak.h"
@@ -81,6 +83,7 @@ const int kFacNotRealOff = 0x1D0, kFacPlayerIfOff = 0x250, kPiFactionOff = 0x2A0
 const char* const kListName   = "SWPlayersList";
 const char* const kLineName   = "SWPlayersStanceLine";
 const char* const kSelectName = "SWPlayersSelectLine";
+const char* const kSpeedName  = "SWPlayersGameSpeedLine";   /* the world's GAME SPEED line under the table */
 const char* const kBtnName[3] = { "SWPlayersAllyBtn", "SWPlayersNeutralBtn", "SWPlayersHostileBtn" };
 const char* const kActName[2] = { "SWPlayersLeftActBtn", "SWPlayersRightActBtn" };   /* the bottom line's action buttons */
 const char* const kNoteName   = "SWPlayersRightNote";   /* the words in the right-hand button's place (why a player cannot be invited) */
@@ -91,6 +94,10 @@ const char* const kAdminBtnName = "SWPlayersAdminBtn";     /* the owner's admin 
 const char* const kBoxAmount = "SWGiveMoneyAmount";   /* the GIVE MONEY box's typing box and its hint line */
 const char* const kBoxHint = "SWGiveMoneyHint";
 const int kBoxGiveMoney = 1000;   /* the GIVE MONEY box: this module's own box kind, beside teamscreen::kBox* */
+const char* const kGiveCharsLineName = "SWPlayersGiveCharsLine";   /* T-1135: the GIVE row's blocking line */
+const char* const kGiveCharsBtnName = "SWPlayersGiveCharsBtn";     /* T-1135: GIVE <name> / GIVE <n> CHARACTERS */
+const int kBoxGiveChars = 1001;   /* T-1135: the giver's GIVE box (GIVE / CANCEL) */
+const int kBoxGiveOffer = 1002;   /* T-1135: the receiver's box (ACCEPT / REFUSE), not modal; it goes when its offer stops waiting */
 /* the one box this module shows at a time: SET HOSTILE, FACTION INVITATION, LEAVE / REMOVE FROM / DISBAND FACTION, FACTION */
 const char* const kBoxName    = "SWFactionBox";
 const char* const kBoxText    = "SWFactionBoxText";
@@ -107,6 +114,8 @@ MyGUI::TabItem* g_item = 0;
 MyGUI::MultiListBox* g_list = 0;
 MyGUI::TextBox* g_line = 0;
 MyGUI::TextBox* g_select = 0;
+MyGUI::TextBox* g_speedLine = 0;     /* GAME SPEED: <the world's GAME SPEED CONTROL>, under the table */
+std::string g_shownSpeedLine;
 MyGUI::Button* g_btn[3] = { 0, 0, 0 };
 MyGUI::Widget* g_box = 0;
 std::string g_fitShown;              /* the tab widths MgmtTabsFit last logged */
@@ -138,6 +147,13 @@ bool g_adminRow = false;             /* the page was built with the admin row (t
 std::string g_adminShown;            /* the admin row as last applied */
 int g_adminListed = -1;              /* the picked player's admin-list mark as the row shows it (-1 = the row hidden) */
 long long g_adminPressed = 0;
+/* T-1135 GIVE: the row under the bottom row (the blocking line, the button), the characters the GIVE box names, the box words */
+MyGUI::TextBox* g_gcLine = 0;
+MyGUI::Button* g_gcBtn = 0;
+std::string g_gcShown;
+std::vector<unsigned int> g_gcUids;
+std::string g_giveText;
+long long g_gcPressed = 0, g_gcConfirmed = 0, g_offerBoxes = 0, g_offerAnswered = 0;
 std::string g_shownView;
 teamscreen::View g_view;
 bool g_viewSelected = false;
@@ -212,6 +228,7 @@ public:
         if (g_list != 0 && Inside(g_list, w)) g_list = 0;
         if (g_line != 0 && Inside(g_line, w)) g_line = 0;
         if (g_select != 0 && Inside(g_select, w)) g_select = 0;
+        if (g_speedLine != 0 && Inside(g_speedLine, w)) g_speedLine = 0;
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0 && Inside(g_btn[k], w)) g_btn[k] = 0;
         for (int k = 0; k < 2; ++k) if (g_act[k] != 0 && Inside(g_act[k], w)) g_act[k] = 0;
         if (g_note != 0 && Inside(g_note, w)) g_note = 0;
@@ -219,6 +236,8 @@ public:
         if (g_give != 0 && Inside(g_give, w)) g_give = 0;
         if (g_adminLine != 0 && Inside(g_adminLine, w)) g_adminLine = 0;
         if (g_adminBtn != 0 && Inside(g_adminBtn, w)) g_adminBtn = 0;
+        if (g_gcLine != 0 && Inside(g_gcLine, w)) g_gcLine = 0;
+        if (g_gcBtn != 0 && Inside(g_gcBtn, w)) g_gcBtn = 0;
         if (g_boxAmount != 0 && Inside(g_boxAmount, w)) g_boxAmount = 0;
         if (g_boxHint != 0 && Inside(g_boxHint, w)) g_boxHint = 0;
     }
@@ -235,7 +254,7 @@ bool UnlinkerOn()
     return true;
 }
 bool PageWhole() { return g_list != 0 && g_line != 0 && g_select != 0 && g_btn[0] != 0 && g_btn[1] != 0 && g_btn[2] != 0 && g_act[0] != 0 && g_act[1] != 0 && g_note != 0
-                          && (!g_adminRow || (g_adminLine != 0 && g_adminBtn != 0)); }
+                          && (!g_adminRow || (g_adminLine != 0 && g_adminBtn != 0)) && g_gcLine != 0 && g_gcBtn != 0; }
 
 /* the management window's tab control, or 0 while the window has not been built (it is built the first time it opens) */
 MyGUI::TabControl* FindTabs()
@@ -390,9 +409,11 @@ void ForgetTab()
 {
     g_act[0] = g_act[1] = 0; g_note = 0; g_actShown[0] = g_actShown[1] = 0; g_shownView.clear(); g_view = teamscreen::View(); g_viewSelected = false;
     g_tabs = 0; g_item = 0; g_list = 0; g_line = 0; g_select = 0; g_btn[0] = g_btn[1] = g_btn[2] = 0;
+    g_speedLine = 0; g_shownSpeedLine.clear();
     g_msg = 0; g_msgShown = -1;
     g_give = 0; g_giveShown = -1;
     g_adminLine = 0; g_adminBtn = 0; g_adminRow = false; g_adminShown.clear(); g_adminListed = -1;
+    g_gcLine = 0; g_gcBtn = 0; g_gcShown.clear();
     g_rows.clear(); g_selSlot = -1; g_shownLine.clear(); g_shownSelect.clear(); g_shownTicked = -2; g_shownSelected = -1; g_shownLocked = -1; g_rowsEpoch = -1;
 }
 
@@ -405,6 +426,7 @@ void OnActClicked(MyGUI::Widget* w);
 void OnMessageClicked(MyGUI::Widget* w);
 void OnGiveClicked(MyGUI::Widget* w);
 void OnAdminClicked(MyGUI::Widget* w);
+void OnGiveCharsClicked(MyGUI::Widget* w);
 
 /* THE PAGE (mock-up A4.2): the table (Kenshi's own Kenshi_MultiListBox, as the Load Game list) over the tab's height, the
    stance line (painted text, the window's label face) and the three tick buttons (Kenshi_TickButton1) along the bottom. Sizes
@@ -422,9 +444,13 @@ bool BuildPage(MyGUI::TabItem* item)
     /* on the owner's own game one more row under the bottom row, the same height (the admin row): the bottom row moves up by it */
     const bool adminRow = coop::AdminOwnerNow();
     const int adminY = H - pad - btnH;
-    const int btnY = adminRow ? adminY - pad / 2 - btnH : adminY;
+    /* T-1135: the GIVE row under the bottom row, above the admin row when there is one: the bottom row moves up by it */
+    const int giveRowY = adminRow ? adminY - pad / 2 - btnH : adminY;
+    const int btnY = giveRowY - pad / 2 - btnH;
     const int lineY = btnY - pad / 2 - lineH;
-    const int listY = pad, listH = lineY - pad - listY;
+    /* the world's GAME SPEED line (mock-up 7) between the table and the text line, a line's height: the table ends above it */
+    const int speedY = lineY - pad / 2 - lineH;
+    const int listY = pad, listH = speedY - pad / 2 - listY;
     if (listH < 60) return false;
     MyGUI::Widget* lw = Mk(item, "MultiListBox", "Kenshi_MultiListBox", 0, listY, W, listH, MyGUI::Align::Stretch, kListName);
     MyGUI::Widget* line = Mk(item, "TextBox", "Kenshi_TextboxPaintedText", 0, lineY, W, lineH, MyGUI::Align::HStretch | MyGUI::Align::Bottom, kLineName);
@@ -442,6 +468,18 @@ bool BuildPage(MyGUI::TabItem* item)
         lt->setCoord(MyGUI::IntCoord(inset, lineY, W - inset, lineH));
         st->setCoord(MyGUI::IntCoord(inset, lineY, W - inset, lineH));
         DebugLog("[UI] rect playerstab line inset x=" + S(inset) + " (the list's client area " + S(lc != 0 && lc != list ? lc->getAbsoluteCoord().left - list->getAbsoluteCoord().left : -1) + " + " + S(kTextMargin) + ")");
+    }
+    {
+        const int sx = lt->getCoord().left;   /* where the text line's words start: the list's text, not the window's frame */
+        MyGUI::Widget* sw = Mk(item, "TextBox", "Kenshi_TextboxStandardText", sx, speedY, W - sx, lineH, MyGUI::Align::HStretch | MyGUI::Align::Bottom, kSpeedName);
+        MyGUI::TextBox* sp = sw != 0 ? sw->castType<MyGUI::TextBox>(false) : 0;
+        if (sp == 0) return false;
+        g_speedLine = sp; g_shownSpeedLine.clear();
+        sp->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
+        sp->setTextColour(Lit());
+        sp->setCaption(MyGUI::UString(""));
+        sp->setVisible(false);
+        DebugLog("[UI] rect playerstab game speed line x=" + S(sx) + " y=" + S(speedY) + " h=" + S(lineH) + " (under the table, above the text line at y=" + S(lineY) + ")");
     }
     int cw[playerstab::kColumns];
     playerstab::ColumnWidths(W - 32 > 0 ? W - 32 : 0, cw);   /* the inner width: less the skin's frame and its scroll bar (ui.cpp's lists) */
@@ -525,6 +563,31 @@ bool BuildPage(MyGUI::TabItem* item)
         const int lineW = giveX - gap - lc.left;
         lt->setCoord(MyGUI::IntCoord(lc.left, lc.top, lineW > 1 ? lineW : 1, lc.height));
         DebugLog("[UI] rect playerstab give money x=" + S(giveX) + " y=" + S(giveY) + " w=" + S(giveW) + " h=" + S(btnH) + " left of MESSAGE (the line's text now w=" + S(lineW) + ")");
+    }
+    /* T-1135 GIVE: the blocking line from where the line's text starts, GIVE <name> / GIVE <n> CHARACTERS at the right edge where
+       INVITE TO FACTION is on the row above, the same size and style; shown while another player's row is picked and this player's own
+       characters are selected in the world */
+    {
+        const int gbX = W - actW - gap;
+        MyGUI::Widget* bw = Mk(item, "Button", "Kenshi_Button2", gbX, giveRowY, actW, btnH, MyGUI::Align::Right | MyGUI::Align::Bottom, kGiveCharsBtnName);
+        MyGUI::Button* b = bw != 0 ? bw->castType<MyGUI::Button>(false) : 0;
+        const MyGUI::IntCoord lc = lt->getCoord();
+        const int textW = gbX - gap - lc.left;
+        MyGUI::Widget* tw = Mk(item, "TextBox", "Kenshi_TextboxStandardText", lc.left, giveRowY + (btnH - lineH) / 2, textW > 1 ? textW : 1, lineH,
+                               MyGUI::Align::HStretch | MyGUI::Align::Bottom, kGiveCharsLineName);
+        MyGUI::TextBox* gt = tw != 0 ? tw->castType<MyGUI::TextBox>(false) : 0;
+        if (b == 0 || gt == 0) return false;
+        g_gcBtn = b; g_gcLine = gt; g_gcShown.clear();
+        b->setTextColour(Lit());
+        b->setCaption(MyGUI::UString(""));
+        b->eventMouseButtonClick += MyGUI::newDelegate(OnGiveCharsClicked);
+        b->setVisible(false);
+        gt->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
+        gt->setTextColour(Lit());
+        gt->setCaption(MyGUI::UString(""));
+        gt->setVisible(false);
+        DebugLog("[UI] rect playerstab give row y=" + S(giveRowY) + " h=" + S(btnH) + " words x=" + S(lc.left) + " w=" + S(textW) + " button x=" + S(gbX) + " w=" + S(actW)
+                 + " (the bottom row moved up to y=" + S(btnY) + ")");
     }
     /* the owner's admin row: the picked player's words from where the line's text starts, MAKE ADMIN / REMOVE ADMIN at the right edge
        where INVITE TO FACTION is on the row above, the same size and style */
@@ -677,6 +740,31 @@ void ApplyAdminRow(const std::vector<playerstab::RowView>& rows, bool selected)
     DebugLog("[PLAYERS] admin row: " + (listed < 0 ? std::string("hidden") : "'" + line + "' [" + adminwords::AdminRowButton(listed == 1) + "]") + " (selected slot " + S(g_selSlot) + ")");
 }
 
+/* T-1135: the GIVE row for the picked player - hidden with no player picked or none of this player's own characters selected in the
+   world; greyed with the line naming who is blocking (src/common/givewire.h ButtonFor). Read at every refresh of the rows. */
+void ApplyGiveRow(const std::vector<playerstab::RowView>& rows, bool selected)
+{
+    if (g_gcLine == 0 || g_gcBtn == 0) return;
+    const int i = (selected && g_selSlot >= 0) ? playerstab::RowOfSlot(rows, g_selSlot) : -1;
+    swgive::ButtonView v;
+    std::vector<unsigned int> uids; std::vector<std::string> names;
+    if (i >= 0 && !coop::EngineWritesBlocked()) coop::GiveButtonRead(g_selSlot, &v, &uids, &names);
+    const std::string sig = S(v.state) + "|" + v.caption + "|" + v.line;
+    if (sig == g_gcShown) return;
+    g_gcShown = sig;
+    const bool shown = v.state != swgive::kButtonHidden;
+    g_gcBtn->setVisible(shown);
+    g_gcLine->setVisible(shown && !v.line.empty());
+    if (shown)
+    {
+        g_gcBtn->setCaption(MyGUI::UString(playerstab::EscapeHash(v.caption)));
+        g_gcBtn->setEnabled(v.state == swgive::kButtonLit);
+        FitCaption(g_gcLine, playerstab::EscapeHash(v.line));
+    }
+    DebugLog("[PLAYERS] give row: " + (shown ? "[" + v.caption + "] " + (v.state == swgive::kButtonLit ? std::string("lit") : std::string("greyed"))
+             + (v.line.empty() ? std::string() : " '" + v.line + "'") : std::string("hidden")) + " (selected slot " + S(g_selSlot) + ")");
+}
+
 void ApplyBottom(const std::vector<playerstab::RowView>& rows)
 {
     const playerstab::Bottom b = playerstab::BottomFor(rows, g_selSlot);
@@ -726,6 +814,7 @@ void ApplyBottom(const std::vector<playerstab::RowView>& rows)
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0) g_btn[k]->setEnabled(playerstab::ButtonEnabled(b, k));
     }
     ApplyAdminRow(rows, b.selected);
+    ApplyGiveRow(rows, b.selected);
 }
 /* the rows' inputs moved since they were built: a standing with this game's player faction (RelationsPlayerPairEpoch), or
    kRowsEveryMs passed (the roster's names and who is online, a player's faction arriving) */
@@ -733,6 +822,17 @@ bool RowsStale()
 {
     if (coop::TeamMatesSettling()) return false;   /* the teammates just changed: the cells wait for the values the restore settles on */
     return coop::RelationsPlayerPairEpoch() != g_rowsEpoch || ::GetTickCount() - g_rowsMs >= kRowsEveryMs;
+}
+/* the GAME SPEED line as the world's last CLOCK says it; hidden until a CLOCK has */
+void ApplySpeedLine()
+{
+    if (g_speedLine == 0) return;
+    const std::string line = playerstab::GameSpeedLine(coop::TimeModeWords());
+    if (line == g_shownSpeedLine) return;
+    g_shownSpeedLine = line;
+    g_speedLine->setCaption(MyGUI::UString(line.c_str()));
+    g_speedLine->setVisible(!line.empty());
+    DebugLog("[PLAYERS] game speed line: '" + line + "'");
 }
 void Refresh()
 {
@@ -769,6 +869,7 @@ void Refresh()
     }
     g_rows = rows;
     ApplyBottom(g_rows);
+    ApplySpeedLine();
 }
 /* Each frame: other players' factions made known; with our tab in (its widgets kept; the destroy notice drops them with the
    window), the table rebuilt while it shows when its inputs moved, and the tab taken out - the window closed - once the world
@@ -787,6 +888,11 @@ void BoxesTick()
         DebugLog(std::string("[PLAYERS] FACTION INVITATION box taken down: ") + (waiting ? "a newer invitation replaced it" : "the invitation was answered or ended"));
         DropBox();
     }
+    if (g_box != 0 && g_boxKind == kBoxGiveOffer && !coop::GiveOfferStillWaiting(g_boxSerial, g_boxSlot))
+    {
+        DebugLog("[PLAYERS] give offer box taken down: the offer was answered, ran out or ended");
+        DropBox();
+    }
     if (g_box != 0) return;
     const unsigned long now = ::GetTickCount();
     if (g_boxTryMs != 0 && now - g_boxTryMs < kLookEveryMs) return;   /* a box that could not be opened: tried again a second later */
@@ -803,6 +909,20 @@ void BoxesTick()
         else { g_boxTryMs = now | 1u; if (++g_boxRetrySaid <= 1) DebugLog("[PLAYERS] FACTION box could not be shown - tried again every second"); }
         return;
     }
+    {   /* T-1135: an offer of characters waiting for this player's answer - its box, not modal (the player keeps playing; it goes after 60 s) */
+        unsigned int offerId = 0; int giver = -1; std::vector<std::string> names;
+        if (coop::GiveOfferWaiting(&offerId, &giver, &names))
+        {
+            const std::string gname = coop::TeamPlayerName(giver);
+            if (!gname.empty() && !otherUp)
+            {
+                g_giveText = swgive::OfferText(gname, names);
+                if (OpenBox(kBoxGiveOffer, giver, std::string(), gname, offerId)) ++g_offerBoxes;
+                else { g_boxTryMs = now | 1u; if (++g_boxRetrySaid <= 1) DebugLog("[PLAYERS] give offer box could not be shown - tried again every second"); }
+                return;
+            }
+        }
+    }
     if (!waiting) return;
     const std::string who = coop::TeamPlayerName(from);
     if (!teamscreen::InviteBoxDue(waiting, g_box != 0, otherUp, !who.empty()))
@@ -816,6 +936,7 @@ void BoxesTick()
 }
 void BoxCancelBody();
 void BoxConfirmBody();
+void GiveBoxPress(bool left);
 /* the press a box's button recorded: acted on here, on the box it was pressed on (a box gone since then takes no action) */
 void BoxPressTick()
 {
@@ -824,6 +945,7 @@ void BoxPressTick()
     MyGUI::Widget* on = g_boxPressedOn;
     g_boxPressedOn = 0;
     if (g_box == 0 || on != g_box) { DebugLog("[PLAYERS] a box's " + std::string(p == 1 ? "left" : "right") + " button press dropped: that box is no longer up"); return; }
+    if (g_boxKind == kBoxGiveChars || g_boxKind == kBoxGiveOffer) { GiveBoxPress(p == 1); return; }   /* T-1135: their action is the LEFT button */
     if (p == 1) BoxCancelBody(); else BoxConfirmBody();
 }
 /* 478: a member's FACTION NAME box (the FACTION tab) cannot be edited - disabled while this player is a member, enabled again
@@ -938,9 +1060,12 @@ void DropBox()
     gui->destroyWidget(w);
 }
 /* T-810: the GIVE MONEY box is this module's own kind beside teamscreen's; its words are src/common/moneywire.h's */
-std::string BoxTitleOf(int kind) { return kind == kBoxGiveMoney ? std::string(moneyw::GiveWord()) : std::string(teamscreen::BoxTitle(kind)); }
-std::string BoxLeftOf(int kind)  { return kind == kBoxGiveMoney ? std::string(moneyw::CancelWord()) : std::string(teamscreen::BoxLeft(kind)); }
-std::string BoxRightOf(int kind) { return kind == kBoxGiveMoney ? std::string(moneyw::SendWord()) : std::string(teamscreen::BoxRight(kind)); }
+std::string BoxTitleOf(int kind) { if (kind == kBoxGiveChars || kind == kBoxGiveOffer) return std::string();   /* T-1135: the mock-up gives these boxes no title */
+                                   return kind == kBoxGiveMoney ? std::string(moneyw::GiveWord()) : std::string(teamscreen::BoxTitle(kind)); }
+std::string BoxLeftOf(int kind)  { if (kind == kBoxGiveChars) return swgive::GiveWord(); if (kind == kBoxGiveOffer) return swgive::AcceptWord();   /* T-1135: the mock-up's order - the action LEFT */
+                                   return kind == kBoxGiveMoney ? std::string(moneyw::CancelWord()) : std::string(teamscreen::BoxLeft(kind)); }
+std::string BoxRightOf(int kind) { if (kind == kBoxGiveChars) return swgive::CancelWord(); if (kind == kBoxGiveOffer) return swgive::RefuseWord();
+                                   return kind == kBoxGiveMoney ? std::string(moneyw::SendWord()) : std::string(teamscreen::BoxRight(kind)); }
 /* the GIVE MONEY box's words: the approved sentence with this player's money read now, then the amount row's word on a line of
    its own ("" = no name, or the money cannot be read: the box is not opened) */
 std::string GiveBoxText(const std::string& who)
@@ -1014,13 +1139,18 @@ bool OpenBox(int kind, int slot, const std::string& team, const std::string& who
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (gui == 0) return false;
     const std::string title = BoxTitleOf(kind);
+    if (g_box != 0 && g_boxKind == kBoxGiveOffer && kind != kBoxGiveOffer && !teamscreen::OkOnlyBox(kind))
+    {
+        DebugLog("[PLAYERS] give offer box taken down for the box the player asked for - it comes back while the offer waits");
+        DropBox();
+    }
     if (g_box != 0 && g_boxKind == teamscreen::kBoxInvite && kind != teamscreen::kBoxInvite && !teamscreen::OkOnlyBox(kind))
     {
         DebugLog("[PLAYERS] FACTION INVITATION box taken down for the " + title + " box the player asked for - it comes back while the invitation waits");
         DropBox();
     }
     if (g_box != 0) { DebugLog("[PLAYERS] " + title + " box NOT opened: the " + BoxTitleOf(g_boxKind) + " box is up"); return false; }
-    const std::string text = kind == kBoxGiveMoney ? GiveBoxText(who) : teamscreen::BoxText(kind, team, who);
+    const std::string text = kind == kBoxGiveMoney ? GiveBoxText(who) : (kind == kBoxGiveChars || kind == kBoxGiveOffer) ? g_giveText : teamscreen::BoxText(kind, team, who);   /* T-1135: the give boxes' words are made by the caller */
     if (text.empty()) { DebugLog("[PLAYERS] " + title + " box NOT opened: its words need a name this game does not know"); return false; }
     int vw = 1280, vh = 720;
     MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
@@ -1061,7 +1191,10 @@ bool OpenBox(int kind, int slot, const std::string& team, const std::string& who
     e->setEditStatic(true); e->setEditReadOnly(true); e->setEditMultiLine(true); e->setEditWordWrap(true);
     e->setTextAlign(MyGUI::Align::Left | MyGUI::Align::Top);
     e->setTextColour(Lit());
-    e->setCaption(MyGUI::UString(text.c_str()));
+    /* T-1135 review fold 7: the give boxes carry characters' names (the offer box's come from the giver's game) - a '#' in one is
+       shown as itself, never read as a colour code, as the GIVE button's caption is */
+    const std::string shown = (kind == kBoxGiveChars || kind == kBoxGiveOffer) ? playerstab::EscapeHash(text) : text;
+    e->setCaption(MyGUI::UString(shown.c_str()));
     if (b0 != 0) { b0->setCaption(MyGUI::UString(leftWord.c_str())); b0->setTextColour(Lit()); }
     b1->setCaption(MyGUI::UString(rightWord.c_str())); b1->setTextColour(Lit());
     /* the box fitted to the text MyGUI laid out (EditBox::getTextSize at the box's width, the line height from the text's
@@ -1116,7 +1249,7 @@ bool OpenBox(int kind, int slot, const std::string& team, const std::string& who
     if (b0 != 0) b0->eventMouseButtonClick += MyGUI::newDelegate(OnBoxCancel);
     b1->eventMouseButtonClick += MyGUI::newDelegate(OnBoxConfirm);
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
-    const bool modal = kind != teamscreen::kBoxInvite;   /* the invitation does not stop the game: no modal layer, no keyboard focus taken */
+    const bool modal = kind != teamscreen::kBoxInvite && kind != kBoxGiveOffer;   /* the invitation does not stop the game: no modal layer, no keyboard focus taken; T-1135: nor does the offer box (it closes itself after 60 s) */
     if (im != 0 && modal) { im->addWidgetModal(raw); im->setKeyFocusWidget(raw); }
     if (im != 0 && kind == kBoxGiveMoney && g_boxAmount != 0) im->setKeyFocusWidget(g_boxAmount);   /* T-810: the amount takes the typing */
     g_box = raw;
@@ -1277,6 +1410,49 @@ void GiveBody()
 }
 void GiveCatching() { try { GiveBody(); } catch (...) { ++g_throws; } }
 void OnGiveClicked(MyGUI::Widget*) { __try { GiveCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
+/* T-1135 GIVE: the GIVE box for the picked player and the characters selected now (read live at the press); a greyed button does nothing */
+void GiveCharsBody()
+{
+    if (g_selSlot < 0 || coop::EngineWritesBlocked()) return;
+    ++g_gcPressed;
+    swgive::ButtonView v;
+    std::vector<unsigned int> uids; std::vector<std::string> names;
+    coop::GiveButtonRead(g_selSlot, &v, &uids, &names);
+    if (v.state != swgive::kButtonLit) { DebugLog("[PLAYERS] GIVE pressed for slot " + S(g_selSlot) + ", but it is not lit now ('" + v.line + "') - nothing done"); return; }
+    const std::vector<playerstab::RowView> rows = BuildRows();
+    const int i = playerstab::RowOfSlot(rows, g_selSlot);
+    if (i < 0) { DebugLog("[PLAYERS] GIVE pressed, but the picked player (slot " + S(g_selSlot) + ") is no longer listed"); return; }
+    std::string name, fac;
+    if (!coop::PlayersTabPlayerWords(g_selSlot, &name, &fac) || name.empty()) name = rows[(size_t)i].name;
+    g_gcUids = uids;
+    g_giveText = swgive::ConfirmText(names, name);
+    DebugLog("[PLAYERS] GIVE pressed for slot " + S(g_selSlot) + ": [" + v.caption + "] (pressed " + S(g_gcPressed) + ")");
+    OpenBox(kBoxGiveChars, g_selSlot, std::string(), name, 0);
+}
+void GiveCharsCatching() { try { GiveCharsBody(); } catch (...) { ++g_throws; } }
+void OnGiveCharsClicked(MyGUI::Widget*) { __try { GiveCharsCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
+/* T-1135: a give box's buttons, in the mock-up's order. The GIVE box: GIVE (left) arms the offer for the characters it named - every
+   condition is read again when it is sent at the safe point - and CANCEL (right) closes it. The offer box: ACCEPT (left) / REFUSE
+   (right) answer the offer it shows, when that offer still waits. */
+void GiveBoxPress(bool left)
+{
+    const int kind = g_boxKind, slot = g_boxSlot;
+    const unsigned offer = g_boxSerial;
+    DropBox();
+    if (kind == kBoxGiveChars)
+    {
+        if (!left) { ++g_boxCancelled; DebugLog("[PLAYERS] GIVE box: CANCEL (slot " + S(slot) + ") - nothing given"); return; }
+        if (coop::EngineWritesBlocked()) { DebugLog("[PLAYERS] GIVE box: GIVE pressed with no world - nothing sent"); return; }
+        ++g_gcConfirmed;
+        coop::GiveOfferArm(slot, g_gcUids, "the PLAYERS tab");
+        DebugLog("[PLAYERS] GIVE box: GIVE for slot " + S(slot) + " (" + S((long long)g_gcUids.size()) + " character(s)) - the offer goes at the next safe point");
+        return;
+    }
+    const int r = coop::GiveOfferAnswer(offer, slot, left);
+    ++g_offerAnswered;
+    DebugLog("[PLAYERS] give offer box: " + std::string(left ? "ACCEPT" : "REFUSE") + " for offer " + S(offer) + " from slot " + S(slot)
+             + (r == 1 ? std::string(" - answered") : std::string(" - that offer no longer waits")));
+}
 /* SEND on the GIVE MONEY box: money.cpp takes it from here, everything read live at the press. Sent: the box closes (the chat
    line says it). Refused: the box stays and its hint line says why. */
 void GiveSendBody()
@@ -1355,11 +1531,14 @@ void ShownReport()
     const bool lineShown = g_line != 0 && Shown(g_line), selShown = g_select != 0 && Shown(g_select);
     DebugLog("[PLAYERS] SHOWN tab=" + std::string(tabShown ? "open" : "not open") + " role=" + S(g_ctx.role) + " team=" + std::string(g_ctx.team.empty() ? "none" : "named")
              + " | line='" + (lineShown ? g_view.line : selShown ? std::string(playerstab::kSelectLine) : std::string()) + "'"
+             + " | speed='" + (g_speedLine != 0 && Shown(g_speedLine) ? g_shownSpeedLine : std::string()) + "'"
              + " | stance buttons " + (g_btn[0] != 0 ? Vis(g_btn[0]) : std::string("none")) + " [" + stance + "]"
              + " | left='" + (g_act[0] != 0 && Shown(g_act[0]) ? std::string(teamscreen::ActionCaption(g_actShown[0])) : std::string()) + "'"
              + " right='" + (g_act[1] != 0 && Shown(g_act[1]) ? std::string(teamscreen::ActionCaption(g_actShown[1])) : std::string()) + "'"
              + " rightWords='" + (g_note != 0 && Shown(g_note) ? g_view.note : std::string()) + "'"
              + " | GIVE MONEY " + (g_give != 0 ? Vis(g_give) : std::string("none"))
+             + " | give row " + (g_gcBtn != 0 && Shown(g_gcBtn) ? "[" + g_gcBtn->getCaption().asUTF8() + "]" + (g_gcBtn->getEnabled() ? std::string() : std::string(" greyed"))
+                                 + " '" + (g_gcLine != 0 && Shown(g_gcLine) ? g_gcLine->getCaption().asUTF8() : std::string()) + "'" : std::string("hidden"))   /* T-1135 */
              + " | admin row " + (g_adminLine != 0 && Shown(g_adminLine) ? "'" + g_adminLine->getCaption().asUTF8() + "' [" + (g_adminBtn != 0 ? g_adminBtn->getCaption().asUTF8() : std::string()) + "]" : std::string(g_adminRow ? "hidden" : "none"))
              + " | rows: " + (rows.empty() ? std::string("none") : rows)
              + " | box: " + (g_box != 0 ? "'" + BoxTitleOf(g_boxKind) + "' text=" + (g_boxKind == kBoxGiveMoney ? S((int)g_boxText.size()) + " chars" : "'" + g_boxText + "'")   /* GIVE MONEY: counts only - its text names a player */

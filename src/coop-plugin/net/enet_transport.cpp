@@ -26,6 +26,7 @@
 #include "../../common/sendbundle.h"   /* M13: what is handed to ENet for the world server during one pass leaves as one packet per lane */
 #include "steam_transport.h"   /* the factory's Steam backend */
 #include "../store.h"   /* T-1118 (a) review fold: StoreMainThreadId - only the main thread's waits for the link's lock are timed */
+#include "../../common/netthrottle.h"   /* T-1168 TEST-ONLY netthrottle off|on: ENet's throttle terms and the log line */
 
 #include <sstream>
 #include <locale>
@@ -71,6 +72,35 @@ std::string N(long long v)   // RE_Kenshi's locale mangles raw numbers (F030)
     ss.imbue(std::locale::classic());
     ss << v;
     return ss.str();
+}
+
+/* T-1168 (owner 1425 a) TEST-ONLY `netthrottle off|on` (src/common/netthrottle.h says which ENet terms and why): every EnetTransport
+   alive is listed here, so the switch reaches each of this game's ENet links at once (NetThrottleSet). The list has its own lock, taken
+   before a link's lock and never while one is held. Steam links are not ENet and are not touched. */
+typedef char NetThrottleAgreesWithEnet[(netthrottle::kScale == (unsigned)ENET_PEER_PACKET_THROTTLE_SCALE && netthrottle::kDefInterval == (unsigned)ENET_PEER_PACKET_THROTTLE_INTERVAL
+    && netthrottle::kDefAccel == (unsigned)ENET_PEER_PACKET_THROTTLE_ACCELERATION && netthrottle::kDefDecel == (unsigned)ENET_PEER_PACKET_THROTTLE_DECELERATION) ? 1 : -1];   /* a compile error here = the header and ENet disagree */
+class EnetTransport;
+struct NtRegistry
+{
+    CRITICAL_SECTION cs;
+    std::vector<EnetTransport*> all;
+    NtRegistry() { ::InitializeCriticalSection(&cs); }
+};
+NtRegistry s_ntReg;            /* made at the plugin's load, before any link */
+volatile LONG s_ntOff = 1;     /* 1 while the shipped / off terms are in force (T-1168 (c): from the plugin's load): a link that connects gets them; 0 after `netthrottle on` (TEST-ONLY) */
+void NtList(EnetTransport* t, bool add)
+{
+    ::EnterCriticalSection(&s_ntReg.cs);
+    if (add) s_ntReg.all.push_back(t);
+    else for (size_t i = 0; i < s_ntReg.all.size(); ++i) if (s_ntReg.all[i] == t) { s_ntReg.all.erase(s_ntReg.all.begin() + i); break; }
+    ::LeaveCriticalSection(&s_ntReg.cs);
+}
+/* one link's ENet terms set for the mode; off also puts the throttle itself back at its limit (it may already have fallen to 0) */
+void NtApplyPeer(ENetPeer* p, int mode)
+{
+    const netthrottle::Terms t = netthrottle::TermsFor(mode);
+    enet_peer_throttle_configure(p, t.interval, t.accel, t.decel);
+    if (mode == netthrottle::kOff) p->packetThrottle = p->packetThrottleLimit;
 }
 
 class EnetTransport : public ITransport
@@ -128,6 +158,7 @@ public:
     {
         ::InitializeCriticalSection(&ks_->cs);
         ks_->wake = 0; ks_->on = 0; ks_->quit = 0; ks_->owner = this;
+        NtList(this, true);   /* T-1168 TEST-ONLY netthrottle: listed, so the switch reaches this link */
         // PROBE-START: P199 - no stamp handed over yet; ENet's free callback reaches the stamps
         p199Cur_ = -1; p199LastPkt_ = 0; p199Rtt_ = 0; netq_.p199 = &p199_; netq_.p199Peer = &peer_;   /* P199b: the free callback reads whether the peer is up */
         // PROBE-END: P199
@@ -135,11 +166,21 @@ public:
 
     ~EnetTransport()
     {
+        NtList(this, false);   /* T-1168: off the netthrottle list first - the switch never reaches a link being taken down */
         KeepThreadStop();   /* T-1118 (a): the helper is gone - or, if it did not end in time, can no longer reach this transport - before the host it services */
         Disconnect();
         if (keepLeaked_) return;   /* the helper may still wait on the block's lock or event: the block stays (KeepThreadStop) */
         ::DeleteCriticalSection(&ks_->cs);
         delete ks_; ks_ = 0;
+    }
+
+    /* T-1168 TEST-ONLY netthrottle: this link's ENet terms set for the mode, under the link's lock; 1 = a live link was set, 0 = none */
+    int NetThrottleApply(int mode)
+    {
+        Guard g(this);
+        if (host_ == 0 || peer_ == 0 || peer_->state != ENET_PEER_STATE_CONNECTED) return 0;
+        NtApplyPeer(peer_, mode);
+        return 1;
     }
 
     bool Host(unsigned short port, std::string* errOut)
@@ -286,6 +327,14 @@ public:
     {
         Guard g(this);   /* T-1118 (a): the link's lock */
         if (host_ == 0) return;
+        /* T-1168 (c) TEST-ONLY control: under `netthrottle on` a link that adopted the far end's terms (the world server sets the shipped
+           ones at its connect) gets ENet's defaults back - once per adoption, as the far end sends its terms only at connect or a switch */
+        if (peer_ != 0 && peer_->state == ENET_PEER_STATE_CONNECTED && ::InterlockedCompareExchange(&s_ntOff, 0, 0) == 0
+            && netthrottle::OnNeedsReapply(netthrottle::kOn, peer_->packetThrottleAcceleration, peer_->packetThrottleDeceleration))
+        {
+            DebugLog(netthrottle::ReapplyLine("[NET]", peer_->packetThrottleAcceleration, peer_->packetThrottleDeceleration));
+            NtApplyPeer(peer_, netthrottle::kOn);
+        }
 
         /* M13: everything handed over since the last pass leaves now, one packet per lane - the first enet_host_service
            below is where ENet transmits (it held every packet until then anyway), so bundling adds no delay. */
@@ -317,6 +366,12 @@ public:
                     enet_peer_timeout(ev.peer, tLimit_, tMinMs_, tMaxMs_);
                     DebugLog("[net] link1: peer timeouts set - limit " + N(tLimit_) + ", minimum " + N(tMinMs_)
                              + " ms, maximum " + N(tMaxMs_) + " ms (a world load stalls this socket; ENet's 5 s default dropped T416's link)");
+                }
+                lfRate_.ForgetRoundTrip();   /* T-1168 (c): the lowest round trip is this connection's own */
+                if (::InterlockedCompareExchange(&s_ntOff, 0, 0) != 0)   /* T-1168 (c): the shipped terms, set now the connection is complete (never before: protocol.c 960-962) */
+                {
+                    NtApplyPeer(ev.peer, netthrottle::kShippedMode);
+                    DebugLog(netthrottle::ShippedLine("[NET]"));
                 }
                 break;
 
@@ -493,7 +548,10 @@ public:
         SbEdgeLog();
     }
     /* T-1118 (b): THE LIVE-FIRST MODE'S CLOCK AND BUDGET. The drain rate is what ENet let go (acknowledged) per second while record
-       pieces waited; ENet holds a reliable packet until it is acknowledged, so the budget covers a round trip plus 100 ms of it. */
+       pieces waited; ENet holds a reliable packet until it is acknowledged, so the budget covers a round trip plus 100 ms of it
+       (T-1168 design (c): the link's LOWEST round trip since it connected - livefirst::Rate::BudgetLowest).
+       T-1168 (pull request 4 task 6): a window in which any other frame waited in the send line (introductions, live, BULK, held) is
+       measured too, but may only raise the rate (livefirst::Rate) - so entering an area no longer leaves the budget at its floor. */
     static double LfNow()
     {
         LARGE_INTEGER c, f; ::QueryPerformanceCounter(&c); ::QueryPerformanceFrequency(&f);
@@ -504,8 +562,9 @@ public:
         if (!box_.LiveFirst()) return;
         const double now = LfNow();
         box_.SetNow(now);
-        lfRate_.Note(now, netq_.freedBytes, box_.RestWaiting());
-        box_.SetBudget(lfRate_.Budget(peer_ != 0 ? (double)peer_->roundTripTime / 1000.0 : 0.0));
+        lfRate_.Note(now, netq_.freedBytes, box_.RestWaiting(), box_.Count() > 0);   /* T-1168: other frames waiting count, raise-only */
+        if (peer_ != 0) lfRate_.NoteRoundTrip(now, (double)peer_->roundTripTime / 1000.0);   /* T-1168 (c): the lowest, not the current one (it grows with the queue) */
+        box_.SetBudget(lfRate_.BudgetLowest());
     }
     /* What a live message handed over now waits behind in ENet: the bytes ENet has not put on the wire for this link (both of its
        outgoing lists; each command's fragmentLength is its share of a packet, a resend waiting there included) and the open bundles it
@@ -1092,6 +1151,16 @@ private:
     // PROBE-END: P199
 };
 
+/* T-1168 TEST-ONLY netthrottle: every listed link set for the mode - the list's lock, then each link's own; the count of live links set */
+int NtApplyAll(int mode)
+{
+    int links = 0;
+    ::EnterCriticalSection(&s_ntReg.cs);
+    for (size_t i = 0; i < s_ntReg.all.size(); ++i) links += s_ntReg.all[i]->NetThrottleApply(mode);
+    ::LeaveCriticalSection(&s_ntReg.cs);
+    return links;
+}
+
 } // namespace
 
 /* When the current TRAFFIC REPORT window began: the plugin's load, then each report. */
@@ -1112,6 +1181,16 @@ void TrafficReportTick()
         nettally::Take(link, &w);
         if (!nettally::Empty(w)) DebugLog(nettally::ReportLine(link, secs, w));
     }
+}
+
+/* T-1168 (owner 1425 a) TEST-ONLY, the command verb `netthrottle off|on` (net/transport.h) */
+std::string NetThrottleSet(int mode)
+{
+    if (mode != netthrottle::kOff && mode != netthrottle::kOn) return "error netthrottle usage";
+    ::InterlockedExchange(&s_ntOff, mode == netthrottle::kOff ? 1 : 0);   /* first, so a link that connects during the walk below is not missed */
+    const int links = NtApplyAll(mode);
+    DebugLog(netthrottle::Line("[NET]", mode, links, false));
+    return std::string("ok netthrottle ") + netthrottle::Word(mode) + " links=" + netthrottle::Num((unsigned long)links);
 }
 
 ITransport* CreateTransport(BackendId which)
@@ -1181,6 +1260,8 @@ const char* MsgTypeName(MsgType t)
     case MSG_FIGHT_CHOICE: return "FIGHT_CHOICE";   /* T-1101 design (c) */
     case MSG_SHOT_FIRED: return "SHOT_FIRED";
     case MSG_HAND: return "HAND";
+    case MSG_BOX_LOCK: return "BOX_LOCK";   /* T-1061 */
+    case MSG_RESEARCH_BOOK: return "RESEARCH_BOOK";   /* T-1242 */
     case MSG_SESSION_CLOSING: return "SESSION_CLOSING";   /* mmo5 */
     case MSG_SQUAD_LEAD: return "SQUAD_LEAD";   /* T-1 B1 restructure */
     /* 58 (KEEPER) retired by protocol 89 - T-1 B3 restructure */

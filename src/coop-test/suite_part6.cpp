@@ -889,15 +889,6 @@ void t_t596_key_sector()
         Fail("a malformed key was read as a sector");
     if (x != -7 || y != -7) Fail("a refused key wrote its outputs");
 }
-void t_t596_sector_serve()
-{
-    using namespace coopdoor;
-    if (!DoorServesSectorAsk(1, 18, 35, 18, 35, kDoorClosed) || !DoorServesSectorAsk(1, 18, 35, 18, 35, kDoorOpen)) Fail("a resting door of the asked sector was not served");
-    if (DoorServesSectorAsk(1, 18, 35, 18, 35, kDoorOpening) || DoorServesSectorAsk(1, 18, 35, 18, 35, kDoorClosing)) Fail("a swinging door was served");
-    if (DoorServesSectorAsk(1, 18, 35, 17, 35, kDoorOpen) || DoorServesSectorAsk(1, 18, 35, 18, 34, kDoorOpen)) Fail("a door of another sector was served");
-    if (DoorServesSectorAsk(0, 18, 35, 18, 35, kDoorOpen)) Fail("a key whose sector could not be read was served");
-    if (DoorServesSectorAsk(1, 18, 35, 18, 35, -1)) Fail("a door in no known state was served");
-}
 void t_t596_gen_forget()
 {
     using namespace coopdoor;
@@ -945,7 +936,7 @@ void t_t596_reload_sequence()
     int x = 0, y = 0;
     const int parsed = DoorKeySector("2934-Walls2.mod@18,35@-614444,160142,3821gate", &x, &y);
     if (DoorDrainDecide(0, DoorChangeReportsIfNotHolder(-1, 0, 0)) != kDoorSendRefuse) Fail("B's load-time closed state was reported to A");
-    if (!DoorServesSectorAsk(parsed, x, y, 18, 35, kDoorOpen)) Fail("A did not serve its open gate to B's sector ask");
+    if (parsed != 1 || x != 18 || y != 35) Fail("A could not read the sector of its gate's key");
     if (DoorDrainDecide(1, 0) != kDoorSendHolder) Fail("A's served gate did not go as the holder's word");
     if (DoorRecvDecide(kDoorOriginHolder, 0) != kDoorRecvStore) Fail("B did not store A's word");
     if (DoorHolderWordDecide(kDoorAreaOther) != kDoorWordStore || DoorHolderWordDecide(kDoorAreaUnanswerable) != kDoorWordStoreUnanswerable)
@@ -989,18 +980,6 @@ void t_t596_report_decision()
         if (DoorRetIsLoadWriter(0x29D1D2ull, wr, 0) || DoorRetIsLoadWriter(0x29D1D2ull, 0, 3)) Fail("an empty writer list matched");
     }
 }
-void t_t596_catchup_serve()
-{
-    using namespace coopdoor;
-    const int xs[3] = { 17, 18, 19 }, ys[3] = { 35, 35, 36 };
-    if (!DoorServesCatchup(1, 18, 35, xs, ys, 3, kDoorOpen) || !DoorServesCatchup(1, 19, 36, xs, ys, 3, kDoorClosed)) Fail("a resting door of an asked sector was not served");
-    if (DoorServesCatchup(1, 18, 36, xs, ys, 3, kDoorOpen)) Fail("a door of a sector not asked was served (x and y must come from one sector)");
-    if (DoorServesCatchup(1, 18, 35, xs, ys, 3, kDoorOpening) || DoorServesCatchup(1, 18, 35, xs, ys, 3, kDoorClosing)) Fail("a swinging door was served");
-    if (DoorServesCatchup(0, 18, 35, xs, ys, 3, kDoorOpen)) Fail("a key whose sector could not be read was served");
-    if (DoorServesCatchup(1, 18, 35, xs, ys, 0, kDoorOpen) || DoorServesCatchup(1, 18, 35, 0, ys, 3, kDoorOpen)
-        || DoorServesCatchup(1, 18, 35, xs, 0, 3, kDoorOpen))
-        Fail("an empty ask served a door");
-}
 void t_t596_word_refind()
 {
     using namespace coopdoor;
@@ -1008,22 +987,8 @@ void t_t596_word_refind()
     if (!DoorDropMarksReFind(kDoorClosed) || !DoorDropMarksReFind(kDoorOpen)) Fail("a dropped row holding the holder's word was not marked");
     if (DoorHeldResolveDue(0, 0)) Fail("a held entry with nothing due was looked up");
     if (!DoorHeldResolveDue(1, 0) || !DoorHeldResolveDue(0, 1) || !DoorHeldResolveDue(1, 1)) Fail("a due look-up was skipped");
-}
-void t_t596_serve_norow()
-{
-    using namespace coopdoor;
-    const int xs[2] = { 17, 18 }, ys[2] = { 35, 36 };
-    if (!DoorKeyInAsk(1, 18, 36, xs, ys, 2) || !DoorKeyInAsk(1, 17, 35, xs, ys, 2)) Fail("a key of an asked sector was not in the ask");
-    if (DoorKeyInAsk(1, 18, 35, xs, ys, 2)) Fail("x and y of two different asked sectors were taken as one");
-    if (DoorKeyInAsk(0, 17, 35, xs, ys, 2) || DoorKeyInAsk(1, 17, 35, xs, ys, 0) || DoorKeyInAsk(1, 17, 35, 0, ys, 2)
-        || DoorKeyInAsk(1, 17, 35, xs, 0, 2))
-        Fail("an unparsed key or an empty ask matched");
-    if (!DoorServeMarksHeld(1, 0)) Fail("a key known only by its held entry, in an asked sector, was not marked");
-    if (DoorServeMarksHeld(1, 1) || DoorServeMarksHeld(0, 0)) Fail("a key with a row, or outside the ask, was marked");
-    if (DoorHeldLookupDue(0, 0, 0)) Fail("a held entry with nothing due was looked up");
-    if (!DoorHeldLookupDue(0, 0, 1) || !DoorHeldLookupDue(1, 0, 0) || !DoorHeldLookupDue(0, 1, 0)) Fail("a due look-up was skipped");
-    if (DoorHeldVisited(-1, 0, 0)) Fail("an entry with no word, report or mark was visited");
-    if (!DoorHeldVisited(-1, 0, 1) || !DoorHeldVisited(-1, 1, 0) || !DoorHeldVisited(0, 0, 0)) Fail("an entry with work was not visited");
+    if (DoorHeldVisited(-1, 0)) Fail("an entry with no word or report was visited");
+    if (!DoorHeldVisited(-1, 1) || !DoorHeldVisited(0, 0)) Fail("an entry with work was not visited");
 }
 void t_t596_word_line_budget()
 {
@@ -2642,7 +2607,7 @@ void t_steamfriends_list_line()
     if (std::string(steamfriends::SourceWord(steamfriends::kFromList)) != "list" || std::string(steamfriends::SourceWord(steamfriends::kFromCallback)) != "callback"
         || std::string(steamfriends::SourceWord(steamfriends::kFromLaunch)) != "launch" || std::string(steamfriends::SourceWord(steamfriends::kFromLever)) != "lever")
         Fail("the join request's source words");
-    /* JOIN GAME's rows fit the panel: the list, REFRESH and JOIN BY ADDRESS between PLAYER NAME and IP ADDRESS, the bands in that order */
+    /* JOIN GAME's rows fit the panel: the list, REFRESH and JOIN BY ADDRESS between PLAYER NAME and ADDRESS / PORT (T-793), the bands in that order */
     const int lays[] = { coopui::kLayJoin, coopui::kLayJoinHint };
     for (int k = 0; k < 2; ++k)
     {
@@ -2652,9 +2617,33 @@ void t_steamfriends_list_line()
         const coopui::PanelBand kb = coopui::PanelSlotBand(lays[k], coopui::kSlotListBtns, 24);
         const coopui::PanelBand ab = coopui::PanelSlotBand(lays[k], coopui::kSlotJoinByAddr, 24);
         const coopui::PanelBand rb = coopui::PanelSlotBand(lays[k], coopui::kSlotAddrRow, 24);
-        if (lb.h <= 0 || kb.h <= 0 || ab.h <= 0 || rb.h <= 0) Fail("a JOIN GAME row is missing, layout " + I(lays[k]));
-        if (!(nb.top < lb.top && lb.top + lb.h == kb.top && kb.top + kb.h == ab.top && ab.top + ab.h == rb.top))
-            Fail("JOIN GAME's rows are not name, list, REFRESH, JOIN BY ADDRESS, IP ADDRESS in order, layout " + I(lays[k]));
+        const coopui::PanelBand pb = coopui::PanelSlotBand(lays[k], coopui::kSlotPortRow, 24);   /* T-793 */
+        if (lb.h <= 0 || kb.h <= 0 || ab.h <= 0 || rb.h <= 0 || pb.h <= 0) Fail("a JOIN GAME row is missing, layout " + I(lays[k]));
+        if (!(nb.top < lb.top && lb.top + lb.h == kb.top && kb.top + kb.h == ab.top && ab.top + ab.h == rb.top && rb.top + rb.h == pb.top))
+            Fail("JOIN GAME's rows are not name, list, REFRESH, JOIN BY ADDRESS, ADDRESS, PORT in order, layout " + I(lays[k]));
+    }
+    /* T-793 review note c: at 1280x720 (and 1920x1080) the status area starts at or under the PORT box's bottom edge - never over
+       it - at every live status height, and BACK / JOIN stay under the status area */
+    {
+        const int sw[] = { 1280, 1920 }, sh[] = { 720, 1080 };
+        for (int r = 0; r < 2; ++r)
+        {
+            const coopui::PanelGeom g = coopui::PanelGeomIn(sw[r], sh[r]);
+            for (int k = 0; k < 2; ++k)
+            {
+                const int cap = coopui::PanelSlotBand(lays[k], coopui::kSlotStatus, 2).h;
+                for (int live = 1; live <= cap; ++live)
+                {
+                    const coopui::PanelBand pb = coopui::PanelSlotBand(lays[k], coopui::kSlotPortRow, g.rowH, live);
+                    const coopui::PanelBand sb = coopui::PanelSlotBand(lays[k], coopui::kSlotStatus, g.rowH, live);
+                    const coopui::PanelBand bb = coopui::PanelSlotBand(lays[k], coopui::kSlotButtons, g.rowH, live);
+                    const coopui::PanelPairRect jp = coopui::PanelLabelBoxIn(g.innerW, coopui::PanelGapOf(g.rowH), pb, coopui::PanelPortBoxW(g.innerW), 0);
+                    if (jp.top + jp.h > sb.top || sb.top + sb.h > bb.top)
+                        Fail("T-793: JOIN GAME's status area overlaps PORT or BACK / JOIN at " + I(sw[r]) + "x" + I(sh[r]) + ", layout "
+                             + I(lays[k]) + ", " + I(live) + " half-rows");
+                }
+            }
+        }
     }
 }
 
@@ -3289,13 +3278,8 @@ void t_t612_world_keep()
                     || ui.find("PersonActiveRows(text, StoreWorldPlayerId(g_hostProfWorld))") == std::string::npos)
                     Fail("HOST GAME's profile row or CHANGE's list does not read the id through the world's aliases.txt");
             }
-            const size_t lo = server.find("void LoadOwner()"), loEnd = lo == std::string::npos ? std::string::npos : server.find("\n}", lo);
-            int ownerResolves = 0;
-            for (size_t at = lo; lo != std::string::npos && (at = server.find("worldkeep::AliasResolve(g_aliases, g_ownerId)", at)) != std::string::npos && at < loEnd; ++at)
-                ++ownerResolves;
-            if (ownerResolves < 2) Fail("LoadOwner does not resolve the operator's id through the alias table in both branches (--owner and owner.txt)");
-            const size_t la = server.find("LoadAliases();   /*"), lw = server.find("\n    LoadOwner();");
-            if (la == std::string::npos || lw == std::string::npos || la > lw) Fail("the alias table is not read before the operator is");
+            /* T-1158 step 7b: no operator is read by player id any more (owner.txt and --owner are gone, owner 1369 b) */
+            if (server.find("void LoadOwner()") != std::string::npos || server.find("g_ownerId") != std::string::npos) Fail("the world server still names an operator by player id");
             const size_t rt = server.find("void OnResearchTake(");
             const size_t rr = rt == std::string::npos ? std::string::npos : server.find("in[i].player = worldkeep::AliasResolveKey(g_aliases, in[i].player)", rt);
             const size_t rc = rt == std::string::npos ? std::string::npos : server.find("me->second != in[i].player", rt);
@@ -3648,7 +3632,7 @@ void t_t36_reset_world()
         const char* keep[] = { "world.txt", "World.TXT", "world.txt.1", "world.txt.tmp", "format.txt", "slots.txt", "slots.txt.1", "profiles.txt",
                                "profiles.txt.1", "aliases.txt", "aliases.txt.1", "owner.txt", "options.txt", "mods.txt", "uid_seats.txt", "fallen.txt",
                                "teams.txt", "own_high.txt", "own_high.txt.tmp", "world.gen", "world.gen.tmp", "server.lock", "server-refused.txt",
-                               "shared-wastelands-server.log", "shared-wastelands-server.log.1", "auth.txt", "auth.txt.tmp", "access.txt", "access.txt.1", "lookalike_list.txt", "lookalike_list.txt.tmp" };
+                               "shared-wastelands-server.log", "shared-wastelands-server.log.1", "auth.txt", "auth.txt.tmp", "admin-auth.txt", "access.txt", "access.txt.1", "lookalike_list.txt", "lookalike_list.txt.tmp" };
         for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); ++i)
             if (ResetClassify(keep[i], 0) != kResetKeep) Fail(std::string("reset: '") + keep[i] + "' is not kept (" + ResetKindName(ResetClassify(keep[i], 0)) + ")");
         if (ResetWorldGets("lookalike_list.txt", kResetKeep, 0) != kResetGetCopy || ResetWorldGets("lookalike_list.txt", kResetKeep, 1) != kResetGetCopy)
@@ -3823,7 +3807,7 @@ void t_t36_reset_split()
             Fail("split: the password file or the player list is not the name the reset keeps");
         const char* copy[] = { "slots.txt", "slots.txt.1", "profiles.txt", "aliases.txt", "owner.txt", "options.txt", "mods.txt", "uid_seats.txt", "fallen.txt",
                                "teams.txt", "own_high.txt", "world.gen", "format.txt", "server-refused.txt", "shared-wastelands-server.log", "auth.txt",
-                               "Auth.TXT", "access.txt", "access.txt.1" };
+                               "Auth.TXT", "admin-auth.txt", "access.txt", "access.txt.1" };   /* T-1255 F: admin-auth.txt kept as auth.txt is */
         for (size_t i = 0; i < sizeof(copy) / sizeof(copy[0]); ++i)
         {
             const int k = ResetClassify(copy[i], 0);
@@ -4896,7 +4880,7 @@ void t_t625_chat_pins()
 {
     const std::string lr = T313ReadFile("../common/liverelay.h");
     if (lr.empty()) Fail("could not read liverelay.h");
-    else if (lr.find("const unsigned int kInnerChat = 205;") == std::string::npos || lr.find("|| innerType == kInnerChat;") == std::string::npos
+    else if (lr.find("const unsigned int kInnerChat = 205;") == std::string::npos || lr.find("|| innerType == kInnerChat") == std::string::npos
              || cooplive::kInnerChat != 205u || !cooplive::LiveInnerRoadLocal(cooplive::kInnerChat))
         Fail("liverelay.h: kInnerChat is not 205 on the local road");
     const std::string ui = T313ReadFile("../coop-plugin/ui.cpp");
@@ -5110,6 +5094,14 @@ void t_t607_cage_ask_step()
     }
     if (step != cageask::kCageAskGiveUp || sends != cageask::kCageAskSendsMax || seen != cageask::kCageAskOwnerStates * cageask::kCageAskSendsMax)
         Fail("the ask's road is not bounded by the owner's STATEs");
+}
+void t_t2051_cage_own_word_on_hand_over()
+{
+    /* run T2051: a character handed over while caged here (inSomething 2) is recorded as caged on the new owner's word; in a bed
+       (1), standing (0) or unread (-1) it is not */
+    if (!cageask::CageOwnWordOnHandOver(2)) Fail("a character handed over in a cage is taken as this game's new arrest");
+    if (cageask::CageOwnWordOnHandOver(0) || cageask::CageOwnWordOnHandOver(1) || cageask::CageOwnWordOnHandOver(-1))
+        Fail("a character handed over outside a cage is marked caged");
 }
 void t_t607_prison_in_keeps_first_at()
 {
@@ -6256,17 +6248,12 @@ void t_t290s3a_lockout()
 void t_t290s3a_steam_id_trust()
 {
     /* STEAM_ID: believed with the secret as the first message alone; later (or in a bundle, or again) closes; without it ignored.
-       HOST_TOKEN: the owner only with the secret, off the bridge, before the HELLO. The address is an input to neither. */
+       The address is no input. */
     for (int m = 0; m < 16; ++m)
     {
         const bool token = (m & 1) != 0, first = (m & 2) != 0, inBundle = (m & 4) != 0, already = (m & 8) != 0;
         const int want = (!first || inBundle || already) ? (int)accessrule::kSteamIdLate : token ? (int)accessrule::kSteamIdBelieve : (int)accessrule::kSteamIdWrongToken;
         if (accessrule::SteamIdJudge(token, first, inBundle, already) != want) Fail("the STEAM_ID trust rule");
-    }
-    for (int m = 0; m < 8; ++m)
-    {
-        const bool token = (m & 1) != 0, bridged = (m & 2) != 0, afterHello = (m & 4) != 0;
-        if (accessrule::HostTokenProves(token, bridged, afterHello) != (token && !bridged && !afterHello)) Fail("the HOST_TOKEN rule");
     }
 }
 
@@ -6414,6 +6401,7 @@ void t_t290s3a_lock_forget()
 void t_t290s3a_export_auth()
 {
     if (worldkeep::ExportTakes("auth.txt", 0) || worldkeep::ExportTakes("AUTH.TXT", 0)) Fail("auth.txt travels with an export");
+    if (worldkeep::ExportTakes("admin-auth.txt", 0) || worldkeep::ExportTakes("Admin-Auth.txt", 0)) Fail("admin-auth.txt (an old admin key) travels with an export");
     if (!worldkeep::ExportTakes("access.txt", 0)) Fail("access.txt is left out of an export");
     if (!worldkeep::ExportTakes("repair/7/auth.txt", 0)) Fail("a file named auth.txt below the top is left out");
     if (worldkeep::ExportTakes("host.key", 0) || worldkeep::ExportTakes("HOST.KEY", 0)) Fail("host.key (the owner's secret) travels with an export");
@@ -8428,6 +8416,24 @@ void t_bagnest_push_partner()
     if (coopbag::NestMoveRoad(1, 1, 1, 1, 0, 0) != coopbag::kNestRoadPush) Fail("nested move: the six-input form no longer pushes");
     if (coopbag::NestMoveRoad(0, 1, 1, 1, 0, 0, 0) != coopbag::kNestRoadUndo || coopbag::NestMoveRoad(1, 0, 1, 1, 0, 0, 1) != coopbag::kNestRoadUndo)
         Fail("nested move: a game that does not write the box did not put both halves back");
+}
+
+/* the door records run on events, never on a clock: the timed record recheck is gone, and the area map and the area picture settling
+   call the door records */
+void t_t1141_door_events()
+{
+    const std::string doors = T313ReadFile("../coop-plugin/doors.cpp"), store = T313ReadFile("../coop-plugin/store.cpp");
+    const std::string sync = T313ReadFile("../common/doorsync.h");
+    if (doors.empty() || store.empty() || sync.empty()) { Fail("door record events: a source could not be read"); return; }
+    if (doors.find("DrRecheckSweep") != std::string::npos || doors.find("g_drRecheck") != std::string::npos || doors.find("kDrRecheckMs") != std::string::npos
+        || doors.find("s_drRecheckMs") != std::string::npos)
+        Fail("door record events: the timed record recheck (or its two-second clock) is still there");
+    if (store.find("coop::DoorsRecMapEvent(&newly);") == std::string::npos || store.find("coop::DoorsRecMapEvent(0);") == std::string::npos)
+        Fail("door record events: the applied area map or the area picture settling does not call the door records");
+    if (doors.find("if (rep != 0 || verdict == 1) drTick.push_back(doorrec::DoorRecTickMake(std::string(key), (int)st, (int)lk));") == std::string::npos
+        || doors.find("if (origin == coopdoor::kDoorOriginHolder) DrWriteRow(") != std::string::npos)
+        Fail("door record events: a local change is written only when this game holds the door's position");
+    if (sync.find("DoorServesSectorAsk") != std::string::npos) Fail("door record events: the sector ask with no caller is still there");
 }
 
 }   /* namespace suite */

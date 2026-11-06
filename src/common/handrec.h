@@ -32,7 +32,8 @@
  *   the receiver's placement as it really ended - x,y then name the square it ended on (an add may merge onto a stack or move to the
  *   first free square), got the stack there after it, pre what that square held before (0 empty). A line of an earlier shape (x1, a
  *   u:<uid> where - a uid is minted fresh at every load and names nothing after one) does not parse: it is kept on file and held, never
- *   settled.
+ *   settled. T-1181: such a line is moved to the side file pp.handover.unread (HandTakeUnread / HandSideText) - kept there, never
+ *   deleted, and no longer counted toward the caps.
  *
  * Pure: no engine, no file, no network. Tested offline (src/coop-test, t889_*).
  */
@@ -48,8 +49,13 @@ namespace hovrec {
 
 const int          kHandFamily   = 17;
 const unsigned int kHandCap      = 256;    /* lines the file keeps; only SETTLED lines (closed / returned) are dropped to fit */
+const unsigned int kHandPerOther = 64;     /* T-1181: OPEN lines (held / in) the file keeps with any one other player */
+const unsigned int kHandPerOtherOff = 0xFFFFFFFFu;   /* T-1181 review: no per-player limit - a give's receiver line (its item is already built; only the cap) */
 inline std::string HandFile() { return "pp.handover"; }
-const unsigned int kGameProtocol = 187;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it) */
+/* T-1181: lines this build cannot read, moved out of pp.handover (same records folder) - kept, never read back, never deleted */
+inline std::string HandSideFile() { return "pp.handover.unread"; }
+const unsigned int kGameProtocol = 213;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it) */
+
 
 const unsigned int kMsgHandover  = 79;     /* MSG_ITEM_HANDOVER (net/transport.h, liveenvelope.h kInnerItemHandover assert it) */
 
@@ -392,8 +398,9 @@ inline int HandFind(const std::vector<std::string>& lines, int asker, unsigned i
     return -1;
 }
 /* THE CAP: the oldest CLOSED lines go first; open lines, RETURNED lines (T-889 fold 1, review 10: kept until the receiver acknowledges
-   their CLOSED 2 - a lost CLOSED 2 is asked about again) and lines this build cannot read are never dropped.
-   1 = the file fits `cap`; 0 = it does not (only lines that are kept would be left over it). *dropped = lines removed. */
+   their CLOSED 2 - a lost CLOSED 2 is asked about again) and lines this build cannot read are never dropped (T-1181: the loader
+   moves those to the side file, HandTakeUnread). 1 = the file fits `cap`; 0 = it does not (only lines that are kept would be left
+   over it). *dropped = lines removed. */
 inline int CapDrops(int state) { return (state == kStClosed) ? 1 : 0; }
 inline int HandFit(std::vector<std::string>* lines, unsigned int cap, int* dropped)
 {
@@ -411,15 +418,30 @@ inline int HandFit(std::vector<std::string>* lines, unsigned int cap, int* dropp
     }
     return (lines->size() <= (size_t)cap) ? 1 : 0;
 }
+/* T-1181: the OPEN lines (held / in) with other player `otherSlot`, the line at index `skip` not counted (-1 none) */
+inline unsigned int HandOpenWith(const std::vector<std::string>& lines, int otherSlot, int skip)
+{
+    unsigned int n = 0;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        HandLine l;
+        if ((int)i != skip && HandLineParse(lines[i], &l) != 0 && l.otherSlot == otherSlot && IsOpen(l.state) != 0) ++n;
+    }
+    return n;
+}
 /* The line of the same transfer and role replaced, or appended; then the cap. 1 done; 0 the line would not format; -1 it does not
-   fit (the vector is then as it was). */
-inline int HandUpsert(std::vector<std::string>* lines, const HandLine& l, unsigned int cap)
+   fit (the vector is then as it was). T-1181: -2 = a NEW open line with a player who already has `perOther` open lines here (one
+   player's lines that never end cannot fill the file for everyone; the vector is as it was). A line rewritten in place is new only
+   when the line it replaces was not open - an open line already on file is always rewritten. */
+inline int HandUpsert(std::vector<std::string>* lines, const HandLine& l, unsigned int cap, unsigned int perOther = kHandPerOther)
 {
     std::string s;
     if (HandLineFormat(l, &s) == 0) return 0;
     while (!s.empty() && (s[s.size() - 1] == '\n' || s[s.size() - 1] == '\r')) s.erase(s.size() - 1);
     std::vector<std::string> v = *lines;
-    const int at = HandFind(v, l.askerSlot, l.reqId, l.holderSlot, l.role, 0);
+    HandLine was;
+    const int at = HandFind(v, l.askerSlot, l.reqId, l.holderSlot, l.role, &was);
+    if (IsOpen(l.state) != 0 && (at < 0 || IsOpen(was.state) == 0) && HandOpenWith(v, l.otherSlot, at) >= perOther) return -2;
     if (at >= 0) v[(size_t)at] = s; else v.push_back(s);
     if (HandFit(&v, cap, 0) == 0) return -1;
     lines->swap(v);
@@ -433,12 +455,173 @@ inline int HandRemove(std::vector<std::string>* lines, int asker, unsigned int r
     lines->erase(lines->begin() + (std::vector<std::string>::difference_type)at);
     return 1;
 }
+/* T-1181: THE LINES THIS BUILD CANNOT READ leave the file (an earlier shape, a later format, a damaged line): they never settle, so
+   kept here they only count toward the caps. Moved, in their order, from *lines to *unread (appended); returns how many. */
+inline int HandTakeUnread(std::vector<std::string>* lines, std::vector<std::string>* unread)
+{
+    int n = 0;
+    for (size_t i = 0; i < lines->size(); )
+    {
+        HandLine l;
+        if (HandLineParse((*lines)[i], &l) != 0) { ++i; continue; }
+        unread->push_back((*lines)[i]);
+        lines->erase(lines->begin() + (std::vector<std::string>::difference_type)i);
+        ++n;
+    }
+    return n;
+}
+/* T-1181: the side file's new text - its text as read, then every moved line it does not hold yet (a move whose rewrite of
+   pp.handover failed moves the same line again: it is written once). *added = lines appended. Nothing is ever taken out.
+   T-1181 review: a moved line is matched only against the side file's lines as read, each of them at most once - two identical
+   lines moved together are both kept (a line added during this move never stands for another). */
+inline std::string HandSideText(const std::string& sideText, const std::vector<std::string>& unread, int* added)
+{
+    if (added != 0) *added = 0;
+    std::vector<std::string> have;
+    HandSplit(sideText, &have, 0);
+    std::vector<char> matched(have.size(), 0);
+    std::string s = sideText;
+    if (!s.empty() && s[s.size() - 1] != '\n') s += '\n';
+    for (size_t i = 0; i < unread.size(); ++i)
+    {
+        if (unread[i].empty()) continue;
+        bool dup = false;
+        for (size_t k = 0; k < have.size() && !dup; ++k) if (matched[k] == 0 && have[k] == unread[i]) { matched[k] = 1; dup = true; }
+        if (dup) continue;
+        s += unread[i]; s += '\n';
+        if (added != 0) ++*added;
+    }
+    return s;
+}
 /* the largest seqE any line carries (the records sequence restarts from the index at open; a reserved E must stay below every later record) */
 inline unsigned long long HandMaxSeq(const std::vector<std::string>& lines)
 {
     unsigned long long m = 0ULL;
     for (size_t i = 0; i < lines.size(); ++i) { HandLine l; if (HandLineParse(lines[i], &l) != 0 && l.seqE > m) m = l.seqE; }
     return m;
+}
+
+/* ---- T-1181 `handtest` lever (TEST-ONLY, items.cpp HandTestCommand): a run cannot pre-fill a records file, so this lever puts
+   pp.handover into the states the T-1181 limits act on, through HovPut (the caps apply) and the file helper ----
+   THE LEVER'S LINES name the asker and holder slot kHandTestSlot, above every slot a game can hold (slotwire.h kSlotMax 1023). A
+   real transfer id is (asker, request id, holder) with this game or the other player as asker and holder, and request ids start
+   from a random 32-bit base each launch (reqserial.h) - so no request id range alone is safe, but this holder slot is: no real
+   hand-over ever names it. Such a line stays OPEN while its other player is in the world: the settle loop's QUERY goes to that
+   player, whose game answers nothing (a holder line's QUERY: only the holder the transfer names may ask; a receiver line's QUERY:
+   no holder line there, and that game is not the holder named) - and a line naming a slot no player holds is never asked at all.
+   It carries no item bytes, no squad record and no E, so nothing is ever rebuilt or looked up from it. Request ids 1, 2, ... */
+const int kHandTestSlot = 7357;
+inline int HandIsTest(const HandLine& l) { return (l.askerSlot == kHandTestSlot && l.holderSlot == kHandTestSlot) ? 1 : 0; }
+/* role kRoleDst (an `in` line, the default) or kRoleSrc (a `held` line), open, with player `otherSlot` */
+inline HandLine HandTestLine(int role, int otherSlot, unsigned int reqId, long long atUnix)
+{
+    HandLine l;
+    l.role = (role == kRoleSrc) ? kRoleSrc : kRoleDst;
+    l.state = (l.role == kRoleSrc) ? kStHeld : kStIn;
+    l.kind = kKindBox;
+    l.askerSlot = kHandTestSlot; l.holderSlot = kHandTestSlot; l.otherSlot = otherSlot;
+    l.reqId = reqId; l.atUnix = atUnix;
+    l.where = "b:handtest"; l.section = "handtest";
+    return l;
+}
+/* THE LEVER'S UNREADABLE LINE: the q1 envelope of family 17 around an x1 payload - the earlier shape this format names as never read
+   (HandLineParse refuses any payload but x2 with 16 fields) - marked "handtest" and numbered n */
+inline std::string HandTestUnreadLine(unsigned int n, long long atUnix)
+{
+    std::string p = "x1|handtest|";
+    HrPutU(&p, (unsigned long long)n);
+    std::string s = "q1\t";
+    HrPutU(&s, (unsigned long long)kHandFamily);
+    s += "\tp";
+    HrPutU(&s, (unsigned long long)kHandTestSlot);
+    s += '\t';
+    HrPutU(&s, (unsigned long long)n);
+    s += '\t';
+    HrPutU(&s, (unsigned long long)(atUnix < 0 ? 0 : atUnix));
+    s += '\t';
+    s += HrToHex(p);
+    return s;
+}
+/* its number (>= 1), 0 = not a line HandTestUnreadLine made */
+inline unsigned int HandTestUnreadNo(const std::string& line)
+{
+    std::string head = "q1\t";
+    HrPutU(&head, (unsigned long long)kHandFamily);
+    head += "\tp";
+    HrPutU(&head, (unsigned long long)kHandTestSlot);
+    head += '\t';
+    if (line.compare(0, head.size(), head) != 0) return 0;
+    const std::string::size_type tb = line.rfind('\t');
+    std::string hx = line.substr(tb + 1), p;
+    while (!hx.empty() && (hx[hx.size() - 1] == '\r' || hx[hx.size() - 1] == '\n')) hx.erase(hx.size() - 1);
+    const std::string mark = "x1|handtest|";
+    if (HrFromHex(hx, &p) == 0 || p.compare(0, mark.size(), mark) != 0) return 0;
+    unsigned long long v = 0ULL;
+    if (HrGetU(p.substr(mark.size()), 0xFFFFFFFFULL, &v) == 0 || v == 0ULL) return 0;
+    return (unsigned int)v;
+}
+/* the next request id (fill) or unreadable line number (unread) - one past the largest of the lever's own in `lines` */
+inline unsigned int HandTestNextId(const std::vector<std::string>& lines)
+{
+    unsigned int m = 0;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        HandLine l;
+        if (HandLineParse(lines[i], &l) != 0) { if (HandIsTest(l) != 0 && l.reqId > m) m = l.reqId; }
+        else { const unsigned int n = HandTestUnreadNo(lines[i]); if (n > m) m = n; }
+    }
+    return (m == 0xFFFFFFFFu) ? 0xFFFFFFFFu : m + 1u;
+}
+/* clear-test: the lever's own lines (readable and unreadable) taken out; every other line kept, in order. Returns how many. */
+inline int HandTestStrip(std::vector<std::string>* lines)
+{
+    int n = 0;
+    for (size_t i = 0; i < lines->size(); )
+    {
+        HandLine l;
+        const int mine = (HandLineParse((*lines)[i], &l) != 0) ? HandIsTest(l) : (HandTestUnreadNo((*lines)[i]) != 0 ? 1 : 0);
+        if (mine == 0) { ++i; continue; }
+        lines->erase(lines->begin() + (std::vector<std::string>::difference_type)i);
+        ++n;
+    }
+    return n;
+}
+/* count: the file's lines by role and state, the unreadable ones, the lever's, and the OPEN lines per other player (by slot) -
+   "lines=.. src.held=.. src.closed=.. src.returned=.. dst.in=.. unreadable=.. lever=.. open=p<slot>:<n>,..." ("open=none") */
+inline std::string HandTallyText(const std::vector<std::string>& lines)
+{
+    unsigned long long held = 0, closed = 0, ret = 0, in = 0, bad = 0, test = 0;
+    std::vector<int> slot;
+    std::vector<unsigned long long> open;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        HandLine l;
+        if (HandLineParse(lines[i], &l) == 0) { ++bad; continue; }
+        if (HandIsTest(l) != 0) ++test;
+        if (l.role == kRoleDst) ++in; else if (l.state == kStHeld) ++held; else if (l.state == kStClosed) ++closed; else ++ret;
+        if (IsOpen(l.state) == 0) continue;
+        size_t k = 0;
+        while (k < slot.size() && slot[k] < l.otherSlot) ++k;
+        if (k < slot.size() && slot[k] == l.otherSlot) { ++open[k]; continue; }
+        slot.insert(slot.begin() + (std::vector<int>::difference_type)k, l.otherSlot);
+        open.insert(open.begin() + (std::vector<unsigned long long>::difference_type)k, 1ULL);
+    }
+    std::string s = "lines=";
+    HrPutU(&s, (unsigned long long)lines.size());
+    s += " src.held="; HrPutU(&s, held);
+    s += " src.closed="; HrPutU(&s, closed);
+    s += " src.returned="; HrPutU(&s, ret);
+    s += " dst.in="; HrPutU(&s, in);
+    s += " unreadable="; HrPutU(&s, bad);
+    s += " lever="; HrPutU(&s, test);
+    s += " open=";
+    if (slot.empty()) s += "none";
+    for (size_t k = 0; k < slot.size(); ++k)
+    {
+        if (k != 0) s += ',';
+        s += 'p'; HrPutI(&s, (long long)slot[k]); s += ':'; HrPutU(&s, open[k]);
+    }
+    return s;
 }
 
 /* ---- the decisions ---- */
@@ -539,7 +722,7 @@ const int kRcNone = 0, kRcDrop = 1, kRcRemoveCopy = 2, kRcKeep = 3;
 inline int ReceiverOnClosed(int haveIn, int value, int liveCopy, int kind)
 {
     if (haveIn == 0) return kRcNone;
-    if (value == kClosedUnknown) return kRcKeep;
+    if (value == kClosedUnknown) return kind == kKindGive ? kRcDrop : kRcKeep;   /* owner 1365: a give's line ends - its giver has no line and cannot say; a double only if the giver's lost records file comes back */
     if (value == kClosedReturned && liveCopy != 0 && kind != kKindGive) return kRcRemoveCopy;
     return kRcDrop;
 }

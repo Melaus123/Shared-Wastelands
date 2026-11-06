@@ -35,7 +35,7 @@
  *                            | u32 count (<= kWireRowsMax) | count x {u32 number, i32 slot, u32 created, u32 last played,
  *                              u32 played (56: 1 = a finished save reached the world), u32 len + name, u32 len + faction}
  *        T-368 (store protocol 70), two more answers, each with its own body (AnswerKindOf reads the first byte):
- *          4 FACTION: u8 4 | u8 verdict (kFacBack / kFacMoved / kFacDefault) | u32 subject number | u32 len + the name judged
+ *          4 FACTION: u8 4 | u8 verdict (kFacBack / kFacMoved / kFacDefault; kFacKeep from protocol 140, T-717) | u32 subject number | u32 len + the name judged
  *                     | u32 len + the name the profile's faction has now - to the sender of a kind 3 / 5 whose name the world changed
  *          5 TAKEN:   u8 5 | u8 0 | u32 count (<= kTakenWireMax) | count x {u32 len + faction name} - every OTHER profile's faction
  *                     name in the world, connected or not: to a game at its admission and to every admitted game at each change
@@ -866,12 +866,26 @@ inline bool FactionForRow(const std::string& name, std::string* out)
 }
 /* kFacBack / kFacMoved / kFacDefault (T-368): the world gives the profile's faction another name - the row takes *facOut and the sender
    is told (the FACTION answer). Back = a RENAME to a name another profile holds: the row keeps its name and the game goes back to it;
-   Moved = the world LOADED with a name another profile holds: the row and the game take the lowest free "Nameless <n>"; Default = the
+   Moved = the world LOADED with a name another profile holds: the row and the game take the row's own "Nameless <n>" while no other
+   profile holds it, else the lowest free one (T-717 review LOW 3); Default = the
    world LOADED with Kenshi's own default "Nameless" (owner 471: every player's default faction is its own "Nameless <n>"), whoever the
    player is, operator included, played or not: the profile's own "Nameless <n>" (its row's, while no other profile holds that, else
    the lowest free one). Kenshi's plain "Nameless" is therefore never a profile's faction name after a load. */
+/* kFacKeep (T-717, owner 676; store protocol 140): the world LOADED with a name other than the one the profile's row holds by right (no
+   row made earlier holds it) - the row keeps its newer name and the game takes it, silently. Only a name a player GAVE is kept: a
+   placeholder the world gave the row (FactionIsPlaceholder) never wins over the save's name (owner 1403). Order at a load: Kenshi's
+   default (C, kFacDefault), the row's own name (A, kFacKeep), then a clash (B / D, kFacMoved). */
+/* A row's faction name the world gave it, not a player: a new profile's "Nameless <n>" (store_main.cpp, NEW), an adopted slot's
+   "Profile <n>" (AdoptSlotKeys), or (T-717 review LOW 1) a faction name equal to the row's player name - what NEW wrote before T-368
+   (commit 855c3c12b), kept by a row that never had a load since. That form is counted rather than gating case A on `played`: such an
+   old row was admitted, so RowParse marks it played, and only the name says the world gave it. A player who chose their own player
+   name as their faction name loses only case A (the save's name is judged by the name rule, as before T-717). */
+inline bool FactionIsPlaceholder(const Row& r)
+{
+    return IsNamelessNumbered(r.faction) || r.faction == "Profile " + PNum((long long)r.num) || (!r.name.empty() && NameSame(r.faction, r.name));
+}
 enum FactionVerdict { kFacSet = 0, kFacSame = 1, kFacRefusedSender = 2, kFacRefusedUnknown = 3, kFacRefusedName = 4,
-                      kFacBack = 5, kFacMoved = 6, kFacDefault = 7 };
+                      kFacBack = 5, kFacMoved = 6, kFacDefault = 7, kFacKeep = 8 };
 /* Kind 3 FACTION (rename 0: the name the game's world loaded with) or kind 5 RENAME (rename 1: the name the player just gave) from the
    connection admitted under senderKey (its slot key; empty = not admitted). Only that profile's own row may be written: the number must
    name the sender's profile. Every verdict from kFacSet on fills *rowOut and *facOut (the row's faction name after it); kFacSame,
@@ -895,13 +909,21 @@ inline int FactionDecide(const std::vector<Row>& rows, const std::string& sender
         *facOut = (IsNamelessNumbered(r.faction) && FactionHolder(rows, r.faction, i) < 0) ? r.faction : NamelessFree(rows, i);
         return kFacDefault;
     }
+    /* T-717 case A - after Kenshi's default (C), before a clash (B / D): at a load, a row that holds a name by right keeps it over an
+       older name in the save. The same name in another case or spacing is the name rule's (a re-case). */
+    if (rename == 0 && !r.faction.empty() && !FactionIsPlaceholder(r) && !NameSame(r.faction, f) && !FactionHeldEarlier(rows, r.faction, i))
+    {
+        *facOut = r.faction;
+        return kFacKeep;
+    }
     if (FactionHolder(rows, f, i) < 0 || (NameSame(r.faction, f) && !FactionHeldEarlier(rows, f, i)))
     {
         *facOut = f;
         return r.faction == f ? kFacSame : kFacSet;
     }
     if (rename != 0) { *facOut = r.faction; return kFacBack; }
-    *facOut = NamelessFree(rows, i);
+    /* T-717 review LOW 3: as Default (C) does, the row's own "Nameless <n>" while no other profile holds it, else the lowest free one */
+    *facOut = (IsNamelessNumbered(r.faction) && FactionHolder(rows, r.faction, i) < 0) ? r.faction : NamelessFree(rows, i);
     return kFacMoved;
 }
 /* T-368: every OTHER active profile's faction name - what the game of profile (person, num) may not take. A name this profile holds by
@@ -932,15 +954,19 @@ inline bool FactionTakenIn(const std::vector<std::string>& taken, const std::str
    carries the answer's name already. Otherwise the answer judged `asked`; when the faction no longer carries that name (the player
    renamed again, or another world loaded) the answer is old and is dropped - the newer name was sent and the world's judgement of it
    settles what the world owed (FactionOwedAfter). */
-enum FactionApply { kFacApplyDrop = 0, kFacApplySilent = 1, kFacApplyBackBox = 2, kFacApplyMovedBox = 3, kFacApplyHave = 4 };
+/* T-717 (owner 677 A, 678): a Moved answer (B, a real clash) is said on Kenshi's message line (kFacApplyMovedLine,
+   coopui::FactionMovedLineText), not in a box - and not at all when the name judged was an automatic "Nameless <n>" (D: the player
+   never chose it). Keep (A) is silent (owner 676). */
+enum FactionApply { kFacApplyDrop = 0, kFacApplySilent = 1, kFacApplyBackBox = 2, kFacApplyMovedLine = 3, kFacApplyHave = 4 };
 inline int FactionApplyDecide(int verdict, const std::string& current, const std::string& asked, const std::string& to)
 {
-    if (to.empty() || (verdict != kFacBack && verdict != kFacMoved && verdict != kFacDefault)) return kFacApplyDrop;
+    if (to.empty() || (verdict != kFacBack && verdict != kFacMoved && verdict != kFacDefault && verdict != kFacKeep)) return kFacApplyDrop;
     if (to == current) return kFacApplyHave;
     std::string cur;
     if (!FactionForRow(current, &cur) || cur != asked) return kFacApplyDrop;
     if (verdict == kFacBack) return kFacApplyBackBox;
-    if (verdict == kFacMoved) return kFacApplyMovedBox;
+    if (verdict == kFacMoved) return IsNamelessNumbered(asked) ? kFacApplySilent : kFacApplyMovedLine;
+    if (verdict == kFacKeep) return kFacApplySilent;
     return current == kEngineFactionDefault ? kFacApplySilent : kFacApplyDrop;
 }
 /* T-368, the game's side: what the game tells the world after a FACTION answer (`how` = FactionApplyDecide). Seen = kind 6, the faction
@@ -962,8 +988,23 @@ enum FactionOwed { kFacOwedKeep = 0, kFacOwedClear = 1, kFacOwedReplace = 2 };
 inline int FactionOwedAfter(int verdict)
 {
     if (verdict == kFacSet || verdict == kFacSame) return kFacOwedClear;
-    if (verdict == kFacBack || verdict == kFacMoved || verdict == kFacDefault) return kFacOwedReplace;
+    if (verdict == kFacBack || verdict == kFacMoved || verdict == kFacDefault || verdict == kFacKeep) return kFacOwedReplace;
     return kFacOwedKeep;
+}
+/* T-717 (review LOW 1): a clash is told once per change, not at every rejoin. A load judged Moved again to the very name the row took
+   from that same clash, after its game acknowledged that move (toldKey = FactionToldKey of the acknowledged Moved answer; the save
+   still carries the old name - the player has not saved since), changes nothing: the row keeps its name and the game takes it
+   silently, as kFacKeep. Any other judgement is returned as it is. */
+inline std::string FactionToldKey(const std::string& asked, const std::string& name) { return asked + "\t" + name; }
+/* T-717 review LOW 2: the told-once memory of a profile is forgotten whenever its row's faction name changes (any verdict that writes
+   the row; a Moved answer is remembered again at its acknowledgement). A repeat kept silently leaves the row, and the memory, as is. */
+inline void FactionToldAfterRow(std::map<std::string, std::string>* told, const std::string& key, const std::string& before, const std::string& after)
+{
+    if (before != after) told->erase(key);
+}
+inline int FactionToldOnce(int verdict, const std::string& rowBefore, const std::string& asked, const std::string& fac, const std::string& toldKey)
+{
+    return (verdict == kFacMoved && fac == rowBefore && !toldKey.empty() && toldKey == FactionToldKey(asked, fac)) ? kFacKeep : verdict;
 }
 /* T-201 PP6' (owner 175): kind 4 SAVED from the connection admitted under senderKey - only that profile's own row is marked played. */
 enum SavedVerdict { kSavedSet = 0, kSavedSame = 1, kSavedRefusedSender = 2, kSavedRefusedUnknown = 3 };
@@ -983,7 +1024,8 @@ inline const char* FactionVerdictName(int v)
     {
     case kFacSet: return "set"; case kFacSame: return "same"; case kFacRefusedSender: return "notYourProfile";
     case kFacRefusedUnknown: return "unknown"; case kFacRefusedName: return "name";
-    case kFacBack: return "takenChangedBack"; case kFacMoved: return "takenRenamed"; case kFacDefault: return "default"; default: return "other";
+    case kFacBack: return "takenChangedBack"; case kFacMoved: return "takenRenamed"; case kFacDefault: return "default";
+    case kFacKeep: return "worldNameKept"; default: return "other";
     }
 }
 
@@ -1126,7 +1168,7 @@ inline bool DecodeFactionAnswer(const std::vector<char>& b, FactionAnswer* a)
 {
     if (b.size() < 2 || (unsigned char)b[0] != kAnsFaction) return false;
     FactionAnswer o; o.verdict = (unsigned char)b[1];
-    if (o.verdict != kFacBack && o.verdict != kFacMoved && o.verdict != kFacDefault) return false;
+    if (o.verdict != kFacBack && o.verdict != kFacMoved && o.verdict != kFacDefault && o.verdict != kFacKeep) return false;
     size_t at = 2;
     if (!WGetU32(b, &at, &o.num) || !WGetStr(b, &at, &o.asked) || !WGetStr(b, &at, &o.name) || at != b.size()) return false;
     *a = o;

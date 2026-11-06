@@ -26,6 +26,9 @@ void CopyNoteOwnerKo(unsigned int uid, bool ko);   // crash1c (R3a): write the o
 // The per-copy word tables (the owner's hunger, knocked-out and dead words per copy uid): uid's words are forgotten - its copy
 // was removed here, or its ownership moved to or from this game. MAIN THREAD.
 void MedicalForgetCopy(unsigned int uid);
+// T-1205 review fold 10: uid's god row alone is forgotten - a shared-save twin withdrawn (not destroyed) when its peer goes keeps
+// its body here, but the god mode was its gone owner's word. MAIN THREAD.
+void GodForgetCopy(unsigned int uid);
 // ... every copy's words are forgotten - world teardown, session end. MAIN THREAD.
 void MedicalForgetAllCopies();
 // par6 (parity P6): death is the owner's. ANY THREAD - the declareDead hook (worldstate.cpp) asks this first: true lets
@@ -75,6 +78,12 @@ int StealthKnockOutOwned(unsigned int uid, float skill01, float* koTimerOut);
 // P11 fold 1 (T652) TEST-ONLY (`koself`): hold an owned character's wake-up clock at least `seconds` (never shorter),
 // then push its STATE. The clock after, -1 = not ours / no character / unreadable. MAIN THREAD.
 float KnockClockAtLeastOwned(unsigned int uid, float seconds);
+// T-1205 the admin toolbox's /medic, /heal and /restore (level, below) on a character THIS game drives, then its STATE at once (see
+// medical.cpp). 1 healed (*stillOut = still knocked out; /restore: *grown = the lost limbs grown back, *robot = the robotic limbs
+// left on), -2 dead (nothing done), -1 not driven here / unreadable / no road to grow a lost limb back (nothing done). MAIN THREAD,
+// the K2 safe point.
+enum { kAdminMedic = 0, kAdminHeal = 1, kAdminRestore = 2 };
+int AdminHealOwned(unsigned int uid, int level, int* stillOut, int* grown, int* robot);
 
 // PROBE P017 (H011 / F134) - DIAGNOSTIC ONLY, changes nothing.
 //
@@ -114,6 +123,15 @@ std::string LatchString(::Character* c);
 //
 // Returns true if something was actually sent (owned, resolvable, link up).
 bool StatePush(unsigned int uid);
+
+// T-1205 /god (medical.cpp's god table): god mode for a character this game owns is this game's memory alone; a copy's comes from
+// its owner's STATE. GodOn: ANY THREAD. GodSet: MAIN THREAD, the /god job only - 1 changed, 0 already so, -1 the table is full.
+// GodCharacterAnyThread: ANY THREAD, the targeting gates (peace.cpp) - any character, own or a copy. ApplyOwnerGod: MAIN THREAD,
+// a copy's STATE (net/session.cpp).
+bool GodOn(unsigned int uid);
+int GodSet(unsigned int uid, bool on);
+bool GodCharacterAnyThread(const void* character);
+void ApplyOwnerGod(unsigned int uid, unsigned int latchBits);
 
 // F147 - THE LATCH BLOCK NOW TRAVELS, and this is attempt 3 at "the peer should derive prone
 // itself". Recorded as attempt 3 rather than dressed up as something else.

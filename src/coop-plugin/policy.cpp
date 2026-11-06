@@ -118,6 +118,8 @@
 #include "../common/thingaccess.h"   /* T-942: own / teammate / friend / stranger (owner 1187 a, 1188) */
 #include "../common/npcsense.h"      /* T-943: the NPC senses' and memory's player tests, their forms and the teammate list */
 #include "game/GameWorld.h"       /* T-546 step 7: the `team orders` lever walks activeCharacters() */
+#include "game/Faction.h"         /* T-1191: the `itemtest bfac` line names the building's faction (getName) */
+#include "../common/rcgive.h"     /* T-1191: BFac / BFacText - that line's pure form */
 #include "coop_log.h"
 #include "hooks.h"   /* coop::AddHook (own MinHook) / HookStatus - same include items.cpp uses for its four hooks */
 #include "speech.h"  /* T-737: TalkCursorHoverEnter / Leave - the talk cursor's test runs only inside characterSelected */
@@ -288,7 +290,11 @@ volatile LONGLONG g_ownedByPeerDoorPanelPassedThrough = 0;
    allowedMember: requests the gate allowed because requester and owner share a team; click / doorPanel / cursor / doorCursor:
    engine answers made "this player's own" for a teammate's building at the click sites, the door panel and the two cursors. */
 volatile LONGLONG g_allowedMember = 0, g_memberClick = 0, g_memberDoorPanel = 0, g_memberCursor = 0, g_memberDoorCursor = 0;
+volatile LONGLONG g_friendCursor = 0;   /* T-1241: an allowed friend's object (kit table, swaccess::CursorLikeOwn) shown with this player's own cursor */
 volatile LONGLONG g_memberCursorOther = 0;   /* a teammate's type-8 useable with no container: counted, not remapped (as for anyone) */
+/* T-1222 (owner 1444): a world resource node (an ore rock) is nobody's - allowedWorldNode: requests the gate allowed for one;
+   click / cursor: engine answers made "this player's own" for one at the answered click sites and the useable cursor */
+volatile LONGLONG g_allowedWorldNode = 0, g_worldNodeClick = 0, g_worldNodeCursor = 0;
 // P7c / review-p6u MEDIUM-3: a vtable pointer, a Complete Object Locator or a TypeDescriptor that fell OUTSIDE
 // this module's image, rejected by the P029 walk. It also counts the case where the image size itself could
 // not be read - the walk fails CLOSED rather than falling back to a looser bound - and `imageSize` on the
@@ -498,14 +504,23 @@ char detour_OwnedByAPlayerFaction(void* building)
        gate, the click handler, the door panel) whatever the policy and whatever its class. While this game's player is in no team
        nothing more is read than before; the caller is worked out first, so a caller that is never answered (the navmesh worker,
        serialise, createBuilding ...) costs the stand-in pointer compare it always did and never reaches the teammate test. */
-    const bool shared = coop::BasePolicyValue() == coop::kPolicyShared;
-    const bool inTeam = MineInTeam();
-    if (!inTeam && !shared) return a;
     const uintptr_t base = g_base;
     const uintptr_t rva = (base != 0 && (uintptr_t)ret > base) ? ((uintptr_t)ret - base) : 0;
     const bool clickGate = (kGetDefaultTaskRet1 != 0 && rva == (uintptr_t)kGetDefaultTaskRet1)
                         || (kGetDefaultTaskRet2 != 0 && rva == (uintptr_t)kGetDefaultTaskRet2);   /* an empty row is no caller */
     const bool clickHandler = !clickGate && PolicyIsClickRet(rva);
+    /* T-1222 (owner 1444): a world resource node (an ore rock) is nobody's - at the click gate and the click handler it opens for
+       this player whatever the policy and the team, as single player opens a rock after its miner's claim (the claim itself is
+       skipped, build.cpp detour_setfaction). The node test is made only at those sites (main thread); every other caller keeps
+       orig's answer. */
+    if (swaccess::NodeClickOpens(a, clickGate || clickHandler, (clickGate || clickHandler) ? coop::WorldNodeLiveAnyThread(building) : 0))
+    {
+        ::InterlockedIncrement64(&g_worldNodeClick);
+        return 1;
+    }
+    const bool shared = coop::BasePolicyValue() == coop::kPolicyShared;
+    const bool inTeam = MineInTeam();
+    if (!inTeam && !shared) return a;
     const bool doorPanel = !clickGate && !clickHandler && kDoorPanelRetNotAnswered != 0 && rva == (uintptr_t)kDoorPanelRetNotAnswered;
     const bool answered = clickGate || clickHandler || doorPanel;
     if (!answered && !shared) return a;   /* a team never changes these callers' answer */
@@ -576,7 +591,17 @@ unsigned int detour_UseableCursor(void* self)
 {
     const unsigned int a = orig_UseableCursor(self);
     if (a != kCursorPickLock && a != kCursorLoot && a != kCursorTypeEightNoContainer) return a;
-    const bool member = CursorTeammateObject(self);   /* T-546 step 4: a teammate's object of any class, whatever the policy */
+    /* T-1222 (owner 1444): a world resource node (an ore rock) shows this player's own cursor, as its click now opens it - the
+       stranger's loot / pick-lock answers only; a type-8 answer stays as it is (below) */
+    if (swaccess::NodeClickOpens(0, a != kCursorTypeEightNoContainer, (a != kCursorTypeEightNoContainer) ? coop::WorldNodeLiveAnyThread(self) : 0))
+    {
+        ::InterlockedIncrement64(&g_worldNodeCursor);
+        return kCursorOwnUse;
+    }
+    const bool mate = CursorTeammateObject(self);   /* T-546 step 4: a teammate's object of any class, whatever the policy */
+    /* T-1241 (run T2056): an allowed friend's object (the kit table's class, as the take's stealing decision reads it) is shown as a
+       teammate's - one answer for the cursor and the take (swaccess::CursorLikeOwn) */
+    const bool member = swaccess::CursorLikeOwn(mate, mate ? (int)swaccess::kTeam : coop::PolicyKitClassOf(FactionOfBuildingPod(self)));
     if (!member && !CursorIsPeerObject(self)) return a;
     if (!member)
     {
@@ -588,10 +613,10 @@ unsigned int detour_UseableCursor(void* self)
         // A type-8 useable with no container and no lock. An own one answers 9, so this IS a mismatch - but
         // nothing has characterised what such an object is, and remapping an answer we cannot name is how a UI
         // stops matching behaviour. Counted, not changed; the register carries it as the residual.
-        ::InterlockedIncrement64(member ? &g_memberCursorOther : &g_cursorOtherAnswer);
+        ::InterlockedIncrement64(mate ? &g_memberCursorOther : &g_cursorOtherAnswer);
         return a;
     }
-    ::InterlockedIncrement64(member ? &g_memberCursor : &g_cursorRemapped);
+    ::InterlockedIncrement64(mate ? &g_memberCursor : (member ? &g_friendCursor : &g_cursorRemapped));
     return kCursorOwnUse;
 }
 // A door's own locked answer is 0xE and a stranger's is 0xF; both sides answer 0xC unlocked. UNTIL doors1 the 0xF was
@@ -993,6 +1018,94 @@ int g_resHeld = 0;
 /* the teammate cells of one stub set to the given factions (MAIN THREAD, PolicyTeammateFactions); the count held */
 int MateCellsWrite(BoxCells* c, void* const* facs, int n) { return teamstub::MateCellsWrite(c->cell, kBoxCells, facs, n); }
 
+/* ---- T-1150 (owner 1491 a): THIS PLAYER'S WORKERS HAUL INTO A TEAMMATE'S STORAGE AND MACHINES ------------------------------------
+   The engine's 'nearest finished building that takes item kind X' search (1.0.65 0x59A240 / 1.0.68 0x59ACD0: storage, production,
+   furnace and crafting buildings that are built and accept the item; called by hauling 0x997A80 at 0x997B17 / 0x997B9A and the orders object's 0x5A2200 /
+   0x5A4F10) keeps a building of the searcher's own faction; for any other faction it asks 'counts as the player' (0x855CF0 through
+   0x4110A) on the searcher and then, inline (Read, capstone on both Steam builds, 1.0.65 shown; 1.0.68 0x59AE2A the same bytes):
+     0x59A397  call [rax+0x58]                               the building's owner faction (rax)
+     0x59A39A  48 83 B8 50 02 00 00 00   cmp qword [rax+0x250], 0   its PlayerInterface*
+     0x59A3A2  0F 84 BC 00 00 00         je 0x59A464                 EQUAL (ZF=1): not a player's - the building is skipped
+     0x59A3A8  test r15, r15 ...                                     NOT EQUAL (ZF=0): a player's building stays a candidate
+   A teammate's buildings on this game belong to that teammate's stand-in faction, which has no PlayerInterface, so this player's
+   workers never hauled into them (row T-1150, 05-findings 'T-943 THE THREE UNCLEAR SITES READ'). THE FIX: the 8-byte test is
+   replaced (E9 rel32 + 3 NOPs, ending at the je) by the box test's stub (Test8Patch: the original test - a player faction keeps the
+   engine's answer - else the teammate cells, a match giving ZF=0 and counted in hits, else the original test again, ZF=1 as before),
+   back to the je at site + 8. The cells are the team table's factions, written with the others (PolicyTeammateFactions, main thread,
+   only when they change; emptied while a world loads or is torn down, team.cpp), and compared at the moment of the test - a player
+   who leaves the team stops matching at the next table change. Teammates only: a friend's and a stranger's buildings and every NPC
+   faction keep the engine's skip, whatever the base-access option (that option gates friends' chests; teammates always share the
+   whole base - swaccess::Classify, rulesfile.h). A searcher that does not count as the player (an NPC, a teammate's copy here)
+   never reaches the test. The search may run on the AI worker thread: the stub reads only rax and its own page, calls nothing and
+   writes no register. What a haul then puts into the teammate's building goes, where another game holds the box, as a box give to
+   the holder (items.cpp ItOwnerGive); what is inside a player's building is that building owner's (boxowner.h decision 2), as
+   the game treats any storage (the item itself carries no owner here - Inferred). Written once at InstallPolicy. */
+unsigned long long kHaulSearchTestRva = 0; static AddrReg kHaulSearchTestRva_reg("HaulStoreSearchOwnerTest", &kHaulSearchTestRva);   /* Steam_1.0.65 0x59A39A - a patch site, not a function */
+using teamstub::kHaulSearchTestOrig;   /* the test, then its je's opcode (src/common/teamstub.h, shared with the tests) */
+typedef char kHaulOrigIsTest8[(teamstub::kHaulSearchOrigLen == 10 && teamstub::kHaulSearchTestLen == 8) ? 1 : -1];   /* Test8Patch's shape */
+BoxCells* g_haulCells = 0;
+const char* g_haulWhy = "not tried";
+int g_haulHeld = 0;
+
+/* ---- T-1150 SECOND GATE: THE SEARCH'S CANDIDATE LIST KEEPS A TEAMMATE'S BUILDING ------------------------------------------------
+   The search above takes its candidates from the engine's gather (1.0.65 0x8CAFD0 / 1.0.68 0x8CBEA0, called by the search at
+   1.0.65 0x59A2C2, row HaulSearchGatherRet = its return 0x59A2C7 / 1.0.68 0x59AD57): the worker's town's buildings in range, else
+   the nearest town's, else every loaded area's (0x9FF7C0 / 0x9FAB00). For a searcher of a player faction both roads ask the
+   engine's owner filter (row OwnershipsMayUse, 1.0.65 0x6207A0 / 1.0.68 0x621230: bool(record, building, who)) with the player's
+   one global ownership record (0x794B00). Read (decomp 1.0.65): the filter keeps the record's own faction's and its own town's
+   buildings; for any other faction it drops an enemy's (0x6B2380) and then EVERY building with an inventory (vt+0x160) - a box,
+   a furnace, a machine - so a teammate's stand-in-owned storage never reached the compare at 0x59A39A. THE FIX (per site, F1038):
+   the gather is hooked and, only when called from the storage search (its return address), marks this thread for the call; the
+   filter is hooked and, only while that mark is set and only where the engine dropped the building, keeps a building whose owner
+   faction (vt+0x58) is in the teammate cells above (g_haulCells, the same team list). Every other caller of the filter (bed use
+   0x330A70, the AI's use / take finders 0x8C9700 / 0x8C97A0 / 0x8CDD10 / 0x8CF8A0 / 0x8DA0A0 / 0x8DA640, the other 17 callers of
+   the gather 0x9FF7C0) keeps the engine's answer. Only built when the compare is patched (g_haulCells): without it a kept
+   teammate's building would be skipped at 0x59A39A anyway. A searcher that does not count as the player is still skipped there.
+   The search may run on the AI worker thread: the mark is a thread slot (TlsAlloc - this DLL loads late), and the cells are read
+   as the stub reads them. Written once at InstallPolicy. */
+unsigned long long kHaulGatherRva = 0;    static AddrReg kHaulGatherRva_reg("HaulCandidatesGather", &kHaulGatherRva);     /* Steam_1.0.65 0x8CAFD0 */
+unsigned long long kHaulFilterRva = 0;    static AddrReg kHaulFilterRva_reg("OwnershipsMayUse", &kHaulFilterRva);         /* Steam_1.0.65 0x6207A0 */
+unsigned long long kHaulGatherRetRva = 0; static AddrReg kHaulGatherRetRva_reg("HaulSearchGatherRet", &kHaulGatherRetRva); /* Steam_1.0.65 0x59A2C7 - ret */
+typedef void (*HaulGatherFn)(void* who, void* list, unsigned int kinds);
+typedef char (*HaulFilterFn)(void* record, void* building, void* who);
+HaulGatherFn orig_HaulGather = 0;
+HaulFilterFn orig_HaulFilter = 0;
+DWORD g_haulPoolTls = TLS_OUT_OF_INDEXES;
+volatile LONGLONG g_haulPoolHits = 0;
+int g_haulPoolHooked = 0;
+const char* g_haulPoolWhy = "not tried";
+
+/* ANY THREAD: the storage search's own call marks this thread for the gather's length; every other caller runs the engine's as is */
+void detour_HaulGather(void* who, void* list, unsigned int kinds)
+{
+    if (g_haulPoolTls == TLS_OUT_OF_INDEXES || kHaulGatherRetRva == 0
+        || (unsigned long long)(uintptr_t)_ReturnAddress() != (unsigned long long)(g_base + (uintptr_t)kHaulGatherRetRva))
+    {
+        orig_HaulGather(who, list, kinds);
+        return;
+    }
+    LPVOID prev = ::TlsGetValue(g_haulPoolTls);
+    ::TlsSetValue(g_haulPoolTls, (LPVOID)1);
+    __try { orig_HaulGather(who, list, kinds); }
+    __finally { ::TlsSetValue(g_haulPoolTls, prev); }
+}
+
+/* ANY THREAD: the engine's answer, except a building it dropped is kept while the storage search gathers on this thread and the
+   building's owner faction is a teammate's */
+char detour_HaulFilter(void* record, void* building, void* who)
+{
+    const char keep = orig_HaulFilter(record, building, who);
+    if (keep != 0 || building == 0 || g_haulCells == 0 || g_haulPoolTls == TLS_OUT_OF_INDEXES) return keep;
+    const int inSearch = (::TlsGetValue(g_haulPoolTls) != 0) ? 1 : 0;
+    if (inSearch == 0) return keep;
+    typedef void* (*FactionOfFn)(void*);
+    void* fac = (*(FactionOfFn*)(*(char**)building + 0x58))(building);   /* the building's owner faction, as the filter reads it */
+    const int mate = teamstub::MateCellsHas(g_haulCells->cell, kBoxCells, fac);
+    if (teamstub::HaulPoolPass((int)keep, inSearch, mate) == 0) return keep;
+    ::InterlockedIncrement64(&g_haulPoolHits);
+    return 1;
+}
+
 /* ---- T-1128 review HIGH 1: A COPY WORKER'S RESEARCH IS COUNTED ON ITS OWN GAME ONLY ---------------------------------------------
    ResearchBuilding::operate (row ResearchOperate: 1.0.65 0x29B890 / 1.0.68 0x29B8D0, the ResearchBuilding vtable's +0x4B0 on both
    builds - the slot ProductionBuilding::operate fills, items.cpp detour_prodOperate) is void(bench, Character* who, float dt): rcx the
@@ -1105,7 +1218,8 @@ int FoliageTownTestPatch(uintptr_t site)
    1  the stealing decision 0x710B70 (1.0.68 0x711740), InventoryGUI's 'is this move stealing?' for every item move between two
       windows (box or character on each side; 0x713150 right-click / shift-click, 0x714990 drop, 0x7118C0) and the box window's
       'Stealing chance' label (0x711D50:71): a function hook. The engine's answer first (it also makes the windows' records); a
-      'stealing' answer becomes 'not stealing' when the side least this player's own is a teammate's or an allowed friend's.
+      'stealing' answer becomes 'not stealing' when the side least this player's own is a teammate's or an allowed friend's, and
+      (T-1222, before the table is asked) for a move between an ore rock's window and this player's own (NodeTakeClearsStealing).
    2  the item hover cursor 0x7FB8A0: `cmp qword [rax+0x250],0 ; jne` at 0x7FBA00 (1.0.68 0x7FC5A0), then the +0x1D0 test and the
       stealing cursor 0x15 / ALT hint: a cell stub (crime.cpp's sight stub) - a teammate's or allowed friend's owner takes the jne as
       a player faction does.
@@ -1137,6 +1251,7 @@ int g_kitCount[swaccess::kWhoCount];     /* the table's rows by class at the las
 /* the per-site counters: [team, friend allowed, friend refused, stranger] (swaccess::CounterOf) */
 volatile LONG64 g_stealJudged[swaccess::kCounters];   /* site 1: the engine said 'stealing' (team / friend cleared, the rest kept) */
 volatile LONG64 g_stealOffMain = 0;                    /* site 1 judged off the main thread (the engine's thread is measured, not assumed) */
+volatile LONG64 g_stealWorldNode = 0;                  /* site 1: a rock's window and this player's own - 'stealing' cleared (T-1222) */
 volatile LONG64 g_tradeJudged[swaccess::kCounters];   /* site 3: window opens on another player's thing */
 volatile LONG64 g_tradeNoWindow = 0;                   /* site 3: an awake character of a stranger / refused friend: no window */
 volatile LONG64 g_tradeNever = 0;                      /* site 3: the caller's choice changed to 'never a shop window' */
@@ -1282,18 +1397,20 @@ void KitListChanged() { KitBuild(false); g_kitDirty = true; }
 typedef char (*StealFlagFn)(void*, void*);
 StealFlagFn orig_StealFlag = 0;
 typedef void* (*KitGetFn)(void*);
-int KitWindowFactionPod(void* win, void** fac)
+int KitWindowOwnerPod(void* win, void** owner, void** fac)
 {
     __try
     {
+        *owner = 0;
         *fac = 0;
         if (!Plaus(win)) return 0;
-        void* owner = ((KitGetFn)((*(void***)win)[0x80 / 8]))(win);
-        if (!Plaus(owner)) return 0;
-        *fac = ((KitGetFn)((*(void***)owner)[0x58 / 8]))(owner);
+        void* o = ((KitGetFn)((*(void***)win)[0x80 / 8]))(win);
+        if (!Plaus(o)) return 0;
+        *owner = o;
+        *fac = ((KitGetFn)((*(void***)o)[0x58 / 8]))(o);
         return 1;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *owner = 0; *fac = 0; return 0; }
 }
 int KitObjectFactionPod(void* obj, void** fac)
 {
@@ -1309,15 +1426,29 @@ int KitObjectFactionPod(void* obj, void** fac)
 char detour_StealFlag(void* clicked, void* other)
 {
     const char a = orig_StealFlag(clicked, other);
-    if (a == 0 || clicked == other || g_kitN == 0) return a;
+    if (a == 0 || clicked == other) return a;
+    void* oa = 0;
+    void* ob = 0;
     void* fa = 0;
     void* fb = 0;
-    if (KitWindowFactionPod(clicked, &fa) != 1 || KitWindowFactionPod(other, &fb) != 1) return a;
-    const int cls = swaccess::PairClass(KitClassOfPod(fa), KitClassOfPod(fb));
+    if (KitWindowOwnerPod(clicked, &oa, &fa) != 1 || KitWindowOwnerPod(other, &ob, &fb) != 1) return a;
+    const int wa = KitClassOfPod(fa), wb = KitClassOfPod(fb);
+    const unsigned long m = coop::StoreMainThreadId();
+    /* T-1222 (owner 1452): a rock's window and this player's own - before the kit table's early return, so a single-player game and a
+       game whose table is not written yet clear it too. The world-node read is made only on the side facing this player's own. */
+    const int na = (wb == swaccess::kOwn) ? coop::WorldNodeLiveAnyThread(oa) : 0;
+    const int nb = (wa == swaccess::kOwn) ? coop::WorldNodeLiveAnyThread(ob) : 0;
+    if (swaccess::NodeTakeClearsStealing(a, na, wa, nb, wb))
+    {
+        ::InterlockedIncrement64(&g_stealWorldNode);
+        if (m == 0 || ::GetCurrentThreadId() != (DWORD)m) ::InterlockedIncrement64(&g_stealOffMain);
+        return (char)0;
+    }
+    if (g_kitN == 0) return a;
+    const int cls = swaccess::PairClass(wa, wb);
     const int c = swaccess::CounterOf(cls);
     if (c < 0) return a;
     ::InterlockedIncrement64(&g_stealJudged[c]);
-    const unsigned long m = coop::StoreMainThreadId();
     if (m == 0 || ::GetCurrentThreadId() != (DWORD)m) ::InterlockedIncrement64(&g_stealOffMain);
     return swaccess::ClearsStealing(cls) ? (char)0 : a;
 }
@@ -1886,10 +2017,49 @@ int PolicyTeammateFactionList(void** out, int cap)
     }
     return n;
 }
+/* T-1242: is `b` a research bench - its vtable's +0x4B0 slot is ResearchBuilding::operate (row ResearchOperate; the slot holds a jump
+   stub, 0xD378 on 1.0.65, so up to two E9 jumps are followed). 1 yes, 0 another building, -1 unreadable / no row. ANY THREAD. */
+int PolicyIsResearchBench(void* b)
+{
+    if (kResearchOperateRva == 0 || g_base == 0 || !Plaus(b)) return -1;
+    __try
+    {
+        void** vt = *(void***)b;
+        if (!Plaus(vt)) return -1;
+        const unsigned char* p = (const unsigned char*)vt[0x4B0 / 8];
+        const uintptr_t want = g_base + (uintptr_t)kResearchOperateRva;
+        for (int hop = 0; hop < 3 && Plaus(p); ++hop)
+        {
+            if ((uintptr_t)p == want) return 1;
+            if (p[0] != 0xE9) return 0;
+            p = p + 5 + *(const int*)(p + 1);
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 long long PolicyNearTownHits(const char** why)
 {
     if (why != 0) *why = g_nearWhy;
     return g_nearCells != 0 ? (long long)g_nearCells->hits : -1;
+}
+/* T-1240 (T2039 LEG R): the house owner stub's teammate-match count (-1 = not patched; *why the install answer) and the factions its
+   cells hold now - the very values the stub compares the host's owner against. Any thread (plain reads of the stub's page). */
+long long PolicyHouseOwnerHits(const char** why)
+{
+    if (why != 0) *why = g_houseWhy;
+    return g_houseCells != 0 ? (long long)g_houseCells->hits : -1;
+}
+int PolicyHouseOwnerCells(void** out, int cap)
+{
+    int n = 0;
+    if (g_houseCells == 0) return 0;
+    for (int k = 0; k < kBoxCells && n < cap; ++k)
+    {
+        void* const f = g_houseCells->cell[k];
+        if (f != 0) out[n++] = f;
+    }
+    return n;
 }
 
 void PolicyStandInFactions(void* const* facs, int n)
@@ -1962,6 +2132,7 @@ void PolicyTeammateFactions(void* const* facs, int n)
         if (g_resProgCells != 0) rheld = MateCellsWrite(g_resProgCells, facs, n);
         g_resHeld = rheld;
     }
+    if (g_haulCells != 0) g_haulHeld = MateCellsWrite(g_haulCells, facs, n);   /* T-1150: the haul search's building owner test */
     NpcCellsWrite(facs, n);   /* T-943: the NPC senses' and memory's cells - teammates only */
     /* T-942: the box click cells are the kit's (teammates and allowed friends), written by KitBuild */
     g_kitMatesN = 0;
@@ -1995,6 +2166,7 @@ void PolicyKitTick()
 }
 int PolicyKitClassOf(void* faction) { return KitClassOfPod(faction); }
 
+void InstallWorldNodeLeftOpen();   /* T-1222: below, beside the left-click lever's gate reads */
 void InstallPolicy()
 {
     g_base = (uintptr_t)::GetModuleHandleA(0);
@@ -2060,6 +2232,24 @@ void InstallPolicy()
                  + (patched == 3 ? " - this player's pieces may go inside a teammate's house and this player's character researches at a teammate's bench; friends' and strangers' as before"
                                  : " - where not patched, a teammate's house still refuses this player's pieces / a teammate's bench gives no research"));
     }
+    /* T-1150: the haul search's building owner test - this player's workers take a teammate's storage and machines */
+    if (kHaulSearchTestRva == 0) g_haulWhy = "no address row";
+    else Test8Patch(g_base + (uintptr_t)kHaulSearchTestRva, kHaulSearchTestOrig, g_haulCells, g_haulWhy);
+    DebugLog(std::string("[POLICY] T-1150 haul search owner test (1.0.65 0x59A39A): ") + g_haulWhy
+             + (g_haulCells != 0 ? " - this player's workers haul into a teammate's storage and machines; friends', strangers' and NPC factions' as before"
+                                 : " - this player's workers still skip a teammate's storage and machines"));
+    /* T-1150 second gate: the search's candidate list keeps a teammate's building (filter hooked first: it acts only on the mark) */
+    if (g_haulCells == 0) g_haulPoolWhy = "the owner test is not patched";
+    else if (kHaulGatherRva == 0 || kHaulFilterRva == 0 || kHaulGatherRetRva == 0) g_haulPoolWhy = "no address row";
+    else if ((g_haulPoolTls = ::TlsAlloc()) == TLS_OUT_OF_INDEXES) g_haulPoolWhy = "no thread slot";
+    else if (coop::AddHook((void*)(g_base + kHaulFilterRva), (void*)&detour_HaulFilter, (void**)&orig_HaulFilter) != coop::SUCCESS)
+        g_haulPoolWhy = "AddHook owner filter 0x6207A0 FAILED";
+    else if (coop::AddHook((void*)(g_base + kHaulGatherRva), (void*)&detour_HaulGather, (void**)&orig_HaulGather) != coop::SUCCESS)
+        g_haulPoolWhy = "AddHook candidate gather 0x8CAFD0 FAILED";
+    else { g_haulPoolHooked = 1; g_haulPoolWhy = "hooked"; }
+    DebugLog(std::string("[POLICY] T-1150 haul search candidate filter (1.0.65 0x6207A0 from 0x59A2C2): ") + g_haulPoolWhy
+             + (g_haulPoolHooked != 0 ? " - the storage search's candidates keep a teammate's storage and machines; every other caller as before"
+                                      : " - the storage search's candidates still drop a teammate's storage and machines"));
     /* T-942: another player's box and character - the stealing decision, the item hover cursor, the trade / loot window choice */
     if (kStealFlagRva == 0) DebugLog("[POLICY] T-942 stealing decision: no address row - another player's box or downed character shows stealing for everyone");
     else if (coop::AddHook((void*)(g_base + kStealFlagRva), (void*)&detour_StealFlag, (void**)&orig_StealFlag) != coop::SUCCESS)
@@ -2096,6 +2286,7 @@ void InstallPolicy()
     DebugLog(std::string("[POLICY] foliage town owner test: ") + g_foliageWhy
              + (g_foliageCells != 0 ? " (the foliage routine's avoid-towns rule, 1.0.65 0x6D229E: a town of another player's stand-in keeps the world objects the owner's game keeps; every other town as before)"
                                     : " - NOT PATCHED (no-row: no address row for this build; not-expected: the bytes at the site are not the engine's, another mod?): another player's outpost copy still leaves out world objects marked avoid-towns that the owner's game keeps"));
+    InstallWorldNodeLeftOpen();   /* T-1222 (owner 1444): a left click on an ore rock opens its own window */
 }
 
 // PROBE P028 - is the `coop-peer` stand-in faction a player faction? Emitted ONCE, on the main thread, the
@@ -2164,9 +2355,14 @@ bool PolicyJudge(void* building, const std::string& requesterFactionSid, bool co
     const char* dummy = 0;
     if (rule == 0) rule = &dummy;
     Bump(&g_checks, count);
-    /* T-546 step 4 (decision 481): every member's base is open to every member - before the policy, whatever it is */
-    if (MemberRequest(building, requesterFactionSid)) { Bump(&g_allowedMember, count); *rule = "member"; return true; }
-    int pol = BasePolicyValue();
+    /* T-546 step 4 (decision 481): every member's base is open to every member - before the policy, whatever it is.
+       T-1222 (owner 1444): a world resource node (an ore rock) is nobody's - every player takes from it, whatever the policy
+       (swaccess::JudgeFirst; the rule order is the kit's). */
+    const bool member = MemberRequest(building, requesterFactionSid);
+    const int pol = BasePolicyValue();
+    const int first = swaccess::JudgeFirst(member, member ? 0 : coop::WorldNodeLiveAnyThread(building), pol);
+    if (first == swaccess::kJudgeMember) { Bump(&g_allowedMember, count); *rule = "member"; return true; }
+    if (first == swaccess::kJudgeWorldNode) { Bump(&g_allowedWorldNode, count); *rule = "world-node"; return true; }
     if (pol == kPolicyUnknown)
     {
         Bump(&g_unknownEvaluated, count);
@@ -2175,9 +2371,8 @@ bool PolicyJudge(void* building, const std::string& requesterFactionSid, bool co
             g_saidUnknown = true;
             ErrorLog("[POLICY] no notebook process has said what this world's base access policy is (no relay link, or the WELCOME push has not landed yet). THIS REQUEST IS BEING JUDGED AS `shared`, which is the default - it is NOT the same as having been told `shared`, and it is reported as basepolicy=unknown. Logged once.");
         }
-        pol = kPolicyShared;
     }
-    if (pol == kPolicyShared) { Bump(&g_allowedShared, count); *rule = "shared"; return true; }
+    if (first == swaccess::kJudgeShared) { Bump(&g_allowedShared, count); *rule = "shared"; return true; }
 
     char ownerSid[160]; ownerSid[0] = 0;
     void* f = FactionOfBuildingPod(building);
@@ -2221,38 +2416,30 @@ bool PolicyJudge(void* building, const std::string& requesterFactionSid, bool co
     // now counts one thing - a sid that was READ and matched no player faction on this machine - and can no
     // longer absorb "my own base, misread", which is the conflation review-p6h named.
     const bool ownerIsPlayerSide = IsStandInSid(owner.c_str()) || (owner == std::string(mine));   /* stand1: any stand-in (coop-p<n>) by id */
-    if (!ownerIsPlayerSide)
-    {
-        // A building owned by a real NPC faction - a town shop counter, a bandit chest, a ruin. The base access
-        // policy is about PLAYER bases (decision 40: "a hosting option attached to the building's owner
-        // faction"), so it says nothing here and the engine's own rules stand. INTERPRETATION, stated rather
-        // than measured: decision 40 does not name this case.
-        Bump(&g_notPlayerOwned, count);
-        *rule = "not-player-owned";
-        return true;
-    }
     const bool isOwner = !requesterFactionSid.empty() && owner == requesterFactionSid;
-    if (pol == kPolicyOwner)
+    // The rule (swaccess::JudgeAfterReads, the kit's order, T-1222):
+    //   not-player-owned  a building owned by a real NPC faction - a town shop counter, a bandit chest, a ruin. The base
+    //                     access policy is about PLAYER bases (decision 40: "a hosting option attached to the building's
+    //                     owner faction"), so it says nothing here and the engine's own rules stand. INTERPRETATION, stated
+    //                     rather than measured: decision 40 does not name this case.
+    //   `owner`           the owner only.
+    //   kPolicyLocked     the owner always; everybody else falls through to the ENGINE'S lock-and-pick, with no plugin
+    //                     refusal at all. That is only true while the peer stand-in is not a player faction, which is what
+    //                     P028 measures; if it is one, the engine would treat the peer's boxes as ours and `locked` would
+    //                     mean nothing, so we refuse here instead. Doors are untouched either way - nothing in this plugin
+    //                     gates a door.
+    const int after = swaccess::JudgeAfterReads(pol, ownerIsPlayerSide, isOwner,
+                                                (ownerIsPlayerSide && pol != kPolicyOwner && !isOwner) ? (PolicyPeerIsPlayer() != 0) : false);
+    switch (after)
     {
-        if (isOwner) { Bump(&g_allowedOwner, count); *rule = "owner"; return true; }
-        Bump(&g_refusedOwner, count);
-        *rule = "owner-only";
-        return false;
+    case swaccess::kJudgeNotPlayerOwned: Bump(&g_notPlayerOwned, count); *rule = "not-player-owned"; break;
+    case swaccess::kJudgeOwner: Bump(&g_allowedOwner, count); *rule = "owner"; break;
+    case swaccess::kJudgeOwnerOnly: Bump(&g_refusedOwner, count); *rule = "owner-only"; break;
+    case swaccess::kJudgeLockedOwner: Bump(&g_locked, count); *rule = "owner"; break;
+    case swaccess::kJudgeLockedRefused: Bump(&g_locked, count); Bump(&g_lockedRefusedFallback, count); *rule = "locked-refused"; break;
+    default: Bump(&g_locked, count); *rule = "locked-engine-lock"; break;
     }
-    // kPolicyLocked - the owner always; everybody else falls through to the ENGINE'S lock-and-pick, with no
-    // plugin refusal at all. That is only true while the peer stand-in is not a player faction, which is what
-    // P028 measures; if it is one, the engine would treat the peer's boxes as ours and `locked` would mean
-    // nothing, so we refuse here instead. Doors are untouched either way - nothing in this plugin gates a door.
-    Bump(&g_locked, count);
-    if (isOwner) { *rule = "owner"; return true; }
-    if (PolicyPeerIsPlayer() != 0)
-    {
-        Bump(&g_lockedRefusedFallback, count);
-        *rule = "locked-refused";
-        return false;
-    }
-    *rule = "locked-engine-lock";
-    return true;
+    return swaccess::JudgeAllows(after);
 }
 bool BasePolicyAllows(void* building, const std::string& requesterFactionSid) { return PolicyJudge(building, requesterFactionSid, true, 0); }
 
@@ -2411,6 +2598,153 @@ int ClickPod(void* pi, void* b, const float* pos, int* answer, int* byteWas)
 void* PlayerInterfacePod(void* faction) { __try { return *(void**)((char*)faction + kFacPlayerInterface); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
 long long g_clicks = 0;
 }
+/* T-1241 (decision 1487 a) TEST-ONLY, READ-ONLY: the cursor this game's hover would show on `building` (any class - a chest may be a
+   plain Building with an inventory), for the `cursortest hover` lever (items.cpp). The hover is PlayerInterface::buildingSelected
+   with the click byte clear; it SETS the GUI's cursor, so it is not called. Its reads are made here in its own order
+   (swaccess::BoxHoverCursor, thingaccess.h, for the order and the sources), each through the building's own virtual as the hover
+   makes it; its ownership test is OwnedByAPlayerFaction 0x546340 (decomp_546340: the faction's +0x250 - a read), called through
+   the hook's trampoline for the engine's answer and then answered as the hook answers at the hover's sites (swaccess::HoverOwned)
+   for the mod's. Nothing is written and no counter moves. MAIN THREAD. */
+namespace {
+const size_t kPiBusyByte = 0x268, kBldSeatByte = 0x1A0, kInvCount = 0x18, kFacFreeByte = 0x1D0;
+const size_t kChrRoadByte = 0x3A8;
+struct HoverReads { int engineOwned; int selectable; int busy; int built; int inUse; int seat; int fnType; int kind; int haveInv; int invCount; int factionFree; void* fac;
+                    /* T-1241 the getter road (no box): vtable +0x300 and its +0x3A8 byte, where vtable +0x410 leads, and UseableStuff::
+                       getMouseCursor's own owner steps (the faction's +0x250, the lock test +0x408) with the engine's answer */
+                    int getterRoad; int character; int useableGetter; unsigned int getterRva; int facPlayer; int hasLock; int engineGetter; int liveGetter; };
+/* 1 read, 0 faulted or a virtual that is no code pointer. NO std::string (C2712). */
+int HoverReadPod(void* b, void* pi, HoverReads* r)
+{
+    std::memset(r, 0, sizeof(*r));
+    __try
+    {
+        void** vt = *(void***)b;
+        if (!Plaus(vt)) return 0;
+        const size_t slots[7] = { 0x58, 0x108, 0x228, 0x308, 0x2F0, 0x358, 0x160 };
+        for (int i = 0; i < 7; ++i) if (!Plaus(vt[slots[i] / 8])) return 0;
+        typedef void* (*PtrFn)(void*);
+        typedef char (*ByteFn)(void*);
+        typedef const char* (*BytePtrFn)(void*);
+        typedef int (*IntFn)(void*);
+        r->fac = ((PtrFn)vt[0x58 / 8])(b);
+        if (orig_OwnedByAPlayerFaction != 0) r->engineOwned = orig_OwnedByAPlayerFaction(b) != 0 ? 1 : 0;
+        else r->engineOwned = (Plaus(r->fac) && *(void**)((char*)r->fac + kFacPlayerInterface) != 0) ? 1 : 0;   /* 0x546340's own test */
+        r->selectable = ((ByteFn)vt[0x108 / 8])(b) != 0 ? 1 : 0;
+        r->busy = (Plaus(pi) && *((unsigned char*)pi + kPiBusyByte) != 0) ? 1 : 0;
+        const char* built = ((BytePtrFn)vt[0x228 / 8])(b);
+        r->built = (Plaus((void*)built) && *built != 0) ? 1 : 0;
+        r->inUse = ((ByteFn)vt[0x308 / 8])(b) != 0 ? 1 : 0;
+        r->seat = *((unsigned char*)b + kBldSeatByte) != 0 ? 1 : 0;
+        r->fnType = ((IntFn)vt[0x2F0 / 8])(b);
+        r->kind = ((IntFn)vt[0x358 / 8])(b);
+        void* inv = ((PtrFn)vt[0x160 / 8])(b);
+        r->haveInv = Plaus(inv) ? 1 : 0;
+        r->invCount = r->haveInv ? *(int*)((char*)inv + kInvCount) : 0;
+        r->factionFree = (Plaus(r->fac) && *((unsigned char*)r->fac + kFacFreeByte) != 0) ? 1 : 0;
+        /* T-1241 THE GETTER ROAD (decomp_7fbb40 :115-152): no box -> the hover's +0x300 read, then the building's own getMouseCursor
+           (+0x410). For UseableStuff that slot is a jmp thunk into UseableStuff::getMouseCursor (the hooked body, kUseableCursorRva),
+           whose answer comes from the hook's trampoline (the engine's own code, no counter); the mod's remap is made by
+           swaccess::UseableCursorMod in PolicyBoxHoverRead. Any other getter is not called. */
+        r->engineGetter = -1;
+        r->liveGetter = -1;
+        if (!swaccess::HoverIsBox(r->fnType, r->kind))
+        {
+            const size_t gslots[3] = { 0x300, 0x410, 0x408 };
+            for (int i = 0; i < 3; ++i) if (!Plaus(vt[gslots[i] / 8])) return 0;
+            r->getterRoad = 1;
+            void* chr = ((PtrFn)vt[0x300 / 8])(b);
+            r->character = (Plaus(chr) && *((unsigned char*)chr + kChrRoadByte) != 0) ? 1 : 0;
+            const unsigned char* g = (const unsigned char*)vt[0x410 / 8];
+            uintptr_t dest = (uintptr_t)g;
+            if (g[0] == 0xE9) dest = (uintptr_t)g + 5 + (intptr_t)*(const int*)(g + 1);   /* the vtable's jmp thunk */
+            r->getterRva = (g_base != 0 && dest > g_base) ? (unsigned int)(dest - g_base) : 0;
+            r->useableGetter = (kUseableCursorRva != 0 && g_base != 0 && dest == g_base + (uintptr_t)kUseableCursorRva) ? 1 : 0;
+            if (r->useableGetter != 0)
+            {   /* 0x546C30's own owner steps, read for the line: the faction's player interface, then the lock test */
+                r->facPlayer = (Plaus(r->fac) && *(void**)((char*)r->fac + kFacPlayerInterface) != 0) ? 1 : 0;
+                r->hasLock = ((ByteFn)vt[0x408 / 8])(b) != 0 ? 1 : 0;
+                if (orig_UseableCursor != 0) r->engineGetter = (int)orig_UseableCursor(b);
+                if (orig_UseableCursor != 0) r->liveGetter = (int)detour_UseableCursor(b);   /* the mod's live answer, as the real hover gets it (its counters move once) */
+                else r->engineGetter = (int)((UseableCursorFn)vt[0x410 / 8])(b);   /* no hook: the slot is the engine's own */
+            }
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+std::string HoverCursorText(int c) { return c >= 0 ? HexU((unsigned int)c) : (c == swaccess::kHoverNoCursor ? std::string("none") : std::string("unread")); }
+}
+bool PolicyBoxHoverRead(void* building, std::string* text)
+{
+    if (EngineWritesBlocked()) { *text = "no world loaded"; return false; }
+    if (!Plaus(building)) { *text = "no building"; return false; }
+    void* pi = PlayerInterfacePod((void*)LocalPlayerFaction());
+    HoverReads r;
+    if (HoverReadPod(building, pi, &r) != 1) { *text = "the building's reads faulted (a virtual that is no code pointer, or a read that faulted) - nothing read"; return false; }
+    const unsigned int vt = PolicyVtableRvaQuietPod(building);
+    char cls[128]; cls[0] = 0;
+    if (vt == 0 || PolicyClassNamePod(vt, cls, 128) != 1) std::strcpy(cls, "?");
+    char sid[160]; sid[0] = 0;
+    if (!Plaus(r.fac) || FactionSidPod(r.fac, sid, 160) != 1 || sid[0] == 0) std::strcpy(sid, "?");
+    const int me = MySlotForWire();
+    const int ownerSlot = StandInSlotAnyPod(r.fac);
+    const bool shared = BasePolicyValue() == kPolicyShared;
+    const bool inTeam = MineInTeam();
+    const bool member = inTeam && TeammateFaction(r.fac);
+    /* T-1241 (run T2056): the cursor hook's member answer - a teammate, or the owner's kit-table class that clears the take's stealing
+       (swaccess::CursorLikeOwn, the detour's own call); friend = an allowed friend that is no teammate */
+    const int ownerWho = PolicyKitClassOf(r.fac);
+    const bool likeOwn = swaccess::CursorLikeOwn(member, ownerWho);
+    const bool standIn = Plaus(r.fac) && IsStandInFaction((::Faction*)r.fac);
+    const bool hooked = orig_OwnedByAPlayerFaction != 0;
+    const int node = (r.engineOwned == 0 && hooked) ? WorldNodeLiveAnyThread(building) : 0;
+    const int modOwned = hooked ? swaccess::HoverOwned(r.engineOwned, node, shared, inTeam, member, standIn, vt != 0 && vt == kVtStorageBuilding) : r.engineOwned;
+    swaccess::HoverTerms t = { modOwned, r.selectable, r.busy, r.built, r.inUse, r.seat, r.fnType, r.kind, r.haveInv, r.invCount, r.factionFree };
+    int cursor = swaccess::BoxHoverCursor(t);
+    t.owned = r.engineOwned;
+    int engineCursor = swaccess::BoxHoverCursor(t);
+    /* T-1241 (run T2045): no box -> the getter road; for a UseableStuff the cursor is UseableStuff::getMouseCursor's answer, which
+       reads the owner itself (the faction's +0x250), remapped as the mod's hook remaps it (swaccess::UseableCursorMod) */
+    std::string road = "box";
+    if (cursor == swaccess::kHoverOwnGetter && r.getterRoad != 0)
+    {
+        const bool cursorHooked = orig_UseableCursor != 0;
+        const int gNode = (r.useableGetter != 0 && cursorHooked && (r.engineGetter == swaccess::kHoverPickLock || r.engineGetter == swaccess::kHoverSteal))
+                          ? WorldNodeLiveAnyThread(building) : 0;
+        const int mirrorGetter = (r.useableGetter != 0 && cursorHooked)
+                              ? swaccess::UseableCursorMod(r.engineGetter, gNode, likeOwn, shared && standIn, vt != 0 && vt == kVtStorageBuilding) : r.engineGetter;
+        /* the verdict is the live hook's answer; the mirror is a cross-check, its disagreement printed */
+        const int modGetter = (r.useableGetter != 0 && cursorHooked && r.liveGetter >= 0) ? r.liveGetter : mirrorGetter;
+        cursor = swaccess::GetterRoadCursor(r.character, r.fnType, r.useableGetter, modGetter);
+        engineCursor = swaccess::GetterRoadCursor(r.character, r.fnType, r.useableGetter, r.engineGetter);
+        road = "getter (vtable +0x410 -> rva " + HexU(r.getterRva) + (r.useableGetter ? std::string(" = UseableStuff::getMouseCursor") : std::string(", another class's getter - not called"))
+             + ") steps: +0x300 character=" + PN((long long)r.character) + " fnType=" + HexU((unsigned int)r.fnType)
+             + (r.useableGetter ? " ownerFaction+0x250 playerInterface=" + PN((long long)r.facPlayer) + " inv=" + PN((long long)r.haveInv)
+                                  + " hasLock=" + PN((long long)r.hasLock) + " engineGetter=" + HexU((unsigned int)r.engineGetter)
+                                  + " (" + swaccess::HoverCursorMeaning(r.engineGetter) + ") modGetter=" + HexU((unsigned int)modGetter)
+                                  + " (" + swaccess::HoverCursorMeaning(modGetter) + ") cursorHook=" + std::string(cursorHooked ? "1" : "0")
+                                  + " member=" + std::string(member ? "1" : "0") + " peerObject=" + std::string(shared && standIn ? "1" : "0")
+                                  + " storageClass=" + std::string(vt != 0 && vt == kVtStorageBuilding ? "1" : "0") + " worldNode=" + PN((long long)gNode)
+                                  + " liveHook=" + HexU((unsigned int)r.liveGetter) + " mirror=" + HexU((unsigned int)mirrorGetter)
+                                  + std::string(r.liveGetter >= 0 && r.liveGetter != mirrorGetter ? " MIRROR-MISMATCH" : "")
+                                : std::string());
+    }
+    *text = "cursor=" + HoverCursorText(cursor) + " (" + swaccess::HoverCursorMeaning(cursor) + ")"
+          + " engineAlone=" + HoverCursorText(engineCursor) + " (" + swaccess::HoverCursorMeaning(engineCursor) + ")"
+          + " ours=" + std::string(modOwned ? "1" : "0") + " engineOwned=" + std::string(r.engineOwned ? "1" : "0")
+          + " kitWho=" + PN((long long)ownerWho) + " friend=" + std::string(likeOwn && !member ? "1" : "0") + " likeOwn=" + std::string(likeOwn ? "1" : "0")
+          + " ownerFaction='" + std::string(sid) + "' ownerSlot=" + PN((long long)ownerSlot) + " thisSlot=" + PN((long long)me)
+          + " member=" + std::string(member ? "1" : "0") + " standIn=" + std::string(standIn ? "1" : "0") + " basePolicy=" + BasePolicyName()
+          + " class=" + std::string(cls) + " hook=" + std::string(hooked ? "1" : "0")
+          + " | reads selectable=" + PN((long long)r.selectable) + " busy=" + PN((long long)r.busy) + " built=" + PN((long long)r.built)
+          + " inUse=" + PN((long long)r.inUse) + " seat=" + PN((long long)r.seat) + " fnType=" + HexU((unsigned int)r.fnType) + " kind=" + HexU((unsigned int)r.kind)
+          + " box=" + std::string(swaccess::HoverIsBox(r.fnType, r.kind) ? "1" : "0") + " inv=" + PN((long long)r.haveInv) + " items=" + PN((long long)r.invCount)
+          + " factionFree=" + PN((long long)r.factionFree) + " worldNode=" + PN((long long)node)
+          + " | road=" + road
+          + " (PlayerInterface::buildingSelected's hover reads, made in its order; it is not called because it sets the cursor - read-only)";
+    return true;
+}
+
 std::string PolicyTeamClick(int ownerSlot, const std::string& cls)
 {
     const std::string who = "s" + PN((long long)ownerSlot);
@@ -2463,6 +2797,193 @@ int PolicyClickBuilding(void* building, int* answer, int* byteWas)
     const int called = ClickPod(pi, building, pos, answer, byteWas);
     ++g_clicks;
     return called;
+}
+/* T-1191 TEST-ONLY: the player's LEFT click on a building (Read, 1.0.65 addresses). PlayerInterface::update 0x800A80 sets +0x2F1 on
+   the frame the left button is released (decomp_800a80 :90 - DAT_142132413 the button now, DAT_142132282 last frame) and +0x2F3 on
+   the right button's release (:95). The frame's pick 0x7FF6B0 hands the building under the cursor to buildingSelected(pi, b, pos, 0)
+   (decomp_7ff6b0 :340). There every order is gated on +0x2F3; with it clear only the cursor is picked, and the tail (decomp_7fbb40
+   :346-347) hands the object to the select call 0x7F8460 when +0x2F1 is set -> 0x7F7380(pi, b, 1): the building becomes the selected
+   object (+0x250..+0x263 = its hand's ids, decomp_7f7380 :95-99) and its vtable +0x130 runs (:104; ProductionBuilding and
+   StorageBuilding: 0x54FA10 - the click sound, then, when built (+0x228) and its faction (+0x58) has a player interface (+0x250),
+   ForgottenGUI 0x6E5EA0 shows the building's own inventory window; decomp_54fa10 :34-39). No distance is tested on this road (Read:
+   none in 0x7F8460 / 0x7F7380 / 0x54FA10 / 0x6E5EA0); a move out of the window meets the trade check 0x70C6C0 later. The call
+   hands the furniture's occupant instead when one holds it (decomp_7fbb40 :124-141), as the game does. MAIN THREAD. */
+namespace {
+const size_t kPiLeftByte = 0x2F1, kPiSelHand = 0x250, kObjHandIds = 0x60;
+int LeftClickPod(void* pi, void* b, const float* pos, int* answer, int* leftWas, int* rightWas)
+{
+    unsigned char* lb = (unsigned char*)pi + kPiLeftByte;
+    unsigned char* rb = (unsigned char*)pi + kPiClickByte;
+    __try
+    {
+        *leftWas = *lb; *rightWas = *rb;
+        *lb = 1; *rb = 0;
+        const char r = ((BuildingSelectedFn)(g_base + (uintptr_t)kBuildingSelectedRva))(pi, b, pos, 0);
+        *lb = (unsigned char)*leftWas; *rb = (unsigned char)*rightWas;
+        *answer = r != 0 ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        __try { *lb = (unsigned char)*leftWas; *rb = (unsigned char)*rightWas; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return 0;
+    }
+}
+/* the interface's selected object is b: its five hand words equal b's hand words (decomp_7f7380 :95-99). -1 unread. */
+int SelectedIsPod(void* pi, void* b)
+{
+    __try { return std::memcmp((const char*)pi + kPiSelHand, (const char*)b + kObjHandIds, 0x14) == 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* 0x54FA10's own test: built (vtable +0x228 -> a byte) and the faction (vtable +0x58) has a player interface (+0x250). -1 unread. */
+int SelectGatePod(void* b)
+{
+    __try
+    {
+        void** vt = *(void***)b;
+        typedef const char* (*BuiltFn)(void*);
+        typedef void* (*FacFn)(void*);
+        const char* built = ((BuiltFn)vt[0x228 / 8])(b);
+        if (!Plaus((void*)built) || *built == 0) return 0;
+        void* f = ((FacFn)vt[0x58 / 8])(b);
+        if (!Plaus(f)) return 0;
+        return *(void**)((char*)f + kFacPlayerInterface) != 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+}
+int PolicyLeftClickBuilding(void* building, int* answer, int* leftWas, int* rightWas, int* selected, int* gate)
+{
+    *answer = 0; *leftWas = -1; *rightWas = -1; *selected = -1; *gate = -1;
+    if (EngineWritesBlocked() || kBuildingSelectedRva == 0 || g_base == 0 || !Plaus(building)) return -1;
+    void* pi = PlayerInterfacePod((void*)LocalPlayerFaction());
+    if (!Plaus(pi)) return -2;
+    float pos[3] = { 0, 0, 0 };
+    if (BuildingPosPod(building, pos) != 1) return -3;
+    *gate = SelectGatePod(building);
+    const int called = LeftClickPod(pi, building, pos, answer, leftWas, rightWas);
+    ++g_clicks;
+    *selected = SelectedIsPod(pi, building);
+    return called;
+}
+namespace {
+/* T-1191: the building's own faction field (RootObject +0x10, read flat - not the getter). 1 read, -1 faulted. */
+int OwnFactionFieldPod(void* b, void** out)
+{
+    __try { *out = *(void**)((char*)b + 0x10); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1191: the finished byte the select virtual 0x54FA10 tests (vtable +0x228 -> a byte). 1 / 0, -1 unread. */
+int BuiltBytePod(void* b)
+{
+    __try
+    {
+        void** vt = *(void***)b;
+        typedef const char* (*BuiltFn)(void*);
+        const char* built = ((BuiltFn)vt[0x228 / 8])(b);
+        if (!Plaus((void*)built)) return -1;
+        return *built != 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+}
+/* T-1222 (owner 1444): A LEFT CLICK ON A WORLD RESOURCE NODE (an ore rock) OPENS THE ROCK'S OWN INVENTORY WINDOW, on every game and
+   whatever the player count (solo with the mod loaded too). The engine's left click selects the building and runs its select virtual
+   (Building vtable +0x130 = 1.0.65 0x54FA10 / 1.0.68 0x5504A0 for Building, StorageBuilding and ProductionBuilding alike, through the
+   thunk 0x3B741 / 0x3B769; Read from both executables' vtables), which plays the click sound and opens the window only when the
+   building is built (vtable +0x228) and its faction has a player interface (+0x250) - ForgottenGUI 0x6E5EA0 / 0x6E6640 called with
+   (the GUI object, the building + 0x58) (decomp_54fa10 :34-39). A rock keeps 'No Faction' (its miner's claim is skipped, build.cpp
+   detour_setfaction), so the engine opens nothing for anyone. The detour runs the engine's select first, unchanged, and then - only
+   for a world node (WorldNodeLiveAnyThread), built, whose window the engine's own gate did not open (swaccess::NodeLeftOpens) - makes
+   the same call itself. Every other building (town-owned, abandoned, machines, boxes) costs one world-node read and nothing else.
+   Calling the window twice only shows it again (decomp_6e5ea0 :48-52). No message, no wire change. MAIN THREAD (the selection road,
+   decomp_7f7380 :84,104); a call on another thread is counted and left alone. */
+int ObjectPositionKey(void* obj, char* out, int cap, const char* suffix, int countIt, int podPos);   /* items.cpp (items.h): the P7n key, for the log line */
+namespace {
+unsigned long long kBuildingOnSelectRva = 0; static AddrReg kBuildingOnSelectRva_reg("BuildingOnSelect", &kBuildingOnSelectRva);   /* Steam_1.0.65 0x54FA10 / 1.0.68 0x5504A0 - HOOKED */
+unsigned long long kNodeWindowRva = 0; static AddrReg kNodeWindowRva_reg("ForgottenGuiBuildingWindow", &kNodeWindowRva, kAddrUseCallOnly);   /* Steam_1.0.65 0x6E5EA0 / 1.0.68 0x6E6640 - only called */
+unsigned long long kNodeGuiRva = 0; static AddrReg kNodeGuiRva_reg("ForgottenGui", &kNodeGuiRva);   /* Steam_1.0.65 0x2132750: the GUI object itself */
+typedef void (*BuildingOnSelectFn)(void* building);
+typedef void* (*NodeWindowFn)(void* gui, void* hand);
+BuildingOnSelectFn orig_BuildingOnSelect = 0;
+const size_t kNodeHandOff = 0x58;   /* the select virtual's own second argument: the building + 0x58 (decomp_54fa10 :37, param_1 + 0xb) */
+int g_nodeLeftHook = 0;
+volatile LONGLONG g_worldNodeLeftOpen = 0, g_nodeLeftOffMain = 0, g_nodeLeftFault = 0;
+long long g_nodeLeftSaid = 0;
+DWORD g_nodeLeftSaidAt = 0;
+const long long kNodeLeftSayCap = 20;        /* a line for each of the first 20 opens, then at most one every 30 s; the report keeps counting */
+const DWORD kNodeLeftSayGapMs = 30000u;
+/* 1 called (*win = what it returned), 0 faulted. NO std::string (C2712). */
+int NodeWindowPod(void* b, void** win)
+{
+    *win = 0;
+    __try
+    {
+        *win = ((NodeWindowFn)(g_base + (uintptr_t)kNodeWindowRva))((void*)(g_base + (uintptr_t)kNodeGuiRva), (char*)b + kNodeHandOff);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void NodeLeftSay(void* b, int gate, int shown, void* win)
+{
+    const DWORD now = ::GetTickCount();
+    if (g_nodeLeftSaid >= kNodeLeftSayCap && (DWORD)(now - g_nodeLeftSaidAt) < kNodeLeftSayGapMs) return;
+    ++g_nodeLeftSaid;
+    g_nodeLeftSaidAt = now;
+    char k[160]; k[0] = 0;
+    if (ObjectPositionKey(b, k, (int)sizeof(k), "", 3, 0) == 0) k[0] = 0;
+    DebugLog("[POLICY] T-1222 world-node left click: building " + std::string(k[0] != 0 ? k : "(key unread)") + " - the world-node open fired: "
+             + (shown == 1 ? std::string("window shown (") + (win != 0 ? "a window" : "no window") + " returned)" : std::string("the window call FAULTED"))
+             + "; the engine's own gate was " + PN((long long)gate) + " (0 = it opened nothing); opens " + PN(g_worldNodeLeftOpen)
+             + " faults " + PN(g_nodeLeftFault) + (g_nodeLeftSaid == kNodeLeftSayCap ? " - from here at most one line every 30 s; the report keeps counting" : ""));
+}
+void detour_BuildingOnSelect(void* b)
+{
+    orig_BuildingOnSelect(b);
+    if (g_base == 0 || kNodeWindowRva == 0 || kNodeGuiRva == 0 || !Plaus(b)) return;
+    const int node = coop::WorldNodeLiveAnyThread(b);
+    if (node != 1) return;   /* every other building: the engine's select alone */
+    const unsigned long m = coop::StoreMainThreadId();
+    if (m != 0 && ::GetCurrentThreadId() != (DWORD)m) { ::InterlockedIncrement64(&g_nodeLeftOffMain); return; }
+    const int gate = SelectGatePod(b);
+    if (!swaccess::NodeLeftOpens(node, BuiltBytePod(b), gate)) return;
+    void* win = 0;
+    const int shown = NodeWindowPod(b, &win);
+    ::InterlockedIncrement64(shown == 1 ? &g_worldNodeLeftOpen : &g_nodeLeftFault);
+    NodeLeftSay(b, gate, shown, win);
+}
+}
+void InstallWorldNodeLeftOpen()
+{
+    const char* why = "hooked";
+    if (kBuildingOnSelectRva == 0 || kNodeWindowRva == 0 || kNodeGuiRva == 0) why = "no address row";
+    else if (coop::AddHook((void*)(g_base + kBuildingOnSelectRva), (void*)&detour_BuildingOnSelect, (void**)&orig_BuildingOnSelect) != coop::SUCCESS) why = "AddHook FAILED";
+    else g_nodeLeftHook = 1;
+    if (g_nodeLeftHook != 0)
+        DebugLog("[POLICY] T-1222 world-node left click: hook installed on the building select virtual (1.0.65 0x54FA10) - a left click on an ore rock opens its own inventory window through ForgottenGUI (1.0.65 0x6E5EA0) when the engine's own gate opened nothing; every other building as before");
+    else
+        ErrorLog(std::string("[POLICY] T-1222 world-node left click: NOT installed (") + why + ") - a left click on an ore rock opens no window (the right click's take still works)");
+}
+std::string PolicyBuildingFactionText(void* building)
+{
+    rcgive::BFac r;
+    if (!Plaus(building)) return rcgive::BFacText(r);
+    void* own = 0;
+    if (OwnFactionFieldPod(building, &own) == 1) r.own = (own != 0) ? 1 : 0;
+    r.built = BuiltBytePod(building);
+    void* f = FactionOfBuildingPod(building);
+    r.resolved = Plaus(f) ? 1 : 0;
+    if (r.resolved == 1)
+    {
+        r.local = (f == (void*)coop::LocalPlayerFaction()) ? 1 : 0;
+        void* pc = 0;
+        if (IsPlayerFieldPod(f, &pc) == 1) r.controller = (pc != 0) ? 1 : 0;
+        r.standIn = StandInSlotAnyPod(f);
+        char sid[96]; sid[0] = 0;
+        if (FactionSidPod(f, sid, (int)sizeof(sid)) == 1) r.id = sid;
+        r.name = ((::Faction*)f)->getName();
+    }
+    return rcgive::BFacText(r);
 }
 
 /* T-546 step 7: the `team orders <slot>` lever (TEST-ONLY). For this game's own first character and for the first character of player
@@ -2580,6 +3101,9 @@ std::string PolicyReport()
          + " basePolicy2[unknownEvaluated,notPlayerOwned,ownerUnreadable,lockedRefusedFallback,peerIsPlayer,hook]=" + PN(g_unknownEvaluated) + "," + PN(g_notPlayerOwned) + "," + PN(g_ownerUnreadable) + "," + PN(g_lockedRefusedFallback) + "," + PN((long long)PolicyPeerIsPlayer()) + "," + PN(g_hookInstalled)
          + " basePolicy3[mineUnreadable,mineWasStandIn,mineNotYetKnown,policyRequesterFromPeer]=" + PN(g_mineUnreadable) + "," + PN(g_mineWasStandIn) + "," + PN(g_mineNotYetKnown) + "," + PN(g_policyRequesterFromPeer)
          + " basePolicyMember[allowedMember,click,doorPanel,cursor,doorCursor,cursorOther]=" + PN(g_allowedMember) + "," + PN(g_memberClick) + "," + PN(g_memberDoorPanel) + "," + PN(g_memberCursor) + "," + PN(g_memberDoorCursor) + "," + PN(g_memberCursorOther)
+         + " friendCursor=" + PN(g_friendCursor)
+         + " basePolicyWorldNode[allowed,click,cursor,leftOpen,leftHook,leftOffMain,leftFault]=" + PN(g_allowedWorldNode) + "," + PN(g_worldNodeClick) + "," + PN(g_worldNodeCursor)
+         + "," + PN(g_worldNodeLeftOpen) + "," + PN((long long)g_nodeLeftHook) + "," + PN(g_nodeLeftOffMain) + "," + PN(g_nodeLeftFault)
          + TeamOrdersTokens()
          + " nearTownTeammateHits=" + (g_nearCells != 0 ? PN((long long)g_nearCells->hits) : std::string("n/a")) + " nearTownCellsHeld=" + PN((long long)g_nearHeld)
          + " foliageTown[patched,why,cells,hits,drops]=" + PN(g_foliageCells != 0 ? 1 : 0) + "," + g_foliageWhy + "," + PN((long long)g_foliageHeld)
@@ -2590,6 +3114,8 @@ std::string PolicyReport()
          + " teamResearch[patched,cellsHeld,workHits,progressHits,hook,copySkipped]=" + PN((long long)((g_resWorkCells != 0 ? 1 : 0) + (g_resProgCells != 0 ? 1 : 0))) + "," + PN((long long)g_resHeld)
          + "," + PN(g_resWorkCells != 0 ? (long long)g_resWorkCells->hits : 0) + "," + PN(g_resProgCells != 0 ? (long long)g_resProgCells->hits : 0)
          + "," + PN((long long)g_resHook) + "," + PN((long long)g_resCopySkipped)
+         + " teamHaul[patched,cellsHeld,hits]=" + PN(g_haulCells != 0 ? 1 : 0) + "," + PN((long long)g_haulHeld) + "," + PN(g_haulCells != 0 ? (long long)g_haulCells->hits : 0)
+         + " teamHaulPool[hooked,hits]=" + PN((long long)g_haulPoolHooked) + "," + PN((long long)g_haulPoolHits)
          + " ownedByPeerAnswered=" + PN(g_ownedByPeerAnswered)
          + " ownedByPeerAnsweredClick=" + PN(g_ownedByPeerAnsweredClick)
          + " doors1[ownedByPeerStranger,cursorStranger,doorCursorStranger]=" + PN(g_ownedByPeerStranger) + "," + PN(g_cursorStranger) + "," + PN(g_doorCursorStranger)
@@ -2605,6 +3131,7 @@ std::string PolicyReport()
          + "," + PN((long long)g_kitLike) + "," + PN((long long)g_kitLikeDrops) + "," + PN(g_kitBuilds)
          + " kitSteal[hook,team,friend,friendRefused,stranger,offMain]=" + PN((long long)g_stealHook) + "," + PN((long long)g_stealJudged[0]) + "," + PN((long long)g_stealJudged[1])
          + "," + PN((long long)g_stealJudged[2]) + "," + PN((long long)g_stealJudged[3]) + "," + PN((long long)g_stealOffMain)
+         + " kitStealWorldNode=" + PN((long long)g_stealWorldNode)
          + " kitTrade[hook,team,friend,friendRefused,stranger,madeNever,noWindow]=" + PN((long long)g_tradeHook) + "," + PN((long long)g_tradeJudged[0]) + "," + PN((long long)g_tradeJudged[1])
          + "," + PN((long long)g_tradeJudged[2]) + "," + PN((long long)g_tradeJudged[3]) + "," + PN((long long)g_tradeNever) + "," + PN((long long)g_tradeNoWindow)
          + " kitHover[why,hits]=" + std::string(g_hoverWhy) + "," + PN(g_hoverCells != 0 ? (long long)g_hoverCells->hits : -1)

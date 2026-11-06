@@ -3,14 +3,18 @@
    Ported from public pull request 3 (author MassDivide) and changed for this project.
 
    WHO IS AN ADMIN NOW (the world server decides; admincmd.h holds the command rules):
-     - the owner's game on the connection that proved this hosting's secret (HOST_TOKEN) - no password;
-     - any other connection only while it is LOGGED IN: its person id is the owner's or is listed in admins.txt, and it gave the
-       admin password with /login. The owner on another computer logs in like any admin.
-   A login ends on /logout, when the connection goes, and after kIdleSec without an admin command.
+     - THE OWNER (owner 1369 b): a connection that gave the OWNER password (rules.txt's `owner password =` line) with /login, from
+       any computer. The host's game types it by itself (the long random one HOST wrote and remembers); a person who started the
+       world by hand types their own once. Its login has no idle end and no /logout; it ends when the connection goes or the
+       owner password changes. A player id alone never makes a game the owner (it is self-reported).
+     - AN ADMIN: a connection whose person id is listed in admins.txt and that gave the ADMIN password with /login.
+   One /login road serves both: the CHALLENGE carries the one salt both keys are made with, and the proof is checked against the
+   owner key first, then the admin key. An admin login ends on /logout, when the connection goes, and after kIdleSec without an
+   admin command.
 
    THE PASSWORD NEVER LEAVES THE GAME AT LOGIN. "/login <password>" typed in chat is taken by the game itself and never sent as chat
    or as a command. The game asks for a challenge (ASK); the server answers with a fresh random nonce, the salt and iteration count
-   from admin-auth.txt and this connection's session number (CHALLENGE); the game sends back only
+   of its admin key and this connection's session number (CHALLENGE); the game sends back only
        key   = PBKDF2-HMAC-SHA256(password, salt, iterations, 32 bytes)
        proof = HMAC-SHA256(key, nonce || session (u32 LE) || u16 LE n || n bytes of the world id || kProofLabel)
    where the world id is the one the game was WELCOMEd with, so a proof made for one world is worth nothing on another (PROOF).
@@ -20,9 +24,13 @@
    connection, never the person id a game reports) for kLockFirstSec, doubled at each further lock, at most kLockMaxSec. A right
    proof clears it; a key with no wrong try for kForgetSec is forgotten.
 
-   admin-auth.txt (the world folder): "adm1 <iterations> <salt hex> <key hex>" - PASSWORD-EQUIVALENT (whoever reads it can make
-   proofs). Written by the world server when the owner's game sets the password (admincmd.h kVerbSetPassword, at least
-   kPasswordMinChars characters, checked by the server).
+   THE ADMIN PASSWORD is the `admin password =` line of the world's rules file (rulesfile.h, T-1158 step 7, owner 1368 a): the
+   world server makes its key in memory at each read of that file (a salt made once per run, kIterDefault rounds) and keeps no key
+   file - admin-auth.txt is never written. T-1254 (owner 1513 a): while rules.txt has no admin password line, the key 0.4.0 left in
+   admin-auth.txt (AuthLine) is the world's admin lock, with its own salt and rounds (worldpw.h Carried). The owner's game setting the password (admincmd.h kVerbSetPassword) writes
+   that line. No minimum length (owner 1368): PasswordOk asks only for a password that is not empty, at most kPasswordMaxBytes bytes
+   and without a control byte. The value is taken as /login takes a typed one (LoginPassword: the spaces at both ends dropped), so
+   the password in the file is the one an admin can type.
 
    THE ADMIN SECURITY LOG (admin-security-YYYYMMDD.log in the world folder, one per UTC day): one tab-separated line per event, built
    here from its fields alone - no password ever reaches it; text fields are made safe so a player cannot forge a line. Lines a
@@ -50,14 +58,14 @@ enum { kKindAsk = 1, kKindChallenge = 2, kKindProof = 3, kKindResult = 4, kKindL
 const size_t kNonceBytes = 16, kSaltBytes = 16, kKeyBytes = 32, kProofBytes = 32;
 /* kIterMax: the most key rounds a CHALLENGE may ask of the game, whose main thread runs them at /login. Each round is two SHA-256
    blocks in this portable code, about 2 microseconds on a slow PC, so 200,000 rounds stay under about half a second there. The
-   server writes kIterDefault and reads no admin-auth.txt past kIterMax; the game refuses a CHALLENGE past it. */
+   server makes its key with kIterDefault; the game refuses a CHALLENGE past kIterMax. */
 const unsigned kIterDefault = 100000, kIterMin = 100000, kIterMax = 200000;
 typedef char AdminIterDefaultInRange[(kIterDefault >= kIterMin && kIterDefault <= kIterMax) ? 1 : -1];   /* a compile error here = the written default is outside the limits */
 const double kChallengeSec = 30.0;     /* a challenge's life */
 const double kIdleSec = 1800.0;        /* a login ends after this long without an admin command */
 const double kAskBurst = 5.0, kAskPerSec = 0.05;   /* /login asks per connection: 5 at once, then one every 20 s */
 const size_t kWorldIdMax = 255;        /* the world id the proof covers is cut to this many bytes */
-const size_t kPasswordMinChars = 8, kPasswordMaxBytes = 128;
+const size_t kPasswordMaxBytes = 128;
 static const char kProofLabel[] = "SW-ADMIN-2";
 static const char kAuthFile[] = "admin-auth.txt";
 
@@ -104,10 +112,11 @@ inline size_t CharCount(const std::string& s)
     for (size_t i = 0; i < s.size(); ++i) if (((unsigned char)s[i] & 0xC0) != 0x80) ++n;
     return n;
 }
-/* the admin password's rule, on both sides: at least kPasswordMinChars characters, at most kPasswordMaxBytes bytes, no control byte */
-inline bool PasswordLongEnough(const std::string& pw)
+/* the admin password's rule for the set command, on both sides: not empty, at most kPasswordMaxBytes bytes, no control byte - no
+   minimum length (owner 1368) */
+inline bool PasswordOk(const std::string& pw)
 {
-    if (pw.size() > kPasswordMaxBytes || CharCount(pw) < kPasswordMinChars) return false;
+    if (pw.empty() || pw.size() > kPasswordMaxBytes) return false;
     for (size_t i = 0; i < pw.size(); ++i) if ((unsigned char)pw[i] < 0x20 || (unsigned char)pw[i] == 0x7F) return false;
     return true;
 }
@@ -245,14 +254,15 @@ inline bool DecodeProof(const char* p, size_t n, unsigned char proof[kProofBytes
 }
 /* RESULT codes - the game picks the approved words for each */
 enum { kResOk = 0,            /* logged in */
-       kResNotAdmin = 1,      /* this player is not the owner and not on the admin list */
+       kResNotAdmin = 1,      /* the admin password from a player not on the admin list */
        kResWrong = 2,         /* wrong admin password */
        kResLocked = 3,        /* too many wrong passwords: wait `wait` seconds */
-       kResNoPassword = 4,    /* no admin password is set for this world (or its file cannot be read): nobody can log in */
+       kResNoPassword = 4,    /* no admin or owner password is set for this world (or its file cannot be read), or no admin password
+                                 and the proof matched no owner password: nobody can log in as an admin */
        kResNoChallenge = 5,   /* the login took too long or was not asked for - type /login again */
        kResBusy = 6,          /* too many /login asks - wait a little */
        kResLoggedOut = 7,     /* logged out */
-       kResOwnerNoNeed = 8,   /* the owner's own game (it proved the hosting's secret) needs no login */
+       kResOwner = 8,         /* logged in with the owner password: the world's owner (owner 1369 b) */
        kResCount = 9 };
 const size_t kResultLen = 9;
 inline void EncodeResult(unsigned code, unsigned waitSec, std::vector<char>* b) { EncodeKind(kKindResult, b); PutU32(b, code); PutU32(b, waitSec); }
@@ -261,6 +271,19 @@ inline bool DecodeResult(const char* p, size_t n, unsigned* code, unsigned* wait
     if (n != kResultLen || KindOf(p, n) != kKindResult) return false;
     *code = GetU32At(p + 1); *waitSec = GetU32At(p + 5);
     return *code < (unsigned)kResCount;
+}
+
+/* THE WORLD SERVER'S VERDICT ON ONE /login PROOF (owner 1369 b): checked against the owner key first - the owner, whatever player id
+   the connection names - then the admin key, which makes an admin only of a player listed in admins.txt. set = that password is
+   set; match = the proof matches its key. ownerNow = the connection is logged in as the owner already: an owner login stays the
+   owner until the connection ends or the owner password changes, so the admin password then answers as the owner (and a wrong
+   one leaves the login as it is - the caller never ends a login on a wrong proof). */
+enum { kProofOwner = 0, kProofAdmin = 1, kProofNotListed = 2, kProofWrong = 3, kProofNoPassword = 4 };
+inline int ProofVerdict(bool ownerSet, bool ownerMatch, bool adminSet, bool adminMatch, bool listed, bool ownerNow = false)
+{
+    if ((ownerSet && ownerMatch) || (ownerNow && adminSet && adminMatch)) return kProofOwner;
+    if (adminSet && adminMatch) return listed ? kProofAdmin : kProofNotListed;
+    return adminSet ? kProofWrong : kProofNoPassword;
 }
 
 /* ---- a connection's login state (the server's) ---- */
@@ -272,16 +295,19 @@ struct Session
     int elevated;                         /* logged in */
     double lastUse;                       /* the login, then each admin command */
     std::string person;                   /* the person id that logged in: a login holds only while the connection still names it */
-    Session() : pending(0), askedAt(0.0), elevated(0), lastUse(0.0) { std::memset(nonce, 0, sizeof(nonce)); }
+    int owner;                            /* the login gave the owner password: the world's owner (no idle end, no list) */
+    Session() : pending(0), askedAt(0.0), elevated(0), lastUse(0.0), owner(0) { std::memset(nonce, 0, sizeof(nonce)); }
 };
-/* true = this connection is logged in now (as `person`); an idle one is ended here (*idleEnded = 1, once). A connection whose person id
-   is no longer the one that logged in (or is no longer the owner's or listed: stillListed false) is logged out too. */
+/* true = this connection is logged in now (as `person`); an idle admin login is ended here (*idleEnded = 1, once). A connection whose
+   person id is no longer the one that logged in (or, for an admin login, is no longer listed: stillListed false) is logged out too.
+   An owner login (s->owner) holds while the connection names the same person: it has no idle end and needs no list. */
+inline void LoginClear(Session* s) { s->elevated = 0; s->owner = 0; s->person.clear(); }
 inline bool ElevatedNow(Session* s, double now, const std::string& person, bool stillListed, int* idleEnded)
 {
     *idleEnded = 0;
     if (!s->elevated) return false;
-    if (person.empty() || person != s->person || !stillListed) { s->elevated = 0; s->person.clear(); return false; }
-    if (now - s->lastUse >= kIdleSec || now < s->lastUse) { s->elevated = 0; s->person.clear(); *idleEnded = 1; return false; }
+    if (person.empty() || person != s->person || (!s->owner && !stillListed)) { LoginClear(s); return false; }
+    if (!s->owner && (now - s->lastUse >= kIdleSec || now < s->lastUse)) { LoginClear(s); *idleEnded = 1; return false; }
     return true;
 }
 /* a challenge taken for its one proof: false = none out, or too old (either way it is gone now) */
@@ -459,41 +485,41 @@ inline std::vector<std::string> SecLogPrune(const std::vector<std::string>& name
 }
 
 /* ---- ADMIN_STANDING (101, server -> game): a game's admin standing, as the world server holds it ----
-   {u32 standing, u32 why} - 8 bytes. Sent to one game at its WELCOME (none, or owner when its connection proved this hosting's
-   secret) and each time the world server changes that game's standing: a login taken, its /logout, the idle end, the admin password
-   set (every login ends), its player no longer the owner or on the admin list (or the connection no longer naming the player that
-   logged in). A game is an admin now while the last standing of its link says so; a new link is none until its first standing. */
+   {u32 standing, u32 why} - 8 bytes. Sent to one game at its WELCOME (none: a player id never makes a game the owner, owner 1369 b)
+   and each time the world server changes that game's standing: a login taken (admin, or owner with the owner password), its
+   /logout, the idle end, the admin password set (every admin login ends) or the owner password changed (every owner login ends),
+   its player no longer on the admin list (or the connection no longer naming the player that logged in). A game is an admin now while the last standing of its link says so; a new link is none until its first standing. */
 const unsigned kMsgAdminStanding = 101;
 enum { kStandNone = 0, kStandAdmin = 1, kStandOwner = 2, kStandCount = 3 };
-enum { kWhyWelcome = 0,           /* the WELCOME: none, or owner */
-       kWhyLogin = 1,             /* a right proof: admin */
+enum { kWhyWelcome = 0,           /* the WELCOME: none */
+       kWhyLogin = 1,             /* a right proof: admin, or owner */
        kWhyLogout = 2,            /* the player's own /logout */
        kWhyIdle = 3,              /* kIdleSec without an admin act */
-       kWhyPasswordChanged = 4,   /* the admin password was set: every login ends */
-       kWhyRemoved = 5,           /* no longer the owner or on the admin list, or the connection names another player */
+       kWhyPasswordChanged = 4,   /* the admin password was set (every admin login ends) or the owner password changed (every owner login) */
+       kWhyRemoved = 5,           /* no longer on the admin list, or the connection names another player */
        kWhyLinkEnded = 6,         /* the game's own: its link to the world server ended (never on the wire) */
        kWhyCount = 7 };
 const size_t kStandingLen = 8;
 inline void EncodeStanding(unsigned standing, unsigned why, std::vector<char>* b) { b->clear(); PutU32(b, standing); PutU32(b, why); }
-/* the game's side: a known standing with a reason that fits it (owner or none at the WELCOME, admin at a login, none otherwise) */
+/* the game's side: a known standing with a reason that fits it (none at the WELCOME, admin or owner at a login, none otherwise) */
 inline bool DecodeStanding(const char* p, size_t n, unsigned* standing, unsigned* why)
 {
     if (p == 0 || n != kStandingLen) return false;
     *standing = GetU32At(p); *why = GetU32At(p + 4);
     if (*standing >= (unsigned)kStandCount || *why >= (unsigned)kWhyLinkEnded) return false;
-    if (*why == (unsigned)kWhyWelcome) return *standing != (unsigned)kStandAdmin;
-    if (*why == (unsigned)kWhyLogin) return *standing == (unsigned)kStandAdmin;
+    if (*why == (unsigned)kWhyLogin) return *standing != (unsigned)kStandNone;
     return *standing == (unsigned)kStandNone;
 }
-/* THE WORLD SERVER'S END OF A LOGIN, and the reason its game is told (standing none). passwordSet = the admin password was just set:
-   every login ends (kWhyPasswordChanged) and every challenge out is dropped. Otherwise as ElevatedNow: kWhyIdle after kIdleSec
-   without an admin act, kWhyRemoved when `person` is not the one that logged in or is no longer the owner's or listed (stillListed
-   false). -1 = no login ended here (none was in, or it holds) - that game is told nothing. */
-inline int LoginEnds(Session* s, bool passwordSet, double now, const std::string& person, bool stillListed)
+/* THE WORLD SERVER'S END OF A LOGIN, and the reason its game is told (standing none). adminPwSet = the admin password was just set:
+   every admin login ends (kWhyPasswordChanged); ownerPwSet = the owner password changed: every owner login ends; either drops every
+   challenge out. Otherwise as ElevatedNow: kWhyIdle after kIdleSec without an admin act (an admin login), kWhyRemoved when `person`
+   is not the one that logged in or an admin login's player is no longer listed (stillListed false). -1 = no login ended here (none
+   was in, or it holds) - that game is told nothing. */
+inline int LoginEnds(Session* s, bool adminPwSet, bool ownerPwSet, double now, const std::string& person, bool stillListed)
 {
-    if (passwordSet) s->pending = 0;
+    if (adminPwSet || ownerPwSet) s->pending = 0;
     if (!s->elevated) return -1;
-    if (passwordSet) { s->elevated = 0; s->person.clear(); return kWhyPasswordChanged; }
+    if (s->owner ? ownerPwSet : adminPwSet) { LoginClear(s); return kWhyPasswordChanged; }
     int idle = 0;
     if (ElevatedNow(s, now, person, stillListed, &idle)) return -1;
     return idle ? kWhyIdle : kWhyRemoved;

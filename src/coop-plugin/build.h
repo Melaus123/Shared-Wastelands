@@ -19,11 +19,13 @@ void BuildNoteRecv(const coopbuild::BuildMsg& m, unsigned int fromPeer);   // bu
 void BuildForgetWorld();                              // build1-c (review-build1b M2): world teardown - pending PLACEs / STATEs and the copy rows
 void BuildNoteBad();                                  // build1-b: a MSG_BUILD that did not decode
 void PowerNoteRecv(const powerwire::PowerMsg& m, unsigned int fromPeer);   // P47, MAIN THREAD (session dispatch): a POWER_STATE / POWER_ASK, kept for the K2 safe point
+int  CraftAskOf(void* b, int slot, int op, const std::string& sid, const std::string& extra, int mode, unsigned int index);   // T-1192 (c), MAIN THREAD: the crafting window's add / entry removal / repeat asked of the bench's writer at slot (CRAFT_ASK, op powerwire::kCraftOp*); 1 asked, 2 a like ask already waits (not sent again), 0 not sent (said)
 void BuildTestDrain();                                // K2 safe point (combat.cpp detour_tsRagdollUpdates): runs the armed request
 std::string BuildListCommand();
 std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAIN THREAD, read-only: `bldstate <key-substring|key>` - a piece's own state as the kept lay writes it
 std::string BuildSetArm(const std::string& arg);         // KEPT, TEST-ONLY, MAIN THREAD: `bldset <key-substring|key> <field> <value>` - armed, written at the K2 safe point
 std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | refound <name> <dx> <dz> | link <key-substring> | list` - found / refound / link armed for the K2 safe point, list read now
+void BuildTownsMapEvent();                               // T-1158 step 6 review MED-2, MAIN THREAD (store.cpp KeptRecordSweepTick, each applied area map): released pieces held for another writer owe their area's own-piece check
 void BuildTownsNote(const char* p, size_t n);            // OUTPOSTS, MAIN THREAD (store.cpp): a TOWNS LIST from the world server - the kept outposts and their pieces' keys
 void BuildShowNote(const char* p, size_t n);             // T-811, MAIN THREAD (store.cpp): a SHOW from the world server - the teammates' outposts, shown at the next drain
 void BuildShowBeforeSave(int onMainThread);              // T-811 (store.cpp saveGame pre-hook): counts the bases founded here still standing at the save (no engine write)

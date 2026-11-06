@@ -12,6 +12,9 @@
      NOT HOLDER / BUSY / no answer / the link down - asked again (the SAME id; the holder answers a repeat of a TAKE it already
               granted from the item it keeps), never removed silently. Other refusals (unreadable) are asked again up to kReaskMax
               times, then the item stays with the picker, counted.
+     BUSY x12 (T-1181) - kBusyMax busy answers for one pickup (about 4 minutes of re-asks) end it as a GONE ends it: the units go
+              back out of the picker - and, the holder still having the item, onto this game's ground where it lay (never this
+              game's own drop), so both games show it there. Never kept with the picker: that left it on both games.
    Header-only, no engine types; shared by items.cpp and the offline suite (coop-test). */
 
 #include "groundkey.h"
@@ -44,7 +47,9 @@ inline int AskAction(int mineNow, int unconfHere, int unconfWaiting, int putEver
 /* The holder's answer to a shown TAKE. */
 const int kSgGranted = 1, kSgRemove = 2, kSgOwnDrop = 3, kSgReask = 4, kSgHeldHere = 5, kSgKeepStop = 6;
 const int kReaskMax = 12;   /* an unreadable / other refusal: asked this many times, then the item stays with the picker (counted) */
-inline int SettleAction(int ok, int reason, int unconfHere, int unconfWaiting, int mineNow, int tries)
+const int kBusyMax = 12;    /* T-1181: "busy" answers for one pickup, this one counted, that end it (kSgRemove; ReaskDelayMs: about 4 minutes) */
+/* busySeen (T-1181): the busy answers this pickup has had, this answer included (GrRow.busyTries + 1 on a busy answer; 0 = none) */
+inline int SettleAction(int ok, int reason, int unconfHere, int unconfWaiting, int mineNow, int tries, int busySeen = 0)
 {
     if (ok != 0) return kSgGranted;
     if (reason == coopground::kGroundReasonNotFound)
@@ -53,7 +58,8 @@ inline int SettleAction(int ok, int reason, int unconfHere, int unconfWaiting, i
         return kSgRemove;
     }
     if (reason == coopground::kGroundReasonNotHolder) return (mineNow != 0) ? kSgHeldHere : kSgReask;
-    if (reason == coopground::kGroundReasonBusy) return kSgReask;   /* the holder's own pickup of it is running: gone or yes next time */
+    if (reason == coopground::kGroundReasonBusy)   /* the holder's own pickup of it is running: gone or yes next time */
+        return (busySeen >= kBusyMax) ? kSgRemove : kSgReask;   /* T-1181: a holder still busy after kBusyMax answers - it ends */
     return (tries >= kReaskMax) ? kSgKeepStop : kSgReask;
 }
 
@@ -88,7 +94,7 @@ inline int Shortfall(int want, int removed)
 }
 
 /* p105g-f1-5c: which refusals count toward kReaskMax. "Not holder", "busy" and our own drop's "no such item" while its PUT may still
-   land are asked again without a cap; a failed send (the link) is no refusal at all (GrRow.tries only paces the re-asks). */
+   land are asked again without a cap (T-1181: "busy" has its own, kBusyMax); a failed send (the link) is no refusal at all (GrRow.tries only paces the re-asks). */
 inline int CapCounts(int reason)
 {
     return (reason == coopground::kGroundReasonNotFound || reason == coopground::kGroundReasonNotHolder

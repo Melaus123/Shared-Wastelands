@@ -73,7 +73,9 @@ int ActiveZoneSectors(int* sx, int* sy, int cap);
 /* inv5 (kept from phase 0 by phase 1): every ITEM lying on the ground in this game's active zones (ZoneMapContent::items, the
    unordered_set<hand> at +0x110 that saveItems writes), each hand resolved through the engine's own hand::getItem 0x791D90
    (table). Read-only. MAIN THREAD. Returns the count written; `truncated` 1 = a zone or the cap cut the walk short. */
-int LoadedGroundItems(void** out, int cap, int* zonesSeen, int* truncated);
+int LoadedGroundItems(void** out, int cap, int* zonesSeen, int* truncated, int* unread = 0);
+/* T-1039 fold 1: `unread` (may be 0) = 1 when the zone list could not be read (0 items is then NOT "none here"), plus one per active
+   zone whose content could not be read (skipped). A caller proving absence needs it 0 as well as `truncated`. */
 // M-D - does ANOTHER game have this sector loaded? M2: answered from the NOTEBOOK'S area map alone (OtherLoadedTS == 1).
 // With no fresh map it answers false, so a caller that must not read that as 'nobody has it' asks RelayMapFresh() first.
 // OwnedByOther (the A6 owner map) and PeerZonesFresh (the session-link clock) are deleted. ANY THREAD.

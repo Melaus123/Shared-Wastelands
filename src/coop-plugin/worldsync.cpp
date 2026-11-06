@@ -28,7 +28,6 @@
 
 #include "coop_log.h"
 #include "handoff.h"   /* T-1 B1: SquadDecisionPos - a squad member is decided by its squad's position */
-#include "doors.h"   /* DoorsServeCatchup - the catch-up answer re-offers the doors this game holds there */
 #include "../common/squadwriter.h"   /* M7a3f3 [m7a3f3-ws0]: kAnn* and HandedOverSweepAction */
 #include "../common/lostcopy.h"   /* ResendOwnerVerdict, StaleRowGivesWay */
 #include "game/Character.h"
@@ -426,6 +425,8 @@ long long g_reannounceDrained = 0;
 long long g_p21Seen = 0, g_p21Spawned = 0, g_p21Guard = 0, g_p21Rule = 0, g_p21Radius = 0, g_p21Ticks = 0; int g_p21Logged = 0;
 long long g_sweepWakeDupSkipped = 0; int g_sweepWakeDupLogged = 0;   /* people of a refused duplicate wake the sweep did not adopt */
 long long g_sweepContextSkipped = 0; int g_sweepContextLogged = 0;   /* rebuilt people of a context platoon the sweep did not adopt */
+long long g_sweepContextTakeBack = 0;   /* T-1229: rebuilt people of a context platoon whose last sleep here held only this game's people - sent on to the adoption rules */
+std::map<const void*, int> g_sweepContextTakeBackLogged;   /* T-1229: the platoons already logged (one line each; the first 32) */
 long long g_sweepHandedOverSkipped = 0, g_sweepHandedOverAdopted = 0; int g_sweepHandedOverLogged = 0;   /* M7a3f3 T-425 [m7a3f3-ws2] */
 long long g_sweepStandInSkipped = 0;   /* inv7a-b: stand-in copies (faction RECORD coop-p<n> / coop-peer) the sweep met and did not adopt (pass 0 only) */
 static ::Faction* SweepFactionPod(::Character* c)   /* area2 fold: the faction read under its own frame (the purge's PurgeFactionPod form) */
@@ -1011,6 +1012,44 @@ static void P166Report()
 #endif
 // PROBE-END: P166
 
+/* T-1055 (owner 1363) - WHY ONE OF THIS GAME'S OWN PLAYER CHARACTERS IS NOT SHOWN TO ANOTHER PLAYER, in the release log. Log only,
+   from the announce pass's own inputs: a player-faction character not announced (state 0) while another slot is IN_WORLD on this
+   link's roster is noted; once it has stayed so kAnnUnshownSayMs, one line per uid per reason, and one more when it is announced
+   again. The announce is per character, not per receiver, so every other IN_WORLD slot is named. At most kAnnUnshownLinesMax lines a
+   session. Nothing is sent or changed. why: 0 no other game has its area loaded (held false), 1 another game has it and this game
+   has not (mineLoaded false), 2 both have it - its SPAWN is decided and has not gone out. */
+struct AnnUnshown { DWORD sinceMs; int saidWhy; };   /* since when it is not shown; the reason last said, -1 = no line yet */
+static std::map<unsigned int, AnnUnshown> g_annUnshown;
+static long long g_annUnshownLines = 0;
+static const DWORD kAnnUnshownSayMs = 30000;
+static const long long kAnnUnshownLinesMax = 40;
+static void AnnUnshownNote(unsigned int uid, ::Character* c, bool shown, bool held, bool mineLoaded)
+{
+    if (!IsPlayerFaction(c->getOwnerFactionDirect())) return;
+    std::map<unsigned int, AnnUnshown>::iterator it = g_annUnshown.find(uid);
+    if (shown && it == g_annUnshown.end()) return;
+    std::string slots;
+    const int mine = StoreMySlot(), count = StoreWorldPlayerCount();
+    for (int s = 0; s <= count && s < 64; ++s)
+        if (s != mine && StoreRosterSlotInWorld(s) == 1) { if (!slots.empty()) slots += ","; slots += S((long long)s); }
+    if (slots.empty()) { if (it != g_annUnshown.end()) g_annUnshown.erase(it); return; }   /* no other game in the world: nobody to show it to */
+    const DWORD now = ::GetTickCount();
+    const int why = !held ? 0 : (!mineLoaded ? 1 : 2);
+    if (!shown && it == g_annUnshown.end()) { AnnUnshown u = { now, -1 }; g_annUnshown[uid] = u; return; }
+    const int said = it->second.saidWhy;
+    if (shown) g_annUnshown.erase(it);
+    else if (why == said || (DWORD)(now - it->second.sinceMs) < kAnnUnshownSayMs) return;
+    else it->second.saidWhy = why;
+    if ((shown && said < 0) || g_annUnshownLines >= kAnnUnshownLinesMax) return;
+    ++g_annUnshownLines;
+    std::string name;
+    if (!NameOf(c, &name)) name = "?";
+    if (name.size() > 40) name.resize(40);
+    if (shown) { DebugLog("[WORLD] shown to slot " + slots + ": '" + name + "' uid=" + S((long long)uid)); return; }
+    DebugLog("[WORLD] not shown to slot " + slots + ": '" + name + "' uid=" + S((long long)uid) + " why="
+             + (why == 0 ? "no other game has this area loaded" : why == 1 ? "this game has not loaded this area" : "its announce has not gone out yet"));
+}
+
 static void AnnouncePass()
 {
     ++g_announceTicks;
@@ -1073,6 +1112,7 @@ static void AnnouncePass()
         P166Note(kP166Pass, c, uid, pos, P166DecOfAnn(ann, ReleasePendingHas(uid)), annWhy);
 #endif
         // PROBE-END: P166
+        AnnUnshownNote(uid, c, state == 1, held, mineLoaded);   /* T-1055: the release log's not shown / shown line (log only) */
         if (ann == cooplive::kAnnHoldForHandover)
         {
             if (it == g_announced.end()) g_announced[uid] = 1;   /* stays marked announced: ReleaseOnPutAway opens its RELEASE and WithdrawHeldUnload sends its UNLOAD */
@@ -1336,14 +1376,37 @@ void WorldSyncTick()
             const bool sweepPlayerF = IsPlayerFaction(c->getOwnerFactionDirect());
             Ogre::Vector3 dp = p;
             if (!sweepPlayerF) { float sqx = 0, sqz = 0; if (SquadDecisionPos(c, &sqx, &sqz) == 1) { dp.x = sqx; dp.z = sqz; } }
-            /* a rebuilt person of a CONTEXT platoon (built here for another game's announced squad; its people arrive by SPAWN) is never
+            /* a rebuilt person of a CONTEXT platoon (built here for another game's announced squad; its people arrive by SPAWN) is not
                adopted: a body in it that is not a registered copy was rebuilt by this game's engine from the platoon's sleeping data, and
                adopting it would SPAWN a second copy of that game's person under a fresh uid. Noted for the orphan clean-up; the refused
-               wake's drop (store.cpp detour_activate) removes the platoon. */
+               wake's drop (store.cpp detour_activate) removes the platoon. T-1229 (run T1944 A 597.915): except a TAKE-BACK - the
+               platoon's last sleep here held only people this game runs (coopsquad::ContextSweepAdopt; the wake rule's own fact): its
+               rebuilt people are this game's and go on to the rules below. */
             if (!sweepPlayerF)
             {
                 SquadView csv;
+                int ctxAns = coopsquad::kCtxSweepGo;
                 if (ReadSquadOf(c, &csv) == 1 && IsContextPlatoon(csv.platoon) == 1)
+                {
+                    int sc = 0, sk = 0, sm = 0;
+                    const int held = StoreCtxSleptCounts(csv.platoon, &sc, &sk, &sm);
+                    ctxAns = coopsquad::ContextSweepAdopt(1, held, sc, sk, sm);
+                    if (ctxAns == coopsquad::kCtxSweepTakeBack && pass == 0)
+                    {
+                        ++g_sweepContextTakeBack;
+                        if (g_sweepContextTakeBackLogged.size() < 32 && g_sweepContextTakeBackLogged.count((const void*)csv.platoon) == 0)
+                        {
+                            g_sweepContextTakeBackLogged[(const void*)csv.platoon] = 1;
+                            const Sector ts = SectorOf(dp.x, dp.z);
+                            void* tf = 0; std::string tid; if (!SquadKeyOf(c, &tf, &tid)) tid = "?";
+                            char tp[32]; std::sprintf(tp, "%p", csv.platoon);
+                            SW_DEVLOG("[P033] sweep: context platoon " + std::string(tp) + " id='" + tid + "' (sector " + S((long long)ts.x) + "," + S((long long)ts.y)
+                                     + ") - its last sleep here held only this game's people (chars=" + S((long long)sc) + " known=" + S((long long)sk) + " mine=" + S((long long)sm)
+                                     + "): a take-back, its rebuilt people go on to adoption (sweepContextTakeBack=" + S(g_sweepContextTakeBack) + "; one line per platoon, the first 32)");
+                        }
+                    }
+                }
+                if (ctxAns == coopsquad::kCtxSweepRefuse)
                 {
                     if (pass == 0)
                     {
@@ -1940,7 +2003,7 @@ void ReportWorldSync()
              + " falseGone=" + S(g_falseGone)
              + " sweepStandInSkipped=" + S(g_sweepStandInSkipped)   /* inv7a-b */
              + " sweepAdopted[own,world]=" + S(g_sweepOwnAdopted) + "," + S(g_sweepWorldAdopted)   /* characters the sweep adopted: this game's own player faction, and every other */
-             + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped) + " sweepWakeDupSkipped=" + S(g_sweepWakeDupSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
+             + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped) + " sweepContextTakeBack=" + S(g_sweepContextTakeBack) + " sweepWakeDupSkipped=" + S(g_sweepWakeDupSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
              + OrphanReportTokenWs()   /* orphan1: orphan[removed,skipped,gatedHeldUnlinked]= */
              + " reannounceSkippedNotMine=" + S(g_reannounceSkippedNotMine)
              + " stale1[rowsSuperseded,staleUidSpared]=" + S(g_rowsSuperseded) + "," + S(g_staleUidSpared)
@@ -2010,6 +2073,7 @@ void ReportWorldSync()
 // population is not adopted. That is the same as today; this function does not make it worse.
 void WorldsyncWorldTeardown()
 {
+    g_sweepContextTakeBackLogged.clear();   /* T-1229 fold 3: the take-back lines' platoons belong to the freed world */
     const int rows = g_adoptedCount;
     for (int i = 0; i < g_adoptedCount && i < kMaxAdopted; ++i)
     {
@@ -2141,16 +2205,6 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
         return;
     }
     SquadLeadReannounce(a.keys);   /* M7a A1 build 1 [a1b1-ws0] [review F7]: a game that newly has the area hears the leaders of the squads there again (handoff.cpp; fold 1 [a1b1f1-ws0] [F5]: only those) */
-    {   /* the asker is in these sectors' delivery set from now: the resting doors this game holds there are re-offered to it once */
-        std::vector<int> dx, dy;
-        for (size_t k = 0; k < a.keys.size(); ++k)
-        {
-            const int key = (int)a.keys[k];
-            if (key < 0 || key >= cooplive::kAreaKeyCount) continue;
-            dx.push_back(cooplive::AreaKeyX(key)); dy.push_back(cooplive::AreaKeyY(key));
-        }
-        if (!dx.empty()) coop::DoorsServeCatchup(&dx[0], &dy[0], (int)dx.size(), (int)a.slot, (unsigned int)a.askNo);
-    }
     std::set<int> want(a.keys.begin(), a.keys.end());
     long long mine = 0, resent = 0, announced = 0, failed = 0, held = 0;
     cooplive::CatchupEndMsg end; end.askNo = a.askNo; end.keys = a.keys;

@@ -1,11 +1,14 @@
 // store.cpp - the shared sleeping-record store, phase 1. See store.h for the contract and
 // docs/persistence-service.md for the design; engine facts F451-F454 (.modding/03-systems/platoon-lifecycle.md).
 #include "store.h"
+#include "../common/leverpick.h"   /* T-1218: TEST-ONLY picks by key - exactly one, or `#<k>` */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "ownstore.h"   /* mmo1: the own-squad record writer */
 #include "ui.h"         /* mmo5: the host-left window (UiHostLeftShow / UiHostLeftExitClicked) */
 #include "bugreport.h"  /* T-461: LOG_ASK / LOG_PART, a nearby player's log for a bug report */
 #include "chat.h"       /* a chat line from another player */
+#include "teammap.h"    /* T-930: MAP_DOTS - teammates' characters on the world map */
+#include "command_channel.h"   /* PathNextToDll: login-passwords.txt beside this DLL */
 #include "../common/ownrec.h"
 #include "../common/buildpick.h"   /* T-906: WorldKey - the building-swap pick's world key */
 #include "../common/zonerec.h"   /* T-609 part 2 (H1): a zone record is stamped max(now, last + 1) */
@@ -21,6 +24,8 @@
 #include "../common/townverwire.h"   /* TOWN_VER (87): one town version per placed town */
 #include "../common/livefirst.h"   /* T-1118 (b) (protocol 126): CHUNK (88) - the number this file reserves must agree */
 #include "townver.h"   /* TownVerArrive / TownVerFeedBegin / TownVerFeedPageEnd / TownVerWorldLoadBegan */
+#include "camp.h"      /* T-929: CampArrive / CampWorldLoadBegan - the world's camp list */
+#include "../common/campwire.h"   /* T-929: CAMP (93) */
 #include "../common/squadwriterreg.h"   /* T-1084 step 5: the world server's per-squad writer register - SQUAD_TAKE / SQUAD_WRITER */
 #include "../common/clearnear.h"   /* owner 1205 a: the TEST-ONLY clearnear lever's argument check, keep decision and reply */
 #include "../common/squadorigin.h"   /* a squad's origin slot: its number's block, or for a save squad the game that runs it now */
@@ -30,10 +35,15 @@
 #include "../common/groundrec.h"   /* T-697 step 2: a ground.<sx>.<sy> record is an area's ground (items.cpp keeps it), never a squad; GROUND_REFUSE (71) */
 #include "../common/piecerec.h"   /* a piece.<sx>.<sy>.#<hash>.<x10>.<z10>.<y10> record is one built piece (build.cpp keeps it), never a squad */
 #include "../common/shoprec.h"    /* a shop.<sx>.<sy>.#<hash>.<x10>.<z10> record is one shop building's restock state (items.cpp keeps it), never a squad */
+#include "../common/doorrec.h"    /* a door.<sx>.<sy>.#<hash> record is one world door's facts (doors.cpp keeps it), never a squad */
 #include "../common/boxrec.h"   /* T-823: a box.<sx>.<sy>.#<hash>.<x10>.<z10> record is one box's contents (items.cpp keeps it), never a squad */
+namespace coop { void SameIdWithdrawMarkClearNear(const unsigned int* uids, int n); void SameIdWithdrawDone(); long long SameIdClearNearUnoffered(); }   /* handoff.cpp (handoff.h): the TEST-ONLY clearnear lever's removed squads are never offered to another game */
 namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); int HandedOverSlot(void* faction, const std::string& id); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
 namespace coop { void* SpawnBuildingFromSentHand(const unsigned char* handRaw32); int PlatoonHomeHandPod(const void* platoon, unsigned char* out32); int PlatoonSetHomeHandPod(void* platoon, const unsigned char* handRaw32); }   /* spawn.cpp: a sent building handle resolved here; a squad's home-building hand read and given back [t755-copyhome-decl] */
 namespace coop { void KeptNoteRows(const char* p, size_t n); void KeptSaveFinished(long reqSeq); void KeptAreaWritten(const std::string& zoneId); void KeptAreaEcho(const std::string& worldId, int hasStamp, long long stamp); void KeptAreaSent(const std::string& zoneId, int sent, long long stamp); void KeptAreaStampSent(const std::string& zoneId, long long stamp); }   /* KEPT (src/common/keptwire.h): the rows and their state, and what settles a lay - defined in the kept block at the end of this file */
+namespace coop { int TalkWindowOpenNow(); }   /* speech.cpp (speech.h): T-978 - 1 = this game's conversation window shows a conversation now */
+namespace coop { void TalkFreezeWorldTeardown(); }   /* speech.cpp (speech.h): T-978 A - the frozen NPC slot is forgotten at the world teardown */
+namespace coop { bool AdminLogoutHolds(); }   /* admin.cpp (admin.h): owner 1412 b - this player typed /logout in this world; the door answer carries no login proof until it leaves the world */
 namespace coop { void KeeperMoneyKnownMark(void* own, int ev); int KeeperMoneyKnown(void* own); void KeeperRecordMoneyNote(int carried); void KeeperMoneyListNote(int kind); int ShopPlatoonRecorded(void* platoon); void ShopPlatoonForget(void* platoon); }
 namespace coop { void BoxOwedCopyFollow(); }   /* below, with the box changes a save holds: each waiting save's copy follows its noted rows */
 namespace coop { void KeeperRepairForget(void* own); }   /* items.cpp: a freed squad's pot leaves the keeper repair's rows */   /* handoff.cpp: T-799 the money-known mark of a squad pot (D1) and the records' money counts (D2) */
@@ -51,6 +61,7 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "admin.h"   /* AdminArrive - the admin login, this game's admin standing and the admin commands */
 #include "../common/adminauth.h"   /* kMsgAdminLogin (103), kMsgAdminStanding (101) */
 #include "../common/admincmd.h"    /* kMsgAdminReply (100) */
+#include "../common/admintool.h"   /* kMsgAdminDo (98): a toolbox job for this game */
 #include "../common/moneywire.h"   /* T-810: MONEY (73-77) and the pp.money record's version 2 */
 #include "spawn.h"          // FindSpawnedUid - is this character one of the session's uids?
 #include "identity.h"       // PROBE P120: CaptureObjId - a member's handle (index, serial)
@@ -100,6 +111,7 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "items.h"        /* E22a: the item-move counters, printed on the same [STORE] REPORT line */
 #include "doors.h"        /* E45: DoorsWorldTeardown */
 #include "policy.h"       /* E36 / decision 40: the base access policy's counters, and the enum this file's ONE writer assigns */
+#include "../common/bookshare.h"   /* T-1242: a research's Books in a teammate's bench */
 #include "soak.h"   /* GameplayRunning (decision 31a) */
 #include "tags.h"   /* TagsCaptionsDirty: a new PLAYERS roster renames the name tags */
 #include "config.h"   /* E38 / decisions 42-43: RoleIsSingle, ConfigSlot, ConfigWorldKey */
@@ -120,8 +132,10 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "../common/restoreguard.h"   /* restore1a: the world guard - its pure decision, key-file fields 5-7 and the WORLD_SAVED wire - the SAME header the notebook and the offline suite compile */
 #include "../common/areadrop.h"   /* M9 (T-197; world-server protocol 65): the AREAMAP layout (seat table + 256-wide rows) - the SAME header the world server and the offline suite compile */
 #include "../common/storelink.h"   /* B10-b (review-b10 M-3 / M-7): coopstore::RepushDecide and StoreHandshakeDecide - the store link's two pure decisions, in the SAME translation unit the notebook and the offline test exe compile. */
-#include "../common/authproof.h"   /* the world's password: the proof, auth.txt's line - the SAME header the world server and the offline suite compile */
+#include "../common/authproof.h"   /* the world's password: the proof - the SAME header the world server and the offline suite compile */
+#include "../common/worldpw.h"     /* the world password's text: the spaces at both ends dropped, as the world server reads the file */
 #include "../common/accessrule.h"   /* TEST-ONLY accesstest: access.txt's shape */
+#include "../common/netthrottle.h"   /* T-1168 TEST-ONLY netthrottle off|on: the word and the world server's request file */
 #include "../common/sendbundle.h"   /* M13: BUNDLE (59) - the messages of one pass as one packet per lane; the SAME header the world server and the offline suite compile */
 #include "../common/writerladder.h"   /* B10 (audit C11): coopwriter::ZoneWriterDecide - ZoneWriteIsMine takes THE SAME ladder items.cpp takes for a box, a door and a shop, and the offline suite sweeps the whole rule without a game. */
 #include "settings.h"   /* settings2 S2: the OPTIONS handler hands the gp.* keys to settings.cpp */
@@ -174,6 +188,7 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include <vector>
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 #include "../common/spimport.h"   /* T-1096: starting a new profile from a single-player save */
+#include "../common/crashkeep.h"   /* the marker line the next launch's crash judgement looks for (RoutesMarked) */
 #include "../common/lookalikelist.h"   /* T-1096: LOOKALIKE (90) - the world's look-alike list; the SAME header the world server and the offline suite compile */
 
 namespace coop {
@@ -192,21 +207,91 @@ long long g_sleepStampBumped = 0;   /* review-s2hb fold: a sleep record stamped 
    g_storeAuthStop: the world server refused this join for its password or its access list (coopstore::StoreRefuseStopsJoin), so
    neither re-dial dials it again (StoreLinkSockState reads it as refused) until the player acts - a password, or leaving. */
 std::string g_hostPassword, g_joinPassword;
+/* THE WORLD'S OWNER PASSWORD ON THE HOST'S GAME (owner 1369 b / 1371): rules.txt's `owner password =` value as HOST found it there,
+   or the long random one HOST wrote there when the line was empty (StoreWriteWorldPassword) - the file keeps it, so each HOST of the
+   world finds the same one. This game shows it at the door of a hosting link (StoreAuthAnswer) and logs in with it by itself
+   (admin.cpp). Memory only; never logged. */
+std::string g_hostOwnerPassword;
+/* THE LOGIN PASSWORDS THIS GAME REMEMBERS (owner 1380 / 1379): after a typed /login that a world's server took as the owner or an admin,
+   the password is kept in login-passwords.txt beside this DLL for the place this link dialled and that world's id (authproof::LoginPut)
+   and shown at the door of a link to the same place whose challenge names the same world (StoreAuthAnswer), so the world server logs
+   this game in at its admission. A server anywhere else gets no proof, whatever world id it names. One the world server answers as a
+   wrong password is forgotten (admin.cpp OnResult). Never logged. */
+int g_storeDoorLoginSentLink = 0;   /* this link's door answer carried a login proof */
 int g_storeAuthStop = 0;
 long long g_storeAuthAnswered = 0, g_storeAuthNoPassword = 0, g_storeAuthBadChallenge = 0, g_storeRefusedAuth = 0;
-long long g_storeAuthExtra = 0, g_storeHostTokenSent = 0, g_storeHostTokenFailed = 0;
+long long g_storeAuthExtra = 0, g_storeDoorLoginSent = 0, g_storeLoginRemembered = 0, g_storeLoginRememberFailed = 0, g_storeLoginForgotten = 0;
 int g_storeAuthAnsweredLink = 0;   /* this connection's one AUTH_CHALLENGE has been taken (answered or not); each new link clears it */
 int g_storeRefusalSayAgain = 0;    /* a new join password: the next password or access refusal is said even when its reason was said before */
 /* THIS HOSTING'S SECRET: 32 random bytes made each time this game starts its world server (StoreNewHostToken) and handed to that
-   server on its command line. This game shows it in HOST_TOKEN ahead of its HELLO (it is the world's owner), its Steam bridge in each
-   STEAM_ID (StoreHostToken). Memory only; never logged. */
+   server on its command line. This game's Steam bridge shows it in each STEAM_ID (StoreHostToken); it grants this game nothing (the
+   owner is proven by the owner password alone, owner 1369 b). Memory only; never logged. */
 unsigned char g_hostToken[authproof::kTokenBytes];
 bool g_hostTokenSet = false;
-long g_hostTokenLinkGen = -1;   /* the link generation whose HELLO this game's HOST_TOKEN went ahead of (-1 = none). MAIN THREAD. */
 /* a new host password is a new hosting's: a refusal of the old one (reason 11 included) no longer stops this game's join */
-void SetHostPassword(const std::string& password) { g_hostPassword = password; g_storeAuthStop = 0; }
+bool HostPasswordBlank(const std::string& box) { return worldpw::WorldPassword(box).empty(); }   /* T-1255 (re-check #1): the HOST note and the write agree on a box of spaces */
+void SetHostPassword(const std::string& password) { g_hostPassword = worldpw::WorldPassword(password); g_storeAuthStop = 0; }   /* the box's text as the file's value makes its key */
 int StoreHostHasPassword() { return g_hostPassword.empty() ? 0 : 1; }
-void SetJoinPassword(const std::string& password) { g_joinPassword = password; g_storeAuthStop = 0; g_storeRefusalSayAgain = 1; }
+static std::string StoreLoginFile() { return PathNextToDll("login-passwords.txt"); }
+/* login-passwords.txt's whole text ("" = none or not readable; a handful of lines, read up to 64 KB) */
+static std::string StoreLoginFileText()
+{
+    std::string text;
+    FILE* f = U8fopen(StoreLoginFile().c_str(), "rb");
+    if (f == 0) return text;
+    char buf[1024]; size_t got;
+    while ((got = fread(buf, 1, sizeof buf, f)) > 0 && text.size() < 65536) text.append(buf, got);
+    fclose(f);
+    ::SecureZeroMemory(buf, sizeof buf);
+    return text;
+}
+std::string StoreLinkPlace();   /* beside StoreLinkWorldId below: where this link dialled */
+std::string StoreLoginLookupPlace();   /* beside StoreLinkPlace below: the place a remembered login is looked up under, the door included */
+/* the login password remembered for world `worldId` at the place this link dialled ("" = none) - at the door too, before the WELCOME */
+static std::string StoreLoginRemembered(const std::string& worldId)
+{
+    const std::string place = StoreLoginLookupPlace();
+    if (worldId.empty() || place.empty()) return std::string();
+    std::string text = StoreLoginFileText();
+    const std::string found = authproof::LoginFind(text, place, worldId);
+    authproof::WipeText(&text);
+    return found;
+}
+bool StoreLoginPasswordForLink(std::string* out)
+{
+    *out = ConfigRole() == kRoleHost ? g_hostOwnerPassword : StoreLoginRemembered(StoreLinkWorldId());
+    return !out->empty();
+}
+static bool StoreAuthWriteFile(const std::string& path, const std::string& text);
+/* this link's place and world `worldId` written with `password`, or forgotten when it is empty; every other line kept. True = the
+   file holds what was asked now. */
+static bool StoreLoginPasswordPut(const std::string& worldId, const std::string& password)
+{
+    const std::string place = StoreLinkPlace();
+    if (place.empty() || worldId.empty() || worldId.find_first_of("\t\r\n") != std::string::npos || password.find_first_of("\r\n") != std::string::npos) return false;
+    std::string old = StoreLoginFileText();
+    std::string text = authproof::LoginPut(old, place, worldId, password);
+    const bool wrote = text == old || StoreAuthWriteFile(StoreLoginFile(), text);
+    authproof::WipeText(&old); authproof::WipeText(&text);
+    return wrote;
+}
+void StoreLoginPasswordRemember(const std::string& worldId, const std::string& password)
+{
+    if (password.empty()) return;
+    const bool wrote = StoreLoginPasswordPut(worldId, password);
+    if (wrote) ++g_storeLoginRemembered; else ++g_storeLoginRememberFailed;
+    DebugLog(std::string("[ADMIN] the login password for this world ") + (wrote ? "is remembered - it is shown at this world's door at this place from now on" : "could NOT be remembered (login-passwords.txt not written)"));
+}
+bool StoreLoginPasswordForget(const std::string& worldId)
+{
+    if (ConfigRole() == kRoleHost) return false;   /* the host's game logs in with rules.txt's owner password, never the file's */
+    const bool gone = StoreLoginPasswordPut(worldId, std::string());
+    if (gone) ++g_storeLoginForgotten;
+    DebugLog(std::string("[ADMIN] the login password remembered for this world at this place ") + (gone ? "is forgotten - it is not shown again" : "could NOT be forgotten (login-passwords.txt not written)"));
+    return gone;
+}
+int StoreDoorLoginSentThisLink() { return g_storeDoorLoginSentLink; }
+void SetJoinPassword(const std::string& password) { g_joinPassword = worldpw::WorldPassword(password); g_storeAuthStop = 0; g_storeRefusalSayAgain = 1; }   /* as SetHostPassword */
 
 /* n bytes from Windows' own random source (RtlGenRandom, advapi32's SystemFunction036, looked up so the DLL's imports stay as they are) */
 static bool StoreAuthRandom(unsigned char* out, size_t n)
@@ -239,18 +324,45 @@ bool StoreHostToken(unsigned char out[32])
     return true;
 }
 
-/* The answer to one AUTH_CHALLENGE, made from the password this game hosts with (the host's own game) or the one given for this
-   join. 1 = *proof made; 0 = this game has no password for it (nothing is sent: the world server refuses it in words); -1 = the
-   challenge is malformed. */
-int StoreAuthAnswer(const std::vector<char>& challenge, bool hosting, std::vector<char>* proof)
+/* The answer to one AUTH_CHALLENGE: the world password's proof, made from the password this game hosts with (the host's own game) or
+   the one given for this join, when it is asked; and a login proof when a login is asked and this game knows a login password for
+   that world - the host's owner password, else the one remembered for the place this link dialled and the challenge's world id
+   (owner 1380 / 1379; a server elsewhere naming this world gets none) - and never for a challenge asking fewer key rounds than a world
+   server makes its key with (adminauth::kIterDefault; the salt is new at each world-server run, so none is kept). 1 = *proof made
+   (*login: it carries a login proof); 0 = the world password is asked and this game has nothing to show (nothing is sent: the world
+   server refuses it in words); -1 = the challenge is malformed. */
+int StoreAuthAnswer(const std::vector<char>& challenge, bool hosting, std::vector<char>* proof, bool* login)
 {
-    unsigned char nonce[authproof::kNonceBytes], salt[authproof::kSaltBytes], key[authproof::kKeyBytes], pr[authproof::kProofBytes];
-    if (!authproof::ChallengeDecode(challenge, nonce, salt)) return -1;
+    *login = false;
+    authproof::Challenge c;
+    if (!authproof::ChallengeDecode(challenge, &c)) return -1;
+    unsigned char key[authproof::kKeyBytes], wp[authproof::kProofBytes], lp[authproof::kProofBytes];
+    memset(wp, 0, sizeof wp); memset(lp, 0, sizeof lp);
+    unsigned has = 0;
     const std::string& pw = hosting ? g_hostPassword : g_joinPassword;
-    if (pw.empty()) return 0;
-    authproof::DeriveKey(pw, salt, key);
-    authproof::MakeProof(key, nonce, pr);
-    proof->assign((const char*)pr, (const char*)pr + authproof::kProofBytes);
+    if ((c.asks & authproof::kAskWorld) && !pw.empty())
+    {
+        authproof::DeriveKey(pw, c.salt, key);
+        authproof::MakeProof(key, c.nonce, wp);
+        has |= authproof::kHasWorld;
+    }
+    /* owner 1412 b: not after this player's own /logout in this world - a reconnect inside the same world is the same visit */
+    if ((c.asks & authproof::kAskLogin) && c.ownerRounds >= adminauth::kIterDefault && c.ownerRounds <= adminauth::kIterMax && !AdminLogoutHolds())
+    {
+        std::string lpw = hosting ? g_hostOwnerPassword : StoreLoginRemembered(c.worldId);
+        if (!lpw.empty())
+        {
+            adminauth::DeriveKey(lpw, c.ownerSalt, c.ownerRounds, key);
+            authproof::LoginDoorProof(key, c.nonce, lp);
+            has |= authproof::kHasLogin;
+            ::SecureZeroMemory(&lpw[0], lpw.size());
+        }
+    }
+    ::SecureZeroMemory(key, sizeof key);
+    if (has == 0 && (c.asks & authproof::kAskWorld)) return 0;
+    authproof::DoorProofEncode(has, wp, lp, proof);
+    ::SecureZeroMemory(wp, sizeof wp); ::SecureZeroMemory(lp, sizeof lp);
+    *login = (has & authproof::kHasLogin) != 0;
     return 1;
 }
 
@@ -272,46 +384,192 @@ static std::string StoreAuthErr()
     return b;
 }
 
-bool StoreWriteWorldAuth(const std::string& worldDir)
+/* T-1254 (owner 1513 a / 1508 b): a 0.4.0 password file in the world folder (auth.txt, admin-auth.txt), read whole (as the world
+   server reads it: the first 64 KB). true = read, or not there (*present false); false = there but not readable. */
+static bool StoreReadOldPwFile(const std::string& path, std::string* text, bool* present)
 {
+    text->clear(); *present = false;
+    if (U8GetFileAttributes(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        const DWORD e = ::GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+    }
+    *present = true;
+    FILE* f = U8fopen(path.c_str(), "rb");
+    if (f == 0) return false;
+    char buf[4096];
+    size_t n = 0;
+    while (text->size() <= 65536 && (n = fread(buf, 1, sizeof buf, f)) > 0) text->append(buf, n);
+    const bool bad = ferror(f) != 0;
+    fclose(f);
+    return !bad;
+}
+
+/* HOST: the HOST GAME PASSWORD box's text written after "world password =" in the world's rules.txt (writeWorld; a HOST that joins a
+   world running now leaves that line as it is) and, when the "owner password =" line is empty or missing, a long random owner
+   password made now (owner 1369 b / 1371) - with the same writer the world server uses (rulesfile::WritePasswords): a missing file
+   is made with the standard header and the three password lines, an existing one keeps every other byte. The owner password the
+   file holds afterwards is the one this game logs in with by itself (g_hostOwnerPassword). The world server reads only that file
+   (owner rule 2026-11-02: one way a world works, two ways to start it; owner 1371), so the file is the same as one written by hand
+   with the same values. A rules.txt that is there but cannot be read is never overwritten.
+   T-1202: firstRows - at a world's FIRST hosting, every GAME OPTIONS row the host chose for it (rulesfile::FirstStartRows) - go into
+   the same text in the same write (rulesfile::WriteFirstStartRows), so the world server reads the host's choice before any game
+   connects: a brand-new world's first import, asked from the menu, is allowed or refused, and gets money and research, and NEW
+   PROFILE answers with the profile cap, as the host chose. Empty: the file as before (every later hosting, or no Done on GAME
+   OPTIONS for this world - the world server's defaults).
+   T-1254 (owner 1508 b / 1513 a): a password line the file does not have is left out while the world's 0.4.0 password file carries a
+   lock for it (worldpw::HostLeaveOut): the world line when the box is empty and auth.txt holds a key (or cannot be read or used), the
+   admin line when admin-auth.txt does; on a world running now (writeWorld false) only the owner line is ever added.
+   T-1255 A (owner 1516 a): keepTicked - the KEEP RUNNING box at this press. Ticked with an empty box, the world keeps the world password
+   it already has (a line that is not empty is left as it is; no line and a saved lock - the world server's or 0.4.0's auth.txt - adds
+   none); the empty (open) line is written only when the world has no password at all (worldpw::HostWritesWorld). A typed password
+   still replaces the line; unticked, the box's text is written as before (empty = open for that hosting). */
+bool StoreWriteWorldPassword(const std::string& worldDir, const std::string& worldName, bool writeWorld, const std::vector<std::pair<std::string, std::string> >& firstRows, bool keepTicked)
+{
+    if (!g_hostOwnerPassword.empty()) ::SecureZeroMemory(&g_hostOwnerPassword[0], g_hostOwnerPassword.size());
+    g_hostOwnerPassword.clear();
     if (worldDir.empty() || worldDir[worldDir.size() - 1] == '\\' || worldDir[worldDir.size() - 1] == '/')
     {
-        ErrorLog("[AUTH] the world's folder has no name (its path is empty or ends in a separator) - auth.txt is neither written nor removed,"
+        ErrorLog("[AUTH] the world's folder has no name (its path is empty or ends in a separator) - its rules.txt is not written,"
                  " because it would land outside any world's folder, and the world server is not started");
         return false;
     }
-    const std::string path = worldDir + "\\" + authproof::kAuthFile;
-    if (g_hostPassword.empty())
+    if (g_hostPassword.find_first_of("\r\n") != std::string::npos)
     {
-        const bool there = U8GetFileAttributes(path.c_str()) != INVALID_FILE_ATTRIBUTES;
-        if (there && !U8DeleteFile(path.c_str()))
+        ErrorLog("[AUTH] the world's password holds a line break, which a line of the rules file cannot hold - the world server is not started");
+        return false;
+    }
+    const std::string path = worldDir + "\\" + rulesfile::kFile;
+    std::string old;
+    if (U8GetFileAttributes(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        const DWORD e = ::GetLastError();
+        if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND)
         {
-            ErrorLog("[AUTH] this world is hosted with no password, but its auth.txt from an earlier hosting could not be removed (Windows error "
-                     + StoreAuthErr() + ") - the world server would still ask for the old password");
+            char b[24]; sprintf(b, "%lu", (unsigned long)e);
+            ErrorLog(std::string("[AUTH] the world's rules.txt could not be looked up (Windows error ") + b + ") - it is not written, and the world server is not started");
             return false;
         }
-        DebugLog(std::string("[AUTH] hosting with no password: the world's auth.txt ") + (there ? "is removed" : "is absent") + " - the world server asks nobody for one");
-        return true;
     }
-    unsigned char salt[authproof::kSaltBytes], key[authproof::kKeyBytes];
-    if (!StoreAuthRandom(salt, sizeof(salt)))
+    else
     {
-        ErrorLog("[AUTH] the world's password could not be written: Windows gave no random numbers for its salt");
+        FILE* rf = U8fopen(path.c_str(), "rb");
+        if (rf == 0)
+        {
+            ErrorLog("[AUTH] the world's rules.txt is there but could not be opened (Windows error " + StoreAuthErr() + ") - it is not overwritten, and the world server is not started");
+            return false;
+        }
+        char buf[4096];
+        size_t n = 0;
+        while ((n = fread(buf, 1, sizeof buf, rf)) > 0) old.append(buf, n);
+        const bool readBad = ferror(rf) != 0;
+        fclose(rf);
+        if (readBad)
+        {
+            ErrorLog("[AUTH] the world's rules.txt is there but could not be read to its end - it is not overwritten, and the world server is not started");
+            return false;
+        }
+    }
+    std::map<int, std::string> set;   /* the world line is set below, once the saved lock is known (T-1255 A) */
+    /* the owner password: the file's own when it holds one, else 32 random bytes from Windows as 64 hex digits (worldpw.h) */
+    std::string fresh;
+    {
+        unsigned char rb[worldpw::kOwnerRandomBytes];
+        if (StoreAuthRandom(rb, sizeof rb)) fresh = worldpw::OwnerPasswordFromRandom(rb, sizeof rb);
+        ::SecureZeroMemory(rb, sizeof rb);
+    }
+    bool ownerWrite = false;
+    std::string owner = worldpw::HostOwnerPassword(old, fresh, &ownerWrite);
+    if (!fresh.empty()) ::SecureZeroMemory(&fresh[0], fresh.size());
+    if (owner.empty())
+    {
+        if (!old.empty()) ::SecureZeroMemory(&old[0], old.size());
+        ErrorLog("[AUTH] Windows gave no random numbers for the world's owner password - its rules.txt is not written");
         return false;
     }
-    authproof::DeriveKey(g_hostPassword, salt, key);
-    const size_t cut = worldDir.find_last_of("\\/");
-    if (cut != std::string::npos) U8CreateDirectory(worldDir.substr(0, cut).c_str(), 0);   /* the top folder and a new world's own folder: the world server makes the rest */
-    U8CreateDirectory(worldDir.c_str(), 0);
-    const std::string text = "# the world's password as a salted key - written each time this world is hosted with a password; the password itself is in no file\r\n"
-                             + authproof::AuthLine(salt, key) + "\r\n";
-    if (!StoreAuthWriteFile(path, text))
-    {
-        ErrorLog("[AUTH] the world's password could not be written to its auth.txt (Windows error " + StoreAuthErr() + ")");
-        return false;
+    if (ownerWrite) set[rulesfile::kPwOwner] = owner;
+    g_hostOwnerPassword.swap(owner);
+    unsigned leaveOut = 0;
+    int oldWorld = worldpw::kOldNone;
+    {   /* the 0.4.0 files: read only, never changed */
+        std::string t; bool present = false; unsigned rounds = 0;
+        unsigned char ws[authproof::kSaltBytes], wk[authproof::kKeyBytes], as[adminauth::kSaltBytes], ak[adminauth::kKeyBytes];
+        const bool wOk = StoreReadOldPwFile(worldDir + "\\" + authproof::kAuthFile, &t, &present);
+        oldWorld = worldpw::OldWorldFile(wOk, present, t, ws, wk);
+        const bool aOk = StoreReadOldPwFile(worldDir + "\\" + adminauth::kAuthFile, &t, &present);
+        const int oldAdmin = worldpw::OldAdminFile(aOk, present, t, &rounds, as, ak);
+        ::SecureZeroMemory(ws, sizeof ws); ::SecureZeroMemory(wk, sizeof wk); ::SecureZeroMemory(as, sizeof as); ::SecureZeroMemory(ak, sizeof ak);
+        if (!t.empty()) ::SecureZeroMemory(&t[0], t.size());
+        leaveOut = worldpw::HostLeaveOut(writeWorld, g_hostPassword.empty(), oldWorld, oldAdmin);
     }
-    DebugLog("[AUTH] hosting with a password: the world's auth.txt holds its salted key; the password itself is kept in this game's memory only");
+    /* T-1255 A (owner 1516 a): the world line - kept running with an empty box, only for a world with no password at all */
+    bool lineThere = false, writesWorld = false;
+    {
+        rulesfile::Parsed op = rulesfile::Parse(old, 0);
+        lineThere = op.pwThere[rulesfile::kPwWorld];
+        writesWorld = worldpw::HostWritesWorld(writeWorld, keepTicked, g_hostPassword.empty(), lineThere, op.pw[rulesfile::kPwWorld], oldWorld);
+        for (int i = 0; i < rulesfile::kPwCount; ++i) if (!op.pw[i].empty()) ::SecureZeroMemory(&op.pw[i][0], op.pw[i].size());
+    }
+    if (writesWorld) set[rulesfile::kPwWorld] = g_hostPassword;
+    const bool worldCarried = writeWorld && g_hostPassword.empty() && (leaveOut & (1u << rulesfile::kPwWorld)) != 0 && !lineThere;
+    const bool worldKept = writeWorld && !writesWorld && !worldCarried;   /* a world password line that is not empty, left as it is */
+    std::string text = rulesfile::WritePasswords(old, set, worldName, leaveOut);
+    for (std::map<int, std::string>::iterator s = set.begin(); s != set.end(); ++s) if (!s->second.empty()) ::SecureZeroMemory(&s->second[0], s->second.size());
+    std::string firstWhat;   /* T-1202: the host's GAME OPTIONS rows, for the log line (key=value; no password) */
+    if (!firstRows.empty())
+    {
+        std::map<std::string, std::string> rows;
+        for (size_t i = 0; i < firstRows.size(); ++i) { rows[firstRows[i].first] = firstRows[i].second; firstWhat += " " + firstRows[i].first + "=" + firstRows[i].second; }
+        std::string withRows = rulesfile::WriteFirstStartRows(text, rows, worldName);
+        if (!text.empty()) ::SecureZeroMemory(&text[0], text.size());
+        text.swap(withRows);
+    }
+    const bool same = text == old;
+    if (!old.empty()) ::SecureZeroMemory(&old[0], old.size());
+    if (!same)
+    {
+        const size_t cut = worldDir.find_last_of("\\/");
+        if (cut != std::string::npos) U8CreateDirectory(worldDir.substr(0, cut).c_str(), 0);   /* the top folder and a new world's own folder: the world server makes the rest */
+        U8CreateDirectory(worldDir.c_str(), 0);
+        const bool wrote = StoreAuthWriteFile(path, text);
+        if (!text.empty()) ::SecureZeroMemory(&text[0], text.size());
+        if (!wrote)
+        {
+            ErrorLog("[AUTH] the world's password could not be written into its rules.txt (Windows error " + StoreAuthErr() + ")");
+            return false;
+        }
+    }
+    DebugLog(std::string("[AUTH] HOST: the world's rules.txt ") + (same ? "already says" : "now says")
+             + (worldCarried ? std::string(" no world password line - the world keeps the password lock its auth.txt carries (0.4.0's, or one the world server saved; auth.txt ") + (oldWorld == worldpw::kOldKey ? "holds a key" : "cannot be read or holds no key: nobody joins by password until it can") + "; owner 1508 b / 1513 a / 1517 a) and"
+                : worldKept ? std::string(" the world password line it already had - KEEP RUNNING is ticked and the HOST GAME PASSWORD box is empty, so the world keeps its password (owner 1516 a) and")
+                : writeWorld ? std::string(" the world password ") + (g_hostPassword.empty() ? "is empty (anyone can join)" : "typed in the HOST GAME PASSWORD box") + " and" : std::string())
+             + " the owner password " + (ownerWrite ? "made now (long and random)" : "it already held") + " - this game logs in as the world's owner with it by itself; no password is in any log");
+    if (!firstRows.empty())
+        DebugLog("[RULES] T-1202 HOST: the world's first start - its rules.txt names the host's GAME OPTIONS rows" + firstWhat
+                 + " before the world server reads it, so what it decides before the host's game is in (the first import asked from the menu, NEW PROFILE's profile cap) follows them");
     return true;
+}
+
+/* T-1255 D (owner 1515): whether the world in worldDir has a world password of its own (worldpw::WorldHasPassword) - 1: a world
+   password line that is not empty, or no line and a saved lock that applies (auth.txt: the world server's or 0.4.0's); 0: none, so HOST
+   with KEEP RUNNING ticked and an empty PASSWORD box starts it open; -1: its rules.txt could not be read (not known: no note). Reads
+   both files; HOST GAME asks once per pick (ui.cpp PanelKeepPickRefresh), never per frame. No password is kept or logged. */
+int StoreWorldPwHas(const std::string& worldDir)
+{
+    if (worldDir.empty() || worldDir[worldDir.size() - 1] == '\\' || worldDir[worldDir.size() - 1] == '/') return -1;
+    std::string t;
+    bool present = false;
+    if (!StoreReadOldPwFile(worldDir + "\\" + rulesfile::kFile, &t, &present)) { if (!t.empty()) ::SecureZeroMemory(&t[0], t.size()); return -1; }
+    rulesfile::Parsed p = rulesfile::Parse(t, 0);
+    if (!t.empty()) ::SecureZeroMemory(&t[0], t.size());
+    unsigned char ws[authproof::kSaltBytes], wk[authproof::kKeyBytes];
+    const bool aOk = StoreReadOldPwFile(worldDir + "\\" + authproof::kAuthFile, &t, &present);
+    const int oldWorld = worldpw::OldWorldFile(aOk, present, t, ws, wk);
+    ::SecureZeroMemory(ws, sizeof ws); ::SecureZeroMemory(wk, sizeof wk);
+    if (!t.empty()) ::SecureZeroMemory(&t[0], t.size());
+    const bool has = worldpw::WorldHasPassword(p.pwThere[rulesfile::kPwWorld], p.pw[rulesfile::kPwWorld], oldWorld);
+    for (int i = 0; i < rulesfile::kPwCount; ++i) if (!p.pw[i].empty()) ::SecureZeroMemory(&p.pw[i][0], p.pw[i].size());
+    return has ? 1 : 0;
 }
 
 /* TEST-ONLY `accesstest mode open|mode allowlist|clear`: the world folder's access.txt, written on the hosting game. */
@@ -337,6 +595,26 @@ std::string StoreAccessTest(const std::string& args)
     DebugLog("[ACCESS] TEST-ONLY access.txt: " + args + " (" + (entryNo > 0 ? std::string(e) : std::string("no entry written")) + "; now mode "
              + accessrule::ModeWord(r.mode) + ", " + n + ")");
     return "ok accesstest " + args;
+}
+
+/* T-1168 (owner 1425 a) TEST-ONLY `netthrottle off|on`: this game's own ENet links switched (net::NetThrottleSet); the hosting game also
+   asks its world server - netthrottle.request written into the world folder (written aside and renamed in, so the server's folder
+   watch never reads half a file); the world server takes it and logs its own [STORE] netthrottle line. A joining game asks no server. */
+std::string StoreNetThrottle(const std::string& word)
+{
+    const int mode = netthrottle::Parse(word);
+    if (mode == netthrottle::kBad) { DebugLog("[cmd] malformed: 'netthrottle' requires off|on"); return "error netthrottle usage: netthrottle off|on"; }
+    const std::string here = net::NetThrottleSet(mode);
+    if (ConfigRole() != kRoleHost) return here + " server=not-hosting";
+    const std::string dir = StoreNotebookDir();
+    U8CreateDirectory(dir.c_str(), 0);
+    if (!StoreAuthWriteFile(dir + "\\" + netthrottle::kRequestFile, netthrottle::RequestText(mode)))
+    {
+        DebugLog("[NET] netthrottle " + std::string(netthrottle::Word(mode)) + " (TEST-ONLY): netthrottle.request could NOT be written to the world folder (Windows error " + StoreAuthErr() + ") - the world server is not switched");
+        return here + " server=unwritten";
+    }
+    DebugLog("[NET] netthrottle " + std::string(netthrottle::Word(mode)) + " (TEST-ONLY): netthrottle.request written to the world folder for the world server");
+    return here + " server=asked";
 }
 
 namespace {
@@ -480,7 +758,7 @@ const int kSaveRequestLoad = 2;
 unsigned long long kSaveFileSystemGlobalRva = 0; static coop::AddrReg kSaveFileSystemGlobalRva_reg("SaveFileSystemGlobal", &kSaveFileSystemGlobalRva);   /* P8h: the address table fills this. Steam_1.0.65 0x212DC08 */
 const unsigned int kSfsBusyOff = 0x1E0;
 unsigned long long kResetGameRva = 0; static coop::AddrReg kResetGameRva_reg("ResetGame", &kResetGameRva);   /* P8h: the address table fills this. Steam_1.0.65 0x36CA40 */   // F489: GameWorld::resetGame - what SaveManager::loadGame calls to clear the world mid-session (FactionDirectory::clearAndFree, the global container, the player faction)
-const unsigned int kStoreProtocol = 133;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kStoreProtocol = 145;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 typedef bool (*GdcLoadFn)(void* container, const std::string* file, const std::string* modName, int modIndex, void* serialisable, bool flag);
 GdcLoadFn orig_gdcLoad = 0;
 /* Z1-b (review-z1 item 1): the readFile -> load handshake. It was two bare strings any thread overwrote; it is now a
@@ -3738,8 +4016,8 @@ const unsigned int kStoreMsgUniqueState = 36;   /* E5 / decision 31(c): a named 
 const unsigned int kStoreMsgClock = 39;
 const unsigned int kStoreMsgSpeedVote = 40;
 const unsigned int kStoreMsgRefuse = 42;   /* B10-b (review-b10 M-7): the notebook REFUSING this game's handshake - {u32 store protocol, u32 the protocol this game sent}. No WELCOME follows it and no records do. A notebook older than B10-b never sends it; the WELCOME's own protocol test below still catches that case. */
-const unsigned int kStoreMsgAuthChallenge = 65, kStoreMsgAuthProof = 66, kStoreMsgHostToken = 68;   /* HOST_TOKEN up {token}, ahead of the HELLO */   /* the world's password: CHALLENGE down {nonce, salt}, PROOF up {proof} (src/common/authproof.h) */
-typedef char StoreAuthNumbersAgree[(kStoreMsgAuthChallenge == authproof::kMsgAuthChallenge && kStoreMsgAuthProof == authproof::kMsgAuthProof && kStoreMsgHostToken == authproof::kMsgHostToken && kStoreProtocol == authproof::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
+const unsigned int kStoreMsgAuthChallenge = 65, kStoreMsgAuthProof = 66;   /* the door: CHALLENGE down, PROOF up (src/common/authproof.h) */
+typedef char StoreAuthNumbersAgree[(kStoreMsgAuthChallenge == authproof::kMsgAuthChallenge && kStoreMsgAuthProof == authproof::kMsgAuthProof && kStoreProtocol == authproof::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgWeather = 41;   // decision 32: my loaded areas -> the relay; the relay's owner map -> me
 const unsigned int kStoreMsgProfiles = 45;   /* prof1 (store protocol 48): PROFILES - up {kind NEW/DELETE, number, name}, down {answers, verdict, cap, subject, active rows} (src/common/profiles.h) */
 const unsigned int kStoreMsgCatchup = 56;   /* M6 (store protocol 60): CATCHUP - down only: ASK {requester slot, ask number, sectors} / ASKED {owners asked, ask number, sectors} (src/common/liverelay.h) */
@@ -3778,6 +4056,8 @@ const unsigned int kStoreMsgSquadTake = 84, kStoreMsgSquadWriter = 85, kStoreMsg
 typedef char StoreSquadWriterNumbersAgree[(kStoreMsgSquadTake == sqwreg::kMsgSquadTake && kStoreMsgSquadWriter == sqwreg::kMsgSquadWriter && kStoreMsgSquadRelease == sqwreg::kMsgSquadRelease && kStoreProtocol == sqwreg::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgTownVer = 87;   /* TOWN_VER - up WRITE, down STORED / REFUSED (src/common/townverwire.h) */
 typedef char StoreTownVerNumbersAgree[(kStoreMsgTownVer == cooptv::kMsgTownVer && kStoreProtocol == cooptv::kTvProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
+const unsigned int kStoreMsgCamp = 93;   /* T-929: CAMP - up PROPOSE / NOT_BUILT, down STORED / REFUSED / BEGIN / END / SEEDED / REMOVED (src/common/campwire.h) */
+typedef char StoreCampNumbersAgree[(kStoreMsgCamp == campl::kMsgCamp && kStoreProtocol == campl::kProtocol) ? 1 : -1];   /* a compile error here = campwire.h and this file disagree */
 /* T-1118 (b) (protocol 126): CHUNK (88), the pieces of a big message, is cut and joined inside the ENet transport (net/enet_transport.cpp,
    src/common/livefirst.h) - nothing here sends or reads it; the number is reserved on this link. */
 const unsigned int kStoreMsgChunk = 88;
@@ -4383,6 +4663,9 @@ bool detour_windowClosing(void* self, void* renderWindow)
                             (onMain > 0 ? "main" : (onMain == 0 ? "other" : "noTickYet")), (unsigned long)g_closeThreadId, (unsigned long)g_storeMainThread,
                             (long long)g_closeSeen, wrote, QuitFlagSet(), (unsigned long long)kQuitFlagSetterRva); cb[319] = 0;
     DebugLog(cb);
+    /* a normal quit, marked whatever the thread or Steam: the next launch's [CRASHKEEP] judges this launch by it
+       (src/common/crashkeep.h) - Kenshi's crash handling also ends in the exit hook, so "quit complete" cannot tell */
+    if (QuitFlagSet() != 0) DebugLog("[EXIT] quit route: window");
     if (onMain > 0)
     {
         ::InterlockedExchange(&g_closeHandled, 1);
@@ -4442,6 +4725,7 @@ void detour_quitConfirm(void* sender, int result)
                             seen, (unsigned long long)kQuitConfirmRva); cb[319] = 0;
     DebugLog(cb);
     if (live == 0) return;   /* the player said no, or the engine declined: nothing was raised, so there is nothing to note */
+    DebugLog("[EXIT] quit route: menu");   /* a normal quit, marked for the next launch's [CRASHKEEP] (src/common/crashkeep.h) */
     if (onMain > 0) { NoteQuitting("menu"); return; }
     ::InterlockedIncrement64(onMain == 0 ? &g_menuOffThread : &g_menuNoTickYet);
     g_closeThreadId = ::GetCurrentThreadId();
@@ -4466,6 +4750,7 @@ void detour_titleExit(void* self, void* widget)
                             seen, (unsigned long long)kTitleExitRva); cb[319] = 0;
     DebugLog(cb);
     if (live == 0) return;
+    DebugLog("[EXIT] quit route: title");   /* a normal quit, marked for the next launch's [CRASHKEEP] (src/common/crashkeep.h) */
     if (onMain > 0) { NoteQuitting("title"); return; }
     ::InterlockedIncrement64(onMain == 0 ? &g_titleOffThread : &g_titleNoTickYet);
     g_closeThreadId = ::GetCurrentThreadId();
@@ -4980,6 +5265,7 @@ void StoreApplyRecordSeq(const std::vector<char>& payload)
         if (coopgrec::IsGroundRecId(worldId)) coop::GroundRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-697 step 2 fold 2 (item 7): this game's ground write was taken - the area may be written again */
         if (shoprec::IsShopRecId(worldId)) coop::ShopRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* this game's shop record write sent with that stamp is stored: a cancel's mark in it is answered */
         if (coopbrec::IsBoxRecId(worldId)) coop::BoxRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* a shop counter's undo list in that write is stored */
+        if (doorrec::IsDoorRecId(worldId)) coop::DoorRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* this game's door record write sent with that stamp is stored: its pending write is confirmed */
     }
     {
         std::map<std::string, Record>::iterator it = g_records.find(worldId);
@@ -5191,7 +5477,7 @@ void StoreRepushUpTick()
     {
         if (g_welcomeGotIds.count(it->first) != 0) continue;   /* the notebook already has this one */
         if (IsZoneId(it->first) && !g_zoneOn) { ++skipped; continue; }   /* review-p3h H1, as the deleted arm did */
-        if (coopbrec::IsBoxRecId(it->first) || piecerec::IsPieceRecId(it->first) || shoprec::IsShopRecId(it->first)) { ++skipped; continue; }   /* a box, piece or shop record is written only by its writer (items.cpp, build.cpp), never re-sent from here */
+        if (coopbrec::IsBoxRecId(it->first) || piecerec::IsPieceRecId(it->first) || shoprec::IsShopRecId(it->first) || doorrec::IsDoorRecId(it->first)) { ++skipped; continue; }   /* a box, piece, shop or door record is written only by its writer (items.cpp, build.cpp, doors.cpp), never re-sent from here */
         SwRefusedForget(it->first);   /* T-1084 step 5: the world server does not have this record (its WELCOME did not list it), so the register that refused it is gone too */
         if (!SwMaySend(it->first, "re-push")) continue;   /* T-1084 step 5: a squad record is re-pushed only by the game that wrote it (or when nobody is known to have) */
         std::vector<char> b;
@@ -5457,6 +5743,10 @@ long long g_sleepRefusedOtherGame = 0, g_sleepOtherGameLogged = 0;   /* BlockSqu
    this game's people (coopsquad::ContextSleepDrop) or at a refused wake - keyed by the platoon itself: every player's squad can carry the
    same id. Both forget a platoon when it is freed (ForgetPlatoon) and at world teardown. Printed on the REPORT's contextDrop[] token. */
 std::set<void*> g_ctxSleptMine;
+/* T-1229: the counts of that last sleep (chars, known, mine) for each platoon in g_ctxSleptMine - the adoption sweep's take-back test
+   (coopsquad::ContextSweepAdopt via StoreCtxSleptCounts). Written and forgotten with g_ctxSleptMine. */
+struct CtxSleptCount { int chars, known, mine; };
+std::map<void*, CtxSleptCount> g_ctxSleptCount;
 struct CtxDrop { std::string wid; int atWake; int tries; int dup; };   /* dup: a refused duplicate wake (WakeDupQueue), not a context platoon */
 std::map<void*, CtxDrop> g_ctxDrops;
 long long g_ctxWakeRefused = 0, g_ctxWakeNoId = 0;
@@ -5630,11 +5920,11 @@ std::set<std::string> g_swRanHere;     /* ids whose living people this game ran 
 int MembersRunner(void** members, int count, int* decided, int* runHere, int* topSlot, int* topN);   /* defined below, beside MembersRunBySlot */
 void SwRefusedErase(const std::string& id) { g_swRefused.erase(id); }
 void SwRefusedForget(const std::string& id) { if (g_swRefused.count(id) == 0) return; SwRefusedErase(id); ++g_swRefusedForgot; }
-/* a squad group id this game writes: not a zone, ground, box, piece or shop record */
+/* a squad group id this game writes: not a zone, ground, box, piece, shop or door record */
 bool SwSquadId(const std::string& id)
 {
     std::string fac; unsigned n = 0;
-    return !IsZoneId(id) && !coopgrec::IsGroundRecId(id) && !coopbrec::IsBoxRecId(id) && !piecerec::IsPieceRecId(id) && !shoprec::IsShopRecId(id) && SplitGroupId(id, &fac, &n);
+    return !IsZoneId(id) && !coopgrec::IsGroundRecId(id) && !coopbrec::IsBoxRecId(id) && !piecerec::IsPieceRecId(id) && !shoprec::IsShopRecId(id) && !doorrec::IsDoorRecId(id) && SplitGroupId(id, &fac, &n);
 }
 void SwLine(const std::string& s) { if (g_swLines < 60) { ++g_swLines; DebugLog("[STORE] SQUAD-WRITER " + s + " (the first 60 lines; squadWriter[...] on the REPORT line)"); } }
 /* THE WRITER NOTES [t1084i-game] (squadwriterreg.h): the squads ANOTHER live game runs now, as the world server last said (RUNS / STOPPED
@@ -6338,7 +6628,8 @@ void detour_deactivate(void* platoon, void* container)
     {   /* the wake rule's memory: this sleep held a person this game runs (the sleep rule's own test), or not. Not: the platoon is
            queued for removal - another game's people arrive by SPAWN, and the engine would wake it in a loaded area (H067). */
         const int heldMine = coopsquad::ContextSleepWrite(1, 0, known, mine) == coopsquad::kCtxSleepGoContextWithMine ? 1 : 0;
-        if (heldMine != 0) g_ctxSleptMine.insert(platoon); else g_ctxSleptMine.erase(platoon);
+        if (heldMine != 0) { g_ctxSleptMine.insert(platoon); CtxSleptCount sc; sc.chars = okb ? before.activeChars : 0; sc.known = known; sc.mine = mine; g_ctxSleptCount[platoon] = sc; }
+        else { g_ctxSleptMine.erase(platoon); g_ctxSleptCount.erase(platoon); }
         if (coopsquad::ContextSleepDrop(1, heldMine) != 0) CtxDropQueue(platoon, WorldIdOf(platoon), 0);
     }
     HbForget(platoon);   /* E47-S2 exit edge: asleep - the sleep path owns its record from here */
@@ -7230,7 +7521,7 @@ void ForgetPlatoonRows(void* platoon, bool money)
 {
     ForgetContextPlatoon(platoon);   // review-p3o H1
     if (money) MoneyLoadForget(platoon);   /* T-799 D1: its pot's mark must not pass to a platoon given the same address */
-    g_ctxSleptMine.erase(platoon); g_ctxDrops.erase(platoon); g_wakeDup.erase(platoon); g_saveSplit.erase(platoon);
+    g_ctxSleptMine.erase(platoon); g_ctxSleptCount.erase(platoon); g_ctxDrops.erase(platoon); g_wakeDup.erase(platoon); g_saveSplit.erase(platoon);
     g_arPending.erase(platoon); g_arSeen.erase(platoon); g_arFromSquadPos.erase(platoon);   /* T-1084 step 3 */
     std::map<void*, std::string>::iterator it = g_bind.find(platoon);
     if (it != g_bind.end()) { std::map<std::string, void*>::iterator b = g_byWorldId.find(it->second); if (b != g_byWorldId.end() && b->second == platoon) g_byWorldId.erase(b); g_bind.erase(it); }
@@ -9648,6 +9939,17 @@ unsigned long long kSetGameSpeedRva = 0; static coop::AddrReg kSetGameSpeedRva_r
 unsigned long long kUserPauseRva = 0; static coop::AddrReg kUserPauseRva_reg("UserPause", &kUserPauseRva);   /* P8h: the address table fills this. Steam_1.0.65 0x787470 */
 unsigned long long kDialogueWindowShowPauseRetRva = 0; static coop::AddrReg kDialogueWindowShowPauseRetRva_reg("DialogueWindowShowPauseRet", &kDialogueWindowShowPauseRetRva);   /* T-288: Steam_1.0.65 0x726D4A - DialogueWindow::show's userPause(true) returns here (1.0.68 0x72787A) */
 unsigned long long kDialogueWindowHidePauseRetRva = 0; static coop::AddrReg kDialogueWindowHidePauseRetRva_reg("DialogueWindowHidePauseRet", &kDialogueWindowHidePauseRetRva);   /* T-288: Steam_1.0.65 0x72141B - DialogueWindow::hide's userPause(false) returns here (1.0.68 0x721F4B) */
+unsigned long long kTogglePauseRva = 0; static coop::AddrReg kTogglePauseRva_reg("TogglePause", &kTogglePauseRva);   /* T-927: GameWorld::togglePause, the writer of the pause byte GameWorld+0x8B9. Steam_1.0.65 0x787200 (1.0.68 0x787D40) */
+/* T-927: the four menu calls into togglePause, each an exact return address (found as the only togglePause call in each
+   function by a direct-call scan of both executables; 1.0.68 rows first, gen_table_1068 --reverse 'same' for each). */
+unsigned long long kGameMenuShowPauseRetRva = 0; static coop::AddrReg kGameMenuShowPauseRetRva_reg("GameMenuShowPauseRet", &kGameMenuShowPauseRetRva);   /* T-927: the game menu's show 0x913250, togglePause(true) only when the game was running. Steam_1.0.65 0x91329B (1.0.68 0x91416B) */
+unsigned long long kGameMenuHidePauseRetRva = 0; static coop::AddrReg kGameMenuHidePauseRetRva_reg("GameMenuHidePauseRet", &kGameMenuHidePauseRetRva);   /* T-927: the game menu's hide 0x916190, togglePause(false) only when its show paused. Steam_1.0.65 0x9161B0 (1.0.68 0x917080) */
+unsigned long long kBuildModeEnterPauseRetRva = 0; static coop::AddrReg kBuildModeEnterPauseRetRva_reg("BuildModeEnterPauseRet", &kBuildModeEnterPauseRetRva);   /* T-927: build mode's entry 0x4E5B50, togglePause(true) unconditionally. Steam_1.0.65 0x4E5B7D (1.0.68 0x4E660D) */
+unsigned long long kBuildModeLeavePauseRetRva = 0; static coop::AddrReg kBuildModeLeavePauseRetRva_reg("BuildModeLeavePauseRet", &kBuildModeLeavePauseRetRva);   /* T-927: build mode's exit 0x4D0DE0, togglePause(false) unconditionally. Steam_1.0.65 0x4D0E43 (1.0.68 0x4D18D3) */
+/* T-927 review fold: the game menu's hide, hooked so the menu's pause vote follows the menu's own open / closed state (its show is
+   ui.cpp's MainMenuPopup_show hook). Steam_1.0.65 0x916190 (1.0.68 0x917060: the 1.0.68 function holding the 0x917080 row, its
+   exception-table start; gen_table_1068 --reverse 'same', the whole function and its 3 direct callees). */
+unsigned long long kGameMenuHideRva = 0; static coop::AddrReg kGameMenuHideRva_reg("MainMenuPopup_hide", &kGameMenuHideRva);
 unsigned long long kMainBarChangeSpeedRva = 0; static coop::AddrReg kMainBarChangeSpeedRva_reg("MainBarChangeSpeed", &kMainBarChangeSpeedRva);   /* P8h: the address table fills this. Steam_1.0.65 0x723DF0 */
 unsigned long long kWeatherUpdateBTRva = 0; static coop::AddrReg kWeatherUpdateBTRva_reg("WeatherUpdateBT", &kWeatherUpdateBTRva);   /* P8h: the address table fills this. Steam_1.0.65 0x9DCF80 */
 unsigned long long kSetCurrentSeasonRva = 0; static coop::AddrReg kSetCurrentSeasonRva_reg("SetCurrentSeason", &kSetCurrentSeasonRva);   /* P8h: the address table fills this. Steam_1.0.65 0x9DB4F0 */
@@ -9687,6 +9989,8 @@ typedef void (*SetCurrentSeasonFn)(void* region, int index, int endDay);
 typedef void (*SetupWeatherFn)(void* instance, void* weather);
 SetGameSpeedFn     orig_setGameSpeed = 0;
 UserPauseFn        orig_userPause = 0;
+typedef void (*TogglePauseFn)(void* gameWorld, bool pause);
+TogglePauseFn      orig_togglePause = 0;
 ChangeSpeedFn      orig_changeSpeed = 0;
 WeatherUpdateBTFn  orig_weatherUpdateBT = 0;
 SetCurrentSeasonFn g_setCurrentSeason = 0;
@@ -9695,6 +9999,8 @@ SetupWeatherFn     g_setupWeather = 0;
 uintptr_t g_clkBase = 0, g_clkImageSize = 0;
 float  g_hourRealSeconds = 109.0909f;
 int    g_clkSpeedHook = 0, g_clkPauseHook = 0, g_clkBarHook = 0, g_clkWeatherHook = 0;
+int    g_clkToggleHook = 0;   /* T-927: GameWorld::togglePause, for the menu calls */
+int    g_clkMenuHideHook = 0; /* T-927: the game menu's hide 0x916190, for the menu's open / closed state */
 volatile long g_inPlayerSpeedUi = 0;   /* raised across MainBarGUI::changeSpeed, which tail-jumps into setGameSpeed */
 /* THE NOTEBOOK'S ANSWER. Written only by the MSG_CLOCK handler in PumpLink (main thread) and read only from the
    main-thread tick, exactly as g_basePolicy is. */
@@ -9702,7 +10008,7 @@ double g_srvHours = -1.0;          /* < 0 = the notebook has no clock for this w
 int    g_srvSeedState = 0;         /* P7j: 0 none, 1 first, 2 advanced, 3 late - how the WORLD got its clock */
 double g_srvAtMs  = 0.0;           /* GetTickCount() when it arrived, so the ladder can interpolate to now */
 float  g_srvSpeed = 1.0f;
-int    g_srvMode  = 0;             /* 0 fixed, 1 consensus - for the report line only */
+int    g_srvMode  = 0;             /* the world's GAME SPEED CONTROL, coopclock::kTimeMode* (0 Admin only .. 3 Normal speed only) */
 long   g_clockLinkGen = 0;         /* interlocked: the link generation the last CLOCK arrived on (E38 load gate) */
 float  g_myVote = 1.0f;            /* THIS player's own setting - the vote */
 /* P7o (review-p7e H-1): has this player ever NAMED a speed? 1.0f above is a default, not a choice, and the two
@@ -9723,8 +10029,18 @@ volatile long g_spdSeenPending = 0;     /* a setter detour passed an accounted c
 volatile long g_spdOutsideLogged = 0;   /* the first setter call from outside the game's image has been named */
 long long g_spdVoteSeqAtAdopt = -1;     /* g_votesSent when the last adoption was made */
 long long g_voteSentClockRecv = -1;     /* g_clockRecv when the last vote went out - a CLOCK after it is the answer */
+/* A SPEED PRESS THE WORLD DID NOT USE (mock-up 8): a press raises the pending flag (any thread); the send arms the check with the
+   choice and g_clockRecv; the CLOCK handler compares (coopclock::SpeedPressAnswer) and says the mode's line, at most every 30 s. */
+volatile long g_speedPressPending = 0;
+int g_speedPressArmed = 0;
+float g_speedPressChosen = 1.0f;
+long long g_speedPressSentRecv = 0;
+int g_speedPressLineSaid = 0;
+unsigned int g_speedPressLineMs = 0;
+long long g_speedPressNotTaken = 0, g_speedPressLines = 0;
 long long g_speedOutsideAdopted = 0, g_speedOutsideHeldTicks = 0, g_speedOutsideNotAdopted = 0, g_speedTestWrites = 0, g_speedOutsideWaits = 0;
 volatile long g_votePending = 0;   /* a detour recorded a vote; the main-thread tick sends it */
+volatile long g_voteWithdrawOwed = 0;   /* this game's world closed and nothing was pressed since: the next vote sent is the withdrawal */
 /* ------------------------------ P7u: THE CLOCK STATE, REBUILT TO DECISION 46 ------------------------------
    Decision 46 separates the two jobs the old ladder conflated - ADOPT the world's clock, and KEEP UP with it -
    and every finding from P7e to P7o came out of that conflation. Two mechanisms, two counter groups:
@@ -9754,12 +10070,24 @@ int    g_engineHeld = 0;           /* the engine's own UI/load pause is holding 
 int    g_dlgPauseSuppressed = 0;
 long long g_dlgPauseSkipped = 0, g_dlgUnpauseSkipped = 0;
 int    g_dlgPauseTestLetThrough = 0;   /* TEST-ONLY (talkpause verb): 1 = a conversation window pauses the game as in single player */
+/* T-927 (owner rules 2026-10-19 / 2026-10-30): the game menu and build mode stop nobody's world in a session; under
+   Slowest wins an open one is this player's pause vote (coopclock::MenuPauseDecide). g_menuVoteSaved* is the choice
+   the vote stood in for, given back when the last skipped menu closes. The counters are on the [TIME] report. */
+coopclock::MenuPauseState g_menuPause = { 0, 0, 0, 0, 0 };
+long long g_talkVoteOpened = 0, g_talkVoteClosed = 0;   /* T-978: the conversation window's vote edges (kMenuSkipVote / kMenuSkipRestore) */
+float  g_menuVoteSaved = 1.0f;
+int    g_menuVoteSavedExpressed = 0;
+long long g_menuSkipped[coopclock::kMenuSiteCount] = { 0, 0, 0, 0, 0 };
+long long g_menuVotesCast = 0, g_menuVotesRestored = 0;
 
 /* THE WORLD EPOCH. Incremented on every not-live -> live transition of ClockWorldLive(). It is what invalidates
    g_prevLocalAbs: a clock+0xA0 remembered across a world teardown belongs to a world that no longer exists, and
    subtracting it would produce an "engine advance" of days. */
 long   g_worldEpoch = 0;
 int    g_worldWasLive = 0;
+/* T-1055 (owner 1363), log-only: the request the save-request pump last let through to the engine (2 load, 3 import, 4 new game;
+   -1 none since the last world-live edge) - the [WORLD] started line's by= (ClockNoteEpoch takes it) */
+int    g_worldStartReq = -1;
 /* clock+0xA0 as it stood when the previous pass ENDED - after our own write, so the difference at the next pass
    is exactly what the ENGINE added and nothing this plugin did. < 0 = no previous pass in this epoch.
    THIS IS THE FIX FOR review-p7j H-1, and it is a MEASUREMENT rather than elapsed x speed: when the engine is
@@ -10272,10 +10600,13 @@ void ClockNoteVote(float speed, const char* why)
        state of every session. The send now happens on every valid press; `changed` survives only to keep the log
        honest about which presses moved this player's setting and which restated it. */
     const int changed = (g_myVote != speed) ? 1 : 0;
+    coopclock::MenuPauseNotePress(&g_menuPause);   /* T-927: a choice made with a menu open is the player's; closing the menu does not undo it */
     g_myVote = speed;
     if (speed > 0.0f) g_myVoteNonZero = speed;
     g_voteExpressed = 1;
+    ::InterlockedExchange(&g_voteWithdrawOwed, 0);   /* a press is a choice again: the withdrawal a closed world owed is not sent */
     if (!changed) ++g_votesRepeatPress;
+    ::InterlockedExchange(&g_speedPressPending, 1);   /* a press: the world's answer to it is checked once it has gone up */
     ::InterlockedExchange(&g_votePending, 1);
     DebugLog(std::string("[TIME] this player's setting is now ") + F1(speed) + "x (" + why + ")"
              + (changed ? std::string("") : std::string(" - the same speed this player was already asking for, and it is SENT anyway: before P7o a press that restated the standing setting sent nothing, so a player sitting at 1x had no vote at the notebook and could not acquire one by pressing 1"))
@@ -10418,6 +10749,135 @@ void detour_userPause(void* gameWorld, bool pause)
     if (orig_userPause != 0) orig_userPause(gameWorld, pause);
     ::InterlockedExchange(&g_spdSeenPending, 1);   /* a pause or unpause is never a pace (coopclock::ClockSetterCallAccounted) */
 }
+/* T-927: which menu call into togglePause is this? An EXACT return-address match against the four table rows (each the
+   only togglePause call in its function); a missing row or any other caller (userPause, setGameSpeed, the mod's own
+   applies through them) answers kMenuSiteNone and passes through. */
+int ClockCallerMenuSite(void* ret)
+{
+    if (g_clkBase == 0 || ret == 0) return coopclock::kMenuSiteNone;
+    {
+        const uintptr_t r = (uintptr_t)ret;
+        /* the game menu's two calls are skipped only while its show and hide are both hooked: its vote follows them, and a
+           menu whose state cannot be followed keeps pausing this game only, as before T-927 */
+        const int menuFollowed = (g_clkMenuHideHook != 0 && UiPauseMenuShowHooked() != 0) ? 1 : 0;
+        if (menuFollowed && kGameMenuShowPauseRetRva != 0 && r == g_clkBase + (uintptr_t)kGameMenuShowPauseRetRva) return coopclock::kMenuSiteMenuOpen;
+        if (menuFollowed && kGameMenuHidePauseRetRva != 0 && r == g_clkBase + (uintptr_t)kGameMenuHidePauseRetRva) return coopclock::kMenuSiteMenuClose;
+        if (kBuildModeEnterPauseRetRva != 0 && r == g_clkBase + (uintptr_t)kBuildModeEnterPauseRetRva) return coopclock::kMenuSiteBuildEnter;
+        if (kBuildModeLeavePauseRetRva != 0 && r == g_clkBase + (uintptr_t)kBuildModeLeavePauseRetRva) return coopclock::kMenuSiteBuildLeave;
+    }
+    return coopclock::kMenuSiteNone;
+}
+const char* MenuSiteName(int site)
+{
+    switch (site)
+    {
+    case coopclock::kMenuSiteMenuOpen:   return "game menu opening";
+    case coopclock::kMenuSiteMenuClose:  return "game menu closing";
+    case coopclock::kMenuSiteBuildEnter: return "build mode entry";
+    case coopclock::kMenuSiteBuildLeave: return "build mode exit";
+    default:                             return "?";
+    }
+}
+/* T-927 (owner rules 2026-10-19 'Menus never stop the world in multiplayer', 2026-10-30 'Menu pause only with slowest
+   time wins'): in a session, in a world, the game menu's and build mode's pause and unpause are not passed to the engine,
+   so this game's world keeps running with everyone else's. Under Slowest wins an open menu is this player's pause vote,
+   sent on the ordinary vote road (the world server answers it like a pause key); the last menu holding it closing gives
+   back the choice the player had before (or withdraws the vote if they had none). Build mode's vote rides its own
+   togglePause calls (it pauses unconditionally); the game menu's rides its show and hide (ClockGameMenuVisible), since
+   its show makes no call over a world already paused. The vote is not a press: no "speed not used" line is owed for it.
+   Single player and the title screen: unchanged. MAIN THREAD. */
+std::string MenuVoteApply(int act)
+{
+    if (act == coopclock::kMenuSkipVote)
+    {
+        ++g_menuVotesCast;
+        g_menuVoteSaved = g_myVote; g_menuVoteSavedExpressed = g_voteExpressed;
+        g_myVote = 0.0f; g_voteExpressed = 1;
+        ::InterlockedExchange(&g_voteWithdrawOwed, 0);
+        ::InterlockedExchange(&g_votePending, 1);
+        return "; under Slowest wins it is this player's pause vote (their choice before: "
+               + (g_menuVoteSavedExpressed ? F1(g_menuVoteSaved) + "x" : std::string("none")) + ")";
+    }
+    if (act == coopclock::kMenuSkipRestore)
+    {
+        ++g_menuVotesRestored;
+        if (g_menuVoteSavedExpressed) { g_myVote = g_menuVoteSaved; g_voteExpressed = 1; ::InterlockedExchange(&g_voteWithdrawOwed, 0); }
+        else { g_myVote = 1.0f; g_voteExpressed = 0; ::InterlockedExchange(&g_voteWithdrawOwed, 1); }
+        ::InterlockedExchange(&g_votePending, 1);
+        return "; the menu's pause vote is lifted and this player's choice is back to "
+               + (g_menuVoteSavedExpressed ? F1(g_menuVoteSaved) + "x" : std::string("none (withdrawn)"));
+    }
+    return std::string();
+}
+std::string MenuPauseCounters()
+{
+    return std::string(" (timemode=") + (coopclock::TimeModeWire(g_srvMode)[0] != 0 ? coopclock::TimeModeWire(g_srvMode) : "unknown")
+           + " menuPause[open,close,enter,leave,votes,restored]=" + N(g_menuSkipped[1]) + "," + N(g_menuSkipped[2]) + ","
+           + N(g_menuSkipped[3]) + "," + N(g_menuSkipped[4]) + "," + N(g_menuVotesCast) + "," + N(g_menuVotesRestored)
+           + " talkVote[open,cast,restored]=" + N((long long)g_menuPause.talkOpen) + "," + N(g_talkVoteOpened) + "," + N(g_talkVoteClosed) + ")";
+}
+/* the game menu's show (ui.cpp, after the engine's own ran) or hide (below, after the engine's own ran) - `visible` is its
+   panel read then (1 shown; anything else is taken as closed). Under Slowest wins, in a session, in a world, an open game
+   menu is this player's pause vote whether or not its show paused anything, and closing it gives the vote back. Only while
+   both its show and hide are hooked (as ClockCallerMenuSite): a menu half followed would hold a vote nothing gives back.
+   Defined in coop itself (store.h), so the anonymous namespace closes around it. MAIN THREAD. */
+}
+void ClockGameMenuVisible(int visible)
+{
+    if (g_clkToggleHook == 0 || g_clkMenuHideHook == 0 || UiPauseMenuShowHooked() == 0) return;   /* without the togglePause hook the menu still pauses this game: no vote on top */
+    const int linked = ::InterlockedCompareExchange(&g_relayLinkedCached, 0, 0) != 0 ? 1 : 0;
+    const int act = coopclock::MenuPauseNoteGameMenu(visible == 1 ? 1 : 0, linked, linked ? ClockWorldLive() : 0, g_srvMode, &g_menuPause);
+    if (act == coopclock::kMenuPass) return;
+    const std::string vote = MenuVoteApply(act);
+    if (g_menuVotesCast + g_menuVotesRestored <= 24)
+        DebugLog(std::string("[TIME] T-927: the game menu ") + (visible == 1 ? "opened" : "closed") + vote + MenuPauseCounters());
+}
+/* T-978 (owner decision 1445 a, rule 'Conversations and the world clock'): under Slowest wins, in a session, in a world, an open
+   NPC conversation window is this player's pause vote, like build mode and the game menu; the vote is given back when the game
+   menu, build mode and the window are all closed. Polled every frame from ClockTick: the window's own state (TkWindowDlg, its
+   +0xD0), so a takeover and every road that ends a conversation are followed. The window's own pause stays skipped in a session
+   (T-288, detour_userPause). Only while the pause hook is in: without it the window still pauses this game itself, and with the
+   TEST-ONLY talkpause lever it pauses as in single player - no vote on top (an open window then counts as closed). MAIN THREAD. */
+static void ClockTalkWindowPoll()
+{
+    const int gate = (g_clkPauseHook == 1 && g_dlgPauseTestLetThrough == 0) ? 1 : 0;
+    const int open = (gate && TalkWindowOpenNow() == 1) ? 1 : 0;
+    const int linked = ::InterlockedCompareExchange(&g_relayLinkedCached, 0, 0) != 0 ? 1 : 0;
+    const int act = coopclock::MenuPauseNoteTalkWindow(open, linked, (linked && open) ? ClockWorldLive() : 0, g_srvMode, &g_menuPause);   /* the world read only while it matters */
+    if (act == coopclock::kMenuPass) return;
+    if (act == coopclock::kMenuSkipVote) ++g_talkVoteOpened; else ++g_talkVoteClosed;
+    const std::string vote = MenuVoteApply(act);
+    if (g_talkVoteOpened + g_talkVoteClosed <= 24)
+        DebugLog(std::string("[TIME] T-978: the conversation window ") + (open ? "opened" : "closed") + vote + MenuPauseCounters());
+}
+namespace {
+typedef void (*GameMenuHideFn)(void* panel);
+GameMenuHideFn orig_gameMenuHide = 0;
+void detour_gameMenuHide(void* panel)
+{
+    orig_gameMenuHide(panel);
+    if (panel != 0) ClockGameMenuVisible(UiPauseMenuPanelVisible(panel));
+}
+void detour_togglePause(void* gameWorld, bool pause)
+{
+    const int site = ClockCallerMenuSite(_ReturnAddress());
+    if (site != coopclock::kMenuSiteNone)
+    {
+        const int linked = ::InterlockedCompareExchange(&g_relayLinkedCached, 0, 0) != 0 ? 1 : 0;
+        const int act = coopclock::MenuPauseDecide(site, linked, linked ? ClockWorldLive() : 0, g_srvMode, &g_menuPause);
+        if (act != coopclock::kMenuPass)
+        {
+            ++g_menuSkipped[site];
+            const std::string vote = MenuVoteApply(act);
+            const long long skips = g_menuSkipped[1] + g_menuSkipped[2] + g_menuSkipped[3] + g_menuSkipped[4];
+            if (skips <= 12)
+                DebugLog(std::string("[TIME] T-927: the ") + MenuSiteName(site) + "'s " + (pause ? "pause" : "unpause")
+                         + " was not applied - in a session menus stop nobody's world" + vote + MenuPauseCounters());
+            return;
+        }
+    }
+    if (orig_togglePause != 0) orig_togglePause(gameWorld, pause);
+}
 /* MainBarGUI::changeSpeed tail-jumps into setGameSpeed, so the return address the detour above sees belongs to
    whatever MyGUI called changeSpeed - unknowable, and different for every button. The flag is raised across the
    call instead. MyGUI dispatches its widget callbacks from the frame it draws on, which is the main thread, so
@@ -10500,10 +10960,13 @@ bool ClockSendUp(unsigned int type, const char* bytes, size_t n)
    repair, and the pending flag is cleared only on a send that actually went out. */
 int ClockSendVote()
 {
-    char b[4]; const float v = g_myVote; std::memcpy(b, &v, 4);
+    const long withdraw = ::InterlockedCompareExchange(&g_voteWithdrawOwed, 0, 0);
+    char b[4]; const float v = withdraw ? coopclock::kSpeedVoteWithdrawn : g_myVote; std::memcpy(b, &v, 4);
     if (!ClockSendUp(kStoreMsgSpeedVote, b, 4)) return 0;   /* P7o: the caller needs to know, so a link-up publish that did not go out is retried next frame rather than marked done */
     ++g_votesSent; ::InterlockedExchange(&g_votePending, 0);
+    if (withdraw) ::InterlockedExchange(&g_voteWithdrawOwed, 0);   /* sent once; the world server has dropped this game's choice */
     g_voteSentClockRecv = g_clockRecv;
+    if (::InterlockedExchange(&g_speedPressPending, 0) != 0) { g_speedPressArmed = 1; g_speedPressChosen = v; g_speedPressSentRecv = g_clockRecv; }
     return 1;
 }
 /* P7j: the two fields this game's store HELLO now carries. `hours` is NEGATIVE unless a world is actually
@@ -10586,6 +11049,27 @@ int ClockPublishOwn(double localAbs, int prejump)
         return 1;
     }
 }
+/* A press this player made and the world did not use: once the world server's CLOCKs show it (coopclock::SpeedPressAnswer), the
+   world's GAME SPEED CONTROL line in grey chat to this player only, at most once every 30 s. MAIN THREAD (the CLOCK handler). */
+void ClockPressAnswerTick()
+{
+    if (!g_speedPressArmed) return;
+    const int a = coopclock::SpeedPressAnswer(g_speedPressChosen, g_srvSpeed, g_clockRecv - g_speedPressSentRecv);
+    if (a == coopclock::kSpeedPressWait) return;
+    g_speedPressArmed = 0;
+    if (a == coopclock::kSpeedPressTaken) return;
+    ++g_speedPressNotTaken;
+    const char* const line = coopclock::SpeedNotTakenLine(g_srvMode);
+    const unsigned int nowMs = (unsigned int)::GetTickCount();
+    const bool say = line[0] != 0 && coopclock::SpeedLineDue(g_speedPressLineSaid, g_speedPressLineMs, nowMs) != 0;
+    if (say)
+    {
+        g_speedPressLineSaid = 1; g_speedPressLineMs = nowMs; ++g_speedPressLines;
+        coop::ChatNoticeLine(-1, std::string(), std::string(line));
+    }
+    DebugLog("[TIME] this player's press of " + F1(g_speedPressChosen) + "x was not used: the world runs at " + F1(g_srvSpeed) + "x under timemode "
+             + std::string(coop::TimeModeName()) + (say ? std::string(" - said in chat: ") + line : std::string(" - no chat line (one was said in the last 30 s)")));
+}
 void ClockOnClockMessage(const std::vector<char>& payload)
 {
     if (payload.size() < 13) { ErrorLog("[TIME] malformed CLOCK from the notebook - ignored"); return; }
@@ -10599,6 +11083,7 @@ void ClockOnClockMessage(const std::vector<char>& payload)
     g_srvAtMs = (double)::GetTickCount();
     ++g_clockRecv;
     ::InterlockedExchange(&g_clockLinkGen, ::InterlockedCompareExchange(&g_linkGen, 0, 0));
+    ClockPressAnswerTick();
     /* P7u: THE PASS RUNS ON THE MESSAGE. ClockTick sits below PumpLink in StoreTick, so this is consumed
        the same frame it arrives and the extrapolation ClockSharedHoursNow does is sub-frame rather than
        sub-second. Main thread both sides; a plain int is right. */
@@ -10765,11 +11250,12 @@ void ClockApplySpeed()
                 const int act = coopclock::ClockLiveSpeedDecide(g_spd, live, g_srvSpeed, g_myVote, nowMs, answered);
                 if (act == coopclock::kLiveSpeedAdopt)
                 {
-                    /* the vote counts under consensus, or from the authority under fixed; otherwise nothing holds it */
-                    const int voteCounts = (g_srvMode == 1 || g_storeAuthority) ? 1 : 0;
                     ++g_speedOutsideAdopted;
                     const float was = g_spd.lastSeen;
                     const float value = coopclock::LiveSpeedAdoptValue(g_spd, live);
+                    /* held here until the world answers only when this choice can move the world's speed under its GAME SPEED
+                       CONTROL (Slowest wins, Everyone agrees, or Admin only on a game that is an admin now); otherwise nothing holds it */
+                    const int voteCounts = coopclock::TimeModePressCounts(g_srvMode, coop::AdminNow() ? 1 : 0, value);
                     coopclock::LiveSpeedNoteAdopted(&g_spd, live, nowMs, voteCounts);
                     g_spdVoteSeqAtAdopt = g_votesSent;
                     DebugLog("[TIME] the engine's speed changed to " + F1(value) + "x (from " + F1(was) + "x) with no game button or key -"
@@ -10818,6 +11304,15 @@ void ClockNoteEpoch()
         ++g_worldEpoch;
         g_joinJumpOwed = 1; g_joinJumpArmCause = "worldlive";
         g_prevLocalAbs = -1.0; g_prevLocalAbsEpoch = -1;
+        /* T-1055 (owner 1363): ONE RELEASE LINE PER WORLD-LIVE EDGE - how this world started, so a player's log answers "why did my
+           hosted world start single player". Log only: the role now, the request the pump last let through, the NEW GAME window's
+           start name and the HOST / JOIN preparation (ui.cpp UiWorldStartFacts). */
+        const int req = g_worldStartReq;
+        g_worldStartReq = -1;
+        const int role = ConfigRole();
+        DebugLog(std::string("[WORLD] started: role=") + (role == kRoleHost ? "host" : role == kRoleClient ? "join" : "single")
+                 + " by=" + (req == coopprof::kProfReqNewGame ? "new game" : req == coopprof::kProfReqImport ? "import" : req == coopprof::kProfReqLoad ? "load" : "?")
+                 + " " + UiWorldStartFacts(req == coopprof::kProfReqNewGame ? 1 : 0));
     }
     g_worldWasLive = liveNow;
     {
@@ -11099,6 +11594,7 @@ void ClockTick()
        link, and sampling it below the return is what let a world that loaded while the link was down be booked
        later as a link-up edge. */
     ClockNoteEpoch();
+    ClockTalkWindowPoll();   /* T-978: an open conversation window is this player's pause vote under Slowest wins (above the LinkUp() return, so a close is always followed) */
     if (!LinkUp())
     {
         /* the speed memory belongs to this link: a change made while it is down is never a speed mod's vote */
@@ -11158,23 +11654,27 @@ void ClockWorldTeardown()
        main menu leaves a vote of 0 standing at the notebook, and under consensus the minimum wins, so THE OTHER
        PLAYER'S WORLD STAYS PAUSED with nothing on their screen saying why - and they cannot escape it, because
        pressing unpause sends their own non-zero vote and the 0 still wins. Clearing the vote here is not enough
-       on its own: the notebook is still holding the 0 and only forgets it at a disconnect. So the neutral
-       setting is SENT, through the pending flag the tick already drains, and the other player's world resumes.
+       on its own: the notebook is still holding the 0 and only forgets it at a disconnect. So a withdrawal
+       is SENT (below), through the pending flag the tick already drains, and the other player's world resumes.
        THIS IS NOT THE LINK-BOUNCE CASE review-p7o warned about. This function is called from TeardownBroadcast -
        the world object is being destroyed - and a link bounce runs the link-down arm in PumpLink, which never
        reaches here; a player who is still playing keeps their setting. What it does cost is that a speed chosen
        in one world does not follow the player into the next one, which is the honest reading of a vote about a
        world that no longer exists.
-       THE RESIDUE, STATED: 1.0 is a real vote, so a game parked at the main menu still caps a consensus world at
-       1x. Saying "I have no vote" needs the notebook to drop the entry, and on protocol 39 there is no value
-       that means that - every value SPEEDVOTE carries (0 .. coopclock::kClockSpeedMax) is a real setting. Owed,
-       and not closed here. */
+       THE WITHDRAWAL (T-1158 step 4 review fold): the vote sent is kSpeedVoteWithdrawn (clockmath.h), not 1.0, and
+       the world server drops this game's entry. A 1.0 was a choice nobody made: under Admin only an admin's reload
+       put the world at 1x over another admin's choice, and under Slowest wins a game at the main menu capped the
+       world at 1x. The world server still counts this game in the world until its next JOIN_STAGE (a return to
+       the main menu sends none), so only the value itself can say the world closed. */
     /* review-p7u L-6: the "now REPORTING its own time" line is a fact about THIS WORLD on this link, so the
        latch is reset here as well as on a link edge. Without this it printed once per link generation and a
        reload was silent. */
     g_clockPublishedGen = -1;
     g_myVote = 1.0f; g_myVoteNonZero = 1.0f; g_voteExpressed = 0;
+    coopclock::MenuPauseNoteWorldClosed(&g_menuPause);   /* T-927: the vote a menu cast went with the world; nothing is owed back */
+    ::InterlockedExchange(&g_voteWithdrawOwed, 1);
     ::InterlockedExchange(&g_votePending, 1);
+    ::InterlockedExchange(&g_speedPressPending, 0); g_speedPressArmed = 0;   /* the reset setting is not a press */
     WxForgetRegions();
 }
 /* E38 (d) extended by E40: has a CLOCK arrived on the link that is up right now? The load gate waits for it,
@@ -11196,6 +11696,10 @@ std::string ClockReport()
       << g_throttleSkippedWrap << "," << g_throttleFailed << "," << g_clockWriteBelowCurrentRefused << ","
       << g_engineAdvanceMinutesLastPass << "," << g_engineSpeedCalls << "," << g_engineHeldTicks
       << " dlgPause[showSkipped,hideSkipped]=" << g_dlgPauseSkipped << "," << g_dlgUnpauseSkipped
+      << " menuPause[menuOpenSkipped,menuCloseSkipped,buildEnterSkipped,buildLeaveSkipped,votesCast,votesRestored]="
+      << g_menuSkipped[coopclock::kMenuSiteMenuOpen] << "," << g_menuSkipped[coopclock::kMenuSiteMenuClose] << ","
+      << g_menuSkipped[coopclock::kMenuSiteBuildEnter] << "," << g_menuSkipped[coopclock::kMenuSiteBuildLeave] << ","
+      << g_menuVotesCast << "," << g_menuVotesRestored
       << " clock3[forwardSetRefusedOverBound,clockWorldMismatch,seedState,votesSentOnLink,votesRepeatPress,votesHeldNoWorld,clockPublished]="
       << g_forwardSetRefusedOverBound << "," << g_clockWorldMismatch << "," << g_srvSeedState << "," << g_votesSentOnLink
       << "," << g_votesRepeatPress << "," << g_votesHeldNoWorld << "," << g_clockPublished
@@ -11212,7 +11716,7 @@ std::string ClockReport()
       << g_offersWhileUnseeded << "," << g_relinkNoJump << "," << g_forwardSetRefusedBelowLive << ","
       << g_forwardSetSkippedWrap << "," << g_forwardSetFailed << "," << g_publishOwnNoClock << "," << g_publishOwnSendFailed
       << "," << g_throttleRefusedBelowLive
-      << " clockHooks[speed,pause,mainbar,weather]=" << g_clkSpeedHook << "," << g_clkPauseHook << "," << g_clkBarHook << "," << g_clkWeatherHook
+      << " clockHooks[speed,pause,mainbar,weather,toggle,menuHide,menuShow]=" << g_clkSpeedHook << "," << g_clkPauseHook << "," << g_clkBarHook << "," << g_clkWeatherHook << "," << g_clkToggleHook << "," << g_clkMenuHideHook << "," << UiPauseMenuShowHooked()
       << " weather[sent,recv,applied,unsafe]=" << g_wxSent << "," << g_wxRecv << "," << g_wxApplied << "," << g_weatherApplyUnsafe
       << " weather2[regions,changes,applyFailed,applyNoSetter,readFail,recvSame,registryFull]=" << g_wxCount << ","
       << g_wxChanges << "," << g_wxApplyFailed << "," << g_wxApplyNoSetter << "," << g_wxReadFail << "," << g_wxRecvSame << "," << g_wxRegistryFull
@@ -11267,7 +11771,8 @@ void ReportClockLines()
              + " clockWorldMismatch=" + N((long long)g_clockWorldMismatch)
              + " joinJumpRefusedOverBound=" + N((long long)g_joinJumpRefusedOverBound)
              + " pauseByte=" + (okp ? N((long long)pb) : std::string("?"))
-             + " timemode=" + std::string(g_srvMode == 1 ? "consensus" : "fixed")
+             + " timemode=" + std::string(coopclock::TimeModeWire(g_srvMode)[0] != 0 ? coopclock::TimeModeWire(g_srvMode) : "unknown")
+             + " speedPressNotUsed=" + N(g_speedPressNotTaken) + " speedPressLines=" + N(g_speedPressLines)
              + " seed=" + std::string(g_srvSeedState == 1 ? "first" : (g_srvSeedState == 2 ? "advanced" : (g_srvSeedState == 4 ? "restored" : "none")))
              + " engineHeld=" + N((long long)g_engineHeld)
              + " dlgPauseSkipped=" + N(g_dlgPauseSkipped) + " dlgUnpauseSkipped=" + N(g_dlgUnpauseSkipped)
@@ -11427,10 +11932,10 @@ void TeardownBroadcast(const char* why)
     g_zoneLogLines = 0;   /* E22c: the 64-line budget is PER WORLD (the suppressed count is cumulative evidence and is not reset) */
     ZoneMarkPendingClear(false, false);   /* Z1-b: the handshake table, under its lock (the load facts stay for the post-teardown flush - E33) */   // review-p3y P3Y-1: these were swallowed into the comment below by p3y (review-p3j: a stranded handshake must not outlive the read that set it)
     g_loadOverrideRestoredLogged = 0; g_loadOverrideFailedLogged = 0; g_loadOverrideMissingLogged = 0;   // review-p3x P3X-4: first-only per world
-    ResetPlayerFactionState(); ForgetContextPlatoons(); RelationsForgetQueue(); PlayersTabForgetWorld(); FallenTabForgetWorld(); coop::UiEditorForgetWorld();
+    ResetPlayerFactionState(); ForgetContextPlatoons(); coop::CampWorldTeardown(); RelationsForgetQueue(); PlayersTabForgetWorld(); FallenTabForgetWorld(); coop::UiEditorForgetWorld();
     coop::TeamForget("the world was torn down - leaving to the title, or another load", false);   /* T-546: asked again once a world is loaded */
     OwnResBenchForget();   /* the team research level: the next world's own benches give this game's own level */
-    g_ctxSleptMine.clear(); g_ctxDrops.clear(); g_wakeDup.clear(); g_saveSplit.clear();   /* the context wake rule's platoons and the refused duplicate wakes belong to the freed world */
+    g_ctxSleptMine.clear(); g_ctxSleptCount.clear(); g_ctxDrops.clear(); g_wakeDup.clear(); g_saveSplit.clear();   /* the context wake rule's platoons and the refused duplicate wakes belong to the freed world */
     coop::BuildForgetWorld();   /* build1-c (review-build1b M2): the other game's pending PLACEs / STATEs and copy rows die with the world */
     g_homeOf.clear(); g_homeClearedFrom.clear(); g_homeOwed.clear(); g_homeOwedNow = 0; g_homeKeyless.clear(); g_copyHomeOwedMap.clear(); g_loHomeSeen.clear(); /* [t755-copyhome-clear] */   /* the groups' home building keys and the homes owed are world state */
     g_pendingTown.clear(); g_goneTownLaunch.clear(); g_testPendNotes.clear(); g_noteEngineHas.clear(); g_noteUnplaceLogged.clear(); g_notePlaceFailed.clear(); g_copyNotBuiltPlaceIds.clear(); g_sweepFirst.clear(); g_sweepPending.clear(); g_notKeptWait.clear(); memset(g_sweepMine, 0, sizeof(g_sweepMine)); memset(g_sweepOther, 0, sizeof(g_sweepOther)); ArClear(); ArRunsClear(); g_sweepLastAuthority = 0; g_sweepNoMapPending = false; g_noteRaiseDone = false; g_sleepPosStaleIds.clear(); g_sleepPosUnusableIds.clear(); PublishPendingTowns();   /* decision 34 */
@@ -11447,7 +11952,9 @@ void TeardownBroadcast(const char* why)
        StoreTick and at the WELCOME, so nothing depends on this clear. */
     /* E33 (verify-p5v MEDIUM-1): ZonesForgetHeldGrid() IS NOT CALLED HERE ANY MORE - see TeardownBroadcastLateFlags below. */
     ClockWorldTeardown();   /* E40 / decision 45: the clock object and every WeatherRegion go with this world - the next one is SET, not trimmed */
-    SpawnWorldTeardown(); ResurrectWorldTeardown(); ReplicateWorldTeardown(); TownGenWorldTeardown(); WorldsyncWorldTeardown(); CombatWorldTeardown(); AiSpikeWorldTeardown(); WorldStateWorldTeardown();   /* E19: the unique-state shadow, the non-ALIVE register and the ring are all keyed to this world */ ItemsWorldTeardown();   /* E22a: the item-move ring names characters in the world being destroyed */ DoorsWorldTeardown();   /* E45: the door registry names doors in it, and a recycled address must never answer for the next world */
+    SpawnWorldTeardown(); ResurrectWorldTeardown(); ReplicateWorldTeardown(); TownGenWorldTeardown(); WorldsyncWorldTeardown(); CombatWorldTeardown(); AiSpikeWorldTeardown(); TalkFreezeWorldTeardown();   /* T-978 A: after every hold was freed */ WorldStateWorldTeardown();   /* E19: the unique-state shadow, the non-ALIVE register and the ring are all keyed to this world */ ItemsWorldTeardown();   /* E22a: the item-move ring names characters in the world being destroyed */ DoorsWorldTeardown();   /* E45: the door registry names doors in it, and a recycled address must never answer for the next world */
+    coop::TeamMapWorldTeardown();   /* T-930: the dots are children of this world's map screen; the viewers are this world's players */
+    StoreBookWorldTeardown();   /* T-1242 fold 6: the research-books hold and the holder's records are this world's */
     DebugLog("[STORE] world teardown (" + std::string(why) + "): forgot " + N((long long)bound) + " bound platoons, " + N((long long)byId) + " ids, the peer faction, and the zone marks");
 }
 // E29 (review-p5r MEDIUM-1): THE SECOND DRAIN - THE ONE THAT CATCHES WHAT THE ENGINE'S TEARDOWN ITSELF QUEUED.
@@ -15122,6 +15629,7 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
         if (PumpVerdictInDepth(self) != 0)
         {
             ++g_loadRefusedAtPump;
+            const int heldForOperator = g_loadRefuseQuiet;   /* T-967: a load HELD for the world's operator, not failed - read before SayRefusedOnScreen clears it */
             if (g_pumpRefusalUncleared == 0) SayRefusedOnScreen();   /* T-201 PP6' fold (F2): once per refusal */
             const int cleared = ClearSaveRequestCodePod(self);
             if (cleared != 1)
@@ -15149,16 +15657,24 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
                              + ". The player may be left looking at a loading screen over the title"
                                " (loadingScreenOffFailed in the report).");
             }
-            ErrorLog("[STORE] LOAD REFUSED AT THE TITLE SCREEN, in the save-request pump (SaveManager::execute), BEFORE"
-                     " it deleted the title screen. The reason is the LOAD REFUSED line just above. The request was"
-                     " cleared, the engine's pump was not run, and the loading screen was turned off the way the request"
-                     " turned it on (ForgottenGUI::setLoading, now with 0; loadRefuseLoadingScreenOff) - Read from the"
-                     " code, not yet seen in a run. Start the notebook, let the game link, then load again"
-                     " (loadRefusedAtPump).");
+            if (heldForOperator != 0)
+                DebugLog("[STORE] load HELD at the title screen, in the save-request pump (SaveManager::execute), BEFORE it deleted"
+                         " the title screen: the world's operator is not in the world yet. The request was cleared and the loading"
+                         " screen turned off; the load starts by itself when the operator is in the world (the JOIN held load line"
+                         " just above) - nothing for the player to do (loadRefusedAtPump).");
+            else
+                ErrorLog("[STORE] LOAD REFUSED AT THE TITLE SCREEN, in the save-request pump (SaveManager::execute), BEFORE"
+                         " it deleted the title screen. The reason is the LOAD REFUSED line just above. The request was"
+                         " cleared, the engine's pump was not run, and the loading screen was turned off the way the request"
+                         " turned it on (ForgottenGUI::setLoading, now with 0; loadRefuseLoadingScreenOff) (loadRefusedAtPump).");
             return;
         }
         g_loadDecidedAtPump = 1;   /* allowed: the loadGame gate below must not decide this request again */
         PreloadReleased();   /* T-346 fold 1 (review LOW 5): a held load's exchange is counted done / stale only now, when the load is let go */
+    }
+    {   /* T-1055: the request this call lets through (a load, an import or a new game the engine dispatches now), for the [WORLD] started line */
+        const int sent = SaveRequestCodePod(self);
+        if (sent >= coopprof::kProfReqLoad && sent <= coopprof::kProfReqNewGame && PumpWillDispatchPod(self) != 0) g_worldStartReq = sent;
     }
     orig_saveRequestPump(self, a2, a3, a4);
 }
@@ -15469,6 +15985,9 @@ void detour_gameWorldDtor(void* gameWorld)
     /* 4. C-runtime file buffers */
     const int flushAll = ExitFlushAllBounded();
     /* 5. */
+    /* the quit byte as the exit hook finds it: recorded so a later read can tell whether a crash's exit and a quit's differ by
+       it; the crash judgement does not use it */
+    DebugLog(std::string("[EXIT] the game's quit byte at exit: ") + (g_quitFlagAddr == 0 ? "not known (its address was not found)" : (QuitFlagSet() != 0 ? "up" : "down")));
     DebugLog("[EXIT] quit complete - ending the process (Kenshi's own shutdown past this point crashes: H052 Havok allocator, H053 ParticleUniverse externs); records idle="
              + N((long long)(recIdle ? 1 : 0)) + " link=" + linkWord
              + " saveWait=" + (saveReadable ? N((long long)saveWaited) : std::string("skipped")) + " flushall=" + N((long long)flushAll));
@@ -15579,6 +16098,34 @@ void InstallStore()
                 coop::AddHook((void*)aPause, (void*)&detour_userPause, (void**)&orig_userPause);
                 g_clkPauseHook = (ReadPrologue((const void*)aPause, post) != 0 && std::memcmp(pre, post, 8) != 0) ? 1 : 0;
             }
+            /* T-927: togglePause. Its rows are in both Steam tables; a build whose togglePause bytes differ keeps menus
+               pausing only this game, as before (no guessed address is ever hooked). */
+            {
+                const unsigned char sigToggle[8] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74 };   /* mov [rsp+8],rbx / mov [rsp+0x10],rsi */
+                const uintptr_t aToggle = base + kTogglePauseRva;
+                if (kTogglePauseRva == 0 || ReadPrologue((const void*)aToggle, pre) == 0 || std::memcmp(pre, sigToggle, 8) != 0)
+                    ErrorLog("[TIME] togglePause hook=not-installed at rva " + P113Hex((unsigned long long)kTogglePauseRva) + ": the prologue is not the `48 89 5C 24 08 48 89 74` this build was read against. The game menu and build mode still pause only this game's world in a session (T-927 not in effect).");
+                else
+                {
+                    coop::AddHook((void*)aToggle, (void*)&detour_togglePause, (void**)&orig_togglePause);
+                    g_clkToggleHook = (ReadPrologue((const void*)aToggle, post) != 0 && std::memcmp(pre, post, 8) != 0) ? 1 : 0;
+                    if (!g_clkToggleHook) ErrorLog("[TIME] togglePause hook=not-installed: the bytes read back unchanged after AddHook. The game menu and build mode still pause only this game's world in a session (T-927 not in effect).");
+                }
+            }
+            /* T-927: the game menu's hide, so its pause vote follows the menu's own state. Without it (or without ui.cpp's
+               show hook) the game menu keeps pausing only this game in a session; build mode is not affected. */
+            {
+                const unsigned char sigHide[8] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x80, 0xB9 };   /* push rbx / sub rsp,0x40 / cmp byte [rcx+0xE8],0 */
+                const uintptr_t aHide = base + kGameMenuHideRva;
+                if (kGameMenuHideRva == 0 || ReadPrologue((const void*)aHide, pre) == 0 || std::memcmp(pre, sigHide, 8) != 0)
+                    ErrorLog("[TIME] game menu hide hook=not-installed at rva " + P113Hex((unsigned long long)kGameMenuHideRva) + ": the prologue is not the `40 53 48 83 EC 40 80 B9` this build was read against. The game menu still pauses only this game's world in a session (T-927 not in effect for it; build mode unaffected).");
+                else
+                {
+                    coop::AddHook((void*)aHide, (void*)&detour_gameMenuHide, (void**)&orig_gameMenuHide);
+                    g_clkMenuHideHook = (orig_gameMenuHide != 0 && ReadPrologue((const void*)aHide, post) != 0 && std::memcmp(pre, post, 8) != 0) ? 1 : 0;
+                    if (!g_clkMenuHideHook) ErrorLog("[TIME] game menu hide hook=not-installed: the bytes read back unchanged after AddHook. The game menu still pauses only this game's world in a session (T-927 not in effect for it; build mode unaffected).");
+                }
+            }
             if (ReadPrologue((const void*)aBar, pre) == 0 || std::memcmp(pre, sigBar, 4) != 0)
                 ErrorLog("[TIME] main-bar hook=not-installed at rva 0x723DF0 (MainBarGUI::changeSpeed): the speed BUTTONS will not be recognised as the player's, so a click changes this game's speed locally and the next tick puts it back. The KEYS still vote.");
             else
@@ -15595,7 +16142,7 @@ void InstallStore()
             }
         }
         DebugLog("[TIME] E40 hooks: setGameSpeed 0x787300=" + N((long long)g_clkSpeedHook) + " userPause 0x787470=" + N((long long)g_clkPauseHook)
-                 + " MainBarGUI::changeSpeed 0x723DF0=" + N((long long)g_clkBarHook) + " WeatherRegion::updateBT 0x9DCF80=" + N((long long)g_clkWeatherHook)
+                 + " togglePause=" + N((long long)g_clkToggleHook) + " gameMenuHide=" + N((long long)g_clkMenuHideHook) + " MainBarGUI::changeSpeed 0x723DF0=" + N((long long)g_clkBarHook) + " WeatherRegion::updateBT 0x9DCF80=" + N((long long)g_clkWeatherHook)
                  + "; imageSize=" + N((long long)g_clkImageSize) + " hourRealSeconds=" + F1(g_hourRealSeconds)
                  + " (read back from rva 0x16FC454, not hard-coded). The clock is SET by replicating the load"
                  " path 0x66D0C0's own write set - that function is never called, because it reads its three"
@@ -15874,6 +16421,18 @@ void InstallStore()
             if (h8 == coop::SUCCESS && !g_titleHookOn)
                 ErrorLog("[STORE] title-exit hook: AddHook RETURNED SUCCESS AND THE PROLOGUE IS UNCHANGED at rva 0x9142B0. Read no conclusion from titleSeen or quitFromTitle this run.");
         }
+    }
+    /* THE NEXT LAUNCH JUDGES THIS ONE (src/common/crashkeep.h) ONLY WHEN EVERY ROAD THAT RAISES THE QUIT BYTE WRITES ITS
+       [EXIT] quit route LINE: the exit hook, the quit byte's address (the window close raises it through it), the window-close,
+       menu-quit and title-exit hooks and the title screen's Escape gate (ui.cpp, installed before this) must all be in. Without
+       one of them a normal quit could look like a crash, so there is no marker and the next launch says "not judged". */
+    {
+        const bool marked = swcrashkeep::RoutesMarked(hExit == coop::SUCCESS, g_quitFlagAddr != 0, g_closeHookOn, g_menuHookOn, g_titleHookOn, coop::UiTitleEscGateOn() != 0);
+        const std::string which = std::string(" (exit hook ") + (hExit == coop::SUCCESS ? "in" : "OUT") + ", quit byte " + (g_quitFlagAddr != 0 ? "found" : "NOT FOUND")
+                                  + ", window " + (g_closeHookOn ? "in" : "OUT") + ", menu " + (g_menuHookOn ? "in" : "OUT") + ", title " + (g_titleHookOn ? "in" : "OUT")
+                                  + ", title-escape " + (coop::UiTitleEscGateOn() != 0 ? "in" : "OUT") + ")";
+        if (marked) DebugLog(std::string(swcrashkeep::kHookOkText) + "window, menu, title, title-escape" + which);
+        else ErrorLog("[EXIT] quit routes NOT all marked - the next launch will not judge whether this one crashed" + which);
     }
 }
 
@@ -16451,7 +17010,7 @@ struct PreWantHere
     {
         const int cls = cooppre::PreAoiClass(e.ax, e.ay, g_preAoiList, cooppre::kPreRing);
         if (cls == cooppre::kPreAoiIn) ++g_preAoiRowsIn; else if (cls == cooppre::kPreAoiOut) ++g_preAoiRowsOut; else if (cls == cooppre::kPreAoiNoArea) ++g_preAoiRowsNoArea; else ++g_preAoiRowsNoList;
-        const bool boxOrPiece = coopbrec::IsBoxRecId(e.key) || piecerec::IsPieceRecId(e.key) || shoprec::IsShopRecId(e.key);   /* a shop record names its area as a box does */
+        const bool boxOrPiece = coopbrec::IsBoxRecId(e.key) || piecerec::IsPieceRecId(e.key) || shoprec::IsShopRecId(e.key) || doorrec::IsDoorRecId(e.key);   /* a shop or door record names its area as a box does */
         /* T-985 C2b fold 1 (preload.h PreRowChoose): a row is left for the feed only when the world server's copy AND this game's
            own copy lie outside the ring and the asker's player did not write it (review HIGH 1, 2). A kept key the gate still holds
            back that is left outside stays held while the server's copy is newer; a kept row held beside goes into the skipped
@@ -16834,6 +17393,7 @@ void StoreWorldLoadBegan(const char* why)
     ++g_worldLoadBegan;
     StoreFeedOffAtLoad(why);   /* T-313: the world is going away - OFF, once per load (the second call of a load finds nothing asked) */
     coop::TownVerWorldLoadBegan();   /* the town-version sweep and seeds die with the zones; the note book is marked ended */
+    coop::CampWorldLoadBegan();      /* T-929: the waiting camp builds, the proposal and the list end with the world */
     coop::KapiWorldLoadBegan();   /* per-race rules: solo play takes its own file's rules; a multiplayer role drops a set taken from it */
     DebugLog(std::string("[STORE] world load/teardown begins (") + why + "): worldGen is now "
              + N((long long)::InterlockedCompareExchange(&g_worldGen, 0, 0))
@@ -17782,6 +18342,8 @@ typedef char SwingEndInnerNumber[(net::MSG_SWING_END == (int)cooplive::kInnerSwi
 typedef char FightChoiceInnerNumber[(net::MSG_FIGHT_CHOICE == (int)cooplive::kInnerFightChoice) ? 1 : -1];   /* T-1101 design (c) */
 typedef char ShotFiredInnerNumber[(net::MSG_SHOT_FIRED == (int)cooplive::kInnerShotFired) ? 1 : -1];
 typedef char HandInnerNumber[(net::MSG_HAND == (int)cooplive::kInnerHand) ? 1 : -1];
+typedef char BoxLockInnerNumber[(net::MSG_BOX_LOCK == (int)cooplive::kInnerBoxLock && net::MSG_BOX_LOCK == (int)coopbrec::kMsgBoxLock) ? 1 : -1];   /* T-1061 */
+typedef char ResearchBookInnerNumber[(net::MSG_RESEARCH_BOOK == (int)cooplive::kInnerResearchBook && net::MSG_RESEARCH_BOOK == (int)bookshare::kMsgResearchBook) ? 1 : -1];   /* T-1242 */
 std::string LiveReportToken()
 {
     return " liveRecv=" + N(g_liveRecv)
@@ -17835,6 +18397,8 @@ static void StoreLiveRoadLocal(const cooplive::LiveDown& d, const std::vector<ch
     { coop::BugReportLiveIn(d.innerType, d.originSlot, in, d.innerLen); return; }   /* T-461: a nearby player's log for a bug report (bugreport.cpp checks the bytes) */
     if (d.innerType == cooplive::kInnerChat)
     { coop::ChatLiveIn((int)d.originSlot, in, (unsigned)d.innerLen); return; }   /* a chat line (chat.cpp checks the bytes and who may send it) */
+    if (d.innerType == cooplive::kInnerMapDots)
+    { coop::TeamMapLiveIn((int)d.originSlot, in, (unsigned)d.innerLen); return; }   /* T-930: a teammate's map OPEN / CLOSE or its characters' positions (teammap.cpp checks the bytes and the team) */
     ++g_roadLocalMalformed;
     if (cooplive::LiveLogThis(g_roadLocalMalformed)) ErrorLog("[STORE] LIVE: a malformed notebook-road message (inner type " + N((long long)d.innerType) + ", " + N((long long)d.innerLen) + " bytes) from slot " + N((long long)d.originSlot) + " - dropped (roadLocalMalformed " + N(g_roadLocalMalformed) + ")");
 }
@@ -18098,15 +18662,7 @@ void PumpLink()
         g_profPanelReqOut = 0; g_profAutoOwed = 0; g_profListThisLink = 0;   /* recheck-prof3: a new link, a new list */
         spimport::TieReset(&g_spTie);   /* T-1096 fold: this connection's answers count from here */
         ++g_helloPlayerIdSent;
-        g_storeAuthAnsweredLink = 0;   /* a new connection: its world server may ask for the password once */
-        bool tokenSent = false;
-        if (ConfigRole() == kRoleHost && g_hostTokenSet)
-        {
-            /* the host's own game shows this hosting's secret ahead of its HELLO, on the same ordered lane: it is the world's owner */
-            std::vector<char> tb; authproof::HostTokenEncode(g_hostToken, &tb);
-            if (g_link->Send(0, (net::MsgType)kStoreMsgHostToken, &tb[0], tb.size(), net::CH_RELIABLE)) { ++g_storeHostTokenSent; tokenSent = true; }
-            else ++g_storeHostTokenFailed;
-        }
+        g_storeAuthAnsweredLink = 0; g_storeDoorLoginSentLink = 0;   /* a new connection: its world server may ask for the password once */
         g_linkHello = g_link->Send(0, net::MSG_STORE_HELLO, &b[0], b.size(), net::CH_RELIABLE);
         /* P6q (review-p6j MEDIUM-1): A NEW LINK IS A NEW NUMBERING, and it is stamped here, on the edge, before any
            message of the new link can be drained below. Everything keyed to the previous generation - most of all
@@ -18117,7 +18673,6 @@ void PumpLink()
            only and is what the WELCOME/AREAMAP slot comparisons key on; an entry queued before a DROP has to
            be able to see that drop, so it cannot share that counter. */
         ::InterlockedIncrement(&g_notebookLinkGen);
-        g_hostTokenLinkGen = tokenSent ? ::InterlockedCompareExchange(&g_linkGen, 0, 0) : -1;   /* the owner's own game on this link (StoreOwnerTokenThisLink) */
         DebugLog(std::string("[STORE] link up to ") + relaybridge::AddrForLog(g_linkAddr) + " (route used: " + net::RelayRouteNoteUp(g_link) + ") - HELLO " + (g_linkHello ? "sent" : "FAILED") + " (link generation " + N((long long)g_linkGen) + ", saveFolder='" + slot + "', world='" + world + "', clock=" + F1((float)helloHours) + ", speed=" + F1(helloSpeed) + ")");
         /* P7u: THE LINK-UP ARM HAS MOVED into ClockNoteEpoch, which runs every frame above ClockTick's LinkUp()
            return and compares g_linkGen against the generation it last armed on. Three arm sites written out by
@@ -18171,12 +18726,14 @@ void PumpLink()
             g_storeAuthAnsweredLink = 1;
             std::vector<char> proof;
             const bool hosting = ConfigRole() == kRoleHost;
-            const int a = StoreAuthAnswer(m.payload, hosting, &proof);
+            bool login = false;
+            const int a = StoreAuthAnswer(m.payload, hosting, &proof, &login);
             if (a > 0 && g_link != 0 && g_link->Send(0, (net::MsgType)kStoreMsgAuthProof, &proof[0], proof.size(), net::CH_RELIABLE))
             {
                 ++g_storeAuthAnswered;
-                DebugLog(std::string("[STORE] the world server asked for the world's password - answered with a proof made from ")
-                         + (hosting ? "the password this game hosts with" : "the password given for this join"));
+                if (login) { ++g_storeDoorLoginSent; g_storeDoorLoginSentLink = 1; }
+                DebugLog(std::string("[STORE] the world server's door asked - answered") + (hosting ? " as the host" : "")
+                         + (login ? " with a login proof (the owner or admin password this game knows for this world)" : " without a login proof"));
             }
             else if (a == 0)
             {
@@ -18440,7 +18997,7 @@ void PumpLink()
                 if (coop::ResurrectOption(ok2, ov)) continue;   /* T-556: the host's resurrection options - on/off, the fee amount, its growth (resurrect.cpp) */
                 if (ok2 == "researchmode") { coop::ResearchModeOption(ov); continue; }   /* loot2b: the host option - research items lifted out of opened boxes (items.cpp) */
                 if (ok2 == "recruitmult") { coop::RecruitMultOption(ov); continue; }   /* recruit3: the host option - bar hire lists x players (towngen.cpp) */
-                if (ok2 == "timemode") { DebugLog(std::string("[TIME] the world's time mode is '") + ov + "' (" + (ov == "consensus" ? "every player's speed setting is a vote and the slowest wins, pause included" : "the host sets the pace and every game follows") + "). This game acts on the mode carried in the notebook's CLOCK, which is derived from this same option."); continue; }
+                if (ok2 == "timemode") { DebugLog(std::string("[TIME] the world's time mode is '") + ov + "' (" + (ov == "consensus" ? "the slowest speed among the players in the world is used, pause included" : ov == "vote" ? "the speed every player in the world picked, pause being one (all paused = paused), else 1x" : ov == "locked" ? "always 1x; nobody can pause" : "the latest speed an admin in the world picked while an admin, 1x with no admin in the world") + "). This game acts on the mode carried in the notebook's CLOCK, which is derived from this same option."); continue; }
                 if (spimport::IsOptionKey(ok2)) { SpImportOptionNote(ok2, ov); continue; }   /* T-1096: the host's import options */
                 if (ok2 != "basepolicy") { DebugLog("[STORE] OPTIONS: the notebook sent '" + ok2 + "' = '" + ov + "', which this build does not know - ignored, nothing else in the map is affected"); continue; }
                 const int was = g_basePolicy;
@@ -18523,6 +19080,7 @@ void PumpLink()
             if (!g_storeProtoMismatch) coop::TownVerArrive(m.payload);
             else ++g_storeMismatchIgnored;
         }
+        else if (m.type == (net::MsgType)kStoreMsgCamp) { if (!g_storeProtoMismatch) coop::CampArrive(m.payload); else ++g_storeMismatchIgnored; }   /* T-929: plugin tables only; the engine is touched by its own camp pass */
         else if (m.type == (net::MsgType)areafresh::kMsgAreaFresh) { if (!g_storeProtoMismatch) AreaFreshArrive(m.payload); else ++g_storeMismatchIgnored; }   /* T-1129: a WRITE queued for the next tick, a FRESH / CANT noted on the waiting area - plugin tables only */
         else if (m.type == (net::MsgType)kStoreMsgSquadWriter) SquadWriterArrive(m.payload);   /* T-1084 step 5: the writer register's answer - plugin tables only; the record it sends after a refusal comes as a RECORD */   /* T-1084 step 3: the marks - a plugin table, and a one-shot sweep of a marked area loaded and held here */
         else if (m.type == (net::MsgType)kStoreMsgRecordSeq)
@@ -18569,8 +19127,9 @@ void PumpLink()
         else if (m.type == (net::MsgType)kStoreMsgFallen) coop::ResurrectArrive(m.payload);   /* T-556: this player's fallen list - a plugin table and log lines only */
         else if (m.type == (net::MsgType)moneyw::kMsgSentOk || m.type == (net::MsgType)moneyw::kMsgDeliver || m.type == (net::MsgType)moneyw::kMsgRefuse)
             coop::MoneyArrive((unsigned)m.type, m.payload);   /* T-810: money between players - plugin tables and log lines only; money.cpp's tick acts on them */
-        else if (m.type == (net::MsgType)adminauth::kMsgAdminLogin || m.type == (net::MsgType)admincmd::kMsgAdminReply || m.type == (net::MsgType)adminauth::kMsgAdminStanding)
-            coop::AdminArrive((unsigned)m.type, m.payload);   /* the admin login's CHALLENGE / RESULT, this game's admin standing and the admin commands' answers - this player's chat lines and admin.cpp's own tables only */
+        else if (m.type == (net::MsgType)adminauth::kMsgAdminLogin || m.type == (net::MsgType)admincmd::kMsgAdminReply || m.type == (net::MsgType)adminauth::kMsgAdminStanding
+                 || m.type == (net::MsgType)admintool::kMsgAdminDo)
+            coop::AdminArrive((unsigned)m.type, m.payload);   /* the admin login's CHALLENGE / RESULT, this game's admin standing, the admin commands' answers and the toolbox's jobs - this player's chat lines and admin.cpp's own tables only (a job is queued and done in AdminTick) */
         /* P7f (review-p6z C-1) - THE THREE KINDS THAT TOUCH THE ENGINE, AND THE ONLY THREE THAT ARE QUEUED.
            RECORD reaches findFactionByName, GameDataContainer::load and addUnloadedSquad; RECORD_GONE
            reaches findFactionByName and Faction::removeSquad; UNIQUE_STATE reaches getData, a walk of
@@ -18601,7 +19160,6 @@ void PumpLink()
                record answer is lowered. */
             if (auth != 0 && !wasSteward) { WorldGenOnPromoted(); WxOnPromoted(); coop::SettingsStewardEdge(1); JoinHoldOnRoster(); }
             else if (auth == 0 && wasSteward) coop::SettingsStewardEdge(0);
-            coop::KapiAuthorityChanged();   /* per-race rules: a game newly made the rule-setter sends its rows now (after the steward edge above, so a steward that only keeps the duties sends none), a change is logged */
         }
     }
     g_publishSuppressed = false;
@@ -21432,8 +21990,10 @@ void OwnInstallResWork(unsigned long long base)
     { orig_ownResWork = 0; ErrorLog("[RESEARCH] AddHook Research::addProgress FAILED - research progress is not shared with teammates"); }
     else DebugLog("[RESEARCH] hook installed: Research::addProgress (this game's progress goes to its teammates; theirs is added to the same front topic here)");
 }
+void BookInstall(unsigned long long base);   /* T-1242: below, before StoreResearchQueueTech */
 void OwnInstallMmo3(unsigned long long base)
 {
+    BookInstall(base);   /* T-1242: a teammate's research bench's Books */
     OwnInstallResWork(base);
     if (kOwnResSetRva == 0) { ErrorLog("[OWNSAVE] mmo3: ResearchSetResearched not in the address table - a completed tech is caught by the 30 s compare only"); return; }
     const coop::HookStatus h = coop::AddHook((void*)(base + kOwnResSetRva), (void*)&detour_ownResSet, (void**)&orig_ownResSet);
@@ -22063,6 +22623,13 @@ int StoreMoneyAdjust(int delta)
     int w = (int)v;
     return OwnMoneyPod(1, &w) == 1 ? 1 : -1;
 }
+/* T-478 TEST-ONLY (money.cpp MoneyTestCommand): Ownerships::takeMoney, vtable slot 0, the call every trade and payment makes - a
+   negative amount is a gift (build.cpp BdPurseSetPod sets a purse the same way) */
+int StoreMoneyPay(int amount)
+{
+    void* own = OwnPursePod();
+    return own == 0 ? -1 : OwnPurseTakePod(own, amount);
+}
 bool StoreMoneyWriteNow(unsigned long long* seq)
 {
     const unsigned long long before = g_ownSeq;
@@ -22084,16 +22651,23 @@ bool StoreSendMoney(unsigned type, const std::vector<char>& b)
     return g_link->Send(0, (net::MsgType)type, &b[0], b.size(), net::CH_RELIABLE);
 }
 long StoreMoneyLink() { return LinkUp() ? ::InterlockedCompareExchange(&g_welcomeLinkGen, 0, 0) : -1; }
-bool StoreOwnerTokenThisLink()
-{
-    return LinkUp() && StoreWelcomedThisLink() != 0 && g_hostTokenLinkGen >= 0 && g_hostTokenLinkGen == ::InterlockedCompareExchange(&g_linkGen, 0, 0);
-}
 bool StoreSendAdmin(unsigned type, const std::vector<char>& b)
 {
     if (!LinkUp() || StoreWelcomedThisLink() == 0 || b.empty()) return false;
     return g_link->Send(0, (net::MsgType)type, &b[0], b.size(), net::CH_RELIABLE);
 }
 std::string StoreLinkWorldId() { return (LinkUp() && StoreWelcomedThisLink() != 0) ? g_linkWorldId : std::string(); }
+/* where this link dialled (authproof::LoginPlace): the address and port SetStoreServer was given - steam:<id> for a Steam join - never
+   anything the world server said; "" = no link up */
+std::string StoreLinkPlace() { return LinkUp() ? authproof::LoginPlace(g_linkAddr, g_linkPort) : std::string(); }
+/* T-1158 (T1870): THE PLACE A REMEMBERED LOGIN IS LOOKED UP UNDER (authproof::LoginLookupPlace). The world server's door asks before
+   its WELCOME, while LinkUp() - and so StoreLinkPlace - is still false; the address and port this connection dialled are known from
+   SetStoreServer on, so the door looks under those (the same key StoreLoginPasswordPut writes). After the WELCOME it is the link's
+   place, as before. Writing and forgetting stay on StoreLinkPlace (after the world server's RESULT). MAIN THREAD ONLY, like LinkUp. */
+std::string StoreLoginLookupPlace()
+{
+    return authproof::LoginLookupPlace(g_link != 0 && g_link->State() == net::LINK_UP, g_storeWelcomed, g_linkAddr, g_linkPort, StoreLinkPlace());
+}
 long StoreMoneyEdge() { return ::InterlockedCompareExchange(&g_moneyEdge, 0, 0); }
 long long StoreMoneyBaseReads() { return g_moneyBaseReads; }
 unsigned long long g_ownBuildEnqSeq = 0;   /* help1 fold (review MED 4): the seq pp.build was last handed to the writer with ... */
@@ -22700,6 +23274,7 @@ void OwnRestoreTick()
 }
 bool StoreOwnRestorePending() { return g_ownRsPending != 0; }
 int StoreOwnBuildRowsRead() { return g_ownBuildRowsRead; }
+int StoreOwnRestoreNoRecord() { return g_ownRsWhyAll == coopown::kRsWhyAllNoRecord ? 1 : 0; }
 
 /* ---- T-546 step 6: shared research (team.cpp; the decisions in src/common/teamresearch.h) ---- */
 void StoreResearchTakeOwnFinished(std::vector<std::string>* out, long long* dropped)
@@ -22964,6 +23539,575 @@ int StoreResearchApply(const std::string& sid, bool asOwn, std::string* name, st
     if (k == -1) OwnResearchFault("fault");
     return k;
 }
+/* ==================================================================================================================
+   T-1242 (design 3, manager 2026-11-05; src/common/bookshare.h): RESEARCH BOOKS IN A TEAMMATE'S BENCH count the same for every team
+   member, and a research needs them on every game. Run T2047 (Confirmed): each game holds the teammate's bench with the Book, owned by
+   the stand-in; the engine's bench list 0x82D880 keeps only the LOCAL faction's benches (decomp_8c9700 :24-25), so the count refuses.
+     COUNT  the list 0x82D880 (callers: the count 0x82D940 and the take 0x82DA30 only, build/xrefs_82d880.txt), when the count asks for
+            it (g_bkCountDepth, set by the count's own hook), also holds the CURRENT teammates' research benches (the team read now:
+            PolicyTeammateFactionList) whose map cell is within one of the view point's - the engine's own range (decomp_9fb580 :24-27,
+            the view point 0x7F1DC0 = CampViewPoint). The take 0x82DA30 calls the list directly, so it never sees a teammate's bench.
+     SPEND  the pay 0x8334F0 (canPay, then the take 0x832050 -> 0x82DA30, then the 'already paid' record +0xD8; decomp_8334f0) asks
+            canPay itself first with every cost row recorded (the count's data and need, this game's own benches' total and each
+            teammate bench's). Own Books enough: the engine's own pay. Else nothing is paid or queued now: each holder game is ASKED
+            (MSG_RESEARCH_BOOK) to take its share from its own bench by the engine's own take, the list forced to that one bench. After
+            every yes this game queues through the engine's own addToQueue (row ResearchAddToQueue) with its count asking its own
+            benches for need - remote (bookshare::CommitNeed): the engine takes the own share and writes its own 'already paid' record.
+            A no, no answer within 15 s, a holder that left the world, or a refused commit: nothing queued, and every game that may
+            have taken is told to GIVE BACK (the engine's own add into that bench). Two asks for one Book: the holder takes at the ask,
+            on its main thread, so the second finds it gone (the reservation); this game runs one hold at a time.
+     Own Books, no team, single player: the engine's own road, unchanged. Covers the Add button (0x496C30 -> canPay -> addToQueue ->
+     pay) and `team research queue` (addToQueue). MAIN THREAD only (an off-main call is the engine's own, counted). [RESEARCH] T-1242.
+   ================================================================================================================== */
+unsigned long long kBkListRva = 0;   static coop::AddrReg kBkListRva_reg("ResearchBenchList", &kBkListRva);     /* Steam_1.0.65 0x82D880: void (Research*, lektor<Building*>* out) - the benches the count and the take use */
+unsigned long long kBkHasRva = 0;    static coop::AddrReg kBkHasRva_reg("ResearchHasItems", &kBkHasRva);       /* 0x82D940: bool (Research*, GameData* item, int need) - the book count */
+unsigned long long kBkCanPayRva = 0; static coop::AddrReg kBkCanPayRva_reg("ResearchCanPay", &kBkCanPayRva);   /* 0x831F80: int (Research*, GameData* tech) - 1 = paid already or every cost row counted */
+unsigned long long kBkPayRva = 0;    static coop::AddrReg kBkPayRva_reg("ResearchPay", &kBkPayRva);            /* 0x8334F0: bool (Research*, GameData* tech) - canPay, the take 0x832050, the paid record +0xD8 */
+typedef void (*BkListFn)(void* research, void* out);
+typedef char (*BkHasFn)(void* research, void* data, int need);
+typedef int (*BkCanPayFn)(void* research, void* tech);
+typedef char (*BkPayFn)(void* research, void* tech);
+static BkListFn orig_bkList = 0;
+static BkHasFn orig_bkHas = 0;
+static BkPayFn orig_bkPay = 0;
+static const int kBkNormal = 0, kBkCommit = 1, kBkForced = 2;
+static int g_bkMode = 0;                 /* MAIN THREAD */
+static void* g_bkForced = 0;             /* kBkForced: the one bench the engine's take may use (the holder's take) */
+static int g_bkCountDepth = 0;           /* > 0 inside the count 0x82D940: only then does the list add teammates' benches */
+static int g_bkProbe = 0;                /* the pay hook's own canPay: each cost row is recorded */
+static std::vector<void*> g_bkOwnSeen;   /* the last count list's own benches (the engine's own answer) */
+static std::vector<void*> g_bkMatePtrs;  /* the teammates' benches the last count list added, and their rows below */
+static std::vector<bookshare::MateBench> g_bkMatesSeen;
+static std::vector<bookshare::CostRow> g_bkRows;
+static std::vector<bookshare::Row> g_bkCommitTaken;   /* kBkCommit: the teammates' confirmed rows */
+static bookshare::Hold g_bkHold;         /* the asker's one hold */
+static bookshare::Book g_bkBook;         /* the holder's record of what it took (until a GIVEBACK or DONE, or this world's teardown) */
+static bookshare::OwedList g_bkOwed;     /* the asker's GIVEBACK / DONE messages the holders have not acknowledged */
+static std::map<int, int> g_bkOwedIn;    /* per owed holder slot: its last StoreRosterSlotInWorld (a 1 after anything else = it came back) */
+static int g_bkOwedGen = -1;             /* the link generation whose WELCOME last sent the owed list */
+static int g_bkOwedKick = 0;             /* the teardown owed new messages: the next tick sends them */
+static unsigned int g_bkReqNext = 0;
+static unsigned long long g_bkFrame = 0;             /* StoreTick's frame count */
+struct BkMate { void* b; bookshare::MateBench mb; };
+static std::vector<BkMate> g_bkMateCache;            /* the teammates' research benches in range, as the frame g_bkMateFrame scanned them */
+static unsigned long long g_bkMateFrame = ~0ull;
+static long long g_bkOffMain = 0, g_bkListUnread = 0, g_bkForcedLists = 0, g_bkNoView = 0, g_bkKeyUnread = 0, g_bkOutOfRange = 0, g_bkListFull = 0,
+                 g_bkMateAdded = 0, g_bkCountsWithMates = 0, g_bkCommitCounts = 0, g_bkRowUnread = 0, g_bkProbeFault = 0, g_bkOwnRoad = 0,
+                 g_bkShort = 0, g_bkBusy = 0, g_bkAsked = 0, g_bkSendFail = 0, g_bkCommitted = 0, g_bkCommitRefused = 0, g_bkRefused = 0,
+                 g_bkIgnored = 0, g_bkLateGiveBack = 0, g_bkMalformed = 0, g_bkHolderYes = 0, g_bkHolderNo = 0, g_bkTakeFault = 0,
+                 g_bkGivenBack = 0, g_bkGiveBackLost = 0, g_bkDone = 0, g_bkNoSlot = 0, g_bkScans = 0, g_bkCacheHits = 0, g_bkTakeLowered = 0,
+                 g_bkOwedSends = 0, g_bkAcked = 0, g_bkOwedDropped = 0, g_bkNoRecord = 0, g_bkTeardownHolds = 0, g_bkTeardownRecords = 0,
+                 g_bkAskerLeft = 0;
+
+static int BkLektorReadPod(void* lk, unsigned int* count, unsigned int* cap, void*** data)
+{
+    __try { *count = *(const unsigned int*)((const char*)lk + 8); *cap = *(const unsigned int*)((const char*)lk + 0xC); *data = *(void***)((char*)lk + 0x10); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int BkLektorItemPod(void** data, unsigned int i, void** out)
+{
+    __try { *out = data[i]; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* writes slot `at` and makes the list's count at + 1 (an append at the end, or the forced one-bench list at 0) */
+static int BkLektorSetPod(void* lk, unsigned int at, void* v)
+{
+    __try { void** d = *(void***)((char*)lk + 0x10); d[at] = v; *(unsigned int*)((char*)lk + 8) = at + 1; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int BkCanPayPod(uintptr_t fn, void* research, void* tech, int* out)
+{
+    __try { *out = (((BkCanPayFn)fn)(research, tech) & 0xFF) != 0 ? 1 : 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static std::string BkRowsText(const std::vector<bookshare::Row>& rows)
+{
+    std::string s;
+    for (size_t i = 0; i < rows.size(); ++i) s += (i ? std::string(", ") : std::string()) + rows[i].itemSid + " x" + N((long long)rows[i].count) + " from '" + rows[i].benchKey + "'";
+    return s.empty() ? std::string("(none)") : s;
+}
+
+/* the scan's filter (ItBenchesOwnedBy, before its cap): a research bench of a current teammate whose map cell is within one of the view
+   point's; kept ones go to the frame's cache */
+struct BkScanCtx { Sector vs; void* const* facs; };
+static int BkKeepBench(void* b, int facIndex, void* ctx)
+{
+    const BkScanCtx* c = (const BkScanCtx*)ctx;
+    if (PolicyIsResearchBench(b) != 1) return 0;
+    std::string key; int bx = -1, by = -1;
+    if (!ItBenchKey(b, &key) || !bookshare::KeyCell(key, &bx, &by)) { ++g_bkKeyUnread; return 0; }
+    if (!bookshare::CellNear(c->vs.x, c->vs.y, bx, by)) { ++g_bkOutOfRange; return 0; }
+    const int slot = PolicyTeammateSlot(c->facs[facIndex]);
+    if (slot < 0) return 0;
+    BkMate m; m.b = b; m.mb = bookshare::MateBench(slot, key, 0);
+    g_bkMateCache.push_back(m);
+    return 1;
+}
+/* THE LIST 0x82D880 */
+static void detour_bkList(void* research, void* out)
+{
+    orig_bkList(research, out);
+    if (!OnMainThread()) { ++g_bkOffMain; return; }
+    unsigned int cnt = 0, cap = 0; void** data = 0;
+    if (BkLektorReadPod(out, &cnt, &cap, &data) != 1 || !Plaus(data) || cnt > cap || cap > 100000u) { ++g_bkListUnread; return; }
+    if (g_bkMode == kBkForced)
+    {   /* the holder's take: exactly the one bench the ask named */
+        if (cap >= 1 && Plaus(g_bkForced) && BkLektorSetPod(out, 0, g_bkForced) == 1) ++g_bkForcedLists; else ++g_bkListUnread;
+        return;
+    }
+    if (g_bkCountDepth <= 0 || g_bkMode == kBkCommit) return;   /* the take, or the commit's count: this game's own benches only */
+    g_bkOwnSeen.clear(); g_bkMatePtrs.clear(); g_bkMatesSeen.clear();
+    for (unsigned int i = 0; i < cnt && i < 256u; ++i) { void* b = 0; if (BkLektorItemPod(data, i, &b) == 1 && b != 0) g_bkOwnSeen.push_back(b); }
+    void* facs[16];
+    const int nf = PolicyTeammateFactionList(facs, 16);   /* the team as it is now */
+    if (nf <= 0 || StoreTearingDown() != 0) return;
+    if (g_bkMateFrame != g_bkFrame)
+    {   /* fold 5: the scan of every loaded building and furniture runs once per frame; every count in the frame reuses its answer */
+        g_bkMateFrame = g_bkFrame; g_bkMateCache.clear();
+        float vp[3] = { 0.0f, 0.0f, 0.0f }, dist = 0.0f;
+        if (CampViewPoint(vp, &dist) == 0) ++g_bkNoView;
+        else
+        {
+            BkScanCtx c; c.vs = SectorOf(vp[0], vp[2]); c.facs = facs;
+            ItBenchesOwnedBy(facs, nf, &BkKeepBench, &c, 64);   /* fold 2: research bench and range filtered inside the scan, before its cap */
+            ++g_bkScans;
+        }
+    }
+    else ++g_bkCacheHits;
+    for (size_t i = 0; i < g_bkMateCache.size(); ++i)
+    {
+        if (cnt >= cap) { ++g_bkListFull; break; }
+        if (BkLektorSetPod(out, cnt, g_bkMateCache[i].b) != 1) { ++g_bkListUnread; break; }
+        ++cnt; ++g_bkMateAdded;
+        g_bkMatePtrs.push_back(g_bkMateCache[i].b);
+        g_bkMatesSeen.push_back(g_bkMateCache[i].mb);
+    }
+}
+/* THE COUNT 0x82D940 */
+static char detour_bkHas(void* research, void* data, int need)
+{
+    if (!OnMainThread() || g_bkMode == kBkForced) return orig_bkHas(research, data, need);
+    if (g_bkMode == kBkCommit)
+    {   /* the teammates took their share: this game's own benches must hold the rest */
+        std::string sid;
+        ItGdSidOf(data, &sid);
+        ++g_bkCommitCounts;
+        return orig_bkHas(research, data, bookshare::CommitNeed(need, bookshare::RemoteOf(g_bkCommitTaken, sid)));
+    }
+    ++g_bkCountDepth;
+    const char r = orig_bkHas(research, data, need);
+    --g_bkCountDepth;
+    if (!g_bkMatePtrs.empty()) ++g_bkCountsWithMates;
+    if (g_bkProbe != 0)
+    {
+        bookshare::CostRow c; c.need = need;
+        if (!ItGdSidOf(data, &c.sid)) { ++g_bkRowUnread; c.sid.clear(); }
+        for (size_t i = 0; i < g_bkOwnSeen.size(); ++i) { const long long q = ItBenchCount(g_bkOwnSeen[i], c.sid); if (q > 0) c.own += q; }
+        for (size_t i = 0; i < g_bkMatePtrs.size() && i < g_bkMatesSeen.size(); ++i)
+        {
+            bookshare::MateBench mb = g_bkMatesSeen[i];
+            const long long q = ItBenchCount(g_bkMatePtrs[i], c.sid);
+            mb.have = q > 0 ? q : 0;
+            c.mates.push_back(mb);
+        }
+        g_bkRows.push_back(c);
+    }
+    return r;
+}
+static void BookSend(int slot, const bookshare::Msg& m)
+{
+    std::vector<char> b;
+    if (!bookshare::Encode(m, &b) || !net::SendResearchBook(b, slot))
+    {
+        ++g_bkSendFail;
+        ErrorLog("[RESEARCH] T-1242 a RESEARCH_BOOK op " + N((long long)m.op) + " req " + N((long long)m.reqId) + " to s" + N((long long)slot) + " was NOT sent (no road, or it did not encode)");
+    }
+}
+/* the owed GIVEBACK / DONE messages (fold 3) sent: all (slot < 0) or one holder's; each stays owed until that holder's ACK */
+static void BookOwedSend(int slot, const char* why)
+{
+    const int me = StoreMySlot();
+    if (me < 0) return;   /* no slot (the link is down): the next WELCOME sends them */
+    int sent = 0, failed = 0;
+    for (size_t i = 0; i < g_bkOwed.size(); ++i)
+    {
+        const bookshare::Owed& o = g_bkOwed[i];
+        if (slot >= 0 && o.slot != slot) continue;
+        bookshare::Msg m; m.op = o.op; m.reqId = o.reqId; m.askerSlot = (unsigned int)me; m.tech = o.tech;
+        std::vector<char> b;
+        if (bookshare::Encode(m, &b) && net::SendResearchBook(b, o.slot)) { ++sent; ++g_bkOwedSends; } else { ++failed; ++g_bkSendFail; }
+    }
+    if (sent + failed > 0)
+        DebugLog("[RESEARCH] T-1242 owed GIVE BACK / DONE sent (" + std::string(why) + "): " + N((long long)sent) + " sent, " + N((long long)failed)
+                 + " not sent (no road; the next WELCOME or the holder's return sends them) - owed " + N((long long)g_bkOwed.size()) + " until each holder's ACK");
+}
+/* fold 7: the owed list was full and its oldest was dropped unacknowledged - one line naming it, on both paths (BookOwe, the teardown) */
+static void BookOwedDropped(const bookshare::Owed& d, const char* path)
+{
+    ++g_bkOwedDropped;
+    ErrorLog("[RESEARCH] T-1242 the owed list was full (" + N((long long)bookshare::kMaxOwed) + ", " + path + ") - its oldest was dropped unacknowledged: "
+             + (d.op == bookshare::kOpDone ? "DONE" : "GIVE BACK") + " to s" + N((long long)d.slot) + " for req " + N((long long)d.reqId) + " (owedDropped " + N(g_bkOwedDropped) + ")");
+}
+/* a GIVEBACK or DONE owed to `slot` for the request, and sent now */
+static void BookOwe(int slot, unsigned char op, unsigned int reqId, const std::string& tech, const char* why)
+{
+    bookshare::Owed dropped;
+    if (!bookshare::OwedAdd(&g_bkOwed, slot, reqId, op, tech, &dropped)) BookOwedDropped(dropped, why);
+    if (g_bkOwedIn.find(slot) == g_bkOwedIn.end()) g_bkOwedIn[slot] = StoreRosterSlotInWorld(slot);
+    BookOwedSend(slot, why);
+}
+/* the hold ends refused: nothing was paid or queued here; every game that may have taken gives back */
+static void BookEndRefused(const std::string& why)
+{
+    const bookshare::Hold h = g_bkHold;
+    g_bkHold = bookshare::Hold();
+    const std::vector<int> back = bookshare::GiveBackSlots(h);
+    std::string bw;
+    for (size_t i = 0; i < back.size(); ++i) { BookOwe(back[i], bookshare::kOpGiveBack, h.reqId, h.tech, "a refused start"); bw += (i ? ",s" : "s") + N((long long)back[i]); }
+    ++g_bkRefused;
+    DebugLog("[RESEARCH] T-1242 start of '" + h.tech + "' REFUSED (req " + N((long long)h.reqId) + "): " + why + " - nothing paid or queued here; give back sent to "
+             + (bw.empty() ? std::string("nobody") : bw) + " (refused " + N(g_bkRefused) + ")");
+}
+static void BookCommit()
+{
+    const bookshare::Hold h = g_bkHold;
+    g_bkHold = bookshare::Hold();
+    void* gd = 0; char nm[256]; nm[0] = 0;
+    const int k = OwnTechRecordPod(&h.tech, &gd, nm, (int)sizeof(nm));
+    void* r = 0; long long q = 0;
+    const int pr = OwnResearchPod(&r, &q);
+    int queued = 0, call = 0;
+    if (k == 1 && pr == 1 && kOwnResQueueRva != 0)
+    {
+        g_bkCommitTaken = bookshare::TakenAll(h);
+        g_bkMode = kBkCommit;
+        call = OwnResQueueCallPod(Base() + (uintptr_t)kOwnResQueueRva, r, gd, &queued);
+        g_bkMode = kBkNormal;
+        g_bkCommitTaken.clear();
+    }
+    const std::string taken = BkRowsText(bookshare::TakenAll(h));
+    if (call == 1 && queued != 0)
+    {
+        for (std::set<int>::const_iterator it = h.yes.begin(); it != h.yes.end(); ++it) BookOwe(*it, bookshare::kOpDone, h.reqId, h.tech, "queued");
+        ++g_bkCommitted;
+        ::InterlockedExchange(&g_ownResDirty, 1);
+        DebugLog("[RESEARCH] T-1242 '" + h.tech + "' (" + std::string(nm) + ") QUEUED through the engine's addToQueue after every yes (req " + N((long long)h.reqId)
+                 + "): teammates took " + taken + "; this game's own benches paid the rest (committed " + N(g_bkCommitted) + ") thread=main");
+        return;
+    }
+    const std::vector<int> back = bookshare::GiveBackSlots(h);
+    for (size_t i = 0; i < back.size(); ++i) BookOwe(back[i], bookshare::kOpGiveBack, h.reqId, h.tech, "a refused commit");
+    ++g_bkCommitRefused;
+    DebugLog("[RESEARCH] T-1242 '" + h.tech + "' NOT queued after every yes (req " + N((long long)h.reqId) + "): "
+             + (k != 1 ? std::string("the tech record is not found") : pr != 1 ? std::string("no research object")
+                : call != 1 ? std::string("the addToQueue call faulted / no row") : std::string("the engine's addToQueue refused it (level, this game's own share gone, or already queued)"))
+             + " - give back sent for " + taken + " (commit refused " + N(g_bkCommitRefused) + ")");
+}
+/* THE PAY 0x8334F0 */
+static char detour_bkPay(void* research, void* tech)
+{
+    if (!OnMainThread()) { ++g_bkOffMain; return orig_bkPay(research, tech); }
+    if (g_bkMode != kBkNormal) return orig_bkPay(research, tech);   /* the commit's own pay */
+    void* facs[16];
+    if (PolicyTeammateFactionList(facs, 16) <= 0) return orig_bkPay(research, tech);   /* no team: the engine's own road */
+    std::string techSid;
+    ItGdSidOf(tech, &techSid);
+    g_bkRows.clear(); g_bkProbe = 1;
+    int can = 0;
+    const int pr = BkCanPayPod(Base() + (uintptr_t)kBkCanPayRva, research, tech, &can);
+    g_bkProbe = 0;
+    if (pr != 1) { ++g_bkProbeFault; ErrorLog("[RESEARCH] T-1242 the canPay read for '" + techSid + "' FAULTED - refused, nothing paid or queued"); return 0; }
+    if (can == 0) return orig_bkPay(research, tech);   /* the engine refuses itself */
+    std::vector<bookshare::Share> shares;
+    const int plan = bookshare::PlanShares(g_bkRows, &shares);
+    std::string rw;
+    for (size_t i = 0; i < g_bkRows.size(); ++i)
+    {
+        rw += (i ? "; " : "") + g_bkRows[i].sid + " need " + N((long long)g_bkRows[i].need) + " own " + N(g_bkRows[i].own);
+        for (size_t m = 0; m < g_bkRows[i].mates.size(); ++m) rw += " s" + N((long long)g_bkRows[i].mates[m].slot) + "'" + g_bkRows[i].mates[m].key + "'=" + N(g_bkRows[i].mates[m].have);
+    }
+    if (plan == bookshare::kPlanOwn) { ++g_bkOwnRoad; return orig_bkPay(research, tech); }
+    if (plan == bookshare::kPlanShort)
+    {
+        ++g_bkShort;
+        DebugLog("[RESEARCH] T-1242 start of '" + techSid + "' REFUSED: the engine counted enough Books but the bench totals do not cover a row (" + rw + ") - nothing paid or queued (short " + N(g_bkShort) + ")");
+        return 0;
+    }
+    if (g_bkHold.on)
+    {
+        ++g_bkBusy;
+        DebugLog("[RESEARCH] T-1242 start of '" + techSid + "' REFUSED: the start of '" + g_bkHold.tech + "' still waits for teammates' answers (req " + N((long long)g_bkHold.reqId) + ") - nothing paid or queued (busy " + N(g_bkBusy) + ")");
+        return 0;
+    }
+    const int me = StoreMySlot();
+    if (me < 0 || techSid.empty()) { ++g_bkNoSlot; DebugLog("[RESEARCH] T-1242 start of '" + techSid + "' REFUSED: this game's slot or the tech's id is unknown - nothing paid or queued"); return 0; }
+    bookshare::Hold h; h.on = true; h.tech = techSid; h.startMs = ::GetTickCount();
+    h.reqId = bookshare::NextReqId(me, &g_bkReqNext, ::GetTickCount());
+    const std::vector<int> slots = bookshare::SlotsOf(shares);
+    g_bkHold = h;
+    std::string aw;
+    bool failed = false;
+    for (size_t i = 0; i < slots.size(); ++i)
+    {
+        bookshare::Msg m; m.op = bookshare::kOpAsk; m.reqId = h.reqId; m.askerSlot = (unsigned int)me; m.tech = techSid; m.rows = bookshare::RowsFor(shares, slots[i]);
+        std::vector<char> b;
+        if (!bookshare::Encode(m, &b) || !net::SendResearchBook(b, slots[i])) { ++g_bkSendFail; failed = true; aw += " s" + N((long long)slots[i]) + " NOT SENT"; continue; }
+        g_bkHold.asked.insert(slots[i]);
+        aw += " s" + N((long long)slots[i]) + " [" + BkRowsText(m.rows) + "]";
+    }
+    ++g_bkAsked;
+    DebugLog("[RESEARCH] T-1242 start of '" + techSid + "' HELD (req " + N((long long)h.reqId) + "): Books in teammates' benches - asked" + aw + " | rows: " + rw
+             + " - nothing paid or queued until every answer (asked " + N(g_bkAsked) + ") thread=main");
+    if (failed) BookEndRefused("a teammate's game could not be reached (link down)");
+    return 0;
+}
+/* THE HOLDER: an ASK from a teammate's game */
+static void BookAsk(const bookshare::Msg& m, int from)
+{
+    bookshare::Msg a; a.op = bookshare::kOpAnswer; a.reqId = m.reqId; a.askerSlot = m.askerSlot; a.tech = m.tech; a.why = bookshare::kWhyYes;
+    void* r = 0; long long q = 0;
+    if (from < 0 || (unsigned int)from != m.askerSlot || PolicyTeammateSlotIsMate(from) == 0) a.why = bookshare::kWhyNotMate;
+    else if (EngineWritesBlocked() || !GameplayRunning()) a.why = bookshare::kWhyBlocked;
+    else if (OwnResearchPod(&r, &q) != 1) a.why = bookshare::kWhyNoResearch;
+    const std::vector<bookshare::Row> groups = bookshare::GroupRows(m.rows);
+    std::vector<void*> benches(groups.size(), (void*)0);
+    std::vector<void*> datas(groups.size(), (void*)0);
+    std::string seen;
+    for (size_t i = 0; i < groups.size() && a.why == bookshare::kWhyYes; ++i)
+    {
+        int several = 0;
+        void* b = ItBenchByKey(groups[i].benchKey, &several);
+        const int state = (b == 0) ? 0 : ((ItBenchIsMine(b) == 1 && PolicyIsResearchBench(b) == 1) ? 1 : -1);
+        void* gd = ItGdOfSid(groups[i].itemSid);
+        const long long have = (b != 0) ? ItBenchCount(b, groups[i].itemSid) : 0;
+        seen += " '" + groups[i].benchKey + "' " + groups[i].itemSid + " have " + N(have) + " want " + N((long long)groups[i].count) + (several ? " (several)" : "");
+        a.why = bookshare::RowVerdict(state, gd != 0 ? 1 : 0, have, groups[i].count);
+        benches[i] = b; datas[i] = gd;
+    }
+    std::vector<bookshare::Row> taken;
+    if (a.why == bookshare::kWhyYes)
+        for (size_t i = 0; i < groups.size(); ++i)
+        {
+            const long long before = ItBenchCount(benches[i], groups[i].itemSid);
+            g_bkMode = kBkForced; g_bkForced = benches[i];
+            const int rc = ItResearchConsumeCall(r, datas[i], groups[i].count);
+            g_bkMode = kBkNormal; g_bkForced = 0;
+            const long long after = ItBenchCount(benches[i], groups[i].itemSid);
+            const long long took = (before >= 0 && after >= 0) ? before - after : 0;
+            if (took > 0) taken.push_back(bookshare::Row(groups[i].benchKey, groups[i].itemSid, (int)took));
+            if (rc != 1 || took != (long long)groups[i].count)
+            {
+                ++g_bkTakeFault;
+                ErrorLog("[RESEARCH] T-1242 holder: the engine's take of " + groups[i].itemSid + " x" + N((long long)groups[i].count) + " from '" + groups[i].benchKey + "' took "
+                         + N(took) + " (call " + N((long long)rc) + ") - everything taken for req " + N((long long)m.reqId) + " is given back");
+                for (size_t k = 0; k < taken.size(); ++k)
+                {
+                    std::string w;
+                    const int added = ItBenchGiveBack(ItBenchByKey(taken[k].benchKey, 0), taken[k].itemSid, taken[k].count, &w);
+                    g_bkGivenBack += added;
+                    if (added != taken[k].count) { ++g_bkGiveBackLost; ErrorLog("[RESEARCH] T-1242 holder: give back of " + taken[k].itemSid + " short " + N((long long)(taken[k].count - added)) + " (" + w + ")"); }
+                }
+                taken.clear();
+                a.why = bookshare::kWhyTakeFault;
+                break;
+            }
+        }
+    if (a.why == bookshare::kWhyYes) { bookshare::BookPut(&g_bkBook, from, m.reqId, taken); a.rows = taken; ++g_bkHolderYes; }
+    else ++g_bkHolderNo;
+    DebugLog("[RESEARCH] T-1242 holder: s" + N((long long)from) + " asks for '" + m.tech + "' (req " + N((long long)m.reqId) + "):" + seen + " -> "
+             + (a.why == bookshare::kWhyYes ? "YES, taken by the engine's own take: " + BkRowsText(taken) : "NO (" + std::string(bookshare::WhyName(a.why)) + "), nothing taken")
+             + " (yes " + N(g_bkHolderYes) + " no " + N(g_bkHolderNo) + ") thread=main");
+    if (from >= 0) BookSend(from, a);
+}
+static void BookGiveBackRows(const std::vector<bookshare::Row>& rows, int asker, unsigned int reqId, const char* why)
+{
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        std::string w;
+        void* b = ItBenchByKey(rows[i].benchKey, 0);
+        const int added = (b != 0) ? ItBenchGiveBack(b, rows[i].itemSid, rows[i].count, &w) : 0;
+        g_bkGivenBack += added;
+        if (added != rows[i].count) { ++g_bkGiveBackLost; ErrorLog("[RESEARCH] T-1242 holder: give back of " + rows[i].itemSid + " x" + N((long long)rows[i].count) + " into '" + rows[i].benchKey + "' added " + N((long long)added) + " (" + (b == 0 ? std::string("bench not loaded") : w) + ")"); }
+    }
+    DebugLog("[RESEARCH] T-1242 holder: GIVE BACK for s" + N((long long)asker) + " req " + N((long long)reqId) + " (" + why + "): " + BkRowsText(rows) + " (given back " + N(g_bkGivenBack) + ")");
+}
+void StoreBookNote(const char* p, size_t n, unsigned int fromPeer)
+{
+    bookshare::Msg m;
+    if (!bookshare::Decode(p, n, &m)) { ++g_bkMalformed; ErrorLog("[RESEARCH] T-1242 a malformed RESEARCH_BOOK (" + N((long long)n) + " bytes) - refused whole (malformed " + N(g_bkMalformed) + ")"); return; }
+    if (!OnMainThread()) { ++g_bkOffMain; return; }
+    const int from = net::PlayerSlotOfKey(fromPeer);
+    if (m.op == bookshare::kOpAsk) { BookAsk(m, from); return; }
+    if (m.op == bookshare::kOpAnswer)
+    {
+        const bool yes = (m.why == bookshare::kWhyYes);
+        if (bookshare::LateYesGivesBack(g_bkHold, m.reqId, yes))
+        {
+            ++g_bkLateGiveBack;
+            DebugLog("[RESEARCH] T-1242 a late YES from s" + N((long long)from) + " for req " + N((long long)m.reqId) + " (no such hold now) - give back sent");
+            if (from >= 0) BookOwe(from, bookshare::kOpGiveBack, m.reqId, m.tech, "a late yes");
+            return;
+        }
+        const int k = bookshare::HoldAnswer(&g_bkHold, from, m.reqId, yes, m.rows);
+        if (k == bookshare::kHoldIgnored) { ++g_bkIgnored; return; }
+        DebugLog("[RESEARCH] T-1242 answer from s" + N((long long)from) + " for '" + m.tech + "' (req " + N((long long)m.reqId) + "): "
+                 + (yes ? "YES, it took " + BkRowsText(m.rows) : "NO (" + std::string(bookshare::WhyName(m.why)) + ")"));
+        if (k == bookshare::kHoldRefuse) BookEndRefused("s" + N((long long)from) + " said no (" + bookshare::WhyName(m.why) + ")");
+        else if (k == bookshare::kHoldCommit) BookCommit();
+        return;
+    }
+    if (m.op == bookshare::kOpAck)
+    {
+        if (bookshare::OwedAck(&g_bkOwed, from, m.reqId, m.why))
+        {
+            ++g_bkAcked;
+            DebugLog("[RESEARCH] T-1242 s" + N((long long)from) + " acknowledged the " + (m.why == bookshare::kOpDone ? "DONE" : "GIVE BACK") + " for req " + N((long long)m.reqId)
+                     + " (owed " + N((long long)g_bkOwed.size()) + ", acked " + N(g_bkAcked) + ")");
+        }
+        else ++g_bkIgnored;   /* a repeated ACK */
+        return;
+    }
+    std::vector<bookshare::Row> back;
+    const int had = bookshare::HolderClose(&g_bkBook, from, m.reqId, m.op, &back);
+    if (had == 0)
+    {
+        ++g_bkNoRecord;
+        DebugLog("[RESEARCH] T-1242 holder: " + std::string(m.op == bookshare::kOpGiveBack ? "GIVE BACK" : "DONE") + " from s" + N((long long)from) + " for req " + N((long long)m.reqId)
+                 + " finds no record (a repeat, the asker left the session first and it was given back then, or this game's world was loaded since and its save decides the benches)"
+                 + " - nothing given back (noRecord " + N(g_bkNoRecord) + ")");
+    }
+    else if (m.op == bookshare::kOpGiveBack) BookGiveBackRows(back, from, m.reqId, "the asker refused");
+    else
+    {
+        ++g_bkDone;
+        DebugLog("[RESEARCH] T-1242 holder: s" + N((long long)from) + " queued with req " + N((long long)m.reqId) + " - the Books taken stay spent (done " + N(g_bkDone) + ")");
+    }
+    bookshare::Msg a; a.op = bookshare::kOpAck; a.reqId = m.reqId; a.askerSlot = m.askerSlot; a.tech = m.tech; a.why = m.op;
+    if (from >= 0) BookSend(from, a);   /* every GIVEBACK and DONE is acknowledged, a repeat too, so the asker stops owing it */
+}
+/* MAIN THREAD, the team tick: a hold's end by time or by a holder that left the world; the holder's records of an asker that left the
+   session given back; the owed GIVEBACK / DONE sent again at this game's WELCOME (a new link generation), after a teardown owed new
+   ones, and to a holder whose slot came back into the world.
+   FOLD 7 (the asker leaves): when an asker's slot is out of this game's world (StoreRosterSlotInWorld == 0, the leave event the code used
+   before fold 3), each record still held for it - one no DONE has reached, since a DONE clears its record - is given back and cleared
+   (bookshare::HolderAskerLeft). Without this, an asker whose link dropped after the holder's YES refuses its hold and owes a GIVEBACK it
+   cannot send with no slot; if it then closes its game the owed list is gone and the holder's Book is lost for good. The one risk kept:
+   the asker's DONE sent but lost in the very link drop that ends the session - the holder then gives back Books the research was paid
+   with, a duplicate. Accepted, because the alternative loses a player's Book. An asker that rejoins and sends its owed GIVEBACK / DONE
+   again finds no record and is acknowledged with nothing given back (HolderClose). */
+void StoreBookTick()
+{
+    if (g_bkHold.on)
+    {
+        if (bookshare::HoldTimedOut(g_bkHold, ::GetTickCount())) BookEndRefused("no answer within " + N((long long)(bookshare::kAnswerWaitMs / 1000)) + " s");
+        else
+            for (std::set<int>::const_iterator it = g_bkHold.asked.begin(); it != g_bkHold.asked.end(); ++it)
+                if (g_bkHold.yes.count(*it) == 0 && StoreRosterSlotInWorld(*it) == 0) { BookEndRefused("s" + N((long long)*it) + " left the world (its link dropped)"); break; }
+    }
+    if (!g_bkBook.empty())
+    {
+        std::set<int> askers;
+        for (bookshare::Book::const_iterator it = g_bkBook.begin(); it != g_bkBook.end(); ++it) askers.insert(it->first.first);
+        for (std::set<int>::const_iterator it = askers.begin(); it != askers.end(); ++it)
+        {
+            if (StoreRosterSlotInWorld(*it) != 0) continue;   /* in the world, or no roster to tell */
+            std::vector<unsigned int> reqs; std::vector<std::vector<bookshare::Row> > all;
+            const size_t k = bookshare::HolderAskerLeft(&g_bkBook, *it, &reqs, &all);
+            g_bkAskerLeft += (long long)k;
+            for (size_t i = 0; i < k; ++i) BookGiveBackRows(all[i], *it, reqs[i], "the asker left the session with no DONE received");
+        }
+    }
+    const int gen = StoreLinkGen();
+    const bool welcomed = StoreWelcomedThisLink() != 0 && gen != g_bkOwedGen;
+    if (welcomed) g_bkOwedGen = gen;
+    if (g_bkOwed.empty()) { g_bkOwedIn.clear(); g_bkOwedKick = 0; return; }
+    std::vector<int> back;
+    for (std::map<int, int>::iterator it = g_bkOwedIn.begin(); it != g_bkOwedIn.end(); ++it)
+    {
+        const int in = StoreRosterSlotInWorld(it->first);
+        if (in == 1 && it->second != 1) back.push_back(it->first);
+        it->second = in;
+    }
+    if (welcomed || g_bkOwedKick != 0) { g_bkOwedKick = 0; BookOwedSend(-1, welcomed ? "this game's WELCOME" : "owed at the world teardown"); return; }
+    for (size_t i = 0; i < back.size(); ++i) BookOwedSend(back[i], "the holder is back in the world");
+}
+/* items.cpp detour_researchConsume (fold 4): the engine's take 0x82DA30 empties its benches up to `need` (decomp_82da30). While this game
+   queues with teammates' Books (kBkCommit), the take is asked only for this game's own share - the CommitNeed the count used - so Books
+   put into this game's own bench during the wait are not taken for the teammates' share as well. Else `need` as the engine asked. */
+int StoreBookTakeNeed(void* data, int need)
+{
+    if (g_bkMode != kBkCommit || !OnMainThread()) return need;
+    std::string sid;
+    if (!ItGdSidOf(data, &sid)) { ++g_bkRowUnread; return need; }
+    ++g_bkTakeLowered;
+    return bookshare::CommitNeed(need, bookshare::RemoteOf(g_bkCommitTaken, sid));
+}
+/* TeardownBroadcast (fold 6): the world teardown - the load's resetGame, the one that runs (a load passes here). This world's hold and the
+   holder's records go with it. A hold still open ends refused: its GIVEBACKs are owed (the holders' worlds did not change, and they took
+   for a start this game never queued) and the next tick sends them. The holder's records are dropped, so a GIVEBACK or DONE that comes
+   after the load finds no record and is acknowledged with nothing given back (HolderClose; the loaded save decides this game's benches).
+   The owed list stays: it names the other games' worlds. The bench cache goes (its pointers are this world's). */
+void StoreBookWorldTeardown()
+{
+    std::string hw = "none";
+    if (g_bkHold.on)
+    {
+        const bookshare::Hold h = g_bkHold;
+        const std::vector<int> back = bookshare::GiveBackSlots(h);
+        for (size_t i = 0; i < back.size(); ++i)
+        {
+            bookshare::Owed dropped;
+            if (!bookshare::OwedAdd(&g_bkOwed, back[i], h.reqId, bookshare::kOpGiveBack, h.tech, &dropped)) BookOwedDropped(dropped, "the world teardown");
+            if (g_bkOwedIn.find(back[i]) == g_bkOwedIn.end()) g_bkOwedIn[back[i]] = -1;
+        }
+        ++g_bkTeardownHolds; ++g_bkRefused;
+        hw = "'" + h.tech + "' req " + N((long long)h.reqId) + " refused, give back owed to " + N((long long)back.size());
+        g_bkOwedKick = 1;
+    }
+    const size_t recs = g_bkBook.size();
+    g_bkTeardownRecords += (long long)recs;
+    g_bkHold = bookshare::Hold(); g_bkBook.clear();
+    g_bkMode = kBkNormal; g_bkForced = 0; g_bkCountDepth = 0; g_bkProbe = 0;
+    g_bkCommitTaken.clear(); g_bkRows.clear(); g_bkOwnSeen.clear(); g_bkMatePtrs.clear(); g_bkMatesSeen.clear();
+    g_bkMateCache.clear(); g_bkMateFrame = ~0ull;
+    DebugLog("[RESEARCH] T-1242 world teardown: hold " + hw + "; holder records dropped " + N((long long)recs) + " (a later GIVE BACK / DONE for them finds no record); owed kept "
+             + N((long long)g_bkOwed.size()));
+}
+/* `team research queue`'s words for a start this hold took */
+std::string BookHoldWords(const std::string& sid)
+{
+    if (!g_bkHold.on || g_bkHold.tech != sid) return std::string();
+    std::string s;
+    for (std::set<int>::const_iterator it = g_bkHold.asked.begin(); it != g_bkHold.asked.end(); ++it) s += (s.empty() ? "s" : ",s") + N((long long)*it);
+    return "HELD for teammates' Books (req " + N((long long)g_bkHold.reqId) + ", asked " + s + ") - the [RESEARCH] T-1242 lines say whether it was queued";
+}
+void BookReport()
+{
+    DebugLog("[RESEARCH] T-1242 REPORT books: list mateAdded=" + N(g_bkMateAdded) + " countsWithMates=" + N(g_bkCountsWithMates) + " outOfRange=" + N(g_bkOutOfRange)
+             + " keyUnread=" + N(g_bkKeyUnread) + " noView=" + N(g_bkNoView) + " listFull=" + N(g_bkListFull) + " listUnread=" + N(g_bkListUnread) + " forcedLists=" + N(g_bkForcedLists)
+             + " | asker ownRoad=" + N(g_bkOwnRoad) + " asked=" + N(g_bkAsked) + " committed=" + N(g_bkCommitted) + " commitRefused=" + N(g_bkCommitRefused) + " refused=" + N(g_bkRefused)
+             + " short=" + N(g_bkShort) + " busy=" + N(g_bkBusy) + " commitCounts=" + N(g_bkCommitCounts) + " lateGiveBack=" + N(g_bkLateGiveBack) + " ignored=" + N(g_bkIgnored)
+             + " probeFault=" + N(g_bkProbeFault) + " rowUnread=" + N(g_bkRowUnread)
+             + " | holder yes=" + N(g_bkHolderYes) + " no=" + N(g_bkHolderNo) + " takeFault=" + N(g_bkTakeFault) + " givenBack=" + N(g_bkGivenBack) + " giveBackLost=" + N(g_bkGiveBackLost)
+             + " done=" + N(g_bkDone) + " noRecord=" + N(g_bkNoRecord) + " askerLeft=" + N(g_bkAskerLeft) + " open=" + N((long long)g_bkBook.size())
+             + " | owed=" + N((long long)g_bkOwed.size()) + " owedSends=" + N(g_bkOwedSends) + " acked=" + N(g_bkAcked) + " owedDropped=" + N(g_bkOwedDropped)
+             + " noSlot=" + N(g_bkNoSlot) + " takeLowered=" + N(g_bkTakeLowered) + " scans=" + N(g_bkScans) + " cacheHits=" + N(g_bkCacheHits)
+             + " teardownHolds=" + N(g_bkTeardownHolds) + " teardownRecords=" + N(g_bkTeardownRecords)
+             + " | sendFail=" + N(g_bkSendFail) + " malformed=" + N(g_bkMalformed) + " offMain=" + N(g_bkOffMain) + " hold=" + (g_bkHold.on ? "on" : "off"));
+}
+void BookInstall(unsigned long long base)
+{
+    if (kBkListRva == 0 || kBkHasRva == 0 || kBkCanPayRva == 0 || kBkPayRva == 0 || kOwnResQueueRva == 0)
+    { ErrorLog("[RESEARCH] T-1242 a research-books row is missing (ResearchBenchList / ResearchHasItems / ResearchCanPay / ResearchPay / ResearchAddToQueue) - a teammate's bench's Books are not counted"); return; }
+    /* the pay first, the list, then the count: teammates' benches are counted only once the pay holds every start that needs them */
+    if (coop::AddHook((void*)(base + kBkPayRva), (void*)&detour_bkPay, (void**)&orig_bkPay) != coop::SUCCESS)
+    { orig_bkPay = 0; ErrorLog("[RESEARCH] T-1242 AddHook Research pay 0x8334F0 FAILED - a teammate's bench's Books are not counted"); return; }
+    if (coop::AddHook((void*)(base + kBkListRva), (void*)&detour_bkList, (void**)&orig_bkList) != coop::SUCCESS)
+    { orig_bkList = 0; ErrorLog("[RESEARCH] T-1242 AddHook the bench list 0x82D880 FAILED - a teammate's bench's Books are not counted (the pay hook passes every start through)"); return; }
+    if (coop::AddHook((void*)(base + kBkHasRva), (void*)&detour_bkHas, (void**)&orig_bkHas) != coop::SUCCESS)
+    { orig_bkHas = 0; ErrorLog("[RESEARCH] T-1242 AddHook the book count 0x82D940 FAILED - a teammate's bench's Books are not counted (the list adds none)"); return; }
+    DebugLog("[RESEARCH] T-1242 hooks installed: the bench list 0x82D880, the book count 0x82D940, the pay 0x8334F0 (a teammate's research bench's Books count here; a start that needs them is asked of that teammate's game)");
+}
 std::string StoreResearchQueueTech(const std::string& sid, std::string* name, std::string* detail)
 {
     *name = sid; detail->clear();
@@ -22980,7 +24124,12 @@ std::string StoreResearchQueueTech(const std::string& sid, std::string* name, st
     int queued = 0;
     if (OwnResQueueCallPod(Base() + (uintptr_t)kOwnResQueueRva, r, gd, &queued) != 1) return "fault";
     *detail = "researchLevel=" + N((long long)level);
-    if (!queued) return "the engine's addToQueue refused it (its level above researchLevel " + N((long long)level) + ", artifacts the research benches lack, or already queued)";
+    if (!queued)
+    {
+        const std::string held = BookHoldWords(sid);   /* T-1242: a start that needs teammates' Books is held, not refused */
+        if (!held.empty()) return held;
+        return "the engine's addToQueue refused it (its level above researchLevel " + N((long long)level) + ", artifacts the research benches lack, or already queued)";
+    }
     ::InterlockedExchange(&g_ownResDirty, 1);
     return std::string();
 }
@@ -24273,7 +25422,7 @@ void OwnResetImportRestoreArm(const std::string& carriedFolder, const std::strin
                                           haveHead && coopown::IdentityMatchesWorld(headWorld, headProf, curWorld, curProf, OwnStoreIsById()));
     if (idxV == coopown::kIdxNoRecords)   /* T-1139: an empty store is no records yet, not an identity refusal */
     {
-        OwnRestoreArmAll("no-record");
+        OwnRestoreArmAll(coopown::kRsWhyAllNoRecord);
         DebugLog("[RESET] restore at the import: records store '" + g_ownStoreName + "' has no records yet for this world and profile - nothing to lay back"
                  " (the save's money, research and map stay as imported)");
         return;
@@ -24881,7 +26030,7 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
         DebugLog("[OWNSAVE] overlay: no records yet for this world and profile (records store '" + sdir + "' has " + std::string(idxRead ? "an empty own.index" : "no own.index")
                  + " and no record file) - nothing to lay over: the save loads as it is, and the pending-strips list is not read (noRecordsYet="
                  + N(g_ownOvNoStore) + ")");
-        OwnRestoreArmAll("no-record");   /* money / research / map / faction: no record of theirs either */
+        OwnRestoreArmAll(coopown::kRsWhyAllNoRecord);   /* money / research / map / faction: no record of theirs either */
         return;
     }
     if (idxV != coopown::kIdxOk)
@@ -26725,7 +27874,7 @@ void OwnCreatedSaveTick()
     const int step = coopown::CreatedPendingStep(C, world, stopping, wanted);
     if (step == coopown::kCrDropWorld || step == coopown::kCrDropStopping)
     {
-        C.pending = 0;
+        C.pending = 0; C.fresh = 0;
         if (step == coopown::kCrDropWorld) ++g_ownCrDroppedWorld; else ++g_ownCrDroppedStopping;
         DebugLog(std::string("[OWNSAVE] the armed save after character creation is DROPPED (") + (step == coopown::kCrDropWorld ? "the world changed" : "the game is stopping") + ")");
         return;
@@ -26739,9 +27888,10 @@ void OwnCreatedSaveTick()
         }
         return;
     }
+    if (coopown::CreatedJoinWaits(C, g_ownLs.phase != coopown::kLsIdle ? 1 : 0) != 0) return;   /* T-1135 review fold 4: a give's save waits for the save running now to end, then starts its own */
     const long long endBefore = g_ownLsEnded;
     if (!OwnLeaveSaveBegin("created", 0)) return;   /* nothing continues after it; a refusal here leaves it armed for the next frame */
-    C.pending = 0; C.running = 1; C.endSeen = endBefore;
+    C.pending = 0; C.running = 1; C.endSeen = endBefore; C.fresh = 0;
     ++g_ownCrStarted;
 }
 std::string OwnCreatedToken()
@@ -26751,6 +27901,19 @@ std::string OwnCreatedToken()
          + "," + N(g_ownCrDroppedStopping) + "," + N(g_ownCrGaveUp) + "," + N(g_ownCrNotArmed) + "," + N(g_ownCrInGame)
          + "," + N((long long)g_ownCr.pending) + "," + N((long long)g_ownCr.running)
          + " createdFold[triesSpent,aiUnknownFrames]=" + N(g_ownCrTriesSpent) + "," + N(g_ownCrAiUnknown);   /* T-251 review fold L1 / L2 */
+}
+/* T-1135: a character was given (the giver's game, at the release) or received (the receiver's game, at the take) - both games save at
+   once, by the road the save after character creation takes: armed here, started by OwnCreatedSaveTick as soon as the leave save is
+   wanted (one that is running finishes first); a world change or the game stopping drops it. MAIN THREAD. */
+long long g_ownGiveSaves = 0;
+void OwnGiveSaveArm(const std::string& why)
+{
+    coopown::CreatedSave& C = g_ownCr;
+    C.pending = 1; C.worldArmed = ::InterlockedCompareExchange(&g_ownWorldReset, 0, 0); C.waitLogged = 0; C.tries = 0;
+    C.fresh = 1;   /* T-1135 review fold 4: a save running now may hold records from before the hand-over - this one starts after it */
+    ++g_ownGiveSaves;
+    DebugLog("[OWNSAVE] a character was given (" + why + ") - the save is ARMED on the save after character creation's road; it starts as soon as"
+             " the leave save is wanted (a save running now ends first; this one is its own). giveSaves=" + N(g_ownGiveSaves));
 }
 
 /* ==================================================================================================================
@@ -27150,6 +28313,7 @@ std::string OwnHostLeftToken()
 
 void OwnSaveReport()
 {
+    BookReport();   /* T-1242 */
     OwnStoreDrainFailLog();   /* mmo1b */
     OwnStoreStat d; OwnStoreStats(&d);
     const DWORD span = g_ownOnAt ? (DWORD)(::GetTickCount() - g_ownOnAt) : 0;
@@ -28342,6 +29506,7 @@ void TalkReportTick();   /* T-726: speech.cpp - the same namespace (coop) */
 void PlatoonNudgeTick();   /* defined beside PlatoonNudge, below - the same namespace (coop) [t761-nudge-hold] */
 void StoreTick()
 {
+    ++g_bkFrame;   /* T-1242 fold 5: the teammates' research benches are scanned at most once per frame */
     LoadFloorTick();   /* first, every frame until read: the floor is each counter as the load left it, before anything this tick can raise one (PlaceUnplacedNotes, NumberBlockTick) */
     NumberBlockTick();   /* decision 31(a): every frame (it returns at once while the applied block stands), so the block is applied in the frame the floor is read - E11: the relay's slot decides, not the session role */
     MoneyLoadDrain();   /* T-799 D1: container loads that ran off the main thread, decided before anything announces this frame */
@@ -28400,6 +29565,12 @@ void StoreTick()
     else if (ageMs > (long long)kAreaMapStaleMs)           { verdict = kPicStale;       ++g_pictureStaleTicks; }
     else                                                   { verdict = kPicFresh;       ++g_pictureFreshTicks; }
     ::InterlockedExchange(&g_pictureCached, (long)verdict);
+    {   /* the holder answer leaves "not known" when the picture leaves loading: door lays waiting on it are tried again (doors.cpp) */
+        static int s_picWasLoading = 1;
+        const int loadingNow = (verdict == kPicLoading) ? 1 : 0;
+        if (s_picWasLoading != 0 && loadingNow == 0) coop::DoorsRecMapEvent(0);
+        s_picWasLoading = loadingNow;
+    }
     /* review-p7f M-4's measurement, costing no run: the predicate is blocked while a world HAS been built and
        no load is in progress. A climb here says the render loop stops when the window is minimised; a flat 0
        with a timestamp gap in the log says CommandChannelTick itself stops. Either way the run answers it. */
@@ -29210,6 +30381,8 @@ void KeptRecordSweepTick()
         }
         if (!newly.empty()) { KeptSweepQueue(kSweepNewlyHeld, &newly); ArStartRuns(newly); }   /* (c); and R5 for each newly held area (it decides at its own steps) */
         if (!newly.empty()) SquadTakeNewlyHeld(newly);   /* T-1084 step 5: this game now writes the squads recorded in the areas it newly holds */
+        coop::BuildTownsMapEvent();   /* T-1158 step 6 review MED-2: a released piece held for another writer is tried again (its writer is read from this map) */
+        coop::DoorsRecMapEvent(&newly);   /* doors.cpp: door lays waiting on the holder answer tried again, a newly held area's doors with no record seeded, a rebuilt town's area swept, queued removals tried */
         SquadRefusedOnMap(newly);   /* T-1084 step 5: each applied map looks at the refused squads (a newly held area asks again; the authority's refusals lift where nobody holds) */
         if (!freed.empty()) { ++g_sweepFreedRuns; KeptSweepQueue(kSweepFreed, &freed); }   /* (d): the authority builds its copies there. The runner's sleep writes were sent when its engine
             unloaded the area, at least the world server's 10 s release grace before the area turned free, on the same reliable channel as this map
@@ -29871,6 +31044,7 @@ void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char
     if (piecerec::IsPieceRecId(worldId)) { coop::PieceRecordGone(worldId, from); return; }   /* a piece record's removal leaves the piece table (build.cpp), never the squad path */
     if (coopbrec::IsBoxRecId(worldId)) { coop::BoxRecordGone(worldId, from); return; }   /* T-823: a box record's removal leaves the box table (items.cpp), never the squad path */
     if (shoprec::IsShopRecId(worldId)) return;   /* a shop record is never removed: a removal of one changes nothing here */
+    if (doorrec::IsDoorRecId(worldId)) { coop::DoorRecordGone(worldId); return; }   /* a door record's removal leaves the door table (doors.cpp), never the squad path */
     ++g_goneRecv;
     if (EngineWritesBlocked()) StoreNoteRecordArrivedNoWorld("RECORD_GONE");   /* P7f (review-p6z C-1), P7p (review-p7f H-1/M-1): the ARRIVAL detector, on the shared predicate. Not a refusal - the guards below are what make it safe */
     if (!g_dirReady) return;
@@ -29933,6 +31107,19 @@ bool StoreSendPieceRecord(const std::string& id, float x, float y, float z, cons
     if (stampOut != 0) *stampOut = stamp;
     return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
 }
+/* a world door's record (doors.cpp DrSend) as a RECORD at the door's position. MAIN THREAD. false = not sent (no link); nothing is queued */
+bool StoreSendDoorRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut)
+{
+    if (!doorrec::IsDoorRecId(id) || !LinkUp() || bytes.empty()) return false;
+    const long long stamp = (long long)time(0);
+    if (stampOut != 0) *stampOut = stamp;
+    return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
+}
+bool StoreSendDoorGone(const std::string& id)
+{
+    if (!doorrec::IsDoorRecId(id) || !LinkUp()) return false;
+    return SendGoneAny(id, (long long)time(0));
+}
 void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, const std::string& factionName,
                        float x, float y, float z, long long writtenAt, int owner, const std::vector<char>& bytes, unsigned recFlags)
 {
@@ -29947,6 +31134,9 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
     if (piecerec::IsPieceRecId(worldId)) { coop::PieceRecordArrive(worldId, bytes); return; }
     /* A SHOP RECORD IS NOT A SQUAD. It is kept in the shop table (items.cpp ShopRecordArrive) - no file, no squad lookup. */
     if (shoprec::IsShopRecId(worldId)) { coop::ShopRecordArrive(worldId, bytes); return; }
+    /* A DOOR RECORD IS NOT A SQUAD. It is kept in the door table (doors.cpp DoorRecordArrive) and laid on its door when its area's
+       records are laid - no file, no squad lookup. */
+    if (doorrec::IsDoorRecId(worldId)) { coop::DoorRecordArrive(worldId, bytes); return; }
     ++g_recv;
     /* B10-b (review-b10 M-2): the opening push's bookkeeping is NOT here. This function is reached from the
        session peer's link as well as the notebook's, and only the notebook's records may count toward the
@@ -30301,9 +31491,9 @@ void ReportStore()
              + " outageQueueSeqEcho[received,appliedToKnownKey,unknownKey]=" + N(g_queueSeqEchoReceived) + "," + N(g_queueSeqEchoApplied) + "," + N(g_queueSeqEchoUnknownKey) + " outageQueueSeqEchoMalformed=" + N(g_queueSeqEchoMalformed)
              + " zoneOutageQueue[queued,queueRefused,replayWriteFailed]=" + N(g_zoneQueuedNoNotebook) + "," + N(g_zoneQueueRefused) + "," + N(g_queueZoneWriteFailed)
              + "   (B12 / decision 52, counters restated by B12-c: THE IDENTITY IS queued == replayed + droppedNewerWriter + droppedUnknown + droppedBadPayload + droppedNotMineNow + superseded + pending, and a LOADED entry counts as queued on load so it closes across a restart of the game. OUTSIDE the identity, because neither was ever a queued entry of this session: droppedFull is a write the cap refused (256 entries / 4 MB) and outageQueueBadLines is a journal line that would not parse. journalWriteFailed means QUEUED IN MEMORY ONLY - the entries replay this session and do not survive a restart - and is a defect, as offThread and badKey are. superseded is an entry replaced in place by a later one for the same key, which only the zone and door families do; a box move is an event and every one is kept. seqZeroIgnored is an arriving RECORD with no sequence number in it, which is left alone rather than written in. Family counts are QUEUED counts and sum to queued. THE VERDICT: in the outage leg queued >= 1 and replayed >= 1 after the relay restarts, and droppedNewerWriter == 0 when nobody else wrote the same record)"
-             + " storeAuth[answered,noPassword,badChallenge,refused,stopped,extra,hostTokenSent,hostTokenFailed]=" + N(g_storeAuthAnswered) + ","
+             + " storeAuth[answered,noPassword,badChallenge,refused,stopped,extra,doorLoginSent,loginRemembered,loginRememberFailed,loginForgotten]=" + N(g_storeAuthAnswered) + ","
                + N(g_storeAuthNoPassword) + "," + N(g_storeAuthBadChallenge) + "," + N(g_storeRefusedAuth) + "," + N((long long)g_storeAuthStop)
-               + "," + N(g_storeAuthExtra) + "," + N(g_storeHostTokenSent) + "," + N(g_storeHostTokenFailed)
+               + "," + N(g_storeAuthExtra) + "," + N(g_storeDoorLoginSent) + "," + N(g_storeLoginRemembered) + "," + N(g_storeLoginRememberFailed) + "," + N(g_storeLoginForgotten)
              + " storeProto[mismatch,ignoredMessages]=" + N((long long)(g_storeProtoMismatch ? 1 : 0)) + "," + N(g_storeMismatchIgnored)
              + " u8AnsiFallback=" + N((long long)g_u8AnsiFallback)   /* paths read in the ANSI code page because they were not UTF-8 (u8file.h) */
              + coop::BoxRecordReport() + StoreSendBoundToken() + StoreBundleToken() + LinkKeepToken() + OriginReport() + SwReportToken() + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)");
@@ -30415,6 +31605,19 @@ int StorePlatoonMineMembers(void* platoon)
     return MembersMinePod(q.members, q.activeChars);
 }
 int StoreIsWakeDup(void* platoon) { return (platoon != 0 && g_wakeDup.count(platoon) != 0) ? 1 : 0; }   /* store.h: MAIN THREAD */
+int StoreCtxSleptCounts(void* platoon, int* chars, int* known, int* mine)   /* store.h (T-1229): MAIN THREAD */
+{
+    *chars = 0; *known = 0; *mine = 0;
+    if (platoon == 0 || g_ctxSleptMine.count(platoon) == 0) return 0;
+    std::map<void*, CtxSleptCount>::const_iterator it = g_ctxSleptCount.find(platoon);
+    if (it != g_ctxSleptCount.end()) { *chars = it->second.chars; *known = it->second.known; *mine = it->second.mine; }
+    return 1;
+}
+void StoreCtxSleptForget(void* platoon)   /* store.h (T-1229 fold 1): MAIN THREAD */
+{
+    if (platoon == 0) return;
+    g_ctxSleptMine.erase(platoon); g_ctxSleptCount.erase(platoon);
+}
 int StoreArHoldPeople(void* platoon)   /* store.h: T-1084 step 3 - MAIN THREAD */
 {
     if (platoon == 0 || !g_on || !g_dirReady || !OnMainThread()) return 0;
@@ -30653,7 +31856,7 @@ std::string ClearNearLever(const std::string& args)
     }
     if (!Plaus(coop::GameWorldPtr())) return "error clearnear: no world";
     FmPod fm; if (!ReadFactionsPod((void*)coop::GameWorldPtr()->factionDirectory, &fm) || !Plaus(fm.factions) || fm.count > 4096) return "error clearnear: the faction list would not read";
-    struct Hit { std::string wid; std::string faction; float d; int base; int at; };
+    struct Hit { std::string wid; std::string faction; float d; int base; int at; std::vector<unsigned int> mine; };   /* mine: its own-uid people */
     std::vector<Hit> hits;
     int players = 0, runSpawned = 0, notHolder = 0, town = 0, faults = 0, wiped = 0, baseWiped = 0;
     std::map<int, int> homeTypes;   /* the home record types seen in the circles, for the log line (which type a camp carries) */
@@ -30699,6 +31902,7 @@ std::string ClearNearLever(const std::string& args)
             if (!Plaus(q.active) || q.activeChars <= 0 || !Plaus(q.members)) continue;   /* awake squads only */
             const int n = q.activeChars < 256 ? q.activeChars : 256;
             float best = 1e30f, bx = 0.0f, bz = 0.0f; int run = 0, other = 0, bestAt = -1;
+            std::vector<unsigned int> mine;
             for (int k = 0; k < n; ++k)
             {
                 void* m = 0; float mx = 0.0f, mz = 0.0f;
@@ -30714,6 +31918,7 @@ std::string ClearNearLever(const std::string& args)
                 const unsigned int uid = FindSpawnedUid(m);
                 if (uid != 0 && g_cnRunUids.count(uid) != 0) run = 1;
                 else if (uid != 0 && !net::IsUidMine(uid)) other = 1;   /* another game's character: that game runs it */
+                else if (uid != 0) mine.push_back(uid);
             }
             if (best > r2) continue;
             if (g_cnRunSquads.count(p) != 0) run = 1;
@@ -30736,20 +31941,30 @@ std::string ClearNearLever(const std::string& args)
             if (c == swclearnear::kKeepTown) { ++town; continue; }
             if (c == swclearnear::kKeepNotHolder) { ++notHolder; continue; }
             Hit h; h.wid = WorldIdOf(p); h.faction = fname; h.d = std::sqrt(best);
-            h.base = (homeKind == swclearnear::kHomeBase) ? 1 : 0; h.at = bestAt;
+            h.base = (homeKind == swclearnear::kHomeBase) ? 1 : 0; h.at = bestAt; h.mine = mine;
             if (h.wid.empty()) { ++faults; continue; }
             hits.push_back(h);
         }
     }
-    /* removed after the walk: a wipe changes the faction's squad lists */
+    /* removed after the walk: a wipe changes the faction's squad lists. A removed squad leaves the world: its own-uid people are marked
+       just before its platoonwipe and unmarked right after, so the put-away of the wipe's sleep step unloads them and never offers them
+       to another game (handoff.h kSameIdClearNear) - only this squad's people, only for this one wipe */
+    long long handOversPrevented = 0;
     for (size_t i = 0; i < hits.size(); ++i)
     {
-        if (PlatoonWipe(hits[i].wid))
+        const long long unofferedBefore = SameIdClearNearUnoffered();
+        if (!hits[i].mine.empty()) SameIdWithdrawMarkClearNear(&hits[i].mine[0], (int)hits[i].mine.size());
+        const bool gone = PlatoonWipe(hits[i].wid);
+        if (!hits[i].mine.empty()) SameIdWithdrawDone();   /* only marks an XFER flight still holds stay */
+        const long long prevented = SameIdClearNearUnoffered() - unofferedBefore;
+        handOversPrevented += prevented;
+        if (gone)
         {
             ++wiped;
             if (hits[i].base != 0) ++baseWiped;
             DebugLog("[CLEARNEAR] wiped squad '" + hits[i].wid + "' faction='" + hits[i].faction + "'" + std::string(hits[i].base != 0 ? " home=nest" : "")
-                     + " nearest member " + F1(hits[i].d) + " from " + CnFromText(hits[i].at, cx, cz, others));
+                     + " nearest member " + F1(hits[i].d) + " from " + CnFromText(hits[i].at, cx, cz, others)
+                     + " handOversPrevented=" + N(prevented) + " of " + N((long long)hits[i].mine.size()) + " own people");
         }
         else
         {
@@ -30766,7 +31981,7 @@ std::string ClearNearLever(const std::string& args)
     for (std::map<int, int>::const_iterator it = homeTypes.begin(); it != homeTypes.end(); ++it)
         types += (it == homeTypes.begin() ? "" : ",") + N((long long)it->first) + ":" + N((long long)it->second);
     DebugLog("[CLEARNEAR] TEST-ONLY " + std::string(here != 0 ? "here " : "") + "(" + F1(cx) + ", " + F1(cz) + ") r=" + F1(r)
-             + centres + types + " mySlot=" + N((long long)g_mySlot) + ": " + reply);
+             + centres + types + " mySlot=" + N((long long)g_mySlot) + ": " + reply + " handOversPrevented=" + N(handOversPrevented));
     return reply;
 }
 }
@@ -30953,8 +32168,10 @@ bool QuitViaMenu()
     DebugLog(qr);
     return true;
 }
-bool KillNamed(const std::string& needle)
+bool KillNamed(const std::string& needleIn)
 {
+    std::string needle; int lpK = 0;   /* T-1218: `<name>#<k>` */
+    if (leverpick::SplitSelector(needleIn, &needle, &lpK) < 0) { DebugLog("[STORE] killnamed error killnamed: " + leverpick::BadSelector(needleIn)); return false; }
     if (needle.empty()) { DebugLog("[STORE] killnamed: no name given"); return false; }
     if (!Plaus(coop::GameWorldPtr())) { DebugLog("[STORE] killnamed '" + needle + "' -> no GameWorld (this is a REFUSAL, not 'no match')"); return false; }
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
@@ -30967,9 +32184,10 @@ bool KillNamed(const std::string& needle)
        reports "we stopped counting". The needle is a SUBSTRING, and the set is iterated in bucket order over hashed
        pointer values, so several uniques can match and WHICH one is picked changes between runs, between machines
        and between two loads of one save. Counting the whole walk first makes that choice visible instead of silent;
-       the pick is still the first named match the set hands back, and an ambiguous target is now said out loud. */
+       T-1218: an ambiguous target is now refused (nobody killed) unless one name equals the text or `#<k>` picks one. */
     long long scanned = 0, unreadable = 0, nameHits = 0, notUnique = 0, named = 0;
     ::Character* pick = 0;
+    leverpick::Picker< ::Character*> lpPk(lpK);   /* T-1218: every named match, in the walk's order */
     char pickName[256], pickSid[256]; pickName[0] = 0; pickSid[0] = 0;
     for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
     {
@@ -30983,17 +32201,22 @@ bool KillNamed(const std::string& needle)
         ++nameHits;
         if (KillNamedIsUniquePod(c) != 1) { ++notUnique; continue; }   /* a FAULT reads as "not named", the safe side - exactly as the world-state gate reads it */
         ++named;
-        if (pick == 0) { pick = c; std::memcpy(pickName, nm, 256); std::memcpy(pickSid, sd, 256); pickName[255] = 0; pickSid[255] = 0; }
+        lpPk.Add(c, nameStr == needle ? 0 : 1, 0.0, "'" + nameStr + "' sid=" + std::string(sd) + " uid=" + N((long long)FindSpawnedUid(c)));
     }
     /* lesson 12 again, and this time on EVERY terminal line: a hit that cannot be interrogated is as useless as a
        zero that cannot be. The same inputs are printed whether the lever hit, missed or faulted. */
     const std::string inputs = " (walked=" + N(scanned) + " unreadable=" + N(unreadable)
                              + " nameHits=" + N(nameHits) + " nameHitsNotNamedCharacter=" + N(notUnique)
                              + " namedMatches=" + N(named) + ")";
+    {   /* T-1218: the ONE named character whose name holds the text (a name equal to it wins), or #k in the walk's order; several ->
+           refused, nobody killed (this used to kill the first the set handed back and say AMBIGUOUS) */
+        std::string amb;
+        if (lpPk.Decide(&pick, "named characters whose name holds '" + needle + "'", "load order", &amb) > leverpick::kOne)
+        { DebugLog("[STORE] killnamed '" + needleIn + "' -> error killnamed: " + amb + inputs); return false; }
+        if (pick != 0 && KillNamedReadPod(pick, pickName, 256, pickSid, 256) != 1) { pickName[0] = 0; pickSid[0] = 0; }
+        pickName[255] = 0; pickSid[255] = 0;
+    }
     if (pick == 0) { DebugLog("[STORE] killnamed '" + needle + "' -> no match" + inputs); return false; }
-    if (named > 1)
-        ErrorLog("[STORE] killnamed '" + needle + "' -> AMBIGUOUS: " + N(named) + " named characters match this substring;"
-                 " killing the first the engine's set handed back, which is not a stable choice" + inputs);
     const unsigned int uid = FindSpawnedUid(pick);
     const std::string sidStr(pickSid), nameStr(pickName);
     if (StoreDeclareDeadPod(pick) != 1)
@@ -31915,6 +33138,13 @@ bool StoreSendTownVer(const std::vector<char>& b)
     return g_link->Send(0, (net::MsgType)kStoreMsgTownVer, &b[0], b.size(), net::CH_RELIABLE);
 }
 bool StoreTownVerLinkUp() { return LinkUp(); }   /* MAIN THREAD */
+/* T-929: MAIN THREAD - an encoded CAMP message (PROPOSE / NOT_BUILT) to the world server */
+bool StoreSendCamp(const std::vector<char>& b)
+{
+    if (!LinkUp() || b.empty()) return false;
+    return g_link->Send(0, (net::MsgType)kStoreMsgCamp, &b[0], b.size(), net::CH_RELIABLE);
+}
+bool StoreCampLinkUp() { return LinkUp(); }   /* MAIN THREAD */
 /* loot2c: MAIN THREAD - one take row (an encoded RESEARCH_TAKE, src/common/researchwire.h) to the notebook */
 bool StoreSendResearchTake(const std::vector<char>& b)
 {
@@ -31923,6 +33153,7 @@ bool StoreSendResearchTake(const std::vector<char>& b)
 }
 /* M5a (T-197 piece 4): MAIN THREAD - the live road through the notebook (store.h) */
 bool StoreLiveReady() { return LinkUp(); }
+int StoreDlgPauseSkipped() { return g_dlgPauseSuppressed != 0 ? 1 : 0; }   /* T-978 BUBBLE (store.h) */
 bool StoreSendLive(unsigned int route, unsigned int target, unsigned int innerType, const std::vector<char>& inner, bool reliable)
 {
     std::vector<char> b;
@@ -31993,7 +33224,26 @@ bool StoreLinkIsUp() { return LinkUp(); }                 /* U2: see store.h - M
 bool StoreLinkConnected() { return g_link != 0 && g_link->State() == net::LINK_UP && !g_storeProtoMismatch && !g_storeWrongWorld; }   /* see store.h - MAIN THREAD ONLY */
 std::string StoreNotebookDir() { return coopworld::WorldDirIn(BaseDir(), ConfigWorldKey()); }   /* P8J-B2: the notebook's top folder may be storedir= */   /* U2 / W2b: this game's world folder, through the ONE construction (coopworld::WorldDir) the notebook also uses */
 std::string StoreDataDir() { return g_dirCanonical; }   /* T-924 FOLD 3: see store.h */
+bool StoreDataDirFinal() { return g_indexLoaded; }   /* T-1020 re-check (LOW 2): see store.h */
 void StoreEnsureDir(const std::string& d) { EnsureDir(d); }   /* T-924 FOLD 3 */
+namespace { struct StoreDiskDirs   /* T-1020: coopdir::EnsureFileDir's two calls on the real disk */
+{
+    /* T-1020 fold (review LOW 2): a level that is a FILE is no folder - not there, and not made (counted and logged as a failure) */
+    /* T-1020 re-check (LOW 4): the rule itself is coopdir::AttrIsDir / MadeIsDir, checked offline against a real folder and file */
+    static bool IsDir(const std::string& d) { return coopdir::AttrIsDir((unsigned long)U8GetFileAttributes(d.c_str())); }
+    bool Exists(const std::string& d) const { return IsDir(d); }
+    bool Make(const std::string& d) const
+    {
+        const bool made = U8CreateDirectory(d.c_str(), 0) != 0;
+        const bool already = !made && ::GetLastError() == ERROR_ALREADY_EXISTS;
+        return coopdir::MadeIsDir(made, already, already ? (unsigned long)U8GetFileAttributes(d.c_str()) : 0xFFFFFFFFUL);
+    }
+}; }
+int StoreEnsureFileDir(const std::string& file, long long* failed, int* said, std::string* bad)
+{
+    StoreDiskDirs fs;
+    return coopdir::EnsureFileDir(file, fs, failed, said, bad);
+}
 std::string StoreTopDir() { return BaseDir(); }                                         /* mp3: see store.h */
 std::string MyPersonId() { return g_worldPersonId.empty() ? ConfigPlayerId() : g_worldPersonId; }   /* see store.h */
 std::string StorePlayerKey() { return g_profPickedNum >= 1 ? coopprof::SlotKey(MyPersonId(), g_profPickedNum) : MyPersonId(); }   /* loot2c x prof1 merge: see store.h */
@@ -32029,7 +33279,97 @@ const char* BasePolicyName() { return BasePolicyNameOf(g_basePolicy); }
    decision 45 nothing sets the local speed except the notebook's answer coming back - which is exactly the
    property a run has to be able to exercise deliberately. The engine ignores injected input (F010), so a lever
    is the only way a run can press pause at all. */
-const char* TimeModeName() { return g_srvHours < 0.0 ? "unknown (no notebook clock yet)" : (g_srvMode == 1 ? "consensus" : "fixed"); }
+const char* TimeModeName()
+{
+    if (g_srvHours < 0.0) return "unknown (no notebook clock yet)";
+    const char* const w = coopclock::TimeModeWire(g_srvMode);
+    return w[0] != 0 ? w : "unknown (a mode byte this build does not know)";
+}
+/* the PLAYERS tab's GAME SPEED line: the world's GAME SPEED CONTROL in GAME OPTIONS' words; "" until a CLOCK has said it */
+std::string TimeModeWords()
+{
+    if (g_clockRecv == 0) return std::string();
+    const char* const w = coopclock::TimeModeWire(g_srvMode);
+    return w[0] != 0 ? rulesfile::Shown("timemode", w) : std::string();
+}
+/* T-927 TEST-ONLY `buildmode enter | buildmode leave` (MAIN THREAD): build mode entered and left through the engine's own player
+   roads, so a run reaches the two build-mode togglePause calls T-927 recognises (rows BuildModeEnterPauseRet, BuildModeLeavePauseRet)
+   - no lever reached them before. Read (Ghidra and capstone, Steam 1.0.65; 1.0.68 in brackets - both rows matched 'same' by
+   gen_table_1068.py --reverse):
+     enter  MainBarBuildButton 0x720450 [0x720F80]: the main bar's BUILD button's own click handler (the widget "BuildButton" is
+            bound to it through thunk 0x4791F [0x47951], 0x72D364 [0x72DE94]). It reads no argument, makes the build list if it
+            was never made, and tail-jumps to build mode's entry 0x4E5B50 [0x4E65E0] (list, 0), whose togglePause(true) call
+            returns to 0x4E5B7D [0x4E660D].
+     leave  BuildModeCancel 0x4D3890 [0x4D4320] (list): what the Esc key runs while build mode is on (the key handler 0x82A460, its
+            call at 0x82A621 [0x82B1D1]: Esc with no game menu up -> build mode on ? this cancel : open the game menu). It drops the
+            unconfirmed previews and tail-jumps to build mode's exit 0x4D0DE0 [0x4D1870], whose togglePause(false) call returns to
+            0x4D0E43 [0x4D18D3].
+     flag   build mode = the build list's +0x28 (the build window; 0x4D0DD0 [0x4D1860] answers list+0x28 != 0 - build.cpp T-923).
+   Refused with no world; enter refused with build mode already on (the handler would make a second build window over the first),
+   leave refused with it off (Esc would open the game menu instead). It only calls the engine's own functions: the T-927 detour
+   decides on their togglePause calls exactly as on a player's click. No mod behaviour changes. */
+static unsigned long long kBmButtonRva = 0; static coop::AddrReg kBmButtonRva_reg("MainBarBuildButton", &kBmButtonRva, coop::kAddrUseCallOnly);   /* T-927 TEST-ONLY buildmode enter. Steam_1.0.65 0x720450 (1.0.68 0x720F80) */
+static unsigned long long kBmCancelRva = 0; static coop::AddrReg kBmCancelRva_reg("BuildModeCancel", &kBmCancelRva, coop::kAddrUseCallOnly);        /* T-927 TEST-ONLY buildmode leave. Steam_1.0.65 0x4D3890 (1.0.68 0x4D4320) */
+static unsigned long long kBmListRva = 0;   static coop::AddrReg kBmListRva_reg("BuildPreviewListGlobal", &kBmListRva);     /* Steam_1.0.65 0x212CE38 (var) */
+static unsigned long long kBmGuardRva = 0;  static coop::AddrReg kBmGuardRva_reg("BuildPreviewListGuard", &kBmGuardRva);    /* Steam_1.0.65 0x212CE44 (var, bit 1) */
+const size_t kBmListMode = 0x28;
+/* build mode as the engine keeps it: 1 on, 0 off (or the build list never made), -1 a row missing or a fault. No std::string here (C2712). */
+static int BuildModeFlagPod(void** listOut)
+{
+    *listOut = 0;
+    if (g_clkBase == 0 || kBmListRva == 0 || kBmGuardRva == 0) return -1;
+    __try
+    {
+        if ((*(const unsigned int*)(g_clkBase + (uintptr_t)kBmGuardRva) & 1u) == 0) return 0;
+        void* list = *(void* const*)(g_clkBase + (uintptr_t)kBmListRva);
+        if (list == 0) return 0;
+        *listOut = list;
+        return *(void* const*)((const char*)list + kBmListMode) != 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+typedef void (*BmButtonFn)();
+typedef void (*BmCancelFn)(void* list);
+/* 1 = the engine's function returned, 0 = it faulted. No std::string here (C2712). */
+static int BuildModeCallPod(int enter, void* list)
+{
+    __try
+    {
+        if (enter != 0) ((BmButtonFn)(g_clkBase + (uintptr_t)kBmButtonRva))();
+        else ((BmCancelFn)(g_clkBase + (uintptr_t)kBmCancelRva))(list);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+bool BuildModeCommand(const std::string& args)
+{
+    const bool enter = (args == "enter");
+    if (!enter && args != "leave") { DebugLog("[TIME] T-927 TEST-ONLY buildmode REFUSED - usage: buildmode enter | buildmode leave"); return false; }
+    const std::string head = "[TIME] T-927 TEST-ONLY buildmode " + args;
+    if (g_clkBase == 0 || (enter ? kBmButtonRva : kBmCancelRva) == 0 || kBmListRva == 0 || kBmGuardRva == 0)
+    { DebugLog(head + " REFUSED - an address row is missing (" + (enter ? "MainBarBuildButton" : "BuildModeCancel") + ", BuildPreviewListGlobal or BuildPreviewListGuard)"); return false; }
+    if (!coop::GameplayRunning() || ClockWorldLive() == 0) { DebugLog(head + " REFUSED - no world is running (the title screen or a load)"); return false; }
+    void* list = 0;
+    const int before = BuildModeFlagPod(&list);
+    if (before < 0) { DebugLog(head + " REFUSED - the build list could not be read"); return false; }
+    if (enter && before == 1) { DebugLog(head + " REFUSED - build mode is already on"); return false; }
+    if (!enter && (before == 0 || list == 0)) { DebugLog(head + " REFUSED - build mode is off"); return false; }
+    int okp0 = 0, okp1 = 0;
+    const unsigned char pb0 = ReadByteAtPod(g_clkBase + kPauseByteRva, &okp0);
+    const int rc = BuildModeCallPod(enter ? 1 : 0, list);
+    void* list2 = 0;
+    const int after = BuildModeFlagPod(&list2);
+    const unsigned char pb1 = ReadByteAtPod(g_clkBase + kPauseByteRva, &okp1);
+    const int want = enter ? 1 : 0;
+    const std::string line = head + (rc == 1 ? ": " : " FAULTED: ")
+        + (enter ? "the main bar's BUILD button's own handler ran (MainBarBuildButton)" : "the Esc key's build-mode cancel ran (BuildModeCancel)")
+        + " - build mode " + (after == want ? (enter ? "entered" : "left") : "did NOT change")
+        + "; the engine's build-mode flag (build list +0x28) before=" + N((long long)before) + " after=" + N((long long)after)
+        + " pauseByte before=" + (okp0 ? N((long long)pb0) : std::string("?")) + " after=" + (okp1 ? N((long long)pb1) : std::string("?"))
+        + MenuPauseCounters();
+    if (rc == 1 && after == want) DebugLog(line); else ErrorLog(line);
+    return rc == 1 && after == want;
+}
 bool SpeedVoteCommand(float speed)
 {
     if (!coopclock::ClockSpeedIsValid(speed)) return false;   /* the shared predicate */
@@ -32407,11 +33747,21 @@ std::string StoreTestCommand(const std::string& arg)
     if (rest == "off") { g_recPosNoPosArmed.clear(); DebugLog("[STORE] storetest nopos off: nothing armed"); return "ok storetest nopos off"; }
     if (rest == "next") { g_recPosNoPosArmed = "*"; DebugLog("[STORE] storetest nopos armed for the next SLEEP write of any group"); return "ok storetest nopos armed for the next SLEEP write"; }
     std::string found;
-    if (g_records.count(rest) != 0) found = rest;
-    for (std::map<std::string, Record>::const_iterator it = g_records.begin(); found.empty() && it != g_records.end(); ++it)
-        if (it->first.find(rest) != std::string::npos) found = it->first;
-    for (std::map<void*, std::string>::const_iterator bi = g_bind.begin(); found.empty() && bi != g_bind.end(); ++bi)
-        if (bi->second.find(rest) != std::string::npos) found = bi->second;
+    {   /* T-1218: the ONE group the text names - an exact worldId wins, then the records here whose id contains it (worldId order),
+           then (only when no record does) the groups bound here; `<text>#<k>` = the k-th; several -> refused naming them */
+        std::string base; int k = 0;
+        if (leverpick::SplitSelector(rest, &base, &k) < 0)
+        { DebugLog("[STORE] storetest nopos error storetest: " + leverpick::BadSelector(rest)); return "error storetest nopos: " + leverpick::BadSelector(rest); }
+        leverpick::Picker<std::string> pk(k);
+        std::set<std::string> added;
+        for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it)
+            if (it->first.find(base) != std::string::npos && added.insert(it->first).second) pk.Add(it->first, it->first == base ? 0 : 1, 0.0, "'" + it->first + "'");
+        for (std::map<void*, std::string>::const_iterator bi = g_bind.begin(); bi != g_bind.end(); ++bi)
+            if (bi->second.find(base) != std::string::npos && added.insert(bi->second).second) pk.Add(bi->second, bi->second == base ? 0 : 2, 0.0, "'" + bi->second + "'");
+        std::string amb;
+        if (pk.Decide(&found, "groups whose worldId contains '" + base + "'", "worldId order", &amb) > leverpick::kOne)
+        { DebugLog("[STORE] storetest nopos error storetest: " + amb + " - nothing armed"); return "error storetest nopos: " + amb; }
+    }
     if (found.empty()) { DebugLog("[STORE] storetest nopos: no group here matches '" + rest + "' - nothing armed"); return "error storetest nopos: no group matches"; }
     g_recPosNoPosArmed = found;
     DebugLog("[STORE] storetest nopos armed for " + found);

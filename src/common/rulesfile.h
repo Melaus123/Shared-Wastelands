@@ -16,7 +16,17 @@
 
    RULES_CHANGED (92, down only): the rules the world server just stored - the real fact, sent to every game when a change is
    stored, from the game or from the file. Each game turns it into grey chat lines (ChangeLines): "The world's rules changed: ..."
-   with no changer's name. */
+   with no changer's name.
+
+   THE WORLD'S PASSWORDS (T-1158 step 7, owner 1368 a / 1369 b / 1371, build/mockups-t1158-step7.md): three more lines,
+   `world password =`, `admin password =` and `owner password =`, each under its notes, at the top of the file under its opening notes. They are read APART from the rules:
+   never a rule, never in the rules map, never sent to a game, and their values are never said in the window or the log (a line that
+   names no rule and holds the word "password" is said with its value hidden). A password line's value is everything after the `=`
+   with one space after it dropped (the space the file shows); the text its key is made from has the spaces at both ends dropped
+   (worldpw.h - the same as a typed box or /login); an empty one, or no line, is no password. No minimum length (owner 1368). The world server makes its keys from them in memory at each
+   read (store_main.cpp); the host's game writes the world password line and, when the owner password line is empty, a long random
+   owner password when HOST is pressed with the same writer (WritePasswords),
+   so the file is the same as one written by hand with the same values (owner rule 2026-11-02, "one way a world works"). */
 #ifndef RULESFILE_H
 #define RULESFILE_H
 
@@ -31,7 +41,8 @@
 namespace rulesfile {
 
 const unsigned int kMsgRulesChanged = 92u;   /* down only: {u32 count, [str key, str value]...}, an empty value = the row was removed */
-const unsigned int kProtocol = 133u;          /* the world-server protocol that carries RULES_CHANGED */
+const unsigned int kProtocol = 145u;          /* the world-server protocol that carries RULES_CHANGED */
+
 const char* const kFile = "rules.txt";
 const char* const kOldFile = "options.txt";
 const unsigned int kMaxPairs = 64u;           /* as OPTIONS: the most rows one message carries */
@@ -47,7 +58,10 @@ const int kShownLines = 3;                    /* the chat lines one change shows
 enum Kind { kNumber = 0, kTick = 1, kPick = 2, kAmount = 3, kWhole = 4, kOnOff = 5, kRace = 6, kHidden = 7 };
 struct Rule { const char* key; const char* label; int kind; const char* note; };
 const int kRuleCount = 25;
-/* The GAME OPTIONS rows, in the screen's order (panelstatus.h OptDefs - the offline suite checks the two agree), each with its note. */
+/* The GAME OPTIONS rows, in the screen's order (panelstatus.h OptDefs - the offline suite checks the two agree), each with its note.
+   Decision 1360 (2026-11-02): EXTRA RECRUITS IN BARS, BASE ACCESS, RESURRECTION FEE and FEE GROWTH say what their GAME OPTIONS hover
+   notes say (panelstatus.h OptHoverText). A note is written only into a new file or with a rule the file lacks (WriteBack): an
+   existing file's older note lines are kept as they are. */
 inline const Rule* Rules()
 {
     static const Rule r[kRuleCount] = {
@@ -66,21 +80,21 @@ inline const Rule* Rules()
         { "gt.raidfreq", "RAID FREQUENCY", kNumber, "how often raids come. 0.25 to 3." },
         { "gt.attacks", "BASE ATTACKS", kWhole, "how often bases are attacked. 0 Bombardment, 1 High, 2 Normal, 3 Fewer, 4 Rare, 5 Never." },
         { "gt.limbloss", "LIMB LOSS", kWhole, "how easily limbs are lost. 0 Never, 1 Rare, 2 Frequent." },
-        { "recruitmult", "EXTRA RECRUITS IN BARS", kPick, "how many more recruits bars offer. Auto, 1, 2, 3 or 4." },
-        { "basepolicy", "BASE ACCESS", kPick, "who may use a player's base. Everyone, Owner only or Locked." },
-        { "timemode", "GAME SPEED CONTROL", kPick, "who sets the game speed. Admin only or Slowest wins." },
+        { "recruitmult", "EXTRA RECRUITS IN BARS", kPick, "how many times the usual recruits bars offer - Auto is one set per player, up to 4. Auto, 1, 2, 3 or 4." },
+        { "basepolicy", "BASE ACCESS", kPick, "who may open a player's chests - teammates always share the whole base. Everyone, Owner only or Locked." },
+        { "timemode", "GAME SPEED CONTROL", kPick, "who sets the game speed. Admin only, Slowest wins, Everyone agrees or Normal speed only." },
         { "profilecap", "PROFILES PER PLAYER", kWhole, "how many profiles one player may have. 1 to 16." },
         { "resurrect", "RESURRECTION", kOnOff, "fallen characters can be brought back. on or off." },
-        { "resurrectfee", "RESURRECTION FEE", kAmount, "what bringing one back costs, in cats. 0 or more." },
-        { "resurrectgrowth", "FEE GROWTH", kPick, "how the fee rises with each one brought back. Steady or Steep." },
-        { "spimport", "IMPORT FROM SINGLE PLAYER", kPick, "who may start a profile from a single-player save. Allowed for everyone, Host only or Not allowed." },
+        { "resurrectfee", "RESURRECTION FEE", kAmount, "the price of bringing one back, in cats - the first is free, then it rises with each one currently reanimated. 0 or more." },
+        { "resurrectgrowth", "FEE GROWTH", kPick, "how the price rises with each one currently reanimated. Steady or Steep." },
+        { "spimport", "IMPORT FROM SINGLE PLAYER", kPick, "who may start a profile from a single-player save. Allowed for everyone, Owner and admins only or Not allowed." },
         { "spimportmoney", "IMPORT INCLUDES MONEY", kPick, "an imported profile keeps its money. Yes or No." },
         { "spimportresearch", "IMPORT INCLUDES RESEARCH", kPick, "an imported profile keeps its research. Yes or No." } };
     return r;
 }
 /* The words a pick row shows for each value the world server stores (panelstatus.h OptChoices). */
 struct Word { const char* key; const char* wire; const char* word; };
-const int kWordCount = 26;
+const int kWordCount = 28;
 inline const Word* Words()
 {
     static const Word w[kWordCount] = {
@@ -90,8 +104,9 @@ inline const Word* Words()
         { "recruitmult", "auto", "Auto" },
         { "basepolicy", "shared", "Everyone" }, { "basepolicy", "owner", "Owner only" }, { "basepolicy", "locked", "Locked" },
         { "timemode", "fixed", "Admin only" }, { "timemode", "consensus", "Slowest wins" },
+        { "timemode", "vote", "Everyone agrees" }, { "timemode", "locked", "Normal speed only" },
         { "resurrectgrowth", "steady", "Steady" }, { "resurrectgrowth", "steep", "Steep" },
-        { "spimport", "all", "Allowed for everyone" }, { "spimport", "host", "Host only" }, { "spimport", "off", "Not allowed" },
+        { "spimport", "all", "Allowed for everyone" }, { "spimport", "owner", "Owner and admins only" }, { "spimport", "off", "Not allowed" },
         { "spimportmoney", "yes", "Yes" }, { "spimportmoney", "no", "No" },
         { "spimportresearch", "yes", "Yes" }, { "spimportresearch", "no", "No" },
         { "researchmode", "on", "on" }, { "researchmode", "off", "off" } };
@@ -140,6 +155,9 @@ inline int KindOf(const std::string& key)
 }
 /* a key this world keeps: a GAME OPTIONS row, a hidden rule, or a race row */
 inline bool KnownKey(const std::string& key) { return RuleIndex(key) >= 0 || IsHiddenKey(key) || IsRaceKey(key); }
+/* T-1209 (owner 1414 d, mock-up 1418): race rows are not kept in rules.txt - the world reads its kenshi_api.cfg. A race row's line
+   the world server removes is replaced by this one line (once in the file). */
+const char* const kRaceComment = "# Race rules are not set here. Put a race mod's kenshi_api.cfg in this folder; the world reads it when it starts and when the file is saved.";
 /* the race's name as players read it: the race row's id with each word's first letter in capitals ("shek" -> "Shek") */
 inline std::string RaceName(const std::string& key)
 {
@@ -164,7 +182,7 @@ inline std::string Note(const std::string& key)
 {
     const int i = RuleIndex(key);
     if (i >= 0) return Label(key) + ": " + Rules()[i].note;
-    if (IsRaceKey(key)) return key + ": the race rules for " + RaceName(key) + ", set in the game.";
+    if (IsRaceKey(key)) return key + ": the race rules for " + RaceName(key) + ", set in the game.";   /* the note a 0.4.0 world wrote above a race row: matched only so the row's removal takes it too (T-1209) */
     return key + ": a rule GAME OPTIONS does not show.";
 }
 /* the key a name in the file stands for ("" = none): a row's name in any case and spacing, or a key as the world server writes it */
@@ -203,11 +221,14 @@ inline bool WireOf(const std::string& key, const std::string& text, std::string*
         if (f == "off" || f == "no" || f == "false" || f == "0") { *wire = "off"; return true; }
         *wire = t; return true;
     }
-    if (key == "timemode")   /* `fixed` (the word options.txt and earlier builds wrote) and `admin` are Admin only */
+    if (key == "timemode")   /* `fixed` (the word options.txt and earlier builds wrote) and `admin` are Admin only; `vote` is Everyone agrees */
     {
         if (f == "admin" || f == "fixed" || f == "host") { *wire = "fixed"; return true; }
-        if (f == "consensus" || f == "vote" || f == "slowest") { *wire = "consensus"; return true; }
+        if (f == "consensus" || f == "slowest") { *wire = "consensus"; return true; }
+        if (f == "vote" || f == "agree") { *wire = "vote"; return true; }
+        if (f == "locked" || f == "normal") { *wire = "locked"; return true; }
     }
+    if (key == "spimport" && (f == "host" || f == "host only")) { *wire = "owner"; return true; }   /* the middle choice's old value and label, as v0.4.0 wrote them (owner 1383) */
     for (int i = 0; i < kWordCount; ++i)
         if (key == Words()[i].key && (f == Fold(Words()[i].word) || f == Words()[i].wire)) { *wire = Words()[i].wire; return true; }
     if (k == kPick || k == kWhole || k == kAmount || k == kNumber) { *wire = f; return true; }
@@ -275,6 +296,57 @@ inline bool RuleLine(const std::string& body, std::string* key, std::string* val
     return true;
 }
 
+/* ---- the world's passwords ---- */
+enum { kPwWorld = 0, kPwAdmin = 1, kPwOwner = 2, kPwCount = 3 };
+inline const char* PwName(int i) { return i == kPwWorld ? "world password" : i == kPwAdmin ? "admin password" : "owner password"; }
+/* the notes above each password line, without their "# " (the mock-up's words): n from 0; 0 = past the last note */
+inline const char* PwNote(int i, int n)
+{
+    if (i == kPwWorld) return n == 0 ? "WORLD PASSWORD: what players type to join. Empty = anyone who knows the address can join."
+                            : n == 1 ? "Anyone who can open this file can read it." : 0;   /* owner 1515 (2026-11-05) */
+    if (i == kPwAdmin) return n == 0 ? "ADMIN PASSWORD: what admins type after /login in the game's chat. Empty = nobody can log in"
+                            : n == 1 ? "as an admin. Anyone who can open this file can read it." : 0;
+    return n == 0 ? "OWNER PASSWORD: what the world's owner types after /login. The owner is always an admin and"
+         : n == 1 ? "alone chooses the admins. When the world is started from the game, the game fills this in"
+         : n == 2 ? "and logs its host in by itself. Empty = the world has no owner." : 0;
+}
+/* A password line: its name before the first "=" (any case and spacing) is a password's; value = everything after the "=" with one
+   space after it dropped. false for any other line (a note, a blank line, a rule line, a line with no "="). */
+inline bool PwLine(const std::string& body, int* which, std::string* value)
+{
+    const std::string t = Trim(body);
+    if (t.empty() || t[0] == '#') return false;
+    const size_t eq = body.find('=');
+    if (eq == std::string::npos) return false;
+    const std::string f = Fold(body.substr(0, eq));
+    for (int i = 0; i < kPwCount; ++i)
+        if (f == PwName(i))
+        {
+            *which = i;
+            *value = body.substr(eq + 1);
+            if (!value->empty() && (*value)[0] == ' ') value->erase(0, 1);
+            return true;
+        }
+    return false;
+}
+/* the password's line as written: "world password =" when empty, "world password = <value>" otherwise */
+inline std::string PwLineText(int i, const std::string& value) { return std::string(PwName(i)) + " =" + (value.empty() ? std::string() : " " + value); }
+/* a password's notes and line, each ending in eol */
+inline std::string PwText(int i, const std::string& value, const std::string& eol)
+{
+    std::string s;
+    for (int n = 0; PwNote(i, n) != 0; ++n) s += std::string("# ") + PwNote(i, n) + eol;
+    return s + PwLineText(i, value) + eol;
+}
+/* A line's text as the window and the log may show it: a line holding the word "password" (any case) shows only its name, its value
+   hidden - a misspelt password line never prints the password. */
+inline std::string ShownLineText(const std::string& t)
+{
+    if (LowerOf(t).find("password") == std::string::npos) return t;
+    const size_t eq = t.find('=');
+    return eq == std::string::npos ? std::string("(hidden)") : Trim(t.substr(0, eq)) + " = (hidden)";
+}
+
 typedef bool (*ValueCheck)(const std::string& key, const std::string& wire);
 struct BadLine { int line; std::string text; std::string key; };   /* line numbers from 1, as Notepad counts */
 struct Parsed
@@ -283,7 +355,9 @@ struct Parsed
     std::vector<BadLine> bad;                   /* a rule line whose value the world server refuses */
     std::vector<BadLine> unknown;               /* a line naming no rule this world knows (key "") */
     int duplicates;                             /* good lines of a rule an earlier good line already set */
-    Parsed() : duplicates(0) {}
+    std::string pw[kPwCount];                   /* the password lines' values (kPwWorld, kPwAdmin, kPwOwner): the last line of each wins */
+    bool pwThere[kPwCount];                     /* a line names that password */
+    Parsed() : duplicates(0) { for (int i = 0; i < kPwCount; ++i) pwThere[i] = false; }
 };
 /* ok: the world server's check of a key and value (store_main.cpp OptionValueOk); 0 = take every mapped value */
 inline Parsed Parse(const std::string& text, ValueCheck ok)
@@ -295,12 +369,14 @@ inline Parsed Parse(const std::string& text, ValueCheck ok)
         std::string key, value, wire;
         bool unknown = false;
         const std::string body = BodyOf(ls, i);
+        int which = -1;
+        if (PwLine(body, &which, &value)) { p.pw[which] = value; p.pwThere[which] = true; continue; }   /* a password: apart from the rules */
         if (!RuleLine(body, &key, &value, &unknown))
         {
-            if (unknown) { BadLine b; b.line = (int)i + 1; b.text = Trim(body); p.unknown.push_back(b); }
+            if (unknown) { BadLine b; b.line = (int)i + 1; b.text = ShownLineText(Trim(body)); p.unknown.push_back(b); }
             continue;
         }
-        if (!WireOf(key, value, &wire) || (ok != 0 && !ok(key, wire))) { BadLine b; b.line = (int)i + 1; b.text = Trim(body); b.key = key; p.bad.push_back(b); continue; }
+        if (!WireOf(key, value, &wire) || (ok != 0 && !ok(key, wire))) { BadLine b; b.line = (int)i + 1; b.text = ShownLineText(Trim(body)); b.key = key; p.bad.push_back(b); continue; }
         if (p.rules.count(key)) ++p.duplicates;
         p.rules[key] = wire;
     }
@@ -333,26 +409,98 @@ inline std::string Header(const std::string& worldName, const std::string& eol)
          + "# and tells every player in chat. Lines starting with # are notes." + eol
          + "# Admins can change the same rules in the game (GAME OPTIONS)." + eol;
 }
-/* A whole new file: the header, then each rule with its note (the world's first rules.txt, and the migration from options.txt). */
-inline std::string Fresh(const std::map<std::string, std::string>& want, const std::string& worldName)
+/* A whole new file: the header, the three password lines (empty), then each rule with its note (the world's first rules.txt, the
+   migration from options.txt, a rules.txt made again). leaveOut: bit (1 << kPw*) = that password line is not written (a 0.4.0 lock the
+   world carries for it, worldpw::CarryLeaveOut - owner 1513 a). */
+inline std::string Fresh(const std::map<std::string, std::string>& want, const std::string& worldName, unsigned leaveOut = 0)
 {
     const std::string eol = "\r\n";
     std::string s = Header(worldName, eol);
+    for (int i = 0; i < kPwCount; ++i) if ((leaveOut & (1u << i)) == 0) s += eol + PwText(i, std::string(), eol);
     const std::vector<std::string> o = KeyOrder(want);
     for (size_t i = 0; i < o.size(); ++i) s += eol + RuleText(o[i], want.find(o[i])->second, eol);
     return s;
 }
+/* the line index just past the file's opening notes: the run of # lines it starts with, when a blank line or the file's end follows
+   it (a # line right above a rule line is that rule's note, not an opening note: 0) */
+inline size_t PastOpeningNotes(const std::vector<Line>& ls)
+{
+    size_t at = 0;
+    while (at < ls.size() && !Trim(BodyOf(ls, at)).empty() && Trim(BodyOf(ls, at))[0] == '#') ++at;
+    if (at < ls.size() && !Trim(BodyOf(ls, at)).empty()) return 0;
+    return at;
+}
+/* THE PASSWORD WRITE (the world server and the host's game alike). set: the passwords this write gives a value (kPwWorld /
+   kPwAdmin -> value; an empty map = none). Each line naming a set password gets "= value" (its name as written and its ending kept);
+   a password no line names is added under the file's opening notes with its two notes - empty, or with its set value - the world's
+   in the order world, admin, owner. Every other byte is kept. An empty old: a new file (the header and the three password lines). A value holding a
+   line ending is never written (the caller refuses it first). leaveOut (owner 1513 a / 1508 b): bit (1 << kPw*) = a password no line
+   names is NOT added unless this write gives it a value that is not empty (worldpw::CarryLeaveOut, HostLeaveOut). */
+inline std::string WritePasswords(const std::string& old, const std::map<int, std::string>& set, const std::string& worldName, unsigned leaveOut = 0)
+{
+    unsigned skip = leaveOut;
+    for (std::map<int, std::string>::const_iterator v = set.begin(); v != set.end(); ++v)
+        if (v->first >= 0 && v->first < kPwCount && !v->second.empty()) skip &= ~(1u << v->first);
+    const std::string base = (Trim(old).empty() && old.find('\n') == std::string::npos) ? Fresh(std::map<std::string, std::string>(), worldName, skip) : old;
+    const std::string eol = EndOf(base);
+    std::vector<Line> ls = SplitLines(base);
+    bool there[kPwCount] = { false, false, false };
+    for (size_t i = 0; i < ls.size(); ++i)
+    {
+        int which = -1; std::string value;
+        if (!PwLine(BodyOf(ls, i), &which, &value)) continue;
+        there[which] = true;
+        std::map<int, std::string>::const_iterator w = set.find(which);
+        if (w == set.end() || w->second == value) continue;
+        const size_t eq = ls[i].text.find('=');
+        ls[i].text = ls[i].text.substr(0, eq) + "=" + (w->second.empty() ? std::string() : " " + w->second);
+    }
+    const size_t at = PastOpeningNotes(ls);
+    std::string add;
+    for (int i = 0; i < kPwCount; ++i)
+    {
+        if (there[i] || (skip & (1u << i)) != 0) continue;
+        std::map<int, std::string>::const_iterator w = set.find(i);
+        const std::string block = PwText(i, w == set.end() ? std::string() : w->second, eol);
+        add += at == 0 ? block + eol : eol + block;
+    }
+    std::string s;
+    for (size_t i = 0; i < ls.size(); ++i)
+    {
+        if (i == at && !add.empty()) s += add;
+        s += ls[i].text + (i + 1 == at && ls[i].end.empty() && !add.empty() ? eol : ls[i].end);
+    }
+    if (at >= ls.size()) s += add;
+    return s;
+}
+/* THE EXPORT'S rules.txt (a world export, store_main.cpp KeepExport): every password line empty (`world password =`, ...), a
+   password the file has no line for added empty under its opening notes, every other byte as it is - a copy of the world never
+   carries its passwords. An empty file stays empty. */
+inline std::string ExportText(const std::string& text)
+{
+    if (Trim(text).empty() && text.find('\n') == std::string::npos) return text;
+    std::map<int, std::string> none;
+    for (int i = 0; i < kPwCount; ++i) none[i] = std::string();
+    return WritePasswords(text, none, std::string());
+}
+/* the world folder's own rules.txt, as an export names it ('/'-joined, below the world folder; any case) */
+inline bool IsTopRulesFile(const std::string& rel) { return LowerOf(rel) == kFile; }
 /* THE LINE-KEEPING WRITE. old: the file's bytes as last read or written; want: the world's rules; only: the keys this write is about
    (0 = every key). For each key in `only`: the value of each of its lines that does not already say the wanted value is replaced
    (the name as written, the spacing after "=" and the ending kept); a key `want` no longer holds (a removed race row) loses its lines
-   and the note just above each; a key no line names is added at the end with its note. Everything else is kept byte for byte. */
-inline std::string WriteBack(const std::string& old, const std::map<std::string, std::string>& want, const std::set<std::string>* only, const std::string& worldName)
+   and the note just above each - the first removed race row's line becomes kRaceComment when the file does not say it yet (T-1209);
+   a key no line names is added at the end with its note. Everything else is kept byte for byte. An empty old is a whole new file
+   (Fresh, with leaveOut's password lines left out). */
+inline std::string WriteBack(const std::string& old, const std::map<std::string, std::string>& want, const std::set<std::string>* only, const std::string& worldName,
+                             unsigned leaveOut = 0)
 {
-    if (Trim(old).empty() && old.find('\n') == std::string::npos) return Fresh(want, worldName);
+    if (Trim(old).empty() && old.find('\n') == std::string::npos) return Fresh(want, worldName, leaveOut);
     const std::string eol = EndOf(old);
     std::vector<Line> ls = SplitLines(old);
     std::vector<int> drop(ls.size(), 0);
     std::set<std::string> seen;
+    bool raceNote = false;   /* the file already says kRaceComment */
+    for (size_t i = 0; i < ls.size() && !raceNote; ++i) raceNote = Trim(ls[i].text) == kRaceComment;
     for (size_t i = 0; i < ls.size(); ++i)
     {
         std::string key, value, wire;
@@ -366,6 +514,7 @@ inline std::string WriteBack(const std::string& old, const std::map<std::string,
         {
             drop[i] = 1;
             if (i > 0 && Trim(BodyOf(ls, i - 1)) == "# " + Note(key)) drop[i - 1] = 1;
+            if (IsRaceKey(key) && !raceNote) { raceNote = true; drop[i] = 0; ls[i].text = kRaceComment; }   /* T-1209: one comment line takes the race rows' place */
             continue;
         }
         if (WireOf(key, value, &wire) && wire == w->second) continue;
@@ -385,6 +534,46 @@ inline std::string WriteBack(const std::string& old, const std::map<std::string,
         s += eol + RuleText(o[i], want.find(o[i])->second, eol);
     }
     return s;
+}
+/* T-1202 - THE HOST'S GAME OPTIONS BEFORE THE WORLD'S FIRST START. A brand-new world's server answers its first game while that
+   game is still in the menu, before its Game options can reach it (they go up only once it is in the world): an import asked from
+   the menu is allowed or refused, and gets money and research, and NEW PROFILE's answer carries the profile cap - all decided on the
+   world server's defaults unless rules.txt already holds the host's choice. So at a world's FIRST hosting (stewardrules.h
+   FirstHostingPress: no rule in its rules.txt, no options.txt) the host's game writes EVERY row the host chose for that world into
+   rules.txt in the same step as the password lines, before the world server starts (ui.cpp PanelStartNotebook, store.cpp
+   StoreWriteWorldPassword) - the same rows the HOST press then hands over (ui.cpp PanelOptHandOver), which the world server, already
+   holding them, stores as no change. firstHostingRows: the press carries the host's chosen rows as the world's first settings
+   (stewardrules.h HostPressRows gave kPressSendsHostSettings - not when GAME OPTIONS' Done was never pressed for this world, nor for a
+   later hosting); chosen: those rows (key, value as GAME OPTIONS stores it); ok: the world server's own check (optionvalue.h
+   worldopt::ValueOk, the body of store_main.cpp OptionValueOk; 0 = no rows). A row is written only when it is a GAME OPTIONS row
+   (never a hidden rule, a race row or a message's marker), the world server takes its value, and the line written reads back as that
+   same value. None otherwise: the world server's defaults, as before. */
+inline std::map<std::string, std::string> FirstStartRows(bool firstHostingRows, const std::vector<std::pair<std::string, std::string> >& chosen, ValueCheck ok)
+{
+    std::map<std::string, std::string> out;
+    if (!firstHostingRows || ok == 0) return out;
+    for (size_t i = 0; i < chosen.size(); ++i)
+    {
+        const std::string& key = chosen[i].first;
+        if (RuleIndex(key) < 0) continue;
+        std::string wire, back;
+        if (!WireOf(key, chosen[i].second, &wire) || !ok(key, wire)) continue;
+        if (!WireOf(key, Shown(key, wire), &back) || back != wire) continue;   /* the line written ("name = <shown>") reads back as this value */
+        out[key] = wire;
+    }
+    return out;
+}
+/* The rows written into the file HOST is about to hand the world server (the password write's result): the line-keeping write for
+   these keys only - a line naming one gets the value, a missing one is added at the end with its note, in the file's own line
+   ending; every other byte kept, no key written twice. No rows: the text as it is. options.txt is never in play here: a first
+   hosting has none (MigrateFromOld is only ever false once a rule is named, and with no options.txt that read was the defaults
+   anyway). */
+inline std::string WriteFirstStartRows(const std::string& text, const std::map<std::string, std::string>& rows, const std::string& worldName)
+{
+    if (rows.empty()) return text;
+    std::set<std::string> only;
+    for (std::map<std::string, std::string>::const_iterator it = rows.begin(); it != rows.end(); ++it) only.insert(it->first);
+    return WriteBack(text, rows, &only, worldName);
 }
 
 /* ---- what changed, said ---- */
@@ -413,9 +602,23 @@ inline Pairs Announced(const Pairs& moved, bool fill)
     for (size_t i = 0; i < moved.size() && out.size() < (size_t)kMaxPairs; ++i) out.push_back(moved[i]);
     return out;
 }
-/* The world's rules are made from options.txt only when rules.txt is absent AND the world server never made or read one here
-   (kMadeFile absent): a world from before rules.txt. A deleted rules.txt otherwise gives the default rules. */
-inline bool MigrateFromOld(bool rulesFileThere, bool madeMarkerThere) { return !rulesFileThere && !madeMarkerThere; }
+/* The world's rules are made from options.txt only when rules.txt names no rule (absent, or holding only the password lines the host's
+   game writes ahead of the first start of a world from before rules.txt) AND the world server never made or read one here (kMadeFile
+   absent): a world from before rules.txt. A deleted rules.txt otherwise gives the default rules. rulesNamed: rules.txt is there and
+   names a rule (NamesARule), or is there and cannot be read. */
+inline bool MigrateFromOld(bool rulesNamed, bool madeMarkerThere) { return !rulesNamed && !madeMarkerThere; }
+/* the text has a line naming a rule (its value good or not) - a password line, a note or an unknown line is none */
+inline bool NamesARule(const std::string& text)
+{
+    const std::vector<Line> ls = SplitLines(text);
+    for (size_t i = 0; i < ls.size(); ++i)
+    {
+        std::string key, value; bool unknown = false; int which = -1;
+        if (PwLine(BodyOf(ls, i), &which, &value)) continue;
+        if (RuleLine(BodyOf(ls, i), &key, &value, &unknown)) return true;
+    }
+    return false;
+}
 /* one change's words: "RAID SIZE is now 1.5" / "the race rules for Shek" */
 inline std::string ChangeWords(const std::string& key, const std::string& wire)
 {

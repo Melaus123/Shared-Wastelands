@@ -14,7 +14,8 @@
  * SWING, after uid u32 | targetUid u32:
  *   tag u8 (kSwingTag) | moveLen u8 | move
  * SWING_END (81): the owner's swing that sent SWING ended - uid u32 | targetUid u32 (the target its SWING named), little-endian,
- *   kSwingEndBytes; bytes after them are ignored. uid 0, or a uid swinging at itself, is refused (kDecodeBadUid); target 0 = none.
+ *   | end u8 (what the swing met on the owner's game, kSwingEnd*), kSwingEndBytes; bytes after them are ignored. uid 0, or a uid
+ *   swinging at itself, is refused (kDecodeBadUid); target 0 = none; an end word above kSwingEndUntouched is refused (kDecodeBadEnd).
  * A name is 0..kNameMax bytes, each printable ASCII (0x20..0x7E), no NUL on the wire; length 0 = none (no move, no block, no
  * stumble). flags bit 0 (kBlowStumbleKnown): the stumble field is the deciding game's answer (with length 0: the hit played no
  * stumble); clear = the deciding game could not read it, and the replaying game lets its own engine choose. Other flag bits
@@ -49,6 +50,7 @@ const int kDecodeBadName   = 4;
 const int kDecodeBadResult = 5;
 const int kDecodeBadFlags  = 6;
 const int kDecodeBadUid    = 7;   /* SWING_END: uid 0, or the uid its own target */
+const int kDecodeBadEnd    = 8;   /* SWING_END: an end word this build does not know */
 
 struct Blow
 {
@@ -180,26 +182,37 @@ inline int DecodeSwingMove(const char* p, size_t size, char* out)
     return kDecodeOk;
 }
 
-const size_t kSwingEndBytes = 8;
+const size_t kSwingEndBytes = 9;
 
-/* false (nothing appended) for uid 0 or a uid that is its own target. */
-inline bool EncodeSwingEnd(std::vector<char>* b, unsigned int uid, unsigned int targetUid)
+/* SWING_END's end word: what the owner's swing met on the owner's game, for its copies' getting-ready pause after the swing
+   (fightready.h CopyDecide; the same numbers as fightready::kOwnerEnd*, the suite checks it). */
+const unsigned char kSwingEndUnknown   = 0;   /* the owner's game cannot tell */
+const unsigned char kSwingEndResult    = 1;   /* its last contact got the victim's game's result, or was a hit the owner's game ran */
+const unsigned char kSwingEndNoResult  = 2;   /* it touched a character whose game decides the blow, and no result came by its end */
+const unsigned char kSwingEndUntouched = 3;   /* it touched nothing */
+
+/* false (nothing appended) for uid 0, a uid that is its own target, or an end word above kSwingEndUntouched. */
+inline bool EncodeSwingEnd(std::vector<char>* b, unsigned int uid, unsigned int targetUid, unsigned char end)
 {
-    if (b == 0 || uid == 0 || uid == targetUid) return false;
+    if (b == 0 || uid == 0 || uid == targetUid || end > kSwingEndUntouched) return false;
     for (int i = 0; i < 4; ++i) b->push_back((char)(unsigned char)(uid >> (8 * i)));
     for (int i = 0; i < 4; ++i) b->push_back((char)(unsigned char)(targetUid >> (8 * i)));
+    b->push_back((char)end);
     return true;
 }
 
-/* uid / targetUid written only on kDecodeOk. */
-inline int DecodeSwingEnd(const char* p, size_t size, unsigned int* uid, unsigned int* targetUid)
+/* uid / targetUid / end written only on kDecodeOk. */
+inline int DecodeSwingEnd(const char* p, size_t size, unsigned int* uid, unsigned int* targetUid, unsigned char* end)
 {
     if (p == 0 || size < kSwingEndBytes) return kDecodeTruncated;
     unsigned int u = 0, g = 0;
     for (int i = 3; i >= 0; --i) { u = (u << 8) | (unsigned char)p[i]; g = (g << 8) | (unsigned char)p[4 + i]; }
     if (u == 0 || u == g) return kDecodeBadUid;
+    const unsigned char e = (unsigned char)p[8];
+    if (e > kSwingEndUntouched) return kDecodeBadEnd;
     if (uid != 0) *uid = u;
     if (targetUid != 0) *targetUid = g;
+    if (end != 0) *end = e;
     return kDecodeOk;
 }
 

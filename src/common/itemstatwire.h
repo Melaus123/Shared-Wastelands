@@ -12,6 +12,8 @@
  *    and id, an optional BAG1 block (bagwire.h - a dropped backpack's contents, rows + OWNL tail) and then the optional OWN1
  *    block (ownerwire.h - the stolen mark), both only when there is something to say. The same tail is legal on every op 0.
  *    The optional GEM1 block (gearwire.h - a gear item's uniform and crafter) follows the OWN1 block.
+ *    T-1214 (protocol 203): a GROUND ADD of an item a building's item spot holds ends that tail with an SPT1 block (spotsync.h - the
+ *    spot's position); only ITEM_MOVE's reader accepts it (DecodeAddTail with a spot out), every other reader still calls it trailing.
  * 4. `snapshot ... detail` item lines gain the stats (DetailStats) and `itemtest set` reads its arguments here (ParseSetArgs).
  *
  * Pure: no engine memory, no Windows; the offline suite hits the same bytes. C++03 (VS2010 v100).
@@ -26,6 +28,7 @@
 #include "bagwire.h"
 #include "ownerwire.h"
 #include "gearwire.h"   /* op 0's GEM1 block after OWN1 */
+#include "spotsync.h"   /* T-1214 (protocol 203): a GROUND ADD's SPT1 block after GEM1 */
 
 namespace coopistat {
 
@@ -40,13 +43,14 @@ const int kTailBadOwner = 4;    /* an OWN1 block that is cut or out of range */
 const int kTailTrailing = 5;    /* bytes left after the last block */
 const int kTailBadGear = 6;     /* a GEM1 block, or the BAG1 rows' GEML tail, that is cut or not valid */
 const int kTailBadNest = 7;     /* the BAG1 rows' BAGN tail (packs inside the pack) that is cut, out of range or too deep */
+const int kTailBadSpot = 8;     /* T-1214: an SPT1 block that is cut or out of range */
 
 inline const char* TailWhy(int why)
 {
     return why == kTailOk ? "ok" : why == kTailCut ? "cut" : why == kTailBadValue ? "a bad value"
          : why == kTailBadBag ? "a bad backpack block" : why == kTailBadOwner ? "a bad owner block"
          : why == kTailTrailing ? "trailing bytes" : why == kTailBadGear ? "a bad gear block"
-         : why == kTailBadNest ? "a bad pack-inside-pack tail" : "unknown";
+         : why == kTailBadNest ? "a bad pack-inside-pack tail" : why == kTailBadSpot ? "a bad item spot block" : "unknown";
 }
 
 inline bool ChargesOk(float f) { return f == f && f >= 0.0f && f <= kChargesMax; }
@@ -111,13 +115,15 @@ inline bool EncodeAddTail(std::vector<char>* b, const std::vector<coopbag::BagRo
    Nothing left = kTailOk with nothing set. A trailing BAGP block (the pack path) is left for the caller: `*end` stops before it.
    `bag` / `owner` / `gear` (may be 0) are written only on kTailOk. */
 inline int DecodeAddTail(const char* p, size_t size, size_t at, std::vector<coopbag::BagRow>* bag, coopmark::OwnerId* owner,
-                         gearwire::GearMarks* gear, size_t* end)
+                         gearwire::GearMarks* gear, spotsync::SpotMark* spot, size_t* end)
 {
     size_t off = at;
     std::vector<coopbag::BagRow> rows;
     coopmark::OwnerId o;
     gearwire::GearMarks g;
-    if (p != 0 && off < size && !coopmark::OwnerBlockAt(p, size, off) && !gearwire::GearBlockAt(p, size, off) && !coopbag::BagPathAt(p, size, off))
+    spotsync::SpotMark sm; spotsync::SpotMarkClear(&sm);
+    if (p != 0 && off < size && !coopmark::OwnerBlockAt(p, size, off) && !gearwire::GearBlockAt(p, size, off) && !coopbag::BagPathAt(p, size, off)
+        && !spotsync::SpotBlockAt(p, size, off))
     {
         size_t be = 0;
         const int bw = coopbag::DecodeBagRows(p, size, off, &rows, &be);
@@ -138,9 +144,21 @@ inline int DecodeAddTail(const char* p, size_t size, size_t at, std::vector<coop
         if (gearwire::DecodeGear(p, size, off, &g, &ge) != gearwire::kGearOk) return kTailBadGear;
         off = ge;
     }
+    if (spot != 0 && p != 0 && off < size && spotsync::SpotBlockAt(p, size, off))
+    {   /* T-1214: the SPT1 block - only for a reader that takes it (spot not 0); for any other it stays trailing below */
+        size_t se = 0;
+        if (spotsync::DecodeSpot(p, size, off, &sm, &se) != spotsync::kSpotOk) return kTailBadSpot;
+        off = se;
+    }
     if (off != size && !coopbag::BagPathAt(p, size, off)) return kTailTrailing;
-    bag->swap(rows); *owner = o; if (gear) *gear = g; *end = off;
+    bag->swap(rows); *owner = o; if (gear) *gear = g; if (spot) *spot = sm; *end = off;
     return kTailOk;
+}
+/* The same tail without an SPT1 block (one there is trailing). */
+inline int DecodeAddTail(const char* p, size_t size, size_t at, std::vector<coopbag::BagRow>* bag, coopmark::OwnerId* owner,
+                         gearwire::GearMarks* gear, size_t* end)
+{
+    return DecodeAddTail(p, size, at, bag, owner, gear, (spotsync::SpotMark*)0, end);
 }
 /* The same tail read without keeping the gear block (it is still checked). */
 inline int DecodeAddTail(const char* p, size_t size, size_t at, std::vector<coopbag::BagRow>* bag, coopmark::OwnerId* owner,

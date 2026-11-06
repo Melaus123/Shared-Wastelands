@@ -22,6 +22,9 @@ void UiTitleScreenNote(void* title);
 // title screen exists. Safe when the panel has never been opened: the detour calls the original first
 // and only widens its answer. See ui.cpp for the decompile this rests on.
 void InstallUiTitleClose();
+// 1 when InstallUiTitleClose hooked closeTheOtherBits, so an Escape quit at the title screen writes its [EXIT] quit route line
+// (src/common/crashkeep.h; store.cpp prints the start-up's marker from it). ANY THREAD.
+int UiTitleEscGateOn();
 
 // One token for the [P005] periodic title-pump line. Locale-safe: RE_Kenshi imbues a process-wide
 // locale that inserts digit-group separators into numbers (F030).
@@ -57,6 +60,11 @@ int UiDialogRectPoll();
 // multiplayer world -> the [SAVE] hb line's handSave[].
 void InstallUiPauseMenuArrange();
 long long UiHandSaveHiddenOpens();
+/* T-927: the game menu's panel (the object its show 0x913250 and hide 0x916190 take) - 1 shown, 0 hidden, -1 a fault reading
+   it, -2 no panel / no widget. MAIN THREAD. */
+int UiPauseMenuPanelVisible(void* panel);
+/* T-927: 1 = the menu's show is hooked (InstallUiPauseMenuArrange), so its opens are seen (store.cpp ClockGameMenuVisible) */
+int UiPauseMenuShowHooked();
 // T-514: shows / hides the three and places every row of the pause menu `panel` (the engine's MainMenuPopup) from Kenshi's own
 // positions - the same answer whoever calls and however often. >= 0 done (ui.cpp's result bits), < 0 not done. MAIN THREAD.
 int UiPauseMenuArrange(void* panel);
@@ -112,6 +120,10 @@ bool UiFactionTabRename(const std::string& name);   // T-368, TEST-ONLY `renamem
 // command (coop.cpp: after orig_titleUpdate / after orig_mainLoop and TagsTick). The status was written `ok uiclick` first; a
 // click that refuses here (the widget is gone or covered by then) writes `error uiclick`, as quitmenu does.
 void UiDriveEngineClickFlush(int atTitle);   /* T-201 PP6' fold: 1 = after the title's update (the one-press load may post), 0 = the in-world tail */
+// T-1055 (owner 1363), MAIN THREAD, log-only: the NEW GAME window's start name noted at BEGIN (settings.cpp's SaveManager::newGame pre-hook),
+// and the [WORLD] started line's "start='<name>' prepared=<...>" fields (store.cpp ClockNoteEpoch; newGame 0 = start '-'), cleared once said.
+void UiNewGameStartNote();
+std::string UiWorldStartFacts(int newGame);
 // command_channel.cpp - the harness status file, written late (UiDriveEngineClickFlush's refusal after `ok uiclick`).
 void CommandStatusLate(const std::string& text);
 

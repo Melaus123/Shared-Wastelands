@@ -114,16 +114,13 @@ inline int KeyParse(const std::string& text, std::string* tokenHex, unsigned int
    malformed key is a world server this game cannot prove it owns - not "running now". */
 inline int RunningNow(int lockHeld, int keyState) { return (lockHeld != 0 && keyState == kKeyOk) ? 1 : 0; }
 
-/* HOST is lit for keep-running unless the box is ticked with an empty PASSWORD box (a joined world running now needs neither). */
-inline int KeepHostLit(int runningNow, int ticked, int pwEmpty) { return (runningNow != 0 || ticked == 0 || pwEmpty == 0) ? 1 : 0; }
-
-/* THE WORDS (owner-approved mock-ups, T-1158 sections 1, 2 and 9). */
+/* THE WORDS (owner-approved mock-ups, T-1158 sections 1, 2 and 9; kKeepOpenWarn owner 1509). */
 const char* const kKeepLabel   = "Keep this world running for others";
 const char* const kKeepNote    = "When you leave, the world keeps running in its own window. Only players who joined by address stay."
                                  " Players who joined through Steam leave with you.";
-const char* const kKeepWarn    = "A world kept running checks only its password. Keep it on your home network or a private network such as"
-                                 " Radmin or Hamachi.";
-const char* const kKeepNeedsPw = "A world kept running needs a password.";
+const char* const kKeepWarn    = "A world kept running checks only its password, if it has one. Keep it on your home network or a private"
+                                 " network such as Radmin or Hamachi.";   /* owner 1514 a (3) */
+const char* const kKeepOpenWarn = "No password: anyone who knows this world's address can join while you are away.";
 const char* const kRunningNowPlayed = "running now";   /* the worlds list's LAST PLAYED cell */
 const char* const kStopBtn     = "STOP WORLD";         /* in DELETE WORLD's place, and the dialog's action */
 const char* const kStopTitle   = "STOP WORLD?";
@@ -136,13 +133,31 @@ inline std::string RunningNowText(const std::string& world) { return "\"" + worl
 inline std::string StopDlgText(const std::string& world) { return "Stop \"" + world + "\"? Everyone in it is disconnected. The world is saved first."; }
 inline std::string StoppedText(const std::string& world) { return "\"" + world + "\" stopped."; }
 
-/* HOST GAME's status line: a press in progress says its own line; else a picked world running now says so; else a ticked box with an
-   empty PASSWORD box says it needs one; else the panel's own line. */
-inline std::string KeepStatusPick(int busy, int runningNow, int ticked, int pwEmpty, const std::string& world, const std::string& base)
+/* AN OLDER VERSION STILL RUNNING (T-1254, owner 1512 a): HOST on a world running now (its lock held, its host.key whole) joins it; when
+   that world server answers with the version refusal (the "Version mismatch" sentence, coopui::RefusalIsVersion) it is an older
+   version's - 0.4.0 kept worlds write the same host.key. The game marks that run by its folder and host.key secret (a world started
+   again writes a new secret, so the mark ends with the run), and while the marked run is the pick HOST writes no password line into
+   its rules.txt (owner 1508 b: a 0.4.0 world's password lock stays for the 0.4.1 world server) and its status line says this. */
+const char* const kOlderRunningLine = "This world is still running an older version. Press STOP WORLD, then HOST.";
+inline int OlderRunningMark(int keepJoin, int versionRefusal) { return (keepJoin != 0 && versionRefusal != 0) ? 1 : 0; }
+inline int OlderRunningNow(int runningNow, const std::string& markFolder, const std::string& markToken, const std::string& pickFolder, const std::string& pickToken)
+{
+    return (runningNow != 0 && !markFolder.empty() && markFolder == pickFolder && markToken == pickToken) ? 1 : 0;
+}
+
+/* T-1255 D (owner 1515: "the host screen doesn't need a note at all to tell them it keeps the password"): the ticked world will really
+   be open - the PASSWORD box empty and the world has no password of its own (worldHas: 1 a world password line that is not empty or a
+   saved lock that applies, worldpw::WorldHasPassword; 0 none; -1 not known - no note) */
+inline int KeepOpenPick(int pwEmpty, int worldHas) { return (pwEmpty != 0 && worldHas == 0) ? 1 : 0; }
+/* HOST GAME's status line: a press in progress says its own line; else a picked world running now says so (an older version's says
+   kOlderRunningLine: older = OlderRunningNow); else a ticked box whose world will really be open (open: KeepOpenPick) says so while its
+   host is away (owner 1508 b; HOST stays lit); else the panel's own line. */
+inline std::string KeepStatusPick(int busy, int runningNow, int ticked, int open, const std::string& world, const std::string& base, int older = 0)
 {
     if (busy != 0) return base;
+    if (runningNow != 0 && older != 0) return kOlderRunningLine;
     if (runningNow != 0) return RunningNowText(world);
-    if (ticked != 0 && pwEmpty != 0) return kKeepNeedsPw;
+    if (ticked != 0 && open != 0) return kKeepOpenWarn;
     return base;
 }
 
