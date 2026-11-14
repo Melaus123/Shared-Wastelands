@@ -22,6 +22,9 @@ void TownVerFeedBegin();                                // MAIN THREAD (store pu
 void TownVerFeedPageEnd();                              // MAIN THREAD (store pump): a feed page ended - after a BEGIN, the whole list is here
 void TownVerTick();                                     // MAIN THREAD, every frame: records onto towns whose area is not loaded here; old-world seeds
 std::string TownVerReportToken();                       // townOv[...] for the [P032] REPORT line
+// T-640 D1, MAIN THREAD (the towns2 walk): the engine's own version test, read-only, for each other version of a loaded town -
+// coopt2::kVaApplies (one would apply now) / kVaNone / kVaUnread (*why says why). *tested / *would: versions tested / that hold.
+int TownVerAskOthers(void* town, int* tested, int* would, const char** why);
 // THE "BUILT WITH" NOTE inside each area file (store.cpp TownNote*, townverwire.h kTvNoteId)
 int TownVerNoteTowns(int sx, int sy, std::vector<std::pair<std::string, std::string> >* out);   // MAIN THREAD: the towns the area's next write notes, each with the version its buildings in that area are built with; -1 = no area
 void TownVerNoteWritten(const std::string& zoneId, int ok, int reused, const std::vector<std::pair<std::string, std::string> >& towns);   // MAIN THREAD: a note was added to an area write

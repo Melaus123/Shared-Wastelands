@@ -42,6 +42,14 @@ inline int SplitCountPublish(int mine, int stackAtSquare, int count)
     return (mine != 0 && stackAtSquare != 0 && count > 0) ? 1 : 0;
 }
 
+/* T-1042: units lifted off a stack in a BOX this game writes change that box with no hook ringing (F540), so the box's stored record is
+   owed here as for any rung move in a box - else the next game to hold the area lays the old count back (run T2157: one ore doubled).
+   1 = mark the box's record for writing (whether or not the count could be published: the box changed either way). */
+inline int SplitMarksBox(int isBox, int hasKey)
+{
+    return (isBox != 0 && hasKey != 0) ? 1 : 0;
+}
+
 /* Units lifted off a stack this game writes, at the drop (the ADD of the engine's clone that ends the drag). srcMine: this game still
    writes the stack's container, read again at the drop; dstMine: this game writes the container the units landed in; dstNamed: that
    container can be named (a replicated uid, a box key). kSdGive: into a container another game writes - the give road a whole item

@@ -5,7 +5,7 @@
 
 namespace coopstate { struct PoseWire; }   /* POSE (read-poses): src/common/statewire.h */
 namespace cooplimb { struct LimbsWire; }   /* LIMBS: src/common/limbwire.h */
-namespace coopcrime { struct CrimeState; struct CrimeRelEvent; }   /* crime3: src/common/crimewire.h */
+namespace coopcrime { struct CrimeState; struct CrimeRelEvent; struct CrimeCaught; }   /* crime3: src/common/crimewire.h */
 namespace coopbounty { struct BountyEntry; }   /* crime5: src/common/bountywire.h */
 namespace cooprison { struct PrisonMsg; }   /* arrest2: src/common/prisonwire.h */
 namespace swgive { struct GiveMsg; }     /* T-1135: src/common/givewire.h */
@@ -144,8 +144,8 @@ bool SendInside(unsigned int uid, int inside, const char* key);
 // M-D - handoff wire records (POD; sizeof must match on both instances - same binary).
 struct XferMember { unsigned int uid; float x, y, z, fx, fz; int intentType; unsigned int intentSubject; float ix, iy, iz; unsigned int pad; };
 bool SendUnload(unsigned int uid, int ownerStillRuns);   /* ownerStillRuns 1 = the announce pass (the sender still runs the person; the receiver keeps its squad index), 0 = the sender runs it nowhere (put away, reloaded, retired) */
-bool SendXfer(unsigned int leader, unsigned int reason, const XferMember* members, int count, int targetSlot);   /* protocol 84: reason = coopsquad::kXferReason*. M7a A1 build 1 [a1b1-sh0]: + each member's gen; by WorldFirstRoute to targetSlot (-1: not sent) */
-bool SendXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int toPeer);   // protocol 27 (F447): the ACK names the uids taken. M7a A1 build 1 [a1b1-sh1]: back to the XFER's sender by slot (fold 1 [a1b1f1-sh0] [F1]: on the session link when the XFER came by it)
+bool SendXfer(unsigned int leader, unsigned int reason, const XferMember* members, int count, int targetSlot, int wholeBits = 0);   /* T-1318 attempt 2: wholeBits - cooplo::kWholeBitLent (T-1122) | kWholeBitWorld (D3, protocol 226) */   /* T-1122 lent flag (protocol 224): lentWhole 1 - the reason word's "lent squad - whole or none" bit */   /* protocol 84: reason = coopsquad::kXferReason*. M7a A1 build 1 [a1b1-sh0]: + each member's gen; by WorldFirstRoute to targetSlot (-1: not sent) */
+bool SendXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int toPeer, const unsigned int* notInGroup = 0, int notInGroupCount = 0);   /* T-1239: + an optional tail (u32 n, n uids) - follow-leader members refused as not in the leader's group here; an older reader ignores it */   // protocol 27 (F447): the ACK names the uids taken. M7a A1 build 1 [a1b1-sh1]: back to the XFER's sender by slot (fold 1 [a1b1f1-sh0] [F1]: on the session link when the XFER came by it)
 /* M7a A1 build 2 [a1b2-sh0] (design 1.3, 2.5), MAIN THREAD: RELEASE (68) to one slot (WorldFirstRoute; false = no road - the release's
    tick tries again); RELEASE_ACK (69) back to the sender (the XFER_ACK's road); IsRecordedOwner: peer is uid's recorded owner (by
    player); ForgetCopyRecord: a copy's owner record and gen go (an offer this game dropped - its copy was removed). */
@@ -166,6 +166,7 @@ unsigned int CopyGenOf(unsigned int uid);
 unsigned int GenForTake(unsigned int uid, unsigned int giverGen);
 int PeerSlotOfKey(unsigned int key);
 int OwnerSlotOf(unsigned int uid);
+int OwnerPlayerSlotOf(unsigned int uid);   /* T-1318 a5 fold 1: uid's recorded owner's player slot (PlayerSlotOfKey, link fallback); -2 no owner record */
 int OwnerMovedClaimed(unsigned int uid);   /* T-1135 review fold 6: 1 when an OWNER_MOVED word named another game the owner of a character this game runs (or the note list overflowed) */
 void SessionCatchupApplyTick();   /* M7a2 fold 1 [m7a2f-ap3]: MAIN THREAD, CommandChannelTick right after coop::InQueueDrain() - the catch-up's engine writes */
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
@@ -217,6 +218,11 @@ int SendCrimeToOwner(unsigned int uid, const coopcrime::CrimeState& s);
 // MSG_CRIME kind 2: a standing event this game's engine raised against player `toSlot`'s stand-in, to that player only
 // (toSlot < 0: the session peer). RELIABLE. 1 sent; 0 no road now (keep it); -1 never sendable. MAIN THREAD (RelationsTick).
 int SendCrimeRelEvent(const coopcrime::CrimeRelEvent& e, int toSlot);
+// T-1131 MSG_CRIME kind 3: a lost caught roll on this game whose watcher is another game's character - the thief's crime at the roll
+// and the watcher's event, to the WATCHER's owner only. RELIABLE. 1 sent; 0 no road now; -1 never sendable. MAIN THREAD (crime.cpp).
+int SendCrimeCaught(unsigned int thiefUid, const coopcrime::CrimeState& s, const coopcrime::CrimeCaught& c);
+// T-1131: is there a road to this uid's owner now (the character stream's road open, another game on record as its owner)? MAIN THREAD.
+bool CaughtRouteOpen(unsigned int uid);
 // crime5: a character's bounty list (kind 0, owner) or a copy's additions (kind 1) - src/common/bountywire.h. RELIABLE; false
 // when the link is down or the list does not encode. MAIN THREAD (CrimeTick).
 bool SendBounty(unsigned int uid, unsigned char kind, const std::vector<coopbounty::BountyEntry>& list,
@@ -246,6 +252,8 @@ bool SendMeleeDecided(const meleewire::MeleeMsg& m, const hitwire::Blow* blow = 
    used (cooffect::kRoadSession 1 / kRoadLive 2) or 0 = not sent (no owner record, no road, or the send failed). MAIN THREAD. */
 int SendEffectRequest(unsigned int targetUid, const std::vector<char>& b);
 int SendEffectAnswer(unsigned int toKey, bool viaRelay, const std::vector<char>& b);
+/* T-1262 review fold 1: the road SendEffectRequest would take to targetUid's owner now (its own test), 0 none. MAIN THREAD. */
+int EffectRequestRoadNow(unsigned int targetUid);
 /* T-354: MSG_NOT_SHOWN to the owner of a SPAWN this game's table refused, on the road the SPAWN came by. 0 = no road. */
 int SendNotShownToOwner(unsigned int uid, unsigned int ownerKey);
 /* A LOST COPY (src/common/lostcopy.h; net/session.cpp beside OnResend). MAIN THREAD, all of them.
@@ -430,6 +438,13 @@ bool EncodeItemConfirmBody(const coop::ItemConfirmMsg& c, std::vector<char>* out
 bool DecodeItemConfirmBody(const std::vector<char>& bytes, coop::ItemConfirmMsg* out);
 /* T-889 step 2: MSG_ITEM_HANDOVER (RELIABLE) to one player by slot - kind 1 QUERY / 2 VERDICT / 3 CLOSED (src/common/handrec.h). */
 bool SendItemHandover(int kind, unsigned int asker, unsigned int reqId, unsigned int holder, int value, int toSlot);
+/* T-1122 build: MSG_RAID_LEND (RELIABLE) to one player by slot - an encoded raidsq::LendMsg (src/common/raidsquad.h). false = no road now. */
+bool SendRaidLend(const std::vector<char>& body, int toSlot);
+/* T-1122 awake hand (owner 1524): MSG_RAID_LEND (RELIABLE) by the road XFER / RELEASE take (WorldFirstRoute) - an AWAKE block goes ahead of
+   the hand-over message on the same road. false = no road now. */
+bool SendRaidLendSlotRoad(const std::vector<char>& body, int toSlot);
+/* T-1122 redesign (b): MSG_RAID_END (RELIABLE) to the lender by slot - an encoded raidsq::RaidEndMsg (src/common/raidsquad.h). false = no road now. */
+bool SendRaidEnd(const std::vector<char>& body, int toSlot);
 // E22b-2 (P6b). The taker's "it landed" / "it did not", and the giver's "undo your half".
 bool SendItemPlaced(unsigned int id, int ok);
 bool SendItemGiveDone(unsigned int id);   // MSG_ITEM_PLACED value 2 - the giver's GIVE `id` is done (its yes came in time)

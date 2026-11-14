@@ -91,7 +91,9 @@ inline void ShotDamages(float boltDamage, float out6[6])
  *   AI::underRangedAttack(victim's AI, attacker, 1)          on purpose, an attacker, the victim's combat class +0x130 clear
  *                                                            (0 = read clear; -1 = unread: not run) and the attacker's type 1;
  *   the hit reaction 0x438E50                                always.
- * attackerPresent false (no copy of the shooter): nothing - the owner applies no wound either. */
+ * attackerPresent false (no copy of the shooter here): nothing - the owner applies the wound with the victim standing in as the
+ * attacker (T-1264, WoundAttacker below) and these reactions need the real attacker; a copy present but not positionable keeps
+ * remember and under attack and loses only the hit reaction (StandInReactions below). */
 const int kShotReactRemember    = 1;
 const int kShotReactUnderRanged = 2;
 const int kShotReactHitReaction = 4;
@@ -119,6 +121,44 @@ inline int ShotUnderRangedSkip(bool onPurpose, int combatFlag130, int attackerTy
     if (combatFlag130 != 0) return kShotUrSkipFlagUnread;
     if (attackerType != 1) return kShotUrSkipNotChar;
     return kShotUrRun;
+}
+
+/* T-1264: whom MedicalSystem::addWound gets as the attacker when this game applies a remote wound (MSG_SHOT, MSG_MELEE_DECIDED) to
+ * a character it runs. addWound (decomp_64fe40) has no attacker-free road: it reads the attacker's position (vtable +0x40, :373),
+ * its body's facing when the victim's gate is set and there is no projectile object (:419-432) and its vtable +0x58 (:790, the
+ * damage number's colour); the stored wound keeps nothing of the attacker. With no copy of the shooter here, or a copy whose body
+ * cannot be positioned, the victim stands in as the attacker: the direction addWound computes is then zero (Ogre's normalise
+ * leaves a zero vector as it is; addWound passes it, times the damage, only to 0x64E870 -> 0x64E330 -> 0x0CECD0, which copies it
+ * into a severed limb's record, +0x214 - a push of nothing, no division) and the front / back side is always 2 when the victim's
+ * gate is set. The reactions run with the real attacker only: StandInReactions below.
+ *   victimReady false (no character, or its body cannot be oriented): refuse - no wound;
+ *   a copy present and positionable: the real attacker;
+ *   anything else: the victim stands in - the wound is never thrown away for want of the shooter. */
+const int kWoundRefuse       = 0;
+const int kWoundRealAttacker = 1;
+const int kWoundStandIn      = 2;
+inline int WoundAttacker(bool victimReady, bool copyPresent, bool copyPositionable)
+{
+    if (!victimReady) return kWoundRefuse;
+    if (copyPresent && copyPositionable) return kWoundRealAttacker;
+    return kWoundStandIn;
+}
+
+/* T-1264 review: the victim-side reactions a remote wound still runs, by how its attacker was found - a mask over kShotReact*
+ * (for MSG_MELEE_DECIDED kShotReactUnderRanged stands for under melee attack). Remember takes the real attacker's character, not its
+ * body, so it runs with the copy whenever one is here; under attack puts the attacker on the victim's attacker list (T-918,
+ * decomp_999030:64), so the victim's later combat ticks would target a copy with no finished body - it runs only with a positionable
+ * copy (re-check, the T240 crash class); the hit reaction (the flinch) is skipped whenever the victim stands in. With no copy here
+ * nothing runs - accepted by design (a stand-in hit gets no reaction).
+ *   kStandInNone: the real attacker; kStandInNoCopy: no copy here; kStandInNotPositionable: a copy whose body cannot be positioned. */
+const int kStandInNone            = 0;
+const int kStandInNoCopy          = 1;
+const int kStandInNotPositionable = 2;
+inline int StandInReactions(int standIn)
+{
+    if (standIn == kStandInNone) return kShotReactRemember | kShotReactUnderRanged | kShotReactHitReaction;
+    if (standIn == kStandInNotPositionable) return kShotReactRemember;
+    return 0;
 }
 
 } // namespace coopshot

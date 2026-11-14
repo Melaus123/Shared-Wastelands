@@ -102,6 +102,38 @@ inline int KeepDecide(int living, int birth, int fromLive, int hasHome, int play
     if (otherHeld == 1) return kKeepOtherHolder;
     return kKeepEngine;
 }
+/* T-850 fold 1 (T2198): the keep question's otherHeld input - another game HOLDS the squad's area, or (the reverse case) has it LOADED now
+   by its latest area report (it shows the squad's people as copies). A runner leaving the area while another game still has it loaded
+   keeps the squad (it sleeps here with its record; its people are offered to that game at the put-away) instead of the engine's
+   discard deleting a group the other game still shows. heldByOther / otherLoaded: 1 yes, 0 no, -1 no fresh area map (-1 = no, as before). */
+inline int OtherShowsArea(int heldByOther, int otherLoaded) { return (heldByOther == 1 || otherLoaded == 1) ? 1 : 0; }
+/* T-1046 fix 2 (owner 1591 a, T2299 / T2301): ONE KEEP RULE FOR BOTH QUESTIONS. The engine asks "keep this squad?" of a squad put away
+   (awake, 0x6BABD7) and of a squad asleep (its wake test, 0x7EE833); the mod gave two answers (asleep the engine's "no", awake "kept for
+   the other game" from the bare loaded bit), so a squad in the edge strip of an area the other game had loaded was woken and put back to
+   sleep every ~3.2 s. Now "kept for another game" only where the hand-over's own receiver test (handoff.cpp ReceiversFor ->
+   liveowner.h EngineKeepsAt, the same 250 margin) names a game whose engine would keep the squad at its spot - asleep, only when this
+   game's records also show the squad's people wholly taken by a game that test names (RelAccept / fold 1b: the squad index's given);
+   everywhere else the engine's own answer. receivers: ReceiversFor's k at the squad's spot (-1 hold: no fresh map, a row stale, no slot
+   of this game's own, the link down; 0 nobody; >= 1 that many games named); takenByNamed: 1 = the squad's people were wholly taken by a
+   game the order names (asked only asleep); staleShows: today's answer for a stale map (OtherShowsArea over HeldByOtherTS and
+   OtherLoadedTS read live - with the map stale both read -1, so the engine's answer), used for BOTH questions so they never disagree.
+   Returns 1 = kept (the mod answers keep), 0 = the engine's own answer. */
+inline int OneKeepRule(int asleep, int receivers, int takenByNamed, int staleShows)
+{
+    if (receivers < 0) return staleShows == 1 ? 1 : 0;   /* stale or missing map: today's answer, the same asleep and awake */
+    if (receivers == 0) return 0;                          /* no game's engine keeps it at this spot: the engine's own answer */
+    if (asleep != 0 && takenByNamed != 1) return 0;        /* asleep, its people not taken by a game that keeps it: the engine's answer (it wakes, is put away and offered) */
+    return 1;
+}
+/* the counter for one answer (store.cpp oneKeep[...] on the birth REPORT) */
+enum { kOkKeptAwake = 0, kOkKeptAsleep = 1, kOkNoGameAwake = 2, kOkNoGameAsleep = 3, kOkNotTakenAsleep = 4, kOkStaleKept = 5, kOkStaleEngine = 6, kOkVerdicts = 7 };
+inline int OneKeepVerdict(int asleep, int receivers, int takenByNamed, int staleShows)
+{
+    if (receivers < 0) return staleShows == 1 ? (int)kOkStaleKept : (int)kOkStaleEngine;
+    if (receivers == 0) return asleep != 0 ? (int)kOkNoGameAsleep : (int)kOkNoGameAwake;
+    if (asleep != 0) return takenByNamed == 1 ? (int)kOkKeptAsleep : (int)kOkNotTakenAsleep;
+    return kOkKeptAwake;
+}
 /* 1 = the mod answers 'keep'; 0 = the game's own answer is returned */
 inline int KeepAnswers(int verdict) { return verdict >= kKeepBorn ? 1 : 0; }
 /* the kept byte a squad made here from another game's message or from a world record is given: its birth flag; unknown = kept */
@@ -162,6 +194,91 @@ inline int ModMarkClearedBy(int living) { return living > 0 ? 1 : 0; }
 inline int MadeEmptyPlaceFailed(int del, int madeMark) { return (del == kDelModKept && madeMark != 0) ? 1 : 0; }
 /* takes one squad's mark: 1 = it was marked; the mark is gone afterwards (a destroy uses it once) */
 template <class K> inline int ModRemovedTake(std::set<K>* marks, const K& key) { return (marks != 0 && marks->erase(key) != 0) ? 1 : 0; }
+
+/* T-850: ANOTHER GAME RUNS LIVING PEOPLE THIS SQUAD LOST HERE. A squad's copy here can be emptied by the engine's own area unload while
+   its people are another game's: this game's copies of them (puppets - the other game drives them) are put away, the squad reads empty
+   and the engine destroys it. That is no end of the squad - its runner still has the people and writes the record when it puts them
+   away. The mark: unloadRemoval - the engine's unload removal of a member of the squad (not a death); runElsewhere - the person is
+   another game's puppet here at that moment (who runs it NOW, not who made its uid); deadRead - Character::hasDied read at the removal
+   (1 dead, 0 alive, -1 not read). Only a copy read ALIVE marks: a dead copy's body removed at an unload does not keep a dead squad's
+   record (a ghost). 1 = mark. */
+inline int OtherRunRemovedMark(int unloadRemoval, int runElsewhere, int deadRead)
+{
+    return (unloadRemoval != 0 && runElsewhere != 0 && deadRead == 0) ? 1 : 0;
+}
+/* T-850: kDelRunKept - the destroy of a squad that lost living people another game runs keeps the record: nothing is deleted here or on
+   the world server (no discard delete, no plain delete), and - unlike kDelModKept - the squad is placed from its record again when its
+   area is this game's to run. kDelRunHeld (fold 1, M4) - one of those people was this game's own, offered to another game at its
+   put-away, and the offer has not settled: no delete yet; the squad's delete waits for the hand-over's outcome (RunHeldResolve). */
+enum { kDelRunKept = 4, kDelRunHeld = 5 };
+/* T-850 fold 1: what a squad's copy here noted about a living person it lost (per uid, store.cpp g_otherRunRemoved): kLostRunsThere - the
+   engine's unload put away this game's puppet of another game's person; kLostAwayThere - another game's message removed the copy of a
+   living person (its UNLOAD: put away alive or withdrawn; PEER GONE; a stale copy retired); kLostHandedOff - this game's own person, offered
+   to another game at its put-away (an open release). A DESPAWN (the runner says it died) notes nothing. */
+enum { kLostNone = 0, kLostRunsThere = 1, kLostAwayThere = 2, kLostHandedOff = 3 };
+/* T-850 fold 1: the person's answer NOW, at the squad's destroy (live facts, not the note's age): diedReported - the person's runner has
+   said it died (a DESPAWN since the note); releasePending - its release is still open; takenByOther - another game owns it now (its
+   owner record; this game's own no longer). 1 runs elsewhere alive, 0 not, 2 not known yet (the hand-over is open). */
+enum { kRunNo = 0, kRunYes = 1, kRunPending = 2 };
+inline int PersonRunsElsewhere(int kind, int diedReported, int releasePending, int takenByOther)
+{
+    if (kind == kLostNone || diedReported != 0) return kRunNo;
+    if (kind == kLostHandedOff) return releasePending != 0 ? (int)kRunPending : (takenByOther != 0 ? (int)kRunYes : (int)kRunNo);
+    return kRunYes;   /* another game ran it, or put it away alive: its runner holds it (and writes its record) */
+}
+/* the squad's answer from its people's: any one living elsewhere keeps it; else an open hand-over waits; else nobody */
+inline int SquadRunAnswer(int anyYes, int anyPending) { return anyYes != 0 ? (int)kRunYes : (anyPending != 0 ? (int)kRunPending : (int)kRunNo); }
+/* T-850: the delete a destroy sends, with the squad's 'another game runs its people' answer (otherRun: kRunNo / kRunYes / kRunPending) as
+   one more input. kRunYes turns the discard delete and the plain delete - and the mod-removal keep, whose not-placed-again rule must not
+   apply to people still alive elsewhere - into kDelRunKept; kRunPending holds them (kDelRunHeld). A wipe-out the death watch saw
+   (diedOut) is deleted as before, and the same-id keep (kDelNone) stays. */
+inline int DestroyDeleteRun(int otherRun, int modRemoved, int bound, int diedOut, int discarding, int livingAtDestroy, int emptiedByUnload, int idShared)
+{
+    const int del = DestroyDeleteMod(modRemoved, bound, diedOut, discarding, livingAtDestroy, emptiedByUnload, idShared);
+    if (otherRun == kRunNo || diedOut != 0) return del;
+    if (del != kDelDiscard && del != kDelPlain && del != kDelModKept) return del;
+    return otherRun == kRunPending ? (int)kDelRunHeld : (int)kDelRunKept;
+}
+/* T-850 fold 1: a held squad delete (kDelRunHeld) at each look: answer is the squad's SquadRunAnswer now; was - the delete the destroy
+   would have sent (DestroyDeleteMod). kDelRunKept once a person is taken by another game, `was` once every hand-over settled with nobody
+   taking one, kDelRunHeld while one is open. */
+inline int RunHeldResolve(int answer, int was) { return answer == kRunYes ? (int)kDelRunKept : (answer == kRunPending ? (int)kDelRunHeld : was); }
+/* T-850 fold 2 (T2217): THE COPY THAT WAS NEVER THE SQUAD HERE. The engine destroys an emptied copy and the destroy's answer is the plain
+   delete (kDelPlain: the permanent deleted mark, here and on the world server). That ends the squad only when its people died. A copy whose
+   wake this game refused (another game runs the squad, or the list hold held it), a copy of a squad another game runs now (the world
+   server's runner note), a copy that never had a living member of this game's own here (an empty shell woken beside another game's people)
+   and a copy whose id another copy here is still bound to (a same-id pair: the other copy holds the squad's record) are not that end - the
+   plain delete becomes no delete (kDelShellKept): nothing is sent and the record stays. reallyDied keeps the delete in every case: the death
+   watch marked the squad wiped out (diedOut), or its members are all bodies and some were this game's own (ReallyDiedOut). */
+enum { kDelShellKept = 6 };
+/* 1 = the squad really died out here: the death watch's wipe-out mark, or no living member left (livingAtDestroy 0: members, all dead)
+   while this game ran some of them (ownMembers: members now whose session uid is this game's or none; ownLivedHere: the death watch saw a
+   living member of this game's own in this copy) */
+inline int ReallyDiedOut(int diedOut, int livingAtDestroy, int ownMembers, int ownLivedHere)
+{
+    if (diedOut != 0) return 1;
+    return (livingAtDestroy == 0 && (ownMembers > 0 || ownLivedHere != 0)) ? 1 : 0;
+}
+/* the destroy's answer (del, DestroyDeleteRun's) with the copy's facts: wakeRefused - this game refused the copy's wake (store.cpp
+   g_wakeDup); otherRuns - the world server says another live game runs the squad (SwOtherRunner); ownLivedHere - the copy had a living
+   member of this game's own here (seen by the death watch, or living now); idShared - another platoon here is bound to the same id */
+inline int ShellKeep(int del, int reallyDied, int wakeRefused, int otherRuns, int ownLivedHere, int idShared)
+{
+    if (del != kDelPlain || reallyDied != 0) return del;
+    return (wakeRefused != 0 || otherRuns != 0 || ownLivedHere == 0 || idShared != 0) ? (int)kDelShellKept : del;
+}
+/* T-850 fold 1b: a squad here binds a held delete's id again (it lives here) - 1 = the hold is dropped, nothing deleted */
+inline int RunHeldOnRebind(int held) { return held != 0 ? 1 : 0; }
+/* T-850 fold 1 (M1): the note goes when the squad here has living members again at the keep question (the person lost was a straggler,
+   the squad lives on here; its later destroy is decided by what empties it then) and at its sleep. 1 = forget the squad's notes. */
+inline int OtherRunNotesCleared(int livingAtKeepQuestion) { return livingAtKeepQuestion > 0 ? 1 : 0; }
+/* T-850: the received RECORD_GONE's permanent deleted mark. A discard (the sender's copy was put away, born not kept) is no death:
+   the record goes, no mark is set - a living copy elsewhere is written again at its put-away. Any other gone (a plain or wipe-out
+   delete) sets the mark. 1 = set the mark. */
+inline int GoneSetsDeletedMark(int isDiscard) { return isDiscard != 0 ? 0 : 1; }
+/* T-850 fold 1 (L2): 1 = a received gone is older than the record here and ignored. A discard loses to a write in its own second too
+   (stamps are whole seconds: a runner's sleep write in that second is the squad living on); a death delete only to a newer write. */
+inline int GoneIgnoredAsOlder(int isDiscard, long long recordWrittenAt, long long goneStamp) { return isDiscard != 0 ? (recordWrittenAt >= goneStamp ? 1 : 0) : (recordWrittenAt > goneStamp ? 1 : 0); }
 
 /* ---- the world server's judgement of a discard delete ----
    holderId: the player the area map names as the holder of the record's area ("" = nobody); senderId: the sending game's player;

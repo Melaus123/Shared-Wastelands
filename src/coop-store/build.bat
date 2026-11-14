@@ -41,7 +41,7 @@ if not exist server_version.res (
 rem /bigobj: store_main.cpp held more sections than the default object format allows (error C1128).
 cl /nologo /O2 /EHsc /MD /bigobj /D_CRT_SECURE_NO_WARNINGS /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I ..\coop-plugin\third_party\enet\include ^
-   store_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\cfgtext.cpp ..\coop-plugin\u8file.cpp ^
+   store_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\fileprobe.cpp ..\common\cfgtext.cpp ..\coop-plugin\u8file.cpp ^
    ..\coop-plugin\upnp.cpp ..\coop-plugin\net\routerask.cpp ..\coop-plugin\net\homeaddr.cpp server_version.res ^
    %OBJ%\callbacks.obj %OBJ%\compress.obj %OBJ%\host.obj %OBJ%\list.obj %OBJ%\packet.obj %OBJ%\peer.obj %OBJ%\protocol.obj %OBJ%\win32.obj ^
    /FeSharedWastelandsServer.exe ^

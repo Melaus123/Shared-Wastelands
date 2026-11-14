@@ -14,6 +14,7 @@
 #include "../handoff.h" // M-D: ApplyRemoteXfer / Ack
 #include "../../common/groundname.h"   /* T-693: the id kind on the ground item messages (IdKindPut / IdKindGet) */
 #include "../../common/holdwire.h"   /* P105 build 2 (protocol 126): HOLD / LAND, the 'HLD1' / 'LND1' / 'RQT1' trailers */
+#include "../../common/screentake.h"   /* T-1260 (protocol 217): the 'STK1' block - a screen take's source checked by its owner */
 #include "../../common/squadlead.h"   /* T-1 B1 restructure: MSG_SQUAD_LEAD encode / decode */
 /* T-1 B3 restructure (protocol 89): MSG_KEEPER and src/common/keeperwire.h retired - the squad's money rides MSG_SQUAD_LEAD */
 #include "transport.h"
@@ -58,6 +59,7 @@
 #include "../../common/fightchoice.h"   /* T-1101 design (c): the MSG_FIGHT_CHOICE payload */
 #include "../../common/squadbirth.h"   /* CONTEXT's birth word */
 #include "../../common/handrec.h"   /* T-889 step 2: MSG_ITEM_HANDOVER and the game-to-game protocol number */
+#include "../../common/raidsquad.h"   /* T-1122 build: MSG_RAID_LEND's number */
 #include "../../common/givelate.h"   /* coopgive::kPlacedGiveDone - MSG_ITEM_PLACED's 'give done' value */
 #include "../../common/effectwire.h"   /* T-327: the MSG_EFFECT payload and its road */
 #include "../effect.h"                 /* T-327: EffectOnNet */
@@ -107,6 +109,7 @@ static const int kPsRows = 1024;   /* the player-area rows read from PlayerSecto
 namespace coop { void WorldStateOnOwnershipReleased(unsigned int uid, const void* character); }   /* worldstate.cpp - a dual run's yield is a release */
 namespace coop { void OnPlayerGone(unsigned int slot, const char* how, int standIn); }   /* below, in coop: the return check handles a leave it missed as PLAYER_GONE's (standIn 1: no take here) */
 namespace coop { int CopyIsPlayerCharacter(unsigned int uid); }   /* spawn.cpp: 1 the player character / a player-faction person, 0 an NPC, -1 unreadable, -2 no body */
+namespace coop { bool LeverIsMade(unsigned int uid); void LeverMarkMade(unsigned int uid, const std::string& label); }   /* items.cpp (lever1 TEST-ONLY, levermade.h): the spawn lever's characters */
 namespace coop { bool SpawnTwinHeld(unsigned int uid); }   /* spawn.cpp: a body of this game's own world the creation core adopts as the uid's copy (AdoptExistingTwin's lookups) */
 namespace coop {
 namespace net {
@@ -188,8 +191,11 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 213;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02). 195 (T-1205): STATE's latch bits 21-22 (god mode) and a "whole" limb now grows a copy's lost limb back (194 is taken by unmerged effort/t858a). 197 (T-858, main): END's unrun list and reason TALKER_CLOSED. 199 (T-478 step 3; 198 is taken by unmerged effort/t1214a, t930a, t947a): END carries the line id after endsType (before T-858's optional unrun list), and endsType 43 BAIL makes the talker's game open its own bail window. 201 (merge of T-930 / T-947 with main's 199; 200 is held by unmerged effort/t1122a): T-930: the new MAP_DOTS inner type 206 - teammates' characters on the world map, src/common/mapdots.h (196 and 197 are held by unmerged effort/t478b and effort/t858a). 203 (T-1214 design D1; 200-202 are taken by unmerged effort/t1122a, t947a, t478c; 201 then by main's T-930 / T-947): ITEM_MOVE op 0 carries the SPT1 building item spot block, and a game that is not the area's ground holder withholds its spot roll and gives the holder's item to the spot. 204 (T-23; 202 / 203 held by other efforts): a piece placed in a teammate's outpost or house travels in its piece record (a hand-over seed naming the owner) - the hand-over PLACE and HAND_ACK are gone - and help work goes to the piece's writer (the owner while its game has the area loaded, else the area's holder). 207 (T-1061; 205 is retired, 206 is held by another effort): BOX_LOCK (85) - a chest's pick asked of the box's writer, or its NO; a box record may carry its lock block (world-server protocol 145). 208 (T-478 step 5): END endsType 41 SELL SLAVES carries its line id and makes the talker's game open its own selling window (an older talker's game would read 41 as no window and close the talk silently). 211 (T-1242; 209 / 210 are held by effort/t478e / effort/t1122a): RESEARCH_BOOK (88) - a research's Books in a teammate's bench asked of that teammate's game, its answer, give back and done (src/common/bookshare.h). 209 (T-478 step 6): END endsType 42 BUY SLAVES / 48 BUY ANIMALS carries its line id and makes the buyer's game open its own buying window, and MSG_HIRE carries join types 42 / 48 (the buying confirm asks each row's owner game; an older game refuses those join types as a bad field). 213 (merge of T-478 step 6 (209) with main's T-1242 (211); 212 is held by effort/t1122a): both sides' wire changes */
+const unsigned int kProtocolVersion = 227;   /* 227 (T-1318 attempt 2, design D3; on top of main's 226, T-1122 attempt 3): a world squad is handed to another game whole or not at all - the XFER's reason word bit 0x200 and the RELEASE's flags bit 8 say "world squad - whole or none"; every forced XFER and every RELEASE offer carries it and the receiver takes all of the squad's people or none (an older game reads the XFER's word as an unknown bit and refuses the RELEASE's flags as malformed). 226 (T-1122 attempt 3): RAID_END carries a u8 endedBy after its phase - the engine's ending handler that really ran on the borrower's copy (0 none, 1 'has ended', 2 'defeated'), which the lender then runs on its own campaign so the raid's follow-up queues there, and (fold 1) an i32 defeatByte - the copy's campaign +0x3C byte when its 'defeated' ran, which picks that handler's follow-up (an older game refuses the longer RAID_END as malformed, and this game refuses the shorter one). 225 (T-1333): a HIT ask may name a TOWN wall by its position key (or a town building's door by index), asked of the holder of its area, and a HIT repair ask may name a wall (door -1) - an older game answers such an ask 'gone' or refuses it as malformed. 224 (T-1122 lent flag): the XFER's reason word bit 0x100 and the RELEASE's flags bit 4 say "lent squad - whole or none" on the hand-over message itself - the receiver judges the squad whole from the message, not only from its raid block (AWAKE), which may be dropped (an older game reads the XFER's word as an unknown reason and refuses the RELEASE's flags as malformed). 223 (T-1131): MSG_CRIME kind 3 CAUGHT - a lost caught roll whose watcher is a copy is sent to the watcher's owner, which raises the watcher's event there; the thief's game no longer runs the copy's own reaction (an older game would refuse kind 3 as a bad kind and the reaction would be lost). 222 (T-860): BOX_LOCK kinds 3 CAGE / 4 CAGE_QUERY - a cage's lock change, or a question for its first record, asked of the holder of the cage's area (src/common/cagerec.h, boxrec.h kBlmCage); an older game refuses the kinds as malformed, and the prisoner road no longer sends a cage's lock word (an older game would wait for it). 221 (T-1122's lend / return by reference, 218 / 219) after main's 220 (T-1262's burn) and 217 (T-1260): both sides' wire changes. 219 (T-1122 lend by reference; 216 / 217 are taken on other branches, 218 is this branch's RETURN by reference): RAID_LEND's sleeping LEND names the world record its lender wrote at the lend (world id, writtenAt, writer slot) instead of the squad's bytes (96-98 KB in run T2116, over the 60000 cap - no sleeping lend ever went), every RETURN is form 1 (form 0, the bytes, is refused), a new kind 8 KEEPOWN (the borrower's put-away could not write the copy's world record: the lender resumes its own squad - it said DIED before, which removed a living squad) and REFUSED why 8 (the named record did not come), and (T-1122 review folds, still 219 - unmerged) kind 9 WITHDRAWN (the lender's answer to a TAKEN / RETURN naming a serial it has not open: the borrower removes its copy) and KEEPOWN after a RETURN whose write the world server refused: an older game reads the new LEND as malformed. 218 (T-1122 RETURN by reference; 216 / 217 are taken on other branches): RAID_LEND RETURN carries a form byte - the awake lend's RETURN names the world record its holder's sleep save wrote at the put-away (world id, writtenAt, writer slot, spot) instead of the squad's bytes (106 KB in run T2103, over the 64 KB road); the sleeping lend's RETURN keeps its bytes as form 0 (an older game refuses the new layout as malformed). 215 (T-1122 awake hand, owner 1524): RAID_LEND kind 7 AWAKE - an awake raid squad's raid block, sent before its ordinary hand-over (an older game refuses the kind as malformed). The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02). 195 (T-1205): STATE's latch bits 21-22 (god mode) and a "whole" limb now grows a copy's lost limb back (194 is taken by unmerged effort/t858a). 197 (T-858, main): END's unrun list and reason TALKER_CLOSED. 199 (T-478 step 3; 198 is taken by unmerged effort/t1214a, t930a, t947a): END carries the line id after endsType (before T-858's optional unrun list), and endsType 43 BAIL makes the talker's game open its own bail window. 201 (merge of T-930 / T-947 with main's 199; 200 is held by unmerged effort/t1122a): T-930: the new MAP_DOTS inner type 206 - teammates' characters on the world map, src/common/mapdots.h (196 and 197 are held by unmerged effort/t478b and effort/t858a). 203 (T-1214 design D1; 200-202 are taken by unmerged effort/t1122a, t947a, t478c; 201 then by main's T-930 / T-947): ITEM_MOVE op 0 carries the SPT1 building item spot block, and a game that is not the area's ground holder withholds its spot roll and gives the holder's item to the spot. 204 (T-23; 202 / 203 held by other efforts): a piece placed in a teammate's outpost or house travels in its piece record (a hand-over seed naming the owner) - the hand-over PLACE and HAND_ACK are gone - and help work goes to the piece's writer (the owner while its game has the area loaded, else the area's holder). 207 (T-1061; 205 is retired, 206 is held by another effort): BOX_LOCK (85) - a chest's pick asked of the box's writer, or its NO; a box record may carry its lock block (world-server protocol 145). 208 (T-478 step 5): END endsType 41 SELL SLAVES carries its line id and makes the talker's game open its own selling window (an older talker's game would read 41 as no window and close the talk silently). 211 (T-1242; 209 / 210 are held by effort/t478e / effort/t1122a): RESEARCH_BOOK (88) - a research's Books in a teammate's bench asked of that teammate's game, its answer, give back and done (src/common/bookshare.h). 209 (T-478 step 6): END endsType 42 BUY SLAVES / 48 BUY ANIMALS carries its line id and makes the buyer's game open its own buying window, and MSG_HIRE carries join types 42 / 48 (the buying confirm asks each row's owner game; an older game refuses those join types as a bad field). 213 (merge of T-478 step 6 (209) with main's T-1242 (211); 212 is held by effort/t1122a): both sides' wire changes. 216 (T-1262; 215 is held by unmerged effort/t1122a - whichever of the two merges second re-checks the number): MSG_EFFECT kind 7 BURN - a body burned in a corpse furnace on a game that does not run it is asked of its owner (an older game would refuse kind 7 as a bad kind), and 'incinerated or cooked' is a final end on every game (DESPAWN, never UNLOAD). 217 (T-1260; 215 / 216 are held by unmerged effort/t1122a / effort/t1262a - whichever merges later re-checks this number): every ITEM_REQUEST carries the 'STK1' block just before its ASK1 trailer - a player's screen take (right-click or mouse pickup) of an item another game writes, which that game checks with Inventory::deathCheck on its own item before it takes it out (src/common/screentake.h); an older game would refuse the request as cut. 220 (merge of T-1262 (216) with main's T-1260 (217); 218 / 219 are held by effort/t1122a): both sides' wire changes */
+typedef char ScreenTakeProtocolAgrees[(kProtocolVersion >= coopstake::kGameProtocolScreenTake) ? 1 : -1];   /* T-1260: the STK1 block */
 typedef char BoxLockProtocolAgrees[(kProtocolVersion >= coopbrec::kGameProtocolBoxLock) ? 1 : -1];   /* T-1061: BOX_LOCK */
+typedef char RaidLendWireNumber[(raidsq::kMsgRaidLend == (unsigned int)MSG_RAID_LEND) ? 1 : -1];
+typedef char RaidEndWireNumber[(raidsq::kMsgRaidEnd == (unsigned int)MSG_RAID_END) ? 1 : -1];   /* T-1122 redesign (b) */
 typedef char ResearchBookProtocolAgrees[(kProtocolVersion >= bookshare::kGameProtocolBooks && (unsigned int)MSG_RESEARCH_BOOK == bookshare::kMsgResearchBook) ? 1 : -1];   /* T-1242 */
 typedef char PieceFeedProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolRecordFeed) ? 1 : -1];   /* PLACE / STATE / REMOVE / ROSTER_REQUEST are no longer sent */
 typedef char PieceLiveBarProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveBar) ? 1 : -1];   /* T-1047 step 2b (175): a player's power piece's production bar and work state ride its record's LIVE part - no MINE_STATE for it */
@@ -889,6 +895,13 @@ void OnSpawn(const Message& m)
     // on the map being right from the object's first frame, not from the next message.
     g_owner[sm.uid] = OwnerKeyOf(m.peer);   /* M5b: the owning PLAYER, by its slot when known */
     g_departedPending.erase(sm.uid);   /* M8: a claim made after a departure supersedes it - no road removes this row for that departure */
+    /* lever1 TEST-ONLY: the owner's `spawn` lever made this character - marked before the copy is made, so the copy's [M1] spawned
+       line says lever-made and `spawned:<Template>` / `made:<label>` count it here (levermade.h); a wild or taken-over one never */
+    if (sm.leverMade) coop::LeverMarkMade(sm.uid, std::string());
+    /* T-1262: a body burned here in a corpse furnace whose owner has not removed it yet - its re-send or catch-up copy is not built
+       (the owner record above stays: its DESPAWN closes the burn pending, its REFUSED answer books the lost copy). Review fold 2: the
+       request is sent again (its owner still runs the body), up to a cap a row; past it the row closes and the lost copy is booked */
+    if (coop::EffectBurnHoldSpawn(sm.uid)) return;
 
     std::ostringstream ageText; ageText.imbue(std::locale::classic()); ageText << sm.age;
     SW_QUIETLOG(g_qNetSpawn, "[net] <- SPAWN", 0, 0, "[net] <- SPAWN uid=" + N(sm.uid) + " '" + sm.templateName + "' (owner peer " + N(m.peer) + ")"
@@ -896,7 +909,8 @@ void OnSpawn(const Message& m)
              + "' keepContainer=" + N(sm.keepContainer ? 1 : 0)
              + " age=" + (sm.ageAbsent ? std::string("<absent>") : ageText.str()) + (sm.ageClamped ? " (clamped)" : "")
              + " dead=" + (sm.flagsAbsent ? std::string("<absent>") : N((sm.ownerFlags & coopspawn::kSpawnFlagDead) != 0 ? 1 : 0))
-             + " ko=" + (sm.flagsAbsent ? std::string("<absent>") : N((sm.ownerFlags & coopspawn::kSpawnFlagKo) != 0 ? 1 : 0)));   /* T-303 */
+             + " ko=" + (sm.flagsAbsent ? std::string("<absent>") : N((sm.ownerFlags & coopspawn::kSpawnFlagKo) != 0 ? 1 : 0))   /* T-303 */
+             + (sm.leverMade ? std::string(" lever-made") : std::string()));   /* lever1 TEST-ONLY */
     /* a copy this game's engine would not keep at the SPAWN's spot is not made (that engine would put it away 4 s later): the owner
        record above stays, the uid is booked in the lost-copy book at the spot, and its owner is asked for it when the spot is kept here;
        its later MOVEs move the booked spot (ApplyRemoteMove -> LostCopyMove), its owner's UNLOAD / DESPAWN forgets the row */
@@ -954,6 +968,7 @@ void OnState(const Message& m)
     // POSE (read-poses, 50): the owner's in-place pose; PoseApplyTick acts on it. An absent block changes nothing.
     // BED1 (51): a bed pose also carries the outer building's key (sm.pose.outerKey), empty when the bed is not layout furniture.
     if (!sm.poseAbsent) coop::NotePoseWant(uid, sm.pose, m.peer);
+    coop::ActOwedOnOwnerState(uid, sm.poseAbsent ? -1 : (int)sm.pose.kind, carryingUid, dead != 0);   /* T-860: the owner's real state judges acts owed on this copy */
 
     // T040/T041, flagged by two different executors: there was NO receive line for STATE,
     // so "the peer got it" rested entirely on counter reconciliation. A counter can only say
@@ -1184,6 +1199,7 @@ void OnDespawn(const Message& m)
         return;
     }
     DebugLog("[net] <- DESPAWN uid=" + N(uid));
+    coop::EffectBurnOwnerDespawned(uid);   /* T-1262: a body burned here - its owner ended it; the burn is not pending any more */
     coop::SquadIdxOwnerWithdrew(uid, 0);   /* M7a A1 build 2 [a1b2-sp1] (design 2.3): its recorded owner says it died - out of the squad index's given */
     coop::ApplyRemoteDespawn(uid);
     coop::TalkCursorForgetNpc(uid);   /* T-737: its talk-cursor answers go with the copy */
@@ -1378,6 +1394,9 @@ unsigned int CopyGenOf(unsigned int uid) { return CopyGenHere(uid); }
 unsigned int GenForTake(unsigned int uid, unsigned int giverGen) { const unsigned int c = CopyGenHere(uid); return (giverGen > c ? giverGen : c) + 1u; }
 int PeerSlotOfKey(unsigned int key) { const unsigned int k = OwnerKeyOf(key); return cooplive::IsRelayPeer(k) ? (int)cooplive::RelayPeerSlot(k) : -1; }
 int OwnerSlotOf(unsigned int uid) { std::map<unsigned int, unsigned int>::const_iterator o = g_owner.find(uid); return o == g_owner.end() ? -1 : PeerSlotOfKey(o->second); }
+/* T-1318 a5 fold 1 (review LOW): uid's recorded owner as a PLAYER slot - the squad index's given hands' source (PlayerSlotOfKey, with its
+   link-slot fallback); -2 = no owner record */
+int OwnerPlayerSlotOf(unsigned int uid) { std::map<unsigned int, unsigned int>::const_iterator o = g_owner.find(uid); return o == g_owner.end() ? -2 : PlayerSlotOfKey(o->second); }
 
 static bool CharRoadOpen();   /* the character stream's road is open: the session link or the world road (defined with the stream) */
 bool NextOwnedUid(unsigned int* out)
@@ -2780,11 +2799,11 @@ void OnReleaseAck(const Message& m)
 /* M7a A1 build 1 [a1b1-sp31] (design 1.3 [review F11], protocol 118): + count x u32 gen (the giver's; the taker holds gen + 1), and the
    road is WorldFirstRoute to the TARGET SLOT (LIVE SLOT; the session link only while the notebook link is down). No slot: not sent. */
 typedef char A1XferMemberIs48[(sizeof(XferMember) == cooplo::kXferMemberSize) ? 1 : -1];
-bool SendXfer(unsigned int leader, unsigned int reason, const XferMember* members, int count, int targetSlot)
+bool SendXfer(unsigned int leader, unsigned int reason, const XferMember* members, int count, int targetSlot, int wholeBits)
 {
     if (count <= 0 || count > 64) return false;
     if (targetSlot < 0) { ++g_xferNoSlot; return false; }
-    std::vector<char> b; PutU32(&b, leader); PutU32(&b, reason); PutU32(&b, (unsigned int)count);
+    std::vector<char> b; PutU32(&b, leader); PutU32(&b, cooplo::XferReasonWord(reason, wholeBits)); PutU32(&b, (unsigned int)count);   /* T-1122 lent flag (protocol 224); T-1318 attempt 2: the world bit (226) */
     size_t at = b.size(); b.resize(at + (size_t)count * sizeof(XferMember)); std::memcpy(&b[at], members, (size_t)count * sizeof(XferMember));
     for (int i = 0; i < count; ++i) PutU32(&b, MineGenOf(members[i].uid));
     return SendToSlot(targetSlot, MSG_XFER, b);
@@ -2797,16 +2816,20 @@ void OnXfer(const Message& m)
     std::vector<XferMember> mem(n); std::memcpy(&mem[0], &m.payload[12], (size_t)n * sizeof(XferMember));
     std::vector<unsigned int> gens(n);   /* M7a A1 build 1 [a1b1-sp32]: the giver's gen per member */
     for (unsigned int i = 0; i < n; ++i) GetU32(m.payload, cooplo::XferGenAt(n) + (size_t)i * 4, &gens[i]);
-    coop::ApplyRemoteXfer(leader, forced, &mem[0], (int)n, m.peer, &gens[0]);   /* protocol 84: the u32 is the reason code */
+    unsigned int reason = 0; int wholeBits = 0;   /* T-1122 lent flag (protocol 224) and T-1318 attempt 2's world bit (226): the reason code and the "whole or none" bits (cooplo::kWholeBitLent / kWholeBitWorld) */
+    if (!cooplo::XferReasonSplit(forced, &reason, &wholeBits)) { ErrorLog("[net] malformed XFER (reason word " + N(forced) + ": an unknown bit) - ignored"); return; }
+    coop::ApplyRemoteXfer(leader, reason, &mem[0], (int)n, m.peer, &gens[0], wholeBits);   /* protocol 84: the u32 is the reason code */
 }
 /* M7a A1 build 1 [a1b1-sp33]: back to the XFER's sender by slot (WorldFirstRoute); a session peer with no slot yet is answered on the
    session link, as before. Fold 1 [a1b1f1-sp2] [F1] (cooplo::XferAckRoad): an XFER that came on the session link is answered on it while
    it is up (one-sided outage: by slot the ACK would go to a world server that cannot deliver it, the giver re-owes and two games run
    the person); a slot with no road goes on the session link when that is up and the slot is the session peer's. */
-bool SendXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int toPeer)
+bool SendXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int toPeer, const unsigned int* notInGroup, int notInGroupCount)
 {
     std::vector<char> b; PutU32(&b, leader); PutU32(&b, (unsigned int)count);
     for (int i = 0; i < count; ++i) PutU32(&b, takenUids[i]);
+    if (notInGroup != 0 && notInGroupCount > 0)   /* T-1239: the tail, only when there is one (an older reader stops at the uid list) */
+    { PutU32(&b, (unsigned int)notInGroupCount); for (int i = 0; i < notInGroupCount; ++i) PutU32(&b, notInGroup[i]); }
     const int slot = PeerSlotOfKey(toPeer);
     const cooplo::Road rs = RoadToSlot(slot);
     const int road = cooplo::XferAckRoad(g_dispCameBySession, cooplive::IsRelayPeer(toPeer) ? 1 : 0, slot, rs.road, SessionUpNow() ? 1 : 0, coop::LinkPeerSlot());
@@ -2822,7 +2845,13 @@ void OnXferAck(const Message& m)
     if (n > 256 || m.payload.size() < 8 + n * 4) { ErrorLog("[net] malformed XFER_ACK (uid list) - ignored"); return; }
     std::vector<unsigned int> uids(n);
     for (unsigned int i = 0; i < n; ++i) GetU32(m.payload, 8 + i * 4, &uids[i]);
-    coop::ApplyRemoteXferAck(leader, n ? &uids[0] : 0, (int)n, m.peer);
+    /* T-1239: the optional tail - members refused as not in the leader's group on the answering game (absent: none) */
+    std::vector<unsigned int> out; unsigned int k = 0;
+    const size_t tail = 8 + (size_t)n * 4;
+    if (m.payload.size() >= tail + 4 && GetU32(m.payload, tail, &k) && k <= 256 && m.payload.size() >= tail + 4 + (size_t)k * 4)
+    { out.resize(k); for (unsigned int i = 0; i < k; ++i) GetU32(m.payload, tail + 4 + i * 4, &out[i]); }
+    else if (m.payload.size() > tail) ErrorLog("[net] XFER_ACK tail malformed - read as none");
+    coop::ApplyRemoteXferAck(leader, n ? &uids[0] : 0, (int)n, m.peer, out.empty() ? 0 : &out[0], (int)out.size());
 }
 /* T-1 B1 restructure (protocol 85) - MSG_SQUAD_LEAD. Reliable: sent by handoff.cpp's 1-Hz pass (first sight, change, new link, n = 0
    when this game runs no member of the squad any more). */
@@ -3685,6 +3714,8 @@ bool SendItemRequest(const coop::ItemRequestMsg& r)
     /* P105 build 2 (protocol 126): a HOLD / LAND's 'HLD1' trailer, last but for the ASK1 trailer every request ends with (announced by the dir byte) */
     if (r.dir == coophold::kDirHold || r.dir == coophold::kDirLand)
     { coophold::HoldTail ht; ht.holdId = r.holdId; ht.how = r.holdHow; ht.slot = r.holdSlot; coophold::PutHoldTail(&b, ht); }
+    /* T-1260 (game protocol 217): the 'STK1' block just before the ASK1 trailer - 1 = a player's screen take, checked by the owner */
+    coopstake::PutTail(&b, r.screenTake);
     /* game protocol 180: every request ends with its 'ASK1' trailer, after the HLD1 one - a journalled ask's id for the box's ledger */
     { coopbrec::AskTail at; at.askId = r.askId; at.slot = r.askSlot; at.carry = r.askCarry; coopbrec::PutAskTail(&b, at); }
     /* M7b slice 2: a character's request to its OWNER (the owner table); a box's, a shop's or the ground's to the WRITER of its key
@@ -3824,6 +3855,29 @@ bool SendItemHandover(int kind, unsigned int asker, unsigned int reqId, unsigned
     std::vector<char> b;
     if (hovrec::EncodeMsg(hm, &b) == 0) return false;
     return ItemSendTo(MSG_ITEM_HANDOVER, toSlot, &b[0], b.size(), 0u, 0);
+}
+
+/* T-1122 build: MSG_RAID_LEND (86) - one raid lend's message to one player by slot (src/common/raidsquad.h). RELIABLE; false = no road to
+   that player now (the lender asks again while the link is up; the borrower's one-shot RETURN / DIED is said again at the lender's
+   status ask). */
+bool SendRaidLend(const std::vector<char>& body, int toSlot)
+{
+    if (toSlot < 0 || body.empty() || CharRoadNow() == cooplive::kCharRoadNone) return false;
+    return ItemSendTo(MSG_RAID_LEND, toSlot, &body[0], body.size(), 0u, 0);
+}
+/* T-1122 awake hand (owner 1524): MSG_RAID_LEND kind AWAKE on the road XFER and RELEASE take (SendToSlot - WorldFirstRoute), so it reaches
+   the receiver before the hand-over message sent after it on that road. RELIABLE; false = no road now. */
+bool SendRaidLendSlotRoad(const std::vector<char>& body, int toSlot)
+{
+    if (toSlot < 0 || body.empty()) return false;
+    return SendToSlot(toSlot, MSG_RAID_LEND, body);
+}
+/* T-1122 redesign (b): MSG_RAID_END (87) - the borrower's raid campaign for a lent copy ended, to the lender by slot (an encoded
+   raidsq::RaidEndMsg). RELIABLE; false = no road to that player now (the lender's own peer-gone / status-ask endings still apply). */
+bool SendRaidEnd(const std::vector<char>& body, int toSlot)
+{
+    if (toSlot < 0 || body.empty() || CharRoadNow() == cooplive::kCharRoadNone) return false;
+    return ItemSendTo(MSG_RAID_END, toSlot, &body[0], body.size(), 0u, 0);
 }
 
 /* M7b slice 4 (C3) + DOOR_STATE (C4) - T-197; protocol 121. THE SIDE MESSAGES ON THE CHARACTER STREAM'S ROAD (ownerroute.h
@@ -3978,6 +4032,23 @@ int SendCrimeToOwner(unsigned int uid, const coopcrime::CrimeState& s)
     if (SideSendToOwnerOf(MSG_CRIME, uid, &b[0], b.size(), &to, &why)) return 1;
     return (to == cooplive::kAddrOwnerNone) ? -1 : 0;
 }
+/* T-1131 kind 3: by slot to the WATCHER's owner (the thief's crime rides in the kind-0 fields) */
+int SendCrimeCaught(unsigned int thiefUid, const coopcrime::CrimeState& s, const coopcrime::CrimeCaught& c)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return 0;
+    std::vector<char> b;
+    if (!coopcrime::EncodeCrimeCaught(&b, thiefUid, s, c)) return -1;
+    int to = cooplive::kAddrOwnerUnknown, why = cooplive::kAddrWhyOk;
+    if (SideSendToOwnerOf(MSG_CRIME, c.watcherUid, &b[0], b.size(), &to, &why)) return 1;
+    return (to == cooplive::kAddrOwnerNone) ? -1 : 0;
+}
+/* T-1131: a road to this uid's owner now - the character stream's road is open and another game is on record as its owner */
+bool CaughtRouteOpen(unsigned int uid)
+{
+    if (uid == 0 || CharRoadNow() == cooplive::kCharRoadNone) return false;
+    std::map<unsigned int, unsigned int>::const_iterator own = g_owner.find(uid);
+    return own != g_owner.end() && g_localOwned.find(uid) == g_localOwned.end();
+}
 /* kind 2: by slot to the player whose stand-in the event named */
 int SendCrimeRelEvent(const coopcrime::CrimeRelEvent& e, int toSlot)
 {
@@ -3998,8 +4069,9 @@ void OnCrime(const Message& m)
     coopcrime::CrimeState s;
     unsigned char kind = coopcrime::kCrimeKindState;
     coopcrime::CrimeRelEvent rel;
+    coopcrime::CrimeCaught caught;
     const int r = m.payload.empty() ? coopcrime::kCrimeDecodeTooShort
-                                    : coopcrime::DecodeCrimeMsg(&m.payload[0], m.payload.size(), &uid, &s, &kind, &rel);
+                                    : coopcrime::DecodeCrimeMsg(&m.payload[0], m.payload.size(), &uid, &s, &kind, &rel, &caught);
     if (r != coopcrime::kCrimeDecodeOk)
     {
         coop::CrimeNoteMalformed();
@@ -4008,6 +4080,7 @@ void OnCrime(const Message& m)
     }
     if (kind == coopcrime::kCrimeKindCopyWrite) { coop::ApplyRemoteCopyWrite(uid, s, m.peer); return; }   /* a copy's crime, to us the owner */
     if (kind == coopcrime::kCrimeKindRelEvent) { coop::ApplyRemoteRelEvent(rel, m.peer); return; }       /* a standing event against our player */
+    if (kind == coopcrime::kCrimeKindCaught) { coop::ApplyRemoteCaught(uid, s, caught, m.peer); return; }   /* T-1131: our watcher caught a thief on another game */
     coop::ApplyRemoteCrime(uid, s, m.peer);
 }
 
@@ -4072,6 +4145,7 @@ bool SendPrison(const cooprison::PrisonMsg& m, unsigned int askerPeer)
 {
     std::vector<char> b;
     if (!cooprison::EncodePrison(&b, m)) return true;   /* not encodable: dropped, never retried forever */
+    coop::ActOwedNotePrison(m);   /* T-860 (owner 1551 a): an act on another game's character is owed until its owner shows it */
     /* M7b slice 1: REFUSED and BED REFUSED answer the game that asked; IN, RELEASE, DEATH and BED IN go to the character's owner */
     if (m.kind == cooprison::kPrisonRefused || m.kind == cooprison::kPrisonBedRefused) return ReplyTo(askerPeer, MSG_PRISON, &b[0], b.size());
     /* T-980: JOIN NO answers the prisoner's owner that asked; JOIN ASK goes to the game that runs the freer (the prisoner is the
@@ -4396,12 +4470,18 @@ static int EffectSendOn(int road, unsigned int key, const std::vector<char>& b)
         return g_transport->Send(0, MSG_EFFECT, &b[0], b.size(), CH_RELIABLE) ? road : 0;
     return 0;
 }
+static int EffectRequestRoadTo(unsigned int targetUid, unsigned int* key)   /* the request's road to the target's owner; 0 none (no owner record, no road) */
+{
+    if (!UidOwnerPeer(targetUid, key)) return 0;
+    const bool sessUp = g_transport != 0 && g_transport->State() == LINK_UP;
+    return cooffect::EffectRequestRoad(coop::StoreLiveReady(), sessUp, *key, coop::LinkPeerSlot(), SessionPeerRelayOk());
+}
+int EffectRequestRoadNow(unsigned int targetUid) { unsigned int key = 0; return EffectRequestRoadTo(targetUid, &key); }   /* T-1262 review fold 1 */
 int SendEffectRequest(unsigned int targetUid, const std::vector<char>& b)
 {
     unsigned int key = 0;
-    if (!UidOwnerPeer(targetUid, &key)) return 0;
-    const bool sessUp = g_transport != 0 && g_transport->State() == LINK_UP;
-    return EffectSendOn(cooffect::EffectRequestRoad(coop::StoreLiveReady(), sessUp, key, coop::LinkPeerSlot(), SessionPeerRelayOk()), key, b);
+    const int road = EffectRequestRoadTo(targetUid, &key);
+    return road == 0 ? 0 : EffectSendOn(road, key, b);
 }
 int SendEffectAnswer(unsigned int toKey, bool viaRelay, const std::vector<char>& b)
 {
@@ -4605,6 +4685,7 @@ static bool LostLook(size_t i, bool tick = false)
 {
     unsigned int key = 0, recordKey = 0;
     const unsigned int uid = g_lost.rows[i].uid;
+    if (coop::EffectBurnPending(uid)) return false;   /* T-1262: burned here, its owner's removal awaited - no RESEND ask */
     const bool recordKnown = UidOwnerPeer(uid, &recordKey);
     /* the owner record when there is one; a row booked from a held MOVE (no record: its SPAWN never came) asks the game that streams it */
     const bool ownerKnown = lostcopy::LostRowOwner(recordKnown ? 1 : 0, recordKey, g_lost.rows[i].ownerFromMove, g_lost.rows[i].ownerKey, &key) != 0;
@@ -4672,6 +4753,7 @@ static void LostBookUid(unsigned int uid, bool hasPos, float x, float y, float z
 {
     unsigned int key = 0;
     if (uid == 0) return;
+    if (coop::EffectBurnHoldsLost(uid)) return;   /* T-1262: burned here, its owner's removal awaited - not lost */
     if (LostCopyHereNow(uid)) return;   /* the uid table holds a live copy (one made this frame too): nothing is lost */
     bool known = UidOwnerPeer(uid, &key);
     const bool fromMove = !known && moveKey != 0;
@@ -5352,7 +5434,7 @@ bool SendShopCancelAnswer(unsigned int id, unsigned int epoch, unsigned int toKe
 static unsigned int ItemMsgId(const Message& m) { unsigned int id = 0; return GetU32(m.payload, 0, &id) ? id : 0u; }
 // E22b - MSG_ITEM_REQUEST: the peer touched an inventory it does not own and is asking US, the owner, to make
 // the move. Refused whole on any malformed field: a half-read request would name a slot nobody can name.
-static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail, int hdDir, const coopbrec::AskTail& ask)
+static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail, int hdDir, const coopbrec::AskTail& ask, int screenTake)
 {
     coop::ItemRequestMsg r;
     size_t at = 0;
@@ -5463,6 +5545,7 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
     }
     if (hdTail != 0) { r.dir = hdDir; r.holdId = hdTail->holdId; r.holdHow = hdTail->how; r.holdSlot = hdTail->slot; }   /* P105 build 2 */
     r.askId = ask.askId; r.askSlot = ask.slot; r.askCarry = ask.carry;   /* game protocol 180: the ASK1 trailer */
+    r.screenTake = (screenTake != 0 && (r.dir == 0 || r.dir == coophold::kDirHold)) ? 1 : 0;   /* T-1260 (217): a TAKE's or a HOLD's only */
     coop::ApplyItemRequest(r, m.peer);
 }
 /* P105 build 2 (protocol 126): dir 2 HOLD / 3 LAND end with the 'HLD1' trailer (coophold) - read off the end, the rest read as a
@@ -5476,6 +5559,11 @@ void OnItemRequest(const Message& m0)
     { ErrorLog("[net] ITEM_REQUEST without a whole 'ASK1' trailer - REFUSED"); coop::ItemRequestRefusedHere(ItemMsgId(m0), m0.peer); return; }
     Message m = m0;
     m.payload.resize(m.payload.size() - askLen);
+    /* T-1260 (game protocol 217): the 'STK1' block just before the ASK1 trailer - none, or a flag word this build does not know: REFUSED */
+    int screenTake = 0;
+    if (m.payload.empty() || !coopstake::TakeTail(&m.payload[0], m.payload.size(), &screenTake))
+    { ErrorLog("[net] ITEM_REQUEST without a whole 'STK1' block before its ASK1 trailer - REFUSED"); coop::ItemRequestRefusedHere(ItemMsgId(m0), m0.peer); return; }
+    m.payload.resize(m.payload.size() - coopstake::kTailLen);
     if (m.payload.size() >= 5 && ((unsigned char)m.payload[4] == coophold::kDirHold || (unsigned char)m.payload[4] == coophold::kDirLand))
     {
         coophold::HoldTail ht;
@@ -5486,10 +5574,10 @@ void OnItemRequest(const Message& m0)
         c.payload.resize(c.payload.size() - coophold::kHoldTailLen);
         if (c.payload.size() < 5) { ErrorLog("[net] malformed ITEM_REQUEST (nothing before its HLD1 block) - REFUSED"); coop::ItemRequestRefusedHere(ItemMsgId(m), m.peer); return; }
         c.payload[4] = 0;
-        OnItemRequestBody(c, &ht, dir, ask);
+        OnItemRequestBody(c, &ht, dir, ask, screenTake);
         return;
     }
-    OnItemRequestBody(m, 0, 0, ask);
+    OnItemRequestBody(m, 0, 0, ask, screenTake);
 }
 
 // E22b-2 (P6b) - MSG_ITEM_PLACED: the taker's answer about a TAKE we granted (0 / 1), or a giver's 'give done' (2,
@@ -5501,6 +5589,19 @@ void OnItemPlaced(const Message& m)
     if (!GetU32(m.payload, 0, &id) || m.payload.size() < 5) { ErrorLog("[net] malformed ITEM_PLACED (too short) - REFUSED"); return; }
     const int ok = (int)(unsigned char)m.payload[4];
     coop::ApplyItemPlaced(id, ok, m.peer);
+}
+
+/* T-1122 build - MSG_RAID_LEND: decoded and checked whole in coop::ApplyRaidLend (store.cpp) */
+void OnRaidLend(const Message& m)
+{
+    if (m.payload.empty()) { ErrorLog("[net] malformed RAID_LEND (empty) - REFUSED"); return; }
+    coop::ApplyRaidLend(&m.payload[0], m.payload.size(), m.peer);
+}
+/* T-1122 redesign (b) - MSG_RAID_END: decoded and checked whole in coop::ApplyRaidEnd (store.cpp) */
+void OnRaidEnd(const Message& m)
+{
+    if (m.payload.empty()) { ErrorLog("[net] malformed RAID_END (empty) - REFUSED"); return; }
+    coop::ApplyRaidEnd(&m.payload[0], m.payload.size(), m.peer);
 }
 
 /* T-889 step 2 - MSG_ITEM_HANDOVER: refused whole unless it is exactly the 14-byte body with a known kind and value (coop::ApplyItemHandover). */
@@ -5726,7 +5827,10 @@ bool SendSpawn(unsigned int uid, const std::string& templateName, float x, float
     /* T-303 (protocol 102): the character's dead / knocked-out state rides the SPAWN, read now, so every announce - creation,
        adoption, link-up, reload, a rejoin - creates the copy as the character is here (a corpse is never announced standing). */
     const unsigned int spawnFlags = coop::SpawnOwnerFlags(character);
-    coopspawn::AppendSpawnFlags(&b, spawnFlags);
+    /* lever1 TEST-ONLY: a character the `spawn` lever made carries kSpawnFlagLeverMade in the same byte (a spare bit an older build
+       ignores), so the other game counts its copy for `spawned:<Template>` / `made:<label>` (levermade.h); every re-announce too */
+    const bool leverMade = coop::LeverIsMade(uid);
+    coopspawn::AppendSpawnFlags(&b, spawnFlags | (leverMade ? coopspawn::kSpawnFlagLeverMade : 0u));
     /* T-922 (protocol 172): the template's stringID follows (templatekey.h); "" = none, the receiver then uses the shown name */
     const std::string tmplSid = coop::TemplateSidOf(character);
     coopspawn::AppendSpawnTemplateSid(&b, tmplSid);
@@ -5751,6 +5855,7 @@ bool SendSpawn(unsigned int uid, const std::string& templateName, float x, float
              + (clampedOut ? " (clamped)" : "")
              + " dead=" + N((spawnFlags & coopspawn::kSpawnFlagDead) != 0 ? 1 : 0)
              + " ko=" + N((spawnFlags & coopspawn::kSpawnFlagKo) != 0 ? 1 : 0)   /* T-303 */
+             + (leverMade ? " lever-made" : "")   /* lever1 TEST-ONLY */
              + (ok ? "" : " (SEND FAILED)"));
     return ok;
 }
@@ -6069,6 +6174,8 @@ void SessionDispatchOne(const Message& m)
     case MSG_ITEM_CONFIRM: OnItemConfirm(m); break;   /* E22b */
     case MSG_ITEM_PLACED:  OnItemPlaced(m);  break;   /* E22b-2 (P6b) - the rollback's ack */
     case MSG_ITEM_REVOKE:  OnItemRevoke(m);  break;   /* E22b-2 (P6b) - undo a give */
+    case MSG_RAID_END: OnRaidEnd(m); break;   /* T-1122 redesign (b): the borrower's raid campaign for a lent copy ended */
+    case MSG_RAID_LEND: OnRaidLend(m); break;   /* T-1122 build: a raid lend's LEND / TAKEN / REFUSED / RETURN / DIED / UNKNOWN */
     case MSG_ITEM_HANDOVER: OnItemHandover(m); break;   /* T-889 step 2: a hand-over line's QUERY / VERDICT / CLOSED */
     case MSG_PARITY_REQ:   OnParityReq(m);   break;   /* par1: the other game asks us, the holder, about its boxes */
     case MSG_PARITY_BOX:   OnParityBox(m);   break;   /* par1: the holder's answer for one of our boxes */
@@ -6304,6 +6411,9 @@ bool SessionPollAndQueue()
            drain runs it in the new world. Of those lost anyway, only IN (a caging) and TREAT are sent again by their sender until
            the owner's word shows them; RELEASE, BED IN and the lock requests are applied after the load and checked again by
            their handlers there. */
+        /* T-860 (OWNER DECISION 1551 a, 2026-11-07): kills stay dropped here and are NOT owed by their sender (spawn.cpp ActOwed*), while
+           a bed, a cage, a release, an opened restraint and a carry's end on an away player's character are: a relaunch rebuilds the
+           owner's world from records up to ~30 s old, and a kill landing on that world late is not the act the player saw. */
         if (m.type == MSG_PRISON && coop::EngineWritesBlocked() && !m.payload.empty()
             && cooprison::PrisonPayloadIsDeath(&m.payload[0], m.payload.size())) { coop::PrisonNoteDeathDroppedLoad(); continue; }
         coop::InQueueEnqueue((int)m.type, coop::kOriginSession, scope, cls, subject, m.peer, m.payload);

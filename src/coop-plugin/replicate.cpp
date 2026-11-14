@@ -29,6 +29,7 @@
 #include "../common/livechar.h"   /* DropPuppet: the reason a stored pointer is not written through */
 #include "stats.h"   // T-189 runboost: RunCeilingRead / RunCeilingWrite / RunCeilingRestore
 #include "zones.h"   // review-r2 item 7: IsPositionLoadedHere - the far snap never places a copy into an area this game has not loaded
+#include "../common/liverelay.h"   /* T-1178 fold 1: AnnounceSpotAtOrigin - an own spot at the world origin is not sent */
 #include "../common/stalecopy.h"   // a copy whose owner's target is in an area not loaded here is retired, not walked
 #include "ai_spike.h"
 #include "net/session.h"
@@ -71,6 +72,7 @@ static unsigned long long kMig3AiIsEnemy = 0; static coop::AddrReg kMig3AiIsEnem
 #include "../common/insidewire.h"   // P25 fold 2: the owner's INSIDE word - its staleness and send rules
 #include "../common/copyjudge.h"   // T-573: the judge held while the simulation is stopped; a given-up copy re-armed
 #include "../common/floorplace.h"   // T-424: a copy on another floor than its stopped owner is placed at the owner's height
+#include "../common/goalrefill.h"   // T-918: the take gives the character its default goal set back (Decide)
 #include <set>                    // mirror1: the once-per-uid refusal log
 #include <sstream>
 #include <locale>
@@ -883,6 +885,11 @@ long long g_velNonFinite   = 0;   // the arithmetic produced a non-number - a DE
 long long g_velTeleport    = 0;   // above kMaxPlausibleSpeed: a jump, not a walk
 long long g_velBadClock    = 0;   // non-positive elapsed time between samples
 long long g_velNoSampleSlot = 0;  // mirror index beyond the sample array - velocity unavailable
+/* T-1178 fold 1 (F-T2357-ORIGINSPOT): own spots read at the world origin and NOT sent - [0] the ~10 Hz MOVE pass, [1] the stop send
+   (FollowOwnerStopFrame); the first kMoveOriginLinesMax get a line (MoveSpotAtOrigin) */
+long long g_moveOriginHeld[2] = { 0, 0 };
+long long g_moveOriginLines = 0;
+const long long kMoveOriginLinesMax = 20;
 // Peer side:
 // FRAMES, not characters and not messages - these are per-frame per-puppet decisions, and F342
 // was written because a counter whose name did not carry its unit was read as the wrong quantity.
@@ -5286,14 +5293,167 @@ bool IntentResendOwned(unsigned int uid)
 }
 bool ReadAuthorityFacing(::Character* c, float* fx, float* fz) { return AuthorityFacing(c, fx, fz); }
 void PoseToolOffForOwnership(unsigned int uid, ::Character* c);   // T-890 review fold 1 (spawn.cpp)
+// T-918 fix attempt 1 (design A, 2026-11-07; fold 1) - THE DEFAULT GOAL SET BACK AFTER THE TAKE. Run T2159 (Confirmed): every
+// character this game took over had an EMPTY default goal set - the copy life empties it on purpose (ClearAttackOrder -> the engine's
+// dropGoals, which clears all five priority lists; T075's protection, unchanged) and nothing filled it again, so the tier-3 'Self
+// preservation' goal (TaskType 32) could never start and the character never fought back. When 32 is missing the engine's setupAI
+// fills the set as the engine's create fills a new character's (decomp_580ce0:633); a set that has 32 is never filled again.
+// FOLD 1 (review M1): setupAI ends with AI vt+0x30 (0x5A4050, updateStateBroadcast; for a slave it can add / remove job 0xBB), which
+// otherwise only the AI worker runs, every frame and ungated (F401), and a pulse's pass can start after any wait the take could do. So
+// the take only QUEUES the uid (GoalRefillQueue); the fill runs at the K2 safe point (combat.cpp detour_tsRagdollUpdates ->
+// GoalRefillSafePointDrain, MAIN THREAD, the AI worker paused), after a live re-check: still this game's own, the engine still knows
+// it, not dead, its AI and order system readable, still no goal 32. The take's own 20 ms waits are gone.
+// FOLD 1 (review M2, Read decomp_6210e0:55-129): setupAI picks the set by the character's faction ON THIS GAME: no player controller
+// (Faction +0x250 == 0) -> the race's 'AI Goals' package; a player faction -> goal 0xF3 (and, when vt+0x248 answers, the race package
+// and 0x103, 0xE6 removed). Another player's character taken here through UNLOAD or peer-gone is in its stand-in faction, never a
+// player faction, so it gets the NPC (race) set: no live fact selects the player branch without writing faction state, and this does
+// not write faction state. Its line says so: fac=player|npc and pc= (IsUidPlayerCharAnyThread). A hire / give take is filled at a
+// later safe point than the recruit's own faction change (0x5CB030 resets the set itself; the queued fill then finds 32 and keeps).
+// FOLD 1 (review L2 / L3 / L6): a fill that faults is tried again at the next safe point, at most goalrefill::kMaxTries; a fill that ran
+// and still has no 32 is not run again. A take is asked once and counted once. The decisions are src/common/goalrefill.h (offline suite).
+// Counted on [M2] REPORT goalRefill[asked,refilled,failed] and goalRefillMore[retried,kept,dropped,queueFull,queued]; one
+// `[M2] take uid=.. goalRefill ..` line per refill, failure or first retry (cap below; a keep or a drop is counted only).
+static unsigned long long kGoalSetupAI = 0; static coop::AddrReg kGoalSetupAI_reg("Character_setupAI", &kGoalSetupAI);   /* Steam_1.0.65 0x6210E0, 1.0.68 0x621B70 */   /* void (Character*) */
+static unsigned long long kGoalHasTask = 0; static coop::AddrReg kGoalHasTask_reg("OrdersReceiver_hasTaskOfType", &kGoalHasTask);   /* Steam_1.0.65 0x5069B0, 1.0.68 0x507440 */   /* bool (orders, int taskType) */
+typedef bool (*GoalHasTaskFn)(void* orders, int taskType);
+typedef void (*GoalSetupAIFn)(void* character);
+typedef void* (*GoalFactionFn)(void* character);
+const size_t kGoalOrdersOff = 0x20;                          // AI +0x20: the order system (InjectOrder's read)
+const size_t kGoalListCount = 0xA8, kGoalListStride = 0x18;  // the five priority lists' counts: orders +0xA8 + 0x18k (hasTaskOfType 0x5069B0 walks the same five; decomp_509f40)
+const size_t kGoalFactionSlot = 0x58;                        // Character vtable +0x58: its faction - the call setupAI makes (decomp_6210e0:69)
+const size_t kGoalFacPlayer = 0x250;                         // Faction +0x250: the player controller; 0 = not a player faction (decomp_6210e0:70)
+const long long kGoalRefillLineCap = 40;
+long long g_goalRefillAsked = 0, g_goalRefilled = 0, g_goalRefillFailed = 0, g_goalRefillLines = 0;
+long long g_goalRefillRetried = 0, g_goalRefillKept = 0, g_goalRefillDropped = 0, g_goalRefillQueueFull = 0, g_goalRefillQueued = 0;
+struct GoalRefillDue { unsigned int uid; int tries; };
+std::vector<GoalRefillDue> g_goalRefillQ;   // MAIN THREAD: the take -> the K2 safe point
+bool EngineWritesBlocked();   // store.h, the same namespace: a world loading or tearing down
+static int GoalHas32Pod(void* orders)   // 1 / 0, -1 not bound or faulted
+{
+    if (kGoalHasTask == 0) return -1;
+    __try { return ((GoalHasTaskFn)coop::AddrAbs(kGoalHasTask))(orders, goalrefill::kSelfPreservationType) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int GoalSetCountPod(const void* orders)   // the five lists' entries together, -1 faulted
+{
+    __try
+    {
+        int n = 0;
+        for (int k = 0; k < 5; ++k) n += (int)*(const unsigned int*)((const char*)orders + kGoalListCount + kGoalListStride * (size_t)k);
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static bool GoalSetupAIPod(void* c)   // false: not bound or faulted
+{
+    if (kGoalSetupAI == 0) return false;
+    __try { ((GoalSetupAIFn)coop::AddrAbs(kGoalSetupAI))(c); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static int GoalDiedPod(::Character* c)   // the engine's own hasDied: 1 / 0, -1 faulted
+{
+    __try { return c->hasDied() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int GoalFacPlayerPod(void* c)   // 1 a player faction (setupAI's player branch), 0 not (its race branch), -1 unreadable
+{
+    __try
+    {
+        const uintptr_t* vt = *(const uintptr_t* const*)c;
+        const char* f = (const char*)((GoalFactionFn)vt[kGoalFactionSlot / sizeof(uintptr_t)])(c);
+        if (f == 0) return -1;
+        return (*(void* const*)(f + kGoalFacPlayer) != 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static void* GoalOrdersOf(::Character* c)
+{
+    void* ai = GetCharacterAI(c);
+    if (!PlausibleObj(ai)) return 0;
+    void* orders = *(void**)((char*)ai + kGoalOrdersOff);
+    return PlausibleObj(orders) ? orders : 0;
+}
+// MAIN THREAD (every caller of UnpuppetForOwnership runs there). The uid is queued once; the K2 safe point fills it.
+static void GoalRefillQueue(unsigned int uid)
+{
+    bool present = false;
+    for (size_t i = 0; i < g_goalRefillQ.size(); ++i)
+        if (g_goalRefillQ[i].uid == uid) { present = true; break; }
+    const int q = goalrefill::QueueAdd(present, (unsigned int)g_goalRefillQ.size(), goalrefill::kQueueCap);
+    if (q == goalrefill::kQueueAdd)
+    {
+        GoalRefillDue d;
+        d.uid = uid; d.tries = 0;
+        g_goalRefillQ.push_back(d);
+        ++g_goalRefillQueued;
+    }
+    else if (q == goalrefill::kQueueFull) ++g_goalRefillQueueFull;
+}
+// K2 safe point (combat.cpp detour_tsRagdollUpdates), MAIN THREAD, the AI worker paused. See the block comment above.
+void GoalRefillSafePointDrain()
+{
+    if (g_goalRefillQ.empty() || EngineWritesBlocked()) return;   // a world loading or tearing down: the queue waits
+    std::vector<GoalRefillDue> q;
+    q.swap(g_goalRefillQ);
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        GoalRefillDue d = q[i];
+        ::Character* c = FindSpawned(d.uid);
+        const bool mine = net::IsUidMine(d.uid);
+        void* orders = 0;
+        if (mine && PlausibleObj(c) && !IsRetiredObject(c) && LiveCharacter(c) != 0 && GoalDiedPod(c) == 0)   /* the engine still knows it this frame */
+            orders = GoalOrdersOf(c);
+        const bool live = orders != 0;
+        const int has32 = live ? GoalHas32Pod(orders) : -1;
+        if (live && d.tries == 0) ++g_goalRefillAsked;   // a take is asked once, counted once (review L6)
+        int act = goalrefill::Decide(mine, live, has32, d.tries, goalrefill::kMaxTries);
+        int before = -1, after = -1, has32After = -1, fac = -1;
+        bool ran = false, filled = false;
+        if (act == goalrefill::kRefill)
+        {
+            filled = true;
+            before = GoalSetCountPod(orders);
+            fac = GoalFacPlayerPod(c);
+            ran = GoalSetupAIPod(c);
+            void* now = GoalOrdersOf(c);   // read again: the order system after the engine's own fill
+            if (now != 0) { after = GoalSetCountPod(now); has32After = GoalHas32Pod(now); }
+            act = goalrefill::AfterFill(ran, has32After, d.tries, goalrefill::kMaxTries);
+        }
+        if (act == goalrefill::kDrop) { ++g_goalRefillDropped; continue; }
+        if (act == goalrefill::kKeep) { ++g_goalRefillKept; continue; }
+        if (act == goalrefill::kDone) ++g_goalRefilled;
+        else if (act == goalrefill::kFail) ++g_goalRefillFailed;
+        else if (act == goalrefill::kRetry)
+        {
+            if (d.tries == 0) ++g_goalRefillRetried;   // a take retried counts once
+            GoalRefillDue r = d;
+            ++r.tries;
+            g_goalRefillQ.push_back(r);
+            if (d.tries > 0) continue;   // only the first retry is lined
+        }
+        if (g_goalRefillLines < kGoalRefillLineCap)
+        {
+            ++g_goalRefillLines;
+            DebugLog("[M2] take uid=" + N2(d.uid) + " goalRefill "
+                     + (act == goalrefill::kDone ? "refilled" : act == goalrefill::kFail ? "FAILED" : "retry")
+                     + ": try=" + N2(d.tries + 1) + " of " + N2(goalrefill::kMaxTries) + " has32=" + N2(has32)
+                     + " set[before,after]=" + N2(before) + "," + N2(after) + " has32After=" + N2(has32After)
+                     + " setupAI=" + (!filled ? "not run" : ran ? "ran" : "faulted/unbound")
+                     + " fac=" + (fac == 1 ? "player" : fac == 0 ? "npc" : "?") + " pc=" + N2(IsUidPlayerCharAnyThread(d.uid))
+                     + " - at the K2 safe point (AI worker paused)"
+                     + (g_goalRefillLines == kGoalRefillLineCap ? " (line cap reached; later takes counted on [M2] REPORT goalRefill)" : ""));
+        }
+    }
+}
 // M-D - the new owner un-puppets a copy: drop the drive row (restores the engine's own speed, closes a window),
 // then release the AI gate. The caller has already taken ownership so the streams flip with it.
 // T-890 review fold 1: a work tool this mod hung on the copy comes off first, while no job of the character's own can hold one.
+// T-918 (fold 1): its default goal set is given back at the next K2 safe point (GoalRefillQueue above) - the copy life emptied it.
 void UnpuppetForOwnership(unsigned int uid)
 {
     ::Character* c = FindSpawned(uid);
     DropPuppet(uid, true);
-    if (PlausibleObj(c)) { PoseToolOffForOwnership(uid, c); SuppressCharacter(c, false); }
+    if (PlausibleObj(c)) { PoseToolOffForOwnership(uid, c); SuppressCharacter(c, false); GoalRefillQueue(uid); }
 }
 
 /* P25 fold 2: items.cpp (declared in items.h, namespace coop) - the P7n position key of a building, and the building a key names */
@@ -5593,6 +5753,23 @@ void P071Tick()
 // or when it is gone or no longer this game's), so it is bounded by the send set - the mirror's rows, kMaxSentSamples - and
 // sized to it: no stop is dropped for room. The per-frame check costs one position read and one flag read per character
 // that is walking right now; a standing character is not in it.
+/* T-1178 fold 1 (F-T2357-ORIGINSPOT): AN OWN SPOT AT THE WORLD ORIGIN IS NOT SENT. Right after a dialogue hire, during the character
+   editor's pause (the frame still runs, so the ~10 Hz MOVE pass and the stop watch still send), the hiring game read its recruit's own
+   spot as the world origin; a MOVE or a stop from there would walk or snap the other game's copy to the origin (or retire it as an owner
+   in an area not loaded there). The same test as the announce pass (cooplive::AnnounceSpotAtOrigin): such a spot is treated as unread -
+   nothing sent this pass, the character's last sent spot stands on the other game. road 0 = MOVE, 1 = stop. MAIN THREAD. */
+static bool MoveSpotAtOrigin(unsigned int uid, const Ogre::Vector3& p, int road)
+{
+    if (cooplive::AnnounceSpotAtOrigin(p.x, p.y, p.z) == 0) return false;
+    ++g_moveOriginHeld[road == 0 ? 0 : 1];
+    if (g_moveOriginLines < kMoveOriginLinesMax)
+    {
+        ++g_moveOriginLines;
+        DebugLog("[M2] own spot at the world origin uid=" + N2((long long)uid) + " road=" + (road == 0 ? "move" : "stop")
+                 + " - not sent (an unread spot, not a place; F-T2357-ORIGINSPOT) (#" + N2(g_moveOriginLines) + "/" + N2(kMoveOriginLinesMax) + ")");
+    }
+    return true;
+}
 namespace {
 struct FollowOwnWatch { bool armed; int stillFrames, stillPasses; bool havePos; float lx, lz; long long stillTick; double stillAt; };
 const size_t kFollowOwnMax = (size_t)kMaxSentSamples;   // the send set: every character this game streams can be watched at once
@@ -5671,6 +5848,7 @@ static void FollowOwnerStopFrame()
         if (!w.armed || !PlausibleObj(c) || IsRetiredObject(c) || !net::IsUidMine(it->first)) { g_followOwn.erase(it++); continue; }
         Ogre::Vector3 pos;
         if (!SafeReadPosition(c, &pos)) { ++it; continue; }
+        if (MoveSpotAtOrigin(it->first, pos, 1)) { ++it; continue; }   /* T-1178 fold 1: never a stop at the origin (nor a sample of it) */
         if (w.havePos)
         {
             const float mx = pos.x - w.lx, mz = pos.z - w.lz;
@@ -6369,6 +6547,7 @@ void ReplicateTick()
         // was missing here too, and this runs ~10 times a second for every owned character.
         Ogre::Vector3 p;
         if (!SafeReadPosition(c, &p)) continue;
+        if (MoveSpotAtOrigin(uid, p, 0)) continue;   /* T-1178 fold 1: never a MOVE at the origin (nor a velocity sample of it) */
 
         // F350 - MEASURE THE AUTHORITY'S OWN VELOCITY FROM TWO SAMPLES OF THE THING WE ALREADY
         // SEND. Deliberately not read out of the engine: `desiredMotion` is a unit direction and
@@ -6422,7 +6601,7 @@ void ReplicateTick()
     if (g_ownedUid != 0 && FindSpawned(g_ownedUid) == 0)
     {
         Ogre::Vector3 pos;
-        if (SafeReadPosition(g_ownedChar, &pos))            // F316
+        if (SafeReadPosition(g_ownedChar, &pos) && !MoveSpotAtOrigin(g_ownedUid, pos, 0))            // F316; T-1178 fold 1: not at the origin
         {
             // F353 - and this one gets a velocity too. It was the caller left on zeros.
             float vx = 0.0f, vz = 0.0f;
@@ -6667,9 +6846,13 @@ bool ClearAttackOrder(::Character* puppet)
     // AI used it to choose for itself. That is the T071 failure arriving through a much smaller
     // door: one pulse is enough, and it does not matter that the order was deleted first.
     //
-    // So the goal is removed directly instead. `dropGoals` is the engine's own, and clearing
-    // the goal is what the pulse was trying to achieve indirectly - **with no window in which
-    // the AI gets to pick a replacement.**
+    // So the goals are removed directly instead, **with no window in which the AI gets to pick a
+    // replacement.** `dropGoals` is the engine's own, and it clears MORE than the current goal:
+    // it deletes every entry of all five priority lists of the character's default goal set
+    // (decomp_509f40) - 'Self preservation' (type 32) among them - so a copy has nothing left to
+    // choose from (T075's protection). The set stays empty until something fills it again: when
+    // this game takes the character over, UnpuppetForOwnership refills it with the engine's
+    // setupAI (T-918, GoalRefillQueue -> GoalRefillSafePointDrain); without that it would never fight back.
     orders->dropGoals();
     return true;
 }
@@ -7663,6 +7846,8 @@ void ReportReplication()
        << " intentSent=" << N2(g_intentSent) << " intentGoalResent=" << N2(g_intentGoalResent) << " intentRecv=" << N2(g_intentRecv) << " intentRefused=" << N2(g_intentRefused)
        << " handoffInjected=" << N2(g_handoffInjected) << " handoffMatched=" << N2(g_handoffMatched) << " handoffControl=" << N2(g_handoffControl) << " handoffControlMatched=" << N2(g_handoffControlMatched)
        << " handoffInjectFailed=" << N2(g_handoffInjectFailed) << " handoffQuiesceTimedOut=" << N2(g_handoffQuiesceTimedOut)
+       << " goalRefill[asked,refilled,failed]=" << N2(g_goalRefillAsked) << "," << N2(g_goalRefilled) << "," << N2(g_goalRefillFailed)   // T-918
+       << " goalRefillMore[retried,kept,dropped,queueFull,queued,pending]=" << N2(g_goalRefillRetried) << "," << N2(g_goalRefillKept) << "," << N2(g_goalRefillDropped) << "," << N2(g_goalRefillQueueFull) << "," << N2(g_goalRefillQueued) << "," << N2((long long)g_goalRefillQ.size())   // T-918 fold 1
        << " rcBoostedSteps=" << N2(g_rcBoostedSteps)
        << " driveSkippedRetired=" << N2(g_driveSkippedRetired) << " driveSkippedUnregistered=" << N2(g_driveSkippedUnregistered) << " adoptRefusedFull=" << N2(g_adoptRefusedFull) << " adoptRefusedOtherUid=" << N2(g_adoptRefusedOtherUid) << " puppetsDroppedReclaim=" << N2(g_puppetsDroppedReclaim) << " rcSetterFaulted=" << N2(g_rcSetterFaulted) << " speedArriveSynced=" << N2(g_speedArriveSynced)
        << " orderdrive=" << (g_orderDrive ? "on" : "off") << " orderIssued=" << N2(g_orderIssued) << " orderIssueFailed=" << N2(g_orderIssueFailed) << " orderHeldFrames=" << N2(g_orderHeldFrames) << " orderDoneFrames=" << N2(g_orderDoneFrames) << " orderFallbackPush=" << N2(g_orderFallbackPush) << " unstickOrders=" << N2(g_unstickOrders) << " unstickResolved=" << N2(g_unstickResolved) << " unstickTimedOut=" << N2(g_unstickTimedOut) << " unstickHeldFrames=" << N2(g_unstickHeldFrames)
@@ -7763,6 +7948,7 @@ void ReportReplication()
        << " velTeleportSamples=" << N2(g_velTeleport)
        << " velBadClockSamples=" << N2(g_velBadClock)
        << " velNoSampleSlot=" << N2(g_velNoSampleSlot)
+       << " ownSpotOriginHeld[move,stop]=" << N2(g_moveOriginHeld[0]) << "," << N2(g_moveOriginHeld[1])   /* T-1178 fold 1 */
        << " velRagdollSamples=" << N2(g_velRagdoll)
        << " velInSomethingSamples=" << N2(g_velInSomething)
        << " velCarriedSamples=" << N2(g_velCarried)
@@ -7925,6 +8111,7 @@ void ReplicateWorldTeardown()
         if (it->second.nativeWindow) ++windows;
     g_fpTests.clear();   // T-986 floorplace fold: open floorplace readings end with the table
     g_puppets.clear();
+    g_goalRefillQ.clear();   // T-918: a queued refill names a uid of the world that is going (uids restart with each world)
     g_followClk.clear(); g_followOwn.clear(); g_followOwnSent.clear();   // the owners' clocks and this game's stop watch belong to the world that is going
     g_adoptRefusedUids.clear();   // mirror1: the once-per-uid log belongs to the world that is going
     g_snapFarByUid.clear(); g_snapFarByUidOther = 0;   // runboost2 (T-195 R6): so is the far-snap list

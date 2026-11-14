@@ -93,6 +93,9 @@ void InstallKnockSafePoint();
 // Installed by InstallCombatHook, on by default; ReportPhysicsGuard prints the [H054] REPORT line.
 void InstallPhysicsGuard();
 void ReportPhysicsGuard();
+// T-1046 fix 1 (installed by InstallPhysicsGuard): a physics piece already queued for delete gets no first-ready setup, so
+// it is not queued - and deleted - twice. Its REPORT line: with ReportPhysicsGuard and at quit. MAIN THREAD.
+void PhysSelfQueueReport();
 
 // P-15 / F220 - COMBAT MODE replication.
 //

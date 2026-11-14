@@ -73,6 +73,9 @@ void StoreNoteSquadEvent(void* character);
    call) / a shop squad's stock and money were set (items.cpp detour_refreshBuildingInventory: the squad's own address, or its active
    part). The world squad this game writes that owns it is marked due. ANY THREAD - off the main thread the address is queued, never read. */
 void StoreNoteSquadHome(void* pot);
+/* T-1334: a pot's home blanked (spawn.cpp detour_removeOwned: set before Ownerships::removeOwnedObject, empty after). The squad is marked
+   due as for a move, and its next record written by this game sends its home as none ("-"). ANY THREAD - off the main thread queued. */
+void StoreNoteSquadHomeBlank(void* pot);
 void StoreNoteSquadRestock(void* squadOrActive);
 // P2 item 1: connect to SharedWastelandsServer.exe (empty address = back to the in-game store). `store server <addr> <port>`.
 bool SetStoreServer(const std::string& address, unsigned short port);
@@ -109,7 +112,7 @@ int StoreRecordFacts(const std::string& worldId, int* owner, long long* writtenA
 int StoreRecordsHomedAt(const std::string& buildingKey);   /* MAIN THREAD - living world records whose group's home building is this key (the town refill's home test) */
 int StoreTownGoneThisLaunch(const std::string& townSid);   /* MAIN THREAD - groups of this town this game deleted since it started */
 std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z, const std::string& kind = std::string(), const std::string& homeKey = std::string());   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set; kind "" / stale / asleep picks the note's id; kind home (T-1099): a note homed at building homeKey */
-std::string StoreTestCommand(const std::string& arg);   /* TEST-ONLY (storetest verb), main thread: storetest nopos <worldId or part of one> | storetest nopos off */
+std::string StoreTestCommand(const std::string& arg);   /* TEST-ONLY (storetest verb), main thread: storetest nopos <worldId or part of one> | storetest nopos off | (T-1334, DEV build) storetest home show|drop <buildingKey> | storetest home move <buildingKey> <toBuildingKey> */
 std::string DialoguePauseTestCommand(const std::string& arg);   /* TEST-ONLY (talkpause verb), main thread: talkpause on|off - a conversation window pauses the game as in single player */
 void NoteTownPeople(const std::string& worldId, const std::string& town);   /* main thread: a received note names its home town ("" = none) */
 std::string StoreWorldIdOf(void* platoon);   /* P4p: the group's id string (Platoon+0x78), "" if unreadable */
@@ -135,6 +138,10 @@ int StorePlatoonOwnCopyOrigin(void* platoon, const std::string& worldId);   /* t
 int StorePlatoonActiveChars(void* platoon);                           /* inv7a3: the platoon's live member count, -1 if unreadable */
 int StoreRetireLocalCopy(void* platoon);
 int StorePlatoonBound(void* platoon);   /* 1 = the store keeps this squad (it answers 'persistent' for it), 0 = the engine's own rule decides. MAIN THREAD */
+void StoreNoteOtherRunRemoved(void* platoon, unsigned int uid, int kind, int deadRead);   /* T-850, MAIN THREAD: a living person (deadRead 0) its squad here (the Platoon read at the removal) lost - kind sqbirth::kLost*: another game's puppet put away by this engine (1), a copy removed on its runner's say-so alive (2), this game's own person offered at its put-away (3); the squad's destroy keeps its record while such a person lives elsewhere */
+void StoreHandOverJudge(const std::string& id, int toSlot, long long released, long long kept);   /* T-850 (T2230), MAIN THREAD: handoff.cpp's XFER ACK passed `released` people of squad `id` to the game in toSlot and kept `kept` here - the heartbeat's writer re-check runs for it now (sqwreg::HandOverStep), so the release goes out */
+void StoreRunHeldSettle(unsigned int uid);   /* T-850 fold 1b, MAIN THREAD: handoff.cpp - the release of uid ended (taken, asleep / cancelled, no longer this game's): the squad deletes held for it are decided */
+void StoreOtherRunDied(unsigned int uid);   /* T-850 fold 1, MAIN THREAD: the runner's DESPAWN of a copy (it died) */
 void StoreNoteUnloadEmptied(void* platoon, int offThread);   /* T-999 fold 3, MAIN THREAD: spawn.cpp's UNLOAD removal of a character notes its squad (the Platoon, 0 = none) - a bound squad emptied by the engine's own unload keeps its discard to its destroy; offThread = 1: counted, not noted */
 void StoreModRemovalMark(void* platoon, int livingAfter);   /* T-1080: this game is about to remove a person of platoon; livingAfter = its living members left (-1 not read) - a squad left with nobody living keeps its record at its discard */
 void StoreOrphanEmptiedSquad(void* faction, void* active, void* platoonHint, int havePos, float x, float z, const void* const* gone, int goneN);   /* havePos / x / z: where the last person removed stood; gone: the people removed (compared by address only); platoonHint: their squad read before the destroy, looked up by address in the sleeping list when the squad is no longer awake - a squad this game's save split off another game's people is removed once empty (squadorigin.h SaveSplitDrop) */   /* T-300 fix 2, MAIN THREAD: the orphan purge removed people of this ActivePlatoon - another game's file-built squad in an area another game holds is thrown away once empty; a world NPC squad's copy forgets its record stamp once empty (squadwriter.h NpcPurgeForgetStamp) */
@@ -147,6 +154,12 @@ bool PlatoonWipe(const std::string& worldId);
 // `ok clearnear wiped=<n> base=<n> kept=<n> (players=<n> runSpawned=<n> notHolder=<n> town=<n>) faults=<n>`.
 // MAIN THREAD.
 std::string ClearNearLever(const std::string& args);
+// T-1243 TEST-ONLY lever `zonedamage <zone id> before|after <offset> <length>` (src/common/zonecheck.h): the next send of that area
+// record by this game has <length> bytes from <offset> set to zero, before this game's own check (it must refuse the send) or after it
+// (the world server must refuse it). One use per arming. Returns the status line. MAIN THREAD.
+// T-1243 (owner 1523): `mirror` - this game's next mirror write of that area record: its mirror FILE is damaged after the write and
+// the send, and the kept record table is written again to match it.
+std::string ZoneDamageLever(const std::string& args);
 // The run's own spawns, kept by clearnear: a character a spawn lever made (by its uid) and a squad a lever made (by its Platoon).
 // MAIN THREAD; bounded sets, written only by the TEST-ONLY spawn levers.
 void ClearNearNoteRunUid(unsigned int uid);
@@ -161,13 +174,14 @@ bool QuitViaMenu();
 bool KillNamed(const std::string& nameSubstring);   /* E21 (T223) lever, MAIN THREAD: declare dead the first LOADED character whose game-data name contains this substring and whose Character::isUnique says it is a named character. `platoonkill nearest` picks by distance and T223 got a passing group; this picks by name. */
 bool PlatoonKill(const std::string& worldId);       // T203 lever: every member declared dead through the engine (the natural wipe-out chain)       // T199 lever: destroy a group as the engine would after a wipe-out (the delete path end to end)
 int  StoreRecordCreated(void* platoon);            // P4e: a group created asleep -> the notebook now (1 ok, 0 off, -1 failed)
+void StoreOwnRaidNote(void* platoon);              /* T-1122 own raid squads: a raid squad the creation gate made here (towngen.cpp) - ANY THREAD */
 void StoreAdminDestroyBegin();                     // P4e: our own destroys (retire/supersede) are not "gone"
 void StoreAdminDestroyEnd();
 /* M2 (decisions 32/44/54): ApplyRemoteGone and StoreWorldListed were the session link's RECORD_GONE / WORLD_LISTED entries - deleted. */
 void ApplyDeletedBits(const std::string& faction, const std::vector<char>& bits, const char* from);
 int  StoreAreasTaken();   /* fold 4 (review): 1 = the world server takes this game's AREAS now (a world-road game only after its IN_WORLD on this link) */
 void StoreAreaFileNote(const int* xy, int count, const int* playerXY, int playerCount);   /* MAIN THREAD: one zone tick's loaded areas and player-character areas (as StoreSendAreas takes them) for this game's area file - written, read back at the next join and measured; nothing is filtered by it */
-bool StoreSendAreas(const int* xy, int count, const int* playerXY, int playerCount);   // my loaded areas (x,y pairs) to the world server, then this game's player-character areas (x,y pairs, the followed character's first, at most coopdrop::kAreasPlayerSectorsMax); playerCount 0 = not known, and the world server drops this game's rows
+bool StoreSendAreas(const int* xy, int count, const int* playerXY, int playerCount, int loading);   // decision 1556: loading 1 = the AREAS loading mark (coopdrop::kAreasFlagLoading); my loaded areas (x,y pairs) to the world server, then this game's player-character areas (x,y pairs, the followed character's first, at most coopdrop::kAreasPlayerSectorsMax); playerCount 0 = not known, and the world server drops this game's rows
 bool StoreProfileFactionName(const std::string& name, const char* why, int rename);   /* names2a: MAIN THREAD - PROFILES kind 3 (a load) or 5 (rename != 0: the player renamed), my faction's name for my profile's notebook row; false = not sent now (no profile / link down) */
 bool StoreProfileFactionSeen(unsigned num, const std::string& name);   /* T-368, MAIN THREAD: PROFILES kind 6 - this game has the FACTION answer naming `name` for profile num; false = not sent (another pick, link down) */
 bool StoreFactionNameTakenInWorld(const std::string& name);   /* T-368, MAIN THREAD: another profile of this world (connected or not) has this faction name (coopprof::FactionTakenIn over the world's TAKEN list; false in single player) */
@@ -203,6 +217,27 @@ bool StoreProfilePickFromPanel(unsigned num);   /* PLAY: ProfilePick(num), the s
    the link's channel - true = reliable (channel 0), false = unreliable and unsequenced (channel 1, the latest-wins MOVE and
    STATE, exactly as on the session link); the world server forwards a LIVE with the reliability it arrived with. */
 bool StoreLiveReady();
+/* T-1122 build (src/common/raidsquad.h): MSG_RAID_LEND's arrival (net/session.cpp OnRaidLend) - fromPeer the transport's sender key */
+void ApplyRaidLend(const char* p, size_t n, unsigned int fromPeer);
+/* T-1122 redesign (b): MSG_RAID_END's arrival (net/session.cpp OnRaidEnd) - fromPeer the transport's sender key */
+void ApplyRaidEnd(const char* p, size_t n, unsigned int fromPeer);
+/* T-1122 awake hand (owner 1524, src/common/raidsquad.h): MAIN THREAD. The sender, at each ordinary hand-over send (handoff.cpp: the
+   forced and follow-leader XFER, their resends, the RELEASE offer and its resend) - the squad by its awake object `ap`, or (ap 0) by its
+   faction and engine id: when its raid campaign was made on this game, AWAKE goes to toSlot first. 1 = sent. */
+/* T-1122 whole or none (owner 1581 a, 2026-11-09): returns raidsq::kLgWholeAtReceiver (1) the block went - the receiver takes all or none,
+   kLgOrdinary (0) not a lent squad here, kLgHoldBack (-1) a lent squad whose block does not go - NOT handed over (no XFER, no RELEASE offer) */
+int RaidAwakeHandSend(void* ap, void* faction, const std::string& squadId, unsigned int keyUid, int toSlot, int whole = 1);
+void RaidLentWholeNote(int which);   /* T-1122 whole or none: the raidLendWhole token's counters (raidsq::kLw*) */   /* whole: T-1122 re-check fold 5 (0 = a member was held back from this hand-over) */
+/* the receiver: 1 = an AWAKE block (or an applied awake row) names this hand-over key uid - its members' carried goals are not issued */
+int RaidAwakeBlockHas(unsigned int keyUid);
+/* the receiver, after the take: the block applied to the squad it took (ap: that uid's awake squad here, 0 none) */
+void RaidAwakeTaken(unsigned int keyUid, void* ap, int whole);
+void RaidAwakeTakeNote(unsigned int keyUid, int whole);   /* T-1122 fix A re-check fold (2): every take's fullness by its key uid (1 all named taken, 0 part), block or not */   /* whole (T-1122 fix A review fold 1): every member the hand-over message named was taken here (1), part (0) */
+/* handoff.cpp: the awake squad (ActivePlatoon) of uid when this game runs uid (*mine 1), else 0 */
+void* HandoffMySquadApOf(unsigned int uid, int* mine);
+/* T-1122 review fold 3 (handoff.cpp): 1 = uid is in an open RELEASE offer of this game (the RELEASE road decides it first). MAIN THREAD. */
+int HandoffReleaseHolds(unsigned int uid);
+
 /* T-978 BUBBLE: 1 = the conversation window now open had its opening pause skipped (T-288's g_dlgPauseSuppressed). MAIN THREAD. */
 int StoreDlgPauseSkipped();
 bool StoreSendLive(unsigned int route, unsigned int target, unsigned int innerType, const std::vector<char>& inner, bool reliable);
@@ -266,6 +301,8 @@ bool StoreSendResearchTake(const std::vector<char>& payload);   /* loot2c: MAIN 
 bool StoreSendUniqueState(const std::string& sid, int state, int playerInvolved);   /* E5 / decision 31(c): MAIN THREAD - a named character's state to the notebook */
 unsigned long StoreMainThreadId();   /* review-p5j MEDIUM-2, ANY thread: the id the store captured at its first tick, or 0 while it is not yet known (which a caller must read as "not the main thread") */
 int KillNamedIsUniquePod(void* c);   /* towns2: Character::isUnique 0x505ED0 under SEH (the killnamed lever's own call) - 1 unique, 0 ordinary, -1 fault; MAIN THREAD */
+int StoreSleepersTakenSlot(void* platoon, void* faction, const std::string& wid);   /* T-1318 attempt 4: the sleeping squad's own records all given to one slot (that slot), -1 not, -2 unread, -3 given to more than one slot (store.cpp SleepersTakenSlotNow). MAIN THREAD */
+int StoreSleepersHands(void* platoon, std::vector<std::string>* hands, std::vector<int>* dead = 0);   /* a4 fold 2 (re-check LOW-B): dead - each record's death, the same order (1 a corpse, 0 alive, -1 unread; coopown::GdcCharDeadOf) */   /* T-1318 a4 fold 1 (review HIGH-1): the sleeping squad's 0x24 records' hands ("" no hand) - 1 read (one or more records), 0 not. MAIN THREAD */
 int StoreIsDeadPod(void* character);        /* par6 fold (review-par6 #3): Character::hasDied under SEH - 1 dead, 0 alive, -1 fault */
 int StoreDeclareDeadPod(void* character);   /* review-p5j HIGH-2, MAIN THREAD: Character::declareDead 0x7A5660 under SEH - the platoonkill lever's own path, now shared with the world-state apply */
 std::string StoreModsRefusal(long long* seq);   // settings5 S5, MAIN THREAD: the player-facing mods refusal ("" = none) and its change number
@@ -486,6 +523,10 @@ int GameSpeedTestWrite(float speed, float* was);
 int GameSpeedTestSweep(float from, float to, float step, unsigned int everyMs);
 // MAIN THREAD, from the clock tick: the sweep's next write, when it is due.
 void GameSpeedSweepTick();
+// T-1183 TEST-ONLY lever, MAIN THREAD: `timeskip <hours>` moves this game's clock forward through the join jump's write set
+// (the engine's load-path clock restore 0x66D0C0); `timeskip show` reads only. Returns the status line; logs [TIME] T-1183
+// timeskip lines with the clock before and after, the shared clock, and any refusal. Definition: store.cpp.
+std::string TimeSkipTestCommand(const std::string& arg);
 // E40 / decision 45, MAIN THREAD: "fixed", "consensus", "vote", "locked", or "unknown (no notebook clock yet)". The value is the
 // mode byte carried in the notebook's CLOCK message, which the notebook derives from its own options.txt row -
 // one authority for the rule, never two that can disagree.
@@ -714,6 +755,11 @@ int StoreQueueWrite(int family, const std::string& recordKey, const std::vector<
 bool StoreSendGroundRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-697 step 2, MAIN THREAD: the area holder's ground record as a RECORD at the area centre; false = no link (nothing queued) */
 bool StoreSendPieceRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* MAIN THREAD: a piece's record as a RECORD at the piece's position (the stamp sent, which RECORD_SEQ carries back); false = no link (nothing queued) */
 bool StoreSendDoorRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* MAIN THREAD: a world door's record (doors.cpp) as a RECORD at the door's position; false = no link (nothing queued) */
+bool StoreSendBldgRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-1333, MAIN THREAD: a town building's record (build.cpp) as a RECORD at its area's centre; false = no link */
+bool StoreSendBldgGone(const std::string& id);   /* T-1333, MAIN THREAD: a building record's removal (RECORD_GONE) - a rebuilt town; false = not sent */
+
+bool StoreSendTownTimeRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-4, MAIN THREAD: a town's clock record (towngen.cpp) as a RECORD at the town's position; false = no link */
+bool StoreSendCageRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-860, MAIN THREAD: a cage's lock record (spawn.cpp) as a RECORD at its area's centre; false = no link */
 bool StoreSendDoorGone(const std::string& id);   /* MAIN THREAD: a door record's removal (RECORD_GONE) - a ruined building's doors; false = not a door record id, or not sent */
 bool StoreSendBoxAsk(const std::vector<std::string>& ids);   /* MAIN THREAD: BOX_ASK (81) for the boxes whose writes the link lost; false = not sent */
 

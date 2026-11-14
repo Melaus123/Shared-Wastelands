@@ -199,8 +199,9 @@ std::string MetaHomeClean(const std::string& home)
 }
 bool MetaHomeIsCleared(const std::string& home) { return home == kMetaHomeCleared; }
 std::string MetaHomeKey(const std::string& home) { return MetaHomeIsCleared(home) ? std::string() : home; }
-std::string MetaHomeNote(const std::string& kept, const std::string& arriving, int fromLive, int sameAsCleared)
+std::string MetaHomeNote(const std::string& kept, const std::string& arriving, int fromLive, int sameAsCleared, int byClearer)
 {
+    if (byClearer != 0) return MetaHomeMerge(kept, arriving);   /* T-1334 fold 1: the game that wrote "-" names a home again */
     if (MetaHomeIsCleared(kept) && !arriving.empty() && !MetaHomeIsCleared(arriving) && (sameAsCleared > 0 || (sameAsCleared < 0 && fromLive == 0))) return kept;
     return MetaHomeMerge(kept, arriving);
 }
@@ -235,6 +236,43 @@ int LoadOverrideHomeDecide(int homeAfterRead, int saveHadHome, int keyKnown)
     if (saveHadHome != 0) return kLoHomeRestore;
     return keyKnown != 0 ? kLoHomeOweByKey : kLoHomeNoneAnywhere;
 }
+int LoadOverrideHomeDecideRec(int homeAfterRead, int saveHadHome, int keyKnown, int recordCleared)
+{
+    if (homeAfterRead == 0 && recordCleared != 0) return kLoHomeClearedNone;
+    return LoadOverrideHomeDecide(homeAfterRead, saveHadHome, keyKnown);
+}
+int RecHomeState(const std::string& recordHome)
+{
+    if (recordHome.empty()) return kRecHomeUnknown;
+    return MetaHomeIsCleared(recordHome) ? kRecHomeNone : kRecHomeKey;
+}
+int ReHomeDecide(int isRunner, int liveRead, int sameKey, int recordState, int buildingLoaded, int linkOther)
+{
+    if (isRunner != 0) return kReHomeRunner;
+    if (liveRead < 0 || recordState == kRecHomeUnknown) return kReHomeNone;
+    if (recordState == kRecHomeNone) return liveRead == 1 ? kReHomeBlank : kReHomeNone;
+    if (liveRead == 1 && sameKey != 0 && linkOther == 0) return kReHomeNone;
+    return buildingLoaded != 0 ? kReHomeMove : kReHomeMissing;
+}
+int RecHomeArrive(int held, long long heldAt, long long arrivingAt)
+{
+    if (held == 0 || arrivingAt > heldAt) return kRecHomeArriveTake;
+    return arrivingAt == heldAt ? kRecHomeArriveNote : kRecHomeArriveSkip;
+}
+int ReHomeOwes(int decision, int moveRc)
+{
+    if (decision == kReHomeMissing) return 1;
+    if (decision != kReHomeMove) return 0;
+    return (moveRc == 1 || moveRc == 2 || moveRc == kGiveHomePlayerHouse) ? 0 : 1;
+}
+int ReHomeOwedStep(int stillBound, int recordIsKey, int isRunner, int liveSame, int buildingLoaded)
+{
+    if (stillBound == 0) return kReOwedDrop;
+    if (recordIsKey == 0 || isRunner != 0) return kReOwedRecheck;
+    if (liveSame != 0) return kReOwedDone;
+    return buildingLoaded != 0 ? kReOwedGive : kReOwedWait;
+}
+int HomeBlankListed(int bound, int isRunner) { return (bound != 0 && isRunner != 0) ? 1 : 0; }
 
 bool MetaParse(const std::string& line, MetaLine* out)
 {

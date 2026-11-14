@@ -124,6 +124,13 @@ const unsigned int kInnerHand = 84;
    asker); its handler takes an ASK only as the box's writer and a NO only for an ask of its own (items.cpp BoxLockNote).
    net/transport.h number; store.cpp asserts it. */
 const unsigned int kInnerBoxLock = 85;
+/* T-1122 build: RAID_LEND - a raid squad lent by the game that made it to the game holding the area its route enters, and that game's
+   answers (src/common/raidsquad.h); to one player by slot; its handler takes each kind only under the lend's key (lender slot + id +
+   serial) and from the slot the key names. net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerRaidLend = 86;
+/* T-1122 redesign (b): RAID_END - the borrower's raid campaign for a lent copy ended (src/common/raidsquad.h); to the lender by slot;
+   its handler takes it only as the lender of its key, from that lend's borrower. net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerRaidEnd = 87;
 /* T-1242: RESEARCH_BOOK - a research's Books asked of the teammate whose bench holds them (ASK), its ANSWER, and the asker's GIVEBACK /
    DONE (src/common/bookshare.h); to one player by slot; its handler takes an ASK only from a current teammate and an ANSWER only for
    this game's own hold (store.cpp BookNote). net/transport.h number; store.cpp asserts it. (86 / 87 are held by effort/t1122a.) */
@@ -436,8 +443,10 @@ inline bool LiveInnerAccepted(unsigned int t)
         || t == kInnerHand   /* taken only for a copy of the character, from the game that runs it (combat.cpp) */
         || t == kInnerSwingEnd   /* the relayed-owner gate, as SWING */
         || t == kInnerBoxLock   /* T-1061: an ASK taken only by the box's writer, a NO only for this game's own ask (items.cpp) */
-        || t == kInnerResearchBook   /* T-1242: an ASK taken only from a current teammate, an ANSWER only for this game's own hold (store.cpp) */
-        || t == kInnerFightChoice;   /* the relayed-owner gate, as SWING; applied only to a copy here (combat.cpp) */
+        || t == kInnerFightChoice   /* the relayed-owner gate, as SWING; applied only to a copy here (combat.cpp) */
+        || t == kInnerRaidLend   /* T-1122 build: a raid lend's message, taken only under its key (store.cpp ApplyRaidLend) */
+        || t == kInnerRaidEnd     /* T-1122 redesign (b): taken only by the lender of its key, from its borrower (store.cpp RaidEndApplyImpl) */
+        || t == kInnerResearchBook;   /* T-1242: an ASK taken only from a current teammate, an ANSWER only for this game's own hold (store.cpp) */
 }
 
 /* M7b slice 2 fold 1: the relayed types that WAIT in the arrival queue while this game has no running world (store.cpp), as they

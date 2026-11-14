@@ -10,6 +10,7 @@
  *   GsWriteChoice    - seed (this game holds no copy) or update (known generation + 1)
  *   GsRefuseAnswer   - what a game does with the world server's GROUND_REFUSE (message 71)
  *   GsStoredWait     - wait for the stored record the world server named, or give the area up after a bounded wait (fold 1, L1)
+ *   GsKnownAfterRefuse, GsStaleHolderTake, GsHolderStep, GsChangedAfter - T-1100 (a hand-over's changes on the previous holder)
  *   GsApplyPlan      - per record row: keep / take over / build; per local item no row lists: remove (only after a whole walk of a
  *                      record that lists every item; never a guarded item)
  *
@@ -85,6 +86,53 @@ inline int GsStoredWait(int knownHave, unsigned int knownGen, int haveMine, unsi
     if (srvHave != 0 && srvGen >= knownGen) return kGsWaitNo;
     return waitedMs >= kGsStoredWaitMs ? kGsWaitGiveUp : kGsWaitYes;
 }
+/* T-1100: a write raises the known generation to the written one before the world server answers. When the answer refuses this game's
+   LATEST write, the world server never held that generation: the known generation goes back to what it was just before the write
+   (sentKnownHave / sentKnownGen), never below a record of the area that arrived meanwhile (srvHave / srvGen) - else GsStoredWait would
+   wait for a record that does not exist and give the area up. */
+inline void GsKnownAfterRefuse(int sentKnownHave, unsigned int sentKnownGen, int srvHave, unsigned int srvGen, int* knownHaveOut, unsigned int* knownGenOut)
+{
+    unsigned int g = (sentKnownHave != 0) ? sentKnownGen : 0u;
+    if (srvHave != 0 && srvGen > g) g = srvGen;
+    if (knownHaveOut) *knownHaveOut = (sentKnownHave != 0 || srvHave != 0) ? 1 : 0;
+    if (knownGenOut) *knownGenOut = g;
+}
+
+/* ---- T-1100: a change the area's previous holder made inside the hand-over window ---- */
+/* The area moved to this game while the previous holder still believed it held it: that game's drop / pick-up went out as a plain ground
+   ADD / GONE (a holder's own send - never a catch-up's naming ADD) and reached this game after it became the holder. This game takes it
+   onto its ground and its record (as it takes another game's drop / pick-up request) when the sender is the game this game's area map
+   named holder just before it named this game. Every input is a fact this game has: iHold (its own holder verdict), catchUp (the
+   message is a catch-up naming ADD), senderSlot (the slot of the game the message came from), holderBefore (the holder this game's
+   area map named just before this game, -1 none). 1 = taken; 0 = refused, as before. */
+inline int GsStaleHolderTake(int iHold, int catchUp, int senderSlot, int holderBefore)
+{
+    if (iHold == 0 || catchUp != 0) return 0;
+    return (senderSlot >= 0 && holderBefore >= 0 && senderSlot == holderBefore) ? 1 : 0;
+}
+/* The area map's holder sequence per area: *last is the last real holder (a slot >= 0) a map named, *before the one named before it.
+   A map naming nobody or no row (named < 0) changes neither; the same holder again changes neither. */
+inline void GsHolderStep(int* last, int* before, int named)
+{
+    if (named < 0 || named == *last) return;
+    *before = *last;
+    *last = named;
+}
+/* The order rule of the apply guard (replaces the ~10 s clock): an item added or changed here (noted at notedAt) is newer than the
+   stored record when it was noted at or after the record arrived (since). GetTickCount values, unsigned difference. 1 = newer. */
+inline int GsChangedAfter(int noted, unsigned int notedAt, unsigned int since)
+{
+    return (noted != 0 && (int)(notedAt - since) >= 0) ? 1 : 0;
+}
+/* T-1100 fold 1 (MED-1): the apply guard is EITHER rule - the order rule above, or the clock it replaced (noted within windowMs of now):
+   an older record can arrive AFTER a fresh change (the writer's record goes through the world server, its ADD game to game), and the
+   order rule alone would let that record remove the fresh drop. 1 = guarded. */
+inline int GsRecentGuard(int noted, unsigned int notedAt, unsigned int since, unsigned int now, unsigned int windowMs)
+{
+    if (noted == 0) return 0;
+    if (GsChangedAfter(noted, notedAt, since) != 0) return 1;
+    return (now - notedAt < windowMs) ? 1 : 0;
+}
 
 /* ---- fold 2 (item 4): the same generation, other bytes ---- */
 /* A record arrives at the very generation this game's ground is (mineGen) but with rows other than this game's last write of it
@@ -130,8 +178,9 @@ inline int GsUnconfHow(int gaveUp, int leaving)
 const int kGsGuardSpill = 1;    /* a spill / copy item still to be removed here: never kept, taken over or removed by the plan */
 const int kGsGuardOwn = 2;      /* this game's own unconfirmed or pending drop, a removal waiting for its claim, an item held for a TAKE:
                                    never taken over or removed (a name it already carries still keeps it) */
-const int kGsGuardRecent = 4;   /* fold 1 (M6): added to (fold 2: or changed on) this ground within the last ~10 s (a record from around a
-                                   holder change can be older than it): never removed, its quantity never set (it may still be kept or taken over) */
+const int kGsGuardRecent = 4;   /* fold 1 (M6): added to (fold 2: or changed on) this ground after the stored record arrived or in the last
+                                   ~10 s (T-1100 fold 1: GsRecentGuard - either rule; a record from around a holder change can be older than it):
+                                   never removed, its quantity never set (it may still be kept or taken over) */
 const int kGsGuardSpot = 8;     /* T-1129: an item a shop spot holds here - the area file is its source: never removed, its quantity never
                                    set (it may still be kept or taken over, so a record row of it builds nothing beside it) */
 struct GsLocal

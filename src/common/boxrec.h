@@ -30,7 +30,7 @@
  *   LEDGER (only with kBrFlagLedger): THE BOX'S LEDGER below ('BJLD' ...), after the undo list when both are there.
  *   LOCK BLOCK (only with kBrFlagLock, T-1061, world-server protocol 145): the box's lock as its writer's engine holds it - u8 locked |
  *     u8 broken | i32 lock level (0..kBrLockLevelMax) | f32 hardness (finite) - after the undo list and the ledger. A box with no
- *     lock object, and a cage (its lock is the prisoner road's, prisonwire.h), carries none. A record written before it existed has
+ *     lock object, and a cage (its lock is its own cage record's, cagerec.h - T-860), carries none. A record written before it existed has
  *     none: each game keeps its own lock until the writer next writes the box.
  *   Nothing else may follow. A record with neither is byte for byte the form written before either existed. The whole record is at
  *   most kBrMaxBytes.
@@ -44,8 +44,9 @@
  * THE WORLD SERVER'S RULE (BoxAcceptRule): ONE WRITER at a time, as boxowner.h. While the box's owner player's game has the box's
  * area loaded, only that owner's game may write or remove the box; otherwise only the area's holder may. A SEED is taken only when
  * no record of that id exists, judged against the owner the seed names (so a game may name itself the owner only while its game has
- * the area loaded; otherwise only the holder seeds); a shop or a cage never has an owner, and no write changes a box's kind. Any
- * later write must be an update
+ * the area loaded; otherwise only the holder seeds); a shop or a cage never has an owner, and no write changes the kind of a box a
+ * player owns (T-1130: a box no player owns, stored and sent, may change kind - each game labels it from its own shop list, filled
+ * some seconds after a load - unless the change drops the stored record's undo list, an older game's write). Any later write must be an update
  * (not a seed) from the one writer of the stored record (its stored owner is the one tested), with a generation higher than the
  * stored one - an equal generation is taken only as a harmless repeat of the very same bytes, and then nothing is written; only the
  * area's holder may change a record's owner. A removal is taken from the stored record's owner or the area's holder (BoxMayRemove). A refused write
@@ -66,7 +67,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 145;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
+const unsigned int kProtocol = 153;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
                                                  list, kBrFlagUndos, and its ledger, kBrFlagLedger) */
 
 
@@ -629,6 +630,20 @@ inline int TakeAskTail(const char* p, size_t size, AskTail* t, size_t* len)
 const unsigned int kGameProtocolBoxLock = 207u;   /* the game-to-game protocol that carries BOX_LOCK (net/session.cpp asserts it) */
 const unsigned int kMsgBoxLock = 85u;             /* net/transport.h MSG_BOX_LOCK, liveenvelope.h kInnerBoxLock (store.cpp asserts) */
 const int kBlmAsk = 1, kBlmNo = 2;
+/* T-860 (game-to-game protocol 222): a cage's lock (cagerec.h) asked of the holder of the cage's area on the same message - kBlmCage:
+   a change made on the asker's game (its lock now: lay it and write the cage's record), kBlmCageQuery: the asker has no record of
+   the cage (write your own lock as its first). Hardness is 0 on both; the answer is the cage record itself. */
+const int kBlmCage = 3, kBlmCageQuery = 4;
+/* T-860 fold 1: the holder's answers that take nothing - kBlmCageNotHolder (this game does not hold the area), kBlmCageNone (no record and
+   no cage here); the lock block repeats the asker's */
+const int kBlmCageNotHolder = 5, kBlmCageNone = 6;
+/* T-860 fold 2: the holder's answers that took a change - kBlmCageTaken (written as generation `gen`; the change ends at any record of
+   that generation or newer), kBlmCageStale (the holder's record moved past the one the change was made over: its record, generation
+   `gen`, is the newer fact). Every cage kind (3-8) carries after its lock block: u32 gen (a request: the generation of the record its
+   change was made over, 0 none; an answer: the holder's) | the base lock block (a request: that record's lock). */
+const int kBlmCageTaken = 7, kBlmCageStale = 8;
+const unsigned int kGameProtocolCageLock = 222u;
+inline bool BoxLockKindOk(int k) { return k >= kBlmAsk && k <= kBlmCageStale; }
 inline bool BoxLockValid(const BoxLock& l)
 {
     return (l.locked == 0 || l.locked == 1) && (l.broken == 0 || l.broken == 1) && l.level >= 0 && l.level <= kBrLockLevelMax
@@ -721,24 +736,32 @@ inline int BoxLockPickRoute(int verdict, int linked, int sent, unsigned long wai
    0 = refuse: NO with this game's lock (or the asker's own, locked, when this game has no box), which the asker lays. */
 inline int BoxLockAskTake(int mine, int found) { return (mine != 0 && found != 0) ? 1 : 0; }
 
-/* BOX_LOCK: u8 kind (kBlmAsk / kBlmNo) | u32 length + the box's position key (1..kBrKeyMax, height included, a key BoxKeyParse reads) |
+/* BOX_LOCK: u8 kind (kBlmAsk / kBlmNo; T-860 kBlmCage / kBlmCageQuery) | u32 length + the box's position key (1..kBrKeyMax, height included, a key BoxKeyParse reads) |
    the lock block (ASK: the picker's lock after the pick, locked 0; NO: the writer's lock, which the picker lays). Nothing follows. */
 struct BoxLockMsg
 {
     int kind;
     std::string key;
     BoxLock lock;
-    BoxLockMsg() : kind(0) {}
+    unsigned int gen;   /* T-860 fold 2: cage kinds only (above) */
+    BoxLock base;
+    BoxLockMsg() : kind(0), gen(0) {}
 };
 inline bool EncodeBoxLockMsg(std::vector<char>* out, const BoxLockMsg& m)
 {
     if (out == 0) return false;
     out->clear();
     BoxKeyParts kp;
-    if ((m.kind != kBlmAsk && m.kind != kBlmNo) || !BrTextOk(m.key, kBrKeyMax) || BoxKeyParse(m.key, &kp) == 0 || !BoxLockValid(m.lock)) return false;
+    if (!BoxLockKindOk(m.kind) || !BrTextOk(m.key, kBrKeyMax) || BoxKeyParse(m.key, &kp) == 0 || !BoxLockValid(m.lock)) return false;
     out->push_back((char)(unsigned char)m.kind);
     BrPutStr(out, m.key);
     BoxLockPut(out, m.lock);
+    if (m.kind >= kBlmCage)
+    {
+        if (!BoxLockValid(m.base)) { out->clear(); return false; }
+        BrPutU32(out, m.gen);
+        BoxLockPut(out, m.base);
+    }
     return true;
 }
 inline bool DecodeBoxLockMsg(const char* p, size_t size, BoxLockMsg* out)
@@ -746,12 +769,14 @@ inline bool DecodeBoxLockMsg(const char* p, size_t size, BoxLockMsg* out)
     if (p == 0 || size < 1) return false;
     BoxLockMsg m;
     m.kind = (unsigned char)p[0];
-    if (m.kind != kBlmAsk && m.kind != kBlmNo) return false;
+    if (!BoxLockKindOk(m.kind)) return false;
     size_t off = 1;
     if (!BrGetStr(p, size, &off, kBrKeyMax, &m.key) || !BrTextOk(m.key, kBrKeyMax)) return false;
     BoxKeyParts kp;
     if (BoxKeyParse(m.key, &kp) == 0) return false;
-    if (!BoxLockGet(p, size, &off, &m.lock) || off != size) return false;
+    if (!BoxLockGet(p, size, &off, &m.lock)) return false;
+    if (m.kind >= kBlmCage && (!BrGet4(p, size, &off, &m.gen) || !BoxLockGet(p, size, &off, &m.base))) return false;
+    if (off != size) return false;
     if (out) *out = m;
     return true;
 }
@@ -928,6 +953,54 @@ inline void BoxUndoCarry(const std::vector<BoxUndoKey>& kept, const std::vector<
     }
     while (out->size() > kBrUndoMax) { out->erase(out->begin()); if (dropped != 0) ++*dropped; }
 }
+/* T-1130: THE UNDOS AND THE KIND A GAME'S WRITE OF A BOX CARRIES. A box no player owns (ownerSlot -1) carries its undo list (BoxUndoCarry
+   over the stored record's keys and this game's own) whatever this game's label says - the label (labelKind: kBrKindShop when this
+   game lists the box as a shop piece, else kBrKindBox) is filled some seconds after a load. The write is a shop's (kind 1) whenever it
+   carries any undo - the only kind whose record may hold an undo list (BoxUndoListValid, BoxHeaderValid) - so a reader of protocol
+   145 takes the list. keptUndos (this game's kept copy of the stored record carries an undo list) is a GUARD, not a case the game
+   reaches: items.cpp BoxUndoListFor drops done undos only for a box this game labels a shop (its shop record read), so a write
+   labelled plain carries every kept undo and undoCount already decides; were a write ever to carry none over a kept list, it stays a
+   shop's - the world server refuses a kind change that drops a stored undo list (BoxKindChangeDropsUndos). A player's box carries
+   none and keeps its label. */
+inline int BoxCarriesUndos(int ownerSlot) { return ownerSlot < 0 ? 1 : 0; }
+inline int BoxWriteKind(int labelKind, int ownerSlot, size_t undoCount, int keptUndos = 0)
+{
+    return (BoxCarriesUndos(ownerSlot) != 0 && (undoCount > 0 || keptUndos != 0)) ? kBrKindShop : labelKind;
+}
+/* T-1130 TEST-ONLY lever `boxtest plainkind` (items.cpp BoxTestPlainKind / BoxPlainArmTake): may this game's next write of a box go
+   as a PLAIN box (kind 0, no undo list) - the record a shop counter's first save made when it came before the keeper's home listed the
+   counter (H-T1130-kindfreeze)? Only over a stored record (haveKept: this game keeps one) that no player owns (keptOwner and the
+   write's owner -1), that is a shop's (keptKind 1), and when neither the stored record nor this write carries an undo list (the world
+   server refuses a kind change that drops one, BoxKindChangeDropsUndos). A record already plain needs nothing sent. */
+const int kPkSend = 0, kPkNoRecord = 1, kPkOwned = 2, kPkUndos = 3, kPkPlainAlready = 4, kPkNotShop = 5;
+inline int BoxPlainKindPlan(int haveKept, int keptKind, int keptOwner, int writeOwner, size_t keptUndos, size_t writeUndos)
+{
+    if (haveKept == 0) return kPkNoRecord;
+    if (keptOwner >= 0 || writeOwner >= 0) return kPkOwned;
+    if (keptUndos > 0 || writeUndos > 0) return kPkUndos;
+    if (keptKind == kBrKindBox) return kPkPlainAlready;
+    if (keptKind != kBrKindShop) return kPkNotShop;
+    return kPkSend;
+}
+inline const char* BoxPlainKindWhy(int plan)
+{
+    switch (plan)
+    {
+    case kPkSend: return "written plain";
+    case kPkNoRecord: return "no stored record of the box is kept here (a first write is a seed - no kind to change)";
+    case kPkOwned: return "a player owns the box (its kind never changes)";
+    case kPkUndos: return "the stored record or this write carries an undo list (a plain write would drop it - the world server refuses that)";
+    case kPkPlainAlready: return "the stored record is a plain box already (kind 0) - nothing to send";
+    case kPkNotShop: return "the stored record is not a shop's (kind 1)";
+    default: break;
+    }
+    return "unknown plan";
+}
+/* the lever's arm lasts windowMs from armedAt (GetTickCount values; the difference wraps as the tick count does) */
+inline int BoxPlainKindArmLive(unsigned int now, unsigned int armedAt, unsigned int windowMs)
+{
+    return (unsigned int)(now - armedAt) < windowMs ? 1 : 0;
+}
 
 /* ---- the world server's rule ---- */
 /* 1 = slot is one of slots (a slot below 0 never is) */
@@ -947,15 +1020,31 @@ inline int BoxMayWrite(int senderSlot, int holderSlot, int ownerSlot, int ownerL
     if (ownerSlot >= 0 && ownerLoaded != 0) return senderSlot == ownerSlot ? 1 : 0;
     return (holderSlot >= 0 && senderSlot == holderSlot) ? 1 : 0;
 }
+/* T-1130: 1 = an update may change the box's kind (storage box, shop or cage): only a box no player owns, the stored record and the
+   write both naming nobody (-1). Such a box's kind is each game's LABEL from its own shop list (filled some seconds after a load), so
+   two games, or one game a moment apart, may label it differently; refusing the change froze a counter for good. A player's box
+   keeps its kind (its record id carries the height, and a shop or a cage never has an owner). */
+inline int BoxKindMayChange(int storedOwner, int sentOwner) { return (storedOwner < 0 && sentOwner < 0) ? 1 : 0; }
+/* T-1130 fold: 1 = a kind change would lose the stored record's undo list: the stored record carries one (storedUndos 1) and the
+   write none. A game of this version writes a box whose kept record carries undos as a shop's (BoxWriteKind), so only an older game's
+   write (it labels a counter from its own shop list and sends a plain box with no undo list) changes the kind that way: refused as
+   before T-1130, so a cancelled trade's undo is never lost and done twice. */
+inline int BoxKindChangeDropsUndos(int storedUndos, int sentUndos) { return (storedUndos != 0 && sentUndos == 0) ? 1 : 0; }
+/* T-1130 re-check: 1 = a decoded header says its record carries an undo list (kBrFlagUndos) - what the world server keeps of a stored
+   record as BoxJudgeWrite's storedUndos (store_main.cpp BoxStoredHead, from the file's first kBrHeaderMaxBytes bytes; BoxLanded, from
+   the bytes it stored) */
+inline int BoxHeaderUndos(const BoxHeader& h) { return (h.flags & kBrFlagUndos) != 0 ? 1 : 0; }
 /* exists: a record of this id is stored; storedGen / storedOwner / storedKind: its generation, owner slot and kind (storedKind -1 =
    not known: its header could not be read, so any kind may replace it); storedOwnerLoaded: 1 when the stored
    owner's game has the area loaded; sameBytes: 1 when the write's bytes are exactly the stored record's; seed: the write is a seed
    (kBrFlagSeed); gen / sentOwner / kind: the write's generation, owner slot and kind; sentOwnerLoaded: 1 when the owner the write
    names has the area loaded. A seed is judged against the owner it names, an update against the stored owner; a shop or a cage
-   never has an owner and no update changes the kind; an update must be newer, except the very same bytes again (kBrRepeat:
-   nothing to write); only the holder may change the owner. */
+   never has an owner and no update changes the kind of a box a player owns (BoxKindMayChange) or drops a stored undo list by changing
+   the kind (storedUndos / sentUndos: 1 when the stored record / the write carries an undo list, kBrFlagUndos; BoxKindChangeDropsUndos);
+   an update must be newer, except the very same bytes again (kBrRepeat: nothing to write); only the holder may change the owner. */
 inline int BoxAcceptRule(int exists, unsigned int storedGen, int storedOwner, int storedOwnerLoaded, int sameBytes, int seed, unsigned int gen,
-                         int sentOwner, int sentOwnerLoaded, int kind, int senderSlot, int holderSlot, int storedKind)
+                         int sentOwner, int sentOwnerLoaded, int kind, int senderSlot, int holderSlot, int storedKind,
+                         int storedUndos = 0, int sentUndos = 0)
 {
     if (exists == 0)
     {
@@ -967,18 +1056,20 @@ inline int BoxAcceptRule(int exists, unsigned int storedGen, int storedOwner, in
     if (BoxMayWrite(senderSlot, holderSlot, storedOwner, storedOwnerLoaded) == 0) return kBrRefuseNotWriter;
     if (gen < storedGen) return kBrRefuseOlder;
     if (gen == storedGen) return sameBytes != 0 ? kBrRepeat : kBrRefuseSameGen;
-    if (storedKind >= 0 && kind != storedKind) return kBrRefuseKindChange;
+    if (storedKind >= 0 && kind != storedKind
+        && (BoxKindMayChange(storedOwner, sentOwner) == 0 || BoxKindChangeDropsUndos(storedUndos, sentUndos) != 0)) return kBrRefuseKindChange;
     if (sentOwner >= 0 && kind != kBrKindBox) return kBrRefuseOwnerKind;
     if (sentOwner != storedOwner && !(holderSlot >= 0 && senderSlot == holderSlot)) return kBrRefuseOwnerChange;
     return kBrAccept;
 }
 /* A whole write judged: the id must parse, the bytes decode, the header's key name this id's box and its writer slot be the
    sender's, then BoxAcceptRule. loadedSlots: the slots whose games the area map shows with the box's area loaded now. storedOwner /
-   storedKind: the STORED record's owner slot (-1 = nobody's, or no record) and kind (-1 = not known, or no record). sameBytes: 1 when the bytes are exactly the stored record's (the
+   storedKind: the STORED record's owner slot (-1 = nobody's, or no record) and kind (-1 = not known, or no record); storedUndos: 1 when
+   the stored record carries an undo list (its header's kBrFlagUndos; 0 = none, not known or no record). sameBytes: 1 when the bytes are exactly the stored record's (the
    server tests it when the generations are equal). *hOut (may be 0): the decoded header (left default when the bytes do not
    decode). kBrAccept: store it; kBrRepeat: taken, nothing to store; anything else: refused. */
 inline int BoxJudgeWrite(const std::string& id, const char* p, size_t size, int senderSlot, int holderSlot, const std::vector<int>& loadedSlots,
-                         int exists, unsigned int storedGen, int storedOwner, int storedKind, int sameBytes, BoxHeader* hOut)
+                         int exists, unsigned int storedGen, int storedOwner, int storedKind, int sameBytes, BoxHeader* hOut, int storedUndos = 0)
 {
     if (BoxRecIdParse(id, 0, 0, 0, 0, 0) == 0) return kBrRefuseBadId;
     BoxHeader h;
@@ -987,7 +1078,8 @@ inline int BoxJudgeWrite(const std::string& id, const char* p, size_t size, int 
     if (BoxRecIdOfHeader(h) != id) return kBrRefuseWrongBox;
     if (senderSlot < 0 || h.writerSlot != senderSlot) return kBrRefuseWriter;
     return BoxAcceptRule(exists, storedGen, storedOwner, BrSlotIn(loadedSlots, storedOwner), sameBytes, (h.flags & kBrFlagSeed) != 0 ? 1 : 0,
-                         h.generation, h.ownerSlot, BrSlotIn(loadedSlots, h.ownerSlot), h.kind, senderSlot, holderSlot, storedKind);
+                         h.generation, h.ownerSlot, BrSlotIn(loadedSlots, h.ownerSlot), h.kind, senderSlot, holderSlot, storedKind,
+                         storedUndos, h.undos.empty() ? 0 : 1);
 }
 /* A removal judged: the id must parse and the sender be the stored record's owner or the area's holder - whichever of the two is the
    writer now. A removal is sent only when the box's piece is taken down (by its owner's game, perhaps queued while the link was down
@@ -1021,7 +1113,7 @@ inline const char* BoxRefuseWhy(int why)
          : why == kBrRefuseOwnerKind ? "it gives a shop or a cage an owner, and only a storage box has one"
          : why == kBrRefuseSameGen ? "its generation equals the stored record's and its bytes differ"
          : why == kBrRepeat ? "the very same bytes again (taken, nothing written)"
-         : why == kBrRefuseKindChange ? "it changes the box's kind (storage box, shop or cage)"
+         : why == kBrRefuseKindChange ? "it changes the kind (storage box, shop or cage) of a box a player owns, or drops the stored record's undo list"
          : "refused";
 }
 
@@ -2570,6 +2662,15 @@ inline int BoxOwedChoose(unsigned long long besideFt, unsigned long long saveFt,
     if (BoxOwedFileCurrent(besideFt, saveFt) != 0) return kOwUseBeside;
     if (copyHave != 0 && saveFt != 0ULL && copyReqFt != 0ULL && copyReqFt <= saveFt) return kOwUseCopy;
     return kOwUseNone;
+}
+/* T-1280 fold 1c (N1): a landed save whose two owed files were both held keeps its rows in memory (memHave, with its request's time).
+   At a load of that save they answer ahead of the copy - which then holds an EARLIER save's rows - unless a file beside is current
+   (written after the quick.save: a later save's own). Requested after the quick.save: not that save's. Pure. */
+const int kOwUseMemory = 3;
+inline int BoxOwedChooseMem(int use, int memHave, unsigned long long memReqFt, unsigned long long saveFt)
+{
+    if (use == kOwUseBeside || memHave == 0 || saveFt == 0ULL || memReqFt == 0ULL || memReqFt > saveFt) return use;
+    return kOwUseMemory;
 }
 /* the copy's key text: the save's folder as a full path, lower case (one save, however its folder was spelt) */
 inline std::string BoxOwedCopyKey(const std::string& fullDir)

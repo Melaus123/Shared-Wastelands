@@ -213,14 +213,16 @@ inline void ReadRec(Reader& r, Rec* rec)
     if (rec->type == kRecCharacter && ip != ints.end()) rec->portrait = ip->second;
 }
 
-/* Reads the whole file; false when any part of it does not parse or bytes are left over. */
-inline bool ParseAll(const unsigned char* b, size_t n, std::vector<Rec>* out)
+/* Reads the whole file; false when any part of it does not parse or bytes are left over. T-1243: ParseAllAt also says where reading
+   ended (*stop, when given): n for a file read to its end; otherwise the first byte of the field that could not be read, or the first
+   byte left over. The check is the same one ParseAll has always made (src/common/zonecheck.h uses it for area records). */
+inline bool ParseAllAt(const unsigned char* b, size_t n, std::vector<Rec>* out, size_t* stop)
 {
     out->clear();
     Reader r(b, n);
     r.I(); r.I();   /* version, last id */
     const int count = r.Count(60);
-    if (!r.ok) return false;
+    if (!r.ok) { if (stop != 0) *stop = r.p; return false; }
     out->resize((size_t)count);
     for (int k = 0; k < count && r.ok; ++k) ReadRec(r, &(*out)[(size_t)k]);
     if (r.ok && r.p < n)
@@ -229,8 +231,10 @@ inline bool ParseAll(const unsigned char* b, size_t n, std::vector<Rec>* out)
         const int tail = r.Count(4);
         r.Skip((size_t)tail * 4);
     }
+    if (stop != 0) *stop = r.p;
     return r.ok && r.p == n;
 }
+inline bool ParseAll(const unsigned char* b, size_t n, std::vector<Rec>* out) { return ParseAllAt(b, n, out, 0); }
 
 inline void AppendPart(std::string* key, const std::string& part)
 {

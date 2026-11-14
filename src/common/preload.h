@@ -33,8 +33,9 @@
  * The game asks at the title, with its load posted and held in the save-request pump (store.cpp SaveRequestPumpBody, under the
  * loading screen SaveManager::load turned on), takes every record the index names NEWER than its own table (PreWant), writes the
  * fetched records into its mirror only (no engine memory - there is no world), and lets the load go when every batch is
- * answered, or the link fails, or kPreBoundMs passes (a counted STALE LOAD). A world server one protocol behind would count the
- * new kinds as malformed and never answer, so the pair SHIPS TOGETHER (protocol 66 -> 67).
+ * answered (T-1279: with no time bound while the link is up - PreWaitDecide). A world server one protocol behind would count the
+ * new kinds as malformed and never answer, so the pair SHIPS TOGETHER (protocol 66 -> 67). T-1279 (design B): the fetch keeps the
+ * ring (T-1175) - an area loaded later in the session waits for its own record at its load (areafresh.h kWaitRecord).
  *
  * WIRE: u8 kind, three zero bytes, then the kind's fields, little-endian (recordfeed.h's helpers); a string is u32 length + bytes
  * (<= coopfeed::kFeedKeyMax). Nothing may follow the last field. */
@@ -52,7 +53,7 @@
 
 namespace cooppre {
 
-const unsigned int kPreProtocol = 145;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
+const unsigned int kPreProtocol = 153;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
 
 
 
@@ -63,7 +64,8 @@ enum { kPreIndexAsk = 5, kPreIndexPage = 6, kPreFetch = 7, kPreFetchEnd = 8 };
 const size_t kPreIndexPageEntries = 4096;          /* at most this many index rows a page */
 const size_t kPreIndexPageBytes = 512u * 1024u;    /* and about this many bytes */
 const size_t kPreFetchBatch = 256;                 /* keys per FETCH */
-const unsigned int kPreBoundMs = 60000;            /* the longest the load is held (decision 256 a); then a counted stale load */
+const unsigned int kPreWaitNoteMs = 60000;         /* T-1279 (owner decision 1580 a): NOT a bound - a held load says it is still held every
+                                                      this many ms; the load waits for the world server's records with no time limit */
 const int kPreGrid = 64;                           /* an area is x,y on the 64 x 64 grid (areafile.h, liverelay.h) */
 const int kPreRing = 2;                            /* the ring round the area list that the load's fetch covers (areafile::kRing) */
 const int kPreRingMax = 8;                         /* the widest ring an INDEX_ASK may name */
@@ -499,18 +501,59 @@ inline void PreStaleKeys(const PreState& s, std::set<std::string>* out)
     for (size_t i = 0; i < s.want.size(); ++i) if (s.settled.find(s.want[i]) == s.settled.end()) out->insert(s.want[i]);
 }
 
-/* THE WAIT'S EXIT RULE (game, every pump frame while the load is held) - a recurring check on the state, never a fixed delay:
-   Go once every batch is answered (Done); StaleLink once the link this exchange began on is down or replaced; StaleTimeout at
-   the bound; otherwise Wait. A state that is not in flight (Idle / Released) never holds the load. */
-enum { kPreWait = 0, kPreGo = 1, kPreStaleLink = 2, kPreStaleTimeout = 3 };
-inline int PreWaitDecide(int phase, int linkOk, unsigned int elapsedMs, unsigned int boundMs)
+/* THE WAIT'S EXIT RULE (game, every pump frame while the load is held) - a recurring check on the state, never a fixed delay.
+   T-1279 (owner decision 1580 a, 2026-11-09: "One true world - records win"; the 60 s bound of decision 256 a is gone): the load
+   waits until the world server's records are in, however long that takes while its link is up; it never falls back to this game's
+   own save-file copies because time passed. The standard of an authoritative server: a client enters only the server's state, and
+   never plays a local copy whose writes the server will discard. Inputs: linkOk = the link this exchange began on is up and welcomed;
+   linkUpNow = a link is up and welcomed now (and the record index is read) - another generation than the exchange's when linkOk = 0;
+   linkCanServe = the world server may still answer this game (its address is set - not the link object, which a failed dial deletes
+   while the re-dial keeps the address (review finding 3); it has not refused this game's protocol, named another world or refused
+   the join); dialPending = a dial of it is still to come or in flight (the link is connecting or mid-handshake, or the title's re-dial
+   has dials left - a joining game only; a host's game never re-dials at the title); stalled = the exchange's own progress fact is
+   broken (PreStalled). Go once every batch is answered (Done); on the exchange's link: Restart when stalled (begun again on the same
+   link - review finding 2), else Wait; off it: StaleLink when the world server can never answer (the load goes with this game's own
+   copies, a logged fault - nothing of this world is written from that game anyway); Restart when a new link is up (what was fetched
+   is in the mirror and not asked again); Wait while a dial is pending (the connection-trouble notice covers a long one); Refuse when
+   none is (review finding 1, 2026-11-09 owner: not reaching the world server while loading IS being disconnected): the load is
+   refused as the join gate refuses it - the request cleared, the loading screen off, the existing CAN'T JOIN box - never loaded
+   from the save file. A state that is not in flight (Idle / Released) never holds the load. kPreStaleTimeout is no longer an
+   answer (kept: the report's column). */
+enum { kPreWait = 0, kPreGo = 1, kPreStaleLink = 2, kPreStaleTimeout = 3, kPreRestart = 4, kPreRefuse = 5 };
+inline int PreWaitDecide(int phase, int linkOk, int linkUpNow, int linkCanServe, int dialPending, int stalled)
 {
     if (phase == kPhDone) return kPreGo;
     if (phase != kPhIndex && phase != kPhFetch) return kPreGo;
-    if (!linkOk) return kPreStaleLink;
-    if (elapsedMs >= boundMs) return kPreStaleTimeout;
-    return kPreWait;
+    if (linkOk) return stalled ? kPreRestart : kPreWait;
+    if (!linkCanServe) return kPreStaleLink;
+    if (linkUpNow) return kPreRestart;
+    return dialPending ? kPreWait : kPreRefuse;
 }
+/* T-1279: THE START OF A HELD LOAD (game, the title load about to dispatch, no exchange yet). linkReady = the link is up and
+   welcomed and the record index is read; linkCanServe / dialPending as above. Ask = begin the exchange now; WaitLink = hold the
+   load until the link is up (the loading screen stays); NotAsked = no world server can answer this game: the load goes as before
+   (not asked); Refuse = the link is down and no dial is pending - refused as PreWaitDecide's kPreRefuse. */
+enum { kPreBeginAsk = 0, kPreBeginWaitLink = 1, kPreBeginNotAsked = 2, kPreBeginRefuse = 3 };
+inline int PreBeginDecide(int linkReady, int linkCanServe, int dialPending)
+{
+    if (linkReady) return kPreBeginAsk;
+    if (!linkCanServe) return kPreBeginNotAsked;
+    return dialPending ? kPreBeginWaitLink : kPreBeginRefuse;
+}
+/* T-1279 (review finding 2): THE EXCHANGE'S PROGRESS FACT. brokeFact = this exchange's chain of asks is known broken - its next ask
+   could not be sent, or an answer was dropped as malformed - so no answer is coming on this link; sinceProgressMs = since the
+   exchange began or last moved (an index page, a fetched record or a FETCH_END of its own token). Stalled = broken, or no progress
+   for kPreStallMs (a backstop for an answer the world server did not send - longer than one ~512 KB index page or ~1 MB fetch answer
+   takes at 8 KB/s, so a slow link is never read as a stall). Stalled on the exchange's link = Restart on the same link (re-armed
+   until Done, design principle 4; each restart logged). */
+const unsigned int kPreStallMs = 180000;
+inline int PreStalled(int brokeFact, unsigned int sinceProgressMs) { return (brokeFact != 0 || sinceProgressMs >= kPreStallMs) ? 1 : 0; }
+/* T-1279 fold 2 (re-check E): an answer dropped as malformed breaks the exchange's chain (brokeFact) only while an exchange is in
+   flight (Index or Fetch): no answer to its ask is coming, so it begins again on its link at the next held frame, not at kPreStallMs */
+inline int PreMalformedBreaks(int phase) { return (phase == kPhIndex || phase == kPhFetch) ? 1 : 0; }
+/* T-1279 fold 2 (re-check A): the DONE line's "since the first index ask" - taken when the exchange finishes (PreloadFinish), BEFORE
+   the first-ask time is zeroed there; 0 = no index ask was sent */
+inline unsigned int PreSinceFirstAsk(unsigned int firstAskMs, unsigned int nowMs) { return firstAskMs != 0 ? (unsigned int)(nowMs - firstAskMs) : 0u; }
 
 }   /* namespace cooppre */
 

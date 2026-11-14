@@ -23,6 +23,7 @@
 #include "playerfaction.h"   // P3: the player faction travels as "@player:<name>" (decision 23)
 #include "../common/standinpurge.h"   /* inv7a-b: IsStandInRecord - the purge's own stand-in test */
 #include <map>   /* area2 fold: the sweep's per-faction stand-in answer */
+#include <set>   /* T-1318 a4 fold 1: the re-made given bodies' queue */
 #include "../common/uidtable.h"   /* mirror1 fold (review-mirror1 #3): SweepRefusalAction / LogRefusal, offline-tested */
 #include "../common/retirewithdraw.h"   /* P8m (H-ghost): the pending-withdraw transition as a pure function, swept by the offline suite */
 
@@ -47,6 +48,7 @@
 #include <locale>
 #include <cmath>
 
+namespace coop { bool DestroyLocalObject(void* obj); }   /* T-1318 a4 fold 1: worldgen.cpp (worldgen.h) - the mod's own destroy of one object */
 namespace coop {
 
 namespace {
@@ -417,6 +419,7 @@ void SetWorldSync(int mode, int budget)
 // the bounded wait after which slot 0 used to: the sweep re-walks every un-adopted character each pass, so the
 // holder adopts and announces once the map is fresh again. One answer for every game.
 long long g_worldAdoptable = 0, g_skippedOtherHeld = 0, g_skippedNoMap = 0;
+long long g_skippedNobodyYet = 0;   /* T-1268: characters skipped because the fresh map names nobody the area's holder yet (once per tick per character) */
 /* P8e (build/read-host-audit.md C5/C6, F669): the number that replaces the role (its sibling,
    the bounded no-map wait's counter, is RETIRED by P97).  `reannounceDrained` is rows the re-announce queue actually walked, which nothing counted while the
    drain was host-only and a client's zero could not be told from a queue that was empty. */
@@ -427,8 +430,61 @@ long long g_sweepWakeDupSkipped = 0; int g_sweepWakeDupLogged = 0;   /* people o
 long long g_sweepContextSkipped = 0; int g_sweepContextLogged = 0;   /* rebuilt people of a context platoon the sweep did not adopt */
 long long g_sweepContextTakeBack = 0;   /* T-1229: rebuilt people of a context platoon whose last sleep here held only this game's people - sent on to the adoption rules */
 std::map<const void*, int> g_sweepContextTakeBackLogged;   /* T-1229: the platoons already logged (one line each; the first 32) */
-long long g_sweepHandedOverSkipped = 0, g_sweepHandedOverAdopted = 0; int g_sweepHandedOverLogged = 0;   /* M7a3f3 T-425 [m7a3f3-ws2] */
+long long g_sweepHandedOverSkipped = 0, g_sweepHandedOverAdopted = 0; int g_sweepHandedOverLogged = 0;   /* M7a3f3 T-425 [m7a3f3-ws2]; adopted: nothing raises it since T-1318 (kept on the REPORT, 0) */
+long long g_contextTakeBackRefused = 0; int g_contextTakeBackRefusedLogged = 0;   /* T-1318: context take-backs refused - the squad index has people of the squad given */
+long long g_sweepOpenSkipped = 0; int g_sweepOpenLogged = 0;   /* T-1318 fold 2: rebuilt people of a squad whose hand-over is open here (offer sent, no answer yet), left for the answer */
+long long g_sweepWholeNotGiven = 0, g_sweepWholeNotGivenLogged = 0;   /* T-1318 attempt 4 (design A, site 9): rebuilt people of a squad the index calls wholly given whose own hand is not given - decided by the sweep's rules (numbered) */
+/* T-1318 a4 fold 1 (review MEDIUM-2): re-made bodies of a squad woken here with given people whose own hand is GIVEN (another game runs the
+   person) - queued by the sweep's pass 0, removed at the next sweep by the mod's own destroy (DestroyLocalObject); counted givenRemake[..] */
+std::set<const void*> g_givenRemakeQ;
+long long g_givenRemakeQueued = 0, g_givenRemakeRemoved = 0, g_givenRemakeGone = 0, g_givenRemakeNumbered = 0, g_givenRemakeFailed = 0, g_givenRemakeLogged = 0;
+/* T-1318 a4 fold 2 (re-check MEDIUM-A): queued bodies dropped (never destroyed) because their identity no longer held at the drain - a
+   player's character (or its faction unread), no squad key, its own hand no longer surely given, its squad no longer woken with given
+   people - and the queue emptied at the world teardown (an address of the freed world is never destroyed in the next one) */
+long long g_givenRemakePlayer = 0, g_givenRemakeNoKey = 0, g_givenRemakeNotGiven = 0, g_givenRemakeNotWoke = 0, g_givenRemakeTeardown = 0;
+long long g_sweepGivenPersonSkipped = 0, g_sweepGivenHandUnread = 0;   /* T-1318 fold 1: rebuilt people skipped because THEY are given (a squad given in part); people of such a squad whose hand did not read */
 long long g_sweepStandInSkipped = 0;   /* inv7a-b: stand-in copies (faction RECORD coop-p<n> / coop-peer) the sweep met and did not adopt (pass 0 only) */
+/* T-1318 a4 fold 1 (review MEDIUM-2): the queued re-made given bodies, each removed only while the engine still lists it this tick, has no
+   uid (the sweep numbered nobody of it since) and engine writes are open. MAIN THREAD, before the sweep reads its list. */
+static ::Faction* SweepFactionPod(::Character* c);   /* below: the faction read under its own frame */
+static void GivenRemakeDrain()
+{
+    if (g_givenRemakeQ.empty() || EngineWritesBlocked() || !PlausiblePtr(coop::GameWorldPtr())) return;
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() > 20000) { g_givenRemakeQ.clear(); return; }
+    std::vector< ::Character*> live;   /* collected first: the destroy may change the list */
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+        if (*it != 0 && g_givenRemakeQ.count((const void*)*it) != 0) live.push_back(*it);
+    g_givenRemakeGone += (long long)(g_givenRemakeQ.size() - live.size());
+    g_givenRemakeQ.clear();
+    for (size_t i = 0; i < live.size(); ++i)
+    {
+        /* T-1318 a4 fold 2 (re-check MEDIUM-A): the body's identity read again before the destroy (an address reused since it was queued is
+           another body): still listed (above), no uid, not a player's character, its squad's key read, its own hand given (HandoffPersonGiven
+           1), its squad woken here with given people - coopsquad::GivenRemakeDrainStep; any failing check drops it from the queue, counted */
+        const unsigned int ruid = FindSpawnedUid(live[i]);
+        ::Faction* rf = ruid == 0 ? SweepFactionPod(live[i]) : 0;
+        const int rplayer = ruid != 0 ? 0 : (rf == 0 ? -1 : (IsPlayerFaction(rf) ? 1 : 0));
+        void* kf = 0; std::string kid;
+        const int rkey = (ruid == 0 && rplayer == 0 && SquadKeyOf(live[i], &kf, &kid)) ? 1 : 0;
+        const int rgiven = rkey != 0 ? HandoffPersonGiven(kf, kid, (const void*)live[i]) : 0;
+        const int rwoke = rkey != 0 ? HandoffWokeWithGiven(kf, kid) : 0;
+        const int step = coopsquad::GivenRemakeDrainStep(1, ruid, rplayer, rkey, rgiven, rwoke);
+        if (step == coopsquad::kGrNumbered) { ++g_givenRemakeNumbered; continue; }
+        if (step == coopsquad::kGrPlayer) { ++g_givenRemakePlayer; continue; }
+        if (step == coopsquad::kGrNoKey) { ++g_givenRemakeNoKey; continue; }
+        if (step == coopsquad::kGrNotGiven) { ++g_givenRemakeNotGiven; continue; }
+        if (step != coopsquad::kGrDestroy) { ++g_givenRemakeNotWoke; continue; }
+        const bool ok = DestroyLocalObject((void*)live[i]);
+        if (ok) ++g_givenRemakeRemoved; else ++g_givenRemakeFailed;
+        if (g_givenRemakeLogged < 20)
+        {
+            ++g_givenRemakeLogged;
+            DebugLog(std::string("[P033] sweep: a re-made body of a squad woken here with given people, whose own hand is GIVEN (another game runs the person), ") + (ok ? "REMOVED" : "NOT removed (no world / hook)")
+                     + " - no person shown on two games (T-1318 a4 fold 1; givenRemake removed=" + S(g_givenRemakeRemoved) + " failed=" + S(g_givenRemakeFailed) + "; the first 20)");
+        }
+    }
+}
 static ::Faction* SweepFactionPod(::Character* c)   /* area2 fold: the faction read under its own frame (the purge's PurgeFactionPod form) */
 {
     __try { return c->getOwnerFactionDirect(); }
@@ -442,10 +498,15 @@ static ::Faction* SweepFactionPod(::Character* c)   /* area2 fold: the faction r
    P97 (owner 334 a / 337 a): THREE answers now - the fourth, the no-map fallback that let slot 0 adopt after
    20 s, is RETIRED.  The answer is coopor::AnnounceArea (src/common/orphanpurge.h), a pure function of the
    area map's answer swept by the offline suite; with no fresh map it is "skip" on every game. */
-enum { kAreaAdoptable = coopor::kAnnounceAdoptable, kAreaOtherHeld = coopor::kAnnounceOtherHeld, kAreaNoMap = coopor::kAnnounceNoMap };
+enum { kAreaAdoptable = coopor::kAnnounceAdoptable, kAreaOtherHeld = coopor::kAnnounceOtherHeld, kAreaNoMap = coopor::kAnnounceNoMap, kAreaNobodyYet = coopor::kAnnounceNobodyYet };
+/* T-1268: held and mine from ONE locked read of the area map (AreaViewTS), so "another game holds it" and "the map names me"
+   cannot come from two different maps. An unheld area is no longer adoptable on every game that has it: only the named holder
+   adopts (kAreaNobodyYet is skipped like no map until the map names a holder). */
 static int AnnounceAreaDecide(float x, float z)
 {
-    return coopor::AnnounceArea(HeldByOtherTS(SectorOf(x, z)));
+    int held = -1, mine = -1;
+    AreaViewTS(SectorOf(x, z), &held, &mine, 0, 0, 0, 0);
+    return coopor::AnnounceArea(held, mine);
 }
 /* review-p8a M-4: the dead first read is gone.  `const int held = HeldByOtherTS(...)` was never used
    again - AnnounceAreaDecide reads it a second time - and HeldByOtherTS takes g_heldLock, so it was a
@@ -455,6 +516,7 @@ static bool AnnounceAreaMine(float x, float z, bool count)   /* count: once per 
     const int d = AnnounceAreaDecide(x, z);
     if (d == kAreaOtherHeld) { if (count) ++g_skippedOtherHeld; return false; }
     if (d == kAreaNoMap) { if (count) ++g_skippedNoMap; return false; }
+    if (d == kAreaNobodyYet) { if (count) ++g_skippedNobodyYet; return false; }   /* T-1268: no OrphanNote either - nobody holds it, so it is nobody's orphan */
     if (count) ++g_worldAdoptable; return true;
 }
 
@@ -678,13 +740,13 @@ static int SweepNumberNextHas(::Character* c)
     return 0;
 }
 /* T-1007 (J2): THE SWEEP'S AREA RULE AS AN ANSWER for a trader caravan's unnumbered members (items.cpp ShopCaravanArea), so the
-   game that trades with such a caravan is the game whose sweep numbers it: AnnounceAreaDecide (HeldByOtherTS of the sector) - 1
-   this game's (AnnounceAreaMine's true), 2 another game holds it, 0 no map. MAIN THREAD. */
+   game that trades with such a caravan is the game whose sweep numbers it: AnnounceAreaDecide (the area map's held / mine) - 1
+   this game's (AnnounceAreaMine's true), 2 another game holds it, 0 no map or (T-1268) nobody named yet. MAIN THREAD. */
 int SweepAreaAnswer(float x, float z)
 {
     const int d = AnnounceAreaDecide(x, z);
     if (d == kAreaOtherHeld) return 2;
-    if (d == kAreaNoMap) return 0;
+    if (d == kAreaNoMap || d == kAreaNobodyYet) return 0;
     return 1;
 }
 static void SweepNumberNextScanEnd(bool full)
@@ -875,6 +937,44 @@ static bool AnnounceHeldByOther(::Character* c, const Ogre::Vector3& pos, int* w
 #endif
     if (whyOut) *whyOut = why;
     return held;
+}
+/* T-1178 (F-T2357-ORIGINSPOT): THE SPOT THE 1 Hz PASS JUDGES A CHARACTER BY. Its own spot, unless that reads the world origin
+   (cooplive::AnnounceSpotAtOrigin - T2357: a dialogue recruit's own spot read 0,0,0 during the character editor's pause while its
+   squad's spot was right); then, on the own-spot road, the squad's spot when it reads (kAnnSpotSquad: *judge takes its x and z), or
+   nothing is decided this pass (kAnnSpotKeep). Counted on REPORT as announceOwnSpotUnread[squad,kept,spawnHeld]; the first
+   kAnnOwnSpotLinesMax answers off the own spot get a line, with the engine's body-built answer (CharacterBuilt) beside it, so a run shows
+   whether the body was being re-made at that moment. MAIN THREAD (the pass). */
+static long long g_annOwnSpotSquad = 0, g_annOwnSpotKept = 0, g_annOwnSpotSpawnHeld = 0, g_annOwnSpotLines = 0;
+static long long g_areaKeyOrigin = 0;   /* T-1178 fold 2 (M1): CharAreaKeyNow reads that named no area - the own spot at the world origin */
+static long long g_catchupOriginHeld = 0, g_catchupOriginLines = 0;   /* T-1178 fold 2b: CatchupCharReads rows refused at the world origin */
+static long long g_reannounceOriginKept = 0;   /* T-1178 fold 2 (L2): re-announce rows left as they were - no spot to judge by, or a held one at the origin */
+static const long long kAnnOwnSpotLinesMax = 20;
+static int AnnounceJudgeSpot(::Character* c, unsigned int uid, const Ogre::Vector3& pos, Ogre::Vector3* judge)
+{
+    *judge = pos;
+    const int atOrigin = cooplive::AnnounceSpotAtOrigin(pos.x, pos.y, pos.z);
+    if (atOrigin == 0) return cooplive::kAnnSpotOwn;
+    SquadView sv;
+    float sqx = 0, sqz = 0;
+    const int sqGot = (ReadSquadOf(c, &sv) == 1 && sv.ap != 0 && SquadDecisionPosAt(sv, &sqx, &sqz) == 1) ? 1 : 0;
+    const int sqRead = cooplive::AnnounceSquadSpotUsable(sqGot, sqx, sqGot ? sv.y : 0.0f, sqz);   /* T-1178 fold 2 (L1): not a squad spot in the origin band either */
+    const int ownRoad = (IsPlayerFaction(c->getOwnerFactionDirect()) || sqRead == 0) ? 1 : 0;   /* AnnounceHeldByOther's own-spot test */
+    const int ch = cooplive::AnnounceSpotChoice(ownRoad, atOrigin, sqRead);
+    if (ch == cooplive::kAnnSpotSquad) { judge->x = sqx; judge->z = sqz; ++g_annOwnSpotSquad; }
+    else if (ch == cooplive::kAnnSpotKeep) ++g_annOwnSpotKept;
+    if (ch != cooplive::kAnnSpotOwn && g_annOwnSpotLines < kAnnOwnSpotLinesMax)
+    {
+        ++g_annOwnSpotLines;
+        int builtWhy = -1;
+        const int built = CharacterBuilt(c, &builtWhy);
+        DebugLog("[P033] announce own spot unread uid=" + S((long long)uid) + " spot=" + S((long long)pos.x) + "," + S((long long)pos.y) + "," + S((long long)pos.z)
+                 + " (the world origin) - " + (ch == cooplive::kAnnSpotSquad
+                     ? "judged by its squad's spot " + S((long long)sqx) + "," + S((long long)sqz) + " area=" + SectorString(SectorOf(sqx, sqz))
+                     : std::string("no squad spot read: kept this pass, nothing withdrawn or announced"))
+                 + " bodyBuilt=" + S((long long)built) + " builtWhy=" + S((long long)builtWhy)
+                 + " (#" + S(g_annOwnSpotLines) + "/" + S(kAnnOwnSpotLinesMax) + ")");
+    }
+    return ch;
 }
 // PROBE-START: P166
 #ifdef SW_DEV_BUILD
@@ -1080,9 +1180,14 @@ static void AnnouncePass()
            area another game holds), so its whole squad is withdrawn or announced together; a player-faction character keeps its own.
            Loaded here and the hand-over read the squad's spot dp (the engine sleeps and wakes the squad whole by it). pos stays the
            character's own (its SPAWN) */
-        Ogre::Vector3 dp = AnnounceDecisionPos(c, pos);
+        /* T-1178 (F-T2357-ORIGINSPOT): an own spot at the world origin is not a 'not held' answer - judged by the squad's spot, or not
+           at all this pass (AnnounceJudgeSpot); jp is the spot judged, pos stays the one a SPAWN carries */
+        Ogre::Vector3 jp = pos;
+        const int spotChoice = AnnounceJudgeSpot(c, uid, pos, &jp);
+        if (spotChoice == cooplive::kAnnSpotKeep) continue;
+        Ogre::Vector3 dp = AnnounceDecisionPos(c, jp);
         int annWhy = 0;
-        const bool held = AnnounceHeldByOther(c, pos, &annWhy);
+        const bool held = AnnounceHeldByOther(c, jp, &annWhy);
         /* W1-b (T240; review 2026-09-22 H2/H3): with the relay present `held` reads the EFFECTIVE area map (zones.cpp
            ApplyRelayAreaMap -> g_otherLoaded), in which a reporter absent from the latest AREAMAP keeps its last known
            areas - so an absent reporter never reads as holding nothing, and a present one that walked away reads exactly
@@ -1130,6 +1235,7 @@ static void AnnouncePass()
         if (ann == cooplive::kAnnUnload) { if (ReleasePendingHas(uid)) { /* M7a3f1 #8: HELD - its squad's hand-over is owed; the owed outcome decides */ } else if (net::SendUnload(uid, 1)) { g_announced[uid] = 0; ++g_unloadsSent; UnloadSentNote(uid, kUnloadWhyAnnounce); if (held) ++g_withdrawnOwnUnload; } }   /* held == true here means !mineLoaded is the reason, i.e. this is a withdrawal the old rule would NOT have made */
         else if (ann == cooplive::kAnnSpawn)
         {
+            if (cooplive::AnnounceSpawnSpotOk(cooplive::AnnounceSpotAtOrigin(pos.x, pos.y, pos.z)) == 0) { ++g_annOwnSpotSpawnHeld; continue; }   /* T-1178: never a SPAWN at the origin */
             GameData* gd = c->getRecordDirect(); Faction* f = c->getOwnerFactionDirect();
             if (!PlausibleObject(gd) || !PlausibleObject(f)) continue;
             SendContextFor(uid, c);
@@ -1226,14 +1332,21 @@ void WorldSyncTick()
         // adopted as suppressed puppets and driven every tick, and the drift they do show is
         // already explained by adoption distance (F294), not by their container.
             if (coopslot::WireLacksSlot(WireFactionName(f))) { coop::NoteHeldForSlot(); g_announced[row.uid] = 0; continue; }   /* stand1 fold (1d): held, not dropped */
+            /* T-1178 fold 2 (L2, F-T2357-ORIGINSPOT): judged by the same spot as the 1 Hz pass (AnnounceJudgeSpot) - an own spot at the
+               world origin neither marks the character unannounced (which would make the pass SPAWN it again to a game that still has the
+               copy) nor sends a SPAWN from the origin; the mark stands and the pass decides once the spot reads a place */
+            Ogre::Vector3 jp = pos;
+            const int linkChoice = AnnounceJudgeSpot(c, row.uid, pos, &jp);
             int linkWhy = 0;
-            const bool linkHeld = AnnounceHeldByOther(c, pos, &linkWhy);
+            const bool linkHeld = linkChoice == cooplive::kAnnSpotKeep ? false : AnnounceHeldByOther(c, jp, &linkWhy);
+            const int reann = cooplive::ReannounceSpotDecide(linkChoice, linkHeld ? 1 : 0, cooplive::AnnounceSpotAtOrigin(pos.x, pos.y, pos.z));
+            if (reann == cooplive::kReannKeep) { ++g_reannounceOriginKept; continue; }
             // PROBE-START: P166
 #ifdef SW_DEV_BUILD
             P166Note(kP166Link, c, row.uid, pos, linkHeld ? kP166DecSpawn : kP166DecWithheld, linkWhy);
 #endif
             // PROBE-END: P166
-            if (!linkHeld) { if (RelayMapFresh()) g_announced[row.uid] = 0; ++g_withheld; continue; }   /* M7a3 P3: with no fresh area map nobody can say the peer lacks it - the entry is left as it was */   // M-A step 2
+            if (reann == cooplive::kReannWithhold) { if (RelayMapFresh()) g_announced[row.uid] = 0; ++g_withheld; continue; }   /* M7a3 P3: with no fresh area map nobody can say the peer lacks it - the entry is left as it was */   // M-A step 2
             SendContextFor(row.uid, c);   // M-B: CONTEXT before SPAWN, same reliable channel, so the copy is created with it
             if (net::SendSpawn(row.uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c))
             {
@@ -1289,6 +1402,7 @@ void WorldSyncTick()
     /* M4 fold 2 (re-check L-A): a tick that cannot mint still walks the candidates - the orphan notes and the stand-in purge
        requests of pass 0 are not about minting - and stops only before the registration of `best` (below). */
     const bool uidMintable = coop::SpawnUidMintReady();
+    GivenRemakeDrain();   /* T-1318 a4 fold 1 (review MEDIUM-2): last pass's re-made given bodies, before the list is read */
 
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
     size_t n = all.size();
@@ -1391,6 +1505,23 @@ void WorldSyncTick()
                     int sc = 0, sk = 0, sm = 0;
                     const int held = StoreCtxSleptCounts(csv.platoon, &sc, &sk, &sm);
                     ctxAns = coopsquad::ContextSweepAdopt(1, held, sc, sk, sm);
+                    if (ctxAns == coopsquad::kCtxSweepTakeBack)
+                    {   /* T-1318 design 1: the sleep counts are from before the release and never updated - a take-back of a squad the squad
+                           index has people of given (HandoffSquadHasGiven) is refused: the given people are another game's */
+                        void* gf = 0; std::string gid;
+                        const int gave = (SquadKeyOf(c, &gf, &gid) && HandoffSquadHasGiven(gf, gid) != 0) ? 1 : 0;
+                        ctxAns = coopsquad::ContextTakeBackAfterGive(ctxAns, gave);
+                        if (ctxAns == coopsquad::kCtxSweepRefuse && pass == 0)
+                        {
+                            ++g_contextTakeBackRefused;
+                            if (g_contextTakeBackRefusedLogged < 8)
+                            {
+                                ++g_contextTakeBackRefusedLogged;
+                                SW_DEVLOG("[P033] sweep: context take-back REFUSED - squad id='" + gid + "' has people given to another game in the squad index; its rebuilt person is noted for the orphan clean-up (contextTakeBackRefused="
+                                         + S(g_contextTakeBackRefused) + "; the first 8 logged)");
+                            }
+                        }
+                    }
                     if (ctxAns == coopsquad::kCtxSweepTakeBack && pass == 0)
                     {
                         ++g_sweepContextTakeBack;
@@ -1453,20 +1584,66 @@ void WorldSyncTick()
                 SquadView psv;
                 if (ReadSquadOf(c, &psv) == 1 && StoreArHoldPeople(psv.platoon) == 1) continue;
             }
-            /* M7a3f3 T-425 [m7a3f3-ws3]: a rebuilt person of a squad this game HANDED to another game (its own world data still holds the squad;
-               a walk-back, a wake or an in-ring put-away re-creates it) is not adopted while that game runs a live copy of the squad here or
-               the area is not known to be this game's alone (HeldByOtherTS 1 or -1) - adopting it SPAWNed a fresh uid to the other game,
-               which then showed two. Noted for the orphan clean-up instead. A fresh map with no other holder and no live copy here: adopted,
-               and the squad is this game's again (unmarked). */
+            /* T-1318 fold 2 (re-check B1; T2316 Western Hive_13: OPEN 441.201, adopted here 441.203, ACK 441.240, offered again 443.542): a
+               rebuilt person of a squad whose hand-over is OPEN here (an offer sent, no ACK or refusal yet - HandoffSquadOpen: the RELEASE
+               batch or an open record, the asleep road; an XFER flight, the awake road) is not adopted and not noted for the orphan
+               clean-up: the answer decides. Accepted - the given rule below skips it; refused, timed out or the candidate gone - a later
+               pass adopts it as this game's. */
+            if (!sweepPlayerF && HandoffOpenAny() != 0)
+            {
+                void* of = 0; std::string oid;
+                if (SquadKeyOf(c, &of, &oid) && HandoffSquadOpen(of, oid) != 0)
+                {
+                    if (pass == 0)
+                    {
+                        ++g_sweepOpenSkipped;
+                        if (g_sweepOpenLogged < 8)
+                        {
+                            ++g_sweepOpenLogged;
+                            SW_DEVLOG("[P033] sweep: NOT adopted yet - a rebuilt person of squad id='" + oid + "', whose hand-over to another game is open (no answer yet); the answer decides (sweepOpenSkipped="
+                                     + S(g_sweepOpenSkipped) + "; the first 8 logged)");
+                        }
+                    }
+                    continue;
+                }
+            }
+            /* M7a3f3 T-425 [m7a3f3-ws3], T-1318 design 1: a rebuilt person of a squad this game HANDED to another game (its own world data
+               still holds the squad; a walk-back, a wake or an in-ring put-away re-creates it) is never adopted here, whoever holds the
+               area - adopting it SPAWNed a fresh uid to the other game, which then showed two (T735, T2279). Noted for the orphan clean-up
+               instead. The squad's index entry is cleared only by events (the runner's withdrawal, the player gone, a take-back).
+               T-1318 fold 1 (review F2): "handed over" is asked person by person too - the squad wholly given, or THIS person given (its own
+               hand is a given entry of its squad, HandoffPersonGiven), so a squad given in part (a wake the given test let through, an
+               off-thread wake, a failed read mark) never has its given people adopted here again; its people kept here are not given and go
+               on to the rules below. */
             if (!sweepPlayerF && (HandedOverAny() || HandedOverLeftBehindAny()))   /* M7a3f4 [m7a3f4-ws0] */
             {
                 void* hf = 0; std::string hid;
                 const bool hkey = SquadKeyOf(c, &hf, &hid);
-                if (hkey) HandedOverLeftBehindRebuilt(hf, hid);   /* M7a3f4 [m7a3f4-ws1]: a left-behind person of the squad is live here again - its note (and mark) go */
-                if (hkey && HandedOverHas(hf, hid))
+                if (hkey)
+                {   /* T-1318 a4 fold 1 (review LOW-1): its awake engine squad - a member of the same never-slept squad its held put-aways came from is no re-wake */
+                    SquadView rsv;
+                    HandedOverLeftBehindRebuilt(hf, hid, ReadSquadOf(c, &rsv) == 1 ? (const void*)rsv.ap : 0);   /* M7a3f4 [m7a3f4-ws1]: a left-behind person of the squad is live here again - its note (and mark) go */
+                }
+                const int hWhole = (hkey && HandedOverHas(hf, hid)) ? 1 : 0;
+                /* T-1318 attempt 4 (owner 1626, design A, site 9): the person's own hand decides for a wholly given squad too - a re-made body
+                   whose hand is not given (never numbered, so never given) is numbered here and the gap closes (coopsquad::SweepGivenPerson) */
+                const int hPerson = (hkey && HandoffSquadHasGiven(hf, hid) != 0) ? HandoffPersonGiven(hf, hid, (const void*)c) : 0;
+                if (hPerson < 0 && pass == 0) ++g_sweepGivenHandUnread;
+                if (hWhole != 0 && hPerson == 0 && pass == 0)
+                {
+                    ++g_sweepWholeNotGiven;
+                    if (g_sweepWholeNotGivenLogged < 20)
+                    {
+                        ++g_sweepWholeNotGivenLogged;
+                        SW_DEVLOG("[P033] sweep: a rebuilt person of squad id='" + hid + "', which the index calls wholly given, whose own hand is NOT given - this game's own: the sweep's rules decide it (T-1318 attempt 4; sweepGivenPerson wholeNotGiven="
+                                  + S(g_sweepWholeNotGiven) + "; the first 20)");
+                    }
+                }
+                if (coopsquad::SweepGivenPerson(hWhole, hPerson) == 1)
                 {
                     const Sector hs = SectorOf(dp.x, dp.z);
-                    const int hact = coopsquad::HandedOverSweepAction(1, CtxPlatoonLiveForId(hf, hid), HeldByOtherTS(hs));
+                    const int hact = coopsquad::HandedOverSweepAction(1);
+                    if (hWhole == 0 && pass == 0) ++g_sweepGivenPersonSkipped;
                     if (hact == coopsquad::kHoSweepSkip)
                     {
                         if (pass == 0)
@@ -1478,12 +1655,15 @@ void WorldSyncTick()
                                 SW_DEVLOG("[P033] sweep: NOT adopted - a rebuilt person of squad id='" + hid + "', which this game handed to another game (sector "
                                          + S((long long)hs.x) + "," + S((long long)hs.y) + "); noted for the orphan clean-up (sweepHandedOverSkipped=" + S(g_sweepHandedOverSkipped) + "; the first 8 logged)");
                             }
-                            OrphanNote((void*)c, dp.x, dp.z);
+                            /* T-1318 a4 fold 1 (review MEDIUM-2): its own hand given and its squad woken here with given people - removed next sweep */
+                            if (coopsquad::GivenRemakeRemove(hPerson, HandoffWokeWithGiven(hf, hid)) == 1)
+                            {
+                                if (g_givenRemakeQ.size() < 4096 && g_givenRemakeQ.insert((const void*)c).second) ++g_givenRemakeQueued;
+                            }
+                            else OrphanNote((void*)c, dp.x, dp.z);
                         }
                         continue;
                     }
-                    ++g_sweepHandedOverAdopted;
-                    HandedOverUnmark(hf, hid, 1);
                 }
             }
             if (!sweepPlayerF && !AnnounceAreaMine(dp.x, dp.z, pass == 0))
@@ -1956,6 +2136,7 @@ const char* AdoptGateFor(void* character)
             const int d = AnnounceAreaDecide(p.x, p.z);
             if (d == kAreaOtherHeld) return "skippedOtherHeld";
             if (d == kAreaNoMap) return "skippedNoMap";
+            if (d == kAreaNobodyYet) return "skippedNobodyYet";
         }
         if (g_adoptRadius > 0.0f)
         {
@@ -1999,11 +2180,11 @@ void ReportWorldSync()
              + " retired=" + S(g_retired)
              + " restored=" + S(g_restored)
              + " unloadSent[putAway,reloaded,heldSettled,retire,announce]=" + S(g_unloadSentWhy[0]) + "," + S(g_unloadSentWhy[1]) + "," + S(g_unloadSentWhy[2]) + "," + S(g_unloadSentWhy[3]) + "," + S(g_unloadSentWhy[4])
-             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " annMemberHeld=" + S(g_annMemberHeld) + " annMarginKept=" + S(g_annMarginKept) + " annSquadAnswers=" + S(g_annSqAnswers) + " annMemberPosFail=" + S(g_annSqPosFail) + " annOverCapAnswers=" + S(g_annOverCap) + " annDeadMemberRows=" + S(g_annDeadRows) + " annDeadUnreadRows=" + S(g_annDeadUnreadRows) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
+             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " annMemberHeld=" + S(g_annMemberHeld) + " annMarginKept=" + S(g_annMarginKept) + " annSquadAnswers=" + S(g_annSqAnswers) + " annMemberPosFail=" + S(g_annSqPosFail) + " annOverCapAnswers=" + S(g_annOverCap) + " annDeadMemberRows=" + S(g_annDeadRows) + " annDeadUnreadRows=" + S(g_annDeadUnreadRows) + " announceOwnSpotUnread[squad,kept,spawnHeld]=" + S(g_annOwnSpotSquad) + "," + S(g_annOwnSpotKept) + "," + S(g_annOwnSpotSpawnHeld) /* T-1178 */ + " reannounceOriginKept=" + S(g_reannounceOriginKept) /* T-1178 fold 2 (L2) */ + " areaKeyOrigin=" + S(g_areaKeyOrigin) + " catchupOriginHeld=" + S(g_catchupOriginHeld) /* T-1178 fold 3 (H1): also here - a world-server-only game prints no full [net] REPORT line */ + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " d33NobodyYet=" + S(g_skippedNobodyYet) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
              + " falseGone=" + S(g_falseGone)
              + " sweepStandInSkipped=" + S(g_sweepStandInSkipped)   /* inv7a-b */
              + " sweepAdopted[own,world]=" + S(g_sweepOwnAdopted) + "," + S(g_sweepWorldAdopted)   /* characters the sweep adopted: this game's own player faction, and every other */
-             + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped) + " sweepContextTakeBack=" + S(g_sweepContextTakeBack) + " sweepWakeDupSkipped=" + S(g_sweepWakeDupSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
+             + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped) + " sweepContextTakeBack=" + S(g_sweepContextTakeBack) + " contextTakeBackRefused=" + S(g_contextTakeBackRefused) + " sweepGivenPerson[skipped,handUnread]=" + S(g_sweepGivenPersonSkipped) + "," + S(g_sweepGivenHandUnread) + " sweepWholeNotGiven=" + S(g_sweepWholeNotGiven) + " givenRemake[queued,removed,gone,numbered,failed]=" + S(g_givenRemakeQueued) + "," + S(g_givenRemakeRemoved) + "," + S(g_givenRemakeGone) + "," + S(g_givenRemakeNumbered) + "," + S(g_givenRemakeFailed) + " givenRemakeDropped[player,noKey,notGiven,notWoke,teardown]=" + S(g_givenRemakePlayer) + "," + S(g_givenRemakeNoKey) + "," + S(g_givenRemakeNotGiven) + "," + S(g_givenRemakeNotWoke) + "," + S(g_givenRemakeTeardown) + " sweepOpenSkipped=" + S(g_sweepOpenSkipped) + " sweepWakeDupSkipped=" + S(g_sweepWakeDupSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
              + OrphanReportTokenWs()   /* orphan1: orphan[removed,skipped,gatedHeldUnlinked]= */
              + " reannounceSkippedNotMine=" + S(g_reannounceSkippedNotMine)
              + " stale1[rowsSuperseded,staleUidSpared]=" + S(g_rowsSuperseded) + "," + S(g_staleUidSpared)
@@ -2073,6 +2254,7 @@ void ReportWorldSync()
 // population is not adopted. That is the same as today; this function does not make it worse.
 void WorldsyncWorldTeardown()
 {
+    g_givenRemakeTeardown += (long long)g_givenRemakeQ.size(); g_givenRemakeQ.clear();   /* T-1318 a4 fold 2 (re-check MEDIUM-A): no queued address of the freed world is destroyed in the next */
     g_sweepContextTakeBackLogged.clear();   /* T-1229 fold 3: the take-back lines' platoons belong to the freed world */
     const int rows = g_adoptedCount;
     for (int i = 0; i < g_adoptedCount && i < kMaxAdopted; ++i)
@@ -2109,6 +2291,7 @@ int AreaKeyAt(float x, float z) { const Sector s = SectorOf(x, z); return coopli
    implausible AnimationClass; the SEH frame catches a member freed between that check and the read. Both refusals answer
    -1, the "not live here" answer every caller already handles, and are counted on the catchUpState line (areaKey[...]). */
 static long long g_areaKeyNoBody = 0, g_areaKeyFault = 0;
+static const long long kCatchupOriginLinesMax = 20;
 static long long g_rsAskUids = 0, g_rsSent = 0, g_rsHeld = 0, g_rsRefused = 0, g_rsFailed = 0;   /* WorldsyncResendAsk's uids asked, sent, held, refused, failed */
 static int CharAreaPosPod(::Character* c, Ogre::Vector3* out)   /* 1 read, 0 refused (no body), -1 faulted */
 {
@@ -2122,7 +2305,12 @@ int CharAreaKeyNow(unsigned int uid)
     Ogre::Vector3 pos;
     const int rd = CharAreaPosPod(c, &pos);
     if (rd != 1) { if (rd == 0) ++g_areaKeyNoBody; else ++g_areaKeyFault; return -1; }
-    return AreaKeyAt(pos.x, pos.z);
+    /* T-1178 fold 2 (M1, F-T2357-ORIGINSPOT): an own spot at the world origin (a dialogue recruit during the character editor's pause)
+       names no area - the AREA sends (TASK, STATE, COMBATMODE, SWING, APPEARANCE, CLOTHING, item moves, side sends) keep the area they
+       last named, the squad lead goes WORLD, the roster answers PENDING (the body is still registered); never area 32,32 */
+    const int atOrigin = cooplive::AnnounceSpotAtOrigin(pos.x, pos.y, pos.z);
+    if (atOrigin != 0) ++g_areaKeyOrigin;
+    return cooplive::CharAreaKeyOfSpot(1, atOrigin, AreaKeyAt(pos.x, pos.z));
 }
 static long long g_cuResent = 0, g_cuAnnounced = 0, g_cuLooks = 0, g_cuState = 0, g_cuCombat = 0, g_cuFailed = 0, g_cuKept = 0;
 /* M7a2 [m7a2-ws1]: INTENT sent, ASKs answered already (dedup), characters held back by a hand-over, re-sent when it settled, settled
@@ -2148,6 +2336,8 @@ std::string WorldsyncCatchupCounts()
         + "," + S(g_cuReverse) + "," + S(g_cuReverseChars) + "," + S(g_cuReverseAnnounced)
         + "," + S(g_cuRevQueued) + "," + S(g_cuRevBudgetHit) + "," + S(g_cuRevDropped) + "," + S(g_cuWireReadFailed)   /* [m7a2f-ws2] */
         + " areaKey[noBody,fault]=" + S(g_areaKeyNoBody) + "," + S(g_areaKeyFault)   /* CharAreaKeyNow's refused reads */
+        + " areaKeyOrigin=" + S(g_areaKeyOrigin)   /* T-1178 fold 2 (M1): CharAreaKeyNow answered no area for an own spot at the world origin */
+        + " catchupOriginHeld=" + S(g_catchupOriginHeld)   /* T-1178 fold 2b: catch-up / resend rows refused - own spot at the world origin */
         + " resendAsk[uids,sent,held,refused,failed]=" + S(g_rsAskUids) + "," + S(g_rsSent) + "," + S(g_rsHeld) + "," + S(g_rsRefused) + "," + S(g_rsFailed);   /* a RESEND ask answered here */
 }
 /* M7a2: the live reads the catch-up takes of one row (AnnouncePass's plausibility tests), and the wire's faction. */
@@ -2158,6 +2348,20 @@ static bool CatchupCharReads(unsigned int uid, ::Character** c, Ogre::Vector3* p
     /* the checked read CharAreaKeyNow uses: retired row and body (Character+0x448) refused, a body freed mid-read caught */
     const int rd = CharAreaPosPod(ch, pos);
     if (rd != 1) { if (rd == 0) ++g_areaKeyNoBody; else ++g_areaKeyFault; return false; }
+    /* T-1178 fold 2b (F-T2357-ORIGINSPOT): an own spot at the world origin is not a place - the row is refused like an unread body
+       (skipped this round; its catch-up / resend SPAWN would carry the origin spot) */
+    const int atOrigin = cooplive::AnnounceSpotAtOrigin(pos->x, pos->y, pos->z);
+    if (cooplive::CatchupSpotUsable(1, atOrigin) == 0)
+    {
+        ++g_catchupOriginHeld;
+        if (g_catchupOriginLines < kCatchupOriginLinesMax)
+        {
+            ++g_catchupOriginLines;
+            DebugLog("[P033] catch-up own spot at the world origin uid=" + S((long long)uid) + " - not sent this round, nothing withdrawn (F-T2357-ORIGINSPOT) (#"
+                     + S(g_catchupOriginLines) + "/" + S(kCatchupOriginLinesMax) + ")");
+        }
+        return false;
+    }
     const Sector s = SectorOf(pos->x, pos->z);
     if (key != 0) *key = cooplive::AreaKey(s.x, s.y);
     *c = ch;

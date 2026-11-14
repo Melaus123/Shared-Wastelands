@@ -140,13 +140,9 @@ bool LeafGated()     { return g_worldGenOn == kGenOff || g_worldGenOn == kGenLea
 // (verify-p5t MEDIUM-3). What is still forbidden is what it was written to forbid: choosing the AREA by the
 // player's position. The area is the one the character is about to be placed in, full stop - a squad waking four
 // sectors from the camera is judged where it wakes, and MyPlayerSector() must never be substituted for that.
-// What the gate now READS, on top of the area's own row, is two ring-1 facts ABOUT that area:
-//   `wRing1`     - is this area within one sector of THIS game's player (E13 attempt 2, H047: the engine streams
-//                  only the ~3x3 around the player, so an unclaimed area beside them is being loaded by this game);
-//   `wPeerRing1` - is it within one sector of ANOTHER game's player, from the notebook process's player-sector
-//                  table (E25 re-designed) - which is what makes the presumption yield instead of doubling a town.
-// Both are answers about the sector `s` below, taken in the same locked read as the rest of the view. Neither
-// changes which sector is judged, which is the rule this comment exists to hold.
+// T-1261 (owner decision 1531): the gate reads only the area's own row - held and mine - and makes the character only
+// where the world server names THIS game the holder; the ring-1 presumptions no longer reach it. Neither ever changed
+// which sector is judged, which is the rule this comment exists to hold.
 //
 // Names are coop::-qualified because this anonymous namespace sits at GLOBAL scope in this file (the
 // engine class declarations above it have to mangle without a namespace), not inside `namespace coop`.
@@ -159,7 +155,13 @@ volatile LONG64 g_leafAllowedArea = 0, g_leafGatedHeld = 0, g_leafGatedNoMap = 0
    freeing the world reported as "no player holds this area", in the one counter that is supposed to size how often
    decision 37 refuses a genuinely unclaimed area. Its own number. */
 volatile LONG64 g_leafGatedTeardown = 0;
-volatile LONG64 g_leafGatedOtherLoaded = 0;   /* decision 37 (was decision 35): gated because this game does NOT hold the area, while no other player holds it either - a different fact from "another player holds it", and it must not hide inside that number. The identifier keeps its P5f name so an old log still reads; the report label is gatedNotMine. */
+/* decision 37 (was decision 35): gated because this game does NOT hold the area, while no other player holds it either - a different fact
+   from "another player holds it", and it must not hide inside that number. The report label stays gatedNotMine so an old log still
+   reads. T-1261 fold (review LOW 5): since decision 1531 this arm is exactly "nobody holds the area yet" (the loaded-here / ring-1
+   grants are gone), so the identifier says that now (its P5f name said 'other loaded', which it never counted). Like every leafArea
+   number it counts the GATE's answers - a player-faction character still passes after it (charPlayerPass); the refusals themselves
+   are nobodyYetDeferred[..,character] on the [TG] line (detour_createRandomCharacter). */
+volatile LONG64 g_leafGatedNobodyYet = 0;
 // PROBE-START: P116 - leaf no-map refusal follow-up
 /* .modding/04-probes.md P116 (Related: P97).  QUESTION: does a squad woken empty during a notebook outage get
    refilled after the area map returns?  The leaf gate's no-map refusal runs on any thread (the character factory
@@ -273,7 +275,7 @@ void P116Tick()   /* MAIN THREAD (WorldGenTick) */
     }
 }
 // PROBE-END: P116
-static bool LeafGatedAt(const coop::Sector& s, void* p116Owner = 0, void* p116Caller = 0)   /* PROBE P116: the two trailing parameters */
+static bool LeafGatedAt(const coop::Sector& s, void* p116Owner = 0, void* p116Caller = 0, int* nobodyYetOut = 0)   /* PROBE P116: the two middle parameters. T-1261 fold: *nobodyYetOut = 1 when the refusal is "nobody holds the area yet" */
 {
     if (g_worldGenOn == kGenOff) return true;
     if (g_worldGenOn != kGenLeaf) return false;
@@ -283,24 +285,26 @@ static bool LeafGatedAt(const coop::Sector& s, void* p116Owner = 0, void* p116Ca
     /* decision 37: the gate is "does the relay name THIS game the holder of this area". An area nobody holds is refused too -
        it is claimed by the first game to report it, and inventing into it from a distance is what duplicated a town (F514c). */
     /* review-p5g Q5: ONE locked read - the gate's decision and the counter that says WHY come from the same view (the cause
-       used to be a second HeldByOtherTS call, which an AREAMAP could invalidate between the two). decision 37 amended:
-       `wLoadedHere` is the first-there presumption for an area nobody has claimed yet. */
-    /* E13 attempt 2 (H047): the fifth input, `ring1` - an unclaimed area within ring 1 of this game's own player is
-       this game's to invent in, because the engine streams only the ~3x3 around the player and nobody else is loading
-       it. The leaf gate and the town gate must answer the same question with the same `ring1`, or a town's squads and
-       its individual characters would come from two different rules. */
-    /* E25 (review-p5p HIGH-1): and the sixth and seventh - is the OTHER player also within ring 1 of it, and does
-       this game's relay slot outrank theirs. The leaf gate and the town gate must yield on the same terms as well
-       as presume on the same terms, or a town's squads and its individual characters come from two different rules
-       at exactly the moment two players walk into it together. */
-    int wHeld = 0, wMine = 0, wLoadedHere = 0, wRing1 = 0, wPeerRing1 = 0, wPeerLow = -2, wPresumedEmpty = 0, wPeerLowFresh = 1;
-    coop::AreaViewTS(s, &wHeld, &wMine, 0, &wLoadedHere, &wRing1, &wPeerRing1, &wPeerLow, &wPresumedEmpty, &wPeerLowFresh);
-    const int may = coop::MayInventFromView(wHeld, wMine, wLoadedHere, wRing1, wPeerRing1, coop::MySlotLower(wPeerLow), wPresumedEmpty, wPeerLowFresh);
+       used to be a second HeldByOtherTS call, which an AREAMAP could invalidate between the two). */
+    /* T-1261 (owner decision 1531): the same answer as the town gates - MayMakeFromView, the named holder only. Loaded here and
+       ring 1 no longer grant, so a town's squads and its individual characters still come from one rule. */
+    int wHeld = 0, wMine = 0;
+    coop::AreaViewTS(s, &wHeld, &wMine, 0, 0, 0, 0);
+    const int may = coop::MayMakeFromView(wHeld, wMine);
     /* P6j (verify-p6c MEDIUM-2): FIRST, because kInventTeardown is negative and the no-map arm further down would
        otherwise take it - and before P6j the bare 0 it used to be was taken by the not-mine arm on the next line.
        The gate still refuses; only the number it is filed under changes. */
     if (may == coop::kInventTeardown) { InterlockedIncrement64(&g_leafGatedTeardown); return true; }
-    if (may == 0) { if (wHeld == 1) InterlockedIncrement64(&g_leafGatedHeld); else InterlockedIncrement64(&g_leafGatedOtherLoaded); return true; }
+    /* T-1261 fold (review MED 2): NOBODY HOLDS THE AREA YET. The roads that still reach this refusal (Read: build/town-squad-generation-read.md
+       "Awake spawns", F268 / F269 - createRandomCharacter 0x582C50's eight call sites): createRandomSquad 0x582F80 from
+       Faction::_spawnASquad 0x2DDA20 (a group made awake), FactionWarMgr::getAllTheForces 0x9C4170 (a war force),
+       createCharacterForBuilding 0x585A80, Town::spawnTheBarFlies 0x9FBE50 (only if the map changes between the bar gate's read and
+       this one - the bar gate sets a crowd aside first) and newGameWithCharEdit 0x871F30 (the player's own faction, which passes);
+       ActivePlatoon::restoreSquad 0x7B50F0; and a wake the per-frame update does not carry - the one-shot activators 0x6B9860 /
+       0x6BA050 call the wake test directly (F518), so store.cpp's wake hold does not see them. The per-frame wake (setupCheck
+       0x4FF040) is held in store.cpp until the naming. The caller says which it was: detour_createRandomCharacter counts and logs the
+       refusal (nobodyYetDeferred[..,character], first 5 per world with the engine caller's address). */
+    if (may == 0) { if (wHeld == 1) InterlockedIncrement64(&g_leafGatedHeld); else { InterlockedIncrement64(&g_leafGatedNobodyYet); if (nobodyYetOut != 0) *nobodyYetOut = 1; } return true; }   /* T-1261: nobody holds the area yet */
     /* P8e (audit C4, F669) took the session role out of this arm; P97 (owner 334 a / 337 a) takes the bounded
        wait out of it too.  With no fresh area map EVERY game refuses, whatever its slot and however long the map
        has been missing; world population freezes during a notebook outage and resumes when the map is back.  A
@@ -391,11 +395,18 @@ RootObject* detour_createRandomCharacter(RootObjectFactory* self, Faction* facti
        squad through this same function (newGameWithCharEdit 0x871F30 -> createRandomSquad -> here); a joiner that starts a new game
        while linked stands in an area the host holds, and a refusal left the character editor with no characters (initCharacters
        then read list[0] of an empty list). The player's own faction always passes. IsPlayerFaction is a guarded POD read (any thread). */
-    if (LeafGatedAt(coop::SectorOf(position.x, position.z), (void*)owner, _ReturnAddress() /* PROBE P116 */))
+    const coop::Sector cs = coop::SectorOf(position.x, position.z);
+    int nobodyYet = 0;   /* T-1261 fold: the gate's refusal was "nobody holds the area yet" */
+    if (LeafGatedAt(cs, (void*)owner, _ReturnAddress() /* PROBE P116 */, &nobodyYet))
     {
         /* P97: coopor::LeafCreationRefused is this rule as a pure function, so the offline suite shows the player's
            own faction still passes a no-map refusal. */
-        if (coopor::LeafCreationRefused(1, coop::IsPlayerFaction(faction) ? 1 : 0) != 0) { InterlockedIncrement64(&g_blkChar); return 0; }
+        if (coopor::LeafCreationRefused(1, coop::IsPlayerFaction(faction) ? 1 : 0) != 0)
+        {
+            InterlockedIncrement64(&g_blkChar);
+            if (nobodyYet != 0) coop::TownGenNobodyYetCharacter(cs.x, cs.y, _ReturnAddress());   /* T-1261 fold (review MED 2): counted where it is a refusal, never for a player-faction pass */
+            return 0;
+        }
         InterlockedIncrement64(&g_charPlayerPass);
     }
     InterlockedIncrement64(&g_charCreated);
@@ -688,7 +699,7 @@ void ReportWorldGen()
              + " repopulateTown=" + S(g_repopTown) + " repopForced=" + S(g_repopForced) + " " + coop::TownVerReportToken() + " " + coop::CampReportToken()
              + " | blockedChar=" + S(g_blkChar) + " charPlayerPass=" + S(g_charPlayerPass)
              + " leafArea[allowed,gatedHeld,gatedNotMine,leafRefusedNoMap,allowedSingle,gatedTeardown]=" + S(g_leafAllowedArea)
-             + "," + S(g_leafGatedHeld) + "," + S(g_leafGatedOtherLoaded) + "," + S(g_leafGatedNoMap)
+             + "," + S(g_leafGatedHeld) + "," + S(g_leafGatedNobodyYet) + "," + S(g_leafGatedNoMap)
              + "," + S(g_leafAllowedSingle) + "," + S(g_leafGatedTeardown)
              + " blockedCharForBuilding=" + S(g_blkCharForBld)
              + " blockedPopulate=" + S(g_blkPopulate)

@@ -49,6 +49,16 @@ std::string PolicyRequesterSid(unsigned int requesterPeer, bool local);
 // P028's answer: 1 = the stand-in IS a player faction (so `locked` cannot lean on the engine and refuses at the
 // plugin level instead), 0 = it is not, -1 = never observed.
 int PolicyPeerIsPlayer();
+/* T-1199 (owner 1480; fold 1): 1 = under Owner only this door is another non-teammate player's and this game's player opens it - the
+   open is refused (cooptake1::DoorOpenRefuse). applying: this game's door applier / the purchase replay is opening it; openerMine: the
+   opener is this game's player (doors.cpp). ANY THREAD (pointer compares, guarded record-id reads, the team table's any-thread copy). */
+int PolicyDoorOpenRefused(void* door, int applying, int openerMine);
+/* T-1199 fold 1 (design B): 1 = under Owner only `obj` is another non-teammate player's box or machine with inventory (not a character,
+   not an ore rock) - its loot window is not opened (cooptake1::OpenRefuse); *slot = that player's slot (-1 unread). */
+int PolicyBoxOpenRefused(void* obj, int* slot);
+/* T-1199 fold 2 TEST-ONLY: 1 = obj (not a character) is owned by another player's faction, whatever the policy and the team; *slot =
+   that player's slot (-1 unread). MAIN THREAD. */
+int PolicyObjOtherPlayer(void* obj, int* slot);
 // MAIN THREAD: the engine has torn the world down and freed the factions - forget the stand-in's address and
 // re-arm P028 for the next world.
 void PolicyForgetPeerFaction();

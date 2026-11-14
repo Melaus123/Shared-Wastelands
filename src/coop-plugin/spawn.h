@@ -20,8 +20,10 @@ namespace coop {
 // If a network session is UP, also replicates the spawn to the peer so both
 // instances create the same character, at the same world position, with the same uid.
 // uid == 0 means "allocate a new one" (the local/originating case).
+// lever1 TEST-ONLY: the character is marked as made by the spawn lever (items.cpp LeverMarkMade, levermade.h); a non-empty label
+// (`spawn .. as <label>`, checked by the caller) also becomes its name, which its SPAWN's NAME carries to the other game.
 bool SpawnTemplate(const std::string& templateName, float dx, float dz,
-                   unsigned int uid, bool replicate);
+                   unsigned int uid, bool replicate, const std::string& label = std::string());
 
 // P11 (test-only lever capturetest): the `spawn` road (AllocateUid / CreateAt / SetLocalOwner / SendSpawn / WatchLocalRoll,
 // as SpawnTemplate with replicate) anchored on a registered character (own or copy) instead of the captured reference, in
@@ -108,6 +110,10 @@ void TemplateNoteSidBad();                  /* T-922: counts a SPAWN received wh
 // dereferenced by the caller; P034 compares it with a liveness row's address to tell a current row from an out-of-date one.
 // MAIN THREAD.
 const void* SpawnedRawObject(unsigned int uid);
+/* T-1262 TEST-ONLY (LeverNearestNamed kLeverPickDead): every uid the registry holds a row for, in uid order; the caller resolves
+   each through FindSpawned, which refuses a retired, released or no-longer-live row. A dead character leaves the engine's
+   character-update list but keeps its row. MAIN THREAD. */
+void SpawnedUidList(std::vector<unsigned int>* out);
 /* The last lasting refusal of the creation core (lostcopy::kCr*: a template or faction not in this game's data, the TEST-ONLY table
    cap), kCrNone when none since the reset. net/session.cpp OnSpawn resets it before a SPAWN and reads it after. MAIN THREAD. */
 void CreateRefusalReset();
@@ -586,6 +592,10 @@ std::string NameReportLine();                                     // "[NAME] REP
 void InstallSlaves();
 // T-1084: Ownerships::setHomeBuilding hooked - a world squad's home building set by the engine marks its record due (spawn.cpp).
 void InstallHomeWatch();
+int PlatoonSetHomeBuildingEnginePod(void* platoon, void* building);   // T-1334 TEST-ONLY (DEV): the engine's setHomeBuilding through its hooked entry - 1 called, 0 no row / fault
+int PlatoonDropHomeOwnPod(void* platoon);   // T-1334, MAIN THREAD: the engine's own home blanking (removeOwnedObject with the home), unnoted - 1 blanked, 0 no row / still set, -1 fault
+long long HomeMoveNotedCount(); long long HomeBlankNotedCount();   // T-1334: the home hooks' noted moves and blanks
+std::string HomeBlankWatchReport();   // T-1334: the homeBlankHook[...] counts
 // T-307: the AnimationClass layer play hooked (table rows AnimLayerPlay, AnimCtl*, the layer-only tasks): who started each layer state, so a
 // refuse-list starter's state is never sent as a pose and any other's is (common/poselayer.h 3, decision 1236 a). MAIN THREAD install; the detour runs on any thread.
 void InstallPoseLayerStart();
@@ -644,6 +654,18 @@ int PrisonPutInOutcome(unsigned int uid);
 // for its shackles and cage are sent to the owner before the freed message that follows on the same road. Returns the locks that
 // read found open (cooprison::kFreedLock* bits) - the freed message's lock byte.
 unsigned char RestraintCheckNow(unsigned int uid);
+// T-860, MAIN THREAD: the cage record road (src/common/cagerec.h) - a record arrived, this game's write confirmed or refused, a
+// record removed (store.cpp / items.cpp), the area map arrived (store.cpp), a teammate's request as the area's holder (items.cpp BoxLockNote).
+void CageRecordArrive(const std::string& id, const std::vector<char>& bytes);
+void CageRecordEcho(const std::string& id, int hasStamp, long long stamp);
+void CageRecRefuseArrive(const std::string& id, int reason, unsigned int storedGen, unsigned int sentGen);
+void CageRecordGone(const std::string& id);
+void CageRecMapEvent();
+void CageRecRequestNote(const std::string& key, int locked, int broken, int level, int query, unsigned int baseGen, int baseLocked, int baseBroken,
+                        int baseLevel, unsigned int fromPeer);
+void CageRecAnswerNote(const std::string& key, int kind, unsigned int gen, unsigned int fromPeer);
+// T-860 fold 2, MAIN THREAD (items.cpp BoxLockPickDrain): the engine's pick tick opened this cage's lock - a change made here, as an event
+void CageLockPickNote(void* cage, void* lock);
 // T-980, ANY THREAD (speech.cpp FreedNoteEvent, at the engine's unlock event): the character's cage as the event finds it - its
 // in-something field and its +0x300 hand's five id fields (20 bytes into hand), plain reads only. 1 in a cage, 0 not, -1 unreadable.
 int FreedCageFactsPod(const void* c, unsigned char* hand);
@@ -704,6 +726,19 @@ bool PoseOfOwned(unsigned int uid, coopstate::PoseWire* out);
 void PoseWatchTick();
 // OnState: the owner's word on a copy's pose (latest ARRIVAL wins - STATE has no sequence field); PoseApplyTick acts on it.
 void NotePoseWant(unsigned int uid, const coopstate::PoseWire& pose, unsigned int fromPeer);
+// T-860 / T-859 (owner 1551 a; src/common/actowed.h): an act made here on another game's character - caged, let out, put in a bed,
+// a restraint opened (ActOwedNotePrison, from net::SendPrison), the carry of an own body by its carrier ended (ActOwedNoteCarryEnd)
+// - is owed until its owner's STATE shows it (ActOwedOnOwnerState, from OnState); the owner's new copy after a relaunch re-binds it
+// (ActOwedOnCopyReady) and a missing act is sent again once. Cleared at teardown and at the world-server link's loss. Kills are not owed.
+void ActOwedNotePrison(const cooprison::PrisonMsg& m);
+void ActOwedNoteCarryEnd(unsigned int body, unsigned int carrier);
+void ActOwedNotePickup(unsigned int body);                   // fold 1: our carrier picked up another game's character here
+void ActOwedOnRefused(unsigned int uid, bool bed, bool final);  // fold 1: REFUSED / BED REFUSED (final = permanent) for an owed act
+void ActOwedOnCopyReady(unsigned int uid);
+void ActOwedOnOwnerState(unsigned int uid, int poseKind, unsigned int carryingUid, bool dead);
+void ActOwedClear(const char* why);
+void ActOwedLinkLost();
+std::string ActOwedReportToken();
 // Every in-game frame: a copy (not carried, not ragdolled, not dead) is put in its bed with setBedMode 0x32E2B0, or has
 // its action replayed with playAction 0x51F920; kind 0, a handoff, and 10 s without a confirming STATE undo what was
 // applied. An action pose waits until the copy stands within 1.6 of the owner's spot. setBedMode DOES register the copy

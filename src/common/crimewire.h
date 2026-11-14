@@ -118,14 +118,24 @@ inline int CrimeShouldSend(const CrimeState& lastSent, float lastSampledExpiry, 
  *      called with that player's stand-in faction), to that player only:
  *        uid 0 | crime 0 | expiry 0 | victim 0 | len | ownerSid (the faction whose standing moves) | 2 | seq u32 | ev i32 |
  *        mult f32 | len2 u8 | otherSid (the player's wire name, "@slot:<n>")
- * An older build reads kinds 1 and 2 as kind 0 and refuses them (kind 1: the sender is not the uid's owner; kind 2: uid 0). */
+ *   3  T-1131 CAUGHT: a lost caught roll on THIS game (a take with thievery checks, 0x793C70) whose watcher is the receiver's
+ *      character (a copy here), to the watcher's owner only: the layout above with uid = the thief (a character the sender drives)
+ *      and the thief's crime as the roll left it (crime, expiry, victim, sid = the victim's faction; crime 0 = none to write), then
+ *      | 3 | watcherUid u32 | ev i32 (8 caught, 0x2F the let-off branch). The receiver records the crime on its copy of the thief
+ *      first, then raises the same engine event on its own watcher (and, for 8, the watcher's memory note).
+ * An older build reads kinds 1 and 2 as kind 0 and refuses them (kind 1: the sender is not the uid's owner; kind 2: uid 0). A build
+ * with kinds 1-2 refuses kind 3 as a bad kind (protocol 223 keeps such a build out of the session). */
 const unsigned char kCrimeKindState     = 0;
 const unsigned char kCrimeKindCopyWrite = 1;
 const unsigned char kCrimeKindRelEvent  = 2;
-const int kCrimeDecodeBadKind  = 5;    /* a kind byte above kCrimeKindRelEvent */
+const unsigned char kCrimeKindCaught    = 3;
+const unsigned char kCrimeKindMaxBefore223 = kCrimeKindRelEvent;   /* the last kind a protocol-222 build reads */
+const int kCrimeDecodeBadKind  = 5;    /* a kind byte above kCrimeKindCaught */
 const int kCrimeDecodeRelTrunc = 6;    /* kind 2 ends before its fields or its second sid do, or len2 names > kCrimeMaxSid */
 const int kCrimeDecodeRelBad   = 7;    /* kind 2 with an event outside 0..kRelEvMaxEv, a multiplier not finite or beyond
                                           kRelEvMaxMult, or an empty sid */
+const int kCrimeDecodeCaughtTrunc = 8; /* kind 3 ends before its watcher and event do */
+const int kCrimeDecodeCaughtBad   = 9; /* kind 3 with watcher uid 0, thief uid 0, the watcher named as the thief, or an event not 8 / 0x2F */
 const int kRelEvMaxEv = 16;            /* FactionEvent is small (0..12 used) */
 const float kRelEvMaxMult = 100.0f;
 
@@ -138,6 +148,17 @@ struct CrimeRelEvent
     std::string otherSid;    /* the player's faction as relations names it ("@slot:<n>") */
     CrimeRelEvent() : seq(0), ev(0), mult(0.0f) {}
 };
+
+/* T-1131 kind 3: the watcher's event of a lost caught roll */
+const int kCaughtEvCaught = 8;         /* EventTriggerEnum: the watcher saw the take (the roll's main branch) */
+const int kCaughtEvLetOff = 0x2F;      /* the roll's other branch (watcher +0x2F8 == 1 and a coin flip): the event only, no crime */
+struct CrimeCaught
+{
+    unsigned int watcherUid;
+    int ev;
+    CrimeCaught() : watcherUid(0), ev(0) {}
+};
+inline bool CaughtEvOk(int ev) { return ev == kCaughtEvCaught || ev == kCaughtEvLetOff; }
 
 /* kind 0 or 1: the layout above and the kind byte. false (and nothing appended) when the sid is too long. */
 inline bool EncodeCrimeKind(std::vector<char>* b, unsigned int uid, const CrimeState& s, unsigned char kind)
@@ -176,9 +197,22 @@ inline bool EncodeCrimeRelEvent(std::vector<char>* b, const CrimeRelEvent& e)
     return true;
 }
 
+/* kind 3. false (and nothing appended) for a sid too long, a thief or watcher uid 0, the same uid twice or an event not 8 / 0x2F. */
+inline bool EncodeCrimeCaught(std::vector<char>* b, unsigned int thiefUid, const CrimeState& s, const CrimeCaught& c)
+{
+    if (b == 0 || thiefUid == 0 || c.watcherUid == 0 || c.watcherUid == thiefUid || !CaughtEvOk(c.ev)) return false;
+    if (!EncodeCrimeKind(b, thiefUid, s, kCrimeKindCaught)) return false;
+    const size_t at = b->size();
+    b->resize(at + 8);
+    std::memcpy(&(*b)[at], &c.watcherUid, 4);
+    std::memcpy(&(*b)[at + 4], &c.ev, 4);
+    return true;
+}
+
 /* Every kind. The kind-0 fields are decoded (and refused) exactly as DecodeCrime; *kind is 0 when nothing follows the sid; *rel
- * is filled for kind 2 only (its ownerSid = the sid above). */
-inline int DecodeCrimeMsg(const char* p, size_t size, unsigned int* uid, CrimeState* out, unsigned char* kind, CrimeRelEvent* rel)
+ * is filled for kind 2 only (its ownerSid = the sid above); *caught for kind 3 only. */
+inline int DecodeCrimeMsg(const char* p, size_t size, unsigned int* uid, CrimeState* out, unsigned char* kind, CrimeRelEvent* rel,
+                          CrimeCaught* caught = 0)
 {
     unsigned int u = 0;
     CrimeState s;
@@ -187,10 +221,18 @@ inline int DecodeCrimeMsg(const char* p, size_t size, unsigned int* uid, CrimeSt
     const size_t off = kCrimeFixedBytes + s.factionSid.size();
     unsigned char k = kCrimeKindState;
     CrimeRelEvent e;
+    CrimeCaught cc;
     if (size > off)
     {
         k = (unsigned char)p[off];
-        if (k > kCrimeKindRelEvent) return kCrimeDecodeBadKind;
+        if (k > kCrimeKindCaught) return kCrimeDecodeBadKind;
+        if (k == kCrimeKindCaught)
+        {
+            if (size - off < 9) return kCrimeDecodeCaughtTrunc;
+            std::memcpy(&cc.watcherUid, p + off + 1, 4);
+            std::memcpy(&cc.ev, p + off + 5, 4);
+            if (u == 0 || cc.watcherUid == 0 || cc.watcherUid == u || !CaughtEvOk(cc.ev)) return kCrimeDecodeCaughtBad;
+        }
         if (k == kCrimeKindRelEvent)
         {
             if (size - off < 14) return kCrimeDecodeRelTrunc;
@@ -209,7 +251,44 @@ inline int DecodeCrimeMsg(const char* p, size_t size, unsigned int* uid, CrimeSt
     if (out) *out = s;
     if (kind) *kind = k;
     if (rel) *rel = e;
+    if (caught) *caught = cc;
     return kCrimeDecodeOk;
+}
+
+/* T-1131 KIND 3 ON THE THIEF'S GAME, at the roll's own call of the watcher's event (0x684BD0 from inside 0x793C70). The event is
+ * the watcher's reaction, and the watcher's reaction belongs to the game that runs the watcher:
+ *   kCaughtPass       not a copy's event about this game's character (the watcher is ours, or the thief is not): the engine as before;
+ *   kCaughtForward    the watcher is a copy and a road to its owner is open: the copy's own event and memory note are NOT run here -
+ *                     the thief's crime at the roll and the event go to the watcher's owner as kind 3;
+ *   kCaughtLocalNoRoute / kCaughtLocalOffMain   the copy's own reaction runs here as before (no road to the watcher's owner, or not
+ *                     on the main thread where the road may be read) - one reaction, never none. */
+const int kCaughtPass = 0, kCaughtForward = 1, kCaughtLocalNoRoute = 2, kCaughtLocalOffMain = 3;
+inline int CaughtForwardDecide(int ev, bool watcherCopy, bool thiefMine, bool onMain, bool routeOpen)
+{
+    if (!CaughtEvOk(ev) || !watcherCopy || !thiefMine) return kCaughtPass;
+    if (!onMain) return kCaughtLocalOffMain;
+    return routeOpen ? kCaughtForward : kCaughtLocalNoRoute;
+}
+
+/* T-1131 KIND 3 ON THE WATCHER'S OWNER (the session drain, and again at the K2 safe point before the raise). Refused, with a line and
+ * no retry: the watcher is not this game's character now (kCaughtNotOwner), it is not in this world (kCaughtNoWatcher), the thief is
+ * not the sender's character (kCaughtThiefNotSenders), this game holds no copy of the thief (kCaughtNoThief), or the event is not
+ * one the roll raises (kCaughtBadEv). Else kCaughtRaise: the crime first, then the watcher's event. */
+const int kCaughtRaise = 0, kCaughtNotOwner = 1, kCaughtNoWatcher = 2, kCaughtThiefNotSenders = 3, kCaughtNoThief = 4, kCaughtBadEv = 5;
+inline int CaughtOwnerDecide(bool watcherMine, bool watcherHere, bool thiefSenders, bool thiefHere, int ev)
+{
+    if (!CaughtEvOk(ev)) return kCaughtBadEv;
+    if (!watcherMine) return kCaughtNotOwner;
+    if (!watcherHere) return kCaughtNoWatcher;
+    if (!thiefSenders) return kCaughtThiefNotSenders;
+    if (!thiefHere) return kCaughtNoThief;
+    return kCaughtRaise;
+}
+inline const char* CaughtOwnerWhy(int d)
+{
+    return d == kCaughtNotOwner ? "this game does not run the watcher now" : d == kCaughtNoWatcher ? "the watcher is not in this world"
+         : d == kCaughtThiefNotSenders ? "the thief is not the sender's character" : d == kCaughtNoThief ? "no copy of the thief here"
+         : d == kCaughtBadEv ? "not an event the roll raises" : "raise";
 }
 
 /* KIND 1 ON THE COPY'S GAME, one call each time this game's engine records a crime on the copy. `recorded` = the crime the copy
@@ -240,6 +319,34 @@ inline int CopyHeldNotOwners(int before, int after, int requested, int prevKnown
     if (before <= 0 || before > kCrimeMaxEnum) return 0;
     if (after != before || requested == before) return 0;
     return before != prevKnown ? 1 : 0;
+}
+
+/* T-1293 (F-T2353-REPLAYCRIME). While this game replays another game's decided blow (ApplyRemoteHit's played hit), the engine's
+ * crime pass can record a crime on a COPY (notifyCaller 0x666191 -> setCrime): the replay's side effect, not that character's act
+ * (the owner's game decides its own character's blows and records its own crimes there). What the setCrime detour does with one
+ * recorded crime (`owned` = a character this game owns, `inReplay` = this thread is inside the played hit):
+ *   kCopyCapNone   - nothing recorded;
+ *   kCopyCapReplay - on a copy inside a replayed hit: never sent to the owner (counted, logged, the copy's crime remembered);
+ *   kCopyCapNote   - noted as before (a copy's crime goes to its owner; an own character's is skipped by the drain). */
+const int kCopyCapNone = 0, kCopyCapNote = 1, kCopyCapReplay = 2;
+inline int CopyCaptureDecide(bool owned, bool inReplay, int crime)
+{
+    if (crime == 0) return kCopyCapNone;
+    if (inReplay && !owned) return kCopyCapReplay;
+    return kCopyCapNote;
+}
+
+/* T-1293: the crime a replayed hit recorded on a copy (`replayCrime`, 0 none) stays on that copy; the roads that read the copy's
+ * LIVE crime later (the owner's state refused for it, a guard's bounty added to it: `liveRead`) must not send it either.
+ *   kReplayHeldNone - no such crime, or a fresh setCrime outside a replay: decided as before;
+ *   kReplayHeldSkip - a live read of that same crime the owner does not hold: not sent;
+ *   kReplayHeldEnd  - the copy no longer holds it, or the owner's state holds it now: the remembered crime ends (then as before). */
+const int kReplayHeldNone = 0, kReplayHeldSkip = 1, kReplayHeldEnd = 2;
+inline int CopyReplayHeldDecide(int replayCrime, int live, int ownerKnown, bool liveRead)
+{
+    if (replayCrime == 0) return kReplayHeldNone;
+    if (live != replayCrime || ownerKnown == replayCrime) return kReplayHeldEnd;
+    return liveRead ? kReplayHeldSkip : kReplayHeldNone;
 }
 
 /* A MSG_CRIME arriving while engine writes are blocked (a load): kind 2 is kept (relations.cpp holds it, bounded, until a world

@@ -17,8 +17,9 @@ cl /nologo /MP8 /O2 /EHsc /MD /W4 /bigobj /D_CRT_SECURE_NO_WARNINGS ^
    /I ..\common ^
    test_main.cpp suite_part1.cpp suite_part2.cpp suite_part3.cpp suite_part4.cpp suite_part5.cpp suite_part6.cpp suite_part7.cpp ^
    ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
+   ..\common\fileprobe.cpp ..\coop-plugin\u8file.cpp ^
    /Fecoop_test.exe ^
-   /link /MACHINE:X64 /SUBSYSTEM:CONSOLE
+   /link /MACHINE:X64 /SUBSYSTEM:CONSOLE shell32.lib
 if errorlevel 1 (
     echo BUILD FAILED ^(tests: compile^)
     exit /b 1

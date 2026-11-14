@@ -23,6 +23,20 @@ bool EffectKoHoldsKnockdown(unsigned int victimUid);
 // TEST-ONLY lever `eatbite <eaterUid | animal> <victimUid> <seconds>`: victim->gettingEaten(1.0, eater) THROUGH the hooked
 // entry once per frame at the K2 safe point for <seconds> (1..120), or until the call answers 1. MAIN THREAD (command channel).
 std::string EatBiteLever(const std::string& eaterArg, unsigned int victimUid, float seconds);
+// T-1262 (MAIN THREAD): a body of another game's character burned HERE in a corpse furnace by this game's carrier (spawn.cpp
+// NotifyDespawn -> CopyBurnedHere): a "burn pending" row opens and the body's owner gets MSG_EFFECT kind 7 BURN (effectwire.h).
+// false = no row (the caller books the lost copy, as before T-1262).
+bool EffectBurnOpen(unsigned int body, unsigned int carrier, bool hasPos, float x, float y, float z);
+// T-1262 (MAIN THREAD, net/session.cpp OnSpawn): true = a SPAWN of a body whose burn is pending - not built (counted, logged). Review
+// fold 2: its owner still runs the body, so the request is sent again (cooffect::BurnRowStep), up to kBurnSpawnResendsMax times a
+// row; the next one closes the row and books the lost copy (the re-ask of before T-1262).
+bool EffectBurnHoldSpawn(unsigned int uid);
+// T-1262 (MAIN THREAD, net/session.cpp LostBookUid): true = the body's burn is pending - not booked as a lost copy (counted).
+bool EffectBurnHoldsLost(unsigned int uid);
+// T-1262 (MAIN THREAD, net/session.cpp LostLook): true = the body's burn is pending - no RESEND ask (silent).
+bool EffectBurnPending(unsigned int uid);
+// T-1262 (MAIN THREAD, net/session.cpp OnDespawn, the owner's accepted DESPAWN): the body's burn-pending row closes.
+void EffectBurnOwnerDespawned(unsigned int uid);
 // appearance.cpp (P10's animal test): the nearest living, standing animal this game DRIVES within radiusM of the anchor; 0 none.
 unsigned int NearestOwnedAnimal(unsigned int anchorUid, float radiusM, float* distSqUnits);
 

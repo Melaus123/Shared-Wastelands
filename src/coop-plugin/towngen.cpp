@@ -23,8 +23,10 @@
 #include "game/Character.h"   /* refill1: the character update list walk (as items.cpp captlist / spawn.cpp roster full) */
 #include "game/GameWorld.h"   /* refill1 */
 #include "playerfaction.h"      /* refill1: the nearby rule's player test (this game's own and every other player's stand-in faction) */
+#include "../common/towntime.h"   /* T-4: the town's 5-day rebuild clock as one world-server record - the SAME header the world server and the offline suite compile */
 #include "../common/townrebuild.h"   /* towns2: the game's marker rule, the 5-day timer, the version wait, the sight test and the group verdict - the SAME header the offline suite compiles */
 #include "worldstate.h"                /* towns2: WorldStateGeneration - a named character's state changed */
+#include "townver.h"                   /* towns2: TownVerAskOthers - the engine's own version test (T-640 D1) */
 #include "game/hand.h"   /* towns2: hand::getSquad / hand::asBuilding */
 #include "../common/townpending.h"   /* T-580: which notebook notes hold a town's creation back - the SAME header the store and the offline suite compile */
 #include "../common/townreoffer.h"   /* T-392 (owner 335 a): the set-aside causes and the re-offer decision - the SAME header the offline suite compiles */
@@ -34,7 +36,16 @@
 #include "../common/barwire.h"  /* refill1: the shared bar record, the due decision and the per-entry counts - the SAME header the notebook and the offline suite compile */
 #include "../common/townrefill.h"   /* each town's recorded losses, the record tally and the one-refill decision - the SAME header the world server and the offline suite compile */
 #include "../common/emptytown.h"   /* the unexplained-empty-town facts, verdict, once-per-town rule and line - the SAME header the offline suite compiles */
+namespace coop { int StoreGroupRunner(void* platoon, int* otherRunner, int* listHeld); }   /* T-4 design (d) (store.cpp): the writer rule's runner of a town group */
 #include "../common/areadrop.h"    /* the area map's frozen answer (kAreaFrozen), told apart from "not held" */
+#include "../common/raidnow.h"    /* the TEST-ONLY raidnow lever's argument and timer value, and the raid creation line gate - the SAME header the offline suite compiles */
+#include "../common/raidsquad.h"   /* T-1122 own raid squads: the gate's raid allowance - the SAME header the store and the offline suite compile */
+#include "../common/raidroll.h"   /* T-1122 roller (owner 1577 c): the cover, presence, pick, call-off and hide decisions - the SAME header the offline suite compiles */
+#include "team.h"   /* T-1122 roller: TeamSameAnyThread / TeamNoOfSlotAnyThread / TeamPlayerName */
+namespace coop { int ItemsWorldClockHours(double* now); }   /* T-4 fold 2 (items.cpp): the shop record's clock read */
+namespace coop { int PolicyTeamBaseFactions(void** facs, int* slots, int cap); int PolicyFactionSlot(void* faction); int StoreRaidCampBorrowed(void* camp); }   /* T-1122 roller: policy.cpp / store.cpp */
+#include "game/Faction.h"   /* raidnow: FactionDirectory::findFactionByName */
+
 #include "../common/wanderspawn.h"   /* T-1235: the [SPAWN] wander line's distances and cap - the SAME header the offline suite compiles */
 #include "replicate.h"   /* T-1235: PlayerCharSpots - every player's characters here */
 #include "camp.h"        /* T-1235: CampViewPoint - this game's view point and the engine's spot distance */
@@ -157,14 +168,34 @@ void TgLockInit() { if (!g_tgLockInit) { ::InitializeCriticalSection(&g_tgLock);
    g_barPend keeps a set-aside bar list by - compared, never dereferenced - so no town id read is needed), under g_tgLock. An entry
    leaves when its check-up judges it with the area loaded, or when the work is settled any other way (T392ResErase, the owed-row
    settles, BarPendClear), and both sets are cleared at the world teardown with the T-392 tables. */
+/* T-1261 (owner decision 1531): `ring1Party` can only read 0 from this build on - the creation gates ask MayMakeFromView (the named
+   holder only), so a ring 1 no longer lets any town gate make people. The position is kept so a readout does not shift. */
 long long g_t1076Ring1Party = 0, g_t1076MidLoad = 0, g_t1076ReJudged = 0;
 std::set<std::string> g_t1076Loading;
 std::set<void*> g_t1076LoadingBars;
-static void T1076CountRing1(int may, int held, int mine, int loadedHere, int ring1, int partyOnly)
-{
-    if (partyOnly != 1 || ring1 != 1 || held != 0 || mine == 1 || loadedHere == 1) return;   /* answered by an earlier rule */
-    if (may == 1) ::InterlockedIncrement64(&g_t1076Ring1Party);
-}
+/* T-1261 (owner decision 1531, H-T1261-preholder): A CREATION REFUSED BECAUSE NOBODY HOLDS THE AREA YET. Only the game the world
+   server names the area's holder makes a town's people, so a gate asked before the naming refuses. What asks again depends on the
+   road (T-1261 fold, review LOW 3 - only the set-aside kinds are re-offered after the naming):
+   kind 0 squad - refused, never set aside. A town's roaming / military group (createRandomUnloadedSquad 0x57EA30 from 0x8F7190, the
+     spawner round of ZoneManager::spawnChecksUpdateThreaded 0x8F8370, every 2 s, and from 0x8F7870 on Town::_NV_periodicUpdate
+     0x92BE50) is asked for again by those two while the area stays loaded (F500 / F524); so is a group with no home town (the
+     spawner). The fourth caller, FactionWarMgr::_generateForcesForTown 0x9C3280 (a war force), retries up to 99 times inside its
+     own call (decomp_9c3280.txt:88-91) and then gives up. A building's residents do not reach this refusal: the residents gate sets
+     the building aside first (kind 1), and the engine never tops resident groups up (F956).
+   kind 1 residents and 2 bar crowd - set aside as `nobody` / `loading`; the town's check-up offers them again once the area is
+     named (townreoffer::Decide).
+   kind 3 character - the character factory's member refused (worldgen.cpp detour_createRandomCharacter, a player-faction pass not
+     counted); the engine's caller skips it, as for a no-map refusal. A sleeping group's per-frame wake does not get here - store.cpp
+     holds it until the naming (loadedzones::WakeWaitsForNaming); the roads that still can are listed at worldgen.cpp LeafGatedAt.
+   nobodyYetDeferred[...] on the [TG] line counts every one; the first 5 per kind PER WORLD are logged (the cap is reset at the world
+   teardown). ANY THREAD (the squad and character gates run on the engine's workers). */
+const int kT1261Kinds = 4;
+long long g_t1261NobodyYet[kT1261Kinds] = { 0, 0, 0, 0 };
+volatile LONG g_t1261Lines[kT1261Kinds] = { 0, 0, 0, 0 };
+/* T-1261 fold (review LOW 4): set-aside residents / bar crowds the town's check-up kept waiting because the game named the area's holder
+   has not reported it loaded yet (an unconfirmed naming) - they are not settled as another game's until it has (T1261HolderConfirmedWait).
+   MAIN THREAD (the check-up). */
+long long g_t1261OtherUnconfirmed = 0;
 static void T1076MarkLoading(const std::string& k)
 {
     ::InterlockedIncrement64(&g_t1076MidLoad);
@@ -220,6 +251,22 @@ std::map<std::string, long long> g_p027ByTown;
 DWORD g_mainThread = 0; bool g_mainThreadFromTick = false;   // review-p4a HIGH-2: set on the first TownGenTick (the game's main loop), not at preload
 
 std::string N(long long v) { char b[32]; _snprintf(b, 31, "%lld", v); b[31] = 0; return b; }
+static void T1261NobodyYet(int kind, const std::string& town, int sx, int sy, void* caller = 0)
+{
+    static const char* const kName[kT1261Kinds] = { "squad", "residents", "bar", "character" };
+    static const char* const kNext[kT1261Kinds] = { "not set aside - a town's roaming / military group is asked for again by the engine's spawner and the town's update, a war force retries in its own call",
+                                                   "set aside - the town's check-up offers it again once the area is named",
+                                                   "set aside - the town's check-up offers it again once the area is named",
+                                                   "the engine's caller skips the member (caller= names the engine call that asked)" };
+    if (kind < 0 || kind >= kT1261Kinds) return;
+    ::InterlockedIncrement64(&g_t1261NobodyYet[kind]);
+    if (::InterlockedIncrement(&g_t1261Lines[kind]) > 5) return;
+    char cb[48]; cb[0] = 0;
+    if (caller != 0) { _snprintf(cb, 47, " caller=0x%llX", (unsigned long long)((uintptr_t)caller - (uintptr_t)::GetModuleHandleA(0))); cb[47] = 0; }
+    DebugLog(std::string("[TOWN] nobody holds the area yet kind=") + kName[kind] + " town=" + (town.empty() ? std::string("-") : town)
+             + " sector=" + N((long long)sx) + "," + N((long long)sy) + cb + ": refused - only the named holder makes a town's people (decision 1531); next: "
+             + kNext[kind] + " (first 5 per kind per world; nobodyYetDeferred[...] on the [TG] line counts all)");
+}
 
 int TownPosPod(void* town, float* pos)
 {
@@ -321,7 +368,7 @@ volatile DWORD g_t392PopTid = 0; volatile long g_t392PopSx = -1, g_t392PopSy = -
    Read only on the thread the context names. The rest feeds the once-per-building line Done writes. */
 volatile long g_t392PopAside = 0, g_t392PopAsideN = 0, g_t392PopCnt0 = 0, g_t392PopCnt0Ok = 0;
 void* volatile g_t392PopBld = 0; void* volatile g_t392PopTown = 0;
-/* the residents gate's area answer (MayInventFromView) for the building its context names - 1 when the gate let the
+/* the residents gate's area answer (MayMakeFromView, T-1261) for the building its context names - 1 when the gate let the
    building through to be made here; read with that context on the same thread (T591PendingAside), lowered by TownGenResidentsDone.
    pendAside = buildings set aside when one of their squads was refused notebook-pending; pendAsideNoKey = such refusals whose
    building would not read (a plain refusal, as before). */
@@ -724,7 +771,33 @@ static std::string WanderReportLine()   /* MAIN THREAD (ReportTownGen) */
     b[1199] = 0;
     return b;
 }
-void* detour_create(void* self, void* faction, void* pos, void* town, unsigned long long p5, void* p6, void* p7,
+unsigned long long kRaidSquadCreateRetRva = 0; static coop::AddrReg kRaidSquadCreateRetRva_reg("RaidSquadCreateRet", &kRaidSquadCreateRetRva);   /* the raid caller: the return address of 0x9C3280's createRandomUnloadedSquad call (Steam_1.0.65 0x9C3489) */
+static long long g_raidAllowedUnheld = 0;   /* T-1122 own raid squads: raid squads the gate made in an area nobody holds (raidsquad.h rule 1) */
+/* T-1122 gate 1 (1a, owner 1612 a): raid-caller creations the notebook gate would have held, passed on to the area gates
+   (raidPassedNotebook on the REPORT), and their line - per town the first, then at most once per 5 minutes, kRaidPassLineCap in all. ANY THREAD. */
+static long long g_raidPassedNotebook = 0, g_raidPassLines = 0;
+static std::map<std::string, DWORD> g_raidPassLogAt;   /* under g_tgLock; at most raidnow::kTownCap towns */
+const long long kRaidPassLineCap = 40;
+static void RaidPassesNotebook(const char* sid, const char* holder)
+{
+    const long long n = ::InterlockedIncrement64(&g_raidPassedNotebook);
+    const DWORD now = ::GetTickCount(); bool due = false;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    {
+        std::map<std::string, DWORD>::iterator lt = g_raidPassLogAt.find(sid);
+        if (lt == g_raidPassLogAt.end() && g_raidPassLogAt.size() < raidnow::kTownCap) { g_raidPassLogAt[sid] = now; due = true; }
+        else if (lt != g_raidPassLogAt.end() && townpending::LogDue(1, (unsigned)lt->second, (unsigned)now) != 0) { lt->second = now; due = true; }
+        if (due && ++g_raidPassLines > kRaidPassLineCap) due = false;
+    }
+    ::LeaveCriticalSection(&g_tgLock);
+    if (due) DebugLog(std::string("[TG] town '") + sid + "': raid caller passes the notebook gate - the war-force routine's squad is not a resident (owner 1612 a); the note "
+                      + holder + " would have held it; it goes on to the holder gate and the own-raid rule (raid creations passed so far " + N(n) + "; per town the first, then at most once per 5 minutes)");
+}
+/* What the creation gate decided for one call, for the raid creation line: the gate's answer and its reason, and the area (sector)
+   the squad was judged by (-1 before it is known). */
+struct CreateVerdict { const char* why; int sx, sy; int pending; };   /* pending: refused by the notebook-pending gate (T-1122 fold b: counted for the raid caller) */
+/* The creation gate. callerRva = the engine's return address of this creation call (the detour below reads it). */
+static void* CreateJudged(unsigned long long callerRva, CreateVerdict* cv, void* self, void* faction, void* pos, void* town, unsigned long long p5, void* p6, void* p7,
                     unsigned long long p8, unsigned long long p9, unsigned char p10, void* p11, unsigned long long p12, unsigned int squadType)
 {
     ::InterlockedIncrement64(&g_seen);
@@ -733,7 +806,7 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
     if (offThread) ::InterlockedIncrement64(&g_offThread);
     // the caller, first-only per return address (F503: which path creates with a town, on which thread)
     {
-        const uintptr_t rva = (uintptr_t)_ReturnAddress() - (uintptr_t)::GetModuleHandleA(0);
+        const uintptr_t rva = (uintptr_t)callerRva;
         const unsigned long long ckey = ((unsigned long long)rva << 2) | (town != 0 ? 2ULL : 0ULL) | (offThread ? 1ULL : 0ULL);
         TgLockInit(); ::EnterCriticalSection(&g_tgLock);
         bool known = false; for (int i = 0; i < g_callerCount; ++i) if (g_callerRvas[i] == ckey) { known = true; break; }
@@ -742,7 +815,7 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
         // review-p4d HIGH-1: a full table logs nothing more (the probe stays first-only)
         if (inserted) { char b[160]; _snprintf(b, 159, "[TOWN] creation caller rva=0x%llX town=%d type=%u thread=%s (first only per caller+town+thread)", (unsigned long long)rva, town != 0 ? 1 : 0, squadType, offThread ? "other" : "main"); b[159] = 0; DebugLog(b); }
     }
-    if (!g_on) { ::InterlockedIncrement64(&g_leverOff); return CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10); }
+    if (!g_on) { ::InterlockedIncrement64(&g_leverOff); cv->why = "allowed: the mod's town gate is off"; return CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10); }
     /* T-929 (owner 1377): A GROUP WITH NO HOME TOWN (a roaming group) TAKES THE PATROLS' ROAD. It used to be made here by every game
        for itself, so each game had its own roaming groups. It now falls through to the same gates as a town's squads and is judged
        by where it APPEARS (T-392: its spawn position's area) - only the game holding that area makes it, and the squad record road
@@ -757,7 +830,7 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
         int asx = -1, asy = -1;
         const int inB = T392PopSector(&asx, &asy);
         if (townreoffer::InBuildingSquad(inB, inB != 0 ? (int)g_t392PopAside : 0) == townreoffer::kSqSetAside)
-        { ::InterlockedIncrement64(&g_t392SquadsAside); ::InterlockedIncrement(&g_t392PopAsideN); T515AsideState(p6, p7, "set-aside"); return 0; }   /* T-515: the building's own state now, its people later */
+        { ::InterlockedIncrement64(&g_t392SquadsAside); ::InterlockedIncrement(&g_t392PopAsideN); T515AsideState(p6, p7, "set-aside"); cv->why = "refused: set aside (a building's residents)"; return 0; }   /* T-515: the building's own state now, its people later */
     }
     /* decision 34: the notebook lists living groups for this town that THIS game has not placed yet, in an area this game has loaded or in
        or beside the town's own area (T-580, townpending::Holds) - the town has people about to be placed; do not invent more. Groups
@@ -767,10 +840,16 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
        generation for towns it had never shared - silently, and for the rest of the process. RoleIsSingle() is the
        precondition, tested here as well as inside StoreTownPeoplePending so the refusal cannot be reached by any
        route. ANY THREAD: this creation detour runs on the engine's workers, and the role is an interlocked long. */
+    /* T-1122 gate 1 (1a, owner 1612 a, 2026-11-13; T2327): a creation the engine's war-force routine asked for (the raid caller - raids
+       and caravan visits) is a new campaign squad, not a town resident: it passes this gate and meets the holder gate and the own-raid
+       rule below (raidsq::NotebookGate), as in one-player play. Every other creation keeps decision 34's gate unchanged. */
     if (!RoleIsSingle())
     {
         char sidP[128]; char holderP[192];
-        if (TownSidPod(town, sidP, 128) != 0 && T1099CreationAsk(town, pos, sidP, holderP, 192) == townpending::kTownHeld)
+        const int nbHeld = (TownSidPod(town, sidP, 128) != 0 && T1099CreationAsk(town, pos, sidP, holderP, 192) == townpending::kTownHeld) ? 1 : 0;
+        const int nbGate = raidsq::NotebookGate(raidnow::IsRaidCaller(callerRva, kRaidSquadCreateRetRva), nbHeld);
+        if (nbGate == raidsq::kNbRaidPasses) RaidPassesNotebook(sidP, holderP);
+        if (nbGate == raidsq::kNbHold)
         {
             ::InterlockedIncrement64(&g_refusedPending);
             if (townpending::InRun(g_t580RunTid, ::GetCurrentThreadId()) != 0) { ++g_t580RunPending; if (g_t1099RunHolder[0] == 0) { std::strncpy(g_t1099RunHolder, holderP, 191); g_t1099RunHolder[191] = 0; } }   /* T-580: on a residents re-run's own thread - that re-run reads it (and the first refusing note: T-1099's park) */
@@ -783,6 +862,7 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
                building's, so the re-offer does not repeat it); elsewhere a plain refusal whose building state still lands */
             if (T591PendingAside(sidP, holderP) != 0) T515AsideState(p6, p7, "notebook-pending-set-aside");
             else { T515RefusedState(p6, p7, 0, "notebook-pending"); coop::StorePreTownWaitRefused(sidP, holderP); }   /* T-985 C2b fold 2 (re-check LOW 3): a refusal by the load's town wait is counted and its town named when the wait ends */
+            cv->why = "refused: notebook-pending (the notebook lists this town's people)"; cv->pending = 1;
             return 0;
         }
     }
@@ -802,9 +882,11 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
             bool first4 = false; TgLockInit(); ::EnterCriticalSection(&g_tgLock); first4 = g_refusedTowns.insert(key4).second; ++g_refusedByTown[key4]; ::LeaveCriticalSection(&g_tgLock);
             if (first4) SW_DEVLOG(std::string("[VERDICT] {\"ev\":\"towngen\",\"town\":\"") + key4 + "\",\"type\":" + N((long long)squadType) + ",\"refused\":1,\"cause\":\"no-notebook\"}");
             T515RefusedState(p6, p7, 0, "no-notebook");   /* T-515 */
+            cv->why = "refused: no-notebook (not linked)";
             return 0;
         }
         ::InterlockedIncrement64(&g_unlinkedAllowed);   /* P8a: reachable ONLY on role=single from here on */
+        cv->why = "allowed: a lone game (role=single)";
         return CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10);
     }
     // linked: THE HOLDER RULE, decided on ANY thread through the locked sector snapshot (F503). Same rule on both games.
@@ -815,17 +897,24 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
     const int inBuilding = T392PopSector(&popSx, &popSy);   /* T-392 fold: inside a populateBuilding the residents gate let through */
     const int fromSpawn = inBuilding != 0 ? 0 : SpawnPosPod(pos, tp);
     ::InterlockedIncrement64(inBuilding != 0 ? &g_t392SecBuilding : (fromSpawn != 0 ? &g_t392SecSpawn : &g_t392SecTown));
-    if (inBuilding == 0 && fromSpawn == 0 && !TownPosPod(town, tp)) { ::InterlockedIncrement64(&g_readFault); if (offThread) ::InterlockedIncrement64(&g_readFaultOff); return CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10); }
+    if (inBuilding == 0 && fromSpawn == 0 && !TownPosPod(town, tp)) { ::InterlockedIncrement64(&g_readFault); if (offThread) ::InterlockedIncrement64(&g_readFaultOff); cv->why = "allowed: the spawn and town positions are unreadable"; return CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10); }
     Sector s = SectorOf(tp[0], tp[2]);
     if (inBuilding != 0) { s.x = popSx; s.y = popSy; }   /* T-392 fold: the building's sector */
+    cv->sx = s.x; cv->sy = s.y;
     /* review-p5g Q5: ONE locked read of the area; the decision below and the refusal's CAUSE both come out of it. The cause
        used to be a second query (HeldByOtherTS) taken after the decision, so an AREAMAP landing between the two could label a
-       refusal with a map that no longer existed. decision 37 amended: `aLoadedHere` is the first-there presumption. */
-    int aHeld = 0, aMine = 0, aLoadedHere = 0, aRing1 = 0, aPeerRing1 = 0, aPeerLow = -2, aPresumedEmpty = 0, aPeerLowFresh = 1, aPartyOnly = 0;   /* T-1076 */
-    AreaViewTS(s, &aHeld, &aMine, 0, &aLoadedHere, &aRing1, &aPeerRing1, &aPeerLow, &aPresumedEmpty, &aPeerLowFresh, &aPartyOnly);   /* E25 re-designed: the slot to compare against comes out of the SAME locked read as the answer it decides */   /* P6j (verify-p6c MEDIUM-4): and so does the empty-table offer, which is counted only if the grant below is reached */
-    const int may = MayInventFromView(aHeld, aMine, aLoadedHere, aRing1, aPeerRing1, MySlotLower(aPeerLow), aPresumedEmpty, aPeerLowFresh);
-    T1076CountRing1(may, aHeld, aMine, aLoadedHere, aRing1, aPartyOnly);
-    /* decision 31(b): symmetric; decision 37 (amended): the relay names THIS game the holder, or nobody holds it and this game has it loaded, or `ring1` says it is unclaimed and next to this game's own player (E13 attempt 2 - this gate is the one T224 caught refusing its own town). E25: and if the OTHER player is next to it too, the lower slot invents and the other yields, so one town does not get two crowds. */
+       refusal with a map that no longer existed. */
+    int aHeld = 0, aMine = 0, aLoadedHere = 0, aRing1 = 0, aPeerRing1 = 0, aPeerLow = -2;
+    int aOther = -1;   /* T-1122 own raid squads: another game has the area loaded (1), not (0), no fresh map (-1) - off the same locked read */
+    AreaViewTS(s, &aHeld, &aMine, &aOther, &aLoadedHere, &aRing1, &aPeerRing1, &aPeerLow);   /* T-1261: ring 1 and the slot only for the probes' lines - the decision reads held and mine; T-1122: aOther for the raid gate below */
+    const int may = MayMakeFromView(aHeld, aMine);
+    /* decision 31(b): symmetric. T-1261 (owner decision 1531): only the game the world server names the area's holder makes the
+       group - loaded here and ring 1 no longer grant (the game that made a town's groups before the naming was not always the one
+       then named: H-T1261-preholder). A group refused here while nobody holds the area is NOT set aside: a town's roaming / military
+       group is asked for again by the engine's spawner round and the town's periodic update while the area stays loaded (F500 /
+       F524), a war force (0x9C3280) retries inside its own call. A building's residents are not judged here - the residents gate
+       set their building aside before populateBuilding ran (the set-aside arm at the top of this function) and the town's check-up
+       re-offers it after the naming; the engine never tops resident groups up (F956). See T1261NobodyYet. */
     /* P6j (verify-p6c MEDIUM-2): kInventTeardown is NEGATIVE, so it has to be excluded here or the engine freeing the
        world would be reported as a stale lease. It falls through to the ordinary refusal path below, which gives it
        its own cause string - the refusal line and the verdict both carry `teardown` rather than `not-mine`. */
@@ -854,6 +943,7 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
         char sid2[128]; const std::string key2 = (TownSidPod(town, sid2, 128) != 0 ? std::string(sid2) : std::string("?")) + " (no-map)";   // review-p4g MEDIUM-2: per-town bookkeeping
         bool first2 = false; TgLockInit(); ::EnterCriticalSection(&g_tgLock); first2 = g_refusedTowns.insert(key2).second; ++g_refusedByTown[key2]; ::LeaveCriticalSection(&g_tgLock);
         if (first2) SW_DEVLOG(std::string("[VERDICT] {\"ev\":\"towngen\",\"town\":\"") + key2 + "\",\"type\":" + N((long long)squadType) + ",\"refused\":1,\"cause\":\"no-map\"}");
+        cv->why = "refused: no-map (no fresh area map)";
         return 0;
         }
     }
@@ -875,7 +965,8 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
             const int wsV = WanderJudge(tp, &wsNear, &wsSlot, &wsOwn, &wsBaseR, &wsAge);
             if (wsV != wanderspawn::kAllow)
             {
-                WanderRefuseNote(wsV, tp, s, faction, p7, (unsigned long long)((uintptr_t)_ReturnAddress() - (uintptr_t)::GetModuleHandleA(0)), offThread ? 1 : 0,
+                cv->why = "refused: a wandering group too near a player or inside another player's base (T-1235 keep-away)";   /* merge t1122a: the gate's verdict for the raid creation line */
+                WanderRefuseNote(wsV, tp, s, faction, p7, callerRva, offThread ? 1 : 0,
                                  wsNear, wsSlot, wsOwn, wsBaseR, wsAge);
                 return 0;
             }
@@ -899,7 +990,7 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
         void* np = CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10);
         /* T-1235: a wandering group this game made - its [SPAWN] wander line (WanderNote / WanderDrain) */
         if (np != 0 && wanderspawn::IsWanderCreation((p6 != 0 || inBuilding != 0) ? 1 : 0, p9 != 0 ? 1 : 0) != 0)
-            WanderNote(tp, fromSpawn, s, faction, p7, (unsigned long long)((uintptr_t)_ReturnAddress() - (uintptr_t)::GetModuleHandleA(0)), offThread ? 1 : 0);
+            WanderNote(tp, fromSpawn, s, faction, p7, callerRva, offThread ? 1 : 0);
         /* PROBE-START: P085 */
         if (np != 0 && s.x >= 0 && s.x < 64 && s.y >= 0 && s.y < 64)
         { ::InterlockedIncrement(&g_p085Squads[s.x * 64 + s.y]); if (squadType == 2) ::InterlockedIncrement(&g_p085Residents[s.x * 64 + s.y]); }
@@ -920,7 +1011,24 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
             ::LeaveCriticalSection(&g_tgLock);
         }
         if (firstA) SW_DEVLOG(std::string("[VERDICT] {\"ev\":\"towngen\",\"town\":\"") + JsonEsc(keyA) + "\",\"type\":" + N((long long)squadType) + ",\"refused\":0,\"id\":\"" + JsonEsc(idA) + "\",\"sector\":\"" + N(s.x) + "," + N(s.y) + "\"}");
+        cv->why = "allowed: this game holds the area";
         return np;
+    }
+    /* T-1122 own raid squads (src/common/raidsquad.h rule 1): A RAID SQUAD OF THIS GAME'S OWN CAMPAIGN. The raid caller (row
+       RaidSquadCreateRet) asks for the squads of a campaign this game's war manager started against this game's own player's base. Its
+       attacker towns usually lie in areas nobody holds, and the refusal below left every such campaign short of squads (T1918), so the
+       engine cancelled it. Where nobody holds the area and no other game has it loaded or stands beside it, the squad is made here,
+       asleep, as in solo play, and noted as this game's own raid squad: this game travels it off-screen (store.cpp OwnRaidUpdate) and
+       no other game holds a record of it while it sleeps. Another game's area, a frozen area, no fresh map and a teardown keep their
+       refusals; every other caller is unchanged. ANY THREAD: the note takes its own lock. */
+    if (raidsq::GateAllows(raidnow::IsRaidCaller(callerRva, kRaidSquadCreateRetRva), may, aHeld, aMine, aOther, aPeerRing1) == 1)
+    {
+        ::InterlockedIncrement64(&g_allowed); if (offThread) ::InterlockedIncrement64(&g_allowedOff);
+        ::InterlockedIncrement64(&g_raidAllowedUnheld);
+        void* npR = CreatedTown(orig_create(self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType), town, p10);
+        if (npR != 0) StoreOwnRaidNote(npR);
+        cv->why = "allowed: a raid squad of this game's own campaign (nobody holds the area, no other game has it loaded)";
+        return npR;
     }
     /* decision 37: a refusal here has TWO causes and the verdict must tell them apart - another player HOLDS the area
        (decision 31(b), as before), or NOBODY holds it, which is now a refusal too: an unheld area is claimed by the first
@@ -965,7 +1073,60 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
         SW_DEVLOG(std::string("[VERDICT] {\"ev\":\"towngen\",\"town\":\"") + key + "\",\"type\":" + N((long long)squadType) + ",\"refused\":1,\"cause\":\"" + std::string(causeR) + "\",\"holder\":\"" + std::string(holderR) + "\",\"sector\":\"" + N(s.x) + "," + N(s.y) + "\"}");   // first only per town (T191: 1576 lines otherwise)
     }
     T515RefusedState(p6, p7, teardownR ? 1 : 0, heldByOther ? "not-holder-other" : "not-holder-nobody");   /* T-515: the building's own state still lands on the game that is not the holder */
+    if (!teardownR && !heldByOther) T1261NobodyYet(0, haveSid ? std::string(sid) : std::string(), s.x, s.y);   /* T-1261: nobody holds the area yet */
+    cv->why = teardownR ? "refused: teardown" : (heldByOther ? "refused: not-holder (another player holds the area)" : "refused: not-holder (nobody holds the area)");
     return 0;
+}
+
+/* THE RAID CREATION LINE (T-1122): every creation call from the raid caller (row RaidSquadCreateRet) gets a [TOWN] line with the
+   town, what the gate decided and why, and whether a squad came back - at most one line per town per second (raidnow::LineDue),
+   the calls in between counted onto the next line; a call that made a squad always prints. A refused raid squad is how a raid on a far-off target fails, and the
+   first-refusal line above prints only once per town. ANY THREAD: the gates sit under g_tgLock. */
+static std::map<std::string, raidnow::LineGate> g_raidGates;   /* per town string id; at most raidnow::kTownCap */
+static raidnow::LineGate g_raidGateOverflow = { 0, 0, 0 };    /* shared by the towns past the cap */
+/* kRaidSquadCreateRetRva: defined above CreateJudged (T-1122 own raid squads: the gate reads it) */
+static long long g_raidCalls = 0, g_raidMade = 0, g_raidRefused = 0;
+static long long g_raidRefusedPending = 0;   /* T-1122 fold b: raid-caller squads refused by the notebook-pending gate - 0 from T-1122 gate 1 on (owner 1612 a: the raid caller passes that gate; raidPassedNotebook counts it) */
+static void RaidCreationLine(unsigned long long callerRva, void* town, unsigned int squadType, void* made, const CreateVerdict* cv)
+{
+    const long long calls = ::InterlockedIncrement64(&g_raidCalls);
+    const long long nMade = made != 0 ? ::InterlockedIncrement64(&g_raidMade) : g_raidMade;
+    const long long nRefused = made == 0 ? ::InterlockedIncrement64(&g_raidRefused) : g_raidRefused;
+    const long long nPending = (made == 0 && cv->pending != 0) ? ::InterlockedIncrement64(&g_raidRefusedPending) : g_raidRefusedPending;
+    char sid[128];
+    if (town == 0) std::strcpy(sid, "(no town)");
+    else if (TownSidPod(town, sid, 128) == 0) std::strcpy(sid, "?");
+    const unsigned long long nowMs = (unsigned long long)::GetTickCount();
+    long long skipped = 0;
+    int due = 0;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    {
+        const std::string key(sid);
+        std::map<std::string, raidnow::LineGate>::iterator it = g_raidGates.find(key);
+        if (it == g_raidGates.end() && g_raidGates.size() < raidnow::kTownCap)
+        { const raidnow::LineGate zero = { 0, 0, 0 }; it = g_raidGates.insert(std::make_pair(key, zero)).first; }
+        due = raidnow::LineDue(it != g_raidGates.end() ? &it->second : &g_raidGateOverflow, nowMs, &skipped);
+    }
+    ::LeaveCriticalSection(&g_tgLock);
+    if (due == 0 && made == 0) return;   /* a made squad always prints: the per-second gate hid T1934's retry that made one */
+    char b[512];
+    _snprintf(b, 511, "[TOWN] raid creation: town='%s' type=%u caller=0x%llX thread=%s squad=%s gate='%s' sector=%d,%d (raid calls %lld, made %lld, refused %lld of them %lld notebook-pending; %lld earlier calls for this town not printed - one line per town per second)",
+              sid, squadType, callerRva, ::GetCurrentThreadId() != g_mainThread ? "other" : "main", made != 0 ? "made" : "none",
+              cv->why, cv->sx, cv->sy, calls, nMade, nRefused, nPending, skipped);
+    b[511] = 0;
+    DebugLog(b);
+}
+
+/* The hook on createRandomUnloadedSquad: the gate above, then the raid creation line for a call from the raid caller. The return
+   address is read HERE, in the function the engine called. */
+void* detour_create(void* self, void* faction, void* pos, void* town, unsigned long long p5, void* p6, void* p7,
+                    unsigned long long p8, unsigned long long p9, unsigned char p10, void* p11, unsigned long long p12, unsigned int squadType)
+{
+    const unsigned long long callerRva = (unsigned long long)((uintptr_t)_ReturnAddress() - (uintptr_t)::GetModuleHandleA(0));
+    CreateVerdict cv; cv.why = "?"; cv.sx = -1; cv.sy = -1; cv.pending = 0;
+    void* made = CreateJudged(callerRva, &cv, self, faction, pos, town, p5, p6, p7, p8, p9, p10, p11, p12, squadType);
+    if (raidnow::IsRaidCaller(callerRva, kRaidSquadCreateRetRva) != 0) RaidCreationLine(callerRva, town, squadType, made, &cv);
+    return made;
 }
 
 /* recruit3 (user decision 2026-09-26, 02-project-rules "Recruits"): BAR HIRE LISTS x PLAYERS, cap x4, host option
@@ -1541,18 +1702,31 @@ static int T392Key(void* building, char* out)
     if (cap <= 0 || cap > kT392KeyRoom) return 0;
     return ObjectPositionKey(building, out, cap, "", 3, 0);
 }
-/* T-392 fold (review LOW): the load-time gate's OWN question - MayInventFromView over one locked AreaViewTS read, with the
-   loaded-here and next-to-the-player presumptions - asked by the residents gate and by the re-offer alike. *heldOut = held. */
-/* T-1076: *loadedOut = loadedHere (1 = the area is in this game's loaded list); countRing1 = 1 at the load-time residents gate. */
-static int T392MayAt(const Sector& s, int* heldOut, int* loadedOut = 0, int countRing1 = 0)
+/* T-392 fold (review LOW): the load-time gate's OWN question over one locked AreaViewTS read - asked by the residents gate, the
+   bar and residents re-offers and the town fill alike. T-1261 (owner decision 1531): MayMakeFromView, the named holder only (no
+   loaded-here or next-to-the-player presumption), so the re-offer generates only once the world server has named this game.
+   *heldOut = held. T-1076: *loadedOut = loadedHere (1 = the area is in this game's KEPT set - decision 1556 fold 2 (re-check M2): AreaViewTS
+   answers the areas this game's engine keeps, not one it is loading or unloading). */
+static int T392MayAt(const Sector& s, int* heldOut, int* loadedOut = 0)
 {
-    int h = 0, m = 0, l = 0, r1 = 0, pr1 = 0, low = -2, pe = 0, lf = 1, po = 0;
-    AreaViewTS(s, &h, &m, 0, &l, &r1, &pr1, &low, &pe, &lf, &po);
-    const int may = MayInventFromView(h, m, l, r1, pr1, MySlotLower(low), pe, lf);
+    int h = 0, m = 0, l = 0;
+    AreaViewTS(s, &h, &m, 0, &l, 0, 0);
+    const int may = MayMakeFromView(h, m);
     if (heldOut != 0) *heldOut = h;
     if (loadedOut != 0) *loadedOut = l;
-    if (countRing1 != 0) T1076CountRing1(may, h, m, l, r1, po);
     return may;
+}
+/* T-1261 fold (review LOW 4): ANOTHER GAME'S ANSWER WAITS FOR ITS NAMING TO BE CONFIRMED. A named holder may not have the area in its
+   loaded bits (T-1285: no longer ahead of its report; decision 1556: a holder that drops the area passes it at once to another lister or
+   to nobody, areaclaim.h AreaChargeDecide - a map can still lag the bits); a set-aside item settled as `answered-other` inside that window was forgotten here and the town
+   stayed empty if the area then passed to this game. The check-up's answer `another game holds it` stands only once the named holder
+   has the area in its loaded bits (HolderLoadedTS 1); until then the item waits (townreoffer::OtherConfirmed). MAIN THREAD. */
+static int T1261HolderConfirmedWait(int d, int held, const Sector& s)
+{
+    if (d != townreoffer::kReOther || held != 1) return d;
+    const int w = townreoffer::OtherConfirmed(d, held, HolderLoadedTS(s));
+    if (w != d) ++g_t1261OtherUnconfirmed;
+    return w;
 }
 /* T-438: the town's resident-bucket count - the int at bucket+8 that populateBuilding's tail adds the building's expected
    headcount to (decomp_57ed90:197-199; the bucket is the town population manager's vt+0x8 with type 1, as T2NodesPod reads it).
@@ -1658,7 +1832,7 @@ static int T392ResidentsGate(void* factory, void* building)
     if (t == 0 || TownSidPod(t, sid, 128) == 0) { ::InterlockedIncrement64(&g_t392ResNoTown); return 1; }   /* populateBuilding returns at once with no town (decomp_57ed90:65-68) */
     const Sector s = SectorOf(bp[0], bp[2]);
     int dc = townreoffer::kDefNoNotebook, mayG = 0;
-    if (g_linkedCached) { int h = 0, lh = 0; mayG = T392MayAt(s, &h, &lh, 1); dc = townreoffer::DeferCauseAt(1, mayG, h, lh); }   /* T-1076: an area still loading is set aside as `loading`, not `nobody` */
+    if (g_linkedCached) { int h = 0, lh = 0; mayG = T392MayAt(s, &h, &lh); dc = townreoffer::DeferCauseAt(1, mayG, h, lh, h == 1 ? HolderLoadedTS(s) : -1); }   /* T-1076: an area still loading - not yet kept, decision 1556 fold 2 (re-check M2) - is set aside as `loading`, not `nobody` */   /* T-1261 re-check fold: another game named but not confirmed is `nobody` yet */
     char key[kT392KeyRoom]; key[0] = 0;
     int keyOk = -1;   /* -1 = not built yet */
     /* T-581: residents this game would make now are set aside when they are an owed row this game does not hold yet (they are made
@@ -1694,6 +1868,7 @@ static int T392ResidentsGate(void* factory, void* building)
         T392ResRecord(key, sid, bp[0], bp[2]);
         if (dc == townreoffer::kDefLoading) T1076MarkLoading(std::string("res|") + key);   /* T-1076 */
         T392DeferLog("residents", std::string(sid), s.x, s.y, townreoffer::DeferCauseName(dc), key);
+        if (dc == townreoffer::kDefNobody || dc == townreoffer::kDefLoading) T1261NobodyYet(1, std::string(sid), s.x, s.y);   /* T-1261: nobody holds the area yet - set aside */
     }
     /* T-438: populateBuilding still runs (interior/furniture, owner faction - at this load event); its squads are refused as SET
        ASIDE inside the creation detour, judged by THIS building-sector context. The caller lowers the flag (TownGenResidentsDone). */
@@ -1777,7 +1952,7 @@ void detour_barFlies(void* town)
     const char* cause = "not-holder";   /* DECISION 48 (P8a): one rule, one cause; `holder` below says which non-holder state it was */
     const char* holderB = "other";
     /* P6q (review-p6j MEDIUM-4) - THE DECLARATION IS OUTSIDE THE PROBE MARKERS. These six are the decision's own
-       inputs, not probe state: AreaViewTS fills them below, MayInventFromView is called with them, and the
+       inputs, not probe state: AreaViewTS fills them below, MayMakeFromView is called with two of them (T-1261), and the
        `not-mine` cause test reads one. references/probe-management.md tells a reader to delete from
        `// PROBE-START: <ID>` through `// PROBE-END: <ID>` inclusive, with "no judgment needed and no chance of
        taking adjacent real code with it" - and following that here would have deleted six declarations three later
@@ -1800,11 +1975,11 @@ void detour_barFlies(void* town)
         if (!TownPosPod(town, tp)) { BarPendClear(town); ::InterlockedIncrement64(&g_barFliesReadFault); orig_barFlies(town); return; }   // review-p4f Q2: a read fault allows, counted (never drains)
         const Sector bs = SectorOf(tp[0], tp[2]);
         bHeld = 0; bMine = 0; bLoadedHere = 0; bRing1 = 0; bPeerRing1 = 0; bPeerLow = -2;
-        int bPresumedEmpty = 0, bPeerLowFresh = 1, bPartyOnly = 0;   /* T-1076 */
-        AreaViewTS(bs, &bHeld, &bMine, 0, &bLoadedHere, &bRing1, &bPeerRing1, &bPeerLow, &bPresumedEmpty, &bPeerLowFresh, &bPartyOnly);   /* review-p5g Q5: one locked read for the decision AND the cause */   /* E25 re-designed: and for the slot the tie-break compares */   /* P6j: and the empty-table offer */
-        const int may = MayInventFromView(bHeld, bMine, bLoadedHere, bRing1, bPeerRing1, MySlotLower(bPeerLow), bPresumedEmpty, bPeerLowFresh);
-        T1076CountRing1(may, bHeld, bMine, bLoadedHere, bRing1, bPartyOnly);
-        /* decision 37 (amended): bar residents are people too - invented where the relay names this game the holder, where nobody holds the area and this game has it loaded, or (E13 attempt 2, `ring1`) where nobody holds it and it is next to this game's own player. The bar list is drained IRREVERSIBLY on a refusal, so this gate is the one that must not refuse during the ~10-12 s window H047 names. */
+        AreaViewTS(bs, &bHeld, &bMine, 0, &bLoadedHere, &bRing1, &bPeerRing1, &bPeerLow);   /* review-p5g Q5: one locked read for the decision AND the cause (ring 1 and the slot only for P027's line since T-1261) */
+        const int may = MayMakeFromView(bHeld, bMine);
+        /* T-1261 (owner decision 1531): bar residents are people too - made only where the world server names this game the holder.
+           While nobody holds the area the list is SET ASIDE below (`nobody` / `loading`), never drained, and the town's check-up
+           re-offers it once the area is named - so the ~10-12 s window H047 names costs a wait, not the crowd. */
         /* P6j (verify-p6c MEDIUM-2): kInventTeardown refuses on BOTH sides (it is not an answer about the area, so the
            client/host split does not apply to it) and it is separated from the no-map arm, which is negative as well.
            The outcome is exactly what P6c already produced here - refuse, and drain as the engine would have - so
@@ -1826,10 +2001,11 @@ void detour_barFlies(void* town)
            aside. (owner 335 a) So does "nobody holds the area": it is refused (not this game's to fill now) but NOT drained,
            because the drain below is irreversible. Only another game holding the area, or teardown, still drains. The second
            chance is the town's own check-up (T392Reoffer), not a clock. */
-        const int dcB = townreoffer::DeferCauseAt(1, may, bHeld, bLoadedHere);   /* T-1076: an area still loading is set aside as `loading`, not `nobody` */
+        const int dcB = townreoffer::DeferCauseAt(1, may, bHeld, bLoadedHere, bHeld == 1 ? HolderLoadedTS(bs) : -1);   /* T-1076: an area still loading - not yet kept, decision 1556 fold 2 (re-check M2) - is set aside as `loading`, not `nobody` */   /* T-1261 re-check fold: another game named but not confirmed is `nobody` yet - set aside, never drained */
         if (dcB == townreoffer::kDefNoMap) { cause = "no-map"; holderB = "-"; deferB = true; ::InterlockedIncrement64(&g_refusedNoMap); }   /* DEFERRED, not drained: this is not an answer about the area */
         if (dcB == townreoffer::kDefNobody) deferB = true;
         if (dcB == townreoffer::kDefLoading) { deferB = true; T1076MarkLoadingBar(town); }   /* set aside, never drained; kept by its Town*, as g_barPend keeps it */
+        if (dcB == townreoffer::kDefNobody || dcB == townreoffer::kDefLoading) { char sidN[128]; T1261NobodyYet(2, TownSidPod(town, sidN, 128) != 0 ? std::string(sidN) : std::string(), bs.x, bs.y); }   /* T-1261: nobody holds the area yet - set aside */
         if (dcB != townreoffer::kDefNone) { t392Cause = townreoffer::DeferCauseName(dcB); t392Sx = bs.x; t392Sy = bs.y; }
         if (owedB != townreoffer::kDefNone)   /* T-581 */
         {
@@ -1895,7 +2071,7 @@ void detour_barFlies(void* town)
    check-up, Town::periodicTick 0x92BE50 (main thread, one town per pass, every loaded town - recruit-refill-live.md
    L2), tops a bar back up to its usual size once 5 in-game days have passed since it was last filled:
    - ONLY on the game the relay names as the holder of the town's area (MineHeldTS == 1). The bar roll's own gate
-     (MayInventFromView) also lets an unclaimed loaded area through; a timed top-up waits for a named holder instead,
+     (MayMakeFromView since T-1261) also waits for a named holder; a timed top-up asks MineHeldTS the same way,
      so two games can never both top one bar up.
    - THE USUAL SIZE (free recruits, hire squads) is counted at the first check-up after the town's first roll under
      the mod (from=firstRoll) or, for a town first seen already rolled, from its live count (from=live, usualFromLive),
@@ -2437,7 +2613,8 @@ static void RefillCheck(void* town)
    (ActivePlatoon::setupCheck 0x4FF040 -> createRandomSquad 0x582F80). In a town that stays loaded neither step happens, so
    the game that HOLDS the town does both, every 5 in-game days:
    - DECIDE in the refill's own Town::periodicTick 0x92BE50 post-hook (main thread): holder only with the zone live, every
-     120 in-game hours per town (coopt2::RebuildDue; the timer is this holder's own, g_t2Last). Skipped whole when the town is
+     120 in-game hours per town on the town's clock record (T-4, src/common/towntime.h: one clock per town on the world server, read
+     and advanced by whichever game holds the town's area - TtTown below). Skipped whole when the town is
      dead (population manager byte +8 - the marker's own skip) or its version may have changed since it came into range
      (coopt2::VersionMayChange: the town has "override town" versions and a named character's state changed
      since - the game would pick the version again first, so the old version's groups are never rebuilt). The walk reads
@@ -2486,14 +2663,162 @@ const int kT2Mem = 256, kT2Nodes = 256, kT2Players = 128, kT2HandBytes = 0x20;
 const size_t kT2QueueCap = 64;
 const DWORD kT2QueueMaxMs = 120000, kT2VerifyMaxMs = 60000, kT2ForcedLineMs = 30000;
 const long long kT2LineCap = 400;
-const int kT2KillPat = 1 << 12, kT2KillRegen = 1 << 13, kT2KillNoRegen = 1 << 14, kT2KillAll = 1 << 15, kT2KillCountMask = 0xFFF;
+const int kT2KillPat = coopt2::kKillPat, kT2KillRegen = coopt2::kKillRegen, kT2KillNoRegen = coopt2::kKillNoRegen, kT2KillAll = coopt2::kKillAll, kT2KillLeader = coopt2::kKillLeader, kT2KillCountMask = coopt2::kKillCountMask;
+#ifdef SW_DEV_BUILD
+const int kT2DevBuild = 1;   /* T2333: `townres kill .. leader` is a DEV-build TEST option */
+#else
+const int kT2DevBuild = 0;
+#endif
 enum { kT2xGone = 0, kT2xFault, kT2xNotHolder, kT2xNoFactionTurn, kT2xNoAddr, kT2xStepFault, kT2xRebuildNotSeen, kT2xQueueFull, kT2xN };
 const char* const kT2xName[kT2xN] = { "gone", "readFault", "notHolder", "noFactionTurn", "noAddr", "stepFault", "rebuildNotSeen", "queueFull" };
-struct T2Q { unsigned char h[kT2HandBytes]; std::string town; std::string list; std::string wid; int idx; int orig; int living; int nosight; DWORD at; };
+struct T2Q { unsigned char h[kT2HandBytes]; std::string town; std::string list; std::string wid; int idx; int orig; int living; int nosight; DWORD at; std::string tid; int sx; int sy; float tx; float tz; };   /* T-4: tid = the town's clock record id, sx / sy its area square */
 struct T2V { unsigned char h[kT2HandBytes]; std::string town; std::string list; std::string wid; int idx; int origBefore; int livingBefore; DWORD at; };
 std::vector<T2Q> g_t2Queue;                 /* MAIN THREAD: groups to rebuild, by a copy of their hand */
 std::vector<T2V> g_t2Verify;                /* MAIN THREAD: groups slept and woken, watched until the rebuild is seen */
-std::map<std::string, double> g_t2Last;     /* MAIN THREAD: per town stringID, the in-game hour of THIS holder's last walk */
+/* T-4 (owner rule 1560): THE TOWN'S 5-DAY CLOCK IS ONE WORLD-SERVER RECORD, towntime.<sx>.<sy>.<sid> (src/common/towntime.h). MAIN
+   THREAD. One row per record id: what this game knows of the record (towntime::TtKeep - the last record the world server accepted
+   apart from this game's write in flight), its hold of the town and the walk in flight (towntime::TtWalk). Towns2Check judges the
+   record only once the world server's records of the town's area are all in (StoreAreaDoneXY: the feed's AREA_DONE marker, which
+   the drain applies behind that area's records; a record written later arrives as a live forward and wins when newer):
+   - no record: the first one is written (due = now + 120 h);
+   - due reached: the PERIOD WALK. It always finishes: after its last queued group is committed it writes due = now + 120 h. A
+     group a player sees (at the walk or at its commitment - coopt2::IsDeferral) goes on the record's OWED list; a group rebuilt,
+     marked or skipped for good leaves it. An asleep pick gets the engine's own mark (coopt2::AsleepAct, after every final refusal
+     that applies to it; sight is not tested - the base game rebuilds it at its own wake) and its id goes on the record's MARKED list
+     (the save does not keep the mark), or a final skip; a group with a living unique member is a final skip (owner rule 1560);
+   - a MARKED group: at each check-up while listed, its mark is re-applied when missing (a new holder, a reload) if it is still
+     asleep and qualifying; it leaves the list when it wakes (rebuilt or not) or fails a final test;
+   - before due with groups owed or marked: the OWED WALK at each check-up - only the owed groups, each rebuilt once nobody sees it, then
+     dropped; due is not moved (a group is rebuilt at most once a period);
+   - not walked at all (lists, a group or the flags unreadable, the version wait): nothing is written; the next check-up tries again
+     (the version wait - T-640 D1, coopt2::VersionAskWait: another version would apply at the town's next load - the world server's
+     record names one, or the engine's own version test says one holds - and it lasts while that stays true: it ends when a later
+     load really switches the town (or the states change back), not by the town being seen out of range; only when the test could
+     not run does the stand-in decide - a named character changed since the town was last out of range - and that wait ends when
+     the town is seen out of loaded range - g_t2GenOut);
+   - the town's area no longer held here at a queued group's commitment (Towns2Act): the walk is dropped and nothing is written. */
+struct TtTown
+{
+    towntime::TtKeep k;             /* the accepted record, the working record, the write in flight, the refusal floor */
+    towntime::TtWalk w;             /* the walk in flight */
+    int holding;                    /* this game holds the town's area with its zone live */
+    float pos[3];                   /* the town's position (the record is sent at it) */
+    std::string why;                /* why the last walk could not run (REPORT) */
+    std::map<std::string, int> said;   /* lines said since the clock was last written (a walk tried again repeats none) */
+    TtTown() : holding(0) { pos[0] = pos[1] = pos[2] = 0.0f; }
+};
+std::map<std::string, TtTown> g_tt;   /* MAIN THREAD: by record id */
+const long long kTtLineCap = 150;
+long long g_ttArrived = 0, g_ttTaken = 0, g_ttOlder = 0, g_ttBad = 0, g_ttSeeded = 0, g_ttWritten = 0, g_ttNotSent = 0, g_ttRefused = 0, g_ttFinished = 0,
+          g_ttOwedWalks = 0, g_ttNotWalked = 0, g_ttClockBack = 0, g_ttRecordsWait = 0, g_ttPendingWait = 0, g_ttNoId = 0, g_ttPeerSector = 0, g_ttAsleepMarked = 0,
+          g_ttLostHold = 0, g_ttEchoed = 0, g_ttRemarked = 0, g_ttCapped = 0, g_ttLinkGaveUp = 0, g_ttLines = 0, g_ttLinesDropped = 0;
+const long long kTtCapLineCap = 20;
+long long g_ttCapLines = 0;
+/* T-4 TEST-ONLY `towntime period <hours>` (command file only): the period every NEW due is written with on THIS game - give both
+   games the same value. Players never change it: kTtPeriodHours (120). MAIN THREAD (the command channel and the town check-up). */
+double g_ttPeriodHours = towntime::kTtPeriodHours;
+long long g_ttPeriodSets = 0, g_ttPeriodLines = 0;
+const long long kTtPeriodLineCap = 20;
+static void TtLine(const std::string& s) { if (g_ttLines >= kTtLineCap) { ++g_ttLinesDropped; return; } ++g_ttLines; DebugLog(s); }
+static std::string TtHours(double h) { char b[32]; _snprintf(b, 31, "%.2f", h); b[31] = 0; return std::string(b); }
+static std::string TtPeriodText() { return "now + " + TtHours(g_ttPeriodHours) + " h" + (g_ttPeriodHours != towntime::kTtPeriodHours ? std::string(" (TEST-ONLY period)") : std::string()); }
+static std::string TtRecText(const towntime::TownTimeRec& r)
+{
+    std::string o;
+    for (size_t i = 0; i < r.owed.size(); ++i) o += (i != 0 ? "," : "") + r.owed[i];
+    return "gen=" + N((long long)r.generation) + " writer=" + N((long long)r.writerSlot) + " started=" + TtHours(r.started) + " due=" + TtHours(r.due)
+         + " lastRebuilt=" + (r.lastRebuilt < 0.0 ? std::string("never") : TtHours(r.lastRebuilt)) + " rebuilds=" + N((long long)r.rebuilds)
+         + " owed=" + N((long long)r.owed.size()) + (r.owed.empty() ? std::string() : "[" + o + "]");
+}
+/* D (fold 2): the in-game hour the shop record's deadline uses - the engine's clock (GameWorld +0xA0, items.cpp ShopClockNow), which
+   every game keeps in step with the world server's CLOCK; -1 = not read */
+static double TtNow() { double h = -1.0; return coop::ItemsWorldClockHours(&h) == 1 ? h : -1.0; }
+/* An asleep pick's mark (Platoon+0x118 = 1), as the engine's marker 0x929150 writes it; the engine's setupCheck consumes it at the
+   group's own wake. 1 = written. MAIN THREAD */
+static int T2MarkPod(void* platoon)
+{
+    if (platoon == 0) return 0;
+    __try { *(int*)((char*)platoon + 0x118) = 1; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* one group's end for the walk; an owed group with no readable id cannot be named on the record: a final skip */
+static void TtEnd(TtTown& T, int end, const std::string& wid, int fromQueue)
+{
+    if (end == towntime::kTtEndOwe && (wid.empty() || wid == "?" || !towntime::TtSidOk(wid))) end = towntime::kTtEndFinal;
+    towntime::TtWalkGroupEnd(&T.w, end, wid, fromQueue);
+}
+/* This game's write of the town's clock (towntime.h TtNextRecord) sent at the town's position. 1 = sent. */
+static int TtWriteNext(const std::string& tid, TtTown& T, double now, int asked, int period, const std::vector<std::string>& owed, const std::vector<std::string>& marked, const std::string& what)
+{
+    const int me = StoreMySlot();
+    int sx = 0, sy = 0; std::string sid;
+    if (me < 0 || towntime::TownTimeIdParse(tid, &sx, &sy, &sid) == 0) { ++g_ttNotSent; TtLine("[TOWNTIME] write " + tid + " not made (slot " + N((long long)me) + ") - " + what); return 0; }
+    const towntime::TownTimeRec n = towntime::TtNextRecord(T.k.have, T.k.r, T.k.floorGen, me, sx, sy, sid, now, asked, period, owed, marked, g_ttPeriodHours);
+    std::vector<char> b;
+    if (!towntime::EncodeTownTimeRec(&b, n)) { ++g_ttBad; TtLine("[TOWNTIME] write " + tid + " NOT made: the record does not encode (" + TtRecText(n) + ")"); return 0; }
+    long long stamp = 0;
+    if (!StoreSendTownTimeRecord(tid, T.pos[0], T.pos[1], T.pos[2], b, &stamp)) { ++g_ttNotSent; TtLine("[TOWNTIME] write " + tid + " not sent (no world-server link) - " + what + "; tried again at a later check-up"); return 0; }
+    if (T.k.have == 0) ++g_ttSeeded; else ++g_ttWritten;
+    towntime::TtOnWrite(&T.k, n, stamp);
+    T.said.clear(); T.why.clear();
+    TtLine("[TOWNTIME] written " + tid + " - " + what + " - " + TtRecText(n));
+    return 1;
+}
+/* A walk's end (its last queued group committed or skipped, or nothing queued): a period walk writes due = now + 120 h with the owed
+   list after it; an owed walk writes (due kept) when it rebuilt a group or changed the list. */
+static void TtWalkMaybeEnd(const std::string& tid, TtTown& T)
+{
+    if (towntime::TtWalkReady(T.w) == 0) return;
+    const std::vector<std::string> before = T.k.r.owed, mbefore = T.k.r.marked;
+    int capO = 0, capM = 0;
+    const std::vector<std::string> after = towntime::TtWalkOwedAfter(before, T.w, &capO);
+    const std::vector<std::string> mafter = towntime::TtWalkMarkedAfter(mbefore, T.w, &capM);
+    if (capO + capM > 0)
+    {   /* fold 3: past kTtOwedMax ids a group misses its period's rebuild - said, never silent */
+        g_ttCapped += capO + capM;
+        if (g_ttCapLines < kTtCapLineCap) { ++g_ttCapLines; DebugLog("[TOWNTIME] " + tid + " list FULL - " + N((long long)capO) + " owed and " + N((long long)capM) + " marked group id(s) past the cap of " + N((long long)towntime::kTtOwedMax) + " left off the record: those groups miss this period's rebuild (line " + N(g_ttCapLines) + " of " + N(kTtCapLineCap) + ")"); }
+    }
+    if (towntime::TtWalkWrites(T.w, before, mbefore) != 0)
+    {
+        double now = TtNow();
+        if (now < T.w.at) now = T.w.at;
+        if (T.w.period != 0) ++g_ttFinished;
+        TtWriteNext(tid, T, now, T.w.asked, T.w.period, after, mafter,
+                    std::string(T.w.period != 0 ? "period walk finished" : "owed walk") + " rebuilt=" + N((long long)T.w.asked) + " owedAdded=" + N((long long)T.w.add.size()) + " markedAdded=" + N((long long)T.w.madd.size()) + " markedDropped=" + N((long long)T.w.mdrop.size())
+                    + " owedDropped=" + N((long long)T.w.drop.size()) + (T.w.period != 0 ? ": due = " + TtPeriodText() : std::string(": due kept")));
+    }
+    T.w.active = 0;
+}
+/* A queued group of a walk committed (rebuilt), skipped for sight (owed) or skipped for good (final): its walk's count goes down. */
+static void TtResolve(const std::string& tid, const std::string& wid, int end)
+{
+    if (tid.empty()) return;
+    std::map<std::string, TtTown>::iterator t = g_tt.find(tid);
+    if (t == g_tt.end() || t->second.w.active == 0) return;
+    TtEnd(t->second, end, wid, 1);
+    TtWalkMaybeEnd(tid, t->second);
+}
+/* B (fold 2): the town's area is no longer held here at a queued group's commitment: every queued group of its walk leaves the queue
+   and the walk is dropped - nothing is written (the holder now judges the record) */
+static void TtLostHold(const std::string& tid)
+{
+    for (size_t i = 0; i < g_t2Queue.size(); ) { if (g_t2Queue[i].tid == tid) g_t2Queue.erase(g_t2Queue.begin() + i); else ++i; }
+    std::map<std::string, TtTown>::iterator t = g_tt.find(tid);
+    if (t != g_tt.end()) towntime::TtWalkLostHold(&t->second.w);
+}
+/* a walk that could not run: nothing is written; the next check-up tries again */
+static void TtWalkAbort(TtTown& T, const std::string& why) { ++g_ttNotWalked; T.why = why; towntime::TtWalkLostHold(&T.w); }
+/* 1 = another player's area square (the world server's player sectors, MSG 37 - fresh only) is the town's: a player there may not be
+   a copy here yet, so the town is treated as in sight. 0 = none, or no fresh table (the local copies decide alone). */
+static int TtPeerInSector(int sx, int sy)
+{
+    static int sl[coopdrop::kPlayerSectorsMaxRows], xs[coopdrop::kPlayerSectorsMaxRows], ys[coopdrop::kPlayerSectorsMaxRows];   /* main thread only */
+    const int n = PeerPlayerSectorsTS(sl, xs, ys, coopdrop::kPlayerSectorsMaxRows);
+    if (n <= 0) return 0;
+    const int me = StoreMySlot();
+    for (int i = 0; i < n; ++i) if (sl[i] != me && xs[i] == sx && ys[i] == sy) return 1;
+    return 0;
+}
 std::map<std::string, long long> g_t2GenOut;   /* MAIN THREAD: per town stringID, the named-character state generation when the town was last seen out of loaded range */
 long long g_t2GenWorld = 0;                 /* MAIN THREAD: the generation when the last world ended (the stamp of a town never seen out of range) */
 std::map<std::string, int> g_t2Forced;      /* MAIN THREAD: `townres now` targets, lower case stringID or name; 1 = nosight */
@@ -2504,6 +2829,13 @@ long long g_t2Checks = 0, g_t2Due = 0, g_t2Walks = 0, g_t2WalkFault = 0, g_t2Gro
           g_t2Kills = 0, g_t2Killed = 0, g_t2Lines = 0, g_t2LinesDropped = 0, g_t2OffThread = 0, g_t2NoClock = 0, g_t2ActFaults = 0, g_t2TownDead = 0, g_t2VersionWait = 0;
 long long g_t2Verdict[coopt2::kVerdicts];
 long long g_t2Skip[kT2xN];
+long long g_t2NotRun = 0, g_t2NotRunOwed = 0, g_t2NotRunMarkedKept = 0, g_t2KillNotRun = 0, g_t2ActNotRun = 0, g_t2NoVerdict = 0, g_t2ByteDisagree = 0, g_t2ByteDisagreeTowns = 0;   /* T-4 design (d) */
+long long g_t2VaAsked = 0, g_t2VaWould = 0, g_t2VaWalked = 0, g_t2VaFault = 0, g_t2VaLines = 0;   /* T-640 D1: versionAsk[asked,wouldSwitch,walked,fault] and its own line count */
+const long long kT2VaLineCap = 40;
+long long g_t2DeadKept = 0;   /* T-4 fold 1 (LOW-2): owed / marked ids a dead town's walk kept (not resident groups this game runs) */
+long long g_t2DeadCleared = 0, g_t2DeadReSet = 0, g_t2DeadClearFault = 0, g_t2DeadNoIntact = 0, g_t2DeadRunsNone = 0;   /* T-1341: the engine's dead mark cleared here / found set again / the write faulted / kept (no intact resident group) / kept (no resident group run here) */
+std::set<std::string> g_t2DeadClearedTowns;   /* T-1341: towns whose dead mark this game cleared (the re-set watch; cleared at the world teardown) */
+std::set<std::string> g_t2ByteSaid;   /* T-4 design (d): towns whose byte-vs-living disagreement was said (once per town per load - fold 1 LOW-3: cleared at the world teardown) */
 
 static void T2Line(const std::string& s) { if (g_t2Lines >= kT2LineCap) { ++g_t2LinesDropped; return; } ++g_t2Lines; DebugLog(s); }
 static std::string T2GroupLine(const std::string& town, const std::string& list, int idx, const std::string& wid, int living, int orig, const std::string& what)
@@ -2593,6 +2925,22 @@ static int T2FactionOfPod(const void* h, void** f)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* T-4 design (d): 1 = this game runs the group's people (coopt2::RunsHere over the writer rule's runner test); *runner / *other for
+   the lines - fold 1 (LOW-1): *other = kT2RunnerHeld when only the list hold made it not run here. MAIN THREAD */
+const int kT2RunnerHeld = -2;
+static int T2RunsHere(void* platoon, int* runner, int* other)
+{
+    *other = -1; int held = 0;
+    *runner = coop::StoreGroupRunner(platoon, other, &held);
+    const int here = coopt2::RunsHere(*runner, StoreMySlot(), *other, held);
+    if (here == 0 && *runner < 0 && *other < 0 && held != 0) *other = kT2RunnerHeld;
+    return here;
+}
+static std::string T2RunnerText(int runner, int other)
+{
+    if (runner < 0 && other == kT2RunnerHeld) return "held until this link's list of who runs which group ends";
+    return runner >= 0 ? "slot " + N((long long)runner) + " runs most of its living people" : "slot " + N((long long)other) + " runs it (the world server's note)";
+}
 /* One list (type 1 residents, type 2 patrols) of the town's population manager: copies of up to `cap` node hands and the
    list's float budget (+0xC). 1 read, 2 no manager, 0 fault. MAIN THREAD */
 static int T2NodesPod(void* town, int type, unsigned char (*hs)[kT2HandBytes], int cap, int* total, float* budget)
@@ -2633,6 +2981,44 @@ static int T2TownFlagsPod(void* town, int* active, int* dead)
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-4 design (d): the town's resident list as this game reads it - *read 1 = the list read; *n its groups (hands that no longer resolve
+   left out); *living the living ones (coopt2::LivingGroup - own groups and copies alike); *unread groups that could not be read. MAIN THREAD */
+static void T2ResidentsLiving(void* town, int* read, int* n, int* living, int* unread)
+{
+    static unsigned char hs[kT2Nodes][kT2HandBytes];   /* main thread only */
+    *read = 0; *n = 0; *living = 0; *unread = 0;
+    int total = 0; float budget = 0.0f;
+    if (T2NodesPod(town, 1, hs, kT2Nodes, &total, &budget) != 1) return;
+    *read = 1;
+    if (total > kT2Nodes) { *unread += total - kT2Nodes; *n += total - kT2Nodes; }
+    T2Grp G;
+    for (int i = 0; i < total && i < kT2Nodes; ++i)
+    {
+        T2GroupPod(hs[i], &G);
+        if (G.ok == 2) continue;   /* a hand that no longer resolves: not a group */
+        ++*n;
+        if (G.ok != 1) { ++*unread; continue; }
+        if (coopt2::LivingGroup(G.f.dead, G.f.living) != 0) ++*living;
+    }
+}
+/* T-4 fold 1 (LOW-2): the ids of the town's resident groups read here, each with 1 = this game runs it (T2RunsHere). MAIN THREAD */
+static void T2ResidentRunHere(void* town, std::map<std::string, int>* ids)
+{
+    static unsigned char hs[kT2Nodes][kT2HandBytes];   /* main thread only */
+    ids->clear();
+    int total = 0; float budget = 0.0f;
+    if (T2NodesPod(town, 1, hs, kT2Nodes, &total, &budget) != 1) return;
+    T2Grp G;
+    for (int i = 0; i < total && i < kT2Nodes; ++i)
+    {
+        T2GroupPod(hs[i], &G);
+        if (G.ok != 1) continue;
+        const std::string w = T2Wid(G.platoon);
+        if (w == "?" || !towntime::TtSidOk(w)) continue;
+        int ru = -1, ot = -1;
+        (*ids)[w] = T2RunsHere(G.platoon, &ru, &ot);
+    }
 }
 /* 1 = the town's game data (Town vt+0x18 _NV_getGameData 0x9510A0: its current version's record) has a non-empty
    "override town" list - the versions checkForRepopulateTown 0x9FE6D0 chooses from; 0 = none; -1 = unreadable.
@@ -2675,9 +3061,10 @@ static int T2Players(float* x, float* z, int cap)
     return n;
 }
 /* 1 = a player character is within the sight radius of a member (living or dead) or of the building; no world reads as seen */
-static int T2Seen(int np, const float* plx, const float* plz, const T2Grp* G)
+static int T2Seen(int np, const float* plx, const float* plz, const T2Grp* G, int peerInSector)
 {
     if (np < 0) return 1;
+    if (peerInSector != 0) { ++g_ttPeerSector; return 1; }   /* T-4: another player stands in the town's area square (MSG 37) */
     if (coopt2::WithinAny(plx, plz, np, G->px, G->pz, G->nl, coopt2::kSightUnits) != 0) return 1;
     if (coopt2::WithinAny(plx, plz, np, G->dx, G->dz, G->nd, coopt2::kSightUnits) != 0) return 1;
     if (G->hasB != 0 && coopt2::WithinAny(plx, plz, np, &G->bx, &G->bz, 1, coopt2::kSightUnits) != 0) return 1;
@@ -2854,7 +3241,7 @@ static void T2Show(void* town, const std::string& tn)
     std::string s = "[TOWNS2] show: town '" + tn + "'";
     for (int type = 1; type <= 2; ++type)
     {
-        int total = 0, awake = 0, killable = 0; float budget = 0.0f;
+        int total = 0, awake = 0, killable = 0, runHere = 0, killableHere = 0; float budget = 0.0f;
         const int r = T2NodesPod(town, type, hs, kT2Nodes, &total, &budget);
         if (r == 1)
             for (int i = 0; i < total && i < kT2Nodes; ++i)
@@ -2862,14 +3249,17 @@ static void T2Show(void* town, const std::string& tn)
                 T2Grp G; T2GroupPod(hs[i], &G);
                 if (G.ok != 1 || G.f.awake == 0) continue;
                 ++awake;
-                if (G.f.dead == 0 && G.canRefresh != 0 && G.sepType == coopt2::kNullItemType && G.f.uniqueAlive == 0 && G.f.player == 0 && G.f.carried == 0) ++killable;
+                int ru = -1, ot = -1; const int here = T2RunsHere(G.platoon, &ru, &ot);   /* T-4 design (d): the kill takes only a group this game runs */
+                if (here != 0) ++runHere;
+                if (G.f.dead == 0 && G.canRefresh != 0 && G.sepType == coopt2::kNullItemType && G.f.uniqueAlive == 0 && G.f.player == 0 && G.f.carried == 0) { ++killable; if (here != 0) ++killableHere; }
             }
-        s += std::string(type == 1 ? " residents=" : " patrols=") + N((long long)total) + " awake=" + N((long long)awake) + " killable=" + N((long long)killable)
+        s += std::string(type == 1 ? " residents=" : " patrols=") + N((long long)total) + " awake=" + N((long long)awake) + " killable=" + N((long long)killable) + " awakeRunHere=" + N((long long)runHere) + " killableRunHere=" + N((long long)killableHere)
              + (r != 1 ? " (step=" + N((long long)r) + ")" : std::string());
     }
     T2Line(s + " (TEST)");
 }
-/* TEST ONLY (`townres kill <town> <n> [res|pat] [regen|noregen] [all]`): in the first awake, whole, non-slave group of the
+/* TEST ONLY (`townres kill <town> <n> [res|pat] [regen|noregen] [all|leader]`; leader: DEV build, only the leader dies - n is not
+   read - in a group with a living leader and one more living member, so the engine's own leader-death road decides it): in the first awake, whole, non-slave group of the
    chosen list (residents by default) that matches the recipe filter (regen: Platoon+0xD9 set, noregen: not set) and has no
    living unique, player or carried member, n living members die through the engine's own Character::declareDead 0x7A5660
    (StoreDeclareDeadPod - the platoonkill lever's path). Without `all` one member always stays alive (the leader when it can)
@@ -2879,10 +3269,11 @@ static void T2Show(void* town, const std::string& tn)
 static void T2Kill(void* town, const std::string& tn, int spec)
 {
     const int want = spec & kT2KillCountMask, type = (spec & kT2KillPat) != 0 ? 2 : 1, all = (spec & kT2KillAll) != 0 ? 1 : 0;
+    const int leaderOnly = (spec & kT2KillLeader) != 0 ? 1 : 0;   /* T2333 (DEV TEST): only the leader dies, the others stay alive */
     unsigned char hs[kT2Nodes][kT2HandBytes]; int total = 0; float budget = 0.0f;
     const int r = T2NodesPod(town, type, hs, kT2Nodes, &total, &budget);
     if (r != 1) { T2Line("[TOWNS2] kill: town '" + tn + "' - its " + T2ListName(type) + " list could not be read (step=" + N((long long)r) + ") - nothing killed (TEST)"); return; }
-    int awake = 0;   /* the list's awake groups, said when nothing matched */
+    int awake = 0, notRun = 0;   /* the list's awake groups, said when nothing matched; T-4 design (d): matching groups this game does not run */
     for (int i = 0; i < total && i < kT2Nodes; ++i)
     {
         T2Grp G; T2GroupPod(hs[i], &G);
@@ -2890,11 +3281,18 @@ static void T2Kill(void* town, const std::string& tn, int spec)
         if (G.ok != 1 || G.f.awake == 0 || G.f.dead != 0 || G.canRefresh == 0 || G.sepType != coopt2::kNullItemType || G.f.uniqueAlive != 0 || G.f.player != 0 || G.f.carried != 0) continue;
         if ((spec & kT2KillRegen) != 0 && G.f.regenerates == 0) continue;
         if ((spec & kT2KillNoRegen) != 0 && G.f.regenerates != 0) continue;
-        if (all != 0 ? (G.nl < 1) : (G.orig < 3 || G.f.living < 2 || G.nl < 2)) continue;
+        if (leaderOnly != 0)
+        {
+            int leaderLiving = 0;
+            for (int j = 0; j < G.nl; ++j) if (G.leader != 0 && G.live[j] == G.leader) leaderLiving = 1;
+            if (leaderLiving == 0 || G.nl < 2) continue;
+        }
+        else if (all != 0 ? (G.nl < 1) : (G.orig < 3 || G.f.living < 2 || G.nl < 2)) continue;
+        { int ru = -1, ot = -1; if (T2RunsHere(G.platoon, &ru, &ot) == 0) { ++notRun; ++g_t2KillNotRun; continue; } }   /* T-4 design (d): only a group this game runs - a copy is skipped and counted (its owner decides; the copy gate would refuse its deaths) */
         const std::string wid = T2Wid(G.platoon);   /* read before the kills, which can end the group */
-        int k = want; if (all != 0) k = G.nl; else if (k > G.nl - 1) k = G.nl - 1;
+        int k = want; if (leaderOnly != 0) k = 1; else if (all != 0) k = G.nl; else if (k > G.nl - 1) k = G.nl - 1;
         int killed = 0, faults = 0, refused = 0;   /* a kill counts only when the member reads dead after it */
-        for (int pass = 0; pass < 2 && killed < k; ++pass)   /* pass 0: everyone but the leader; pass 1: the leader */
+        for (int pass = leaderOnly; pass < 2 && killed < k; ++pass)   /* pass 0: everyone but the leader; pass 1: the leader (leaderOnly: pass 1 only) */
             for (int j = 0; j < G.nl && killed < k; ++j)
             {
                 const bool isLeader = (G.live[j] == G.leader);
@@ -2904,18 +3302,19 @@ static void T2Kill(void* town, const std::string& tn, int spec)
         ++g_t2Kills; g_t2Killed += killed;
         T2Grp A; T2GroupPod(hs[i], &A);
         T2Line("[TOWNS2] kill: town '" + tn + "' " + T2ListName(type) + " " + N((long long)i) + " id=" + wid + " living=" + N((long long)G.f.living) + "/" + N((long long)G.orig)
-               + " regenerates=" + N((long long)G.f.regenerates) + " -> killed " + N((long long)killed)
+               + " regenerates=" + N((long long)G.f.regenerates) + " -> killed " + N((long long)killed) + (leaderOnly != 0 ? " (the leader only)" : "")
                + (faults != 0 ? " faults=" + N((long long)faults) : std::string())
                + (refused != 0 ? " refused=" + N((long long)refused) + " (a copy - the owner decides)" : std::string())
                + " through Character::declareDead 0x7A5660; after: mark=" + (A.ok == 1 ? N((long long)A.mark) : std::string("?")) + " dead=" + (A.ok == 1 ? N((long long)A.f.dead) : std::string("?"))
                + " living=" + (A.ok == 1 ? N((long long)A.f.living) : std::string("?")) + " (TEST)");
         return;
     }
-    T2Line("[TOWNS2] kill: town '" + tn + "' - no matching awake whole " + std::string(T2ListName(type)) + " group among " + N((long long)total) + " (awake " + N((long long)awake) + ") - nothing killed (TEST)");
+    T2Line("[TOWNS2] kill: town '" + tn + "' - no matching awake whole " + std::string(T2ListName(type)) + " group among " + N((long long)total) + " (awake " + N((long long)awake) + ")"
+           + (notRun != 0 ? " notRunHere=" + N((long long)notRun) + " (matching groups whose people another game runs - skipped, their owner decides)" : std::string()) + " - nothing killed (TEST)");
 }
 /* The 5-day walk of one town: both lists read, the game's marker rule run on them, each pick queued or its refusal said.
    townDead: the town's own flag as its check-up read it. MAIN THREAD */
-static void T2Walk(void* town, const std::string& tn, const float* tp, int nosight, bool forced, int townDead)
+static void T2Walk(void* town, const std::string& tn, const float* tp, int nosight, bool forced, int townDead, const std::string& tid, int sx, int sy, TtTown* T)
 {
     ++g_t2Walks;
     static unsigned char hr[kT2Nodes][kT2HandBytes], hp[kT2Nodes][kT2HandBytes];   /* main thread only */
@@ -2926,6 +3325,7 @@ static void T2Walk(void* town, const std::string& tn, const float* tp, int nosig
     {
         ++g_t2WalkFault;
         T2Line("[TOWNS2] town '" + tn + "' - its population lists could not be read whole (residents step=" + N((long long)r1) + " n=" + N((long long)nr) + ", patrols step=" + N((long long)r2) + " n=" + N((long long)np) + ") - not walked");
+        if (T != 0) TtWalkAbort(*T, "listsUnread");   /* T-4: not walked - nothing written, tried again at the next check-up */
         return;
     }
     static coopt2::MarkIn mr[kT2Nodes], mp[kT2Nodes];
@@ -2943,6 +3343,7 @@ static void T2Walk(void* town, const std::string& tn, const float* tp, int nosig
             {
                 ++g_t2Skip[kT2xFault]; ++g_t2WalkFault;
                 T2Line("[TOWNS2] town '" + tn + "' - " + std::string(k == 0 ? "resident" : "patrol") + " " + N((long long)i) + " could not be read (step=" + N((long long)G.ok) + ") - the budget cannot be counted, not walked");
+                if (T != 0) TtWalkAbort(*T, "groupUnread");   /* T-4: not walked - nothing written, tried again at the next check-up */
                 return;
             }
             if (G.ok != 1) continue;   /* a handle that no longer resolves: the marker skips it too */
@@ -2956,6 +3357,8 @@ static void T2Walk(void* town, const std::string& tn, const float* tp, int nosig
     for (int i = 0; i < np; ++i) if (mp[i].counted != 0) livP += mp[i].living;
     float plx[kT2Players], plz[kT2Players];
     const int npl = T2Players(plx, plz, kT2Players);
+    const int peerSec = TtPeerInSector(sx, sy);   /* T-4: every player the game knows of - the local copies and the world server's player sectors */
+    std::vector<std::string> owedSeen;   /* T-4 owed walk: the owed groups found in the town's lists */
     int picked = 0;
     for (int k = 0; k < 2; ++k)
     {
@@ -2970,31 +3373,106 @@ static void T2Walk(void* town, const std::string& tn, const float* tp, int nosig
             T2GroupPod(k == 0 ? hr[i] : hp[i], &G);
             if (G.ok != 1) { ++g_t2Skip[G.ok == 2 ? kT2xGone : kT2xFault]; continue; }
             G.f.marked = (byMarker != 0 || G.mark == 1) ? 1 : 0;
+            if (T != 0)
+            {   /* T-4 design (d): a group whose people this game does not run is OWED - NOT RUN HERE: never marked, queued or ended as final */
+                int ru = -1, ot = -1;
+                if (T2RunsHere(G.platoon, &ru, &ot) == 0)
+                {
+                    ++g_t2NotRun;
+                    const std::string nw = T2Wid(G.platoon);
+                    const int st = (nw == "?" || !towntime::TtSidOk(nw)) ? coopt2::kNrLeave
+                                 : coopt2::NotRunStepOf(towntime::TtOwedAt(T->k.r.marked, nw) >= 0 ? 1 : 0, towntime::TtOwedAt(T->k.r.owed, nw) >= 0 ? 1 : 0, T->w.period, G.f.marked);
+                    if (st == coopt2::kNrKeepMarked) { owedSeen.push_back(nw); ++g_t2NotRunMarkedKept; TtEnd(*T, towntime::kTtEndRemarked, nw, 0); }
+                    else if (st == coopt2::kNrOwe) { owedSeen.push_back(nw); ++g_t2NotRunOwed; TtEnd(*T, towntime::kTtEndOwe, nw, 0); }
+                    if (st != coopt2::kNrLeave && T->said.insert(std::make_pair(nw + "|notRun", 1)).second)
+                        T2Line(T2GroupLine(tn, list, i, nw, G.f.living, G.orig, std::string(st == coopt2::kNrKeepMarked ? "on the marked list" : G.f.marked != 0 ? "picked" : "on the owed list")
+                               + "; owed - not run here (" + T2RunnerText(ru, ot) + "): not marked, not queued, not ended - a later check-up decides"));
+                    continue;
+                }
+            }
+            if (T != 0 && (T->w.period == 0 || !T->k.r.marked.empty()))
+            {
+                const std::string ow = T2Wid(G.platoon);
+                if (towntime::TtOwedAt(T->k.r.marked, ow) >= 0)
+                {   /* T-4 fold 3: a group on the MARKED list (an asleep pick given the mark, by this game or an earlier holder) */
+                    owedSeen.push_back(ow);
+                    if (G.f.awake != 0)
+                    {   /* awake: the engine's wake consumed the mark (rebuilt or not) - it leaves the list */
+                        TtEnd(*T, towntime::kTtEndWoke, ow, 0);
+                        if (T->said.insert(std::make_pair(ow + "|woke", 1)).second) T2Line(T2GroupLine(tn, list, i, ow, G.f.living, G.orig, "awake - leaves the marked list (mark=" + N((long long)G.mark) + ")"));
+                        continue;
+                    }
+                    G.f.held = T2AllHeld(&G, tp);
+                    T2Recipe mrc; const int mrv = T2RecipeUnique(G.platoon, &mrc);
+                    const int ma = coopt2::AsleepAct(G.f, mrc.step, mrc.uniq, mrv == 2 ? 1 : 0);
+                    if (ma != coopt2::kQueue || G.f.marked == 0)
+                    {
+                        TtEnd(*T, towntime::kTtEndFinal, ow, 0);
+                        T2Line(T2GroupLine(tn, list, i, ow, G.f.living, G.orig, "marked list: final skip (" + std::string(G.f.marked == 0 ? "no longer picked" : coopt2::VerdictName(ma)) + ") - leaves the list"));
+                        continue;
+                    }
+                    if (G.mark != 1 && T2MarkPod(G.platoon) == 1)
+                    {
+                        ++g_ttRemarked;
+                        if (T->said.insert(std::make_pair(ow + "|remark", 1)).second) T2Line(T2GroupLine(tn, list, i, ow, G.f.living, G.orig, "asleep, on the marked list - its mark re-applied (the engine rebuilds it at its own wake)"));
+                    }
+                    TtEnd(*T, towntime::kTtEndRemarked, ow, 0);
+                    continue;
+                }
+                if (T->w.period == 0)
+                {   /* T-4 owed walk: only the owed groups; an owed group the marker no longer picks has nothing to rebuild - it leaves the list */
+                    if (towntime::TtOwedAt(T->k.r.owed, ow) < 0) continue;
+                    owedSeen.push_back(ow);
+                    if (G.f.marked == 0) { TtEnd(*T, towntime::kTtEndFinal, ow, 0); continue; }
+                }
+            }
             if (G.f.marked == 0) { ++g_t2Verdict[coopt2::kNotMarked]; continue; }
             ++picked; ++g_t2Picked; if (byMarker != 0) ++g_t2PickedMarker; else ++g_t2PickedEngine;
             const std::string wid = T2Wid(G.platoon);
             G.f.held = T2AllHeld(&G, tp);
-            G.f.seen = T2Seen(npl, plx, plz, &G);
+            G.f.seen = T2Seen(npl, plx, plz, &G, peerSec);
             T2Recipe rc; const int rv = T2RecipeUnique(G.platoon, &rc);
             G.f.recipeUnique = (rv == 1) ? 1 : 0; G.f.subSquads = (rv == 2) ? 1 : 0;
             const int v = coopt2::GroupVerdict(G.f, nosight);
             ++g_t2Verdict[v];
             const std::string why = std::string(byMarker != 0 ? (G.orig - G.f.living > 0 && m.regenerates != 0 && k == 0 ? "picked by the marker rule (regenerates or 60%)" : "picked by the marker rule (60% within the budget)")
                                                               : "already marked by the engine (its leader died)");
-            if (v != coopt2::kQueue) { T2Line(T2GroupLine(tn, list, i, wid, G.f.living, G.orig, why + "; skipped(" + std::string(coopt2::VerdictName(v)) + (v == coopt2::kUniqueUnknown || v == coopt2::kSubSquads ? T2RecipeWhy(rc) : std::string()) + ")")); continue; }
+            if (v != coopt2::kQueue)
+            {
+                std::string sayV = coopt2::VerdictName(v);
+                if (T != 0)
+                {
+                    if (v == coopt2::kAsleep)
+                    {   /* T-4 fold 2: an asleep pick gets the engine's own mark (coopt2::AsleepAct) - rebuilt at its own wake - or a final skip */
+                        const int a = coopt2::AsleepAct(G.f, rc.step, rc.uniq, rv == 2 ? 1 : 0);
+                        if (a == coopt2::kQueue && T2MarkPod(G.platoon) == 1) { TtEnd(*T, towntime::kTtEndMarked, wid, 0); ++g_ttAsleepMarked; sayV = "asleep - marked: the engine rebuilds it at its own wake; on the marked list"; }
+                        else { TtEnd(*T, towntime::kTtEndFinal, wid, 0); sayV = std::string("asleep - final skip: ") + (a == coopt2::kQueue ? "the mark could not be written" : coopt2::VerdictName(a)); }
+                    }
+                    else { TtEnd(*T, coopt2::IsDeferral(v) != 0 ? towntime::kTtEndOwe : towntime::kTtEndFinal, wid, 0); if (coopt2::IsDeferral(v) != 0) sayV += " - owed"; }
+                }
+                if (T == 0 || T->said.insert(std::make_pair(wid + "|" + sayV, 1)).second)   /* a walk tried again does not say the same skip again */
+                    T2Line(T2GroupLine(tn, list, i, wid, G.f.living, G.orig, why + "; skipped(" + sayV + (v == coopt2::kUniqueUnknown || v == coopt2::kSubSquads ? T2RecipeWhy(rc) : std::string()) + ")"));
+                continue;
+            }
             const unsigned char* hh = (k == 0) ? hr[i] : hp[i];
             bool dup = false;
             for (size_t q = 0; q < g_t2Queue.size(); ++q) if (T2SameHand(g_t2Queue[q].h, hh)) { dup = true; break; }
             if (dup) continue;
-            if (g_t2Queue.size() >= kT2QueueCap) { ++g_t2Skip[kT2xQueueFull]; T2Line(T2GroupLine(tn, list, i, wid, G.f.living, G.orig, why + "; skipped(queueFull)")); continue; }
+            if (g_t2Queue.size() >= kT2QueueCap) { ++g_t2Skip[kT2xQueueFull]; if (T != 0) TtEnd(*T, towntime::kTtEndOwe, wid, 0); if (T == 0 || T->said.insert(std::make_pair(wid + "|queueFull", 1)).second) T2Line(T2GroupLine(tn, list, i, wid, G.f.living, G.orig, why + "; skipped(queueFull" + std::string(T != 0 ? " - owed" : "") + ")")); continue; }
             T2Q q;
             std::memcpy(q.h, hh, kT2HandBytes);
             q.town = tn; q.list = list; q.wid = wid; q.idx = i; q.orig = G.orig; q.living = G.f.living; q.nosight = nosight; q.at = ::GetTickCount();
+            q.tid = (T != 0) ? tid : std::string(); q.sx = sx; q.sy = sy; q.tx = tp[0]; q.tz = tp[2];
             g_t2Queue.push_back(q); ++g_t2Queued;
+            if (T != 0) towntime::TtWalkQueued(&T->w);   /* T-4: the walk ends when this group is committed or skipped (Towns2Act) */
             T2Line(T2GroupLine(tn, list, i, wid, G.f.living, G.orig, why + "; queued" + (nosight != 0 ? " (TEST nosight: the sight rule is ignored for this group)" : "")));
         }
     }
-    if (forced || picked != 0)
+    if (T != 0 && T->w.period == 0)   /* T-4 owed walk: an owed group no longer in the town's lists leaves the owed list */
+        for (size_t o = 0; o < T->k.r.owed.size(); ++o) if (towntime::TtOwedAt(owedSeen, T->k.r.owed[o]) < 0) TtEnd(*T, towntime::kTtEndFinal, T->k.r.owed[o], 0);
+    if (T != 0)   /* T-4 fold 3: a marked group no longer in the town's lists leaves the marked list */
+        for (size_t o = 0; o < T->k.r.marked.size(); ++o) if (towntime::TtOwedAt(owedSeen, T->k.r.marked[o]) < 0) TtEnd(*T, towntime::kTtEndFinal, T->k.r.marked[o], 0);
+    if (forced || (picked != 0 && (T == 0 || T->said.insert(std::make_pair("walked|" + N((long long)picked) + "|" + N((long long)T->w.period), 1)).second)))   /* T-4: a walk tried again says the same walk once */
         T2Line("[TOWNS2] town '" + tn + "' walked" + std::string(forced ? (nosight != 0 ? " (townres now nosight)" : " (townres now)") : "") + " residents=" + N((long long)nr) + " patrols=" + N((long long)np)
                + " budget[residents,patrols]=" + N((long long)br) + "," + N((long long)bp) + " living[residents,patrols]=" + N((long long)livR) + "," + N((long long)livP) + " picked=" + N((long long)picked) + " players=" + N((long long)npl));
 }
@@ -3013,13 +3491,15 @@ static void Towns2Check(void* town)
     if (TownPosPod(town, tp) == 0) return;
     char nm[96]; if (RcTownNamePod(town, nm, 96) == 0) std::strcpy(nm, "?");
     const std::string tn = RfStr(nm);
+    const Sector tsec = SectorOf(tp[0], tp[2]);
+    const std::string tid = towntime::MakeTownTimeId(tsec.x, tsec.y, key);   /* T-4: the town's clock record */
     std::map<std::string, int>::iterator fi = T2Find(g_t2Forced, key, nm);
     std::map<std::string, int>::iterator ki = T2Find(g_t2Kill, key, nm);
     std::map<std::string, int>::iterator si = T2Find(g_t2Show, key, nm);
     const int held = T2HeldHere(tp[0], tp[2]);
     if (held != 1)
     {
-        g_t2Last.erase(key);   /* the 5 days belong to this holder: a later hold starts them again */
+        { const std::map<std::string, TtTown>::iterator ti = g_tt.find(tid); if (ti != g_tt.end()) ti->second.holding = 0; }   /* T-4: the hold ends; the clock stays the record's */
         ++g_t2Skip[kT2xNotHolder];   /* a check-up of a town this game does not hold with its zone live */
         if (fi != g_t2Forced.end() || ki != g_t2Kill.end() || si != g_t2Show.end())
             T2ForcedSkip(key, tn, held == -2 ? std::string("its zone is not live on this game - only the game that holds it acts")
@@ -3029,34 +3509,203 @@ static void Towns2Check(void* town)
     ++g_t2Checks;
     if (si != g_t2Show.end()) { g_t2Show.erase(si); T2Show(town, tn); }
     if (ki != g_t2Kill.end()) { const int spec = ki->second; g_t2Kill.erase(ki); T2Kill(town, tn, spec); }
-    const double now = LocalWorldHours();
+    const double now = TtNow();   /* T-4 fold 2 D: the shop record's clock read (the engine's, kept in step with the world server's CLOCK) */
     if (now < 0.0) { ++g_t2NoClock; return; }
     const bool forced = (fi != g_t2Forced.end());
     const int nosight = forced ? fi->second : 0;
-    std::map<std::string, double>::iterator li = g_t2Last.find(key);
-    const int due = coopt2::RebuildDue(now, li == g_t2Last.end() ? -1.0 : li->second, forced ? 1 : 0);
-    if (due == 3 || due == 2) { g_t2Last[key] = now; return; }   /* first seen by this holder, or the clock went back: the 5 days start now */
-    if (due != 1) return;
-    ++g_t2Due;
-    if (forced) { g_t2Forced.erase(fi); g_t2WhyAt.erase(key); }
-    g_t2Last[key] = now;
-    if (flagsOk == 0 || townDead != 0)
+    /* T-4: THE CLOCK IS THE TOWN'S RECORD (TtTown above). This game reads it now that it holds the town. */
+    if (tid.empty()) { ++g_ttNoId; return; }
+    TtTown& T = g_tt[tid];
+    T.pos[0] = tp[0]; T.pos[1] = tp[1]; T.pos[2] = tp[2];
+    T.holding = 1;
+    if (T.w.active != 0) { ++g_ttPendingWait; return; }   /* a walk's queued groups are not all committed yet: its end decides the clock */
+    /* RECORDS FIRST (T-1279): the clock is judged only once the world server's records of the town's area are all in - the feed's
+       AREA_DONE for this area (or the whole snapshot's), which the drain applies behind the records sent before it; reset at every
+       load, quit to menu and new link. A record written after it reaches this game as a live forward and wins when newer. */
+    if (StoreAreaDoneXY(tsec.x, tsec.y, StoreSnapshotApplied() != 0 ? 1 : 0, kAreaGateTown) == 0) { ++g_ttRecordsWait; return; }
+    const int step = towntime::TtClockStep(T.k.have, T.k.r, now, forced ? 1 : 0, g_ttPeriodHours);
+    if (step == towntime::kTtSeed) { TtWriteNext(tid, T, now, 0, 1, std::vector<std::string>(), std::vector<std::string>(), "town '" + tn + "' first held with no record: due = " + TtPeriodText()); return; }
+    if (step == towntime::kTtClockBack) { ++g_ttClockBack; TtWriteNext(tid, T, now, 0, 1, T.k.r.owed, T.k.r.marked, "town '" + tn + "' due " + TtHours(T.k.r.due) + " is more than " + TtHours(g_ttPeriodHours) + " h after now " + TtHours(now)
+                                                + (g_ttPeriodHours != towntime::kTtPeriodHours ? " (more than one period ahead: the TEST-ONLY period was shortened, or the world's clock went back)" : " (the world's clock went back)") + ": due = " + TtPeriodText()); return; }
+    if (step != towntime::kTtDue && step != towntime::kTtOwed) return;
+    const int period = (step == towntime::kTtDue) ? 1 : 0;   /* 1 the period walk at due; 0 the owed walk */
+    if (period != 0) { ++g_t2Due; if (forced) { g_t2Forced.erase(fi); g_t2WhyAt.erase(key); } }
+    else ++g_ttOwedWalks;
+    if (flagsOk == 0)
+    {
+        ++g_t2TownDead; ++g_ttNotWalked; T.why = "flagsUnread";
+        if (T.said.insert(std::make_pair(std::string("flagsUnread"), 1)).second) T2Line("[TOWNS2] town '" + tn + "' - its flags could not be read; not walked (tried again at the next check-up)");
+        return;
+    }
+    /* T-4 design (d): THE 'DEAD' VERDICT IS THE TOWN'S LIVING RESIDENT GROUPS as this game reads them (own groups and copies - the list
+       the walk reads), not the population manager's byte alone: T2323 saw the byte set by the engine's own check-up on a game whose
+       resident list was empty for a moment, and never cleared. A town with a living resident group is not dead whatever the byte says;
+       a town with none read here gets no verdict this check-up - not walked, the due not moved, nothing ended. From here on townDead
+       is that verdict (1 = dead), not the byte (byteDead). */
+    const int byteDead = townDead;
+    int tvRead = 0, tvN = 0, tvLiving = 0, tvUnread = 0;
+    T2ResidentsLiving(town, &tvRead, &tvN, &tvLiving, &tvUnread);
+    const int tv = coopt2::TownVerdictOf(tvRead, tvN, tvLiving, tvUnread, byteDead);
+    if (coopt2::TownByteDisagrees(tvRead, tvN, tvLiving, tvUnread, byteDead) != 0)
+    {
+        ++g_t2ByteDisagree;
+        if (g_t2ByteSaid.insert(key).second)
+        {
+            ++g_t2ByteDisagreeTowns;
+            T2Line("[TOWNS2] town '" + tn + "' - its population manager's dead byte reads " + N((long long)byteDead) + " but " + N((long long)tvLiving) + " of its " + N((long long)tvN)
+                   + " resident group(s) read here are living: the verdict is the living groups' (" + coopt2::TownVerdictName(tv) + "); said once per town, counted as byteDisagree on the REPORT");
+        }
+    }
+    if (tv == coopt2::kTvNoResidents || tv == coopt2::kTvUnread)
+    {
+        ++g_t2NoVerdict; ++g_ttNotWalked; T.why = coopt2::TownVerdictName(tv);
+        if (T.said.insert(std::make_pair(std::string("noVerdict"), 1)).second)
+            T2Line("[TOWNS2] town '" + tn + "' - " + (tv == coopt2::kTvNoResidents ? std::string("no resident group read on this game while its population manager's dead byte is set (the byte may be another game's copies withdrawn)") : std::string("its resident list could not be read whole"))
+                   + " (residents=" + N((long long)tvN) + " unread=" + N((long long)tvUnread) + ", dead byte " + N((long long)byteDead) + ") - no verdict this check-up: not walked, the due not moved, nothing ended (tried again at the next check-up)");
+        return;
+    }
+    townDead = (tv == coopt2::kTvDead) ? 1 : 0;
+    towntime::TtWalkBegin(&T.w, period, now);
+    if (townDead != 0)
     {
         ++g_t2TownDead;
-        T2Line("[TOWNS2] town '" + tn + "' " + (flagsOk == 0 ? std::string("- its flags could not be read") : std::string("is dead (its population manager says so)")) + " - the game's marker never runs for it; not walked");
+        if (T.said.insert(std::make_pair(std::string("townDead"), 1)).second)
+            T2Line("[TOWNS2] town '" + tn + "' is dead (" + N((long long)tvN) + " resident group(s) read here, none living, and its population manager says so) - the game's marker never runs for it; not walked");
+        /* nothing is rebuilt in a dead town - fold 1 (LOW-2): but only ids this game runs end as final (coopt2::DeadTownEndsFinal); patrol ids,
+           not-run ids and ids not read in the resident list stay on their lists (owed stays owed, marked stays marked) */
+        std::map<std::string, int> runIds; T2ResidentRunHere(town, &runIds);
+        int keptHere = 0;
+        for (int l = 0; l < 2; ++l)
+        {
+            const std::vector<std::string>& ls = (l == 0) ? T.k.r.owed : T.k.r.marked;
+            for (size_t o = 0; o < ls.size(); ++o)
+            {
+                const std::map<std::string, int>::const_iterator ri = runIds.find(ls[o]);
+                if (coopt2::DeadTownEndsFinal(ri != runIds.end() ? 1 : 0, (ri != runIds.end() && ri->second != 0) ? 1 : 0) != 0) TtEnd(T, towntime::kTtEndFinal, ls[o], 0);
+                else { ++keptHere; ++g_t2DeadKept; }
+            }
+        }
+        if (keptHere > 0 && T.said.insert(std::make_pair(std::string("deadKept"), 1)).second)
+            T2Line("[TOWNS2] town '" + tn + "' is dead here, but " + N((long long)keptHere) + " owed / marked id(s) are not resident groups this game runs (patrols, groups another game runs, or not read here) - kept on their lists, not ended as final (counted deadKept on the REPORT)");
+        TtWalkMaybeEnd(tid, T);
         return;
     }
     std::map<std::string, long long>::const_iterator gi = g_t2GenOut.find(key);
     const long long genOut = (gi == g_t2GenOut.end()) ? g_t2GenWorld : gi->second;
     const int hasVersions = T2TownHasVersionsPod(town);
-    if (coopt2::VersionMayChange(hasVersions, coop::WorldStateGeneration(), genOut) != 0)
+    /* T-640 D1: the engine's own version test, read-only, for each other version (coop::TownVerAskOthers); the world-wide named-character
+       counter decides only when the test could not run (coopt2::VersionAskWait) */
+    int vaTested = 0, vaWould = 0; const char* vaWhy = "";
+    const int va = (hasVersions != 0) ? coop::TownVerAskOthers(town, &vaTested, &vaWould, &vaWhy) : coopt2::kVaNone;
+    const int vaWait = coopt2::VersionAskWait(hasVersions, va, coop::WorldStateGeneration(), genOut);
+    if (hasVersions != 0)
+    {
+        ++g_t2VaAsked;
+        if (va == coopt2::kVaApplies) ++g_t2VaWould; else if (va == coopt2::kVaUnread) ++g_t2VaFault;
+        if (vaWait == 0) ++g_t2VaWalked;
+        if (g_t2VaLines < kT2VaLineCap)
+        {
+            ++g_t2VaLines;
+            T2Line("[TOWNS2] town '" + tn + "' versionAsk: " + (va == coopt2::kVaUnread
+                       ? ("the engine's version test could not run (" + std::string(vaWhy) + ") - the named-character generation decides (" + N(genOut) + " -> " + N(coop::WorldStateGeneration()) + ")")
+                       : (vaWhy[0] != 0 ? std::string(vaWhy) : ("the engine's version test: " + N((long long)vaWould) + " of " + N((long long)vaTested) + " other version(s) would apply now")))
+                   + " -> " + (vaWait != 0 ? "waits" : "walks") + (g_t2VaLines == kT2VaLineCap ? " (versionAsk line cap reached - counters only from here)" : ""));
+        }
+    }
+    if (vaWait != 0)
     {
         ++g_t2VersionWait;
-        T2Line("[TOWNS2] town '" + tn + "' has other versions (override town=" + N((long long)hasVersions) + ") and a named character's state changed since it came into range (generation "
-               + N(genOut) + " -> " + N(coop::WorldStateGeneration()) + ") - the game chooses its version again first; not walked until it has been out of range");
+        TtWalkAbort(T, "versionWait");   /* not walked: nothing written; it ends when the town is seen out of loaded range (g_t2GenOut) */
+        if (T.said.insert(std::make_pair(std::string("versionWait"), 1)).second)
+            T2Line("[TOWNS2] town '" + tn + "' has other versions (override town=" + N((long long)hasVersions) + ") and " + (va == coopt2::kVaApplies
+                       ? ("another version would apply at its next load (" + (vaWhy[0] != 0 ? std::string(vaWhy) : std::string("the engine's own version test")) + ")")
+                       : ("a named character's state changed since it came into range (generation " + N(genOut) + " -> " + N(coop::WorldStateGeneration()) + "; the version test could not run)"))
+                   + " - the game chooses its version again first; not walked until it has been out of range");
         return;
     }
-    T2Walk(town, tn, tp, nosight, forced, townDead);
+    T2Walk(town, tn, tp, nosight, forced, townDead, tid, tsec.x, tsec.y, &T);
+    TtWalkMaybeEnd(tid, T);   /* T-4: nothing queued -> the walk ends here; else at its last group's commitment (Towns2Act) */
+}
+/* T-1341 design (a) (owner 1614 a): THE GAME THAT RUNS A TOWN'S PEOPLE CLEARS THE ENGINE'S WRONG 'DEAD' MARK. The population
+   manager's byte +8 (Town+0xE0 -> +8) is set to 1 only by 0x926570 and never cleared by the engine; once set, the engine's own
+   check-up exits early and the town is never judged again (its rebuild, refill and wake marker stop). T2323 (Confirmed): the engine
+   set it on B while B's resident list was empty for a moment (A's copies withdrawn), and it stayed set after B took the people over.
+   Rule (coopt2::DeadMarkStepOf): byte set, this game holds the area, at least one resident group answers T2RunsHere = 1 (a group
+   this game runs, or one no runner is known for - no runner slot, no world-server note, no list hold: townrebuild.h RunsHere), and
+   at least one resident group - its own or a copy - is intact by the facts the engine's own intact test 0x7ABC10 uses
+   (coopt2::GroupIntact) -> one SEH-guarded write clears the byte. A truly dead town (no intact resident group) is never cleared.
+   fold 1 (review MED): the engine's test is NOT CALLED - on an awake group 0x7ABC10 calls 0x7A5040, which writes +0x100 and can call
+   declareDead 0x7964F0 while the byte is still set (losing the keep of a regrowing group). The facts are read only.
+   TOWNS ONLY: this runs from the Town::periodicTick 0x92BE50 post-hook, which only towns reach; nests share the byte but tick
+   through 0x926540 and never come here - there is no nest code. MAIN THREAD. */
+/* The asleep group's cached intact byte Platoon+0x100 (what 0x7ABC10 returns for a group with no ActivePlatoon +0x1D8), read only:
+   1 / 0, -1 = a fault (counted as not intact) */
+static int T1341CachedIntactPod(void* platoon)
+{
+    if (platoon == 0) return -1;
+    __try { return *((const unsigned char*)platoon + 0x100) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* The one write: the population manager's byte +8 back to 0. 1 written, 0 no manager or a fault. */
+static int T1341ClearPod(void* town)
+{
+    __try
+    {
+        char* mgr = *(char* const*)((const char*)town + 0xE0);
+        if (mgr == 0) return 0;
+        *(volatile unsigned char*)(mgr + 8) = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void T1341DeadMarkCheck(void* town)
+{
+    if (town == 0) return;
+    if (::GetCurrentThreadId() != g_mainThread) return;
+    int townActive = 0, byteDead = 0;
+    if (T2TownFlagsPod(town, &townActive, &byteDead) == 0 || byteDead == 0) return;   /* the usual case: nothing to do */
+    char sid[128];
+    if (TownSidPod(town, sid, 128) == 0 || !coopbar::BarSidOk(sid)) return;
+    const std::string key(sid);
+    const int cleared = (g_t2DeadClearedTowns.find(key) != g_t2DeadClearedTowns.end()) ? 1 : 0;
+    float tp[3] = { 0, 0, 0 };
+    if (TownPosPod(town, tp) == 0) return;
+    char nm[96]; if (RcTownNamePod(town, nm, 96) == 0) std::strcpy(nm, "?");
+    const std::string tn = RfStr(nm);
+    if (coopt2::DeadMarkReSet(byteDead, cleared) != 0)
+    {
+        ++g_t2DeadReSet; g_t2DeadClearedTowns.erase(key);   /* counted once per re-set; a later clear arms the watch again */
+        T2Line("[TOWNS2] dead mark RE-SET town=" + tn + " - the engine set its population manager's dead byte again after this game cleared it (counted deadReSet on the REPORT)");
+    }
+    const int held = (T2HeldHere(tp[0], tp[2]) == 1) ? 1 : 0;
+    static unsigned char hs[kT2Nodes][kT2HandBytes];   /* main thread only */
+    int total = 0; float budget = 0.0f;
+    const int listRead = (held != 0 && T2NodesPod(town, 1, hs, kT2Nodes, &total, &budget) == 1) ? 1 : 0;
+    int runs = 0, intactOwn = 0, intactCopy = 0, groups = 0, faults = 0;   /* faults: groups or cached bytes unreadable - not intact */
+    T2Grp G;
+    for (int i = 0; listRead != 0 && i < total && i < kT2Nodes; ++i)
+    {
+        T2GroupPod(hs[i], &G);
+        if (G.ok == 2) continue;   /* a hand that no longer resolves: not a group */
+        if (G.ok != 1) { ++faults; continue; }   /* an unreadable group is not intact */
+        ++groups;
+        int ru = -1, ot = -1;
+        const int here = T2RunsHere(G.platoon, &ru, &ot);
+        if (here != 0) ++runs;
+        /* T2GroupPod: G.f.dead = Platoon+0x1F0; G.f.awake = ActivePlatoon +0x1D8 present with its +0xF0 set; awake, G.f.living = the
+           members not hasDied(); asleep the cached +0x100 below (not G.f.living, which is the stored +0xA0 count) */
+        const int cached = (G.f.awake == 0 && G.f.dead == 0) ? T1341CachedIntactPod(G.platoon) : 0;
+        if (cached < 0) { ++faults; continue; }
+        if (coopt2::GroupIntact(G.f.dead, G.f.awake, G.f.living, cached) != 0) { if (here != 0) ++intactOwn; else ++intactCopy; }
+    }
+    const int step = coopt2::DeadMarkStepOf(byteDead, listRead, held, runs, intactOwn, intactCopy);
+    if (step == coopt2::kDmRunsNone) ++g_t2DeadRunsNone;
+    if (step == coopt2::kDmNoIntact) ++g_t2DeadNoIntact;
+    if (step != coopt2::kDmClear) return;
+    if (T1341ClearPod(town) == 0) { ++g_t2DeadClearFault; return; }
+    ++g_t2DeadCleared; g_t2DeadClearedTowns.insert(key);
+    T2Line("[TOWNS2] dead mark CLEARED town=" + tn + " intact=" + N((long long)intactOwn) + "/" + N((long long)intactCopy) + " (own/copy) groups=" + N((long long)groups)
+           + " runHere=" + N((long long)runs) + " unreadable=" + N((long long)faults) + " - this game holds the town and runs (or no game is known to run) a resident group; the engine's own check-up judges it again from now on");
 }
 /* The engine's own sleep pair and wake pair, back to back, in ONE SEH frame. *step says how far it got. */
 static int T2SleepWakePod(void* f, void* p, uintptr_t base, int* step)
@@ -3091,21 +3740,38 @@ static void Towns2Act(void* faction)
             ++g_t2Skip[kT2xNoFactionTurn];
             T2Line(T2GroupLine(q.town, q.list, q.idx, q.wid, q.living, q.orig, "skipped(noFactionTurn: its faction's update did not come in " + N((long long)(kT2QueueMaxMs / 1000)) + " s)"));
             g_t2Queue.erase(g_t2Queue.begin() + i);
+            TtResolve(q.tid, q.wid, towntime::kTtEndOwe);   /* T-4: not committed - owed, rebuilt at a later check-up */
             continue;
         }
         T2Grp G; T2GroupPod(q.h, &G);
         if (G.ok == 1 && G.faction != faction) { ++i; continue; }   /* changed between the two reads: its own faction's turn decides */
+        if (!q.tid.empty() && T2HeldHere(q.tx, q.tz) != 1)
+        {   /* T-4 fold 2 B: the moment of commitment - this game no longer holds the town's area: its walk is dropped, nothing written */
+            ++g_ttLostHold;
+            T2Line(T2GroupLine(q.town, q.list, q.idx, q.wid, q.living, q.orig, "skipped(notHolder at commitment: the town's area is no longer held here - the walk is dropped, nothing written)"));
+            TtLostHold(q.tid);   /* every queued group of that walk leaves the queue */
+            i = 0; continue;
+        }
         std::string res;
+        int ttEnd = towntime::kTtEndFinal;   /* T-4: this group's end, for its walk */
+        int ru = -1, ot = -1;   /* T-4 design (d): the runner at the commitment */
         if (G.ok != 1) { ++g_t2Skip[G.ok == 2 ? kT2xGone : kT2xFault]; res = std::string("skipped(") + (G.ok == 2 ? "gone" : "readFault") + " at commitment)"; }
+        else if (T2RunsHere(G.platoon, &ru, &ot) == 0)
+        {   /* T-4 design (d): the moment of commitment - this game no longer runs the group's people: owed, not run here */
+            ++g_t2ActNotRun; ttEnd = towntime::kTtEndOwe;
+            res = "skipped(notRunHere at commitment: " + T2RunnerText(ru, ot) + " - owed, a later check-up decides)";
+        }
         else
         {
             if (np == -2) np = T2Players(plx, plz, kT2Players);
             G.f.marked = 1;
             G.f.held = T2AllHeld(&G, 0);
-            G.f.seen = T2Seen(np, plx, plz, &G);
+            G.f.seen = T2Seen(np, plx, plz, &G, TtPeerInSector(q.sx, q.sy));   /* sight decided live at the commitment: the local copies and the world server's player sectors */
             T2Recipe rc; const int rv = T2RecipeUnique(G.platoon, &rc);
             G.f.recipeUnique = (rv == 1) ? 1 : 0; G.f.subSquads = (rv == 2) ? 1 : 0;
             const int v = coopt2::GroupVerdict(G.f, q.nosight);
+            if (v != coopt2::kQueue && coopt2::IsDeferral(v) != 0) ttEnd = towntime::kTtEndOwe;   /* seen at the commitment: owed */
+            if (v == coopt2::kAsleep && coopt2::AsleepAct(G.f, rc.step, rc.uniq, rv == 2 ? 1 : 0) == coopt2::kQueue && T2MarkPod(G.platoon) == 1) { ttEnd = towntime::kTtEndMarked; ++g_ttAsleepMarked; }   /* fell asleep since the walk: the engine's own mark */
             if (v != coopt2::kQueue) { ++g_t2Verdict[v]; res = "skipped(" + std::string(coopt2::VerdictName(v)) + (v == coopt2::kUniqueUnknown || v == coopt2::kSubSquads ? T2RecipeWhy(rc) : std::string()) + " at commitment)"; }
             else if (kPlatoonDeactivateRva == 0 || kFactionDeactivatePlatoonRva == 0 || kPlatoonActivateRva == 0 || kFactionActivatePlatoonRva == 0) { ++g_t2Skip[kT2xNoAddr]; res = "skipped(noAddr)"; }
             else
@@ -3119,7 +3785,7 @@ static void Towns2Act(void* faction)
                 }
                 else
                 {
-                    ++g_t2Asked;
+                    ++g_t2Asked; ttEnd = towntime::kTtEndRebuilt;
                     res = "asked (rebuild mark set, slept and woken by the engine's own four calls; the rebuild runs in this faction's update)";
                     T2V w; std::memcpy(w.h, q.h, kT2HandBytes); w.town = q.town; w.list = q.list; w.wid = q.wid; w.idx = q.idx; w.origBefore = G.orig; w.livingBefore = G.f.living; w.at = nowMs;
                     g_t2Verify.push_back(w);
@@ -3128,6 +3794,7 @@ static void Towns2Act(void* faction)
         }
         T2Line(T2GroupLine(q.town, q.list, q.idx, q.wid, G.ok == 1 ? G.f.living : q.living, G.ok == 1 ? G.orig : q.orig, res));
         g_t2Queue.erase(g_t2Queue.begin() + i);
+        TtResolve(q.tid, q.wid, ttEnd);
     }
 }
 void detour_t2FactionUpdate(void* faction, float dt)
@@ -3184,15 +3851,26 @@ static void Towns2Report()
              + " groups=" + N(g_t2Groups) + " picked=" + N(g_t2Picked) + " pickedMarker=" + N(g_t2PickedMarker) + " pickedEngineMark=" + N(g_t2PickedEngine)
              + " queued=" + N(g_t2Queued) + " asked=" + N(g_t2Asked) + " rebuilt=" + N(g_t2Rebuilt) + " actFaults=" + N(g_t2ActFaults)
              + " verdicts[" + vs + "] other[" + xs + "] queueNow=" + N((long long)g_t2Queue.size()) + " verifyNow=" + N((long long)g_t2Verify.size())
-             + " townsTimed=" + N((long long)g_t2Last.size()) + " stateGen=" + N(coop::WorldStateGeneration()) + " kills=" + N(g_t2Kills) + " killed=" + N(g_t2Killed) + " forcedPending=" + N((long long)g_t2Forced.size())
+             + " townsTimed=" + N((long long)g_tt.size()) + " stateGen=" + N(coop::WorldStateGeneration()) + " kills=" + N(g_t2Kills) + " killed=" + N(g_t2Killed) + " forcedPending=" + N((long long)g_t2Forced.size())
              + " killPending=" + N((long long)g_t2Kill.size()) + " showPending=" + N((long long)g_t2Show.size()) + " noClock=" + N(g_t2NoClock) + " offThread=" + N(g_t2OffThread) + " hook=" + N((long long)(g_t2Hooked ? 1 : 0))
-             + " linesDropped=" + N(g_t2LinesDropped));
+             + " linesDropped=" + N(g_t2LinesDropped) + " notRunHere[seen,owed,markedKept,kill,commit]=" + N(g_t2NotRun) + "," + N(g_t2NotRunOwed) + "," + N(g_t2NotRunMarkedKept) + "," + N(g_t2KillNotRun) + "," + N(g_t2ActNotRun)
+             + " noVerdict=" + N(g_t2NoVerdict) + " byteDisagree=" + N(g_t2ByteDisagree) + " byteDisagreeTowns=" + N(g_t2ByteDisagreeTowns) + " deadKept=" + N(g_t2DeadKept)
+             + " deadCleared=" + N(g_t2DeadCleared) + " deadReSet=" + N(g_t2DeadReSet) + " deadClearFault=" + N(g_t2DeadClearFault) + " deadKeptNoIntact=" + N(g_t2DeadNoIntact) + " deadKeptRunsNone=" + N(g_t2DeadRunsNone)
+             + " versionAsk[asked,wouldSwitch,walked,fault]=" + N(g_t2VaAsked) + "," + N(g_t2VaWould) + "," + N(g_t2VaWalked) + "," + N(g_t2VaFault));
+    DebugLog("[TOWNTIME] REPORT records=" + N((long long)g_tt.size()) + " arrived=" + N(g_ttArrived) + " taken=" + N(g_ttTaken) + " older=" + N(g_ttOlder) + " bad=" + N(g_ttBad)
+             + " seeded=" + N(g_ttSeeded) + " written=" + N(g_ttWritten) + " echoed=" + N(g_ttEchoed) + " notSent=" + N(g_ttNotSent) + " refused=" + N(g_ttRefused)
+             + " periodWalks=" + N(g_ttFinished) + " owedWalks=" + N(g_ttOwedWalks) + " notWalked=" + N(g_ttNotWalked) + " asleepMarked=" + N(g_ttAsleepMarked)
+             + " lostHold=" + N(g_ttLostHold) + " remarked=" + N(g_ttRemarked) + " capped=" + N(g_ttCapped) + " linkGaveUp=" + N(g_ttLinkGaveUp) + " clockBack=" + N(g_ttClockBack) + " recordsWaits=" + N(g_ttRecordsWait) + " pendingWaits=" + N(g_ttPendingWait)
+             + " peerSectorSeen=" + N(g_ttPeerSector) + " noId=" + N(g_ttNoId) + " linesDropped=" + N(g_ttLinesDropped) + " period=" + TtHours(g_ttPeriodHours) + "h periodSets=" + N(g_ttPeriodSets));
+    for (std::map<std::string, TtTown>::const_iterator t = g_tt.begin(); t != g_tt.end(); ++t)
+        if (t->second.holding != 0) DebugLog("[TOWNTIME] held " + t->first + " " + (t->second.k.have != 0 ? TtRecText(t->second.k.r) : std::string("no record")) + " inflight=" + N((long long)t->second.k.inflight)
+                                             + " walk=" + N((long long)t->second.w.active) + " pending=" + N((long long)t->second.w.pending) + (t->second.why.empty() ? std::string() : " notWalked(" + t->second.why + ")"));
     for (std::map<std::string, int>::const_iterator f = g_t2Forced.begin(); f != g_t2Forced.end(); ++f)
         DebugLog("[TOWNS2] townres now '" + RfStr(f->first.c_str()) + "'" + (f->second != 0 ? " nosight" : "") + " still pending on this game - no check-up of that town has come here while this game holds it");
     for (std::map<std::string, int>::const_iterator k = g_t2Kill.begin(); k != g_t2Kill.end(); ++k)
         DebugLog("[TOWNS2] townres kill '" + RfStr(k->first.c_str()) + "' " + N((long long)(k->second & kT2KillCountMask)) + " still pending on this game - no check-up of that town has come here while this game holds it");
 }
-static void Towns2Teardown() { g_t2Queue.clear(); g_t2Verify.clear(); g_t2Last.clear(); g_t2WhyAt.clear(); g_t2GenOut.clear(); g_t2GenWorld = coop::WorldStateGeneration(); }   /* hands, holds and range sightings belong to the world that made them; the TEST targets stay */
+static void Towns2Teardown() { g_t2Queue.clear(); g_t2Verify.clear(); g_tt.clear(); g_t2WhyAt.clear(); g_t2GenOut.clear(); g_t2GenWorld = coop::WorldStateGeneration(); }   /* hands, holds and range sightings belong to the world that made them; the TEST targets stay */
 /* T-392 (owner 335 a): THE SECOND CHANCE. Run from the post-hook on the engine's own per-town check-up, after the engine's
    check-up and before RefillCheck, so a bar settled here is then topped up by the refill's own rules. MAIN THREAD.
    WHY THIS IS NOT THE RE-OFFER P8e-b DELETED (review-p8e C-2): that pass called the engine through a Town* cached for up to
@@ -3382,17 +4060,18 @@ static void T392ReofferBar(void* town, const std::string& sid)
     if (g_owedLever != 0) { T392ReofferLog("bar", sid, "waiting", " why=test-lever"); return; }
     int held = 0, loadedR = 0;
     const int may = T392MayAt(s, &held, &loadedR);   /* T-392 fold: the load-time gate's own decision */
-    T1076ReJudgeBar(town, loadedR);   /* set aside while loading, judged now the area is in the loaded list */
+    T1076ReJudgeBar(town, loadedR);   /* set aside while loading, judged now the area is kept here (decision 1556 fold 2) */
     const int filled = (mark == 1 && n == 0) ? 1 : 0;   /* a later engine pass used the list on this game */
     const int live = T392SectorLive(s.x, s.y) ? 1 : 0;
-    const int d = townreoffer::Decide(live, 0, 0, StoreTownPeoplePending(sid.c_str(), s.x, s.y, 0, 0) == townpending::kTownHeld ? 1 : 0, may, held);
+    const int d0 = townreoffer::Decide(live, 0, 0, StoreTownPeoplePending(sid.c_str(), s.x, s.y, 0, 0) == townpending::kTownHeld ? 1 : 0, may, held);
+    const int d = T1261HolderConfirmedWait(d0, held, s);   /* T-1261 fold: another game's answer only once its naming is confirmed (the list is drained on it) */
     int claim = 0;
     const int stored = OwedStored(owedpop::kKindBar, sid, &claim);
     const int settling = OwedSettling(owedpop::kKindBar, sid);   /* rolled here and not settled yet - left alone */
     /* T-581: the town's first roll is owed work (owedpop::Commit): made only by the game the world server gave the row to */
     const int act = owedpop::Checkup(settling, d, 1, owedpop::BarHas(filled, live, may, filledElsewhere, settled ? 1 : 0), stored, claim);   /* a fill elsewhere counts only with the zone live, as before */
     const std::string ow = stored != 0 ? " owed=" + N(stored) + " claim=" + owedpop::ClaimName(claim) + (settling != 0 ? std::string(" settling=made-here") : std::string()) : std::string();
-    if (act == owedpop::kActWait) { T392ReofferLog("bar", sid, "waiting", ow); return; }
+    if (act == owedpop::kActWait) { T392ReofferLog("bar", sid, "waiting", ow + (d != d0 ? std::string(" why=holder-unconfirmed") : std::string())); return; }
     if (act == owedpop::kActClaim) { OwedSendClaim(owedpop::kKindBar, sid); T392ReofferLog("bar", sid, "waiting", ow + " asked=claim"); return; }
     if (act == owedpop::kActForget || act == owedpop::kActDoneHas || act == owedpop::kActDoneGone)
     {
@@ -3830,13 +4509,14 @@ static int T392ReofferOne(void* town, void* factory, const std::string& sid, con
     if (g_owedLever != 0) { o1->gate = -1; T392ReofferLog("residents", sid, "waiting", extra + " why=test-lever"); return townreoffer::kOneWait; }
     int held = 0, loadedR = 0;
     const int may = T392MayAt(s, &held, &loadedR);   /* T-392 fold: the load-time gate's own decision */
-    T1076ReJudge("res|" + key, loadedR);   /* T-1076 */
-    const int d = townreoffer::Decide(T392SectorLive(s.x, s.y) ? 1 : 0, 0, 0, pend, may, held);
+    T1076ReJudge("res|" + key, loadedR);   /* T-1076: judged once the area is kept here (decision 1556 fold 2) */
+    const int d0 = townreoffer::Decide(T392SectorLive(s.x, s.y) ? 1 : 0, 0, 0, pend, may, held);
+    const int d = T1261HolderConfirmedWait(d0, held, s);   /* T-1261 fold: another game's answer only once its naming is confirmed */
     o1->gate = d;
     if (d != townreoffer::kReGenerate && d != townreoffer::kReOther)
     {
         if (pend != 0) T591WaitLine(sid, key, holderW, row.pendAside);   /* each wait on a note is counted, the first 20 named */
-        T392ReofferLog("residents", sid, "waiting", extra); return townreoffer::kOneWait;
+        T392ReofferLog("residents", sid, "waiting", extra + (d != d0 ? std::string(" why=holder-unconfirmed") : std::string())); return townreoffer::kOneWait;
     }
     int claim = 0;
     const int stored = OwedStored(owedpop::kKindResidents, key, &claim);
@@ -4160,7 +4840,7 @@ static void OwedTick()
     {
         if (owedpop::SettleStep(mineSettling[i], 1, (int)owedpop::kClaimYou) == owedpop::kSetHold) continue;   /* made here and not saved - kept wherever the player goes */
         const Sector s = SectorOf(mine[i].x, mine[i].z);
-        int h = 0; const int may = T392MayAt(s, &h);
+        const int may = MayInventHereTS(s);   /* T-1261: the presumption answer, as before decision 1531 - keeping a claim is not making people (the making goes through the check-up's holder-only gate) */
         const int live = T392SectorLive(s.x, s.y) ? 1 : 0;
         if (owedpop::KeepClaim(live, may, (int)g_owedLever) != 0) continue;
         OwedSendKey(owedpop::kOpRelease, mine[i].kind, mine[i].key, " zoneLive=" + N(live) + " may=" + N(may) + " lever=" + N((long long)g_owedLever));
@@ -4914,7 +5594,7 @@ static void TownFillTick()
         if (in.owner == 0 && in.populatable == 1)
         {
             if (TownPosPod(b, bp) != 0) bs = SectorOf(bp[0], bp[2]);
-            in.mayHere = T392MayAt(bs, 0) != 0 ? 1 : 0;
+            in.mayHere = T392MayAt(bs, 0) == 1 ? 1 : 0;   /* T-1268: only "the map names this game" - no map (-1) or a teardown (-2) is not "may" */
             in.buildPending = BuildRowPendingFor(b);   /* another game's purchase or build row for it, not applied here yet */
             if (T.force != 0) { in.home = 0; in.recordsHome = 0; }   /* TEST-ONLY `townfill force`: the home answers are not asked */
             else { in.home = T392BuildingHasResidents(town, b, 0); in.recordsHome = StoreRecordsHomedAt(B.key); }
@@ -5038,6 +5718,7 @@ static std::string TownFillLeverImpl(const std::string& arg)
 void detour_townPeriodic(void* town)
 {
     orig_townPeriodic(town);   /* the engine's own check-up first, unchanged */
+    T1341DeadMarkCheck(town);   /* T-1341: the game that runs the town's people clears the engine's wrong dead mark - before every reader below */
     T392Reoffer(town);   /* T-392: the set-aside bar list and building residents get their second chance here */
     RefillCheck(town);
     Towns2Check(town);   /* towns2: the same post-hook - the game's marker rule picks the town's groups for the engine's own rebuild */
@@ -5103,13 +5784,15 @@ static void RefillTeardown()
 
 } // namespace
 
+void RaidRollInstall(uintptr_t base);   /* T-1122 roller: below, at the end of this namespace */
 void InstallTownGen()
 {
     g_mainThread = ::GetCurrentThreadId();   // provisional (preload); replaced on the first tick
     TgLockInit(); ZonesInitLocks();   // review-p4b HIGH-1: the two critical sections initialised here, once, before any worker can reach them
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     RefillInstall(base);   /* refill1: the post-hook on Town::periodicTick 0x92BE50 */
-    Towns2Install(base);   /* towns2: the pre-hook on Faction::updateActivePlatoons 0x6BA810 (the act); the decision rides the refill's post-hook */
+    Towns2Install(base);
+    RaidRollInstall(base);   /* T-1122 roller (owner 1577 c): an offline teammate's base rolled by the game in charge of its area */   /* towns2: the pre-hook on Faction::updateActivePlatoons 0x6BA810 (the act); the decision rides the refill's post-hook */
     coop::HookStatus h = coop::AddHook((void*)(base + kCreateRandomUnloadedSquadRva), (void*)&detour_create, (void**)&orig_create);
     if (h != coop::SUCCESS) { ErrorLog("[TOWN] AddHook createRandomUnloadedSquad failed - town generation is NOT gated"); return; }
     /* T-515: the building-state step (set-aside squads take it at load; the re-offer does not repeat it) */
@@ -5126,8 +5809,9 @@ void InstallTownGen()
 void SetTownGenOn(bool on) { g_on = on; DebugLog(std::string("[TOWN] towngen ") + (on ? "on" : "off")); }
 /* P8a: the world's groups are gone with the world, so the id set goes with the refusal keys beside it - a recycled
    pointer or a re-used id from a previous world must never answer `towngen` for a character in this one. */
-void TownGenWorldTeardown() { TownRefillTeardown(); ZonesSlotsSeenReset("world teardown");   /* review-recruit3 5b: auto counts THIS world's players only */
-                             TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_refusedTowns.clear(); g_refusedByTown.clear(); g_pendingLogAt.clear(); g_elsewhereByTown.clear(); g_t580KeptByKey.clear(); g_t1099Parked.clear(); g_allowedTowns.clear(); g_tgCreatedIds.clear(); ::LeaveCriticalSection(&g_tgLock); { TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_barPend.clear(); ::LeaveCriticalSection(&g_tgLock); } /* T-392 */ T392Teardown(); /* PROBE P085 */ for (int p085i = 0; p085i < 4096; ++p085i) { g_p085Squads[p085i] = 0; g_p085Residents[p085i] = 0; } /* refill1 */ RefillTeardown(); /* towns2 */ Towns2Teardown(); }   /* F666: a Town pointer belongs to the world that made it */
+void TownGenWorldTeardown() { for (int k = 0; k < kT1261Kinds; ++k) ::InterlockedExchange(&g_t1261Lines[k], 0);   /* T-1261 fold (review LOW 5): the first-5 lines are per world */
+                             TownRefillTeardown(); ZonesSlotsSeenReset("world teardown");   /* review-recruit3 5b: auto counts THIS world's players only */
+                             TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_refusedTowns.clear(); g_refusedByTown.clear(); g_pendingLogAt.clear(); g_elsewhereByTown.clear(); g_t580KeptByKey.clear(); g_t1099Parked.clear(); g_allowedTowns.clear(); g_tgCreatedIds.clear(); ::LeaveCriticalSection(&g_tgLock); { TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_barPend.clear(); ::LeaveCriticalSection(&g_tgLock); } /* T-392 */ T392Teardown(); /* PROBE P085 */ for (int p085i = 0; p085i < 4096; ++p085i) { g_p085Squads[p085i] = 0; g_p085Residents[p085i] = 0; } /* refill1 */ RefillTeardown(); /* towns2 */ Towns2Teardown(); g_t2ByteSaid.clear(); g_t2DeadClearedTowns.clear(); /* T-1341: the re-set watch belongs to the world */ /* T-4 fold 1 (LOW-3): the byte line once per town per load */ }   /* F666: a Town pointer belongs to the world that made it */
 int TownGenMadeThisPlatoon(const char* platoonId)
 {
     if (platoonId == 0 || platoonId[0] == 0) return 0;
@@ -5162,6 +5846,11 @@ void ReportTownGen()
              + " towngenHolderGenerated=" + N(g_holderGenerated)
              + " towngenRefusedNotHolder=" + N(g_refusedNotHolder)
              + " towngenRefusedNoMap=" + N(g_refusedNoMap)
+             + " nobodyYetDeferred[squad,residents,bar,character]=" + N(g_t1261NobodyYet[0]) + "," + N(g_t1261NobodyYet[1]) + "," + N(g_t1261NobodyYet[2]) + "," + N(g_t1261NobodyYet[3])   /* T-1261 (decision 1531): refused because nobody holds the area yet - T1261NobodyYet says what asks again for each kind */
+             + " reofferHolderUnconfirmedWait=" + N(g_t1261OtherUnconfirmed)   /* T-1261 fold (review LOW 4): check-up waits on a naming not yet confirmed (T1261HolderConfirmedWait) */
+             + " raidAllowedUnheld=" + N(g_raidAllowedUnheld)   /* T-1122 own raid squads */
+             + " raidRefusedPending=" + N(g_raidRefusedPending)   /* T-1122 fold b */
+             + " raidPassedNotebook=" + N(g_raidPassedNotebook)   /* T-1122 gate 1 (owner 1612 a) */
              + " townGenIds=" + N((long long)TownGenCreatedIdCount()) + " townGenIdOverflow=" + N(g_tgIdOverflow)
              + " seen=" + N(g_seen) + " refused=" + N(g_refused) + " refusedUnlinked=" + N(g_refusedUnlinked)
              + " allowed=" + N(g_allowed) + " unlinkedAllowed=" + N(g_unlinkedAllowed) + " noTown=" + N(g_noTown) + " noLease=" + N(g_noLease) + " readFault=" + N(g_readFault)
@@ -5216,14 +5905,833 @@ void ReportTownGen()
                " ABSENT and not zero (F172).  The pre-link cause is now `no-notebook` and it asks the NOTEBOOK"
                " link (F665); `pre-link` is RETIRED, so a readout writes ABSENT and not zero.");
 }
+/* THE TEST-ONLY `raidnow <faction name>` LEVER (T-1122; command_channel.cpp, MAIN THREAD). It starts one campaign of the named
+   faction now, through the engine's own campaign start, without the dice the war manager's update rolls (src/common/raidnow.h has
+   the reads). The war manager's update 0x9CA440 (Read, decomp_9ca440.txt:216-311): only when the war manager (Faction+0x88) has no
+   campaign running (+0x70 count) and none waiting to start (+0xC0 count), it walks its campaign kinds (+0xD8 count, the array at
+   +0xE0); for each enabled kind (kind+0x11) it asks the kind's target finder (kind vtable +0x00: kind, the player faction
+   PlayerInterface+0x2A0, an 8-byte out slot) and that target's chance (kind vtable +0x08: kind, the player faction, the target),
+   keeps the kinds whose chance beats rand(), picks one of them by weight, asks its target finder again and, when it finds one,
+   starts it: 0x9C8960(war manager, target, kind, the out slot's value). The lever makes the same calls with the same arguments and
+   leaves out the two random draws: of the enabled kinds that find a target it starts the one with the highest chance
+   (raidnow::PickKind). Started = the war manager's running count went up.
+   T-1122 kind choice (owner 1500 a): `raidnow <faction name> kind <name piece|#index>` starts, of the kinds that piece or place names
+   and that found a target, the one with the highest chance (raidnow::PickKindSel); none = the `kind not found` line listing every
+   kind. Every read of the kinds prints a `[RAID] raidnow kinds (TEST-ONLY)` line: each kind's place, name, enabled, target, chance. */
+static unsigned long long kRaidPlayerIfaceRva = 0; static coop::AddrReg kRaidPlayerIfaceRva_reg("PlayerInterfaceGlobal", &kRaidPlayerIfaceRva);   /* a POINTER VARIABLE; Steam_1.0.65 0x2133630 */
+static unsigned long long kRaidClockRva = 0; static coop::AddrReg kRaidClockRva_reg("ClockOwnerPtr", &kRaidClockRva);   /* a POINTER VARIABLE; Steam_1.0.65 0x212F3C0 - read for the lines' world time only */
+static unsigned long long kWarCampaignStartRva = 0; static coop::AddrReg kWarCampaignStartRva_reg("WarCampaignStart", &kWarCampaignStartRva, coop::kAddrUseCallOnly);   /* Steam_1.0.65 0x9C8960, Steam_1.0.68 0x9C9830 (call-only) */
+typedef void* (*RaidFindTargetFn)(void* kind, void* playerFaction, void* outSlot);   // campaign kind vtable +0x00
+typedef float (*RaidChanceFn)(void* kind, void* playerFaction, void* target);        // campaign kind vtable +0x08
+typedef void* (*WarCampaignStartFn)(void* warManager, void* target, void* kind, void* extra);
+const size_t kRaidWarManagerOff = 0x88;    // Faction: the war manager pointer
+const size_t kRaidWarRunningOff = 0x70;    // war manager: running campaigns (count)
+const size_t kRaidWarWaitingOff = 0xC0;    // war manager: campaigns waiting to start (count)
+const size_t kRaidWarKindsOff   = 0xD8;    // war manager: campaign kinds it can roll (count)
+const size_t kRaidWarKindArrOff = 0xE0;    // war manager: the campaign kinds (array of pointers)
+const size_t kRaidKindEnabledOff = 0x11;   // campaign kind: the update only asks kinds with this byte set
+const size_t kRaidKindDataOff   = 0x138;   // campaign kind: its GameData record (the name the engine prints, at +0x28)
+const size_t kRaidIfaceFactionOff = 0x2A0; // PlayerInterface: the player faction
+const size_t kRaidClockNowOff   = 0xA0;    // the clock object: now (double, in-game hours)
+static bool RaidPtrOk(const void* p) { return p != 0 && (uintptr_t)p > 0x10000 && (uintptr_t)p < 0x00007FFFFFFFFFFFull; }
+struct RaidNowRead
+{
+    void* wm; void* playerFaction; void* kind; void* target; void* extra; void* campaign;
+    int running, waiting, kinds, enabled, withTarget, pick, runningAfter, stage;
+    float chance; float pos[4];
+    double now; int haveNow;   /* the world time (in-game hours); haveNow 0 = no clock */
+    char kindName[96];
+    int matched;   /* T-1122 kind choice: the kinds the choice names (every kind when none was given) */
+    char kindNames[raidnow::kKindsMax][raidnow::kKindNameMax];   /* every kind's name, "" when unread */
+    signed char kEnabled[raidnow::kKindsMax]; int kHas[raidnow::kKindsMax]; float kChance[raidnow::kKindsMax];
+};
+/* 1 = started (the running count went up); 2 = the start was called and the running count did not go up; 0 = no enabled kind found
+   a target, or the picked kind found none on the second ask (nothing started); -1 = the faction has no war manager; -3 = the war
+   manager does not look like the 1.0.65 layout (nothing called); -4 = a campaign runs or waits (the update would not roll either;
+   nothing started); -5 = no player faction (the row unbound or the pointer empty); -6 = the start row unbound; -2 = a fault
+   (r->stage: 1 reading, 2 asking the kinds, 3 the second ask, 4 the start); -7 = a choice was given (sel) and none of the kinds it
+   names found a target (nothing started). No C++ object here (C2712). */
+static int RaidNowStartPod(void* faction, RaidNowRead* r, const raidnow::KindSel* sel)
+{
+    if (kWarCampaignStartRva == 0) return -6;
+    const unsigned long long ifaceAt = (kRaidPlayerIfaceRva != 0) ? AddrAbs(kRaidPlayerIfaceRva) : 0;
+    if (ifaceAt == 0) return -5;
+    const WarCampaignStartFn start = (WarCampaignStartFn)(uintptr_t)AddrAbs(kWarCampaignStartRva);
+    int hasTarget[raidnow::kKindsMax]; float chance[raidnow::kKindsMax];
+    r->stage = 1;
+    __try
+    {
+        void* iface = *(void**)(uintptr_t)ifaceAt;
+        if (!RaidPtrOk(iface)) return -5;
+        r->playerFaction = *(void**)((char*)iface + kRaidIfaceFactionOff);
+        if (!RaidPtrOk(r->playerFaction)) return -5;
+        const unsigned long long clockAt = (kRaidClockRva != 0) ? AddrAbs(kRaidClockRva) : 0;
+        void* clk = (clockAt != 0) ? *(void**)(uintptr_t)clockAt : 0;
+        if (RaidPtrOk(clk)) { r->now = *(const double*)((const char*)clk + kRaidClockNowOff); r->haveNow = 1; }
+        void* wm = *(void**)((char*)faction + kRaidWarManagerOff);
+        r->wm = wm;
+        if (!RaidPtrOk(wm)) return -1;
+        r->running = *(const int*)((const char*)wm + kRaidWarRunningOff);
+        r->waiting = *(const int*)((const char*)wm + kRaidWarWaitingOff);
+        r->kinds = *(const int*)((const char*)wm + kRaidWarKindsOff);
+        void* const* arr = *(void* const* const*)((const char*)wm + kRaidWarKindArrOff);
+        /* the offsets are read from the 1.0.65 code; counts outside their range or a missing kind array mean this version lays the
+           war manager out differently - call nothing */
+        if (r->running < 0 || r->running > 256 || r->waiting < 0 || r->waiting > 256 || r->kinds < 0 || r->kinds > raidnow::kKindsMax
+            || (r->kinds > 0 && !RaidPtrOk(arr))) return -3;
+        if (r->running != 0 || r->waiting != 0) return -4;
+        r->stage = 2;
+        for (int i = 0; i < r->kinds; ++i)
+        {
+            hasTarget[i] = 0; chance[i] = 0.0f;
+            void* k = arr[i];
+            if (RaidPtrOk(k))
+            {
+                const char* kgd = *(const char* const*)((const char*)k + kRaidKindDataOff);
+                if (!RaidPtrOk(kgd) || RcNamePod(kgd, r->kindNames[i], raidnow::kKindNameMax) == 0) r->kindNames[i][0] = 0;
+            }
+            if (raidnow::KindMatches(sel, i, r->kindNames[i]) != 0) ++r->matched;
+            if (!RaidPtrOk(k) || *((const char*)k + kRaidKindEnabledOff) == 0) continue;
+            r->kEnabled[i] = 1;
+            ++r->enabled;
+            void* const* kvt = *(void* const* const*)k;
+            unsigned long long kslot[2] = { 0, 0 };
+            void* t = ((RaidFindTargetFn)kvt[0])(k, r->playerFaction, kslot);
+            if (t == 0) continue;
+            hasTarget[i] = 1; ++r->withTarget;
+            chance[i] = ((RaidChanceFn)kvt[1])(k, r->playerFaction, t);
+        }
+        for (int i = 0; i < r->kinds; ++i) { r->kHas[i] = hasTarget[i]; r->kChance[i] = chance[i]; }
+        const int chose = (sel != 0 && sel->given != 0) ? 1 : 0;
+        r->pick = chose != 0 ? raidnow::PickKindSel(hasTarget, chance, r->kindNames, r->kinds, sel) : raidnow::PickKind(hasTarget, chance, r->kinds);
+        if (r->pick < 0) return chose != 0 ? -7 : 0;
+        r->kind = arr[r->pick];
+        r->chance = chance[r->pick];
+        const char* gd = *(const char* const*)((const char*)r->kind + kRaidKindDataOff);
+        if (!RaidPtrOk(gd) || RcNamePod(gd, r->kindName, (int)sizeof(r->kindName)) == 0) r->kindName[0] = 0;
+        r->stage = 3;
+        void* const* vt = *(void* const* const*)r->kind;
+        unsigned long long slot[2] = { 0, 0 };
+        r->target = ((RaidFindTargetFn)vt[0])(r->kind, r->playerFaction, slot);
+        if (r->target == 0) return 0;
+        r->extra = (void*)(uintptr_t)slot[0];
+        ((GetPositionFn)(*(void* const* const*)r->target)[0x40 / sizeof(void*)])(r->target, r->pos);   /* as 0x9C8960 asks it */
+        r->stage = 4;
+        r->campaign = start(wm, r->target, r->kind, r->extra);
+        r->runningAfter = *(const int*)((const char*)wm + kRaidWarRunningOff);
+        return r->runningAfter > r->running ? 1 : 2;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+/* T-1122 kind choice: every kind read, as ` #<place> '<name>' enabled=<0|1> target=<0|1> chance=<x|->;` */
+static std::string RaidKindList(const RaidNowRead& r)
+{
+    std::string out;
+    for (int i = 0; i < r.kinds && i < raidnow::kKindsMax; ++i)
+    {
+        char b[160];
+        if (r.kHas[i] != 0) _snprintf(b, 159, " #%d '%s' enabled=%d target=1 chance=%.4f;", i, r.kindNames[i], (int)r.kEnabled[i], (double)r.kChance[i]);
+        else _snprintf(b, 159, " #%d '%s' enabled=%d target=0 chance=-;", i, r.kindNames[i], (int)r.kEnabled[i]);
+        b[159] = 0; out += b;
+    }
+    return out;
+}
+std::string RaidRollLever(const std::string& rest);   /* T-1122 roller: below */
+std::string RaidNowLever(const std::string& rest)
+{
+    const char* rollerRest = 0;
+    if (raidroll::LeverIsRoller(rest.c_str(), &rollerRest) != 0) return RaidRollLever(std::string(rollerRest));   /* `raidnow roller ...`: the roller's own road */
+    std::string name; raidnow::KindSel sel;
+    if (raidnow::ParseArgs(rest, &name, &sel) == 0)
+    { ErrorLog("[RAID] raidnow error: usage raidnow <faction name> [kind <name piece|#index>] (a name of 1 to " + N((long long)raidnow::kNameMax) + " characters; a piece of 1 to " + N((long long)raidnow::kPieceMax) + ", or # and 0 to " + N((long long)(raidnow::kKindsMax - 1)) + ")"); return "error raidnow usage"; }
+    const std::string choice = sel.given == 0 ? std::string() : (sel.index >= 0 ? "#" + N((long long)sel.index) : std::string(sel.piece));
+    if (g_mainThread != 0 && ::GetCurrentThreadId() != g_mainThread)
+    { ErrorLog("[RAID] raidnow error: not on the main thread - nothing started"); return "error raidnow not main thread"; }
+    ::GameWorld* w = GameWorldPtr();
+    if (!RaidPtrOk(w) || !RaidPtrOk(w->factionDirectory))
+    { ErrorLog("[RAID] raidnow error: no world loaded - '" + name + "' not looked up"); return "error raidnow no world"; }
+    ::Faction* f = w->factionDirectory->findFactionByName(name);
+    if (!RaidPtrOk(f))
+    { ErrorLog("[RAID] raidnow error: faction '" + name + "' not found (the 'factions' command lists real names) - nothing started"); return "error raidnow not found"; }
+    RaidNowRead r; std::memset(&r, 0, sizeof(r)); r.pick = -1;
+    const int rc = RaidNowStartPod((void*)f, &r, &sel);
+    if (rc == -6) { ErrorLog("[RAID] raidnow error: the campaign start row (WarCampaignStart) is unbound - nothing started"); return "error raidnow no start"; }
+    if (rc == -5) { ErrorLog("[RAID] raidnow error: no player faction (PlayerInterfaceGlobal unbound or empty) - nothing started"); return "error raidnow no player faction"; }
+    if (rc == -1) { ErrorLog("[RAID] raidnow error: faction '" + name + "' has no war manager (Faction+0x88 empty) - nothing started"); return "error raidnow no war manager"; }
+    if (rc == -3) { ErrorLog("[RAID] raidnow error: faction '" + name + "' - the war manager's counts (running " + N((long long)r.running) + ", waiting " + N((long long)r.waiting) + ", kinds " + N((long long)r.kinds) + ") do not look like this game version's layout - nothing started"); return "error raidnow layout"; }
+    if (rc == -4) { DebugLog("[RAID] raidnow busy (TEST-ONLY): faction '" + name + "' - running campaigns " + N((long long)r.running) + ", waiting " + N((long long)r.waiting) + " (the war manager's update would not roll either) - nothing started"); return "error raidnow busy"; }
+    if (rc == -2) { ErrorLog("[RAID] raidnow error: faction '" + name + "' - FAULT at stage " + N((long long)r.stage) + " (1 reading, 2 asking the kinds, 3 the second ask, 4 the campaign start)"); return "error raidnow fault"; }
+    if (rc == -7)
+    {
+        ErrorLog("[RAID] raidnow kind not found (TEST-ONLY): faction '" + name + "' - no campaign kind named by 'kind " + choice + "' (" + N((long long)r.matched)
+                 + " named) is enabled with a target for the player faction - nothing started; its " + N((long long)r.kinds) + " kinds:" + RaidKindList(r));
+        return "error raidnow kind not found";
+    }
+    DebugLog("[RAID] raidnow kinds (TEST-ONLY): faction '" + name + "' choice " + (sel.given != 0 ? "'kind " + choice + "' (" + N((long long)r.matched) + " named)" : std::string("none (the highest chance)"))
+             + " - its " + N((long long)r.kinds) + " kinds:" + RaidKindList(r));
+    char b[640];
+    if (rc == 0)
+    {
+        _snprintf(b, 639, "[RAID] raidnow no target (TEST-ONLY): faction '%s' warManager=%p - of its %d campaign kinds %d enabled, %d found a target for the player faction %p%s - nothing started",
+                  name.c_str(), r.wm, r.kinds, r.enabled, r.withTarget, r.playerFaction, r.pick >= 0 ? " (the picked kind found none on the second ask)" : "");
+        b[639] = 0; DebugLog(b);
+        return "error raidnow no target";
+    }
+    const std::string chosenBy = sel.given != 0 ? ", chosen by 'kind " + choice + "'" : std::string();
+    _snprintf(b, 639, "[RAID] raidnow target (TEST-ONLY): faction '%s' warManager=%p kind #%d '%s' (%d enabled, %d with a target; chance %.4f, dice skipped%s) target=%p at (%.0f, %.0f) extra=%p worldTime %.4f - starting it through the engine's campaign start",
+              name.c_str(), r.wm, r.pick, r.kindName, r.enabled, r.withTarget, (double)r.chance, chosenBy.c_str(), r.target, (double)r.pos[0], (double)r.pos[2], r.extra, r.haveNow != 0 ? r.now : -1.0);
+    b[639] = 0; DebugLog(b);
+    if (rc == 2)
+    {
+        _snprintf(b, 639, "[RAID] raidnow not started (TEST-ONLY): faction '%s' kind '%s' - the engine's campaign start returned %p and the running campaigns stayed %d -> %d",
+                  name.c_str(), r.kindName, r.campaign, r.running, r.runningAfter);
+        b[639] = 0; ErrorLog(b);
+        return "error raidnow not started";
+    }
+    _snprintf(b, 639, "[RAID] raidnow started (TEST-ONLY): faction '%s' kind '%s' campaign=%p worldTime %.4f - running campaigns %d -> %d",
+              name.c_str(), r.kindName, r.campaign, r.haveNow != 0 ? r.now : -1.0, r.running, r.runningAfter);
+    b[639] = 0; DebugLog(b);
+    return "ok raidnow " + name + " started";
+}
+/* ===================================================================================================================================
+   T-1122 THE ROLLER FOR AN OFFLINE OWNER'S BASE (owner decision 1577 c, 2026-11-09, as narrowed by owner decision 1579 a; src/common/
+   raidroll.h has the rule and the pure decisions). While a base's owner is OFFLINE (the world server's PLAYERS roster), the game IN
+   CHARGE of the base's area (owner rule 1556) rolls raids for it when that game is a teammate's and a member of the owner's team
+   stands within 2500 of the base. NO CALL-OFF (owner 1579 a): a raid of such a roll that reaches the base with nobody of the team
+   there WAITS as in single player (the engine's own wait for the announcement, decomp_9c6220:110-119) and starts when a team member
+   - the teammate, or the owner logging in - is near (the announcement's owner test counts teammates, policy.cpp RaidNearTeam). While
+   it waits or runs the base is busy for this roll (raidroll::BusyFor). With the owner online the roller does not roll.
+   THE HOOKS (Read, our decompile of Steam 1.0.65):
+     - FactionWarMgr::update 0x9CA440 (its one caller is the faction update 0x6B9470; MAIN THREAD here, anything else passes through
+       and is counted): before it, roller campaigns leave the running list when they alone would stop a due engine roll
+       (raidroll::HideForUpdate, as store.cpp's RaidCampSaveHide takes borrowed ones out around a save) and come back after it;
+       after it, this war manager's roll for each offline teammate whose own 6.0 h timer is due.
+     - the town lister 0x927E90 (dir, out list, faction): only while the roller asks a kind's target finder 0x9C4FB0 - whose second
+       half lists towns for the GLOBAL player faction (bytes 0x9C5307-0x9C5321) - it is asked for the owner's stand-in instead and its
+       list is cut to the towns this rule covers (raidroll::Covers). Whatever road the finder took, its answer is started only when it
+       is the owner's town AND covered (raidroll::TargetOk; review fold 1 H1).
+   THE ROLL is the engine's: each enabled kind's finder (vtable +0x00) and score (vtable +0x08) - the score with the kind's repeat
+   stamp (kind+0x108) swapped for this owner's own around the call; the town-level test the score skips for a faction without a
+   PlayerInterface done here (fold 1 M1) - the two draws (raidroll::PickWeighted), the finder asked again and the start 0x9C8960
+   (WarCampaignStart), whose stamp write goes to this owner's stamp and the kind's own is put back, with the kind's 'faction
+   override' follow-up count held at 0 around it (fold 1 M3: no follow-up campaigns on other war managers outside this rule).
+   NOT SAVED: the timers and stamps live in this session; a campaign in a save is an ordinary one. */
+static unsigned long long kRrWarUpdateRva = 0;  static coop::AddrReg kRrWarUpdateRva_reg("FactionWarMgrUpdate", &kRrWarUpdateRva);              /* Steam_1.0.65 0x9CA440 */
+static unsigned long long kRrTownsOfRva = 0;    static coop::AddrReg kRrTownsOfRva_reg("TownsOfFaction", &kRrTownsOfRva);                        /* Steam_1.0.65 0x927E90 */
+typedef void (*RrWarUpdateFn)(void* wm);
+typedef void* (*RrTownsOfFn)(void* dir, void* out, void* faction);
+typedef void* (*RrFactionOfFn)(void* obj);     /* town vtable +0x58: its faction */
+static RrWarUpdateFn orig_rrWarUpdate = 0;
+static RrTownsOfFn orig_rrTownsOf = 0;
+const size_t kRrWarCapOff = 0x74, kRrWarArrOff = 0x78, kRrWarTimerOff = 0xB0;   /* war manager: running list capacity / array; the roll timer (double) */
+const size_t kRrKindStampOff = 0x108;    /* campaign kind: the repeat stamp (double; 0.0 unset), written by the start (decomp_9c8960:126-128) */
+const size_t kRrCampT18 = 0x18, kRrCampT20 = 0x20, kRrCampHandOff = 0x40, kRrCampTargetFacOff = 0x78, kRrCampPhaseOff = 0xC0;   /* campaign */
+const int kRrCampsMax = 64;
+const int kRrOwnersMax = 16;
+struct RrTimer { void* wm; int slot; double next; };
+struct RrStamp { void* kind; int slot; double stamp; };
+static std::vector<RrTimer> g_rrTimers;        /* MAIN THREAD */
+static std::vector<RrStamp> g_rrStamps;        /* MAIN THREAD */
+static void* g_rrOverride = 0;                 /* MAIN THREAD: while set, the town lister is asked for this stand-in (the roller's finder calls) */
+static int g_rrOverrideSlot = -1;
+static int g_rrInUpdate = 0;                   /* MAIN THREAD: inside our call of the engine's war-manager update */
+struct RrSpots { int n; float xs[raidroll::kSpotsMax]; float zs[raidroll::kSpotsMax]; int slots[raidroll::kSpotsMax]; unsigned teams[raidroll::kSpotsMax]; int deads[raidroll::kSpotsMax]; };
+static RrSpots g_rrSpots;
+static int g_rrHooked[2] = { 0, 0 };     /* war update, town lister */
+static unsigned long long g_rrState = 0x1122ABCDull;
+static long long g_rrRolls = 0, g_rrNoTargets = 0, g_rrBusy = 0, g_rrStarted = 0, g_rrNotStarted = 0, g_rrNoPick = 0, g_rrTownsKept = 0, g_rrTownsCut = 0,
+                 g_rrHidden = 0, g_rrBackFail = 0, g_rrFaults = 0, g_rrOwnerOnline = 0;
+static volatile LONGLONG g_rrOffMain = 0;   /* review fold 1 L2: war-manager updates seen off the main thread (passed through untouched) */
+static float RrRand01()
+{
+    unsigned long long x = g_rrState;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17; g_rrState = x;
+    return (float)((double)(x >> 11) * (1.0 / 9007199254740992.0));
+}
+/* the world time (in-game hours); 0 = no clock */
+static int RrNowPod(double* now)
+{
+    __try
+    {
+        const unsigned long long at = (kRaidClockRva != 0) ? AddrAbs(kRaidClockRva) : 0;
+        void* clk = at != 0 ? *(void**)(uintptr_t)at : 0;
+        if (!RaidPtrOk(clk)) return 0;
+        *now = *(const double*)((const char*)clk + kRaidClockNowOff);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void* RrPlayerFactionPod()
+{
+    __try
+    {
+        const unsigned long long at = (kRaidPlayerIfaceRva != 0) ? AddrAbs(kRaidPlayerIfaceRva) : 0;
+        void* pi = at != 0 ? *(void**)(uintptr_t)at : 0;
+        if (!RaidPtrOk(pi)) return 0;
+        void* f = *(void**)((char*)pi + kRaidIfaceFactionOff);
+        return RaidPtrOk(f) ? f : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the war manager's running campaigns, their target factions and phases, its waiting count, kinds count, capacity and timer;
+   1 read, 0 not a layout this build knows, -1 fault */
+struct RrWar { int running, waiting, kinds, cap, n; double timer; void* camps[kRrCampsMax]; void* tfac[kRrCampsMax]; int phase[kRrCampsMax]; };
+static int RrWarReadPod(void* wm, RrWar* w)
+{
+    __try
+    {
+        const char* c = (const char*)wm;
+        w->running = *(const int*)(c + kRaidWarRunningOff); w->waiting = *(const int*)(c + kRaidWarWaitingOff);
+        w->kinds = *(const int*)(c + kRaidWarKindsOff); w->cap = *(const int*)(c + kRrWarCapOff);
+        w->timer = *(const double*)(c + kRrWarTimerOff);
+        if (w->running < 0 || w->running > 256 || w->waiting < 0 || w->waiting > 256 || w->kinds < 0 || w->kinds > raidnow::kKindsMax || w->cap < w->running) return 0;
+        void* const* a = *(void* const* const*)(c + kRrWarArrOff);
+        w->n = 0;
+        if (w->running > 0 && !RaidPtrOk(a)) return 0;
+        for (int i = 0; i < w->running && w->n < kRrCampsMax; ++i)
+        {
+            void* camp = a[i];
+            w->camps[w->n] = camp; w->tfac[w->n] = 0; w->phase[w->n] = -1;
+            if (RaidPtrOk(camp)) { w->tfac[w->n] = *(void**)((char*)camp + kRrCampTargetFacOff); w->phase[w->n] = *(const int*)((const char*)camp + kRrCampPhaseOff); }
+            ++w->n;
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int RrListOutPod(void* wm, void* camp)
+{
+    __try
+    {
+        char* w = (char*)wm;
+        unsigned int* count = (unsigned int*)(w + kRaidWarRunningOff);
+        void** a = *(void***)(w + kRrWarArrOff);
+        for (unsigned int i = 0; i < *count && i < 4096; ++i)
+            if (a[i] == camp) { for (unsigned int k = i + 1; k < *count; ++k) a[k - 1] = a[k]; *count = *count - 1; return 1; }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int RrListBackPod(void* wm, void* camp)
+{
+    __try
+    {
+        char* w = (char*)wm;
+        unsigned int* count = (unsigned int*)(w + kRaidWarRunningOff);
+        if (*count >= *(unsigned int*)(w + kRrWarCapOff)) return 0;
+        (*(void***)(w + kRrWarArrOff))[*count] = camp; *count = *count + 1;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* a campaign's slot of the player whose base it targets (-1 none) and whether it is a roller campaign here */
+static int RrCampSlot(void* tfac) { return RaidPtrOk(tfac) ? coop::PolicyFactionSlot(tfac) : -1; }
+static int RrCampIsRoller(void* camp, void* tfac, int* slotOut)
+{
+    const int s = RrCampSlot(tfac);
+    if (slotOut != 0) *slotOut = s;
+    return raidroll::IsRollerCampaign(s, coop::MySlotForWire(), coop::StoreRaidCampBorrowed(camp));
+}
+static void RrSpotsRead()
+{
+    int owns[raidroll::kSpotsMax]; int left = 0;
+    g_rrSpots.n = coop::PlayerCharSpots(g_rrSpots.xs, g_rrSpots.zs, g_rrSpots.slots, owns, g_rrSpots.deads, raidroll::kSpotsMax, coop::MySlotForWire(), &left);
+    if (g_rrSpots.n < 0) g_rrSpots.n = 0;
+    for (int i = 0; i < g_rrSpots.n; ++i) g_rrSpots.teams[i] = coop::TeamNoOfSlotAnyThread(g_rrSpots.slots[i]);
+}
+static int RrTeamNear(const float* pos, int ownerSlot)
+{
+    return raidroll::TeamPresent(pos[0], pos[2], g_rrSpots.xs, g_rrSpots.zs, g_rrSpots.slots, g_rrSpots.teams, g_rrSpots.deads, g_rrSpots.n,
+                                 ownerSlot, coop::TeamNoOfSlotAnyThread(ownerSlot), raidroll::kPresenceRadius);
+}
+/* the cover decision for one town of the owner's (raidroll::Covers); pos / holder / near out */
+static int RrCoverTown(void* town, int ownerSlot, float* pos, int* holder, int* nearN)
+{
+    *holder = -1; *nearN = 0;
+    if (!RaidPtrOk(town) || TownPosPod(town, pos) != 1) return -1;
+    const int me = coop::MySlotForWire();
+    *holder = coop::AreaHolderSlotTS(coop::SectorOf(pos[0], pos[2]));
+    *nearN = RrTeamNear(pos, ownerSlot);
+    return raidroll::Covers(ownerSlot, me, coop::TeamSameAnyThread(me, ownerSlot) ? 1 : 0, coop::StoreRosterSlotInWorld(ownerSlot), *holder, *nearN);
+}
+static int RrListReadPod(void* list, void** items, int cap, int* n)
+{
+    __try
+    {
+        const int c = *(const int*)((const char*)list + 0x08);
+        void* const* d = *(void* const* const*)((const char*)list + 0x10);
+        if (c < 0 || c > cap || (c > 0 && !RaidPtrOk(d))) return 0;
+        for (int i = 0; i < c; ++i) items[i] = d[i];
+        *n = c;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int RrListWritePod(void* list, void* const* items, int n)
+{
+    __try
+    {
+        void** d = *(void***)((char*)list + 0x10);
+        for (int i = 0; i < n; ++i) d[i] = items[i];
+        *(int*)((char*)list + 0x08) = n;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the town list the finder asked for, cut to the covered towns of the owner (an unreadable list is emptied: nothing uncovered is
+   ever offered) */
+static void RrCutTowns(void* list)
+{
+    void* items[256]; void* keep[256]; int n = 0, k = 0;
+    if (RrListReadPod(list, items, 256, &n) != 1) { ++g_rrFaults; RrListWritePod(list, keep, 0); return; }
+    for (int i = 0; i < n; ++i)
+    {
+        float pos[4] = { 0, 0, 0, 0 }; int holder = -1, nearN = 0;
+        if (RrCoverTown(items[i], g_rrOverrideSlot, pos, &holder, &nearN) == raidroll::kCoverYes) { keep[k++] = items[i]; ++g_rrTownsKept; }
+        else ++g_rrTownsCut;
+    }
+    if (k != n && RrListWritePod(list, keep, k) != 1) ++g_rrFaults;
+}
+static void* detour_rrTownsOf(void* dir, void* out, void* faction)
+{
+    if (g_rrOverride == 0 || ::GetCurrentThreadId() != g_mainThread) return orig_rrTownsOf(dir, out, faction);
+    void* const r = orig_rrTownsOf(dir, out, g_rrOverride);
+    RrCutTowns(out);
+    return r;
+}
+/* ONE ROLL of a war manager for one offline owner (the engine's own calls; see the block comment) */
+struct RrRoll
+{
+    void* wm; void* standIn; void* asked; int force; const raidnow::KindSel* sel;
+    int slot, uncovered, lowLevel, followKeep, followZeroed;   /* review fold 1: H1 / M1 / M3 */
+    int kinds, enabled, withTarget, matched, pick, stage, running, runningAfter;
+    void* kind; void* target; void* extra; void* camp; float chance, total, r01; float pos[4];
+    double given, seen; void* stampKind; double stampKeep; int stampWritten;
+    char kindName[96];
+    char kindNames[raidnow::kKindsMax][raidnow::kKindNameMax];
+    int kHas[raidnow::kKindsMax]; float kChance[raidnow::kKindsMax]; float kDraw[raidnow::kKindsMax]; signed char kEnabled[raidnow::kKindsMax];
+    double kStamp[raidnow::kKindsMax]; void* kPtr[raidnow::kKindsMax];
+};
+static int RrKindsPod(void* wm, void** out, int* n)
+{
+    __try
+    {
+        const int k = *(const int*)((const char*)wm + kRaidWarKindsOff);
+        void* const* arr = *(void* const* const*)((const char*)wm + kRaidWarKindArrOff);
+        if (k < 0 || k > raidnow::kKindsMax || (k > 0 && !RaidPtrOk(arr))) return 0;
+        for (int i = 0; i < k; ++i) out[i] = arr[i];
+        *n = k;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static void* RrTownFactionPod(void* town)
+{
+    __try { if (!RaidPtrOk(town)) return 0; void* const* vt = *(void* const* const*)town; return ((RrFactionOfFn)vt[0x58 / sizeof(void*)])(town); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* review fold 1 (H1): the target the finder returned is the owner's town AND covered (holder, presence, owner offline) - whatever
+   road the finder took (its first half never asks the lister, where the cut sits) */
+static int RrTargetOk(void* t, void* standIn, int slot)
+{
+    float pos[4] = { 0, 0, 0, 0 }; int holder = -1, nearN = 0;
+    const int own = (RrTownFactionPod(t) == standIn) ? 1 : 0;
+    return raidroll::TargetOk(own, own != 0 ? RrCoverTown(t, slot, pos, &holder, &nearN) : -1);
+}
+/* review fold 1 (M1): the score's town-level test, skipped by the engine for a faction without a PlayerInterface: 1 below the
+   kind's minimum, 0 not, -1 unread */
+const size_t kRrKindTownLevelOff = 0x14, kRrTownLevelOff = 0x388, kRrKindFollowOff = 0x128;   /* kind: minimum town level; town: its level; kind: the 'faction override' follow-up count (decomp_9c8960:130) */
+static int RrBelowTownLevelPod(void* town, void* kind)
+{
+    __try
+    {
+        void* const* vt = *(void* const* const*)town;
+        const int type = ((int (*)(void*))vt[0x20 / sizeof(void*)])(town);
+        return raidroll::BelowTownLevel(type, *(const int*)((const char*)town + kRrTownLevelOff), *(const int*)((const char*)kind + kRrKindTownLevelOff));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* 1 started, 2 the start was called and nothing runs more, 0 no kind joined / no covered target, -2 a fault (r->stage), -3 layout */
+static int RrRollPod(RrRoll* r)
+{
+    const WarCampaignStartFn start = (WarCampaignStartFn)(uintptr_t)AddrAbs(kWarCampaignStartRva);
+    r->stage = 1;
+    __try
+    {
+        void* const* arr = *(void* const* const*)((const char*)r->wm + kRaidWarKindArrOff);
+        if (r->kinds > 0 && !RaidPtrOk(arr)) return -3;
+        r->stage = 2;
+        for (int i = 0; i < r->kinds; ++i)
+        {
+            r->kHas[i] = 0; r->kChance[i] = 0.0f;
+            void* k = arr[i];
+            if (RaidPtrOk(k))
+            {
+                const char* kgd = *(const char* const*)((const char*)k + kRaidKindDataOff);
+                if (!RaidPtrOk(kgd) || RcNamePod(kgd, r->kindNames[i], raidnow::kKindNameMax) == 0) r->kindNames[i][0] = 0;
+            }
+            if (raidnow::KindMatches(r->sel, i, r->kindNames[i]) != 0) ++r->matched;
+            if (!RaidPtrOk(k) || *((const char*)k + kRaidKindEnabledOff) == 0) continue;
+            r->kEnabled[i] = 1; ++r->enabled;
+            void* const* kvt = *(void* const* const*)k;
+            unsigned long long kslot[2] = { 0, 0 };
+            void* t = ((RaidFindTargetFn)kvt[0])(k, r->asked, kslot);
+            if (t == 0) continue;
+            if (RrTargetOk(t, r->standIn, r->slot) == 0) { ++r->uncovered; continue; }   /* H1 */
+            r->kHas[i] = 1; ++r->withTarget;
+            double* st = (double*)((char*)k + kRrKindStampOff);
+            r->stampKind = k; r->stampKeep = *st; r->stampWritten = 1;
+            *st = r->kStamp[i];
+            r->kChance[i] = ((RaidChanceFn)kvt[1])(k, r->standIn, t);
+            *st = r->stampKeep; r->stampWritten = 0;
+            if (RrBelowTownLevelPod(t, k) != 0) { r->kChance[i] = 0.0f; ++r->lowLevel; }   /* M1: the town-level test (unread = no raid) */
+        }
+        if (r->force != 0)
+            r->pick = (r->sel != 0 && r->sel->given != 0) ? raidnow::PickKindSel(r->kHas, r->kChance, r->kindNames, r->kinds, r->sel) : raidnow::PickKind(r->kHas, r->kChance, r->kinds);
+        else
+            r->pick = raidroll::PickWeighted(r->kHas, r->kChance, r->kDraw, r->kinds, r->r01, &r->total);
+        if (r->pick < 0) return 0;
+        r->kind = arr[r->pick];
+        r->chance = r->kChance[r->pick];
+        const char* gd = *(const char* const*)((const char*)r->kind + kRaidKindDataOff);
+        if (!RaidPtrOk(gd) || RcNamePod(gd, r->kindName, (int)sizeof(r->kindName)) == 0) r->kindName[0] = 0;
+        r->stage = 3;
+        void* const* vt = *(void* const* const*)r->kind;
+        unsigned long long slot[2] = { 0, 0 };
+        r->target = ((RaidFindTargetFn)vt[0])(r->kind, r->asked, slot);
+        if (r->target == 0 || RrTargetOk(r->target, r->standIn, r->slot) == 0) { r->target = 0; ++r->uncovered; return 0; }   /* H1 */
+        r->extra = (void*)(uintptr_t)slot[0];
+        ((GetPositionFn)(*(void* const* const*)r->target)[0x40 / sizeof(void*)])(r->target, r->pos);
+        r->stage = 4;
+        r->running = *(const int*)((const char*)r->wm + kRaidWarRunningOff);
+        double* st = (double*)((char*)r->kind + kRrKindStampOff);
+        r->stampKind = r->kind; r->stampKeep = *st; r->stampWritten = 1;
+        r->given = r->kStamp[r->pick];
+        *st = r->given;
+        int* const fo = (int*)((char*)r->kind + kRrKindFollowOff);
+        r->followKeep = *fo; r->followZeroed = 1; *fo = 0;   /* M3: no 'faction override' follow-ups handed to other war managers (decomp_9c8960:130-166) */
+        r->camp = start(r->wm, r->target, r->kind, r->extra);
+        *fo = r->followKeep; r->followZeroed = 0;
+        r->seen = *st;
+        *st = r->stampKeep; r->stampWritten = 0;
+        r->runningAfter = *(const int*)((const char*)r->wm + kRaidWarRunningOff);
+        return r->runningAfter > r->running ? 1 : 2;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (r->stampWritten != 0) { __try { *(double*)((char*)r->stampKind + kRrKindStampOff) = r->stampKeep; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        if (r->followZeroed != 0) { __try { *(int*)((char*)r->kind + kRrKindFollowOff) = r->followKeep; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        return -2;
+    }
+}
+static double* RrStampFor(void* kind, int slot)
+{
+    for (size_t i = 0; i < g_rrStamps.size(); ++i) if (g_rrStamps[i].kind == kind && g_rrStamps[i].slot == slot) return &g_rrStamps[i].stamp;
+    RrStamp s; s.kind = kind; s.slot = slot; s.stamp = 0.0;   /* 0.0 = unset, as the engine's own (0x791080: due) */
+    g_rrStamps.push_back(s);
+    return &g_rrStamps.back().stamp;
+}
+static std::string RrHex(unsigned long long v) { char b[32]; _snprintf(b, 31, "%llX", v); b[31] = 0; return b; }
+static std::string RrP(const void* p) { char b[32]; _snprintf(b, 31, "%p", p); b[31] = 0; return b; }
+/* a faction's name: only for a faction the directory lists (the raiders' faction, found there) - no read of an unknown pointer */
+static std::string RrFactionName(void* f)
+{
+    if (!RaidPtrOk(f)) return std::string("?");
+    return ((::Faction*)f)->getName();
+}
+static void* RrWarOfPod(void* faction)
+{
+    __try { void* wm = *(void**)((char*)faction + kRaidWarManagerOff); return RaidPtrOk(wm) ? wm : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* one roll of war manager wm for owner `slot` (its stand-in standIn); force (the TEST-ONLY lever): no dice, the highest chance of the
+   kinds the choice names. Returns the RrRollPod code; *line the [RAIDROLL] line (empty = nothing to print). MAIN THREAD. */
+static int RrRollOne(void* wm, void* raiders, void* standIn, int slot, int force, const raidnow::KindSel* sel, std::string* line)
+{
+    line->clear();
+    RrRoll* r = new RrRoll;
+    std::memset(r, 0, sizeof(*r));
+    r->wm = wm; r->standIn = standIn; r->force = force; r->sel = sel; r->pick = -1; r->slot = slot;
+    void* kinds[raidnow::kKindsMax]; int nk = 0;
+    if (RrKindsPod(wm, kinds, &nk) != 1) { delete r; ++g_rrFaults; *line = "[RAIDROLL] roll not made: the war manager's kinds unreadable"; return -3; }
+    r->kinds = nk;
+    for (int i = 0; i < nk; ++i) { r->kPtr[i] = kinds[i]; r->kStamp[i] = *RrStampFor(kinds[i], slot); r->kDraw[i] = RrRand01(); }
+    r->r01 = RrRand01();
+    /* the finder's first half reads the GIVEN faction's war manager: the stand-in when it has one, else this game's player faction
+       (whose towns the target test below refuses) */
+    r->asked = RrWarOfPod(standIn) != 0 ? standIn : RrPlayerFactionPod();
+    RrSpotsRead();
+    g_rrOverride = standIn; g_rrOverrideSlot = slot;
+    const long long keptBefore = g_rrTownsKept, cutBefore = g_rrTownsCut;
+    const int rc = RaidPtrOk(r->asked) ? RrRollPod(r) : -2;
+    g_rrOverride = 0; g_rrOverrideSlot = -1;
+    if (r->pick >= 0 && rc >= 1)
+    {
+        double* st = RrStampFor(r->kind, slot);
+        *st = raidroll::StampAfterStart(*st, r->given, r->seen);
+    }
+    double now = -1.0; RrNowPod(&now);
+    const std::string who = coop::TeamPlayerName(slot);
+    char b[900];
+    const std::string head = "[RAIDROLL] " + std::string(force != 0 ? "lever roll (TEST-ONLY, timer and dice skipped)" : "roll") + ": raiders '" + RrFactionName(raiders)
+                             + "' for offline owner slot " + N((long long)slot) + (who.empty() ? std::string() : " '" + who + "'") + " (stand-in " + RrP(standIn) + ")";
+    const long long kept = g_rrTownsKept - keptBefore, cut = g_rrTownsCut - cutBefore;
+    if (rc == -2 || rc == -3) { ++g_rrFaults; _snprintf(b, 899, " - FAULT at stage %d (1 reading, 2 asking the kinds, 3 the second ask, 4 the start) - nothing started", r->stage); b[899] = 0; *line = head + b; }
+    else if (rc == 0 && r->withTarget == 0)
+    {
+        ++g_rrNoTargets;
+        _snprintf(b, 899, " - no kind found a covered base (%d kinds, %d enabled; towns kept %lld cut %lld; targets refused %d) worldTime %.3f", r->kinds, r->enabled, kept, cut, r->uncovered, now);
+        b[899] = 0; if (force != 0 || kept > 0) *line = head + b;
+    }
+    else if (rc == 0)
+    {
+        ++g_rrNoPick;
+        _snprintf(b, 899, " - %d kinds with a covered base, none won its draw (total %.4f; below town level %d; targets refused %d) worldTime %.3f - nothing started", r->withTarget, (double)r->total, r->lowLevel, r->uncovered, now);
+        b[899] = 0; *line = head + b;
+    }
+    else
+    {
+        if (rc == 1) ++g_rrStarted; else ++g_rrNotStarted;
+        _snprintf(b, 899, " - kind #%d '%s' chance %.4f (%d with a covered base) target=%p at (%.0f, %.0f) %s campaign=%p running %d -> %d; repeat stamp %.3f (kind's own kept) worldTime %.3f",
+                  r->pick, r->kindName, (double)r->chance, r->withTarget, r->target, (double)r->pos[0], (double)r->pos[2],
+                  rc == 1 ? "STARTED through the engine's start" : "start called, NOT started (the engine's weakness / no squads)", r->camp, r->running, r->runningAfter, r->seen, now);
+        b[899] = 0; *line = head + b;
+    }
+    if (force != 0)
+    {
+        std::string ks;
+        for (int i = 0; i < r->kinds && i < raidnow::kKindsMax; ++i)
+        {
+            char k[200];
+            if (r->kHas[i] != 0) _snprintf(k, 199, " #%d '%s' enabled=%d target=1 chance=%.4f;", i, r->kindNames[i], (int)r->kEnabled[i], (double)r->kChance[i]);
+            else _snprintf(k, 199, " #%d '%s' enabled=%d target=0;", i, r->kindNames[i], (int)r->kEnabled[i]);
+            k[199] = 0; ks += k;
+        }
+        *line += " - kinds:" + ks;
+    }
+    delete r;
+    return rc;
+}
+static void* RrRaidersOfWm(void* wm);   /* below (L3: walked only when a roll is made) */
+/* this war manager's roll for every offline teammate whose timer is due */
+static void RrRollFor(void* wm, void* raiders, const RrWar& w, double now)
+{
+    void* facs[kRrOwnersMax]; int slots[kRrOwnersMax];
+    const int nf = coop::PolicyTeamBaseFactions(facs, slots, kRrOwnersMax);
+    const int me = coop::MySlotForWire();
+    for (int i = 0; i < nf; ++i)
+    {
+        const int s = slots[i];
+        if (s == me || !coop::TeamSameAnyThread(me, s)) continue;
+        const int inWorld = coop::StoreRosterSlotInWorld(s);
+        if (inWorld != 0) { if (inWorld == 1) ++g_rrOwnerOnline; continue; }   /* online: the owner's engine rolls; unknown: nobody */
+        RrTimer* t = 0;
+        for (size_t k = 0; k < g_rrTimers.size(); ++k) if (g_rrTimers[k].wm == wm && g_rrTimers[k].slot == s) t = &g_rrTimers[k];
+        if (raidroll::RollDue(t != 0 ? 1 : 0, t != 0 ? t->next : 0.0, now) == 0) continue;
+        if (t == 0) { RrTimer nt; nt.wm = wm; nt.slot = s; nt.next = 0.0; g_rrTimers.push_back(nt); t = &g_rrTimers.back(); }
+        t->next = now + raidroll::kRollHours;
+        int busy = 0;
+        for (int c = 0; c < w.n; ++c) if (raidroll::BusyFor(RrCampSlot(w.tfac[c]), s) != 0) busy = 1;   /* M2: the roller's own or a borrowed one */
+        if (busy != 0) { ++g_rrBusy; continue; }
+        ++g_rrRolls;
+        std::string line;
+        if (raiders == 0) raiders = RrRaidersOfWm(wm);
+        RrRollOne(wm, raiders, facs[i], s, 0, 0, &line);
+        if (!line.empty()) DebugLog(line);
+    }
+}
+static void* RrRaidersOfWm(void* wm);   /* below */
+static void detour_rrWarUpdate(void* wm)
+{
+    if (g_mainThread == 0 || ::GetCurrentThreadId() != g_mainThread || g_rrInUpdate != 0 || !RaidPtrOk(wm))
+    {
+        if (g_mainThread != 0 && ::GetCurrentThreadId() != g_mainThread) ::InterlockedIncrement64(&g_rrOffMain);   /* L2: the main-thread assumption (Read) seen broken */
+        orig_rrWarUpdate(wm); return;
+    }
+    RrWar w; std::memset(&w, 0, sizeof(w));
+    double now = 0.0;
+    if (RrWarReadPod(wm, &w) != 1 || w.kinds == 0 || RrNowPod(&now) != 1) { orig_rrWarUpdate(wm); return; }
+    /* 1. the engine's own roll keeps its rate: roller campaigns out of its running list when they alone would stop a due roll */
+    void* hidden[kRrCampsMax]; int nh = 0, others = 0;
+    for (int c = 0; c < w.n; ++c) { if (RrCampIsRoller(w.camps[c], w.tfac[c], 0) != 0) hidden[nh++] = w.camps[c]; else ++others; }
+    int hide = raidroll::HideForUpdate(raidroll::WarTimerDue(w.timer, now), w.waiting, others, nh, w.cap);
+    int out = 0;
+    if (hide != 0) for (int c = 0; c < nh; ++c) if (RrListOutPod(wm, hidden[c]) == 1) ++out;
+    if (hide != 0) g_rrHidden += out;
+    g_rrInUpdate = 1;
+    orig_rrWarUpdate(wm);
+    g_rrInUpdate = 0;
+    if (hide != 0)
+    {
+        int back = 0;
+        for (int c = 0; c < nh; ++c) if (RrListBackPod(wm, hidden[c]) == 1) ++back;
+        if (back != out) { g_rrBackFail += out - back; ErrorLog("[RAIDROLL] ERROR: " + N((long long)(out - back)) + " roller campaign(s) NOT put back in war manager " + RrP(wm) + "'s running list after its update"); }
+    }
+    /* 2. this war manager's roll for the offline teammates (a waiting or running raid on a base keeps it busy - no call-off, owner 1579 a) */
+    if (RrWarReadPod(wm, &w) != 1) return;
+    RrRollFor(wm, 0, w, now);
+}
+/* the raiders' faction of a war manager: the faction whose +0x88 it is (the faction directory walked; 0 when not found) */
+static void* RrRaidersOfWm(void* wm)
+{
+    ::GameWorld* gw = GameWorldPtr();
+    if (!RaidPtrOk(gw) || !RaidPtrOk(gw->factionDirectory)) return 0;
+    const lektor<Faction*>* all = 0;
+    __try { all = gw->factionDirectory->allFactions(); } __except (EXCEPTION_EXECUTE_HANDLER) { all = 0; }
+    if (!RaidPtrOk(all)) return 0;
+    __try
+    {
+        const unsigned n = *(const unsigned*)((const char*)all + 0x08);
+        Faction* const* d = *(Faction* const* const*)((const char*)all + 0x10);
+        for (unsigned i = 0; i < n && i < 4096; ++i)
+            if (RaidPtrOk(d[i]) && *(void**)((char*)d[i] + kRaidWarManagerOff) == wm) return d[i];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+std::string RaidRollStatus()
+{
+    return "rrHooked[war,towns]=" + N((long long)g_rrHooked[0]) + "," + N((long long)g_rrHooked[1])
+           + " raidRoll[rolls,noTarget,noPick,busy,started,notStarted,ownerOnline]=" + N(g_rrRolls) + "," + N(g_rrNoTargets) + "," + N(g_rrNoPick) + "," + N(g_rrBusy) + "," + N(g_rrStarted) + "," + N(g_rrNotStarted) + "," + N(g_rrOwnerOnline)
+           + " raidRollTowns[kept,cut]=" + N(g_rrTownsKept) + "," + N(g_rrTownsCut)
+           + " raidRollHide[hidden,backFail]=" + N(g_rrHidden) + "," + N(g_rrBackFail) + " raidRollFaults=" + N(g_rrFaults)
+           + " raidRollOffMain=" + N((long long)::InterlockedCompareExchange64(&g_rrOffMain, 0, 0));
+}
+/* `raidnow roller <faction name> [kind ..]` (TEST-ONLY, T-1122 roller): that raiders' war manager rolls NOW for every offline
+   teammate this game covers, through the roller's own road (the finder asked for the stand-in and cut to the covered towns, the
+   score with the owner's stamp, the engine's start) with the timer and the dice skipped - the highest chance of the kinds the
+   choice names, as raidnow; an owner online / not in this game's team gets one line saying so and nothing is rolled for it.
+   `raidnow roller status`: the [RAIDROLL] REPORT line. MAIN THREAD. */
+std::string RaidRollLever(const std::string& rest)
+{
+    if (g_mainThread != 0 && ::GetCurrentThreadId() != g_mainThread) { ErrorLog("[RAIDROLL] lever error: not on the main thread"); return "error raidroll not main thread"; }
+    {
+        const size_t s = rest.find_first_not_of(" \t\r\n"), e = rest.find_last_not_of(" \t\r\n");
+        if (s != std::string::npos && rest.substr(s, e - s + 1) == "status") { DebugLog("[RAIDROLL] REPORT " + RaidRollStatus()); return "ok raidroll status"; }
+    }
+    std::string name; raidnow::KindSel sel;
+    if (raidnow::ParseArgs(rest, &name, &sel) == 0) { ErrorLog("[RAIDROLL] lever error: usage raidnow roller <faction name> [kind <name piece|#index>] | raidnow roller status"); return "error raidroll usage"; }
+    if (orig_rrWarUpdate == 0 || orig_rrTownsOf == 0 || kWarCampaignStartRva == 0) { ErrorLog("[RAIDROLL] lever error: the roller's hooks are not in (" + RaidRollStatus() + ") - nothing rolled"); return "error raidroll not hooked"; }
+    ::GameWorld* gw = GameWorldPtr();
+    if (!RaidPtrOk(gw) || !RaidPtrOk(gw->factionDirectory)) { ErrorLog("[RAIDROLL] lever error: no world loaded"); return "error raidroll no world"; }
+    ::Faction* f = gw->factionDirectory->findFactionByName(name);
+    if (!RaidPtrOk(f)) { ErrorLog("[RAIDROLL] lever error: faction '" + name + "' not found - nothing rolled"); return "error raidroll not found"; }
+    void* const wm = RrWarOfPod((void*)f);
+    RrWar w; std::memset(&w, 0, sizeof(w));
+    if (!RaidPtrOk(wm) || RrWarReadPod(wm, &w) != 1) { ErrorLog("[RAIDROLL] lever error: faction '" + name + "' has no readable war manager - nothing rolled"); return "error raidroll no war manager"; }
+    void* facs[kRrOwnersMax]; int slots[kRrOwnersMax];
+    const int nf = coop::PolicyTeamBaseFactions(facs, slots, kRrOwnersMax);
+    const int me = coop::MySlotForWire();
+    int rolled = 0, started = 0;
+    for (int i = 0; i < nf; ++i)
+    {
+        const int s = slots[i];
+        if (s == me) continue;
+        const int team = coop::TeamSameAnyThread(me, s) ? 1 : 0;
+        const int inWorld = coop::StoreRosterSlotInWorld(s);
+        if (team == 0 || inWorld != 0)
+        {
+            DebugLog("[RAIDROLL] lever (TEST-ONLY): raiders '" + name + "' owner slot " + N((long long)s) + " - " + (team == 0 ? "not in this game's team" : inWorld == 1 ? "owner ONLINE (the owner's game rolls; nothing rolled here)" : "no roster (nothing rolled)"));
+            continue;
+        }
+        int busy = 0;
+        for (int c = 0; c < w.n; ++c) if (raidroll::BusyFor(RrCampSlot(w.tfac[c]), s) != 0) busy = 1;   /* M2: the roller's own or a borrowed one */
+        if (busy != 0)
+        {
+            std::string ph;   /* each campaign aimed at that base: its phase (0 travelling or waiting at the base, 1 its talk / assault, 2 over) */
+            for (int c = 0; c < w.n; ++c) if (raidroll::BusyFor(RrCampSlot(w.tfac[c]), s) != 0) ph += " campaign=" + RrP(w.camps[c]) + " phase=" + N((long long)w.phase[c]) + (coop::StoreRaidCampBorrowed(w.camps[c]) != 0 ? " (borrowed)" : "") + ";";
+            DebugLog("[RAIDROLL] lever (TEST-ONLY): raiders '" + name + "' owner slot " + N((long long)s) + " - busy (a campaign of this war manager targets that base:" + ph + ") - nothing rolled");
+            continue;
+        }
+        std::string line;
+        ++rolled;
+        if (RrRollOne(wm, f, facs[i], s, 1, &sel, &line) == 1) ++started;
+        if (!line.empty()) DebugLog(line);
+    }
+    if (rolled == 0) DebugLog("[RAIDROLL] lever (TEST-ONLY): raiders '" + name + "' - no offline teammate's base to roll for (" + N((long long)nf) + " player factions known)");
+    return "ok raidroll " + name + " rolled " + N((long long)rolled) + " started " + N((long long)started);
+}
+void RaidRollInstall(uintptr_t base)
+{
+    g_rrState ^= ((unsigned long long)::GetTickCount() + 1ull) * 0x9E3779B97F4A7C15ull;
+    if (kRrWarUpdateRva == 0 || kRrTownsOfRva == 0 || kWarCampaignStartRva == 0)
+    { ErrorLog("[RAIDROLL] not installed: an address row is unbound (FactionWarMgrUpdate / TownsOfFaction / WarCampaignStart) - an offline owner's base gets no raids here"); return; }
+    /* the lister first: the war-manager hook leans on it */
+    if (coop::AddHook((void*)(base + kRrTownsOfRva), (void*)&detour_rrTownsOf, (void**)&orig_rrTownsOf) != coop::SUCCESS) { ErrorLog("[RAIDROLL] not installed: the town lister hook failed"); return; }
+    g_rrHooked[1] = 1;
+    if (coop::AddHook((void*)(base + kRrWarUpdateRva), (void*)&detour_rrWarUpdate, (void**)&orig_rrWarUpdate) != coop::SUCCESS) { ErrorLog("[RAIDROLL] partly installed: the war manager hook failed - no roll"); return; }
+    g_rrHooked[0] = 1;
+    DebugLog("[RAIDROLL] installed: war manager update exe+0x" + RrHex(kRrWarUpdateRva) + ", town lister exe+0x" + RrHex(kRrTownsOfRva)
+             + " - an offline teammate's base is rolled by the game in charge of its area while a team member is within 2500 (owner 1577 c); no call-off - a raid waits at the base as in single player (owner 1579 a)");
+}
 } // namespace coop
 namespace coop { int TownGenTownSid(void* town, char* out, int cap) { return TownSidPod(town, out, cap); } }
+namespace coop { void TownGenNobodyYetCharacter(int sx, int sy, void* caller) { T1261NobodyYet(3, std::string(), sx, sy, caller); } }   /* see towngen.h */
 namespace coop { int TownGenTownPos(void* town, float* pos) { return (town == 0 || pos == 0) ? 0 : TownPosPod(town, pos); } }   /* see towngen.h */
+namespace coop {
+/* T-4: a town clock record from the world server (store.cpp ApplyRemoteRecord; a stored record, live or sent back with a refusal). It
+   becomes the accepted record when newer, and the working one unless this game's newer write is in flight (towntime.h TtOnArrive).
+   MAIN THREAD (the link's drain). */
+void TownTimeArrive(const std::string& id, const std::vector<char>& bytes)
+{
+    towntime::TownTimeRec r;
+    const int d = bytes.empty() ? towntime::kTtShort : towntime::DecodeTownTimeRec(&bytes[0], bytes.size(), &r);
+    if (d != towntime::kTtOk || towntime::MakeTownTimeId(r.sx, r.sy, r.sid) != id)
+    {
+        ++g_ttBad;
+        TtLine("[TOWNTIME] record " + id + " received but NOT kept: " + (d != towntime::kTtOk ? std::string(towntime::TownTimeDecodeWhy(d)) : std::string("its square and sid name another town")));
+        return;
+    }
+    ++g_ttArrived;
+    TtTown& T = g_tt[id];
+    if (towntime::TtOnArrive(&T.k, r) == 0) { ++g_ttOlder; return; }
+    ++g_ttTaken;
+    TtLine("[TOWNTIME] record " + id + " taken - " + TtRecText(r));
+}
+/* T-4 fold 3: a new link's WELCOME (store.cpp, beside TownLossReset): a write sent before the link dropped may never be answered - each
+   town's write in flight goes back to the accepted record (towntime.h TtOnLinkNew); the clock is judged again once the new link's
+   records of the town's area are in (the AREA_DONE gate is reset with the link). MAIN THREAD. */
+void TownTimeLinkNew()
+{
+    for (std::map<std::string, TtTown>::iterator t = g_tt.begin(); t != g_tt.end(); ++t)
+        if (towntime::TtOnLinkNew(&t->second.k) != 0)
+        {
+            ++g_ttLinkGaveUp;
+            TtLine("[TOWNTIME] " + t->first + " - a write sent before the link dropped was never answered: back to the accepted record " + (t->second.k.have != 0 ? TtRecText(t->second.k.r) : std::string("(none)")));
+        }
+}
+/* T-4 fold 2 B: the world server stored this game's write sent with `stamp` (store.cpp's RECORD echo): it is the accepted record now */
+void TownTimeEcho(const std::string& id, int hasStamp, long long stamp)
+{
+    if (hasStamp == 0) return;
+    std::map<std::string, TtTown>::iterator t = g_tt.find(id);
+    if (t == g_tt.end()) return;
+    const int was = t->second.k.inflight;
+    towntime::TtOnEcho(&t->second.k, stamp);
+    if (was != 0 && t->second.k.inflight == 0) ++g_ttEchoed;
+}
+/* T-4: the world server refused this game's write (items.cpp BoxRefuseArrive): back to the last accepted record (towntime.h
+   TtOnRefuse), the next write above the stored generation; an older / same-generation refusal comes with the stored record. */
+void TownTimeRefuseArrive(const std::string& id, int reason, unsigned int storedGen, unsigned int sentGen)
+{
+    ++g_ttRefused;
+    TtTown& T = g_tt[id];
+    towntime::TtOnRefuse(&T.k, storedGen);
+    TtLine("[TOWNTIME] write " + id + " REFUSED - " + coopbrec::BoxRefuseWhy(reason) + " (stored generation " + N((long long)storedGen) + ", sent " + N((long long)sentGen)
+           + ") - back to the accepted record " + (T.k.have != 0 ? TtRecText(T.k.r) : std::string("(none)")));
+}
+}
 namespace coop { int TownGenResidentsGate(void* factory, void* building) { return T392ResidentsGate(factory, building); } }   /* T-392 (owner 335 a): see towngen.h */
 namespace coop { int TownGenPlatoonHomeKey(const void* platoon, char* out, int cap) { return T591HomeKey(platoon, out, cap); } }   /* see towngen.h */
 namespace coop { int TownGenRepairMarks(const std::string& buildingKey, int* repaired, int* owedSettling) { *repaired = 0; *owedSettling = 0; if (buildingKey.empty()) return 0; TgLockInit(); ::EnterCriticalSection(&g_tgLock); *repaired = (g_t392Repaired.count(buildingKey) != 0) ? 1 : 0; ::LeaveCriticalSection(&g_tgLock); *owedSettling = OwedSettling(owedpop::kKindResidents, buildingKey); return 1; } }   /* T-984 (TEST lever's read): see towngen.h */
 namespace coop { int TownGenGiveHomeTo(void* platoon, void* building) { return T591GiveHomeTo(platoon, building); } }   /* see towngen.h */
 namespace coop { void TownGenUnparkAfterPublish() { T1099UnparkWalk(); } }   /* T-1099: see towngen.h */
+static void* T1334ResidentGroupPod(void* building)   /* T-1334 TEST-ONLY read: the building's residents hand (+0xD0) -> its group (hand::getSquad), 0 none or a fault */
+{
+    __try { return (void*)((const hand*)((const char*)building + 0xD0))->getSquad(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+namespace coop { void* TownGenResidentGroupOf(void* building) { return building == 0 ? 0 : T1334ResidentGroupPod(building); } }   /* see towngen.h */
 namespace coop { int TownGenGiveHomeByKey(void* platoon, const char* key) { if (platoon == 0 || key == 0 || key[0] == 0) return 0; void* const b = ObjectByPositionKey(key); return b == 0 ? 3 : T591GiveHomeTo(platoon, b); } }   /* see towngen.h */
 namespace coop { int TownGenPlayerHouse(void* building) { return T805PlayerHouse(building); } }   /* see towngen.h */
 namespace coop { int TownGenPlayerHouseSkip(void* building, int rerun) { return T805PopulateSkip(building, rerun); } }   /* see towngen.h */
@@ -5302,6 +6810,31 @@ void RefillNoteRows(const std::vector<char>& payload)
 }
 /* towns2: the TEST verb `townres` / `towns2` (MAIN THREAD) */
 namespace coop {
+/* T-4 TEST-ONLY lever (command file only): `towntime period <hours 1-120>` sets the period every NEW due is written with on this
+   game (due = now + period: the first record, a finished period walk, the clock-back rewrite); `towntime period show` reads it.
+   Nothing else changes - the owed / marked lists, sight, the walk, the record's bytes and the world server's judge are the
+   players'. One capped line per change. MAIN THREAD. */
+std::string TownTimePeriodCommand(const std::string& args)
+{
+    double h = 0.0;
+    const int k = towntime::TtPeriodLeverParse(args, &h);
+    if (k == 0) return "error towntime: period <hours 1-120> | period show (TEST-ONLY)";
+    if (k == 2) return "ok towntime period " + TtHours(g_ttPeriodHours) + " h (default " + TtHours(towntime::kTtPeriodHours) + " h, sets " + N(g_ttPeriodSets) + ")";
+    const double was = g_ttPeriodHours;
+    g_ttPeriodHours = h;
+    if (h != was)
+    {
+        ++g_ttPeriodSets;
+        if (g_ttPeriodLines < kTtPeriodLineCap)
+        {
+            ++g_ttPeriodLines;
+            DebugLog("[TOWNTIME] TEST-ONLY period " + TtHours(h) + " h (was " + TtHours(was) + " h): every NEW due on this game is now + " + TtHours(h)
+                     + " h, and a held record due more than one period ahead is rewritten once (the clock-back road) - give both games the same value (line "
+                     + N(g_ttPeriodLines) + " of " + N(kTtPeriodLineCap) + ")");
+        }
+    }
+    return "ok towntime period " + TtHours(h) + " h (was " + TtHours(was) + " h)";
+}
 std::string Towns2Command(const std::string& args)
 {
     std::vector<std::string> tok;
@@ -5317,7 +6850,7 @@ std::string Towns2Command(const std::string& args)
     if (tok.empty())
         return "ok townres checks=" + N(g_t2Checks) + " walks=" + N(g_t2Walks) + " queued=" + N(g_t2Queued) + " asked=" + N(g_t2Asked) + " rebuilt=" + N(g_t2Rebuilt)
                + " queueNow=" + N((long long)g_t2Queue.size()) + " forcedPending=" + N((long long)g_t2Forced.size()) + " killPending=" + N((long long)g_t2Kill.size()) + " hook=" + N((long long)(g_t2Hooked ? 1 : 0));
-    const std::string usage = "error townres: townres [now <town stringID or name> [nosight] | kill <town stringID or name> <n> [res|pat] [regen|noregen] [all] | show <town stringID or name>]";
+    const std::string usage = "error townres: townres [now <town stringID or name> [nosight] | kill <town stringID or name> <n> [res|pat] [regen|noregen] [all|leader] | show <town stringID or name>]";
     if (tok[0] == "now")
     {
         size_t end = tok.size();
@@ -5348,13 +6881,10 @@ std::string Towns2Command(const std::string& args)
         int flags = 0;
         while (end > 3)
         {
-            const std::string o = RfLower(tok[end - 1]);
-            if (o == "res") { flags &= ~kT2KillPat; --end; }
-            else if (o == "pat") { flags |= kT2KillPat; --end; }
-            else if (o == "regen") { flags = (flags & ~kT2KillNoRegen) | kT2KillRegen; --end; }
-            else if (o == "noregen") { flags = (flags & ~kT2KillRegen) | kT2KillNoRegen; --end; }
-            else if (o == "all") { flags |= kT2KillAll; --end; }
-            else break;
+            const int ko = coopt2::KillOptWord(RfLower(tok[end - 1]), kT2DevBuild, &flags);   /* T2333: the option words, read in one place (tested) */
+            if (ko < 0) return "error townres: kill .. leader is a DEV-build TEST option - this is a release build";
+            if (ko == 0) break;
+            --end;
         }
         if (end < 3) return usage;
         const std::string& ns = tok[end - 1];
@@ -5366,7 +6896,7 @@ std::string Towns2Command(const std::string& args)
         if (town.size() >= 2 && (town[0] == '\'' || town[0] == '"') && town[town.size() - 1] == town[0]) town = town.substr(1, town.size() - 2);
         if (town.empty()) return usage;
         g_t2Kill[RfLower(town)] = n | flags;
-        const std::string what = N((long long)n) + ((flags & kT2KillPat) != 0 ? " pat" : " res") + ((flags & kT2KillRegen) != 0 ? " regen" : ((flags & kT2KillNoRegen) != 0 ? " noregen" : "")) + ((flags & kT2KillAll) != 0 ? " all" : "");
+        const std::string what = N((long long)n) + ((flags & kT2KillPat) != 0 ? " pat" : " res") + ((flags & kT2KillRegen) != 0 ? " regen" : ((flags & kT2KillNoRegen) != 0 ? " noregen" : "")) + ((flags & kT2KillAll) != 0 ? " all" : "") + ((flags & kT2KillLeader) != 0 ? " leader" : "");
         DebugLog("[TOWNS2] townres kill: '" + RfStr(town.c_str()) + "' " + what + " - at its next check-up on the game that holds it (TEST)");
         return "ok townres kill '" + town + "' " + what + " - at its next check-up on the game that holds it";
     }

@@ -32,7 +32,7 @@
 
 namespace coopor {
 
-/* (1b) p97-op - P97 (owner 334 a / 337 a): THE LEAF GATE'S LINKED ARM.  `may` is MayInventFromView's answer:
+/* (1b) p97-op - P97 (owner 334 a / 337 a): THE LEAF GATE'S LINKED ARM.  `may` is MayMakeFromView's answer (T-1261):
    > 0 this game invents here, 0 it does not, < 0 no fresh area map (the caller takes the teardown answer apart
    first).  With no fresh map EVERY game refuses.  The retired bounded wait let the game holding slot 0 generate
    once 20 s had passed; neither the slot nor the length of the outage is an input here, so neither can move the
@@ -43,12 +43,33 @@ inline int LeafLinked(int may) { return may > 0 ? kLeafLinkedAllow : (may == 0 ?
    refuses the creation unless the character is the player's own faction (T-230: the new-game squad). */
 inline int LeafCreationRefused(int gated, int isPlayerFaction) { return (gated != 0 && isPlayerFaction == 0) ? 1 : 0; }
 
-/* (1c) P97: THE ANNOUNCE SWEEP'S AREA ANSWER (worldsync.cpp AnnounceAreaDecide).  heldByOther is HeldByOtherTS's
-   answer as in (1).  Adoptable only where the map answered and no other game holds the area; with no fresh map the
-   sweep skips on every game, whatever its slot.  Nothing is lost: the sweep re-walks every un-adopted character
-   each pass, so the holder adopts and announces once the map is fresh again. */
-const int kAnnounceAdoptable = 0, kAnnounceOtherHeld = 1, kAnnounceNoMap = 2;
-inline int AnnounceArea(int heldByOther) { return heldByOther == 1 ? kAnnounceOtherHeld : (heldByOther < 0 ? kAnnounceNoMap : kAnnounceAdoptable); }
+/* (1c) P97: THE ANNOUNCE SWEEP'S AREA ANSWER (worldsync.cpp AnnounceAreaDecide).  heldByOther and mine come from ONE
+   area-map read (zones' AreaViewTS: held / mine; 1 yes, 0 no, < 0 no fresh map or a frozen area).  Adoptable only where
+   the world server names THIS game the area's holder (owner decision 1531, holder-only); with no fresh map the sweep skips
+   on every game, whatever its slot.
+   T-1268: A FOURTH ANSWER, "nobody holds it yet" (the map is fresh, no other game holds the area, and it does not name this
+   game).  Before T-1268 that case was adoptable, so two games arriving together at an unheld town BOTH gave one save-born
+   person a fresh id, and the other game showed two of them until the two-runner check.  It is skipped exactly as "no map":
+   nothing is noted for the orphan clean-up, and nothing is lost - the sweep re-walks every un-adopted character each pass,
+   so the game the map then names adopts and announces at its next pass (the naming ends the wait, no timer). */
+const int kAnnounceAdoptable = 0, kAnnounceOtherHeld = 1, kAnnounceNoMap = 2, kAnnounceNobodyYet = 3;
+inline int AnnounceArea(int heldByOther, int mine)
+{
+    if (heldByOther == 1) return kAnnounceOtherHeld;
+    if (heldByOther < 0) return kAnnounceNoMap;
+    return mine == 1 ? kAnnounceAdoptable : kAnnounceNobodyYet;
+}
+/* T-1268 fold 1 (review M2): THE SWEEP'S ANSWER AS THE RE-WOKEN SQUAD'S AREA READ (handoff.cpp RewakeAreaHeldByOther, cooplo::
+   AdoptAfterRewakeWait): 1 another game holds it, 0 the map names this game (the sweep adopts here), -1 no fresh map, -2 nobody holds it
+   yet (the sweep waits for the naming, so the release waits too). */
+const int kRewakeAreaNobodyYet = -2;
+inline int RewakeAreaOf(int announceAnswer)
+{
+    if (announceAnswer == kAnnounceOtherHeld) return 1;
+    if (announceAnswer == kAnnounceAdoptable) return 0;
+    if (announceAnswer == kAnnounceNobodyYet) return kRewakeAreaNobodyYet;
+    return -1;
+}
 
 /* (2) THE CLEANUP'S ACTION for one queued character on this pass. */
 enum {

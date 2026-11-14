@@ -1,7 +1,8 @@
 #pragma once
 /* src/common/doorrec.h - ONE WORLD DOOR AS ONE WORLD-SERVER RECORD.
  *
- * One record per door of a building no player owns (a town's house doors and its gates), id `door.<sx>.<sy>.#<hash8>`: the door's
+ * One record per door (a town's house doors and its gates; T-1082: a player's piece's doors too, carrying only the lock word, a gate's
+ * open / closed state and the lock's hardness - DoorRecPlayerFields - and health -1 as its mark), id `door.<sx>.<sy>.#<hash8>`: the door's
  * area square (the "@x,y@" field of its position key, 0..63 each, plain decimal) and the FNV-1a hash of its whole key in eight
  * lower-case hex digits. The key is the door road's own (doors.cpp DoorKeyBuild: a house door's position key, a gate's gateway
  * building key with "gate" appended) and travels in the record, so a reader checks that the record it holds names that very door
@@ -37,7 +38,7 @@
 
 namespace doorrec {
 
-const unsigned int kProtocol = 145;            /* the world-server protocol that carries door records */
+const unsigned int kProtocol = 153;            /* the world-server protocol that carries door records */
 
 
 const unsigned int kDrMarker = 0x31524F44u;    /* 'D','O','R','1' little-endian */
@@ -266,8 +267,18 @@ inline int DrKeyArea(const char* key)
     return DrAreaIndex(sx, sy);
 }
 /* which of the record's facts a door's live values change: the open / closed state (a gate's only), the lock word, broken, the lock's
-   level or hardness, the lock's broken flag. Health rides with any write and is no trigger of its own (every hit moves it). */
+   level or hardness, the lock's broken flag, and (T-1333 fold 3, owner 1083 a) a town door's health - a hit's or a repair's health
+   alone writes the record, so a half-bashed door looks the same on every game. Health rides with any write. */
 const int kDrChState = 1, kDrChLock = 2, kDrChBroken = 4, kDrChLevel = 8, kDrChLockBroken = 16;
+const int kDrChHardness = 32;   /* T-1082: a player's piece's door's lock hardness (a town door's rides kDrChLevel with its level) */
+const int kDrChHealth = 64;     /* T-1333 fold 3: a town door's health (a player's piece's door's lives on its piece record: never this bit) */
+const float kDrHealthEps = 0.01f;   /* T-1333 fold 3: health closer than this to the record's is no change (a hit moves it by ~1 of 16) */
+/* 1 = two healths differ by more than kDrHealthEps (a NaN on either side differs) */
+inline int DrHealthDiffers(float a, float b)
+{
+    const float d = a - b;
+    return (d > kDrHealthEps || d < -kDrHealthEps || d != d) ? 1 : 0;
+}
 inline int DoorRecChangeMask(int haveRec, const DoorRec& rec, const DoorRec& live)
 {
     if (haveRec == 0) return (live.gate != 0 ? kDrChState : 0) | kDrChLock | kDrChBroken | kDrChLevel | kDrChLockBroken;
@@ -277,6 +288,7 @@ inline int DoorRecChangeMask(int haveRec, const DoorRec& rec, const DoorRec& liv
     if (live.broken != rec.broken) m |= kDrChBroken;
     if (live.hasLock != 0 && (live.lockLevel != rec.lockLevel || live.hardness != rec.hardness)) m |= kDrChLevel;
     if (live.hasLock != 0 && live.lockBroken != rec.lockBroken) m |= kDrChLockBroken;
+    if (DrHealthDiffers(live.health, rec.health) != 0) m |= kDrChHealth;   /* T-1333 fold 3 */
     return m;
 }
 /* the words of a change mask, for the write's log line */
@@ -288,6 +300,8 @@ inline std::string DoorRecChangeWords(int m)
     if (m & kDrChBroken) s += " broken";
     if (m & kDrChLevel) s += " lock-level";
     if (m & kDrChLockBroken) s += " lock-broken";
+    if (m & kDrChHardness) s += " lock-hardness";
+    if (m & kDrChHealth) s += " health";
     return s.empty() ? std::string(" nothing") : s;
 }
 /* Whether this game writes the record for a door change. weHold: the holder of the key's area is this game (1), another game or nobody
@@ -322,11 +336,33 @@ inline int DoorRecLayDecide(int haveRec, int weHold, int heldChange, int awaitSt
     if (haveRec != 0) return (weHold == 1) ? kDrLayWriteHeld : kDrLayRecord;
     return (weHold == 1) ? kDrLaySeed : kDrLayOwn;
 }
-/* the health a lay writes: the record's only when the record's broken flag differs from the door's (a break or a mend carries its
-   health); otherwise the door keeps its own - a hit's health alone is never written, so the record's health is no newer than it */
-inline float DoorRecLayHealth(int recBroken, int liveBroken, float recHealth, float liveHealth)
+/* the health a lay writes on a town door (T-1333 fold 3: the record's health is kept current by its holder - every hit's and repair's
+   health is written): the record's, unless the door is newer than the record - doorNewer: this game's own door changed after this
+   game's own record of it was written (a change not written yet: held, or its send failed), and the broken flags agree. A broken
+   flag that differs always lays the record's health with it (a break or a mend carries its health), as the lay writes the broken flag. */
+inline float DoorRecLayHealth(int recBroken, int liveBroken, float recHealth, float liveHealth, int doorNewer)
 {
-    return (recBroken != liveBroken) ? recHealth : liveHealth;
+    if (recBroken != liveBroken) return recHealth;
+    return (doorNewer != 0) ? liveHealth : recHealth;
+}
+/* doorNewer for DoorRecLayHealth: the row's own unwritten change (healthNew) counts only over a record this game wrote itself - another
+   game's record (the area's holder's) is newer than anything this game did to the door - and (T-1333 fold 4, review LOW 3) only while
+   this game holds the key's area now (weHold 1): a game that wrote the record and no longer holds the area takes the record */
+inline int DoorRecDoorNewer(int healthNew, int recWriter, int mySlot, int weHold)
+{
+    return (healthNew != 0 && mySlot >= 0 && recWriter == mySlot && weHold == 1) ? 1 : 0;
+}
+/* T-1333 fold 4 (review MED 1): a town door's HEALTH-ONLY change (a hit or a repair step that broke or mended nothing) is written at
+   most once every kDrHealthPaceMs per door; one noted sooner waits on the door tick until its time is up, so the last value is always
+   written (the final write). A break, a mend and a lock change are not paced. 250 ms: the engine's repair step runs every frame (about
+   60 a second), so a repair costs 4 writes a second per door instead of 60, and another game's view of the door lags by a quarter
+   second at most - the same gap as a player door's repair asks (buildwire.h kBuildDoorRepairGapMs). */
+const unsigned int kDrHealthPaceMs = 250u;
+/* 1 = a waiting health-only change of a door is written now: no write carrying its health yet (haveLast 0), or the last one (lastAt)
+   gapMs or more before now (wrap-safe) */
+inline int DoorRecHealthPaceDue(int haveLast, unsigned int lastAt, unsigned int now, unsigned int gapMs)
+{
+    return (haveLast == 0 || (unsigned int)(now - lastAt) >= gapMs) ? 1 : 0;
 }
 /* a door laid showing its own (no record; another game or nobody held the key's area): once this game holds that area and still has
    no record, the door is laid again, which seeds it. 1 = lay it again. */
@@ -395,16 +431,18 @@ inline int DoorRecRefuseRestores(int pending, int confHave, unsigned int confGen
 }
 /* The facts the holder writes at the lay for a change held before it: the stored facts the held changes moved (heldMask, the
    DoorRecChangeMask bits) from the door's live values, every other fact from the record - the save's lock, level or health never ride
-   above the world's record. Health comes with the broken flag (a break or a mend carries it), else the record's. An ordinary door's
-   swing is no bit, so it never rides. */
+   above the world's record. Health comes with the broken flag (a break or a mend carries it) or its own bit (T-1333 fold 3: a hit's or
+   a repair's health held before the lay), else the record's. An ordinary door's swing is no bit, so it never rides. */
 inline DoorRec DoorRecHeldMerge(const DoorRec& rec, const DoorRec& live, int heldMask)
 {
     DoorRec m = rec;
     if ((heldMask & kDrChState) != 0 && live.gate != 0) m.state = live.state;
     if ((heldMask & kDrChLock) != 0) m.lockWord = live.lockWord;
     if ((heldMask & kDrChBroken) != 0) { m.broken = live.broken; m.health = live.health; }
+    if ((heldMask & kDrChHealth) != 0) m.health = live.health;   /* T-1333 fold 3 */
     if ((heldMask & kDrChLevel) != 0 && live.hasLock != 0) { m.hasLock = live.hasLock; m.lockLevel = live.lockLevel; m.hardness = live.hardness; }
     if ((heldMask & kDrChLockBroken) != 0 && live.hasLock != 0) { m.hasLock = live.hasLock; m.lockBroken = live.lockBroken; }
+    if ((heldMask & kDrChHardness) != 0 && live.hasLock != 0) { m.hasLock = live.hasLock; m.hardness = live.hardness; }
     return m;
 }
 /* this game's own seed, sent and not yet confirmed (the world server's answer, DoorRecEchoConfirms): nothing is written above it, as while a refused seed's stored record
@@ -434,6 +472,81 @@ inline std::vector<std::string> DoorRecRebuiltRemoveList(const std::vector<std::
         if (resolve[i] == kDrResolveNoDoor) out.push_back(ids[i]);
     return out;
 }
+/* ---- T-1082: A PLAYER'S PIECE'S DOOR ----
+   A door of a player's piece (a house or gate a player built, or a house a player bought in town - the buyer's piece from the purchase)
+   has its lock level, broken flags and health on its piece record (piecerec.h, the LIVE part's doors) - their one source. Its door
+   record carries only the facts no piece record holds: the lock word, a gate's open / closed state and the lock's hardness (with
+   whether the door has a lock, which says only whether the hardness means anything). Its other fields are 0, and nothing of them is
+   compared, merged or laid for it. A bought house's door keeps the record its town door had (same key, same id): the purchase changes
+   which fields are read, and its first write as a player's door drops the rest.
+   THE MARK (review MED 1): a player door's record carries health -1 (kDrPlayerMark; DrNumberOk accepts it, no format change) and a
+   town door's never less than 0 (DoorRecTownFields), so the record says its own kind. A game whose own view of the door still says
+   town (the purchase not arrived yet) reads the record's kind (DoorRecKindFor): it lays only the lock word, a gate's state and the
+   hardness from a player record - never level, broken flags or health - and its change of that door is written as a player write
+   (the player field set, the mark kept), never a town write over it. */
+const int kDrPlayerFacts = kDrChState | kDrChLock | kDrChHardness;
+const float kDrPlayerMark = -1.0f;
+inline int DoorRecIsPlayer(const DoorRec& r) { return (r.health < 0.0f) ? 1 : 0; }
+/* the kind a door's record is written and laid as: localKind is this game's own view (1 a player's piece, 0 a town's, -1 unreadable -
+   no record either way); a kept record of the door marked as a player's makes it a player door whatever that view says */
+inline int DoorRecKindFor(int localKind, int haveRec, const DoorRec& rec)
+{
+    if (localKind < 0) return -1;
+    return (haveRec != 0 && DoorRecIsPlayer(rec) != 0) ? 1 : localKind;
+}
+/* a town door's record as written: its live values, health never below 0 (a negative health would read as the player mark) */
+inline DoorRec DoorRecTownFields(const DoorRec& live)
+{
+    DoorRec t = live;
+    if (!(t.health >= 0.0f)) t.health = 0.0f;
+    return t;
+}
+inline DoorRec DoorRecPlayerFields(const DoorRec& live)
+{
+    DoorRec p;
+    p.flags = live.flags; p.generation = live.generation; p.writerSlot = live.writerSlot;
+    p.key = live.key;
+    p.gate = live.gate;
+    p.state = (live.gate != 0) ? live.state : 0;
+    p.lockWord = live.lockWord;
+    p.hasLock = live.hasLock;
+    p.hardness = (live.hasLock != 0) ? live.hardness : 0.0f;
+    p.health = kDrPlayerMark;   /* the record's own kind (review MED 1) */
+    return p;
+}
+/* which of a player door's facts its live values change (both read through DoorRecPlayerFields) */
+inline int DoorRecPlayerChangeMask(int haveRec, const DoorRec& rec, const DoorRec& live)
+{
+    if (haveRec == 0) return (live.gate != 0 ? kDrChState : 0) | kDrChLock | (live.hasLock != 0 ? kDrChHardness : 0);
+    int m = 0;
+    if (live.gate != 0 && live.state != rec.state) m |= kDrChState;
+    if (live.lockWord != rec.lockWord) m |= kDrChLock;
+    if (live.hasLock != 0 && live.hardness != rec.hardness) m |= kDrChHardness;
+    return m;
+}
+/* the change mask of a door of either kind: a player's piece's door (player 1) reads its own field set only */
+inline int DoorRecChangeMaskFor(int player, int haveRec, const DoorRec& rec, const DoorRec& live)
+{
+    return (player != 0) ? DoorRecPlayerChangeMask(haveRec, DoorRecPlayerFields(rec), DoorRecPlayerFields(live))
+                         : DoorRecChangeMask(haveRec, rec, live);
+}
+/* the record the holder writes at the lay for a player door's held change: the player facts the held changes moved from the door, the
+   rest of its field set from the record, nothing else (a bought house's town record loses its other fields with it) */
+inline DoorRec DoorRecPlayerHeldMerge(const DoorRec& rec, const DoorRec& live, int heldMask)
+{
+    return DoorRecPlayerFields(DoorRecHeldMerge(DoorRecPlayerFields(rec), DoorRecPlayerFields(live), heldMask & kDrPlayerFacts));
+}
+/* whether a lay writes the record's lock hardness on the door: both have a lock and the two differ (a door of either kind) */
+inline int DoorRecLayHardness(int recHasLock, int liveHasLock, float recHardness, float liveHardness)
+{
+    return (recHasLock != 0 && liveHasLock != 0 && recHardness != liveHardness) ? 1 : 0;
+}
+/* A piece taken away by a dismantle (the engine's step, the mod's REMOVE, the panel's own): its isDismantled read before and after the
+   step (-1 not read) - only a real 0 -> 1 flip takes the piece away, and with it its doors' records, queued as a ruin's are and sent by
+   the holder of each key's area (DoorRecGoneDecide), so a piece built again on the same spot starts from its own door (bug class 483:
+   a record that outlives what it marks). 1 = remove. */
+inline int DoorRecDismantleRemoves(int before, int after) { return (before == 0 && after == 1) ? 1 : 0; }
+
 /* ONE RECORD PER DOOR PER TICK. A door can change more than once inside one engine update (a lever lock of an open door: the door
    shuts, then the engine's lock lands on it), and a stored fact can be written straight into a door (its lock level). Every such change
    of the tick is gathered as an entry and merged here: each door gets ONE write, in the order of its first entry, with its final state

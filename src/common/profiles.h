@@ -321,6 +321,32 @@ inline int DeleteApply(std::vector<Row>* rows, const std::string& person, unsign
     if (v == kOk) (*rows)[(size_t)FindRow(*rows, person, num)].active = 0;
     return v;
 }
+/* T-1280 fold 1 (M4): profiles.txt read at last after another program held it (fileRows), with the rows made in memory meanwhile
+   (memRows). A memory row joins when the file has no row of that person and number and no active row under its name (the world's
+   name rule, PlayerNameTaken); a memory row equal to the file's row of that person and number is already there. Any other is a CLASH - one number or one
+   name given twice - counted and left out of *out (the caller then keeps memory as it was, read-only, as before). *added = rows
+   joined. Returns the clashes. Pure. */
+inline int RowsMergeHeld(const std::vector<Row>& fileRows, const std::vector<Row>& memRows, std::vector<Row>* out, int* added)
+{
+    *out = fileRows;
+    int clash = 0, joined = 0;
+    for (size_t i = 0; i < memRows.size(); ++i)
+    {
+        const Row& m = memRows[i];
+        const int f = FindRow(*out, m.person, m.num);
+        if (f >= 0)
+        {
+            const Row& r = (*out)[(size_t)f];
+            if (!(r.slot == m.slot && r.created == m.created && r.active == m.active && r.name == m.name && r.faction == m.faction)) ++clash;
+            continue;
+        }
+        if (m.active && PlayerNameTaken(*out, m.name)) { ++clash; continue; }   /* the world's name rule (NewDecide's) */
+        out->push_back(m);
+        ++joined;
+    }
+    if (added != 0) *added = joined;
+    return clash;
+}
 /* profiles.txt, line by line, as the notebook reads it (LoadProfiles) and writes it (WriteProfiles): an unreadable line, or a second
    line for the same person + number, is dropped (false). */
 inline bool RowsAddLine(std::vector<Row>* rows, const std::string& line)

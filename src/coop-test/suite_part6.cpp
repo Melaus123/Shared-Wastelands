@@ -122,6 +122,112 @@ void t_t563_forward_roads()
     if (ForwardMoment(false, false, false) != kMomentNow) Fail("before the main thread is known: now");
 }
 
+/* T-918 fix attempt 1 + fold 1: src/common/goalrefill.h - a character this game takes over is queued at the take and gets its default
+   goal set back (setupAI) at the K2 safe point, only when it is still this game's own, live, and 'Self preservation' (32) is missing;
+   a faulted try is retried, bounded; a fill that ran is never run twice. */
+void t_t918_goal_refill_queue()
+{
+    if (goalrefill::QueueAdd(false, 0, goalrefill::kQueueCap) != goalrefill::kQueueAdd) Fail("an empty queue takes the uid");
+    if (goalrefill::QueueAdd(true, 5, goalrefill::kQueueCap) != goalrefill::kQueueHave) Fail("a uid already queued is not queued twice");
+    if (goalrefill::QueueAdd(true, goalrefill::kQueueCap, goalrefill::kQueueCap) != goalrefill::kQueueHave) Fail("already queued wins over full");
+    if (goalrefill::QueueAdd(false, goalrefill::kQueueCap - 1, goalrefill::kQueueCap) != goalrefill::kQueueAdd) Fail("the last free place is used");
+    if (goalrefill::QueueAdd(false, goalrefill::kQueueCap, goalrefill::kQueueCap) != goalrefill::kQueueFull) Fail("a full queue refuses (counted)");
+    if (goalrefill::kQueueCap < 400) Fail("the queue holds a take of T2159's size (381 copies)");
+}
+
+void t_t918_goal_refill_decide()
+{
+    const int M = goalrefill::kMaxTries;
+    if (goalrefill::Decide(false, true, 0, 0, M) != goalrefill::kDrop) Fail("no longer this game's own: drop, nothing written");
+    if (goalrefill::Decide(true, false, 0, 0, M) != goalrefill::kDrop) Fail("gone / dead / no AI: drop");
+    if (goalrefill::Decide(false, false, -1, M - 1, M) != goalrefill::kDrop) Fail("drop wins over a faulted ask on the last try");
+    if (goalrefill::Decide(true, true, 1, 0, M) != goalrefill::kKeep) Fail("32 there: keep (no duplicate set)");
+    if (goalrefill::Decide(true, true, 1, M - 1, M) != goalrefill::kKeep) Fail("32 there on a retry: keep (a retried fill is never doubled)");
+    if (goalrefill::Decide(true, true, 0, 0, M) != goalrefill::kRefill) Fail("32 missing, ours, live: refill");
+    if (goalrefill::Decide(true, true, 0, M - 1, M) != goalrefill::kRefill) Fail("32 missing on the last try: refill");
+    if (goalrefill::Decide(true, true, -1, 0, M) != goalrefill::kRetry) Fail("the ask faulted with tries left: retry");
+    if (goalrefill::Decide(true, true, -1, M - 1, M) != goalrefill::kFail) Fail("the ask faulted on the last try: fail");
+    for (int mine = 0; mine < 2; ++mine)
+        for (int live = 0; live < 2; ++live)
+            for (int h = -1; h < 2; ++h)
+                for (int t = 0; t < M; ++t)
+                {
+                    const int a = goalrefill::Decide(mine != 0, live != 0, h, t, M);
+                    if (a == goalrefill::kRefill && !(mine && live && h == 0))
+                        Fail("refill only for this game's own, live character with 32 missing (mine=" + I(mine) + " live=" + I(live) + " has32=" + I(h) + " try=" + I(t) + ")");
+                    if (a == goalrefill::kRetry && t + 1 >= M) Fail("no retry beyond the bound");
+                }
+    if (goalrefill::kSelfPreservationType != 32) Fail("'Self preservation' is TaskType 32");
+    if (goalrefill::kMaxTries < 2 || goalrefill::kMaxTries > 5) Fail("a bounded retry: 2..5 tries");
+}
+
+void t_t918_goal_refill_retry()
+{
+    const int M = goalrefill::kMaxTries;
+    if (goalrefill::AfterFill(true, 1, 0, M) != goalrefill::kDone) Fail("ran and 32 is there: done");
+    if (goalrefill::AfterFill(true, 1, M - 1, M) != goalrefill::kDone) Fail("done on the last try");
+    if (goalrefill::AfterFill(true, 0, 0, M) != goalrefill::kFail) Fail("ran and 32 still missing: fail, never run twice");
+    if (goalrefill::AfterFill(false, -1, 0, M) != goalrefill::kRetry) Fail("setupAI faulted / unbound with tries left: retry");
+    if (goalrefill::AfterFill(false, 0, 0, M) != goalrefill::kRetry) Fail("setupAI did not run, 32 missing: retry");
+    if (goalrefill::AfterFill(true, -1, 0, M) != goalrefill::kRetry) Fail("the after-read faulted: retry (the next ask keeps a set that has 32)");
+    if (goalrefill::AfterFill(false, -1, M - 1, M) != goalrefill::kFail) Fail("setupAI faulted on the last try: fail");
+    /* one take walked through its tries: every road ends in done / fail within kMaxTries safe points */
+    for (int ranMask = 0; ranMask < 8; ++ranMask)
+    {
+        int tries = 0, end = -1;
+        while (tries < M + 2)
+        {
+            const bool ran = ((ranMask >> (tries % 3)) & 1) != 0;
+            const int a = goalrefill::AfterFill(ran, ran ? 1 : -1, tries, M);
+            if (a != goalrefill::kRetry) { end = a; break; }
+            ++tries;
+        }
+        if (end != goalrefill::kDone && end != goalrefill::kFail) Fail("a take did not end (mask " + I(ranMask) + ")");
+        if (tries >= M) Fail("a take used more than kMaxTries safe points (mask " + I(ranMask) + ")");
+    }
+    if (std::string(goalrefill::ActionName(goalrefill::kDone)) != "done" || std::string(goalrefill::ActionName(goalrefill::kFail)) != "fail"
+        || std::string(goalrefill::ActionName(goalrefill::kKeep)) != "keep")
+        Fail("the decision names");
+}
+
+void t_t918_goal_refill_wiring()
+{
+    const std::string rp = T313ReadFile("../coop-plugin/replicate.cpp");
+    const std::string cb = T313ReadFile("../coop-plugin/combat.cpp");
+    const std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt");
+    const std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
+    const std::string sig = T313ReadFile("../coop-plugin/addresses/signatures.sig");
+    if (rp.empty() || cb.empty() || t65.empty() || t68.empty() || sig.empty()) { Fail("t918 wiring: a source file is not readable"); return; }
+    if (t65.find("Character_setupAI                              code 006210E0 006210E0 488BC455574154488D68A14881ECA000") == std::string::npos
+        || t68.find("Character_setupAI                              code 00621B70 00621B70 488BC455574154488D68A14881ECA000") == std::string::npos
+        || sig.find("Character_setupAI ") == std::string::npos)
+        Fail("t918 wiring: the setupAI row is not in both tables and the signatures");
+    if (rp.find("AddrReg kGoalSetupAI_reg(\"Character_setupAI\"") == std::string::npos) Fail("t918 wiring: replicate.cpp does not bind setupAI");
+    const size_t un = rp.find("void UnpuppetForOwnership(unsigned int uid)");
+    const size_t unEnd = (un == std::string::npos) ? un : rp.find("\n}", un);
+    if (un == std::string::npos || unEnd == std::string::npos) { Fail("t918 wiring: UnpuppetForOwnership not found"); return; }
+    const std::string body = rp.substr(un, unEnd - un);
+    if (body.find("GoalRefillQueue(uid);") == std::string::npos) Fail("t918 wiring: the take does not queue the refill");
+    if (body.find("GoalSetupAIPod") != std::string::npos || body.find("WaitForNoAiPassOn") != std::string::npos)
+        Fail("t918 wiring (fold 1): the take itself must not run setupAI or wait - the K2 safe point does the fill");
+    /* the fill runs only at the K2 safe point, inside the engine's threadSafeRagdollUpdates detour (the AI worker paused) */
+    const size_t ts = cb.find("void detour_tsRagdollUpdates(void* gameWorld)");
+    const size_t tsEnd = (ts == std::string::npos) ? ts : cb.find("\n}", ts);
+    if (ts == std::string::npos || tsEnd == std::string::npos || cb.substr(ts, tsEnd - ts).find("coop::GoalRefillSafePointDrain();") == std::string::npos)
+        Fail("t918 wiring (fold 1): the refill drain is not called at the K2 safe point");
+    size_t calls = 0;
+    for (size_t p = rp.find("GoalSetupAIPod(c)"); p != std::string::npos; p = rp.find("GoalSetupAIPod(c)", p + 1)) ++calls;
+    if (calls != 1) Fail("t918 wiring (fold 1): setupAI is called from exactly one place (the safe-point drain)");
+    const size_t dr = rp.find("void GoalRefillSafePointDrain()");
+    if (dr == std::string::npos || rp.find("GoalSetupAIPod(c)") < dr) Fail("t918 wiring (fold 1): setupAI is called outside the drain");
+    if (rp.find("net::IsUidMine(d.uid)") == std::string::npos || rp.find("EngineWritesBlocked()) return;") == std::string::npos)
+        Fail("t918 wiring (fold 1): the drain does not re-check ownership or skip a loading world");
+    if (rp.find("goalRefill[asked,refilled,failed]=") == std::string::npos || rp.find("goalRefillMore[retried,kept,dropped,queueFull,queued,pending]=") == std::string::npos)
+        Fail("t918 wiring: a REPORT token is missing");
+    if (rp.find(" fac=\" + (fac == 1 ? \"player\"") == std::string::npos) Fail("t918 wiring (fold 1, M2): the line does not name the faction kind");
+    if (rp.find("orders->dropGoals();") == std::string::npos) Fail("t918 wiring: the copy life's dropGoals (T075's protection) must stay");
+}
+
 /* T-573: src/common/copyjudge.h - the judge held while this game's simulation is stopped, and the bounded re-arm. */
 void t_t573_simulation_held()
 {
@@ -1338,8 +1444,8 @@ void t_t735_lost_backoff()
     using namespace lostcopy;
     /* FAILS BEFORE: every answer but SENT parked the row for the rest of its visit, and an owed answer that never came waited for the
        visit to end - a character standing still on kept ground was never asked for again. */
-    const int passing[5] = { kRvHeld, kRvNoBody, kRvFailed, kRvNoRoad, kRvNotInArea };
-    for (int pi = 0; pi < 5; ++pi)
+    const int passing[4] = { kRvHeld, kRvFailed, kRvNoRoad, kRvNotInArea };   /* T-1178 fold 3 (L-a): NO BODY gives its ask back - t1178_origin_spot */
+    for (int pi = 0; pi < 4; ++pi)
     {
         LostBook b;
         LostNote(&b, 40u, 2u, 1, 5.0f, 0.0f, 5.0f);
@@ -5269,7 +5375,7 @@ void t_t677_talk_purse()
         if (b.size() >= 4)
         {
             TalkMsg o;
-            if (DecodeTalk(&b[0], b.size() - 4, &o) != kTalkDecodeTrunc) Fail("a REQUEST without the purse (the older layout) must decode as Trunc");
+            if (b.size() < 5 || DecodeTalk(&b[0], b.size() - 5, &o) != kTalkDecodeTrunc) Fail("a REQUEST without the purse (the older layout) must decode as Trunc");   /* 5: the purse and T-898's empty talker block */
         }
         TalkMsg a;
         a.kind = kTalkAnswer; a.convId = 3; a.npcUid = 5; a.targetUid = 6; a.result = kTalkAnsReply; a.index = 2; a.replyId = "r9"; a.purse = purses[k];
@@ -5280,7 +5386,7 @@ void t_t677_talk_purse()
         if (ab.size() >= 4)
         {
             TalkMsg o;
-            if (DecodeTalk(&ab[0], ab.size() - 4, &o) != kTalkDecodeTrunc) Fail("an ANSWER without the purse (the older layout) must decode as Trunc");
+            if (ab.size() < 5 || DecodeTalk(&ab[0], ab.size() - 5, &o) != kTalkDecodeTrunc) Fail("an ANSWER without the purse (the older layout) must decode as Trunc");   /* 5: the purse and T-898's empty talker block */
         }
     }
     TalkMsg d;
@@ -5334,6 +5440,105 @@ void t_t677_purse_after_act()
     std::vector<int> two; two.push_back(8); two.push_back(8);
     std::vector<int> one(1, 100);
     if (TalkPurseAfterAct(250, two, one) != 150) Fail("more types than values: only the pairs count");
+}
+
+/* T-898 (T898RANK): REQUEST, ANSWER, CURSOR_ASK and ACT_RESULT end with the optional talker block (u8 n | n x (u8 key | i32 value):
+   absent = no values, part of one = Trunc, over 16 entries = TooMany, an unknown key skipped); TalkRankCond is the engine's
+   condition 10; TalkRankAfterAct / TalkTalkerAfterAct the join line's 35 on the talker's game. */
+void t_t898_talk_rank()
+{
+    using namespace cooptalk;
+    const int kinds[4] = { kTalkRequest, kTalkAnswer, kTalkCursorAsk, kTalkActResult };
+    const int ranks[3] = { 0, 3, kTalkerAbsent };
+    for (int k = 0; k < 4; ++k)
+        for (int j = 0; j < 3; ++j)
+        {
+            TalkMsg q;
+            q.kind = kinds[k]; q.npcUid = 5; q.targetUid = 6; q.reqId = 9; q.event = 1; q.purse = 700; q.talker[kTalkerRank] = ranks[j];
+            q.result = (kinds[k] == kTalkAnswer) ? kTalkAnsReply : 0; q.index = 1; q.replyId = "r1"; q.seq = 4;
+            std::vector<char> b;
+            TalkMsg r;
+            if (!EncodeTalk(&b, q) || DecodeTalk(&b[0], b.size(), &r) != kTalkDecodeOk || r.talker[kTalkerRank] != ranks[j] || r.kind != kinds[k])
+            { Fail("T-898: " + std::string(TalkKindName(kinds[k])) + " must round-trip its rank " + I(ranks[j])); continue; }
+            if (kinds[k] != kTalkActResult && r.purse != 700) Fail("T-898: the purse before the block must stay");
+            const size_t blk = (ranks[j] == kTalkerAbsent) ? 1 : 6;
+            TalkMsg o;
+            o.talker[kTalkerRank] = 42;
+            if (DecodeTalk(&b[0], b.size() - blk, &o) != kTalkDecodeOk || o.talker[kTalkerRank] != kTalkerAbsent)
+                Fail("T-898: " + std::string(TalkKindName(kinds[k])) + " without the talker block (an older sender) must decode with no values");
+            for (size_t cut = 1; cut < blk; ++cut)
+            {
+                TalkMsg t;
+                if (DecodeTalk(&b[0], b.size() - cut, &t) != kTalkDecodeTrunc) { Fail("T-898: part of a talker block must decode as Trunc"); break; }
+            }
+            std::vector<char> more(b);
+            more.push_back(1); more.push_back(2);
+            TalkMsg m2;
+            if (DecodeTalk(&more[0], more.size(), &m2) != kTalkDecodeOk || m2.talker[kTalkerRank] != ranks[j]) Fail("T-898: bytes after the block are ignored");
+        }
+    {   /* a key this build does not keep is read and skipped; more than 16 entries is TooMany */
+        TalkMsg q;
+        q.kind = kTalkRequest; q.npcUid = 5; q.targetUid = 6; q.reqId = 9; q.event = 1; q.purse = 1;
+        std::vector<char> b;
+        if (!EncodeTalk(&b, q)) { Fail("T-898: a REQUEST did not encode"); return; }
+        b.pop_back();   /* the empty block's count */
+        std::vector<char> u(b);
+        TalkPut8(&u, 2); TalkPut8(&u, 200); TalkPut32(&u, 77); TalkPut8(&u, (unsigned int)kTalkerRank); TalkPut32(&u, 4);
+        TalkMsg r;
+        if (DecodeTalk(&u[0], u.size(), &r) != kTalkDecodeOk || r.talker[kTalkerRank] != 4) Fail("T-898: an unknown key must be skipped");
+        std::vector<char> big(b);
+        TalkPut8(&big, kTalkMaxTalker + 1);
+        for (unsigned int i = 0; i <= kTalkMaxTalker; ++i) { TalkPut8(&big, 9); TalkPut32(&big, 0); }
+        TalkMsg rb;
+        if (DecodeTalk(&big[0], big.size(), &rb) != kTalkDecodeTooMany) Fail("T-898: a block of 17 entries must decode as TooMany");
+    }
+    TalkMsg d;
+    for (int k = 0; k < kTalkerKeys; ++k) if (d.talker[k] != kTalkerAbsent) Fail("T-898: a new TalkMsg holds no talker values");
+    /* condition 10 (675ec0:360-368, 957-958): 1 = rank < val, 2 = val < rank, any other = rank == val */
+    if (!TalkRankCond(0, 1, 1) || TalkRankCond(0, 1, 0) || TalkRankCond(0, 1, 2)) Fail("T-898: compare 0 is equal");
+    if (!TalkRankCond(1, 1, 0) || TalkRankCond(1, 1, 1) || TalkRankCond(1, 1, 2)) Fail("T-898: compare 1 is less than");
+    if (!TalkRankCond(2, 1, 2) || TalkRankCond(2, 1, 1) || TalkRankCond(2, 1, 0)) Fail("T-898: compare 2 is more than");
+    if (!TalkRankCond(7, 0, 0) || TalkRankCond(7, 0, 1)) Fail("T-898: another compare is equal");
+    /* the join line 51852: acts [8:10000, 35:1, 4:100] (T2143) */
+    std::vector<int> ty, va;
+    ty.push_back(8); va.push_back(10000); ty.push_back(35); va.push_back(1); ty.push_back(4); va.push_back(100);
+    if (TalkRankAfterAct(0, 20000, ty, va) != 1) Fail("T-898: the join from rank 0 with 20000 cats: rank 1");
+    if (TalkRankAfterAct(0, -1, ty, va) != 1) Fail("T-898: an unknown purse does not refuse");
+    if (TalkRankAfterAct(0, 9999, ty, va) != 0) Fail("T-898: the ACT refused for money: unchanged");
+    if (TalkRankAfterAct(1, 20000, ty, va) != 1) Fail("T-898: 35 with value 1 at rank 1: unchanged (rank not below the value)");
+    if (TalkRankAfterAct(-1, 20000, ty, va) != -1) Fail("T-898: an unknown rank stays unknown");
+    std::vector<int> z(1, 35), zv(1, 0);
+    if (TalkRankAfterAct(5, -1, z, zv) != 6) Fail("T-898: 35 with value 0 always raises");
+    std::vector<int> tw, twv;
+    tw.push_back(35); twv.push_back(2); tw.push_back(35); twv.push_back(2);
+    if (TalkRankAfterAct(0, -1, tw, twv) != 2 || TalkRankAfterAct(1, -1, tw, twv) != 2) Fail("T-898: two 35s with value 2: the second sees the first one's rank");
+    std::vector<int> none;
+    if (TalkRankAfterAct(3, 100, none, none) != 3) Fail("T-898: no actions: unchanged");
+    if (TalkTalkerAfterAct(kTalkerRank, 0, 20000, ty, va) != 1 || TalkTalkerAfterAct(kTalkerRank, kTalkerAbsent, 20000, ty, va) != kTalkerAbsent
+        || TalkTalkerAfterAct(5, 0, 20000, ty, va) != 0) Fail("T-898: TalkTalkerAfterAct - the rank's rule, nothing for no value or a key with no rule");
+    if (kTalkActRankUp != 35 || kTalkerRank != 1) Fail("T-898: action 35, key 1");
+    /* review LOW-2: a hover check never keeps its block over an open conversation's; a late ACT_RESULT of another conversation is not taken */
+    if (TalkTalkerNoteRule(kTalkCursorAsk, 1, 0) != kTalkerNotePutBack || TalkTalkerNoteRule(kTalkCursorAsk, 1, 1) != kTalkerNotePutBack)
+        Fail("T-898: a CURSOR_ASK while a conversation with the talker is open: used for the check, the kept block put back");
+    if (TalkTalkerNoteRule(kTalkCursorAsk, 0, 0) != kTalkerNoteTake) Fail("T-898: a CURSOR_ASK with no conversation open: taken (dropped after the check)");
+    if (TalkTalkerNoteRule(kTalkActResult, 1, 1) != kTalkerNoteTake) Fail("T-898: an ACT_RESULT of the open conversation is taken");
+    if (TalkTalkerNoteRule(kTalkActResult, 1, 0) != kTalkerNoteSkip || TalkTalkerNoteRule(kTalkActResult, 0, 0) != kTalkerNoteSkip)
+        Fail("T-898: a late ACT_RESULT of an earlier conversation (or with none open) changes nothing");
+    if (TalkTalkerNoteRule(kTalkRequest, 0, 0) != kTalkerNoteTake || TalkTalkerNoteRule(kTalkAnswer, 1, 1) != kTalkerNoteTake)
+        Fail("T-898: REQUEST / ANSWER blocks are taken as before");
+    /* review LOW-4: the guessed +1 from the ACT is undone when the ACT_RESULT carries no rank */
+    if (TalkTalkerUndoGuess(0, 1, 1, kTalkerAbsent) != 0) Fail("T-898: a result with no rank puts the rank before the guess back");
+    if (TalkTalkerUndoGuess(0, 1, 1, 1) != kTalkerAbsent || TalkTalkerUndoGuess(0, 1, 0, 0) != kTalkerAbsent)
+        Fail("T-898: a result with a rank has replaced the guess itself (applied or refused): nothing to undo");
+    if (TalkTalkerUndoGuess(1, 2, 3, kTalkerAbsent) != kTalkerAbsent) Fail("T-898: a newer kept rank than the guess stays");
+    if (TalkTalkerUndoGuess(-1, -1, 1, kTalkerAbsent) != kTalkerAbsent || TalkTalkerUndoGuess(2, 2, 2, kTalkerAbsent) != kTalkerAbsent)
+        Fail("T-898: an ACT that made no guess: nothing to undo");
+    {   /* the whole road: rank 0 kept, the join's ACT guesses 1, the result carries none -> 0 again */
+        const int before = 0, after = TalkTalkerAfterAct(kTalkerRank, before, 20000, ty, va);
+        TalkMsg res;
+        res.kind = kTalkActResult; res.result = kTalkActNoChar;
+        if (after != 1 || TalkTalkerUndoGuess(before, after, after, res.talker[kTalkerRank]) != 0) Fail("T-898: the join's guess undone by a NO_CHAR result with no block");
+    }
 }
 
 /* ===== the duplicate report (src/common/dupsquad.h) ===== */

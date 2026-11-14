@@ -18,7 +18,7 @@
 
 #include "../common/bountywire.h"   /* crime5: coopbounty::BountyList */
 
-namespace coopcrime { struct CrimeState; }
+namespace coopcrime { struct CrimeState; struct CrimeCaught; }
 
 namespace coop {
 
@@ -34,6 +34,10 @@ void CrimeNoteDroppedBlocked();
 // MSG_CRIME kind 1, MAIN THREAD (the session drain): a crime another game's engine recorded on its copy of a character THIS game
 // drives - queued for the K2 safe point, where it is recorded on this game's own character (CrimeApplyDrain).
 void ApplyRemoteCopyWrite(unsigned int uid, const coopcrime::CrimeState& s, unsigned int fromPeer);
+// T-1131 MSG_CRIME kind 3, MAIN THREAD (the session drain): another game's caught roll whose watcher is THIS game's character - the
+// thief's crime queued first, the watcher's event raised on our own watcher at the K2 safe point (CrimeApplyDrain); refused with a
+// line (no retry) when this game does not run the watcher now.
+void ApplyRemoteCaught(unsigned int thiefUid, const coopcrime::CrimeState& s, const coopcrime::CrimeCaught& c, unsigned int fromPeer);
 // ANY THREAD (Dialogue::sendEvent's detour, speech.cpp): counts the crime witness events 0x29, 0x2A, 8 and 0x11 this game's
 // engine raises, and those about a replicated character. Address compares and interlocked counts only.
 void CrimeNoteWitnessEvent(int what, const void* who);

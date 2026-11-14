@@ -1261,6 +1261,8 @@ const char* MsgTypeName(MsgType t)
     case MSG_SHOT_FIRED: return "SHOT_FIRED";
     case MSG_HAND: return "HAND";
     case MSG_BOX_LOCK: return "BOX_LOCK";   /* T-1061 */
+    case MSG_RAID_LEND: return "RAID_LEND";   /* T-1122 build */
+    case MSG_RAID_END: return "RAID_END";   /* T-1122 redesign (b) */
     case MSG_RESEARCH_BOOK: return "RESEARCH_BOOK";   /* T-1242 */
     case MSG_SESSION_CLOSING: return "SESSION_CLOSING";   /* mmo5 */
     case MSG_SQUAD_LEAD: return "SQUAD_LEAD";   /* T-1 B1 restructure */

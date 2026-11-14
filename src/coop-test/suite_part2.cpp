@@ -944,6 +944,7 @@ void t_m7a3_removal_reason_class()
     if (EngineRemovalReasonClass("_putTheSpecialCharactersInNewSquads") != kReasonDeath) Fail("special-character discard - DESTROY");
     if (EngineRemovalReasonClass(kDuplicateNamedRemoved) != kReasonDeath) Fail("the plugin's removal of a duplicate named body - DEATH (DESPAWN)");
     if (EngineRemovalReasonClass("duplicate named character removed") != kReasonDeath) Fail("the duplicate reason compared by value - DEATH");
+    if (EngineRemovalReasonClass("incinerated or cooked") != kReasonFinal) Fail("T-1262: incinerated or cooked (the corpse furnace) - a FINAL end");
     if (RemovalIsUnload(0, EngineRemovalReasonClass(kDuplicateNamedRemoved), 0) != 0) Fail("a living duplicate removed - not sent as DESPAWN");
     if (EngineRemovalReasonClass("platoon destructor") != kReasonAmbiguous) Fail("platoon destructor - ambiguous (isDead decides)");
     if (EngineRemovalReasonClass("wandered out of zone") != kReasonAmbiguous) Fail("wandered out of zone - ambiguous");
@@ -959,7 +960,10 @@ void t_m7a3_removal_reason_class()
 void t_m7a3_removal_is_unload()
 {
     using namespace coopremoval;
-    if (RemovalIsUnload(1, kReasonDeath, 1) != 1) Fail("the engine's own unload flag always means UNLOAD");
+    if (RemovalIsUnload(1, kReasonDeath, 1) != 1) Fail("the engine's own unload flag means UNLOAD for every reason but a final end");
+    if (RemovalIsUnload(1, kReasonFinal, 0) != 0 || RemovalIsUnload(1, kReasonFinal, -1) != 0 || RemovalIsUnload(0, kReasonFinal, 0) != 0)
+        Fail("T-1262: a final end ('incinerated or cooked') is a DESPAWN under either flag - the reason before the flag");
+    if (RemovalIsUnload(1, EngineRemovalReasonClass("ZoneMapContent::deactivate"), 1) != 1) Fail("T-1262: the zone's deactivate (the flag hard-coded 1) stays an UNLOAD");
     if (RemovalIsUnload(0, kReasonUnload, 1) != 1) Fail("an unload reason: UNLOAD even for a body");
     if (RemovalIsUnload(0, kReasonDeath, 0) != 0) Fail("an ending reason: DESPAWN even when isDead reads 0 (eaten alive)");
     if (RemovalIsUnload(0, kReasonAmbiguous, 0) != 1) Fail("ambiguous, alive: UNLOAD (T772's platoon walk)");
@@ -1083,27 +1087,28 @@ void t_m7a3f3_handed_over_supersede()
     if (SupersedeOwnIdAfterHandover(0, 0) != 0) Fail("another game's id: superseded as before");
     if (SupersedeOwnIdAfterHandover(0, 1) != 0) Fail("another game's id, marked: superseded as before");
 }
-/* M7a3f3 T-425 [m7a3f3-t4]: the wake of a handed-over squad - refused only where another game holds the area (or it is frozen), a world
-   faction. The rule has no player-count input: a host alone and a host with others take the same verdict for the same area answer. */
+/* M7a3f3 T-425 [m7a3f3-t4], T-1318 design 1: the wake of a squad given at an ACK - refused for a world faction's squad WHOEVER holds
+   the area (T2279: this game held it, woke the squad and rebuilt its people under new ids). The rule has no area or player-count input. */
 void t_m7a3f3_handed_over_wake()
 {
     using namespace coopsquad;
-    if (HandedOverWakeRefuse(1, 1, 1) != 1) Fail("handed over, another game holds the area, world faction: refused");
-    if (HandedOverWakeRefuse(0, 1, 1) != 0) Fail("not handed over: woken");
-    if (HandedOverWakeRefuse(1, 0, 1) != 0) Fail("nobody else holds the area: woken (this game runs it)");
-    if (HandedOverWakeRefuse(1, -1, 1) != 0) Fail("no fresh map: woken (nothing is thrown away on a guess)");
-    if (HandedOverWakeRefuse(1, -2, 1) != 1) Fail("a frozen area (its holder away - what a host alone reads for another player's area): refused, as held");
-    if (HandedOverWakeRefuse(1, 1, 0) != 0) Fail("a player / peer / stand-in squad: never refused");
+    if (HandedOverWakeRefuse(1, 1) != 1) Fail("given, world faction: refused");
+    if (HandedOverWakeRefuse(0, 1) != 0) Fail("not given: woken");
+    if (HandedOverWakeRefuse(1, 0) != 0) Fail("a player / peer / stand-in squad: never refused");
+    /* the area answers the old rule asked (1 held, 0 this game / nobody, -1 no fresh map, -2 frozen): the refusal is the same for each;
+       only 0 and -1 are a given entry blocking this game's own wake (the area rule alone would have woken it) */
+    const int held[4] = { 1, 0, -1, -2 }, blocks[4] = { 0, 1, 1, 0 };
+    for (int i = 0; i < 4; ++i)
+        if (GivenBlocksOwnWake(HandedOverWakeRefuse(1, 1), held[i]) != blocks[i]) Fail("T-1318: givenBlockedWake counted off the area answers the old rule let wake");
+    if (GivenBlocksOwnWake(0, 0) != 0) Fail("T-1318: a wake not refused counted as blocked");
 }
-/* M7a3f3 T-425 [m7a3f3-t5]: the sweep and a rebuilt person of a handed-over squad. */
+/* M7a3f3 T-425 [m7a3f3-t5], T-1318 design 1: the sweep and a rebuilt person of a handed-over squad - never adopted here (no area rule, no
+   live-copy test: both were stand-ins for the ACK); the index entry is cleared only by events. */
 void t_m7a3f3_handed_over_sweep()
 {
     using namespace coopsquad;
-    if (HandedOverSweepAction(0, 1, 1) != kHoSweepAdopt) Fail("not handed over: the sweep's own rules");
-    if (HandedOverSweepAction(1, 1, 0) != kHoSweepSkip) Fail("the other game's live copy here: not adopted");
-    if (HandedOverSweepAction(1, 0, 1) != kHoSweepSkip) Fail("another game holds the area: not adopted");
-    if (HandedOverSweepAction(1, 0, -1) != kHoSweepSkip) Fail("no fresh map: not adopted (not known to be mine alone)");
-    if (HandedOverSweepAction(1, 0, 0) != kHoSweepAdoptUnmark) Fail("fresh map, nobody else, no copy here: adopted and unmarked");
+    if (HandedOverSweepAction(0) != kHoSweepAdopt) Fail("not handed over: the sweep's own rules");
+    if (HandedOverSweepAction(1) != kHoSweepSkip) Fail("T-1318 (T2279): a given squad's rebuilt person adopted here (this game holds the area, no copy live here)");
 }
 /* M7a3f4 [m7a3f4-t4]: the awake retire of a handed-over squad's own copy is refused while a person of ours is in it. */
 void t_m7a3f4_retire_refused_when_mine()
@@ -2548,7 +2553,7 @@ void t_t311_shot_reactions()
     if (coopshot::ShotReactions(true, true, 0, -1) != (R | H)) Fail("an unread attacker type: underRangedAttack was not skipped");
     if (coopshot::ShotReactions(false, true, 0, 1) != H) Fail("not on purpose: only the hit reaction should run");
     if (coopshot::ShotReactions(false, true, 1, 1) != H) Fail("not on purpose, +0x130 set: only the hit reaction should run");
-    if (coopshot::ShotReactions(true, false, 0, 1) != 0) Fail("no copy of the shooter: a reaction was chosen");
+    if (coopshot::ShotReactions(true, false, 0, 1) != 0) Fail("no copy of the shooter (the victim stands in): a reaction was chosen");
     if (coopshot::ShotReactions(false, false, 0, 1) != 0) Fail("no copy, not on purpose: a reaction was chosen");
     /* T-311 fold 1: each underRangedAttack skip has its own reason, and the rule runs it exactly when ShotReactions chooses it */
     if (coopshot::ShotUnderRangedSkip(true, 0, 1) != coopshot::kShotUrRun) Fail("on purpose, +0x130 clear, type 1: a skip reason was given");
@@ -2566,6 +2571,46 @@ void t_t311_shot_reactions()
                 if (runs != (coopshot::ShotUnderRangedSkip(op != 0, fl, ty) == coopshot::kShotUrRun))
                     Fail("ShotUnderRangedSkip disagrees with ShotReactions on when underRangedAttack runs");
             }
+}
+
+/* T-1264: a remote wound (MSG_SHOT / MSG_MELEE_DECIDED) whose shooter has no positionable copy here is applied with the victim
+   standing in as the attacker, never thrown away; only a victim that is not ready refuses it. */
+void t_t1264_wound_stand_in()
+{
+    if (coopshot::WoundAttacker(true, true, true) != coopshot::kWoundRealAttacker) Fail("a positionable copy of the shooter: not the real attacker");
+    if (coopshot::WoundAttacker(true, false, false) != coopshot::kWoundStandIn) Fail("no copy of the shooter: the victim does not stand in");
+    if (coopshot::WoundAttacker(true, false, true) != coopshot::kWoundStandIn) Fail("no copy (positionable read as true): the victim does not stand in");
+    if (coopshot::WoundAttacker(true, true, false) != coopshot::kWoundStandIn) Fail("a copy that cannot be positioned: the victim does not stand in");
+    for (int c = 0; c < 2; ++c)
+        for (int p = 0; p < 2; ++p)
+        {
+            if (coopshot::WoundAttacker(false, c != 0, p != 0) != coopshot::kWoundRefuse) Fail("a victim that is not ready: the wound was not refused");
+            if (coopshot::WoundAttacker(true, c != 0, p != 0) == coopshot::kWoundRefuse) Fail("a ready victim's wound was thrown away for want of the shooter");
+        }
+    if (coopshot::kWoundRefuse == coopshot::kWoundRealAttacker || coopshot::kWoundRefuse == coopshot::kWoundStandIn
+        || coopshot::kWoundRealAttacker == coopshot::kWoundStandIn) Fail("the three answers are not distinct");
+    /* T-1264 review: the reactions a stand-in wound still runs - all with the real attacker; remember and under attack, never the
+       flinch, with a copy that cannot be positioned; none with no copy (accepted by design) */
+    const int all = coopshot::kShotReactRemember | coopshot::kShotReactUnderRanged | coopshot::kShotReactHitReaction;
+    if (coopshot::StandInReactions(coopshot::kStandInNone) != all) Fail("the real attacker: not every reaction is allowed");
+    if (coopshot::StandInReactions(coopshot::kStandInNotPositionable) != coopshot::kShotReactRemember)
+        Fail("a copy that cannot be positioned: not remember only (under attack would list a copy with no finished body)");
+    if (coopshot::StandInReactions(coopshot::kStandInNoCopy) != 0) Fail("no copy of the attacker: a reaction was allowed");
+    /* T-1264 review: a MELEE_DECIDED blow on our NPC whose attacker has no copy here is applied, not refused as rule (the sender
+       sends only its player character's blow; this game made no result of its own for it); with a copy, this game's class decides */
+    for (int k = -1; k <= 1; ++k)
+    {
+        if (meleewire::MeleeReceiverAttackerClass(false, k) != 1) Fail("no copy of the attacker: not taken as a player character");
+        if (meleewire::MeleeReceiverAttackerClass(true, k) != k) Fail("a copy of the attacker: this game's own class was not kept");
+    }
+    if (!meleewire::MeleeReceiverApplies(false, meleewire::MeleeReceiverAttackerClass(false, -1), true, 0))
+        Fail("no copy of the attacker, our NPC the victim: the blow was refused");
+    if (meleewire::MeleeReceiverApplies(false, meleewire::MeleeReceiverAttackerClass(true, -1), true, 0))
+        Fail("a copy not classified here yet: the blow was applied (this game's own result may stand)");
+    if (meleewire::MeleeReceiverApplies(false, meleewire::MeleeReceiverAttackerClass(false, -1), true, 1))
+        Fail("no copy of the attacker, our player character the victim: the blow was applied");
+    if (meleewire::MeleeReceiverApplies(true, meleewire::MeleeReceiverAttackerClass(false, -1), true, 0))
+        Fail("our own character the attacker: the blow was applied");
 }
 
 /* slave1: MSG_SLAVE - the owner's SlaveStateEnum for the other game's copy. */
@@ -3259,18 +3304,243 @@ void t_t1076_ring1_party()
     if (loadedzones::Ring1Grants(1, 0, 0) != 1) Fail("ring 1, nobody else beside it, higher slot: grants");
     if (loadedzones::Ring1Grants(0, 0, 1) != 0) Fail("no ring 1: no grant");
 }
-/* the world server's area assignment with a slot holding two player-character areas: an area beside either goes to that slot */
-void t_t1077_area_assign_list()
+/* decision 1556 (T-1285 restored): who is in charge of an area - the first or only game with it loaded (its latest report without the
+   loading mark lists it kept), or the game it was passed to (coopstore::AreaChargeDecide and the listing clocks); and what 'kept' is on
+   the game (loadedzones::WhyFromCountdowns) */
+void t_t1285_area_charge()
 {
-    const int s[3] = { 0, 1, 1 }, x[3] = { 10, 40, 20 }, y[3] = { 10, 40, 21 };   /* slot 0 at 10,10; slot 1 followed at 40,40 and a party at 20,21 */
-    const double at[3] = { 99.0, 99.0, 99.0 };
-    int n = -1, why = -1;
-    if (coopstore::AreaAssignDecide(0, 20, 20, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || n != 1 || why != coopstore::kAssignRing1) Fail("t1077: an area beside slot 1's second entry goes to slot 1");
-    if (coopstore::AreaAssignDecide(0, 41, 40, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || why != coopstore::kAssignRing1) Fail("t1077: and an area beside its first entry");
-    if (coopstore::AreaAssignDecide(1, 11, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 0 || why != coopstore::kAssignRing1) Fail("t1077: beside slot 0 only -> slot 0");
-    if (coopstore::AreaAssignDecide(1, 30, 30, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || n != 0 || why != coopstore::kAssignReporter) Fail("t1077: beside nobody -> the reporter");
-    const int s2[3] = { 1, 0, 1 }, x2[3] = { 20, 21, 50 }, y2[3] = { 20, 20, 50 };
-    if (coopstore::AreaAssignDecide(1, 20, 21, 3, s2, x2, y2, at, 100.0, 5.0, &n, &why) != 0 || n != 2) Fail("t1077: slot 1's party and slot 0 both beside -> the lower slot 0");
+    using namespace coopstore;
+    int why = -1;
+    const int only0[1] = { 0 }, only1[1] = { 1 }, both[2] = { 1, 0 }, three[2] = { 2, 1 };
+    const double t5[1] = { 5.0 }, t57[2] = { 5.0, 7.0 }, t97[2] = { 9.0, 7.0 }, t77[2] = { 7.0, 7.0 };
+    /* first / only: nobody holds it - the game whose report lists it, nothing else asked (no player beside it needed) */
+    if (AreaChargeDecide(-1, 0, 1, only1, t5, &why) != 1 || why != kChargeAssign) Fail("d1556: the only game listing an unheld area kept gets it");
+    if (AreaChargeDecide(-1, 0, 0, 0, 0, &why) != -1 || why != kChargeNone) Fail("d1556: nobody lists it - nobody is named");
+    /* several listers only after a hold ended: the earliest unbroken kept-listing, then the lowest slot */
+    if (AreaChargeDecide(0, 1, 2, three, t97, &why) != 1 || why != kChargePassGone) Fail("d1556: the holder gone - the lister with the earliest unbroken listing (slot 1 since 7 s, not slot 2 since 9 s)");
+    if (AreaChargeDecide(0, 1, 2, three, t77, &why) != 1 || why != kChargePassGone) Fail("d1556: equal listings - the lowest slot");
+    if (AreaChargeDecide(0, 0, 2, three, t97, &why) != 1 || why != kChargePassDropped) Fail("d1556: the holder no longer lists it - the earliest lister, at once");
+    if (AreaChargeDecide(-1, 0, 2, both, t57, &why) != 1 || why != kChargeAssign) Fail("d1556: an unheld area with two listers (a hold just ended) - the earlier listing (slot 1 at 5 s) before the lower slot");
+    if (AreaChargePick(2, both, 0, -1) != 0) Fail("d1556: no times - the lowest slot");
+    /* sticky: the holder keeps it while it lists it, whoever else lists it and since when */
+    if (AreaChargeDecide(1, 0, 2, both, t97, &why) != 1 || why != kChargeKeep) Fail("d1556: the holder lists it - it keeps it although another game listed it earlier");
+    /* pass to a lister; pass to nobody - at the holder's first report without it */
+    if (AreaChargeDecide(1, 0, 1, only0, t5, &why) != 0 || why != kChargePassDropped) Fail("d1556: the holder's report dropped it and another game lists it - that game, at once");
+    if (AreaChargeDecide(1, 0, 0, 0, 0, &why) != -1 || why != kChargeReleaseDropped) Fail("d1556: the holder's report dropped it and nobody lists it - nobody, at once (no keeping by a player nearby)");
+    /* link close and silence (1552 a): the holder's game gone - its areas pass or go to nobody at once */
+    if (AreaChargeDecide(1, 1, 1, only0, t5, &why) != 0 || why != kChargePassGone) Fail("d1556: the holder's link closed or silent and another game lists it - that game");
+    if (AreaChargeDecide(1, 1, 1, only1, t5, &why) != -1 || why != kChargeRelease) Fail("d1556: the holder gone and only its own stale listing - nobody");
+    if (AreaSlotHeard(1, 100.0, 110.0, 10.0) != 1 || AreaSlotHeard(1, 100.0, 110.01, 10.0) != 0 || AreaSlotHeard(0, 100.0, 100.0, 10.0) != 0)
+        Fail("d1556: a slot is silent past 10 s of no report of either kind, and never heard is silent");
+    /* a slot above 15 is chosen like any other */
+    const int big[1] = { 40 };
+    if (AreaChargeDecide(-1, 0, 1, big, t5, &why) != 40) Fail("d1556: slot 40 listing is named");
+    /* THE LOADING MARK CHANGES NOTHING: slot 0 lists the area unmarked at 100 s (stamp 100, heard 100, lastSeen 100), then sends only
+       loading-marked reports to 144 s (heard moves, stamp and lastSeen do not) - it still lists the area and keeps it; silent, it would not */
+    if (AreasReportListing(1) != 0 || AreasReportListing(0) != 1) Fail("d1556: a loading-marked report is not a listing; an unmarked one is");
+    if (AreaListedNow(1, 100.0, 1, 144.0, 1, 100.0, 144.5, 10.0) != 1) Fail("d1556: 44 s of loading-marked reports - the last unmarked listing stands");
+    if (AreaListedNow(1, 100.0, 1, 100.0, 1, 100.0, 144.5, 10.0) != 0) Fail("d1556: 44 s of no report at all - silent, not listed");
+    if (AreaChargeDecide(0, 0, 1, only0, t5, &why) != 0 || why != kChargeKeep) Fail("d1556: so the holder that is loading keeps the area");
+    if (AreaListedNow(1, 145.0, 1, 145.0, 1, 100.0, 145.5, 10.0) != 0) Fail("d1556: its first unmarked report without the area - no longer listed");
+    if (AreaListedNow(0, 0.0, 1, 145.0, 1, 100.0, 145.5, 10.0) != 0 || AreaListedNow(1, 100.0, 1, 100.0, 0, 0.0, 100.5, 10.0) != 0)
+        Fail("d1556: no listing stamp, or the area never listed - not listed");
+    /* the unbroken kept-listing: goes on while each unmarked report lists it, restarts after a report without it */
+    if (AreaListedSince(1, 100.0, 1, 100.0, 1, 50.0, 101.0) != 50.0) Fail("d1556: listed by the previous report too - the run goes on");
+    if (AreaListedSince(1, 100.0, 1, 90.0, 1, 50.0, 101.0) != 101.0) Fail("d1556: the previous report did not list it - a new run");
+    if (AreaListedSince(1, 100.0, 0, 0.0, 0, 0.0, 101.0) != 101.0 || AreaListedSince(0, 0.0, 1, 100.0, 1, 50.0, 101.0) != 101.0)
+        Fail("d1556: first listing, or no previous report (a game back) - a new run");
+    /* T-1269: a restored holder's first report WITHOUT the loading mark decides - the server marks the player reported only on a listing
+       report, and runs the charge only on it (store_main.cpp OnAreas) */
+    {
+        const std::string sm = T313ReadFile("../coop-store/store_main.cpp");
+        const size_t on = sm.find("void OnAreas(ENetPeer* from, const std::vector<char>& payload)");
+        const size_t lz = sm.find("if (listing == 0)", on), el = sm.find("    else", lz), rep_ = sm.find("if (!rid.empty()) g_idReportedThisRun[rid] = 1;", on);
+        const size_t sw = sm.find("if (listing != 0) AreaChargeSweep(now, slot, std::string(), \"a report\");", on), st = sm.find("if (listing != 0) g_areaReportAt[slot] = now;", on);
+        const size_t nx = sm.find("\nvoid ", on + 10);
+        if (on == std::string::npos || lz == std::string::npos || el == std::string::npos || rep_ == std::string::npos || !(lz < el && el < rep_) || sw == std::string::npos || st == std::string::npos
+            || sw > nx || st > nx || rep_ > nx)
+            Fail("d1556 wiring: OnAreas marks a player reported, stamps the listing and decides the charge only on a report without the loading mark");
+        if (sm.find("const unsigned int kProtocol = 153;") == std::string::npos) Fail("d1556 wiring: the world server speaks protocol 153");
+    }
+    /* the game's own step-aside (fold 1, review M3) */
+    if (loadedzones::LoadedHereGrants(1) != 0) Fail("t1285 fold 1: another player beside an unheld loaded area - not mine until the server names a holder");
+    if (loadedzones::LoadedHereGrants(0) != 1) Fail("t1285 fold 1: nobody else beside it - this game presumes it");
+    /* THE GAME SIDE: kept from the three countdowns (T2203: camera 4.0, player 6.0, town-only 4.0; a left area falls 1 s a second) */
+    using namespace loadedzones;
+    if (TownFullSec(4.0f, 6.0f) != 4.0f || TownFullSec(6.0f, 4.0f) != 4.0f) Fail("d1556: the town's full value is the smaller of the camera's and the player's (the town update copies one of them)");
+    const float full[3] = { 4.0f, 6.0f, TownFullSec(4.0f, 6.0f) };
+    const float townOnly[3] = { -0.0f, 0.0f, 4.0f }, townLow[3] = { 0.0f, 0.0f, 3.4f }, cam[3] = { 4.0f, 0.0f, 0.0f }, camAfter[3] = { 3.9f, 0.0f, 0.0f }, camLeft[3] = { 3.4f, 0.0f, 0.0f };
+    const float pl[3] = { 4.0f, 5.9f, 0.0f }, plLeft[3] = { 0.0f, 5.4f, 0.0f }, plAfter[3] = { 0.0f, 5.9f, 0.0f }, plCamOnly[3] = { 4.0f, 5.0f, 0.0f };
+    if ((WhyFromCountdowns(kWhyTown, 1, 0, townOnly, full) & kWhyKept) == 0) Fail("d1556: a town-only area at 4.0 (T2203 LEG T: 20,31-33) is kept");
+    if ((WhyFromCountdowns(kWhyTown, 1, 0, townLow, full) & kWhyKept) != 0) Fail("d1556: a town-only area falling (3.4) is not kept");
+    if ((WhyFromCountdowns(kWhyCamera, 1, 0, cam, full) & kWhyKept) == 0) Fail("d1556: a camera-edge area at 4.0 is kept");
+    if ((WhyFromCountdowns(kWhyCamera, 1, 0, camAfter, full) & kWhyKept) == 0) Fail("d1556: a left area at 3.9 right after a freeze ends reads kept for that one report (accepted, T2203)");
+    if ((WhyFromCountdowns(kWhyCamera, 1, 0, camLeft, full) & kWhyKept) != 0) Fail("d1556: a left camera area at 3.4 is not kept");
+    if (WhyFromCountdowns(kWhyPlayer | kWhyCamera, 1, 0, pl, full) != (kWhyPlayer | kWhyCamera | kWhyKept)) Fail("d1556: a player area at 5.9 is kept and its mark held");
+    if (WhyFromCountdowns(kWhyPlayer, 1, 0, plLeft, full) != (kWhyPlayer | kWhyPlayerLeaving)) Fail("d1556: a player area at 5.4 (the character left) is leaving and not kept");
+    if ((WhyFromCountdowns(kWhyPlayer, 1, 0, plAfter, full) & (kWhyKept | kWhyPlayerLeaving)) != kWhyKept) Fail("d1556: a left player area at 5.9 right after a freeze reads kept for one report");
+    if (WhyFromCountdowns(kWhyPlayer | kWhyCamera, 1, 0, plCamOnly, full) != (kWhyPlayer | kWhyCamera | kWhyPlayerLeaving | kWhyKept))
+        Fail("d1556: per-type reads - the player countdown falling (5.0) is leaving although the camera keeps the area (4.0): kept, mark not held (T2182 A:23599 'cp- 5s')");
+    if ((WhyFromCountdowns(kWhyCamera | kWhyTown, 1, 1, cam, full) & kWhyKept) != 0) Fail("d1556: loading - nothing is judged kept");
+    if (WhyFromCountdowns(kWhyPlayer, 0, 0, plLeft, full) != (kWhyPlayer | kWhyKept)) Fail("d1556: countdowns unknown - kept and held, as before");
+    if (ReportsArea(kWhyCamera, 0) != 0 || ReportsArea(kWhyCamera | kWhyKept, 0) != 1 || ReportsArea(kWhyCamera, 1) != 1) Fail("d1556: the report names kept areas, or every loaded area while loading");
+    if (ZonesLoading(1, 2) != 1 || ZonesLoading(1, 4) != 1 || ZonesLoading(1, 1) != 0 || ZonesLoading(1, 0) != 0 || ZonesLoading(0, 3) != 0) Fail("d1556: loading = the zone manager field at 2 or above, read");
+    std::vector<Area> ar; Area r;
+    r.x = 52; r.y = 56; r.why = kWhyPlayer | kWhyCamera | kWhyKept; ar.push_back(r);           /* where the character is now */
+    r.x = 53; r.y = 52; r.why = kWhyPlayer | kWhyCamera | kWhyPlayerLeaving; ar.push_back(r);   /* the area it left, counting down */
+    std::vector<int> xy;
+    PlayerSectorList(52, 56, ar, 1, 8, &xy);
+    if (xy.size() != 2 || xy[0] != 52 || xy[1] != 56) Fail("t1285 (d): the player-sector list leaves out a mark counting down (T2182 LEG 5: 53,52 was sent for 6 s)");
+    /* the wire: the AREAS flags byte (protocol 153) */
+    std::vector<char> b(4, (char)0);
+    coopdrop::AreasPutPlayerSectors(&b, 0, 0);
+    coopdrop::AreasPutFlags(&b, coopdrop::kAreasFlagLoading);
+    unsigned pairs = 9, flags = 9; std::vector<int> got;
+    if (coopdrop::AreasParse((const unsigned char*)&b[0], b.size(), &pairs, &got, &flags) != coopdrop::kAreasOk || flags != coopdrop::kAreasFlagLoading || pairs != 0) Fail("d1556: the loading mark round trips");
+    if (coopdrop::AreasParse((const unsigned char*)&b[0], b.size() - 1, &pairs, &got, &flags) != coopdrop::kAreasBadFlags) Fail("d1556: no flags byte is malformed");
+    /* d1556 fold 3 (T2210's 90 kept-check mismatches): KEPT = RENEWED - at full now AND not fallen since the previous report's read (a
+       left area's countdown only falls); the ZoneMap constructor's fill (0xECECECEC = -2.29e27, P265's -999.0) is 'never renewed', not
+       'unreadable' - zones.cpp took it as unreadable and so kept every area with a never-used reason, whatever its live countdown */
+    {
+        const float fill = -2.2914026e27f;
+        volatile float zero = 0.0f; const float nanv = zero / zero;
+        const float withFill[3] = { 1.0f, fill, fill }, withNan[3] = { 4.0f, nanv, 0.0f }, withBig[3] = { 4.0e6f, 0.0f, 0.0f };
+        if (CountdownsReadable(withFill) != 1 || CountdownsReadable(withNan) != 0 || CountdownsReadable(withBig) != 0)
+            Fail("d1556 fold 3: the constructor's fill is a readable 'never renewed'; a NaN or a huge positive value is unreadable");
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, withNan, full) & kWhyKept) == 0 || (WhyFromCountdowns(kWhyCamera, 1, 0, withBig, full) & kWhyKept) == 0)
+            Fail("d1556 fold 3: unreadable countdowns - kept, as before decision 1556");
+        /* T2210 A:4083 / A:4085: 19,31 camera 1.0 (2.1 a report before), player and town never set - was listed kept; now not */
+        const float a19[3] = { 1.0f, fill, fill }, p19[3] = { 2.1f, fill, fill };
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, a19, full, 1, p19) & kWhyKept) != 0 || (WhyFromCountdowns(kWhyCamera, 1, 0, a19, full) & kWhyKept) != 0)
+            Fail("d1556 fold 3: T2210 A:4085 - an area whose camera countdown fell to 1.0, its other two never set, is not kept");
+        /* THE FREEZE-ENDING READ (T2210 A:3797 -> A:3879): frozen at 4.0 through the load, the freeze ended 0.9 s before the read - the
+           left ring reads 3.1 and is not kept; the kept ring beside it reads 4.0 and is; a freeze that ended 0.1 s before the read (3.9)
+           leaves one extra kept report (accepted); 0.4 s before (3.6, kept under fold 1's slack) - not kept */
+        const float frozen[3] = { 4.0f, fill, fill }, after09[3] = { 3.1f, fill, fill }, after01[3] = { 3.9f, fill, fill }, after04[3] = { 3.6f, fill, fill };
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, after09, full, 1, frozen) & kWhyKept) != 0) Fail("d1556 fold 3: after a freeze - a left area at 3.1 is not kept");
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, frozen, full, 1, frozen) & kWhyKept) == 0) Fail("d1556 fold 3: after a freeze - a kept area at 4.0 is kept");
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, after01, full, 1, frozen) & kWhyKept) == 0) Fail("d1556 fold 3: after a freeze - 0.1 s fallen is one extra kept report (accepted)");
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, after04, full, 1, frozen) & kWhyKept) != 0) Fail("d1556 fold 3: after a freeze - 0.4 s fallen (3.6) is not kept: it fell since the last read");
+        /* the player area left during the freeze (T2210 A:3879 20,32: 3.1 / 5.1 / 5.1, frozen at 4.0 / 6.0 / 6.0): the player mark goes at
+           once; its town countdown is a falling copy of the player's 6.0, which cannot be told from a copy floored at 4.0 by a renewed
+           camera until it passes 4.0 - kept at 5.1 and 4.1 (A:3883 / A:4042), not at 3.0 (A:4085 left out) */
+        const float f20[3] = { 4.0f, 6.0f, 6.0f }, a20[3] = { 3.1f, 5.1f, 5.1f }, b20[3] = { 2.1f, 4.1f, 4.1f }, c20[3] = { 1.0f, 3.0f, 3.0f };
+        const int w20 = kWhyCamera | kWhyPlayer | kWhyTown;
+        if (WhyFromCountdowns(w20, 1, 0, a20, full, 1, f20) != (w20 | kWhyPlayerLeaving | kWhyKept)) Fail("d1556 fold 3: 20,32 after the freeze - player mark leaving, the town copy (5.1) kept");
+        if (WhyFromCountdowns(w20, 1, 0, b20, full, 1, a20) != (w20 | kWhyPlayerLeaving | kWhyKept)) Fail("d1556 fold 3: 20,32 a second later - the town copy (4.1) still kept");
+        if (WhyFromCountdowns(w20, 1, 0, c20, full, 1, b20) != (w20 | kWhyPlayerLeaving)) Fail("d1556 fold 3: 20,32 at 3.0 - not kept (A:4085)");
+        /* T2210 A:34473: the Hub's areas frozen at 4.0, read 3.5 0.5 s after the freeze - all of them not kept (20,32 / 21,32 were left
+           out by the slack test; 20,31 / 21,31 / 20,33 / 21,33 were listed only by the fill fallback) */
+        const float h31[3] = { -0.0f, fill, 3.5f }, hp31[3] = { -0.0f, fill, 4.0f }, h32[3] = { 3.5f, -0.0f, 3.5f }, hp32[3] = { 4.0f, -0.0f, 4.0f };
+        if ((WhyFromCountdowns(kWhyTown, 1, 0, h31, full, 1, hp31) & kWhyKept) != 0 || (WhyFromCountdowns(kWhyCamera | kWhyTown, 1, 0, h32, full, 1, hp32) & kWhyKept) != 0)
+            Fail("d1556 fold 3: T2210 A:34473 - town / camera countdowns 0.5 s down from a freeze's 4.0 are not kept, fill or no fill");
+        /* A SLOW FRAME (review M1 kept): should the engine leave its renewed countdowns 0.8 s under full at a read, the freshest camera
+           countdown shows it (lag 0.8) and every kept area stays kept, the player mark held; an area left 1 s before reads kept for that one
+           report (accepted) and not at the next */
+        if (RenewLagSec(4.0f, 4.0f) != 0.0f || RenewLagSec(3.2f, 4.0f) < 0.79f || RenewLagSec(3.2f, 4.0f) > 0.81f || RenewLagSec(0.5f, 4.0f) != kRenewLagMaxSec
+            || RenewLagSec(0.0f, 4.0f) != 0.0f || RenewLagSec(5.0f, 4.0f) != 0.0f || RenewLagSec(3.0f, 0.0f) != 0.0f)
+            Fail("d1556 fold 3: the lag is camera full less the freshest camera countdown, 0..1 s; nothing renewed or no table - 0");
+        const float lag = RenewLagSec(3.2f, 4.0f);
+        const float camK[3] = { 3.2f, fill, fill }, camKp[3] = { 4.0f, fill, fill }, plK[3] = { 3.2f, 5.2f, fill }, plKp[3] = { 4.0f, 6.0f, fill };
+        const float plOnly[3] = { fill, 5.2f, fill }, plOnlyP[3] = { fill, 6.0f, fill }, townK[3] = { -0.0f, fill, 3.2f }, townKp[3] = { -0.0f, fill, 4.0f };
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, camK, full, 1, camKp, lag) & kWhyKept) == 0 || WhyFromCountdowns(kWhyCamera | kWhyPlayer, 1, 0, plK, full, 1, plKp, lag) != (kWhyCamera | kWhyPlayer | kWhyKept)
+            || WhyFromCountdowns(kWhyPlayer, 1, 0, plOnly, full, 1, plOnlyP, lag) != (kWhyPlayer | kWhyKept) || (WhyFromCountdowns(kWhyTown, 1, 0, townK, full, 1, townKp, lag) & kWhyKept) == 0)
+            Fail("d1556 fold 3: a slow frame (lag 0.8) - kept camera / player / town areas stay kept, the player mark held");
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, camK, full, 1, camKp) & kWhyKept) != 0) Fail("d1556 fold 3: the same read with no lag - a left area");
+        const float leftH[3] = { 3.0f, fill, fill }, leftH2[3] = { 2.0f, fill, fill };
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, leftH, full, 1, camKp, lag) & kWhyKept) == 0) Fail("d1556 fold 3: an area left 1 s before the slow read - one extra kept report (accepted)");
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, leftH2, full, 1, leftH) & kWhyKept) != 0 || (WhyFromCountdowns(kWhyCamera, 1, 0, leftH2, full, 1, leftH, lag) & kWhyKept) != 0)
+            Fail("d1556 fold 3: a left area at the next read - not kept, lag or no lag");
+        /* A LEFT AREA, no freeze: each type not kept at the first read after it fell a second - even inside fold 1's 0.5 s band (the player
+           at 5.6 from 6.0 is not renewed: it fell); kept jitter (player 5.9 <-> 6.0, T2210 A:17283) is held */
+        const float plL[3] = { fill, 5.6f, fill }, plLp[3] = { fill, 6.0f, fill }, plJ[3] = { fill, 5.9f, fill }, plJ2[3] = { fill, 6.0f, fill };
+        if (WhyFromCountdowns(kWhyPlayer, 1, 0, plL, full, 1, plLp) != (kWhyPlayer | kWhyPlayerLeaving)) Fail("d1556 fold 3: a player countdown fallen 0.4 s since the last read - leaving, not kept");
+        if (WhyFromCountdowns(kWhyPlayer, 1, 0, plJ, full, 1, plJ2) != (kWhyPlayer | kWhyKept) || WhyFromCountdowns(kWhyPlayer, 1, 0, plJ2, full, 1, plJ) != (kWhyPlayer | kWhyKept))
+            Fail("d1556 fold 3: a kept player countdown's 5.9 / 6.0 jitter is held, the mark held");
+        if ((WhyFromCountdowns(kWhyCamera, 1, 0, after09, full, 1, after09) & kWhyKept) != 0) Fail("d1556 fold 3: a countdown under full is not kept even when it did not move (frozen low)");
+        /* A TOWN-ONLY AREA (T2210 LEG T: 20,31-33 at camera -0.0, town 4.0, A:30322): kept on read after read; a copy landing on the camera's
+           4.0 from a falling player copy (4.3 before) is held, so walking out of a town does not drop its camera-kept towns */
+        const float tOnly[3] = { -0.0f, fill, 4.0f }, tLand[3] = { -0.0f, fill, 4.3f };
+        if ((WhyFromCountdowns(kWhyTown, 1, 0, tOnly, full, 1, tOnly) & kWhyKept) == 0 || (WhyFromCountdowns(kWhyTown, 1, 0, tOnly, full) & kWhyKept) == 0)
+            Fail("d1556 fold 3: a town-only area at 4.0 is kept, with or without a previous read");
+        if ((WhyFromCountdowns(kWhyTown, 1, 0, tOnly, full, 1, tLand) & kWhyKept) == 0) Fail("d1556 fold 3: a town copy landing on 4.0 from 4.3 is held - kept");
+        if ((WhyFromCountdowns(kWhyTown, 1, 0, h31, full, 1, tOnly) & kWhyKept) != 0) Fail("d1556 fold 3: a town copy falling from 4.0 to 3.5 is not kept");
+        /* the second town writer's 1.0 s - kept when it sits there on two reads in a row (fold 1, review L3) */
+        const float town1[3] = { 0.0f, 0.0f, 1.0f }, town1p[3] = { 0.0f, 0.0f, 0.98f }, town2p[3] = { 0.0f, 0.0f, 2.0f };
+        if ((WhyFromCountdowns(kWhyTown, 1, 0, town1, full, 1, town1p) & kWhyKept) == 0) Fail("d1556 fold 3: a town area held at 1.0 s on two reads is kept");
+        if ((WhyFromCountdowns(kWhyTown, 1, 0, town1, full) & kWhyKept) != 0) Fail("d1556 fold 3: at 1.0 s with no previous read - not kept yet");
+        if ((WhyFromCountdowns(kWhyTown, 1, 0, town1, full, 1, town2p) & kWhyKept) != 0) Fail("d1556 fold 3: a town copy falling through 1.0 s (2.0 a read before) is not kept");
+        if (TownWriter2Held(0.3f, 1, 0.3f) != 0 || TownWriter2Held(1.0f, 1, 1.0f) != 1 || TownWriter2Held(1.0f, 0, 1.0f) != 0) Fail("d1556 fold 3: the second writer's window is 0.5 - 1.05 s on two reads");
+        if ((WhyFromCountdowns(kWhyTown, 1, 1, town1, full, 1, town1) & kWhyKept) != 0 || (WhyFromCountdowns(kWhyCamera, 1, 1, frozen, full, 1, frozen) & kWhyKept) != 0)
+            Fail("d1556 fold 3: loading - nothing is judged kept");
+        /* wiring: zones.cpp judges each area after the whole list is read, with the previous read of all three countdowns and the lag; no
+           frame timer; the fill is not taken as unreadable */
+        const std::string zo = T313ReadFile("../coop-plugin/zones.cpp");
+        if (zo.find("g_zlLag = (g_zlFullKnown != 0 && g_zlLoading == 0) ? loadedzones::RenewLagSec(maxCamera, g_zlFull[0]) : 0.0f;") == std::string::npos
+            || zo.find("loadedzones::WhyFromCountdowns(ra.why, g_zlFullKnown, g_zlLoading, ra.cd, g_zlFull, prevKnown, g_zlPrevCd[ra.x][ra.y], g_zlLag)") == std::string::npos
+            || zo.find("g_zlFrameSec") != std::string::npos || zo.find("cd[k] > -1e6f") != std::string::npos)
+            Fail("d1556 fold 3 wiring: zones.cpp judges kept with the previous read and the engine's lag, no frame timer, the fill not unreadable");
+    }
+    /* d1556 fold 1 (review M2): the presumption's grid is the KEPT set, kept as it was through a loading tick */
+    {
+        std::vector<Area> kv; Area ka;
+        ka.x = 10; ka.y = 11; ka.why = kWhyCamera | kWhyKept; kv.push_back(ka);
+        ka.x = 12; ka.y = 11; ka.why = kWhyCamera; kv.push_back(ka);            /* loaded, being unloaded */
+        std::vector<unsigned char> g(kGrid * kGrid, 0);
+        g[40 * kGrid + 40] = 1;
+        if (KeptGridFill(kv, 0, &g[0]) != 1 || g[10 * kGrid + 11] != 1 || g[12 * kGrid + 11] != 0 || g[40 * kGrid + 40] != 0)
+            Fail("d1556 fold 1: not loading - the grid is exactly the kept areas (an area being unloaded is not this game's)");
+        kv[0].why = kWhyCamera;
+        if (KeptGridFill(kv, 1, &g[0]) != 0 || g[10 * kGrid + 11] != 1) Fail("d1556 fold 1: loading - the grid stays as the last unmarked report said");
+        if (KeptGridFill(kv, 0, 0) != 0) Fail("d1556 fold 1: no grid");
+    }
+    {
+        const std::string zo = T313ReadFile("../coop-plugin/zones.cpp");
+        if (zo.find("l = (int)g_keptHere[s.x][s.y];") == std::string::npos || zo.find("loadedzones::KeptGridFill(areas, g_zlLoading, &g_keptHere[0][0]);") == std::string::npos)
+            Fail("d1556 fold 1 wiring: AreaViewTS's loadedHere reads the kept grid, filled in the tick's locked pass");
+    }
+    /* d1556 fold 1 (review L1): a loading lister only when no settled lister lists the area */
+    {
+        const int ls[2] = { 1, 2 }, lo1[2] = { 1, 0 }, lo2[2] = { 1, 1 };
+        const double ts[2] = { 5.0, 9.0 };
+        if (AreaChargePick(2, ls, ts, -1, lo1) != 2) Fail("d1556 fold 1: a settled lister before a loading one with an earlier listing");
+        if (AreaChargePick(2, ls, ts, -1, lo2) != 1) Fail("d1556 fold 1: only loading listers - the earliest of them");
+        if (AreaChargeDecide(0, 0, 2, ls, ts, &why, lo1) != 2 || why != kChargePassDropped) Fail("d1556 fold 1: a pass goes to the settled lister");
+    }
+    /* d1556 fold 2 (re-check M1, game speed): retired by fold 3 - no frame timer is left to scale; the countdowns fall by real time
+       (decomp_a0a960 / decomp_787e70, Read) and the held test compares two reads of the engine's own values */
+    /* d1556 fold 2 (review L5): MARKED AND UNMARKED REPORTS THROUGH THE RESTORED-HOLDER BRANCH (coopstore::AreaSweepDecide, the sweep's
+       own per-area answer). Slot 0 holds the area from areas.txt (restored); slot 1 lists it. The world server marks slot 0's player
+       reported only on a report without the loading mark (AreasReportListing - store_main.cpp OnAreas) */
+    {
+        const int l1[1] = { 1 }, l01[2] = { 0, 1 };
+        const double t1[1] = { 3.0 }, t01[2] = { 4.0, 3.0 };
+        int reported = 0;
+        /* (a) slot 0 connected, its reports carry the loading mark: nothing changes - the claim stands */
+        for (int k = 0; k < 3; ++k) if (AreasReportListing(1) != 0) reported = 1;
+        if (reported != 0 || AreaSweepDecide(1, 0, 0, 1, 0, 1, 1, 1, l1, t1, 0, &why) != 0 || why != kChargeRestoredStands)
+            Fail("d1556 fold 2: a loading-marked report changes nothing - the restored claim stands though another game lists the area");
+        /* (b) its first unmarked report lists the area: reported now, and it keeps the claim */
+        if (AreasReportListing(0) != 0) reported = 1;
+        if (reported != 1 || AreaSweepDecide(1, 0, 0, reported ? 0 : 1, 0, 1, 1, 2, l01, t01, 0, &why) != 0 || why != kChargeKeep)
+            Fail("d1556 fold 2: the first unmarked report that lists the area keeps the claim");
+        /* (c) its first unmarked report without the area: passed to the lister at once, or to nobody */
+        if (AreaSweepDecide(1, 0, 0, 0, 0, 1, 1, 1, l1, t1, 0, &why) != 1 || why != kChargePassDropped)
+            Fail("d1556 fold 2: the first unmarked report without the area lets it go - to the other lister");
+        if (AreaSweepDecide(1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, &why) != -1 || why != kChargeReleaseDropped)
+            Fail("d1556 fold 2: the first unmarked report without the area and no other lister - nobody");
+        /* (d) the 'not back' set: not connected, not reported, not back - the claim stands; out of the set and not connected - gone */
+        if (AreaSweepDecide(1, 0, 0, 1, 1, 0, 0, 1, l1, t1, 0, &why) != 0 || why != kChargeRestoredStands) Fail("d1556 fold 2: a 'not back' player's restored claim stands");
+        if (AreaSweepDecide(1, 0, 0, 1, 0, 0, 0, 1, l1, t1, 0, &why) != 1 || why != kChargePassGone) Fail("d1556 fold 2: no longer 'not back' and not connected - passed");
+        if (AreaSweepDecide(1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, &why) != -1 || why != kChargeRelease) Fail("d1556 fold 2: no longer 'not back', nobody lists it - nobody");
+        /* its game gone at an event (its link closed) overrides a restored claim; a live holder silent past the grace is gone */
+        if (AreaSweepDecide(1, 0, 1, 1, 1, 1, 1, 1, l1, t1, 0, &why) != 1 || why != kChargePassGone) Fail("d1556 fold 2: a link close lets a restored claim go");
+        if (AreaSweepDecide(1, 0, 0, 0, 0, 1, 0, 2, l01, t01, 0, &why) != 1 || why != kChargePassGone) Fail("d1556 fold 2: a silent holder is gone though its stale listing remains");
+        if (AreaSweepDecide(0, -1, 0, 0, 0, 0, 0, 1, l1, t1, 0, &why) != 1 || why != kChargeAssign) Fail("d1556 fold 2: an unheld area - the first lister");
+        const std::string sm = T313ReadFile("../coop-store/store_main.cpp");
+        if (T1080BodyHas(sm, "void AreaChargeSweep(double now,", "coopstore::AreaSweepDecide(held, holder, goneEvent, restoredUnreported, notBack, here, heard,") == 0)
+            Fail("d1556 fold 2 wiring: the sweep decides each area through AreaSweepDecide");
+    }
 }
 /* AREAS' player-sector list (src/common/areadrop.h): {u16 m, m x (i32 x, i32 y)} after the loaded pairs */
 void t_t1077_player_sector_wire()
@@ -3326,21 +3596,21 @@ void t_t1077_onareas_rows()
     a.push_back((char)1); a.push_back((char)0); a.push_back((char)0); a.push_back((char)0);   /* u32 n = 1 loaded pair */
     a.resize(a.size() + 8, (char)0);                                                          /* the pair 0,0 */
     const int xy[6] = { 19, 13, 70, 2, 35, 18 };   /* the second entry is off the grid */
-    coopdrop::AreasPutPlayerSectors(&a, xy, 3);
+    coopdrop::AreasPutPlayerSectors(&a, xy, 3); coopdrop::AreasPutFlags(&a, 0u);   /* protocol 153: the flags byte */
     if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&a[0], a.size(), 10.0) != 2) Fail("t1077 rows: the two on-grid entries are taken");
     coopdrop::AreasPlayerRows::const_iterator r1 = rows.find(1);
     if (r1 == rows.end() || r1->second.size() != 2 || r1->second[0].x != 19 || r1->second[0].y != 13 || r1->second[1].x != 35 || r1->second[1].y != 18
         || r1->second[0].at != 10.0) Fail("t1077 rows: in order, the off-grid entry skipped, stamped with the arrival time");
     std::vector<char> b(4, (char)0);
     const int xy2[2] = { 40, 40 };
-    coopdrop::AreasPutPlayerSectors(&b, xy2, 1);
+    coopdrop::AreasPutPlayerSectors(&b, xy2, 1); coopdrop::AreasPutFlags(&b, 0u);
     if (coopdrop::AreasPlayerRowsUpdate(&rows, 2, (const unsigned char*)&b[0], b.size(), 11.0) != 1) Fail("t1077 rows: slot 2's one entry");
     if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&b[0], b.size(), 12.0) != 1) Fail("t1077 rows: slot 1's new list");
     r1 = rows.find(1);
     if (r1 == rows.end() || r1->second.size() != 1 || r1->second[0].x != 40 || r1->second[0].at != 12.0) Fail("t1077 rows: a new list replaces the old one whole");
     std::vector<char> c(4, (char)0); c[0] = (char)5;   /* 5 loaded pairs promised, none there */
-    coopdrop::AreasPutPlayerSectors(&c, xy2, 1);
-    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&a[0], a.size() - 1, 13.0) != -1) Fail("t1077 rows: a list short by a byte is malformed");
+    coopdrop::AreasPutPlayerSectors(&c, xy2, 1); coopdrop::AreasPutFlags(&c, 0u);
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&a[0], a.size() - 2, 13.0) != -1) Fail("t1077 rows: a list short by a byte is malformed");
     if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&c[0], c.size(), 13.0) != -1) Fail("t1077 rows: loaded pairs past the end are malformed");
     if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, 0, 0, 13.0) != -1) Fail("t1077 rows: no payload is malformed");
     r1 = rows.find(1);
@@ -3348,13 +3618,14 @@ void t_t1077_onareas_rows()
     unsigned pairs = 99; std::vector<int> got;
     if (coopdrop::AreasParse((const unsigned char*)&a[0], a.size(), &pairs, &got) != coopdrop::kAreasOk || pairs != 1 || got.size() != 6) Fail("t1077 rows: AreasParse reads the pair count and the list");
     if (coopdrop::AreasParse((const unsigned char*)&c[0], c.size(), &pairs, &got) != coopdrop::kAreasBadPairs) Fail("t1077 rows: AreasParse names the pairs fault");
-    if (coopdrop::AreasParse((const unsigned char*)&a[0], a.size() - 1, &pairs, &got) != coopdrop::kAreasBadList) Fail("t1077 rows: AreasParse names the list fault");
+    if (coopdrop::AreasParse((const unsigned char*)&a[0], a.size() - 2, &pairs, &got) != coopdrop::kAreasBadList) Fail("t1077 rows: AreasParse names the list fault");
+    if (coopdrop::AreasParse((const unsigned char*)&a[0], a.size() - 1, &pairs, &got) != coopdrop::kAreasBadFlags) Fail("d1556 rows: AreasParse names a missing flags byte");
     std::vector<char> e(4, (char)0);
-    coopdrop::AreasPutPlayerSectors(&e, 0, 0);
+    coopdrop::AreasPutPlayerSectors(&e, 0, 0); coopdrop::AreasPutFlags(&e, 0u);
     if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&e[0], e.size(), 14.0) != 0 || rows.count(1) != 0 || rows.count(2) != 1) Fail("t1077 rows: m = 0 erases the slot's rows, another slot keeps its own");
     const int off[2] = { -1, 64 };
     std::vector<char> f(4, (char)0);
-    coopdrop::AreasPutPlayerSectors(&f, off, 1);
+    coopdrop::AreasPutPlayerSectors(&f, off, 1); coopdrop::AreasPutFlags(&f, 0u);
     if (coopdrop::AreasPlayerRowsUpdate(&rows, 2, (const unsigned char*)&f[0], f.size(), 15.0) != 0 || rows.count(2) != 0) Fail("t1077 rows: a list with no on-grid entry erases too");
 }
 /* this game's own party halo is drawn from exactly the list it sends (src/common/loadedzones.h PartyHaloFromList) */
@@ -3397,15 +3668,15 @@ void t_t1077_receipt_and_roster_near()
 /* T-1076: an area still loading is set aside as `loading`, not judged `nobody`; once loaded it is judged as before */
 void t_t1076_mid_load_defer()
 {
-    if (townreoffer::DeferCauseAt(1, 0, 0, 0) != townreoffer::kDefLoading) Fail("mid-load, nobody holds it: set aside as loading");
-    if (townreoffer::DeferCauseAt(1, 0, -2, 0) != townreoffer::kDefNobody) Fail("a frozen area (held -2) mid-load keeps its earlier label");
-    if (townreoffer::DeferCauseAt(1, 0, -1, 0) != townreoffer::kDefNobody) Fail("no map row (held -1, may 0) mid-load keeps its earlier label");
+    if (townreoffer::DeferCauseAt(1, 0, 0, 0, -1) != townreoffer::kDefLoading) Fail("mid-load, nobody holds it: set aside as loading");
+    if (townreoffer::DeferCauseAt(1, 0, -2, 0, -1) != townreoffer::kDefNobody) Fail("a frozen area (held -2) mid-load keeps its earlier label");
+    if (townreoffer::DeferCauseAt(1, 0, -1, 0, -1) != townreoffer::kDefNobody) Fail("no map row (held -1, may 0) mid-load keeps its earlier label");
     if (std::strcmp(townreoffer::DeferCauseName(townreoffer::kDefLoading), "loading") != 0) Fail("the cause word is loading");
-    if (townreoffer::DeferCauseAt(1, 0, 0, 1) != townreoffer::kDefNobody) Fail("loaded, nobody holds it: nobody, as before");
-    if (townreoffer::DeferCauseAt(1, 0, 1, 0) != townreoffer::kDefNone) Fail("another game holds it: an answer, mid-load or not");
-    if (townreoffer::DeferCauseAt(1, -1, -1, 0) != townreoffer::kDefNoMap) Fail("no fresh map stays no-map");
-    if (townreoffer::DeferCauseAt(1, 1, 0, 0) != townreoffer::kDefNone) Fail("may invent (ring 1) mid-load: an answer");
-    if (townreoffer::DeferCauseAt(0, 0, 0, 0) != townreoffer::kDefNoNotebook) Fail("no link stays no-notebook");
+    if (townreoffer::DeferCauseAt(1, 0, 0, 1, -1) != townreoffer::kDefNobody) Fail("loaded, nobody holds it: nobody, as before");
+    if (townreoffer::DeferCauseAt(1, 0, 1, 0, 1) != townreoffer::kDefNone) Fail("another game holds it (confirmed): an answer, mid-load or not");
+    if (townreoffer::DeferCauseAt(1, -1, -1, 0, -1) != townreoffer::kDefNoMap) Fail("no fresh map stays no-map");
+    if (townreoffer::DeferCauseAt(1, 1, 0, 0, -1) != townreoffer::kDefNone) Fail("may make (the named holder) mid-load: an answer");
+    if (townreoffer::DeferCauseAt(0, 0, 0, 0, -1) != townreoffer::kDefNoNotebook) Fail("no link stays no-notebook");
     if (townreoffer::Decide(1, 0, 0, 0, 0, 0) != townreoffer::kReWait) Fail("the check-up keeps a mid-load item waiting, never drained");
     if (townreoffer::Decide(1, 0, 0, 0, 1, 0) != townreoffer::kReGenerate) Fail("once loaded and this game's: generated");
 }
@@ -3429,11 +3700,275 @@ void t_t392_reoffer_decide()
     if (townreoffer::Decide(1, 0, 1, 0, 1, 0) != townreoffer::kReOther) Fail("the notebook records a roll - settled, never a second one");
     if (townreoffer::Decide(1, 0, 0, 1, 1, 0) != townreoffer::kReWait) Fail("the notebook's people for the town are still to come - wait");
     if (townreoffer::Decide(1, 0, 0, 0, 1, 0) != townreoffer::kReGenerate) Fail("this game may invent there - generate");
-    if (townreoffer::Decide(1, 0, 0, 0, 1, -1) != townreoffer::kReGenerate) Fail("the loaded-here / next-to-the-player presumption generates as at load");
+    if (townreoffer::Decide(1, 0, 0, 0, 1, -1) != townreoffer::kReGenerate) Fail("may 1 generates whatever held says (since T-1261 the gate answers 1 only for the named holder)");
     if (townreoffer::Decide(1, 0, 0, 0, 0, 1) != townreoffer::kReOther) Fail("another game holds it - answered-other");
-    if (townreoffer::Decide(1, 0, 0, 0, 0, 0) != townreoffer::kReWait) Fail("nobody holds it and it is not this game's to presume - wait");
+    if (townreoffer::Decide(1, 0, 0, 0, 0, 0) != townreoffer::kReWait) Fail("nobody holds it yet - wait for the naming");
     if (townreoffer::Decide(1, 0, 0, 0, -1, -1) != townreoffer::kReWait) Fail("no fresh map - wait, no timer and no fallback");
     if (townreoffer::Decide(1, 0, 0, 0, -2, 1) != townreoffer::kReWait) Fail("teardown is not an answer - wait");
+}
+/* T-1268 (owner decision 1531): BEFORE THE WORLD SERVER NAMES AN AREA'S HOLDER NO GAME ACTS ON A GUESS - adoption (a fourth answer,
+   'nobody holds it yet', skipped like no map), boxes / doors / ground / restocks (loadedzones::HolderVerdict, the ring-1 presumption
+   retired), the town refill's 'may' (only 1); fold 1: a re-woken squad's late adopter waits for the naming (review M2). The town
+   version's pick is as T-1285 left it (review H1: it moves to its own design read). Every answer, and the source sites that ask them. */
+static std::string T1268Body(const std::string& src, const char* head);
+void t_t1268_holder_only()
+{
+    /* adoption: coopor::AnnounceArea(held, mine) - every answer */
+    if (coopor::AnnounceArea(0, 1) != coopor::kAnnounceAdoptable) Fail("t1268 adopt: the map names this game - not adoptable");
+    if (coopor::AnnounceArea(0, 0) != coopor::kAnnounceNobodyYet) Fail("t1268 adopt: nobody holds it yet - adoptable (both games would give one person two ids)");
+    if (coopor::AnnounceArea(1, 0) != coopor::kAnnounceOtherHeld || coopor::AnnounceArea(1, 1) != coopor::kAnnounceOtherHeld) Fail("t1268 adopt: another game holds it - not other-held");
+    if (coopor::AnnounceArea(-1, -1) != coopor::kAnnounceNoMap || coopor::AnnounceArea(-2, -2) != coopor::kAnnounceNoMap) Fail("t1268 adopt: no fresh map / frozen - not no-map");
+    if (coopor::kAnnounceNobodyYet == coopor::kAnnounceAdoptable || coopor::kAnnounceNobodyYet == coopor::kAnnounceNoMap || coopor::kAnnounceNobodyYet == coopor::kAnnounceOtherHeld)
+        Fail("t1268 adopt: 'nobody yet' shares a value with another answer");
+    /* the orphan clean-up never removes a person in an area nobody holds (it acts only on 'another game holds it') */
+    { coopor::Seen s = coopor::SeenNone(); s.areaOther = 0; int why = -1; if (coopor::Decide(s, &why) != coopor::kActNone) Fail("t1268 adopt: an unheld area's person treated as an orphan"); }
+    /* boxes / doors / ground / restocks: loadedzones::HolderVerdict - every answer */
+    if (loadedzones::HolderVerdict(0, 1) != loadedzones::kHvMine) Fail("t1268 box: the map names this game - not mine");
+    if (loadedzones::HolderVerdict(1, 0) != loadedzones::kHvHeld) Fail("t1268 box: another game holds it - not held");
+    if (loadedzones::HolderVerdict(0, 0) != loadedzones::kHvUnowned) Fail("t1268 box: nobody holds it yet - not unowned (the retired ring-1 guess answered mine here)");
+    if (loadedzones::HolderVerdict(-1, -1) != loadedzones::kHvNoAnswer || loadedzones::HolderVerdict(-2, -2) != loadedzones::kHvNoAnswer) Fail("t1268 box: no fresh row / frozen - not no-answer");
+    /* T-1268 fold 1 (review M2): THE RE-WOKEN SQUAD'S SETTLE, RUN THROUGH THE SAME FUNCTIONS THE PLUGIN CHAINS (handoff.cpp
+       RewakeAreaHeldByOther -> AdoptAfterRewakeWait at the ACK / settle, then RelRewakeWaitTick: AdoptAfterRewakeDue -> AdoptAfterRewakeWait
+       -> AdoptAfterRewake) for every area-map view. Nobody holds the area yet: the late adopter WAITS (never ACCEPT - the sweep would adopt
+       the re-woken body under a fresh id once this game is named), and it waits on until a NEW map answers otherwise. */
+    {
+        const int helds[4] = { 1, 0, -1, -2 }, mines[3] = { 1, 0, -1 };
+        for (int h = 0; h < 4; ++h) for (int m = 0; m < 3; ++m)
+        {
+            const int area = coopor::RewakeAreaOf(coopor::AnnounceArea(helds[h], mines[m]));
+            const int nobody = (helds[h] == 0 && mines[m] != 1) ? 1 : 0;
+            const int now = cooplo::AdoptAfterRewakeWait(1, area);
+            if (nobody != 0 && now != cooplo::kSettleWait) Fail("t1268 m2: re-woken, nobody holds the area yet (held " + I(helds[h]) + " mine " + I(mines[m]) + ") - settled " + I(now) + ", want WAIT");
+            if (nobody == 0 && now == cooplo::kSettleWait) Fail("t1268 m2: re-woken, the area answers (held " + I(helds[h]) + " mine " + I(mines[m]) + ") - waits");
+            if (nobody == 0 && now != cooplo::AdoptAfterRewake(1, area)) Fail("t1268 m2: an answered area decided off AdoptAfterRewake's rule");
+            /* REVOKE exactly when the sweep adopts the re-woken body here; never ACCEPT while the sweep may still adopt it */
+            const int sweepAdopts = (coopor::AnnounceArea(helds[h], mines[m]) == coopor::kAnnounceAdoptable) ? 1 : 0;
+            if ((now == cooplo::kSettleRevoke) != (sweepAdopts == 1)) Fail("t1268 m2: REVOKE disagrees with the sweep's adoption (held " + I(helds[h]) + " mine " + I(mines[m]) + ")");
+            if (now == cooplo::kSettleAccept && coopor::AnnounceArea(helds[h], mines[m]) == coopor::kAnnounceNobodyYet) Fail("t1268 m2: ACCEPTED while the sweep waits");
+            if (cooplo::AdoptAfterRewakeWait(0, area) != cooplo::kSettleAccept) Fail("t1268 m2: not re-woken here - not accepted");
+        }
+        /* the wait's life: no new map - not decided; a new map still naming nobody - waits on; a new map naming this game - REVOKE;
+           naming another game - ACCEPT; no fresh map - ACCEPT (a duplicate the dual-run / orphan paths settle, never a loss) */
+        const unsigned int seq0 = 7u;
+        int state = cooplo::AdoptAfterRewakeWait(1, coopor::RewakeAreaOf(coopor::AnnounceArea(0, 0)));
+        if (state != cooplo::kSettleWait) Fail("t1268 m2 life: the wait was not entered");
+        if (cooplo::AdoptAfterRewakeDue(seq0, seq0) != 0) Fail("t1268 m2 life: decided again with no new area map");
+        if (cooplo::AdoptAfterRewakeDue(seq0, seq0 + 1u) != 1) Fail("t1268 m2 life: a new area map does not end the wait's turn");
+        if (cooplo::AdoptAfterRewakeWait(1, coopor::RewakeAreaOf(coopor::AnnounceArea(0, 0))) != cooplo::kSettleWait) Fail("t1268 m2 life: still nobody - not waiting on");
+        if (cooplo::AdoptAfterRewakeWait(1, coopor::RewakeAreaOf(coopor::AnnounceArea(0, 1))) != cooplo::kSettleRevoke) Fail("t1268 m2 life: named here - not revoked");
+        if (cooplo::AdoptAfterRewakeWait(1, coopor::RewakeAreaOf(coopor::AnnounceArea(1, 0))) != cooplo::kSettleAccept) Fail("t1268 m2 life: named another game - not accepted");
+        if (cooplo::AdoptAfterRewakeWait(1, coopor::RewakeAreaOf(coopor::AnnounceArea(-1, -1))) != cooplo::kSettleAccept) Fail("t1268 m2 life: no fresh map - not accepted");
+        if (cooplo::kSettleWait == cooplo::kSettleAccept || cooplo::kSettleWait == cooplo::kSettleRevoke || cooplo::kSettleWait == cooplo::kSettleIgnore) Fail("t1268 m2: WAIT shares a value");
+        if (cooplo::kRewakeNobodyYet != coopor::kRewakeAreaNobodyYet) Fail("t1268 m2: the two 'nobody yet' area values differ");
+    }
+    /* T-1268 fold 2: one waiting entry's life through the same decisions handoff.cpp makes (RelLateAdopted, the player-gone drain,
+       RelRewakeWaitTick): an ACK entry adopted by slot 2; slot 3's late ACK joins it, slot 2's again is a duplicate; at the naming the
+       late adopters are answered as the settle answers them (named here: every adopter revoked; named elsewhere: 2 wins, 3 revoked). */
+    {
+        int kind = 0, from = 2, late[4]; int nLate = 0;
+        const int acks[3] = { 3, 2, 3 };
+        for (int i = 0; i < 3; ++i)
+        {
+            int listed = 0; for (int j = 0; j < nLate; ++j) if (late[j] == acks[i]) listed = 1;
+            if (cooplo::RewakeLateAck(from, listed, acks[i]) == cooplo::kRwLateAdd) late[nLate++] = acks[i];
+        }
+        if (nLate != 1 || late[0] != 3) Fail("t1268 f2: the late ACKs during the wait - want slot 3 added once, the entry's own adopter a duplicate");
+        const int nobody = coopor::RewakeAreaOf(coopor::AnnounceArea(0, 0));
+        if (!(cooplo::RewakeWaitNeeded(kind, nLate) != 0 && cooplo::AdoptAfterRewakeWait(1, nobody) == cooplo::kSettleWait)) Fail("t1268 f2: still nobody - not waiting");
+        /* named here: REVOKE the entry's adopter, and the settle (RelAsleep cancelled with the late list) revokes the rest - nobody accepted */
+        const int here = coopor::RewakeAreaOf(coopor::AnnounceArea(0, 1));
+        if (cooplo::AdoptAfterRewake(1, here) != cooplo::kSettleRevoke) Fail("t1268 f2: named here - the waiting adopter not revoked");
+        if (cooplo::AdoptAfterRewake(1, here) == cooplo::kSettleAccept) Fail("t1268 f2: named here - a late adopter accepted");
+        /* named elsewhere: ACCEPT the entry's adopter (RelAccept then revokes every late adopter but the winner) */
+        const int other = coopor::RewakeAreaOf(coopor::AnnounceArea(1, 0));
+        if (cooplo::AdoptAfterRewake(1, other) != cooplo::kSettleAccept) Fail("t1268 f2: named elsewhere - the waiting adopter not accepted");
+        /* the player-gone path: slot 2 leaves - the entry becomes a settle with slot 3 left, and still waits while nobody holds the area */
+        kind = cooplo::RewakeOnGone(kind, from, 2); if (kind == 1) from = -1;
+        if (kind != 1 || from != -1) Fail("t1268 f2: the adopter gone - the entry is not a settle");
+        if (cooplo::RewakeWaitNeeded(kind, nLate) == 0) Fail("t1268 f2: slot 3 still waiting to be answered - the entry no longer waits");
+        if (cooplo::RewakeOnGone(kind, from, 9) != kind) Fail("t1268 f2: another player gone - the entry changed");
+        /* slot 3 leaves too: no adopter left - decided at once (cancelled, kept here), not left waiting for a player who is gone */
+        for (int j = 0; j < nLate; ) { if (late[j] == 3) { late[j] = late[--nLate]; } else ++j; }
+        if (cooplo::RewakeWaitNeeded(kind, nLate) != 0) Fail("t1268 f2: no adopter left - the entry still waits");
+        if (cooplo::RewakeWaitNeeded(0, 0) != 1) Fail("t1268 f2: an ACK entry must wait while nobody holds the area");
+    }
+    /* the sites ask the holder-only answers */
+    const std::string it = T313ReadFile("../coop-plugin/items.cpp"), tv = T313ReadFile("../coop-plugin/townver.cpp"), tg = T313ReadFile("../coop-plugin/towngen.cpp");
+    const std::string ws = T313ReadFile("../coop-plugin/worldsync.cpp"), ho = T313ReadFile("../coop-plugin/handoff.cpp");
+    if (it.empty() || tv.empty() || tg.empty() || ws.empty() || ho.empty()) { Fail("t1268: a plugin source would not read"); return; }
+    const std::string av = T1268Body(it, "int ItAreaVerdictAt(const float* pos, int forBox)");
+    if (av.find("loadedzones::HolderVerdict(held, mine)") == std::string::npos) Fail("t1268: ItAreaVerdictAt does not ask HolderVerdict");
+    if (av.find("MayInventFromView(") != std::string::npos || av.find("Ring1Grants(") != std::string::npos || av.find("MySlotLower(peerLow)") != std::string::npos)
+        Fail("t1268: ItAreaVerdictAt still asks the ring-1 presumption");
+    if (av.find("if (pic == coop::kPicLoading)") == std::string::npos) Fail("t1268: the load window arm (kept for now) is gone");
+    if (tg.find("in.mayHere = T392MayAt(bs, 0) == 1 ? 1 : 0;") == std::string::npos) Fail("t1268: the town refill's 'may' takes no map / teardown as may");
+    const std::string ad = T1268Body(ws, "static int AnnounceAreaDecide(float x, float z)");
+    if (ad.find("coopor::AnnounceArea(held, mine)") == std::string::npos || ad.find("HeldByOtherTS(") != std::string::npos) Fail("t1268: the sweep's area answer is not read from one held / mine view");
+    if (T1268Body(ws, "static bool AnnounceAreaMine(float x, float z, bool count)").find("if (d == kAreaNobodyYet) { if (count) ++g_skippedNobodyYet; return false; }") == std::string::npos)
+        Fail("t1268: the sweep does not skip 'nobody yet'");
+    const std::string rw = T1268Body(ho, "static int RewakeAreaHeldByOther(const RelMember& rm, int* awake)");
+    if (rw.find("coopor::AnnounceArea(held, mine)") == std::string::npos) Fail("t1268: the re-woken squad's area is not read the sweep's way");
+    if (ws.find("\" d33NobodyYet=\"") == std::string::npos || ho.find("rewakeWait[put,decided,stillNobody,notMine,worldCleared,now]=") == std::string::npos
+        || ho.find("rewakeWait2[lateAdded,playerGone]=") == std::string::npos
+        || it.find("itemBox3[publishedRemove,applyNotHolder,nobodyYet,") == std::string::npos || it.find("doorArea[loadWindow,staleMap,noSession,nobodyYet,") == std::string::npos
+        || it.find("restock[ran,skippedNotHolder,noBuilding,unreadable,nobodyYet,") == std::string::npos || it.find("noSession,nobodyYet,freshNoAreaRow]=") == std::string::npos
+        || it.find(" loadWindow[restock,box]=") == std::string::npos)
+        Fail("t1268: a report label for the wait or the load window is missing");
+}
+/* T-1261 (owner decision 1531, H-T1261-preholder): ONLY THE NAMED HOLDER MAKES A TOWN'S PEOPLE. The creation gates' answer
+   (loadedzones::HolderMakes, zones' MayMakeFromView) for every input family; each creation road's deferral and re-offer; the other
+   callers keep the presumption answer; a lone game is unchanged. */
+static std::string T1261Body(const std::string& src, const char* head)
+{
+    const size_t s = T1080DefAt(src, head), e = T1080BodyEnd(src, s);
+    return (s == std::string::npos || e == std::string::npos) ? std::string() : src.substr(s, e - s);
+}
+static std::string T1268Body(const std::string& src, const char* head) { return T1261Body(src, head); }
+void t_t1261_holder_only()
+{
+    using namespace loadedzones;
+    /* the gate's answers: held (1 another game, 0 nobody, -1 no fresh map, -2 a frozen area) x mine. Loaded here and ring 1 are not
+       inputs any more - every family the old rule granted on (loaded here, ring 1 alone, ring 1 with a lower slot, the 2 s stale
+       yield) is "held 0, mine 0" here and refuses. */
+    if (HolderMakes(0, 1) != 1) Fail("t1261: the named holder makes");
+    if (HolderMakes(1, 0) != 0 || HolderMakes(1, 1) != 0) Fail("t1261: another game holds the area - refused, whatever mine says");
+    if (HolderMakes(0, 0) != 0) Fail("t1261: nobody holds the area yet (loaded here, ring 1 or neither) - refused");
+    if (HolderMakes(-1, 0) != -1 || HolderMakes(-1, 1) != -1 || HolderMakes(-2, 0) != -1) Fail("t1261: no fresh map (or a frozen area) - the no-map answer");
+    /* building residents and bar crowds refused while nobody holds the area are SET ASIDE, never lost: `nobody` with the area
+       loaded, `loading` before it is; the town's check-up waits, then makes them once this game is named, or settles them as
+       another game's once that game is named */
+    const int nobody = HolderMakes(0, 0);
+    if (townreoffer::DeferCauseAt(1, nobody, 0, 1, -1) != townreoffer::kDefNobody) Fail("t1261: loaded, nobody holds it - set aside as nobody");
+    if (townreoffer::DeferCauseAt(1, nobody, 0, 0, -1) != townreoffer::kDefLoading) Fail("t1261: not loaded yet, nobody holds it - set aside as loading");
+    if (townreoffer::Decide(1, 0, 0, 0, nobody, 0) != townreoffer::kReWait) Fail("t1261: the check-up waits while nobody holds the area");
+    if (townreoffer::Decide(1, 0, 0, 0, HolderMakes(0, 1), 0) != townreoffer::kReGenerate) Fail("t1261: named this game's - the check-up makes them");
+    if (townreoffer::Decide(1, 0, 0, 0, HolderMakes(1, 0), 1) != townreoffer::kReOther) Fail("t1261: named another game's - settled as answered-other");
+    if (townreoffer::DeferCauseAt(1, HolderMakes(0, 1), 0, 1, -1) != townreoffer::kDefNone) Fail("t1261: the named holder is an answer - nothing set aside");
+    if (townreoffer::DeferCauseAt(1, HolderMakes(1, 0), 1, 1, 1) != townreoffer::kDefNone) Fail("t1261: another holder (confirmed) is an answer - nothing set aside");
+    /* a single character: the leaf's linked arm reads a nobody refusal as not-here (not no-map) */
+    if (coopor::LeafLinked(nobody) != coopor::kLeafLinkedNotHere || coopor::LeafLinked(HolderMakes(0, 1)) != coopor::kLeafLinkedAllow) Fail("t1261: the character gate's answers");
+    /* the presumption rule the other callers keep (MayInventFromView's last rule) is unchanged */
+    if (Ring1Grants(1, 0, 0) != 1 || Ring1Grants(1, 1, 0) != 0 || Ring1Grants(0, 0, 1) != 0) Fail("t1261: the ring-1 presumption the other callers keep changed");
+    /* the wiring */
+    const std::string zo = T313ReadFile("../coop-plugin/zones.cpp"), tg = T313ReadFile("../coop-plugin/towngen.cpp"), wg = T313ReadFile("../coop-plugin/worldgen.cpp");
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp"), tv = T313ReadFile("../coop-plugin/townver.cpp"), it = T313ReadFile("../coop-plugin/items.cpp");
+    if (zo.empty() || tg.empty() || wg.empty() || st.empty() || tv.empty() || it.empty()) { Fail("t1261: could not read the sources"); return; }
+    const std::string mm = T1261Body(zo, "int MayMakeFromView(int held, int mine)");
+    if (mm.find("StoreTearingDown()") == std::string::npos || mm.find("loadedzones::HolderMakes(held, mine)") == std::string::npos) Fail("t1261: MayMakeFromView is the teardown refusal then HolderMakes");
+    const std::string mi = T1261Body(zo, "int MayInventFromView(int held,");
+    if (mi.find("if (loadedHere == 1)") == std::string::npos || mi.find("loadedzones::Ring1Grants(ring1, peerRing1, mySlotLower)") == std::string::npos) Fail("t1261: MayInventFromView lost its presumption arms (other callers keep them)");
+    struct Gate { const std::string* src; const char* head; const char* call; const char* what; };
+    const Gate gates[] = {
+        { &tg, "static void* CreateJudged(", "MayMakeFromView(aHeld, aMine)", "the squad gate (main's CreateJudged, which detour_create calls)" },
+        { &tg, "static int T392MayAt(", "MayMakeFromView(h, m)", "the residents gate and the re-offers" },
+        { &tg, "void detour_barFlies(void* town)", "MayMakeFromView(bHeld, bMine)", "the bar crowd gate" },
+        { &wg, "static bool LeafGatedAt(", "coop::MayMakeFromView(wHeld, wMine)", "the character gate" } };
+    for (size_t i = 0; i < sizeof gates / sizeof gates[0]; ++i)
+    {
+        const std::string b = T1261Body(*gates[i].src, gates[i].head);
+        if (b.empty() || b.find(gates[i].call) == std::string::npos) Fail(std::string("t1261: ") + gates[i].what + " does not ask the named-holder answer");
+        if (b.find("MayInventFromView(") != std::string::npos || b.find("MayInventHereTS(") != std::string::npos) Fail(std::string("t1261: ") + gates[i].what + " still asks the presumption answer");
+    }
+    if (T1080BodyHas(tg, "static int T392ResidentsGate(", "T392MayAt(s, &h, &lh)") == 0) Fail("t1261: the residents gate asks T392MayAt");
+    if (T1080BodyHas(tg, "static int T392ReofferOne(", "T392MayAt(s, &held, &loadedR)") == 0) Fail("t1261: the residents re-offer asks the same gate");
+    /* each refused creation road counts its nobody-holds-yet refusal */
+    if (T1080BodyHas(tg, "static void* CreateJudged(", "T1261NobodyYet(0,") == 0 || T1080BodyHas(tg, "static int T392ResidentsGate(", "T1261NobodyYet(1,") == 0
+        || T1080BodyHas(tg, "void detour_barFlies(void* town)", "T1261NobodyYet(2,") == 0
+        || T1080BodyHas(wg, "RootObject* detour_createRandomCharacter(", "coop::TownGenNobodyYetCharacter(cs.x, cs.y, _ReturnAddress())") == 0)
+        Fail("t1261: a creation road does not count its nobody-holds-yet refusal");
+    if (tg.find("\" nobodyYetDeferred[squad,residents,bar,character]=\"") == std::string::npos) Fail("t1261: the [TG] line's nobodyYetDeferred label");
+    /* the other callers keep today's answer */
+    if (st.find("const int may = MayInventHereTS(s); if (may == coop::kInventTeardown) ++g_mineAreaTeardown;") == std::string::npos) Fail("t1261: the off-screen update's answer changed");
+    if (tv.find("coop::MayInventFromView(held, mine, 1, r1, pr1, coop::MySlotLower(plow), pe) == 1 ? 1 : 0") == std::string::npos
+        || tv.find("MayInventHereTS(SectorOf(pl.x, pl.z)) == 1 ? 1 : 0") == std::string::npos) Fail("t1261: the town-record checks' answer changed");
+    /* T-1268: the box / door / ground / restock answer moved to the named holder only (t1268_holder_only); T-1268 fold 1 (review H1): the
+       town version's pick and first publish stay as T-1285 left them - the town version moves to its own design read */
+    if (tg.find("const int may = MayInventHereTS(s);   /* T-1261: the presumption answer, as before decision 1531") == std::string::npos) Fail("t1261: the owed claim keep's answer changed");
+    /* a lone game (role=single) makes its own people as before */
+    if (T1080BodyHas(tg, "static int T392ResidentsGate(", "RoleIsSingle()) return 1;") == 0 || T1080BodyHas(wg, "static bool LeafGatedAt(", "if (coop::RoleIsSingle())") == 0
+        || T1080BodyHas(tg, "void detour_barFlies(void* town)", "refuse = !RoleIsSingle();") == 0 || T1080BodyHas(tg, "static void* CreateJudged(", "if (!RoleIsSingle())") == 0)
+        Fail("t1261: the lone-game road changed");
+}
+/* T-1261 review folds: a sleeping group's wake waits for the naming; the nobody-holds character refusal counted where it is one; set-aside
+   work settled as another game's only once that game's naming is confirmed; the first-5 lines per world */
+void t_t1261_folds()
+{
+    using namespace loadedzones;
+    /* (1) the wake: held only while the area is loaded here and the fresh map names nobody */
+    if (WakeWaitsForNaming(1, 0, 0, -1) != 1) Fail("t1261 fold: loaded here, nobody holds it - the wake waits for the naming");
+    if (WakeWaitsForNaming(1, 0, 1, -1) != 0) Fail("t1261 fold: this game named - the wake runs (its people pass the character gate)");
+    if (HolderMakes(0, 1) != 1 || HolderMakes(0, 0) != 0) Fail("t1261 fold: the wake's rule and the character gate's rule disagree");
+    if (WakeWaitsForNaming(1, 1, 0, 1) != 0 || WakeWaitsForNaming(1, -1, -1, -1) != 0 || WakeWaitsForNaming(1, -2, -2, -1) != 0) Fail("t1261 fold: a confirmed other holder / no map / frozen - the wake's other rules decide");
+    if (WakeWaitsForNaming(0, 0, 0, -1) != 0) Fail("t1261 fold: not loaded here - the engine does not wake there, nothing held");
+    /* re-check fold (MED): another game named but not yet confirmed (no loaded report from it) is still 'nobody yet' - the wake is held
+       and the town's residents / bar crowd are set aside; once the holder reports the area loaded, its naming is an answer */
+    if (WakeWaitsForNaming(1, 1, 0, 0) != 1 || WakeWaitsForNaming(1, 1, 0, -1) != 1) Fail("t1261 re-check: another game named, not confirmed - the wake waits");
+    if (WakeWaitsForNaming(1, 1, 0, 1) != 0) Fail("t1261 re-check: another game named and confirmed - the wake's other rules decide");
+    if (WakeWaitsForNaming(0, 1, 0, 0) != 0) Fail("t1261 re-check: not loaded here - nothing held, confirmed or not");
+    const int other = HolderMakes(1, 0);
+    if (townreoffer::DeferCauseAt(1, other, 1, 1, 0) != townreoffer::kDefNobody || townreoffer::DeferCauseAt(1, other, 1, 1, -1) != townreoffer::kDefNobody)
+        Fail("t1261 re-check: loaded here, another game named but not confirmed - set aside as nobody");
+    if (townreoffer::DeferCauseAt(1, other, 1, 0, 0) != townreoffer::kDefLoading) Fail("t1261 re-check: not loaded here yet, another game named but not confirmed - set aside as loading");
+    if (townreoffer::DeferCauseAt(1, other, 1, 1, 1) != townreoffer::kDefNone || townreoffer::DeferCauseAt(1, other, 1, 0, 1) != townreoffer::kDefNone)
+        Fail("t1261 re-check: another game named and confirmed - an answer, nothing set aside");
+    if (townreoffer::DeferCauseAt(1, -1, -1, 1, 0) != townreoffer::kDefNoMap || townreoffer::DeferCauseAt(1, -2, 1, 1, 0) != townreoffer::kDefNone
+        || townreoffer::DeferCauseAt(0, other, 1, 1, 0) != townreoffer::kDefNoNotebook) Fail("t1261 re-check: no map / teardown / no link keep their answers");
+    /* the set-aside item's check-up: waits while unconfirmed; made here if the area passes to this game; settled as another's once confirmed */
+    if (townreoffer::OtherConfirmed(townreoffer::Decide(1, 0, 0, 0, other, 1), 1, 0) != townreoffer::kReWait) Fail("t1261 re-check: the check-up waits for the naming");
+    if (townreoffer::OtherConfirmed(townreoffer::Decide(1, 0, 0, 0, HolderMakes(0, 1), 0), 0, -1) != townreoffer::kReGenerate) Fail("t1261 re-check: passed to this game - made here");
+    if (townreoffer::OtherConfirmed(townreoffer::Decide(1, 0, 0, 0, other, 1), 1, 1) != townreoffer::kReOther) Fail("t1261 re-check: confirmed another's - settled");
+    if (townreoffer::Decide(0, 0, 0, 0, other, 1) != townreoffer::kReWait) Fail("t1261 re-check: the area unloaded here - the item keeps waiting");
+    /* (4) another game's answer only once its naming is confirmed */
+    if (townreoffer::OtherConfirmed(townreoffer::kReOther, 1, 0) != townreoffer::kReWait || townreoffer::OtherConfirmed(townreoffer::kReOther, 1, -1) != townreoffer::kReWait)
+        Fail("t1261 fold: an unconfirmed naming of another game - the set-aside item waits");
+    if (townreoffer::OtherConfirmed(townreoffer::kReOther, 1, 1) != townreoffer::kReOther) Fail("t1261 fold: a confirmed naming of another game - answered-other as before");
+    if (townreoffer::OtherConfirmed(townreoffer::kReGenerate, 0, 0) != townreoffer::kReGenerate || townreoffer::OtherConfirmed(townreoffer::kReWait, 0, -1) != townreoffer::kReWait
+        || townreoffer::OtherConfirmed(townreoffer::kReFilled, 1, 0) != townreoffer::kReFilled) Fail("t1261 fold: only another game's answer is changed");
+    /* the residents check-up: waiting while unconfirmed, then answered-other (stored 0: forgotten) once confirmed */
+    const int dU = townreoffer::OtherConfirmed(townreoffer::Decide(1, 0, 0, 0, HolderMakes(1, 0), 1), 1, 0);
+    if (owedpop::Commit(dU, 1, 0, 0, (int)owedpop::kClaimNone) != owedpop::kActWait) Fail("t1261 fold: an unconfirmed naming must not forget the set-aside row");
+    const int dC = townreoffer::OtherConfirmed(townreoffer::Decide(1, 0, 0, 0, HolderMakes(1, 0), 1), 1, 1);
+    if (owedpop::Commit(dC, 1, 0, 0, (int)owedpop::kClaimNone) != owedpop::kActForget) Fail("t1261 fold: a confirmed naming settles the row as before");
+    /* the wiring */
+    const std::string tg = T313ReadFile("../coop-plugin/towngen.cpp"), wg = T313ReadFile("../coop-plugin/worldgen.cpp"), st = T313ReadFile("../coop-plugin/store.cpp"), zo = T313ReadFile("../coop-plugin/zones.cpp");
+    if (tg.empty() || wg.empty() || st.empty() || zo.empty()) { Fail("t1261 fold: could not read the sources"); return; }
+    const std::string up = T1261Body(st, "unsigned char detour_unloadedUpdate(void* unloaded)");
+    const size_t hold = up.find("WakeWaitsNamingAt(ws) != 0) { ++g_wakeHeldNobodyYet;"), auth = up.find("if ((g_relayLinkedCached != 0) && g_storeAuthority)");
+    if (hold == std::string::npos || auth == std::string::npos || hold > auth) Fail("t1261 fold: the wake hold must come before every road that wakes (the store authority's too)");
+    if (T1080BodyHas(st, "static int WakeWaitsNamingAt(", "loadedzones::WakeWaitsForNaming(l, h, m, hl)") == 0) Fail("t1261 fold: the wake hold asks WakeWaitsForNaming");
+    {
+        const std::string wn = T1261Body(st, "static int WakeWaitsNamingAt(");
+        const size_t lh = wn.find("if (coop::SectorLoadedHereTS(s) != 1) return 0;"), av = wn.find("AreaViewTS(s, &h, &m, 0, &kept, 0, 0);");   /* d1556 fold 1: the view's loadedHere is the kept set; the wake asks the engine's loaded set first */
+        if (lh == std::string::npos || av == std::string::npos || lh > av) Fail("t1261 re-check: the wake hold reads loaded-here before the full area read");
+        if (wn.find("(l == 1 && h == 1) ? HolderLoadedTS(s) : -1") == std::string::npos) Fail("t1261 re-check: the wake hold reads the holder's loaded bit when another game is named");
+    }
+    if (T1080BodyHas(tg, "static int T392ResidentsGate(", "townreoffer::DeferCauseAt(1, mayG, h, lh, h == 1 ? HolderLoadedTS(s) : -1)") == 0
+        || T1080BodyHas(tg, "void detour_barFlies(void* town)", "townreoffer::DeferCauseAt(1, may, bHeld, bLoadedHere, bHeld == 1 ? HolderLoadedTS(bs) : -1)") == 0)
+        Fail("t1261 re-check: the residents and bar gates pass the holder's loaded bit");
+    {
+        const std::string wn = T1261Body(st, "static int WakeWaitsNamingAt(");
+        const size_t lh = wn.find("if (coop::SectorLoadedHereTS(s) != 1) return 0;"), av = wn.find("AreaViewTS(s, &h, &m, 0, &kept, 0, 0);");   /* d1556 fold 1: the view's loadedHere is the kept set; the wake asks the engine's loaded set first */
+        if (lh == std::string::npos || av == std::string::npos || lh > av) Fail("t1261 re-check: the wake hold reads loaded-here before the full area read");
+        if (wn.find("(l == 1 && h == 1) ? HolderLoadedTS(s) : -1") == std::string::npos) Fail("t1261 re-check: the wake hold reads the holder's loaded bit when another game is named");
+    }
+    if (T1080BodyHas(tg, "static int T392ResidentsGate(", "townreoffer::DeferCauseAt(1, mayG, h, lh, h == 1 ? HolderLoadedTS(s) : -1)") == 0
+        || T1080BodyHas(tg, "void detour_barFlies(void* town)", "townreoffer::DeferCauseAt(1, may, bHeld, bLoadedHere, bHeld == 1 ? HolderLoadedTS(bs) : -1)") == 0)
+        Fail("t1261 re-check: the residents and bar gates pass the holder's loaded bit");
+    if (st.find("\" wakeHeldNobodyYet=\"") == std::string::npos) Fail("t1261 fold: the WAKE line's wakeHeldNobodyYet");
+    const std::string lg = T1261Body(wg, "static bool LeafGatedAt(");
+    if (lg.find("TownGenNobodyYetCharacter") != std::string::npos || lg.find("*nobodyYetOut = 1;") == std::string::npos) Fail("t1261 fold: the gate reports the cause; the refusal is counted by its caller");
+    const std::string rc = T1261Body(wg, "RootObject* detour_createRandomCharacter(");
+    const size_t blk = rc.find("InterlockedIncrement64(&g_blkChar);"), cnt = rc.find("coop::TownGenNobodyYetCharacter(");
+    if (blk == std::string::npos || cnt == std::string::npos || cnt < blk || rc.find("InterlockedIncrement64(&g_charPlayerPass);") < cnt) Fail("t1261 fold: the character refusal is counted inside the refused arm, never for a player-faction pass");
+    if (wg.find("g_leafGatedOtherLoaded") != std::string::npos || wg.find("S(g_leafGatedNobodyYet)") == std::string::npos) Fail("t1261 fold: gatedNotMine's counter is named for what it counts");
+    if (T1080BodyHas(tg, "static int T392ReofferOne(", "T1261HolderConfirmedWait(d0, held, s)") == 0 || T1080BodyHas(tg, "static void T392ReofferBar(", "T1261HolderConfirmedWait(d0, held, s)") == 0)
+        Fail("t1261 fold: a re-offer settles another game's answer before its naming is confirmed");
+    if (T1080BodyHas(tg, "static int T1261HolderConfirmedWait(", "townreoffer::OtherConfirmed(d, held, HolderLoadedTS(s))") == 0) Fail("t1261 fold: the check-up asks HolderLoadedTS");
+    const std::string hl = T1261Body(zo, "int HolderLoadedTS(const Sector& s)");
+    if (hl.find("g_ownerSlot[s.x][s.y]") == std::string::npos || hl.find("g_effMask[s.x][s.y]") == std::string::npos || hl.find("g_areaFrozen[s.x][s.y] == 0") == std::string::npos)
+        Fail("t1261 fold: HolderLoadedTS reads the holder's own loaded bit (frozen excluded)");
+    if (T1080BodyHas(tg, "void TownGenWorldTeardown()", "::InterlockedExchange(&g_t1261Lines[k], 0)") == 0) Fail("t1261 fold: the first-5 lines are per world");
+    if (tg.find("\" reofferHolderUnconfirmedWait=\"") == std::string::npos) Fail("t1261 fold: the [TG] line's reofferHolderUnconfirmedWait");
 }
 /* ---- T-581: A TOWN'S FIRST POPULATION THAT WAS SET ASIDE IS KEPT ON THE WORLD SERVER UNTIL IT IS MADE (src/common/owedpop.h) ---- */
 owedpop::Row T581Row(unsigned kind, const char* key, const char* sid) { owedpop::Row r; r.kind = kind; r.key = key; r.sid = sid; r.x = -2150.5f; r.z = 9876.25f; return r; }
@@ -3920,6 +4455,26 @@ void t_towns2_rebuild_decisions()
     if (coopt2::VersionMayChange(1, 5, 5) != 0) Fail("versions, nothing changed since out of range - walks");
     if (coopt2::VersionMayChange(1, 6, 5) != 1) Fail("versions and a changed state - waits");
     if (coopt2::VersionMayChange(-1, 5, 5) != 1) Fail("unread versions - waits");
+    /* T-640 D1: the engine's own version test decides; unread falls back to the stand-in */
+    if (coopt2::VersionAskWait(0, coopt2::kVaApplies, 6, 5) != 0 || coopt2::VersionAskWait(0, coopt2::kVaUnread, 6, 5) != 0) Fail("D1: no other versions - never waits");
+    if (coopt2::VersionAskWait(1, coopt2::kVaNone, 6, 5) != 0) Fail("D1: asked, no other version applies - walks although a named character changed");
+    if (coopt2::VersionAskWait(-1, coopt2::kVaNone, 6, 5) != 0) Fail("D1: the version list unread by the walk but the engine's own test ran - its answer decides");
+    if (coopt2::VersionAskWait(1, coopt2::kVaApplies, 5, 5) != 1) Fail("D1: asked, another version applies - waits although no named character changed");
+    if (coopt2::VersionAskWait(1, coopt2::kVaUnread, 6, 5) != 1) Fail("D1: test unreadable, a state changed - the stand-in waits (safe side)");
+    if (coopt2::VersionAskWait(1, coopt2::kVaUnread, 5, 5) != 0) Fail("D1: test unreadable, nothing changed - the stand-in walks");
+    if (coopt2::VersionAskWait(-1, coopt2::kVaUnread, 5, 5) != 1) Fail("D1: nothing readable - waits");
+    {   /* T2333: `townres kill` option words (TEST-ONLY lever): leader is DEV-only and replaces all; the count is not an option */
+        int f = 0;
+        if (coopt2::KillOptWord("leader", 1, &f) != 1 || f != coopt2::kKillLeader) Fail("T2333: leader not read in a DEV build");
+        f = 0; if (coopt2::KillOptWord("leader", 0, &f) != -1 || f != 0) Fail("T2333: leader accepted in a release build");
+        f = coopt2::kKillAll; if (coopt2::KillOptWord("leader", 1, &f) != 1 || f != coopt2::kKillLeader) Fail("T2333: leader did not replace all");
+        f = coopt2::kKillLeader; if (coopt2::KillOptWord("all", 1, &f) != 1 || f != coopt2::kKillAll) Fail("T2333: all did not replace leader");
+        f = 0; if (coopt2::KillOptWord("noregen", 0, &f) != 1 || f != coopt2::kKillNoRegen) Fail("T2333: noregen not read");
+        f = coopt2::kKillNoRegen; if (coopt2::KillOptWord("regen", 0, &f) != 1 || f != coopt2::kKillRegen) Fail("T2333: regen did not replace noregen");
+        f = 0; if (coopt2::KillOptWord("pat", 0, &f) != 1 || coopt2::KillOptWord("res", 0, &f) != 1 || f != 0) Fail("T2333: pat / res");
+        f = 0; if (coopt2::KillOptWord("1", 1, &f) != 0 || coopt2::KillOptWord("Leader", 1, &f) != 0 || f != 0) Fail("T2333: a count or an unlowered word read as an option");
+        if ((coopt2::kKillLeader & (coopt2::kKillCountMask | coopt2::kKillPat | coopt2::kKillRegen | coopt2::kKillNoRegen | coopt2::kKillAll)) != 0) Fail("T2333: the leader bit overlaps");
+    }
     /* due: 120 in-game hours, the TEST verb skips the timer only, no clock is never due */
     if (coopt2::RebuildDue(-1.0, 10.0, 1) != -1) Fail("no clock -> -1, even when forced");
     if (coopt2::RebuildDue(50.0, -1.0, 0) != 3) Fail("never stamped on this holder -> stamp, the 5 days start");
@@ -6906,8 +7461,10 @@ void t_crime_kinds_wire()
         Fail("the old decoder must read kind 1's fields (the kind byte ignored)");
     std::vector<char> k1x(k1); k1x.push_back((char)0x77); k1x.push_back((char)0x01);
     if (coopcrime::DecodeCrimeMsg(&k1x[0], k1x.size(), &uid, &o, &kind, &rel) != coopcrime::kCrimeDecodeOk || kind != 1) Fail("bytes after kind 1 must be ignored");
-    std::vector<char> k9(k0); k9.push_back((char)3);
-    if (coopcrime::DecodeCrimeMsg(&k9[0], k9.size(), &uid, &o, &kind, &rel) != coopcrime::kCrimeDecodeBadKind) Fail("kind 3 must be refused");
+    std::vector<char> k9(k0); k9.push_back((char)4);
+    if (coopcrime::DecodeCrimeMsg(&k9[0], k9.size(), &uid, &o, &kind, &rel) != coopcrime::kCrimeDecodeBadKind) Fail("kind 4 must be refused");
+    std::vector<char> k3(k0); k3.push_back((char)3);   /* T-1131: kind 3 exists now - a bare kind byte is a cut kind 3 */
+    if (coopcrime::DecodeCrimeMsg(&k3[0], k3.size(), &uid, &o, &kind, &rel) != coopcrime::kCrimeDecodeCaughtTrunc) Fail("a bare kind 3 must be refused as cut");
     std::vector<char> kc(k1); kc.resize(kc.size() - 2);
     if (coopcrime::DecodeCrimeMsg(&kc[0], kc.size(), &uid, &o, &kind, &rel) != coopcrime::kCrimeDecodeSidTrunc) Fail("a cut sid under kind 1 must be refused as before");
 
@@ -7222,6 +7779,26 @@ void t_p25_name_levers_parse()
         if (TalkTestCarrierParse("nearestcarrier money 5", &ca, &ct, &ce, &co)) Fail("a word for the act must be refused");
         if (TalkTestCarrierParse("nearestname 8 5", &ca, &ct, &ce, &co)) Fail("another verb must be refused");
     }
+    {   /* T-1145 (owner 1559 a): talktest dialogue <dialogueSid> <npcUid | leader:<Faction_Name>> <targetUid> */
+        std::string ds, df; unsigned int dn = 9, dt = 9;
+        if (!TalkTestDialogueParse("dialogue 44152-Dialogue.mod leader:United_Cities 4194305", &ds, &dn, &df, &dt)
+            || ds != "44152-Dialogue.mod" || dn != 0 || df != "united cities" || dt != 4194305)
+            Fail("talktest dialogue by faction leader must parse (sid kept as written, faction keyed, '_' = a space)");
+        if (!TalkTestDialogueParse("  dialogue\t44146-Dialogue.mod 0x10 77 ", &ds, &dn, &df, &dt) || ds != "44146-Dialogue.mod" || dn != 16 || !df.empty() || dt != 77)
+            Fail("talktest dialogue by npc uid (hex) must parse");
+        if (TalkTestDialogueParse("dialogue 44152-Dialogue.mod leader:United_Cities", &ds, &dn, &df, &dt) || !ds.empty() || dt != 0)
+            Fail("no target must be refused (outputs reset)");
+        if (TalkTestDialogueParse("dialogue 44152-Dialogue.mod 5 0", &ds, &dn, &df, &dt)) Fail("target 0 must be refused");
+        if (TalkTestDialogueParse("dialogue 44152-Dialogue.mod 0 5", &ds, &dn, &df, &dt)) Fail("npc uid 0 must be refused");
+        if (TalkTestDialogueParse("dialogue 44152 5 6", &ds, &dn, &df, &dt)) Fail("a number for the sid must be refused");
+        if (TalkTestDialogueParse("dialogue {sid} 5 6", &ds, &dn, &df, &dt)) Fail("an unresolved placeholder sid must be refused");
+        if (TalkTestDialogueParse("dialogue 44152-Dialogue.mod leader: 6", &ds, &dn, &df, &dt)) Fail("an empty faction must be refused");
+        if (TalkTestDialogueParse("dialogue 44152-Dialogue.mod leader:{fac} 6", &ds, &dn, &df, &dt)) Fail("a placeholder faction must be refused");
+        if (TalkTestDialogueParse("dialogue 44152-Dialogue.mod 5 6 extra", &ds, &dn, &df, &dt)) Fail("a word after the target must be refused");
+        if (TalkTestDialogueParse("nearestname 44152-Dialogue.mod 5 6", &ds, &dn, &df, &dt)) Fail("another verb must be refused");
+        if (TalkTestDialogueParse("dialogue " + std::string(65, 'x') + " 5 6", &ds, &dn, &df, &dt)) Fail("a sid over 64 characters must be refused");
+        if (TalkTestDialogueParse("dialogue 44152-Dialogue.mod 5 0x100000000", &ds, &dn, &df, &dt)) Fail("a target over 32 bits must be refused");
+    }
     if (TalkTestNameParse("nearestname Bar Thug", &nm, &t, &ev, &own)) Fail("no target must be refused");
     if (TalkTestNameParse("nearestname Bar Thug 0 1", &nm, &t, &ev, &own)) Fail("target 0 must be refused");
     if (TalkTestNameParse("nearestname Bar Thug 5 256", &nm, &t, &ev, &own)) Fail("event 256 must be refused");
@@ -7450,15 +8027,16 @@ void t_p26s5_talkwire_act_round_trip_caps_and_side_table()
     res.anyApplied = kTalkAnyUnknown;   /* P26s5 fold 1 */
     std::vector<char> rb;
     TalkMsg qr;
-    if (!EncodeTalk(&rb, res) || rb.size() != 31 || DecodeTalk(&rb[0], rb.size(), &qr) != kTalkDecodeOk || qr.kind != kTalkActResult
+    if (!EncodeTalk(&rb, res) || rb.size() != 32 || DecodeTalk(&rb[0], rb.size(), &qr) != kTalkDecodeOk || qr.kind != kTalkActResult
         || qr.seq != 17 || qr.result != kTalkActNoMoney || qr.detail != 8 || qr.moneyBefore != 20 || qr.moneyAfter != -1 || qr.applied != 0
-        || qr.unsupported != 2 || qr.convId != 3 || qr.anyApplied != kTalkAnyUnknown)
-        Fail("an ACT_RESULT must be 31 bytes and round-trip every field (anyApplied apart from result: P26s5 fold 1)");
+        || qr.unsupported != 2 || qr.convId != 3 || qr.anyApplied != kTalkAnyUnknown || qr.talker[kTalkerRank] != kTalkerAbsent)
+        Fail("an ACT_RESULT must be 32 bytes (T-898 T898RANK: an empty talker block last) and round-trip every field (anyApplied apart from result: P26s5 fold 1)");
     for (size_t n = 0; n < rb.size(); ++n)
     {
         TalkMsg r;
         const int e = DecodeTalk(n ? &rb[0] : "", n, &r);
-        if (e != (n < 13 ? kTalkDecodeTooShort : kTalkDecodeTrunc)) { Fail("a truncated ACT_RESULT must decode as Trunc"); break; }
+        if (e != (n < 13 ? kTalkDecodeTooShort : (n == rb.size() - 1 ? kTalkDecodeOk : kTalkDecodeTrunc)))   /* T-898: without the talker block = the older layout */
+        { Fail("a truncated ACT_RESULT must decode as Trunc (the older layout without the talker block: ok)"); break; }
     }
     TalkMsg over = a;
     while (over.actTypes.size() < 33) { over.actTypes.push_back(9); over.actValues.push_back(1); }
@@ -7639,6 +8217,7 @@ void t_p26s1f1_talkwire_every_truncation_is_trunc()
         {
             TalkMsg r;
             r.convId = 0xDEADBEEFu;
+            if (ms[k].kind == kTalkAnswer && n == b.size() - 1) continue;   /* T-898: an ANSWER without its (empty) talker block is the older layout */
             const int want = n < 13 ? kTalkDecodeTooShort : kTalkDecodeTrunc;
             if (DecodeTalk(n ? &b[0] : "", n, &r) != want) { Fail("a message cut inside a field must decode as Trunc (TooShort under 13 bytes)"); return; }
             if (r.convId != 0xDEADBEEFu) { Fail("a truncated message must leave the output untouched"); return; }
@@ -7680,7 +8259,7 @@ void t_t737_talk_cursor_decisions_wire_and_rate()
     TalkMsg q;
     q.kind = kTalkCursorAsk; q.convId = 0; q.npcUid = 0x00400001u; q.targetUid = 0x00800002u; q.reqId = 41; q.purse = 1234;
     std::vector<char> b;
-    if (!EncodeTalk(&b, q) || b.size() != 21) { Fail("T-737: a CURSOR_ASK must encode to 21 bytes"); return; }
+    if (!EncodeTalk(&b, q) || b.size() != 22) { Fail("T-737: a CURSOR_ASK must encode to 22 bytes (T-898: an empty talker block last)"); return; }
     TalkMsg r;
     if (DecodeTalk(&b[0], b.size(), &r) != kTalkDecodeOk || r.kind != kTalkCursorAsk || r.reqId != 41 || r.purse != 1234
         || r.npcUid != 0x00400001u || r.targetUid != 0x00800002u || r.convId != 0)
@@ -7688,8 +8267,8 @@ void t_t737_talk_cursor_decisions_wire_and_rate()
     for (size_t n = 0; n < b.size(); ++n)
     {
         TalkMsg t;
-        const int want = n < 13 ? kTalkDecodeTooShort : kTalkDecodeTrunc;
-        if (DecodeTalk(n ? &b[0] : "", n, &t) != want) { Fail("T-737: a cut CURSOR_ASK must decode as Trunc (TooShort under 13 bytes)"); break; }
+        const int want = n < 13 ? kTalkDecodeTooShort : (n == 21 ? kTalkDecodeOk : kTalkDecodeTrunc);   /* 21: without the talker block (T-898), the older layout */
+        if (DecodeTalk(n ? &b[0] : "", n, &t) != want) { Fail("T-737: a cut CURSOR_ASK must decode as Trunc (TooShort under 13 bytes; ok at 21, the older layout)"); break; }
     }
     TalkMsg a;
     a.kind = kTalkCursorAnswer; a.convId = 0; a.npcUid = 0x00400001u; a.targetUid = 0x00800002u; a.reqId = 41; a.result = kTalkCursorParked;
@@ -7799,7 +8378,7 @@ void t_p25_talkwire_request_and_new_fields()
     TalkMsg q;
     q.kind = kTalkRequest; q.convId = 0; q.npcUid = 0x00400001u; q.targetUid = 0x00800002u; q.reqId = 77; q.event = 1;
     std::vector<char> b;
-    if (!EncodeTalk(&b, q) || b.size() != 22) { Fail("P25: a REQUEST must encode to 22 bytes (the purse last)"); return; }
+    if (!EncodeTalk(&b, q) || b.size() != 23) { Fail("P25: a REQUEST must encode to 23 bytes (the purse, then T-898's empty talker block)"); return; }
     TalkMsg r;
     if (DecodeTalk(&b[0], b.size(), &r) != kTalkDecodeOk || r.kind != kTalkRequest || r.reqId != 77 || r.event != 1
         || r.npcUid != 0x00400001u || r.targetUid != 0x00800002u || r.convId != 0)
@@ -7807,8 +8386,8 @@ void t_p25_talkwire_request_and_new_fields()
     for (size_t n = 0; n < b.size(); ++n)
     {
         TalkMsg t;
-        const int want = n < 13 ? kTalkDecodeTooShort : kTalkDecodeTrunc;
-        if (DecodeTalk(n ? &b[0] : "", n, &t) != want) { Fail("P25: a cut REQUEST must decode as Trunc (TooShort under 13 bytes)"); break; }
+        const int want = n < 13 ? kTalkDecodeTooShort : (n == 22 ? kTalkDecodeOk : kTalkDecodeTrunc);   /* 22: without the talker block (T-898), the older layout */
+        if (DecodeTalk(n ? &b[0] : "", n, &t) != want) { Fail("P25: a cut REQUEST must decode as Trunc (TooShort under 13 bytes; ok at 22, the older layout)"); break; }
     }
     TalkMsg qb = q;
     qb.event = 256;
@@ -7997,6 +8576,15 @@ void t_t430_lever_shapes_parse()
     if (coopsay::CarryNameParse("carry 0 name Thug", &c, &p)) Fail("carry name: carrier 0 must be refused");
     if (coopsay::CarryNameParse("carry 5 name Bar Thug", &c, &p)) Fail("carry name: a name with a real space must be refused");
     if (coopsay::CarryNameParse("carried 5 name Thug", &c, &p)) Fail("carried is not the carry name form");
+    {   /* T-1262: the trailing `dead` word picks a dead body */
+        int dead = -1;
+        if (!coopsay::CarryNameParse("carry 4194305 name Hungry_bandit dead", &c, &p, &dead) || c != 4194305 || p != "hungry bandit" || dead != 1)
+            Fail("carry name dead must parse with dead=1");
+        if (!coopsay::CarryNameParse("carry 4194305 name Hungry_bandit", &c, &p, &dead) || dead != 0) Fail("carry name without dead: dead=0");
+        if (coopsay::CarryNameParse("carry 4194305 name Hungry_bandit alive", &c, &p, &dead)) Fail("carry name: a fifth word other than dead must be refused");
+        if (coopsay::CarryNameParse("carry 4194305 name Hungry_bandit dead dead", &c, &p, &dead)) Fail("carry name: dead twice must be refused");
+        if (!coopsay::CarryNameParse("carry 4194305 name Hungry_bandit dead", &c, &p) || p != "hungry bandit") Fail("carry name dead: the dead slot may be left out");
+    }
     if (!coopsay::TalkCarriersOptParse("", &ev, &act) || ev != -1 || act != -1) Fail("talkcarriers: no options");
     if (!coopsay::TalkCarriersOptParse(" ev 1 act 10", &ev, &act) || ev != 1 || act != 10) Fail("talkcarriers: ev and act");
     if (!coopsay::TalkCarriersOptParse("act 10", &ev, &act) || ev != -1 || act != 10) Fail("talkcarriers: act alone");
@@ -8551,7 +9139,7 @@ void t_t478_sell()
             || t65.find("TradingWindowCurrent                           var  02131BE0 02131BE0 -") == std::string::npos
             || t68.find("TradingWindowCurrent                           var  02132C30 02132C30 -") == std::string::npos)
             Fail("T-478 sell: an address table lacks the selling confirm or the trading window row");
-        if (t65.find("!count 719") == std::string::npos || t68.find("!count 719") == std::string::npos) Fail("T-478 sell: both address tables declare 719 rows (T-1150: + HaulStoreSearchOwnerTest, HaulCandidatesGather, OwnershipsMayUse, HaulSearchGatherRet; T-1242: + ResearchBenchList, ResearchCanPay, ResearchHasItems, ResearchPay; T-478 step 6: + the two buying confirms)");
+        if (t65.find("!count 759") == std::string::npos || t68.find("!count 759") == std::string::npos) Fail("T-478 sell: both address tables declare 759 rows (T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction; T-1122 cursorjoin: + PlacementPieceTown, PlacementRegionAdd, TownListNearestPlayer, PlacementGroupTownRange, TerrainHeightAt; decision 1556: + ZoneActivationDefaults (the fold reads it); T-1250: - the nine rows only its use-filter probe read (BuildingScorer and the eight MayUseRet* caller returns); T-1250 fix attempt 2: + TownUpdateOwnSearchRet, GetFoodTownGateTest; T-918 (main): + Character_setupAI; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1122: - the four rows only its assault-start probe read; T-1260: + RClickAutoTradeEnd; T-1150: + HaulStoreSearchOwnerTest, HaulCandidatesGather, OwnershipsMayUse, HaulSearchGatherRet; T-1242: + ResearchBenchList, ResearchCanPay, ResearchHasItems, ResearchPay; T-478 step 6: + the two buying confirms; T-1131 design A: + PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet; T-1131 fold 1: + TheftCaughtNotifyRet; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: + BuildingCreatePhysical; T-1294: + WalkMapDeferInterior (its box queue binds PlacementRegionAdd, the same function); T-1082: + UnlockDoorTaskStep; T-1309: + TaskObjectMineFactionTest; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet)");
         if (sw.find("AddrReg kSellConfirmRva_reg(\"SlaveSellingConfirm\"") == std::string::npos || sw.find("AddrReg kTradingWindowRva_reg(\"TradingWindowCurrent\"") == std::string::npos)
             Fail("T-478 sell: spawn.cpp does not bind the two rows");
         const size_t tk = sw.find("void SellWindowTick()\n{"), tkEnd = (tk == std::string::npos) ? tk : sw.find("\n}\n", tk);
@@ -8724,7 +9312,7 @@ void t_t478_buy()
             Fail("T-478 buy: a REQ with join type 42 / 48 must round-trip");
     }
     /* the protocol */
-    if (hovrec::kGameProtocol != 213u) Fail("T-478 buy: the game-to-game protocol is 213");
+    if (hovrec::kGameProtocol != 227u) Fail("T-478 buy: the game-to-game protocol is not 227");
     /* the address rows (1.0.68 from tools/gen_table_1068.py, forward and --reverse 'same'; signatures regenerated and proven) */
     {
         std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt");

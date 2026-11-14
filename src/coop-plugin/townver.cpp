@@ -64,8 +64,10 @@
 #include "townver.h"
 #include "../common/townverwire.h"
 #include "../common/townrefill.h"   /* SameWorld: the world the records belong to */
+#include "../common/townrebuild.h"   /* T-640 D1: kVaNone / kVaApplies / kVaUnread - the version ask's answers */
 #include "zones.h"
 #include "doors.h"   /* DoorsRecAreaRebuilt - a rebuilt town's stale door records */
+#include "build.h"   /* T-1333: TownBldgAreaRebuilt - a rebuilt town's building records */
 #include "store.h"
 #include "addresses.h"
 #include "hooks.h"
@@ -108,6 +110,14 @@ int g_tvRefuseDepth = 0;                            /* ... where no version may 
 void* g_tvScratch = 0;                              /* the chooser's world-state list (the list fill's first argument) */
 int g_tvFeedBegun = 0, g_tvListComplete = 0;        /* this world load's feed BEGIN arrived / its first page ended (the whole list is here) */
 DWORD g_tvSeedAt = 0;                               /* GetTickCount of the last seed pass (the unsigned difference is wrap-safe) */
+/* T-640 D1 - THE VERSION ASK (coop::TownVerAskOthers): the engine's chooser run in test-only mode for a town that is loaded here */
+coop::TvChooserFn g_tvChooserOrig = 0;              /* the chooser's original, seen at TownVerChoose (main thread) */
+void* g_tvZm = 0;                                   /* the zone manager the chooser was called with (the engine passes its one ZoneManager) */
+int g_tvAskDepth = 0;                               /* inside an ask: every candidate is tested here and refused to the engine */
+void* g_tvAskTown = 0;                              /* the town being asked about */
+int g_tvAskTested = 0, g_tvAskWould = 0, g_tvAskFault = 0;   /* this ask: other versions tested / whose states all hold / a read faulted */
+long long g_tvAsks = 0, g_tvAskStandingOnly = 0, g_tvAskStandingStripped = 0, g_tvAskScratchMiss = 0, g_tvAskQueryFault = 0;   /* asks' own decision-260 counts (REPORT townOv ask[...]) */
+long long g_tvAskRecord = 0, g_tvAskStandIn = 0;   /* answered from the stored record / a stand-in town, before the engine's test */
 
 long long g_tvOffThread = 0, g_tvNoHook = 0, g_tvFaults = 0, g_tvPlayerTown = 0, g_tvSolo = 0, g_tvStandInTown = 0;
 long long g_tvApplied = 0, g_tvAppliedLoad = 0, g_tvAppliedActivate = 0, g_tvAppliedSweep = 0, g_tvFacApplied = 0, g_tvFacMissing = 0, g_tvNoData = 0;
@@ -210,9 +220,9 @@ struct TvIntDepth { int* d; explicit TvIntDepth(int* p) : d(p) { if (d) ++*d; } 
    as true (the chooser runs exactly when this game switches the zone on). Held by another game answers 0, no fresh map not 1. */
 int TvHolderAtActivation(float x, float z)
 {
-    int held = 0, mine = 0, oth = 0, here = 0, r1 = 0, pr1 = 0, plow = -2, pe = 0, pf = 1;
-    coop::AreaViewTS(coop::SectorOf(x, z), &held, &mine, &oth, &here, &r1, &pr1, &plow, &pe, &pf);
-    return coop::MayInventFromView(held, mine, 1, r1, pr1, coop::MySlotLower(plow), pe, pf) == 1 ? 1 : 0;
+    int held = 0, mine = 0, oth = 0, here = 0, r1 = 0, pr1 = 0, plow = -2, pe = 0;
+    coop::AreaViewTS(coop::SectorOf(x, z), &held, &mine, &oth, &here, &r1, &pr1, &plow, &pe);
+    return coop::MayInventFromView(held, mine, 1, r1, pr1, coop::MySlotLower(plow), pe) == 1 ? 1 : 0;
 }
 
 /* The stored record onto this town: version first, then the owner. 1 = something changed. */
@@ -294,25 +304,66 @@ void TvResendMine()
 char detour_tvIsTrue(void* q, void* a2, void* a3, void* a4)
 {
     if (g_tvChooserDepth <= 0 || q == 0 || !TvOnMain()) return orig_tvIsTrue(q, a2, a3, a4);
+    const int ask = g_tvAskDepth > 0 ? 1 : 0;   /* T-640 D1 fold 1: a version ask counts in its own fields, not in the real loads' */
     unsigned long long npc = 0, standing = 0;
-    if (!TvQueryCountsPod(q, &npc, &standing)) { ++g_tvQueryFault; return orig_tvIsTrue(q, a2, a3, a4); }
+    if (!TvQueryCountsPod(q, &npc, &standing)) { ++(ask ? g_tvAskQueryFault : g_tvQueryFault); return orig_tvIsTrue(q, a2, a3, a4); }
     const int act = cooptv::TvIgnoreAction(npc, standing);
     if (act == cooptv::kTvEngine) return orig_tvIsTrue(q, a2, a3, a4);
     if (act == cooptv::kTvExpected)
     {
         char e = 0;
-        if (g_tvScratch != 0 && TvScratchExpectedPod(g_tvScratch, q, &e)) { ++g_tvStandingOnly; return e; }
-        ++g_tvScratchMiss; return orig_tvIsTrue(q, a2, a3, a4);
+        if (g_tvScratch != 0 && TvScratchExpectedPod(g_tvScratch, q, &e)) { ++(ask ? g_tvAskStandingOnly : g_tvStandingOnly); return e; }
+        ++(ask ? g_tvAskScratchMiss : g_tvScratchMiss); return orig_tvIsTrue(q, a2, a3, a4);
     }
-    ++g_tvStandingStripped;
+    ++(ask ? g_tvAskStandingStripped : g_tvStandingStripped);
     int fault = 0; const char r = TvIsTrueStripped(q, a2, a3, a4, &fault);
-    if (fault) ++g_tvQueryFault;
+    if (fault) ++(ask ? g_tvAskQueryFault : g_tvQueryFault);
     return r;
+}
+/* T-640 D1: the chooser's own test of one candidate, on the list the engine just cleared and the fill just filled (decomp_9fe6d0:
+   every node's query answered by isTrue - here through detour_tvIsTrue, so owner decision 260 is in force exactly as at an
+   activation - must equal the node's expected byte; the first mismatch fails the candidate). 1 = read; *holds = all met. */
+int TvAskHoldsPod(void* list, int* holds)
+{
+    __try
+    {
+        *holds = 1;
+        const unsigned long long bc = *(unsigned long long*)((char*)list + 0x18);
+        void** buckets = *(void***)((char*)list + 0x38);
+        if (*(unsigned long long*)((char*)list + 0x20) == 0 || buckets == 0) return 1;   /* nothing to meet: the engine's loop runs no test */
+        void** node = (void**)buckets[bc];
+        int n = 0;
+        for (; node != 0 && n < 256; ++n)
+        {
+            if (detour_tvIsTrue(node[2], 0, 0, 0) != *(char*)(node + 3)) { *holds = 0; return 1; }
+            node = (void**)node[0];
+        }
+        return node == 0 ? 1 : 0;   /* a list longer than 256 is not read as met */
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int TvCurVerPod(void* town, void** cur) { __try { *cur = *(void**)((char*)town + 0x338); return 1; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }   /* the chooser's own skip of the current version */
+/* One candidate during an ask: the engine's fill on its own list (it cleared the list just before), then the chooser's test here.
+   Always 0 to the engine, so it skips every candidate: nothing is switched and the town is not listed (decomp_9fe6d0: the version
+   setter and the +0x168148 insert run only when a candidate was collected). */
+char TvAskCandidate(void* list, void* gd, void* name, void* a4)
+{
+    if (orig_tvSetupFrom(list, gd, name, a4) == 0) return 0;   /* the engine skips it too: no world state read for this version */
+    void* cur = 0;
+    if (g_tvAskTown == 0 || !TvCurVerPod(g_tvAskTown, &cur)) { ++g_tvAskFault; return 0; }
+    if (gd == cur) return 0;                                    /* the version the town has now is never a switch */
+    g_tvScratch = list;                                         /* detour_tvIsTrue's expected-answer read (decision 260) */
+    int holds = 0;
+    if (!TvAskHoldsPod(list, &holds)) { ++g_tvAskFault; return 0; }
+    ++g_tvAskTested;
+    if (holds) ++g_tvAskWould;
+    return 0;
 }
 char detour_tvSetupFrom(void* list, void* gd, void* name, void* a4)
 {
     if (g_tvChooserDepth > 0 && TvOnMain())
     {
+        if (g_tvAskDepth > 0) return TvAskCandidate(list, gd, name, a4);   /* T-640 D1: test only, never a candidate */
         /* a game that does not run the area lets no candidate qualify: the engine neither switches nor lists the town as decided
            (decomp_9fe6d0: a 0 here skips the candidate; notifyRepopulation and the +0x168148 insert run only when one qualified) */
         if (g_tvRefuseDepth > 0) { ++g_tvNonHolderSkipped; return 0; }
@@ -374,6 +425,7 @@ bool TownVerChoose(void* zm, void* town, TvChooserFn orig)
 {
     if (orig == 0) return false;
     const int onMain = (zm != 0 && town != 0 && TvOnMain()) ? 1 : 0;
+    if (onMain) { g_tvChooserOrig = orig; g_tvZm = zm; }   /* T-640 D1: the version ask runs this same chooser */
     const int hooked = (TvNotify() != 0 && orig_tvIsTrue != 0 && orig_tvSetupFrom != 0) ? 1 : 0;
     int loadPass = 0; TvTownPod tp; tp.base = 0; tp.fac = 0; tp.playerOwned = 0; TvPlaced pl;
     const int readOk = (onMain && hooked && TvLoadPassPod(zm, &loadPass) && TvTownPodRead(town, &tp) && TvRead(town, &pl)) ? 1 : 0;
@@ -444,6 +496,7 @@ bool TownVerChoose(void* zm, void* town, TvChooserFn orig)
     {   /* the town's saved buildings were replaced: the area's door records that name no door are removed by its holder (doors.cpp) */
         const Sector ts = SectorOf(pl.x, pl.z);
         DoorsRecAreaRebuilt(ts.x * 64 + ts.y);
+        TownBldgAreaRebuilt(ts.x * 64 + ts.y);   /* T-1333: its building records describe the old town - never laid, removed by the holder (build.cpp) */
     }
     return r;
 }
@@ -608,6 +661,49 @@ void TownVerNoteRead(int sx, int sy, const std::string& zoneId, int loaded, int 
              + (unreadable > 0 ? " unreadable=" + TvN(unreadable) : std::string()) + " path=" + path);
 }
 
+/* T-640 D1 - would the engine's chooser switch this loaded town to another version if its area were switched on now? The chooser
+   itself runs (its "override town" list of the town's current record, each reference resolved, the shared world-state list cleared
+   and filled per candidate - all the engine's own code) with owner decision 260 in force (g_tvChooserDepth: detour_tvIsTrue), and
+   every candidate is tested here and refused to the engine (TvAskCandidate), so nothing is switched, listed, published or noted.
+   coopt2::kVaNone / kVaApplies / kVaUnread. */
+int TownVerAskOthers(void* town, int* tested, int* would, const char** why)
+{
+    *tested = 0; *would = 0; *why = "";
+    if (town == 0 || !TvOnMain()) { *why = "off the main thread"; return coopt2::kVaUnread; }
+    if (g_tvChooserOrig == 0 || g_tvZm == 0) { *why = "no chooser call seen yet"; return coopt2::kVaUnread; }
+    if (orig_tvIsTrue == 0 || orig_tvSetupFrom == 0) { *why = "the world-state hooks are not in"; return coopt2::kVaUnread; }
+    if (g_tvChooserDepth > 0 || g_tvAskDepth > 0) { *why = "inside the chooser"; return coopt2::kVaUnread; }
+    int loadPass = 0;
+    if (!TvLoadPassPod(g_tvZm, &loadPass)) { *why = "the zone manager unreadable"; return coopt2::kVaUnread; }
+    if (loadPass) { *why = "a save is loading"; return coopt2::kVaUnread; }
+    /* fold 1: what the next load does before the engine tests anything - the same TvChooseMode inputs TownVerChoose reads */
+    TvTownPod tp; tp.base = 0; tp.fac = 0; tp.playerOwned = 0; TvPlaced pl;
+    if (!TvTownPodRead(town, &tp) || !TvRead(town, &pl)) { *why = "the town unreadable"; return coopt2::kVaUnread; }
+    int standIn = 0;
+    if (tp.fac != 0 && !tp.playerOwned) { const int s = coop::StandInRecordSlot((::Faction*)tp.fac); standIn = (s >= 0 || s == -2 || s == -3) ? 1 : 0; }
+    const int mode = cooptv::TvChooseMode(1, 1, 1, tp.playerOwned, standIn, coop::StoreMySlot() >= 0 ? 1 : 0, TvHolderAtActivation(pl.x, pl.z));
+    std::map<std::string, cooptv::TownVer>::const_iterator rec = g_tvCache.find(pl.key);
+    const int recDiffers = (rec != g_tvCache.end() && rec->second.ver != pl.repl && (rec->second.ver.empty() || TvFindData(rec->second.ver) != 0)) ? 1 : 0;   /* TvApply's own test and its noData refusal */
+    const int before = cooptv::TvAskBefore(mode, tp.playerOwned, recDiffers);
+    if (before == cooptv::kTvAskNone) { if (mode == cooptv::kTvStandIn) ++g_tvAskStandIn; *why = mode == cooptv::kTvStandIn ? "another player's town: no version may qualify on any game" : "a player-owned town: the engine never switches it"; return coopt2::kVaNone; }
+    if (before == cooptv::kTvAskUnread) { *why = "no world-server world: the load runs the engine alone"; return coopt2::kVaUnread; }
+    if (before == cooptv::kTvAskApplies) { ++g_tvAskRecord; *why = "the world server's record names another version - the next load puts it on before choosing"; *would = 1; return coopt2::kVaApplies; }
+    ++g_tvAsks;
+    g_tvAskTested = 0; g_tvAskWould = 0; g_tvAskFault = 0;
+    bool listed = false;
+    {
+        TvDepth d(&g_tvChooserDepth);
+        TvIntDepth a(&g_tvAskDepth);
+        g_tvAskTown = town; g_tvScratch = 0;
+        listed = g_tvChooserOrig(g_tvZm, town);   /* every candidate refused: true only from the engine's "already decided in this load batch" list */
+        g_tvScratch = 0; g_tvAskTown = 0;
+    }
+    if (listed) { *why = "decided in this load batch (the chooser does not test it again until its area is loaded again)"; return coopt2::kVaUnread; }
+    if (g_tvAskFault != 0) { *why = "a candidate's read faulted"; return coopt2::kVaUnread; }
+    *tested = g_tvAskTested; *would = g_tvAskWould;
+    return g_tvAskWould > 0 ? coopt2::kVaApplies : coopt2::kVaNone;
+}
+
 std::string TownVerReportToken()
 {
     std::ostringstream o;
@@ -620,6 +716,8 @@ std::string TownVerReportToken()
       << " notesRead=" << g_tvNotesRead << " notesMissing=" << g_tvNotesMissing << " notesBase=" << g_tvNotesBase << " notesReadOffThread=" << (long long)::InterlockedCompareExchange64(&g_tvNotesReadOffThread, 0, 0) << " asBuilt=" << g_tvBook.built.size() << " pending=" << g_tvPending.size()
       << " sweepNoTown=" << g_tvSweepNoTown << " sweepDeferredLoaded=" << g_tvSweepDeferredLoaded
       << " standingOnly=" << g_tvStandingOnly << " standingStripped=" << g_tvStandingStripped << " scratchMiss=" << g_tvScratchMiss << " queryFault=" << g_tvQueryFault
+      << " ask[runs,record,standIn,standingOnly,standingStripped,scratchMiss,queryFault]=" << g_tvAsks << "," << g_tvAskRecord << "," << g_tvAskStandIn << "," << g_tvAskStandingOnly
+      << "," << g_tvAskStandingStripped << "," << g_tvAskScratchMiss << "," << g_tvAskQueryFault
       << " offThread=" << g_tvOffThread << " noHook=" << g_tvNoHook << " faults=" << g_tvFaults << " playerTown=" << g_tvPlayerTown << " standInTown=" << g_tvStandInTown
       << " solo=" << g_tvSolo << " malformed=" << g_tvMalformed << " encodeFailed=" << g_tvEncodeFailed << " feedBegins=" << g_tvFeedBegins << " listComplete=" << g_tvListComplete
       << " noPublishApplyFailed=" << g_tvNoPublishApplyFailed << " revZeroStopped=" << g_tvRevZeroStopped << " noRepublish=" << g_tvNoRepublish.size() << " loadClears=" << g_tvLoadClears

@@ -1641,6 +1641,111 @@ void t_t1389_keeper_form()
     if (KeeperForm(1, 0, 0, 0, 0, 0) != keeperaim::kFormBad || KeeperForm(3, 1, 0, 0, 0, 0) != keeperaim::kFormBad)
         Fail("t1389: a missing or extra key token was accepted");
 }
+/* T-1120: `buytest keeper <...> hold=<s>` - the seconds parse (1..30) and the forms it goes with (the player's plain buy only). */
+void t_t1120_keeper_hold()
+{
+    using keeperaim::HoldSecs; using keeperaim::KeeperHoldForm;
+    if (HoldSecs("hold=8") != 8 || HoldSecs("hold=1") != 1 || HoldSecs("hold=30") != 30) Fail("t1120: a good hold= was not read");
+    if (HoldSecs("hold=0") != 0 || HoldSecs("hold=31") != 0 || HoldSecs("hold=") != 0 || HoldSecs("hold=8s") != 0
+        || HoldSecs("hold=-1") != 0 || HoldSecs("hold=999999999999") != 0) Fail("t1120: a bad hold= was accepted");
+    if (HoldSecs("sell") != -1 || HoldSecs("hold") != -1 || HoldSecs("cats=5") != -1 || HoldSecs(0) != -1) Fail("t1120: a non-hold token was read as hold=");
+    if (KeeperHoldForm(keeperaim::kFormPlayer, 0, 0, 0) != keeperaim::kFormPlayer) Fail("t1120: a plain buy changed form without hold=");
+    if (KeeperHoldForm(keeperaim::kFormPlayer, 1, 0, 0) != keeperaim::kFormPlayer) Fail("t1120: a sale changed form without hold=");
+    if (KeeperHoldForm(keeperaim::kFormNpc, 0, 0, 0) != keeperaim::kFormNpc) Fail("t1120: an npc buy changed form without hold=");
+    if (KeeperHoldForm(keeperaim::kFormPlayer, 0, 8, 0) != keeperaim::kFormPlayer) Fail("t1120: a plain buy with hold= was refused");
+    if (KeeperHoldForm(keeperaim::kFormPlayer, 1, 8, 0) != keeperaim::kFormBad) Fail("t1120: hold= with sell was accepted");
+    if (KeeperHoldForm(keeperaim::kFormNpc, 0, 8, 0) != keeperaim::kFormBad) Fail("t1120: hold= with npc was accepted");
+    if (KeeperHoldForm(keeperaim::kFormBad, 0, 8, 0) != keeperaim::kFormBad) Fail("t1120: hold= made a bad form good");
+    if (KeeperHoldForm(keeperaim::kFormPlayer, 0, 0, 1) != keeperaim::kFormBad) Fail("t1120: a bad hold= was accepted");
+}
+/* T-1120: `shoptest stale <s>|off` - the seconds parse, and THE HOLD DECISION as a table: message kind (contents / any other answer)
+   x an ask of this game awaiting the key (the message is its answer) x a shop counter x the lever on / off x room in the list. Held
+   only: lever on, contents, no ask awaiting, a shop counter, room. */
+void t_t1120_stale_hold()
+{
+    using keeperaim::StaleSecs; using keeperaim::StaleHold;
+    if (StaleSecs("1") != 1 || StaleSecs("40") != 40 || StaleSecs("60") != 60) Fail("t1120 stale: good seconds not read");
+    if (StaleSecs("off") != -1) Fail("t1120 stale: off not read");
+    if (StaleSecs("0") != 0 || StaleSecs("61") != 0 || StaleSecs("") != 0 || StaleSecs(0) != 0 || StaleSecs("4s") != 0 || StaleSecs("-1") != 0
+        || StaleSecs("OFF") != 0 || StaleSecs("99999999999") != 0) Fail("t1120 stale: a bad value was accepted");
+    struct Row { int on, contents, asked, counter, heldNow, want; const char* what; };
+    const int cap = keeperaim::kStaleCap;
+    const Row rows[] = {
+        { 1, 1, 0, 1, 0,       keeperaim::kStaleHeld, "lever on: a pushed counter update (contents, no ask awaiting) is held" },
+        { 1, 1, 0, 1, cap - 1, keeperaim::kStaleHeld, "lever on: the last free place holds it" },
+        { 1, 1, 0, 1, cap,     keeperaim::kStaleFull, "lever on: the list full - it goes in now" },
+        { 1, 1, 1, 1, 0,       keeperaim::kStaleGo,   "lever on: contents an ask awaits (an open window's answer) goes in" },
+        { 1, 0, 0, 1, 0,       keeperaim::kStaleGo,   "lever on: a non-contents answer (equal / notHolder / ..) goes in" },
+        { 1, 0, 1, 1, 0,       keeperaim::kStaleGo,   "lever on: an open window's equal answer goes in" },
+        { 1, 1, 0, 0, 0,       keeperaim::kStaleGo,   "lever on: a push for a box that is not a shop counter goes in" },
+        { 0, 1, 0, 1, 0,       keeperaim::kStaleGo,   "lever off: a pushed counter update goes in" },
+        { 0, 1, 1, 1, 0,       keeperaim::kStaleGo,   "lever off: an answer goes in" },
+        { 0, 0, 0, 0, 0,       keeperaim::kStaleGo,   "lever off: anything goes in" },
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
+        if (StaleHold(rows[i].on, rows[i].contents, rows[i].asked, rows[i].counter, rows[i].heldNow) != rows[i].want) Fail(std::string("t1120 stale: ") + rows[i].what);
+}
+/* T-1120: the lever's sites - the hold before ParityNoteBox counts or applies anything, its asks read from the live tables, the
+   release through ParityNoteBox in order and past the hold, the tick's drive, the teardown, the command, the report token */
+void t_t1120_stale_wiring()
+{
+    std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    it.erase(std::remove(it.begin(), it.end(), '\r'), it.end());
+    std::string cc = T313ReadFile("../coop-plugin/command_channel.cpp");
+    cc.erase(std::remove(cc.begin(), cc.end(), '\r'), cc.end());
+    if (it.empty() || cc.empty()) { Fail("T-1120 stale wiring: a source file not read"); return; }
+    const size_t take = it.find("    if (ShopStaleTake(a, p, n, fromPeer) != 0) return;");
+    const size_t recv = it.find("    ++g_parityBoxRecv;\n    if (a.status == cooppar::kParityStatusContents && ItBoxSenderIsWriter(a.key, fromPeer) == 0)");
+    if (take == std::string::npos || recv == std::string::npos || take > recv)
+        Fail("T-1120 stale wiring: the hold is not right after the decode, before ParityNoteBox counts, checks the writer or applies");
+    if (it.find("const int asked = (g_parityOpenAsked.find(a.key) != g_parityOpenAsked.end() || g_parityAskPlKeys.find(a.key) != g_parityAskPlKeys.end()\n"
+                "                       || ItParityPullLive(a.key) != 0 || ItHandbackWaiting(a.key) != 0) ? 1 : 0;") == std::string::npos)
+        Fail("T-1120 stale wiring: an awaited ask (open window, player box, pull, hand-back) is not read before the hold");
+    if (it.find("const int d = keeperaim::StaleHold(g_shopStaleOn, contents, asked, counter, (int)g_shopStaleQ.size());") == std::string::npos
+        || it.find("counter = (b != 0 && ItShopPieceOf(b, 0, 0, 0) == 1) ? 1 : 0;") == std::string::npos)
+        Fail("T-1120 stale wiring: the decision is not keeperaim::StaleHold on a live shop-counter test");
+    if (it.find("if (g_shopStaleOn == 0 || g_shopStaleReleasing != 0) return 0;") == std::string::npos
+        || it.find("    g_shopStaleReleasing = 1;\n    for (size_t i = 0; i < q.size(); ++i)") == std::string::npos
+        || it.find("ParityNoteBox(q[i].bytes.empty() ? 0 : &q[i].bytes[0], q[i].bytes.size(), q[i].from);") == std::string::npos)
+        Fail("T-1120 stale wiring: the release does not hand the held pushes to ParityNoteBox in order, past the hold");
+    if (it.find("    ItShopStaleDrive();    /* T-1120 TEST LEVER") == std::string::npos) Fail("T-1120 stale wiring: ItParityTick does not drive the release");
+    if (it.find("    ItShopStaleWorldGone();   /* T-1120 TEST LEVER") == std::string::npos) Fail("T-1120 stale wiring: the world teardown does not clear the lever");
+    if (it.find("        + ItShopStaleReportTok()   /* T-1120 TEST LEVER: shoptest stale */") == std::string::npos) Fail("T-1120 stale wiring: no shopStale token on the REPORT");
+    if (cc.find("else if (verb == \"shoptest\")") == std::string::npos || cc.find("const int secs = keeperaim::StaleSecs(val.c_str());") == std::string::npos
+        || cc.find("else WriteStatus(coop::ShopStaleCommand(secs));") == std::string::npos)
+        Fail("T-1120 stale wiring: the shoptest verb is not read by keeperaim::StaleSecs or does not reach ShopStaleCommand");
+}
+/* T-1120 fix 1 (T2360: every swap rebuilt=noSlot, slotMismatch 18 / 21): the shop stand-in's vtable +0x70 holds the incremental-link
+   jump stub, never updateInventory itself. The stub's real bytes in both exes, followed by coophuman::ThunkTarget, reach the address-
+   table row; the raw slot value never does; and ItShopFacadeUpdateSlot follows the stub (guarded read) before its compare. */
+void t_t1120_slot_follows_stub()
+{
+    using coophuman::ThunkTarget;
+    const unsigned long long base = 0x7FF7750B0000ull;
+    struct Row { unsigned long long slot; unsigned char b[5]; unsigned long long row; const char* what; };
+    const Row rows[] = {
+        { 0x50D94ull, { 0xE9, 0x67, 0x0C, 0x90, 0x00 }, 0x951A00ull, "1.0.65: slot +0x70 = stub 0x50D94 -> updateInventory 0x951A00" },
+        { 0x50DD0ull, { 0xE9, 0xFB, 0x1A, 0x90, 0x00 }, 0x9528D0ull, "1.0.68: slot +0x70 = stub 0x50DD0 -> updateInventory 0x9528D0" },
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
+    {
+        if (ThunkTarget(base + rows[i].slot, rows[i].b) != base + rows[i].row) Fail(std::string("t1120 slot: the stub does not lead to the row - ") + rows[i].what);
+        if (base + rows[i].slot == base + rows[i].row) Fail(std::string("t1120 slot: (the old miss) the raw slot equals the row - ") + rows[i].what);
+    }
+    const unsigned char body[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+    if (ThunkTarget(base + 0x951A00ull, body) != base + 0x951A00ull) Fail("t1120 slot: a slot already holding the function itself still matches");
+    std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    it.erase(std::remove(it.begin(), it.end(), '\r'), it.end());
+    if (it.empty()) { Fail("t1120 slot wiring: items.cpp not read"); return; }
+    const size_t follow = it.find("    if (fn != 0 && ItPtrPod(fn, 0, &head) != 0)\n"
+                                  "        fn = (void*)(uintptr_t)coophuman::ThunkTarget((unsigned long long)(uintptr_t)fn, (const unsigned char*)&head);\n"
+                                  "    if (fn != (void*)(g_base + kShopFacadeUpdateRva)) { ++g_openFacadeSlotMismatch; return 0; }");
+    const size_t fnStart = it.find("void* ItShopFacadeUpdateSlot(void* facade)\n{");
+    if (fnStart == std::string::npos || follow == std::string::npos || follow < fnStart || follow - fnStart > 600)
+        Fail("t1120 slot wiring: ItShopFacadeUpdateSlot does not follow the jump stub (guarded) right before its compare");
+    if (it.find("\" windowCounters=\" + p160WinCounters") == std::string::npos || it.find("ItPtrPod(p160Fac, kShopInvMapSize, &p160FacN)") == std::string::npos)
+        Fail("t1120 slot wiring: the window-open line does not carry the window's own counter count (facade +0xB8)");
+}
 /* T-164 B4-4: A SHOP PIECE IS RECOGNISED FROM THE LIST ONLY WHILE ITS SQUAD ROW IS LIVE AND NAMES THE SAME HOME. */
 void t_b44_piece_recognition()
 {
@@ -3492,6 +3597,177 @@ void t_t969_take_access_gate()
     if (AccessTakeRuns(1, 0) != 0) Fail("T-969: a refused take still ran");
     if (AccessTakeRuns(1, 1) != 1 || AccessTakeRuns(0, 0) != 1) Fail("T-969: an allowed (or not asked) take did not run");
 }
+/* T-1199 (decision 1348 a; owner 1480): Owner only protects another player's box, machine and door whether or not the owner is in
+   the world. GateDecide's table (policy x this game writes x owner), the window-move decision, the door decision, and the call sites. */
+void t_t1199_owner_away()
+{
+    using namespace cooptake1;
+    const int pols[4] = { kT1PolicyUnknown, kT1PolicyShared, kT1PolicyOwner, kT1PolicyLocked };
+    for (int pi = 0; pi < 4; ++pi)
+        for (int w = 0; w < 2; ++w)
+        {
+            const int pol = pols[pi];
+            const int other = GateDecide(pol, 1, kT1OwnPeer, w, 0, 1);
+            const int mate = GateDecide(pol, 1, kT1OwnPeer, w, 1, 1);
+            const int none = GateDecide(pol, 1, kT1OwnNone, w, 0, 1);
+            const int me = GateDecide(pol, 1, kT1OwnMe, w, 0, 1);
+            const int restricts = (pol == kT1PolicyOwner || pol == kT1PolicyLocked) ? 1 : 0;
+            if (other != (restricts != 0 ? kT1GateRefuse : kT1GateRun)) Fail("T-1199: another player's box answered wrong for its policy / writer");
+            if (mate != (restricts != 0 ? kT1GateRunMate : kT1GateRun)) Fail("T-1199: a teammate's box was not allowed");
+            if (none != kT1GateRun) Fail("T-1199: nobody's box (an ore mine) was not allowed");
+            if (me != kT1GateRun) Fail("T-1199: this player's own box was not allowed");
+        }
+    /* locked: the engine's own lock decides unless the stand-in is a player faction - the same whichever game writes */
+    if (GateDecide(kT1PolicyLocked, 1, kT1OwnPeer, 1, 0, 0) != kT1GateRun || GateDecide(kT1PolicyLocked, 1, kT1OwnPeer, 1, 0, -1) != kT1GateRun)
+        Fail("T-1199: locked refused where the engine's own lock decides (this game writes)");
+    /* fold 1 (HIGH): another player's owner - a stand-in, or a saved player's faction its record names before that player is resolved */
+    if (OtherPlayerOwner(1, -1, 0) != 1) Fail("T-1199 f1: a stand-in is not another player's");
+    if (OtherPlayerOwner(0, 2, 0) != 1) Fail("T-1199 f1: an unresolved saved player's faction (record coop-p2) is not another player's");
+    if (OtherPlayerOwner(0, 0, 0) != 0) Fail("T-1199 f1: this game's own slot's record counted as another player's");
+    if (OtherPlayerOwner(0, -1, 0) != 0 || OtherPlayerOwner(0, -3, 1) != 0 || OtherPlayerOwner(0, -2, 1) != 0) Fail("T-1199 f1: an NPC / unreadable faction counted as a player's");
+    /* fold 2 (LOW, recheck): this game's slot not known yet - no saved record (its own included) is another player's; a stand-in still is */
+    if (OtherPlayerOwner(0, 0, -1) != 0 || OtherPlayerOwner(0, 2, -1) != 0 || OtherPlayerOwner(0, -1, -1) != 0)
+        Fail("T-1199 f2: a saved player record counted as another player's before this game knows its own slot");
+    if (OtherPlayerOwner(1, -1, -1) != 1) Fail("T-1199 f2: a stand-in stopped counting as another player's before this game knows its slot");
+    /* fold 1 (design B): the open of a box / machine - owner present (a stand-in) or away after a load (only its record) - the same */
+    const int owners[3] = { OtherPlayerOwner(1, -1, 0), OtherPlayerOwner(1, 3, 0), OtherPlayerOwner(0, 3, 0) };
+    for (int oi = 0; oi < 3; ++oi)
+    {
+        const int o = owners[oi];
+        if (OpenRefuse(kT1PolicyOwner, 0, 0, o, 0) != 1) Fail("T-1199 f1: another player's box / machine opened under Owner only");
+        if (OpenRefuse(kT1PolicyOwner, 0, 0, o, 1) != 0) Fail("T-1199 f1: a teammate's box was refused");
+        if (OpenRefuse(kT1PolicyOwner, 0, 1, o, 0) != 0) Fail("T-1199 f1: an ore mine was refused");
+        if (OpenRefuse(kT1PolicyOwner, 1, 0, o, 0) != 0) Fail("T-1199 f1: a character's window was refused here (the trade window's own rule)");
+        if (OpenRefuse(kT1PolicyShared, 0, 0, o, 0) != 0 || OpenRefuse(kT1PolicyLocked, 0, 0, o, 0) != 0 || OpenRefuse(kT1PolicyUnknown, 0, 0, o, 0) != 0)
+            Fail("T-1199 f1: a box was refused under Everyone / locked / not known");
+    }
+    if (OpenRefuse(kT1PolicyOwner, 0, 0, 0, 0) != 0) Fail("T-1199 f1: this player's own / an NPC's box was refused");
+    /* the door: player x NPC opener, owner present / away / unresolved, teammate, the applier */
+    for (int oi = 0; oi < 3; ++oi)
+    {
+        const int o = owners[oi];
+        if (DoorOpenRefuse(kT1PolicyOwner, 0, o, 0, 1) != 1) Fail("T-1199 f1: this player's open of a non-teammate's door was let through");
+        if (DoorOpenRefuse(kT1PolicyOwner, 0, o, 0, 0) != 0) Fail("T-1199 f1: an NPC's / a copy's open of a player's door was refused");
+        if (DoorOpenRefuse(kT1PolicyOwner, 0, o, 1, 1) != 0) Fail("T-1199 f1: a teammate's door was refused");
+        if (DoorOpenRefuse(kT1PolicyOwner, 1, o, 0, 1) != 0) Fail("T-1199 f1: the door applier's / purchase replay's open was refused");
+        if (DoorOpenRefuse(kT1PolicyShared, 0, o, 0, 1) != 0 || DoorOpenRefuse(kT1PolicyLocked, 0, o, 0, 1) != 0 || DoorOpenRefuse(kT1PolicyUnknown, 0, o, 0, 1) != 0)
+            Fail("T-1199 f1: a door was refused under Everyone / locked / not known");
+    }
+    if (DoorOpenRefuse(kT1PolicyOwner, 0, 0, 0, 1) != 0) Fail("T-1199 f1: an NPC faction's / this player's own door was refused");
+    if (RepeatSays(1) != 1 || RepeatSays(2) != 1 || RepeatSays(4) != 1 || RepeatSays(64) != 1) Fail("T-1199 f1: a repeat line was not written at a power of two");
+    if (RepeatSays(0) != 0 || RepeatSays(3) != 0 || RepeatSays(6) != 0 || RepeatSays(65) != 0) Fail("T-1199 f1: a repeat line written between powers of two");
+    /* wiring */
+    const std::string to = T313ReadFile("../common/takeone.h");
+    const std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    const std::string dr = T313ReadFile("../coop-plugin/doors.cpp");
+    const std::string po = T313ReadFile("../coop-plugin/policy.cpp");
+    const std::string bd = T313ReadFile("../coop-plugin/build.cpp");
+    if (to.empty() || it.empty() || dr.empty() || po.empty() || bd.empty()) { Fail("T-1199: a source file could not be read"); return; }
+    if (to.find("if (thisGameWrites != 0) return kT1GateRun;") != std::string::npos) Fail("T-1199: GateDecide still lets a box this game writes through");
+    /* design A's window put-back is gone (design B refuses the open) */
+    if (to.find("WindowTakeRefused") != std::string::npos || it.find("ItOwnOnlyTakeBack") != std::string::npos || it.find("ItOwnOnlyBoxGate") != std::string::npos
+        || it.find("g_ctPolicyForce") != std::string::npos || it.find("ownOnlyNo") != std::string::npos || it.find("s_ownOnlyAdd") != std::string::npos
+        || it.find("winTake[") != std::string::npos)
+        Fail("T-1199 f1: design A's window put-back machinery is still in the source");
+    if (it.find("if (!BoxAccessAllowed(ghostBld, 0, true) || ItRefuseHere(tradecharge::kGatePolicy, priced) != 0)") == std::string::npos)
+        Fail("T-1199 f1: ItCrossTransfer's access exit is not back to its own test");
+    if (it.find("+ \" writes=\" + N((long long)writes)") == std::string::npos) Fail("T-1199: the take gate's line does not name the writer");
+    {   /* the box open: refused in the loot window's open, before the trade window's own rule */
+        const size_t a = po.find("void detour_KitShowTrade(void* gui, void* player, void* other, int type)");
+        const size_t g = po.find("if (other != 0 && coop::PolicyBoxOpenRefused(other, &oslot) != 0)", a == std::string::npos ? 0 : a);
+        const size_t k = po.find("if (g_kitN != 0 && other != 0)", a == std::string::npos ? 0 : a);
+        if (a == std::string::npos || g == std::string::npos || k == std::string::npos || g > k) Fail("T-1199 f1: the box open refusal is not first in the loot window's open");
+    }
+    if (po.find("const int r = cooptake1::OpenRefuse(pol, 0, node, other, mate);") == std::string::npos) Fail("T-1199 f1: the box open decision is not OpenRefuse");
+    if (po.find("return cooptake1::OtherPlayerOwner(si, (si == 0) ? StandInRecordSlot((::Faction*)fac) : -1, MySlotForWire());") == std::string::npos)
+        Fail("T-1199 f1: an unresolved saved player's faction is not read by its record");
+    if (po.find("return cooptake1::DoorOpenRefuse(pol, applying, other, mate, openerMine);") == std::string::npos) Fail("T-1199 f1: the door decision is not DoorOpenRefuse with the opener");
+    if (po.find("ownOnlyOpenRefused=") == std::string::npos) Fail("T-1199 f1: the box open refusals are not on the report");
+    {
+        const size_t a = dr.find("unsigned char detour_openDoor(void* door)");
+        const size_t g = dr.find("if (openerMine != 0 && PolicyDoorOpenRefused(door,", a == std::string::npos ? 0 : a);
+        const size_t o = dr.find("orig_openDoor(door)", a == std::string::npos ? 0 : a);
+        if (a == std::string::npos || g == std::string::npos || o == std::string::npos || g > o) Fail("T-1199: the door refusal is not before the engine's open");
+    }
+    if (dr.find("ret == (uintptr_t)kDoorOpenButtonRet) ? 1 : ((DoorOpenerNow() == kOpenerMine) ? 1 : 0);") == std::string::npos) Fail("T-1199 f1: the door's opener is not the panel or the action's character");
+    if (dr.find("void detour_doorOpenAct(void* task, void* who) { DoorOpenActRun(orig_doorOpenAct, task, who); }") == std::string::npos
+        || dr.find("void detour_doorOpenLockAct(void* task, void* who) { DoorOpenActRun(orig_doorOpenLockAct, task, who); }") == std::string::npos)
+        Fail("T-1199 f1: the two open actions do not record their opener");
+    if (dr.find("return (*(void* const*)((const char*)f + 0x250) != 0) ? kOpenerMine : kOpenerOther;") == std::string::npos) Fail("T-1199 f1: the opener is not judged by the engine's own player test");
+    if (dr.find("\"DoorOpenTaskAction\"") == std::string::npos || dr.find("\"DoorOpenLockTestTaskAction\"") == std::string::npos || dr.find("\"DoorOpenButtonOpenRet\"") == std::string::npos)
+        Fail("T-1199 f1: an opener address row is not bound");
+    if (dr.find("return cooptake1::RepeatSays(*n);") == std::string::npos || dr.find("ownOnlyMaxPerDoor=%lld") == std::string::npos) Fail("T-1199 f1: the per-door repeat count is missing");
+    /* fold 4 (option A): a refused AI open ends the opener's task as the engine's locked door does - one refusal per order */
+    if (DoorRefusalEndsTask(1, 0, 1) != 1) Fail("T-1199 f4: a refused AI open of this game's player's character did not end its task");
+    if (DoorRefusalEndsTask(1, 1, 0) != 0 || DoorRefusalEndsTask(1, 1, 1) != 0) Fail("T-1199 f4: a refused panel open (no task) asked for a task end");
+    if (DoorRefusalEndsTask(0, 0, 1) != 0 || DoorRefusalEndsTask(0, 1, 0) != 0 || DoorRefusalEndsTask(0, 0, 0) != 0) Fail("T-1199 f4: an allowed open asked for a task end");
+    if (DoorRefusalEndsTask(1, 0, 0) != 0) Fail("T-1199 f4: a refusal with no action of this game's player running asked for a task end");
+    if (DoorRefusalSays(kT1DoorTaskEnded, 37) != 1 || DoorRefusalSays(kT1DoorTaskEnded, 1) != 1) Fail("T-1199 f4: the order's one refusal line was not written");
+    if (DoorRefusalSays(kT1DoorTaskAgain, 2) != 0 || DoorRefusalSays(kT1DoorTaskDone, 1) != 0) Fail("T-1199 f4: a second refusal of the same order was written");
+    if (DoorRefusalSays(kT1DoorTaskPanel, 4) != 1 || DoorRefusalSays(kT1DoorTaskPanel, 3) != 0 || DoorRefusalSays(kT1DoorTaskNoTask, 8) != 1 || DoorRefusalSays(kT1DoorTaskNoTask, 6) != 0)
+        Fail("T-1199 f4: a refusal that ended no task does not keep the per-door 1, 2, 4, 8 rule");
+    {   /* wiring: the end decided at the refusal, before the engine's open; the write is the locked branch's own */
+        const size_t a = dr.find("unsigned char detour_openDoor(void* door)");
+        const size_t e = dr.find("if (cooptake1::DoorRefusalEndsTask(1, fromPanel, (DoorOpenerNow() == kOpenerMine) ? 1 : 0) != 0)", a == std::string::npos ? 0 : a);
+        const size_t w = dr.find("task = DoorTaskEndPod(DoorOpenerWho());", a == std::string::npos ? 0 : a);
+        const size_t l = dr.find("if (cooptake1::DoorRefusalSays(task, perDoor) != 0 && ::InterlockedIncrement(&g_doorOwnOnlyLines) <= 24", a == std::string::npos ? 0 : a);
+        const size_t o = dr.find("orig_openDoor(door)", a == std::string::npos ? 0 : a);
+        if (a == std::string::npos || e == std::string::npos || w == std::string::npos || l == std::string::npos || o == std::string::npos || e > w || w > l || l > o)
+            Fail("T-1199 f4: the refusal does not end the opener's task (decide, write, line) before the engine's open");
+    }
+    {
+        const size_t a = dr.find("int DoorTaskEndPod(void* who)");
+        const size_t g = dr.find("char* const ai = *(char* const*)((const char*)who + 0x50);", a == std::string::npos ? 0 : a);
+        const size_t q = dr.find("char* const p = *(char* const*)(ai + 0x20);", a == std::string::npos ? 0 : a);
+        const size_t f = dr.find("volatile unsigned char* const stop = (volatile unsigned char*)(p + 0x26D);", a == std::string::npos ? 0 : a);
+        const size_t d = dr.find("if (*(volatile const unsigned char*)(p + 0x26C) != 0) return cooptake1::kT1DoorTaskDone;", a == std::string::npos ? 0 : a);
+        const size_t x = dr.find("__except (EXCEPTION_EXECUTE_HANDLER) { return cooptake1::kT1DoorTaskNoTask; }", a == std::string::npos ? 0 : a);
+        if (a == std::string::npos || g == std::string::npos || q == std::string::npos || f == std::string::npos || d == std::string::npos || x == std::string::npos
+            || g > q || q > f || f > d || x - a > 2000)
+            Fail("T-1199 f4: the task end is not FUN_140019538's write on *(*(who+0x50)+0x20) (+0x26D, a done task left alone, guarded)");
+    }
+    if (dr.find("::TlsSetValue(t, &now);") == std::string::npos || dr.find("now.who = who;") == std::string::npos)
+        Fail("T-1199 f4: the open action does not record its own character's task context for the refusal");
+    if (dr.find("ownOnlyTaskEnded=%lld ownOnlyNoTask=%lld") == std::string::npos) Fail("T-1199 f4: the task-end counters are not on the [DOOR] report");
+    {
+        const size_t a = bd.find("apPrev = DoorsApplyingSet(1);");
+        const size_t o = bd.find("((BdOpenDoorFn)(base + (uintptr_t)od))(ds);", a == std::string::npos ? 0 : a);
+        if (a == std::string::npos || o == std::string::npos || o - a > 120) Fail("T-1199 f1: the purchase replay's door open is not inside the applier's flag");
+    }
+    /* fold 2 (LOW, recheck): no slot yet - the record rule says 'not another player's' */
+    if (to.find("if (mySlot < 0) return 0;") == std::string::npos) Fail("T-1199 f2: OtherPlayerOwner does not answer 'not another player's' before this game's slot is known");
+    if (bd.find("namespace coop { int AiWorkerBusyNow(); }   /* coop.cpp - the engine's own AI-worker busy test") == std::string::npos)
+        Fail("T-1199 f2: the AiWorkerBusyNow comment is not on its own line");
+    /* fold 2 TEST-ONLY levers: lootorder / dooruse - dispatched, and each gives the engine's own order (giveOrder) on the named target */
+    const std::string cc = T313ReadFile("../coop-plugin/command_channel.cpp");
+    const std::string sp = T313ReadFile("../coop-plugin/speech.cpp");
+    if (cc.empty() || sp.empty()) { Fail("T-1199 f2: a lever source file could not be read"); return; }
+    if (cc.find("else if (verb == \"lootorder\")") == std::string::npos || cc.find("WriteStatus(coop::LootOrderCommand(Trim(arg)));") == std::string::npos)
+        Fail("T-1199 f2: lootorder is not dispatched");
+    if (cc.find("else if (verb == \"dooruse\")") == std::string::npos || cc.find("WriteStatus(coop::DoorUseCommand(Trim(arg)));") == std::string::npos)
+        Fail("T-1199 f2: dooruse is not dispatched");
+    if (it.find("const int kLootOrderTask = 0x1A;") == std::string::npos || it.find("const int r = JobClickGivePod(c, b, kLootOrderTask, zero, 1, 1);") == std::string::npos)
+        Fail("T-1199 f2: lootorder does not give the loot road's order (LOOT_TARGET through giveOrder)");
+    if (it.find("const int kDoorUseTask = 0x48;") == std::string::npos || it.find("const int r = JobGiveOrderPod(c, kDoorUseTask, door, 0);") == std::string::npos)
+        Fail("T-1199 f2: dooruse does not give OPEN_DOOR through giveOrder");
+    if (it.find("if (peerPick) { if (PolicyObjOtherPlayer(g_parityRefs[r].b, &sl) == 0) continue; }") == std::string::npos)
+        Fail("T-1199 f2: lootorder nearest-peer does not pick by the policy's own other-player test");
+    if (it.find("c = LeverNearestOwnNpc(dp[0], dp[2], kDoorUseNpcMax, &uid, &cd, &name, &npcs);") == std::string::npos || it.find("c = ItBoxOpenOpener();") == std::string::npos)
+        Fail("T-1199 f2: dooruse's openers are not this game's player character / its own nearest NPC");
+    if (dr.find("void* DoorsLeverDoor(const std::string& target, std::string* key, double* dist, std::string* err)") == std::string::npos
+        || dr.find("std::strncpy(g_testKey, kb, kDoorKeyCap - 1);") == std::string::npos)
+        Fail("T-1199 f2: dooruse's door is not found as doortest finds it / not remembered as `last`");
+    if (dr.find("void* b = ObjectByPositionKey(bk.c_str());") == std::string::npos || dr.find("door = DoorsKeptDoorAt(b, idx);") == std::string::npos
+        || dr.find("door = DoorsLeverDoor(target, &key, &dd, &e);") == std::string::npos)
+        Fail("T-1199 f2: the bld:<building key>#<i> door form is missing from dooruse / doortest");
+    {   /* the npc pick: this game's own (never a copy), not a player's faction, living */
+        const size_t a = sp.find("::Character* LeverNearestOwnNpc(float x, float z, float maxDist,");
+        const size_t m = sp.find("if (u == 0 || !net::IsUidMine(u)) continue;", a == std::string::npos ? 0 : a);
+        const size_t f = sp.find("if (!CrimeFactionOf(ch, &f) || f == 0 || IsPlayerFaction(f) || IsPeerFaction(f)) continue;", a == std::string::npos ? 0 : a);
+        if (a == std::string::npos || m == std::string::npos || f == std::string::npos || m - a > 1200 || f - a > 1200)
+            Fail("T-1199 f2: the npc opener is not this game's own non-player character");
+    }
+}
 /* T-969 fold 2 (review): GateDecide - the same decision on every thread (off the main thread its inputs come from the owner table;
    never booked there = known 0). Unreadable owner allowed, teammate allowed, non-teammate refused, this game's own writing allowed. */
 void t_t969_gate_decide()
@@ -3517,8 +3793,8 @@ void t_t969_gate_decide()
     if (GateDecide(kT1PolicyLocked, 1, kT1OwnPeer, 0, 0, 1) != kT1GateRefuse) Fail("T-969 fold 2: locked (stand-in a player faction) let a non-teammate take");
     if (GateDecide(kT1PolicyLocked, 1, kT1OwnPeer, 0, 0, 0) != kT1GateRun || GateDecide(kT1PolicyLocked, 1, kT1OwnPeer, 0, 0, -1) != kT1GateRun)
         Fail("T-969 fold 2: locked refused where the engine's own lock decides");
-    /* this game writes the box (owner away, its area here): not a box another game writes - allowed */
-    if (GateDecide(kT1PolicyOwner, 1, kT1OwnPeer, 1, 0, 1) != kT1GateRun) Fail("T-969 fold 2: a box this game writes was refused");
+    /* T-1199 (decision 1348 a): this game writes the box (owner away, its area here) - refused as when another game writes it */
+    if (GateDecide(kT1PolicyOwner, 1, kT1OwnPeer, 1, 0, 1) != kT1GateRefuse) Fail("T-1199: a non-teammate's box this game writes was not refused");
     /* the repeat minute */
     if (GateNewMinute(0, 0u, 5u) != 1 || GateNewMinute(1, 1000u, 60999u) != 0 || GateNewMinute(1, 1000u, 61000u) != 1)
         Fail("T-969 fold 2: the repeat minute is wrong");
@@ -4855,6 +5131,9 @@ void t_p105b3_split_count_publish()
     if (SplitCountPublish(1, 0, 4) != 0) Fail("P105b3: the stack is no longer the object in its square - its own moves speak for it");
     if (SplitCountPublish(1, 1, 0) != 0) Fail("P105b3: an unread count is never published");
     if (SplitCountPublish(0, 1, 4) != 0) Fail("P105b3: another game's stack - its writer publishes it");
+    if (SplitMarksBox(1, 1) != 1) Fail("T-1042: units lifted off a stack in our own box - the box's record is owed");
+    if (SplitMarksBox(0, 1) != 0) Fail("T-1042: units lifted off a character's stack - no box record");
+    if (SplitMarksBox(1, 0) != 0) Fail("T-1042: a box with no key cannot be named - nothing to mark");
 }
 /* the ordinary carries walked through the rules in the order the drain asks them: what each one sends of the item's removal and add.
    removals / adds count what goes on the wire about the item for its container (a give's own request road is not counted here). */
@@ -5159,6 +5438,360 @@ void t_t1079_drag_merged_take()
         Fail("T-1079 drag merged take: their square was taken during the drag - another free square, nothing asked, the writer re-asked");
     if (DragTakeBackPlace(0, 0) != kDtNone || DragTakeAsks(kDtNone) != 0)
         Fail("T-1079 drag merged take: no free square at all - the move stands, nothing asked, the writer re-asked");
+}
+/* T-1266 (run T2109): the cross-game undo's arm from live facts (undoarm.h RevertArm) - every row of its table. where: gone / on its
+   recorded square / on another square of the same section; the recorded square empty; the record in hand; live count; moved units;
+   (fold 1, M4) a stack of its record on its square / elsewhere in the section. */
+void t_t1266_revert_arm()
+{
+    using namespace undoarm;
+    struct Row { int where, empty, rec, live, units, sameAt, sameIn, want; const char* what; };
+    static const Row rows[] = {
+        { kWhereGone,     1, 1, 0,  9, 0, 0, kArmRemake,   "gone, its square empty, the record in hand: made again from the record" },
+        { kWhereGone,     1, 1, 0,  0, 0, 1, kArmRemake,   "gone, square empty, record, no units given (a give): made again, as before" },
+        { kWhereGone,     1, 0, 0,  9, 0, 0, kArmNothing,  "gone, square empty, no record: nothing (notFound)" },
+        { kWhereGone,     0, 1, 0,  9, 0, 0, kArmNothing,  "gone, its square holds another item: never remade - it would over-restore" },
+        { kWhereGone,     0, 0, 0,  9, 0, 0, kArmNothing,  "gone, square taken, no record: nothing" },
+        { kWhereGone,     0, 1, 0,  9, 1, 1, kArmMergedAt, "M4: gone, the stack on its square has its record - the units merged there" },
+        { kWhereGone,     1, 1, 0,  9, 0, 1, kArmMergedSomewhere, "M4: gone, square empty, a stack of its record elsewhere - never remade (a yes would double)" },
+        { kWhereGone,     0, 1, 0,  0, 1, 1, kArmNothing,  "a give (no units) with a same-record stack on its square: the old rule" },
+        { kWhereRecorded, 0, 1, 9,  9, 0, 0, kArmPutBack,  "T2109: the whole stack of 9 on its own square holds the 9 moved: put back" },
+        { kWhereOther,    1, 1, 9,  9, 0, 0, kArmPutBack,  "T2109 / T-1266: on ANOTHER square of this section, its recorded square empty, the record in hand: put back, NEVER remade" },
+        { kWhereOther,    0, 1, 9,  9, 0, 0, kArmPutBack,  "on another square, recorded square taken: put back" },
+        { kWhereRecorded, 0, 1, 3,  9, 0, 0, kArmPutBack,  "holds fewer than moved (the player split some off): what is here goes back" },
+        { kWhereRecorded, 0, 1, 12, 9, 0, 0, kArmLeftover, "holds more than moved (merged onto this game's own stack): never moved back whole" },
+        { kWhereOther,    1, 1, 12, 9, 0, 0, kArmLeftover, "on another square, holds more than moved: never moved back whole, never remade" },
+        { kWhereRecorded, 0, 1, 0,  9, 0, 0, kArmPutBack,  "its count not read: the old rule (put back)" },
+        { kWhereRecorded, 0, 1, 12, 0, 0, 0, kArmPutBack,  "no units given (a give, ItBagNestUndo): the old rule (put back)" },
+        { kWhereOther,    1, 0, 12, 0, 0, 0, kArmPutBack,  "another square, no record, no units given: put back" },
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
+    {
+        const Row& r = rows[i];
+        const int got = RevertArm(r.where, r.empty, r.rec, r.live, r.units, r.sameAt, r.sameIn);
+        if (got != r.want) Fail(std::string("T-1266 arm: ") + r.what + " - got " + ArmName(got) + ", want " + ArmName(r.want));
+    }
+    /* the invariants the bugs broke: while the object is anywhere in this section the remake arm never runs; a gone object is never put
+       back or cut; a take whose units may sit in one of our stacks is never remade (M4) */
+    const int wheres[3] = { kWhereGone, kWhereRecorded, kWhereOther };
+    const int lives[5] = { 0, 1, 3, 9, 12 }, unitsv[4] = { 0, 1, 9, 12 };
+    for (int w = 0; w < 3; ++w) for (int e = 0; e < 2; ++e) for (int rc = 0; rc < 2; ++rc) for (int sa = 0; sa < 2; ++sa) for (int si = 0; si < 2; ++si)
+        for (int l = 0; l < 5; ++l) for (int u = 0; u < 4; ++u)
+        {
+            const int a = RevertArm(wheres[w], e, rc, lives[l], unitsv[u], sa, si);
+            if (wheres[w] != kWhereGone && a != kArmPutBack && a != kArmLeftover) Fail("T-1266 arm: an object still in this section was remade or left alone");
+            if (wheres[w] == kWhereGone && (a == kArmPutBack || a == kArmLeftover)) Fail("T-1266 arm: a gone object was put back or cut");
+            if (a == kArmLeftover && !(unitsv[u] > 0 && lives[l] > unitsv[u])) Fail("T-1266 arm: a leftover arm for an object holding no more than was moved");
+            if (a == kArmRemake && unitsv[u] > 0 && (sa != 0 || si != 0)) Fail("T-1266 arm (M4): a take remade while a stack of its record may hold its units");
+        }
+    for (int a = 0; a <= kArmMergedSomewhere; ++a) for (int b = a + 1; b <= kArmMergedSomewhere; ++b)
+        if (std::string(ArmName(a)) == ArmName(b)) Fail("T-1266 arm: two arms share a name");
+}
+/* T-1266: the fixed ending at ItCrossTransfer's two failure exits (TakeEnding), what the leftover removal does
+   (LeftoverAct), the owner's live fact (OwnerStillHas), and the new undo reasons */
+void t_t1266_take_ending()
+{
+    using namespace undoarm;
+    namespace cs = coopstake;
+    const int whys[12] = { cs::kRevNone, cs::kRevNotFound, cs::kRevCellTaken, cs::kRevTakeOutFailed, cs::kRevPlaceFailed, cs::kRevFault,
+                           cs::kRevRecreateFailed, cs::kRevSplit, cs::kRevRemakeCellTaken, cs::kRevHoldsMore, cs::kRevMergedInto, cs::kRevMergedUnknown };
+    for (int k = 0; k < 12; ++k) for (int hm = 0; hm < 2; ++hm) for (int ce = 0; ce < 2; ++ce) for (int oh = 0; oh < 2; ++oh) for (int pr = 0; pr < 3; ++pr)
+    {
+        const int w = whys[k];
+        if (TakeEnding(1, hm, w, ce, oh, pr) != kEndGive) Fail("T-1266 ending: a give is not left as it was");
+        const int e = TakeEnding(0, hm, w, ce, oh, pr);
+        const int stands = (hm != 0 || w == cs::kRevCellTaken || w == cs::kRevTakeOutFailed || w == cs::kRevHoldsMore || w == cs::kRevMergedInto) ? 1 : 0;
+        const int want = (ce != 0) ? kEndCaller : (stands == 0 ? kEndNone : (oh == 0 ? kEndKeepUnheld
+                         : (pr == 2 ? kEndKeepPaid : (pr == 1 ? kEndRefundAfter : kEndLeftover))));
+        if (e != want) Fail(std::string("T-1266 ending: the take ending is wrong for ") + cs::RevertWhyName(w));
+        /* M2: a paid take never reaches the removal before its refund; M3: never without the owner's live fact; M5: never under a caller */
+        if (e == kEndLeftover && (pr != 0 || oh == 0 || ce != 0)) Fail("T-1266 ending: a leftover removed while paid, unheld or under a caller");
+    }
+    /* M5 (would fail before fold 1, which removed the AI take-one's unit and then asked the writer to consume one too): the half-missing
+       exit of a take-one / right-click piece / units already made again is the caller's */
+    if (TakeEnding(0, 1, cs::kRevNone, 1, 1, 0) != kEndCaller || TakeEnding(0, 0, cs::kRevCellTaken, 1, 1, 0) != kEndCaller)
+        Fail("T-1266 ending (M5): a road whose caller ends the move itself had its leftover removed under it");
+    /* M3: the owner's live fact */
+    if (OwnerStillHas(1, 1, 0) != 1 || OwnerStillHas(1, 0, 1) != 0 || OwnerStillHas(0, 0, 1) != 1 || OwnerStillHas(0, 1, 0) != 0)
+        Fail("T-1266 ending (M3): a box needs its area held by another game, a character another game running it");
+    /* the leftover removal: by live facts, never the player's own units */
+    if (LeftoverAct(0, 9, 9, 0) != kLoNothing) Fail("T-1266 leftover: an object not found here is not removed");
+    if (LeftoverAct(1, 9, 9, 0) != kLoWhole) Fail("T-1266 leftover: T2109's whole stack of 9 is taken out and destroyed");
+    if (LeftoverAct(1, 3, 9, 0) != kLoWhole) Fail("T-1266 leftover: an object holding fewer than moved is removed whole");
+    if (LeftoverAct(1, 12, 9, 0) != kLoLower) Fail("T-1266 leftover: a merged stack of 12 loses only the 9 moved - the player's 3 stay");
+    if (LeftoverAct(1, 0, 9, 0) != kLoNothing || LeftoverAct(1, 12, 0, 0) != kLoNothing) Fail("T-1266 leftover: an unread count or no units is guessed at");
+    if (LeftoverAct(1, 12, 9, 1) != kLoLower || LeftoverAct(1, 9, 9, 1) != kLoNothing || LeftoverAct(1, 3, 9, 1) != kLoNothing)
+        Fail("T-1266 leftover (M4): the stack the units merged into is only ever lowered, never removed whole");
+    /* the new reasons */
+    if (cs::RevertLeft(0, cs::kRevHoldsMore) != cs::kLeftDuplicate || cs::RevertLeft(0, cs::kRevRemakeCellTaken) != cs::kLeftShortHere
+        || cs::RevertLeft(1, cs::kRevHoldsMore) != cs::kLeftGiveGone || cs::RevertLeft(1, cs::kRevRemakeCellTaken) != cs::kLeftGiveGone
+        || cs::RevertLeft(0, cs::kRevMergedInto) != cs::kLeftDuplicate || cs::RevertLeft(0, cs::kRevMergedUnknown) != cs::kLeftUnknown)
+        Fail("T-1266 reasons: what holdsMore / remakeCellTaken / mergedInto / mergedUnknown leave is wrong");
+    for (int k = 0; k < 12; ++k) for (int k2 = k + 1; k2 < 12; ++k2)
+        if (std::string(cs::RevertWhyName(whys[k])) == cs::RevertWhyName(whys[k2])) Fail("T-1266 reasons: two reasons share a name");
+    for (int dr = 0; dr < 2; ++dr)
+    {
+        const int nw[4] = { cs::kRevHoldsMore, cs::kRevRemakeCellTaken, cs::kRevMergedInto, cs::kRevMergedUnknown };
+        for (int q = 0; q < 4; ++q)
+        {
+            const std::string t = cs::RevertLeftText(dr, nw[q]);
+            if (t.find("nothing was asked") == std::string::npos && t.find("never asked") == std::string::npos) Fail("T-1266 reasons: a line does not say nothing was asked");
+            if ((t.find("(a duplicate)") != std::string::npos) != (cs::RevertLeft(dr, nw[q]) == cs::kLeftDuplicate)) Fail("T-1266 reasons: only a standing take says a duplicate");
+            if (t.find("placeFailed") != std::string::npos) Fail("T-1266 reasons: a new reason says placeFailed");
+            if (dr != 0 && cs::RevertLeft(dr, nw[q]) == cs::kLeftGiveGone && (t.find("own item") == std::string::npos || t.find("until that game's next record") != std::string::npos))
+                Fail("T-1266 reasons: a give's line does not say this game's own item, or says short until the next record");
+        }
+    }
+    /* the endings' counters and lines */
+    if (kEbRemoved != 0 || kEbNotHere != 1 || kEbStuck != 2 || kEbNone != 3 || kEbGive != 4 || kEbCaller != 5 || kEbKeptUnheld != 6 || kEbKeptPaid != 7 || kEbCount != 8)
+        Fail("T-1266 endings: the counters' order");
+    if (EndedByOf(kEndGive) != kEbGive || EndedByOf(kEndCaller) != kEbCaller || EndedByOf(kEndKeepUnheld) != kEbKeptUnheld || EndedByOf(kEndKeepPaid) != kEbKeptPaid
+        || EndedByOf(kEndNone) != kEbNone)
+        Fail("T-1266 endings: an ending that removes nothing is counted under another");
+    for (int a = 0; a < kEbCount; ++a)
+    {
+        if (std::string(EndedByText(a)).find("T-1266 ending") == std::string::npos) Fail("T-1266 endings: a line does not name its ending");
+        for (int b = a + 1; b < kEbCount; ++b) if (std::string(EndedByName(a)) == EndedByName(b)) Fail("T-1266 endings: two endings share a name");
+    }
+    if (std::string(EndedByText(kEbRemoved)).find("only on the game that writes") == std::string::npos) Fail("T-1266 endings: a removed leftover does not say the item is now once");
+    if (std::string(EndedByText(kEbStuck)).find("both games") == std::string::npos) Fail("T-1266 endings: a stuck leftover does not say both games");
+}
+/* T-1266 fold 1b: the order of a paid take's removal and refund (N2), whether a charge stands (N4), a kept merged stack re-sent (N1), and
+   the right-click caller's fallback (N3). Each would fail on fold 1: it refunded before removing (a stuck removal left the buyer the item
+   and the money), priced an unresolved box as free, sent nothing for a kept merged stack, and never fell back. */
+void t_t1266_refund_and_fallback()
+{
+    using namespace undoarm;
+    /* N2: walk the paid ending as ItEndRun does - removal first, refund only after a removal that succeeded */
+    const int ebs[3] = { kEbRemoved, kEbStuck, kEbNotHere };
+    for (int i = 0; i < 3; ++i)
+    {
+        int refunded = 0, itemHere = 1;
+        const int end = TakeEnding(0, 0, coopstake::kRevCellTaken, 0, 1, 1);
+        if (end != kEndRefundAfter) Fail("T-1266 N2: a paid standing take is not 'remove, then refund'");
+        if (ebs[i] == kEbRemoved) itemHere = 0;              /* what the removal did */
+        if (RefundAfterRemoval(end, ebs[i]) != 0) refunded = 1;
+        if (itemHere != 0 && refunded != 0) Fail("T-1266 N2: a buyer keeps the item AND gets the money back");
+        if (itemHere == 0 && refunded == 0) Fail("T-1266 N2: a removed paid take keeps its charge");
+    }
+    if (RefundAfterRemoval(kEndLeftover, kEbRemoved) != 0 || RefundAfterRemoval(kEndKeepPaid, kEbKeptPaid) != 0 || RefundAfterRemoval(kEndCaller, kEbCaller) != 0)
+        Fail("T-1266 N2: a refund for a move that was not a paid take removed here");
+    /* N4: whether a charge stands */
+    if (PriceState(1, 1, 1, 1) != 1 || PriceState(1, 1, 0, 0) != 1) Fail("T-1266 N4: a shop / caravan move is not priced");
+    if (PriceState(0, 1, 1, 0) != 2) Fail("T-1266 N4: a far box that did not resolve with a trade window open is priced as free");
+    if (PriceState(0, 0, 1, 0) != 0 || PriceState(0, 1, 0, 0) != 0 || PriceState(0, 1, 1, 1) != 0) Fail("T-1266 N4: an unpriced move is held back");
+    if (TakeEnding(0, 1, coopstake::kRevNone, 0, 1, PriceState(0, 1, 1, 0)) != kEndKeepPaid) Fail("T-1266 N4: removed while a charge may stand");
+    /* N1: a kept merged stack (12 = our 3 + the 9 moved) is re-sent as it stands; the other game's copy that saw its removal gets it back */
+    const int kept[3] = { kEbKeptUnheld, kEbKeptPaid, kEbStuck };
+    for (int i = 0; i < 3; ++i)
+    {
+        int theirs = -1;   /* the merge-gone fallback sent our stack's removal */
+        const int pub = KeptStackPublish(kept[i], 1, 12, 9, 1);
+        if (pub == kPubAddAndCount && theirs < 0) theirs = 12;
+        if (pub != kPubNone && theirs >= 0) theirs = 12;
+        if (theirs != 12) Fail("T-1266 N1: a kept merged stack is lost from the other game's copy of us");
+    }
+    if (KeptStackPublish(kEbKeptPaid, 1, 12, 9, 0) != kPubCount) Fail("T-1266 N1: no record - the count alone");
+    if (KeptStackPublish(kEbKeptUnheld, 1, 9, 9, 1) != kPubNone || KeptStackPublish(kEbKeptUnheld, 0, 12, 9, 1) != kPubNone
+        || KeptStackPublish(kEbRemoved, 1, 12, 9, 1) != kPubNone || KeptStackPublish(kEbGive, 1, 12, 9, 1) != kPubNone || KeptStackPublish(kEbCaller, 1, 12, 9, 1) != kPubNone)
+        Fail("T-1266 N1: a stack that is not a kept merged one is re-sent");
+    /* N3: the right-click caller's fallback - only a move back that moved nothing before touching the destination, with an ending waiting */
+    if (CallerFallback(0, 1, 1) != 1) Fail("T-1266 N3: a move back that found no source / no room does not fall back to the exit's ending");
+    if (CallerFallback(3, 0, 1) != 0 || CallerFallback(0, 0, 1) != 0 || CallerFallback(0, 1, 0) != 0)
+        Fail("T-1266 N3: a fallback after units moved back, after the destination was touched, or with no ending waiting");
+    /* and the fallback's own ending keeps the M3 / M2 rules (callerEnds 0 at that point) */
+    if (TakeEnding(0, 0, coopstake::kRevCellTaken, 0, 0, 0) != kEndKeepUnheld || TakeEnding(0, 0, coopstake::kRevCellTaken, 0, 1, 1) != kEndRefundAfter
+        || TakeEnding(0, 0, coopstake::kRevCellTaken, 0, 1, 2) != kEndKeepPaid || TakeEnding(0, 0, coopstake::kRevCellTaken, 0, 1, 0) != kEndLeftover)
+        Fail("T-1266 N3: the fallback's ending does not keep the owner and charge rules");
+}
+/* T-1266 fold 1 (M1): a stack the leftover removal lowered is told to the other games (would fail before fold 1, which lowered it behind
+   the guard and sent nothing - after the drag's 'merge gone at send' removal the player's own units stayed gone there) */
+void t_t1266_lower_published()
+{
+    using namespace undoarm;
+    if (LowerPublish(1, 1) != kPubAddAndCount) Fail("T-1266 M1: a lowered stack with its record is not sent as an ADD and its count");
+    if (LowerPublish(1, 0) != kPubCount) Fail("T-1266 M1: a lowered stack with no record does not send its count");
+    if (LowerPublish(0, 1) != kPubNone || LowerPublish(0, 0) != kPubNone) Fail("T-1266 M1: a whole removal (never heard of there) or nothing removed sends something");
+    /* the drag fallback's sequence: the other game's copy of our stack (3 own + 9 merged = 12) got the removal first; the ADD rebuilds it
+       with the count it holds now and the count message is then a no-op there; a copy that still held it refuses the ADD and takes the count */
+    int theirs = -1;   /* -1 = no object there (it saw the removal) */
+    const int ourNow = 12 - 9;
+    const int pub = LowerPublish(1, 1);
+    if (pub == kPubAddAndCount && theirs < 0) theirs = ourNow;   /* the ADD into an empty square */
+    if (pub != kPubNone && theirs >= 0) theirs = ourNow;          /* the absolute count */
+    if (theirs != 3) Fail("T-1266 M1: after the merge-gone removal the other game's copy of our stack does not hold our 3");
+    int kept = 12;   /* a copy that still holds the merged stack */
+    if (pub != kPubNone) kept = ourNow;
+    if (kept != 3) Fail("T-1266 M1: a copy that still holds the merged stack keeps the 9 removed here");
+}
+/* T-1266: the plugin's sites - the arm from live facts in ItRevert, the remake arm's old condition gone, the ending at both exits, the
+   take's units passed, the callers' own endings, the lowered stack published, the report's counters */
+void t_t1266_wiring()
+{
+    std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    it.erase(std::remove(it.begin(), it.end(), '\r'), it.end());
+    if (it.empty()) { Fail("T-1266 wiring: items.cpp not read"); return; }
+    if (it.find("const int arm = undoarm::RevertArm(where, squareEmpty, fieldsValid != 0 ? 1 : 0, live, recordedUnits, sameAtSquare, sameInSection);") == std::string::npos
+        || it.find("        else if (arm == undoarm::kArmRemake)\n") == std::string::npos || it.find("        if (arm == undoarm::kArmPutBack)\n") == std::string::npos
+        || it.find("else if (arm == undoarm::kArmMergedAt) why = coopstake::kRevMergedInto;") == std::string::npos
+        || it.find("else if (arm == undoarm::kArmMergedSomewhere) why = coopstake::kRevMergedUnknown;") == std::string::npos)
+        Fail("T-1266 wiring: ItRevert does not choose its arm from live facts");
+    if (it.find("else if (moved == 0 && fieldsValid != 0 && ItSlotInSection(dstSec, dx, dy) && dstSec->getItemAt(dx, dy) == 0)") != std::string::npos)
+        Fail("T-1266 wiring: the remake arm's old condition (by `moved`, not by where the object is) is back");
+    if (it.find("why = (remade != 0) ? coopstake::kRevRemakeCellTaken : coopstake::kRevPlaceFailed;") == std::string::npos)
+        Fail("T-1266 wiring: a remade copy its square would not take is still said as placeFailed");
+    if (it.find("ItEndFill(dir, 1, coopstake::kRevNone, src.quantity, pricedHere, (dir == 0) ? 1 : 2, 0, ghostVerdict,") == std::string::npos
+        || it.find("ItEndFill(dir, 0, why, src.quantity, pricedNow, refundTrade, price, ghostVerdict,") == std::string::npos
+        || it.find("(revertFailedBy halfMissing #\" + N(nRf) + \")\" + ItUndoEndingText(endedBy));") == std::string::npos
+        || it.find("(revertFailedBy putBack #\" + N(nRf) + \")\" + ItUndoEndingText(endedBy));") == std::string::npos)
+        Fail("T-1266 wiring: an exit has no fixed ending, or does not say it");
+    /* M2, M3, M5 at both exits: the caller's own ending (the take-one, units already back, a right-click piece); the run's owner fact
+       and its refund after the removal (fold 1b N2); the right-click caller's fallback kept (N3); the charge state (N4) */
+    size_t ne = 0, at = 0;
+    while ((at = it.find("const int endedBy = ItEndRun((callerEnds != 0 || aiTakeOne != 0 || takeSplitDone != 0) ? 1 : 0, dstInv, dstSec);\n"
+                         "        if (callerEnds != 0 && dir == 0) g_ctEnd.used = 1;", at)) != std::string::npos) { ++ne; ++at; }
+    if (ne != 2) Fail("T-1266 wiring: an exit's ending ignores the caller, or does not keep it for the right-click fallback");
+    const size_t er = it.find("static int ItEndRun("), eu = (er == std::string::npos) ? std::string::npos : it.find("ItOwnerStillHasLive(c.ghostUid, c.ghostVerdict), c.priced);", er);
+    const size_t ee = (eu == std::string::npos) ? std::string::npos : it.find("const int eb = ItUndoEnding(end, c.why, dstInv, dstSec, c.dst, c.dstUid, c.units);", eu);
+    const size_t ef = (ee == std::string::npos) ? std::string::npos : it.find("if (undoarm::RefundAfterRemoval(end, eb) != 0)", ee);
+    const size_t eg = (ef == std::string::npos) ? std::string::npos : it.find("ItRefundUnclaimed(c.dir, c.refundTrade, c.price,", ef);
+    if (eg == std::string::npos) Fail("T-1266 wiring (N2): the paid take's refund does not follow a removal that succeeded");
+    if (it.find("PaidEnding") != std::string::npos) Fail("T-1266 wiring (N2): a refund before the removal is back");
+    if (it.find("const int pricedHere = undoarm::PriceState(shopHere, openHere, (ghostHalf.kind == kKindBox) ? 1 : 0, (bldHere != 0) ? 1 : 0);") == std::string::npos
+        || it.find("const int pricedNow = undoarm::PriceState(priced, tradeOpen, (ghostHalf.kind == kKindBox) ? 1 : 0, (ghostBldAtGate != 0) ? 1 : 0);") == std::string::npos)
+        Fail("T-1266 wiring (N4): an exit prices an unresolved far box as free");
+    const size_t rt = it.find("    const int refundTrade = (trade != 0) ? trade :"), pb = it.find("    const int putRoad = rcgive::PutBackRoad(undone, dir);");
+    if (rt == std::string::npos || pb == std::string::npos || rt > pb) Fail("T-1266 wiring (M2): the put-back exit cannot see the charge");
+    if (it.find("const int shopKind = ItShopMoveNotIntercepted(tradeOpen, tradeSide, ghostBldAtGate, &sideFacade);") == std::string::npos
+        || it.find("shopHere = (ItShopMoveNotIntercepted(openHere, sideHere, bldHere, 0) != 0) ? 1 : 0;") == std::string::npos
+        || it.find("ItShopPieceBuildingAny(ghostBldAtGate)") != std::string::npos)
+        Fail("T-1266 wiring (M2): the gate and the half-missing exit do not ask one shop rule");
+    /* N3: the right-click fallback */
+    if (it.find("const int movedBack = ItRcMoveBack(jb, p, rp.gain, consumed, curK, ph + \" was not undone by the request road\", &untouched);") == std::string::npos
+        || it.find("if (undoarm::CallerFallback(movedBack, untouched, g_ctEnd.used) != 0 && ItCtCallerFellThrough(ph) == undoarm::kEbRemoved)\n                ItRcHoldPiece(jb, p, consumed, curK);") == std::string::npos)
+        Fail("T-1266 wiring (N3): a right-click piece whose move back moved nothing does not fall back to the exit's ending");
+    size_t nu = 0;
+    at = 0;
+    while ((at = it.find("ItRcRelease(jb, p, consumed, curK);\n        if (untouched != 0) *untouched = 1;\n        return 0;", at)) != std::string::npos) { ++nu; ++at; }
+    if (nu != 2) Fail("T-1266 wiring (N3): the move back does not say its two untouched failures (source, room)");
+    if (it.find("g_ctEnd.used = 0;   /* T-1266 fold 1b (N3): an earlier exit's ending is never run for this move */") == std::string::npos)
+        Fail("T-1266 wiring (N3): an earlier move's ending could run for a later move");
+    /* N1: a kept merged stack is re-sent */
+    if (it.find("ItSendOurStack(dst, dstUid, kx, ky, live, undoarm::KeptStackPublish(eb, found, live, units, haveRecord));") == std::string::npos)
+        Fail("T-1266 wiring (N1): a kept merged stack is not re-sent");
+    /* M5: the right-click piece is moved back by its caller, never removed under it; the take-one's consume is kept */
+    if (it.find("(pr == rcgive::kPrMergedGive) ? 1 : 0,\n                        0, 1);   /* T-1266 fold 1 (M5): callerEnds") == std::string::npos)
+        Fail("T-1266 wiring (M5): the right-click piece's call does not say its caller ends a failed move");
+    if (it.find("else { ++g_t1TransferFellBack; ItTakeOneConsume(cur, s_uid[s_pair[k]], &par); }") == std::string::npos
+        || it.find("ItCrossTransfer(0, t1e, s_uid[k], par, s_uid[s_pair[k]], s_box[k], 1);") == std::string::npos)
+        Fail("T-1266 wiring (M5): the take-one road's own ending (aiTakeOne 1, then its consume) changed");
+    /* M1: the lowered stack is sent - an ADD, then its count (ItSendOurStack, called by ItUndoEnding after the removal) */
+    const size_t ss = it.find("static void ItSendOurStack(");
+    const size_t o0 = (ss == std::string::npos) ? std::string::npos : it.find("um.op = 0;", ss);
+    const size_t o2 = (o0 == std::string::npos) ? std::string::npos : it.find("um.op = 2;", o0);
+    const size_t sn = (o2 == std::string::npos) ? std::string::npos : it.find("if (ItNetSendMove(um)) ++g_sent;", o2);
+    const size_t ue = it.find("static int ItUndoEnding(");
+    const size_t lp = (ue == std::string::npos) ? std::string::npos : it.find("const int pub = undoarm::LowerPublish((eb == undoarm::kEbRemoved && loweredTo > 0) ? 1 : 0, haveRecord);\n"
+                                                                              "        ItSendOurStack(dst, dstUid, lx, ly, loweredTo, pub);", ue);
+    if (sn == std::string::npos || ue == std::string::npos || sn > ue || lp == std::string::npos)
+        Fail("T-1266 wiring (M1): a stack the leftover removal lowered is not sent to the other games");
+    if (it.find("*loweredTo = live - units; *lx = ax; *ly = ay;") == std::string::npos) Fail("T-1266 wiring (M1): the lowered count is not handed to the ending");
+    if (it.find("(mergeRest != 0) ? src.quantity : 0, &revWhy,\n                   (dir == 0) ? src.quantity : 0);") == std::string::npos)
+        Fail("T-1266 wiring: a take's units do not reach ItRevert");
+    if (it.find("+ \" revertEndedBy[removed,notHere,stuck,none,give,caller,keptUnheld,keptPaid]=\"") == std::string::npos
+        || it.find("+ \" revertCallerFell=\" + N(g_ctCallerFell)") == std::string::npos) Fail("T-1266 wiring: the report lacks revertEndedBy / revertCallerFell");
+    if (it.find("static int ItTakeLeftoverRemove(") == std::string::npos || it.find("undoarm::LeftoverAct(at != 0 ? 1 : 0, live, units, other)") == std::string::npos)
+        Fail("T-1266 wiring: the leftover removal does not read live facts");
+}
+/* T-1266 TEST-ONLY lever `itemtest undofail` (run T2166): when it fires (a plain take from another game's character only, never unarmed),
+   and its wiring - the verb, the placeholder before the put-back and its removal after, the one line, the report */
+void t_t1266_undofail_lever()
+{
+    using namespace undoarm;
+    if (UndoFailLeverFires(0, 0, 0, 0, 0, 0, 0, 0) != 0) Fail("T-1266 lever: fires unarmed");
+    if (UndoFailLeverFires(1, 0, 0, 0, 0, 0, 0, 0) != 1) Fail("T-1266 lever: an armed plain take from a character does not fire");
+    for (int k = 1; k < 8; ++k)
+    {
+        int f[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+        f[k] = 1;   /* a give, a box source, a split, units already back, a take-one, a caller's own ending, a shop move */
+        if (UndoFailLeverFires(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]) != 0) Fail("T-1266 lever: fires on a move that is not a plain take from a character");
+    }
+    std::string it = T313ReadFile("../coop-plugin/items.cpp"), cc = T313ReadFile("../coop-plugin/command_channel.cpp");
+    it.erase(std::remove(it.begin(), it.end(), '\r'), it.end());
+    cc.erase(std::remove(cc.begin(), cc.end(), '\r'), cc.end());
+    if (it.empty() || cc.empty()) { Fail("T-1266 lever wiring: a source not read"); return; }
+    if (cc.find("else if (undoFail) WriteStatus(coop::ItemTestUndoFailCommand(Trim(rest.substr(8))));") == std::string::npos)
+        Fail("T-1266 lever wiring: `itemtest undofail` is not sent to its command");
+    const size_t pl = it.find("undoFailPlaced = ItUndoFailPlacePod(srcC, srcSec, src.x, src.y, &phFields, &undoFailPh);");
+    const size_t rv = (pl == std::string::npos) ? std::string::npos : it.find(": ItRevert(dstInv, dstSec, dst.item, dst.x, dst.y, srcC, srcSec, src.x, src.y, allowRelocate,", pl);
+    const size_t rm = (rv == std::string::npos) ? std::string::npos : it.find("ItUndoFailRemovePod(srcInv, srcSec, undoFailPh)", rv);
+    const size_t ln = (rm == std::string::npos) ? std::string::npos : it.find("[ITEMS] T-1266 undofail lever FIRED (TEST-ONLY)", rm);
+    const size_t ex = (ln == std::string::npos) ? std::string::npos : it.find("    const int putRoad = rcgive::PutBackRoad(undone, dir);", ln);
+    if (ex == std::string::npos) Fail("T-1266 lever wiring: the placeholder is not put before the put-back, removed after it and said, before the exit");
+    if (it.find("g_undoFailArmed = 0;\n        ++g_undoFailFired;") == std::string::npos) Fail("T-1266 lever wiring: a firing does not disarm it (one take per arming)");
+    if (it.find("+ \" undoFailLever[armed,fired]=\" + N((long long)g_undoFailArmed) + \",\" + N(g_undoFailFired)") == std::string::npos)
+        Fail("T-1266 lever wiring: the report lacks undoFailLever");
+}
+/* T-1266 fix attempt 1 (H-T1266-putback, run T2166 LEG 2): the undo's cell rule (undoarm.h UndoCellFree). A put-back into the cell the
+   item JUST LEFT is decided by the grid and the section's shape only - a section whose allowed-items list allows nothing (an animal's
+   main section; engineFits 0) still takes it back; any other cell keeps the engine's fitsAt. And the wiring: which callers use it. */
+void t_t1266_undo_cell_rule()
+{
+    using namespace undoarm;
+    /* (rule, inGrid, inShape, engineFits, visibleOther) */
+    if (UndoCellFree(kCellJustLeft, 1, 1, 0, 0) != 1) Fail("T-1266 cell rule: a put-back into the cell it just left is refused by a section that allows nothing (or is off)");
+    if (UndoCellFree(kCellFits, 1, 1, 0, 0) != 0) Fail("T-1266 cell rule: a cell it did not just leave skips the engine's fitsAt");
+    if (UndoCellFree(kCellFits, 1, 0, 1, 0) != 1 || UndoCellFree(kCellJustLeft, 1, 1, 1, 0) != 1)
+        Fail("T-1266 cell rule: a cell every test allows is refused");
+    if (UndoCellFree(kCellJustLeft, 0, 1, 1, 0) != 0 || UndoCellFree(kCellFits, 0, 1, 1, 0) != 0)
+        Fail("T-1266 cell rule: a footprint off the grid is allowed");
+    if (UndoCellFree(kCellJustLeft, 1, 0, 1, 0) != 0)
+        Fail("T-1266 cell rule: a just-left cell past the section's own width / height is allowed");
+    if (UndoCellFree(kCellJustLeft, 1, 1, 0, 1) != 0 || UndoCellFree(kCellFits, 1, 1, 1, 1) != 0)
+        Fail("T-1266 cell rule: a visible occupant does not refuse");
+    /* fold 1b: the settle's put-back a round trip later into a switched-off section that allows nothing (an animal's main: en=0, the
+       list allows no item - engineFits 0) is ACCEPTED: the undo rule asks neither */
+    if (UndoCellFree(kCellJustLeft, 1, 1, 0, 0) != 1) Fail("T-1266 fold 1b: the settle's put-back into a switched-off, allow-nothing section is refused");
+    std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    it.erase(std::remove(it.begin(), it.end(), '\r'), it.end());
+    if (it.empty()) { Fail("T-1266 cell rule wiring: items.cpp not read"); return; }
+    const char* want[] = {
+        "static bool ItUndoCellRule(::InventorySection* sec, ::Item* item, int x, int y, int rule)",
+        "    else if (inGrid != 0) engineFits = sec->fitsAt(item, x, y) ? 1 : 0;",
+        "    return undoarm::UndoCellFree(rule, inGrid, inShape, engineFits, other) != 0;",
+        "    const bool exact = (undoRule == 2) ? ItUndoBackCellFree(sec, item, x, y)",
+        "    return ItPlaceRule(sec, item, x, y, allowRelocate, 2);",
+        "            const int fits = ItUndoBackCellFree(srcSec, at, sx, sy) ? 1 : 0;",
+        "        else if (at != 0 && orig == 0 && ItUndoBackCellFree(srcSec, at, sx, sy))",
+        "    const int back = ItPlaceBackPod(sec, *kept, x, y, 1);",
+        "    const int r = ItUndoBackAddAtPod(sec, item, x, y);   /* T-1266: the cell it just left - no allowed-items list */",
+        "            if (ItShowPutGhostBackPod(srcSec, esc, src.x, src.y, undoarm::kCellJustLeft) != 1)",
+        "            if (ItPlaceUndo(sec, ph, x, y, 0) == 1) { ok = 1; *out = ph; }",
+        /* fold 1b: the show-at-once settle, a round trip later - the just-left rule too */
+        "        const int oldFree = (gsec != 0 && ItUndoFitsRulePod(gsec, p.showObj, p.ghostX, p.ghostY, undoarm::kCellJustLeft) == 1) ? 1 : 0;",
+        "        if (where == coopshow::kTbOldCell) put = coopshow::PutOutcome(ItShowPutGhostBackPod(gsec, p.showObj, p.ghostX, p.ghostY, undoarm::kCellJustLeft));",
+        "        else if (where == coopshow::kTbAnyCell) put = coopshow::PutOutcome(ItShowPutGhostPod(gsec, p.showObj, fx, fy));",
+        /* fold 1 (F2): the owner side's take rollback */
+        "    const int placed = (sec != 0 && ItObj((::Item*)p->item)) ? ItPlaceBackPod(sec, p->item, p->x, p->y, 1) : 0;",
+        /* fold 1 (F1): the right-click and drag merged-take roads - the source cell they left; any other cell keeps fitsAt */
+        "    int placed = (ItSlotInSectionWhy(sec, px, py) == 1) ? ItPlaceBackPod(sec, it, px, py, 0) : 0;",
+        "    if (placed == 0 && ItFirstFreeSlot(sec, it, &px, &py) != 0) placed = ItPlacePod(sec, it, px, py, 0);",
+        "    if (ItSlotInSectionWhy(sec, x, y) == 1 && ItUndoBackCellFree(sec, (::Item*)obj, x, y)) return 1;",
+        "    if (ItUndoFitsRulePod(ssec, it, r.x, r.y, undoarm::kCellJustLeft) != 1)",
+        "    const int added = ItUndoBackAddAtPod(ssec, it, r.x, r.y);",
+        "            const int ownFits = (ItSlotInSectionWhy(ssec, src.x, src.y) == 1 && ItUndoFitsRulePod(ssec, it, src.x, src.y, undoarm::kCellJustLeft) == 1) ? 1 : 0;",
+        "            const int otherFree = (ownFits == 0 && ItFirstFreeSlot(ssec, it, &fx, &fy) == 1 && fx >= 0) ? 1 : 0;",
+        "                const int added = ItUndoAddAtRule(ssec, it, bx, by, (place == rcgive::kDtOwn) ? undoarm::kCellJustLeft : undoarm::kCellFits);",
+        "            ready = (ssec != 0 && ((ItSlotInSectionWhy(ssec, r.x, r.y) == 1 && ItUndoBackCellFree(ssec, (::Item*)rp.obj, r.x, r.y))" };
+    for (size_t k = 0; k < sizeof(want) / sizeof(want[0]); ++k)
+        if (it.find(want[k]) == std::string::npos) Fail(std::string("T-1266 cell rule wiring: missing: ") + want[k]);
+    /* the undo's put-back never asks fitsAt directly again, and the old fits pod (fitsAt for a just-left cell) is gone */
+    if (it.find("if (!ItSlotInRange(sec, item, x, y) || !sec->fitsAt(item, x, y)) return false;\n    int iw = 0, ih = 0;") != std::string::npos)
+        Fail("T-1266 cell rule wiring: the old undo cell test (fitsAt first) is back");
+    if (it.find("ItUndoFitsPod(") != std::string::npos || it.find("ItPlaceUndoPod(") != std::string::npos)
+        Fail("T-1266 fold 1 wiring: a just-left put-back asks the old rule (ItUndoFitsPod / ItPlaceUndoPod) again");
+    if (it.find("kCellBackLater") != std::string::npos || it.find("sectionOn") != std::string::npos)
+        Fail("T-1266 fold 1b wiring: the undo rule asks the section's on/off byte again (an animal's main section is always off)");
 }
 void t_t1079_give_merged_source_stays()
 {
@@ -8408,6 +9041,24 @@ std::string T313ReadFile(const char* path)
     char buf[65536]; size_t n;
     while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
     std::fclose(f);
+    /* Text files are read with LF line ends whatever the checkout wrote: the bench checks out with Windows line ends (core.autocrlf),
+       so a wiring test's needle holding a line break passed here and failed there (T2363 / T2365 bench builds, 2026-11-14). Squad,
+       meta and other binary fixtures stay byte-exact. */
+    const std::string p(path);
+    const char* textExt[] = { ".cpp", ".h", ".hpp", ".c", ".bat", ".txt", ".sig", ".ps1", ".py", ".md", ".cfg", ".json", ".xml" };
+    bool text = false;
+    for (size_t i = 0; i < sizeof(textExt) / sizeof(textExt[0]) && !text; ++i)
+    {
+        const size_t k = std::strlen(textExt[i]);
+        text = p.size() >= k && p.compare(p.size() - k, k, textExt[i]) == 0;
+    }
+    if (text && out.find('\r') != std::string::npos)
+    {
+        std::string lf; lf.reserve(out.size());
+        for (size_t i = 0; i < out.size(); ++i)
+            if (!(out[i] == '\r' && i + 1 < out.size() && out[i + 1] == '\n')) lf += out[i];
+        out.swap(lf);
+    }
     return out;
 }
 /* The loader keeps every AddrReg binding in a fixed registry (addrtable.h kAddrMaxRegs); one binding too many disables the whole

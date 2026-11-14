@@ -419,6 +419,50 @@ inline int AnnounceMemberRow(int deadFlag, int spotRead, int spotHeld, int spotN
     if (nearOut) *nearOut = (!spotHeld && ann && spotNear) ? 1 : 0;
     return kAnnMemCounts;
 }
+/* T-1178 (F-T2357-ORIGINSPOT): A CHARACTER'S OWN SPOT AT THE WORLD ORIGIN IS NOT A PLACE. Right after a dialogue hire, during the
+   character editor's pause, the recruiting game read its recruit's own spot - the engine's position answer and the stored spot alike - as
+   the world origin (area 32,32) while the recruit's squad's spot was right and held; the 1 Hz announce pass, which judges a player-faction
+   character by its own spot, then withdrew the recruit's copy from the other game. A spot inside kAnnOriginSpotTol of the origin on all
+   three axes (T2357's line printed whole units, so a value under one unit cannot be told from zero) is a spot the pass cannot trust, not a
+   'not held' answer. On the own-spot road (ownRoad: a player-faction character, or one whose squad's spot is not read) the pass then
+   decides from the squad's spot when it reads (kAnnSpotSquad), otherwise keeps the character this pass - nothing withdrawn, nothing
+   announced (kAnnSpotKeep). Off the own road the pass already decides by the squad's spot (kAnnSpotOwn - only a SPAWN carries the own
+   spot, and AnnounceSpawnSpotOk refuses one from the origin). A spot that is not at the origin stands (kAnnSpotOwn). */
+const float kAnnOriginSpotTol = 1.0f;
+inline int AnnounceSpotAtOrigin(float x, float y, float z)
+{
+    return (x > -kAnnOriginSpotTol && x < kAnnOriginSpotTol && y > -kAnnOriginSpotTol && y < kAnnOriginSpotTol
+            && z > -kAnnOriginSpotTol && z < kAnnOriginSpotTol) ? 1 : 0;
+}
+enum { kAnnSpotOwn = 0, kAnnSpotSquad = 1, kAnnSpotKeep = 2 };
+inline int AnnounceSpotChoice(int ownRoad, int spotAtOrigin, int squadSpotRead)
+{
+    if (!spotAtOrigin || !ownRoad) return kAnnSpotOwn;
+    return squadSpotRead ? (int)kAnnSpotSquad : (int)kAnnSpotKeep;
+}
+/* a SPAWN carries the character's own spot: none goes from a spot at the origin (the pass sends it once the spot reads a place) */
+inline int AnnounceSpawnSpotOk(int spotAtOrigin) { return spotAtOrigin ? 0 : 1; }
+/* T-1178 fold 2 (L1): the squad's spot the pass would judge by is usable only when read AND not itself inside the origin band
+   (AnnounceSpotAtOrigin on its x, its y as the squad's own read gives it, and its z) - squadwriter.h SquadPosUsable refuses only an
+   exact 0,0,0, so a squad spot of 0.3,0,0.2 would otherwise stand in for an own spot at the origin */
+inline int AnnounceSquadSpotUsable(int read, float x, float y, float z) { return (read != 0 && AnnounceSpotAtOrigin(x, y, z) == 0) ? 1 : 0; }
+/* T-1178 fold 2 (M1): the area a character's own spot names for the AREA-addressed stream sends and the roster (worldsync.cpp
+   CharAreaKeyNow): a refused or faulted read, or a spot at the world origin, names none (-1) - every caller then uses the area it
+   last sent in (or WORLD), and the roster answers PENDING for a body this game still has; never the origin's area */
+inline int CharAreaKeyOfSpot(int readOk, int spotAtOrigin, int areaKey) { return (readOk == 0 || spotAtOrigin != 0) ? -1 : areaKey; }
+/* T-1178 fold 2b: the catch-up's read of one row (worldsync.cpp CatchupCharReads) is usable only when read and not at the world origin -
+   a refused row is skipped this round (no SPAWN carrying the origin spot, nothing withdrawn) */
+inline int CatchupSpotUsable(int readOk, int spotAtOrigin) { return (readOk != 0 && spotAtOrigin == 0) ? 1 : 0; }
+/* T-1178 fold 2 (L2): THE RE-ANNOUNCE (link-up / slot arrival drain) judges by the same spot as the 1 Hz pass (AnnounceJudgeSpot's
+   choice): kept = no spot to judge by, the announce mark stands, nothing sent; not held = unannounced, as before; held = a SPAWN,
+   but never one from an own spot at the origin (the mark stands - the pass decides once the spot reads a place) */
+enum { kReannSpawn = 0, kReannWithhold = 1, kReannKeep = 2 };
+inline int ReannounceSpotDecide(int spotChoice, int held, int spotAtOrigin)
+{
+    if (spotChoice == kAnnSpotKeep) return kReannKeep;
+    if (!held) return kReannWithhold;
+    return AnnounceSpawnSpotOk(spotAtOrigin) ? (int)kReannSpawn : (int)kReannKeep;
+}
 /* THE RELAYED-OWNER GATE for the six stream types whose session handler has no owner test of its own (it applies only to a
    copy this game holds - fine for the one session peer, not for any number of games): a relayed one is refused when this game
    runs the uid, or when the uid's recorded owner is another player. An unknown uid passes (CONTEXT arrives before SPAWN). */

@@ -307,6 +307,28 @@ int MenuPauseNoteTalkWindow(int open, int linked, int inWorld, int mode, MenuPau
    the next session's vote give-back or skip a single-player unpause */
 void MenuPauseNoteWorldClosed(MenuPauseState* st);
 
+/* T-1183 TEST-ONLY `timeskip <hours>` (owner decision 1494): the pure half of the lever. The jump itself is the join jump's
+   write set (the engine's load-path clock restore 0x66D0C0, replicated by store.cpp ClockJoinSetPod), run on EACH game the
+   line is sent to; the world server's clock then follows by its own bounded forward pull, and while it does each game is
+   AHEAD of it, which ClockDecide never writes (kClockAheadNoWrite). So a skip is forward only, and the clock after it may be
+   at most maxAheadHours ahead of the shared clock - under the world server's 24-hour pull refusal, past which the world's
+   clock would stop following the games for the rest of the session. */
+enum TimeSkipVerdict
+{
+    kSkipOk          = 0,
+    kSkipBadHours    = 1,   /* hours not in (0, maxAheadHours] */
+    kSkipNoClock     = 2,   /* this game's clock reads below 0 (no world) */
+    kSkipJoinOwed    = 3,   /* this game has not taken the world's clock yet - its join jump would overwrite the skip */
+    kSkipAheadBound  = 4    /* the clock after the skip would be more than maxAheadHours ahead of the shared clock */
+};
+const double kTimeSkipMaxAheadHours = 22.0;   /* the world server refuses to follow a game more than 24 in-game hours ahead */
+/* localAbs = this game's clock (day*24 + hours into the day), sharedAbs = the shared clock now (< 0 = none known: nothing to
+   stay in step with, the ahead test is skipped). On kSkipOk *targetAbs = localAbs + hours, split into *day and *hourOfDay
+   (0 <= hourOfDay < 24). */
+int TimeSkipDecide(double localAbs, double sharedAbs, int joinJumpOwed, double hours, double maxAheadHours,
+                   double* targetAbs, int* day, float* hourOfDay);
+const char* TimeSkipVerdictName(int v);
+
 }   /* namespace coopclock */
 
 #endif

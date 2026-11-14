@@ -699,6 +699,20 @@ inline int LockPickedRule(int lockedBefore, int lockedAfter, int lockOfDoor)
     return (lockedBefore != 0 && lockedAfter == 0 && lockOfDoor != 0) ? 1 : 0;
 }
 
+/* T-1082: the player's unlock JOB (Task_UnlockDoor's step 0x33D3C0) writes the door lock's locked byte to 0 directly, which no
+   watched door call sees. Read around one step: lockedBefore / lockedAfter = the lock's locked byte before and after the engine's
+   step; lockOfDoor 1 = the lock is a door's (the door found and its lock is this one); hasRow 1 = that door has a live row on the
+   door road. An unlock (locked 1 -> 0) of a door's lock with a row MARKS the row for the lock sweep (the next door tick compares
+   its word with the live one and sends the change as this game's own); a door with no row is counted, nothing is marked; a lock
+   that is no door's is counted; a step that did not unlock does nothing. */
+const int kUnlockJobNothing = 0, kUnlockJobMark = 1, kUnlockJobNoRow = 2, kUnlockJobNotDoor = 3;
+inline int UnlockJobStepOutcome(int lockedBefore, int lockedAfter, int lockOfDoor, int hasRow)
+{
+    if (lockedBefore == 0 || lockedAfter != 0) return kUnlockJobNothing;
+    if (lockOfDoor == 0) return kUnlockJobNotDoor;
+    return (hasRow != 0) ? kUnlockJobMark : kUnlockJobNoRow;
+}
+
 /* DoorBrokenKeeps: a broken door stands open (the engine's break opens it and nothing shuts it until a repair mends it) - a word
    that would close it (holder state closed or closing) is not applied; the door keeps its own state. 1 = keep */
 inline int DoorBrokenKeeps(int broken, int holderState)

@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 719
+!count 759
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -719,14 +719,54 @@ CampLimitScale                                 var  02132538 02132538 -
 CampViewDistance                               ro   0172F4F0 0172F4F0 CDCCAC44
 CampNestCheckRet                               ret  008F51EB 008F51E6 E8F4E172FF
 CampDebrisPlace                                code 00937570 00937570 488BC455535657415441554156415748
-BuildingItemSpot_makeItem                      code 00547440 00547440 4889742410574883EC204883B9C00000
+RaidSquadCreateRet                             ret  009C3489 009C3484 E8AB1E65FF
 JobStartTakeRet                                ret  0035B4AC 0035B4A6 FF93F8040000
+WarCampaignStart                               code 009C8960 009C8960 40555356574154415541564157488DAC
+BuildingItemSpot_makeItem                      code 00547440 00547440 4889742410574883EC204883B9C00000
 BuildingItemSpot_update                        code 005493D0 005493D0 40534883EC30488B01488BD9FF90F800
 JobClaimSetFactionRet                          ret  0035B9E4 0035B9DE FF93A0000000
 BuildingOnSelect                               code 0054FA10 0054FA10 4C8BDC574881EC8000000048C7442440
 ForgottenGuiBuildingWindow                     code 006E5EA0 006E5EA0 48895C241048896C2418488974242057
+RaidCampaignJoin                               code 009C3850 009C3850 40555657415441554883EC40488B7170
+RaidCampaignDrop                               code 009C3A90 009C3A90 4053564883EC38488B4170488BF14889
+RaidCampaignOrigin                             code 009C2E00 009C2E00 48895C24084889742410574883EC2048
+RaidWarListGrow                                code 009CDC80 009CDC80 48895C2410574883EC2085D28BFAB80A
 PrisonTakeRet                                  ret  00330732 0033072C FF90F8040000
+TaskMakeAnnouncement_ownerNear                 code 00354930 00354930 4C8BDC574881ECC000000048C7442478
+Faction_findNear                               code 006BA4D0 006BA4D0 4C8BDC4154415541564883EC6048C744
+PassingByTownAssault_canStart                  code 00290410 00290410 40574883EC6048C7442430FEFFFFFF48
+PassingByTownAssault_fillTargets               code 00290080 00290080 488BC457415441554883EC6048C74424
+AssaultTownPlayerTest                          code 00290484 00290484 4883B850020000000F8426010000488B
 HaulStoreSearchOwnerTest                       code 0059A39A 0059A39A 4883B850020000000F84BC0000004D85
 HaulCandidatesGather                           code 008CAFD0 008CAFD0 488BC45741544155415641574883EC70
 OwnershipsMayUse                               code 006207A0 006207A0 48895C24084889742410574883EC2048
 HaulSearchGatherRet                            ret  0059A2C7 0059A2C2 E85B4FA7FF
+RClickAutoTradeEnd                             code 00713D60 00713D60 4C8BDC49895B0849896B104989731857
+Character_setupAI                              code 006210E0 006210E0 488BC455574154488D68A14881ECA000
+FoodStoreSearchOwnerTest                       code 008D9DD4 008D9DD4 4883B850020000000F85F0010000488B
+BedCostMayUseRet                               ret  00330BB2 00330BAD E834B1D0FF
+TownUpdateOwnSearchRet                         ret  005A47DD 005A47D8 E824A9AAFF
+GetFoodTownGateTest                            code 0059B261 0059B261 84C00F84FEFEFFFF4883BE2801000000
+WalkMapDeferInterior                           code 004D2340 004D2340 40534883EC30488BD94584C07411488B
+BuildingCreatePhysical                         code 0055FF50 0055FF50 488BC4554154415541564157488DA8F8
+DialogueListPlayerReplies                      code 0067F6A0 0067F6A0 488BC4554154415541564157488D68A1
+PlatoonMemoryNote                               code 00672F90 00672F90 48895C2408574883EC20418BD8488BFA
+TheftCaughtEv2FRet                              ret  00793D00 00793CFB E845858AFF
+TheftCaughtEv8Ret                               ret  00793D50 00793D4B E8F5848AFF
+TheftCaughtMemoryRet                            ret  00793D8D 00793D88 E825DC89FF
+TheftCaughtNotifyRet                            ret  00793D7C 00793D77 E8837387FF
+ZoneActivationDefaults                         ro   017477A0 017477A0 000080400000C0400000A04000000000
+PlacementPieceTown                             code 004D6300 004D6300 488BC4554154415541564157488DA818
+PlacementRegionAdd                             code 004D21F0 004D21F0 48895C241048896C2418574883EC7048
+TownListNearestPlayer                          code 00926F70 00926F70 48896C24104889742418574154415548
+PlacementGroupTownRange                        ro   016E0158 016E0158 00007A46
+TerrainHeightAt                                code 009B10B0 009B10B0 48895C24084889742410574883EC4041
+TaskObjectMineFactionTest                      code 005A3341 005A3341 483BC70F94C0488B6C2448488B5C2440
+UnlockDoorTaskStep                             code 0033D3C0 0033D3C0 48895C241048896C2418488974242057
+FactionWarMgrUpdate                            code 009CA440 009CA440 488BC4554154415541564157488D6888
+TownsOfFaction                                 code 00927E90 00927E90 48895C2418555741554883EC2033FF4D
+ScythePhysicsJunk                              code 007DBF20 007DBF20 48895C240848896C2410488974241848
+ScythePhysicsFirstReady                        code 007D46F0 007D46F0 405355574883EC504883B9B801000000
+DoorOpenTaskAction                             code 00336FC0 00336FC0 48895C2408574883EC20488BD9488B4A
+DoorOpenLockTestTaskAction                     code 003370B0 003370B0 40564883EC4083791800488BF2488D51
+DoorOpenButtonOpenRet                          ret  005465B7 005465B2 E85A8BAFFF

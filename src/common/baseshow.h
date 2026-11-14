@@ -62,7 +62,7 @@
 namespace baseshow {
 
 const unsigned kMsgShow = 78;
-const unsigned kProtocol = 145;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+const unsigned kProtocol = 153;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
 
 
 
@@ -1154,6 +1154,20 @@ inline int OwnCheckTownAt(OwnCheck* g, int sx, int sy)
             ++n;
         }
     return n;
+}
+/* T-1332: a SHOW's own rows (this player's outposts by id and words) are an event for the own-piece check when they differ from the
+   rows held (another link - linkChanged - or a row more or fewer, or a row's id, words or centre changed): the own pieces around each
+   row then owe a check, so a piece whose record names an outpost the earlier check could not find here is moved once its row comes.
+   1 = an event */
+inline int OwnRowsChanged(const std::vector<ShowRow>& held, const std::vector<ShowRow>& now, int linkChanged)
+{
+    if (linkChanged != 0 || held.size() != now.size()) return 1;
+    for (size_t i = 0; i < now.size(); ++i)
+    {
+        if (held[i].id != now[i].id || held[i].pos[0] != now[i].pos[0] || held[i].pos[2] != now[i].pos[2]) return 1;
+        for (int j = 0; j < 5; ++j) if (held[i].hand[j] != now[i].hand[j]) return 1;
+    }
+    return 0;
 }
 /* a copy's apply made or moved its town (founded, taken up, moved or founded again: step a kRow* step, moved 1 = the copy moved):
    a town event. A copy kept where it stood is none - no check at every apply */

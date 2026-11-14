@@ -193,7 +193,11 @@ std::string MetaHomeClean(const std::string& home);
 const char* const kMetaHomeCleared = "-";
 bool MetaHomeIsCleared(const std::string& home);
 std::string MetaHomeKey(const std::string& home);
-std::string MetaHomeNote(const std::string& kept, const std::string& arriving, int fromLive, int sameAsCleared);
+/* T-1334 fold 1 (review LOW, the replaced key): byClearer 1 = the arriving key is written by the game that wrote the "-" (its own live home
+   on that game, or a newer record from it): that game saw its own blanking, so its key replaces "-" even when it names the replaced
+   building again (a real return). Every game keeps the replaced key beside a "-" and who wrote it - the writer as well as the receivers -
+   so all of them take and refuse the same keys. */
+std::string MetaHomeNote(const std::string& kept, const std::string& arriving, int fromLive, int sameAsCleared, int byClearer = 0);
 /* A give of an owed home (towngen.cpp TownGenGiveHomeTo / ...ByKey: 1 / 2 given, 0 a fault, 3 not loaded, kGiveHomePlayerHouse the
    building is a player's house and is never given). OwedHomeGiveAct: kOwedGiveDone - the entry leaves the list; kOwedGiveKeep - tried
    again later; kOwedGiveDrop - the entry is dropped and the group's home cleared. */
@@ -225,6 +229,39 @@ int CopyHomeAfter(int homeAfter, int* tries, int maxTries);
    kLoHomeNoneAnywhere - no home known anywhere. */
 const int kLoHomeKept = 1, kLoHomeRestore = 2, kLoHomeOweByKey = 3, kLoHomeNoneAnywhere = 4;
 int LoadOverrideHomeDecide(int homeAfterRead, int saveHadHome, int keyKnown);
+/* T-1334: the same after the read, when the group's record says "-" (its home was blanked or bought): a squad with no home after the
+   read keeps none - the save's own home is NOT given back (kLoHomeClearedNone), the road by which a blanked home came back at a reload. */
+const int kLoHomeClearedNone = 5;
+int LoadOverrideHomeDecideRec(int homeAfterRead, int saveHadHome, int keyKnown, int recordCleared);
+/* T-1334: A LIVE COPY'S HOME AGAINST ITS RECORD (store.cpp ReHomeTick, MAIN THREAD). The game running the group is the source and is never
+   re-homed (kReHomeRunner). liveRead: TownGenPlatoonHomeKey - 1 a home, 0 none, -1 unread (kReHomeNone). sameKey: the live key is the
+   record's (exact or near it, BoxKeyNearKey). recordState: kRecHomeUnknown (no home known for the group: nothing done), kRecHomeNone ("-"),
+   kRecHomeKey. buildingLoaded: the record's building is loaded here. linkOther (after a load only, else 0): the building's residents hand
+   names another group or none - the area file's raw link, which the record's home is given over. Answers: kReHomeNone nothing to do;
+   kReHomeMove the engine's own move (Ownerships::setHomeBuilding) to the record's building; kReHomeBlank the engine's own blanking
+   (Ownerships::removeOwnedObject with the home); kReHomeMissing the record's building is not loaded here (counted, no move). */
+const int kRecHomeUnknown = 0, kRecHomeNone = 1, kRecHomeKey = 2;
+const int kReHomeNone = 0, kReHomeMove = 1, kReHomeBlank = 2, kReHomeMissing = 3, kReHomeRunner = 4;
+int RecHomeState(const std::string& recordHome);
+int ReHomeDecide(int isRunner, int liveRead, int sameKey, int recordState, int buildingLoaded, int linkOther);
+/* T-1334 fold 1 (review MED 2): what a record's home does when the record reaches this game (store.cpp the push road and the index road),
+   by its stamp against the record held here (held 0 = none held): kRecHomeArriveSkip - older: refused as not newer, its home is not noted
+   (the held, newer record's home stands); kRecHomeArriveNote - the same stamp (the same record by another road): noted, no live copy moved;
+   kRecHomeArriveTake - newer, or none held: noted, and live copies are compared (ReHomeTick). */
+const int kRecHomeArriveSkip = 0, kRecHomeArriveNote = 1, kRecHomeArriveTake = 2;
+int RecHomeArrive(int held, long long heldAt, long long arrivingAt);
+/* T-1334 fold 1 (review LOW 3): a re-home that did not happen is owed, not dropped - kReHomeMissing (the record's building is not loaded
+   here) and a move the engine did not make (moveRc not 1/2), but never a refusal as a player's house (kGiveHomePlayerHouse: a final answer
+   until the runner writes another home). moveRc is read only for kReHomeMove. 1 = owed (store.cpp CopyHomeOweAdd with reHome 1). */
+int ReHomeOwes(int decision, int moveRc);
+/* the owed re-home at the once-a-second owed-home check (store.cpp CopyHomeOwedTick): kReOwedDrop - the squad is no longer the one listed;
+   kReOwedRecheck - the record no longer names a building, or this game runs the group now: handed back to the re-home compare (it leaves
+   the list); kReOwedDone - the live home is the record's already; kReOwedWait - the building is not loaded here; kReOwedGive - move now. */
+const int kReOwedDrop = 0, kReOwedRecheck = 1, kReOwedDone = 2, kReOwedWait = 3, kReOwedGive = 4;
+int ReHomeOwedStep(int stillBound, int recordIsKey, int isRunner, int liveSame, int buildingLoaded);
+/* T-1334 fold 1 (review MED 1): a home the engine blanked is listed for this game's "-" write only on the game that writes the group (the
+   runner); on any other game nothing is listed - its record's home is put back instead (ReHomeTick). 1 = listed. */
+int HomeBlankListed(int bound, int isRunner);
 
 /* P8d. WHAT ONE FILE IS, IN THREE ANSWERS, AND THE ONLY THREE THERE ARE. Every reader in the notebook
    produces one of these and nothing else, so no caller can invent a fourth meaning by collapsing two.

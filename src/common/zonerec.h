@@ -27,12 +27,14 @@
  * (F480), and a record the game wrote itself never counts. ZoneKeptAdoptJudge names the first condition that fails, or adopt.
  *
  * PURE C++03 (VS2010 v100), header-only: no engine, no OS header. Swept by the offline suite (t609_zone_stamp, t609_zone_holder, t609_area_holder_rule, t609_zone_recv_holder,
- * t609_held_sender, t609_zone_kept_adopt). */
+ * t609_held_sender, t609_zone_kept_adopt, t1279_refused_save_fault, t1329_empty_record, t1329_read_decision). */
 #ifndef ZONEREC_H_INCLUDED
 #define ZONEREC_H_INCLUDED
 
 #include <string>
 #include <cstdio>
+#include <cstddef>
+#include <vector>
 
 namespace zonerec {
 
@@ -175,6 +177,79 @@ inline const char* ZoneKeptAdoptWhy(int why)
     }
     return "unknown";
 }
+
+/* T-1279 (owner decision 1580, 2026-11-09: "a save of your own area that gets refused will be logged as a fault rather than only
+   counted"; owner rule 1556: a game is in charge of an area it has loaded). A zone save this game refused as a stale copy is a FAULT
+   (an error line naming the area and why) when no other game holds the area: this game holds it, or nobody / an unknown game does -
+   the area is loaded here, so it is this game's own. Refused while another game holds the area is the holder rule working (a debug
+   line, as before). holderSlot: the area's holder on this game's AREAMAP (< 0 unknown, nobody or frozen); mySlot: this game's slot
+   (-1 unknown). 1 = a fault. The counter (zoneStaleCopyRefused) counts both, as before. */
+inline int ZoneRefusedSaveIsFault(int holderSlot, int mySlot)
+{
+    if (holderSlot < 0) return 1;
+    return (mySlot >= 0 && holderSlot == mySlot) ? 1 : 0;
+}
+/* T-1279 fold (review finding 6): the FAULT line is said ONCE PER AREA PER LOAD (the counter keeps counting every refusal). saidBefore
+   = this area's line was said before; saidLoad = the load number (the world teardown count) it was said in; loadNow = this one.
+   1 = say it now. */
+inline int ZoneFaultLineDue(int saidBefore, long long saidLoad, long long loadNow) { return (saidBefore == 0 || saidLoad != loadNow) ? 1 : 0; }
+
+/* T-1329 (design C; owner decision 1598 a, 2026-11-12): AN EMPTY AREA RECORD. Kenshi's one-area save (saveLevelData 0x36DCA0) writes
+   the area file only when the area holds something to save; otherwise it deletes the old file and sets ZoneMap+0x24 ("has a file") to
+   0 (build/decomp_36dca0.txt:263-291). The game that saved then publishes an EMPTY area record: these exact bytes in place of an area
+   file, stamped as any area record. The world server stores, judges and forwards it as any area record (zonecheck::Readable takes
+   it), so it replaces an older copy and answers later askers; a game holding it gives the area read a path where no file is
+   (ZoneReadServe kZrdNoFile), so Kenshi builds the base area. The bytes cannot be an area file Kenshi wrote (an area file is the
+   duplicate report's layout, which these do not read as). */
+const char kZoneEmptyMark[] = "SWAREA-EMPTY-1\n";
+const size_t kZoneEmptyMarkLen = 15;   /* the bytes of kZoneEmptyMark, without its terminating zero */
+inline void ZoneEmptyEncode(std::vector<char>* out) { out->assign(kZoneEmptyMark, kZoneEmptyMark + kZoneEmptyMarkLen); }
+/* 1 = exactly the EMPTY mark */
+inline int ZoneEmptyIsRaw(const unsigned char* b, size_t n)
+{
+    if (b == 0 || n != kZoneEmptyMarkLen) return 0;
+    for (size_t i = 0; i < n; ++i) if (b[i] != (unsigned char)kZoneEmptyMark[i]) return 0;
+    return 1;
+}
+inline int ZoneEmptyIs(const std::vector<char>& v) { return v.empty() ? 0 : ZoneEmptyIsRaw((const unsigned char*)&v[0], v.size()); }
+/* THE AREA READ (the game's swap, store.cpp detour_sfsReadFile): gateOn - the swap may serve at all; haveRec - a record of the area
+   is held; fileNamed - it names a mirror file; empty - that record is EMPTY. kZrdOwnFile: Kenshi reads its own file (as before);
+   kZrdNoFile: the read is given a path where no file is (ZoneNoFilePath) - Kenshi's load fails and it builds the base area, and its
+   next own save of the area deletes any stale local file; kZrdRecord: the record's file, by the swap's own further checks. */
+const int kZrdOwnFile = 0, kZrdNoFile = 1, kZrdRecord = 2;
+inline int ZoneReadServe(int gateOn, int haveRec, int fileNamed, int empty)
+{
+    if (gateOn == 0 || haveRec == 0 || fileNamed == 0) return kZrdOwnFile;
+    return empty != 0 ? kZrdNoFile : kZrdRecord;
+}
+/* the path an EMPTY record's read is given: the mirror file's own name inside a folder that is never made, so no file is there and
+   the name Kenshi gives the area is unchanged */
+inline std::string ZoneNoFilePath(const std::string& mirrorFile)
+{
+    const size_t slash = mirrorFile.find_last_of("\\/");
+    if (slash == std::string::npos) return std::string("no-file-empty-area\\") + mirrorFile;
+    return mirrorFile.substr(0, slash + 1) + "no-file-empty-area\\" + mirrorFile.substr(slash + 1);
+}
+/* THE HOLDER'S WRITE (AREA_FRESH WRITE round): nothing was published, and Kenshi's save set ZoneMap+0x24 (hasFile: 1 = it wrote an
+   area file, 0 = it saved nothing, -1 = not read). T-1329 fold 1 (F2): either answer from the save that published nothing is a FAULT
+   (it ends the asker's wait) - a written file that sent nothing, or an EMPTY area whose record a gate refused (the stale-copy gate,
+   the area's read still due); only "not read" keeps the reason as it was (notPublished). T-1329 fold 2 (re-check item 4): NOT when
+   the area's read is still due here (readDue = ZoneMapContent+0x108, 1): this game has nothing newer than the world server's record
+   (owner 1580 a), so the round answers notPublished and the asker keeps waiting for the record - its next ask's WRITE round, after
+   this game's own read ran (its own wait is answered from the world server's records: it is the area's holder), writes a file or an
+   EMPTY. readDue -1 = not read: judged as not due. */
+inline int ZoneNotPublishedIsFault(int hasFile, int readDue) { return (hasFile == 1 || (hasFile == 0 && readDue != 1)) ? 1 : 0; }
+/* T-1329 fold 1 (F1): ZoneMap+0x24 = 0 says the area's CONTAINER was empty when Kenshi saved it - an area whose read has not run yet
+   (its load still due, or held by the mod's wait - AfSetRetryPod re-arms the same flag) saves empty too. readDue: the engine's own
+   "this area's read is still due" byte, ZoneMapContent+0x108 (set when a load starts - decomp_a0d6a0 / a1a330; cleared by 0x9FF730
+   just before it runs the read 0x9FEC00 - decomp_9ff730.txt:19-22; set again by the mod while it holds the read). 1 = an EMPTY area
+   record may be published (Kenshi saved nothing AND this area's read ran here); 0 = not (a file was written, the byte was not read,
+   or the read is still due - the empty container is the unread area, not an empty one). */
+inline int ZoneEmptyMayPublish(int hasFile, int readDue) { return (hasFile == 0 && readDue == 0) ? 1 : 0; }
+/* T-1329 fold 1 (F4): an EMPTY queued off the main thread (an unload on a worker) is stamped only when the queue drains, so it is
+   dropped when a main-thread save of the same area came after it was queued (a newer state - it must not be overwritten). queuedSeq /
+   lastMainSaveSeq: one counter both draw from (0 = no main-thread save of the area). 1 = drop it. */
+inline int ZoneQueuedEmptyStale(long long queuedSeq, long long lastMainSaveSeq) { return lastMainSaveSeq > queuedSeq ? 1 : 0; }
 
 }   /* namespace zonerec */
 

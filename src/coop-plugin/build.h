@@ -9,7 +9,10 @@
 namespace coopbuild { struct BuildMsg; }   /* build1-b: src/common/buildwire.h */
 namespace powerwire { struct PowerMsg; }   /* P47: src/common/powerwire.h */
 namespace coopown { struct BuildRow; struct HelpRecRow; }     /* mmo8a: src/common/ownrec.h (pp.build); help1 fold: pp.help */
+class hand;   /* T-1130 re-check: game/hand.h - BdHandLookupPod below */
 namespace coop {
+int BdHandLookupPod(const hand* h, int which, void** out);   /* T-903 (F1026), T-1130 re-check: a hand's engine lookup, guarded - which 0 = hand::asBuilding, 1 = hand::asObjectBase; 1 = it returned (*out its answer, null included), 0 = it faulted (build.cpp; items.cpp's shop home walk sorts its handles with it) */
+unsigned int BuildSafePointNo();   /* T-1130 re-check, MAIN THREAD: the K2 safe points seen (BuildCopyDrain) - the clock a dead-handle set ages on (coopbuild::BuildDeadSetStep) */
 void InstallBuild();                                  // preload: the observe hooks (address table names below)
 void BuildTick();                                     // MAIN THREAD, every frame: drains the detours' POD queue into the log and the registry
 std::string BuildTestArm(const std::string& arg);     // MAIN THREAD: `buildtest place <sid> [dx dz] | progress <key-substring> <amount> | dismantle <key-substring> | into <near|host-key-substring> <sid> [indoors]`
@@ -24,7 +27,7 @@ void BuildTestDrain();                                // K2 safe point (combat.c
 std::string BuildListCommand();
 std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAIN THREAD, read-only: `bldstate <key-substring|key>` - a piece's own state as the kept lay writes it
 std::string BuildSetArm(const std::string& arg);         // KEPT, TEST-ONLY, MAIN THREAD: `bldset <key-substring|key> <field> <value>` - armed, written at the K2 safe point
-std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | refound <name> <dx> <dz> | link <key-substring> | list` - found / refound / link armed for the K2 safe point, list read now
+std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | refound <name> <dx> <dz> | link <key-substring> | list` - found / refound / link armed for the K2 safe point, list read now; `found relink <name> [dx dz]` (T-1332) also links the own pieces the new town is now nearest to, as the engine's founding does
 void BuildTownsMapEvent();                               // T-1158 step 6 review MED-2, MAIN THREAD (store.cpp KeptRecordSweepTick, each applied area map): released pieces held for another writer owe their area's own-piece check
 void BuildTownsNote(const char* p, size_t n);            // OUTPOSTS, MAIN THREAD (store.cpp): a TOWNS LIST from the world server - the kept outposts and their pieces' keys
 void BuildShowNote(const char* p, size_t n);             // T-811, MAIN THREAD (store.cpp): a SHOW from the world server - the teammates' outposts, shown at the next drain
@@ -73,5 +76,21 @@ void PieceRecordArrive(const std::string& id, const std::vector<char>& bytes);  
 void PieceRecordGone(const std::string& id, const char* from);   // MAIN THREAD (store.cpp): a piece record's removal - its kept copy is forgotten
 void PieceRecordEcho(const std::string& id, int hasStamp, long long stamp);   // MAIN THREAD (store.cpp RECORD_SEQ): this game's piece write sent with that stamp is on the world server's disk
 void PieceRefuseArrive(const std::vector<char>& payload);   // MAIN THREAD (store.cpp): PIECE_REFUSE (79) - counted, the piece marked again or its mark dropped
+/* T-1333 (src/common/bldgrec.h): ONE TOWN BUILDING AS ONE WORLD-SERVER RECORD - a town wall's ruin flag and health, written by the
+   holder of its area from the engine's own hit / ruin / repair, laid on every game through the engine's own setDestroyed and the
+   construction state. MAIN THREAD, each. */
+void TownBldgRecordArrive(const std::string& id, const std::vector<char>& bytes);   /* store.cpp: a building record from the world server - kept, laid when its area is laid */
+void TownBldgRecordGone(const std::string& id);   /* store.cpp: a building record removed on the world server - forgotten */
+void TownBldgRecordEcho(const std::string& id, int hasStamp, long long stamp);   /* store.cpp: RECORD_SEQ - this game's write was stored */
+void TownBldgRefuseArrive(const std::string& id, int reason, unsigned int storedGen, unsigned int sentGen);   /* items.cpp: BOX_REFUSE for a building record */
+void TownBldgMapEvent();   /* store.cpp: an area map arrived - queued removals tried against the holders it names */
+void TownBldgAreaRebuilt(int c);   /* townver.cpp: area c's town was rebuilt for a new version - its records are never laid; the holder removes them */
+void TbAreaLay(int c);   /* PieceRecApplyTick: area c's record list is complete - its kept building records are laid */
+void TbAreaLeft(int c);   /* PieceRecApplyTick: area c left - laid again at its next load */
+void TbLinkReset();   /* PieceRecApplyTick: a new link - every area laid again */
+void TbTick();   /* BuildTick: lays that waited for the engine's writes */
+int TbAreaLaidAnyThread(int c);   /* T-1333 fold 1, ANY THREAD (the wall hit hook): 1 = area c's building records are laid here (a byte read) */
+void TbRepairAnswer(const std::string& key, int door, int repair, int verdict);   /* T-1333 fold 1 D: the holder's answer to this game's town ask (BdHitAnswer) */
+void TownBldgReport();   /* the REPORT's [TOWNBLDG] line */
 void BuildHelpQuitFlush();                            // MAIN THREAD, process exit: the batched owed-file save now (review MED 8)
 }

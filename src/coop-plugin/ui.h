@@ -53,6 +53,9 @@ int UiModsWarnHide();
 // ui1 (connection trouble step 2): the small non-blocking notice - on 1 shows `text`, on 0 takes it down. 1 done, 0 refused,
 // -1 a MyGUI throw, -2 a fault. MAIN THREAD only.
 int UiQuietNotice(const char* text, int on);
+// T-1279 fold: MAIN THREAD - a held title load refused (the world server's link down, no dial pending): the existing CAN'T JOIN
+// box (joining = 1) or CAN'T HOST box (0), as the one press's failure when that press started the load.
+void UiPreloadRefusedBox(int joining);
 // ui1: log the host-left dialog's and the notice's on-screen rectangles when they changed ([UI] rect ...). MAIN THREAD.
 int UiDialogRectPoll();
 // T-514 (owner 448): the pause menu's NEW GAME / SAVE GAME / LOAD GAME are hidden and disabled on every open while HandSaveBlocked()

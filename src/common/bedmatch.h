@@ -115,4 +115,39 @@ inline int PickPieceKey(const char* want, const char* const* have, int n, int* n
     return kPickAmbiguous;
 }
 
+/* T-860: WHICH ROAD NAMES A PIECE'S OUTER BUILDING (items.cpp LayoutOuterKey, the owner's side of every bed / cage key).
+ * Road 1, the layout: Building+0x238 (the layout the piece was made from) -> Layout+0x90 (that layout's building). Only a
+ * piece the engine furnished from a layout has it; a piece made from a saved AREA FILE has none (createBuilding 0x57C1E0
+ * takes its host from the saved "isInsideBuilding" hand instead, decomp_57c1e0 :203-219), so before T-860 such a cage or
+ * bed was named with an empty outer key and the other game's layout road (spawn.cpp PoseBedViaLayout) could never find it.
+ * Road 2, the piece's own inside-building hand: Building+0x80, five words at +0x88 (type, container, containerStamp,
+ * index, serial - type first; kHandTypeNone = stands inside nothing; finding F1024), resolved to the building it names.
+ * Only a hand of type kHandTypeBuilding with a non-zero index or serial is resolved; a hand naming the piece itself is
+ * refused. No road -> kOuterRoadNone (an empty outer key, as before). The engine reads are the Reader's (the plugin's
+ * guarded pods, a fake one offline):
+ *   void* LayoutHost(void* piece)                  the building road 1 reaches, 0 = none / unreadable
+ *   int   InsideIds(void* piece, unsigned int* f)  the five words at +0x88 into f: 1 read, 0 faulted
+ *   void* Resolve(const unsigned int* f)           the building those words name, 0 = none / not plausible */
+const int kOuterRoadNone   = 0;
+const int kOuterRoadLayout = 1;
+const int kOuterRoadInside = 2;
+const unsigned int kHandTypeBuilding = 0;     /* itemType BUILDING */
+const unsigned int kHandTypeNone     = 0xB;   /* the inside-building hand of a piece that stands inside nothing */
+
+template <class Reader>
+inline int PickOuterRoad(Reader& r, void* piece, void** host)
+{
+    *host = 0;
+    if (piece == 0) return kOuterRoadNone;
+    void* h = r.LayoutHost(piece);
+    if (h != 0 && h != piece) { *host = h; return kOuterRoadLayout; }
+    unsigned int f[5] = { kHandTypeNone, 0, 0, 0, 0 };
+    if (r.InsideIds(piece, f) == 0) return kOuterRoadNone;
+    if (f[0] != kHandTypeBuilding || (f[3] == 0 && f[4] == 0)) return kOuterRoadNone;
+    h = r.Resolve(f);
+    if (h == 0 || h == piece) return kOuterRoadNone;
+    *host = h;
+    return kOuterRoadInside;
+}
+
 }   /* namespace coopbed */

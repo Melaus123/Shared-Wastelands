@@ -45,7 +45,7 @@
 
 namespace coopfeed {
 
-const unsigned int kFeedProtocol = 145;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+const unsigned int kFeedProtocol = 153;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
 
 
 
@@ -547,13 +547,19 @@ struct AreaDoneTable
 {
     volatile long long all, some;
     volatile long long area[kFeedAreaKeys];
+    volatile long long stale[kFeedAreaKeys];   /* T-1339: the stamp at which an AREA_STALE named the area (-1 none); it holds in that generation only */
     AreaDoneTable() { Clear(); }
-    void Clear() { all = -1; some = -1; for (int i = 0; i < kFeedAreaKeys; ++i) area[i] = -1; }
-    void Apply(const AreaDoneMsg& m, long long stamp)   /* a partial AREA_DONE (all = 0): its named areas */
+    void Clear() { all = -1; some = -1; for (int i = 0; i < kFeedAreaKeys; ++i) { area[i] = -1; stale[i] = -1; } }
+    void Apply(const AreaDoneMsg& m, long long stamp)   /* a partial AREA_DONE (all = 0): its named areas - done, and (T-1339) no longer stale */
     {
-        for (size_t i = 0; i < m.keys.size(); ++i) if ((int)m.keys[i] < kFeedAreaKeys) area[m.keys[i]] = stamp;
+        for (size_t i = 0; i < m.keys.size(); ++i) if ((int)m.keys[i] < kFeedAreaKeys) { area[m.keys[i]] = stamp; stale[m.keys[i]] = -1; }
         some = stamp;
     }
+    void Stale(const AreaDoneMsg& m, long long stamp)   /* T-1339: an AREA_STALE - its named areas read as not done until their AREA_DONE */
+    {
+        for (size_t i = 0; i < m.keys.size(); ++i) if ((int)m.keys[i] < kFeedAreaKeys) stale[m.keys[i]] = stamp;
+    }
+    long long StaleStamp(int k) const { return (k < 0 || k >= kFeedAreaKeys) ? -1 : stale[k]; }
     long long Stamp(int k) const
     {
         if (k == kFeedAreaAny) return some;
@@ -583,6 +589,76 @@ inline int FeedAreaDoneHeld(long long allStamp, long long areaStamp, long gen)
 {
     return (gen >= 0 && (FeedAreaStampGen(allStamp) == gen || FeedAreaStampGen(areaStamp) == gen)) ? 1 : 0;
 }
+/* ---- T-1339 (protocol 153): AREA_STALE (down, kind 11) {u32 epoch, u32 n, n * u16 area key} ----
+   The world server HELD a record write of each named area for this game (the area is outside its interest - src/common/aoifilter.h):
+   the game's copy of that area may be older than the world server's. Sent once per area until its catch-up; the catch-up (the area's
+   records written since, then AREA_DONE all = 0 naming it) follows on the SAME line, so the STALE always comes before that DONE.
+   The game queues it as a marker behind the records (FeedMarkerEncode, as AREA_DONE) and the drain stamps the named areas STALE; from
+   then every reader gate reads that area as not done - the whole-table mark of the first download included - until an AREA_DONE
+   all = 0 names it (AreaDoneTable::Apply). Epoch and arrival rule: AREA_DONE's (FeedAreaDoneArrived). */
+const unsigned int kFeedAreaStale = 11;
+inline bool FeedEncodeAreaStale(std::vector<char>* b, unsigned int epoch, const std::vector<unsigned short>& keys)
+{
+    if (keys.empty() || keys.size() > kFeedAreaDoneMax) return false;
+    for (size_t i = 0; i < keys.size(); ++i) if ((int)keys[i] >= kFeedAreaKeys) return false;
+    FeedHead(b, kFeedAreaStale); FeedPut32(b, epoch); FeedPut32(b, (unsigned int)keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) { b->push_back((char)(keys[i] & 0xFFu)); b->push_back((char)((keys[i] >> 8) & 0xFFu)); }
+    return true;
+}
+inline bool IsFeedAreaStaleKind(const char* p, size_t n)
+{
+    return p != 0 && n >= kFeedHeader && p[1] == 0 && p[2] == 0 && p[3] == 0 && (unsigned int)(unsigned char)p[0] == kFeedAreaStale;
+}
+/* into an AreaDoneMsg (all = 0): at least one key, each on the grid, nothing after the last */
+inline bool FeedAreaStaleDecode(const char* p, size_t n, AreaDoneMsg* out)
+{
+    if (!IsFeedAreaStaleKind(p, n)) return false;
+    size_t at = kFeedHeader;
+    if (n - at < 8) return false;
+    AreaDoneMsg m;
+    m.epoch = FeedGet32(p + at);
+    const unsigned int cnt = FeedGet32(p + at + 4); at += 8;
+    if (cnt == 0 || cnt > (unsigned int)kFeedAreaDoneMax || n - at != (size_t)cnt * 2) return false;
+    for (unsigned int i = 0; i < cnt; ++i)
+    {
+        const unsigned int k = (unsigned int)(unsigned char)p[at] | ((unsigned int)(unsigned char)p[at + 1] << 8); at += 2;
+        if ((int)k >= kFeedAreaKeys) return false;
+        m.keys.push_back((unsigned short)k);
+    }
+    *out = m;
+    return true;
+}
+inline bool IsFeedAreaStaleMarker(const std::vector<char>& b) { return b.size() >= 4 + kFeedHeader && IsFeedAreaStaleKind(&b[4], b.size() - 4); }
+inline bool FeedAreaStaleMarkerDecode(const std::vector<char>& b, unsigned int* epoch, AreaDoneMsg* m)
+{
+    if (!IsFeedAreaStaleMarker(b)) return false;
+    AreaDoneMsg t;
+    if (!FeedAreaStaleDecode(&b[4], b.size() - 4, &t)) return false;
+    *epoch = FeedGet32(&b[0]); *m = t;
+    return true;
+}
+/* THE OVERRIDE: an AREA_STALE stamp holds in its own generation only (a WELCOME or a world load moves the generation, and the next
+   first download carries every latest copy) */
+inline int FeedAreaStaleNow(long long staleStamp, long gen) { return (gen >= 0 && staleStamp >= 0 && FeedAreaStampGen(staleStamp) == gen) ? 1 : 0; }
+/* EVERY READER GATE (T-1339): done as before (the area's own mark OR the whole table's) AND not stale */
+inline int FeedAreaReadyOnLink(long long allStamp, long long areaStamp, long long staleStamp, long gen, long link)
+{
+    return (FeedAreaDoneOnLink(allStamp, areaStamp, gen, link) != 0 && FeedAreaStaleNow(staleStamp, gen) == 0) ? 1 : 0;
+}
+inline int FeedAreaReadyHeld(long long allStamp, long long areaStamp, long long staleStamp, long gen)
+{
+    return (FeedAreaDoneHeld(allStamp, areaStamp, gen) != 0 && FeedAreaStaleNow(staleStamp, gen) == 0) ? 1 : 0;
+}
+/* THE DETECTOR (game, at an AREA_DONE all = 0 of area k): the world server sends that DONE only behind a catch-up, and every catch-up
+   only after an AREA_STALE for the area - so a DONE finding the area NOT stale means records of an area this game read as done were
+   arriving late (kAdLate when the area is loaded here - store.cpp lateRecordDone, must stay 0; kAdNotStale when it is not loaded) */
+enum { kAdStaleCleared = 0, kAdNotStale = 1, kAdLate = 2 };
+inline int FeedAreaDoneStaleJudge(long long staleStamp, long gen, int loadedHere)
+{
+    if (FeedAreaStaleNow(staleStamp, gen)) return kAdStaleCleared;
+    return loadedHere == 1 ? kAdLate : kAdNotStale;
+}
+
 /* the settle of named areas: is area k one of them */
 inline bool FeedAreaListHas(const std::vector<unsigned short>& keys, int k)
 {

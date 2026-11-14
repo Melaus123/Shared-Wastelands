@@ -73,6 +73,28 @@ inline bool ClothingMissedKoHold(int dead, int downed, bool ownerKo, bool ownerD
         && !ClothingThroughKoHold(dead, downed, ownerKo, ownerDead, lookWentThrough, knockHeld);
 }
 
+/* T-1244 (design A, F-T1244-DOWNHOLD): a copy's kit (its worn items and its whole inventory, the owner's list) is the owner's
+   inventory, and the owner's item moves land on a knocked-out copy at once (items.cpp ApplyItemMove has no down test). Putting
+   the kit on queues only the re-attach step (+0x141), never the body rebuild (+0x143) the down / owner-says-knocked-out holds
+   exist for (F939). So a LIVE HUMAN copy's kit is no longer held because the copy is down or its owner says knocked out; only
+   its look waits. dead: 0 alive, nonzero dead or unreadable. downed: 0 standing, nonzero down or unreadable. human: 1 human,
+   anything else not (dead animals keep waiting by the owner's decision; live animals keep today's rule with them). A copy
+   the owner says dead keeps today's rule. The caller keeps every other hold (built, settled, KitApplyBusy) and adds the
+   body-rebuild guard checks. */
+inline bool KitPassesDownHold(int dead, int downed, bool ownerKo, bool ownerDead, int human)
+{
+    return dead == 0 && !ownerDead && human == 1 && (downed != 0 || ownerKo);
+}
+
+/* The same copy's kit while a look for it is queued: it no longer waits for that look only when LookGate holds the look now
+   (kLookWait) and the copy passes KitPassesDownHold - the look is held for down / owner-says-knocked-out alone. A look LookGate
+   would apply now (the first-look exception on a held knockdown) goes first, as before, and the kit after it. */
+inline bool KitPassesLookHold(int dead, int downed, bool ownerKo, bool ownerDead, int human, bool firstLook, bool knockHeld)
+{
+    return KitPassesDownHold(dead, downed, ownerKo, ownerDead, human)
+        && LookGate(dead, downed, ownerKo, ownerDead, false, firstLook, knockHeld) == kLookWait;
+}
+
 /* T-601 D1: a wake-up clock held back with a parked knockdown (spawn.cpp ProneParkTick) goes on when the hold ends, less the
    time it waited: koTimer - waitedMs / 1000, never below 0. A value outside the range ApplyLatch writes (0 or below, 3600 and
    above, or not a number: no clock running) comes back unchanged, so ApplyLatch treats it exactly as the owner sent it. */

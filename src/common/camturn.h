@@ -128,6 +128,17 @@ inline int YawPitchFromQuat(const float q[4], float* yawDeg, float* pitchDeg)
     return 1;
 }
 
+/* T-1294 test tool (camfollow's once-a-second `[CAMFOLLOW] at` line): is a sample due? now / lastAt are GetTickCount readings
+   (ms since the PC started, wrapping every ~49.7 days); first = 1 for the first frame after following starts. The first sample
+   is due at once; after that one is due when at least periodMs have passed since the last, judged on the UNSIGNED distance
+   now - lastAt, which is right at any uptime and across the wrap. (T2243: the old test `(LONG)(now - dueAt) >= 0` with dueAt
+   starting at 0 was false whenever the PC had been up more than ~24.9 days - no sample ever printed.) */
+inline int TrailDue(unsigned int now, unsigned int lastAt, int first, unsigned int periodMs)
+{
+    if (first != 0) return 1;
+    return (unsigned int)(now - lastAt) >= periodMs ? 1 : 0;
+}
+
 }   /* namespace camturn */
 
 #endif

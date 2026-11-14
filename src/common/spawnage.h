@@ -54,6 +54,10 @@ const int kSpawnStatsBad    = 3;   /* statsHas set, but the block was truncated 
 const unsigned int kSpawnFlagDead  = 1u;   /* Character::hasDied on the owner's game */
 const unsigned int kSpawnFlagKo    = 2u;   /* unconscious, or the owner's wake-up clock running (the NoteOwnerKo test) */
 const unsigned int kSpawnFlagsKnown = 3u;  /* any other bit is ignored on decode */
+/* TEST-ONLY (lever1): a spare bit of the same byte - the character was made by the `spawn` lever (levermade.h), so the levers'
+   `spawned:<Template>` / `made:<label>` picks count its copy too. Not an owner flag: never in ownerFlags (SpawnMsg::leverMade);
+   an older build masks it off. */
+const unsigned int kSpawnFlagLeverMade = 4u;
 
 struct SpawnMsg
 {
@@ -67,6 +71,7 @@ struct SpawnMsg
     bool ageClamped;    /* the age was present but NaN / infinite / outside [0,1] */
     int statsState;     /* S1: kSpawnStats* */
     unsigned int ownerFlags;   /* T-303: kSpawnFlag* (unknown bits masked off); 0 when absent */
+    bool leverMade;            /* TEST-ONLY (lever1): kSpawnFlagLeverMade was set; false when the flags byte is absent */
     bool flagsAbsent;          /* T-303: the payload ended before the flags byte */
     std::string templateSid;   /* T-922: the template's stringID, "" = none sent / absent / refused */
     bool templateSidAbsent;    /* T-922: the payload ended before the stringID's length */
@@ -74,7 +79,7 @@ struct SpawnMsg
     int statsBadIndex;  /* S1: the first non-finite float of a refused block, -1 otherwise */
     unsigned int stats[coopstats::kStatsCount];   /* S1: the owner's 44 values when statsState == kSpawnStatsOk */
     SpawnMsg() : uid(0), x(0), y(0), z(0), keepContainer(true), age(0.0f), ageAbsent(false), ageClamped(false),
-                 statsState(kSpawnStatsAbsent), ownerFlags(0), flagsAbsent(true), templateSidAbsent(true), templateSidBad(false), statsBadIndex(-1) { std::memset(stats, 0, sizeof(stats)); }
+                 statsState(kSpawnStatsAbsent), ownerFlags(0), leverMade(false), flagsAbsent(true), templateSidAbsent(true), templateSidBad(false), statsBadIndex(-1) { std::memset(stats, 0, sizeof(stats)); }
 };
 
 /* [0,1], with NaN and the infinities caught by their BITS (a `v != v` test is not safe under /fp:fast).
@@ -134,7 +139,7 @@ inline void AppendSpawnStats(std::vector<char>* b, const unsigned int* raw44)
 /* T-303 (protocol 102): appended AFTER AppendSpawnStats - the owner's kSpawnFlag* bits of the character. */
 inline void AppendSpawnFlags(std::vector<char>* b, unsigned int flags)
 {
-    b->push_back((char)(unsigned char)(flags & kSpawnFlagsKnown));
+    b->push_back((char)(unsigned char)(flags & (kSpawnFlagsKnown | kSpawnFlagLeverMade)));   /* lever1: the TEST-ONLY bit rides too */
 }
 
 /* T-922 (protocol 172): appended AFTER AppendSpawnFlags - the template's stringID (templatekey.h SidToSend), u32 length then
@@ -188,6 +193,7 @@ inline int DecodeSpawn(const char* p, size_t size, SpawnMsg* out)
             if (size - off >= 1)
             {
                 m.ownerFlags = (unsigned int)(unsigned char)p[off] & kSpawnFlagsKnown;
+                m.leverMade = ((unsigned int)(unsigned char)p[off] & kSpawnFlagLeverMade) != 0;   /* lever1 TEST-ONLY */
                 m.flagsAbsent = false;
                 off += 1;
                 if (size - off >= 4)   /* T-922 (protocol 172): the template's stringID follows the flags byte */

@@ -5,6 +5,7 @@
  * than one file uses is in suite.h. New tests go in test_main.cpp.
  */
 #include "suite.h"
+#include "areafresh.h"   /* T-1279 (T2290): the AREA_FRESH kinds */
 #include "keeprunning.h"   /* the kept world's router lines (RouterLine) */
 
 namespace suite {
@@ -119,7 +120,7 @@ void t_t985s2a_ledger_index()
     const std::string server = T313ReadFile("../coop-store/store_main.cpp");
     struct Want { const char* text; size_t n; };
     const Want want[] = { { "AoiSent(to, aoi::kRoadPreload, r, AoiFullStamp(r), b);", 1 }, { "if (aoiSentOk) AoiSent(to, aoi::kRoadFeed, r, coopfeed::FeedHeldHeaderStamp(", 1 },
-                          { "AoiSent(to, aoi::kRoadFeed, r, AoiFullStamp(r), b);", 1 }, { "if (SbSendRel(p, buf))", 1 }, { "AoiSent(p, aoi::kRoadForward, r,", 1 }, { "AoiSent(", 5 },
+                          { "AoiSent(to, aoi::kRoadFeed, r, AoiFullStamp(r), b);", 1 }, { "if (SbSend(p, buf, false, kChReliable, answer ? (int)livefirst::kLineAnswerBulk : -1, !answer))", 1 }, { "AoiSent(p, aoi::kRoadForward, r,", 1 }, { "AoiSent(", 5 },
                           { "AoiIndexPut(", 6 }, { "AoiIndexErase(", 3 }, { "AoiFirstAreas(", 2 }, { "AoiGameGone(", 2 }, { "if (aoiGoneSlot >= 0) AoiGameGone(aoiGoneSlot, p);", 1 },
                           { "+ AoiReportGroup());", 1 }, { "\"preload@firstAreas\"", 1 }, { "NowSec() - la->second.at <= kGraceSec) loaded = &la->second.loaded;", 1 } };
     for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); ++i)
@@ -375,7 +376,9 @@ void t_t985s2b_server_sends_area_done()
         if (between.find("if (last)") == std::string::npos || between.find("return") != std::string::npos || ad - pe > 400) Fail("AREA_DONE is not sent at once after every last PAGE_END");
         if (server.find("SendMsg(from, MSG_RECORD_FEED, ad); ++g_feedAreaDoneSent;", ad) == std::string::npos) Fail("the world server encodes AREA_DONE but does not send it");
     }
-    if (T985s2bCount(server, "FeedEncodeAreaDone(") != 1 || T985s2bCount(game, "FeedEncodeAreaDone(") != 0) Fail("AREA_DONE is encoded somewhere else (the game never sends it)");
+    /* T-1339 (protocol 153): the world server also ends each area catch-up with AREA_DONE all=0 naming that area (store_main.cpp AoifCatchUp) */
+    if (T985s2bCount(server, "FeedEncodeAreaDone(") != 2 || server.find("coopfeed::FeedEncodeAreaDone(&ad, g_feedFirstAsks[p], false, one)") == std::string::npos
+        || T985s2bCount(game, "FeedEncodeAreaDone(") != 0) Fail("AREA_DONE is encoded somewhere other than the last page and the area catch-up (the game never sends it)");
     if (server.find("if (m.key.empty()) ++g_feedFirstAsks[from];") == std::string::npos || server.find("g_feedFirstAsks.erase(p);") == std::string::npos)
         Fail("the world server does not number AREA_DONE by this connection's first-page asks");
     if (game.find("if (coopfeed::FeedAreaDoneArrived(g_feed, StoreNotebookLinkGen(), ad.epoch) == 0) { ++g_areaDoneStale; return; }") == std::string::npos
@@ -660,7 +663,7 @@ void t_t346_flow_fetches_exactly_the_newer()
         ++batches; asked += keys.size();
         if (keys.size() > cooppre::kPreFetchBatch) { Fail("a batch over the cap"); return; }
         for (size_t i = 0; i < keys.size(); ++i) if (keys[i] == "zone.6.6") s.failed.insert(keys[i]);   /* its write failed */
-        if (cooppre::PreWaitDecide(s.phase, 1, 10u, cooppre::kPreBoundMs) != cooppre::kPreWait) { Fail("the wait let the load go mid-fetch"); return; }
+        if (cooppre::PreWaitDecide(s.phase, 1, 1, 1, 1, 0) != cooppre::kPreWait) { Fail("the wait let the load go mid-fetch"); return; }
         cooppre::PreMsg end; end.kind = cooppre::kPreFetchEnd; end.token = 42u; end.answered = (unsigned)keys.size(); end.sent = (unsigned)keys.size();
         cooppre::PreMsg wrong = end; wrong.token = 7u;
         if (cooppre::PreOnFetchEnd(&s, wrong, &keys) != cooppre::kActNone) { Fail("a FETCH_END of another token was taken"); return; }
@@ -669,7 +672,7 @@ void t_t346_flow_fetches_exactly_the_newer()
     if (act != cooppre::kActDone || s.phase != cooppre::kPhDone || batches != 2 || asked != 302) { Fail("the fetch did not end Done after 2 batches of all 302"); return; }
     std::set<std::string> stale; cooppre::PreStaleKeys(s, &stale);
     if (stale.size() != 1 || stale.count("zone.6.6") != 1) Fail("the stale keys are not exactly the one whose write failed");
-    if (cooppre::PreWaitDecide(s.phase, 1, 10u, cooppre::kPreBoundMs) != cooppre::kPreGo) Fail("Done did not let the load go");
+    if (cooppre::PreWaitDecide(s.phase, 1, 1, 1, 1, 0) != cooppre::kPreGo) Fail("Done did not let the load go");
     /* nothing newer: the index ends Done at once, no FETCH */
     cooppre::PreState s2; cooppre::PreBegin(&s2, 1u, 1); std::map<std::string, T346Rec> same = srv; T346LocalWant w2; w2.local = &same;
     std::vector<cooppre::IndexEntry> es2; std::string lk2; cooppre::PreIndexWalk(srv, std::string(), 4096, cooppre::kPreIndexPageBytes, st, &es2, &lk2);
@@ -678,19 +681,332 @@ void t_t346_flow_fetches_exactly_the_newer()
 }
 void t_t346_wait_exit_rule()
 {
-    const unsigned int B = cooppre::kPreBoundMs;
-    if (B != 60000u) Fail("the bound is not 60 s");
-    if (cooppre::PreWaitDecide(cooppre::kPhIndex, 1, 0u, B) != cooppre::kPreWait) Fail("the index wait did not hold");
-    if (cooppre::PreWaitDecide(cooppre::kPhFetch, 1, B - 1, B) != cooppre::kPreWait) Fail("the fetch wait let go before the bound");
-    if (cooppre::PreWaitDecide(cooppre::kPhFetch, 1, B, B) != cooppre::kPreStaleTimeout) Fail("the bound did not end the wait");
-    if (cooppre::PreWaitDecide(cooppre::kPhIndex, 0, 5u, B) != cooppre::kPreStaleLink) Fail("a failed link did not end the wait at once");
-    if (cooppre::PreWaitDecide(cooppre::kPhFetch, 0, B + 5, B) != cooppre::kPreStaleLink) Fail("a failed link past the bound is not named as the link");
-    if (cooppre::PreWaitDecide(cooppre::kPhDone, 0, B + 5, B) != cooppre::kPreGo) Fail("Done did not win over a later link failure");
-    if (cooppre::PreWaitDecide(cooppre::kPhIdle, 1, 0u, B) != cooppre::kPreGo || cooppre::PreWaitDecide(cooppre::kPhReleased, 1, 0u, B) != cooppre::kPreGo) Fail("a state not in flight held the load");
+    /* T-1279 (owner decision 1580 a): the 60 s bound is gone - the rule has no clock input; t1279_wait_rule covers the link cases */
+    if (cooppre::kPreWaitNoteMs != 60000u) Fail("the still-held note is not every 60 s");
+    if (cooppre::PreWaitDecide(cooppre::kPhIndex, 1, 1, 1, 1, 0) != cooppre::kPreWait) Fail("the index wait did not hold");
+    if (cooppre::PreWaitDecide(cooppre::kPhFetch, 1, 1, 1, 1, 0) != cooppre::kPreWait) Fail("the fetch wait let go while the link is up");
+    if (cooppre::PreWaitDecide(cooppre::kPhIndex, 0, 0, 0, 1, 0) != cooppre::kPreStaleLink) Fail("a world server that can never answer did not end the wait");
+    if (cooppre::PreWaitDecide(cooppre::kPhDone, 0, 0, 0, 0, 1) != cooppre::kPreGo) Fail("Done did not win over a later link failure");
+    if (cooppre::PreWaitDecide(cooppre::kPhIdle, 1, 1, 1, 1, 0) != cooppre::kPreGo || cooppre::PreWaitDecide(cooppre::kPhReleased, 1, 1, 1, 1, 0) != cooppre::kPreGo) Fail("a state not in flight held the load");
     /* a page that says "more" with no rows ends the index (it cannot ask forever) */
     cooppre::PreState s; cooppre::PreBegin(&s, 5u, 1); cooppre::PreMsg m; m.kind = cooppre::kPreIndexPage; m.token = 5u; m.last = 0; std::vector<std::string> keys;
     T346Stamp unused; (void)unused; std::map<std::string, T346Rec> l; T346LocalWant w; w.local = &l;
     if (cooppre::PreOnIndexPage(&s, m, w, &keys) != cooppre::kActDone || s.phase != cooppre::kPhDone) Fail("an empty 'more' page did not end the index");
+}
+/* T-1279 (owner decision 1580 a, 2026-11-09): THE LOAD WAITS FOR THE WORLD'S RECORDS - no time bound while the link is up; a lost
+   link holds the load while a dial is pending and the exchange begins again on the next link; with no dial pending the load is
+   refused (review finding 1); only a world server that can never answer lets the load go with this game's own copies. Inputs:
+   phase, linkOk (the exchange's link up), linkUpNow (a link up now), linkCanServe, dialPending, stalled. */
+void t_t1279_wait_rule()
+{
+    using namespace cooppre;
+    if (PreWaitDecide(kPhDone, 1, 1, 1, 1, 0) != kPreGo) Fail("t1279: link up and every record in did not let the load go");
+    if (PreWaitDecide(kPhIndex, 1, 1, 1, 1, 0) != kPreWait || PreWaitDecide(kPhFetch, 1, 1, 1, 0, 0) != kPreWait) Fail("t1279: link up and records not in did not wait");
+    if (PreWaitDecide(kPhFetch, 1, 0, 0, 0, 0) != kPreWait) Fail("t1279: the exchange's own link up did not decide the wait first");
+    /* link down -> held while a dial is pending, begun again on a new link, REFUSED when no dial is pending (finding 1) */
+    if (PreWaitDecide(kPhFetch, 0, 0, 1, 1, 0) != kPreWait) Fail("t1279: a lost link with a dial pending did not hold the load");
+    if (PreWaitDecide(kPhFetch, 0, 0, 1, 0, 0) != kPreRefuse || PreWaitDecide(kPhIndex, 0, 0, 1, 0, 1) != kPreRefuse) Fail("t1279 fold: a lost link with no dial pending was not refused");
+    if (PreWaitDecide(kPhIndex, 0, 1, 1, 0, 0) != kPreRestart || PreWaitDecide(kPhFetch, 0, 1, 1, 1, 0) != kPreRestart) Fail("t1279: a new link did not begin the exchange again");
+    if (PreWaitDecide(kPhFetch, 0, 0, 0, 1, 0) != kPreStaleLink || PreWaitDecide(kPhIndex, 0, 1, 0, 0, 0) != kPreStaleLink) Fail("t1279: a world server that can never answer held the load");
+    for (int ph = kPhIdle; ph <= kPhReleased; ++ph)
+        for (int c = 0; c < 64; ++c)
+        {
+            const int d = PreWaitDecide(ph, c & 1, (c >> 1) & 1, (c >> 2) & 1, (c >> 3) & 1, (c >> 4) & 1);
+            if (d == kPreStaleTimeout) { Fail("t1279: the wait still answers a timeout"); return; }
+            if (d == kPreRefuse && (c & 1) != 0) { Fail("t1279 fold: a load was refused while its exchange's link is up"); return; }
+            if (d == kPreStaleLink && ((c >> 2) & 1) != 0) { Fail("t1279: the save file was used while a world server can still answer"); return; }
+        }
+    /* the start of a held load */
+    if (PreBeginDecide(1, 1, 0) != kPreBeginAsk || PreBeginDecide(1, 0, 0) != kPreBeginAsk) Fail("t1279: a ready link did not begin the exchange");
+    if (PreBeginDecide(0, 1, 1) != kPreBeginWaitLink) Fail("t1279: a load asked for while the link is down (a dial pending) was not held for it");
+    if (PreBeginDecide(0, 1, 0) != kPreBeginRefuse) Fail("t1279 fold: a load with the link down and no dial pending was not refused");
+    if (PreBeginDecide(0, 0, 1) != kPreBeginNotAsked || PreBeginDecide(0, 0, 0) != kPreBeginNotAsked) Fail("t1279: a load with no world server that can answer was held");
+}
+/* T-1279 fold: finding 2's restart rule, finding 6's cap, and the wiring of the game and the world server */
+void t_t1279f_refuse_restart_cap()
+{
+    using namespace cooppre;
+    /* finding 2: a broken chain or no progress for kPreStallMs on the exchange's link begins it again on that link */
+    if (kPreStallMs != 180000u) Fail("t1279f: the no-progress backstop is not 180 s");
+    if (PreStalled(0, 0) != 0 || PreStalled(0, kPreStallMs - 1) != 0) Fail("t1279f: an exchange still in its window was read as stalled");
+    if (PreStalled(1, 0) != 1 || PreStalled(0, kPreStallMs) != 1) Fail("t1279f: a broken chain or no progress was not read as stalled");
+    if (PreWaitDecide(kPhFetch, 1, 1, 1, 1, PreStalled(1, 5)) != kPreRestart || PreWaitDecide(kPhIndex, 1, 1, 1, 0, PreStalled(0, kPreStallMs)) != kPreRestart)
+        Fail("t1279f: a stalled exchange on its link was not begun again");
+    if (PreWaitDecide(kPhDone, 1, 1, 1, 1, 1) != kPreGo) Fail("t1279f: Done lost to a stall");
+    /* finding 6: the FAULT line once per area per load */
+    if (zonerec::ZoneFaultLineDue(0, 0, 3) != 1 || zonerec::ZoneFaultLineDue(1, 3, 3) != 0 || zonerec::ZoneFaultLineDue(1, 2, 3) != 1) Fail("t1279f: the FAULT line is not once per area per load");
+    /* wiring */
+    const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp"), ui = T313ReadFile("../coop-plugin/ui.cpp");
+    if (plugin.empty() || server.empty() || ui.empty()) { Fail("t1279f: could not read store.cpp / store_main.cpp / ui.cpp"); return; }
+    if (plugin.find("UiPreloadRefusedBox(ConfigRole() == kRoleClient ? 1 : 0);") == std::string::npos || ui.find("void UiPreloadRefusedBox(int joining)") == std::string::npos
+        || ui.find("coopui::kPressJoinNoAnswerText : coopui::kPressHostLateText") == std::string::npos) Fail("t1279f: the refused load does not show the existing CAN'T JOIN / CAN'T HOST box");
+    if (plugin.find("return (!g_storeTargetAddr.empty() && g_storeTargetPort != 0 && !g_storeProtoMismatch") == std::string::npos) Fail("t1279f (finding 3): 'a server is set' is not the target address and port");
+    if (plugin.find("PreFetchClass") != std::string::npos) Fail("t1279f (design B): the all-zones pre-load fetch is still there");
+    if (plugin.find("UiQuietNotice(coopown::HostQuietLine(), 1);") == std::string::npos) Fail("t1279f: the held load shows no connection-problem notice");
+    if (plugin.find("areafresh::WaitEndOrNoServer(") == std::string::npos || plugin.find("verdict != areafresh::kWaitRecord") == std::string::npos) Fail("t1279f (design B): the game does not wait for the record of an area nobody holds");
+    if (server.find("{ AfAnswerFromRecords(from, slot, m, why, holder); return; }") == std::string::npos || server.find("areafresh::ServerRecordAnswer(") == std::string::npos)
+        Fail("t1279f (design B): the world server does not answer an ASK from its records");
+    if (plugin.find("zonerec::ZoneFaultLineDue(") == std::string::npos) Fail("t1279f (finding 6): the FAULT line has no per-area cap");
+}
+/* T-1279 (owner decision 1580): a refused save of this game's own area is a fault line; refused while another game holds it is not */
+void t_t1279_refused_save_fault()
+{
+    using namespace zonerec;
+    if (ZoneRefusedSaveIsFault(3, 3) != 1) Fail("t1279: a refused save of an area this game holds is not a fault");
+    if (ZoneRefusedSaveIsFault(-1, 3) != 1 || ZoneRefusedSaveIsFault(-1, -1) != 1) Fail("t1279: a refused save of an area nobody holds is not a fault");
+    if (ZoneRefusedSaveIsFault(0, 3) != 0) Fail("t1279: a refused save while another game holds the area is a fault");
+    if (ZoneRefusedSaveIsFault(0, -1) != 0) Fail("t1279: a refused save with this game's slot unknown and a holder named is a fault");
+    /* the report's case: loaded from the save file, the game's own record held -> refused (kZaNoMark) -> a fault */
+    if (ZoneKeptAdoptJudge(0, -1, 5, 3, 3, 3, 10.0, 20.0) != kZaNoMark || ZoneRefusedSaveIsFault(3, 3) != 1) Fail("t1279: the report's refused save is not a fault");
+}
+/* T-1279 (T2290): the world server's area answers do not wait behind the record stream - the line of each AREA_FRESH kind, the ANSWER
+   line in the send queue (ahead of records and REST barriers, never ahead of a WELCOME), the REST marks that keep a CANT behind a
+   waiting record of its own area, and the ordering cases the change relies on (a CANT current or fault ends the wait; a FRESH ends it
+   only with its record in the swap; an older record arriving after is refused unless it is the holder's copy - the case the mark guards) */
+static coopsb::Item T1279Frame(unsigned int type, size_t payload, int line, bool barrier, char tag)
+{
+    std::vector<char> f(5 + payload, tag);
+    f[0] = (char)type; unsigned int n = (unsigned int)payload; std::memcpy(&f[1], &n, 4);
+    coopsb::Item it; it.type = type; it.channel = coopsb::kChannelReliable; it.cls = coopsb::kClassMust;
+    it.line = line; it.barrier = barrier; it.len = f.size(); it.bytes = f;
+    return it;
+}
+/* T-1279 review fold: a RECORD frame whose id is `id`, `pad` bytes of body after it; a whole frame as one waiting item */
+static std::vector<char> T1279RecordFrame(const char* id, size_t pad)
+{
+    const unsigned int idn = (unsigned int)std::strlen(id);
+    std::vector<char> f(5 + 4 + idn + pad, 'p');
+    f[0] = (char)coopsb::AnswerGate::kTypeRecord;
+    const unsigned int body = (unsigned int)(f.size() - 5); std::memcpy(&f[1], &body, 4);
+    std::memcpy(&f[5], &idn, 4); std::memcpy(&f[9], id, idn);
+    return f;
+}
+static coopsb::Item T1279Item(const std::vector<char>& f)
+{
+    coopsb::Item it; it.type = (unsigned char)f[0]; it.channel = coopsb::kChannelReliable; it.cls = coopsb::kClassMust;
+    it.line = livefirst::kLineRest; it.barrier = false; it.len = f.size(); it.bytes = f;
+    return it;
+}
+/* the CHUNK pieces (whole frames) a frame is cut into, `piece` bytes each */
+static std::vector<std::vector<char> > T1279Pieces(const std::vector<char>& f, size_t piece)
+{
+    std::vector<std::vector<char> > out;
+    for (size_t at = 0; at < f.size(); )
+    {
+        std::vector<char> c;
+        const size_t n = livefirst::ChunkEncodeUpTo(&f[0], f.size(), at, piece, &c);
+        if (n == 0) break;
+        out.push_back(c); at += n;
+    }
+    return out;
+}
+void t_t1279_answer_line()
+{
+    using namespace livefirst;
+    /* the wire numbers this file's decision uses are the world server's */
+    if (kTypeAreaFresh != areafresh::kMsgAreaFresh || kFreshKindCant != (unsigned int)areafresh::kCant || kFreshKindWrite != (unsigned int)areafresh::kWrite)
+        Fail("t1279 answer line: livefirst's AREA_FRESH numbers differ from areafresh.h");
+    /* the line of each kind */
+    if (AreaFreshLine(areafresh::kCant, 0) != kLineAnswer) Fail("t1279 answer line: a CANT with no record of its area waiting is not on the ANSWER line");
+    if (AreaFreshLine(areafresh::kCant, 1) != kLineRest) Fail("t1279 answer line: a CANT passed a waiting record of its own area");
+    if (AreaFreshLine(areafresh::kWrite, 0) != kLineLive || AreaFreshLine(areafresh::kWrite, 1) != kLineLive) Fail("t1279 answer line: a WRITE is not on the LIVE line");
+    if (AreaFreshLine(areafresh::kFresh, 0) != kLineRest || AreaFreshLine(areafresh::kFresh, 1) != kLineRest) Fail("t1279 answer line: a FRESH left the REST line (it would pass its own record)");
+    if (AreaFreshLine(areafresh::kAsk, 0) != kLineRest || AreaFreshLine(99, 0) != kLineRest) Fail("t1279 answer line: an unknown kind left the REST line");
+    if (LineOf(kTypeAreaFresh, "x", 1, kDirDown) != kLineRest) Fail("t1279 answer line: LineOf moved AREA_FRESH (its line is chosen by kind and by what waits: AreaFreshLine)");
+
+    /* the T2290 shape: records and a changed AREAMAP (a barrier) wait; a LIVE message waits behind the barrier; the CANT goes first */
+    {
+        coopsb::Outbox b; b.SetLiveFirst(true); b.SetBudget(16384);
+        for (int i = 0; i < 3; ++i) b.Put(T1279Frame(28, 40000, kLineRest, false, (char)('a' + i)));
+        b.Put(T1279Frame(kTypeAreaMap, 64, kLineRest, true, 'm'));
+        b.Put(T1279Frame(kTypeLive, 30, kLineLive, false, 'l'));
+        const coopsb::Item cant = T1279Frame(kTypeAreaFresh, 20, kLineAnswer, false, 'c');
+        if (!b.Direct(0, 0, cant)) Fail("t1279 answer line: a CANT did not go straight out past records and a barrier");
+        b.Put(cant);
+        coopsb::Item out;
+        if (!b.Take(0, 0, &out) || out.type != kTypeAreaFresh) Fail("t1279 answer line: the waiting CANT was not handed over first");
+        if (!b.Take(0, 0, &out) || out.type == kTypeLive) Fail("t1279 answer line: a LIVE message passed the AREAMAP barrier");
+        const coopsb::Item cant2 = T1279Frame(kTypeAreaFresh, 20, kLineAnswer, false, 'd');
+        b.Put(cant2);
+        if (!b.Take(0, 0, &out) || out.type != kTypeAreaFresh) Fail("t1279 answer line: a CANT waited behind a record cut in pieces");
+    }
+    /* never past a waiting WELCOME */
+    {
+        coopsb::Outbox b; b.SetLiveFirst(true);
+        b.Put(T1279Frame(28, 100, kLineRest, false, 'r'));
+        b.Put(T1279Frame(kTypeWelcome, 50, kLineRest, true, 'w'));
+        const coopsb::Item cant = T1279Frame(kTypeAreaFresh, 20, kLineAnswer, false, 'c');
+        if (b.Direct(0, 0, cant)) Fail("t1279 answer line: a CANT went out while a WELCOME waited");
+        b.Put(cant);
+        coopsb::Item out;
+        if (!b.Take(0, 0, &out) || out.type != 28) Fail("t1279 answer line: the REST line did not drain to the WELCOME first");
+        if (!b.Take(0, 0, &out) || out.type != kTypeWelcome) Fail("t1279 answer line: the WELCOME did not go before the CANT");
+        if (!b.Take(0, 0, &out) || out.type != kTypeAreaFresh) Fail("t1279 answer line: the CANT did not follow the WELCOME");
+    }
+    /* answers keep their own order; a box not in live-first mode keeps every frame in order (REST) */
+    {
+        coopsb::Outbox b; b.SetLiveFirst(true);
+        b.Put(T1279Frame(kTypeAreaFresh, 20, kLineAnswer, false, '1'));
+        if (b.Direct(0, 0, T1279Frame(kTypeAreaFresh, 20, kLineAnswer, false, '2'))) Fail("t1279 answer line: a CANT passed an earlier waiting CANT");
+        b.Put(T1279Frame(kTypeAreaFresh, 20, kLineAnswer, false, '2'));
+        coopsb::Item out;
+        if (!b.Take(0, 0, &out) || out.bytes[5] != '1' || !b.Take(0, 0, &out) || out.bytes[5] != '2') Fail("t1279 answer line: two CANTs left out of order");
+        coopsb::Outbox o;
+        o.Put(T1279Frame(28, 100, kLineRest, false, 'r'));
+        o.Put(T1279Frame(kTypeAreaFresh, 20, kLineAnswer, false, 'c'));
+        if (!o.Take(0, 0, &out) || out.type != 28) Fail("t1279 answer line: a box not in live-first mode let a CANT pass a record");
+    }
+    /* the REST marks (review LOW-1: by put order): a record's mark is met only when its last piece is handed over, or with the link */
+    {
+        coopsb::Outbox b; b.SetLiveFirst(true);
+        if (b.RestPutSeq() != 0 || !b.RestGoneTo(0)) Fail("t1279 answer line: an empty box has a REST mark");
+        b.Put(T1279Frame(28, 40000, kLineRest, false, 'z'));
+        const unsigned long long mark = b.RestPutSeq();
+        if (mark == 0 || b.RestGoneTo(mark)) Fail("t1279 answer line: a waiting record's mark is wrong or already met");
+        coopsb::Item out;
+        if (!b.Take(0, 0, &out) || out.type != kMsgChunk || b.RestGoneTo(mark)) Fail("t1279 answer line: the mark was met with only the first piece handed over");
+        if (!b.Take(0, 0, &out) || !b.RestGoneTo(mark)) Fail("t1279 answer line: the mark was not met when the last piece went");
+        b.Put(T1279Frame(28, 100, kLineRest, false, 'y'));
+        const unsigned long long m2 = b.RestPutSeq();
+        b.Put(T1279Frame(kTypeLive, 30, kLineLive, false, 'l'));
+        if (b.RestPutSeq() != m2) Fail("t1279 answer line: a LIVE frame moved the REST mark");
+        if (!b.Take(0, 0, &out) || out.type != kTypeLive || b.RestGoneTo(m2)) Fail("t1279 answer line: a LIVE frame handed over met a record's mark");
+        b.Clear();
+        if (!b.RestGoneTo(m2)) Fail("t1279 answer line: a record thrown away with the link still counts as waiting");
+    }
+    /* review LOW-1: a latest-value REST frame put AFTER the record and replaced (it leaves from the middle) never meets the record's mark -
+       counted in bytes it did (a 200-byte frame gone "covered" a 100-byte record) */
+    {
+        coopsb::Outbox b; b.SetLiveFirst(true);
+        b.Put(T1279Frame(28, 100, kLineRest, false, 'r'));
+        const unsigned long long mark = b.RestPutSeq();
+        coopsb::Item l1 = T1279Frame(coopsb::kTypeMove, 200, kLineRest, false, '1'); l1.cls = coopsb::kClassLatest; l1.key.a = coopsb::kTypeMove; l1.key.c = 7;
+        coopsb::Item l2 = T1279Frame(coopsb::kTypeMove, 200, kLineRest, false, '2'); l2.cls = coopsb::kClassLatest; l2.key.a = coopsb::kTypeMove; l2.key.c = 7;
+        b.Put(l1);
+        if (!b.Put(l2)) Fail("t1279 LOW-1: the newer value did not replace the waiting one");
+        if (b.RestGoneTo(mark)) Fail("t1279 LOW-1: a replaced frame put after a record met the record's mark (a CANT would overtake it)");
+        coopsb::Item out;
+        if (!b.Take(0, 0, &out) || out.type != 28 || !b.RestGoneTo(mark)) Fail("t1279 LOW-1: the record's mark was not met when it went");
+    }
+    /* THE GATE (sendbound.h AnswerGate; the world server's links and the Steam bridge's links toward joiners) */
+    {
+        using coopsb::AnswerGate;
+        const int k2032 = areafresh::Key(20, 32), k2132 = areafresh::Key(21, 32);
+        /* a whole RECORD: its area read from its id; another record id, a malformed one, another type: no hold */
+        const std::vector<char> rec = T1279RecordFrame("zone.20.32", 100);
+        if (AnswerGate::AreaOfRecordHead(&rec[0], rec.size(), true) != k2032) Fail("t1279 gate: a zone record's area was not read");
+        const std::vector<char> other = T1279RecordFrame("item.5", 100);
+        if (AnswerGate::AreaOfRecordHead(&other[0], other.size(), true) != AnswerGate::kHoldNone) Fail("t1279 gate: a record that is not an area's holds a CANT");
+        if (AnswerGate::AreaOfRecordHead(&rec[0], 12, true) != AnswerGate::kHoldNone || AnswerGate::AreaOfRecordHead(&rec[0], 12, false) != AnswerGate::kHoldAnyArea)
+            Fail("t1279 gate: a head too short for the id - whole: no hold (never taken); a first piece: any area");
+        const std::vector<char> live = T1279Frame(kTypeLive, 30, kLineLive, false, 'l').bytes;
+        if (AnswerGate::AreaOfRecordHead(&live[0], live.size(), true) != AnswerGate::kHoldNone) Fail("t1279 gate: a frame that is not a RECORD holds a CANT");
+        /* the world server's shape: a whole record waits - a CANT of its area is held, another area's is not; met when it goes */
+        {
+            coopsb::Outbox b; b.SetLiveFirst(true); AnswerGate g;
+            const int h = g.HoldOf(&rec[0], rec.size());
+            if (h != k2032) Fail("t1279 gate: HoldOf a whole record");
+            b.Put(T1279Item(rec)); g.Waits(h, b);
+            if (!g.Holds(k2032, b) || g.Holds(k2132, b)) Fail("t1279 gate: a waiting record does not hold its own area's CANT alone");
+            coopsb::Item out;
+            if (!b.Take(0, 0, &out) || out.type != 28 || g.Holds(k2032, b) || g.Marks() != 0) Fail("t1279 gate: the record went and still holds its area's CANT");
+            g.Waits(g.HoldOf(&rec[0], rec.size()), b);   /* marked (the last REST put) while nothing waits: met at once */
+            if (g.Holds(k2032, b)) Fail("t1279 gate: a mark with nothing waiting held a CANT");
+        }
+        /* the bridge's shape: a record handed on in pieces - each piece put on this link's REST; the CANT of its area waits until the last piece goes */
+        {
+            coopsb::Outbox b; b.SetLiveFirst(true); AnswerGate g;
+            const std::vector<std::vector<char> > pc = T1279Pieces(T1279RecordFrame("zone.20.32", 70000), kChunkBytes);
+            if (pc.size() != 3) Fail("t1279 gate: test pieces");
+            for (size_t i = 0; i < pc.size(); ++i)
+            {
+                const int h = g.HoldOf(&pc[i][0], pc[i].size());
+                if (h != k2032) Fail("t1279 gate: a piece of an area's record is not held as that area");
+                b.Put(T1279Item(pc[i])); g.Waits(h, b);
+            }
+            if (!g.Holds(k2032, b) || g.Holds(k2132, b)) Fail("t1279 gate: pieces waiting do not hold their area's CANT alone");
+            coopsb::Item out;
+            if (!b.Take(0, 0, &out) || !b.Take(0, 0, &out) || !g.Holds(k2032, b)) Fail("t1279 gate: the CANT was let go before the record's last piece");
+            if (!b.Take(0, 0, &out) || g.Holds(k2032, b)) Fail("t1279 gate: the record's last piece went and its CANT is still held");
+            /* a piece whose first piece was not seen here: any area (the safe side) */
+            const int h = g.HoldOf(&pc[1][0], pc[1].size());
+            if (h != AnswerGate::kHoldAnyArea) Fail("t1279 gate: a piece with no first piece seen is not held as any area");
+            b.Put(T1279Item(pc[1])); g.Waits(h, b);
+            if (!g.Holds(k2132, b)) Fail("t1279 gate: an unplaced piece did not hold every area's CANT");
+            b.Clear();
+            if (g.Holds(k2132, b)) Fail("t1279 gate: a piece thrown away with the link still holds a CANT");
+        }
+        /* the first piece went straight out, the rest wait: the later pieces carry the mark */
+        {
+            coopsb::Outbox b; b.SetLiveFirst(true); AnswerGate g;
+            const std::vector<std::vector<char> > pc = T1279Pieces(T1279RecordFrame("zone.20.32", 70000), kChunkBytes);
+            g.HoldOf(&pc[0][0], pc[0].size());   /* Direct: not put */
+            for (size_t i = 1; i < pc.size(); ++i) { const int h = g.HoldOf(&pc[i][0], pc[i].size()); b.Put(T1279Item(pc[i])); g.Waits(h, b); }
+            if (!g.Holds(k2032, b)) Fail("t1279 gate: the waiting rest of a record whose first piece went straight out did not hold its CANT");
+        }
+        /* a first piece too short to hold the record's id: any area; a WELCOME's pieces: every CANT waits behind them */
+        {
+            coopsb::Outbox b; b.SetLiveFirst(true); AnswerGate g;
+            const std::vector<char> big = T1279RecordFrame("zone.20.32", 70000);
+            std::vector<char> c;
+            livefirst::ChunkEncodeUpTo(&big[0], big.size(), 0, 6, &c);
+            if (g.HoldOf(&c[0], c.size()) != AnswerGate::kHoldAnyArea) Fail("t1279 gate: a first piece too short for the id is not held as any area");
+            g.Reset();
+            std::vector<char> w(5 + 50000, 'w'); w[0] = (char)kTypeWelcome; const unsigned int wn = 50000; std::memcpy(&w[1], &wn, 4);
+            const std::vector<std::vector<char> > wp = T1279Pieces(w, kChunkBytes);
+            for (size_t i = 0; i < wp.size(); ++i)
+            {
+                const int h = g.HoldOf(&wp[i][0], wp[i].size());
+                if (h != AnswerGate::kHoldWelcome) Fail("t1279 gate: a WELCOME's piece is not held as a WELCOME");
+                b.Put(T1279Item(wp[i])); g.Waits(h, b);
+            }
+            if (b.RestWaitingOf(kTypeWelcome) != 0) Fail("t1279 gate: the Outbox counts a WELCOME's pieces (the gate's WELCOME hold would be needless)");
+            if (!g.Holds(k2132, b)) Fail("t1279 gate: a CANT may pass a WELCOME handed on in pieces");
+            coopsb::Item out;
+            while (b.Take(0, 0, &out)) {}
+            if (g.Holds(k2132, b)) Fail("t1279 gate: the WELCOME went and the CANT is still held");
+        }
+    }
+    /* THE ORDERING CASES (store.cpp AreaFreshArrive / ApplyRemoteRecord; areafresh.h; zonerec.h) */
+    {
+        using namespace areafresh;
+        /* 'current': the server's record is not newer than the asker's stamp -> CANT current, which ends the wait (the copy here loads) */
+        if (ServerRecordAnswer(1, 100, 100) != kRecCurrent || ServerRecordAnswer(1, 99, 100) != kRecCurrent || ServerRecordAnswer(0, 0, 0) != kRecCurrent) Fail("t1279 ordering: CANT current rule");
+        if (CantDecide(kWhyCurrent, 1, 0) != kCantEnd || WaitEndDecide(-1, 1, 100, 1, 0, -1, -1, -1, 1) != kEndCant) Fail("t1279 ordering: CANT current does not end the wait");
+        /* an older record of that area arriving after the CANT: refused by its stamp (ZoneRecvJudge) - not newer, not the holder's */
+        if (zonerec::ZoneRecvJudge(1, 100, 1, 90, 0, -1, 1) != zonerec::kZvRefuseNotNewer || zonerec::ZoneRecvJudge(1, 100, 1, 100, 0, 2, 1) != zonerec::kZvRefuseNotNewer)
+            Fail("t1279 ordering: an older record arriving after CANT current was not refused");
+        /* ... except the area holder's copy over another writer's - taken although older: the reason a CANT never passes a waiting record of its area */
+        if (zonerec::ZoneRecvJudge(1, 100, 1, 90, 0, 0, 2) != zonerec::kZvTakeHolder) Fail("t1279 ordering: the holder's older copy is not taken (the mark guards a case that no longer exists)");
+        /* 'got': the record, then FRESH(its stamp), both on REST in that order. A FRESH whose record is not in the swap keeps the wait;
+           the record in (swap >= stamp) ends it; a still older record arriving after is refused by its stamp */
+        if (ServerRecordAnswer(1, 101, 100) != kRecSend) Fail("t1279 ordering: a newer record is not sent");
+        if (WaitEndDecide(101, 1, 100, 0, 0, -1, -1, -1, 1) != kKeepWaiting || WaitEndDecide(101, 0, 0, 0, 0, -1, -1, -1, 1) != kKeepWaiting) Fail("t1279 ordering: a FRESH ended the wait before its record");
+        if (WaitEndDecide(101, 1, 101, 0, 0, -1, -1, -1, 1) != kEndFresh || WaitEndDecide(101, 1, 102, 0, 0, -1, -1, -1, 1) != kEndFresh) Fail("t1279 ordering: the record in did not end the wait");
+        if (zonerec::ZoneRecvJudge(1, 101, 0, 100, 0, 0, 1) != zonerec::kZvRefuseNotNewer) Fail("t1279 ordering: an older record overwrote the newest");
+        /* 'cant' (no record, or a why that is not current / fault): no record involved - turned into a record wait and asked again */
+        if (CantDecide(kWhyNotLoaded, 1, 0) != kCantRecordAskNow || CantDecide(kWhyNotLoaded, 1, 1) != kCantRecordReask) Fail("t1279 ordering: a CANT that is not current did not turn into a record wait");
+    }
+    /* wiring: the world server and the Steam bridge send each kind on its line and mark the RECORDs (and pieces) they queue */
+    const std::string server = T313ReadFile("../coop-store/store_main.cpp");
+    if (server.empty()) { Fail("t1279 answer line: could not read store_main.cpp"); return; }
+    if (server.find("const int line = livefirst::AreaAnswerLine(kind, onRest, onBulk);") == std::string::npos || server.find("sent = SbSend(to, buf, true, kChReliable, line);") == std::string::npos)
+        Fail("t1279 answer line: AfSend does not send each kind on its line");
+    if (server.find("SbZoneRecordLines(to, areafresh::Key(x, y), &onRest, &onBulk);") == std::string::npos || server.find("const int hold = s.answerGate.HoldOf(&buf[0], buf.size());") == std::string::npos
+        || server.find("if (ch == kChReliable) s.answerGate.Waits(hold, s.box);") == std::string::npos || server.find("return s.answerGate.Holds(key, s.box);") == std::string::npos)
+        Fail("t1279 answer line: a CANT is not kept behind a waiting record of its area");
+    const std::string bridge = T313ReadFile("../coop-plugin/net/steam_transport.cpp");
+    if (bridge.empty()) { Fail("t1279 answer line: could not read steam_transport.cpp"); return; }
+    if (bridge.find("lfHold = lfGate_.HoldOf(&(*frame)[0], frame->size());") == std::string::npos
+        || bridge.find("lfGate_.Holds(areafresh::Key(am.x, am.y), box_)) ? 1 : 0;") == std::string::npos
+        || bridge.find("it.line = livefirst::AreaFreshLine(am.kind, waiting);") == std::string::npos
+        || bridge.find("if (reliable) lfGate_.Waits(lfHold, box_);") == std::string::npos)
+        Fail("t1279 answer line: the Steam bridge does not send the area answers on their lines behind its own waiting records");
+    {
+        const size_t f0 = bridge.find("bool LfSend("), hp = bridge.find("lfHold = lfGate_.HoldOf");
+        const size_t sw = f0 == std::string::npos ? std::string::npos : bridge.find("it.bytes.swap(*frame);", f0);
+        if (hp == std::string::npos || sw == std::string::npos || hp < f0 || hp > sw) Fail("t1279 answer line: the bridge reads the frame after handing its bytes to the item");
+    }
 }
 /* T-346 fold 1 (review 2026-09-30, MED 1): a FETCH answer stops at ~1 MB and says how many keys it covered; the game settles only
    those and asks again (resume) for the rest - every key is eventually answered, and the world server writes out once a batch */
@@ -1982,7 +2298,7 @@ void t_a1b2f2_fold2()   /* fold 2 of A1 build 2 (re-check 2026-10-02) [a1b2f2-t0
     {
         if (AdoptAfterRewake(0, h) != kSettleAccept) Fail("G1: not re-woken here - an adoption refused");
         /* the same read as the sweep: REVOKE exactly when the sweep adopts the re-woken body here (coopor::AnnounceArea adoptable) */
-        if ((AdoptAfterRewake(1, h) == kSettleRevoke) != (coopor::AnnounceArea(h) == coopor::kAnnounceAdoptable))
+        if ((AdoptAfterRewake(1, h) == kSettleRevoke) != (coopor::AnnounceArea(h, h == 0 ? 1 : h) == coopor::kAnnounceAdoptable))   /* T-1268: h 0 reaches here only when the map names this game (handoff.cpp RewakeAreaHeldByOther maps 'nobody yet' to -1) */
             Fail("G1: the decision disagrees with the sweep's area rule - both copies deleted, or both kept by design");
     }
     if (RevokeAction(1, 9, 11, 0, 1) != kRvRemove) Fail("G1: the REVOKE sent when this game holds the area must remove the adopter's copy");

@@ -286,7 +286,7 @@ inline int PutBackGuard(int inGuard, int trackedCopy, int standIn, int gate)
 /* T-164 part 2 fold (M2): the engine's answer to a drop the destination cannot afford one unit of (decomp_714990 :472-476): the
    source window record's side flag + 3 - 3 "You can't afford that." (a buy), 4 "The shopkeeper can't afford that." (a sale). */
 inline int DragShortResult(int srcSide) { return (srcSide != 0) ? kTrKeeperBroke : kTrCantAfford; }
-/* T-164 part 2 fold 2 (HIGH): 0x7118C0 - the cursor item released over a world object (a character or container under the mouse that
+/* T-164 part 2 fold 2 (HIGH): 0x7118C0 - the cursor item released over a character (a squad portrait under the mouse - 0x712AD0 finds no other target, T-1263 2026-11-06 - that
    is not the window's owner, 0x712AD0's first branch) goes straight into that object's inventory (decomp_7118c0: target +0x160 ->
    slot +0x18) and 0x712AD0 then only clears the cursor (0x70CE50): no put-back, no guard. The tracked shop copy, or an item whose
    source window shows a stand-in of a shop not held here (the pick-up's rule), is never given: the original does not run and 0 is

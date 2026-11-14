@@ -632,6 +632,8 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
             continue;
         }
         ++created;
+        /* T-1119 (F-T2356-COLOURDROP): the maker ignores the record's "color sid" - the holder's colour goes on as the engine's loader puts it */
+        if (haveDetail) coop::ItemColourApplyTo((void*)item, set.details[i].colorSid);
 
         /* quality1: the owner's quality, charges, stack size, item function and unique flag, written onto the fresh item
            before it enters the inventory (the fields ItCreateItem writes for a live move with setFields=1). The add below is

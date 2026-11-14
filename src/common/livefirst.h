@@ -42,7 +42,7 @@
 
 namespace livefirst {
 
-const unsigned int kProtocol = 145;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
+const unsigned int kProtocol = 153;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
 
 
 const unsigned int kMsgChunk = 88;      /* CHUNK - one piece of a frame too big to go whole; either way, world-server link only */
@@ -60,6 +60,8 @@ const double kRaiseMax = 2.0;           /* T-1168: a window with no record piece
 
 enum { kDirUp = 0, kDirDown = 1 };      /* = coopsb::kDirUp / kDirDown: a game's frames to the world server / the world server's to a game */
 enum { kLineRest = 0, kLineLive = 1, kLineAnnounce = 2, kLineBulk = 3 };
+enum { kLineAnswer = 4 };   /* T-1279 (T2290): the ANSWER line - an AREA_FRESH CANT toward a game (AreaFreshLine, sendbound.h Outbox) */
+enum { kLineAnswerBulk = 5 };   /* T-1320 B: the ANSWER-BULK line - an area answer's RECORD and its FRESH toward a game (AreaAnswerLine; sendbound.h Outbox) */
 
 /* T-1118 (c) (owner decision 1231 c) - BULK ON THE LIVE LINE, DECIDED FROM THE BYTES. The LIVE line has no byte limit, so a burst of
    one kind of live message (T1716: a game's town price tables, 130 frames of about 1.85 KB, 264 KB in front of faction-relation
@@ -129,6 +131,47 @@ inline int LineOf(unsigned int type, const char* p, size_t n, int dir)
     else if (dir == kDirDown) { if (n < kLiveDownHeader) return kLineRest; inner = (unsigned char)p[2]; }
     else return kLineRest;
     return LineOfInner(inner);
+}
+/* T-1279 (T2290) - THE WORLD SERVER'S AREA ANSWERS DO NOT WAIT BEHIND THE RECORD STREAM. Every AREA_FRESH went on the REST line,
+   in order behind every RECORD forwarded to that game; on a link slower than the record inflow (T2290: 21 MB, 5425 messages
+   waiting for one game) a game's answers came minutes late or never, and its held area stayed unloaded. Toward a game, by kind:
+     - CANT (any why): the ANSWER line - before every other line (LIVE, ANNOUNCE, BULK, REST) and past an AREAMAP or PLAYER_GONE
+       barrier (the game's CANT handling reads neither its area map nor its player list: store.cpp AreaFreshArrive -> CantDecide),
+       never past a waiting WELCOME (sendbound.h). UNLESS a RECORD of that same area still waits on that game's link
+       (zoneRecordWaiting): then the REST line, in order behind it, as before - a CANT current or fault ends the wait and the copy
+       here loads, so it must not overtake a record of the area the game would otherwise have judged first (zonerec.h
+       ZoneRecvJudge takes a holder's copy even when it is not newer).
+     - WRITE (to the holder): the LIVE line - ahead of the records, but held by a waiting barrier like any live message: the
+       holder's gate reads its area map (areafresh.h HolderGate), so it must not pass a changed AREAMAP.
+     - FRESH: the REST line, behind the record it names. The wait it is for ends only when that record is in the game's swap
+       (areafresh.h WaitEndDecide kEndFresh), so going first would end no wait sooner - and every 10 s re-ask told another FRESH
+       before the bytes came would count as an unmet FRESH (FreshUnmetNote's error line after 3).
+   The world server's own constants (= areafresh::kMsgAreaFresh / kWrite / kCant; store_main.cpp and the offline suite check). */
+const unsigned int kTypeAreaFresh = 89;
+const unsigned int kFreshKindWrite = 2, kFreshKindCant = 3;
+inline int AreaFreshLine(unsigned int kind, int zoneRecordWaiting)
+{
+    if (kind == kFreshKindCant) return zoneRecordWaiting != 0 ? (int)kLineRest : (int)kLineAnswer;
+    if (kind == kFreshKindWrite) return kLineLive;
+    return kLineRest;
+}
+/* T-1320 B - THE WORLD SERVER'S OWN LINES FOR AN AREA ANSWER (store_main.cpp AfSend; the Steam bridge keeps AreaFreshLine). The answer's
+   RECORD goes on the ANSWER-BULK line (kLineAnswerBulk: after LIVE and ANNOUNCE, ahead of BULK and REST, cut in pieces under the
+   budget like REST - sendbound.h Outbox), and toward a game, by kind:
+     - FRESH (kFreshKindFresh): the REST line while a RECORD of its area waits on REST (behind it, as before); otherwise the ANSWER-BULK
+       line - behind its own record when that waits there (frames of one area keep their order there; T-1320 (b): the line itself is taken
+       out of put order, sendbound.h AnsBulkPick), else ahead of the record stream.
+     - CANT: the REST line while a RECORD of its area waits on REST (as AreaFreshLine); the ANSWER-BULK line, behind it, while one waits
+       there; otherwise the ANSWER line.
+     - WRITE: the LIVE line, as AreaFreshLine.
+   onRest / onAnswerBulk: a RECORD of the answer's area waits on that line of the game's link (sendbound.h AnswerGate). */
+const unsigned int kFreshKindFresh = 4;   /* = areafresh::kFresh (store_main.cpp checks) */
+inline int AreaAnswerLine(unsigned int kind, int onRest, int onAnswerBulk)
+{
+    if (kind == kFreshKindWrite) return kLineLive;
+    if (kind == kFreshKindCant) return onRest != 0 ? (int)kLineRest : (onAnswerBulk != 0 ? (int)kLineAnswerBulk : (int)kLineAnswer);
+    if (kind == kFreshKindFresh) return onRest != 0 ? (int)kLineRest : (int)kLineAnswerBulk;
+    return kLineRest;
 }
 /* T-1118 (c): the kind a frame's bytes are measured under on the LIVE line (sendbound.h Outbox, with its sender Item.origin):
    0x100 | the inner type for a well-formed LIVE envelope, 0 for every other frame (never measured: an unchanged AREAMAP or
@@ -512,56 +555,82 @@ private:
 };
 
 /* THE AREAMAP REPEAT. The world server sends every game its AREAMAP (35) every second and PLAYERSECTORS (37) right after it. The
-   game judges zone records against the holders in its latest map, so a map whose CONTENT changed is a barrier on the REST line (it
-   may not overtake zone files put before it). A map whose bytes equal the last one put on the link changes nothing at the game but
+   game judges zone records against the holders in its latest map, so a map whose CONTENT changed is a barrier (live frames put after
+   it never pass it). A map whose bytes equal the last one put on the link changes nothing at the game but
    the map's 5-second clock (every holder answer reads -1 once the last map is over 5 s old) - yet as a barrier it would hold every
-   later live message behind the whole of a big download, about a second into it. So, per link (Reset at a new connection):
-     - an AREAMAP whose bytes differ from the last one put here (or the first one): REST, a barrier - kMapChanged;
-     - the same bytes, no AREAMAP waiting on this link's REST line (whole or partly cut), and it goes whole (not over kChunkBytes):
-       the LIVE line, not a barrier - kMapRepeatLive (the game already holds this exact map, or is handed it ahead of this one);
-     - the same bytes otherwise: REST, not a barrier - kMapRepeatRest (it keeps its place behind the waiting map, which keeps its
-       own barrier);
-     - a PLAYERSECTORS goes LIVE only when the last AREAMAP put here since the previous PLAYERSECTORS went LIVE, its bytes equal the
-       last PLAYERSECTORS put here, none waits on the REST line and it goes whole; otherwise REST as before - so it never arrives
-       ahead of its own map, nor ahead of an earlier different PLAYERSECTORS.
+   later live message behind the whole of a big download, about a second into it. MAPS AND SECTORS ARE LATEST-VALUE: the game applies
+   each map whole (store.cpp ~22985), so a newer map makes every earlier one not yet started redundant. So, per link (Reset at a new
+   connection; Forget after a refused send), the line (MapLine):
+     - the FIRST map since the last Reset or Forget: REST, a barrier - kMapChanged (the game ends its welcome push at the first frame
+       type not on its list, and AREAMAP is not on it: store.cpp ~22678);
+     - any later map while the link's first map still waits on the REST line, while an AREAMAP or a PLAYERSECTORS there is partly sent,
+       or when it is over one piece (the LIVE line never cuts): REST - kMapChanged (a barrier) when its bytes differ from the last map
+       put here, else kMapRepeatRest (no barrier);
+     - otherwise the LIVE line, in put order - kMapChangedLive (a barrier: every live frame put after it stays behind it) when its
+       bytes differ, else kMapRepeatLive. T-1320 fix 3 fold 1 (H1): such a map REMOVES every AREAMAP and PLAYERSECTORS still waiting on
+       the REST line not started, except one put before a waiting WELCOME or PLAYER_GONE (sendbound.h Outbox::Put) - so a waiting map
+       never makes a later one wait behind the REST line; a removed changed map's area set and put order pass to the new map (it holds
+       what that one held, and takes its place in put order);
+     - a PLAYERSECTORS goes LIVE right after any map that went LIVE, changed or not, when none waits on the REST line and it goes
+       whole; otherwise REST - so it never arrives ahead of its own map, nor ahead of an earlier PLAYERSECTORS still on REST.
+   On the world server a changed map carries the areas whose holder it changes against LastMap (sendbound.h MapHolderChange) and holds
+   only those areas' answer RECORDs on the ANSWER-BULK line; after a Forget the last map the game holds is not known (PrevUnknown):
+   the next map holds every area.
    A link that hands frames on (the host's Steam bridge) sees a big map only as CHUNK pieces: the first piece of an AREAMAP or a
-   PLAYERSECTORS forgets everything remembered here, so the next whole one counts as changed (the safe side). Frames are whole frames,
-   header included. */
-enum { kMapChanged = 0, kMapRepeatLive = 1, kMapRepeatRest = 2 };
+   PLAYERSECTORS forgets everything remembered here (Reset), so the next whole one is a first map (REST, behind those pieces - the
+   safe side). Frames are whole frames, header included. */
+enum { kMapChanged = 0, kMapRepeatLive = 1, kMapRepeatRest = 2, kMapChangedLive = 3 };
+/* T-1320 fix 3 fold 1: an AREAMAP's line decision (MapRepeat::Map). changed = its bytes differ from the last map put on the link; first
+   = no map was put on it since the last Reset / Forget; firstWaiting = the link's first map still waits on its REST line (whole or
+   partly cut); partly = an AREAMAP or a PLAYERSECTORS on that line is partly sent; cuts = it is over one piece (CutsInto). */
+inline int MapLine(bool changed, bool first, bool firstWaiting, bool partly, bool cuts)
+{
+    if (first) return kMapChanged;
+    if (firstWaiting || partly || cuts) return changed ? kMapChanged : kMapRepeatRest;
+    return changed ? kMapChangedLive : kMapRepeatLive;
+}
 class MapRepeat
 {
 public:
-    MapRepeat() : m_haveMap(false), m_haveSectors(false), m_mapLive(false) {}
-    void Reset() { m_map.clear(); m_sectors.clear(); m_haveMap = false; m_haveSectors = false; m_mapLive = false; }
-    /* An AREAMAP put on this link; mapWaiting = an AREAMAP (whole or partly cut) still waits on this link's REST line. */
-    int Map(const char* frame, size_t n, bool mapWaiting)
+    MapRepeat() : m_haveMap(false), m_haveSectors(false), m_mapLive(false), m_everMap(false), m_prevUnknown(false), m_lastFirst(false) {}
+    void Reset() { m_map.clear(); m_sectors.clear(); m_haveMap = false; m_haveSectors = false; m_mapLive = false; m_everMap = false; m_prevUnknown = false; m_lastFirst = false; }
+    /* T-1320 fix 3 fold 1 (LOW a): a frame on this link was refused - the game holds SOME earlier map, not known which (the refused frame
+       may have been the last map put here): forget as Reset does (the next map is a first map, on REST) and mark the last map unknown, so
+       the world server's next changed map holds every area (PrevUnknown) instead of comparing against an empty map. */
+    void Forget() { Reset(); m_prevUnknown = true; }
+    /* T-1320 (b): the last AREAMAP put on this link (whole frame), 0 = none since the last Reset - read before Classify replaces it */
+    const std::vector<char>* LastMap() const { return m_haveMap ? &m_map : 0; }
+    /* T-1320 fix 3 fold 1: no map was put since a Forget - the game's last map is not known (read before Classify) */
+    bool PrevUnknown() const { return m_prevUnknown; }
+    /* T-1320 fix 3 fold 1: the last AREAMAP classified was the link's first since the last Reset / Forget (sendbound.h Item.mapFirst) */
+    bool LastFirst() const { return m_lastFirst; }
+    /* An AREAMAP put on this link; firstWaiting / partly as MapLine. */
+    int Map(const char* frame, size_t n, bool firstWaiting, bool partly)
     {
         if (frame == 0 || n == 0) { Reset(); return kMapChanged; }
-        if (!Same(m_haveMap, m_map, frame, n))
-        {
-            m_map.assign(frame, frame + n); m_haveMap = true; m_mapLive = false;
-            return kMapChanged;
-        }
-        m_mapLive = !mapWaiting && !CutsInto(n);
-        return m_mapLive ? kMapRepeatLive : kMapRepeatRest;
+        const bool changed = !Same(m_haveMap, m_map, frame, n), first = !m_everMap;
+        const int v = MapLine(changed, first, firstWaiting, partly, CutsInto(n));
+        if (changed) { m_map.assign(frame, frame + n); m_haveMap = true; }
+        m_everMap = true; m_prevUnknown = false; m_lastFirst = first;
+        m_mapLive = v == kMapRepeatLive || v == kMapChangedLive;
+        return v;
     }
-    /* A PLAYERSECTORS put on this link: true = the LIVE line. Its bytes are remembered either way. */
+    /* A PLAYERSECTORS put on this link: true = the LIVE line - right after a map that went LIVE (changed or not; T-1320 fix 3 fold 1: the
+       changed-map test is gone), when none waits on the REST line and it goes whole (it stays right behind its own map: store_main.cpp
+       puts the map just before it). Its bytes are remembered either way. */
     bool SectorsLive(const char* frame, size_t n, bool sectorsWaiting)
     {
         const bool mapLive = m_mapLive;
         m_mapLive = false;
         if (frame == 0 || n == 0) { m_sectors.clear(); m_haveSectors = false; return false; }
-        if (!Same(m_haveSectors, m_sectors, frame, n))
-        {
-            m_sectors.assign(frame, frame + n); m_haveSectors = true;
-            return false;
-        }
+        if (!Same(m_haveSectors, m_sectors, frame, n)) { m_sectors.assign(frame, frame + n); m_haveSectors = true; }
         return mapLive && !sectorsWaiting && !CutsInto(n);
     }
     /* One guaranteed frame toward a game, whole (header included). An AREAMAP or a PLAYERSECTORS: *line and *barrier set as above,
-       true. A CHUNK (a link handing pieces on): the first piece of an AREAMAP or a PLAYERSECTORS forgets what is remembered; false,
-       *line and *barrier untouched. Any other frame: false, untouched. */
-    bool Classify(unsigned int type, const char* frame, size_t n, bool mapWaiting, bool sectorsWaiting, int* line, bool* barrier)
+       true (firstWaiting / partly: MapLine; sectorsWaiting: a PLAYERSECTORS waits on the REST line, whole or partly cut). A CHUNK (a link
+       handing pieces on): the first piece of an AREAMAP or a PLAYERSECTORS forgets what is remembered; false, *line and *barrier
+       untouched. Any other frame: false, untouched. */
+    bool Classify(unsigned int type, const char* frame, size_t n, bool firstWaiting, bool partly, bool sectorsWaiting, int* line, bool* barrier)
     {
         if (type == kMsgChunk)
         {
@@ -576,9 +645,9 @@ public:
         }
         if (type == kTypeAreaMap)
         {
-            const int v = Map(frame, n, mapWaiting);
-            *line = v == kMapRepeatLive ? kLineLive : kLineRest;
-            *barrier = v == kMapChanged;
+            const int v = Map(frame, n, firstWaiting, partly);
+            *line = (v == kMapRepeatLive || v == kMapChangedLive) ? kLineLive : kLineRest;
+            *barrier = v == kMapChanged || v == kMapChangedLive;
             return true;
         }
         if (type == kTypePlayerSectors)
@@ -596,7 +665,10 @@ private:
     }
     std::vector<char> m_map, m_sectors;
     bool m_haveMap, m_haveSectors;
-    bool m_mapLive;   /* the last AREAMAP put here since the last PLAYERSECTORS went LIVE */
+    bool m_mapLive;       /* the last AREAMAP put here since the last PLAYERSECTORS went LIVE */
+    bool m_everMap;       /* T-1320 fix 3 fold 1: a map was put here since the last Reset / Forget (the next one is not the first) */
+    bool m_prevUnknown;   /* T-1320 fix 3 fold 1: Forget ran and no map was put since (PrevUnknown) */
+    bool m_lastFirst;     /* T-1320 fix 3 fold 1: LastFirst */
 };
 
 /* What a link's waiting line did (sendbound.h Outbox fills it in live-first mode; DrainStats hands it over): chunks = CHUNK messages

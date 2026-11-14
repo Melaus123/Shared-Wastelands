@@ -81,6 +81,9 @@ void DoorsRecMapEvent(const std::set<int>* newly);
 // a laid door of a building no player owns (a player's piece's door is skipped there); before the door's lay the flip is engine work
 // (a repair step at load) and is taken into the door's facts, never held.
 void DoorsRecNoteBrokenChanged(void* door);
+// ANY THREAD (build.cpp's door hit and repair step), T-1333 fold 3: the door's health moved with no broken flip (a hit, a repair gain) -
+// DoorsTick writes the record of a laid town door the same way (DoorsRecNoteBrokenChanged's road; doorrec kDrChHealth).
+void DoorsRecNoteHealthChanged(void* door);
 // ANY THREAD: a stored fact was written straight into the door (its lock level) - DoorsTick measures it as a change of its own and
 // writes the door's record (or holds the change until the lay). 1 = noted; 0 = the door has no row here, nothing noted.
 int DoorsRecNoteChanged(void* door);
@@ -95,6 +98,20 @@ void DoorRecordEcho(const std::string& id, int hasStamp, long long stamp);
 // made a ruin their removals are queued and sent by the holder of their area once its record list is complete here.
 void DoorsRecRuinBefore(void* building);
 void DoorsRecRuinAfter(void* building, int ruined);
+// T-1082: build.cpp's dismantle step (detour_dismantle, ANY THREAD). Before a real step on a piece not yet dismantled, the door keys of
+// its doors are read while they live - the doors its door array lists (guarded reads and the door key only), and on the main thread
+// also every door row whose recorded owner it is (a gate's row names its gateway building). After a step that took the piece away (its
+// isDismantled 0 -> 1, doorrec::DoorRecDismantleRemoves) their door records' removals are queued and sent by the holder of each key's
+// area, as a ruin's are - on the main thread at once, off it by the next DoorsTick - so a piece built again on the same spot starts
+// from its own door (bug class 483).
+const int kDoorsPieceKeysMax = 16, kDoorsPieceKeyCap = 64;
+struct DoorsPieceKeys { int n; char key[kDoorsPieceKeysMax][kDoorsPieceKeyCap]; };
+int DoorsRecPieceKeysRead(void* building, DoorsPieceKeys* out, int onMain);   /* the number of keys read */
+void DoorsRecPieceDismantled(const DoorsPieceKeys* keys, int before, int after, int onMain);
+// T-1082 review MED 2: build.cpp's REMOVE of a copy already gone (no dismantle step ran here): the gate door record its piece key names
+// (the piece key + "gate") is queued for removal as a dismantle's is, sent by the holder of its area. A house door's key cannot be formed
+// from the piece key and is left. ANY THREAD (off the main thread it is handed to the next DoorsTick).
+void DoorsRecPieceGoneByKey(const char* pieceKey, int onMain);
 // ANY THREAD, inside the engine's own zone teardown: items.cpp's ZoneMapContent::deactivate detour
 // fans out to this (one hook, two subscribers).  It makes two interlocked integer writes and nothing
 // else - no walk, no log, no allocation - and the next main-thread DoorsTick drops every registry row
@@ -108,6 +125,11 @@ void DoorsForgetOwner(void* building);
 // MAIN THREAD, TEST-ONLY (T-160): `doortest open|close|lock|npclock|show <nearest|last|key>` / `doortest show held` - see doors.cpp.
 std::string DoorTestCommand(const std::string& arg);
 unsigned long long DoorsOpenDoorRva();   /* P18 fold 1: DoorStuff::openDoor (1.0.65 0x297000), 0 = no address row */
+// MAIN THREAD, TEST-ONLY (T-1199 fold 2, items.cpp `dooruse`): the door `nearest` / `last` / a door key names, as doortest finds it;
+// remembered as doortest's `last`. 0 = none (*err says why).
+void* DoorsLeverDoor(const std::string& target, std::string* key, double* dist, std::string* err);
+// T-1199 fold 2: the Owner only door counters (openAct[mine,other], ownOnlyOpenRefused, ownOnlyMaxPerDoor). ANY THREAD.
+void DoorsOwnOnlyCounts(long long* actMine, long long* actOther, long long* refused, long long* maxPerDoor);
 // MAIN THREAD, from OnDoorState: the message's trailing origin byte was neither 0 nor 1, so the
 // message was IGNORED rather than taken as the area holder's word (P8n-b, review-p8n L-8).
 void NoteDoorOriginUnknown();

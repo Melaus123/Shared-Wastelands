@@ -41,7 +41,7 @@
 
 namespace shoprec {
 
-const unsigned int kProtocol = 145;            /* the world-server protocol that carries shop records */
+const unsigned int kProtocol = 153;            /* the world-server protocol that carries shop records */
 
 
 
@@ -862,6 +862,46 @@ inline int ShopFlightFor(const std::vector<ShopFlight>& f, long long stamp)
 inline int ShopUnreadVerdict(int leaderRead, int haveHome)
 {
     return (leaderRead != 0 && haveHome == 0) ? 0 : 2;
+}
+/* T-1292 (owner 1604 a): THE SILENT-SKIP AND SILENCE LINES - release-build log lines naming why a shop this game holds, whose
+   refill is due, got no restock call. A shop counts when the area map names this game for its area (areaMine 1; the gate's exact
+   holder test can still refuse it, which is then a reason), its record is kept here, the clock read and the record's deadline has
+   passed. */
+inline int ShopSilentHeldDue(int areaMine, int haveRecord, int haveClock, double deadline, double now)
+{
+    return (areaMine == 1 && haveRecord != 0 && haveClock != 0 && deadline <= now) ? 1 : 0;
+}
+const long long kSilentSkipEvery = 100, kSilentSkipLineCap = 40, kSilenceLineCap = 20, kSilencePerShopCap = 2;
+/* 1 = write a skip line: the shop and reason's 1st skip (nth counts from 1) and every 100th after, while the launch has written
+   fewer than 40 */
+inline int ShopSilentSkipLine(long long nth, long long linesSoFar)
+{
+    if (nth < 1 || linesSoFar >= kSilentSkipLineCap) return 0;
+    return (nth == 1 || (nth % kSilentSkipEvery) == 0) ? 1 : 0;
+}
+/* how long the shop has gone without a gate entry: the ms since the watch began (the shop became held, due and loaded), or since
+   a road's last gate entry if that is later (an age below 0 = that road has not entered the gate for this shop this world) */
+inline long long ShopSilentMs(long long sinceWatchMs, long long reaskAgeMs, long long engineAgeMs)
+{
+    long long s = sinceWatchMs;
+    if (reaskAgeMs >= 0 && reaskAgeMs < s) s = reaskAgeMs;
+    if (engineAgeMs >= 0 && engineAgeMs < s) s = engineAgeMs;
+    return s;
+}
+const long long kSilenceFirstMs = 60000, kSilenceAgainMs = 300000;
+/* the silence lines of one episode: 0 none yet, 1 the over-60-s line, 2 the over-300-s line too. 60 s or less of silence ends the
+   episode (0). The caller writes a line when the answer is above `said`. */
+inline int ShopSilenceSaid(long long silentMs, int said)
+{
+    if (silentMs <= kSilenceFirstMs) return 0;
+    if (said <= 0) return 1;
+    if (said == 1 && silentMs > kSilenceAgainMs) return 2;
+    return said;
+}
+/* 1 = a silence line the episode is due may be written: under the launch's 20 lines and this shop's 2 a launch */
+inline int ShopSilenceLineOk(long long linesSoFar, long long shopLinesSoFar)
+{
+    return (linesSoFar < kSilenceLineCap && shopLinesSoFar < kSilencePerShopCap) ? 1 : 0;
 }
 /* AN ASKER'S CANCEL of an applied request by the old road (tail kind 0, a caravan's): 0 = the record does not carry the keeper
    (today's roads); 1 = marked here (this game is the exact holder: the entry is marked cancelled and the money undo is captured into

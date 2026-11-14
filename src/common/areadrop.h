@@ -416,11 +416,15 @@ inline void AreaApplyMapCore(AreaBook* b, const int* listed, int mySlot, double 
      ownerInWorld - 1 that roster shows the owner IN_WORLD.
    No roster on this link: frozen for every other-slot owner. 1 = frozen. */
 const int kAreaFrozen = -2;
-/* AREAS (34): {u32 n, n x (i32 x, i32 y), u16 m, m x (i32 x, i32 y)} - the reporter's loaded areas, then the areas its player
-   characters stand in, the followed character's first. m = 0 means "this game does not know where its players are" (the world
+/* AREAS (34): {u32 n, n x (i32 x, i32 y), u16 m, m x (i32 x, i32 y), u8 flags} - the reporter's loaded areas, then the areas its player
+   characters stand in, the followed character's first, then (world-server protocol 148, decision 1556) one flags byte, always present:
+   kAreasFlagLoading = the engine's zone manager is loading - the pairs are every area it has loaded, and the world server changes no
+   listing and no holder on this report (areaclaim.h AreasReportListing); without it the pairs are the areas the engine KEEPS. m = 0 means "this game does not know where its players are" (the world
    server drops that slot's rows at once), never "no players". m is at most kAreasPlayerSectorsMax at both ends: the writer cuts the
    list there, the reader refuses more. Little-endian, as the rest of the message. */
 const int kAreasPlayerSectorsMax = 64;
+const unsigned kAreasFlagLoading = 1u;
+inline void AreasPutFlags(std::vector<char>* b, unsigned flags) { b->push_back((char)(unsigned char)(flags & 0xFFu)); }
 inline void AreasPutPlayerSectors(std::vector<char>* b, const int* xy, int m)
 {
     if (m < 0 || xy == 0) m = 0;
@@ -447,19 +451,25 @@ inline int AreasReadPlayerSectors(const unsigned char* p, size_t n, size_t at, s
     return 1;
 }
 /* AREAS (34), the whole payload of n bytes, checked before the world server acts on any of it: kAreasOk = well formed (*pairs = the
-   loaded-pair count, *xy = the player-sector list as AreasReadPlayerSectors reads it); kAreasBadPairs = no count, or the loaded pairs
-   run past the end; kAreasBadList = the player-sector list is malformed (no count, m over the cap, or fewer bytes than m pairs). */
-const int kAreasOk = 0, kAreasBadPairs = 1, kAreasBadList = 2;
-inline int AreasParse(const unsigned char* p, size_t n, unsigned* pairs, std::vector<int>* xy)
+   loaded-pair count, *xy = the player-sector list as AreasReadPlayerSectors reads it, *flags = the flags byte); kAreasBadPairs = no
+   count, or the loaded pairs run past the end; kAreasBadList = the player-sector list is malformed (no count, m over the cap, or fewer
+   bytes than m pairs); kAreasBadFlags = no flags byte after the list (protocol 148 always sends one). */
+const int kAreasOk = 0, kAreasBadPairs = 1, kAreasBadList = 2, kAreasBadFlags = 3;
+inline int AreasParse(const unsigned char* p, size_t n, unsigned* pairs, std::vector<int>* xy, unsigned* flags = 0)
 {
     if (pairs != 0) *pairs = 0;
+    if (flags != 0) *flags = 0;
     if (xy == 0) return kAreasBadList;
     xy->clear();
     if (p == 0 || n < 4) return kAreasBadPairs;
     const unsigned c = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
     if ((size_t)c > (n - 4) / 8) return kAreasBadPairs;
     if (pairs != 0) *pairs = c;
-    if (AreasReadPlayerSectors(p, n, 4 + (size_t)c * 8, xy) == 0) return kAreasBadList;
+    const size_t at = 4 + (size_t)c * 8;
+    if (AreasReadPlayerSectors(p, n, at, xy) == 0) return kAreasBadList;
+    const size_t end = at + 2 + xy->size() * 4;   /* xy holds 2 ints per entry: 8 bytes per entry, 4 per int */
+    if (n <= end) return kAreasBadFlags;
+    if (flags != 0) *flags = (unsigned)p[end];
     return kAreasOk;
 }
 /* ONE ROW OF THE WORLD SERVER'S PLAYER-SECTOR TABLE: an area one of a reporter's player characters stands in, and when it arrived. */

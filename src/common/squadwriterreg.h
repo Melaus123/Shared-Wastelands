@@ -62,7 +62,7 @@
 
 namespace sqwreg {
 
-const unsigned kProtocol = 145u;          /* the world-server protocol that carries SQUAD_TAKE, SQUAD_WRITER (its answers and its writer notes) and SQUAD_RELEASE */
+const unsigned kProtocol = 153u;          /* the world-server protocol that carries SQUAD_TAKE, SQUAD_WRITER (its answers and its writer notes) and SQUAD_RELEASE (146: its id "*" is the re-claim batch's end mark, T-1269) */
 
 
 
@@ -91,7 +91,7 @@ inline const char* VerdictName(int v)
         case kSwRefuseNotWriter: return "REFUSED - another game is the registered writer and it still runs the squad (or this game neither runs nor keeps it)";
         case kSwRefuseOldGen: return "REFUSED - the take named an older generation than the registered one";
         case kSwRefusePos: return "REFUSED - a position note for a squad whose area a game holds";
-        case kSwHoldDelete: return "HELD - a released writer's delete while another live game has the area loaded (judged again when that changes)";
+        case kSwHoldDelete: return "HELD - a released writer's delete while another live game has the area loaded, or another game's delete of a squad whose live keeper holds its area (judged again when that changes)";
         case kSwAskAgain: return "ASK AGAIN - the writer released the squad or left the world";
         case 21: return "NOTE - this game runs the squad now";
         case 22: return "NOTE - this game runs the squad no more";
@@ -175,6 +175,19 @@ inline int WriterAway(const JudgeIn& in)
 }
 /* the writer runs none of the squad's people now: away, or only its keeper - a game that runs them (a full write, a RUNS take) takes over */
 inline int WriterRunsNone(const JudgeIn& in) { return (WriterAway(in) != 0 || in.writerKeeper != 0) ? 1 : 0; }
+/* T-850 fold 2 (T2217): another game's plain or discard delete of a squad whose registered writer is its KEEPER, live, not released and the
+   live holder of the squad's area (so the sender does not hold it). The keeper stands for the squad there: its sleeping record, or people
+   it is about to run whose RUNS take has not landed. Another game's copy emptied beside them is no end of the squad, so the delete is HELD
+   (kSwHoldDelete, the held-delete list), not taken over: applied once the keeper lets the squad go (its release, its link closing, the
+   area passing to another game) or once the sender is the writer; refused when the record is written again meanwhile (KeeperHeldStep). */
+inline int KeeperHoldsDelete(const JudgeIn& in)
+{
+    if (in.kind != kKindDelete && in.kind != kKindDiscard) return 0;
+    if (in.sender < 0 || in.registered == 0 || in.sender == in.writer) return 0;
+    if (in.writerKeeper == 0 || WriterAway(in) != 0) return 0;
+    const int h = LiveHolder(in);
+    return (h >= 0 && h == in.writer) ? 1 : 0;
+}
 inline int Judge(const JudgeIn& in)
 {
     const int h = LiveHolder(in);
@@ -203,6 +216,7 @@ inline int Judge(const JudgeIn& in)
         if (in.kind == kKindDelete && in.writerReleased != 0 && in.otherLoadedHere != 0) return kSwHoldDelete;
         return kSwWriter;
     }
+    if (KeeperHoldsDelete(in) != 0) return kSwHoldDelete;   /* T-850 fold 2: the keeper that holds the area stands for the squad */
     if (in.sender >= 0 && WriterRunsNone(in) != 0) return kSwTakeover;
     return kSwRefuseNotWriter;
 }
@@ -260,6 +274,18 @@ inline int HeldDeleteStep(int haveRecord, int writerNow, int sender, long long w
     if (writerNow != sender) return kHdRefuse;
     if (writtenAtNow != writtenAtHeld) return kHdDrop;
     return otherLoaded != 0 ? kHdKeep : kHdApply;
+}
+/* T-850 fold 2: one delete held for a live keeper that holds the area (KeeperHoldsDelete), judged again at the same events and at the
+   keeper's release: no record any more -> dropped; the sender is the writer now -> applied (run again: judged as the writer's own delete);
+   the record written again since it was held (the keeper, or the game running the people, wrote the squad: it lives) -> refused, so the
+   sender's local delete and deleted mark are taken back; still held (the judge would hold it again) -> kept; else applied (run again and
+   judged as the register then stands - a keeper that let the squad go is taken over, one that now runs the people refuses it) */
+inline int KeeperHeldStep(int haveRecord, int writerNow, int sender, long long writtenAtNow, long long writtenAtHeld, int stillHeld)
+{
+    if (haveRecord == 0) return kHdDrop;
+    if (writerNow == sender) return kHdApply;
+    if (writtenAtNow != writtenAtHeld) return kHdRefuse;
+    return stillHeld != 0 ? kHdKeep : kHdApply;
 }
 
 /* ---- index line field 17 ---- */
@@ -372,6 +398,24 @@ inline int RunnerMovedRelease(int mySlot, int runner, int squadRec, int npcFacti
 /* a squad record re-pushed after the world server lost its data registers its sender as the writer: a release follows it on the same
    ordered channel unless this game runs the squad (basis RUNS), so the game that runs it takes it at its next wake */
 inline int RepushRelease(int squadRec, int npcFaction, int basis) { return (squadRec != 0 && npcFaction != 0 && basis != kBasisRuns) ? 1 : 0; }
+/* T-850 (T2230): a hand-over's acknowledgement (handoff.cpp's XFER ACK) passed people of a squad to another game. The world server moves
+   a squad's writer only on a release from the writing game, and the hand-over sends none - so for each squad whose people it passed:
+   kHandRejudge  - a copy of it is filed in this game's heartbeat (an awake copy: a copy put to sleep or destroyed is forgotten there): the
+                   heartbeat's own writer re-check runs now (store.cpp HbRegister). Another game running a strict majority of its living people
+                   marks the entry another game's - no heartbeat writes it from here - and releases it (RunnerMovedRelease); a squad this game
+                   still runs, or a split one, is kept
+   kHandByRecord - no filed copy and no awake one here (asleep or destroyed before the ACK) and the ACK kept none of its people here: this game
+                   runs none of them - released by the same rule (RunnerMovedRelease), the receiver as the runner; no copy is left to write it
+   kHandNone     - nothing passed; an awake copy the heartbeat does not file (it never writes it); or the ACK kept some of its people here with
+                   no copy to read who runs the rest */
+const int kHandNone = 0, kHandRejudge = 1, kHandByRecord = 2;
+inline int HandOverStep(int releasedOfSquad, int keptOfSquad, int filed, int awakeUnfiled)
+{
+    if (releasedOfSquad == 0) return kHandNone;
+    if (filed != 0) return kHandRejudge;
+    if (awakeUnfiled != 0 || keptOfSquad != 0) return kHandNone;
+    return kHandByRecord;
+}
 /* the register's answer marks this game's copy changed (written at its next heartbeat visit, the checksum of the bytes last sent
    forgotten): a refused full write (the rolled-back copy is not what the world server holds) and a take that made this game the writer
    (its changes refused meanwhile were never sent). The writer's own answer marks nothing (a write at every wake). */
@@ -529,5 +573,99 @@ inline int AreaHeldChanged(int mineBefore, int mineAfter, int otherBefore, int o
 /* 1 = a waiting id is asked again at an applied area map: no other game runs it now and its area's holder changed (areaChanged), or the
    map came after a no-map refusal (the caller passes 1 for every area then) */
 inline int WaitReaskAtMap(int waiting, int otherRuns, int areaChanged) { return (waiting != 0 && otherRuns == 0 && areaChanged != 0) ? 1 : 0; }
+/* ---- THE LIST HOLD [t1269a-A] (T-1269) ----
+   From a link's WELCOME until that link's LIST END the game's list of the squads other games run is not whole: a squad missing from it
+   may be one another game runs. While the list is held no road builds or wakes a copy of a squad that HAS a record here and that no other
+   game is listed as running: the id waits in the build-wait list as a refusal for another runner does, and the LIST END's loop builds each
+   one no other game runs then. A squad with no record here is never held (a held wake is put on ice and destroyed; only a record builds it
+   again). The hold ends on events only: the LIST END, or the link down longer than the list's grace (going offline - no list will end on
+   that link and the game plays on without one). A WELCOME of another protocol arms nothing: no list follows it. */
+enum { kLhWelcome = 1, kLhListEnd = 2, kLhOffline = 3 };
+inline int ListHoldAfter(int holding, int event, int listComes)
+{
+    if (event == kLhWelcome) return listComes != 0 ? 1 : 0;
+    if (event == kLhListEnd || event == kLhOffline) return 0;
+    return holding;
+}
+/* 1 = held: the list is not whole, the id is a squad with a record here, and no other game is listed as running it (that one is refused) */
+inline int ListHoldBlocks(int holding, int squadId, int haveRecord, int otherRuns) { return (holding != 0 && squadId != 0 && haveRecord != 0 && otherRuns == 0) ? 1 : 0; }
+/* 1 = going offline lifts the hold: held, the link down, its outage seen (OtherListLinkStep) and longer than the list's grace */
+inline int ListHoldOfflineLift(int holding, int linkUp, int downSeen, unsigned nowMs, unsigned downAt)
+{
+    return (holding != 0 && linkUp == 0 && downSeen != 0 && nowMs - downAt > kOtherListGraceMs) ? 1 : 0;
+}
+/* the gate the two engine-wake roads, the town-note road and the move-in at a release ask BEFORE the refusal: another game runs the squad,
+   or the list hold holds it */
+inline int OtherOrHeld(int otherRuns, int held) { return (otherRuns != 0 || held != 0) ? 1 : 0; }
+/* ---- THE RESTART [t1269a-B] (T-1269, world-server protocol 146) ----
+   The register's marks (released / keeper / runs) live in memory only; the index line keeps only the writer (wslot, wgen). After a world-
+   server restart a squad with a registered writer and no marks yet, whose writer has not come back and ended its re-claim batch and has not
+   been told gone, counts as 'maybe running': the list each game is sent holds it, so no other game builds or wakes a copy of a squad its
+   writer may still run (the take judge reads it the same way: ApplyNotBack). It ends three ways:
+     - the writer's game comes back and sends its RE-CLAIM BATCH: one RUNS take per squad it runs (SQUAD_TAKE, as at a heartbeat visit), then
+       the END MARK - SQUAD_RELEASE with the id "*" (new in protocol 146). At the end mark each of its squads still without marks is either
+       re-claimed (a RUNS take of it arrived since its return: it runs, even if that take still waits behind a write) or released, as a link
+       close releases a game's squads;
+     - its SLOT GONE, started for every registered writer at the world server's start and sent kSlotGoneStartGraceSec later if it is still
+       away (a game that stays relinks within it);
+     - its link closing before the end mark (released as at any link close).
+   No save-format change: an old index line simply names its writer. A squad released before the restart is over-held until one of the three.
+   Every registered writer is marked: nothing saved tells who was connected at the last shutdown (slots.txt's last-heard time is written at a
+   join and at a leave, and a killed world server writes no leave), and no event comes for a player who never returns - the SLOT GONE wait
+   is the backstop for that player, paid at every restart. */
+const double kSlotGoneStartGraceSec = 90.0;   /* the start's SLOT GONE wait: the games' own link timeout, the 5 s re-dial pace and the handshake fit inside it */
+/* 1 = maybe running: registered, no marks since the start, its writer not back (no end mark, no SLOT GONE, no link close), the record not gone */
+inline int MaybeRunning(int registered, int haveMarks, int writerNotBack, int gone) { return (registered != 0 && haveMarks == 0 && writerNotBack != 0 && gone == 0) ? 1 : 0; }
+/* the world server's 'who runs it' test: the writer live, or not back yet since the restart (NoteRuns), or maybe running */
+inline int RunsNow(int registered, int writerLive, int writerNotBack, int haveMarks, int released, int runs, int keeper, int gone)
+{
+    if (MaybeRunning(registered, haveMarks, writerNotBack, gone) != 0) return 1;
+    return NoteRuns(registered, (writerLive != 0 || writerNotBack != 0) ? 1 : 0, (released != 0 || runs == 0) ? 1 : 0, keeper, gone);
+}
+/* 1 = a writer that is 'not back' from the start: a squad record with a registered writer that is not gone */
+inline int NotBackAtStart(int squadId, int writerSlot, int gone) { return (squadId != 0 && writerSlot >= 0 && gone == 0) ? 1 : 0; }
+/* the start's SLOT GONE hold is kept in the link-close table, whose step waits `grace`: its start is placed so it sends startGrace after the start */
+inline double SlotGoneStartAt(double startSec, double startGrace, double grace) { return startSec + (startGrace - grace); }
+/* the end mark: a SQUAD_RELEASE naming "*" */
+inline int IsReclaimEnd(const std::string& id) { return id == kNoteAllId ? 1 : 0; }
+inline std::vector<char> EncodeReclaimEnd() { return EncodeRelease(std::string(kNoteAllId)); }
+/* 1 = a take counts toward its sender's re-claim: a RUNS take from a game not back yet */
+inline int ReclaimNoted(int senderNotBack, int basis) { return (senderNotBack != 0 && basis == kBasisRuns) ? 1 : 0; }
+/* at the end mark, one squad: kReUnchanged - not that game's, or it has marks (a take of it already landed); kReRuns - re-claimed (it runs);
+   kReRelease - not re-claimed (released, as at a link close) */
+enum { kReUnchanged = 0, kReRuns = 1, kReRelease = 2 };
+inline int ReclaimEndStep(int writerIsSender, int haveMarks, int reclaimed)
+{
+    if (writerIsSender == 0 || haveMarks != 0) return kReUnchanged;
+    return reclaimed != 0 ? kReRuns : kReRelease;
+}
+/* fold 1 (M1): the take judge reads 'not back' as the list does - the writer counts as live, and a squad still maybe running as neither
+   released nor only kept, so another game's take of it (or the holder's note) is refused until its writer re-claims it, its end mark
+   releases it, or its SLOT GONE (RunsNow and Judge agree) */
+inline void ApplyNotBack(JudgeIn* in, int haveMarks, int writerNotBack, int gone)
+{
+    if (in->registered == 0 || writerNotBack == 0) return;
+    in->writerLive = 1;
+    if (MaybeRunning(1, haveMarks, 1, gone) != 0) { in->writerReleased = 0; in->writerKeeper = 0; }
+}
+/* fold 1 (M2): a squad the batch re-claims is one this game runs NOW (read live at the send): it runs the strict majority of the awake
+   squad's people, or some of them (a split squad) */
+inline int ReclaimRunsNow(int mySlot, int runner, int runHere) { return (mySlot >= 0 && (runner == mySlot || runHere > 0)) ? 1 : 0; }
+/* the end mark goes only once every claim of the batch went out (a failed send keeps the batch owed: its end mark would release that squad) */
+inline int ReclaimEndMayGo(long long failedSends) { return failedSends == 0 ? 1 : 0; }
+/* fold 1 (H1): a squad waiting for its list end or its runner's release whose only copy here is a refused wake queued for removal (put on
+   ice, destroyed at the next removal pass) keeps waiting at the sweep - it is neither moved in nor dropped; the removal's end asks again
+   (WakeDupSettledAsks), and the sweep then builds it (no copy left) or keeps a copy that stayed */
+inline int SweepWaitOnDoomed(int waitAsk, int liveCopy, int doomedCopy) { return (waitAsk != 0 && liveCopy == 0 && doomedCopy != 0) ? 1 : 0; }
+/* a refused wake's removal ended (removed, kept or given up): a waiting id is asked again through its release road */
+inline int WakeDupSettledAsks(int waiting) { return waiting != 0 ? 1 : 0; }
+/* the game's side: the batch goes once per WELCOME of this protocol, as soon as the link is up (owed until then) */
+inline int ReclaimSendNow(int owed, int linkUp) { return (owed != 0 && linkUp != 0) ? 1 : 0; }
+/* a squad the batch re-claims: a squad record written here, of a world NPC faction, that this game runs now (ReclaimRunsNow), not refused
+   here and with no take out on this link */
+inline int ReclaimWanted(int squadRec, int written, int npcFaction, int ranHere, int refusedHere, int takeOut)
+{
+    return (squadRec != 0 && written != 0 && npcFaction != 0 && ranHere != 0 && refusedHere == 0 && takeOut == 0) ? 1 : 0;
+}
 
 }   // namespace sqwreg

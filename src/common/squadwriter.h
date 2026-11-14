@@ -47,6 +47,40 @@ inline int XferTakeMember(int leaderHereOrTaking, int squadPosKnown, int squadIn
     return memberInRing != 0 ? 1 : 0;
 }
 
+/* T-1239 fix attempt 1 (H-T1239-leader): THE RECEIVER'S OWN GROUP VIEW. Copies are built with no group and each engine groups them
+   its own way, so the agreed leader one game computes can name a leader whose group on the other game does not hold the member
+   (T2129: one member handed A <-> B 57 times by follow-leader alone). The game asked to take a follow-leader member takes it only
+   when ITS OWN copy of that member stands in the named leader's group on its engine, read live at the take: leaderGroup /
+   memberGroup are the two characters' active platoons here (0 = none or unreadable). 1 = in the group (the other tests decide),
+   0 = refuse with the reason 'not in the leader's group here'. */
+inline int FollowMemberInLeaderGroup(const void* leaderGroup, const void* memberGroup)
+{
+    return (leaderGroup != 0 && memberGroup != 0 && leaderGroup == memberGroup) ? 1 : 0;
+}
+
+/* T-1239 fix attempt 1, the sender's side. After that refusal the sender treats the group's leader as unknown: its follow pass runs
+   the position rule for the group (its keep check and the area hand-over), and it does not send the refused members by follow-leader
+   again until either game's announcement for the group changes - an event, no timer. The mark is what both announcements were when
+   the refused XFER went: the other game's (its sender key and seq; 0 = none heard) and this game's own record for the squad (its key
+   and the seq of its last send; 0 = none). */
+struct FollowAnnounceMark
+{
+    unsigned int peerSender, peerSeq, myKey, mySeq;
+    FollowAnnounceMark() : peerSender(0), peerSeq(0), myKey(0), mySeq(0) {}
+};
+inline int FollowAnnounceSame(const FollowAnnounceMark& a, const FollowAnnounceMark& b)
+{
+    return (a.peerSender == b.peerSender && a.peerSeq == b.peerSeq && a.myKey == b.myKey && a.mySeq == b.mySeq) ? 1 : 0;
+}
+/* The follow pass's action for a group under such a block. blockHolds: a refused member of this group is run here, the agreed
+   leader is the one that refused it, no follow XFER for that leader is in flight, and both announcements are as marked. A send or a
+   wait then becomes the position rule; any other action stands. */
+inline int FollowActionBlocked(int act, int blockHolds)
+{
+    if (blockHolds != 0 && (act == kFollowSend || act == kFollowWait)) return kFollowByPosition;
+    return act;
+}
+
 /* Owner 110: this game keeps a copy squad awake (refreshes its ActivePlatoon+0xB0 stay-awake timer) when EVERY member is a
    copy of a character the other game runs, at least one member stands on ground loaded here, and it is not a player's squad
    (a player's squad never sleeps and never changes hands). 1 = refresh. */
@@ -144,13 +178,103 @@ inline int SupersedeOwnIdAfterHandover(int ownBlock, int handedOver)
 {
     return (ownBlock != 0 && handedOver == 0) ? 1 : 0;
 }
-/* The wake hook: the wake of a squad I handed over is refused while another game holds its area (heldByOther, HeldByOtherTS at its file
-   position: 1 held, 0 not, -1 no fresh map, -2 frozen) and it is a world faction's squad - the T-300 treatment (back on ice, thrown
-   away on the next tick). No player-count input: the same rule runs whoever else is in the world. 1 = refuse. */
-inline int HandedOverWakeRefuse(int handedOver, int heldByOther, int worldFaction)
+/* T-1318 design 1 (T2279: after the receiver's adoption ACK this game's engine woke the handed squad in an area this game holds, rebuilt
+   its people under new ids, and the sweep took them over from the area holder): THE ACKNOWLEDGED HAND-OVER DECIDES WHO OWNS THE GROUP.
+   given = the squad index says another game took it at its ACK: wholeGiven (HandedOverHas - every person given, none kept / asleep /
+   open / live here) or takenSlot >= 0 (the sleeping squad's own people, person by person, all given to one slot - SleepersTakenSlotNow).
+   1 = given. */
+/* T-1318 attempt 4 (owner 1626, design A; T2343): the squad index's "wholly given" counts only numbered people, so it no longer decides
+   alone when the engine's own records read: takenSlot is SleepersTakenSlotNow's answer from the sleeping squad's own 0x24 records (or
+   HandoffMembersTakenBy over an awake squad's living members) - >= 0 every one given to that slot; kTakenNot (-1) read and NOT all given
+   (a never-numbered person of this game's among them: not given, whatever the index says); kTakenUnread (-2) the records did not read -
+   then the index's whole answer stands, as before. */
+/* T-1318 a4 fold 1 (review MEDIUM-1): kTakenSplit (-3) - every living person of the records given, not all to one known slot (cooplo::
+   SleepersTakenSlot): given. kTakenUnread now also when a given entry has no recorded hand and a record is not found among the given. */
+const int kTakenNot = -1, kTakenUnread = -2, kTakenSplit = -3;
+inline int GivenAtAck(int wholeGiven, int takenSlot)
 {
-    if (handedOver != 0 && heldByOther == -2 && worldFaction != 0) return 1;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world - nothing of its area wakes here */
-    return (handedOver != 0 && heldByOther == 1 && worldFaction != 0) ? 1 : 0;
+    return (takenSlot >= 0 || takenSlot == kTakenSplit || (wholeGiven != 0 && takenSlot == kTakenUnread)) ? 1 : 0;
+}
+/* T-1318 a4 fold 1 (review MEDIUM-2): a wake the given test let through (a person of the squad not given, or its records unread with the
+   squad given in part) re-makes the GIVEN people too, beside the running copy of the game that took them. The sweep removes such a re-made
+   body (worldsync.cpp GivenRemakeDrain - the mod's own destroy, DestroyLocalObject) when its own hand is given (personGiven 1 - never an
+   unread hand) and its squad woke here with given people (wokeWithGiven). 1 = remove. */
+inline int GivenRemakeRemove(int personGiven, int wokeWithGiven) { return (personGiven == 1 && wokeWithGiven != 0) ? 1 : 0; }
+/* T-1318 a4 fold 2 (re-check MEDIUM-A): a queued re-made given body re-checked at the drain, its identity read again (an address reused
+   between the queue and the drain is another body): inList - the engine still lists the address this tick; uid - its mirror uid (0 none);
+   player - a player's character (1), not (0), its faction unread (-1: counted as a player's); keyRead - its squad key read; personGiven -
+   HandoffPersonGiven of it now; woke - HandoffWokeWithGiven of its squad now. kGrDestroy only when every check holds; otherwise the first
+   that failed - the body leaves the queue and is never destroyed (counted). The queue is emptied at the world teardown. */
+const int kGrDestroy = 0, kGrGone = 1, kGrNumbered = 2, kGrPlayer = 3, kGrNoKey = 4, kGrNotGiven = 5, kGrNotWoke = 6;
+inline int GivenRemakeDrainStep(int inList, unsigned int uid, int player, int keyRead, int personGiven, int woke)
+{
+    if (inList == 0) return kGrGone;
+    if (uid != 0) return kGrNumbered;
+    if (player != 0) return kGrPlayer;
+    if (keyRead == 0) return kGrNoKey;
+    if (personGiven != 1) return kGrNotGiven;
+    if (woke == 0) return kGrNotWoke;
+    return kGrDestroy;
+}
+/* T-1318 attempt 4 (design A, site 8): the same-id supersede destroys this game's SLEEPING copy of a squad it handed over only when that
+   copy's own people are given (GivenAtAck on its records): a copy holding a person never given (T2343 A 687.687 Starving Bandits_19: its
+   never-numbered people destroyed with it) is kept, counted and logged. 1 = destroy. */
+inline int SupersedeAsleepDestroys(int wholeGiven, int takenSlot) { return GivenAtAck(wholeGiven, takenSlot); }
+/* The wake hook (and the off-thread wake's drain): the wake of a squad given at an ACK is refused WHOEVER HOLDS THE AREA (heldByOther
+   is not asked) when it is a world faction's squad, with or without a file here (T-1318 fold 1: a squad with no file is refused too and
+   counted noFile - its runner's put-away writes its record). Its container is marked read so no bodies are built (the main-thread wake
+   only), and the refused platoon itself rides the duplicate-wake road (store.cpp WakeDupQueue / CtxDropTick: put on ice and destroyed
+   under the admin flag, its people never adopted). Before the ACK the squad is not given and wakes; the late adopter's revoke
+   (liveowner.h AdoptAfterRewake) decides as before. 1 = refuse. */
+inline int HandedOverWakeRefuse(int given, int worldFaction)
+{
+    return (given != 0 && worldFaction != 0) ? 1 : 0;
+}
+/* A refused wake the area rule alone would have let through (heldByOther, HeldByOtherTS at the file position: 1 another game holds,
+   -2 frozen, 0 this game / nobody, -1 no fresh map): the given entry blocks this game's own wake. It lasts until an event clears the
+   entry - the runner's UNLOAD of the person as gone, its DESPAWN or death, a roster / return-check withdrawal, a take-back, or the
+   runner leaving the world; a lost UNLOAD keeps it until that player leaves. Counted (givenBlockedWake) and logged. 1 = blocks. */
+inline int GivenBlocksOwnWake(int refused, int heldByOther)
+{
+    return (refused != 0 && heldByOther != 1 && heldByOther != -2) ? 1 : 0;
+}
+/* T-1318 fold 2 (re-check B1, T2316 Western Hive_13): THE OPEN HAND-OVER. While an offer of the squad is open on this game (sent, no
+   ACK or refusal yet - handoff.cpp HandoffSquadOpen: a person of it in this frame's put-away batch or an open RELEASE record, the asleep
+   road, or in an XFER still waiting for its ACK, the awake road), its wake is refused on the given refusal's own road (no bodies built,
+   the refused copy removed) and the sweep adopts none of its people: a wake then rebuilt its people under new ids before the ACK and the
+   sweep took them over (T2316 A 441.201 OPEN, 441.203 adopted, 441.240 ACK, 443.542 offered again). given: GivenAtAck; open: an offer
+   of it open here. 1 = a hand-over (given, or open) holds the wake - HandedOverWakeRefuse then asks the faction. */
+inline int HandOverHoldsWake(int given, int open)
+{
+    return (given != 0 || open != 0) ? 1 : 0;
+}
+/* T-1318 fold 1 (review F3), fold 2 (re-check B1, B2): THE GIVEN-WAIT. A squad whose copy here was refused its wake (given at an ACK, or
+   an offer of it open) and removed is built again from its record (the records win) once nothing of it is given and no offer of it is
+   open (an event closed it: the runner's UNLOAD as gone, DESPAWN or death, a withdrawal, a take-back, that player leaving; the offer's
+   ACK, refusal, time-out or its candidate gone). Looked at when the squad index or the open offers change (store.cpp GivenWaitTick).
+   stillGiven: the index still has a person of the id given; open: an offer of it still open here; haveRecord: the store holds its
+   record; writerOk: GivenWaitWriterOk. 1 = put it on the release road now (store.cpp SwReleaseBuild), 0 = keep waiting, -1 = drop the
+   wait (no record here: nothing to build), -2 = drop the wait (the record is older than the hand-over and not its runner's: not the truth
+   of a squad another game ran - the roads that bring it back are the runner's own, store.cpp GivenWaitTick's comment). */
+inline int GivenWaitStep(int stillGiven, int open, int haveRecord, int writerOk)
+{
+    if (stillGiven != 0 || open != 0) return 0;
+    if (haveRecord == 0) return -1;
+    return writerOk != 0 ? 1 : -2;
+}
+/* T-1318 fold 2 (re-check B2): may the given-wait build from the record it holds? The writer guard of the runner-restart road
+   (ContextRecreateAfterRunnerRestart: recordOwner == the runner's slot). wasGiven: the wait saw the squad given at an ACK (0: only an
+   offer of it was open and it closed unaccepted - this game's own record is the truth, built); givenSlot: the one slot it was given to
+   (-1 several / unknown); recordOwner: the record's writer slot; mySlot: this game's slot; recAtAck: a record was held when the wait first
+   saw it given, seqAtAck its notebook sequence; recordSeq: the record's sequence now. A record written by the given slot, or one written
+   after the ACK by a game other than this one (a newer sequence, or none held at the ACK), is built; this game's own write is never the
+   runner's truth. 1 = build. */
+inline int GivenWaitWriterOk(int wasGiven, int givenSlot, int recordOwner, int mySlot, int recAtAck, unsigned long long seqAtAck, unsigned long long recordSeq)
+{
+    if (wasGiven == 0) return 1;
+    if (givenSlot >= 0 && recordOwner == givenSlot) return 1;
+    if (recordOwner == mySlot) return 0;
+    return (recAtAck == 0 || recordSeq > seqAtAck) ? 1 : 0;
 }
 /* THE STALE-SQUAD SWEEP (store.cpp T300SweepTick), armed when another player enters this world (the arrival record: the world server's
    roster or the old link). armed: a sweep is owed; worldReady: a running world this game may write to. The sweep waits for a world,
@@ -162,15 +286,25 @@ inline int StaleSweepStep(int armed, int worldReady)
     if (armed == 0) return kStaleSweepIdle;
     return worldReady == 0 ? kStaleSweepWait : kStaleSweepRun;
 }
-/* The sweep: a rebuilt non-player person of a squad I handed over is never adopted while another game runs a live copy of that squad
-   here, or while the area is not known to be mine alone (heldByOther 1, or -1 no fresh map) - it is noted for the orphan clean-up.
-   A fresh map with no other holder and no live copy here: adopted, and the squad is mine again (unmarked). */
-enum { kHoSweepAdopt = 0, kHoSweepSkip = 1, kHoSweepAdoptUnmark = 2 };
-inline int HandedOverSweepAction(int handedOver, int peerCopyHere, int heldByOther)
+/* The sweep: a rebuilt non-player person of a squad I handed over is never adopted here - whoever holds the area and whether or not
+   the other game's copy is live here (T-1318 design 1: the area holder and the context platoon were stand-ins for the ACK). It is
+   noted for the orphan clean-up. The squad's index entry is not cleared here: only events clear it (handoff.cpp SquadIdxOwnerWithdrew,
+   the player gone, a take-back). Not handed over: the sweep's own rules. */
+enum { kHoSweepAdopt = 0, kHoSweepSkip = 1 };
+inline int HandedOverSweepAction(int handedOver)
 {
-    if (handedOver == 0) return kHoSweepAdopt;
-    if (peerCopyHere != 0 || heldByOther != 0) return kHoSweepSkip;
-    return kHoSweepAdoptUnmark;
+    return handedOver != 0 ? kHoSweepSkip : kHoSweepAdopt;
+}
+/* T-1318 fold 1 (review F2): the sweep's "handed over" for ONE rebuilt person - the squad wholly given (HandedOverHas), or this person
+   given (personGiven 1: its own hand is a given entry of its squad - handoff.cpp HandoffPersonGiven). A person of a squad given in part
+   whose own hand is not given (kept or asleep here) is not: the sweep's rules decide it (it is this game's). personGiven -1 (hand
+   unread) is not given. 1 = handed over. */
+/* T-1318 attempt 4 (owner 1626, design A, site 9): a re-made body of a wholly given squad whose own hand is NOT given (personGiven 0 - a
+   person never numbered, so never given) is this game's own: the sweep numbers it, so the gap closes. The squad's wholeness decides only
+   when the person's hand did not read (personGiven -1). */
+inline int SweepGivenPerson(int wholeGiven, int personGiven)
+{
+    return (personGiven == 1 || (personGiven < 0 && wholeGiven != 0)) ? 1 : 0;
 }
 
 /* PrepareContextForSpawn: the awake retire of this game's own platoon whose id is mine but whose squad I handed over (handedOverOnly)
@@ -280,6 +414,13 @@ inline int ContextSleepDrop(int isContext, int heldMine)
    person was whose, so a MIXED sleep (some of another game's people, or a member whose uid did not resolve) stays refused: one of its
    rebuilt bodies may be another game's person. Not a context platoon: kCtxSweepGo (the existing rules). */
 enum { kCtxSweepGo = 0, kCtxSweepRefuse = 1, kCtxSweepTakeBack = 2 };
+/* T-1318 design 1: a take-back of a squad the squad index has given people of (HandoffSquadHasGiven - the sleep counts the take-back
+   reads are from before the release and are never updated) is refused: its rebuilt people are noted for the orphan clean-up, not
+   adopted. Any other answer is kept. */
+inline int ContextTakeBackAfterGive(int ctxAns, int squadHasGiven)
+{
+    return (ctxAns == kCtxSweepTakeBack && squadHasGiven != 0) ? kCtxSweepRefuse : ctxAns;
+}
 inline int ContextSweepAdopt(int isContext, int lastSleepHeldMine, int sleptChars, int sleptKnown, int sleptMine)
 {
     if (isContext == 0) return kCtxSweepGo;

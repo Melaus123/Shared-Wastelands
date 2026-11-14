@@ -39,7 +39,7 @@
 namespace cooptv {
 
 const unsigned int kMsgTownVer = 87u;   /* 28-86 are taken on the world-server link (store_main.cpp's enum) */
-const unsigned int kTvProtocol = 145u;   /* the world-server protocol that carries TOWN_VER */
+const unsigned int kTvProtocol = 153u;   /* the world-server protocol that carries TOWN_VER */
 
 
 
@@ -296,6 +296,24 @@ inline int TvChooseMode(int onMain, int hooked, int readOk, int playerOwned, int
     if (!onMain || !hooked || !readOk || playerOwned || !inWorld) return kTvEngineAlone;
     if (standIn) return kTvStandIn;
     return holder == 1 ? kTvDecide : kTvRefuse;
+}
+
+/* T-640 D1 - THE VERSION ASK (townver.cpp TownVerAskOthers), what the town's next load does before the engine tests anything, from
+   the same TvChooseMode inputs (onMain / hooked / readOk taken as checked). The values equal coopt2::kVaNone / kVaApplies / kVaUnread.
+     kTvStandIn       none: nothing is put on and no version may qualify, on every game - the walk never waits on it
+     kTvEngineAlone   a player-owned town: none (the engine's own player gate refuses every version); no world-server world: unread
+                      (the load then runs the engine without owner decision 260, which the ask applies)
+     kTvRefuse /      the stored record is put on BEFORE choosing (TvApply), and a record that arrives while the town is loaded is not
+     kTvDecide        put on until then: a record whose version differs from the town's now, and that this game can put on, applies;
+                      otherwise the engine's own test decides (kTvAskEngine). kTvRefuse lets no version qualify on this game, but the
+                      holder's chooser runs the same shared states and its record then reaches this game's next load: tested the same. */
+enum { kTvAskUnread = -1, kTvAskNone = 0, kTvAskApplies = 1, kTvAskEngine = 2 };
+inline int TvAskBefore(int mode, int playerOwned, int recordDiffers)
+{
+    if (mode == kTvStandIn) return kTvAskNone;
+    if (mode == kTvEngineAlone) return playerOwned ? kTvAskNone : kTvAskUnread;
+    if (recordDiffers) return kTvAskApplies;
+    return kTvAskEngine;
 }
 
 /* THE PLACED-TOWN KEY (zones.cpp TownKey prints exactly this): the town's own record sid and its position rounded to whole metres. */

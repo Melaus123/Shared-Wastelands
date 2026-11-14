@@ -73,6 +73,9 @@ bool ReadAuthorityIntent(::Character* c, int* type, unsigned int* subj, float* x
 bool IntentResendOwned(unsigned int uid);   /* M7a2 item 9 [m7a2-rh1]: the catch-up's INTENT, MAIN THREAD */
 bool ReadAuthorityFacing(::Character* c, float* fx, float* fz);
 void UnpuppetForOwnership(unsigned int uid);
+// T-918 fold 1: the default goal set of a character this game took over, filled by the engine's setupAI when goal 32 is missing -
+// K2 safe point (combat.cpp detour_tsRagdollUpdates), MAIN THREAD, the AI worker paused.
+void GoalRefillSafePointDrain();
 
 // E25 (review-p5p HIGH-1) - WHERE THE OTHER PLAYER WAS LAST SEEN, from the copies of their characters this game
 // holds. There was no accessor for this at all: the peer's position lives only inside the puppet rows, as the last

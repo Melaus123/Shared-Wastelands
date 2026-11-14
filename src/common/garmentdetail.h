@@ -176,4 +176,21 @@ inline unsigned int GarmentUnknown(const std::vector<GarmentDetail>& d)
     return coopmark::OwnerTailUnknown(own);
 }
 
+/* T-1119 (F-T2356-COLOURDROP): a copy's freshly made item takes the colour its holder sent. The engine's item maker 0x5825F0 never
+ * reads a "color sid"; the engine's own item loader 0x760A10 does (build/decomp_760a10.txt:203-212): it looks the sid up as a colour
+ * record (GdcGetDataTyped 0x6BFB10 on the base container 0x21330D0, type 0x37) and writes the item's colour field +0xD0 only when the
+ * record is found. What the mod's colour step does with one made item:
+ *   kColourNone       - no colour was sent: the item keeps what the engine gave it (its base item's own colour, or none);
+ *   kColourApply      - the record was found: written, as the loader writes it;
+ *   kColourUnknownSid - sent, but this game has no such colour record: left alone, as the loader leaves it;
+ *   kColourNoField    - the field or the lookup cannot be reached here (no address row, a fault, no item): left alone. */
+const int kColourNone = 0, kColourApply = 1, kColourUnknownSid = 2, kColourNoField = 3;
+inline int GarmentColourDecide(bool sent, bool fieldOk, bool sidFound)
+{
+    if (!sent) return kColourNone;
+    if (!fieldOk) return kColourNoField;
+    if (!sidFound) return kColourUnknownSid;
+    return kColourApply;
+}
+
 } // namespace coopgarment

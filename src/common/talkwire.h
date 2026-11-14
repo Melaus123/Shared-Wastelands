@@ -13,6 +13,10 @@
  *       T-478 step 3 (protocol 199) appends s16 lineSid to END after endsType, before T-858's optional unrun list (the line whose 43 BAIL
  *       the talker's game runs; empty otherwise)
  *     7 CURSOR_ASK, 8 CURSOR_ANSWER - T-737, the talk cursor (talkcursor.h), below REQUEST
+ *   T-898 (T898RANK): REQUEST, ANSWER, CURSOR_ASK and ACT_RESULT end with an optional TALKER BLOCK - the talker's own per-player
+ *     values as its game reads them: u8 n (<= 16) | n x (u8 key | i32 value), keys kTalker* below (1 = its rank in the NPC's
+ *     faction). Absent (an older sender) = no values, part of one = Trunc, a key this build does not know is skipped. No
+ *     protocol bump: an older game ignores the block and a newer one reads its absence as unknown (the engine's own answer).
  *   s16 = u16 length + that many bytes: a string id (line, reply) at most 128 bytes, a text at most 512 bytes.
  *
  * convId is the PROMPT sender's own number (never 0); the receiver keys a conversation on {peer, convId}. event 255 = the start
@@ -591,6 +595,39 @@ inline bool TalkMoneyCond(int cmp, int val, int purse)
     return cmp == 1 ? (purse < val) : (val <= purse);
 }
 
+/* T-1145: the engine's "can afford the bounty" condition (DialogConditionEnum 0x42) toward ANOTHER player's character, asked by an
+   NPC this game drives (speech.cpp detour_s6CheckCond). The engine answers false for any target whose faction has no player pointer
+   (faction +0x250, decomp_675ec0.txt:208-210) - the other player's character on this game - and otherwise answers
+   (bounty <= THIS game's player's money) == (0 < val) (:211-215). Answered here with that player's own numbers:
+   - its purse known in this talk (purse >= 0, noted from its ANSWER / REQUEST): bountyFits == (0 < val); bountyFits = the bounty this
+     game's copy of its bounty list holds for the speaker's faction (the owner's list, re-sent every 30 s) <= purse;
+   - no purse yet (the first line of a talk the NPC started): while this game lists the player's replies for this talk (listing) both
+     the "can pay" (val > 0) and the "can't pay" (val 0) replies pass - the other game shows its OWN list, which holds the one that
+     applies, and that pick is in this union; anywhere else (the NPC choosing its own line) the engine's answer stands. */
+inline bool TalkBountyCond(int val, int purse, bool bountyFits, bool listing, bool engine)
+{
+    if (purse >= 0) return bountyFits == (0 < val);
+    return listing ? true : engine;
+}
+
+/* T-1145: the value to ask the engine's bounty-amount condition (0x2F) with compare 1 (less than: bounty < value, decomp_675ec0.txt
+   :401-407) so that it answers "bounty <= purse": purse + 1; 0 = no ask needed (a purse at the int top holds any bounty). */
+inline int TalkBountyFitsAsk(int purse)
+{
+    return purse >= 0x7FFFFFFF ? 0 : purse + 1;
+}
+
+/* T-1145 fold 1: 1 = the other game's PROMPT ids hold every id of this game's own list, in the same order, and more - the shape a
+   union listing gives (the bounty stop's first line: the NPC's game lists both pay replies, this game its own one). Counted apart from
+   the mismatch counter; an equal list is not a superset. */
+inline int TalkIdsSuperset(const std::vector<std::string>& here, const std::vector<std::string>& prompt)
+{
+    if (prompt.size() <= here.size()) return 0;
+    size_t j = 0;
+    for (size_t i = 0; i < prompt.size() && j < here.size(); ++i) if (prompt[i] == here[j]) ++j;
+    return j == here.size() ? 1 : 0;
+}
+
 /* The talker's purse after its game applies an ACT's actions {types, values} (speech.cpp TkApplyAct): that game refuses the whole
    ACT when the line's TAKE_MONEY (8) total - a hire's price included - is more than its purse (NO_MONEY: unchanged); otherwise
    TAKE_MONEY comes off and GIVE_MONEY (9) goes on. A TAKE_MONEY in a line with a hire (3 / 18) is the hire's price: it comes off
@@ -616,6 +653,35 @@ inline int TalkPurseAfterAct(int purse, const std::vector<int>& types, const std
     return (int)r;
 }
 
+/* T-898: the engine's rank condition (DialogConditionEnum 10) as Dialogue's condition check answers it (0x675EC0, Read
+   build/decomp_675ec0.txt:360-368 and 957-958): the speaker faction's rank (Faction +0x78 -> +0x10) against val - compare 1
+   (less than) = rank < val; 2 (more than) = val < rank; any other compare = rank == val. */
+inline bool TalkRankCond(int cmp, int val, int rank)
+{
+    if (cmp == 1) return rank < val;
+    if (cmp == 2) return val < rank;
+    return rank == val;
+}
+
+const int kTalkActRankUp = 35;   /* DialogActionEnum 35: the speaker faction's rank goes up by one (decomp_67fad0.txt:1271-1276) */
+
+/* T-898: the talker's rank in the NPC's faction after its game applies an ACT's actions {types, values} (speech.cpp TkApplyAct
+   runs the engine's own _doActions there): each 35 raises the rank by one when the rank is below its value or the value is 0
+   (67fad0:1271-1276), in line order - a second 35 sees the first one's rank; the whole ACT refused for money (TalkPurseAfterAct's
+   rule: the line's TAKE_MONEY total over a known purse) leaves it unchanged. rank < 0 (unknown) is returned as it is. */
+inline int TalkRankAfterAct(int rank, int purse, const std::vector<int>& types, const std::vector<int>& values)
+{
+    if (rank < 0) return rank;
+    const size_t n = types.size() < values.size() ? types.size() : values.size();
+    long long take = 0;
+    for (size_t i = 0; i < n; ++i) if (types[i] == 8) take += values[i];
+    if (purse >= 0 && take > (long long)purse) return rank;
+    int r = rank;
+    for (size_t i = 0; i < n; ++i)
+        if (types[i] == kTalkActRankUp && (r < values[i] || values[i] == 0) && r < 0x7FFFFFFF) ++r;
+    return r;
+}
+
 /* P26s5 fold 1: ACT_RESULT anyApplied */
 const int kTalkAnyNone    = 0;   /* nothing of the ACT was applied there */
 const int kTalkAnyYes     = 1;   /* some part was applied there (whatever the result) */
@@ -628,6 +694,50 @@ const int kTalkDecodeTooLong  = 3;  /* a string's length field is over its cap *
 const int kTalkDecodeTrunc    = 4;  /* the payload ends inside a field */
 const int kTalkDecodeTooMany  = 5;  /* a PROMPT names more than 10 replies; an ACT more than 32 actions / 16 items / 16 relation effects */
 const int kTalkDecodeBadValue = 6;  /* T-737: a CURSOR_ASK / CURSOR_ANSWER with askId 0 or no NPC / talker uid, or an answer over 3 */
+
+/* T-898: THE TALKER BLOCK's keys - one per-player value the talker's game reads for itself, which the NPC's game answers a
+   condition with (speech.cpp kTkS6Rows: one row per condition). A new value is a new key here and a row there. */
+const int kTalkerRank   = 1;    /* the talker's rank in the conversation NPC's faction (Faction +0x78 -> +0x10) - condition 10 */
+const int kTalkerKeys   = 8;    /* keys 1..7 kept by this build; 0 unused */
+const int kTalkerAbsent = (int)0x80000000;   /* no value for that key */
+const unsigned int kTalkMaxTalker = 16;   /* entries one block may carry */
+
+/* T-898: a talker-block value after the talker's game applies an ACT - the key's own rule (the rank: TalkRankAfterAct); a key with no
+   rule, or no value (kTalkerAbsent), is returned as it is. */
+inline int TalkTalkerAfterAct(int key, int v, int purse, const std::vector<int>& types, const std::vector<int>& values)
+{
+    if (v == kTalkerAbsent) return v;
+    if (key == kTalkerRank) return TalkRankAfterAct(v, purse, types, values);
+    return v;
+}
+
+/* T-898 review LOW-2: what a talk step's talker block does to the block kept for that talker. A CURSOR_ASK (a hover check about
+   any NPC) is used for that check only and, while a conversation with the talker is open here (talkerConvOpen), the kept block -
+   read for THAT conversation's NPC's faction - is put back after it; an ACT_RESULT is taken only when its own conversation
+   (its convId, from that game, with that talker) is still open here (ownConvOpen) - a late result of an earlier one changes
+   nothing; the others are taken. */
+const int kTalkerNoteSkip    = 0;   /* not taken: the kept block stays */
+const int kTalkerNoteTake    = 1;   /* taken: merged into / replacing the kept block */
+const int kTalkerNotePutBack = 2;   /* taken for this step only; the kept block is put back after it */
+inline int TalkTalkerNoteRule(int kind, int talkerConvOpen, int ownConvOpen)
+{
+    if (kind == kTalkCursorAsk) return talkerConvOpen ? kTalkerNotePutBack : kTalkerNoteTake;
+    if (kind == kTalkActResult) return ownConvOpen ? kTalkerNoteTake : kTalkerNoteSkip;
+    return kTalkerNoteTake;
+}
+
+/* T-898 review LOW-4: an ACT moved the kept rank before -> after when it was sent (the guess, TalkTalkerAfterAct); its ACT_RESULT
+   carries resultRank (kTalkerAbsent = none: the talker's game has no copy of the NPC, or its read failed). With no rank in the
+   result the guess is undone - the value to put back (before) is returned - but only while the kept rank is still the guess
+   (keptNow == after; a newer value, e.g. a later ACT's guess or an ANSWER's read, stays). A result that carries a rank has already
+   replaced the guess by the talker's own read (refused or not). kTalkerAbsent = nothing to undo. */
+inline int TalkTalkerUndoGuess(int before, int after, int keptNow, int resultRank)
+{
+    if (before < 0 || after < 0 || before == after) return kTalkerAbsent;   /* the ACT made no guess */
+    if (resultRank != kTalkerAbsent) return kTalkerAbsent;
+    if (keptNow != after) return kTalkerAbsent;
+    return before;
+}
 
 struct TalkMsg
 {
@@ -654,11 +764,13 @@ struct TalkMsg
     int endsType;                               /* P25: END - 1 TRADE / 11 CHARACTER_EDITOR: the talker's game opens that window */
     unsigned int carriedUid;                    /* ACT: the person the addressed character carries on the sender's game, 0 none */
     int purse;                                  /* REQUEST / ANSWER: the talker's purse on its own game, -1 unknown - the NPC's game answers its money condition with it */
+    int talker[kTalkerKeys];                    /* T-898 - REQUEST / ANSWER / CURSOR_ASK / ACT_RESULT: the talker block, by key (kTalkerAbsent = none) */
     std::vector<unsigned int> unrun;            /* END (game protocol 194, T-858 - talkrefund.h): the ACT seqs whose NPC-side part this end
                                                    leaves unrun; the talker's game refunds what it took for them. <= kTalkMaxUnrun */
     TalkMsg() : kind(0), convId(0), npcUid(0), targetUid(0), event(0), deadlineMs(0), result(0), index(-1), reason(0),
                 seq(0), detail(0), moneyBefore(-1), moneyAfter(-1), applied(0), unsupported(0), anyApplied(0),
-                reqId(0), why(0), endsType(0), carriedUid(0), purse(-1) {}
+                reqId(0), why(0), endsType(0), carriedUid(0), purse(-1)
+    { for (int k = 0; k < kTalkerKeys; ++k) talker[k] = kTalkerAbsent; }
 };
 
 inline const char* TalkKindName(int k)
@@ -783,6 +895,16 @@ inline bool TalkPutStr(std::vector<char>* b, const std::string& s, unsigned int 
     return true;
 }
 
+/* T-898: the talker block - u8 n | n x (u8 key | i32 value), the keys that hold a value. */
+inline void TalkPutTalker(std::vector<char>* b, const TalkMsg& m)
+{
+    unsigned int n = 0;
+    for (int k = 1; k < kTalkerKeys; ++k) if (m.talker[k] != kTalkerAbsent) ++n;
+    TalkPut8(b, n);
+    for (int k = 1; k < kTalkerKeys; ++k)
+        if (m.talker[k] != kTalkerAbsent) { TalkPut8(b, (unsigned int)k); TalkPut32(b, (unsigned int)m.talker[k]); }
+}
+
 /* false (and nothing appended) when the kind is unknown, a string is over its cap, a PROMPT has more than 10 replies, or its
    id and text lists differ in length. */
 inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
@@ -810,6 +932,7 @@ inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
         TalkPut32(&b, (unsigned int)m.index);
         if (!TalkPutStr(&b, m.replyId, kTalkMaxId)) return false;
         TalkPut32(&b, (unsigned int)m.purse);
+        TalkPutTalker(&b, m);   /* T-898: the talker block, last */
     }
     else if (m.kind == kTalkAct)   /* P26 stage 5 */
     {
@@ -851,6 +974,7 @@ inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
         TalkPut8(&b, (unsigned int)m.applied);
         TalkPut8(&b, (unsigned int)m.unsupported);
         TalkPut8(&b, (unsigned int)m.anyApplied);   /* P26s5 fold 1 */
+        TalkPutTalker(&b, m);   /* T-898: the talker block, last */
     }
     else if (m.kind == kTalkRequest)   /* P25 */
     {
@@ -858,13 +982,14 @@ inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
         TalkPut32(&b, m.reqId);
         TalkPut8(&b, (unsigned int)m.event);
         TalkPut32(&b, (unsigned int)m.purse);
+        TalkPutTalker(&b, m);   /* T-898: the talker block, last */
     }
     else if (m.kind == kTalkCursorAsk || m.kind == kTalkCursorAnswer)   /* T-737 */
     {
         if (m.reqId == 0 || m.npcUid == 0 || m.targetUid == 0) return false;
         if (m.kind == kTalkCursorAnswer && (m.result < 0 || m.result > kTalkCursorAnswerMax)) return false;
         TalkPut32(&b, m.reqId);
-        if (m.kind == kTalkCursorAsk) TalkPut32(&b, (unsigned int)m.purse);
+        if (m.kind == kTalkCursorAsk) { TalkPut32(&b, (unsigned int)m.purse); TalkPutTalker(&b, m); }   /* T-898: the talker block, last */
         else TalkPut8(&b, (unsigned int)m.result);
     }
     else
@@ -922,6 +1047,23 @@ inline bool TalkGetStr(TalkReader* r, std::string* s, unsigned int cap)
     return true;
 }
 
+/* T-898: the optional talker block - none left (an older sender's layout) = no values and true; part of one = Trunc, more than
+   kTalkMaxTalker entries = TooMany (false, r->err set); a key this build does not keep is read and skipped. */
+inline bool TalkGetTalker(TalkReader* r, TalkMsg* t)
+{
+    if (r->at >= r->n) return true;
+    unsigned int n = 0;
+    if (!TalkGet8(r, &n)) return false;
+    if (n > kTalkMaxTalker) { r->err = kTalkDecodeTooMany; return false; }
+    for (unsigned int i = 0; i < n; ++i)
+    {
+        unsigned int k = 0, v = 0;
+        if (!TalkGet8(r, &k) || !TalkGet32(r, &v)) return false;
+        if (k >= 1 && k < (unsigned int)kTalkerKeys) t->talker[k] = (int)v;
+    }
+    return true;
+}
+
 /* kTalkDecodeOk, or why not (and *m untouched). */
 inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
 {
@@ -963,6 +1105,7 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
         if (!TalkGetStr(&r, &t.replyId, kTalkMaxId)) return r.err;
         if (!TalkGet32(&r, &v)) return r.err;
         t.purse = (int)v;
+        if (!TalkGetTalker(&r, &t)) return r.err;   /* T-898 */
     }
     else if (t.kind == kTalkAct)   /* P26 stage 5 */
     {
@@ -1005,6 +1148,7 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
         if (!TalkGet32(&r, &t.seq) || !TalkGet8(&r, &a8) || !TalkGet16(&r, &d16) || !TalkGet32(&r, &mb) || !TalkGet32(&r, &ma)
             || !TalkGet8(&r, &ap) || !TalkGet8(&r, &un) || !TalkGet8(&r, &aa)) return r.err;
         t.anyApplied = (int)aa;
+        if (!TalkGetTalker(&r, &t)) return r.err;   /* T-898 */
         t.result = (int)a8; t.detail = (int)d16; t.moneyBefore = (int)mb; t.moneyAfter = (int)ma; t.applied = (int)ap; t.unsupported = (int)un;
     }
     else if (t.kind == kTalkRequest)   /* P25 */
@@ -1013,11 +1157,12 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
         t.event = (int)v;
         if (!TalkGet32(&r, &v)) return r.err;
         t.purse = (int)v;
+        if (!TalkGetTalker(&r, &t)) return r.err;   /* T-898 */
     }
     else if (t.kind == kTalkCursorAsk || t.kind == kTalkCursorAnswer)   /* T-737 */
     {
         if (!TalkGet32(&r, &t.reqId)) return r.err;
-        if (t.kind == kTalkCursorAsk) { if (!TalkGet32(&r, &v)) return r.err; t.purse = (int)v; }
+        if (t.kind == kTalkCursorAsk) { if (!TalkGet32(&r, &v)) return r.err; t.purse = (int)v; if (!TalkGetTalker(&r, &t)) return r.err; }   /* block: T-898 */
         else { if (!TalkGet8(&r, &v)) return r.err; t.result = (int)v; }
         if (t.reqId == 0 || t.npcUid == 0 || t.targetUid == 0 || (t.kind == kTalkCursorAnswer && t.result > kTalkCursorAnswerMax))
             return kTalkDecodeBadValue;

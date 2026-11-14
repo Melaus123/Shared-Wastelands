@@ -56,6 +56,7 @@
 #include "liveowner.h"        /* M7a A1 build 1 [a1b1-t0]: generations, receipts, ROSTER, the road to one game */
 #include "preload.h"         /* T-346 slice 1: the records before the load (world-server protocol 67, RECORD_FEED kinds 5-8) */
 #include "recordfeed.h"       /* T-313: the record feed (world-server protocol 63, RECORD_FEED 58) */
+#include "aoifilter.h"        /* T-1339: the forward filter (world-server protocol 153) */
 #include "pumpcarry.h"         /* the world-server link's carry and its MOVE collapse */
 #include "liveenvelope.h"     /* M5a (T-197 piece 4): the LIVE envelope, its routes and the relayed sender id */
 #include "ownerroute.h"       /* M7b slice 1 (T-197): a request to its target's owner, an answer back to its asker */
@@ -159,6 +160,7 @@
 #include <cmath>        /* T-189: std::sqrt, std::fabs */
 #include "getupcrawl.h"   /* T-178 crawl1 (H050): owner up / copy ready / MOVE drives a crawler */
 #include "copyjudge.h"   /* T-573: the copy judge held while the simulation is stopped; a given-up copy re-armed */
+#include "goalrefill.h"  /* T-918: the take gives the character its default goal set back */
 #include "sneakwire.h"    /* the owner's stealth mode in STATE bit 7, and what the copy's game does with it */
 #include "slotwire.h"      /* stand1: the per-slot stand-in names and the N-party zone owner swap */
 #include "copykeep.h"     /* copy1: a copy keeps its blood across the stats push; a refused kit item goes to its own section */
@@ -182,6 +184,7 @@
 #include "ownpick.h"      /* P105: an own pickup out of a container this game writes - its removal published at once */
 #include "wanderspawn.h"  /* T-1235: the [SPAWN] wander line - distances to every player's characters, the cap */
 #include "rcgive.h"       /* T-1079: a give made without the cursor - the drain's pairing by record and units */
+#include "undoarm.h"      /* T-1266: the cross-game undo's arm from live facts, and the fixed ending of a take neither sent nor undone */
 #include "showmove.h"     /* T-164 non-shop road: the show-at-once decisions */
 #include "ownerwire.h"    /* inv6: the stolen mark as an identity - the OWN1 block, the journal b2 fields, the D5-2 choice */
 #include "gearwire.h"     /* an item's uniform and crafter - the GEM1 block, the GEML tail, the journal b3 fields */
@@ -559,6 +562,8 @@ void t591_home_key_rides_the_v7_line();
 void t805b_player_house_and_cleared_home();
 void t755_copy_home_owed_and_load_override_keep();
 void t_b12_a_v6_index_line_upgrades_to_v7_with_seq_zero();
+void t_t1334_home_none_rehome_decide_and_load_order();
+void t_t1334_fold1_blank_runner_newer_owed_and_cleared_by();
 void t_b12b_a_seq_echo_applies_to_a_known_key_and_is_counted_for_an_unknown_one();
 void t_b12a_the_door_drain_is_unchanged_by_the_outage_queue();
 void t_b12c_a_zero_sequence_carries_no_information();
@@ -567,9 +572,7 @@ void t_b12c_the_own_ahead_mark_travels_in_the_journal_line();
 void t_b12c_only_state_families_supersede_and_the_cap_is_bounded();
 void t_t962_store_sock_could_arm_only_while_a_welcome_can_come();
 void t_b12e_a_down_link_with_a_server_configured_is_re_dialled();
-void t_b13_areaclaim_takes_every_arm_including_the_grace_boundary();
 void t_t592_frozen_area();
-void t_restored_claim_released_when_its_holder_loads();
 void t_b13_the_three_file_lines_round_trip_and_a_corrupt_line_is_dropped();
 void t_b13_a_known_id_gets_its_old_slot_even_when_a_new_id_dialled_first();
 void t_b13_the_playerid_survives_a_cfg_round_trip_and_a_v41_game_is_refused();
@@ -606,6 +609,7 @@ void t_t697_catchup_world_add();
 void t_t481_ground_catch_up_plan();
 void t_t481_ground_catch_up_rejoin();
 void t_p109_parity_pull();
+void t_t1268_box_wait();   /* T-1268 */
 
 /* suite_part2.cpp */
 void t_bag23_parity_box_packs();
@@ -671,6 +675,7 @@ void t_melee_decided_decide();
 void t_melee_decided_paced_and_counted();
 void t_p104_shot_wire();
 void t_t311_shot_reactions();
+void t_t1264_wound_stand_in();
 void t_slave1_slave_wire();
 void t_p11f6_slave_gate();
 void t_p11f5_chain_wire();
@@ -686,7 +691,10 @@ void t_copy1_keep_decisions();
 void t_copy3_animal_route();
 void t_t959_area_flag();
 void t_t1076_ring1_party();
-void t_t1077_area_assign_list();
+void t_t1261_holder_only();   /* T-1261 (owner decision 1531): only the named holder makes a town's people */
+void t_t1261_folds();   /* T-1261 review folds: the wake waits for the naming; set-aside work kept until another game's naming is confirmed */
+void t_t1285_area_charge();
+void t_t1268_holder_only();
 void t_t1077_player_sector_wire();
 void t_t1077_player_sector_list();
 void t_t1077_onareas_rows();
@@ -780,6 +788,8 @@ void t_t1242_books_hold();
 void t_t1242_books_holder();
 void t_t1242_books_owed();
 void t_t1242_books_wiring();
+void t_t1145_bounty_cond();
+void t_t1145_bounty_wiring();
 void t_p25f2_click_event_and_not_started_why();
 void t_t719_copy_own_end_action_every_branch();
 void t_t726_talk_order_log_due_outcome_and_nth();
@@ -889,8 +899,7 @@ void t_restore1a_world_guard();
 void t_crash2_copy_body_decide();
 void t_t500_ko_look_gate();
 void t_t293_human_class_by_vtable();
-void t_p5t_area_assign_ring1_lowest();
-void t_area2_fold_sweep_request_and_unconfirmed_lease();
+void t_area2_fold_sweep_request();
 void t_mmo6_ledger();
 void t_t251_overlay_window();
 void t_hb_cursor_quota_takes_elapsed_ms_not_ticks();
@@ -961,6 +970,10 @@ void t_m14_held_position_merge();
 void t_m14_held_merge_per_record_id();
 void t_lev343_keeper_aim();
 void t_t1389_keeper_form();
+void t_t1120_keeper_hold();   /* T-1120 */
+void t_t1120_stale_hold();   /* T-1120 shoptest stale */
+void t_t1120_stale_wiring();   /* T-1120 shoptest stale */
+void t_t1120_slot_follows_stub();   /* T-1120 fix 1: the open window's rebuild slot follows the jump stub */
 void t_b44_piece_recognition();
 void t_b44i_gate();
 void t_b5_caravan_holder();
@@ -1040,6 +1053,7 @@ void t_t164_show_road_decisions();
 void t_t338_ai_take_one_shows();
 void t_t969_take_access_gate();
 void t_t969_gate_decide();
+void t_t1199_owner_away();   /* T-1199: Owner only with the owner away - the gate table, the window move, the door, the call sites */
 void t_t338_f2_holder_split_absorbed();
 void t_t338_f3_absorb_moves_to_its_take();
 void t_shop_refusenext_answers_the_named_verdict();
@@ -1120,6 +1134,13 @@ void t_t1079_take_part_and_onto();
 void t_t1079_take_merged_last_unit();
 void t_t1079_take_merged_shift_click();
 void t_t1079_drag_merged_take();
+void t_t1266_revert_arm();
+void t_t1266_take_ending();
+void t_t1266_lower_published();
+void t_t1266_refund_and_fallback();
+void t_t1266_wiring();
+void t_t1266_undofail_lever();
+void t_t1266_undo_cell_rule();
 void t_t1079_give_merged_source_stays();
 void t_t1079_mismatch_back();
 void t_t1079_not_this_road();
@@ -1294,6 +1315,7 @@ void t_t346_want_rule();
 void t_t346_index_walk_pages();
 void t_t346_flow_fetches_exactly_the_newer();
 void t_t346_wait_exit_rule();
+void t_t1279_wait_rule(); void t_t1279f_refuse_restart_cap(); void t_t1279_refused_save_fault(); void t_t1279_answer_line();   /* T-1279 (owner 1580 a); T2290 */
 void t_t346f1_fetch_cut_by_bytes();
 void t_t346f1_position_only_not_current();
 void t_t313f1_gone_reaches_unsubscribed();
@@ -1533,6 +1555,10 @@ void t_t573_hold_shift_sec();
 void t_t573_shift_since();
 void t_t573_rearm_schedule();
 void t_t573_rearm_bound();
+void t_t918_goal_refill_queue();    /* T-918 fold 1: a take is queued once; a full queue refuses */
+void t_t918_goal_refill_decide();   /* T-918 fold 1: the safe point's decision - drop / keep / refill / retry / fail */
+void t_t918_goal_refill_retry();    /* T-918 fold 1: after the fill - done / fail / bounded retry, never run twice */
+void t_t918_goal_refill_wiring();   /* T-918: the setupAI rows, the take queues, the K2 safe point fills, the REPORT tokens */
 void t_t986_giveup_lift_rule();
 void t_t986_giveup_lift_moving_owner();
 void t_t986g_floor_judge_due();
@@ -1673,6 +1699,7 @@ void t_t702_treat_added_after_send();
 void t_t702_treat_source();
 void t_t677_talk_purse();
 void t_t677_purse_after_act();
+void t_t898_talk_rank();   /* T-898 */
 void t_t676_dup_report();
 void t_t599_pace_decide();
 void t_t599_pace_burst();
@@ -1960,6 +1987,21 @@ void t_t1061_lock_record();   /* T-1061: a chest's lock on its box record */
 void t_t1061_lock_rules();
 void t_t1061_lock_msg();
 void t_t1061_wiring();
+void t_t860_cage_record();
+void t_t860_cage_decide();
+void t_t860_cage_wiring();
+void t_t1333_bldg_record();   /* T-1333 */
+void t_t1333_bldg_decide();
+void t_t1333_bldg_wiring();
+void t_t1333_townhit_lever();   /* T-1333 TEST-ONLY buildtest townhit */
+void t_t1333_fold1();   /* T-1333 fold 1 (the review's A-E) */
+void t_t1333_door_health();   /* T-1333 fold 3 (owner 1083 a): a town door's health */
+void t_t1333_fold4();   /* T-1333 fold 4: the fold 3 review's MED 1 / LOW 2 / LOW 3 */
+void t_t1178_origin_spot();   /* T-1178: an own spot at the world origin is not a 'not held' answer */
+void t_t1333_fold2();   /* T-1333 fold 2 (the re-check: one road, kept hits per wall, laid after the lay) */
+void t_t1122_roller_rule();     /* T-1122 roller (owner 1577 c) */
+void t_t1122_roller_wiring();
+void t_t1122_roller_fold1();
 void t_t23_review_fold();   /* T-23 review fold */
 void t_t23_review_fold5();   /* T-23 review fold 5 */
 void t_t23_help_fix();   /* T-23 fix (T1963) */
@@ -1970,6 +2012,8 @@ void t_t1222_gate_answers();   /* T-1222: a rock opens for anyone; machines unde
 void t_t1222_wiring();   /* T-1222: the row, the detour's skip, the three gates */
 void t_t1222_left_open();   /* T-1222: a left click on a built rock the engine opened nothing for opens its window; nothing else does */
 void t_t1222_left_wiring();   /* T-1222: the two rows, the select virtual's hook, the order in the detour, the install, the report */
+void t_t1250_team_left_open();   /* T-1250: a left click on a built teammate's building opens its window; a move in it is no theft */
+void t_t1250_team_left_wiring();   /* T-1250: the detour hands non-node buildings to TeamLeftOpen; its order; the report; rcgive lclick */
 void t_t1222_steal_take();   /* T-1222: a rock's window against this player's own is no theft; every other pair keeps its answer */
 void t_t1222_claimskip_lever();   /* T-1222 TEST-ONLY claimskip: the claim skip is bypassed only while the DEV switch is off */
 void t_t1222_steal_wiring();   /* T-1222: the stealing decision's world-node rule before the kit table's early return, its counter */
@@ -1980,8 +2024,15 @@ void t_t1077_wiring();   /* T-1077: TcHover's copy filter, the NPC's game's full
 void t_t1187_hold_end();   /* T-1187: the end waits for any held line (as TkHoldEndFor calls it); which held lines a lost answer or a run that did not happen lists as unrun */
 void t_t1235_wander_line();   /* T-1235: the [SPAWN] wander line's distances, cap and wandering-call test, and its wiring in towngen.cpp */
 void t_t1235_keepaway();   /* T-1235 (owner 1478 b): a new wandering group kept 1382.4 on the ground from every live player character and out of other players' bases; the stale snapshot refuses; its wiring */
+void t_cursorjoin_confirm();   /* T-1122 (effort cursorjoin): `buildtest cursor .. commit` runs the placement confirm 0x4DA6F0's own steps (town pick 0x4D6300, region add, group step) before the commit, and leaves the list's state 2 */
 void t_t1240_cursor_commit();   /* T-1240: `buildtest cursor ... commit` - the commit word, the click's own refusal checks in its order (the engine's texts), the place-then-PlacementCommit wiring */
 void t_t1187_wiring();   /* T-1187: TkHoldEndFor's decision, the unrun list and cap drop through TalkHoldMayListUnrun, the fold-2 note, the held run's [TALK] line */
+void t_t1130_plainkind_lever();   /* T-1130 TEST-ONLY boxtest plainkind: the plan (shop, nobody's, no undos), the world server takes both kind changes, the arm's window */
+void t_t1130_kind_label();   /* T-1130: a nobody's box carries its undos whatever its label (kind 1 with them); the restock hold per home; the set-up stock without the kind */
+void t_t860_act_owed_table();   /* T-860 / T-859 (owner 1551 a): the owed table - newest per key, the new copy's binding, the cap */
+void t_t860_act_owed_cases();   /* T-860 fold 1: two opposite acts, a refusal, a may-pass re-asked, a region reload, the roster */
+void t_t860_act_owed_step();    /* T-860: settled / resent once / ended from the owner's STATEs, no clock */
+void t_t860_act_owed_wiring();  /* T-860: the note, the judge, the binding, the clears, the counter and line in the sources */
 void t_t1078_town_mismatch();   /* T-1078: the [BUILD] town mismatch decision, its link word, the session cap, once per piece per state; the line's sites in build.cpp */
 
 }   /* namespace suite */

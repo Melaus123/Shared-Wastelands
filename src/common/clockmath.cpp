@@ -432,5 +432,35 @@ void MenuPauseNoteWorldClosed(MenuPauseState* st)
     if (st == 0) return;
     st->menuSkipped = 0; st->buildSkipped = 0; st->voteHeld = 0; st->menuOpen = 0; st->talkOpen = 0;
 }
+int TimeSkipDecide(double localAbs, double sharedAbs, int joinJumpOwed, double hours, double maxAheadHours,
+                   double* targetAbs, int* day, float* hourOfDay)
+{
+    *targetAbs = localAbs; *day = -1; *hourOfDay = -1.0f;
+    if (!(hours > 0.0) || !(hours <= maxAheadHours)) return kSkipBadHours;
+    if (!(localAbs >= 0.0)) return kSkipNoClock;
+    if (joinJumpOwed) return kSkipJoinOwed;
+    {
+        const double t = localAbs + hours;
+        if (sharedAbs >= 0.0 && t - sharedAbs > maxAheadHours) return kSkipAheadBound;
+        int d = (int)(t / 24.0);
+        float h = (float)(t - (double)d * 24.0);
+        if (!(h >= 0.0f)) h = 0.0f;
+        if (!(h < 24.0f)) { ++d; h = 0.0f; }
+        *targetAbs = (double)d * 24.0 + (double)h; *day = d; *hourOfDay = h;
+    }
+    return kSkipOk;
+}
+const char* TimeSkipVerdictName(int v)
+{
+    switch (v)
+    {
+    case kSkipOk: return "ok";
+    case kSkipBadHours: return "hours must be above 0 and at most 22";
+    case kSkipNoClock: return "no world clock on this game";
+    case kSkipJoinOwed: return "this game has not taken the world's clock yet (join jump owed)";
+    case kSkipAheadBound: return "the clock would be more than 22 in-game hours ahead of the world's clock - wait for it to follow";
+    default: return "unknown";
+    }
+}
 
 }   /* namespace coopclock */

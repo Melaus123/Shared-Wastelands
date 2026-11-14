@@ -39,7 +39,7 @@ const unsigned int kMsgAuthChallenge = 65;   /* server -> game: nonce (16) | wor
 const unsigned int kMsgAuthProof     = 66;   /* game -> server: u8 has | world proof (32) | login proof (32) - 65 bytes */
 const unsigned int kMsgSteamId       = 67;   /* host's bridge -> server: token (32) | u64 Steam id, little-endian (8) - 40 bytes; id 0 = a bridged link whose id Steam did not check */
 /* 68 is unused: HOST_TOKEN, the host's own game's door pass by this hosting's secret, was removed in T-1158 step 7b (owner 1369 b) */
-const unsigned int kProtocol         = 145;   /* the world-server protocol that carries the three */
+const unsigned int kProtocol         = 153;   /* the world-server protocol that carries the three */
 
 
 

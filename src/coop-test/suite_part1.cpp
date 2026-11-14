@@ -2310,11 +2310,11 @@ void t_p97_announce_nomap_refuses_every_slot()
     const int slots[3] = { 0, 1, -1 };
     for (int si = 0; si < 3; ++si)
     {
-        const int a = coopor::AnnounceArea(-1);
+        const int a = coopor::AnnounceArea(-1, -1);
         if (a != coopor::kAnnounceNoMap) Fail("p97 announce: no map at slot " + I(slots[si]) + " answered " + I(a) + ", want skip (no-map)");
     }
-    if (coopor::AnnounceArea(0) != coopor::kAnnounceAdoptable) Fail("p97 announce: held 0 was not adoptable");
-    if (coopor::AnnounceArea(1) != coopor::kAnnounceOtherHeld) Fail("p97 announce: held 1 was not other-held");
+    if (coopor::AnnounceArea(0, 1) != coopor::kAnnounceAdoptable) Fail("p97 announce: held 0, named me - not adoptable");
+    if (coopor::AnnounceArea(1, 0) != coopor::kAnnounceOtherHeld) Fail("p97 announce: held 1 was not other-held");
 }
 
 
@@ -6540,6 +6540,91 @@ void t755_copy_home_owed_and_load_override_keep()
     if (coopstore::LoadOverrideHomeDecide(0, 0, 1) != coopstore::kLoHomeOweByKey) Fail("a squad homeless after the read with a known key was not owed by it");
     if (coopstore::LoadOverrideHomeDecide(0, 0, 0) != coopstore::kLoHomeNoneAnywhere) Fail("a squad with no home known anywhere was not said so");
 }
+/* T-1334: a town resident group's home is one fact on every game - "none" carried explicitly as "-", the re-home decision on a game
+   holding a live copy, and the load order (a record saying "-" gets no save home back; after a load the record's home is given over the
+   area file's raw residents link). */
+void t_t1334_home_none_rehome_decide_and_load_order()
+{
+    {   /* the record's none / key round trip: "-" is written as field 15 and read back as "-"; a key the same; MetaHomeKey reads "-" as no key */
+        coopstore::MetaLine m;
+        m.worldId = "W1"; m.writtenAt = 900; m.owner = 2; m.x = 10; m.y = 20; m.z = 30; m.squadSid = "sid"; m.factionName = "fac"; m.seq = 44;
+        const char* const homes[2] = { "-", "3384-TwoStorey.mod@21,31" };
+        for (int i = 0; i < 2; ++i)
+        {
+            m.home = homes[i];
+            std::string s; coopstore::MetaLine b;
+            if (!coopstore::MetaEncodeV7(m, &s)) { Fail("a v7 line with a home would not encode"); continue; }
+            if (!coopstore::MetaParse(s, &b) || b.home != m.home) Fail("a record's home did not round-trip (none as '-', or a key)");
+        }
+        if (!coopstore::MetaHomeKey("-").empty() || coopstore::MetaHomeKey("K").empty()) Fail("'-' must read as no key, a key as itself");
+        /* the old format: a v6 line carries no home and reads back as none known (not '-') - an old game's record never blanks a home */
+        m.home = "-";
+        std::string v6; coopstore::MetaLine b6;
+        if (!coopstore::MetaEncodeV6(m, &v6) || !coopstore::MetaParse(v6, &b6) || !b6.home.empty()) Fail("a v6 line read back a home");
+        if (coopstore::RecHomeState(b6.home) != coopstore::kRecHomeUnknown) Fail("an old line's missing home was read as a fact");
+        /* the merge: '-' replaces a key (the world server's plain merge), a write without a home keeps '-', the group's own live new home replaces it */
+        if (coopstore::MetaHomeMerge("K1", "-") != "-") Fail("'-' did not replace the old key");
+        if (coopstore::MetaHomeMerge("-", "") != "-") Fail("a write without a home erased '-'");
+        if (coopstore::MetaHomeNote("-", "K1", 1, -1) != "K1") Fail("the group's own live home (cleared key not kept) did not replace '-'");
+        if (coopstore::MetaHomeNote("-", "K1", 0, -1) != "-") Fail("another game's older key undid '-'");
+    }
+    if (coopstore::RecHomeState("") != coopstore::kRecHomeUnknown || coopstore::RecHomeState("-") != coopstore::kRecHomeNone || coopstore::RecHomeState("K") != coopstore::kRecHomeKey) Fail("RecHomeState");
+    /* the re-home decision: (isRunner, liveRead, sameKey, recordState, buildingLoaded, linkOther) */
+    for (int lr = -1; lr <= 1; ++lr)
+        for (int rs = 0; rs <= 2; ++rs)
+            if (coopstore::ReHomeDecide(1, lr, 0, rs, 1, 1) != coopstore::kReHomeRunner) Fail("the runner was re-homed - it is the source");
+    if (coopstore::ReHomeDecide(0, 1, 0, coopstore::kRecHomeKey, 1, 0) != coopstore::kReHomeMove) Fail("differs: a live K2 with record K3 was not moved");
+    if (coopstore::ReHomeDecide(0, 0, 0, coopstore::kRecHomeKey, 1, 0) != coopstore::kReHomeMove) Fail("differs: a live none with record K was not given it");
+    if (coopstore::ReHomeDecide(0, 1, 1, coopstore::kRecHomeKey, 1, 0) != coopstore::kReHomeNone) Fail("same: a live home equal to the record's was touched");
+    if (coopstore::ReHomeDecide(0, 1, 0, coopstore::kRecHomeKey, 0, 0) != coopstore::kReHomeMissing) Fail("missing building: not counted as missing");
+    if (coopstore::ReHomeDecide(0, 1, 1, coopstore::kRecHomeKey, 0, 1) != coopstore::kReHomeMissing) Fail("missing building after a load: not counted as missing");
+    if (coopstore::ReHomeDecide(0, 1, 0, coopstore::kRecHomeNone, 1, 0) != coopstore::kReHomeBlank) Fail("record '-' with a live home was not blanked");
+    if (coopstore::ReHomeDecide(0, 0, 0, coopstore::kRecHomeNone, 0, 0) != coopstore::kReHomeNone) Fail("record '-' with no live home was touched");
+    if (coopstore::ReHomeDecide(0, 1, 0, coopstore::kRecHomeUnknown, 1, 0) != coopstore::kReHomeNone) Fail("no home known: the live home was touched");
+    if (coopstore::ReHomeDecide(0, -1, 0, coopstore::kRecHomeKey, 1, 0) != coopstore::kReHomeNone) Fail("an unread live home was acted on");
+    /* the load order: after a load the record's home is given over the area file's raw link that names another group or none */
+    if (coopstore::ReHomeDecide(0, 1, 1, coopstore::kRecHomeKey, 1, 1) != coopstore::kReHomeMove) Fail("after a load the record's home was not given over the raw residents link");
+    if (coopstore::ReHomeDecide(0, 1, 1, coopstore::kRecHomeKey, 1, 0) != coopstore::kReHomeNone) Fail("after a load a building already naming the group was given again");
+    /* LOAD-OVERRIDE with a record that says '-': no save home back (the R1 revert road), anything else as before */
+    if (coopstore::LoadOverrideHomeDecideRec(0, 1, 0, 1) != coopstore::kLoHomeClearedNone) Fail("a record saying '-' got the save's own home back");
+    if (coopstore::LoadOverrideHomeDecideRec(0, 1, 0, 0) != coopstore::kLoHomeRestore) Fail("a record with a key lost the save-home restore");
+    if (coopstore::LoadOverrideHomeDecideRec(1, 1, 1, 1) != coopstore::kLoHomeKept) Fail("a squad with a home after the read was touched by the '-' rule");
+    if (coopstore::LoadOverrideHomeDecideRec(0, 0, 1, 0) != coopstore::kLoHomeOweByKey) Fail("the owe-by-key answer changed");
+}
+/* T-1334 fold 1 (t1334_fold1): MED 1 - a blank is listed for the "-" write only on the runner; MED 2 - a record's home moves live copies
+   only from a record newer than the one held; LOW 3 - a missing building or a failed move is owed (a player's house is not), and the
+   owed re-home's steps; LOW (the replaced key) - the game that wrote "-" may name the replaced building again, others may not. */
+void t_t1334_fold1_blank_runner_newer_owed_and_cleared_by()
+{
+    /* MED 1 */
+    if (coopstore::HomeBlankListed(1, 1) != 1) Fail("the runner's blank was not listed for its '-' write");
+    if (coopstore::HomeBlankListed(1, 0) != 0) Fail("a non-runner's blank was listed - it never writes the group, so the entry would outlive it");
+    if (coopstore::HomeBlankListed(0, 1) != 0) Fail("an unbound squad's blank was listed");
+    /* MED 2 */
+    if (coopstore::RecHomeArrive(0, 0, 5) != coopstore::kRecHomeArriveTake) Fail("a record with none held did not take its home");
+    if (coopstore::RecHomeArrive(1, 100, 101) != coopstore::kRecHomeArriveTake) Fail("a newer record did not move live copies");
+    if (coopstore::RecHomeArrive(1, 100, 100) != coopstore::kRecHomeArriveNote) Fail("a same-stamp record must note only");
+    if (coopstore::RecHomeArrive(1, 100, 99) != coopstore::kRecHomeArriveSkip) Fail("an older record's home was noted - it would move live copies");
+    /* LOW 3 */
+    if (coopstore::ReHomeOwes(coopstore::kReHomeMissing, 0) != 1) Fail("a re-home whose building is not loaded was dropped, not owed");
+    if (coopstore::ReHomeOwes(coopstore::kReHomeMove, 0) != 1 || coopstore::ReHomeOwes(coopstore::kReHomeMove, 3) != 1) Fail("a failed move was dropped, not owed");
+    if (coopstore::ReHomeOwes(coopstore::kReHomeMove, 1) != 0 || coopstore::ReHomeOwes(coopstore::kReHomeMove, 2) != 0) Fail("a move that took was owed");
+    if (coopstore::ReHomeOwes(coopstore::kReHomeMove, coopstore::kGiveHomePlayerHouse) != 0) Fail("a player's house refusal was owed - it is a final answer");
+    if (coopstore::ReHomeOwes(coopstore::kReHomeBlank, 0) != 0 || coopstore::ReHomeOwes(coopstore::kReHomeNone, 0) != 0 || coopstore::ReHomeOwes(coopstore::kReHomeRunner, 0) != 0) Fail("a non-move was owed");
+    if (coopstore::ReHomeOwedStep(0, 1, 0, 0, 1) != coopstore::kReOwedDrop) Fail("owed: an unbound squad was not dropped");
+    if (coopstore::ReHomeOwedStep(1, 0, 0, 0, 1) != coopstore::kReOwedRecheck) Fail("owed: a record no longer naming a building was not handed back");
+    if (coopstore::ReHomeOwedStep(1, 1, 1, 0, 1) != coopstore::kReOwedRecheck) Fail("owed: this game runs the group now - it must not move it");
+    if (coopstore::ReHomeOwedStep(1, 1, 0, 1, 0) != coopstore::kReOwedDone) Fail("owed: a live home equal to the record's was not done");
+    if (coopstore::ReHomeOwedStep(1, 1, 0, 0, 0) != coopstore::kReOwedWait) Fail("owed: a building not loaded did not wait");
+    if (coopstore::ReHomeOwedStep(1, 1, 0, 0, 1) != coopstore::kReOwedGive) Fail("owed: a loaded building was not moved to");
+    /* LOW (the replaced key): writer and receivers keep the same state */
+    if (coopstore::MetaHomeNote("-", "K1", 1, 1, 1) != "K1") Fail("the writer's own live return to the replaced building was refused");
+    if (coopstore::MetaHomeNote("-", "K1", 0, 1, 1) != "K1") Fail("a receiver refused the '-' writer's newer record naming the replaced building");
+    if (coopstore::MetaHomeNote("-", "K1", 0, 1, 0) != "-") Fail("another game naming the replaced building undid '-'");
+    if (coopstore::MetaHomeNote("-", "K1", 1, 1, 0) != "-") Fail("a live home naming the replaced building on a game that did not write '-' undid it");
+    if (coopstore::MetaHomeNote("-", "K9", 0, 0, 0) != "K9") Fail("a key naming another building did not replace '-'");
+    if (coopstore::MetaHomeNote("-", "", 0, 1, 1) != "-" || coopstore::MetaHomeNote("-", "-", 0, 1, 1) != "-") Fail("byClearer with no key changed '-'");
+}
 void t_b12_a_v6_index_line_upgrades_to_v7_with_seq_zero()
 {
     coopstore::MetaLine m;
@@ -6832,40 +6917,6 @@ void t_b12e_a_down_link_with_a_server_configured_is_re_dialled()
  * other game's replayed move was then refused as a collision by the game the relay had just named the
  * writer. Every decision below is the same source the relay compiles; every input here is a literal.
  */
-void t_b13_areaclaim_takes_every_arm_including_the_grace_boundary()
-{
-    const double grace = 60.0, lease = 10.0;
-
-    /* The owner is the one reporting: it is back, and nothing else is asked. */
-    if (coopstore::AreaClaimDecide(1, 999.0, 1, grace, lease) != coopstore::kAreaKeep)
-        Fail("a reporting owner must KEEP its area whatever it has been silent for (silent 999, reporterIsOwner 1)");
-    if (coopstore::AreaClaimDecide(0, 999.0, 1, grace, lease) != coopstore::kAreaKeep)
-        Fail("a restored owner that has just reported must KEEP its area (silent 999, reporterIsOwner 1)");
-
-    /* Restored, the owner has NOT dialled back in: the restore grace stands, not the 10 s lease. This is the
-       row that fails on the pre-B13 behaviour, where every area was 'first there' at the restart. */
-    if (coopstore::AreaClaimDecide(0, 30.0, 0, grace, lease) != coopstore::kAreaKeep)
-        Fail("a restored claim 30 s into a 60 s grace must KEEP even though another game is reporting it");
-    if (coopstore::AreaClaimDecide(0, 60.0, 0, grace, lease) != coopstore::kAreaKeep)
-        Fail("the grace BOUNDARY itself keeps: a claim is lost PAST the grace, not AT it (silent 60, grace 60)");
-    if (coopstore::AreaClaimDecide(0, 60.001, 0, grace, lease) != coopstore::kAreaTransfer)
-        Fail("past the restore grace with another game reporting, the area must TRANSFER (silent 60.001, grace 60)");
-    if (coopstore::AreaClaimDecide(0, 60.001, -1, grace, lease) != coopstore::kAreaRelease)
-        Fail("past the restore grace with NOBODY reporting, the area must be RELEASED (silent 60.001, grace 60)");
-
-    /* The owner is live again: the ordinary 10 s silence lease applies and the 60 s grace is over with. */
-    if (coopstore::AreaClaimDecide(1, 9.5, 0, grace, lease) != coopstore::kAreaKeep)
-        Fail("a live owner silent 9.5 s of a 10 s lease must KEEP");
-    if (coopstore::AreaClaimDecide(1, 10.0, 0, grace, lease) != coopstore::kAreaKeep)
-        Fail("the lease BOUNDARY itself keeps (silent 10, lease 10)");
-    if (coopstore::AreaClaimDecide(1, 10.5, 0, grace, lease) != coopstore::kAreaTransfer)
-        Fail("a live owner silent past its 10 s lease loses the area to a current reporter (silent 10.5)");
-    if (coopstore::AreaClaimDecide(1, 10.5, -1, grace, lease) != coopstore::kAreaRelease)
-        Fail("a live owner silent past its lease with nobody reporting releases the area (silent 10.5)");
-    if (coopstore::AreaClaimDecide(1, 45.0, 0, grace, lease) != coopstore::kAreaTransfer)
-        Fail("a LIVE owner does not get the restore grace: 45 s of silence is past its 10 s lease");
-}
-
 /* An area the map names for a player who is not in the world is FROZEN on every other game: nothing is created, adopted, woken,
    loaded from a record, written or removed there. The shape of the live report: slot 1's restored claim on the town's area stood
    while slot 1 re-dialled, and the other game removed its people there in favour of slot 1's world. Before the change the five
@@ -6882,16 +6933,17 @@ void t_t592_frozen_area()
     if (AreaFrozenDecide(0, -1, 1, 0) != 1 || AreaFrozenDecide(0, -1, 1, 1) != 0) Fail("no slot of my own: slot 0 is another player like any other");
     if (coopdrop::kAreaFrozen != -2) Fail("frozen is -2: below 0, so every '== 1', '!= 1' and '< 0' test reads it as no answer");
     /* the deciders refuse on frozen; their -1 answers are unchanged */
-    if (coopor::AnnounceArea(-2) != coopor::kAnnounceNoMap) Fail("announce sweep, frozen area: no adoption");
+    if (coopor::AnnounceArea(-2, -2) != coopor::kAnnounceNoMap) Fail("announce sweep, frozen area: no adoption");
     { coopor::Seen s = coopor::SeenNone(); s.areaOther = -2; int why = -1; if (coopor::Decide(s, &why) != coopor::kActNone) Fail("orphan clean-up, frozen area: nobody removed"); }
     if (coopsquad::NpcWakeSkipLoad(1, -2) != 1) Fail("wake in a frozen area: the record is not loaded");
     if (coopsquad::NpcWakeSkipLoad(1, -1) != 0) Fail("wake with no fresh map: the record applies as before");
     if (coopsquad::NpcWakeSkipLoad(0, -2) != 0) Fail("not a world NPC squad: the record applies");
-    if (coopsquad::HandedOverWakeRefuse(1, -2, 1) != 1) Fail("a handed-over world squad in a frozen area: its wake is refused");
-    if (coopsquad::HandedOverWakeRefuse(1, -2, 0) != 0) Fail("a player / peer / stand-in squad: never refused");
-    if (coopsquad::HandedOverWakeRefuse(0, -2, 1) != 0) Fail("not handed over: woken");
-    if (coopsquad::HandedOverWakeRefuse(1, -1, 1) != 0) Fail("no fresh map: woken as before");
-    if (coopsquad::HandedOverSweepAction(1, 0, -2) != coopsquad::kHoSweepSkip) Fail("handed-over sweep, frozen area: not adopted");
+    /* T-1318 design 1: the given squad's wake and sweep no longer ask the area's holder - frozen or not, the same verdict */
+    if (coopsquad::HandedOverWakeRefuse(1, 1) != 1) Fail("a handed-over world squad (a frozen area or any other): its wake is refused");
+    if (coopsquad::HandedOverWakeRefuse(1, 0) != 0) Fail("a player / peer / stand-in squad: never refused");
+    if (coopsquad::HandedOverWakeRefuse(0, 1) != 0) Fail("not handed over: woken");
+    if (coopsquad::GivenBlocksOwnWake(1, -2) != 0) Fail("a frozen area: the area rule refused it too - not counted as a given entry blocking this game's wake");
+    if (coopsquad::HandedOverSweepAction(1) != coopsquad::kHoSweepSkip) Fail("handed-over sweep, frozen area: not adopted");
     if (coopsquad::OwnBlockRecvHold(0, 1, 0, -2, 1) != 1) Fail("another game's record of my squad in a frozen area: left asleep");
     if (coopsquad::OwnBlockRecvHold(0, 1, 0, -2, 0) != 0) Fail("not a world faction's squad: the ordinary path");
     if (coopsquad::OwnBlockRecvHold(0, 0, 0, -2, 1) != 0) Fail("my own record: the ordinary path");
@@ -6900,19 +6952,6 @@ void t_t592_frozen_area()
         Fail("frozen area, none of the people is mine: never written here");
     if (coopsquad::NpcSquadWriter(1, 1, -2, -2, 3, 0, 0) != coopsquad::kNpcWriteToday) Fail("frozen area, I run some of the people: the block and member rules decide");
     if (coopsquad::NpcSquadWriter(1, 1, -1, -1, 0, 0, 0) != coopsquad::kNpcWriteToday) Fail("no fresh map, none mine: today's rules as before");
-}
-
-/* A restored holder that says LOADING releases its restored claims, and nothing else does. */
-void t_restored_claim_released_when_its_holder_loads()
-{
-    if (coopstore::RestoredClaimOnStageDecide(1, 1, 1) != coopstore::kAreaRelease)
-        Fail("a restored claim whose holder says LOADING must be RELEASED");
-    if (coopstore::RestoredClaimOnStageDecide(1, 1, 0) != coopstore::kAreaKeep)
-        Fail("a restored claim whose holder says IN_WORLD (a re-dial with its world running) must be KEPT");
-    if (coopstore::RestoredClaimOnStageDecide(0, 1, 1) != coopstore::kAreaKeep)
-        Fail("another player's LOADING must not release this row");
-    if (coopstore::RestoredClaimOnStageDecide(1, 0, 1) != coopstore::kAreaKeep)
-        Fail("a live (not restored) claim is left to the lease, not released at a LOADING");
 }
 
 void t_b13_the_three_file_lines_round_trip_and_a_corrupt_line_is_dropped()
@@ -8579,12 +8618,10 @@ void t_p109_parity_pull()
     if (cooppar::ParityAskerForget(-1, 4) != 1) Fail("a departure whose slot is not known ends every record");
     if (cooppar::ParityAskerForget(3, -1) != 1) Fail("a record whose slot was not known ends with any departure");
     /* R3: the mark */
-    if (cooppar::ParitySectorMark(0, 0, 1, 0) != 1) Fail("an arrival held by the other game marks");
-    if (cooppar::ParitySectorMark(0, 0, 0, 0) != 0) Fail("an arrival this game holds (or nobody holds) does not mark");
-    if (cooppar::ParitySectorMark(0, 0, 0, 1) != 1) Fail("a gave-up arrival marks (R3: the asker keeps its own copy)");
-    if (cooppar::ParitySectorMark(0, 1, 1, 0) != 0 || cooppar::ParitySectorMark(0, 1, 0, 1) != 0)
-        Fail("a sector this game had as its own keeps its trust when it returns as the non-holder");
-    if (cooppar::ParitySectorMark(1, 0, 0, 0) != 1 || cooppar::ParitySectorMark(1, 1, 0, 0) != 1) Fail("a mark is kept for the world");
+    if (cooppar::ParitySectorMark(0, 0, 1) != 1) Fail("an arrival held by the other game marks");
+    if (cooppar::ParitySectorMark(0, 0, 0) != 0) Fail("an arrival this game holds does not mark");
+    if (cooppar::ParitySectorMark(0, 1, 1) != 0) Fail("a sector this game had as its own keeps its trust when it returns as the non-holder");
+    if (cooppar::ParitySectorMark(1, 0, 0) != 1 || cooppar::ParitySectorMark(1, 1, 0) != 1) Fail("a mark is kept for the world");
     if (cooppar::ParitySectorOwned(0, 0, 1) != 1) Fail("an arrival as the holder owns the sector");
     if (cooppar::ParitySectorOwned(0, 1, 1) != 0) Fail("holding a sector after it was marked never makes its copies real");
     if (cooppar::ParitySectorOwned(1, 1, 0) != 1 || cooppar::ParitySectorOwned(0, 0, 0) != 0) Fail("owned is kept; not owned without a holding arrival");
@@ -8593,18 +8630,175 @@ void t_p109_parity_pull()
     if (cooppar::ParityPullSector(1, 1, 1, 1) != 0) Fail("once per holding");
     if (cooppar::ParityPullSector(1, 1, 0, 0) != 0 || cooppar::ParityPullSector(0, 1, 0, 1) != 0 || cooppar::ParityPullSector(1, 0, 0, 1) != 0)
         Fail("no pull while held elsewhere, for an unmarked sector, or for one not loaded");
-    /* fold 1 (F2): a gave-up mark is cleared only while this game holds the sector alone (fresh map, nobody else loaded) */
-    if (cooppar::ParityGaveUpClears(1, 1, 0) != 1) Fail("a gave-up mark is cleared while this game holds the sector alone");
-    if (cooppar::ParityGaveUpClears(1, 1, 1) != 0 || cooppar::ParityGaveUpClears(1, 1, -1) != 0)
-        Fail("another game loaded there, or no fresh map, keeps the mark");
-    if (cooppar::ParityGaveUpClears(1, 0, 0) != 0 || cooppar::ParityGaveUpClears(0, 1, 0) != 0)
-        Fail("not holding keeps it; a held-verdict mark is never cleared");
-    {   /* fold 1b (manager ruling revised): a cleared gave-up mark leaves the sector unmarked and NOT owned (the plugin's clear
-           touches only the mark), so a later arrival held elsewhere marks it again, and only a later holding arrival owns it */
-        const int ownedAfterClear = 0, markedAfterClear = 0;
-        if (cooppar::ParitySectorMark(markedAfterClear, ownedAfterClear, 1, 0) != 1) Fail("a cleared gave-up mark gives no trust: a held arrival marks again");
-        if (cooppar::ParitySectorOwned(ownedAfterClear, markedAfterClear, 1) != 1) Fail("a later holding arrival owns the cleared sector by the normal rule");
+}
+
+/* T-1268 (F1053, decision 1563 a / 1556): the named holder's copy is the one source for a box changed in the wait */
+void t_t1268_box_wait()
+{
+    /* (1) the wait list: a box is listed once; past the cap it is refused (counted) */
+    if (cooppar::WaitBoxAdd(0, 0, 4) != cooppar::kWaitBoxAdded) Fail("t1268: a box changed while nobody is named is listed");
+    if (cooppar::WaitBoxAdd(1, 3, 4) != cooppar::kWaitBoxAlready) Fail("t1268: a listed box is not listed twice");
+    if (cooppar::WaitBoxAdd(0, 4, 4) != cooppar::kWaitBoxFull) Fail("t1268: past the cap a box is refused (counted full)");
+    if (cooppar::WaitBoxAdd(1, 4, 4) != cooppar::kWaitBoxAlready) Fail("t1268: a listed box at the cap is already there, not refused");
+    /* (1) the drain on a new area map, read live: holder -> push; another game -> re-ask (its answer replaces ours); nobody -> stays */
+    if (cooppar::WaitBoxAction(0, 1, 1, 1, 0) != cooppar::kWaitBoxPush) Fail("t1268: this game named the holder - the box's whole contents are pushed");
+    if (cooppar::WaitBoxAction(0, 1, 1, 0, 1) != cooppar::kWaitBoxReask) Fail("t1268: another game named the holder - it is asked (its copy replaces this one)");
+    if (cooppar::WaitBoxAction(0, 1, 0, 0, 0) != cooppar::kWaitBoxKeep) Fail("t1268: still nobody named - the box stays listed");
+    if (cooppar::WaitBoxAction(0, 1, 0, 1, 0) != cooppar::kWaitBoxKeep || cooppar::WaitBoxAction(0, 1, 0, 0, 1) != cooppar::kWaitBoxKeep)
+        Fail("t1268: an unsettled verdict (loading, no answer) keeps the box whatever else reads");
+    if (cooppar::WaitBoxAction(0, 0, 1, 1, 0) != cooppar::kWaitBoxForget || cooppar::WaitBoxAction(0, 0, 0, 0, 0) != cooppar::kWaitBoxForget)
+        Fail("t1268: a box that no longer resolves leaves the list");
+    if (cooppar::WaitBoxAction(0, 1, 1, 0, 0) != cooppar::kWaitBoxForget) Fail("t1268: a settled verdict that is neither (the area going) leaves the list");
+    /* fold (review LOW 5): loading is read before the box - a box not found while its area loads stays listed */
+    if (cooppar::WaitBoxAction(1, 0, 0, 0, 0) != cooppar::kWaitBoxKeep || cooppar::WaitBoxAction(1, 1, 1, 1, 0) != cooppar::kWaitBoxKeep)
+        Fail("t1268 fold: while the area loads every listed box stays, found or not");
+    /* (2) an arrival that waits past the limit is said once and keeps waiting; it is never marked by the wait */
+    const int lim = 3600;
+    if (cooppar::ParityArrivalStep(0, lim, lim, 0) != cooppar::kParityArrWait) Fail("t1268: inside the limit an unsettled arrival waits");
+    if (cooppar::ParityArrivalStep(0, lim + 1, lim, 0) != cooppar::kParityArrWaitLong) Fail("t1268: past the limit the wait is said once");
+    if (cooppar::ParityArrivalStep(0, lim + 500, lim, 1) != cooppar::kParityArrWait) Fail("t1268: once said, the arrival keeps waiting (no end, no mark)");
+    if (cooppar::ParityArrivalStep(1, lim + 500, lim, 1) != cooppar::kParityArrDecide || cooppar::ParityArrivalStep(1, 0, lim, 0) != cooppar::kParityArrDecide)
+        Fail("t1268: a settled verdict decides, however long the wait was");
+    {   /* the long wait never marks: after it, the real naming decides by the normal rule (decision 1556) */
+        const int owned = cooppar::ParitySectorOwned(0, 0, 1);
+        if (cooppar::ParitySectorMark(0, owned, 0) != 0 || owned != 1) Fail("t1268: named this game's after a long wait - owned, not marked");
+        if (cooppar::ParitySectorMark(0, cooppar::ParitySectorOwned(0, 0, 0), 1) != 1) Fail("t1268: named another game's after a long wait - marked by the held rule only");
     }
+    /* (3) the pull's target is never this game */
+    {
+        const int me = 0;
+        const int slots[3] = { 0, 1, 2 };
+        const int bitsBoth[3] = { 1, 1, 0 };
+        const int bitsMeOnly[3] = { 1, 0, 0 };
+        const int bitsThird[3] = { 1, 0, 1 };
+        /* refusal: the game that asked */
+        if (cooppar::ParityPullTarget(1, me, slots, bitsMeOnly, 3, 1) != 1) Fail("t1268: a refusal pull goes to the game that asked");
+        if (cooppar::ParityPullTarget(2, me, slots, bitsBoth, 3, 0) != 2) Fail("t1268: a refusal pull goes to the asker even with a stale map");
+        if (cooppar::ParityPullTarget(me, me, slots, bitsBoth, 3, 1) != 1) Fail("t1268: an asker that reads as this game is never the target");
+        /* start of holding: another game the fresh map shows there */
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsBoth, 3, 1) != 1) Fail("t1268: a holding pull goes to another game with the area loaded");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsThird, 3, 1) != 2) Fail("t1268: a holding pull skips games without the area loaded");
+        /* no other game */
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsMeOnly, 3, 1) != cooppar::kParityPullNoTarget) Fail("t1268: alone there - no target, never this game");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsBoth, 0, 1) != cooppar::kParityPullNoTarget) Fail("t1268: no seated row - no target");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsBoth, 3, 0) != cooppar::kParityPullMapStale
+            || cooppar::ParityPullTarget(-1, me, slots, bitsBoth, 3, -1) != cooppar::kParityPullMapStale)
+            Fail("t1268: a stale map chooses nothing now (asked again)");
+        if (cooppar::ParityPullTarget(-1, -1, slots, bitsBoth, 3, 1) != cooppar::kParityPullMapStale
+            || cooppar::ParityPullTarget(1, -1, slots, bitsBoth, 3, 1) != cooppar::kParityPullMapStale)
+            Fail("t1268: this game's own slot not known - no target can be told from itself");
+        for (int a = -1; a < 3; ++a)
+            for (int f = -1; f < 2; ++f)
+            {
+                const int t1 = cooppar::ParityPullTarget(a, me, slots, bitsBoth, 3, f), t2 = cooppar::ParityPullTarget(a, me, slots, bitsMeOnly, 3, f);
+                if (t1 == me || t2 == me) Fail("t1268: a pull is never addressed to this game");
+            }
+    }
+    /* fold (review LOW 8): which verdicts are settled - the arrival wait and the wait-list drain read the same rule */
+    if (cooppar::ParityVerdictSettled(0, 0, 0, 0) != 1) Fail("t1268 fold: a named holder (or the area going) is settled");
+    if (cooppar::ParityVerdictSettled(1, 0, 0, 0) != 0 || cooppar::ParityVerdictSettled(0, 1, 0, 0) != 0
+        || cooppar::ParityVerdictSettled(0, 0, 1, 0) != 0 || cooppar::ParityVerdictSettled(0, 0, 0, 1) != 0)
+        Fail("t1268 fold: loading, nobody named, no answer and no notebook are not settled");
+    if (cooppar::ParityArrivalStep(cooppar::ParityVerdictSettled(0, 0, 1, 0), 5, 3600, 0) != cooppar::kParityArrWait)
+        Fail("t1268 fold: an arrival with no answer waits (never decides from a stale map)");
+    /* fold (review LOW 8): push vs re-ask vs replace - the drain's whole path, from the verdict to what the answer does */
+    {
+        const int mineAct = cooppar::WaitBoxAction(0, 1, cooppar::ParityVerdictSettled(0, 0, 0, 0), 1, 0);
+        const int heldAct = cooppar::WaitBoxAction(0, 1, cooppar::ParityVerdictSettled(0, 0, 0, 0), 0, 1);
+        const int noAnsAct = cooppar::WaitBoxAction(0, 1, cooppar::ParityVerdictSettled(0, 0, 1, 0), 0, 0);
+        if (mineAct != cooppar::kWaitBoxPush || heldAct != cooppar::kWaitBoxReask || noAnsAct != cooppar::kWaitBoxKeep)
+            Fail("t1268 fold: named mine -> push, named another -> re-ask, no answer -> stays");
+        /* the re-ask's answer REPLACES this copy on the non-holder (writerMine 0); on a game that became the holder meanwhile its copy stands */
+        if (cooppar::ParityApplyOverOwn(0, 0) != 1) Fail("t1268 fold: the named holder's answer replaces the non-holder's copy (decision 1563 a)");
+        if (cooppar::ParityApplyOverOwn(1, 0) != 0) Fail("t1268 fold: a game named holder meanwhile keeps its own copy");
+    }
+    /* fold (review MED 2): a fill push that waits past the limit goes on the wait list, never dropped */
+    if (cooppar::FillWaitStep(3600, 3600) != cooppar::kFillWaitKeep || cooppar::FillWaitStep(3601, 3600) != cooppar::kFillWaitList)
+        Fail("t1268 fold: inside the limit a fill push waits; past it the box is listed (the next area map decides it)");
+    /* fold (review MED 3 / LOW 4): the next game after a refusal or a lost pull; each game at most once per need; a game out of the world never */
+    {
+        const int me = 0;
+        const int slots[4] = { 0, 1, 2, 3 };
+        const int bitsAll[4] = { 1, 1, 1, 1 };
+        const int goneNone[4] = { 0, 0, 0, 0 };
+        const int gone1[4] = { 0, 1, 0, 0 };
+        const int tried1[1] = { 1 };
+        const int tried12[2] = { 1, 2 };
+        const int tried123[3] = { 1, 2, 3 };
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsAll, 4, 1, goneNone, 0, 0, 0) != 1) Fail("t1268 fold: the first other loaded game first");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsAll, 4, 1, goneNone, tried1, 1, 0) != 2) Fail("t1268 fold: after slot 1 refused, slot 2 is asked");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsAll, 4, 1, goneNone, tried12, 2, 0) != 3) Fail("t1268 fold: then slot 3");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsAll, 4, 1, goneNone, tried123, 3, 0) != cooppar::kParityPullAllTried)
+            Fail("t1268 fold: every game asked once - the need ends (allTried), no loop");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsAll, 4, 1, gone1, 0, 0, 0) != 2) Fail("t1268 fold: a game the roster shows gone is never chosen, whatever the map says");
+        if (cooppar::ParityPullTarget(1, me, slots, bitsAll, 4, 1, goneNone, tried1, 1, 0) != 2) Fail("t1268 fold: a refused asker is not asked again for the same need");
+        if (cooppar::ParityPullTarget(1, me, slots, bitsAll, 4, 1, gone1, 0, 0, 1) != 2) Fail("t1268 fold: an asker that left is not asked");
+        if (cooppar::ParityPullTarget(-1, me, slots, bitsAll, 4, 0, goneNone, tried1, 1, 0) != cooppar::kParityPullMapStale)
+            Fail("t1268 fold: a stale map chooses nothing now - the need waits for the next map");
+        /* bounded: walking the needs refuses at most once per game, never this game */
+        int triedRun[4]; int nRun = 0; int guard = 0;
+        for (;;)
+        {
+            const int t = cooppar::ParityPullTarget(-1, me, slots, bitsAll, 4, 1, goneNone, triedRun, nRun, 0);
+            if (t < 0) { if (t != cooppar::kParityPullAllTried) Fail("t1268 fold: a walk of refusals ends allTried"); break; }
+            if (t == me || cooppar::ParityPullSlotIn(t, triedRun, nRun) != 0) { Fail("t1268 fold: a game asked twice, or this game asked"); break; }
+            triedRun[nRun++] = t;
+            if (++guard > 4) { Fail("t1268 fold: the walk did not end"); break; }
+        }
+        if (nRun != 3) Fail("t1268 fold: the walk asks each other game once");
+    }
+    /* fold (review MED 3 / LOW 4): a pull still wanted after a refusal or a loss */
+    if (cooppar::ParityPullRetryAction(0, 1, 1, 1, 1) != cooppar::kParityPullRetryPull) Fail("t1268 fold: still this game's and untrusted - ask the next game");
+    if (cooppar::ParityPullRetryAction(1, 0, 0, 0, 0) != cooppar::kParityPullRetryKeep || cooppar::ParityPullRetryAction(0, 1, 0, 0, 0) != cooppar::kParityPullRetryKeep)
+        Fail("t1268 fold: loading, or nobody named now - kept for the next map");
+    if (cooppar::ParityPullRetryAction(0, 0, 1, 0, 0) != cooppar::kParityPullRetryEnd || cooppar::ParityPullRetryAction(0, 1, 1, 0, 1) != cooppar::kParityPullRetryEnd
+        || cooppar::ParityPullRetryAction(0, 1, 1, 1, 0) != cooppar::kParityPullRetryEnd)
+        Fail("t1268 fold: the box gone, held by another game now, or received - the pull ends");
+    /* fold 2 (re-check NEW LOW): a retried need that meets this game's owed hand-back stays listed; in flight / asked / ended do not */
+    if (cooppar::ParityPullNeedStays(cooppar::kParityPullOwed) != 1) Fail("t1268 fold 2: an owed hand-back keeps the need listed (not dropped as busy)");
+    if (cooppar::kParityPullOwed == cooppar::kParityPullBusy) Fail("t1268 fold 2: owed has its own code");
+    if (cooppar::ParityPullNeedStays(cooppar::kParityPullMapStale) != 1 || cooppar::ParityPullNeedStays(cooppar::kParityPullNotOut) != 1)
+        Fail("t1268 fold 2: map stale and not out stay listed");
+    if (cooppar::ParityPullNeedStays(cooppar::kParityPullSent) != 0 || cooppar::ParityPullNeedStays(cooppar::kParityPullBusy) != 0
+        || cooppar::ParityPullNeedStays(cooppar::kParityPullNoTarget) != 0 || cooppar::ParityPullNeedStays(cooppar::kParityPullAllTried) != 0)
+        Fail("t1268 fold 2: asked, in flight, noTarget and allTried leave the list");
+    /* fold 2 (re-check LOW 4): two games - B (slot 1) still in the world loses an answer: asked again once, then allTried; never endless */
+    {
+        const int me = 0;
+        const int slots[2] = { 0, 1 };
+        const int bits[2] = { 1, 1 };
+        const int gone[2] = { 0, 0 };
+        int tried[8]; int n = 0; int asks = 0;
+        for (int guard = 0; guard < 8; ++guard)
+        {
+            const int t = cooppar::ParityPullTarget(-1, me, slots, bits, 2, 1, gone, n > 0 ? tried : 0, n, 0);
+            if (t < 0) { if (t != cooppar::kParityPullAllTried) Fail("t1268 fold 2: the lost walk ends allTried"); break; }
+            if (t != 1) { Fail("t1268 fold 2: the only other game is asked"); break; }
+            ++asks;   /* this ask is lost */
+            const int entry = (cooppar::ParityPullLostTried(t, 1, tried, n) != 0) ? t : cooppar::ParityPullLostMark(t);
+            tried[n++] = entry;
+        }
+        if (asks != cooppar::kParityPullLostAsks || asks != 2) Fail("t1268 fold 2: a live game that loses answers is asked exactly kParityPullLostAsks (2) times");
+        /* a game out of the world counts as asked at its first loss */
+        if (cooppar::ParityPullLostTried(1, 0, 0, 0) != 1) Fail("t1268 fold 2: a lost game out of the world is not asked again");
+        if (cooppar::ParityPullLostTried(1, 1, 0, 0) != 0) Fail("t1268 fold 2: a live game's first lost answer is asked again");
+        /* a mark is never a seat: it does not count as asked, and a refused asker that lost once is still the asker */
+        const int mark1[1] = { cooppar::ParityPullLostMark(1) };
+        if (cooppar::ParityPullSlotIn(1, mark1, 1) != 0 || cooppar::ParityPullLostMark(0) >= -1) Fail("t1268 fold 2: a lost mark is not a seat");
+        if (cooppar::ParityPullTarget(1, me, slots, bits, 2, 1, gone, mark1, 1, 0) != 1) Fail("t1268 fold 2: a refusal pull's asker that lost once is asked again");
+        /* three games: B lost twice -> C is asked next */
+        const int slots3[3] = { 0, 1, 2 };
+        const int bits3[3] = { 1, 1, 1 };
+        const int gone3[3] = { 0, 0, 0 };
+        const int lostB[2] = { cooppar::ParityPullLostMark(1), 1 };
+        if (cooppar::ParityPullTarget(-1, me, slots3, bits3, 3, 1, gone3, lostB, 2, 0) != 2) Fail("t1268 fold 2: after B's last lost answer, C is asked");
+    }
+    /* fold 2 (re-check, no-notebook drop): no notebook waits like no answer, and the wait list keeps it until a map names the holder */
+    if (cooppar::FillPushWaits(0, 0, 1) != 1 || cooppar::FillPushWaits(0, 1, 0) != 1 || cooppar::FillPushWaits(1, 0, 0) != 1)
+        Fail("t1268 fold 2: loading, no answer and no notebook wait (never dropped)");
+    if (cooppar::FillPushWaits(0, 0, 0) != 0) Fail("t1268 fold 2: a read verdict does not wait");
+    if (cooppar::WaitBoxAction(0, 1, cooppar::ParityVerdictSettled(0, 0, 0, 1), 0, 0) != cooppar::kWaitBoxKeep)
+        Fail("t1268 fold 2: a box listed with no notebook stays listed until the link returns and a map names its holder");
 }
 
 }   /* namespace suite */

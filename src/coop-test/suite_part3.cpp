@@ -6912,36 +6912,9 @@ void t_t293_human_class_by_vtable()
     if (ThunkTarget(base + 0x539440ull, b) != base + 0x539440ull) Fail("t293: a function's own first byte is not a stub");
 }
 
-/* P5t (T418): the notebook gives an unclaimed area to the lowest slot whose player is fresh and within ring 1 of it (the
-   local tie-break's winner), else the reporter. */
-void t_p5t_area_assign_ring1_lowest()
-{
-    using namespace coopstore;
-    int s[3] = { 0, 1, 2 }, x[3] = { 43, 43, 50 }, y[3] = { 11, 11, 20 }; double at[3] = { 100.0, 100.0, 100.0 };
-    int n = -1, why = -1;
-    if (AreaAssignDecide(1, 43, 11, 0, 0, 0, 0, 0, 100.0, 5.0, &n, &why) != 1 || n != 0 || why != kAssignReporter) Fail("p5t: no player positions -> the reporter");
-    if (AreaAssignDecide(1, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 0 || n != 2 || why != kAssignRing1) Fail("p5t: T418 - B reports first, A (lower) beside it too -> A");
-    if (AreaAssignDecide(0, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 0 || why != kAssignRing1) Fail("p5t: A reports, both beside -> A");
-    at[0] = 94.9;
-    if (AreaAssignDecide(1, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || n != 1) Fail("p5t: A's position 5.1 s old is stale -> B, the only fresh ring-1 player");
-    at[0] = 95.0;
-    if (AreaAssignDecide(1, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 0) Fail("p5t: exactly 5 s old is still fresh (the relay's own > test)");
-    at[0] = 100.0; x[0] = 45;
-    if (AreaAssignDecide(1, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || n != 1) Fail("p5t: A two areas away is not ring 1 -> B");
-    x[0] = 44; y[0] = 12;
-    if (AreaAssignDecide(1, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 0 || n != 2) Fail("p5t: the diagonal neighbour is ring 1 (Chebyshev 1)");
-    x[0] = 43; y[0] = 11; x[1] = 60;
-    if (AreaAssignDecide(2, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 0 || n != 1 || why != kAssignRing1) Fail("p5t: a third game reports, A beside it -> A");
-    at[0] = 0.0;
-    if (AreaAssignDecide(2, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 2 || n != 0 || why != kAssignReporter) Fail("p5t: nobody fresh beside it -> the reporter as before");
-    s[0] = -1; at[0] = 100.0; x[1] = 43;
-    if (AreaAssignDecide(2, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1) Fail("p5t: a negative slot is never chosen");
-    x[1] = -1;
-    if (AreaAssignDecide(2, 43, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 2) Fail("p5t: an unknown (negative) position is never ring 1");
-}
-
-/* area2 fold (review-area2): the sweep's purge request rule, the sweep-only pass, and the unconfirmed area lease. */
-void t_area2_fold_sweep_request_and_unconfirmed_lease()
+/* area2 fold (review-area2): the sweep's purge request rule and the sweep-only pass (the unconfirmed area lease and the ring-1 choice
+   it also tested are gone with T-1285). */
+void t_area2_fold_sweep_request()
 {
     using namespace coopsp;
     if (SweepRequestDecide(0, 0, 0, 0, 0, kSweepReqGapMs) != kSweepReqAsk) Fail("area2: a first-seen copy with no pass yet asks");
@@ -6956,15 +6929,6 @@ void t_area2_fold_sweep_request_and_unconfirmed_lease()
     if (std::string(TriggerText(kTrigSweep)) != "sweep" || std::string(TriggerText(kTrigWake | kTrigSweep)) != "wake+sweep") Fail("area2: the sweep trigger is named");
     if (std::string(PassPrefix(kTrigLoad | kTrigSweep)) != "load") Fail("area2: a load pass keeps its prefix");
     for (int m = 0; m < 16; ++m) { const char* x = TriggerText(m); if (x == 0 || x[0] == 0) Fail("area2: every trigger mask has a name"); }
-    using namespace coopstore;
-    if (UnconfirmedLeaseDecide(0, 0, 99.0, kUnconfirmedLeaseSec) != kLeaseNormal) Fail("area2: a confirmed row is on the ordinary rules");
-    if (UnconfirmedLeaseDecide(1, 1, 3.0, kUnconfirmedLeaseSec) != kLeaseConfirm) Fail("area2: the assignee's own report confirms");
-    if (UnconfirmedLeaseDecide(1, 0, 11.0, kUnconfirmedLeaseSec) != kLeaseHold) Fail("area2: 11 s unconfirmed is held (past the 10 s lease, inside 12 s)");
-    if (UnconfirmedLeaseDecide(1, 0, 12.0, kUnconfirmedLeaseSec) != kLeaseHold) Fail("area2: the 12 s boundary itself holds");
-    if (UnconfirmedLeaseDecide(1, 0, 12.1, kUnconfirmedLeaseSec) != kLeaseHandOver) Fail("area2: past 12 s unconfirmed it is handed to the reporter");
-    if (UnconfirmedLeaseDecide(1, 1, 30.0, kUnconfirmedLeaseSec) != kLeaseConfirm) Fail("area2: a late report by the assignee itself still confirms");
-    int s[2] = { 16, 1 }, x[2] = { 43, 50 }, y[2] = { 11, 20 }; double at[2] = { 100.0, 100.0 }; int n = -1, why = -1;
-    if (AreaAssignDecide(1, 43, 11, 2, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || n != 0 || why != kAssignReporter) Fail("area2: a slot above 15 is never chosen");
 }
 
 /* mmo6: the hand-over ledger line round trip, its refusals, and the cap */

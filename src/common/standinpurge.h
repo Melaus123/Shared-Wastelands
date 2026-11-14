@@ -29,6 +29,22 @@ namespace coopsp {
    load (ResetPlayerFactionState), so IsPeerFaction answers false there; the record id is what is asked. */
 inline int IsStandInRecord(int recordSlot) { return (recordSlot >= 0 || recordSlot == -2) ? 1 : 0; }
 
+/* T-840: IS ONE CHARACTER A PLAYER'S - the one rule spawn.cpp PlayerCharClassOf gives every caller (CopyIsPlayerCharacter: a
+   leaving player's copies, the knockout classifier, the return check's NPC list; the player-character table's sweep).
+   ownPlayer: 1 = the watched player or this game's own player faction; factionPlausible: 0 = its faction pointer is not plausible;
+   inTable: 1 = the faction is in the stand-in table (IsStandInFaction); recordSlot: StandInRecordSlot of the faction (the caller may
+   pass -1 when it did not read it because ownPlayer, !factionPlausible or inTable already answers). The table is empty right after a
+   load and refilled by faction lookups - the record id answers in that window. 1 = a player's character, 0 = an NPC, -1 = its
+   faction or its record id unreadable. */
+inline int PlayerCharClass(int ownPlayer, int factionPlausible, int inTable, int recordSlot)
+{
+    if (ownPlayer != 0) return 1;
+    if (factionPlausible == 0) return -1;
+    if (inTable != 0) return 1;
+    if (recordSlot == -3) return -1;
+    return IsStandInRecord(recordSlot);
+}
+
 /* The ACTION for one character on this pass. */
 enum {
     kActNone        = 0,   /* not a stand-in, or a mirror row knows it (a live copy of this session) */

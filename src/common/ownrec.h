@@ -806,7 +806,8 @@ struct GdcRecSpan
     int                      fields, lists;   /* how many fields (all seven kinds) and reference lists the record has */
     bool                     hasMoney;   /* the record holds kRecMoneyKey (T-799 D2) - money its value */
     int                      money;
-    GdcRecSpan() : from(0), to(0), instCountAt(0), charCountAt(0), type(0), charCount(0), hasCharCount(false), fields(0), lists(0), hasMoney(false), money(0) {}
+    int                      dead;   /* T-1318 a4 fold 2: the record's bool field "dead" (a 0x39 medical record's - worldstate.cpp WsMemberDeadPod's field): 1 true, 0 false, -1 no such field */
+    GdcRecSpan() : from(0), to(0), instCountAt(0), charCountAt(0), type(0), charCount(0), hasCharCount(false), fields(0), lists(0), hasMoney(false), money(0), dead(-1) {}
 };
 inline void GdcPutI32(std::vector<char>* v, int x)
 {
@@ -842,6 +843,7 @@ inline bool GdcSpans(const char* data, size_t n, size_t* recsEnd, std::vector<Gd
                 std::string k;
                 GdcStr(&c, &k);
                 if (kWidth[m] == 0) { GdcStr(&c, 0); continue; }
+                if (m == 0 && k == "dead" && !c.bad && c.at < c.n) s.dead = c.p[c.at] != 0 ? 1 : 0;   /* T-1318 a4 fold 2: read in place, skipped below */
                 if (m != 2) { GdcSkip(&c, (size_t)kWidth[m]); continue; }
                 const size_t at = c.at;
                 const int v = GdcI32(&c);
@@ -902,6 +904,50 @@ inline bool GdcSpans(const char* data, size_t n, size_t* recsEnd, std::vector<Gd
     }
     *recsEnd = c.at;
     return !c.bad;
+}
+/* T-1318 a4 fold 2 (re-check LOW-B): each 0x24 record's death, in record order (as SleepersHandsRead lists their hands), from the bytes the
+   engine holds: the squad record's (0x1E) instance naming the 0x24 record among its states names the person's own records, its 0x39
+   medical record among them; that record's "dead" field 1 -> 1 (a corpse); "dead" false or no such field -> 0 (alive - the engine's own
+   load reads it so, WsMemberDeadPod); not readable -> -1: a 0x24 record with no name, no instance or more than one naming it, or no 0x39
+   record (or two) among its states. */
+inline void GdcCharDeadOf(const std::vector<GdcRecSpan>& rs, std::vector<int>* out)
+{
+    out->clear();
+    std::map<std::string, size_t> bySid;
+    std::set<std::string> twice;
+    for (size_t i = 0; i < rs.size(); ++i)
+    {
+        if (rs[i].sid.empty()) continue;
+        if (bySid.count(rs[i].sid) != 0) twice.insert(rs[i].sid); else bySid[rs[i].sid] = i;
+    }
+    for (size_t i = 0; i < rs.size(); ++i)
+    {
+        if (rs[i].type != 0x24) continue;
+        int d = -1;
+        if (!rs[i].sid.empty() && twice.count(rs[i].sid) == 0)
+        {
+            int hits = 0; const GdcInstSpan* own = 0;
+            for (size_t r = 0; r < rs.size(); ++r)
+            {
+                if (rs[r].type != 0x1E) continue;
+                for (size_t k = 0; k < rs[r].inst.size(); ++k)
+                    for (size_t j = 0; j < rs[r].inst[k].states.size(); ++j)
+                        if (rs[r].inst[k].states[j] == rs[i].sid) { ++hits; own = &rs[r].inst[k]; }
+            }
+            if (hits == 1 && own != 0)
+            {
+                int med = 0; size_t at = 0;
+                for (size_t j = 0; j < own->states.size(); ++j)
+                {
+                    const std::map<std::string, size_t>::const_iterator f = bySid.find(own->states[j]);
+                    if (f == bySid.end() || twice.count(own->states[j]) != 0 || rs[f->second].type != 0x39) continue;
+                    ++med; at = f->second;
+                }
+                if (med == 1) d = rs[at].dead == 1 ? 1 : 0;
+            }
+        }
+        out->push_back(d);
+    }
 }
 /* T-799 D2: the money a record file carries - kRecMoneyCarried (*money its value, 0 included), kRecMoneyNone (an older record: the
    squad record has no kRecMoneyKey - never read as 0), kRecMoneyUnread (the bytes do not parse, or not exactly one squad record). */

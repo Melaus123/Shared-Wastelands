@@ -197,6 +197,20 @@ std::map<unsigned int, bool> g_lookKoThrough;
 long long g_lookKoApplied = 0, g_lookKoGaveUp = 0, g_lookKoAppliedPlayer = 0, g_lookKoGaveUpPlayer = 0;
 long long g_lookKoClothLate = 0;
 
+// T-1244 (design A, F-T1244-DOWNHOLD, src/common/kolook.h KitPassesDownHold): a LIVE HUMAN copy's kit goes on while the copy is
+// down or its owner says knocked out (only its look waits), behind the body-rebuild guard checks the dead-copy road uses.
+// kitDown[applied] kits put on that way; [pastLook] of those, kits that went on while a look for the copy was still held (or
+// not yet applied because of that hold); [reattached] re-attach requests (+0x141) made once after that look later went on;
+// [guardHeld] waits entered because the guard holds the copy's body rebuild (once per uid per wait). [pastLook] counts such a kit
+// on either road that puts it on (this one or lookKoThrough), so each pastLook sets up one re-attach (fold 1).
+// kitDownReattachDropped[noAppearance]: re-attaches given up because the copy had no appearance object to ask (fold 1).
+// g_kitDownReattach: uid -> false = its kit went on past a held look, true = that look has now been applied (re-attach due).
+std::map<unsigned int, bool> g_kitDownReattach;
+std::map<unsigned int, bool> g_waitKitDownGuard;
+long long g_kitDownApplied = 0, g_kitDownPastLook = 0, g_kitDownReattached = 0, g_kitDownGuardHeld = 0;
+long long g_kitDownLines = 0;   // the capped log line (20 at most)
+long long g_kitDownReattachNoApp = 0;   // T-1244 fold 1: re-attach entries erased - no appearance object
+
 // 1 = the copy's faction is a player's stand-in (a copy of a player's character), 0 = not, -1 = no copy or a read faulted.
 // No C++ object with a destructor in this frame (C2712).
 static int CopyPlayerSidePod(::Character* c)
@@ -1987,6 +2001,7 @@ void GarmentsNoteOwnerMove(unsigned int uid, const std::string& section, int op)
     g_waitNotBuiltClothing.erase(uid);
     g_waitDownedClothing.erase(uid);
     g_waitKitOpen.erase(uid);
+    g_waitKitDownGuard.erase(uid);   // T-1244
     ++g_kitStaleDropped;
     if (++g_kitStaleLines <= 50)
         SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " DROPPED before it was applied - the owner moved an item in its '" + section
@@ -2002,6 +2017,8 @@ void DeadlookForgetCopy(unsigned int uid)
     g_deadHeldReason.erase(uid);
     g_copyLookApplied.erase(uid);   // a re-spawned copy's first look is its own
     g_lookKoThrough.erase(uid);
+    g_kitDownReattach.erase(uid);   // T-1244: a re-spawned copy's kit and look are its own
+    g_waitKitDownGuard.erase(uid);
     CopyBodyForgetUid(uid);   // T-293 fold 2 (F3-b): the createBody guard's marks describe this copy only
 }
 
@@ -2010,6 +2027,7 @@ void DeadlookForgetCopy(unsigned int uid)
 void AppearanceForgetCopyBody(unsigned int uid)
 {
     g_appearanceDone.erase(uid);
+    g_kitDownReattach.erase(uid);   // T-1244: the new body's kit and look are its own
 }
 
 // MAIN THREAD (off it: counted, never marked). The mod has just made an apply that may queue a body rebuild on
@@ -2031,6 +2049,8 @@ void DeadlookForgetAllCopies()
     g_deadHeldReason.clear();
     g_copyLookApplied.clear();   // a copy met in the next world with the same uid: its first look is its own
     g_lookKoThrough.clear();
+    g_kitDownReattach.clear();   // T-1244
+    g_waitKitDownGuard.clear();
     CopyBodyForgetAll();
 }
 
@@ -2800,6 +2820,13 @@ void AppearanceTick()
             CopyBodyNoteModApply(uid, c);   // held as a copy's even if the uid becomes this game's own first
             if (ok) { ++g_c.applied; g_appearanceDone[uid] = true; g_copyLookApplied[uid] = true; }
             else    ++g_c.applyFailed;
+            // T-1244: this copy's kit went on while this look was held - re-attach its items once this look has gone on
+            // (KitDownReattachTick), in case the body rebuild the look queued left the old attachments behind.
+            if (ok)
+            {
+                std::map<unsigned int, bool>::iterator ra = g_kitDownReattach.find(uid);
+                if (ra != g_kitDownReattach.end()) ra->second = true;
+            }
             if (ok && lookKoThrough)
             {
                 g_lookKoThrough[uid] = true;
@@ -2829,8 +2856,61 @@ void QueueRemoteGarments(unsigned int uid, const GarmentSet& set)
     g_pendingGarments[uid] = set;
 }
 
+// T-1244: asks the engine to re-attach the copy's items (+0x141 -> buildAttachments 0x537BA0 on its next update, the step the
+// engine's own attach / detach item calls queue). 1 written, -1 no appearance object or a fault. No C++ object here (C2712).
+static int KitReattachPod(::Character* c)
+{
+    void* app = GetAppearance(c);
+    if (app == 0) return -1;
+    __try { *((unsigned char*)app + kUpdAttachOff) = 1; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// T-1244 (design A): a copy whose kit went on while its look was held (g_kitDownReattach) gets ONE re-attach after that look has
+// gone on and its rebuild has finished (settled, built, no createBody pending or held) - the look apply may queue a body rebuild
+// (+0x143) after the items were attached. The list is never applied again; the inventory itself is untouched by a look apply.
+// A newer kit queued meanwhile re-attaches by itself; a dead copy or one this game owns now is let go. MAIN THREAD.
+static void KitDownReattachTick()
+{
+    std::map<unsigned int, bool>::iterator it = g_kitDownReattach.begin();
+    while (it != g_kitDownReattach.end())
+    {
+        const unsigned int uid = it->first;
+        if (!it->second) { ++it; continue; }   // its look has not gone on yet
+        if (net::IsUidMine(uid) || g_pendingGarments.find(uid) != g_pendingGarments.end()) { g_kitDownReattach.erase(it++); continue; }
+        ::Character* c = FindSpawned(uid);
+        if (c == 0) { ++it; continue; }
+        if (DeadPod(c) != 0) { g_kitDownReattach.erase(it++); continue; }
+        // T-1244 fold 1 (review LOW): no appearance object to ask (CreateBodyPendingPod -1) - the entry is erased and counted, never
+        // left waiting (a copy knocked down again later would otherwise get the +0x141 step while down).
+        const int cbPending = CreateBodyPendingPod(c);
+        if (cbPending < 0)
+        {
+            ++g_kitDownReattachNoApp;
+            if (++g_kitDownLines <= 20)
+                DebugLog("[P022] CLOTHING uid=" + S(uid) + " its look went on after its kit, but it has no appearance object - the"
+                         " re-attach is given up (T-1244 kitDownReattachDropped[noAppearance]=" + S(g_kitDownReattachNoApp)
+                         + "; 20 lines at most)");
+            g_kitDownReattach.erase(it++);
+            continue;
+        }
+        if (!AppearanceSettled(c) || !CharacterBuilt(c, 0) || cbPending != 0 || CopyBodyHeldNowPod(c, 0, 1) != 0)
+        {
+            ++it; continue;
+        }
+        const int r = KitReattachPod(c);
+        if (r == 1) ++g_kitDownReattached;
+        if (++g_kitDownLines <= 20)
+            DebugLog("[P022] CLOTHING uid=" + S(uid) + " its look went on after its kit (put on while it was held) - items re-attached"
+                     " once " + (r == 1 ? std::string("(+0x141 set)") : std::string("FAILED (no appearance object)"))
+                     + " (T-1244 kitDown[reattached]=" + S(g_kitDownReattached) + "; 20 lines at most)");
+        g_kitDownReattach.erase(it++);
+    }
+}
+
 void ApplyPendingGarments()
 {
+    if (!g_kitDownReattach.empty()) KitDownReattachTick();
     if (g_pendingGarments.empty()) return;
     std::map<unsigned int, GarmentSet>::iterator it = g_pendingGarments.begin();
     while (it != g_pendingGarments.end())
@@ -2847,6 +2927,7 @@ void ApplyPendingGarments()
             g_waitNotBuiltClothing.erase(uid);
             g_waitDownedClothing.erase(uid);
             g_waitKitOpen.erase(uid);
+            g_waitKitDownGuard.erase(uid);   // T-1244
             g_pendingGarments.erase(it++);
             continue;
         }
@@ -2855,11 +2936,23 @@ void ApplyPendingGarments()
         // cheap half (dead + human) is asked here; the rest (carried, bed/cage, looted, rebuild) at the lying-down gate.
         const bool appDone = g_appearanceDone.find(uid) != g_appearanceDone.end();
         const bool appPending = g_pendingRemote.find(uid) != g_pendingRemote.end();
+        bool kitPastLook = false;   // T-1244: this kit goes on while the copy's look is held for down / owner-says-KO
         if (!appDone || appPending)
         {
             ::Character* dc = FindSpawned(uid);
             const bool deadHuman = (dc != 0 && DeadPod(dc) == 1 && DeadHumanPod(dc) == 1);
-            if (!deadHuman)
+            // T-1244 (design A, F-T1244-DOWNHOLD): a LIVE HUMAN copy whose queued look is held ONLY because the copy is down or
+            // its owner says knocked out (kolook.h KitPassesLookHold, read live with the look gate's own inputs) no longer
+            // holds its kit behind that look; it goes on below behind the body-rebuild guard. No look queued yet: waits as before.
+            if (!deadHuman && dc != 0 && appPending)
+            {
+                const bool kOwnerKo = coop::CopyOwnerSaysKo(uid);
+                const bool kFirst = g_copyLookApplied.find(uid) == g_copyLookApplied.end();
+                const bool kHeld = kOwnerKo && kFirst && coop::CopyKnockdownHeld(uid);
+                kitPastLook = coopkolook::KitPassesLookHold(DeadPod(dc), CopyDownedPod(dc), kOwnerKo,
+                                                            coop::CopyOwnerSaysDead(uid), DeadHumanPod(dc), kFirst, kHeld);
+            }
+            if (!deadHuman && !kitPastLook)
             {
                 if (!appDone) { ++it; continue; }
                 NoteWaitEntered(g_waitClothingForAppearance, uid, &g_clothingWaitAppearance); ++it; continue;
@@ -2898,11 +2991,30 @@ void ApplyPendingGarments()
                 late->second = false;
                 ++g_lookKoClothLate;
                 SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " its first look went through on the held knockdown, but the hold is"
-                         " gone or the copy is down now - the worn items wait for it to stand (lookKoArrival clothLate="
+                         " gone or the copy is down now - the worn items go by the down-copy road (a live human: kitDown, behind"
+                         " the body-rebuild guard; else they wait for it to stand) (lookKoArrival clothLate="
                          + S(g_lookKoClothLate) + ")");
             }
         }
-        if (!clothKoThrough
+        // T-1244 (design A, F-T1244-DOWNHOLD): a LIVE HUMAN copy that is down or whose owner says knocked out (not dead) takes its
+        // kit now (kolook.h KitPassesDownHold): the kit apply queues only the re-attach step (+0x141), never the body rebuild
+        // (+0x143) these holds exist for. It waits only while the body-rebuild guard holds the copy's rebuild or a rebuild is in
+        // flight - the dead-copy road's checks (DeadClothingVerdict) - and is never dropped here.
+        const int clothHuman = (clothKoThrough || deadNow != 0) ? 0 : DeadHumanPod(c);
+        const bool clothDownKit = !clothKoThrough
+            && coopkolook::KitPassesDownHold(deadNow, clothDowned, clothOwnerKo, clothOwnerDead, clothHuman);
+        // T-1244 fold 1 (review LOW, accepted): this road skips the dead road's carried / bed / cage hold (DeadClothingVerdict).
+        // That hold guarded createBody on a carried corpse (answers-deadlook1.md:114); the kit apply queues no body rebuild
+        // (+0x143), only the re-attach step (+0x141), so it is not needed here.
+        if (clothDownKit)
+        {
+            if (CopyBodyHeldNowPod(c, 1, 1) != 0 || CopyBodyHeldNowPod(c, 0, 1) != 0 || AppearanceRebuildInFlight(c) != 0)
+            {
+                NoteWaitEntered(g_waitKitDownGuard, uid, &g_kitDownGuardHeld); ++it; continue;
+            }
+            g_waitKitDownGuard.erase(uid);
+        }
+        if (!clothKoThrough && !clothDownKit
             && (deadNow != 0 || clothDowned != 0 || clothOwnerKo   // crash1b
                 || clothOwnerDead))   /* T-303: owner says dead, the copy's death not landed yet - held as not-dead */
         {
@@ -2972,7 +3084,22 @@ void ApplyPendingGarments()
             }
         }
         if (ok) g_lookKoThrough.erase(uid);
+        // T-1244 fold 1 (review LOW): a kit that went on past a held look sets up the one re-attach whichever road put it on - this
+        // down road or the lookKoThrough road (a second look queued while the knockdown hold is live).
+        if (ok && kitPastLook) { ++g_kitDownPastLook; g_kitDownReattach[uid] = false; }
+        if (ok && clothDownKit)
+        {
+            ++g_kitDownApplied;
+            if (++g_kitDownLines <= 20)   // in release builds too: the report this fixes came from one
+                DebugLog("[P022] CLOTHING uid=" + S(uid) + " put on while the copy is "
+                         + (clothDowned != 0 ? std::string("down") : std::string("standing"))
+                         + (clothOwnerKo ? " and its owner says knocked out" : "")
+                         + (kitPastLook ? " - its look is still held and goes on when it stands" : "")
+                         + " (T-1244 kitDown[applied]=" + S(g_kitDownApplied) + "; createBody pending after: "
+                         + S((long long)CreateBodyPendingPod(c)) + "; 20 lines at most)");
+        }
         SW_DEVLOG_OR_FAIL(!ok, "[P022] <- CLOTHING uid=" + S(uid) + (ok ? " applied" : " FAILED") + (deadApply ? " (dead copy)" : "")
+                 + (clothDownKit ? " (live copy down / owner says knocked out - kitDown)" : "")
                  + (clothKoThrough ? " (owner says knocked out; standing, knockdown held - lookKoArrival)" : ""));
         SW_DEVLOG_OR_FAIL(!ok, "[P022]   before " + before);
         SW_DEVLOG_OR_FAIL(!ok, "[P022]   after  " + GearString(c));
@@ -3102,6 +3229,11 @@ void ReportAppearanceCounters()
              + " copyBodyHeld[gateHeldPassed,heldNow,tableFull]=" + S((long long)g_gateHeldPassed) + "," + S((long long)CopyBodyHeldCount())
              + "," + S((long long)g_copyBodyHeldFull)
              + " kit3[kitOwnedSkipped]=" + S(g_kitOwnedSkipped)
+             // T-1244: live human copies' kits put on while down / owner says KO; of those, past a held look; re-attaches made
+             // once that look went on; waits entered because the body-rebuild guard held the copy (once per uid per wait); waiting now
+             + " kitDown[applied,pastLook,reattached,guardHeld,guardWaitingNow]=" + S(g_kitDownApplied) + "," + S(g_kitDownPastLook)
+             + "," + S(g_kitDownReattached) + "," + S(g_kitDownGuardHeld) + "," + S((long long)g_waitKitDownGuard.size())
+             + " kitDownReattachDropped[noAppearance]=" + S(g_kitDownReattachNoApp)   // T-1244 fold 1
              // T-293 fold 1 (review F1): waiting clothing lists dropped because the owner moved a worn item after sending them
              + " kitStale[droppedOnOwnerMove,heldCorpse]=" + S(g_kitStaleDropped) + "," + S(g_kitStaleHeldCorpse)
              // T-1 B2 fold (review F2): kit applies held while the copy is open / on the cursor / under a request (once per uid per wait)

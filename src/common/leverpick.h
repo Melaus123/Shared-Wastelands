@@ -84,6 +84,18 @@ inline std::string Refusal(int verdict, long count, int k, const std::string& wh
     return std::string();
 }
 
+/* T-1262: the count tail of a name pick's "no ... named ..." words. onList = the matches on the engine's character-update list (any
+   distance); offList = the dead matches found only through the mod's uid table (a dead character leaves the update list);
+   offWalked = the pick walked the uid table (the dead pick). Without the walk " (N such loaded at any distance)"; with it
+   " (N such loaded at any distance: A on the character update list + B dead off it in the uid table)", N = A + B. It holds one
+   " (" only: a caller keeps the tail from its last " (" (items.cpp P105NameUid). */
+inline std::string NoneCountTail(long onList, long offList, bool offWalked)
+{
+    if (!offWalked) return " (" + Num(onList) + " such loaded at any distance)";
+    return " (" + Num(onList + offList) + " such loaded at any distance: " + Num(onList) + " on the character update list + "
+           + Num(offList) + " dead off it in the uid table)";
+}
+
 inline std::string BadSelector(const std::string& sel)
 {
     return "a malformed #<k> in '" + sel + "' (#1..#" + Num(kSelMax) + " after the name or key)";

@@ -29,7 +29,7 @@
 namespace townrefill {
 
 const unsigned kMsgTownLoss = 64;
-const unsigned kProtocol = 145;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
+const unsigned kProtocol = 153;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
 
 
 
@@ -158,6 +158,17 @@ inline int GoneIsDiscard(const char* p, size_t n, size_t at)
     if (p == 0 || at >= n || n - at != 4) return 0;
     unsigned v = 0; std::memcpy(&v, p + at, 4);
     return v == kGoneDiscardMark ? 1 : 0;
+}
+/* T-850: the whole RECORD_GONE payload (u32 id length, the id, the stamp's two u32 halves, then the town or the DISCARD word) - 1 = it is
+   marked DISCARD, 0 = not, or too short to read (read as no discard: the permanent mark is then kept, as before). */
+inline int GonePayloadIsDiscard(const std::vector<char>& payload)
+{
+    if (payload.size() < 4) return 0;
+    unsigned len = 0; std::memcpy(&len, &payload[0], 4);
+    if ((size_t)len > payload.size()) return 0;
+    const size_t at = 4 + (size_t)len + 8;
+    if (at > payload.size()) return 0;
+    return GoneIsDiscard(&payload[0], payload.size(), at);
 }
 // RECORD_GONE's town, written after the stamp. false = not a usable town id (nothing is written).
 inline bool AppendGoneTown(std::vector<char>* b, const std::string& town)

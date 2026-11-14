@@ -308,13 +308,17 @@ inline int LostAnswerFromOwner(unsigned int rowOwnerKey, unsigned int senderKey)
    if no copy came). NOT ANNOUNCED or NOT MINE (LostAnswerParks): REFUSED for the rest of the visit - the owner's announce pass, or
    the roster's MOVED word, decides. Any other (a hand-over in flight, no body, a failed send, no road, an older build's NOT IN AREA):
    BACKOFF - asked again after kLostBackoffLooks once-a-second looks, within the visit's kLostAsksPerVisit asks. */
+/* T-1178 fold 3 (L-a): a NO BODY answer (the owner's body unreadable now - e.g. a recruit read at the world origin during the character
+   editor's pause, worldsync.cpp CatchupCharReads) does not use up the visit: the ask it answered is given back, so a long pause
+   backs off and asks again instead of spending the visit's kLostAsksPerVisit asks (asksTotal still counts it) */
+inline int LostAnswerRefunds(int verdict) { return verdict == kRvNoBody ? 1 : 0; }
 inline int LostAnswerParks(int verdict) { return (verdict == kRvNotAnnounced || verdict == kRvNotMine) ? 1 : 0; }
 inline void LostAnswerApply(LostRow* r, int verdict)
 {
     if (r == 0 || r->state != kLcAsked) return;
     if (verdict == kRvSent) r->state = kLcAnswered;
     else if (LostAnswerParks(verdict)) r->state = kLcRefused;
-    else { r->state = kLcBackoff; r->waitLooks = 0; }
+    else { r->state = kLcBackoff; r->waitLooks = 0; if (LostAnswerRefunds(verdict) && r->asksThisVisit > 0) --r->asksThisVisit; }
 }
 /* A SPAWN made the copy of a booked uid (or found it live): the row is HERE at once and the visit is marked, so no look after it
    asks while the copy is here or after it is put away again in the same visit. Answers 1 when the row was not HERE (the copy is
@@ -349,6 +353,16 @@ inline int WireFactionMayAppear(const char* name) { return (name != 0 && name[0]
 inline int StaleRowGivesWay(int askedForIt, int uidMine, int rowRetired, int handleResolves, int inRunningList, int spawnSpotLoaded)
 {
     return (askedForIt && !uidMine && rowRetired && !handleResolves && !inRunningList && spawnSpotLoaded) ? 1 : 0;
+}
+/* T-1318 attempt 5 (owner 1626, D1-R2): does a remote SPAWN run the squad context step (spawn.cpp PrepareContextForSpawn) before the copy
+   is made? rowExists: this game has a row for the uid; rowStale: that row names no copy (CreateAt's own test - another game's uid,
+   FindSpawned 0, WorldsyncCopyRowStale), so CreateAt retires it and makes the copy; tmplOk: the template resolved. A copy made over a stale
+   row is placed as every fresh copy is - in its own context squad, never one the engine picks (T2359: a returning given person's copy went
+   into this game's refused wake of the given squad). False assumption fixed: 'a person with a row here has a copy here'. 1 = run it. */
+inline int SpawnContextRuns(int rowExists, int rowStale, int tmplOk)
+{
+    if (rowExists == 0) return 1;
+    return (rowStale != 0 && tmplOk != 0) ? 1 : 0;
 }
 
 /* THE RETURN CHECK. While this game was off the world-server link, an owner's withdrawal of a character (its UNLOAD when the

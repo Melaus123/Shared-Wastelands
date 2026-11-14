@@ -13,6 +13,8 @@
  *   ANSWER  kind 1 EAT : result u8 (1 APPLIED, 2 DONE, 3 REFUSED, 4 ALREADY) | reason u8 (kReason*)                 16 bytes
  *   ANSWER  kind 3 KO  : result u8 | reason u8 | outcome u8 (1 KNOCKED_OUT, 2 NOTICED; nonzero exactly with APPLIED)  17 bytes
  *                        (REFUSED STATE = the victim sees the assassin; REFUSED FAR = too far apart there)
+ *   REQUEST kind 7 BURN: the header alone (target = the body, actor = the carrier)                                  14 bytes
+ *   ANSWER  kind 7 BURN: result u8 (1 APPLIED, 3 REFUSED, 4 ALREADY - never DONE) | reason u8                       16 bytes
  *   Kinds 2, 4..6 (HIT, NOTICE, BED, ORDER) are reserved by the design and refused by this decoder until they are built; a
  *   decoder that takes kind 1 only refuses kind 3 as a bad kind.
  *
@@ -43,6 +45,8 @@ namespace cooffect {
 
 const unsigned char kDirRequest = 1, kDirAnswer = 2;
 const unsigned char kKindEat = 1, kKindKo = 3;       /* 2 HIT, 4 NOTICE, 5 BED, 6 ORDER: reserved */
+const unsigned char kKindBurn = 7;                   /* T-1262 (protocol 216): a body burned in a corpse furnace on the carrier's game */
+inline bool KindKnown(unsigned char k) { return k == kKindEat || k == kKindKo || k == kKindBurn; }
 const unsigned char kResultApplied = 1, kResultDone = 2, kResultRefused = 3, kResultAlready = 4;
 /* Refusal reasons (the design's table). NOT_SENDERS is counted and NOT answered (a stale or forged request). */
 enum { kReasonNone = 0, kReasonNotMine = 1, kReasonGone = 2, kReasonNoActor = 3, kReasonNotSenders = 4, kReasonState = 5,
@@ -54,6 +58,7 @@ inline const char* ReasonName(int r)
 }
 
 const size_t kHeaderSize = 14, kEatRequestSize = 23, kAnswerSize = 16, kKoRequestSize = 20, kKoAnswerSize = 17;
+const size_t kBurnRequestSize = 14, kBurnAnswerSize = 16;   /* T-1262: a BURN request is the header alone */
 const unsigned char kKoSourceStealth = 1;                                                  /* REQUEST KO: Task_StealthKO */
 const unsigned char kKoDecidedOwner = 0;   /* REQUEST KO: the assassin's game sees another player's character */
 const unsigned char kKoDecidedNpc = 4;     /* REQUEST KO: the assassin's game sees an NPC (1..3 are refused) */
@@ -84,8 +89,9 @@ inline bool FloatIn(float v, float lo, float hi) { return v == v && v >= lo && v
 
 inline bool EffectMsgOk(const EffectMsg& m)
 {
-    if (m.reqId == 0 || m.targetUid == 0 || m.actorUid == 0 || m.targetUid == m.actorUid || (m.kind != kKindEat && m.kind != kKindKo))
+    if (m.reqId == 0 || m.targetUid == 0 || m.actorUid == 0 || m.targetUid == m.actorUid || !KindKnown(m.kind))
         return false;
+    if (m.dir == kDirRequest && m.kind == kKindBurn) return true;   /* T-1262: nothing after the header */
     if (m.dir == kDirRequest && m.kind == kKindKo)
         return m.source == kKoSourceStealth && (m.decided == kKoDecidedOwner || m.decided == kKoDecidedNpc)
             && FloatIn(m.skill, kKoSkillUnread, kKoSkillMax);
@@ -99,6 +105,7 @@ inline bool EffectMsgOk(const EffectMsg& m)
             return false;
         if (m.kind == kKindKo)   /* an outcome is carried exactly when the owner APPLIED one */
             return m.outcome <= kKoOutcomeNoticed && ((m.outcome != kKoOutcomeNone) == (m.result == kResultApplied));
+        if (m.kind == kKindBurn) return m.result != kResultDone;   /* T-1262: a burn is never DONE */
         return true;
     }
     return false;
@@ -106,6 +113,7 @@ inline bool EffectMsgOk(const EffectMsg& m)
 
 inline size_t EffectMsgSize(unsigned char dir, unsigned char kind)
 {
+    if (kind == kKindBurn) return (dir == kDirRequest) ? kBurnRequestSize : kBurnAnswerSize;   /* T-1262 */
     if (kind == kKindKo) return (dir == kDirRequest) ? kKoRequestSize : kKoAnswerSize;
     return (dir == kDirRequest) ? kEatRequestSize : kAnswerSize;
 }
@@ -123,9 +131,9 @@ inline bool EncodeEffect(std::vector<char>* b, const EffectMsg& m)
     std::memcpy(p + 6, &m.targetUid, 4);
     std::memcpy(p + 10, &m.actorUid, 4);
     if (m.dir == kDirRequest && m.kind == kKindKo) { p[14] = (char)m.source; p[15] = (char)m.decided; std::memcpy(p + 16, &m.skill, 4); }
-    else if (m.dir == kDirRequest) { std::memcpy(p + 14, &m.rate, 4); std::memcpy(p + 18, &m.budget, 4); p[22] = (char)m.flags; }
-    else { p[14] = (char)m.result; p[15] = (char)m.reason; if (m.kind == kKindKo) p[16] = (char)m.outcome; }
-    return true;
+    else if (m.dir == kDirRequest && m.kind == kKindEat) { std::memcpy(p + 14, &m.rate, 4); std::memcpy(p + 18, &m.budget, 4); p[22] = (char)m.flags; }
+    else if (m.dir == kDirAnswer) { p[14] = (char)m.result; p[15] = (char)m.reason; if (m.kind == kKindKo) p[16] = (char)m.outcome; }
+    return true;   /* T-1262: a BURN request is the header alone */
 }
 
 /* Nothing is written on a refusal. A longer payload is read up to its kind's size. */
@@ -135,15 +143,15 @@ inline int DecodeEffect(const char* p, size_t size, EffectMsg* out)
     EffectMsg m;
     m.dir = (unsigned char)p[0]; m.kind = (unsigned char)p[1];
     if (m.dir != kDirRequest && m.dir != kDirAnswer) return kDecodeBadDir;
-    if (m.kind != kKindEat && m.kind != kKindKo) return kDecodeBadKind;
+    if (!KindKnown(m.kind)) return kDecodeBadKind;
     std::memcpy(&m.reqId, p + 2, 4);
     std::memcpy(&m.targetUid, p + 6, 4);
     std::memcpy(&m.actorUid, p + 10, 4);
     if (size < EffectMsgSize(m.dir, m.kind)) return kDecodeTooShort;
     if (m.reqId == 0 || m.targetUid == 0 || m.actorUid == 0 || m.targetUid == m.actorUid) return kDecodeBadUid;
     if (m.dir == kDirRequest && m.kind == kKindKo) { m.source = (unsigned char)p[14]; m.decided = (unsigned char)p[15]; std::memcpy(&m.skill, p + 16, 4); }
-    else if (m.dir == kDirRequest) { std::memcpy(&m.rate, p + 14, 4); std::memcpy(&m.budget, p + 18, 4); m.flags = (unsigned char)p[22]; }
-    else { m.result = (unsigned char)p[14]; m.reason = (unsigned char)p[15]; if (m.kind == kKindKo) m.outcome = (unsigned char)p[16]; }
+    else if (m.dir == kDirRequest && m.kind == kKindEat) { std::memcpy(&m.rate, p + 14, 4); std::memcpy(&m.budget, p + 18, 4); m.flags = (unsigned char)p[22]; }
+    else if (m.dir == kDirAnswer) { m.result = (unsigned char)p[14]; m.reason = (unsigned char)p[15]; if (m.kind == kKindKo) m.outcome = (unsigned char)p[16]; }
     if (!EffectMsgOk(m)) return kDecodeBadField;
     *out = m;
     return kDecodeOk;
@@ -336,6 +344,178 @@ inline int KoClassDiffer(unsigned char decided, int ownerPc)
     if (decided == kKoDecidedOwner && ownerPc == 0) return kKoClassOwnerSaysNpc;
     return kKoClassSame;
 }
+
+/* ---- T-1262: BURN (kind 7) - A BODY FED INTO A CORPSE FURNACE ON A GAME THAT DOES NOT RUN IT. The carrier's job 'feed corpse into
+   machine' (1.0.65 0x140356740) runs on the CARRIER's game: the carrier lets go (0x5CD750) and the engine removes the body with the
+   reason 'incinerated or cooked' (removalreason.h: a final end). When the body is another game's character that game still has it:
+   the carrier's game opens a "burn pending" row for the body and asks its owner (REQUEST BURN; the body is the target, the carrier
+   the actor). The owner makes its copy of the carrier let go, when it still holds the body, and removes the body through the engine
+   with the same reason; its DESPAWN then removes every other game's copy. A body knocked out (or dead) on its owner's game is burned
+   (single player lets a player feed an unconscious person in; manager decision 2026-11-06); review fold 4: a body awake there that no
+   copy of the sender's carrier holds (it woke while the request travelled) is not - REFUSED state. ANSWER BURN: APPLIED, ALREADY (this
+   game burned it on an earlier request) or REFUSED (notMine, gone, busy: another character carries it there, or the owner's world
+   loaded while the request waited; state: the body is awake there, or the engine refused; notSenders too - unlike EAT it is
+   answered: an unanswered row would hold the body back on the carrier's game).
+   While a row is open a SPAWN of the body (the owner's re-send, its catch-up) is not built and the body is not booked as a lost
+   copy. A row closes on the owner's DESPAWN of the body, or on a REFUSED answer (then the lost-copy re-ask of before T-1262 runs:
+   the owner's world wins). An unanswered request is sent again when the owner becomes reachable again (its link comes back or it
+   arrives again in this world) or the body's owner changes (review fold 3), and any row's request is sent again when a SPAWN of the
+   body is held back (review fold 2: its owner still runs the body - a REFUSED answer can be lost), up to kBurnSpawnResendsMax times;
+   the next held SPAWN closes the row (the lost-copy re-ask) - events, never a timer (BurnRowStep). ---- */
+enum { kBurnWaiting = 0, kBurnAnswered = 1 };   /* a row: no answer yet / APPLIED or ALREADY (it waits for the owner's DESPAWN) */
+struct BurnRow
+{
+    unsigned int body, carrier, reqId;
+    int state;            /* kBurnWaiting / kBurnAnswered */
+    int reach;            /* the owner reachable at the last look (1) or not (0): a rise sends a waiting row again */
+    int hasPos;           /* the owner's last streamed spot of the body, for the lost-copy fallback */
+    float x, y, z;
+    unsigned int ownerKey;   /* review fold 3: the owner the request last went to (a change of owner sends it again) */
+    int spawnResends;     /* review fold 2: requests sent again on a held SPAWN of the body (capped: kBurnSpawnResendsMax) */
+    BurnRow() : body(0), carrier(0), reqId(0), state(kBurnWaiting), reach(0), hasPos(0), x(0.0f), y(0.0f), z(0.0f), ownerKey(0), spawnResends(0) {}
+};
+const size_t kBurnRowsMax = 64;
+struct BurnTable { std::vector<BurnRow> rows; long long dropped; BurnTable() : dropped(0) {} };
+inline int BurnFind(const BurnTable& t, unsigned int body)
+{
+    for (size_t i = 0; i < t.rows.size(); ++i) if (t.rows[i].body == body) return (int)i;
+    return -1;
+}
+/* Open (or refresh) the row of a body burned here. A full table drops its oldest row first (counted in `dropped`): that body's
+   re-sent copy is built again. 1 opened, 2 refreshed (the row is replaced whole), 0 refused (a body, carrier or request id of 0, or
+   the body named as its own carrier). */
+inline int BurnOpen(BurnTable* t, const BurnRow& r)
+{
+    if (t == 0 || r.body == 0 || r.carrier == 0 || r.reqId == 0 || r.body == r.carrier) return 0;
+    const int at = BurnFind(*t, r.body);
+    if (at >= 0) { t->rows[(size_t)at] = r; return 2; }
+    if (t->rows.size() >= kBurnRowsMax) { t->rows.erase(t->rows.begin()); ++t->dropped; }
+    t->rows.push_back(r);
+    return 1;
+}
+/* A SPAWN of `body` (a re-send or a catch-up), or a lost-copy booking of it: true = held back (its burn is pending). */
+inline bool BurnHoldsCopy(const BurnTable& t, unsigned int body) { return body != 0 && BurnFind(t, body) >= 0; }
+/* The owner's DESPAWN of `body`: its row closes. true = a row was closed. */
+inline bool BurnOnDespawn(BurnTable* t, unsigned int body)
+{
+    const int at = (t != 0 && body != 0) ? BurnFind(*t, body) : -1;
+    if (at < 0) return false;
+    t->rows.erase(t->rows.begin() + at);
+    return true;
+}
+/* An answer for `body` / `reqId` (a re-send keeps its row's request id). kBurnAnsWait: APPLIED or ALREADY - the row stays, answered,
+   until the DESPAWN; kBurnAnsFallback: REFUSED - the row closes and *closed holds it (the caller books the lost copy, as before
+   T-1262); kBurnAnsStale: no row, or the row of another request. */
+enum { kBurnAnsStale = 0, kBurnAnsWait = 1, kBurnAnsFallback = 2 };
+inline int BurnOnAnswer(BurnTable* t, unsigned int body, unsigned int reqId, unsigned char result, BurnRow* closed)
+{
+    const int at = (t != 0 && body != 0) ? BurnFind(*t, body) : -1;
+    if (at < 0 || t->rows[(size_t)at].reqId != reqId) return kBurnAnsStale;
+    if (result == kResultRefused)
+    {
+        if (closed != 0) *closed = t->rows[(size_t)at];
+        t->rows.erase(t->rows.begin() + at);
+        return kBurnAnsFallback;
+    }
+    t->rows[(size_t)at].state = kBurnAnswered;
+    return kBurnAnsWait;
+}
+/* A waiting row is sent again when its owner becomes reachable (in this world with a road up): reachable now and not at the last
+   look, or the session link changed (a new link) while it is reachable. An answered row is never sent again. */
+inline bool BurnResendDue(int state, int wasReach, int reachNow, int linkChanged)
+{
+    if (state != kBurnWaiting || reachNow == 0) return false;
+    return wasReach == 0 || linkChanged != 0;
+}
+/* T-1262 review fold 8: ONE ROW'S STEP, pure (effect.cpp BurnTick every frame with spawnHeld 0; EffectBurnHoldSpawn with spawnHeld
+   1). reachNow: the owner is in this world and the request's own road to it is up (review fold 1: SendEffectRequest's test);
+   ownerNow: the body's recorded owner now (0 none). Every send answers an event, and a send - gone or failed - is never repeated
+   without a new one (re-check: a failed send repeated at the next look would be sent every frame):
+   - a held SPAWN of the body: its owner still runs it, so the request is sent again whatever the row's state (review fold 2: a
+     REFUSED answer can be lost - it returns only by its request's road - and an owner's world load answers its queued requests
+     REFUSED busy), up to kBurnSpawnResendsMax times a row; the next held SPAWN closes the row (kBurnStepClose: the lost-copy re-ask
+     of before T-1262);
+   - a waiting row whose owner is reachable: sent again when the owner changed (review fold 3: a hand-over or a release - the old
+     owner's 'not mine' answer is not taken from a game that no longer owns the body), when the owner became reachable, or on a new
+     session link (BurnResendDue).
+   The DESPAWN and REFUSED closes are BurnOnDespawn / BurnOnAnswer. *why: kBurnWhy*. */
+enum { kBurnStepKeep = 0, kBurnStepSend = 1, kBurnStepClose = 2 };
+enum { kBurnWhyNone = 0, kBurnWhyReach = 1, kBurnWhyLink = 2, kBurnWhyOwner = 3, kBurnWhySpawn = 4, kBurnWhyCap = 5 };
+const int kBurnSpawnResendsMax = 4;
+inline int BurnRowStep(const BurnRow& r, int reachNow, int linkChanged, unsigned int ownerNow, int spawnHeld, int* why)
+{
+    int w = kBurnWhyNone, step = kBurnStepKeep;
+    if (spawnHeld != 0)
+    {
+        const bool capped = r.spawnResends >= kBurnSpawnResendsMax;
+        w = capped ? kBurnWhyCap : kBurnWhySpawn;
+        step = capped ? kBurnStepClose : kBurnStepSend;
+    }
+    else if (r.state == kBurnWaiting && reachNow != 0 && ownerNow != 0 && ownerNow != r.ownerKey) { w = kBurnWhyOwner; step = kBurnStepSend; }
+    else if (BurnResendDue(r.state, r.reach, reachNow, linkChanged)) { w = (r.reach == 0) ? kBurnWhyReach : kBurnWhyLink; step = kBurnStepSend; }
+    if (why != 0) *why = w;
+    return step;
+}
+/* After a step: reach takes the look's value and, after a send (road: the road it went by, 0 not sent - only logged), the owner
+   asked is kept whether the send went or not (re-check: a failed send is sent again on the next event - a new link, the owner
+   unreachable and back, another owner, a held SPAWN - never on the next look). A held SPAWN's send counts toward the cap and makes
+   the row waiting again (its owner still runs the body). kBurnStepClose: the caller removes the row. */
+inline void BurnRowAfter(BurnRow* r, int step, int why, int reachNow, unsigned int ownerNow, int road)
+{
+    (void)road;
+    if (r == 0 || step == kBurnStepClose) return;
+    r->reach = reachNow;
+    if (step != kBurnStepSend) return;
+    if (why == kBurnWhySpawn) { ++r->spawnResends; r->state = kBurnWaiting; }
+    r->ownerKey = ownerNow;
+}
+inline const char* BurnWhyName(int w)
+{
+    return w == kBurnWhyReach ? "its owner is reachable again" : (w == kBurnWhyLink ? "a new link to its owner"
+         : (w == kBurnWhyOwner ? "the body's owner changed" : (w == kBurnWhySpawn ? "its owner sent the body again (a held SPAWN)"
+         : (w == kBurnWhyCap ? "its owner sent the body again past the cap" : "none"))));
+}
+/* THE OWNER (MAIN THREAD): the request's check. A body this game burned on an earlier request is ALREADY (the answer a lost APPLIED
+   would have been). Else notMine, notSenders (the sender does not drive that carrier: answered for a BURN), gone. kBurnOwnApply: burn it
+   (the apply itself refuses BUSY when another character carries it here). */
+enum { kBurnOwnApply = 100, kBurnOwnAlready = 101 };
+inline int BurnOwnerCheck(bool burnedHereBefore, bool bodyMine, bool senderDrivesCarrier, bool bodyHere)
+{
+    if (burnedHereBefore) return kBurnOwnAlready;
+    if (!bodyMine) return kReasonNotMine;
+    if (!senderDrivesCarrier) return kReasonNotSenders;
+    if (!bodyHere) return kReasonGone;
+    return kBurnOwnApply;
+}
+/* THE OWNER: a request that arrived while engine writes are blocked (a load, a save) waits; one that waited longer than this is
+   refused BUSY (the carrier's game then books the lost copy). */
+const unsigned int kBurnOwnerWaitMs = 30000;
+enum { kBurnOwnRun = 0, kBurnOwnWait = 1, kBurnOwnRefuse = 2 };
+inline int BurnOwnerWhen(bool writesBlocked, unsigned int waitedMs)
+{
+    if (!writesBlocked) return kBurnOwnRun;
+    return waitedMs > kBurnOwnerWaitMs ? kBurnOwnRefuse : kBurnOwnWait;
+}
+/* The owner's apply (spawn.cpp BurnOwnBody: 1 removed, 0 not here, -2 another character carries it here, -3 awake there and no copy
+   of the sender's carrier holds it (review fold 4), -1 the engine refused or a fault) -> the answer's result; *reason its reason. */
+inline unsigned char BurnApplyAnswer(int rc, unsigned char* reason)
+{
+    unsigned char why = (unsigned char)kReasonNone, res = kResultApplied;
+    if (rc != 1) { res = kResultRefused; why = (unsigned char)(rc == 0 ? kReasonGone : (rc == -2 ? kReasonBusy : kReasonState)); }
+    if (reason != 0) *reason = why;
+    return res;
+}
+/* T-1262 review fold 4 (the owner, spawn.cpp BurnOwnBody): a body no copy of the sender's carrier holds there is removed only when it
+   is down there - dead or knocked out (awake 0). Awake (1: it woke while the request travelled, or was never down) or not read (-1)
+   is refused STATE, and the carrier's game books the lost copy (the owner's world wins). Held by the sender's carrier copy: removed
+   whatever its state (the carrier's game carried it to the furnace). */
+inline bool BurnOwnerMayRemove(bool heldBySendersCarrier, int awake) { return heldBySendersCarrier || awake == 0; }
+/* T-1262 review fold 6 (the owner, spawn.cpp BurnOwnBody): GameWorld::destroy's answer (1 true; 0 false, the engine postponed the
+   removal; -1 a fault) and whether the uid table still holds the body afterwards -> 1 removed / -1 not. The destroy detour
+   (worldgen.cpp) takes the body out of the uid table and announces its DESPAWN before the engine's own destroy answers: a postponed
+   removal (0) whose body is gone from the table reached it, and is APPLIED. A fault (-1) is not, gone or not (re-check: the table
+   mark comes before the DESPAWN is sent, so a fault between them leaves no DESPAWN - REFUSED is safe whichever arrives first). */
+inline int BurnDestroyOutcome(int destroyRc, bool stillInTable) { return (destroyRc == 1 || (destroyRc == 0 && !stillInTable)) ? 1 : -1; }
 
 /* ---- ROUTING (T-327 manager decision 5): by the target's OWNER, through the notebook (LIVE route SLOT) when that road is up,
    else the session link; exactly one road, never both (the M7a rule). The session peer rides the notebook only once it is proven

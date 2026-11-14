@@ -14,8 +14,8 @@ namespace coopsquad { struct SquadLeadMsg; }   /* T-1 B1 restructure: src/common
 namespace cooplo { struct ReleaseMsg; struct ReleaseAckMsg; }   /* src/common/liveowner.h [a1b2-hh0] */
 namespace coop {
 void HandoffTick();                                                                  // MAIN THREAD, 1 Hz inside
-void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMember* m, int count, unsigned int fromPeer, const unsigned int* gens);   /* M7a A1 build 1 [a1b1-hh0]: + the giver's gen per member */   /* protocol 84: reason (coopsquad::kXferReason*) */
-void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int fromPeer);   // F447
+void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMember* m, int count, unsigned int fromPeer, const unsigned int* gens, int wholeBits = 0);   /* T-1318 attempt 2: wholeBits - cooplo::kWholeBitLent (T-1122) | kWholeBitWorld (D3, protocol 226) */   /* T-1122 lent flag (protocol 224): lentWhole - the message says "lent squad - whole or none" */   /* M7a A1 build 1 [a1b1-hh0]: + the giver's gen per member */   /* protocol 84: reason (coopsquad::kXferReason*) */
+void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int fromPeer, const unsigned int* notInGroup, int notInGroupCount);   // F447. T-1239: + the ACK's tail - members refused as not in the leader's group there
 /* M7a A1 build 2 [a1b2-hh1] (design 2.3, 2.5), MAIN THREAD. ReleaseOnPutAway: NotifyDespawn's UNLOAD branch, own uid - collected into this
    frame's RELEASE batch (objWhole 0 = an off-thread destroy drained later: nothing read, its UNLOAD goes). ReleasePendingHas: uid is in an
    open release, this frame's batch, or an XFER awaiting its ACK - its UNLOAD is held. ApplyRemoteRelease / Ack: the RELEASE (68) and
@@ -52,16 +52,38 @@ int HandedOverSlot(void* faction, const std::string& id);   /* the one slot a wh
    earlier mark has no effect). The sweep, meeting a rebuilt person of a squad, clears its note and its mark (the person is live here
    again). A player gone: the squads handed to that player leave the index (HandedOverForgetPlayer, drained on the main thread). */
 bool HandedOverLeftBehindAny();
-void HandedOverLeftBehindRebuilt(void* faction, const std::string& id);
+void HandedOverLeftBehindRebuilt(void* faction, const std::string& id, const void* personAp = 0);   /* T-1318 a4 fold 1 (review LOW-1): personAp - the rebuilt person's awake engine squad (0 unread) */
+/* T-1318 a4 fold 1 (review MEDIUM-2): a wake of squad (faction, id) this game let through while the squad index has people of it given
+   (store.cpp detour_activate / the off-thread wake's drain) - noted; the sweep removes its re-made bodies whose own hand is given. MAIN THREAD. */
+void HandoffNoteWokeWithGiven(void* faction, const std::string& id);
+int HandoffWokeWithGiven(void* faction, const std::string& id);
 void HandedOverForgetPlayer(int slot);   /* MAIN THREAD - the player in `slot` left: the people handed to it leave the squad index (-1: the whole index) */
 void HandoffRevokesPlayerGone(int slot);   /* fold 2 [a1b2f2-hh0] [review G2]: MAIN THREAD - a player left: the REVOKEs waiting from it and owed to it drop (-1: none, counted) */
-void HandedOverUnmark(void* faction, const std::string& id, int why);   /* why 0 = a member taken back by hand-over, 1 = adopted by the sweep */
+void HandedOverUnmark(void* faction, const std::string& id, int why);   /* why 0 = a member taken back by hand-over (the one caller); 1 = adopted by the sweep - no caller since T-1318 (the sweep never adopts a given squad) */
 std::string HandoffReleaseReportToken();     /* [a1b2-hh2]: the release[...] / index[...] tokens of the [net] REPORT line */
 bool HandoffPendingHas(unsigned int uid);   /* M4 fold 2 (re-check L-C): this game's XFER naming uid awaits its ACK - MAIN THREAD */
 /* T-650 fold 2 (the announce pass's hold, worldsync.cpp): MAIN THREAD. HandoffOtherInWorldHasArea - an IN_WORLD game other than this one
    has the area of (x, z) loaded on the world server's map (1 yes, 0 no, -1 no fresh map); HandoffForcedRefusedFor - this game's forced
    hand-over of uid's squad was refused and is backed off now (the record ends when the squad's sector or receiver changes). */
 int HandoffOtherInWorldHasArea(float x, float z);
+/* T-1046 fix 2: the keep question's receiver test - the RELEASE's own ReceiversFor at (px, pz), nobody tried (k: -1 hold, 0 nobody,
+   >= 1 named; *namesSlot = wantSlot is named), and the position the RELEASE decides an awake squad at. MAIN THREAD. */
+int HandoffKeepReceivers(float px, float pz, int wantSlot, int* namesSlot, int* holderOut);
+int HandoffSquadKeepPos(void* activePlatoon, float* x, float* z);
+void HandoffKeepReceiverCounts(long long* skipped, long long* asked);
+/* T-1046 fold 2: a sleeping squad taken person by person (its own records' hands all given to one slot; -1 not), the cheap index test,
+   and the index's change count. MAIN THREAD. */
+int HandoffSquadHasGiven(void* faction, const std::string& id);
+int HandoffSquadHasGivenId(const std::string& id);   /* T-1318: any faction, by id - the given-wait's test (store.cpp GivenWaitTick) */
+int HandoffPersonGiven(void* faction, const std::string& id, const void* character);   /* T-1318 fold 1: this person given, by its hand (1), not (0), hand unread (-1) */
+void HandoffNoteOtherCopyPutAway(unsigned int uid, const void* obj);   /* T-1318 attempt 5 (D1-R3): another game's living copy put away by this engine - its hand and owner slot noted under its given squad. MAIN THREAD */
+int HandoffMembersTakenBy(void* faction, const std::string& id, void* const* members, int n);   /* T-1318 fold 1: an awake squad's members all given to one slot (that slot), else -1 */
+int HandoffSquadOpen(void* faction, const std::string& id);   /* T-1318 fold 2: an offer of the squad open here (RELEASE batch / record, XFER flight) - 1; faction 0 any */
+int HandoffOpenAny();   /* T-1318 fold 2: any offer open here */
+long long HandoffOpenSeq();   /* T-1318 fold 2: bumped when an offer closes */
+int HandoffGivenSlotId(const std::string& id);   /* T-1318 fold 2: the one slot the id's given people went to, else -1 */
+int HandoffSleepersTakenBy(void* faction, const std::string& id, const std::vector<std::string>& hands);
+long long HandoffIdxSeq();   /* review fold: receiver tests skipped (no other game has the area loaded) / run */
 bool HandoffForcedRefusedFor(unsigned int uid);
 /* a final leaver's NPC (handoff.cpp): the area receiver order asked in the leaver's place at the squad's decision position, without
    the receivers already passed over (k, first slot), and this game's take */

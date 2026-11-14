@@ -41,7 +41,7 @@
 namespace rulesfile {
 
 const unsigned int kMsgRulesChanged = 92u;   /* down only: {u32 count, [str key, str value]...}, an empty value = the row was removed */
-const unsigned int kProtocol = 145u;          /* the world-server protocol that carries RULES_CHANGED */
+const unsigned int kProtocol = 153u;          /* the world-server protocol that carries RULES_CHANGED */
 
 const char* const kFile = "rules.txt";
 const char* const kOldFile = "options.txt";

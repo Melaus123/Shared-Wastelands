@@ -91,6 +91,8 @@ const int kServerExitFormatRefused = 5;
    Kept here, beside exit 5, so the panel's header (panelstatus.h) words them without pulling in worldkeep.h. */
 const int kServerExitSlotsShrunk = 33;
 const int kServerExitWorldAside = 34;
+/* ... T-1280: when slots.txt is there and cannot be read (another program holds it) - read as empty it would make every player new */
+const int kServerExitSlotsUnreadable = 37;
 /* ... when the world's lock (server.lock) is held: another world server already runs this world (another Kenshi on this computer, or
    one left over after a crash). */
 const int kServerExitWorldLocked = 4;

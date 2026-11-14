@@ -142,7 +142,8 @@ rem added to PLUGIN_SRC is compiled and linked; nothing else lists it.
 set PLUGIN_SRC=coop.cpp hooks.cpp coop_log.cpp config.cpp addresses.cpp command_channel.cpp ai_spike.cpp spawn.cpp replicate.cpp combat.cpp medical.cpp ^
    identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp townver.cpp camp.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp fontguard.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp chat.cpp money.cpp admin.cpp kapi.cpp u8file.cpp teammap.cpp ^
    net\enet_transport.cpp net\session.cpp net\homeaddr.cpp net\routerask.cpp net\steam_probe.cpp net\steam_transport.cpp net\relay_test.cpp net\relay_bridge.cpp net\steam_friends.cpp ^
-   ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp
+   ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
+   ..\common\fileprobe.cpp
 if not exist obj\plugin mkdir obj\plugin
 echo [STEP] plugin compile %time%
 cl /nologo /MP8 /c /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^

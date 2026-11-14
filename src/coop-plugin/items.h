@@ -30,7 +30,14 @@
 
 namespace coop {
 int LeverNameUid(const std::string& w, unsigned int* uid, std::string* label);   /* TEST-ONLY: 1 resolved, 0 not a name form, -1 a name that did not resolve (label says why) */
-void LeverNoteSpawned(const std::string& templateName, unsigned int uid);   /* TEST-ONLY: notes a uid an [M1] spawned line named for that template (the `spawned:<Template>` form names the newest this game drives, else the newest) */
+void LeverNoteSpawned(const std::string& templateName, unsigned int uid);   /* TEST-ONLY: notes a uid an [M1] spawned line named for that template - a lever-made uid only (the `spawned:<Template>` form names the newest this game drives, else the newest) */
+/* lever1 TEST-ONLY (levermade.h): the characters the `spawn` lever made - on its game (spawn.cpp SpawnTemplate) and as copies whose
+   SPAWN said so (session.cpp OnSpawn). MAIN THREAD. */
+void LeverMarkMade(unsigned int uid, const std::string& label);   /* label "" = none (a copy learns its label from its name) */
+void LeverUnmarkMade(unsigned int uid);                            /* the lever's creation failed */
+bool LeverIsMade(unsigned int uid);
+std::string LeverMadeWords(unsigned int uid);                      /* "" or " lever-made" or " lever-made label '<l>'" for the [M1] spawned line */
+unsigned int LeverLabelTaken(const std::string& label);            /* the newest lever-made uid known here named <label>, 0 none */
 
 // One item move on the wire. `quantity` MEANS A DIFFERENT THING PER OP and that is deliberate - see the table:
 //   op 0 ADD    - the stack size of the item that entered the slot.
@@ -192,9 +199,15 @@ struct ItemRequestMsg
     unsigned long long askId;
     int askSlot;
     std::vector<coopbrec::BoxLedgerEntry> askCarry;
+    // T-1260 (game protocol 217, src/common/screentake.h): 1 = this TAKE or HOLD came from a player's screen take (the right-click take
+    // or the mouse pickup) whose engine road ran Inventory::deathCheck on the source item here - the game that runs the item's owner
+    // runs deathCheck on its own item just before its takeItemOut, so its own byte and its own knocked-out state decide. The 'STK1'
+    // block just before the ASK1 trailer; 0 on every other request (a give, a LAND, an AI take, a lever's take).
+    int screenTake;
     ItemRequestMsg() : id(0), dir(0), ownerUid(0), ownerIdKind(0), made(0), ownerX(0), ownerY(0), quantity(0), takerUid(0),
                        takerX(0), takerY(0), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0),
-                       trade(0), price(0), ownerBagDone(0), ownerBagShadowed(0), holdId(0u), holdHow(0), holdSlot(-1), askId(0ULL), askSlot(-1) {}
+                       trade(0), price(0), ownerBagDone(0), ownerBagShadowed(0), holdId(0u), holdHow(0), holdSlot(-1), askId(0ULL), askSlot(-1),
+                       screenTake(0) {}
 };
 
 // E22b. The owner's answer. `ok` 0 is a REFUSAL and the requester changes nothing at all - the item simply
@@ -339,6 +352,10 @@ bool BoxTest(const std::string& needle, const std::string& baseSid, int count);
 /* TEST-ONLY `boxtest cantmake <item string id>` (`off` clears): this game reads that item template as missing from its data, so a box
    whose world copy holds it keeps that row aside and refuses puts here. Only that answer changes. Returns the status line. */
 std::string BoxTestCantMake(const std::string& sid);
+/* T-1130 TEST-ONLY `boxtest plainkind <record id | box key>`: the named box's next write by this game (its writer) goes through the
+   ordinary record write as a plain box - kind 0, no undo list, its contents as now - the record the players' first-save race made;
+   [BOXREC] TEST-ONLY boxtest plainkind lines (armed, sent, the box's later writes and the world server's answers). Returns the status. */
+std::string BoxTestPlainKind(const std::string& arg);
 /* P17 TEST LEVER: boxtest's path into one chosen section - `input` = the section whose limit list names the item, any other text =
    the section of that name; no whole-inventory fallback after a refusal. MAIN THREAD, command channel only. */
 bool BoxTestIn(const std::string& needle, const std::string& baseSid, int count, const std::string& sectionWant);
@@ -378,7 +395,9 @@ std::string KeeperListCommand(const std::string& arg);   // T-164 B4-0: TEST, re
 void* GiveCounterPiece(const std::string& key, std::string* why);
 /* T-608 T1389 (TEST-ONLY): the owner class the NPC purchase gate now reads for that counter, and its writer - line words */
 std::string GiveCounterOwnerWords(void* piece, const std::string& key);
-bool BuyTestKeeper(const std::string& pick, int sell, int cats, int npc = 0, int stack = 0);   /* T-608 T1389: npc 1 = the NPC purchase path (stack 1 = one unit of a stack); T-164 B4-1: cats = the purse set first (-1 = not asked) */   // T-164 B4-0: TEST LEVER - `buytest keeper <n|ghost|own> [sell]`: BuyTest aimed at a keeperlist keeper, buyer walked to it first; ghost = home area held by the other game ([BUYTEST] keeper line)
+bool BuyTestKeeper(const std::string& pick, int sell, int cats, int npc = 0, int stack = 0, int hold = 0);   /* T-608 T1389: npc 1 = the NPC purchase path (stack 1 = one unit of a stack); T-164 B4-1: cats = the purse set first (-1 = not asked) */   // T-164 B4-0: TEST LEVER - `buytest keeper <n|ghost|own> [sell]`: BuyTest aimed at a keeperlist keeper, buyer walked to it first; ghost = home area held by the other game ([BUYTEST] keeper line)   /* T-1120: hold = seconds the window is kept open with nothing bought (0 = the buy as before) */
+int BuyTestHoldBusy();   /* T-1120 TEST LEVER: 1 = a `buytest keeper hold=` window is still held open */
+std::string ShopStaleCommand(int secs);   /* T-1120 TEST LEVER, MAIN THREAD: `shoptest stale <s>` (secs 1-60) | `shoptest stale off` (secs -1) - the holder's pushed shop-counter contents held back here s seconds, then applied in order; one status line */
 bool BuyTestChar(unsigned int uid, const std::string& nameText, int sell, int cats);   /* TEST LEVER: `buytest char <uid|name=<text>> sell [cats=<n>]` - sell one item to that character, no home or pack test ([STORE] buytest char line) */
 
 // P7i (T232 section 2/section 3) READ-ONLY LEVERS, MAIN THREAD, command channel only. T232's `boxtest rebirth ...` and
@@ -426,6 +445,11 @@ int ItResearchConsumeCall(void* research, void* data, int need);   /* the engine
 std::string RestockNowCommand(const std::string& arg);   /* par2: TEST-ONLY `restocknow <x>,<y>` - arms the lever; holder squads only. T-1 B2: `restocknow wander near` */
 std::string TraderSpawnCommand(const std::string& arg);   /* T-1 TEST-ONLY `traderspawn [dist] [animals]` (T-478: animals = the Nomads' animal seller squad) - arms the lever: one wandering trader caravan beside this game's player through the engine's own createRandomSquad */
 std::string BoxOpenCommand(const std::string& arg);      /* parity3: TEST-ONLY `boxopen <n>` - opens the n nearest non-player boxes one after another through the engine's loot open, then closes them */
+/* T-1199 fold 2 TEST-ONLY (items.cpp): `lootorder <box key part | nearest-peer>` - this game's player character gets the engine's own LOOT
+   order on that box (a right click's loot road); `dooruse <door key | nearest | last> me|npc` - this game's player character or its
+   nearest own NPC gets the engine's own OPEN_DOOR order on that door. MAIN THREAD. */
+std::string LootOrderCommand(const std::string& arg);
+std::string DoorUseCommand(const std::string& arg);
 void RestockNowDrain();                                   /* par2: the lever itself, at the K2 safe point (combat.cpp) */
 void ItWanderRestockNote(void* ap);   /* T-1 B2: MAIN THREAD - note a wandering squad's packs and wearers around this game's restock of it */
 /* T-1 B3 (owner 95), restructured (protocol 89): a squad's money rides MSG_SQUAD_LEAD (handoff.cpp). MAIN THREAD, all of them. */
@@ -570,11 +594,13 @@ void ShopNoteRequest(void* keeper, unsigned int asker, unsigned int epoch, unsig
 /* replicate.cpp: every player character's building key as its owner last said it (fresh words only); the count appended */
 int  PlayersInsideKeys(std::vector<std::string>* keys);
 /* The stored record put into the box at its area's load (items.cpp BoxApplyScan, from BoxRecTick). BoxRecWLinkLost: a link loss
-   forgets the stored generations refusals named and decides every box's apply again; BoxRecShopApplyPending: 1 while a shop's
-   stored stock in area (sx, sy) is not decided yet at this load (the area's restock waits for it). MAIN THREAD. */
+   forgets the stored generations refusals named and decides every box's apply again; BoxRecHomeApplyPending (T-1130): 1 while the
+   stored stock of the shop whose home building is `home` is not decided yet at this load - its own pieces, walked live from the home
+   (shopsetup::HomeApplyHold), whatever their records' kind; also 1 when the walk is torn (its restock waits), never for a home with
+   no interior. MAIN THREAD. */
 void BoxRecWLinkLost();
-int  BoxRecShopApplyPending(int sx, int sy);
-/* 1 = the box at `key` holds the world server's shop stock here: its kept record is a shop record with items and that record's
+int  BoxRecHomeApplyPending(void* home);
+/* 1 = the box at `key` holds the world server's shop stock here: its kept record (any kind, not a player's box) has items and that record's
    apply at this load is done, another game writes the box, or the record was refused (detour_refreshInventory's set-up restock
    rule). MAIN THREAD; 0 off it. */
 int  BoxRecShopStockApplied(const std::string& key);
@@ -583,7 +609,7 @@ std::string AddrReuseCommand(const std::string& arg);       /* TEST-ONLY `addrre
 std::string GroundTestCommand(const std::string& arg);      /* TEST-ONLY `groundtest list [r] | drop <section> <x> <y> | dropsid <sid> | pick <sid> [r]` */
 void ReportGround();                                        /* `report`: the [GROUND] REPORT line */
 int GrIsGroundKey(const char* key);                         /* 1 = a G| ground key */
-void GroundApplyMove(const ItemMoveMsg& m);                 /* MAIN THREAD, from ApplyItemMove: GROUND ADD / GONE from the holder */
+void GroundApplyMove(const ItemMoveMsg& m, unsigned int fromPeer);   /* MAIN THREAD, from ApplyItemMove: GROUND ADD / GONE from the holder (T-1100: or, on the holder, the previous holder's - fromPeer, its sender) */
 void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer);   /* MAIN THREAD, from ApplyItemRequest: a PUT / TAKE on the ground */
 int GroundNoteConfirm(const ItemConfirmMsg& cf);            /* MAIN THREAD, from ApplyItemConfirm: 1 = the answer to one of our ground requests */
 int GroundPutBackOk(void* item, const float* pos, const char* why);   /* inv7c fold: 1 = it was put back */
@@ -598,6 +624,7 @@ std::string CursorTestCommand(const std::string& arg);   /* p105h: TEST-ONLY `cu
 std::string BoxMoveCommand(const std::string& arg);
 std::string HoldTestCommand(const std::string& arg);   /* P105 build 2: TEST-ONLY `holdtest delay <s> [n] | refusenext <gone|busy|policy> | list` - the writer keeps the next n HOLD / LAND requests unprocessed for s seconds (released in arrival order), refuses the next HOLD, or lists its rows */
 void ItemsHoldSave(int phase, int onMainThread);       /* P105 build 2, the save pre-hooks (store.cpp): phase 0 before saveGame (every kept item back into its own square), 1 after it returns (lifted out again), 2 a saveLevelData outside a game save (a zone write: every hold put back and ended) */       /* p105h: TEST-ONLY `boxmove <boxKey> <section> <fx> <fy> <tx> <ty> [n]` - a move of n units (all when omitted) inside one box through the engine's own take-out + add */
+std::string ItemTestUndoFailCommand(const std::string& arg);   /* T-1266: TEST-ONLY `itemtest undofail [off]` - the next plain take from another game's character finds its source square taken at the put-back (a placeholder), so the put-back exit's ending runs */
 std::string ItemTestRefuseHereCommand(const std::string& arg);   /* T-164 B4-2: TEST-ONLY `itemtest refusehere <gate> [n]` - the REQUESTER takes that refusal exit after the early put-back (and refunds) */
 std::string ItemTestPackItemCommand(const std::string& arg);   /* T-215 (owner 177 a): TEST-ONLY `itemtest packitem [n]` - n sellable single items into this game's own seller's general grid */
 std::string ItemTestOwnerFullCommand(const std::string& arg);   /* T-608 (c): TEST-ONLY `itemtest ownerfull on|off` - as the OWNER, read the owner table as full: every character and box take / give refused busy */
@@ -638,6 +665,7 @@ int ItemOwnerApplyTo(void* item, const coopmark::OwnerId& o, const std::string& 
 void ItemOwnerNoteBadBlock();  /* inv6: session.cpp - an owner that would not encode (the item went clean) */
 void ItemGearOf(void* item, gearwire::GearMarks* out);   /* MAIN THREAD: a gear item's uniform and crafter as they travel (none for any other item) */
 int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string& sid);   /* MAIN THREAD: onto a fresh item, gear items only; 1 written */
+int ItemColourApplyTo(void* item, const std::string& colorSid);   /* T-1119, MAIN THREAD: onto a fresh kit item, the sent colour (coopgarment::kColour*) */
 void ItemGearNoteSent(int blocks, unsigned int dropped);   /* session.cpp: GEM1 blocks written, fields that went empty */
 void ItemGearNoteBadRecv();   /* session.cpp: a RECEIVED GEM1 block that was malformed */
 void ItemBagNestNoteBadRecv();   /* session.cpp / clothing.cpp: a RECEIVED pack-row BAGN tail that was malformed */
@@ -824,9 +852,12 @@ int  ItemRequestTargetSlot(const ItemRequestMsg& r);
    z within its +/-0.1 u window (ItBoxKeyNear; y not compared). 0 = not, or a key does not parse. No building is touched */
 int  BoxKeyNearKey(const char* have, const char* want);
 /* BED1 (T263/T264 poseBedUnresolved): the P7n key of the building whose interior LAYOUT made `piece`
-   (Building+0x238 -> Layout+0x90, the engine's own furnitureParentBuilding 0xD5F60). 1 = built; 0 = not layout
-   furniture, or no key. Guarded POD loads, then ObjectPositionKey (countIt 3, podPos 1). ANY THREAD. */
+   (Building+0x238 -> Layout+0x90, the engine's own furnitureParentBuilding 0xD5F60); T-860: when the piece has no layout (a
+   piece made from a saved area file), the building its own inside-building hand (Building+0x80, F1024) names, resolved with
+   hand::asBuilding - the same thread as the hand resolve its callers already make. 1 = built; 0 = neither road, or no key.
+   Guarded POD loads, then ObjectPositionKey (countIt 3, podPos 1). */
 int  LayoutOuterKey(void* piece, char* out, int cap);
+std::string OuterKeyReportToken();   /* T-860: " outerKey[layout,insideHandle,none]=a,b,c" */
 /* BED1: the hands of `outer`'s interior pieces - the boost::unordered_set<hand> at myInterior(+0x1F0)+0xE8 that
    createBuilding fills through 0x54E940 and collectInteriorBuildings 0x54A220 walks. Five u32 per piece into `ids`
    (type, container, containerStamp, index, serial - game/hand.h order), at most `cap` pieces; POD reads

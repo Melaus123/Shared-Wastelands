@@ -30,8 +30,9 @@ struct OwnStoreStat
     int       busy;
 };
 /* MAIN THREAD. Makes the folder (and its parents), reads the index (the highest seq is returned in *maxSeq, unparsable
-   lines in *badLines) and starts the writer thread once. Refuses (false) while a previous folder still has queued work. */
-bool OwnStoreOpen(const std::string& dir, unsigned long long* maxSeq, int* badLines);
+   lines in *badLines) and starts the writer thread once. Refuses (false) while a previous folder still has queued work, or (T-1280)
+   while its index is held by another program - then *indexHeld (when given) is true, so the caller names that cause. */
+bool OwnStoreOpen(const std::string& dir, unsigned long long* maxSeq, int* badLines, bool* indexHeld = 0);
 /* owner 429: the store folder's format number - read only (swformat::FormatDecide's verdict; *found = its number, 0 = no file); and
    the conversion of an open store to this build's number, format.txt written last. MAIN THREAD. */
 int  OwnStoreFormatCheck(const std::string& dir, unsigned int* found, std::string* why = 0);   /* why: an unreadable file's reason */

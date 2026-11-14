@@ -54,7 +54,7 @@ const unsigned int kHandPerOtherOff = 0xFFFFFFFFu;   /* T-1181 review: no per-pl
 inline std::string HandFile() { return "pp.handover"; }
 /* T-1181: lines this build cannot read, moved out of pp.handover (same records folder) - kept, never read back, never deleted */
 inline std::string HandSideFile() { return "pp.handover.unread"; }
-const unsigned int kGameProtocol = 213;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it) */
+const unsigned int kGameProtocol = 227;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it) */
 
 
 const unsigned int kMsgHandover  = 79;     /* MSG_ITEM_HANDOVER (net/transport.h, liveenvelope.h kInnerItemHandover assert it) */

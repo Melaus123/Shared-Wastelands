@@ -127,10 +127,12 @@
 #include "../common/farmwire.h"   /* T-1128 HIGH 1: WorkerIsCopy / MineWorkerSkip - the copy worker's step skipped, as factory work */
 #include "spawn.h"                /* T-1128 HIGH 1: FindSpawnedUid (address compares, any thread) */
 #include "config.h"               /* T-1128 HIGH 1: RoleIsSingle (any thread) */
+#include "../common/takeone.h"    /* T-1199: cooptake1::DoorOpenRefuse / OpenRefuse / OtherPlayerOwner - the pure decisions */
 #include <Windows.h>
 #include <intrin.h>   /* _ReturnAddress: which of OwnedByAPlayerFaction's sixteen callers is asking */
 #include <sstream>
 #include <cstdio>
+#include <cmath>    /* T-1122: std::sqrt - the [RAIDCAMP] team-near line's distance */
 #include <cstring>   /* strcmp: the stand-in guard compares the faction's OWN string id, not only its address */
 
 namespace {
@@ -1057,10 +1059,10 @@ int g_haulHeld = 0;
    a furnace, a machine - so a teammate's stand-in-owned storage never reached the compare at 0x59A39A. THE FIX (per site, F1038):
    the gather is hooked and, only when called from the storage search (its return address), marks this thread for the call; the
    filter is hooked and, only while that mark is set and only where the engine dropped the building, keeps a building whose owner
-   faction (vt+0x58) is in the teammate cells above (g_haulCells, the same team list). Every other caller of the filter (bed use
-   0x330A70, the AI's use / take finders 0x8C9700 / 0x8C97A0 / 0x8CDD10 / 0x8CF8A0 / 0x8DA0A0 / 0x8DA640, the other 17 callers of
-   the gather 0x9FF7C0) keeps the engine's answer. Only built when the compare is patched (g_haulCells): without it a kept
-   teammate's building would be skipped at 0x59A39A anyway. A searcher that does not count as the player is still skipped there.
+   faction (vt+0x58) is in the teammate cells above (g_haulCells, the same team list). T-1250 widens the filter's pass to its other
+   callers (below, teamstub::MayUsePass); the storage search's own passes are still counted on their own (g_haulPoolHits). Only
+   built when the compare is patched (g_haulCells, whose cells the filter reads): without it a kept teammate's building would be
+   skipped at 0x59A39A anyway. A searcher that does not count as the player is still skipped there.
    The search may run on the AI worker thread: the mark is a thread slot (TlsAlloc - this DLL loads late), and the cells are read
    as the stub reads them. Written once at InstallPolicy. */
 unsigned long long kHaulGatherRva = 0;    static AddrReg kHaulGatherRva_reg("HaulCandidatesGather", &kHaulGatherRva);     /* Steam_1.0.65 0x8CAFD0 */
@@ -1074,6 +1076,33 @@ DWORD g_haulPoolTls = TLS_OUT_OF_INDEXES;
 volatile LONGLONG g_haulPoolHits = 0;
 int g_haulPoolHooked = 0;
 const char* g_haulPoolWhy = "not tried";
+
+/* ---- T-1250 (parity with T-1150, owner 1187 a / 1499): A TEAMMATE'S BUILDINGS PASS THE FILTER FOR EVERY JOB ----------------------
+   The filter above is also asked by the engine's other building finders, which all dropped a teammate's building with an inventory
+   (Read, decomp 1.0.65; the T-1250 design read): the nearest allies' building 0x8C9700, the special-function building 0x8CDD10
+   (machines), the building scorer 0x8CF8A0, the turrets finder 0x8DA0A0, the cages finder 0x8DA640 (BuildingFinder_Cages: building
+   function type 8, vt+0x2F0, is a cage), and the area gathers 0x9FF7C0 / 0x9FAB00 only when their caller hands them an ownership
+   record (decomp_9ff7c0.txt:59-66): the haul gather 0x8CAFD0 (above) and the prisoner gatherings' cage checks 0x290B30 /
+   0x295AD0 (both then drop any cage whose owner faction is a player's, +0x250). The gathers' other twelve callers hand none - eight
+   tutorial triggers 0x98CFC0-0x9957A0, the crafting panel 0x2BED40, 0x340300, the outpost placing 0x4D6300 and 0x7B5A10 - and get
+   the relation test 0x6B22E0 (ally flag, or standing 50 or more) of the faction they pass, mostly this game's player faction
+   [PlayerInterface+0x2A0], never this filter; a teammate's stand-in passes that test while the team pin holds this game's side at
+   ally (100). The table search 0x8C97A0 refuses on its own test (vt+0x290) whatever the filter says. So, for ANY caller, a building the engine dropped is kept when its owner faction (vt+0x58) is a teammate's (the
+   cells above) AND the ownership record asked about is this game's own player faction's: record+0x70 (the filter compares it with
+   the building's faction, decomp_6207a0.txt:16) holds a PlayerInterface at +0x250 (coop::IsPlayerFaction, the engine's own player
+   test; a stand-in faction has none). An NPC's, a teammate's copy's (its stand-in faction) and every other faction's question keeps
+   the engine's answer; friends and strangers are never in the cells. One caller is left out by its return address: the bed cost
+   0x330A70 (row BedCostMayUseRet, 1.0.65 0x330BB2 / 1.0.68 0x330BF2). Read (decomp_330a70.txt): it answers 0 (free) for a bed of
+   an allied town faction before it asks the filter; a refusal there answers -1 (may not use); a pass goes on to 'public beds': -1
+   in a town that sells none, else 0 (free) when 0x791D20(town+0xD0) answers 0, else 'bed usage cost' - a pass could make a
+   teammate's bed free or charged, so it is left to the engine.
+   Without that row every caller but the storage search keeps the engine's answer. Counted: the job passes (g_mayUseJobHits) with
+   the last caller's return address (an RVA, for a run's readout: which finder asked), and the bed cost's teammate refusals left to
+   the engine (g_mayUseBedLeft). ANY THREAD (the finders run on the AI worker thread). Written once at InstallPolicy. */
+unsigned long long kBedCostRetRva = 0; static AddrReg kBedCostRetRva_reg("BedCostMayUseRet", &kBedCostRetRva);   /* Steam_1.0.65 0x330BB2 - ret */
+volatile LONGLONG g_mayUseJobHits = 0;
+volatile LONGLONG g_mayUseJobLastRet = 0;
+volatile LONGLONG g_mayUseBedLeft = 0;
 
 /* ANY THREAD: the storage search's own call marks this thread for the gather's length; every other caller runs the engine's as is */
 void detour_HaulGather(void* who, void* list, unsigned int kinds)
@@ -1090,21 +1119,360 @@ void detour_HaulGather(void* who, void* list, unsigned int kinds)
     __finally { ::TlsSetValue(g_haulPoolTls, prev); }
 }
 
-/* ANY THREAD: the engine's answer, except a building it dropped is kept while the storage search gathers on this thread and the
-   building's owner faction is a teammate's */
+/* ANY THREAD: the engine's answer, except a building it dropped whose owner faction is a teammate's is kept while the storage search
+   gathers on this thread (T-1150), or for any other caller but the bed cost when the record asked about is this game's player
+   faction's (T-1250) */
 char detour_HaulFilter(void* record, void* building, void* who)
 {
     const char keep = orig_HaulFilter(record, building, who);
-    if (keep != 0 || building == 0 || g_haulCells == 0 || g_haulPoolTls == TLS_OUT_OF_INDEXES) return keep;
-    const int inSearch = (::TlsGetValue(g_haulPoolTls) != 0) ? 1 : 0;
-    if (inSearch == 0) return keep;
+    if (keep != 0 || building == 0 || record == 0 || g_haulCells == 0 || g_haulPoolTls == TLS_OUT_OF_INDEXES) return keep;
     typedef void* (*FactionOfFn)(void*);
     void* fac = (*(FactionOfFn*)(*(char**)building + 0x58))(building);   /* the building's owner faction, as the filter reads it */
     const int mate = teamstub::MateCellsHas(g_haulCells->cell, kBoxCells, fac);
-    if (teamstub::HaulPoolPass((int)keep, inSearch, mate) == 0) return keep;
-    ::InterlockedIncrement64(&g_haulPoolHits);
+    if (mate == 0) return keep;
+    const int inSearch = (::TlsGetValue(g_haulPoolTls) != 0) ? 1 : 0;
+    const unsigned long long ret = (unsigned long long)(uintptr_t)_ReturnAddress();
+    /* no row: every caller is taken as the bed cost, so only the storage search's pass is given */
+    const int bedCost = (kBedCostRetRva == 0 || ret == (unsigned long long)(g_base + (uintptr_t)kBedCostRetRva)) ? 1 : 0;
+    /* the record's faction (non-zero: the engine answers 1 at once for a record without one) - this game's player faction? */
+    const int asker = (inSearch == 0 && bedCost == 0) ? (coop::IsPlayerFaction(*(::Faction**)((char*)record + 0x70)) ? 1 : 0) : 0;
+    const int pass = teamstub::MayUsePass((int)keep, inSearch, mate, asker, bedCost);
+    if (pass == teamstub::kMayUseKeptSearch) { ::InterlockedIncrement64(&g_haulPoolHits); return 1; }
+    if (pass == teamstub::kMayUseKeptJob)
+    {
+        ::InterlockedIncrement64(&g_mayUseJobHits);
+        ::InterlockedExchange64(&g_mayUseJobLastRet, (LONGLONG)(ret - (unsigned long long)g_base));
+        return 1;
+    }
+    if (inSearch == 0 && bedCost != 0 && kBedCostRetRva != 0) ::InterlockedIncrement64(&g_mayUseBedLeft);
+    return keep;
+}
+
+/* ---- T-1250: THIS PLAYER'S HUNGRY CHARACTERS EAT FROM A TEAMMATE'S FOOD STORES ---------------------------------------------------
+   The eating search BuildingFinder_LootFoodAndStuff (1.0.65 0x8D9D50 / 1.0.68 0x8DAC20) does not ask the filter above: it keeps a
+   building owned by the eater's own faction, else skips it for any eater whose faction is a player's - the 8-byte test at 1.0.65
+   0x8D9DD4 / 1.0.68 0x8DACA4 and its jne (bytes and polarity: src/common/teamstub.h, EatStubBuild). THE FIX: the test is replaced
+   (E9 rel32 + 3 NOPs, ending at the jne) by that stub on its own page: the original test (an eater of a non-player faction keeps the
+   engine's answer), else the building's owner [rsi+0x10] against the teammate cells - a match keeps the building (ZF=1, counted in
+   hits) - else the original test again (skipped as before). The cells are the team table's factions, written with the others
+   (PolicyTeammateFactions, main thread, only when they change), empty with no team: a friend's or a stranger's stores and every NPC
+   faction's keep the engine's rule. The search may run on the AI worker thread: the stub reads only rax, rsi and its own page and
+   writes no register. The food itself is then taken by the eat task, which sends the take to the game that holds the box
+   (items.cpp, the take-one road). Written once at InstallPolicy. */
+unsigned long long kFoodSearchTestRva = 0; static AddrReg kFoodSearchTestRva_reg("FoodStoreSearchOwnerTest", &kFoodSearchTestRva);   /* Steam_1.0.65 0x8D9DD4 - a patch site, not a function */
+using teamstub::kFoodSearchTestOrig;   /* the test, then its jne's opcode (src/common/teamstub.h, shared with the tests) */
+typedef char kFoodOrigIsTest8[(teamstub::kFoodSearchOrigLen == 10 && teamstub::kFoodSearchTestLen == 8) ? 1 : -1];
+typedef char kEatStubBeforeCells[(65 + 13 * kBoxCells <= (int)kBoxCellsOff) ? 1 : -1];
+BoxCells* g_eatCells = 0;
+const char* g_eatWhy = "not tried";
+int g_eatHeld = 0;
+int EatTestPatch(uintptr_t site)
+{
+    unsigned char now[teamstub::kFoodSearchOrigLen];
+    if (!BoxReadPod((const void*)site, now, teamstub::kFoodSearchOrigLen)) { g_eatWhy = "the site could not be read"; return 0; }
+    if (std::memcmp(now, kFoodSearchTestOrig, teamstub::kFoodSearchOrigLen) != 0) { g_eatWhy = "the 10 bytes at the site are not the expected test (another mod?)"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_eatWhy = "no page for the stub within a jump of the site"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_eatWhy = "the stub page is out of jump range"; return 0; }
+    BoxCells* cells = (BoxCells*)(stub + kBoxCellsOff);
+    for (int k = 0; k < kBoxCells; ++k) cells->cell[k] = 0;
+    cells->hits = 0;
+    if (teamstub::EatStubBuild(stub, (unsigned long long)site, kBoxCells, (int)kBoxCellsOff) != teamstub::EatStubLenFor(kBoxCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_eatWhy = "the stub came out at an unexpected length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[8];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    patch[5] = patch[6] = patch[7] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, 8, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_eatWhy = "VirtualProtect refused"; return 0; }
+    std::memcpy((void*)site, patch, 8);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, 8, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, 8);
+    g_eatCells = cells;
+    g_eatWhy = "patched";
     return 1;
 }
+
+/* ---- T-1250 fix attempt 2 (design A): A TEAMMATE'S OUTPOST PASSES THE TWO ENGINE TOWN GATES ON THIS GAME --------------------------
+   Run T2167: the host's hungry character fetched food in its own outpost; this game's character, inside the teammate's outpost
+   beside its stocked store, kept the town it had before ('Sho-Battai') and 'Getting food' never said yes - the two gates below,
+   both asking for this game's OWN player faction, which a teammate's outpost (shown here under the teammate's stand-in faction)
+   never is (bug class 'an engine rule gated on "player faction" that the mod's stand-in factions fail'; bytes and rules:
+   src/common/teamstub.h, kTownGateTestOrig).
+   GATE 1: the town update's own-faction town search (1.0.65 call 0x5A47D8, row TownUpdateOwnSearchRet = its return 0x5A47DD /
+   1.0.68 0x5A526D): the call's rel32 points at a jump page near it, to TeamTownSearch, which calls the original first with the same
+   six arguments; only with a team, and only when no town of this game's own player faction covers the spot at the caller's 1.25x
+   (TownContainsPoint 0x925E80, the caller's own test), it asks the same search once per teammate faction and returns the nearest
+   teammate town that covers the spot (teamstub::TeamTownTakeMate / TeamTownNearer). The caller then tests it at 1.25x again and
+   makes it the character's town, as it does for an own outpost. 0x927040 itself and its 34 other callers are not changed.
+   GATE 2: 'Getting food''s town test (row GetFoodTownGateTest, 1.0.65 0x59B261 / 1.0.68 0x59BCF1): `test al,al / je` is replaced
+   by teamstub::TownGateStubBuild's stub - the engine's yes stands; a no becomes a yes when the town's owner field (+0x10, the field
+   0x951190 compares) is a teammate's faction (counted in hits), else the no stands. Every ask is counted (calls).
+   Both read the team table's factions (PolicyTeammateFactions, main thread, only when they change; empty with no team, so with
+   no team nothing changes: gate 1 returns the engine's answer without asking more, gate 2's cells match nothing). A friend's,
+   a stranger's and every NPC faction's town keeps the engine's rule. Both may run on the AI worker thread: gate 1 calls only the
+   two engine reads the caller itself makes; gate 2 reads al, rsi and its own page.
+   NOT CHANGED (design A): the 'is at home town' AI condition 0x997110 and the nearest friendly town 0x926AD0 (the home point of a
+   squad with no home building) - both still ask town+0x10 / the town's set for the character's own faction, so they stay false
+   for a teammate's outpost. Written once at InstallPolicy. */
+unsigned long long kTownUpdOwnRetRva = 0; static AddrReg kTownUpdOwnRetRva_reg("TownUpdateOwnSearchRet", &kTownUpdOwnRetRva);   /* Steam_1.0.65 0x5A47DD - ret (the call at 0x5A47D8) */
+unsigned long long kTeamTownInsideRva = 0; static AddrReg kTeamTownInsideRva_reg("TownContainsPoint", &kTeamTownInsideRva);    /* Steam_1.0.65 0x925E80 (town, pos, scale): the spot is in the town */
+unsigned long long kTownGateTestRva = 0; static AddrReg kTownGateTestRva_reg("GetFoodTownGateTest", &kTownGateTestRva);       /* Steam_1.0.65 0x59B261 - a patch site, not a function */
+using teamstub::kTownGateTestOrig;   /* test al,al / je rel32 (src/common/teamstub.h, shared with the tests) */
+typedef char kTownStubBeforeCells[(72 + 13 * kBoxCells <= (int)kBoxCellsOff) ? 1 : -1];
+typedef char kTownCallsInPage[((int)kBoxCellsOff + (int)sizeof(BoxCells) + 8 <= 0x1000 && (int)sizeof(BoxCells) == 8 + 8 * kBoxCells) ? 1 : -1];
+const unsigned char kTeamTownNearestHead[11] = { 0x48, 0x8B, 0xC4, 0x4C, 0x89, 0x48, 0x20, 0x48, 0x89, 0x50, 0x10 };   /* 0x927040 [0x927F10]'s first 11 bytes (row TownListNearest) */
+const float kTeamTownScale = 1.25f;   /* the caller's own scale for the own-faction town (1.0.65 0x168AA14 = 1.25, Confirmed in the T-1250 check) */
+typedef void* (*TeamTownNearestFn)(void* list, const float* pos, void* faction, void* left, void* p5, int kind);
+typedef char (*TeamTownInsideFn)(void* town, const float* pos, float scale);
+TeamTownNearestFn g_town1Orig = 0;   /* the call's own target (the thunk), read from the site */
+void* volatile g_town1Cells[kBoxCells];   /* gate 1's teammate factions (main thread writes, any thread reads) */
+int g_town1Held = 0;
+const char* g_town1Why = "not tried";
+volatile LONG64 g_town1Calls = 0, g_town1Hits = 0, g_town1Faults = 0;
+BoxCells* g_town2Cells = 0;
+volatile LONG64* g_town2Calls = 0;   /* on the stub's page, after the cells */
+int g_town2Held = 0;
+const char* g_town2Why = "not tried";
+
+/* ANY THREAD (the town update runs in the AI's periodic step): the engine's answer, except - with a team, when no town of this
+   game's own player faction covers the spot - the nearest teammate's town that does */
+void* TeamTownSearch(void* list, const float* pos, void* faction, void* left, void* p5, int kind)
+{
+    void* own = g_town1Orig(list, pos, faction, left, p5, kind);
+    ::InterlockedIncrement64(&g_town1Calls);
+    if (faction == 0 || pos == 0 || kTeamTownInsideRva == 0) return own;
+    void* mates[kBoxCells];
+    int n = 0;
+    for (int k = 0; k < kBoxCells; ++k) { void* c = g_town1Cells[k]; if (c != 0 && c != faction) mates[n++] = c; }
+    if (n == 0) return own;   /* no team: nothing else asked */
+    const TeamTownInsideFn inside = (TeamTownInsideFn)(g_base + (uintptr_t)kTeamTownInsideRva);
+    int ownCovers = 0;
+    void* best = 0;
+    float bestD2 = 0.0f;
+    __try
+    {
+        ownCovers = (own != 0 && inside(own, pos, kTeamTownScale) != 0) ? 1 : 0;
+        for (int i = 0; i < n && ownCovers == 0; ++i)
+        {
+            void* t = g_town1Orig(list, pos, mates[i], left, p5, kind);
+            if (t == 0 || inside(t, pos, kTeamTownScale) == 0) continue;
+            const float* c = (const float*)((const char*)t + 0x48);   /* x at +0x48, z at +0x50: what the search measures */
+            const float dx = c[0] - pos[0], dz = c[2] - pos[2];
+            const float d2 = dx * dx + dz * dz;
+            if (teamstub::TeamTownNearer(best != 0 ? 1 : 0, bestD2, d2) != 0) { best = t; bestD2 = d2; }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ::InterlockedIncrement64(&g_town1Faults); return own; }
+    if (teamstub::TeamTownTakeMate(ownCovers, best != 0 ? 1 : 0) == 0) return own;
+    ::InterlockedIncrement64(&g_town1Hits);
+    return best;
+}
+/* at install: the site must be `call rel32` whose target (through its E9 thunk) starts with 0x927040's own bytes; the target is kept
+   as the original, a page near the site gets `jmp [rip] -> TeamTownSearch`, and the call's rel32 is pointed at it */
+int TeamTownGate1Install(uintptr_t site)
+{
+    unsigned char c[5], th[5], head[11];
+    if (!BoxReadPod((const void*)site, c, 5) || c[0] != 0xE8) { g_town1Why = "the site is not a call (another mod?)"; return 0; }
+    int rel = 0;
+    std::memcpy(&rel, c + 1, 4);
+    const uintptr_t target = site + 5 + (intptr_t)rel;
+    uintptr_t body = target;
+    if (!BoxReadPod((const void*)target, th, 5)) { g_town1Why = "the call's target could not be read"; return 0; }
+    if (th[0] == 0xE9) { int r2 = 0; std::memcpy(&r2, th + 1, 4); body = target + 5 + (intptr_t)r2; }
+    if (!BoxReadPod((const void*)body, head, 11) || std::memcmp(head, kTeamTownNearestHead, 11) != 0) { g_town1Why = "the call's target is not the town list's nearest-town search (another mod?)"; return 0; }
+    unsigned char* page = (unsigned char*)BoxAllocNear(site);
+    if (page == 0) { g_town1Why = "no page for the jump within reach of the site"; return 0; }
+    const long long nrel = (long long)((intptr_t)page - (intptr_t)(site + 5));
+    if (nrel > 0x7FFFFFF0LL || nrel < -0x7FFFFFF0LL) { ::VirtualFree(page, 0, MEM_RELEASE); g_town1Why = "the jump page is out of reach"; return 0; }
+    const unsigned long long to = (unsigned long long)(uintptr_t)&TeamTownSearch;
+    page[0] = 0xFF; page[1] = 0x25; page[2] = page[3] = page[4] = page[5] = 0x00;
+    std::memcpy(page + 6, &to, 8);
+    {   /* the written jump page becomes execute-read (T-940) */
+        DWORD was = 0;
+        if (!::VirtualProtect(page, 0x1000, PAGE_EXECUTE_READ, &was)) { ::VirtualFree(page, 0, MEM_RELEASE); g_town1Why = "the jump page could not be made execute-read"; return 0; }
+    }
+    ::FlushInstructionCache(::GetCurrentProcess(), page, 14);
+    g_town1Orig = (TeamTownNearestFn)target;
+    const int r32 = (int)nrel;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)(site + 1), 4, PAGE_EXECUTE_READWRITE, &oldProt)) { g_town1Orig = 0; ::VirtualFree(page, 0, MEM_RELEASE); g_town1Why = "VirtualProtect refused"; return 0; }
+    std::memcpy((void*)(site + 1), &r32, 4);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)(site + 1), 4, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, 5);
+    g_town1Why = "patched";
+    return 1;
+}
+/* at install: the 8 bytes at the site must be exactly `test al,al / je rel32` (kTownGateTestOrig, the same je distance on both
+   builds); the je's target is kept as the refusal, the stub is built on its own page and the site becomes `jmp stub` + 3 NOPs */
+int TeamTownGate2Install(uintptr_t site)
+{
+    unsigned char now[teamstub::kTownGateOrigLen];
+    if (!BoxReadPod((const void*)site, now, teamstub::kTownGateOrigLen)) { g_town2Why = "the site could not be read"; return 0; }
+    if (std::memcmp(now, kTownGateTestOrig, teamstub::kTownGateOrigLen) != 0) { g_town2Why = "the 8 bytes at the site are not the expected test (another mod?)"; return 0; }
+    int jrel = 0;
+    std::memcpy(&jrel, now + 4, 4);
+    const unsigned long long refuseTo = (unsigned long long)(site + 8 + (intptr_t)jrel);
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_town2Why = "no page for the stub within a jump of the site"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_town2Why = "the stub page is out of jump range"; return 0; }
+    BoxCells* cells = (BoxCells*)(stub + kBoxCellsOff);
+    for (int k = 0; k < kBoxCells; ++k) cells->cell[k] = 0;
+    cells->hits = 0;
+    volatile LONG64* calls = (volatile LONG64*)(stub + kBoxCellsOff + sizeof(BoxCells));
+    *calls = 0;
+    if (teamstub::TownGateStubBuild(stub, (unsigned long long)site, refuseTo, kBoxCells, (int)kBoxCellsOff) != teamstub::TownGateStubLenFor(kBoxCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_town2Why = "the stub came out at an unexpected length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[8];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    patch[5] = patch[6] = patch[7] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, 8, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_town2Why = "VirtualProtect refused"; return 0; }
+    std::memcpy((void*)site, patch, 8);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, 8, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, 8);
+    g_town2Calls = calls;
+    g_town2Cells = cells;
+    g_town2Why = "patched";
+    return 1;
+}
+
+/* ---- T-1309 (owner 1187 a, 512): A TEAMMATE'S GATE OR DOOR IS "MINE" TO THIS PLAYER'S CHARACTERS, AS THE OWNER'S OWN ----------------
+   The lock / unlock tasks (77 / 78 / 79 / 80, the player's unlock order 140, 162, 198) start only when the task-condition 0x46, the
+   engine's "is this object mine" test isObjectMine (row TaskObjectMineFactionTest's function: 1.0.65 0x5A3180 / 1.0.68 0x5A3C10),
+   says yes; the bash / smash tasks (81 / 123 / 226 / 272 / 287 / 290) ask it negated. Its one reference (Read, a full rel32 scan of
+   the 1.0.65 exe: the E9 thunk 0xABA0 and one `lea` of that thunk) is the condition table's registration at 0x61553D (`mov ecx,0x46`),
+   so it is asked only by the task-start check 0x60EEB0 - on the AI worker thread and on the main thread for a player's order. The
+   test ends with the faction compare (teamstub.h kMineFactionTestOrig: `cmp rax, rdi / sete al`, rax the asking character's faction,
+   rdi the object's, rsi the object). A teammate's gate or house door is owned on this game by that teammate's stand-in faction, so
+   B's unlock order on A's gate failed on this compare (T2268, F-T1309-MINE). THE FIX (design B, the compare only): the 6 bytes become
+   a jump to teamstub::MineStubBuild's stub - the same faction is the engine's yes, as before; otherwise the stub calls MineTeamAsk
+   with both factions and the object, and that answer is the result. MineTeamAsk (ANY THREAD: reads the cells below, the factions'
+   PlayerInterface field and the three object calls the engine itself made a moment earlier, all inside __try) applies
+   teamstub::MineTeamAnswer: yes only when one side is a CURRENT teammate's stand-in (the cells PolicyTeammateFactions writes on the
+   main thread when the team table changes; empty with no team), the other side is this game's player faction (its PlayerInterface)
+   or another teammate's, and the object is not on the engine's own-cage road; a stranger's, a non-team player's, a town's and an
+   NPC's object keep the engine's no, and with no team nothing is asked past the empty cells. Under owner 512 this also makes a
+   teammate's door "mine" for the bash tasks (a teammate does not bash it), and answers a teammate's copy asking about this player's
+   own building the same way (copies do not decide tasks here - their decisions are gated - so that side is the rule, not a road
+   seen in a run). The earlier answers of the test (the cage road's no, the occupant list's yes, the faction's +0x80 list's yes) are
+   untouched: they jump past the site to the epilogue. Written once at InstallPolicy. */
+unsigned long long kMineFactionTestRva = 0; static AddrReg kMineFactionTestRva_reg("TaskObjectMineFactionTest", &kMineFactionTestRva);   /* Steam_1.0.65 0x5A3341 - a patch site, not a function */
+using teamstub::kMineFactionTestOrig;   /* the compare and the epilogue's first two loads (src/common/teamstub.h, shared with the tests) */
+void* volatile g_mineCells[kBoxCells];   /* this game's current teammates' factions (main thread writes, any thread reads) */
+int g_mineHeld = 0;
+const char* g_mineWhy = "not tried";
+int g_minePatched = 0;
+volatile LONG64 g_mineAsks = 0, g_mineHits = 0, g_mineCage = 0, g_mineFaults = 0;
+typedef int (*MineKindFn)(void* thing);
+typedef void* (*MinePtrFn)(void* thing);
+/* the engine's own-cage road for this object (decomp_5a3180:23-27): kind (vt+0x20) 0, vt+0x78 non-null with +0x128 set, building
+   function (vt+0x2F0) 8; -1 when a read faults */
+int MineCagePod(void* thing)
+{
+    __try
+    {
+        void** vt = *(void***)thing;
+        if (((MineKindFn)vt[0x20 / 8])(thing) != 0) return 0;
+        void* const own = ((MinePtrFn)vt[0x78 / 8])(thing);
+        if (own == 0 || *(void* const*)((const char*)own + 0x128) == 0) return 0;
+        return (((MineKindFn)vt[0x2F0 / 8])(thing) == 8) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int MinePlayerPod(void* faction)   /* 1 the faction has a PlayerInterface (this game's player faction), 0 not, -1 a fault */
+{
+    __try { return (*(void* const*)((const char*)faction + 0x250) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* ANY THREAD - called by the stub only when the two factions differ (the engine's answer would be no); returns the answer (al) */
+int MineTeamAsk(void* askerFac, void* objFac, void* thing)
+{
+    ::InterlockedIncrement64(&g_mineAsks);
+    if (askerFac == 0 || objFac == 0 || thing == 0) return 0;
+    const int askerMate = teamstub::MateCellsHas(g_mineCells, kBoxCells, askerFac);
+    const int objMate = teamstub::MateCellsHas(g_mineCells, kBoxCells, objFac);
+    if (askerMate == 0 && objMate == 0) return 0;   /* no team, or no teammate's faction on either side: the engine's no */
+    const int askerPlayer = askerMate != 0 ? 0 : MinePlayerPod(askerFac);
+    const int objPlayer = objMate != 0 ? 0 : MinePlayerPod(objFac);
+    if (askerPlayer < 0 || objPlayer < 0) { ::InterlockedIncrement64(&g_mineFaults); return 0; }
+    if (teamstub::MineTeamAnswer(0, askerMate, askerPlayer, objMate, objPlayer, 0) == 0) return 0;
+    const int cage = MineCagePod(thing);
+    if (cage < 0) { ::InterlockedIncrement64(&g_mineFaults); return 0; }
+    if (teamstub::MineTeamAnswer(0, askerMate, askerPlayer, objMate, objPlayer, cage) == 0) { ::InterlockedIncrement64(&g_mineCage); return 0; }
+    ::InterlockedIncrement64(&g_mineHits);
+    return 1;
+}
+/* at install: the 16 bytes at the site must be exactly kMineFactionTestOrig; the stub is built on its own page (then execute-read)
+   and the site becomes `jmp stub` + 1 NOP */
+int MineTestInstall(uintptr_t site)
+{
+    unsigned char now[teamstub::kMineFactionOrigLen];
+    if (!BoxReadPod((const void*)site, now, teamstub::kMineFactionOrigLen)) { g_mineWhy = "the site could not be read"; return 0; }
+    if (std::memcmp(now, kMineFactionTestOrig, teamstub::kMineFactionOrigLen) != 0) { g_mineWhy = "the 16 bytes at the site are not the expected compare (another mod?)"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_mineWhy = "no page for the stub within a jump of the site"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_mineWhy = "the stub page is out of jump range"; return 0; }
+    if (teamstub::MineStubBuild(stub, (unsigned long long)site, (unsigned long long)(uintptr_t)&MineTeamAsk) != teamstub::kMineStubLen)
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_mineWhy = "the stub came out at an unexpected length"; return 0; }
+    {   /* the written stub page becomes execute-read (T-940); it holds no cells */
+        DWORD was = 0;
+        if (!::VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &was)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_mineWhy = "the stub page could not be made execute-read"; return 0; }
+    }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[teamstub::kMineFactionTestLen];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    patch[5] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, teamstub::kMineFactionTestLen, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_mineWhy = "VirtualProtect refused"; return 0; }
+    std::memcpy((void*)site, patch, teamstub::kMineFactionTestLen);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, teamstub::kMineFactionTestLen, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, teamstub::kMineFactionTestLen);
+    g_minePatched = 1;
+    g_mineWhy = "patched";
+    return 1;
+}
+
+/* ---- T-1122 (owner 1499, manager decision 2026-11-05): A TEAMMATE'S TOWN PASSES THE ASSAULT'S PLAYER-TOWN TEST -------------------
+   Package_PassingByTownAssault slot 12 (0x290410 / 1.0.68 0x290450, the assault-start test; T-1122 block below) goes on only for a
+   town whose faction is a player faction (Read, capstone on both Steam builds, 1.0.65 shown; build/decomp_290410.txt):
+     0x290481  call [rdx+0x58]                                 the town's faction (rax; the town rsi = the squad's target, null-checked)
+     0x290484  48 83 B8 50 02 00 00 00   cmp qword [rax+0x250], 0   its PlayerInterface*
+     0x29048C  0F 84 26 01 00 00         je 0x2905B8                EQUAL (ZF=1): not a player's town - return 0, no assault
+   So ZF=0 means "a player": the research bench's polarity. A teammate's outpost town is held on this game under the teammate's
+   stand-in faction (no PlayerInterface), so the raid on it never started its assault there (T2071: the borrower B holds A's outpost
+   as A's stand-in town). What follows the gate reads no PlayerInterface (Read): the town's faction again (vt+0x58), the squad
+   faction's relations +0x78 with the town's faction through 0x6B22E0 (an ally test: the faction pointer and the relation table only,
+   decomp_6b22e0), 0x7ABC10 on the squad, 0x28FFE0 with the squad's faction (decomp_28ffe0), the town's vt+0x2F0 (Town 0x951180:
+   town+0x3B0 != 0; TownBase 0x9502B0: 0), then the owner-faction search (the T-1122 sites below, with the team rule). THE FIX: the
+   research bench's stub on this test (Test8Patch, the same 8-byte test): a teammate's stand-in faction (the cells
+   PolicyTeammateFactions writes: this game's current teammates' factions, empty with no team) answers ZF=0, as a player's; this
+   game's own player faction as before (its PlayerInterface); every other faction - an NPC's, a non-team player's stand-in - as
+   before (teamstub::AssaultTownGate). The stub reads only rax and its own page. Written once at InstallPolicy. */
+unsigned long long kAssaultTownTestRva = 0; static AddrReg kAssaultTownTestRva_reg("AssaultTownPlayerTest", &kAssaultTownTestRva);   /* Steam_1.0.65 0x290484 - a patch site, not a function */
+using teamstub::kAssaultTownTestOrig;   /* the test, then its je's opcode (src/common/teamstub.h, shared with the tests) */
+typedef char kAssaultOrigIsTest8[(teamstub::kAssaultTownOrigLen == 10 && teamstub::kAssaultTownTestLen == 8) ? 1 : -1];   /* Test8Patch's shape */
+BoxCells* g_assaultCells = 0;
+const char* g_assaultWhy = "not tried";
+int g_assaultHeld = 0;
+long long g_assaultSaidAt = 0;   /* MAIN THREAD: the hits at the last line */
+int g_assaultSaid = 0;
+const int kAssaultSayCap = 5;
+DWORD g_assaultLookAt = 0;
 
 /* ---- T-1128 review HIGH 1: A COPY WORKER'S RESEARCH IS COUNTED ON ITS OWN GAME ONLY ---------------------------------------------
    ResearchBuilding::operate (row ResearchOperate: 1.0.65 0x29B890 / 1.0.68 0x29B8D0, the ResearchBuilding vtable's +0x4B0 on both
@@ -1244,6 +1612,7 @@ bool g_kitDirty = true;        /* MAIN THREAD: a faction list changed - classify
 long long g_kitRelEp = -1;
 int g_kitPol = -1, g_kitMe = -2;
 void* g_kitMine = 0;
+void* volatile g_kitMineAny = 0;   /* T-1122: this game's own player faction for any thread - set with the table, 0 while engine writes are blocked */
 DWORD g_kitAt = 0;
 long long g_kitBuilds = 0;     /* full classifications */
 int g_kitLike = 0, g_kitLikeDrops = 0;   /* teammates + allowed friends in the stub cells; those past the cells */
@@ -1330,10 +1699,12 @@ void KitBuild(bool classify)
     const void* facs[kKitCap];
     int who[kKitCap];
     int n = 0;
+    void* mineAny = 0;
     if (!coop::EngineWritesBlocked())
     {
         const int pol = coop::BasePolicyValue();
         ::Faction* mine = coop::LocalPlayerFaction();
+        if (Plaus(mine)) mineAny = (void*)mine;
         for (int k = 0; k < g_kitMatesN; ++k) KitAdd(facs, who, &n, g_kitMates[k], swaccess::kTeam);
         for (int k = 0; k < kFoliageCells; ++k)
         {
@@ -1364,6 +1735,7 @@ void KitBuild(bool classify)
         g_kitFac[k] = (k < n) ? (void*)facs[k] : 0;
     }
     ::InterlockedExchange(&g_kitN, (LONG)n);
+    g_kitMineAny = mineAny;
     for (int c = 0; c < swaccess::kWhoCount; ++c) g_kitCount[c] = 0;
     for (int k = 0; k < n; ++k) if (who[k] >= 0 && who[k] < swaccess::kWhoCount) ++g_kitCount[who[k]];
     /* the stubs' cells: teammates and allowed friends - a faction keeps its cell while it stays */
@@ -1391,6 +1763,259 @@ void KitBuild(bool classify)
 }
 /* a list changed: freed factions leave at once, the classes are judged again at the next tick */
 void KitListChanged() { KitBuild(false); g_kitDirty = true; }
+
+/* ---- T-1122 (owner 1499): A RAID COUNTS THE BASE OWNER'S TEAMMATES AS THE OWNER'S OWN -----------------------------------------------
+   Three engine tests on a raid's road look for characters of the town owner's faction through that faction's find-near (vtable slot
+   0, row Faction_findNear, 1.0.65 0x6BA4D0 / 1.0.68 0x6BA820: void(faction, list, centre, radius, flag) - it walks THAT faction's
+   own squads (+0x210 count, +0x218 array, 0x6B9C80 per squad) and appends what it finds to the list; decomp_6ba4d0). Each makes the
+   list itself, calls the search with radius 2500 (the float 0x16ADF20) and frees the list (Read, build/decomp_*.txt for 1.0.65):
+   1 announce - the announcement task's update (0x355710) starts the talk only when its owner test (row
+     TaskMakeAnnouncement_ownerNear, 0x354930 / 0x354990) answers 'count (+8) != 0'; the centre is the speaker's spot (vt+0x38)
+     (decomp_354930; Confirmed T2071: with only the owner's teammate at the base the test found 0 and the raid waited);
+   2 assaultStart - Package_PassingByTownAssault (vtable 1.0.65 0x16ADCB8, RTTI .?AVPackage_PassingByTownAssault@@) slot 12 (row
+     PassingByTownAssault_canStart, 0x290410 / 0x290450): for a town whose faction has a PlayerInterface (+0x250 != 0 - so only on the
+     game whose player owns the town; another player's stand-in town returns 0 before the search), not allied to the raiders, and two
+     more engine tests, it answers 1 only when the search around the town's spot (vt+0x40, flag 0) finds someone (decomp_290410);
+   3 assaultTargets - the same package's slot 6 (row PassingByTownAssault_fillTargets, 0x290080 / 0x2900C0): the raiders' target
+     list (+0xD8) is filled with every character the search around the town's spot finds (decomp_290080).
+   A teammate is another faction, so none of the three counted one. THE FIX (owner 1499: a teammate imitates being in the same
+   faction, with its benefits and its negatives): each of the three is hooked and marks this thread with its site while the engine's
+   own runs (a thread slot, as the T-1150 storage search's mark above); the find-near is hooked and, only for the marked site's own
+   call (its return address inside that site's function) and only once per mark, repeats the same search (the same list, centre,
+   radius and flag) for each other faction whose player shares a team with the town owner's player: for the two yes / no tests only
+   when the engine found nobody, stopping at the first that finds someone; for the target list always, every teammate's
+   (teamstub::RaidNearWiden / RaidNearStopAtFirst). The candidates: this game's own player faction and every other player's faction
+   the kit table holds (stand-ins and the coop-p<n> records a save carries); a faction's player is its slot (StandInSlotAnyPod; this
+   game's own faction - the one with a PlayerInterface - is MySlotForWire), the team rule is teamstub::RaidNearSameTeam (team.cpp
+   TeamSameAnyThread's rule) on the any-thread team index. A town of an NPC faction (no player's slot), or an owner in no team, adds
+   nothing; outside a mark the find-near is the engine's as is. What is added goes into the site's own list, used as the engine uses
+   it (a count, or the targets) and freed by the engine. ANY THREAD (the sites run where the engine runs the AI); the kit table and
+   the own-faction pointer are read as the kit's other readers read them (written on the main thread, emptied while engine writes
+   are blocked). Each call the rule changed is recorded; the first kRaidNearRecs a session for each site are printed on the main
+   thread as [RAIDCAMP] lines, then only counted. Hooked once at InstallPolicy. */
+unsigned long long kRaidFindNearRva = 0;      static AddrReg kRaidFindNearRva_reg("Faction_findNear", &kRaidFindNearRva);                         /* Steam_1.0.65 0x6BA4D0 */
+unsigned long long kRaidOwnerNearRva = 0;     static AddrReg kRaidOwnerNearRva_reg("TaskMakeAnnouncement_ownerNear", &kRaidOwnerNearRva);        /* Steam_1.0.65 0x354930 */
+unsigned long long kRaidAssaultStartRva = 0;  static AddrReg kRaidAssaultStartRva_reg("PassingByTownAssault_canStart", &kRaidAssaultStartRva);   /* Steam_1.0.65 0x290410 */
+unsigned long long kRaidAssaultTargetsRva = 0; static AddrReg kRaidAssaultTargetsRva_reg("PassingByTownAssault_fillTargets", &kRaidAssaultTargetsRva);   /* Steam_1.0.65 0x290080 */
+/* each site's function length (tools/gen_table_1068.py: the whole function, the same bytes on 1.0.65 and 1.0.68): its find-near
+   call's return address lies inside it */
+const unsigned long long kRaidSiteLen[4] = { 0, 399, 450, 470 };
+typedef bool (*RaidOwnerNearFn)(void* task, void* obj, void* speaker, unsigned long long a4);
+typedef unsigned long long (*RaidPackageFn)(void* package, unsigned long long a2, unsigned long long a3, unsigned long long a4);
+typedef void (*RaidFindNearFn)(void* faction, void* list, void* centre, float radius, unsigned char flag);
+typedef void (*RaidGetPosFn)(void*, float*);
+RaidFindNearFn orig_RaidFindNear = 0;
+RaidOwnerNearFn orig_RaidOwnerNear = 0;
+RaidPackageFn orig_RaidAssaultStart = 0;
+RaidPackageFn orig_RaidAssaultTargets = 0;
+DWORD g_raidNearTls = TLS_OUT_OF_INDEXES;
+uintptr_t g_raidSiteAt[4] = { 0, 0, 0, 0 };   /* each site's function start in this process (InstallPolicy) */
+int g_raidNearHooked[4] = { 0, 0, 0, 0 };     /* [0] the find-near, [site] that site: 1 hooked */
+const char* g_raidNearWhy = "not tried";
+volatile LONGLONG g_raidNearTests[4] = { 0, 0, 0, 0 }, g_raidNearEngine[4] = { 0, 0, 0, 0 }, g_raidNearTeamFound[4] = { 0, 0, 0, 0 }, g_raidNearTeamNone[4] = { 0, 0, 0, 0 };
+volatile LONGLONG g_raidNearFaults = 0, g_raidNearOutside = 0;
+const int kRaidNearRecs = 8;   /* per site */
+struct RaidNearRec { volatile LONG ready; int ownerSlot, foundSlot, own, before, added, posRead; void* owner; void* found; float c[3]; float radius, dist; };
+RaidNearRec g_raidNearRec[4][kRaidNearRecs];
+volatile LONG g_raidNearClaimed[4] = { 0, 0, 0, 0 };
+int g_raidNearPrinted[4] = { 0, 0, 0, 0 };   /* MAIN THREAD */
+
+/* the find-near list's count (+8; each site reads this count). 1 read, 0 faulted. */
+int RaidListCountPod(const void* list, int* n)
+{
+    __try { *n = *(const int*)((const char*)list + 0x08); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the centre the search was given (the speaker's spot, or the town's), and entry `at`'s position (the list's data +0x10; RootObject
+   vt+0x40 getPosition, as BuildingPosPod reads a building's - Inferred for the characters the list holds). 1 both read, 0 not. */
+int RaidNearPosPod(const void* centre, const void* list, int at, float* c, float* pos)
+{
+    __try
+    {
+        const float* v = (const float*)centre; c[0] = v[0]; c[1] = v[1]; c[2] = v[2];
+        void* const* data = *(void* const* const*)((const char*)list + 0x10);
+        void* o = data[at];
+        if (!Plaus(o)) return 0;
+        void** vt = *(void***)o;
+        float p[3] = { 0, 0, 0 };
+        ((RaidGetPosFn)vt[8])(o, p);
+        pos[0] = p[0]; pos[1] = p[1]; pos[2] = p[2];
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* ANY THREAD: the engine's search for one candidate faction, fault-guarded. The candidate comes from the kit table, which the main
+   thread rewrites (KitBuild) while this runs on the AI thread, so the faction may have been freed between the read and the call.
+   POD arguments only (no C++ objects here: __try). 1 searched, 0 faulted. */
+int RaidFindNearPod(void* faction, void* list, void* centre, float radius, unsigned char flag)
+{
+    __try { orig_RaidFindNear(faction, list, centre, radius, flag); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* ANY THREAD: one call a teammate changed - kept for the main thread's line (the first kRaidNearRecs a session for each site) */
+void RaidNearRecord(int site, void* owner, int ownerSlot, void* found, int foundSlot, int own, int before, int added, const void* centre, const void* list, int firstAt, float radius)
+{
+    if (site < 1 || site > teamstub::kRaidSites) return;
+    const LONG i = ::InterlockedIncrement(&g_raidNearClaimed[site]) - 1;
+    if (i < 0 || i >= kRaidNearRecs) return;
+    RaidNearRec& r = g_raidNearRec[site][i];
+    r.owner = owner; r.ownerSlot = ownerSlot; r.found = found; r.foundSlot = foundSlot; r.own = own; r.before = before; r.added = added; r.radius = radius;
+    r.c[0] = r.c[1] = r.c[2] = 0.0f; r.dist = -1.0f;
+    float pos[3] = { 0, 0, 0 };
+    r.posRead = RaidNearPosPod(centre, list, firstAt, r.c, pos);
+    if (r.posRead == 1)
+    {
+        const float dx = pos[0] - r.c[0], dy = pos[1] - r.c[1], dz = pos[2] - r.c[2];
+        r.dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    ::InterlockedExchange(&r.ready, 1);
+}
+/* ANY THREAD: the same search for each faction of a player who shares the town owner player's team (the yes / no sites: until one
+   finds someone; the target list: every one). `before` = what the engine's own search left in the list. */
+void RaidNearTeam(int site, void* owner, void* list, void* centre, float radius, unsigned char flag, int before)
+{
+    const int me = coop::MySlotForWire();
+    void* pi = 0;
+    const int piRead = IsPlayerFieldPod(owner, &pi);
+    if (piRead == -1) { ::InterlockedIncrement64(&g_raidNearFaults); return; }
+    const int ownerSlot = (piRead == 1 && pi != 0) ? me : StandInSlotAnyPod(owner);
+    const unsigned ownerTeam = coop::TeamNoOfSlotAnyThread(ownerSlot);
+    if (ownerSlot < 0 || ownerTeam == 0) return;   /* an NPC faction's town, or an owner in no team: the engine's answer */
+    const int kCand = kKitCap + 1;
+    void* cand[kCand]; int slot[kCand]; unsigned team[kCand]; int own[kCand];
+    int n = 0;
+    void* const mine = g_kitMineAny;
+    if (Plaus(mine) && mine != owner) { cand[n] = mine; slot[n] = me; team[n] = coop::TeamNoOfSlotAnyThread(me); own[n] = 1; ++n; }
+    const int kn = (int)g_kitN;
+    for (int k = 0; k < kn && k < kKitCap && n < kCand; ++k)
+    {
+        void* const f = g_kitFac[k];
+        if (!Plaus(f) || f == owner || f == mine) continue;
+        cand[n] = f; slot[n] = StandInSlotAnyPod(f); team[n] = coop::TeamNoOfSlotAnyThread(slot[n]); own[n] = 0; ++n;
+    }
+    int pick[kCand];
+    const int np = teamstub::RaidNearPick(ownerSlot, ownerTeam, slot, team, n, pick, kCand);
+    int total = before, firstK = -1, firstAt = before, faulted = 0;
+    for (int i = 0; i < np; ++i)
+    {
+        const int k = pick[i];
+        /* a fault stops the repeats for this call; what the list holds stays as the engine's site sees it */
+        if (RaidFindNearPod(cand[k], list, centre, radius, flag) != 1) { ::InterlockedIncrement64(&g_raidNearFaults); faulted = 1; break; }
+        int got = 0;
+        if (RaidListCountPod(list, &got) != 1)
+        {
+            ::InterlockedIncrement64(&g_raidNearFaults);
+            if (firstK >= 0) ::InterlockedIncrement64(&g_raidNearTeamFound[site]);   /* an earlier teammate's search already added */
+            return;
+        }
+        if (got > total)
+        {
+            if (firstK < 0) { firstK = k; firstAt = total; }
+            total = got;
+            if (teamstub::RaidNearStopAtFirst(site) != 0) break;
+        }
+    }
+    if (firstK < 0) { if (faulted == 0) ::InterlockedIncrement64(&g_raidNearTeamNone[site]); return; }
+    ::InterlockedIncrement64(&g_raidNearTeamFound[site]);
+    RaidNearRecord(site, owner, ownerSlot, cand[firstK], slot[firstK], own[firstK], before, total - before, centre, list, firstAt, radius);
+}
+/* ANY THREAD: the three sites - the engine's own, with this thread marked with the site for its length */
+bool detour_RaidOwnerNear(void* task, void* obj, void* speaker, unsigned long long a4)
+{
+    ::InterlockedIncrement64(&g_raidNearTests[teamstub::kRaidSiteAnnounce]);
+    LPVOID prev = ::TlsGetValue(g_raidNearTls);
+    ::TlsSetValue(g_raidNearTls, (LPVOID)(uintptr_t)teamstub::kRaidSiteAnnounce);
+    bool ans = false;
+    __try { ans = orig_RaidOwnerNear(task, obj, speaker, a4); }
+    __finally { ::TlsSetValue(g_raidNearTls, prev); }
+    return ans;
+}
+unsigned long long detour_RaidAssaultStart(void* package, unsigned long long a2, unsigned long long a3, unsigned long long a4)
+{
+    ::InterlockedIncrement64(&g_raidNearTests[teamstub::kRaidSiteAssaultStart]);
+    LPVOID prev = ::TlsGetValue(g_raidNearTls);
+    ::TlsSetValue(g_raidNearTls, (LPVOID)(uintptr_t)teamstub::kRaidSiteAssaultStart);
+    unsigned long long ans = 0;
+    __try { ans = orig_RaidAssaultStart(package, a2, a3, a4); }
+    __finally { ::TlsSetValue(g_raidNearTls, prev); }
+    return ans;
+}
+unsigned long long detour_RaidAssaultTargets(void* package, unsigned long long a2, unsigned long long a3, unsigned long long a4)
+{
+    ::InterlockedIncrement64(&g_raidNearTests[teamstub::kRaidSiteAssaultTargets]);
+    LPVOID prev = ::TlsGetValue(g_raidNearTls);
+    ::TlsSetValue(g_raidNearTls, (LPVOID)(uintptr_t)teamstub::kRaidSiteAssaultTargets);
+    unsigned long long ans = 0;
+    __try { ans = orig_RaidAssaultTargets(package, a2, a3, a4); }
+    __finally { ::TlsSetValue(g_raidNearTls, prev); }
+    return ans;
+}
+/* ANY THREAD: the engine's search first; for a marked site's own call (once per mark), the teammates' as that site needs */
+void detour_RaidFindNear(void* faction, void* list, void* centre, float radius, unsigned char flag)
+{
+    orig_RaidFindNear(faction, list, centre, radius, flag);
+    if (g_raidNearTls == TLS_OUT_OF_INDEXES) return;
+    const int site = (int)(uintptr_t)::TlsGetValue(g_raidNearTls);
+    if (site < 1 || site > teamstub::kRaidSites) return;
+    const unsigned long long ret = (unsigned long long)(uintptr_t)_ReturnAddress();
+    if (teamstub::RaidNearCallInside(ret, (unsigned long long)g_raidSiteAt[site], kRaidSiteLen[site]) == 0) { ::InterlockedIncrement64(&g_raidNearOutside); return; }
+    ::TlsSetValue(g_raidNearTls, (LPVOID)0);   /* the site's one search; the site's __finally puts the mark back as it was */
+    int n = 0;
+    if (list == 0 || RaidListCountPod(list, &n) != 1) { ::InterlockedIncrement64(&g_raidNearFaults); return; }
+    if (teamstub::RaidNearWiden(site, n != 0 ? 1 : 0) == 0) { ::InterlockedIncrement64(&g_raidNearEngine[site]); return; }
+    RaidNearTeam(site, faction, list, centre, radius, flag, n);
+}
+std::string RaidNearF(float v) { char b[32]; _snprintf(b, 31, "%.0f", v); b[31] = 0; return b; }
+std::string RaidNearWho(int slot)
+{
+    const std::string nm = coop::TeamPlayerName(slot);
+    return "slot " + PN((long long)slot) + (nm.empty() ? std::string() : " '" + nm + "'");
+}
+/* the REPORT's per-site figures: name:hooked,tests,engineFound,teamFound,teamNone */
+std::string RaidNearSiteText(int site)
+{
+    return std::string(teamstub::RaidSiteName(site)) + ":" + PN((long long)g_raidNearHooked[site]) + "," + PN((long long)g_raidNearTests[site]) + "," + PN((long long)g_raidNearEngine[site])
+         + "," + PN((long long)g_raidNearTeamFound[site]) + "," + PN((long long)g_raidNearTeamNone[site]);
+}
+/* MAIN THREAD (PolicyKitTick): each recorded call's line, in order, site by site */
+void RaidNearLook()
+{
+    if (g_assaultCells != 0 && g_assaultSaid < kAssaultSayCap)
+    {   /* the assault gate: a line when its teammate count rose (looked at once a second), kAssaultSayCap lines a session */
+        const DWORD now = ::GetTickCount();
+        if ((DWORD)(now - g_assaultLookAt) >= 1000u)
+        {
+            g_assaultLookAt = now;
+            const long long h = (long long)g_assaultCells->hits;
+            if (h > g_assaultSaidAt)
+            {
+                g_assaultSaidAt = h;
+                ++g_assaultSaid;
+                DebugLog("[RAIDCAMP] assault gate: a teammate's town passed the assault-start test's player-town gate (Package_PassingByTownAssault 0x290410) as this player's own, opened "
+                         + PN(h) + " so far (owner 1499)" + (g_assaultSaid == kAssaultSayCap ? " - the last such line this session; the REPORT's assaultGateTeam counts the rest" : ""));
+            }
+        }
+    }
+    for (int site = 1; site <= teamstub::kRaidSites; ++site)
+        while (g_raidNearPrinted[site] < kRaidNearRecs && g_raidNearRec[site][g_raidNearPrinted[site]].ready != 0)
+        {
+            const RaidNearRec& r = g_raidNearRec[site][g_raidNearPrinted[site]];
+            ++g_raidNearPrinted[site];
+            const char* what = site == teamstub::kRaidSiteAnnounce ? "the announcement's owner test (the talk starts only when someone is found)"
+                             : site == teamstub::kRaidSiteAssaultStart ? "the assault's start test (Package_PassingByTownAssault: the assault starts only when someone is found)"
+                             : "the assault's target list (Package_PassingByTownAssault: the raiders' targets are who is found)";
+            const char* at = site == teamstub::kRaidSiteAnnounce ? "the speaker" : "the town";
+            DebugLog(std::string("[RAIDCAMP] team near site=") + teamstub::RaidSiteName(site) + ": " + what + " - the engine's search found " + PN((long long)r.before)
+                     + " of the town owner's faction (" + RaidNearWho(r.ownerSlot) + ", faction " + PH((long long)(uintptr_t)r.owner) + ") within " + RaidNearF(r.radius)
+                     + " of " + at + " at " + (r.posRead == 1 ? RaidNearF(r.c[0]) + "," + RaidNearF(r.c[2]) : std::string("?"))
+                     + "; teammates' factions added " + PN((long long)r.added) + ", the first from " + RaidNearWho(r.foundSlot) + ", faction " + PH((long long)(uintptr_t)r.found)
+                     + (r.own == 1 ? " (this game's own player faction)" : " (another player's faction on this game)")
+                     + ", " + (r.dist >= 0.0f ? RaidNearF(r.dist) + " u from " + at : std::string("its distance not read"))
+                     + " - counted as the owner's (owner 1499) (#" + PN((long long)g_raidNearPrinted[site]) + " for this site"
+                     + (g_raidNearPrinted[site] == kRaidNearRecs ? "; the last such line this session, the REPORT's raidTeamNear counts the rest)" : ")"));
+        }
+}
+
 
 /* site 1: InventoryGUI's stealing decision. Its windows' owners: window vt+0x80 (the owner object), then vt+0x58 (its faction) - the
    two calls 0x710B70 itself makes on its first window (decomp_710b70.txt:44-45) and 0x713150 on the other (:119). */
@@ -1471,8 +2096,27 @@ int KitCharacterPod(void* obj, int* down)
 /* site 3: the trade / loot window choice for another player's thing (swaccess::WindowFor) */
 typedef void (*KitShowTradeFn)(void*, void*, void*, int);
 KitShowTradeFn orig_KitShowTrade = 0;
+volatile LONG64 g_ownOnlyOpenRefused = 0;   /* T-1199 fold 1: loot window opens refused under Owner only (design B) */
 void detour_KitShowTrade(void* gui, void* player, void* other, int type)
 {
+    {   /* T-1199 fold 1 (design B, decision 1348 a, owner 1480): another non-teammate player's box or machine under Owner only does not
+           open - the call is skipped, as for a stranger's awake character (no window, no text); whether or not its owner is in the world */
+        int oslot = -1;
+        if (other != 0 && coop::PolicyBoxOpenRefused(other, &oslot) != 0)
+        {
+            const long long n = (long long)::InterlockedIncrement64(&g_ownOnlyOpenRefused);
+            if (n <= 16)
+            {
+                char b[360];
+                _snprintf(b, 359, "[POLICY] box open refused obj=%p owner=slot%d type=%d n=%lld - Owner only: another player's chest or machine"
+                                  " (not a teammate's), its owner in the world or not (T-1199 fold 1, design B): the loot window did not open,"
+                                  " no text shown", other, oslot, type, n);
+                b[359] = 0;
+                DebugLog(b);
+            }
+            return;
+        }
+    }
     if (g_kitN != 0 && other != 0)
     {
         void* fac = 0;
@@ -2133,6 +2777,11 @@ void PolicyTeammateFactions(void* const* facs, int n)
         g_resHeld = rheld;
     }
     if (g_haulCells != 0) g_haulHeld = MateCellsWrite(g_haulCells, facs, n);   /* T-1150: the haul search's building owner test */
+    if (g_eatCells != 0) g_eatHeld = MateCellsWrite(g_eatCells, facs, n);      /* T-1250: the eating search's building owner test */
+    g_town1Held = teamstub::MateCellsWrite(g_town1Cells, kBoxCells, facs, n);   /* T-1250 fix attempt 2: gate 1, the town update's teammate towns */
+    g_mineHeld = teamstub::MateCellsWrite(g_mineCells, kBoxCells, facs, n);   /* T-1309: the 'is this object mine' test's teammates */
+    if (g_town2Cells != 0) g_town2Held = MateCellsWrite(g_town2Cells, facs, n);   /* T-1250 fix attempt 2: gate 2, 'Getting food''s town test */
+    if (g_assaultCells != 0) g_assaultHeld = MateCellsWrite(g_assaultCells, facs, n);   /* T-1122: the assault-start test's player-town gate */
     NpcCellsWrite(facs, n);   /* T-943: the NPC senses' and memory's cells - teammates only */
     /* T-942: the box click cells are the kit's (teammates and allowed friends), written by KitBuild */
     g_kitMatesN = 0;
@@ -2143,12 +2792,13 @@ void PolicyTeammateFactions(void* const* facs, int n)
 void PolicyKitTick()
 {
     NpcHitsLook();   /* T-943: the first lines of each NPC site's teammate count */
+    RaidNearLook();  /* T-1122: the [RAIDCAMP] lines of the raid tests a teammate answered */
     /* T-942: the kit table judged again when anything it depends on changed - a faction list (KitListChanged), a standing between
        players (the relations change count), the base-access option, this game's slot or player faction; standing changes at most
        four times a second. Nothing is judged while engine writes are blocked (the table was emptied when they were). */
     if (coop::EngineWritesBlocked())
     {
-        if (g_kitN != 0 || g_kitLike != 0) KitBuild(false);
+        if (g_kitN != 0 || g_kitLike != 0 || g_kitMineAny != 0) KitBuild(false);
         g_kitDirty = true;
         return;
     }
@@ -2248,8 +2898,65 @@ void InstallPolicy()
         g_haulPoolWhy = "AddHook candidate gather 0x8CAFD0 FAILED";
     else { g_haulPoolHooked = 1; g_haulPoolWhy = "hooked"; }
     DebugLog(std::string("[POLICY] T-1150 haul search candidate filter (1.0.65 0x6207A0 from 0x59A2C2): ") + g_haulPoolWhy
-             + (g_haulPoolHooked != 0 ? " - the storage search's candidates keep a teammate's storage and machines; every other caller as before"
+             + (g_haulPoolHooked != 0 ? " - the storage search's candidates keep a teammate's storage and machines"
                                       : " - the storage search's candidates still drop a teammate's storage and machines"));
+    DebugLog(std::string("[POLICY] T-1250 the filter's other callers (machines, cages, the allies' and scored buildings, the area jobs): ")
+             + (g_haulPoolHooked == 0 ? "off (the filter is not hooked) - a teammate's buildings stay refused for those jobs"
+                : kBedCostRetRva == 0 ? "off (no BedCostMayUseRet row) - a teammate's buildings stay refused for those jobs"
+                                      : "on - this player's characters may use a teammate's buildings for every job but a bed's cost; NPCs', copies' and other factions' questions as before"));
+    /* T-1250: the eating search's building owner test - this player's hungry characters eat from a teammate's food stores */
+    if (kFoodSearchTestRva == 0) g_eatWhy = "no address row";
+    else EatTestPatch(g_base + (uintptr_t)kFoodSearchTestRva);
+    DebugLog(std::string("[POLICY] T-1250 eating search owner test (1.0.65 0x8D9DD4): ") + g_eatWhy
+             + (g_eatCells != 0 ? " - this player's hungry characters eat from a teammate's food stores; friends', strangers' and NPC factions' as before"
+                                : " - this player's hungry characters still skip a teammate's food stores"));
+    /* T-1250 fix attempt 2 (design A): a teammate's outpost passes the town update's own-town search (gate 1) and 'Getting food''s
+       town test (gate 2); 'is at home town' 0x997110 and the homeless squad's friendly town 0x926AD0 are not changed */
+    if (kTownUpdOwnRetRva == 0) g_town1Why = "no address row";
+    else if (kTeamTownInsideRva == 0) g_town1Why = "no TownContainsPoint row";
+    else TeamTownGate1Install(g_base + (uintptr_t)kTownUpdOwnRetRva - 5);
+    if (kTownGateTestRva == 0) g_town2Why = "no address row";
+    else TeamTownGate2Install(g_base + (uintptr_t)kTownGateTestRva);
+    DebugLog(std::string("[POLICY] T-1250 town gates: gate1 (the town update's own-town search, 1.0.65 call 0x5A47D8) ") + g_town1Why
+             + ", gate2 (the 'Getting food' town test, 1.0.65 0x59B261) " + g_town2Why
+             + ((g_town1Orig != 0 && g_town2Cells != 0)
+                ? " - a teammate's outpost becomes the town of any character on this game (this player's and the NPCs, as on the owner's game) where no own town covers the spot, and 'Getting food' passes it; friends', strangers' and NPC towns as before; 'is at home town' and a homeless squad's friendly town not changed"
+                : " - a teammate's outpost is still not any character's town on this game for fetching food"));
+    /* T-1309: a teammate's gate or door is 'mine' to this player's characters (the lock / unlock tasks' condition 0x46) */
+    if (kMineFactionTestRva == 0) g_mineWhy = "no address row";
+    else MineTestInstall(g_base + (uintptr_t)kMineFactionTestRva);
+    DebugLog(std::string("[POLICY] T-1309 'is this object mine' faction compare (1.0.65 0x5A3341): ") + g_mineWhy
+             + (g_minePatched != 0 ? " - this player's characters may lock and unlock a teammate's gates and doors as their own (and do not bash them); strangers', non-team players', towns' and NPCs' as before"
+                                   : " - a teammate's gates and doors still refuse this player's lock and unlock orders"));
+    /* T-1122: a raid counts the base owner's teammates as the owner's own (the find-near hooked first: it acts only on a site's mark) */
+    if (kRaidFindNearRva == 0) g_raidNearWhy = "no find-near row";
+    else if ((g_raidNearTls = ::TlsAlloc()) == TLS_OUT_OF_INDEXES) g_raidNearWhy = "no thread slot";
+    else if (coop::AddHook((void*)(g_base + kRaidFindNearRva), (void*)&detour_RaidFindNear, (void**)&orig_RaidFindNear) != coop::SUCCESS)
+        g_raidNearWhy = "AddHook faction find-near 0x6BA4D0 FAILED";
+    else
+    {
+        g_raidNearHooked[0] = 1; g_raidNearWhy = "find-near hooked";
+        const unsigned long long rva[4] = { 0, kRaidOwnerNearRva, kRaidAssaultStartRva, kRaidAssaultTargetsRva };
+        void* const det[4] = { 0, (void*)&detour_RaidOwnerNear, (void*)&detour_RaidAssaultStart, (void*)&detour_RaidAssaultTargets };
+        void** const orig[4] = { 0, (void**)&orig_RaidOwnerNear, (void**)&orig_RaidAssaultStart, (void**)&orig_RaidAssaultTargets };
+        for (int site = 1; site <= teamstub::kRaidSites; ++site)
+        {
+            if (rva[site] == 0) { g_raidNearHooked[site] = -2; continue; }
+            g_raidSiteAt[site] = g_base + (uintptr_t)rva[site];   /* before the hook: the find-near reads it */
+            g_raidNearHooked[site] = (coop::AddHook((void*)g_raidSiteAt[site], det[site], orig[site]) == coop::SUCCESS) ? 1 : -1;
+        }
+    }
+    /* T-1122: the assault-start test's player-town gate - a teammate's town passes as a player's */
+    if (kAssaultTownTestRva == 0) g_assaultWhy = "no address row";
+    else Test8Patch(g_base + (uintptr_t)kAssaultTownTestRva, kAssaultTownTestOrig, g_assaultCells, g_assaultWhy);
+    DebugLog(std::string("[POLICY] T-1122 assault-start player-town gate (1.0.65 0x290484): ") + g_assaultWhy
+             + (g_assaultCells != 0 ? " - a raid's assault on a teammate's town may start as on this player's own; NPC and non-team players' towns as before"
+                                    : " - a raid's assault on a teammate's town still never starts here"));
+    DebugLog(std::string("[POLICY] T-1122 raid sites that look for the town owner's characters (find-near 1.0.65 0x6BA4D0): ") + g_raidNearWhy
+             + "; announce (0x354930)=" + PN((long long)g_raidNearHooked[1]) + " assaultStart (0x290410)=" + PN((long long)g_raidNearHooked[2])
+             + " assaultTargets (0x290080)=" + PN((long long)g_raidNearHooked[3]) + " (1 hooked, -1 AddHook failed, -2 no row)"
+             + (g_raidNearHooked[0] == 1 ? " - a raid's announcement, assault start and targets count a player of the base owner's team as the owner's own; an NPC town and a non-team player as before"
+                                         : " - a raid still looks for the base owner's own faction only"));
     /* T-942: another player's box and character - the stealing decision, the item hover cursor, the trade / loot window choice */
     if (kStealFlagRva == 0) DebugLog("[POLICY] T-942 stealing decision: no address row - another player's box or downed character shows stealing for everyone");
     else if (coop::AddHook((void*)(g_base + kStealFlagRva), (void*)&detour_StealFlag, (void**)&orig_StealFlag) != coop::SUCCESS)
@@ -2321,6 +3028,65 @@ void PolicyForgetPeerFaction()
 }
 
 int PolicyPeerIsPlayer() { return g_peerIsPlayer; }
+
+/* T-1199 fold 1 (HIGH, review): another player's faction - a stand-in, or a saved player's faction its record id names (coop-p<n>, not
+   this game's slot) before that player is resolved (playerfaction.cpp keeps it out of the stand-in table until then; build.cpp
+   BdOwnerIsPlayerSide reads it the same way). ANY THREAD (pointer compares, a guarded record-id read). */
+int PolicyOtherPlayerFaction(void* fac)
+{
+    if (fac == 0) return 0;
+    const int si = IsStandInFaction((::Faction*)fac) ? 1 : 0;
+    return cooptake1::OtherPlayerOwner(si, (si == 0) ? StandInRecordSlot((::Faction*)fac) : -1, MySlotForWire());
+}
+/* T-1199 (owner 1480: "widen to doors and machines with inventory"; fold 1): the door's owner faction through the door's own
+   getOwnerFaction (a door forwards to its parent building), another player's by PolicyOtherPlayerFaction, the teammate test only while
+   this game's player is in a team (decision 481). Only an open by this game's player (openerMine) is ever refused. role=single: never. */
+int PolicyDoorOpenRefused(void* door, int applying, int openerMine)
+{
+    if (applying != 0 || openerMine == 0 || door == 0 || RoleIsSingle()) return 0;
+    const int pol = BasePolicyValue();
+    if (pol != kPolicyOwner) return 0;   /* the hot path: one int */
+    void* const fac = FactionOfBuildingPod(door);
+    const int other = PolicyOtherPlayerFaction(fac);
+    const int mate = (other != 0 && MineInTeam() && TeammateFaction(fac)) ? 1 : 0;
+    return cooptake1::DoorOpenRefuse(pol, applying, other, mate, openerMine);
+}
+/* T-1199 fold 1 (design B): the loot window's open of `obj` (ForgottenGUI::_showTradeWindow's other party) - a box or a machine with
+   inventory of another non-teammate player, under Owner only, whether or not its owner is in the world. A character (awake, down or
+   carried) keeps the trade window's own rule; an ore rock is nobody's; an unreadable object or owner is let through. */
+int PolicyBoxOpenRefused(void* obj, int* slot)
+{
+    *slot = -1;
+    if (obj == 0 || RoleIsSingle()) return 0;
+    const int pol = BasePolicyValue();
+    if (pol != kPolicyOwner) return 0;
+    int down = 0;
+    if (KitCharacterPod(obj, &down) != 0) return 0;   /* 1 a character, -1 unreadable */
+    void* fac = 0;
+    if (KitObjectFactionPod(obj, &fac) != 1 || fac == 0) return 0;
+    const int other = PolicyOtherPlayerFaction(fac);
+    if (other == 0) return 0;
+    const int node = WorldNodeLiveAnyThread(obj);
+    const int mate = (MineInTeam() && TeammateFaction(fac)) ? 1 : 0;
+    const int r = cooptake1::OpenRefuse(pol, 0, node, other, mate);
+    if (r != 0) *slot = StandInSlotAnyPod(fac);
+    return r;
+}
+/* T-1199 fold 2 TEST-ONLY (items.cpp `lootorder nearest-peer`): 1 = obj's owner faction is another player's (PolicyOtherPlayerFaction -
+   a stand-in, or a saved player's record before that player is resolved), whatever the policy and the team; *slot = that player's slot
+   (-1 unread). A character is never one. MAIN THREAD (the lever's walk). */
+int PolicyObjOtherPlayer(void* obj, int* slot)
+{
+    *slot = -1;
+    if (obj == 0) return 0;
+    int down = 0;
+    if (KitCharacterPod(obj, &down) != 0) return 0;
+    void* fac = 0;
+    if (KitObjectFactionPod(obj, &fac) != 1 || fac == 0) return 0;
+    if (PolicyOtherPlayerFaction(fac) == 0) return 0;
+    *slot = StandInSlotAnyPod(fac);
+    return 1;
+}
 
 // The requester's faction string id AS THIS GAME KNOWS IT.
 //
@@ -2937,12 +3703,60 @@ void NodeLeftSay(void* b, int gate, int shown, void* win)
              + "; the engine's own gate was " + PN((long long)gate) + " (0 = it opened nothing); opens " + PN(g_worldNodeLeftOpen)
              + " faults " + PN(g_nodeLeftFault) + (g_nodeLeftSaid == kNodeLeftSayCap ? " - from here at most one line every 30 s; the report keeps counting" : ""));
 }
+/* T-1250 (owners 1187 a / 1499 / 1554 b): A TEAMMATE'S BUILDING OPENS ITS WINDOW ON A LEFT CLICK, as this player's own does. On this
+   game a teammate's machine, bench, cage or box belongs to that player's stand-in faction, which has no player interface, so the
+   select virtual's own gate opens nothing (Read, decomp_54fa10 :34-38). For a built building whose owner faction (vtable +0x58) is in
+   this game's teammate list (g_kitMates: the team table's factions as PolicyTeammateFactions gives them, the same list every team
+   cell set takes; empty with no team, so nothing is read then) the detour makes the ore rock's call (swaccess::TeamLeftOpens).
+   Moving items in that window: the engine marks the building's window record +10 only when the owner has a player interface
+   (decomp_6e4ea0: entry +8 = 0, +9 = 1, +10 = that test), so its own stealing decision 0x710B70 answers 'stealing' and would send the
+   move to the strict place test of 0x70C6C0; the T-942 site-1 hook (detour_StealFlag) answers 'not stealing' for a teammate's pair,
+   so the move meets the plain trade range as this player's own building does. MAIN THREAD; a call on another thread is counted. */
+volatile LONGLONG g_teamLeftOpen = 0, g_teamLeftFault = 0, g_teamLeftOffMain = 0, g_teamLeftNotMate = 0;
+long long g_teamLeftSaid = 0;
+DWORD g_teamLeftSaidAt = 0;
+/* the building's owner faction as the select virtual reads it (vtable +0x58); 1 read, 0 faulted */
+int TeamLeftFacPod(void* b, void** fac)
+{
+    *fac = 0;
+    __try { *fac = ((void* (*)(void*))((*(void***)b)[0x58 / 8]))(b); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *fac = 0; return 0; }
+}
+void TeamLeftSay(void* b, int gate, int shown, void* win)
+{
+    const DWORD now = ::GetTickCount();
+    if (g_teamLeftSaid >= kNodeLeftSayCap && (DWORD)(now - g_teamLeftSaidAt) < kNodeLeftSayGapMs) return;
+    ++g_teamLeftSaid;
+    g_teamLeftSaidAt = now;
+    char k[160]; k[0] = 0;
+    if (ObjectPositionKey(b, k, (int)sizeof(k), "", 3, 0) == 0) k[0] = 0;
+    DebugLog("[POLICY] T-1250 teammate left click: building " + std::string(k[0] != 0 ? k : "(key unread)") + " (a teammate's) - its window "
+             + (shown == 1 ? std::string("shown (") + (win != 0 ? "a window" : "no window") + " returned)" : std::string("call FAULTED"))
+             + "; the engine's own gate was " + PN((long long)gate) + " (0 = it opened nothing); opened " + PN(g_teamLeftOpen)
+             + " faults " + PN(g_teamLeftFault) + (g_teamLeftSaid == kNodeLeftSayCap ? " - from here at most one line every 30 s; the report keeps counting" : ""));
+}
+void TeamLeftOpen(void* b)
+{
+    if (g_kitMatesN <= 0) return;   /* no team: nothing is read */
+    const unsigned long m = coop::StoreMainThreadId();
+    if (m != 0 && ::GetCurrentThreadId() != (DWORD)m) { ::InterlockedIncrement64(&g_teamLeftOffMain); return; }
+    void* fac = 0;
+    if (TeamLeftFacPod(b, &fac) != 1) return;
+    const int mate = teamstub::MateCellsHas(g_kitMates, g_kitMatesN, fac);
+    if (mate != 1) { ::InterlockedIncrement64(&g_teamLeftNotMate); return; }
+    const int gate = SelectGatePod(b);
+    if (!swaccess::TeamLeftOpens(mate, BuiltBytePod(b), gate)) return;
+    void* win = 0;
+    const int shown = NodeWindowPod(b, &win);
+    ::InterlockedIncrement64(shown == 1 ? &g_teamLeftOpen : &g_teamLeftFault);
+    TeamLeftSay(b, gate, shown, win);
+}
 void detour_BuildingOnSelect(void* b)
 {
     orig_BuildingOnSelect(b);
     if (g_base == 0 || kNodeWindowRva == 0 || kNodeGuiRva == 0 || !Plaus(b)) return;
     const int node = coop::WorldNodeLiveAnyThread(b);
-    if (node != 1) return;   /* every other building: the engine's select alone */
+    if (node != 1) { TeamLeftOpen(b); return; }   /* T-1250: a teammate's building; every other building: the engine's select alone */
     const unsigned long m = coop::StoreMainThreadId();
     if (m != 0 && ::GetCurrentThreadId() != (DWORD)m) { ::InterlockedIncrement64(&g_nodeLeftOffMain); return; }
     const int gate = SelectGatePod(b);
@@ -3104,6 +3918,8 @@ std::string PolicyReport()
          + " friendCursor=" + PN(g_friendCursor)
          + " basePolicyWorldNode[allowed,click,cursor,leftOpen,leftHook,leftOffMain,leftFault]=" + PN(g_allowedWorldNode) + "," + PN(g_worldNodeClick) + "," + PN(g_worldNodeCursor)
          + "," + PN(g_worldNodeLeftOpen) + "," + PN((long long)g_nodeLeftHook) + "," + PN(g_nodeLeftOffMain) + "," + PN(g_nodeLeftFault)
+         + " teamWindow[opened,faults,offMain,notMate,mates]=" + PN(g_teamLeftOpen) + "," + PN(g_teamLeftFault) + "," + PN(g_teamLeftOffMain)
+         + "," + PN(g_teamLeftNotMate) + "," + PN((long long)g_kitMatesN)
          + TeamOrdersTokens()
          + " nearTownTeammateHits=" + (g_nearCells != 0 ? PN((long long)g_nearCells->hits) : std::string("n/a")) + " nearTownCellsHeld=" + PN((long long)g_nearHeld)
          + " foliageTown[patched,why,cells,hits,drops]=" + PN(g_foliageCells != 0 ? 1 : 0) + "," + g_foliageWhy + "," + PN((long long)g_foliageHeld)
@@ -3116,6 +3932,17 @@ std::string PolicyReport()
          + "," + PN((long long)g_resHook) + "," + PN((long long)g_resCopySkipped)
          + " teamHaul[patched,cellsHeld,hits]=" + PN(g_haulCells != 0 ? 1 : 0) + "," + PN((long long)g_haulHeld) + "," + PN(g_haulCells != 0 ? (long long)g_haulCells->hits : 0)
          + " teamHaulPool[hooked,hits]=" + PN((long long)g_haulPoolHooked) + "," + PN((long long)g_haulPoolHits)
+         + " teamMayUse[on,jobHits,lastRet,bedLeft]=" + PN((long long)((g_haulPoolHooked != 0 && kBedCostRetRva != 0) ? 1 : 0)) + "," + PN((long long)g_mayUseJobHits)
+         + "," + PH((long long)g_mayUseJobLastRet) + "," + PN((long long)g_mayUseBedLeft)
+         + " teamEat[patched,cellsHeld,hits]=" + PN(g_eatCells != 0 ? 1 : 0) + "," + PN((long long)g_eatHeld) + "," + PN(g_eatCells != 0 ? (long long)g_eatCells->hits : 0)
+         + " teamTown[gate1,gate2,cellsHeld,gate1Calls,gate1Hits,gate1Faults,gate2Calls,gate2Hits]=" + PN(g_town1Orig != 0 ? 1 : 0) + "," + PN(g_town2Cells != 0 ? 1 : 0)
+         + "," + PN((long long)g_town1Held) + "," + PN((long long)g_town1Calls) + "," + PN((long long)g_town1Hits) + "," + PN((long long)g_town1Faults)
+         + "," + PN(g_town2Calls != 0 ? (long long)*g_town2Calls : 0) + "," + PN(g_town2Cells != 0 ? (long long)g_town2Cells->hits : 0)
+         + " raidTeamNear[site:hooked,tests,engineFound,teamFound,teamNone]=" + RaidNearSiteText(1) + ";" + RaidNearSiteText(2) + ";" + RaidNearSiteText(3)
+         + " teamMine[patched,cellsHeld,asks,hits,cageNo,faults]=" + PN((long long)g_minePatched) + "," + PN((long long)g_mineHeld) + "," + PN((long long)g_mineAsks)
+         + "," + PN((long long)g_mineHits) + "," + PN((long long)g_mineCage) + "," + PN((long long)g_mineFaults)
+         + " assaultGateTeam[patched,cellsHeld,opened]=" + PN(g_assaultCells != 0 ? 1 : 0) + "," + PN((long long)g_assaultHeld) + "," + PN(g_assaultCells != 0 ? (long long)g_assaultCells->hits : 0)
+         + " raidTeamNearOther[findNearHooked,faults,outside]=" + PN((long long)g_raidNearHooked[0]) + "," + PN((long long)g_raidNearFaults) + "," + PN((long long)g_raidNearOutside)
          + " ownedByPeerAnswered=" + PN(g_ownedByPeerAnswered)
          + " ownedByPeerAnsweredClick=" + PN(g_ownedByPeerAnsweredClick)
          + " doors1[ownedByPeerStranger,cursorStranger,doorCursorStranger]=" + PN(g_ownedByPeerStranger) + "," + PN(g_cursorStranger) + "," + PN(g_doorCursorStranger)
@@ -3134,10 +3961,41 @@ std::string PolicyReport()
          + " kitStealWorldNode=" + PN((long long)g_stealWorldNode)
          + " kitTrade[hook,team,friend,friendRefused,stranger,madeNever,noWindow]=" + PN((long long)g_tradeHook) + "," + PN((long long)g_tradeJudged[0]) + "," + PN((long long)g_tradeJudged[1])
          + "," + PN((long long)g_tradeJudged[2]) + "," + PN((long long)g_tradeJudged[3]) + "," + PN((long long)g_tradeNever) + "," + PN((long long)g_tradeNoWindow)
+         + " ownOnlyOpenRefused=" + PN((long long)g_ownOnlyOpenRefused)   /* T-1199 fold 1 */
          + " kitHover[why,hits]=" + std::string(g_hoverWhy) + "," + PN(g_hoverCells != 0 ? (long long)g_hoverCells->hits : -1)
          + " kitTradeOwner[why,hits]=" + std::string(g_tradeWhy) + "," + PN(g_tradeCells != 0 ? (long long)g_tradeCells->hits : -1)
          + " kitNpc[patched,sites,mates,cellDrops]=" + PN((long long)g_npcPatched) + "," + PN((long long)swnpc::kSites) + "," + PN((long long)g_npcHeld)
-         + "," + PN((long long)g_npcDrops) + " kitNpcHits[site1..site26]=" + NpcHitsText());
+         + "," + PN((long long)g_npcDrops) + " kitNpcHits[site1..site26]=" + NpcHitsText()
+         );
 }
 
 }
+
+/* T-1122 THE ROLLER (owner decision 1577 c; towngen.cpp's roller block): every player faction this game knows another player's bases
+   under - the kit table's stand-ins and save records (StandInSlotAnyPod >= 0) - one per player slot (a stand-in made or reused here
+   before a save record), at most cap; and a faction's player slot. MAIN THREAD. */
+namespace coop {
+int PolicyTeamBaseFactions(void** facs, int* slots, int cap)
+{
+    int m = 0;
+    const int n = (int)g_kitN;
+    for (int k = 0; k < n && k < kKitCap; ++k)
+    {
+        void* const f = g_kitFac[k];
+        if (!Plaus(f)) continue;
+        const int s = StandInSlotAnyPod(f);
+        if (s < 0) continue;
+        int at = -1;
+        for (int j = 0; j < m; ++j) if (slots[j] == s) at = j;
+        if (at >= 0)
+        {
+            if (coop::StandInSlotOf((::Faction*)f) >= 0 && coop::StandInSlotOf((::Faction*)facs[at]) < 0) facs[at] = f;
+            continue;
+        }
+        if (m >= cap) continue;
+        facs[m] = f; slots[m] = s; ++m;
+    }
+    return m;
+}
+int PolicyFactionSlot(void* faction) { return StandInSlotAnyPod(faction); }
+}   /* namespace coop */

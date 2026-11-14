@@ -210,21 +210,31 @@ inline int ParityAskerForget(int goneSlot, int recordedSlot)
 }
 /* P109 R3: A SECTOR'S MARK (this game's copies there are the non-holder's, never stocked by the engine). Owned = this game had
    the sector as its own (verdict mine) at an arrival before any arrival marked it - its copies there are real, and a later
-   return as the non-holder keeps them trusted. Holding a sector after it was marked never makes its copies real (a gave-up
-   mark that clears, ParityGaveUpClears, leaves the sector unmarked and NOT owned - owned only by a later arrival, as if it
-   had never been marked - P109 fold 1b). */
+   return as the non-holder keeps them trusted. Holding a sector after it was marked never makes its copies real. */
 inline int ParitySectorOwned(int wasOwned, int wasMarked, int mine)
 {
     if (wasOwned != 0) return 1;
     return (wasMarked == 0 && mine != 0) ? 1 : 0;
 }
-/* 1 = marked: kept for the world; an arrival held by the other game marks; one whose verdict never settled (gave up) marks
-   too (decided 2026-09-30: the asker then keeps its own copy, the safer side); a sector owned before is never marked. */
-inline int ParitySectorMark(int wasMarked, int ownedBefore, int held, int gaveUp)
+/* 1 = marked: kept for the world; an arrival held by another game marks; a sector owned before is never marked. T-1268 (F1053 (2),
+   decision 1556 / 1563): an arrival whose verdict has not settled is never marked - it waits for a real naming
+   (ParityArrivalStep), and this rule then decides from that naming. */
+inline int ParitySectorMark(int wasMarked, int ownedBefore, int held)
 {
     if (wasMarked != 0) return 1;
     if (ownedBefore != 0) return 0;
-    return (held != 0 || gaveUp != 0) ? 1 : 0;
+    return (held != 0) ? 1 : 0;
+}
+/* T-1268 (F1053 (2)): ONE DRAIN OF A SECTOR'S ARRIVAL. settled = the verdict is mine or another game's (not loading, no answer or
+   nobody named yet). An unsettled arrival waits for the naming, however long; the drain its wait first passes `limit` is said
+   once (longSaid: already said) - only a line and a counter, never a mark and never an end of the wait. */
+const int kParityArrWait     = 0;   /* keep waiting */
+const int kParityArrWaitLong = 1;   /* keep waiting; the wait passed the limit now (count, say it once) */
+const int kParityArrDecide   = 2;   /* the verdict settled: mark by ParitySectorMark and ask */
+inline int ParityArrivalStep(int settled, int ticks, int limit, int longSaid)
+{
+    if (settled != 0) return kParityArrDecide;
+    return (ticks > limit && longSaid == 0) ? kParityArrWaitLong : kParityArrWait;
 }
 /* P109 R1: a marked sector this game has loaded pulls its never-received boxes ONCE per holding - when its verdict reads
    mine and this LOAD of the sector has not pulled yet (pulled is cleared only when the sector leaves; a re-holding within the
@@ -233,15 +243,129 @@ inline int ParityPullSector(int marked, int inZone, int pulled, int mine)
 {
     return (marked != 0 && inZone != 0 && pulled == 0 && mine != 0) ? 1 : 0;
 }
-/* P109 fold 1 (F2, manager ruling 2026-09-30): a mark made because an arrival's verdict never settled (gave up) does not outlive a
-   holding where this game holds the sector ALONE - this game's verdict reads mine and the notebook's fresh loaded map shows no
-   other game with the sector loaded (otherLoaded 0; -1 = no fresh map, 1 = another game has it: kept). The mark is then
-   cleared - the sector is simply no longer marked; it is NOT made owned (fold 1b, manager ruling revised 2026-09-30: owned
-   only by the normal rules, ParitySectorOwned, as before the gave-up mark existed). A mark made by a held verdict is never
-   cleared. */
-inline int ParityGaveUpClears(int gaveUpMark, int mine, int otherLoaded)
+/* T-1268 (F1053 (3)): WHOM A PULL GOES TO - never this game (a pull addressed to the area's holder reached this game itself and went
+   nowhere). askerSlot = the game whose ask this game refused (-1: none - the pull starts a holding or follows a land); mySlot = this
+   game's slot (-1 not known); slots / bits = the n seated slots of this game's map of the loaded areas for the box's area and each
+   one's loaded bit; mapFresh = that map is fresh (1) or not (0 / -1). The asker when it is another game; else the first other game
+   the map shows with the area loaded; kParityPullNoTarget when the fresh map shows none (this game is alone there); and
+   kParityPullMapStale when this game's own slot or the map is not known (asked again on the next trigger). */
+const int kParityPullNoTarget = -1;
+const int kParityPullMapStale = -2;
+const int kParityPullAllTried = -3;   /* T-1268 fold (review MED 3): every other game with the area loaded was asked once for this need */
+/* T-1268 fold 2: WHAT ONE PULL CALL DID (ItParityPullOne), beside the three endings above. Busy = a pull of the box is in flight;
+   NotOut = the ask did not go out (no box read, no link, list full); Owed = this game's own rows on the box are not sent yet (the
+   hand-back safety net), so no pull runs now - re-check NEW LOW: it was Busy before and a refused or lost pull's need was dropped. */
+const int kParityPullBusy   = 0;
+const int kParityPullSent   = 1;
+const int kParityPullNotOut = 2;
+const int kParityPullOwed   = 3;
+/* a refused or lost pull's need after one pull call r: 1 = it stays on the retry list and the next area map asks again (map stale,
+   ask not out, hand-back owed); 0 = asked or in flight, or ended with its own line and counter (noTarget / allTried) */
+inline int ParityPullNeedStays(int r)
 {
-    return (gaveUpMark != 0 && mine != 0 && otherLoaded == 0) ? 1 : 0;
+    return (r == kParityPullSent || r == kParityPullBusy || r == kParityPullNoTarget || r == kParityPullAllTried) ? 0 : 1;
+}
+inline int ParityPullSlotIn(int slot, const int* list, int n)
+{
+    for (int i = 0; i < n; ++i) if (list != 0 && list[i] == slot) return 1;
+    return 0;
+}
+/* T-1268 fold 2 (re-check LOW 4): A LOST PULL FROM A GAME STILL IN THE WORLD IS ASKED AGAIN - at most kParityPullLostAsks asks of
+   one game per need. Bound 2: one lost answer from a game still in the world is most likely one late or dropped message, so it is
+   asked once more; a second loss in a row means it does not answer for this box, and asking on every area map would repeat the
+   kOpenAskLostMs wait without end. The tried list then holds, beside each game asked and done, one mark per lost answer
+   (ParityPullLostMark: -100 and below, never a seat, so ParityPullSlotIn on a seat never matches a mark). After a lost pull to
+   `slot`: 1 = the game now counts as asked (it is out of the world, or this is its kParityPullLostAsks-th lost answer) - the slot
+   itself is added; 0 = one mark is added and the next area map asks it again. */
+const int kParityPullLostAsks = 2;
+inline int ParityPullLostMark(int slot) { return -100 - slot; }
+inline int ParityPullLostTried(int slot, int inWorld, const int* tried, int nTried)
+{
+    if (inWorld == 0 || slot < 0) return 1;
+    int lost = 0;
+    for (int i = 0; i < nTried; ++i) if (tried != 0 && tried[i] == ParityPullLostMark(slot)) ++lost;
+    return (lost + 1 >= kParityPullLostAsks) ? 1 : 0;
+}
+/* T-1268 fold (review MED 3 / LOW 4): the same choice, past the games already asked for this need (tried: nTried slots - one that
+   refused from an untrusted copy, or whose pull was lost) and past a game the roster shows out of the world now (gone[i] = 1 for
+   slots[i]; askerGone = 1 for the asker) - the loaded map counts as fresh for 5 s, so a game that just left can still show there.
+   A game in tried is not asked again for this need (a lost-answer mark, ParityPullLostMark, does not count - fold 2: such a game
+   is asked again, at most kParityPullLostAsks times); with games tried and none left -> kParityPullAllTried (the need ends: a
+   line and a counter). */
+inline int ParityPullTarget(int askerSlot, int mySlot, const int* slots, const int* bits, int n, int mapFresh,
+                            const int* gone, const int* tried, int nTried, int askerGone)
+{
+    if (askerSlot >= 0 && mySlot >= 0 && askerSlot != mySlot && askerGone == 0 && ParityPullSlotIn(askerSlot, tried, nTried) == 0)
+        return askerSlot;
+    if (mySlot < 0 || mapFresh <= 0) return kParityPullMapStale;
+    for (int i = 0; i < n; ++i)
+        if (slots != 0 && bits != 0 && slots[i] >= 0 && slots[i] != mySlot && bits[i] != 0 && (gone == 0 || gone[i] == 0)
+            && ParityPullSlotIn(slots[i], tried, nTried) == 0) return slots[i];
+    return (nTried > 0) ? kParityPullAllTried : kParityPullNoTarget;
+}
+inline int ParityPullTarget(int askerSlot, int mySlot, const int* slots, const int* bits, int n, int mapFresh)
+{
+    return ParityPullTarget(askerSlot, mySlot, slots, bits, n, mapFresh, 0, 0, 0, 0);
+}
+/* T-1268 fold (review LOW 4 / MED 3): A PULL STILL WANTED AFTER IT WAS LOST OR REFUSED - read on the next area map (lost) or at the
+   refusal. loading: the area picture is loading; resolved: the box is found here; settled: ParityVerdictSettled; mine: this game
+   holds it; neverRecv: its copy here is still untrusted. Keep = ask again on the next map; Pull = ask the next game now; End = no
+   longer wanted (the box gone, another game holds it now, or the copy is received). */
+const int kParityPullRetryKeep = 0;
+const int kParityPullRetryPull = 1;
+const int kParityPullRetryEnd  = 2;
+inline int ParityPullRetryAction(int loading, int resolved, int settled, int mine, int neverRecv)
+{
+    if (loading != 0) return kParityPullRetryKeep;
+    if (resolved == 0) return kParityPullRetryEnd;
+    if (settled == 0) return kParityPullRetryKeep;
+    return (mine != 0 && neverRecv != 0) ? kParityPullRetryPull : kParityPullRetryEnd;
+}
+/* T-1268 fold (review LOW 8): IS AN AREA VERDICT SETTLED - a game named (this one or another), or the area going? 0 while the area
+   picture is loading, and for 'nobody named yet', 'no answer' (no fresh map) and, where the caller counts it, 'no notebook'. The
+   arrival wait passes noNotebook 0 (it waits only on the first three). */
+inline int ParityVerdictSettled(int loading, int unowned, int noAnswer, int noNotebook)
+{
+    return (loading != 0 || unowned != 0 || noAnswer != 0 || noNotebook != 0) ? 0 : 1;
+}
+/* T-1268 fold (review MED 2): ONE WAIT OF A FILL PUSH (loading, no answer, or the other game's map stale). ticks = the drains it
+   has waited, counted now. Past the limit the box is not dropped: it goes on the wait list (WaitBoxAdd), and the next area map
+   decides it again - its whole contents still go out once this game can push. */
+const int kFillWaitKeep = 0;
+const int kFillWaitList = 1;
+inline int FillWaitStep(int ticks, int limit) { return (ticks > limit) ? kFillWaitList : kFillWaitKeep; }
+/* T-1268 fold 2 (re-check, the no-notebook drop): a fill push whose verdict cannot be read now WAITS (FillWaitStep, then the wait
+   list): the area picture loading, no answer (linked, no fresh map) or no notebook (the world-server link down - it was dropped
+   before). The wait list's drain keeps all three (ParityVerdictSettled 0) until an area map names the holder. */
+inline int FillPushWaits(int loading, int noAnswer, int noNotebook) { return (loading != 0 || noAnswer != 0 || noNotebook != 0) ? 1 : 0; }
+/* T-1268 (F1053 (1), decision 1563 a): THE BOXES CHANGED WHILE NOBODY IS NAMED FOR THEIR AREA. A lone change (no paired half on a
+   character) the drain reads as 'nobody holds it yet' puts the box's key on a bounded list; the next area map empties it, each box
+   read live: this game holds it -> its whole contents go to the other games (the fill push); another game holds it -> that game is
+   asked and its answer replaces this game's copy (a non-holder's own change in the wait is lost - decision 1563 a); still nobody
+   -> stays listed; the box gone or its area going -> leaves the list. */
+const int kWaitBoxAdded   = 0;
+const int kWaitBoxAlready = 1;
+const int kWaitBoxFull    = 2;
+inline int WaitBoxAdd(int listed, size_t size, size_t cap)
+{
+    if (listed != 0) return kWaitBoxAlready;
+    return (size >= cap) ? kWaitBoxFull : kWaitBoxAdded;
+}
+const int kWaitBoxKeep   = 0;   /* still nobody named (or the verdict cannot be read now): stays listed */
+const int kWaitBoxPush   = 1;   /* this game holds it: its whole contents to the other games */
+const int kWaitBoxReask  = 2;   /* another game holds it: ask it; its answer replaces this copy */
+const int kWaitBoxForget = 3;   /* the box no longer resolves here, or its area is going */
+/* loading: the area picture is loading here (T-1268 fold, review LOW 5: read FIRST - a box not found while its area loads stays
+   listed); resolved: the key finds the box; settled (ParityVerdictSettled) 0 = no answer, nobody named yet or no notebook; mine /
+   held: the verdict */
+inline int WaitBoxAction(int loading, int resolved, int settled, int mine, int held)
+{
+    if (loading != 0) return kWaitBoxKeep;
+    if (resolved == 0) return kWaitBoxForget;
+    if (settled == 0) return kWaitBoxKeep;
+    if (mine != 0) return kWaitBoxPush;
+    if (held != 0) return kWaitBoxReask;
+    return kWaitBoxForget;
 }
 inline unsigned int ParityUnknownCount(const std::vector<ParityItem>& items) { return coopmark::OwnerTailUnknown(ParityOwners(items)); }   /* review-inv6p2 LOW */
 /* The whole box, from its items - the same sum the plugin builds while walking a live inventory. */

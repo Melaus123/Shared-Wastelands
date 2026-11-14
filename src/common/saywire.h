@@ -502,6 +502,35 @@ inline std::string TalkLeverNameKey(const std::string& tok)
     return TalkPersonKey(tok);
 }
 
+/* T-1145 (owner 1559 a, TEST-ONLY): `talktest dialogue <dialogueSid> <npcUid | leader:<Faction_Name>> <targetUid>` - arg is the whole
+   talktest argument. 1 parsed, 0 malformed. sid: one word, at most 64 characters, not a number and holding no '{' or '}' (an
+   unresolved harness placeholder); the speaker an NPC uid (non-zero) or leader:<faction> (*facKey = TalkLeverNameKey of the name,
+   '_' = a space; *npcUid = 0); the target non-zero. Outputs are reset on a refusal. */
+inline int TalkTestDialogueParse(const std::string& arg, std::string* sid, unsigned int* npcUid, std::string* facKey, unsigned int* targetUid)
+{
+    sid->clear(); *npcUid = 0; facKey->clear(); *targetUid = 0;
+    std::string tok[5];
+    if (TalkSplit(arg, tok, 5) != 4 || tok[0] != "dialogue") return 0;
+    unsigned long long v = 0;
+    if (tok[1].empty() || tok[1].size() > 64 || tok[1].find('{') != std::string::npos || tok[1].find('}') != std::string::npos
+        || TalkParseNumber(tok[1], &v)) return 0;
+    std::string fk;
+    unsigned int nu = 0;
+    if (tok[2].compare(0, 7, "leader:") == 0)
+    {
+        fk = TalkLeverNameKey(tok[2].substr(7));
+        if (fk.empty()) return 0;
+    }
+    else
+    {
+        if (!TalkParseNumber(tok[2], &v) || v == 0 || v > 0xFFFFFFFFull) return 0;
+        nu = (unsigned int)v;
+    }
+    if (!TalkParseNumber(tok[3], &v) || v == 0 || v > 0xFFFFFFFFull) return 0;
+    *sid = tok[1]; *npcUid = nu; *facKey = fk; *targetUid = (unsigned int)v;
+    return 1;
+}
+
 const int kLeverBountyMaxAmount = 1000000;
 /* `crimetest bountyset <personName> <lawNpcName> <amount>` - arg is what follows `bountyset`: two name tokens, then the amount
    1..kLeverBountyMaxAmount (decimal or 0x hex). 1 parsed, 0 malformed. */
@@ -534,17 +563,22 @@ inline int KoSelfNameParse(const std::string& arg, std::string* name, int* secon
     return 1;
 }
 
-/* `capturetest carry <carrierUid> name <name>` - arg is the whole capturetest argument. 1 parsed (carrier non-zero), 0 not this
-   form or malformed. */
-inline int CarryNameParse(const std::string& arg, unsigned int* carrier, std::string* name)
+/* `capturetest carry <carrierUid> name <name> [dead]` - arg is the whole capturetest argument. 1 parsed (carrier non-zero), 0 not
+   this form or malformed. *dead (when given) = 1 when the trailing word `dead` is there (T-1262 TEST-ONLY: the body is a DEAD
+   character, not a down one), else 0. */
+inline int CarryNameParse(const std::string& arg, unsigned int* carrier, std::string* name, int* dead = 0)
 {
     *carrier = 0; name->clear();
+    if (dead != 0) *dead = 0;
     std::string tok[5];
     unsigned long long v = 0;
-    if (TalkSplit(arg, tok, 5) != 4 || tok[0] != "carry" || tok[2] != "name" || !TalkParseNumber(tok[1], &v) || v == 0) return 0;
+    const int n = TalkSplit(arg, tok, 5);
+    if ((n != 4 && n != 5) || tok[0] != "carry" || tok[2] != "name" || !TalkParseNumber(tok[1], &v) || v == 0) return 0;
+    if (n == 5 && tok[4] != "dead") return 0;
     const std::string k = TalkLeverNameKey(tok[3]);
     if (k.empty()) return 0;
     *carrier = (unsigned int)v; *name = k;
+    if (dead != 0) *dead = (n == 5) ? 1 : 0;
     return 1;
 }
 

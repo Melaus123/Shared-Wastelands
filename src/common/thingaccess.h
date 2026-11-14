@@ -66,6 +66,18 @@ inline bool NodeLeftOpens(int worldNode, int built, int engineGate)
     return worldNode == 1 && built == 1 && engineGate != 1;
 }
 
+/* T-1250 (owners 1187 a / 1499 / 1554 b): A TEAMMATE'S BUILDING'S WINDOW ON A LEFT CLICK. On this game a teammate's machine, bench,
+   cage or box belongs to that player's stand-in faction, which has no player interface, so the select virtual's own gate (above)
+   opens nothing - single player opens your own building's window on this click. policy.cpp's detour then opens it with the same call
+   the ore rock takes, only when this says so:
+   mate: the building's owner faction (vtable +0x58) is in this game's teammate list (the team table's factions, as
+         PolicyTeammateFactions gives them - empty with no team; 1 = in it);
+   built / engineGate: as NodeLeftOpens reads them. A friend's, a stranger's, a town's or nobody's building keeps the engine's select. */
+inline bool TeamLeftOpens(int mate, int built, int engineGate)
+{
+    return mate == 1 && built == 1 && engineGate != 1;
+}
+
 /* THE REQUEST GATE (policy.cpp PolicyJudge, which BoxAccessAllowed asks): the rule that decides, in its order. The first step needs
    no owner read: a member's request, then a world node, then `shared` (an option not heard yet is judged as `shared`, as before);
    kJudgeReadOwners = read the building's owner and this game's own player and go on with JudgeAfterReads. */

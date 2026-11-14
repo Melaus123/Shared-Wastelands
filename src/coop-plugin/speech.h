@@ -84,8 +84,9 @@ std::string TalkCarriersCommand(float x, float z, float radius);
    LeverNearestNamed: the nearest loaded character (2D) within maxDist of `from` (0 = this game's first own player character)
    whose display name keys as nameKey (coopsay::TalkPersonKey). kLeverPickOwnLiving: this game's own, living, non-player, with a
    uid (crimetest bountyset's person, koself name); kLeverPickAny: any (crimetest bountyset's law NPC); kLeverPickDowned: living
-   and down (prone or ragdoll), either game's (capturetest carry name); kLeverPickDead: dead, either game's (cursortest
-   deadname:). *uid (0 = not replicated), *dist, *name = its display
+   and down (prone or ragdoll), either game's (capturetest carry name); kLeverPickDead: dead, either game's (capturetest carry name .. dead; cursortest
+   deadname:) - T-1262: a dead character leaves the engine's update list, so this pick also walks the mod's uid table
+   (SpawnedUidList / FindSpawned) and its miss words count both (leverpick::NoneCountTail). *uid (0 = not replicated), *dist, *name = its display
    name; 0 = none (*why says so in words). T-1218: only when exactly ONE such character is within maxDist, or nameKey ends in
    `#<k>` (the k-th nearest); several -> 0 with *why = the refusal naming the count and the five nearest (leverpick.h). */
 const int kLeverPickOwnLiving = 0, kLeverPickAny = 1, kLeverPickDowned = 2, kLeverPickDead = 3;
@@ -93,6 +94,10 @@ std::string TalkCarriersActCommand(float x, float z, float radius, int ev, int a
 ::Character* LeverNearestNamed(const std::string& nameKey, int pick, ::Character* from, float maxDist, unsigned int* uid, float* dist,
                                std::string* name, std::string* why);
 int TalkNearPoint(const std::string& arg, float* x, float* z, std::string* why);
+/* T-1199 fold 2 TEST-ONLY (dooruse npc): the nearest (2D) of THIS game's own living, conscious non-player characters with a uid
+   (net::IsUidMine - never another game's copy; not a player's or a stand-in's faction) within maxDist of (x, z). *count = how many
+   such characters are loaded; 0 = none within maxDist. MAIN THREAD. */
+::Character* LeverNearestOwnNpc(float x, float z, float maxDist, unsigned int* uid, float* dist, std::string* name, int* count);
 int TalkWaitTick(float* x, float* z, unsigned long* waitedMs);
 /* P25 T729 (TEST-ONLY): `talktest nearestname <npc name> <targetUid> [event] [copy | mine]` (P25 T729b: copy / mine = only a copy
    the other game drives / only this game's own) - the nearest living, conscious non-player character
@@ -100,6 +105,11 @@ int TalkWaitTick(float* x, float* z, unsigned long* waitedMs);
    re-checked by TalkWaitTick), then exactly `talktest <uid> <target> <event>`. `playerteleport near name <npc name> <units>
    [maxdy <n>]` goes through TalkNearPoint. */
 std::string TalkTestNameArm(const std::string& arg);
+/* T-1145 (owner 1559 a) TEST-ONLY: `talktest dialogue <dialogueSid> <npcUid | leader:<Faction_Name>> <targetUid>` - the named
+   dialogue started by the engine's own Dialogue::startPlayerConversation (through its hook) and every reply of the line it opens
+   logged with its conditions' answers; `talktest replies` - the same listing for that conversation now (speech.cpp). */
+std::string TalkTestDialogueArm(const std::string& arg);
+std::string TalkTestRepliesArm();
 std::string TalkTestCarrierArm(const std::string& arg);   /* T-858 TEST-ONLY: `talktest nearestcarrier <act> <targetUid> [event] [copy | mine]` (speech.cpp) */
 std::string TalkActResultDropArm();   /* T-858 TEST-ONLY: `talktest actresultdrop` - the next paid line's ACT_RESULT dropped once on the NPC's game (speech.cpp) */
 

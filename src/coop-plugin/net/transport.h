@@ -314,6 +314,17 @@ enum MsgType
     // (writer -> the picker) with its lock, which the picker lays back. RELIABLE.
     //   kind u8 (1 ASK, 2 NO) | u32 len + the box's position key | locked u8 | broken u8 | level i32 | hardness f32   (src/common/boxrec.h)
     MSG_BOX_LOCK = 85,
+    // RAID_LEND (T-1122 build, game-to-game protocol 200, number 86 since 208; the game that made a raid squad (the lender) <-> the game holding the area its
+    // sleeping route enters (the borrower), each by slot): kind 1 LEND (the squad's bytes, its position and the raid target's position;
+    // or, with no bytes, the lender's status ask), 2 TAKEN, 3 REFUSED (why), 4 RETURN (the copy's bytes and position when the
+    // borrower's engine put it away), 5 DIED, 6 UNKNOWN (the borrower knows nothing of that lend). Keyed by the lender's slot + the
+    // squad's id + a serial. RELIABLE.   u32 'RLD1' | u8 kind | u32 serial | i32 lender | id | per kind   (src/common/raidsquad.h)
+    MSG_RAID_LEND = 86,
+    // RAID_END (T-1122 redesign (b), game-to-game protocol 208; the borrower -> the lender, by slot): the borrower's raid campaign for a
+    // lent copy ended for it - arrived (the raid's attack stage, phase 1 - not proof the assault started), defeated, retreated or
+    // returned - so the lender's own campaign is not left
+    // waiting. Keyed as RAID_LEND. RELIABLE.   u32 'RND1' | u32 serial | i32 lender | id | u8 outcome | i32 phase   (src/common/raidsquad.h)
+    MSG_RAID_END = 87,
     // RESEARCH_BOOK (T-1242, game-to-game protocol 211; 86 / 87 are held by effort/t1122a): a research's Books in a teammate's bench.
     // ASK (the researcher's game -> the bench owner's game, by slot): take these counts from these benches of yours; ANSWER (back): yes
     // with what was taken, or no; GIVEBACK / DONE (the researcher's game -> the bench owner's): put back what you took / forget it. RELIABLE.

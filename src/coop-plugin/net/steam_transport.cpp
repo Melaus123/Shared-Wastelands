@@ -387,6 +387,7 @@ struct LfAll
 {
     livefirst::Stats st;
     long long links, chunksIn, joinedIn, joinFault, joinDup, handedIn, handedOut, aheadMaxMs;
+    long long answerOut, answerLive, answerBehind;   /* T-1279 (T2290; review MEDIUM): bridge links - AREA_FRESH sent on the ANSWER line / the LIVE line / CANTs kept on REST behind what they may not pass (steamAnswerLine[...]) */
 };
 LfAll g_lf;   /* static storage: zero */
 
@@ -1614,6 +1615,7 @@ private:
         lfHandOn_ = handOn;
         box_.SetLiveFirst(true);
         lfMapRep_.Reset();
+        lfGate_.Reset();
     }
     static double LfNow()
     {
@@ -1662,8 +1664,33 @@ private:
            and goes LIVE when no earlier one waits here (livefirst.h MapRepeat); a map handed on in pieces stays a barrier, and makes
            the next whole one count as changed */
         if (lfHandOn_ && lfDir_ == livefirst::kDirDown && reliable && !frame->empty())
-            lfMapRep_.Classify(it.type, &(*frame)[0], frame->size(), box_.RestWaitingOf(livefirst::kTypeAreaMap) > 0,
-                               box_.RestWaitingOf(livefirst::kTypePlayerSectors) > 0, &it.line, &it.barrier);
+        {   /* T-1320 fix 3 fold 1 (H1): the same line rule as the world server's links (livefirst.h MapLine) - REST while this link's first
+               map waits there or a map / sectors frame there is partly sent; otherwise LIVE, and the box removes the REST maps and sectors
+               it supersedes (sendbound.h Outbox::Put; the bridge's maps hold every area - Item.barAll's default) */
+            if (lfMapRep_.Classify(it.type, &(*frame)[0], frame->size(), box_.FirstMapWaiting(), box_.RestMapPartly(),
+                                   box_.RestWaitingOf(livefirst::kTypePlayerSectors) > 0, &it.line, &it.barrier) && it.type == livefirst::kTypeAreaMap)
+                it.mapFirst = lfMapRep_.LastFirst();
+        }
+        /* T-1279 (T2290; review MEDIUM): a bridge link toward a joiner sends the world server's area answers on the lines the world
+           server sends them on (livefirst.h AreaFreshLine), decided again here from what waits on THIS link (sendbound.h AnswerGate):
+           a CANT on the ANSWER line unless a RECORD of its area - whole or any piece of one - still waits here (or a piece whose
+           record's area this link could not read, or a piece of a WELCOME), then REST behind it; a WRITE on the LIVE line (held by a
+           waiting AREAMAP barrier, whole or its last piece - HandOn / MapRepeat above); a FRESH on REST behind its record. Every
+           frame goes through the gate (Direct ones too), so a record handed on in pieces is followed from its first piece. */
+        int lfHold = coopsb::AnswerGate::kHoldNone;
+        if (lfHandOn_ && lfDir_ == livefirst::kDirDown && reliable && !frame->empty())
+        {
+            lfHold = lfGate_.HoldOf(&(*frame)[0], frame->size());
+            areafresh::Msg am;
+            if (it.type == livefirst::kTypeAreaFresh && areafresh::Decode(data, len, &am))
+            {
+                const int waiting = (am.kind == (unsigned int)areafresh::kCant && lfGate_.Holds(areafresh::Key(am.x, am.y), box_)) ? 1 : 0;
+                it.line = livefirst::AreaFreshLine(am.kind, waiting);
+                if (waiting != 0) ++g_lf.answerBehind;
+                if (it.line == livefirst::kLineAnswer) ++g_lf.answerOut;
+                else if (it.line == livefirst::kLineLive) ++g_lf.answerLive;
+            }
+        }
         it.len = frame->size();
         it.bytes.swap(*frame);
         if (reliable)
@@ -1692,6 +1719,7 @@ private:
         it.p199At = it.line == livefirst::kLineLive ? p199t0 : 0.0;
         // PROBE-END: P199
         if (box_.Put(it)) ++sbCoalesced_;
+        if (reliable) lfGate_.Waits(lfHold, box_);   /* T-1279 (T2290; review MEDIUM): a RECORD (or a piece) waits on REST - marked by its put order */
         ++sbWaited_;
         if (box_.Count() > sbWaitMax_) sbWaitMax_ = box_.Count();
         if (box_.Edge() > 0) ++sbEpisodes_;
@@ -1779,6 +1807,7 @@ private:
         lfJoin_ = livefirst::Joiner();
         lfHandOnOut_.Reset();
         lfMapRep_.Reset();
+        lfGate_.Reset();
         LfCollect();
     }
     void LfCollect()
@@ -1894,6 +1923,7 @@ private:
     livefirst::Joiner lfJoin_;   /* a joiner's link: the world server's pieces */
     livefirst::HandOn lfHandOnOut_;   /* a bridge link: which world-server piece handed on is the last of a barrier */
     livefirst::MapRepeat lfMapRep_;   /* a bridge link: the last whole AREAMAP and PLAYERSECTORS handed on toward the joiner */
+    coopsb::AnswerGate lfGate_;       /* T-1279 (T2290; review MEDIUM) a bridge link: what an AREA_FRESH CANT toward the joiner may not pass */
     livefirst::Stats lfStats_;
     long long    steamUnsent_;   /* bytes Steam holds not yet sent: the last status read (pending reliable + unreliable) plus what it took since */
     long long    lfChunksIn_, lfJoinedIn_, lfJoinFault_, lfJoinDup_, lfAheadMaxMs_;
@@ -2557,7 +2587,8 @@ static std::string SteamLiveFirstToken()
          + "," + N(g_lf.joinDup) + "," + N(g_lf.handedIn) + "," + N(g_lf.handedOut) + "," + N(g_lf.st.livePassed) + "," + N(g_lf.st.liveWaited)
          + "," + N(g_lf.st.barrierHeld) + "," + N((long long)(g_lf.st.liveWaitMaxSec * 1000.0)) + "," + N(g_lf.aheadMaxMs)
          + "," + N(g_lf.st.announceQueued) + "," + N(g_lf.st.announceSent) + "," + N((long long)(g_lf.st.announceWaitMaxSec * 1000.0)) + "," + N(g_lf.st.gateHeld)
-         + livefirst::BulkTokenValues(g_lf.st);
+         + livefirst::BulkTokenValues(g_lf.st)
+         + " steamAnswerLine[answer,live,behindRecord]=" + N(g_lf.answerOut) + "," + N(g_lf.answerLive) + "," + N(g_lf.answerBehind);   /* T-1279 (T2290; review MEDIUM): the bridge's area answers, as areaFreshLine[...] on the world server's REPORT line */
     g_lf.st.liveWaitMaxSec = 0.0; g_lf.st.announceWaitMaxSec = 0.0; g_lf.aheadMaxMs = 0;
     g_lf.st.RestartBulkMaxima();
     return t;

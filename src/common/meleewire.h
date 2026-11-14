@@ -116,6 +116,19 @@ inline bool MeleeReceiverApplies(bool attackerMine, int attackerPlayer, bool vic
     return MeleeDecide(attackerMine, attackerPlayer, victimMine, victimPlayer) == kMeleeIgnore;
 }
 
+/* T-1264 review: the attacker's class the NPC's game hands MeleeReceiverApplies. A game classifies only characters it has (the
+ * player-character sweep walks its own mirror, spawn.cpp), so with no copy of the attacker here its class is unknown and the blow
+ * would be refused as "rule" and lost. The sending game sends only its own player character's blow on another game's NPC copy
+ * (MeleeDecide == kMeleeSend needs attackerPlayer 1 - the THEIRS branch of detour_hitByMelee, combat.cpp), and with no copy here
+ * this game ran no hit of its own for that swing, so nothing is counted twice: the attacker is taken as a player character. With
+ * a copy here, this game's own class decides as before (not classified yet: refused, its own result may stand). Accepted (re-check
+ * LOW, Inferred rare): a copy here but not yet classified when it swung (its own result kept) that is gone when the message arrives
+ * has the message applied too - it needs the class lag (up to one sweep) and the copy's leaving (within one round trip) to meet. */
+inline int MeleeReceiverAttackerClass(bool copyHere, int classHere)
+{
+    return copyHere ? classHere : 1;
+}
+
 /* The attacker's game: our character's blow on another game's copy kept today's rule (nothing sent) only because the attacker or
  * the copy is not classified here yet - with both known it could have been kMeleeSend. The NPC's game may already have classified
  * both and ignore its own result for that swing, and then the blow lands nowhere; counted (meleeKeptUnclassified) so a run shows

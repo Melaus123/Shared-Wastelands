@@ -53,6 +53,7 @@
 #include "../common/aimstamp.h"   /* T-330: the owner's aim word and the copy's raise / lower step */
 #include "effect.h"   /* T-327: InstallEffectHook, EffectSafePointDrain */
 #include "../common/windowbound.h"   /* T-986 fold 1: which close leaves combat mode (winbound::CloseKind) */
+#include "../common/physqueued.h"   /* T-1046 fix 1: is a physics piece already queued for delete (its first-ready setup skipped) */
 namespace coop { void RestockNowDrain(); }   /* par2: items.cpp - the `restocknow` lever runs at this same safe point */
 namespace coop { void TraderSpawnDrain(); }   /* traderspawn: items.cpp - the `traderspawn` lever runs at this same safe point */
 namespace coop { void SquadLeaderSafePointDrain(); }   /* T-1 B1: handoff.cpp - the copy squad's leader set to the owner's at this safe point */
@@ -61,6 +62,7 @@ namespace coop { void LimbSafePointDrain(); }   /* LIMBS: clothing.cpp - the own
 namespace coop { int AiWorkerBusyNow(); }   /* T-1101 step 3: coop.cpp - the engine's own AI-worker busy test: 1 running, 0 idle, -1 cannot be told. MAIN THREAD */
 namespace coop { void BoxTakeDrain(); }      /* loot2c: items.cpp - the `boxtake` lever's move runs at this same safe point */
 namespace coop { void AdminSafePointDrain(); }   /* T-1205: admin.cpp - the admin toolbox's /medic, /heal and /additem on this game's own characters */
+namespace coop { unsigned long CrimeReplayHitEnter(); void CrimeReplayHitLeave(unsigned long prev); }   /* T-1293: crime.cpp - this thread is inside ApplyRemoteHit's played hit */
 
 #include "coop_log.h"
 namespace { swlogbudget::Gate g_qM6State, g_qNcOpen, g_qNcClose, g_qM6Sent, g_qM6Unknown, g_qM6NoTarget; }   /* T-910: g_qM6Sent, g_qM6Unknown; T-879: g_qM6NoTarget */   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
@@ -1527,7 +1529,9 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
         FpArm(victim, blow);   /* fight parity: the engine plays the carried answer and stumble in this call */
         FpDecide dec;          /* the stumble the engine picks in this call, for the [FIGHT] line */
         FpDecideArm(&dec, victim);
+        const DWORD replayPrev = CrimeReplayHitEnter();   /* T-1293: a crime the engine records on a copy inside this call is the replay's, not the copy's act */
         const int fightResult = orig_hitByMelee(victim, cutDirection, dmg, attacker, 0, comboId);
+        CrimeReplayHitLeave(replayPrev);
         FpDecideDisarm(&dec);
         FpDisarm();
         InterlockedExchange(&g_applyingRemote, 0);
@@ -1696,8 +1700,10 @@ volatile LONG64 g_rsShotFiredLost = 0;   /* our own character's fire lost to a f
 /* P104 fix, MAIN THREAD only (the drain, the net pump, the K2 safe point) */
 long long g_shotSent = 0, g_shotSendFail = 0, g_shotSendBad = 0, g_shotOutLogged = 0, g_rsBlockLogged = 0;
 long long g_shotIn = 0, g_shotApplied = 0, g_shotRefusedNotMine = 0, g_shotRefusedShooter = 0, g_shotMalformed = 0, g_shotQDrop = 0;
-long long g_shotNoVictim = 0, g_shotNoShooter = 0, g_shotNotOrientable = 0, g_shotBlockedLoad = 0, g_shotFault = 0, g_shotNoAddWound = 0;
+long long g_shotNoVictim = 0, g_shotNotOrientable = 0, g_shotBlockedLoad = 0, g_shotFault = 0, g_shotNoAddWound = 0;
 long long g_shotInLogged = 0;
+/* T-1264, MAIN THREAD: MSG_SHOT wounds applied with the victim standing in as the attacker (no copy / a copy not positionable) */
+long long g_shotStandInApplied = 0, g_shotStandInNoCopy = 0, g_shotStandInNotPositionable = 0, g_shotStandInLogged = 0;
 long long g_shotRefusedRule = 0;   /* MSG_SHOT for a victim this game classifies as a player character (its hits are decided here) */
 long long g_shotFiredSent = 0, g_shotFiredNotSent = 0, g_shotFiredRecv = 0, g_shotFiredRefused = 0, g_shotFiredLogged = 0;   /* MSG_SHOT_FIRED */
 long long g_shotFiredNoAim = 0;   /* our fire's aim point unreadable: not sent */
@@ -1737,7 +1743,7 @@ std::vector<ShotFire> g_shotFireQ;      /* net pump -> K2 safe point, both MAIN 
 const size_t kShotFireMax = 64;
 /* T-311, MAIN THREAD: the victim-side reactions after a SHOT-IN wound (ShotReactOne) and the follow-up WATCH lines */
 long long g_shotReactRuns = 0, g_shotReactRemember = 0, g_shotReactUnderRanged = 0, g_shotReactHitReaction = 0;
-long long g_shotReactNoCopy = 0, g_shotReactNoRow = 0, g_shotReactFault = 0, g_shotReactNoAI = 0, g_shotReactNoPart = 0;
+long long g_shotReactNoRow = 0, g_shotReactFault = 0, g_shotReactNoAI = 0, g_shotReactNoPart = 0;
 long long g_shotReactNotOnPurpose = 0, g_shotReactFlag130 = 0, g_shotReactEnemy = 0, g_shotReactLogged = 0;
 long long g_shotReactFlagUnread = 0, g_shotReactNotChar = 0;   /* T-311 fold 1: underRangedAttack skipped - combat +0x130 unread / attacker type != 1 */
 long long g_shotWatchLines = 0, g_shotWatchTurned = 0, g_shotWatchGone = 0, g_shotWatchBusy = 0;
@@ -2777,7 +2783,7 @@ std::string RangedCountersLine()
          + " rhitCopyBlocked=" + N3(g_rsHitCopyBlocked) + " shotSent=" + N3(g_shotSent) + " shotSendFail=" + N3(g_shotSendFail)
          + " shotSendBad=" + N3(g_shotSendBad) + " shotIn=" + N3(g_shotIn) + " shotApplied=" + N3(g_shotApplied)
          + " shotRefused[notMine,shooter,malformed]=" + N3(g_shotRefusedNotMine) + "," + N3(g_shotRefusedShooter) + "," + N3(g_shotMalformed)
-         + " shotNot[victim,shooter,orientable,loading,addWoundOff,fault,qDrop]=" + N3(g_shotNoVictim) + "," + N3(g_shotNoShooter)
+         + " shotNot[victim,orientable,loading,addWoundOff,fault,qDrop]=" + N3(g_shotNoVictim)
          + "," + N3(g_shotNotOrientable) + "," + N3(g_shotBlockedLoad) + "," + N3(g_shotNoAddWound) + "," + N3(g_shotFault) + "," + N3(g_shotQDrop)
          + " addWound=" + (g_p104AddWound != 0 ? std::string("ON") : "OFF(why=" + N3(g_p104AddWoundWhy) + ")")
          + " rhitDecided[here,leftToOwner,notAimed]=" + N3(g_rsHitDecidedHere) + "," + N3(g_rsHitLeftToOwner) + ","
@@ -2788,12 +2794,14 @@ std::string RangedCountersLine()
          + " hooks=" + N3(g_rsHooks) + "/2 leverRuns=" + N3(g_rsLeverRuns)
          + " react[runs,remember,underRanged,hitReaction]=" + N3(g_shotReactRuns) + "," + N3(g_shotReactRemember) + ","
          + N3(g_shotReactUnderRanged) + "," + N3(g_shotReactHitReaction)
-         + " reactSkip[noCopy,noRow,notOnPurpose,flag130,flagUnread,notChar,noAI,noPart]=" + N3(g_shotReactNoCopy) + "," + N3(g_shotReactNoRow) + ","
+         + " reactSkip[noRow,notOnPurpose,flag130,flagUnread,notChar,noAI,noPart]=" + N3(g_shotReactNoRow) + ","
          + N3(g_shotReactNotOnPurpose) + "," + N3(g_shotReactFlag130) + "," + N3(g_shotReactFlagUnread) + "," + N3(g_shotReactNotChar)
          + "," + N3(g_shotReactNoAI) + "," + N3(g_shotReactNoPart)
          + " reactFault=" + N3(g_shotReactFault) + " reactEnemy=" + N3(g_shotReactEnemy)
          + " watch[lines,turned,gone,busy]=" + N3(g_shotWatchLines) + "," + N3(g_shotWatchTurned) + "," + N3(g_shotWatchGone)
-         + "," + N3(g_shotWatchBusy);
+         + "," + N3(g_shotWatchBusy)
+         + " shotStandIn[applied,noCopy,notPositionable]=" + N3(g_shotStandInApplied) + "," + N3(g_shotStandInNoCopy) + ","
+         + N3(g_shotStandInNotPositionable);
 }
 
 // PROBE-START: P112 (T-310, block 2 of 2) - MAIN THREAD: the lines, the REPORT, `rangedtest watch`, the install.
@@ -3034,8 +3042,9 @@ void ShotOnNet(unsigned int victimUid, unsigned int shooterUid, const float* rec
 }
 
 // T-311, MAIN THREAD (K2 safe point, inside ShotSafePointDrain): the wound was applied - play iShotYou's victim-side reactions
-// (see P311ReadGate above) with the shooter's copy `a` as the attacker, then arm the +3 s / +8 s WATCH lines.
-static void ShotReactOne(::Character* v, ::Character* a, const ShotIn& s, float* damages6, void* part)
+// (see P311ReadGate above) with the shooter's copy `a` as the attacker, then arm the +3 s / +8 s WATCH lines. `allow`
+// (coopshot::StandInReactions, T-1264 review) drops the flinch when the copy cannot be positioned and the victim stood in.
+static void ShotReactOne(::Character* v, ::Character* a, const ShotIn& s, float* damages6, void* part, int allow)
 {
     ++g_shotReactRuns;
     if (kP311Remember == 0 || kP311UnderRanged == 0 || kP311HitReaction == 0)
@@ -3052,7 +3061,7 @@ static void ShotReactOne(::Character* v, ::Character* a, const ShotIn& s, float*
     }
     int flag130 = -1, type = -1;
     const int gateRead = P311ReadGate(v, a, &flag130, &type);
-    const int want = coopshot::ShotReactions(s.onPurpose, true, flag130, type);
+    const int want = coopshot::ShotReactions(s.onPurpose, true, flag130, type) & allow;
     /* T-311 fold 1 (the T733 proof): whom the victim targeted just BEFORE the reactions, read as the WATCH lines read it - a
        later WATCH 'TURNED' proves the reactions only when this was not already the shooter's copy. */
     const void* tgtBefore = 0;
@@ -3089,6 +3098,7 @@ static void ShotReactOne(::Character* v, ::Character* a, const ShotIn& s, float*
             if (hr == 1) ++g_shotReactHitReaction; else ++g_shotReactFault;
         }
     }
+    else if ((allow & coopshot::kShotReactHitReaction) == 0) hr = -3;   /* T-1264 review: the copy cannot be positioned - no flinch */
     const int enemy = P311IsEnemy(v, a);
     if (enemy == 1) ++g_shotReactEnemy;
     if (g_shotReactLogged < kRsLogLimit)
@@ -3099,7 +3109,7 @@ static void ShotReactOne(::Character* v, ::Character* a, const ShotIn& s, float*
                  + " attackerType=" + N3(type) + " targetBefore=" + tb + " targetBeforeRead=" + N3(tbRead)
                  + " -> rememberCharacter(ST_TEMPORARY_ENEMY)=" + N3(rem)
                  + " underRangedAttack=" + N3(ur) + " hitReaction=" + N3(hr)
-                 + " (1 ran, -2 the engine would not run it, 0 fault caught, -1 no AI / no part) victim treatsAsEnemy(copy)=" + N3(enemy)
+                 + " (1 ran, -2 the engine would not run it, 0 fault caught, -1 no AI / no part, -3 skipped: the copy cannot be positioned) victim treatsAsEnemy(copy)=" + N3(enemy)
                  + " - the victim's reactions ran as iShotYou's; WATCH lines +3 s / +8 s");
     }
     int freeAt = -1;
@@ -3263,9 +3273,11 @@ struct MeleeIn { unsigned int victim; unsigned int attacker; int cutDir; int com
 std::vector<MeleeIn> g_meleeInQ;          /* net pump -> K2 safe point, both MAIN THREAD */
 const size_t kMeleeInMax = 256;
 long long g_meleeIn = 0, g_meleeApplied = 0, g_meleeRefused = 0, g_meleeRefNotMine = 0, g_meleeRefSender = 0, g_meleeMalformed = 0,
-          g_meleeInDropped = 0, g_meleeRefBlockedLoad = 0, g_meleeRefNoAddWound = 0, g_meleeRefNoVictim = 0, g_meleeRefNoAttacker = 0,
+          g_meleeInDropped = 0, g_meleeRefBlockedLoad = 0, g_meleeRefNoAddWound = 0, g_meleeRefNoVictim = 0,
           g_meleeRefOrient = 0, g_meleeFault = 0, g_meleeHitSent = 0, g_meleeKnock = 0, g_meleeReactRemember = 0, g_meleeReactHit = 0,
           g_meleeRefRule = 0, g_meleeReactUnder = 0, g_meleeReactFault = 0;
+/* T-1264: MSG_MELEE_DECIDED wounds applied with the victim standing in as the attacker (no copy / a copy not positionable) */
+long long g_meleeStandInApplied = 0, g_meleeStandInNoCopy = 0, g_meleeStandInNotPositionable = 0;
 long long g_meleeSent = 0, g_meleeNotSent = 0;          /* the attacker's side, MeleeDecidedDrain */
 long long g_meleeIgnSeen = 0, g_meleeIgnLines = 0, g_meleeIgnLoggedAt = 0;
 const long long kMeleeLogFirst = 20, kMeleeLogEvery = 50;   /* the first 20 lines of a kind, then every 50th */
@@ -3511,31 +3523,43 @@ void MeleeSafePointDrain()
         if (blocked) { ++g_meleeRefBlockedLoad; why = "loading (a world is loading or tearing down)"; }
         else if (g_p104AddWound == 0) { ++g_meleeRefNoAddWound; why = "noAddWound (see the ranged probe line)"; }
         else if (!net::IsUidMine(s.victim)) { ++g_meleeRefNotMine; why = "notMine (the victim is no longer run here)"; }
-        else if (!meleewire::MeleeReceiverApplies(net::IsUidMine(s.attacker), IsUidPlayerCharAnyThread(s.attacker), true,
-                                                  IsUidPlayerCharAnyThread(s.victim)))
+        else if (!meleewire::MeleeReceiverApplies(net::IsUidMine(s.attacker),   /* T-1264 review: no copy here - a player character */
+                                                  meleewire::MeleeReceiverAttackerClass(FindSpawned(s.attacker) != 0,
+                                                                                        IsUidPlayerCharAnyThread(s.attacker)),
+                                                  true, IsUidPlayerCharAnyThread(s.victim)))
         {
             ++g_meleeRefRule;
             why = "rule (this game's own rule does not ignore its result for this pair - that result stands)";
         }
         else if ((v = FindSpawned(s.victim)) == 0) { ++g_meleeRefNoVictim; why = "noVictim (no character for the victim uid)"; }
-        else if ((a = FindSpawned(s.attacker)) == 0) { ++g_meleeRefNoAttacker; why = "noAttackerCopy (addWound reads the attacker)"; }
+        int standIn = 0;   /* T-1264: 0 the attacker's copy is addWound's attacker; 1 no copy here; 2 the copy cannot be positioned */
         if (why == 0)
         {
+            a = FindSpawned(s.attacker);
             void* an = 0; void* ap = 0; void* en = 0;
             int reason = kHitBodyAttached, gate = 0;
-            bool orientable = (AppearanceBodyAttached(v, &an, &ap, &en, &reason, &gate) != 0);
-            if (orientable && gate != 0)   /* no harpoon: addWound orients on the attacker's body when the victim's gate is set (C1-b) */
+            const bool victimReady = (AppearanceBodyAttached(v, &an, &ap, &en, &reason, &gate) != 0);
+            bool copyPositionable = (a != 0);
+            if (victimReady && a != 0 && gate != 0)   /* no harpoon: addWound orients on the attacker's body when the victim's gate is set (C1-b) */
             {
                 int atReason = kHitBodyAttached;
-                if (AppearanceBodyChain(a, false, &an, &ap, &en, &atReason, 0) == 0) { orientable = false; reason = kHitAttackerNotOrientable; }
+                if (AppearanceBodyChain(a, false, &an, &ap, &en, &atReason, 0) == 0) copyPositionable = false;
             }
-            if (!orientable)
+            const int pick = coopshot::WoundAttacker(victimReady, a != 0, copyPositionable);
+            if (pick == coopshot::kWoundRefuse)
             {
                 ++g_meleeRefOrient;
                 why = (reason >= 0 && reason < kHitBodySkipCount) ? kHitBodyReasonWord[reason] : "notOrientable";
             }
+            else if (pick == coopshot::kWoundStandIn)
+            {
+                /* T-1264: no live, positionable copy of the attacker here - the victim, whose body was just found orientable, stands in
+                   as addWound's attacker; armour, part and bleeding stay the engine's own. Never a wait, never thrown away. */
+                standIn = (a == 0) ? coopshot::kStandInNoCopy : coopshot::kStandInNotPositionable;   /* a stays the copy (0 when none) */
+            }
         }
         if (why != 0) { MeleeRefusedLine(s.victim, s.attacker, why); continue; }
+        ::Character* const wa = (standIn != 0) ? v : a;   /* T-1264: addWound's attacker - the copy, or the victim standing in */
         float before[32 * kPartFloats];
         float after[32 * kPartFloats];
         float bloodBefore = 0.0f, bloodAfter = 0.0f;
@@ -3546,7 +3570,7 @@ void MeleeSafePointDrain()
         int side[2] = { 0, 0 };
         void* part = 0;
         const int arm = KnockArmClaim(v);   /* applyDamage marks a knock on this thread */
-        const int ok = MeleeCallAddWound(v, a, s.techFlag, s.cutDir, dm, armour, side, &part);
+        const int ok = MeleeCallAddWound(v, wa, s.techFlag, s.cutDir, dm, armour, side, &part);
         const unsigned char knock = KnockArmRelease(arm);
         if (!ok)
         {
@@ -3556,14 +3580,28 @@ void MeleeSafePointDrain()
         }
         ++g_meleeApplied;
         if (knock) ++g_meleeKnock;
+        if (standIn != 0)
+        {
+            ++g_meleeStandInApplied;
+            if (standIn == coopshot::kStandInNoCopy) ++g_meleeStandInNoCopy; else ++g_meleeStandInNotPositionable;   /* after the wound: applied = the sum */
+            if (MeleeLogThis(g_meleeStandInApplied))
+                DebugLog("[MELEE] decided STAND-IN ATTACKER victim=" + N3(s.victim) + " attacker=" + N3(s.attacker) + " - "
+                         + (standIn == 1 ? "no copy of the attacker here" : "the attacker's copy cannot be positioned (attackerNotOrientable)")
+                         + ": applied through addWound with the victim standing in as the attacker; "
+                         + (standIn == coopshot::kStandInNoCopy ? "no remember / underMelee / hitReaction (they need the real attacker)"
+                                                                : "remember / underMelee with the copy, no hitReaction")
+                         + " side=" + N3(side[0]) + " (standIn " + N3(g_meleeStandInApplied) + ")");
+        }
+        /* T-1264 review, accepted by design: a stand-in hit with no copy here gets no reaction (each needs the real attacker). */
+        const int react = coopshot::StandInReactions(standIn);   /* a copy that cannot be positioned: remember / under attack, no flinch */
         int rem = -2, hr = -2;   /* -2 not run (no row / no part), 1 ran, 0 a fault caught */
-        if (kP311Remember != 0)
+        if (kP311Remember != 0 && (react & coopshot::kShotReactRemember) != 0)
         {
             rem = P311CallRemember((P311RememberFn)coop::AddrAbs(kP311Remember), v, a);
             if (rem == 1) ++g_meleeReactRemember;
         }
         int ua = -2;   /* -2 not run (no row, or the engine's gate is closed), 1 ran, 0 a fault caught, -1 the victim has no AI */
-        if (kMeleeUnderAttack != 0)
+        if (kMeleeUnderAttack != 0 && (react & coopshot::kShotReactUnderRanged) != 0)
         {
             int flag130 = -1, type = -1;
             if (P311ReadGate(v, a, &flag130, &type) == 1 && flag130 == 0 && type == 1)
@@ -3572,11 +3610,12 @@ void MeleeSafePointDrain()
                 if (ua == 1) ++g_meleeReactUnder; else if (ua == 0) ++g_meleeReactFault;
             }
         }
-        if (kP311HitReaction != 0 && part != 0)
+        if (kP311HitReaction != 0 && part != 0 && (react & coopshot::kShotReactHitReaction) != 0)
         {
             hr = MeleeCallHitReaction((P311HitReactionFn)coop::AddrAbs(kP311HitReaction), v, armour[1], dm, part, a);
             if (hr == 1) ++g_meleeReactHit; else if (hr == 0) ++g_meleeReactFault;
         }
+        else if ((react & coopshot::kShotReactHitReaction) == 0) hr = -3;   /* the flinch skipped for a stand-in (as the shot side logs) */
         const int na = SnapshotHealth(s.victim, after, 32, &bloodAfter);
         ObjId noId;
         noId.index = noId.serial = 0;
@@ -4417,21 +4456,31 @@ void ShotSafePointDrain()
         else if (g_p104AddWound == 0) { ++g_shotNoAddWound; why = "addWound is OFF (see the ranged probe line)"; }
         else if (!net::IsUidMine(s.victim)) { ++g_shotRefusedNotMine; why = "the victim is no longer driven here"; }
         else if ((v = FindSpawned(s.victim)) == 0) { ++g_shotNoVictim; why = "no character for the victim uid"; }
-        else if ((a = FindSpawned(s.shooter)) == 0) { ++g_shotNoShooter; ++g_shotReactNoCopy; why = "no copy of the shooter here (addWound reads the attacker unconditionally) - no wound, no reactions"; }
+        int standIn = 0;   /* T-1264: 0 the shooter's copy is addWound's attacker; 1 no copy here; 2 the copy cannot be positioned */
         if (why == 0)
         {
+            a = FindSpawned(s.shooter);
             void* an = 0; void* ap = 0; void* en = 0;
             int reason = kHitBodyAttached, gate = 0;
-            bool orientable = (AppearanceBodyAttached(v, &an, &ap, &en, &reason, &gate) != 0);
-            if (orientable && gate != 0)   /* harpoon 0: addWound orients on the attacker's body when the victim's gate is set */
+            const bool victimReady = (AppearanceBodyAttached(v, &an, &ap, &en, &reason, &gate) != 0);
+            bool copyPositionable = (a != 0);
+            if (victimReady && a != 0 && gate != 0)   /* harpoon 0: addWound orients on the attacker's body when the victim's gate is set */
             {
                 int atReason = kHitBodyAttached;
-                if (AppearanceBodyChain(a, false, &an, &ap, &en, &atReason, 0) == 0) { orientable = false; reason = kHitAttackerNotOrientable; }
+                if (AppearanceBodyChain(a, false, &an, &ap, &en, &atReason, 0) == 0) copyPositionable = false;
             }
-            if (!orientable)
+            const int pick = coopshot::WoundAttacker(victimReady, a != 0, copyPositionable);
+            if (pick == coopshot::kWoundRefuse)
             {
                 ++g_shotNotOrientable;
                 why = (reason >= 0 && reason < kHitBodySkipCount) ? kHitBodyReasonWord[reason] : "notOrientable";
+            }
+            else if (pick == coopshot::kWoundStandIn)
+            {
+                /* T-1264: no live, positionable copy of the shooter here (not loaded, in the edge strip, retired, not built yet, or its
+                   body not attached) - the victim, whose body was just found orientable, stands in as addWound's attacker; armour,
+                   part and bleeding stay the engine's own. Never a wait, never thrown away. */
+                standIn = (a == 0) ? coopshot::kStandInNoCopy : coopshot::kStandInNotPositionable;   /* a stays the copy (0 when none) */
             }
         }
         if (why != 0)
@@ -4453,11 +4502,12 @@ void ShotSafePointDrain()
         int armour[2] = { -1, 0 };   /* iShotYou's local_res20: -1 in; >= 0 out = an armour deflected it */
         int side[2] = { 0, 0 };      /* iShotYou's local_res18: addWound writes 1 / 2 */
         void* part = 0;
-        if (!P104CallAddWound(v, a, dm, armour, side, &part))
+        ::Character* const wa = (standIn != 0) ? v : a;   /* T-1264: addWound's attacker - the copy, or the victim standing in */
+        if (!P104CallAddWound(v, wa, dm, armour, side, &part))
         {
             ++g_shotFault;
             ErrorLog("[P104] SHOT-IN FAULTED inside MedicalSystem::addWound victim uid=" + N3(s.victim) + " shooter uid=" + N3(s.shooter)
-                     + " dmg=" + F1(s.rec[3]) + " - caught, not retried");
+                     + " dmg=" + F1(s.rec[3]) + (standIn != 0 ? " (stand-in attacker: the victim)" : "") + " - caught, not retried");
             continue;
         }
         ++g_shotApplied;
@@ -4469,14 +4519,32 @@ void ShotSafePointDrain()
             for (int k = 0; k < nb * kPartFloats; ++k) sb += before[k];
             for (int k = 0; k < na * kPartFloats; ++k) sa += after[k];
             SW_DEVLOG("[P104] SHOT-IN #" + N3(g_shotApplied) + " victim uid=" + N3(s.victim) + " (mine) shooter uid=" + N3(s.shooter)
-                     + " (copy) dmg=" + F1(s.rec[3]) + " onPurpose=" + N3(s.onPurpose ? 1 : 0)
+                     + (standIn != 0 ? " (stand-in attacker: the victim)" : " (copy)") + " dmg=" + F1(s.rec[3]) + " onPurpose=" + N3(s.onPurpose ? 1 : 0)
                      + " -> APPLIED through MedicalSystem::addWound (type 6): part=" + Ptr(part) + " armour=" + N3(armour[0])
                      + " side=" + N3(side[0]) + " partSum " + F1((float)sb) + " -> " + F1((float)sa)
                      + " blood " + F1(bloodBefore) + " -> " + F1(bloodAfter)
                      + ((nb <= 0 || na <= 0) ? std::string(" (health unread)") : std::string())
                      + " - the shooter's game sees it in our STATE");
         }
-        ShotReactOne(v, a, s, dm, part);   /* T-311: iShotYou's victim-side reactions, the shooter's copy as the attacker */
+        /* T-1264 review, accepted by design: a stand-in hit with no copy here gets no reaction (each needs the real attacker). */
+        if (standIn != coopshot::kStandInNoCopy)   /* T-311: iShotYou's victim-side reactions, the shooter's copy as the attacker */
+            ShotReactOne(v, a, s, dm, part, coopshot::StandInReactions(standIn));   /* a copy that cannot be positioned: no flinch */
+        if (standIn != coopshot::kStandInNone)
+        {
+            ++g_shotStandInApplied;
+            if (standIn == coopshot::kStandInNoCopy) ++g_shotStandInNoCopy; else ++g_shotStandInNotPositionable;   /* after the wound: applied = the sum */
+            if (g_shotStandInLogged < kRsLogLimit)
+            {
+                ++g_shotStandInLogged;
+                DebugLog("[P104] SHOT-IN STAND-IN ATTACKER victim uid=" + N3(s.victim) + " (mine) shooter uid=" + N3(s.shooter)
+                         + " dmg=" + F1(s.rec[3]) + " - "
+                         + (standIn == 1 ? "no copy of the shooter here" : "the shooter's copy cannot be positioned (attackerNotOrientable)")
+                         + ": applied through addWound with the victim standing in as the attacker; "
+                         + (standIn == coopshot::kStandInNoCopy ? "no reactions (they need the real attacker)"
+                                                                : "remember / under ranged attack with the copy, no hitReaction")
+                         + " side=" + N3(side[0]) + " armour=" + N3(armour[0]) + " (standIn " + N3(g_shotStandInApplied) + ")");
+            }
+        }
     }
 }
 
@@ -5698,16 +5766,18 @@ void ReportCombat()
        // play was skipped here because this game decided the blow.
        << " melee[queued,sent,notSent,droppedQ,blocked,noHit]=" << N3(g_meleeQueued) << "," << N3(g_meleeSent) << ","
        << N3(g_meleeNotSent) << "," << N3(g_meleeQDropped) << "," << N3(g_meleeBlocked) << "," << N3(g_meleeNoHit)
-       << " melee[ownIgnored,in,applied,refused,notMine,sender,malformed,inDropped,loading,noAddWound,noVictim,noAttacker,"
+       << " melee[ownIgnored,in,applied,refused,notMine,sender,malformed,inDropped,loading,noAddWound,noVictim,"
           "notOrientable,fault,hitSent,knock,rule]=" << N3(g_meleeOwnIgnored) << "," << N3(g_meleeIn) << "," << N3(g_meleeApplied)
        << "," << N3(g_meleeRefused) << "," << N3(g_meleeRefNotMine) << "," << N3(g_meleeRefSender) << "," << N3(g_meleeMalformed)
        << "," << N3(g_meleeInDropped) << "," << N3(g_meleeRefBlockedLoad) << "," << N3(g_meleeRefNoAddWound) << ","
-       << N3(g_meleeRefNoVictim) << "," << N3(g_meleeRefNoAttacker) << "," << N3(g_meleeRefOrient) << "," << N3(g_meleeFault)
+       << N3(g_meleeRefNoVictim) << "," << N3(g_meleeRefOrient) << "," << N3(g_meleeFault)
        << "," << N3(g_meleeHitSent) << "," << N3(g_meleeKnock) << "," << N3(g_meleeRefRule)
        << " meleeHitPlaySkipped=" << N3(g_meleeHitPlaySkipped)
        << " meleeKeptUnclassified=" << N3(g_meleeKeptUnclassified)
        << " meleeReact[remember,underMelee,hitReaction,fault]=" << N3(g_meleeReactRemember) << "," << N3(g_meleeReactUnder) << ","
-       << N3(g_meleeReactHit) << "," << N3(g_meleeReactFault);
+       << N3(g_meleeReactHit) << "," << N3(g_meleeReactFault)
+       << " meleeStandIn[applied,noCopy,notPositionable]=" << N3(g_meleeStandInApplied) << "," << N3(g_meleeStandInNoCopy) << ","
+       << N3(g_meleeStandInNotPositionable);
     DebugLog(ss.str());
     // Stated in words, because `noAttacker` sat in this line for six runs being read as a
     // safety statistic rather than as "how often a player watched damage happen to someone
@@ -14016,6 +14086,7 @@ void detour_tsRagdollUpdates(void* gameWorld)
     coop::CrimeApplyDrain();  // crime3: the other game's crimes written onto its copies - the same BountyManager calls
     coop::PrisonSafePointDrain();   // arrest2: setPrisonMode / isFreeSlot / the sentence, with the worker paused (engine read 1)
     coop::SlaveSafePointDrain();    /* slave1: the owner's slave state set on its copy (setSlaveAIJob touches the AI's job list) */
+    coop::GoalRefillSafePointDrain();   /* T-918 fold 1: a taken character's default goal set (setupAI ends in the AI's own update step), worker paused */
     coop::CaptureSafePointDrain();  /* P11: MSG_CAPTURE / MSG_CAPTURE_PLACED on our own character, MSG_CAPTURE_DONE's items into our slaver */
     coop::ShotSafePointDrain();     /* P104 fix: MSG_SHOT - the other game's bolt played on our own character through addWound, worker paused */
     /* T-327: coop::EffectSafePointDrain runs AFTER the original below (review fold M2) */
@@ -14159,6 +14230,158 @@ void detour_physDestroy(void* physicsActual, void* actor)
 
 } // namespace (H054)
 
+// ===========================================================================================
+// T-1046 FIX 1 - A PHYSICS PIECE ALREADY QUEUED FOR DELETE GETS NO FIRST-READY SETUP.
+// What went wrong (Confirmed T2301 on both games; Read, 1.0.68 addresses): a character's hair / clothing piece has a
+// physics part (a ScythePhysicsT). When the piece is torn down before its physics part is ready, the teardown
+// (exe+0x532228) hands the physics part to the physics holder's delete queue (ScythePhysicsJunk, 0x7DCAC0: it appends the
+// object to the holder's main list - count +0x200, data +0x208 - and checks nothing). The object stays in the holder's
+// live set until the physics thread deletes it, so later in the same frame updateUT (0x4CDAD0, main thread) still runs its
+// update (vtable slot 2, 0x7D4CD0). At its first ready update (+0x1C == 0 and +0xB0 > 0) that runs its one-time setup
+// (slot 15, ScythePhysicsFirstReady, 0x7D5290), which finds its owner gone and queues it AGAIN (0x7D54DB) while it already
+// sits on the delete list (count +0x218, data +0x220; the once-a-frame flush 0x7DEF50, called with holder+0x1F0, appends
+// the main list to it and keeps duplicates). The physics thread's delete loop (0x4CCA36) deletes every entry -> the
+// object is deleted twice -> heap corruption (0xC0000374). The engine assumes "an object handed to the delete queue is no
+// longer updated"; slot 15 decides to queue without asking "already queued?".
+// THE FIX (design B of the T-1046 check): a detour on slot 15. If the object is already on the holder's main list or its
+// delete list, slot 15 does not run at all - the object is about to be deleted, its one-time setup is pointless, and its
+// push would be the second entry. Otherwise slot 15 runs unchanged. It decides from the real fact (the engine's own two
+// lists), at the place the engine decides.
+// WHY SKIPPING IS SAFE (Read, 1.0.68): slot 15 (a) hands a shared material to the +0x108 entities (0x7D4C10) - the first
+// push already emptied +0x108; (b) builds one entry per +0x190 map node into the +0x120 list - the destructors (0x7E2290 ->
+// 0x7DD320 -> 0x7DCF40) free only that list's buffer, never its entries, so entries built after the first push could only
+// leak; (c) with the owner alive, places the piece (+0x138 / +0x160) - the owner is gone here; (d) with the owner gone,
+// pushes - the duplicate. The destructors need nothing slot 15 does (the +0x120 buffer is freed either way). Slot 2 sets
+// +0x1C before calling slot 15, so the setup is not tried again.
+// WHY THE LISTS ARE SAFE TO READ HERE (Read, the T-1046 check): slot 15 is called only from slot 2, inside updateUT on the
+// main thread, and updateUT never overlaps the physics thread's delete loop (the busy lock +0x68 / flag +0x14); the main
+// list is written by the main thread only. Off the main thread (never seen) the original runs and is counted.
+// THE HOLDER is found the way the push itself finds it: the global named by its own `mov rdi,[rip+disp32]` at +0xBD
+// (1.0.65 0x7DBFDD, 1.0.68 0x7DCB7D -> exe+0x2134128) - the global P275 read in T2301, through which it found the object on
+// the delete list. Any read fault, or a list too long to search, runs the original (today's behaviour) and is counted.
+// ===========================================================================================
+unsigned long long kScythePhysicsJunkRva = 0; static coop::AddrReg kScythePhysicsJunkRva_reg("ScythePhysicsJunk", &kScythePhysicsJunkRva);   /* P8h: the address table fills this. Steam_1.0.65 0x7DBF20 */   /* ScythePhysicsT vtable slot 1: hand this object to the physics holder's delete queue void(this) - NOT hooked; its +0xBD mov names the holder's global (T-1046 fix 1) */
+unsigned long long kScythePhysicsFirstReadyRva = 0; static coop::AddrReg kScythePhysicsFirstReadyRva_reg("ScythePhysicsFirstReady", &kScythePhysicsFirstReadyRva);   /* P8h: the address table fills this. Steam_1.0.65 0x7D46F0 */   /* ScythePhysicsT vtable slot 15: the one-time setup at its first ready update void(this) - hooked (T-1046 fix 1) */
+
+namespace {
+
+typedef void (*PhysFirstReadyFn)(void* self);
+PhysFirstReadyFn g_origPhysFirstReady = 0;
+unsigned long long g_psqHolderVar = 0;   /* the address of the global that holds the physics holder (read from the push's own mov) */
+int g_psqHook = 0;                        /* 1 hooked; 0 no address row; -1 the push's bytes are not the expected mov; -2 AddHook failed */
+const size_t kPsqMainCount = 0x200, kPsqMainData = 0x208;   /* the holder's main list (the push appends here) */
+const size_t kPsqDelCount = 0x218, kPsqDelData = 0x220;     /* the holder's delete list (the flush appends the main list here) */
+const unsigned int kPsqScanMax = 65536;   /* a longer list is taken as unreadable (the original runs) */
+const long long kPsqLineCap = 20;          /* log lines a game; the REPORT counts the rest */
+volatile LONG64 g_psqChecked = 0;    /* first-ready setups looked at on the main thread */
+volatile LONG64 g_psqSkipped = 0;    /* skipped: the object was already queued for delete */
+volatile LONG64 g_psqReadFail = 0;   /* the lists could not be read - the original ran */
+volatile LONG64 g_psqOffMain = 0;    /* called off the main thread (or before the main thread is known) - the original ran */
+long long g_psqLines = 0;            /* main thread only */
+
+/* Guarded read of the holder's two lists: 1 read (*onMain / *onDel are 0 or 1), 0 a read fault, no holder, or a list
+   that cannot be searched. No C++ object with a destructor in this function (C2712). */
+int PsqReadLists(unsigned long long obj, int* onMain, int* onDel)
+{
+    __try
+    {
+        const unsigned long long holder = *(const unsigned long long*)(uintptr_t)g_psqHolderVar;
+        if (holder == 0) return 0;
+        const unsigned int mainCount = *(const unsigned int*)(uintptr_t)(holder + kPsqMainCount);
+        const unsigned long long* mainData = *(const unsigned long long* const*)(uintptr_t)(holder + kPsqMainData);
+        const unsigned int delCount = *(const unsigned int*)(uintptr_t)(holder + kPsqDelCount);
+        const unsigned long long* delData = *(const unsigned long long* const*)(uintptr_t)(holder + kPsqDelData);
+        const int m = physqueued::ListHolds(mainData, mainCount, obj, kPsqScanMax);
+        const int d = physqueued::ListHolds(delData, delCount, obj, kPsqScanMax);
+        if (m < 0 || d < 0) return 0;
+        *onMain = m;
+        *onDel = d;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* MAIN THREAD: the capped line for one skipped setup. */
+void PsqLine(unsigned long long obj, int onMain, int onDel)
+{
+    if (g_psqLines >= kPsqLineCap) return;
+    ++g_psqLines;
+    char b[256];
+    _snprintf_s(b, sizeof b, _TRUNCATE, "[T-1046] physics piece already queued for delete - its first-ready setup skipped (obj=0x%llX onMain=%d onDel=%d)%s",
+                obj, onMain, onDel, g_psqLines == kPsqLineCap ? " - line 20 of 20 this game; the REPORT's physSelfQueue counts the rest" : "");
+    DebugLog(b);
+}
+
+/* ScythePhysicsT slot 15. Called by the engine with the object; runs the original unless the object is already queued. */
+void detour_physFirstReady(void* self)
+{
+    const unsigned long mt = StoreMainThreadId();
+    if (mt == 0 || ::GetCurrentThreadId() != mt)
+    {
+        ::InterlockedIncrement64(&g_psqOffMain);
+        g_origPhysFirstReady(self);
+        return;
+    }
+    ::InterlockedIncrement64(&g_psqChecked);
+    const unsigned long long obj = (unsigned long long)(uintptr_t)self;
+    int onMain = 0, onDel = 0;
+    if (!PsqReadLists(obj, &onMain, &onDel))
+    {
+        ::InterlockedIncrement64(&g_psqReadFail);
+        g_origPhysFirstReady(self);
+        return;
+    }
+    if (physqueued::SkipFirstReady(onMain, onDel))
+    {
+        ::InterlockedIncrement64(&g_psqSkipped);
+        PsqLine(obj, onMain, onDel);
+        return;   /* about to be deleted: no setup, no second push */
+    }
+    g_origPhysFirstReady(self);
+}
+
+/* From InstallPhysicsGuard, at the preload like every other hook. */
+void InstallPhysSelfQueueGuard()
+{
+    if (kScythePhysicsJunkRva == 0 || kScythePhysicsFirstReadyRva == 0)
+    {
+        g_psqHook = 0;
+        ErrorLog("[T-1046] physics piece first-ready guard: ScythePhysicsJunk / ScythePhysicsFirstReady not in the address table - OFF"
+                 " (a physics piece torn down before it is ready can still be deleted twice)");
+        return;
+    }
+    const unsigned char* push = (const unsigned char*)(uintptr_t)coop::AddrAbs(kScythePhysicsJunkRva);
+    /* +0xBD: mov rdi,[rip+disp32] - the global holding the physics holder (1.0.65 0x7DBFDD, 1.0.68 0x7DCB7D) */
+    if (push == 0 || push[0xBD] != 0x48 || push[0xBE] != 0x8B || push[0xBF] != 0x3D)
+    {
+        g_psqHook = -1;
+        ErrorLog("[T-1046] physics piece first-ready guard: the delete-queue function's bytes are not the expected read of the physics"
+                 " holder - OFF (a physics piece torn down before it is ready can still be deleted twice)");
+        return;
+    }
+    int disp = 0;
+    std::memcpy(&disp, push + 0xC0, sizeof disp);
+    g_psqHolderVar = (unsigned long long)(uintptr_t)(push + 0xC4 + disp);
+    void* fn = (void*)(uintptr_t)coop::AddrAbs(kScythePhysicsFirstReadyRva);
+    g_psqHook = (fn != 0 && coop::AddHook(fn, (void*)&detour_physFirstReady, (void**)&g_origPhysFirstReady) == coop::SUCCESS) ? 1 : -2;
+    if (g_psqHook == 1)
+        DebugLog("[T-1046] physics piece first-ready guard: hook SUCCESS - a physics piece already queued for delete gets no first-ready"
+                 " setup (so it is not queued twice)");
+    else
+        ErrorLog("[T-1046] physics piece first-ready guard: AddHook FAILED - OFF (a physics piece torn down before it is ready can"
+                 " still be deleted twice)");
+}
+
+} // namespace (T-1046 fix 1)
+
+/* MAIN THREAD: with the [H054] REPORT (the report command) and at quit. */
+void PhysSelfQueueReport()
+{
+    DebugLog("[T-1046] REPORT physSelfQueue[checked,skipped,readFail,offMain]=" + N3((long long)g_psqChecked) + ","
+             + N3((long long)g_psqSkipped) + "," + N3((long long)g_psqReadFail) + "," + N3((long long)g_psqOffMain)
+             + " physSelfQueueHook=" + N3((long long)g_psqHook) + " physSelfQueueLines=" + N3(g_psqLines));
+}
+
 void InstallPhysicsGuard()
 {
 #ifdef SW_DEV_BUILD
@@ -14167,6 +14390,7 @@ void InstallPhysicsGuard()
     P210Install();   /* after P169Install: it uses P169's bare base vtable and image bounds */
 // PROBE-END: P210
 #endif
+    InstallPhysSelfQueueGuard();   /* T-1046 fix 1: before the box / destroy hooks, whose success returns early */
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     bool boxOk = false;
     bool desOk = false;
@@ -14199,6 +14423,7 @@ void ReportPhysicsGuard()
     DebugLog("[H054] REPORT physGuard[queries,destroys,destroyWaited,queryWaited,queryWaitedQuery,maxWaitUs]="
              + N3(g_pgQueries) + "," + N3(g_pgDestroys) + "," + N3(g_pgDestroyWaited) + ","
              + N3(g_pgQueryWaited) + "," + N3(g_pgQueryWaitedQuery) + "," + N3(g_pgMaxWaitUs));
+    PhysSelfQueueReport();   /* T-1046 fix 1 */
 #ifdef SW_DEV_BUILD
     P169Report();   /* PROBE P169 */
 // PROBE-START: P210

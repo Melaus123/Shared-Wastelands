@@ -33,6 +33,10 @@
 //
 // A SNEAK KNOCKOUT (MSG_EFFECT kind 3 KO; the block 'A SNEAK KNOCKOUT' below) takes the same road for Task_StealthKO: the assassin's
 // game holds its task and sends one request; the victim's owner decides, applies the outcome on its own character and answers it.
+//
+// T-1262: A BODY BURNED IN A CORPSE FURNACE (MSG_EFFECT kind 7 BURN; the block 'BURN' below; effectwire.h). The carrier's job 'feed
+// corpse into machine' ends on the carrier's game; a body another game runs is ended there by its owner on request, and its re-sent
+// copy is not built here meanwhile.
 
 #include "effect.h"
 #include "spawn.h"
@@ -55,6 +59,10 @@
 #include <Windows.h>
 
 namespace coop {
+void NoteUidPermanentlyLost(unsigned int uid);   /* spawn.cpp: a copy this engine removed is kept as once held (T-1262's lost-copy fallback) */
+int BurnOwnBody(unsigned int bodyUid, unsigned int carrierUid, unsigned int* heldBy, int* letGo, int* awake, int* destroyRc);   /* spawn.cpp: T-1262, the owner's burn */
+long long BurnCopyNoCarrierCount();   /* spawn.cpp: T-1262 review fold 7 - copies burned here with no carrier of this game named */
+int CopyOwnerInWorldNow(unsigned int uid);   /* spawn.cpp: T-1262, the copy's owner is in this world (mppresence::OwnerInWorld) */
 namespace {
 
 unsigned long long kEffEatRva = 0; static AddrReg kEffEatRva_reg("Character_beingEaten", &kEffEatRva);   /* Steam_1.0.65 0x435350 */
@@ -1211,6 +1219,230 @@ void EatBiteStep()   /* K2 safe point */
     else if (r == 1) EatBiteEnd("the call answered 1: the pair stopped here, or the engine finished eating");
 }
 
+// ---- T-1262: BURN - a body fed into a corpse furnace (effectwire.h BURN). MAIN THREAD. ----
+// THE CARRIER'S GAME: a row per body burned here that another game runs (g_burn); the request goes at once, again on its owner's
+// return (BurnTick), and the row closes on the owner's DESPAWN or a REFUSED answer (then the lost-copy re-ask of before).
+// THE OWNER: a request is queued (g_burnOwnQ) and run by EffectTick when engine writes are allowed: its copy of the carrier lets go and
+// the body is removed through the engine (spawn.cpp BurnOwnBody); the destroy detour's DESPAWN tells every game.
+cooffect::BurnTable g_burn;
+struct BurnOwnJob { unsigned int body, carrier, key, reqId; bool viaRelay; DWORD arrived; bool waitNoted; };
+std::vector<BurnOwnJob> g_burnOwnQ;
+const size_t kBurnOwnQMax = 64;
+const int kBurnedHereRows = 16;
+unsigned int g_burnedHere[kBurnedHereRows] = { 0 };   /* the owner: bodies this game burned on a request (an ALREADY answer) */
+int g_burnedHereNext = 0;
+long g_burnLinkGen = 0;
+bool g_burnLinkSeen = false;
+long long g_burnOpened = 0, g_burnSent = 0, g_burnUnsent = 0, g_burnResent = 0, g_burnResendFailed = 0, g_burnAnsApplied = 0, g_burnAnsAlready = 0,
+          g_burnAnsRefused = 0, g_burnAnsStale = 0, g_burnAnsNotOwner = 0, g_burnClosedDespawn = 0, g_burnSpawnHeld = 0, g_burnLostHeld = 0,
+          g_burnCleared = 0, g_burnRefusedOpen = 0;
+long long g_burnOwnIn = 0, g_burnOwnApplied = 0, g_burnOwnAlready = 0, g_burnOwnRefused = 0, g_burnOwnLetGo = 0, g_burnOwnWaited = 0,
+          g_burnOwnFault = 0, g_burnOwnQFull = 0, g_burnOwnNotSenders = 0;
+long long g_burnSpawnResent = 0, g_burnSpawnCap = 0, g_burnOwnerChanged = 0, g_burnOwnAwake = 0, g_burnOwnPostponed = 0, g_burnOwnClearRefused = 0;   /* T-1262 review folds */
+
+bool BurnedHereBefore(unsigned int u)
+{
+    if (u == 0) return false;
+    for (int i = 0; i < kBurnedHereRows; ++i) if (g_burnedHere[i] == u) return true;
+    return false;
+}
+void BurnedHereNote(unsigned int u)
+{
+    if (u == 0 || BurnedHereBefore(u)) return;
+    g_burnedHere[g_burnedHereNext] = u;
+    g_burnedHereNext = (g_burnedHereNext + 1) % kBurnedHereRows;
+}
+int BurnReachNow(unsigned int body)   /* 1 = the body's owner is in this world and the request's own road to it is up */
+{
+    if (CopyOwnerInWorldNow(body) != 1) return 0;
+    return net::EffectRequestRoadNow(body) != 0 ? 1 : 0;   /* review fold 1: SendEffectRequest's own test (cooffect::EffectRequestRoad) */
+}
+unsigned int BurnOwnerNow(unsigned int body)   /* review fold 3: the body's recorded owner now, 0 none */
+{
+    unsigned int k = 0;
+    return net::UidOwnerPeer(body, &k) ? k : 0;
+}
+int BurnSend(const cooffect::BurnRow& r)   /* the road the request went by, 0 none */
+{
+    cooffect::EffectMsg m;
+    m.dir = cooffect::kDirRequest; m.kind = cooffect::kKindBurn; m.reqId = r.reqId; m.targetUid = r.body; m.actorUid = r.carrier;
+    std::vector<char> b;
+    if (!cooffect::EncodeEffect(&b, m)) return 0;
+    const int road = net::SendEffectRequest(r.body, b);
+    if (road == cooffect::kRoadLive) ++g_eqRoadLive; else if (road != 0) ++g_eqRoadSession;
+    return road;
+}
+const char* BurnResultName(unsigned char r)
+{
+    return r == cooffect::kResultApplied ? "APPLIED" : (r == cooffect::kResultAlready ? "ALREADY" : (r == cooffect::kResultRefused ? "REFUSED" : "?"));
+}
+// THE CARRIER'S GAME: an answer from the body's owner.
+void BurnAnswerIn(const cooffect::EffectMsg& m, unsigned int fromKey)
+{
+    if (m.result == cooffect::kResultApplied) ++g_burnAnsApplied;
+    else if (m.result == cooffect::kResultAlready) ++g_burnAnsAlready;
+    else ++g_burnAnsRefused;
+    if (!net::RemoteMayWriteStill(m.targetUid, fromKey)) { ++g_burnAnsNotOwner; return; }   /* only the body's owner answers for it */
+    cooffect::BurnRow closed;
+    const int v = cooffect::BurnOnAnswer(&g_burn, m.targetUid, m.reqId, m.result, &closed);
+    if (v == cooffect::kBurnAnsStale) { ++g_burnAnsStale; return; }   /* its DESPAWN came first (the usual order), or another request's */
+    if (EqLog())
+        DebugLog(std::string("[EFFECT] burn <- ") + BurnResultName(m.result) + " (carrier's game) req=" + EffN(m.reqId) + " body uid=" + EffN(m.targetUid)
+                 + " carrier uid=" + EffN(m.actorUid)
+                 + (v == cooffect::kBurnAnsFallback
+                    ? std::string(" why=") + cooffect::ReasonName(m.reason) + " - the burn is not pending any more: the copy is booked as lost and its owner asked to send it again (the owner's world wins)"
+                    : std::string(" - the owner ended the body; its DESPAWN closes the burn pending here")));
+    if (v == cooffect::kBurnAnsFallback)
+    {
+        NoteUidPermanentlyLost(closed.body);
+        net::LostCopyNote(closed.body, closed.hasPos != 0, closed.x, closed.y, closed.z);
+    }
+}
+void BurnOwnAnswer(const BurnOwnJob& j, unsigned char result, unsigned char reason)
+{
+    cooffect::EffectMsg a;
+    a.dir = cooffect::kDirAnswer; a.kind = cooffect::kKindBurn; a.reqId = j.reqId; a.targetUid = j.body; a.actorUid = j.carrier;
+    a.result = result; a.reason = reason;
+    std::vector<char> b;
+    if (!cooffect::EncodeEffect(&b, a)) { ++g_eqAnsFail; return; }
+    if (net::SendEffectAnswer(j.key, j.viaRelay, b) != 0) ++g_eqAnsSent; else ++g_eqAnsFail;
+}
+std::string BurnOwnText(const BurnOwnJob& j)
+{
+    return "req=" + EffN(j.reqId) + " body uid=" + EffN(j.body) + " carrier uid=" + EffN(j.carrier) + " (the sender's) from "
+         + (j.viaRelay ? "the notebook (LIVE)" : "the session link");
+}
+// A world load (EffectTick): the rows and the queued requests describe the old world. Review fold 2: each queued owner request is
+// answered REFUSED busy (its row on the carrier's game would otherwise wait for an answer that never comes); review fold 5: the ring of
+// bodies burned here goes too (a loaded world may hold the body again).
+void BurnClear(const char* why)
+{
+    const long long n = (long long)(g_burn.rows.size() + g_burnOwnQ.size());
+    std::vector<BurnOwnJob> q;
+    q.swap(g_burnOwnQ);
+    g_burn.rows.clear();
+    for (size_t k = 0; k < q.size(); ++k)
+    {
+        ++g_burnOwnRefused; ++g_burnOwnClearRefused;
+        BurnOwnAnswer(q[k], cooffect::kResultRefused, (unsigned char)cooffect::kReasonBusy);
+        if (EqLog()) DebugLog("[EFFECT] burn <- REQUEST (owner's game) " + BurnOwnText(q[k]) + " - REFUSED busy: this game's world loaded while it waited");
+    }
+    for (int i = 0; i < kBurnedHereRows; ++i) g_burnedHere[i] = 0;
+    g_burnedHereNext = 0;
+    if (n > 0)
+    {
+        ++g_burnCleared;
+        if (EqLog()) DebugLog(std::string("[EFFECT] burn tables CLEARED on ") + why + ": rows and owner requests=" + EffN(n)
+                              + " (each owner request answered REFUSED busy)");
+    }
+}
+// THE OWNER: a request (MAIN THREAD, net/session.cpp OnEffect). Queued; EffectTick runs it when engine writes are allowed.
+void BurnRequestIn(const cooffect::EffectMsg& m, unsigned int fromKey, bool viaRelay)
+{
+    ++g_burnOwnIn;
+    BurnOwnJob j;
+    j.body = m.targetUid; j.carrier = m.actorUid; j.key = fromKey; j.reqId = m.reqId; j.viaRelay = viaRelay; j.arrived = ::GetTickCount();
+    j.waitNoted = false;
+    if (g_burnOwnQ.size() >= kBurnOwnQMax)
+    {
+        ++g_burnOwnQFull; ++g_burnOwnRefused;
+        BurnOwnAnswer(j, cooffect::kResultRefused, (unsigned char)cooffect::kReasonBusy);
+        if (EqLog()) DebugLog("[EFFECT] burn <- REQUEST (owner's game) " + BurnOwnText(j) + " - REFUSED busy: " + EffN((long long)kBurnOwnQMax) + " requests already wait");
+        return;
+    }
+    g_burnOwnQ.push_back(j);
+}
+// THE OWNER: one request, engine writes allowed (MAIN THREAD).
+void BurnOwnRun(const BurnOwnJob& j)
+{
+    ::Character* body = FindSpawned(j.body);
+    const int check = cooffect::BurnOwnerCheck(BurnedHereBefore(j.body), net::IsUidMine(j.body), net::RemoteMayWriteStill(j.carrier, j.key), body != 0);
+    if (check == cooffect::kBurnOwnAlready)
+    {
+        ++g_burnOwnAlready;
+        BurnOwnAnswer(j, cooffect::kResultAlready, (unsigned char)cooffect::kReasonNone);
+        if (EqLog()) DebugLog("[EFFECT] burn <- REQUEST (owner's game) " + BurnOwnText(j) + " - ALREADY: this game burned it on an earlier request");
+        return;
+    }
+    if (check != cooffect::kBurnOwnApply)
+    {
+        /* every refusal is answered, notSenders too (unlike EAT): an unanswered row would hold the body back on the carrier's game */
+        ++g_burnOwnRefused;
+        if (check == cooffect::kReasonNotSenders) ++g_burnOwnNotSenders;
+        BurnOwnAnswer(j, cooffect::kResultRefused, (unsigned char)check);
+        if (EqLog()) DebugLog("[EFFECT] burn <- REQUEST (owner's game) " + BurnOwnText(j) + " - REFUSED why=" + cooffect::ReasonName(check)
+                              + (check == cooffect::kReasonNotSenders ? std::string(" (this game does not record the sender as the carrier's game)") : std::string()));
+        return;
+    }
+    unsigned int heldBy = 0;
+    int letGo = 0, awake = -2, destroyRc = 9;
+    const int rc = BurnOwnBody(j.body, j.carrier, &heldBy, &letGo, &awake, &destroyRc);
+    unsigned char why = 0;
+    const unsigned char result = cooffect::BurnApplyAnswer(rc, &why);
+    if (letGo == 1) ++g_burnOwnLetGo;
+    if (rc == -1) ++g_burnOwnFault;
+    if (rc == -3) ++g_burnOwnAwake;                         /* review fold 4 */
+    if (rc == 1 && destroyRc != 1) ++g_burnOwnPostponed;    /* review fold 6 */
+    if (result == cooffect::kResultApplied) { ++g_burnOwnApplied; BurnedHereNote(j.body); } else ++g_burnOwnRefused;
+    BurnOwnAnswer(j, result, why);
+    if (EqLog())
+        DebugLog("[EFFECT] burn <- REQUEST (owner's game) " + BurnOwnText(j) + " - " + BurnResultName(result)
+                 + (result == cooffect::kResultApplied
+                    ? std::string(": ") + (letGo == 1 ? "this game's copy of the carrier let go of the body, " : "no copy here held the body, ")
+                      + "the body removed through the engine ('incinerated or cooked', its inventory with it); its DESPAWN removes every other game's copy"
+                      + (destroyRc != 1 ? std::string(" (the engine answered ") + (destroyRc == 0 ? "false - postponed" : "with a fault")
+                                          + " after the destroy detour had taken the body out of the uid table and announced its DESPAWN)" : std::string())
+                    : std::string(" why=") + cooffect::ReasonName(why)
+                      + (rc == -2 ? " (character uid=" + EffN(heldBy) + " carries it here, not the sender's carrier)" : std::string())
+                      + (rc == -3 ? std::string(awake == 1 ? " (the body is awake here and no copy of the sender's carrier holds it)"
+                                                           : " (the body's state here is not read and no copy of the sender's carrier holds it)") : std::string())
+                      + (rc == -1 ? (letGo == -1 ? std::string(" (the carrier's let-go faulted)") : std::string(" (the engine refused the removal, or it faulted)")) : std::string())));
+}
+// MAIN THREAD, every frame (EffectTick): the carrier's game's re-sends on its owner's return, the owner's queued requests.
+void BurnTick(DWORD now)
+{
+    const long lg = net::SessionLinkGen();
+    const int linkChanged = (g_burnLinkSeen && lg != g_burnLinkGen) ? 1 : 0;
+    g_burnLinkGen = lg; g_burnLinkSeen = true;
+    for (size_t i = 0; i < g_burn.rows.size(); ++i)
+    {
+        cooffect::BurnRow& r = g_burn.rows[i];
+        const int reach = BurnReachNow(r.body);
+        const unsigned int ownerNow = BurnOwnerNow(r.body);
+        int why = cooffect::kBurnWhyNone;
+        const int step = cooffect::BurnRowStep(r, reach, linkChanged, ownerNow, 0, &why);   /* review fold 8: the decision, offline-tested */
+        if (step != cooffect::kBurnStepSend) { cooffect::BurnRowAfter(&r, step, why, reach, ownerNow, 0); continue; }
+        const int road = BurnSend(r);
+        cooffect::BurnRowAfter(&r, step, why, reach, ownerNow, road);   /* re-check: a failed send is sent again on the next event, never at the next look */
+        if (road != 0) ++g_burnResent; else ++g_burnResendFailed;
+        if (why == cooffect::kBurnWhyOwner) ++g_burnOwnerChanged;
+        if (EqLog() && (road != 0 || g_burnResendFailed <= 20))
+            DebugLog("[EFFECT] burn REQUEST -> again (carrier's game) req=" + EffN(r.reqId) + " body uid=" + EffN(r.body) + " carrier uid=" + EffN(r.carrier)
+                     + " - " + cooffect::BurnWhyName(why)
+                     + (road != 0 ? std::string(" via ") + KoRoadName(road) : std::string(" NOT SENT (the send failed: sent again at the next look that finds its owner reachable)")));
+    }
+    if (g_burnOwnQ.empty()) return;
+    const bool blocked = EngineWritesBlocked();
+    std::vector<BurnOwnJob> q;
+    q.swap(g_burnOwnQ);   /* a run below removes a body: nothing it starts touches this queue */
+    for (size_t k = 0; k < q.size(); ++k)
+    {
+        BurnOwnJob& j = q[k];
+        const int when = cooffect::BurnOwnerWhen(blocked, cooffect::EffSinceMs(now, j.arrived));
+        if (when == cooffect::kBurnOwnRun) { BurnOwnRun(j); continue; }
+        if (when == cooffect::kBurnOwnWait)
+        {
+            if (!j.waitNoted) { j.waitNoted = true; ++g_burnOwnWaited; }
+            g_burnOwnQ.push_back(j);
+            continue;
+        }
+        ++g_burnOwnRefused;
+        BurnOwnAnswer(j, cooffect::kResultRefused, (unsigned char)cooffect::kReasonBusy);
+        if (EqLog()) DebugLog("[EFFECT] burn <- REQUEST (owner's game) " + BurnOwnText(j) + " - REFUSED busy: engine writes stayed blocked "
+                              + EffN((long long)cooffect::kBurnOwnerWaitMs) + " ms");
+    }
+}
+
 // Review fold L7 (MAIN THREAD): a world load or a session-link change - the uids and pairs describe the old world / link.
 void EffClearTables(const char* why)
 {
@@ -1253,6 +1485,7 @@ void EffectTick()
     {
         const long wg = StoreWorldGenNow(), lg = net::SessionLinkGen();
         if (g_eqGenSeen && (wg != g_eqWorldGen || lg != g_eqLinkGen)) EffClearTables(wg != g_eqWorldGen ? "a world load" : "a session link change");
+        if (g_eqGenSeen && wg != g_eqWorldGen) BurnClear("a world load");   /* T-1262: a link change keeps the rows - they are sent again (BurnTick) */
         g_eqGenSeen = true; g_eqWorldGen = wg; g_eqLinkGen = lg;
     }
     const DWORD now = ::GetTickCount();
@@ -1263,6 +1496,7 @@ void EffectTick()
     }
     g_ansQ.clear();
     KoTick(now);   /* the sneak knockout: the assassin's slots and the owner's queued answers */
+    BurnTick(now);   /* T-1262: a body burned in a corpse furnace - the carrier's re-sends, the owner's queued requests */
     for (int i = 0; i < kEatSlots; ++i)
     {
         EatSlot& s = g_eat[i];
@@ -1409,6 +1643,12 @@ void EffectOnNet(const char* p, size_t n, unsigned int fromKey, bool viaRelay)
         else KoOnRequest(m, fromKey, viaRelay);
         return;
     }
+    if (m.kind == cooffect::kKindBurn)   /* T-1262 */
+    {
+        if (m.dir == cooffect::kDirAnswer) BurnAnswerIn(m, fromKey);
+        else BurnRequestIn(m, fromKey, viaRelay);
+        return;
+    }
     if (m.dir == cooffect::kDirAnswer) EatOnAnswer(m, fromKey);
     else EatOnRequest(m, fromKey, viaRelay);
 }
@@ -1449,10 +1689,92 @@ void ReportEffect()
        << "," << g_koResKo << "," << g_koResFailed << "," << g_koResRefused << "," << g_koResNone << "," << g_koDecide << "," << g_koDecideKo
        << "," << g_koDecideFailed << "," << g_koDecideRefused
        << " koHook=" << (g_koOn ? "on" : "OFF") << " koSees[hook,forced]=" << (g_koSeesOn ? "on" : "OFF") << "," << (long long)g_koSeesForced << " koOwner=" << (g_koOwnOn ? "on" : "OFF") << " koThread=" << (long long)g_koThread
+       << " burn[opened,sent,unsent,resent,resendFailed,refusedOpen,dropped,open]=" << g_burnOpened << "," << g_burnSent << "," << g_burnUnsent
+       << "," << g_burnResent << "," << g_burnResendFailed << "," << g_burnRefusedOpen << "," << g_burn.dropped << "," << (long long)g_burn.rows.size()
+       << " burnAns[applied,already,refused,stale,notOwner]=" << g_burnAnsApplied << "," << g_burnAnsAlready << "," << g_burnAnsRefused << ","
+       << g_burnAnsStale << "," << g_burnAnsNotOwner
+       << " burnHeld[spawn,lost,closedByDespawn,cleared]=" << g_burnSpawnHeld << "," << g_burnLostHeld << "," << g_burnClosedDespawn << "," << g_burnCleared
+       << " burnOwn[in,applied,already,refused,notSenders,letGo,waited,faults,queueFull,queued]=" << g_burnOwnIn << "," << g_burnOwnApplied << ","
+       << g_burnOwnAlready << "," << g_burnOwnRefused << "," << g_burnOwnNotSenders << "," << g_burnOwnLetGo << "," << g_burnOwnWaited << ","
+       << g_burnOwnFault << "," << g_burnOwnQFull << "," << (long long)g_burnOwnQ.size()
+       << " burnFold[spawnResent,spawnCapClosed,ownerChanged,ownAwakeRefused,ownPostponedApplied,ownLoadRefused,copyNoCarrier]=" << g_burnSpawnResent
+       << "," << g_burnSpawnCap << "," << g_burnOwnerChanged << "," << g_burnOwnAwake << "," << g_burnOwnPostponed << "," << g_burnOwnClearRefused
+       << "," << BurnCopyNoCarrierCount()
        << " hook=" << (g_eqInstalled ? "on" : "OFF")
        << " thread[detour,main]=" << (long long)g_eatThread << "," << (long long)g_mainThread
        << (g_eatThread == 0 ? " (no call yet)" : ((DWORD)g_eatThread == g_mainThread ? " (the main thread)" : " (another thread)"));
     DebugLog(ss.str());
+}
+
+// ---- T-1262: BURN, the public half (MAIN THREAD) ----
+bool EffectBurnOpen(unsigned int body, unsigned int carrier, bool hasPos, float x, float y, float z)
+{
+    cooffect::BurnRow r;
+    r.body = body; r.carrier = carrier;
+    if (++g_eqNextReq == 0) ++g_eqNextReq;
+    r.reqId = g_eqNextReq;
+    r.hasPos = hasPos ? 1 : 0; r.x = x; r.y = y; r.z = z;
+    r.ownerKey = BurnOwnerNow(body);   /* review fold 3: a later change of the body's owner sends the request again */
+    const long long droppedBefore = g_burn.dropped;
+    const int o = cooffect::BurnOpen(&g_burn, r);
+    if (o == 0) { ++g_burnRefusedOpen; return false; }
+    ++g_burnOpened;
+    const int road = BurnSend(r);
+    const int at = cooffect::BurnFind(g_burn, body);
+    if (at >= 0) g_burn.rows[(size_t)at].reach = road != 0 ? 1 : 0;   /* no road: sent when its owner is reachable again */
+    if (road != 0) ++g_burnSent; else ++g_burnUnsent;
+    if (EqLog())
+        DebugLog("[EFFECT] burn REQUEST -> (carrier's game) req=" + EffN(r.reqId) + " body uid=" + EffN(body) + " (a COPY here, burned in a corpse furnace)"
+                 + " carrier uid=" + EffN(carrier) + " (mine)" + (road != 0 ? std::string(" via ") + KoRoadName(road) : std::string(" NOT SENT (no road: sent when its owner is reachable again)"))
+                 + " - its owner ends the body; a copy it sends meanwhile is not built here" + (o == 2 ? " (its row refreshed)" : "")
+                 + (g_burn.dropped != droppedBefore ? " (the table was full: its oldest row dropped)" : ""));
+    return true;
+}
+bool EffectBurnHoldSpawn(unsigned int uid)
+{
+    const int at = (uid != 0) ? cooffect::BurnFind(g_burn, uid) : -1;
+    if (at < 0) return false;
+    ++g_burnSpawnHeld;
+    /* review fold 2: its owner still runs the body - the request is sent again (a REFUSED answer can be lost), up to the cap */
+    cooffect::BurnRow& r = g_burn.rows[(size_t)at];
+    const int reach = BurnReachNow(uid);
+    const unsigned int ownerNow = BurnOwnerNow(uid);
+    int why = cooffect::kBurnWhyNone;
+    const int step = cooffect::BurnRowStep(r, reach, 0, ownerNow, 1, &why);
+    if (step == cooffect::kBurnStepClose)
+    {
+        const cooffect::BurnRow closed = r;
+        g_burn.rows.erase(g_burn.rows.begin() + at);
+        ++g_burnSpawnCap;
+        DebugLog("[EFFECT] burn closed (carrier's game): body uid=" + EffN(uid) + " req=" + EffN(closed.reqId) + " - its owner sent the body again "
+                 + EffN((long long)cooffect::kBurnSpawnResendsMax + 1) + " times with no removal: the burn is not pending any more, the copy is booked as lost"
+                 " and its owner asked to send it again (the owner's world wins); this SPAWN is not built (burnFold spawnCapClosed " + EffN(g_burnSpawnCap) + ")");
+        NoteUidPermanentlyLost(closed.body);
+        net::LostCopyNote(closed.body, closed.hasPos != 0, closed.x, closed.y, closed.z);
+        return true;
+    }
+    const int road = BurnSend(r);
+    cooffect::BurnRowAfter(&r, step, why, reach, ownerNow, road);
+    if (road != 0) ++g_burnSpawnResent; else ++g_burnResendFailed;
+    if (EqLog())
+        DebugLog("[EFFECT] burn: SPAWN of body uid=" + EffN(uid) + " NOT built - it was burned here in a corpse furnace and its owner's removal is awaited;"
+                 " its owner still runs it, so the request req=" + EffN(r.reqId) + " is sent again (" + EffN((long long)r.spawnResends) + " of "
+                 + EffN((long long)cooffect::kBurnSpawnResendsMax) + ")" + (road != 0 ? std::string(" via ") + KoRoadName(road) : std::string(" NOT SENT (no road)"))
+                 + " (burnHeld spawn " + EffN(g_burnSpawnHeld) + ")");
+    return true;
+}
+bool EffectBurnHoldsLost(unsigned int uid)
+{
+    if (!cooffect::BurnHoldsCopy(g_burn, uid)) return false;
+    ++g_burnLostHeld;
+    return true;
+}
+bool EffectBurnPending(unsigned int uid) { return cooffect::BurnHoldsCopy(g_burn, uid); }
+void EffectBurnOwnerDespawned(unsigned int uid)
+{
+    if (!cooffect::BurnOnDespawn(&g_burn, uid)) return;
+    ++g_burnClosedDespawn;
+    if (EqLog()) DebugLog("[EFFECT] burn closed (carrier's game): body uid=" + EffN(uid) + " - its owner's DESPAWN came; the burn is not pending any more");
 }
 
 unsigned int EffectKoAwaitingReq(unsigned long long ret, unsigned int victimUid)

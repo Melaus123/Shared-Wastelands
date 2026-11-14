@@ -1,5 +1,6 @@
 // handoff.cpp - M-D step 1. See handoff.h.
 #include "handoff.h"
+#include "identity.h"   /* T-1046 fold 2: CaptureObjId - a put-away person's hand, read while the body is whole */
 #include "playerfaction.h"   // P3: IsPlayerFaction - player squads are never handed off
 #include "zones.h"
 #include "store.h"   /* PlayersPresent, StorePeerEpoch: another player here, and each arrival */
@@ -27,12 +28,16 @@
 #include "../common/liveowner.h"   /* M7a A1 build 1 [a1b1-hd0]: AgreedSquadLeaderN */
 #include "../common/peergone.h"    /* PlayerGoneTakesRow: a player who leaves takes back only the squads handed to it */
 #include "../common/twinsleep.h"   /* T-761: the withdrawal kinds - a REVOKE with no winner takes a save-born twin only as the last resort */
+#include "../common/raidsquad.h"   /* T-1122 awake hand (owner 1524): AwakeTakeOrder - a taken raid squad's carried goal */
+#include "../common/orphanpurge.h"   /* T-1268: AnnounceArea - the sweep's own area answer, so a re-woken squad is judged as the sweep judges it */
 namespace coop { int KeeperPot(void* character, void** ownOut, int* catsOut); int KeeperPotWritePod(void* own, int cats);
                  int KeeperPotsInFlight(std::vector<void*>* pots, int* unresolved); }   /* T-1 B3 restructure: items.cpp - the squad's pot */
 namespace coop { int KeeperPotAnnounced(void* character, void** ownOut, int* catsOut); }
 // PROBE-START: P133 - items.cpp: a copy write that changes a keeper group's money is logged
 namespace coop { void P133KeeperCopyWrite(unsigned int leader, int from, int to); }
 // PROBE-END: P133
+namespace coop { long long CopyJoinGivenCount(); long long CopyJoinCtxGivenCount(); long long WakeDupKeptGivenCount(); long long CopyJoinSkippedIgnoredCount(); }   /* T-1318 attempt 5 (D1-R2): spawn.cpp / store.cpp - the worldWhole8 REPORT token */
+namespace coop { long long CtxSupersedeKeptNotGiven(); }   /* T-1318 attempt 4 (design A, site 8): spawn.cpp - sleeping copies of a handed-over squad kept, a record not given */
 namespace coop { std::string StoreWorldIdOf(void* platoon); }   /* M7a3f3 T-425 [m7a3f3-hc0]: store.cpp (store.h) - the squad's engine id, "" if unreadable */
 namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* P25 fold 2: combat.cpp - 1 height, 0 no terrain, -1 no row / faulted. MAIN THREAD */
 namespace coop { int ItTraderHomePos(void* ap, void* platoon, void* leader, float* x, float* z); }   /* T-164 B4-3 (M4): items.cpp - a trader squad's home building position */   /* T-1 B3 fold (M2): items.cpp - net of this game's in-flight predictions */
@@ -104,6 +109,12 @@ int SquadReadPod(void* ap, SquadView* o)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* T-1318 attempt 4: a Platoon's ActivePlatoon (Platoon+0x1D8; ReadSquadAt checks it points back) - POD, guarded */
+int PlatoonApPod(void* pl, void** ap)
+{
+    __try { *ap = *(void**)((char*)pl + 0x1D8); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ap = 0; return 0; }
+}
 /* step 5: ActivePlatoon::setSquadLeader(Character*) 0x790C00 (Steam_1.0.65.br slot 88); it resets the old leader's member type, gives the new one type 2 and writes +0xA0. 1 = +0xA0 is `c` after. */
 typedef void (*ApSetSquadLeaderFn)(void* activePlatoon, ::Character* c);
 int SetSquadLeaderPod(void* ap, ::Character* c, uintptr_t fn)
@@ -138,7 +149,7 @@ int StayAwakeWritePod(void* ap)
 unsigned long long kApSetSquadLeaderRva = 0; static coop::AddrReg kApSetSquadLeaderRva_reg("ActivePlatoon_setLeader", &kApSetSquadLeaderRva);   /* T-1 B1: the address table fills this. Steam_1.0.65 0x790C00 */
 
 typedef std::pair<void*, std::string> HoKey;   /* (faction, the engine's squad id): a squad's key (SquadKeyOf) */
-struct Pending { std::vector<net::XferMember> members; std::map<unsigned int, HoKey> keyOf; /* [a1b2-hc1]: each member's squad key, read at the send */ unsigned int reason; double sentAt; int sends; void* ap; int logged; int targetSlot; Pending() : reason(0), sentAt(0.0), sends(0), ap(0), logged(0), targetSlot(-1) {} };   /* M7a A1 build 1 [a1b1-hd1] [review F11]: targetSlot - fixed at the first send; every resend and the ACK's sender test use it */   /* protocol 84: reason = coopsquad::kXferReason*. T-1 B1 restructure: ap = my squad the members were read from (the crossing test), logged = its xfer_out line was written (N5: its ACK line is written exactly then) */
+struct Pending { std::vector<net::XferMember> members; std::map<unsigned int, HoKey> keyOf; /* [a1b2-hc1]: each member's squad key, read at the send */ std::map<unsigned int, std::string> handOf; /* T-1046 leg-N fold 2: each member's hand (cooplo::HandKey), read at the send while the body is whole */ unsigned int reason; double sentAt; int sends; void* ap; int logged; int targetSlot; int awakeWhole; int lentWhole; /* T-1122 lent flag (protocol 224): the message says "lent squad - whole or none" (kept over its resends) */ int worldWhole; /* T-1318 attempt 2 (D3, protocol 226): cooplo::kWholeBitWorld on a forced XFER - "world squad, whole or none" (kept over its resends); 0 on a follow-leader XFER */ coopsquad::FollowAnnounceMark mark; /* T-1239: both announcements of the squad when a follow XFER went */ Pending() : reason(0), sentAt(0.0), sends(0), ap(0), logged(0), targetSlot(-1), awakeWhole(1), lentWhole(0), worldWhole(0) {} };   /* awakeWhole (T-1122 re-check fold 5): 1 = no member was held back from this hand-over (its raid may go on with it) */   /* M7a A1 build 1 [a1b1-hd1] [review F11]: targetSlot - fixed at the first send; every resend and the ACK's sender test use it */   /* protocol 84: reason = coopsquad::kXferReason*. T-1 B1 restructure: ap = my squad the members were read from (the crossing test), logged = its xfer_out line was written (N5: its ACK line is written exactly then) */
 long long g_ackWrongSender = 0;   /* M7a A1 build 1 [a1b1-hd1]: XFER_ACKs from a game that was not the XFER's target - ignored */
 std::map<unsigned int, Pending> g_pending;   // leader uid -> squad in flight (owner side)
 /* ==== M7a A1 build 2 [a1b2-hc0] (design 2.2, 2.3, 2.5) - RETIRED here: the owed hand-overs, the held UNLOADs, the put-away batch and
@@ -148,7 +159,33 @@ std::map<unsigned int, Pending> g_pending;   // leader uid -> squad in flight (o
    game's engine put away that nobody adopted (asleepHere); g_idxOf: uid -> its squad key (one entry per indexed person) */
 struct SquadIdx { std::map<unsigned int, unsigned int> given; std::set<unsigned int> asleepHere; std::set<unsigned int> keptHere; int liveHere; SquadIdx() : liveHere(0) {} };   /* [a1b2f1-hd0]: keptHere, liveHere */
 std::map<HoKey, SquadIdx> g_squadIdx;
+std::map<unsigned int, std::string> g_givenHandOf;   /* T-1046 fold 2: a given person's hand (read at its put-away), for the sleeping squad's person-by-person test; goes with its index entry */
+long long g_idxSeq = 0;   /* T-1046 fold 2: bumped by every index change - the keep question's cached answer is asked again after one */
 std::map<unsigned int, HoKey> g_idxOf;
+/* T-1318 attempt 5 (owner 1626, D1-R1): a kept / asleep-here person's hand, read when it is kept (IdxKeepKey, RelAsleep's asleep settle) -
+   a re-wake erases only the people whose hand is in the woken squad's engine list (cooplo::KeptRemadeByHands). Bounded; goes when the
+   person is given or leaves the index, at the peer-gone and the world teardown (IdxDropAll). */
+static std::map<unsigned int, std::string> g_keptHandOf;
+static const size_t kKeptHandCap = 65536;
+static void KeptHandNote(unsigned int uid, const std::string& hand)
+{
+    if (uid == 0 || hand.empty()) return;
+    if (g_keptHandOf.count(uid) != 0 || g_keptHandOf.size() < kKeptHandCap) g_keptHandOf[uid] = hand;
+}
+/* keptStay - squads a re-wake left with kept / asleep people kept (not in the woken squad's engine list), once per squad per wake (a5 fold 1:
+   g_keptStayAp - the woken squad each squad key was last counted for); keptGhost - of those people, the ones with no recorded hand (no
+   re-wake can show them re-made: a person put away off-thread, dead or deleted - they hold the squad here whole); keptRemade - people
+   erased because their hand was in the list; keptStayLines - the capped lines written */
+static long long g_wwKeptStay = 0, g_wwKeptRemade = 0, g_wwKeptStayLines = 0, g_wwKeptGhost = 0;
+static std::map<HoKey, const void*> g_keptStayAp;
+/* T-1318 attempt 5 (owner 1626, D1-R3): per squad key with people given away, the hands of ANOTHER game's living copies seen in the squad
+   (its engine list at a put-away of this game's person, a copy's own put-away by this engine) -> that copy's uid (a5 fold 1, review
+   MEDIUM-2: its owner is read NOW, at the taken test - a uid taken back is skipped). The sleeping squad's taken test counts them as taken
+   by that game (cooplo::SlotOfHandAddOther). Bounded; a squad's notes go with its index entry, a uid's at its take-back; cleared at the
+   peer-gone and the world teardown. */
+static std::map<HoKey, std::map<std::string, unsigned int> > g_otherHandsOf;
+static const size_t kOtherHandsSquadCap = 8192, kOtherHandsPerSquadCap = 256;
+static long long g_wwOtherHandsNoted = 0, g_wwOtherHandsCapHit = 0;
 long long g_idxGiven = 0, g_idxAsleepHere = 0, g_idxNoKey = 0, g_idxClearedByOwnerUnload = 0, g_idxClearedByOwnerDespawn = 0, g_idxTakenBack = 0;
 long long g_idxKeptOnAnnounce = 0;   /* announce-pass UNLOADs of a person in `given` - kept (the owner still runs it) */
 long long g_idxSquadCleared = 0, g_idxAsleepRebuilt = 0, g_idxPeerGoneCleared = 0;
@@ -168,21 +205,85 @@ struct RelWalk { RelWalk() { ++g_relWalkDepth; } ~RelWalk() { --g_relWalkDepth; 
 /* 2.5 the release records. A record has a stable id (its END line names it once) and ONE candidate at a time; the gen offered to the k-th
    candidate is baseGen + 1 + k, so the tried list says which gen a late adopter holds. Dropped members of a record whose other members
    were deferred move to a NEW record (split). */
-struct RelMember { net::XferMember m; HoKey key; int hasKey; unsigned int baseGen; RelMember() : hasKey(0), baseGen(0) { std::memset(&m, 0, sizeof(m)); } };
+struct RelMember { net::XferMember m; HoKey key; int hasKey; unsigned int baseGen; std::string hand; /* T-1046 fold 2: the person's hand (cooplo::HandKey), "" unread */ RelMember() : hasKey(0), baseGen(0) { std::memset(&m, 0, sizeof(m)); } };
 struct ReleaseRec
 {
-    unsigned int id, keyUid; Sector sector; std::vector<RelMember> mem; std::vector<int> tried;
-    int candidate; double sentAt, clock, lastTick; int sends, defers, flight, held;
+    unsigned int id, keyUid, awakeKey; Sector sector; std::vector<RelMember> mem; std::vector<int> tried;   /* awakeKey (T-1122 re-check fold 2): the key its raid's AWAKE block goes under (0: keyUid) */
+    int candidate; double sentAt, clock, lastTick; int sends, defers, flight, held, lentWhole;   /* lentWhole (T-1122 lent flag, protocol 224): the offer says "lent squad - whole or none" (set by the gate; kept over its resends and candidates) */
     float px, pz;   /* the squad's decision position at the put-away - the receivers' keep rule is asked there */
     long long nAdopted, nAsleep, nCancelled, nMoved;
-    ReleaseRec() : id(0), keyUid(0), candidate(-1), sentAt(0.0), clock(0.0), lastTick(0.0), sends(0), defers(0), flight(0), held(0),
+    ReleaseRec() : id(0), keyUid(0), awakeKey(0), candidate(-1), sentAt(0.0), clock(0.0), lastTick(0.0), sends(0), defers(0), flight(0), held(0), lentWhole(0),
                    nAdopted(0), nAsleep(0), nCancelled(0), nMoved(0), px(0.0f), pz(0.0f) { sector.x = -1; sector.y = -1; }
 };
 std::map<unsigned int, ReleaseRec> g_release;   /* id -> open record */
 unsigned int g_releaseNextId = 0;
+long long g_hoOpenSeq = 0;   /* T-1318 fold 2 (re-check B1): bumped when an offer closes (a release record ends, a member is accepted or settles, an XFER flight ends) - the given-wait looks again (HandoffOpenSeq) */
+/* T-1318 attempt 2 (design D3): a world squad is handed over whole or not at all - the sender's not-offered roads, the receiver's world
+   judge, and the tripwire (handoff.cpp's [RELEASE] token, worldWhole[...]) */
+static long long g_wwRelKeptOut = 0, g_wwRelOver64 = 0, g_wwXferHeldPart = 0, g_wwRelAll = 0, g_wwRelNone = 0, g_wwXferAll = 0, g_wwXferNone = 0;
+static long long g_wwRelNoneLeaderless = 0, g_wwXferNoneLeaderless = 0, g_wwPartGiven = 0, g_wwLines = 0, g_wwGivenAsleepKept = 0;
+static const long long kWwLineCap = 200;   /* the sender's not-offered lines: the first 200 (each road also counted; the receivers' whole-refusal lines are the [RELEASE] / [XFER] lines) */
+/* T-1318 attempt 2 fold 1 (review): followHeldPart - follow-leader XFERs not sent because a member was held back (per pass, as xferHeldPart);
+   partGivenAwake - squads the tripwire found given AND awake here; ownKeptAsleep / ownKeptHandUnread - people of a wholly given squad's
+   not-offered put-away whose hand is not a given hand (this game's own) or did not read: kept asleep here, indexed (HIGH-1 b) */
+static long long g_wwFollowHeldPart = 0, g_wwPartGivenAwake = 0, g_wwOwnKeptAsleep = 0, g_wwOwnKeptHandUnread = 0;
+/* T-1318 attempt 3 (owner 1615 a) - worldWhole3[..]: xferKeptAsleep / followKeptAsleep - passes a forced / follow-leader XFER was NOT sent
+   because people of the squad are kept asleep here (cooplo::kWxKeptAsleep); rebuiltKeptGiven - re-wakes whose own part left the index while
+   its given part stayed (cooplo::kSrDropOwn); rewokeNotPerson - re-wake tests that found the squad id awake here but not the person
+   (cooplo::RewokeBodyIs - the old squad-id test would have said re-woken). */
+static long long g_wwXferKeptAsleep = 0, g_wwFollowKeptAsleep = 0, g_wwRebuiltKeptGiven = 0, g_wwRewokeNotPerson = 0;
+static std::set<std::pair<int, unsigned int> > g_wwHeldLogged;   /* review LOW-1: (0 forced / 1 follow-leader, leader uid) whose NOT SENT line was written - one line per squad, then counted only */
+static long long g_wwOwnKeptLogged = 0;
+static long long g_relGivenNotOffered = 0, g_relGivenNotOfferedLogged = 0;   /* T-1318 fold 2: put-aways of a squad still wholly given at an accepted ACK, not offered again (ReleaseFlush) */
 /* the frame's put-aways per engine squad (NotifyDespawn's main-thread branch), opened by ReleaseFlush at the next frame */
-struct RelBatch { unsigned int keyUid; Sector sector; std::vector<RelMember> mem; float px, pz; RelBatch() : keyUid(0), px(0.0f), pz(0.0f) { sector.x = -1; sector.y = -1; } };
+/* T-1318 attempt 3 fold 1 (review MED-1): awakeKey / flight - a batch that carries the put-aways of an ended XFER flight (ReleaseOpenFromFlight)
+   keeps the XFER leader its raid's AWAKE block went under and the "from an XFER flight" mark, through the hold, into its offer */
+/* T-1318 attempt 4 (owner 1626, design A; T2343, F-T2343-UNNUMBERED) - the engine's own member list at each put-away: unaccAwake - living
+   members of the squad's engine list with no uid (never numbered) or this game's uid, seen at a put-away (ReleaseOnPutAway through ReadSquadOf;
+   another game's people are run there - not counted, a4 fold 1 HIGH-2); over64 - that list held over 64 (never whole); chars / known - the
+   list's count and its members with a uid, for the lines. Each object once (sets). T-1318 a4 fold 1 (review HIGH-1 / LOW-1): handsAcc - the
+   hands of the list's corpses and of another game's people (accounted: never KEPT by the squad's sleeping records, RelRecordsKept); ap - the
+   engine squad (ActivePlatoon) the put-aways came from, 0 unread (cooplo::RebuiltIsRewake). The despawn hook's never-numbered road (attempt
+   4 site 3) is gone: NotifyDespawn never runs for a body with no mirror / index row, so it never saw one. */
+struct RelBatch { unsigned int keyUid, awakeKey; int flight; Sector sector; std::vector<RelMember> mem; float px, pz; std::set<const void*> unaccAwake; std::set<std::string> handsAcc; void* ap; int over64, chars, known; RelBatch() : keyUid(0), awakeKey(0), flight(0), px(0.0f), pz(0.0f), ap(0), over64(0), chars(-1), known(-1) { sector.x = -1; sector.y = -1; } };
 std::map<void*, RelBatch> g_relBatch;
+/* T-1318 a4 fold 1 (review MEDIUM-1): per squad key, the hands of its corpses seen in its engine list at a put-away - a corpse's sleeping
+   record counts as neither given nor kept (cooplo::SleepersTakenSlot, RelRecordsKept). Bounded; cleared at the world teardown. */
+static std::map<HoKey, std::set<std::string> > g_deadHandsOf;
+static const size_t kDeadHandsSquadCap = 8192, kDeadHandsPerSquadCap = 64;
+/* T-1318 a4 fold 1 (review MEDIUM-2): squads woken here with given people (HandoffNoteWokeWithGiven) - the sweep removes their re-made
+   bodies whose own hand is given. Bounded; cleared at the world teardown. */
+static std::set<HoKey> g_wokeWithGiven;
+static long long g_wokeWithGivenNoted = 0, g_wokeWithGivenFull = 0;
+/* worldWhole6[..] (T-1318 a4 fold 1): recordsRead / recordsUnread - RELEASE decisions with no awake list that read the squad's own sleeping
+   records / found them unread (the members seen listed then count as kept); relUnaccKeptOut / relUnaccHeld - put-away batches settled
+   asleep / held because of unaccounted people of their squad (kept by its records or seen listed / living and listed); relOver64 is
+   worldWhole's; xferUnacc / followUnacc - forced / follow-leader XFER passes not sent because the engine's list holds living members outside
+   the people this game runs (or over 64); rebuiltSameSquad - sweep meetings of a never-numbered member of a squad whose held put-aways came
+   from that same awake squad (no re-wake, LOW-1); unaccLines - the capped lines written */
+static long long g_wwRecRead = 0, g_wwRecUnread = 0, g_wwRelUnaccKeptOut = 0, g_wwRelUnaccHeld = 0, g_wwXferUnacc = 0, g_wwFollowUnacc = 0, g_wwRebuiltSameSquad = 0, g_unaccLines = 0;
+/* T-1318 a4 fold 2 (re-check LOW-A / LOW-B), worldWhole7: recDeadSkipped / recDeadUnread - records not accounted for whose body read dead at the
+   RELEASE (neither kept nor given) / whose death did not read (kept, the safe side), per decide; recUnreadHeld - decides HELD because no awake
+   list and no records read where the numbered people alone would go whole; recUnreadRead - such holds later decided by their records;
+   recUnreadGone / recUnreadCap - such holds ended settled asleep here, whole (the squad gone / the try cap) */
+static long long g_wwRecDeadSkipped = 0, g_wwRecDeadUnread = 0, g_wwRecHold = 0, g_wwRecHoldRead = 0, g_wwRecHoldGone = 0, g_wwRecHoldCap = 0;
+static const long long kUnaccLineCap = 100;
+static char g_relFlightBatchKey[256];   /* T-1318 attempt 3 fold 1: g_relBatch keys for an ended flight's put-aways with no batch of their squad this frame (a static address is never an engine squad) */
+static long long g_relFlightBatched = 0, g_relFlightBatchFull = 0;
+/* T-1318 attempt 3 fold 2 (re-check MED-A) - worldWhole5[..]: batchesMerged - a frame's put-away batches that joined another batch of their
+   squad before the decision (ReleaseFlush, cooplo::ReleaseMergeBase); heldOpen - batches held because an offer / XFER of their squad was still
+   open (cooplo::kHdHold on openOfSquad); heldGivenSettled - held people settled asleep here because another game took their squad while they
+   waited (cooplo::kHdGiven) */
+static long long g_relBatchesMerged = 0, g_wwHeldOpen = 0, g_wwHeldGivenSettled = 0;
+/* T-1318 attempt 3c (owner 1617 a): put-away batches of a world squad HELD UNDECIDED while people of that squad are awake here - per squad key,
+   the held people with the data read once at each put-away while the body was whole (RelMember: uid, position / facing, key, hand, gen) and
+   the last batch's key uid / sector / position. Nothing in it points at a body: the engine holds the people asleep as it put them away. A held
+   person is this game's (RelHolds: its UNLOAD stays held, a ROSTER CHECK is answered PENDING; IdxOpenHere). Decided by events only:
+   RelHeldDecide (a later batch of the squad, or the 1 Hz re-check RelHeldTick), the sweep's re-wake (HandedOverLeftBehindRebuilt), the
+   world teardown (ReleaseForgetDrain). */
+struct RelHeld { RelBatch b; int batches, recTries; RelHeld() : batches(0), recTries(0) {} };   /* recTries - T-1318 a4 fold 2 (re-check LOW-A): decides of this hold that met the squad's records unread (cooplo::RecordsUnreadStep) */
+static std::map<HoKey, RelHeld> g_relHeldSq;
+static long long g_wwHeldBatches = 0, g_wwHeldPeople = 0, g_wwOfferedTogether = 0, g_wwSettledAfterHold = 0, g_wwDroppedOnWake = 0, g_wwHeldNotMine = 0;
 /* late adopters of a uid whose later offer is still open - their REVOKE waits for the settle */
 struct RelLate { int slot; unsigned int peer, gen; };
 std::map<unsigned int, std::vector<RelLate> > g_relLate;
@@ -221,6 +322,12 @@ static long long g_relRewokeAtAck = 0, g_relRewokeAtSettle = 0, g_relSkipNoKey =
    holds the area, or its holder is unknown: rewokeHolderUnknown); revoke{Wait,Owed}WorldCleared = REVOKEs dropped by the world teardown;
    revoke{Wait,Owed}PlayerGone = dropped because the player they came from / were owed to left; goneSlotUnknown = a player gone with no slot */
 static long long g_relRewokeAcceptAtAck = 0, g_relRewokeLateAccepted = 0, g_relRewokeHolderUnknown = 0;
+/* T-1268 fold 1 (review M2): a re-woken member whose late adopter came while nobody holds its area yet - set aside, decided again by the
+   next applied area map. kind 0 = an adoption ACK (from / fromPeer / gen), kind 1 = a settle with late adopters (late). */
+struct RelRewakeWait { int kind; RelMember rm; int from; unsigned int fromPeer, gen, settleGen, seq; std::vector<RelLate> late; };
+static std::vector<RelRewakeWait> g_relRewakeWait;
+static long long g_relRewakeWaitPut = 0, g_relRewakeWaitDecided = 0, g_relRewakeWaitStillNobody = 0, g_relRewakeWaitNotMine = 0, g_relRewakeWaitWorldCleared = 0;
+static long long g_relRewakeWaitLateAdded = 0, g_relRewakeWaitPlayerGone = 0;   /* T-1268 fold 2 */
 static long long g_relRevokeWaitWorldCleared = 0, g_relRevokeOwedWorldCleared = 0, g_relRevokeWaitPlayerGone = 0, g_relRevokeOwedPlayerGone = 0, g_relRevokeGoneSlotUnknown = 0;
 static std::vector<int> g_relRevokeGoneSlots;   /* MAIN THREAD: players gone whose REVOKEs are still to drop (ReleaseForgetDrain) */
 static std::vector<int> g_idxGoneSlots;         /* MAIN THREAD: players gone whose squad-index rows (people handed to them) are still to drop (ReleaseForgetDrain) */
@@ -258,11 +365,18 @@ static std::set<std::pair<unsigned int, unsigned int> > g_passHeldSeen;   /* (ui
 /* T-1 B1 */
 const double kFollowBackoffSec = 5.0;        // a follow the receiver did not take is offered again after this
 std::map<unsigned int, double> g_followBackoff;   // leader uid -> not before (owner side)
+/* T-1239 fix attempt 1 (owner side): per leader uid the receiver named, the follow-leader members it refused as 'not in the leader's
+   group here' (its own engine groups the copies otherwise) and both announcements of the squad when that XFER went. While a refused
+   member is run here, that leader is still the agreed one and both announcements are as marked, the group goes by position (keep
+   check, area hand-over) and is not sent by follow-leader; the first pass that sees either announcement changed lifts the block. */
+struct FollowGroupBlock { std::set<unsigned int> members; coopsquad::FollowAnnounceMark mark; };
+std::map<unsigned int, FollowGroupBlock> g_followGroupBlock;
+long long g_followNotInGroup = 0, g_followBlockSet = 0, g_followBlockedPass = 0, g_followUnblocked = 0;   /* receiver refusals (members); blocks set; passes a send / wait went by position; blocks lifted by an announcement change */
 /* T-1 B1 restructure (re-check N1-N5 of ff655c5): MSG_SQUAD_LEAD (src/common/squadlead.h). SENDER: one record per squad this game
    runs members of (keyed by its ActivePlatoon*) - the key it is announced under and what was last SENT; it is announced again when
    any of that changes, to every new link, and (n = 0) when this game runs no member of it any more. A send that fails stays due and
    goes again next second (N3a). RECEIVER: g_peerLead, the other game's announcements (the newest seq per its key). */
-struct MyLead { unsigned int key; unsigned int acting, formal; std::vector<unsigned int> members; int sent; int has; int cats; int areaKey; };   /* T-1 B3 restructure: has / cats - the money last sent. Fold 1 [a1b1f1-hd0] [F3]: areaKey - the leader's area key the last announcement went with (-1 none: WORLD) */
+struct MyLead { unsigned int key; unsigned int acting, formal; std::vector<unsigned int> members; int sent; int has; int cats; int areaKey; unsigned int seq; };   /* T-1239: seq - the seq of the last send (0 none), the sender's half of FollowAnnounceMark */   /* T-1 B3 restructure: has / cats - the money last sent. Fold 1 [a1b1f1-hd0] [F3]: areaKey - the leader's area key the last announcement went with (-1 none: WORLD) */
 std::map<void*, MyLead> g_myLead;
 unsigned int g_myLeadKeyNext = 0, g_myLeadSeq = 0;
 const int kLeadSendsPerPass = 64;            // announcements per 1-Hz pass; the rest go next second
@@ -323,6 +437,7 @@ void LeadLinkEdge()
     if (gen == g_leadLinkGen) return;
     g_leadLinkGen = gen;
     g_peerLead.Clear(); g_myLead.clear(); g_crossRefused.clear();
+    g_followGroupBlock.clear();   /* T-1239: every announcement is heard again - a change */
     g_catsAdopt.clear(); g_catsUnreadSeq.clear(); g_catsDue = 1;   /* T-1 B3 restructure: the money is heard again too */
     g_catsTakeSnap.clear();   /* T-1 B3 fold (M2): a snapshot belongs to its link */
 }
@@ -363,7 +478,7 @@ int AnnounceLead(void* ap, unsigned int acting, unsigned int formal, const std::
     if (it == g_myLead.end())
     {
         MyLead r; if (++g_myLeadKeyNext == 0) ++g_myLeadKeyNext;
-        r.key = g_myLeadKeyNext; r.acting = 0; r.formal = 0; r.sent = 0; r.has = 0; r.cats = 0; r.areaKey = -1;
+        r.key = g_myLeadKeyNext; r.acting = 0; r.formal = 0; r.sent = 0; r.has = 0; r.cats = 0; r.areaKey = -1; r.seq = 0;
         it = g_myLead.insert(std::make_pair(ap, r)).first;
     }
     MyLead& r = it->second;
@@ -375,7 +490,7 @@ int AnnounceLead(void* ap, unsigned int acting, unsigned int formal, const std::
     m.cats = money; m.hasCats = (unsigned char)has;
     if (!net::SendSquadLead(m)) return 0;         // not sent: due again next second (N3a)
     ++*sends; ++g_squadLeadSent; if (has != 0) ++g_catsSent;
-    r.acting = acting; r.formal = formal; r.members.swap(mem); r.sent = 1; r.has = has; r.cats = money; r.areaKey = areaKey;
+    r.acting = acting; r.formal = formal; r.members.swap(mem); r.sent = 1; r.has = has; r.cats = money; r.areaKey = areaKey; r.seq = m.seq;
     return 1;
 }
 /* T-1 B3 restructure: a pot that could not be read (or written) - counted once per leader and announcement. */
@@ -423,7 +538,7 @@ int CatsResendRecord(MyLead& r)
     coopsquad::SquadLeadMsg m; m.squadKey = r.key; m.acting = r.acting; m.formal = r.formal; m.members = r.members; m.seq = NextLeadSeq();
     m.cats = cats; m.hasCats = 1;
     if (!net::SendSquadLead(m)) return 0;   /* the 1-Hz pass sends it */
-    ++g_squadLeadSent; ++g_catsSent; r.cats = cats;
+    ++g_squadLeadSent; ++g_catsSent; r.cats = cats; r.seq = m.seq;   /* T-1239: an announcement change */
     return 1;
 }
 /* T-1 B3 fold (M3): at the ACK, before `uid` is released - a squad whose money this game announces through that formal leader gets
@@ -586,6 +701,14 @@ void* SquadActivePlatoonOf(::Character* c)
     SquadView sv;
     return ReadSquadOf(c, &sv) == 1 ? sv.ap : 0;
 }
+/* T-1122 awake hand (store.h): the awake squad of uid when this game runs uid (*mine 1), else 0 */
+void* HandoffMySquadApOf(unsigned int uid, int* mine)
+{
+    *mine = (uid != 0 && net::IsUidMine(uid)) ? 1 : 0;
+    if (*mine == 0) return 0;
+    ::Character* c = FindSpawned(uid);
+    return Plaus(c) ? SquadActivePlatoonOf(c) : 0;
+}
 /* T-164 B4-3 (M4, owner 125-130): a trader squad whose formal leader has a home building is decided by the home building's
    position (ItTraderHomePos, items.cpp) - where its shop stock and its restock are decided - so one game runs the keeper, holds
    its stock and restocks it; every other squad by its own position (coopsquad::SquadDecisionChoice). */
@@ -609,6 +732,50 @@ int SquadDecisionPos(::Character* c, float* x, float* z)
    state. The other player gone: the squad index goes (as the marks did). World teardown: the open releases, the frame's batch and the index
    go (their faction pointers belong to the freed world; an open release's held UNLOADs are not sent - its world is gone). g_pending is
    kept: a late ACK still releases. */
+/* T-1046 leg-N fold 2: a person leaves the squad index on a bulk road (a player or the old peer gone, the area rule's adoption, the
+   re-wake drop, teardown) - its uid row and its hand go together, and the keep question's cached answers are asked again (g_idxSeq) */
+static void IdxDropUid(unsigned int uid) { g_idxOf.erase(uid); g_givenHandOf.erase(uid); g_keptHandOf.erase(uid); ++g_idxSeq; }   /* T-1318 a5 fold 1: its kept hand too */
+static void IdxDropAll() { g_squadIdx.clear(); g_idxOf.clear(); g_givenHandOf.clear(); g_keptHandOf.clear(); g_otherHandsOf.clear(); ++g_idxSeq; g_keptStayAp.clear(); }   /* T-1318 attempt 5: the kept and other games' hands go too */
+/* T-1318 attempt 5 (D1-R3): another game's living copy of squad k, its hand and its uid - noted (the taken test reads its owner then), only for
+   a squad with people given away (a5 fold 1: no notes for other squads, so the cap is never filled by them; the cap logged once) */
+static void OtherHandNote(const HoKey& k, const std::string& hand, unsigned int uid)
+{
+    if (hand.empty() || k.second.empty() || uid == 0) return;
+    const std::map<HoKey, SquadIdx>::const_iterator si = g_squadIdx.find(k);
+    if (si == g_squadIdx.end() || si->second.given.empty()) return;
+    std::map<HoKey, std::map<std::string, unsigned int> >::iterator o = g_otherHandsOf.find(k);
+    if (o == g_otherHandsOf.end())
+    {
+        if (g_otherHandsOf.size() >= kOtherHandsSquadCap)
+        {
+            if (g_wwOtherHandsCapHit++ == 0) DebugLog("[RELEASE] another game's copies' hands: the " + N((long long)kOtherHandsSquadCap) + "-squad cap is reached - squad id='" + k.second + "' and later ones are not noted (T-1318 a5 fold 1; worldWhole8 otherHandsCapHit, logged once)");
+            return;
+        }
+        o = g_otherHandsOf.insert(std::make_pair(k, std::map<std::string, unsigned int>())).first;
+    }
+    std::map<std::string, unsigned int>::iterator h = o->second.find(hand);
+    if (h != o->second.end()) { if (h->second != uid) { h->second = uid; ++g_idxSeq; } return; }
+    if (o->second.size() >= kOtherHandsPerSquadCap) { ++g_wwOtherHandsCapHit; return; }
+    o->second[hand] = uid; ++g_wwOtherHandsNoted; ++g_idxSeq;   /* the sleeping squads' taken answers are asked again */
+}
+/* T-1318 a5 fold 1 (review MEDIUM-2, LOW): a squad's index entry goes - its kept / asleep people's hands, its other-game notes and its
+   kept-stay note go with it */
+static void IdxEntryGone(const HoKey& k, const SquadIdx& e)
+{
+    for (std::set<unsigned int>::const_iterator u = e.keptHere.begin(); u != e.keptHere.end(); ++u) g_keptHandOf.erase(*u);
+    for (std::set<unsigned int>::const_iterator u = e.asleepHere.begin(); u != e.asleepHere.end(); ++u) g_keptHandOf.erase(*u);
+    if (g_otherHandsOf.erase(k) != 0) ++g_idxSeq;
+    g_keptStayAp.erase(k);
+}
+/* T-1318 a5 fold 1 (review MEDIUM-2): uid taken back - its other-game notes go (the taken test also skips a uid this game runs now) */
+static void OtherHandsForgetUid(unsigned int uid)
+{
+    for (std::map<HoKey, std::map<std::string, unsigned int> >::iterator o = g_otherHandsOf.begin(); o != g_otherHandsOf.end(); ++o)
+        for (std::map<std::string, unsigned int>::iterator h = o->second.begin(); h != o->second.end(); )
+        {
+            if (h->second == uid) { o->second.erase(h++); ++g_idxSeq; } else ++h;
+        }
+}
 static void ReleaseForgetDrain()
 {
     if (g_relWalkDepth > 0)
@@ -620,7 +787,7 @@ static void ReleaseForgetDrain()
     if (::InterlockedCompareExchange(&g_idxPeerGoneReq, 0, 1) == 1)
     {
         const long long n = (long long)g_squadIdx.size();
-        g_squadIdx.clear(); g_idxOf.clear(); g_keptRecent.clear(); g_keyCache.clear(); g_idxGoneSlots.clear(); ++g_idxPeerGoneCleared;   /* [a1b2f1-hd3] */
+        IdxDropAll(); g_keptRecent.clear(); g_keyCache.clear(); g_idxGoneSlots.clear(); ++g_idxPeerGoneCleared;   /* [a1b2f1-hd3] */
         DebugLog("[RELEASE] the old link's peer is gone (its slot never known): squad index cleared (" + N(n) + " squads) - this game runs its own copies of those squads again");
     }
     if (!g_idxGoneSlots.empty())
@@ -637,12 +804,13 @@ static void ReleaseForgetDrain()
                 int takes = 0;
                 for (size_t gi = 0; gi < gone.size() && takes == 0; ++gi) if (cooppg::PlayerGoneTakesRow(toSlot, gone[gi])) takes = 1;
                 if (takes == 0) { ++g; continue; }
-                g_idxOf.erase(g->first);
+                IdxDropUid(g->first);
                 s->second.given.erase(g++);
                 ++dropped; ++people;
             }
             if (dropped == 0 || !s->second.given.empty()) { ++s; continue; }
-            for (std::set<unsigned int>::const_iterator a = s->second.asleepHere.begin(); a != s->second.asleepHere.end(); ++a) g_idxOf.erase(*a);
+            for (std::set<unsigned int>::const_iterator a = s->second.asleepHere.begin(); a != s->second.asleepHere.end(); ++a) IdxDropUid(*a);
+            IdxEntryGone(s->first, s->second);   /* T-1318 a5 fold 1 */
             g_squadIdx.erase(s++);
             ++squads;
         }
@@ -658,6 +826,18 @@ static void ReleaseForgetDrain()
             for (size_t i = 0; i < g_relRevokeWait.size(); ) { if (g_relRevokeWait[i].from == gone[gi]) { g_relRevokeWait.erase(g_relRevokeWait.begin() + (long)i); ++nw; } else ++i; }
             for (size_t i = 0; i < g_relRevokeOwed.size(); ) { if (g_relRevokeOwed[i].slot == gone[gi]) { g_relRevokeOwed.erase(g_relRevokeOwed.begin() + (long)i); ++no; } else ++i; }
         }
+        long long nr = 0;
+        for (size_t gi = 0; gi < gone.size(); ++gi)
+            for (size_t i = 0; i < g_relRewakeWait.size(); ++i)
+            {   /* T-1268 fold 2: a waiting member's adopters that left go; with none left it is decided at the next tick (RelRewakeWaitTick) */
+                RelRewakeWait& w = g_relRewakeWait[i];
+                for (size_t j = 0; j < w.late.size(); ) { if (w.late[j].slot == gone[gi]) { w.late.erase(w.late.begin() + (long)j); ++nr; } else ++j; }
+                const int k = cooplo::RewakeOnGone(w.kind, w.from, gone[gi]);
+                if (k != w.kind) { w.kind = k; w.from = -1; ++nr; }
+                if (cooplo::RewakeWaitNeeded(w.kind, (int)w.late.size()) == 0) w.seq = AreaMapApplySeqTS() - 1u;   /* due at the next tick */
+            }
+        g_relRewakeWaitPlayerGone += nr;
+        if (nr > 0) DebugLog("[RELEASE] a player gone: " + N(nr) + " adopter row(s) of members waiting for their area's naming dropped (T-1268)");
         g_relRevokeWaitPlayerGone += nw; g_relRevokeOwedPlayerGone += no;
         if (nw + no > 0) DebugLog("[RELEASE] a player gone: REVOKEs dropped - waiting from it " + N(nw) + ", owed to it " + N(no));
     }
@@ -665,7 +845,11 @@ static void ReleaseForgetDrain()
     const long long r = (long long)g_release.size(), b = (long long)g_relBatch.size(), s = (long long)g_squadIdx.size();
     for (std::map<unsigned int, ReleaseRec>::const_iterator it = g_release.begin(); it != g_release.end(); ++it)
         DebugLog("[RELEASE] id=" + N((long long)it->first) + " END cleared by the world teardown (" + N((long long)it->second.mem.size()) + " member(s) open)");
-    g_release.clear(); g_relBatch.clear(); g_relLate.clear(); g_squadIdx.clear(); g_idxOf.clear(); g_keptRecent.clear(); g_keyCache.clear(); g_keepNoted.clear(); g_niwNoted.clear(); g_forcedTry.clear();   /* [a1b2f1-hd3]; T-650 fold 1: the forced hand-over's notes and back-offs */
+    g_relRewakeWaitWorldCleared += (long long)g_relRewakeWait.size(); g_relRewakeWait.clear();   /* T-1268 fold 1: they name uids of the world being freed */
+    if (!g_relHeldSq.empty()) DebugLog("[RELEASE] the world teardown cleared " + N((long long)g_relHeldSq.size()) + " squad(s) held until the squad sleeps (T-1318 attempt 3c)");
+    g_relHeldSq.clear();   /* T-1318 attempt 3c: no hold outlives its world */
+    g_deadHandsOf.clear(); g_wokeWithGiven.clear(); g_otherHandsOf.clear(); g_keptHandOf.clear(); g_keptStayAp.clear();   /* T-1318 a4 fold 1: they name squads of the world being freed; attempt 5: and these */
+    g_release.clear(); g_relBatch.clear(); g_relLate.clear(); IdxDropAll(); g_keptRecent.clear(); g_keyCache.clear(); g_keepNoted.clear(); g_niwNoted.clear(); g_forcedTry.clear();   /* [a1b2f1-hd3]; T-650 fold 1: the forced hand-over's notes and back-offs */
     g_sameIdWd.clear();   /* the same-id retire's marks name uids of the world being freed */
     /* [a1b2f2-hd3] [review G2]: the REVOKEs waiting to be applied and owed to be sent name uids of the world being freed - never applied in the next */
     const long long rw = (long long)g_relRevokeWait.size(), ro = (long long)g_relRevokeOwed.size();
@@ -703,19 +887,22 @@ static void IdxErase(unsigned int uid)
 {
     std::map<unsigned int, HoKey>::iterator o = g_idxOf.find(uid);
     if (o == g_idxOf.end()) return;
+    ++g_idxSeq; g_givenHandOf.erase(uid); g_keptHandOf.erase(uid);   /* T-1318 attempt 5: its kept hand goes with it */
     std::map<HoKey, SquadIdx>::iterator s = g_squadIdx.find(o->second);
     if (s != g_squadIdx.end())
     {
         s->second.given.erase(uid); s->second.asleepHere.erase(uid);
-        if (s->second.given.empty() && s->second.asleepHere.empty()) g_squadIdx.erase(s);
+        if (s->second.given.empty() && s->second.asleepHere.empty()) { IdxEntryGone(s->first, s->second); g_squadIdx.erase(s); }   /* T-1318 a5 fold 1 */
     }
     g_idxOf.erase(o);
 }
 static void IdxPut(unsigned int uid, const HoKey& k, int asleep, unsigned int owner)
 {
     IdxErase(uid);
+    ++g_idxSeq;
+    g_givenHandOf.erase(uid);   /* T-1046 leg-N fold 2: no hand rides over onto the new entry (a given entry's caller sets its own after this) */
     SquadIdx& s = g_squadIdx[k];
-    if (asleep != 0) { s.asleepHere.insert(uid); ++g_idxAsleepHere; } else { s.given[uid] = owner; ++g_idxGiven; }
+    if (asleep != 0) { s.asleepHere.insert(uid); ++g_idxAsleepHere; } else { s.given[uid] = owner; ++g_idxGiven; g_keptHandOf.erase(uid); }
     g_idxOf[uid] = k;
     std::map<HoKey, KeptRecent>::iterator kr = g_keptRecent.find(k);   /* [a1b2f1-hd4] [review F5]: kept people of it noted before it was indexed */
     if (kr != g_keptRecent.end()) { s.keptHere.insert(kr->second.uids.begin(), kr->second.uids.end()); g_keptRecent.erase(kr); }
@@ -723,43 +910,233 @@ static void IdxPut(unsigned int uid, const HoKey& k, int asleep, unsigned int ow
 }
 /* [a1b2f1-hd5] [review F5]: uid, a person of this game put away and NOT offered (or its offer cancelled by a re-wake), stays in this game's
    world data only - kept here. The key: as read from the whole body (have 1), else the 1 Hz scan's cache; unknown -> counted (a leftover). */
-static void IdxKeepKey(unsigned int uid, const HoKey& k, int have)
+static void IdxKeepKey(unsigned int uid, const HoKey& k, int have, const std::string& hand = std::string())   /* T-1318 attempt 5: hand - its hand when read */
 {
     if (have == 0)
     {
         std::map<unsigned int, HoKey>::const_iterator ck = g_keyCache.find(uid);
         if (ck == g_keyCache.end()) { ++g_idxKeptUnknown; return; }
         const HoKey cached(ck->second);
-        IdxKeepKey(uid, cached, 1);
+        IdxKeepKey(uid, cached, 1, hand);
         return;
     }
     ++g_idxKept;
+    KeptHandNote(uid, hand);   /* T-1318 attempt 5 (D1-R1): a re-wake erases it only when this hand is in the woken squad's list */
     std::map<HoKey, SquadIdx>::iterator s = g_squadIdx.find(k);
     if (s != g_squadIdx.end()) { s->second.keptHere.insert(uid); return; }
     KeptRecent& r = g_keptRecent[k]; r.uids.insert(uid); r.at = NowSec();
 }
 static void IdxKeep(unsigned int uid, ::Character* c)   /* c: a WHOLE body, or 0 (nothing may be read) */
 {
-    void* f = 0; std::string id;
-    if (c != 0 && Plaus(c) && SquadKeyOf(c, &f, &id)) { IdxKeepKey(uid, HoKey(f, id), 1); return; }
-    IdxKeepKey(uid, HoKey(), 0);
+    void* f = 0; std::string id, hand;
+    { ObjId oid; if (c != 0 && Plaus(c) && CaptureObjId(c, &oid)) hand = cooplo::HandKey(oid.serial, oid.type); }   /* T-1318 attempt 5 (D1-R1) */
+    if (c != 0 && Plaus(c) && SquadKeyOf(c, &f, &id)) { IdxKeepKey(uid, HoKey(f, id), 1, hand); return; }
+    IdxKeepKey(uid, HoKey(), 0, hand);
+}
+/* T-1318 attempt 3 (owner 1615 a; F-T2324-WHOLEKEPT): the people of squad k (the index key: faction + squad id) this game keeps asleep
+   un-offered - the index's keptHere and asleepHere, the not-yet-indexed kept list and (attempt 3c) the held-undecided put-aways (g_relHeldSq),
+   each person once; people named in `except` (the ones
+   the hand-over itself is about to send or offer) are not counted. The XFER's and the RELEASE's whole tests read it. MAIN THREAD. */
+static int KeptAsleepOf(const HoKey& k, const std::set<unsigned int>& except)
+{
+    std::set<unsigned int> u;
+    const std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(k);
+    if (s != g_squadIdx.end()) { u.insert(s->second.keptHere.begin(), s->second.keptHere.end()); u.insert(s->second.asleepHere.begin(), s->second.asleepHere.end()); }
+    const std::map<HoKey, KeptRecent>::const_iterator kr = g_keptRecent.find(k);
+    if (kr != g_keptRecent.end()) u.insert(kr->second.uids.begin(), kr->second.uids.end());
+    const std::map<HoKey, RelHeld>::const_iterator hd = g_relHeldSq.find(k);   /* T-1318 attempt 3c: held undecided - asleep here, this game's */
+    if (hd != g_relHeldSq.end()) for (size_t m = 0; m < hd->second.b.mem.size(); ++m) u.insert(hd->second.b.mem[m].m.uid);
+    int n = 0;
+    for (std::set<unsigned int>::const_iterator i = u.begin(); i != u.end(); ++i) if (except.count(*i) == 0) ++n;
+    return n;
+}
+/* T-1318 attempt 4 (owner 1626, design A): THE ENGINE'S OWN MEMBER LIST. The living members of a read list (sv) that are not people this game
+   runs of the squad (inRun: a uid named in run; run 0 - any uid of this game's), one at a time through cooplo::SquadMemberUnaccounted (dead
+   left out by the engine's flag, StoreIsDeadPod; unreadable counted alive); skip - a body to leave out (the one being put away). *known:
+   members with any uid. Objects go to *objs when given. MAIN THREAD (reads under the guarded readers). */
+/* T-1318 attempt 3 fold 2 (re-check LOW-2), attempt 4: THE ONE READ of a body's engine dead flag (Character::hasDied under SEH - 1 dead, 0
+   alive, -1 unreadable) for every rule in this file: the awake rule (SquadBodyAwake), the engine list's living members (SquadUnaccountedIn,
+   HandoffMembersTakenBy) */
+static int BodyDeadFlag(const void* c) { return coop::StoreIsDeadPod((void*)c); }
+/* T-1318 a4 fold 1 (review HIGH-2): a member with ANOTHER game's uid is run there already - never outside (cooplo::SquadMemberUnaccounted's
+   otherGame); outside: living with no uid, or with this game's uid not in run. deadHands / otherHands (when given): the hands of the list's
+   corpses / of another game's living people - accounted, never kept by the squad's sleeping records. */
+static int SquadUnaccountedIn(const SquadView& sv, const std::set<unsigned int>* run, const void* skip, int* known, std::set<const void*>* objs, std::set<std::string>* deadHands = 0, std::set<std::string>* otherHands = 0, std::map<std::string, unsigned int>* otherUids = 0)   /* T-1318 attempt 5 (D1-R3): otherUids - another game's living people's hands -> their uid */
+{
+    int n = 0;
+    if (known != 0) *known = 0;
+    for (int i = 0; i < sv.stored && i < kSquadViewCap; ++i)
+    {
+        ::Character* m = sv.members[i];
+        if (m == 0 || (const void*)m == skip) continue;
+        const int plaus = Plaus(m) ? 1 : 0;
+        const unsigned int uid = plaus != 0 ? FindSpawnedUid(m) : 0;
+        if (uid != 0 && known != 0) ++*known;
+        const int mine = (uid != 0 && net::IsUidMine(uid)) ? 1 : 0;
+        const int inRun = (mine != 0 && (run == 0 || run->count(uid) != 0)) ? 1 : 0;
+        const int otherGame = (uid != 0 && mine == 0) ? 1 : 0;
+        const int dead = plaus != 0 ? BodyDeadFlag(m) : -1;
+        std::set<std::string>* hs = dead == 1 ? deadHands : (otherGame != 0 ? otherHands : 0);
+        const int slotNote = (otherUids != 0 && otherGame != 0 && dead != 1) ? 1 : 0;
+        if ((hs != 0 || slotNote != 0) && plaus != 0)
+        {
+            ObjId oid;
+            if (CaptureObjId(m, &oid))
+            {
+                const std::string hk = cooplo::HandKey(oid.serial, oid.type);
+                if (hs != 0) hs->insert(hk);
+                if (slotNote != 0) (*otherUids)[hk] = uid;   /* T-1318 attempt 5 (D1-R3): its owner is read at the taken test (a5 fold 1) */
+            }
+        }
+        if (cooplo::SquadMemberUnaccounted(dead, inRun, otherGame) == 0) continue;
+        ++n;
+        if (objs != 0) objs->insert((const void*)m);
+    }
+    return n;
+}
+/* the awake engine list of squad k now (the faction's ACTIVE platoon of that id - never a context platoon: its people are another game's),
+   read: 1, else 0 */
+static int SquadAwakeListOf(const HoKey& k, SquadView* sv)
+{
+    if (!Plaus(k.first) || k.second.empty()) return 0;
+    void* pl = FindAwakePlatoon((::Faction*)k.first, k.second);
+    if (!Plaus(pl) || coop::IsContextPlatoon(pl) == 1) return 0;
+    void* ap = 0;
+    if (PlatoonApPod(pl, &ap) != 1 || !Plaus(ap)) return 0;
+    return ReadSquadAt(ap, sv) == 1 ? 1 : 0;
+}
+/* the same for an awake squad this game runs (uids: its people here) - the squad key read from its first member whose key reads; no key read
+   (a squad of one, or unread bodies): 0 - nothing can be indexed under a key that does not read */
+/* T-1318 attempt 3b: this game's LIVE people of squad k - awake and run here (net::IsUidMine; this game's copies of another game's people are
+   not), the batch being put away (except) left out; read now from the mirror (cooplo::ReleaseAwakeHolds). MAIN THREAD. */
+/* T-1318 attempt 3 fold 2 (re-check LOW-2): THE AWAKE RULE for one plausible body of this game's mirror - 1 = a live person of this game's
+   of the squad in question (same), not in the batch (inBatch 0). One helper for the hold (AwakeOfSquadHere) and the tripwire's drain
+   (PartGivenDrain), so both read a corpse alike. MAIN THREAD. */
+static int SquadBodyAwake(unsigned int uid, ::Character* c, int mine, int inBatch, int same)
+{
+    /* T-1318 attempt 3 fold 1 (review MED-2b): a corpse is not awake - the engine's own dead flag (Character::hasDied under SEH,
+       StoreIsDeadPod; the mirror's "dead" means a retired pointer, not a dead person). A world faction's corpses stay in its squad's
+       member list (store.cpp: declareDead removes them only for the player's faction), so a body of the squad left by a fight would
+       hold the rest. Unreadable (-1) counts as awake: the hold is the safe side. */
+    const int dead = same != 0 ? BodyDeadFlag(c) : 0;
+    return cooplo::ReleaseAwakeHolds(uid, mine, inBatch, same, dead);
+}
+static int AwakeOfSquadHere(const HoKey& k, const std::set<unsigned int>& except)
+{
+    int n = 0;
+    const int cap = MirrorCapacity();
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int uid = 0; ::Character* c = 0;
+        if (!MirrorSlot(i, &uid, &c) || !Plaus(c)) continue;
+        const int mine = net::IsUidMine(uid) ? 1 : 0;
+        if (mine == 0 || except.count(uid) != 0) continue;   /* the cheap tests first; the rule itself is ReleaseAwakeHolds */
+        void* f = 0; std::string id;
+        const int same = (SquadKeyOf(c, &f, &id) && HoKey(f, id) == k) ? 1 : 0;
+        n += SquadBodyAwake(uid, c, mine, 0, same);   /* fold 2 (LOW-2): the one awake rule - a corpse is not awake */
+    }
+    return n;
+}
+static int KeptAsleepOfRun(const std::vector<unsigned int>& uids)
+{
+    const std::set<unsigned int> run(uids.begin(), uids.end());
+    for (size_t i = 0; i < uids.size(); ++i)
+    {
+        void* f = 0; std::string id;
+        if (SquadKeyOf(FindSpawned(uids[i]), &f, &id)) return KeptAsleepOf(HoKey(f, id), run);
+    }
+    return 0;
+}
+/* T-1318 attempt 2 (D3) THE TRIPWIRE, fold 1 (review MEDIUM-1): after an accepted hand-over's index write (RelAccept, the XFER ACK's
+   IdxGiveAtAck), the settle of an offer that had an accepted ACK (RelSettleAll), or a wholly given squad's not-offered put-away that kept
+   people of this game's own (ReleaseFlush) - the squad is noted (PartGivenNote) and judged at the frame's drain (PartGivenDrain, the top of
+   HandoffTick: after the whole ACK is applied, so its own members are no longer this game's). Given in part = people of it given AND people
+   asleep or kept here, or AND people of it still awake here (this game runs them live - read at the drain, cooplo::PartGivenAt). Counted
+   once per squad (partGiven - the last field of worldWhole[..]; those with people awake here also partGivenAwake in worldWhole2[..]) with
+   one line, the first 20. Whole or none leaves no road to it; where part-giving could still arise (each Inferred, rare) and where it shows:
+   - a whole refusal on the receiver that still names rows it ALREADY runs (RELEASE nDup / XFER alreadyHere - a dual run or a lost ACK's
+     resend): the ACK gives those rows, the rest stay asleep / kept (RELEASE) or awake (XFER) here -> partGiven (awake: partGivenAwake);
+   - a member that stopped being this game's while its offer was open (RelAdvance's not-mine erase) -> partGiven at the settle;
+   - a member in flight on an XFER at its squad's put-away (ReleaseOnPutAway's kPadLeaveToAck: neither offered nor kept) -> partGiven at
+     that XFER's ACK (the put-away people asleep here);
+   - a re-woken body accepted at a RELEASE ACK (rewokeAcceptAtAck: its duplicate goes to the orphan clean-up) -> partGivenAwake while it lives;
+   - a wholly given squad's put-away person whose hand is not a given hand (ownKeptAsleep / ownKeptHandUnread) -> partGiven;
+   - a kept person whose squad key was NOT known (IdxKeepKey without a key): never indexed under any squad, so no squad can show it here -
+     it shows ONLY as worldWhole2 keptUnknown (the same count as indexFold1 keptUnknown). */
+static std::set<HoKey> g_wwPartGivenNoted;
+static std::map<HoKey, std::string> g_wwPartGivenDue;   /* squads to judge at the next drain -> the road that noted it */
+static void PartGivenNote(const HoKey& k, const char* where)
+{
+    if (g_wwPartGivenNoted.count(k) != 0) return;   /* already counted */
+    if (g_wwPartGivenDue.size() < 4096) g_wwPartGivenDue.insert(std::make_pair(k, std::string(where)));
+}
+static void PartGivenDrain()
+{
+    if (g_wwPartGivenDue.empty()) return;
+    std::map<HoKey, std::string> due; due.swap(g_wwPartGivenDue);
+    std::map<HoKey, int> awake;   /* this game's live people of each due squad, read now */
+    const int cap = MirrorCapacity();
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int uid = 0; ::Character* c = 0;
+        if (!MirrorSlot(i, &uid, &c) || !net::IsUidMine(uid) || !Plaus(c)) continue;
+        void* f = 0; std::string id;
+        if (!SquadKeyOf(c, &f, &id)) continue;
+        const HoKey k(f, id);
+        if (due.count(k) != 0) awake[k] += SquadBodyAwake(uid, c, 1, 0, 1);   /* T-1318 attempt 3 fold 2 (re-check LOW-2): a corpse is not awake here (the hold's own rule) */
+    }
+    for (std::map<HoKey, std::string>::const_iterator d = due.begin(); d != due.end(); ++d)
+    {
+        std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(d->first);
+        if (s == g_squadIdx.end()) continue;
+        const std::map<HoKey, int>::const_iterator a = awake.find(d->first);
+        const int awakeHere = a != awake.end() ? a->second : 0;
+        const int pg = cooplo::PartGivenAt((int)s->second.given.size(), (int)s->second.asleepHere.size(), (int)s->second.keptHere.size(), awakeHere);
+        if (pg == cooplo::kPgNone) continue;
+        if (g_wwPartGivenNoted.size() >= 4096 || !g_wwPartGivenNoted.insert(d->first).second) continue;
+        ++g_wwPartGiven; if ((pg & cooplo::kPgAwake) != 0) ++g_wwPartGivenAwake;
+        if (g_wwPartGiven > 20) continue;
+        DebugLog(std::string("[RELEASE] PART-GIVEN squad id='") + d->first.second + "' at " + d->second + ": given " + N((long long)s->second.given.size()) + ", asleep here " + N((long long)s->second.asleepHere.size())
+                 + ", kept here " + N((long long)s->second.keptHere.size()) + ", awake here " + N((long long)awakeHere) + " - whole or none was not kept (T-1318 D3 tripwire; partGiven=" + N(g_wwPartGiven)
+                 + " partGivenAwake=" + N(g_wwPartGivenAwake) + "; the first 20)");
+    }
 }
 /* the XFER ACK's release: the key from the body when it is still here, else as read when the XFER was built (Pending::keyOf) */
+/* T-850 (T2230): the squad id of a person an ACK names - read from the body (SquadKeyOf), else as read at the send (p.keyOf); "" unknown */
+static std::string HoSquadIdOf(unsigned int uid, ::Character* c, const Pending& p)
+{
+    void* f = 0; std::string id;
+    if (SquadKeyOf(c, &f, &id)) return id;
+    const std::map<unsigned int, HoKey>::const_iterator k = p.keyOf.find(uid);
+    return k != p.keyOf.end() ? k->second.second : std::string();
+}
+/* T-1046 leg-N fold 2: the hand the ACK's given entry carries - from the body when it is still whole, else as read at the send
+   (Pending::handOf); neither read: no hand (the sleeping squad's test then reads that person as not given) */
+static void IdxGiveHand(unsigned int uid, ::Character* rel, const Pending& p)
+{
+    std::string body;
+    if (Plaus(rel)) { ObjId oid; if (CaptureObjId(rel, &oid)) body = cooplo::HandKey(oid.serial, oid.type); }
+    const std::map<unsigned int, std::string>::const_iterator h = p.handOf.find(uid);
+    const std::string hand = cooplo::AckHand(body, h != p.handOf.end() ? h->second : std::string());
+    if (!hand.empty() && g_givenHandOf.size() < 65536) g_givenHandOf[uid] = hand;
+}
 static void IdxGiveAtAck(unsigned int uid, ::Character* rel, const Pending& p, unsigned int to)
 {
     void* f = 0; std::string id;
-    if (Plaus(rel) && SquadKeyOf(rel, &f, &id)) { IdxPut(uid, HoKey(f, id), 0, to); return; }
+    if (Plaus(rel) && SquadKeyOf(rel, &f, &id)) { IdxPut(uid, HoKey(f, id), 0, to); IdxGiveHand(uid, rel, p); PartGivenNote(HoKey(f, id), "an XFER ACK"); return; }   /* T-1318 D3 tripwire */
     std::map<unsigned int, HoKey>::const_iterator k = p.keyOf.find(uid);
-    if (k != p.keyOf.end()) { IdxPut(uid, k->second, 0, to); return; }
+    if (k != p.keyOf.end()) { IdxPut(uid, k->second, 0, to); IdxGiveHand(uid, rel, p); PartGivenNote(k->second, "an XFER ACK"); return; }
     ++g_idxNoKey;
 }
-/* an XFER's members' squad keys, read at the send while the bodies are whole (the ACK may come after the engine put them away) */
+/* an XFER's members' squad keys and hands, read at the send while the bodies are whole (the ACK may come after the engine put them away) */
 static void PendingKeysRead(Pending* p)
 {
     for (size_t k = 0; k < p->members.size(); ++k)
     {
         void* f = 0; std::string id;
-        if (SquadKeyOf(FindSpawned(p->members[k].uid), &f, &id)) p->keyOf[p->members[k].uid] = HoKey(f, id);
+        ::Character* c = FindSpawned(p->members[k].uid);
+        if (SquadKeyOf(c, &f, &id)) p->keyOf[p->members[k].uid] = HoKey(f, id);
+        if (Plaus(c)) { ObjId oid; if (CaptureObjId(c, &oid)) p->handOf[p->members[k].uid] = cooplo::HandKey(oid.serial, oid.type); }   /* T-1046 leg-N fold 2 */
     }
 }
 /* the XFER in flight (other than exceptKey) naming uid, else 0 */
@@ -780,6 +1157,21 @@ static int IdxOpenHere(const HoKey& k)
         for (size_t m = 0; m < b->second.mem.size(); ++m) if (b->second.mem[m].hasKey != 0 && b->second.mem[m].key == k) ++n;
     for (std::map<unsigned int, ReleaseRec>::const_iterator r = g_release.begin(); r != g_release.end(); ++r)
         for (size_t m = 0; m < r->second.mem.size(); ++m) if (r->second.mem[m].hasKey != 0 && r->second.mem[m].key == k) ++n;
+    const std::map<HoKey, RelHeld>::const_iterator hd = g_relHeldSq.find(k);   /* T-1318 attempt 3c: held undecided - still this game's */
+    if (hd != g_relHeldSq.end()) n += (int)hd->second.b.mem.size();
+    return n;
+}
+/* T-1318 attempt 3 fold 2 (re-check MED-A): people of squad k in a hand-over of this game still OPEN - an offer record waiting for its
+   answer (g_release; a member leaves it at its ACK's accept or its settle) or an XFER waiting for its ACK (g_pending, each member's key read
+   at the send) - HandoffSquadOpen's two open lists, counted per person by the exact key. While it is non-zero a new put-away of the squad is
+   HELD (RelHeldDecide), never a second offer. MAIN THREAD. */
+static int RelOpenOfSquad(const HoKey& k)
+{
+    int n = 0;
+    for (std::map<unsigned int, ReleaseRec>::const_iterator r = g_release.begin(); r != g_release.end(); ++r)
+        for (size_t m = 0; m < r->second.mem.size(); ++m) if (r->second.mem[m].hasKey != 0 && r->second.mem[m].key == k) ++n;
+    for (std::map<unsigned int, Pending>::const_iterator p = g_pending.begin(); p != g_pending.end(); ++p)
+        for (std::map<unsigned int, HoKey>::const_iterator q = p->second.keyOf.begin(); q != p->second.keyOf.end(); ++q) if (q->second == k) ++n;
     return n;
 }
 static int IdxWholeGiven(const HoKey& k, const SquadIdx& s)
@@ -825,6 +1217,45 @@ bool HandedOverAny()
     for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s) if (!s->second.given.empty()) return true;
     return false;
 }
+/* T-1318 fold 2 (re-check B1): THE OPEN HAND-OVER - an offer of squad (faction, id) sent by this game and not yet answered: a person of
+   it in this frame's put-away batch or an open RELEASE record (the asleep road - IdxOpenHere's own two lists; a record leaves g_release
+   at its END, a member at its ACK's accept or its settle), or in an XFER still waiting for its ACK (the awake road - Pending::keyOf, each
+   member's key read at the send; the flight leaves g_pending at its ACK or abandonment). faction 0 = any faction, by id. 1 open, 0 not.
+   MAIN THREAD. */
+int HandoffSquadOpen(void* faction, const std::string& id)
+{
+    ReleaseForgetDrain();
+    if (id.empty()) return 0;
+    for (std::map<void*, RelBatch>::const_iterator b = g_relBatch.begin(); b != g_relBatch.end(); ++b)
+        for (size_t m = 0; m < b->second.mem.size(); ++m)
+            if (b->second.mem[m].hasKey != 0 && b->second.mem[m].key.second == id && (faction == 0 || b->second.mem[m].key.first == faction)) return 1;
+    for (std::map<unsigned int, ReleaseRec>::const_iterator r = g_release.begin(); r != g_release.end(); ++r)
+        for (size_t m = 0; m < r->second.mem.size(); ++m)
+            if (r->second.mem[m].hasKey != 0 && r->second.mem[m].key.second == id && (faction == 0 || r->second.mem[m].key.first == faction)) return 1;
+    for (std::map<unsigned int, Pending>::const_iterator p = g_pending.begin(); p != g_pending.end(); ++p)
+        for (std::map<unsigned int, HoKey>::const_iterator k = p->second.keyOf.begin(); k != p->second.keyOf.end(); ++k)
+            if (k->second.second == id && (faction == 0 || k->second.first == faction)) return 1;
+    return 0;
+}
+int HandoffOpenAny() { ReleaseForgetDrain(); return (!g_relBatch.empty() || !g_release.empty() || !g_pending.empty()) ? 1 : 0; }
+long long HandoffOpenSeq() { return g_hoOpenSeq; }
+/* T-1318 fold 2 (re-check B2): the one slot every given person of squad id (any faction) went to; -1 = nothing given, or several slots */
+int HandoffGivenSlotId(const std::string& id)
+{
+    ReleaseForgetDrain();
+    int slot = -1;
+    for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s)
+    {
+        if (s->first.second != id) continue;
+        for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g)
+        {
+            const int to = net::PlayerSlotOfKey(g->second);
+            if (to < 0 || (slot >= 0 && to != slot)) return -1;
+            slot = to;
+        }
+    }
+    return slot;
+}
 /* the sweep adopted the squad's rebuilt people under the area rule (a fresh map says no other game holds the area and no other game's
    copy of it is live here): the squad is this game's again - its index entry goes */
 void HandedOverUnmark(void* faction, const std::string& id, int why)
@@ -832,14 +1263,16 @@ void HandedOverUnmark(void* faction, const std::string& id, int why)
     ReleaseForgetDrain();
     std::map<HoKey, SquadIdx>::iterator s = g_squadIdx.find(HoKey(faction, id));
     if (s == g_squadIdx.end()) return;
-    for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g) g_idxOf.erase(g->first);
-    for (std::set<unsigned int>::const_iterator a = s->second.asleepHere.begin(); a != s->second.asleepHere.end(); ++a) g_idxOf.erase(*a);
+    for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g) IdxDropUid(g->first);
+    for (std::set<unsigned int>::const_iterator a = s->second.asleepHere.begin(); a != s->second.asleepHere.end(); ++a) IdxDropUid(*a);
+    IdxEntryGone(s->first, s->second);   /* T-1318 a5 fold 1 */
     g_squadIdx.erase(s); ++g_idxSquadCleared;
     DebugLog("[RELEASE] squad id='" + id + "' out of the squad index - " + (why == 0 ? std::string("taken back") : std::string("its rebuilt people are adopted here (the area rule)"))
              + " (index squadCleared=" + N(g_idxSquadCleared) + ")");
 }
 void SquadIdxTaken(unsigned int uid)
 {
+    OtherHandsForgetUid(uid);   /* T-1318 a5 fold 1 (review MEDIUM-2): this game runs it again */
     if (g_idxOf.find(uid) == g_idxOf.end()) return;
     IdxErase(uid); ++g_idxTakenBack;
 }
@@ -948,7 +1381,7 @@ static int PlayerTableFresh() { int a = 0, b = 0, c = 0; return PeerPlayerSector
 /* the XFER take path, factored (design 2.5 item 3) - used by the XFER and the RELEASE: one member this game takes from another game -
    owner record at `gen`, the giver's copy announced (its later withdrawal is this game's), not a sweep adoption, the puppet made this
    game's own, the squad's money snapshot, the intent. MAIN THREAD (the drain - engine writes allowed). */
-static void TakeMemberFromPeer(const net::XferMember& mm, unsigned int gen, int* intents, int* unresolved)
+static void TakeMemberFromPeer(const net::XferMember& mm, unsigned int gen, int* intents, int* unresolved, int awakeBlock = 0, int* skipped = 0)   /* T-1122 awake hand: awakeBlock / skipped */
 {
     ::Character* c = FindSpawned(mm.uid);
     net::TakeLocalOwner(mm.uid, gen);
@@ -961,7 +1394,8 @@ static void TakeMemberFromPeer(const net::XferMember& mm, unsigned int gen, int*
         const coopsquad::PeerLeadEntry* te = g_peerLead.ForLeader(mm.uid);
         if (te != 0 && g_catsAdopt.find(mm.uid) == g_catsAdopt.end()) { CatsAdopt& s = g_catsTakeSnap[mm.uid]; s.seq = te->seq; s.cats = te->cats; }
     }
-    if (mm.intentType > 0 && Plaus(c))
+    if (raidsq::AwakeTakeOrder(awakeBlock, mm.intentType) == raidsq::kTakeOrderSkip) { if (skipped != 0) ++*skipped; }   /* T-1122 awake hand: the raid's campaign drives the squad - its carried goal is not issued (T2094: it pinned the squad) */
+    else if (mm.intentType > 0 && Plaus(c))
     {
         ::Character* subj = mm.intentSubject ? FindSpawned(mm.intentSubject) : 0;
         if (mm.intentSubject && !Plaus(subj)) { ++*unresolved; ++g_intentsSubjectUnresolved; }
@@ -975,12 +1409,13 @@ static unsigned int RelOfferGen(const ReleaseRec& r, const RelMember& m) { retur
 static int RelIndexOf(const ReleaseRec& r, unsigned int uid) { for (size_t k = 0; k < r.mem.size(); ++k) if (r.mem[k].m.uid == uid) return (int)k; return -1; }
 static void RelEnd(const ReleaseRec& r, const std::string& how)
 {
+    ++g_hoOpenSeq;   /* T-1318 fold 2: an offer closed */
     RelLog("[RELEASE] id=" + N((long long)r.id) + " END " + how + " (adopted " + N(r.nAdopted) + ", asleep " + N(r.nAsleep) + ", cancelled " + N(r.nCancelled)
            + ", moved to a split " + N(r.nMoved) + "; candidates tried " + N((long long)r.tried.size()) + ")");
 }
 static bool RelSendOffer(ReleaseRec& r, int resend)
 {
-    cooplo::ReleaseMsg msg; msg.id = r.id; msg.keyUid = r.keyUid; msg.flags = cooplo::kRelFlagPutAway;
+    cooplo::ReleaseMsg msg; msg.id = r.id; msg.keyUid = r.keyUid; msg.flags = cooplo::kRelFlagPutAway | cooplo::kRelFlagWorldWhole | (r.lentWhole != 0 ? cooplo::kRelFlagLentWhole : 0u);   /* T-1122 lent flag (protocol 224); T-1318 attempt 2 (D3, protocol 226): every RELEASE offer is a world squad's, whole or none */
     msg.sectorKey = (r.sector.x >= 0 && r.sector.x < 64 && r.sector.y >= 0 && r.sector.y < 64) ? (unsigned int)(r.sector.y * 64 + r.sector.x) : cooplo::kNoSector;
     for (size_t k = 0; k < r.mem.size(); ++k)
     {
@@ -993,6 +1428,15 @@ static bool RelSendOffer(ReleaseRec& r, int resend)
     r.sentAt = NowSec(); ++r.sends;
     if (resend != 0) ++g_relResent; else ++g_relOffers;
     return true;
+}
+/* T-1122 awake hand (owner 1524): before each offer to the candidate (and its resend), the squad's raid block on the same road - store.cpp
+   RaidAwakeHandSend sends it only when the squad's raid campaign was made on this game, read live there by the squad's faction and id */
+static int RelAwakeBlock(const ReleaseRec& r)   /* T-1122 whole or none (owner 1581 a): RaidAwakeHandSend's gate (-1: a lent squad not offered) */
+{
+    if (r.candidate < 0) return 0;
+    for (size_t k = 0; k < r.mem.size(); ++k)
+        if (r.mem[k].hasKey != 0) { return RaidAwakeHandSend(0, r.mem[k].key.first, r.mem[k].key.second, r.awakeKey != 0 ? r.awakeKey : r.keyUid, r.candidate); }   /* T-1122 re-check fold 2: a release from a half-taken XFER sends its block under the XFER's leader */
+    return 0;
 }
 /* REVOKE (design 2.5 item 4 [review F4]): to a late adopter - the winner's slot (-1: none, asleep / cancelled) and gen */
 static bool RelRevokeSendOnce(int slot, unsigned int uid, int winnerSlot, unsigned int winnerGen)
@@ -1036,37 +1480,59 @@ static void RelRevokeOwedTick()
                + (o.winnerSlot >= 0 ? SlotText(o.winnerSlot) : std::string("none (asleep / cancelled here)")) + " gen=" + N((long long)o.winnerGen) + " (revokeRetrySent " + N(g_relRevokeRetrySent) + ")");
     }
 }
-/* [a1b2f1-hd8] [review F3]: is squad k awake in this game's engine again - an active squad of its faction with that id and a member?
-   1 yes, 0 no, -1 unreadable (taken as no). Guarded reads only. */
-static int SquadAwakeHere(const HoKey& k, SquadView* found = 0)   /* [a1b2f2-hd5]: found = the awake squad (its area decides G1) */
+/* [a1b2f1-hd8] [review F3]: is the put-away person rm awake in this game's engine again? 1 yes, 0 no, -1 unreadable (taken as no). Guarded
+   reads only. T-1318 attempt 3 (owner 1615 a; T2324, F-T2324-WHOLEKEPT): judged PER PERSON - a body of THAT person (this game runs it under
+   rm's uid, or a fresh body carries rm's hand: cooplo::RewokeBodyIs) in an active squad of its faction with that id. It asked "any awake
+   member of the squad id" before: the squad's own awake people (and this game's copies of people another game runs) made every put-away of
+   the rest read "re-woken" - CANCELLED / REVOKED, left asleep here. found = the squad the body is in (its area decides G1). */
+static int PersonAwakeHere(const RelMember& rm, SquadView* found = 0, int note = 1)   /* [a1b2f2-hd5]: found = the awake squad (its area decides G1); note 0: not counted (the 1 Hz held re-check) */
 {
-    if (!Plaus(k.first) || k.second.empty()) return -1;
+    const HoKey& k = rm.key;
+    if (rm.hasKey == 0 || !Plaus(k.first) || k.second.empty()) return -1;
     void** items = 0; unsigned int n = 0;
     if (FactionActiveListPod(k.first, &items, &n) == 0 || !Plaus(items) || n > 4096) return -1;
+    int idAwake = 0;
     for (unsigned int i = 0; i < n; ++i)
     {
         void* ap = 0;
         if (ActiveOfListPod(items, i, &ap) == 0 || !Plaus(ap)) continue;
         SquadView sv;
         if (ReadSquadAt(ap, &sv) != 1 || sv.count <= 0 || !Plaus(sv.platoon)) continue;
-        if (StoreWorldIdOf(sv.platoon) == k.second) { if (found != 0) *found = sv; return 1; }   /* [a1b2f2-hd9] */
+        if (StoreIsWakeDup(sv.platoon) == 1) continue;   /* T-1318 fold 2: a copy whose wake was refused (a duplicate, or a given or open hand-over) is being removed - not this engine running the squad again */
+        if (StoreWorldIdOf(sv.platoon) != k.second) continue;   /* [a1b2f2-hd9] */
+        idAwake = 1;
+        for (int m = 0; m < sv.stored; ++m)
+        {
+            if (!Plaus(sv.members[m])) continue;
+            const unsigned int bu = FindSpawnedUid(sv.members[m]);
+            std::string bh;
+            if (!rm.hand.empty()) { ObjId oid; if (CaptureObjId(sv.members[m], &oid)) bh = cooplo::HandKey(oid.serial, oid.type); }
+            if (cooplo::RewokeBodyIs(bu, (bu != 0 && net::IsUidMine(bu)) ? 1 : 0, rm.m.uid, bh, rm.hand) == 1) { if (found != 0) *found = sv; return 1; }
+        }
     }
+    if (idAwake != 0 && note != 0) ++g_wwRewokeNotPerson;   /* the squad id is awake here, this person is not (the old test said "re-woken") */
     return 0;
 }
 /* fold 2 [a1b2f2-hd5] [review G1]: the re-woken squad's area, read at this moment the way the sweep reads it (worldsync.cpp
    AnnounceAreaDecide: HeldByOtherTS of the sector of the squad's decision position, the position SquadDecisionPos gives the sweep).
    *awake 1 = the squad is awake in this game's engine again. Returns 1 another game holds the area, 0 this game (the sweep adopts the
-   re-woken body), -1 unknown (no key, not awake, no readable position, or no fresh area map). */
+   re-woken body), -1 unknown (no key, not awake, no readable position, or no fresh area map).
+   T-1268: the sweep now adopts only where the map NAMES this game (coopor::AnnounceArea's kAnnounceNobodyYet is skipped), so the read
+   is that same answer, and 0 means only "the map names this game". REVOKE stays exactly "the sweep adopts the re-woken body".
+   T-1268 fold 1 (review M2): an area nobody holds yet answers -2 (coopor::RewakeAreaOf) and the late adopter WAITS
+   (cooplo::AdoptAfterRewakeWait -> RelRewakeWaitPut), decided again by the next applied area map (RelRewakeWaitTick). */
 static int RewakeAreaHeldByOther(const RelMember& rm, int* awake)
 {
     *awake = 0;
     if (rm.hasKey == 0) return -1;
     SquadView sv;
-    if (SquadAwakeHere(rm.key, &sv) != 1) return -1;
+    if (PersonAwakeHere(rm, &sv) != 1) return -1;   /* T-1318 attempt 3: this person, not any member of the squad id */
     *awake = 1;
     float x = 0.0f, z = 0.0f;
     if (SquadDecisionPosAt(sv, &x, &z) != 1) return -1;
-    return HeldByOtherTS(SectorOf(x, z));
+    int held = -1, mine = -1;
+    AreaViewTS(SectorOf(x, z), &held, &mine, 0, 0, 0, 0);
+    return coopor::RewakeAreaOf(coopor::AnnounceArea(held, mine));   /* T-1268 fold 1 (M2): -2 = nobody holds it yet - the settle waits */
 }
 /* [a1b2f1-hd13] [review F6]: the released person becomes the new owner's puppet when its body is here; a put-away has no body - nothing to
    puppet: a counted debug line (the first 20), never an ErrorLog per person */
@@ -1083,13 +1549,15 @@ static void PuppetIfBody(unsigned int uid, ::Character* c, const char* where)
 static void RelAccept(const RelMember& rm, int slot, unsigned int peer, unsigned int gen)
 {
     const unsigned int uid = rm.m.uid;
+    ++g_hoOpenSeq;   /* T-1318 fold 2: a member's offer closed (accepted) */
     SquadCatsFinalBeforeRelease(uid);
     net::ReleaseLocalOwner(uid, peer, gen);
     SquadCatsReleased(uid);
     WorldStateOnOwnershipReleased(uid, 0);
-    if (rm.hasKey != 0) IdxPut(uid, rm.key, 0, peer); else ++g_idxNoKey;
+    if (rm.hasKey != 0) { IdxPut(uid, rm.key, 0, peer); if (!rm.hand.empty() && g_givenHandOf.size() < 65536) g_givenHandOf[uid] = rm.hand; PartGivenNote(rm.key, "an accepted RELEASE ACK"); } else ++g_idxNoKey;   /* T-1318 D3 tripwire */   /* T-1046 fold 2: the hand goes with the given entry */
     ++g_relAdopted; ++g_released;
     RelDone& d = g_relDone[uid]; d.slot = slot; d.gen = gen; d.at = NowSec();
+    StoreRunHeldSettle(uid);   /* T-850 fold 1b: taken by another game - out of every record, the owner record names it: a delete held for its squad is decided now (kept) */
     std::map<unsigned int, std::vector<RelLate> >::iterator l = g_relLate.find(uid);
     if (l == g_relLate.end()) return;
     const std::vector<RelLate> late(l->second);
@@ -1100,9 +1568,10 @@ static void RelAccept(const RelMember& rm, int slot, unsigned int peer, unsigned
    adopter is accepted instead of the sleep (a person another game runs is never put to sleep); cancelled 1: every late adopter is revoked
    (this engine runs the squad again under fresh uids). Otherwise asleep here (the index's asleepHere) and the put-away's UNLOAD (with
    receipts) goes now, so the other games' copies go. The member must already be out of every record. true = a late adopter accepted. */
-static int RelAsleep(const RelMember& rm, int cancelled, unsigned int settleGen)   /* [a1b2f1-hd9]: 0 asleep, 1 a late adopter accepted, 2 cancelled */
+static int RelAsleep(const RelMember& rm, int cancelled, unsigned int settleGen)   /* [a1b2f1-hd9]: 0 asleep, 1 a late adopter accepted, 2 cancelled; T-1268 fold 1: 3 waiting for the naming */
 {
     const unsigned int uid = rm.m.uid;
+    ++g_hoOpenSeq;   /* T-1318 fold 2: a member's offer closed (settled) */
     int awake = 0;
     const int heldByOther = RewakeAreaHeldByOther(rm, &awake);   /* [a1b2f2-hd1] [review G1]: the sweep's area read of the re-woken squad */
     if (cancelled == 0 && awake != 0)
@@ -1116,6 +1585,14 @@ static int RelAsleep(const RelMember& rm, int cancelled, unsigned int settleGen)
     /* [a1b2f2-hd1] [review G1]: cancelled (re-woken here) - a late adopter is still accepted unless THIS game holds the re-woken squad's area
        (cooplo::AdoptAfterRewake: another game holds it, or its holder is unknown): the adopter's copy lives and the re-woken body here is the
        duplicate the orphan clean-up removes - never a revoke that leaves nobody running the person */
+    if (cancelled != 0 && !late.empty() && net::IsUidMine(uid) && cooplo::AdoptAfterRewakeWait(1, heldByOther) == cooplo::kSettleWait)
+    {   /* T-1268 fold 1 (review M2): nobody holds the re-woken squad's area yet - neither accepted nor revoked; the next applied area map decides */
+        RelRewakeWait w; w.kind = 1; w.rm = rm; w.from = -1; w.fromPeer = 0; w.gen = 0; w.settleGen = settleGen; w.seq = AreaMapApplySeqTS(); w.late = late;
+        g_relRewakeWait.push_back(w); ++g_relRewakeWaitPut;
+        RelLog("[RELEASE] uid=" + N((long long)uid) + " - re-woken here and " + N((long long)late.size()) + " late adopter(s), but nobody holds its area yet: WAITS for the area map"
+               " that names a holder (T-1268; rewakeWait put " + N(g_relRewakeWaitPut) + ")");
+        return 3;
+    }
     const int lateOk = cancelled == 0 ? 1 : (cooplo::AdoptAfterRewake(1, heldByOther) == cooplo::kSettleAccept ? 1 : 0);
     if (!late.empty() && lateOk != 0 && net::IsUidMine(uid))
     {
@@ -1138,10 +1615,11 @@ static int RelAsleep(const RelMember& rm, int cancelled, unsigned int settleGen)
         return 1;
     }
     for (size_t i = 0; i < late.size(); ++i) RelSendRevoke(late[i].slot, uid, -1, settleGen, late[i].gen);
-    if (cancelled != 0) { ++g_relCancelled; IdxKeepKey(uid, rm.key, rm.hasKey); }   /* [a1b2f1-hd9] [review F2]: in this game's world data only - kept here */
-    else { ++g_relAsleep; if (rm.hasKey != 0) IdxPut(uid, rm.key, 1, 0); else ++g_idxNoKey; }
+    if (cancelled != 0) { ++g_relCancelled; IdxKeepKey(uid, rm.key, rm.hasKey, rm.hand); }   /* [a1b2f1-hd9] [review F2]: in this game's world data only - kept here */
+    else { ++g_relAsleep; if (rm.hasKey != 0) { IdxPut(uid, rm.key, 1, 0); KeptHandNote(uid, rm.hand); } else ++g_idxNoKey; }   /* T-1318 attempt 5 (D1-R1): its hand */
     RelDone& d = g_relDone[uid]; d.slot = -1; d.gen = settleGen; d.at = NowSec();
     if (net::IsUidMine(uid)) WithdrawHeldUnload(uid);   /* the UNLOAD held since the put-away (ReleasePendingHas is false for it now) */
+    StoreRunHeldSettle(uid);   /* T-850 fold 1b: ended with nobody taking it (asleep here, or cancelled): a delete held for its squad is decided now */
     return cancelled != 0 ? 2 : 0;
 }
 /* endLine 0: a part of a record that stays open (no END line - each id has exactly one) */
@@ -1154,11 +1632,25 @@ static long long RelSettleAll(ReleaseRec& r, int cancelled, const std::string& h
     {
         const unsigned int settleGen = mem[k].baseGen + 2u + (unsigned int)r.tried.size();   /* above every gen offered */
         const int endedAs = RelAsleep(mem[k], cancelled, settleGen);
-        if (endedAs == 1) ++r.nAdopted; else if (endedAs == 2) { ++r.nCancelled; ++nc; } else ++r.nAsleep;   /* [a1b2f2-hd2b] */
+        if (endedAs == 1) ++r.nAdopted; else if (endedAs == 2) { ++r.nCancelled; ++nc; } else if (endedAs == 0) ++r.nAsleep;   /* [a1b2f2-hd2b]; 3 = set aside (T-1268 fold 1) */
+    }
+    if (r.nAdopted > 0)
+    {   /* T-1318 D3 tripwire: an offer that had an accepted ACK now settles people of the same squad asleep / kept here */
+        std::set<HoKey> keys;
+        for (size_t k = 0; k < mem.size(); ++k) if (mem[k].hasKey != 0) keys.insert(mem[k].key);
+        for (std::set<HoKey>::const_iterator k = keys.begin(); k != keys.end(); ++k) PartGivenNote(*k, "the settle of an offer with an accepted ACK");
     }
     if (endLine != 0) RelEnd(r, how);
     else RelLog("[RELEASE] id=" + N((long long)r.id) + " " + how + " (" + N((long long)mem.size()) + " member(s): adopted late " + N(r.nAdopted) + ", cancelled " + N(r.nCancelled) + ")");
     return nc;   /* [a1b2f2-hd2c] */
+}
+/* T-1122 whole or none (owner 1581 a, 2026-11-09): a lent squad's people whose raid block does not go with the offer are never offered one by
+   one - they stay asleep here, whole; the lent copy's own ending (its put-away's RETURN, or KEEPOWN) gives the squad back. The record ends. */
+static void RelLentAsleep(ReleaseRec& r)
+{
+    r.candidate = -1;
+    RaidLentWholeNote(raidsq::kLwRelHeld);
+    RelSettleAll(r, 0, "ASLEEP - a lent raid squad is not offered one by one (whole or none, T-1122): its people stay asleep here and its own ending gives it back (key=" + N((long long)r.keyUid) + ")", 1);
 }
 /* one open record's next step (cooplo::ReleaseStep). false = the record ended (the caller erases it). */
 static bool RelAdvance(ReleaseRec& r, double now)
@@ -1172,7 +1664,7 @@ static bool RelAdvance(ReleaseRec& r, double now)
         for (size_t k = 0; k < r.mem.size(); )
         {
             if (net::IsUidMine(r.mem[k].m.uid)) { ++k; continue; }
-            ++g_relNotMine; r.mem.erase(r.mem.begin() + (long)k);   /* no longer this game's (a hire, a dual run's yield): nothing to offer */
+            { const unsigned int gone = r.mem[k].m.uid; ++g_relNotMine; r.mem.erase(r.mem.begin() + (long)k); StoreRunHeldSettle(gone); }   /* no longer this game's (a hire, a dual run's yield): nothing to offer; T-850 fold 1b: its release ended */
         }
         if (r.mem.empty()) { RelEnd(r, "emptied - no member is this game's any more"); return false; }
         std::vector<int> order; int holder = -1, niw = 0, nk = 0;
@@ -1191,13 +1683,22 @@ static bool RelAdvance(ReleaseRec& r, double now)
         }
         r.held = 0;
         if (st == cooplo::kRsWait) return true;
-        if (st == cooplo::kRsResend) { RelSendOffer(r, 1); return true; }
+        if (st == cooplo::kRsResend)
+        {   /* T-1122 awake hand: the raid's block said again first; whole-or-none review fold MED-1 (b): the resend honours the gate */
+            const int rsGate = RelAwakeBlock(r);
+            if (raidsq::LentGateHolds(rsGate) != 0) { RelLentAsleep(r); return false; }
+            r.lentWhole |= raidsq::LentWholeFlagOf(rsGate);   /* T-1122 lent flag: the offer says "whole or none" itself */
+            RelSendOffer(r, 1); return true;
+        }
         if (st == cooplo::kRsOffer)
         {
             r.candidate = order[0]; r.clock = 0.0; r.defers = 0; r.sends = 0; r.sentAt = now;
+            const int lentGate = RelAwakeBlock(r);   /* T-1122 awake hand: the raid's block before the offer */
+            if (raidsq::LentGateHolds(lentGate) != 0) { RelLentAsleep(r); return false; }   /* T-1122 whole or none */
+            r.lentWhole |= raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag (protocol 224): the offer says "whole or none" itself */
             const bool ok = RelSendOffer(r, 0);
             ++g_holderOffer; if (niw > 0) ++g_holderNotInWorld; if (nk > 0) ++g_keepNotKeep;
-            RelLog("[RELEASE] id=" + N((long long)r.id) + " -> " + SlotText(r.candidate) + " key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " sector=" + SectorString(r.sector)
+            RelLog("[RELEASE] id=" + N((long long)r.id) + " -> " + SlotText(r.candidate) + " key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " lentWhole=" + N((long long)r.lentWhole) + " worldWhole=1" /* T-1318 D3 fold 1: every offer carries the world bit (RelSendOffer) */ + " sector=" + SectorString(r.sector)
                    + (r.candidate == holder ? std::string(" (has the area loaded, the area's holder") : " (has the area loaded; holder " + (holder < 0 ? std::string("none") : SlotText(holder)))
                    + "; releaseHolder offer " + N(g_holderOffer) + ")"
                    + " gen=" + N((long long)RelOfferGen(r, r.mem[0])) + " candidate " + N((long long)r.tried.size() + 1) + " of " + N((long long)(r.tried.size() + order.size()))
@@ -1240,14 +1741,219 @@ static bool RelHolds(unsigned int uid)
         for (size_t k = 0; k < b->second.mem.size(); ++k) if (b->second.mem[k].m.uid == uid) return true;
     for (std::map<unsigned int, ReleaseRec>::const_iterator r = g_release.begin(); r != g_release.end(); ++r)
         if (RelIndexOf(r->second, uid) >= 0) return true;
+    for (std::map<HoKey, RelHeld>::const_iterator h = g_relHeldSq.begin(); h != g_relHeldSq.end(); ++h)   /* T-1318 attempt 3c: held undecided - its UNLOAD stays held */
+        for (size_t k = 0; k < h->second.b.mem.size(); ++k) if (h->second.b.mem[k].m.uid == uid) return true;
     return false;
 }
+/* T-1122 review fold 3 (store.h): 1 = uid is in an open RELEASE offer (or this frame's batch) of this game - MAIN THREAD */
+int HandoffReleaseHolds(unsigned int uid) { return RelHolds(uid) ? 1 : 0; }
 /* M7a A1 build 2 [a1b2-hd3]: uid is still being handed on by this game - its UNLOAD is held (worldsync.cpp's three withdrawal paths) and
    a ROSTER CHECK is answered PENDING (design 2.5 item 8 [review F1]) */
 bool ReleasePendingHas(unsigned int uid)
 {
     ReleaseForgetDrain();
     return RelHolds(uid) || HandoffPendingHas(uid);
+}
+/* T-1318 attempt 3c (owner 1617 a): one decision for squad wk's held people and (cur, 0 at the 1 Hz re-check) its new batch - all of them
+   together (cooplo::HeldReleaseDecide): kHdHold - held on (cur joins the held set); kHdOffer - *out = held + cur, the held set goes, the
+   caller offers it as ONE whole put-away; kHdKeptOut / kHdOver64 - every person settles asleep here now (their UNLOADs go). Returns the
+   decision. Inside a RelWalk. */
+/* T-1318 attempt 3c: squad wk's held people re-checked (the 1 Hz RelHeldTick; fold 1, review L2: also RelHeldDecide before a new batch joins
+   them) - a held person no longer this game's leaves the hold; a held person awake here again (PersonAwakeHere) leaves it CANCELLED, never
+   offered. The held set may be erased (nobody left). Inside a RelWalk. */
+static void RelHeldRecheck(const HoKey& wk)
+{
+    std::map<HoKey, RelHeld>::iterator h = g_relHeldSq.find(wk);
+    if (h == g_relHeldSq.end()) return;
+    std::vector<RelMember> keep, woken; std::vector<unsigned int> gone;
+    for (size_t m = 0; m < h->second.b.mem.size(); ++m)
+    {
+        const RelMember& rm = h->second.b.mem[m];
+        const int mine = net::IsUidMine(rm.m.uid) ? 1 : 0;
+        const int step = cooplo::HeldMemberStep(mine, mine != 0 && PersonAwakeHere(rm, 0, 0) == 1 ? 1 : 0);
+        if (step == cooplo::kHmGone) gone.push_back(rm.m.uid); else if (step == cooplo::kHmWoken) woken.push_back(rm); else keep.push_back(rm);
+    }
+    if (gone.empty() && woken.empty()) return;
+    const RelBatch last(h->second.b);
+    h->second.b.mem = keep;   /* first: the people leaving are out of RelHolds before their settle */
+    if (keep.empty()) g_relHeldSq.erase(h);
+    for (size_t g = 0; g < gone.size(); ++g) { ++g_relSent; ++g_relNotMine; ++g_wwHeldNotMine; StoreRunHeldSettle(gone[g]); }   /* as RelAdvance's not-mine erase */
+    if (!woken.empty())
+    {
+        ReleaseRec r; r.id = RelNewId(); r.keyUid = last.keyUid; r.sector = last.sector; r.px = last.px; r.pz = last.pz; r.mem = woken; r.awakeKey = last.awakeKey; r.flight = last.flight;
+        g_relSent += (long long)woken.size(); g_wwDroppedOnWake += (long long)woken.size();
+        RelSettleAll(r, 1, "CANCELLED - held until the squad sleeps, but this game's engine runs the person(s) again (T-1318 attempt 3c; worldWhole4 droppedOnWake=" + N(g_wwDroppedOnWake) + ")", 1);
+    }
+}
+/* T-1318 a4 fold 1 (review HIGH-1): the RELEASE's KEPT people of squad wk from its OWN SLEEPING RECORDS (the faction's sleeping platoon of
+   that id - never a context platoon; StoreSleepersHands): a record that is not one of all's people (the batch and held people, by hand),
+   a given person of the squad, a person of it in an open offer or XFER of this game, a corpse or another game's person seen in its list is
+   KEPT here (cooplo::SleepRecordsKept - a never-numbered person among them). *records - the records read. -1 = no sleeping platoon or no
+   records read. MAIN THREAD (inside a RelWalk). T-1318 a4 fold 2: *sleeping - a sleeping platoon of the squad found (LOW-A's 'squad
+   gone'); a record whose body reads dead in the records is neither kept nor given (LOW-B, coopown::GdcCharDeadOf). */
+static int RelRecordsKept(const HoKey& wk, const RelBatch& all, int* records, int* sleeping)
+{
+    *records = -1; *sleeping = 0;
+    if (!Plaus(wk.first) || wk.second.empty()) return -1;
+    void* pl = FindSleepingPlatoon((::Faction*)wk.first, wk.second);
+    if (Plaus(pl)) *sleeping = 1;
+    if (!Plaus(pl) || coop::IsContextPlatoon(pl) == 1) return -1;
+    std::vector<std::string> recs; std::vector<int> recDead;
+    if (StoreSleepersHands(pl, &recs, &recDead) != 1) return -1;
+    *records = (int)recs.size();
+    std::set<std::string> acc(all.handsAcc);
+    for (size_t k = 0; k < all.mem.size(); ++k) if (!all.mem[k].hand.empty()) acc.insert(all.mem[k].hand);
+    const std::map<HoKey, std::set<std::string> >::const_iterator dh = g_deadHandsOf.find(wk);
+    if (dh != g_deadHandsOf.end()) acc.insert(dh->second.begin(), dh->second.end());
+    const std::map<HoKey, SquadIdx>::const_iterator gs = g_squadIdx.find(wk);
+    if (gs != g_squadIdx.end())
+        for (std::map<unsigned int, unsigned int>::const_iterator g = gs->second.given.begin(); g != gs->second.given.end(); ++g)
+        {
+            const std::map<unsigned int, std::string>::const_iterator h = g_givenHandOf.find(g->first);
+            if (h != g_givenHandOf.end() && !h->second.empty()) acc.insert(h->second);
+        }
+    for (std::map<unsigned int, ReleaseRec>::const_iterator r = g_release.begin(); r != g_release.end(); ++r)
+        for (size_t m = 0; m < r->second.mem.size(); ++m) if (r->second.mem[m].hasKey != 0 && r->second.mem[m].key == wk && !r->second.mem[m].hand.empty()) acc.insert(r->second.mem[m].hand);
+    for (std::map<unsigned int, Pending>::const_iterator pp = g_pending.begin(); pp != g_pending.end(); ++pp)
+        for (std::map<unsigned int, std::string>::const_iterator q = pp->second.handOf.begin(); q != pp->second.handOf.end(); ++q)
+        {
+            const std::map<unsigned int, HoKey>::const_iterator ko = pp->second.keyOf.find(q->first);
+            if (ko != pp->second.keyOf.end() && ko->second == wk && !q->second.empty()) acc.insert(q->second);
+        }
+    int dSkip = 0, dUnread = 0;
+    const int kept = cooplo::SleepRecordsKept(recs, acc, &recDead, &dSkip, &dUnread);   /* a4 fold 2 (re-check LOW-B): a corpse's record neither kept nor given */
+    g_wwRecDeadSkipped += dSkip; g_wwRecDeadUnread += dUnread;
+    return kept;
+}
+static int RelHeldDecide(const HoKey& wk, const RelBatch* cur, RelBatch* out)
+{
+    if (cur != 0) RelHeldRecheck(wk);   /* T-1318 attempt 3 fold 1 (review L2): the held people re-checked as the 1 Hz tick does, before a new batch is decided with them */
+    RelBatch all; int heldBatches = 0;
+    std::map<HoKey, RelHeld>::iterator h = g_relHeldSq.find(wk);
+    if (h != g_relHeldSq.end()) { all = h->second.b; heldBatches = h->second.batches; }
+    const int prevRecTries = h != g_relHeldSq.end() ? h->second.recTries : 0;   /* T-1318 a4 fold 2 (re-check LOW-A) */
+    if (cur != 0)
+    {
+        all.mem.insert(all.mem.end(), cur->mem.begin(), cur->mem.end()); all.keyUid = cur->keyUid; all.sector = cur->sector; all.px = cur->px; all.pz = cur->pz;
+        if (cur->awakeKey != 0) all.awakeKey = cur->awakeKey;   /* fold 1 (MED-1): an ended flight's leader and mark go with the squad */
+        if (cur->flight != 0) all.flight = 1;
+        all.unaccAwake.insert(cur->unaccAwake.begin(), cur->unaccAwake.end());   /* T-1318 attempt 4 */
+        all.handsAcc.insert(cur->handsAcc.begin(), cur->handsAcc.end()); if (cur->ap != 0) all.ap = cur->ap;   /* T-1318 a4 fold 1 */
+        if (cur->over64 != 0) all.over64 = 1;
+        if (cur->chars > all.chars) { all.chars = cur->chars; all.known = cur->known; }
+    }
+    std::set<unsigned int> uids;
+    for (size_t k = 0; k < all.mem.size(); ++k) uids.insert(all.mem[k].m.uid);
+    const int kept = KeptAsleepOf(wk, uids), awake = AwakeOfSquadHere(wk, uids);
+    /* T-1318 attempt 3 fold 2 (re-check MED-A): an offer / XFER of the squad still open holds the batch (never a second offer); a squad
+       another game took whole while these waited settles them asleep here (cooplo::kHdGiven) */
+    const int open = RelOpenOfSquad(wk);
+    int wholeGiven = 0;
+    {
+        const std::map<HoKey, SquadIdx>::const_iterator gs = g_squadIdx.find(wk);
+        if (gs != g_squadIdx.end()) wholeGiven = cooplo::GivenSquadNotOffered((int)gs->second.given.size(), (int)gs->second.asleepHere.size(), (int)gs->second.keptHere.size());
+    }
+    /* T-1318 attempt 4 (owner 1626, design A, site 4), a4 fold 1 (review HIGH-1): the engine's own member list. unaccAwake - living members
+       with no uid, or this game's uid not put away, in the squad's awake engine list now (SquadAwakeListOf) -> awake: held. NO AWAKE LIST
+       (the squad asleep, or put away this frame - at a new batch and at the 1 Hz re-check alike): the squad's OWN SLEEPING RECORDS decide
+       (RelRecordsKept: every record not accounted for - a never-numbered person among them - is KEPT -> the squad settles asleep here,
+       whole); records unread: every living member its put-aways saw listed outside them was put away with it - KEPT too, never 0 (the
+       numbered part is never offered as whole without them). A list over 64 counts as one kept. */
+    int unaccPut = all.over64 != 0 ? 1 : 0, unaccAwake = 0, listChars = all.chars, listKnown = all.known, records = -1, fromRecords = 0, recUnread = 0, recSleeping = 0;
+    {
+        SquadView lv;
+        if (SquadAwakeListOf(wk, &lv) == 1) { int kn = 0; unaccAwake = SquadUnaccountedIn(lv, 0, 0, &kn, 0); listChars = lv.count; listKnown = kn; if (lv.count > kSquadViewCap || lv.stored < lv.count) ++unaccPut; }
+        else
+        {
+            const int rk = RelRecordsKept(wk, all, &records, &recSleeping);
+            if (rk >= 0) { unaccPut += rk; fromRecords = 1; ++g_wwRecRead; }
+            else { unaccPut += (int)all.unaccAwake.size(); ++g_wwRecUnread; }
+            if (rk < 0) recUnread = 1;
+        }
+    }
+    const int hdNumbered = all.mem.empty() ? (int)cooplo::kHdOffer : cooplo::HeldReleaseDecide((int)all.mem.size(), kept, awake, open, wholeGiven);
+    int hd = all.mem.empty() ? (int)cooplo::kHdOffer : cooplo::HeldReleaseDecideUnacc((int)all.mem.size(), kept, awake, unaccPut, unaccAwake, open, wholeGiven);
+    /* T-1318 a4 fold 2 (re-check LOW-A): no awake list and the records unread, where the numbered people would go whole - HELD, the 1 Hz
+       re-decide reads the records again; never offered as whole on that road (T2343's Herbivore_9 / Starving Bandits_19 road). Ended by the
+       records read, the squad gone or the try cap (cooplo::RecordsUnreadStep: settled asleep here, whole), or the world teardown. */
+    int recStep = -1;
+    if (recUnread != 0 && hd == cooplo::kHdOffer && !all.mem.empty())
+    {
+        recStep = cooplo::RecordsUnreadStep(recSleeping, prevRecTries, cooplo::kRuTryCap);
+        if (recStep == cooplo::kRuHold) { hd = cooplo::kHdHold; ++g_wwRecHold; }
+        else { hd = cooplo::kHdKeptOut; if (recStep == cooplo::kRuKeptGone) ++g_wwRecHoldGone; else ++g_wwRecHoldCap; }
+        if (g_unaccLines < kUnaccLineCap && (recStep != cooplo::kRuHold || prevRecTries == 0))
+        {
+            ++g_unaccLines;
+            DebugLog("[RELEASE] squad id='" + wk.second + "' key=" + N((long long)all.keyUid) + (recStep == cooplo::kRuHold ? " NOT OFFERED yet - held: no awake list and its own sleeping records not read; the 1 Hz re-decide reads them again"
+                     : recStep == cooplo::kRuKeptGone ? " NOT OFFERED - settled asleep here, whole: its records never read and the squad gone (no sleeping platoon)" : " NOT OFFERED - settled asleep here, whole: its records not read in the tries allowed")
+                     + " (T-1318 a4 fold 2; " + N((long long)all.mem.size()) + " numbered put-away people; tries=" + N((long long)prevRecTries) + " sleeping=" + N((long long)recSleeping)
+                     + "; worldWhole7 recUnreadHeld=" + N(g_wwRecHold) + " recUnreadGone=" + N(g_wwRecHoldGone) + " recUnreadCap=" + N(g_wwRecHoldCap) + ")");
+        }
+    }
+    else if (prevRecTries > 0 && fromRecords != 0) ++g_wwRecHoldRead;   /* a records-unread hold decided by its records now */
+    if (recStep < 0 && hd != hdNumbered && (hd == cooplo::kHdKeptOut || hd == cooplo::kHdHold))
+    {   /* a hold or a settle the numbered people alone would not have made: counted (worldWhole6), the first lines named */
+        if (hd == cooplo::kHdKeptOut) ++g_wwRelUnaccKeptOut; else if (cur != 0) ++g_wwRelUnaccHeld;
+        if ((hd == cooplo::kHdKeptOut || cur != 0) && g_unaccLines < kUnaccLineCap)
+        {
+            ++g_unaccLines;
+            DebugLog("[RELEASE] squad id='" + wk.second + "' key=" + N((long long)all.keyUid) + (hd == cooplo::kHdKeptOut ? " NOT OFFERED - settled asleep here, whole" : " NOT OFFERED yet - held")
+                     + " (T-1318 attempt 4, the engine's member list): chars=" + N((long long)listChars) + " known=" + N((long long)listKnown) + " - " + N((long long)unaccPut) + " person(s) of it kept asleep here "
+                     + (fromRecords != 0 ? "by its own sleeping records (" + N((long long)records) + " records; a4 fold 1)" : std::string("seen listed outside the numbered people (its records not read)"))
+                     + (all.over64 != 0 ? " (its list held over 64)" : "") + ", " + N((long long)unaccAwake) + " living member(s) outside the numbered people still listed; " + N((long long)all.mem.size())
+                     + " numbered put-away people (worldWhole6 relUnaccKeptOut=" + N(g_wwRelUnaccKeptOut) + " relUnaccHeld=" + N(g_wwRelUnaccHeld) + "; the first " + N(kUnaccLineCap) + " unaccounted lines)");
+        }
+    }
+    if (hd == cooplo::kHdHold)
+    {
+        RelHeld& H = g_relHeldSq[wk];
+        H.b = all; H.batches = heldBatches + (cur != 0 ? 1 : 0);
+        H.recTries = recStep == cooplo::kRuHold ? prevRecTries + 1 : 0;   /* T-1318 a4 fold 2 (re-check LOW-A) */
+        if (cur != 0)
+        {
+            ++g_wwHeldBatches; g_wwHeldPeople += (long long)cur->mem.size(); if (open > 0) ++g_wwHeldOpen;
+            if (g_wwLines < kWwLineCap && recStep != cooplo::kRuHold)
+            {
+                ++g_wwLines;
+                DebugLog("[RELEASE] squad id='" + wk.second + "' key=" + N((long long)cur->keyUid) + " NOT OFFERED yet - held until the squad sleeps (T-1318 attempt 3c): awake here " + N((long long)awake)
+                         + " person(s) of it (run by this game)" + (open > 0 ? ", " + N((long long)open) + " in an offer / XFER of it still open (T-1318 fold 2: never a second offer; worldWhole5 heldOpen=" + N(g_wwHeldOpen) + ")" : std::string()) + "; its " + N((long long)cur->mem.size()) + " put-away people wait undecided with " + N((long long)(all.mem.size() - cur->mem.size()))
+                         + " held before (" + N((long long)H.batches) + " batch(es); worldWhole4 heldBatches=" + N(g_wwHeldBatches) + " heldPeople=" + N(g_wwHeldPeople) + ")");
+            }
+        }
+        return hd;
+    }
+    if (h != g_relHeldSq.end()) g_relHeldSq.erase(h);   /* decided: out of the hold before any settle (ReleasePendingHas must be false at each UNLOAD) */
+    if (all.mem.empty()) return cooplo::kHdKeptOut;   /* nothing left to decide */
+    if (hd == cooplo::kHdOffer)
+    {
+        if (heldBatches > 0)
+        {
+            ++g_wwOfferedTogether;
+            RelLog("[RELEASE] squad id='" + wk.second + "' - nobody of it awake here any more: its " + N((long long)heldBatches) + " held batch(es)" + std::string(cur != 0 ? " and this put-away" : "")
+                   + " go as ONE whole offer of " + N((long long)all.mem.size()) + " people (T-1318 attempt 3c; worldWhole4 offeredTogether=" + N(g_wwOfferedTogether) + ")");
+        }
+        *out = all;
+        return hd;
+    }
+    if (heldBatches > 0) ++g_wwSettledAfterHold;
+    ReleaseRec r; r.id = RelNewId(); r.keyUid = all.keyUid; r.sector = all.sector; r.px = all.px; r.pz = all.pz; r.mem = all.mem; r.awakeKey = all.awakeKey; r.flight = all.flight;
+    g_relSent += (long long)r.mem.size();
+    if (hd == cooplo::kHdKeptOut) ++g_wwRelKeptOut; else if (hd == cooplo::kHdGiven) ++g_wwHeldGivenSettled; else ++g_wwRelOver64;
+    const std::string why = recStep == cooplo::kRuKeptGone || recStep == cooplo::kRuKeptCap ? std::string("its own sleeping records never read (the squad gone, or the tries allowed spent) - never offered as whole without them (T-1318 a4 fold 2)")
+                          : hd == cooplo::kHdKeptOut ? "this game keeps " + N((long long)(kept + unaccPut)) + " person(s) of it asleep un-offered (kept or asleep here; " + N((long long)unaccPut) + " of them by the engine's own list / records)"
+                          : hd == cooplo::kHdGiven ? "another game took the squad whole while these waited for that offer's answer - never a second offer (T-1318 fold 2; worldWhole5 heldGivenSettled=" + N(g_wwHeldGivenSettled) + ")"
+                          : std::string("it holds over 64 people (one message holds 64)");
+    if (g_wwLines < kWwLineCap)
+    {
+        ++g_wwLines;
+        DebugLog("[RELEASE] squad id='" + wk.second + "' key=" + N((long long)all.keyUid) + " NOT OFFERED (whole or none, T-1318 D3): " + why + " - its " + N((long long)all.mem.size())
+                 + " put-away people (" + N((long long)heldBatches) + " batch(es) held before) stay asleep here, whole (worldWhole relKeptOut=" + N(g_wwRelKeptOut) + " relOver64=" + N(g_wwRelOver64)
+                 + "; worldWhole4 settledAfterHold=" + N(g_wwSettledAfterHold) + ")");
+    }
+    RelSettleAll(r, 0, "ASLEEP - NOT OFFERED, whole or none (T-1318 D3): " + why + " (key=" + N((long long)r.keyUid) + ")", 1);
+    if (hd == cooplo::kHdGiven) PartGivenNote(wk, "held put-aways of a squad another game took while they waited (T-1318 fold 2)");   /* the tripwire judges it */
+    return hd;
 }
 /* every frame (HandoffTick, before the 1 Hz gate): the last frame's put-aways become records - at most 64 people each - and are offered */
 static void ReleaseFlush(double now)
@@ -1256,19 +1962,207 @@ static void ReleaseFlush(double now)
     RelWalk walk;   /* [a1b2f1-hd10] [review F1] */
     std::map<void*, RelBatch> batch;
     batch.swap(g_relBatch);
+    /* T-1318 attempt 3 fold 2 (re-check MED-A): ONE SQUAD, ONE DECISION. Every road that files a put-away (ReleaseOnPutAway under its engine
+       squad, ReleaseOpenFromFlight under its squad's batch or a placeholder) ends here, the only place a batch is decided - so every batch of
+       one squad key (its first keyed member's, as the decision below reads it) joins one base batch first (cooplo::ReleaseMergeBase: the
+       squad's first engine batch, else its first), whatever road and order filed them. Two batches decided alone could each find nobody
+       awake and nobody kept and go as two whole-or-none offers of one squad. */
+    {
+        std::vector<std::map<void*, RelBatch>::iterator> its; std::vector<int> sq, fl; std::map<HoKey, int> ids;
+        for (std::map<void*, RelBatch>::iterator it = batch.begin(); it != batch.end(); ++it)
+        {
+            int id = -1;
+            for (size_t k = 0; k < it->second.mem.size(); ++k)
+                if (it->second.mem[k].hasKey != 0) { const int next = (int)ids.size(); id = ids.insert(std::make_pair(it->second.mem[k].key, next)).first->second; break; }
+            its.push_back(it); sq.push_back(id); fl.push_back(it->second.flight != 0 ? 1 : 0);
+        }
+        std::vector<int> base(its.size(), 0);
+        if (its.size() > 1 && cooplo::ReleaseMergeBase(&sq[0], &fl[0], (int)its.size(), &base[0]) > 0)
+            for (size_t i = 0; i < its.size(); ++i)
+            {
+                if (base[i] == (int)i) continue;
+                RelBatch& to = its[(size_t)base[i]]->second;
+                const RelBatch& from = its[i]->second;
+                to.mem.insert(to.mem.end(), from.mem.begin(), from.mem.end());
+                if (to.awakeKey == 0) to.awakeKey = from.awakeKey;   /* an ended flight's leader (the raid's AWAKE block key) goes with the squad */
+                to.unaccAwake.insert(from.unaccAwake.begin(), from.unaccAwake.end()); if (from.over64 != 0) to.over64 = 1;   /* T-1318 attempt 4 */
+                to.handsAcc.insert(from.handsAcc.begin(), from.handsAcc.end()); if (to.ap == 0) to.ap = from.ap;   /* T-1318 a4 fold 1 */
+                if (from.chars > to.chars) { to.chars = from.chars; to.known = from.known; }
+                if (from.flight != 0) to.flight = 1;
+                ++g_relBatchesMerged;
+                RelLog("[RELEASE] squad id='" + (from.mem.empty() ? std::string() : from.mem[0].key.second) + "' - " + N((long long)from.mem.size()) + " put-away(s) of a second batch of it this frame join its batch (now "
+                       + N((long long)to.mem.size()) + "): one squad, one decision (T-1318 fold 2; worldWhole5 batchesMerged=" + N(g_relBatchesMerged) + ")");
+                batch.erase(its[i]);
+            }
+    }
     for (std::map<void*, RelBatch>::iterator it = batch.begin(); it != batch.end(); ++it)
     {
         const RelBatch& b = it->second;
+        /* T-1318 fold 2 (re-check B1): a squad another game took at an accepted ACK and still wholly given (cooplo::GivenSquadNotOffered over
+           the squad index; the batch is one engine squad, read by its first keyed member) is never offered again - these people are bodies
+           this game made of a squad it gave away (T2316 Western Hive_13: offered a second time at 443.542). They settle asleep here
+           (RelSettleAll: their UNLOADs go), counted, the first 20 logged. */
+        int notOffer = 0; std::string notOfferId;
+        for (size_t k = 0; k < b.mem.size(); ++k)
+        {
+            if (b.mem[k].hasKey == 0) continue;
+            const std::map<HoKey, SquadIdx>::const_iterator gs = g_squadIdx.find(b.mem[k].key);
+            if (gs != g_squadIdx.end() && cooplo::GivenSquadNotOffered((int)gs->second.given.size(), (int)gs->second.asleepHere.size(), (int)gs->second.keptHere.size()) == 1)
+            { notOffer = 1; notOfferId = b.mem[k].key.second; }
+            break;
+        }
+        /* T-1318 attempt 2 (design D3): A WORLD SQUAD IS OFFERED WHOLE OR NOT AT ALL (cooplo::WorldReleaseOffer). The batch is one engine
+           squad's put-away; people of that squad this game put away and did NOT offer (kept / asleep here) mean the batch is not the whole
+           squad; over 64 people would need two messages. Either way the squad is NOT offered: every person settles asleep here, whole,
+           counted, a capped line. Every offer that goes says "whole or none" (kRelFlagWorldWhole, RelSendOffer).
+           T-1318 attempt 3c (owner 1617 a): with people of the squad still awake here the batch is HELD UNDECIDED (RelHeldDecide); the
+           batch that finds none awake goes with every held batch of the squad as ONE whole offer. */
+        if (notOffer == 0)
+        {
+            HoKey wk; int haveWk = 0;
+            for (size_t k = 0; k < b.mem.size() && haveWk == 0; ++k) if (b.mem[k].hasKey != 0) { wk = b.mem[k].key; haveWk = 1; }
+            if (haveWk != 0)
+            {
+                RelBatch whole;
+                if (RelHeldDecide(wk, &it->second, &whole) != cooplo::kHdOffer) continue;   /* held undecided, or settled asleep here */
+                it->second = whole;   /* b: the squad's held batches and this one - one whole put-away */
+            }
+            else if (cooplo::WorldReleaseOffer((int)b.mem.size(), 0) != cooplo::kWroOffer)
+            {   /* no squad key (never batched today - ReleaseOnPutAway keeps a keyless person): over 64, settled whole */
+                ReleaseRec r; r.id = RelNewId(); r.keyUid = b.keyUid; r.sector = b.sector; r.px = b.px; r.pz = b.pz; r.mem = b.mem; r.awakeKey = b.awakeKey; r.flight = b.flight;
+                g_relSent += (long long)r.mem.size(); ++g_wwRelOver64;
+                RelSettleAll(r, 0, "ASLEEP - NOT OFFERED, whole or none (T-1318 D3): it holds over 64 people (key=" + N((long long)r.keyUid) + ")", 1);
+                continue;
+            }
+        }
         for (size_t at = 0; at < b.mem.size(); at += (size_t)cooplo::kReleaseMaxMembers)
         {
             const size_t to = (at + (size_t)cooplo::kReleaseMaxMembers < b.mem.size()) ? at + (size_t)cooplo::kReleaseMaxMembers : b.mem.size();
-            ReleaseRec r; r.id = RelNewId(); r.keyUid = b.keyUid; r.sector = b.sector; r.px = b.px; r.pz = b.pz;
+            ReleaseRec r; r.id = RelNewId(); r.keyUid = b.keyUid; r.sector = b.sector; r.px = b.px; r.pz = b.pz; r.awakeKey = b.awakeKey; r.flight = b.flight;   /* fold 1 (MED-1): an ended flight's put-aways keep its leader and mark */
             for (size_t k = at; k < to; ++k) r.mem.push_back(b.mem[k]);
             g_relSent += (long long)r.mem.size();
+            if (notOffer != 0)
+            {
+                ++g_relGivenNotOffered;
+                const int toSlot = HandedOverSlot(0, notOfferId);
+                if (g_relGivenNotOfferedLogged < 20)
+                {
+                    ++g_relGivenNotOfferedLogged;
+                    DebugLog("[RELEASE] squad id='" + notOfferId + "' NOT OFFERED - " + SlotText(toSlot) + " took it at an accepted ACK and it is still wholly given; these " + N((long long)r.mem.size())
+                             + " people are bodies this game made of it again (key=" + N((long long)r.keyUid) + "): kept asleep here (T-1318 fold 2; givenNotOffered=" + N(g_relGivenNotOffered) + "; the first 20)");
+                }
+                const std::vector<RelMember> settled(r.mem);
+                RelSettleAll(r, 0, "ASLEEP - NOT OFFERED: its squad is still wholly given to " + SlotText(toSlot) + " (T-1318 fold 2; key=" + N((long long)r.keyUid) + ")", 1);
+                /* T-1318 attempt 2: these bodies are this game's copies of people another game runs - they do not join the squad's asleepHere
+                   (their UNLOADs went at the settle). Indexed asleep they made the squad part-given: its next wake was not refused, the
+                   sweep's re-wake drop took the whole entry and the given people were adopted and offered again (T2315's road). */
+                /* fold 1 (review HIGH-1 b): only a person whose hand is one of the squad's GIVEN hands is such a copy (cooplo::GivenNotOfferedRow);
+                   any other stays asleep here, indexed, counted and noted for the tripwire - this game's own people are never dropped silently */
+                std::set<std::string> givenHands;
+                if (!settled.empty() && settled[0].hasKey != 0)
+                {
+                    const std::map<HoKey, SquadIdx>::const_iterator gs = g_squadIdx.find(settled[0].key);
+                    if (gs != g_squadIdx.end())
+                        for (std::map<unsigned int, unsigned int>::const_iterator g = gs->second.given.begin(); g != gs->second.given.end(); ++g)
+                        { const std::map<unsigned int, std::string>::const_iterator h = g_givenHandOf.find(g->first); if (h != g_givenHandOf.end() && !h->second.empty()) givenHands.insert(h->second); }
+                }
+                long long ownKept = 0;
+                for (size_t q = 0; q < settled.size(); ++q)
+                {
+                    if (g_idxOf.find(settled[q].m.uid) == g_idxOf.end()) continue;
+                    const int row = cooplo::GivenNotOfferedRow(settled[q].hand.empty() ? 0 : 1, givenHands.count(settled[q].hand) != 0 ? 1 : 0);
+                    if (row == cooplo::kNoRowErase) { IdxErase(settled[q].m.uid); ++g_wwGivenAsleepKept; continue; }
+                    if (row == cooplo::kNoRowOwn) ++g_wwOwnKeptAsleep; else ++g_wwOwnKeptHandUnread;
+                    ++ownKept;
+                    if (settled[q].hasKey != 0) PartGivenNote(settled[q].key, "a wholly given squad's put-away that kept this game's own people asleep");
+                }
+                if (ownKept > 0 && g_wwOwnKeptLogged < 20)
+                {
+                    ++g_wwOwnKeptLogged;
+                    DebugLog("[RELEASE] squad id='" + notOfferId + "' NOT OFFERED, " + N(ownKept) + " of its " + N((long long)settled.size()) + " put-away people are NOT bodies of given people (hand not given, or not read) - kept asleep here, indexed (T-1318 D3 fold 1; worldWhole2 ownKeptAsleep="
+                             + N(g_wwOwnKeptAsleep) + " ownKeptHandUnread=" + N(g_wwOwnKeptHandUnread) + "; the first 20)");
+                }
+                continue;
+            }
             RelLog("[RELEASE] id=" + N((long long)r.id) + " OPEN key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " sector=" + SectorString(r.sector)
                    + " - this game's engine put them away (release sent " + N(g_relSent) + ")");
             if (RelAdvance(r, now)) g_release[r.id] = r;
         }
+    }
+}
+/* T-1318 attempt 3c (owner 1617 a): 1 Hz re-check of every held squad - events read as state, no timer. A held person no longer this
+   game's (it died, or another road took it) leaves the hold; a held person awake here again (PersonAwakeHere - the engine runs it again)
+   leaves it CANCELLED, never offered (its UNLOAD goes, kept here: the sweep's re-wake clears it); then the squad is decided again with no new
+   batch (RelHeldDecide): its awake people gone by any road (put away into a batch, died, taken) -> the held people go as one whole offer, or
+   settle. A hold so never outlives its people; the world teardown clears it (ReleaseForgetDrain). */
+static void RelHeldTick(double now)
+{
+    if (g_relHeldSq.empty()) return;
+    RelWalk walk;
+    std::vector<HoKey> keys;
+    for (std::map<HoKey, RelHeld>::const_iterator h = g_relHeldSq.begin(); h != g_relHeldSq.end(); ++h) keys.push_back(h->first);
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        if (g_relHeldSq.find(keys[i]) == g_relHeldSq.end()) continue;
+        RelHeldRecheck(keys[i]);   /* gone / re-woken held people leave the hold (fold 1: shared with RelHeldDecide's new-batch road, review L2) */
+        if (g_relHeldSq.find(keys[i]) == g_relHeldSq.end()) continue;
+        RelBatch whole;
+        if (RelHeldDecide(keys[i], 0, &whole) != cooplo::kHdOffer || whole.mem.empty()) continue;
+        ReleaseRec r; r.id = RelNewId(); r.keyUid = whole.keyUid; r.sector = whole.sector; r.px = whole.px; r.pz = whole.pz; r.mem = whole.mem; r.awakeKey = whole.awakeKey; r.flight = whole.flight;   /* <= 64: HeldReleaseDecide */
+        g_relSent += (long long)r.mem.size();
+        RelLog("[RELEASE] id=" + N((long long)r.id) + " OPEN key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " sector=" + SectorString(r.sector)
+               + " - this game's engine put them away; held until the squad slept (release sent " + N(g_relSent) + ")");
+        if (RelAdvance(r, now)) g_release[r.id] = r;
+    }
+}
+/* T-1268 fold 1 (review M2): each set-aside member is decided again once an area map was applied after it was set aside (the event that
+   ends the sweep's own 'nobody yet' wait): still nobody - waits on; otherwise AdoptAfterRewake's rule, exactly as at the ACK / settle.
+   A member no longer this game's is dropped (another road settled it). Inside ReleaseTick's walk. */
+static void RelRewakeWaitTick()
+{
+    if (g_relRewakeWait.empty()) return;
+    const unsigned int seq = AreaMapApplySeqTS();
+    std::vector<RelRewakeWait> keep, due;
+    for (size_t i = 0; i < g_relRewakeWait.size(); ++i)
+    {
+        if (cooplo::AdoptAfterRewakeDue(g_relRewakeWait[i].seq, seq) == 0) keep.push_back(g_relRewakeWait[i]); else due.push_back(g_relRewakeWait[i]);
+    }
+    g_relRewakeWait.swap(keep);
+    for (size_t i = 0; i < due.size(); ++i)
+    {
+        RelRewakeWait& w = due[i];
+        const unsigned int uid = w.rm.m.uid;
+        if (!net::IsUidMine(uid)) { ++g_relRewakeWaitNotMine; continue; }
+        int awake = 0;
+        const int area = RewakeAreaHeldByOther(w.rm, &awake);
+        if (cooplo::RewakeWaitNeeded(w.kind, (int)w.late.size()) != 0 && cooplo::AdoptAfterRewakeWait(awake, area) == cooplo::kSettleWait)
+        { w.seq = seq; g_relRewakeWait.push_back(w); ++g_relRewakeWaitStillNobody; continue; }
+        ++g_relRewakeWaitDecided;
+        if (!w.late.empty())
+        {   /* T-1268 fold 2: its late adopters back where the settle reads them - RelAccept revokes all but the winner, a cancel all */
+            std::vector<RelLate>& l = g_relLate[uid];
+            l.insert(l.end(), w.late.begin(), w.late.end());
+        }
+        if (w.kind == 1)
+        {   /* the settle, decided by RelAsleep's own rule now that the area answers (no adopter left: cancelled, kept here) */
+            const int r = RelAsleep(w.rm, 1, w.settleGen);
+            RelLog("[RELEASE] uid=" + N((long long)uid) + " - the area map now answers for its re-woken squad: settled " + std::string(r == 1 ? "(a late adopter accepted)" : r == 2 ? "(cancelled, kept here)" : r == 3 ? "(waits again)" : "(asleep)")
+                   + " (T-1268; rewakeWait decided " + N(g_relRewakeWaitDecided) + ")");
+            continue;
+        }
+        if (cooplo::AdoptAfterRewake(awake, area) == cooplo::kSettleRevoke)
+        {
+            ++g_relRewokeAtAck;
+            RelLog("[RELEASE] uid=" + N((long long)uid) + " adopted by " + SlotText(w.from) + " after this game's engine re-woke its squad; the area map now names THIS game - REVOKED, cancelled here"
+                   " (T-1268; rewakeWait decided " + N(g_relRewakeWaitDecided) + ")");
+            RelSendRevoke(w.from, uid, -1, w.settleGen, w.gen);
+            RelAsleep(w.rm, 1, w.settleGen);
+            continue;
+        }
+        ++g_relRewokeAcceptAtAck; if (area < 0) ++g_relRewokeHolderUnknown;
+        RelLog("[RELEASE] uid=" + N((long long)uid) + " adopted by " + SlotText(w.from) + " after this game's engine re-woke its squad; the area map now answers "
+               + std::string(awake == 0 ? "(asleep again here)" : area < 0 ? "(no fresh map)" : "(another game holds it)") + " - ACCEPTED (T-1268; rewakeWait decided " + N(g_relRewakeWaitDecided) + ")");
+        RelAccept(w.rm, w.from, w.fromPeer, w.gen);
     }
 }
 /* 1 Hz: every open record's next step; the settled-uid book pruned */
@@ -1276,6 +2170,7 @@ static void ReleaseTick(double now)
 {
     RelWalk walk;   /* [a1b2f1-hd10] [review F1]: the walk of g_release below - a nested drain (RelAsleep -> WithdrawHeldUnload -> ReleasePendingHas) defers */
     RelRevokeOwedTick();   /* [a1b2f1-hd7] [review F4] */
+    RelRewakeWaitTick();   /* T-1268 fold 1 (review M2) */
     for (std::map<unsigned int, ReleaseRec>::iterator it = g_release.begin(); it != g_release.end(); )
     {
         if (RelAdvance(it->second, now)) ++it; else g_release.erase(it++);
@@ -1302,6 +2197,7 @@ static void ReleaseOpenFromFlight(unsigned int leader, const Pending& p, const s
         RelMember rm; rm.m = p.members[k]; rm.baseGen = net::MineGenOf(u);
         std::map<unsigned int, HoKey>::const_iterator kk = p.keyOf.find(u);
         if (kk != p.keyOf.end()) { rm.key = kk->second; rm.hasKey = 1; }
+        { const std::map<unsigned int, std::string>::const_iterator hh = p.handOf.find(u); if (hh != p.handOf.end()) rm.hand = hh->second; }   /* T-1046 leg-N fold 2: its hand as read at the send - an adoption's given entry carries it */
         const int fpr = cooplo::FlightPutAwayRoad(sameIdWd, rm.hasKey);
         if (fpr == cooplo::kFprUnloadSameId)
         {   /* a same-id retire withdrew it: another game runs this person - its held UNLOAD goes, never offered */
@@ -1310,18 +2206,47 @@ static void ReleaseOpenFromFlight(unsigned int leader, const Pending& p, const s
         }
         if (fpr == cooplo::kFprUnloadNoKey)
         {   /* [a1b2f1-hd11] [review F3]: no squad key - never offered (a re-wake could not cancel it): it sleeps here, its held UNLOAD goes now */
-            ++g_relFlightNoKey; IdxKeepKey(u, HoKey(), 0); WithdrawHeldUnload(u);
+            ++g_relFlightNoKey; IdxKeepKey(u, HoKey(), 0, rm.hand); WithdrawHeldUnload(u);
             continue;
         }
         r.mem.push_back(rm);
     }
     if (r.mem.empty()) return;
-    r.id = RelNewId(); r.keyUid = net::IsUidMine(leader) ? leader : r.mem[0].m.uid; r.sector = SectorOf(r.mem[0].m.x, r.mem[0].m.z); r.px = r.mem[0].m.x; r.pz = r.mem[0].m.z;
-    g_relSent += (long long)r.mem.size();
     if (abandoned != 0) g_relFlightAbandoned += (long long)r.mem.size(); else g_relFlightNotTaken += (long long)r.mem.size();
-    RelLog("[RELEASE] id=" + N((long long)r.id) + " OPEN key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " sector=" + SectorString(r.sector)
-           + " - members of XFER leader=" + N((long long)leader) + (abandoned != 0 ? std::string(" (abandoned, no ACK)") : std::string(" (not taken)")) + " whose body this game's engine put away while it flew");
-    if (RelAdvance(r, NowSec())) g_release[r.id] = r;
+    /* T-1318 attempt 3 fold 1 (review MED-1, owner 1617 a): ONE ROAD FOR EVERY RELEASE. These put-aways were not batched while the XFER flew
+       (ReleaseOnPutAway's kPadLeaveToAck); they are not offered here any more - they join this frame's put-away batch of their squad (the
+       same squad key: one batch, one decision) or open one, and ReleaseFlush decides them exactly as an engine put-away: a wholly given
+       squad's not-offered settle, then RelHeldDecide (people of the squad kept / asleep here -> settled asleep; awake here -> HELD until the
+       squad sleeps; none -> one whole offer). Before, they were offered at once with no whole test and no hold while the rest of the squad
+       was awake here - a squad split across games. Their UNLOADs stay held (RelHolds reads the batch). */
+    std::map<HoKey, std::vector<RelMember> > byKey;
+    for (size_t k = 0; k < r.mem.size(); ++k) byKey[r.mem[k].key].push_back(r.mem[k]);   /* every member here has a key (kFprRelease) */
+    const unsigned int awakeKey = leader != 0 ? leader : r.mem[0].m.uid;   /* T-1122 re-check fold 2: the raid's AWAKE block goes under the XFER's leader */
+    for (std::map<HoKey, std::vector<RelMember> >::const_iterator g = byKey.begin(); g != byKey.end(); ++g)
+    {
+        void* slot = 0;
+        for (std::map<void*, RelBatch>::const_iterator b = g_relBatch.begin(); b != g_relBatch.end() && slot == 0; ++b)
+            for (size_t m = 0; m < b->second.mem.size(); ++m) if (b->second.mem[m].hasKey != 0) { if (b->second.mem[m].key == g->first) slot = b->first; break; }
+        for (int s = 0; s < 256 && slot == 0; ++s) if (g_relBatch.find((void*)&g_relFlightBatchKey[s]) == g_relBatch.end()) slot = (void*)&g_relFlightBatchKey[s];
+        if (slot == 0)
+        {   /* 256 flight batches in one frame (never expected): kept asleep here, their UNLOADs go - never offered outside the one road */
+            ++g_relFlightBatchFull;
+            for (size_t m = 0; m < g->second.size(); ++m) { IdxKeepKey(g->second[m].m.uid, g->first, 1, g->second[m].hand); WithdrawHeldUnload(g->second[m].m.uid); }
+            DebugLog("[RELEASE] squad id='" + g->first.second + "' - " + N((long long)g->second.size()) + " member(s) of XFER leader=" + N((long long)leader) + " put away while it flew: NO batch slot free - kept asleep here (relFlightBatchFull " + N(g_relFlightBatchFull) + ")");
+            continue;
+        }
+        RelBatch& b = g_relBatch[slot];
+        if (b.mem.empty())
+        {   /* the offer keeps its own key (a uid this game runs, else one in the offer - the receiver reads the squad's spot by it) */
+            b.keyUid = net::IsUidMine(leader) ? leader : g->second[0].m.uid; b.sector = SectorOf(g->second[0].m.x, g->second[0].m.z); b.px = g->second[0].m.x; b.pz = g->second[0].m.z;
+        }
+        if (b.awakeKey == 0) b.awakeKey = awakeKey;
+        b.flight = 1;
+        b.mem.insert(b.mem.end(), g->second.begin(), g->second.end());
+        g_relFlightBatched += (long long)g->second.size();
+        RelLog("[RELEASE] squad id='" + g->first.second + "' - " + N((long long)g->second.size()) + " member(s) of XFER leader=" + N((long long)leader) + (abandoned != 0 ? std::string(" (abandoned, no ACK)") : std::string(" (not taken)"))
+               + " whose body this game's engine put away while it flew join its put-away batch (now " + N((long long)b.mem.size()) + "), decided as a put-away: held while people of it are awake here, else whole or none (T-1318 attempt 3 fold 1; relFlightBatched " + N(g_relFlightBatched) + ")");
+    }
 }
 /* an adoption that is not the current offer's (design 2.5 items 4, 6): a late adopter of an open record waits for the settle (accepted then
    if nobody else adopts); after the settle it is revoked by the outcome; a repeat of the winner's own ACK is ignored */
@@ -1342,6 +2267,18 @@ static void RelLateAdopted(unsigned int uid, int from, unsigned int peer)
         RelLate l; l.slot = from; l.peer = peer; l.gen = lateGen; v.push_back(l);
         RelLog("[RELEASE] id=" + N((long long)it->first) + " uid=" + N((long long)uid) + " adopted LATE by " + SlotText(from) + " at gen " + N((long long)lateGen)
                + " (the current offer is gen " + N((long long)curGen) + ") - its REVOKE waits for the settle");
+        return;
+    }
+    for (size_t wi = 0; wi < g_relRewakeWait.size(); ++wi)
+    {   /* T-1268 fold 2: the member waits for the naming - the late adopter joins it and the wait's decision answers it */
+        RelRewakeWait& w = g_relRewakeWait[wi];
+        if (w.rm.m.uid != uid) continue;
+        int listed = 0;
+        for (size_t i = 0; i < w.late.size(); ++i) if (w.late[i].slot == from) listed = 1;
+        if (from < 0 || cooplo::RewakeLateAck(w.from, listed, from) == cooplo::kRwLateDup) { ++g_relDupAck; return; }
+        RelLate l; l.slot = from; l.peer = peer; l.gen = 0; w.late.push_back(l); ++g_relRewakeWaitLateAdded;
+        RelLog("[RELEASE] uid=" + N((long long)uid) + " adopted LATE by " + SlotText(from) + " while it waits for its area's naming - answered by the wait's decision (T-1268; rewakeWait lateAdded "
+               + N(g_relRewakeWaitLateAdded) + ")");
         return;
     }
     std::map<unsigned int, RelDone>::const_iterator d = g_relDone.find(uid);
@@ -1380,6 +2317,14 @@ void ApplyRemoteReleaseAck(const cooplo::ReleaseAckMsg& a, unsigned int fromPeer
         r.mem.erase(r.mem.begin() + k);
         int awake = 0;
         const int heldByOther = RewakeAreaHeldByOther(rm, &awake);   /* [a1b2f2-hd6] [review G1]: the sweep's own area read, as the ACK is answered */
+        if (cooplo::AdoptAfterRewakeWait(awake, heldByOther) == cooplo::kSettleWait)
+        {   /* T-1268 fold 1 (review M2): nobody holds the re-woken squad's area yet - the adoption waits for the area map that names a holder */
+            RelRewakeWait w; w.kind = 0; w.rm = rm; w.from = from; w.fromPeer = fromPeer; w.gen = g; w.settleGen = rm.baseGen + 2u + (unsigned int)r.tried.size();
+            w.seq = AreaMapApplySeqTS(); g_relRewakeWait.push_back(w); ++g_relRewakeWaitPut;
+            RelLog("[RELEASE] id=" + N((long long)r.id) + " uid=" + N((long long)rm.m.uid) + " adopted by " + SlotText(from) + " after this game's engine re-woke its squad, but nobody"
+                   " holds its area yet: WAITS for the area map that names a holder (T-1268; rewakeWait put " + N(g_relRewakeWaitPut) + ")");
+            continue;
+        }
         if (cooplo::AdoptAfterRewake(awake, heldByOther) == cooplo::kSettleRevoke)
         {   /* [a1b2f1-hd9] [review F3] / [review G1]: this game's engine re-woke the squad before the sweep met it AND this game holds its area (the
                sweep adopts the re-woken body) - the adoption is REVOKED (no winner: the old uid is run by nobody, this engine runs the person under
@@ -1496,7 +2441,12 @@ static void IdxLiveScan(double now)
 {
     for (std::map<HoKey, KeptRecent>::iterator r = g_keptRecent.begin(); r != g_keptRecent.end(); )
     {
-        if (now - r->second.at > kRelDoneKeepSec || now < r->second.at) g_keptRecent.erase(r++); else ++r;
+        if (now - r->second.at > kRelDoneKeepSec || now < r->second.at)
+        {
+            for (std::set<unsigned int>::const_iterator u = r->second.uids.begin(); u != r->second.uids.end(); ++u) g_keptHandOf.erase(*u);   /* T-1318 a5 fold 1 */
+            g_keptRecent.erase(r++);
+        }
+        else ++r;
     }
     for (std::map<HoKey, SquadIdx>::iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s) s->second.liveHere = 0;
     std::map<unsigned int, HoKey> cache;
@@ -1546,6 +2496,10 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
     const int squadInRing = (squadKnown != 0 && KeepTakeAt(sqx, sqz) == 1) ? 1 : 0;   /* this game's engine keeps the squad at its spot (live), not the once-a-second loaded list */
     cooplo::ReleaseAckMsg ack; ack.id = msg.id;
     int intents = 0, unresolved = 0; long long stale = 0;
+    const int awakeBlock = RaidAwakeBlockHas(leader); int awakeSkipped = 0;   /* T-1122 awake hand: the squad's raid came first - no carried goal issued */
+    /* T-1122 whole or none (owner 1581 a): every row judged first (no change made), then a lent squad's rows are all adopted or none */
+    std::vector<int> verdict(mm.size(), (int)cooplo::kDrop), haveRow(mm.size(), 0);
+    int nAdoptable = 0, nDropLike = 0, nDup = 0;   /* nDup (T-1122 lent flag): rows this game already runs - ACKed adopted under any judge */
     for (size_t i = 0; i < mm.size(); ++i)
     {
         const unsigned int uid = mm[i].uid;
@@ -1558,7 +2512,33 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
         /* T-650 fold 1 (manager decision on review L2): no corner refusal - takeRing reads this game's engine-loaded list, which is the
            whole answer to "can this game run it"; a corner sector it has loaded is taken like any other (no corner, keepMargin 0) */
         const int v = cooplo::AdoptDecide(have, net::IsRecordedOwner(uid, fromPeer) ? 1 : 0, mine, myGen, msg.rows[i].gen, takeRing, 0, linkUp, writesBlocked, 0);
-        if (v == cooplo::kAdopt) { TakeMemberFromPeer(mm[i], msg.rows[i].gen, &intents, &unresolved); ack.adopted.push_back(uid); ++g_relInAdopted; continue; }
+        verdict[i] = v; haveRow[i] = have;
+        if (v == cooplo::kAdopt || v == cooplo::kAdoptDup) ++nAdoptable; else if (v != cooplo::kDefer) ++nDropLike;
+        if (v == cooplo::kAdoptDup) ++nDup;
+    }
+    const int lentWhole = cooplo::ReleaseLentWhole(msg.flags);   /* T-1122 lent flag (protocol 224): the offer itself says "whole or none" */
+    const int worldWhole = cooplo::ReleaseWorldWhole(msg.flags);   /* T-1318 attempt 2 (D3, protocol 226): a world squad's offer - whole or none */
+    const int judge = cooplo::WholeJudgeOf((lentWhole != 0 ? (int)cooplo::kWholeBitLent : 0) | (worldWhole != 0 ? (int)cooplo::kWholeBitWorld : 0), awakeBlock != 0 ? 1 : 0);
+    int wholeRefused = 0;   /* T-1122 whole or none: 1 - the adoptable rows go back dropped (a row was dropped); 2 - deferred (only defers stood in the way) */
+    {
+        const int tw = raidsq::LentTakeWhole(judge != cooplo::kWjEach ? 1 : 0, nAdoptable, (int)mm.size());   /* T-1122 lent judge (flag or block) / T-1318 D3 world bit: all rows or none */
+        if (tw == raidsq::kTwAll) { if (judge == cooplo::kWjLent) RaidLentWholeNote(raidsq::kLwRelAll); else ++g_wwRelAll; }   /* the lent counters keep counting lent squads only */
+        if (tw == raidsq::kTwNone)
+        {
+            wholeRefused = nDropLike > 0 ? 1 : 2;
+            if (judge == cooplo::kWjLent) RaidLentWholeNote(raidsq::kLwRelNone); else { ++g_wwRelNone; if (leaderHere == 0) ++g_wwRelNoneLeaderless; }   /* T-1318 D3: a refused batch without its leader counted apart (read-T1318-spread risk b) */
+            RelLog("[RELEASE] <- id=" + N((long long)msg.id) + (judge == cooplo::kWjLent ? " lent squad" : " world squad") + " key=" + N((long long)leader) + (leaderHere != 0 ? std::string() : std::string(" (its leader not in the batch)")) + " worldWhole=" + N((long long)worldWhole) + " WHOLE OR NONE: " + N((long long)nAdoptable) + " of " + N((long long)mm.size())
+                   + " row(s) adoptable here (lentWhole=" + N((long long)lentWhole) + " block=" + N((long long)(awakeBlock != 0 ? 1 : 0)) + ") - NONE adopted; " + N((long long)nDup) + " already run here ACKed adopted - this game's (" + (wholeRefused == 1 ? std::string("all dropped: the giver tries the next candidate or keeps them asleep") : std::string("all deferred")) + ")"
+                   + (judge == cooplo::kWjWorld ? " (worldWhole relNone=" + N(g_wwRelNone) + " leaderless=" + N(g_wwRelNoneLeaderless) + ")" : std::string()));
+        }
+    }
+    for (size_t i = 0; i < mm.size(); ++i)
+    {
+        const unsigned int uid = mm[i].uid;
+        const int have = haveRow[i];
+        int v = verdict[i];
+        if (v == cooplo::kAdopt && wholeRefused != 0) v = wholeRefused == 1 ? (int)cooplo::kDrop : (int)cooplo::kDefer;   /* T-1122 whole or none */
+        if (v == cooplo::kAdopt) { TakeMemberFromPeer(mm[i], msg.rows[i].gen, &intents, &unresolved, awakeBlock, &awakeSkipped); ack.adopted.push_back(uid); ++g_relInAdopted; continue; }
         if (v == cooplo::kAdoptDup)
         {
             if (net::MineGenOf(uid) < msg.rows[i].gen) net::TakeLocalOwner(uid, msg.rows[i].gen);   /* a repeat (or a dual run): run at the offer's gen */
@@ -1572,7 +2552,15 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
     }
     std::vector<char> b;
     const bool sent = cooplo::ReleaseAckEncode(&b, ack) && net::SendReleaseAck(fromPeer, b);
-    RelLog("[RELEASE] <- id=" + N((long long)msg.id) + " from " + SlotText(from) + " n=" + N((long long)mm.size()) + " adopted=" + N((long long)ack.adopted.size())
+    if (!ack.adopted.empty() && wholeRefused == 0) RaidAwakeTakeNote(leader, ack.adopted.size() == mm.size() ? 1 : 0);   /* T-1122 fix A re-check fold (2): the take's fullness, block or not; review LOW-B: not under a whole refusal (no row was adopted) */
+    if (awakeBlock != 0 && !ack.adopted.empty() && wholeRefused == 0)   /* review LOW-B: a whole refusal starts no campaign here */
+    {   /* T-1122 awake hand: the squad came with its raid - the block applied to the squad adopted here (its campaign starts) */
+        int mine = 0; void* ap = HandoffMySquadApOf(leader, &mine);
+        RaidAwakeTaken(leader, ap, ack.adopted.size() == mm.size() ? 1 : 0);   /* T-1122 fix A review fold 1: every row of the offer adopted */
+        DebugLog("[XFER] <- awake raid squad key=" + N(leader) + " by RELEASE id=" + N((long long)msg.id) + " adopted=" + N((long long)ack.adopted.size()) + " - the carried order skipped for "
+                 + N((long long)awakeSkipped) + " member(s) (its raid's plan came with it; runs the key " + N((long long)mine) + ")");
+    }
+    RelLog("[RELEASE] <- id=" + N((long long)msg.id) + " from " + SlotText(from) + " n=" + N((long long)mm.size()) + " lentWhole=" + N((long long)lentWhole) + " worldWhole=" + N((long long)worldWhole) + " alreadyHere=" + N((long long)nDup) + " adopted=" + N((long long)ack.adopted.size())
            + " dropped=" + N((long long)ack.dropped.size()) + " (stale " + N(stale) + ") deferred=" + N((long long)ack.deferred.size()) + " intents=" + N((long long)intents)
            + (sent ? std::string() : std::string(" - ACK NOT SENT (no road; the giver resends)")));
 }
@@ -1592,30 +2580,59 @@ static void HandoffResends(double now, const std::map<void*, int>& gate)
             if (p.sends >= kMaxResends) { ++g_xferAbandoned; DebugLog("[XFER] ABANDONED leader=" + N(it->first) + " after " + N(p.sends) + " sends - no ACK");
                 const Pending flown(p); const unsigned int flownKey = it->first;   /* [a1b2-hd5] [a1b2-hd15]: opened AFTER the erase - an UNLOAD settled at once must not be held by this flight */
                 std::vector<unsigned int> ab; for (size_t k = 0; k < p.members.size(); ++k) ab.push_back(p.members[k].uid);
-                g_pending.erase(it++);
+                g_pending.erase(it++); ++g_hoOpenSeq;   /* T-1318 fold 2: the flight ended */
                 ReleaseOpenFromFlight(flownKey, flown, std::vector<unsigned int>(), 1);   /* design 2.5 item 1: members put away while it flew go to a release */
                 for (size_t k = 0; k < ab.size(); ++k) WorldsyncCatchupHandoverSettled(ab[k]);   /* M7a2 item 2 [m7a2-ho3]: the aborted hand-over keeps them here */
                 continue; }
             std::map<void*, int>::const_iterator g = gate.find(p.ap);
             const int seen = (g != gate.end()) ? 1 : 0;
-            if (coopsquad::ResendMayGo(1, seen, seen != 0 ? g->second : 1) != 0
-                && net::SendXfer(it->first, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot)) { ++p.sends;   /* [a1b1-hd5]: the first send's slot only */ ++g_xferResent; p.sentAt = now; }
+            const int resendGo = coopsquad::ResendMayGo(1, seen, seen != 0 ? g->second : 1);
+            /* T-1122 whole-or-none review fold MED-1 (b): a lent squad whose block does not go is not resent; counted as a send, so the flight
+               ends by its ABANDON (the squad stays here, whole) instead of waiting for ever */
+            const int lentGate = resendGo != 0 ? RaidAwakeHandSend(p.ap, 0, std::string(), it->first, p.targetSlot, p.awakeWhole) : 0;   /* T-1122 awake hand: the raid's block said again before the resend */
+            if (resendGo != 0) p.lentWhole |= raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag: the resend says "whole or none" as its first send did */
+            if (resendGo != 0 && raidsq::LentGateHolds(lentGate) != 0) { RaidLentWholeNote(raidsq::kLwSendHeld); ++p.sends; p.sentAt = now; }
+            else if (resendGo != 0
+                && net::SendXfer(it->first, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot, p.lentWhole | p.worldWhole)) { ++p.sends;   /* [a1b1-hd5]: the first send's slot only */ ++g_xferResent; p.sentAt = now; }
         }
         ++it;
     }
 }
 
+/* T-1318 attempt 4 (owner 1626, design A, site 6): an XFER's runHere from the engine's own member list (cooplo::XferRunHereOf) - the people
+   this game runs of the squad (run: the mirror's group, its corpses too) plus the list's living members outside them (never numbered, or
+   this game's not in the run - a4 fold 1 HIGH-2: another game's copies are run there, not outside); a list over 64: -1 (never whole). Not a squad (a squad of one): the group's size, as before. *outside / *known:
+   for the line. MAIN THREAD. */
+static int XferRunHereFor(bool isSquad, const SquadView& sv, const std::vector<unsigned int>& run, int* outside, int* known)
+{
+    *outside = 0; *known = -1;
+    if (!isSquad) return (int)run.size();
+    const std::set<unsigned int> inRun(run.begin(), run.end());
+    *outside = SquadUnaccountedIn(sv, &inRun, 0, known, 0);
+    return cooplo::XferRunHereOf((int)run.size(), *outside, sv.count, sv.stored);
+}
+/* the capped line of an XFER pass the engine's list held back (worldWhole6 xferUnacc / followUnacc), one per squad and road */
+static void XferUnaccLine(int follow, unsigned int key, const SquadView& sv, int built, int runHere, int outside, int known)
+{
+    if (g_unaccLines >= kUnaccLineCap || g_wwHeldLogged.size() >= 4096 || !g_wwHeldLogged.insert(std::make_pair(follow != 0 ? 5 : 4, key)).second) return;
+    ++g_unaccLines;
+    DebugLog(std::string("[XFER] ") + (follow != 0 ? "follow leader=" : "forced leader=") + N((long long)key) + " squad id='" + StoreWorldIdOf(sv.platoon) + "' NOT SENT (whole or none, T-1318 attempt 4 - the engine's member list): chars="
+             + N((long long)sv.count) + " known=" + N((long long)known) + ", " + N((long long)built) + " people could go, " + N((long long)outside) + " living member(s) outside them (never numbered, or this game's and not sent; another game's people not counted - a4 fold 1)"
+             + (runHere < 0 ? ", its list over 64" : "") + " - the squad stays here (worldWhole6 xferUnacc=" + N(g_wwXferUnacc) + " followUnacc=" + N(g_wwFollowUnacc) + "; once per squad)");
+}
 void HandoffTick()
 {
     ReleaseForgetDrain();   /* [a1b2-hd6]: a world teardown's / the other player gone request first */
     RelRevokeWaitDrain();   /* [a1b2f1-hd12] [review F4]: REVOKEs that waited for unblocked engine writes */
     ReleaseFlush(NowSec());   /* [a1b2-hd6] design 2.5 item 2: last frame's put-aways become RELEASE offers - every frame, before the 1 Hz gate */
+    PartGivenDrain();   /* T-1318 D3 fold 1 (review MEDIUM-1): the tripwire's squads noted since the last frame, judged with a fresh awake-here count */
     P119Flush();   // PROBE P119
     if (++g_tick % kTickEvery != 0) return;
     const double now = NowSec();
     /* 1. resend / abandon pending transfers: T-1 B3 fold (L3) - at the END of this pass (HandoffResends), after the announcements */
     LeadLinkEdge();   /* T-1 B1 restructure: a new link hears every announcement again */
     ReleaseTick(now);   /* [a1b2-hd7] design 2.5: every open release's next step - resend, next candidate, asleep */
+    RelHeldTick(now);   /* T-1318 attempt 3c: the held-undecided squads re-checked (gone / re-woken people, nobody awake any more) */
     IdxLiveScan(now);   /* [a1b2f1-hd6] [review F5] */
     // 2. group my owned characters by squad (T-1 B1: the verified reader - never getSquad, which can create a squad)
     const Sector mine = MyPlayerSector();
@@ -1672,6 +2689,7 @@ void HandoffTick()
         // XFER). An agreed leader neither game runs here is "leader unknown": the position rule. SquadFollowLeader's engine-only
         // fallback is gone - the announced value already names the engine's leader when the other game runs it.
         unsigned int followUid = 0;
+        coopsquad::FollowAnnounceMark annNow;   /* T-1239: both announcements of this squad as they stand this pass */
         if (isSquad)
         {
             unsigned int uids[kSquadViewCap];
@@ -1688,31 +2706,84 @@ void HandoffTick()
             const unsigned int peerLead = pe != 0 ? pe->acting : 0u;
             if (myLead != 0 && peerLead != 0 && myLead != peerLead) ++g_agreedDiffered;
             followUid = coopsquad::AgreedSquadLeader(myLead, peerLead);
+            if (pe != 0) { annNow.peerSender = pe->sender; annNow.peerSeq = pe->seq; }
+            std::map<void*, MyLead>::const_iterator ml = g_myLead.find(it->first);
+            if (ml != g_myLead.end() && ml->second.sent != 0) { annNow.myKey = ml->second.key; annNow.mySeq = ml->second.seq; }
         }
         xferGate[it->first] = coopsquad::HandoverXferMayGo(haveCats, announceCurrent);   /* T-1 B3 fold (L3) */
         const bool followMine = followUid != 0 && net::IsUidMine(followUid);
         const bool followPeer = followUid != 0 && !followMine && HasPuppet(followUid);   // the other game runs it (H1: a live puppet here)
         std::map<unsigned int, double>::const_iterator bo = g_followBackoff.find(followUid);
         const int held = (followPeer && (g_pending.find(followUid) != g_pending.end() || bo != g_followBackoff.end())) ? 1 : 0;
-        const int act = coopsquad::FollowAction((followMine || followPeer) ? 1 : 0, followMine ? 1 : 0, held);
+        int act = coopsquad::FollowAction((followMine || followPeer) ? 1 : 0, followMine ? 1 : 0, held);
+        /* T-1239 fix attempt 1: the game running that leader refused a member of this group as not in the leader's group on its engine -
+           the leader is unknown for this group (the position rule below) until either game's announcement for it changes. */
+        std::map<unsigned int, FollowGroupBlock>::iterator gb = followPeer ? g_followGroupBlock.find(followUid) : g_followGroupBlock.end();
+        if (gb != g_followGroupBlock.end())
+        {
+            int refusedHere = 0;
+            for (size_t k = 0; k < it->second.size() && refusedHere == 0; ++k) if (gb->second.members.count(it->second[k]) != 0) refusedHere = 1;
+            if (refusedHere != 0 && coopsquad::FollowAnnounceSame(gb->second.mark, annNow) == 0)
+            {
+                ++g_followUnblocked;
+                DebugLog("[XFER] follow leader=" + N(followUid) + " block LIFTED - an announcement for its group changed (other game " + N((long long)gb->second.mark.peerSeq) + " -> " + N((long long)annNow.peerSeq)
+                         + ", this game " + N((long long)gb->second.mark.mySeq) + " -> " + N((long long)annNow.mySeq) + "); follow-leader may send again (followUnblocked " + N(g_followUnblocked) + ")");
+                g_followGroupBlock.erase(gb);
+            }
+            else if (refusedHere != 0)
+            {
+                const int blocked = coopsquad::FollowActionBlocked(act, g_pending.find(followUid) == g_pending.end() ? 1 : 0);
+                if (blocked != act) { ++g_followBlockedPass; act = blocked; }
+            }
+        }
         if (act == coopsquad::kFollowWait) { ++g_waitedLeader; continue; }
         if (coopsquad::HandoverXferMayGo(haveCats, announceCurrent) == 0) continue;   /* T-1 B3 restructure (F1): the squad's cats go out before its XFER - next second */
         if (act == coopsquad::kFollowSend)
         {
             Pending p; p.reason = coopsquad::kXferReasonFollowLeader; p.sentAt = now; p.sends = 1; p.ap = it->first; p.logged = 0;
+            p.mark = annNow;   /* T-1239: a 'not in the leader's group' refusal blocks until either announcement differs from this */
             BuildMembers(it->second, &p.members);
+            const size_t followBuilt = p.members.size();
             PassHoldElsewhere(followUid, &p.members, "follow-leader");   /* M7a2 fold 3 [m7a2h-hp1] (T807 GAP 1) */
+            p.awakeWhole = p.members.size() == followBuilt ? 1 : 0;   /* T-1122 re-check fold 5: a member held back - a held raid is not sent onward */
+            const int followKept = KeptAsleepOfRun(it->second);   /* T-1318 attempt 3: people of the squad this game keeps asleep un-offered */
+            int followOutside = 0, followKnown = -1;
+            const int followRunHere = XferRunHereFor(isSquad, sv, it->second, &followOutside, &followKnown);   /* T-1318 attempt 4 (design A, site 6): the squad's living members, the engine's list */
+            const int followGo = cooplo::WorldXferGo((int)p.members.size(), followRunHere, followKept);
+            if (followGo != cooplo::kWxGo && !p.members.empty() && cooplo::WorldXferGo((int)p.members.size(), (int)it->second.size(), followKept) == cooplo::kWxGo)
+            { ++g_wwFollowUnacc; XferUnaccLine(1, followUid, sv, (int)p.members.size(), followRunHere, followOutside, followKnown); }
+            if (followGo != cooplo::kWxGo)
+            {   /* T-1318 attempt 2 fold 1 (review HIGH-1 a): the follow-leader XFER also goes whole or not at all - every person this game runs of
+                   the squad, or none this pass (counted each pass; one line per squad, review LOW-1). Attempt 3 (owner 1615 a): "whole" also
+                   counts the people of the squad kept asleep here - with any, not sent this pass */
+                if (!p.members.empty())
+                {
+                    if (followGo == cooplo::kWxKeptAsleep) ++g_wwFollowKeptAsleep; else ++g_wwFollowHeldPart;
+                    if (g_wwLines < kWwLineCap && g_wwHeldLogged.size() < 4096 && g_wwHeldLogged.insert(std::make_pair(followGo == cooplo::kWxKeptAsleep ? 3 : 1, followUid)).second)
+                    {
+                        ++g_wwLines;
+                        DebugLog("[XFER] follow leader=" + N(followUid) + " NOT SENT (whole or none, T-1318 D3): " + N((long long)p.members.size()) + " of " + N((long long)it->second.size())
+                                 + " people could go, kept asleep here " + N((long long)followKept) + " - the squad stays here (worldWhole2 followHeldPart=" + N(g_wwFollowHeldPart)
+                                 + ", worldWhole3 followKeptAsleep=" + N(g_wwFollowKeptAsleep) + "; once per squad)");
+                    }
+                }
+                continue;
+            }
+            p.worldWhole = cooplo::kWholeBitWorld;   /* T-1318 attempt 2 fold 1: "world squad - whole or none" on the follow-leader XFER too, kept over its resends */
             PendingKeysRead(&p);   /* [a1b2-hd8]: each member's squad key while whole - the ACK's index entry */
             if (coopsquad::PassSendAfterHold((int)p.members.size()) != coopsquad::kPassSendGo) continue;
             p.targetSlot = net::OwnerSlotOf(followUid);   /* M7a A1 build 1 [a1b1-hd6]: the game that runs the leader */
-            if (!net::SendXfer(followUid, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot)) continue;
+            const int lentGate = RaidAwakeHandSend(it->first, 0, std::string(), followUid, p.targetSlot, p.awakeWhole);   /* T-1122 awake hand: the raid's block first, on the same road */
+            if (raidsq::LentGateHolds(lentGate) != 0) { RaidLentWholeNote(raidsq::kLwSendHeld); continue; }   /* T-1122 whole or none: a lent squad not sent */
+            p.lentWhole = raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag (protocol 224) */
+            if (!net::SendXfer(followUid, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot, p.lentWhole | p.worldWhole)) continue;
             ++g_xferOut; ++g_followedLeader; g_xferFollowSent += (long long)p.members.size();
             p.logged = FollowLogChanged(0, followUid, (long long)p.members.size()) ? 1 : 0;
             g_pending[followUid] = p;
             if (p.logged != 0)
             {
                 const std::string q(1, (char)34);
-                DebugLog("[XFER] -> squad leader=" + N(followUid) + " members=" + N((long long)p.members.size()) + " reason=follow-leader");
+                DebugLog("[XFER] -> squad leader=" + N(followUid) + " members=" + N((long long)p.members.size()) + " reason=follow-leader lentWhole=" + N((long long)p.lentWhole) + " worldWhole=" + N((long long)(p.worldWhole != 0 ? 1 : 0)));
                 SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(followUid) + "," + q + "members" + q + ":" + N((long long)p.members.size())
                          + "," + q + "forced" + q + ":0," + q + "reason" + q + ":" + q + "follow-leader" + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
             }
@@ -1776,26 +2847,60 @@ void HandoffTick()
         }
         Pending p; p.reason = coopsquad::kXferReasonForced; p.sentAt = now; p.sends = 1; p.ap = it->first; p.logged = 1;
         BuildMembers(it->second, &p.members);
+        const size_t forcedBuilt = p.members.size();
         PassHoldElsewhere(key, &p.members, "forced");   /* M7a2 fold 3 [m7a2h-hp2] (T807 GAP 1) */
+        p.awakeWhole = p.members.size() == forcedBuilt ? 1 : 0;   /* T-1122 re-check fold 5 */
+        const int forcedKept = KeptAsleepOfRun(it->second);   /* T-1318 attempt 3: people of the squad this game keeps asleep un-offered */
+        int forcedOutside = 0, forcedKnown = -1;
+        const int forcedRunHere = XferRunHereFor(isSquad, sv, it->second, &forcedOutside, &forcedKnown);   /* T-1318 attempt 4 (design A, site 6): the squad's living members, the engine's list */
+        const int forcedGo = cooplo::WorldXferGo((int)p.members.size(), forcedRunHere, forcedKept);
+        if (forcedGo != cooplo::kWxGo && !p.members.empty() && cooplo::WorldXferGo((int)p.members.size(), (int)it->second.size(), forcedKept) == cooplo::kWxGo)
+        { ++g_wwXferUnacc; XferUnaccLine(0, key, sv, (int)p.members.size(), forcedRunHere, forcedOutside, forcedKnown); }
+        if (forcedGo != cooplo::kWxGo)
+        {   /* T-1318 attempt 2 (D3): a world squad goes whole or not at all - a member held back (or over the 64 cap): not sent this pass; the
+               squad stays here, and its engine's put-away offers it whole (RELEASE) or a later pass sends it whole. Attempt 3 (owner 1615 a;
+               T2324 Traders Guild_1: 7 awake sent as "whole" while 5 were kept asleep here): "whole" also counts the people of the squad kept
+               asleep here - with any, not sent this pass */
+            if (!p.members.empty()) { if (forcedGo == cooplo::kWxKeptAsleep) ++g_wwXferKeptAsleep; else ++g_wwXferHeldPart; }   /* each pass */
+            if (!p.members.empty() && g_wwLines < kWwLineCap && g_wwHeldLogged.size() < 4096 && g_wwHeldLogged.insert(std::make_pair(forcedGo == cooplo::kWxKeptAsleep ? 2 : 0, key)).second)   /* fold 1 (review LOW-1): one line per squad */
+            {
+                ++g_wwLines;
+                DebugLog("[XFER] forced leader=" + N(key) + " NOT SENT (whole or none, T-1318 D3): " + N((long long)p.members.size()) + " of " + N((long long)it->second.size())
+                         + " people could go, kept asleep here " + N((long long)forcedKept) + " - the squad stays here (worldWhole xferHeldPart=" + N(g_wwXferHeldPart)
+                         + ", worldWhole3 xferKeptAsleep=" + N(g_wwXferKeptAsleep) + "; once per squad)");
+            }
+            continue;
+        }
+        p.worldWhole = cooplo::kWholeBitWorld;   /* T-1318 attempt 2 (D3, protocol 226): "world squad - whole or none" on the wire, kept over its resends */
         PendingKeysRead(&p);   /* [a1b2-hd8] */
         if (coopsquad::PassSendAfterHold((int)p.members.size()) != coopsquad::kPassSendGo) continue;
         p.targetSlot = target;   /* the first game with the area loaded (the holder first) */
-        if (!net::SendXfer(key, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot)) continue;
+        const int lentGate = RaidAwakeHandSend(it->first, 0, std::string(), key, p.targetSlot, p.awakeWhole);   /* T-1122 awake hand: the raid's block first, on the same road */
+        if (raidsq::LentGateHolds(lentGate) != 0) { RaidLentWholeNote(raidsq::kLwSendHeld); continue; }   /* T-1122 whole or none: a lent squad not sent */
+        p.lentWhole = raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag (protocol 224) */
+        if (!net::SendXfer(key, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot, p.lentWhole | p.worldWhole)) continue;
         ++g_xferOut; ++g_holderLeave; if (listedHere != 0) ++g_keepForcedListed;
         g_pending[key] = p;
         { ForcedTry f; f.target = target; f.x = s.x; f.y = s.y; f.refused = 0; g_forcedTry[key] = f; }   /* its ACK says whether to back off */
         const std::string q(1, (char)34);
-        DebugLog("[XFER] -> squad leader=" + N(key) + " members=" + N((long long)p.members.size()) + " sector=" + SectorString(s) + " (my player sector " + SectorString(mine) + ") " + reason + " to slot " + N((long long)target) + " keepHere=0 listed=" + N((long long)listedHere));
+        DebugLog("[XFER] -> squad leader=" + N(key) + " members=" + N((long long)p.members.size()) + " sector=" + SectorString(s) + " (my player sector " + SectorString(mine) + ") " + reason + " to slot " + N((long long)target) + " keepHere=0 listed=" + N((long long)listedHere) + " lentWhole=" + N((long long)p.lentWhole) + " worldWhole=" + N((long long)(p.worldWhole != 0 ? 1 : 0)));
         SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(key) + "," + q + "members" + q + ":" + N((long long)p.members.size())
                  + "," + q + "sector" + q + ":" + q + SectorString(s) + q + "," + q + "forced" + q + ":" + (forced ? "1" : "0") + "," + q + "reason" + q + ":" + q + reason + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
+    }
+    for (std::map<unsigned int, FollowGroupBlock>::iterator gb = g_followGroupBlock.begin(); gb != g_followGroupBlock.end(); )   /* T-1239: none of its members run here any more */
+    {
+        int anyMine = 0;
+        for (std::set<unsigned int>::const_iterator u = gb->second.members.begin(); u != gb->second.members.end() && anyMine == 0; ++u) if (net::IsUidMine(*u)) anyMine = 1;
+        if (anyMine == 0) g_followGroupBlock.erase(gb++); else ++gb;
     }
     LeadDropUnseen(leadSeen, &leadSends);   /* squads this game no longer runs any member of: n = 0, the other game forgets them */
     HandoffResends(now, xferGate);          /* T-1 B3 fold (L3): after this pass's announcements */
 }
 
-void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMember* m, int count, unsigned int fromPeer, const unsigned int* gens)
+void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMember* m, int count, unsigned int fromPeer, const unsigned int* gens, int wholeBits)
 {
     ++g_xferIn;
+    const int lentWhole = (wholeBits & cooplo::kWholeBitLent) != 0 ? 1 : 0, worldWhole = (wholeBits & cooplo::kWholeBitWorld) != 0 ? 1 : 0;   /* T-1122 lent flag; T-1318 attempt 2 (D3, protocol 226): the world bit */
     /* T-1 B1 restructure (point 4): CROSSING follow transfers. A follow-leader XFER arriving while my own follow-leader XFER for the
        SAME squad (my squad holds its leader or one of its members) still waits for its ACK: coopsquad::CrossingTakeIncoming - the
        transfer whose destination runs the lower leader uid proceeds; the other game evaluates the same test with the keys swapped,
@@ -1832,6 +2937,8 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
     }
     int taken = 0, intents = 0, unresolved = 0, unknown = 0;
     std::vector<unsigned int> takenUids;   // F447: the ACK names exactly these
+    std::vector<int> takeIdx;   /* T-1122 whole or none (owner 1581 a): the members this game can take, taken after the whole squad is judged */
+    const int awakeBlock = RaidAwakeBlockHas(leader); int awakeSkipped = 0;   /* T-1122 awake hand: the squad's raid came first - no carried goal issued */
     // T-1 B1 (F448 corrected): the engine sleeps a squad WHOLE by its squad position, and a member outside the loaded area
     // whose leader is inside stays live. So when this game runs the leader, or takes it in this message, the SQUAD position
     // (this game's copy squad's +0xB4, else the leader's own position in the message) is checked against my ring for every
@@ -1849,10 +2956,29 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
     const int squadInRing = (squadKnown != 0 && KeepTakeAt(sqx, sqz) == 1) ? 1 : 0;   /* this game's engine keeps the squad at its spot (live), not the once-a-second loaded list */
     const bool isFollow = reason == (unsigned int)coopsquad::kXferReasonFollowLeader;
     const bool logIn = !isFollow || FollowLogChanged(2, leader, (long long)count * 8 + leaderHere * 4 + squadKnown * 2 + squadInRing);   // review M1
+    /* T-1239 fix attempt 1: a follow-leader member is taken only when this game's own copy of it stands in the named leader's group on
+       this game's engine (read live here, at the take); otherwise refused as 'not in the leader's group here' - the ACK names it so
+       (its tail), and the sender goes by position until an announcement for the group changes. */
+    void* leaderGroupHere = 0;
+    if (isFollow) { ::Character* lg = FindSpawned(leader); if (Plaus(lg)) leaderGroupHere = SquadActivePlatoonOf(lg); }
+    std::vector<unsigned int> notInGroup;
     for (int i = 0; i < count; ++i)
     {
         ::Character* c = FindSpawned(m[i].uid);
         if (!Plaus(c)) { ++unknown; ++g_xferInUnknownUid; if (logIn) DebugLog("[XFER] member uid=" + N(m[i].uid) + " has no copy here - NOT taken (the sender keeps it)"); continue; }   /* M7a3f6 [m7a3f6-hb1] M7a3f7: no void here - an offer (even a forced one: the ordinary position hand-over is sent forced too, H1) says nothing of whether the sender still runs the person; only its RELEASE does (A1 build 2) */
+        if (isFollow && !net::IsUidMine(m[i].uid))   /* already ours (a resend after our ACK was lost): never refused here */
+        {
+            void* const memberGroupHere = SquadActivePlatoonOf(c);
+            if (coopsquad::FollowMemberInLeaderGroup(leaderGroupHere, memberGroupHere) == 0)
+            {
+                ++unknown; ++g_followNotInGroup; notInGroup.push_back(m[i].uid);
+                DebugLog("[XFER] member uid=" + N(m[i].uid) + " - this game's copy is not in leader " + N(leader) + "'s group here ("
+                         + (leaderGroupHere == 0 ? std::string("the leader has no group here") : std::string(memberGroupHere == 0 ? "the copy has no group" : "the copy is in another group"))
+                         + ") - NOT taken: not in the leader's group here (followNotInGroup " + N(g_followNotInGroup) + ")");
+                continue;
+            }
+        }
+        if (net::IsUidMine(m[i].uid)) { ++taken; takenUids.push_back(m[i].uid); continue; }   // duplicate XFER (resend after our ACK was lost): already ours - read before the keep test (T-1122 review item 4: named even where this game's engine would no longer keep it)
         const int memberInRing = KeepTakeAt(m[i].x, m[i].z) == 1 ? 1 : 0;   /* the live keep read */
         if (coopsquad::XferTakeMember(leaderHere, squadKnown, squadInRing, memberInRing) == 0)
         {
@@ -1864,23 +2990,50 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
                 DebugLog("[XFER] member uid=" + N(m[i].uid) + " stands in " + SectorString(SectorOf(m[i].x, m[i].z)) + ", at a spot this game's engine would not keep - NOT taken (my engine would unload it)");
             continue;
         }
-        if (net::IsUidMine(m[i].uid)) { ++taken; takenUids.push_back(m[i].uid); continue; }   // duplicate XFER (resend after our ACK was lost): already ours
+        takeIdx.push_back(i);   /* T-1122 whole or none: taken below, once the whole squad is judged */
+    }
+    const int alreadyHere = taken;   /* T-1122 lent flag: members this game already runs - this game's, named in the ACK under any judge (LOW-2 reverted) */
+    int tw = raidsq::kTwEach;   /* T-1122 review LOW-B: the judge, kept for the take note and the block below */
+    {   /* T-1122 whole or none (owner 1581 a, run T2274; raidsquad.h's section): a hand-over carrying the squad's raid block is a lent squad's -
+           all of its people are taken here or none; none: the ACK names none, the sender keeps the whole squad and backs off */
+        const int judge = cooplo::WholeJudgeOf(wholeBits, awakeBlock != 0 ? 1 : 0);   /* T-1318 D3: lent (T-1122, its counters), else world (the bit every XFER carries - forced, and follow-leader since fold 1 (review HIGH-1 a): a T-1239 'not in the leader's group' or 'no copy here' row then refuses the WHOLE message, not one row) */
+        tw = raidsq::LentTakeWhole(judge != cooplo::kWjEach ? 1 : 0, taken + (int)takeIdx.size(), count);   /* T-1122 lent flag (with or without the block) / T-1318 D3 world bit */
+        if (tw == raidsq::kTwAll) { if (judge == cooplo::kWjLent) RaidLentWholeNote(raidsq::kLwXferAll); else ++g_wwXferAll; }
+        if (tw == raidsq::kTwNone)
+        {
+            if (judge == cooplo::kWjLent) RaidLentWholeNote(raidsq::kLwXferNone); else { ++g_wwXferNone; if (leaderHere == 0) ++g_wwXferNoneLeaderless; }   /* T-1318 D3: a refused batch without its leader counted apart */
+            if (logIn) DebugLog("[XFER] " + std::string(judge == cooplo::kWjLent ? "lent" : "world") + " squad leader=" + N(leader) + (leaderHere != 0 ? std::string() : std::string(" (its leader not in the message)")) + " worldWhole=" + N((long long)worldWhole) + " lentWhole=" + N((long long)lentWhole) + " block=" + N((long long)(awakeBlock != 0 ? 1 : 0)) + " WHOLE OR NONE: " + N((long long)(taken + (int)takeIdx.size())) + " of " + N(count) + " member(s) can be taken here - NONE taken"
+                     + " (the sender keeps the whole squad with its raid; " + N((long long)takeIdx.size()) + " take(s) not made; " + N((long long)alreadyHere) + " already run here - named in the ACK, this game's)");
+            takeIdx.clear();
+        }
+    }
+    for (size_t t = 0; t < takeIdx.size(); ++t)
+    {
+        const int i = takeIdx[t];
         takenUids.push_back(m[i].uid);
-        TakeMemberFromPeer(m[i], net::GenForTake(m[i].uid, gens != 0 ? gens[i] : 0u), &intents, &unresolved);   /* [a1b2-hd4] design 2.5 item 3: the take path shared with RELEASE (the giver's gen + 1, or above this game's copy record) */
+        TakeMemberFromPeer(m[i], net::GenForTake(m[i].uid, gens != 0 ? gens[i] : 0u), &intents, &unresolved, awakeBlock, &awakeSkipped);   /* [a1b2-hd4] design 2.5 item 3: the take path shared with RELEASE (the giver's gen + 1, or above this game's copy record) */
         ++taken;
         if (reason == (unsigned int)coopsquad::kXferReasonFollowLeader) ++g_xferFollowTaken;
     }
-    if (net::SendXferAck(leader, takenUids.empty() ? 0 : &takenUids[0], (int)takenUids.size(), fromPeer)) ++g_ackOut;
+    if (net::SendXferAck(leader, takenUids.empty() ? 0 : &takenUids[0], (int)takenUids.size(), fromPeer, notInGroup.empty() ? 0 : &notInGroup[0], (int)notInGroup.size())) ++g_ackOut;
+    if (taken > 0 && tw != raidsq::kTwNone) RaidAwakeTakeNote(leader, taken == count ? 1 : 0);   /* T-1122 fix A re-check fold (2): the take's fullness, block or not; review LOW-B: not under a whole refusal (no take was made) */
+    if (awakeBlock != 0 && taken > 0 && tw != raidsq::kTwNone)   /* review LOW-B: a whole refusal starts no campaign here */
+    {   /* T-1122 awake hand: the squad came with its raid - the block applied to the squad taken here (its campaign starts) */
+        int mine = 0; void* ap = HandoffMySquadApOf(leader, &mine);
+        RaidAwakeTaken(leader, ap, taken == count ? 1 : 0);   /* T-1122 fix A review fold 1: every member the message named taken here */
+        DebugLog("[XFER] <- awake raid squad leader=" + N(leader) + " taken=" + N(taken) + " - the carried order skipped for " + N((long long)awakeSkipped)
+                 + " member(s) (its raid's plan came with it; runs the leader " + N((long long)mine) + ")");
+    }
     if (isFollow && taken > 0) FollowLogReset(2, leader);   // settled: the next refusal logs again
     if (!logIn && taken == 0) return;
     const std::string q(1, (char)34);
-    DebugLog("[XFER] <- squad leader=" + N(leader) + " members=" + N(count) + " taken=" + N(taken) + " intents=" + N(intents) + " unresolvedSubjects=" + N(unresolved) + " unknown=" + N(unknown) + (reason == (unsigned int)coopsquad::kXferReasonForced ? std::string(" FORCED") : (reason == (unsigned int)coopsquad::kXferReasonNone ? std::string() : " reason=" + std::string(coopsquad::XferReasonName(reason)))));
+    DebugLog("[XFER] <- squad leader=" + N(leader) + " members=" + N(count) + " taken=" + N(taken) + " intents=" + N(intents) + " unresolvedSubjects=" + N(unresolved) + " unknown=" + N(unknown) + " lentWhole=" + N((long long)lentWhole) + " alreadyHere=" + N((long long)alreadyHere) + " worldWhole=" + N((long long)worldWhole) + (reason == (unsigned int)coopsquad::kXferReasonForced ? std::string(" FORCED") : (reason == (unsigned int)coopsquad::kXferReasonNone ? std::string() : " reason=" + std::string(coopsquad::XferReasonName(reason)))));
     SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_in" + q + "," + q + "leader" + q + ":" + N(leader) + "," + q + "members" + q + ":" + N(count) + "," + q + "taken" + q + ":" + N(taken)
              + "," + q + "intents" + q + ":" + N(intents) + "," + q + "unresolved" + q + ":" + N(unresolved) + "," + q + "unknown" + q + ":" + N(unknown) + ",\"tick\":" + N(g_tick) + "}");
 }
 
 static long long g_ackNotMine = 0;   /* fold 1 [a1b1f1-hd3] [F7]: members an ACK named that this game no longer runs (a dual run's yield released them) */
-void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int fromPeer)
+void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int count, unsigned int fromPeer, const unsigned int* notInGroup, int notInGroupCount)
 {
     ++g_ackIn;
     ReleaseForgetDrain();
@@ -1896,6 +3049,8 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
     }
     long long released = 0, kept = 0;
     const bool isFollow = p.reason == (unsigned int)coopsquad::kXferReasonFollowLeader;
+    std::set<unsigned int> refusedOutOfGroup;   /* T-1239 */
+    std::map<std::string, std::pair<long long, long long> > hoSquads;   /* T-850 (T2230): each squad this ACK names people of -> (released, kept): the writer re-check below */
     const bool logAck = !isFollow || p.logged != 0;   /* N5: an ACK line is written exactly when its send's xfer_out line was - the two stay paired */
     for (size_t k = 0; k < p.members.size(); ++k)
     {
@@ -1905,7 +3060,16 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
         // until the squad's sector or its receiver changes (g_forcedTry); a follow-leader one waits kFollowBackoffSec.
         bool taken = false;
         for (int i = 0; i < count; ++i) if (takenUids[i] == uid) { taken = true; break; }
-        if (!taken) { WorldsyncCatchupHandoverSettled(uid); /* M7a2 item 2 [m7a2-ho1]: still ours - a catch-up that held it back is answered */ ++kept; ++g_keptUntaken; if (logAck) DebugLog("[XFER] member uid=" + N(uid) + " NOT taken by the receiver (no copy there) - still ours"); continue; }
+        if (!taken)
+        {
+            WorldsyncCatchupHandoverSettled(uid); /* M7a2 item 2 [m7a2-ho1]: still ours - a catch-up that held it back is answered */ ++kept; ++g_keptUntaken;
+            { const std::string hk = HoSquadIdOf(uid, FindSpawned(uid), p); if (!hk.empty()) ++hoSquads[hk].second; }   /* T-850: kept here - its squad is not released by record */
+            bool outOfGroup = false;   /* T-1239: the ACK's tail - refused as not in the leader's group on the receiver */
+            for (int j = 0; isFollow && j < notInGroupCount; ++j) if (notInGroup[j] == uid) { outOfGroup = true; break; }
+            if (outOfGroup) { refusedOutOfGroup.insert(uid); DebugLog("[XFER] member uid=" + N(uid) + " NOT taken by the receiver: not in the leader's group there - still ours"); }
+            else if (logAck) DebugLog("[XFER] member uid=" + N(uid) + " NOT taken by the receiver (no copy there, or its engine would not keep it there) - still ours");
+            continue;
+        }
         if (!net::IsUidMine(uid))   /* [a1b1f1-hd3] [F7]: already released (a dual run's yield) - never released again with gen 0 */
         {
             WorldsyncCatchupHandoverSettled(uid); ++g_ackNotMine;
@@ -1918,6 +3082,7 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
         WorldsyncCatchupHandoverSettled(uid);   /* M7a2 item 2 [m7a2-ho2]: BEFORE the release - a held-back asker gets its state from the owner of the moment, then OWNER_MOVED */
         ::Character* rel = FindSpawned(uid);
         IdxGiveAtAck(uid, rel, p, fromPeer);   /* [a1b2-hd10] design 2.3: the index's given - the squad key from the body, else as read at the send */
+        { const std::string hk = HoSquadIdOf(uid, rel, p); if (!hk.empty()) ++hoSquads[hk].first; }   /* T-850 (T2230): this person's squad - read before the release, as the probe below reads it */
         SquadCatsFinalBeforeRelease(uid);        /* T-1 B3 fold (M3): the round trip's own change, announced before the release */
         net::ReleaseLocalOwner(uid, fromPeer);   // the streams stop here (IsUidMine false)
         SquadCatsReleased(uid);                  /* T-1 B3 fold (L4): no stale carries-cats record */
@@ -1926,6 +3091,13 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
         ++g_released; ++released;
     }
     if (kept > 0 && p.reason == (unsigned int)coopsquad::kXferReasonFollowLeader) g_followBackoff[leader] = NowSec() + kFollowBackoffSec;   // T-1 B1
+    if (!refusedOutOfGroup.empty())   /* T-1239 fix attempt 1: the leader is unknown for this group until an announcement for it changes */
+    {
+        FollowGroupBlock& b = g_followGroupBlock[leader];
+        b.members.insert(refusedOutOfGroup.begin(), refusedOutOfGroup.end()); b.mark = p.mark; ++g_followBlockSet;
+        DebugLog("[XFER] follow leader=" + N(leader) + " refused " + N((long long)refusedOutOfGroup.size()) + " member(s) as not in its group on the receiver - BLOCKED: the group goes by position"
+                 " (keep check, area hand-over) and is not sent by follow-leader again until either game's announcement for it changes (followBlockSet " + N(g_followBlockSet) + ")");
+    }
     if (p.reason == (unsigned int)coopsquad::kXferReasonForced)   /* T-650 fold 1 (review MED-1): a refused forced hand-over backs off */
     {
         std::map<unsigned int, ForcedTry>::iterator ftry = g_forcedTry.find(leader);
@@ -1949,8 +3121,12 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
         DebugLog("[XFER] ACK leader=" + N(leader) + " released=" + N(released) + " kept=" + N(kept) + " after " + N(p.sends) + " send(s)");
         SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_ack" + q + "," + q + "leader" + q + ":" + N(leader) + "," + q + "released" + q + ":" + N(released) + "," + q + "kept" + q + ":" + N(kept) + "," + q + "sends" + q + ":" + N(p.sends) + ",\"tick\":" + N(g_tick) + "}");
     }
+    /* T-850 (T2230): the hand-over sends no SQUAD_RELEASE, and the world server moves a squad's writer only on one - each squad whose people
+       this ACK passed gets the heartbeat's writer re-check now (store.cpp StoreHandOverJudge), so its release goes out. MAIN THREAD. */
+    for (std::map<std::string, std::pair<long long, long long> >::const_iterator hs = hoSquads.begin(); hs != hoSquads.end(); ++hs)
+        if (hs->second.first > 0) coop::StoreHandOverJudge(hs->first, p.targetSlot, hs->second.first, hs->second.second);
     const Pending flown(p);
-    g_pending.erase(it);
+    g_pending.erase(it); ++g_hoOpenSeq;   /* T-1318 fold 2: the flight ended (its ACK) */
     { const std::vector<unsigned int> tk(takenUids, takenUids + count); ReleaseOpenFromFlight(leader, flown, tk, 0); }   /* [a1b2-hd11] design 2.5 item 1: a member not taken whose body was put away while it flew goes to a release - after the erase, so an UNLOAD settled at once is not held by this flight */
 }
 
@@ -2126,29 +3302,85 @@ void ReleaseOnPutAway(unsigned int uid, const void* obj, int objWhole)
     if (player != 0) { if (player == 1) ++g_relSkipPlayer; else { ++g_relSkipUnread; IdxKeep(uid, 0); } return; }
     if (coopsquad::AnnouncedToOthers(AnnouncedState(uid)) == 0) { ++g_relSkipNotAnnounced; IdxKeep(uid, c); return; }
     RelMember rm; rm.m.uid = uid; rm.baseGen = net::MineGenOf(uid);
-    { void* f = 0; std::string id; if (SquadKeyOf(c, &f, &id)) { rm.key = HoKey(f, id); rm.hasKey = 1; } }   /* read once, while the body is whole (design 2.1) */
-    if (!ReadPos(c, &rm.m.x, &rm.m.y, &rm.m.z) || PutAwayFacingIntentPod(c, &rm.m) != 1) { ++g_relSkipUnread; IdxKeepKey(uid, rm.key, rm.hasKey); return; }
-    if (rm.hasKey == 0) { ++g_relSkipNoKey; IdxKeepKey(uid, rm.key, 0); return; }   /* [a1b2f1-hd15] [review F3]: no squad key - never offered (a re-wake could not cancel it); its UNLOAD goes as before */
+    { void* f = 0; std::string id; if (SquadKeyOf(c, &f, &id)) { rm.key = HoKey(f, id); rm.hasKey = 1; } }
+    { ObjId oid; if (CaptureObjId(c, &oid)) rm.hand = cooplo::HandKey(oid.serial, oid.type); }   /* T-1046 fold 2: the hand its sleeping record will carry */   /* read once, while the body is whole (design 2.1) */
+    if (!ReadPos(c, &rm.m.x, &rm.m.y, &rm.m.z) || PutAwayFacingIntentPod(c, &rm.m) != 1) { ++g_relSkipUnread; IdxKeepKey(uid, rm.key, rm.hasKey, rm.hand); return; }
+    if (rm.hasKey == 0) { ++g_relSkipNoKey; IdxKeepKey(uid, rm.key, 0, rm.hand); return; }   /* [a1b2f1-hd15] [review F3]: no squad key - never offered (a re-wake could not cancel it); its UNLOAD goes as before */
     SquadView sv; void* ap = 0; unsigned int leaderUid = 0; float dx = rm.m.x, dz = rm.m.z;
+    std::set<const void*> unaccSeen; int over64 = 0, listChars = -1, listKnown = -1; std::set<std::string> deadSeen, otherSeen; std::map<std::string, unsigned int> otherUidSeen;
     if (ReadSquadOf(c, &sv) == 1)
     {
         ap = sv.ap;
         if (Plaus(sv.leader)) leaderUid = FindSpawnedUidForDestroy(sv.leader);
         if (sv.posUsable != 0) { dx = sv.x; dz = sv.z; }   /* the squad decision position - the engine sleeps the squad by it */
+        /* T-1318 attempt 4 (owner 1626, design A, site 2): the engine's own member list at the put-away - its living members other than this
+           person with no uid of this game's (never numbered, or another game's copy) are unaccounted; a list over 64 is never whole */
+        SquadUnaccountedIn(sv, 0, (const void*)c, &listKnown, &unaccSeen, &deadSeen, &otherSeen, &otherUidSeen);   /* a4 fold 1: corpses' / another game's hands; attempt 5 (D1-R3): with their owner slots */
+        for (std::map<std::string, unsigned int>::const_iterator o = otherUidSeen.begin(); o != otherUidSeen.end(); ++o) OtherHandNote(rm.key, o->first, o->second);
+        listChars = sv.count;
+        if (sv.count > kSquadViewCap || sv.stored < sv.count) over64 = 1;
     }
     if (ap == 0) ap = (void*)c;
     RelBatch& b = g_relBatch[ap];
     if (b.mem.empty()) { b.keyUid = (leaderUid != 0 && net::IsUidMine(leaderUid)) ? leaderUid : uid; b.sector = SectorOf(dx, dz); b.px = dx; b.pz = dz; }
     b.mem.push_back(rm);
+    b.unaccAwake.insert(unaccSeen.begin(), unaccSeen.end());
+    b.handsAcc.insert(deadSeen.begin(), deadSeen.end()); b.handsAcc.insert(otherSeen.begin(), otherSeen.end());   /* T-1318 a4 fold 1 (HIGH-1 / MEDIUM-1) */
+    if (b.ap == 0 && ap != (void*)c) b.ap = ap;   /* T-1318 a4 fold 1 (LOW-1): the engine squad, only when its list read */
+    if (!deadSeen.empty() && (g_deadHandsOf.count(rm.key) != 0 || g_deadHandsOf.size() < kDeadHandsSquadCap))
+    {   /* T-1318 a4 fold 1 (MEDIUM-1): the squad's corpses - neither given nor kept by its sleeping records later */
+        std::set<std::string>& dh = g_deadHandsOf[rm.key];
+        for (std::set<std::string>::const_iterator d = deadSeen.begin(); d != deadSeen.end() && dh.size() < kDeadHandsPerSquadCap; ++d) dh.insert(*d);
+    }
+    if (over64 != 0) b.over64 = 1;
+    if (listChars >= 0 && listChars > b.chars) { b.chars = listChars; b.known = listKnown + 1; }   /* + this person (numbered) */
+}
+/* T-1318 attempt 5 (D1-R1): the capped line for kept people a re-wake left kept - not in the woken squad's engine list (counted keptStay) */
+/* a5 fold 1 (review LOW): the people of squad k kept here with no recorded hand - ghosts no re-wake can show re-made */
+static long long KeptGhostOf(const HoKey& k)
+{
+    std::set<unsigned int> u;
+    const std::map<HoKey, KeptRecent>::const_iterator kr = g_keptRecent.find(k);
+    if (kr != g_keptRecent.end()) u.insert(kr->second.uids.begin(), kr->second.uids.end());
+    const std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(k);
+    if (s != g_squadIdx.end()) { u.insert(s->second.keptHere.begin(), s->second.keptHere.end()); u.insert(s->second.asleepHere.begin(), s->second.asleepHere.end()); }
+    long long n = 0;
+    for (std::set<unsigned int>::const_iterator i = u.begin(); i != u.end(); ++i)
+    {
+        const std::map<unsigned int, std::string>::const_iterator h = g_keptHandOf.find(*i);
+        if (h == g_keptHandOf.end() || h->second.empty()) ++n;
+    }
+    return n;
+}
+/* a5 fold 1 (review LOW): counted and logged once per squad per wake (wakeAp: the woken squad; the sweep meets every re-made body) */
+static void KeptStayLine(const HoKey& k, const void* wakeAp, const std::string& id, long long stay, long long remade, long long listed)
+{
+    if (stay <= 0) { g_keptStayAp.erase(k); return; }
+    const std::map<HoKey, const void*>::const_iterator seen = g_keptStayAp.find(k);
+    if (seen != g_keptStayAp.end() && seen->second == wakeAp) return;
+    if (g_keptStayAp.size() >= 4096) g_keptStayAp.clear();
+    g_keptStayAp[k] = wakeAp;
+    const long long ghost = KeptGhostOf(k);
+    ++g_wwKeptStay; g_wwKeptGhost += ghost;
+    if (g_wwKeptStayLines >= 40) return;
+    ++g_wwKeptStayLines;
+    RelLog("[RELEASE] squad id='" + id + "' re-woken here: kept " + N(stay) + " stay - not re-made by the engine's list (" + N(ghost) + " of them with no hand recorded; " + N(remade) + " re-made, " + N(listed)
+           + " living listed; T-1318 attempt 5; worldWhole8 keptStay " + N(g_wwKeptStay) + ", keptGhost " + N(g_wwKeptGhost) + ", keptRemade " + N(g_wwKeptRemade) + "; one per squad per wake, the first 40)");
 }
 /* the sweep met a rebuilt person of squad (faction, id) - this game's engine re-created it from its own world data: the squad's asleepHere
    people are live here again (they leave the index), and an OPEN release of its people is CANCELLED (design 2.5 item 7: the engine runs
    them again under fresh uids - un-adopted members settle asleep-superseded, their UNLOAD goes, a late adopter is revoked). */
-void HandedOverLeftBehindRebuilt(void* faction, const std::string& id)
+/* T-1318 a4 fold 1 (review LOW-1): personAp - the met person's awake engine squad; the same squad its held put-aways came from (never
+   slept: cooplo::RebuiltIsRewake 0) is no re-wake - nothing changes (counted worldWhole6 rebuiltSameSquad). */
+void HandedOverLeftBehindRebuilt(void* faction, const std::string& id, const void* personAp)
 {
     ReleaseForgetDrain();
     RelWalk walk;   /* [a1b2f1-hd10] [review F1]: its own walk of g_release and the index entry below */
     const HoKey k(faction, id);
+    {
+        const std::map<HoKey, RelHeld>::const_iterator sh = g_relHeldSq.find(k);
+        if (sh != g_relHeldSq.end() && cooplo::RebuiltIsRewake(sh->second.b.ap, personAp) == 0) { ++g_wwRebuiltSameSquad; return; }
+    }
     long long cancelledNow = 0;
     for (std::map<unsigned int, ReleaseRec>::iterator r = g_release.begin(); r != g_release.end(); )
     {
@@ -2166,25 +3398,89 @@ void HandedOverLeftBehindRebuilt(void* faction, const std::string& id)
         if (!ended) part.nAdopted = part.nAsleep = part.nCancelled = part.nMoved = 0;
         cancelledNow += RelSettleAll(part, 1, ended ? std::string("CANCELLED - this game's engine re-woke the squad (fresh uids)") : std::string("CANCELLED in part - this game's engine re-woke the squad; the rest stay offered"), ended ? 1 : 0);
     }
-    /* [a1b2f1-hd17] [review F2]: a person of the squad only in this game's world data (asleep, kept, or just cancelled) -> the WHOLE entry goes
-       (given too, as the retired unmark did): the re-woken people are adopted by the sweep, never noted as orphans and deleted */
+    /* [a1b2f1-hd17] [review F2]: a person of the squad only in this game's world data (asleep, kept, or just cancelled) -> that part of the
+       entry goes: the re-woken people are adopted by the sweep, never noted as orphans and deleted. T-1318 attempt 3 (owner 1615 a;
+       F-T2324-WHOLEKEPT): the GIVEN part stays recorded as given (cooplo::SquadRebuiltAction) - it went too before, and a re-made body of a
+       given person was then adopted and offered again (T2315's road); the sweep still skips such a body by its hand (HandoffPersonGiven) */
+    {   /* T-1318 attempt 3c: the squad's held-undecided people - the engine runs the squad again: CANCELLED, never offered (kept here, cleared below) */
+        std::map<HoKey, RelHeld>::iterator hh = g_relHeldSq.find(k);
+        if (hh != g_relHeldSq.end())
+        {
+            ReleaseRec part; part.id = RelNewId(); part.keyUid = hh->second.b.keyUid; part.sector = hh->second.b.sector; part.px = hh->second.b.px; part.pz = hh->second.b.pz; part.mem = hh->second.b.mem;
+            g_relHeldSq.erase(hh);
+            g_relSent += (long long)part.mem.size(); g_wwDroppedOnWake += (long long)part.mem.size();
+            cancelledNow += RelSettleAll(part, 1, "CANCELLED - held until the squad sleeps, but this game's engine re-woke the squad (fresh uids) (T-1318 attempt 3c; worldWhole4 droppedOnWake=" + N(g_wwDroppedOnWake) + ")", 1);
+        }
+    }
+    /* T-1318 attempt 5 (owner 1626, D1-R1): the re-wake re-made only the people its engine list holds - the woken squad's LIVING members'
+       hands (read as HandoffMembersTakenBy reads them). A kept / asleep person leaves only when its hand (read when it was kept) is among
+       them; one with no hand, or not listed, stays kept (cooplo::KeptRemadeByHands) and the entry goes only when nobody is left. Before,
+       every kept person went here on the false assumption 'a re-wake re-made the whole squad', and the whole test then offered the rest as
+       whole (T2359: five squads, Herbivore_9's kept 2 - 0 of them in the engine's list). An unread list re-made nobody. */
+    std::set<std::string> woken;
+    {
+        SquadView wv;
+        if (personAp != 0 && Plaus(personAp) && ReadSquadAt((void*)personAp, &wv) == 1)
+            for (int i = 0; i < wv.stored && i < kSquadViewCap; ++i)
+            {
+                ::Character* m = wv.members[i];
+                if (m == 0 || !Plaus(m) || BodyDeadFlag(m) == 1) continue;
+                ObjId oid; if (CaptureObjId(m, &oid)) woken.insert(cooplo::HandKey(oid.serial, oid.type));
+            }
+    }
+    long long stay = 0, remadeNow = 0;
+    {
+        std::map<HoKey, KeptRecent>::iterator kr = g_keptRecent.find(k);   /* kept people of it not yet indexed */
+        if (kr != g_keptRecent.end())
+        {
+            std::set<unsigned int> rk;
+            cooplo::KeptRemadeByHands(kr->second.uids, g_keptHandOf, woken, &rk);
+            for (std::set<unsigned int>::const_iterator u = rk.begin(); u != rk.end(); ++u) { kr->second.uids.erase(*u); g_keptHandOf.erase(*u); }
+            remadeNow += (long long)rk.size(); stay += (long long)kr->second.uids.size();
+            if (kr->second.uids.empty()) g_keptRecent.erase(kr);
+        }
+    }
     std::map<HoKey, SquadIdx>::iterator s = g_squadIdx.find(k);
-    if (s == g_squadIdx.end()) return;
-    if (cooplo::SquadRebuiltDropsEntry((int)s->second.asleepHere.size(), (int)s->second.keptHere.size(), cancelledNow > 0 ? 1 : 0) == 0) return;
-    const long long ng = (long long)s->second.given.size(), na = (long long)s->second.asleepHere.size(), nk = (long long)s->second.keptHere.size();
-    for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g) g_idxOf.erase(g->first);
-    for (std::set<unsigned int>::const_iterator a = s->second.asleepHere.begin(); a != s->second.asleepHere.end(); ++a) g_idxOf.erase(*a);
-    g_squadIdx.erase(s);
+    if (s == g_squadIdx.end()) { g_wwKeptRemade += remadeNow; KeptStayLine(k, personAp, id, stay, remadeNow, (long long)woken.size()); return; }
+    std::set<unsigned int> ra, rk;
+    cooplo::KeptRemadeByHands(s->second.asleepHere, g_keptHandOf, woken, &ra);
+    cooplo::KeptRemadeByHands(s->second.keptHere, g_keptHandOf, woken, &rk);
+    const int act = cooplo::SquadRebuiltAction((int)s->second.given.size(), (int)ra.size(), (int)rk.size(), cancelledNow > 0 ? 1 : 0);
+    const long long ng = (long long)s->second.given.size(), na = (long long)ra.size(), nk = (long long)rk.size();
+    for (std::set<unsigned int>::const_iterator a = ra.begin(); a != ra.end(); ++a) { s->second.asleepHere.erase(*a); IdxDropUid(*a); g_keptHandOf.erase(*a); }
+    for (std::set<unsigned int>::const_iterator a = rk.begin(); a != rk.end(); ++a) { s->second.keptHere.erase(*a); g_keptHandOf.erase(*a); }
+    remadeNow += na + nk; g_wwKeptRemade += remadeNow;
+    stay += (long long)(s->second.asleepHere.size() + s->second.keptHere.size());
+    if (act == cooplo::kSrKeep) { KeptStayLine(k, personAp, id, stay, remadeNow, (long long)woken.size()); return; }
+    const int dropEntry = (act == cooplo::kSrDropEntry && s->second.asleepHere.empty() && s->second.keptHere.empty()) ? 1 : 0;
+    if (dropEntry != 0) { IdxEntryGone(s->first, s->second); g_squadIdx.erase(s); }   /* T-1318 a5 fold 1 */
+    else { ++g_idxSeq; if (act == cooplo::kSrDropOwn) ++g_wwRebuiltKeptGiven; }   /* T-1318 attempt 3: the given people (and their hands) stay; attempt 5: and the kept people not re-made */
     g_idxAsleepRebuilt += na; ++g_idxRebuiltDropped;
-    RelLog("[RELEASE] squad id='" + id + "' - the sweep met a person of it this game's engine re-woke: its WHOLE index entry goes (given " + N(ng) + ", asleep " + N(na)
-           + ", kept " + N(nk) + ", cancelled now " + N(cancelledNow) + ") - its re-woken people are adopted here (indexMore asleepRebuilt " + N(g_idxAsleepRebuilt)
-           + ", rebuiltDropped " + N(g_idxRebuiltDropped) + ")");
+    RelLog("[RELEASE] squad id='" + id + "' - the sweep met a person of it this game's engine re-woke: " + std::string(dropEntry != 0 ? "its index entry goes" : (act == cooplo::kSrDropOwn ? "its re-made own part of the index entry goes, its GIVEN part stays" : "its re-made own part of the index entry goes, its kept part stays"))
+           + " (given " + N(ng) + (act == cooplo::kSrDropOwn ? " kept as given" : "") + ", asleep " + N(na) + ", kept " + N(nk) + " re-made by the engine's list, " + N(stay) + " stay kept, cancelled now " + N(cancelledNow)
+           + ") - its re-woken people are adopted here (indexMore asleepRebuilt " + N(g_idxAsleepRebuilt) + ", rebuiltDropped " + N(g_idxRebuiltDropped) + "; worldWhole3 rebuiltKeptGiven " + N(g_wwRebuiltKeptGiven) + ")");
+    KeptStayLine(k, personAp, id, stay, remadeNow, (long long)woken.size());
+}
+void HandoffNoteWokeWithGiven(void* faction, const std::string& id)
+{
+    ReleaseForgetDrain();
+    const HoKey k(faction, id);
+    if (g_wokeWithGiven.count(k) != 0) return;
+    if (g_wokeWithGiven.size() >= 4096) { ++g_wokeWithGivenFull; return; }
+    g_wokeWithGiven.insert(k); ++g_wokeWithGivenNoted;
+}
+int HandoffWokeWithGiven(void* faction, const std::string& id)
+{
+    ReleaseForgetDrain();
+    return g_wokeWithGiven.count(HoKey(faction, id)) != 0 ? 1 : 0;
 }
 bool HandedOverLeftBehindAny()
 {
     ReleaseForgetDrain();
     if (!g_release.empty()) return true;   /* an open release may need cancelling (HandedOverLeftBehindRebuilt) */
-    for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s) if (!s->second.asleepHere.empty()) return true;
+    for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s) if (!s->second.asleepHere.empty() || !s->second.keptHere.empty()) return true;
+    if (!g_relHeldSq.empty()) return true;   /* T-1318 attempt 3c: held-undecided people - their squad's re-wake drops them */
+    if (!g_keptRecent.empty()) return true;   /* T-1318 attempt 3: kept people (indexed or not) hold the squad's XFER (KeptAsleepOf) - their re-wake must clear them */
     return false;
 }
 /* MAIN THREAD - a player left: the squads this game handed to that player are dropped from the index at the next drain
@@ -2240,7 +3536,28 @@ std::string HandoffReleaseReportToken()
            + "," + N(g_idxScans) + "," + N((long long)g_keptRecent.size()) + "," + N((long long)g_keyCache.size())   /* [a1b2f1-hd18] */
            + " releaseFold2[rewokeAcceptAtAck,rewokeLateAccepted,rewokeHolderUnknown,revokeWaitWorldCleared,revokeOwedWorldCleared,revokeWaitPlayerGone,revokeOwedPlayerGone,goneSlotUnknown]="
            + N(g_relRewokeAcceptAtAck) + "," + N(g_relRewokeLateAccepted) + "," + N(g_relRewokeHolderUnknown) + "," + N(g_relRevokeWaitWorldCleared) + "," + N(g_relRevokeOwedWorldCleared)
-           + "," + N(g_relRevokeWaitPlayerGone) + "," + N(g_relRevokeOwedPlayerGone) + "," + N(g_relRevokeGoneSlotUnknown);   /* [a1b2f2-hd7] */
+           + "," + N(g_relRevokeWaitPlayerGone) + "," + N(g_relRevokeOwedPlayerGone) + "," + N(g_relRevokeGoneSlotUnknown)   /* [a1b2f2-hd7] */
+           + " rewakeWait[put,decided,stillNobody,notMine,worldCleared,now]=" + N(g_relRewakeWaitPut) + "," + N(g_relRewakeWaitDecided) + "," + N(g_relRewakeWaitStillNobody)
+           + "," + N(g_relRewakeWaitNotMine) + "," + N(g_relRewakeWaitWorldCleared) + "," + N((long long)g_relRewakeWait.size())   /* T-1268 fold 1 (review M2) */
+           + " rewakeWait2[lateAdded,playerGone]=" + N(g_relRewakeWaitLateAdded) + "," + N(g_relRewakeWaitPlayerGone)   /* T-1268 fold 2 */
+           + " givenNotOffered=" + N(g_relGivenNotOffered)   /* T-1318 fold 2 (re-check B1) */
+           + " worldWhole[relKeptOut,relOver64,xferHeldPart,relAll,relNone,relNoneLeaderless,xferAll,xferNone,xferNoneLeaderless,givenAsleepKept,partGiven]="
+           + N(g_wwRelKeptOut) + "," + N(g_wwRelOver64) + "," + N(g_wwXferHeldPart) + "," + N(g_wwRelAll) + "," + N(g_wwRelNone) + "," + N(g_wwRelNoneLeaderless)
+           + "," + N(g_wwXferAll) + "," + N(g_wwXferNone) + "," + N(g_wwXferNoneLeaderless) + "," + N(g_wwGivenAsleepKept) + "," + N(g_wwPartGiven)   /* T-1318 attempt 2 (D3): partGiven must stay 0 */
+           + " worldWhole3[xferKeptAsleep,followKeptAsleep,rebuiltKeptGiven,rewokeNotPerson]=" + N(g_wwXferKeptAsleep) + "," + N(g_wwFollowKeptAsleep) + "," + N(g_wwRebuiltKeptGiven) + "," + N(g_wwRewokeNotPerson)
+           + " worldWhole4[heldBatches,heldPeople,offeredTogether,settledAfterHold,droppedOnWake,heldNotMine,heldNow]=" + N(g_wwHeldBatches) + "," + N(g_wwHeldPeople) + "," + N(g_wwOfferedTogether)
+           + "," + N(g_wwSettledAfterHold) + "," + N(g_wwDroppedOnWake) + "," + N(g_wwHeldNotMine) + "," + N((long long)g_relHeldSq.size())
+           + " worldWhole5[batchesMerged,heldOpen,heldGivenSettled]=" + N(g_relBatchesMerged) + "," + N(g_wwHeldOpen) + "," + N(g_wwHeldGivenSettled)   /* T-1318 attempt 3 fold 2 (re-check MED-A) */
+           + " worldWhole6[recordsRead,recordsUnread,relUnaccKeptOut,relUnaccHeld,xferUnacc,followUnacc,rebuiltSameSquad,supersedeKeptNotGiven,wokeWithGiven,wokeWithGivenFull,deadHandSquads]=" + N(g_wwRecRead) + "," + N(g_wwRecUnread)
+           + "," + N(g_wwRelUnaccKeptOut) + "," + N(g_wwRelUnaccHeld) + "," + N(g_wwXferUnacc) + "," + N(g_wwFollowUnacc) + "," + N(g_wwRebuiltSameSquad) + "," + N(CtxSupersedeKeptNotGiven())
+           + "," + N(g_wokeWithGivenNoted) + "," + N(g_wokeWithGivenFull) + "," + N((long long)g_deadHandsOf.size())   /* T-1318 attempt 4 (design A), a4 fold 1 */
+           + " worldWhole7[recDeadSkipped,recDeadUnread,recUnreadHeld,recUnreadRead,recUnreadGone,recUnreadCap]=" + N(g_wwRecDeadSkipped) + "," + N(g_wwRecDeadUnread) + "," + N(g_wwRecHold)
+           + "," + N(g_wwRecHoldRead) + "," + N(g_wwRecHoldGone) + "," + N(g_wwRecHoldCap)   /* T-1318 a4 fold 2 (re-check LOW-A / LOW-B) */
+           + " worldWhole8[keptStay,keptRemade,keptGhost,otherHands,otherHandSquads,otherHandsCapHit,copyJoinGiven,copyJoinCtxGiven,dupKeptGiven]=" + N(g_wwKeptStay) + "," + N(g_wwKeptRemade) + "," + N(g_wwKeptGhost)
+           + "," + N(g_wwOtherHandsNoted) + "," + N((long long)g_otherHandsOf.size()) + "," + N(g_wwOtherHandsCapHit) + "," + N(CopyJoinGivenCount()) + "," + N(CopyJoinCtxGivenCount()) + "," + N(WakeDupKeptGivenCount())   /* T-1318 attempt 5 (owner 1626, D1) + fold 1 */
+           + " worldWhole9[copyJoinSkippedIgnored]=" + N(CopyJoinSkippedIgnoredCount())   /* owner 1640: ignored repeat SPAWNs, no placement read */
+           + " worldWhole2[followHeldPart,partGivenAwake,keptUnknown,ownKeptAsleep,ownKeptHandUnread]=" + N(g_wwFollowHeldPart) + "," + N(g_wwPartGivenAwake) + "," + N(g_idxKeptUnknown)
+           + "," + N(g_wwOwnKeptAsleep) + "," + N(g_wwOwnKeptHandUnread);   /* T-1318 attempt 2 fold 1 (review): keptUnknown = indexFold1's keptUnknown (no squad can show those) */
 }
 
 /* the announce pass's two inputs (handoff.h) */
@@ -2253,6 +3570,143 @@ int HandoffOtherInWorldHasArea(float x, float z)
     for (int i = 0; i < n; ++i)
         if (sl[(size_t)i] != me && bit[(size_t)i] == 1 && StoreRosterSlotInWorld(sl[(size_t)i]) == 1) return 1;
     return 0;
+}
+long long g_keepRcvSkipped = 0, g_keepRcvAsked = 0;   /* T-1046 fix 2 review fold: receiver tests skipped (no other game has the area loaded) / run */
+/* T-1046 fix 2 (owner 1591 a): THE KEEP QUESTION'S RECEIVER TEST - the RELEASE's own (ReceiversFor: every other IN_WORLD game with the
+   area loaded whose engine would keep the squad at (px, pz), cooplo::EngineKeepsAt with kKeepMarginUnits), asked with nobody tried, so
+   "kept for another game" always means "a game the put-away would offer it to". Returns ReceiversFor's k (-1 hold, 0 nobody, >= 1);
+   *namesSlot (may be 0) = 1 when wantSlot (>= 0) is among the games named; *holderOut (may be 0) = the area's holder the map names. MAIN THREAD. */
+int HandoffKeepReceivers(float px, float pz, int wantSlot, int* namesSlot, int* holderOut)
+{
+    if (namesSlot != 0) *namesSlot = 0;
+    if (holderOut != 0) *holderOut = -1;
+    if (cooplo::KeepReceiversKnownNone(StoreLiveReady() ? 1 : 0, StoreMySlot(), OtherLoadedTS(SectorOf(px, pz))) != 0) { ++g_keepRcvSkipped; return 0; }   /* review fold (cost): no other game has the area loaded - k is 0 */
+    ++g_keepRcvAsked;
+    std::vector<int> order;
+    int holder = -1, niw = 0, nkp = 0;
+    const int k = ReceiversFor(SectorOf(px, pz), px, pz, std::vector<int>(), &order, &holder, &niw, &nkp);
+    if (holderOut != 0) *holderOut = holder;
+    if (k >= 1 && wantSlot >= 0 && namesSlot != 0)
+        for (size_t i = 0; i < order.size(); ++i) if (order[i] == wantSlot) { *namesSlot = 1; break; }
+    return k;
+}
+void HandoffKeepReceiverCounts(long long* skipped, long long* asked) { *skipped = g_keepRcvSkipped; *asked = g_keepRcvAsked; }
+/* T-1046 fold 2 (T2305 leg N): the sleeping squad (faction, id) is TAKEN by one slot when every person of its own records (hands =
+   one per 0x24 record of its sleeping container) is in the squad index's given to that slot - person by person (cooplo::SleepersTakenSlot);
+   people kept here or given who are not among the sleepers do not block it (SquadWholeGiven, for its other callers, is unchanged).
+   -1 = not taken. HandoffSquadHasGiven: the index has the squad with at least one given person (the cheap test first). MAIN THREAD. */
+int HandoffSquadHasGiven(void* faction, const std::string& id)
+{
+    ReleaseForgetDrain();
+    std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(HoKey(faction, id));
+    return (s != g_squadIdx.end() && !s->second.given.empty()) ? 1 : 0;
+}
+/* T-1318: the index has a squad of this id (any faction) with at least one given person - the given-wait's test (store.cpp
+   GivenWaitTick: a squad whose copy here was refused its wake and removed is built from its record once nothing of it is given). MAIN THREAD. */
+int HandoffSquadHasGivenId(const std::string& id)
+{
+    ReleaseForgetDrain();
+    for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s)
+        if (s->first.second == id && !s->second.given.empty()) return 1;
+    return 0;
+}
+/* T-1318 fold 1 (review F2): one person of a squad, by its own hand (the engine's handle, as the ACK's given entry and the sleeping
+   records carry it) - 1 = the squad index has that person given, 0 = not, -1 = its hand did not read. The sweep's person-by-person
+   test: a rebuilt person of a squad given in part is skipped when IT is given; the squad's people kept here are not. MAIN THREAD. */
+int HandoffPersonGiven(void* faction, const std::string& id, const void* character)
+{
+    ReleaseForgetDrain();
+    std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(HoKey(faction, id));
+    if (s == g_squadIdx.end() || s->second.given.empty()) return 0;
+    ObjId oid;
+    if (!Plaus(character) || !CaptureObjId(character, &oid)) return -1;
+    const std::string hand = cooplo::HandKey(oid.serial, oid.type);
+    int handless = 0;
+    for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g)
+    {
+        std::map<unsigned int, std::string>::const_iterator h = g_givenHandOf.find(g->first);
+        if (h != g_givenHandOf.end() && h->second == hand) return 1;
+        if (h == g_givenHandOf.end() || h->second.empty()) handless = 1;
+    }
+    /* T-1318 attempt 4 (design A, site 9): a given person whose hand was never read could be this one - not known (-1), never "not given":
+       the sweep then numbers a re-made body of a wholly given squad only when every given hand is known (coopsquad::SweepGivenPerson) */
+    return handless != 0 ? -1 : 0;
+}
+/* T-1318 fold 1 (review F2): the slot that took every person of an AWAKE squad - its members' own hands (n of them, read from the bodies)
+   through the sleeping squad's test (cooplo::SleepersTakenSlot); -1 = not taken, or a member's hand did not read. The off-thread wake's
+   drain asks it: the wake already built the bodies, so the sleeping records may no longer read. MAIN THREAD. */
+/* T-1318 attempt 4 (owner 1626, design A, site 7): over the squad's LIVING members (a corpse left out by the engine's dead flag; an
+   unreadable flag counted alive); a member that does not read, or no living member: coopsquad::kTakenUnread (-2 - the index's whole answer
+   then stands); read and not all given to one slot: -1. */
+/* T-1318 attempt 5 (owner 1626, D1-R3): another game's living copy put away by this engine (spawn.cpp's despawn hook, 'this engine put the
+   copy away', the body whole): its hand is noted under its squad with its owner slot, when that squad has people this game gave away - the
+   sleeping squad's records then count it as taken by that game (HandoffSleepersTakenBy). MAIN THREAD. */
+void HandoffNoteOtherCopyPutAway(unsigned int uid, const void* obj)
+{
+    ReleaseForgetDrain();
+    if (uid == 0 || net::IsUidMine(uid) || !Plaus(obj)) return;
+    ::Character* c = (::Character*)obj;
+    if (BodyDeadFlag(c) == 1) return;
+    void* f = 0; std::string id;
+    if (!SquadKeyOf(c, &f, &id) || id.empty()) return;
+    const std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(HoKey(f, id));
+    if (s == g_squadIdx.end() || s->second.given.empty()) return;
+    ObjId oid;
+    if (!CaptureObjId(c, &oid)) return;
+    OtherHandNote(HoKey(f, id), cooplo::HandKey(oid.serial, oid.type), uid);
+}
+int HandoffMembersTakenBy(void* faction, const std::string& id, void* const* members, int n)
+{
+    if (members == 0 || n <= 0 || n > 256) return coopsquad::kTakenUnread;
+    std::vector<std::string> hands;
+    for (int i = 0; i < n; ++i)
+    {
+        ObjId oid;
+        if (!Plaus(members[i])) return coopsquad::kTakenUnread;
+        if (BodyDeadFlag(members[i]) == 1) continue;
+        if (!CaptureObjId(members[i], &oid)) return coopsquad::kTakenUnread;
+        hands.push_back(cooplo::HandKey(oid.serial, oid.type));
+    }
+    if (hands.empty()) return coopsquad::kTakenUnread;
+    return HandoffSleepersTakenBy(faction, id, hands);
+}
+int HandoffSleepersTakenBy(void* faction, const std::string& id, const std::vector<std::string>& hands)
+{
+    ReleaseForgetDrain();
+    std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(HoKey(faction, id));
+    if (s == g_squadIdx.end()) return -1;
+    std::map<std::string, int> slotOfHand;
+    int handless = 0;   /* T-1318 a4 fold 1 (review MEDIUM-1): a given person whose hand was never recorded - a record not found could be it (-2) */
+    for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g)
+    {
+        std::map<unsigned int, std::string>::const_iterator h = g_givenHandOf.find(g->first);
+        if (h != g_givenHandOf.end() && !h->second.empty()) slotOfHand[h->second] = net::PlayerSlotOfKey(g->second);
+        else handless = 1;
+    }
+    {   /* T-1318 attempt 5 (owner 1626, D1-R3): another game's copies seen in the squad count as taken by that game, never as 'not given' */
+        const std::map<HoKey, std::map<std::string, unsigned int> >::const_iterator oh = g_otherHandsOf.find(HoKey(faction, id));
+        if (oh != g_otherHandsOf.end())
+        {   /* a5 fold 1 (review MEDIUM-2 / LOW): each uid read NOW - taken back here or no owner record: skipped; else its owner's player slot
+               (the given hands' own source, net::PlayerSlotOfKey) */
+            std::map<std::string, int> otherNow;
+            for (std::map<std::string, unsigned int>::const_iterator h = oh->second.begin(); h != oh->second.end(); ++h)
+            {
+                const int sl = cooplo::OtherHandSlotNow(net::IsUidMine(h->second) ? 1 : 0, net::OwnerPlayerSlotOf(h->second));
+                if (sl != cooplo::kOtherHandSkip) otherNow[h->first] = sl;
+            }
+            cooplo::SlotOfHandAddOther(&slotOfHand, otherNow);
+        }
+    }
+    const std::map<HoKey, std::set<std::string> >::const_iterator dh = g_deadHandsOf.find(HoKey(faction, id));   /* its corpses: neither given nor kept */
+    return cooplo::SleepersTakenSlot(hands, slotOfHand, handless, dh != g_deadHandsOf.end() ? &dh->second : 0);
+}
+long long HandoffIdxSeq() { return g_idxSeq; }
+/* the position the put-away's RELEASE decides an awake squad at (SquadDecisionPosAt over the squad at its ActivePlatoon): 1 read, else 0 */
+int HandoffSquadKeepPos(void* activePlatoon, float* x, float* z)
+{
+    SquadView sv;
+    if (!Plaus(activePlatoon) || ReadSquadAt(activePlatoon, &sv) != 1) return 0;
+    return SquadDecisionPosAt(sv, x, z) == 1 ? 1 : 0;
 }
 bool HandoffForcedRefusedFor(unsigned int uid)
 {
@@ -2308,6 +3762,8 @@ void ReportHandoff()
              + N(g_followedLeader) + "," + N(g_leaderUnknownFellBack) + "," + N(g_waitedLeader) + "," + N(g_xferFollowSent) + "," + N(g_xferFollowTaken)
              + "," + N(g_leaderSet) + "," + N(g_leaderSetMiss) + "," + N(g_keepAwakeRefresh)
              + " followBackoff=" + N((long long)g_followBackoff.size())
+             + " followGroup[notInGroup,blockSet,blockedPasses,unblocked,blocks]=" + N(g_followNotInGroup) + "," + N(g_followBlockSet) + "," + N(g_followBlockedPass)
+             + "," + N(g_followUnblocked) + "," + N((long long)g_followGroupBlock.size())   /* T-1239 */
              + " | fold[agreedDiffered,leaderActing,leaderSetPrecond,followLogQuiet]="
              + N(g_agreedDiffered) + "," + N(g_leaderActing) + "," + N(g_leaderSetPrecond) + "," + N(g_followLogQuiet)
              + " | squadLead[sent,recv,applied,stale,crossingResolved,crossingRefused]="

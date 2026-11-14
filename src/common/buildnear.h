@@ -326,5 +326,35 @@ inline const char* ClickRefusalText(int r)
         "Invalid placing floor number. Change to the correct floor to place it in that position.", "Ground needs to be more level." };
     return (r >= 0 && r < kClickCount) ? k[r] : "?";
 }
+/* T-1122 (effort cursorjoin): THE PLACEMENT CONFIRM'S STEPS for `buildtest cursor .. commit` - what the engine's confirm 0x4DA6F0
+   (1.0.68 0x4DB180) does to the placed previews on its outdoor road (PlayerInterface+0x298 = 0), decomp_4da6f0.txt:51-160, Read:
+   per piece in list order (1) the piece's own town pick 0x4D6300 (preview+0x90: own town within 5000, own building within 2500, else a
+   'creates player town' piece founds 'Your Outpost'), (2) the region add 0x4D21F0(list, preview+0xE0) when the piece has no host
+   (+0xD8 and +0xD0 zero), its vt+0xE8 answers 0 and its record's float "build threshold" is 0 (ConfirmRegionDue), (3) the tally
+   (ConfirmTally): pieces whose vt+0x98 answers non-zero and that still have no town are counted; the town of the LAST piece whose
+   +0x90 town's faction is a player's (+0x250) is kept; then (4) the group step (ConfirmGroupStep) when the count is non-zero: that
+   kept town, else the nearest player town within 16000 of the counted pieces' average position (0x926F70), else a new 'Your Outpost'
+   there (0x933F40) - given to every counted piece. Pure: the plugin reads the facts and makes the engine's calls. */
+struct ConfirmPiece { int vt98; int hasTown; int townIsPlayer; };
+/* the piece's region add is due (decomp_4da6f0.txt:63-65) */
+inline int ConfirmRegionDue(int hostD8, int hostD0, int vtE8, float threshold) { return (hostD8 == 0 && hostD0 == 0 && vtE8 == 0 && threshold == 0.0f) ? 1 : 0; }
+/* decomp_4da6f0.txt:70-88 over pieces read AFTER their own town pick: *count = the counted pieces; return the index of the last
+   piece whose town is a player's (-1 none) */
+inline int ConfirmTally(const ConfirmPiece* p, int n, int* count)
+{
+    int kept = -1;
+    *count = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (p[i].vt98 != 0 && p[i].hasTown == 0) { ++*count; continue; }
+        if (p[i].hasTown != 0 && p[i].townIsPlayer != 0) kept = i;
+    }
+    return kept;
+}
+enum { kGroupNone = 0, kGroupKept = 1, kGroupNearest = 2 };
+/* decomp_4da6f0.txt:89-160: no counted piece or inside a building = nothing; a kept player town = it; else the nearest-then-found road */
+inline int ConfirmGroupStep(int count, int interior, int kept) { return (count == 0 || interior != 0) ? kGroupNone : (kept >= 0 ? kGroupKept : kGroupNearest); }
+/* the group step gives the town to this piece (decomp_4da6f0.txt:151-157) */
+inline int ConfirmGroupTakes(const ConfirmPiece& p) { return (p.vt98 != 0 && p.hasTown == 0) ? 1 : 0; }
 }   // namespace buildnear
 #endif

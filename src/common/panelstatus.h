@@ -275,6 +275,8 @@ inline std::string PanelNotebookText(int state, int port, long exitCode)
             if (exitCode == swformat::kServerExitWorldLocked)   /* the world's lock is held: another world server runs this world */
                 return "Couldn't host: this world is already running in another program on this computer (another Kenshi, or one left"
                        " over after a crash).";
+            if (exitCode == swformat::kServerExitSlotsUnreadable)   /* T-1280: its slots.txt is held by another program */
+                return "The world couldn't start: its list of players (slots.txt) could not be read. Close any program that has it open and try again.";
             if (exitCode == kServerExitRulesUnreadable)   /* T-1254 D (owner 1512 a): its rules.txt could not be read */
                 return "The world couldn't start: its rules.txt could not be read. Close any program that has it open and try again.";
             return "The world couldn't start (error " + PanelNum((long long)exitCode)

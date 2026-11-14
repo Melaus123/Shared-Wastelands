@@ -4,6 +4,8 @@
 //                                                                  [door=<i>]: the order on door i of the building instead
 //   jobtest click <characterUid> <buildingKey> [near=<x>,<z>]   - T-1191: the direct order a player's right click on the building
 //                                                                  gives (items.cpp JobClickRun)
+//   jobtest work <characterUid> notarget task=<n> [plain]       - T-1250 (dev build): the order with no target, so the task's own
+//                                                                  search picks one (items.cpp JobNoTargetRun)
 //   jobtest input <buildingKey> <itemSid> <n> [section=<name>]  - P17: n of an item into the machine's input section (items.cpp)
 //   jobtest input <buildingKey> need<i> <n> [section=<name>]    - T-609: the same, the item being the one the machine's i-th
 //                                                                  input asks for (i = 0..; read as `jobtest show` reads it)
@@ -211,6 +213,39 @@ inline int JobClickParse(const std::string& arg, JobWork* out)
     }
     out->uid = (unsigned int)v; out->key = needle;
     out->hasNear = hasNear; out->nearX = nx; out->nearZ = nz;
+    return 1;
+}
+
+/* T-1250 TEST-ONLY `work <uid> notarget task=<n> [plain]`: this game's own character gets the engine's giveOrder with NO target
+   (items.cpp JobNoTargetRun), so the task's own search picks one - task 112's finder 0x8CFE60 calls the cage scorer only when the
+   order's target is empty. uid decimal or 0x hex, non-zero; the word `notarget` right after the uid; task= is REQUIRED (1..kTaskMax:
+   there is no machine to take task 87 from); `plain` as in `work`. Each option once, in any order. Checked BEFORE JobWorkParse, which
+   would read `notarget` as a building needle. door / near are left empty and unused; out->key
+   is empty. 1 parsed, 0 not this form. */
+inline int JobNoTargetParse(const std::string& arg, JobWork* out)
+{
+    out->uid = 0; out->key.clear(); out->task = 0; out->plain = 0; out->door = -1;
+    out->hasNear = 0; out->nearX = 0.0f; out->nearZ = 0.0f;
+    std::string tok[kNeedleTokMax];
+    const int n = coopsay::TalkSplit(arg, tok, kNeedleTokMax);
+    if (n < 4 || tok[0] != "work" || tok[2] != "notarget") return 0;
+    unsigned long long v = 0;
+    if (!coopsay::TalkParseNumber(tok[1], &v) || v == 0 || v > 0xFFFFFFFFULL) return 0;
+    int plain = 0, task = -1;
+    for (int k = 3; k < n; ++k)
+    {
+        if (tok[k] == "plain" && plain == 0) { plain = 1; continue; }
+        if (tok[k].compare(0, 5, "task=") == 0 && task < 0)
+        {
+            unsigned long long t = 0;
+            if (!coopsay::TalkParseNumber(tok[k].substr(5), &t) || t == 0 || t > (unsigned long long)kTaskMax) return 0;
+            task = (int)t;
+            continue;
+        }
+        return 0;
+    }
+    if (task < 0) return 0;
+    out->uid = (unsigned int)v; out->task = task; out->plain = plain;
     return 1;
 }
 

@@ -93,58 +93,6 @@ inline int DuplicateIdDecide(double oldPeerSilentSec, double liveSec)
     return kDupIdEvictOld;
 }
 
-/* ================= WHO HOLDS AN AREA AFTER A RESTART =================
-   Three answers, and the caller acts on exactly one of them.
-
-   THE ARGUMENTS.
-     restoredOwnerKnownNow - 1 when the id named as this row's owner has ALREADY SPOKEN to this process
-                             (it dialled in and was welcomed), 0 when it has not been heard from since the
-                             restart. The whole point of the restore grace is that 0 is not the same as gone.
-     ownerSilentSec        - how long the owner has been silent. When the owner is known now, that is the time
-                             since its last AREAS report; when it is not, it is the age of the RESTORE (how
-                             long this process has been running), because a name that has never spoken has
-                             been silent for exactly that long.
-     reporterIsOwner       - 1 the game reporting this area right now IS the owner; 0 somebody else is
-                             reporting it; -1 NOBODY is reporting it right now (the once-a-second sweep asks
-                             with -1, because it has no reporter in its hand).
-     restoreGraceSec       - how long a restored claim stands for an owner that has not dialled back in yet.
-                             60 s: a game re-dialling on B12-e's cadence needs about 17 s an attempt, so 60
-                             covers three of them.
-     leaseSec              - the ordinary silence lease once the owner IS live again (kGraceSec, 10 s).
-
-   PRE-PATCH EQUIVALENT: there was no restored row at all, so every area was "first there" (kTransfer to
-   whoever reported first) the moment the relay came up. The offline row that fails on the old behaviour is
-   a restored row inside its grace with another game reporting: kKeep here, kTransfer before. */
-enum AreaClaimAction
-{
-    kAreaKeep     = 0,   /* the owner keeps it: it is back, or it is inside the restore grace */
-    kAreaTransfer = 1,   /* the owner is past its lease/grace AND another game is reporting - it passes over */
-    kAreaRelease  = 2    /* the owner is past its lease/grace and NOBODY is reporting - the row falls to nobody */
-};
-
-inline int AreaClaimDecide(int restoredOwnerKnownNow, double ownerSilentSec, int reporterIsOwner,
-                           double restoreGraceSec, double leaseSec)
-{
-    /* The owner itself is reporting: nothing else matters, and this is the only arm that can end a restore. */
-    if (reporterIsOwner == 1) return kAreaKeep;
-    const double budget = restoredOwnerKnownNow ? leaseSec : restoreGraceSec;
-    if (ownerSilentSec <= budget) return kAreaKeep;      /* the boundary itself KEEPS - a claim is lost past it, not at it */
-    return (reporterIsOwner == 0) ? kAreaTransfer : kAreaRelease;
-}
-
-/* A restored owner that says LOADING is loading a world from its save, so the world it held those areas in is gone
-   (a game re-dialling with its world still running says IN_WORLD, never LOADING - joinstage.h InWorldOwedDecide).
-   Its restored claims are released at that stage change, and each area's next report assigns it to a game that is
-   there instead of the area waiting out the restore grace.
-     isOwner  - 1 the row's owner id is the player whose stage changed.
-     restored - 1 the row came from areas.txt and its owner has not reported it since this process started.
-     loading  - 1 the new stage is LOADING.
-   Answers kAreaRelease or kAreaKeep. */
-inline int RestoredClaimOnStageDecide(int isOwner, int restored, int loading)
-{
-    return (isOwner != 0 && restored != 0 && loading != 0) ? kAreaRelease : kAreaKeep;
-}
-
 /* ================= THE SLOT NUMBER, KEYED ON THE ID =================
    A known id gets its old number back - even when a new id dialled first and would have taken it under
    AssignSlot's smallest-free rule. A new id gets the smallest number NO KNOWN ID holds, which is not the
@@ -269,42 +217,97 @@ inline int AreasLineParse(const std::string& line, int* x, int* y, std::string* 
     return 1;
 }
 
-/* P5t (T418): WHO THE NOTEBOOK GIVES AN UNCLAIMED AREA TO. Each game's own ring-1 tie-break (zones.cpp
-   MayInventFromView / MySlotLower) lets the LOWER slot invent when both players stand within one area of it; the
-   notebook used to name whichever game's loaded report arrived first (T418: B stepped aside, A invented, and B's
-   report named B). Now it names the tie-break's winner: the LOWEST slot among players whose position is fresh
-   (now - at <= freshSec, at > 0) and within ring 1 (Chebyshev 1) of the area; nobody -> the reporter, as before.
-   *nRing1 = how many such players; *why = kAssignRing1 / kAssignReporter. Pure: the offline suite sweeps it. */
-const int kAssignReporter = 0, kAssignRing1 = 1;
-inline int AreaAssignDecide(int reporterSlot, int ax, int ay, int count, const int* slots, const int* xs, const int* ys,
-                            const double* ats, double now, double freshSec, int* nRing1, int* why)
+/* decision 1556 (owner 2026-11-08; T-1285 restored; owner decisions 15 / 580 / 1552): WHO IS IN CHARGE OF ONE AREA. A game is in charge
+   of an area it has LOADED when it is the first or only game with it loaded, or charge was passed to it; nothing else (no player character
+   nearby) is asked. "Loaded" = the engine still KEEPS the area - the game's latest report WITHOUT the loading mark lists it (zones.cpp
+   lists only areas one of whose three keep-alive countdowns is at its renewal value, loadedzones.h WhyFromCountdowns; an area counting
+   down to unload after being left is not listed - T2182 LEG 5). A report WITH the loading mark (the engine's zone manager is loading,
+   AreasReportListing 0) changes no listing and no charge. No clock decides a move here; the caller decides "gone" from events (link
+   closed, clean quit, a new connection of the same player, its JOIN_STAGE LOADING) or from the reports stopping (the 10 s silence limit).
+     holder      - the slot in charge now, -1 nobody.
+     holderGone  - 1 the holder's game is gone.
+     listers     - the slots whose latest unmarked report lists the area (the holder may be among them).
+     since       - per lister, when its unbroken kept-listing of the area began (server arrival time of the first report of the run,
+                   AreaListedSince); 0 = no times (every lister equal, the lowest slot decides).
+   The answer, and *why:
+     kChargeKeep           - the holder is here and lists the area: it keeps it (sticky - another game listing it changes nothing, so a
+                             game coming back never takes back an area it gave up).
+     kChargeAssign         - nobody held it: the first or only lister (several only after a hold ended: AreaChargePick).
+     kChargePassDropped    - the holder's latest report no longer lists it and another game lists it: that game, at once.
+     kChargePassGone       - the holder's game is gone and another game lists it: that game, at once.
+     kChargeReleaseDropped - the holder's latest report no longer lists it and nobody else lists it: nobody (-1), at that report.
+     kChargeRelease        - the holder's game is gone and nobody else lists it: nobody (-1).
+     kChargeNone           - nobody held it and nobody lists it: -1.
+   review M5 (accepted, counted): when BOTH games flap the same edge area, A dropping it passes it to B and B dropping it later passes it
+   back to A; every move is counted (the area's `switches`, areaCharge[switches]). */
+const int kChargeKeep = 0, kChargeAssign = 1, kChargePassDropped = 2, kChargePassGone = 3, kChargeRelease = 5, kChargeNone = 6, kChargeReleaseDropped = 7;
+/* WHICH LISTER, when several list an area nobody (else) holds: the earliest unbroken kept-listing by server arrival time, then the lowest
+   slot. `skip` (the holder) is never picked. The world server takes reports one at a time (store_main.cpp's one receive loop), so an
+   area nobody holds goes to the first game whose report lists it; several listers meet only when a hold ends (its holder gone or no
+   longer listing it). -1 = no lister. */
+/* fold 1 (review L1): a lister whose latest report carries the loading mark (loading[i] 1 - it still lists from its last unmarked report)
+   is picked only when no settled lister lists the area, so a frozen game is never given an area ahead of a settled one. loading 0 = none. */
+inline int AreaChargePick(int nListers, const int* listers, const double* since, int skip, const int* loading = 0)
 {
-    int low = -1, nr = 0;
-    for (int i = 0; i < count; ++i)
+    int pick = -1, pickLoading = 0; double pickSince = 0.0;
+    for (int i = 0; i < nListers; ++i)
     {
-        if (slots[i] < 0 || slots[i] > 15 || xs[i] < 0 || ys[i] < 0 || ats[i] <= 0.0 || now - ats[i] > freshSec) continue;   /* area2 fold: slots 0-15, the plugin's table */
-        const int dx = xs[i] - ax, dy = ys[i] - ay;
-        if (dx < -1 || dx > 1 || dy < -1 || dy > 1) continue;
-        ++nr;
-        if (low < 0 || slots[i] < low) low = slots[i];
+        const int s = listers[i];
+        if (s < 0 || s == skip) continue;
+        const double t = since != 0 ? since[i] : 0.0;
+        const int l = (loading != 0 && loading[i] != 0) ? 1 : 0;
+        if (pick < 0 || l < pickLoading || (l == pickLoading && (t < pickSince || (t == pickSince && s < pick)))) { pick = s; pickSince = t; pickLoading = l; }
     }
-    if (nRing1 != 0) *nRing1 = nr;
-    if (why != 0) *why = (low >= 0) ? kAssignRing1 : kAssignReporter;
-    return (low >= 0) ? low : reporterSlot;
+    return pick;
 }
-
-/* area2 fold (review-area2 MED): AN UNCONFIRMED ASSIGNMENT. An area given to a ring-1 slot that has not yet listed it as
-   loaded is held for that slot kUnconfirmedLeaseSec (H047: ~8.6-11.6 s from a teleport to the area reading loaded) and not
-   on the ordinary 10 s lease stamped at the assignment; past it, it is handed to the reporter. The assignee's own report
-   confirms it (and stamps its lease). Not unconfirmed -> the ordinary rules. */
-const double kUnconfirmedLeaseSec = 12.0;
-const int kLeaseNormal = 0, kLeaseConfirm = 1, kLeaseHold = 2, kLeaseHandOver = 3;
-inline int UnconfirmedLeaseDecide(int unconfirmed, int reporterIsAssignee, double sinceAssignSec, double leaseSec)
+inline int AreaChargeDecide(int holder, int holderGone, int nListers, const int* listers, const double* since, int* why, const int* loading = 0)
 {
-    if (unconfirmed == 0) return kLeaseNormal;
-    if (reporterIsAssignee != 0) return kLeaseConfirm;
-    if (sinceAssignSec > leaseSec) return kLeaseHandOver;
-    return kLeaseHold;
+    int holderLists = 0;
+    for (int i = 0; i < nListers; ++i) if (holder >= 0 && listers[i] == holder) holderLists = 1;
+    if (holder >= 0 && holderGone == 0 && holderLists != 0) { if (why != 0) *why = kChargeKeep; return holder; }
+    const int pick = AreaChargePick(nListers, listers, since, holder, loading);
+    if (pick >= 0) { if (why != 0) *why = holder < 0 ? kChargeAssign : (holderGone != 0 ? kChargePassGone : kChargePassDropped); return pick; }
+    if (why != 0) *why = holder < 0 ? kChargeNone : (holderGone != 0 ? kChargeRelease : kChargeReleaseDropped);
+    return -1;
+}
+/* fold 2 (review L5): THE SWEEP'S ANSWER FOR ONE AREA (store_main.cpp AreaChargeSweep), pure so the offline suite walks marked and
+   unmarked reports through the restored-holder branch.
+     held / holder       - the area has a holder (its row names a player) / that player's slot (-1 a player slots.txt does not know).
+     goneEvent           - the holder's game is gone at this event (link closed, quit, JOIN_STAGE LOADING, a new connection of its player).
+     restoredUnreported  - held, and the holder's player has sent no report WITHOUT the loading mark since this process started
+                           (AreasReportListing: a loading-marked report does not count - T-1269, a save load is one long freeze).
+     notBack / connected - that player is in T-1269's 'not back' set / has a connection now.
+     heard               - the holder's slot sent a report of either kind within the grace (AreaSlotHeard).
+   A restored claim stands (kChargeRestoredStands, the holder kept whoever lists the area) while its player is not back, or connected
+   and not yet reported unmarked; otherwise a restored claim's holder is gone. Any other holder is gone at its event or its silence.
+   Then AreaChargeDecide. */
+const int kChargeRestoredStands = 8;
+inline int AreaSweepDecide(int held, int holder, int goneEvent, int restoredUnreported, int notBack, int connected, int heard,
+                           int nListers, const int* listers, const double* since, const int* loading, int* why)
+{
+    if (held != 0 && goneEvent == 0 && restoredUnreported != 0 && (notBack != 0 || connected != 0)) { if (why != 0) *why = kChargeRestoredStands; return holder; }
+    int gone = 0;
+    if (held != 0) gone = (goneEvent != 0 || restoredUnreported != 0 || holder < 0 || heard == 0) ? 1 : 0;
+    return AreaChargeDecide(holder, gone, nListers, listers, since, why, loading);
+}
+/* THE LISTING CLOCKS (pure, so the offline suite walks them). The world server keeps per slot two arrival times - `stamp`, its latest
+   report WITHOUT the loading mark (what it lists is what it keeps), and `heard`, its latest report of either kind (the silence clock) -
+   and per area per slot `lastSeen`, the stamp of the latest unmarked report that listed it, and `since`, when that unbroken listing began.
+   A slot lists an area when lastSeen equals its stamp and the slot has been heard within the grace: a loading-marked report moves only
+   `heard`, so a game loading for 44 s (T2203 LEG T) still lists - and keeps - what its last unmarked report listed, and its first
+   unmarked report afterwards decides (T-1269: a save load is one long freeze). */
+inline int AreasReportListing(int loadingMark) { return loadingMark != 0 ? 0 : 1; }   /* 1 = the report's list is a kept listing; 0 = loading: silence clock and position only */
+inline int AreaSlotHeard(int haveHeard, double heard, double now, double grace) { return (haveHeard != 0 && now - heard <= grace) ? 1 : 0; }
+inline int AreaListedNow(int haveStamp, double stamp, int haveHeard, double heard, int haveSeen, double lastSeen, double now, double grace)
+{
+    if (haveStamp == 0 || haveSeen == 0 || AreaSlotHeard(haveHeard, heard, now, grace) == 0) return 0;
+    return lastSeen == stamp ? 1 : 0;
+}
+/* an unmarked report arriving at `now` lists the area: the run goes on when the slot's previous unmarked report (its stamp, havePrev)
+   listed it too (lastSeen == that stamp), else it starts now. */
+inline double AreaListedSince(int havePrev, double prevStamp, int haveSeen, double lastSeen, int haveSince, double since, double now)
+{
+    return (havePrev != 0 && haveSeen != 0 && haveSince != 0 && lastSeen == prevStamp) ? since : now;
 }
 
 }   /* namespace coopstore */

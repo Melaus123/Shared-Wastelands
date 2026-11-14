@@ -47,7 +47,7 @@
 namespace owedpop {
 
 const unsigned kMsgOwed = 63;
-const unsigned kProtocol = 145;   /* the world-server protocol that carries OWED */
+const unsigned kProtocol = 153;   /* the world-server protocol that carries OWED */
 
 
 
@@ -348,7 +348,7 @@ inline int ParseLine(const std::string& line0, Table* t)
 
 // ---- a game's decisions ----
 // LoadCause: the load-time gate's set-aside cause once the owed table is known. `cause` is townreoffer::DeferCause's answer,
-// `may` zones' MayInventFromView answer for the work's sector (1 = this game would make it now), `owed` 1 = the work is an owed
+// `may` zones' MayMakeFromView answer for the work's sector (1 = this game would make it now: the named holder, T-1261), `owed` 1 = the work is an owed
 // row this game does not hold (in the table, or sent and not yet back), `lever` the TEST-ONLY `owedtest aside on`. Work this
 // game would make now is set aside when it is owed (it is made under a claim, from the check-up) or the lever is on. Every other
 // answer stands. The causes are townreoffer::kDefOwed / kDefTestLever (4 / 5 there; repeated here so the header stands alone).
@@ -361,7 +361,9 @@ inline int LoadCause(int cause, int may, int owed, int lever)
     return kCauseNone;
 }
 // Commit: what the town check-up does with one item of set-aside work, once the facts are read.
-//   decide  townreoffer::Decide (0 wait, 1 generate - this game holds the area with the zone live, 2 another game holds it)
+//   decide  townreoffer::Decide (0 wait, 1 generate - this game holds the area with the zone live, 2 another game holds it - since the
+//           T-1261 fold only once that game's naming is confirmed, townreoffer::OtherConfirmed, so a forget below never acts on a lease
+//           the world server may still pass to this game)
 //   found   1 = the building was found in this game's live zones (a bar: always 1); 0 = a complete search found none; -1 = unsure
 //   has     1 = the engine already shows the work done here (residents homed in the building; a bar list used up, or a fill
 //           recorded in the world's bar table); 0 = not done; -1 = could not be read

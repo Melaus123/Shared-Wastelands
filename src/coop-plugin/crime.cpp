@@ -34,6 +34,7 @@
 #include "game/Character.h"
 #include "game/hand.h"
 #include <Windows.h>
+#include <intrin.h>   /* T-1131: _ReturnAddress - the roll's own call sites */
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -42,6 +43,11 @@
 #include <vector>
 
 namespace coop {
+/* T-1293: the thread inside ApplyRemoteHit's played hit right now (0 none) - combat.cpp sets it around that one engine call (the
+   main thread in practice); the setCrime detour compares it with its own thread, so another thread's crime is never taken for it */
+volatile DWORD g_replayHitThread = 0;
+DWORD CrimeReplayHitEnter() { const DWORD prev = g_replayHitThread; g_replayHitThread = ::GetCurrentThreadId(); return prev; }
+void CrimeReplayHitLeave(DWORD prev) { g_replayHitThread = prev; }
 namespace {
 
 unsigned long long kCrNotifyRva = 0; static AddrReg kCrNotifyRva_reg("NotifyCrimeWitnessed", &kCrNotifyRva);   /* Steam_1.0.65 0x851F40 */
@@ -55,6 +61,7 @@ const size_t kCrFaction     = 0x150;   /* Faction* crimeAgainstFaction */
 const size_t kCrHandFields  = 0x168;   /* the victim hand's five id fields (the hand object starts at +0x160) */
 const size_t kCrExpiry      = 0x180;   /* float, game seconds */
 const size_t kCrOwnHandFields = 0x60;  /* a character's own hand +0x58; its five id fields from +0x60 */
+const size_t kCrHandIdsInHand = 0x8;   /* T-1131 fold 2: in a hand OBJECT (as notifyCrimeWitnessed gets it) the five id fields start at +8 (0x168 - 0x160, 0x60 - 0x58) */
 const int    kCrimeScanPerTick = 128;  /* owned characters sampled per CrimeTick */
 const int    kCrimeMaxPerTick  = 16;   /* MSG_CRIME sent per CrimeTick */
 const size_t kCrimeQueueCap    = 256;  /* distinct uids waiting for the safe point */
@@ -130,7 +137,7 @@ int CrCallSet(CrSetFn fn, void* c, const hand* h)
 
 /* Where a copy-side crime (kind 1) was seen: the engine's setCrime write, the owner's state refused because the copy held
    another crime, a guard's bounty added to the copy here. */
-const int kCapSrcSet = 0, kCapSrcRefused = 1, kCapSrcBounty = 2;
+const int kCapSrcSet = 0, kCapSrcRefused = 1, kCapSrcBounty = 2, kCapSrcReplay = 3;   /* T-1293: kCapSrcReplay - recorded inside a replayed hit, never sent */
 void CopyNoteLive(::Character* c, unsigned int uid, int src);   /* defined with the copy-side writes below */
 
 int CrFactionOf(::Character* c, ::Faction** out)
@@ -669,6 +676,7 @@ size_t g_copyCapN = 0;
 CRITICAL_SECTION g_copyCapLock;
 volatile LONG g_copyCapLockInit = 0;
 volatile LONG64 g_copyCaptured = 0, g_copyCapOverflow = 0;
+volatile LONG64 g_copyCrimeInReplaySkipped = 0;   /* T-1293: crimes recorded on a copy inside a replayed hit, not captured */
 long long g_copyLiveNote[2] = { 0, 0 };              /* copy crimes noted held (main thread): the owner's state refused for one, a guard's bounty added */
 volatile LONG64 g_trespassSet[4] = { 0, 0, 0, 0 };   /* setCrime TRESPASSING: calls, recorded, on another player's character, recorded on one */
 volatile DWORD g_crApplyingThread = 0;   /* the thread writing the owner's state onto a copy right now (CrimeApplyDrain); 0 none */
@@ -700,8 +708,18 @@ void CopyCapNote(void* bountyManager, int crime)
     if (!CrBmCharPod(bountyManager, &c) || c == 0) return;
     const unsigned int uid = FindSpawnedUid(c);
     if (uid == 0) return;
+    /* T-1293: inside ApplyRemoteHit's played hit a crime on a copy is the replay's side effect - noted for the drain's line only */
+    const bool inReplay = g_replayHitThread != 0 && g_replayHitThread == ::GetCurrentThreadId();
+    const bool owned = inReplay && net::IsUidMineAnyThread(uid);   /* only read inside a replay: outside it the decision does not use it */
+    const int d = coopcrime::CopyCaptureDecide(owned, inReplay, crime);
+    if (d == coopcrime::kCopyCapNone) return;
+    if (d == coopcrime::kCopyCapReplay) ::InterlockedIncrement64(&g_copyCrimeInReplaySkipped);
     ::EnterCriticalSection(&g_copyCapLock);
-    if (g_copyCapN < kCopyCapMax) { g_copyCap[g_copyCapN].uid = uid; g_copyCap[g_copyCapN].crime = crime; g_copyCap[g_copyCapN].src = kCapSrcSet; ++g_copyCapN; ::InterlockedIncrement64(&g_copyCaptured); }
+    if (g_copyCapN < kCopyCapMax)
+    {
+        g_copyCap[g_copyCapN].uid = uid; g_copyCap[g_copyCapN].crime = crime; g_copyCap[g_copyCapN].src = d == coopcrime::kCopyCapReplay ? kCapSrcReplay : kCapSrcSet; ++g_copyCapN;
+        if (d == coopcrime::kCopyCapNote) ::InterlockedIncrement64(&g_copyCaptured);
+    }
     else ::InterlockedIncrement64(&g_copyCapOverflow);
     ::LeaveCriticalSection(&g_copyCapLock);
 }
@@ -718,6 +736,8 @@ void TrespassSetNote(void* bountyManager, bool recorded)
     if (recorded) ::InterlockedIncrement64(&g_trespassSet[3]);
 }
 
+DWORD g_caughtInNotifyTid = 0;   /* T-1131 fold 2: the main thread inside the caught roll's notifyCrimeWitnessed (0 none) */
+int g_caughtRecorded = 0;         /* ... and the crime its setCrime recorded there (0 = none / refused) */
 bool detour_setCrime(void* bountyManager, int crime, void* againstFaction, const void* againstWho)
 {
     if (PvpRefuse(bountyManager, crime, againstFaction))
@@ -728,12 +748,24 @@ bool detour_setCrime(void* bountyManager, int crime, void* againstFaction, const
     const bool r = orig_setCrime(bountyManager, crime, againstFaction, againstWho);
     if (crime == 11) TrespassSetNote(bountyManager, r);   /* TRESPASSING */
     if (r) CopyCapNote(bountyManager, CrRecordedCrime(bountyManager));   /* what the engine recorded (5 may become 9) */
+    if (g_caughtInNotifyTid != 0 && g_caughtInNotifyTid == ::GetCurrentThreadId()) g_caughtRecorded = r ? CrRecordedCrime(bountyManager) : 0;   /* T-1131 fold 2 */
     return r;
 }
+uintptr_t g_caughtNotifyAt = 0;   /* T-1131: absolute return address of the caught roll's notifyCrimeWitnessed call (0 = no row) */
+bool CaughtBeforeNotify();   /* T-1131, below: true = an event 8 is held for this record (main thread) */
+void CaughtAfterNotify(void* fac, const void* who, int expirySeconds, int recorded);
 void detour_notify(void* bountyManager, void* againstFaction, const void* againstWho, int expirySeconds, int crime)
 {
-    if (PvpRefuse(bountyManager, crime, againstFaction)) { ::InterlockedIncrement64(&g_pvpRefused); return; }
+    const bool atRoll = g_caughtNotifyAt != 0 && (uintptr_t)_ReturnAddress() == g_caughtNotifyAt && CaughtBeforeNotify();   /* T-1131 */
+    if (PvpRefuse(bountyManager, crime, againstFaction))
+    {
+        ::InterlockedIncrement64(&g_pvpRefused);
+        if (atRoll) CaughtAfterNotify(againstFaction, againstWho, expirySeconds, 0);   /* T-1131 fold 2: nothing recorded */
+        return;
+    }
+    if (atRoll) { g_caughtRecorded = 0; g_caughtInNotifyTid = ::GetCurrentThreadId(); }
     orig_notify(bountyManager, againstFaction, againstWho, expirySeconds, crime);   /* its own setCrime call (0x851DB0) goes through detour_setCrime, which notes what was recorded */
+    if (atRoll) { g_caughtInNotifyTid = 0; CaughtAfterNotify(againstFaction, againstWho, expirySeconds, g_caughtRecorded); }   /* T-1131 fold 2: after the record */
 }
 
 // sight1 (docs/design-arrest.md 3 "sight1"; F899; user decision 3 = full parity, recognition on sight included). A guard's
@@ -870,6 +902,18 @@ const size_t kK1InCap = 64;
 const float kCopyDefaultExpiry = 20.0f;        /* the expiry the engine sets (crimewire.h), when the copy's own does not read */
 long long g_copyQueued = 0, g_copySent = 0, g_copyNotRecorded = 0, g_copyAlready = 0, g_copyPlayerVictim = 0, g_copyGone = 0,
           g_copyDropped = 0, g_copySendRetry = 0, g_copySidTooLong = 0;
+std::map<unsigned int, int> g_copyReplayHeld;   /* T-1293: the crime a replayed hit recorded on each copy, while the copy holds it */
+long long g_copyReplayHeldSkipped = 0, g_copyReplayLines = 0;
+const long long kCopyReplayLineCap = 20;
+/* T-1293: one line per copy crime not sent because a replayed hit recorded it (shared cap 20) */
+void CopyReplayLog(unsigned int uid, int crime, unsigned int victim, const char* why)
+{
+    if (g_copyReplayLines >= kCopyReplayLineCap) return;
+    ++g_copyReplayLines;
+    char b[320];
+    std::sprintf(b, "[CRIME] copy crime NOT sent uid=%u crime=%d victim=%u - %s (#%lld/%lld)", uid, crime, victim, why, g_copyReplayLines, kCopyReplayLineCap);
+    DebugLog(std::string(b));
+}
 long long g_ownerK1Recv = 0, g_ownerK1Applied = 0, g_ownerK1Refused = 0, g_ownerK1NotMine = 0, g_ownerK1PlayerVictim = 0,
           g_ownerK1Bad = 0, g_ownerK1Engine = 0, g_ownerK1NoChar = 0, g_ownerK1Overflow = 0, g_ownerK1Dropped = 0, g_ownerK1NoFaction = 0;
 long long g_clearsKeptLocal = 0, g_localCrimeEnded = 0;
@@ -892,6 +936,7 @@ bool MarkRunOut(const CopyMark& m, DWORD now) { return (DWORD)(now - m.ms) >= m.
 void CopyForget()
 {
     g_copyMark.clear(); g_ownerKnown.clear(); g_ownerKnownAt.clear(); g_copyOut.clear(); g_k1In.clear();
+    g_copyReplayHeld.clear();   /* T-1293 */
     if (g_copyCapLockInit != 0) { ::EnterCriticalSection(&g_copyCapLock); g_copyCapN = 0; ::LeaveCriticalSection(&g_copyCapLock); }
 }
 
@@ -950,6 +995,13 @@ void CopyWriteDrain()
         if (c == 0) { ++g_copyGone; continue; }
         int crime = 0; void* fac = 0; unsigned int hand5[5]; float expiry = 0.0f;
         if (!CrReadOwner(c, &crime, &fac, hand5, &expiry)) continue;
+        if (local[i].src == kCapSrcReplay)
+        {   /* T-1293: recorded inside a replayed hit - never sent; remembered while the copy holds it (the live-read roads below) */
+            if (crime == local[i].crime) g_copyReplayHeld[uid] = crime;
+            bool vPlayer = false;
+            CopyReplayLog(uid, local[i].crime, VictimUidOf(hand5, &vPlayer), "recorded inside a replayed hit (another game's decided blow): the replay's side effect, not this character's act");
+            continue;
+        }
         if (crime != local[i].crime) { ++g_copyNotRecorded; continue; }   /* refused by the engine, or replaced since: the live crime wins */
         int pending = 0;
         std::map<unsigned int, CopyMark>::iterator mk = g_copyMark.find(uid);
@@ -959,6 +1011,19 @@ void CopyWriteDrain()
         }
         std::map<unsigned int, int>::const_iterator ok = g_ownerKnown.find(uid);
         const int known = ok != g_ownerKnown.end() ? ok->second : 0;
+        {   /* T-1293: a live read (owner's state refused, guard's bounty added) of the crime a replayed hit recorded here is not sent */
+            std::map<unsigned int, int>::iterator rh = g_copyReplayHeld.find(uid);
+            const int rdec = coopcrime::CopyReplayHeldDecide(rh != g_copyReplayHeld.end() ? rh->second : 0, crime, known, local[i].src != kCapSrcSet);
+            if (rdec == coopcrime::kReplayHeldEnd) g_copyReplayHeld.erase(rh);
+            else if (rdec == coopcrime::kReplayHeldSkip)
+            {
+                ++g_copyReplayHeldSkipped;
+                bool vPlayer = false;
+                CopyReplayLog(uid, crime, VictimUidOf(hand5, &vPlayer), local[i].src == kCapSrcBounty ? "a guard's bounty added here, but the crime the copy holds was recorded inside a replayed hit"
+                              : "the owner's state refused for it, but the crime the copy holds was recorded inside a replayed hit");
+                continue;
+            }
+        }
         float ownerLeft = 1.0e9f;   /* no owner state: nothing is running out */
         std::map<unsigned int, OwnerAt>::const_iterator oa = g_ownerKnownAt.find(uid);
         if (oa != g_ownerKnownAt.end()) ownerLeft = oa->second.expiry - (float)(DWORD)(now - oa->second.ms) / 1000.0f;
@@ -1095,6 +1160,386 @@ bool CopyClearKept(unsigned int uid, int liveCrime, const coopcrime::CrimeState&
     return false;
 }
 
+/* T-1131 DESIGN A: A LOST CAUGHT ROLL'S WATCHER REACTION IS RAISED ON THE GAME THAT RUNS THE WATCHER.
+   A take with thievery checks rolls the thief's caught roll Character vt+0x298 0x793C70 on the THIEF's game (decomp_793c70.txt).
+   Lost, it calls 0x684BD0(watcher's Dialogue +0x280, thief, 8, 0) - the watcher's 'caught' event (call site 0x793D4B, row
+   TheftCaughtEv8Ret) - then notifyCrimeWitnessed(thief, owner's faction, owner's hand, 30, 3) and 0x672F90(watcher, thief, 4), the
+   watcher's memory note (call site 0x793D88, row TheftCaughtMemoryRet); its other branch (watcher +0x2F8 == 1 and a coin flip) calls
+   0x684BD0(.., thief, 0x2F, 0) only (call site 0x793CFB, row TheftCaughtEv2FRet). When the watcher is ANOTHER game's character, that
+   reaction ran on this game's copy (its line dropped at say(), its AI gated) and the real watcher never reacted (T2220, Confirmed).
+   Now, on the thief's game, at those two calls from inside the roll (told apart by their return addresses, so no hook on the roll
+   itself), on the main thread, for a copy watcher and this game's thief with a road open to the watcher's owner: the copy's event
+   and its memory note are NOT run; after the roll's crime write (the memory-note call) the thief's crime and the event go to the
+   watcher's owner as MSG_CRIME kind 3 (crimewire.h). With no road (or off the main thread) the copy's reaction runs here as before
+   and a line says why; a send that fails after the event was held back runs the held copy reaction then. On the watcher's owner:
+   refused with a line when it does not run the watcher now (no retry); else the thief's crime is queued as a kind-0 state first and,
+   at the K2 safe point after that write, the same engine entries are called on its own watcher: 0x684BD0(dlg, thief's copy, ev, 0)
+   and, for event 8, 0x672F90(watcher, thief's copy, 4), after the roll's own state stop of the watcher (vt+0x368 / +0x370).
+   Review folds 1-2: event 8 is sent at the roll's notifyCrimeWitnessed call (row TheftCaughtNotifyRet, through pvp1's hook) with the
+   crime the engine recorded there (sent AFTER the record); with no road there the copy's event runs first, in the roll's order. */
+unsigned long long kCaughtAlertRva = 0; static AddrReg kCaughtAlertRva_reg("StealthKoFailAlert", &kCaughtAlertRva);   /* Steam_1.0.65 0x684BD0: (Dialogue*, who, event, flag) */
+unsigned long long kCaughtMemRva = 0;   static AddrReg kCaughtMemRva_reg("PlatoonMemoryNote", &kCaughtMemRva);       /* Steam_1.0.65 0x672F90: (watcher, about, tag) */
+unsigned long long kCaughtEv8Ret = 0;   static AddrReg kCaughtEv8Ret_reg("TheftCaughtEv8Ret", &kCaughtEv8Ret);       /* Steam_1.0.65 0x793D50 */
+unsigned long long kCaughtEv2FRet = 0;  static AddrReg kCaughtEv2FRet_reg("TheftCaughtEv2FRet", &kCaughtEv2FRet);    /* Steam_1.0.65 0x793D00 */
+unsigned long long kCaughtMemRet = 0;   static AddrReg kCaughtMemRet_reg("TheftCaughtMemoryRet", &kCaughtMemRet);    /* Steam_1.0.65 0x793D8D */
+unsigned long long kCaughtNotifyRet = 0; static AddrReg kCaughtNotifyRet_reg("TheftCaughtNotifyRet", &kCaughtNotifyRet); /* Steam_1.0.65 0x793D7C: the roll's notifyCrimeWitnessed call returns here */
+typedef unsigned long long (*CaughtAlertFn)(void* dlg, void* who, unsigned int ev, char flag);
+typedef void (*CaughtMemFn)(void* watcher, void* about, int tag);
+CaughtAlertFn orig_caughtAlert = 0;
+CaughtMemFn orig_caughtMem = 0;
+uintptr_t g_caughtEv8At = 0, g_caughtEv2FAt = 0, g_caughtMemAt = 0;   /* absolute return addresses of the roll's three calls (0 = no row) */
+long g_caughtHook = 0;                                                /* 1 both hooks in, -1 not */
+const size_t kCaughtDlgOfChar = 0x280;   /* Character -> its Dialogue (the roll's own read, 0x793D3A) */
+const size_t kCaughtDlgMe = 0x150;       /* Dialogue::me (0x684BD0's own read, 0x684BE7) */
+struct CaughtPend { int active; int sent; void* watcherAt; void* thiefAt; unsigned int watcherUid, thiefUid; int ev; char flag; };
+/* MAIN THREAD: an event 8 held back at the roll's event call. Held by uid; the two addresses are kept only to check, after a fresh
+   FindSpawned of each uid, that both are still the same characters (they are never read through). sent = 1: kind 3 went out at the
+   roll's crime record and the memory-note call is to be skipped. */
+CaughtPend g_caughtPend = { 0, 0, 0, 0, 0u, 0u, 0, 0 };
+struct CaughtIn { unsigned int thiefUid, watcherUid, fromPeer; int ev; };
+std::vector<CaughtIn> g_caughtIn;                          /* MAIN THREAD: received kind 3, raised at the K2 safe point */
+const size_t kCaughtInCap = 64;
+long long g_caughtFwd[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };     /* thief's game: heldBack, sent, sendFailed (copy reaction run), noRoute, memMissed, crimeNone, gone, droppedLoading */
+volatile LONG64 g_caughtOffMain = 0;
+long long g_caughtOwn[7] = { 0, 0, 0, 0, 0, 0, 0 };        /* watcher's owner: recv, refused, raised, engineRefused, faulted, overflow, notOwnerNow */
+
+void* CaughtReadPtrPod(const void* p, size_t off)
+{
+    if (p == 0) return 0;
+    __try { return *(void* const*)((const char*)p + off); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int CaughtHandPod(const void* h, unsigned int* hand5)   /* h = a hand object; its id fields from +kCrHandIdsInHand */
+{
+    __try { for (int i = 0; i < 5; ++i) hand5[i] = ((const unsigned int*)((const char*)h + kCrHandIdsInHand))[i]; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* 1 called (*r = its answer), 0 faulted. No C++ object here (C2712). */
+int CaughtCallAlertPod(CaughtAlertFn fn, void* dlg, void* who, unsigned int ev, char flag, unsigned long long* r)
+{
+    __try { *r = fn(dlg, who, ev, flag); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int CaughtCallMemPod(CaughtMemFn fn, void* watcher, void* about, int tag)
+{
+    __try { fn(watcher, about, tag); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* M2 (review fold 1): the roll's own 'stop what you are doing' step on its watcher, before event 8 (decomp_793c70 :35-43, the code at
+   0x793D05-0x793D34): state = vt+0x368(watcher); the first answer 3, else a second read's answer 1 -> vt+0x370(watcher, 0). *state = the first
+   answer (-1 unread). 1 done, 0 faulted. */
+int CaughtStopPod(void* w, int* state, int* stopped)
+{
+    *state = -1; *stopped = 0;
+    __try
+    {
+        void** vt = *(void***)w;
+        typedef int (*StateFn)(void*);
+        typedef void (*StopFn)(void*, int);
+        const int st = ((StateFn)vt[0x368 / 8])(w);
+        *state = st;
+        /* decomp_793c70.txt :35-42: stop when the first answer is 3, else when a second read answers 1 */
+        const bool stop = (st == 3) || (((StateFn)vt[0x368 / 8])(w) == 1);
+        if (stop) { ((StopFn)vt[0x370 / 8])(w, 0); *stopped = 1; }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+bool CaughtOnMain()
+{
+    const unsigned long m = StoreMainThreadId();
+    return m != 0 && ::GetCurrentThreadId() == (DWORD)m;
+}
+/* MAIN THREAD: the held event's two characters looked up again by uid; 1 = both still here at the same addresses, *dlg the watcher's
+   Dialogue (its me = the watcher). */
+int CaughtResolve(const CaughtPend& p, void** w, void** t, void** dlg)
+{
+    *w = 0; *t = 0; *dlg = 0;
+    void* const cw = FindSpawned(p.watcherUid);
+    void* const ct = FindSpawned(p.thiefUid);
+    if (cw == 0 || ct == 0 || cw != p.watcherAt || ct != p.thiefAt) return 0;
+    void* const d = CaughtReadPtrPod(cw, kCaughtDlgOfChar);
+    if (d == 0 || CaughtReadPtrPod(d, kCaughtDlgMe) != cw) return 0;
+    *w = cw; *t = ct; *dlg = d;
+    return 1;
+}
+/* the thief's crime as a kind-3 state: crime 1..max, not against a player (decision 4), sid sendable; else crime 0 */
+coopcrime::CrimeState CaughtState(int crime, float expiry, void* fac, const unsigned int* hand5)
+{
+    coopcrime::CrimeState s;
+    if (crime <= 0 || crime > coopcrime::kCrimeMaxEnum) return s;
+    ::Faction* f = (::Faction*)fac;
+    bool victimIsPlayer = false;
+    const unsigned int victim = VictimUidOf(hand5, &victimIsPlayer);
+    const std::string sid = (f != 0) ? RelationsWireSid(f) : std::string();
+    if ((f != 0 && (IsPlayerFaction(f) || IsPeerFaction(f))) || victimIsPlayer || sid.size() > (size_t)coopcrime::kCrimeMaxSid) return s;
+    s.crime = crime;
+    s.expiry = (coopcrime::CrimeExpiryOk(expiry) && expiry > 0.0f) ? expiry : kCopyDefaultExpiry;
+    if (s.expiry > (float)kCrimeExpiryMax) s.expiry = (float)kCrimeExpiryMax;
+    s.victimUid = victim;
+    s.factionSid = sid;
+    return s;
+}
+void CaughtSentLog(const CaughtPend& p, const coopcrime::CrimeState& s, const char* at)
+{
+    char b[400];
+    std::sprintf(b, "[CRIME] caught -> watcher uid=%u thief uid=%u ev=0x%X crime=%d expiry=%.1f victim=%u sent to the watcher's owner (kind 3, %s; the copy's own event%s not run here)",
+                 p.watcherUid, p.thiefUid, (unsigned int)p.ev, s.crime, CrClampForLog(s.expiry), s.victimUid, at,
+                 p.ev == coopcrime::kCaughtEvCaught ? " and memory note" : "");
+    DebugLog(std::string(b));
+}
+/* MAIN THREAD: the copy's held reaction run here after all (a send that failed): its event, and for 8 its memory note when runMem */
+void CaughtRunLocal(const CaughtPend& p, void* w, void* t, void* dlg, bool runMem, int sendRc, const char* at)
+{
+    unsigned long long er = 0;
+    const int evOk = (orig_caughtAlert != 0) ? CaughtCallAlertPod(orig_caughtAlert, dlg, t, (unsigned int)p.ev, p.flag, &er) : 0;
+    int memOk = -1;
+    if (runMem && p.ev == coopcrime::kCaughtEvCaught && orig_caughtMem != 0) memOk = CaughtCallMemPod(orig_caughtMem, w, t, 4);
+    char b[400];
+    std::sprintf(b, "[CRIME] caught -> watcher uid=%u thief uid=%u ev=0x%X NOT sent (%s, %s) - the copy's own reaction runs here as before: event %s memoryNote=%d",
+                 p.watcherUid, p.thiefUid, (unsigned int)p.ev, sendRc == 0 ? "no road now" : "never sendable", at, evOk ? "raised" : "FAULTED", memOk);
+    ErrorLog(std::string(b));
+}
+void CaughtGoneLog(const CaughtPend& p, const char* why)
+{
+    char b[300];
+    std::sprintf(b, "[CRIME] caught -> watcher uid=%u thief uid=%u ev=0x%X DROPPED: %s - neither game raises this catch",
+                 p.watcherUid, p.thiefUid, (unsigned int)p.ev, why);
+    DebugLog(std::string(b));
+}
+
+/* MAIN THREAD: send the held event with the thief's crime as it stands now (the 0x2F branch at its event call; the backstops). Not
+   sent: the copy's held reaction runs here (L4: after the crime record when the roll had already written it). */
+void CaughtSendHeld(const CaughtPend& p, bool runMem, const char* at)
+{
+    void* w = 0; void* t = 0; void* dlg = 0;
+    if (!CaughtResolve(p, &w, &t, &dlg)) { ++g_caughtFwd[6]; CaughtGoneLog(p, "the watcher or the thief is no longer the character the roll named"); return; }
+    int crime = 0; void* fac = 0; unsigned int hand5[5] = { 0, 0, 0, 0, 0 }; float expiry = 0.0f;
+    if (!CrReadOwner(t, &crime, &fac, hand5, &expiry)) crime = 0;
+    const coopcrime::CrimeState s = CaughtState(crime, expiry, fac, hand5);
+    if (s.crime == 0) ++g_caughtFwd[5];
+    coopcrime::CrimeCaught c;
+    c.watcherUid = p.watcherUid; c.ev = p.ev;
+    const int r = net::SendCrimeCaught(p.thiefUid, s, c);
+    if (r > 0) { ++g_caughtFwd[1]; CaughtSentLog(p, s, at); return; }
+    ++g_caughtFwd[2];
+    CaughtRunLocal(p, w, t, dlg, runMem, r, at);
+}
+
+/* MAIN THREAD, inside the roll: notifyCrimeWitnessed called from the roll (0x793D77, row TheftCaughtNotifyRet) while an event 8 is
+   held. BEFORE the record (fold 2): with no road to the watcher's owner now, the copy's event runs here at once - the roll's own order
+   (event, crime, memory note) - and the hold ends. true = still held: the forward follows the record. */
+bool CaughtBeforeNotify()
+{
+    if (g_caughtPend.active == 0 || g_caughtPend.sent != 0 || !CaughtOnMain()) return false;
+    if (net::CaughtRouteOpen(g_caughtPend.watcherUid)) return true;
+    const CaughtPend p = g_caughtPend;
+    g_caughtPend.active = 0;
+    void* w = 0; void* t = 0; void* dlg = 0;
+    if (!CaughtResolve(p, &w, &t, &dlg)) { ++g_caughtFwd[6]; CaughtGoneLog(p, "the watcher or the thief is no longer the character the roll named"); return false; }
+    ++g_caughtFwd[2];
+    CaughtRunLocal(p, w, t, dlg, false, 0, "before the roll's crime record, single player's order");
+    return false;
+}
+
+/* MAIN THREAD, inside the roll, AFTER notifyCrimeWitnessed (fold 2): kind 3 carries what the engine actually recorded - the crime
+   setCrime recorded inside that call (`recorded`; 0 = notify, setCrime or pvp1 refused it: then no crime, with one line), with the
+   call's own expiry, faction and victim hand. Sent: the memory-note call is skipped (sent = 1). Not sent (the road failed inside
+   this one call): the copy's event runs now, after the record (rare), and the memory note then runs as the engine's. */
+void CaughtAfterNotify(void* fac, const void* who, int expirySeconds, int recorded)
+{
+    if (g_caughtPend.active == 0 || g_caughtPend.sent != 0 || !CaughtOnMain()) return;
+    const int crime = recorded;
+    const CaughtPend p = g_caughtPend;
+    void* w = 0; void* t = 0; void* dlg = 0;
+    if (!CaughtResolve(p, &w, &t, &dlg))
+    {
+        g_caughtPend.active = 0; ++g_caughtFwd[6];
+        CaughtGoneLog(p, "the watcher or the thief is no longer the character the roll named");
+        return;
+    }
+    unsigned int hand5[5] = { 0, 0, 0, 0, 0 };
+    if (who == 0 || !CaughtHandPod(who, hand5)) std::memset(hand5, 0, sizeof(hand5));
+    const coopcrime::CrimeState s = CaughtState(crime, (float)expirySeconds, fac, hand5);
+    if (s.crime == 0) ++g_caughtFwd[5];
+    if (crime == 0)
+    {
+        char nb[300];
+        std::sprintf(nb, "[CRIME] caught -> watcher uid=%u thief uid=%u ev=0x%X: the engine did not record the thief's crime (notifyCrimeWitnessed / setCrime / pvp1 refused it) - kind 3 carries no crime",
+                     p.watcherUid, p.thiefUid, (unsigned int)p.ev);
+        DebugLog(std::string(nb));
+    }
+    coopcrime::CrimeCaught c;
+    c.watcherUid = p.watcherUid; c.ev = p.ev;
+    const int r = net::SendCrimeCaught(p.thiefUid, s, c);
+    if (r > 0) { ++g_caughtFwd[1]; g_caughtPend.sent = 1; CaughtSentLog(p, s, "at the roll's crime record"); return; }
+    ++g_caughtFwd[2];
+    g_caughtPend.active = 0;
+    CaughtRunLocal(p, w, t, dlg, false, r, "after the roll's crime record: the send failed inside the call");
+}
+
+/* MAIN THREAD or ANY THREAD: the roll's own call of the watcher's event (the detour below saw its return address).
+   L5 (review fold 1, kept): the let-off branch 0x2F is chosen inside the roll from THIS game's copy of the watcher (its +0x2F8 and
+   this game's coin flip); the forward carries that choice as it is. */
+unsigned long long CaughtAtRoll(void* dlg, void* who, unsigned int ev, char flag)
+{
+    void* const watcher = CaughtReadPtrPod(dlg, kCaughtDlgMe);
+    const unsigned int wu = (watcher != 0) ? FindSpawnedUid(watcher) : 0u;
+    const unsigned int tu = (who != 0) ? FindSpawnedUid(who) : 0u;
+    const bool onMain = CaughtOnMain();
+    /* L2: on the main thread the exact owner table; off it the lock-free mirror (only to pass the event on untouched) */
+    const bool wCopy = wu != 0 && !(onMain ? net::IsUidMine(wu) : net::IsUidMineAnyThread(wu));
+    const bool tMine = tu != 0 && (onMain ? net::IsUidMine(tu) : net::IsUidMineAnyThread(tu));
+    const bool hooksReady = (int)ev == coopcrime::kCaughtEvLetOff || (orig_notify != 0 && g_caughtNotifyAt != 0);   /* event 8 is sent at the crime record */
+    const bool route = onMain && wCopy && tMine && hooksReady && net::CaughtRouteOpen(wu);
+    const int d = coopcrime::CaughtForwardDecide((int)ev, wCopy, tMine, onMain, route);
+    if (d == coopcrime::kCaughtPass) return orig_caughtAlert(dlg, who, ev, flag);
+    if (d == coopcrime::kCaughtLocalOffMain) { ::InterlockedIncrement64(&g_caughtOffMain); return orig_caughtAlert(dlg, who, ev, flag); }
+    if (g_caughtPend.active != 0)   /* a held event 8 the crime-record / memory-note calls never ended (not expected: straight-line code) */
+    {
+        const CaughtPend old = g_caughtPend;
+        g_caughtPend.active = 0;
+        ++g_caughtFwd[4];
+        if (old.sent == 0) CaughtSendHeld(old, false, "the next roll came first");
+    }
+    if (d == coopcrime::kCaughtLocalNoRoute)
+    {
+        ++g_caughtFwd[3];
+        char b[320];
+        std::sprintf(b, "[CRIME] caught -> watcher uid=%u thief uid=%u ev=0x%X NOT forwarded: %s - the copy's own reaction runs here (as before)",
+                     wu, tu, ev, hooksReady ? "no road to the watcher's owner" : "the crime-record hook is not installed");
+        DebugLog(std::string(b));
+        return orig_caughtAlert(dlg, who, ev, flag);
+    }
+    ++g_caughtFwd[0];
+    CaughtPend p;
+    p.active = 1; p.sent = 0; p.watcherAt = watcher; p.thiefAt = who; p.watcherUid = wu; p.thiefUid = tu; p.ev = (int)ev; p.flag = flag;
+    if ((int)ev == coopcrime::kCaughtEvCaught) { g_caughtPend = p; return 0; }   /* sent after the roll's crime record (CaughtAfterNotify) */
+    CaughtSendHeld(p, false, "at the event (0x2F: no crime record follows)");
+    return 0;
+}
+
+unsigned long long detour_caughtAlert(void* dlg, void* who, unsigned int ev, char flag)
+{
+    const uintptr_t ra = (uintptr_t)_ReturnAddress();
+    if (ra == 0 || (ra != g_caughtEv8At && ra != g_caughtEv2FAt)) return orig_caughtAlert(dlg, who, ev, flag);
+    return CaughtAtRoll(dlg, who, ev, flag);
+}
+
+void detour_caughtMem(void* watcher, void* about, int tag)
+{
+    const uintptr_t ra = (uintptr_t)_ReturnAddress();
+    if (ra == 0 || ra != g_caughtMemAt || g_caughtPend.active == 0 || !CaughtOnMain()) { orig_caughtMem(watcher, about, tag); return; }
+    if (g_caughtPend.watcherAt != watcher || g_caughtPend.thiefAt != about) { orig_caughtMem(watcher, about, tag); return; }
+    const CaughtPend p = g_caughtPend;
+    g_caughtPend.active = 0;
+    if (p.sent != 0) return;   /* sent at the crime record: the copy's memory note is not written here */
+    ++g_caughtFwd[4];          /* the crime-record call was not seen: send now (the crime is recorded by now) */
+    CaughtSendHeld(p, true, "at the memory-note call (the crime-record call was not seen)");
+}
+
+void CaughtInstall()
+{
+    if (g_caughtHook != 0) return;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    if (kCaughtAlertRva == 0 || kCaughtMemRva == 0 || kCaughtEv8Ret == 0 || kCaughtEv2FRet == 0 || kCaughtMemRet == 0 || kCaughtNotifyRet == 0)
+    {
+        g_caughtHook = -1;
+        ErrorLog("[CRIME] T-1131 caught forward NOT installed: a row is missing (StealthKoFailAlert / PlatoonMemoryNote / TheftCaught*Ret) - a caught roll's copy watcher reacts here, as before");
+        return;
+    }
+    g_caughtEv8At = base + (uintptr_t)kCaughtEv8Ret; g_caughtEv2FAt = base + (uintptr_t)kCaughtEv2FRet; g_caughtMemAt = base + (uintptr_t)kCaughtMemRet;
+    g_caughtNotifyAt = base + (uintptr_t)kCaughtNotifyRet;   /* read by detour_notify (pvp1's hook, installed in InstallCrime) */
+    const coop::HookStatus a = coop::AddHook((void*)(base + (uintptr_t)kCaughtAlertRva), (void*)&detour_caughtAlert, (void**)&orig_caughtAlert);
+    if (a != coop::SUCCESS) { orig_caughtAlert = 0; g_caughtEv8At = g_caughtEv2FAt = g_caughtMemAt = 0; g_caughtNotifyAt = 0; g_caughtHook = -1; }
+    else
+    {
+        const coop::HookStatus m = coop::AddHook((void*)(base + (uintptr_t)kCaughtMemRva), (void*)&detour_caughtMem, (void**)&orig_caughtMem);
+        if (m != coop::SUCCESS) { orig_caughtMem = 0; g_caughtMemAt = 0; }   /* L1: event 8 is still sent at the crime record; the copy's memory note then runs here */
+        g_caughtHook = 1;
+    }
+    DebugLog(std::string("[CRIME] T-1131 caught forward hooks: event entry 0x684BD0 ") + (g_caughtHook == 1 ? "installed" : "FAILED")
+             + ", memory note 0x672F90 " + (orig_caughtMem != 0 ? "installed" : "FAILED (the copy's memory note runs here)")
+             + " (event 8 is sent at the roll's crime record, through pvp1's notifyCrimeWitnessed hook; a lost caught roll whose watcher is another game's character is raised on that game)");
+}
+
+/* MAIN THREAD (CrimeTick, after its teardown check): a held event 8 still open outside a roll. sent = the memory-note call was not
+   seen (nothing left to do); else it is sent now, its characters looked up again by uid. While the world loads or tears down
+   (blocked) it is dropped with a line. */
+void CaughtPendFlush(bool blocked)
+{
+    if (g_caughtPend.active == 0) return;
+    const CaughtPend p = g_caughtPend;
+    g_caughtPend.active = 0;
+    if (p.sent != 0) return;   /* already sent at the crime record: nothing is dropped, nothing missed */
+    if (blocked) { ++g_caughtFwd[7]; CaughtGoneLog(p, "the world is loading or tearing down"); return; }
+    ++g_caughtFwd[4];
+    CaughtSendHeld(p, false, "the roll's crime-record and memory-note calls were not seen");
+}
+
+/* MAIN THREAD, K2 safe point (CrimeApplyDrain), after the queued crimes were written: each received kind 3 checked again on this
+   game's own tables (the second owner check) and raised on our own watcher through the engine's own entries (the hooked ones: called
+   from here they pass). For event 8 the roll's own 'stop what you are doing' step runs first (M2). */
+void CaughtRaiseDrain()
+{
+    if (g_caughtIn.empty()) return;
+    std::vector<CaughtIn> work;
+    work.swap(g_caughtIn);
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    for (size_t i = 0; i < work.size(); ++i)
+    {
+        const CaughtIn& in = work[i];
+        char b[460];
+        ::Character* w = net::IsUidMine(in.watcherUid) ? FindSpawned(in.watcherUid) : 0;
+        ::Character* t = FindSpawned(in.thiefUid);
+        int d = coopcrime::CaughtOwnerDecide(net::IsUidMine(in.watcherUid), w != 0, net::UidOwnedByPeer(in.thiefUid, in.fromPeer), t != 0, in.ev);
+        const char* why = coopcrime::CaughtOwnerWhy(d);
+        if (d == coopcrime::kCaughtNotOwner) { ++g_caughtOwn[6]; why = "the watcher changed owner in flight - neither game raises this catch"; }
+        void* dlg = 0;
+        if (d == coopcrime::kCaughtRaise && EngineWritesBlocked()) { d = -1; why = "the world is loading or tearing down"; }
+        if (d == coopcrime::kCaughtRaise && kCaughtAlertRva == 0) { d = -1; why = "the event entry is not in the address table"; }
+        if (d == coopcrime::kCaughtRaise)
+        {
+            dlg = CaughtReadPtrPod(w, kCaughtDlgOfChar);
+            if (dlg == 0 || CaughtReadPtrPod(dlg, kCaughtDlgMe) != (void*)w) { d = -1; why = "the watcher has no Dialogue"; }
+        }
+        if (d != coopcrime::kCaughtRaise)
+        {
+            ++g_caughtOwn[1];
+            std::sprintf(b, "[CRIME] caught <- watcher uid=%u thief uid=%u ev=0x%X from=%u REFUSED at the raise: %s (no retry)",
+                         in.watcherUid, in.thiefUid, (unsigned int)in.ev, in.fromPeer, why);
+            DebugLog(std::string(b));
+            continue;
+        }
+        int state = -1, stopped = 0, stopOk = -1;
+        if (in.ev == coopcrime::kCaughtEvCaught) stopOk = CaughtStopPod(w, &state, &stopped);   /* M2: the roll's own stop of its watcher */
+        unsigned long long r = 0;
+        const int ok = CaughtCallAlertPod((CaughtAlertFn)(base + (uintptr_t)kCaughtAlertRva), dlg, t, (unsigned int)in.ev, 0, &r);
+        int memOk = -1;
+        if (ok && in.ev == coopcrime::kCaughtEvCaught && kCaughtMemRva != 0) memOk = CaughtCallMemPod((CaughtMemFn)(base + (uintptr_t)kCaughtMemRva), w, t, 4);
+        int crime = -1; float ce = -1.0f;
+        CrReadCrime(t, &crime, &ce);
+        if (!ok) ++g_caughtOwn[4];
+        else if ((r & 0xFF) != 0) ++g_caughtOwn[2];
+        else ++g_caughtOwn[3];
+        std::sprintf(b, "[CRIME] caught <- watcher uid=%u thief uid=%u ev=0x%X from=%u event 0x%X %s answer=%d stop[ok,state,stopped]=%d,%d,%d memoryNote=%d thiefCrimeNow=%d/%.1f (our watcher, the engine's own entries)",
+                     in.watcherUid, in.thiefUid, (unsigned int)in.ev, in.fromPeer, (unsigned int)in.ev,
+                     !ok ? "FAULTED" : ((r & 0xFF) != 0 ? "raised" : "raised - REFUSED by the engine"), (int)(r & 0xFF), stopOk, state, stopped,
+                     memOk, crime, CrClampForLog(ce));
+        if (ok) DebugLog(std::string(b)); else ErrorLog(std::string(b));
+    }
+}
+
+std::string CaughtReportText()
+{
+    char b[400];
+    std::sprintf(b, " caughtForward[hook,heldBack,sent,sendFailed,noRoute,memMissed,crimeNone,offMain,gone,droppedLoading]=%ld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " caughtOwner[recv,refused,raised,engineRefused,faulted,overflow,notOwnerNow]=%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_caughtHook, g_caughtFwd[0], g_caughtFwd[1], g_caughtFwd[2], g_caughtFwd[3], g_caughtFwd[4], g_caughtFwd[5], (long long)g_caughtOffMain,
+                 g_caughtFwd[6], g_caughtFwd[7], g_caughtOwn[0], g_caughtOwn[1], g_caughtOwn[2], g_caughtOwn[3], g_caughtOwn[4], g_caughtOwn[5], g_caughtOwn[6]);
+    return std::string(b);
+}
+
 } // namespace
 
 // PROBE-START: P158
@@ -1120,6 +1565,7 @@ void CrimeTick()
 {
     if (EngineWritesBlocked())
     {
+        CaughtPendFlush(true);   /* T-1131 (review fold 1 M1): a held event 8 is dropped with a line while the world loads or tears down */
         ++g_tickBlocked; g_bOut.clear(); g_crimePeer = 0;   /* the world is being torn down or loaded: its factions are going */
         g_sightLawLogged = false;
         if (g_sightCells != 0)   /* sight1; T-356: every cell */
@@ -1132,6 +1578,7 @@ void CrimeTick()
         if (!g_bWasBlocked) { g_bSent.clear(); g_bKnown.clear(); g_bWasBlocked = true; }
         return;
     }
+    CaughtPendFlush(false);   /* T-1131: a held event 8 still open outside a roll (after the teardown check) */
     g_bWasBlocked = false;
     g_crimePeer = (void*)PeerFactionAny();   /* review-pvp1 4: MAIN THREAD, world loaded - a save's coop-peer counts before the first SPAWN */
     if (g_sightCells != 0 || g_trespassCells != 0)
@@ -1282,6 +1729,35 @@ void ApplyRemoteCopyWrite(unsigned int uid, const coopcrime::CrimeState& s, unsi
     g_k1In.push_back(in);
 }
 
+/* T-1131 kind 3 on the watcher's owner (MAIN THREAD, the session drain): refused with a line when this game does not run the watcher
+   now (no retry); else the thief's crime is queued as the sender's kind-0 state (the owner test there), and the raise waits for the
+   K2 safe point after that write (CaughtRaiseDrain). */
+void ApplyRemoteCaught(unsigned int thiefUid, const coopcrime::CrimeState& s, const coopcrime::CrimeCaught& c, unsigned int fromPeer)
+{
+    ++g_caughtOwn[0];
+    const bool wMine = net::IsUidMine(c.watcherUid);
+    const int d = coopcrime::CaughtOwnerDecide(wMine, wMine && FindSpawned(c.watcherUid) != 0, net::UidOwnedByPeer(thiefUid, fromPeer),
+                                               FindSpawned(thiefUid) != 0, c.ev);
+    char b[400];
+    if (d == coopcrime::kCaughtRaise && g_caughtIn.size() >= kCaughtInCap) ++g_caughtOwn[5];
+    if (d == coopcrime::kCaughtNotOwner) ++g_caughtOwn[6];   /* L3 (review fold 1): the watcher changed owner in flight - logged, no retry */
+    if (d != coopcrime::kCaughtRaise || g_caughtIn.size() >= kCaughtInCap)
+    {
+        ++g_caughtOwn[1];
+        std::sprintf(b, "[CRIME] caught <- watcher uid=%u thief uid=%u ev=0x%X from=%u REFUSED: %s (no retry)", c.watcherUid, thiefUid,
+                     (unsigned int)c.ev, fromPeer, d == coopcrime::kCaughtNotOwner ? "this game does not run the watcher now (it changed owner in flight?) - neither game raises this catch"
+                     : (d != coopcrime::kCaughtRaise ? coopcrime::CaughtOwnerWhy(d) : "the queue is full"));
+        DebugLog(std::string(b));
+        return;
+    }
+    std::sprintf(b, "[CRIME] caught <- watcher uid=%u thief uid=%u ev=0x%X from=%u crime=%d expiry=%.1f received: the thief's crime first, the event at the safe point",
+                 c.watcherUid, thiefUid, (unsigned int)c.ev, fromPeer, s.crime, CrClampForLog(s.expiry));
+    DebugLog(std::string(b));
+    if (s.crime != 0) ApplyRemoteCrime(thiefUid, s, fromPeer);
+    CaughtIn in; in.thiefUid = thiefUid; in.watcherUid = c.watcherUid; in.fromPeer = fromPeer; in.ev = c.ev;
+    g_caughtIn.push_back(in);
+}
+
 void CrimeNoteWitnessEvent(int what, const void* who)
 {
     int i = -1;
@@ -1424,7 +1900,7 @@ static void CrimeHeldDrain()
 }
 
 // MAIN THREAD, worker paused (combat.cpp detour_tsRagdollUpdates).
-void CrimeApplyDrain()
+static void CrimeApplyDrainBody()
 {
     /* crime5: bounties - read and written only here, where the worker's BountyManager::update is paused */
     if (!EngineWritesBlocked()) { BountyTestClearDrain(); BountyTestSetDrain(); BountyApply(); BountySample(); }   /* the levers first */
@@ -1526,9 +2002,18 @@ void CrimeApplyDrain()
     }
 }
 
+// MAIN THREAD, worker paused: the queued crimes are written first, then (T-1131) each received caught event is raised on our watcher.
+void CrimeApplyDrain()
+{
+    CrimeApplyDrainBody();
+    if (EngineWritesBlocked() && !g_caughtIn.empty()) { g_caughtOwn[1] += (long long)g_caughtIn.size(); g_caughtIn.clear(); DebugLog("[CRIME] caught <- dropped: the world is loading or tearing down (no retry)"); }
+    CaughtRaiseDrain();
+}
+
 void InstallCrime()
 {
     if (g_copyCapLockInit == 0) { ::InitializeCriticalSection(&g_copyCapLock); g_copyCapLockInit = 1; }   /* before the detours note a write */
+    CaughtInstall();   /* T-1131: before the pvp1 hooks' early return */
     if (g_pvpHook != 0) return;
     if (kCrSetRva == 0) { g_pvpHook = -1; ErrorLog("[CRIME] pvp1: SetCrime is not in the address table - player-vs-player crimes are NOT suppressed"); return; }
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -1596,7 +2081,10 @@ void ReportCrime()
                  (long long)g_witnessEvRepl[0], (long long)g_witnessEvRepl[1], (long long)g_witnessEvRepl[2], (long long)g_witnessEvRepl[3],
                  (long long)g_trespassSet[0], (long long)g_trespassSet[1], (long long)g_trespassSet[2], (long long)g_trespassSet[3],
                  g_copyLiveNote[0], g_copyLiveNote[1]);
-    DebugLog(std::string(b) + " " + PeerFactionCopies() + pv + hv + cw + RelationsEvText());
+    char rp[160];   /* T-1293 */
+    std::sprintf(rp, " copyCrimeInReplaySkipped=%lld copyReplayHeld[skipped,now]=%lld,%u", (long long)g_copyCrimeInReplaySkipped,
+                 g_copyReplayHeldSkipped, (unsigned int)g_copyReplayHeld.size());
+    DebugLog(std::string(b) + " " + PeerFactionCopies() + pv + hv + cw + rp + RelationsEvText() + CaughtReportText());
     char bb[640];
     std::sprintf(bb, "[BOUNTY] REPORT sent[lists,adds,preApplyAdds]=%lld,%lld,%lld applied[lists,adds,addsGated,erased]=%lld,%lld,%lld,%lld"
                  " refused[notOwner,noCopy,noFaction,readFault,writeFault,malformed,queueDropped,noAddr,droppedBlocked]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"

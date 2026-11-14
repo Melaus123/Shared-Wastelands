@@ -13,16 +13,26 @@
  *               the plugin's own removal of a second living body of a named character (kDuplicateNamedRemoved, worldstate.cpp)
  *               is a DEATH too: that body ends for good and the other games remove their copies of it.
  *   AMBIGUOUS - every other reason, and an unknown one: a DEATH only when the engine's own Character::hasDied says dead.
+ *
+ * T-1262 (2026-11-06): ONE REASON IS READ BEFORE THE FLAG. The carrier's job 'feed corpse into machine' (1.0.65 0x140356740) ends by
+ * making the carrier let go (0x5CD750) and removing the body with justUnloaded = TRUE and the reason 'incinerated or cooked'
+ * (0x140356a76..a8a); the body and its inventory end for good. That reason is a FINAL end (kReasonFinal) whatever the flag: a DEATH
+ * (DESPAWN to the other games), never "put away" - so the owner's own burn of its own body is a normal DESPAWN to the other games
+ * (before, it was an UNLOAD and the body was offered for hand-over). For every other reason the flag still decides first: the only
+ * other engine site that hard-codes it to 1 is 'ZoneMapContent::deactivate', a real unload.
  */
 #ifndef COOP_COMMON_REMOVALREASON_H
 #define COOP_COMMON_REMOVALREASON_H
 
 namespace coopremoval {
 
-enum { kReasonDeath = 0, kReasonUnload = 1, kReasonAmbiguous = 2 };
+enum { kReasonDeath = 0, kReasonUnload = 1, kReasonAmbiguous = 2, kReasonFinal = 3 };   /* kReasonFinal: T-1262 - an end under either flag */
 
 /* the reason the plugin passes to GameWorld::destroy when it removes a second living body of a named character this game owns */
 static const char* const kDuplicateNamedRemoved = "duplicate named character removed";
+/* T-1262: the engine's reason when the carrier's job 'feed corpse into machine' burns the body (1.0.65 0x140356a76); the owner's game
+   removes its own body with the same reason when another game's carrier burned its copy there (spawn.cpp BurnOwnBody) */
+static const char* const kIncineratedOrCooked = "incinerated or cooked";
 
 inline int ReasonIs(const char* r, const char* lit)
 {
@@ -34,21 +44,26 @@ inline int ReasonIs(const char* r, const char* lit)
 inline int EngineRemovalReasonClass(const char* r)
 {
     if (r == 0) return kReasonAmbiguous;
+    if (ReasonIs(r, kIncineratedOrCooked)) return kReasonFinal;   /* T-1262: read before anything else */
     if (ReasonIs(r, "corpse unloaded") || ReasonIs(r, "ZoneMapContent::deactivate") || ReasonIs(r, "delayedSpawningChecks")) return kReasonUnload;
     if (ReasonIs(r, "eaten") || ReasonIs(r, "corpse decayed") || ReasonIs(r, "createRandomSquad") || ReasonIs(r, "_putTheSpecialCharactersInNewSquads") || ReasonIs(r, kDuplicateNamedRemoved)) return kReasonDeath;
     return kReasonAmbiguous;
 }
 
-/* 1 = the peer is told UNLOAD (not a death), 0 = DESPAWN. justUnloaded (the engine's own flag) always means UNLOAD; then the
-   reason's class; an AMBIGUOUS reason is a DEATH only when deadState is 1 (Character::hasDied read under SEH: 1 dead, 0 alive,
-   -1 not read or faulted - not a confirmation). */
+/* 1 = the peer is told UNLOAD (not a death), 0 = DESPAWN. T-1262: a FINAL reason is a DEATH whatever the flag; then justUnloaded
+   (the engine's own flag) means UNLOAD; then the reason's class; an AMBIGUOUS reason is a DEATH only when deadState is 1
+   (Character::hasDied read under SEH: 1 dead, 0 alive, -1 not read or faulted - not a confirmation). */
 inline int RemovalIsUnload(int justUnloaded, int reasonClass, int deadState)
 {
+    if (reasonClass == kReasonFinal) return 0;   /* T-1262: the reason before the flag */
     if (justUnloaded != 0) return 1;
     if (reasonClass == kReasonUnload) return 1;
     if (reasonClass == kReasonDeath) return 0;
     return deadState == 1 ? 0 : 1;
 }
+
+/* T-1262: 1 = the engine burned the body in a corpse furnace ('incinerated or cooked'), 0 = any other reason or none. */
+inline int RemovalIsBurn(const char* r) { return EngineRemovalReasonClass(r) == kReasonFinal ? 1 : 0; }
 
 }   /* namespace coopremoval */
 

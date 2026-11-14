@@ -3926,6 +3926,19 @@ static void LoadFail(const std::string& box, const char* title, const std::strin
     g_pressBoxReturn = mode;
     PanelIntro();
 }
+/* T-1279 fold (review finding 1): MAIN THREAD, store.cpp's save-request pump - a held title load REFUSED because the world server's
+   link is down and no dial of it is pending (a joining game's title re-dials used up, or a hosting game, which never re-dials at the
+   title). The existing box and words, nothing new: CAN'T JOIN "The host isn't responding." (the title's own box when its dials run
+   out) for a joining game; CAN'T HOST "The world didn't start in time." for the hosting game. A load the one press started is left
+   as that press's failure (LoadFail: the world left, the box's OK returns to HOST GAME / JOIN GAME); any other load gets the box alone. */
+void UiPreloadRefusedBox(int joining)
+{
+    const std::string box = joining != 0 ? coopui::kPressJoinNoAnswerText : coopui::kPressHostLateText;
+    const char* title = coopui::PressBoxTitle(joining != 0 ? 1 : 0);
+    if (g_loadMode != 0) { LoadFail(box, title, "the held load was refused at the title: the world server's link is down and no dial of it is pending (T-1279)"); return; }
+    ErrorLog("[UI] T-1279: a held load refused at the title (the world server's link is down, no dial pending) - the " + std::string(title) + " box: " + box);
+    UiRaiseNoticeTitled(box, title);
+}
 static void LoadCancel(const char* how)
 {
     const int mode = g_loadMode;

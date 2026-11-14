@@ -100,7 +100,8 @@ inline int AccessTakeRuns(int asked, int allowed) { return (asked == 0 || allowe
 /* T-969 fold 2 (review): THE GATE'S WHOLE DECISION, the same on every thread - PolicyJudge's answer for this game's own player,
    from what the take hook can read without the writer decision. ownerCls: boxowner.h's classes (mirrored below, items.cpp checks
    them); known 0 = no owner answer here (never read on the main thread, or not resolvable now). thisGameWrites: this game writes
-   the box (the owner rung said mine, or the area rule answers this game) - not "a box another game writes". mate: the owner's
+   the box (the owner rung said mine, or the area rule answers this game) - since T-1199 (decision 1348 a) it no longer lets a take through: an owner away is
+   protected as an owner present is. mate: the owner's
    slot is this player's current teammate (rule "member"). peerIsPlayer: PolicyPeerIsPlayer (1 = the stand-in is a player
    faction, so `locked` refuses instead of leaning on the engine's lock).
    DIFFERS FROM PolicyJudge ON PURPOSE: an owner this game cannot read is allowed (counted, kT1GateRunUnread) - PolicyJudge refuses
@@ -121,12 +122,70 @@ inline int GateDecide(int policy, int known, int ownerCls, int thisGameWrites, i
 {
     if (AccessAsk(policy, 1) == 0) return kT1GateRun;                  /* shared / not known yet: judged as shared */
     if (known == 0 || ownerCls == kT1OwnUnreadable || ownerCls == kT1OwnUnknown) return kT1GateRunUnread;
-    if (ownerCls != kT1OwnPeer) return kT1GateRun;                      /* nobody's, mine, a shared faction's: allowed */
-    if (thisGameWrites != 0) return kT1GateRun;                         /* not a box another game writes (decision 992 b) */
+    if (ownerCls != kT1OwnPeer) return kT1GateRun;                      /* nobody's (an ore mine's too), mine, a shared faction's: allowed */
+    (void)thisGameWrites;   /* T-1199 (decision 1348 a): whichever game writes the box - the owner away included - the rule is the same */
     if (mate != 0) return kT1GateRunMate;
     if (policy == kT1PolicyOwner) return kT1GateRefuse;
     if (policy == kT1PolicyLocked) return (peerIsPlayer == 1) ? kT1GateRefuse : kT1GateRun;   /* else the engine's own lock */
     return kT1GateRun;
+}
+/* T-1199 fold 1 (HIGH, review): ANOTHER PLAYER'S OWNER FACTION. standIn: IsStandInFaction (the stand-in table, pointer compares);
+   recordSlot: StandInRecordSlot when it is not a stand-in (the slot its record id coop-p<n> names; < 0 none) - a saved player's
+   faction stays out of the stand-in table until that player is resolved (playerfaction.cpp), so after a load with its owner never
+   joining only its record id names it; mySlot: this game's slot (MySlotForWire). 1 = another player's.
+   Fold 2 (LOW, recheck): before this game knows its own slot (mySlot < 0) no saved player record counts as another player's - this
+   game's own record included, which cannot be told apart yet - so nothing is refused by a record alone then. */
+inline int OtherPlayerOwner(int standIn, int recordSlot, int mySlot)
+{
+    if (standIn != 0) return 1;
+    if (mySlot < 0) return 0;
+    return (recordSlot >= 0 && recordSlot != mySlot) ? 1 : 0;
+}
+/* T-1199 fold 1 (design B, manager 2026-11-14; decision 1348 a; owner 1480): THE OPEN OF A BOX OR A MACHINE WITH INVENTORY. Under
+   Owner only ("who may open a player's chests", rulesfile.h) this game's player's character does not open another non-teammate
+   player's box or machine at all - whether or not its owner is in the world (the loot window is not opened: policy.cpp
+   detour_KitShowTrade). policy: the base access option; character: the thing opened is a character (the trade window's own rule,
+   swaccess::WindowFor, decides those); worldNode: an ore rock (nobody's, owner 1480); otherPlayer: OtherPlayerOwner; mate: that
+   player is this game's player's teammate (decision 481). 1 = refused. */
+inline int OpenRefuse(int policy, int character, int worldNode, int otherPlayer, int mate)
+{
+    if (policy != kT1PolicyOwner || character != 0 || worldNode != 0) return 0;
+    return (otherPlayer != 0 && mate == 0) ? 1 : 0;
+}
+/* T-1199 fold 1 (owner 1480: "another player can still use the owner's ... doors"): A DOOR UNDER Owner only. applying: this game's
+   door applier (another game's state) or the house-purchase replay is opening it; otherPlayer: OtherPlayerOwner of the door's owner;
+   mate: that player is this game's teammate; openerMine: the open is made by THIS game's player - one of its characters' AI open
+   actions (the opener's faction is a player faction, the engine's own test in both actions) or its door panel's Open button. Town
+   people, raiders, other games' copies and the engine's other door opens (a dialogue, a purchase, a melee bash) are never refused.
+   A picked lock does not change it: the door stays refused to this player (the owner's lock is not the protection under Owner only). */
+inline int DoorOpenRefuse(int policy, int applying, int otherPlayer, int mate, int openerMine)
+{
+    if (applying != 0 || openerMine == 0 || policy != kT1PolicyOwner) return 0;
+    return (otherPlayer != 0 && mate == 0) ? 1 : 0;
+}
+/* the per-door repeat line: the 1st, 2nd, 4th, 8th ... refusal of one door is written (a refused open that repeats every tick shows
+   as a climbing count without filling the log) */
+inline int RepeatSays(long n) { return (n > 0 && (n & (n - 1)) == 0) ? 1 : 0; }
+/* T-1199 fold 4 (manager, option A - parity with single player's locked door): A REFUSED DOOR ENDS THE OPENER'S ORDER. Neither engine
+   open action reads openDoor's answer and the task has no timeout, so a refused open was tried again every frame (T2368: 25036
+   refusals). The engine's own locked branch in the lock-test action sets the task's 'impossible' flag (FUN_140019538: +0x26D = 1) and
+   the task system cancels the task on its next look (0x50CE90 -> 0x50C5F0). refused: DoorOpenRefuse said 1; fromPanel: the door panel's
+   Open button (no task - nothing to end); actionMine: an AI open action of THIS game's player's character is running (its task is
+   known). 1 = set that task's end flag, 0 = nothing. */
+inline int DoorRefusalEndsTask(int refused, int fromPanel, int actionMine)
+{
+    return (refused != 0 && fromPanel == 0 && actionMine != 0) ? 1 : 0;
+}
+/* what the end-flag write found (doors.cpp DoorTaskEndPod); kT1DoorTaskPanel = no write asked (the panel's open) */
+enum { kT1DoorTaskPanel = -1, kT1DoorTaskNoTask = 0, kT1DoorTaskEnded = 1, kT1DoorTaskAgain = 2, kT1DoorTaskDone = 3 };
+/* the refusal line, once per order: a refusal that set the end flag is written (the order ends there, so this is the order's one
+   line); a second refusal of the same order before the cancel (Again) or one whose task had already reported done (Done) is not; a
+   refusal that ended no task (the panel's open, a task that could not be read) keeps the per-door 1st, 2nd, 4th, 8th ... rule. */
+inline int DoorRefusalSays(int taskResult, long perDoorN)
+{
+    if (taskResult == kT1DoorTaskEnded) return 1;
+    if (taskResult == kT1DoorTaskAgain || taskResult == kT1DoorTaskDone) return 0;
+    return RepeatSays(perDoorN);
 }
 /* the repeat counter's minute: 1 = a refusal at `now` starts a new minute for the box (none yet, or the last began 60 s ago) */
 inline int GateNewMinute(int haveWindow, unsigned int windowAt, unsigned int now)

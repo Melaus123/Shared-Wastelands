@@ -2,6 +2,7 @@
 // docs/persistence-service.md for the design; engine facts F451-F454 (.modding/03-systems/platoon-lifecycle.md).
 #include "store.h"
 #include "../common/leverpick.h"   /* T-1218: TEST-ONLY picks by key - exactly one, or `#<k>` */
+#include "../common/hometest.h"   /* T-1334: the TEST-ONLY storetest home lever's argument check */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "ownstore.h"   /* mmo1: the own-squad record writer */
 #include "ui.h"         /* mmo5: the host-left window (UiHostLeftShow / UiHostLeftExitClicked) */
@@ -12,6 +13,7 @@
 #include "../common/ownrec.h"
 #include "../common/buildpick.h"   /* T-906: WorldKey - the building-swap pick's world key */
 #include "../common/zonerec.h"   /* T-609 part 2 (H1): a zone record is stamped max(now, last + 1) */
+#include "../common/zonecheck.h"   /* T-1243 (owner 1520 e): an area file that cannot be read to its end is not sent; the TEST-ONLY zonedamage lever */
 #include "../common/savesquadforeign.h"   /* T-710: whose characters a save squad file holds, and the fence for laying this game's own record over it */
 #include "../common/teamresearch.h"   /* T-546 step 6: the shared research decisions (StoreResearchLoadUnion) */
 #include "../common/gamelink.h"   /* M11a S3 (decision 6(a)): link1's ENet timeout terms, applied to the world-server link too */
@@ -19,6 +21,7 @@
 #include "../common/standinpurge.h"   /* inv7a-b: IsStandInRecord - the purge's own stand-in test */
 #include "../common/squadwriter.h"   /* M7a3f3 T-425 [m7a3f3-st0]: HandedOverWakeRefuse */
 #include "../common/arearec.h"   /* T-1084 step 3: the area-recorded marks (R5), the decision at the wake, the authority's build arm */
+#include "../common/loadedzones.h"   /* T-1261 fold: WakeWaitsForNaming - a sleeping group's wake waits for the area's naming */
 #include "../common/areafresh.h"   /* T-1129 (owner 1215 a): AREA_FRESH (89) - a fresh area file from its holder before this game loads the area */
 #include "../common/poskey.h"   /* T-1129 part 2: SectorOf - a restored shop spot's area */
 #include "../common/townverwire.h"   /* TOWN_VER (87): one town version per placed town */
@@ -27,6 +30,8 @@
 #include "camp.h"      /* T-929: CampArrive / CampWorldLoadBegan - the world's camp list */
 #include "../common/campwire.h"   /* T-929: CAMP (93) */
 #include "../common/squadwriterreg.h"   /* T-1084 step 5: the world server's per-squad writer register - SQUAD_TAKE / SQUAD_WRITER */
+#include "game/AITaskSystem.h"   /* T-1122 build: the lent copy's march order (OrdersReceiver::issueOrder) */
+#include "../common/raidsquad.h"   /* T-1122 own raid squads: the travel decision, the publish skip and the row check - the SAME header towngen.cpp and the offline suite compile */
 #include "../common/clearnear.h"   /* owner 1205 a: the TEST-ONLY clearnear lever's argument check, keep decision and reply */
 #include "../common/squadorigin.h"   /* a squad's origin slot: its number's block, or for a save squad the game that runs it now */
 #include "../common/sameidpair.h"   /* one live platoon per world squad id: the record-built mark and the pair guard */
@@ -36,12 +41,20 @@
 #include "../common/piecerec.h"   /* a piece.<sx>.<sy>.#<hash>.<x10>.<z10>.<y10> record is one built piece (build.cpp keeps it), never a squad */
 #include "../common/shoprec.h"    /* a shop.<sx>.<sy>.#<hash>.<x10>.<z10> record is one shop building's restock state (items.cpp keeps it), never a squad */
 #include "../common/doorrec.h"    /* a door.<sx>.<sy>.#<hash> record is one world door's facts (doors.cpp keeps it), never a squad */
+#include "../common/towntime.h"   /* T-4: a towntime.<sx>.<sy>.<sid> record is one town's rebuild clock (towngen.cpp keeps it), never a squad */
+#include "../common/cagerec.h"    /* T-860: a cage.<sx>.<sy>.#<hash>.<x10>.<z10> record is one cage's lock (spawn.cpp keeps it), never a squad */
+#include "../common/bldgrec.h"    /* T-1333: a bldg.<sx>.<sy>.#<hash> record is one town building's ruin flag and wall health (build.cpp keeps it), never a squad */
 #include "../common/boxrec.h"   /* T-823: a box.<sx>.<sy>.#<hash>.<x10>.<z10> record is one box's contents (items.cpp keeps it), never a squad */
 namespace coop { void SameIdWithdrawMarkClearNear(const unsigned int* uids, int n); void SameIdWithdrawDone(); long long SameIdClearNearUnoffered(); }   /* handoff.cpp (handoff.h): the TEST-ONLY clearnear lever's removed squads are never offered to another game */
-namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); int HandedOverSlot(void* faction, const std::string& id); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
+namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); int HandedOverSlot(void* faction, const std::string& id); void HandedOverUnmark(void* faction, const std::string& id, int why); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
+namespace coop { int HandoffKeepReceivers(float px, float pz, int wantSlot, int* namesSlot, int* holderOut); int HandoffSquadKeepPos(void* activePlatoon, float* x, float* z); void HandoffKeepReceiverCounts(long long* skipped, long long* asked); int HandoffSquadHasGiven(void* faction, const std::string& id); int HandoffSquadHasGivenId(const std::string& id); int HandoffMembersTakenBy(void* faction, const std::string& id, void* const* members, int n); int HandoffSquadOpen(void* faction, const std::string& id); int HandoffOpenAny(); long long HandoffOpenSeq(); int HandoffGivenSlotId(const std::string& id); int HandoffSleepersTakenBy(void* faction, const std::string& id, const std::vector<std::string>& hands); long long HandoffIdxSeq(); void HandoffNoteWokeWithGiven(void* faction, const std::string& id); }   /* T-1046 fix 2: handoff.cpp (handoff.h) - the keep question's receiver test is the RELEASE's own (ReceiversFor) */
 namespace coop { void* SpawnBuildingFromSentHand(const unsigned char* handRaw32); int PlatoonHomeHandPod(const void* platoon, unsigned char* out32); int PlatoonSetHomeHandPod(void* platoon, const unsigned char* handRaw32); }   /* spawn.cpp: a sent building handle resolved here; a squad's home-building hand read and given back [t755-copyhome-decl] */
 namespace coop { void KeptNoteRows(const char* p, size_t n); void KeptSaveFinished(long reqSeq); void KeptAreaWritten(const std::string& zoneId); void KeptAreaEcho(const std::string& worldId, int hasStamp, long long stamp); void KeptAreaSent(const std::string& zoneId, int sent, long long stamp); void KeptAreaStampSent(const std::string& zoneId, long long stamp); }   /* KEPT (src/common/keptwire.h): the rows and their state, and what settles a lay - defined in the kept block at the end of this file */
-namespace coop { int TalkWindowOpenNow(); }   /* speech.cpp (speech.h): T-978 - 1 = this game's conversation window shows a conversation now */
+namespace coop { int TalkWindowOpenNow(); }
+/* T-1318 attempt 5 (D1-R2 belt): refused duplicate wakes of a squad this game gave away kept awake for copies in them (CtxDropTick) */
+static long long g_wakeDupKeptGiven = 0, g_wakeDupKeptGivenLines = 0;
+namespace coop { long long WakeDupKeptGivenCount() { return g_wakeDupKeptGiven; } }   /* handoff.cpp's worldWhole8 REPORT token */
+namespace coop { void* BdNearestRowPod(const float* pos, void* faction, int* faulted); float BdTownDistXZ(void* t, const float* pos); }   /* build.cpp: TownListNearest through its own row (faction 0 = any) and a town's x/z distance - T-1122 redesign (b): the borrower's campaign target */   /* speech.cpp (speech.h): T-978 - 1 = this game's conversation window shows a conversation now */
 namespace coop { void TalkFreezeWorldTeardown(); }   /* speech.cpp (speech.h): T-978 A - the frozen NPC slot is forgotten at the world teardown */
 namespace coop { bool AdminLogoutHolds(); }   /* admin.cpp (admin.h): owner 1412 b - this player typed /logout in this world; the door answer carries no login proof until it leaves the world */
 namespace coop { void KeeperMoneyKnownMark(void* own, int ev); int KeeperMoneyKnown(void* own); void KeeperRecordMoneyNote(int carried); void KeeperMoneyListNote(int kind); int ShopPlatoonRecorded(void* platoon); void ShopPlatoonForget(void* platoon); }
@@ -51,6 +64,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 namespace coop { extern volatile long g_bdPickKey; }
 namespace coop { void AreaFreshArrive(const std::vector<char>& payload); void AreaFreshPlayerGone(const std::vector<char>& payload); void AreaFreshTick(); void AreaFreshInstall(unsigned long long base); std::string AreaFreshReportValues(); }   /* T-1129: defined at the end of this file */
 namespace coop { void SettingsStewardEdge(int nowSteward); }   /* settings.cpp: the authority message's edge - a game made the steward mid-world keeps the world's rules (src/common/stewardrules.h) */
+namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* combat.cpp: the terrain height at (x,z) - 1 height, 0 no terrain, -1 no row / faulted. MAIN THREAD (T-1122 attempt 2 fold 1: a lent copy's people placed at the ground's height) */
 namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1084 step 3 - 1 / -1 = the squad may hold a unique character, 0 = its recipe names none */   /* build.cpp (LONG; the Windows names are not included yet here) - T-906: the world key the building-swap pick draws from (PickWorldKeyPublish) */
 #include "../common/queuejournal.h"   /* B12 (decision 52): the outage queue's two pure decisions - the conflict rule and the journal line */
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
@@ -122,6 +136,7 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "../common/stateptr.h"   /* T-296 fix 2 (H055): coopstate::StateWakeDecide / StateReloadAllowed / StateCreateDecide - a platoon's state record (+0x40) lives outside its own container; the offline suite sweeps the same header */
 #include "../common/slotwire.h"   /* stand1: coop-p<n> ids and the N-party zone owner swap */
 #include "../common/squadbirth.h"   /* a squad's birth flag: the keep question, the discard delete, the retire rule */
+#include "../common/fileprobe.h"   /* T-1280: ProbeFile - a file another program holds is never read as empty and written back */
 #include "../common/storemeta.h"   /* B10 (audit C13): kOwnerUnknown, OwnerFieldFromSlot and OwnerTranslateDecide - the SAME translation unit the notebook and the offline test exe compile, so three programs cannot hold three ideas of what the RECORD owner field means. */
 #include "../common/modlist.h"   /* settings5 S5: the mod list on the store HELLO and in the mods REFUSE */
 #include "../common/permdelete.h"   /* DELETE WORLD / DELETE PROFILE delete for good - the path-inside check and which saves go */
@@ -192,7 +207,10 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "../common/lookalikelist.h"   /* T-1096: LOOKALIKE (90) - the world's look-alike list; the SAME header the world server and the offline suite compile */
 
 namespace coop {
-void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char* from);   /* P4e: defined at coop scope below, used by the store-link receive */
+int OwnScratchStateBytes(const void* rec, const std::string& name, const std::string& file, std::vector<char>* out); int OwnStateTypePod(void* rec, int* type);   /* T-1122 fix (H-T1122-emptylend): the raid lend's state record, saved through the own writer's scratch container (defined there) */
+void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char* from, int discard = 0);   /* P4e: defined at coop scope below, used by the store-link receive; T-850: discard = the gone is marked DISCARD (no deleted mark) */
+}
+namespace coop {
 int PreloadHoldsTitleLoad(); void PreloadNoRequest(); void PreloadNoteLoad(const std::string& key, int isZone); void PreloadReleased();   /* T-346 slice 1: defined at coop scope beside StoreFeedTick; the pump and the two load detours call them */
 int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot);   /* M9 (T-197): the whole AREAMAP payload; 1 applied, 0 malformed (msg 0 = malformed). decision 32: zones.cpp fills the locked grid from the relay's map */
 void StoreDrainCreated(); void StoreCreatedLockInit();   /* P4e: defined at coop scope at the end of the file */
@@ -758,7 +776,7 @@ const int kSaveRequestLoad = 2;
 unsigned long long kSaveFileSystemGlobalRva = 0; static coop::AddrReg kSaveFileSystemGlobalRva_reg("SaveFileSystemGlobal", &kSaveFileSystemGlobalRva);   /* P8h: the address table fills this. Steam_1.0.65 0x212DC08 */
 const unsigned int kSfsBusyOff = 0x1E0;
 unsigned long long kResetGameRva = 0; static coop::AddrReg kResetGameRva_reg("ResetGame", &kResetGameRva);   /* P8h: the address table fills this. Steam_1.0.65 0x36CA40 */   // F489: GameWorld::resetGame - what SaveManager::loadGame calls to clear the world mid-session (FactionDirectory::clearAndFree, the global container, the player faction)
-const unsigned int kStoreProtocol = 145;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kStoreProtocol = 153;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 typedef bool (*GdcLoadFn)(void* container, const std::string* file, const std::string* modName, int modIndex, void* serialisable, bool flag);
 GdcLoadFn orig_gdcLoad = 0;
 /* Z1-b (review-z1 item 1): the readFile -> load handshake. It was two bare strings any thread overwrote; it is now a
@@ -782,7 +800,7 @@ struct ZoneStamp { long long writtenAt; unsigned long long seq; ZoneStamp() : wr
    >= 0 also sets the kept mark (g_zoneKeptMark, T-609, owner decision 911 a): on a fresh read it says "loaded while no
    record of this zone existed, with the record list known on link generation markGen"; on a load from a record it is the
    link generation of that load. */
-struct ZoneSwapEntry { std::string file; int owner; long long writtenAt; unsigned long long seq; ZoneSwapEntry() : owner(0), writtenAt(0), seq(0) {} };
+struct ZoneSwapEntry { std::string file; int owner; long long writtenAt; unsigned long long seq; int empty; ZoneSwapEntry() : owner(0), writtenAt(0), seq(0), empty(0) {} };   /* T-1329: empty - the record is an EMPTY area record (zonerec::kZoneEmptyMark): the read gets no file */
 struct ZoneMarkEvent { bool loaded; ZoneStamp stamp; long markGen; long provGen; int listDone; ZoneMarkEvent() : loaded(false), markGen(-1), provGen(-1), listDone(-1) {} };   /* T-823 fold 2: provGen / listDone */
 std::map<std::string, ZoneSwapEntry> g_zoneSwapTS; std::map<std::string, ZoneMarkEvent> g_zoneMarkPending; CRITICAL_SECTION g_zoneSwapLock; bool g_zoneSwapLockInit = false;
 volatile LONG64 g_afFbOffMain = 0;   /* T-1129 part 2 (fallbackOffMain): the area-file swap refused a read OFF the main thread - such a read cannot be held, so this game's own copy loaded; counted only */
@@ -827,6 +845,16 @@ coopfeed::AreaDoneTable g_areaDone;
 volatile long g_areaDoneGen = 1;
 volatile long g_areaGateDisagree[kAreaGateCount] = { 0, 0, 0, 0, 0, 0, 0 };
 long long g_areaDoneAllFeed = 0, g_areaDoneAllTotal = 0, g_areaDoneAllMismatch = 0, g_areaDoneAreas = 0, g_areaDoneStale = 0, g_areaDoneMarkersStale = 0, g_areaDoneMalformed = 0;
+/* T-1339 (protocol 153): AREA_STALE - per area the stamp at which the world server said it HELD a write of that area for this game
+   (g_areaDone.stale); every reader gate reads such an area as not done until its AREA_DONE all=0 (recordfeed.h FeedAreaReadyOnLink /
+   FeedAreaReadyHeld). g_areaGateStaleHeld counts gate reads the old rule called done that a stale mark held (by gate; the last slot =
+   the squad wake and R5, which pass gate -1). g_lateRecordDone: an AREA_DONE all=0 (always behind a catch-up) found its area NOT
+   stale while loaded here - records of an area this game read as done came late (must stay 0). */
+volatile long g_areaGateStaleHeld[kAreaGateCount + 1] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+long long g_staleWhileLoaded = 0;   /* fold 1 (review MED 2): an AREA_STALE drained for an area loaded here that the old rule read as done - it may have been laid from the older copy (the run reads it) */
+long long g_areaStaleIn = 0, g_areaStaleAreas = 0, g_areaStaleCleared = 0, g_areaDoneNotStale = 0, g_lateRecordDone = 0, g_areaStaleMarkersStale = 0, g_areaStaleMalformed = 0, g_areaStaleArrivedStale = 0;
+long long AreaStaleStamp(int k) { return (k < 0 || k >= coopfeed::kFeedAreaKeys) ? -1 : ::InterlockedCompareExchange64(&g_areaDone.stale[k], 0, 0); }
+void AreaGateStaleCount(int gate) { ::InterlockedIncrement(&g_areaGateStaleHeld[(gate >= 0 && gate < kAreaGateCount) ? gate : kAreaGateCount]); }
 long long AreaDoneStamp(int k)
 {
     if (k == coopfeed::kFeedAreaAny) return ::InterlockedCompareExchange64(&g_areaDone.some, 0, 0);
@@ -841,16 +869,22 @@ void AreaGateCount(int gate, int oldAnswer, int newAnswer)
 int AreaDoneOnLinkGate(int k, long link, int oldAnswer, int gate)
 {
     const long gen = ::InterlockedCompareExchange(&g_areaDoneGen, 0, 0);
-    const int n = coopfeed::FeedAreaDoneOnLink(::InterlockedCompareExchange64(&g_areaDone.all, 0, 0), AreaDoneStamp(k), gen, link);
-    AreaGateCount(gate, oldAnswer, n);
+    const long long all = ::InterlockedCompareExchange64(&g_areaDone.all, 0, 0), area = AreaDoneStamp(k);
+    const int done = coopfeed::FeedAreaDoneOnLink(all, area, gen, link);
+    AreaGateCount(gate, oldAnswer, done);   /* gateDisagree keeps its 2B meaning: the area rule against the whole-feed rule */
+    const int n = coopfeed::FeedAreaReadyOnLink(all, area, AreaStaleStamp(k), gen, link);   /* T-1339: and not stale */
+    if (done != 0 && n == 0) AreaGateStaleCount(gate);
     return n;
 }
 /* the snapshot gates: area k done in this generation (StoreSnapshotApplied's meaning, per area) */
 int AreaDoneHeldGate(int k, int oldAnswer, int gate)
 {
     const long gen = ::InterlockedCompareExchange(&g_areaDoneGen, 0, 0);
-    const int n = coopfeed::FeedAreaDoneHeld(::InterlockedCompareExchange64(&g_areaDone.all, 0, 0), AreaDoneStamp(k), gen);
-    AreaGateCount(gate, oldAnswer, n);
+    const long long all = ::InterlockedCompareExchange64(&g_areaDone.all, 0, 0), area = AreaDoneStamp(k);
+    const int done = coopfeed::FeedAreaDoneHeld(all, area, gen);
+    AreaGateCount(gate, oldAnswer, done);
+    const int n = coopfeed::FeedAreaReadyHeld(all, area, AreaStaleStamp(k), gen);   /* T-1339: and not stale */
+    if (done != 0 && n == 0) AreaGateStaleCount(gate);
     return n;
 }
 void AreaDoneClear() { ::InterlockedIncrement(&g_areaDoneGen); }   /* fold (LOW 4): every stamp of the old generation stops reading as done */
@@ -861,7 +895,8 @@ struct ZoneProvRead { long gen; long long teardowns; bool fromRecord; bool after
 std::map<std::string, ZoneProvRead> g_zoneProvRead;
 long long g_zoneProvMade = 0, g_zoneProvGood = 0, g_zoneProvDropRecord = 0, g_zoneProvDropLink = 0, g_zoneProvDropTeardown = 0,
           g_zoneProvThrown = 0, g_zoneReadLines = 0, g_zoneReadLinesSuppressed = 0,
-          g_zoneProvWaitAtSettle = 0;   /* T-823 fold 4: provisional reads made after a settle of their own link, still waiting at the next settle or throw */
+          g_zoneProvWaitAtSettle = 0,   /* T-823 fold 4: provisional reads made after a settle of their own link, still waiting at the next settle or throw */
+          g_zoneProvDropLoadedFault = 0;   /* T-1279: provisional reads dropped for a record while their area was still loaded here (a fault line each, first 16) */
 long g_zoneSettledGen = -1;   /* T-823 fold 4: MAIN THREAD - the link generation of the last list-end settle (-1 after a throw: a WELCOME or teardown) */
 /* seconds on the performance counter - the clock zones.cpp stamps coop::MyMapLoadedSinceTS with */
 static double ZoneNowSec() { static LARGE_INTEGER f; static bool have = false; if (!have) { ::QueryPerformanceFrequency(&f); have = true; } LARGE_INTEGER c; ::QueryPerformanceCounter(&c); return (double)c.QuadPart / (double)f.QuadPart; }
@@ -906,7 +941,8 @@ std::map<void*, unsigned long long> g_bindGenOf;       // Platoon* -> the g_bind
 // Every `g_bind[...] = ...` in this file is followed by this call. There are six of them: StoreRecordCreatedImpl,
 // detour_activate's refused-wake bind, DeathWatchTick's wipe-out bind, StoreBindPlatoon (which is also the CONTEXT bind -
 // spawn.cpp calls it with the peer's platoon id), CreateUnknownSquad, and PlatoonWipe.
-void StampBind(void* platoon) { g_bindGenOf[platoon] = (unsigned long long)(++g_bindGen); }
+void RunHeldRebound(void* platoon);   /* T-850 fold 1b: defined beside g_otherRunHeld (this unnamed namespace) */
+void StampBind(void* platoon) { g_bindGenOf[platoon] = (unsigned long long)(++g_bindGen); RunHeldRebound(platoon); }   /* T-850 fold 1b: every bind site stamps here - a squad here answering to a held delete's id again ends that hold */
 /* THE GROUP'S HOME BUILDING KEY, per world id - MAIN THREAD, world state (the teardown clears it). Filled from every road a record
    reaches this game by (an index line, the world server's push, a preload answer) and from the live group whenever this game writes
    its record (towngen.cpp TownGenPlatoonHomeKey); the record encoder sends it after the flags byte (RecordHomeOf, registered with
@@ -922,7 +958,29 @@ std::string RecordHomeOf(const std::string& worldId) { std::map<std::string, std
    world state */
 std::map<std::string, std::string> g_homeClearedFrom;
 long long g_homeClearedSet = 0, g_homeClearedKept = 0, g_homeRefusedDrop = 0, g_homeClearedNoHome = 0, g_loHomeSaveRefused = 0;
-void NoteRecordHome(const std::string& worldId, const std::string& home, int fromLive = 0)
+/* T-1334: A GROUP'S HOME IS ONE FACT ON EVERY GAME. The game running a group writes its home on change - a move (the T-1084 hook on
+   Ownerships::setHomeBuilding) or a blanking (spawn.cpp detour_removeOwned) marks it due, and a blanked home is written as "-", never left
+   as the old key (HomeWriteLive). Every other game re-homes its LIVE copy when its record's home differs (ReHomeTick), through the
+   engine's own move or blanking; after a world load every bound group is checked once, so a record's home is given over the area file's
+   raw residents link. g_homeBlankSet: squads whose home the engine blanked here since this game last wrote their record. g_homeRecheck:
+   world ids whose record home another game's write changed (or whose home this game blanked); g_homeRecheckLoad: every bound group after a
+   load. MAIN THREAD, world state */
+std::set<void*> g_homeBlankSet;
+std::set<std::string> g_homeRecheck, g_homeRecheckLoad;
+int g_homeRecLoadPass = 0;
+long long g_homeRecDirtyBlank = 0, g_homeRecWrittenNone = 0, g_homeRecReHomed = 0, g_homeRecReHomeMissing = 0, g_homeRecBlankApplied = 0,
+          g_homeRecLinkFixed = 0, g_homeRecRunnerSkip = 0, g_homeRecFailed = 0, g_homeRecSame = 0, g_homeRecLines = 0;
+/* T-1334 fold 1 (review LOW, the replaced key): beside a "-" held for a group, the owner field of the game that wrote it (absent = not
+   known: a purchase's clear made here, HomeClearOne / StoreHomeClearForBuilding). The writer (HomeBlankOne) and every receiver keep the
+   replaced key AND who wrote "-", so every game takes and refuses the same keys: a key naming another building replaces "-"; the
+   replaced building (or near it) named again is refused unless the game that wrote "-" names it (coopstore::MetaHomeNote byClearer). */
+std::map<std::string, int> g_homeClearedBy;
+long long g_homeRecByClearer = 0, g_homeRecArriveSkipped = 0, g_homeRecArriveNoteOnly = 0, g_homeRecBlankNotRunner = 0;
+long long g_homeRecOwed = 0, g_homeRecOwedDone = 0, g_homeRecOwedFailed = 0, g_homeRecOwedRecheck = 0;
+unsigned int StoreOwnerField();   /* defined below in this (anonymous) namespace */
+/* owner: the owner field of the record the home came with (-1 not known; fromLive 1 = this game's own). moveLive 0 (T-1334 fold 1, review
+   MED 2): noted only, no live copy compared - a record of the same stamp as the one held (coopstore::RecHomeArrive) */
+void NoteRecordHome(const std::string& worldId, const std::string& home, int fromLive = 0, int owner = -1, int moveLive = 1)
 {
     if (worldId.empty()) return;
     const std::string was = RecordHomeOf(worldId);
@@ -931,14 +989,26 @@ void NoteRecordHome(const std::string& worldId, const std::string& home, int fro
     /* review MED 4 / 5: the arriving key against the cleared one - exact, or near it (BoxKeyNearKey: the same sector and record within
        the layout drift); -1 = the cleared key is not known */
     const int same = from.empty() ? -1 : ((home == from || (!home.empty() && BoxKeyNearKey(home.c_str(), from.c_str()) != 0)) ? 1 : 0);
-    const std::string kept = coopstore::MetaHomeNote(was, home, fromLive, same);
+    int byClearer = 0;
+    if (coopstore::MetaHomeIsCleared(was) && !home.empty() && !coopstore::MetaHomeIsCleared(home))
+    {   /* the game that wrote the "-" names a home again: its own live home here, or its newer record */
+        const std::map<std::string, int>::const_iterator cb = g_homeClearedBy.find(worldId);
+        const int me = (int)StoreOwnerField();
+        if (cb != g_homeClearedBy.end()) byClearer = (fromLive != 0) ? (cb->second == me ? 1 : 0) : ((owner >= 0 && owner == cb->second) ? 1 : 0);
+    }
+    const std::string kept = coopstore::MetaHomeNote(was, home, fromLive, same, byClearer);
     if (coopstore::MetaHomeIsCleared(was))
     {
-        if (!coopstore::MetaHomeIsCleared(kept)) g_homeClearedFrom.erase(worldId);   /* the group's own live home names another building now */
+        if (!coopstore::MetaHomeIsCleared(kept)) { g_homeClearedFrom.erase(worldId); g_homeClearedBy.erase(worldId); if (byClearer != 0 && same > 0) ++g_homeRecByClearer; }   /* a home again: another building, or the replaced one named by the game that wrote "-" */
         else if (!home.empty() && !coopstore::MetaHomeIsCleared(home)) ++g_homeClearedKept;
     }
-    else if (coopstore::MetaHomeIsCleared(kept) && !was.empty()) g_homeClearedFrom[worldId] = was;   /* cleared by another game: the key it replaced */
+    else if (coopstore::MetaHomeIsCleared(kept))
+    {   /* cleared by another game: the key it replaced, and that game */
+        if (!was.empty()) g_homeClearedFrom[worldId] = was;
+        if (owner >= 0) g_homeClearedBy[worldId] = owner; else g_homeClearedBy.erase(worldId);
+    }
     if (!kept.empty()) g_homeOf[worldId] = kept;
+    if (fromLive == 0 && moveLive != 0 && !kept.empty() && kept != was) g_homeRecheck.insert(worldId);   /* T-1334: another game's newer write changed it - this game's live copy is compared (ReHomeTick) */
 }
 /* one group's home cleared ("-"): a give of its home was refused as a player's house, or the save's own home is one. MAIN THREAD */
 void HomeClearOne(const std::string& worldId)
@@ -947,7 +1017,46 @@ void HomeClearOne(const std::string& worldId)
     const std::string was = RecordHomeOf(worldId);
     if (coopstore::MetaHomeIsCleared(was)) return;
     if (!was.empty()) g_homeClearedFrom[worldId] = was;
+    g_homeClearedBy.erase(worldId);   /* T-1334 fold 1: a purchase's clear - no game may name the house again (unchanged rule) */
     g_homeOf[worldId] = coopstore::kMetaHomeCleared; ++g_homeClearedSet;
+}
+/* T-1334: the engine blanked the group's home on this game, which writes its record: "-" (no home), so the old key cannot come back.
+   T-1334 fold 1 (review LOW): the key it replaced is kept beside it, with this game as the one that wrote "-" - exactly what every
+   receiving game keeps when the "-" reaches it (NoteRecordHome) - so the writer and the receivers take and refuse the same keys: this
+   game's own live home (or a later record of its own) naming any building replaces the mark; another game naming the replaced building
+   (or near it) does not, naming another building does. 1 = set. MAIN THREAD */
+int HomeBlankOne(const std::string& worldId)
+{
+    const std::string was = RecordHomeOf(worldId);
+    if (worldId.empty() || coopstore::MetaHomeIsCleared(was)) return 0;
+    if (!was.empty()) g_homeClearedFrom[worldId] = was; else g_homeClearedFrom.erase(worldId);
+    g_homeClearedBy[worldId] = (int)StoreOwnerField();
+    g_homeOf[worldId] = coopstore::kMetaHomeCleared;
+    return 1;
+}
+/* T-1334: the group's home as this game writes its record (the sleep write, the heartbeat): the live key, or "-" when the engine blanked
+   its home here since the last write and it has none now (a group made from its record that has not been given its home yet has none
+   too, and keeps its key). 1 = the home sent with the record changed. MAIN THREAD */
+int HomeWriteLive(void* platoon, const std::string& worldId)
+{
+    const std::string was = RecordHomeOf(worldId);
+    char hk[128]; hk[0] = 0;
+    const int hr = TownGenPlatoonHomeKey(platoon, hk, 128);
+    if (hr == 1) { g_homeBlankSet.erase(platoon); NoteRecordHome(worldId, std::string(hk), 1); }
+    else if (hr == 0 && g_homeBlankSet.erase(platoon) != 0 && HomeBlankOne(worldId) != 0) ++g_homeRecWrittenNone;
+    return RecordHomeOf(worldId) != was ? 1 : 0;
+}
+/* T-1334 fold 1 (review MED 2): the world server's push of a record - its home is noted by ApplyRemoteRecord's own newer-than test, read
+   before it runs (the stamp it compares: posAt for a position update, writtenAt for a full record): an older record's home is not noted
+   and moves nothing; one of the same stamp is noted without moving a live copy; a newer one is noted and live copies compared. MAIN THREAD */
+void PushNoteRecordHome(const std::string& worldId, const std::string& homeR, int owner, long long writtenAt, int positionOnly)
+{
+    const std::map<std::string, Record>::const_iterator hr = g_records.find(worldId);
+    const long long heldAt = hr == g_records.end() ? 0LL : (positionOnly != 0 ? hr->second.posAt : hr->second.writtenAt);
+    const int hv = coopstore::RecHomeArrive(hr != g_records.end() ? 1 : 0, heldAt, writtenAt);
+    if (hv == coopstore::kRecHomeArriveSkip) { ++g_homeRecArriveSkipped; return; }
+    if (hv == coopstore::kRecHomeArriveNote) ++g_homeRecArriveNoteOnly;
+    NoteRecordHome(worldId, homeR, 0, owner, hv == coopstore::kRecHomeArriveTake ? 1 : 0);
 }
 /* 1 = the building a save's own home hand names is loaded here and is a player's house (towngen.cpp TownGenPlayerHouse). MAIN THREAD */
 int LoSaveHomePlayerHouse(const unsigned char* hand32)
@@ -971,7 +1080,7 @@ long long g_homeAsked = 0, g_homeSetCreate = 0, g_homeSetLater = 0, g_homeNotLoa
    bind stamp it was listed under (stamp 0: it was not bound here then), the building handle it was sent with (or the save's own) and the
    home key known then (either may be empty), the gives that did not take, and whether a key/handle disagreement was logged. MAIN THREAD,
    world state [t755-copyhome-owelist] */
-struct CopyHomeOwed { std::string worldId, key; unsigned long long bindGen; unsigned char hand[32]; int tries, mismatchLogged; DWORD nextLookAt; CopyHomeOwed() : bindGen(0), tries(0), mismatchLogged(0), nextLookAt(0) { std::memset(hand, 0, sizeof hand); } };
+struct CopyHomeOwed { std::string worldId, key; unsigned long long bindGen; unsigned char hand[32]; int tries, mismatchLogged, reHome; DWORD nextLookAt; CopyHomeOwed() : bindGen(0), tries(0), mismatchLogged(0), reHome(0), nextLookAt(0) { std::memset(hand, 0, sizeof hand); } };   /* reHome 1 (T-1334 fold 1): a live copy owed its RECORD's home over the one it has (ReHomeOne) */
 std::map<void*, CopyHomeOwed> g_copyHomeOwedMap;
 void* g_copyHomeCursor = 0;   /* where the next once-a-second walk starts (round-robin) */
 long long g_copyHomeOwed = 0, g_copyHomeGiven = 0, g_copyHomeNotResident = 0, g_copyHomeHad = 0, g_copyHomeRetried = 0, g_copyHomeGiveFailed = 0, g_copyHomeMismatch = 0, g_copyHomeGone = 0, g_copyHomeNoId = 0;
@@ -979,10 +1088,11 @@ long long g_copyHomeOwedLines = 0, g_copyHomeGivenLines = 0, g_copyHomeRetryLine
 /* LOAD-OVERRIDE and the squad's home after the engine's read: the squads already logged, and what was done */
 long long g_loHomeKeptRefused = 0;   /* review MED 2: a home the swapped-in record left that is a player's house - dropped, the key cleared */
 std::set<std::string> g_loHomeSeen; long long g_loHomeKept = 0, g_loHomeRestored = 0, g_loHomeRestoreFailed = 0, g_loHomeOwedByKey = 0, g_loHomeNoneAnywhere = 0;
-/* lists a squad as owed its home: with the bind stamp it holds under worldId now (0 when it is not bound here under that id) */
-void CopyHomeOweAdd(void* p, const std::string& worldId, const unsigned char* hand32, const std::string& key)
+/* lists a squad as owed its home: with the bind stamp it holds under worldId now (0 when it is not bound here under that id); reHome 1 =
+   owed its record's home over the one it has (T-1334 fold 1, ReHomeOne) */
+void CopyHomeOweAdd(void* p, const std::string& worldId, const unsigned char* hand32, const std::string& key, int reHome = 0)
 {
-    CopyHomeOwed o; o.worldId = worldId; o.key = key;
+    CopyHomeOwed o; o.worldId = worldId; o.key = key; o.reHome = reHome;
     const std::map<void*, std::string>::const_iterator b = g_bind.find(p);
     const std::map<void*, unsigned long long>::const_iterator g = g_bindGenOf.find(p);
     o.bindGen = (b != g_bind.end() && b->second == worldId && g != g_bindGenOf.end()) ? g->second : 0;
@@ -1032,6 +1142,8 @@ long long g_storeLooseDeferred = 0, g_worldSwitchNeedsRestart = 0;
    the queue.txt and deleted.*.bits of a world folder not yet armed would be the wrong file or none - and the entries
    stay in memory: the queue is merged at QueueLoad, the bits are written at LoadIndex. */
 long long g_writesHeldBeforeIndex = 0;
+int g_queueUnmerged = 0;   /* T-1280: queue.txt was there and could not be read at QueueLoad - the queue is in memory only; the next QueueSave merges first */
+int g_queueLockHeld = 0, g_joinedQueueLockHeld = 0;   /* T-1280: FileLockedNote's flags - QueueLoad's read, JoinedQueueTake's read */
 std::set<std::string> g_bitsHeldBeforeIndex;   /* W2-f (review-w2 B): factions whose bits file write waited for the index */
 // P2 item 1 - the store link. When it is up, records go to SharedWastelandsServer.exe (which forwards them), the canonical files are
 // the process's (we keep mirrors only), and the OFF-SCREEN AUTHORITY (who moves sleeping squads and publishes their
@@ -1346,6 +1458,33 @@ std::set<void*> g_unloadEmptied;
 const size_t kUnloadEmptiedCap = 65536;
 long long g_unloadEmptiedNoted = 0, g_unloadEmptiedKeptMark = 0, g_unloadEmptiedDiscard = 0, g_unloadEmptiedCapFull = 0, g_unloadEmptiedCleared = 0, g_unloadEmptiedLines = 0;
 volatile LONGLONG g_unloadEmptiedOffThread = 0;   /* removals replayed off the object (the off-thread despawn drain) or off the main thread: counted, not noted */
+/* T-850: bound squads that lost a LIVING member another game runs now (its puppet here) to an engine UNLOAD removal (spawn.cpp
+   NotifyDespawn's RemovalIsUnload branch; an off-thread removal carries the squad and the hasDied read taken at its hook). Their destroy
+   keeps the record (squadbirth.h DestroyDeleteRun -> kDelRunKept). Taken by the destroy; forgotten with the platoon, at its unbind and
+   at teardown; capped. MAIN THREAD. */
+std::map<void*, std::map<unsigned int, int> > g_otherRunRemoved;   /* fold 1: platoon -> each living person it lost -> sqbirth::kLost* */
+const size_t kOtherRunRemovedCap = 65536;
+std::set<unsigned int> g_otherRunDead;   /* fold 1: uids whose runner said they died (a DESPAWN) - a squad's note of them answers 'not run elsewhere'; capped, world state */
+struct OtherRunHeld { long long stamp; int was; int modMade; std::map<unsigned int, int> notes; OtherRunHeld() : stamp(0), was(0), modMade(0) {} };
+std::map<std::string, OtherRunHeld> g_otherRunHeld;   /* fold 1 (M4): squad deletes held until an open hand-over of one of its people settles; world state */
+long long g_otherRunNoted = 0, g_otherRunNotedDrained = 0, g_otherRunDeadSkipped = 0, g_otherRunUnbound = 0, g_otherRunCapFull = 0, g_otherRunKept = 0, g_otherRunKeptLines = 0;
+/* T-850 fold 2 (T2217): the platoons the death watch saw with a living member of this game's own (session uid this game's, or none) -
+   a copy never in it, destroyed empty, was never the squad here (sqbirth::ShellKeep). Keyed by address: erased at the forget, at a reused
+   address and at the world teardown. */
+std::set<void*> g_ownLivedHere;
+const size_t kOwnLivedCap = 65536;
+long long g_ownLivedCapFull = 0, g_shellKept = 0, g_shellKeptLines = 0, g_shellWake = 0, g_shellOther = 0, g_shellNeverOwn = 0, g_shellPair = 0, g_shellDiedSent = 0;
+long long g_otherRunCleared = 0, g_otherRunDied = 0, g_otherRunAnsweredNo = 0, g_otherRunHeldN = 0, g_otherRunHeldKept = 0, g_otherRunHeldSent = 0, g_otherRunHeldRebound = 0, g_otherRunHeldLines = 0;
+/* T-850 fold 1b: the bind of `platoon` (StampBind - g_bind already names its id): a held delete for that id is dropped - the squad lives here
+   again, so nothing is deleted (sqbirth::RunHeldOnRebind). MAIN THREAD. */
+void RunHeldRebound(void* platoon)
+{
+    if (g_otherRunHeld.empty()) return;
+    std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
+    if (b == g_bind.end() || b->second.empty()) return;
+    if (sqbirth::RunHeldOnRebind(g_otherRunHeld.count(b->second) != 0 ? 1 : 0) != 0) { g_otherRunHeld.erase(b->second); ++g_otherRunHeldRebound; }
+}
+long long g_goneDiscardRecv = 0, g_goneDiscardBitSkipped = 0, g_sleepRefusedDeletedLines = 0;   /* T-850 D2: received discards with no deleted mark set; discards dropped unapplied with no mark set; the refused put-away's lines */
 std::map<void*, int> g_keepVerdictOf;    /* MAIN THREAD: each bound squad's last keep verdict (squadbirth.h), so a squad is counted once per change */
 void BirthLockEnter()
 {
@@ -1443,6 +1582,7 @@ int CharRecCountPod(const void* holder)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+static const long long kWakeCountLineCap = 300;   /* T-850 T2198: the WAKE-COUNT lines (logging only) - 40 before; a joining game wakes more groups than that (T2194) */
 static long long g_wakeRoadSwap = 0, g_wakeRoadSwapMissed = 0, g_wakeCountLines = 0, g_wakeFilledUnread = 0, g_wakeMarkedRead = 0;   // wakes left to the engine's read / of those the load hook did not take / WAKE-COUNT lines written
 static long long g_loadOverrideRetried = 0, g_loadOverrideRetryFailed = 0;   // a record's file the engine failed to load, read again from the save's own file / that read failing too
 /* A squad woken with a newer record, until its people are first seen (main thread only). The engine builds the people on a later
@@ -1457,6 +1597,15 @@ int ReadCharPosPod(void* c, float* x, float* z)
 {
     __try { *x = *(float*)((char*)c + 0x48); *z = *(float*)((char*)c + 0x50); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1122 attempt 2 (owner 1619 a): THE PEOPLE'S CENTRE of an awake squad - the point the engine's keep test reads (raidsq::PeopleCentre
+   over each live member's Character+0x48), never the platoon's own marker (F463: it lags walking members by kilometres). n members
+   (at most 64 read); the number read (0 = none). MAIN THREAD. */
+int LivePeopleCentrePod(void** members, int n, float* cx, float* cz)
+{
+    float xs[64], zs[64]; int k = 0;
+    for (int i = 0; i < n && i < 64 && members != 0; ++i) if (Plaus(members[i]) && ReadCharPosPod(members[i], &xs[k], &zs[k])) ++k;
+    return raidsq::PeopleCentre(xs, zs, k, cx, cz);
 }
 /* T-251 part 2: THE CHARACTER EDITOR'S STATE (.modding/investigations/t251-part2-save-after-creation.md). ForgottenGUI+0x1C0 =
    the CharacterEditWindow, 0 = none (isCharacterEditorMode 0x47A0A0 is exactly this test - Confirmed bytes, same in 1.0.68
@@ -1521,6 +1670,23 @@ int MembersOwnership(void** members, int count, int* known, int* mine)
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1318 attempt 4 (design A, site 10): living members with no uid (never numbered) - dead left out by the engine's flag, unreadable counted
+   alive; -1 = the read faulted */
+int MembersLivingUnnumbered(void** members, int count)
+{
+    __try
+    {
+        int n = 0;
+        for (int i = 0; i < count && i < 256; ++i)
+        {
+            void* c = members[i];
+            if (!Plaus(c) || FindSpawnedUid(c) != 0) continue;
+            if (StoreIsDeadPod(c) != 1) ++n;
+        }
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 /* members whose uid is a person this game ran and released to another game (net::IsUidReleasedHere); -1 = the read faulted (read as "some") */
 int MembersReleasedHere(void** members, int count)
@@ -2316,14 +2482,25 @@ std::string MetaFile(const std::string& worldId) { return g_dirCanonical + "\\" 
 std::string MirrorFile(const std::string& worldId) { return recname::MirrorDataFile(g_dirMirror, Sanitize(worldId), IsZoneId(worldId)); }
 /* Z1-b (review-z1 item 1): MAIN THREAD. Copy g_records' current entry for one zone id into the swap table, or remove it.
    Called after every g_records write or erase that can touch a zone id; a non-zone id returns at once. */
+/* T-1329: 1 = the file at `path` is exactly an EMPTY area record (zonerec::kZoneEmptyMark) - its size is looked at first, so an area
+   file is never read whole here */
+int ZoneFileEmptyMark(const std::string& path)
+{
+    std::ifstream f(U8W(path.c_str()).c_str(), std::ios::binary); if (!f) return 0;
+    f.seekg(0, std::ios::end); const std::streamoff n = f.tellg();
+    if (n != (std::streamoff)zonerec::kZoneEmptyMarkLen) return 0;
+    f.seekg(0); std::vector<char> b((size_t)n); f.read(&b[0], n); if (!f) return 0;
+    return zonerec::ZoneEmptyIs(b);
+}
 void ZoneSwapPublish(const std::string& worldId)
 {
     if (!IsZoneId(worldId)) return;
     PendingLockInit();   /* the main thread; normally already done at install */
     std::map<std::string, Record>::const_iterator it = g_records.find(worldId);
+    const int emptyRec = (it != g_records.end() && !it->second.file.empty()) ? ZoneFileEmptyMark(it->second.file) : 0;   /* T-1329: an EMPTY record - the read is given no file */
     ::EnterCriticalSection(&g_zoneSwapLock);
     if (it == g_records.end()) g_zoneSwapTS.erase(worldId);
-    else { ZoneSwapEntry& e = g_zoneSwapTS[worldId]; e.file = it->second.file; e.owner = it->second.owner; e.writtenAt = it->second.writtenAt; e.seq = it->second.seq; }
+    else { ZoneSwapEntry& e = g_zoneSwapTS[worldId]; e.file = it->second.file; e.owner = it->second.owner; e.writtenAt = it->second.writtenAt; e.seq = it->second.seq; e.empty = emptyRec; }
     ::LeaveCriticalSection(&g_zoneSwapLock);
     if (it != g_records.end())
     {   /* T-609: the first record ANOTHER slot wrote of a zone with a kept mark - when it landed is the time the copy must have been loaded by */
@@ -2331,7 +2508,7 @@ void ZoneSwapPublish(const std::string& worldId)
         const int ow = it->second.owner;
         if (nm != g_zoneKeptMark.end() && nm->second.recordSeenAt == 0.0 && ow >= 0 && ow <= coopslot::kSlotMax && ow != ZoneMySlot()) nm->second.recordSeenAt = ZoneNowSec();
     }
-    if (it == g_records.end() || it->second.file.empty()) { g_areaNamed.erase(worldId); g_areaScanQueue.erase(worldId); }
+    if (it == g_records.end() || it->second.file.empty() || emptyRec != 0) { g_areaNamed.erase(worldId); g_areaScanQueue.erase(worldId); }   /* T-1329: an EMPTY record names no owners */
     else if (g_areaScanQueue.size() < 65536) g_areaScanQueue.insert(worldId);   /* AreaOwnerScanTick reads which players its file names */
     ++g_zoneSwapPubGen;   /* AreaWriterStandInsTick looks at the table again */
 }
@@ -2443,7 +2620,16 @@ void ZoneProvisionalSettle(const std::vector<unsigned short>* areas)   /* T-985 
         const int why = zonerec::ZoneProvisionalJudge(blocks, p.gen, lg, p.teardowns, g_worldTeardowns);
         if (why == zonerec::kZpMadeGood)
         { ZoneKeptMark& m = g_zoneKeptMark[it->first]; m.gen = lg; m.fromRecord = p.fromRecord; m.recordSeenAt = 0.0; ++g_zoneProvGood; }
-        else if (why == zonerec::kZpRecordHeld) ++g_zoneProvDropRecord;
+        else if (why == zonerec::kZpRecordHeld)
+        {
+            ++g_zoneProvDropRecord;
+            int sx = -1, sy = -1; double since = 0.0;
+            if (zonerec::ZoneRecIdParse(it->first, &sx, &sy) != 0) { coop::Sector sec; sec.x = sx; sec.y = sy; since = coop::MyMapLoadedSinceTS(sec); }
+            if (since > 0.0 && ++g_zoneProvDropLoadedFault <= 16)   /* T-1279: still loaded here - it stays as read until the engine loads it again */
+                ErrorLog("[ZONE] FAULT (T-1279): " + it->first + " was read " + std::string(p.fromRecord ? "from an older record" : "from this game's own area file")
+                         + " before the world's record of it was here, and that record has arrived while the area is still loaded - it stays as read until it is loaded again, and its saves are refused"
+                         + " until then (zoneProvDropLoadedFault=" + N(g_zoneProvDropLoadedFault) + ", first 16 logged)");
+        }
         else if (why == zonerec::kZpLinkChanged) ++g_zoneProvDropLink;
         else ++g_zoneProvDropTeardown;
         if (g_zoneReadLines < 200)
@@ -2732,7 +2918,8 @@ long long g_queueQueued = 0, g_queueWriteFailed = 0, g_queueLoaded = 0, g_queueR
 long long g_queueDropNewerWriter = 0, g_queueDropUnknown = 0, g_queueDropBadEntry = 0;
 long long g_queueOffThread = 0, g_queueKeyRefused = 0, g_queueSeqNoRecord = 0;
 /* B12-c (review-b12). FIVE MORE OUTCOMES, EACH ITS OWN EVENT.
-   dropBadPayload (M-4): an entry whose saved write could not be read back at the replay. It used to be
+   dropBadPayload (M-4): an entry whose saved write could not be read back at the replay (T-1243: and a zone entry whose area file
+   cannot be read to its end). It used to be
    counted as REPLAYED, which is a lost move printed as a written one.
    dropNotMineNow (M-5): the zone ladder was asked again at the replay - decision 40 wins over a stale
    queue - and another game holds that sector now.
@@ -2784,9 +2971,11 @@ long long g_queueZoneWriteFailed = 0;
    asked by name in several readouts and widening it would change every one of them. */
 int g_zoneLastRefusedNoNotebook = 0;
 std::string QueueFile() { return g_dirCanonical + "\\queue.txt"; }   /* W2b: inside the world folder - see THE FILE above */
+void QueueLoad();   /* T-1280: QueueSave merges a journal QueueLoad could not read before it writes one */
 int QueueSave()
 {
     if (!g_indexLoaded) { ++g_writesHeldBeforeIndex; return 1; }   /* W2-f (review-w2 B): held in memory, written at QueueLoad */
+    if (g_queueUnmerged != 0) { QueueLoad(); return 1; }   /* T-1280: merged with the file first (QueueLoad writes the merge); still held - kept in memory, nothing written */
     std::string all;
     for (std::vector<coopqueue::QueueEntry>::size_type i = 0; i < g_queue.size(); ++i)
     {
@@ -2818,10 +3007,23 @@ void QueueLoad()
        queued when they were queued and are not counted again. */
     std::vector<coopqueue::QueueEntry> held;
     held.swap(g_queue);
-    std::vector<char> b;
     long long good = 0, bad = 0, heldSuperseding = 0;
-    const bool haveFile = ReadFileBytes(QueueFile(), &b);   /* no journal is the ordinary case and is not an event */
-    const std::string all = haveFile ? std::string(b.begin(), b.end()) : std::string();
+    const coopstore::FileProbe qp = coopstore::ProbeFile(QueueFile());   /* no journal is the ordinary case and is not an event */
+    const int qstep = coopstore::FileLockedNote(qp.kind, &g_queueLockHeld);
+    if (coopstore::FileLockSkips(qstep))
+    {   /* T-1280: a journal another program holds is not an empty one - read as one, the next QueueSave would rewrite it with only this
+           session's entries. Every entry stays in memory (they replay at this session's link-up as before), nothing is written, and
+           the next QueueSave merges the file first. */
+        g_queue.swap(held);
+        g_queueUnmerged = 1;
+        if (qstep == coopstore::kLockSkipFirst)
+            ErrorLog(coopstore::FileLockedLine("[STORE] outage queue", QueueFile(), qp, (N((long long)g_queue.size()) + " entry(ies) kept in memory and the journal NOT"
+                                               " written; merged with it at the next write of the queue").c_str()));
+        return;
+    }
+    g_queueUnmerged = 0;
+    const bool haveFile = qp.kind == coopstore::kFileReadable;
+    const std::string all = (haveFile && !qp.bytes.empty()) ? std::string(qp.bytes.begin(), qp.bytes.end()) : std::string();
     std::string::size_type at = 0;
     while (at < all.size())
     {
@@ -2955,21 +3157,74 @@ int StoreQueueWriteImpl(int family, const std::string& recordKey, const std::vec
 /* MAIN THREAD (LoadIndex). An area record read from the world server's folder names the server's <id>.platoon file. The area-load
    swap serves a file named as the engine's own area file (<id>.zone) - the engine names the area it loads from the file's name - so
    the server's file is copied into this game's mirror under that name and the record points at the copy. A copy that fails leaves the
-   record on the mirror name with no file there: the swap counts it missing and the engine loads its own save's area. */
-long long g_zoneIndexCopied = 0, g_zoneIndexCopyFailed = 0;
+   record on the mirror name with no file there: the swap counts it missing and the engine loads its own save's area.
+   T-1243 (owner 1523, 2026-11-05): the bytes are checked first with the world server's reader (zonecheck::ReadableBytes). An area
+   file that cannot be read to its end is NOT copied: the function fails as a failed read does (LoadIndex keeps a record this game
+   already holds; otherwise it takes the record on the mirror name, with nothing written there by this copy). Counted in
+   zoneIndexCopyFailed and apart in zoneIndexUnreadable= (the REPORT line's ZONE part); logged every time. */
+long long g_zoneIndexCopied = 0, g_zoneIndexCopyFailed = 0, g_zoneIndexUnreadable = 0;
 bool ZoneIndexMirrorCopy(Record* r)
 {
     const std::string from = r->file;
     r->file = MirrorFile(r->worldId);
     std::vector<char> bytes;
     const bool readOk = ReadFileBytes(from, &bytes);
-    const bool ok = readOk && WriteFileBytes(r->file, bytes);
+    size_t zstop = 0;
+    const bool unreadable = readOk && zonecheck::ReadableBytes(bytes, &zstop) == 0;   /* T-1243 (owner 1523) */
+    const bool ok = readOk && !unreadable && WriteFileBytes(r->file, bytes);
     if (ok) ++g_zoneIndexCopied; else ++g_zoneIndexCopyFailed;
-    if (g_zoneIndexCopied + g_zoneIndexCopyFailed <= 8)
+    if (unreadable)
+    {
+        ++g_zoneIndexUnreadable;
+        ErrorLog("[STORE] index: area record " + r->worldId + " NOT copied - the world server's file " + from + " cannot be read to its end ("
+                 + N((long long)bytes.size()) + " bytes, reading stopped at byte " + N((long long)zstop) + "), so it is not written into this game's mirror"
+                 + " (zoneIndexUnreadable=" + N(g_zoneIndexUnreadable) + ", counted in zoneIndexCopyFailed=" + N(g_zoneIndexCopyFailed) + ")");
+    }
+    else if (g_zoneIndexCopied + g_zoneIndexCopyFailed <= 8)
         DebugLog("[STORE] index: area record " + r->worldId + (ok ? " copied" : (readOk ? " NOT copied (the mirror write failed)" : " NOT copied (the world server's file could not be read)"))
                  + " from " + from + " to " + r->file + " (" + N((long long)bytes.size()) + " bytes) - the area-load swap serves the copy;"
                  + " zoneIndexCopied=" + N(g_zoneIndexCopied) + " zoneIndexCopyFailed=" + N(g_zoneIndexCopyFailed) + " (first 8 logged)");
     return ok;
+}
+/* T-1243 re-check fold (owner 1523, 2026-11-05): A HELD AREA RECORD NEVER POINTS THE AREA SWAP AT A FILE THAT IS NOT THERE OR CANNOT BE
+   READ. Asked where a held area record's mirror file may be stale, missing or unreadable: ZoneIndexMirrorCopy failed (LoadIndex - the
+   world server's file unreadable, or a read or write failure), and MirrorKeepLoad set aside a kept file that the record LoadIndex took
+   still names. The file at the record's name is read with the world server's reader (zonecheck::ReadableBytes): a readable one stays
+   and the record is kept. One that cannot be read is moved aside as MirrorKeepLoad does (zonecheck::SetAsideName, never replacing,
+   never deleting). When no readable file is left at that name the record is DROPPED (g_records.erase, then ZoneSwapPublish removes its
+   swap entry - as a deleted area record is dropped). Not merely given an empty file: a record keeps its stamp, so the load's fetch
+   (cooppre::PreWant) and the feed's not-newer test would refuse the world server's copy. With no record here the area swap has no
+   entry - Kenshi loads its own file for that area - and the fetch (or the feed, for an area outside the fetch ring) takes the world
+   server's copy. Counted in zoneHeldDropped= (and zoneHeldSetAside=). MAIN THREAD. Returns 1 = the record is kept, 0 = dropped. */
+long long g_zoneHeldDropped = 0, g_zoneHeldSetAside = 0;
+int ZoneHeldAreaFileCheck(const std::string& zoneId, const std::string& road)
+{
+    const std::map<std::string, Record>::iterator it = g_records.find(zoneId);
+    if (it == g_records.end() || it->second.file.empty()) return 1;
+    const std::string file = it->second.file;
+    std::string what;
+    if (U8GetFileAttributes(file.c_str()) == INVALID_FILE_ATTRIBUTES) what = "no file is at " + file;
+    else
+    {
+        std::vector<char> b; size_t stop = 0;
+        const bool opened = ReadFileBytes(file, &b);
+        if (opened && zonecheck::ReadableBytes(b, &stop) != 0) return 1;   /* a readable file: the record stays as it is */
+        const std::string aside = zonecheck::SetAsideName(file, U8GetFileAttributes((file + ".unreadable").c_str()) != INVALID_FILE_ATTRIBUTES ? 1 : 0, (long long)::time(0));
+        const bool moved = U8MoveFileEx(file.c_str(), aside.c_str(), 0) != 0;   /* no replace: never onto another file */
+        const DWORD merr = moved ? 0 : ::GetLastError();
+        if (moved) ++g_zoneHeldSetAside;
+        what = file + (opened ? " cannot be read to its end (" + N((long long)b.size()) + " bytes, reading stopped at byte " + N((long long)stop) + ")"
+                              : std::string(" could not be read"))
+             + (moved ? "; set aside as " + aside + " (nothing deleted)"
+                      : "; it could NOT be set aside as " + aside + " (Windows error " + N((long long)merr) + ") and stays in place");
+    }
+    g_records.erase(it);
+    ZoneSwapPublish(zoneId);   /* no record: the swap entry goes, so the area-load swap serves nothing for this area */
+    ++g_zoneHeldDropped;
+    ErrorLog("[STORE] T-1243: held area record " + zoneId + " (" + road + "): " + what + " - the record is dropped, so the area swap names no file"
+             " for it: Kenshi loads its own file for that area until the world server's copy comes (the load's fetch, or the feed after it for"
+             " an area outside the fetch ring) (zoneHeldDropped=" + N(g_zoneHeldDropped) + ")");
+    return 0;
 }
 long long g_indexEarlierName = 0;   /* .meta files LoadIndex passed over: under their id's earlier file name */
 void LoadIndex()
@@ -3008,15 +3263,27 @@ void LoadIndex()
         }
         if (DeletedBitTest(r.worldId)) { ++g_recvRefusedDeleted; continue; }   /* review-p4h M1 */
         NoteTownPeople(r.worldId, r.town);   /* decision 34 */
-        NoteRecordHome(r.worldId, r.home);   /* the group's home building key (optional field 15) */
+        {   /* the group's home building key (optional field 15) - T-1334 fold 1 (review MED 2): from a record older than the one held, not
+               noted; of the same stamp, noted without moving a live copy (coopstore::RecHomeArrive) */
+            const std::map<std::string, Record>::const_iterator hr = g_records.find(r.worldId);
+            const int hv = coopstore::RecHomeArrive(hr != g_records.end() ? 1 : 0, hr != g_records.end() ? hr->second.writtenAt : 0LL, r.writtenAt);
+            if (hv == coopstore::kRecHomeArriveSkip) ++g_homeRecArriveSkipped;
+            else { if (hv == coopstore::kRecHomeArriveNote) ++g_homeRecArriveNoteOnly; NoteRecordHome(r.worldId, r.home, 0, r.owner, hv == coopstore::kRecHomeArriveTake ? 1 : 0); }
+        }
         if (IsZoneId(r.worldId) && !g_zoneOn) continue;   // review-p3h H1: zone records stay out of the index while the lever is off
         r.file = CanonicalFile(r.worldId);
         std::map<std::string, Record>::iterator it = g_records.find(r.worldId);
         if (it == g_records.end() || it->second.writtenAt < r.writtenAt)
         {
             /* the swap serves the engine's own area file name; a failed copy never replaces a record this game already holds */
-            if (IsZoneId(r.worldId) && !ZoneIndexMirrorCopy(&r) && it != g_records.end()) continue;
+            const bool zoneCopyFailed = IsZoneId(r.worldId) && !ZoneIndexMirrorCopy(&r);
+            if (zoneCopyFailed && it != g_records.end())
+            {   /* T-1243 re-check fold: the record held stays only while a readable file is at its name */
+                ZoneHeldAreaFileCheck(r.worldId, "the copy from the world server's folder failed; the record already held names this file");
+                continue;
+            }
             g_records[r.worldId] = r; ZoneSwapPublish(r.worldId); ++g_indexRecords;   /* Z1-b: the swap table follows every zone write */
+            if (zoneCopyFailed) ZoneHeldAreaFileCheck(r.worldId, "the copy from the world server's folder failed; the record taken names this file");   /* T-1243 re-check fold: an older file left at the mirror name is never served under the server's newer stamp */
         }
     } while (U8FindNextFile(h, &fd));
     ::FindClose(h);
@@ -3135,7 +3402,19 @@ bool JoinedQueueTake(const std::string& oldPath)
     const std::vector<coopqueue::QueueEntry> older = QueueEntriesOf(std::string(ob.begin(), ob.end()), &bad);
     std::vector<coopqueue::QueueEntry> newer;
     if (g_indexLoaded) newer = g_queue;
-    else { std::vector<char> nb; if (ReadFileBytes(QueueFile(), &nb)) newer = QueueEntriesOf(std::string(nb.begin(), nb.end()), &bad); }
+    else
+    {   /* T-1280: a journal another program holds is not an empty one - the merge would be written over it with the older entries only */
+        const coopstore::FileProbe np = coopstore::ProbeFile(QueueFile());
+        const int nstep = coopstore::FileLockedNote(np.kind, &g_joinedQueueLockHeld);
+        if (coopstore::FileLockSkips(nstep))
+        {
+            if (nstep == coopstore::kLockSkipFirst)
+                ErrorLog(coopstore::FileLockedLine("[STORE] T-490 outage journal", QueueFile(), np, "the joined folder is not converted and neither journal is"
+                                                   " written; tried again at the next accepted WELCOME"));
+            return false;
+        }
+        if (np.kind == coopstore::kFileReadable && !np.bytes.empty()) newer = QueueEntriesOf(std::string(np.bytes.begin(), np.bytes.end()), &bad);
+    }
     const std::vector<coopqueue::QueueEntry> merged = coopqueue::QueueMergeOlderFirst(older, newer, &sup);
     if (g_indexLoaded)
     {
@@ -3234,6 +3513,9 @@ void JoinedFolderRetry()
    (ProfileSavedTell) - no timer. It is read back right after LoadIndex (MirrorKeepLoad); a row is taken only when its mirror file
    is there with the size and last-write time the row recorded (fold 1, review MED 5: no CRC, no record file read on the main
    thread), so the HELD list never claims a record this game lacks.
+   T-1243 (owner 1523, 2026-11-05): AND an area row (zone.*) that would be taken has its file read and checked to its end
+   (zonecheck::ReadableBytes); one that cannot be read is moved aside (<file>.unreadable, never deleted) and its row rejected, so the
+   load's fetch brings the world server's copy (keptTable keptUnreadable). Area files only; the other rows stay size and time only.
    FOLD 1 (review 2026-10-24): a key taken back is HELD BACK (MirrorKeepGated: not woken, not placed, not made again on a peer drop)
    until the world server names it - its preload index, a fetch, or a record of the feed - and at the end of the first whole feed
    snapshot a kept key the snapshot did not name is dropped (MirrorKeepSnapshotEnd). Deleted marks that arrive after the load drop
@@ -3257,6 +3539,9 @@ long long g_mkBytesReadLoad = 0, g_mkBytesReadWrite = 0;
    before its keys would be released (mirrorkeep::SeqJudge) */
 long long g_mkDroppedUnnamed = 0, g_mkUnnamedChanged = 0, g_mkDroppedDeleted = 0, g_mkNameClash = 0, g_mkNameClashLogged = 0, g_mkGatedPlace = 0, g_mkGatedWake = 0;
 long long g_mkDropSkipped = 0, g_mkRefusedUnjudged = 0;
+/* T-1243 (owner 1523): unreadable = kept area rows rejected because their file could not be read to its end (keptTable keptUnreadable;
+   inside rejected, beside noFile and changed); areaFilesRead / areaBytesRead = the kept area files MirrorKeepLoad read to check (its line) */
+long long g_mkUnreadable = 0, g_mkAreaFilesRead = 0, g_mkAreaBytesRead = 0;
 std::set<std::string> g_mkGatedPlaceKeys;   /* the kept keys gatedPlace has counted this load */
 std::map<std::string, Record> g_mkBeside;   /* kept rows held beside the record LoadIndex gave the same key, until the world server names it (mirrorkeep::KeptPlace) */
 long long g_mkHeldBeside = 0;               /* keptTable gatedKeptHeldBeside: kept rows held beside an index-load record at the load */
@@ -3303,7 +3588,7 @@ void MirrorKeepConfirmed(const std::string& key, int fullFollows)
         if (mirrorkeep::BesideSwapIn(it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, bs->second.writtenAt) != 0)
         {
             NoteTownPeople(key, bs->second.town);   /* decision 34, as LoadIndex */
-            NoteRecordHome(key, bs->second.home);
+            NoteRecordHome(key, bs->second.home, 0, bs->second.owner);
             it->second = bs->second;
             if (!fullFollows) MirrorKeepMoveAsleep(it->second);   /* the header-only answer is refused as not newer now, so it would never move the sleeping squad */
         }
@@ -3408,11 +3693,42 @@ void MirrorKeepLoad()
             continue;
         }
         if (mirrorkeep::RowLoadNotes(lv) == 0) { ++g_mkSkipped; continue; }   /* skipped, or not newer: and no town or home note (fold 1, review LOW 8) */
+        if (IsZoneId(k.key))
+        {   /* T-1243 (owner 1523, 2026-11-05): A KEPT AREA FILE IS READ TO ITS END BEFORE ITS ROW IS TAKEN. A row that passed the size and
+               time check above can still hold bytes Kenshi cannot load (run T2079: a load that never ends); taken, the area swap hands it
+               to Kenshi and the load's fetch skips the world server's copy as not newer. So the file is read and checked with the world
+               server's reader (zonecheck::ReadableBytes). One that cannot be read, or not to its end, is moved aside to <file>.unreadable
+               (.unreadable-<unix seconds> when that is taken; never replacing, never deleting - a failed move leaves it in place and still
+               rejects the row) and the row is rejected as a changed row is (keptTable rejected, and apart keptUnreadable): no record of
+               the key is held here, so the load's fetch brings the world server's copy. Only area rows; the other kinds are unchanged.
+               MAIN THREAD (StoreArmWorldIndex): every kept area file that would be taken is read once, here, at the world's start. */
+            std::vector<char> zb; size_t zstop = 0;
+            const bool zopen = ReadFileBytes(file, &zb);
+            ++g_mkAreaFilesRead; g_mkAreaBytesRead += (long long)zb.size();
+            if (!zopen || zonecheck::ReadableBytes(zb, &zstop) == 0)
+            {
+                ++g_mkRejected; ++g_mkUnreadable;
+                const bool heldNamesIt = it != g_records.end() && it->second.file == file;   /* T-1243 re-check fold: the record LoadIndex took names this same file */
+                const std::string aside = zonecheck::SetAsideName(file, StoreFileThere(file + ".unreadable") ? 1 : 0, (long long)::time(0));
+                const bool moved = U8MoveFileEx(file.c_str(), aside.c_str(), 0) != 0;   /* no replace: never onto another file */
+                const DWORD merr = moved ? 0 : ::GetLastError();
+                ErrorLog("[STORE] T-1243: kept area record " + k.key + " NOT taken - its mirror file "
+                         + (zopen ? "cannot be read to its end (" + N((long long)zb.size()) + " bytes, reading stopped at byte " + N((long long)zstop) + ")"
+                                  : std::string("could not be read"))
+                         + (moved ? "; set aside as " + aside + " (nothing deleted)"
+                                  : "; it could NOT be set aside as " + aside + " (Windows error " + N((long long)merr) + ") and stays in place")
+                         + (heldNamesIt ? std::string(" - the record held from the world server's folder names the same file and is checked next")
+                                        : std::string(" - no record of it is held, so the world server's copy is fetched before the load (by the feed after it, for an area outside the load's fetch ring)"))
+                         + " (keptTable keptUnreadable=" + N(g_mkUnreadable) + ")");
+                if (heldNamesIt) ZoneHeldAreaFileCheck(k.key, "its kept copy was set aside and the record held names the same file");   /* T-1243 re-check fold: `it` is not used after this */
+                continue;
+            }
+        }
         const int place = mirrorkeep::KeptPlace(lv, it != g_records.end() ? 1 : 0, IsZoneId(k.key) ? 1 : 0);   /* beside the index-load record, or in its place */
         if (place == mirrorkeep::kKeptReplace)
         {
             NoteTownPeople(k.key, k.town);   /* decision 34, as LoadIndex */
-            NoteRecordHome(k.key, k.home);
+            NoteRecordHome(k.key, k.home, 0, (int)k.owner);
         }
         Record r;
         r.worldId = k.key; r.squadSid = k.squadSid; r.factionName = k.factionName; r.town = k.town; r.home = k.home; r.file = file;
@@ -3427,8 +3743,9 @@ void MirrorKeepLoad()
     g_mkVerifyMs = (long long)(DWORD)(::GetTickCount() - t0);
     DebugLog("[STORE] T-985 C1: KEPT record table read back from " + g_dirMirror + ": " + N(g_mkRead) + " of " + N((long long)rows.size())
              + " records taken, " + N(g_mkRejected) + " rejected (file gone " + N(g_mkNoFile) + ", file changed " + N(g_mkChanged)
-             + "), " + N(g_mkSkipped) + " skipped (deleted, area records off, or not newer), " + N(g_mkBadLines) + " unreadable row(s); "
-             + N(g_mkBytesReadLoad) + " table bytes read, rows checked by size and time in " + N(g_mkVerifyMs) + " ms; the "
+             + ", area file unreadable " + N(g_mkUnreadable) + "), " + N(g_mkSkipped) + " skipped (deleted, area records off, or not newer), " + N(g_mkBadLines) + " unreadable row(s); "
+             + N(g_mkBytesReadLoad) + " table bytes read, rows checked by size and time and " + N(g_mkAreaFilesRead) + " kept area file(s) ("
+             + N(g_mkAreaBytesRead) + " bytes) read to their end (T-1243) in " + N(g_mkVerifyMs) + " ms; the "
              + N((long long)g_mkGate.size()) + " taken are not woken or placed until the world server names them");
 }
 /* the kept table, written whole by rename - at PreloadFinish and when a save finished. MAIN THREAD. */
@@ -3483,7 +3800,7 @@ std::string MirrorKeepReportValues()
          + "," + N(g_mkUnlisted) + "," + N(g_mkBytesReadLoad) + "," + N(g_mkBytesReadWrite) + "," + N(g_mkVerifyMs) + "," + N(g_mkOffThread)
          + "," + N(g_mkDroppedUnnamed) + "," + N(g_mkUnnamedChanged) + "," + N(g_mkDroppedDeleted) + "," + N(g_mkNameClash)
          + "," + N(g_mkGatedPlace) + "," + N(g_mkGatedWake) + "," + N((long long)g_mkGate.size()) + "," + N(g_mkRefusedBehind)
-         + "," + N(g_mkDropSkipped) + "," + N(g_mkRefusedUnjudged) + "," + N(g_mkHeldBeside);
+         + "," + N(g_mkDropSkipped) + "," + N(g_mkRefusedUnjudged) + "," + N(g_mkHeldBeside) + "," + N(g_mkUnreadable);   /* T-1243 (owner 1523): keptUnreadable */
 }
 /* THIS GAME'S AREA FILE (src/common/areafile.h), in the kept mirror folder beside records-kept.txt: the areas of this game's player
    characters (the AREAS list, the followed character's first) and its loaded areas, written whole by rename when those lists change
@@ -3941,7 +4258,38 @@ extern bool g_quitDraining;  /* P6c (p5z HIGH-1): the quit drain's own scope fla
 // and their bodies need DeleteEntryHere, ForgetPlatoon and the whole zone-record path, all of which are defined much further
 // down this file. Same anonymous namespace, same shape as the line above.
 void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp, unsigned long long gen, int living);   /* MAIN THREAD: a destroy the engine did on a worker (E23: `gen` is g_bindGen as it stood then) */
-void ZoneSaveApply(const std::string& path);                                       /* MAIN THREAD: the zone-record body for a file the engine just saved */
+void ZoneSaveApply(const std::string& path);
+void ZoneEmptyApply(const std::string& zoneId);   /* T-1329, MAIN THREAD: Kenshi's one-area save wrote nothing for this area - its EMPTY area record (ZoneSaveApply's road) */
+/* T-1329 (design C) REPORT counters: emptyPublished - EMPTY area records this game wrote and sent (ZoneMirrorCommit); emptyServed - area
+   reads given no file for an EMPTY record (detour_sfsReadFile); emptyOffMainQueued - empty saves seen off the main thread, queued for
+   the drain; levelSaveReadFail - ZoneMap reads after a one-area save that failed; savedNotPublished - WRITE rounds where Kenshi wrote a
+   file (ZoneMap+0x24 = 1) and no record was published (answered CANT fault); engineSaveFalse / engineSaveFalseArea - detour_gdcSave
+   exits where the engine's save returned false (all files / area files); pathCopyFail - exits where the saved file's path could not be
+   copied. g_levelSaveHasFile: ZoneMap+0x24 after the last one-area save on the main thread (-1 = not read). */
+long long g_zoneEmptyPublished = 0, g_afSavedNotPublished = 0;
+volatile LONG64 g_zoneEmptyServed = 0, g_zoneEmptyOffMainQueued = 0, g_zoneLevelSaveReadFail = 0, g_gdcEngineSaveFalse = 0, g_gdcEngineSaveFalseArea = 0, g_gdcPathCopyFail = 0;
+volatile LONG g_gdcSilentLines = 0;
+int g_levelSaveHasFile = -1, g_levelSaveReadDue = -1;   /* fold 2: ZoneMapContent+0x108 after the last one-area save on the main thread (-1 = not read) */
+/* T-1329 fold 1: emptyRefusedUnread (F1) - one-area saves with nothing saved whose area's read was still due (content+0x108), so no
+   EMPTY was published; emptyQueuedStale (F4) - queued off-main EMPTYs dropped at the drain because a main-thread save of the area came
+   after them. g_zoneSaveSeq: the one order both draw from; g_zoneMainSaveSeq: area -> its last main-thread save (MAIN THREAD). */
+volatile LONG64 g_zoneEmptyRefusedUnread = 0, g_zoneSaveSeq = 0;
+volatile LONG g_zoneEmptyRefusedLines = 0;
+long long g_zoneEmptyQueuedStale = 0;
+std::map<std::string, long long> g_zoneMainSaveSeq;
+void ZoneMainSaveNote(const std::string& zoneId) { if (!zoneId.empty()) g_zoneMainSaveSeq[zoneId] = (long long)::InterlockedIncrement64(&g_zoneSaveSeq); }
+/* the drain's EMPTY (no path): dropped when a main-thread save of the area came after it was queued (F4) */
+void ZoneEmptyDrain(const std::string& zoneId, long long queuedSeq)
+{
+    const std::map<std::string, long long>::const_iterator m = g_zoneMainSaveSeq.find(zoneId);
+    if (zonerec::ZoneQueuedEmptyStale(queuedSeq, m != g_zoneMainSaveSeq.end() ? m->second : 0) != 0)
+    {
+        ++g_zoneEmptyQueuedStale;
+        if (g_zoneEmptyQueuedStale <= 20) DebugLog("[ZONE] T-1329: a queued EMPTY of " + zoneId + " was DROPPED - this game saved that area on the main thread after it was queued (emptyQueuedStale=" + N(g_zoneEmptyQueuedStale) + ", first 20 logged)");
+        return;
+    }
+    ZoneEmptyApply(zoneId);
+}                                       /* MAIN THREAD: the zone-record body for a file the engine just saved */
 /* A RECORD OVER 2 MB (coophb::kBigRecordBytes) goes to the world server as one message, and while it goes this game's link and
    frame rate suffer; each squad or zone that sends one is named once, with its member count, so a run shows which ones are that
    big. `members` < 0 = the caller does not know it: an awake squad seen here is read for it, a zone has none. MAIN THREAD. */
@@ -4430,7 +4778,7 @@ long long StoreOutboxDrain()
            either - their own counters say what happened to them, and `continue` keeps them out of the send tally, which
            would otherwise read as if the outbox had transmitted something it never tried to. */
         else if (q[i].type == kOutGone) { DrainGoneEntry(q[i].worldId, q[i].platoon, q[i].stamp, q[i].bindGen, q[i].living); continue; }
-        else if (q[i].type == kOutZone) { ZoneSaveApply(q[i].path); ++g_gdcSaveOffThreadDrained; continue; }
+        else if (q[i].type == kOutZone) { if (q[i].path.empty()) ZoneEmptyDrain(q[i].worldId, q[i].stamp); else { ZoneSaveApply(q[i].path); ++g_gdcSaveOffThreadDrained; } continue; }   /* T-1329: no path = Kenshi saved nothing for the area (ZoneLevelSaveAfter) */
         else { ::InterlockedIncrement64(&g_outboxDroppedCap); continue; }   /* unreachable: only the five kinds above are ever queued - counted with the cap's drops so it can never be a silent zero, never sent blind */
         if (ok) ::InterlockedIncrement64(&g_outboxDrained); else ::InterlockedIncrement64(&g_outboxSendFailed);
     }
@@ -4615,6 +4963,7 @@ int NoteQuitting(const char* where)
               (g_closeHookOn ? 1 : 0), (g_menuHookOn ? 1 : 0), (g_titleHookOn ? 1 : 0));
     qv[511] = 0;
     DebugLog(std::string(qv) + (took > 0 ? (" flushed=" + N(took)) : std::string()));
+    if (OnMainThread()) PhysSelfQueueReport();   /* T-1046 fix 1: its counters at quit (no other REPORT runs after a quit, F539) */
     QuitSteamClose(where);   /* after the drain and the flush above, so what they put on a Steam link goes before its close */
     return 1;
 }
@@ -5266,6 +5615,9 @@ void StoreApplyRecordSeq(const std::vector<char>& payload)
         if (shoprec::IsShopRecId(worldId)) coop::ShopRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* this game's shop record write sent with that stamp is stored: a cancel's mark in it is answered */
         if (coopbrec::IsBoxRecId(worldId)) coop::BoxRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* a shop counter's undo list in that write is stored */
         if (doorrec::IsDoorRecId(worldId)) coop::DoorRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* this game's door record write sent with that stamp is stored: its pending write is confirmed */
+        if (bldgrec::IsBldgRecId(worldId)) coop::TownBldgRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-1333: this game's building record write is stored */
+        if (cagerec::IsCageRecId(worldId)) coop::CageRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-860: this game's cage record write is stored */
+        if (towntime::IsTownTimeId(worldId)) coop::TownTimeEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-4 fold 2: this game's town clock write is stored - the accepted record */
     }
     {
         std::map<std::string, Record>::iterator it = g_records.find(worldId);
@@ -5316,6 +5668,7 @@ void StoreNotePushArrival(const std::string& worldId)
    caller, in the same namespace - which is what this file already does for LoadBitsFiles and
    DeletedBitTest at the top. */
 bool ZoneWriteIsMine(const std::string& zoneId);
+extern long long g_zoneUnreadableNotSent;   /* T-1243 fold: defined with the zone road below; the replay's check counts in it too */
 /* Z1-c (recheck-z1b item 2): the three main-thread writers of a zone mirror file - ZoneSaveApply, this replay and a RECV -
    go through ZoneMirrorWriteOrPark (defined beside ZoneSaveApply), which waits while that path's load is in flight. */
 const int kZoneWriteSave = 0, kZoneWriteReplay = 1, kZoneWriteRecv = 2;
@@ -5341,6 +5694,20 @@ int QueueSendEntry(const coopqueue::QueueEntry& e)
        the push up FIRST, then the mirror copy and the index entry (Z1-b, review-z1 item 3 - see the send below). writtenAt is stamped NOW, which is
        correct and is only safe because the conflict was already decided against seq above - a replay that
        re-stamps before it has won is read-b12's top risk. */
+    {   /* T-1243 fold (finding 1): the journal outlives a restart (QueueLoad), so an area file journaled by a build without the check
+           can reach here. One that cannot be read to its end is neither sent nor written into this game's mirror: it leaves the journal
+           as a bad entry (answer -1, outageQueue[droppedBadPayload] - the queue identity still closes) and is counted apart in
+           zoneUnreadableNotSent=. */
+        size_t zstop = 0;
+        if (zonecheck::ReadableBytes(e.payload, &zstop) == 0)
+        {
+            ++g_zoneUnreadableNotSent;
+            ErrorLog("[ZONE] " + e.key + " NOT SENT - the area file the outage journal held for it cannot be read to its end: " + N((long long)e.payload.size())
+                     + " bytes, reading stopped at byte " + N((long long)zstop) + "; it leaves the journal unsent and unwritten (zoneUnreadableNotSent=" + N(g_zoneUnreadableNotSent)
+                     + ", counted in outageQueue[droppedBadPayload])");
+            return -1;
+        }
+    }
     Record r;
     r.worldId = e.key; r.x = r.y = r.z = 0.0f;
     r.writtenAt = ZoneStampFor(e.key); r.posAt = r.writtenAt;   /* T-609 (H1): max(now, last + 1), as the save */
@@ -5477,7 +5844,7 @@ void StoreRepushUpTick()
     {
         if (g_welcomeGotIds.count(it->first) != 0) continue;   /* the notebook already has this one */
         if (IsZoneId(it->first) && !g_zoneOn) { ++skipped; continue; }   /* review-p3h H1, as the deleted arm did */
-        if (coopbrec::IsBoxRecId(it->first) || piecerec::IsPieceRecId(it->first) || shoprec::IsShopRecId(it->first) || doorrec::IsDoorRecId(it->first)) { ++skipped; continue; }   /* a box, piece, shop or door record is written only by its writer (items.cpp, build.cpp, doors.cpp), never re-sent from here */
+        if (coopbrec::IsBoxRecId(it->first) || piecerec::IsPieceRecId(it->first) || shoprec::IsShopRecId(it->first) || doorrec::IsDoorRecId(it->first) || bldgrec::IsBldgRecId(it->first) || cagerec::IsCageRecId(it->first) || towntime::IsTownTimeId(it->first)) { ++skipped; continue; }   /* a box, piece, shop or door record is written only by its writer (items.cpp, build.cpp, doors.cpp), never re-sent from here */
         SwRefusedForget(it->first);   /* T-1084 step 5: the world server does not have this record (its WELCOME did not list it), so the register that refused it is gone too */
         if (!SwMaySend(it->first, "re-push")) continue;   /* T-1084 step 5: a squad record is re-pushed only by the game that wrote it (or when nobody is known to have) */
         std::vector<char> b;
@@ -5737,6 +6104,11 @@ int StoreRecordCreatedImpl(void* platoon)
    the context platoons that held a person this game runs at a sleep (e.g. a take-back): NOT refused - the existing rules decide, as
    before M7a2. Printed on the REPORT's contextPlatoon[] token (T300Report). */
 long long g_ctxLoadSkipped = 0, g_ctxWakeSkipped = 0, g_ctxSleepRefused = 0, g_ctxSleepWithMine = 0, g_ctxSleepRefusedHandedOver = 0, g_ctxSleepLogged = 0;
+/* T-1318 attempt 4 (owner 1626, design A) - givenEngine[..]: wholeWakeNotGiven - wakes of a squad the index calls wholly given that its own
+   records (or living members) show NOT all given (a never-numbered person among them): not refused - woken here; hoUnnumberedSleep /
+   hoUnnumberedHb - THE TRIPWIRE (site 10, must stay 0): a sleep record / heartbeat refused as handed over while the engine's list held
+   living people with no uid (writing would publish people another game runs; refusing is today's behaviour, so only counted and logged) */
+long long g_wholeWakeNotGiven = 0, g_hoUnnumberedSleep = 0, g_hoUnnumberedHb = 0, g_givenEngineLines = 0;
 long long g_sleepRefusedOtherGame = 0, g_sleepOtherGameLogged = 0;   /* BlockSquadWrite at the sleep: a squad numbered in my block formed around another game's people - REPORT sleepOtherGame */
 /* the context-platoon WAKE rule (coopsquad::ContextWake): g_ctxSleptMine = context platoons whose last sleep here held a person this game
    runs (their wake goes on to the rules). g_ctxDrops = the context platoons queued for REMOVAL (CtxDropTick) - at a sleep that held none of
@@ -5906,7 +6278,9 @@ long long g_swRefusedHereN = 0, g_swLocalRolledBack = 0, g_swRequeuedOnMap = 0, 
           g_swRunsTakeSent = 0, g_swKeepTakeSkipped = 0, g_swReleaseSent = 0, g_swReleaseResent = 0, g_swAskAgainGot = 0, g_swAskAgainTake = 0,
           g_swRefusedNoRecord = 0, g_swTakeNoWriter = 0;
 int g_swLines = 0;
-long long g_swReleaseRunnerMoved = 0, g_swRepushReleased = 0, g_swCopyMarked = 0, g_swAskAgainDropped = 0;   /* releases at a runner change; releases after a re-pushed record; copies marked changed by an answer; refusals dropped at ASK_AGAIN */
+long long g_swReleaseRunnerMoved = 0, g_swRepushReleased = 0, g_swCopyMarked = 0, g_swAskAgainDropped = 0;
+/* T-850 (T2230): squads a hand-over's ACK passed people of (StoreHandOverJudge) - seen; a release sent; owed (link down); already another game's in the heartbeat; not this game's to release; kept (this game still runs it, a split, or people kept here); lines written (the first 200) */
+long long g_hoRelSeen = 0, g_hoRelSent = 0, g_hoRelOwed = 0, g_hoRelAlready = 0, g_hoRelNotMine = 0, g_hoRelKept = 0, g_hoRelLines = 0;   /* releases at a runner change; releases after a re-pushed record; copies marked changed by an answer; refusals dropped at ASK_AGAIN */
 volatile LONG64 g_swReleaseOwed = 0;   /* put-aways run off the main thread: their release is queued for the main thread (SwOffPutAwayQueue) */
 volatile LONG64 g_swReleaseOffFull = 0;   /* off-thread put-aways not queued: the queue full (squadwriterreg.h kSwOffPutAwayCap), the id unread or the lock not made */
 long long g_swReleaseOffSent = 0;   /* queued off-thread put-aways whose release the main thread sent (or kept for the relink) */
@@ -5924,7 +6298,7 @@ void SwRefusedForget(const std::string& id) { if (g_swRefused.count(id) == 0) re
 bool SwSquadId(const std::string& id)
 {
     std::string fac; unsigned n = 0;
-    return !IsZoneId(id) && !coopgrec::IsGroundRecId(id) && !coopbrec::IsBoxRecId(id) && !piecerec::IsPieceRecId(id) && !shoprec::IsShopRecId(id) && !doorrec::IsDoorRecId(id) && SplitGroupId(id, &fac, &n);
+    return !IsZoneId(id) && !coopgrec::IsGroundRecId(id) && !coopbrec::IsBoxRecId(id) && !piecerec::IsPieceRecId(id) && !shoprec::IsShopRecId(id) && !doorrec::IsDoorRecId(id) && !cagerec::IsCageRecId(id) && !bldgrec::IsBldgRecId(id) && !towntime::IsTownTimeId(id) && SplitGroupId(id, &fac, &n);
 }
 void SwLine(const std::string& s) { if (g_swLines < 60) { ++g_swLines; DebugLog("[STORE] SQUAD-WRITER " + s + " (the first 60 lines; squadWriter[...] on the REPORT line)"); } }
 /* THE WRITER NOTES [t1084i-game] (squadwriterreg.h): the squads ANOTHER live game runs now, as the world server last said (RUNS / STOPPED
@@ -5937,6 +6311,10 @@ std::set<std::string> g_swOtherSaid;   /* ids whose refusal was logged (once per
 long long g_swNoteGot = 0, g_swNoteSlotGone = 0, g_swNoteListEnd = 0, g_swBuildSkippedOther = 0, g_swWakeRefusedOther = 0, g_swBuildAtReleaseQueued = 0,
           g_swBuildAtRelease = 0, g_swMovedInAtRelease = 0, g_swBuildAtReleaseNoRecord = 0, g_swOtherLines = 0,
           g_swWaitBuilt = 0, g_swWaitReasked = 0, g_swBuildAtReask = 0;   /* waiting ids built by any road; waiting ids queued again at a map that changed their area's holder or came after a no-map refusal; the sweep's builds of re-asked ids (a real release counts as buildAtRelease) [t1084i-f2-store] */
+int g_swListHold = 0;   /* T-1269 [t1269a-A]: this link's list of the squads other games run has not ended yet (WELCOME to LIST END; squadwriterreg.h ListHoldAfter) */
+std::set<std::string> g_swHeldIds, g_swHeldSaid;   /* ids held by it (also in g_swBuildWait) until the list ends or the game goes offline; ids whose hold was logged (once per squad in a world) */
+long long g_swHeldBuild = 0, g_swHeldWake = 0, g_swHeldAtListEnd = 0, g_swHeldLiftedOffline = 0, g_swHeldLines = 0;
+long long g_swWaitDoomedKept = 0, g_swWaitDupSettled = 0;   /* fold 1 (H1): sweep entries kept waiting while their only copy was a refused wake queued for removal; waiting ids asked again when that removal ended */   /* builds and wakes held; held ids handed to the LIST END's loop; held ids built at an offline lift */
 int g_swLinkDownSeen = 0; unsigned g_swLinkDownAt = 0; long long g_swOtherDropped = 0;   /* the list dropped after a link outage longer than the grace [t1084i-f1-game] */
 volatile LONG64 g_swWakeOffThread = 0, g_swWakeOffFull = 0;   /* wakes the engine ran off the main thread; those not queued (queue full, lock not made) */
 long long g_swWakeOffChecked = 0, g_swWakeOffRefused = 0, g_swWakeOffUnresolved = 0;   /* queued off-thread wakes checked on the main thread; refused; not the awake platoon of a record's id any more */
@@ -5948,13 +6326,35 @@ int SwOtherRunner(const std::string& id)
     if (o == g_swOther.end()) return -1;
     return sqwreg::OtherRunsBlocks(1, o->second.slot, g_mySlot) != 0 ? o->second.slot : -1;
 }
+/* T-1269 [t1269a-A]: 1 = held by the list hold (squadwriterreg.h ListHoldBlocks) - this link's list has not ended, the squad has a record
+   here and no other game is listed as running it */
+int SwListHeld(const std::string& id)
+{
+    if (g_swListHold == 0 || id.empty()) return 0;
+    return sqwreg::ListHoldBlocks(g_swListHold, SwSquadId(id) ? 1 : 0, g_records.find(id) != g_records.end() ? 1 : 0, SwOtherRunner(id) >= 0 ? 1 : 0);
+}
+/* the gate asked before the refusal by the roads that do not start at it (squadwriterreg.h OtherOrHeld) */
+int SwOtherOrHeld(const std::string& id) { return sqwreg::OtherOrHeld(SwOtherRunner(id) >= 0 ? 1 : 0, SwListHeld(id)); }
 /* asked by every road that builds a sleeping copy here (wake 0) or wakes one (wake 1): 1 = another live game runs the squad - not built
    or woken; counted, logged once per squad, and the id waits for that game to let it go */
 int SwOtherRefuse(const std::string& id, int wake, const char* road)
 {
     if (id.empty() || !SwSquadId(id)) return 0;
     const int slot = SwOtherRunner(id);
-    if (slot < 0) return 0;
+    if (slot < 0)
+    {   /* T-1269 [t1269a-A]: nobody listed - but while this link's list has not ended a squad with a record here is held, not built or
+           woken; it waits as a refused one does and the LIST END's loop builds it if no other game runs it then */
+        if (SwListHeld(id) == 0) return 0;
+        if (wake != 0) ++g_swHeldWake; else ++g_swHeldBuild;
+        g_swBuildWait.insert(id); g_swHeldIds.insert(id);
+        if (g_swHeldSaid.insert(id).second && g_swHeldLines < 60)
+        {
+            ++g_swHeldLines;
+            DebugLog("[STORE] SQUAD-WRITER " + std::string(road) + " worldId=" + id + (wake != 0 ? " NOT WOKEN" : " NOT BUILT") + " - held: this link's list of the groups other games run"
+                     " has not ended yet; built at its end if no other game runs it (once per squad, 60 lines at most; squadWriter[listHeldBuild,listHeldWake] on the REPORT)");
+        }
+        return 1;
+    }
     if (wake != 0) ++g_swWakeRefusedOther; else ++g_swBuildSkippedOther;
     g_swBuildWait.insert(id);
     if (g_swOtherSaid.insert(id).second && g_swOtherLines < 60)
@@ -5973,6 +6373,14 @@ void SwReleaseBuild(const std::string& id)
     /* it stays waiting until the sweep decided it (squadwriter.h SweepWriterLeftDone): a refusal by the area gate is asked again at the next release or list end */
     ++g_swBuildAtReleaseQueued;
     SwSweepQueueWriterLeft(id, coopsquad::kSweepWhyWriterLeft);
+}
+/* T-1269 fold 1 (H1): a refused wake's removal ended (CtxDropTick: removed, kept or given up) - a waiting id is asked again through its
+   release road (squadwriterreg.h WakeDupSettledAsks): the sweep builds it now no copy is left, keeps a copy that stayed, or it waits on */
+void SwWakeDupSettled(const std::string& wid)
+{
+    if (wid.empty() || sqwreg::WakeDupSettledAsks(g_swBuildWait.count(wid) != 0 ? 1 : 0) == 0) return;
+    ++g_swWaitDupSettled;
+    SwReleaseBuild(wid);
 }
 /* an applied area map changed who holds the areas in `changed` (key x * 64 + y), or came after a no-map refusal (mapFresh: every area):
    each squad still waiting there (refused by the area gate when its runner let it go, or refused while another game ran it) that no
@@ -6008,6 +6416,8 @@ void SwNoteArrive(const sqwreg::WriterReply& r)
     if (r.verdict == sqwreg::kSwNoteListEnd)
     {   /* the list after the WELCOME is whole: each id still waiting that no game runs now is built */
         ++g_swNoteListEnd;
+        g_swListHold = sqwreg::ListHoldAfter(g_swListHold, sqwreg::kLhListEnd, 1);   /* T-1269: the hold ends here - the held ids are in the build-wait list below */
+        g_swHeldAtListEnd += (long long)g_swHeldIds.size(); g_swHeldIds.clear();
         const std::vector<std::string> ids(g_swBuildWait.begin(), g_swBuildWait.end());
         for (size_t i = 0; i < ids.size(); ++i) SwReleaseBuild(ids[i]);
         return;
@@ -6144,9 +6554,15 @@ void SwPutAwayDone(const std::string& id, int npcFaction)
 {
     if (id.empty()) return;
     g_swRunAsked.erase(id); g_swRanHere.erase(id);   /* its next wake here asks again */
-    if (sqwreg::PutAwayRelease(SwSquadId(id) ? 1 : 0, npcFaction, g_swRefused.count(id) != 0 ? 1 : 0) == 0) return;
+    if (sqwreg::PutAwayRelease(SwSquadId(id) ? 1 : 0, npcFaction, g_swRefused.count(id) != 0 ? 1 : 0) == 0)
+    {
+        return;
+    }
     const std::map<std::string, Record>::const_iterator rt = g_records.find(id);
-    if (rt == g_records.end() || rt->second.writtenAt <= 0) return;   /* no record of it: nothing registered to release */
+    if (rt == g_records.end() || rt->second.writtenAt <= 0)
+    {
+        return;   /* no record of it: nothing registered to release */
+    }
     SwSendRelease(id);
 }
 /* a put-away off the main thread (detour_deactivate's bypass): no shared map is touched there - the platoon and its engine squad id (read
@@ -6167,7 +6583,14 @@ struct SwPutAway
 {
     std::string id; int npc; int send;   /* send 0: a delete path - no release follows it */
     SwPutAway(const std::string& i, int n) : id(i), npc(n), send(1) {}
-    ~SwPutAway() { if (send != 0) SwPutAwayDone(id, npc); else { g_swRunAsked.erase(id); g_swRanHere.erase(id); } }
+    ~SwPutAway()
+    {
+        if (send != 0) SwPutAwayDone(id, npc);
+        else
+        {
+            g_swRunAsked.erase(id); g_swRanHere.erase(id);
+        }
+    }
 };
 /* who runs a strict majority of an awake squad's living people (runner: a slot, -1 nobody), read at a heartbeat visit (ranOnly 1: acted on
    only where this game ran them at an earlier visit) or at the heartbeat entry's turn to foreign (ranOnly 0). Another game runs them now:
@@ -6177,13 +6600,53 @@ void SwRunnerSeen(const std::string& id, void* faction, int runner, int ranOnly)
     if (id.empty() || g_mySlot < 0 || runner < 0) return;   /* no slot yet, or nobody runs a strict majority (a split squad): nothing changed hands */
     if (runner == g_mySlot) { g_swRanHere.insert(id); return; }
     const int ran = g_swRanHere.erase(id) != 0 ? 1 : 0;
-    if (ranOnly != 0 && ran == 0) return;
+    if (ranOnly != 0 && ran == 0)
+    {
+        return;
+    }
     g_swRunAsked.erase(id);   /* a later wake where this game runs the majority again asks again */
     const std::map<std::string, Record>::const_iterator rt = g_records.find(id);
-    if (rt == g_records.end() || rt->second.writtenAt <= 0) return;   /* no record of it: nothing registered to release */
-    if (sqwreg::RunnerMovedRelease(g_mySlot, runner, SwSquadId(id) ? 1 : 0, SwNpcFaction(faction), g_swRefused.count(id) != 0 ? 1 : 0) == 0) return;
+    if (rt == g_records.end() || rt->second.writtenAt <= 0)
+    {
+        return;   /* no record of it: nothing registered to release */
+    }
+    if (sqwreg::RunnerMovedRelease(g_mySlot, runner, SwSquadId(id) ? 1 : 0, SwNpcFaction(faction), g_swRefused.count(id) != 0 ? 1 : 0) == 0)
+    {
+        return;
+    }
     ++g_swReleaseRunnerMoved;
     SwSendRelease(id);
+}
+/* T-1269 [t1269a-B] THE RE-CLAIM BATCH (squadwriterreg.h, protocol 146): after each WELCOME of this protocol, as soon as the link is up,
+   one RUNS take per squad this game ran at its last heartbeat visit (ReclaimWanted), then the END MARK (SQUAD_RELEASE "*"). A world server
+   restarted since this game last linked counts this game's squads as maybe running until the mark, then releases those not re-claimed;
+   a world server that did not restart changes nothing at the mark. */
+int g_swReclaimOwed = 0; long long g_swReclaimSent = 0, g_swReclaimEndSent = 0, g_swReclaimEndFailed = 0, g_swReclaimTakeFailed = 0;
+void SwReclaimSend()
+{
+    if (sqwreg::ReclaimSendNow(g_swReclaimOwed, LinkUp() ? 1 : 0) == 0) return;
+    g_swReclaimOwed = 0;
+    /* fold 1 (M2): every awake squad this game runs NOW - read live from its people (MembersRunner, the one shared count), a split squad
+       among them, a squad woken since the last heartbeat visit too - not the last visit's list */
+    long long failed = 0;
+    for (std::map<std::string, void*>::const_iterator bw = g_byWorldId.begin(); bw != g_byWorldId.end(); ++bw)
+    {
+        if (!Plaus(bw->second)) continue;
+        Pod q;
+        if (!ReadPod(bw->second, &q) || !Plaus(q.active) || q.activeChars <= 0 || q.activeChars > 512 || !Plaus(q.members)) continue;
+        int dec = 0, here = 0, top = -1, topN = 0;
+        const int runner = MembersRunner(q.members, q.activeChars, &dec, &here, &top, &topN);
+        if (sqwreg::ReclaimRunsNow(g_mySlot, runner, here) == 0) continue;
+        const std::map<std::string, Record>::const_iterator rt = g_records.find(bw->first);
+        if (rt == g_records.end()) continue;
+        if (sqwreg::ReclaimWanted(SwSquadId(bw->first) ? 1 : 0, rt->second.writtenAt > 0 ? 1 : 0, SwNpcRecord(rt->second), 1, g_swRefused.count(bw->first) != 0 ? 1 : 0, g_swTakeSent.count(bw->first) != 0 ? 1 : 0) == 0) continue;
+        SwSendTake(bw->first, SwGenOf(bw->first), sqwreg::kBasisRuns);
+        if (g_swTakeSent.count(bw->first) != 0) { g_swRunAsked.insert(bw->first); ++g_swReclaimSent; }   /* out: the heartbeat visit does not ask again this wake */
+        else { ++failed; ++g_swReclaimTakeFailed; }
+    }
+    if (sqwreg::ReclaimEndMayGo(failed) == 0) { g_swReclaimOwed = 1; return; }   /* a claim did not go: the batch stays owed and its end mark waits (it would release that squad) */
+    const std::vector<char> b = sqwreg::EncodeReclaimEnd();
+    if (g_link->Send(0, (net::MsgType)kStoreMsgSquadRelease, &b[0], b.size(), net::CH_RELIABLE)) ++g_swReclaimEndSent; else { ++g_swReclaimEndFailed; g_swReclaimOwed = 1; }
 }
 /* the relink (StoreRepushUpTick, after the re-pushed records): the releases the outage kept */
 void SwReleaseResend()
@@ -6222,6 +6685,7 @@ void SwUndoLocalDelete(const std::string& id)
     if (undone != 0) ++g_swDeleteUndone;
 }
 /* SQUAD_WRITER: the register's answer to a take, or to a write of this game's it refused, or ASK_AGAIN */
+void RaidLendWriteRefused(const std::string& worldId, long long refusedAt);   /* T-1122 review fold 3 / re-check fold 2 (the lend module, below) */
 void SquadWriterArrive(const std::vector<char>& payload)
 {
     sqwreg::WriterReply r;
@@ -6265,10 +6729,12 @@ void SquadWriterArrive(const std::vector<char>& payload)
     if (r.kind != sqwreg::kKindTake)
     {   /* roll back: the refused version is not the world's - the world server's record follows this answer and is taken as newer, and
            this game's copies of the squad load it at their next wake */
+        const long long refusedAt = rt != g_records.end() ? rt->second.writtenAt : 0;   /* T-1122 re-check fold 2: the refused write's stamp, read before the rollback */
         if (rt != g_records.end()) { rt->second.writtenAt = 0; rt->second.posAt = 0; }
         for (std::map<void*, std::string>::const_iterator b = g_bind.begin(); b != g_bind.end(); ++b) if (b->second == r.id) g_localWrittenAt.erase(b->first);
         ++g_swLocalRolledBack;
         if (sqwreg::CopyMarkChanged(r.verdict, r.kind) != 0) HbMarkCopyChanged(r.id);   /* a refused full write: the checksum of the refused bytes is forgotten, so the copy is sent once this game writes it again */
+        if (r.kind == sqwreg::kKindFull) RaidLendWriteRefused(r.id, refusedAt);   /* T-1122 review fold 3 / re-check fold 2: a RETURN this game said naming that write (its stamp) - KEEPOWN follows */
     }
     SwLine("worldId=" + r.id + " " + sqwreg::KindName(r.kind) + " " + sqwreg::VerdictName(r.verdict) + " - registered writer slot " + N((long long)r.writerSlot)
            + ", generation " + N((long long)r.gen) + "; not written here until its next wake here, ASK_AGAIN or a newly held area asks again");
@@ -6277,13 +6743,15 @@ void SquadWriterArrive(const std::vector<char>& payload)
 void SwWorldTeardown()
 {
     g_swRefused.clear(); g_swGen.clear(); g_swTakeSent.clear(); g_swRunAsked.clear(); g_swReleaseUnsent.clear(); g_swRanHere.clear();
-    g_swBuildWait.clear(); g_swOtherSaid.clear();   /* that world's refused copies (the list of squads other games run is the link's: rebuilt at each WELCOME) */
+    g_swBuildWait.clear(); g_swOtherSaid.clear(); g_swHeldIds.clear(); g_swHeldSaid.clear();   /* that world's refused copies (the list of squads other games run is the link's: rebuilt at each WELCOME) */
     if (g_swOffLockInit) { ::EnterCriticalSection(&g_swOffLock); g_swOffPutAway.clear(); ::LeaveCriticalSection(&g_swOffLock); }
 }
 /* a new world-server link (its WELCOME): the generations learned and the takes out were the last link's - a world server that lost its
    data starts its generations again at 1 (there is no data epoch on the link to tell), and a take out on the old link is never answered;
    each squad this game runs asks again at its next visit */
-void SwLinkNew() { g_swGen.clear(); g_swTakeSent.clear(); g_swRunAsked.clear(); g_swOther.clear(); g_swLinkDownSeen = 0; }   /* the squads other games run: the list the world server sends right after the WELCOME rebuilds them */
+void SwLinkNew(int listComes) { g_swGen.clear(); g_swTakeSent.clear(); g_swRunAsked.clear(); g_swOther.clear(); g_swLinkDownSeen = 0;
+    g_swListHold = sqwreg::ListHoldAfter(g_swListHold, sqwreg::kLhWelcome, listComes);
+    g_swReclaimOwed = listComes != 0 ? 1 : 0; }   /* T-1269 [t1269a-B]: the re-claim batch is owed to this link (SwReclaimSend) */   /* T-1269 [t1269a-A]: held until this link's LIST END (a WELCOME of another protocol: no list follows, nothing held) */   /* the squads other games run: the list the world server sends right after the WELCOME rebuilds them */
 std::string SwReportToken()
 {
     return " squadWriter[squadRefusedHere=" + N(g_swRefusedHereN) + ",localRolledBack=" + N(g_swLocalRolledBack) + ",requeuedOnMap=" + N(g_swRequeuedOnMap)
@@ -6296,13 +6764,18 @@ std::string SwReportToken()
          + ",refusedNoRecord=" + N(g_swRefusedNoRecord) + ",takeNoWriter=" + N(g_swTakeNoWriter)
          + ",releaseOwed=" + N((long long)g_swReleaseOwed) + ",releaseRunnerMoved=" + N(g_swReleaseRunnerMoved) + ",repushReleased=" + N(g_swRepushReleased)
          + ",copyMarked=" + N(g_swCopyMarked) + ",askAgainDropped=" + N(g_swAskAgainDropped)
+         + ",handOverRel[seen,sent,owed,already,notMine,kept]=" + N(g_hoRelSeen) + "," + N(g_hoRelSent) + "," + N(g_hoRelOwed) + "," + N(g_hoRelAlready) + "," + N(g_hoRelNotMine) + "," + N(g_hoRelKept)
          + ",releaseOffSent=" + N(g_swReleaseOffSent) + ",releaseOffFull=" + N((long long)g_swReleaseOffFull) + ",releaseOffSkipped=" + N(g_swReleaseOffSkipped) + ",releaseOffCreate=" + N((long long)g_swReleaseOffCreate) + ",releaseOffNone=" + N(g_swReleaseOffNone)
          + ",writerMapSize=" + N((long long)g_swOther.size()) + ",buildSkippedOtherWriter=" + N(g_swBuildSkippedOther) + ",wakeRefusedOtherWriter=" + N(g_swWakeRefusedOther)
          + ",buildAtRelease=" + N(g_swBuildAtRelease) + ",buildAtReleaseQueued=" + N(g_swBuildAtReleaseQueued) + ",movedInAtRelease=" + N(g_swMovedInAtRelease)
          + ",buildAtReleaseNoRecord=" + N(g_swBuildAtReleaseNoRecord) + ",buildWaitNow=" + N((long long)g_swBuildWait.size()) + ",waitBuiltAnyRoad=" + N(g_swWaitBuilt) + ",waitReaskedOnMap=" + N(g_swWaitReasked) + ",buildAtReask=" + N(g_swBuildAtReask)
          + ",notesGot=" + N(g_swNoteGot) + ",noteSlotGone=" + N(g_swNoteSlotGone) + ",noteListEnd=" + N(g_swNoteListEnd)
          + ",otherDroppedLinkDown=" + N(g_swOtherDropped) + ",wakeOffThread=" + N((long long)g_swWakeOffThread) + ",wakeOffChecked=" + N(g_swWakeOffChecked)
-         + ",wakeOffRefused=" + N(g_swWakeOffRefused) + ",wakeOffUnresolved=" + N(g_swWakeOffUnresolved) + ",wakeOffFull=" + N((long long)g_swWakeOffFull) + "]";
+         + ",wakeOffRefused=" + N(g_swWakeOffRefused) + ",wakeOffUnresolved=" + N(g_swWakeOffUnresolved) + ",wakeOffFull=" + N((long long)g_swWakeOffFull)
+         + ",listHoldNow=" + N((long long)g_swListHold) + ",listHeldBuild=" + N(g_swHeldBuild) + ",listHeldWake=" + N(g_swHeldWake) + ",listHeldNow=" + N((long long)g_swHeldIds.size())
+         + ",listHeldAtListEnd=" + N(g_swHeldAtListEnd) + ",listHeldLiftedOffline=" + N(g_swHeldLiftedOffline)
+         + ",reclaimSent=" + N(g_swReclaimSent) + ",reclaimEndSent=" + N(g_swReclaimEndSent) + ",reclaimEndFailed=" + N(g_swReclaimEndFailed) + ",reclaimOwed=" + N((long long)g_swReclaimOwed)
+         + ",reclaimTakeFailed=" + N(g_swReclaimTakeFailed) + ",waitDoomedKept=" + N(g_swWaitDoomedKept) + ",waitDupSettled=" + N(g_swWaitDupSettled) + "]";   /* T-1269 [t1269a-A / B] */
 }
 /* the first member whose position reads, alive or dead (a wiped-out squad's people are corpses); 1 = read */
 int NpcMemberPos(void** members, int count, float* x, float* z)
@@ -6562,6 +7035,13 @@ int PlayerSideFaction(void* faction)
     return (IsPlayerFaction(f) || IsPeerFaction(f) || coopsp::IsStandInRecord(StandInRecordSlot(f)) != 0) ? 1 : 0;
 }
 int PlayerSideSquad(void* platoon) { Pod q; return (ReadPod(platoon, &q) && PlayerSideFaction(q.faction) == 1) ? 1 : 0; }
+/* T-1122 build: the raid lend (defined beside the own raid squads, below; the same anonymous namespace) */
+int RaidLentHas(void* platoon);
+int RaidLentEnded(void* platoon);
+int RaidLentOver(void* platoon);   /* T-1122 attempt 2 fold 2: defined below, beside RaidLentEnded */
+void RaidLentAtSleep(void* platoon, int living, int haveMember, float mx, float my, float mz);
+void AwakeSleepWrote(void* platoon, const std::string& worldId, long long writtenAt, int sent);   /* T-1122 RETURN by reference: a squad taken awake here - its sleep write noted on its row (review fold 2: named only once sent) */
+static int LivingMembersPod(void* platoon);
 void detour_deactivate(void* platoon, void* container)
 {
     if (!OnMainThread()) { ++g_offThreadDetours; ::InterlockedIncrement64(&g_offThreadDeactivate); }   /* review-p5f CRASH-1 / G: its own number - T220's shared 14/7 could not say WHICH detour, and T222 did: offThreadDetours[deactivate,destroy,gdcSave]=8,0,0 on BOTH sides */
@@ -6612,18 +7092,27 @@ void detour_deactivate(void* platoon, void* container)
     NoteQuitting("sleep");   /* E26: the earliest main-thread point that still runs while the process is shutting down */
     Pod before; const int okb = ReadPod(platoon, &before);
     g_p120N = (okb && g_p120Writes < 40) ? P120Read(before.members, before.activeChars, g_p120Mem, 64) : -1;   // PROBE P120
-    int known = 0, mine = 0, relHere = 0; float mx = 0, mz = 0, my = 0; int haveMember = 0; int memRun = -1;
+    int known = 0, mine = 0, relHere = 0; float mx = 0, mz = 0, my = 0; int haveMember = 0; int memRun = -1; int unnumLiving = 0;
     if (okb && before.activeChars > 0 && Plaus(before.members))
     {
         MembersOwnership(before.members, before.activeChars, &known, &mine);
+        unnumLiving = MembersLivingUnnumbered(before.members, before.activeChars);   /* T-1318 attempt 4: the tripwire below (site 10) */
         memRun = MembersRunBySlot(before.members, before.activeChars);   /* the squad's runner by its members, read while they exist (SquadOriginSlot below) */
         relHere = MembersReleasedHere(before.members, before.activeChars);   /* here, with known / mine: after orig_deactivate the members are destroyed and their uids no longer resolve */
         // T149 (F463): the platoon's own position (+0x48) lags its walking members by kilometres; the record's position is a
         // live member's, read before the engine destroys them.
         for (int i = 0; i < before.activeChars && i < 64 && !haveMember; ++i) if (Plaus(before.members[i]) && ReadCharPosPod(before.members[i], &mx, &mz)) { haveMember = 1; ReadCharYPod(before.members[i], &my); }
     }
+    const int lentLiving = (container == 0 && RaidLentHas(platoon)) ? LivingMembersPod(platoon) : -9;   /* T-1122 build: read before the sleep destroys the members */
+    if (lentLiving != -9 && okb && before.activeChars > 0 && Plaus(before.members))
+    {   /* T-1122 attempt 2 (owner 1619 a): a lent copy is judged, and its RETURN placed, by its people's centre - the engine's own test */
+        float lcx = 0.0f, lcz = 0.0f;
+        if (LivePeopleCentrePod(before.members, before.activeChars, &lcx, &lcz) > 0) { mx = lcx; mz = lcz; haveMember = 1; }
+    }
     orig_deactivate(platoon, container);
+    if (g_otherRunRemoved.erase(platoon) != 0) ++g_otherRunCleared;   /* T-850 fold 1 (M1): put to sleep here - its notes of people lost do not outlive that */
     ++g_sleeps;
+    if (lentLiving != -9) { RaidLentAtSleep(platoon, lentLiving, haveMember, mx, my, mz); HbForget(platoon); return; }   /* T-1122 build: a lent copy - its bytes go back to its lender (RETURN), or DIED; no record, no release, nothing to the world server */
     if (coop::IsContextPlatoon(platoon) == 1)
     {   /* the wake rule's memory: this sleep held a person this game runs (the sleep rule's own test), or not. Not: the platoon is
            queued for removal - another game's people arrive by SPAWN, and the engine would wake it in a loaded area (H067). */
@@ -6643,7 +7132,18 @@ void detour_deactivate(void* platoon, void* container)
         /* review-p4h H1 / review-p4k H1+H2: a deleted number is never recorded again - keyed on the platoon's own id (the ordinary wake does
            not bind), and the empty shell is routed for destruction on the next tick (the entry was deleted by whoever set the bit) */
         const std::string sleepId = !deadId.empty() ? deadId : WorldIdOf(platoon);
-        if (!sleepId.empty() && DeletedBitTest(sleepId) && PlayerSideSquad(platoon) == 0) { swPutAway.send = 0; ++g_sleepRefusedDeleted; g_deadPending.erase(sleepId); g_deadShellPtrs[sleepId] = platoon; g_deadShells.push_back(sleepId); return; }
+        if (!sleepId.empty() && DeletedBitTest(sleepId) && PlayerSideSquad(platoon) == 0)
+        {
+            swPutAway.send = 0; ++g_sleepRefusedDeleted;
+            if (g_sleepRefusedDeletedLines < 20)   /* T-850: the only trace of a refused put-away - one line per refusal, capped */
+            {
+                ++g_sleepRefusedDeletedLines;
+                DebugLog("[STORE] SLEEP REFUSED worldId=" + sleepId + " - the engine put the squad away with " + N((long long)(okb ? before.activeChars : -1))
+                         + " member(s) but its id carries the permanent deleted mark: no record written, the shell is destroyed next tick (sleepRefusedDeleted="
+                         + N(g_sleepRefusedDeleted) + "; the first 20 logged)");
+            }
+            g_deadPending.erase(sleepId); g_deadShellPtrs[sleepId] = platoon; g_deadShells.push_back(sleepId); return;
+        }
     }
     if (!deadId.empty() && g_deadPending.count(deadId))
     {
@@ -6716,6 +7216,13 @@ void detour_deactivate(void* platoon, void* container)
         {
             if (sw == coopsquad::kCtxSleepRefuseContext) ++g_ctxSleepRefused;
             else ++g_ctxSleepRefusedHandedOver;
+            if (isHo != 0 && unnumLiving != 0)
+            {   /* T-1318 attempt 4 (design A, site 10): THE TRIPWIRE - refused as handed over with never-numbered living people in the list (must stay 0) */
+                ++g_hoUnnumberedSleep;
+                if (++g_givenEngineLines <= 40)
+                    DebugLog("[STORE] SLEEP refused as HANDED OVER with never-numbered living people in its list (T-1318 attempt 4 tripwire, must stay 0): worldId=" + worldId + " chars=" + N(before.activeChars)
+                             + " known=" + N(known) + " unnumberedLiving=" + N((long long)unnumLiving) + " (givenEngine hoUnnumberedSleep=" + N(g_hoUnnumberedSleep) + "; the first 40 givenEngine lines)");
+            }
             if (++g_ctxSleepLogged <= 20)
                 DebugLog("[STORE] SLEEP refused worldId=" + worldId + " chars=" + N(before.activeChars) + " known=" + N(known) + " mine=" + N(mine) + " block=" + std::string(mineByBlock ? "mine" : "not mine")
                          + (sw == coopsquad::kCtxSleepRefuseContext ? std::string(" - a context platoon for another game's characters (its people arrive by SPAWN): not written")
@@ -6778,7 +7285,7 @@ void detour_deactivate(void* platoon, void* container)
     if (!Plaus(after.unloadedContainer)) { ++g_faults; if (++g_faultSleepContainer == 1) ErrorLog("[STORE] Q12 fault: no container after deactivate - platoon " + P(platoon) + " unloaded=" + P(after.unloaded) + " container=" + P(after.unloadedContainer) + " chars(before)=" + N(before.activeChars)); return; }
     Record r; r.worldId = worldId; r.x = haveMember ? mx : after.x; r.y = haveMember ? my : after.y; r.z = haveMember ? mz : after.z; r.writtenAt = (long long)time(0); { std::map<std::string, Record>::const_iterator pr = g_records.find(worldId); if (pr != g_records.end() && pr->second.writtenAt >= r.writtenAt) { r.writtenAt = pr->second.writtenAt + 1; ++g_sleepStampBumped; } }   /* review-s2hb fold: max(now, last + 1) - a heartbeat in the same second must not make the notebook refuse the SLEEP record as not newer */ r.owner = (int)StoreOwnerField(); r.posAt = r.writtenAt;   /* B10 (audit C13) site 2 of 6 */
     r.town = PlatoonTownSid(platoon);   /* decision 34 */   // review-store S6: all three axes from the live member
-    { char hk[128]; if (TownGenPlatoonHomeKey(platoon, hk, 128) == 1) NoteRecordHome(worldId, std::string(hk), 1); }   /* the group's home building key, sent with its record (RecordHomeOf) - read off the live group */
+    HomeWriteLive(platoon, worldId);   /* the group's home building key, or "-" after the engine blanked it (T-1334), sent with its record (RecordHomeOf) - read off the live group */
     char buf[160];
     if (Plaus(after.squadGd) && CopyStdStringPod((const char*)after.squadGd + 0x58, buf, 160)) r.squadSid = buf;
     if (Plaus(after.faction)) { Faction* f = (Faction*)after.faction; r.factionName = FactionKey(f); }   /* factionkey.h */
@@ -6861,6 +7368,9 @@ void detour_deactivate(void* platoon, void* container)
     if (g_p120N >= 0 && g_p120Writes < 40) { ++g_p120Writes; SW_DEVLOG("[PROBE] P120 write wid=" + worldId + " slot=" + N((long long)g_mySlot) + " n=" + N((long long)g_p120N) + P120List(g_p120Mem, g_p120N)); }   // PROBE P120
     if (mineByBlock && memberRuleRefuses) ++g_writtenByBlock;   /* E2: counted at the WRITE, not at the gate - a group the block rule let past can still be refused below it (player faction, a faulted read, a failed save), and a counter named "written" that counted gate passes would be this project's lesson 1 all over again */
     const bool sent = SendOne(r);
+    AwakeSleepWrote(platoon, worldId, r.writtenAt, sent ? 1 : 0);   /* T-1122 RETURN by reference: the put-away of a squad taken awake here names this record (AwakeRowTick). Review fold 2:
+                                                                       only once it is on its way - SendOne false (no link, the send refused, the file unreadable) is re-pushed
+                                                                       only at a later relink, so a RETURN naming it could name a record the owner never gets (raidsq::AwakeSleepNote) */
     DebugLog("[STORE] SLEEP wrote worldId=" + worldId + " squad='" + r.squadSid + "' faction='" + r.factionName + "' chars=" + N(before.activeChars)
              + " known=" + N(known) + " mine=" + N(mine) + " pos=" + F1(r.x) + "," + F1(r.y) + "," + F1(r.z) + " file=" + r.file + " sent=" + (sent ? "1" : "0"));
 }
@@ -6888,6 +7398,29 @@ static int LivingMembersPod(void* platoon)
         return living;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-850 fold 2: the members this game runs or nobody runs (session uid this game's, or none - a body's retired row answers none), dead or
+   alive; *ownLiving = the living ones among them. -1 = not read; 0 = none (no members, or all another game's copies). MAIN THREAD. */
+static int OwnMembersPod(void* platoon, int* ownLiving)
+{
+    *ownLiving = 0;
+    __try
+    {
+        Pod q; if (!ReadPod(platoon, &q)) return -1;
+        if (q.activeChars <= 0) return 0;
+        if (!Plaus(q.members) || q.activeChars > 512) return -1;
+        int own = 0;
+        for (int i = 0; i < q.activeChars && i < 512; ++i)
+        {
+            void* c = q.members[i]; if (!Plaus(c)) continue;
+            const unsigned int uid = FindSpawnedUid(c);
+            if (uid != 0 && !net::IsUidMine(uid)) continue;   /* another game's person (its copy here) */
+            ++own;
+            if (!((::Character*)c)->hasDied()) ++*ownLiving;
+        }
+        return own;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ownLiving = 0; return -1; }
 }
 long long g_releasedDead = 0, g_livingFault = 0;
 /* the keep question's protections for a squad born not kept, read live at the question. MAIN THREAD. */
@@ -6988,12 +7521,162 @@ int SquadHasHome(void* platoon)
     if ((hr == 1 || hr == 0) && (hc != g_liveHomeOf.end() || g_liveHomeOf.size() < kLiveHomeCap)) g_liveHomeOf[platoon] = std::make_pair(boundId, live);
     return live;
 }
-/* 1 = another game holds the squad's area now (the area map, read live) */
+/* T-850 fold 1, T-1046 fix 2: awake keep answers "kept for another game" where no other game HELD the area (it had it loaded) - since
+   fix 2 that game's engine must also keep the squad at its spot (the receiver test); the meaning is otherwise unchanged */
+long long g_keepOtherLoaded = 0;
+/* T-1046 fix 2 (owner 1591 a): ONE KEEP RULE FOR BOTH QUESTIONS (squadbirth.h OneKeepRule). Counted per squad when its answer changes
+   (oneKeep[...] on the birth REPORT, sqbirth::kOk* order), the first 3 of each kind per area logged (400 a kind at most); asked = every question the rule answered;
+   posFallback = an awake squad whose RELEASE position was not read (its Platoon +0x48 spot used). MAIN THREAD. */
+long long g_oneKeep[sqbirth::kOkVerdicts] = { 0, 0, 0, 0, 0, 0, 0 };
+long long g_oneKeepLines[sqbirth::kOkVerdicts] = { 0, 0, 0, 0, 0, 0, 0 };
+long long g_oneKeepAsked = 0, g_oneKeepPosFallback = 0;
+std::map<void*, int> g_oneKeepOf;   /* each bound squad's last one-rule answer (sqbirth::kOk*); goes with the platoon, cleared at the world teardown */
+void OneKeepNote(void* platoon, int verdict, int k, float x, float z, int takenSlot)
+{
+    if (verdict < 0 || verdict >= sqbirth::kOkVerdicts) return;
+    std::map<void*, int>::iterator it = g_oneKeepOf.find(platoon);
+    if (it != g_oneKeepOf.end() && it->second == verdict) return;
+    if (it != g_oneKeepOf.end()) it->second = verdict; else if (g_oneKeepOf.size() < 65536) g_oneKeepOf[platoon] = verdict;
+    ++g_oneKeep[verdict];
+    const Sector s = SectorOf(x, z);
+    {   /* review fold (request premise): the first 3 of each kind PER AREA are logged (at most 400 lines a game), so a run can tie an answer to an area */
+        static std::map<int, int> s_linesAt;
+        static std::set<std::pair<void*, int> > s_squadSaid;   /* T-1046 fold 2: the kept / not-taken kinds once per squad (a run reads each group's answer) */
+        if (g_oneKeepLines[verdict] >= 400) return;
+        if (verdict == sqbirth::kOkKeptAwake || verdict == sqbirth::kOkKeptAsleep || verdict == sqbirth::kOkNotTakenAsleep)
+        {
+            if (!s_squadSaid.insert(std::make_pair(platoon, verdict)).second) return;
+        }
+        else
+        {
+            const int key = verdict * 4096 + (s.x >= 0 && s.x < 64 ? s.x : 63) * 64 + (s.y >= 0 && s.y < 64 ? s.y : 63);
+            int& n = s_linesAt[key];
+            if (n >= 3) return;
+            ++n;
+        }
+        ++g_oneKeepLines[verdict];
+    }
+    static const char* const kWhy[sqbirth::kOkVerdicts] = { "awake - another game's engine keeps it at this spot: kept for that game",
+        "asleep - another game's engine keeps it at this spot and that game took its people: kept for that game",
+        "awake - no other game's engine keeps it at this spot: the game's own answer",
+        "asleep - no other game's engine keeps it at this spot: the game's own answer",
+        "asleep - another game's engine would keep it here but no such game took its people: the game's own answer (it wakes, is put away and offered)",
+        "no fresh area map - today's answer (another game holds or has the area loaded by the last map): kept",
+        "no fresh area map - today's answer: the game's own" };
+    DebugLog(std::string("[STORE] KEEP-RULE squad '") + WorldIdOf(platoon) + "': " + kWhy[verdict] + " (receivers=" + N((long long)k) + " taken by slot "
+             + N((long long)takenSlot) + " spot " + F1(x) + "," + F1(z) + " area " + N((long long)s.x) + "," + N((long long)s.y)
+             + "; T-1046 fix 2, kept / not-taken kinds once per squad, the others the first 3 of the kind in this area; oneKeep[...] on the birth REPORT)");
+}
+/* T-1046 fold 2 (T2305 leg N): THE SLEEPING SQUAD'S OWN PEOPLE, person by person. The sleeping container (UnloadedPlatoon +0x10,
+   Pod.unloadedContainer - the records the put-away serialised: one 0x24 record per character, Character::serialise decomp_627610:207,
+   holding the character's own handle as "handleS" / "handleTYPE", :223-224) is walked by OwnBytesPod (guarded) and parsed by
+   ownrec.h GdcSpans; its 0x24 records' hands go to the squad index's person-by-person test. Cached per platoon until the index
+   changes (HandoffIdxSeq) or 5 s pass. -1 = not taken (a living person not given); -3 = all given, not to one slot (T-1318 a4 fold 1); T-1318 attempt 4 (design A, site 7):
+   coopsquad::kTakenUnread (-2) = not read (no squad / container, no records, a record with no hand) - GivenAtAck then lets the index's
+   whole answer stand.
+   Counted: oneKeepTaken[reads,cached,noRecords,noHand,taken]. MAIN THREAD. */
+int (*g_sleepOwnBytes)(const void* container, char* buf, size_t cap, size_t* need, unsigned int* shape) = 0;   /* OwnBytesPod (the mmo1c container walk, defined below in its own unnamed namespace - set there at load) */
+struct SleepTakenMemo { long long seq; double at; int slot; };
+std::map<void*, SleepTakenMemo> g_sleepTakenMemo;   /* goes with the platoon, cleared at the world teardown */
+long long g_sleepTakenReads = 0, g_sleepTakenCached = 0, g_sleepTakenNoRecords = 0, g_sleepTakenNoHand = 0, g_sleepTakenYes = 0;
+/* T-1318 a4 fold 1 (review HIGH-1): the sleeping squad's 0x24 records' hands, in record order ("" = a record with no hand, *noHand 1) -
+   -1 no sleeping container read, 0 read (hands may be empty: no records). SleepersTakenSlotNow's read, shared with the RELEASE's records
+   decision (StoreSleepersHands). MAIN THREAD. */
+int SleepersHandsRead(void* platoon, std::vector<std::string>* hands, int* noHand, std::vector<int>* dead = 0)   /* T-1318 a4 fold 2 (re-check LOW-B): dead - each record's death (coopown::GdcCharDeadOf, the same order) */
+{
+    *noHand = 0;
+    if (dead != 0) dead->clear();
+    Pod q;
+    if (!(ReadPod(platoon, &q) && Plaus(q.unloaded) && Plaus(q.unloadedContainer))) return -1;
+    std::vector<char> buf(256 * 1024);
+    size_t need = 0; unsigned int shape = 0;
+    int r = g_sleepOwnBytes != 0 ? g_sleepOwnBytes(q.unloadedContainer, &buf[0], buf.size(), &need, &shape) : -1;
+    if (r == 1 && need > buf.size() && need <= 8u * 1024u * 1024u) { buf.resize(need); r = g_sleepOwnBytes(q.unloadedContainer, &buf[0], buf.size(), &need, &shape); }
+    std::vector<coopown::GdcRecSpan> spans; size_t end = 0;
+    if (r == 1 && need <= buf.size() && coopown::GdcSpans(&buf[0], need, &end, &spans))
+    {
+        for (size_t i = 0; i < spans.size(); ++i) { if (spans[i].type != 0x24) continue; if (spans[i].hand.empty()) *noHand = 1; hands->push_back(spans[i].hand); }
+        if (dead != 0) coopown::GdcCharDeadOf(spans, dead);
+    }
+    return 0;
+}
+int SleepersTakenSlotNow(void* platoon, void* faction, const std::string& wid)
+{
+    const long long seq = coop::HandoffIdxSeq();
+    const double now = ZoneNowSec();
+    std::map<void*, SleepTakenMemo>::iterator m = g_sleepTakenMemo.find(platoon);
+    if (m != g_sleepTakenMemo.end() && m->second.seq == seq && now - m->second.at >= 0.0 && now - m->second.at < 5.0) { ++g_sleepTakenCached; return m->second.slot; }
+    ++g_sleepTakenReads;
+    int slot = coopsquad::kTakenUnread;   /* T-1318 attempt 4: not read until the records read */
+    std::vector<std::string> hands; int noHand = 0;
+    if (SleepersHandsRead(platoon, &hands, &noHand) == 0)   /* T-1318 a4 fold 1: the read shared with the RELEASE's records decision */
+    {
+        if (hands.empty()) ++g_sleepTakenNoRecords;
+        else if (noHand != 0) ++g_sleepTakenNoHand;
+        else slot = coop::HandoffSleepersTakenBy(faction, wid, hands);
+        if (slot >= 0) ++g_sleepTakenYes;
+    }
+    if (m != g_sleepTakenMemo.end()) { m->second.seq = seq; m->second.at = now; m->second.slot = slot; }
+    else if (g_sleepTakenMemo.size() < 65536) { SleepTakenMemo e; e.seq = seq; e.at = now; e.slot = slot; g_sleepTakenMemo[platoon] = e; }
+    return slot;
+}
+std::string SleepTakenToken() { return N(g_sleepTakenReads) + "," + N(g_sleepTakenCached) + "," + N(g_sleepTakenNoRecords) + "," + N(g_sleepTakenNoHand) + "," + N(g_sleepTakenYes); }
+/* the one rule at (x, z): asleep = the engine's wake test asks (the squad has no ActivePlatoon); faction = the squad's (Platoon +0x10, the
+   squad index's key with its id). 1 = kept for another game, 0 = the engine's own answer. MAIN THREAD. */
+int OneKeepAt(void* platoon, int asleep, float x, float z, void* faction)
+{
+    ++g_oneKeepAsked;
+    int takenSlot = -1;
+    if (asleep != 0 && Plaus(faction))
+    {   /* T-1046 fold 2 (T2305 leg N): the slot that took every person of this sleeping squad, person by person against its own records
+           (RelAccept put them in the squad index's given) - leftovers kept here that are not among its sleepers do not block it */
+        const std::string wid = WorldIdOf(platoon);
+        if (!wid.empty() && coop::HandoffSquadHasGiven(faction, wid) != 0) takenSlot = SleepersTakenSlotNow(platoon, faction, wid);
+    }
+    int names = 0, holder = -1;
+    const int k = coop::HandoffKeepReceivers(x, z, takenSlot, &names, &holder);
+    int staleShows = 0, held = -1;
+    const Sector sec = SectorOf(x, z);
+    if (k < 0)
+    {   /* no fresh map: today's answer (T-850 fold 1's bare bits, read live) - for both questions */
+        held = HeldByOtherTS(sec);
+        const int shows = sqbirth::OtherShowsArea(held, held == 1 ? 0 : OtherLoadedTS(sec));
+        staleShows = shows;
+    }
+    else held = (holder >= 0 && holder != StoreMySlot()) ? 1 : 0;
+    const int taken = (takenSlot >= 0 && names == 1) ? 1 : 0;
+    const int kept = sqbirth::OneKeepRule(asleep, k, taken, staleShows);
+    OneKeepNote(platoon, sqbirth::OneKeepVerdict(asleep, k, taken, staleShows), k, x, z, takenSlot);
+    if (asleep == 0 && kept != 0 && held != 1) ++g_keepOtherLoaded;
+    return kept;
+}
+std::string OneKeepRcvToken() { long long sk = 0, as = 0; coop::HandoffKeepReceiverCounts(&sk, &as); return N(sk) + "," + N(as); }
+/* 1 = kept for another game (the awake question, the put-away's): the one rule at the position the RELEASE decides the squad at */
 int SquadAreaHeldByOther(void* platoon)
 {
     Pod q;
     if (!ReadPod(platoon, &q)) return 0;
-    return HeldByOtherTS(SectorOf(q.x, q.z)) == 1 ? 1 : 0;
+    float x = q.x, z = q.z;
+    if (coop::HandoffSquadKeepPos(q.active, &x, &z) != 1) { x = q.x; z = q.z; ++g_oneKeepPosFallback; }
+    return OneKeepAt(platoon, 0, x, z, q.faction);
+}
+/* T-1046 fix 2: 1 = the squad is ASLEEP and its sleep spot is read. The engine keeps exactly one of the two at a time: the put-away's
+   deactivate 0x7EF4B0 stores the new UnloadedPlatoon at Platoon +0x1E0 (0x7EF62C), deletes the ActivePlatoon and clears +0x1D8
+   (0x7EF649-0x7EF65F); the wake's activate stores the new ActivePlatoon at +0x1D8 (0x7EBEA9), deletes the UnloadedPlatoon and clears
+   +0x1E0 (0x7EBEE5-0x7EBEFB); only the platoon teardown (0x7EC6E5 / 0x7EC725) clears both (1.0.68, Read). A squad emptied by hiring or
+   merging or by the unload's removals is awake (+0x1D8 set, no members) - never asleep here. The UnloadedPlatoon's +0x48 is its
+   platoon (the wake test hands it to the keep question at 0x7EE82F); its +0x64 / +0x6C is the spot the wake test's area tests read
+   (0x7EBF46 / 0x7EE87F) and the activate copies into ActivePlatoon +0xB4, the RELEASE's position. MAIN THREAD. */
+int SquadAsleepPod(void* platoon, float* x, float* z, void** faction)
+{
+    Pod q;
+    if (!ReadPod(platoon, &q) || q.active != 0 || !Plaus(q.unloaded)) return 0;
+    void* back = 0;
+    __try { back = *(void**)((char*)q.unloaded + 0x48); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (back != platoon || coopsquad::SquadPosUsable(q.ux, q.uy, q.uz) == 0) return 0;
+    *x = q.ux; *z = q.uz; *faction = q.faction;
+    return 1;
 }
 long long g_birthKept[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };   /* squads per keep verdict (squadbirth.h kKeep*), counted when a squad's verdict changes */
 long long g_birthKeepLines[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -7015,9 +7698,27 @@ void KeepVerdictNote(void* platoon, int verdict)
 }
 unsigned char detour_isPersistent(void* platoon)
 {
+    if (g_on && RaidLentHas(platoon))
+    {   /* T-1122 attempt 2 fold 2 (re-check HIGH): once the engine ended the copy's raid here, the engine's own answer (one-player play: a raid
+           squad with no campaign is not kept - it is discarded at its put-away; its destroy says DIED) */
+        const int over = RaidLentOver(platoon);
+        return (unsigned char)raidsq::LentKeep(RaidLentEnded(platoon), LivingMembersPod(platoon), over, over != 0 ? (orig_isPersistent(platoon) != 0 ? 1 : 0) : 1);
+    }   /* T-1122 review fold: a lent copy with living people is kept while its lend is open - the engine puts it to sleep at this game's area edge and RaidLentAtSleep gives it back (RETURN); "not kept" was the engine's delete, said as DIED */
     if (g_on && g_bind.find(platoon) != g_bind.end())
     {
         const int living = LivingMembersPod(platoon);
+        int ownAsleep = -1;   /* T-1046 fix 2: the game's own answer for a sleeping squad, asked once */
+        if (living == -2 && OnMainThread())
+        {   /* T-1046 fix 2 (owner 1591 a): ASLEEP - the one keep rule, as for the put-away: kept for another game only where its engine keeps
+               the squad at its spot and that game took its people; else the game's own answer below, as before */
+            float sx = 0.0f, sz = 0.0f; void* sf = 0;
+            if (SquadAsleepPod(platoon, &sx, &sz, &sf) == 1) ownAsleep = (int)orig_isPersistent(platoon);   /* asked only where the game itself would not keep it */
+            if (ownAsleep == 0 && OneKeepAt(platoon, 1, sx, sz, sf) != 0)
+            {
+                g_discarding.erase(platoon);
+                ++g_keptPersistent; return 1;
+            }
+        }
         if (living == 0 || (living == -2 && OnMainThread()))
         {
             // everyone is dead, or a squad read whole with no awake members (LivingMembersPod -2: emptied by hiring or merging; off the main thread -2 keeps the answer from before, below; -1, not read, is kept below): let the engine's classifier decide (it discards) - the destroy hook below then deletes the notebook entry
@@ -7039,12 +7740,13 @@ unsigned char detour_isPersistent(void* platoon)
                 else if (g_discarding.count(platoon) != 0) ++g_unloadEmptiedKeptMark;
                 KeepVerdictNote(platoon, sqbirth::kKeepDeadRelease);
             }
-            return orig_isPersistent(platoon);
+            return ownAsleep >= 0 ? (unsigned char)ownAsleep : orig_isPersistent(platoon);
         }
         if (living == -1) ++g_livingFault;   /* T-999 fold 2: the member list not read - kept below (KeepDecide kKeepNotRead), the answer from before the birth flag */
         /* off the main thread (the sleep hook runs on a worker at times): the answer from before the birth flag - kept - with no map
            touched, since the birth registry's companions, the record table and the character tables below are the main thread's */
         if (!OnMainThread()) { ::InterlockedIncrement64(&g_keepOffThread); ++g_keptPersistent; return 1; }
+        if (sqbirth::OtherRunNotesCleared(living) != 0 && g_otherRunRemoved.erase(platoon) != 0) ++g_otherRunCleared;   /* T-850 fold 1 (M1): living members here again - a lost straggler does not decide this squad's later destroy */
         if (living > 0 && g_unloadEmptied.erase(platoon) != 0) ++g_unloadEmptiedCleared;   /* T-999 fold 3: asked with living members again - the unload removal noted (a straggler 'wandered out of zone') did not empty it */
         /* the squad's birth flag decides (squadbirth.h KeepDecide): a home building - kept; born kept - kept; no flag readable - kept; born
            not kept, or a kept byte read off the squad itself with no home (in an older world that byte may be this mod's own forcing) -
@@ -7074,6 +7776,3293 @@ unsigned char detour_isPersistent(void* platoon)
     return orig_isPersistent(platoon);
 }
 
+/* ==================== T-1122 own raid squads (src/common/raidsquad.h) - T-1122 fold b ====================
+   This game's own raid squads, in one raidsq::Book (the header's plain code) under this module's lock. A squad is noted by the creation
+   gate (towngen.cpp, rule 1) or by the lasting-facts sweep (OwnRaidSweepTick: in a running war campaign of its faction on this game, no
+   binding, no world record - so a save reload or a rejoin finds the travelling squads again). On a game that is not the off-screen
+   authority the engine's own off-screen update runs for it (OwnRaidUpdate, rule 2); nothing of it is sent to the world server while it
+   sleeps (rule 3). A row goes at the squad's wake (detour_activate, any thread), its free (ForgetPlatoonRows), the destroy drain's
+   reused-address branch, the world teardown, and when its platoon no longer points at the noted sleeping object or - on the main
+   thread - is no longer in its faction's sleeping list. ANY THREAD - the lock; the gate notes rows on the engine's worker threads. The
+   platoon is read only through the SEH-guarded ReadPod. Lines: one budget per kind. */
+raidsq::Book g_ownRaid;                            /* g_ownRaidLock */
+CRITICAL_SECTION g_ownRaidLock;
+volatile LONG g_ownRaidLockState = 0;
+volatile LONG g_ownRaidCount = 0;                  /* rows held: the off-screen update takes no lock while it is 0 */
+volatile LONGLONG g_ownRaidNoted = 0, g_ownRaidSweepNoted = 0, g_ownRaidNoSleeper = 0, g_ownRaidAwake = 0, g_ownRaidCapFull = 0, g_ownRaidReplaced = 0,
+                  g_ownRaidTravelled = 0, g_ownRaidSteps = 0, g_ownRaidHeld = 0, g_ownRaidWoke = 0, g_ownRaidFreed = 0, g_ownRaidStale = 0,
+                  g_ownRaidNotListed = 0, g_ownRaidPosSkipped = 0, g_ownRaidSweeps = 0,
+                  g_ownRaidAwakeNoted = 0, g_ownRaidPosIgnored = 0;   /* T-1122 re-check folds 7 / 1: noted from an awake lend (not the gate's count); position updates not applied to an own raid squad */
+enum { kOwnRaidLineNote = 0, kOwnRaidLineStep = 1, kOwnRaidLineHeld = 2, kOwnRaidLineEnd = 3 };
+const LONGLONG kOwnRaidLineCap[4] = { 60, 200, 60, 60 };
+volatile LONGLONG g_ownRaidLines[4] = { 0, 0, 0, 0 };
+enum { kOwnRaidFreed = 0, kOwnRaidWoke = 1, kOwnRaidReused = 2 };
+enum { kOwnRaidByGate = 0, kOwnRaidBySweep = 1, kOwnRaidByAwake = 2 };   /* kOwnRaidByAwake: T-1122 review fold 4 - a squad lent awake, asleep here (main thread) */
+}   /* the anonymous namespace closes: InSleepingListImpl is defined in coop itself, below with the sleeping-list walks (C2668) */
+int InSleepingListImpl(::Faction* f, void* platoon);
+/* T-1318 attempt 4 (design A, site 8): SleepersTakenSlotNow for spawn.cpp's same-id supersede (store.h) */
+int StoreSleepersTakenSlot(void* platoon, void* faction, const std::string& wid) { return SleepersTakenSlotNow(platoon, faction, wid); }
+int StoreSleepersHands(void* platoon, std::vector<std::string>* hands, std::vector<int>* dead) { int noHand = 0; hands->clear(); return (SleepersHandsRead(platoon, hands, &noHand, dead) == 0 && !hands->empty()) ? 1 : 0; }   /* T-1318 a4 fold 1 (store.h) */
+namespace {
+void OwnRaidLockEnter()
+{
+    if (::InterlockedCompareExchange(&g_ownRaidLockState, 1, 0) == 0) { ::InitializeCriticalSection(&g_ownRaidLock); ::InterlockedExchange(&g_ownRaidLockState, 2); }
+    while (g_ownRaidLockState != 2) ::Sleep(0);
+    ::EnterCriticalSection(&g_ownRaidLock);
+}
+static void OwnRaidLeave() { ::InterlockedExchange(&g_ownRaidCount, (LONG)g_ownRaid.Size()); ::LeaveCriticalSection(&g_ownRaidLock); }
+static void OwnRaidLine(int kind, const std::string& s)
+{
+    const LONGLONG n = ::InterlockedIncrement64(&g_ownRaidLines[kind]);
+    if (n <= kOwnRaidLineCap[kind]) DebugLog(s + (n == kOwnRaidLineCap[kind] ? std::string(" (the last line of this kind - the counts are on the store REPORT's ownRaid token)") : std::string()));
+}
+static std::string OwnRaidSec(int x, int y) { return N((long long)x) + "," + N((long long)y); }
+/* by: kOwnRaidByGate (the creation gate, any thread) / kOwnRaidBySweep (the lasting facts, main thread). 1 = noted. */
+static int OwnRaidNoteImpl(void* platoon, int by)
+{
+    if (platoon == 0) return 0;
+    Pod q; std::memset(&q, 0, sizeof(q));
+    const int ok = ReadPod(platoon, &q);
+    const int pre = raidsq::NoteDecide(ok, Plaus(q.unloaded) ? 1 : 0, (ok && Plaus(q.active)) ? 1 : 0);
+    if (pre != raidsq::kNoteGo)
+    {
+        ::InterlockedIncrement64(pre == raidsq::kNoteAwake ? &g_ownRaidAwake : &g_ownRaidNoSleeper);
+        OwnRaidLine(kOwnRaidLineNote, "[STORE] own raid squad NOT noted: platoon=" + P(platoon) + (pre == raidsq::kNoteAwake ? std::string(" is already awake - the existing roads' (its heartbeat writes it)") : std::string(" has no sleeping object (read=" + N((long long)ok) + ") - no off-screen update reaches it"))
+                    + (by == kOwnRaidBySweep ? " (sweep)" : " (gate)"));
+        return 0;
+    }
+    std::string sid; if (!PlatoonSidPod(platoon, &sid) || sid.empty()) sid = "?";
+    const Sector s = SectorOf(q.ux, q.uz);
+    int replaced = 0;
+    OwnRaidLockEnter();
+    const int added = g_ownRaid.Note(platoon, q.unloaded, s.x, s.y, sid.c_str(), raidsq::kCap, ::GetTickCount(), &replaced);
+    OwnRaidLeave();
+    if (replaced != 0) ::InterlockedIncrement64(&g_ownRaidReplaced);
+    if (added == 0)
+    {
+        ::InterlockedIncrement64(&g_ownRaidCapFull);
+        OwnRaidLine(kOwnRaidLineNote, "[STORE] own raid squad NOT noted: id=" + sid + " - " + N((long long)raidsq::kCap) + " rows are held (ownRaid capFull; the sweep tries again)");
+        return 0;
+    }
+    const LONGLONG n = ::InterlockedIncrement64(by == kOwnRaidBySweep ? &g_ownRaidSweepNoted : by == kOwnRaidByAwake ? &g_ownRaidAwakeNoted : &g_ownRaidNoted);   /* T-1122 re-check fold 7: awake notes have their own count */
+    OwnRaidLine(kOwnRaidLineNote, "[STORE] own raid squad noted" + std::string(by == kOwnRaidBySweep ? " from its lasting facts (asleep, in a running war campaign of its faction here, no world record)" : by == kOwnRaidByAwake ? " from its awake lend (asleep here while another game runs its raid: held frozen until the lend ends)" : " by the creation gate (an area nobody holds)")
+                + ": id=" + sid + " asleep at sector " + OwnRaidSec(s.x, s.y) + " pos=" + F1(q.ux) + "," + F1(q.uz) + " platoon=" + P(platoon)
+                + " - this game travels it off-screen, nothing of it goes to the world server while it sleeps (" + N((long long)n) + (by == kOwnRaidBySweep ? " by the sweep" : by == kOwnRaidByAwake ? " by the awake lend" : " by the gate") + (replaced != 0 ? "; an older row on this platoon or sleeping object replaced)" : ")"));
+    return 1;
+}
+void OwnRaidNote(void* platoon) { OwnRaidNoteImpl(platoon, kOwnRaidByGate); }
+/* 1 = this sleeping object is an own raid squad's and its row still names it (*platoonOut set); a row that no longer does is dropped */
+static int OwnRaidLookup(void* unloaded, void** platoonOut)
+{
+    if (g_ownRaidCount == 0 || unloaded == 0) return 0;
+    OwnRaidLockEnter();
+    void* const platoon = const_cast<void*>(g_ownRaid.PlatoonOf(unloaded));
+    OwnRaidLeave();
+    if (platoon == 0) return 0;
+    Pod q; std::memset(&q, 0, sizeof(q));
+    const int ok = ReadPod(platoon, &q);
+    int live = raidsq::RowStillThis(ok, ok ? q.unloaded : 0, unloaded);
+    int listed = -1;   /* -1 not asked (off the main thread: the faction's list is the main thread's to walk) */
+    if (live != 0 && OnMainThread()) { listed = InSleepingListImpl(Plaus(q.faction) ? (::Faction*)q.faction : 0, platoon); if (listed != 1) live = 0; }
+    if (live != 0) { *platoonOut = platoon; return 1; }
+    raidsq::Row r; std::memset(&r, 0, sizeof(r));
+    OwnRaidLockEnter();
+    const int dropped = g_ownRaid.ForgetIf(platoon, unloaded, ::GetTickCount(), &r);
+    OwnRaidLeave();
+    if (dropped != 0)
+    {
+        ::InterlockedIncrement64(listed == 0 ? &g_ownRaidNotListed : &g_ownRaidStale);
+        OwnRaidLine(kOwnRaidLineEnd, "[STORE] own raid squad dropped: id=" + std::string(r.id) + " - its platoon " + P(platoon)
+                    + (listed == 0 ? std::string(" is not in its faction's sleeping list") : " no longer points at the sleeping object noted for it (read=" + N((long long)ok) + ")") + " (stale)");
+    }
+    return 0;
+}
+/* the sleeping-position publish's and the sweep's question (the lookup is locked) */
+int OwnRaidHas(void* platoon)
+{
+    if (g_ownRaidCount == 0 || platoon == 0) return 0;
+    OwnRaidLockEnter();
+    const int has = g_ownRaid.Has(platoon);
+    OwnRaidLeave();
+    return has;
+}
+/* the squad woke (kOwnRaidWoke - an ordinary awake squad from here, written and released by the existing roads), was freed, or its
+   address was found reused by the destroy drain */
+void OwnRaidForget(void* platoon, int why)
+{
+    if (g_ownRaidCount == 0 || platoon == 0) return;
+    raidsq::Row r; std::memset(&r, 0, sizeof(r));
+    OwnRaidLockEnter();
+    const int had = g_ownRaid.Forget(platoon, ::GetTickCount(), &r);
+    OwnRaidLeave();
+    if (had == 0) return;
+    ::InterlockedIncrement64(why == kOwnRaidWoke ? &g_ownRaidWoke : &g_ownRaidFreed);
+    OwnRaidLine(kOwnRaidLineEnd, std::string("[STORE] own raid squad ") + (why == kOwnRaidWoke ? "woke" : (why == kOwnRaidReused ? "forgotten (its address was reused)" : "freed")) + ": id=" + std::string(r.id)
+                + " last sleeping sector " + OwnRaidSec(r.sx, r.sy) + " after " + N(r.steps) + " sector steps" + (why == kOwnRaidWoke ? " - an ordinary awake squad of this game from here" : ""));
+}
+void OwnRaidWorldTeardown()
+{
+    OwnRaidLockEnter();
+    g_ownRaid.Clear(::GetTickCount());
+    OwnRaidLeave();
+}
+/* the REPORT's stop figures: stops begun, squads that ever stopped, seconds stopped (closed + open), squads stopped now */
+static std::string OwnRaidHeldFigures()
+{
+    OwnRaidLockEnter();
+    const unsigned long now = ::GetTickCount();
+    const long long stops = g_ownRaid.heldStops, squads = g_ownRaid.heldSquads, nowHeld = g_ownRaid.HeldNow();
+    const unsigned long long ms = g_ownRaid.HeldMsNow(now);
+    OwnRaidLeave();
+    return N(stops) + "," + N(squads) + "," + N((long long)(ms / 1000ULL)) + "," + N(nowHeld);
+}
+/* ==================== T-1122 build (owner 1443 b): THE RAID HAND-OVER - the LEND (src/common/raidsquad.h) ====================
+   LENDER (the game that made the raid squad and keeps the raid): its own raid squad held where ANOTHER game holds the area
+   (OwnRaidUpdate, heldByOther == 1) is queued for the main thread (g_lendWant); RaidLendTick saves its sleeping bytes (the save half of
+   StoreRecordCreatedImpl - no send to the world server, no bind), reads the raid's target position (the faction war manager's campaign
+   of this squad, its target hand) and sends LEND to the area holder. While the lend is open (ASKED / TAKEN) the squad is frozen - its
+   clock kept fresh, no travel, no wake. Every answer ends the lend by raidsq::LendAnswer: TAKEN keeps it frozen; REFUSED / UNKNOWN /
+   the borrower gone / silence with the link down resume the ordinary rule; RETURN moves the squad to the returned position and loads
+   the returned bytes into its container (the wake's own load steps, now), then lets it travel on (attempt 2 fold 1: no grace timer); DIED removes
+   it through Faction::removeSquad (the hooked entry, as PlatoonWipe does). Silence with the link up asks again.
+   BORROWER (the area holder): builds a sleeping copy from the bytes (CreateUnknownSquad's engine steps, NO bind, no record) and marks it
+   LENT (g_lentPlatoons): no heartbeat, no first-sight decision, no sleep write, no delete and no sleeping-position publish reaches the
+   world server for it. At its wake its people get a walk order to the target (task 29 through OrdersReceiver::issueOrder, again every
+   30 s while awake - the order does not survive sleep). The keep question keeps a lent copy with living people while its lend is open
+   (raidsq::LentKeep - the engine deletes an awake raid squad with no raid and no home at the loaded area's edge, Read 1.0.65), so its
+   engine puts it to sleep there (detour_deactivate): the bytes go back in RETURN, and the copy, still listed asleep after
+   raidsq::kLendReturnSweepMs, is removed through Faction::removeSquad. A copy wiped out (death watch: no living member) or destroyed says
+   DIED. A copy that never woke and whose area this game no longer holds is given back from its sleeping bytes. T-1122 fix (T1967,
+   F1050): a lend is built only where this game's engine can wake it - its spot inside this game's wake box (raidsq::WakeBoxOf, the
+   game's own flags read at the decision); outside it the lend is refused with the box and the lender travels its squad on until it is inside. Either side missing from
+   the roster for raidsq::kLendGoneMs has left (a shorter gap is a blip). MAIN THREAD except RaidLentHas / RaidLentEnded (any thread -
+   g_ownRaidLock). Lines: [RAIDLEND], one budget. */
+struct LendRow
+{
+    int state; unsigned int serial; int borrower; std::string id; unsigned long askedAt; unsigned long quietUntil;
+    int asks; unsigned int applied; std::vector<char> body; int goneSeen; unsigned long goneSince;
+    int lendAx, lendAy;                                 /* T-1122 fix (T1967): the area of the spot lent */
+    unsigned long answeredAt; int stillTaken;           /* T-1122 F2 (T1974): the borrower's last TAKEN answer (the first or a status ask's), and how many status asks it answered */
+    int boxHave, boxAx, boxAy; unsigned int boxSig; raidsq::WakeBox box;   /* the borrower's 'outside my wake box' answer for that area (raidsq::LendBoxDecide) */
+    int endOutcome, endPhase;                           /* T-1122 redesign (b): the borrower's last RAID_END for this lend (raidsq::kEnd*, its campaign phase) */
+    int awakeNoted;                                     /* T-1122 review fold 4: 1 = its squad, asleep here while lent awake, was noted as an own raid squad by this row (held frozen; dropped with the row) */
+    int awake; void* awakeFaction;                      /* T-1122 awake hand (owner 1524): 1 = an AWAKE lend - its squad was handed over awake by the ordinary hand-over, its row keyed by
+                                                           its platoon here and checked under its id in awakeFaction's lists (not an own raid row) */
+    std::string recId; long long recAt;                 /* T-1122 lend by reference: the world record this lend's write named (empty: none) - the tick ends an ASKED lend
+                                                           whose write the world server refused (raidsq::LendAskRefused) */
+    int shortReturns, shortAx, shortAy;                 /* T-1122 attempt 2 fold 1 (MED 2): SHORT returns from area (shortAx, shortAy) since its spot was last the give-back
+                                                           line outside it (raidsq::LendReturnShort / LendShortClears) */
+    int shortSlot, shortQuiet;                          /* T-1122 attempt 2 fold 2: the holder those returns came from (raidsq::LendShortReset); 1 = quietUntil is a short return's wait */
+    LendRow() : shortReturns(0), shortAx(-1), shortAy(-1), shortSlot(-1), shortQuiet(0), state(raidsq::kLendIdle), serial(0), borrower(-1), askedAt(0), quietUntil(0), asks(0), applied(0), goneSeen(0), goneSince(0),
+                lendAx(-1), lendAy(-1), answeredAt(0), stillTaken(0), boxHave(0), boxAx(-1), boxAy(-1), boxSig(0), endOutcome(0), endPhase(-1), awake(0), awakeFaction(0), awakeNoted(0), recAt(0) {}
+};
+struct BorrowRow
+{
+    int lender; unsigned int serial; std::string id; std::string faction; void* platoon; int hasTarget; float tx, ty, tz;   /* faction: the lend's faction key (the save fold's list) */
+    int awake; int ended; unsigned long builtAt, endAt; int destroyedOff; int goneSeen; unsigned long goneSince;
+    int hasCamp; std::string campKind; int campPhase; unsigned long long campT18, campT20;   /* T-1122 redesign (b): the lender's raid campaign block (LEND) */
+    int campTried, campMade, campEnded, campPhaseSeen; void* camp; void* campWm; void* campKindPtr; void* campVt;   /* T-1122 redesign (b): this game's campaign for the copy (BorrowCampStart); campVt: its table (this code's copy) */
+    int forwardTo; unsigned long asleepAt; std::vector<unsigned int> uids;   /* T-1122 review folds 2-4: the slot its AWAKE went on to (-1 none); first seen asleep (0 awake); its people run here (read while awake) */
+    int awakeHand; unsigned int leaderUid; void* hereFaction; std::string hereId;   /* T-1122 awake hand (owner 1524): 1 = a squad taken AWAKE by the ordinary hand-over - an ordinary
+                                                                                     world squad here (not lent), found by its id in hereFaction's lists; leaderUid the hand-over's key uid */
+    long long sleepWroteAt; std::string sleepWroteId;   /* T-1122 RETURN by reference: the world record this game's sleep save wrote of the squad since it was last seen awake here (0 none) */
+    long long sleepUnsentAt;   /* T-1122 review fold 2: a sleep write of it that could not be sent to the world server (0 none) - never named; its RAID_END says so */
+    int retPending; unsigned long retAt; std::vector<char> retBody; std::string retRecId; long long retRecAt; int retOut, retPhase, retEnded, retByte;   /* T-1122 review fold 3: the put-away's RETURN, waiting for
+                                                       this game's own copy to be removed first (AwakeReturnFinish); retOut / retPhase: the RAID_END its campaign's end read, said instead if that cannot be; retEnded (T-1122 attempt 3): its ending handler (raidsq::kEndBy*); retByte (fold 1): its +0x3C byte with 'defeated' */
+    std::string recId;   /* T-1122 lend by reference: the world id the LEND named - the copy's put-away writes that record (LentPutAway) */
+    int retireTries;   /* T-1122 re-check fold 1: failed put-to-sleep-and-remove tries of this ended copy (raidsq::kLendRetireMaxTries) */
+    int placed;   /* T-1122 attempt 2 (owner 1619 a): this lend's placements tried here - fold 1: one per lend, at its FIRST wake (0 = not yet; a re-wake of a kept copy is never placed) */
+    int raidOver; int noWakeSaid; unsigned long sleptAt;   /* T-1122 attempt 2 fold 2: the engine ended its raid here (raidsq::LentKeep raidOver); a kept copy not woken was said; asleep since (0 awake) */
+    BorrowRow() : lender(-1), serial(0), platoon(0), hasTarget(0), tx(0), ty(0), tz(0), awake(0), ended(0), builtAt(0), endAt(0), destroyedOff(0), goneSeen(0), goneSince(0), hasCamp(0), campPhase(-1), campT18(0), campT20(0),
+                  campTried(0), campMade(0), campEnded(0), campPhaseSeen(-1), camp(0), campWm(0), campKindPtr(0), campVt(0), awakeHand(0), leaderUid(0), hereFaction(0), forwardTo(-1), asleepAt(0), sleepWroteAt(0), sleepUnsentAt(0), retPending(0), retAt(0), retRecAt(0), retOut(raidsq::kEndNone), retPhase(-1), retEnded(raidsq::kEndByNone), retByte(raidsq::kDefeatByteNone), retireTries(0), placed(0), raidOver(0), noWakeSaid(0), sleptAt(0) {}
+};
+std::map<void*, LendRow> g_lend;                    /* lender rows, by platoon - g_ownRaidLock (OwnRaidUpdate reads the state on any thread) */
+std::set<void*> g_lendWant;                         /* squads OwnRaidUpdate found held for a lend - g_ownRaidLock */
+std::map<std::string, BorrowRow> g_borrow;          /* borrower rows, by key (lender|id|serial) - main thread */
+std::map<void*, std::string> g_lentPlatoons;        /* the lent copies here -> key - g_ownRaidLock (the hooks ask on any thread) */
+std::set<void*> g_lentRaidOver;                     /* T-1122 attempt 2 fold 2: the lent copies here whose raid the engine ended here - g_ownRaidLock (the keep question asks on any thread) */
+std::set<void*> g_lentEnded;                        /* the lent copies here whose lend ended (RETURN / DIED said, or the lender left) - g_ownRaidLock (the keep question asks on any thread) */
+std::map<std::string, unsigned long> g_awakeOnwardAt;   /* T-1122 re-check fold 6: an awake borrow this game sent on (AWAKE onward) -> when its row ended here; the owner's status ask is not answered UNKNOWN for raidsq::kAwakeOnwardQuietMs - main thread; emptied at the world teardown */
+std::map<std::string, std::vector<char> > g_borrowEnded;   /* key -> the ending said (RETURN / DIED body), to say again at a status ask - main thread; emptied at the world teardown */
+unsigned int g_lendSerial = 0;                      /* the last serial lent (raidsq::LendSerialNext over LendSerialSeed - unique across this game's restarts) */
+volatile LONG g_lentCount = 0;                      /* g_lentPlatoons' size, set under the lock: RaidLentHas takes no lock while it is 0 */
+static void LentCountSet() { ::InterlockedExchange(&g_lentCount, (LONG)g_lentPlatoons.size()); }
+const size_t kBorrowCap = 64, kBorrowEndedCap = 64;
+volatile LONGLONG g_lendSent = 0, g_lendReasked = 0, g_lendStatusAsked = 0, g_lendTaken = 0, g_lendRefused = 0, g_lendReturned = 0, g_lendDied = 0, g_lendResumed = 0,
+                  g_lendRemoved = 0, g_lendSaveFailed = 0, g_lendSendFailed = 0, g_lendFrozenTicks = 0, g_lendStale = 0,
+                  g_lendMalformed = 0, g_lendOffThread = 0, g_lendNoTarget = 0, g_lendLoadFailed = 0,
+                  g_lendNoCamp = 0, g_raidEndIn = 0, g_raidEndStale = 0, g_raidEndRemoved = 0,   /* T-1122 redesign (b): LEND without a campaign block; RAID_END taken / stale / removing */
+                  g_borrowBuilt = 0, g_borrowRefused = 0, g_borrowReturnSent = 0, g_borrowDiedSent = 0, g_borrowRemoved = 0, g_borrowOrphaned = 0,
+                  g_borrowSaidAgain = 0, g_borrowUnknown = 0, g_borrowAsleepReturned = 0;
+volatile LONGLONG g_wakeRefused = 0, g_wakeGivenBack = 0, g_wakeNeverWoke = 0, g_wakeBoxAnswers = 0, g_wakeBoxRuns = 0, g_wakeBoxLends = 0, g_wakeHostStays = 0;   /* T-1122 fix (T1967): the raidWake token (hostStays: T-1122 review fold) */
+volatile LONGLONG g_lendLines = 0;
+/* T-1122 attempt 2 (owner 1619 a): the raidLendPlace token - people placed at a wake (moved), refused (longer than raidsq::kLendPlaceMax),
+   put-aways kept in the band, given back past the margin, campaigns started at the placement; the centre already deep, no box, never
+   seen with people; and every put-away's give-back by its reason (raidsq::kSl*) */
+volatile LONGLONG g_lpPlaced = 0, g_lpRefused = 0, g_lpKeptInBand = 0, g_lpReturnedPastMargin = 0, g_lpCampStarted = 0, g_lpAlready = 0, g_lpNoBox = 0, g_lpTimedOut = 0;
+volatile LONGLONG g_lpReturn[raidsq::kSlCount] = { 0 };
+/* T-1122 attempt 2 fold 1: people not moved for want of a ground height (HIGH 1); placements refused because this game does not hold the
+   target point's area (LOW); people made later, placed (MED 3); re-wakes not placed (one placement per lend); asleep copies travelled
+   through the band outside this game's areas (LentBandUpdate); off-thread wakes queued for the main thread (LOW); keeps whose spot write
+   failed (given back instead); the lender's short returns, safety stops, updates held at a stop, and stops cleared past the line */
+volatile LONGLONG g_lpNoGround = 0, g_lpNotHeldAt = 0, g_lpLate = 0, g_lpNotFirst = 0, g_lpBandTravel = 0, g_lpWokeOffThread = 0, g_lpKeepWriteFailed = 0;
+volatile LONGLONG g_lsShort = 0, g_lsQuiet = 0, g_lsQuietTicks = 0, g_lsCleared = 0;
+/* T-1122 attempt 2 fold 2 (the raidLendFold2 token and raidLend's endRuns / raidLendShort's holderResets): copies whose raid the engine ended here,
+   and those discarded by its engine after it; lends refused for a raid over; updates of a raid-over squad run by this game's engine in another
+   game's area / held there (its own game would wake it); short-return waits cleared by a holder change; kept copies not woken in the wake box;
+   band updates refused in another game's area; asleep copies given back there; placements given up for a ground height not read */
+volatile LONGLONG g_f2RaidOverMarked = 0, g_f2RaidOverDiscarded = 0, g_f2NoLendRaidOver = 0, g_f2EndRuns = 0, g_f2EndHeldTicks = 0, g_f2ShortHolderReset = 0,
+                  g_f2KeptNoWake = 0, g_f2BandRefusedOther = 0, g_f2GivenBackOtherArea = 0, g_f2GroundPartial = 0;
+std::set<void*> g_lentBand;   /* the sleeping objects of this game's asleep lent copies (rebuilt by RaidLendTick) - g_ownRaidLock (the off-screen update asks on any thread) */
+std::vector<void*> g_lentWokeOff; volatile LONG g_lentWokeOffN = 0;   /* lent copies woken off the main thread, for RaidLentWoke - g_ownRaidLock */
+volatile LONGLONG g_awakeSent = 0, g_awakeSendFailed = 0, g_awakeOffThread = 0, g_awakeStored = 0, g_awakeDup = 0, g_awakeApplied = 0, g_awakeCampRefused = 0, g_awakeDropped = 0,
+                  g_awakeEnded = 0, g_awakeLeft = 0, g_awakeForgot = 0;   /* T-1122 awake hand: the raidAwake token */
+volatile LONGLONG g_awakeOnward = 0, g_awakeNotOverRow = 0, g_awakeMoved = 0, g_awakeHome = 0, g_awakeFrozen = 0, g_awakeReturnSent = 0, g_awakeReturned = 0, g_awakeQuietEnd = 0;   /* T-1122 review folds: the raidAwakeFold token */
+volatile LONGLONG g_awakeReturnFailed = 0, g_awakeReturnUnapplied = 0, g_awakeOnwardPart = 0, g_awakeOnwardQuiet = 0, g_awakeCopyRemoved = 0, g_awakeCopyKept = 0;   /* T-1122 re-check folds: the raidAwakeRecheck token */
+/* T-1122 save fold: the lent copies beside each save and their removal at its load (RaidLentLoadTick) - main thread, but the saveGame
+   pre-hook's off-thread count */
+long long g_lentFileWritten = 0, g_lentFileWriteFail = 0, g_lentFileRead = 0, g_lentFileStale = 0, g_lentFileBad = 0, g_lentFileEncodeFail = 0, g_lentFileUnreadable = 0,
+          g_lentCopyRemoved = 0, g_lentCopyRefused = 0, g_lentCopyAmbiguous = 0, g_lentCopyNotFound = 0, g_lentCopyRemoveFailed = 0;
+volatile LONGLONG g_lentNoteOffThread = 0;
+volatile LONGLONG g_lrWritten = 0, g_lrNoId = 0, g_lrWriterRefused = 0, g_lrNotSent = 0, g_lrReleased = 0, g_lrAskRefused = 0, g_lrBuiltNow = 0, g_lrBuiltAtRecv = 0,
+                  g_lrWaited = 0, g_lrWaitDup = 0, g_lrTimedOut = 0, g_lrRecvRefused = 0, g_lrLenderGone = 0, g_lrBackWritten = 0, g_lrBackNotWritten = 0,
+                  g_lrBackReleased = 0, g_lrKeepOwn = 0;   /* T-1122 lend by reference: the raidLendRef token */
+volatile LONGLONG g_lbSent = 0, g_lbKeptRoad = 0, g_lbHeld = 0, g_lbConfirmSent = 0, g_lbPartial = 0, g_lbHomeSwap = 0, g_lbHomeDropOnly = 0, g_lbHomeNone = 0, g_lbOwnRemoved = 0, g_lbOwnKept = 0;   /* T-1122 fix A (owner 1575 a, 2026-11-09): the raidLendBack token */
+volatile LONGLONG g_lwCount[raidsq::kLwCount] = { 0 }, g_lwHeldLines = 0;   /* T-1122 whole or none (owner 1581 a, 2026-11-09): the raidLendWhole token */
+static void LwNote(int which) { if (which >= 0 && which < raidsq::kLwCount) ::InterlockedIncrement64(&g_lwCount[which]); }
+volatile LONGLONG g_lhHeldLate = 0, g_lhRetireGaveUp = 0;   /* T-1122 re-check fold 1: the raidLendBound token - held endings sent past their bound, copies whose removal was given up */
+volatile LONGLONG g_lhHeldSent = 0, g_lhHeldKeepOwn = 0, g_lhRetired = 0, g_lhRetireFailed = 0, g_lhWithdrawnSent = 0, g_lhWithdrawnIn = 0, g_lhWithdrawnRemoved = 0,
+                  g_lhWithdrawnNoCopy = 0, g_lhRefusedKeepOwn = 0, g_lhKeepOwnNoteDropped = 0, g_lhUnsentRolledBack = 0;   /* T-1122 review folds: the raidLendHold token */
+const LONGLONG kLendLineCap = 300;
+static void LendLine(const std::string& s)
+{
+    const LONGLONG n = ::InterlockedIncrement64(&g_lendLines);
+    if (n <= kLendLineCap) DebugLog(s + (n == kLendLineCap ? std::string(" (the last [RAIDLEND] line - the counts are on the store REPORT's raidLend token)") : std::string()));
+}
+static std::string LendKey(int lender, const std::string& id, unsigned int serial) { return N((long long)lender) + "|" + id + "|" + N((long long)serial); }
+int SleepSectorPod(void* unloaded, Sector* s);   /* defined below, beside the off-screen update (the same anonymous namespace) */
+int EngineDtPod(void* u, float* dt);
+int StateBeforeWake(void* platoon, void** afterContainer);
+void* StateMake22(const ::GameData* src, const std::string& templateSid, int* why);
+void detour_destroyPlatoon(void* faction, void* platoon);
+void* FindSleepingPlatoonImpl(::Faction* f, const std::string& worldId);
+void* FindActivePlatoonImpl(::Faction* f, const std::string& worldId);
+/* any thread: is this platoon a lent copy here (the borrower) */
+int RaidLentHas(void* platoon)
+{
+    if (platoon == 0 || g_lentCount == 0) return 0;
+    OwnRaidLockEnter();
+    const int has = g_lentPlatoons.count(platoon) != 0 ? 1 : 0;
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    return has;
+}
+/* any thread: this lent copy's lend has ended here (the keep question - raidsq::LentKeep) */
+int RaidLentEnded(void* platoon)
+{
+    if (platoon == 0 || g_lentCount == 0) return 0;
+    OwnRaidLockEnter();
+    const int ended = g_lentEnded.count(platoon) != 0 ? 1 : 0;
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    return ended;
+}
+/* T-1122 attempt 2 fold 2: any thread - the engine ended this lent copy's raid campaign here (raidsq::LentKeep raidOver) */
+int RaidLentOver(void* platoon)
+{
+    if (platoon == 0 || g_lentCount == 0) return 0;
+    OwnRaidLockEnter();
+    const int over = g_lentRaidOver.count(platoon) != 0 ? 1 : 0;
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    return over;
+}
+static void LentEndedMark(void* platoon) { OwnRaidLockEnter(); if (g_lentPlatoons.count(platoon) != 0) g_lentEnded.insert(platoon); ::LeaveCriticalSection(&g_ownRaidLock); }
+/* the per-process draw of the lend serials' high part (raidsq::LendSerialNext) - main thread, drawn once */
+static unsigned int LendSerialSeed()
+{
+    static unsigned int s = 0;
+    if (s == 0)
+    {
+        LARGE_INTEGER c; c.QuadPart = 0; ::QueryPerformanceCounter(&c);
+        s = ((unsigned int)time(0) * 2654435761u) ^ ((unsigned int)c.QuadPart * 40503u) ^ ((unsigned int)::GetCurrentProcessId() << 16);
+        if (s == 0) s = 1;
+    }
+    return s;
+}
+/* any thread: the lender's row state of this own raid squad (kLendIdle with no row); *raidOverOut 1 once the borrower's RAID_END said its raid
+   is over there (T-1122 attempt 2 fold 2 - raidsq::LendRaidOver), *quietOut 1 while a refusal's backoff or a short return's wait runs */
+static int LendStateOf(void* platoon, int* raidOverOut, int* quietOut, int* awakeOut = 0)   /* awakeOut: T-1122 re-check fold 3 - 1 = an awake lend's row */
+{
+    *raidOverOut = 0; *quietOut = 0; if (awakeOut != 0) *awakeOut = 0;
+    OwnRaidLockEnter();
+    int st = raidsq::kLendIdle;
+    std::map<void*, LendRow>::const_iterator it = g_lend.find(platoon);
+    if (it != g_lend.end())
+    {
+        const unsigned long now = ::GetTickCount();
+        st = it->second.state; if (awakeOut != 0) *awakeOut = it->second.awake != 0 ? 1 : 0;
+        *raidOverOut = raidsq::LendRaidOver(it->second.endOutcome, it->second.endPhase);
+        if (it->second.quietUntil != 0 && (long)(it->second.quietUntil - now) > 0) *quietOut = 1;
+    }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    return st;
+}
+/* T-1122 attempt 2 fold 2 (re-check: a return into another area the borrower holds was not counted short): how far (x, z) lies outside the
+   areas game `slot` holds by this game's area map (raidsq::HeldOutsideBy over the 3 x 3 areas around it); -1 = it holds none of them. ANY
+   THREAD (the TS reads; call it with no lock of this file held) */
+static float LenderHeldOutside(int slot, float x, float z)
+{
+    if (slot < 0 || x != x || z != z) return -1.0f;
+    const Sector s = SectorOf(x, z);
+    int held[9];
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) { Sector n; n.x = s.x + dx; n.y = s.y + dy; held[(dy + 1) * 3 + (dx + 1)] = coop::AreaHolderSlotTS(n) == slot ? 1 : 0; }
+    return raidsq::HeldOutsideBy(held, x, z);
+}
+static void LendWantNote(void* platoon) { OwnRaidLockEnter(); if (g_lendWant.size() < raidsq::kCap) g_lendWant.insert(platoon); ::LeaveCriticalSection(&g_ownRaidLock); }
+
+/* ---- T-1122 fix (T1967, F518 / F1050): the game's wake box (raidsquad.h) ----
+   this game's wake box for the area at (x, z) - raidsq::WakeBoxOf. T-1122 review fold (item 1): read from the game's OWN flags at the
+   decision, never the once-a-second loaded set (+0xB3, which can still say loaded after the game cleared +0xB1 at an unload's start):
+   the area's own loaded byte (ZoneLoadedSectorTri, +0xB1) and each neighbour's side test as the game makes it (ZoneKeepSectorTri,
+   +0xB1 or +0xB0 - as EngineKeepsHere reads them). MAIN THREAD (BorrowOnLend, RaidLendTick); off it every flag reads -1: no box. */
+static raidsq::WakeBox LendWakeBoxHere(float x, float z)
+{
+    const Sector s = SectorOf(x, z);
+    const int dx[5] = { 0, -1, 1, 0, 0 }, dy[5] = { 0, 0, 0, -1, 1 };
+    int l[5];
+    l[0] = ZoneLoadedSectorTri(s.x, s.y) == 1 ? 1 : 0;
+    for (int i = 1; i < 5; ++i) l[i] = ZoneKeepSectorTri(s.x + dx[i], s.y + dy[i]) == 1 ? 1 : 0;
+    return raidsq::WakeBoxOf(s.x, s.y, l[0], l[1], l[2], l[3], l[4]);
+}
+/* the lender's area-map signature around area (ax, ay) - raidsq::WakeSigOf. ANY THREAD. */
+static unsigned int LendWakeSig(int ax, int ay)
+{
+    const int dx[4] = { -1, 1, 0, 0 }, dy[4] = { 0, 0, -1, 1 };
+    int h[4], o[4];
+    for (int i = 0; i < 4; ++i) { Sector n; n.x = ax + dx[i]; n.y = ay + dy[i]; h[i] = coop::AreaHolderSlotTS(n); o[i] = OtherLoadedTS(n); }
+    return raidsq::WakeSigOf(h, o);
+}
+static int LendSpotPod(void* unloaded, float* x, float* z)
+{
+    __try { *x = *(float*)((char*)unloaded + 0x64); *z = *(float*)((char*)unloaded + 0x6C); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1122 review fold (item 2): on a travel-on road this game runs the game's full off-screen update, its own wake check included - so
+   the squad travels only where this game's own game would not wake it (raidsq::HostTravelDecide), read from this game's own flags as
+   EngineKeepsHere reads them (ZoneKeepSectorTri; off the grid no neighbour narrows). Off the main thread they cannot be read: it stays.
+   No string is built here. */
+static int LendHostTravel(void* unloaded)
+{
+    float x = 0.0f, z = 0.0f;
+    const int onMain = OnMainThread() ? 1 : 0;
+    const int spot = LendSpotPod(unloaded, &x, &z);
+    int ax = -1, ay = -1, self = -1, w = 1, e = 1, no = 1, so = 1;
+    if (onMain != 0 && spot != 0 && x == x && z == z)
+    {
+        ax = (int)floorf((raidsq::kAreaOrigin + x) / raidsq::kAreaSize);
+        ay = (int)floorf((raidsq::kAreaOrigin + z) / raidsq::kAreaSize);
+        self = ZoneKeepSectorTri(ax, ay);
+        if (ax > 0) w = ZoneKeepSectorTri(ax - 1, ay);
+        if (ax < 63) e = ZoneKeepSectorTri(ax + 1, ay);
+        if (ay > 0) no = ZoneKeepSectorTri(ax, ay - 1);
+        if (ay < 63) so = ZoneKeepSectorTri(ax, ay + 1);
+    }
+    return raidsq::HostTravelDecide(onMain, spot, ax, ay, self, w, e, no, so, x, z);
+}
+/* the lender, in the off-screen update of an own raid squad in another game's area (any thread): the borrower's 'outside my wake box'
+   answer against the squad's spot now - raidsq::LendBoxDecide */
+static int LendBoxOf(void* platoon, void* unloaded, const Sector& s)
+{
+    int have = 0, bx = -1, by = -1; unsigned int sigAt = 0; raidsq::WakeBox b;
+    OwnRaidLockEnter();
+    std::map<void*, LendRow>::const_iterator it = g_lend.find(platoon);
+    if (it != g_lend.end() && it->second.state == raidsq::kLendIdle) { have = it->second.boxHave; bx = it->second.boxAx; by = it->second.boxAy; sigAt = it->second.boxSig; b = it->second.box; }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    if (have != 1) return raidsq::kBoxNone;
+    float x = 0.0f, z = 0.0f;
+    if (!LendSpotPod(unloaded, &x, &z)) return raidsq::kBoxNone;
+    return raidsq::LendLineDecide(have, bx, by, sigAt, s.x, s.y, LendWakeSig(s.x, s.y), b, x, z);   /* T-1122 attempt 2 fold 1: kBoxShallow - inside its box, short of its lend line */
+}
+/* ---- the raid's target (the lender). Faction +0x88 the war manager; its campaign of this squad is the map at +0x30 (the lookup
+   0x2834C0: a std::map node - left +0x00, right +0x10, key +0x18, value +0x20, nil byte +0x29 - decomp_2834c0, decomp_7eb9d0:12-14;
+   Read); the campaign's state +0xC0 (2 = over), its target hand +0x40 (type +0x48). The hand is resolved by the engine's own
+   hand::asObjectBase (gamecalls.cpp) and its position read by the object's vtable +0x40 (decomp_7edbf0:175 does the same). */
+struct LendHandRaw { void* vt; int type; unsigned int container, stamp, index, serial; };
+typedef char LendHandRawIs0x20[(sizeof(LendHandRaw) == 0x20) ? 1 : -1];
+static void* LendCampaignPod(void* faction, void* platoon)
+{
+    __try
+    {
+        char* wm = *(char**)((char*)faction + 0x88); if (!Plaus(wm)) return 0;
+        char* head = *(char**)(wm + 0x30); if (!Plaus(head)) return 0;
+        char* node = *(char**)(head + 0x8);
+        char* best = head;
+        for (int guard = 0; guard < 128 && Plaus(node) && *(char*)(node + 0x29) == 0; ++guard)
+        {
+            if (*(unsigned long long*)(node + 0x18) < (unsigned long long)platoon) node = *(char**)(node + 0x10);
+            else { best = node; node = *(char**)node; }
+        }
+        if (best == head || (unsigned long long)platoon < *(unsigned long long*)(best + 0x18)) return 0;
+        void* camp = *(void**)(best + 0x20);
+        return Plaus(camp) ? camp : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+typedef float* (*LendPosFn)(void* self, float* out);
+static int LendTargetPod(void* camp, float* x, float* y, float* z, int* type)
+{
+    __try
+    {
+        if (*(int*)((char*)camp + 0xC0) == 2) return 0;
+        const LendHandRaw* h = (const LendHandRaw*)((char*)camp + 0x40);
+        *type = h->type;
+        ::RootObjectBase* o = ((const hand*)h)->asObjectBase();
+        if (!Plaus(o)) return 0;
+        const uintptr_t* vt = *(const uintptr_t* const*)o;
+        float buf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        const float* p = ((LendPosFn)vt[0x40 / sizeof(uintptr_t)])(o, buf);
+        if (p == 0) return 0;
+        *x = p[0]; *y = p[1]; *z = p[2];
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the faction that owns the running campaign's target (RootObjectBase::getOwnerFactionDirect, the engine's own getter). 1 = read */
+static int LendTargetOwnerPod(void* camp, void** owner)
+{
+    __try
+    {
+        if (*(int*)((char*)camp + 0xC0) == 2) return 0;
+        ::RootObjectBase* o = ((const hand*)((const LendHandRaw*)((char*)camp + 0x40)))->asObjectBase();
+        if (!Plaus(o)) return 0;
+        *owner = (void*)o->getOwnerFactionDirect();
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* ---- T-1122 gate 2 (2a+, owner 1612 a, 2026-11-13; run T2327, F-T2327-RAIDGATES): THE SPOT MOVED ACROSS THE STRIP (raidsq::SpotAlongLine) ----
+   kSpotRoadLend: the borrower's box (its REFUSED answer, kept on the row) says the spot is outside it (LendBoxDecide kBoxTravel) while this
+   game's own game would wake the squad there (LendHostTravel kHostStay) - the strip where neither game acted. The spot moves at most
+   raidsq::kSpotMoveMax along the squad's line toward its raid's target to the near edge of the borrower's box, written into this game's
+   own squad (SetSleepPosPod, the position-only update: its anchor stays) BEFORE the lend's write reads it - the record, the LEND and the
+   squad name one position; the update then holds it inside that box and lends it (kBoxLend).
+   (T-1122 attempt 2 fold 2: the grace road is gone with the grace timer.) Any other answer leaves the spot (held as before). MAIN THREAD only (the flags, the target, the write).
+   1 = moved. */
+enum { kSpotRoadLend = 1 };
+volatile LONGLONG g_spotMovedIn = 0, g_spotMovedOut = 0, g_spotTooFar = 0, g_spotMissed = 0, g_spotNoTarget = 0, g_spotWriteFailed = 0;   /* the raidSpot token */
+int SetSleepPosAllPod(void* platoon, float x, float y, float z);   /* defined below (this anonymous namespace): the movement object's copies (F459) */
+/* T-1122 fold 1 (review LOW 3): the spot lines have their own budget (not the shared [RAIDLEND] one) - the first per squad of each kind
+   (moved, not moved), then only counted (raidSpot on the REPORT). MAIN THREAD (LendSpotMove). */
+std::set<std::string> g_spotSaid;
+static void SpotLine(const char* kind, const std::string& id, const std::string& line)
+{
+    if (g_spotSaid.size() >= raidsq::kCap) return;
+    if (g_spotSaid.insert(std::string(kind) + "|" + id).second) DebugLog(line + " (first for this squad; later ones counted on the REPORT's raidSpot token)");
+}
+static int LendSpotMove(void* platoon, void* unloaded, const Sector& s, int road)
+{
+    if (!OnMainThread()) return 0;
+    float x = 0.0f, z = 0.0f;
+    if (!LendSpotPod(unloaded, &x, &z) || x != x || z != z) return 0;
+    int have = 0, bx = -1, by = -1, borrower = -1; unsigned int sigAt = 0; raidsq::WakeBox bb; std::string id;
+    OwnRaidLockEnter();
+    std::map<void*, LendRow>::const_iterator it = g_lend.find(platoon);
+    if (it != g_lend.end() && it->second.state == raidsq::kLendIdle)
+    { have = it->second.boxHave; bx = it->second.boxAx; by = it->second.boxAy; sigAt = it->second.boxSig; bb = it->second.box; borrower = it->second.borrower; id = it->second.id; }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    raidsq::WakeBox box;
+    if (road != kSpotRoadLend) return 0;   /* T-1122 attempt 2 fold 2: the lend road only */
+    {
+        /* T-1122 attempt 2 fold 1 (owner 1619 a; review MED 1 / MED 2): THE LEND LINE - a spot short of the borrower's lend line (raidsq::DeepOf
+           its box) is moved to it: inside the borrower's box (kBoxShallow), or outside it where this game's own game would wake it */
+        const int line = raidsq::LendLineDecide(have, bx, by, sigAt, s.x, s.y, LendWakeSig(s.x, s.y), bb, x, z);
+        if (line != raidsq::kBoxTravel && line != raidsq::kBoxShallow) return 0;
+        if (line == raidsq::kBoxTravel && LendHostTravel(unloaded) != raidsq::kHostStay) return 0;   /* outside the borrower's box and its own game would not wake it: the box road travels it on */
+        box = bb;
+    }
+    Pod q; std::memset(&q, 0, sizeof(q));
+    float tx = 0.0f, ty = 0.0f, tz = 0.0f; int ttype = -1;
+    void* camp = (ReadPod(platoon, &q) && Plaus(q.faction)) ? LendCampaignPod(q.faction, platoon) : 0;
+    const int haveT = (camp != 0 && LendTargetPod(camp, &tx, &ty, &tz, &ttype) == 1) ? 1 : 0;
+    if (haveT == 0) ::InterlockedIncrement64(&g_spotNoTarget);   /* no target: the nearest point of the lend line (raidsq::LendTargetPoint) */
+    float nx = x, nz = z, d = 0.0f;
+    int v = raidsq::kSpotNoBox;
+    {   /* T-1122 attempt 2 fold 1 (owner 1619 a; review MED 2): to the lend line by the borrower's own placement rule - raidsq::LendTargetPoint
+           into its deep box: along the line toward the target, else the nearest deep point; at most raidsq::kLendPlaceMax and no limit straight
+           across, so a RETURN spot anywhere in the area short of the line (under 144 u in, too) is moved and lent, never held still */
+        const int tp = raidsq::LendTargetPoint(raidsq::DeepOf(box), x, z, haveT, tx, tz, &nx, &nz, &d);
+        v = (tp == raidsq::kTpLine || tp == raidsq::kTpNearest) ? raidsq::kSpotMoved : tp == raidsq::kTpTooFar ? raidsq::kSpotTooFar : tp == raidsq::kTpAlready ? raidsq::kSpotAlready : raidsq::kSpotNoBox;
+    }
+    if (v != raidsq::kSpotMoved)
+    {
+        const LONGLONG n = (v == raidsq::kSpotTooFar) ? ::InterlockedIncrement64(&g_spotTooFar) : (v == raidsq::kSpotMissed || v == raidsq::kSpotNoLine) ? ::InterlockedIncrement64(&g_spotMissed) : 0;
+        if (n > 0)
+            SpotLine("refused", id, "[RAIDLEND] spot NOT moved: id=" + id + " at " + F1(x) + "," + F1(z) + " target " + F1(tx) + "," + F1(tz) + " - "
+                     + (v == raidsq::kSpotTooFar ? "the lend line is " + F1(d) + " u away (more than " + F1(raidsq::kLendPlaceMax) + " u)" : std::string("its line toward the target does not cross the box's edge before the target"))
+                     + " (the borrower's lend line); it stays held as before (raidSpot on the REPORT)");
+        return 0;
+    }
+    /* T-1122 fold 1 (review HIGH 1, F459): all three position copies - the platoon's and the sleeping object's (SetSleepPosPod) and the
+       movement object's (SetSleepPosAllPod), whose position the engine's off-screen update copies back into the sleeping object */
+    if (SetSleepPosPod(platoon, nx, q.uy, nz, 0) != 1 || SetSleepPosAllPod(platoon, nx, q.uy, nz) != 1) { ::InterlockedIncrement64(&g_spotWriteFailed); return 0; }
+    ::InterlockedIncrement64(&g_spotMovedIn);   /* raidSpot's movedOutOfOwnBox (g_spotMovedOut) stays 0 since fold 2: no grace road */
+    SpotLine("moved", id, "[RAIDLEND] spot moved " + F1(d) + " u to the borrower's lend line: id=" + id + " from " + F1(x) + "," + F1(z) + " to " + F1(nx) + "," + F1(nz) + " toward target " + F1(tx) + "," + F1(tz)
+                 + " (slot " + N((long long)borrower) + "'s box in area " + N((long long)bx) + "," + N((long long)by) + ": x " + F1(box.x0) + ".." + F1(box.x1) + ", z " + F1(box.z0) + ".." + F1(box.z1)
+                 + ") - written into this squad before the lend's write, " + F1(raidsq::kLendDeep) + " u in from the area's edge; it is held there and lent (owner 1612 a / 1619 a)");
+    return 1;
+}
+/* T-1122 redesign (b) (owner 1465 a): THE LENDER'S CAMPAIGN BLOCK for LEND (raidsq::LendMsg hasCamp) - the campaign's kind (+0x10;
+   the kind's GameData at +0x138, its name at +0x28 - towngen.cpp kRaidKindDataOff; +0x10 as the kind is Inferred from decomp_9cad50 /
+   9cb050, Confirmed by probe P242 in run T2002: kind #0 of its war manager's kinds), its phase +0xC0 and the two times +0x18 / +0x20 the update
+   stamps at arrival (decomp_9c6220:89-91 / 117-120), copied raw. Reads only. 1 = read. */
+static int LendCampRawPod(void* camp, int* phase, unsigned long long* t18, unsigned long long* t20, void** gd)
+{
+    __try
+    {
+        *phase = *(const int*)((const char*)camp + 0xC0);
+        *t18 = *(const unsigned long long*)((const char*)camp + 0x18);
+        *t20 = *(const unsigned long long*)((const char*)camp + 0x20);
+        const char* kind = *(char* const*)((const char*)camp + 0x10);
+        if (!Plaus(kind)) return 0;
+        *gd = *(void* const*)(kind + 0x138);
+        return Plaus(*gd) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static int LendCampBlock(void* camp, raidsq::LendMsg* m)
+{
+    int phase = -1; unsigned long long t18 = 0, t20 = 0; void* gd = 0;
+    if (LendCampRawPod(camp, &phase, &t18, &t20, &gd) != 1) return 0;
+    char name[96]; name[0] = 0;
+    if (!CopyStdStringPod((const char*)gd + 0x28, name, 96) || name[0] == 0) return 0;
+    m->campKind = name; m->campPhase = phase; m->campT18 = t18; m->campT20 = t20;
+    return 1;
+}
+/* T-1122 redesign (b): the raid campaign's join and take-out (src/common/raidsquad.h's section) - the borrower's campaign checks its
+   campaign's vt+0x70 / vt+0x80 against them and calls them (BorrowCampStart / BorrowCampEnd) */
+unsigned long long kRaidCampaignJoinRva = 0; static coop::AddrReg kRaidCampaignJoinRva_reg("RaidCampaignJoin", &kRaidCampaignJoinRva);   /* Steam_1.0.65 0x9C3850 / 1.0.68 0x9C4720 */   // void join(campaign*, platoon*, char lead) - the campaign's vt+0x70 by decomp_9c4170's calls (Confirmed by probe P242, runs T2002 / T2009); decomp_9c3850
+unsigned long long kRaidCampaignDropRva = 0; static coop::AddrReg kRaidCampaignDropRva_reg("RaidCampaignDrop", &kRaidCampaignDropRva);   /* Steam_1.0.65 0x9C3A90 / 1.0.68 0x9C4960 */   // void takeOut(campaign*, platoon*) - map value cleared, list entry removed, a new leader if it led; decomp_9c3a90
+unsigned long long kRaidCampaignOriginRva = 0; static coop::AddrReg kRaidCampaignOriginRva_reg("RaidCampaignOrigin", &kRaidCampaignOriginRva);   /* Steam_1.0.65 0x9C2E00 / 1.0.68 0x9C3CD0 */   // Town* origin(warManager*, const Vector3* targetSpot) - the raiders' town a raid starts from; decomp_9c8960:52-58
+unsigned long long kRaidWarListGrowRva = 0; static coop::AddrReg kRaidWarListGrowRva_reg("RaidWarListGrow", &kRaidWarListGrowRva);   /* Steam_1.0.65 0x9CDC80 / 1.0.68 0x9CEB50 */   // void grow(lektor<T*>*, unsigned n) - n 0 = 10; storage moved to n slots when n > maxSize (disassembly 0x9CDC80-0x9CDD0A); decomp_9c8960:62-64
+/* T-1122 review fold - WHICH GAME MADE THIS RAID (raidsq::LastingOwn's madeHere; MAIN THREAD): each game picks raid targets only among
+   its own player's bases (raidsquad.h THE CAUSE), so a running campaign aimed at an object of THIS game's own player faction was made
+   here; one aimed at another player's stand-in, or whose target cannot be read, was not. 1 made here, 0 not, -1 not read. */
+static int RaidCampaignMadeHere(void* faction, void* platoon)
+{
+    void* camp = LendCampaignPod(faction, platoon);
+    void* owner = 0;
+    if (camp == 0 || LendTargetOwnerPod(camp, &owner) != 1 || !Plaus(owner)) return -1;
+    ::Faction* f = (::Faction*)owner;
+    return (IsPlayerFaction(f) && !IsPeerFaction(f) && coopsp::IsStandInRecord(StandInRecordSlot(f)) == 0) ? 1 : 0;
+}
+/* the march order (the borrower): every living member of the awake copy gets task 29 (MOVE_CUS_ORDERED) to the target, through the
+   order call replicate.cpp InjectOrder uses (OrdersReceiver::issueOrder: Character +0x650 the AI, AI +0x20 its orders). */
+/* the squad's sleeping container saved to `file` and read back (the save half of StoreRecordCreatedImpl: no record, no send, no bind) */
+static int LendSaveBytes(void* container, const std::string& file, std::vector<char>* out)
+{
+    out->clear();
+    g_saveExcCode = 0; g_saveExcAddr = 0;
+    const int sv = SavePod(container, &file);
+    if (sv != 1) { if (sv == -1) StoreSaveFaultBoth("the raid lend's save (SavePod)"); return 0; }
+    return ReadFileBytes(file, out) && !out->empty() ? 1 : 0;
+}
+static std::string LendFile(const char* what, const std::string& id, unsigned int serial) { return g_dirMirror + "\\raidlend-" + what + "-" + Sanitize(id) + "-" + N((long long)serial) + ".dat"; }
+static int LendSend(const raidsq::LendMsg& m, int toSlot, std::vector<char>* keep)
+{
+    std::vector<char> b;
+    if (raidsq::EncodeLend(m, &b) == 0) return 0;
+    if (keep != 0) *keep = b;
+    return net::SendRaidLend(b, toSlot) ? 1 : 0;
+}
+/* ==== T-1122 RETURN by reference (2026-11-06, design (a)): THE OWNER'S SIDE ====
+   The awake lend's holder gives the raid back by naming the world record its sleep save wrote at the put-away (raidsq::ReturnRefWritten);
+   the record itself reaches this game by the store road (no 64 KB limit). This game loads its record of that id - at the RETURN's stamp or
+   newer - into its own sleeping copy by the wake road's load steps. A RETURN whose record is not here yet leaves a waiting note (by world
+   id) that the record's arrival consumes (ReturnWaitRecv, from the RECV) - an event, never a timer; a copy that wakes first is settled by
+   the wake road's own newer-record load (ReturnWaitAtWake says which road applied it). While a note waits the copy is not lent again
+   (LendStartOne); review fold 4: a note also goes when its copy is no longer this game's own raid squad (ReturnWaitTick) - never because
+   its sender left the world (re-check: the record comes from the world server, sent before the RETURN). MAIN THREAD; emptied at the world teardown. */
+struct ReturnWait { void* platoon; std::string id; unsigned int serial; long long stamp; int from; unsigned long at;
+                    ReturnWait() : platoon(0), serial(0), stamp(0), from(-1), at(0) {} };
+std::map<std::string, ReturnWait> g_returnWait;   /* world id -> the RETURN waiting here for that record (stamp: the writtenAt it named) */
+volatile LONGLONG g_retRefNotWritten = 0, g_retRefLoadedNow = 0, g_retRefWaited = 0, g_retRefLoadedAtRecv = 0, g_retRefAppliedByWake = 0, g_retRefWokeFirst = 0,
+                  g_retRefWrongId = 0, g_retRefDropped = 0, g_retRefLoadFailed = 0, g_retRefLendHeld = 0, g_retRefUnsent = 0, g_retRefNotAsleep = 0;   /* the raidReturnRef token (review fold 6: wrongId - a RETURN naming
+                  another world id; dropped - a waiting note that went unapplied: its copy no longer its own sleeping raid squad; re-check: notAsleep - the put-away's RETURN turned into RAID_END, this game's own copy not asleep here under its id) */
+/* the record `rec` (this game's entry of the returned world id) loaded into platoon's sleeping container by the wake road's own steps
+   (StateBeforeWake, LoadPod, MarkReadPod, SetSleepPosPod). keepPos 1: the copy keeps its sleeping position (a late load - it has travelled
+   on from the returned spot as this game's own raid squad); 0: it goes to the record's spot. The copy's stamp becomes the record's own -
+   never higher, so a newer record still loads at its wake. 1 = loaded; -3 not asleep or not readable; -2 the reload refused (T-296). */
+static int ReturnRefLoad(void* platoon, const Record& rec, int keepPos, int* moved)
+{
+    Pod q; std::memset(&q, 0, sizeof(q));
+    if (!ReadPod(platoon, &q) || !Plaus(q.unloadedContainer) || !Plaus(q.unloaded) || Plaus(q.active)) return -3;
+    const float px = keepPos != 0 ? q.ux : rec.x, py = keepPos != 0 ? q.uy : rec.y, pz = keepPos != 0 ? q.uz : rec.z;
+    void* after = 0; const std::string modName;
+    const int ld = StateBeforeWake(platoon, &after) == 1 ? LoadPod(q.unloadedContainer, &rec.file, &modName) : -2;
+    if (ld == 1 && CharRecCountPod(q.unloaded) > 0) MarkReadPod(q.unloaded);
+    if (ld == 1) { *moved = SetSleepPosPod(platoon, px, py, pz, 1); g_localWrittenAt[platoon] = rec.writtenAt; }
+    return ld;
+}
+static int ReturnWaitHas(void* platoon)
+{
+    for (std::map<std::string, ReturnWait>::const_iterator it = g_returnWait.begin(); it != g_returnWait.end(); ++it) if (it->second.platoon == platoon) return 1;
+    return 0;
+}
+/* the record's arrival (the RECV, right after the record is kept here): a RETURN waiting for this world id loads it now when it is the named
+   stamp or newer - into the copy still this game's own raid squad, asleep under its id, its lend row idle; an older record keeps the note */
+static void ReturnWaitRecv(const std::string& worldId)
+{
+    if (g_returnWait.empty() || !OnMainThread() || EngineWritesBlocked()) return;
+    std::map<std::string, ReturnWait>::iterator it = g_returnWait.find(worldId);
+    if (it == g_returnWait.end()) return;
+    std::map<std::string, Record>::const_iterator rr = g_records.find(worldId);
+    if (rr == g_records.end()) return;
+    const ReturnWait w = it->second;
+    int idle = 1;
+    OwnRaidLockEnter();
+    { std::map<void*, LendRow>::const_iterator lr = g_lend.find(w.platoon); if (lr != g_lend.end() && lr->second.state != raidsq::kLendIdle) idle = 0; }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    Pod q; std::memset(&q, 0, sizeof(q));
+    const int copyOk = (idle != 0 && OwnRaidHas(w.platoon) != 0 && ReadPod(w.platoon, &q) && Plaus(q.faction) && Plaus(q.unloaded) && !Plaus(q.active)
+                        && FindSleepingPlatoonImpl((::Faction*)q.faction, w.id) == w.platoon) ? 1 : 0;
+    const int act = raidsq::ReturnWaitOn(raidsq::kRwRecv, rr->second.writtenAt, w.stamp, copyOk);
+    if (act == raidsq::kRwKeep) return;
+    g_returnWait.erase(it);
+    if (act == raidsq::kRwApply)
+    {
+        int moved = -1;
+        const int ld = ReturnRefLoad(w.platoon, rr->second, 1, &moved);
+        ::InterlockedIncrement64(ld == 1 ? &g_retRefLoadedAtRecv : &g_retRefLoadFailed);
+        LendLine("[RAIDLEND] returned record applied at its arrival (RECV): id=" + w.id + " serial=" + N((long long)w.serial) + " world record " + worldId + " writtenAt=" + N(rr->second.writtenAt)
+                 + " (the RETURN from slot " + N((long long)w.from) + " named " + N(w.stamp) + ") writer slot " + N((long long)rr->second.owner) + " load=" + N((long long)ld) + " moved=" + N((long long)moved)
+                 + (ld == 1 ? std::string(" - the returned people are this squad's from here (it keeps its sleeping position: it travelled on from the returned spot)")
+                            : std::string(" - NOT loaded: it keeps its own people")));
+        return;
+    }
+    ::InterlockedIncrement64(&g_retRefDropped);
+    LendLine("[RAIDLEND] returned record arrived but NOT loaded: id=" + w.id + " serial=" + N((long long)w.serial) + " world record " + worldId + " writtenAt=" + N(rr->second.writtenAt)
+             + " - this game's copy is no longer its own raid squad asleep under that id with an idle lend row (awake, gone, or lent again); the note goes");
+}
+/* the copy woke (detour_activate, after the wake road): loadedAt - the record that road loaded or left to the engine's read (0 none). A
+   note for this copy is settled here: applied by the wake road (the named stamp or newer), or the copy woke before its record came */
+static void ReturnWaitAtWake(void* platoon, long long loadedAt)
+{
+    if (g_returnWait.empty() || !OnMainThread()) return;
+    for (std::map<std::string, ReturnWait>::iterator it = g_returnWait.begin(); it != g_returnWait.end(); ++it)
+    {
+        if (it->second.platoon != platoon) continue;
+        const ReturnWait w = it->second; const std::string wid = it->first;
+        g_returnWait.erase(it);
+        if (raidsq::ReturnWaitOn(raidsq::kRwWake, loadedAt, w.stamp, 1) == raidsq::kRwWakeApplied)
+        {
+            ::InterlockedIncrement64(&g_retRefAppliedByWake);
+            LendLine("[RAIDLEND] returned record applied by the wake road: id=" + w.id + " serial=" + N((long long)w.serial) + " world record " + wid + " writtenAt=" + N(loadedAt)
+                     + " (the RETURN named " + N(w.stamp) + ") - its copy woke here and the wake's newer-record load took it");
+        }
+        else
+        {
+            ::InterlockedIncrement64(&g_retRefWokeFirst);
+            LendLine("[RAIDLEND] returned record NOT applied: id=" + w.id + " serial=" + N((long long)w.serial) + " - its copy woke here before world record " + wid + " writtenAt=" + N(w.stamp)
+                     + " came (the wake loaded " + (loadedAt > 0 ? "writtenAt " + N(loadedAt) : std::string("no record")) + "); it runs the people it had, and a newer record of it loads at a later wake");
+        }
+        return;
+    }
+}
+/* T-1122 review fold 4 / re-check: a note goes only when the copy is no longer this game's own raid squad (freed, gone, woke) - so the
+   squad can be lent again (LendStartOne). Never because the RETURN's sender left the world: the record comes from the WORLD SERVER, and the
+   sender sent the RETURN only after its record was really sent there (fold 2), so the record still arrives after the sender left and its
+   arrival loads it (ReturnWaitRecv). The tick; MAIN THREAD */
+static void ReturnWaitTick()
+{
+    for (std::map<std::string, ReturnWait>::iterator it = g_returnWait.begin(); it != g_returnWait.end(); )
+    {
+        ReturnWait& w = it->second;
+        const int own = OwnRaidHas(w.platoon) != 0 ? 1 : 0;
+        if (raidsq::ReturnWaitTickOn(own) == raidsq::kRwKeep) { ++it; continue; }
+        ::InterlockedIncrement64(&g_retRefDropped);
+        LendLine("[RAIDLEND] returned record no longer waited for: id=" + w.id + " serial=" + N((long long)w.serial) + " world record " + it->first + " writtenAt=" + N(w.stamp)
+                 + " - this game's copy is no longer its own raid squad (freed, gone or woke); the note goes and the squad may be lent again");
+        g_returnWait.erase(it++);
+    }
+}
+/* T-1122 review fold 5: a squad record kept here as this game's write but never sent to the world server - rolled back as a refusal is
+   (SquadWriterArrive): its writtenAt / posAt 0, so the world server's version is taken as newer and a copy here loads it at its next wake.
+   platoon: the own copy whose stamp went with it (0 none). MAIN THREAD */
+static void LendWriteUnsentRollback(const std::string& wid, void* platoon)
+{
+    std::map<std::string, Record>::iterator rt = g_records.find(wid);
+    if (rt != g_records.end()) { rt->second.writtenAt = 0; rt->second.posAt = 0; }
+    if (platoon != 0) g_localWrittenAt.erase(platoon);
+    for (std::map<void*, std::string>::const_iterator b = g_bind.begin(); b != g_bind.end(); ++b) if (b->second == wid) g_localWrittenAt.erase(b->first);
+    ::InterlockedIncrement64(&g_lhUnsentRolledBack);
+}
+/* ---- the lender ---- */
+long long g_lendFromRecord = 0, g_lendNoState = 0, g_lendStateFault = 0, g_lendCopyFault = 0, g_lendWriterOff = 0;   /* T-1122 fix: lends saved from the state record +0x40 / not lent, no state record anywhere / scratch faults (both writers off) / the shared record's copy faulted (writers on) / the own writer already off */
+static void LendStartOne(void* platoon)
+{
+    if (OwnRaidHas(platoon) == 0) return;
+    Pod q; std::memset(&q, 0, sizeof(q));
+    if (!ReadPod(platoon, &q) || !Plaus(q.unloaded) || Plaus(q.active) || !Plaus(q.unloadedContainer) || !Plaus(q.faction)) return;
+    const Sector s = SectorOf(q.ux, q.uz);
+    const int held = HeldByOtherTS(s), holder = coop::AreaHolderSlotTS(s);
+    int raidOver = 0, quiet = 0; const int st = LendStateOf(platoon, &raidOver, &quiet);
+    const int go = raidsq::LendStart(LinkUp() ? 1 : 0, held, holder, g_mySlot, st, quiet, raidOver);   /* T-1122 attempt 2 fold 2: a squad whose raid is over is never lent again */
+    if (go == raidsq::kStartRaidOver) ::InterlockedIncrement64(&g_f2NoLendRaidOver);
+    if (go != raidsq::kStartGo) return;
+    if (ReturnWaitHas(platoon) != 0)
+    {   /* T-1122 RETURN by reference: not lent again before the returned record is in it (its arrival or the copy's wake ends the wait; asked each tick) */
+        if (::InterlockedIncrement64(&g_retRefLendHeld) <= 5) LendLine("[RAIDLEND] not lent yet: a RETURN by reference waits here for its world record (the squad's returned people are not in this copy yet)");
+        return;
+    }
+    std::string id; if (!PlatoonSidPod(platoon, &id) || id.empty()) return;
+    const unsigned int serial = raidsq::LendSerialNext(g_lendSerial, LendSerialSeed()); g_lendSerial = serial;
+    raidsq::LendMsg m; m.kind = raidsq::kLendKindLend; m.serial = serial; m.lender = g_mySlot; m.id = id; m.full = 1;
+    m.faction = FactionKey((::Faction*)q.faction);
+    { char buf[160]; if (Plaus(q.squadGd) && CopyStdStringPod((const char*)q.squadGd + 0x58, buf, 160)) m.squad = buf; }
+    m.x = q.ux; m.y = q.uy; m.z = q.uz;
+    void* camp = LendCampaignPod(q.faction, platoon);
+    int ttype = -1;
+    if (camp != 0 && LendTargetPod(camp, &m.tx, &m.ty, &m.tz, &ttype) == 1) m.hasTarget = 1; else ::InterlockedIncrement64(&g_lendNoTarget);
+    if (camp != 0 && LendCampBlock(camp, &m) == 1) m.hasCamp = 1; else ::InterlockedIncrement64(&g_lendNoCamp);   /* T-1122 redesign (b): the campaign the borrower runs for the copy */
+    const std::string file = LendFile("out", id, serial);
+    /* T-1122 fix (H-T1122-emptylend, proven by T1957): a squad the campaign made asleep has an EMPTY container - its state is only in the
+       shared 0x22 record +0x40. Read live at the save: the container's records, its people and that record (raidsq::LendStateSource). */
+    void* rec40 = 0; StateScan sc; std::memset(&sc, 0, sizeof(sc));
+    const int recRead = (PlatoonStatePod(platoon, &rec40) == 1 && Plaus(rec40)) ? 1 : 0;
+    const int walked = StateScanPod(q.unloadedContainer, recRead != 0 ? rec40 : 0, &sc);
+    int recType = -1;
+    if (recRead != 0 && OwnStateTypePod(rec40, &recType) != 1) recType = -1;
+    const int people = CharRecCountPod(q.unloaded);
+    const int src = raidsq::LendStateSource(walked, sc.n1E, people, recType, (walked == 1 && sc.member == 0) ? 1 : 0);
+    int saved = 0, sr = 0;
+    std::vector<char> state;   /* T-1122 lend by reference: the squad's state - written as its WORLD record below, never sent game to game */
+    if (src == raidsq::kLendSrcContainer) saved = LendSaveBytes(q.unloadedContainer, file, &state);
+    else if (src == raidsq::kLendSrcRecord)
+    {   /* the record's fields as ONE 0x1E record in the own writer's scratch container - the squad's container and record are only read */
+        sr = OwnScratchStateBytes(rec40, id, file, &state);
+        if (sr == -1) { ::InterlockedIncrement64(&g_lendStateFault); StoreSaveFaultBoth("the raid lend's state record save (the scratch container)"); }
+        else if (sr == -2) ::InterlockedIncrement64(&g_lendCopyFault);   /* the shared record's copy faulted, the scratch cleared: the writers stay on, the lend backs off */
+        else if (sr == -3) ::InterlockedIncrement64(&g_lendWriterOff);
+        saved = sr == 1 ? 1 : 0;
+        if (saved != 0) ::InterlockedIncrement64(&g_lendFromRecord);
+    }
+    else { ::InterlockedIncrement64(&g_lendNoState); state.clear(); }
+    const std::string srcWord = src == raidsq::kLendSrcRecord ? "record" : (src == raidsq::kLendSrcContainer ? "container" : "none");
+    ::DeleteFileA(file.c_str());
+    /* T-1122 lend by reference (design (a), game protocol 219): the state goes as the squad's WORLD record on the store road (no 64 KB limit;
+       T2116's raid squad was 96-98 KB, so no byte lend ever went) and the LEND names it. Read live at the write: the squad's world id, whether
+       the world server refuses this game's writes of it now (another game its registered writer - squadwriterreg.h), the save; the record
+       has the sleep write's own fields (the held record's town, home and birth kept) and this game's own copy's stamp becomes the record's */
+    const std::string wid = WorldIdOf(platoon);
+    const int refusedHere = (!wid.empty() && g_swRefused.count(wid) != 0) ? 1 : 0;
+    Record rec; int sentRec = 0;
+    if (!wid.empty() && refusedHere == 0 && saved != 0 && !state.empty())
+    {
+        std::map<std::string, Record>::const_iterator hr = g_records.find(wid);
+        if (hr != g_records.end()) rec = hr->second;
+        rec.worldId = wid; rec.squadSid = m.squad; rec.factionName = m.faction; rec.x = q.ux; rec.y = q.uy; rec.z = q.uz; rec.gone = 0;
+        rec.writtenAt = (long long)time(0); if (hr != g_records.end() && hr->second.writtenAt >= rec.writtenAt) rec.writtenAt = hr->second.writtenAt + 1;
+        rec.posAt = rec.writtenAt; rec.owner = (int)StoreOwnerField(); rec.file = MirrorFile(wid);
+        if (WriteFileBytes(rec.file, state)) { g_records[wid] = rec; g_localWrittenAt[platoon] = rec.writtenAt; sentRec = SendOne(rec) ? 1 : 0; if (sentRec == 0) LendWriteUnsentRollback(wid, platoon); }   /* review fold 5: an unsent write is not this game's record */
+        else saved = 0;
+    }
+    const int lw = raidsq::LendWriteGo(wid.empty() ? 0 : 1, refusedHere, saved, sentRec);
+    if (lw != raidsq::kLwGo)
+    {   /* not lent - it stays held by the ordinary rule (another game holds its area) and is asked again after the backoff */
+        ::InterlockedIncrement64(lw == raidsq::kLwNoId ? &g_lrNoId : lw == raidsq::kLwRefused ? &g_lrWriterRefused : lw == raidsq::kLwNotSent ? &g_lrNotSent : &g_lendSaveFailed);
+        OwnRaidLockEnter(); g_lend[platoon].quietUntil = ::GetTickCount() + raidsq::kLendBackoffMs; ::LeaveCriticalSection(&g_ownRaidLock);
+        LendLine("[RAIDLEND] NOT lent: id=" + id + " - " + (lw == raidsq::kLwNoId ? std::string("no world id is bound to it here (no world record to name)")
+                 : lw == raidsq::kLwRefused ? "the world server refuses this game's writes of world record " + wid + " (another game is its registered writer)"
+                 : lw == raidsq::kLwNotSent ? "its world record " + wid + " writtenAt=" + N(rec.writtenAt) + " could not be sent to the world server (no link, the send refused, or its file unreadable)"
+                 : src == raidsq::kLendSrcNone ? "no state record to lend (walk=" + N((long long)walked) + " state1E=" + N((long long)sc.n1E) + " people=" + N((long long)people) + " recType=" + N((long long)recType) + ")"
+                 : sr == -3 ? std::string("the own writer is off (an earlier fault) - its state record is not saved")
+                 : sr == -2 ? std::string("the copy of its state record faulted (the scratch cleared; the writers stay on)")
+                 : "its state could not be saved or written to its world record's file (from=" + srcWord + ")") + "; it stays held, asked again in " + N((long long)(raidsq::kLendBackoffMs / 1000UL)) + " s");
+        return;
+    }
+    ::InterlockedIncrement64(&g_lrWritten);
+    {   /* this game runs none of the squad's people while it is lent: released, so the borrower's put-away write of it is taken (squadwriterreg.h:
+           a released writer's squad is taken over by another game's full write); the world server holds the release behind the write above */
+        const long long relWas = g_swReleaseSent;
+        SwPutAwayDone(wid, SwNpcFaction(q.faction));
+        if (g_swReleaseSent != relWas) ::InterlockedIncrement64(&g_lrReleased);
+    }
+    m.recId = wid; m.recAt = rec.writtenAt; m.recWriter = rec.owner;
+    std::vector<char> body;
+    const int sent = LendSend(m, holder, &body);
+    OwnRaidLockEnter();
+    LendRow& r = g_lend[platoon];
+    if (sent != 0) { r.state = raidsq::kLendAsked; r.serial = serial; r.borrower = holder; r.id = id; r.askedAt = ::GetTickCount(); r.asks = 1; r.body.swap(body); r.goneSeen = 0; r.goneSince = 0; r.lendAx = s.x; r.lendAy = s.y; r.boxHave = 0; r.answeredAt = 0; r.stillTaken = 0; r.recId = wid; r.recAt = rec.writtenAt; }
+    else r.quietUntil = ::GetTickCount() + raidsq::kLendAskGapMs;
+    if (sent != 0) { r.endOutcome = 0; r.endPhase = -1; }   /* T-1122 redesign (b): a new lend has no RAID_END yet */
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    ::InterlockedIncrement64(sent != 0 ? &g_lendSent : &g_lendSendFailed);
+    LendLine("[RAIDLEND] " + std::string(sent != 0 ? "sent" : "NOT sent (no road to that player now)") + ": LEND id=" + id + " serial=" + N((long long)serial) + " to slot " + N((long long)holder)
+             + " by reference to world record " + wid + " writtenAt=" + N(rec.writtenAt) + " writer slot " + N((long long)rec.owner) + " (" + N((long long)state.size()) + " state bytes on the store road)"
+             + " from=" + srcWord + " pos=" + F1(m.x) + "," + F1(m.z) + (m.hasTarget != 0 ? " target=" + F1(m.tx) + "," + F1(m.tz) + " type=" + N((long long)ttype) : std::string(" target=none (no running campaign read)"))
+             + (m.hasCamp != 0 ? " campaign='" + m.campKind + "' phase=" + N((long long)m.campPhase) : std::string(" campaign=none (not read)"))
+             + " - the squad stays frozen here while lent");
+}
+/* ---- T-1122 awake hand (owner 1524, src/common/raidsquad.h's section): THE SENDER ----
+   At each ordinary hand-over send of a squad (handoff.cpp: the forced and the follow-leader XFER, their resends, the RELEASE offer and its
+   resend) whose raid campaign this game made (RaidCampaignMadeHere 1, read live now), AWAKE goes to the receiver first, on the road the
+   hand-over takes (net::SendRaidLendSlotRoad): the lend's key, the squad's position, its target and campaign block (as LEND carries them,
+   no saved bytes) and the hand-over's key uid. The row is TAKEN at once (the status ask runs as for a taken lend); the squad stays in this
+   game's campaign until RAID_END says the raid is over there (raidsq::AwakeEndApply). MAIN THREAD. */
+static void* AwakeApPlatoonPod(void* ap)
+{
+    __try { void* p = *(void**)((char*)ap + 0x78); return Plaus(p) ? p : 0; }   /* ActivePlatoon -> Platoon* (items.cpp kApPlatoon, decomp_4feb50) */
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* 1 = `platoon` is still listed under `id` in faction's awake (*awakeOut 1) or sleeping list - nothing of the platoon is read before this */
+static int AwakeHereListed(void* faction, const std::string& id, void* platoon, int* awakeOut)
+{
+    *awakeOut = 0;
+    if (!Plaus(faction) || id.empty() || platoon == 0) return 0;
+    if (FindActivePlatoonImpl((::Faction*)faction, id) == platoon) { *awakeOut = 1; return 1; }
+    return FindSleepingPlatoonImpl((::Faction*)faction, id) == platoon ? 1 : 0;
+}
+/* T-1122 review fold 4: an awake lend row goes - and the own raid note it made for its sleeping squad with it (that note held the squad
+   frozen while lent; without the row nothing holds it). MAIN THREAD. */
+static void AwakeLendDrop(void* platoon, const LendRow& r)
+{
+    OwnRaidLockEnter(); g_lend.erase(platoon); ::LeaveCriticalSection(&g_ownRaidLock);
+    if (r.awakeNoted != 0) OwnRaidForget(platoon, kOwnRaidFreed);
+}
+/* T-1122 review fold 2: this game's awake borrow row for `platoon` (its raid came here with it and runs here), else g_borrow.end() */
+static std::map<std::string, BorrowRow>::iterator AwakeHeldRowOf(void* platoon)
+{
+    for (std::map<std::string, BorrowRow>::iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+        if (it->second.awakeHand != 0 && it->second.ended == 0 && it->second.campEnded == 0 && it->second.retPending == 0 && it->second.platoon == platoon) return it;
+    return g_borrow.end();
+}
+/* T-1122 fix A (owner 1575 a, 2026-11-09; raidsquad.h's section): this game's open borrow row of the lent copy `platoon` (lent by
+   reference, not ended, no held ending, still in g_lentPlatoons), else g_borrow.end() */
+static std::map<std::string, BorrowRow>::iterator LentHeldRowOf(void* platoon)
+{
+    if (platoon == 0 || RaidLentHas(platoon) == 0) return g_borrow.end();
+    for (std::map<std::string, BorrowRow>::iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+        if (it->second.awakeHand == 0 && it->second.ended == 0 && it->second.retPending == 0 && it->second.platoon == platoon) return it;
+    return g_borrow.end();
+}
+/* T-1122 whole or none (owner 1581 a, 2026-11-09; raidsquad.h's section): this game holds `platoon` as a lent squad in any state - a copy
+   lent here by reference (still in g_lentPlatoons), or a borrow row of it not finished (open, or its ending held) - 1, else 0 */
+static int LentSquadHere(void* platoon)
+{
+    if (platoon == 0) return 0;
+    if (RaidLentHas(platoon) != 0) return 1;
+    for (std::map<std::string, BorrowRow>::const_iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+        if (it->second.platoon == platoon && (it->second.ended == 0 || it->second.retPending != 0)) return 1;
+    return 0;
+}
+/* T-1122 review fold 2: this game holds the squad by an awake borrow and hands it on (to a third game, or back to the raid's owner): AWAKE
+   goes onward, naming the raid's owner as lender with the borrow's id and serial - the owner stays the game that made the raid (its row
+   follows the squad by the new holder's TAKEN; taking it back, it skips the carried order and keeps its campaign - AwakeApply). The block:
+   the borrow's target and this game's campaign block read live (else the block it came with). MAIN THREAD. */
+static int AwakeSendOnward(BorrowRow& r, const Pod& q, unsigned int keyUid, int toSlot)
+{
+    raidsq::LendMsg m; m.kind = raidsq::kLendKindAwake; m.lender = r.lender; m.id = r.id; m.serial = r.serial; m.full = 0; m.leader = keyUid; m.faction = r.faction;
+    { char buf[160]; if (Plaus(q.squadGd) && CopyStdStringPod((const char*)q.squadGd + 0x58, buf, 160)) m.squad = buf; }
+    const int awakeNow = Plaus(q.active) ? 1 : 0;
+    m.x = awakeNow != 0 ? q.x : q.ux; m.y = awakeNow != 0 ? q.y : q.uy; m.z = awakeNow != 0 ? q.z : q.uz;
+    if (!raidsq::LendFinite(m.x) || !raidsq::LendFinite(m.y) || !raidsq::LendFinite(m.z)) { m.x = 0.0f; m.y = 0.0f; m.z = 0.0f; }
+    m.hasTarget = r.hasTarget; m.tx = r.tx; m.ty = r.ty; m.tz = r.tz;
+    if (r.campMade == 1 && r.campEnded == 0 && Plaus(r.camp) && LendCampBlock(r.camp, &m) == 1) m.hasCamp = 1;
+    else { m.hasCamp = r.hasCamp; m.campKind = r.campKind; m.campPhase = r.campPhase; m.campT18 = r.campT18; m.campT20 = r.campT20; }
+    if (m.hasCamp != 0 && m.campKind.empty()) m.hasCamp = 0;
+    std::vector<char> b;
+    const bool ok = raidsq::EncodeLend(m, &b) == 1 && net::SendRaidLendSlotRoad(b, toSlot);
+    ::InterlockedIncrement64(ok ? &g_awakeOnward : &g_awakeSendFailed);
+    const int first = r.forwardTo != toSlot ? 1 : 0;
+    if (ok) r.forwardTo = toSlot;
+    if (first != 0 || !ok)
+        LendLine("[RAIDLEND] awake block sent onward" + std::string(ok ? "" : " (NOT sent - no road to that player now)") + ": AWAKE id=" + r.id + " serial=" + N((long long)r.serial) + " owner slot " + N((long long)r.lender)
+                 + " leader=" + N((long long)keyUid) + " to slot " + N((long long)toSlot) + (toSlot == r.lender ? " (back to the raid's owner)" : "") + " (before the hand-over message)"
+                 + (m.hasCamp != 0 ? " campaign='" + m.campKind + "' phase=" + N((long long)m.campPhase) : std::string(" campaign=none")));
+    return ok ? 1 : 0;
+}
+/* T-1122 whole-or-none review fold MED-1 (a): RaidAwakeSendImpl's early returns - a squad not read here (off the main thread, unreadable,
+   not this pass's awake squad, its id no longer naming it, no longer listed) that is a lent squad here is held back like one whose block
+   does not go (the hand-over goes only with its block - the receiver then judges it whole), never handed over as an ordinary one. Off the
+   main thread only the lent-copy list is asked (any thread, its lock); the borrow rows are main-thread. By the RELEASE road's engine id
+   (platoon 0: no longer in its faction's lists) a borrow row of that id not finished answers. */
+static int LentSquadIdHere(void* faction, const std::string& squadId)
+{
+    if (squadId.empty()) return 0;
+    const std::string fk = Plaus(faction) ? FactionKey((::Faction*)faction) : std::string();
+    for (std::map<std::string, BorrowRow>::const_iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+    {
+        const BorrowRow& r = it->second;
+        if (r.ended != 0 && r.retPending == 0) continue;
+        if (r.awakeHand != 0 ? (r.hereId == squadId && r.hereFaction == faction) : (r.id == squadId && !fk.empty() && r.faction == fk)) return 1;
+    }
+    return 0;
+}
+static int LentGateUnread(void* platoon, void* faction, const std::string& squadId, unsigned int keyUid, int toSlot, const char* why, int onMain)
+{
+    int lentHere = 0;
+    if (onMain == 0) lentHere = platoon != 0 ? RaidLentHas(platoon) : 0;
+    else lentHere = platoon != 0 ? LentSquadHere(platoon) : LentSquadIdHere(faction, squadId);
+    if (lentHere == 0) return raidsq::kLgOrdinary;
+    if (onMain != 0 && ::InterlockedIncrement64(&g_lwHeldLines) <= 10)
+        LendLine("[RAIDLEND] lent squad NOT handed over (whole or none): leader=" + N((long long)keyUid) + " to slot " + N((long long)toSlot) + " " + P(platoon)
+                 + " - " + why + "; it stays here (its block cannot go with this hand-over)");
+    return raidsq::LentGateOf(1, 0);
+}
+int RaidAwakeSendImpl(void* ap, void* faction, const std::string& squadId, unsigned int keyUid, int toSlot, int whole)
+{
+    if (!OnMainThread()) { ::InterlockedIncrement64(&g_awakeOffThread); return LentGateUnread((ap != 0 && Plaus(ap)) ? AwakeApPlatoonPod(ap) : 0, 0, std::string(), keyUid, toSlot, "off the main thread", 0); }   /* review fold MED-1 (a) */
+    if (keyUid == 0 || toSlot < 0 || toSlot == g_mySlot) return 0;
+    void* platoon = 0; Pod q; std::memset(&q, 0, sizeof(q)); std::string id;
+    if (ap != 0)
+    {   /* the XFER roads: the awake squad of this pass (a resend's is a second old - shown still listed under its id before it is used) */
+        platoon = Plaus(ap) ? AwakeApPlatoonPod(ap) : 0;
+        if (platoon == 0 || !ReadPod(platoon, &q) || q.active != ap || !Plaus(q.faction) || !PlatoonSidPod(platoon, &id) || id.empty())
+            return LentGateUnread(platoon, 0, std::string(), keyUid, toSlot, "its awake squad not read, not this pass's, or its id not read", 1);   /* review fold MED-1 (a) */
+        if (FindActivePlatoonImpl((::Faction*)q.faction, id) != platoon) return LentGateUnread(platoon, 0, std::string(), keyUid, toSlot, "its id no longer names it", 1);   /* review fold MED-1 (a) */
+    }
+    else
+    {   /* the RELEASE road: the squad its engine put away, by its faction and engine id (awake or already asleep) */
+        int aw = 0;
+        if (!Plaus(faction) || squadId.empty()) return 0;
+        platoon = FindActivePlatoonImpl((::Faction*)faction, squadId);
+        if (platoon == 0) platoon = FindSleepingPlatoonImpl((::Faction*)faction, squadId);
+        if (platoon == 0 || AwakeHereListed(faction, squadId, platoon, &aw) == 0 || !ReadPod(platoon, &q) || !Plaus(q.faction))
+            return LentGateUnread(platoon, faction, squadId, keyUid, toSlot, "its squad not listed or not read by its engine id", 1);   /* review fold MED-1 (a) */
+        id = squadId;
+    }
+    const int made = RaidCampaignMadeHere(q.faction, platoon);
+    std::map<std::string, BorrowRow>::iterator held = AwakeHeldRowOf(platoon);   /* T-1122 review fold 2: held here by an awake borrow - AWAKE goes onward */
+    {   /* T-1122 fix A (owner 1575 a, 2026-11-09): a copy lent here by reference, handed back to its lender by this ordinary hand-over - its
+           raid goes with it (AWAKE onward, the owner as lender); the members this game runs are kept on the row, so its put-away can tell the
+           people went (RaidLentAtSleep). Not to its lender, not whole, or its members not read awake now: nothing new - the RETURN road at its
+           put-away, as before. A lent copy is never sent as this game's own raid. T-1122 fix A review fold 1: the RELEASE offer of a copy
+           still awake takes this road too (its members read the same way); an asleep copy's put-away has already started the RETURN road. */
+        std::map<std::string, BorrowRow>::iterator lent = LentHeldRowOf(platoon);
+        if (lent != g_borrow.end())
+        {
+            std::vector<unsigned int> u;
+            if (Plaus(q.active) && Plaus(q.members) && q.activeChars > 0)
+                for (int k = 0; k < q.activeChars && k < 64; ++k)
+                {
+                    const unsigned int uid = Plaus(q.members[k]) ? FindSpawnedUid(q.members[k]) : 0u;
+                    if (uid != 0 && net::IsUidMine(uid)) u.push_back(uid);
+                }
+            if (raidsq::LentHandBackSends(1, 1, toSlot == lent->second.lender ? 1 : 0, whole, u.empty() ? 0 : 1) == 0)
+            {
+                if (::InterlockedIncrement64(&g_lbKeptRoad) <= 10)
+                    LendLine("[RAIDLEND] lent copy NOT handed over (whole or none - its raid block does not go): id=" + lent->second.id + " serial=" + N((long long)lent->second.serial) + " to slot " + N((long long)toSlot)
+                             + " (its lender slot " + N((long long)lent->second.lender) + ", whole=" + N((long long)whole) + ", members read " + N((long long)u.size()) + ") - it stays here; its put-away gives it back by RETURN");
+                return raidsq::LentGateOf(1, 0);   /* T-1122 whole or none (owner 1581 a): no hand-over of a lent copy without its block - the receiver could not judge it whole */
+            }
+            lent->second.uids.swap(u);
+            const int ok = AwakeSendOnward(lent->second, q, keyUid, toSlot);
+            if (ok != 0) ::InterlockedIncrement64(&g_lbSent);
+            return raidsq::LentGateOf(1, ok);   /* T-1122 whole or none: the block went - the lender takes all or none; not sent - held back */
+        }
+    }
+    if (held == g_borrow.end() && LentSquadHere(platoon) != 0)
+    {   /* T-1122 whole or none (owner 1581 a): a lent squad whose lend has ended or whose ending is held here - its own ending (the RETURN, or
+           KEEPOWN) gives it back whole; never handed over by the ordinary road, people one by one */
+        if (::InterlockedIncrement64(&g_lwHeldLines) <= 10)
+            LendLine("[RAIDLEND] lent squad NOT handed over (whole or none): leader=" + N((long long)keyUid) + " to slot " + N((long long)toSlot) + " " + P(platoon)
+                     + " - its lend ended or its ending is held here; it stays here and goes back by its own ending");
+        return raidsq::LentGateOf(1, 0);
+    }
+    int otherRow = 0;   /* T-1122 review fold 6: a lend row of this squad that is not an awake one is never overwritten */
+    { OwnRaidLockEnter(); std::map<void*, LendRow>::const_iterator o = g_lend.find(platoon); otherRow = (o != g_lend.end() && o->second.awake == 0) ? 1 : 0; ::LeaveCriticalSection(&g_ownRaidLock); }
+    const int how = raidsq::AwakeSendChoice(1, made, id.empty() ? 0 : 1, otherRow, held != g_borrow.end() ? 1 : 0, whole);
+    if (held != g_borrow.end() && how == raidsq::kAwSendNone)
+    {   /* T-1122 re-check fold 5: part of the squad was held back from this hand-over - the raid stays here with the rest (its row ends
+           here by the squad's own check once none of its people run here); T-1122 whole or none (owner 1581 a): the members are not sent either */
+        if (::InterlockedIncrement64(&g_awakeOnwardPart) <= 10)
+            LendLine("[RAIDLEND] awake block NOT sent onward: id=" + held->second.id + " serial=" + N((long long)held->second.serial) + " leader=" + N((long long)keyUid) + " to slot " + N((long long)toSlot)
+                     + " - a member was held back from this hand-over (another in flight names it); the raid stays here");
+    }
+    if (held != g_borrow.end() && how == raidsq::kAwSendNone) return raidsq::LentGateOf(1, 0);   /* T-1122 whole or none: the squad is not handed over in part */
+    if (how == raidsq::kAwSendOnward) return raidsq::LentGateOf(1, AwakeSendOnward(held->second, q, keyUid, toSlot));   /* T-1122 whole or none: not sent - held back */
+    if (how != raidsq::kAwSendOwn) { if (made == 1 && otherRow != 0) ::InterlockedIncrement64(&g_awakeNotOverRow); return 0; }
+    void* camp = LendCampaignPod(q.faction, platoon);
+    raidsq::LendMsg m; m.kind = raidsq::kLendKindAwake; m.lender = g_mySlot; m.id = id; m.full = 0; m.leader = keyUid;
+    m.faction = FactionKey((::Faction*)q.faction);
+    { char buf[160]; if (Plaus(q.squadGd) && CopyStdStringPod((const char*)q.squadGd + 0x58, buf, 160)) m.squad = buf; }
+    const int awakeNow = Plaus(q.active) ? 1 : 0;
+    m.x = awakeNow != 0 ? q.x : q.ux; m.y = awakeNow != 0 ? q.y : q.uy; m.z = awakeNow != 0 ? q.z : q.uz;
+    if (!raidsq::LendFinite(m.x) || !raidsq::LendFinite(m.y) || !raidsq::LendFinite(m.z)) { m.x = 0.0f; m.y = 0.0f; m.z = 0.0f; }   /* the receiver reads the squad it takes, not this spot */
+    int ttype = -1;
+    if (camp != 0 && LendTargetPod(camp, &m.tx, &m.ty, &m.tz, &ttype) == 1 && raidsq::LendFinite(m.tx) && raidsq::LendFinite(m.ty) && raidsq::LendFinite(m.tz)) m.hasTarget = 1;
+    else { m.hasTarget = 0; m.tx = 0.0f; m.ty = 0.0f; m.tz = 0.0f; }
+    if (camp != 0 && LendCampBlock(camp, &m) == 1) m.hasCamp = 1;
+    int keep = 0; unsigned int serial = 0;
+    OwnRaidLockEnter();
+    {
+        std::map<void*, LendRow>::const_iterator it = g_lend.find(platoon);
+        const int have = it != g_lend.end() ? 1 : 0;
+        keep = raidsq::AwakeSerialKeep(have, have != 0 ? it->second.awake : 0, have != 0 ? it->second.state : raidsq::kLendIdle, have != 0 ? it->second.borrower : -1, toSlot);
+        if (keep != 0) serial = it->second.serial;
+    }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    if (keep == 0) { serial = raidsq::LendSerialNext(g_lendSerial, LendSerialSeed()); g_lendSerial = serial; }
+    m.serial = serial;
+    std::vector<char> b;
+    const bool sent = raidsq::EncodeLend(m, &b) == 1 && net::SendRaidLendSlotRoad(b, toSlot);
+    ::InterlockedIncrement64(sent ? &g_awakeSent : &g_awakeSendFailed);
+    if (sent && keep == 0)
+    {
+        const unsigned long now = ::GetTickCount();
+        OwnRaidLockEnter();
+        LendRow& r = g_lend[platoon];
+        r = LendRow(); r.state = raidsq::kLendTaken; r.serial = serial; r.borrower = toSlot; r.id = id; r.awake = 1; r.awakeFaction = q.faction;
+        r.askedAt = now; r.answeredAt = now; r.asks = 1;
+        ::LeaveCriticalSection(&g_ownRaidLock);
+    }
+    if (keep == 0 || !sent)
+        LendLine("[RAIDLEND] awake block " + std::string(sent ? "sent" : "NOT sent (no road to that player now)") + ": AWAKE id=" + id + " serial=" + N((long long)serial) + " leader=" + N((long long)keyUid)
+                 + " to slot " + N((long long)toSlot) + " (before the hand-over message) " + (awakeNow != 0 ? "awake" : "put away") + " at " + F1(m.x) + "," + F1(m.z)
+                 + (m.hasTarget != 0 ? " target=" + F1(m.tx) + "," + F1(m.tz) + " type=" + N((long long)ttype) : std::string(" target=none (not read)"))
+                 + (m.hasCamp != 0 ? " campaign='" + m.campKind + "' phase=" + N((long long)m.campPhase) : std::string(" campaign=none (not read)"))
+                 + (sent ? std::string(" - the lend row is TAKEN here; the squad stays in this game's campaign until the raid is over there") : std::string()));
+    return sent ? 1 : 0;
+}
+/* the action LendAnswer chose, applied to the row of `platoon` (main thread). m: the answer (0 for peer gone / silence). */
+static void LendAct(void* platoon, int act, const raidsq::LendMsg* m, const char* why)
+{
+    LendRow r;
+    {
+        OwnRaidLockEnter();
+        std::map<void*, LendRow>::iterator it = g_lend.find(platoon);
+        if (it == g_lend.end()) { ::LeaveCriticalSection(&g_ownRaidLock); return; }
+        r = it->second;
+        ::LeaveCriticalSection(&g_ownRaidLock);
+    }
+    const unsigned long now = ::GetTickCount();
+    if (r.awake != 0 && (act == raidsq::kActResume || act == raidsq::kActRemove))   /* T-1122 review fold 4 (owner 1527): RETURN is applied below, as for any lend */
+    {   /* T-1122 awake hand: the people run on the receiver - nothing to resume or remove here; the row goes and the squad stays in
+           this game's campaign (an UNKNOWN answer: the receiver never took it, or its campaign there was not made) */
+        AwakeLendDrop(platoon, r);
+        ::InterlockedIncrement64(&g_awakeForgot);
+        LendLine("[RAIDLEND] awake lend forgotten: id=" + r.id + " serial=" + N((long long)r.serial) + " slot " + N((long long)r.borrower) + " - " + why + " (action " + N((long long)act)
+                 + "); the squad stays in this game's campaign");
+        return;
+    }
+    if (act == raidsq::kActReask)
+    {
+        std::vector<char> b = r.body;
+        if (r.state == raidsq::kLendTaken)
+        {   /* the status ask: the same key, no bytes */
+            raidsq::LendMsg s; s.kind = raidsq::kLendKindLend; s.serial = r.serial; s.lender = g_mySlot; s.id = r.id; s.full = 0;
+            b.clear(); raidsq::EncodeLend(s, &b);
+            ::InterlockedIncrement64(&g_lendStatusAsked);
+        }
+        else ::InterlockedIncrement64(&g_lendReasked);
+        const bool ok = !b.empty() && net::SendRaidLend(b, r.borrower);
+        OwnRaidLockEnter(); std::map<void*, LendRow>::iterator it = g_lend.find(platoon); if (it != g_lend.end()) { it->second.askedAt = now; ++it->second.asks; } ::LeaveCriticalSection(&g_ownRaidLock);
+        if (r.asks <= 3 || (r.asks % 20) == 0)
+        {   /* T-1122 F2: a TAKEN lend's ask is the status ask (every raidsq::kLendStatusGapMs after the borrower's last answer); it says how long ago that answer came */
+            const std::string what = r.state != raidsq::kLendTaken ? std::string(" (no answer yet)")
+                                   : (r.answeredAt != 0 ? " (status ask - lent; the borrower's last answer " + N((long long)(raidsq::LendAgeMs(now, r.answeredAt) / 1000UL)) + " s ago, status answers " + N((long long)r.stillTaken) + ")"
+                                                        : std::string(" (status ask - lent; no answer from the borrower yet)"));
+            LendLine("[RAIDLEND] asked again: id=" + r.id + " serial=" + N((long long)r.serial) + what + " sent=" + (ok ? "1" : "0") + " asks=" + N((long long)(r.asks + 1)));
+        }
+        return;
+    }
+    if (act == raidsq::kActTaken)
+    {
+        ::InterlockedIncrement64(&g_lendTaken);
+        OwnRaidLockEnter(); g_lend[platoon].state = raidsq::kLendTaken; g_lend[platoon].askedAt = now; g_lend[platoon].answeredAt = now; g_lend[platoon].body.clear(); ::LeaveCriticalSection(&g_ownRaidLock);
+        LendLine("[RAIDLEND] taken: id=" + r.id + " serial=" + N((long long)r.serial) + " by slot " + N((long long)r.borrower) + " - frozen here until it comes back or dies");
+        return;
+    }
+    if (act == raidsq::kActStillTaken)
+    {   /* T-1122 F2 (T1974): the borrower answered a status ask TAKEN - a fresh answer: the ask timer restarts from it, not counted stale */
+        int k = 0;
+        OwnRaidLockEnter();
+        { std::map<void*, LendRow>::iterator it = g_lend.find(platoon); if (it != g_lend.end()) { it->second.askedAt = now; it->second.answeredAt = now; k = ++it->second.stillTaken; } }
+        ::LeaveCriticalSection(&g_ownRaidLock);
+        if (k <= 3 || (k % 20) == 0)
+            LendLine("[RAIDLEND] still taken: id=" + r.id + " serial=" + N((long long)r.serial) + " by slot " + N((long long)r.borrower) + " - the status ask answered (answer " + N((long long)k)
+                     + (r.answeredAt != 0 ? ", " + N((long long)(raidsq::LendAgeMs(now, r.answeredAt) / 1000UL)) + " s after the last" : std::string()) + "); next status ask in " + N((long long)(raidsq::kLendStatusGapMs / 1000UL)) + " s");
+        return;
+    }
+    if (act == raidsq::kActApplyReturn)
+    {
+        if (m == 0 || raidsq::ReturnApplies(r.state, r.serial, m->serial, r.applied) == 0) { ::InterlockedIncrement64(&g_lendStale); return; }
+        {   /* T-1122 review fold: nothing is written into the platoon before it is shown to be this squad still - an own raid row, asleep,
+               listed under its id in its faction's sleeping list (the DIED road's own test) */
+            Pod lq; std::memset(&lq, 0, sizeof(lq));
+            const int here = (OwnRaidHas(platoon) != 0 && ReadPod(platoon, &lq) && Plaus(lq.faction) && Plaus(lq.unloaded) && !Plaus(lq.active)
+                              && FindSleepingPlatoonImpl((::Faction*)lq.faction, r.id) == platoon) ? 1 : 0;
+            if (here == 0)
+            {
+                if (r.awake != 0)
+                {   /* T-1122 re-check fold 4: an awake lend's row goes the awake row's way (its own raid note with it); the holder removed its
+                       own copy before this RETURN (AwakeReturnFinish), so this game's copy - awake here, or gone - is the one left */
+                    AwakeLendDrop(platoon, r);
+                    ::InterlockedIncrement64(&g_awakeReturnUnapplied);
+                    LendLine("[RAIDLEND] awake lend given back but NOT loaded: id=" + r.id + " serial=" + N((long long)m->serial) + " from slot " + N((long long)r.borrower)
+                             + " - this game's copy is not asleep under its id here (awake, or gone); the returned bytes are not used, its row and note go");
+                }
+                else { OwnRaidLockEnter(); g_lend.erase(platoon); ::LeaveCriticalSection(&g_ownRaidLock); }
+                ::InterlockedIncrement64(&g_lendStale);
+                LendLine("[RAIDLEND] return NOT applied: id=" + r.id + " serial=" + N((long long)m->serial) + " - its squad is no longer here (not asleep in its faction's list under that id); nothing written");
+                return;
+            }
+        }
+        int moved = SetSleepPosPod(platoon, m->x, m->y, m->z, 1);
+        int ld = -3, waits = 0;
+        std::string refWord;   /* T-1122 RETURN by reference: how the named record reaches this copy (the log) */
+        if (m->byRef != 0)
+        {   /* T-1122 RETURN by reference (2026-11-06, design (a)): the holder named the world record its sleep save wrote at the put-away - this
+               game's record of that id at that stamp or newer is loaded now by the wake road's load steps, else a note waits for the record's
+               arrival (ReturnWaitRecv) or the copy's wake (ReturnWaitAtWake) */
+            const std::string own = WorldIdOf(platoon);
+            std::map<std::string, Record>::const_iterator rr = g_records.find(m->recId);
+            const int held = rr != g_records.end() ? raidsq::ReturnRefHeld(1, rr->second.writtenAt, rr->second.gone, rr->second.file.empty() ? 0 : 1, m->recAt) : 0;
+            const int wrongId = (!own.empty() && own != m->recId) ? 1 : 0;
+            if (wrongId != 0)
+            {
+                ::InterlockedIncrement64(&g_retRefWrongId);
+                refWord = "NOT loaded: it names world record " + m->recId + " but this copy is " + own;
+            }
+            else if (held != 0)
+            {
+                ld = ReturnRefLoad(platoon, rr->second, 0, &moved);
+                ::InterlockedIncrement64(ld == 1 ? &g_retRefLoadedNow : &g_retRefLoadFailed);
+                refWord = "this game's record of it (writtenAt " + N(rr->second.writtenAt) + ", writer slot " + N((long long)rr->second.owner) + ") loaded at the RETURN";
+            }
+            else
+            {
+                if (g_returnWait.size() >= kBorrowCap && g_returnWait.count(m->recId) == 0) g_returnWait.erase(g_returnWait.begin());
+                ReturnWait& w = g_returnWait[m->recId];
+                w.platoon = platoon; w.id = r.id; w.serial = m->serial; w.stamp = m->recAt; w.from = r.borrower; w.at = now != 0 ? now : 1;
+                waits = 1; ::InterlockedIncrement64(&g_retRefWaited);
+                refWord = "its record is not here yet (held: " + (rr != g_records.end() ? "writtenAt " + N(rr->second.writtenAt) : std::string("none"))
+                        + ") - a note waits: the record's arrival loads it (or the copy's wake does, by the wake road's newer-record load)";
+            }
+            if (raidsq::ReturnRefUnmarks(wrongId, ld, waits) != 0)
+            {   /* T-1122 RETURN by reference (item 3): the raid is back - the squad leaves this game's handed-over index, so its sleep save here is not
+                   refused as 'this game HANDED the squad over and none of its known members is this game's' (detour_deactivate, ContextSleepWrite).
+                   Review fold 6: only when the RETURN is taken for this copy - loaded, or a note left; never for one naming another world id, nor a
+                   failed load (the copy keeps its old people: its sleep save must not write them over the returned record) */
+                Pod fq; std::memset(&fq, 0, sizeof(fq));
+                if (ReadPod(platoon, &fq) && Plaus(fq.faction)) coop::HandedOverUnmark(fq.faction, own.empty() ? m->recId : own, 0);
+            }
+        }
+        /* T-1122 lend by reference (game protocol 219): the sleeping lend's RETURN names its record too - form 0 (the bytes) is gone */
+        if (ld != 1 && waits == 0) ::InterlockedIncrement64(&g_lendLoadFailed);
+        ::InterlockedIncrement64(&g_lendReturned);
+        /* T-1122 attempt 2 fold 1 (owner 1619 a; review MED 1 / MED 2): no grace timer - a RETURN past the give-back line leaves the squad that far
+           outside the borrower's areas, so it is lent there again only when its own travel brings it back; a SHORT return (the borrower gave it
+           back for another reason) is moved to the lend line and lent again while the borrower holds the area (raidsq::LendReturnShort).
+           Fold 2 (re-check MED): measured against every area that borrower holds (a return into another of its areas is short too), counted
+           per area and holder, and lent to that holder again only after a wait (raidsq::LendShortQuietMs) - never a stop */
+        const float retOut = LenderHeldOutside(r.borrower, m->x, m->z);
+        const Sector retS = SectorOf(m->x, m->z);
+        int shortNow = 0; unsigned long shortWait = 0;
+        OwnRaidLockEnter();
+        LendRow& w = g_lend[platoon];
+        if (raidsq::LendReturnShort(retOut) != 0)
+        {
+            if (raidsq::LendShortReset(w.shortAx, w.shortAy, w.shortSlot, retS.x, retS.y, r.borrower) != 0) w.shortReturns = 0;
+            w.shortAx = retS.x; w.shortAy = retS.y; w.shortSlot = r.borrower; shortNow = ++w.shortReturns;
+            shortWait = raidsq::LendShortQuietMs(shortNow);
+            ::InterlockedIncrement64(&g_lsShort); ::InterlockedIncrement64(&g_lsQuiet);
+        }
+        else if (retOut >= 0.0f) w.shortReturns = 0;
+        w.state = raidsq::kLendIdle; w.applied = m->serial; w.body.clear();
+        w.quietUntil = shortWait != 0 ? ::GetTickCount() + shortWait : 0; w.shortQuiet = shortWait != 0 ? 1 : 0;
+        w.awake = 0; w.awakeFaction = 0; w.awakeNoted = 0;   /* T-1122 review fold 4: an awake lend given back is an own raid squad's ordinary row from here */
+        ::LeaveCriticalSection(&g_ownRaidLock);
+        LendLine("[RAIDLEND] returned: id=" + r.id + " serial=" + N((long long)m->serial) + " at " + F1(m->x) + "," + F1(m->z)
+                 + " by reference to world record " + m->recId + " writtenAt=" + N(m->recAt) + " writer slot " + N((long long)m->recWriter) + " - " + refWord
+                 + " moved=" + N((long long)moved) + " load=" + N((long long)ld)
+                 + (ld == 1 ? std::string(" (the returned people are this squad's from here)") : waits != 0 ? std::string(" (waiting for its record)") : std::string(" (NOT loaded - it keeps its own people)"))
+                 + " - resumed: " + F1(retOut) + " u outside slot " + N((long long)r.borrower) + "'s areas (the give-back line " + F1(raidsq::kLendGiveBack) + ")"
+                 + (shortNow == 0 ? std::string("; lent there again only when its own travel brings it back")
+                    : "; a SHORT return (" + N((long long)shortNow) + " from that holder there) - moved to the lend line and lent to that holder again after a wait of " + N((long long)(shortWait / 1000UL))
+                      + " s (never a stop; a holder change or a walk out clears it - raidLendShort)")
+                 + (waits != 0 ? std::string(", and not before its record is in it") : std::string()));
+        if (r.awake != 0)
+        {   /* T-1122 review fold 4 (owner 1527): the raid came back out of sight - it runs on here off-screen in this game's campaign. T-1122 RETURN by
+               reference: the copy's stamp is the loaded record's own (ReturnRefLoad) - never raised above it (re-check fold 1's raise is gone) */
+            ::InterlockedIncrement64(&g_awakeReturned);
+            LendLine("[RAIDLEND] awake lend given back: id=" + r.id + " serial=" + N((long long)m->serial) + " from slot " + N((long long)r.borrower) + " load=" + N((long long)ld)
+                     + " - its squad went out of sight there; it travels on here off-screen as this game's own raid squad, its campaign row kept");
+        }
+        return;
+    }
+    if (act == raidsq::kActRemove)
+    {
+        ::InterlockedIncrement64(&g_lendDied);
+        OwnRaidLockEnter(); g_lend.erase(platoon); ::LeaveCriticalSection(&g_ownRaidLock);
+        Pod q; std::memset(&q, 0, sizeof(q));
+        const int ok = ReadPod(platoon, &q) && Plaus(q.faction) ? 1 : 0;
+        const int listed = ok != 0 && FindSleepingPlatoonImpl((::Faction*)q.faction, r.id) == platoon ? 1 : 0;
+        LendLine("[RAIDLEND] died: id=" + r.id + " serial=" + N((long long)r.serial) + " - wiped out on slot " + N((long long)r.borrower) + (listed != 0 ? "; removed here through Faction::removeSquad (the raid declares itself defeated)" : "; NOT removed here (no longer in its faction's sleeping list)"));
+        if (listed != 0) { detour_destroyPlatoon(q.faction, platoon); ::InterlockedIncrement64(&g_lendRemoved); LendLine("[RAIDLEND] removed: id=" + r.id); }
+        return;
+    }
+    if (act == raidsq::kActResume)
+    {
+        ::InterlockedIncrement64(&g_lendResumed);
+        const int backoff = (m != 0) ? 1 : (std::string(why) == "silent" ? 1 : 0);
+        /* T-1122 fix (T1967): the borrower said the spot is outside its wake box - its box is kept for the area lent; the squad travels on
+           (OwnRaidUpdate, raidsq::LendBoxDecide) and is lent again inside it */
+        const int boxed = (m != 0 && m->kind == raidsq::kLendKindRefused && m->why == raidsq::kRefOutsideWake && m->box.ok == 1 && r.lendAx >= 0) ? 1 : 0;
+        const unsigned int sig = boxed != 0 ? LendWakeSig(r.lendAx, r.lendAy) : 0u;
+        OwnRaidLockEnter();
+        LendRow& w = g_lend[platoon];
+        w.state = raidsq::kLendIdle; w.body.clear(); w.quietUntil = boxed != 0 ? now + raidsq::kLendBoxAskGapMs : (backoff != 0 ? now + raidsq::kLendBackoffMs : 0);
+        w.boxHave = boxed; if (boxed != 0) { w.boxAx = r.lendAx; w.boxAy = r.lendAy; w.boxSig = sig; w.box = m->box; }
+        ::LeaveCriticalSection(&g_ownRaidLock);
+        if (boxed != 0)
+        {
+            ::InterlockedIncrement64(&g_lendRefused); ::InterlockedIncrement64(&g_wakeBoxAnswers);
+            LendLine("[RAIDLEND] resumed: id=" + r.id + " serial=" + N((long long)r.serial) + " - refused why=7: outside slot " + N((long long)r.borrower) + "'s wake box in area " + N((long long)r.lendAx) + "," + N((long long)r.lendAy)
+                     + " (x " + F1(m->box.x0) + ".." + F1(m->box.x1) + ", z " + F1(m->box.z0) + ".." + F1(m->box.z1) + ") - it travels on, as the game travels it there, and is lent again inside that box");
+            return;
+        }
+        if (m != 0 && m->kind == raidsq::kLendKindRefused) ::InterlockedIncrement64(&g_lendRefused);
+        LendLine("[RAIDLEND] resumed: id=" + r.id + " serial=" + N((long long)r.serial) + " - " + why + (m != 0 && m->kind == raidsq::kLendKindRefused ? " why=" + N((long long)m->why) : std::string())
+                 + " (the ordinary rule again: held in another game's area" + (backoff != 0 ? ", not lent again for " + N((long long)(raidsq::kLendBackoffMs / 1000UL)) + " s)" : ")"));
+    }
+}
+/* ==== T-1122 redesign (b) (owner 1465 a; 1479 a, 2026-11-04): THE BORROWER'S RAID CAMPAIGN FOR A LENT COPY ====
+   The engine's start 0x9C8960 (decomp_9c8960) makes a campaign and then FILLS it with new squads made at the raiders' towns (0x9C4170),
+   so the borrower makes its campaign by that start's own steps without the fill: the raiders' town to start from (RaidCampaignOrigin),
+   the war manager's campaign counter (+0x08), the kind's own maker kind vt+0x18(kind, counter, the target's faction (target vt+0x58),
+   the target's handle (+0x58), the start town's handle (+0x58)) (1.0.65 0x9D5710: the campaign's faction is the kind's +0x08, its kind
+   +0x10, target +0x40, start town +0xA0), and the war manager's campaign list (+0x68: count +0x70, room +0x74, items +0x78, grown by
+   RaidWarListGrow as the start grows it). The copy then joins through the join row with the lead flag (the campaign's vt+0x70, checked
+   equal first), as the engine's fill joins its squads (probe P242, Confirmed T2002 / T2009). Not done (the start's other steps): the
+   kind's last-start stamp (kind +0x108 - this game's own raids keep their own schedule), the screen message, the faction-override
+   follow-ups.
+   NO FOLLOW-UP RAID HERE: the campaign's two ending handlers (vt+0x10 'has ended' 0x9CAD50, vt+0x18 'defeated' 0x9CB050 - both raid
+   campaign classes' tables, 1.0.65 0x17435A8 / 0x1743818, 24 slots each, Read) only show a message and may start a follow-up campaign
+   through 0x9C8540, which makes new squads (decomp_9cad50 / 9cb050). The borrower's campaign gets its own copy of its class's table with
+   those two slots noting the ending only, so a follow-up stays with the raid's own game. The copy of the table is never freed: the
+   engine deletes the campaign through slot 0, the original destructor.
+   THE COPY'S ENDINGS (raidsq::RaidEndOf): a phase change is said to the lender; on sleep, return, death or the lender leaving, the copy is
+   taken out through RaidCampaignDrop and the campaign is ended by phase 2 with its stamp moved back (raidsq::CampOverStamp), which the
+   engine's own update removes and deletes; a campaign the engine ended itself is left to it. A campaign is read only after it is found
+   in its war manager's list with its own kind (F459: a deleted campaign is never read). MAIN THREAD (RaidLendTick, and the sleep / death
+   / destroy hooks' main-thread roads). */
+typedef void* (*CampOriginFn)(void* wm, const float* spot);
+typedef void (*CampGrowFn)(void* list, unsigned int n);
+typedef void* (*CampMakeFn)(void* kind, int counter, void* targetFaction, const void* targetHand, const void* startHand);
+typedef void (*CampJoinFn)(void* camp, void* platoon, char lead);
+typedef void (*CampDropFn)(void* camp, void* platoon);
+typedef void (*CampDeleteFn)(void* camp, int flags);
+typedef char (*ObjBoolFn)(void* self);
+typedef void* (*ObjPtrFn)(void* self);
+const LONGLONG kCampLineCap = 120;
+volatile LONGLONG g_campLines = 0, g_campMade = 0, g_campRefused = 0, g_campFaults = 0, g_campJoined = 0, g_campTakenOut = 0, g_campEndedHere = 0, g_campEngineEnded = 0,
+                  g_campEndSent = 0, g_campEndSendFailed = 0, g_campStubEnded = 0, g_campStubDefeated = 0, g_campWrongClass = 0, g_campLenderOut = 0,
+                  g_campLenderHandlerRan = 0, g_campLenderHandlerFault = 0, g_campLenderHandlerNotCode = 0, g_campLenderNoHandler = 0,
+                  g_campNoteDropped = 0, g_campHandlerUnsent = 0, g_campDefeatByteWritten = 0;
+static void CampLine(const std::string& s)
+{
+    const LONGLONG n = ::InterlockedIncrement64(&g_campLines);
+    if (n <= kCampLineCap) DebugLog(s + (n == kCampLineCap ? std::string(" (the last [RAIDCAMP] line - the counts are on the store REPORT's raidCamp token)") : std::string()));
+}
+static std::string CampHex(unsigned long long v) { char b[24]; _snprintf(b, 23, "%llX", v); b[23] = 0; return std::string(b); }
+/* the engine's ending handler that ran on a borrower's campaign (on the thread the engine's update runs): 1 'has ended', 2 'defeated' */
+static void* volatile g_campHandled[16];
+static volatile LONG g_campHandledKind[16];
+static volatile LONG g_campHandledByte[16];   /* T-1122 attempt 3 fold 1: the campaign's +0x3C byte when 'defeated' ran (raidsq::kDefeatByteNone none) */
+/* fold 1 (review LOW): a note with no free slot (16 by address) is dropped - counted on the REPORT (raidCampLender noteDropped) and said once.
+   No hook sees a campaign's destruction (the copied table keeps the class's own slot 0), so a slot is freed only by its row's take */
+static void CampHandlerNote(void* camp, LONG kind, LONG byte3c)
+{
+    for (int i = 0; i < 16; ++i)
+    {
+        void* was = ::InterlockedCompareExchangePointer((PVOID volatile*)&g_campHandled[i], camp, 0);
+        if (was == 0 || was == camp) { ::InterlockedExchange(&g_campHandledByte[i], byte3c); ::InterlockedExchange(&g_campHandledKind[i], kind); return; }
+    }
+    if (::InterlockedIncrement64(&g_campNoteDropped) == 1)
+        DebugLog("[RAIDCAMP] ending handler note DROPPED: camp=" + P(camp) + " handler " + std::string(kind == 1 ? "'has ended'" : "'defeated'") + " - all 16 note slots are taken; this campaign's"
+                 + " RAID_END carries no handler (said once; raidCampLender noteDropped counts each)");
+}
+static LONG CampHandlerTake(void* camp, int* byte3c)
+{
+    *byte3c = raidsq::kDefeatByteNone;
+    for (int i = 0; i < 16; ++i)
+        if (g_campHandled[i] == camp)
+        {
+            const LONG k = ::InterlockedExchange(&g_campHandledKind[i], 0); *byte3c = (int)::InterlockedExchange(&g_campHandledByte[i], raidsq::kDefeatByteNone);
+            ::InterlockedExchangePointer((PVOID volatile*)&g_campHandled[i], 0);
+            return k;
+        }
+    return 0;
+}
+/* fold 1 (review MEDIUM): the campaign's +0x3C byte (decomp_9cb050:218-221 - 'defeated' picks the loss follow-up or a retry by it), -1 fault */
+static LONG CampByte3CPod(void* camp)
+{
+    __try { return (LONG)*(const unsigned char*)((const char*)camp + 0x3C); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return raidsq::kDefeatByteNone; }
+}
+static void CampEndedStub(void* camp) { ::InterlockedIncrement64(&g_campStubEnded); CampHandlerNote(camp, 1, raidsq::kDefeatByteNone); }
+static void CampDefeatedStub(void* camp) { ::InterlockedIncrement64(&g_campStubDefeated); CampHandlerNote(camp, 2, CampByte3CPod(camp)); }
+const int kCampVtSlots = 24;
+struct CampVt { const void* orig; void* v[1 + kCampVtSlots]; };   /* v[0]: the word before the table (its type information) */
+static CampVt g_campVt[8];
+static int g_campVtN = 0;
+/* 1 = p lies in an executable section of the game's image, 0 not, -1 fault reading the image (fold 1, review LOW: never 'in code') */
+static int InGameCodePod(const void* p)
+{
+    __try
+    {
+        const unsigned char* b = (const unsigned char*)Base();
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(b + ((const IMAGE_DOS_HEADER*)b)->e_lfanew);
+        const IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
+        const uintptr_t a = (uintptr_t)p;
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+            if ((sh[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 && a >= (uintptr_t)b + sh[i].VirtualAddress && a < (uintptr_t)b + sh[i].VirtualAddress + sh[i].Misc.VirtualSize) return 1;
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the table's word before it and its 24 slots; *next: the 25th slot (fold 5: a longer table is refused) */
+static int CampVtCopyPod(const void* orig, void** out, const void** next)
+{
+    __try
+    {
+        const void* const* t = (const void* const*)orig;
+        for (int i = -1; i < kCampVtSlots; ++i) { if (i >= 0 && !Plaus(t[i])) return 0; out[i + 1] = (void*)t[i]; }
+        *next = t[kCampVtSlots];
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void** CampVtFor(const void* orig)
+{
+    for (int i = 0; i < g_campVtN; ++i) if (g_campVt[i].orig == orig) return &g_campVt[i].v[1];
+    if (g_campVtN >= 8) return 0;
+    CampVt& c = g_campVt[g_campVtN];
+    const void* next = 0;
+    const int read = CampVtCopyPod(orig, c.v, &next);
+    if (raidsq::CampVtUsable(read, read == 1 ? (InGameCodePod(next) != 0 ? 1 : 0) : 0) != 1) { ::InterlockedIncrement64(&g_campWrongClass); return 0; }
+    c.v[1 + 0x10 / 8] = (void*)&CampEndedStub;
+    c.v[1 + 0x18 / 8] = (void*)&CampDefeatedStub;
+    c.orig = orig; ++g_campVtN;
+    return &c.v[1];
+}
+/* the war manager (Faction +0x88) and in it the campaign kind whose GameData (+0x138) is named `name` and whose faction (+0x08) is this
+   faction. 1 found, 0 none, -1 fault */
+static int CampKindPod(void* faction, const char* name, void** wmOut, void** kindOut)
+{
+    __try
+    {
+        char* wm = *(char**)((char*)faction + 0x88);
+        if (!Plaus(wm)) return 0;
+        *wmOut = wm;
+        const int n = *(const int*)(wm + 0xD8);
+        void* const* ka = *(void* const* const*)(wm + 0xE0);
+        if (n <= 0 || n > 256 || !Plaus(ka)) return 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const char* k = (const char*)ka[i];
+            if (!Plaus(k)) continue;
+            const char* gd = *(const char* const*)(k + 0x138);
+            char buf[96]; buf[0] = 0;
+            if (!Plaus(gd) || !CopyStdStringPod(gd + 0x28, buf, 96)) continue;
+            if (std::strcmp(buf, name) == 0) { *kindOut = (void*)k; return *(void* const*)(k + 0x08) == faction ? 1 : 0; }
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* a town's spot (vt+0x40) and faction (vt+0x58 - build.cpp kVtTownPos / kVtTownFaction). 1 read */
+static int CampTownPod(void* town, float* spot, void** faction)
+{
+    __try
+    {
+        const uintptr_t* vt = *(const uintptr_t* const*)town;
+        float b[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        const float* p = ((LendPosFn)vt[0x40 / 8])(town, b);
+        if (p == 0) return 0;
+        spot[0] = p[0]; spot[1] = p[1]; spot[2] = p[2];
+        *faction = ((ObjPtrFn)vt[0x58 / 8])(town);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the raiders' town the engine's start would take, with its own given-up test (vt+0x288 - decomp_9c8960:51-58). 0 none */
+static void* CampOriginPod(void* wm, const float* spot)
+{
+    __try
+    {
+        void* o = ((CampOriginFn)(Base() + kRaidCampaignOriginRva))(wm, spot);
+        if (!Plaus(o)) return 0;
+        const uintptr_t* vt = *(const uintptr_t* const*)o;
+        return ((ObjBoolFn)vt[0x288 / 8])(o) != 0 ? 0 : o;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ::InterlockedIncrement64(&g_campFaults); return 0; }
+}
+/* the engine's start's own steps without its fill (decomp_9c8960:46-66). 1 made and listed; 0 the kind made none; -1 fault (nothing more
+   touched); -2 the list had no room after its grow (the campaign deleted through its own slot 0, as 0x9D1790 deletes one) */
+static int CampMakePod(void* wm, void* kind, void* town, void* origin, void** campOut, int* counterOut)
+{
+    __try
+    {
+        char* w = (char*)wm;
+        const int counter = *(int*)(w + 0x08);
+        *(int*)(w + 0x08) = counter + 1;
+        *counterOut = counter;
+        const uintptr_t* kvt = *(const uintptr_t* const*)kind;
+        const uintptr_t* tvt = *(const uintptr_t* const*)town;
+        void* tf = ((ObjPtrFn)tvt[0x58 / 8])(town);
+        void* c = ((CampMakeFn)kvt[0x18 / 8])(kind, counter, tf, (const char*)town + 0x58, (const char*)origin + 0x58);
+        if (!Plaus(c)) return 0;
+        unsigned int* count = (unsigned int*)(w + 0x70);
+        unsigned int* room = (unsigned int*)(w + 0x74);
+        if (*room <= *count) ((CampGrowFn)(Base() + kRaidWarListGrowRva))(w + 0x68, *room * 2);
+        if (*room <= *count) { ((CampDeleteFn)(*(const uintptr_t* const*)c)[0])(c, 1); return -2; }
+        (*(void***)(w + 0x78))[*count] = c;
+        *count = *count + 1;
+        *campOut = c;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* a campaign's vtable slot, through its E9 jump stub (07-bug-classes.md :203); 0 = fault */
+static uintptr_t CampSlotPod(void* camp, int off, const void** vtOut)
+{
+    __try
+    {
+        const uintptr_t* vt = *(const uintptr_t* const*)camp;
+        if (vtOut != 0) *vtOut = vt;
+        uintptr_t t = vt[off / 8];
+        const unsigned char* q = (const unsigned char*)t;
+        if (Plaus(q) && q[0] == 0xE9) { int rel = 0; std::memcpy(&rel, q + 1, 4); t = t + 5 + (intptr_t)rel; }
+        return t;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the borrower's table copy in, the copy joined as leader, the lender's phase and times written. 1 done, -1 fault */
+static int CampInstallPod(void* camp, void** vt, void* platoon, int phase, unsigned long long t18, unsigned long long t20)
+{
+    __try
+    {
+        char* c = (char*)camp;
+        *(void***)c = vt;
+        ((CampJoinFn)(Base() + kRaidCampaignJoinRva))(camp, platoon, 1);
+        unsigned long long* s18 = (unsigned long long*)(c + 0x18);
+        unsigned long long* s20 = (unsigned long long*)(c + 0x20);
+        *s18 = raidsq::CampTimeTake(t18, *s18);
+        *s20 = raidsq::CampTimeTake(t20, *s20);
+        *(int*)(c + 0xC0) = phase;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* listed: the campaign is in its war manager's list with its own kind (only then is anything of it read). 1 read, -1 fault */
+struct CampNow { int listed; int phase; int have; int listN; };
+static int CampReadPod(void* wm, void* camp, void* kind, const void* vt, CampNow* o)
+{
+    o->listed = 0; o->phase = -1; o->have = 0; o->listN = 0;
+    __try
+    {
+        const char* w = (const char*)wm;
+        const unsigned int n = *(const unsigned int*)(w + 0x70);
+        void* const* a = *(void* const* const*)(w + 0x78);
+        if (n > 4096 || (n > 0 && !Plaus(a))) return -1;
+        for (unsigned int i = 0; i < n; ++i) if (a[i] == camp) { o->listed = 1; break; }
+        if (o->listed == 0) return 1;
+        const char* c = (const char*)camp;
+        if (*(void* const*)(c + 0x10) != kind || (vt != 0 && *(const void* const*)c != vt)) { o->listed = 0; return 1; }   /* another campaign at the same address (fold 3: its table is not this code's copy) */
+        o->phase = *(const int*)(c + 0xC0); o->have = *(const int*)(c + 0x38); o->listN = *(const int*)(c + 0xD0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int CampDropPod(void* camp, void* platoon)
+{
+    __try { ((CampDropFn)(Base() + kRaidCampaignDropRva))(camp, platoon); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1122 fix A: a platoon joined to a running campaign through the engine's join (the campaign's vt+0x70, checked equal to RaidCampaignJoin by the caller). 1 done, -1 fault */
+static int CampJoinPod(void* camp, void* platoon, char lead)
+{
+    __try { ((CampJoinFn)(Base() + kRaidCampaignJoinRva))(camp, platoon, lead); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int CampOverPod(void* camp)
+{
+    __try
+    {
+        char* c = (char*)camp;
+        unsigned long long* s18 = (unsigned long long*)(c + 0x18);
+        *s18 = raidsq::CampOverStamp(*s18);
+        *(int*)(c + 0xC0) = raidsq::kCampOver;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static const char* CampHandlerWord(LONG k) { return k == 1 ? "'has ended'" : k == 2 ? "'defeated'" : "none"; }
+/* endedBy (T-1122 attempt 3): the engine's ending handler that ran on this copy's campaign here (CampHandlerTake: raidsq::kEndBy*) - the
+   lender runs the same handler on its own campaign (LenderCampLeave), so the raid's follow-up queues there, as in one-player play */
+static void BorrowCampSay(const BorrowRow& r, int outcome, int phase, int endedBy, int defeatByte, const char* how)   /* defeatByte (fold 1): the copy's campaign +0x3C when 'defeated' ran here */
+{
+    raidsq::RaidEndMsg m; m.serial = r.serial; m.lender = r.lender; m.id = r.id; m.outcome = outcome; m.phase = phase;
+    m.endedBy = (endedBy == raidsq::kEndByEnded || endedBy == raidsq::kEndByDefeated) ? endedBy : raidsq::kEndByNone;
+    m.defeatByte = (m.endedBy == raidsq::kEndByDefeated && defeatByte >= 0 && defeatByte <= 255) ? defeatByte : raidsq::kDefeatByteNone;
+    std::vector<char> b;
+    const bool sent = raidsq::EncodeRaidEnd(m, &b) == 1 && net::SendRaidEnd(b, r.lender);
+    ::InterlockedIncrement64(sent ? &g_campEndSent : &g_campEndSendFailed);
+    CampLine("[RAIDCAMP] RAID_END sent: id=" + r.id + " serial=" + N((long long)r.serial) + " to slot " + N((long long)r.lender) + " outcome=" + std::string(raidsq::RaidEndWord(outcome, phase))
+             + " phase=" + N((long long)phase) + " endedBy='" + raidsq::EndedByWord(m.endedBy) + "' defeatByte=" + N((long long)m.defeatByte) + " (" + how + ") sent=" + (sent ? "1" : "0"));
+}
+/* MAIN THREAD, the tick, once per awake copy: the borrower's campaign made and the copy joined, or refused (once, said) */
+static void BorrowCampStart(BorrowRow& r, void* faction)
+{
+    r.campTried = 1;
+    const int rowsOk = (kRaidCampaignJoinRva != 0 && kRaidCampaignDropRva != 0 && kRaidCampaignOriginRva != 0 && kRaidWarListGrowRva != 0) ? 1 : 0;
+    const int blockOk = raidsq::CampBlockUsable(r.hasCamp, r.campKind.size(), r.campPhase);
+    void* wm = 0; void* kind = 0; void* town = 0; void* tf = 0; void* origin = 0;
+    float spot[3] = { 0.0f, 0.0f, 0.0f };
+    float dist = -1.0f;
+    int kindFound = 0, targetFound = 0;
+    if (rowsOk != 0 && blockOk != 0) kindFound = CampKindPod(faction, r.campKind.c_str(), &wm, &kind) == 1 ? 1 : 0;
+    if (kindFound != 0 && r.hasTarget != 0)
+    {
+        const float tp[3] = { r.tx, r.ty, r.tz };
+        int faulted = 0;
+        town = coop::BdNearestRowPod(tp, 0, &faulted);
+        if (faulted == 0 && Plaus(town) && CampTownPod(town, spot, &tf) == 1)
+        {
+            dist = coop::BdTownDistXZ(town, tp);
+            targetFound = raidsq::CampTargetMatch(dist, tf == faction ? 1 : 0);
+        }
+    }
+    if (targetFound != 0) origin = CampOriginPod(wm, spot);
+    const int joined = LendCampaignPod(faction, r.platoon) != 0 ? 1 : 0;   /* fold 4: the faction's squad->campaign map already names one for the copy */
+    const int d = raidsq::BorrowCampDecide(blockOk, kindFound, targetFound, joined, origin != 0 ? 1 : 0, rowsOk);
+    if (d != raidsq::kCampGo)
+    {
+        ::InterlockedIncrement64(&g_campRefused);
+        CampLine("[RAIDCAMP] no campaign: id=" + r.id + " serial=" + N((long long)r.serial) + " kind='" + r.campKind + "' phase=" + N((long long)r.campPhase) + " - " + raidsq::BorrowCampWhy(d)
+                 + (r.hasTarget != 0 ? " (target " + F1(r.tx) + "," + F1(r.tz) + ", nearest town " + P(town) + " " + F1(dist) + " u away)" : std::string(" (the lend named no target)"))
+                 + " - the copy runs without a raid here");
+        return;
+    }
+    void* camp = 0; int counter = -1;
+    const int mk = CampMakePod(wm, kind, town, origin, &camp, &counter);
+    if (mk != 1)
+    {
+        if (mk == -1) ::InterlockedIncrement64(&g_campFaults);
+        ::InterlockedIncrement64(&g_campRefused);
+        CampLine("[RAIDCAMP] campaign NOT made: id=" + r.id + " kind='" + r.campKind + "' - " + (mk == 0 ? std::string("the kind made none") : mk == -2 ? std::string("the war manager's list had no room (deleted)") : std::string("fault"))
+                 + " counter=" + N((long long)counter));
+        return;
+    }
+    ::InterlockedIncrement64(&g_campMade);
+    r.camp = camp; r.campWm = wm; r.campKindPtr = kind; r.campPhaseSeen = r.campPhase;
+    const void* vt0 = 0;
+    const uintptr_t j = CampSlotPod(camp, 0x70, &vt0), x = CampSlotPod(camp, 0x80, 0);
+    void** vt = (j == Base() + kRaidCampaignJoinRva && x == Base() + kRaidCampaignDropRva) ? CampVtFor(vt0) : 0;
+    const int in = vt != 0 ? CampInstallPod(camp, vt, r.platoon, r.campPhase, r.campT18, r.campT20) : 0;
+    if (in != 1)
+    {   /* not a raid campaign class this code knows (or a fault): ended by phase 2 - the engine removes it */
+        if (in == -1) ::InterlockedIncrement64(&g_campFaults); else ::InterlockedIncrement64(&g_campWrongClass);
+        CampOverPod(camp);
+        r.campEnded = 1;
+        CampLine("[RAIDCAMP] campaign made but NOT used: id=" + r.id + " camp=" + P(camp) + " join slot exe+0x" + CampHex((unsigned long long)(j - Base())) + " take-out slot exe+0x" + CampHex((unsigned long long)(x - Base()))
+                 + (in == -1 ? " - fault while joining" : " - not the rows' raid campaign class, or its table not copied") + "; ended by phase 2 (the engine deletes it)");
+        return;
+    }
+    r.campMade = 1;
+    ::InterlockedIncrement64(&g_campJoined);
+    r.campVt = (void*)vt;
+    CampNow cn; CampReadPod(wm, camp, kind, vt, &cn);
+    CampLine("[RAIDCAMP] campaign started: id=" + r.id + " serial=" + N((long long)r.serial) + " kind='" + r.campKind + "' camp=" + P(camp) + " counter=" + N((long long)counter) + " target town=" + P(town)
+             + " at " + F1(spot[0]) + "," + F1(spot[2]) + " (" + F1(dist) + " u from the lend's target) start town=" + P(origin) + " phase=" + N((long long)cn.phase) + " (the lender's " + N((long long)r.campPhase) + ")"
+             + " listed=" + N((long long)cn.listed) + " strength=" + N((long long)cn.have) + " squads=" + N((long long)cn.listN) + " - the copy joined as leader; no new squads made, no follow-up raid here");
+}
+/* MAIN THREAD, the tick: the campaign's phase read; a change said to the lender; over (or gone from the list - the engine removes a
+   campaign only from phase 2) ends the row's campaign, and the copy stays as the engine leaves it */
+static void BorrowCampWatch(BorrowRow& r, void* platoon, int awake)
+{
+    CampNow cn;
+    const int rd = CampReadPod(r.campWm, r.camp, r.campKindPtr, r.campVt, &cn);
+    if (rd != 1) { ::InterlockedIncrement64(&g_campFaults); return; }
+    const int now = raidsq::CampPhaseRead(1, cn.listed, cn.phase);
+    if (now < 0 || now == r.campPhaseSeen) return;
+    const int living = awake != 0 ? LivingMembersPod(platoon) : -1;
+    int hb = raidsq::kDefeatByteNone;
+    const LONG h = now == raidsq::kCampOver ? CampHandlerTake(r.camp, &hb) : 0;
+    const int out = raidsq::CampEndOutcome(raidsq::kCeTick, living, r.campPhaseSeen, now, (int)h);   /* fold 1 (review LOW): a phase never read before still says the engine's end */
+    CampLine("[RAIDCAMP] campaign phase: id=" + r.id + " camp=" + P(r.camp) + " " + N((long long)r.campPhaseSeen) + "->" + N((long long)now) + (cn.listed == 0 ? std::string(" (gone from the war manager's list)") : std::string())
+             + " living=" + N((long long)living) + (now == raidsq::kCampOver ? " - the engine ended it; its ending handler here " + std::string(CampHandlerWord(h)) + " (noted only - no follow-up raid on this game)" : std::string()));
+    if (out != raidsq::kEndNone) BorrowCampSay(r, out, now, (int)h, hb, "the campaign's phase changed here");
+    r.campPhaseSeen = now;
+    if (now == raidsq::kCampOver)
+    {
+        r.campEnded = 1; ::InterlockedIncrement64(&g_campEngineEnded);
+        if (r.ended == 0 && r.awakeHand == 0 && r.raidOver == 0)
+        {   /* T-1122 attempt 2 fold 2 (re-check HIGH): the engine ended this copy's raid here - from now its keep answer is the engine's own
+               (raidsq::LentKeep raidOver): discarded as in one-player play. Nobody is moved for it and it is no give-back reason */
+            r.raidOver = 1; ::InterlockedIncrement64(&g_f2RaidOverMarked);
+            OwnRaidLockEnter(); if (g_lentPlatoons.count(platoon) != 0) g_lentRaidOver.insert(platoon); ::LeaveCriticalSection(&g_ownRaidLock);
+            LendLine("[RAIDLEND] lent copy's raid is over here: id=" + r.id + " serial=" + N((long long)r.serial) + " - its keep answer is the engine's own from now (one-player play: a raid squad with no campaign is"
+                     + " not kept - discarded at its put-away, said DIED); no placement and no RETURN for its raid's end (raidLendFold2 raidOverMarked " + N(g_f2RaidOverMarked) + ")");
+        }
+    }
+}
+/* MAIN THREAD: the copy's ending here (raidsq::kCe*: sleep, return, all dead, the lender gone) for its campaign: the outcome said, the
+   copy taken out (alive: the platoon still exists), the campaign ended by phase 2. World close: nothing (the world is torn down). */
+static void BorrowCampEnd(BorrowRow& r, int ev, int living, int alive, const char* how, int say = 1, int* outSaid = 0, int* phaseSaid = 0, int* endedSaid = 0, int* byteSaid = 0)   /* byteSaid (fold 1): its +0x3C byte when 'defeated' ran; endedSaid (T-1122 attempt 3): its ending handler (raidsq::kEndBy*) with outSaid; say 0 (T-1122 review folds 2 / 4): RAID_END not said - RETURN said instead, or the raid went on with the squad; outSaid / phaseSaid (RETURN by reference review fold 3): the RAID_END it read (kEndNone: none), said later if the RETURN cannot go */
+{
+    if (outSaid != 0) *outSaid = raidsq::kEndNone;
+    if (phaseSaid != 0) *phaseSaid = -1;
+    if (endedSaid != 0) *endedSaid = raidsq::kEndByNone;
+    if (byteSaid != 0) *byteSaid = raidsq::kDefeatByteNone;
+    if (r.campMade != 1 || r.campEnded != 0) return;
+    r.campEnded = 1;
+    int hb = raidsq::kDefeatByteNone;
+    const LONG h = CampHandlerTake(r.camp, &hb);   /* fold 6: its ending note goes with the row */
+    if (ev == raidsq::kCeWorldClose) return;
+    CampNow cn;
+    const int rd = CampReadPod(r.campWm, r.camp, r.campKindPtr, r.campVt, &cn);
+    const int now = raidsq::CampPhaseRead(rd == 1 ? 1 : 0, cn.listed, cn.phase);
+    const int out = raidsq::CampEndOutcome(ev, living, r.campPhaseSeen, now, (int)h);   /* fold 1 (review LOW): the engine ended it here (handler or phase 2) - the tick's outcome, not 'returned' */
+    int took = 0, over = 0;
+    if (rd == 1 && cn.listed == 1 && raidsq::RaidEndLeaves(ev) != 0)
+    {
+        if (alive != 0) { took = CampDropPod(r.camp, r.platoon); if (took == 1) ::InterlockedIncrement64(&g_campTakenOut); }
+        if (cn.phase != raidsq::kCampOver) { over = CampOverPod(r.camp); if (over == 1) ::InterlockedIncrement64(&g_campEndedHere); }
+        if (took == -1 || over == -1) ::InterlockedIncrement64(&g_campFaults);
+    }
+    else if (rd != 1) ::InterlockedIncrement64(&g_campFaults);
+    CampLine("[RAIDCAMP] copy left its campaign: id=" + r.id + " camp=" + P(r.camp) + " (" + how + ") listed=" + N((long long)cn.listed) + " phase=" + N((long long)now) + " living=" + N((long long)living)
+             + " takenOut=" + N((long long)took) + " endedHere=" + N((long long)over) + (over == 1 ? std::string(" (phase 2: the engine's update removes it)") : std::string()) + " handler=" + CampHandlerWord(h));
+    if (outSaid != 0) *outSaid = out;
+    const int ph = raidsq::CampEndPhase(ev, now, (int)h);   /* fold 2 (re-check LOW): over (2) when CampEndOutcome said the engine's end - the lender's apply then runs the handler */
+    if (phaseSaid != 0) *phaseSaid = ph;
+    if (endedSaid != 0) *endedSaid = (int)h;
+    if (byteSaid != 0) *byteSaid = hb;
+    if (out != raidsq::kEndNone && say != 0) BorrowCampSay(r, out, ph, (int)h, hb, how);
+    else if (h != 0)
+    {   /* fold 1 (review LOW): the handler that ran here goes nowhere on this road now - no RAID_END (the link is lost, or the people went to the
+           raid's owner), or one kept with a RETURN (said only if that RETURN cannot go) */
+        const int kept = (out != raidsq::kEndNone && outSaid != 0) ? 1 : 0;
+        if (kept == 0) ::InterlockedIncrement64(&g_campHandlerUnsent);
+        CampLine("[RAIDCAMP] ending handler NOT sent: id=" + r.id + " serial=" + N((long long)r.serial) + " handler " + CampHandlerWord(h) + " (" + how + ") - "
+                 + (kept != 0 ? std::string("its RAID_END waits with the RETURN (said only if the RETURN cannot go)") : "no RAID_END on this road (raidCampLender handlerUnsent " + N(g_campHandlerUnsent) + ")"));
+    }
+}
+/* fold 2: the war manager's squad->campaign map node of `platoon` (the tree LendCampaignPod walks, +0x30; node key +0x18, value +0x20). 0 none */
+static void* CampMapNodePod(void* wm, void* platoon)
+{
+    __try
+    {
+        char* head = *(char**)((char*)wm + 0x30); if (!Plaus(head)) return 0;
+        char* node = *(char**)(head + 0x8);
+        char* best = head;
+        for (int guard = 0; guard < 128 && Plaus(node) && *(char*)(node + 0x29) == 0; ++guard)
+        {
+            if (*(unsigned long long*)(node + 0x18) < (unsigned long long)platoon) node = *(char**)(node + 0x10);
+            else { best = node; node = *(char**)node; }
+        }
+        if (best == head || *(void**)(best + 0x18) != platoon) return 0;
+        return best;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* fold 2: out of the war manager's list (1 taken out, 0 not there, -1 fault) / back at its end (1, 0 no room, -1 fault) */
+static int CampListOutPod(void* wm, void* camp)
+{
+    __try
+    {
+        char* w = (char*)wm;
+        unsigned int* count = (unsigned int*)(w + 0x70);
+        void** a = *(void***)(w + 0x78);
+        for (unsigned int i = 0; i < *count && i < 4096; ++i)
+            if (a[i] == camp) { for (unsigned int k = i + 1; k < *count; ++k) a[k - 1] = a[k]; *count = *count - 1; return 1; }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int CampListBackPod(void* wm, void* camp)
+{
+    __try
+    {
+        char* w = (char*)wm;
+        unsigned int* count = (unsigned int*)(w + 0x70);
+        if (*count >= *(unsigned int*)(w + 0x74)) return 0;
+        (*(void***)(w + 0x78))[*count] = camp; *count = *count + 1;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int CampNodeSetPod(void* node, void* value) { __try { *(void**)((char*)node + 0x20) = value; return 1; } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; } }
+struct CampHidden { void* wm; void* camp; void* node; };
+static CampHidden g_campHidden[kBorrowCap];
+static size_t g_campHiddenN = 0;
+volatile LONGLONG g_campSaveHidden = 0, g_campSaveBack = 0, g_campSaveOffThread = 0, g_campSaveFail = 0;
+/* the saveGame hook (fold 2): after = 0 before the engine's save - each running borrowed campaign leaves its war manager's list and the
+   copy's map node value is 0; after = 1 when the save returns (or throws) - both put back. MAIN THREAD only (off it: counted, nothing
+   hidden - such a save may hold the campaign). */
+void RaidCampSaveHide(int after)
+{
+    if (!OnMainThread()) { if (after == 0) ::InterlockedIncrement64(&g_campSaveOffThread); return; }
+    if (after != 0)
+    {
+        int back = 0, fail = 0;
+        for (size_t i = 0; i < g_campHiddenN; ++i)
+        {
+            const int b = CampListBackPod(g_campHidden[i].wm, g_campHidden[i].camp);
+            if (b == 1 && (g_campHidden[i].node == 0 || CampNodeSetPod(g_campHidden[i].node, g_campHidden[i].camp) == 1)) ++back; else ++fail;
+        }
+        if (g_campHiddenN > 0)
+        {
+            ::InterlockedExchangeAdd64(&g_campSaveBack, back); ::InterlockedExchangeAdd64(&g_campSaveFail, fail);
+            CampLine("[RAIDCAMP] the save returned: " + N((long long)back) + " borrowed campaign(s) back in their war manager's list" + (fail != 0 ? " - " + N((long long)fail) + " NOT put back" : std::string()));
+        }
+        g_campHiddenN = 0;
+        return;
+    }
+    g_campHiddenN = 0;
+    for (std::map<std::string, BorrowRow>::iterator it = g_borrow.begin(); it != g_borrow.end() && g_campHiddenN < kBorrowCap; ++it)
+    {
+        BorrowRow& r = it->second;
+        CampNow cn;
+        const int rd = r.campMade == 1 && r.campEnded == 0 ? CampReadPod(r.campWm, r.camp, r.campKindPtr, r.campVt, &cn) : 0;
+        if (raidsq::CampHideAtSave(r.campMade, r.campEnded, rd == 1 ? cn.listed : 0, 1) != 1) continue;
+        void* node = CampMapNodePod(r.campWm, r.platoon);
+        if (node != 0 && *(void**)((char*)node + 0x20) != r.camp) node = 0;   /* the copy's node names another campaign: left as it is */
+        if (CampListOutPod(r.campWm, r.camp) != 1) { ::InterlockedIncrement64(&g_campSaveFail); continue; }
+        if (node != 0 && CampNodeSetPod(node, 0) != 1) node = 0;
+        CampHidden& hd = g_campHidden[g_campHiddenN++]; hd.wm = r.campWm; hd.camp = r.camp; hd.node = node;
+        ::InterlockedIncrement64(&g_campSaveHidden);
+    }
+    if (g_campHiddenN > 0) CampLine("[RAIDCAMP] kept out of the save: " + N((long long)g_campHiddenN) + " borrowed campaign(s) and their copies' map entries (put back when the save returns)");
+}
+/* fold 1, THE LENDER (MAIN THREAD): the raid is over at the borrower - its squad leaves its own campaign through the engine's take-out
+   (the campaign's vt+0x80, checked equal to RaidCampaignDrop), and the campaign, with no squad left and still running, is ended by phase
+   2 (the engine's update deletes it). T-1122 attempt 3 (F-T2349-CHAINSKIP): before that end, the ending handler that really ran on the
+   borrower's copy (RAID_END endedBy) runs here on this game's own campaign (raidsq::LenderEndSlot), so the kind's follow-up raid queues in
+   this game's war manager, as the engine's own end does (decomp_9c6220: 'has ended' vt+0x10, 'defeated' vt+0x18) */
+static int CampLeftPod(void* camp, int* left, int* phase)
+{
+    __try { *left = *(const int*)((const char*)camp + 0xD0); *phase = *(const int*)((const char*)camp + 0xC0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1122 attempt 3: the campaign's ending handler at table offset `slotOff` (0x10 / 0x18), called as the engine calls it (the campaign only).
+   *waitA / *waitB: the campaign's war manager's waiting count (+0xC0; the war manager of the campaign's faction +0x70, Faction +0x88 - the one
+   decomp_9c6220:250 removes it from) before and after (-1 not read). byte3c (fold 1, review MEDIUM; raidsq::LenderDefeatByte): 0-255 written
+   into the campaign's +0x3C just before the call (the borrower's copy's byte when its 'defeated' ran), -1 nothing written; *oldByte: this
+   campaign's own byte before (-1 not read). 1 ran, 0 the slot is not in the game's code (not called), -1 fault reading (the campaign, or the game's image - fold 2), -2 fault inside the
+   handler. MAIN THREAD */
+typedef void (*CampHandlerFn)(void* camp);
+static int CampHandlerRunPod(void* camp, int slotOff, int byte3c, int* oldByte, int* waitA, int* waitB)
+{
+    *waitA = -1; *waitB = -1; *oldByte = -1;
+    void* fn = 0; char* wm = 0;
+    __try
+    {
+        fn = (*(void* const* const*)camp)[slotOff / 8];
+        char* fac = *(char**)((char*)camp + 0x70);
+        wm = Plaus(fac) ? *(char**)(fac + 0x88) : 0;
+        if (Plaus(wm)) *waitA = *(const int*)(wm + 0xC0); else wm = 0;
+        *oldByte = (int)*(const unsigned char*)((const char*)camp + 0x3C);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    const int inCode = fn != 0 ? InGameCodePod(fn) : 0;
+    if (inCode == -1) return -1;   /* fold 2 (re-check LOW): a fault reading the game's image is a fault (handlerFault), not 'not in code' */
+    if (inCode != 1) return 0;
+    if (byte3c >= 0 && byte3c <= 255)
+    {
+        __try { *(unsigned char*)((char*)camp + 0x3C) = (unsigned char)byte3c; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    }
+    __try { ((CampHandlerFn)fn)(camp); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+    __try { if (wm != 0) *waitB = *(const int*)(wm + 0xC0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *waitB = -1; }
+    return 1;
+}
+static void LenderCampLeave(void* platoon, const std::string& id, unsigned int serial, int outcome, int endPhase, int endedBy, int defeatByte)
+{
+    Pod q; std::memset(&q, 0, sizeof(q));
+    void* camp = (ReadPod(platoon, &q) && Plaus(q.faction)) ? LendCampaignPod(q.faction, platoon) : 0;
+    if (camp == 0) { CampLine("[RAIDCAMP] lender: id=" + id + " - its squad is in no campaign here; nothing to take out"); return; }
+    const uintptr_t x = CampSlotPod(camp, 0x80, 0);
+    if (kRaidCampaignDropRva == 0 || x != Base() + kRaidCampaignDropRva) { ::InterlockedIncrement64(&g_campWrongClass); CampLine("[RAIDCAMP] lender: id=" + id + " camp=" + P(camp) + " - its take-out slot is not RaidCampaignDrop; left as it is"); return; }
+    const int took = CampDropPod(camp, platoon);
+    int left = -1, phase = -1;
+    if (took == 1) CampLeftPod(camp, &left, &phase);
+    const int ends = raidsq::LenderCampEnds(took, left, phase);
+    const int slot = raidsq::LenderEndSlot(ends, endedBy);
+    const int put = raidsq::LenderDefeatByte(slot, defeatByte);
+    int ran = 0, waitA = -1, waitB = -1, oldByte = -1;
+    if (slot != 0)
+    {   /* the handler before the end, as the engine's 'has ended' road does (decomp_9c6220:369 then 381-387); a fault is said and counted, the end still runs */
+        ran = CampHandlerRunPod(camp, slot, put, &oldByte, &waitA, &waitB);
+        if (ran == 1 && put >= 0) ::InterlockedIncrement64(&g_campDefeatByteWritten);
+        ::InterlockedIncrement64(ran == 1 ? &g_campLenderHandlerRan : ran == 0 ? &g_campLenderHandlerNotCode : &g_campLenderHandlerFault);
+        if (ran < 0) ::InterlockedIncrement64(&g_campFaults);
+    }
+    else if (ends != 0) ::InterlockedIncrement64(&g_campLenderNoHandler);
+    const int over = ends != 0 ? CampOverPod(camp) : 0;
+    if (slot != 0)
+        DebugLog("[RAIDCAMP] lender: id=" + id + " serial=" + N((long long)serial) + " camp=" + P(camp) + " handler '" + raidsq::EndedByWord(endedBy) + "' "
+                 + (ran == 1 ? "run here, waiting " + N((long long)waitA) + "->" + N((long long)waitB)
+                    : ran == 0 ? std::string("NOT run (its table slot is not in the game's code)") : ran == -1 ? std::string("NOT run (fault reading the campaign or the game's image)")
+                    : "FAULTED inside the handler, waiting before " + N((long long)waitA))
+                 + (slot == 0x18 ? " defeatByte(+0x3C) borrower's=" + N((long long)defeatByte) + " here before=" + N((long long)oldByte) + (put >= 0 ? std::string(" - the borrower's written here before the call") : std::string(" - none came: this campaign's own kept"))
+                    : std::string()) + " (the borrower's copy ended by it; the campaign then ended by phase 2)");
+    if (took == 1) ::InterlockedIncrement64(&g_campLenderOut);
+    if (took == -1 || over == -1) ::InterlockedIncrement64(&g_campFaults);
+    CampLine("[RAIDCAMP] lender: id=" + id + " camp=" + P(camp) + " - the raid is over at the borrower (" + raidsq::RaidEndWord(outcome, endPhase) + "): taken out of its own campaign=" + N((long long)took)
+             + " squads left=" + N((long long)left) + " phase=" + N((long long)phase) + (over == 1 ? std::string(" - the campaign ended by phase 2 (the engine deletes it)") : std::string(" - the campaign runs on with its other squads"))
+             + (ends != 0 && slot == 0 ? std::string("; no ending handler (none ran on the borrower's copy)") : std::string()));
+}
+static std::string RaidCampReportToken()
+{
+    return " raidCamp[made,refused,joined,takenOut,endedHere,engineEnded,endSent,endSendFailed,stubEnded,stubDefeated,wrongClass,faults]=" + N(g_campMade) + "," + N(g_campRefused) + "," + N(g_campJoined) + ","
+         + N(g_campTakenOut) + "," + N(g_campEndedHere) + "," + N(g_campEngineEnded) + "," + N(g_campEndSent) + "," + N(g_campEndSendFailed) + "," + N(g_campStubEnded) + "," + N(g_campStubDefeated) + ","
+         + N(g_campWrongClass) + "," + N(g_campFaults) + " raidCampSave[hidden,back,offThread,fail]=" + N(g_campSaveHidden) + "," + N(g_campSaveBack) + "," + N(g_campSaveOffThread) + "," + N(g_campSaveFail)
+         + " raidCampLender[out,handlerRan,handlerNotCode,handlerFault,noHandler,noteDropped,handlerUnsent,defeatByteWritten]=" + N(g_campLenderOut) + "," + N(g_campLenderHandlerRan) + "," + N(g_campLenderHandlerNotCode) + ","
+         + N(g_campLenderHandlerFault) + "," + N(g_campLenderNoHandler) + "," + N(g_campNoteDropped) + "," + N(g_campHandlerUnsent) + "," + N(g_campDefeatByteWritten);
+}
+/* ---- the borrower ---- */
+static void BorrowSay(const raidsq::LendMsg& in, int kind, int why, int toSlot, const raidsq::WakeBox* box = 0)
+{
+    raidsq::LendMsg a; a.kind = kind; a.serial = in.serial; a.lender = in.lender; a.id = in.id; a.why = why;
+    if (box != 0) a.box = *box;
+    LendSend(a, toSlot, 0);
+}
+static void BorrowEnd(const std::string& key, const std::vector<char>& said)
+{
+    if (g_borrowEnded.size() >= kBorrowEndedCap) g_borrowEnded.erase(g_borrowEnded.begin());
+    g_borrowEnded[key] = said;
+}
+void* RaidLendBuildImpl(const raidsq::LendMsg& m, const std::string& file, int* people, int* why);
+/* T-1122 lend by reference (game protocol 219): a LEND names the world record its lender wrote at the lend. The copy is built from this
+   game's record of that id at the named stamp or newer: now (BorrowOnLend), or at the record's arrival (LendWaitRecv marks the wait from the
+   RECV; RaidLendTick builds after BorrowDecide is asked again, live). A wait ends by raidsq::LendRecWaitOn: built, the lender gone (dropped -
+   its own peer-gone ending resumes the squad there), or refused kRefNoRecord after raidsq::kLendRecordWaitMs. MAIN THREAD; emptied at the
+   world teardown. */
+struct LendRecWait { raidsq::LendMsg m; int from; unsigned long at; int arrived; LendRecWait() : from(-1), at(0), arrived(0) {} };
+std::map<std::string, LendRecWait> g_lendRecWait;   /* the lend's key (lender|id|serial) -> the LEND waiting here for its world record */
+static void LendWaitRecv(const std::string& worldId)
+{
+    for (std::map<std::string, LendRecWait>::iterator it = g_lendRecWait.begin(); it != g_lendRecWait.end(); ++it) if (it->second.m.recId == worldId) it->second.arrived = 1;
+}
+static void BorrowBuild(const raidsq::LendMsg& m, int from, const Record& rec, const char* road, volatile LONGLONG* counter)
+{
+    const std::string key = LendKey(m.lender, m.id, m.serial);
+    int people = -1, bwhy = 0;
+    void* p = RaidLendBuildImpl(m, rec.file, &people, &bwhy);   /* the record's own file - this game's mirror of it, kept (never deleted here) */
+    if (p == 0)
+    {
+        ::InterlockedIncrement64(&g_borrowRefused);
+        BorrowSay(m, raidsq::kLendKindRefused, raidsq::kRefBuildFailed, from);
+        LendLine("[RAIDLEND] refused: id=" + m.id + " serial=" + N((long long)m.serial) + " - the copy could not be built from world record " + m.recId + " writtenAt=" + N(rec.writtenAt) + " (step " + N((long long)bwhy) + ")");
+        return;
+    }
+    BorrowRow r; r.lender = m.lender; r.serial = m.serial; r.id = m.id; r.faction = m.faction; r.platoon = p; r.hasTarget = m.hasTarget; r.tx = m.tx; r.ty = m.ty; r.tz = m.tz; r.builtAt = ::GetTickCount();
+    r.hasCamp = m.hasCamp; r.campKind = m.campKind; r.campPhase = m.campPhase; r.campT18 = m.campT18; r.campT20 = m.campT20;   /* T-1122 redesign (b) */
+    r.recId = m.recId;
+    g_borrow[key] = r;
+    OwnRaidLockEnter(); g_lentPlatoons[p] = key; LentCountSet(); ::LeaveCriticalSection(&g_ownRaidLock);
+    ::InterlockedIncrement64(&g_borrowBuilt); ::InterlockedIncrement64(counter);
+    BorrowSay(m, raidsq::kLendKindTaken, 0, from);
+    LendLine("[RAIDLEND] copy built: id=" + m.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)from) + " members=" + N((long long)people) + " platoon=" + P(p) + " at " + F1(m.x) + "," + F1(m.z)
+             + " from world record " + m.recId + " writtenAt=" + N(rec.writtenAt) + " (the LEND named " + N(m.recAt) + "; " + road + ")"
+             + (m.hasTarget != 0 ? " target=" + F1(m.tx) + "," + F1(m.tz) : std::string(" target=none"))
+             + (m.hasCamp != 0 ? " campaign='" + m.campKind + "' phase=" + N((long long)m.campPhase) + " usable=" + N((long long)raidsq::CampBlockUsable(m.hasCamp, m.campKind.size(), m.campPhase)) : std::string(" campaign=none"))
+             + " - LENT (nothing of it reaches the world server until its put-away); taken sent");
+}
+static void BorrowOnLend(const raidsq::LendMsg& m, int from)
+{
+    const std::string key = LendKey(m.lender, m.id, m.serial);
+    std::map<std::string, BorrowRow>::iterator act = g_borrow.find(key);
+    const int active = (act != g_borrow.end() && (act->second.ended == 0 || act->second.retPending != 0)) ? 1 : 0;   /* review fold 4: a held ending - still TAKEN until its copy is removed */
+    const std::map<std::string, std::vector<char> >::const_iterator ended = g_borrowEnded.find(key);
+    const int worldReady = (g_on && g_dirReady && Plaus(coop::GameWorldPtr()) && !EngineWritesBlocked()) ? 1 : 0;
+    const int holds = MayInventHereTS(SectorOf(m.x, m.z)) == 1 ? 1 : 0;
+    /* T-1122 fix (T1967): the copy is built only where this game's engine can wake it - the spot inside this game's wake box, read live */
+    const raidsq::WakeBox wb = LendWakeBoxHere(m.x, m.z);
+    const int inWake = wb.ok != 1 ? -1 : raidsq::WakeBoxHas(wb, m.x, m.z);
+    {   /* T-1122 re-check fold 6: this game sent the squad on with its raid moments ago - the owner's status ask hears nothing yet (its row
+           waits for the new holder's TAKEN and asks again); after raidsq::kAwakeOnwardQuietMs the ordinary answer */
+        std::map<std::string, unsigned long>::iterator ow = g_awakeOnwardAt.find(key);
+        if (ow != g_awakeOnwardAt.end())
+        {
+            const unsigned long since = ::GetTickCount() - ow->second;
+            if (raidsq::AwakeOnwardQuiet(m.full == 0 ? 1 : 0, active, ended != g_borrowEnded.end() ? 1 : 0, since) != 0)
+            {
+                ::InterlockedIncrement64(&g_awakeOnwardQuiet);
+                LendLine("[RAIDLEND] status ask not answered yet: id=" + m.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)from) + " - this game sent the squad on with its raid "
+                         + N((long long)(since / 1000UL)) + " s ago (the new holder's TAKEN moves that row)");
+                return;
+            }
+            if (since >= raidsq::kAwakeOnwardQuietMs) g_awakeOnwardAt.erase(ow);
+        }
+    }
+    if (m.full != 0 && g_lendRecWait.count(key) != 0) { ::InterlockedIncrement64(&g_lrWaitDup); return; }   /* T-1122 lend by reference: the lender's ask again while its record is on its way - the wait stands */
+    int refWhy = 0;
+    const int d = raidsq::BorrowDecide(m.full, active, ended != g_borrowEnded.end() ? 1 : 0, worldReady, holds, inWake, g_borrow.size() >= kBorrowCap ? 1 : 0, &refWhy);
+    if (d == raidsq::kBorrowSayTaken) { BorrowSay(m, raidsq::kLendKindTaken, 0, from); return; }
+    if (d == raidsq::kBorrowSayEnd) { ::InterlockedIncrement64(&g_borrowSaidAgain); if (!ended->second.empty()) net::SendRaidLend(ended->second, from); return; }
+    if (d == raidsq::kBorrowUnknown) { ::InterlockedIncrement64(&g_borrowUnknown); BorrowSay(m, raidsq::kLendKindUnknown, 0, from); LendLine("[RAIDLEND] unknown: a status ask for id=" + m.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)from) + " - no such lend here"); return; }
+    if (d == raidsq::kBorrowRefuse)
+    {
+        const int outside = refWhy == raidsq::kRefOutsideWake ? 1 : 0;
+        ::InterlockedIncrement64(&g_borrowRefused); if (outside != 0) ::InterlockedIncrement64(&g_wakeRefused);
+        BorrowSay(m, raidsq::kLendKindRefused, refWhy, from, outside != 0 ? &wb : 0);
+        LendLine("[RAIDLEND] refused: id=" + m.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)from) + " why=" + N((long long)refWhy) + " (1 no world, 2 this game does not hold its area, 5 table full, 7 outside this game's wake box)"
+                 + (outside != 0 ? " spot=" + F1(m.x) + "," + F1(m.z) + " box x " + F1(wb.x0) + ".." + F1(wb.x1) + ", z " + F1(wb.z0) + ".." + F1(wb.z1) + " - the game would not wake it there; the lender travels it on and lends it again inside this box" : std::string()));
+        return;
+    }
+    std::map<std::string, Record>::const_iterator rr = g_records.find(m.recId);
+    const int held = rr != g_records.end() ? raidsq::ReturnRefHeld(1, rr->second.writtenAt, rr->second.gone, rr->second.file.empty() ? 0 : 1, m.recAt) : 0;
+    if (held != 0) { BorrowBuild(m, from, rr->second, "now: the record was here at the LEND", &g_lrBuiltNow); return; }
+    if (g_lendRecWait.size() >= kBorrowCap)
+    {
+        ::InterlockedIncrement64(&g_borrowRefused);
+        BorrowSay(m, raidsq::kLendKindRefused, raidsq::kRefCapFull, from);
+        LendLine("[RAIDLEND] refused: id=" + m.id + " serial=" + N((long long)m.serial) + " - " + N((long long)g_lendRecWait.size()) + " lends already wait here for their world records (why=5)");
+        return;
+    }
+    LendRecWait& w = g_lendRecWait[key]; w.m = m; w.from = from; w.at = ::GetTickCount(); w.arrived = 0;
+    ::InterlockedIncrement64(&g_lrWaited);
+    LendLine("[RAIDLEND] lend waits for its world record: id=" + m.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)from) + " world record " + m.recId + " writtenAt=" + N(m.recAt)
+             + " writer slot " + N((long long)m.recWriter) + " (held here: " + (rr != g_records.end() ? "writtenAt " + N(rr->second.writtenAt) : std::string("none")) + ") - built at its arrival (the store road),"
+             + " refused why=8 if it is not here in " + N((long long)(raidsq::kLendRecordWaitMs / 1000UL)) + " s");
+}
+/* the borrower's ending for row `key`: kind RETURN (ret: the RETURN naming the world record its put-away wrote - LentPutAway, its position),
+   KEEPOWN (that record could not be saved, written or sent) or DIED; the row stays (ended) until its platoon goes */
+static void BorrowFinish(const std::string& key, int kind, const raidsq::LendMsg* ret, const char* how)
+{
+    std::map<std::string, BorrowRow>::iterator it = g_borrow.find(key);
+    if (it == g_borrow.end() || it->second.ended != 0) return;
+    BorrowRow& r = it->second;
+    raidsq::LendMsg a; if (ret != 0) a = *ret;
+    a.kind = kind; a.serial = r.serial; a.lender = r.lender; a.id = r.id;
+    std::vector<char> b;
+    if (raidsq::EncodeLend(a, &b) == 0 && kind == raidsq::kLendKindReturn)
+    {   /* a RETURN that names no record: KEEPOWN - the lender resumes its own squad as it lent it (T-1122 lend by reference: never DIED for
+           that - DIED removed a living squad there) */
+        a = raidsq::LendMsg(); a.kind = raidsq::kLendKindKeepOwn; a.serial = r.serial; a.lender = r.lender; a.id = r.id; kind = a.kind; raidsq::EncodeLend(a, &b);
+    }
+    r.ended = kind; r.endAt = ::GetTickCount();
+    LentEndedMark(r.platoon);   /* the keep question no longer keeps it: nothing more to give back */
+    BorrowEnd(key, b);
+    const bool sent = !b.empty() && net::SendRaidLend(b, r.lender);
+    ::InterlockedIncrement64(kind == raidsq::kLendKindReturn ? &g_borrowReturnSent : kind == raidsq::kLendKindDied ? &g_borrowDiedSent : &g_lrBackNotWritten);
+    LendLine("[RAIDLEND] " + std::string(kind == raidsq::kLendKindReturn ? "returned" : kind == raidsq::kLendKindDied ? "died" : "keep-own (KEEPOWN)") + " sent: id=" + r.id + " serial=" + N((long long)r.serial)
+             + " to slot " + N((long long)r.lender) + " (" + how + ")"
+             + (kind == raidsq::kLendKindReturn ? " naming world record " + a.recId + " writtenAt=" + N(a.recAt) + " writer slot " + N((long long)a.recWriter) + " at " + F1(a.x) + "," + F1(a.z) : std::string())
+             + " sent=" + (sent ? "1" : "0"));
+}
+/* T-1122 review fold 4: the sleeping copy's ending (RETURN or KEEPOWN) is HELD on its row until the copy's removal takes - it is sent by
+   BorrowSendHeld when the copy is destroyed here (RaidLentGone: the 2 s sweep, the put-to-sleep-and-remove of a copy that woke meanwhile, or
+   the engine's own removal), never before, so no copy runs here beside the lender's squad. The row is ended at once (the keep question no
+   longer keeps it); while held the lender's status ask hears TAKEN (BorrowOnLend). MAIN THREAD */
+static void BorrowHold(const std::string& key, int kind, const raidsq::LendMsg* ret, const char* how)
+{
+    std::map<std::string, BorrowRow>::iterator it = g_borrow.find(key);
+    if (it == g_borrow.end() || it->second.ended != 0) return;
+    BorrowRow& r = it->second;
+    raidsq::LendMsg a; if (ret != 0) a = *ret;
+    a.kind = kind; a.serial = r.serial; a.lender = r.lender; a.id = r.id;
+    std::vector<char> b;
+    if (raidsq::EncodeLend(a, &b) == 0 && kind == raidsq::kLendKindReturn)
+    {   /* a RETURN that names no record: KEEPOWN (as BorrowFinish) */
+        a = raidsq::LendMsg(); a.kind = raidsq::kLendKindKeepOwn; a.serial = r.serial; a.lender = r.lender; a.id = r.id; kind = a.kind; raidsq::EncodeLend(a, &b);
+    }
+    const unsigned long now = ::GetTickCount();
+    r.ended = kind; r.endAt = now;
+    LentEndedMark(r.platoon);   /* the keep question no longer keeps it: nothing more to give back */
+    r.retPending = 1; r.retAt = now != 0 ? now : 1; r.retBody.swap(b);
+    r.retRecId = kind == raidsq::kLendKindReturn ? a.recId : std::string(); r.retRecAt = kind == raidsq::kLendKindReturn ? a.recAt : 0;
+    LendLine("[RAIDLEND] " + std::string(kind == raidsq::kLendKindReturn ? "RETURN" : "KEEPOWN") + " held: id=" + r.id + " serial=" + N((long long)r.serial) + " to slot " + N((long long)r.lender) + " (" + how + ")"
+             + (kind == raidsq::kLendKindReturn ? " naming world record " + a.recId + " writtenAt=" + N(a.recAt) + " writer slot " + N((long long)a.recWriter) + " at " + F1(a.x) + "," + F1(a.z) : std::string())
+             + " - sent once this game's copy is removed (the sweep in " + N((long long)(raidsq::kLendReturnSweepMs / 1000UL)) + " s; a copy that woke meanwhile is put to sleep and removed first);"
+             + " the lender's status ask hears TAKEN meanwhile");
+}
+/* the held ending sent at the copy's removal (RaidLentGone). A RETURN reads its named record again now: no longer this game's put-away write
+   here (the world server refused it - SquadWriterArrive's rollback - or another write replaced it) says KEEPOWN instead (raidsq::HeldEndingKind).
+   Kept to say again at the lender's status ask. MAIN THREAD */
+static void BorrowSendHeld(const std::string& key, BorrowRow& r, const char* how)
+{
+    if (r.retPending == 0 || r.awakeHand != 0) return;
+    r.retPending = 0;
+    std::vector<char> b; b.swap(r.retBody);
+    int still = raidsq::kRetRefWritten;
+    std::map<std::string, Record>::const_iterator rr = g_records.end();
+    if (r.ended == raidsq::kLendKindReturn)
+    {
+        rr = g_records.find(r.retRecId);
+        const int held = rr != g_records.end() ? 1 : 0;
+        still = raidsq::ReturnRefWritten(1, r.retRecAt, held, held != 0 ? rr->second.writtenAt : 0LL, held != 0 ? rr->second.gone : 0, (held != 0 && !rr->second.file.empty()) ? 1 : 0,
+                                         (held != 0 && g_mySlot >= 0 && rr->second.owner == g_mySlot) ? 1 : 0);
+    }
+    const int kind = raidsq::HeldEndingKind(r.ended, still);
+    if (kind != r.ended || b.empty())
+    {
+        raidsq::LendMsg k; k.kind = raidsq::kLendKindKeepOwn; k.serial = r.serial; k.lender = r.lender; k.id = r.id;
+        b.clear(); raidsq::EncodeLend(k, &b);
+        if (kind != r.ended) ::InterlockedIncrement64(&g_lhHeldKeepOwn);
+        r.ended = raidsq::kLendKindKeepOwn;
+    }
+    BorrowEnd(key, b);
+    const bool sent = !b.empty() && net::SendRaidLend(b, r.lender);
+    ::InterlockedIncrement64(&g_lhHeldSent);
+    ::InterlockedIncrement64(r.ended == raidsq::kLendKindReturn ? &g_borrowReturnSent : &g_lrBackNotWritten);
+    LendLine("[RAIDLEND] copy removed, then " + std::string(r.ended == raidsq::kLendKindReturn ? "RETURN" : "KEEPOWN") + " sent: id=" + r.id + " serial=" + N((long long)r.serial) + " to slot " + N((long long)r.lender) + " (" + how + ")"
+             + (r.ended == raidsq::kLendKindReturn ? " naming world record " + r.retRecId + " writtenAt=" + N(r.retRecAt)
+                : (kind != raidsq::kLendKindKeepOwn || still == raidsq::kRetRefWritten) ? std::string(" - its put-away wrote no world record")
+                : " - world record " + r.retRecId + " writtenAt=" + N(r.retRecAt) + " is no longer this game's put-away write here (" + N((long long)still)
+                  + (rr != g_records.end() ? ", held writtenAt " + N(rr->second.writtenAt) : std::string(", not held")) + " - the world server refused it): its lender resumes its own squad as it lent it")
+             + " sent=" + (sent ? "1" : "0"));
+}
+/* T-1122 lend by reference (game protocol 219): the lent copy put away here (or given back asleep) - its state written as the squad's
+   WORLD record with the sleep write's own fields, sent to the world server, the squad released (this game runs none of its people now, so
+   the owner's later writes are taken - squadwriterreg.h), then RETURN naming that record (raidsq::LentPutAwaySays). A state that cannot be
+   saved, written or sent - or a record whose writes the world server refuses this game - says KEEPOWN: the lender resumes its own squad as it
+   lent it; never DIED for size. Review fold 4: the ending is held on the row until the copy's removal takes (BorrowHold / BorrowSendHeld).
+   MAIN THREAD */
+static void LentPutAway(const std::string& key, const Pod* q, float x, float y, float z, const char* how)
+{
+    if (q != 0 && Plaus(q->unloaded)) { OwnRaidLockEnter(); g_lentBand.erase(q->unloaded); ::LeaveCriticalSection(&g_ownRaidLock); }   /* T-1122 attempt 2 fold 2 (re-check LOW): off the band list at its give-back */
+    std::map<std::string, BorrowRow>::iterator it = g_borrow.find(key);
+    if (it == g_borrow.end() || it->second.ended != 0) return;
+    const std::string rid = it->second.recId, lid = it->second.id; const unsigned int lser = it->second.serial;
+    raidsq::LendMsg a; a.byRef = 1; a.x = x; a.y = y; a.z = z;
+    std::string why; int written = 0;
+    if (rid.empty()) why = "its LEND named no world record";
+    else if (g_swRefused.count(rid) != 0) why = "the world server refuses this game's writes of world record " + rid + " (another game is its registered writer)";
+    else if (q == 0 || !Plaus(q->unloadedContainer)) why = "its sleeping container could not be read";
+    else
+    {
+        std::vector<char> b; const std::string file = LendFile("back", lid, lser);
+        const int sv = LendSaveBytes(q->unloadedContainer, file, &b); ::DeleteFileA(file.c_str());
+        Record rec;
+        std::map<std::string, Record>::const_iterator held = g_records.find(rid);
+        if (held != g_records.end()) rec = held->second;
+        rec.worldId = rid; rec.x = x; rec.y = y; rec.z = z; rec.gone = 0;
+        { char buf[160]; if (Plaus(q->squadGd) && CopyStdStringPod((const char*)q->squadGd + 0x58, buf, 160)) rec.squadSid = buf; }
+        if (Plaus(q->faction)) rec.factionName = FactionKey((::Faction*)q->faction);
+        rec.writtenAt = (long long)time(0); if (held != g_records.end() && held->second.writtenAt >= rec.writtenAt) rec.writtenAt = held->second.writtenAt + 1;
+        rec.posAt = rec.writtenAt; rec.owner = (int)StoreOwnerField(); rec.file = MirrorFile(rid);
+        if (sv == 0 || b.empty()) why = "its sleeping state could not be saved";
+        else if (!WriteFileBytes(rec.file, b)) why = "its world record's file could not be written here";
+        else
+        {
+            g_records[rid] = rec;
+            if (!SendOne(rec)) { why = "its world record " + rid + " writtenAt=" + N(rec.writtenAt) + " could not be sent to the world server (no link, the send refused, or its file unreadable)"; LendWriteUnsentRollback(rid, 0); }   /* review fold 5 */
+            else
+            {
+                written = 1; a.recId = rid; a.recAt = rec.writtenAt; a.recWriter = rec.owner;
+                const long long relWas = g_swReleaseSent;
+                SwPutAwayDone(rid, SwNpcFaction(q->faction));
+                if (g_swReleaseSent != relWas) ::InterlockedIncrement64(&g_lrBackReleased);
+            }
+        }
+    }
+    const int kind = raidsq::LentPutAwaySays(written);
+    if (written != 0) ::InterlockedIncrement64(&g_lrBackWritten);
+    else LendLine("[RAIDLEND] put-away NOT written as its world record: id=" + lid + " serial=" + N((long long)lser) + " - " + why + "; KEEPOWN: its lender resumes its own squad as it lent it");
+    BorrowHold(key, kind, written != 0 ? &a : 0, how);   /* review fold 4: sent once the copy's removal takes */
+}
+static std::string LentKeyOf(void* platoon)
+{
+    OwnRaidLockEnter();
+    std::map<void*, std::string>::const_iterator it = g_lentPlatoons.find(platoon);
+    const std::string k = it != g_lentPlatoons.end() ? it->second : std::string();
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    return k;
+}
+/* detour_deactivate, MAIN THREAD, after the engine's sleep of a lent copy: living (read before the sleep) - nobody living or no awake
+   members = DIED (raidsq::LentSleepEnding); otherwise its sleeping state is written as the squad's world record and RETURN names it
+   (LentPutAway - T-1122 lend by reference). No sleep write of the ordinary road, no heartbeat - the caller returns. */
+/* T-1122 attempt 2 fold 1 (review MED 1): how far (x, z) - a lent copy's people's centre - lies outside the areas this game holds
+   (raidsq::HeldOutsideBy over the 3 x 3 areas around it); -1 = none held, a NaN spot, or its own area is loaded here but not held by this
+   game (another game's area, or nobody's yet: not this game's to keep - its engine could wake it there). ANY THREAD (the TS reads). */
+static float HeldOutsideHere(float x, float z)
+{
+    if (x != x || z != z) return -1.0f;
+    const Sector s = SectorOf(x, z);
+    if (MayInventHereTS(s) != 1 && coop::SectorLoadedHereTS(s) == 1) return -1.0f;
+    int held[9];
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) { Sector n; n.x = s.x + dx; n.y = s.y + dy; held[(dy + 1) * 3 + (dx + 1)] = MayInventHereTS(n) == 1 ? 1 : 0; }
+    return raidsq::HeldOutsideBy(held, x, z);
+}
+void RaidLentAtSleep(void* platoon, int living, int haveMember, float mx, float my, float mz)
+{
+    const std::string key = LentKeyOf(platoon);
+    if (key.empty()) return;
+    int holdForHome = 0;
+    {   /* T-1122 fix A review fold 1 (owner 1575 a): handed back to its lender with its raid and none of the people sent runs here now (the
+           owner took them all) - no RAID_END now; the RETURN is written and HELD until the copy's removal (the existing held ending): the
+           owner's WITHDRAWN (it took them into its raid) drops it, else it goes - the old road */
+        std::map<std::string, BorrowRow>::iterator hb = g_borrow.find(key);
+        if (hb != g_borrow.end() && hb->second.ended == 0 && hb->second.forwardTo >= 0)
+        {
+            int runs = 0;
+            for (size_t k = 0; k < hb->second.uids.size(); ++k) if (net::IsUidMine(hb->second.uids[k])) runs = 1;
+            {   /* T-1122 whole or none (owner 1581 a): the people sent all run here, or none - part is unreachable; counted and said */
+                int runsAll = hb->second.uids.empty() ? 0 : 1;
+                for (size_t k = 0; k < hb->second.uids.size(); ++k) if (!net::IsUidMine(hb->second.uids[k])) runsAll = 0;
+                if (raidsq::LentPutAwayWrites(runs, runsAll) == raidsq::kPwPartial)
+                {
+                    LwNote(raidsq::kLwPutAwayPartial);
+                    LendLine("[RAIDLEND] lent copy put away with PART of the people it sent still run here: id=" + hb->second.id + " serial=" + N((long long)hb->second.serial)
+                             + " - whole or none was not kept (raidLendWhole putAwayPartial " + N(g_lwCount[raidsq::kLwPutAwayPartial]) + "); the ordinary put-away, as before");
+                }
+            }
+            holdForHome = raidsq::LentHandBackHolds(hb->second.forwardTo == hb->second.lender ? 1 : 0, hb->second.uids.empty() ? 0 : 1, runs);
+            if (holdForHome != 0)
+            {
+                ::InterlockedIncrement64(&g_lbHeld);
+                BorrowCampEnd(hb->second, raidsq::kCeSleep, living, 1, "its people went to the raid's owner with their raid (put away here)", 0);
+                LendLine("[RAIDLEND] lent copy handed back with its raid, then put away here: id=" + hb->second.id + " serial=" + N((long long)hb->second.serial) + " - its " + N((long long)hb->second.uids.size())
+                         + " people run at slot " + N((long long)hb->second.lender) + " now; no RAID_END, no world record written; a KEEPOWN waits for the copy's removal and goes only if slot "
+                         + N((long long)hb->second.lender) + " does not say WITHDRAWN first (it took them into its raid)");
+                /* T-1122 fix A re-check fold (1): nothing of the copy is written - the people's state is the owner's now; the held ending names no record */
+                BorrowHold(key, raidsq::LentHeldEndingKind(), 0, "its people went to the raid's owner with their raid; held for its WITHDRAWN");
+                return;
+            }
+        }
+    }
+    if (holdForHome == 0 && raidsq::LentSleepEnding(living) != raidsq::kLendKindDied)
+    {   /* T-1122 attempt 2 fold 1 (owner 1619 a; review MED 1): THE GIVE-BACK LINE (raidsq::LentKeepRule) on where the people stand - their
+           centre read just before the sleep. Kept here asleep while this game holds an area within the give-back line of it (fold 2: its raid's end is no reason):
+           its sleeping spot (and anchor) is written to that centre, so the asleep tick judges where the people are, and this game's own
+           off-screen update travels it on from there (LentBandUpdate past this game's area edge) - it wakes only by this game's engine, back
+           inside the wake box, and is never placed again (one placement per lend). Its raid campaign here is not ended. Otherwise, or if the
+           spot write fails, it is given back (RETURN at that centre). */
+        std::map<std::string, BorrowRow>::iterator kb = g_borrow.find(key);
+        if (kb != g_borrow.end() && kb->second.ended == 0 && kb->second.forwardTo < 0)
+        {
+            BorrowRow& kr = kb->second;
+            const float out = haveMember != 0 ? HeldOutsideHere(mx, mz) : -1.0f;
+            const int k = raidsq::LentKeepRule(haveMember != 0 ? 1 : 0, out);
+            if (k == raidsq::kSlKeep)
+            {
+                if (SetSleepPosPod(platoon, mx, my, mz, 1) == 1 && SetSleepPosAllPod(platoon, mx, my, mz) == 1)
+                {
+                    ::InterlockedIncrement64(&g_lpKeptInBand);
+                    LendLine("[RAIDLEND] lent copy put away - KEPT here: id=" + kr.id + " serial=" + N((long long)kr.serial) + " people's centre " + F1(mx) + "," + F1(mz) + " is " + F1(out)
+                             + " u outside this game's areas (the give-back line " + F1(raidsq::kLendGiveBack) + "); its sleeping spot is that centre - travelled on here, woken only by this game's engine; no RETURN (keptInBand " + N(g_lpKeptInBand) + ")");
+                    return;
+                }
+                ::InterlockedIncrement64(&g_lpKeepWriteFailed);
+            }
+            if (k == raidsq::kSlPastMargin) ::InterlockedIncrement64(&g_lpReturnedPastMargin);
+            if (k >= 0 && k < raidsq::kSlCount) ::InterlockedIncrement64(&g_lpReturn[k]);
+            LendLine("[RAIDLEND] lent copy put away and given back: id=" + kr.id + " serial=" + N((long long)kr.serial) + " - " + (k == raidsq::kSlKeep ? std::string("its sleeping spot could not be written (kept otherwise)") : std::string(raidsq::LentSleepWhy(k)))
+                     + (haveMember != 0 ? " (people's centre " + F1(mx) + "," + F1(mz) + ", " + F1(out) + " u outside this game's areas; the give-back line " + F1(raidsq::kLendGiveBack) + ")" : std::string()));
+        }
+    }
+    if (holdForHome == 0) { std::map<std::string, BorrowRow>::iterator c = g_borrow.find(key); if (c != g_borrow.end()) BorrowCampEnd(c->second, raidsq::kCeSleep, living, 1, "its engine put it away"); }
+    if (raidsq::LentSleepEnding(living) == raidsq::kLendKindDied) { BorrowFinish(key, raidsq::kLendKindDied, 0, living == 0 ? "wiped out when its engine put it away" : "no awake members when its engine put it away"); return; }
+    Pod q; std::memset(&q, 0, sizeof(q));
+    const int okPod = ReadPod(platoon, &q) ? 1 : 0;
+    const float x = haveMember != 0 ? mx : q.ux, y = haveMember != 0 ? my : q.uy, z = haveMember != 0 ? mz : q.uz;
+    LentPutAway(key, okPod != 0 ? &q : 0, x, y, z, "its engine put it away at this game's area edge");   /* T-1122 lend by reference: RETURN naming its put-away's world record */
+}
+/* T-1122 review folds: WITHDRAWN from the lender - it has no lend open under that serial (it resumed, refused, or lent again) and runs its own
+   squad. A wait under that key is dropped; an open copy ends here (kLendKindWithdrawn: the keep question no longer keeps it, out of its
+   campaign here, nothing said) and is removed - asleep by the sweep, awake put to sleep and removed (raidsq::LentEndedRetire); a held ending
+   is not sent. An awake hand's row is an ordinary world squad here and is never removed for it. MAIN THREAD */
+static void BorrowOnWithdrawn(const raidsq::LendMsg& m, int from)
+{
+    const std::string key = LendKey(m.lender, m.id, m.serial);
+    ::InterlockedIncrement64(&g_lhWithdrawnIn);
+    {
+        std::map<std::string, LendRecWait>::iterator w = g_lendRecWait.find(key);
+        if (w != g_lendRecWait.end())
+        {
+            g_lendRecWait.erase(w);
+            LendLine("[RAIDLEND] lend wait dropped: id=" + m.id + " serial=" + N((long long)m.serial) + " - WITHDRAWN by its lender (slot " + N((long long)from) + "); nothing is built");
+        }
+    }
+    std::map<std::string, BorrowRow>::iterator it = g_borrow.find(key);
+    const int have = it != g_borrow.end() ? 1 : 0;
+    const int wd = raidsq::WithdrawnAct(have, have != 0 ? it->second.awakeHand : 0, have != 0 ? it->second.ended : 0, have != 0 ? it->second.retPending : 0);
+    if (wd == raidsq::kWdNone || wd == raidsq::kWdAwakeHand || wd == raidsq::kWdEnded)
+    {
+        ::InterlockedIncrement64(&g_lhWithdrawnNoCopy);
+        LendLine("[RAIDLEND] WITHDRAWN from slot " + N((long long)from) + ": id=" + m.id + " serial=" + N((long long)m.serial) + " - "
+                 + (wd == raidsq::kWdNone ? std::string("no copy here under that key (already removed, or never built)")
+                    : wd == raidsq::kWdAwakeHand ? std::string("an awake hand's squad here is an ordinary world squad - not removed")
+                    : "its copy here already ended (" + N((long long)it->second.ended) + ") and goes by the sweep"));
+        return;
+    }
+    BorrowRow& r = it->second;
+    if (wd == raidsq::kWdHeld) { r.retPending = 0; r.retBody.clear(); r.retRecId.clear(); r.retRecAt = 0; }   /* the lender wants no ending: none is sent */
+    else
+    {
+        r.endAt = ::GetTickCount();
+        LentEndedMark(r.platoon);
+        BorrowCampEnd(r, raidsq::kCeLinkLost, -1, 1, "withdrawn by its lender");   /* out of its campaign here; nothing said */
+    }
+    r.ended = raidsq::kLendKindWithdrawn;
+    BorrowEnd(key, std::vector<char>());   /* a later ask under this key hears nothing: its lender has it closed */
+    ::InterlockedIncrement64(&g_lhWithdrawnRemoved);
+    LendLine("[RAIDLEND] WITHDRAWN from slot " + N((long long)from) + ": id=" + m.id + " serial=" + N((long long)m.serial) + " platoon=" + P(r.platoon) + " - its lender has no lend open under that serial and runs"
+             + " its own squad: this copy is removed here (asleep by the sweep, awake put to sleep and removed first)" + (wd == raidsq::kWdHeld ? std::string("; its held ending is not sent") : std::string()));
+}
+/* T-1122 review fold 3: the world server refused this game's full write of `worldId` (SquadWriterArrive, after its rollback). A RETURN this
+   game said naming that world id, kept to say again (g_borrowEnded - the sleeping lend's and the awake lend's), named a record that will never
+   reach its lender: KEEPOWN with that serial follows, and is what a status ask hears from here; the lender drops its waiting note and keeps
+   its own people (raidsq::KeepOwnAfterReturn). A held ending reads the record again at its send (BorrowSendHeld). MAIN THREAD */
+void RaidLendWriteRefused(const std::string& worldId, long long refusedAt)
+{
+    if (worldId.empty() || g_borrowEnded.empty()) return;
+    if (!OnMainThread()) { ::InterlockedIncrement64(&g_lendOffThread); return; }
+    for (std::map<std::string, std::vector<char> >::iterator it = g_borrowEnded.begin(); it != g_borrowEnded.end(); ++it)
+    {
+        raidsq::LendMsg d;
+        if (it->second.empty() || raidsq::DecodeLend(&it->second[0], it->second.size(), &d) == 0 || d.kind != raidsq::kLendKindReturn || d.recId != worldId
+            || raidsq::RefusedWriteNamesReturn(refusedAt, d.recAt) == 0) continue;   /* re-check fold 2: only the refusal of the write that RETURN named */
+        raidsq::LendMsg k; k.kind = raidsq::kLendKindKeepOwn; k.serial = d.serial; k.lender = d.lender; k.id = d.id;
+        std::vector<char> b;
+        if (raidsq::EncodeLend(k, &b) == 0) continue;
+        it->second = b;
+        const bool sent = net::SendRaidLend(b, d.lender);
+        ::InterlockedIncrement64(&g_lhRefusedKeepOwn);
+        LendLine("[RAIDLEND] KEEPOWN sent after its RETURN: id=" + d.id + " serial=" + N((long long)d.serial) + " to slot " + N((long long)d.lender) + " - the world server refused this game's write of world record "
+                 + worldId + " (writtenAt " + N(d.recAt) + ", named by that RETURN): that record will not reach the lender, which keeps its own people sent=" + (sent ? "1" : "0"));
+    }
+}
+/* detour_destroyPlatoon (main thread: o == 0; off it: o == 1 - only marked, the tick says DIED) and the death watch (living 0) */
+void RaidLentGone(void* platoon, int offThread)
+{
+    if (offThread != 0)
+    {
+        OwnRaidLockEnter();
+        std::map<void*, std::string>::iterator it = g_lentPlatoons.find(platoon);
+        if (it != g_lentPlatoons.end()) it->second = "!" + it->second;   /* marked: the tick finishes it */
+        ::LeaveCriticalSection(&g_ownRaidLock);
+        return;
+    }
+    const std::string key = LentKeyOf(platoon);
+    if (key.empty()) return;
+    { std::map<std::string, BorrowRow>::iterator c = g_borrow.find(key[0] == '!' ? key.substr(1) : key); if (c != g_borrow.end()) BorrowCampEnd(c->second, raidsq::kCeAllDead, 0, 0, "destroyed here (the engine's removal took it out of its raid)"); }
+    BorrowFinish(key[0] == '!' ? key.substr(1) : key, raidsq::kLendKindDied, 0, "destroyed here");
+    OwnRaidLockEnter(); g_lentPlatoons.erase(platoon); g_lentEnded.erase(platoon); const int wasOver = g_lentRaidOver.erase(platoon) != 0 ? 1 : 0; LentCountSet(); ::LeaveCriticalSection(&g_ownRaidLock);
+    if (wasOver != 0)
+    {   /* T-1122 attempt 2 fold 2: the one-player end of a raid squad whose raid is over - its engine discarded it here */
+        ::InterlockedIncrement64(&g_f2RaidOverDiscarded);
+        LendLine("[RAIDLEND] lent copy " + (key[0] == '!' ? key.substr(1) : key) + " discarded by this game's engine after its raid ended here (the engine's own keep answer, as in one-player play) - DIED said; its lender removes its squad (raidLendFold2 raidOverDiscarded " + N(g_f2RaidOverDiscarded) + ")");
+    }
+    std::map<std::string, BorrowRow>::iterator it = g_borrow.find(key[0] == '!' ? key.substr(1) : key);
+    if (it != g_borrow.end() && it->second.retPending != 0) BorrowSendHeld(it->first, it->second, "its copy removed here");   /* review fold 4: the held ending goes now */
+    if (it != g_borrow.end()) g_borrow.erase(it);
+}
+void RaidLentWatch(void* platoon, int living)
+{
+    if (living != 0) return;
+    const std::string key = LentKeyOf(platoon);
+    if (key.empty() || key[0] == '!') return;
+    { std::map<std::string, BorrowRow>::iterator c = g_borrow.find(key); if (c != g_borrow.end()) BorrowCampEnd(c->second, raidsq::kCeAllDead, 0, 1, "no living member while awake"); }
+    BorrowFinish(key, raidsq::kLendKindDied, 0, "no living member while awake");
+}
+/* T-1122 attempt 2 fold 1: a woken lent copy's placement - waiting for its people steady (n, who, where: the last frame's), then (done)
+   watching kLendPlaceWatchFrames for people made later, placed by their offset from the old centre (cx, cz) at the point (nx, nz) */
+struct LentPlace { int frames; int n; int done; int watch; float cx, cz, nx, nz; void* ms[64]; float xs[64], zs[64];
+                   LentPlace() : frames(0), n(-1), done(0), watch(0), cx(0), cz(0), nx(0), nz(0) {} };
+std::map<void*, LentPlace> g_lentPlace;   /* T-1122 attempt 2: woken lent copies whose people are not placed yet - main thread */
+void RaidLentWoke(void* platoon)
+{
+    const std::string key = LentKeyOf(platoon);
+    std::map<std::string, BorrowRow>::iterator it = g_borrow.find(key);
+    if (it == g_borrow.end()) return;
+    it->second.awake = 1;   /* the tick starts its raid campaign once it is awake (BorrowCampStart) */
+    LendLine("[RAIDLEND] copy woke: id=" + it->second.id + " serial=" + N((long long)it->second.serial));
+    if (it->second.placed == 0) { LentPlace lp; g_lentPlace[platoon] = lp; }   /* T-1122 attempt 2: its people are placed once they are steady (LentPlaceTick) - fold 1: at the lend's FIRST wake only */
+    else ::InterlockedIncrement64(&g_lpNotFirst);   /* a kept copy woken again by this game's engine: its people stand where it woke them */
+}
+/* T-1122 attempt 2 (owner 1619 a): CharMovement::teleportTo, as TeleportMemberPod (the absolute placement replicate.cpp uses). 1 placed */
+static int LentTeleportPod(void* c, float x, float y, float z)
+{
+    __try
+    {
+        CharMovement* mv = ((::Character*)c)->movement;
+        if (!Plaus(mv)) return 0;
+        mv->teleportTo(Ogre::Vector3(x, y, z), -1);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1122 attempt 2 (owner 1619 a): THE PEOPLE OF A WOKEN LENT COPY ARE PLACED, at the lend's first wake (MAIN THREAD).
+   Each member goes to the target point (raidsq::LendTargetPoint: from the people's centre toward the raid's target, kLendDeep in from
+   the area's edge) plus its own offset from that centre - the formation kept. The positions are the people's own, never the platoon's
+   marker (F463's stale 5.6 km); a move longer than raidsq::kLendPlaceMax is refused and counted. Then the copy's raid campaign is started
+   here (BorrowCampStart) - the 1 Hz tick never saw these copies awake.
+   Fold 1: MED 3 - the centre is taken only once the people are steady: the same people (who and how many) at the same positions two
+   frames running (raidsq::LentSteady), so a relocation the engine makes after building them is read after it; people made after the
+   placement are placed too, for kLendPlaceWatchFrames, by their offset from the old centre. HIGH 1 - each person at the ground height of
+   its NEW spot (GroundTerrainHeightAt, the engine's terrain read, as hire.cpp's squad move); no height read: that person is not moved
+   (counted). LOW - no move unless this game holds the target point's area (counted). */
+static int LentPlaceOne(void* c, float ox, float oz)
+{
+    float gy = 0.0f, y = 0.0f;
+    if (raidsq::LentMemberY(GroundTerrainHeightAt(ox, oz, &gy) == 1 ? 1 : 0, gy, &y) != 1) { ::InterlockedIncrement64(&g_lpNoGround); return 0; }
+    return LentTeleportPod(c, ox, y, oz);
+}
+void LentPlaceTick()
+{
+    for (std::map<void*, LentPlace>::iterator it = g_lentPlace.begin(); it != g_lentPlace.end(); )
+    {
+        const std::string key = LentKeyOf(it->first);
+        std::map<std::string, BorrowRow>::iterator b = (key.empty() || key[0] == '!') ? g_borrow.end() : g_borrow.find(key);
+        if (b == g_borrow.end() || b->second.ended != 0) { g_lentPlace.erase(it++); continue; }
+        BorrowRow& r = b->second;
+        LentPlace& lp = it->second;
+        Pod q; std::memset(&q, 0, sizeof(q));
+        const int ok = ReadPod(it->first, &q) ? 1 : 0;
+        const int people = (ok != 0 && Plaus(q.active) && Plaus(q.members)) ? q.activeChars : 0;
+        void* ms[64]; float xs[64], zs[64]; int n = 0;
+        for (int i = 0; i < people && i < 64; ++i)
+            if (Plaus(q.members[i]) && ReadCharPosPod(q.members[i], &xs[n], &zs[n])) { ms[n] = q.members[i]; ++n; }
+        if (lp.done != 0)
+        {   /* people made after the placement: each at the point plus its offset from the old centre - once (a person already nearer the point is left) */
+            for (int i = 0; i < n && lp.n < 64; ++i)
+            {
+                int seen = 0;
+                for (int j = 0; j < lp.n && seen == 0; ++j) if (lp.ms[j] == ms[i]) seen = 1;
+                if (seen != 0) continue;
+                lp.ms[lp.n++] = ms[i];
+                const float dOld = (xs[i] - lp.cx) * (xs[i] - lp.cx) + (zs[i] - lp.cz) * (zs[i] - lp.cz), dNew = (xs[i] - lp.nx) * (xs[i] - lp.nx) + (zs[i] - lp.nz) * (zs[i] - lp.nz);
+                if (dNew <= dOld) continue;
+                float ox = 0.0f, oz = 0.0f; raidsq::PlaceMember(xs[i], zs[i], lp.cx, lp.cz, lp.nx, lp.nz, &ox, &oz);
+                if (LentPlaceOne(ms[i], ox, oz) == 1) ::InterlockedIncrement64(&g_lpLate);
+            }
+            if (++lp.watch > raidsq::kLendPlaceWatchFrames) g_lentPlace.erase(it++); else ++it;
+            continue;
+        }
+        const int steady = (n > 0 && n == people && raidsq::LentSteady(xs, zs, n, lp.xs, lp.zs, lp.n) == 1 && std::memcmp(ms, lp.ms, (size_t)n * sizeof(void*)) == 0) ? 1 : 0;
+        if (steady == 0)
+        {
+            lp.n = n;
+            for (int i = 0; i < n; ++i) { lp.ms[i] = ms[i]; lp.xs[i] = xs[i]; lp.zs[i] = zs[i]; }
+            if (++lp.frames > raidsq::kLendPlaceFrames) { ::InterlockedIncrement64(&g_lpTimedOut); LendLine("[RAIDLEND] lent copy's people NOT placed: id=" + r.id + " serial=" + N((long long)r.serial) + " - no steady people in " + N((long long)raidsq::kLendPlaceFrames) + " frames after its wake (tried again at its next wake)"); g_lentPlace.erase(it++); }
+            else ++it;
+            continue;
+        }
+        float cx = 0.0f, cz = 0.0f;
+        if (raidsq::PeopleCentre(xs, zs, n, &cx, &cz) == 0) { ++it; continue; }
+        ++r.placed;
+        const raidsq::WakeBox wb = LendWakeBoxHere(cx, cz);
+        const raidsq::WakeBox db = raidsq::DeepOf(wb);
+        float nx = cx, nz = cz, mv = 0.0f;
+        const int tp = raidsq::LendTargetPoint(db, cx, cz, r.hasTarget, r.tx, r.tz, &nx, &nz, &mv);
+        const int pd = raidsq::LentPlaceDecide(tp, MayInventHereTS(SectorOf(nx, nz)) == 1 ? 1 : 0);
+        if (pd == raidsq::kPdMove)
+        {
+            /* T-1122 attempt 2 fold 2 (re-check LOW): the group moves whole or not at all - every person's ground height read first (raidsq::LentGroundAll) */
+            float oxs[64], ozs[64], oys[64]; int gok[64];
+            for (int i = 0; i < n; ++i)
+            {
+                raidsq::PlaceMember(xs[i], zs[i], cx, cz, nx, nz, &oxs[i], &ozs[i]);
+                float gy = 0.0f; oys[i] = 0.0f;
+                gok[i] = raidsq::LentMemberY(GroundTerrainHeightAt(oxs[i], ozs[i], &gy) == 1 ? 1 : 0, gy, &oys[i]);
+                if (gok[i] != 1) ::InterlockedIncrement64(&g_lpNoGround);
+            }
+            const int whole = raidsq::LentGroundAll(gok, n);
+            int moved = 0;
+            if (whole == 1) { for (int i = 0; i < n; ++i) moved += LentTeleportPod(ms[i], oxs[i], oys[i], ozs[i]); ::InterlockedIncrement64(&g_lpPlaced); }
+            else ::InterlockedIncrement64(&g_f2GroundPartial);
+            LendLine("[RAIDLEND] lent copy's people " + std::string(whole == 1 ? "placed" : "NOT placed (a ground height not read - the group moves whole or not at all)") + ": id=" + r.id + " serial=" + N((long long)r.serial) + " " + N((long long)moved) + "/" + N((long long)n) + " moved " + F1(mv) + " u from their centre "
+                     + F1(cx) + "," + F1(cz) + " to " + F1(nx) + "," + F1(nz) + " at the ground's height there" + (tp == raidsq::kTpLine ? " along the line toward its target " + F1(r.tx) + "," + F1(r.tz) : std::string(" (the nearest deep point: no target, or the line does not reach the deep box first)"))
+                     + " (deep box x " + F1(db.x0) + ".." + F1(db.x1) + ", z " + F1(db.z0) + ".." + F1(db.z1) + ") - once per lend (lendPeoplePlaced " + N(g_lpPlaced) + ", noGround " + N(g_lpNoGround) + ")");
+            lp.done = 1; lp.cx = cx; lp.cz = cz; lp.nx = nx; lp.nz = nz;   /* lp.ms already holds these people (steady: the same as the last frame) */
+        }
+        else if (pd == raidsq::kPdTooFar)
+        {
+            ::InterlockedIncrement64(&g_lpRefused);
+            LendLine("[RAIDLEND] lent copy's people NOT placed: id=" + r.id + " serial=" + N((long long)r.serial) + " - the move from their centre " + F1(cx) + "," + F1(cz) + " would be " + F1(mv)
+                     + " u, more than " + F1(raidsq::kLendPlaceMax) + " u (lendPlaceRefused " + N(g_lpRefused) + ")");
+        }
+        else if (pd == raidsq::kPdNotHeld)
+        {
+            ::InterlockedIncrement64(&g_lpNotHeldAt);
+            LendLine("[RAIDLEND] lent copy's people NOT placed: id=" + r.id + " serial=" + N((long long)r.serial) + " - this game does not hold the target point " + F1(nx) + "," + F1(nz) + "'s area (notHeldAt " + N(g_lpNotHeldAt) + ")");
+        }
+        else if (pd == raidsq::kPdAlready) ::InterlockedIncrement64(&g_lpAlready);
+        else { ::InterlockedIncrement64(&g_lpNoBox); LendLine("[RAIDLEND] lent copy's people NOT placed: id=" + r.id + " serial=" + N((long long)r.serial) + " - no wake box here at their centre " + F1(cx) + "," + F1(cz)); }
+        if (r.campTried == 0 && Plaus(q.faction)) { ::InterlockedIncrement64(&g_lpCampStarted); BorrowCampStart(r, q.faction); }   /* the walk: its raid campaign here, toward the base */
+        if (pd == raidsq::kPdMove) ++it; else g_lentPlace.erase(it++);
+    }
+}
+/* T-1122 attempt 2 fold 1 (review LOW): a lent copy woken off the main thread - queued here (any thread), its RaidLentWoke run on the main
+   thread by LentWokeDrain (StoreTick), so its placement still comes */
+static void LentWokeOffThread(void* platoon)
+{
+    OwnRaidLockEnter();
+    if (g_lentWokeOff.size() < raidsq::kCap) g_lentWokeOff.push_back(platoon);
+    ::InterlockedExchange(&g_lentWokeOffN, (LONG)g_lentWokeOff.size());
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    ::InterlockedIncrement64(&g_lpWokeOffThread);
+}
+void LentWokeDrain()
+{
+    std::vector<void*> q;
+    OwnRaidLockEnter(); q.swap(g_lentWokeOff); ::InterlockedExchange(&g_lentWokeOffN, 0); ::LeaveCriticalSection(&g_ownRaidLock);
+    for (size_t i = 0; i < q.size(); ++i) if (RaidLentHas(q[i])) RaidLentWoke(q[i]);
+}
+/* ---- T-1122 awake hand (owner 1524, src/common/raidsquad.h's section): THE RECEIVER ----
+   AWAKE is kept by the hand-over's key uid (g_awakeBlocks). When this game takes that squad by the ordinary hand-over (handoff.cpp
+   ApplyRemoteXfer / ApplyRemoteRelease) it issues no carried goal and applies the block: a borrow row for the squad it took (awake, no
+   saved bytes, NOT lent - an ordinary world squad, written, kept and released by the ordinary roads) and a campaign of the block's kind
+   (BorrowCampStart). A block that came after the members is applied at its arrival or the tick, once this game runs that uid; one whose
+   squad this game does not run within raidsq::kAwakeBlockDropMs is dropped. The row's endings (AwakeRowTick): its campaign ends here
+   (RAID_END as today), its squad is handed back or on, put away, all dead or gone (BorrowCampEnd: taken out of the campaign, RAID_END
+   said), or the sender leaves. MAIN THREAD. */
+struct AwakeBlock { raidsq::LendMsg m; int from; unsigned long at; int whole; AwakeBlock() : from(-1), at(0), whole(-1) {} };   /* whole: T-1122 fix A re-check fold (2) - the take's fullness when the take came first (-1 not known) */
+/* T-1122 fix A re-check fold (2): each take's fullness by the hand-over's key uid (1 every member named taken, 0 part) and when - noted by
+   every take road, block or not (RaidAwakeTakeNote), read by a block that arrives after the take or is applied by the tick
+   (raidsq::AwakeTakeNoteUsable) - main thread; emptied at the world teardown */
+struct AwakeTakeNote { int whole; unsigned long at; AwakeTakeNote() : whole(-1), at(0) {} };
+std::map<unsigned int, AwakeTakeNote> g_awakeTakeNotes;
+static int AwakeTakeWholeOf(unsigned int keyUid)
+{
+    std::map<unsigned int, AwakeTakeNote>::const_iterator n = g_awakeTakeNotes.find(keyUid);
+    return (n != g_awakeTakeNotes.end() && raidsq::AwakeTakeNoteUsable(1, raidsq::LendAgeMs(::GetTickCount(), n->second.at)) != 0) ? n->second.whole : -1;
+}
+std::map<unsigned int, AwakeBlock> g_awakeBlocks;   /* the hand-over key uid -> its AWAKE block, until that squad is taken here - main thread; emptied at the world teardown */
+/* T-1122 fix A (owner 1575 a, 2026-11-09; raidsquad.h's section): THE OWNER - a squad this game lent by reference (`own`: its sleeping copy
+   here, frozen while lent, in this game's campaign) came home awake by the ordinary hand-over with its raid block. The platoon its people
+   were taken into joins that campaign (the engine's join, not as leader) and the sleeping copy leaves it (the engine's take-out: a new
+   leader if it led); the copy is removed (admin: no gone mark, no delete - its people run in the platoon taken) and the lend row goes, so no
+   status ask, RETURN or resume follows. No campaign / unknown slots / two factions: the copy leaves what it can (the campaign ended by phase 2
+   when no squad is left) and is removed - the raid is lost, said. Nothing read: left as today (the row stays). MAIN THREAD */
+static void LentCameHome(const AwakeBlock& b, void* ap, void* own, const LendRow& lr, const char* road, int whole)
+{
+    const raidsq::LendMsg& m = b.m;
+    void* taken = Plaus(ap) ? AwakeApPlatoonPod(ap) : 0;
+    Pod qt; std::memset(&qt, 0, sizeof(qt));
+    const int takenRead = (taken != 0 && taken != own && ReadPod(taken, &qt) && qt.active == ap && Plaus(qt.faction)) ? 1 : 0;
+    Pod qo; std::memset(&qo, 0, sizeof(qo));
+    const int ownRead = (ReadPod(own, &qo) && Plaus(qo.faction)) ? 1 : 0;
+    const int ownAsleep = (ownRead != 0 && !Plaus(qo.active) && FindSleepingPlatoonImpl((::Faction*)qo.faction, lr.id) == own) ? 1 : 0;
+    void* camp = ownRead != 0 ? LendCampaignPod(qo.faction, own) : 0;
+    const int slotsOk = (camp != 0 && kRaidCampaignJoinRva != 0 && kRaidCampaignDropRva != 0 && CampSlotPod(camp, 0x70, 0) == Base() + kRaidCampaignJoinRva
+                         && CampSlotPod(camp, 0x80, 0) == Base() + kRaidCampaignDropRva) ? 1 : 0;
+    const int act = raidsq::LentHomeAct(lr.state, b.from == lr.borrower ? 1 : 0, whole, takenRead, camp != 0 ? 1 : 0, slotsOk, (takenRead != 0 && ownRead != 0 && qt.faction == qo.faction) ? 1 : 0);
+    if (act == raidsq::kLhNone)
+    {   /* T-1122 fix A review fold 1: nothing closed, nothing said - the holder keeps the people it still runs in its copy and its campaign;
+           a partial take's people here run without the raid; the rest come home by the next hand-over (a full take swaps) or by RETURN */
+        ::InterlockedIncrement64(whole == 0 ? &g_lbPartial : &g_lbHomeNone);
+        LendLine("[RAIDLEND] lent raid squad came home awake, NOT applied: id=" + m.id + " serial=" + N((long long)m.serial) + " leader=" + N((long long)m.leader) + " from slot " + N((long long)b.from) + " (" + road + ")"
+                 + " - row state " + N((long long)lr.state) + ", its borrower slot " + N((long long)lr.borrower) + ", full take " + N((long long)whole) + " (1 yes, 0 part of the people taken, -1 not known)"
+                 + ", the platoon taken read " + N((long long)takenRead) + "; the row and its sleeping copy stay as they are, no WITHDRAWN (the holder keeps the rest in its raid)");
+        return;
+    }
+    int joined = 0, took = 0, left = -1, phase = -1, over = 0;
+    if (act == raidsq::kLhSwap)
+    {
+        joined = LendCampaignPod(qt.faction, taken) == camp ? 2 : CampJoinPod(camp, taken, 0);   /* 2: already in it */
+        took = CampDropPod(camp, own);
+    }
+    else if (camp != 0 && slotsOk != 0)
+    {
+        took = CampDropPod(camp, own);
+        if (took == 1) CampLeftPod(camp, &left, &phase);
+        if (raidsq::LenderCampEnds(took, left, phase) != 0) over = CampOverPod(camp);
+    }
+    if (joined == -1 || took == -1 || over == -1) ::InterlockedIncrement64(&g_campFaults);
+    ::InterlockedIncrement64(act == raidsq::kLhSwap && joined >= 1 ? &g_lbHomeSwap : &g_lbHomeDropOnly);
+    OwnRaidLockEnter(); g_lend.erase(own); g_lendWant.erase(own); ::LeaveCriticalSection(&g_ownRaidLock);   /* the lend closed: no status ask, no RETURN, no resume of the copy */
+    int removed = 0;
+    if (raidsq::LentHomeRemovesOwn(act, ownAsleep) != 0)
+    {
+        AdminDestroyBeginImpl();
+        detour_destroyPlatoon(qo.faction, own);
+        AdminDestroyEndImpl();
+        removed = InSleepingListImpl((::Faction*)qo.faction, own) != 1 ? 1 : 0;   /* out of its faction's sleeping list (the list is walked, the freed squad is not read) */
+    }
+    ::InterlockedIncrement64(removed != 0 ? &g_lbOwnRemoved : &g_lbOwnKept);
+    int confirmed = 0;
+    if (raidsq::LentHomeConfirms(act) != 0)
+    {   /* T-1122 fix A review fold 1: the holder's copy ends with nothing said (BorrowOnWithdrawn) - this game runs the squad now */
+        raidsq::LendMsg w; w.kind = raidsq::kLendKindWithdrawn; w.serial = lr.serial; w.lender = g_mySlot; w.id = lr.id;
+        confirmed = LendSend(w, b.from, 0);
+        ::InterlockedIncrement64(&g_lbConfirmSent);
+    }
+    LendLine("[RAIDLEND] lent raid squad came home awake: id=" + m.id + " serial=" + N((long long)m.serial) + " leader=" + N((long long)m.leader) + " from slot " + N((long long)b.from) + " (" + road + ")"
+             + " platoon taken=" + P(taken) + " own copy=" + P(own) + " camp=" + P(camp)
+             + (act == raidsq::kLhSwap ? " - joined its own campaign=" + N((long long)joined) + " (2: already in it), own copy taken out=" + N((long long)took)
+                : " - NO swap (campaign here " + N((long long)(camp != 0 ? 1 : 0)) + ", slots known " + N((long long)slotsOk) + ", one faction " + N((long long)(qt.faction == qo.faction ? 1 : 0))
+                  + "): own copy taken out=" + N((long long)took) + " squads left=" + N((long long)left) + (over == 1 ? std::string(" (the campaign ended by phase 2; no ending handler - no outcome came from the holder)") : std::string()) + " - the raid is lost")
+             + "; own copy removed=" + N((long long)removed) + (ownAsleep == 0 ? std::string(" (not asleep here under its id - left as it is)") : std::string())
+             + "; its lend row goes (no RETURN, no resume); WITHDRAWN to slot " + N((long long)b.from) + " sent=" + N((long long)confirmed));
+}
+static void AwakeApply(const AwakeBlock& b, void* ap, const char* road, int whole)   /* whole (T-1122 fix A review fold 1): the take's every member taken - 1, 0 part, -1 not known */
+{
+    const raidsq::LendMsg& m = b.m;
+    const std::string key = LendKey(m.lender, m.id, m.serial);
+    if (g_borrow.count(key) != 0) { ::InterlockedIncrement64(&g_awakeDup); return; }
+    if (m.lender == g_mySlot)
+    {   /* T-1122 review fold 2: this game's own raid squad came back with its block - its carried order was skipped (the take); it stays in
+           this game's own campaign, which drives it again here; its awake lend row goes */
+        void* lp = 0; LendRow lr;
+        OwnRaidLockEnter();
+        for (std::map<void*, LendRow>::const_iterator it = g_lend.begin(); it != g_lend.end(); ++it)
+            if (it->second.awake != 0 && it->second.id == m.id && it->second.serial == m.serial) { lp = it->first; lr = it->second; break; }
+        ::LeaveCriticalSection(&g_ownRaidLock);
+        if (lp == 0)
+        {   /* T-1122 fix A (owner 1575 a): a squad this game lent by reference came home awake with its raid - its people join this game's own
+               campaign in place of its sleeping copy (LentCameHome) */
+            void* rp = 0; LendRow rr;
+            OwnRaidLockEnter();
+            for (std::map<void*, LendRow>::const_iterator it = g_lend.begin(); it != g_lend.end(); ++it)
+                if (it->second.awake == 0 && it->second.id == m.id && it->second.serial == m.serial) { rp = it->first; rr = it->second; break; }
+            ::LeaveCriticalSection(&g_ownRaidLock);
+            if (rp != 0) { LentCameHome(b, ap, rp, rr, road, whole); return; }
+        }
+        if (lp != 0) AwakeLendDrop(lp, lr);
+        ::InterlockedIncrement64(&g_awakeHome);
+        LendLine("[RAIDLEND] awake raid squad came home: id=" + m.id + " serial=" + N((long long)m.serial) + " leader=" + N((long long)m.leader) + " from slot " + N((long long)b.from) + " (" + road + ")"
+                 + (lp != 0 ? std::string(" - its awake lend row goes") : std::string(" - no open awake lend row here")) + (lp != 0 && Plaus(ap) && AwakeApPlatoonPod(ap) != lp ? " (taken into another platoon than the lent one)" : "")
+                 + "; it stays in this game's own campaign");
+        return;
+    }
+    void* platoon = Plaus(ap) ? AwakeApPlatoonPod(ap) : 0;
+    Pod q; std::memset(&q, 0, sizeof(q)); std::string hereId;
+    if (platoon == 0 || !ReadPod(platoon, &q) || q.active != ap || !Plaus(q.faction) || !PlatoonSidPod(platoon, &hereId) || hereId.empty()
+        || FindActivePlatoonImpl((::Faction*)q.faction, hereId) != platoon || g_borrow.size() >= kBorrowCap)
+    {
+        ::InterlockedIncrement64(&g_awakeDropped);
+        LendLine("[RAIDLEND] awake block NOT applied: id=" + m.id + " serial=" + N((long long)m.serial) + " leader=" + N((long long)m.leader) + " (" + road + ") - "
+                 + (g_borrow.size() >= kBorrowCap ? std::string("the table is full") : std::string("the squad taken here is not read")) + "; it runs without a raid here");
+        return;
+    }
+    BorrowRow r; r.lender = m.lender; r.serial = m.serial; r.id = m.id; r.faction = m.faction; r.platoon = platoon; r.hasTarget = m.hasTarget; r.tx = m.tx; r.ty = m.ty; r.tz = m.tz;
+    r.builtAt = ::GetTickCount(); r.awake = 1;
+    r.hasCamp = m.hasCamp; r.campKind = m.campKind; r.campPhase = m.campPhase; r.campT18 = m.campT18; r.campT20 = m.campT20;
+    r.awakeHand = 1; r.leaderUid = m.leader; r.hereFaction = q.faction; r.hereId = hereId;
+    g_borrow[key] = r;
+    BorrowRow& w = g_borrow[key];
+    ::InterlockedIncrement64(&g_awakeApplied);
+    LendLine("[RAIDLEND] awake block applied: id=" + m.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)m.lender) + " leader=" + N((long long)m.leader) + " platoon=" + P(platoon)
+             + " (" + road + ")" + (m.hasTarget != 0 ? " target=" + F1(m.tx) + "," + F1(m.tz) : std::string(" target=none"))
+             + (m.hasCamp != 0 ? " campaign='" + m.campKind + "' phase=" + N((long long)m.campPhase) : std::string(" campaign=none"))
+             + " - an ordinary world squad here (not lent); its raid campaign starts now");
+    BorrowCampStart(w, q.faction);
+    if (w.campMade != 1)
+    {
+        ::InterlockedIncrement64(&g_awakeCampRefused);
+        LendLine("[RAIDLEND] awake lend NOT kept: id=" + m.id + " serial=" + N((long long)m.serial) + " - no campaign here (the [RAIDCAMP] line says why); the squad runs without a raid; the sender's status ask hears UNKNOWN");
+        g_borrow.erase(key);
+        return;
+    }
+    BorrowSay(m, raidsq::kLendKindTaken, 0, m.lender);   /* T-1122 review fold 2: the raid's owner hears which game holds it now (its row follows the squad) */
+}
+static void AwakeBlockArrive(const raidsq::LendMsg& m, int from)
+{
+    if (g_borrow.count(LendKey(m.lender, m.id, m.serial)) != 0) { ::InterlockedIncrement64(&g_awakeDup); return; }   /* said again for a squad already in its campaign here */
+    const int had = g_awakeBlocks.count(m.leader) != 0 ? 1 : 0;
+    if (had == 0 && g_awakeBlocks.size() >= kBorrowCap)
+    {
+        ::InterlockedIncrement64(&g_awakeDropped);
+        LendLine("[RAIDLEND] awake block dropped: id=" + m.id + " serial=" + N((long long)m.serial) + " leader=" + N((long long)m.leader) + " from slot " + N((long long)from) + " - the table is full");
+        return;
+    }
+    AwakeBlock& b = g_awakeBlocks[m.leader]; b.m = m; b.from = from; b.at = ::GetTickCount();
+    if (had == 0)
+    {
+        ::InterlockedIncrement64(&g_awakeStored);
+        LendLine("[RAIDLEND] awake block stored: id=" + m.id + " serial=" + N((long long)m.serial) + " leader=" + N((long long)m.leader) + " from slot " + N((long long)from)
+                 + (m.hasCamp != 0 ? " campaign='" + m.campKind + "' phase=" + N((long long)m.campPhase) : std::string(" campaign=none"))
+                 + " - applied when this game takes that squad (dropped after " + N((long long)(raidsq::kAwakeBlockDropMs / 1000UL)) + " s)");
+    }
+    int mine = 0; void* ap = HandoffMySquadApOf(m.leader, &mine);
+    if (raidsq::AwakeBlockAct(ap != 0 ? 1 : 0, 0) == raidsq::kBlockApply)
+    {   /* the block came after the members (or this game runs that uid already): applied now */
+        const AwakeBlock blk = b; g_awakeBlocks.erase(m.leader);
+        AwakeApply(blk, ap, "the block came after the take", AwakeTakeWholeOf(m.leader));   /* re-check fold (2): the take's own fullness */
+    }
+}
+int RaidAwakeHasImpl(unsigned int keyUid)
+{
+    if (keyUid == 0 || !OnMainThread()) return 0;
+    if (g_awakeBlocks.count(keyUid) != 0) return 1;
+    for (std::map<std::string, BorrowRow>::const_iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+        if (it->second.awakeHand != 0 && it->second.ended == 0 && it->second.leaderUid == keyUid) return 1;
+    return 0;
+}
+void RaidAwakeTakenImpl(unsigned int keyUid, void* ap, int whole)
+{
+    if (!OnMainThread()) return;
+    std::map<unsigned int, AwakeBlock>::iterator it = g_awakeBlocks.find(keyUid);
+    if (it == g_awakeBlocks.end()) return;
+    if (raidsq::AwakeBlockAct(ap != 0 ? 1 : 0, raidsq::LendAgeMs(::GetTickCount(), it->second.at)) != raidsq::kBlockApply) { it->second.whole = whole; return; }   /* not this game's to run yet: the tick waits (re-check fold (2): with this take's fullness) */
+    const AwakeBlock b = it->second; g_awakeBlocks.erase(it);
+    AwakeApply(b, ap, "taken by the ordinary hand-over", whole);
+}
+/* T-1122 whole or none (owner 1581 a): the raidLendWhole token's counters, from the hand-over roads (handoff.cpp) */
+void RaidLentWholeNoteImpl(int which) { LwNote(which); }
+/* T-1122 fix A re-check fold (2): every take road notes its fullness by the hand-over's key uid, block or not (main thread) */
+void RaidAwakeTakeNoteImpl(unsigned int keyUid, int whole)
+{
+    if (keyUid == 0 || !OnMainThread()) return;
+    const unsigned long now = ::GetTickCount();
+    if (g_awakeTakeNotes.size() >= kBorrowCap && g_awakeTakeNotes.count(keyUid) == 0)
+    {   /* the stale ones go first; a full table of fresh ones drops its first */
+        for (std::map<unsigned int, AwakeTakeNote>::iterator it = g_awakeTakeNotes.begin(); it != g_awakeTakeNotes.end(); )
+            if (raidsq::AwakeTakeNoteUsable(1, raidsq::LendAgeMs(now, it->second.at)) == 0) g_awakeTakeNotes.erase(it++); else ++it;
+        if (g_awakeTakeNotes.size() >= kBorrowCap) g_awakeTakeNotes.erase(g_awakeTakeNotes.begin());
+    }
+    AwakeTakeNote& n = g_awakeTakeNotes[keyUid]; n.whole = whole; n.at = now != 0 ? now : 1;
+    std::map<unsigned int, AwakeBlock>::iterator b = g_awakeBlocks.find(keyUid);
+    if (b != g_awakeBlocks.end()) b->second.whole = whole;
+}
+static void AwakeBlocksTick(unsigned long now)
+{
+    std::vector<unsigned int> keys;
+    for (std::map<unsigned int, AwakeBlock>::const_iterator it = g_awakeBlocks.begin(); it != g_awakeBlocks.end(); ++it) keys.push_back(it->first);
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        std::map<unsigned int, AwakeBlock>::iterator it = g_awakeBlocks.find(keys[i]);
+        if (it == g_awakeBlocks.end()) continue;
+        int mine = 0; void* ap = HandoffMySquadApOf(keys[i], &mine);
+        const int d = raidsq::AwakeBlockAct(ap != 0 ? 1 : 0, raidsq::LendAgeMs(now, it->second.at));
+        if (d == raidsq::kBlockWait) continue;
+        const AwakeBlock b = it->second; g_awakeBlocks.erase(it);
+        if (d == raidsq::kBlockApply) { AwakeApply(b, ap, "found at the tick", b.whole >= 0 ? b.whole : AwakeTakeWholeOf(keys[i])); continue; }   /* re-check fold (2) */
+        ::InterlockedIncrement64(&g_awakeDropped);
+        LendLine("[RAIDLEND] awake block dropped: id=" + b.m.id + " serial=" + N((long long)b.m.serial) + " leader=" + N((long long)b.m.leader) + " from slot " + N((long long)b.from)
+                 + " - this game did not take that squad within " + N((long long)(raidsq::kAwakeBlockDropMs / 1000UL)) + " s (runs that uid: " + N((long long)mine) + ")");
+    }
+}
+/* T-1122 RETURN by reference: this game's sleep save wrote the world record of a squad taken awake here (detour_deactivate, right after the
+   write; main thread) - noted on its row, so the put-away's RETURN names that write (AwakeRowTick). Cleared each time it is seen awake here. */
+void AwakeSleepWrote(void* platoon, const std::string& worldId, long long writtenAt, int sent)
+{
+    if (platoon == 0 || g_borrow.empty()) return;
+    for (std::map<std::string, BorrowRow>::iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+        if (it->second.awakeHand != 0 && it->second.ended == 0 && it->second.platoon == platoon)
+        {   /* review fold 2: a write not sent is never named (raidsq::AwakeSleepNote) */
+            raidsq::AwakeSleepNote(sent, writtenAt, &it->second.sleepWroteAt, &it->second.sleepUnsentAt); it->second.sleepWroteId = worldId;
+        }
+}
+/* the tick, once per awake row: 1 = its lend ended here (the row goes after the walk). key: the row's key (a RETURN is kept under it,
+   said again to the owner's status ask) */
+static int AwakeRowTick(const std::string& key, BorrowRow& r, unsigned long now)
+{
+    int awakeNow = 0;
+    const int listed = AwakeHereListed(r.hereFaction, r.hereId, r.platoon, &awakeNow);
+    if (raidsq::GoneFor(StoreRosterSlotInWorld(r.lender) != 0 ? 1 : 0, &r.goneSeen, &r.goneSince, now) != 0)
+    {
+        BorrowCampEnd(r, raidsq::kCeLinkLost, -1, listed, "the sender left the world");
+        ::InterlockedIncrement64(&g_awakeEnded);
+        LendLine("[RAIDLEND] awake lend ended here: id=" + r.id + " serial=" + N((long long)r.serial) + " leader=" + N((long long)r.leaderUid) + " - the sender left the world; the squad runs on without a raid"
+                 + (r.retPending != 0 ? std::string(" (its RETURN waiting for this game's own copy to be removed is not sent; the copy stays)") : std::string()));
+        return 1;
+    }
+    if (r.retPending != 0) return raidsq::AwakeReturnDue(1, raidsq::LendAgeMs(now, r.retAt)) != 0 ? 2 : 0;   /* T-1122 review fold 3: its RETURN waits for this game's own copy to be removed first (AwakeReturnFinish, after the walk) */
+    if (raidsq::AwakeCampWatched(listed, r.campMade, r.campEnded) != 0) BorrowCampWatch(r, r.platoon, awakeNow != 0 ? 1 : 0);   /* fold 2 (re-check LOW): asleep too (living -1) - an engine end in the put-away's settle is said with its handler, no RETURN */
+    if (r.campEnded != 0)
+    {
+        ::InterlockedIncrement64(&g_awakeEnded);
+        LendLine("[RAIDLEND] awake lend ended here: id=" + r.id + " serial=" + N((long long)r.serial) + " leader=" + N((long long)r.leaderUid) + " - its campaign here ended (the engine's own end; RAID_END said)");
+        return 1;
+    }
+    /* T-1122 review fold 3: judged by the squad - its platoon still listed here and its people run here - never by the key member alone
+       (a key member that leaves the squad, or is handed on alone, leaves the raid with the squad) */
+    int runHere = 0, relOpen = 0, living = -1;
+    if (listed != 0 && awakeNow != 0)
+    {
+        r.asleepAt = 0; r.sleepWroteAt = 0; r.sleepWroteId.clear(); r.sleepUnsentAt = 0;   /* T-1122 RETURN by reference: seen awake - an earlier sleep write is not this put-away's */
+        Pod q; std::memset(&q, 0, sizeof(q));
+        if (ReadPod(r.platoon, &q) && Plaus(q.members) && q.activeChars > 0)
+        {
+            std::vector<unsigned int> u;
+            for (int k = 0; k < q.activeChars && k < 64; ++k)
+            {
+                const unsigned int uid = Plaus(q.members[k]) ? FindSpawnedUid(q.members[k]) : 0u;
+                if (uid != 0 && net::IsUidMine(uid)) u.push_back(uid);
+            }
+            runHere = u.empty() ? 0 : 1;
+            if (!u.empty()) r.uids.swap(u);
+        }
+        living = LivingMembersPod(r.platoon);
+    }
+    else if (listed != 0)
+    {   /* asleep here: its people (read while awake) still run here, or are in an open RELEASE offer - that road decides first */
+        if (r.asleepAt == 0) r.asleepAt = now != 0 ? now : 1;
+        for (size_t k = 0; k < r.uids.size(); ++k) { if (net::IsUidMine(r.uids[k])) runHere = 1; if (HandoffReleaseHolds(r.uids[k]) != 0) relOpen = 1; }
+    }
+    const int d = raidsq::AwakeHandCheck((listed != 0 && awakeNow != 0) ? 1 : 0, (listed != 0 && awakeNow == 0) ? 1 : 0, runHere, relOpen, r.asleepAt != 0 ? raidsq::LendAgeMs(now, r.asleepAt) : 0UL, living);
+    if (d == raidsq::kAhKeep) return 0;
+    const char* how = d == raidsq::kAhPutAway ? "its engine put it away here and no other game took it (out of sight)" : d == raidsq::kAhGone ? "its squad is gone here"
+                    : d == raidsq::kAhAllDead ? "no living member" : "handed back (or on) by the ordinary hand-over";
+    /* T-1122 review fold 4 (owner 1527) / T-1122 RETURN by reference (2026-11-06, design (a)): out of sight - the raid goes back to its owner
+       by RETURN naming the world record this game's sleep save wrote at the put-away (world id, writtenAt, writer slot, spot - read live
+       from this game's own record entry now, raidsq::ReturnRefWritten). The record reaches the owner by the store road (no 64 KB limit); the
+       squad's bytes no longer ride the RETURN (run T2103: 106 KB, over the game-to-game road's 64 KB, so no RETURN went). The owner loads that
+       record into its own copy and travels it on in its campaign. The save wrote none: RAID_END, with the reason. */
+    std::vector<char> ret; float bx = 0.0f, bz = 0.0f; int written = 0; std::string notWhy; raidsq::LendMsg a;
+    if (d == raidsq::kAhPutAway)
+    {
+        const std::string wid = !r.sleepWroteId.empty() ? r.sleepWroteId : WorldIdOf(r.platoon);
+        std::map<std::string, Record>::const_iterator rr = wid.empty() ? g_records.end() : g_records.find(wid);
+        const int held = rr != g_records.end() ? 1 : 0;
+        const int w = raidsq::ReturnRefWritten(r.sleepWroteAt > 0 ? 1 : 0, r.sleepWroteAt, held, held != 0 ? rr->second.writtenAt : 0LL, held != 0 ? rr->second.gone : 0,
+                                               (held != 0 && !rr->second.file.empty()) ? 1 : 0, (held != 0 && g_mySlot >= 0 && rr->second.owner == g_mySlot) ? 1 : 0);
+        if (w == raidsq::kRetRefWritten)
+        {
+            a.kind = raidsq::kLendKindReturn; a.serial = r.serial; a.lender = r.lender; a.id = r.id; a.byRef = 1; a.recId = wid; a.recAt = rr->second.writtenAt; a.recWriter = rr->second.owner;
+            a.x = rr->second.x; a.y = rr->second.y; a.z = rr->second.z;
+            bx = a.x; bz = a.z;
+            if (raidsq::EncodeLend(a, &ret) == 1) written = 1; else notWhy = "its RETURN naming world record " + wid + " could not be encoded";
+        }
+        else
+        {
+            const std::string w0 = wid.empty() ? std::string("its world id (none read)") : wid;
+            notWhy = (w == raidsq::kRetRefNoWrite && r.sleepUnsentAt > 0) ? "this game's sleep save wrote world record " + w0 + " at the put-away (writtenAt " + N(r.sleepUnsentAt)
+                                                                              + ") but could not send it to the world server (sent=0 on its [STORE] SLEEP line), so the owner might never get it"
+                   : w == raidsq::kRetRefNoWrite ? "this game's sleep save wrote no world record of " + w0 + " at the put-away (refused or failed - its [STORE] SLEEP line says why)"
+                   : w == raidsq::kRetRefNoRecord ? "the world record of " + w0 + " written at the put-away (writtenAt " + N(r.sleepWroteAt) + ") is no longer held here"
+                   : w == raidsq::kRetRefReplaced ? "the world record of " + w0 + " written at the put-away (writtenAt " + N(r.sleepWroteAt) + ") was replaced here by writtenAt " + N(rr->second.writtenAt) + " (writer slot " + N((long long)rr->second.owner) + ")"
+                   : w == raidsq::kRetRefNotMine ? "the world record of " + w0 + " held here was written by slot " + N((long long)rr->second.owner) + ", not this game"
+                   : "the world record of " + w0 + " written at the put-away is marked gone or names no file here";
+        }
+        if (written == 0) ::InterlockedIncrement64(&g_retRefNotWritten);
+        if (written == 0 && w == raidsq::kRetRefNoWrite && r.sleepUnsentAt > 0) ::InterlockedIncrement64(&g_retRefUnsent);
+    }
+    int say = raidsq::AwakeEndSays(d, r.forwardTo >= 0 ? 1 : 0, written);
+    if (say == raidsq::kAwSayReturn && raidsq::AwakeHereRemoves(say, (listed != 0 && awakeNow == 0) ? 1 : 0) == 0)
+    {   /* T-1122 review fold 3: no RETURN without this game's own copy removed first */
+        say = raidsq::kAwSayRaidEnd; notWhy = "this game's own copy is not asleep here under its id, so it cannot be removed before a RETURN";
+        ::InterlockedIncrement64(&g_retRefNotAsleep);   /* T-1122 re-check: the REPORT's raidReturnRef notAsleep */
+    }
+    BorrowCampEnd(r, raidsq::AwakeHandEv(d), living, listed, how, say == raidsq::kAwSayRaidEnd ? 1 : 0, &r.retOut, &r.retPhase, &r.retEnded, &r.retByte);
+    ::InterlockedIncrement64(&g_awakeEnded);
+    const size_t retN = ret.size();
+    if (say == raidsq::kAwSayReturn)
+    {   /* T-1122 review fold 3: this game's own copy goes FIRST - the RETURN waits on the row (still held: the owner's status ask hears TAKEN
+           meanwhile) and AwakeReturnFinish sends it once that copy is removed; a copy that cannot be removed then ends by RAID_END (retOut) */
+        r.retPending = 1; r.retAt = now != 0 ? now : 1; r.retBody.swap(ret); r.retRecId = a.recId; r.retRecAt = a.recAt;
+    }
+    else if (say == raidsq::kAwSayNothing)
+    {
+        ::InterlockedIncrement64(&g_awakeQuietEnd);
+        if (g_awakeOnwardAt.size() >= kBorrowEndedCap) g_awakeOnwardAt.erase(g_awakeOnwardAt.begin());
+        g_awakeOnwardAt[key] = now != 0 ? now : 1;   /* T-1122 re-check fold 6: the owner's status ask is not answered UNKNOWN for a while */
+    }
+    LendLine("[RAIDLEND] awake lend ended here: id=" + r.id + " serial=" + N((long long)r.serial) + " leader=" + N((long long)r.leaderUid) + " - " + how + " (living " + N((long long)living) + "); taken out of its campaign here, "
+             + (say == raidsq::kAwSayReturn ? "RETURN to slot " + N((long long)r.lender) + " naming world record " + a.recId + " writtenAt=" + N(a.recAt) + " writer slot " + N((long long)a.recWriter)
+                                              + " at " + F1(bx) + "," + F1(bz) + " (" + N((long long)retN) + " bytes, no squad bytes) waits for this game's own sleeping copy to be removed first (in "
+                                              + N((long long)(raidsq::kLendReturnSweepMs / 1000UL)) + " s; no gone mark - its world record stays), then goes; written by this game's sleep save at the put-away,"
+                                              + " the record reaches the owner by the store road and the raid runs on there off-screen"
+                : say == raidsq::kAwSayNothing ? "nothing said - its raid went on with it to slot " + N((long long)r.forwardTo) + " (AWAKE sent onward)"
+                : "RAID_END said to slot " + N((long long)r.lender) + (d == raidsq::kAhPutAway ? " (not given back by RETURN: " + notWhy + "; the owner keeps its campaign and its own copy)" : std::string())));
+    return say == raidsq::kAwSayReturn ? 0 : 1;   /* review fold 3: a RETURN keeps the row until its own copy is removed (AwakeReturnFinish) */
+}
+/* ---- the arrival (main thread) ---- */
+/* T-1122 review folds: an answer the lender's row ignored (LendAnswer kActNone). KEEPOWN for the serial whose RETURN it applied, its note
+   still waiting for that RETURN's record: the world server refused that write there - the note goes, the squad keeps its own people
+   (raidsq::KeepOwnAfterReturn). A TAKEN or RETURN naming a serial not open here: WITHDRAWN to its sender (raidsq::LendWithdrawSays) - this
+   game runs its own squad, so that copy must go. MAIN THREAD */
+static void LendIgnoredAnswer(void* platoon, const LendRow& r, const raidsq::LendMsg& m, int from)
+{
+    if (m.kind == raidsq::kLendKindKeepOwn)
+    {
+        std::map<std::string, ReturnWait>::iterator nw = g_returnWait.begin();
+        for (; nw != g_returnWait.end(); ++nw) if (nw->second.platoon == platoon && nw->second.serial == m.serial) break;
+        if (raidsq::KeepOwnAfterReturn(r.state, r.applied, m.serial, nw != g_returnWait.end() ? 1 : 0) == 0) return;
+        const std::string wid = nw->first; const long long stamp = nw->second.stamp;
+        g_returnWait.erase(nw);
+        ::InterlockedIncrement64(&g_lhKeepOwnNoteDropped);
+        LendLine("[RAIDLEND] KEEPOWN after its RETURN: id=" + r.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)from) + " - the world server refused that game's put-away write of world record "
+                 + wid + " writtenAt=" + N(stamp) + ", so it will not come: the note goes and this game's squad keeps its own people (it may be lent again)");
+        return;
+    }
+    if (raidsq::LendWithdrawSays(1, r.awake, r.state, r.serial, r.applied, m.kind, m.serial) == 0) return;   /* re-check fold 3: no memory of a WITHDRAWN said - each arrival is answered, so one lost is said again */
+    raidsq::LendMsg w; w.kind = raidsq::kLendKindWithdrawn; w.serial = m.serial; w.lender = g_mySlot; w.id = m.id;
+    const int sent = LendSend(w, from, 0);
+    ::InterlockedIncrement64(&g_lhWithdrawnSent);
+    LendLine("[RAIDLEND] WITHDRAWN sent: id=" + m.id + " serial=" + N((long long)m.serial) + " to slot " + N((long long)from) + " - its " + std::string(m.kind == raidsq::kLendKindTaken ? "TAKEN" : "RETURN")
+             + " names a serial this game has not open (row state " + N((long long)r.state) + ", serial " + N((long long)r.serial) + "): this game runs its own squad, that copy is removed there sent=" + N((long long)sent));
+}
+void RaidLendApplyImpl(const char* p, size_t n, unsigned int fromPeer)
+{
+    if (!OnMainThread()) { ::InterlockedIncrement64(&g_lendOffThread); return; }   /* the asker asks again / the status ask re-says an ending */
+    raidsq::LendMsg m;
+    if (raidsq::DecodeLend(p, n, &m) == 0) { if (::InterlockedIncrement64(&g_lendMalformed) <= 5) ErrorLog("[net] malformed RAID_LEND (" + N((long long)n) + " bytes) - REFUSED"); return; }
+    const int from = net::PlayerSlotOfKey(fromPeer);
+    if (m.kind == raidsq::kLendKindAwake)
+    {   /* T-1122 awake hand: from a game in the world (T-1122 review fold 2: sent onward by the game that held the squad, it names the raid's owner, not its sender) */
+        if (from < 0 || m.lender < 0) { ::InterlockedIncrement64(&g_lendStale); return; }
+        AwakeBlockArrive(m, from);
+        return;
+    }
+    if (m.kind == raidsq::kLendKindLend)
+    {
+        if (from < 0 || m.lender != from) { ::InterlockedIncrement64(&g_lendStale); return; }   /* a lend is taken only from the slot it names as its lender */
+        BorrowOnLend(m, from);
+        return;
+    }
+    if (m.kind == raidsq::kLendKindWithdrawn)
+    {   /* T-1122 review folds: from the lender it names - it has no lend open under that serial; this game, its borrower, removes its copy */
+        if (from < 0 || m.lender != from) { ::InterlockedIncrement64(&g_lendStale); return; }
+        BorrowOnWithdrawn(m, from);
+        return;
+    }
+    if (m.lender != g_mySlot) { ::InterlockedIncrement64(&g_lendStale); return; }   /* an answer about another game's lend */
+    void* platoon = 0; LendRow r;
+    OwnRaidLockEnter();
+    for (std::map<void*, LendRow>::const_iterator it = g_lend.begin(); it != g_lend.end(); ++it)
+        if (it->second.id == m.id && it->second.borrower == from && it->second.state != raidsq::kLendIdle) { platoon = it->first; r = it->second; break; }
+    if (platoon == 0)   /* a returned or ended row: matched by its id alone, so a duplicate is seen as stale */
+        for (std::map<void*, LendRow>::const_iterator it = g_lend.begin(); it != g_lend.end(); ++it) if (it->second.id == m.id) { platoon = it->first; r = it->second; break; }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    if (platoon == 0) { ::InterlockedIncrement64(&g_lendStale); return; }
+    if (raidsq::AwakeBorrowerMoves(r.awake, r.state, m.kind, m.serial == r.serial ? 1 : 0, from, r.borrower) != 0)
+    {   /* T-1122 review fold 2: the squad was handed on with its raid - the game that holds it now said TAKEN; status asks and endings from there */
+        OwnRaidLockEnter(); { std::map<void*, LendRow>::iterator mv = g_lend.find(platoon); if (mv != g_lend.end()) mv->second.borrower = from; } ::LeaveCriticalSection(&g_ownRaidLock);
+        ::InterlockedIncrement64(&g_awakeMoved);
+        LendLine("[RAIDLEND] awake lend moved: id=" + r.id + " serial=" + N((long long)r.serial) + " slot " + N((long long)r.borrower) + " -> slot " + N((long long)from) + " - the squad was handed on with its raid");
+        r.borrower = from;
+    }
+    const int act = raidsq::LendAnswer(r.state, m.kind, (m.serial == r.serial && from == r.borrower) ? 1 : 0, LinkUp() ? 1 : 0);
+    if (act == raidsq::kActNone) { ::InterlockedIncrement64(&g_lendStale); LendIgnoredAnswer(platoon, r, m, from); return; }   /* review folds: WITHDRAWN, or KEEPOWN after a RETURN */
+    if (m.kind == raidsq::kLendKindKeepOwn) ::InterlockedIncrement64(&g_lrKeepOwn);
+    LendAct(platoon, act, &m, m.kind == raidsq::kLendKindRefused ? "refused" : (m.kind == raidsq::kLendKindUnknown ? "the borrower knows nothing of it (no copy there)"
+                              : (m.kind == raidsq::kLendKindKeepOwn ? "KEEPOWN - the borrower could not write its copy's state as the world record at its put-away; this game's own squad resumes as it lent it" : "answered")));
+}
+/* T-1122 redesign (b): RAID_END - the borrower's raid campaign for a lent copy ended for it (raidsq::RaidEndOf). The lender applies it
+   to its row (raidsq::RaidEndApply): defeated - its own squad is removed (the DIED road, LendAct kActRemove: the engine's own removal,
+   after which its campaign counts the squad gone); arrived / retreated / returned - noted on the row (a returned copy's bytes come by
+   RETURN). Taken only as the lender of its key, from that lend's borrower, for the open serial. MAIN THREAD. */
+void RaidEndApplyImpl(const char* p, size_t n, unsigned int fromPeer)
+{
+    if (!OnMainThread()) { ::InterlockedIncrement64(&g_lendOffThread); return; }
+    raidsq::RaidEndMsg m;
+    if (raidsq::DecodeRaidEnd(p, n, &m) == 0) { if (::InterlockedIncrement64(&g_lendMalformed) <= 5) ErrorLog("[net] malformed RAID_END (" + N((long long)n) + " bytes) - REFUSED"); return; }
+    ::InterlockedIncrement64(&g_raidEndIn);
+    const int from = net::PlayerSlotOfKey(fromPeer);
+    void* platoon = 0; LendRow r;
+    if (from >= 0 && m.lender == g_mySlot)
+    {
+        OwnRaidLockEnter();
+        for (std::map<void*, LendRow>::const_iterator it = g_lend.begin(); it != g_lend.end(); ++it)
+            if (it->second.id == m.id && it->second.borrower == from && it->second.serial == m.serial) { platoon = it->first; r = it->second; break; }
+        ::LeaveCriticalSection(&g_ownRaidLock);
+    }
+    const int act = platoon != 0 ? (r.awake != 0 ? raidsq::AwakeEndApply(r.state, 1, m.outcome, m.phase) : raidsq::RaidEndApply(r.state, 1, m.outcome, m.phase)) : raidsq::kEndActNone;   /* T-1122 awake hand */
+    if (act == raidsq::kEndActNone)
+    {
+        ::InterlockedIncrement64(&g_raidEndStale);
+        LendLine("[RAIDLEND] RAID_END stale: id=" + m.id + " serial=" + N((long long)m.serial) + " from slot " + N((long long)from) + " outcome=" + std::string(raidsq::RaidEndWord(m.outcome, m.phase))
+                 + (platoon == 0 ? std::string(" - no open lend of this game under that key") : " - the lend is not taken there now (state " + N((long long)r.state) + ")"));
+        return;
+    }
+    /* T-1122 attempt 3: the borrower's ending handler is run here once per serial - only for this row's first RAID_END that ends the raid
+       (r is the row before this message: no earlier ending one) */
+    const int endedBy = raidsq::LenderEndedByOnce(r.endOutcome, r.endPhase, m.endedBy);
+    OwnRaidLockEnter();
+    { std::map<void*, LendRow>::iterator it = g_lend.find(platoon); if (it != g_lend.end()) { it->second.endOutcome = m.outcome; it->second.endPhase = m.phase; } }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    LendLine("[RAIDLEND] RAID_END from slot " + N((long long)from) + ": id=" + m.id + " serial=" + N((long long)m.serial) + " outcome=" + std::string(raidsq::RaidEndWord(m.outcome, m.phase))
+             + " phase=" + N((long long)m.phase) + " endedBy='" + raidsq::EndedByWord(m.endedBy) + "' defeatByte=" + N((long long)m.defeatByte) + (act == raidsq::kEndActRemove ? std::string(" - the raid lost it: this game's own squad is removed (the DIED road)")
+                                                  : act == raidsq::kEndActForget ? std::string(" - an awake lend handed back, handed on or put away there: its row goes; the squad stays in this game's campaign")
+                                                  : act == raidsq::kEndActLeave ? std::string(" - the raid is over there: this game's own squad leaves its campaign")
+                                                  : std::string(" - noted; the squad stays lent there, in its campaign")));
+    int awakeListed = 0;
+    if (r.awake != 0) { int aw = 0; awakeListed = AwakeHereListed(r.awakeFaction, r.id, platoon, &aw); }   /* T-1122 awake hand: its squad still here under its id before it is read */
+    /* T-1122 attempt 3 (fold 1: raidsq::LenderLeavesCamp): the raid over there - the squad leaves its campaign; defeated by the engine's ending
+       there (endedBy set) - it leaves and that campaign's handler runs here BEFORE the removal; defeated with no handler there (all dead, the
+       borrower ended its own copy): the removal only, as before - no outcome the engine reached exists to run */
+    const int squadHere = (r.awake == 0 || awakeListed != 0) ? 1 : 0;
+    if (raidsq::LenderLeavesCamp(act, endedBy, squadHere) != 0) LenderCampLeave(platoon, r.id, m.serial, m.outcome, m.phase, endedBy, m.defeatByte);
+    else if (act == raidsq::kEndActRemove) LendLine("[RAIDLEND] RAID_END defeated: id=" + m.id + " serial=" + N((long long)m.serial) + " - " + (endedBy != raidsq::kEndByNone
+                    ? std::string("its handler NOT run here (the awake squad is no longer listed here)") : std::string("no ending handler here (none ran on the borrower's copy)")) + "; the removal only");
+    if (r.awake != 0 && (act == raidsq::kEndActLeave || act == raidsq::kEndActForget))
+    {   /* T-1122 awake hand: the raid there is over for this squad - its row goes */
+        AwakeLendDrop(platoon, r);   /* T-1122 review fold 4: its own raid note goes with it */
+        ::InterlockedIncrement64(act == raidsq::kEndActLeave ? &g_awakeLeft : &g_awakeForgot);
+    }
+    if (act == raidsq::kEndActRemove) { ::InterlockedIncrement64(&g_raidEndRemoved); LendAct(platoon, raidsq::kActRemove, 0, "the borrower's raid campaign: defeated"); }
+}
+/* ---- the main-thread tick (beside OwnRaidSweepTick) ---- */
+/* T-1122 re-check fold 1 / review fold 3: a put-away's RETURN waiting on its row (AwakeRowTick, retPending), after raidsq::kLendReturnSweepMs and
+   AFTER the row walk: this game's own copy - still asleep here under its id, the named record still this game's put-away write - is removed
+   FIRST, through Faction::removeSquad under the admin flag (the lend road's LentSavedCopyRemove road: no gone mark, no delete, no write - the
+   named world record stays at the put-away spot); its world id is not placed from that record again in this world (g_notePlaceFailed,
+   cleared at the world teardown). Only a removal that took (the copy out of its faction's sleeping list) sends the RETURN (kept to say again
+   at the owner's status ask). A copy that woke here first or went, a record no longer the named one, or a removal that did not take: the
+   RAID_END its campaign's end read (retOut), with that reason - the copy stays this game's. The row goes either way. MAIN THREAD. */
+static void AwakeReturnFinish(const std::string& key)
+{
+    std::map<std::string, BorrowRow>::iterator it = g_borrow.find(key);
+    if (it == g_borrow.end() || it->second.retPending == 0) return;
+    const BorrowRow r = it->second;
+    Pod q; std::memset(&q, 0, sizeof(q));
+    const int asleep = (Plaus(r.hereFaction) && ReadPod(r.platoon, &q) && !Plaus(q.active) && FindSleepingPlatoonImpl((::Faction*)r.hereFaction, r.hereId) == r.platoon) ? 1 : 0;
+    std::map<std::string, Record>::const_iterator rr = g_records.find(r.retRecId);
+    const int held = rr != g_records.end() ? 1 : 0;
+    const int ref = raidsq::ReturnRefWritten(1, r.retRecAt, held, held != 0 ? rr->second.writtenAt : 0LL, held != 0 ? rr->second.gone : 0, (held != 0 && !rr->second.file.empty()) ? 1 : 0,
+                                             (held != 0 && g_mySlot >= 0 && rr->second.owner == g_mySlot) ? 1 : 0);
+    int removed = 0; std::string wid = r.hereId;
+    if (raidsq::AwakeReturnFinish(asleep, ref, 1) == raidsq::kArfReturn)
+    {
+        { std::map<void*, std::string>::const_iterator b = g_bind.find(r.platoon); if (b != g_bind.end() && !b->second.empty()) wid = b->second; }
+        AdminDestroyBeginImpl();
+        detour_destroyPlatoon(r.hereFaction, r.platoon);
+        AdminDestroyEndImpl();
+        removed = InSleepingListImpl((::Faction*)r.hereFaction, r.platoon) != 1 ? 1 : 0;   /* done: out of its faction's sleeping list (the list is walked, the freed squad is not read) */
+        if (removed != 0 && g_notePlaceFailed.insert(wid).second) { ++g_notePlaceFailedN; ArClaimFailNote(wid); }
+        /* no release here: the put-away was the ordinary sleep road, whose release followed its sleep write (detour_deactivate's SwPutAway;
+           T2116, Inferred: releaseTaken 88 -> 91 after the holder's write at 20:27:49 - a count of every squad's releases) - the world server already holds the squad released */
+    }
+    const int fin = raidsq::AwakeReturnFinish(asleep, ref, removed);
+    { std::map<std::string, BorrowRow>::iterator e = g_borrow.find(key); if (e != g_borrow.end()) g_borrow.erase(e); }
+    if (fin == raidsq::kArfReturn)
+    {
+        BorrowEnd(key, r.retBody);   /* said again to the owner's status ask */
+        const int sent = net::SendRaidLend(r.retBody, r.lender) ? 1 : 0;
+        ::InterlockedIncrement64(sent != 0 ? &g_awakeReturnSent : &g_awakeReturnFailed);   /* T-1122 re-check fold 7: only a send that went counts as sent (a failed one is said again at the owner's status ask) */
+        ::InterlockedIncrement64(&g_awakeCopyRemoved);
+        LendLine("[RAIDLEND] own copy removed, then RETURN sent: id=" + r.hereId + " worldId=" + wid + " platoon=" + P(r.platoon) + " - RETURN to slot " + N((long long)r.lender) + " naming world record "
+                 + r.retRecId + " writtenAt=" + N(r.retRecAt) + " (" + N((long long)r.retBody.size()) + " bytes) sent=" + N((long long)sent)
+                 + " - its raid and people went back to their owner; no gone mark (its world record stays), not placed from it again in this world");
+        return;
+    }
+    ::InterlockedIncrement64(&g_awakeCopyKept);
+    const std::string why = fin == raidsq::kArfNotAsleep ? std::string("this game's own copy is no longer asleep here under its id (it woke here first, or went)")
+                          : fin == raidsq::kArfRecord ? "world record " + r.retRecId + " writtenAt=" + N(r.retRecAt) + " is no longer this game's put-away write here (" + N((long long)ref) + ")"
+                          : std::string("this game's own copy is still in its faction's sleeping list after its removal");
+    if (r.retOut != raidsq::kEndNone) BorrowCampSay(r, r.retOut, r.retPhase, r.retEnded, r.retByte, why.c_str());
+    LendLine("[RAIDLEND] own copy NOT removed: id=" + r.hereId + " serial=" + N((long long)r.serial) + " platoon=" + P(r.platoon) + " - " + why + "; its RETURN is NOT sent"
+             + (r.retOut != raidsq::kEndNone ? " - RAID_END said to slot " + N((long long)r.lender) : std::string(" - no RAID_END to say (no campaign was made here)"))
+             + "; the owner keeps its campaign and its own copy, this game keeps its copy");
+}
+static int LentSavedCopyRemove(::Faction* f, void* p);   /* below: the saved-copy road (put to sleep when awake, then Faction::removeSquad) */
+void RaidLendTick()
+{
+    if (!OnMainThread()) return;
+    const unsigned long now = ::GetTickCount();
+    /* the lender: lends wanted, then each open lend's silence and its borrower's presence */
+    std::vector<void*> want;
+    std::vector<std::pair<void*, LendRow> > open;
+    std::vector<std::pair<void*, LendRow> > awakeRows;   /* T-1122 awake hand */
+    OwnRaidLockEnter();
+    for (std::set<void*>::const_iterator w = g_lendWant.begin(); w != g_lendWant.end(); ++w) want.push_back(*w);
+    g_lendWant.clear();
+    for (std::map<void*, LendRow>::iterator it = g_lend.begin(); it != g_lend.end(); )
+    {
+        if (it->second.awake != 0) awakeRows.push_back(*it);   /* T-1122 awake hand: an awake squad's lend (not an own raid row) - its squad checked below, outside the lock */
+        else if (!g_ownRaid.Has(it->first)) { g_lend.erase(it++); continue; }   /* the squad woke, was freed or dropped: its lend row goes with it */
+        if (it->second.state != raidsq::kLendIdle) open.push_back(*it);
+        ++it;
+    }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    for (size_t i = 0; i < want.size(); ++i) LendStartOne(want[i]);
+    for (size_t i = 0; i < awakeRows.size(); ++i)
+    {   /* T-1122 awake hand: a row whose squad is no longer listed here under its id goes (its engine removed this game's copy) */
+        int aw = 0;
+        if (AwakeHereListed(awakeRows[i].second.awakeFaction, awakeRows[i].second.id, awakeRows[i].first, &aw) != 0)
+        {   /* T-1122 review fold 4 / LOW 7: asleep here while another game runs it - noted as this game's own raid squad, so its off-screen
+               update holds it frozen while the lend is TAKEN (OwnRaidUpdate: no travel, no wake - on the authority too, before its blanket
+               run) and a RETURN loads it and travels it on (LendAct kActApplyReturn) */
+            if (aw == 0 && awakeRows[i].second.state == raidsq::kLendTaken && OwnRaidHas(awakeRows[i].first) == 0 && OwnRaidNoteImpl(awakeRows[i].first, kOwnRaidByAwake) == 1)
+            {
+                OwnRaidLockEnter(); { std::map<void*, LendRow>::iterator nt = g_lend.find(awakeRows[i].first); if (nt != g_lend.end()) nt->second.awakeNoted = 1; } ::LeaveCriticalSection(&g_ownRaidLock);
+                ::InterlockedIncrement64(&g_awakeFrozen);
+            }
+            continue;
+        }
+        AwakeLendDrop(awakeRows[i].first, awakeRows[i].second);
+        ::InterlockedIncrement64(&g_awakeForgot);
+        LendLine("[RAIDLEND] awake lend forgotten: id=" + awakeRows[i].second.id + " serial=" + N((long long)awakeRows[i].second.serial) + " slot " + N((long long)awakeRows[i].second.borrower)
+                 + " - its squad is no longer listed here under its id");
+    }
+    for (size_t i = 0; i < open.size(); ++i)
+    {
+        const LendRow& r = open[i].second;
+        if (raidsq::LendAskRefused(r.state, r.recId.empty() ? 0 : 1, g_swRefused.count(r.recId) != 0 ? 1 : 0) != 0)
+        {   /* T-1122 lend by reference: the world server refused this game's write of the record the LEND names - no copy can be built from it */
+            ::InterlockedIncrement64(&g_lrAskRefused);
+            LendAct(open[i].first, raidsq::kActResume, 0, "the world server refused this game's write of the world record the LEND names (another game is its registered writer)");
+            continue;
+        }
+        const int there = StoreRosterSlotInWorld(r.borrower) != 0 ? 1 : 0;
+        int gone = 0;   /* T-1122 review fold: missing for raidsq::kLendGoneMs - a roster blip leaves the lend open (its RETURN / DIED still applies) */
+        OwnRaidLockEnter();
+        { std::map<void*, LendRow>::iterator g = g_lend.find(open[i].first); if (g != g_lend.end()) gone = raidsq::GoneFor(there, &g->second.goneSeen, &g->second.goneSince, now); }
+        ::LeaveCriticalSection(&g_ownRaidLock);
+        int ev = -1;
+        if (gone != 0) ev = raidsq::kEvPeerGone;
+        else if (raidsq::LendAgeMs(now, r.askedAt) > (r.state == raidsq::kLendTaken ? raidsq::kLendStatusGapMs : raidsq::kLendAskGapMs)) ev = raidsq::kEvSilent;
+        if (ev < 0) continue;
+        const int act = raidsq::LendAnswer(r.state, ev, 1, LinkUp() ? 1 : 0);
+        if (act != raidsq::kActNone) LendAct(open[i].first, act, 0, ev == raidsq::kEvPeerGone ? "the borrower left the world" : "silent");
+    }
+    /* T-1122 lend by reference: the LENDs waiting here for their world records (raidsq::LendRecWaitOn) - built once the record is here, after
+       BorrowDecide is asked again (live, at the build); dropped when the lender left; refused kRefNoRecord after raidsq::kLendRecordWaitMs */
+    for (std::map<std::string, LendRecWait>::iterator lw = g_lendRecWait.begin(); lw != g_lendRecWait.end(); )
+    {
+        const LendRecWait w = lw->second; const std::string wkey = lw->first;
+        std::map<std::string, Record>::const_iterator rr = g_records.find(w.m.recId);
+        const int held = rr != g_records.end() ? raidsq::ReturnRefHeld(1, rr->second.writtenAt, rr->second.gone, rr->second.file.empty() ? 0 : 1, w.m.recAt) : 0;
+        const int wa = raidsq::LendRecWaitOn(held, StoreRosterSlotInWorld(w.from) != 0 ? 1 : 0, raidsq::LendAgeMs(now, w.at));
+        if (wa == raidsq::kLrKeep) { ++lw; continue; }
+        g_lendRecWait.erase(lw++);
+        if (wa == raidsq::kLrGone)
+        {
+            ::InterlockedIncrement64(&g_lrLenderGone);
+            LendLine("[RAIDLEND] lend wait dropped: id=" + w.m.id + " serial=" + N((long long)w.m.serial) + " - its lender (slot " + N((long long)w.from) + ") left the world before world record " + w.m.recId + " came");
+            continue;
+        }
+        if (wa == raidsq::kLrTimeout)
+        {
+            ::InterlockedIncrement64(&g_lrTimedOut); ::InterlockedIncrement64(&g_borrowRefused);
+            BorrowSay(w.m, raidsq::kLendKindRefused, raidsq::kRefNoRecord, w.from);
+            LendLine("[RAIDLEND] refused: id=" + w.m.id + " serial=" + N((long long)w.m.serial) + " from slot " + N((long long)w.from) + " why=8 - world record " + w.m.recId + " writtenAt=" + N(w.m.recAt)
+                     + " did not come in " + N((long long)(raidsq::kLendRecordWaitMs / 1000UL)) + " s (held here: " + (rr != g_records.end() ? "writtenAt " + N(rr->second.writtenAt) : std::string("none")) + "); its lender resumes its own squad");
+            continue;
+        }
+        const std::map<std::string, BorrowRow>::const_iterator bact = g_borrow.find(wkey);
+        const std::map<std::string, std::vector<char> >::const_iterator bend = g_borrowEnded.find(wkey);
+        const int wReady = (g_on && g_dirReady && Plaus(coop::GameWorldPtr()) && !EngineWritesBlocked()) ? 1 : 0;
+        const int wHolds = MayInventHereTS(SectorOf(w.m.x, w.m.z)) == 1 ? 1 : 0;
+        const raidsq::WakeBox wwb = LendWakeBoxHere(w.m.x, w.m.z);
+        const int wIn = wwb.ok != 1 ? -1 : raidsq::WakeBoxHas(wwb, w.m.x, w.m.z);
+        int wWhy = 0;
+        const int wd = raidsq::BorrowDecide(w.m.full, (bact != g_borrow.end() && (bact->second.ended == 0 || bact->second.retPending != 0)) ? 1 : 0, bend != g_borrowEnded.end() ? 1 : 0, wReady, wHolds, wIn, g_borrow.size() >= kBorrowCap ? 1 : 0, &wWhy);
+        if (wd == raidsq::kBorrowBuild) { BorrowBuild(w.m, w.from, rr->second, w.arrived != 0 ? "at its arrival by the store road" : "found here at the tick", &g_lrBuiltAtRecv); continue; }
+        ::InterlockedIncrement64(&g_lrRecvRefused);
+        if (wd == raidsq::kBorrowSayTaken) { BorrowSay(w.m, raidsq::kLendKindTaken, 0, w.from); continue; }
+        if (wd == raidsq::kBorrowSayEnd) { if (!bend->second.empty()) net::SendRaidLend(bend->second, w.from); continue; }
+        ::InterlockedIncrement64(&g_borrowRefused); if (wWhy == raidsq::kRefOutsideWake) ::InterlockedIncrement64(&g_wakeRefused);
+        BorrowSay(w.m, raidsq::kLendKindRefused, wWhy, w.from, wWhy == raidsq::kRefOutsideWake ? &wwb : 0);
+        LendLine("[RAIDLEND] refused at its record's arrival: id=" + w.m.id + " serial=" + N((long long)w.m.serial) + " from slot " + N((long long)w.from) + " why=" + N((long long)wWhy)
+                 + " (1 no world, 2 this game does not hold its area, 5 table full, 7 outside this game's wake box) - judged again when world record " + w.m.recId + " came");
+    }
+    /* the borrower - the row map is not changed inside the walk: removals are applied after it */
+    std::vector<void*> goneOff;
+    std::vector<std::pair<void*, void*> > removeQ;
+    std::vector<std::pair<void*, void*> > retireQ;   /* T-1122 review fold 4 / WITHDRAWN: ended copies awake past the sweep's time - put to sleep and removed */
+    std::vector<std::string> heldLate;   /* T-1122 re-check fold 1: held endings past raidsq::kLendHeldMaxMs - sent though their copy is not removed */
+    std::vector<std::string> awakeDone;   /* T-1122 awake hand: awake rows whose lend ended here */
+    std::vector<std::string> awakeFinish;   /* T-1122 review fold 3: awake rows whose RETURN waited out its time - its own copy removed first, after the walk */
+    std::set<void*> bandNow;   /* T-1122 attempt 2 fold 1: the asleep lent copies' sleeping objects (g_lentBand, LentBandUpdate) */
+    for (std::map<std::string, BorrowRow>::iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+    {
+        BorrowRow& r = it->second;
+        if (r.awakeHand != 0) { const int at = AwakeRowTick(it->first, r, now); if (at == 1) awakeDone.push_back(it->first); else if (at == 2) awakeFinish.push_back(it->first); continue; }   /* T-1122 awake hand: an ordinary world squad - none of the lent copy's roads below */
+        { const std::string k = LentKeyOf(r.platoon); if (!k.empty() && k[0] == '!') { goneOff.push_back(r.platoon); continue; } }   /* destroyed off the main thread */
+        if (r.ended == 0 && raidsq::GoneFor(StoreRosterSlotInWorld(r.lender) != 0 ? 1 : 0, &r.goneSeen, &r.goneSince, now) != 0)
+        {   /* the lender left (missing for raidsq::kLendGoneMs - a blip leaves the copy lent): no ending can be said; the copy stays LENT
+               (nothing of it is written), the keep question no longer keeps it - the engine discards it at this area's edge - and asleep
+               it is removed below */
+            r.ended = -1; r.endAt = now; ::InterlockedIncrement64(&g_borrowOrphaned); LentEndedMark(r.platoon);
+            BorrowCampEnd(r, raidsq::kCeLinkLost, -1, 1, "the lender left the world");
+            LendLine("[RAIDLEND] lender gone: id=" + r.id + " serial=" + N((long long)r.serial) + " - the copy is left to the engine (discarded at this game's area edge)");
+        }
+        Pod q; std::memset(&q, 0, sizeof(q));
+        const int ok = ReadPod(r.platoon, &q);
+        /* T-1122 redesign (b) (owner 1465 a / 1479 a): the awake copy runs a raid campaign of the lender's kind here (no walk order - T1987: a
+           walk order carries no raid); its phase is watched and said to the lender */
+        if (r.ended == 0 && ok && Plaus(q.active) && r.campTried == 0) BorrowCampStart(r, q.faction);
+        if (r.campMade == 1 && r.campEnded == 0) BorrowCampWatch(r, r.platoon, ok && Plaus(q.active) ? 1 : 0);
+        /* T-1122 fix (T1967): a copy asleep where this game no longer holds the area, or outside this game's wake box now (the live loaded
+           set - a neighbour dropped after the build), is given back at once; one asleep inside the box past raidsq::kLendAsleepMaxMs (the
+           game wakes one there in ~5 s) is the last resort for a cause not known. Its sleeping bytes go back, the copy is removed below. */
+        /* T-1122 attempt 2 fold 1 (review MED 1): the give-back line on where its people stand (raidsq::LentAsleepRule) - no clock for a kept copy */
+        const int asleepNow = (r.ended == 0 && ok && !Plaus(q.active) && Plaus(q.unloaded) && Plaus(q.unloadedContainer)) ? 1 : 0;
+        const int inWakeNow = asleepNow != 0 ? raidsq::WakeBoxHas(LendWakeBoxHere(q.ux, q.uz), q.ux, q.uz) : 0;
+        int otherArea = 0;   /* T-1122 attempt 2 fold 2 (re-check LOW): asleep in an area this game does not hold that another game holds or has loaded */
+        if (asleepNow != 0) { const Sector os = SectorOf(q.ux, q.uz); otherArea = (MayInventHereTS(os) != 1 && (HeldByOtherTS(os) == 1 || OtherLoadedTS(os) == 1)) ? 1 : 0; }
+        if (asleepNow != 0) { if (r.sleptAt == 0) r.sleptAt = now != 0 ? now : 1; } else { r.sleptAt = 0; r.noWakeSaid = 0; }
+        const int give = asleepNow != 0
+                         ? raidsq::LentAsleepRule(HeldOutsideHere(q.ux, q.uz), otherArea, r.awake, inWakeNow, raidsq::LendAgeMs(now, r.builtAt))
+                         : raidsq::kAsleepKeep;
+        if (asleepNow != 0 && give == raidsq::kAsleepKeep) bandNow.insert(q.unloaded);   /* fold 2 (re-check LOW): a copy given back is not left on the band list */
+        if (r.noWakeSaid == 0 && raidsq::LentKeptNoWake((asleepNow != 0 && give == raidsq::kAsleepKeep) ? 1 : 0, r.awake, inWakeNow, r.sleptAt != 0 ? raidsq::LendAgeMs(now, r.sleptAt) : 0) != 0)
+        {   /* fold 2 (re-check LOW): a kept copy that woke here before, asleep inside this game's wake box past the time its engine wakes one - counted, no clock */
+            r.noWakeSaid = 1; ::InterlockedIncrement64(&g_f2KeptNoWake);
+            LendLine("[RAIDLEND] kept lent copy NOT woken: id=" + r.id + " serial=" + N((long long)r.serial) + " asleep " + N((long long)(raidsq::LendAgeMs(now, r.sleptAt) / 1000UL)) + " s inside this game's wake box at "
+                     + F1(q.ux) + "," + F1(q.uz) + " after waking here before - kept (no clock gives it back); once per copy (raidLendFold2 keptNoWake " + N(g_f2KeptNoWake) + ")");
+        }
+        if (give != raidsq::kAsleepKeep)
+        {
+            ::InterlockedIncrement64(&g_borrowAsleepReturned);
+            if (give == raidsq::kAsleepOutsideWake) ::InterlockedIncrement64(&g_wakeGivenBack); else if (give == raidsq::kAsleepNeverWoke) ::InterlockedIncrement64(&g_wakeNeverWoke);
+            else if (give == raidsq::kAsleepOtherArea) ::InterlockedIncrement64(&g_f2GivenBackOtherArea);
+            const char* how = give == raidsq::kAsleepOutsideWake ? "asleep the give-back line (250 u) or more outside every area this game holds"
+                            : give == raidsq::kAsleepNeverWoke ? "never woke here inside this game's wake box"
+                            : give == raidsq::kAsleepOtherArea ? "asleep in an area another game holds or has loaded (this game does not travel it there)"
+                            : (r.awake == 0 ? "never woke here; this game holds no area near it" : "asleep where this game holds no area near it");
+            BorrowCampEnd(r, raidsq::kCeReturn, -1, 1, how);
+            LentPutAway(it->first, &q, q.ux, q.uy, q.uz, how);   /* T-1122 lend by reference: RETURN naming the world record written from its sleeping state */
+        }
+        /* ended: a copy still in its faction's sleeping list is removed through Faction::removeSquad (the hooked entry, as PlatoonWipe) */
+        if (r.ended != 0 && raidsq::LendAgeMs(now, r.endAt) > raidsq::kLendReturnSweepMs && ok && Plaus(q.faction) && FindSleepingPlatoonImpl((::Faction*)q.faction, r.id) == r.platoon)
+            removeQ.push_back(std::make_pair(q.faction, r.platoon));
+        else if (ok && Plaus(q.faction) && raidsq::LentRetireTry(raidsq::LentEndedRetire(r.ended, r.retPending, Plaus(q.active) ? 1 : 0, raidsq::LendAgeMs(now, r.endAt)), r.retireTries) != 0)
+            retireQ.push_back(std::make_pair(q.faction, r.platoon));   /* review fold 4: it woke inside the sweep's time - never left running beside the lender's squad; re-check fold 1: at most raidsq::kLendRetireMaxTries tries */
+        if (raidsq::HeldEndingOverdue(r.retPending, raidsq::LendAgeMs(now, r.endAt)) != 0) heldLate.push_back(it->first);   /* re-check fold 1: not removed by its bound (whatever the cause, ReadPod failing too) */
+    }
+    OwnRaidLockEnter(); g_lentBand.swap(bandNow); ::LeaveCriticalSection(&g_ownRaidLock);
+    for (size_t i = 0; i < goneOff.size(); ++i) RaidLentGone(goneOff[i], 0);
+    for (size_t i = 0; i < removeQ.size(); ++i)
+    {
+        const std::string k = LentKeyOf(removeQ[i].second);
+        LendLine("[RAIDLEND] removed: lent copy " + k + " platoon=" + P(removeQ[i].second) + " still asleep here after its ending - Faction::removeSquad");
+        ::InterlockedIncrement64(&g_borrowRemoved);
+        detour_destroyPlatoon(removeQ[i].first, removeQ[i].second);   /* the hook's RaidLentGone ends the row */
+    }
+    for (size_t i = 0; i < retireQ.size(); ++i)
+    {   /* put to sleep, then Faction::removeSquad under the admin flag (the saved-copy road); the hook's RaidLentGone ends the row and sends a held ending */
+        const std::string k = LentKeyOf(retireQ[i].second);
+        const int rm = LentSavedCopyRemove((::Faction*)retireQ[i].first, retireQ[i].second);
+        ::InterlockedIncrement64(rm == 1 ? &g_lhRetired : &g_lhRetireFailed);
+        int tries = 0;   /* re-check fold 1: this copy's failed tries (a removed copy's row is gone) */
+        if (rm != 1) { std::map<std::string, BorrowRow>::iterator fr = g_borrow.find((!k.empty() && k[0] == '!') ? k.substr(1) : k); if (fr != g_borrow.end()) tries = ++fr->second.retireTries; }
+        const int gaveUp = rm != 1 ? raidsq::LentRetireGaveUp(tries) : 0;
+        if (gaveUp != 0) ::InterlockedIncrement64(&g_lhRetireGaveUp);
+        if (rm == 1 || tries == 1 || gaveUp != 0)   /* re-check fold 1: one line at its first failure and one when it is given up - never one a tick */
+            LendLine("[RAIDLEND] " + (rm == 1 ? std::string("removed")
+                                      : gaveUp != 0 ? "NOT removed - given up after " + N((long long)tries) + " tries (left to the engine; a held ending goes at its " + N((long long)(raidsq::kLendHeldMaxMs / 1000UL)) + " s bound)"
+                                      : "NOT removed (tried again each second, at most " + N((long long)raidsq::kLendRetireMaxTries) + " tries)")
+                     + ": lent copy " + k + " platoon=" + P(retireQ[i].second) + " awake after its ending - put to sleep and Faction::removeSquad");
+    }
+    for (size_t i = 0; i < heldLate.size(); ++i)
+    {   /* re-check fold 1: a held ending past its bound - its copy was not removed (not in its faction's sleeping list, not readable, or its
+           put-to-sleep-and-remove failed): the ending goes anyway, said so, so the lender's squad is not lent for ever; the copy stays ended
+           (the keep question no longer keeps it - left to the engine) */
+        std::map<std::string, BorrowRow>::iterator hl = g_borrow.find(heldLate[i]);
+        if (hl == g_borrow.end() || hl->second.retPending == 0) continue;   /* removed meanwhile: sent there */
+        ::InterlockedIncrement64(&g_lhHeldLate);
+        const std::string how = "not removed " + N((long long)(raidsq::kLendHeldMaxMs / 1000UL)) + " s after its end (" + N((long long)hl->second.retireTries)
+                                + " failed put-to-sleep-and-remove tries; not in its faction's sleeping list or not readable otherwise) - sent anyway, the copy is left to the engine";
+        BorrowSendHeld(hl->first, hl->second, how.c_str());
+    }
+    for (size_t i = 0; i < awakeDone.size(); ++i) g_borrow.erase(awakeDone[i]);   /* T-1122 awake hand */
+    for (size_t i = 0; i < awakeFinish.size(); ++i) AwakeReturnFinish(awakeFinish[i]);   /* T-1122 re-check fold 1 / review fold 3: after the walk - the own copy removed, then the RETURN */
+    ReturnWaitTick();   /* T-1122 review fold 4 / re-check: the owner's waiting notes whose copy is no longer its own raid squad */
+    AwakeBlocksTick(now);
+}
+void RaidLendWorldTeardown()
+{
+    OwnRaidLockEnter(); g_lend.clear(); g_lendWant.clear(); g_lentPlatoons.clear(); g_lentEnded.clear(); g_lentRaidOver.clear(); LentCountSet(); ::LeaveCriticalSection(&g_ownRaidLock);
+    g_borrow.clear();   /* T-1122 redesign (b): its campaigns are not touched - the world deletes them (raidsq::kCeWorldClose says nothing) */
+    g_borrowEnded.clear();   /* T-1122 review fold: the endings kept to say again belong to this world's lends */
+    g_awakeBlocks.clear();   /* T-1122 awake hand: the blocks waiting for a take belong to this world */
+    g_awakeTakeNotes.clear();   /* T-1122 fix A re-check fold (2) */
+    g_awakeOnwardAt.clear();   /* T-1122 re-check fold 6: this world's (fold 1's removal queue is each row's own waiting RETURN since review fold 3) */
+    g_returnWait.clear();   /* T-1122 RETURN by reference: the RETURNs waiting for their records belong to this world */
+    g_lendRecWait.clear();   /* T-1122 lend by reference: the LENDs waiting for their records belong to this world */
+    for (int i = 0; i < 16; ++i) { g_campHandled[i] = 0; g_campHandledKind[i] = 0; }
+}
+static std::string RaidLendReportToken()
+{
+    return " raidLend[sent,reasked,statusAsked,taken,refused,returned,died,resumed,removed,saveFailed,sendFailed,frozenTicks,endRuns,stale,malformed,offThread,noTarget,loadFailed]="
+         + N(g_lendSent) + "," + N(g_lendReasked) + "," + N(g_lendStatusAsked) + "," + N(g_lendTaken) + "," + N(g_lendRefused) + "," + N(g_lendReturned) + "," + N(g_lendDied) + "," + N(g_lendResumed) + ","
+         + N(g_lendRemoved) + "," + N(g_lendSaveFailed) + "," + N(g_lendSendFailed) + "," + N(g_lendFrozenTicks) + "," + N(g_f2EndRuns) + "," + N(g_lendStale) + ","
+         + N(g_lendMalformed) + "," + N(g_lendOffThread) + "," + N(g_lendNoTarget) + "," + N(g_lendLoadFailed)
+         + " raidLendState[fromRecord,noState,fault,copyFault,writerOff]=" + N(g_lendFromRecord) + "," + N(g_lendNoState) + "," + N(g_lendStateFault) + "," + N(g_lendCopyFault) + "," + N(g_lendWriterOff)
+         + " raidBorrow[built,refused,returnSent,diedSent,removed,orphaned,saidAgain,unknown,asleepReturned,rows]=" + N(g_borrowBuilt) + "," + N(g_borrowRefused) + ","
+         + N(g_borrowReturnSent) + "," + N(g_borrowDiedSent) + "," + N(g_borrowRemoved) + "," + N(g_borrowOrphaned) + "," + N(g_borrowSaidAgain) + "," + N(g_borrowUnknown) + "," + N(g_borrowAsleepReturned) + "," + N((long long)g_borrow.size())
+         + " raidWake[refusedOutside,givenBackOutside,neverWokeInside,boxAnswers,boxTravelTicks,boxLendTicks,hostWouldWakeHeldTicks]=" + N(g_wakeRefused) + "," + N(g_wakeGivenBack) + "," + N(g_wakeNeverWoke) + "," + N(g_wakeBoxAnswers) + "," + N(g_wakeBoxRuns) + "," + N(g_wakeBoxLends) + "," + N(g_wakeHostStays)
+         + " raidSpot[movedIntoBorrowerBox,movedOutOfOwnBox,tooFarTicks,noCrossingTicks,noTargetTicks,writeFailed]=" + N(g_spotMovedIn) + "," + N(g_spotMovedOut) + "," + N(g_spotTooFar) + "," + N(g_spotMissed) + "," + N(g_spotNoTarget) + "," + N(g_spotWriteFailed)   /* T-1122 gate 2 (owner 1612 a) */
+         + " raidLendPlace[lendPeoplePlaced,lendPlaceRefused,keptInBand,returnedPastMargin,campStarted,already,noBox,timedOut]=" + N(g_lpPlaced) + "," + N(g_lpRefused) + "," + N(g_lpKeptInBand) + ","
+         + N(g_lpReturnedPastMargin) + "," + N(g_lpCampStarted) + "," + N(g_lpAlready) + "," + N(g_lpNoBox) + "," + N(g_lpTimedOut)
+         + " raidLendReturnWhy[pastMargin,notHeld,raidEnded,noCentre,keepWriteFailed]=" + N(g_lpReturn[raidsq::kSlPastMargin]) + "," + N(g_lpReturn[raidsq::kSlNotHeld]) + "," + N(g_lpReturn[raidsq::kSlRaidEnded]) + ","
+         + N(g_lpReturn[raidsq::kSlNoCentre]) + "," + N(g_lpKeepWriteFailed)   /* T-1122 attempt 2 (owner 1619 a) */
+         + " raidLendPlaceFold[noGround,notHeldAt,latePlaced,notFirstWake,bandTravel,wokeOffThread]=" + N(g_lpNoGround) + "," + N(g_lpNotHeldAt) + "," + N(g_lpLate) + "," + N(g_lpNotFirst) + "," + N(g_lpBandTravel) + "," + N(g_lpWokeOffThread)
+         + " raidLendShort[shortReturns,waits,waitTicks,cleared,holderResets]=" + N(g_lsShort) + "," + N(g_lsQuiet) + "," + N(g_lsQuietTicks) + "," + N(g_lsCleared) + "," + N(g_f2ShortHolderReset)   /* T-1122 attempt 2 fold 1; fold 2: a wait, never a stop */
+         + " raidLendFold2[raidOverMarked,raidOverDiscarded,noLendRaidOver,endHeldTicks,keptNoWake,bandRefusedOther,givenBackOtherArea,groundPartial]=" + N(g_f2RaidOverMarked) + "," + N(g_f2RaidOverDiscarded) + ","
+         + N(g_f2NoLendRaidOver) + "," + N(g_f2EndHeldTicks) + "," + N(g_f2KeptNoWake) + "," + N(g_f2BandRefusedOther) + "," + N(g_f2GivenBackOtherArea) + "," + N(g_f2GroundPartial)
+         + " raidLentSave[written,writeFail,read,stale,bad,unreadable,encodeFail,noteOffThread,removed,refused,ambiguous,notFound,removeFailed]=" + N(g_lentFileWritten) + "," + N(g_lentFileWriteFail) + ","
+         + N(g_lentFileRead) + "," + N(g_lentFileStale) + "," + N(g_lentFileBad) + "," + N(g_lentFileUnreadable) + "," + N(g_lentFileEncodeFail) + "," + N(g_lentNoteOffThread) + "," + N(g_lentCopyRemoved) + "," + N(g_lentCopyRefused) + ","
+         + N(g_lentCopyAmbiguous) + "," + N(g_lentCopyNotFound) + "," + N(g_lentCopyRemoveFailed)
+         + " raidAwake[sent,sendFailed,offThread,stored,dup,applied,campRefused,dropped,ended,left,forgot,blocks]=" + N(g_awakeSent) + "," + N(g_awakeSendFailed) + "," + N(g_awakeOffThread) + ","
+         + N(g_awakeStored) + "," + N(g_awakeDup) + "," + N(g_awakeApplied) + "," + N(g_awakeCampRefused) + "," + N(g_awakeDropped) + "," + N(g_awakeEnded) + "," + N(g_awakeLeft) + "," + N(g_awakeForgot) + ","
+         + N((long long)g_awakeBlocks.size())
+         + " raidAwakeFold[onward,notOverRow,moved,home,frozen,returnSent,returned,quietEnd]=" + N(g_awakeOnward) + "," + N(g_awakeNotOverRow) + "," + N(g_awakeMoved) + "," + N(g_awakeHome) + ","
+         + N(g_awakeFrozen) + "," + N(g_awakeReturnSent) + "," + N(g_awakeReturned) + "," + N(g_awakeQuietEnd)
+         + " raidAwakeRecheck[returnSendFailed,returnUnapplied,onwardPart,onwardQuiet,copyRemoved,copyKept]=" + N(g_awakeReturnFailed) + "," + N(g_awakeReturnUnapplied) + "," + N(g_awakeOnwardPart) + ","
+         + N(g_awakeOnwardQuiet) + "," + N(g_awakeCopyRemoved) + "," + N(g_awakeCopyKept)
+         + " raidReturnRef[notWritten,unsent,notAsleep,loadedNow,waited,loadedAtRecv,appliedByWake,wokeFirst,wrongId,noteDropped,loadFailed,lendHeld,waiting]=" + N(g_retRefNotWritten) + "," + N(g_retRefUnsent) + "," + N(g_retRefNotAsleep) + "," + N(g_retRefLoadedNow) + "," + N(g_retRefWaited) + ","
+         + N(g_retRefLoadedAtRecv) + "," + N(g_retRefAppliedByWake) + "," + N(g_retRefWokeFirst) + "," + N(g_retRefWrongId) + "," + N(g_retRefDropped) + "," + N(g_retRefLoadFailed) + "," + N(g_retRefLendHeld) + "," + N((long long)g_returnWait.size())
+         + " raidLendRef[written,noId,writerRefused,notSent,released,askRefused,builtNow,builtAtRecv,waited,waitDup,timedOut,recvRefused,lenderGone,backWritten,backNotWritten,backReleased,keepOwn,waiting]="
+         + N(g_lrWritten) + "," + N(g_lrNoId) + "," + N(g_lrWriterRefused) + "," + N(g_lrNotSent) + "," + N(g_lrReleased) + "," + N(g_lrAskRefused) + "," + N(g_lrBuiltNow) + "," + N(g_lrBuiltAtRecv) + ","
+         + N(g_lrWaited) + "," + N(g_lrWaitDup) + "," + N(g_lrTimedOut) + "," + N(g_lrRecvRefused) + "," + N(g_lrLenderGone) + "," + N(g_lrBackWritten) + "," + N(g_lrBackNotWritten) + ","
+         + N(g_lrBackReleased) + "," + N(g_lrKeepOwn) + "," + N((long long)g_lendRecWait.size())
+         + " raidLendHold[heldSent,heldKeepOwn,retired,retireFailed,withdrawnSent,withdrawnIn,withdrawnRemoved,withdrawnNoCopy,refusedKeepOwn,keepOwnNoteDropped,unsentRolledBack]="
+         + N(g_lhHeldSent) + "," + N(g_lhHeldKeepOwn) + "," + N(g_lhRetired) + "," + N(g_lhRetireFailed) + "," + N(g_lhWithdrawnSent) + "," + N(g_lhWithdrawnIn) + "," + N(g_lhWithdrawnRemoved) + ","
+         + N(g_lhWithdrawnNoCopy) + "," + N(g_lhRefusedKeepOwn) + "," + N(g_lhKeepOwnNoteDropped) + "," + N(g_lhUnsentRolledBack)
+         + " raidLendBound[heldLate,retireGaveUp]=" + N(g_lhHeldLate) + "," + N(g_lhRetireGaveUp)
+         + " raidLendBack[sent,keptRoad,held,confirmSent,partial,homeSwap,homeDropOnly,homeNone,ownRemoved,ownKept]=" + N(g_lbSent) + "," + N(g_lbKeptRoad) + "," + N(g_lbHeld) + ","
+         + N(g_lbConfirmSent) + "," + N(g_lbPartial) + "," + N(g_lbHomeSwap) + ","
+         + N(g_lbHomeDropOnly) + "," + N(g_lbHomeNone) + "," + N(g_lbOwnRemoved) + "," + N(g_lbOwnKept)
+         + " raidLendWhole[xferAll,xferNone,relAll,relNone,sendHeld,relHeld,putAwayPartial]=" + N(g_lwCount[raidsq::kLwXferAll]) + "," + N(g_lwCount[raidsq::kLwXferNone]) + ","
+         + N(g_lwCount[raidsq::kLwRelAll]) + "," + N(g_lwCount[raidsq::kLwRelNone]) + "," + N(g_lwCount[raidsq::kLwSendHeld]) + "," + N(g_lwCount[raidsq::kLwRelHeld]) + ","
+         + N(g_lwCount[raidsq::kLwPutAwayPartial])
+         + RaidCampReportToken()
+         ;
+}
+/* the lent copy built (the borrower): CreateUnknownSquad's engine steps on the lent bytes - the container loaded from them, its state
+   record made a global 0x22 record (T-296 fix 2) named with the lender's id and placed at the lend's position, addUnloadedSquad -
+   and NOTHING of the record roads: no bind, no record, no writer question, no home. Kept byte 0; the keep question keeps it while its
+   lend is open (raidsq::LentKeep). One live platoon per id here: refused when this game already has a squad of that id. MAIN THREAD.
+   *why: the failed step. A failure before addUnloadedSquad keeps the container, cleared, for the next build (g_lendSpare, as
+   CreateUnknownSquad's spare); a squad the engine added but this code did not find is removed through the engine's own removal. */
+static GameDataContainer* g_lendSpare = 0;
+static void LendSpareKeep(GameDataContainer* c)
+{
+    __try { ClearFn fn = (ClearFn)(Base() + kClearAndDestroyRva); fn(c); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (g_lendSpare == 0) g_lendSpare = c;
+}
+void* RaidLendBuildImpl(const raidsq::LendMsg& m, const std::string& file, int* people, int* why)
+{
+    *people = -1; *why = 0;
+    if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory) || m.squad.empty() || m.faction.empty()) { *why = 1; return 0; }
+    ::Faction* f = FindFactionByKey(m.faction);
+    ::GameData* squadGd = coop::GameWorldPtr()->gamedata.getData(m.squad);
+    if (!Plaus(f) || !Plaus(squadGd)) { *why = 2; return 0; }
+    if (FindSleepingPlatoonImpl(f, m.id) != 0 || FindActivePlatoonImpl(f, m.id) != 0) { *why = 3; return 0; }
+    GameDataContainer* c = g_lendSpare;   /* engine-owned after addUnloadedSquad */
+    g_lendSpare = 0;
+    if (c == 0)
+    {
+        c = (GameDataContainer*)Ogre::GeneralAllocatedObject::operator new(0x180);
+        if (!c) { *why = 4; return 0; }
+        c->runConstructor();
+    }
+    const std::string modName;
+    if (LoadPod(c, &file, &modName) != 1) { *why = 5; LendSpareKeep(c); return 0; }
+    lektor<GameData*> states; c->listRecordsOfType(states, (itemType)0x1E);
+    GameData* state = states.size() > 0 ? states[0] : 0;
+    if (!Plaus(state)) { *why = 6; LendSpareKeep(c); return 0; }
+    int stWhy = 0; ::GameData* s22 = (::GameData*)StateMake22(state, m.squad, &stWhy);
+    if (!coopstate::StateCreateDecide(1, s22 != 0 ? 1 : 0, stWhy == 0 ? 1 : 0)) { *why = 7; LendSpareKeep(c); return 0; }
+    s22->stringFields["platoon stringID"] = m.id;
+    StateSetPositionPod(s22, m.x, m.y, m.z);
+    const unsigned before = f->unloadedSquads() ? f->unloadedSquads()->size() : 0;
+    f->addUnloadedSquad(s22, c, squadGd, Ogre::Vector3(m.x, m.y, m.z), true);
+    const lektor<Platoon*>* ul = f->unloadedSquads();
+    Platoon* p = (ul && ul->size() > before) ? (*ul)[ul->size() - 1] : 0;
+    if (!Plaus(p))
+    {   /* no copy may stay unmarked under the lender's id: one the engine added elsewhere in its list goes by Faction::removeSquad (the
+           hooked entry - unbound, so no delete reaches the world server) */
+        *why = 8;
+        void* stray = FindSleepingPlatoonImpl(f, m.id);
+        if (stray != 0) { detour_destroyPlatoon(f, stray); *why = 9; }
+        return 0;
+    }
+    g_stCreated[p] = s22;
+    Pod cq; std::memset(&cq, 0, sizeof(cq));
+    if (ReadPod(p, &cq) && Plaus(cq.unloaded)) { *people = CharRecCountPod(cq.unloaded); if (*people > 0) MarkReadPod(cq.unloaded); }   /* no person records: left unread, the engine builds its template's people at the wake */
+    SetPersistentPod(p, false);
+    return p;
+}
+}   /* the anonymous namespace closes for StoreOwnRaidNote, defined in coop itself (store.h - towngen.cpp's creation gate, any thread) */
+void StoreOwnRaidNote(void* platoon) { OwnRaidNote(platoon); }
+namespace {
 // ---- P2 item 3: only the world's authority (the host; later the server) moves sleeping squads. On a non-authority the
 // travel jobs are skipped (the authority's records move the copy). The WAKE is a state question, not a timer (user, 2026-09-03;
 // review-store S5 measured the old fixed 0.05 s step making client squads wake ~40x late):
@@ -7081,6 +11070,9 @@ unsigned char detour_isPersistent(void* platoon)
 //   - otherwise this game is alone there: the engine's own wake check with the REAL elapsed time since this platoon's last
 //     visit (the engine's update computes the same from its clock into UnloadedPlatoon+0x50 before the check - decomp_7edbf0).
 unsigned long long g_wakeHeldNoMap = 0;   /* M2-b (review-m2 H2) */
+/* T-1261 fold (review MED 1): wakes held because the area is loaded here and nobody holds it yet (loadedzones::WakeWaitsForNaming) -
+   on the store authority's road and on the others'. Each held update counts (a group waits a few updates for the naming). */
+unsigned long long g_wakeHeldNobodyYet = 0;
 unsigned long long g_wakeSkippedHeld = 0, g_wakeChecked = 0, g_wakeFrozen = 0, g_wakeDtFaults = 0; float g_wakeDtMax = 0.0f;
 int SleepSectorPod(void* unloaded, Sector* s)
 {
@@ -7115,7 +11107,153 @@ int EngineDtPod(void* u, float* dt)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* T-1261 fold (review MED 1): 1 = hold this sleeping group's wake - its area is loaded here and the fresh map names nobody yet (or names
+   another game whose naming is not confirmed - T-1261 re-check fold), so the people the wake would make are refused at the character
+   gate (loadedzones::WakeWaitsForNaming). T-1261 re-check fold (LOW): every sleeping group in the world comes through here on the store
+   authority, so the one-cell loaded-here read goes first and the full area read is taken only for a group in an area loaded here; the
+   holder's loaded bit is read only when another game is named. ANY THREAD; no string is built (the caller has an __try). */
+static int WakeWaitsNamingAt(const Sector& s)
+{
+    if (coop::SectorLoadedHereTS(s) != 1) return 0;   /* the engine wakes a group only in a zone loaded here (F518) */
+    int h = 0, m = 0, kept = 0;
+    AreaViewTS(s, &h, &m, 0, &kept, 0, 0);
+    const int l = 1;   /* fold 1 (review M2): AreaViewTS's loadedHere is the KEPT set now; the wake asks the engine's loaded set (above) */
+    (void)kept;
+    const int hl = (l == 1 && h == 1) ? HolderLoadedTS(s) : -1;
+    return loadedzones::WakeWaitsForNaming(l, h, m, hl);
+}
 static void P023Log(const Sector& s, void* u) { DebugLog("[PROBE] P023 mine-area update: sector " + N((long long)s.x) + "," + N((long long)s.y) + " unloaded=" + P(u) + " (engine update runs here)"); }
+/* T-1122 own raid squads (raidsquad.h rule 2; T-1122 fold b): on a game that is not the off-screen authority, the engine's own off-screen
+   update (its travel and its wake check) runs for this game's own raid squad where this game holds its sleeping area, or where no other
+   game holds or has loaded it. 1 = run here (*ret = the engine's answer); 0 = the existing roads decide (another game's area or no fresh
+   map: it is held where it is, its clock kept fresh - the stop is counted and timed). */
+/* T-1122 attempt 2 fold 2 (re-check MED): the lender's short-return wait (raidsq::LendShortQuietMs) belongs to the holder and area it counted:
+   the count and its wait clear once the squad's spot (x, z) is the give-back line outside that holder's areas (raidsq::LendShortClears - a walk
+   out) or the squad's area (ax, ay) or its holder (holderSlot) is another (raidsq::LendShortReset - a hand-over: the new holder is lent it at
+   once). ANY THREAD (the lock; the area-map reads are made outside it) */
+static void LendShortCheck(void* platoon, float x, float z, int ax, int ay, int holderSlot)
+{
+    int n = 0, sax = -1, say = -1, slot = -1;
+    OwnRaidLockEnter();
+    std::map<void*, LendRow>::const_iterator it = g_lend.find(platoon);
+    if (it != g_lend.end() && it->second.state == raidsq::kLendIdle) { n = it->second.shortReturns; sax = it->second.shortAx; say = it->second.shortAy; slot = it->second.shortSlot; }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    if (n <= 0) return;
+    const int walked = raidsq::LendShortClears(LenderHeldOutside(slot, x, z));
+    const int other = raidsq::LendShortReset(sax, say, slot, ax, ay, holderSlot);
+    if (walked == 0 && other == 0) return;
+    OwnRaidLockEnter();
+    std::map<void*, LendRow>::iterator w = g_lend.find(platoon);
+    if (w != g_lend.end() && w->second.state == raidsq::kLendIdle && w->second.shortReturns == n)
+    {
+        w->second.shortReturns = 0;
+        if (w->second.shortQuiet != 0) { w->second.quietUntil = 0; w->second.shortQuiet = 0; }
+        ::InterlockedIncrement64(walked != 0 ? &g_lsCleared : &g_f2ShortHolderReset);
+    }
+    ::LeaveCriticalSection(&g_ownRaidLock);
+}
+static int OwnRaidUpdate(void* unloaded, unsigned char* ret)
+{
+    void* platoon = 0;
+    if (OwnRaidLookup(unloaded, &platoon) == 0) return 0;
+    Sector s; s.x = -1; s.y = -1;
+    const int haveS = SleepSectorPod(unloaded, &s);
+    const int mineHolds = haveS ? (MayInventHereTS(s) == 1 ? 1 : 0) : 0;
+    const int held = haveS ? HeldByOtherTS(s) : -1;
+    const int other = haveS ? OtherLoadedTS(s) : -1;
+    const int d = raidsq::TravelDecide(g_relayLinkedCached != 0 ? 1 : 0, 1, mineHolds, held, other);
+    raidsq::Row r; std::memset(&r, 0, sizeof(r));
+    /* T-1122 attempt 2 fold 2 (re-check MED): a short return's wait clears at a walk out or a holder change (LendShortCheck) - before the state is read */
+    float spx = 0.0f, spz = 0.0f;
+    if (haveS && LendSpotPod(unloaded, &spx, &spz)) LendShortCheck(platoon, spx, spz, s.x, s.y, held == 1 ? coop::AreaHolderSlotTS(s) : -1);
+    int raidOver = 0, quiet = 0, lentAwake = 0;
+    const int lendSt = LendStateOf(platoon, &raidOver, &quiet, &lentAwake);
+    if (raidsq::LendCopyFrozen(lentAwake, lendSt) != 0)   /* T-1122 re-check fold 3: an awake lend exactly while TAKEN (lent out, not given back) */
+    {   /* T-1122 build: lent to (or asked of) the area's holder - frozen here: no travel, no wake, its clock kept fresh; the lender keeps the raid */
+        ::InterlockedIncrement64(&g_lendFrozenTicks);
+        float fdt = 0.0f; EngineDtPod(unloaded, &fdt);
+        *ret = 1; return 1;
+    }
+    if (d == raidsq::kTravelNotOwn) return 0;   /* T-1122 review fold: the link is down - the existing roads decide; no held stop is booked and no held line said (this runs before the authority and single-player roads now) */
+    /* T-1122 gate 2 (2a+, owner 1612 a; T2327) / attempt 2 fold 1: in another game's area short of the borrower's lend line, its spot moves to
+       that line (LendSpotMove, main thread); the decisions below read the moved spot. Fold 2: not while a wait runs (it moves just before its
+       lend), and never for a squad whose raid is over (re-check HIGH: a raid's end moves nobody) */
+    if (d == raidsq::kTravelOtherArea && haveS && held == 1 && quiet == 0 && raidOver == 0) LendSpotMove(platoon, unloaded, s, kSpotRoadLend);
+    /* T-1122 fix (T1967): the borrower said this spot is outside its wake box - the squad travels on (the game itself travels a sleeping
+       squad there and does not wake it); inside the box it is held and lent below */
+    const int boxD = (d == raidsq::kTravelOtherArea && raidOver == 0 && haveS) ? LendBoxOf(platoon, unloaded, s) : raidsq::kBoxNone;
+    /* T-1122 attempt 2 fold 2 (re-check HIGH): a squad whose raid is over (the borrower's RAID_END - it left its campaign) in another game's area
+       is neither moved nor lent: this game's engine runs it, as one-player play does (with no campaign it is not kept - discarded at its 60
+       game-s lifetime outside a loaded area; Inferred: it has no travel goal then) - only where this game's own game would not wake it; else
+       it is held (counted endHeldTicks) until this game's player or the holder leaves */
+    const int endWant = (d == raidsq::kTravelOtherArea && held == 1 && raidOver != 0) ? 1 : 0;
+    /* T-1122 review fold (item 2): the travel-on roads run this game's full off-screen update, its own wake check included - so they run
+       only where this game's own game would not wake the squad (LendHostTravel, its own flags now); else it is held here, not lent again
+       (the borrower would refuse the same spot), until the map around it changes */
+    const int hostStay = (endWant != 0 || boxD == raidsq::kBoxTravel) ? (LendHostTravel(unloaded) == raidsq::kHostStay ? 1 : 0) : 0;
+    if (hostStay != 0) ::InterlockedIncrement64(&g_wakeHostStays);
+    const int endRun = (endWant != 0 && hostStay == 0) ? 1 : 0;
+    if (endRun != 0) ::InterlockedIncrement64(&g_f2EndRuns); else if (endWant != 0) ::InterlockedIncrement64(&g_f2EndHeldTicks);
+    const int boxRun = (boxD == raidsq::kBoxTravel && hostStay == 0) ? 1 : 0;
+    if (boxRun != 0) ::InterlockedIncrement64(&g_wakeBoxRuns); else if (boxD == raidsq::kBoxLend || boxD == raidsq::kBoxShallow) ::InterlockedIncrement64(&g_wakeBoxLends);
+    if (d != raidsq::kTravelRuns && endRun == 0 && boxRun == 0)
+    {
+        OwnRaidLockEnter();
+        const int first = g_ownRaid.HoldBegin(platoon, ::GetTickCount(), &r);
+        OwnRaidLeave();
+        if (first != 0)
+        {
+            ::InterlockedIncrement64(&g_ownRaidHeld);
+            OwnRaidLine(kOwnRaidLineHeld, "[STORE] own raid squad held: id=" + std::string(r.id) + " at sector " + OwnRaidSec(s.x, s.y) + " heldByOther=" + N((long long)held) + " otherLoaded=" + N((long long)other)
+                        + " - another game holds or has loaded this area (or no fresh map): it waits here, its clock kept fresh, until that changes (once per stop; ownRaidHeld on the REPORT)");
+        }
+        if (d == raidsq::kTravelOtherArea && held == 1 && raidOver == 0 && hostStay == 0) { if (quiet == 0) LendWantNote(platoon); else ::InterlockedIncrement64(&g_lsQuietTicks); }   /* T-1122 build: lent to the area's holder (RaidLendTick, main thread - raidsq::LendStart); fold 2: a wait ends by time, never a stop */
+        /* T-1122 build: the off-screen AUTHORITY reaches this before its blanket run, so it holds the squad itself (no invisible pass
+           through another game's area); a non-authority leaves it to the existing roads, as before */
+        if (d != raidsq::kTravelNotOwn && g_storeAuthority) { float hdt = 0.0f; EngineDtPod(unloaded, &hdt); *ret = 1; return 1; }
+        return 0;
+    }
+    ::InterlockedIncrement64(&g_ownRaidTravelled);
+    *ret = orig_unloadedUpdate(unloaded);
+    /* a squad that woke in the engine's update left its row in detour_activate: nothing of it is read after that */
+    int moved = 0, fx = -1, fy = -1; long long steps = 0; unsigned long stopMs = 0;
+    Sector a; a.x = -1; a.y = -1;
+    OwnRaidLockEnter();
+    if (g_ownRaid.HasWith(platoon, unloaded) != 0 && SleepSectorPod(unloaded, &a)) moved = g_ownRaid.TravelStep(platoon, a.x, a.y, ::GetTickCount(), &fx, &fy, &steps, &stopMs, &r);
+    OwnRaidLeave();
+    if (stopMs != 0)
+        OwnRaidLine(kOwnRaidLineHeld, "[STORE] own raid squad resumes: id=" + std::string(r.id) + " at sector " + OwnRaidSec(a.x, a.y) + " after " + N((long long)(stopMs / 1000UL)) + " s held at another game's area");
+    if (moved != 0)
+    {
+        ::InterlockedIncrement64(&g_ownRaidSteps);
+        OwnRaidLine(kOwnRaidLineStep, "[STORE] own raid squad travels: id=" + std::string(r.id) + " sector " + OwnRaidSec(fx, fy) + " -> " + OwnRaidSec(a.x, a.y) + " (step " + N(steps) + (mineHolds != 0 ? "; this game's own area" : "") + "; the engine's own off-screen update, run here)");
+    }
+    return 1;
+}
+/* T-1122 attempt 2 fold 1 (review MED 1): THE BAND OUTSIDE THIS GAME'S AREAS - a kept lent copy asleep past this game's area edge (in an
+   area it does not hold and has not loaded, so its engine cannot wake it there) is travelled on by this game's own off-screen update,
+   so it reaches the give-back line (the tick returns it) or comes back in; elsewhere the ordinary roads (its own area: travelled and
+   woken; an area loaded here that it does not hold: the tick gives it back). ANY THREAD; no string is built. 1 = run here (*ret). */
+static int LentBandUpdate(void* unloaded, unsigned char* ret)
+{
+    if (g_lentCount == 0 || unloaded == 0) return 0;
+    OwnRaidLockEnter();
+    const int is = g_lentBand.count(unloaded) != 0 ? 1 : 0;
+    ::LeaveCriticalSection(&g_ownRaidLock);
+    if (is == 0) return 0;
+    Sector s; s.x = -1; s.y = -1;
+    if (!SleepSectorPod(unloaded, &s) || MayInventHereTS(s) == 1 || coop::SectorLoadedHereTS(s) == 1) return 0;
+    if (HeldByOtherTS(s) != 0 || OtherLoadedTS(s) != 0)
+    {   /* T-1122 attempt 2 fold 2 (re-check LOW): never travelled in an area another game holds or has loaded (or no fresh map) - OwnRaidUpdate's
+           rule (both 0); held, its clock kept fresh: the tick gives it back there (raidsq::kAsleepOtherArea), or travels it once the map is fresh */
+        ::InterlockedIncrement64(&g_f2BandRefusedOther);
+        float hdt = 0.0f; EngineDtPod(unloaded, &hdt);
+        *ret = 1; return 1;
+    }
+    ::InterlockedIncrement64(&g_lpBandTravel);
+    *ret = orig_unloadedUpdate(unloaded);
+    return 1;
+}
 unsigned char detour_unloadedUpdate(void* unloaded)
 {
     /* E18.6 (review-p5l CRASH-2): the probe this detour never had, and it goes above every early return so it counts CALLS,
@@ -7132,6 +11270,18 @@ unsigned char detour_unloadedUpdate(void* unloaded)
        main-thread guard. skippedNoNotebook is the number that says how much of a run the world spent
        with nobody moving the sleeping squads, which nothing measures today. NO STRING IS BUILT HERE:
        this function has an __try, so a std::string temporary in it would not compile (C2712). */
+    /* T-1261 fold (review MED 1): A WAKE WAITS FOR THE AREA'S NAMING, on every road below - the store authority's too. While the area
+       is loaded here and nobody holds it yet, the wake's people would be refused at the character gate (only the named holder makes
+       a town's people, decision 1531) and the group would come up empty (F956). Held here, with the platoon's clock kept fresh as the
+       held arms below keep it (F488); the next update after the naming runs as before. Only a group in an area loaded here can wake
+       (F518), so a group travelling elsewhere is not held. */
+    if (g_relayLinkedCached != 0)
+    {
+        Sector ws; ws.x = -1; ws.y = -1;
+        if (SleepSectorPod(unloaded, &ws) && WakeWaitsNamingAt(ws) != 0) { ++g_wakeHeldNobodyYet; float wdt = 0.0f; EngineDtPod(unloaded, &wdt); return 1; }
+    }
+    { unsigned char bandRet = 1; if (LentBandUpdate(unloaded, &bandRet) != 0) return bandRet; }   /* T-1122 attempt 2 fold 1: a kept lent copy past this game's area edge */
+    { unsigned char raidRet = 1; if (OwnRaidUpdate(unloaded, &raidRet) != 0) return raidRet; }   /* T-1122 own raid squads: this game travels its own raid squads (raidsquad.h rule 2). T-1122 build: FIRST after the T-1261 naming wait above (merge 2026-11-07: an own raid squad in an area loaded here that nobody holds yet waits too, else its wake would come up empty) - on the authority too, so its own raid squads stop (or are lent) at another game's area instead of passing through it unseen */
     if ((g_relayLinkedCached != 0) && g_storeAuthority) { ++g_offscreenRanAuthority; return orig_unloadedUpdate(unloaded); }
     if (RoleIsSingle())                                 { ++g_offscreenRanSingle;    return orig_unloadedUpdate(unloaded); }
     if (g_relayLinkedCached == 0)                         ++g_offscreenSkippedNoNotebook;
@@ -7227,7 +11377,7 @@ static void WakeWaitEnd(WakeWait& w, Pod* q, const std::string& noPeople)
         P120Member lm[64]; const int ln = P120Read(q->members, q->activeChars, lm, 64); ++g_p120Loads;
         SW_DEVLOG("[PROBE] P120 load wid=" + w.wid + " writer=" + N((long long)w.owner) + " path=engine-read n=" + N((long long)ln) + (ln > 0 ? P120List(lm, ln) : std::string()));
     }
-    if (g_wakeCountLines < 40)
+    if (g_wakeCountLines < kWakeCountLineCap)
     {   /* person records in the sleeping container before the wake and in the awake one once the people are built, and the people
            awake: a record that went in twice shows after = 2 x before */
         const int after = (q != 0 && Plaus(q->active)) ? CharRecCountPod(q->active) : -1;
@@ -7235,7 +11385,7 @@ static void WakeWaitEnd(WakeWait& w, Pod* q, const std::string& noPeople)
         DebugLog("[STORE] WAKE-COUNT worldId=" + w.wid + " road=" + std::string(w.road == coopsquad::kWakeRoadSwap ? (w.taken != 0 ? "engine-read" : "save-file (swap missed)") : "reload")
                  + " writer=" + N((long long)w.owner) + " mine=" + N((long long)(w.owner == g_mySlot ? 1 : 0)) + " records " + N((long long)w.before) + " -> " + N((long long)after)
                  + " members=" + N((long long)(q != 0 ? q->activeChars : -1)) + " " + N((long long)w.ticks) + " ticks after the wake"
-                 + (q != 0 ? std::string() : (" (people not seen: " + noPeople + ")")) + " (" + N(g_wakeCountLines) + " of the first 40)");
+                 + (q != 0 ? std::string() : (" (people not seen: " + noPeople + ")")) + " (" + N(g_wakeCountLines) + " of the first " + N(kWakeCountLineCap) + ")");
     }
 }
 /* the platoon is freed or unbound while it waits */
@@ -7435,7 +11585,7 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
                    line says so. A keeper with no home restocks only as a travelling trader. [t755-lohome-judge] */
                 unsigned char loAfter[32];
                 const int loHas = (PlatoonHomeHandPod(applyPlatoon, loAfter) == 1) ? 1 : 0;
-                const int lod = coopstore::LoadOverrideHomeDecide(loHas, loHad, loKey.empty() ? 0 : 1);
+                const int lod = coopstore::LoadOverrideHomeDecideRec(loHas, loHad, loKey.empty() ? 0 : 1, coopstore::MetaHomeIsCleared(RecordHomeOf(applyId)) ? 1 : 0);   /* T-1334: a record saying "-" gets no save home back */
                 std::string loWhat;
                 if (lod == coopstore::kLoHomeKept && LoSaveHomePlayerHouse(loAfter) != 0)
                 {   /* review MED 2: the home the swapped-in record left is a player's house now - dropped as the engine's purchase drops it
@@ -7468,6 +11618,7 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
                     ++g_loHomeOwedByKey; CopyHomeOweAdd(applyPlatoon, applyId, 0, loKey);
                     loWhat = "the squad has no home after the engine's read and the save's own had none - owed by the home key " + loKey + ", given when that building is loaded here";
                 }
+                else if (lod == coopstore::kLoHomeClearedNone) { ++g_loHomeNoneAnywhere; loWhat = "the squad has no home after the engine's read and its record says none (blanked or bought, \"-\") - the save's own home is not given back (T-1334)"; }
                 else { ++g_loHomeNoneAnywhere; loWhat = "the squad has no home after the engine's read, the save's own had none and no home key is known for it - no home known for this squad anywhere"; }
                 if (!loWhat.empty() && g_loHomeSeen.insert(applyId).second)
                     DebugLog("[STORE] LOAD-OVERRIDE " + applyId + ": " + loWhat + " (loadOverrideHome kept=" + N(g_loHomeKept) + " restored=" + N(g_loHomeRestored) + " restoreFailed=" + N(g_loHomeRestoreFailed)
@@ -7519,9 +11670,11 @@ void ForgetPlatoon(void* platoon) { ForgetPlatoonRows(platoon, true); }
    entry was drained (MoneyFreedQueue), so this later forget must not take the rows of a group given the address since. */
 void ForgetPlatoonRows(void* platoon, bool money)
 {
+    OwnRaidForget(platoon, kOwnRaidFreed);   /* T-1122 own raid squads */
     ForgetContextPlatoon(platoon);   // review-p3o H1
     if (money) MoneyLoadForget(platoon);   /* T-799 D1: its pot's mark must not pass to a platoon given the same address */
     g_ctxSleptMine.erase(platoon); g_ctxSleptCount.erase(platoon); g_ctxDrops.erase(platoon); g_wakeDup.erase(platoon); g_saveSplit.erase(platoon);
+    g_ownLivedHere.erase(platoon);   /* T-850 fold 2 */
     g_arPending.erase(platoon); g_arSeen.erase(platoon); g_arFromSquadPos.erase(platoon);   /* T-1084 step 3 */
     std::map<void*, std::string>::iterator it = g_bind.find(platoon);
     if (it != g_bind.end()) { std::map<std::string, void*>::iterator b = g_byWorldId.find(it->second); if (b != g_byWorldId.end() && b->second == platoon) g_byWorldId.erase(b); g_bind.erase(it); }
@@ -7529,9 +11682,10 @@ void ForgetPlatoonRows(void* platoon, bool money)
     g_localWrittenAt.erase(platoon); g_pendingPlace.erase(platoon); g_npcStampErased.erase(platoon); g_npcPurged.erase(platoon); g_modRemoved.erase(platoon); g_modMade.erase(platoon); WakeWaitForget(platoon);
     g_bindGenOf.erase(platoon);   /* E23: the stamp is part of the binding - it goes when the binding goes, or the map grows by one entry per platoon the engine ever frees */
     HbForget(platoon);   /* E47-S2 exit edge: destroyed / retired */
-    BirthForget(platoon); g_discarding.erase(platoon); g_keepVerdictOf.erase(platoon); g_liveHomeOf.erase(platoon); g_roamOf.erase(platoon);   /* the birth flag, the keep marks, the live home read and the template test go with the platoon (the address can be reused) */
+    BirthForget(platoon); g_discarding.erase(platoon); g_keepVerdictOf.erase(platoon); g_oneKeepOf.erase(platoon); g_sleepTakenMemo.erase(platoon); g_liveHomeOf.erase(platoon); g_roamOf.erase(platoon);   /* the birth flag, the keep marks, the live home read and the template test go with the platoon (the address can be reused) */
     SquadReadForgetOne(platoon);   /* the read-in mark goes with the platoon (the address can be reused) */
     g_unloadEmptied.erase(platoon);   /* T-999 fold 3: the unload-emptied mark goes with the platoon (the address can be reused) */
+    g_otherRunRemoved.erase(platoon);   /* T-850: and the 'another game runs its people' mark */
     if (g_stCreated.erase(platoon) != 0) ++g_stForgotten;   /* T-296 fix 2: the origin mark goes with the platoon (the address can be reused) */
     g_madeFromRecord.erase(platoon); g_pairBook.Forget(platoon);   /* the record-built mark and the same-id pair notes go with the platoon (the address can be reused) */
     if (g_copyHomeOwedMap.erase(platoon) != 0) ++g_copyHomeGone;   /* a copy freed before its building loaded here: its owed home goes with it [t755-copyhome-forget] */
@@ -7598,6 +11752,104 @@ void ModRemovedKeptNote(const std::string& worldId, const char* where)
         DebugLog("[STORE] KEPT worldId=" + worldId + " - the game discarded a squad this game's own removal of people emptied" + std::string(where)
                  + ": no delete is sent and its record stays (the first 20 logged; npcWriter squadDelete[keptMod] on the REPORT)");
 }
+/* T-850: the game discarded a squad that lost living people another game runs (sqbirth::kDelRunKept): nothing is deleted here or on the
+   world server - its runner writes the record when it puts them away. Counted (otherRun[kept]) with the first 20 logged. MAIN THREAD. */
+void OtherRunKeptNote(const std::string& worldId, int was, const char* where)
+{
+    ++g_otherRunKept;
+    if (g_otherRunKeptLines < 20)
+    {
+        ++g_otherRunKeptLines;
+        DebugLog("[STORE] KEPT worldId=" + worldId + " - the game discarded a squad that lost living people another game runs" + std::string(where)
+                 + " (would have been: " + (was == sqbirth::kDelDiscard ? "discard delete" : was == sqbirth::kDelPlain ? "plain delete" : was == sqbirth::kDelModKept ? "mod-removal keep" : "?")
+                 + "): no delete is sent, its record stays and its runner writes it (the first 20 logged; otherRun[kept] on the REPORT)");
+    }
+}
+/* T-850 fold 2 (T2217): the engine destroyed a copy here that was never the squad here (sqbirth::kDelShellKept): no plain delete, here or
+   on the world server; the record stays. Counted per reason (shellKept[..] on the REPORT), the first 30 logged. MAIN THREAD. */
+void ShellKeptNote(const std::string& worldId, int wake, int other, int lived, int pair, const char* where)
+{
+    ++g_shellKept;
+    if (wake != 0) ++g_shellWake;
+    if (other != 0) ++g_shellOther;
+    if (lived == 0) ++g_shellNeverOwn;
+    if (pair != 0) ++g_shellPair;
+    if (g_shellKeptLines >= 30) return;
+    ++g_shellKeptLines;
+    std::string why;
+    if (wake != 0) why += "this game refused its wake; ";
+    if (other != 0) why += "another game runs the squad (slot " + N((long long)SwOtherRunner(worldId)) + "); ";
+    if (lived == 0) why += "it never had a living member of this game's own here; ";
+    if (pair != 0) why += "another copy here is bound to the same id; ";
+    DebugLog("[STORE] KEPT worldId=" + worldId + " - the engine destroyed a copy that was not the squad here" + std::string(where) + " (" + why
+             + "its people did not die here): no plain delete is sent, its record stays (the first 30 logged; shellKept[..] on the REPORT)");
+}
+/* T-850 fold 1: one person's answer now (sqbirth::PersonRunsElsewhere), from live facts: its runner's DESPAWN since the note, its release
+   still open, another game its owner now. MAIN THREAD. */
+void MadeEmptyNotPlacedAgain(const std::string& worldId);   /* T-850 fold 1: defined below */
+int OtherRunPersonNow(unsigned int uid, int kind)
+{
+    const int pending = kind == sqbirth::kLostHandedOff ? (HandoffReleaseHolds(uid) != 0 ? 1 : 0) : 0;   /* fold 1b: an open release record - each of its ends calls StoreRunHeldSettle */
+    const int taken = (!net::IsUidMine(uid) && net::OwnerSlotOf(uid) >= 0) ? 1 : 0;
+    return sqbirth::PersonRunsElsewhere(kind, g_otherRunDead.count(uid) != 0 ? 1 : 0, pending, taken);
+}
+int OtherRunAnswerOf(const std::map<unsigned int, int>& notes)
+{
+    int anyYes = 0, anyPending = 0;
+    for (std::map<unsigned int, int>::const_iterator n = notes.begin(); n != notes.end(); ++n)
+    {
+        const int a = OtherRunPersonNow(n->first, n->second);
+        if (a == sqbirth::kRunYes) anyYes = 1; else if (a == sqbirth::kRunPending) anyPending = 1;
+    }
+    return sqbirth::SquadRunAnswer(anyYes, anyPending);
+}
+/* takes a squad's notes (they go with its destroy) and answers for it now. MAIN THREAD. */
+int OtherRunTake(void* platoon, std::map<unsigned int, int>* notesOut)
+{
+    std::map<void*, std::map<unsigned int, int> >::iterator it = g_otherRunRemoved.find(platoon);
+    if (it == g_otherRunRemoved.end()) return sqbirth::kRunNo;
+    notesOut->swap(it->second); g_otherRunRemoved.erase(it);
+    const int a = OtherRunAnswerOf(*notesOut);
+    if (a == sqbirth::kRunNo) ++g_otherRunAnsweredNo;   /* noted, but nobody living runs them elsewhere now (died since, or a hand-over nobody took) */
+    return a;
+}
+/* T-850 fold 1 (M4): the destroy of a squad one of whose people this game offered to another game at its put-away, the offer still open:
+   no delete yet - RunHeldSettle (each release end of its people, handoff.cpp) sends `was` (the destroy's own delete) once every offer settled with nobody taking one, or keeps the record
+   when one was taken. MAIN THREAD. */
+void OtherRunHoldDelete(const std::string& worldId, long long stamp, int was, int modMade, const std::map<unsigned int, int>& notes, const char* where)
+{
+    OtherRunHeld& h = g_otherRunHeld[worldId]; h.stamp = stamp; h.was = was; h.modMade = modMade; h.notes = notes; ++g_otherRunHeldN;
+    if (g_otherRunHeldLines < 20) { ++g_otherRunHeldLines; DebugLog("[STORE] HELD delete worldId=" + worldId + " - one of its people was offered to another game at its put-away and the offer is open" + std::string(where) + ": its delete waits for the hand-over (the first 20 logged; otherRun[held] on the REPORT)"); }
+}
+/* T-850 fold 1b: EVENTS, not a per-tick look - the release of `uid` (a person this game offered at its put-away) settled: taken by another
+   game (RelAccept), put to sleep / cancelled with nobody taking it (RelAsleep), or no longer this game's (RelAdvance). Called by handoff.cpp
+   after the release state is updated (HandoffReleaseHolds(uid) is 0, the owner record shows the new owner). Resolves exactly the held
+   deletes whose notes name uid. The rebound case is decided at the bind (RunHeldRebound, from StampBind). MAIN THREAD. */
+void RunHeldSettle(unsigned int uid)
+{
+    if (g_otherRunHeld.empty() || g_tearingDown || g_quitDraining || uid == 0) return;
+    std::vector<std::string> done;
+    for (std::map<std::string, OtherRunHeld>::iterator h = g_otherRunHeld.begin(); h != g_otherRunHeld.end(); ++h)
+    {
+        const std::string& id = h->first;
+        if (h->second.notes.count(uid) == 0) continue;   /* not this person's squad */   /* a squad here answers to the id again: it lives here - nothing to delete */
+        const int r = sqbirth::RunHeldResolve(OtherRunAnswerOf(h->second.notes), h->second.was);
+        if (r == sqbirth::kDelRunHeld) continue;   /* another of its people's offers is still open: decided at that one's settle */
+        done.push_back(id);
+        if (r == sqbirth::kDelRunKept) { ++g_otherRunHeldKept; OtherRunKeptNote(id, h->second.was, " (after its hand-over: another game took a person)"); continue; }
+        ++g_otherRunHeldSent;
+        if (r == sqbirth::kDelDiscard) DiscardDeleteSend(id, h->second.stamp, "the game discarded a squad born not kept at its area unload (sent after its hand-over: nobody took its people)");
+        else if (r == sqbirth::kDelModKept) { ModRemovedKeptNote(id, " (after its hand-over)"); if (sqbirth::MadeEmptyPlaceFailed(r, h->second.modMade) != 0) MadeEmptyNotPlacedAgain(id); }
+        else if (r == sqbirth::kDelPlain && SwMaySend(id, "engine destroy delete (after its hand-over)"))
+        {
+            DeleteEntryHere(id, false);
+            { std::string fac; unsigned n = 0; if (SplitGroupId(id, &fac, &n)) SendBitsAny(fac); }   /* decision 30 */
+            const bool sent = SendGoneAny(id, h->second.stamp); ++g_goneSent; ++g_plainDeleteSent;
+            DebugLog("[STORE] DELETED worldId=" + id + " (the engine's own destroy of a group we had written down, sent after its hand-over: nobody took its people) sent=" + (sent ? "1" : "0"));
+        }
+    }
+    for (size_t i = 0; i < done.size(); ++i) g_otherRunHeld.erase(done[i]);
+}
 /* T-1080: a squad this game made from its record was discarded with no living member of its own here (sqbirth::MadeEmptyPlaceFailed):
    its record stays, and it joins the failed-creation registry for this world (g_notePlaceFailed - cleared at the world teardown), so
    the town-note placement does not make it from the same record again; the note then holds nothing back, as for a creation that
@@ -7619,6 +11871,11 @@ void UnloadEmptiedDiscardNote(const std::string& worldId, int living, int emptie
 }
 void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp, unsigned long long gen, int living)
 {
+    /* T-850: the decision below reads the 'another game runs its people' mark. A member removal the engine did off the main thread is
+       queued (spawn.cpp's despawn ring, with the squad and hasDied read at its hook) and is normally applied by ReplicateTick, before
+       StoreTick drains this destroy - but one queued after that drain and before this one would be missed. The ring is applied first
+       (a live read at the commitment); its entries are free once taken, so the later ReplicateTick drain finds nothing twice. */
+    if (!g_adminDestroy && !g_tearingDown && !g_quitDraining && OnMainThread()) { const long long before = g_otherRunNoted; coop::DrainOffThreadDespawns(); g_otherRunNotedDrained += g_otherRunNoted - before; }
     std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
     const bool boundHere = (b != g_bind.end() && !b->second.empty());   /* the main path's test, negated */
     if (boundHere)
@@ -7646,7 +11903,10 @@ void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp,
                group standing in the world, and forgetting it would strand it - so this entry is dropped whole. The dead
                group's own note is not removed either; the entry was never identifiable and saying so is the honest outcome. */
             ++g_goneRebound;
+            OwnRaidForget(platoon, kOwnRaidReused);   /* T-1122 fold b: a row at a reused address cannot be told to be the new group's - it goes (the sweep notes a campaign squad again) */
             g_modRemoved.erase(platoon); g_modMade.erase(platoon);   /* T-1080: a removal mark at a reused address cannot be told to be the new group's - it goes */
+            g_otherRunRemoved.erase(platoon);   /* T-850: likewise the 'another game runs its people' mark */
+            g_ownLivedHere.erase(platoon);   /* T-850 fold 2: likewise the own-lived mark */
             return;
         }
     }
@@ -7671,13 +11931,30 @@ void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp,
     const int offEmptied = (boundHere && g_unloadEmptied.count(platoon) != 0) ? 1 : 0;
     const int offMod = boundHere ? sqbirth::ModRemovedTake(&g_modRemoved, platoon) : 0;   /* T-1080: this game's own removal emptied it - by the freed address as g_discarding above */
     const int offMade = boundHere ? sqbirth::ModRemovedTake(&g_modMade, platoon) : 0;   /* T-1080: the mark came from a make from the record */
-    const int offDel = sqbirth::DestroyDeleteMod(offMod, boundHere ? 1 : 0, diedOut ? 1 : 0, offDiscarding, living, offEmptied, (offDiscarding != 0 && sqbirth::LivingUnloadRoad(living, offEmptied) != 0) ? BoundIdHeldByOther(platoon, id) : 0);
-    if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelModKept)
+    std::map<unsigned int, int> offNotes;
+    const int offRun = boundHere ? OtherRunTake(platoon, &offNotes) : sqbirth::kRunNo;   /* T-850: it lost living people another game runs - by the freed address as g_discarding above (the removals queued before this destroy were applied at this drain's start) */
+    const int offWas = sqbirth::DestroyDeleteMod(offMod, boundHere ? 1 : 0, diedOut ? 1 : 0, offDiscarding, living, offEmptied, (offDiscarding != 0 && sqbirth::LivingUnloadRoad(living, offEmptied) != 0) ? BoundIdHeldByOther(platoon, id) : 0);
+    const int offDel = sqbirth::DestroyDeleteRun(offRun, offMod, boundHere ? 1 : 0, diedOut ? 1 : 0, offDiscarding, living, offEmptied, (offDiscarding != 0 && sqbirth::LivingUnloadRoad(living, offEmptied) != 0) ? BoundIdHeldByOther(platoon, id) : 0);
+    /* T-850 fold 2 (T2217): the same plain-delete question as the main destroy, by the freed address only (its members are not read: the
+       queued living count and the watch's own-lived mark answer for them) */
+    const int offLived = (boundHere && g_ownLivedHere.count(platoon) != 0) ? 1 : 0;
+    const int offWake = (boundHere && g_wakeDup.count(platoon) != 0) ? 1 : 0;
+    const int offOther = (boundHere && SwOtherRunner(id) >= 0) ? 1 : 0;
+    const int offPair = (boundHere && offDel == sqbirth::kDelPlain) ? BoundIdHeldByOther(platoon, id) : 0;
+    const int offDied = sqbirth::ReallyDiedOut(diedOut ? 1 : 0, living, 0, offLived);
+    const int offDelShell = sqbirth::ShellKeep(offDel, offDied, offWake, offOther, offLived, offPair);
+    if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelRunKept)
+    { OtherRunKeptNote(id, offWas, " (drained off the main thread)"); ++g_destroyOffThreadGoneDrained; }   /* T-850: its people live on in another game: its record stays */
+    else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelRunHeld)
+    { OtherRunHoldDelete(id, stamp, offWas, offMade, offNotes, " (drained off the main thread)"); ++g_destroyOffThreadGoneDrained; }   /* T-850 fold 1 (M4): a hand-over of its people is open - the delete waits for it */
+    else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelModKept)
     { ModRemovedKeptNote(id, " (drained off the main thread)"); if (sqbirth::MadeEmptyPlaceFailed(offDel, offMade) != 0) MadeEmptyNotPlacedAgain(id); ++g_destroyOffThreadGoneDrained; }   /* this game's own removal emptied it: its record stays */
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelDiscard)
     { UnloadEmptiedDiscardNote(id, living, offEmptied, " (drained off the main thread)"); DiscardDeleteSend(id, stamp, "the game discarded a squad born not kept at its area unload (drained off the main thread)"); ++g_destroyOffThreadGoneDrained; }
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelNone)
     { ++g_discardSharedKept; ++g_destroyOffThreadGoneDrained; }   /* another squad here holds the same id: its record stays */
+    else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDelShell == sqbirth::kDelShellKept)
+    { ShellKeptNote(id, offWake, offOther, offLived, offPair, " (drained off the main thread)"); ++g_destroyOffThreadGoneDrained; }   /* T-850 fold 2: not the squad's end here */
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && !SwMaySend(id, "engine destroy delete (drained off the main thread)"))
     { ++g_destroyOffThreadGoneDrained; }   /* T-1084 step 5: another game writes this squad - its record stays, here and on the world server */
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining)
@@ -7716,6 +11993,7 @@ void detour_destroyPlatoon(void* faction, void* platoon)
     if (!OnMainThread())
     {
         MoneyFreedQueue(platoon);   /* T-799 D1: its money rows go at the drain, in order with the background loads */
+        if (RaidLentHas(platoon)) { RaidLentGone(platoon, 1); orig_destroyPlatoon(faction, platoon); return; }   /* T-1122 build: a lent copy - no gone mark for the lender's id; the tick says DIED */
         std::string offId;
         if (PlatoonSidPod(platoon, &offId) && !offId.empty())
         {
@@ -7726,6 +12004,7 @@ void detour_destroyPlatoon(void* faction, void* platoon)
         orig_destroyPlatoon(faction, platoon);
         return;
     }
+    if (RaidLentHas(platoon)) RaidLentGone(platoon, 0);   /* T-1122 build: a lent copy destroyed here - DIED to its lender unless it already ended; unbound, so no delete below */
     bool diedOut = false;   /* the death watch marked this group wiped out - read as the mark is erased; only then does its delete name its town */
     { std::map<void*, std::string>::const_iterator bb = g_bind.find(platoon); if (bb != g_bind.end()) diedOut = g_deadPending.erase(bb->second) != 0; }   /* review-p4e5 Q4 */
     if (g_adminDestroy || g_tearingDown || g_quitDraining) ++g_adminDestroys;   /* P6c (p5z HIGH-1) */
@@ -7733,6 +12012,9 @@ void detour_destroyPlatoon(void* faction, void* platoon)
     {
         // P4e (decision 26): the ENGINE threw this group away (Faction::updateActivePlatoons destroys an active group with no living
         // members; a UI removal) - the notebook gets a "gone" mark that both games honour
+        /* T-850 fold 1 (M2): removals the engine did off the main thread and still queued are applied first (as DrainGoneEntry does), so
+           this destroy decides on the same notes as the drained one. The ring's entries are free once taken; nothing here is freed. */
+        if (g_bind.find(platoon) != g_bind.end()) { const long long before = g_otherRunNoted; coop::DrainOffThreadDespawns(); g_otherRunNotedDrained += g_otherRunNoted - before; }
         std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
         if (b == g_bind.end() || b->second.empty()) ++g_goneNoId;
         else
@@ -7743,14 +12025,32 @@ void detour_destroyPlatoon(void* faction, void* platoon)
             const int emptiedByUnload = g_unloadEmptied.count(platoon) != 0 ? 1 : 0;   /* T-999 fold 3: its members were removed by the engine's own unload (-2 is then still the unload road) */
             const int modRemoved = sqbirth::ModRemovedTake(&g_modRemoved, platoon);   /* T-1080: this game's own doing emptied or made it */
             const int modMade = sqbirth::ModRemovedTake(&g_modMade, platoon);   /* T-1080: the mark came from a make from the record */
-            const int del = sqbirth::DestroyDeleteMod(modRemoved, 1, diedOut ? 1 : 0, discarding, livingNow, emptiedByUnload, (discarding != 0 && sqbirth::LivingUnloadRoad(livingNow, emptiedByUnload) != 0) ? BoundIdHeldByOther(platoon, worldId) : 0);
-            if (del == sqbirth::kDelDiscard)
+            std::map<unsigned int, int> notes;
+            const int otherRun = OtherRunTake(platoon, &notes);   /* T-850: it lost living people another game runs - answered from the live facts now (fold 1) */
+            const int heldByOther = (discarding != 0 && sqbirth::LivingUnloadRoad(livingNow, emptiedByUnload) != 0) ? BoundIdHeldByOther(platoon, worldId) : 0;
+            const int was = sqbirth::DestroyDeleteMod(modRemoved, 1, diedOut ? 1 : 0, discarding, livingNow, emptiedByUnload, heldByOther);
+            const int del = sqbirth::DestroyDeleteRun(otherRun, modRemoved, 1, diedOut ? 1 : 0, discarding, livingNow, emptiedByUnload, heldByOther);
+            /* T-850 fold 2 (T2217): a plain delete only for the squad's own end here - read from the copy now (sqbirth::ShellKeep) */
+            int shOwnLiving = 0;
+            const int shOwn = del == sqbirth::kDelPlain ? OwnMembersPod(platoon, &shOwnLiving) : 0;
+            const int shLiving = del == sqbirth::kDelPlain ? LivingMembersPod(platoon) : -1;
+            const int shLived = (g_ownLivedHere.count(platoon) != 0 || shOwnLiving > 0) ? 1 : 0;
+            const int shWake = g_wakeDup.count(platoon) != 0 ? 1 : 0;
+            const int shOther = SwOtherRunner(worldId) >= 0 ? 1 : 0;
+            const int shPair = del == sqbirth::kDelPlain ? BoundIdHeldByOther(platoon, worldId) : 0;
+            const int shDied = sqbirth::ReallyDiedOut(diedOut ? 1 : 0, shLiving, shOwn, shLived);
+            const int delShell = sqbirth::ShellKeep(del, shDied, shWake, shOther, shLived, shPair);
+            if (del == sqbirth::kDelPlain && delShell == sqbirth::kDelPlain && diedOut == false && shDied != 0) ++g_shellDiedSent;
+            if (del == sqbirth::kDelRunKept) OtherRunKeptNote(worldId, was, "");   /* T-850: its people live on in another game: its record stays, its runner writes it */
+            else if (del == sqbirth::kDelRunHeld) OtherRunHoldDelete(worldId, stamp, was, modMade, notes, "");   /* T-850 fold 1 (M4): a hand-over of its people is open - the delete waits for it */
+            else if (del == sqbirth::kDelDiscard)
             {
                 UnloadEmptiedDiscardNote(worldId, livingNow, emptiedByUnload, "");
                 DiscardDeleteSend(worldId, stamp, "the game discarded a squad born not kept at its area unload");
             }
             else if (del == sqbirth::kDelModKept) { ModRemovedKeptNote(worldId, ""); if (sqbirth::MadeEmptyPlaceFailed(del, modMade) != 0) MadeEmptyNotPlacedAgain(worldId); }   /* this game's own removal emptied it: its record stays */
             else if (del == sqbirth::kDelNone) ++g_discardSharedKept;   /* another squad here holds the same id: its record stays */
+            else if (delShell == sqbirth::kDelShellKept) ShellKeptNote(worldId, shWake, shOther, shLived, shPair, "");   /* T-850 fold 2: not the squad's end here */
             else if (!SwMaySend(worldId, "engine destroy delete")) {}   /* T-1084 step 5: another game writes this squad - its record stays, here and on the world server */
             else
             {
@@ -7811,6 +12111,145 @@ void* FindActivePlatoonImpl(::Faction* f, const std::string& worldId)
         if (id == worldId) return p;
     }
     return 0;
+}
+/* ==================== T-1122 save fold (manager 2026-11-03, design (b)): THE LENT COPIES A SAVE HOLDS (raidsq::kLentFile) ====================
+   The engine's faction save writes every squad (0x372920 -> squad save 0x372DB0; design read 2026-11-03), so a lent copy here goes into
+   this game's save; after a reload it is an ordinary squad, and its lender, told 'unknown lend' (BorrowOnLend), resumes its own frozen
+   squad - the raider twice. So each save gets beside it the lends this game holds as borrower - the road of the discovered outposts and
+   the box changes (the save-mark ring): taken at the save's request (RaidLentSaveAsk), as the saveGame pre-hook noted them when it ran
+   since (RaidLentSaveNote / RaidLentSaveClaim, the box changes' guard - a save from a paused game has no safe point between its request
+   and its run, and its pre-hook's note is what it was written with), written once the save has landed (LentFileWrite), read at the load's
+   prepare only when written after that save's quick.save (LentFileLoad), bound at the load call's end to the world it made
+   (RaidLentLoadEnded, the box changes' arm). Then, at the first ticks of that world with engine writes allowed (RaidLentLoadTick, the
+   first call of StoreTick), each listed copy - by its id in its faction, passing raidsq::LentCopyRemovable - is removed through
+   Faction::removeSquad (the hooked entry, put to sleep first when awake: PlatoonWipe's road) under the admin flag: no gone mark, no
+   record. Its lender's next status ask is answered 'unknown lend' (no row here) and it resumes. No file, or an older one: nothing is
+   done (the copy, kept byte 0 and in no raid here, is the engine's to discard - Inferred). MAIN THREAD. */
+coopbrec::BoxOwedGuard g_lentGuard;          /* the saveGame pre-hook's notes of the list, one per save run */
+coopbrec::BoxOwedArm g_lentArm;              /* the loading save's list: armed at the prepare, bound at the load call's end */
+std::vector<raidsq::LentEntry> g_lentNext;   /* the loading save's list, until its world takes it */
+std::vector<raidsq::LentEntry> g_lentWork;   /* the list this world works through */
+long g_lentWorkGen = -1; unsigned long g_lentWorkSince = 0; int g_lentWorkStarted = 0;
+const size_t kLentGuardCap = 8;
+/* the lends this game holds as borrower, as the file beside a save holds them: every row whose copy is still here (open, or ended and
+   not yet removed - either is in a save made now) */
+std::string RaidLentSaveText()
+{
+    std::vector<raidsq::LentEntry> v;
+    for (std::map<std::string, BorrowRow>::const_iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+    {
+        if (it->second.awakeHand != 0) continue;   /* T-1122 awake hand: an ordinary world squad, not a lent copy - never removed at a load */
+        raidsq::LentEntry e; e.lender = it->second.lender; e.serial = it->second.serial; e.faction = it->second.faction; e.id = it->second.id;
+        v.push_back(e);
+    }
+    std::string s;
+    if (raidsq::EncodeLentFile(v, &s) == 0)
+    {
+        ++g_lentFileEncodeFail;
+        ErrorLog("[RAIDLEND] the " + N((long long)v.size()) + " lent copies here cannot be listed for the save - a reload of it keeps them (encodeFail " + N(g_lentFileEncodeFail) + ")");
+        return std::string();
+    }
+    return s;
+}
+/* the save's request (MAIN THREAD): the list now, and the pre-hook notes taken so far (*n0) */
+std::string RaidLentSaveAsk(long long* n0) { *n0 = coopbrec::BoxOwedGuardAt(g_lentGuard); return RaidLentSaveText(); }
+/* the saveGame pre-hook: the list this save is written with. Off the main thread: counted only (the save lands with its request's list) */
+void RaidLentSaveNote(int onMainThread)
+{
+    if (onMainThread == 0) { ::InterlockedIncrement64(&g_lentNoteOffThread); return; }
+    coopbrec::BoxOwedGuardNote(&g_lentGuard, RaidLentSaveText(), kLentGuardCap);
+}
+/* the save landed: its own pre-hook note when one was taken since its request, else *text stays its request's */
+void RaidLentSaveClaim(long long n0, std::string* text) { coopbrec::BoxOwedGuardClaim(&g_lentGuard, n0, text); }
+/* the load's prepare: the loading save's list (empty: none) */
+void RaidLentLoaded(const std::vector<raidsq::LentEntry>& v) { g_lentNext = v; coopbrec::BoxOwedArmAtPrepare(&g_lentArm); }
+/* the end of the engine's load call: a load that made no world drops the list */
+void RaidLentLoadEnded(long genAtPrepare) { if (coopbrec::BoxOwedArmAtLoadEnd(&g_lentArm, genAtPrepare, coop::StoreWorldGenNow()) != 0) g_lentNext.clear(); }
+/* one listed copy removed: put to sleep first when awake (PlatoonWipe's road), then Faction::removeSquad through its hooked entry under
+   the admin flag (unbound and admin: no gone mark, no delete, no record). 1 = removed */
+static int LentSavedCopyRemove(::Faction* f, void* p)
+{
+    Pod q; std::memset(&q, 0, sizeof(q));
+    if (!ReadPod(p, &q)) return 0;
+    if (Plaus(q.active) && coop::StoreRetireLocalCopy(p) != 1) return 0;
+    if (InSleepingListImpl(f, p) != 1) return 0;
+    AdminDestroyBeginImpl();
+    detour_destroyPlatoon((void*)f, p);
+    AdminDestroyEndImpl();
+    return 1;
+}
+void RaidLentLoadTick()
+{
+    if (g_lentArm.armed == 0 && g_lentWork.empty()) return;
+    const long gen = coop::StoreWorldGenNow();
+    if (g_lentArm.armed != 0 && g_lentArm.gen != -1)
+    {   /* the load call has ended with a world: that world takes the list (a list bound to another world is dropped) */
+        if (coopbrec::BoxOwedArmTake(&g_lentArm, gen) == 1 && !g_lentNext.empty())
+        {
+            g_lentWork.swap(g_lentNext); g_lentWorkGen = gen; g_lentWorkStarted = 0;
+            LendLine("[RAIDLEND] the loaded save holds " + N((long long)g_lentWork.size()) + " lent copies (" + raidsq::kLentFile + ") - each is removed once found");
+        }
+        g_lentNext.clear();
+    }
+    if (g_lentWork.empty()) return;
+    if (g_lentWorkGen != gen) { g_lentWork.clear(); return; }   /* another world since */
+    if (!OnMainThread() || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory) || EngineWritesBlocked()) return;
+    const unsigned long now = ::GetTickCount();
+    if (g_lentWorkStarted == 0) { g_lentWorkStarted = 1; g_lentWorkSince = now; }
+    std::vector<raidsq::LentEntry> left;
+    for (size_t i = 0; i < g_lentWork.size(); ++i)
+    {
+        const raidsq::LentEntry& e = g_lentWork[i];
+        ::Faction* f = FindFactionByKey(e.faction);
+        std::vector<void*> all, pass;
+        std::string why;
+        int seen = 0;
+        if (Plaus(f))
+        {
+            ActiveListPod L;
+            if (ReadActiveListPod((void*)f, &L) && Plaus(L.items) && L.count <= 4096) for (unsigned k = 0; k < L.count; ++k) all.push_back(L.items[k]);
+            const lektor<Platoon*>* ul = f->unloadedSquads();
+            if (ul) for (unsigned k = 0; k < ul->size() && k < 4096; ++k) all.push_back((*ul)[k]);
+        }
+        for (size_t k = 0; k < all.size(); ++k)
+        {
+            void* p = all[k];
+            std::string sid;
+            if (!Plaus(p) || !PlatoonSidPod(p, &sid) || sid != e.id) continue;
+            ++seen;
+            Pod q; std::memset(&q, 0, sizeof(q));
+            const int rd = ReadPod(p, &q) ? 1 : 0;
+            const int own = OwnRaidHas(p), lentNow = RaidLentHas(p), bound = g_bind.count(p) != 0 ? 1 : 0, rec = g_records.count(e.id) != 0 ? 1 : 0;
+            const int made = rd != 0 ? RaidCampaignMadeHere((void*)f, p) : -1;
+            if (rd != 0 && raidsq::LentCopyRemovable(1, q.faction == (void*)f ? 1 : 0, own, lentNow, (int)q.persistent, made, bound, rec) == 1) pass.push_back(p);
+            else if (why.empty())
+                why = "read=" + N((long long)rd) + " ownRaid=" + N((long long)own) + " lentNow=" + N((long long)lentNow) + " kept=" + N((long long)q.persistent)
+                    + " madeHere=" + N((long long)made) + " bound=" + N((long long)bound) + " record=" + N((long long)rec);
+        }
+        const int act = raidsq::LentEntryAct(seen, (int)pass.size(), now - g_lentWorkSince);
+        const std::string who = "id=" + e.id + " serial=" + N((long long)e.serial) + " lender slot " + N((long long)e.lender) + " faction '" + e.faction + "'";
+        if (act == raidsq::kLentWait) { left.push_back(e); continue; }
+        if (act == raidsq::kLentRemove)
+        {
+            void* p = pass[0];
+            Pod q; std::memset(&q, 0, sizeof(q));
+            const int awake = (ReadPod(p, &q) && Plaus(q.active)) ? 1 : 0;
+            if (LentSavedCopyRemove(f, p) == 1)
+            {
+                ++g_lentCopyRemoved;
+                LendLine("[RAIDLEND] save copy removed: " + who + " platoon=" + P(p) + " awake=" + N((long long)awake) + " - a lent copy the save kept, removed through Faction::removeSquad (no record); its lender is told 'unknown lend' and resumes its own (removed " + N(g_lentCopyRemoved) + ")");
+            }
+            else
+            {
+                ++g_lentCopyRemoveFailed;
+                LendLine("[RAIDLEND] save copy NOT removed: " + who + " platoon=" + P(p) + " awake=" + N((long long)awake) + " - " + (awake != 0 ? "it could not be put to sleep" : "not in its faction's sleeping list") + "; it stays (removeFailed " + N(g_lentCopyRemoveFailed) + ")");
+            }
+        }
+        else if (act == raidsq::kLentAmbiguous) { ++g_lentCopyAmbiguous; LendLine("[RAIDLEND] save copy NOT removed: " + who + " - " + N((long long)pass.size()) + " squads of that id pass the match; which is the copy cannot be told (ambiguous " + N(g_lentCopyAmbiguous) + ")"); }
+        else if (act == raidsq::kLentRefused) { ++g_lentCopyRefused; LendLine("[RAIDLEND] save copy NOT removed: " + who + " - " + N((long long)seen) + " squad(s) of that id, none the lent copy (" + why + ") (refused " + N(g_lentCopyRefused) + ")"); }
+        else { ++g_lentCopyNotFound; LendLine("[RAIDLEND] save copy not found: " + who + (Plaus(f) ? std::string() : std::string(" (faction not found)")) + " - none of that id " + N((long long)(raidsq::kLentLoadWaitMs / 1000UL)) + " s after the load (notFound " + N(g_lentCopyNotFound) + ")"); }
+    }
+    g_lentWork.swap(left);
 }
 
 // The sleeping state has THREE copies of the position: the platoon's, the UnloadedPlatoon's (+0x64 and the +0x80 anchor)
@@ -7981,13 +12420,31 @@ void StateAfterWake(void* platoon, void* container)
 struct T300Drop { std::string wid; int why; int needEmpty; int tries; };
 std::vector<T300Drop> g_t300Q; std::set<std::string> g_t300Queued;
 long long g_hoWakeRefused = 0, g_hoWakeNoFile = 0;   /* M7a3f3 T-425 [m7a3f3-st1]: wakes of a squad this game handed over - refused / no file to place it */
+long long g_givenBlockedWake = 0, g_givenBlockedLines = 0;   /* T-1318: refused wakes the area rule alone would have let through (this game holds the area, or no fresh map) */
+long long g_givenWakeOffRefused = 0, g_givenWaitBuilt = 0, g_givenWaitDropped = 0, g_givenWaitSeq = -1;   /* T-1318 fold 1: given wakes refused off the main thread; the given-wait's builds / drops; the index change it last looked at */
+long long g_openWakeRefused = 0, g_openWakeOffRefused = 0, g_givenWaitOpenSeq = -1, g_givenWaitWrongWriter = 0, g_givenWaitWrongWriterLines = 0;   /* T-1318 fold 2: wakes refused while a hand-over of the squad was open (all / off the main thread); the open-offer change the given-wait last looked at; waits dropped by the writer guard (re-check B2) */
+/* T-1318 fold 1, fold 2 (re-check B2): THE GIVEN-WAIT's entry per id. wasGiven: the wait saw the squad given at an ACK (at the refusal or
+   a later look); givenSlot: the one slot it went to (-1 several / unknown); recAtAck / seqAtAck: a record was held when it was first seen
+   given, and that record's notebook sequence - GivenWaitWriterOk's facts. */
+struct GivenWaitEnt { int wasGiven, givenSlot, recAtAck; unsigned long long seqAtAck; GivenWaitEnt() : wasGiven(0), givenSlot(-1), recAtAck(0), seqAtAck(0) {} };
+std::map<std::string, GivenWaitEnt> g_givenWait;   /* T-1318 fold 1: ids whose refused copy (given, or fold 2: an open hand-over) rode the removal road, waiting (GivenWaitTick) */
+/* T-1318 fold 2: the wait's entry sees the squad given now - the slot, and (the first time) the record it holds at that moment */
+void GivenWaitSawGiven(GivenWaitEnt& e, const std::string& id, int slot)
+{
+    if (slot >= 0) e.givenSlot = slot;
+    if (e.wasGiven != 0) return;
+    e.wasGiven = 1;
+    const std::map<std::string, Record>::const_iterator r = g_records.find(id);
+    e.recAtAck = r != g_records.end() ? 1 : 0;
+    e.seqAtAck = r != g_records.end() ? r->second.seq : 0;
+}
 long long g_t300WakeRefused = 0, g_t300RecvRefused = 0, g_t300PurgeAsked = 0, g_t300PurgeNotOther = 0, g_t300Sweeps = 0, g_t300SweepQueued = 0,
           g_t300SweepKnown = 0, g_t300SweepNoMap = 0, g_t300Removed = 0, g_t300KeptKnown = 0, g_t300Cancelled = 0,
           g_t300Gone = 0, g_t300NotEmpty = 0, g_t300GaveUp = 0, g_t300Lines = 0;
 int g_t300SweepArmed = 0, g_t300SweepTries = 0;
-const int kT300WhyWake = 1, kT300WhyRecv = 2, kT300WhyPurge = 3, kT300WhySweep = 4, kT300WhyHandedOver = 5;
+const int kT300WhyWake = 1, kT300WhyRecv = 2, kT300WhyPurge = 3, kT300WhySweep = 4;   /* 5 (handed over) retired by T-1318 fold 1: a refused given wake rides the duplicate-wake road (GivenWakeRefuse) */
 const long long kT300LineCap = 200;
-const char* T300WhyWord(int why) { return why == kT300WhyWake ? "wake" : why == kT300WhyRecv ? "recv" : why == kT300WhyPurge ? "purge-emptied" : why == kT300WhySweep ? "arrival sweep" : why == kT300WhyHandedOver ? "handed over" : "?"; }
+const char* T300WhyWord(int why) { return why == kT300WhyWake ? "wake" : why == kT300WhyRecv ? "recv" : why == kT300WhyPurge ? "purge-emptied" : why == kT300WhySweep ? "arrival sweep" : "?"; }
 void T300Line(const std::string& s)
 {
     if (g_t300Lines >= kT300LineCap) return;
@@ -8042,6 +12499,10 @@ std::string T300Report()
         + N(g_t300SweepQueued) + "," + N(g_t300SweepKnown) + "," + N(g_t300SweepNoMap) + "," + N(g_t300Removed) + "," + N(g_t300KeptKnown) + ","
         + N(g_t300Cancelled) + "," + N(g_t300Gone) + "," + N(g_t300NotEmpty) + "," + N(g_t300GaveUp) + "," + N((long long)g_t300Q.size())
         + " handedOverWake[refused,noFile]=" + N(g_hoWakeRefused) + "," + N(g_hoWakeNoFile)   /* M7a3f3 T-425 [m7a3f3-st4] */
+        + " givenDecides[hoWakeRefused,givenBlockedWake]=" + N(g_hoWakeRefused) + "," + N(g_givenBlockedWake)   /* T-1318 design 1 */
+        + " givenEngine[wholeWakeNotGiven,hoUnnumberedSleep,hoUnnumberedHb]=" + N(g_wholeWakeNotGiven) + "," + N(g_hoUnnumberedSleep) + "," + N(g_hoUnnumberedHb)   /* T-1318 attempt 4 (design A): the last two are the tripwire - must stay 0 */
+        + " givenWait[offThreadRefused,built,dropped,waiting]=" + N(g_givenWakeOffRefused) + "," + N(g_givenWaitBuilt) + "," + N(g_givenWaitDropped) + "," + N((long long)g_givenWait.size())   /* T-1318 fold 1 */
+        + " openHandOver[wakeRefused,offThread]=" + N(g_openWakeRefused) + "," + N(g_openWakeOffRefused) + " givenWaitWrongWriter=" + N(g_givenWaitWrongWriter)   /* T-1318 fold 2 (re-check B1, B2) */
         + " contextPlatoon[loadSkipped,wakeSkipped,sleepRefused,sleepRefusedHandedOver;contextSleepWithMine]=" + N(g_ctxLoadSkipped) + "," + N(g_ctxWakeSkipped) + "," + N(g_ctxSleepRefused) + "," + N(g_ctxSleepRefusedHandedOver) + ";" + N(g_ctxSleepWithMine) + " contextWake[refused,noId]=" + N(g_ctxWakeRefused) + "," + N(g_ctxWakeNoId)   /* M7a2 [m7a2-cx5]: the first four are skips/refusals, exclusive; the last is sleeps that went on to the rules */
         + " sleepOtherGame=" + N(g_sleepRefusedOtherGame)   /* BlockSquadWrite at the sleep */
         + " contextDrop[queuedSleep,queuedWake,removedAsleep,removedAwake,keptLive,cancelled,gaveUp,pending]=" + N(g_ctxDropQueuedSleep) + "," + N(g_ctxDropQueuedWake) + ","
@@ -8133,6 +12594,116 @@ void SwOffWakeQueue(void* platoon, const std::string& sid)
     ::LeaveCriticalSection(&g_swOffLock);
     if (ok == 0) ::InterlockedIncrement64(&g_swWakeOffFull);
 }
+/* T-1318 fold 1 (review F1, F2, item 4): THE GIVEN-WAKE REFUSAL, shared by the wake hook and the off-thread wake's drain. A squad given
+   at an ACK (squadwriter.h GivenAtAck, HandedOverWakeRefuse) is not woken here: the refused platoon ITSELF rides the duplicate-wake road -
+   in g_wakeDup (the sweep adopts none of its people, the load hook reads no file into it) and queued by its pointer (WakeDupQueue:
+   CtxDropTick puts THAT platoon on ice and destroys it under the admin flag, no 'gone' mark; the record stays). The drop is not looked up
+   by id: another awake platoon under the same id (the runner's context platoon here) could be found first and stop the drop at "kept",
+   leaving this empty copy (review F1). Removed whatever the index says by then (no cancel), so no empty marked-read copy stays bound
+   (review F3); the id waits on the given-wait (GivenWaitTick) and is built from its record once nothing of it is given. A squad with no
+   file here goes the same road (counted noFile; its runner's put-away writes its record). offThread: the wake already ran off the main
+   thread and built its bodies - nothing is marked read. A refusal in an area this game holds (or with no fresh map) is counted
+   (givenBlockedWake) and logged, the first 20. T-1318 fold 2 (re-check B1): open - not given, but an offer of the squad is open here
+   (sent, no ACK or refusal yet; coopsquad::HandOverHoldsWake): refused on this same road (counted openHandOver, never givenBlockedWake),
+   and its id waits on the given-wait until the offer closes: accepted - the given rules; refused, timed out or the candidate gone -
+   built from this game's own record. MAIN THREAD. */
+/* T-1318 attempt 4 (design A, site 7): a wake the index alone would have refused (wholly given by its numbered people) that the squad's own
+   records / living members let through - a person of it never given; counted (givenEngine wholeWakeNotGiven), the first lines named */
+void WholeWakeNotGivenNote(const std::string& wid, int takenSlot, int offThread)
+{
+    ++g_wholeWakeNotGiven;
+    if (++g_givenEngineLines <= 40)
+        DebugLog("[STORE] WAKE of '" + wid + "'" + (offThread != 0 ? " off the main thread" : "") + " NOT refused - the squad index calls it wholly given (by its numbered people) but its own "
+                 + (offThread != 0 ? "living members" : "sleeping records") + " name a person not given (taken " + N((long long)takenSlot) + "): woken here, its people this game's (T-1318 attempt 4; givenEngine wholeWakeNotGiven="
+                 + N(g_wholeWakeNotGiven) + "; the first 40 givenEngine lines)");
+}
+void GivenWakeRefuse(void* platoon, const std::string& wid, const Pod& q, int whole, int takenSlot, int offThread, int open)
+{
+    const std::map<std::string, Record>::const_iterator rt = g_records.find(wid);
+    const int haveFile = rt != g_records.end() ? 1 : 0;
+    if (haveFile == 0) ++g_hoWakeNoFile;
+    const Sector sec = haveFile != 0 ? SectorOf(rt->second.x, rt->second.z) : (offThread != 0 ? SectorOf(q.x, q.z) : SectorOf(q.ux, q.uz));
+    const int held = HeldByOtherTS(sec);
+    const int given = coopsquad::GivenAtAck(whole, takenSlot);
+    const int toSlot = given == 0 ? -1 : takenSlot >= 0 ? takenSlot : coop::HandedOverSlot(q.faction, wid);
+    if (given != 0) { ++g_hoWakeRefused; if (offThread != 0) ++g_givenWakeOffRefused; }
+    else if (open != 0) { ++g_openWakeRefused; if (offThread != 0) ++g_openWakeOffRefused; }
+    g_bind[platoon] = wid; StampBind(platoon);
+    const int marked = (offThread == 0 && Plaus(q.unloaded) && MarkReadPod(q.unloaded) == 1) ? 1 : 0;
+    g_wakeDup.insert(platoon);
+    WakeDupQueue(platoon, wid);
+    if (g_givenWait.size() < 4096 || g_givenWait.count(wid) != 0) { GivenWaitEnt& e = g_givenWait[wid]; if (given != 0) GivenWaitSawGiven(e, wid, toSlot); }
+    if (given == 0)
+        T300Line("[STORE] WAKE of '" + wid + "' (" + P(platoon) + ")" + (offThread != 0 ? " off the main thread" : "") + " refused - a HAND-OVER of the squad is OPEN here (offered, no answer yet; area "
+                 + N((long long)sec.x) + "," + N((long long)sec.y) + " holder answer " + N((long long)held) + (haveFile != 0 ? "" : ", no file here") + "): NOT built here; "
+                 + (offThread != 0 ? "its bodies were built off the main thread" : marked != 0 ? "marked read" : "the read mark FAILED")
+                 + ", put on ice and destroyed next tick on the duplicate-wake road; the answer decides - accepted: the given rules, else built again from its record (T-1318 fold 2; openWakeRefused=" + N(g_openWakeRefused) + ")");
+    else
+    T300Line("[STORE] WAKE of '" + wid + "' (" + P(platoon) + ")" + (offThread != 0 ? " off the main thread" : "") + " refused - this game HANDED the squad to slot " + N((long long)toSlot)
+             + " (" + (whole != 0 ? "wholly given" : offThread != 0 ? "its people all given" : "its sleepers all given") + ", area " + N((long long)sec.x) + "," + N((long long)sec.y) + " holder answer " + N((long long)held)
+             + (haveFile != 0 ? "" : ", no file here") + "): NOT built here; " + (offThread != 0 ? "its bodies were built off the main thread" : marked != 0 ? "marked read" : "the read mark FAILED")
+             + ", put on ice and destroyed next tick on the duplicate-wake road; built again from its record once nothing of it is given (T-1318; hoWakeRefused=" + N(g_hoWakeRefused) + ")");
+    if (given != 0 && coopsquad::GivenBlocksOwnWake(1, held) == 1)
+    {
+        ++g_givenBlockedWake;
+        if (g_givenBlockedLines < 20)
+        {
+            ++g_givenBlockedLines;
+            DebugLog("[STORE] GIVEN-BLOCKS-WAKE '" + wid + "': this game holds area " + N((long long)sec.x) + "," + N((long long)sec.y) + " (answer " + N((long long)held)
+                     + ") but slot " + N((long long)toSlot) + " took the squad at its ACK - the wake is refused until an event clears the given entry (the runner's UNLOAD"
+                     " as gone, its DESPAWN or death, a withdrawal, a take-back, or that player leaving; a lost UNLOAD keeps it until that player leaves)"
+                     " (givenBlockedWake=" + N(g_givenBlockedWake) + "; the first 20)");
+        }
+    }
+}
+/* T-1318 fold 1 (review F3), fold 2 (re-check B1, B2): THE GIVEN-WAIT (squadwriter.h GivenWaitStep), looked at when the squad index or
+   the open offers changed (HandoffIdxSeq, HandoffOpenSeq - the events that clear a given entry or close an offer change them; no timer):
+   an id nothing of which is given and no offer of which is open is put on the release road (g_swBuildWait, SwReleaseBuild): the
+   kept-records sweep builds it from its record unless a copy is here, and waits while its only copy is still on the removal road
+   (CtxDropTick's end asks again, SwWakeDupSettled). Fold 2 (B2): a squad the wait saw given is built only from a record its runner wrote
+   (the given slot) or one another game wrote after the ACK (GivenWaitWriterOk, the runner-restart road's writer guard); otherwise the wait
+   is dropped with a counted line (the first 20) and nothing is built: the squad comes back by the roads that carry the runner's truth -
+   the runner's own put-away record (a later record of that slot reaches the store and its area's load builds it), its people taken over
+   at that player's leave (PLAYER_GONE), or its context platoon rebuilt from the record at peer-gone (spawn.cpp RetirePeerContextPlatoons).
+   MAIN THREAD, 1 Hz. */
+void GivenWaitTick()
+{
+    if (g_givenWait.empty() || !OnMainThread()) return;
+    const long long seq = coop::HandoffIdxSeq(), oseq = coop::HandoffOpenSeq();
+    if (seq == g_givenWaitSeq && oseq == g_givenWaitOpenSeq) return;
+    g_givenWaitSeq = seq; g_givenWaitOpenSeq = oseq;
+    for (std::map<std::string, GivenWaitEnt>::iterator it = g_givenWait.begin(); it != g_givenWait.end(); )
+    {
+        const std::string id = it->first;
+        const int stillGiven = (coop::HandedOverHasId(id) || coop::HandoffSquadHasGivenId(id) != 0) ? 1 : 0;
+        if (stillGiven != 0) GivenWaitSawGiven(it->second, id, coop::HandoffGivenSlotId(id));
+        const std::map<std::string, Record>::const_iterator rt = g_records.find(id);
+        const int haveRecord = rt != g_records.end() ? 1 : 0;
+        const int writerOk = haveRecord != 0 ? coopsquad::GivenWaitWriterOk(it->second.wasGiven, it->second.givenSlot, rt->second.owner, g_mySlot, it->second.recAtAck, it->second.seqAtAck, rt->second.seq) : 0;
+        const GivenWaitEnt e = it->second;
+        const int step = coopsquad::GivenWaitStep(stillGiven, coop::HandoffSquadOpen(0, id), haveRecord, writerOk);
+        if (step == 0) { ++it; continue; }
+        g_givenWait.erase(it++);
+        if (step == -1) { ++g_givenWaitDropped; continue; }
+        if (step == -2)
+        {
+            ++g_givenWaitDropped; ++g_givenWaitWrongWriter;
+            if (g_givenWaitWrongWriterLines < 20)
+            {
+                ++g_givenWaitWrongWriterLines;
+                DebugLog("[STORE] GIVEN-WAIT '" + id + "' DROPPED - nothing of it is given any more, but its record here (writer slot " + N((long long)rt->second.owner) + ", seq " + N((long long)rt->second.seq)
+                         + ") is not its runner's (slot " + N((long long)e.givenSlot) + ") and not newer than the hand-over (seq " + N((long long)e.seqAtAck) + (e.recAtAck != 0 ? "" : ", none then")
+                         + "): NOT built from it; left to the runner's roads (its next record, PLAYER_GONE, the context rebuild) (T-1318 fold 2; givenWaitWrongWriter=" + N(g_givenWaitWrongWriter) + "; the first 20)");
+            }
+            continue;
+        }
+        ++g_givenWaitBuilt;
+        g_swBuildWait.insert(id);
+        SwReleaseBuild(id);
+        T300Line("[STORE] GIVEN-WAIT '" + id + "': nothing of the squad is given and no offer of it is open - put on the release road, built from its record (writer slot " + N((long long)rt->second.owner)
+                 + (e.wasGiven != 0 ? ", the runner's or newer than the hand-over" : ", this game's own: the offer closed unaccepted") + ") unless a copy is here (T-1318 fold 2; givenWait built=" + N(g_givenWaitBuilt) + ")");
+    }
+}
 /* every frame: each queued off-thread wake is checked as the wake hook checks one (squadwriterreg.h OffWakeRefuse) - the platoon is still
    the awake platoon of that id (read from the record's faction now), of a world NPC faction, and another game runs the squad: put on the
    duplicate-wake road (its people never adopted, put on ice and destroyed by CtxDropTick), built again when that game lets it go */
@@ -8144,9 +12715,34 @@ void SwOffWakeDrainTick()
     for (size_t i = 0; i < q.size(); ++i)
     {
         ++g_swWakeOffChecked;
+        if (RaidLentHas(q[i].platoon)) continue;   /* T-1122 build: a lent copy - no writer question */
         const std::map<void*, std::string>::const_iterator b = g_bind.find(q[i].platoon);
         const std::string wid = b != g_bind.end() ? b->second : q[i].sid;
-        if (wid.empty() || IsZoneId(wid) || SwOtherRunner(wid) < 0) continue;
+        if (wid.empty() || IsZoneId(wid)) continue;
+        if (coop::HandedOverAny() || coop::HandoffOpenAny() != 0)
+        {   /* T-1318 fold 2 (re-check B1): an offer of the squad open here refuses it the same way (HandOverHoldsWake).
+               T-1318 fold 1 (review F2): the main wake's given test on the same facts - the squad wholly given, or every person of it given to
+               one slot; the wake already built the bodies, so their own hands are read (HandoffMembersTakenBy), the sleeping records when
+               it has none. Still the awake platoon of that id in its own faction: refused onto the duplicate-wake road (GivenWakeRefuse). */
+            Pod gq; gq.faction = 0; gq.unloaded = 0; gq.members = 0; gq.activeChars = 0; gq.x = gq.z = gq.ux = gq.uz = 0.0f;
+            if (ReadPod(q[i].platoon, &gq) && Plaus(gq.faction) && FindActivePlatoonImpl((::Faction*)gq.faction, wid) == q[i].platoon)
+            {
+                const int whole = coop::HandedOverHas(gq.faction, wid) ? 1 : 0;
+                int takenSlot = coopsquad::kTakenUnread;   /* T-1318 attempt 4 (design A, site 7): read whenever a person of it is given - the living members decide */
+                if (coop::HandoffSquadHasGiven(gq.faction, wid) != 0)
+                    takenSlot = (gq.activeChars > 0 && Plaus(gq.members)) ? coop::HandoffMembersTakenBy(gq.faction, wid, gq.members, gq.activeChars) : SleepersTakenSlotNow(q[i].platoon, gq.faction, wid);
+                const int given = coopsquad::GivenAtAck(whole, takenSlot);
+                if (whole != 0 && given == 0) WholeWakeNotGivenNote(wid, takenSlot, 1);
+                const int open = given == 0 ? coop::HandoffSquadOpen(gq.faction, wid) : 0;
+                if (coopsquad::HandedOverWakeRefuse(coopsquad::HandOverHoldsWake(given, open), T300WorldFaction(q[i].platoon)) == 1)
+                {
+                    GivenWakeRefuse(q[i].platoon, wid, gq, whole, takenSlot, 1, open);
+                    continue;
+                }
+                if (coop::HandoffSquadHasGiven(gq.faction, wid) != 0) coop::HandoffNoteWokeWithGiven(gq.faction, wid);   /* T-1318 a4 fold 1 (review MEDIUM-2): its re-made given people are removed by the sweep */
+            }
+        }
+        if (SwOtherOrHeld(wid) == 0) continue;   /* T-1269: another game runs it, or the list hold holds it */
         const std::map<std::string, Record>::const_iterator rt = g_records.find(wid);
         ::Faction* f = rt != g_records.end() ? FindFactionByKey(rt->second.factionName) : 0;
         const int same = (Plaus(f) && FindActivePlatoonImpl(f, wid) == q[i].platoon) ? 1 : 0;
@@ -8156,21 +12752,35 @@ void SwOffWakeDrainTick()
         ++g_swWakeOffRefused;
         g_wakeDup.insert(q[i].platoon);
         WakeDupQueue(q[i].platoon, wid);
-        WakeDupLine("[STORE] WAKE of '" + wid + "' (" + P(q[i].platoon) + ") off the main thread refused - another game runs the squad: put on ice and destroyed next tick, built again when that game lets it go (squadWriter wakeOffRefused=" + N(g_swWakeOffRefused) + ")");
+        WakeDupLine("[STORE] WAKE of '" + wid + "' (" + P(q[i].platoon) + ") off the main thread refused - " + (SwOtherRunner(wid) >= 0 ? "another game runs the squad" : "held until this link's list of who runs which group ends") + ": put on ice and destroyed next tick, built again when that game lets it go (squadWriter wakeOffRefused=" + N(g_swWakeOffRefused) + ")");
     }
 }
 /* the link to the world server down longer than the grace (squadwriterreg.h OtherListLinkStep): the list of squads other games run is
    dropped - the next WELCOME's list rebuilds it; the squads waiting here are looked at again at its LIST END */
 void SwOtherLinkTick()
 {
-    if (sqwreg::OtherListLinkStep(LinkUp() ? 1 : 0, (unsigned)::GetTickCount(), &g_swLinkDownSeen, &g_swLinkDownAt, g_swOther.empty() ? 1 : 0) == 0) return;
-    ++g_swOtherDropped;
-    DebugLog("[STORE] SQUAD-WRITER the world-server link has been down over " + N((long long)(sqwreg::kOtherListGraceMs / 1000u)) + " s: the list of squads other games run ("
-             + N((long long)g_swOther.size()) + ") is dropped - the next WELCOME's list rebuilds it (squadWriter[otherDroppedLinkDown] on the REPORT)");
-    g_swOther.clear();
+    SwReclaimSend();   /* T-1269 [t1269a-B]: a re-claim batch still owed (the link was not up at its WELCOME, or the end mark's send failed) */
+    const unsigned nowMs = (unsigned)::GetTickCount(); const int up = LinkUp() ? 1 : 0;
+    if (sqwreg::OtherListLinkStep(up, nowMs, &g_swLinkDownSeen, &g_swLinkDownAt, g_swOther.empty() ? 1 : 0) != 0)
+    {
+        ++g_swOtherDropped;
+        DebugLog("[STORE] SQUAD-WRITER the world-server link has been down over " + N((long long)(sqwreg::kOtherListGraceMs / 1000u)) + " s: the list of squads other games run ("
+                 + N((long long)g_swOther.size()) + ") is dropped - the next WELCOME's list rebuilds it (squadWriter[otherDroppedLinkDown] on the REPORT)");
+        g_swOther.clear();
+    }
+    /* T-1269 [t1269a-A]: going offline lifts the list hold (squadwriterreg.h ListHoldOfflineLift) - no list ends on that link; each held id
+       is built as at a LIST END (the next WELCOME holds again) */
+    if (sqwreg::ListHoldOfflineLift(g_swListHold, up, g_swLinkDownSeen, nowMs, g_swLinkDownAt) == 0) return;
+    g_swListHold = sqwreg::ListHoldAfter(g_swListHold, sqwreg::kLhOffline, 0);
+    const std::vector<std::string> ids(g_swHeldIds.begin(), g_swHeldIds.end());
+    g_swHeldIds.clear(); g_swHeldLiftedOffline += (long long)ids.size();
+    DebugLog("[STORE] SQUAD-WRITER the world-server link has been down over " + N((long long)(sqwreg::kOtherListGraceMs / 1000u)) + " s before this link's list of who runs which group ended:"
+             " the hold is lifted and its " + N((long long)ids.size()) + " held groups are built (squadWriter[listHeldLiftedOffline] on the REPORT)");
+    for (size_t i = 0; i < ids.size(); ++i) SwReleaseBuild(ids[i]);
 }
 void detour_activate(void* platoon)
 {
+    OwnRaidForget(platoon, kOwnRaidWoke);   /* T-1122 own raid squads: the wake ends the row (any thread - its own lock) */
     if (!OnMainThread())
     {   /* the maps are main-thread only: the wake runs, and the platoon with its engine squad id (the guarded read, before the call) is queued
            for the main thread's other-runner check (SwOffWakeDrainTick) */
@@ -8178,8 +12788,10 @@ void detour_activate(void* platoon)
         std::string offSid; if (!PlatoonSidPod(platoon, &offSid)) offSid.clear();
         orig_activate(platoon); WakeNoteStandIn(platoon); /* inv7a2 */
         SwOffWakeQueue(platoon, offSid);
+        if (RaidLentHas(platoon)) LentWokeOffThread(platoon);   /* T-1122 attempt 2 fold 1 (LOW): its RaidLentWoke (the placement) on the main thread */
         return;
     }   // review-store S4: the maps are main-thread only
+    if (RaidLentHas(platoon)) { orig_activate(platoon); RaidLentWoke(platoon); return; }   /* T-1122 build: a lent copy wakes with no record, writer or deleted-mark question - the tick gives its march order */
     {
         // decision 30: a group whose number is in its faction's deleted bitmap is thrown away instead of woken (a stale copy in this save)
         const std::string wid = WorldIdOf(platoon);
@@ -8208,28 +12820,34 @@ void detour_activate(void* platoon)
             return;
         }
     }
-    if (g_on && g_dirReady && coop::HandedOverAny())
+    if (g_on && g_dirReady && (coop::HandedOverAny() || coop::HandoffOpenAny() != 0))
     {
-        /* M7a3f3 T-425 [m7a3f3-st5]: a squad this game HANDED to another game, in an area another game holds (at this game's file position)
-           or a frozen one - this game's copy is stale (the other game runs the squad): refused as T-300 refuses another game's file. */
+        /* T-1318 design 1 (was M7a3f3 T-425 [m7a3f3-st5], which asked the area's holder): a squad another game TOOK at its adoption ACK -
+           the squad index has it wholly given (HandedOverHas), or the sleeping squad's own people are all given to one slot (person by
+           person, SleepersTakenSlotNow) - is not woken here WHOEVER HOLDS THE AREA: the other game runs it, and a wake would rebuild its
+           people under new ids. Fold 1: refused by GivenWakeRefuse - the container marked read so no bodies are built, and this platoon
+           itself put on the duplicate-wake road (removed by its pointer, never adopted), with or without a file here; the engine's caller
+           activates it anyway, so the wake finishes. Fold 2 (re-check B1): before the ACK, while an offer of the squad is open here (sent, no
+           ACK or refusal yet - coop::HandoffSquadOpen, the asleep road's RELEASE and the awake road's XFER flight), it is refused the same way
+           (HandOverHoldsWake); after a refusal, time-out or the candidate gone, the given-wait builds it from this game's own record. */
         const std::string wid = WorldIdOf(platoon);
-        Pod q;
-        if (!wid.empty() && !IsZoneId(wid) && ReadPod(platoon, &q) && coop::HandedOverHas(q.faction, wid))
+        Pod q; q.faction = 0; q.unloaded = 0; q.x = q.z = q.ux = q.uz = 0.0f;
+        if (!wid.empty() && !IsZoneId(wid) && ReadPod(platoon, &q))
         {
-            std::map<std::string, Record>::const_iterator rt = g_records.find(wid);
-            if (rt == g_records.end()) ++g_hoWakeNoFile;
-            else
+            const int whole = coop::HandedOverHas(q.faction, wid) ? 1 : 0;
+            /* T-1318 attempt 4 (owner 1626, design A, site 7): the sleeping squad's own records decide whenever they read - a wholly given
+               squad (by its numbered people) whose records name a person not given is NOT refused (GivenAtAck: -1 read, not all given) */
+            const int takenSlot = coop::HandoffSquadHasGiven(q.faction, wid) != 0 ? SleepersTakenSlotNow(platoon, q.faction, wid) : coopsquad::kTakenUnread;
+            const int given = coopsquad::GivenAtAck(whole, takenSlot);
+            if (whole != 0 && given == 0) WholeWakeNotGivenNote(wid, takenSlot, 0);
+            const int open = given == 0 ? coop::HandoffSquadOpen(q.faction, wid) : 0;
+            if (coopsquad::HandedOverWakeRefuse(coopsquad::HandOverHoldsWake(given, open), T300WorldFaction(platoon)) == 1)
             {
-                const Sector sec = SectorOf(rt->second.x, rt->second.z);
-                if (coopsquad::HandedOverWakeRefuse(1, HeldByOtherTS(sec), T300WorldFaction(platoon)) == 1)
-                {
-                    ++g_hoWakeRefused; T300Queue(wid, kT300WhyHandedOver, 0); g_bind[platoon] = wid; StampBind(platoon);
-                    T300Line("[STORE] WAKE of '" + wid + "' refused - this game HANDED the squad to another game, which holds " + N((long long)sec.x) + "," + N((long long)sec.y)
-                             + " (another player in this world): this game's copy is stale - NOT refilled from the file; the copy is put back on ice and thrown away on the next tick (T-425)");
-                    orig_activate(platoon);
-                    return;
-                }
+                GivenWakeRefuse(platoon, wid, q, whole, takenSlot, 0, open);
+                orig_activate(platoon);
+                return;
             }
+            if (coop::HandoffSquadHasGiven(q.faction, wid) != 0) coop::HandoffNoteWokeWithGiven(q.faction, wid);   /* T-1318 a4 fold 1 (review MEDIUM-2): its re-made given people are removed by the sweep */
         }
     }
     if (g_on && g_dirReady && coop::IsContextPlatoon(platoon) == 1)
@@ -8283,13 +12901,13 @@ void detour_activate(void* platoon)
            time beside that game's. Refused onto the duplicate-wake road (not woken: its container marked read, its people never adopted,
            put on ice and destroyed next tick by CtxDropTick, no gone mark); built again from its record when that game lets it go. */
         const std::string wid = WorldIdOf(platoon);
-        if (!wid.empty() && !IsZoneId(wid) && SwOtherRunner(wid) >= 0 && T300WorldFaction(platoon) == 1 && SwOtherRefuse(wid, 1, "WAKE") != 0)
+        if (!wid.empty() && !IsZoneId(wid) && SwOtherOrHeld(wid) != 0 && T300WorldFaction(platoon) == 1 && SwOtherRefuse(wid, 1, "WAKE") != 0)   /* T-1269: or held until the list ends */
         {
             g_wakeDup.insert(platoon);
             Pod q; q.unloaded = 0;
             const int marked = (ReadPod(platoon, &q) && Plaus(q.unloaded) && MarkReadPod(q.unloaded) == 1) ? 1 : 0;
             WakeDupQueue(platoon, wid);
-            WakeDupLine("[STORE] WAKE of '" + wid + "' (" + P(platoon) + ") refused - another game runs the squad: NOT woken; " + (marked != 0 ? "marked read" : "the read mark FAILED")
+            WakeDupLine("[STORE] WAKE of '" + wid + "' (" + P(platoon) + ") refused - " + (SwOtherRunner(wid) >= 0 ? "another game runs the squad" : "held until this link's list of who runs which group ends") + ": NOT woken; " + (marked != 0 ? "marked read" : "the read mark FAILED")
                         + ", put on ice and destroyed next tick, built again when that game lets it go (squadWriter wakeRefusedOtherWriter=" + N(g_swWakeRefusedOther) + ")");
             orig_activate(platoon);
             return;
@@ -8322,6 +12940,7 @@ void detour_activate(void* platoon)
        (squadwriter.h NpcWakeSkipLoad): no record is applied at this wake; a later wake loads it once that game lets go (its stamp is
        forgotten only when the orphan purge empties this copy - NpcPurgeForget) */
     int npcHeldElsewhere = 0;
+    int npcHolderSlot = -1;   /* T-850: the slot the area map names as that area's holder - for the 'woke without record' line */
     if (g_on && g_dirReady)
     {
         Pod nq; const std::string nwid = WorldIdOf(platoon);
@@ -8329,9 +12948,10 @@ void detour_activate(void* platoon)
         {
             float wx = nq.ux, wz = nq.uz; int wpos = coopsquad::SquadPosUsable(nq.ux, nq.uy, nq.uz);
             if (wpos == 0) { std::map<std::string, Record>::const_iterator nr = g_records.find(nwid); if (nr != g_records.end() && (nr->second.x != 0.0f || nr->second.z != 0.0f)) { wx = nr->second.x; wz = nr->second.z; wpos = 1; } }
-            if (wpos != 0) npcHeldElsewhere = coopsquad::NpcWakeSkipLoad(1, HeldByOtherTS(SectorOf(wx, wz)));
+            if (wpos != 0) { npcHeldElsewhere = coopsquad::NpcWakeSkipLoad(1, HeldByOtherTS(SectorOf(wx, wz))); npcHolderSlot = coop::AreaHolderSlotTS(SectorOf(wx, wz)); }
         }
     }
+    long long rwAt = 0;   /* T-1122 RETURN by reference: the record this wake loaded (or left to the engine's read) - for a RETURN waiting here */
     void* countWait = 0; WakeWait ww; ww.road = 0; ww.owner = -1; ww.writtenAt = 0; ww.before = -1; ww.taken = 0; ww.ticks = 0; ww.offThreadAt = g_loadOverrideOffThread; ww.why = 0; ww.at = ::GetTickCount();   /* a record applied, or left to the engine's read, at this wake: it waits for the squad's people */
     if (g_on && g_dirReady)
     {
@@ -8363,6 +12983,14 @@ void detour_activate(void* platoon)
                 {   /* another game holds the squad's area: its live people are the world's version; the record waits for a later wake */
                     ++g_npcWakeLoadSkipped;
                     NpcLine("[STORE] WAKE worldId=" + worldId + " record writtenAt=" + N(r.writtenAt) + " local=" + N(local) + " NOT applied: another game holds the squad's area (wakeLoadSkipped=" + N(g_npcWakeLoadSkipped) + ")");
+                    /* T-850 (close check): the wake gate above refused nothing - the writer list names no other runner for this squad and no
+                       list hold is on - yet another game holds its area, so it wakes on this game with the people its own copy had, not
+                       the world's record. Its own line and cap (the NPC writer cap above is shared), so a run can count these wakes. */
+                    static long long s_wokeNoRecordLines = 0;
+                    if (++s_wokeNoRecordLines <= 30)
+                        DebugLog("[STORE] WAKE '" + worldId + "' woke without record: another game holds its area (holder slot " + N((long long)npcHolderSlot)
+                                 + ") and the squad is not on that game's runner list (runner " + N((long long)SwOtherRunner(worldId)) + ") - its people are this copy's, not the world record's (line "
+                                 + N(s_wokeNoRecordLines) + " of 30; wakeLoadSkipped=" + N(g_npcWakeLoadSkipped) + ")");
                 }
                 else if (road == coopsquad::kWakeRoadSwap)
                 {   /* the container's "already read" byte is 0: the engine reads this squad's file when it builds the people, a later
@@ -8373,6 +13001,7 @@ void detour_activate(void* platoon)
                     const int haveFile = U8GetFileAttributes(r.file.c_str()) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
                     if (haveFile) SetSleepPosPod(platoon, r.x, r.y, r.z, 1);
                     countWait = platoon; ww.road = coopsquad::kWakeRoadSwap; ww.owner = r.owner; ww.wid = worldId; ww.writtenAt = r.writtenAt;
+                    if (haveFile) rwAt = r.writtenAt;
                     if (!haveFile) ww.why = "the record's file was missing at the wake";
                     ++g_wakeRoadSwap;
                     DebugLog("[STORE] WAKE worldId=" + worldId + " squad='" + r.squadSid + "' record writtenAt=" + N(r.writtenAt) + " local=" + N(local)
@@ -8393,6 +13022,7 @@ void detour_activate(void* platoon)
                         if (ld == 1) { SetSleepPosPod(platoon, r.x, r.y, r.z, 1); g_localWrittenAt[platoon] = r.writtenAt; ++g_applied; PendingPlace pp; pp.x = r.x; pp.y = r.y; pp.z = r.z; pp.ticks = 0; g_pendingPlace[platoon] = pp; }
                         else ++g_loadFailed;
                         if (ld == 1 && r.owner != g_mySlot && g_p120Loads < 40) { g_p120LoadPlatoon = platoon; g_p120LoadWriter = r.owner; }   // PROBE P120
+                        if (ld == 1) rwAt = r.writtenAt;
                         if (ld == 1) { countWait = platoon; ww.road = coopsquad::kWakeRoadLoad; ww.owner = r.owner; ww.wid = worldId; ww.writtenAt = r.writtenAt; ww.taken = 1; HbNoteWakeLoaded(platoon, r.writtenAt); }
                         DebugLog("[STORE] WAKE worldId=" + worldId + " squad='" + r.squadSid + "' record writtenAt=" + N(r.writtenAt) + " local=" + N(local)
                                  + " load=" + N(ld) + " pos " + F1(q.ux) + "," + F1(q.uy) + "," + F1(q.uz) + " -> " + F1(r.x) + "," + F1(r.y) + "," + F1(r.z) + " file=" + r.file);
@@ -8404,9 +13034,10 @@ void detour_activate(void* platoon)
         }
         else ++g_noId;
     }
+    if (!g_returnWait.empty()) ReturnWaitAtWake(platoon, rwAt);   /* T-1122 RETURN by reference: a RETURN waiting for its record - this wake settles it (and says which road applied it) */
     if (countWait == platoon)
     {   /* person records in the sleeping container before the wake; the people are built on a later tick (WakeWaitTick) */
-        if (g_wakeCountLines < 40) { Pod cb; ww.before = (ReadPod(platoon, &cb) && Plaus(cb.unloaded)) ? CharRecCountPod(cb.unloaded) : -1; }
+        if (g_wakeCountLines < kWakeCountLineCap) { Pod cb; ww.before = (ReadPod(platoon, &cb) && Plaus(cb.unloaded)) ? CharRecCountPod(cb.unloaded) : -1; }
         std::map<void*, WakeWait>::iterator prev = g_wakeWait.find(platoon);
         if (prev != g_wakeWait.end()) { WakeWaitEnd(prev->second, 0, "woken again before its people were seen"); g_wakeWait.erase(prev); }
         g_wakeWait[platoon] = ww;
@@ -9279,6 +13910,52 @@ long long g_zoneOwnStore = 0, g_zoneWriteFail = 0;
 // zoneWriteAfterTeardownFlush (the same scope, counted at the success exit), viaFlush - zoneWriteAfterTeardownFlush
 // is how many saves that flush saw and did not write. It does NOT say which exit those took.
 long long g_zoneSaveViaFlush = 0;
+/* T-1243 (owner 1520 e, 2026-11-05): AN AREA FILE READ BACK THAT CANNOT BE READ TO ITS END IS NOT SENT (ZoneSaveApply) - checked with the
+   world server's own reader (zonecheck::Readable). Counted in zoneSave[readFail], so the eight exits still sum to ZONE saves=, and apart
+   in zoneUnreadableNotSent=. T-1243 fold: zoneUnreadableNotSent= is a SPAN over three roads, each also counted in its own exit - the
+   save (zoneSave[readFail]), the outage journal (zoneOutageQueue[queueRefused]; that save is in zoneSave[notMine] already) and the
+   journal's replay of an entry journaled before this check (outageQueue[droppedBadPayload]). And the TEST-ONLY zonedamage lever's one arming (coop::ZoneDamageLever): ZoneDamageMaybe zeroes the armed
+   bytes of the next send of that area record at the armed stage - `before` in ZoneSaveApply ahead of the check, `after` in
+   ZoneMirrorCommit on the copy sent only - and disarms. MAIN THREAD. */
+long long g_zoneUnreadableNotSent = 0, g_zoneDamageApplied = 0;
+zonecheck::DamageArm g_zoneDamage;
+void ZoneDamageMaybe(int when, const std::string& zoneId, std::vector<char>* bytes)
+{
+    if (zonecheck::DamageTakes(g_zoneDamage, when, zoneId) == 0) return;
+    const zonecheck::DamageArm a = g_zoneDamage;
+    g_zoneDamage = zonecheck::DamageArm();   /* one use per arming */
+    const long long set = zonecheck::DamageApply(bytes, a.offset, a.length);
+    ++g_zoneDamageApplied;
+    DebugLog("[ZONEDAMAGE] applied " + zoneId + " " + zonecheck::WhenWord(when) + " offset=" + N(a.offset) + " length=" + N(a.length) + " zeroed=" + N(set)
+             + " of " + N((long long)bytes->size()) + " bytes - disarmed (TEST-ONLY)");
+}
+/* T-1243 (owner 1523) TEST-ONLY zonedamage ... mirror: at this game's next mirror write of the armed area record (ZoneMirrorCommit,
+   any of its three writers; for a save that is after ZoneSaveApply's check and after the send, so the world server holds the whole
+   copy) the mirror FILE is read back, the armed bytes are set to zero (ZoneDamageMaybe, which disarms) and the file is written again;
+   then the kept table is written whole (MirrorKeepWrite), so that row has the damaged file's size and last-write time and only
+   MirrorKeepLoad's content check can catch it at the next start. Until then this session's area swap serves the damaged file too,
+   should the area load again. MAIN THREAD. */
+void ZoneDamageMirrorMaybe(const Record& r)
+{
+    if (zonecheck::DamageTakes(g_zoneDamage, zonecheck::kDamageMirror, r.worldId) == 0) return;
+    std::vector<char> fb;
+    if (!ReadFileBytes(r.file, &fb)) { DebugLog("[ZONEDAMAGE] mirror " + r.worldId + ": " + r.file + " could not be read back - still armed (TEST-ONLY)"); return; }
+    const bool pastEnd = g_zoneDamage.offset < 0 || (unsigned long long)g_zoneDamage.offset >= (unsigned long long)fb.size();   /* re-check #5: nothing to zero */
+    ZoneDamageMaybe(zonecheck::kDamageMirror, r.worldId, &fb);
+    if (pastEnd)
+    {
+        DebugLog("[ZONEDAMAGE] mirror " + r.worldId + ": " + r.file + " (" + N((long long)fb.size()) + " bytes) - nothing zeroed (offset past the end): the file is"
+                 " not rewritten and the kept table not written again; disarmed (TEST-ONLY)");
+        return;
+    }
+    const bool wrote = WriteFileBytes(r.file, fb);
+    const long long tablesBefore = g_mkWritten;
+    MirrorKeepWrite("zonedamage mirror (TEST-ONLY)");
+    DebugLog("[ZONEDAMAGE] mirror " + r.worldId + ": " + r.file + (wrote ? std::string(" rewritten with the zeroed bytes") : std::string(" could NOT be rewritten - it keeps its bytes"))
+             + (g_mkWritten > tablesBefore ? std::string("; the kept table was written again, so its row has this file's size and time")
+                                           : std::string("; the kept table was NOT written again (no kept folder, or its write failed)"))
+             + " (TEST-ONLY)");
+}
 struct ZoneSaveLine
 {
     long long n; int written; bool armed; std::string id;
@@ -9310,8 +13987,35 @@ long long g_zoneWriteWaitedForLoad = 0, g_zoneWriteWaitDropped = 0; int g_zoneWa
    record's bytes into the engine, so the copy loaded here did not produce these bytes and is NOT marked (a save) or
    restamped (a replay) as loaded from the record written here; it keeps its load's older stamp and F480's gate refuses
    its next save. Returns 1 written, 0 the write failed. */
+/* T-1243 (owner 1523, 2026-11-05): THE ONE PLACE EVERY AREA COPY ENTERS THE MIRROR - this game's save, the journal's replay and a record
+   from the world server (fetched before the load, fed or forwarded), each immediate or parked - NEVER WRITES ONE THAT CANNOT BE READ TO
+   ITS END (the world server's reader, zonecheck::ReadableBytes). Such a copy is not written and no record is taken or republished for
+   it: a record this game already holds for the key is kept while the file it names still reads to its end, and dropped otherwise
+   (ZoneHeldAreaFileCheck, which sets an unreadable file aside), so with no record left the area swap names nothing and Kenshi loads
+   its own file. Returns 0, which every caller already reads as "not written" (ZoneSaveApply: not written; the load's fetch:
+   preWriteFailed, not current for this load; the RECV, the replay and the parked retry ignore it). Counted in zoneMirrorUnreadable=.
+   The save's own check (ZoneSaveApply) and the replay's (QueueSendEntry) stay: they stop the SEND, which this does not. MAIN THREAD. */
+long long g_zoneMirrorUnreadable = 0;
 int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, const std::string& src, bool deferred)
 {
+    if (IsZoneId(r.worldId))
+    {
+        size_t zstop = 0;
+        if (zonecheck::ReadableBytes(bytes, &zstop) == 0)
+        {
+            ++g_zoneMirrorUnreadable;
+            const char* kindWord = kind == kZoneWriteSave ? "this game's save" : kind == kZoneWriteReplay ? "the journal's replay" : "a record from the world server";
+            const int kept = ZoneHeldAreaFileCheck(r.worldId, "an unreadable copy from " + std::string(kindWord) + " was not written over it");
+            const std::map<std::string, Record>::const_iterator hs = g_records.find(r.worldId);
+            const bool heldStays = kept != 0 && hs != g_records.end() && !hs->second.file.empty();
+            if (kept != 0) ZoneSwapPublish(r.worldId);   /* undoes the caller's hide (ZoneSwapHideUnlessLoading) for a record kept; with none, removes nothing more */
+            ErrorLog("[ZONE] " + r.worldId + " from " + std::string(kindWord) + (deferred ? " (after waiting for a load)" : "") + ": " + N((long long)bytes.size())
+                     + " bytes cannot be read to their end (reading stopped at byte " + N((long long)zstop) + ") - not written; "
+                     + (heldStays ? std::string("the readable copy already held here is kept and served") : std::string("Kenshi loads its own file"))
+                     + " (zoneMirrorUnreadable=" + N(g_zoneMirrorUnreadable) + ")");
+            return 0;
+        }
+    }
     if (deferred) g_zoneKeptMark.erase(r.worldId);   /* T-609: a record held back behind a load lands after that load - the copy loaded
                                                          here never took it in step, so it can no longer be adopted (ZoneKeptAdopt) */
     if (!WriteFileBytes(r.file, bytes))
@@ -9332,8 +14036,16 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
     if (!deferred && !g_tearingDown && !g_quitDraining) { ZoneStamp st; st.writtenAt = r.writtenAt; st.seq = r.seq; g_zoneFromRecord[r.worldId] = st; }   // what is loaded here now IS the record   /* P6c (p5z HIGH-1): and not during the quit drain either, which is the same "nothing is loaded" situation */
     ++g_zoneWritten;   /* E22c: the line reports the outcome, not the intent */
     if (g_postTeardownFlush) ++g_zoneWriteAfterTeardownFlush;   /* P6c (p5z MEDIUM-5): the one number that says E33's re-ordering did what it was for */
-    const bool sent = SendRecordAny(r.worldId, "", "", 0.0f, 0.0f, 0.0f, r.writtenAt, r.owner, bytes);
+    bool sent = false;
+    if (zonecheck::DamageTakes(g_zoneDamage, zonecheck::kDamageAfter, r.worldId) != 0)
+    {   /* T-1243 TEST-ONLY zonedamage ... after: only the copy SENT is damaged, after ZoneSaveApply's check (the world server's must refuse it); this game's mirror file above keeps the bytes it saved */
+        std::vector<char> dmg(bytes);
+        ZoneDamageMaybe(zonecheck::kDamageAfter, r.worldId, &dmg);
+        sent = SendRecordAny(r.worldId, "", "", 0.0f, 0.0f, 0.0f, r.writtenAt, r.owner, dmg);
+    }
+    else sent = SendRecordAny(r.worldId, "", "", 0.0f, 0.0f, 0.0f, r.writtenAt, r.owner, bytes);
     coop::KeptAreaSent(r.worldId, sent ? 1 : 0, r.writtenAt);   /* KEPT: the write's stamp - the echo that answers it carries the same stamp */
+    if (zonerec::ZoneEmptyIs(bytes) != 0) ++g_zoneEmptyPublished;   /* T-1329: an EMPTY area record written here (and sent, when the link is up - the WROTE line says) */
     DebugLog("[ZONE] WROTE " + r.worldId + " bytes=" + N((long long)bytes.size()) + " from '" + src + "' -> " + r.file + (sent ? " (sent)" : " (not sent - no link)") + (deferred ? " - after waiting for a load of that path" : ""));
     }
     else if (kind == kZoneWriteReplay)
@@ -9347,6 +14059,7 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
              " written now (decision 52)");
     }
     else DebugLog("[ZONE] RECV " + r.worldId + " bytes=" + N((long long)bytes.size()) + " writtenAt=" + N(r.writtenAt) + " owner=" + N(r.owner) + " -> " + r.file + (deferred ? " - after waiting for a load of that path" : ""));
+    ZoneDamageMirrorMaybe(r);   /* T-1243 (owner 1523) TEST-ONLY zonedamage ... mirror: the mirror FILE just written (a save's after its send) has the armed bytes zeroed; the kept table follows it */
     return 1;
 }
 void ZoneParkedDropOldest()
@@ -9381,6 +14094,27 @@ int ZoneWriterSlot(long long owner);   /* defined below, same (anonymous) namesp
    the slot range is unknown and refused), and this game's map bit for the area appeared no later than the first landing
    of another slot's record since the load (zonerec::ZoneKeptAdoptJudge). False: *whyOut names the first condition that
    failed. */
+/* T-1279 (owner decision 1580): MAIN THREAD. A zone save refused as a stale copy - counted (zoneStaleCopyRefused, as before) and
+   logged; when no other game holds the area (zonerec::ZoneRefusedSaveIsFault: this game holds it, or nobody does) it is a FAULT -
+   an error line naming the area and why - since the player's changes to an area in its charge are not kept. */
+long long g_zoneOwnSaveRefused = 0;
+std::map<std::string, long long> g_zoneOwnRefusedSaid;   /* T-1279 fold (review finding 6): area -> the world teardown count when its FAULT line was said (once per area per load) */
+void ZoneStaleRefusedSay(const std::string& zoneId, const std::string& text)
+{
+    ++g_zoneStaleCopyRefused;
+    int sx = -1, sy = -1, holder = -1;
+    if (zonerec::ZoneRecIdParse(zoneId, &sx, &sy) != 0) { coop::Sector sec; sec.x = sx; sec.y = sy; holder = coop::AreaHolderSlotTS(sec); }
+    if (zonerec::ZoneRefusedSaveIsFault(holder, g_mySlot) == 0) { DebugLog(text); return; }
+    ++g_zoneOwnSaveRefused;
+    const long long loadNo = (long long)g_worldTeardowns;
+    std::map<std::string, long long>::iterator said = g_zoneOwnRefusedSaid.find(zoneId);
+    if (zonerec::ZoneFaultLineDue(said != g_zoneOwnRefusedSaid.end() ? 1 : 0, said != g_zoneOwnRefusedSaid.end() ? said->second : 0, loadNo) == 0)
+    { DebugLog("[ZONE] T-1279 refused again: " + zoneId + " (its FAULT line was said in this load; zoneOwnSaveRefused=" + N(g_zoneOwnSaveRefused) + ")"); return; }
+    g_zoneOwnRefusedSaid[zoneId] = loadNo;
+    ErrorLog("[ZONE] FAULT (T-1279): a save of this game's own area " + zoneId + " was REFUSED - the player's changes to it are not kept (holder "
+             + (holder < 0 ? std::string("nobody") : "slot " + N((long long)holder)) + ", this game slot " + N((long long)g_mySlot) + ", zoneOwnSaveRefused="
+             + N(g_zoneOwnSaveRefused) + ", zoneStaleCopyRefused=" + N(g_zoneStaleCopyRefused) + "; said once per area per load - the counter keeps counting): " + text);
+}
 bool ZoneKeptAdopt(const std::string& zoneId, const Record& rec, const char** whyOut)
 {
     std::map<std::string, ZoneKeptMark>::iterator nm = g_zoneKeptMark.find(zoneId);
@@ -9424,13 +14158,13 @@ void ZoneParkedWriteTick()
                 if (fr == g_zoneFromRecord.end())
                 {   /* T-609: not loaded from a record - saved only as an adopted kept-in-step copy */
                     const char* why = "";
-                    if (!ZoneKeptAdopt(w.r.worldId, rit->second, &why)) { ++g_zoneStaleCopyRefused; DebugLog("[ZONE] waited save of " + w.r.worldId + " skipped (stale copy): a record is held (owner " + N(rit->second.owner) + " writtenAt=" + N(rit->second.writtenAt) + "), this zone was not loaded from it and it is not a kept-in-step copy: " + why); continue; }
+                    if (!ZoneKeptAdopt(w.r.worldId, rit->second, &why)) { ZoneStaleRefusedSay(w.r.worldId, "[ZONE] waited save of " + w.r.worldId + " skipped (stale copy): a record is held (owner " + N(rit->second.owner) + " writtenAt=" + N(rit->second.writtenAt) + "), this zone was not loaded from it and it is not a kept-in-step copy: " + why); continue; }   /* T-1279: a fault when the area is this game's own */
                     fr = g_zoneFromRecord.find(w.r.worldId);
                 }
                 if (ZoneLoadedCopyOlder(fr->second, rit->second))
                 {   /* T-609: a newer record than the one loaded - saved only as an adopted kept-in-step copy */
                     const char* why = "";
-                    if (!ZoneKeptAdopt(w.r.worldId, rit->second, &why)) { ++g_zoneStaleCopyRefused; DebugLog("[ZONE] waited save of " + w.r.worldId + " skipped (stale copy): the record now held (writtenAt=" + N(rit->second.writtenAt) + " owner " + N(rit->second.owner) + ") is newer than what this zone was loaded from, and it is not a kept-in-step copy: " + why); continue; }
+                    if (!ZoneKeptAdopt(w.r.worldId, rit->second, &why)) { ZoneStaleRefusedSay(w.r.worldId, "[ZONE] waited save of " + w.r.worldId + " skipped (stale copy): the record now held (writtenAt=" + N(rit->second.writtenAt) + " owner " + N(rit->second.owner) + ") is newer than what this zone was loaded from, and it is not a kept-in-step copy: " + why); continue; }
                 }
             }
         }
@@ -9440,16 +14174,20 @@ void ZoneParkedWriteTick()
     for (std::vector<ZoneParkedWrite>::size_type j = 0; j < g_zoneParked.size(); ++j) keep.push_back(g_zoneParked[j]);   /* parked while this ran - none expected */
     g_zoneParked.swap(keep);
 }
-void ZoneSaveApply(const std::string& path)
+/* T-1329 (design C): ONE BODY FOR BOTH. `path` - the area file Kenshi just wrote (emptyId empty); or `emptyId` - the area whose one-area
+   save wrote nothing (ZoneMap+0x24 = 0, path empty): its record is the EMPTY mark (zonerec::kZoneEmptyMark), through every gate, stamp,
+   count and the send below exactly as a file's. */
+void ZoneSaveApplyImpl(const std::string& path, const std::string& emptyId)
 {
-    const std::string zoneId = ZoneIdOfPath(path);
+    const bool isEmpty = !emptyId.empty();
+    const std::string zoneId = isEmpty ? emptyId : ZoneIdOfPath(path);
     if (zoneId.empty()) return;
     ++g_zoneSaves;
     if (g_postTeardownFlush) ++g_zoneSaveViaFlush;   /* P6q (review-p6j MEDIUM-3): at ENTRY, so it spans every exit below */
     ZoneSaveLine zline; zline.n = g_zoneSaves; zline.id = zoneId; zline.armed = true;   /* E22c: armed here, printed at every exit below */
     if (!g_on || !g_zoneOn || !g_dirReady) { ++g_zoneSkippedOff; return; }
     if (RoleIsSingle()) { ++g_zoneSkippedSingle; return; }   /* AUD-b (review-aud HIGH-1): a lone game never copies its own save's zones into the store folder nor overrides its loads from them - the same belt every other store writer carries (:1788) */
-    if (PathUnderDir(path, g_dirCanonical) || PathUnderDir(path, g_dirMirror)) { ++g_zoneOwnStore; return; }   /* W2b: inside the folder, not merely sharing its prefix (coop vs coop2) */   /* our own store files */   /* P6j (verify-p6c MEDIUM-3): counted - the exit above the ownership test was the one exit with no number of any kind */
+    if (!isEmpty && (PathUnderDir(path, g_dirCanonical) || PathUnderDir(path, g_dirMirror))) { ++g_zoneOwnStore; return; }   /* W2b: inside the folder, not merely sharing its prefix (coop vs coop2) */   /* our own store files */   /* P6j (verify-p6c MEDIUM-3): counted - the exit above the ownership test was the one exit with no number of any kind */
     /* B12-c (review-b12 M-2): THE LADDER IS ASKED FIRST AND THE FILE IS READ ONLY WHERE ITS BYTES ARE
        NEEDED. B12 moved the read above this gate so the no-notebook arm would have something to journal,
        and paid for it on EVERY co-op zone save in the build - including the ordinary "another game holds
@@ -9468,14 +14206,29 @@ void ZoneSaveApply(const std::string& path)
         if (r4 != 0)
         {
             std::vector<char> qbytes;
-            if (!ReadFileBytes(path, &qbytes))
+            if (isEmpty) zonerec::ZoneEmptyEncode(&qbytes);   /* T-1329: an EMPTY area is journaled as its mark */
+            if (!isEmpty && !ReadFileBytes(path, &qbytes))
             {
                 ++g_zoneQueueRefused;
                 ErrorLog("[ZONE] outage queue: could not read back " + path + " to journal it, so this"
                          " sector's change is LOST (decision 52)");
             }
-            else if (StoreQueueWriteImpl(coopqueue::kQueueFamilyZone, zoneId, qbytes) != 0) ++g_zoneQueuedNoNotebook;
-            else ++g_zoneQueueRefused;
+            else
+            {
+                size_t zstop = 0;
+                if (zonecheck::ReadableBytes(qbytes, &zstop) == 0)
+                {   /* T-1243 fold (finding 1): the journal road gets the same check as the send below - an area file that cannot be read
+                       to its end is not journaled, so its replay can neither send it nor write it into this game's mirror. This save is
+                       counted at zoneSkippedNotMine already (the eight exits' sum), so it is booked as the journal arm's other refusal,
+                       zoneQueueRefused, and apart in zoneUnreadableNotSent=. */
+                    ++g_zoneQueueRefused;
+                    ++g_zoneUnreadableNotSent;
+                    ErrorLog("[ZONE] " + zoneId + " NOT JOURNALED - the area file read back for the outage queue cannot be read to its end: " + N((long long)qbytes.size())
+                             + " bytes, reading stopped at byte " + N((long long)zstop) + " (zoneUnreadableNotSent=" + N(g_zoneUnreadableNotSent) + ", counted in zoneOutageQueue[queueRefused])");
+                }
+                else if (StoreQueueWriteImpl(coopqueue::kQueueFamilyZone, zoneId, qbytes) != 0) ++g_zoneQueuedNoNotebook;
+                else ++g_zoneQueueRefused;
+            }
         }
         return;
     }
@@ -9500,25 +14253,43 @@ void ZoneSaveApply(const std::string& path)
             if (fr == g_zoneFromRecord.end())
             {
                 const char* why = "";
-                if (!ZoneKeptAdopt(zoneId, rit->second, &why)) { ++g_zoneStaleCopyRefused; DebugLog("[ZONE] skipped (stale copy) " + zoneId + ": a record exists (owner " + N(rit->second.owner) + ") and this zone was not loaded from it, and it is not a kept-in-step copy: " + why); return; }
+                if (!ZoneKeptAdopt(zoneId, rit->second, &why)) { ZoneStaleRefusedSay(zoneId, "[ZONE] skipped (stale copy) " + zoneId + ": a record exists (owner " + N(rit->second.owner) + ") and this zone was not loaded from it, and it is not a kept-in-step copy: " + why); return; }
                 fr = g_zoneFromRecord.find(zoneId);
             }
             if (ZoneLoadedCopyOlder(fr->second, rit->second))
             {   /* T-609: a newer record than the one loaded - saved only as an adopted kept-in-step copy */
                 const char* why = "";
-                if (!ZoneKeptAdopt(zoneId, rit->second, &why)) { ++g_zoneStaleCopyRefused; DebugLog("[ZONE] skipped (stale copy) " + zoneId + ": loaded from the record of writtenAt=" + N(fr->second.writtenAt) + " seq=" + N((long long)fr->second.seq) + ", and a newer one is held now (writtenAt=" + N(rit->second.writtenAt) + " seq=" + N((long long)rit->second.seq) + " owner " + N(rit->second.owner) + "), and it is not a kept-in-step copy: " + why); return; }
+                if (!ZoneKeptAdopt(zoneId, rit->second, &why)) { ZoneStaleRefusedSay(zoneId, "[ZONE] skipped (stale copy) " + zoneId + ": loaded from the record of writtenAt=" + N(fr->second.writtenAt) + " seq=" + N((long long)fr->second.seq) + ", and a newer one is held now (writtenAt=" + N(rit->second.writtenAt) + " seq=" + N((long long)rit->second.seq) + " owner " + N(rit->second.owner) + "), and it is not a kept-in-step copy: " + why); return; }
             }
         }
     }
     std::vector<char> bytes;
-    if (!ReadFileBytes(path, &bytes)) { ++g_zoneReadFail; ErrorLog("[ZONE] could not read back " + path); return; }
+    if (isEmpty) zonerec::ZoneEmptyEncode(&bytes);   /* T-1329: no file to read - the EMPTY mark */
+    else if (!ReadFileBytes(path, &bytes)) { ++g_zoneReadFail; ErrorLog("[ZONE] could not read back " + path); return; }
+    if (!isEmpty) ZoneDamageMaybe(zonecheck::kDamageBefore, zoneId, &bytes);   /* T-1243 TEST-ONLY zonedamage ... before: ahead of the check below, which must refuse it */
+    {   /* T-1243 (owner 1520 e): an area file Kenshi just wrote that cannot be read to its end is not sent - nor written to this game's
+           store mirror or recorded, so the mirror keeps the copy the world server holds. The world server would refuse it, and a game
+           handed it stops in Kenshi's own load (run T2079). Counted in readFail (the eight exits still sum to ZONE saves=) and apart in
+           zoneUnreadableNotSent=. Nothing else changes for this game: Kenshi's own save file is untouched, and its next save is checked again. */
+        size_t zstop = 0;
+        if (zonecheck::ReadableBytes(bytes, &zstop) == 0)
+        {
+            ++g_zoneReadFail;
+            ++g_zoneUnreadableNotSent;
+            ErrorLog("[ZONE] " + zoneId + " NOT SENT - the area file read back cannot be read to its end: " + N((long long)bytes.size()) + " bytes, reading stopped at byte "
+                     + N((long long)zstop) + " (zoneUnreadableNotSent=" + N(g_zoneUnreadableNotSent) + ", counted in zoneSave[readFail])");
+            return;
+        }
+    }
     Record r; r.worldId = zoneId; r.x = r.y = r.z = 0.0f; r.writtenAt = ZoneStampFor(zoneId); r.posAt = r.writtenAt; r.owner = (int)StoreOwnerField();   /* B10 (audit C13) site 3 of 6 */   /* T-609 (H1): max(now, last + 1) - a second save in one second is not refused as not newer */
     r.file = MirrorFile(zoneId);   /* B10 (audit C8) */
     /* Z1-c (recheck-z1b item 2): the write, the record, the mark, the send and the WROTE line are ZoneMirrorCommit's now;
        while a worker's load of this mirror path is in flight the write waits (parked, retried every StoreTick) and they
        happen when it does - this save's line then says written=0 and its exit is counted when the retry settles it. */
-    if (ZoneMirrorWriteOrPark(kZoneWriteSave, r, bytes, path) == 1) { zline.written = 1; coop::KeptAreaWritten(zoneId); }   /* E22c: the line reports the outcome, not the intent; KEPT: a lay in this area may now be in its record */
+    if (ZoneMirrorWriteOrPark(kZoneWriteSave, r, bytes, isEmpty ? std::string("(EMPTY: Kenshi saved nothing for this area)") : path) == 1) { zline.written = 1; if (!isEmpty) coop::KeptAreaWritten(zoneId); }   /* E22c: the line reports the outcome, not the intent; KEPT: a lay in this area may now be in its record (an EMPTY area holds none) */
 }
+void ZoneSaveApply(const std::string& path) { ZoneSaveApplyImpl(path, std::string()); }
+void ZoneEmptyApply(const std::string& zoneId) { ZoneSaveApplyImpl(std::string(), zoneId); }
 /* loot2c part A (docs/design-loot2.md section 2 step 4; .modding/investigations/loot2c-touch-take.md S1): THE TAKE-OUT
    BEFORE ANYTHING IS SERIALISED. saveGame 0x375220 serialises every active zone's boxes (saveActiveZoneStates ->
    saveLevelData) and the TownList before quick.save's gdcSave; saveLevelData 0x36DCA0 serialises a zone's boxes (decomp
@@ -9533,6 +14304,7 @@ void* detour_saveGame(void* self, void* a, void* b)
 {
     coop::ItemsBoxJrnBeforeSave(OnMainThread() ? 1 : 0);   /* a box change parked for the swap's gates: undone on the character before the save */
     coop::ItemsBoxOwedNote(OnMainThread() ? 1 : 0);   /* the box changes this save holds unresolved, as it is written (beside it once it lands) */
+    RaidLentSaveNote(OnMainThread() ? 1 : 0);   /* T-1122 save fold: the lent copies this save is written with (beside it once it lands) */
     if (OnMainThread()) BoxOwedCopyFollow();   /* and its copy in the records store now, before anything of the save is written */
     coop::ItemsLootBeforeSave(OnMainThread() ? 1 : 0, 0);
     /* P105 build 2 (decision 13.2 (b), design 15.5): every item another player holds out of a box this game writes goes back into its
@@ -9541,11 +14313,54 @@ void* detour_saveGame(void* self, void* a, void* b)
     coop::ItemsHoldSave(0, OnMainThread() ? 1 : 0);
     coop::BuildShowBeforeSave(OnMainThread() ? 1 : 0);   /* T-811: counts only - the bases founded here are taken out at the safe point when the save is asked for (build.cpp BdShowSaveGuard); one still standing is in this save and taken up after a reload */
     const int keep = OnMainThread() ? LinkKeepEnter() : 0;   /* T-1118 (a): the world-server link moves while the engine saves */
+    RaidCampSaveHide(0);   /* T-1122 review fold 2: the borrowed raid campaigns stay out of this save (the war manager saves every listed one) */
     void* r = 0;
     __try { r = orig_saveGame(self, a, b); }
-    __finally { if (keep != 0) LinkKeepExit(); }   /* a save that throws still closes the window */
+    __finally { RaidCampSaveHide(1); if (keep != 0) LinkKeepExit(); }   /* a save that throws still closes the window and puts the campaigns back */
     coop::ItemsHoldSave(1, OnMainThread() ? 1 : 0);
     return r;
+}
+/* T-1329 (design C): after Kenshi's one-area save, its ZoneMap (content+0xD0, as AfContentOfZoneMapPod) - the area (+0x18 / +0x1C, as
+   ReadZoneReasonPod) and +0x24, "has a file": saveLevelData 0x36DCA0 sets it on its one exit, 0 = it saved nothing and deleted the old
+   file, 1 = it wrote the file (build/decomp_36dca0.txt:263-291). 1 = read, 0 = not plausible, -1 = a read fault (caught). */
+int ZoneLevelSavePod(void* content, int* x, int* y, int* hasFile, int* readDue)
+{
+    __try
+    {
+        *readDue = (int)*(const unsigned char*)((const char*)content + 0x108);   /* T-1329 fold 1 (F1): the area's read still due (zonerec::ZoneEmptyMayPublish) */
+        void* zm = *(void**)((char*)content + 0xD0);
+        if (!Plaus(zm)) return 0;
+        *x = *(const int*)((const char*)zm + 0x18); *y = *(const int*)((const char*)zm + 0x1C);
+        *hasFile = (int)*(const unsigned char*)((const char*)zm + 0x24);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1329: Kenshi saved nothing for the area (+0x24 = 0) - its EMPTY area record goes out through ZoneSaveApply's road, on every road
+   that runs this save (an AREA_FRESH WRITE round, an unload, the full save); off the main thread it is queued for the drain, as a
+   file saved there is. The main thread keeps the byte for the WRITE round (AfHolderWrite). */
+void ZoneLevelSaveAfter(void* content)
+{
+    const bool onMain = OnMainThread();
+    int x = 0, y = 0, hasFile = -1, readDue = -1;
+    const int got = Plaus(content) ? ZoneLevelSavePod(content, &x, &y, &hasFile, &readDue) : 0;
+    if (got != 1) { ::InterlockedIncrement64(&g_zoneLevelSaveReadFail); if (onMain) { g_levelSaveHasFile = -1; g_levelSaveReadDue = -1; } return; }
+    if (onMain) { g_levelSaveHasFile = hasFile; g_levelSaveReadDue = readDue; }
+    if (hasFile != 0) return;
+    const std::string zoneId = "zone." + N((long long)x) + "." + N((long long)y);
+    if (zonerec::ZoneEmptyMayPublish(hasFile, readDue) == 0)
+    {   /* T-1329 fold 1 (F1): the container was empty because this area's read has not run here (its load is due or held) - not an
+           empty area; nothing is published (a WRITE round answers CANT fault: zonerec::ZoneNotPublishedIsFault) */
+        const long long n = (long long)::InterlockedIncrement64(&g_zoneEmptyRefusedUnread);
+        if (::InterlockedIncrement(&g_zoneEmptyRefusedLines) <= 20)
+            DebugLog("[ZONE] T-1329: no EMPTY for " + zoneId + " - Kenshi saved nothing, but this area's read is still due (content+0x108=" + N((long long)readDue)
+                     + ") so its container is the unread area, not an empty one" + (onMain ? std::string() : std::string(" (off the main thread)")) + " (emptyRefusedUnread=" + N(n) + ", first 20 logged)");
+        return;
+    }
+    if (onMain) { ZoneMainSaveNote(zoneId); ZoneEmptyApply(zoneId); return; }
+    StoreOut e; e.type = kOutZone; e.worldId = zoneId;   /* no path: the drain's EMPTY area save */
+    e.stamp = (long long)::InterlockedIncrement64(&g_zoneSaveSeq);   /* F4: its place in the save order (ZoneEmptyDrain) */
+    if (OutboxPush(e)) ::InterlockedIncrement64(&g_zoneEmptyOffMainQueued);
 }
 void detour_saveLevelData(void* content, char flag, void* a, void* b)
 {
@@ -9555,11 +14370,28 @@ void detour_saveLevelData(void* content, char flag, void* a, void* b)
     const int keep = OnMainThread() ? LinkKeepEnter() : 0;   /* T-1118 (a): an area's write stands the frame still too (inside saveGame it nests in that window) */
     __try { orig_saveLevelData(content, flag, a, b); }
     __finally { if (keep != 0) LinkKeepExit(); }
+    ZoneLevelSaveAfter(content);   /* T-1329: Kenshi saved nothing for the area -> its EMPTY area record */
 }
 /* the "built with" note inside each area file - defined below, after the container helpers (the same namespace as their definitions) */
 void* TownNoteBeforeSave(void* container, const std::string* absPath);
 void TownNoteAfterSave(void* rec);
 void TownNoteAfterLoad(void* container, const std::string* file, bool ok);
+/* T-1329: detour_gdcSave's two exits that sent nothing and said nothing - the engine's save returned false (kind 1; counted for every
+   file, and apart for area files), or the saved file's path could not be copied out (kind 0). Counted, and one line each (the first 20
+   of both together). Any thread. */
+void GdcSilentExit(int kind, const char* path)
+{
+    if (kind == 0) ::InterlockedIncrement64(&g_gdcPathCopyFail);
+    else
+    {
+        ::InterlockedIncrement64(&g_gdcEngineSaveFalse);
+        if (path != 0 && !ZoneIdOfPath(std::string(path)).empty()) ::InterlockedIncrement64(&g_gdcEngineSaveFalseArea);
+    }
+    if (::InterlockedIncrement(&g_gdcSilentLines) > 20) return;
+    ErrorLog(std::string("[ZONE] T-1329: a save the engine made sent no record - ") + (kind == 0 ? std::string("its file's path could not be copied") : "the engine's save returned false for '" + std::string(path != 0 ? path : "?") + "'")
+             + (OnMainThread() ? std::string() : std::string(" (off the main thread)")) + " (engineSaveFalse=" + N((long long)g_gdcEngineSaveFalse) + " engineSaveFalseArea=" + N((long long)g_gdcEngineSaveFalseArea)
+             + " pathCopyFail=" + N((long long)g_gdcPathCopyFail) + "; the first 20 logged)");
+}
 bool detour_gdcSave(void* container, const std::string* absPath, void* serialisable)
 {
     coop::ItemsLootWriteTripwire(OnMainThread() ? 1 : 0);   /* loot2c part A: a TRIPWIRE only - the boxes were serialised before this write (saveLevelData line 202, saveGame), so the take-out runs in the saveGame / saveLevelData pre-hooks above; an untouched copy still in a box here is counted (lootLiveAtWrite, must stay 0) */
@@ -9573,7 +14405,10 @@ bool detour_gdcSave(void* container, const std::string* absPath, void* serialisa
            at all: ZoneIdOfPath is a pure string parse and answers empty for everything else the engine saves. */
         const bool okOff = orig_gdcSave(container, absPath, serialisable);
         char pbOff[1024];
-        if (okOff && Plaus(absPath) && CopyStdStringPod(absPath, pbOff, 1024))
+        const bool copiedOff = Plaus(absPath) && CopyStdStringPod(absPath, pbOff, 1024);
+        if (!copiedOff) GdcSilentExit(0, 0);   /* T-1329 */
+        else if (!okOff) GdcSilentExit(1, pbOff);
+        if (okOff && copiedOff)
         {
             const std::string pathOff(pbOff);
             const std::string zoneOff = ZoneIdOfPath(pathOff);
@@ -9589,8 +14424,9 @@ bool detour_gdcSave(void* container, const std::string* absPath, void* serialisa
     void* const townNote = TownNoteBeforeSave(container, absPath);   /* the "built with" note rides inside the area file (townver.cpp) */
     const bool ok = orig_gdcSave(container, absPath, serialisable);
     TownNoteAfterSave(townNote);
-    char pbuf[1024]; if (!Plaus(absPath) || !CopyStdStringPod(absPath, pbuf, 1024)) return ok;
-    if (!ok) return ok;   /* the engine's save failed: there is nothing on disk to record (the old body's `zoneId.empty() || !ok` gate, kept whole) */
+    char pbuf[1024]; if (!Plaus(absPath) || !CopyStdStringPod(absPath, pbuf, 1024)) { GdcSilentExit(0, 0); return ok; }   /* T-1329: counted and said */
+    if (!ok) { GdcSilentExit(1, pbuf); return ok; }
+    ZoneMainSaveNote(ZoneIdOfPath(std::string(pbuf)));   /* T-1329 fold 1 (F4): a main-thread save of this area - a queued EMPTY older than it is dropped */   /* the engine's save failed: there is nothing on disk to record (the old body's `zoneId.empty() || !ok` gate, kept whole); T-1329: counted and said */
     ZoneSaveApply(std::string(pbuf));
     return ok;
 }
@@ -11927,7 +16763,7 @@ void TeardownBroadcast(const char* why)
     g_stCreated.clear();   /* T-296 fix 2: the origin marks are world state (the global state container is emptied with the world) */
     g_madeFromRecord.clear(); g_pairBook.Clear(); g_pairLogged.clear();   /* the record-built marks and the same-id pair notes are world state */
     MoneyLoadWorldTeardown();   /* T-799 D1: the decided platoons and the queued loads name the world that is going */
-    BirthLockEnter(); g_birthOf.clear(); ::LeaveCriticalSection(&g_birthLock); g_discarding.clear(); g_keepVerdictOf.clear(); g_liveHomeOf.clear(); g_roamOf.clear(); g_unloadEmptied.clear();   /* the birth flags, keep marks, live home reads and template tests are keyed by platoon address, which the next world reuses */
+    BirthLockEnter(); g_birthOf.clear(); ::LeaveCriticalSection(&g_birthLock); OwnRaidWorldTeardown(); RaidLendWorldTeardown();   /* T-1122 own raid squads: keyed by platoon address */ g_discarding.clear(); g_keepVerdictOf.clear(); g_oneKeepOf.clear(); g_sleepTakenMemo.clear(); g_liveHomeOf.clear(); g_roamOf.clear(); g_unloadEmptied.clear(); g_otherRunRemoved.clear(); g_otherRunDead.clear(); g_otherRunHeld.clear();   /* T-850: a held delete is an unload's, not a death's - the world going ends it with nothing sent */ /* the birth flags, keep marks, live home reads and template tests are keyed by platoon address, which the next world reuses */
     g_bind.clear(); g_bindGenOf.clear(); g_byWorldId.clear(); g_localWrittenAt.clear(); g_pendingPlace.clear(); g_wakeWait.clear(); g_npcStampErased.clear(); g_npcPurged.clear(); g_modRemoved.clear(); g_modMade.clear(); g_npcStrayHbSeen.clear(); g_npcStrayDeleteSeen.clear(); g_npcFreshSeen.clear(); g_facCheck.clear(); SwWorldTeardown(); HbWorldTeardown();   /* E47-S2: the registry is world state */   /* E33: g_zoneFromRecord moved to TeardownBroadcastLateFlags - the post-teardown flush has to read it */   /* E23: the stamps are the bindings' - they go with them (the counter itself keeps climbing, so a stamp from the old world can never be read as older than a destroy in the new one) */
     g_zoneLogLines = 0;   /* E22c: the 64-line budget is PER WORLD (the suppressed count is cumulative evidence and is not reset) */
     ZoneMarkPendingClear(false, false);   /* Z1-b: the handshake table, under its lock (the load facts stay for the post-teardown flush - E33) */   // review-p3y P3Y-1: these were swallowed into the comment below by p3y (review-p3j: a stranded handshake must not outlive the read that set it)
@@ -11935,9 +16771,10 @@ void TeardownBroadcast(const char* why)
     ResetPlayerFactionState(); ForgetContextPlatoons(); coop::CampWorldTeardown(); RelationsForgetQueue(); PlayersTabForgetWorld(); FallenTabForgetWorld(); coop::UiEditorForgetWorld();
     coop::TeamForget("the world was torn down - leaving to the title, or another load", false);   /* T-546: asked again once a world is loaded */
     OwnResBenchForget();   /* the team research level: the next world's own benches give this game's own level */
-    g_ctxSleptMine.clear(); g_ctxSleptCount.clear(); g_ctxDrops.clear(); g_wakeDup.clear(); g_saveSplit.clear();   /* the context wake rule's platoons and the refused duplicate wakes belong to the freed world */
+    g_ctxSleptMine.clear(); g_ctxSleptCount.clear(); g_ctxDrops.clear(); g_wakeDup.clear(); g_saveSplit.clear(); g_ownLivedHere.clear(); g_givenWait.clear(); g_givenWaitSeq = -1; g_givenWaitOpenSeq = -1;   /* the context wake rule's platoons, the refused duplicate wakes and the given-wait belong to the freed world */
     coop::BuildForgetWorld();   /* build1-c (review-build1b M2): the other game's pending PLACEs / STATEs and copy rows die with the world */
-    g_homeOf.clear(); g_homeClearedFrom.clear(); g_homeOwed.clear(); g_homeOwedNow = 0; g_homeKeyless.clear(); g_copyHomeOwedMap.clear(); g_loHomeSeen.clear(); /* [t755-copyhome-clear] */   /* the groups' home building keys and the homes owed are world state */
+    g_homeBlankSet.clear(); g_homeRecheck.clear(); g_homeRecheckLoad.clear(); g_homeRecLoadPass = 1;   /* T-1334: the next world's bound groups are checked once it is loaded */
+    g_homeOf.clear(); g_homeClearedFrom.clear(); g_homeClearedBy.clear(); g_homeOwed.clear(); g_homeOwedNow = 0; g_homeKeyless.clear(); g_copyHomeOwedMap.clear(); g_loHomeSeen.clear(); /* [t755-copyhome-clear] */   /* the groups' home building keys and the homes owed are world state */
     g_pendingTown.clear(); g_goneTownLaunch.clear(); g_testPendNotes.clear(); g_noteEngineHas.clear(); g_noteUnplaceLogged.clear(); g_notePlaceFailed.clear(); g_copyNotBuiltPlaceIds.clear(); g_sweepFirst.clear(); g_sweepPending.clear(); g_notKeptWait.clear(); memset(g_sweepMine, 0, sizeof(g_sweepMine)); memset(g_sweepOther, 0, sizeof(g_sweepOther)); ArClear(); ArRunsClear(); g_sweepLastAuthority = 0; g_sweepNoMapPending = false; g_noteRaiseDone = false; g_sleepPosStaleIds.clear(); g_sleepPosUnusableIds.clear(); PublishPendingTowns();   /* decision 34 */
     /* review-p5d CRASH-2: THE TEARDOWN MUST NOT CLEAR g_relayLinkedCached HERE, and P5d's clear is deleted.
        The flag decides which branch OtherHasSector (zones.cpp) takes: with it SET the answer comes from the LOCKED
@@ -15370,7 +20207,7 @@ int LoadGamePrepared(void* self, const void* folder, const void* name)
         long Gen() { return coop::StoreWorldGenNow(); }
         void Prepare() { OwnOverlayPrepare(folder, name); }
         int Load() { return orig_loadGameHook(self, folder, name); }
-        void Ended(long genAtPrepare) { coop::BuildDiscoveredLoadEnded(genAtPrepare); coop::ItemsBoxOwedLoadEnded(genAtPrepare); }
+        void Ended(long genAtPrepare) { coop::BuildDiscoveredLoadEnded(genAtPrepare); coop::ItemsBoxOwedLoadEnded(genAtPrepare); RaidLentLoadEnded(genAtPrepare); }
     } ops;
     ops.self = self; ops.folder = folder; ops.name = name;
     return baseshow::DiscLoadRun(&ops);
@@ -15599,7 +20436,7 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
             {
                 g_resetImportHoldSaid = 1;
                 DebugLog("[RESET] the import of '" + std::string(qb) + "' WAITS under the loading screen for the world server's current records (the"
-                         " hold a load gets: until they are in, its link fails, or 60 s pass) - asked again every frame");
+                         " hold a load gets: until they are in - T-1279: with no time bound while the link is up) - asked again every frame");
             }
             return;
         }
@@ -15624,7 +20461,19 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
     }
     if (SaveRequestCodePod(self) == kSaveRequestLoad && TitleScreenUpPod() == 1 && PumpWillDispatchPod(self) != 0)
     {
-        if (PreloadHoldsTitleLoad() != 0) return;   /* T-346 slice 1 (owner 255-256 a): HELD under the loading screen until the world server's changed records are in the mirror, its link fails, or 60 s pass - asked again every frame, no fixed delay; the request, the title and the delay are untouched */
+        const int preHold = PreloadHoldsTitleLoad();   /* T-346 slice 1 (owner 255-256 a): HELD under the loading screen until the world server's changed records are in the mirror - T-1279 (owner 1580 a): with no time bound while its link is up, and held for the link while a dial of it is pending - asked again every frame, no fixed delay; the request, the title and the delay are untouched */
+        if (preHold == 1) return;
+        if (preHold == 2)
+        {   /* T-1279 fold (review finding 1): the link is down and no dial is pending - refused as the join gate refuses a load: the
+               request cleared, the loading screen off, the existing CAN'T JOIN box (CAN'T HOST for the hosting game); never the save file */
+            ++g_loadRefusedAtPump;
+            const int cleared = ClearSaveRequestCodePod(self);
+            if (cleared != 1) { ++g_pumpClearFailed; g_pumpRefusalUncleared = 1; return; }   /* offered again next frame and refused again, said once */
+            g_pumpRefusalUncleared = 0;
+            if (LoadingScreenOffPod() == 1) ++g_loadRefuseLoadingScreenOff; else ++g_loadingScreenOffFailed;   /* 0x6E1E00(&ForgottenGUI, 0) */
+            UiPreloadRefusedBox(ConfigRole() == kRoleClient ? 1 : 0);
+            return;
+        }
         ++g_pumpTitleLoads;
         if (PumpVerdictInDepth(self) != 0)
         {
@@ -15719,6 +20568,20 @@ std::string* detour_sfsReadFile(void* sfs, std::string* out, const std::string* 
         ZoneMarkNote(zoneId, false, ZoneStamp(), noRecordGen, provGen, listDone);   // a fresh load: derived from a record only if the swap below fires
         ZonePendingDropZone(zoneId);   // review-p3j: a stranded handshake must not outlive the read that set it
         PreloadNoteLoad(zoneId, 1);   /* T-346: counted when the held load knew this area's copy was not current */
+        if (zonerec::ZoneReadServe((g_on && g_zoneOn && !RoleIsSingle()) ? 1 : 0, haveRec ? 1 : 0, sw.file.empty() ? 0 : 1, sw.empty) == zonerec::kZrdNoFile)
+        {   /* T-1329 (design C): the record held is EMPTY - Kenshi saved nothing for this area. The read is given a path where no file is,
+               so Kenshi's load fails and it builds the base area (decomp_9fec00.txt:127-148), never a stale local file; its next own save
+               of the area deletes that file. The copy is marked as loaded from this record (as a served load is at gdcLoad), so its next
+               save is not refused as a stale copy. No owner translation: nothing is loaded. */
+            ZoneStamp est; est.writtenAt = sw.writtenAt; est.seq = sw.seq;
+            ZoneMarkNote(zoneId, true, est, listDone != 0 ? lgR : -1, (listDone == 0 && lgR >= 1) ? lgR : -1, listDone != 0 ? 1 : 0);
+            const std::string none = zonerec::ZoneNoFilePath(sw.file);
+            const long long served = ::InterlockedIncrement64(&g_zoneEmptyServed);
+            if (served <= 32) DebugLog("[ZONE] EMPTY " + zoneId + " (record writtenAt=" + N(sw.writtenAt) + " owner=" + N(sw.owner) + "): Kenshi saved nothing for this area - the read gets no file ('" + none
+                                       + "'), so Kenshi builds the base area" + (onMain ? std::string() : std::string(" (off the main thread)")) + " (emptyServed=" + N(served) + ", first 32 logged)");
+            new (out) std::string(none);   // NRVO slot: the callee constructs the result
+            return out;
+        }
         if (g_on && g_zoneOn && !RoleIsSingle() && haveRec && !sw.file.empty())   /* AUD-b: no override in a lone game */
         {
             if (U8GetFileAttributes(sw.file.c_str()) != INVALID_FILE_ATTRIBUTES)
@@ -16480,6 +21343,49 @@ void PlacePending()
 // +8 count (F451, from FactionDirectory::activateUnloadedPlatoons).
 const float kTravelStepUnits = 50.0f;
 long long g_posKeySent = 0, g_posKeyTaken = 0;   /* factionkey.h: sleeping groups sent once with their faction's code; rows here re-keyed by a position update */
+/* T-1122 fold b (raidsquad.h LastingOwn): THE LASTING-FACTS SWEEP. Every 5 s on the main thread, each sleeping squad of a world NPC
+   faction not yet in the book is asked: its kept byte (+0x115) 0 while the engine's own keep test (0x7EB9D0, the original through
+   orig_isPersistent - not the mod's keep hook) keeps it = it is in a running war campaign of its faction on this game; no binding and
+   no world record of its id = nobody else has it. Such a squad is noted - so a save reload or a rejoin, which empties the book, does not
+   leave this game's travelling raid squads unmoved. Both roles: on the authority it keeps them out of the sleeping-position publish. */
+unsigned long g_ownRaidSweepAt = 0;
+static int EngineKeepsPod(void* platoon, int* keeps)
+{
+    if (orig_isPersistent == 0) return 0;
+    __try { *keeps = orig_isPersistent(platoon) != 0 ? 1 : 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void OwnRaidSweepTick()
+{
+    const unsigned long now = ::GetTickCount();
+    if (g_ownRaidSweepAt != 0 && now - g_ownRaidSweepAt < raidsq::kSweepGapMs) return;
+    g_ownRaidSweepAt = now;
+    if (!OnMainThread() || !Plaus(coop::GameWorldPtr())) return;
+    FmPod fm; if (!ReadFactionsPod((void*)coop::GameWorldPtr()->factionDirectory, &fm) || !Plaus(fm.factions) || fm.count > 4096) return;
+    ++g_ownRaidSweeps;
+    for (unsigned fi = 0; fi < fm.count; ++fi)
+    {
+        Faction* f = (Faction*)fm.factions[fi];
+        if (!Plaus(f)) continue;
+        if (IsPlayerFaction(f) || IsPeerFaction(f)) continue;
+        const lektor<Platoon*>* ul = f->unloadedSquads();
+        if (!ul) continue;
+        for (unsigned i = 0; i < ul->size() && i < 4096; ++i)
+        {
+            void* p = (*ul)[i];
+            if (!Plaus(p) || OwnRaidHas(p) != 0) continue;
+            Pod q; std::memset(&q, 0, sizeof(q));
+            if (!ReadPod(p, &q) || !Plaus(q.unloaded) || Plaus(q.active) || q.persistent != 0) continue;   /* the cheap facts first: asleep, kept byte 0 */
+            int keeps = 0; if (!EngineKeepsPod(p, &keeps) || keeps == 0) continue;
+            const int bound = g_bind.count(p) != 0 ? 1 : 0;
+            const std::string wid = WorldIdOf(p);
+            const int hasRecord = (!wid.empty() && g_records.count(wid) != 0) ? 1 : 0;
+            if (bound != 0 || hasRecord != 0) continue;
+            const int madeHere = RaidCampaignMadeHere(f, p);   /* T-1122 review fold: its campaign aims at this game's own player's base - made here, not by the other game that loaded the same save */
+            if (raidsq::LastingOwn(1, (int)q.persistent, keeps, bound, hasRecord, madeHere) == 1) OwnRaidNoteImpl(p, kOwnRaidBySweep);
+        }
+    }
+}
 void PublishSleepingPositions()
 {
     if (!Plaus(coop::GameWorldPtr())) return;
@@ -16488,7 +21394,7 @@ void PublishSleepingPositions()
     {
         Faction* f = (Faction*)fm.factions[fi];
         if (!Plaus(f)) continue;
-        if (IsPlayerFaction(f) || IsPeerFaction(f)) continue;   // P3: not world state
+        if (IsPlayerFaction(f) || IsPeerFaction(f) || coopsp::IsStandInRecord(StandInRecordSlot(f)) != 0) continue;   // P3: not world state; T-840 (T-852 a): a stand-in by RECORD too (the table - so IsPeerFaction - is empty right after a load)
         const lektor<Platoon*>* ul = f->unloadedSquads();
         if (!ul) continue;
         for (unsigned i = 0; i < ul->size() && i < 4096; ++i)
@@ -16498,6 +21404,7 @@ void PublishSleepingPositions()
             Pod q; if (!ReadPod(p, &q) || !Plaus(q.unloaded)) continue;
             const std::string worldId = WorldIdOf(p);
             if (worldId.empty() || worldId == "0") continue;   // the engine's empty placeholder platoons
+            if (raidsq::SleepPosPublishes(OwnRaidHas(p) | RaidLentHas(p)) == 0) { ::InterlockedIncrement64(&g_ownRaidPosSkipped); continue; }   /* T-1122 own raid squads (rule 3): nothing of it goes to the world server while it sleeps - its maker is its one traveller */
             unsigned facFlags = 0;   /* factionkey.h kRecFacCode: the row's faction field is this group's NPC faction's code */
             std::map<std::string, Record>::iterator it = g_records.find(worldId);
             /* squadwriter.h SleepPosPublish: a copy another game's newer record supersedes sends nothing (the record is the world's
@@ -16816,14 +21723,25 @@ void StoreFeedTick()
    newer than its own table (cooppre::PreWant: the apply's own "newer"). The fetched RECORDs are written into the MIRROR ONLY
    (PreloadMirrorApply: the table-and-file half of ApplyRemoteRecord - there is no world, so nothing touches the engine) and are
    not queued; the load swaps (detour_loadFromDisk, detour_sfsReadFile) then find the current records. The load goes when every
-   batch is answered, or when the link the exchange began on fails, or after cooppre::kPreBoundMs - a STALE LOAD, counted and logged
-   (no player-facing text). The keys still not current are kept (g_preStaleSet, read-only while a world loads) and every load of one
+   batch is answered. T-1279 (owner decision 1580 a): there is NO time bound - while the link is up the load waits, however long (the
+   loading screen stays; no player-facing text); a load asked for while the link is not up, or whose link is lost, is held until the
+   link is up again and the exchange (re)begins on it (cooppre::PreBeginDecide / PreWaitDecide kPreRestart); only a world server that
+   can never answer this game (no world server set, this game's protocol refused, another world named) lets it go with this game's
+   own copies - a STALE LOAD, counted and logged as an error. The keys still not current are kept (g_preStaleSet, read-only while a world loads) and every load of one
    of them is counted (nonCurrentAreas / nonCurrentGroups) until this world's feed snapshot is applied. Unique states are NOT
    fetched here: no load-time step reads them (they reach the engine after the load, by the feed's BEGIN, as before). */
 typedef char T346PreNumbersAgree[(cooppre::kPreProtocol == kStoreProtocol && cooppre::kPreIndexAsk > coopfeed::kFeedPageEnd) ? 1 : -1];
 cooppre::PreState g_pre;
 unsigned int g_preToken = 0;
 DWORD g_preStartMs = 0;
+bool g_preHolding = false;          /* T-1279: a title load is held (from its first held frame until it goes or its request goes); g_preStartMs is that frame */
+DWORD g_preNextNoteMs = 0;          /* T-1279: the held time at which the next "still held" line is due (every cooppre::kPreWaitNoteMs) */
+long long g_preHeldForLink = 0, g_preRestarts = 0, g_preHeldNotes = 0;   /* T-1279: loads held for the link before an exchange; exchanges begun again on a new link; still-held lines */
+bool g_preBroke = false; std::string g_preBrokeWhy;   /* T-1279 fold (review finding 2): this exchange's chain of asks is broken (a send failed, an answer was dropped as malformed) */
+DWORD g_preProgressMs = 0, g_preFirstAskMs = 0;       /* T-1279 fold: the exchange's last progress (begun, a page, a fetched record, a FETCH_END); the hold's first index ask (0 none) */
+long long g_preSinceAskLast = 0;   /* T-1279 fold 2 (re-check A): the finished exchange's time since its first index ask - taken in PreloadFinish before g_preFirstAskMs is zeroed; the DONE line prints it */
+long long g_preStallRestarts = 0, g_preRefused = 0;    /* T-1279 fold: exchanges begun again on the SAME link (stalled); held loads refused (link down, no dial pending) */
+DWORD g_preDownSince = 0, g_preNoticeTriedAt = 0; int g_preNoticeShown = 0; long long g_preNoticeOn = 0, g_preNoticeFailed = 0;   /* T-1279 fold: the connection-problem notice over a held load */
 std::set<std::string> g_preStaleSet;   /* written on the main thread at the title only (begin / finish); read by the load detours */
 CRITICAL_SECTION g_preStaleLock; bool g_preStaleLockInit = false;   /* T-346 fold 1: guards g_preStaleSet; made on the main thread (PreloadHoldsTitleLoad) before the counting switch is first on */
 volatile LONG g_preCountOn = 0;        /* 1 from a held load's release until this world's feed snapshot is applied */
@@ -17010,7 +21928,7 @@ struct PreWantHere
     {
         const int cls = cooppre::PreAoiClass(e.ax, e.ay, g_preAoiList, cooppre::kPreRing);
         if (cls == cooppre::kPreAoiIn) ++g_preAoiRowsIn; else if (cls == cooppre::kPreAoiOut) ++g_preAoiRowsOut; else if (cls == cooppre::kPreAoiNoArea) ++g_preAoiRowsNoArea; else ++g_preAoiRowsNoList;
-        const bool boxOrPiece = coopbrec::IsBoxRecId(e.key) || piecerec::IsPieceRecId(e.key) || shoprec::IsShopRecId(e.key) || doorrec::IsDoorRecId(e.key);   /* a shop or door record names its area as a box does */
+        const bool boxOrPiece = coopbrec::IsBoxRecId(e.key) || piecerec::IsPieceRecId(e.key) || shoprec::IsShopRecId(e.key) || doorrec::IsDoorRecId(e.key) || cagerec::IsCageRecId(e.key) || bldgrec::IsBldgRecId(e.key) || towntime::IsTownTimeId(e.key);   /* a shop or door record names its area as a box does */
         /* T-985 C2b fold 1 (preload.h PreRowChoose): a row is left for the feed only when the world server's copy AND this game's
            own copy lie outside the ring and the asker's player did not write it (review HIGH 1, 2). A kept key the gate still holds
            back that is left outside stays held while the server's copy is newer; a kept row held beside goes into the skipped
@@ -17116,9 +22034,10 @@ bool PreloadTakesRecord(const std::vector<char>& payload)
     std::string homeR;
     if (!net::DecodeRecordPayload(payload, &worldId, &squadSid, &factionName, &x, &y, &z, &writtenAt, &owner, &bytes, &townR, &seqIn, 0, &homeR)) return false;
     NoteTownPeople(worldId, townR);
-    NoteRecordHome(worldId, homeR);   /* the group's home building key */
+    NoteRecordHome(worldId, homeR, 0, owner);   /* the group's home building key */
     MirrorKeepConfirmed(worldId, 1);   /* T-985 C1: re-fetched - the fetched record follows */
     g_preAoiFetchedBytes += (long long)bytes.size();
+    g_preProgressMs = ::GetTickCount();   /* T-1279 fold: a fetched record is progress */
     if (PreloadMirrorApply(worldId, squadSid, factionName, x, y, z, writtenAt, owner, bytes) != 0) g_pre.failed.insert(worldId);
     StoreNoteRecordSeq(worldId, seqIn);
     return true;
@@ -17132,6 +22051,7 @@ void PreloadArrive(const std::vector<char>& payload)
     {
         ++g_preMalformed;
         if (g_preMalformed <= 3) ErrorLog("[STORE] T-346: a malformed (or up-only) records-before-the-load message from the world server - ignored (preload malformed)");
+        if (cooppre::PreMalformedBreaks(g_pre.phase) != 0) { g_preBroke = true; g_preBrokeWhy = "an answer was dropped as malformed"; }   /* T-1279 fold 2 (re-check E): as preload.h says - the exchange begins again on its link at the next held frame */
         return;
     }
     if (g_pre.linkGen != StoreNotebookLinkGen()) { ++g_preAnswersStale; return; }
@@ -17144,13 +22064,20 @@ void PreloadArrive(const std::vector<char>& payload)
     }
     else act = cooppre::PreOnFetchEnd(&g_pre, m, &keys);
     if (act == cooppre::kActNone) { ++g_preAnswersStale; return; }
-    if (act == cooppre::kActAskIndex) { std::vector<char> b; if (cooppre::PreEncodeIndexAsk(&b, g_pre.token, g_pre.afterKey, cooppre::kPreRing, g_preAoiList)) PreloadSend(b); return; }
+    g_preProgressMs = ::GetTickCount();   /* T-1279 fold: this exchange moved */
+    if (act == cooppre::kActAskIndex)
+    {
+        std::vector<char> b;
+        if (!cooppre::PreEncodeIndexAsk(&b, g_pre.token, g_pre.afterKey, cooppre::kPreRing, g_preAoiList) || !PreloadSend(b)) { g_preBroke = true; g_preBrokeWhy = "the next index ask could not be sent"; }   /* T-1279 fold (finding 2) */
+        return;
+    }
     if (act == cooppre::kActFetch)
     {
         if (g_pre.batchBegin == 0)
             DebugLog("[STORE] T-346 records before the load: the index is in (" + N((long long)g_pre.rows) + " records in " + N((long long)g_pre.pages) + " pages) - "
                      + N((long long)g_pre.want.size()) + " are newer on the world server than here; fetching them into the mirror");
-        std::vector<char> b; if (cooppre::PreEncodeFetch(&b, g_pre.token, g_pre.resume != 0, keys)) PreloadSend(b);   /* T-346 fold 1: resume = the rest of a cut batch */
+        std::vector<char> b;
+        if (!cooppre::PreEncodeFetch(&b, g_pre.token, g_pre.resume != 0, keys) || !PreloadSend(b)) { g_preBroke = true; g_preBrokeWhy = "the next fetch could not be sent"; }   /* T-346 fold 1: resume = the rest of a cut batch; T-1279 fold (finding 2): a failed send begins the exchange again */
         return;
     }
     /* Done - the pump sees it on its next frame */
@@ -17177,6 +22104,8 @@ void PreloadFinish(int verdict, DWORD now)
     g_preReasked += (long long)g_pre.reasked.size(); g_preFetchCuts += (long long)g_pre.cuts;
     g_preVerdictPhase = g_pre.phase;
     g_pre.phase = cooppre::kPhReleased;
+    g_preSinceAskLast = (long long)cooppre::PreSinceFirstAsk(g_preFirstAskMs, now);   /* T-1279 fold 2 (re-check A): before the zeroing below */
+    g_preHolding = false; g_preFirstAskMs = 0;   /* T-1279 */
     ::InterlockedExchange(&g_preCountOn, 1);
     g_preVerdictPending = verdict;   /* counted done / stale only when the pump's verdict lets the load go */
     MirrorKeepWrite("the records before the load are in");   /* T-985 C1: the fetched records are in the kept table */
@@ -17192,54 +22121,172 @@ void PreloadReleased()
     if (verdict == cooppre::kPreGo)
     {
         ++g_preDone;
-        DebugLog("[STORE] T-346 records before the load: DONE after " + N(ms) + " ms - index " + N((long long)g_pre.rows) + " records, " + N(g_preWantedLast)
+        DebugLog("[STORE] T-346 records before the load: DONE after " + N(ms) + " ms (" + N(g_preSinceAskLast) + " ms since the first index ask) - index " + N((long long)g_pre.rows) + " records, " + N(g_preWantedLast)
                  + " newer there, areas fetched " + N(g_preAreasFetched) + ", groups fetched " + N(g_preGroupsFetched) + " (totals), " + N(g_preStaleKeysN)
                  + " still not current; " + PreloadAoiText() + " - the load goes");
         return;
     }
     ++g_preStaleLoads;
     if (verdict == cooppre::kPreStaleLink) ++g_preStaleLink; else ++g_preStaleTimeout;
-    ErrorLog("[STORE] T-346 STALE LOAD: " + std::string(verdict == cooppre::kPreStaleLink ? "the world server's link failed" : "the bound passed")
+    ErrorLog("[STORE] T-346 STALE LOAD: " + std::string(verdict == cooppre::kPreStaleLink ? "no world server can answer this game any more (T-1279: protocol refused, another world, or none set)" : "the bound passed")
              + " after " + N(ms) + " ms while " + std::string(wasPhase == cooppre::kPhIndex ? "the index was still arriving (" + N((long long)g_pre.pages) + " pages in)" : "records were being fetched")
              + " - the load goes with this game's own copies; " + N(g_preStaleKeysN) + " known not current (staleLoads=" + N(g_preStaleLoads) + ")");
 }
-/* MAIN THREAD, SaveRequestPumpBody, every frame a title load is about to dispatch: 1 = hold it this frame. */
+/* T-1279: MAIN THREAD. 1 = the world server may still answer this game: one is set (its address and port - T-1279 fold, review
+   finding 3: not the link object, which a dial that fails outright deletes while the re-dial keeps the address), it has not refused
+   this game's protocol, and it has not named another world (this link's WELCOME, or a refusal since the last leave). */
+int PreloadLinkCanServe()
+{
+    return (!g_storeTargetAddr.empty() && g_storeTargetPort != 0 && !g_storeProtoMismatch && !g_storeWrongWorld && !g_storeWrongWorldPress && g_storeAuthStop == 0) ? 1 : 0;   /* g_storeAuthStop: its password or access list refused this join */
+}
+/* T-1279 fold (review finding 1): MAIN THREAD. 1 = a dial of the world server is still in flight or to come: the link is connecting
+   or mid-handshake (coopstore::StoreSockCouldArm), or - a joining game only - the title's re-dial (config.cpp ConfigTitleTick) has
+   dials left under its cap (kDialCap). A host's game never re-dials at the title, so with its link down nothing is pending. */
+int PreloadDialPending()
+{
+    if (StoreLinkCouldArm() != 0) return 1;
+    return (ConfigRole() == kRoleClient && ConfigDialCount() < ConfigDialCap()) ? 1 : 0;
+}
+/* T-1279 fold (review finding 1; owner 2026-11-09: not reaching the world server while loading IS being disconnected - the approved
+   connection-trouble steps, rules ~496): MAIN THREAD, every held frame. down = the hold waits for the link (a dial pending). Nothing
+   up to coopown::kHostQuietMs of it; then the approved small notice (coopown::HostQuietLine, the in-world step 2 text and widget -
+   UiQuietNotice), retried once a second if the UI call fails; off as soon as the link is back or the hold ends. The link declared
+   dead (no dial pending) is the refusal (PreloadRefuse) - the title's CAN'T JOIN box in place of the in-world CONNECTION LOST. */
+void PreloadLinkTrouble(DWORD now, bool down)
+{
+    if (!down)
+    {
+        g_preDownSince = 0;
+        if (g_preNoticeShown == 0) return;
+        const int r = UiQuietNotice("", 0);
+        if (r == 1) { g_preNoticeShown = 0; DebugLog("[STORE] T-1279 records before the load: the connection-problem notice is OFF"); }
+        return;
+    }
+    if (g_preDownSince == 0) g_preDownSince = now != 0 ? now : 1;
+    if (g_preNoticeShown != 0 || (DWORD)(now - g_preDownSince) < coopown::kHostQuietMs) return;
+    if (g_preNoticeTriedAt != 0 && (DWORD)(now - g_preNoticeTriedAt) < 1000) return;
+    g_preNoticeTriedAt = now;
+    const int r = UiQuietNotice(coopown::HostQuietLine(), 1);
+    if (r == 1)
+    {
+        g_preNoticeShown = 1; ++g_preNoticeOn;
+        DebugLog("[STORE] T-1279 records before the load: the connection-problem notice is ON over the held load - the world server's link down "
+                 + N((long long)(DWORD)(now - g_preDownSince)) + " ms with a dial pending (preNoticeOn=" + N(g_preNoticeOn) + ")");
+    }
+    else if (++g_preNoticeFailed <= 5) ErrorLog("[STORE] T-1279 records before the load: the connection-problem notice FAILED rc=" + N((long long)r) + " - retried in 1 s (first 5 logged)");
+}
+/* T-1279 fold (review finding 1): MAIN THREAD. A held title load refused - the link is down and no dial of it is pending. The pump
+   (SaveRequestPumpBody) clears the request, turns the loading screen off and shows the existing CAN'T JOIN box (UiPreloadRefusedBox);
+   nothing is loaded from the save file. Said once per refusal (g_pumpRefusalUncleared, as the pump's other refusals). */
+void PreloadRefuse(DWORD now, const char* why)
+{
+    if (g_pumpRefusalUncleared == 0)
+    {
+        ++g_preRefused;
+        ErrorLog("[STORE] T-1279 records before the load: the load is REFUSED - " + std::string(why) + " (role " + std::string(ConfigRole() == kRoleClient ? "join" : "host")
+                 + ", title dials " + N(ConfigDialCount()) + " of " + N(ConfigDialCap()) + ", held " + N((long long)(g_preHolding ? (DWORD)(now - g_preStartMs) : 0))
+                 + " ms) - nothing is loaded from the save file; the request is cleared, the loading screen turned off and the CAN'T JOIN box shown (preRefused=" + N(g_preRefused) + ")");
+    }
+    g_pre.phase = cooppre::kPhIdle;   /* no exchange: the next load decides afresh */
+    g_preHolding = false; g_preFirstAskMs = 0;
+    PreloadLinkTrouble(now, false);
+}
+/* T-1279: MAIN THREAD. A held title load, every frame: the first frame starts the clock; a line each kPreWaitNoteMs held (first 60). */
+void PreloadHoldNote(DWORD now, const char* what)
+{
+    if (!g_preHolding) { g_preHolding = true; g_preStartMs = now; g_preNextNoteMs = cooppre::kPreWaitNoteMs; return; }
+    const DWORD held = (DWORD)(now - g_preStartMs);
+    if (held < g_preNextNoteMs) return;
+    g_preNextNoteMs += cooppre::kPreWaitNoteMs;
+    if (++g_preHeldNotes > 60) return;
+    DebugLog("[STORE] T-1279 records before the load: the load is STILL HELD after " + N((long long)held) + " ms - " + std::string(what)
+             + " (link up=" + N((long long)(LinkUp() ? 1 : 0)) + ", can answer=" + N((long long)PreloadLinkCanServe()) + ", phase " + N((long long)g_pre.phase)
+             + ", index pages " + N((long long)g_pre.pages) + ", wanted " + N((long long)g_pre.want.size()) + ", answered " + N((long long)g_pre.settled.size())
+             + "; no time bound - the loading screen stays until the world's records are in; first 60 logged)");
+}
+/* MAIN THREAD, SaveRequestPumpBody, every frame a title load is about to dispatch: 1 = hold it this frame; 2 = refuse it (T-1279 fold:
+   the link is down and no dial is pending - the pump clears the request, turns the loading screen off and shows CAN'T JOIN); 0 = go. */
 int PreloadHoldsTitleLoad()
 {
     if (RoleIsSingle() || !g_dirReady) return 0;
     const DWORD now = ::GetTickCount();
     if (g_pre.phase == cooppre::kPhReleased) return 0;
-    if (g_pre.phase == cooppre::kPhIdle)
-    {
-        ::InterlockedExchange(&g_preCountOn, 0);
-        if (!g_preStaleLockInit) { ::InitializeCriticalSection(&g_preStaleLock); g_preStaleLockInit = true; }   /* T-346 fold 1: here, on the main thread, before the switch is ever on */
-        if (!LinkUp() || !g_indexLoaded)
+    const int canServe = PreloadLinkCanServe();
+    const int dialPending = PreloadDialPending();
+    const int linkReady = (LinkUp() && g_indexLoaded) ? 1 : 0;
+    if (g_pre.phase != cooppre::kPhIdle)
+    {   /* T-1279 (owner decision 1580 a): no time bound - Wait while the exchange's link is up (Restart on it when stalled), Restart on a
+           new link, Wait for a pending dial, Refuse when none is, StaleLink only when no world server can answer this game */
+        const int linkOk = (LinkUp() && StoreNotebookLinkGen() == g_pre.linkGen) ? 1 : 0;
+        const unsigned int sinceProgress = (unsigned int)(DWORD)(now - g_preProgressMs);
+        const int stalled = cooppre::PreStalled(g_preBroke ? 1 : 0, sinceProgress);
+        const int d = cooppre::PreWaitDecide(g_pre.phase, linkOk, linkReady, canServe, dialPending, stalled);
+        if (d == cooppre::kPreWait)
         {
-            ++g_preSkippedNoLink; g_pre.phase = cooppre::kPhReleased;
-            DebugLog("[STORE] T-346 records before the load: not asked - the world server's link is not up and welcomed (" + std::string(g_indexLoaded ? "index read" : "no index yet")
-                     + "); the load is decided as before (preload skippedNoLink=" + N(g_preSkippedNoLink) + ")");
-            return 0;
+            PreloadLinkTrouble(now, linkOk == 0);
+            PreloadHoldNote(now, linkOk ? "the world server's records are still arriving" : "the world server's link was lost; a dial of it is pending");
+            return 1;
         }
-        PreloadStaleListSet(0);   /* T-346 fold 1 (LOW 4): the switch went off above; the old list goes before the new exchange */
-        PreloadAoiBegin();
-        g_preVerdictPending = 0;
-        cooppre::PreBegin(&g_pre, ++g_preToken, StoreNotebookLinkGen());
-        g_preStartMs = now; ++g_preBegun;
-        std::vector<char> b;
-        if (!cooppre::PreEncodeIndexAsk(&b, g_pre.token, std::string(), cooppre::kPreRing, g_preAoiList) || !PreloadSend(b)) { PreloadFinish(cooppre::kPreStaleLink, now); return 0; }
-        DebugLog("[STORE] T-346 records before the load: the load is held under the loading screen - asking the world server for its record index (token "
-                 + N((long long)g_pre.token) + ", bound " + N((long long)cooppre::kPreBoundMs) + " ms)");
+        if (d == cooppre::kPreRefuse) { PreloadRefuse(now, "the link the exchange began on was lost and no dial of the world server is pending"); return 2; }
+        if (d != cooppre::kPreRestart) { PreloadLinkTrouble(now, false); PreloadFinish(d, now); return 0; }
+        ++g_preRestarts;
+        if (linkOk != 0)
+        {   /* T-1279 fold (review finding 2): begun again on the SAME link */
+            ++g_preStallRestarts;
+            DebugLog("[STORE] T-1279 records before the load: the exchange made no progress on its link (" + (g_preBroke ? g_preBrokeWhy : "no answer for " + N((long long)sinceProgress) + " ms")
+                     + ") - it begins again on the same link (what was fetched is in the mirror and is not asked again; restarts=" + N(g_preRestarts) + ", on the same link " + N(g_preStallRestarts) + ")");
+        }
+        else
+            DebugLog("[STORE] T-1279 records before the load: the link the exchange began on was lost and a new one is up - the exchange begins again on it"
+                     " (what was fetched is in the mirror and is not asked again; restarts=" + N(g_preRestarts) + ")");
+        g_pre.phase = cooppre::kPhIdle;   /* a new exchange below, on the link now up */
+    }
+    ::InterlockedExchange(&g_preCountOn, 0);
+    if (!g_preStaleLockInit) { ::InitializeCriticalSection(&g_preStaleLock); g_preStaleLockInit = true; }   /* T-346 fold 1: here, on the main thread, before the switch is ever on */
+    const int b = cooppre::PreBeginDecide(linkReady, canServe, dialPending);
+    if (b == cooppre::kPreBeginNotAsked)
+    {
+        ++g_preSkippedNoLink; g_pre.phase = cooppre::kPhReleased;
+        const bool held = g_preHolding; g_preHolding = false;
+        PreloadLinkTrouble(now, false);
+        ErrorLog("[STORE] T-346 records before the load: not asked - no world server can answer this game (" + std::string((g_storeTargetAddr.empty() || g_storeTargetPort == 0) ? "none set" : g_storeProtoMismatch ? "it refused this game's protocol" : g_storeAuthStop != 0 ? "it refused this join (password or access list)" : "it named another world")
+                 + (held ? ", after the load was held for the link" : "") + "); the load goes with this game's own copies (preload skippedNoLink=" + N(g_preSkippedNoLink) + ")");
+        return 0;
+    }
+    if (b == cooppre::kPreBeginRefuse) { PreloadRefuse(now, "the world server's link is down and no dial of it is pending"); return 2; }
+    if (b == cooppre::kPreBeginWaitLink)
+    {   /* T-1279: before, the load went at once with this game's own copies; now it is held until the link is up */
+        if (!g_preHolding) { ++g_preHeldForLink; DebugLog("[STORE] T-1279 records before the load: the load is HELD under the loading screen until the world server's link is up and welcomed ("
+                                                          + std::string(g_indexLoaded ? "index read" : "no index yet") + "; a dial of it is pending; heldForLink=" + N(g_preHeldForLink) + ")"); }
+        PreloadLinkTrouble(now, !LinkUp());
+        PreloadHoldNote(now, "waiting for the world server's link");
         return 1;
     }
-    const int linkOk = (LinkUp() && StoreNotebookLinkGen() == g_pre.linkGen) ? 1 : 0;
-    const int d = cooppre::PreWaitDecide(g_pre.phase, linkOk, (unsigned int)(DWORD)(now - g_preStartMs), cooppre::kPreBoundMs);
-    if (d == cooppre::kPreWait) return 1;
-    PreloadFinish(d, now);
-    return 0;
+    PreloadLinkTrouble(now, false);
+    PreloadStaleListSet(0);   /* T-346 fold 1 (LOW 4): the switch went off above; the old list goes before the new exchange */
+    PreloadAoiBegin();
+    g_preVerdictPending = 0;
+    cooppre::PreBegin(&g_pre, ++g_preToken, StoreNotebookLinkGen());
+    g_preBroke = false; g_preBrokeWhy.clear(); g_preProgressMs = now;   /* T-1279 fold: the exchange's progress fact starts here */
+    PreloadHoldNote(now, "");   /* the first held frame starts the clock (a restart keeps it) */
+    ++g_preBegun;
+    std::vector<char> bb;
+    if (!cooppre::PreEncodeIndexAsk(&bb, g_pre.token, std::string(), cooppre::kPreRing, g_preAoiList) || !PreloadSend(bb))
+    {   /* T-1279: a send that failed - the load stays held and the exchange begins again on the next frame (no fallback to the save) */
+        g_pre.phase = cooppre::kPhIdle;
+        if (g_preSendFailed <= 8) DebugLog("[STORE] T-1279 records before the load: the index ask could not be sent - the load stays held and it is asked again (sendFailed=" + N(g_preSendFailed) + ", first 8 logged)");
+        return 1;
+    }
+    if (g_preFirstAskMs == 0) g_preFirstAskMs = now != 0 ? now : 1;
+    DebugLog("[STORE] T-346 records before the load: the load is held under the loading screen - asking the world server for its record index (token "
+             + N((long long)g_pre.token) + "; T-1279: no time bound while the link is up)");
+    return 1;
 }
 /* MAIN THREAD, SaveRequestPumpBody: no request pending - a released load is behind us; an exchange in flight lost its load. */
 void PreloadNoRequest()
 {
+    g_preHolding = false; g_preFirstAskMs = 0;   /* T-1279: a load held for the link whose request went away is no longer held */
+    if (g_preNoticeShown != 0 || g_preDownSince != 0) PreloadLinkTrouble(::GetTickCount(), false);   /* T-1279 fold: its notice goes with it */
     if (g_pre.phase == cooppre::kPhIdle) return;
     if (g_pre.phase != cooppre::kPhReleased) { ++g_preAbandoned; DebugLog("[STORE] T-346 records before the load: the held load request went away - the exchange is dropped (abandoned)"); }
     if (g_preVerdictPending != 0) { g_preVerdictPending = 0; DebugLog("[STORE] T-346 records before the load: the load its exchange held was refused at the pump - not counted as done or stale (T-346 fold 1)"); }
@@ -17295,12 +22342,62 @@ void StoreAreaDoneApply(const std::vector<char>& payload)
         }
         return;
     }
-    for (size_t i = 0; i < m.keys.size(); ++i) ::InterlockedExchange64(&g_areaDone.area[m.keys[i]], stamp);
+    const long genNow = ::InterlockedCompareExchange(&g_areaDoneGen, 0, 0);
+    for (size_t i = 0; i < m.keys.size(); ++i)
+    {
+        const int k = (int)m.keys[i];
+        /* T-1339: the world server sends an AREA_DONE all=0 only behind an area's catch-up, and a catch-up only after that area's
+           AREA_STALE (same line) - so it must find the area stale (recordfeed.h FeedAreaDoneStaleJudge) */
+        const int j = coopfeed::FeedAreaDoneStaleJudge(AreaStaleStamp(k), genNow, coop::ZoneLoadedSectorTri(k % coopfeed::kFeedAreaGrid, k / coopfeed::kFeedAreaGrid));
+        ::InterlockedExchange64(&g_areaDone.area[k], stamp);
+        if (j == coopfeed::kAdStaleCleared) { ::InterlockedExchange64(&g_areaDone.stale[k], -1); ++g_areaStaleCleared; continue; }   /* after the done stamp: never a read of neither */
+        ++g_areaDoneNotStale;
+        if (j == coopfeed::kAdLate && ++g_lateRecordDone <= 8)
+            ErrorLog("[STORE] T-1339 lateRecordDone: area " + N((long long)(k % coopfeed::kFeedAreaGrid)) + "," + N((long long)(k / coopfeed::kFeedAreaGrid)) + " is loaded here and read as done, and a catch-up of its records"
+                     " just ended (AREA_DONE) with no AREA_STALE before it - records of that area came late (the first 8 logged; lateRecordDone on the REPORT line)");
+    }
     ::InterlockedExchange64(&g_areaDone.some, stamp);
     g_areaDoneAreas += (long long)m.keys.size();
     ZoneFromRecordDrain();     /* T-823 fold 2: reads a worker queued before the list's end land first */
     ZoneProvisionalSettle(&m.keys);   /* the provisional reads of the named areas are judged now */
     DebugLog("[STORE] T-985 AREA_DONE applied: " + N((long long)m.keys.size()) + " area(s) of this snapshot done on link " + N((long long)lg));
+}
+/* T-1339: THE DRAIN - an AREA_STALE marker, in arrival order behind the records before it: each named area reads as not done (every
+   reader gate) until an AREA_DONE all=0 names it. Applied in order, so an AREA_DONE queued before it can never clear it. */
+void StoreAreaStaleApply(const std::vector<char>& payload)
+{
+    unsigned int epoch = 0; coopfeed::AreaDoneMsg m;
+    if (!coopfeed::FeedAreaStaleMarkerDecode(payload, &epoch, &m)) { ++g_areaStaleMalformed; return; }
+    if (epoch != g_feed.epoch) { ++g_areaStaleMarkersStale; return; }   /* queued before an OFF or a new first ASK - that snapshot carries every latest copy */
+    const long lg = ::InterlockedCompareExchange(&g_linkGen, 0, 0);
+    const long long stamp = coopfeed::FeedAreaStampMake(::InterlockedCompareExchange(&g_areaDoneGen, 0, 0), lg);
+    const long genS = ::InterlockedCompareExchange(&g_areaDoneGen, 0, 0);
+    const long long allS = ::InterlockedCompareExchange64(&g_areaDone.all, 0, 0);
+    for (size_t i = 0; i < m.keys.size(); ++i)
+    {
+        const int k = (int)m.keys[i];
+        /* fold 1 (review MED 2): the race lateRecordDone cannot see - the area is loaded here and read as done until this STALE (a camera jump
+           or character switch into it before the STALE drained): it may stand on the older copy until it is caught up */
+        if (coopfeed::FeedAreaDoneHeld(allS, AreaDoneStamp(k), genS) != 0 && coop::ZoneLoadedSectorTri(k % coopfeed::kFeedAreaGrid, k / coopfeed::kFeedAreaGrid) == 1 && ++g_staleWhileLoaded <= 8)
+            ErrorLog("[STORE] T-1339 staleWhileLoaded: area " + N((long long)(k % coopfeed::kFeedAreaGrid)) + "," + N((long long)(k / coopfeed::kFeedAreaGrid))
+                     + " is loaded here and was read as done when its AREA_STALE drained - it may stand on an older copy until its catch-up (the first 8 logged; staleWhileLoaded on the REPORT line)");
+        ::InterlockedExchange64(&g_areaDone.stale[k], stamp);
+    }
+    ++g_areaStaleIn; g_areaStaleAreas += (long long)m.keys.size();
+    DebugLog("[STORE] T-1339 AREA_STALE applied: area " + N((long long)(m.keys[0] % coopfeed::kFeedAreaGrid)) + "," + N((long long)(m.keys[0] / coopfeed::kFeedAreaGrid))
+             + (m.keys.size() > 1 ? " and " + N((long long)(m.keys.size() - 1)) + " more" : std::string()) + " - a write of it was held for this game; read as not done until its catch-up ends");
+}
+/* T-1339: the AREA_STALE counts, the gate reads a stale mark held, and the late-record detector (must stay 0) */
+std::string AreaStaleReportGroup()
+{
+    std::string held; long long now = 0;
+    for (int g = 0; g <= kAreaGateCount; ++g) { if (g != 0) held += ","; held += N((long long)::InterlockedCompareExchange(&g_areaGateStaleHeld[g], 0, 0)); }
+    const long gen = ::InterlockedCompareExchange(&g_areaDoneGen, 0, 0);
+    for (int k = 0; k < coopfeed::kFeedAreaKeys; ++k) if (coopfeed::FeedAreaStaleNow(AreaStaleStamp(k), gen)) ++now;
+    return " areaStale[in,areas,cleared,staleNow,doneNotStale,markersStale,arrivedStale,malformed]=" + N(g_areaStaleIn) + "," + N(g_areaStaleAreas) + "," + N(g_areaStaleCleared) + "," + N(now)
+           + "," + N(g_areaDoneNotStale) + "," + N(g_areaStaleMarkersStale) + "," + N(g_areaStaleArrivedStale) + "," + N(g_areaStaleMalformed)
+           + " lateRecordDone=" + N(g_lateRecordDone) + " staleWhileLoaded=" + N(g_staleWhileLoaded)
+           + " gateStaleHeldBy[areaRead,loadRecord,groundWrite,groundScan,boxHold,boxTick,town,wakeR5]=" + held;
 }
 /* T-985 step 2B: the AREA_DONE counts and gateDisagree (must stay 0 - the proof that 2B changes no gate's answer), for the REPORT line */
 std::string AreaDoneReportGroup()
@@ -17315,13 +22412,15 @@ std::string AreaDoneReportGroup()
     }
     return " areaDone[allThisFeed,allTotal,allMismatch,areasNamed,arrivedStale,markersStale,malformed]=" + N(g_areaDoneAllFeed) + "," + N(g_areaDoneAllTotal) + "," + N(g_areaDoneAllMismatch) + "," + N(g_areaDoneAreas)
            + "," + N(g_areaDoneStale) + "," + N(g_areaDoneMarkersStale) + "," + N(g_areaDoneMalformed)
-           + " gateDisagree=" + N(sum) + " gateDisagreeBy[areaRead,loadRecord,groundWrite,groundScan,boxHold,boxTick,town]=" + by;
+           + " gateDisagree=" + N(sum) + " gateDisagreeBy[areaRead,loadRecord,groundWrite,groundScan,boxHold,boxTick,town]=" + by
+           + AreaStaleReportGroup();   /* T-1339 */
 }
 /* THE DRAIN - a PAGE_END marker (ApplyRecordClassMessage), in arrival order behind its page's records. */
 void StoreFeedMarkerApply(const std::vector<char>& payload)
 {
     g_arFeedProgressAt = ::GetTickCount() | 1u;   /* T-1084 step 3 fold 1: a page or marker arrived - the feed moves */
     if (coopfeed::IsFeedAreaDoneMarker(payload)) { StoreAreaDoneApply(payload); return; }   /* T-985 step 2B: kind 10 rides the same queue entry type */
+    if (coopfeed::IsFeedAreaStaleMarker(payload)) { StoreAreaStaleApply(payload); return; }   /* T-1339: kind 11 too */
     unsigned int epoch = 0; coopfeed::FeedMsg m;
     if (!coopfeed::FeedMarkerDecode(payload, &epoch, &m)) { ++g_feedMalformed; return; }
     bool snap = g_snapshotApplied;
@@ -17429,7 +22528,8 @@ void ApplyRecordClassMessage(int type, const std::vector<char>& payload)
     else if (type == (int)kStoreMsgGone)
     {
         std::string wid; size_t at = 0; unsigned int lo = 0, hi = 0;
-        if (GetStrS(payload, &at, &wid) && GetU32S(payload, at, &lo) && GetU32S(payload, at + 4, &hi)) ApplyRemoteGoneImpl(wid, (long long)(((unsigned long long)hi << 32) | lo), "store");
+        if (GetStrS(payload, &at, &wid) && GetU32S(payload, at, &lo) && GetU32S(payload, at + 4, &hi))
+            ApplyRemoteGoneImpl(wid, (long long)(((unsigned long long)hi << 32) | lo), "store", townrefill::GoneIsDiscard(payload.empty() ? 0 : &payload[0], payload.size(), at + 8));   /* T-850 D2: the DISCARD mark the world server forwards is read - a discard is no death */
         else ErrorLog("[STORE] malformed RECORD_GONE from the store - ignored");
     }
     else if (type == (int)net::MSG_RECORD)
@@ -17438,7 +22538,7 @@ void ApplyRecordClassMessage(int type, const std::vector<char>& payload)
         std::string townR, homeR;
         unsigned long long seqIn = 0;
         unsigned recFlags = 0;
-        if (net::DecodeRecordPayload(payload, &worldId, &squadSid, &factionName, &x, &y, &z, &writtenAt, &owner, &bytes, &townR, &seqIn, &recFlags, &homeR)) { ++g_linkRecords; MirrorKeepNamed(worldId, bytes.empty() ? 0 : 1); NoteTownPeople(worldId, townR); NoteRecordHome(worldId, homeR); StoreNotePushArrival(worldId); ApplyRemoteRecord(worldId, squadSid, factionName, x, y, z, writtenAt, owner, bytes, recFlags); StoreNoteRecordSeq(worldId, seqIn); }   /* B12 (store protocol 41): the notebook's seq is taken from the NOTEBOOK'S OWN link and nowhere else - the session peer sends 0 in that field */   /* B10-b (review-b10 M-2): the push's books are kept HERE, at the store link's own call site, and nowhere the session link can reach */
+        if (net::DecodeRecordPayload(payload, &worldId, &squadSid, &factionName, &x, &y, &z, &writtenAt, &owner, &bytes, &townR, &seqIn, &recFlags, &homeR)) { ++g_linkRecords; MirrorKeepNamed(worldId, bytes.empty() ? 0 : 1); NoteTownPeople(worldId, townR); PushNoteRecordHome(worldId, homeR, owner, writtenAt, bytes.empty() ? 1 : 0); StoreNotePushArrival(worldId); ApplyRemoteRecord(worldId, squadSid, factionName, x, y, z, writtenAt, owner, bytes, recFlags); StoreNoteRecordSeq(worldId, seqIn); }   /* B12 (store protocol 41): the notebook's seq is taken from the NOTEBOOK'S OWN link and nowhere else - the session peer sends 0 in that field */   /* B10-b (review-b10 M-2): the push's books are kept HERE, at the store link's own call site, and nowhere the session link can reach */
         else ErrorLog("[STORE] malformed RECORD from the store - ignored");
     }
 }
@@ -17451,7 +22551,10 @@ void ApplyRecordClassMessage(int type, const std::vector<char>& payload)
 void GoneBitBeforeDrop(const std::vector<char>& payload)
 {
     std::string wid; size_t at = 0;
-    if (GetStrS(payload, &at, &wid) && !wid.empty() && DeletedBitSet(wid)) ++g_goneBitAtDrop;
+    if (!GetStrS(payload, &at, &wid) || wid.empty()) return;
+    /* T-850 D2: a gone marked DISCARD is no death - it never set the permanent bit when applied, so it does not set it when dropped */
+    if (sqbirth::GoneSetsDeletedMark(townrefill::GoneIsDiscard(payload.empty() ? 0 : &payload[0], payload.size(), at + 8)) == 0) { ++g_goneDiscardBitSkipped; return; }
+    if (DeletedBitSet(wid)) ++g_goneBitAtDrop;
 }
 /* THE COPY BUDGET (spawnpace.h). One tally per frame, shared by the frame's two drains; SpawnPaceFrameStart, the first statement
    of CommandChannelTick, closes the last frame into the burst book and starts the next. The held list keeps what the budget held
@@ -18289,6 +23392,7 @@ void NotebookLinkDown(const std::string& why)
     DebugLog("[STORE] link DOWN - " + why);
     coop::TeamForget("the world-server link went down", true);   /* T-546: the membership table belongs to this link */
     coop::ResurrectLinkLost();   /* T-556: the fallen list is the world server's - with no link this game has none */
+    coop::ActOwedLinkLost();   /* T-860: acts owed to other players' games belong to this link */
     JoinHoldDrop("the world-server link went down");   /* a load held for the operator ends here: the re-dial / CAN'T JOIN path applies */
     SpImportLinkEnded();   /* T-1096 fold (review 2026-10-31): an unanswered import request and the OPTIONS map belong to this link */
 }
@@ -18343,6 +23447,8 @@ typedef char FightChoiceInnerNumber[(net::MSG_FIGHT_CHOICE == (int)cooplive::kIn
 typedef char ShotFiredInnerNumber[(net::MSG_SHOT_FIRED == (int)cooplive::kInnerShotFired) ? 1 : -1];
 typedef char HandInnerNumber[(net::MSG_HAND == (int)cooplive::kInnerHand) ? 1 : -1];
 typedef char BoxLockInnerNumber[(net::MSG_BOX_LOCK == (int)cooplive::kInnerBoxLock && net::MSG_BOX_LOCK == (int)coopbrec::kMsgBoxLock) ? 1 : -1];   /* T-1061 */
+typedef char RaidLendInnerNumber[(net::MSG_RAID_LEND == (int)cooplive::kInnerRaidLend && net::MSG_RAID_LEND == (int)raidsq::kMsgRaidLend) ? 1 : -1];   /* T-1122 build */
+typedef char RaidEndInnerNumber[(net::MSG_RAID_END == (int)cooplive::kInnerRaidEnd && net::MSG_RAID_END == (int)raidsq::kMsgRaidEnd) ? 1 : -1];   /* T-1122 redesign (b) */
 typedef char ResearchBookInnerNumber[(net::MSG_RESEARCH_BOOK == (int)cooplive::kInnerResearchBook && net::MSG_RESEARCH_BOOK == (int)bookshare::kMsgResearchBook) ? 1 : -1];   /* T-1242 */
 std::string LiveReportToken()
 {
@@ -18372,7 +23478,7 @@ static void StoreLiveRoadLocal(const cooplive::LiveDown& d, const std::vector<ch
         int here = 0; coop::AreaViewTS(s, 0, 0, 0, &here, 0, 0);
         ++g_liveProbeRecv; if (here == 1) ++g_liveProbeRecvLoaded;
         DebugLog("[STORE] LIVE probe #" + N((long long)a) + " from slot " + N((long long)d.originSlot) + " sector " + N((long long)s.x) + "," + N((long long)s.y)
-                 + " loadedHere=" + N((long long)here) + " (liveProbeRecv " + N(g_liveProbeRecv) + ")");
+                 + " kept=" + N((long long)here) + " (liveProbeRecv " + N(g_liveProbeRecv) + ")");   /* decision 1556 fold 2: AreaViewTS's loadedHere is the kept set */
         return;
     }
     cooplive::CatchupEndMsg em;   /* M7a2 [m7a2-st4]: + the sectors asked and the uids held (protocol 112) */
@@ -18551,6 +23657,15 @@ void StoreFeedArrive(const std::vector<char>& payload)
         coopfeed::AreaDoneMsg ad;
         if (!coopfeed::FeedAreaDoneDecode(&payload[0], payload.size(), &ad)) { ++g_areaDoneMalformed; return; }
         if (coopfeed::FeedAreaDoneArrived(g_feed, StoreNotebookLinkGen(), ad.epoch) == 0) { ++g_areaDoneStale; return; }
+        std::vector<char> mk; coopfeed::FeedMarkerEncode(&mk, g_feed.epoch, payload);
+        InQueueEnqueue((int)kStoreMsgRecordFeed, kOriginNotebook, kScopeSave, kClassEdge, 0, 0, mk);
+        return;
+    }
+    if (!payload.empty() && coopfeed::IsFeedAreaStaleKind(&payload[0], payload.size()))
+    {   /* T-1339: AREA_STALE - queued as a marker in arrival order (an AREA_DONE queued before it must not clear it), on AREA_DONE's arrival rule */
+        coopfeed::AreaDoneMsg as;
+        if (!coopfeed::FeedAreaStaleDecode(&payload[0], payload.size(), &as)) { ++g_areaStaleMalformed; return; }
+        if (coopfeed::FeedAreaDoneArrived(g_feed, StoreNotebookLinkGen(), as.epoch) == 0) { ++g_areaStaleArrivedStale; return; }
         std::vector<char> mk; coopfeed::FeedMarkerEncode(&mk, g_feed.epoch, payload);
         InQueueEnqueue((int)kStoreMsgRecordFeed, kOriginNotebook, kScopeSave, kClassEdge, 0, 0, mk);
         return;
@@ -18906,12 +24021,14 @@ void PumpLink()
             coop::RefillTableReset();   /* refill1: and every town bar row */
             coop::TownGenOwedReset();   /* T-581: and every owed town population row */
             coop::TownLossReset();   /* and every town's recorded losses and refilled flag */
+            coop::TownTimeLinkNew();   /* T-4 fold 3: a town clock write sent before the link dropped goes back to the accepted record */
             GoneKeepThisWorld();   /* this game's unsent gones made in another world are dropped before the relink re-sends them */
             coop::TownVerWelcome();   /* and the town versions, pending writes and stops of another world */
-            SwLinkNew();   /* T-1084 step 5: the register's generations and takes out were the last link's */
+            SwLinkNew(protoOk ? 1 : 0);   /* T-1084 step 5: the register's generations and takes out were the last link's */
             coop::WorldRelTableReset();   /* par24: and every world-vs-world standing row */
             WorldStateNotebookReset();   /* E32 (verify-p5t MEDIUM-4): re-armed with the push that is about to refill it, so "the notebook has named this id" always means THIS notebook */
             ::InterlockedExchange(&g_relayLinkedCached, LinkUp() ? 1 : 0);   /* review-p5b CRASH-2: the WELCOME is what makes the link up - refresh here rather than a frame later */
+            SwReclaimSend();   /* T-1269 [t1269a-B]: the re-claim batch and its end mark, right behind the WELCOME (owed until the link is up) */
             DebugLog("[STORE] WELCOME from the store: protocol=" + N(proto) + " authority=" + N(auth) + " records=" + N(count) + " slot=" + N((long long)g_mySlot) + (StoreJoinViaWorld() ? " (M11a world road)" : "") + (proto == kStoreProtocol ? "" : " (PROTOCOL MISMATCH)") + (welcomeTorn ? " (WELCOME id field malformed)" : ""));
             DebugLog(std::string("[STORE] roles: this game steward=") + (auth != 0 ? "1" : "0") + " (WELCOME)");   /* the authority flag names the world's steward */
             /* P7b / decision 44 - THE FIRST WELCOME FOR THIS WORLD IS WHAT MARKS THE SAVE. This is the event that
@@ -19557,6 +24674,12 @@ void DeathWatchTick()
             void* p = ap.items[i]; if (!Plaus(p)) continue;
             ++g_watchWalked;
             const int living = LivingMembersPod(p);
+            if (RaidLentHas(p)) { RaidLentWatch(p, living); continue; }   /* T-1122 build: a lent copy - no first sight, no heartbeat, no wipe-out mark (its lender removes the squad on DIED) */
+            if (living > 0 && g_ownLivedHere.count(p) == 0)
+            {   /* T-850 fold 2: a living member of this game's own in this copy - it is the squad here, not an empty shell */
+                int ownLiving = 0;
+                if (OwnMembersPod(p, &ownLiving) > 0 && ownLiving > 0) { if (g_ownLivedHere.size() < kOwnLivedCap) g_ownLivedHere.insert(p); else ++g_ownLivedCapFull; }
+            }
             if (living > 0) { ++g_watchAlive; ArFirstSight(p, kArViaWatch); HbRegister(p); HbNoteMembers(p); if (sqbirth::ModMarkClearedBy(living) != 0) { g_modMade.erase(p); if (g_modRemoved.erase(p) != 0) ++g_modRemovedLiving; } continue; }   /* T-1080: a living member of its own here - the mark goes */   /* E47-S2 entry edge: an awake world group with living members (a map find when already known) */
             if (living < 0) { ++g_watchUnknown; continue; }   /* -1 not read (a fault, an implausible member list, more than 512) / -2 not awake here */   /* E12: moved ABOVE the ownership tests - the member rule below was already gated on living == 0, so a -1/-2 group reached this line either way; the order only changes which test names it, and "unknown" is the honest name */
             const std::string wid = WorldIdOf(p); if (wid.empty()) { ++g_watchNoId; continue; }   /* E12: read here rather than after the ownership tests - the block rule needs the NUMBER, and the number is in the id */
@@ -19640,12 +24763,9 @@ void T300DropTick()
         T300Drop d = q[i];
         const std::string why(T300WhyWord(d.why));
         std::map<std::string, Record>::const_iterator rt = g_records.find(d.wid);
-        /* M7a3f3 T-425 [m7a3f3-st6]: a handed-over drop is re-checked by its own rule (still handed over, another game still holds the area) */
-        const int stillDue = (d.why == kT300WhyHandedOver)
-            ? ((rt != g_records.end() && coop::HandedOverHasId(d.wid) && HeldByOtherTS(SectorOf(rt->second.x, rt->second.z)) == 1) ? 1 : 0)
-            : ((rt != g_records.end() && T300OtherHeld(rt->second) == 1) ? 1 : 0);
-        if (stillDue == 0) { ++g_t300Cancelled; g_t300Queued.erase(d.wid); T300Line("[STORE] T-300 drop of '" + d.wid + "' (" + why + ") cancelled: "
-            + (d.why == kT300WhyHandedOver ? std::string("no longer a squad this game handed over, in an area another game holds") : std::string("no longer another game's file in an area another game holds"))); continue; }
+        /* (T-1318 fold 1: a squad given at an ACK is no longer dropped here by id - its refused platoon rides the duplicate-wake road) */
+        const int stillDue = (rt != g_records.end() && T300OtherHeld(rt->second) == 1) ? 1 : 0;
+        if (stillDue == 0) { ++g_t300Cancelled; g_t300Queued.erase(d.wid); T300Line("[STORE] T-300 drop of '" + d.wid + "' (" + why + ") cancelled: no longer another game's file in an area another game holds"); continue; }
         int res = fmOk ? 0 : -1;   /* 0 = no copy here, 1 = removed, 2 = members still there (purge), 3 = a registered member (kept), -1 = failed */
         int members = 0; std::string how;
         for (unsigned fi = 0; fmOk && fi < fm.count && res == 0; ++fi)
@@ -19786,7 +24906,7 @@ void CtxDropTick()
         if (step == coopsquad::kCtxDropCancel)
         {
             if (split != 0) { ++g_saveSplitCancelled; g_saveSplit.erase(p); }
-            if (d.dup != 0) { ++g_wakeDupKeptLive; g_ctxDrops.erase(p); WakeDupLine(head + " NOT removed: its last sleep here held a person this game runs (wakeDup keptLive=" + N(g_wakeDupKeptLive) + ")"); continue; }
+            if (d.dup != 0) { ++g_wakeDupKeptLive; g_ctxDrops.erase(p); WakeDupLine(head + " NOT removed: its last sleep here held a person this game runs (wakeDup keptLive=" + N(g_wakeDupKeptLive) + ")"); SwWakeDupSettled(d.wid); continue; }
             ++g_ctxDropCancelled; g_ctxDrops.erase(p);
             CtxDropLine(head + " NOT removed: no longer a context platoon, or its last sleep held a person this game runs (contextDrop cancelled=" + N(g_ctxDropCancelled) + ")");
             continue;
@@ -19796,8 +24916,19 @@ void CtxDropTick()
             if (split != 0) { ++g_saveSplitKeptLive; g_saveSplit.erase(p); }
             if (d.dup != 0)
             {
-                ++g_wakeDupKeptLive; g_ctxDrops.erase(p);
+                ++g_wakeDupKeptLive; g_ctxDrops.erase(p); SwWakeDupSettled(d.wid);   /* T-1269 fold 1 (H1) */
                 WakeDupLine(head + " NOT removed: " + N((long long)known) + " of its member(s) are registered copies - kept awake; the sweep still adopts none of its people (wakeDup keptLive=" + N(g_wakeDupKeptLive) + ")");
+                if (f != 0 && coop::HandedOverHas((void*)f, d.wid))
+                {   /* T-1318 attempt 5 (owner 1626, D1-R2 belt): the squad is one this game GAVE away and copies sit in its refused wake - the road
+                       D1-R2 closes (copies over a stale row go to their own context squad); behaviour unchanged (T-1269 H1 kept) - counted, capped */
+                    ++g_wakeDupKeptGiven;
+                    if (g_wakeDupKeptGivenLines < 40)
+                    {
+                        ++g_wakeDupKeptGivenLines;
+                        DebugLog(head + " - kept awake with " + N((long long)known) + " registered copies in it, and this game GAVE the squad away (T-1318 attempt 5; wakeDupKeptGiven="
+                                 + N(g_wakeDupKeptGiven) + "; the first 40)");
+                    }
+                }
                 continue;
             }
             ++g_ctxDropKeptLive; g_ctxDrops.erase(p);
@@ -19824,7 +24955,7 @@ void CtxDropTick()
                                   + " under the admin flag, no 'gone' mark (saveSplitDropped=" + N(g_saveSplitDropped) + ")");
                     continue;
                 }
-                ++g_wakeDupRemoved;
+                ++g_wakeDupRemoved; SwWakeDupSettled(d.wid);   /* T-1269 fold 1 (H1): a waiting id is built now its copy is gone */
                 WakeDupLine(head + " removed: " + (step == coopsquad::kCtxDropRetire ? "awake copy put on ice (" + N((long long)members) + " member(s)) and destroyed" : std::string("sleeping copy destroyed"))
                             + " under the admin flag, no 'gone' mark - the live copy runs the squad (wakeDup removed=" + N(g_wakeDupRemoved) + ")");
                 continue;
@@ -19841,7 +24972,7 @@ void CtxDropTick()
         if (d.dup != 0)
         {
             if (split != 0) { ++g_saveSplitGaveUp; g_saveSplit.erase(p); }
-            ++g_wakeDupGaveUp; g_ctxDrops.erase(p);   /* still in g_wakeDup: the sweep keeps away from its people */
+            ++g_wakeDupGaveUp; g_ctxDrops.erase(p); SwWakeDupSettled(d.wid);   /* still in g_wakeDup: the sweep keeps away from its people */
             WakeDupLine(head + " NOT removed - given up after 10 tries: " + (readable == 0 ? std::string("its state could not be read") : awake != 0 ? std::string("the put-on-ice failed") : std::string("not found in its faction's sleeping list"))
                         + " (wakeDup gaveUp=" + N(g_wakeDupGaveUp) + ")");
             continue;
@@ -20589,6 +25720,36 @@ int OwnNewRecordPod(const std::string* forceId, const std::string* name, void** 
     __try { *out = (void*)g_ownScratch->newRecord((itemType)0x1E, *forceId, *name); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return -1; }
 }
+/* T-1122 fix (H-T1122-emptylend, proven by run T1957): THE RAID LEND'S STATE RECORD. A raid squad the campaign makes asleep has an
+   EMPTY own container - its state lives only in the shared type-0x22 record it points to (+0x40) - so the lend writes that record's
+   fields (StateCopyFieldsPod: references by sid, nothing pointing back) as ONE 0x1E record into THIS writer's scratch container (cleared
+   before and after, as OwnWriteSquad), saves it (SavePod) to `file` and reads it back: the borrower's build finds its state record
+   (RaidLendBuildImpl step 6) and StateMake22 copies it unchanged. The squad's container and the shared record are only read. MAIN
+   THREAD (the scratch is the own writer's and the heartbeat's, both main thread). Not after a fault switched the writers off (the
+   scratch or the save lock may be broken). 1 = bytes read back; 0 = not made (not the main thread, no scratch, no record, no bytes);
+   -1 = a fault in the scratch's making or clearing, the record's making or the save (the caller stops both writers: StoreSaveFaultBoth);
+   -2 = the copy of the SHARED record faulted and the scratch was cleared after it (the scratch is sound - the writers stay on, as the
+   head copy's own fault rule in OwnWriteSquadHead; the caller backs the lend off); -3 = the own writer is already off (an earlier fault). */
+int OwnScratchStateBytes(const void* rec, const std::string& name, const std::string& file, std::vector<char>* out)
+{
+    out->clear();
+    if (!OnMainThread()) return 0;
+    if (g_ownFaultOff) return -3;
+    const int sc = OwnScratchPod();
+    if (sc != 1) return sc == -1 ? -1 : 0;
+    if (OwnClearPod() != 1) return -1;
+    const std::string empty;
+    void* r = 0;
+    if (OwnNewRecordPod(&empty, &name, &r) != 1) return -1;
+    if (!Plaus(r)) { OwnClearPod(); return 0; }
+    if (StateCopyFieldsPod(r, rec) < 0) return OwnClearPod() == 1 ? -2 : -1;
+    g_saveExcCode = 0; g_saveExcAddr = 0;
+    const int sv = SavePod(g_ownScratch, &file);
+    if (sv == -1) return -1;   /* the engine lock is not released here - see SavePod */
+    const int got = (sv == 1 && ReadFileBytes(file, out) && !out->empty()) ? 1 : 0;
+    if (OwnClearPod() != 1) { out->clear(); return -1; }
+    return got;
+}
 int OwnSerialiseThingsPod(void* active, void* refList, const std::string* mod)
 {
     __try { ((RootObjectContainer*)active)->saveMembers((GameData*)refList, g_ownScratch, 0, *mod); return 1; }
@@ -20616,6 +25777,25 @@ int OwnSquadUnpublished(void** members, int n)
     __try { for (int i = 0; i < n && i < 256; ++i) m[k++] = members[i]; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
     for (int i = 0; i < k; ++i) if (m[i] != 0 && ItemsCharUnpublished(m[i]) != 0) return 1;
+    return 0;
+}
+/* T-1178 fold 2 (L3, F-T2357-ORIGINSPOT): 1 = a member's own spot reads the world origin (cooplive::AnnounceSpotAtOrigin - a dialogue
+   recruit during the character editor's pause reads 0,0,0). The record is the engine's per-member save (saveMembers ->
+   Character::captureSaveState), which may carry that spot (Inferred - not read), so the squad's write waits, kept dirty, and the next
+   write after the pause stores the real spots. A read refused or faulted is not 'at the origin'. */
+long long g_ownHeldOrigin = 0;
+static int OwnMemberAtOriginPod(void* c)
+{
+    __try { Ogre::Vector3 p; return (SafeReadPosition((::Character*)c, &p) && cooplive::AnnounceSpotAtOrigin(p.x, p.y, p.z) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int OwnSquadMemberAtOrigin(void** members, int n)
+{
+    void* m[256];
+    int k = 0;
+    __try { for (int i = 0; i < n && i < 256; ++i) m[k++] = members[i]; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    for (int i = 0; i < k; ++i) if (m[i] != 0 && OwnMemberAtOriginPod(m[i]) != 0) return 1;
     return 0;
 }
 
@@ -20783,6 +25963,7 @@ int OwnBytesPod(const void* container, char* buf, size_t cap, size_t* need, unsi
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
+struct SleepOwnBytesInit { SleepOwnBytesInit() { g_sleepOwnBytes = &OwnBytesPod; } } g_sleepOwnBytesInit;   /* T-1046 fold 2: the keep question's sleeping-squad walk */
 long long OwnUs(const LARGE_INTEGER& a, const LARGE_INTEGER& b, const LARGE_INTEGER& f)
 {
     return f.QuadPart ? (long long)((b.QuadPart - a.QuadPart) * 1000000LL / f.QuadPart) : 0;
@@ -21035,6 +26216,9 @@ void OwnWriteSquad(void* platoon, OwnSq& s, int why, DWORD now)
         Pod hq;
         if (ReadPod(platoon, &hq) && Plaus(hq.active) && hq.activeChars > 0 && OwnSquadUnpublished(hq.members, hq.activeChars) != 0)
         { ++g_ownHeldUnpublished; s.dirty = 1; return; }
+        /* T-1178 fold 2 (L3): not while a member's own spot reads the world origin - the squad stays dirty and is written after it reads a place */
+        if (ReadPod(platoon, &hq) && Plaus(hq.active) && hq.activeChars > 0 && OwnSquadMemberAtOrigin(hq.members, hq.activeChars) != 0)
+        { ++g_ownHeldOrigin; s.dirty = 1; s.dirtyNow = 0; s.poke = 0; s.lastMs = now; return; }   /* fold 3 (L-b): not picked again every frame - the next try is after the dirty gap, so every other squad's write goes on */
     }
     if (coop::ResurrectDeathsWaiting() != 0)   /* T-1062: a death's left note goes to the store before the record that drops him */
     {
@@ -21569,6 +26753,7 @@ static std::string OwnStoresTop()
 /* T-251: OPEN A RECORDS STORE - <data folder>\\players\\<name> (<save root>\\Shared Wastelands\\players\\<name> without a data folder; refused without either) - for the player's
    own store (isAuto, OwnAutoStoreTick) and a test's (`ownsave <name>`) alike, and judge it against the notebook's number for
    it. The writer switches on with the cfg lever (default on). */
+static void OwnLeftHeldStoreSwitch(const std::string& name);   /* T-1280 fold 1 (L2): defined beside OwnLeftNoteDeath */
 int OwnStoreChoose(const std::string& name, bool isAuto, std::string* status)
 {
     const std::string top = OwnStoresTop();
@@ -21592,11 +26777,12 @@ int OwnStoreChoose(const std::string& name, bool isAuto, std::string* status)
         g_ownFormatRefusedStore = name;
         *status = "error ownsave newer-format"; return 1;
     }
-    unsigned long long maxSeq = 0; int bad = 0;
-    if (!OwnStoreOpen(dir, &maxSeq, &bad))
+    unsigned long long maxSeq = 0; int bad = 0; bool indexHeld = false;
+    if (!OwnStoreOpen(dir, &maxSeq, &bad, &indexHeld))
     {
-        ErrorLog("[OWNSAVE] records store " + name + " NOT opened (" + std::string(isAuto ? "the player's own" : "ownsave") + "): the folder "
-                 + dir + " could not be made, or the writer still has queued work");
+        ErrorLog("[OWNSAVE] records store " + name + " NOT opened (" + std::string(isAuto ? "the player's own" : "ownsave") + "): "
+                 + (indexHeld ? "its index in " + dir + " is held by another program (the held line says it once) - tried again at the next open"   /* T-1280 */
+                              : "the folder " + dir + " could not be made, or the writer still has queued work"));
         *status = "error ownsave open-failed"; return 1;
     }
     if (g_ownFormatRefusedStore == name) g_ownFormatRefusedStore.clear();
@@ -21607,6 +26793,7 @@ int OwnStoreChoose(const std::string& name, bool isAuto, std::string* status)
     }
     if (maxSeq > g_ownSeq) g_ownSeq = maxSeq;
     { const unsigned long long hm = coop::ItemsHandoverMaxSeq(); if (hm > g_ownSeq) g_ownSeq = hm; }   /* T-889 step 2: a reserved E stays below every later record */
+    if (g_ownStoreName != name) OwnLeftHeldStoreSwitch(name);   /* T-1280 fold 1 (L2): died notes held for the store left behind are never written into this one */
     g_ownStoreName = name; g_ownStoreAuto = isAuto ? 1 : 0; g_ownAutoOnOwed = 0;
     g_ownHandPend.clear(); /* mmo6 fold */ g_ownSq.clear(); g_ownRing.clear(); g_ownAt = 0; g_ownCredit = 0; g_ownTurnsOwed = 0;
     if (ConfigOwnSave() == 1 && !g_ownFaultOff && !g_ownOn) { g_ownOn = 1; g_ownOnAt = ::GetTickCount(); g_ownBytesSinceOn = 0; }
@@ -24473,6 +29660,9 @@ long long g_ownLeftWritten = 0, g_ownLeftNotWritten = 0, g_ownLeftNoHand = 0, g_
           g_ownLeftCapDropped = 0;
 std::vector<coopown::LeftNote> g_ownLeftNotes;
 long long g_ownLeftSaveAt = -1;
+std::vector<coopown::LeftNote> g_ownLeftHeld;   /* T-1280: died notes not yet in the store's file because another program held it - written at the next death or save */
+std::string g_ownLeftHeldDir;   /* T-1280 fold 1 (M2, L2): the records store those held notes belong to */
+int g_ownLeftLockHeld = 0, g_ownLeftLoadLockHeld = 0, g_ownPendLockHeld = 0;   /* T-1280: FileLockedNote's flags - the left-note write, its read at a load, the pending-strip read */
 const int kOwnRefusedCap = 32;
 volatile LONGLONG g_ownOvNotLoading = 0, g_ownOvNameMismatch = 0;
 /* T-251 (H-OVL-COLD): the window's clock (MAIN THREAD) and the late-arrival count (interlocked; set by a claimer thread) */
@@ -24727,15 +29917,51 @@ std::string g_discPend[kOwnMarkCap];        /* by mark slot: the set made at tha
    the file beside the save is written - so a game that ends between the save and that file still loads the rows it was written with
    (coopbrec::BoxOwedChoose) */
 std::string g_bjOwedPend[kOwnMarkCap];      /* by mark slot: the rows made at that save's request */
+/* T-1122 save fold: THE LENT COPIES A SAVE HOLDS (raidsq::kLentFile; RaidLentSaveText) - made at the save's request, taken as its saveGame
+   pre-hook noted them when it ran since (RaidLentSaveClaim), written once the save has landed beside multiplayer.mark (none: no file), read
+   at the load's prepare (LentFileLoad) when written after that save's quick.save */
+std::string g_lentPend[kOwnMarkCap];        /* by mark slot: the list made at that save's request */
+long long g_lentN0[kOwnMarkCap];            /* by mark slot: the saveGame notes taken before that request */
 long long g_bjOwedN0[kOwnMarkCap];          /* by mark slot: the saveGame notes taken before that request */
 unsigned long long g_bjOwedReqFt[kOwnMarkCap];   /* by mark slot: the request's time (FILETIME), carried by its copy */
 long long g_bjOwedCopyNote[kOwnMarkCap];    /* by mark slot: the note its copy holds (-1: the request's rows) */
 std::string g_bjOwedCopyAt[kOwnMarkCap];    /* by mark slot: its copy's path, fixed at the request */
 long long g_bjOwedWritten = 0, g_bjOwedWriteFail = 0, g_bjOwedRemoved = 0, g_bjOwedRead = 0, g_bjOwedStale = 0, g_bjOwedCopyFail = 0, g_bjOwedCopyUsed = 0;
-/* 1 = beside the save as owed (written, or none owed and no older file left); 0 = not written */
-int BoxOwedWrite(const std::string& dir, const std::string& bytes)
+int g_bjOwedLockHeld = 0;   /* T-1280: FileLockedNote's flag for the owed box changes read at a load (BoxOwedLoad) */
+/* T-1280 fold 1 (M1): the owed box files (beside a save, or its copy in the records store) whose last read at a load was unreadable -
+   their rows are unresolved, not none: no later save into that folder removes, empties or writes over one (coopstore::HeldPathKeeps)
+   until a load reads it */
+std::set<std::string> g_bjOwedHeldPaths;
+long long g_bjOwedHeldKept = 0, g_bjOwedMemKept = 0, g_bjOwedMemUsed = 0, g_bjOwedMemWritten = 0;
+/* T-1280 fold 1c (N1): a landed save whose beside file AND copy were both held - its own rows, kept in memory (by the beside file's path:
+   a later save into that folder replaces them) until a load lets one of the two go (BoxOwedMemFlush), or a load of that save takes them
+   (coopbrec::kOwUseMemory). Lost only if the game ends first - said when kept. */
+struct BoxOwedMemRows { std::string dir, pp, rows; unsigned long long reqFt; BoxOwedMemRows() : reqFt(0ULL) {} };
+std::map<std::string, BoxOwedMemRows> g_bjOwedMem;
+/* 1 = beside the save as owed (written, or none owed and no older file left); 0 = not written. pp / reqFt: its copy in the records store
+   and its request's time (T-1280 fold 1c: where the rows go when the beside file is held) */
+int BoxOwedWrite(const std::string& dir, const std::string& bytes, const std::string& pp, unsigned long long reqFt)
 {
     const std::string path = dir + "\\" + coopbrec::kBoxOwedFile;
+    const int where = coopstore::HeldWriteWhere(g_bjOwedHeldPaths, path, pp);
+    if (where != coopstore::kHeldWriteFirst)
+    {   /* T-1280 fold 1 (M1): this save's last load could not read the file - its rows were never resolved. It is neither removed nor
+           written over (0: the copy in the records store stays too) until a load reads it. Fold 1c (N1): this save's own rows are in the
+           copy when the copy is free; when it is held as well they are kept in memory - never lost silently */
+        ++g_bjOwedHeldKept;
+        if (where == coopstore::kHeldWriteMemory)
+        {
+            BoxOwedMemRows& m = g_bjOwedMem[path];
+            m.dir = dir; m.pp = pp; m.rows = bytes; m.reqFt = reqFt;
+            ++g_bjOwedMemKept;
+        }
+        ErrorLog("[BOXJRN] the box changes beside this save are NOT replaced: '" + path + "' could not be read at its last load, so the rows it holds"
+                 " stay on disk until a load reads it; " + (where == coopstore::kHeldWriteSecond ? std::string("this save's own rows stay in the records store's copy")
+                 : std::string("its copy in the records store is held too, so this save's own rows are KEPT IN MEMORY - written to the first of the two a load"
+                   " lets go, or read by this save's next load; lost if the game ends first")) + " (heldKept " + N(g_bjOwedHeldKept) + ", memKept "
+                 + N(g_bjOwedMemKept) + ")");
+        return 0;
+    }
     if (bytes.empty())
     {
         if (U8GetFileAttributes(path.c_str()) == INVALID_FILE_ATTRIBUTES) return 1;
@@ -24766,6 +29992,7 @@ std::string BoxOwedCopyPath(const std::string& folder, const std::string& saveNa
 void BoxOwedCopyWrite(const std::string& pp, unsigned long long reqFt, const std::string& rows)
 {
     if (pp.empty()) return;
+    if (coopstore::HeldPathKeeps(g_bjOwedHeldPaths, pp)) return;   /* T-1280 fold 1 (M1): a copy a load could not read holds unresolved rows - not written over */
     U8CreateDirectory(pp.substr(0, pp.rfind('\\')).c_str(), 0);   /* there already: fine; one that cannot be made shows in the write */
     const std::string t = coopbrec::EncodeBoxOwedCopy(reqFt, rows);
     if (Mmo2WriteAtomic(pp, t.data(), t.size())) return;
@@ -24775,7 +30002,31 @@ void BoxOwedCopyWrite(const std::string& pp, unsigned long long reqFt, const std
 }
 void BoxOwedCopyDrop(const std::string& pp)
 {
+    if (coopstore::HeldPathKeeps(g_bjOwedHeldPaths, pp)) return;   /* T-1280 fold 1 (M1): a copy a load could not read holds unresolved rows - not removed */
     if (!pp.empty() && U8GetFileAttributes(pp.c_str()) != INVALID_FILE_ATTRIBUTES) U8DeleteFile(pp.c_str());
+}
+/* T-1280 fold 1c (N1), MAIN THREAD, after each load's holds are noted: rows kept in memory go to the first of their two files no longer
+   held - beside the save (as a landing writes them; its copy then goes), else the copy - and leave memory once written */
+void BoxOwedMemFlush()
+{
+    for (std::map<std::string, BoxOwedMemRows>::iterator it = g_bjOwedMem.begin(); it != g_bjOwedMem.end(); )
+    {
+        const BoxOwedMemRows m = it->second;
+        const int where = coopstore::HeldWriteWhere(g_bjOwedHeldPaths, it->first, m.pp);
+        bool done = false;
+        if (where == coopstore::kHeldWriteFirst) { if (BoxOwedWrite(m.dir, m.rows, m.pp, m.reqFt) != 0) { BoxOwedCopyDrop(m.pp); done = true; } }
+        else if (where == coopstore::kHeldWriteSecond)
+        {
+            const long long fail0 = g_bjOwedCopyFail;
+            BoxOwedCopyWrite(m.pp, m.reqFt, m.rows);
+            done = g_bjOwedCopyFail == fail0;
+        }
+        if (!done) { ++it; continue; }
+        ++g_bjOwedMemWritten;
+        ErrorLog("[BOXJRN] the box changes a save kept in memory (both its files were held) are written now: " + std::string(where == coopstore::kHeldWriteFirst
+                 ? "beside the save ('" + it->first + "')" : "into the records store's copy ('" + m.pp + "')") + " (memWritten " + N(g_bjOwedMemWritten) + ")");
+        g_bjOwedMem.erase(it++);
+    }
 }
 /* MAIN THREAD: each waiting save's copy follows the rows its saveGame pre-hook noted - at that pre-hook, before anything of the save is
    written, and each frame after - so the copy holds the rows the save was written with however soon the game ends */
@@ -24808,13 +30059,49 @@ void BoxOwedLoad(const void* folderStr, const void* nameStr)
     const std::string dir = SlotDirFor(std::string(fbuf), std::string(nbuf), &how);
     const std::string fp = dir + "\\" + coopbrec::kBoxOwedFile, pp = BoxOwedCopyPath(std::string(fbuf), std::string(nbuf));
     const unsigned long long fft = MoneyFileWriteFt(fp), sft = MoneyFileWriteFt(dir + "\\quick.save");
-    std::vector<char> cb;
     unsigned long long reqFt = 0ULL;
     std::string crows;
-    const int copyHave = (!pp.empty() && ReadFileBytes(pp, &cb) && !cb.empty() && coopbrec::DecodeBoxOwedCopy(&cb[0], cb.size(), &reqFt, &crows) != 0) ? 1 : 0;
-    const int use = coopbrec::BoxOwedChoose(fft, sft, copyHave, reqFt);
-    std::vector<char> b;
-    if (use == coopbrec::kOwUseBeside && ReadFileBytes(fp, &b) && !b.empty()) { ++g_bjOwedRead; coop::ItemsBoxOwedLoaded(b, 1); return; }
+    coopstore::FileProbe cp;
+    if (!pp.empty()) cp = coopstore::ProbeFile(pp);
+    const int copyHave = (cp.kind == coopstore::kFileReadable && !cp.bytes.empty() && coopbrec::DecodeBoxOwedCopy(&cp.bytes[0], cp.bytes.size(), &reqFt, &crows) != 0) ? 1 : 0;
+    const std::map<std::string, BoxOwedMemRows>::iterator mem = g_bjOwedMem.find(fp);
+    /* T-1280 fold 1c (N1): this save's rows kept in memory (both files were held when it landed) answer ahead of the copy */
+    const int use = coopbrec::BoxOwedChooseMem(coopbrec::BoxOwedChoose(fft, sft, copyHave, reqFt), mem != g_bjOwedMem.end() ? 1 : 0,
+                                               mem != g_bjOwedMem.end() ? mem->second.reqFt : 0ULL, sft);
+    coopstore::FileProbe bp;
+    const bool fpWasHeld = coopstore::HeldPathKeeps(g_bjOwedHeldPaths, fp);
+    if (use == coopbrec::kOwUseBeside || fpWasHeld) bp = coopstore::ProbeFile(fp);   /* T-1280 fold 1 (M1): a held one is looked at again even when not chosen */
+    /* T-1280: the file the choice needs is there and could not be read (another program holds it) - that is not "none owed". Nothing
+       is resolved at this load, both files stay exactly as they are, and the next load of this save reads them again. */
+    const bool besideLocked = use == coopbrec::kOwUseBeside && bp.kind == coopstore::kFileUnreadable;
+    const bool copyLocked = use == coopbrec::kOwUseNone && cp.kind == coopstore::kFileUnreadable;
+    /* T-1280 fold 1 (M1): which owed files stay held - one that could not be read here; one that reads (or is gone) is let go */
+    if (use == coopbrec::kOwUseBeside || fpWasHeld) coopstore::HeldPathNoteUse(&g_bjOwedHeldPaths, fp, bp.kind, use == coopbrec::kOwUseBeside);   /* fold 1c (N3): let go only once read here */
+    coopstore::HeldPathNote(&g_bjOwedHeldPaths, pp, (copyLocked || (cp.kind == coopstore::kFileUnreadable && coopstore::HeldPathKeeps(g_bjOwedHeldPaths, pp)))
+                                                    ? coopstore::kFileUnreadable : coopstore::kFileReadable);
+    const int ostep = coopstore::FileLockedNote((besideLocked || copyLocked) ? coopstore::kFileUnreadable : coopstore::kFileReadable, &g_bjOwedLockHeld);
+    if (coopstore::FileLockSkips(ostep))
+    {
+        if (ostep == coopstore::kLockSkipFirst)
+            ErrorLog(coopstore::FileLockedLine("[BOXJRN] load", besideLocked ? fp : pp, besideLocked ? bp : cp, "none of this save's unresolved box changes is"
+                                               " resolved at this load and the file is left as it is; read again at the next load of this save"));
+        coop::ItemsBoxOwedLoaded(std::vector<char>(), 0);
+        BoxOwedMemFlush();   /* T-1280 fold 1c (N1): another save's kept rows, should this load have let one of their files go */
+        return;
+    }
+    if (use == coopbrec::kOwUseMemory)
+    {   /* T-1280 fold 1c (N1): this save's own rows, kept in memory when it landed - taken by this load, so they leave memory */
+        const std::string rows = mem->second.rows;
+        g_bjOwedMem.erase(mem);
+        ++g_bjOwedMemUsed;
+        ErrorLog("[BOXJRN] this save's unresolved box changes were kept in memory when it landed (both its files held) - those are read (memUsed "
+                 + N(g_bjOwedMemUsed) + ")");
+        coop::ItemsBoxOwedLoaded(std::vector<char>(rows.begin(), rows.end()), rows.empty() ? 0 : 1);
+        BoxOwedMemFlush();
+        return;
+    }
+    BoxOwedMemFlush();   /* T-1280 fold 1c (N1): rows kept in memory go to a file this load let go */
+    if (use == coopbrec::kOwUseBeside && bp.kind == coopstore::kFileReadable && !bp.bytes.empty()) { ++g_bjOwedRead; coop::ItemsBoxOwedLoaded(bp.bytes, 1); return; }
     if (use == coopbrec::kOwUseCopy)
     {
         ++g_bjOwedCopyUsed;
@@ -24847,8 +30134,19 @@ void DiscoveredLoad(const void* folderStr, const void* nameStr)
     const std::string dir = SlotDirFor(std::string(fbuf), std::string(nbuf), &how);
     const std::string fp = dir + "\\" + baseshow::kDiscoveredFile;
     const unsigned long long fft = MoneyFileWriteFt(fp), sft = MoneyFileWriteFt(dir + "\\quick.save");
-    std::vector<char> b;
-    if (baseshow::DiscoveredFileCurrent(fft, sft) == 0 || !ReadFileBytes(fp, &b) || b.empty())
+    coopstore::FileProbe dp;   /* T-1280 fold 1 (L5): PROBED - "held by another program" is said apart from "none" */
+    if (baseshow::DiscoveredFileCurrent(fft, sft) != 0) dp = coopstore::ProbeFile(fp);
+    if (dp.kind == coopstore::kFileUnreadable)
+    {
+        int held = 0;
+        coopstore::FileLockedNote(dp.kind, &held);
+        ErrorLog(coopstore::FileLockedLine("[TOWNLINK] discovered outposts", fp, dp, "this load starts with none discovered (the engine's own rule discovers"
+                                           " them again) and the file is left as it is"));
+        coop::BuildDiscoveredLoaded(std::string(), 0);
+        return;
+    }
+    const std::vector<char>& b = dp.bytes;
+    if (dp.kind != coopstore::kFileReadable || b.empty())
     {
         if (fft != 0ULL) { ++g_discStale; ErrorLog("[TOWNLINK] the discovered outposts beside this save ('" + fp + "') were written before its quick.save - an earlier save's; not read (stale " + N(g_discStale) + ")"); }
         coop::BuildDiscoveredLoaded(std::string(), 0);
@@ -24865,6 +30163,63 @@ void DiscoveredLoad(const void* folderStr, const void* nameStr)
     }
     ++g_discRead;
     coop::BuildDiscoveredLoaded(text, 1);
+}
+/* T-1122 save fold: the lent copies beside a landed save (raidsq::kLentFile) - none listed: no file (an older one there is an earlier
+   save's, and its time says so at the load) */
+void LentFileWrite(const std::string& dir, const std::string& text)
+{
+    if (text.empty()) return;
+    const std::string path = dir + "\\" + raidsq::kLentFile;
+    if (Mmo2WriteAtomic(path, text.data(), text.size())) { ++g_lentFileWritten; return; }
+    ++g_lentFileWriteFail;
+    ErrorLog("[RAIDLEND] the lent copies NOT written beside the save: '" + path + "' - a reload of that save keeps them (writeFail " + N(g_lentFileWriteFail) + ")");
+}
+/* T-1122 save fold, the load's prepare: the loading save's lent copies (RaidLentLoaded; empty: none). Read only when written after that
+   save's quick.save (raidsq::LentFileCurrent); a file there that cannot be read is said and counted apart from a missing one - nothing is
+   written either way, and nothing is removed */
+void LentFileLoad(const void* folderStr, const void* nameStr)
+{
+    const std::vector<raidsq::LentEntry> none;
+    if (RoleIsSingle()) { RaidLentLoaded(none); return; }
+    char fbuf[512]; fbuf[0] = 0;
+    char nbuf[260]; nbuf[0] = 0;
+    if (Plaus(folderStr)) CopyStdStringPod(folderStr, fbuf, 512);
+    if (Plaus(nameStr)) CopyStdStringPod(nameStr, nbuf, 260);
+    const char* how = "";
+    const std::string dir = SlotDirFor(std::string(fbuf), std::string(nbuf), &how);
+    const std::string fp = dir + "\\" + raidsq::kLentFile;
+    const unsigned long long fft = MoneyFileWriteFt(fp), sft = MoneyFileWriteFt(dir + "\\quick.save");
+    if (fft == 0ULL) { RaidLentLoaded(none); return; }
+    if (raidsq::LentFileCurrent(fft, sft) == 0)
+    {
+        ++g_lentFileStale;
+        ErrorLog("[RAIDLEND] the lent copies beside this save ('" + fp + "') were written before its quick.save - an earlier save's; not read (stale " + N(g_lentFileStale) + ")");
+        RaidLentLoaded(none);
+        return;
+    }
+    const coopstore::FileProbe lfp = coopstore::ProbeFile(fp);   /* T-1280 fold 1 (L5): PROBED - a held file is counted (fileLocked) and its Windows error said */
+    const std::vector<char>& b = lfp.bytes;
+    if (lfp.kind != coopstore::kFileReadable || b.empty())
+    {
+        ++g_lentFileUnreadable;
+        if (lfp.kind == coopstore::kFileUnreadable) { int held = 0; coopstore::FileLockedNote(lfp.kind, &held); }
+        ErrorLog("[RAIDLEND] the lent copies beside this save ('" + fp + "') could NOT be read" + (lfp.kind == coopstore::kFileUnreadable ? " (Windows error "
+                 + N((long long)lfp.err) + ")" : std::string()) + " - none removed; a lent copy it holds stays (unreadable " + N(g_lentFileUnreadable) + ")"
+                 + coopstore::FileLockedToken());
+        RaidLentLoaded(none);
+        return;
+    }
+    std::vector<raidsq::LentEntry> v;
+    if (raidsq::DecodeLentFile(&b[0], b.size(), &v) == 0)
+    {
+        ++g_lentFileBad;
+        ErrorLog("[RAIDLEND] the lent copies beside this save ('" + fp + "', " + N((long long)b.size()) + " bytes) are not a whole list - none removed (bad " + N(g_lentFileBad) + ")");
+        RaidLentLoaded(none);
+        return;
+    }
+    ++g_lentFileRead;
+    DebugLog("[RAIDLEND] the loading save lists " + N((long long)v.size()) + " lent copies it holds - removed at its world's first ticks (read " + N(g_lentFileRead) + ")");
+    RaidLentLoaded(v);
 }
 void MoneyListLoad(const void* folderStr, const void* nameStr)
 {
@@ -24897,8 +30252,18 @@ void MoneyListLoad(const void* folderStr, const void* nameStr)
             ErrorLog("[MONEY] this save has no ledger of its own beside it - the copy written into the records store at its request is read ('"
                      + pp + "', pendUsed " + N(g_moneyLedgerPendUsed) + ")");
         }
-        std::vector<char> lb; std::string ls, lw, lpr; moneyw::Ledger ll; int nw = 0; moneyw::HeldMark lhm;
-        if (use != moneyw::kUseNone && ReadFileBytes(use == moneyw::kUsePending ? pp : fp, &lb) && !lb.empty())
+        std::string ls, lw, lpr; moneyw::Ledger ll; int nw = 0; moneyw::HeldMark lhm;
+        coopstore::FileProbe lgp;   /* T-1280 fold 1 (L5): PROBED - a held ledger is said and counted apart from none */
+        if (use != moneyw::kUseNone) lgp = coopstore::ProbeFile(use == moneyw::kUsePending ? pp : fp);
+        if (lgp.kind == coopstore::kFileUnreadable)
+        {
+            int held = 0;
+            coopstore::FileLockedNote(lgp.kind, &held);
+            ErrorLog(coopstore::FileLockedLine("[MONEY] the loaded save's ledger", use == moneyw::kUsePending ? pp : fp, lgp, "the store's newest pp.money is this"
+                                               " load's ledger, as for none, and the file is left as it is"));
+        }
+        const std::vector<char>& lb = lgp.bytes;
+        if (lgp.kind == coopstore::kFileReadable && !lb.empty())
         {
             const std::string lt(lb.begin(), lb.end());
             if (moneyw::SaveLedgerParse(lt, &ls, &lw, &lpr, &ll))
@@ -24916,8 +30281,16 @@ void MoneyListLoad(const void* folderStr, const void* nameStr)
             else ErrorLog("[MONEY] the loaded save's ledger (" + N((long long)lb.size()) + " bytes) could not be read - the store's newest pp.money is this load's ledger");
         }
     }
-    std::vector<char> b;
-    if (!ReadFileBytes(dir + "\\" + kMoneyListFile, &b) || b.empty()) return;
+    const coopstore::FileProbe mlp = coopstore::ProbeFile(dir + "\\" + kMoneyListFile);   /* T-1280 fold 1 (L5): PROBED - a held list is said and counted */
+    if (mlp.kind == coopstore::kFileUnreadable)
+    {
+        int held = 0;
+        coopstore::FileLockedNote(mlp.kind, &held);
+        ErrorLog(coopstore::FileLockedLine("[KEEPER] money list", dir + "\\" + kMoneyListFile, mlp, "every group's money at this load is the engine's read, as"
+                                           " with no list, and the file is left as it is"));
+    }
+    const std::vector<char>& b = mlp.bytes;
+    if (mlp.kind != coopstore::kFileReadable || b.empty()) return;
     std::set<std::string> ids;
     if (!coopsquad::DecodeMoneyList(std::string(b.begin(), b.end()), &ids)) { coop::KeeperMoneyListNote(3); return; }
     g_moneyUnknownIds.swap(ids);
@@ -24986,6 +30359,7 @@ void OwnMarkNoteSaveRequest(void* self, const void* nameStr, int before, int aft
     g_moneyListPend[slot] = moneyList;   /* T-799: the newest request's list stands */
     g_discPend[slot] = coop::BuildDiscoveredText(&g_discGuardN0[slot]);   /* T-1047 step 5 fold 1: the discovered outposts as this save is made */
     g_bjOwedPend[slot] = coop::ItemsBoxOwedAsk(&g_bjOwedN0[slot]);   /* the box changes this save holds unresolved, as it is made */
+    g_lentPend[slot] = RaidLentSaveAsk(&g_lentN0[slot]);   /* T-1122 save fold: the lent copies here as this save is made */
     g_bjOwedReqFt[slot] = BoxOwedNowFt(); g_bjOwedCopyNote[slot] = -1;
     g_bjOwedCopyAt[slot] = BoxOwedCopyPath(std::string(fbuf), std::string(nbuf));
     BoxOwedCopyWrite(g_bjOwedCopyAt[slot], g_bjOwedReqFt[slot], g_bjOwedPend[slot]);   /* before anything of the save is written */
@@ -25010,6 +30384,7 @@ void OwnMarkNoteSaveRequest(void* self, const void* nameStr, int before, int aft
 }
 
 static void OwnRenameSaveNote(const std::string& dir);   /* T-710 review fold 4: defined after the pending lock */
+static void OwnLeftNoteRetryHeld();   /* T-1280: defined beside OwnLeftNoteDeath */
 void OwnMarkSaveTick()
 {
     BuildSaveTrackTick();   /* P87 rf1: every frame, with the mark ring */
@@ -25042,7 +30417,7 @@ void OwnMarkSaveTick()
             ++g_ownMarkAbandoned;
             ErrorLog("[OWNSAVE] mark ABANDONED for save '" + std::string(m.name) + "': its request could not be read for 120 s -"
                      " no mark written (that save loads by the quick.save-time rule, its money ledger by the copy in the records store)");
-            g_moneyListPend[i].clear(); g_moneyLedgerPend[i].clear(); g_discPend[i].clear(); g_bjOwedPend[i].clear();
+            g_moneyListPend[i].clear(); g_moneyLedgerPend[i].clear(); g_discPend[i].clear(); g_bjOwedPend[i].clear(); g_lentPend[i].clear();
             std::memset(&m, 0, sizeof(m));
             continue;
         }
@@ -25060,7 +30435,7 @@ void OwnMarkSaveTick()
                      + how + ") does not exist now that the save has finished - the save did not happen; nothing is created");
             MoneyLedgerPendDrop(std::string(m.name));   /* T-810 re-check fold: no save - its copy describes nothing */
             BoxOwedCopyDrop(g_bjOwedCopyAt[i]);
-            g_moneyListPend[i].clear(); g_moneyLedgerPend[i].clear(); g_discPend[i].clear(); g_bjOwedPend[i].clear();
+            g_moneyListPend[i].clear(); g_moneyLedgerPend[i].clear(); g_discPend[i].clear(); g_bjOwedPend[i].clear(); g_lentPend[i].clear();
             std::memset(&m, 0, sizeof(m));
             continue;
         }
@@ -25082,6 +30457,7 @@ void OwnMarkSaveTick()
             ErrorLog("[OWNSAVE] mark WRITE FAILED: '" + path + "' (world key '" + mi.world + "') - that save loads by the quick.save-time rule");
         }
         OwnRenameSaveNote(dir);   /* T-710 review fold 4: a clashing copy squad id this session did not rename goes into this save */
+        OwnLeftNoteRetryHeld();   /* T-1280: died notes held while another program had the left-note file - written now if it opens */
         MoneyListWrite(dir, g_moneyListPend[i]);   /* T-799: the list made at this save's request */
         g_moneyListPend[i].clear();
         {   /* T-1047 step 5 fold 1: the discovered outposts - as the take-out before this save noted them, else as at its request */
@@ -25093,7 +30469,7 @@ void OwnMarkSaveTick()
         {   /* the box changes this save holds unresolved - as its own saveGame pre-hook noted them, else as at its request */
             std::string ob = g_bjOwedPend[i];
             coop::ItemsBoxOwedClaim(g_bjOwedN0[i], &ob);
-            if (BoxOwedWrite(dir, ob) != 0)
+            if (BoxOwedWrite(dir, ob, g_bjOwedCopyAt[i], g_bjOwedReqFt[i]) != 0)
             {   /* beside the save now: its copy goes (under the folder read now too, should the save's folder have resolved otherwise at its request) */
                 BoxOwedCopyDrop(g_bjOwedCopyAt[i]);
                 const std::string lp = BoxOwedCopyPath(std::string(m.folder), std::string(m.name));
@@ -25101,6 +30477,12 @@ void OwnMarkSaveTick()
             }
             g_bjOwedCopyAt[i].clear();
             g_bjOwedPend[i].clear();
+        }
+        {   /* T-1122 save fold: the lent copies this save holds - as its own saveGame pre-hook noted them, else as at its request */
+            std::string lt = g_lentPend[i];
+            RaidLentSaveClaim(g_lentN0[i], &lt);
+            LentFileWrite(dir, lt);
+            g_lentPend[i].clear();
         }
         if (MoneyLedgerWrite(dir, g_moneyLedgerPend[i])) MoneyLedgerPendDrop(std::string(m.name));   /* T-810: the ledger made at this save's request; its copy in the records store goes once it is beside the save (re-check fold) */
         g_moneyLedgerPend[i].clear();
@@ -25481,6 +30863,8 @@ void OwnResetImportRestoreArm(const std::string& carriedFolder, const std::strin
 CRITICAL_SECTION g_ownPendLock; bool g_ownPendLockInit = false;
 std::vector<coopown::PendStrip> g_ownPend;                 /* under g_ownPendLock */
 std::string g_ownPendDir;                                  /* the loaded world's records store; under g_ownPendLock */
+std::vector<coopown::PendStrip> g_ownPendHeld;             /* T-1280 fold 1 (L6): strips made at a load whose list was held - kept for that store's next readable load; under g_ownPendLock */
+std::string g_ownPendHeldDir;                              /* T-1280 fold 1 (L6): that store ("" none); under g_ownPendLock */
 std::vector<std::pair<int, std::string> > g_ownPendLog;    /* queued lines (first = 1: ERROR); under g_ownPendLock */
 volatile LONG g_ownPendCount = 0;                          /* entries in g_ownPend (a claim's cheap first look) */
 long g_ownPendWorld = -1;                                  /* MAIN THREAD: g_ownWorldReset at the loaded world's first gameplay frame */
@@ -25522,6 +30906,52 @@ void OwnPendWrite()
     if (!Mmo2WriteAtomic(g_ownPendDir + "\\" + coopown::PendStripFile(), text.data(), text.size()))
         OwnPendQueue(1, "[OWNSAVE] pending strips: the list could not be written to '" + g_ownPendDir + "' (" + N((long long)g_ownPend.size()) + " entries kept in memory)");
 }
+/* T-1280, MAIN THREAD: the store's left-note file read, the held notes and `add` (null: the save's retry) added, and the file written.
+   A file another program holds is NOT read as empty and written back with only the new note: the note is held in memory (and in
+   g_ownLeftNotes, so the fallen list sees the death now), counted, said once, and written at the next death or save. */
+static void OwnLeftNoteCommit(const std::string& dir, const coopown::LeftNote* add, unsigned int uid)
+{
+    const std::string path = dir + "\\" + coopown::LeftNoteFile();
+    const coopstore::FileProbe lp = coopstore::ProbeFile(path);
+    const int step = coopstore::FileLockedNote(lp.kind, &g_ownLeftLockHeld);
+    if (coopstore::FileLockSkips(step))
+    {
+        if (add != 0) { g_ownLeftHeld.push_back(*add); coopown::LeftNoteAdd(&g_ownLeftNotes, *add); g_ownLeftHeldDir = dir; }
+        if (step == coopstore::kLockSkipFirst)
+            ErrorLog(coopstore::FileLockedLine("[OWNSAVE] left notes", path, lp, (N((long long)g_ownLeftHeld.size()) + " died note(s) held in memory and NOT written over"
+                                               " it; written at the next death or save").c_str()));
+        return;
+    }
+    const std::string who = add != 0 ? add->who : std::string("(held notes only)");
+    std::vector<coopown::LeftNote> v;
+    int bad = 0, cap = 0;
+    if (lp.kind == coopstore::kFileReadable && !lp.bytes.empty()) bad = coopown::LeftNoteParseAll(std::string(lp.bytes.begin(), lp.bytes.end()), &v, &cap);
+    for (size_t i = 0; i < g_ownLeftHeld.size(); ++i) cap += coopown::LeftNoteAdd(&v, g_ownLeftHeld[i]);
+    if (add != 0) cap += coopown::LeftNoteAdd(&v, *add);
+    if (cap > 0)
+    {
+        g_ownLeftCapDropped += cap;
+        ErrorLog("[OWNSAVE] left notes: the safety cap (" + N((long long)coopown::kLeftNoteHardCap) + ") dropped the " + N((long long)cap)
+                 + " oldest note(s) - those dead come back at a load of a save older than their death whose newer record lacks them leftCapDropped=" + N(g_ownLeftCapDropped));
+    }
+    const std::string text = coopown::LeftNoteText(v);
+    if (!Mmo2WriteAtomic(path, text.data(), text.size()))
+    {
+        ++g_ownLeftNotWritten; ++g_ownLeftWriteFail;
+        ErrorLog("[OWNSAVE] left note for person " + who + " (uid " + N((long long)uid) + ", died) could not be written to '" + dir
+                 + "' - a load whose newer record lacks him copies him back leftNotWritten=" + N(g_ownLeftNotWritten)
+                 + (g_ownLeftHeld.empty() ? std::string() : " (" + N((long long)g_ownLeftHeld.size()) + " held note(s) stay held)"));
+        return;
+    }
+    if (add != 0) ++g_ownLeftWritten;
+    g_ownLeftWritten += (long long)g_ownLeftHeld.size();
+    const size_t heldNow = g_ownLeftHeld.size();
+    g_ownLeftHeld.clear();
+    g_ownLeftNotes = v;
+    DebugLog("[OWNSAVE] left note: person " + who + " (uid " + N((long long)uid) + ") died - kept in " + coopown::LeftNoteFile() + " ("
+             + N((long long)v.size()) + " notes, badLines=" + N((long long)bad) + (heldNow > 0 ? ", " + N((long long)heldNow) + " held note(s) written with it" : std::string())
+             + ") leftWritten=" + N(g_ownLeftWritten));
+}
 /* T-1062, MAIN THREAD (ownstore.h): a death of this game's own character - its left note to the records store, read back by every
    later load's roster check. handType < 0: the hand could not be read (no note; a load whose newer record lacks him brings him back). */
 void OwnLeftNoteDeath(int handSerial, int handType, unsigned int uid)
@@ -25535,31 +30965,26 @@ void OwnLeftNoteDeath(int handSerial, int handType, unsigned int uid)
                  + ") - a load whose newer record lacks this person copies him back leftNotWritten=" + N(g_ownLeftNotWritten));
         return;
     }
-    std::vector<char> b;
-    std::vector<coopown::LeftNote> v;
-    int bad = 0, cap = 0;
-    if (ReadFileBytes(dir + "\\" + coopown::LeftNoteFile(), &b) && !b.empty()) bad = coopown::LeftNoteParseAll(std::string(b.begin(), b.end()), &v, &cap);
     coopown::LeftNote e;
     e.who = coopown::HandId(handSerial, handType); e.kind = coopown::kLeftDied; e.at = (long long)::time(0);
-    cap += coopown::LeftNoteAdd(&v, e);
-    if (cap > 0)
-    {
-        g_ownLeftCapDropped += cap;
-        ErrorLog("[OWNSAVE] left notes: the safety cap (" + N((long long)coopown::kLeftNoteHardCap) + ") dropped the " + N((long long)cap)
-                 + " oldest note(s) - those dead come back at a load of a save older than their death whose newer record lacks them leftCapDropped=" + N(g_ownLeftCapDropped));
-    }
-    const std::string text = coopown::LeftNoteText(v);
-    if (!Mmo2WriteAtomic(dir + "\\" + coopown::LeftNoteFile(), text.data(), text.size()))
-    {
-        ++g_ownLeftNotWritten; ++g_ownLeftWriteFail;
-        ErrorLog("[OWNSAVE] left note for person " + e.who + " (uid " + N((long long)uid) + ", died) could not be written to '" + dir
-                 + "' - a load whose newer record lacks him copies him back leftNotWritten=" + N(g_ownLeftNotWritten));
-        return;
-    }
-    ++g_ownLeftWritten;
-    g_ownLeftNotes = v;
-    DebugLog("[OWNSAVE] left note: person " + e.who + " (uid " + N((long long)uid) + ") died - kept in " + coopown::LeftNoteFile() + " ("
-             + N((long long)v.size()) + " notes, badLines=" + N((long long)bad) + ") leftWritten=" + N(g_ownLeftWritten));
+    OwnLeftNoteCommit(dir, &e, uid);   /* T-1280: a held file holds the note in memory, written at the next death or save */
+}
+/* T-1280 fold 1 (L2), MAIN THREAD (OwnStoreChoose): another records store is opened - died notes held for the one left behind are not
+   written into the new one (they name that store's people). Said with their count; that store's own file keeps what it had. */
+static void OwnLeftHeldStoreSwitch(const std::string& name)
+{
+    if (g_ownLeftHeld.empty()) { g_ownLeftHeldDir.clear(); return; }
+    ErrorLog("[OWNSAVE] left notes: " + N((long long)g_ownLeftHeld.size()) + " died note(s) held for records store '" + g_ownStoreName + "' (its file was held by"
+             " another program) are NOT carried into store '" + name + "' - a load of that store's saves whose newer record lacks those people copies them back");
+    g_ownLeftHeld.clear();
+    g_ownLeftHeldDir.clear();
+}
+/* T-1280, MAIN THREAD, at each save that finished (OwnMarkSaveTick): died notes held while another program had the file, written now */
+static void OwnLeftNoteRetryHeld()
+{
+    if (g_ownLeftHeld.empty()) return;
+    const std::string dir = g_ownStoreName.empty() ? std::string() : OwnStoreDir();
+    if (!dir.empty()) OwnLeftNoteCommit(dir, 0, 0);
 }
 /* T-1062, MAIN THREAD (ownstore.h; resurrect.cpp Reconcile): 1 = a died note of this hand serial counts for the loaded save
    (coopown::LeftNoteHoldsDeath) - the fallen list's row stays, no ALIVE. */
@@ -25613,6 +31038,8 @@ void OwnPendClear()
 {
     OwnPendLockInit();
     ::EnterCriticalSection(&g_ownPendLock);
+    if (g_ownPendDir.empty() && !g_ownPendHeldDir.empty())   /* T-1280 fold 1 (L6): the last load's list was held - its strips are kept, not dropped */
+        for (size_t i = 0; i < g_ownPend.size(); ++i) coopown::PendStripAdd(&g_ownPendHeld, g_ownPend[i]);
     g_ownPend.clear(); g_ownPendDir.clear();
     ::InterlockedExchange(&g_ownPendCount, 0);
     ::LeaveCriticalSection(&g_ownPendLock);
@@ -25673,7 +31100,12 @@ void OwnPendDrain(bool live)
     if (!g_ownPend.empty() && live)
     {
         if (g_ownPendWorld == -1) g_ownPendWorld = wr;
-        else if (wr != g_ownPendWorld) { g_ownPend.clear(); ::InterlockedExchange(&g_ownPendCount, 0); aside = true; }
+        else if (wr != g_ownPendWorld)
+        {
+            if (g_ownPendDir.empty() && !g_ownPendHeldDir.empty())   /* T-1280 fold 1 (L6): not in the store's file (it was held) - kept for its next readable load */
+                for (size_t i = 0; i < g_ownPend.size(); ++i) coopown::PendStripAdd(&g_ownPendHeld, g_ownPend[i]);
+            g_ownPend.clear(); ::InterlockedExchange(&g_ownPendCount, 0); aside = true;
+        }
     }
     ::LeaveCriticalSection(&g_ownPendLock);
     for (size_t i = 0; i < lines.size(); ++i)
@@ -25926,6 +31358,7 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
     AreaFileLoadBegins(folderStr, nameStr);   /* T-1175: this load's first player-area list is the save's list when nothing is laid over it */
     MoneyListLoad(folderStr, nameStr);   /* T-799: before the engine reads a file of this save */
     DiscoveredLoad(folderStr, nameStr);   /* T-1047 step 5 fold 1: the outposts discovered in this save */
+    LentFileLoad(folderStr, nameStr);   /* T-1122 save fold: the lent copies this save holds - removed once its world runs */
     BoxOwedLoad(folderStr, nameStr);   /* the box changes this save holds unresolved: resolved once the world server answers */
     ::InterlockedExchange(&g_ownOvOpen, 0);   /* no new claim from here on */
     ::InterlockedExchange(&g_ownOvLatePending, 0);   /* T-251: nor a late check, which reads the entries too */
@@ -26245,25 +31678,66 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
     /* T-802 fold: this world's pending strips - an entry stays only when this save already holds the move (mark >= its seq) */
     OwnPendLockInit();
     {
-        std::vector<char> pb;
         std::vector<coopown::PendStrip> pl;
         int bad = 0;
-        if (ReadFileBytes(sdir + "\\" + coopown::PendStripFile(), &pb) && !pb.empty()) bad = coopown::PendStripParseAll(std::string(pb.begin(), pb.end()), &pl);
+        /* T-1280: a list another program holds is not an empty list - read as one, the next strip would rewrite it with only that
+           strip. Nothing is read or written for this world (g_ownPendDir stays empty, so OwnPendWrite writes nothing) until the
+           next load reads it. */
+        const std::string ppath = sdir + "\\" + coopown::PendStripFile();
+        const coopstore::FileProbe pp = coopstore::ProbeFile(ppath);
+        const int pstep = coopstore::FileLockedNote(pp.kind, &g_ownPendLockHeld);
+        const bool pendLocked = coopstore::FileLockSkips(pstep);
+        if (pstep == coopstore::kLockSkipFirst)
+            ErrorLog(coopstore::FileLockedLine("[OWNSAVE] pending strips", ppath, pp, "no strip is read or written for this world and the list on disk"
+                                               " stays as it is; read again at the next load"));
+        if (pp.kind == coopstore::kFileReadable && !pp.bytes.empty()) bad = coopown::PendStripParseAll(std::string(pp.bytes.begin(), pp.bytes.end()), &pl);
+        {   /* T-1280 fold 1 (L6): strips made at an earlier load of this store whose list was held join the list read now (judged below as
+               the file's own entries are) and are written with it; while the list is still held they stay kept */
+            size_t joined = 0, lost = 0;
+            ::EnterCriticalSection(&g_ownPendLock);
+            if (pendLocked)
+            {
+                if (!g_ownPendHeldDir.empty() && g_ownPendHeldDir != sdir) { lost = g_ownPendHeld.size(); g_ownPendHeld.clear(); }
+                g_ownPendHeldDir = sdir;
+            }
+            else if (!g_ownPendHeldDir.empty() && g_ownPendHeldDir == sdir)
+            {
+                for (size_t i = 0; i < g_ownPendHeld.size(); ++i) { if (coopown::PendStripAdd(&pl, g_ownPendHeld[i])) ++joined; else ++lost; }
+                g_ownPendHeld.clear(); g_ownPendHeldDir.clear();
+            }
+            ::LeaveCriticalSection(&g_ownPendLock);
+            if (joined > 0) DebugLog("[OWNSAVE] pending strips: " + N((long long)joined) + " made while the list was held by another program join it now");
+            if (lost > 0)
+                ErrorLog("[OWNSAVE] pending strips: " + N((long long)lost) + " made while a list was held by another program are DROPPED (another records store's, or"
+                         " the list is full) - those people may show in two squads at that store's next load");
+        }
         const size_t read = pl.size();
         int dropped = coopown::PendStripKeepAtLoad(&pl, haveMark, haveMark ? mi.seq : 0ULL);
         int goneHere = 0;   /* an entry whose old squad this save no longer has, or whose file no longer holds the person, has nothing left to strip */
         for (std::vector<coopown::PendStrip>::iterator it = pl.begin(); it != pl.end(); )
         {
-            std::vector<char> ob;
             coopown::GdcScanOut os;
-            const bool fileHere = ReadFileBytes(saveDir + "\\platoon\\" + it->oldSid + ".platoon", &ob) && !ob.empty();
-            const bool parsed = fileHere && coopown::GdcScan(&ob[0], ob.size(), it->oldSid + ".platoon", &os);
+            /* T-1280: a squad file another program holds is not a squad file that is gone - the entry is kept and judged again at
+               the next load (each such file said once per load) */
+            const std::string opath = saveDir + "\\platoon\\" + it->oldSid + ".platoon";
+            const coopstore::FileProbe op = coopstore::ProbeFile(opath);
+            int oneHeld = 0;
+            const int ostep = coopstore::FileLockedNote(op.kind, &oneHeld);
+            if (coopstore::FileLockSkips(ostep))
+            {
+                ErrorLog(coopstore::FileLockedLine("[OWNSAVE] pending strips", opath, op, "its entry is kept (not taken as gone from this save); judged again at the next load"));
+                ++it;
+                continue;
+            }
+            const bool fileHere = op.kind == coopstore::kFileReadable && !op.bytes.empty();
+            const bool parsed = fileHere && coopown::GdcScan(&op.bytes[0], op.bytes.size(), it->oldSid + ".platoon", &os);
             if (!fileHere || (parsed && std::find(os.chars.begin(), os.chars.end(), it->who) == os.chars.end())) { it = pl.erase(it); ++goneHere; }
             else ++it;
         }
         dropped += goneHere;
         ::EnterCriticalSection(&g_ownPendLock);
-        g_ownPend = pl; g_ownPendDir = sdir; g_ownPendDropped += dropped;
+        if (!pendLocked) { g_ownPend = pl; g_ownPendDir = sdir; }   /* T-1280: a held list leaves both empty (OwnPendClear) - nothing is written over it */
+        g_ownPendDropped += dropped;
         ::LeaveCriticalSection(&g_ownPendLock);
         if (read > 0 || bad > 0)
             DebugLog("[OWNSAVE] pending strips read: " + N((long long)read) + " (badLines=" + N((long long)bad) + ", gone from this save=" + N((long long)goneHere) + "), kept " + N((long long)pl.size())
@@ -26361,11 +31835,26 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
     /* T-1062: this store's left notes - a person of a squad's save version whom the newer record no longer holds and who is in no
        squad after the load stays out when a note says why (a death); with none he is copied back into the record (decision 1091 a) */
     std::map<std::string, int> leftMap;
+    bool leftLocked = false;   /* T-1280: the left-note file is there and could not be read - nobody is copied back at this load */
     {
-        std::vector<char> lb;
         std::vector<coopown::LeftNote> notes;
-        if (ReadFileBytes(sdir + "\\" + coopown::LeftNoteFile(), &lb) && !lb.empty())
-            g_ownOvLeftNotesBad = coopown::LeftNoteParseAll(std::string(lb.begin(), lb.end()), &notes);
+        /* T-1280: a left-note file another program holds is not "no deaths": read as one, every dead person a newer record lacks is
+           copied back into it. With it held, the roster check runs with nobody settled (RosterNoSettle - each lost person refuses his
+           squad, as before per-person settling), nothing is copied back, and the next load reads the notes again. */
+        const std::string lpath = sdir + "\\" + coopown::LeftNoteFile();
+        const coopstore::FileProbe lp = coopstore::ProbeFile(lpath);
+        const int lstep = coopstore::FileLockedNote(lp.kind, &g_ownLeftLoadLockHeld);
+        leftLocked = coopstore::FileLockSkips(lstep);
+        if (lstep == coopstore::kLockSkipFirst)
+            ErrorLog(coopstore::FileLockedLine("[OWNSAVE] settle", lpath, lp, "nobody is copied back into a record at this load (each lost person refuses"
+                                               " his squad, as before per-person settling); read again at the next load"));
+        if (lp.kind == coopstore::kFileReadable && !lp.bytes.empty())
+            g_ownOvLeftNotesBad = coopown::LeftNoteParseAll(std::string(lp.bytes.begin(), lp.bytes.end()), &notes);
+        /* T-1280 fold 1 (M2): died notes held in memory while this store's file was held are part of what this load judges - the file's
+           notes, then the held ones over them (LeftNoteAdd: the newer note of one person wins) - so a death the file does not hold yet
+           still keeps that person out; once the file reads, they are written into it below */
+        const bool heldHere = !g_ownLeftHeld.empty() && g_ownLeftHeldDir == sdir;
+        if (heldHere) for (size_t i = 0; i < g_ownLeftHeld.size(); ++i) coopown::LeftNoteAdd(&notes, g_ownLeftHeld[i]);
         g_ownOvLeftNotes = (long long)notes.size();
         /* a note counts only when the death came after the loaded save: an older note's person was brought back by an earlier load
            of an older save and lives in this one. Who is kept out is judged against the save's mark, else its quick.save file's
@@ -26377,7 +31866,8 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
         int stale = 0;
         coopown::LeftNoteMap(notes, &leftMap, settleAt, &stale);
         g_ownOvLeftStale = stale;
-        g_ownLeftNotes = notes;
+        if (!leftLocked) g_ownLeftNotes = notes;   /* T-1280: held - the notes in memory stay */
+        if (heldHere && !leftLocked) OwnLeftNoteCommit(sdir, 0, 0);   /* T-1280 fold 1 (M2): the file reads now - the held notes are written into it */
     }
     /* T-1139: the records of squads the save does not have (missingAt - each one the overlay rule took: newer than the save), read once.
        A person to copy back whom one of them holds is copied from the newest such record (NewestHolder, ownrec.h), not from the save:
@@ -26417,6 +31907,7 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
     for (int round = 0; ; ++round)
     {
         sq = sqUnmarked;
+        if (leftLocked) coopown::RosterNoSettle(&sq);   /* T-1280: the left notes could not be read - nobody settled, no copy-back */
         coopown::RosterResolve(&sq, fixed, &rc, &leftMap);
         addFile.clear();
         addFrom.clear(); addRec = 0; addRecFail = 0;   /* T-1139 */
@@ -28341,6 +33832,7 @@ void OwnSaveReport()
              + N(g_ownKeyChanged) + "," + N(g_ownWorldResets) + "," + N(g_ownHandOverMarks) + "," + N(g_ownHandOverNoSquad) + ","
              + N(g_ownPokeRefused) + "," + N(d.rotated) + "," + N(d.rotateSkipped) + "," + N(d.tmpDeleted) + "," + N(d.tmpKept)
              + " ownHeldUnpublished=" + N(g_ownHeldUnpublished)   /* T-889 step 2 (A2) */
+             + " ownHeldOrigin=" + N(g_ownHeldOrigin)   /* T-1178 fold 2 (L3): squad writes held - a member's own spot read the world origin */
              + " mmo1c[bytesMatched,bytesMismatch,bytesEngineFallback,compares,ownBytesOff]=" + N(g_ownBytesMatched) + "," + N(g_ownBytesMismatch)
              + "," + N(g_ownBytesEngineFallback) + "," + N((long long)g_ownBytesCompared) + "," + N((long long)g_ownBytesOff)
              + " ownBytesUs[max,avg,n]=" + N(g_ownBytesUs.mx) + "," + N(g_ownBytesUs.Avg()) + "," + N(g_ownBytesUs.n)
@@ -28573,10 +34065,26 @@ int HbHolderRuns(void* platoon)
     int known = 0, mine = 0; MembersOwnership(q.members, q.activeChars, &known, &mine);
     return coopsquad::NpcSquadWriter(1, 1, 1, HeldByOtherTS(sec), mine, 0, 0) == coopsquad::kNpcWriteHolder ? 1 : 0;
 }
+/* T-4 design (d) (towngen.cpp T2RunsHere): the writer rule's facts about a town group - the slot running a strict majority of its living
+   people (HbRunnerOfPlatoon; -1 none, split, asleep or unread) and, when that is -1, another live game the world server says runs
+   the squad (SwOtherRunner; -1 none); fold 1 (LOW-1): when neither names a slot, *listHeld = the list hold (SwListHeld - before
+   this link's LIST END a squad with a record here is held, SwOtherOrHeld's semantics). MAIN THREAD */
+int StoreGroupRunner(void* platoon, int* otherRunner, int* listHeld)
+{
+    int d = 0, h = 0, ts = -1, tn = 0;
+    const int r = HbRunnerOfPlatoon(platoon, &d, &h, &ts, &tn);
+    *otherRunner = -1; *listHeld = 0;
+    if (r >= 0) return r;
+    const std::string wid = WorldIdOf(platoon);
+    *otherRunner = SwOtherRunner(wid);
+    if (*otherRunner < 0) *listHeld = SwListHeld(wid);
+    return r;
+}
 /* ---- the registry's edges (forward-declared at coop scope at the top of this file) ---- */
 void HbRegister(void* platoon)
 {
     if (!OnMainThread() || !Plaus(platoon)) return;
+    if (RaidLentHas(platoon)) return;   /* T-1122 build: a lent copy is never written by the heartbeat */
     {   /* an existing entry: who writes it is judged again at every visit (DeathWatchTick asks every second) from who runs the squad's living
            people now (squadwriter.h HbForeignAfter) - a context platoon too; the area holder's answer only when the runner is unknown */
         std::map<void*, HbEntry>::iterator ex = g_hb.find(platoon);
@@ -29011,6 +34519,14 @@ int HbOwnedAwake(void* platoon, const std::string& worldId, Pod* q, int* mineOut
         if (sw == coopsquad::kCtxSleepRefuseContext || sw == coopsquad::kCtxSleepRefuseHandedOver)
         {
             if (sw == coopsquad::kCtxSleepRefuseContext) ++g_hbCtxRefused; else ++g_hbHandedOverRefused;
+            const int hbUnnum = isHo != 0 ? MembersLivingUnnumbered(q->members, q->activeChars) : 0;
+            if (hbUnnum != 0)
+            {   /* T-1318 attempt 4 (design A, site 10): THE TRIPWIRE at the heartbeat (must stay 0) */
+                ++g_hoUnnumberedHb;
+                if (++g_givenEngineLines <= 40)
+                    DebugLog("[STORE] HEARTBEAT not published as HANDED OVER with never-numbered living people in its list (T-1318 attempt 4 tripwire, must stay 0): worldId=" + worldId + " chars=" + N(q->activeChars)
+                             + " known=" + N(known) + " unnumberedLiving=" + N((long long)hbUnnum) + " (givenEngine hoUnnumberedHb=" + N(g_hoUnnumberedHb) + "; the first 40 givenEngine lines)");
+            }
             if (++g_hbCtxLogged <= 20)
                 DebugLog("[STORE] HEARTBEAT not published worldId=" + worldId + " chars=" + N(q->activeChars) + " known=" + N(known) + " mine=" + N(mine)
                          + (sw == coopsquad::kCtxSleepRefuseContext ? std::string(" - a context platoon for another game's characters (none of them this game's)")
@@ -29102,7 +34618,7 @@ int HbPublishOne(void* platoon, DWORD now, bool wasDirty)
     r.posAt = r.writtenAt;
     r.owner = (int)StoreOwnerField();   /* B10 (audit C13) - the heartbeat is a seventh writer of the field, the same call */
     r.town = PlatoonTownSid(platoon);
-    { char hk[128]; if (TownGenPlatoonHomeKey(platoon, hk, 128) == 1) NoteRecordHome(worldId, std::string(hk), 1); }   /* the group's home building key, sent with its record (RecordHomeOf) - read off the live group */
+    if (HomeWriteLive(platoon, worldId) != 0) e.lastCrc = 0;   /* the group's home building key, or "-" after the engine blanked it (T-1334), sent with its record (RecordHomeOf) - read off the live group; a changed home is sent even when the squad's bytes are unchanged */
     char buf[160];
     if (Plaus(q.squadGd) && CopyStdStringPod((const char*)q.squadGd + 0x58, buf, 160)) r.squadSid = buf;
     if (Plaus(q.faction)) { Faction* f = (Faction*)q.faction; r.factionName = FactionKey(f); }   /* factionkey.h */
@@ -29221,7 +34737,7 @@ std::string HbLineText(unsigned int bps, unsigned int windowMs)
          + " sqEvRoad[skipped,ringFull,untaggable,drainUsed,drainDropped,teardownDropped,tooBig]=" + N(g_sqEvSkipped)
          + "," + N((long long)::InterlockedCompareExchange64(&g_sqEvRingFull, 0, 0)) + "," + N((long long)::InterlockedCompareExchange64(&g_sqEvUntaggable, 0, 0))
          + "," + N(g_sqEvDrainUsed) + "," + N(g_sqEvDrainDropped) + "," + N(g_sqEvTeardownDropped) + "," + N(g_sqEvTooBig)
-         + " takeMoneyHook=" + N((long long)g_takeMoneyHookOn) + " " + coop::HomeWatchReport() + coop::SameIdCopyReport()
+         + " takeMoneyHook=" + N((long long)g_takeMoneyHookOn) + " " + coop::HomeWatchReport() + coop::HomeBlankWatchReport() + coop::SameIdCopyReport()
          + " hbRefused[faction,notOwned,notAwake,noId,deleted,heldByOther,quitting,modStr]=" + N(g_hbRefusedFaction) + "," + N(g_hbNotOwned)
          + "," + N(g_hbNotAwake) + "," + N(g_hbNoId) + "," + N(g_hbDeletedNumber) + "," + N(g_hbHeldByOther) + "," + N(g_hbQuitRefused) + "," + N(g_hbModStrBad)
          + " hbFailed[scratch,record,save,commit,send,dirtyLookupMiss]=" + N(g_hbScratchFailed) + "," + N(g_hbRecordFailed) + "," + N(g_hbSaveFailed)
@@ -29392,6 +34908,19 @@ void StoreMarkSquadDirty(void* platoon, int cause) { HbMarkDirty(platoon, cause)
 /* T-1084 (store.h): a member's death, a home building set, a shop squad's restock - noted on any thread (SqEventNote). */
 void StoreNoteSquadEvent(void* character) { SqEventNote(character, sqevent::kKindCharacter); }
 void StoreNoteSquadHome(void* pot) { SqEventNote(pot, sqevent::kKindPotHome); }
+/* T-1334: a pot whose home the engine blanked (spawn.cpp detour_removeOwned) - marked due as a move is, and queued under a lock for the
+   1 Hz block (HomeBlankDrainTick), which lists its squad as blanked (written as "-" at its next write by this game). ANY THREAD */
+SRWLOCK g_homeBlankLock = SRWLOCK_INIT;
+std::vector<void*> g_homeBlankQueue;
+long long g_homeBlankQueueFull = 0, g_homeBlankDropped = 0;
+void StoreNoteSquadHomeBlank(void* pot)
+{
+    if (pot == 0) return;
+    SqEventNote(pot, sqevent::kKindPotHome);
+    ::AcquireSRWLockExclusive(&g_homeBlankLock);
+    if (g_homeBlankQueue.size() < 1024) g_homeBlankQueue.push_back(pot); else ++g_homeBlankQueueFull;
+    ::ReleaseSRWLockExclusive(&g_homeBlankLock);
+}
 void StoreNoteSquadRestock(void* squadOrActive) { SqEventNote(squadOrActive, sqevent::kKindRestock); }
 /* The item road names an OWNER UID. uid 0 is a storage box (zone state, not a group) - a correct non-answer, no miss.
    FindSpawnedUid is the resolver MembersOwnership uses. */
@@ -29420,6 +34949,123 @@ void StoreMarkSquadDirtyByUid(unsigned int uid, int cause)
    group on the building's residents hand). The squad's home is then read back: the entry leaves the list only when the home is set; a give
    that did not take is tried again at the next check, kCopyHomeMaxTries in all, then dropped and counted. At most kCopyHomePerTick entries a
    second, round-robin, as the key lookup is not free. */
+/* T-1334: the blanks queued above, taken in the 1 Hz block before the heartbeat: a bound squad is listed as blanked (HomeWriteLive) and its
+   world id compared again (ReHomeTick) - on a game that does not run it, its record's home is put back (the record is the one source).
+   During a load or a teardown what was taken is dropped. MAIN THREAD */
+/* the game that runs a group here: it runs a strict majority of its people (HbRunnerOfPlatoon), or it wrote the group's newest record.
+   MAIN THREAD */
+int ReHomeIsRunner(void* p, const std::string& wid)
+{
+    int living = 0, here = 0, top = -1, topN = 0;
+    const int rr = g_mySlot >= 0 ? HbRunnerOfPlatoon(p, &living, &here, &top, &topN) : -1;
+    const std::map<std::string, Record>::const_iterator rt = g_records.find(wid);
+    return ((g_mySlot >= 0 && rr == g_mySlot) || (rt != g_records.end() && rt->second.owner == (int)StoreOwnerField())) ? 1 : 0;
+}
+void HomeBlankDrainTick()
+{
+    std::vector<void*> got;
+    ::AcquireSRWLockExclusive(&g_homeBlankLock);
+    got.swap(g_homeBlankQueue);
+    ::ReleaseSRWLockExclusive(&g_homeBlankLock);
+    if (got.empty()) return;
+    if (EngineWritesBlocked()) { g_homeBlankDropped += (long long)got.size(); return; }
+    for (size_t i = 0; i < got.size(); ++i)
+    {
+        void* const p = sqevent::PotPlatoon(got[i]);
+        const std::map<void*, std::string>::const_iterator b = g_bind.find(p);
+        if (b == g_bind.end()) continue;
+        /* T-1334 fold 1 (review MED 1): listed for the "-" write only where this game writes the group; elsewhere its record's home is put back */
+        if (coopstore::HomeBlankListed(1, ReHomeIsRunner(p, b->second)) != 0) { g_homeBlankSet.insert(p); ++g_homeRecDirtyBlank; }
+        else ++g_homeRecBlankNotRunner;
+        g_homeRecheck.insert(b->second);
+    }
+}
+/* T-1334: A LIVE COPY RE-HOMED FROM ITS RECORD, once a second (StoreTick, MAIN THREAD), at most kReHomePerTick world ids: the ones another
+   game's write changed (g_homeRecheck), then after a load every bound group (g_homeRecheckLoad, which also gives the record's home again
+   when the building's residents hand - the area file's raw link - names another group or none). Read live at the moment of applying:
+   the group, its home (TownGenPlatoonHomeKey) and the record's building found by its key. The game that runs the group (it runs a strict
+   majority of its people, HbRunnerOfPlatoon, or wrote its newest record) is the source and is skipped. coopstore::ReHomeDecide. */
+const int kReHomePerTick = 16;
+void ReHomeOne(const std::string& wid, int loadPass)
+{
+    const std::map<std::string, void*>::const_iterator w = g_byWorldId.find(wid);
+    if (w == g_byWorldId.end() || w->second == 0) return;
+    void* const p = w->second;
+    { const std::map<void*, std::string>::const_iterator b = g_bind.find(p); if (b == g_bind.end() || b->second != wid) return; }
+    const std::string rec = RecordHomeOf(wid);
+    const int rs = coopstore::RecHomeState(rec);
+    if (rs == coopstore::kRecHomeUnknown) return;
+    const int isRunner = ReHomeIsRunner(p, wid);
+    char hk[128]; hk[0] = 0;
+    const int lr = TownGenPlatoonHomeKey(p, hk, 128);
+    const std::string key = coopstore::MetaHomeKey(rec);
+    const int same = (lr == 1 && !key.empty() && (key == hk || BoxKeyNearKey(hk, key.c_str()) != 0)) ? 1 : 0;
+    void* const bld = (rs == coopstore::kRecHomeKey && isRunner == 0) ? ObjectByPositionKey(key.c_str()) : 0;
+    int linkOther = 0;
+    if (loadPass != 0 && bld != 0 && same != 0) linkOther = (TownGenResidentGroupOf(bld) != p) ? 1 : 0;
+    const int d = coopstore::ReHomeDecide(isRunner, lr, same, rs, bld != 0 ? 1 : 0, linkOther);
+    if (d == coopstore::kReHomeRunner) { ++g_homeRecRunnerSkip; return; }
+    if (d == coopstore::kReHomeNone) { ++g_homeRecSame; return; }
+    const std::string liveText = lr == 1 ? std::string(hk) : std::string("none");
+    if (d == coopstore::kReHomeMissing)
+    {   /* T-1334 fold 1 (review LOW 3): owed - moved by the owed-home check once the building is loaded here */
+        ++g_homeRecReHomeMissing;
+        if (coopstore::ReHomeOwes(d, 0) != 0) { CopyHomeOweAdd(p, wid, 0, key, 1); ++g_homeRecOwed; }
+        if (++g_homeRecLines <= 400)
+            DebugLog("[STORE] home of " + wid + " re-homed from its record: live " + liveText + " -> record " + key + " - the building is not loaded here; owed to the owed-home check"
+                     + (loadPass != 0 ? " (after a load)" : "") + " (homeRec reHomeMissing=" + N(g_homeRecReHomeMissing) + " owed=" + N(g_homeRecOwed) + "; the first 400 logged)");
+        return;
+    }
+    std::string what;
+    if (d == coopstore::kReHomeMove)
+    {
+        const int rc = TownGenGiveHomeTo(p, bld);
+        if (rc == 1 || rc == 2)
+        {
+            if (linkOther != 0 && same != 0) { ++g_homeRecLinkFixed; what = std::string("given again over the building's residents link, which now names ") + (TownGenResidentGroupOf(bld) == p ? "this group" : "another group still"); }
+            else { ++g_homeRecReHomed; what = "moved by the engine's setHomeBuilding"; }
+        }
+        else
+        {
+            ++g_homeRecFailed; what = "NOT moved (give rc=" + N((long long)rc) + (rc == coopstore::kGiveHomePlayerHouse ? std::string(", a player's house") : std::string()) + ")";
+            if (coopstore::ReHomeOwes(d, rc) != 0) { CopyHomeOweAdd(p, wid, 0, key, 1); ++g_homeRecOwed; what += "; owed to the owed-home check"; }   /* T-1334 fold 1 (review LOW 3) */
+        }
+    }
+    else
+    {
+        const int rc = PlatoonDropHomeOwnPod(p);
+        if (rc == 1) { ++g_homeRecBlankApplied; what = "blanked by the engine's removeOwnedObject"; }
+        else { ++g_homeRecFailed; what = "NOT blanked (rc=" + N((long long)rc) + ")"; }
+    }
+    if (++g_homeRecLines <= 400)
+        DebugLog("[STORE] home of " + wid + " re-homed from its record: live " + liveText + " -> record " + (rs == coopstore::kRecHomeNone ? std::string("none") : key)
+                 + " - " + what + (loadPass != 0 ? " (after a load)" : "") + " (homeRec reHomed=" + N(g_homeRecReHomed) + " blankApplied=" + N(g_homeRecBlankApplied)
+                 + " linkFixed=" + N(g_homeRecLinkFixed) + " failed=" + N(g_homeRecFailed) + "; the first 400 logged)");
+}
+void ReHomeTick()
+{
+    if (!OnMainThread()) return;
+    if (EngineWritesBlocked()) { g_homeRecLoadPass = 1; return; }   /* a load or a teardown: once it ends, every bound group is checked */
+    if (g_homeRecLoadPass != 0)
+    {
+        g_homeRecLoadPass = 0;
+        for (std::map<void*, std::string>::const_iterator b = g_bind.begin(); b != g_bind.end(); ++b) g_homeRecheckLoad.insert(b->second);
+    }
+    int n = 0;
+    while (n < kReHomePerTick && !g_homeRecheck.empty()) { const std::string wid = *g_homeRecheck.begin(); g_homeRecheck.erase(g_homeRecheck.begin()); g_homeRecheckLoad.erase(wid); ReHomeOne(wid, 0); ++n; }
+    while (n < kReHomePerTick && !g_homeRecheckLoad.empty()) { const std::string wid = *g_homeRecheckLoad.begin(); g_homeRecheckLoad.erase(g_homeRecheckLoad.begin()); ReHomeOne(wid, 1); ++n; }
+}
+std::string HomeRecReport()
+{
+    return " homeRec[dirtyMove,dirtyBlank,writtenNone,reHomed,reHomeMissing,blankApplied]=" + N(coop::HomeMoveNotedCount()) + "," + N(coop::HomeBlankNotedCount())
+           + "," + N(g_homeRecWrittenNone) + "," + N(g_homeRecReHomed) + "," + N(g_homeRecReHomeMissing) + "," + N(g_homeRecBlankApplied)
+           + " homeRecMore[blankMatched,linkFixed,runnerSkip,same,failed,queued,loadQueued,blankQueueFull,blankDropped]=" + N(g_homeRecDirtyBlank) + "," + N(g_homeRecLinkFixed)
+           + "," + N(g_homeRecRunnerSkip) + "," + N(g_homeRecSame) + "," + N(g_homeRecFailed) + "," + N((long long)g_homeRecheck.size()) + "," + N((long long)g_homeRecheckLoad.size())
+           + "," + N(g_homeBlankQueueFull) + "," + N(g_homeBlankDropped)
+           + " homeRecFold[owed,owedDone,owedFailed,owedRecheck,blankNotRunner,arriveSkipped,arriveNoteOnly,byClearer]=" + N(g_homeRecOwed) + "," + N(g_homeRecOwedDone)
+           + "," + N(g_homeRecOwedFailed) + "," + N(g_homeRecOwedRecheck) + "," + N(g_homeRecBlankNotRunner) + "," + N(g_homeRecArriveSkipped) + "," + N(g_homeRecArriveNoteOnly)
+           + "," + N(g_homeRecByClearer);
+}
 const int kCopyHomePerTick = 16;
 void CopyHomeOwedTick()
 {
@@ -29440,6 +35086,36 @@ void CopyHomeOwedTick()
             const std::map<void*, unsigned long long>::const_iterator g = g_bindGenOf.find(p);
             if (b != g_bind.end()) bound = (b->second == e.worldId && (e.bindGen == 0 || (g != g_bindGenOf.end() && g->second == e.bindGen))) ? 1 : 0;
             else { const std::map<std::string, void*>::const_iterator w = g_byWorldId.find(e.worldId); bound = (e.bindGen == 0 && w != g_byWorldId.end() && w->second == p) ? 1 : 0; }
+        }
+        if (e.reHome != 0)
+        {   /* T-1334 fold 1 (review LOW 3): a live copy owed its RECORD's home over the one it has - its building was not loaded here, or the
+               engine's move did not take (ReHomeOne). The record, the runner and the live home are read again at each look. */
+            const std::string rec = RecordHomeOf(e.worldId);
+            const std::string rk = coopstore::MetaHomeKey(rec);
+            const int recKey = coopstore::RecHomeState(rec) == coopstore::kRecHomeKey ? 1 : 0;
+            char hk[128]; hk[0] = 0;
+            const int lr = (bound != 0 && recKey != 0) ? TownGenPlatoonHomeKey(p, hk, 128) : -1;
+            const int liveSame = (lr == 1 && (rk == hk || BoxKeyNearKey(hk, rk.c_str()) != 0)) ? 1 : 0;
+            const int runner = (bound != 0 && recKey != 0) ? ReHomeIsRunner(p, e.worldId) : 0;
+            const int looking = (bound != 0 && recKey != 0 && runner == 0 && liveSame == 0) ? 1 : 0;
+            if (looking != 0 && e.nextLookAt != 0 && (LONG)(now - e.nextLookAt) < 0) { ++it; continue; }   /* a building not loaded at the last look: again after 10 s */
+            void* const rb = looking != 0 ? ObjectByPositionKey(rk.c_str()) : 0;
+            const int st = coopstore::ReHomeOwedStep(bound, recKey, runner, liveSame, rb != 0 ? 1 : 0);
+            if (st == coopstore::kReOwedDrop) { ++g_copyHomeGone; g_copyHomeOwedMap.erase(it++); continue; }
+            if (st == coopstore::kReOwedRecheck) { ++g_homeRecOwedRecheck; g_homeRecheck.insert(e.worldId); g_copyHomeOwedMap.erase(it++); continue; }
+            if (st == coopstore::kReOwedDone) { ++g_homeRecOwedDone; g_copyHomeOwedMap.erase(it++); continue; }
+            if (st == coopstore::kReOwedWait) { e.nextLookAt = now + 10000; if (e.nextLookAt == 0) e.nextLookAt = 1; ++it; continue; }
+            const int r = TownGenGiveHomeTo(p, rb);
+            hk[0] = 0;
+            const int took = ((r == 1 || r == 2) && TownGenPlatoonHomeKey(p, hk, 128) == 1 && (rk == hk || BoxKeyNearKey(hk, rk.c_str()) != 0)) ? 1 : 0;   /* the live home read back */
+            const int a = (r == coopstore::kGiveHomePlayerHouse) ? coopstore::kCopyHomeFailed : coopstore::CopyHomeAfter(took, &e.tries, coopstore::kCopyHomeMaxTries);
+            if (a == coopstore::kCopyHomeRetry) { ++it; continue; }
+            if (a == coopstore::kCopyHomeDone) { ++g_homeRecOwedDone; ++g_homeRecReHomed; } else ++g_homeRecOwedFailed;
+            if (++g_homeRecLines <= 400)
+                DebugLog("[STORE] home of " + e.worldId + " re-homed from its record: record " + rk + " - " + (a == coopstore::kCopyHomeDone ? std::string("moved by the owed-home check now that the building is loaded here")
+                         : std::string("NOT moved by the owed-home check (give rc=") + N((long long)r) + (r == coopstore::kGiveHomePlayerHouse ? std::string(", a player's house") : std::string(", tries ") + N((long long)e.tries)) + "); dropped from the owed list")
+                         + " (homeRec reHomed=" + N(g_homeRecReHomed) + " owedDone=" + N(g_homeRecOwedDone) + " owedFailed=" + N(g_homeRecOwedFailed) + "; the first 400 logged)");
+            g_copyHomeOwedMap.erase(it++); continue;
         }
         unsigned char h32[32];
         const int hasHome = (bound != 0 && PlatoonHomeHandPod(p, h32) == 1) ? 1 : 0;
@@ -29506,6 +35182,7 @@ void TalkReportTick();   /* T-726: speech.cpp - the same namespace (coop) */
 void PlatoonNudgeTick();   /* defined beside PlatoonNudge, below - the same namespace (coop) [t761-nudge-hold] */
 void StoreTick()
 {
+    RaidLentLoadTick();   /* T-1122 save fold: the lent copies a loaded save kept, removed at this world's first ticks with engine writes allowed - before the wake, heartbeat and record roads below see them */
     ++g_bkFrame;   /* T-1242 fold 5: the teammates' research benches are scanned at most once per frame */
     LoadFloorTick();   /* first, every frame until read: the floor is each counter as the load left it, before anything this tick can raise one (PlaceUnplacedNotes, NumberBlockTick) */
     NumberBlockTick();   /* decision 31(a): every frame (it returns at once while the applied block stands), so the block is applied in the frame the floor is read - E11: the relay's slot decides, not the session role */
@@ -29606,6 +35283,8 @@ void StoreTick()
     WorldKeySaveTick();   /* review-p7b H-1: the world key is written once the engine has FINISHED the save it accepted - two POD reads and a compare when nothing is pending */
     if (!g_wakeWait.empty()) WakeWaitTick();   // every tick: a woken squad's people first seen
     if (!g_pendingPlace.empty()) PlacePending();   // every tick: the characters appear the same frame as the wake
+    if (g_lentWokeOffN != 0) LentWokeDrain();   /* T-1122 attempt 2 fold 1: lent copies woken off the main thread */
+    if (!g_lentPlace.empty()) LentPlaceTick();   /* T-1122 attempt 2 (owner 1619 a): a woken lent copy's people placed the frame they exist, then its raid campaign */
     OwnTick();   /* mmo1: every frame; it paces itself (one squad per frame at most) */
     UidBlockTick();   /* M4 fold: ask the notebook for the next block of uid counters when the minter wants one */
     SwOffWakeDrainTick();   /* T-1084: wakes the engine ran off the main thread, checked against the squads other games run (every frame, before their people are adopted) */
@@ -29623,12 +35302,17 @@ void StoreTick()
     T300SweepTick();   /* T-300 fix 3: the arrival sweep (armed below when another player enters this world) - before the drop, so what it queues goes this tick */
     T300DropTick();   /* T-300: another game's file-built squads in areas another game holds, thrown away (1 Hz) */
     CtxDropTick();   /* H067: context platoons that slept holding none of this game's people (or whose wake was refused), removed (1 Hz) */
+    GivenWaitTick();   /* T-1318 fold 1: a squad whose given copy was refused and removed is built from its record once nothing of it is given (1 Hz, on an index change) */
     CopyHomeOwedTick();   /* the owed homes: a squad whose home building was not loaded here is given it once it is (1 Hz, at most 16 a second) [t755-copyhome-tick-call] */
+    ReHomeTick();   /* T-1334: live copies whose record's home differs re-homed (after the owed homes, so a home given there is not given twice) */
+    HomeBlankDrainTick();   /* T-1334: homes the engine blanked, listed for the heartbeat's "-" below */
     SqEventDrainTick();   /* T-1084: deaths noted on other threads mark their squads here - before the watch, so a wipe-out's last death is forgotten with the squad, never published */
     DeathWatchTick();   /* decision 28/30: an awake world group whose members are ALL dead is a wipe-out (1 Hz; review-p4e5) */
     HeartbeatTick();   /* E47-S2: BELOW DeathWatchTick, so a wipe-out this second is a delete and never a heartbeat record first */
     /* B10 (audit C14, design-e46-store 3.3): as C10 - the notebook's authority peer publishes sleeping
        positions, and with no notebook nothing does (decision 44). */
+    if (g_on && g_dirReady && !EngineWritesBlocked()) RaidLendTick();   /* T-1122 build: the raid lend's starts, silences, march orders and endings (link down too: an unanswered ask then resumes) */
+    if (g_on && g_dirReady && LinkUp() && !EngineWritesBlocked()) OwnRaidSweepTick();   /* T-1122 fold b: own raid squads found again from their lasting facts (both roles; before the publish skips them) */
     if (g_on && g_dirReady && LinkUp() && g_storeAuthority) PublishSleepingPositions();
     StoreRepushUpTick();   /* B10 (audit C15): the push UP, at the end of the notebook's own push */
     /* M2-b (review-m2 LOW): the session link-up bitmap push is DELETED - SendBitsAny has had no session path since M2, so it sent nothing. A bitmap that could not be sent during a notebook outage is re-sent by StoreRepushUpTick at the relink. */
@@ -30014,6 +35698,7 @@ static std::string HomeReportImpl()
 {
     return " home[asked,givenAtCreate,givenLater,notLoadedAtCreate,notResident,fault,owedGone,owedNow]=" + N(g_homeAsked) + "," + N(g_homeSetCreate) + "," + N(g_homeSetLater)
            + "," + N(g_homeNotLoaded) + "," + N(g_homeNotResident) + "," + N(g_homeFault) + "," + N(g_homeOwedGone) + "," + N((long long)::InterlockedCompareExchange(&g_homeOwedNow, 0, 0))
+           + HomeRecReport()
            + " homeKeyless[made,keyed,gone,now]=" + N(g_homeKeylessMade) + "," + N(g_homeKeylessKeyed) + "," + N(g_homeKeylessGone) + "," + N((long long)g_homeKeyless.size())
            + " copyHome[owed,given,notResident,hadHome,retried,giveFailed,keyHandleMismatch,gone,noId,now]=" + N(g_copyHomeOwed) + "," + N(g_copyHomeGiven) + "," + N(g_copyHomeNotResident)
            + "," + N(g_copyHomeHad) + "," + N(g_copyHomeRetried) + "," + N(g_copyHomeGiveFailed) + "," + N(g_copyHomeMismatch) + "," + N(g_copyHomeGone) + "," + N(g_copyHomeNoId)
@@ -30343,9 +36028,16 @@ void SwSweepQueueWriterLeft(const std::string& id, int why)
 /* the sleeping copy of a squad the record's arrival left where it was while another game ran it: moved in with the wake flag as that
    arrival moves it - its record in an area loaded here, unless another game runs it again, another game's file stands in an area another
    game holds (T300OtherHeld), or another game holds the area of a squad numbered in this game's block (OwnBlockRecvHold) */
+/* T-1269 fold 1 (H1): 1 = the platoon is a refused wake queued for removal (CtxDropTick puts it on ice and destroys it) */
+int SwCopyDoomed(void* p)
+{
+    const std::map<void*, CtxDrop>::const_iterator d = g_ctxDrops.find(p);
+    return (d != g_ctxDrops.end() && d->second.dup != 0) ? 1 : 0;
+}
 void SwMoveInAtRelease(const std::string& id, const Record& r)
 {
     if (SwOtherRunner(id) >= 0) return;
+    if (SwListHeld(id) != 0) { SwOtherRefuse(id, 1, "MOVE-IN AT RELEASE"); return; }   /* T-1269 [t1269a-A]: held until the list ends - it waits again */
     ::Faction* f = FindFactionByKey(r.factionName);
     void* sl = Plaus(f) ? FindSleepingPlatoonImpl(f, id) : 0;
     if (sl == 0 || !IsPositionLoadedHere(r.x, r.y, r.z) || T300OtherHeld(r) == 1) return;
@@ -30382,7 +36074,9 @@ void KeptRecordSweepTick()
         if (!newly.empty()) { KeptSweepQueue(kSweepNewlyHeld, &newly); ArStartRuns(newly); }   /* (c); and R5 for each newly held area (it decides at its own steps) */
         if (!newly.empty()) SquadTakeNewlyHeld(newly);   /* T-1084 step 5: this game now writes the squads recorded in the areas it newly holds */
         coop::BuildTownsMapEvent();   /* T-1158 step 6 review MED-2: a released piece held for another writer is tried again (its writer is read from this map) */
-        coop::DoorsRecMapEvent(&newly);   /* doors.cpp: door lays waiting on the holder answer tried again, a newly held area's doors with no record seeded, a rebuilt town's area swept, queued removals tried */
+        coop::DoorsRecMapEvent(&newly);
+        coop::CageRecMapEvent();
+        coop::TownBldgMapEvent();   /* T-1333 (build.cpp): a rebuilt town's building-record removals waiting on the holder answer tried again */   /* T-860 (spawn.cpp): held cage lock changes and unanswered first-record questions routed again against the holders named now */   /* doors.cpp: door lays waiting on the holder answer tried again, a newly held area's doors with no record seeded, a rebuilt town's area swept, queued removals tried */
         SquadRefusedOnMap(newly);   /* T-1084 step 5: each applied map looks at the refused squads (a newly held area asks again; the authority's refusals lift where nobody holds) */
         if (!freed.empty()) { ++g_sweepFreedRuns; KeptSweepQueue(kSweepFreed, &freed); }   /* (d): the authority builds its copies there. The runner's sleep writes were sent when its engine
             unloaded the area, at least the world server's 10 s release grace before the area turned free, on the same reliable channel as this map
@@ -30424,11 +36118,18 @@ void KeptRecordSweepTick()
         std::map<std::string, Record>::const_iterator rt = g_records.find(id);
         const int usable = (rt != g_records.end() && rt->second.gone == 0 && !rt->second.file.empty() && !(rt->second.x == 0.0f && rt->second.z == 0.0f)
                             && !IsZoneId(id) && !DeletedBitTest(id) && !MirrorKeepGated(id)) ? 1 : 0;
-        int hasCopy = 0, gate = coopsquad::kCopyNotOther, loaded = 0, inNew = 0, held = 0;
+        int hasCopy = 0, gate = coopsquad::kCopyNotOther, loaded = 0, inNew = 0, held = 0, doomedOnly = 0;
         if (usable != 0)
         {
             ::Faction* f = FindFactionByKey(rt->second.factionName);   /* the record's faction key (re-keyed at its arrival) - the one CreateUnknownSquad builds under */
-            hasCopy = (g_byWorldId.count(id) != 0 || (Plaus(f) && (FindSleepingPlatoonImpl(f, id) != 0 || FindActivePlatoonImpl(f, id) != 0))) ? 1 : 0;
+            /* T-1269 fold 1 (H1): a copy that is a refused wake queued for removal (put on ice, destroyed at the next removal pass) is told
+               apart from a live one - a waiting squad whose only copy is that keeps waiting (squadwriterreg.h SweepWaitOnDoomed) */
+            void* const act = Plaus(f) ? FindActivePlatoonImpl(f, id) : 0;
+            const std::map<std::string, void*>::const_iterator bw = g_byWorldId.find(id);
+            const int boundDoomed = (bw != g_byWorldId.end() && SwCopyDoomed(bw->second) != 0) ? 1 : 0, actDoomed = (act != 0 && SwCopyDoomed(act) != 0) ? 1 : 0;
+            const int liveCopy = ((bw != g_byWorldId.end() && boundDoomed == 0) || (Plaus(f) && FindSleepingPlatoonImpl(f, id) != 0) || (act != 0 && actDoomed == 0)) ? 1 : 0;
+            hasCopy = (liveCopy != 0 || boundDoomed != 0 || actDoomed != 0) ? 1 : 0;
+            doomedOnly = sqwreg::SweepWaitOnDoomed((e.why & kSweepWaitAsk) != 0 ? 1 : 0, liveCopy, (boundDoomed != 0 || actDoomed != 0) ? 1 : 0);
             gate = CopyGateRecord(id, rt->second);
             loaded = IsPositionLoadedHere(rt->second.x, rt->second.y, rt->second.z) ? 1 : 0;
             const Sector s = SectorOf(rt->second.x, rt->second.z);
@@ -30436,6 +36137,7 @@ void KeptRecordSweepTick()
             held = MineHeldTS(s) == 1 ? 1 : 0;
         }
         const int pick = coopsquad::SweepPick(usable, hasCopy, g_notePlaceFailed.count(id) != 0 ? 1 : 0, gate, loaded, inNew, coopsquad::SweepOnlyNewlyHeld(e.why));
+        if (doomedOnly != 0) { ++g_swWaitDoomedKept; continue; }   /* T-1269 fold 1 (H1): its only copy is being removed - it keeps waiting; the removal's end asks again (SwWakeDupSettled) */
         if ((e.why & kSweepWaitAsk) != 0 && coopsquad::SweepWriterLeftDone(pick) != 0) g_swBuildWait.erase(id);   /* decided here (a build refused again below for another runner waits again) */
         if (pick == coopsquad::kSwHasCopy && (e.why & kSweepWaitAsk) != 0) { SwMoveInAtRelease(id, rt->second); continue; }   /* a copy here, left asleep while another game ran it */
         if (pick == coopsquad::kSwDeferLoaded) { ++g_sweepDeferredLoaded; continue; }
@@ -30701,6 +36403,7 @@ int ArWakeDecide(void* platoon)
 /* AT THE FIRST SIGHT of an awake group (a save's group loaded awake never passes the wake): via kArViaWatch / kArViaSweep */
 void ArFirstSight(void* platoon, int via)
 {
+    if (RaidLentHas(platoon)) return;   /* T-1122 build: a lent copy is not a save group to decide */
     if (!g_on || !g_dirReady || !OnMainThread() || platoon == 0 || g_arSeen.count(platoon) != 0) return;
     g_arSeen.insert(platoon);
     ++g_arProbe[via == kArViaSweep ? kArProbeFirstSweep : kArProbeFirstWatch];
@@ -30961,7 +36664,7 @@ void PlaceUnplacedNotes()
         if (it->second.empty() || it->second == "-" || DeletedBitTest(it->first) || g_byWorldId.count(it->first) != 0) continue;
         if (MirrorKeepGated(it->first)) { if (g_mkGatedPlaceKeys.insert(it->first).second) ++g_mkGatedPlace; continue; }   /* T-985 C1: a kept key the world server has not named is not placed (counted once per key) */
         const Record* rp = NoteRecordUsable(it->first); if (rp == 0) continue;
-        if (SwOtherRunner(it->first) >= 0)
+        if (SwOtherOrHeld(it->first) != 0)   /* T-1269: or held until this link's list ends */
         {   /* another live game runs the squad: not placed here (it would hold one of this tick's places for nothing); counted and logged once
                per wait (SwOtherRefuse), the note stays pending and the squad is built when that game lets it go */
             if (g_swBuildWait.count(it->first) == 0) SwOtherRefuse(it->first, 0, "TOWN-NOTE");
@@ -31034,31 +36737,41 @@ void StoreUnbindPlatoon(void* platoon)
     g_bindGenOf.erase(platoon);   /* E23: the stamp goes with the binding here too */
     g_liveHomeOf.erase(platoon); g_roamOf.erase(platoon);   /* T-999 fold 2: the live home read and the template test go with the binding */
     g_unloadEmptied.erase(platoon);   /* T-999 fold 3: and the unload-emptied mark */
+    g_otherRunRemoved.erase(platoon);   /* T-850: and the 'another game runs its people' mark */
+    g_homeBlankSet.erase(platoon);   /* T-1334 fold 1 (review MED 1): a blank listed for this group's "-" write goes with its binding - a later group at this address never writes it */
     HbForget(platoon);   /* E47-S2 exit edge: unbound (spawn.cpp retiring a copy) */
     g_pairBook.Forget(platoon);   /* unbound: it leaves the same-id pair notes */
 }
 
-void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char* from)
+void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char* from, int discard)
 {
     if (coopgrec::IsGroundRecId(worldId)) { coop::GroundRecordGone(worldId, from); return; }   /* T-697 step 2: a ground record's removal leaves the ground table (items.cpp), never the squad path */
     if (piecerec::IsPieceRecId(worldId)) { coop::PieceRecordGone(worldId, from); return; }   /* a piece record's removal leaves the piece table (build.cpp), never the squad path */
     if (coopbrec::IsBoxRecId(worldId)) { coop::BoxRecordGone(worldId, from); return; }   /* T-823: a box record's removal leaves the box table (items.cpp), never the squad path */
     if (shoprec::IsShopRecId(worldId)) return;   /* a shop record is never removed: a removal of one changes nothing here */
-    if (doorrec::IsDoorRecId(worldId)) { coop::DoorRecordGone(worldId); return; }   /* a door record's removal leaves the door table (doors.cpp), never the squad path */
+    if (towntime::IsTownTimeId(worldId)) return;   /* T-4: a town clock record is never removed: a removal of one changes nothing here */
+    if (doorrec::IsDoorRecId(worldId)) { coop::DoorRecordGone(worldId); return; }
+    if (bldgrec::IsBldgRecId(worldId)) { coop::TownBldgRecordGone(worldId); return; }   /* T-1333: a building record's removal leaves the building table (build.cpp) */
+    if (cagerec::IsCageRecId(worldId)) { coop::CageRecordGone(worldId); return; }   /* T-860: a cage record's removal leaves the cage table (spawn.cpp) */   /* a door record's removal leaves the door table (doors.cpp), never the squad path */
     ++g_goneRecv;
     if (EngineWritesBlocked()) StoreNoteRecordArrivedNoWorld("RECORD_GONE");   /* P7f (review-p6z C-1), P7p (review-p7f H-1/M-1): the ARRIVAL detector, on the shared predicate. Not a refusal - the guards below are what make it safe */
     if (!g_dirReady) return;
     std::map<std::string, Record>::iterator it = g_records.find(worldId);
-    if (it != g_records.end() && it->second.writtenAt > stamp) { DebugLog("[STORE] DELETE " + worldId + " older than the record here (" + N(stamp) + " < " + N(it->second.writtenAt) + ") - ignored"); return; }
+    if (it != g_records.end() && sqbirth::GoneIgnoredAsOlder(discard, it->second.writtenAt, stamp) != 0) { DebugLog("[STORE] DELETE " + worldId + " older than the record here (" + N(stamp) + " < " + N(it->second.writtenAt) + ") - ignored"); return; }
     const std::string factionName = it != g_records.end() ? it->second.factionName : std::string();
-    DeleteEntryHere(worldId, false);   /* another game's delete: that game named the town; this game sends no gone for it */
+    /* T-850 D2: A DISCARD IS NOT A DEATH. Another game put its copy away at an area unload (born not kept): the entry, record and mirror
+       file go, but no permanent deleted mark - a living copy of the squad here (another game's people put it away later) is written
+       again at its put-away and is not refused (store.cpp's sleep hook). The discard's own rule (DiscardDeleteSend). A plain or
+       wipe-out delete keeps the mark. */
+    if (sqbirth::GoneSetsDeletedMark(discard) == 0) { DropEntryHere(worldId, false); ++g_goneDiscardRecv; }
+    else DeleteEntryHere(worldId, false);   /* another game's delete: that game named the town; this game sends no gone for it */
     if (g_goneUnsent.count(worldId) == 0) g_goneTown.erase(worldId);   /* a gone of this game's own for the id still waiting to be sent keeps the town it names */
     // a sleeping copy here is removed - the engine's own destroy, under the admin flag so it does not echo a delete
     if (EngineWritesBlocked()) StoreNoteRecordEngineTouchNoWorld("RECORD_GONE");   /* P7p (review-p7f M-1): THE ACCEPTANCE TOKEN, booked here and not at the top - every refusal above this line returns without touching the engine */
     Faction* f = (Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory) && !factionName.empty()) ? FindFactionByKey(factionName) : 0;   /* P7f (review-p6z C-1), site 2 of 5 - this one goes on to call orig_destroyPlatoon */
     void* sl = Plaus(f) ? FindSleepingPlatoonImpl(f, worldId) : 0;
     if (sl != 0) { AdminDestroyBeginImpl(); orig_destroyPlatoon(f, sl); AdminDestroyEndImpl(); ForgetPlatoon(sl); ++g_goneRemovedCopy; }
-    DebugLog("[STORE] DELETE " + worldId + " from " + std::string(from) + " stamp=" + N(stamp) + (sl ? " - sleeping copy removed" : " - no copy here"));
+    DebugLog("[STORE] DELETE " + worldId + " from " + std::string(from) + " stamp=" + N(stamp) + (sl ? " - sleeping copy removed" : " - no copy here") + (discard != 0 ? " (DISCARD: no deleted mark)" : ""));
 }
 /* B12 (decision 52): declared in store.h and called from items.cpp, doors.cpp and this file's own zone
    road. The work is StoreQueueWriteImpl, in the anonymous namespace with the list and the file it keeps. */
@@ -31120,6 +36833,46 @@ bool StoreSendDoorGone(const std::string& id)
     if (!doorrec::IsDoorRecId(id) || !LinkUp()) return false;
     return SendGoneAny(id, (long long)time(0));
 }
+/* T-1333: a town building's record (build.cpp TbSend) as a RECORD at its area's centre. MAIN THREAD. false = not sent (no link); each
+   write's stamp is its own, so two writes in one second never confirm each other */
+bool StoreSendBldgRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut)
+{
+    if (!bldgrec::IsBldgRecId(id) || !LinkUp() || bytes.empty()) return false;
+    static long long s_last = 0;
+    long long stamp = (long long)time(0);
+    if (stamp <= s_last) stamp = s_last + 1;
+    s_last = stamp;
+    if (stampOut != 0) *stampOut = stamp;
+    return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
+}
+/* T-4: a town's clock record (towngen.cpp TtWrite) as a RECORD at the town's position. MAIN THREAD. false = not sent (no link) */
+bool StoreSendTownTimeRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut)
+{
+    if (!towntime::IsTownTimeId(id) || !LinkUp() || bytes.empty()) return false;
+    static long long s_last = 0;   /* each write's stamp is its own (as a cage record's) */
+    long long stamp = (long long)time(0);
+    if (stamp <= s_last) stamp = s_last + 1;
+    s_last = stamp;
+    if (stampOut != 0) *stampOut = stamp;
+    return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
+}
+/* T-1333: a building record's removal (RECORD_GONE) - a town rebuilt for a new version; false = not a building record id, or not sent */
+bool StoreSendBldgGone(const std::string& id)
+{
+    if (!bldgrec::IsBldgRecId(id) || !LinkUp()) return false;
+    return SendGoneAny(id, (long long)time(0));
+}
+/* T-860: a cage's lock record (spawn.cpp CageSend) as a RECORD at its area's centre. MAIN THREAD. false = not sent (no link) */
+bool StoreSendCageRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut)
+{
+    if (!cagerec::IsCageRecId(id) || !LinkUp() || bytes.empty()) return false;
+    static long long s_last = 0;   /* fold 1 (L6): each cage write's stamp is its own - two writes in one second never confirm each other */
+    long long stamp = (long long)time(0);
+    if (stamp <= s_last) stamp = s_last + 1;
+    s_last = stamp;
+    if (stampOut != 0) *stampOut = stamp;
+    return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
+}
 void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, const std::string& factionName,
                        float x, float y, float z, long long writtenAt, int owner, const std::vector<char>& bytes, unsigned recFlags)
 {
@@ -31137,6 +36890,15 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
     /* A DOOR RECORD IS NOT A SQUAD. It is kept in the door table (doors.cpp DoorRecordArrive) and laid on its door when its area's
        records are laid - no file, no squad lookup. */
     if (doorrec::IsDoorRecId(worldId)) { coop::DoorRecordArrive(worldId, bytes); return; }
+    /* T-860: A CAGE RECORD IS NOT A SQUAD. It is kept in the cage table (spawn.cpp CageRecordArrive) and laid on the cage when a
+       caged character is next read in it - no file, no squad lookup. */
+    /* T-1333: A BUILDING RECORD IS NOT A SQUAD. It is kept in the town-building table (build.cpp TownBldgRecordArrive) and laid on its
+       building when its area's records are laid (or at once when they are) - no file, no squad lookup. */
+    if (bldgrec::IsBldgRecId(worldId)) { coop::TownBldgRecordArrive(worldId, bytes); return; }
+    if (cagerec::IsCageRecId(worldId)) { coop::CageRecordArrive(worldId, bytes); return; }
+    /* T-4: A TOWN CLOCK RECORD IS NOT A SQUAD. It is kept in the town clock table (towngen.cpp TownTimeArrive) and read by the town's
+       holder at its check-ups - no file, no squad lookup. */
+    if (towntime::IsTownTimeId(worldId)) { coop::TownTimeArrive(worldId, bytes); return; }
     ++g_recv;
     /* B10-b (review-b10 M-2): the opening push's bookkeeping is NOT here. This function is reached from the
        session peer's link as well as the notebook's, and only the notebook's records may count toward the
@@ -31157,7 +36919,8 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
         if (EngineWritesBlocked()) StoreNoteRecordEngineTouchNoWorld("RECORD position update");   /* P7p (review-p7f M-1): the position-update branch's own first engine touch - the notNewer refusal above returns before it */
         Faction* fac2 = (Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory) && !factionName.empty()) ? FindFactionByKey(factionName) : 0;   /* P7f (review-p6z C-1), site 3 of 5 */
         void* sl = FindSleepingPlatoonImpl(fac2, worldId);
-        if (sl != 0) { SetSleepPosPod(sl, x, y, z, 0); SetSleepPosAllPod(sl, x, y, z); ++g_posUpdatesApplied; }
+        if (sl != 0 && raidsq::SleepPosTakes(OwnRaidHas(sl)) == 0) ::InterlockedIncrement64(&g_ownRaidPosIgnored);   /* T-1122 re-check fold 1: this game's own raid squad - it is its one traveller; another game's position for it never moves it */
+        else if (sl != 0) { SetSleepPosPod(sl, x, y, z, 0); SetSleepPosAllPod(sl, x, y, z); ++g_posUpdatesApplied; }
         else
         {   /* T-1084: no copy here - it was built nowhere while the squad stood in an area this game does not run. Moved into an area
                this game runs, it is built there from its record now (the engine wakes it in the loaded area). */
@@ -31206,6 +36969,8 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
     if (!WriteFileBytes(r.file, bytes)) { ErrorLog("[STORE] RECV could not write " + r.file); return; }
     r.birth = sqbirth::BirthMerge(old != g_records.end() ? old->second.birth : sqbirth::kBirthUnknown, sqbirth::BirthOfFlags(recFlags));   /* the squad's birth flag the record carries; one not carried keeps the one held */
     g_records[worldId] = r;
+    ReturnWaitRecv(worldId);   /* T-1122 RETURN by reference: a RETURN waiting here for this record loads it now (an event: its arrival) */
+    if (!g_lendRecWait.empty()) LendWaitRecv(worldId);   /* T-1122 lend by reference: a LEND waiting here for this record is built at the tick (BorrowDecide asked again there) */
     // apply to a local squad of that id: asleep -> move its sleeping position (the engine wakes it in a loaded zone,
     // and the wake hook loads the record); awake -> the live stream is the truth; unknown -> P1b (addUnloadedSquad)
     std::string what;
@@ -31431,7 +37196,7 @@ void ReportStore()
                 snapshotGone = records the last BEGIN counted that its PAGE_ENDs named as deleted before their page reached them (report only);
                 wholeWithGone = snapshots the world server judged complete (the LAST PAGE_END's complete, T-985 C2b fold 6) with snapshotGone > 0;
                 notComplete = snapshots it judged NOT complete (a cut page, a refused record send, or BEGIN keys no page judged). */
-             + " preload[begun,done,stale,staleLink,staleTimeout,skippedNoLink,abandoned,indexPages,indexRows,wanted,areasFetched,groupsFetched,positions,notNewer,deleted,writeFailed,staleKeys,waitLastMs,waitMaxMs,malformed,answersStale,sendFailed,nonCurrentAreas,nonCurrentGroups,counting,phase,positionOnly,reasked,fetchCuts]=" + PreloadReportValues() + " keptTable[kept,why,read,rejected,noFile,changed,badLines,skipped,written,writeFailed,lastRows,unlisted,bytesReadLoad,bytesReadWrite,verifyMs,offThread,droppedUnnamed,unnamedChanged,droppedDeleted,nameClash,gatedPlace,gatedWake,awaiting,refusedBehind,dropSkipped,refusedUnjudged,gatedKeptHeldBeside]=" + MirrorKeepReportValues() + " beside[movedAsleep]=" + N(g_mkBesideMovedAsleep) + " areaFile[readOk,readMissing,readNotKept,readRefused,refusedWhy,filePlayer,fileLoaded,writtenChange,writtenSave,writtenTeardown,writtenQuit,writeFailed,notReady,emptyLists,measured,liveMissing,liveMissingRing2,fileNotLive,ring2InRecs,ring2InBytes,ring2OutRecs,ring2OutBytes,noAreaRecs,noAreaBytes,noFileRecs,liveRing2InBytes,liveRing2OutBytes,measureMs,fileVersion,fileSavePlayer,fileSaveLoaded,savePlayer,saveLoaded,saveCaptured,saveNotOwn,saveNoLists,saveOffMain,startCaptured,startOverlaid,startNotReady,startNotOwn,quitCaptured]=" + AreaFileReportValues() + " areaFresh[asked,fresh,cant,holderGone,waitMaxMs,waitingNow,writes,writeMaxMs,timeout,reasks,holdNoFile,holdNoStandIn,holdOwners,holdLegacy,fallbackTimeout,fallbackUnheld,fallbackOffMain,holdMaxMs,holdingNow,restoreHooks,restoreReads,groundCalls,groundOutside,spotItems,spotUnknown,spotOutside,restoreOffMain,writesDropped,dropUntold,mapHolds,mapTimeout,noRead,noWorldReads,readOffMain,spotStaleRestores]=" + AreaFreshReportValues()
+             + " preload[begun,done,stale,staleLink,staleTimeout,skippedNoLink,abandoned,indexPages,indexRows,wanted,areasFetched,groupsFetched,positions,notNewer,deleted,writeFailed,staleKeys,waitLastMs,waitMaxMs,malformed,answersStale,sendFailed,nonCurrentAreas,nonCurrentGroups,counting,phase,positionOnly,reasked,fetchCuts]=" + PreloadReportValues() + " keptTable[kept,why,read,rejected,noFile,changed,badLines,skipped,written,writeFailed,lastRows,unlisted,bytesReadLoad,bytesReadWrite,verifyMs,offThread,droppedUnnamed,unnamedChanged,droppedDeleted,nameClash,gatedPlace,gatedWake,awaiting,refusedBehind,dropSkipped,refusedUnjudged,gatedKeptHeldBeside,keptUnreadable]=" + MirrorKeepReportValues() + " beside[movedAsleep]=" + N(g_mkBesideMovedAsleep) + " areaFile[readOk,readMissing,readNotKept,readRefused,refusedWhy,filePlayer,fileLoaded,writtenChange,writtenSave,writtenTeardown,writtenQuit,writeFailed,notReady,emptyLists,measured,liveMissing,liveMissingRing2,fileNotLive,ring2InRecs,ring2InBytes,ring2OutRecs,ring2OutBytes,noAreaRecs,noAreaBytes,noFileRecs,liveRing2InBytes,liveRing2OutBytes,measureMs,fileVersion,fileSavePlayer,fileSaveLoaded,savePlayer,saveLoaded,saveCaptured,saveNotOwn,saveNoLists,saveOffMain,startCaptured,startOverlaid,startNotReady,startNotOwn,quitCaptured]=" + AreaFileReportValues() + " areaFresh[asked,fresh,cant,holderGone,waitMaxMs,waitingNow,writes,writeMaxMs,timeout,reasks,holdNoFile,holdNoStandIn,holdOwners,holdLegacy,fallbackTimeout,fallbackUnheld,fallbackOffMain,holdMaxMs,holdingNow,restoreHooks,restoreReads,groundCalls,groundOutside,spotItems,spotUnknown,spotOutside,restoreOffMain,writesDropped,dropUntold,mapHolds,mapTimeout,noRead,noWorldReads,readOffMain,spotStaleRestores,recordWaits,current,noServer]=" + AreaFreshReportValues()
              + " preAoi[source,listAreas,exchanges,exchangesNoList,rowsIn,rowsOut,rowsNoArea,rowsNoList,wantIn,wantNoArea,wantNoList,wantBytes,skipped,skippedBytes,skippedHeld,fetchedBytes,skippedLoadAreas,skippedLoadGroups,wantByLocal,wantOwn,rowsOwn,ownAreasAdded,staleHoldKept,staleHoldReleased,staleHoldDropped,staleHolding,townWaitArmed,townWaits,townWaitNotWhole,townWaitTimedOut,townWaitRefused,townWaitRefusedTowns,fromLive,fromSave,fromLiveTotal,fromSaveTotal]=" + PreloadAoiReportValues()   /* T-346 slice 1: nonCurrentAreas / nonCurrentGroups must read 0 */
              + " recordFeed[asksFirst,asksNext,offs,begins,pages,ends,endsAgain,pageEndsStale,markersStale,malformed,sendFailed,deferredMarked,expected,snapshotSent,snapshotApplied,paging,heldNotebook,heldNotebookEntries,beginsStale,offRetried,offDropped,seqKeptNewer,snapshotGone,wholeWithGone,notComplete]="
              + N(g_feedAsksFirst) + "," + N(g_feedAsksNext) + "," + N(g_feedOffsSent) + "," + N(g_feedBegins) + "," + N(g_feedPagesIn) + "," + N(g_feedEnds)
@@ -31466,12 +37231,26 @@ void ReportStore()
              + " noteSkip[applied,notNewer,otherKey,notHeld,noRecord,failedBefore,built]=" + N(g_noteSkip[0]) + "," + N(g_noteSkip[1]) + "," + N(g_noteSkip[2]) + "," + N(g_noteSkip[3]) + "," + N(g_noteSkip[4]) + "," + N(g_noteSkip[5]) + "," + N(g_noteSkip[6])
              + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " ownMarkRaise=" + N(g_noteMarkRaised) + " ownRaiseCapped[total,lastScan]=" + N(g_noteRaiseCapped) + "," + N(g_noteRaiseCappedLast) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " blockMove[movedDown,held]=" + N(g_blockMovedDown) + "," + N(g_blockHeld) + " blockRememberedOtherWorld=" + N(g_blockRememberedOtherWorld) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept,alreadyDead]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + "," + N(g_watchAlreadyDead) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
              + " destroyedForgotten=" + N(g_destroyedForgotten) + " recvFoundInList=" + N(g_recvFoundInList) + " recvNotLoadedHere=" + N(g_recvNotLoadedHere) + " recvCacheDisagreed=" + N(g_recvCacheDisagreed)
-             + " | faultSid=" + N(g_faultSid) + " faultSleepPod=" + N(g_faultSleepPod) + " faultSleepContainer=" + N(g_faultSleepContainer) + " faultWakePod=" + N(g_faultWakePod) + " | skippedEmpty=" + N(g_skippedEmpty) + " skippedNotMine=" + N(g_skippedNotMine) + " skippedNoUid=" + N(g_skippedNoUid) + " block[writtenByBlock,skippedOtherBlock]=" + N(g_writtenByBlock) + "," + N(g_skippedOtherBlock) + " skippedPlayerFaction=" + N(g_skippedPlayerFaction) + " skippedStandInRecord=" + N(g_sleepSkippedStandInRecord) + " | ZONE saves=" + N(g_zoneSaves) + " zoneSave[applied,notMine,staleCopyRefused,ownStore,readFail,writeFail,skippedOff,skippedSingle;viaFlush]=" + N(g_zoneWritten) + "," + N(g_zoneSkippedNotMine) + "," + N(g_zoneStaleCopyRefused) + "," + N(g_zoneOwnStore) + "," + N(g_zoneReadFail) + "," + N(g_zoneWriteFail) + "," + N(g_zoneSkippedOff) + "," + N(g_zoneSkippedSingle) + ";" + N(g_zoneSaveViaFlush) + "   (P6q: the first EIGHT are ZoneSaveApply's eight counted exits and sum to ZONE saves= above; viaFlush is a SPAN over all eight, not a ninth bucket - saves counted at entry while the post-teardown flush was running, of which zoneWriteAfterTeardownFlush were written) written=" + N(g_zoneWritten) + " skippedNotMine=" + N(g_zoneSkippedNotMine) + " zoneStaleCopyRefused=" + N(g_zoneStaleCopyRefused) + " zoneKeptAdopted=" + N(g_zoneKeptAdopted) + " zoneStampBumped=" + N(g_zoneStampBumped) + " recvOff=" + N(g_zoneRecvOff) + " loadOk=" + N(g_zoneLoadOk) + " loadFailed=" + N(g_zoneLoadFailed) + " zoneReadOffMain=" + N((long long)g_zoneReadOffMain) + " zoneSwapNoPeerFaction=" + N(g_zoneSwapNoPeerFaction) + " areaStandIns[made,failed]=" + N(g_areaStandInsMade) + "," + N(g_areaStandInsFailed)
-             + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " zoneProvRead[made,madeGood,dropRecord,dropLink,dropTeardown,thrown,waitingNow,readLines,readLinesSuppressed,waitingAtSettle]=" + N(g_zoneProvMade) + "," + N(g_zoneProvGood) + "," + N(g_zoneProvDropRecord) + "," + N(g_zoneProvDropLink) + "," + N(g_zoneProvDropTeardown) + "," + N(g_zoneProvThrown) + "," + N((long long)g_zoneProvRead.size()) + "," + N(g_zoneReadLines) + "," + N(g_zoneReadLinesSuppressed) + "," + N(g_zoneProvWaitAtSettle) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the THREE zoneWr paths are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " zoneRecvHolderTaken=" + N(g_zoneRecvHolderTaken) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)
+             + " | faultSid=" + N(g_faultSid) + " faultSleepPod=" + N(g_faultSleepPod) + " faultSleepContainer=" + N(g_faultSleepContainer) + " faultWakePod=" + N(g_faultWakePod) + " | skippedEmpty=" + N(g_skippedEmpty) + " skippedNotMine=" + N(g_skippedNotMine) + " skippedNoUid=" + N(g_skippedNoUid) + " block[writtenByBlock,skippedOtherBlock]=" + N(g_writtenByBlock) + "," + N(g_skippedOtherBlock) + " skippedPlayerFaction=" + N(g_skippedPlayerFaction) + " skippedStandInRecord=" + N(g_sleepSkippedStandInRecord) + " | ZONE saves=" + N(g_zoneSaves) + " zoneSave[applied,notMine,staleCopyRefused,ownStore,readFail,writeFail,skippedOff,skippedSingle;viaFlush]=" + N(g_zoneWritten) + "," + N(g_zoneSkippedNotMine) + "," + N(g_zoneStaleCopyRefused) + "," + N(g_zoneOwnStore) + "," + N(g_zoneReadFail) + "," + N(g_zoneWriteFail) + "," + N(g_zoneSkippedOff) + "," + N(g_zoneSkippedSingle) + ";" + N(g_zoneSaveViaFlush) + "   (P6q: the first EIGHT are ZoneSaveApply's eight counted exits and sum to ZONE saves= above; viaFlush is a SPAN over all eight, not a ninth bucket - saves counted at entry while the post-teardown flush was running, of which zoneWriteAfterTeardownFlush were written) written=" + N(g_zoneWritten) + " skippedNotMine=" + N(g_zoneSkippedNotMine) + " zoneStaleCopyRefused=" + N(g_zoneStaleCopyRefused) + " zoneKeptAdopted=" + N(g_zoneKeptAdopted) + " zoneUnreadableNotSent=" + N(g_zoneUnreadableNotSent) + " zoneDamageApplied=" + N(g_zoneDamageApplied) + " zoneIndexUnreadable=" + N(g_zoneIndexUnreadable) + " zoneHeldDropped=" + N(g_zoneHeldDropped) + " zoneMirrorUnreadable=" + N(g_zoneMirrorUnreadable) + " zoneHeldSetAside=" + N(g_zoneHeldSetAside) + " zoneStampBumped=" + N(g_zoneStampBumped) + " recvOff=" + N(g_zoneRecvOff) + " loadOk=" + N(g_zoneLoadOk) + " loadFailed=" + N(g_zoneLoadFailed) + " zoneReadOffMain=" + N((long long)g_zoneReadOffMain) + " zoneSwapNoPeerFaction=" + N(g_zoneSwapNoPeerFaction) + " areaStandIns[made,failed]=" + N(g_areaStandInsMade) + "," + N(g_areaStandInsFailed)
+             + " emptyPublished=" + N(g_zoneEmptyPublished) + " emptyServed=" + N((long long)g_zoneEmptyServed) + " emptyOffMainQueued=" + N((long long)g_zoneEmptyOffMainQueued)
+             + " levelSaveReadFail=" + N((long long)g_zoneLevelSaveReadFail) + " savedNotPublished=" + N(g_afSavedNotPublished) + " engineSaveFalse=" + N((long long)g_gdcEngineSaveFalse)
+             + " engineSaveFalseArea=" + N((long long)g_gdcEngineSaveFalseArea) + " pathCopyFail=" + N((long long)g_gdcPathCopyFail)   /* T-1329 */
+             + " emptyRefusedUnread=" + N((long long)g_zoneEmptyRefusedUnread) + " emptyQueuedStale=" + N(g_zoneEmptyQueuedStale)   /* T-1329 fold 1 */
+             + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " zoneProvRead[made,madeGood,dropRecord,dropLink,dropTeardown,thrown,waitingNow,readLines,readLinesSuppressed,waitingAtSettle]=" + N(g_zoneProvMade) + "," + N(g_zoneProvGood) + "," + N(g_zoneProvDropRecord) + "," + N(g_zoneProvDropLink) + "," + N(g_zoneProvDropTeardown) + "," + N(g_zoneProvThrown) + "," + N((long long)g_zoneProvRead.size()) + "," + N(g_zoneReadLines) + "," + N(g_zoneReadLinesSuppressed) + "," + N(g_zoneProvWaitAtSettle) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " wakeHeldNobodyYet=" + N((long long)g_wakeHeldNobodyYet) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the THREE zoneWr paths are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " zoneRecvHolderTaken=" + N(g_zoneRecvHolderTaken) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)
              + " ourCreate=" + N(g_ourCreate) + " keptPersistent=" + N(g_keptPersistent) + " noId=" + N(g_noId) + " saveFailed=" + N(g_saveFailed) + " loadFailed=" + N(g_loadFailed) + " faults=" + N(g_faults)
              + " birth[noted,liveRead,capFull,deadRelease,engine,keptBorn,keptUnknown,keptPlayer,keptOtherHolder,hbBound,discardSent,retired,keptHome,keepOffThread,hbBindIdHeld,discardSharedKept,filled,keptNotRead,homeCached,homeCacheHits,roamCached,roamCacheHits]=" + N((long long)g_birthNoted) + "," + N((long long)g_birthLiveRead) + "," + N((long long)g_birthCapFull)
              + "," + N(g_birthKept[0]) + "," + N(g_birthKept[1]) + "," + N(g_birthKept[2]) + "," + N(g_birthKept[3]) + "," + N(g_birthKept[4]) + "," + N(g_birthKept[5])
-             + "," + N(g_hbBound) + "," + N(g_discardSent) + "," + N(g_retiredAtLoad) + "," + N(g_birthKept[6]) + "," + N((long long)g_keepOffThread) + "," + N(g_hbBindIdHeld) + "," + N(g_discardSharedKept) + "," + N(g_birthFilled) + "," + N(g_birthKept[7]) + "," + N((long long)g_liveHomeOf.size()) + "," + N(g_liveHomeHits) + "," + N((long long)g_roamOf.size()) + "," + N(g_roamHits) + " unloadEmptied[noted,offThread,keptMark,discardByIt,capFull,clearedLiving,held]=" + N(g_unloadEmptiedNoted) + "," + N((long long)g_unloadEmptiedOffThread) + "," + N(g_unloadEmptiedKeptMark) + "," + N(g_unloadEmptiedDiscard) + "," + N(g_unloadEmptiedCapFull) + "," + N(g_unloadEmptiedCleared) + "," + N((long long)g_unloadEmptied.size()) + " noId=" + N(g_noId) + " saveFailed=" + N(g_saveFailed) + " loadFailed=" + N(g_loadFailed) + " faults=" + N(g_faults)
+             + "," + N(g_hbBound) + "," + N(g_discardSent) + "," + N(g_retiredAtLoad) + "," + N(g_birthKept[6]) + "," + N((long long)g_keepOffThread) + "," + N(g_hbBindIdHeld) + "," + N(g_discardSharedKept) + "," + N(g_birthFilled) + "," + N(g_birthKept[7]) + "," + N((long long)g_liveHomeOf.size()) + "," + N(g_liveHomeHits) + "," + N((long long)g_roamOf.size()) + "," + N(g_roamHits) + " unloadEmptied[noted,offThread,keptMark,discardByIt,capFull,clearedLiving,held]=" + N(g_unloadEmptiedNoted) + "," + N((long long)g_unloadEmptiedOffThread) + "," + N(g_unloadEmptiedKeptMark) + "," + N(g_unloadEmptiedDiscard) + "," + N(g_unloadEmptiedCapFull) + "," + N(g_unloadEmptiedCleared) + "," + N((long long)g_unloadEmptied.size())
+             + " otherRun[noted,notedAtGoneDrain,deadSkipped,unbound,capFull,kept,held]=" + N(g_otherRunNoted) + "," + N(g_otherRunNotedDrained) + "," + N(g_otherRunDeadSkipped) + "," + N(g_otherRunUnbound) + "," + N(g_otherRunCapFull) + "," + N(g_otherRunKept) + "," + N((long long)g_otherRunRemoved.size())   /* T-850 */
+             + " keepOtherLoaded=" + N(g_keepOtherLoaded)
+             + " oneKeep[keptAwake,keptAsleep,noGameAwake,noGameAsleep,notTakenAsleep,staleKept,staleEngine,asked,posFallback]=" + N(g_oneKeep[0]) + "," + N(g_oneKeep[1]) + "," + N(g_oneKeep[2]) + "," + N(g_oneKeep[3]) + "," + N(g_oneKeep[4]) + "," + N(g_oneKeep[5]) + "," + N(g_oneKeep[6]) + "," + N(g_oneKeepAsked) + "," + N(g_oneKeepPosFallback)   /* T-1046 fix 2 */
+             + " oneKeepRcv[skippedNoOther,asked]=" + OneKeepRcvToken()   /* T-1046 fix 2 review fold (cost) */
+             + " oneKeepTaken[reads,cached,noRecords,noHand,taken]=" + SleepTakenToken()   /* T-1046 fold 2 */
+             + " otherRunF1[cleared,died,answeredNo,held,heldKept,heldSent,heldRebound,heldNow]=" + N(g_otherRunCleared) + "," + N(g_otherRunDied) + "," + N(g_otherRunAnsweredNo) + "," + N(g_otherRunHeldN) + "," + N(g_otherRunHeldKept) + "," + N(g_otherRunHeldSent) + "," + N(g_otherRunHeldRebound) + "," + N((long long)g_otherRunHeld.size())   /* T-850 fold 1 */
+             + " shellKept[kept,wakeRefused,otherRunner,neverOwn,sameIdPair,diedSent,ownLived,ownLivedCapFull]=" + N(g_shellKept) + "," + N(g_shellWake) + "," + N(g_shellOther) + "," + N(g_shellNeverOwn)
+             + "," + N(g_shellPair) + "," + N(g_shellDiedSent) + "," + N((long long)g_ownLivedHere.size()) + "," + N(g_ownLivedCapFull)   /* T-850 fold 2 */
+             + " goneDiscard[recvNoMark,dropNoMark]=" + N(g_goneDiscardRecv) + "," + N(g_goneDiscardBitSkipped)   /* T-850 D2 */
+             + " noId=" + N(g_noId) + " saveFailed=" + N(g_saveFailed) + " loadFailed=" + N(g_loadFailed) + " faults=" + N(g_faults)
              + " | T296 state[created0x22,createRefused,createOdd,copyFaults,stray,tracked,trackedWakes,trackedOurs,trackedChanged,trackedOutside,scanned,scanFaults,inside,moved,moveFailed,outside,reloadRefused,after[outside,inside,moved,faults],forgotten]=" + N(g_stCreated22) + "," + N(g_stCreateRefused) + "," + N(g_stCreateOdd) + "," + N(g_stCopyFaults) + "," + N(g_stStray) + "," + N((long long)g_stCreated.size()) + "," + N(g_stTrackedWakes) + "," + N(g_stTrackedOurs) + "," + N(g_stTrackedChanged) + "," + N(g_stTrackedOutside) + "," + N(g_stScanned) + "," + N(g_stScanFaults) + "," + N(g_stInside) + "," + N(g_stMoved) + "," + N(g_stMoveFailed) + "," + N(g_stOutside) + "," + N(g_stReloadRefused) + ",[" + N(g_stAfterOutside) + "," + N(g_stAfterInside) + "," + N(g_stAfterMoved) + "," + N(g_stAfterFaults) + "]," + N(g_stForgotten) + " createPos[set,setFault,agree,odd]=" + N(g_stCreatePosSet) + "," + N(g_stCreatePosFault) + "," + N(g_stCreatePosAgree) + "," + N(g_stCreatePosOdd)
              + " | B10 canonWriteAttempted=" + N(g_canonWriteAttempted) + " indexReadOnly=1"
              + "   (audit C8: canonWriteAttempted is a TRIPWIRE ON A DELETED RULE and MUST read 0 - it is not F172's silent zero; indexReadOnly says this game READS the notebook's folder and never owns it)"
@@ -31479,6 +37258,10 @@ void ReportStore()
              + "   (audit C9: the six are EXCLUSIVE and sum to the sleeps that reached the rule; noSlotNoMember is C9's named residual - the link-up-to-WELCOME window in which nobody writes the group - and must be QUOTED, never assumed zero)"
              + " offscreen[ranAuthority,ranSingle,skippedNoNotebook,skippedNotAuthority]=" + N(g_offscreenRanAuthority) + "," + N(g_offscreenRanSingle) + "," + N(g_offscreenSkippedNoNotebook) + "," + N(g_offscreenSkippedNotAuthority)
              + "   (audit C10/C14: skippedNoNotebook is how much of this run the world spent with nobody moving the sleeping squads - decision 44 says that must not happen and nothing measured it before)"
+             + " ownRaid[noted,sweepNoted,noSleeper,awake,capFull,replaced,travelled,sectorSteps,woke,freed,stale,notListed,posSkipped,sweeps,rows]=" + N(g_ownRaidNoted) + "," + N(g_ownRaidSweepNoted) + "," + N(g_ownRaidNoSleeper) + "," + N(g_ownRaidAwake) + "," + N(g_ownRaidCapFull) + "," + N(g_ownRaidReplaced) + "," + N(g_ownRaidTravelled) + "," + N(g_ownRaidSteps) + "," + N(g_ownRaidWoke) + "," + N(g_ownRaidFreed) + "," + N(g_ownRaidStale) + "," + N(g_ownRaidNotListed) + "," + N(g_ownRaidPosSkipped) + "," + N(g_ownRaidSweeps) + "," + N((long long)g_ownRaidCount)
+             + " ownRaidAwake[noted,posIgnored]=" + N(g_ownRaidAwakeNoted) + "," + N(g_ownRaidPosIgnored)   /* T-1122 re-check folds 7 / 1 */
+             + " ownRaidHeld[stops,squads,seconds,heldNow]=" + OwnRaidHeldFigures() + RaidLendReportToken()
+             + "   (T-1122 own raid squads, fold b: travelled counts the off-screen updates this game ran for them; noSleeper / awake / capFull are squads not noted - on the authority they travel as ordinary sleeping squads, elsewhere nothing moves them until a sweep notes them; ownRaidHeld times the stops at another game's area)"
              + " owner[fieldSlot,fieldUnknown,noRecord,translatedUnknown,translatedOther,skippedOwn]=" + N(g_ownerFieldSlot) + "," + N(g_ownerFieldUnknown) + "," + N(g_ownerNoRecord) + "," + N(g_ownerTranslatedUnknown) + "," + N(g_ownerTranslatedOther) + "," + N(g_ownerSkippedOwn)
              + "   (audit C13: fieldSlot+fieldUnknown is every read of this game's own owner field; the last four are detour_gdcLoad's four exits and sum to its zone loads. THE PARITY VERDICT: on the game that did NOT write a zone record, translatedOther >= 1 and skippedOwn = 0 for that zone, and the mirror of that on the writer)"
              + " storeRedial[attempts,linkedAfterRedial,connectGaveUp,handshakeStalled]=" + N(g_redialAttempts) + "," + N(g_redialLinkedAfter) + "," + N(g_redialConnectGaveUp) + "," + N(g_redialHandshakeStalled) + "   (B12-e / B12-f / T238: attempts has NO cap - a notebook away for an hour reads about 720 here, which is one connect per 5 s and is the intended cost. linkedAfterRedial counts outages that ended in a WELCOME, not in a socket edge, so attempts > 0 with linkedAfterRedial 0 is a notebook that never came back. connectGaveUp is connects abandoned after " + N((long long)kStoreConnectBudgetMs) + " ms, handshakeStalled is sockets that came UP and never sent a WELCOME inside " + N((long long)kStoreWelcomeBudgetMs) + " ms; both are aborted rather than waited on, and neither prints a line.)"
@@ -31496,7 +37279,7 @@ void ReportStore()
                + "," + N(g_storeAuthExtra) + "," + N(g_storeDoorLoginSent) + "," + N(g_storeLoginRemembered) + "," + N(g_storeLoginRememberFailed) + "," + N(g_storeLoginForgotten)
              + " storeProto[mismatch,ignoredMessages]=" + N((long long)(g_storeProtoMismatch ? 1 : 0)) + "," + N(g_storeMismatchIgnored)
              + " u8AnsiFallback=" + N((long long)g_u8AnsiFallback)   /* paths read in the ANSI code page because they were not UTF-8 (u8file.h) */
-             + coop::BoxRecordReport() + StoreSendBoundToken() + StoreBundleToken() + LinkKeepToken() + OriginReport() + SwReportToken() + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)");
+             + coop::BoxRecordReport() + StoreSendBoundToken() + StoreBundleToken() + LinkKeepToken() + OriginReport() + SwReportToken() + coopstore::FileLockedToken() /* T-1280 */ + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)");
     ReportClockLines();   /* E40 / decision 45: the [TIME] and [WEATHER] lines, on BOTH games, at every report */
     HbReportLine();   /* E47-S2: the [SAVE] hb[...] line at every report */
     const std::string q(1, (char)34);
@@ -31710,6 +37493,61 @@ void StoreForgetRunnerWithdrew(const std::string& worldId)
 }
 namespace coop { int StoreRetireLocalCopy(void* platoon) { AdminDestroyBeginImpl(); const int rc = StoreRetireLocalCopyImpl(platoon); AdminDestroyEndImpl(); return rc; } }   /* P4e: the retire pair is admin, not "gone" */
 namespace coop { int StorePlatoonBound(void* platoon) { return g_bind.find(platoon) != g_bind.end() ? 1 : 0; } }   /* a bound squad is answered 'persistent' (detour_isPersistent) */
+/* T-850 (T2230; store.h): handoff.cpp's XFER ACK passed `released` of squad `id`'s people to the game in toSlot and kept `kept` here. The
+   hand-over sends no release, and the world server moves a squad's writer only on one from the writing game - so the release road that
+   exists runs now, at this event (sqwreg::HandOverStep): a copy filed in the heartbeat gets the heartbeat's own writer re-check (HbRegister:
+   another game runs a strict majority of the living people -> the entry is marked another game's, so no heartbeat writes it again, and
+   SwRunnerSeen releases it); a squad with no awake copy left (asleep or destroyed: both forget the heartbeat entry) is released by the same
+   rule from its id and record, the receiver as the runner. Nothing new goes on the wire: a SQUAD_RELEASE, which the world server takes only
+   from the registered writer. One line per squad (the first 200), counted on the squadWriter REPORT line. MAIN THREAD (the message drain). */
+namespace coop { void StoreHandOverJudge(const std::string& id, int toSlot, long long released, long long kept)
+{
+    if (id.empty() || !OnMainThread()) return;
+    ++g_hoRelSeen;
+    std::set<void*> plats;   /* this game's copies of the squad: the id map's, and any bound to the id (as HbMarkCopyChanged reads them) */
+    { const std::map<std::string, void*>::const_iterator w = g_byWorldId.find(id); if (w != g_byWorldId.end()) plats.insert(w->second); }
+    for (std::map<void*, std::string>::const_iterator b = g_bind.begin(); b != g_bind.end(); ++b) if (b->second == id) plats.insert(b->first);
+    std::vector<void*> filed; int awakeUnfiled = 0;
+    for (std::set<void*>::const_iterator c = plats.begin(); c != plats.end(); ++c)
+    {
+        if (g_hb.find(*c) != g_hb.end()) { filed.push_back(*c); continue; }
+        Pod q; if (Plaus(*c) && ReadPod(*c, &q) && Plaus(q.active) && q.activeChars > 0) awakeUnfiled = 1;
+    }
+    const int step = sqwreg::HandOverStep(released > 0 ? 1 : 0, kept > 0 ? 1 : 0, filed.empty() ? 0 : 1, awakeUnfiled);
+    const long long sentWas = g_swReleaseSent; const size_t unsentWas = g_swReleaseUnsent.size();
+    int runner = toSlot, allWereForeign = 1, anyForeignNow = 0;
+    if (step == sqwreg::kHandRejudge)
+    {
+        int living = 0, runHere = 0, topSlot = -1, topN = 0;
+        runner = HbRunnerOfPlatoon(filed[0], &living, &runHere, &topSlot, &topN);   /* for the line: the read HbRegister makes next */
+        for (size_t i = 0; i < filed.size(); ++i)
+        {
+            std::map<void*, HbEntry>::const_iterator h = g_hb.find(filed[i]);
+            if (h != g_hb.end() && h->second.foreign == 0) allWereForeign = 0;
+            HbRegister(filed[i]);   /* the heartbeat's own writer re-check, as DeathWatchTick's visit makes it */
+            h = g_hb.find(filed[i]);
+            if (h != g_hb.end() && h->second.foreign != 0) anyForeignNow = 1;
+        }
+    }
+    else if (step == sqwreg::kHandByRecord)
+    {
+        const std::map<std::string, Record>::const_iterator rt = g_records.find(id);
+        Faction* f = (rt != g_records.end() && Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory) && !rt->second.factionName.empty()) ? FindFactionByKey(rt->second.factionName) : 0;
+        SwRunnerSeen(id, f, toSlot, 0);   /* the runner rule's release: no written record here, a refused squad or a player's squad -> none */
+    }
+    std::string what;
+    if (g_swReleaseSent != sentWas) { ++g_hoRelSent; what = "release sent"; }
+    else if (g_swReleaseUnsent.size() != unsentWas) { ++g_hoRelOwed; what = "release owed - the link is down, sent at the relink"; }
+    else if (step == sqwreg::kHandRejudge && allWereForeign != 0) { ++g_hoRelAlready; what = "already released - the heartbeat had marked it another game's (or it never was this game's)"; }
+    else if (step == sqwreg::kHandRejudge && anyForeignNow == 0) { ++g_hoRelKept; what = runner == g_mySlot ? "kept - this game still runs most of its people" : "kept - no game runs a strict majority of its living people (a split): this game writes it"; }
+    else if (step == sqwreg::kHandNone && kept > 0) { ++g_hoRelKept; what = "kept - the ACK left " + N(kept) + " of the hand-over's people here and no awake copy reads who runs the rest"; }
+    else { ++g_hoRelNotMine; what = step == sqwreg::kHandNone ? "not this game's - an awake copy the heartbeat does not file" : "not this game's - no written record here, refused here, or not a world NPC squad"; }
+    if (g_hoRelLines >= 200) return;
+    ++g_hoRelLines;
+    DebugLog("[STORE] hand-over released " + id + " -> runner slot " + N((long long)runner) + " (" + what + "; " + N(released) + " of its people passed to slot " + N((long long)toSlot)
+             + ", " + (step == sqwreg::kHandRejudge ? std::string("the heartbeat's writer re-check ran") : (step == sqwreg::kHandByRecord ? std::string("no awake copy here: released by its record") : std::string("no re-check")))
+             + "; handOverRel seen " + N(g_hoRelSeen) + ", the first 200 logged)");
+} }
 #ifdef SW_DEV_BUILD
 // PROBE-START: P172 (T-948, T1516) - the roster's squad fields. sq = the id this store names the squad by (WorldIdOf: the bind map's
 // id for a bound squad, else the engine's own Platoon+0x78 - the [SQSPLIT] lines' naming). sqRow = the registry's verdict from its own
@@ -31758,6 +37596,31 @@ void StoreNoteUnloadEmptied(void* platoon, int offThread)
     if (g_unloadEmptied.count(platoon) != 0) return;
     if (g_unloadEmptied.size() >= kUnloadEmptiedCap) { ++g_unloadEmptiedCapFull; return; }
     g_unloadEmptied.insert(platoon); ++g_unloadEmptiedNoted;
+}
+/* T-850 (store.h): spawn.cpp's UNLOAD removal of a character notes the character's squad when the character is another game's puppet
+   here (runElsewhere - who runs it now) and was read alive (deadRead 0): the squad's destroy keeps the record (sqbirth::DestroyDeleteRun).
+   `platoon` was read at the removal's hook while the object was whole (an off-thread removal carries it to the main thread's drain; the
+   set is keyed by address and only ever looked up, never dereferenced). Bound squads only. MAIN THREAD. */
+void StoreNoteOtherRunRemoved(void* platoon, unsigned int uid, int kind, int deadRead)
+{
+    if (!OnMainThread() || kind == sqbirth::kLostNone || uid == 0) return;
+    if (sqbirth::OtherRunRemovedMark(1, 1, deadRead) == 0) { ++g_otherRunDeadSkipped; return; }   /* a dead (or unread) copy's body: no keep - a dead squad's record must not stay */
+    if (platoon == 0 || g_bind.find(platoon) == g_bind.end()) { ++g_otherRunUnbound; return; }
+    std::map<void*, std::map<unsigned int, int> >::iterator it = g_otherRunRemoved.find(platoon);
+    if (it == g_otherRunRemoved.end() && g_otherRunRemoved.size() >= kOtherRunRemovedCap) { ++g_otherRunCapFull; return; }
+    std::map<unsigned int, int>& notes = g_otherRunRemoved[platoon];
+    if (notes.size() >= 512) { ++g_otherRunCapFull; return; }
+    notes[uid] = kind; ++g_otherRunNoted;
+    g_otherRunDead.erase(uid);   /* living at this note: an older DESPAWN of the uid does not answer for it */
+}
+/* T-850 fold 1b (store.h): handoff.cpp's release end of uid - the held deletes naming it are decided now */
+void StoreRunHeldSettle(unsigned int uid) { if (OnMainThread()) RunHeldSettle(uid); }
+/* T-850 fold 1 (store.h): the runner of a copy said it died (a DESPAWN, not an UNLOAD) - a squad's note of it answers 'not run elsewhere'. */
+void StoreOtherRunDied(unsigned int uid)
+{
+    if (!OnMainThread() || uid == 0) return;
+    if (g_otherRunDead.size() >= 65536) return;
+    if (g_otherRunDead.insert(uid).second) ++g_otherRunDied;
 }
 }
 namespace coop {
@@ -31834,6 +37697,23 @@ static int CnTownTypePod(void* town, int* type)
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1243 TEST-ONLY lever `zonedamage <zone id> before|after <offset> <length>` (src/common/zonecheck.h): arms the NEXT send of that area
+   record by this game to have <length> bytes from <offset> set to zero - `before` ahead of this game's own check (ZoneSaveApply, which
+   must refuse it), `after` behind it on the copy sent only (the world server's check must refuse it). One use per arming; a new arming
+   replaces one not yet used. Logged when armed and when applied ([ZONEDAMAGE]). T-1243 (owner 1523): `mirror` arms this game's next
+   mirror write of that area record instead - its mirror FILE is damaged after the write and the send (ZoneDamageMirrorMaybe). MAIN THREAD. */
+std::string ZoneDamageLever(const std::string& args)
+{
+    zonecheck::DamageArm a;
+    if (zonecheck::ParseDamage(args, &a) == 0) return zonecheck::UsageReply();
+    if (!OnMainThread()) return "error zonedamage: not on the main thread";
+    const bool replaced = g_zoneDamage.when != zonecheck::kDamageNone;
+    g_zoneDamage = a;
+    const std::string reply = zonecheck::ArmReply(a);
+    DebugLog("[ZONEDAMAGE] " + reply.substr(3) + (a.when == zonecheck::kDamageMirror ? std::string(" - this game's next mirror write of that area record (its mirror FILE, after the send; the kept table follows)")
+                                                                                  : std::string(" - the next send of that area record by this game")) + (replaced ? std::string(" (replaces an arming not yet used)") : std::string()) + " (TEST-ONLY)");
+    return reply;
 }
 /* T1692: another player's character this game knows (its copy here), as a second sweep centre for `here` */
 struct CnCentre { float x; float z; unsigned int uid; };
@@ -32236,7 +38116,7 @@ bool KillNamed(const std::string& needleIn)
 }
 namespace coop {
 // decision 32: my loaded areas go to the relay (StoreTick, 1 Hz, when the relay link is up)
-bool StoreSendAreas(const int* xy, int count, const int* playerXY, int playerCount)
+bool StoreSendAreas(const int* xy, int count, const int* playerXY, int playerCount, int loading)
 {
     if (!LinkUp() || count < 0 || count > 4096) return false;
     JoinInWorldOwed("before its AREAS");   /* S1 fold (review L4): a world-road game's owed IN_WORLD goes ahead of its AREAS */
@@ -32245,6 +38125,7 @@ bool StoreSendAreas(const int* xy, int count, const int* playerXY, int playerCou
        hands every game the whole set once a second, which is the answer to "where are the other players" that does not go dark while
        a game's areas load. playerCount 0 says "not known" and the world server drops this game's rows. */
     coopdrop::AreasPutPlayerSectors(&b, playerXY, playerCount);
+    coopdrop::AreasPutFlags(&b, loading != 0 ? coopdrop::kAreasFlagLoading : 0u);   /* decision 1556 (protocol 148): the loading mark - the world server changes no listing or holder on it */
     /* PROBE P142 BEGIN */ long long p142Packets = 0, p142Bytes = 0; const bool p142Known = g_link->SendQueued(&p142Packets, &p142Bytes); /* PROBE P142 END */
     if (!g_link->Send(0, (net::MsgType)kStoreMsgAreas, &b[0], b.size(), net::CH_RELIABLE)) return false;
     /* PROBE P142 BEGIN */ P142AreasSent(xy, count, p142Packets, p142Bytes, p142Known); /* PROBE P142 END */
@@ -33424,6 +39305,67 @@ void GameSpeedSweepTick()
     g_gsSweep.cur += g_gsSweep.step; g_gsSweep.next += g_gsSweep.every;
     if (g_gsSweep.step > 0.0f ? g_gsSweep.cur > g_gsSweep.to + 0.0001f : g_gsSweep.cur < g_gsSweep.to - 0.0001f) g_gsSweep.on = 0;
 }
+/* T-1183 TEST-ONLY lever (owner decision 1494): `timeskip <hours>` | `timeskip show`. THE ROAD: the join jump's own write set,
+   ClockJoinSetPod - the engine's load-path clock restore 0x66D0C0 (Clock::restore, which SaveManager::loadGame calls) copied
+   line for line: day, the controller's hours float, the derived-state virtual, the zeroed vector and both stamps clock+0xA0 /
+   +0xA8. It is the one writer here that carries the day across midnight; every deadline (duration tasks, slave-state stamps,
+   the hour schedules) compares against clock+0xA0, so they all see the new time (Read, the E40 block above).
+   IN STEP: the line goes to EACH game (BOTH); each jumps by the same hours. The world server's shared clock is not written: it
+   follows by its own bounded forward pull from the games' ordinary clock reports (5 in-game minutes a pass), and meanwhile each
+   game is AHEAD of it, which ClockDecide never writes back. coopclock::TimeSkipDecide refuses a skip that would leave this game
+   more than 22 in-game hours ahead of the shared clock (the server refuses to follow past 24). Forward only. Main thread. */
+std::string TimeSkipClockText(const char* tag, int day, float hod, double abs)
+{
+    char b[160];
+    const int hh = (int)hod, mm = (int)((hod - (float)hh) * 60.0f);
+    _snprintf(b, sizeof(b) - 1, " %s[day=%d %02d:%02d abs=%.3f]", tag, day, hh, mm, abs);
+    b[sizeof(b) - 1] = 0;
+    return std::string(b);
+}
+std::string TimeSkipTestCommand(const std::string& arg)
+{
+    std::string w = arg;
+    while (!w.empty() && (w[0] == ' ' || w[0] == '\t')) w.erase(0, 1);
+    while (!w.empty() && (w[w.size() - 1] == ' ' || w[w.size() - 1] == '\t' || w[w.size() - 1] == '\r')) w.erase(w.size() - 1);
+    if (w.empty()) return "error timeskip: <hours above 0, at most 22> | show";
+    const double srv = ClockSharedHoursNow();
+    const std::string srvText = (srv >= 0.0) ? TimeSkipClockText("shared", (int)(srv / 24.0), (float)(srv - (double)(int)(srv / 24.0) * 24.0), srv)
+                                             : std::string(" shared[none]");
+    ClockPod c;
+    const int live = (g_clkBase != 0) ? ClockWorldLive() : 0;
+    const int have = (live && ReadClockPod(g_clkBase, &c)) ? 1 : 0;
+    const std::string beforeText = have ? TimeSkipClockText("before", c.day, c.hoursIntoDay, c.abs) : std::string(" before[no world clock]");
+    if (w == "show")
+    {
+        DebugLog("[TIME] T-1183 timeskip show:" + beforeText + srvText + " aheadOfShared=" + (have && srv >= 0.0 ? F1((float)(c.abs - srv)) : std::string("-"))
+                 + "h joinJumpOwed=" + N((long long)g_joinJumpOwed) + " worldLive=" + N((long long)live) + " - TEST-ONLY read");
+        return "ok timeskip show" + beforeText + srvText;
+    }
+    const double hours = atof(w.c_str());
+    const double localAbs = have ? (((double)c.day * 24.0 + (double)c.hoursIntoDay) > c.abs ? ((double)c.day * 24.0 + (double)c.hoursIntoDay) : c.abs) : -1.0;
+    double target = -1.0; int day = -1; float hod = -1.0f;
+    const int v = coopclock::TimeSkipDecide(localAbs, srv, g_joinJumpOwed, hours, coopclock::kTimeSkipMaxAheadHours, &target, &day, &hod);
+    if (v != coopclock::kSkipOk)
+    {
+        DebugLog("[TIME] T-1183 timeskip REFUSED hours=" + w + ": " + coopclock::TimeSkipVerdictName(v) + beforeText + srvText + " - nothing written");
+        return std::string("error timeskip: ") + coopclock::TimeSkipVerdictName(v);
+    }
+    int usedVt = 0;
+    if (!ClockJoinSetPod(c.clock, c.controller, day, hod, g_clkBase, g_clkImageSize, &usedVt))
+    {
+        DebugLog("[TIME] T-1183 timeskip FAILED hours=" + w + ": the clock write faulted" + beforeText + srvText);
+        return "error timeskip: the clock write faulted";
+    }
+    ClockPod a;
+    const int haveAfter = ReadClockPod(g_clkBase, &a);
+    /* the next clock pass measures the engine's own advance from here, not the skip */
+    if (haveAfter) { g_prevLocalAbs = a.abs; g_prevLocalAbsEpoch = g_worldEpoch; }
+    const std::string afterText = haveAfter ? TimeSkipClockText("after", a.day, a.hoursIntoDay, a.abs) : std::string(" after[unread]");
+    DebugLog("[TIME] T-1183 timeskip DONE hours=" + w + beforeText + afterText + srvText
+             + " road=the load-path clock restore 0x66D0C0's write set (ClockJoinSetPod), virtual " + (usedVt ? "made" : "SKIPPED")
+             + " - TEST-ONLY; the world server's clock follows by its bounded pull, this game stays ahead of it meanwhile");
+    return "ok timeskip " + w + beforeText + afterText + srvText;
+}
 bool StoreSendOption(const std::string& key, const std::string& value)
 {
     if (!LinkUp() || key.empty() || key.size() > 256 || value.size() > 256) return false;
@@ -33535,6 +39477,7 @@ int StoreHomeClearForBuilding(const char* buildingKey)
         if (it->second.empty() || coopstore::MetaHomeIsCleared(it->second)) continue;
         if (it->second != buildingKey && BoxKeyNearKey(it->second.c_str(), buildingKey) == 0) continue;
         g_homeClearedFrom[it->first] = it->second;
+        g_homeClearedBy.erase(it->first);   /* T-1334 fold 1: a purchase's clear - no game may name the house again (unchanged rule) */
         it->second = coopstore::kMetaHomeCleared;
         ++n;
     }
@@ -33737,13 +39680,105 @@ int StoreBuildingPeoplePending(const char* townSid, const char* buildingKey, voi
    no member of it were in the world and its platoon stood at 0,0, so a run can watch the record take a known position
    (RecordPosChoose); storetest nopos next arms the next SLEEP write of any group. An exact worldId wins; else the first record here (in worldId order) whose id contains the text, else the
    first group bound here. storetest nopos off disarms. [STORE] storetest lines. */
+/* T-1334 TEST-ONLY (owner 1616 a, run T2331; DEV build only): `storetest home show|drop <buildingKey>` / `storetest home move <buildingKey>
+   <toBuildingKey>` (common/hometest.h). The group is the one the building's residents hand names on this game (towngen.cpp
+   TownGenResidentGroupOf). show reads it: its world id (g_bind), its live home key (TownGenPlatoonHomeKey) and this game's record home
+   entry for that id (g_homeOf - the key its next record carries), and the same for the group this lever named last on this game (kept
+   across a load, so a group the building no longer names is still read). drop: the ENGINE's Ownerships::removeOwnedObject 0x7EB550 with
+   the building's handle (build.cpp BuildHomeDropPod - the purchase's own first step, which blanks the home when it names the building).
+   move: the ENGINE's Ownerships::setHomeBuilding 0x7EBE40 with the other building, through its hooked entry (spawn.cpp
+   PlatoonSetHomeBuildingEnginePod) as the engine calls it. Neither writes a field itself nor touches the mod's records. One [STORE]
+   storetest home line per use. MAIN THREAD (the command channel). */
+#ifdef SW_DEV_BUILD   /* T-1334: the lever's helpers - the DEV build only */
+std::string g_homeTestId;   /* the world id this lever named last on this game */
+static std::string HomeTestLive(void* platoon)
+{
+    if (platoon == 0) return "nogroup";
+    char hk[128]; hk[0] = 0;
+    const int hr = TownGenPlatoonHomeKey(platoon, hk, 128);
+    return hr == 1 ? std::string(hk) : (hr == 0 ? std::string("none") : std::string("unread"));
+}
+static std::string HomeTestRec(const std::string& worldId)
+{
+    if (worldId.empty()) return "noid";
+    const std::map<std::string, std::string>::const_iterator it = g_homeOf.find(worldId);
+    if (it == g_homeOf.end()) return "noentry";
+    std::string r = it->second.empty() ? std::string("empty") : it->second;
+    const std::map<std::string, std::string>::const_iterator cf = g_homeClearedFrom.find(worldId);
+    if (cf != g_homeClearedFrom.end()) r += "(clearedFrom " + cf->second + ")";
+    return r;
+}
+static void* HomeTestBound(const std::string& worldId)
+{
+    if (worldId.empty()) return 0;
+    for (std::map<void*, std::string>::const_iterator bi = g_bind.begin(); bi != g_bind.end(); ++bi) if (bi->second == worldId) return bi->first;
+    return 0;
+}
+#endif   /* SW_DEV_BUILD - T-1334 helpers */
+std::string StoreHomeTestCommand(const std::string& args)
+{
+#ifndef SW_DEV_BUILD
+    (void)args;
+    return "error storetest home: DEV build only";
+#else
+    std::string key, to;
+    const int op = swhometest::Parse(args, &key, &to);
+    if (op == swhometest::kBad) return swhometest::Usage();
+    if (!OnMainThread()) return "error storetest home: not on the main thread";
+    if (op != swhometest::kShow && EngineWritesBlocked()) return "error storetest home: engine writes blocked (a load or a teardown)";
+    void* const b = ObjectByPositionKey(key.c_str());
+    void* p = b != 0 ? TownGenResidentGroupOf(b) : 0;
+    std::map<void*, std::string>::const_iterator bi = p != 0 ? g_bind.find(p) : g_bind.end();
+    const std::string id = bi != g_bind.end() ? bi->second : std::string();
+    if (!id.empty()) g_homeTestId = id;
+    std::string out;
+    if (op == swhometest::kShow)
+    {
+        long long homedHere = 0;
+        for (std::map<std::string, std::string>::const_iterator it = g_homeOf.begin(); it != g_homeOf.end(); ++it) if (it->second == key) ++homedHere;
+        void* const lp = HomeTestBound(g_homeTestId);
+        out = "ok storetest home show building=" + key + (b == 0 ? std::string(" NOT LOADED here") : (" residentSquad=" + std::string(p != 0 ? "SET" : "none")))
+            + " group=" + (p == 0 ? std::string("-") : (id.empty() ? std::string("unbound") : id)) + " liveHome=" + HomeTestLive(p) + " recordHome=" + HomeTestRec(id)
+            + " recordsHomedHere=" + N(homedHere) + " | lastNamed=" + (g_homeTestId.empty() ? std::string("-") : g_homeTestId)
+            + " lastLiveHome=" + (lp != 0 ? HomeTestLive(lp) : std::string("notBoundHere")) + " lastRecordHome=" + HomeTestRec(g_homeTestId);
+    }
+    else if (b == 0) out = "error storetest home " + std::string(op == swhometest::kDrop ? "drop" : "move") + ": building not loaded here: " + key;
+    else if (p == 0) out = "error storetest home " + std::string(op == swhometest::kDrop ? "drop" : "move") + ": the building's residents hand names no group here: " + key;
+    else if (op == swhometest::kDrop)
+    {
+        const std::string before = HomeTestLive(p);
+        const int rc = BuildHomeDropPod(p, b);
+        out = std::string(rc == 1 ? "ok" : "error") + " storetest home drop building=" + key + " group=" + (id.empty() ? std::string("unbound") : id) + " liveHome " + before
+            + " -> " + HomeTestLive(p) + " recordHome=" + HomeTestRec(id) + " (the engine's Ownerships::removeOwnedObject 0x7EB550; rc=" + N((long long)rc) + ")";
+    }
+    else
+    {
+        void* const b2 = ObjectByPositionKey(to.c_str());
+        if (b2 == 0) out = "error storetest home move: target building not loaded here: " + to;
+        else
+        {
+            const std::string before = HomeTestLive(p);
+            void* const was2 = TownGenResidentGroupOf(b2);
+            const int rc = PlatoonSetHomeBuildingEnginePod(p, b2);
+            void* const now2 = TownGenResidentGroupOf(b2);
+            out = std::string(rc == 1 ? "ok" : "error") + " storetest home move building=" + key + " group=" + (id.empty() ? std::string("unbound") : id) + " liveHome " + before
+                + " -> " + HomeTestLive(p) + " target=" + to + " targetResidents " + (was2 == 0 ? "none" : (was2 == p ? "this" : "other")) + " -> "
+                + (now2 == 0 ? "none" : (now2 == p ? "this" : "other")) + " recordHome=" + HomeTestRec(id) + " (the engine's Ownerships::setHomeBuilding 0x7EBE40, hooked entry; rc="
+                + N((long long)rc) + ") " + coop::HomeWatchReport();
+        }
+    }
+    DebugLog("[STORE] storetest home: " + out);
+    return out;
+#endif
+}
 std::string StoreTestCommand(const std::string& arg)
 {
     const size_t sp = arg.find(' ');
     const std::string op = sp == std::string::npos ? arg : arg.substr(0, sp);
     std::string rest = sp == std::string::npos ? std::string() : arg.substr(sp + 1);
     while (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
-    if (op != "nopos" || rest.empty()) return "error storetest usage: storetest nopos <worldId or part of one> | storetest nopos off";
+    if (op == "home") return StoreHomeTestCommand(rest);   /* T-1334 TEST-ONLY (DEV build) */
+    if (op != "nopos" || rest.empty()) return "error storetest usage: storetest nopos <worldId or part of one> | storetest nopos off | storetest home show|drop|move ... (DEV build)";
     if (rest == "off") { g_recPosNoPosArmed.clear(); DebugLog("[STORE] storetest nopos off: nothing armed"); return "ok storetest nopos off"; }
     if (rest == "next") { g_recPosNoPosArmed = "*"; DebugLog("[STORE] storetest nopos armed for the next SLEEP write of any group"); return "ok storetest nopos armed for the next SLEEP write"; }
     std::string found;
@@ -34024,6 +40059,13 @@ namespace coop { int StoreShowPlayerLine(const std::string& line) { std::string 
 namespace coop { int StoreGameDay() { ClockPod c; return (g_clkBase != 0 && ReadClockPod(g_clkBase, &c) && c.day >= 0) ? c.day : -1; } }   /* T-556: the FALLEN tab's DIED column */
 namespace coop { int StoreGiveOwedHomes(const char* buildingKey, void* building) { return GiveOwedHomesImpl(buildingKey, building); } }   /* store.h */
 namespace coop { void StoreBirthNote(void* platoon, int birth) { BirthNote(platoon, birth); } }   /* store.h */
+namespace coop { void ApplyRaidLend(const char* p, size_t n, unsigned int fromPeer) { RaidLendApplyImpl(p, n, fromPeer); } }   /* store.h: T-1122 build - MSG_RAID_LEND */
+namespace coop { void ApplyRaidEnd(const char* p, size_t n, unsigned int fromPeer) { RaidEndApplyImpl(p, n, fromPeer); } }   /* store.h: T-1122 redesign (b) - MSG_RAID_END */
+namespace coop { int RaidAwakeHandSend(void* ap, void* faction, const std::string& squadId, unsigned int keyUid, int toSlot, int whole) { return RaidAwakeSendImpl(ap, faction, squadId, keyUid, toSlot, whole); } }   /* store.h: T-1122 awake hand - the sender */
+namespace coop { int RaidAwakeBlockHas(unsigned int keyUid) { return RaidAwakeHasImpl(keyUid); } }   /* store.h: T-1122 awake hand - the receiver's carried-goal skip */
+namespace coop { void RaidAwakeTaken(unsigned int keyUid, void* ap, int whole) { RaidAwakeTakenImpl(keyUid, ap, whole); } }
+namespace coop { void RaidAwakeTakeNote(unsigned int keyUid, int whole) { RaidAwakeTakeNoteImpl(keyUid, whole); } }   /* store.h: T-1122 fix A re-check fold (2) */   /* store.h: T-1122 awake hand - the receiver's take */
+namespace coop { void RaidLentWholeNote(int which) { RaidLentWholeNoteImpl(which); } }   /* store.h: T-1122 whole or none */
 namespace coop { int StoreBirthOfPlatoon(void* platoon) { return sqbirth::BirthMerge(BoundRecordBirth(platoon), BirthPublishOf(platoon)); } }   /* store.h: the flag CONTEXT publishes - never one read off the squad's own byte */
 namespace coop { void StoreNoteCopyHome(void* platoon, const std::string& worldId, const unsigned char* handRaw32, int buildingSent, int buildingResolved) { NoteCopyHomeImpl(platoon, worldId, handRaw32, buildingSent, buildingResolved); } }   /* store.h [t755-copyhome-api] */
 namespace coop { int StoreKeylessRecordGroups(const std::string& townSid, KeylessGroup* out, int cap) { return KeylessRecordGroupsImpl(townSid, out, cap); } }   /* store.h */
@@ -34576,6 +40618,11 @@ namespace coop { void StoreApplyBlockToNewFaction(void* faction) { BlockApplyNew
    existing swap in detour_sfsReadFile then loads that copy), on CANT, or when the holder is gone (PLAYER_GONE, the map naming
    another holder or a holder not in the world) - then the newest copy here loads, as before. While the link is down the hold
    stays (the CONNECTION LOST window covers the player) and the ASK goes again on the next link (areafresh::AskDue).
+   T-1279 (design B; owner decisions 1580 a, 1581 a): the read now waits for EVERY area (areafresh::WaitDecide kWaitRecord when no
+   other game in the world holds it - nobody, a holder not in the world, a stale map), and the world server answers that ASK from its
+   records (the record, then FRESH; or CANT current). The 60 s give-up is gone: a wait ends only on its answer, the asked holder gone
+   (kWaitYes), or no world server that can ever answer (PreloadLinkCanServe - kEndNoServer, an error line); the ASK is re-armed every
+   10 s until then. A read during a world load is still not held (kNoWaitNoWorld) - the pre-load's ring covers those (T-346).
    THE HOLDER, MAIN THREAD: the pump queues a WRITE (one per area); AreaFreshTick, at the top of StoreTick where no engine call is in
    progress, writes the area through the HOOKED saveLevelData (the same before-save steps as any area write; its gdcSave publishes
    through ZoneSaveApply - the WROTE / record road) and answers FRESH with the lowest stamp the new record can carry, or CANT.
@@ -34640,7 +40687,10 @@ struct AfRow
     double startAt, lastHoldAt;
     int asks;                   /* part 2: ASKs sent for this wait */
     double lastAskAt;           /* part 2: when an ASK was last tried (the 10 s re-ask counts from it) */
-    AfRow() : state(0), decided(0), holder(-1), haveStamp(0), freshStamp(-1), cant(0), cantWhy(0u), holderGone(0), askedGen(-1), startAt(0.0), lastHoldAt(0.0), asks(0), lastAskAt(0.0) {}
+    int recordWait;             /* T-1279 (design B): 1 = a kWaitRecord wait - no holder asked for; the world server answers from its records */
+    int turned;                 /* T-1279 fold 2 (re-check B): times a CANT / the holder gone turned this row into a record wait (areafresh::CantDecide) */
+    int freshUnmet;             /* T-1279 fold 2 (re-check F): FRESH answers that came while the one before was still not met by the swap */
+    AfRow() : state(0), decided(0), holder(-1), haveStamp(0), freshStamp(-1), cant(0), cantWhy(0u), holderGone(0), askedGen(-1), startAt(0.0), lastHoldAt(0.0), asks(0), lastAskAt(0.0), recordWait(0), turned(0), freshUnmet(0) {}
 };
 AfRow g_afRow[4096];   /* areafresh::Key(x, y) */
 int g_afWaitingN = 0;
@@ -34654,6 +40704,8 @@ const double kAfAbandonSec = 5.0;     /* a held read not called again this long:
 const std::string kAfEmpty;           /* stands in for the full save's empty string (DAT_141f78098; 0x36DCA0 reads only its size word) */
 /* ---- part 2 state (MAIN THREAD unless marked) ---- */
 long long g_afTimeout = 0, g_afReasks = 0;
+long long g_afRecordWaits = 0, g_afCurrent = 0, g_afNoServer = 0;   /* T-1279 (design B): waits with no holder asked for; ended CANT current; ended because no world server can ever answer */
+long long g_afTurned = 0, g_afFbAskRecord = 0, g_afFreshPublished = 0, g_afFreshUnmetSaid = 0;   /* T-1279 fold 2: rows turned into record waits (B); reads whose missing swap file sent them to the record (C); FRESHes that published a record held here (F); unmet-FRESH error lines (F) */
 /* ---- part 3 state (MAIN THREAD unless marked) ---- */
 long long g_afWritesDropped = 0, g_afDropUntold = 0;   /* queued WRITEs dropped when the world stopped (each answered CANT dropped); of them not told (link down) */
 long long g_afMapHolds = 0, g_afMapTimeout = 0;         /* reads held for an area map older than 5 s; of them run with no fresh map at the 60 s */
@@ -34751,7 +40803,7 @@ void AfAsk(int k, const char* when)
     r.lastAskAt = ZoneNowSec();   /* part 2: the 10 s re-ask counts from the last try */
     if (!AfSend(areafresh::kAsk, areafresh::kWhyNone, x, y, r.haveStamp)) return;   /* the link is down: asked at the next link (AreaFreshTick) */
     r.askedGen = gen; ++r.asks;
-    DebugLog("[ZONE] FRESH ask zone=" + AfXy(x, y) + " holder=" + N((long long)r.holder) + " haveStamp=" + N(r.haveStamp) + " ask#" + N((long long)r.asks) + " (" + when + ")");
+    DebugLog("[ZONE] FRESH ask zone=" + AfXy(x, y) + (r.recordWait != 0 ? std::string(" holder=none (the world server's record)") : " holder=" + N((long long)r.holder)) + " haveStamp=" + N(r.haveStamp) + " ask#" + N((long long)r.asks) + " (" + when + ")");
 }
 /* at load decided or the area's first read (row state 0), and again at each retry of a read held for the area map (state 2, part 3) */
 void AfDecide(int x, int y, const char* when)
@@ -34778,11 +40830,26 @@ void AfDecide(int x, int y, const char* when)
         g_afRow[k] = AfRow(); if (g_afWaitingN > 0) --g_afWaitingN;
         DebugLog("[ZONE] FRESH map zone=" + AfXy(x, y) + " fresh now: holder=" + N((long long)holder) + (verdict == areafresh::kWaitYes ? std::string(" - the read waits for a fresh copy") : std::string(" - no wait")));
     }
-    if (verdict != areafresh::kWaitYes) { g_afRow[k].decided = 1; return; }
-    AfRow r; r.state = 1; r.holder = holder; int have = 0; r.haveStamp = AfSwapStamp(x, y, &have); r.startAt = ZoneNowSec();
+    if (verdict != areafresh::kWaitYes && verdict != areafresh::kWaitRecord) { g_afRow[k].decided = 1; return; }
+    AfRow r; r.state = 1; int have = 0; r.haveStamp = AfSwapStamp(x, y, &have); r.startAt = ZoneNowSec();
+    r.recordWait = verdict == areafresh::kWaitRecord ? 1 : 0;   /* T-1279 (design B): nobody else holds it - the world server's record is waited for */
+    r.holder = r.recordWait != 0 ? -1 : holder;
     g_afRow[k] = r;
-    ++g_afWaitingN; ++g_afAsked;
+    ++g_afWaitingN; ++g_afAsked; if (r.recordWait != 0) ++g_afRecordWaits;
     AfAsk(k, when);
+}
+/* T-1279 fold 2 (re-check B; owner decision 1580 a): MAIN THREAD. A wait's CANT (any why but current / fault) or its asked holder gone,
+   while a world server can answer: the copy here does not load - the row becomes a record wait (no holder asked for; the world server
+   answers from its records, or sends a WRITE to the holder its area table names now) and asks again (areafresh::CantDecide) */
+void AfTurnToRecordWait(int k, const char* why, int askNow)
+{
+    AfRow& r = g_afRow[k];
+    const int wasHolder = r.holder;
+    r.recordWait = 1; r.holder = -1; r.holderGone = 0; r.cant = 0; r.cantWhy = 0u; ++r.turned; ++g_afTurned;
+    DebugLog("[ZONE] FRESH cant zone=" + AfXy(areafresh::KeyX(k), areafresh::KeyY(k)) + " why=" + why + " holder=" + N((long long)wasHolder)
+             + " - a world server can still answer, so the copy here does not load: the read waits for the world server's record (a record wait, turned "
+             + N((long long)r.turned) + "x) and asks again " + std::string(askNow != 0 ? "now" : "at the 10 s re-ask") + " (turned=" + N(g_afTurned) + ")");
+    if (askNow != 0) AfAsk(k, "again as a record wait");
 }
 /* ---- T-1129 PART 2 (see the head of this block) ---- */
 /* MAIN THREAD: what the area-file swap (detour_sfsReadFile) would do for area x, y if the read ran now - the same swap entry, the
@@ -34798,6 +40865,7 @@ int AfSwapPrecheck(int x, int y)
     const int haveRec = ZoneSwapLookup(zoneId, &sw) ? 1 : 0;
     const int fileNamed = (haveRec != 0 && !sw.file.empty()) ? 1 : 0;
     if (gateOn == 0 || fileNamed == 0) return areafresh::SwapPrecheck(gateOn, haveRec, fileNamed, 0, 0, 0, 0, 0);
+    if (sw.empty != 0) return areafresh::SwapPrecheck(gateOn, 1, 1, 1, 0, 1, 1, 1);   /* T-1329: an EMPTY record is served as no file - no owner translation, nothing to refuse */
     const int fileThere = U8GetFileAttributes(sw.file.c_str()) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
     const int verdict = coopstore::OwnerTranslateDecide(1, (unsigned int)sw.owner, StoreOwnerField());
     const int translate = (verdict == coopstore::kOwnerTranslateUnknown || verdict == coopstore::kOwnerTranslateOther) ? 1 : 0;
@@ -34827,7 +40895,25 @@ int AfFallbackHold(void* content, int k, int x, int y)
     const int canHold = EngineWritesBlocked() ? 0 : 1;   /* as part 1's wait: no hold during a world load */
     const long long heldMs = f.startAt > 0.0 ? (long long)((now - f.startAt) * 1000.0 + 0.5) : 0;   /* this hold's own length (holdMaxMs) */
     const long long budgetMs = areafresh::BudgetMs(g_afFirstHold[k], now);   /* part 3: the read's shared 60 s, from its first hold (the map, the wait or this) */
-    const int act = areafresh::FallbackHoldDecide(check, canHold, budgetMs);
+    const int canServe = PreloadLinkCanServe();   /* T-1279 fold 2 (re-check C; owner 1580 a): no time bound while a world server can answer this game */
+    const int act = areafresh::FallbackHoldDecide(check, canHold, budgetMs, canServe);
+    if (act == areafresh::kFbAskRecord && AfSetRetryPod(content) == 1)
+    {   /* T-1279 fold 2 (re-check C): the swap names a file that is not there. The record here goes with its swap entry
+           (ZoneHeldAreaFileCheck - a record keeps its stamp, so the world server's copy would otherwise be refused as not newer and
+           a FRESH would publish the missing file again) and the read waits for the world server's record, asked with haveStamp 0 */
+        const std::string zid = AfZoneId(x, y);
+        const int kept = ZoneHeldAreaFileCheck(zid, "the area read's swap check: its file is missing");
+        ZoneSwapPublish(zid);   /* the swap entry follows the record here - none once it is dropped */
+        if (f.startAt > 0.0) { if (heldMs > g_afFbMaxMs) g_afFbMaxMs = heldMs; f = AfFb(); if (g_afFbN > 0) --g_afFbN; }
+        if (kept != 0 && g_records.find(zid) != g_records.end()) return 1;   /* a record whose file is there now: held one frame, checked again */
+        AfRow w; w.state = 1; w.haveStamp = 0; w.startAt = now; w.recordWait = 1; w.holder = -1;
+        g_afRow[k] = w;
+        ++g_afWaitingN; ++g_afAsked; ++g_afRecordWaits; ++g_afFbAskRecord;
+        if (g_afFirstHold[k] <= 0.0) g_afFirstHold[k] = now;
+        DebugLog("[ZONE] FRESH hold zone=" + AfXy(x, y) + " reason=noFile - the area-file swap names a file that is not there: the record here is dropped and the read waits for the world server's record (asked with haveStamp 0; fbAskRecord=" + N(g_afFbAskRecord) + ")");
+        AfAsk(k, "the swap's file is missing");
+        return 1;
+    }
     if (act == areafresh::kFbHold && AfSetRetryPod(content) == 1)
     {
         if (g_afFirstHold[k] <= 0.0) g_afFirstHold[k] = now;
@@ -34836,7 +40922,7 @@ int AfFallbackHold(void* content, int k, int x, int y)
             f.startAt = now; ++g_afFbN; ++g_afFbHolds[check];
             if (check == areafresh::kSwapNoStandIn || check == areafresh::kSwapOwnersNotReady) ++g_areaNamedGen;   /* the stand-in pass looks again at the head of the next drain, as the swap's own refusal makes it */
             DebugLog("[ZONE] FRESH hold zone=" + AfXy(x, y) + " reason=" + areafresh::SwapCheckName(check)
-                     + " - the area-file swap would load this game's own copy now; the read waits for it (at most " + N(areafresh::kWaitLimitMs / 1000) + " s)");
+                     + " - the area-file swap would load this game's own copy now; the read waits for it (" + (canServe != 0 ? std::string("no time bound while a world server can answer") : "at most " + N(areafresh::kWaitLimitMs / 1000) + " s") + ")");
         }
         f.reason = check; f.lastHoldAt = now;
         return 1;
@@ -34991,10 +41077,13 @@ void AfEnd(int k, int end)
     const long long ms = (long long)(waited * 1000.0 + 0.5);
     if (ms > g_afWaitMaxMs) g_afWaitMaxMs = ms;
     if (end == areafresh::kEndFresh) { ++g_afFresh; DebugLog("[ZONE] FRESH got zone=" + AfXy(x, y) + " stamp=" + N(r.freshStamp) + " waited=" + N(ms) + " - the holder's new copy loads"); }
+    else if (end == areafresh::kEndCant && r.cantWhy == (unsigned int)areafresh::kWhyCurrent) { ++g_afCant; ++g_afCurrent; DebugLog("[ZONE] FRESH current zone=" + AfXy(x, y) + " haveStamp=" + N(r.haveStamp) + " waited=" + N(ms) + " - the world server holds nothing newer: the copy here loads"); }   /* T-1279 */
     else if (end == areafresh::kEndCant) { ++g_afCant; DebugLog("[ZONE] FRESH cant zone=" + AfXy(x, y) + " why=" + areafresh::WhyName(r.cantWhy) + " waited=" + N(ms) + " - the newest copy here loads"); }
-    else if (end == areafresh::kEndTimeout) { ++g_afTimeout; DebugLog("[ZONE] FRESH timeout zone=" + AfXy(x, y) + " waited=" + N(ms) + " asks=" + N((long long)r.asks) + " - the newest copy here loads"); }   /* part 2 */
+    else if (end == areafresh::kEndTimeout) { ++g_afTimeout; DebugLog("[ZONE] FRESH timeout zone=" + AfXy(x, y) + " waited=" + N(ms) + " asks=" + N((long long)r.asks) + " - the newest copy here loads"); }   /* part 2 - no longer reached (T-1279) */
+    else if (end == areafresh::kEndNoServer) { ++g_afNoServer; ErrorLog("[ZONE] FRESH noServer zone=" + AfXy(x, y) + " waited=" + N(ms) + " asks=" + N((long long)r.asks) + " - no world server can ever answer this game (none set, protocol refused, another world or the join refused): the newest copy here loads"); }   /* T-1279 */
     else { ++g_afHolderGone; DebugLog("[ZONE] FRESH cant zone=" + AfXy(x, y) + " why=holderGone holder=" + N((long long)r.holder) + " waited=" + N(ms) + " - the newest copy here loads"); }
     g_afRow[k] = AfRow();
+    g_afFirstHold[k] = 0.0;   /* T-1279: the wait has no time bound now, so the swap's own hold (FallbackHoldDecide) counts its 60 s from its own first hold, not the wait's */
     g_afFreshEnded[k] = (end == areafresh::kEndFresh) ? 1 : 0;   /* part 2: the RESTORED line's source */
     if (g_afWaitingN > 0) --g_afWaitingN;
 }
@@ -35058,8 +41147,12 @@ void detour_afContentActivate(void* content, void* a2, void* a3, void* a4)
                     AfRow& r = g_afRow[k];
                     const double now = ZoneNowSec();
                     int have = 0; const long long ss = AfSwapStamp(x, y, &have);
-                    const long long waitedMs = areafresh::BudgetMs(g_afFirstHold[k], now);   /* part 3: the read's shared 60 s, from its first hold */
-                    const int end = areafresh::WaitEndOrTimeout(r.freshStamp, have, ss, r.cant, r.holderGone, r.holder, AfHolderNow(x, y), coopdrop::kAreaFrozen, waitedMs);   /* part 2: 60 s with no answer ends it */
+                    int end = areafresh::WaitEndOrNoServer(r.freshStamp, have, ss, r.cant, r.holderGone, r.holder, AfHolderNow(x, y), coopdrop::kAreaFrozen, r.recordWait, PreloadLinkCanServe());   /* T-1279 (owner 1580 a): no time bound - only an answer, the asked holder gone, or no world server that can ever answer ends it */
+                    if (end == areafresh::kEndHolderGone)
+                    {   /* T-1279 fold 2 (re-check B): the asked holder gone while a world server can answer - a record wait, asked again; not this game's copy */
+                        const int c = areafresh::CantDecide((unsigned int)areafresh::kWhyHolderGone, PreloadLinkCanServe(), r.turned);
+                        if (c != areafresh::kCantEnd) { AfTurnToRecordWait(k, "holderGone", c == areafresh::kCantRecordAskNow ? 1 : 0); end = areafresh::kKeepWaiting; }
+                    }
                     if (end == areafresh::kKeepWaiting)
                     {
                         if (AfSetRetryPod(content) == 1) { if (g_afFirstHold[k] <= 0.0) g_afFirstHold[k] = now; r.lastHoldAt = now; return; }   /* held: the next frame's 0x9FF730 calls here again */
@@ -35115,11 +41208,24 @@ unsigned int AfHolderWrite(int x, int y, void* content)
     const long long written0 = g_zoneWritten, parkSeq0 = g_zoneParkSeq;
     const double t0 = ZoneNowSec();
     coop::ItemsHoldSave(0, 1);   /* every box hold's item back in its square for the write (the game save's pair - see the head of this block) */
+    g_levelSaveHasFile = -1; g_levelSaveReadDue = -1;   /* T-1329: set by detour_saveLevelData (ZoneLevelSaveAfter) inside the call below */
     const int called = AfCallSavePod(content, &kAfEmpty);
+    const int hasFile = g_levelSaveHasFile, readDue = g_levelSaveReadDue;
     coop::ItemsHoldSave(1, 1);   /* ... and lifted out again */
     const double secs = ZoneNowSec() - t0;
     const long long parkedHere = AfParkedSince(zoneId, parkSeq0) ? 1 : 0;   /* part 3: a write of THIS area parked during the save (the list's size can stay put: a park past 64 drops the oldest) */
-    const unsigned int why = areafresh::HolderWriteWhy(called, g_zoneWritten - written0, parkedHere);
+    unsigned int why = areafresh::HolderWriteWhy(called, g_zoneWritten - written0, parkedHere);
+    if (why == (unsigned int)areafresh::kWhyNotPublished && zonerec::ZoneNotPublishedIsFault(hasFile, readDue) != 0)
+    {   /* T-1329: Kenshi wrote this area's file (ZoneMap+0x24 = 1), or saved nothing (0) and its EMPTY was refused (fold 1, F2), and no record was published - a fault, which ends the asker's wait */
+        why = (unsigned int)areafresh::kWhyFault; ++g_afSavedNotPublished;
+        ErrorLog("[ZONE] FRESH write zone=" + AfXy(x, y) + " FAULT (T-1329): " + (hasFile == 1 ? std::string("Kenshi wrote the area file") : std::string("Kenshi saved nothing and its EMPTY record was refused")) + " but no record was published (savedNotPublished=" + N(g_afSavedNotPublished)
+                 + " engineSaveFalse=" + N((long long)g_gdcEngineSaveFalse) + " pathCopyFail=" + N((long long)g_gdcPathCopyFail) + " zoneSaves=" + N(g_zoneSaves) + ") - answered CANT fault");
+    }
+    if (why == (unsigned int)areafresh::kWhyNotPublished && readDue == 1)
+    {   /* T-1329 fold 2: this game's read of the area is still due - nothing newer than the world server's record here (owner 1580 a) */
+        static int s_dueLines = 0;
+        if (++s_dueLines <= 20) DebugLog("[ZONE] FRESH write zone=" + AfXy(x, y) + " not yet: this game's read of the area is still due (readDue=1) - answered notPublished, the asker waits for the record (first 20 logged)");
+    }
     if (why != (unsigned int)areafresh::kWhyNone)
     {
         if (called != 1) ErrorLog("[ZONE] FRESH write zone=" + AfXy(x, y) + " FAULTED in the engine's one-area save (caught) ms=" + AfMs(secs));
@@ -35128,7 +41234,7 @@ unsigned int AfHolderWrite(int x, int y, void* content)
     const long long ms = (long long)(secs * 1000.0 + 0.5);
     ++g_afWrites; if (ms > g_afWriteMaxMs) g_afWriteMaxMs = ms;
     const bool told = AfSend(areafresh::kFresh, areafresh::kWhyNone, x, y, floorStamp);
-    DebugLog("[ZONE] FRESH write zone=" + AfXy(x, y) + " ms=" + N(ms) + " stamp>=" + N(floorStamp) + " written+" + N(g_zoneWritten - written0) + " parked=" + N(parkedHere)
+    DebugLog("[ZONE] FRESH write zone=" + AfXy(x, y) + " ms=" + N(ms) + " stamp>=" + N(floorStamp) + " written+" + N(g_zoneWritten - written0) + " parked=" + N(parkedHere) + " kenshiFile=" + N((long long)hasFile) + " readDue=" + N((long long)readDue) + (hasFile == 0 ? std::string(" (EMPTY record)") : std::string())
              + (told ? std::string(" - the world server told") : std::string(" - NOT told (link down; the waiting game asks again at its link-up)")));
     return (unsigned int)areafresh::kWhyNone;
 }
@@ -35189,8 +41295,37 @@ void AreaFreshArrive(const std::vector<char>& payload)
         const long long was = r.freshStamp;
         r.freshStamp = areafresh::FreshKeep(was, m.stamp);   /* part 3: the LOWEST stamp told; no more asks from here (AskPlan) */
         DebugLog("[ZONE] FRESH told zone=" + AfXy(m.x, m.y) + " stamp=" + N(m.stamp) + (was >= 0 ? " (again; kept " + N(r.freshStamp) + ")" : std::string()) + " - held until that record is in");
+        /* T-1279 fold 2 (re-check F): a record held here as new as the FRESH but not in the swap is published now; unmet FRESHes are said */
+        const std::string zid = AfZoneId(m.x, m.y);
+        const std::map<std::string, Record>::const_iterator hr = g_records.find(zid);
+        const int haveRec = (hr != g_records.end() && !hr->second.file.empty()) ? 1 : 0;
+        const long long recAt = hr != g_records.end() ? hr->second.writtenAt : 0;
+        int have = 0; long long ss = AfSwapStamp(m.x, m.y, &have);
+        if (areafresh::FreshPublishDue(haveRec, recAt, have, ss, m.stamp) != 0)
+        {
+            const bool heldBack = !g_mkStaleHold.empty() && g_mkStaleHold.erase(zid) != 0;
+            if (heldBack) ++g_mkStaleHoldReleased;
+            MirrorKeepConfirmed(zid, 0);   /* the world server named this key */
+            ZoneSwapPublish(zid);
+            ++g_afFreshPublished;
+            const int had = have; const long long was2 = ss;
+            ss = AfSwapStamp(m.x, m.y, &have);
+            DebugLog("[ZONE] FRESH publish zone=" + AfXy(m.x, m.y) + " stamp=" + N(m.stamp) + " - the record here (writtenAt " + N(recAt) + ") is as new as the world server's but the swap had "
+                     + (had != 0 ? "an older entry (" + N(was2) + ")" : std::string("no entry")) + (heldBack ? " (a kept key held back)" : "") + ": published now (freshPublished=" + N(g_afFreshPublished) + ")");
+        }
+        if (areafresh::FreshUnmetNote(was, have, ss) != 0 && ++r.freshUnmet == areafresh::kFreshUnmetSay)
+        {
+            ++g_afFreshUnmetSaid;
+            ErrorLog("[ZONE] FRESH unmet zone=" + AfXy(m.x, m.y) + " - " + N((long long)areafresh::kFreshUnmetSay) + " FRESH answers came and the area-file swap still has no copy as new as stamp " + N(was)
+                     + " (swap " + (have != 0 ? N(ss) : std::string("none")) + ", record here " + (hr != g_records.end() ? N(recAt) : std::string("none")) + ") - the read stays held (no fallback to the copy here); the record is asked for again every 10 s (freshUnmetSaid=" + N(g_afFreshUnmetSaid) + ")");
+        }
     }
-    else { r.cant = 1; r.cantWhy = m.why; }
+    else
+    {   /* T-1279 fold 2 (re-check B): only CANT current / fault - or no world server that can answer - ends the wait; any other why turns it into a record wait */
+        const int c = areafresh::CantDecide(m.why, PreloadLinkCanServe(), r.turned);
+        if (c == areafresh::kCantEnd) { r.cant = 1; r.cantWhy = m.why; }
+        else AfTurnToRecordWait(k, areafresh::WhyName(m.why), c == areafresh::kCantRecordAskNow ? 1 : 0);
+    }
 }
 /* MAIN THREAD (PumpLink): PLAYER_GONE - a wait on that player's area ends at its next retry */
 void AreaFreshPlayerGone(const std::vector<char>& payload)
@@ -35244,7 +41379,7 @@ void AreaFreshTick()
             continue;
         }
         if (r.state != 1) continue;
-        const int plan = areafresh::AskPlan(up, r.askedGen, gen, (long long)((now - r.lastAskAt) * 1000.0), areafresh::BudgetMs(g_afFirstHold[k], now), (r.freshStamp >= 0 || r.cant != 0) ? 1 : 0);   /* none once a FRESH or a CANT is noted; the shared budget */
+        const int plan = areafresh::AskPlan(up, r.askedGen, gen, (long long)((now - r.lastAskAt) * 1000.0), r.cant != 0 ? 1 : 0);   /* none once a CANT is noted; T-1279: re-armed every 10 s until the record is in (no time bound) */
         if (plan == areafresh::kAskLink) AfAsk(k, r.askedGen >= 0 ? "again after a link-up" : "again, the link is up");
         else if (plan == areafresh::kAskAgain) { ++g_afReasks; AfAsk(k, "again, 10 s with no answer"); }
     }
@@ -35285,6 +41420,19 @@ std::string AreaFreshReportValues()
            + "," + N((long long)g_afRestoreHooked) + "," + N(g_afRestoreReads) + "," + N(g_afGroundCalls) + "," + N(g_afGroundOutside) + "," + N(g_afSpotItems) + "," + N(g_afSpotUnknown) + "," + N(g_afSpotOutside)
            + "," + N((long long)::InterlockedCompareExchange64(&g_afRestoreOffMain, 0, 0))
            + "," + N(g_afWritesDropped) + "," + N(g_afDropUntold) + "," + N(g_afMapHolds) + "," + N(g_afMapTimeout) + "," + N(g_afNoRead) + "," + N(g_afNoWorldReads)
-           + "," + N((long long)::InterlockedCompareExchange64(&g_afReadOffMain, 0, 0)) + "," + N(g_afSpotStale);   /* T-1129: spotStaleRestores last; part 2: timeout, fallbackTimeout must read 0; part 3: mapTimeout, noRead must read 0 */
+           + "," + N((long long)::InterlockedCompareExchange64(&g_afReadOffMain, 0, 0)) + "," + N(g_afSpotStale)
+           + "," + N(g_afRecordWaits) + "," + N(g_afCurrent) + "," + N(g_afNoServer);   /* T-1129: spotStaleRestores; T-1279: recordWaits, current, noServer last; part 2: timeout, fallbackTimeout must read 0; part 3: mapTimeout, noRead must read 0 */
+}
+}   /* namespace coop */
+
+/* T-1122 THE ROLLER (towngen.cpp): 1 = `camp` is a campaign this game made for a raid squad another game lent it (fix A's road - a
+   BorrowRow's campaign not yet ended), 0 = not. The roller leaves those to their own road. MAIN THREAD. */
+namespace coop {
+int StoreRaidCampBorrowed(void* camp)
+{
+    if (camp == 0) return 0;
+    for (std::map<std::string, BorrowRow>::const_iterator it = g_borrow.begin(); it != g_borrow.end(); ++it)
+        if (it->second.camp == camp && it->second.campEnded == 0) return 1;
+    return 0;
 }
 }   /* namespace coop */

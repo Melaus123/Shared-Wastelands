@@ -209,7 +209,7 @@ inline bool BuildEncodable(const BuildMsg& m)
         return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.seq != 0 && m.reason <= kBuildHitLastVerdict
             && BuildFloatOk(m.hitCut) && BuildFloatOk(m.hitBlunt) && m.hitCut >= 0.0f && m.hitBlunt >= 0.0f && m.hitCut <= kBuildHitMax && m.hitBlunt <= kBuildHitMax
             && m.hitDoor >= -1 && m.hitDoor <= kBuildHitMaxDoor && m.hitRepair <= 1
-            && (m.hitRepair == 0 || (m.hitDoor >= 0 && m.reason == kBuildHitAsk && m.hitBlunt == 0.0f));   /* a repair: an ask naming a door, its gain in cut */
+            && (m.hitRepair == 0 || (m.reason == kBuildHitAsk && m.hitBlunt == 0.0f));   /* a repair: an ask naming a door, or (T-1333, door -1) a town wall, its gain in cut */
     if (m.kind == kBuildDismantleAsk) return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.reason <= 7;   /* T-805: key + verdict (kBuildDmBlocked the last) */
     if (m.kind == kBuildRemove)   /* build1-d; P87 fold 1: a furniture tail's host key fits */
         return !m.key.empty() && m.key.size() <= kBuildMaxKey
@@ -1189,6 +1189,44 @@ inline int BuildRestorePresentAct(int mineLive, int rowExists, int own, int copy
     if (worldNode != 0) return kBuildRsPresentDropWorld;
     if (rowExists == 0) return kBuildRsPresentRegister;
     return (own != 0 && copyHere == 0) ? kBuildRsPresentNonce : kBuildRsPresentNothing;
+}
+/* T-1335 (H-T1335-buyerrevert, design a): THIS game's own word names it a piece's owner - its own row (a pp.build restore, the purchase
+   registered the bought house as its own piece) or its own piece record (owner slot = this game's) - and the piece stands at its key
+   with an owner that is not this game's player. That happens when the load brought an area copy older than the purchase (the area
+   holder's saves refused as stale, or the holder gone with no save after it) or the town's fresh-area rebuild gave the piece the town's
+   faction. ownNames: an own row or own record names this game; liveMine: the standing piece's owner is this game's player;
+   livePlayerSide: it is another player's (a stand-in, a player faction, a save's player faction - BdOwnerIsPlayerSide);
+   sameBuilding: the standing piece's template is the row's (an unreadable one is not). Only an owner that is no player's (the town, an
+   NPC faction, none) is written back; another player's piece is never taken, nor a different building at the key. T-1335 fold
+   (review MED 1, owner rule 1444 - no world node is ever a player's): a world resource node standing at the key (worldNode: the live
+   piece itself, coopown::WorldNodeOf, as the restore road's later node drop and the PLACE's node refusal test it) is never written. */
+const int kBuildOwnRsNone = 0;            /* nothing names this game, or the piece is already its player's */
+const int kBuildOwnRsRestore = 1;         /* the owner written back to this game's player (the engine's setFaction road) */
+const int kBuildOwnRsOtherPlayer = 2;     /* another player's piece: left */
+const int kBuildOwnRsOtherBuilding = 3;   /* no player's owner, but not the row's building (or its template does not read): left */
+const int kBuildOwnRsWorldNode = 4;       /* a world resource node (an ore rock): never any player's - left */
+inline int BuildOwnRestoreAct(int ownNames, int liveMine, int livePlayerSide, int sameBuilding, int worldNode = 0)
+{
+    if (ownNames == 0 || liveMine != 0) return kBuildOwnRsNone;
+    if (worldNode != 0) return kBuildOwnRsWorldNode;
+    if (livePlayerSide != 0) return kBuildOwnRsOtherPlayer;
+    return (sameBuilding != 0) ? kBuildOwnRsRestore : kBuildOwnRsOtherBuilding;
+}
+/* T-1335 fold (review MED 2, single-player parity): what the restore runs around its owner write. The engine's purchase (the buyer's
+   own, and its replay on every other game - BdCopyOneBody's place-adopt) tears down the house's town furniture by the keep rule
+   (BdBuyTeardown: players' pieces and keyed pieces kept) and moves its residents out; a restore over an older area copy that brought
+   that furniture and those residents back does the same, through the same steps the replay runs, in its order: the engine's
+   isForSale first; then the residents on hold for the house made (TownGenBuyHeld) so the world side collects them; then the world
+   side (residents out, town lists, doors re-owned not opened, the furniture teardown with the room step, the interior's no-player
+   pieces re-owned, new homes). Only a restore of a building (not furniture) the engine says is for sale; otherwise the owner write
+   alone. */
+struct BuildOwnRsPlan { int worldSide; int heldFirst; int teardown; };
+inline BuildOwnRsPlan BuildOwnRestorePlanOf(int act, int furniture, int forSale)
+{
+    BuildOwnRsPlan pl; pl.worldSide = 0; pl.heldFirst = 0; pl.teardown = 0;
+    if (act != kBuildOwnRsRestore || furniture != 0 || forSale != 1) return pl;
+    pl.worldSide = 1; pl.heldFirst = 1; pl.teardown = 1;
+    return pl;
 }
 /* What a present act writes. A world node's saved row is only retired from this player's records (pp.build): no tombstone (the
    next load would take the rock down here) and no REMOVE (the other game would dismantle its own copy of the rock - a REMOVE
@@ -2343,7 +2381,7 @@ inline int BuildBuyerTeardownRuns(int armed, int onMain, int interiorMatches, in
 }
 /* the room step inside the mod's teardown: the friend's road runs it (no engine purchase runs there); on the buyer's road the
    engine's purchase has already run its own (decomp_7acb20 :149-165, every building piece of the set) before the call - not twice */
-inline int BuildTeardownRoomStepHere(int buyerRoad) { return buyerRoad != 0 ? 0 : 1; }
+inline int BuildTeardownRoomStepHere(int buyerRoad) { return buyerRoad == 1 ? 0 : 1; }   /* road 2: the buyer's own restore (T-1335) - no engine purchase ran in this load: the room step runs */
 /* the interior's second set (+0x128): 0x54EA40 erases every entry from it (0x574420) and destroys it, with no type test (decomp_54ea40
    :128-139). The same keep rule judges each entry (engineDestroys 1); one it would remove is removed only when the set's erase can be
    called (eraseRow) - a destroyed entry left in the set is a freed pointer there - else it is kept and counted (kBuildTdKeepNoErase) */
@@ -2906,11 +2944,18 @@ inline int BuildTownArgMatch(const std::string& arg, const std::string& key, con
    list is not empty, the owner is a player faction and the target is in the research object's enabled-buildings set ([0x2133630]+0x38,
    +0x130, filled from finished research's 'enable buildings' - Research::setResearched 0x833680; read 2026-10-17). */
 const int kBuildUpgradeGo = 0, kBuildUpgradeNotOwn = 1, kBuildUpgradeNoState = 2, kBuildUpgradeDismantled = 3, kBuildUpgradeRuin = 4,
-          kBuildUpgradeNotComplete = 5, kBuildUpgradeNoRecord = 6, kBuildUpgradeWall = 7;
-inline int BuildUpgradeLeverVerdict(int own, int isCopy, int stateRead, int complete, int dismantled, int ruin, int hasRecord, int isWall)
+          kBuildUpgradeNotComplete = 5, kBuildUpgradeNoRecord = 6, kBuildUpgradeWall = 7, kBuildUpgradeWallGroup = 8;
+/* T-1294 (the upgrade case): a wall goes through only when the lever's line says `wall` (wallAsked) AND the wall leads no group
+   (wallGroupCount, its +0x390 count, is 0 - a wall made at runtime starts ungrouped with a count of 0). The wall's upgrade override
+   (1.0.65 0x2A5DE0, build/decomp_2a5de0.txt:13-45) upgrades each wall of that list first, then itself (0x2A49A0), then queues the wall's
+   box on the deferred walking-map list (0x4D21F0) - with a count of 0 it changes this wall only, as a player's upgrade of a lone wall
+   does. A count that does not read (-1) or is above 0 is refused. */
+inline int BuildUpgradeLeverVerdict(int own, int isCopy, int stateRead, int complete, int dismantled, int ruin, int hasRecord, int isWall,
+                                    int wallAsked = 0, int wallGroupCount = -1)
 {
     if (own == 0 || isCopy != 0) return kBuildUpgradeNotOwn;
-    if (isWall != 0) return kBuildUpgradeWall;   /* a wall's upgrade override also upgrades its linked walls, which may be other games' pieces */
+    if (isWall != 0 && wallAsked == 0) return kBuildUpgradeWall;   /* a wall's upgrade override also upgrades its linked walls, which may be other games' pieces */
+    if (isWall != 0 && wallGroupCount != 0) return kBuildUpgradeWallGroup;
     if (stateRead == 0) return kBuildUpgradeNoState;
     if (dismantled != 0) return kBuildUpgradeDismantled;
     if (ruin != 0) return kBuildUpgradeRuin;
@@ -2929,7 +2974,8 @@ inline const char* BuildUpgradeLeverWhy(int verdict, int down)
     case kBuildUpgradeDismantled:  return "it is dismantled";
     case kBuildUpgradeRuin:        return "it is a ruin";
     case kBuildUpgradeNotComplete: return "it is not complete";
-    case kBuildUpgradeWall:        return "it is a wall (its upgrade also changes the walls linked to it)";
+    case kBuildUpgradeWall:        return "it is a wall (its upgrade also changes the walls linked to it; `wall` at the end of the line lets a lone wall through)";
+    case kBuildUpgradeWallGroup:   return "it is a wall that leads a group of walls, or its group count does not read (the upgrade would change the other walls too)";
     case kBuildUpgradeNoRecord:    return down != 0 ? "the game gave no 'downgrades to' target (no link in the record, or the owner is not a player faction)"
                                                     : "the game gave no 'upgrades to' target (no link in the record, the owner is not a player faction, or the research that enables the target is not done - team research finish <techSid>)";
     default:                       return "unknown verdict";
@@ -3211,6 +3257,159 @@ struct PieceCheckQueue
     }
     void Clear() { q.clear(); keys.clear(); }
 };
+/* T-1294 design A: the walking-map steps the engine runs for its own building actions, owed by the mod's versions of them. The
+   engine's step is its deferred walking-map list (*BuildPreviewListGlobal): 0x4D21F0 (list, building +0x27C box) - what the
+   placement confirm 0x4DA6F0 does for a piece standing at once (build threshold 0) and the wall upgrade 0x2A5DE0 does - and
+   0x4D2340 (list, building, 0) - what the purchase 0x7ACB20 does for a building whose interior changed: its 'Job added: Interior'
+   (drained by 0x4E3690 -> 0x3ABDE0 -> 0x3C6E90). Both lists are drained once physics settles. A wall the mod finishes goes through
+   its own vt+0x230 (0x5594A0) with kWallFinishAmount: finite and under 9999, so its threshold crossing flips its physics group and
+   posts its own 'Job added: Partial' (FLT_MAX skips both). Which steps one mod event owes (kWmBox | kWmInterior):
+     a piece made / restored / made for a kept row (an upgrade's replacement on another game is a copy made): its box when it
+       stands solid now (complete or past its build threshold - below it the engine leaves it out of the walking map), its
+       interior when it has one;
+     finished, or raised past its threshold by a mod write: its box, and its interior when it has one;
+     removed (asked before the engine's dismantle runs - the box is copied, so the piece may be gone when the list drains): its box.
+   Furniture and anything unknown: nothing (the engine queues furniture only through its host's interior). */
+const int kWmCopyMade = 1, kWmCopyRestored = 2, kWmKeptMade = 3, kWmFinished = 4, kWmThreshold = 5, kWmRemoved = 6, kWmBodyArrived = 7;
+const int kWmBox = 1, kWmInterior = 2;
+const float kWallFinishAmount = 999.0f;     /* 0x5594A0: the crossing is skipped for FLT_MAX, its job for amounts >= 9999 */
+const float kWallJobAmountLimit = 9999.0f;
+/* fold 1 (review M3 / L4): a WALL finished or raised past its threshold by the mod goes through its own threshold crossing
+   (BdCompleteNowPod / BdWallCrossPod -> 0x5594A0), which flips its physics group and posts its own job at that moment - nothing more
+   is queued (a box queued earlier could drain before the flip). A wall copy made counts as solid only when made complete (its group is
+   fixed then, not excluded). kWmBodyArrived (fold 2, review M2): the engine gave a waiting piece its physics body (createPhysical, see
+   BuildWalkMapBodyWait) - its box (and interior) again, a wall too (the earlier job ran without its body). */
+inline int BuildWalkMapWhat(int event, int solid, int hasInterior, int furniture, int wall = 0)
+{
+    if (furniture != 0) return 0;
+    const int in = (hasInterior != 0) ? kWmInterior : 0;
+    if (wall != 0 && (event == kWmFinished || event == kWmThreshold)) return 0;
+    switch (event)
+    {
+    case kWmBodyArrived: return kWmBox | in;
+    case kWmCopyMade: case kWmCopyRestored: case kWmKeptMade: return ((solid != 0) ? kWmBox : 0) | in;
+    case kWmFinished: case kWmThreshold: return kWmBox | in;
+    case kWmRemoved: return kWmBox;
+    default: return 0;
+    }
+}
+/* T-1309 (.modding/05-findings.md F-T1309-GATEISLAND): "when it has one" above means the engine itself would give the building an
+   interior walking map - the area load's test (1.0.65 0x3ABF00 and its regenerate 0x3AB700; 1.0.68 0x3AC040 / 0x3AB840, both
+   byte-identical): vt+0x20 answers 0, the interior pointer +0x1F0 is set, vt+0x2C8 answers 0 (WallBuilding answers non-zero),
+   vt+0x3D8 Building::isGate answers 0 (GatewayBuilding 0x57B400 answers itself) and the interior's +0x2C byte is 0. A gate or a
+   wall has an interior pointer but no interior walking map in the engine; queuing one built an unconnected piece on the teammate's
+   game (T2273: the gate's unlock stand point snapped onto it and no path existed). read 0 = a fault or an unreadable value: no. */
+const size_t kEngIntVtKind = 0x20, kEngIntVtWallPart = 0x2C8, kEngIntVtGate = 0x3D8, kEngIntFlag = 0x2C;
+inline int BuildEngineGivesInterior(int read, int kind, int interiorPtr, int wallPart, int gate, int interiorFlag)
+{
+    return (read != 0 && kind == 0 && interiorPtr != 0 && wallPart == 0 && gate == 0 && interiorFlag == 0) ? 1 : 0;
+}
+/* the piece stands solid in the walking map: finished, or its progress at or past its build threshold (a share of needed) */
+inline int BuildWalkMapSolid(int complete, float progress, float needed, float threshold)
+{
+    if (complete != 0) return 1;
+    if (!(needed > 0.0f)) return 0;
+    if (!(threshold > 0.0f)) return 1;   /* threshold 0: solid from placement (the confirm's own test) */
+    return (progress >= needed * threshold) ? 1 : 0;
+}
+/* a wall counts as solid for a copy made only when complete (review M3); any other piece by BuildWalkMapSolid */
+inline int BuildWalkMapSolidFor(int wall, int complete, float progress, float needed, float threshold)
+{
+    if (wall != 0) return (complete != 0) ? 1 : 0;
+    return BuildWalkMapSolid(complete, progress, needed, threshold);
+}
+/* fold 1 (review H1): the confirm sets the list's state +0x38 = 1 ('build the confirmed pieces' - the drain runs 0x4D6810 only on 1)
+   and the queue calls set 2 - a 1 found before the mod's queue is put back after it */
+inline int BuildWalkMapStateAfter(int before, int after) { return (before == 1) ? 1 : after; }
+/* fold 1 (review M1): a queue made in build mode (+0x28 != 0) leaves the state as it was; leaving build mode by cancel sets nothing.
+   At the next tick out of build mode with such a queue waiting and the state 0, the mod sets 2 (what the queue call itself sets
+   outside build mode) */
+inline int BuildWalkMapDueNow(int heldPending, int buildMode, int state) { return (heldPending != 0 && buildMode == 0 && state == 0) ? 1 : 0; }
+/* fold 1 (review H2): a write that raises a wall from below its threshold (needed x threshold) to at or above it goes through the
+   wall's own vt+0x230 (0x5594A0) so its crossing runs: the progress is first written to just below the line (BuildWallCrossPre),
+   then vt+0x230 with small finite amounts (BuildWallCrossStep, x4 each try; 0x558B10 scales them by the piece's rate +0x18C and the
+   game's settings) until the line is passed; then the write lands its own value. Rate 0 or below: 0x558B10 completes the piece on
+   any finite amount - no crossing call (0 step) */
+const float kWallCrossEps = 0.002f;   /* a share of needed */
+const int kWallCrossTries = 6;
+inline int BuildWallCrossNeeded(int wall, float p0, float p1, float needed, float threshold)
+{
+    if (wall == 0 || !(needed > 0.0f) || !(threshold > 0.0f)) return 0;
+    const float line = needed * threshold;
+    return (p0 < line && p1 >= line) ? 1 : 0;
+}
+/* T-1294 test tool (T2225 premise): `bldstate <key> complete` - the trailing word asks the read to answer an error when the piece is not
+   finished, so a leg check (lever-ok) stops the run. 1 = asked (*key = the argument without it), 0 = a plain read (*key = arg) */
+inline int BuildStateWantsComplete(const std::string& arg, std::string* key)
+{
+    const std::string w = " complete";
+    if (arg.size() > w.size() && arg.compare(arg.size() - w.size(), w.size(), w) == 0)
+    {
+        size_t e = arg.size() - w.size();
+        while (e > 0 && arg[e - 1] == ' ') --e;
+        *key = arg.substr(0, e);
+        return key->empty() ? 0 : 1;
+    }
+    *key = arg;
+    return 0;
+}
+inline float BuildWallCrossPre(float needed, float threshold) { const float v = needed * threshold - needed * kWallCrossEps; return v > 0.0f ? v : 0.0f; }
+/* fold 3 (T2222: B's W2 copy reached 1.00/1.00 by the helper's cap write after the engine's step ran on a raised needed - from 0.00,
+   past its line, with no crossing - so no 'Job added: Partial' on B). The progress a crossing starts from: a replay starts just below
+   the line; a caller whose own write follows the engine's step on a raised needed (BdHelpAfter - the live progress there is the step's
+   raw result, not a share of the real needed) passes the progress read before that step (from >= 0); otherwise the live progress.
+   *writePre = 1: the progress is first written to just below the line (a replay, a `from`, or a live value below it) */
+inline float BuildWallCrossFrom(int replay, float from, float live, float pre, int* writePre)
+{
+    if (replay != 0) { *writePre = 1; return pre; }
+    if (from >= 0.0f) { *writePre = 1; return from; }
+    *writePre = (live < pre) ? 1 : 0;
+    return live;
+}
+inline float BuildWallCrossStep(float needed, float rate, int tryNo)
+{
+    if (!(rate > 0.0f) || !(needed > 0.0f) || tryNo < 0 || tryNo >= kWallCrossTries) return 0.0f;
+    float a = needed * kWallCrossEps * 2.0f / rate;
+    for (int i = 0; i < tryNo; ++i) a *= 4.0f;
+    return a;
+}
+/* fold 2 (review M2, H2(b)): Building::createPhysical 0x55FF50 (vt+0x200; 1.0.68 0x5609E0) makes and fills a piece's physics list
+   +0x228 - the engine step that gives it its body (0x5594A0 crosses a wall's line only with that list set). A piece the mod queues
+   while its list is still empty (bodyList 0; 1 set, -1 unreadable) waits, keyed by the piece, and is queued again from that hook
+   (kWmBodyArrived) - no timer. Removals, the arrival itself and furniture never wait */
+const int kWmBodyWaitCap = 256;
+inline int BuildWalkMapBodyWait(int event, int bodyList, int furniture)
+{
+    if (bodyList != 0 || furniture != 0) return 0;
+    return (event == kWmCopyMade || event == kWmCopyRestored || event == kWmKeptMade || event == kWmFinished || event == kWmThreshold) ? 1 : 0;
+}
+/* fold 2 (H2(b)): a wall whose crossing waited for its body gets it at the arrival when it is still unfinished, not destroyed and at
+   or past its line (the mod's write landed there): written to just below the line and crossed with its own vt+0x230, then put back */
+inline int BuildWallCrossReplay(int complete, int destroyed, float progress, float needed, float threshold)
+{
+    if (complete != 0 || destroyed != 0 || !(needed > 0.0f) || !(threshold > 0.0f)) return 0;
+    return (progress >= needed * threshold) ? 1 : 0;
+}
+/* fold 2 (H2(c)): each crossing step's 0x5594A0 sets every group neighbour's own progress (+0x164, through its vt+0x238 0x559040) to
+   this wall's ratio - a neighbour that stood further along is put back to the value read before the crossing */
+const int kWallNbrCap = 32;
+inline int BuildWallNbrPutBack(float before, float after) { return (after < before) ? 1 : 0; }
+/* a mod write raised the piece past its threshold (or finished it): before not solid, after solid */
+inline int BuildWalkMapCrossed(int solidBefore, int solidAfter) { return (solidBefore == 0 && solidAfter != 0) ? 1 : 0; }
+inline const char* BuildWalkMapEventWord(int event)
+{
+    switch (event)
+    {
+    case kWmCopyMade: return "copyMade";
+    case kWmCopyRestored: return "restored";
+    case kWmKeptMade: return "keptMade";
+    case kWmFinished: return "finished";
+    case kWmThreshold: return "threshold";
+    case kWmRemoved: return "removed";
+    case kWmBodyArrived: return "bodyArrived";
+    default: return "?";
+    }
+}
 /* how the piece came to be finished on this game, as the SUSPECT line names it */
 const int kPcRoadPlaced = 1, kPcRoadLeverPlace = 2, kPcRoadBuilt = 3, kPcRoadLeverProgress = 4, kPcRoadCopyMade = 5, kPcRoadCopyAdopted = 6,
           kPcRoadRestored = 7, kPcRoadOwnerState = 8, kPcRoadHelp = 9, kPcRoadAreaLoad = 10;

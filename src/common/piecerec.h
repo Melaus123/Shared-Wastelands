@@ -70,7 +70,7 @@
 
 namespace piecerec {
 
-const unsigned int kProtocol = 145;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
+const unsigned int kProtocol = 153;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
 
 
 
@@ -1743,6 +1743,16 @@ inline int PieceTownMarkDue(int ownerHere, int writerHere, unsigned int engineId
 {
     return (ownerHere != 0 && writerHere != 0 && engineId != 0u && engineId != keptId && engineId != markedId) ? 1 : 0;
 }
+/* T-1332 fold 1 (review 1b): 1 = a link write would be marked but for the writer answer alone - the owner's game, its engine links the
+   piece to a known outpost the stored record does not name and no write of it is marked, but this game is not the piece's writer at
+   this look. The writer of a piece record is the owner's game while it has the area loaded, whoever holds the area (PieceMayWrite, the
+   box rule), so on the owner's game this is a short window (its loaded report not yet taken after a load, a refused write's same
+   inputs). The caller notes the area: the next applied area map (the writer's inputs) owes its own-piece check again, as T-1158 step
+   6 holds a released piece (kTdHold) - an event, no timer */
+inline int PieceTownMarkHeld(int ownerHere, int writerHere, unsigned int engineId, unsigned int keptId, unsigned int markedId)
+{
+    return (ownerHere != 0 && writerHere == 0 && engineId != 0u && engineId != keptId && engineId != markedId) ? 1 : 0;
+}
 /* T-1158 step 6 (D3, run T1823): A RELEASED PIECE'S RECORD LETS GO OF ITS DEAD OUTPOST. A rebuilt piece whose lost outpost never came
    back is released from its wait (townkeep.h RestoredWaitStep) still standing in no outpost; nothing else writes a link of 0
    (PieceTownMarkDue wants a known engine id, PieceTownWriteId carries the stored id), so its record would name the dead id for ever
@@ -1779,6 +1789,48 @@ inline int PieceTownApplyStep(int removed, int ownerHere, unsigned int link, int
     if (townHere == 0) return kTlNoTown;
     return inThatTown != 0 ? kTlSame : kTlRelink;
 }
+/* T-1332 (F-T1332-NOWHERE; owner 1043 / 1093 records win, 1556): THE OWNER'S GAME AND AN OWN PIECE IN A TOWN THAT IS NOT ITS
+   PLAYER'S. The owner's engine link wins over the record (kTlOwn) only while it names a live town of this player, or a teammate's
+   outpost: the engine founding an outpost relinks the buildings near it before that outpost's id is known here, so there the record
+   trails the engine (T-1047 step 5). Any other town - the wilderness town (another game's save guard put its copy there and this
+   game's load kept those words: the wilderness town stands on every game under the same words), a dead town, a world town, a
+   non-teammate's copy - is not the owner's choice: the record's outpost is, and the piece is moved there. The step of the own-piece
+   check (TlOwnOutOfOther) for one own top-level piece.
+   removed: a removal mark; topLevel: 1 = stands at the top level (inside a building: its host's town); engine: what the piece's town
+   words name here (kOeOwnLive a live town of this player; kOeMate a teammate's outpost; kOeOtherCopy a non-teammate's copy; kOeNone
+   none, a dead town or the wilderness town; kOeWorld another live town; kOeUnread the town lists did not read); restored: a piece
+   rebuilt from its own record that waits for its outpost (T-1158 step 6 links it, TlRestoredTick); link: the record's outpost id (0 =
+   none); townHere: a live town of that outpost stands here for the record's owner's team; inThatTown: the piece's words are its words.
+   Steps: kOoNothing; kOoRestored (left to T-1158); kOoUnread (counted refused); kOoKeep (the engine's link stands - kTlOwn's purpose);
+   kOoNoRecord (the record names no outpost: nothing to move to); kOoUnresolved (its outpost has no town here: nothing moves); kOoSame;
+   kOoMove (to the record's town); kOoPutBack (a non-teammate's copy and no record town here: the put-back pick, as since T-1047 fold 1 -
+   never kept in another player's copy) */
+const int kOeOwnLive = 0, kOeMate = 1, kOeOtherCopy = 2, kOeNone = 3, kOeWorld = 4, kOeUnread = 5;
+const int kOoNothing = 0, kOoRestored = 1, kOoUnread = 2, kOoKeep = 3, kOoNoRecord = 4, kOoUnresolved = 5, kOoSame = 6, kOoMove = 7, kOoPutBack = 8;
+inline int PieceOwnOutStep(int removed, int topLevel, int engine, int restored, unsigned int link, int townHere, int inThatTown)
+{
+    if (removed != 0 || topLevel != 1) return kOoNothing;
+    if (engine == kOeOtherCopy) return (link != 0u && townHere != 0 && inThatTown == 0) ? kOoMove : kOoPutBack;
+    if (restored != 0) return kOoRestored;
+    if (engine == kOeUnread || engine < kOeOwnLive || engine > kOeUnread) return kOoUnread;
+    if (engine == kOeOwnLive || engine == kOeMate) return kOoKeep;
+    if (link == 0u) return kOoNoRecord;
+    if (townHere == 0) return kOoUnresolved;
+    return inThatTown != 0 ? kOoSame : kOoMove;
+}
+/* T-1332 fold 1 (review 6a): 1 = the step kept the engine's link OVER a record that names another outpost - kOoKeep (a live town of
+   this player or a teammate's outpost) while the record names an outpost (link) whose town the piece is not in (inThatTown 0, or no
+   town of it here). This is kTlOwn's purpose at work (the engine founding an outpost relinked the piece before the record follows);
+   the caller writes a per-key line for it, so a run can see THAT piece judged, not just a count */
+inline int PieceOwnKeptOverRecord(int step, unsigned int link, int inThatTown)
+{
+    return (step == kOoKeep && link != 0u && inThatTown == 0) ? 1 : 0;
+}
+inline const char* PieceOwnEngineName(int e)
+{
+    static const char* const n[] = { "a live town of this player", "a teammate's outpost", "another player's copy", "no live town (none, dead or the wilderness town)", "a world town", "not read" };
+    return (e >= kOeOwnLive && e <= kOeUnread) ? n[e] : "unknown";
+}
 /* T-1047 step 5 fold 1: the marked link stands only while its write is owed or sent and not answered (writeOwed / writeFlying); once
    the write is settled - taken, refused or lost - the mark is dropped (0), so the next look marks it again while the stored record
    still does not name the engine's link (a retry covered by the recurring look, not a one-shot mark) */
@@ -1799,6 +1851,45 @@ inline int PieceTownCycleStep(int cycle, int recordPowerKnown)
 {
     if (cycle != kCycleFailed) return kCycleStepNothing;
     return recordPowerKnown != 0 ? kCycleStepRecordSwitch : kCycleStepLeftOff;
+}
+/* T-1001 (F1054): A PIECE INSIDE A BUILDING FOLLOWS ITS HOST'S TOWN - the engine's own rule (Read): a building's town is the town of
+   its TOP parent (0x296900 walks the layout +0x238 / parent hand +0x88 up and reads that building's town hand +0x1D0), a placement
+   inside a building takes its host's town (0x4D6300), and setPowerOn 0x2973B0 leaves / joins the grid of the town 0x296900 gives. So
+   when a top-level piece's town is re-written (BdBuildingSetTownPod - every relink road), each piece inside it changes town with it: a
+   switched-on power piece inside it is switched off BEFORE the host's words change (it leaves the old town's grid) and on AFTER (it joins
+   the new one), and the host's new town words are written onto its own town hand, as the engine's placement gives it. Words: */
+const int kInsideLeave = 0, kInsideWrite = 1, kInsideKept = 2, kInsideUnread = 3;
+/* pieceTop: the piece's own top-level read (0 = stands inside a building; 1 = top-level; -1 = a fault); hostWritten: the host's copy
+   (1 = written); wordsRead / sameAsNew: the piece's own town words read, and equal to the new town's */
+inline int InsideWordsStep(int pieceTop, int hostWritten, int wordsRead, int sameAsNew)
+{
+    if (pieceTop != 0 || hostWritten != 1) return kInsideLeave;   /* not a piece inside it, or the host did not move: nothing written */
+    if (wordsRead == 0) return kInsideUnread;
+    return sameAsNew != 0 ? kInsideKept : kInsideWrite;
+}
+/* the inside piece's power, as the host's (kCycle*): wasOn = switched off before the host's copy; onAgain = its switch reads on after */
+inline int InsidePowerCycle(int wasOn, int onAgain)
+{
+    if (wasOn == 0) return kCycleNone;
+    return onAgain != 0 ? kCycleBack : kCycleFailed;
+}
+/* one line per inside piece that changed (words written, power re-switched, a fault): the first `cap`, then every 100th */
+inline int InsideLineDue(long long n, long long cap) { return (n > 0 && (n <= cap || n % 100 == 0)) ? 1 : 0; }
+/* fold (review LOW 3): a host's interior list - hasInterior: Building+0x1F0 not 0 (1), 0 none, -1 a fault; listed: the list's own size
+   (-1 = it did not read). A host with an interior whose list does not read (or whose interior does not read) is counted, never taken for
+   "nothing inside" */
+const int kInsideListNone = 0, kInsideListRead = 1, kInsideListUnread = 2;
+inline int InsideListStep(int hasInterior, int listed)
+{
+    if (hasInterior == 0) return kInsideListNone;
+    return (hasInterior > 0 && listed >= 0) ? kInsideListRead : kInsideListUnread;
+}
+/* fold (review MED 1): the host's look (its record's kTlSame step - it stands in its town): 1 = this piece inside it is set to the host's
+   town (its own words read and are not the host's town's: it loaded before its host - 0x296900 then read its OWN words and it joined that
+   town's grid - or a road missed it); 0 = nothing (not an inside piece, words unread, or already the host's town) */
+inline int InsideLookStep(int pieceTop, int wordsRead, int sameAsHost)
+{
+    return (pieceTop == 0 && wordsRead != 0 && sameAsHost == 0) ? 1 : 0;
 }
 
 /* ---- A PLAYER FARM'S CROP ON ITS RECORD ----

@@ -12,11 +12,11 @@
 //   (answered-other); anything else keeps waiting.
 namespace townreoffer {
 
-// DeferCause: why a gate sets work aside. `linked` = the notebook link; `may` = zones' MayInventFromView answer
+// DeferCause: why a gate sets work aside. `linked` = the notebook link; `may` = zones' MayMakeFromView answer (T-1261)
 // (1 invent, 0 not mine, -1 no fresh map, -2 teardown); `held` = AreaViewTS's held (1 = another game holds the area).
 const int kDefNone = 0;         // answered: invent, another game holds it, or teardown - nothing is set aside
 const int kDefNoMap = 1;        // no fresh area map
-const int kDefNobody = 2;       // the map answered and nobody holds the area (and it is not this game's to presume)
+const int kDefNobody = 2;       // the map answered and nobody holds the area yet (T-1261, decision 1531: only the named holder makes people)
 const int kDefNoNotebook = 3;   // no notebook link yet
 const int kDefTestLever = 4;   // T-581: the TEST-ONLY `owedtest aside on` - work this game would make now is set aside
 const int kDefOwed = 5;        // T-581: work this game would make now is an owed row it does not hold (made under a claim, owedpop.h)
@@ -34,10 +34,18 @@ inline int DeferCause(int linked, int may, int held)
 // check-up judges it again (Decide waits while may is 0 and nobody else holds the area).
 // Only the plain "nobody holds it" answer (held 0) becomes kDefLoading; a frozen area (held -2) or one with no map row (held -1)
 // keeps the label DeferCause gives it.
-inline int DeferCauseAt(int linked, int may, int held, int loadedHere)
+// T-1261 re-check fold (MED): `holderLoaded` = zones' HolderLoadedTS (1 = the game named the holder has the area in its own loaded
+// bits). Another game named (held 1) is an answer only once that naming is confirmed. The world server used to name a game ahead of
+// its loaded report (T-1285 removed that: it names only a game whose latest report lists the area), and the map can still name a
+// holder ahead of its loaded bit for a map period (decision 1556, areaclaim.h AreaChargeDecide); work refused as another game's inside that window was
+// never set aside, and the town stayed empty if the area then passed to this game. So held 1 with holderLoaded not 1 is "nobody yet"
+// (kDefNobody, or kDefLoading before the area is loaded here): the work is set aside and the town's check-up waits for the naming to
+// settle (OtherConfirmed below) - made here if this game is named, settled as another game's once that naming is confirmed.
+inline int DeferCauseAt(int linked, int may, int held, int loadedHere, int holderLoaded)
 {
-    const int c = DeferCause(linked, may, held);
-    if (c == kDefNobody && held == 0 && loadedHere != 1) return kDefLoading;
+    const int h = (held == 1 && holderLoaded != 1) ? 0 : held;
+    const int c = DeferCause(linked, may, h);
+    if (c == kDefNobody && h == 0 && loadedHere != 1) return kDefLoading;
     return c;
 }
 inline const char* DeferCauseName(int c)
@@ -59,8 +67,8 @@ inline const char* DeferCauseName(int c)
 //   filledElsewhere 1 = the notebook records a fill by some game (bar: town_bars lastFilled >= 0) - never a second roll
 //   notebookPending 1 = the notebook lists people for the town this game has not placed yet, from an area that holds the town
 //                   (StoreTownPeoplePending answers townpending::kTownHeld - src/common/townpending.h)
-//   may             T-392 fold (review LOW): the load-time gate's own answer for the item's sector (zones' MayInventFromView:
-//                   1 invent, 0 not mine, -1 no fresh map, -2 teardown) - the same presumptions as at load
+//   may             T-392 fold (review LOW): the load-time gate's own answer for the item's sector (zones' MayMakeFromView since
+//                   T-1261: 1 this game is the named holder, 0 not, -1 no fresh map, -2 teardown) - the same rule as at load
 //   held            AreaViewTS's held (1 = another game holds the area)
 const int kReWait = 0;       // keep waiting (no map, nobody, zone not live here, notebook people still to come)
 const int kReGenerate = 1;   // this game holds the area: re-run through the normal gate
@@ -75,6 +83,18 @@ inline int Decide(int zoneLive, int filled, int filledElsewhere, int notebookPen
     if (may == 1) return kReGenerate;
     if (may == 0 && held == 1) return kReOther;
     return kReWait;
+}
+
+// T-1261 fold (review LOW 4): OtherConfirmed - Decide's `another game holds it` (kReOther) stands only once the game named the area's
+// holder has the area in its own loaded bits (`holderLoaded` 1: zones' HolderLoadedTS). A holder whose report drops an area passes it at
+// once to another lister or to nobody (decision 1556, areaclaim.h AreaChargeDecide), and a map can lag its bits; set-aside work settled as
+// another game's inside that window was forgotten, and the town stayed empty if the area then passed
+// to this game. Until the naming is confirmed the item waits (kReWait); a holder past its own report (it unloaded the area and its
+// lease is running out) waits the same way. Only kReOther with `held` 1 is changed.
+inline int OtherConfirmed(int decide, int held, int holderLoaded)
+{
+    if (decide == kReOther && held == 1 && holderLoaded != 1) return kReWait;
+    return decide;
 }
 
 // T-438 (t438-townreoffer; a regression of T-392, found in T788): populateBuilding 0x57ED90 is not only the residents. Before it

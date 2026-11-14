@@ -158,6 +158,65 @@ inline int KeeperForm(int nArgs, int npc, int stack, int sell, int pack, int cat
     return kFormPlayer;
 }
 
+/* T-1120 (TEST LEVER): `buytest keeper <...> hold=<s>` - the trade window is opened and KEPT OPEN for s seconds (nothing is bought),
+   then closed by the lever's one close from the main-thread tick. kHoldMin..kHoldMax seconds.
+   HoldSecs(tok): -1 = the token is not a hold= token; 0 = a hold= token that is malformed or out of range (usage); else the seconds. */
+const int kHoldMin = 1, kHoldMax = 30;
+inline int HoldSecs(const char* tok)
+{
+    if (tok == 0 || std::strncmp(tok, "hold=", 5) != 0) return -1;
+    const char* d = tok + 5;
+    if (*d == 0) return 0;
+    int v = 0;
+    for (; *d != 0; ++d)
+    {
+        if (*d < '0' || *d > '9') return 0;
+        v = v * 10 + (*d - '0');
+        if (v > kHoldMax) return 0;
+    }
+    return (v >= kHoldMin) ? v : 0;
+}
+/* the form with hold= folded in: hold goes only with the player's plain buy (no sell, no npc); a bad or repeated hold= is usage.
+   hold 0 = not asked - the form is KeeperForm's unchanged. */
+inline int KeeperHoldForm(int form, int sell, int hold, int holdBad)
+{
+    if (holdBad != 0) return kFormBad;
+    if (hold > 0 && (form != kFormPlayer || sell != 0)) return kFormBad;
+    return form;
+}
+
+/* T-1120 (TEST LEVER ONLY): `shoptest stale <s>` | `shoptest stale off` - on the game that does NOT hold a shop's area, the holder's
+   PUSHED shop-counter contents are held back s seconds (kStaleMin..kStaleMax), then applied in the order they came, so a trade
+   window opened meanwhile opens on stock that is out of date. The holder's fill push and its answer to this game's ask are the SAME
+   message (MSG_PARITY_BOX, status CONTENTS - nothing on the wire tells them apart), so an arrival is read as a push only when no ask
+   of this game awaits its key: an open window's ask and its answer are never held.
+   StaleSecs(tok): -1 = "off"; 0 = malformed or out of range (usage); else the seconds. */
+const int kStaleMin = 1, kStaleMax = 60;
+const int kStaleCap = 256;   /* held updates at most; one past it goes in at once (counted, said) */
+inline int StaleSecs(const char* tok)
+{
+    if (tok == 0 || *tok == 0) return 0;
+    if (std::strcmp(tok, "off") == 0) return -1;
+    int v = 0;
+    for (const char* d = tok; *d != 0; ++d)
+    {
+        if (*d < '0' || *d > '9') return 0;
+        v = v * 10 + (*d - '0');
+        if (v > kStaleMax) return 0;
+    }
+    return (v >= kStaleMin) ? v : 0;
+}
+/* what this game does with one MSG_PARITY_BOX that decoded: leverOn = the lever's time is running; contents = status CONTENTS (an
+   equal / notHolder / unreadable / notFound answer replaces nothing and is never held); askAwaited = an ask of this game awaits the
+   key (an open window's ask, an arrival player-box ask, a pull, a hand-back) - the message is that ask's answer; shopCounter = the key
+   is a piece of a loaded trader's home here. Held only: lever on, contents, no ask awaiting it, a shop counter, room in the list. */
+const int kStaleGo = 0, kStaleHeld = 1, kStaleFull = 2;
+inline int StaleHold(int leverOn, int contents, int askAwaited, int shopCounter, int heldNow)
+{
+    if (leverOn == 0 || contents == 0 || askAwaited != 0 || shopCounter == 0) return kStaleGo;
+    return (heldNow >= kStaleCap) ? kStaleFull : kStaleHeld;
+}
+
 }   // namespace keeperaim
 
 #endif

@@ -6,7 +6,18 @@
  */
 #include <limits>
 #include "suite.h"
+#include <algorithm>   /* T-1145: std::find */
 #include "../common/bookshare.h"   /* T-1242 */
+#include "../common/raidroll.h"   /* T-1122 roller (owner 1577 c) */
+#include "teamstub.h"   /* T-1250: the teammate list lookup the left-click window asks */
+
+#include "../common/actowed.h"   /* T-860 */
+#include "../common/cagerec.h"   /* T-860: the cage record */
+#include "../common/bldgrec.h"   /* T-1333: the town building record */
+#include "../common/doorrec.h"   /* T-1333 fold 3: a town door's health */
+#include "../common/buildwire.h"   /* T-1333: the HIT ask's wall repair */
+#include "../common/prisonwire.h"   /* T-860 fold 1: FREED's owner rule */
+#include <map>
 
 namespace suite {
 
@@ -40,6 +51,21 @@ void t_key_height_into_offset()
         Fail("upgrade lever: a wall is not refused, or refused before the own check");
     if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 0) != coopbuild::kBuildUpgradeGo)
         Fail("upgrade lever: an own complete piece with an 'upgrades to' record is refused");
+    /* T-1294: `wall` lets a lone wall (group count 0) through; a wall leading a group, or with an unreadable count, is still refused */
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 1, 1, 0) != coopbuild::kBuildUpgradeGo)
+        Fail("upgrade lever: a lone own complete wall asked with `wall` is refused");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 1, 0, 0) != coopbuild::kBuildUpgradeWall
+        || coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 1, 1, 2) != coopbuild::kBuildUpgradeWallGroup
+        || coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 1, 1, -1) != coopbuild::kBuildUpgradeWallGroup)
+        Fail("upgrade lever: a wall not asked for, a wall leading a group or a wall whose count does not read goes through");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 1, 1, 1, 0, 0, 1, 1, 1, 0) != coopbuild::kBuildUpgradeNotOwn
+        || coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 0, 0, 0, 1, 1, 1, 0) != coopbuild::kBuildUpgradeNotComplete
+        || coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 0, 1, 1, 0) != coopbuild::kBuildUpgradeNoRecord)
+        Fail("upgrade lever: a lone wall asked with `wall` skips the own, complete or target checks");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 0, 1, 5) != coopbuild::kBuildUpgradeGo)
+        Fail("upgrade lever: `wall` or a group count changes the verdict for a piece that is not a wall");
+    if (std::string(coopbuild::BuildUpgradeLeverWhy(coopbuild::kBuildUpgradeWallGroup, 0)).find("group") == std::string::npos)
+        Fail("upgrade lever: the wall-group refusal does not say why");
     if (coopbuild::BuildUpgradeLeverVerdict(0, 0, 1, 1, 0, 0, 1, 0) != coopbuild::kBuildUpgradeNotOwn
         || coopbuild::BuildUpgradeLeverVerdict(1, 1, 1, 1, 0, 0, 1, 0) != coopbuild::kBuildUpgradeNotOwn)
         Fail("upgrade lever: a piece that is not own (or a copy) is not refused as not own");
@@ -5261,21 +5287,209 @@ void t_t1018_setup_restock()
     if (SetupRestockDecide(1, 0, 0, 0) != kSetupRestockRun) Fail("T-1018: a forced restock with no stored stock (no records, empty, unread) did not run");
     if (SetupRestockDecide(1, 1, 0, 1) != kSetupRestockRun) Fail("T-1018: the mod's own test command's restock was refused");
     if (SetupRestockDecide(1, 0, 1, 1) != kSetupRestockRun) Fail("T-1018: a wandering trader's forced restock was refused");
-    if (SetupPieceHeld(1, 1, 3, coopbrec::kBasDone) != 1) Fail("T-1018: an applied shop record with items did not hold");
-    if (SetupPieceHeld(1, 1, 3, coopbrec::kBasNotWriter) != 1) Fail("T-1018: a shop record another game writes did not hold");
-    if (SetupPieceHeld(1, 1, 3, coopbrec::kBasRefused) != 1) Fail("T-1018: a refused shop record (this game's box stands) did not hold");
-    if (SetupPieceHeld(1, 1, 3, coopbrec::kBasNone) != 0) Fail("T-1018: a shop record not decided at this load held");
-    if (SetupPieceHeld(1, 1, 3, coopbrec::kBasWait) != 0) Fail("T-1018: a shop record waiting at this load held");
-    if (SetupPieceHeld(1, 1, 3, coopbrec::kBasNoBox) != 0) Fail("T-1018: a shop record whose box is not here held");
-    if (SetupPieceHeld(1, 1, 3, 5) != 0 || SetupPieceHeld(1, 1, 3, -1) != 0) Fail("T-1018: an unknown apply state held");
-    if (SetupPieceHeld(0, 1, 3, coopbrec::kBasDone) != 0) Fail("T-1018: a counter with no record held");
-    if (SetupPieceHeld(1, 0, 3, coopbrec::kBasDone) != 0) Fail("T-1018: a plain box record held");
-    if (SetupPieceHeld(1, 1, 0, coopbrec::kBasDone) != 0) Fail("T-1018: an empty shop record held");
-    if (SetupPieceHeld(1, 1, -1, coopbrec::kBasDone) != 0) Fail("T-1018: a negative item count held");
+    const int kS = coopbrec::kBrKindShop;
+    if (SetupPieceHeld(1, kS, -1, 3, coopbrec::kBasDone) != 1) Fail("T-1018: an applied shop record with items did not hold");
+    if (SetupPieceHeld(1, kS, -1, 3, coopbrec::kBasNotWriter) != 1) Fail("T-1018: a shop record another game writes did not hold");
+    if (SetupPieceHeld(1, kS, -1, 3, coopbrec::kBasRefused) != 1) Fail("T-1018: a refused shop record (this game's box stands) did not hold");
+    if (SetupPieceHeld(1, kS, -1, 3, coopbrec::kBasNone) != 0) Fail("T-1018: a shop record not decided at this load held");
+    if (SetupPieceHeld(1, kS, -1, 3, coopbrec::kBasWait) != 0) Fail("T-1018: a shop record waiting at this load held");
+    if (SetupPieceHeld(1, kS, -1, 3, coopbrec::kBasNoBox) != 0) Fail("T-1018: a shop record whose box is not here held");
+    if (SetupPieceHeld(1, kS, -1, 3, 5) != 0 || SetupPieceHeld(1, kS, -1, 3, -1) != 0) Fail("T-1018: an unknown apply state held");
+    if (SetupPieceHeld(0, kS, -1, 3, coopbrec::kBasDone) != 0) Fail("T-1018: a counter with no record held");
+    if (SetupPieceHeld(1, coopbrec::kBrKindBox, -1, 3, coopbrec::kBasDone) != 1) Fail("T-1130: a home counter whose record a game labelled a plain box did not hold");
+    if (SetupPieceHeld(1, coopbrec::kBrKindBox, 2, 3, coopbrec::kBasDone) != 0) Fail("T-1130: a player's box held a shop's stock");
+    if (SetupPieceHeld(1, kS, -1, 0, coopbrec::kBasDone) != 0) Fail("T-1018: an empty shop record held");
+    if (SetupPieceHeld(1, kS, -1, -1, coopbrec::kBasDone) != 0) Fail("T-1018: a negative item count held");
     if (RestockDeadlineAsEngine(38.5, 24.0f, 24000.0f) != 62.5) Fail("T-1018: the deadline is not now + the squad's refresh time");
     if (RestockDeadlineAsEngine(38.5, 12.0f, 24000.0f) != 50.5) Fail("T-1018: a squad's own 12 is not used");
     if (RestockDeadlineAsEngine(38.5, 0.0f, 24000.0f) != 24038.5) Fail("T-1018: a missing (0) field does not take the default");
     if (RestockDeadlineAsEngine(38.5, -3.0f, 24000.0f) != 24038.5) Fail("T-1018: a negative field does not take the default");
+}
+/* T-1130 fold: the kept record and its apply row as HomeApplyHold reads them (items.cpp BoxRecKept / BoxRecW carry the same members) */
+struct T1130Kept { coopbrec::BoxHeader h; };
+struct T1130Apply { int applyState; };
+/* T-1130: a box no player owns carries its undos whatever this game's label says, and is written as a shop's (kind 1) whenever it
+   carries any, so the record keeps them and decodes; a shop's restock is held only by its OWN home's pieces whatever their records'
+   kind (a counter left undecided elsewhere in the map section does not hold it), and held while its home cannot be read. */
+void t_t1130_kind_label()
+{
+    using namespace coopbrec;
+    using namespace shopsetup;
+    /* THE WRITE'S KIND AND UNDOS */
+    if (BoxCarriesUndos(-1) != 1 || BoxCarriesUndos(0) != 0 || BoxCarriesUndos(2) != 0) Fail("T-1130: undos carried other than for a box no player owns");
+    if (BoxWriteKind(kBrKindBox, -1, 0) != kBrKindBox) Fail("T-1130: a nobody's box labelled plain with no undos was not written plain");
+    if (BoxWriteKind(kBrKindBox, -1, 2) != kBrKindShop) Fail("T-1130: a nobody's box labelled plain with undos was not written as a shop's");
+    if (BoxWriteKind(kBrKindShop, -1, 0) != kBrKindShop || BoxWriteKind(kBrKindShop, -1, 1) != kBrKindShop) Fail("T-1130: a box labelled a shop was not written as one");
+    if (BoxWriteKind(kBrKindBox, 2, 3) != kBrKindBox) Fail("T-1130: a player's box took a shop's kind");
+    if (BoxWriteKind(kBrKindBox, -1, 0, 1) != kBrKindShop) Fail("T-1130: a nobody's box labelled plain whose kept record carries undos was not written as a shop's");
+    if (BoxWriteKind(kBrKindBox, -1, 0, 0) != kBrKindBox) Fail("T-1130: a nobody's box labelled plain with no undos anywhere was not written plain");
+    if (BoxWriteKind(kBrKindBox, 2, 0, 1) != kBrKindBox) Fail("T-1130: a player's box took a shop's kind from a kept undo list");
+    {   /* a counter this game labels plain (its shop list not filled yet): the stored record's undo and this game's own go in the write */
+        const std::string ck = "12-counter.mod@3,4@1003,-205,100";
+        std::vector<cooppar::ParityItem> items;
+        items.push_back(T823BoxItem("katana", 0, 0, 1));
+        std::vector<BoxUndoKey> kept, local, done, carried;
+        BoxUndoKey a; a.asker = 5; a.epoch = 9; a.id = 4;
+        BoxUndoKey b = a; b.id = 6;
+        kept.push_back(a); local.push_back(b);
+        unsigned int dropped = 0;
+        BoxHeader h; h.flags = 0; h.generation = 5; h.writerSlot = 1; h.kind = kBrKindBox; h.ownerSlot = -1; h.key = ck;
+        if (BoxCarriesUndos(h.ownerSlot) != 0) BoxUndoCarry(kept, local, done, &h.undos, &dropped);
+        h.kind = BoxWriteKind(h.kind, h.ownerSlot, h.undos.size());
+        std::vector<char> rec;
+        BoxHeader back;
+        if (h.undos.size() != 2 || h.kind != kBrKindShop) Fail("T-1130: the undos of a counter labelled plain were not carried");
+        else if (!EncodeBoxRecord(&rec, h, items)) Fail("T-1130: a counter labelled plain with undos was not encoded");
+        else if (DecodeBoxRecord(&rec[0], rec.size(), &back, 0) != kBrOk || back.kind != kBrKindShop || BoxUndoHas(back.undos, 5, 9, 4) != 1
+                 || BoxUndoHas(back.undos, 5, 9, 6) != 1 || (back.flags & kBrFlagUndos) == 0)
+            Fail("T-1130: the carried undos did not read back");
+        else
+        {
+            const std::vector<int> loaded(1, 1);
+            if (BoxJudgeWrite(MakeBoxRecId(ck), &rec[0], rec.size(), 1, 1, loaded, 1, 4u, -1, kBrKindBox, 0, 0) != kBrAccept)
+                Fail("T-1130: the world server refused the counter's record with undos over a stored plain record");
+        }
+        {   /* a GUARD, not a game path (items.cpp BoxUndoListFor drops done undos only for a box this game labels a shop, so a write
+               labelled plain carries every kept undo): asked for a write with no undos over a kept list that carries some, BoxWriteKind
+               answers a shop's, and the world server takes it over the stored shop record with undos; an older game's plain write with
+               no undos there is refused */
+            BoxHeader d = h; d.undos.clear();
+            std::vector<BoxUndoKey> allDone(kept); allDone.push_back(b);
+            BoxUndoCarry(kept, local, allDone, &d.undos, &dropped);
+            d.kind = BoxWriteKind(kBrKindBox, d.ownerSlot, d.undos.size(), kept.empty() ? 0 : 1);
+            const std::vector<int> loaded(1, 1);
+            std::vector<char> drec, orec;
+            if (!d.undos.empty() || d.kind != kBrKindShop) Fail("T-1130: guard: a write with no undos over a kept undo list was not a shop's");
+            else if (!EncodeBoxRecord(&drec, d, items) || BoxJudgeWrite(MakeBoxRecId(ck), &drec[0], drec.size(), 1, 1, loaded, 1, 4u, -1, kBrKindShop, 0, 0, 1) != kBrAccept)
+                Fail("T-1130: the world server refused a write with every undo done over a shop record with undos");
+            BoxHeader old = d; old.kind = kBrKindBox;
+            if (!EncodeBoxRecord(&orec, old, items) || BoxJudgeWrite(MakeBoxRecId(ck), &orec[0], orec.size(), 1, 1, loaded, 1, 4u, -1, kBrKindShop, 0, 0, 1) != kBrRefuseKindChange)
+                Fail("T-1130: the world server took an older game's plain write over a shop record with undos");
+        }
+        {   /* T-1130 re-check: THE WORLD SERVER'S UNDO FLAG OF A STORED RECORD (store_main.cpp BoxStoredHead reads the file's first
+               kBrHeaderMaxBytes bytes, BoxLanded the bytes it stored; both through BoxHeaderUndos) - then BoxJudgeWrite's storedUndos */
+            const std::vector<int> loaded(1, 1);
+            BoxHeader plain = h; plain.undos.clear(); plain.kind = kBrKindBox;
+            std::vector<char> plainRec;
+            BoxHeader hd;
+            const size_t cut = rec.size() < (size_t)kBrHeaderMaxBytes ? rec.size() : (size_t)kBrHeaderMaxBytes;
+            if (rec.empty() || DecodeBoxHeader(&rec[0], cut, &hd) != kBrOk || BoxHeaderUndos(hd) != 1)
+                Fail("T-1130 re-check: a stored shop record's head (the file's first bytes) did not read its undo list");
+            else if (DecodeBoxHeader(&rec[0], rec.size(), &hd) != kBrOk || BoxHeaderUndos(hd) != 1)
+                Fail("T-1130 re-check: a landed shop record's head did not read its undo list");
+            else if (!EncodeBoxRecord(&plainRec, plain, items) || DecodeBoxHeader(&plainRec[0], plainRec.size(), &hd) != kBrOk || BoxHeaderUndos(hd) != 0)
+                Fail("T-1130 re-check: a record with no undo list read one");
+            else if (DecodeBoxHeader(&rec[0], cut, &hd) == kBrOk
+                     && BoxJudgeWrite(MakeBoxRecId(ck), &plainRec[0], plainRec.size(), 1, 1, loaded, 1, 4u, -1, hd.kind, 0, 0, BoxHeaderUndos(hd)) != kBrRefuseKindChange)
+                Fail("T-1130 re-check: the undo flag read from a stored head did not refuse a plain write that drops it");
+        }
+        BoxHeader o = h; o.kind = kBrKindBox; o.ownerSlot = 2; o.undos.clear();
+        if (BoxCarriesUndos(o.ownerSlot) != 0) BoxUndoCarry(kept, local, done, &o.undos, &dropped);
+        if (!o.undos.empty() || BoxWriteKind(o.kind, o.ownerSlot, o.undos.size()) != kBrKindBox) Fail("T-1130: a player's box carried undos");
+    }
+    /* THE RESTOCK HOLD, PER HOME: shop A's counters, and shop B's counters in the same map section */
+    HomePiece decided; decided.haveRecord = 1; decided.kind = kBrKindShop; decided.ownerSlot = -1; decided.applyState = kBasDone;
+    HomePiece stuck = decided; stuck.applyState = kBasNone;
+    HomePiece stuckPlain = stuck; stuckPlain.kind = kBrKindBox;
+    HomePiece noRec = stuck; noRec.haveRecord = 0;
+    HomePiece player = stuck; player.kind = kBrKindBox; player.ownerSlot = 2;
+    HomePiece heldFail = decided; heldFail.applyState = kBasHeldFail;
+    std::vector<HomePiece> shopA, shopB;
+    shopA.push_back(decided); shopA.push_back(stuck);
+    shopB.push_back(decided); shopB.push_back(decided);
+    if (HomeRestockHold(1, HomePiecesHolding(shopA)) != kHomeHoldPiece) Fail("T-1130: a shop with an undecided counter was not held");
+    if (HomeRestockHold(1, HomePiecesHolding(shopB)) != kHomeHoldNone) Fail("T-1130: a shop was held by another shop's undecided counter in its section");
+    std::vector<HomePiece> c;
+    c.push_back(stuckPlain);
+    if (HomeRestockHold(1, HomePiecesHolding(c)) != kHomeHoldPiece) Fail("T-1130: an undecided counter whose record is labelled plain did not hold");
+    c.clear(); c.push_back(noRec); c.push_back(player); c.push_back(decided);
+    if (HomeRestockHold(1, HomePiecesHolding(c)) != kHomeHoldNone) Fail("T-1130: a piece with no record, or a player's box, held the restock");
+    c.clear(); c.push_back(heldFail);
+    if (HomeRestockHold(1, HomePiecesHolding(c)) != kHomeHoldPiece) Fail("T-1130: a counter whose update failed did not hold");
+    c.clear();
+    if (HomeRestockHold(1, HomePiecesHolding(c)) != kHomeHoldNone) Fail("T-1130: a home read with no pieces held the restock");
+    if (HomeRestockHold(kHomeWalkTorn, 0) != kHomeHoldUnread || HomeRestockHold(kHomeWalkTorn, 2) != kHomeHoldUnread) Fail("T-1130: a torn home walk did not hold");
+    if (HomeRestockHold(kHomeWalkNoInterior, 0) != kHomeHoldNone || HomeRestockHold(kHomeWalkNoInterior, 2) != kHomeHoldNone)
+        Fail("T-1130: a home with no interior held the restock (nothing would release it)");
+    /* T-1130 re-check (F1026): A HOME WALK'S UNRESOLVED LISTED BUILDINGS - dead handles stop tearing it only once their set has lasted the
+       wait in a loaded area; any other unresolved handle keeps it torn */
+    {
+        const long long w = coopbuild::kBuildDeadHandleWait;
+        if (HomeWalkUnresolved(0, 0, 0, -1) != kHomeWalkRead) Fail("T-1130 re-check: a walk with every listed building resolved was not read");
+        if (HomeWalkUnresolved(0, 2, 1, -1) != kHomeWalkTorn) Fail("T-1130 re-check: a dead set seen for the first time did not keep the walk torn");
+        if (HomeWalkUnresolved(0, 2, 1, w - 1) != kHomeWalkTorn) Fail("T-1130 re-check: a dead set younger than the wait did not keep the walk torn");
+        if (HomeWalkUnresolved(0, 2, 1, w) != kHomeWalkRead || HomeWalkUnresolved(0, 1, 1, w + 500) != kHomeWalkRead)
+            Fail("T-1130 re-check: an aged dead set in a loaded area did not count as no piece");
+        if (HomeWalkUnresolved(1, 2, 1, w + 500) != kHomeWalkTorn || HomeWalkUnresolved(1, 0, 1, -1) != kHomeWalkTorn)
+            Fail("T-1130 re-check: a handle not resolved for another reason (a fault, an object, other ids) did not keep the walk torn");
+        if (HomeWalkUnresolved(0, 2, 0, w + 500) != kHomeWalkTorn) Fail("T-1130 re-check: an aged dead set in an area not loaded did not keep the walk torn");
+        /* the per-home memory as items.cpp ItHomeWalkVerdict steps it: the same set ages, a changed set waits again, then the hold */
+        int had = 0; std::string ks; unsigned int at = 0;
+        std::vector<unsigned int> d1; d1.push_back(7); d1.push_back(40); d1.push_back(3);
+        std::vector<unsigned int> d2(d1); d2.push_back(7); d2.push_back(41); d2.push_back(9);
+        const long long a0 = coopbuild::BuildDeadSetStep(&had, &ks, &at, coopbuild::BuildDeadSetSig(d1), 1000u);
+        const long long a1 = coopbuild::BuildDeadSetStep(&had, &ks, &at, coopbuild::BuildDeadSetSig(d1), 1000u + (unsigned int)w);
+        const long long a2 = coopbuild::BuildDeadSetStep(&had, &ks, &at, coopbuild::BuildDeadSetSig(d2), 1000u + (unsigned int)w + 1u);
+        if (HomeApplyHold(HomeWalkUnresolved(0, 1, 1, a0), std::vector<std::string>(), std::map<std::string, T1130Kept>(), std::map<std::string, T1130Apply>(), 100) != kHomeHoldUnread)
+            Fail("T-1130 re-check: a home whose dead set was just seen did not hold its restock");
+        if (HomeApplyHold(HomeWalkUnresolved(0, 1, 1, a1), std::vector<std::string>(), std::map<std::string, T1130Kept>(), std::map<std::string, T1130Apply>(), 100) != kHomeHoldNone)
+            Fail("T-1130 re-check: a home whose same dead set lasted the wait, area loaded, still held its restock");
+        if (HomeWalkUnresolved(0, 2, 1, a2) != kHomeWalkTorn) Fail("T-1130 re-check: a changed dead set did not wait again");
+    }
+    /* THE HOLD FROM THE WALK (BoxRecHomeApplyPending through HomeApplyHold): each walked key -> its record id -> the kept record and its apply */
+    {
+        const std::string kA = "12-counter.mod@3,4@1003,-205,100", kB = "12-counter.mod@3,4@1010,-205,100", kO = "12-counter.mod@3,4@1020,-205,100";
+        const std::string idA = MakeBoxRecId(kA), idB = MakeBoxRecId(kB), idO = MakeBoxRecId(kO);
+        if (idA.empty() || idB.empty() || idO.empty() || idA == idB || idA == idO || idB == idO) Fail("T-1130: wiring: the test's keys give no distinct record ids");
+        else
+        {
+            std::map<std::string, T1130Kept> kr; std::map<std::string, T1130Apply> ap;
+            T1130Kept plain; plain.h.kind = kBrKindBox; plain.h.ownerSlot = -1;   /* a counter some game labelled plain */
+            T1130Apply dn; dn.applyState = kBasDone;
+            T1130Apply nd; nd.applyState = kBasNone;
+            kr[idA] = plain; kr[idB] = plain; kr[idO] = plain;
+            ap[idA] = dn; ap[idB] = dn; ap[idO] = nd;   /* idO: another shop's counter in the same map section, undecided */
+            std::vector<std::string> keys; keys.push_back(kA); keys.push_back(kB);
+            if (HomeApplyHold(kHomeWalkRead, keys, kr, ap, 100) != kHomeHoldNone) Fail("T-1130: wiring: a shop whose own counters are decided was held");
+            ap[idB] = nd;
+            if (HomeApplyHold(kHomeWalkRead, keys, kr, ap, 100) != kHomeHoldPiece) Fail("T-1130: wiring: an undecided counter labelled plain did not hold its shop");
+            ap.erase(idB);
+            if (HomeApplyHold(kHomeWalkRead, keys, kr, ap, 100) != kHomeHoldPiece) Fail("T-1130: wiring: a kept record with no apply row (table not full) did not hold");
+            if (HomeApplyHold(kHomeWalkRead, keys, kr, ap, ap.size()) != kHomeHoldNone) Fail("T-1130: wiring: a full apply table held the restock");
+            ap[idB] = nd; kr[idB].h.ownerSlot = 2;
+            if (HomeApplyHold(kHomeWalkRead, keys, kr, ap, 100) != kHomeHoldNone) Fail("T-1130: wiring: a player's box held a shop's restock");
+            kr.erase(idB);
+            keys.push_back("not a box key");
+            if (HomeApplyHold(kHomeWalkRead, keys, kr, ap, 100) != kHomeHoldNone) Fail("T-1130: wiring: a piece with no record, or a key with no record id, held");
+            if (HomeApplyHold(kHomeWalkTorn, keys, kr, ap, 100) != kHomeHoldUnread) Fail("T-1130: wiring: a torn home walk did not hold");
+            if (HomeApplyHold(kHomeWalkNoInterior, std::vector<std::string>(), kr, ap, 100) != kHomeHoldNone) Fail("T-1130: wiring: a home with no interior held");
+        }
+    }
+}
+/* T-1130 TEST-ONLY `boxtest plainkind`: a box's write is made plain only over a kept shop record no player owns with no undo list stored or
+   carried; a record already plain needs nothing; the arm lasts its window, the tick count's wrap included. */
+void t_t1130_plainkind_lever()
+{
+    using namespace coopbrec;
+    if (BoxPlainKindPlan(1, kBrKindShop, -1, -1, 0, 0) != kPkSend) Fail("T-1130 plainkind: a kept shop record no player owns with no undos is not written plain");
+    if (BoxPlainKindPlan(0, kBrKindShop, -1, -1, 0, 0) != kPkNoRecord) Fail("T-1130 plainkind: no kept record (a seed) was written plain");
+    if (BoxPlainKindPlan(1, kBrKindShop, 1, -1, 0, 0) != kPkOwned || BoxPlainKindPlan(1, kBrKindBox, -1, 0, 0, 0) != kPkOwned)
+        Fail("T-1130 plainkind: a box a player owns (stored or written) was written plain");
+    if (BoxPlainKindPlan(1, kBrKindShop, -1, -1, 2, 0) != kPkUndos) Fail("T-1130 plainkind: a stored undo list would be dropped");
+    if (BoxPlainKindPlan(1, kBrKindShop, -1, -1, 0, 1) != kPkUndos) Fail("T-1130 plainkind: this write's undo list would be dropped");
+    if (BoxPlainKindPlan(1, kBrKindBox, -1, -1, 0, 0) != kPkPlainAlready) Fail("T-1130 plainkind: a record already plain was sent again");
+    if (BoxPlainKindPlan(1, kBrKindCage, -1, -1, 0, 0) != kPkNotShop) Fail("T-1130 plainkind: a cage's record was written plain");
+    /* the plain write the lever sends is one the world server takes over the shop record (no undos either side, nobody's) */
+    if (BoxAcceptRule(1, 3, -1, 0, 0, 0, 4, -1, 0, kBrKindBox, 0, 0, kBrKindShop, 0, 0) != kBrAccept)
+        Fail("T-1130 plainkind: the world server would not take the lever's plain write over a shop record");
+    /* and the shop's next write over the plain record is taken too (kind 0 -> 1) */
+    if (BoxAcceptRule(1, 4, -1, 0, 0, 0, 5, -1, 0, kBrKindShop, 0, 0, kBrKindBox, 0, 1) != kBrAccept)
+        Fail("T-1130 plainkind: the shop's next write over the plain record is not taken");
+    for (int pl = kPkSend; pl <= kPkNotShop; ++pl)
+        if (std::string(BoxPlainKindWhy(pl)) == "unknown plan") Fail("T-1130 plainkind: a plan has no words");
+    if (BoxPlainKindArmLive(1000u, 1000u, 30000u) != 1 || BoxPlainKindArmLive(30999u, 1000u, 30000u) != 1) Fail("T-1130 plainkind: the arm ended inside its window");
+    if (BoxPlainKindArmLive(31000u, 1000u, 30000u) != 0) Fail("T-1130 plainkind: the arm outlived its window");
+    if (BoxPlainKindArmLive(5000u, 0xFFFFF000u, 30000u) != 1) Fail("T-1130 plainkind: the arm ended at the tick count's wrap");
 }
 /* A keeper whose money is not known: the engine's restock is asked when the counters do not hold the stored stock; when they do, the money from
    the squad's record if it carries it, else left not known - never a restock. */
@@ -7318,7 +7532,7 @@ void t_t1047f3_load_and_save_wiring()
         || b.find("baseshow::DiscGuardTakeOut(&g_tlGuard, g_tlDiscovered, kTlGuardHistCap);") == std::string::npos
         || b.find("return baseshow::DiscGuardAsk(g_tlGuard, g_tlDiscovered, guardN);") == std::string::npos)
         Fail("t1047f3: the save's discovered set does not go through baseshow::DiscGuard");
-    if (st.find("return baseshow::DiscLoadRun(&ops);") == std::string::npos || st.find("void Ended(long genAtPrepare) { coop::BuildDiscoveredLoadEnded(genAtPrepare); coop::ItemsBoxOwedLoadEnded(genAtPrepare); }") == std::string::npos)
+    if (st.find("return baseshow::DiscLoadRun(&ops);") == std::string::npos || st.find("void Ended(long genAtPrepare) { coop::BuildDiscoveredLoadEnded(genAtPrepare); coop::ItemsBoxOwedLoadEnded(genAtPrepare); RaidLentLoadEnded(genAtPrepare); }") == std::string::npos)
         Fail("t1047f3: the load does not end through baseshow::DiscLoadRun");
     if (st.find("coop::BuildDiscoveredGuard(g_discGuardN0[i], &dt);") == std::string::npos) Fail("t1047f3: a landed save does not ask for its own set");
 }
@@ -8093,6 +8307,12 @@ void t_townver_key_and_gates()
     if (cooptv::TvChooseMode(0, 1, 1, 0, 0, 1, 1) != cooptv::kTvEngineAlone || cooptv::TvChooseMode(1, 0, 1, 0, 0, 1, 1) != cooptv::kTvEngineAlone
         || cooptv::TvChooseMode(1, 1, 0, 0, 0, 1, 1) != cooptv::kTvEngineAlone || cooptv::TvChooseMode(1, 1, 1, 1, 0, 1, 1) != cooptv::kTvEngineAlone
         || cooptv::TvChooseMode(1, 1, 1, 0, 0, 0, 1) != cooptv::kTvEngineAlone) Fail("off the main thread, unhooked, unreadable, player-owned or in no world is not the engine alone");
+    /* T-640 D1 fold 1: TvAskBefore(mode, playerOwned, recordDiffers) - the version ask before the engine's test, from TvChooseMode's own answer */
+    if (cooptv::TvAskBefore(cooptv::TvChooseMode(1, 1, 1, 0, 1, 1, 1), 0, 1) != cooptv::kTvAskNone || cooptv::TvAskBefore(cooptv::kTvStandIn, 0, 0) != cooptv::kTvAskNone) Fail("D1: another player's town waits (no version may qualify on any game - it would wait for ever)");
+    if (cooptv::TvAskBefore(cooptv::TvChooseMode(1, 1, 1, 1, 0, 1, 1), 1, 1) != cooptv::kTvAskNone) Fail("D1: a player-owned town waits (the engine's gate refuses every version)");
+    if (cooptv::TvAskBefore(cooptv::TvChooseMode(1, 1, 1, 0, 0, 0, 1), 0, 0) != cooptv::kTvAskUnread) Fail("D1: no world - not unread");
+    if (cooptv::TvAskBefore(cooptv::kTvDecide, 0, 1) != cooptv::kTvAskApplies || cooptv::TvAskBefore(cooptv::kTvRefuse, 0, 1) != cooptv::kTvAskApplies) Fail("D1: a stored record naming another version does not wait (the next load puts it on before choosing)");
+    if (cooptv::TvAskBefore(cooptv::kTvDecide, 0, 0) != cooptv::kTvAskEngine || cooptv::TvAskBefore(cooptv::kTvRefuse, 0, 0) != cooptv::kTvAskEngine) Fail("D1: no differing record - the engine's test does not decide");
     /* TvNoteRebuild(hasNote, noteVer, verNow): rebuilt only when the area file's note names another version than the town has now */
     if (cooptv::TvNoteRebuild(1, "", "D") != 1 || cooptv::TvNoteRebuild(1, "D", "") != 1 || cooptv::TvNoteRebuild(1, "D", "E") != 1) Fail("an area file built with another version is not rebuilt");
     if (cooptv::TvNoteRebuild(1, "D", "D") != 0 || cooptv::TvNoteRebuild(1, "", "") != 0) Fail("an area file built with the town's version is rebuilt (an owner-only difference must not rebuild)");
@@ -9056,9 +9276,9 @@ void t_t23_wiring()
         if (bc.find(need[i]) == std::string::npos) Fail(std::string("t23 wiring: build.cpp lacks ") + need[i]);
     if (pr.find("(h.flags & kPrFlagHanded) != 0 ? 1 : 0, coopbrec::BrSlotIn(loadedSlots, senderSlot));") == std::string::npos)
         Fail("t23 wiring: the world server's judge does not pass the hand-over flag and the sender's loaded bit");
-    if (se.find("const unsigned int kProtocolVersion = 213;") == std::string::npos || hr.find("const unsigned int kGameProtocol = 213;") == std::string::npos)
-        Fail("t23 wiring: the game-to-game protocol is not 213");
-    if (sm.find("const unsigned int kProtocol = 145;") == std::string::npos || piecerec::kProtocol != 145u) Fail("t23 wiring: the world-server protocol is not 145");
+    if (se.find("const unsigned int kProtocolVersion = 227;") == std::string::npos || hr.find("const unsigned int kGameProtocol = 227;") == std::string::npos)
+        Fail("t23 wiring: the game-to-game protocol is not 227");
+    if (sm.find("const unsigned int kProtocol = 153;") == std::string::npos || piecerec::kProtocol != 153u) Fail("t23 wiring: the world-server protocol is not 153");
 }
 /* T-23 review fold: a refused hand-over seed is a seed again; the seed carries the owner's outpost the piece got; the writer's owed
    work is flushed at its area's unload; the writer's work moves the help baseline (wiring) */
@@ -9176,7 +9396,7 @@ void t_t23_help_fix()
         "    r.helpOverP = overP;   /* T-23 fix */",
         "r.helpTailKnown = 0; r.helpTailSeq = 0; r.helpTailLive = 0; r.helpOverP = 0.0f;",
         "if (rd != 0 && coopbuild::BuildHelpRetireCompletes(cp, cn, over, cc, cx) != 0)",
-        "const int ok = BdProgressPod(b, FLT_MAX);   /* the engine's own complete-now path */\n        if (ok) PowerCompletionPutBack(b, pwBefore);\n        --g_bdSelf;",
+        "const int ok = BdCompleteNowPod(b);   /* the engine's own complete-now path (T-1294: a wall through its threshold crossing) */\n        if (ok) PowerCompletionPutBack(b, pwBefore);\n        --g_bdSelf;",
         "if (rd == 0 && fv != kObjKeyNone && (r.helpOverP > 0.0f || (r.helpBaseKnown != 0 && savedP > 0.0f)))",
         "BdWriterNoteRow(key, r, rd != 0 ? b : 0, 1);",
         "BdHelpRetireDrain();   /* T-23 fix:",
@@ -9185,7 +9405,7 @@ void t_t23_help_fix()
     for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i)
         if (bc.find(need[i]) == std::string::npos) Fail(std::string("t23 fix wiring: build.cpp lacks ") + need[i]);
     /* the retire's completion runs before the record is written, the drain after the K2 scope opens */
-    const size_t pc = bc.find("const int ok = BdProgressPod(b, FLT_MAX);   /* the engine's own complete-now path */\n        if (ok) PowerCompletionPutBack(b, pwBefore);\n        --g_bdSelf;");
+    const size_t pc = bc.find("const int ok = BdCompleteNowPod(b);   /* the engine's own complete-now path (T-1294: a wall through its threshold crossing) */\n        if (ok) PowerCompletionPutBack(b, pwBefore);\n        --g_bdSelf;");
     const size_t pw = bc.find("BdWriterNoteRow(key, r, rd != 0 ? b : 0, 1);");
     if (pc == std::string::npos || pw == std::string::npos || pc > pw) Fail("t23 fix wiring: the retire writes the record before the completion");
     const size_t ks = bc.find("BdSelfScope selfScope;   /* help1: every engine call below is the mod's own");
@@ -9627,7 +9847,7 @@ void t_t1077_wiring()
 void t_t1061_lock_record()
 {
     using namespace coopbrec;
-    if (kProtocol != 145u || kBrFlagLock != 16u || kBrLockBytes != 10u) Fail("t1061: the lock block is not flag 16 / 10 bytes of world-server protocol 145");
+    if (kProtocol != 153u || kBrFlagLock != 16u || kBrLockBytes != 10u) Fail("t1061: the lock block is not flag 16 / 10 bytes of world-server protocol 153");
     const std::string key = "12-box.mod@3,41@1003,-205,100";
     std::vector<cooppar::ParityItem> items;
     items.push_back(T823BoxItem("katana", 0, 0, 1));
@@ -9727,7 +9947,7 @@ void t_t1061_lock_rules()
 void t_t1061_lock_msg()
 {
     using namespace coopbrec;
-    if (kMsgBoxLock != 85u || cooplive::kInnerBoxLock != 85u || kGameProtocolBoxLock != 207u || hovrec::kGameProtocol != 213u) Fail("t1061 msg: BOX_LOCK is not message 85 of game-to-game protocol 207");
+    if (kMsgBoxLock != 85u || cooplive::kInnerBoxLock != 85u || kGameProtocolBoxLock != 207u || hovrec::kGameProtocol != 227u) Fail("t1061 msg: BOX_LOCK is not message 85 of game-to-game protocol 207");
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerBoxLock) || !cooplive::LiveInnerWaitsForWorld(cooplive::kInnerBoxLock)) Fail("t1061 msg: BOX_LOCK is refused from the world server or dropped while the world loads");
     if (cooplive::AddrGroupOf(cooplive::kInnerBoxLock) != cooplive::kAddrGroupItem) Fail("t1061 msg: BOX_LOCK is not counted with the item road");
     BoxLockMsg m; m.kind = kBlmAsk; m.key = "12-box.mod@3,41@1003,-205,100"; m.lock.locked = 0; m.lock.level = 40; m.lock.hardness = 1.5f;
@@ -9741,7 +9961,7 @@ void t_t1061_lock_msg()
     if (DecodeBoxLockMsg(&t[0], t.size(), 0)) Fail("t1061 msg: a byte after the lock was read");
     std::vector<char> s(b.begin(), b.end() - 1);
     if (DecodeBoxLockMsg(&s[0], s.size(), 0)) Fail("t1061 msg: a message cut short was read");
-    std::vector<char> k(b); k[0] = 3;
+    std::vector<char> k(b); k[0] = 9;   /* T-860: 3-8 are the cage kinds now */
     if (DecodeBoxLockMsg(&k[0], k.size(), 0)) Fail("t1061 msg: an unknown kind was read");
     BoxLockMsg bad = m; bad.key = "not a key";
     if (EncodeBoxLockMsg(&b, bad)) Fail("t1061 msg: a key that is not a position key was written");
@@ -9776,10 +9996,10 @@ void t_t1061_wiring()
     for (size_t i = 0; i < sizeof(goneIt) / sizeof(goneIt[0]); ++i)
         if (it.find(goneIt[i]) != std::string::npos) Fail(std::string("t1061 wiring: items.cpp still uses ") + goneIt[i]);
     if (dr.find("BoxLockPickNote(lock, own);") == std::string::npos) Fail("t1061 wiring: the pick tick does not hand a non-door lock to the box road");
-    if (se.find("case MSG_BOX_LOCK:   OnBoxLock(m);    break;") == std::string::npos || se.find("const unsigned int kProtocolVersion = 213;") == std::string::npos)
-        Fail("t1061 wiring: the session does not take BOX_LOCK or does not speak protocol 213");
-    if (sm.find("const unsigned int kProtocol = 145;") == std::string::npos || st.find("const unsigned int kStoreProtocol = 145;") == std::string::npos)
-        Fail("t1061 wiring: the world server and the game do not both speak world-server protocol 145");
+    if (se.find("case MSG_BOX_LOCK:   OnBoxLock(m);    break;") == std::string::npos || se.find("const unsigned int kProtocolVersion = 227;") == std::string::npos)
+        Fail("t1061 wiring: the session does not take BOX_LOCK or does not speak protocol 227");
+    if (sm.find("const unsigned int kProtocol = 153;") == std::string::npos || st.find("const unsigned int kStoreProtocol = 153;") == std::string::npos)
+        Fail("t1061 wiring: the world server and the game do not both speak world-server protocol 153");
 }
 
 /* T-1187: a forwarded conversation's end waits for ANY held line - also one with no NPC-side action (a hire: its contract is made
@@ -10165,11 +10385,94 @@ void t_t1240_cursor_commit()
         Fail("t1240: the placing slot / the hook's piece count");
 }
 
+/* T-1122 (effort cursorjoin): `buildtest cursor .. commit` runs the placement confirm 0x4DA6F0's own steps before the commit
+   (buildnear::ConfirmRegionDue / ConfirmTally / ConfirmGroupStep / ConfirmGroupTakes; build.cpp BdConfirmStepsPod) */
+void t_cursorjoin_confirm()
+{
+    namespace bn = buildnear;
+    if (bn::ConfirmRegionDue(0, 0, 0, 0.0f) != 1) Fail("cursorjoin: no host, vt+0xE8 0 and threshold 0 add the region");
+    if (bn::ConfirmRegionDue(1, 0, 0, 0.0f) != 0 || bn::ConfirmRegionDue(0, 1, 0, 0.0f) != 0 || bn::ConfirmRegionDue(0, 0, 1, 0.0f) != 0
+        || bn::ConfirmRegionDue(0, 0, 0, 1.0f) != 0 || bn::ConfirmRegionDue(0, 0, 0, -0.5f) != 0)
+        Fail("cursorjoin: a host, vt+0xE8 or a non-zero threshold adds no region");
+    int n = -1;
+    /* a house that joined its own outpost (vt+0x98 0, town a player's): not counted, kept, no group step */
+    bn::ConfirmPiece house = { 0, 1, 1 };
+    int kept = bn::ConfirmTally(&house, 1, &n);
+    if (n != 0 || kept != 0 || bn::ConfirmGroupStep(n, 0, kept) != bn::kGroupNone || bn::ConfirmGroupTakes(house) != 0) Fail("cursorjoin: a joined house");
+    /* a house with no town in reach and no founding (vt+0x98 0): not counted - the commit makes it with none, as the engine does */
+    bn::ConfirmPiece lone = { 0, 0, 0 };
+    kept = bn::ConfirmTally(&lone, 1, &n);
+    if (n != 0 || kept != -1 || bn::ConfirmGroupStep(n, 0, kept) != bn::kGroupNone) Fail("cursorjoin: a townless vt+0x98 0 piece takes no group step");
+    /* a vt+0x98 piece with no town: counted, the nearest-or-found road, and it takes the group's town */
+    bn::ConfirmPiece wall = { 1, 0, 0 };
+    kept = bn::ConfirmTally(&wall, 1, &n);
+    if (n != 1 || kept != -1 || bn::ConfirmGroupStep(n, 0, kept) != bn::kGroupNearest || bn::ConfirmGroupTakes(wall) != 1) Fail("cursorjoin: a counted piece");
+    if (bn::ConfirmGroupStep(n, 1, kept) != bn::kGroupNone) Fail("cursorjoin: inside a building the group step does not run");
+    /* several pieces: the LAST piece with a player town is kept and the counted ones take it; a world town is never kept */
+    bn::ConfirmPiece set[4] = { { 0, 1, 1 }, { 1, 0, 0 }, { 0, 1, 0 }, { 1, 1, 1 } };
+    kept = bn::ConfirmTally(set, 4, &n);
+    if (n != 1 || kept != 3 || bn::ConfirmGroupStep(n, 0, kept) != bn::kGroupKept) Fail("cursorjoin: the last player town is kept");
+    if (bn::ConfirmGroupTakes(set[0]) != 0 || bn::ConfirmGroupTakes(set[1]) != 1 || bn::ConfirmGroupTakes(set[3]) != 0) Fail("cursorjoin: only counted pieces take the group's town");
+    bn::ConfirmPiece world[2] = { { 0, 1, 0 }, { 1, 0, 0 } };
+    kept = bn::ConfirmTally(world, 2, &n);
+    if (n != 1 || kept != -1 || bn::ConfirmGroupStep(n, 0, kept) != bn::kGroupNearest) Fail("cursorjoin: a world town is not kept");
+    /* the wiring: the steps run after the placing call and before PlacementCommit, state 2 is left, the four rows are named */
+    const std::string b = T23NoCr(T313ReadFile("../coop-plugin/build.cpp"));
+    const size_t p0 = b.find("void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)");
+    const size_t p1 = (p0 == std::string::npos) ? std::string::npos : b.find("void BdCursorCommitLines(", p0);
+    if (p0 == std::string::npos || p1 == std::string::npos) { Fail("cursorjoin: the BdCursorPod block"); return; }
+    const std::string body = b.substr(p0, p1 - p0);
+    const size_t c2 = body.find("((BdPrevTestFn)(*(void***)r->p)[kVtPrevPlace / 8])(r->p);");
+    const size_t c3 = body.find("BdConfirmStepsPod(list, r->p, r->movePos, r);");
+    const size_t c4 = body.find("((BdCommitFn)(base + (uintptr_t)kBdCommitRva))(list);");
+    const size_t c5 = body.find("*(int*)((char*)list + kPrevListState) = 2;");
+    if (c2 == std::string::npos || c3 == std::string::npos || c4 == std::string::npos || c5 == std::string::npos || !(c2 < c3 && c3 < c4 && c4 < c5))
+        Fail("cursorjoin: the placing call, then the confirm's steps, then PlacementCommit, then state 2");
+    const size_t s0 = b.find("void BdConfirmStepsPod(void* list, void* p, const float* movePos, BdCursorRead* r)");
+    const size_t s1 = (s0 == std::string::npos) ? std::string::npos : b.find("\n}\n", s0);
+    if (s0 == std::string::npos || s1 == std::string::npos) { Fail("cursorjoin: the steps block"); return; }
+    const std::string st = b.substr(s0, s1 - s0);
+    const size_t d1 = st.find("((BdPieceTownFn)(base + (uintptr_t)kBdPieceTownRva))(p);");
+    const size_t d2 = st.find("((BdRegionAddFn)(base + (uintptr_t)kBdRegionAddRva))(list, pc + kPrevAabb);");
+    const size_t d3 = st.find("buildnear::ConfirmTally(&cp, 1, &r->cfCount);");
+    const size_t d4 = st.find("((BdTownNearPlFn)(base + (uintptr_t)kBdTownNearPlRva))(tl, at, 0, range)");
+    const size_t d5 = st.find("BdTownFoundPod(at);");
+    if (d1 == std::string::npos || d2 == std::string::npos || d3 == std::string::npos || d4 == std::string::npos || d5 == std::string::npos
+        || !(d1 < d2 && d2 < d3 && d3 < d4 && d4 < d5))
+        Fail("cursorjoin: the confirm's order - town pick, region add, tally, nearest player town, founding");
+    if (b.find("AddrReg kBdPieceTownRva_reg(\"PlacementPieceTown\"") == std::string::npos || b.find("AddrReg kBdRegionAddRva_reg(\"PlacementRegionAdd\"") == std::string::npos
+        || b.find("AddrReg kBdTownNearPlRva_reg(\"TownListNearestPlayer\"") == std::string::npos || b.find("AddrReg kBdGroupRangeRva_reg(\"PlacementGroupTownRange\"") == std::string::npos)
+        Fail("cursorjoin: the four address rows");
+    const std::string t65 = T23NoCr(T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt"));
+    const std::string t68 = T23NoCr(T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt"));
+    if (t65.find("PlacementPieceTown                             code 004D6300 004D6300") == std::string::npos
+        || t68.find("PlacementPieceTown                             code 004D6D90 004D6D90") == std::string::npos
+        || t65.find("PlacementGroupTownRange                        ro   016E0158 016E0158 00007A46") == std::string::npos
+        || t68.find("PlacementGroupTownRange                        ro   016E1288 016E1288 00007A46") == std::string::npos)
+        Fail("cursorjoin: the rows in both tables (0x4D6300 / 0x4D6D90; the range 16000.0 at 0x16E0158 / 0x16E1288)");
+    /* the height: the cursor update's own ground call 0x9B10B0 before the move, -99 keeps the character's; the box line per placement */
+    const size_t h1 = body.find("r->groundY = ((BdTerrainAtFn)(base + (uintptr_t)kBdTerrainAtRva))(r->movePos, 0, 0);");
+    const size_t h2 = body.find("if (r->groundY != -99.0f) { r->movePos[1] = r->groundY; r->groundUsed = 1; }");
+    const size_t h3 = body.find("((BdPrevMoveFn)vt[kVtPrevMove / 8])(r->p, r->movePos);");
+    const size_t h4 = body.find("((BdPrevTestFn)vt[kVtPrevTest / 8])(r->p);");
+    if (h1 == std::string::npos || h2 == std::string::npos || h3 == std::string::npos || h4 == std::string::npos || !(h1 < h2 && h2 < h3 && h3 < h4))
+        Fail("cursorjoin: the ground height, then the move to it, then the place test");
+    if (b.find("AddrReg kBdTerrainAtRva_reg(\"TerrainHeightAt\"") == std::string::npos || t65.find("TerrainHeightAt                                code 009B10B0 009B10B0") == std::string::npos
+        || t68.find("TerrainHeightAt                                code 009B1F80 009B1F80") == std::string::npos)
+        Fail("cursorjoin: the TerrainHeightAt row (0x9B10B0 / 0x9B1F80)");
+    if (b.find("void BdCursorBoxLine(const float* pos, const BdCursorRead& r)") == std::string::npos || b.find("    BdCursorBoxLine(pos, r);") == std::string::npos)
+        Fail("cursorjoin: one box line per placement");
+    /* `buildtest into` never places at a local height of exactly 0 (F1025: the engine's load skips a 0.0 and doubles the height) */
+    if (b.find("const float kIntoLift = 1.0f;") == std::string::npos || b.find("d[0] = off; d[1] = kIntoLift; d[2] = off;") == std::string::npos
+        || b.find("d[0] = off; d[1] = 0.0f; d[2] = off;") != std::string::npos)
+        Fail("cursorjoin: buildtest into lifts the piece 1.0 above the host's origin");
+}
+
 /* ---- T-1242: research Books in a teammate's bench (src/common/bookshare.h; store.cpp's T-1242 block) ---- */
 void t_t1242_books_wire()
 {
 
-    if (bookshare::kMsgResearchBook != 88u || cooplive::kInnerResearchBook != 88u || bookshare::kGameProtocolBooks != 211u || hovrec::kGameProtocol != 213u)
+    if (bookshare::kMsgResearchBook != 88u || cooplive::kInnerResearchBook != 88u || bookshare::kGameProtocolBooks != 211u || hovrec::kGameProtocol != 227u)
         Fail("t1242 wire: RESEARCH_BOOK is not message 88 of game-to-game protocol 211");
     if (!cooplive::LiveInnerAccepted(88u) || !cooplive::LiveInnerWaitsForWorld(88u)) Fail("t1242 wire: the relay does not carry RESEARCH_BOOK or does not keep it for the world");
     bookshare::Msg m; m.op = bookshare::kOpAsk; m.reqId = 0x01000007u; m.askerSlot = 1; m.tech = "2025-gamedata.base";
@@ -10351,9 +10654,9 @@ void t_t1242_books_wiring()
     const std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
     const std::string sig = T313ReadFile("../coop-plugin/addresses/signatures.sig");
     if (st.empty() || se.empty() || t65.empty() || t68.empty() || sig.empty()) { Fail("t1242 wiring: a source file is not readable"); return; }
-    if (se.find("const unsigned int kProtocolVersion = 213;") == std::string::npos || se.find("case MSG_RESEARCH_BOOK: OnResearchBook(m); break;") == std::string::npos
+    if (se.find("const unsigned int kProtocolVersion = 227;") == std::string::npos || se.find("case MSG_RESEARCH_BOOK: OnResearchBook(m); break;") == std::string::npos
         || se.find("ItemSendTo(MSG_RESEARCH_BOOK, toSlot, &body[0], body.size(), 0u, 0)") == std::string::npos || tr.find("MSG_RESEARCH_BOOK = 88") == std::string::npos)
-        Fail("t1242 wiring: the session does not speak 213 or does not carry RESEARCH_BOOK by slot");
+        Fail("t1242 wiring: the session does not speak 221 or does not carry RESEARCH_BOOK by slot");
     const char* const need[] = {
         "AddrReg kBkListRva_reg(\"ResearchBenchList\"", "AddrReg kBkHasRva_reg(\"ResearchHasItems\"", "AddrReg kBkCanPayRva_reg(\"ResearchCanPay\"", "AddrReg kBkPayRva_reg(\"ResearchPay\"",
         "    BookInstall(base);", "    BookReport();",
@@ -10418,9 +10721,1517 @@ void t_t1242_books_wiring()
         if (t65.find(rows65[i]) == std::string::npos) Fail(std::string("t1242 wiring: the 1.0.65 table lacks ") + rows65[i]);
         if (t68.find(rows68[i]) == std::string::npos) Fail(std::string("t1242 wiring: the 1.0.68 table lacks ") + rows68[i]);
     }
-    if (t65.find("!count 719") == std::string::npos || t68.find("!count 719") == std::string::npos) Fail("t1242 wiring: both address tables declare 719 rows (T-1242 + T-1150, 4 each; T-478 buying, 2)");
+    if (t65.find("!count 759") == std::string::npos || t68.find("!count 759") == std::string::npos) Fail("t1242 wiring: both address tables declare 759 rows (T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction, 2; T-1122 cursorjoin: + the confirm's four rows and TerrainHeightAt, 5; decision 1556: ZoneActivationDefaults, 1; T-1250: - the nine rows only its use-filter probe read; T-1250 fix attempt 2: TownUpdateOwnSearchRet, GetFoodTownGateTest, 2; T-918 (main): Character_setupAI, 1; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1242 + T-1150, 4 each; T-478 buying, 2; T-1260 RClickAutoTradeEnd, 1; T-1122 - the four rows only its assault-start probe read; T-1131 design A: PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet, 4; T-1131 fold 1: TheftCaughtNotifyRet, 1; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: BuildingCreatePhysical, 1; T-1294: WalkMapDeferInterior, 1 (its box queue binds PlacementRegionAdd, the same function); T-1082: UnlockDoorTaskStep, 1; T-1309: TaskObjectMineFactionTest, 1; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady, 2; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet)");
     if (sig.find("ResearchBenchList ") == std::string::npos || sig.find("ResearchCanPay ") == std::string::npos || sig.find("ResearchHasItems ") == std::string::npos || sig.find("ResearchPay ") == std::string::npos)
         Fail("t1242 wiring: a new row has no signature");
+}
+
+/* T-1145: a guard this game drives stops the other player's character for its bounty - the engine's 0x42 "can afford the bounty"
+   answered false for it whatever val (no player pointer on its faction). TalkBountyCond is the decision detour_s6CheckCond runs:
+   with that player's purse known, (bounty <= purse) == (0 < val); with none yet, both replies pass while the replies are listed, and
+   the engine's answer stands when the NPC chooses its own line. The engine's own 0x2F compare-1 read (bounty < ask) with
+   TalkBountyFitsAsk(purse) is "bounty <= purse". */
+static bool T1145EngineBountyLess(int bounty, int ask) { return bounty < ask; }   /* 0x2F compare 1 (decomp_675ec0.txt:401-407) */
+static bool T1145Fits(int bounty, int purse)
+{
+    const int ask = cooptalk::TalkBountyFitsAsk(purse);
+    return ask == 0 ? true : T1145EngineBountyLess(bounty, ask);
+}
+/* fold 1 (LOW-7): 1 = this game's reply list for the first line (no purse yet) holds the reply the other game picks (its own engine:
+   enough money = pay, val 1; else can't-pay, val 0) - listing and engine as detour_s6CheckCond would pass them */
+static bool T1145PickListed(int pick, bool listing, bool engine)
+{
+    return cooptalk::TalkBountyCond(pick, -1, false, listing, engine);
+}
+void t_t1145_bounty_cond()
+{
+    using namespace cooptalk;
+    /* the ask value */
+    if (TalkBountyFitsAsk(0) != 1 || TalkBountyFitsAsk(500) != 501) Fail("t1145: the 0x2F ask is purse + 1");
+    if (TalkBountyFitsAsk(0x7FFFFFFF) != 0) Fail("t1145: a purse at the int top needs no ask (it holds any bounty)");
+    /* bounty <= purse through the engine's compare-1 read */
+    if (!T1145Fits(500, 500)) Fail("t1145: bounty 500 with purse 500 fits (an equal purse pays)");
+    if (!T1145Fits(500, 2000)) Fail("t1145: bounty 500 with purse 2000 fits");
+    if (T1145Fits(501, 500)) Fail("t1145: bounty 501 with purse 500 does not fit");
+    if (T1145Fits(500, 100)) Fail("t1145: bounty 500 with purse 100 does not fit");
+    if (!T1145Fits(0, 0)) Fail("t1145: no bounty with an empty purse fits");
+    if (!T1145Fits(0x7FFFFFFF, 0x7FFFFFFF)) Fail("t1145: the int top fits itself");
+    /* purse known: the exact rule, whatever the engine said and whether the replies are being listed */
+    for (int e = 0; e < 2; ++e)
+        for (int l = 0; l < 2; ++l)
+        {
+            const bool eng = e != 0, lst = l != 0;
+            if (!TalkBountyCond(1, 2000, T1145Fits(500, 2000), lst, eng)) Fail("t1145: enough money - the pay reply (val 1) passes");
+            if (TalkBountyCond(0, 2000, T1145Fits(500, 2000), lst, eng)) Fail("t1145: enough money - the can't-pay reply (val 0) fails");
+            if (TalkBountyCond(1, 100, T1145Fits(500, 100), lst, eng)) Fail("t1145: short of money - the pay reply fails");
+            if (!TalkBountyCond(0, 100, T1145Fits(500, 100), lst, eng)) Fail("t1145: short of money - the can't-pay reply passes");
+            if (!TalkBountyCond(5, 0, true, lst, eng)) Fail("t1145: any val > 0 reads as 'can pay'");
+        }
+    /* no purse yet: the union while listing, the engine's answer otherwise */
+    for (int v = 0; v < 2; ++v)
+    {
+        if (!TalkBountyCond(v, -1, false, true, false)) Fail("t1145: no purse, listing - both replies pass (val " + I(v) + ")");
+        if (TalkBountyCond(v, -1, false, false, false)) Fail("t1145: no purse, choosing a line - the engine's false stands (val " + I(v) + ")");
+        if (!TalkBountyCond(v, -1, false, false, true)) Fail("t1145: no purse, choosing a line - the engine's true stands (val " + I(v) + ")");
+    }
+    /* the first line of a guard-started talk: this game's union holds the one reply the other game's own engine lists, for both cases */
+    const int purses[2] = { 2000, 100 };
+    for (int k = 0; k < 2; ++k)
+    {
+        std::vector<int> here, there;
+        for (int v = 1; v >= 0; --v)
+        {
+            if (TalkBountyCond(v, -1, false, true, false)) here.push_back(v);
+            /* the other game: its own player, its own purse and list - the engine's rule (bounty <= money) == (0 < val) */
+            if ((500 <= purses[k]) == (0 < v)) there.push_back(v);
+        }
+        if (here.size() != 2) Fail("t1145: the first listing holds both replies");
+        if (there.size() != 1) { Fail("t1145: the other game lists exactly one of the two"); continue; }
+        if (std::find(here.begin(), here.end(), there[0]) == here.end()) Fail("t1145: the other game's pick is not in this game's list");
+        if (there[0] != (purses[k] >= 500 ? 1 : 0)) Fail("t1145: the other game shows pay with enough money, can't-pay without");
+    }
+    /* fold 1 (LOW-7): the same check CAN fail - before T-1145 (the engine's false, no union) this game listed neither reply, so the
+       other game's pick was not in its list; and the union never holds a reply id the other game could not pick */
+    for (int k = 0; k < 2; ++k)
+    {
+        const int pick = purses[k] >= 500 ? 1 : 0;
+        if (T1145PickListed(pick, false, false)) Fail("t1145: the old road (engine false, not listing) must NOT hold the other game's pick");
+        if (!T1145PickListed(pick, true, false)) Fail("t1145: the union must hold the other game's pick");
+    }
+    /* fold 1 (LOW-3): the first PROMPT's union shape - counted apart from the mismatch counter */
+    std::vector<std::string> mine, prompt;
+    mine.push_back("pay");
+    prompt.push_back("pay"); prompt.push_back("nopay");
+    if (!cooptalk::TalkIdsSuperset(mine, prompt)) Fail("t1145: [pay] in [pay,nopay] is the union shape");
+    prompt.clear(); prompt.push_back("nopay"); prompt.push_back("pay");
+    if (!cooptalk::TalkIdsSuperset(mine, prompt)) Fail("t1145: [pay] in [nopay,pay] is the union shape");
+    if (cooptalk::TalkIdsSuperset(mine, mine)) Fail("t1145: an equal list is not a superset");
+    std::vector<std::string> other; other.push_back("other"); other.push_back("nopay");
+    if (cooptalk::TalkIdsSuperset(mine, other)) Fail("t1145: a list without this game's id is a real mismatch");
+    std::vector<std::string> two; two.push_back("b"); two.push_back("a");
+    std::vector<std::string> three; three.push_back("a"); three.push_back("b"); three.push_back("c");
+    if (cooptalk::TalkIdsSuperset(two, three)) Fail("t1145: another order is a real mismatch");
+}
+
+/* T-1145 wiring: the 0x42 branch beside 2 / 0x24 in detour_s6CheckCond, the listing hook on 0x67F6A0 (both tables, signature), the
+   per-thread mark compared with the asking Dialogue, the bounty read by the engine's own 0x2F, the REPORT token. */
+void t_t1145_bounty_wiring()
+{
+    const std::string sp = T313ReadFile("../coop-plugin/speech.cpp");
+    const std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt");
+    const std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
+    const std::string sig = T313ReadFile("../coop-plugin/addresses/signatures.sig");
+    if (sp.empty() || t65.empty() || t68.empty() || sig.empty()) { Fail("t1145 wiring: a source file is not readable"); return; }
+    const char* const need[] = {
+        "const int kS6DcCanAffordBounty = 0x42;",
+        "const int kS6DcBountyAmount = 0x2F;",
+        "else if (cond == kS6DcCanAffordBounty && g_s6On) out = TkS6BountyCond(dlg, val, target, convTarget, r);",
+        "fits = ask == 0 ? true : orig_s6CheckCond(dlg, kS6DcBountyAmount, 1, ask, target, convTarget);",
+        "const bool listing = g_s6ListTls != TLS_OUT_OF_INDEXES && dlg != 0 && ::TlsGetValue(g_s6ListTls) == dlg;",
+        "const bool ans = cooptalk::TalkBountyCond(val, purse, fits, listing, engine);",
+        "if (own != 1) { ::InterlockedIncrement64(own < 0 ? &g_s6NoUid : &g_s6BountyNotOurs); return engine; }",
+        "AddrReg kS6ListRepliesRva_reg(\"DialogueListPlayerReplies\"",
+        "(void**)&orig_s6ListReplies) == coop::SUCCESS) ? 1 : -1;",
+        "    ::TlsSetValue(slot, dlg);\n    __try { orig_s6ListReplies(dlg); }\n    __finally { ::TlsSetValue(slot, prev); }",
+        "return coopsp::PlayerCharClass(0, 1, inTable, rec) == 1 ? 1 : 0;",
+        "if (superset) ++g_tkFirstSuperset;\n    else if (!idsMatch || !sameLine) ++g_tkMismatch;",
+        "if (g_s6ListTls == TLS_OUT_OF_INDEXES) g_s6ListTls = ::TlsAlloc();",
+        " talkT1145bounty[answered,union,line,notOurs,differs,firstSuperset]=%lld,%lld,%lld,%lld,%lld,%lld talkT1145Hook=%s",
+    };
+    std::string spl = sp;
+    for (size_t i = 0; (i = spl.find('\r', i)) != std::string::npos; ) spl.erase(i, 1);
+    for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i)
+        if (spl.find(need[i]) == std::string::npos) Fail(std::string("t1145 wiring: speech.cpp lacks: ") + need[i]);
+    /* the branch sits in the condition detour, after the money arm and before the IS_PLAYER arm */
+    const size_t dt = spl.find("bool detour_s6CheckCond(void* dlg, int cond, int cmp, int val, void* target, void* convTarget)");
+    const size_t mo = spl.find("if (cond == kS6DcMoney && g_s6On) out = TkS6MoneyCond(", dt);
+    const size_t bo = spl.find("else if (cond == kS6DcCanAffordBounty && g_s6On)", dt);
+    const size_t ip = spl.find("else if (cond == kS6DcIsPlayer && g_s6On && TkPeerTarget(target))", dt);
+    if (dt == std::string::npos || mo == std::string::npos || bo == std::string::npos || ip == std::string::npos || !(mo < bo && bo < ip))
+        Fail("t1145 wiring: the 0x42 arm is not between the money arm and the IS_PLAYER arm of detour_s6CheckCond");
+    if (t65.find("DialogueListPlayerReplies                      code 0067F6A0 0067F6A0 488BC4554154415541564157488D68A1") == std::string::npos)
+        Fail("t1145 wiring: the 1.0.65 row of listPlayerReplies");
+    if (t68.find("DialogueListPlayerReplies                      code 00680130 00680130 488BC4554154415541564157488D68A1") == std::string::npos)
+        Fail("t1145 wiring: the 1.0.68 row of listPlayerReplies");
+    if (sig.find("DialogueListPlayerReplies ") == std::string::npos) Fail("t1145 wiring: the new row has no signature");
+}
+
+/* T-1250 (owners 1187 a / 1499 / 1554 b): a left click on a teammate's building opens its window - the real decision: the owner faction
+   looked up in a teammate list by teamstub::MateCellsHas (the policy detour's own call), then swaccess::TeamLeftOpens; and a move in that
+   window is no theft (the T-942 stealing decision's PairClass / ClearsStealing), so the engine's strict place test is not asked */
+void t_t1250_team_left_open()
+{
+    using namespace swaccess;
+    int facA = 0, facC = 0, facNpc = 0;
+    void* mates[4] = { &facA, &facC, 0, 0 };
+    const int nMates = 2;
+    const int mateA = teamstub::MateCellsHas(mates, nMates, &facA), mateNpc = teamstub::MateCellsHas(mates, nMates, &facNpc);
+    if (mateA != 1 || teamstub::MateCellsHas(mates, nMates, &facC) != 1) Fail("t1250 left: a teammate's faction is found in the list");
+    if (mateNpc != 0 || teamstub::MateCellsHas(mates, nMates, 0) != 0) Fail("t1250 left: a town's / stranger's (or no) faction is not a teammate's");
+    void* none[4] = { 0, 0, 0, 0 };
+    if (teamstub::MateCellsHas(none, 0, &facA) != 0) Fail("t1250 left: with no team nobody is a teammate");
+    if (!TeamLeftOpens(mateA, 1, 0)) Fail("t1250 left: a built teammate's building the engine opened nothing for opens");
+    if (!TeamLeftOpens(mateA, 1, -1)) Fail("t1250 left: an unread engine gate still opens (a second show only shows it again)");
+    if (TeamLeftOpens(mateA, 1, 1)) Fail("t1250 left: a window the engine's own gate opened is not opened twice");
+    if (TeamLeftOpens(mateA, 0, 0) || TeamLeftOpens(mateA, -1, 0)) Fail("t1250 left: an unbuilt (or unread) teammate's building opens nothing, as the engine");
+    if (TeamLeftOpens(mateNpc, 1, 0)) Fail("t1250 left: a town's, a friend's or a stranger's building keeps the engine's select");
+    const int v[3] = { -1, 0, 1 };
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+            for (int c = 0; c < 3; ++c)
+                if (TeamLeftOpens(v[a], v[b], v[c]) != (v[a] == 1 && v[b] == 1 && v[c] != 1))
+                    Fail("t1250 left: the rule at mate " + I(v[a]) + " built " + I(v[b]) + " gate " + I(v[c]));
+    if (!ClearsStealing(PairClass(kOwn, kTeam)) || !ClearsStealing(PairClass(kTeam, kOwn)))
+        Fail("t1250 left: a move between this player's own and a teammate's window is no theft (the plain trade range, as one's own)");
+    if (ClearsStealing(PairClass(kOwn, kStranger)) || ClearsStealing(PairClass(kOwn, kFriendRefused)))
+        Fail("t1250 left: a stranger's or a refused friend's window keeps the engine's stealing answer");
+}
+
+/* T-1250: the wiring - the detour hands every building that is no world node to TeamLeftOpen; TeamLeftOpen reads nothing with no team,
+   is main-thread only, looks the owner up in g_kitMates with MateCellsHas, asks the rule and makes the rock's own window call; the report
+   counts it; the rcgive lever's lclick mode opens by the left click */
+void t_t1250_team_left_wiring()
+{
+    const std::string p = T313ReadFile("../coop-plugin/policy.cpp");
+    const size_t f = p.find("void TeamLeftOpen(void* b)");
+    const size_t none = (f == std::string::npos) ? f : p.find("if (g_kitMatesN <= 0) return;", f);
+    const size_t thr = (f == std::string::npos) ? f : p.find("::InterlockedIncrement64(&g_teamLeftOffMain); return;", f);
+    const size_t mate = (f == std::string::npos) ? f : p.find("teamstub::MateCellsHas(g_kitMates, g_kitMatesN, fac)", f);
+    const size_t rule = (f == std::string::npos) ? f : p.find("if (!swaccess::TeamLeftOpens(mate, BuiltBytePod(b), gate)) return;", f);
+    const size_t call = (f == std::string::npos) ? f : p.find("const int shown = NodeWindowPod(b, &win);", f);
+    if (f == std::string::npos || none == std::string::npos || thr == std::string::npos || mate == std::string::npos || rule == std::string::npos
+        || call == std::string::npos || none > thr || thr > mate || mate > rule || rule > call)
+        Fail("t1250 left wiring: TeamLeftOpen - no team first, the main thread, the teammate list, the rule, then the rock's window call");
+    const size_t d = p.find("void detour_BuildingOnSelect(void* b)");
+    if (d == std::string::npos || d < f || p.find("if (node != 1) { TeamLeftOpen(b); return; }", d) == std::string::npos)
+        Fail("t1250 left wiring: the select detour hands a building that is no world node to TeamLeftOpen");
+    if (p.find("teamWindow[opened,faults,offMain,notMate,mates]=") == std::string::npos) Fail("t1250 left wiring: the report counts the opens");
+    const std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    if (it.find("else if (std::strcmp(ws[i], \"lclick\") == 0 && click == 0) click = 2;") == std::string::npos
+        || it.find("const int called = PolicyLeftClickBuilding(tobj, &answer, &leftWas, &rightWas, &selected, &gate);") == std::string::npos)
+        Fail("t1250 left wiring: itemtest rcgive's lclick mode opens the box by the player's left click");
+}
+
+/* ---- T-860 / T-859 (owner 1551 a): AN ACT ON AN AWAY PLAYER'S CHARACTER IS OWED (actowed.h) ------------------------------------ */
+void t_t860_act_owed_table()
+{
+    using namespace actowed;
+    Table<int> t;
+    const Key k(1, 77, 1, kFamPlace), lock(1, 77, 1, kFamCageLock), other(2, 77, 1, kFamPlace);
+    if (Note(&t, Key(-1, 77, 1, kFamPlace), kKindCageIn, 5u, 10u, false, 0u, 1) != 0 || Note(&t, Key(1, 0, 1, kFamPlace), kKindCageIn, 5u, 10u, false, 0u, 1) != 0
+        || Note(&t, k, kKindCageIn, 0u, 10u, false, 0u, 1) != 0 || Note(&t, k, kKindCageLock, 5u, 10u, false, 0u, 1) != 0 || !t.rows.empty())
+        Fail("t860: an act with no seat, no handle, no uid or the wrong family is kept");
+    if (FamilyOf(kKindCageIn) != kFamPlace || FamilyOf(kKindCageOut) != kFamPlace || FamilyOf(kKindBedIn) != kFamPlace || FamilyOf(kKindCarryEnd) != kFamPlace
+        || FamilyOf(kKindShackleLock) != kFamShackleLock || FamilyOf(kKindCageLock) != kFamCageLock)
+        Fail("t860: the 'where it is held' acts do not share one family, or a lock joined it");
+    Note(&t, k, kKindCageIn, 100u, 1000u, false, 0u, 1);
+    Note(&t, k, kKindBedIn, 100u, 1100u, false, 0u, 2);
+    Note(&t, lock, kKindCageLock, 100u, 1150u, false, 0u, 3);
+    Note(&t, other, kKindCageIn, 300u, 1200u, false, 0u, 4);
+    if (t.rows.size() != 3 || t.rows[k].kind != kKindBedIn || t.rows[k].payload != 2 || t.n.noted != 4)
+        Fail("t860: one character's newest placement act does not replace the older one, or a lock / another seat shares its row");
+    /* the owner's new copy after its world load binds that character's rows, not the other seat's */
+    std::vector<std::pair<Key, Entry<int> > > ended;
+    if (Resolve(&t, 1, 77, 1, 200u, true, 20000u, &ended) != 2 || t.rows[k].newUid != 200u || t.rows[lock].newUid != 200u || t.rows[other].newUid != 0 || !ended.empty())
+        Fail("t860: the new copy after the owner's return does not bind exactly that character's owed acts");
+    if (Resolve(&t, 1, 77, 1, 200u, true, 20000u, &ended) != 0 || Resolve(&t, 1, 77, 2, 201u, true, 20000u, &ended) != 0 || !ended.empty())
+        Fail("t860: a repeat SPAWN or another hand type re-binds");
+    /* the old copy's own re-ask of the same act keeps the new binding; a fresh act on the new copy starts again on it */
+    Note(&t, k, kKindBedIn, 100u, 1300u, false, 0u, 5);
+    if (t.rows[k].newUid != 200u || t.rows[k].payload != 5) Fail("t860: an old copy's re-ask loses the new copy's binding");
+    Note(&t, k, kKindCageOut, 200u, 6000u, false, 0u, 6);
+    if (t.rows[k].newUid != 0 || t.rows[k].oldUid != 200u || t.rows[k].kind != kKindCageOut) Fail("t860: a new act on the new copy is not its own");
+    /* a pick-up here ends an owed bed-in only (fold 2, NEW-1) */
+    if (SupersedeBedIn(&t, k) != 0 || t.rows.find(k) == t.rows.end()) Fail("t860: a pick-up ends an owed release");
+    t.rows.erase(k);
+    Finish(&t, lock, kStepWait);
+    if (t.rows.size() != 2) Fail("t860: a waiting act was finished");
+    Finish(&t, other, kStepSettled);
+    Clear(&t);
+    if (!t.rows.empty() || t.n.cleared != 1 || t.n.settled != 1) Fail("t860: teardown / link loss does not clear and count");
+    /* the cap: a new key over it is dropped and counted; a key already kept is still replaced */
+    Table<int> c;
+    for (int i = 0; i < kCap; ++i) Note(&c, Key(0, (unsigned int)(i + 1), 1, kFamPlace), kKindCageOut, (unsigned int)(i + 1), 1u, false, 0u, i);
+    if ((int)c.rows.size() != kCap || c.n.capDropped != 0) Fail("t860: the table does not hold its cap");
+    if (Note(&c, Key(0, 99999, 1, kFamPlace), kKindCageOut, 9u, 1u, false, 0u, 0) != 0 || c.n.capDropped != 1 || (int)c.rows.size() != kCap)
+        Fail("t860: an act over the cap is kept or not counted");
+    if (Note(&c, Key(0, 1, 1, kFamPlace), kKindCageIn, 1u, 2u, false, 0u, 42) != 1 || c.n.capDropped != 1) Fail("t860: a full table refuses a newer act of a kept key");
+    if (kCap != 256 || kStatesNew != 3 || kStatesSame != 10) Fail("t860: the owed table's bounds moved");
+}
+void t_t860_act_owed_step()
+{
+    using namespace actowed;
+    if (Step(false, kShowsYes, false, 1, 0, false) != kStepSettled || Step(true, kShowsYes, true, 1, 1, false) != kStepSettled) Fail("t860: an act the owner shows is not settled");
+    if (Step(true, kShowsNo, true, 1, 0, false) != kStepEnded || Step(false, kShowsUnknown, true, 1, 0, false) != kStepEnded) Fail("t860: a later owner change does not end the act");
+    for (int n = 1; n < kStatesNew; ++n) if (Step(true, kShowsNo, false, n, 0, false) != kStepWait) Fail("t860: a new copy's missing act is judged too early");
+    if (Step(true, kShowsNo, false, kStatesNew, 0, false) != kStepResend) Fail("t860: a new copy's missing act is not sent again");
+    if (Step(true, kShowsUnknown, false, kStatesNew, 0, false) != kStepEnded) Fail("t860: an act the new copy's state cannot judge is sent blind");
+    for (int n = 1; n < kStatesSame; ++n) if (Step(false, kShowsNo, false, n, 0, false) != kStepWait) Fail("t860: a present owner's act is ended too early");
+    if (Step(false, kShowsNo, false, kStatesSame, 0, false) != kStepEnded || Step(false, kShowsNo, false, 99, 0, false) == kStepResend) Fail("t860: a present owner's act is re-sent or kept");
+    /* after a send: kept while unanswered, ended when its word still lacks it, re-asked after a 'may pass' */
+    if (Step(true, kShowsNo, false, 1, 1, false) != kStepWait || Step(true, kShowsNo, false, kStatesNew, 1, false) != kStepEnded) Fail("t860: a sent act is re-sent unasked or kept for ever");
+    if (Step(true, kShowsNo, false, 1, 1, true) != kStepResend) Fail("t860: a 'may pass' answer is not asked again at the next STATE");
+    if (std::string(actowed::StepName(kStepResend)) != "resent" || std::string(actowed::KindName(kKindCarryEnd)) != "carryEnd" || std::string(actowed::KindName(kKindCageLock)) != "cageLock")
+        Fail("t860: the act owed line's words moved");
+}
+/* fold 1 behaviour cases: two opposite acts, a refusal, a 'may pass', a region reload with the owner present, the owner back without it */
+void t_t860_act_owed_cases()
+{
+    using namespace actowed;
+    std::vector<std::pair<Key, Entry<int> > > ended;
+    /* (1) B away: A cages, then lets out. B relaunches with its character caged (its save is older): only the release is owed */
+    {
+        Table<int> t;
+        const Key k(1, 50, 1, kFamPlace);
+        Note(&t, k, kKindCageIn, 100u, 1000u, false, 0u, 1);
+        Note(&t, k, kKindCageOut, 100u, 2000u, false, 0u, 2);
+        if (t.rows.size() != 1 || t.rows[k].kind != kKindCageOut) Fail("t860 case 1: the older cage-in is still owed beside the newer release");
+        if (Resolve(&t, 1, 50, 1, 900u, true, 20000u, &ended) != 1) Fail("t860 case 1: the relaunched owner's copy is not bound");
+        Entry<int>& e = t.rows[k];
+        int st = kStepWait;
+        for (int n = 0; n < kStatesNew; ++n) { ++e.states; st = Step(true, kShowsNo /* the owner's pose: caged */, false, e.states, e.sends, e.reask); }
+        if (st != kStepResend || e.kind != kKindCageOut) Fail("t860 case 1: the release is not the act sent again");
+        MarkSent(&t, &e);
+        if (e.sends != 1 || e.states != 0 || t.n.resent != 1) Fail("t860 case 1: a send is not counted");
+        ++e.states;
+        if (Step(true, kShowsYes, false, e.states, e.sends, e.reask) != kStepSettled) Fail("t860 case 1: the owner's word showing the release does not settle it");
+    }
+    /* (1b) the reverse: let out, then caged again - only the caging is owed */
+    {
+        Table<int> t;
+        const Key k(1, 51, 1, kFamPlace);
+        Note(&t, k, kKindCageOut, 100u, 1000u, false, 0u, 1);
+        Note(&t, k, kKindCageIn, 100u, 2000u, false, 0u, 2);
+        if (t.rows.size() != 1 || t.rows[k].kind != kKindCageIn) Fail("t860 case 1b: the older release is still owed beside the newer caging");
+    }
+    /* (2) a refusal ends it at once - on the first send and after a re-send */
+    {
+        Table<int> t;
+        const Key k(1, 52, 1, kFamPlace);
+        Note(&t, k, kKindCageIn, 100u, 1000u, false, 0u, 1);
+        if (Answer(&t.rows[k], true) != kStepEnded) Fail("t860 case 2: the owner's REFUSED does not end the act");
+        Entry<int> e; e.sends = 1;
+        if (Answer(&e, true) != kStepEnded) Fail("t860 case 2: a final refusal of a re-send does not end it");
+    }
+    /* (3) 'may pass' to a re-send: kept, asked again at the next STATE; to the first send: left to its own asker */
+    {
+        Entry<int> e; e.kind = kKindBedIn; e.sends = 1;
+        if (Answer(&e, false) != kStepWait || !e.reask) Fail("t860 case 3: a 'may pass' answer to a re-send ends it or is not re-asked");
+        if (Step(true, kShowsNo, false, 1, e.sends, e.reask) != kStepResend) Fail("t860 case 3: the re-ask does not go at the next STATE");
+        Table<int> t; MarkSent(&t, &e);
+        if (e.reask || e.sends != 2) Fail("t860 case 3: the re-ask is not spent by the send");
+        Entry<int> f; f.kind = kKindBedIn;
+        if (Answer(&f, false) != kStepWait || f.reask) Fail("t860 case 3: a 'may pass' to the first send arms a re-send");
+    }
+    /* (4) a region reload with the owner present (its world loaded BEFORE the act): no re-bind, no re-send - the act ends */
+    {
+        Table<int> t;
+        const Key k(1, 53, 1, kFamPlace);
+        Note(&t, k, kKindCageIn, 100u, 5000u, false, 0u, 1);
+        ended.clear();
+        if (Resolve(&t, 1, 53, 1, 300u, true, 1000u, &ended) != 0 || !t.rows.empty() || ended.size() != 1 || t.n.ended != 1)
+            Fail("t860 case 4: a copy re-made while its owner stayed re-binds the old act");
+        Note(&t, k, kKindCageIn, 300u, 6000u, false, 0u, 1);
+        ended.clear();
+        if (Resolve(&t, 1, 53, 1, 301u, false, 0u, &ended) != 0 || !t.rows.empty() || ended.size() != 1)
+            Fail("t860 case 4: an unknown owner load moment re-binds");
+        Note(&t, k, kKindCageIn, 301u, 0xFFFFFF00u, false, 0u, 1);   /* the clock wraps */
+        if (Resolve(&t, 1, 53, 1, 302u, true, 0x00002000u, &ended) != 1) Fail("t860 case 4: a load after the act across the clock's wrap is not a return");
+    }
+    /* (5) fold 2 NEW-1: a release then a pick-up here - the release is still owed and re-sent after a relaunch; a bed-in then a
+       pick-up - ended */
+    {
+        Table<int> t;
+        const Key k(1, 60, 1, kFamPlace), kb(1, 61, 1, kFamPlace);
+        Note(&t, k, kKindCageOut, 100u, 1000u, false, 0u, 1);
+        if (SupersedeBedIn(&t, k) != 0 || t.rows.size() != 1) Fail("t860 case 5: a pick-up after a release ends the release");
+        if (Resolve(&t, 1, 60, 1, 700u, true, 20000u, &ended) != 1) Fail("t860 case 5: the release is not carried to the relaunched copy");
+        Entry<int>& e = t.rows[k];
+        int st = kStepWait;
+        for (int n = 0; n < kStatesNew; ++n) { ++e.states; st = Step(true, kShowsNo, false, e.states, e.sends, e.reask); }
+        if (st != kStepResend || e.kind != kKindCageOut) Fail("t860 case 5: the release is not sent again after a pick-up and a relaunch");
+        Note(&t, kb, kKindBedIn, 101u, 1000u, false, 0u, 2);
+        if (SupersedeBedIn(&t, kb) != 1 || t.rows.find(kb) != t.rows.end()) Fail("t860 case 5: a pick-up out of the bed does not end the owed bed-in");
+    }
+    /* (6) fold 2 NEW-2: 'may pass' to a re-send is asked again at most kMayPassMax times; the next one ends the act */
+    {
+        Entry<int> e; e.kind = kKindBedIn; e.sends = 1;
+        Table<int> t;
+        for (int i = 0; i < kMayPassMax; ++i)
+        {
+            if (Answer(&e, false) != kStepWait || !e.reask) Fail("t860 case 6: a 'may pass' within the bound is not asked again");
+            if (Step(true, kShowsNo, false, 1, e.sends, e.reask) != kStepResend) Fail("t860 case 6: the re-ask does not go at the next STATE");
+            MarkSent(&t, &e);
+        }
+        if (Answer(&e, false) != kStepEnded || e.mayPass != kMayPassMax + 1) Fail("t860 case 6: the third 'may pass' does not end the act");
+        if (kMayPassMax != 2) Fail("t860 case 6: the 'may pass' bound moved");
+    }
+    /* (7) fold 2 NEW-4: an act made after B's world load but still on the OLD copy (before the new copy arrived) is carried over;
+       an act on a copy of the owner's current load (a region reload re-made it) is not */
+    {
+        Table<int> t;
+        const Key k(1, 62, 1, kFamPlace);
+        Note(&t, k, kKindCageIn, 100u, 60000u, true, 1000u /* the old copy came from B's first load */, 1);
+        if (Resolve(&t, 1, 62, 1, 800u, true, 50000u /* B's load after the relaunch, before the act */, &ended) != 1 || t.rows[k].newUid != 800u)
+            Fail("t860 case 7: an act made between the owner's load and its new copy is lost");
+        Table<int> u;
+        Note(&u, k, kKindCageIn, 100u, 60000u, true, 50000u, 1);
+        ended.clear();
+        if (Resolve(&u, 1, 62, 1, 801u, true, 50300u /* the same load, read off another CONTEXT */, &ended) != 0 || !u.rows.empty() || ended.size() != 1)
+            Fail("t860 case 7: a copy re-made in the owner's same world load takes the act");
+    }
+}
+void t_t860_act_owed_wiring()
+{
+    const std::string sp = T313ReadFile("../coop-plugin/spawn.cpp"), se = T313ReadFile("../coop-plugin/net/session.cpp"), st = T313ReadFile("../coop-plugin/store.cpp");
+    if (sp.empty() || se.empty() || st.empty()) { Fail("t860 wiring: a source file is not readable"); return; }
+    const size_t enc = se.find("if (!cooprison::EncodePrison(&b, m)) return true;"), note = se.find("coop::ActOwedNotePrison(m);");
+    if (enc == std::string::npos || note == std::string::npos || note < enc || note > se.find("return SendToOwner(MSG_PRISON, m.uid, &b[0], b.size());", enc))
+        Fail("t860 wiring: SendPrison does not note the act before it routes it");
+    const size_t pose = se.find("if (!sm.poseAbsent) coop::NotePoseWant(uid, sm.pose, m.peer);"), judge = se.find("coop::ActOwedOnOwnerState(uid, sm.poseAbsent ? -1 : (int)sm.pose.kind, carryingUid, dead != 0);");
+    if (pose == std::string::npos || judge == std::string::npos || judge < pose) Fail("t860 wiring: the owner's STATE does not judge the owed acts");
+    if (se.find("ActOwedOnOwnerRoster") != std::string::npos || sp.find("ActOwedOnOwnerRoster") != std::string::npos) Fail("t860 wiring: the roster-count ending is back (fold 2 NEW-3)");
+    if (se.find("PrisonPayloadIsDeath(&m.payload[0], m.payload.size())) { coop::PrisonNoteDeathDroppedLoad(); continue; }") == std::string::npos)
+        Fail("t860 wiring: a kill arriving during a load is no longer dropped (owner 1551: kills stay as they were)");
+    size_t ready = 0;
+    for (size_t at = sp.find("ActOwedOnCopyReady(uid);   // T-860"); at != std::string::npos; at = sp.find("ActOwedOnCopyReady(uid);   // T-860", at + 1)) ++ready;
+    if (ready != 2) Fail("t860 wiring: both SPAWN branches (adopt and create) must bind owed acts to the new copy");
+    if (sp.find("if (body != 0 && mine) ActOwedNoteCarryEnd(bodyUid, carrierUid);") == std::string::npos || sp.find("if (now != 0) ActOwedNotePickup(now);") == std::string::npos)
+        Fail("t860 wiring: the carry's end or a pick-up here is not an owed placement act");
+    const size_t bedRef = sp.find("ActOwedOnRefused(m.uid, true, m.permanent != 0);"), bedStale = sp.find("{ ++g_bedRefusalStale; return; }");
+    if (bedRef == std::string::npos || bedStale == std::string::npos || bedRef > bedStale || sp.find("ActOwedOnRefused(m.uid, false, true);") == std::string::npos)
+        Fail("t860 wiring: the owner's REFUSED / BED REFUSED do not answer the owed act (before the ask book's stale test)");
+    if (sp.find("const bool copyLoadKnown = ActOwedCtxLoadAt(*pc, &copyLoadAt);") == std::string::npos || sp.find("const int owner = net::OwnerSlotOf(uid);") == std::string::npos
+        || sp.find("it->second.kind != actowed::kKindBedIn) return;") == std::string::npos)
+        Fail("t860 wiring: the act's copy load moment, the owner record's seat or the bed-in-only pick-up is not read");
+    if (sp.find("ActOwedClear(\"the world is being torn down\");") == std::string::npos || st.find("coop::ActOwedLinkLost();") == std::string::npos)
+        Fail("t860 wiring: teardown or the world-server link's loss does not clear the owed acts");
+    if (sp.find("return BailReportToken() + ActOwedReportToken()") == std::string::npos
+        || sp.find("\" actOwed[noted,resolved,settled,resent,ended,capDropped,cleared]=\"") == std::string::npos
+        || sp.find("DebugLog(\"[PRISON] act owed handle=\"") == std::string::npos || sp.find("ErrorLog(\"[PRISON] act owed: the table is full (\"") == std::string::npos)
+        Fail("t860 wiring: the counter, the act owed line or the overflow line is missing");
+    const size_t np = sp.find("void ActOwedNotePrison(const cooprison::PrisonMsg& m)"), npEnd = sp.find("void ActOwedNoteCarryEnd(", np);
+    if (np == std::string::npos || npEnd == std::string::npos || sp.substr(np, npEnd - np).find("kPrisonDeath") != std::string::npos) Fail("t860 wiring: a kill is owed");
+}
+
+
+/* T-860: a cage's lock as one world-server record (src/common/cagerec.h) - the id, the bytes, the world server's rule */
+void t_t860_cage_record()
+{
+    using namespace cagerec;
+    const std::string key = "#0123abcd@12,34@-501,77,30";
+    const std::string id = MakeCageRecId(key);
+    if (id != "cage.12.34.#0123abcd.-501.77") Fail("t860 cage record: the id of a cage key is not cage.<sx>.<sy>.#<hash>.<x10>.<z10>: " + id);
+    int sx = -1, sy = -1;
+    if (CageRecIdParse(id, &sx, &sy) != 1 || sx != 12 || sy != 34 || CageRecIdArea(id) != 12 * 64 + 34) Fail("t860 cage record: the id's area square does not parse");
+    if (!IsCageRecId(id) || IsCageRecId("box.12.34.#0123abcd.-501.77") || coopbrec::IsBoxRecId(id) || doorrec::IsDoorRecId(id)) Fail("t860 cage record: a cage id is told from a box or door id");
+    if (CageRecIdParse("cage.12.34.#0123abcd.-501.77.30", 0, 0) != 0) Fail("t860 cage record: an id with a height parses (a cage id has none)");
+    if (!MakeCageRecId("no key here").empty() || !MakeCageRecId(std::string(80, 'a')).empty()) Fail("t860 cage record: a non-key makes an id");
+    CageRec r;
+    r.flags = kCrFlagSeed; r.generation = 7; r.writerSlot = 2; r.key = key; r.lock = CageLock(1, 0, 38);
+    std::vector<char> b;
+    if (!EncodeCageRec(&b, r) || b.size() != 24u + key.size() + 6u) { Fail("t860 cage record: the record does not encode to its fixed size"); return; }
+    CageRec back;
+    if (DecodeCageRec(&b[0], b.size(), &back) != kCrOk || back.generation != 7 || back.writerSlot != 2 || back.key != key || !CageLockSame(back.lock, r.lock)
+        || back.flags != kCrFlagSeed) Fail("t860 cage record: the record does not decode to itself");
+    std::vector<char> t = b; t.push_back(0);
+    if (DecodeCageRec(&t[0], t.size(), 0) != kCrTrailing) Fail("t860 cage record: bytes after the last field are not refused");
+    t = b; t.resize(t.size() - 1);
+    if (DecodeCageRec(&t[0], t.size(), 0) != kCrShort) Fail("t860 cage record: a cut record is not refused");
+    t = b; t[24 + key.size()] = 2;
+    if (DecodeCageRec(&t[0], t.size(), 0) != kCrBadRecord) Fail("t860 cage record: a locked byte of 2 is not refused");
+    t = b; t[8] = 4;
+    if (DecodeCageRec(&t[0], t.size(), 0) != kCrBadRecord) Fail("t860 cage record: an unknown flag is not refused");
+    t = b; t[0] = 'X';
+    if (DecodeCageRec(&t[0], t.size(), 0) != kCrBadMarker) Fail("t860 cage record: a wrong marker is not refused");
+    CageRec bad = r; bad.lock.level = kCrLevelMax + 1;
+    if (EncodeCageRec(&b, bad) || !b.empty()) Fail("t860 cage record: a level out of range encodes");
+    /* the world server: only the holder of the id's area writes; a seed only while none is stored; then a rising generation */
+    CageRec w = r; w.flags = 0; w.writerSlot = 3;
+    std::vector<char> wb; EncodeCageRec(&wb, w);
+    if (CageJudgeWrite(id, &wb[0], wb.size(), 3, 3, 0, 0, 0, 0) != coopbrec::kBrAccept) Fail("t860 cage judge: the holder's first write is refused");
+    if (CageJudgeWrite(id, &wb[0], wb.size(), 3, 1, 0, 0, 0, 0) != coopbrec::kBrRefuseNotWriter) Fail("t860 cage judge: a game that does not hold the area writes");
+    if (CageJudgeWrite(id, &wb[0], wb.size(), 3, -1, 0, 0, 0, 0) != coopbrec::kBrRefuseNotWriter) Fail("t860 cage judge: a write is taken while nobody holds the area");
+    if (CageJudgeWrite(id, &wb[0], wb.size(), 2, 2, 0, 0, 0, 0) != coopbrec::kBrRefuseWriter) Fail("t860 cage judge: a record naming another writer is taken");
+    if (CageJudgeWrite("cage.1.1.#0123abcd.-501.77", &wb[0], wb.size(), 3, 3, 0, 0, 0, 0) != coopbrec::kBrRefuseWrongBox) Fail("t860 cage judge: a record under another id is taken");
+    if (CageJudgeWrite(id, &wb[0], wb.size(), 3, 3, 1, 7, 1, 0) != coopbrec::kBrRepeat || CageJudgeWrite(id, &wb[0], wb.size(), 3, 3, 1, 7, 0, 0) != coopbrec::kBrRefuseSameGen
+        || CageJudgeWrite(id, &wb[0], wb.size(), 3, 3, 1, 8, 0, 0) != coopbrec::kBrRefuseOlder || CageJudgeWrite(id, &wb[0], wb.size(), 3, 3, 1, 6, 0, 0) != coopbrec::kBrAccept)
+        Fail("t860 cage judge: the generation rule is not the door record's");
+    CageRec sd = w; sd.flags = kCrFlagSeed; std::vector<char> sb; EncodeCageRec(&sb, sd);
+    if (CageJudgeWrite(id, &sb[0], sb.size(), 3, 3, 1, 1, 0, 0) != coopbrec::kBrRefuseSeedExists) Fail("t860 cage judge: a seed over a stored record is taken");
+    if (CageJudgeRemove(id, 3, 3) != coopbrec::kBrAccept || CageJudgeRemove(id, 2, 3) != coopbrec::kBrRefuseNotWriter) Fail("t860 cage judge: a removal by another game than the holder");
+    if (kProtocol != 153u || coopbrec::kProtocol != 153u || doorrec::kProtocol != 153u) Fail("t860 cage record: the world-server protocol is not 153");
+    if (PrisonRoadSendsLock(1) != 0 || PrisonRoadSendsLock(0) != 1) Fail("t860 cage record: the prisoner road still sends a cage's lock (or no longer the shackles')");
+}
+
+/* T-860 (fold 1): the cage's decisions played as the runs that break them - each scenario is a sequence of events on one game's
+   CageState, and the checks are what the cage ends up showing and what the game sends, not the code's branches */
+namespace {
+cagerec::CageRec T860Rec(unsigned int gen, int locked, int writer)
+{
+    cagerec::CageRec r;
+    r.generation = gen; r.writerSlot = writer; r.key = "#0123abcd@12,34@-501,77,30"; r.lock = cagerec::CageLock(locked, 0, 38);
+    return r;
+}
+const cagerec::CageLock kT860Open(0, 0, 38), kT860Closed(1, 0, 38);
+}
+void t_t860_cage_decide()
+{
+    using namespace cagerec;
+    {   /* T2189 exactly: B relaunches caged from its own record, its save's cage OPEN, the world's record CLOSED, nothing in between.
+           The old road sent B's open read as the word (A opened its copy). Now: B lays closed, never sends its read, and stays closed. */
+        CageState b;
+        if (CageOnArrive(b, T860Rec(3, 1, 0), 0, kT860Open) != 1) Fail("t860 T2189: the record is not kept");
+        int a = CageOnRead(b, kT860Open, 0, CageCagedLive(1, 0, 1, 0), 1000);
+        if (a != kCaLay) Fail("t860 T2189: the relaunched game does not lay the record over its save's open lock");
+        if (CageOnRead(b, kT860Open, 0, 0, 2000) != kCaNothing) Fail("t860 T2189: a queued lay is queued again (or sent) before the safe point");
+        a = CageOnRead(b, kT860Closed, 0, 0, 3000);   /* the safe point laid it */
+        if (a != kCaMarkLaid || CageOnRead(b, kT860Closed, 0, 0, 4000) != kCaNothing || b.pend != 0) Fail("t860 T2189: the laid closed lock is not final, or a change is pending");
+    }
+    {   /* no record yet (an older world, or the record not arrived): the loading game never sends its read as the world's; it asks */
+        CageState b;
+        if (CageOnRead(b, kT860Open, 0, 0, 0) != kCaQuery) Fail("t860 no record: the loading game does not ask the holder");
+        CageOnAsked(b, 1);
+        if (CageOnRead(b, kT860Open, 0, 0, 1000) != kCaNothing) Fail("t860 no record: the question is asked again before an answer");
+        CageOnAnswer(b, coopbrec::kBlmCageNone, 0);   /* none anywhere */
+        if (CageOnRead(b, kT860Open, 0, 0, 2000) != kCaNothing) Fail("t860 no record: after 'none' the game keeps asking");
+        CageOnMapEvent(b);
+        if (CageOnRead(b, kT860Open, 0, 0, 3000) != kCaQuery) Fail("t860 no record: a new area map does not let it ask again");
+        CageState h;
+        if (CageOnRead(h, kT860Closed, 1, 0, 0) != kCaSeed) Fail("t860 no record: the holder does not seed its live lock");
+    }
+    {   /* M2: B (not the holder) picks the lock; a THIRD game's question makes the holder write the older closed lock again before it
+           takes B's request. B keeps its open (the record does not hold it), then the holder's record holding open ends the wait. */
+        CageState b;
+        CageOnArrive(b, T860Rec(4, 1, 0), 0, kT860Closed);
+        CageOnRead(b, kT860Closed, 0, 0, 0);   /* laid */
+        if (CageOnRead(b, kT860Open, 0, 0, 1000) != kCaAsk) Fail("t860 M2: a pick on the game not holding the area is not asked of the holder");
+        CageOnAsked(b, 0);
+        CageOnArrive(b, T860Rec(5, 1, 0), 1, kT860Open);   /* the third game's rewrite, closed */
+        if (b.pend == 0 || CageOnRead(b, kT860Open, 0, 0, 2000) != kCaNothing) Fail("t860 M2: an older lock written again is laid over this game's pick");
+        CageOnArrive(b, T860Rec(6, 0, 0), 1, kT860Open);   /* the holder took B's request */
+        if (b.pend != 0 || CageOnRead(b, kT860Open, 0, 0, 3000) != kCaMarkLaid) Fail("t860 M2: the record holding the pick does not end the request");
+    }
+    {   /* M2: a request to a game that does not hold the area is answered NOT HOLDER; it is not asked again until the area map changes */
+        CageState b;
+        CageOnArrive(b, T860Rec(2, 1, 0), 0, kT860Closed);
+        CageOnRead(b, kT860Closed, 0, 0, 0);
+        CageOnRead(b, kT860Open, 0, 0, 1000); CageOnAsked(b, 0);
+        CageOnAnswer(b, coopbrec::kBlmCageNotHolder, 0);
+        if (CageOnRead(b, kT860Open, 0, 0, 2000) != kCaNothing || b.pend == 0) Fail("t860 M2: a not-holder answer loses the change or loops the ask");
+        CageOnMapEvent(b);
+        if (CagePendRoute(b, 0) != kCaAsk || CagePendRoute(b, 1) != kCaWrite) Fail("t860 M2: the change is not routed at the next area map");
+    }
+    {   /* M1: a pick while NOBODY holds the area: held once, kept applied; then the prisoner leaves (no more reads) and the area map
+           names a holder - the change goes out at that event */
+        CageState b;
+        CageOnArrive(b, T860Rec(2, 1, 0), 0, kT860Closed);
+        CageOnRead(b, kT860Closed, -1, 0, 0);
+        if (CageOnRead(b, kT860Open, -1, 0, 1000) != kCaHeld || CageOnRead(b, kT860Open, -1, 0, 2000) != kCaNothing) Fail("t860 M1: a change with nobody holding is not held once");
+        if (b.pend == 0 || !CageLockSame(b.pendLock, kT860Open)) Fail("t860 M1: the held change is not kept");
+        CageOnMapEvent(b);
+        if (CagePendRoute(b, 1) != kCaWrite || CagePendRoute(b, 0) != kCaAsk || CagePendRoute(b, -1) != kCaNothing) Fail("t860 M1: the area map does not send the held change");
+    }
+    {   /* M3: the holder closes the cage (an owed caging right after its relaunch) before its stored OPEN record has arrived: its write
+           is refused as older; the stored record then arrives - it must not be laid over the close, which is written above it */
+        CageState h;
+        CageOnRead(h, kT860Closed, 1, 1, 0);   /* a change made here (the caging's close) with no record yet */
+        if (h.pend == 0 || CagePendRoute(h, 1) != kCaWrite) Fail("t860 M3: the holder's change is not to be written");
+        CageOnWrote(h, T860Rec(CageNextGen(h.have, h.r.generation, h.floorGen), 1, 1), 100, kCwLive);
+        CageOnRefuse(h, coopbrec::kBrRefuseOlder, 7);
+        if (h.pend == 0 || !CageLockSame(h.pendLock, kT860Closed)) Fail("t860 M3: a refused change of the holder is dropped");
+        CageOnArrive(h, T860Rec(7, 0, 0), 1, kT860Closed);   /* the stored record, open */
+        if (CageOnRead(h, kT860Closed, 1, 0, 1000) != kCaWrite || CageNextGen(h.have, h.r.generation, h.floorGen) != 8) Fail("t860 M3: the stored older record is laid over the holder's close");
+        CageState s2;   /* a SEED refused (the world has a record): the stored record wins - a seed is no change */
+        CageOnRead(s2, kT860Open, 1, 0, 0);
+        CageOnWrote(s2, T860Rec(1, 0, 1), 100, kCwSeed);
+        CageOnRefuse(s2, coopbrec::kBrRefuseSeedExists, 3);
+        CageOnArrive(s2, T860Rec(3, 1, 0), 1, kT860Open);
+        if (s2.pend != 0 || CageOnRead(s2, kT860Open, 1, 0, 1000) != kCaLay) Fail("t860 M3: a refused seed beats the stored record");
+    }
+    {   /* M4: this game's guards cage its own character during play while an older OPEN record is kept but not yet laid: the closed
+           cage is the caging's - it is sent, not opened. The same character caged from the start (the load) gets the record laid. */
+        CageState b;
+        CageOnArrive(b, T860Rec(2, 0, 0), 0, kT860Open);
+        if (CageOnRead(b, kT860Closed, 0, CageCagedLive(1, 1, 1, 0), 0) != kCaAsk) Fail("t860 M4: an engine caging here is opened by an older record");
+        /* fold 2 (MED-1): decided by events, not time - read free after the load ended, then caged, with no record taken in between */
+        if (CageCagedLive(1, 0, 1, 0) != 0) Fail("t860 MED-1: the load's re-caging (caged from the first read) counts as a change");
+        if (CageCagedLive(1, 1, 1, 1) != 0) Fail("t860 MED-1: a caging after which a record arrived beats that (possibly newer) record");
+        if (CageCagedLive(0, 1, 1, 0) != 0 || CageCagedLive(1, 1, 0, 0) != 0) Fail("t860 MED-1: a copy's caging or a later read counts as a change");
+    }
+    {   /* L2: a pick between a record's arrival and the next read is not laid over: the arrival takes it first */
+        CageState b;
+        CageOnArrive(b, T860Rec(2, 1, 0), 0, kT860Closed);
+        CageOnRead(b, kT860Closed, 0, 0, 0);
+        CageOnArrive(b, T860Rec(3, 1, 0), 1, kT860Open);
+        if (b.pend == 0 || CageOnRead(b, kT860Open, 0, 0, 1000) != kCaAsk) Fail("t860 L2: a change made just before a record arrived is laid over");
+    }
+    {   /* L3: a teammate's request the holder took but could not write (not the writer) is sent on at the next area map */
+        CageState h;
+        CageOnWrote(h, T860Rec(1, 0, 1), 100, kCwRequest);
+        CageOnRefuse(h, coopbrec::kBrRefuseNotWriter, 0);
+        if (h.fwd == 0 || CageFwdRoute(h, 0) != kCaAsk || h.blocked == 0) Fail("t860 L3: a refused teammate's request is not sent on");
+        CageOnMapEvent(h);
+        if (h.blocked != 0) Fail("t860 L3: the not-writer block outlives the area map");
+    }
+    /* the holder answers every request: a change is always written (even when the record holds it - so the asker gets it) */
+    if (CageRequestDecide(1, 0, 1, 1, 5, kT860Closed, 5, kT860Closed) != kCqWrite || CageRequestDecide(1, 0, 0, 0, 0, kT860Closed, 0, kT860Open) != kCqWrite)
+        Fail("t860 request: the holder does not write a teammate's change");
+    if (CageRequestDecide(0, 0, 1, 1, 5, kT860Closed, 5, kT860Closed) != kCqNotHolder || CageRequestDecide(-1, 1, 0, 1, 0, kT860Closed, 0, kT860Closed) != kCqNotHolder)
+        Fail("t860 request: a game that does not hold takes a request");
+    if (CageRequestDecide(1, 1, 1, 0, 5, kT860Closed, 0, kT860Closed) != kCqRewrite || CageRequestDecide(1, 1, 0, 1, 0, kT860Closed, 0, kT860Closed) != kCqSeedLive
+        || CageRequestDecide(1, 1, 0, 0, 0, kT860Closed, 0, kT860Closed) != kCqNone)
+        Fail("t860 request: a question is not answered from the record, the live lock or with 'none'");
+    /* fold 2 (MED-2 / LOW-3): the generation orders a change against the record. A change made over gen 5 (closed) when the holder's record
+       is gen 6 OPEN - its own earlier take of this very change, resent at an area map, or another game's newer open - is STALE: nothing is
+       written twice. A newer generation with the SAME lock (a question answered by writing the record again) moved nothing: still taken. */
+    if (CageRequestDecide(1, 0, 1, 1, 6, kT860Open, 5, kT860Closed) != kCqStale) Fail("t860 MED-2: a resent or overtaken change is written again");
+    if (CageRequestDecide(1, 0, 1, 1, 6, kT860Closed, 5, kT860Closed) != kCqWrite) Fail("t860 MED-2: a third game's rewrite makes a change stale");
+    if (CageRequestDecide(1, 0, 1, 1, 9, kT860Open, 0, kT860Open) != kCqWrite) Fail("t860 MED-2: a change made with no record is refused");
+    {   /* MED-2: B's open is TAKEN as gen 6 but B misses that record; the holder then closes (gen 7). B's change is not resent at the area
+           map, ends at gen 7, and the close is laid - the older open never comes back */
+        CageState b;
+        CageOnArrive(b, T860Rec(5, 1, 0), 0, kT860Closed); CageOnRead(b, kT860Closed, 0, 0, 0);
+        CageOnRead(b, kT860Open, 0, 0, 1000); CageOnAsked(b, 0);
+        if (b.pendBaseGen != 5 || !CageLockSame(b.pendBaseLock, kT860Closed)) Fail("t860 MED-2: the change does not carry the record it was made over");
+        CageOnAnswer(b, coopbrec::kBlmCageTaken, 6);
+        CageOnMapEvent(b);
+        if (b.pend == 0 || CagePendRoute(b, 0) != kCaNothing || CageOnRead(b, kT860Open, 0, 0, 1500) != kCaNothing) Fail("t860 MED-2: a taken change is sent again");
+        CageOnArrive(b, T860Rec(7, 1, 0), 1, kT860Open);
+        if (b.pend != 0 || CageOnRead(b, kT860Open, 0, 0, 2000) != kCaLay) Fail("t860 MED-2: a newer close is undone by the older open");
+    }
+    {   /* MED-2: STALE - B's change ends, the holder's newer record is laid, and no older record is laid while it is on its way */
+        CageState b;
+        CageOnArrive(b, T860Rec(5, 1, 0), 0, kT860Closed); CageOnRead(b, kT860Closed, 0, 0, 0);
+        CageOnRead(b, kT860Open, 0, 0, 1000); CageOnAsked(b, 0);
+        CageOnAnswer(b, coopbrec::kBlmCageStale, 7);
+        if (b.pend != 0 || CageOnRead(b, kT860Open, 0, 0, 2000) != kCaNothing) Fail("t860 MED-2: a stale change lays the older record meanwhile");
+        CageOnArrive(b, T860Rec(7, 1, 0), 1, kT860Open);
+        if (CageOnRead(b, kT860Open, 0, 0, 3000) != kCaLay) Fail("t860 MED-2: the holder's newer record is not laid after STALE");
+    }
+    {   /* LOW-1: B picks (open, asked), then relocks before the answer: the relock is a new change sent, not dropped */
+        CageState b;
+        CageOnArrive(b, T860Rec(5, 1, 0), 0, kT860Closed); CageOnRead(b, kT860Closed, 0, 0, 0);
+        CageOnRead(b, kT860Open, 0, 0, 1000); CageOnAsked(b, 0);
+        if (CageOnRead(b, kT860Closed, 0, 0, 2000) != kCaAsk || !CageLockSame(b.pendLock, kT860Closed)) Fail("t860 LOW-1: a revert while a request is in flight is dropped");
+        if (!CageLockSame(b.pendBaseLock, kT860Open) || CageRequestDecide(1, 0, 1, 1, 6, kT860Open, b.pendBaseGen, b.pendBaseLock) != kCqWrite)
+            Fail("t860 LOW-1: the relock is refused as stale by a holder that took the pick first");
+        CageState q;   /* a revert before anything went out sends nothing */
+        CageOnArrive(q, T860Rec(5, 1, 0), 0, kT860Closed); CageOnRead(q, kT860Closed, -1, 0, 0);
+        CageOnRead(q, kT860Open, -1, 0, 1000);
+        if (CageOnRead(q, kT860Closed, -1, 0, 2000) != kCaNothing || q.pend != 0) Fail("t860 LOW-1: a change undone before it went out is still sent");
+    }
+    {   /* LOW-2: after a not-the-writer refusal a held request is not rewritten while the map still names this game */
+        CageState h;
+        CageOnWrote(h, T860Rec(1, 0, 1), 100, kCwRequest);
+        CageOnRefuse(h, coopbrec::kBrRefuseNotWriter, 0);
+        if (CageFwdRoute(h, 1) != kCaNothing || CagePendRoute(h, 1) != kCaNothing) Fail("t860 LOW-2: a blocked game writes again before the area map changes");
+        CageOnMapEvent(h);
+        if (CageFwdRoute(h, 1) != kCaWrite) Fail("t860 LOW-2: the area map does not end the block");
+    }
+    /* H1: the owner opens its cage and raises FREED in one pass when only the cage is in the way */
+    if (FreedCageOpenFirst(1, 1, 1) != 1 || FreedCageOpenFirst(0, 1, 1) != 0 || FreedCageOpenFirst(1, 0, 1) != 0 || FreedCageOpenFirst(1, 1, 0) != 0)
+        Fail("t860 H1: a teammate's rescue is not opened first, or opened when something else refuses it");
+    if (cooprison::FreedOwnerDecide(true, true, true, false, true, cooprison::kFreedLockCage, 0) != cooprison::kFreedRaise) Fail("t860 H1: an opened cage still refuses FREED");
+    if (CageEchoConfirms(1, 77, 1, 77) != 1 || CageEchoConfirms(1, 77, 1, 78) != 0) Fail("t860 echo: the world server's answer confirms the wrong write");
+    coopbrec::BoxLockMsg m; m.kind = coopbrec::kBlmCageNotHolder; m.key = "#0123abcd@12,34@-501,77,30"; m.lock.level = 38;
+    std::vector<char> by; coopbrec::BoxLockMsg back;
+    if (!coopbrec::EncodeBoxLockMsg(&by, m) || !coopbrec::DecodeBoxLockMsg(&by[0], by.size(), &back) || back.kind != coopbrec::kBlmCageNotHolder)
+        Fail("t860 msg: BOX_LOCK's not-holder answer does not round-trip");
+    m.kind = 9;
+    if (coopbrec::EncodeBoxLockMsg(&by, m)) Fail("t860 msg: an unknown BOX_LOCK kind encodes");
+    if (coopbrec::kBlmCage != 3 || coopbrec::kBlmCageQuery != 4 || coopbrec::kBlmCageNone != 6 || coopbrec::kBlmCageStale != 8 || hovrec::kGameProtocol != 227u) Fail("t860 msg: the cage kinds are not 3-8 of game-to-game protocol 222");
+    {   /* fold 2: a cage kind carries its generation and base lock; a cage message cut before them is refused */
+        coopbrec::BoxLockMsg t; t.kind = coopbrec::kBlmCageTaken; t.key = "#0123abcd@12,34@-501,77,30"; t.gen = 41; t.base.locked = 1;
+        std::vector<char> tb; coopbrec::BoxLockMsg tr;
+        if (!coopbrec::EncodeBoxLockMsg(&tb, t) || !coopbrec::DecodeBoxLockMsg(&tb[0], tb.size(), &tr) || tr.gen != 41 || tr.base.locked != 1) Fail("t860 msg: TAKEN's generation does not round-trip");
+        if (coopbrec::DecodeBoxLockMsg(&tb[0], tb.size() - 10, 0)) Fail("t860 msg: a cage message without its base lock is read");
+    }
+}
+
+/* T-860: the road is wired - the watch decides from the record, the cage word is retired, the stores route cage ids */
+void t_t860_cage_wiring()
+{
+    const std::string sp = T23NoCr(T313ReadFile("../coop-plugin/spawn.cpp"));
+    const std::string it = T23NoCr(T313ReadFile("../coop-plugin/items.cpp"));
+    const std::string st = T23NoCr(T313ReadFile("../coop-plugin/store.cpp"));
+    const std::string sm = T23NoCr(T313ReadFile("../coop-store/store_main.cpp"));
+    if (sp.empty() || it.empty() || st.empty() || sm.empty()) { Fail("t860 cage wiring: a source file did not read"); return; }
+    const char* const needSp[] = {
+        "if (kind == cooprison::kPrisonCageLock) { CageRecRead(uid, key, f, lv, s, now, mine); return r; }",
+        "if (cagerec::FreedCageOpenFirst(vOther == cooprison::kFreedRaise ? 1 : 0, 1, 1) != 0 && CageOpenForFreed(c, f.peer) != 0) v = vOther;",
+        "void CageRecMapEvent()",
+        "if (m.kind == cooprison::kPrisonCageLock) { ++g_cgWordRetired; return; }",
+        "CageChangeAtEvent(k, f, lv, ",
+        "if (lk == 1) CageLockChangedHere(c, \"the caging's lock\");",
+        "if (PrisonLockSetPod(cage, 0) == 1) CageLockChangedHere(c, \"the release's open\");",
+        "else if (op.op == kRestraintOpCageLay)",
+        "+ FreedSendReportToken() + CageRecReportToken();" };
+    for (size_t i = 0; i < sizeof(needSp) / sizeof(needSp[0]); ++i)
+        if (sp.find(needSp[i]) == std::string::npos) Fail(std::string("t860 cage wiring: spawn.cpp lacks ") + needSp[i]);
+    /* the prisoner road sends no cage word: the only RestraintSend of a cage is gone */
+    if (sp.find("RestraintSend(uid, cooprison::kPrisonCageLock") != std::string::npos) Fail("t860 cage wiring: the prisoner road still sends a cage lock word");
+    if (it.find("CageRecRequestNote(m.key, m.lock.locked, m.lock.broken, m.lock.level,") == std::string::npos || it.find("CageRecRefuseArrive(id, reason, storedGen, sentGen)") == std::string::npos)
+        Fail("t860 cage wiring: items.cpp does not route BOX_LOCK's cage kinds or a cage refusal");
+    const char* const needSt[] = { "if (cagerec::IsCageRecId(worldId)) { coop::CageRecordArrive(worldId, bytes); return; }", "coop::CageRecordGone(worldId)",
+        "coop::CageRecordEcho(worldId", "coop::CageRecMapEvent();", "const unsigned int kStoreProtocol = 153;" };
+    for (size_t i = 0; i < sizeof(needSt) / sizeof(needSt[0]); ++i)
+        if (st.find(needSt[i]) == std::string::npos) Fail(std::string("t860 cage wiring: store.cpp lacks ") + needSt[i]);
+    const char* const needSm[] = { "cagerec::CageJudgeWrite(r.worldId,", "cagerec::CageJudgeRemove(wid, sender, CageHolderOf(wid))", "CageLanded(id, j->payload);",
+        "|| cagerec::CageRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 153;" };
+    for (size_t i = 0; i < sizeof(needSm) / sizeof(needSm[0]); ++i)
+        if (sm.find(needSm[i]) == std::string::npos) Fail(std::string("t860 cage wiring: store_main.cpp lacks ") + needSm[i]);
+}
+
+/* T-1122 roller (owner decision 1577 c): an offline owner's base is rolled by one teammate's game - the game in charge of the
+   base's area - only while a team member is within 2500; a raid arriving with nobody there is called off; the owner online = no
+   change (src/common/raidroll.h) */
+void t_t1122_roller_rule()
+{
+    using namespace raidroll;
+    /* who rolls: owner slot 0 offline, this game slot 1 in the same team, in charge of the area, someone there */
+    if (Covers(0, 1, 1, 0, 1, 1) != kCoverYes) Fail("t1122 roller: the teammate in charge with a team member near does not cover the base");
+    if (Covers(0, 1, 1, 1, 1, 1) != kCoverOwnerOnline) Fail("t1122 roller: the owner online did not leave the base to the owner's own game");
+    if (Covers(0, 1, 1, -1, 1, 1) != kCoverOwnerUnknown) Fail("t1122 roller: no roster was not refused");
+    if (Covers(0, 1, 0, 0, 1, 1) != kCoverNotTeam) Fail("t1122 roller: a player outside the team covers the base");
+    if (Covers(0, 1, 1, 0, 2, 1) != kCoverNotHolder) Fail("t1122 roller: a teammate NOT in charge of the area covers the base (two games would roll)");
+    if (Covers(0, 1, 1, 0, -1, 1) != kCoverNotHolder) Fail("t1122 roller: an unknown holder was taken as this game");
+    if (Covers(0, 1, 1, 0, 1, 0) != kCoverNobody) Fail("t1122 roller: the base is covered with nobody of the team near");
+    if (Covers(1, 1, 1, 0, 1, 1) != kCoverNoSlot || Covers(-1, 1, 1, 0, 1, 1) != kCoverNoSlot) Fail("t1122 roller: this game's own base or no owner was rolled by the roller");
+    /* two team members at the base on two games: only the holder covers it */
+    {
+        const int holder = 2;
+        const int onB = Covers(0, 1, 1, 0, holder, 1), onC = Covers(0, 2, 1, 0, holder, 1);
+        if (onB == kCoverYes || onC != kCoverYes) Fail("t1122 roller: two teammates at the base do not give exactly one roller");
+    }
+    /* presence: within 2500 on the ground plane, living, of the owner's team (the owner's own characters count too) */
+    {
+        const float xs[5] = { 100.0f, 2400.0f, 0.0f, 3000.0f, 10.0f };
+        const float zs[5] = { 0.0f, 0.0f, 2499.0f, 0.0f, 10.0f };
+        const int slots[5] = { 1, 2, 3, 1, 0 };
+        const unsigned teams[5] = { 7, 7, 9, 7, 7 };
+        const int deads[5] = { 0, 1, 0, 0, 0 };
+        if (TeamPresent(0.0f, 0.0f, xs, zs, slots, teams, deads, 5, 0, 7, kPresenceRadius) != 2) Fail("t1122 roller: presence counts the wrong characters (want the living teammate and the owner's own; not the dead one, the other team's or the one beyond 2500)");
+        if (TeamPresent(0.0f, 0.0f, xs, zs, slots, teams, 0, 5, 0, 7, kPresenceRadius) != 3) Fail("t1122 roller: presence without the death column");
+        if (TeamPresent(0.0f, 0.0f, xs, zs, slots, teams, deads, 5, 0, 0, kPresenceRadius) != 1) Fail("t1122 roller: an owner in no team counts others");
+        const float fx[1] = { 2500.0f }, fz[1] = { 0.0f }; const int fs[1] = { 1 }; const unsigned ft[1] = { 7 };
+        if (TeamPresent(0.0f, 0.0f, fx, fz, fs, ft, 0, 1, 0, 7, kPresenceRadius) != 1) Fail("t1122 roller: a member at exactly 2500 is not near");
+        if (TeamPresent(0.0f, 0.0f, fx, fz, fs, ft, 0, 0, 0, 7, kPresenceRadius) != 0) Fail("t1122 roller: no spots counted someone");
+    }
+    /* the timer: unset = due (as the engine's 0.0), then due only past the next */
+    if (RollDue(0, 0.0, 1.0) != 1 || RollDue(1, 10.0, 9.5) != 0 || RollDue(1, 10.0, 10.0) != 0 || RollDue(1, 10.0, 10.5) != 1) Fail("t1122 roller: the 6 h timer's due rule");
+    if (kRollHours != 6.0) Fail("t1122 roller: the roll interval is not the engine's 6.0 h");
+    /* the engine's pick: draws and weights */
+    {
+        const int has[3] = { 1, 1, 0 }; const float ch[3] = { 0.5f, 0.25f, 0.9f };
+        const float drawAll[3] = { 0.0f, 0.0f, 0.0f }, drawNone[3] = { 0.9f, 0.9f, 0.0f }, drawOne[3] = { 0.9f, 0.1f, 0.0f };
+        float total = 0.0f;
+        if (PickWeighted(has, ch, drawNone, 3, 0.5f) != -1) Fail("t1122 roller: a kind joined without beating its draw (or a kind with no covered base joined)");
+        if (PickWeighted(has, ch, drawOne, 3, 0.99f) != 1) Fail("t1122 roller: the one kind that won its draw was not picked");
+        if (PickWeighted(has, ch, drawAll, 3, 0.1f, &total) != 0 || total < 0.749f || total > 0.751f) Fail("t1122 roller: the weighted pick (low draw) or its total");
+        if (PickWeighted(has, ch, drawAll, 3, 0.9f) != 1) Fail("t1122 roller: the weighted pick (high draw)");
+        const float zero[2] = { 0.0f, -1.0f }; const float d0[2] = { -1.0f, -2.0f };
+        if (PickWeighted(0, zero, d0, 2, 0.5f) != -1) Fail("t1122 roller: a kind with chance 0 or below joined");
+    }
+    /* the repeat stamp: the start's write becomes the owner's own; no write keeps it */
+    if (StampAfterStart(3.0, 3.0, 50.0) != 50.0 || StampAfterStart(3.0, 3.0, 3.0) != 3.0 || StampAfterStart(0.0, 0.0, 0.0) != 0.0) Fail("t1122 roller: the owner's repeat stamp after a start");
+    /* which campaigns are the roller's */
+    if (IsRollerCampaign(0, 1, 0) != 1 || IsRollerCampaign(1, 1, 0) != 0 || IsRollerCampaign(-1, 1, 0) != 0 || IsRollerCampaign(0, 1, 1) != 0) Fail("t1122 roller: the roller campaign test (own base, an NPC town and a borrowed campaign are not the roller's)");
+    /* the engine's own roll keeps its rate: roller campaigns hidden only when they alone stop a due roll, with room to come back */
+    if (HideForUpdate(1, 0, 0, 1, 8) != 1) Fail("t1122 roller: a lone roller campaign blocks the engine's due roll");
+    if (HideForUpdate(0, 0, 0, 1, 8) != 0 || HideForUpdate(1, 1, 0, 1, 8) != 0 || HideForUpdate(1, 0, 1, 1, 8) != 0 || HideForUpdate(1, 0, 0, 0, 8) != 0) Fail("t1122 roller: hidden when the engine would not roll anyway");
+    if (HideForUpdate(1, 0, 0, 2, 2) != 0 || HideForUpdate(1, 0, 0, 2, 3) != 1) Fail("t1122 roller: the room rule");
+    if (WarTimerDue(0.0, 5.0) != 1 || WarTimerDue(6.0, 5.0) != 0 || WarTimerDue(6.0, 6.5) != 1) Fail("t1122 roller: the engine timer rule (0x791080: unset 0.0 or past)");
+    /* the lever's form */
+    {
+        const char* a = 0;
+        if (LeverIsRoller("roller Hungry Bandits", &a) != 1 || std::string(a) != "Hungry Bandits") Fail("t1122 roller: `raidnow roller <faction>` not read");
+        if (LeverIsRoller("  roller\tstatus", &a) != 1 || std::string(a) != "status") Fail("t1122 roller: the lever's status form");
+        if (LeverIsRoller("Hungry Bandits", 0) != 0 || LeverIsRoller("rollers x", 0) != 0 || LeverIsRoller("roller", 0) != 0) Fail("t1122 roller: a faction name taken as the roller form");
+    }
+}
+
+/* T-1122 roller: the road is wired - the hooks, the rows in both tables and their signatures, the exports */
+void t_t1122_roller_wiring()
+{
+    const std::string tg = T23NoCr(T313ReadFile("../coop-plugin/towngen.cpp"));
+    const std::string po = T23NoCr(T313ReadFile("../coop-plugin/policy.cpp"));
+    const std::string st = T23NoCr(T313ReadFile("../coop-plugin/store.cpp"));
+    const std::string t65 = T23NoCr(T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt"));
+    const std::string t68 = T23NoCr(T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt"));
+    const std::string sig = T23NoCr(T313ReadFile("../coop-plugin/addresses/signatures.sig"));
+    if (tg.empty() || po.empty() || st.empty() || t65.empty() || t68.empty() || sig.empty()) { Fail("t1122 roller wiring: a source file did not read"); return; }
+    const char* const needTg[] = {
+        "RaidRollInstall(base);",
+        "coop::AddHook((void*)(base + kRrTownsOfRva), (void*)&detour_rrTownsOf, (void**)&orig_rrTownsOf)",
+        "coop::AddHook((void*)(base + kRrWarUpdateRva), (void*)&detour_rrWarUpdate, (void**)&orig_rrWarUpdate)",
+        "void* const r = orig_rrTownsOf(dir, out, g_rrOverride);",
+        "raidroll::Covers(ownerSlot, me, coop::TeamSameAnyThread(me, ownerSlot) ? 1 : 0, coop::StoreRosterSlotInWorld(ownerSlot), *holder, *nearN)",
+        "if (inWorld != 0) { if (inWorld == 1) ++g_rrOwnerOnline; continue; }",
+        "r->pick = raidroll::PickWeighted(r->kHas, r->kChance, r->kDraw, r->kinds, r->r01, &r->total);",
+        "*st = raidroll::StampAfterStart(*st, r->given, r->seen);",
+        "if (raidroll::LeverIsRoller(rest.c_str(), &rollerRest) != 0) return RaidRollLever(std::string(rollerRest));" };
+    for (size_t i = 0; i < sizeof(needTg) / sizeof(needTg[0]); ++i)
+        if (tg.find(needTg[i]) == std::string::npos) Fail(std::string("t1122 roller wiring: towngen.cpp lacks ") + needTg[i]);
+    if (po.find("int PolicyTeamBaseFactions(void** facs, int* slots, int cap)") == std::string::npos || st.find("int StoreRaidCampBorrowed(void* camp)") == std::string::npos)
+        Fail("t1122 roller wiring: the policy / store exports are missing");
+    const char* const rows65[] = { "FactionWarMgrUpdate                            code 009CA440 009CA440", "TownsOfFaction                                 code 00927E90 00927E90" };
+    const char* const rows68[] = { "FactionWarMgrUpdate                            code 009CB310 009CB310", "TownsOfFaction                                 code 00928D60 00928D60" };
+    const char* const names[] = { "FactionWarMgrUpdate ", "TownsOfFaction " };
+    for (size_t i = 0; i < 2; ++i)
+    {
+        if (t65.find(rows65[i]) == std::string::npos) Fail(std::string("t1122 roller wiring: the 1.0.65 table lacks ") + rows65[i]);
+        if (t68.find(rows68[i]) == std::string::npos) Fail(std::string("t1122 roller wiring: the 1.0.68 table lacks ") + rows68[i]);
+        if (sig.find(names[i]) == std::string::npos) Fail(std::string("t1122 roller wiring: no signature for ") + names[i]);
+    }
+    /* owner decision 1579 a: no call-off - the arrival hook and its rows are gone */
+    const char* const gone[] = { "CampaignAnnouncementOf ", "CampaignArrivalAnnounceRet ", "HandRootObject " };
+    for (size_t i = 0; i < 3; ++i)
+        if (t65.find(gone[i]) != std::string::npos || t68.find(gone[i]) != std::string::npos) Fail(std::string("t1122 roller wiring (1579 a): the call-off's row is still in a table: ") + gone[i]);
+    if (tg.find("detour_rrAnnounceOf") != std::string::npos || tg.find("CALLED OFF") != std::string::npos || tg.find("RrCallOffPod") != std::string::npos)
+        Fail("t1122 roller wiring (1579 a): a call-off of a raid on an offline owner's base is still in towngen.cpp");
+}
+
+/* T-1122 roller review fold 1: H1 (the target itself covered), M1 (town level), M2 (busy counts a borrowed campaign), M3 (no follow-ups),
+   L2, L3; no call-off (owner 1579 a) */
+void t_t1122_roller_fold1()
+{
+    using namespace raidroll;
+    /* H1: a town the finder's first half returned without the cut is still refused unless covered */
+    if (TargetOk(1, kCoverYes) != 1) Fail("t1122 fold1 H1: a covered town of the owner was refused");
+    if (TargetOk(1, kCoverNotHolder) != 0 || TargetOk(1, kCoverNobody) != 0 || TargetOk(1, kCoverOwnerOnline) != 0) Fail("t1122 fold1 H1: an uncovered town (another game in charge / nobody near / owner online) was accepted");
+    if (TargetOk(0, kCoverYes) != 0) Fail("t1122 fold1 H1: a town not the owner's was accepted");
+    /* M1: the town-level test */
+    if (BelowTownLevel(0xd, 1, 2) != 1 || BelowTownLevel(0xd, 2, 2) != 0 || BelowTownLevel(5, 0, 2) != 0) Fail("t1122 fold1 M1: the town-level test");
+    if (BusyFor(0, 0) != 1 || BusyFor(2, 0) != 0 || BusyFor(-1, 0) != 0) Fail("t1122 fold1 M2: busy is not 'any campaign of this war manager aimed at that owner's base' (borrowed ones included)");
+    /* the wiring: the target test after both finder asks; the follow-up
+       count held at 0 around the start (M3); L2's counter; the busy rule */
+    const std::string tg = T23NoCr(T313ReadFile("../coop-plugin/towngen.cpp"));
+    if (tg.empty()) { Fail("t1122 fold1: towngen.cpp did not read"); return; }
+    const char* const need[] = {
+        "if (RrTargetOk(t, r->standIn, r->slot) == 0) { ++r->uncovered; continue; }",
+        "if (r->target == 0 || RrTargetOk(r->target, r->standIn, r->slot) == 0) { r->target = 0; ++r->uncovered; return 0; }",
+        "r->followKeep = *fo; r->followZeroed = 1; *fo = 0;",
+        "*fo = r->followKeep; r->followZeroed = 0;",
+        "if (r->followZeroed != 0) { __try { *(int*)((char*)r->kind + kRrKindFollowOff) = r->followKeep; }",
+        "if (RrBelowTownLevelPod(t, k) != 0) { r->kChance[i] = 0.0f; ++r->lowLevel; }",
+        "::InterlockedIncrement64(&g_rrOffMain);",
+        "if (raiders == 0) raiders = RrRaidersOfWm(wm);" };
+    for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i)
+        if (tg.find(need[i]) == std::string::npos) Fail(std::string("t1122 fold1: towngen.cpp lacks ") + need[i]);
+    size_t busy = 0, at = 0;
+    while ((at = tg.find("if (raidroll::BusyFor(RrCampSlot(w.tfac[c]), s) != 0) busy = 1;", at)) != std::string::npos) { ++busy; ++at; }
+    if (busy != 2) Fail("t1122 fold1 M2: the roll and the lever do not both use the busy rule");
+    if (tg.find("cs == s) busy = 1;") != std::string::npos) Fail("t1122 fold1 M2: a busy test that skips borrowed campaigns is left");
+}
+
+/* ==== T-1333 (design a): a town building's ruin flag and wall health as one world-server record ==== */
+/* the record: its id, bytes and the world server's rule (the door record's) */
+void t_t1333_bldg_record()
+{
+    using namespace bldgrec;
+    if (kProtocol != 153u || doorrec::kProtocol != 153u || coopbrec::kProtocol != 153u) Fail("t1333 record: the world-server protocol is not 153");
+    const std::string key = "2939-Walls2.mod@43,11@-1234,567";
+    const std::string id = MakeBldgRecId(key);
+    int sx = -1, sy = -1;
+    if (id.compare(0, 13, "bldg.43.11.#") != 0 && id.compare(0, 12, "bldg.43.11.#") != 0) Fail("t1333 record: the id does not name the key's area square: " + id);
+    if (BldgRecIdParse(id, &sx, &sy) != 1 || sx != 43 || sy != 11) Fail("t1333 record: the id does not parse back to 43,11");
+    if (!IsBldgRecId(id) || !IsBldgRecId("BLDG.1.2.#00000000") || IsBldgRecId("door.43.11.#00000000") || doorrec::IsDoorRecId(id)) Fail("t1333 record: the prefix test");
+    if (BldgRecIdParse("bldg.043.11.#0000000a", 0, 0) != 0 || BldgRecIdParse("bldg.64.1.#0000000a", 0, 0) != 0 || BldgRecIdParse("bldg.1.1.#0000000A", 0, 0) != 0)
+        Fail("t1333 record: an id spelling MakeBldgRecId never makes parses");
+    if (!MakeBldgRecId("no area field").empty() || !MakeBldgRecId("x@64,1@").empty() || !MakeBldgRecId(std::string(64, 'a') + "@1,1@").empty()) Fail("t1333 record: a key with no area square or too long makes an id");
+    if (BgKeyArea(key) != 43 * 64 + 11 || BgKeyArea("nope") != -1) Fail("t1333 record: the key's area index");
+    BldgRec r;
+    r.key = key; r.ruined = 0; r.progress = 120.5f; r.needed = 400.0f; r.generation = 7; r.writerSlot = 1; r.flags = kBgFlagSeed;
+    std::vector<char> b;
+    if (!EncodeBldgRec(&b, r) || b.size() != 24u + key.size() + 9u) { Fail("t1333 record: the bytes' size"); return; }
+    BldgRec d;
+    if (DecodeBldgRec(&b[0], b.size(), &d) != kBgOk || d.key != key || d.progress != 120.5f || d.needed != 400.0f || d.generation != 7u || d.writerSlot != 1 || d.flags != kBgFlagSeed || d.ruined != 0)
+        Fail("t1333 record: a record does not read back as written");
+    std::vector<char> t = b; t.push_back(0);
+    if (DecodeBldgRec(&t[0], t.size(), &d) != kBgTrailing) Fail("t1333 record: trailing bytes are not refused");
+    if (DecodeBldgRec(&b[0], b.size() - 1, &d) != kBgShort) Fail("t1333 record: a cut record is not refused");
+    t = b; t[0] = 'X';
+    if (DecodeBldgRec(&t[0], t.size(), &d) != kBgBadMarker) Fail("t1333 record: a door / other marker is read");
+    t = b; t[24 + key.size()] = 2;
+    if (DecodeBldgRec(&t[0], t.size(), &d) != kBgBadRecord) Fail("t1333 record: a ruined byte of 2 is read");
+    BldgRec bad = r; bad.progress = -1.0f;
+    if (EncodeBldgRec(&b, bad) || !b.empty()) Fail("t1333 record: a negative health encodes");
+    bad = r; bad.flags = 2u;
+    if (EncodeBldgRec(&b, bad)) Fail("t1333 record: an unknown flag encodes");
+    /* the world server's rule */
+    BldgRec w = r; w.flags = 0; w.writerSlot = 2; w.generation = 3;
+    EncodeBldgRec(&b, w);
+    if (BldgJudgeWrite(id, &b[0], b.size(), 2, 2, 0, 0u, 0, 0) != coopbrec::kBrAccept) Fail("t1333 judge: the holder's first write is refused");
+    if (BldgJudgeWrite(id, &b[0], b.size(), 2, 1, 0, 0u, 0, 0) != coopbrec::kBrRefuseNotWriter) Fail("t1333 judge: a non-holder's write is taken");
+    if (BldgJudgeWrite(id, &b[0], b.size(), 2, -1, 0, 0u, 0, 0) != coopbrec::kBrRefuseNotWriter) Fail("t1333 judge: a write with nobody holding is taken");
+    if (BldgJudgeWrite(id, &b[0], b.size(), 1, 1, 0, 0u, 0, 0) != coopbrec::kBrRefuseWriter) Fail("t1333 judge: a record naming another writer is taken");
+    if (BldgJudgeWrite(id, &b[0], b.size(), 2, 2, 1, 3u, 0, 0) != coopbrec::kBrRefuseSameGen || BldgJudgeWrite(id, &b[0], b.size(), 2, 2, 1, 3u, 1, 0) != coopbrec::kBrRepeat)
+        Fail("t1333 judge: the same generation is not refused / repeated");
+    if (BldgJudgeWrite(id, &b[0], b.size(), 2, 2, 1, 4u, 0, 0) != coopbrec::kBrRefuseOlder || BldgJudgeWrite(id, &b[0], b.size(), 2, 2, 1, 2u, 0, 0) != coopbrec::kBrAccept)
+        Fail("t1333 judge: the generation rule");
+    w.flags = kBgFlagSeed; EncodeBldgRec(&b, w);
+    if (BldgJudgeWrite(id, &b[0], b.size(), 2, 2, 1, 1u, 0, 0) != coopbrec::kBrRefuseSeedExists || BldgJudgeWrite(id, &b[0], b.size(), 2, 2, 0, 0u, 0, 0) != coopbrec::kBrAccept)
+        Fail("t1333 judge: a first write is taken only while none exists");
+    if (BldgJudgeWrite("bldg.1.1.#00000000", &b[0], b.size(), 2, 2, 0, 0u, 0, 0) != coopbrec::kBrRefuseWrongBox) Fail("t1333 judge: a record under another id is taken");
+    if (BldgJudgeRemove(id, 2, 2) != coopbrec::kBrAccept || BldgJudgeRemove(id, 1, 2) != coopbrec::kBrRefuseNotWriter || BldgJudgeRemove("door.1.1.#00000000", 2, 2) != coopbrec::kBrRefuseBadId)
+        Fail("t1333 judge: only the holder removes a building record");
+}
+/* the writer (the 1/20 step, a repair only when it adds health), the lay (a group's health once, from its carrier), the hit routes */
+void t_t1333_bldg_decide()
+{
+    using namespace bldgrec;
+    if (BgBand(0.0f, 100.0f) != 0 || BgBand(100.0f, 100.0f) != kBgBands + 1 || BgBand(4.9f, 100.0f) != 1 || BgBand(5.0f, 100.0f) != 2 || BgBand(99.9f, 100.0f) != kBgBands)
+        Fail("t1333 decide: the twentieth steps");
+    BldgRec rec, live;
+    rec.key = live.key = "w@1,1@"; rec.needed = live.needed = 100.0f;
+    rec.progress = 78.0f; live.progress = 77.0f;   /* both in step 16 */
+    if (BgChangeMask(1, rec, live, kBgCauseHit) != 0) Fail("t1333 decide: a hit inside one step is written");
+    live.progress = 74.0f;
+    if (BgChangeMask(1, rec, live, kBgCauseHit) != kBgChStep) Fail("t1333 decide: a hit crossing a step is not written");
+    if (BgChangeMask(1, rec, live, kBgCauseRepair) != 0) Fail("t1333 decide: a repair that lowered health is written");
+    live.progress = 90.0f;
+    if (BgChangeMask(1, rec, live, kBgCauseRepair) != kBgChStep || BgChangeMask(1, rec, live, kBgCauseHit) != 0) Fail("t1333 decide: a repair adding a step / a hit raising one");
+    live.progress = 60.0f;
+    if (BgChangeMask(0, live, live, kBgCauseHit) != kBgChStep) Fail("t1333 decide: a first hit below full (no record) is not written");
+    live.progress = 100.0f;
+    if (BgChangeMask(0, live, live, kBgCauseHit) != 0) Fail("t1333 decide: a whole wall with no record is written");
+    live.ruined = 1; live.progress = 0.0f;
+    if (BgChangeMask(0, live, live, kBgCauseRuin) != kBgChRuin || BgChangeMask(1, rec, live, kBgCauseRuin) != kBgChRuin) Fail("t1333 decide: a ruin flip is not written at once");
+    rec.ruined = 1; rec.progress = 0.0f; live.ruined = 0; live.progress = 30.0f;
+    if ((BgChangeMask(1, rec, live, kBgCauseRepair) & kBgChRuin) == 0) Fail("t1333 decide: a repair making a ruin whole is not written");
+    if ((BgChangeMask(1, live, rec, kBgCauseRepair) & kBgChRuin) != 0) Fail("t1333 decide: a repair writes a ruin");
+    if (BgWriteDecide(1, 1, kBgChStep, 0) != kBgWrite || BgWriteDecide(0, 1, kBgChStep, 0) != kBgSkipNotHolder || BgWriteDecide(-1, 1, kBgChStep, 0) != kBgSkipUnknown
+        || BgWriteDecide(1, 0, kBgChStep, 0) != kBgSkipNotLaid || BgWriteDecide(1, 1, 0, 0) != kBgSkipNoChange || BgWriteDecide(1, 1, kBgChStep, 1) != kBgSkipSelf)
+        Fail("t1333 decide: who writes");
+    /* the lay */
+    BldgRec r2, l2;
+    r2.key = l2.key = "w@1,1@"; r2.needed = l2.needed = 100.0f;
+    r2.ruined = 1; l2.ruined = 0; l2.progress = 50.0f;
+    float to = -1.0f;
+    if (BgLayAction(r2, l2, 1, &to) != kBgLayRuin) Fail("t1333 lay: a ruined record does not ruin a standing wall (or lays health on it)");
+    r2.ruined = 0; r2.progress = 40.0f; l2.ruined = 1; l2.progress = 0.0f;
+    if (BgLayAction(r2, l2, 1, &to) != (kBgLayWhole | kBgLayHealth) || to != 40.0f) Fail("t1333 lay: a standing record does not make a ruin whole with its health");
+    l2.ruined = 0; l2.progress = 100.0f;
+    if (BgLayAction(r2, l2, 1, &to) != kBgLayHealth || to != 40.0f) Fail("t1333 lay: the carrier's health is not laid");
+    if (BgLayAction(r2, l2, 0, &to) != 0) Fail("t1333 lay: a group member's record lays the group's health");
+    l2.progress = 40.0f;
+    if (BgLayAction(r2, l2, 1, &to) != 0) Fail("t1333 lay: an equal wall is written");
+    r2.needed = 200.0f; r2.progress = 100.0f; l2.progress = 100.0f;
+    if (BgLayAction(r2, l2, 1, &to) != kBgLayHealth || to != 50.0f) Fail("t1333 lay: the record's share of full is not kept when full differs");
+    /* a wall group: three segments of one group (carrier 0) and a lone wall (3); records of 0, 1 and 3 - health laid from 0 and 3 only */
+    std::vector<int> car, have;
+    car.push_back(0); car.push_back(0); car.push_back(0); car.push_back(3);
+    have.push_back(1); have.push_back(1); have.push_back(0); have.push_back(1);
+    const std::vector<int> plan = BgGroupHealthPlan(car, have);
+    if (plan.size() != 4u || plan[0] != 1 || plan[1] != 0 || plan[2] != 0 || plan[3] != 1) Fail("t1333 group: the group's health is not laid once, from its carrier's record");
+    have[0] = 0;
+    if (BgGroupHealthPlan(car, have)[1] != 0) Fail("t1333 group: a member's record lays the group's health when the carrier has none");
+    /* the hit routes */
+    if (BgTownHitRoute(1, -1, 15, 0, 1, 1, 0, 0) != kBgHitHold) Fail("t1333 route: a town wall's hit with a player known is not held");
+    if (BgTownHitRoute(1, -1, 15, 1, 1, 1, 0, 0) != kBgHitEngine || BgTownHitRoute(1, -1, 15, 0, 0, 1, 0, 0) != kBgHitEngine || BgTownHitRoute(1, -1, 15, 0, 1, 0, 0, 0) != kBgHitEngine
+        || BgTownHitRoute(1, -1, 15, 0, 1, 1, 1, 0) != kBgHitEngine || BgTownHitRoute(0, -1, 15, 0, 1, 1, 0, 0) != kBgHitEngine || BgTownHitRoute(1, 16, 15, 0, 1, 1, 0, 0) != kBgHitEngine)
+        Fail("t1333 route: a player's wall, a lone game, an unread hit, the replay, a non-wall or a door past the cap is held");
+    if (BgHeldHitDecide(1, 0, 1, 0) != kBgRunHere || BgHeldHitDecide(0, 2, 1, 0) != kBgAskHolder || BgHeldHitDecide(0, 2, 0, 1) != kBgAskHolder
+        || BgHeldHitDecide(-1, -1, 1, 0) != kBgWaitHolder || BgHeldHitDecide(-1, -1, 1, 1) != kBgRunLocalNoHolder || BgHeldHitDecide(0, -1, 1, 0) != kBgWaitHolder)
+        Fail("t1333 route: the held hit's decision");
+    if (BgHitAskVerdict(1, 1, 0, 0, 1, 7, 3, 4) != 1 || BgHitAskVerdict(0, 1, 0, 0, 1, 7, 3, 4) != 7 || BgHitAskVerdict(1, 0, 0, 0, 1, 7, 3, 4) != 3
+        || BgHitAskVerdict(1, 1, 1, 0, 1, 7, 3, 4) != 4 || BgHitAskVerdict(1, 1, 1, 1, 1, 7, 3, 4) != 1)
+        Fail("t1333 route: the holder's answer");
+    /* the wire: a town wall's repair gain rides a HIT ask with door -1 */
+    coopbuild::BuildMsg m;
+    m.kind = coopbuild::kBuildHit; m.key = "w@1,1@"; m.seq = 5; m.reason = coopbuild::kBuildHitAsk; m.hitCut = 12.0f; m.hitDoor = -1; m.hitRepair = 1;
+    if (!coopbuild::BuildEncodable(m)) Fail("t1333 wire: a wall repair ask (door -1) is not encodable");
+    m.hitBlunt = 1.0f;
+    if (coopbuild::BuildEncodable(m)) Fail("t1333 wire: a repair ask with blunt damage is encodable");
+    /* kept records, refusals and a rebuilt town */
+    if (BgNextGen(1, 4u, 9u) != 10u || BgNextGen(0, 4u, 0u) != 1u || BgArrivalTakes(1, 5u, 4u) != 0 || BgArrivalTakes(1, 5u, 5u) != 1 || BgArrivalTakes(0, 9u, 1u) != 1)
+        Fail("t1333 kept: the generation rules");
+    if (BgRefuseNext(coopbrec::kBrRefuseOlder, 0) != doorrec::kDrRefuseRewrite || BgRefuseNext(coopbrec::kBrRefuseSeedExists, 0) != doorrec::kDrRefuseTakeStored
+        || BgRefuseNext(coopbrec::kBrRefuseNotWriter, 0) != doorrec::kDrRefuseDrop || BgRefuseNext(coopbrec::kBrRefuseOlder, doorrec::kDrRewriteCap) != doorrec::kDrRefuseDrop)
+        Fail("t1333 kept: the refusal rules");
+    if (BgGoneDecide(1) != kBgGoneSend || BgGoneDecide(0) != kBgGoneDrop || BgGoneDecide(-1) != kBgGoneWait) Fail("t1333 rebuilt: the removal rule");
+}
+/* T-1333 fold 1 (the independent review): A a holder's own hit before its area's records are laid is kept and run after the lay; B a
+   blow whose attacker is a copy here is dropped (its own game counts it); C a hit while the holder is not known waits for it (an area
+   map event); D a repair answered 'ruin' lays the ruin again on the asking game; E the world server forgets a removed record's
+   generation. The pure rules (bldgrec.h) and their wiring (build.cpp, store_main.cpp). */
+void t_t1333_fold1()
+{
+    using namespace bldgrec;
+    /* B: a copy's blow on a town wall or door is dropped - before the damage read, never for a player's piece, a lone game or the replay */
+    if (BgTownHitRoute(1, -1, 15, 0, 1, 1, 0, 1) != kBgHitDropCopy || BgTownHitRoute(1, 3, 15, 0, 1, 1, 0, 1) != kBgHitDropCopy
+        || BgTownHitRoute(1, -1, 15, 0, 1, 0, 0, 1) != kBgHitDropCopy)
+        Fail("t1333 fold1 B: a copy's blow on a town building is not dropped");
+    if (BgTownHitRoute(1, -1, 15, 1, 1, 1, 0, 1) != kBgHitEngine || BgTownHitRoute(1, -1, 15, 0, 0, 1, 0, 1) != kBgHitEngine
+        || BgTownHitRoute(1, -1, 15, 0, 1, 1, 1, 1) != kBgHitEngine || BgTownHitRoute(0, -1, 15, 0, 1, 1, 0, 1) != kBgHitEngine)
+        Fail("t1333 fold1 B: a copy's blow on a player's piece, a lone game's, the replay or a non-target is dropped by the town rule");
+    /* A / C: the wall hook keeps a hit unless this game holds the area and its records are laid */
+    if (BgWallHitKept(1, 1) != 0 || BgWallHitKept(1, 0) != 1 || BgWallHitKept(0, 1) != 1 || BgWallHitKept(-1, 1) != 1 || BgWallHitKept(-1, 0) != 1)
+        Fail("t1333 fold1 A/C: the wall hook's keep rule");
+    /* A / C: the main thread's decision - the holder before the lay waits for it, an unknown holder is waited for (a wall), a door runs */
+    if (BgHeldHitDecide(1, 0, 0, 0) != kBgHoldToLay || BgHeldHitDecide(1, 0, 0, 1) != kBgRunHere || BgHeldHitDecide(1, 0, 1, 0) != kBgRunHere)
+        Fail("t1333 fold1 A: the holder's hit before the lay is not kept for it (or a door's is)");
+    if (BgHeldHitDecide(-1, -1, 0, 0) != kBgWaitHolder || BgHeldHitDecide(-1, 3, 1, 0) != kBgWaitHolder || BgHeldHitDecide(0, 4, 0, 0) != kBgAskHolder)
+        Fail("t1333 fold1 C: a wall's hit with no holder known does not wait (or a known holder is not asked)");
+    /* A: a repair gain decided after a wait is added again only when a lay since then laid a kept record over it */
+    if (BgRepairAfterWait(1, 1) != kBgRepairAddGain || BgRepairAfterWait(0, 1) != kBgRepairWriteLive || BgRepairAfterWait(1, 0) != kBgRepairWriteLive
+        || BgRepairAfterWait(0, 0) != kBgRepairWriteLive)
+        Fail("t1333 fold1 A: the waited repair gain's rule");
+    /* D: only a wall repair answered 'ruin' lays the ruin again */
+    if (BgRepairRuinUndo(1, -1, 1) != 1 || BgRepairRuinUndo(0, -1, 1) != 0 || BgRepairRuinUndo(1, 0, 1) != 0 || BgRepairRuinUndo(1, -1, 0) != 0)
+        Fail("t1333 fold1 D: the repair 'ruin' undo rule");
+    /* the wiring */
+    const std::string bd = T23NoCr(T313ReadFile("../coop-plugin/build.cpp"));
+    const std::string sm = T23NoCr(T313ReadFile("../coop-store/store_main.cpp"));
+    const std::string se = T23NoCr(T313ReadFile("../coop-plugin/net/session.cpp"));
+    const std::string st = T23NoCr(T313ReadFile("../coop-plugin/store.cpp"));
+    if (bd.empty() || sm.empty() || se.empty() || st.empty()) { Fail("t1333 fold1 wiring: a source file did not read"); return; }
+    const char* const needBd[] = {
+        "return (u != 0 && !net::IsUidMineAnyThread(u)) ? 1 : 0;",
+        "const int atkCopy = (isWall != 0 && player == 0 && multi != 0 && replay == 0) ? TbAttackerIsCopy(attacker, &atkUid) : 0;",
+        "const int tbRoute = bldgrec::BgTownHitRoute(isWall, -1, coopbuild::kBuildHitMaxDoor, player, multi, dmgOk, replay, atkCopy);",
+        "TbCopyDropCount(t, -1, atkUid, cut, blunt, onMain);",
+        "const int atkCopy = (isDoor != 0 && parent != 0 && player == 0 && multi != 0 && replay == 0) ? TbAttackerIsCopy(attacker, &atkUid) : 0;",
+        "TbCopyDropCount(parent, index, atkUid, cut, blunt, onMain);",
+        "if (bldgrec::BgWallHitKept(tbHold, TbAreaLaidAnyThread(tbArea)) != 0)",
+        "const int dcs = bldgrec::BgHeldHitDecide(hold, slot, laid, door >= 0 ? 1 : 0);",
+        "TbWaitKeep(key, area, dcs, add, 0, haveRec);",
+        "TbWaitRelease(c, \"the area's records are laid\");",
+        "if (!g_tbWait.empty()) TbWaitRelease(-1, \"an area map arrived\");",
+        "TbWaitDropArea(c);",
+        "++g_tbLaySerial[c];",
+        "if (e.kind == 11) { if (e.keyOk != 0) TbCopyDropLine(",
+        "if (had != 0) TbRepairAnswer(o.key, o.door, o.repair, (int)m.reason);",
+        "if (bldgrec::BgRepairRuinUndo(repair, door, verdict == coopbuild::kBuildHitRuin ? 1 : 0) == 0) return;",
+        " townFold1[copyDropWall,copyDropDoor,copyDropPlayer,copyDropNpc,waitLay,waitHolder,waitReleased,waitDropped,waiting,waitGainAdded,ruinRelaid,ruinRelayFail]=" };
+    for (size_t i = 0; i < sizeof(needBd) / sizeof(needBd[0]); ++i)
+        if (bd.find(needBd[i]) == std::string::npos) Fail(std::string("t1333 fold1 wiring: build.cpp lacks ") + needBd[i]);
+    /* E: the LOWs */
+    if (sm.find("g_doorGen.erase(wid);   /* a door record written again later is a new record */\n    g_bldgGen.erase(wid);") == std::string::npos)
+        Fail("t1333 fold1 E: the world server keeps a removed building record's generation");
+    if (se.find("224 224") != std::string::npos) Fail("t1333 fold1 E: session.cpp's protocol note still reads '224 224'");
+    if (st.find("#include \"../common/cagerec.h\"    /* T-860: a cage.") == std::string::npos) Fail("t1333 fold1 E: the cage include's note is not on its line");
+}
+/* T-1333 fold 2 (the re-check): one road whatever the player count, kept hits per wall (nothing dropped, no churn), laid after the lay */
+void t_t1333_fold2()
+{
+    using namespace bldgrec;
+    /* 1: the town road runs in any game that is not single-player - a game alone with its world server holds its areas */
+    if (BgTownHitRoute(1, -1, 15, 0, 1, 1, 0, 0) != kBgHitHold || BgTownHitRoute(1, -1, 15, 0, 0, 1, 0, 0) != kBgHitEngine
+        || BgTownHitRoute(1, -1, 15, 1, 1, 1, 0, 0) != kBgHitEngine)
+        Fail("t1333 fold2 1: the town road is not one road for one player or many (or a single-player game / a player's piece takes it)");
+    /* 2a: one entry per wall - hits counted and summed, run again as that many hits of the average */
+    BgWaitSum w;
+    for (int i = 0; i < 300; ++i) BgWaitAddHits(&w, 1, 30.0, 10.0);
+    if (w.hits != 300 || std::fabs(w.cut - 9000.0) > 1e-6 || std::fabs(w.blunt - 3000.0) > 1e-6 || std::fabs(w.cut / w.hits - 30.0) > 1e-9)
+        Fail("t1333 fold2 2a: the kept hits of one wall are not counted and summed");
+    /* gains: one made before a lay that laid a kept record is added again; one made since is on the wall */
+    BgWaitSum g;
+    BgWaitAddGain(&g, 1.0, 5u, 1);
+    BgWaitAddGain(&g, 2.0, 6u, 1);
+    if (std::fabs(g.gainGone - 1.0) > 1e-9 || std::fabs(g.gainLive - 2.0) > 1e-9 || g.serial != 6u || std::fabs(BgWaitGainToAdd(g, 6u, 1) - 1.0) > 1e-9
+        || std::fabs(BgWaitGainToAdd(g, 7u, 1) - 3.0) > 1e-9)
+        Fail("t1333 fold2 2a: the kept gains by their lay");
+    BgWaitSum g0;
+    BgWaitAddGain(&g0, 1.0, 5u, 0);
+    BgWaitAddGain(&g0, 2.0, 6u, 0);
+    if (std::fabs(g0.gainGone) > 1e-9 || std::fabs(g0.gainLive - 3.0) > 1e-9 || std::fabs(BgWaitGainToAdd(g0, 7u, 0)) > 1e-9 || BgWaitGainToAdd(BgWaitSum(), 1u, 1) != 0.0)
+        Fail("t1333 fold2 2a: a gain with no kept record is added again");
+    /* a released entry kept again folds into the wall's entry made since */
+    BgWaitSum m;
+    BgWaitAddHits(&m, 2, 20.0, 0.0);
+    BgWaitMerge(&m, w, 1);
+    BgWaitMerge(&m, g, 1);
+    if (m.hits != 302 || std::fabs(m.cut - 9020.0) > 1e-6 || m.gainHave != 1 || std::fabs(m.gainGone + m.gainLive - 3.0) > 1e-9)
+        Fail("t1333 fold2 2a: a re-kept entry loses or doubles hits / gains");
+    /* the ask list: never past its cap - the rest wait for the next area map */
+    if (BgWaitAskNow(10, 250, 256) != 6 || BgWaitAskNow(10, 256, 256) != 0 || BgWaitAskNow(3, 0, 256) != 3 || BgWaitAskNow(0, 0, 256) != 0)
+        Fail("t1333 fold2 2a: the ask burst rule");
+    /* 2b: only a wall's first keep writes a line */
+    if (BgWaitKeepLine(1, 0) != 1 || BgWaitKeepLine(0, 0) != 0 || BgWaitKeepLine(1, 1) != 0 || BgWaitKeepLine(0, 1) != 0)
+        Fail("t1333 fold2 2b: the keep line rule");
+    const std::string bd = T23NoCr(T313ReadFile("../coop-plugin/build.cpp"));
+    if (bd.empty()) { Fail("t1333 fold2 wiring: build.cpp did not read"); return; }
+    const char* const needBd[] = {
+        "const int multi = RoleIsSingle() ? 0 : 1;   /* fold 2: the town road whatever the player count */",
+        "if (tbWall != 0 && !RoleIsSingle())",
+        "std::map<std::string, TbWait> g_tbWait;",
+        "bldgrec::BgWaitMerge(&w.s, add, haveRec);",
+        "if (bldgrec::BgWaitKeepLine(created, rekeep) == 0) return;",
+        "const int k = bldgrec::BgWaitAskNow(s.hits, g_hitOut.size(), kHitOutCap);",
+        "if (BdReadState(b, &p, &n, &c, &d, &x) != 0 && x != 0) { onRuin = s.hits - i; break; }",
+        "TbWaitKeep(key, area, dcs, s, 1, haveRec);   /* still waiting: kept again */",
+        "    if (left == 0) return;\n    g_tbWaitReleased += left;",
+        " townFold2[merged,rekept,askDeferred,onRuin]=" };
+    for (size_t i = 0; i < sizeof(needBd) / sizeof(needBd[0]); ++i)
+        if (bd.find(needBd[i]) == std::string::npos) Fail(std::string("t1333 fold2 wiring: build.cpp lacks ") + needBd[i]);
+    if (bd.find("if (tbWall != 0 && StandInAnyAnyThread() != 0)") != std::string::npos || bd.find("TbWaitPush(") != std::string::npos)
+        Fail("t1333 fold2 1/2: the repair still asks for another player, or the per-hit kept list is still there");
+    /* 2c: the wait ends only at an area map or this game's lay - no timer releases it */
+    size_t calls = 0;
+    for (size_t at = bd.find("TbWaitRelease("); at != std::string::npos; at = bd.find("TbWaitRelease(", at + 1)) ++calls;
+    if (calls != 3 || bd.find("if (!g_tbWait.empty()) TbWaitRelease(-1, \"an area map arrived\");") == std::string::npos)
+        Fail("t1333 fold2 2c: TbWaitRelease is called from somewhere other than the lay and the area map");
+    /* 3: the area is marked laid after its records are laid, before the kept hits run */
+    const size_t lay = bd.find("ok += TbLayOne(it->first, it->second.r, \"the area's records laid\");");
+    const size_t mark = bd.find("g_tbLaid[c] = 1;   /* fold 2: marked laid only now");
+    const size_t rel = bd.find("TbWaitRelease(c, \"the area's records are laid\");");
+    if (lay == std::string::npos || mark == std::string::npos || rel == std::string::npos || !(lay < mark && mark < rel)
+        || bd.find("    g_tbLaid[c] = 1;\n    ++g_tbLaySerial[c];") != std::string::npos)
+        Fail("t1333 fold2 3: the area is marked laid before its records are laid");
+    /* decision 1609 a: a copy's blow on a player-built wall or piece door is dropped - never alone, never the replay, never the own blow */
+    if (BgPlayerHitDropCopy(1, 1, 1, 0, 1) != 1 || BgPlayerHitDropCopy(1, 1, 1, 0, 0) != 0 || BgPlayerHitDropCopy(1, 1, 0, 0, 1) != 0
+        || BgPlayerHitDropCopy(1, 1, 1, 1, 1) != 0 || BgPlayerHitDropCopy(1, 0, 1, 0, 1) != 0 || BgPlayerHitDropCopy(0, 1, 1, 0, 1) != 0)
+        Fail("t1333 1609a: the player-piece copy-blow rule");
+    const char* const needPc[] = {
+        "const int pcCopy = (player != 0 && others != 0 && replay == 0) ? TbAttackerIsCopy(attacker, &pcUid) : 0;",
+        "BdPieceCopyDropCount(t, -1, pcUid, cut, blunt, onMain);",
+        "const int pcCopy = (isDoor != 0 && parent != 0 && player != 0 && others != 0 && replay == 0) ? TbAttackerIsCopy(attacker, &pcUid) : 0;",
+        "BdPieceCopyDropCount(parent, index, pcUid, cut, blunt, onMain);",
+        "BdQueueEvent(11, b, cut, onMain, (int)uid, 1, blunt, door);",
+        " pieceCopyDrop[wall,door,player,npc]=" };
+    for (size_t i = 0; i < sizeof(needPc) / sizeof(needPc[0]); ++i)
+        if (bd.find(needPc[i]) == std::string::npos) Fail(std::string("t1333 1609a wiring: build.cpp lacks ") + needPc[i]);
+    /* the drop comes before the player-wall queue in both hooks */
+    const size_t wDrop = bd.find("BdPieceCopyDropCount(t, -1, pcUid"), wQ = bd.find("if (coopbuild::BuildWallHitRoute(BdIsWall(t) == 1 ? 1 : 0, player, others, dmgOk, replay)");
+    const size_t dDrop = bd.find("BdPieceCopyDropCount(parent, index, pcUid"), dQ = bd.find("if (coopbuild::BuildDoorHitRoute(isDoor, index, player, others, dmgOk, replay)");
+    if (wDrop == std::string::npos || wQ == std::string::npos || !(wDrop < wQ) || dDrop == std::string::npos || dQ == std::string::npos || !(dDrop < dQ))
+        Fail("t1333 1609a: a copy's blow reaches the player-wall queue before the drop");
+}
+/* the wiring: the hooks hold and write, the drain, the lay at the area's lay, the stores route bldg ids, the world server judges them */
+void t_t1333_bldg_wiring()
+{
+    const std::string bd = T23NoCr(T313ReadFile("../coop-plugin/build.cpp"));
+    const std::string st = T23NoCr(T313ReadFile("../coop-plugin/store.cpp"));
+    const std::string it = T23NoCr(T313ReadFile("../coop-plugin/items.cpp"));
+    const std::string tv = T23NoCr(T313ReadFile("../coop-plugin/townver.cpp"));
+    const std::string sm = T23NoCr(T313ReadFile("../coop-store/store_main.cpp"));
+    const std::string se = T23NoCr(T313ReadFile("../coop-plugin/net/session.cpp"));
+    if (bd.empty() || st.empty() || it.empty() || tv.empty() || sm.empty() || se.empty()) { Fail("t1333 wiring: a source file did not read"); return; }
+    const char* const needBd[] = {
+        "BdQueueEvent(7, t, cut, onMain, -1, 0, blunt);",
+        "if (isWall != 0 && player == 0 && multi != 0) BdQueueEvent(8, t, cut, onMain, -1, 0, blunt);",
+        "BdQueueEvent(10, parent, cut, onMain, -1, 0, blunt, index);",
+        "BdQueueEvent(9, b, (tp > tbP0) ? tp - tbP0 : 0.0f, BdOnMain(), -1);",
+        "if (e.kind == 8) TbNote(std::string(e.key), bldgrec::kBgCauseHit);",
+        "TbNote(std::string(e.key), bldgrec::kBgCauseRuin);",
+        "TbAreaLay(c);   /* T-1333",
+        "TbAreaLeft(c);",
+        "TbLinkReset();",
+        "if (it == g_reg.end() && TbHitAskHere(m, from)) continue;",
+        "&& TbHitLocalTake(h.key, h.cut, h.blunt, h.door, h.repair, h.reasked, h.noRow, h.at)) continue;",
+        "if (m.hitRepair != 0 && m.hitDoor < 0) { b = 0; held = 0; }",
+        "TownBldgReport();",
+        "const int d = bldgrec::BgWriteDecide(hold, g_tbLaid[area], mask, g_bdSelf > 0 ? 1 : 0);",
+        "const int a = bldgrec::BgLayAction(rec, live, carrier, &to);" };
+    for (size_t i = 0; i < sizeof(needBd) / sizeof(needBd[0]); ++i)
+        if (bd.find(needBd[i]) == std::string::npos) Fail(std::string("t1333 wiring: build.cpp lacks ") + needBd[i]);
+    const char* const needSt[] = { "if (bldgrec::IsBldgRecId(worldId)) { coop::TownBldgRecordArrive(worldId, bytes); return; }", "coop::TownBldgRecordGone(worldId)",
+        "coop::TownBldgRecordEcho(worldId", "coop::TownBldgMapEvent();", "bool StoreSendBldgRecord(", "bool StoreSendBldgGone(", "const unsigned int kStoreProtocol = 153;" };
+    for (size_t i = 0; i < sizeof(needSt) / sizeof(needSt[0]); ++i)
+        if (st.find(needSt[i]) == std::string::npos) Fail(std::string("t1333 wiring: store.cpp lacks ") + needSt[i]);
+    if (it.find("TownBldgRefuseArrive(id, reason, storedGen, sentGen)") == std::string::npos) Fail("t1333 wiring: items.cpp does not route a building record's refusal");
+    if (tv.find("TownBldgAreaRebuilt(ts.x * 64 + ts.y);") == std::string::npos) Fail("t1333 wiring: townver.cpp does not drop a rebuilt town's building records");
+    const char* const needSm[] = { "bldgrec::BldgJudgeWrite(r.worldId,", "bldgrec::BldgJudgeRemove(wid, sender, BldgHolderOf(wid))", "BldgLanded(id, j->payload);",
+        "|| bldgrec::BldgRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 153;", "&& !bldgrec::IsBldgRecId(wid)) TownLossFromGone(" };
+    for (size_t i = 0; i < sizeof(needSm) / sizeof(needSm[0]); ++i)
+        if (sm.find(needSm[i]) == std::string::npos) Fail(std::string("t1333 wiring: store_main.cpp lacks ") + needSm[i]);
+    if (se.find("const unsigned int kProtocolVersion = 227;") == std::string::npos) Fail("t1333 wiring: the game-to-game protocol is not 227 (T-1333's 225, T-1122's 226, then T-1318's 227 on top)");
+}
+/* T-1333 TEST-ONLY lever `buildtest townhit <key> <cut> <blunt> [door|door=<i>] [times]`: its words' parse (bldgrec.h
+   BgTownHitLeverParse), and that build.cpp starts only the engine's own hit (vt+0x1F0 through the hooks) - never a record write, never
+   an ask of the holder, never g_hitReplay */
+void t_t1333_townhit_lever()
+{
+    using namespace bldgrec;
+    const std::string key = "2939-Walls2.mod@43,11@532462,-960865,10866";
+    std::vector<std::string> w;
+    BgTownHitLever lv;
+    lv.key = "untouched"; lv.cut = 0.0f; lv.blunt = 0.0f; lv.door = -2; lv.times = 0;
+    w.push_back(key); w.push_back("500"); w.push_back("0");
+    if (BgTownHitLeverParse(w, 1.0e6f, 15, &lv) != 1 || lv.key != key || lv.cut != 500.0f || lv.blunt != 0.0f || lv.door != -1 || lv.times != 1)
+        Fail("t1333 lever: the plain wall form does not parse");
+    w.push_back("door");
+    if (BgTownHitLeverParse(w, 1.0e6f, 15, &lv) != 1 || lv.door != 0 || lv.times != 1) Fail("t1333 lever: `door` is not door 0");
+    w.back() = "door=3"; w.push_back("7");
+    if (BgTownHitLeverParse(w, 1.0e6f, 15, &lv) != 1 || lv.door != 3 || lv.times != 7) Fail("t1333 lever: `door=3 7` does not parse");
+    w.resize(3); w.push_back("12");
+    if (BgTownHitLeverParse(w, 1.0e6f, 15, &lv) != 1 || lv.door != -1 || lv.times != 12) Fail("t1333 lever: a wall's times do not parse");
+    w[1] = "2.5"; w[2] = "0.25";
+    if (BgTownHitLeverParse(w, 1.0e6f, 15, &lv) != 1 || lv.cut != 2.5f || lv.blunt != 0.25f) Fail("t1333 lever: decimal damage does not parse");
+    const BgTownHitLever keep = lv;
+    const char* const badDamage[] = { "-1", "1e3", "abc", "", ".", "1.2.3", "1000001", "nan" };
+    for (size_t i = 0; i < sizeof(badDamage) / sizeof(badDamage[0]); ++i)
+    {
+        std::vector<std::string> b(w);
+        b[1] = badDamage[i];
+        if (BgTownHitLeverParse(b, 1.0e6f, 15, &lv) != 0) Fail(std::string("t1333 lever: a bad cut is taken: ") + badDamage[i]);
+    }
+    const char* const badTail[][2] = { { "door=16", "" }, { "door=-1", "" }, { "door=1.5", "" }, { "door=", "" }, { "doors", "" }, { "0", "" },
+                                       { "201", "" }, { "1.5", "" }, { "door", "0" }, { "door", "3 4" }, { "5", "door" }, { "door", "door" } };
+    for (size_t i = 0; i < sizeof(badTail) / sizeof(badTail[0]); ++i)
+    {
+        std::vector<std::string> b(w.begin(), w.begin() + 3);
+        b.push_back(badTail[i][0]);
+        if (badTail[i][1][0] != 0) b.push_back(badTail[i][1]);
+        if (BgTownHitLeverParse(b, 1.0e6f, 15, &lv) != 0) Fail(std::string("t1333 lever: a bad tail is taken: ") + badTail[i][0] + " " + badTail[i][1]);
+    }
+    std::vector<std::string> b(w.begin(), w.begin() + 2);
+    if (BgTownHitLeverParse(b, 1.0e6f, 15, &lv) != 0) Fail("t1333 lever: a missing blunt is taken");
+    b = w; b[0] = "no-area-field";
+    if (BgTownHitLeverParse(b, 1.0e6f, 15, &lv) != 0) Fail("t1333 lever: a key with no area square is taken");
+    b[0] = std::string(60, 'k') + "@1,1@";
+    if (BgTownHitLeverParse(b, 1.0e6f, 15, &lv) != 0) Fail("t1333 lever: a key past kBgKeyMax is taken");
+    b = w; b.push_back("door"); b.push_back("3"); b.push_back("extra");
+    if (BgTownHitLeverParse(b, 1.0e6f, 15, &lv) != 0) Fail("t1333 lever: six words are taken");
+    if (lv.key != keep.key || lv.cut != keep.cut || lv.times != keep.times) Fail("t1333 lever: a refused parse changed the output");
+    const std::string bd = T23NoCr(T313ReadFile("../coop-plugin/build.cpp"));
+    if (bd.empty()) { Fail("t1333 lever: build.cpp did not read"); return; }
+    const size_t at = bd.find("void BdTestTownHit()");
+    const size_t end = (at == std::string::npos) ? std::string::npos : bd.find("\nvoid BdOutpostDrain();", at);
+    if (at == std::string::npos || end == std::string::npos) { Fail("t1333 lever: BdTestTownHit is not where it was put"); return; }
+    const std::string fn = bd.substr(at, end - at);
+    if (fn.find("ok = BdHitPod(t, lv.cut, lv.blunt, &ret);") == std::string::npos) Fail("t1333 lever: it does not start the engine's own hit (BdHitPod)");
+    const char* const never[] = { "g_hitReplay", "TbSend(", "TbNote(", "TbRunHit(", "TbHitDecide(", "SendBuild", "StoreSend", "g_hitOut", "BdHitReplayPod(" };
+    for (size_t i = 0; i < sizeof(never) / sizeof(never[0]); ++i)
+        if (fn.find(never[i]) != std::string::npos) Fail(std::string("t1333 lever: BdTestTownHit goes around the hooks: ") + never[i]);
+    if (bd.find("if (!bldgrec::BgTownHitLeverParse(w, coopbuild::kBuildHitMax, coopbuild::kBuildHitMaxDoor, &lv)) return usage;") == std::string::npos
+        || bd.find("else if (kind == 15) BdTestTownHit();") == std::string::npos) Fail("t1333 lever: the arm or the drain is not wired");
+}
+
+/* T-1333 fold 3 (owner 1083 a: "sync it too"): a town door's health alone writes its record (the holder's hit or repair), the lay puts
+   the record's health on every game's door, a player's piece's door is untouched (its health lives on its piece record), and no write
+   is made when the health did not move. */
+void t_t1333_door_health()
+{
+    using namespace doorrec;
+    DoorRec rec;
+    rec.key = "h@43,11@100,200"; rec.gate = 0; rec.state = 0; rec.lockWord = 0; rec.broken = 0; rec.hasLock = 0; rec.health = 16.0f;
+    /* the mask: a hit's health alone is a change; one within the epsilon, or none, is not */
+    DoorRec live = rec;
+    live.health = 15.1f;
+    if (DoorRecChangeMask(1, rec, live) != kDrChHealth || DoorRecWriteDecide(1, 1, DoorRecChangeMask(1, rec, live), 0, 0) != kDrWrite)
+        Fail("t1333 door health: a hit's health alone is not written by the holder");
+    if (DoorRecWriteDecide(0, 1, DoorRecChangeMask(1, rec, live), 0, 0) != kDrSkipNotHolder) Fail("t1333 door health: a game not holding the area writes a door's health");
+    if (DoorRecWriteDecide(-1, 1, DoorRecChangeMask(1, rec, live), 0, 0) != kDrHoldUntilLaid) Fail("t1333 door health: a hit's health with the holder not known is not held");
+    live.health = 16.0f;
+    if (DoorRecChangeMask(1, rec, live) != 0 || DoorRecWriteDecide(1, 1, DoorRecChangeMask(1, rec, live), 0, 0) != kDrSkipNoChange)
+        Fail("t1333 door health: a write is made with the health unchanged");
+    live.health = 16.0f + kDrHealthEps * 0.5f;
+    if (DoorRecChangeMask(1, rec, live) != 0) Fail("t1333 door health: a health within the epsilon writes");
+    live.health = 16.0f - kDrHealthEps * 2.0f;
+    if (DoorRecChangeMask(1, rec, live) != kDrChHealth) Fail("t1333 door health: a health just past the epsilon does not write");
+    /* a repair gain is a change too; a break carries its health with the broken bit */
+    DoorRec hurt = rec; hurt.health = 7.0f;
+    live = hurt; live.health = 9.5f;
+    if (DoorRecChangeMask(1, hurt, live) != kDrChHealth) Fail("t1333 door health: a repair's gain is not written");
+    live = rec; live.broken = 1; live.health = 0.0f;
+    if (DoorRecChangeMask(1, rec, live) != (kDrChBroken | kDrChHealth)) Fail("t1333 door health: a break does not carry its health");
+    if (DoorRecChangeWords(kDrChHealth) != " health") Fail("t1333 door health: the write's words are not 'health'");
+    if (DoorRecTickWords(kDrChHealth, 0, 0) != kDrChHealth) Fail("t1333 door health: a health-only write's tick words lose the health");
+    /* held before the lay: the holder's lay writes the held health over the record, not the save's other facts */
+    {
+        DoorRec w = rec; w.lockWord = 2; w.hasLock = 1; w.lockLevel = 40;
+        DoorRec lv = w; lv.health = 7.0f; lv.lockLevel = 12;
+        const DoorRec m = DoorRecHeldMerge(w, lv, kDrChHealth);
+        if (m.health != 7.0f || m.lockLevel != 40 || m.broken != 0) Fail("t1333 door health: a held health is lost at the lay, or carries other facts");
+        if (DoorRecHeldMerge(w, lv, kDrChLock).health != 16.0f) Fail("t1333 door health: the save's health rides a held lock change");
+    }
+    /* the lay rule: the record's health on every game; the door's own only over this game's own older record */
+    if (DoorRecLayHealth(0, 0, 7.0f, 16.0f, 0) != 7.0f) Fail("t1333 door health: the holder's 7/16 is not laid on the other game's whole door (T2332)");
+    if (DoorRecLayHealth(0, 0, 16.0f, 7.0f, 1) != 7.0f) Fail("t1333 door health: the holder's own newer door is overwritten by its older record");
+    if (DoorRecLayHealth(1, 0, 0.0f, 3.0f, 1) != 0.0f) Fail("t1333 door health: a break's health is not laid with it");
+    if (DoorRecDoorNewer(1, 2, 2, 1) != 1 || DoorRecDoorNewer(1, 1, 2, 1) != 0 || DoorRecDoorNewer(0, 2, 2, 1) != 0 || DoorRecDoorNewer(1, -1, -1, 1) != 0)   /* fold 4: weHold */
+        Fail("t1333 door health: the door counts as newer over another game's record, or with nothing unwritten");
+    /* a town door's record health is never below 0 */
+    { DoorRec n = rec; n.health = -3.0f; if (DoorRecTownFields(n).health != 0.0f) Fail("t1333 door health: a town door's record health is below 0"); }
+    /* a player's piece's door: unchanged - no health bit, its record keeps the player mark, its held merge takes no health */
+    {
+        DoorRec pr = DoorRecPlayerFields(rec);
+        DoorRec pl = rec; pl.health = 3.0f;
+        if (DoorRecChangeMaskFor(1, 1, pr, pl) != 0) Fail("t1333 door health: a player's piece's door's health writes its door record");
+        if (DoorRecPlayerFields(pl).health != kDrPlayerMark) Fail("t1333 door health: a player door's record loses its mark");
+        if (DoorRecPlayerHeldMerge(pr, pl, kDrChHealth).health != kDrPlayerMark) Fail("t1333 door health: a held health rides a player door's record");
+        if (DoorRecChangeMaskFor(0, 1, rec, pl) != kDrChHealth) Fail("t1333 door health: a town door's health is not a change through the kind road");
+    }
+    /* the wiring: the hit and repair hooks note a health move; the record step marks the door newer and writes it; the lay uses the rule */
+    const std::string d = T313ReadFile("../coop-plugin/doors.cpp"), b = T313ReadFile("../coop-plugin/build.cpp");
+    if (d.empty() || b.empty()) { Fail("t1333 door health: could not read the sources"); return; }
+    if (b.find("else if (rh1 != rh) DoorsRecNoteHealthChanged(t);") == std::string::npos) Fail("t1333 door health: the door hit does not note a health move");
+    if (b.find("else if (dRead != 0 && dh1 > dh0) DoorsRecNoteHealthChanged(b);") == std::string::npos) Fail("t1333 door health: the repair step does not note a gain");
+    if (d.find("const float layHealth = doorrec::DoorRecLayHealth(rec.broken, live.broken, rec.health, live.health, doorNewer);") == std::string::npos
+        || d.find("DoorsRecApply(r->door, layHealth, rec.broken, rec.hasLock, rec.lockLevel, rec.lockBroken)") == std::string::npos)
+        Fail("t1333 door health: the lay does not use the health rule");
+    if (d.find("::InterlockedExchange(&rq->recHealthNew, 1);") == std::string::npos || d.find("healthWrites=%lld healthLaid=%lld") == std::string::npos)
+        Fail("t1333 door health: the record step or the REPORT counters are not wired");
+}
+
+/* T-1333 fold 4 (the fold 3 review): a town door's health-only writes paced per door (MED 1), a non-holder's town door repair asked
+   of the holder and run there (LOW 2), "keep my own newer" only while holding the area (LOW 3) */
+namespace {
+/* one door on the door tick, as doors.cpp runs it: a health note sets the waiting flag (a note while one waits is paced); each frame
+   the tick writes a waiting change once doorrec::DoorRecHealthPaceDue says so; a break goes on the unpaced road and its write carries
+   the health (the waiting change is taken by it) */
+struct T1333Pace { int dirty, haveLast, writes, breakWrites, paced; unsigned int lastAt, lastWriteAt; };
+void T1333PaceFrame(T1333Pace* p, unsigned int now, int note, int brk)
+{
+    if (note != 0) { if (p->dirty != 0) ++p->paced; p->dirty = 1; }
+    if (brk != 0) { ++p->breakWrites; p->dirty = 0; p->haveLast = 1; p->lastAt = now; p->lastWriteAt = now; return; }
+    if (p->dirty != 0 && doorrec::DoorRecHealthPaceDue(p->haveLast, p->lastAt, now, doorrec::kDrHealthPaceMs) != 0)
+    { p->dirty = 0; ++p->writes; p->haveLast = 1; p->lastAt = now; p->lastWriteAt = now; }
+}
+}
+void t_t1333_fold4()
+{
+    using namespace doorrec;
+    /* MED 1: a burst of 60 repair gains in 1 s (one a frame) - at most 4 writes plus the final, the last value written */
+    {
+        T1333Pace p = { 0, 0, 0, 0, 0, 0u, 0u };
+        unsigned int lastNote = 0;
+        for (int f = 0; f <= 120; ++f)
+        {
+            const unsigned int now = 5000u + (unsigned int)(f * 1000 / 60);
+            const int note = (f < 60) ? 1 : 0;
+            if (note != 0) lastNote = now;
+            T1333PaceFrame(&p, now, note, 0);
+        }
+        if (p.writes > 5 || p.writes < 2) Fail("t1333 fold4 pace: a 1 s burst of 60 gains is not 4 writes plus the final");
+        if (p.dirty != 0 || p.lastWriteAt < lastNote) Fail("t1333 fold4 pace: the last value of a burst is not written");
+        if (p.paced < 50) Fail("t1333 fold4 pace: the notes folded into a waiting write are not counted");
+    }
+    /* a break inside a burst is written in its own frame (not paced); the burst stays paced around it */
+    {
+        T1333Pace p = { 0, 0, 0, 0, 0, 0u, 0u };
+        for (int f = 0; f <= 120; ++f)
+        {
+            const unsigned int now = 9000u + (unsigned int)(f * 1000 / 60);
+            const int brk = (f == 31) ? 1 : 0;
+            T1333PaceFrame(&p, now, (f < 60 && brk == 0) ? 1 : 0, brk);
+            if (brk != 0 && (p.breakWrites != 1 || p.lastWriteAt != now)) Fail("t1333 fold4 pace: a break inside a burst is not written at once");
+        }
+        if (p.writes > 6 || p.dirty != 0) Fail("t1333 fold4 pace: a burst with a break is not paced, or its last value is not written");
+    }
+    if (DoorRecHealthPaceDue(0, 0u, 7u, kDrHealthPaceMs) != 1 || DoorRecHealthPaceDue(1, 100u, 349u, kDrHealthPaceMs) != 0
+        || DoorRecHealthPaceDue(1, 100u, 350u, kDrHealthPaceMs) != 1 || DoorRecHealthPaceDue(1, 0xFFFFFFF0u, 300u, kDrHealthPaceMs) != 1
+        || DoorRecHealthPaceDue(1, 0xFFFFFFF0u, 100u, kDrHealthPaceMs) != 0)
+        Fail("t1333 fold4 pace: the due rule (first at once, then every 250 ms, across the clock's wrap)");
+    if (kDrHealthPaceMs < 250u || kDrHealthPaceMs > 500u) Fail("t1333 fold4 pace: the interval is outside 250-500 ms");
+    /* LOW 3: the door is newer than this game's own record only while this game holds the area now */
+    if (DoorRecDoorNewer(1, 2, 2, 1) != 1 || DoorRecDoorNewer(1, 2, 2, 0) != 0 || DoorRecDoorNewer(1, 2, 2, -1) != 0 || DoorRecDoorNewer(1, 1, 2, 1) != 0
+        || DoorRecDoorNewer(0, 2, 2, 1) != 0)
+        Fail("t1333 fold4 LOW 3: a game that stopped holding keeps its own newer health over the record");
+    if (DoorRecLayHealth(0, 0, 9.0f, 4.0f, DoorRecDoorNewer(1, 2, 2, 0)) != 9.0f) Fail("t1333 fold4 LOW 3: a former holder does not take the record's health");
+    /* LOW 2: a non-holder's town door repair - asked of the holder (a door never waits for the lay or the holder: it is asked, or kept
+       on the door when no holder is known); the gains summed, at most one ask per kBuildDoorRepairGapMs, none lost */
+    if (bldgrec::BgHeldHitDecide(0, 3, 1, 1) != bldgrec::kBgAskHolder || bldgrec::BgHeldHitDecide(1, 2, 0, 1) != bldgrec::kBgRunHere
+        || bldgrec::BgHeldHitDecide(-1, -1, 0, 1) != bldgrec::kBgRunLocalNoHolder)
+        Fail("t1333 fold4 LOW 2: a town door's repair gain is not asked of the holder");
+    {
+        float sum = 0.0f, out = 0.0f, asked = 0.0f;
+        unsigned int lastAt = 0u;
+        int haveLast = 0, asks = 0;
+        for (int f = 0; f <= 120; ++f)
+        {
+            const unsigned int now = 20000u + (unsigned int)(f * 1000 / 60);
+            if (coopbuild::BuildRepairSumDue(&sum, &lastAt, &haveLast, (f < 60) ? 0.05f : 0.0f, now, coopbuild::kBuildDoorRepairGapMs, &out) != 0) { ++asks; asked += out; }
+        }
+        if (asks > 5 || asked < 60 * 0.05f - 0.01f || asked > 60 * 0.05f + 0.01f) Fail("t1333 fold4 LOW 2: a second of repair gains is not summed into at most 5 asks, or a gain is lost");
+    }
+    /* the wire: a town door's repair gain rides a HIT ask with its door index and the repair word */
+    {
+        coopbuild::BuildMsg m, d;
+        m.kind = coopbuild::kBuildHit; m.key = "g@43,11@100,200"; m.seq = 9; m.reason = coopbuild::kBuildHitAsk; m.hitCut = 0.8f; m.hitDoor = 2; m.hitRepair = 1; m.hitBlunt = 0.0f;
+        std::vector<char> hb;
+        if (!coopbuild::BuildEncodable(m) || !coopbuild::EncodeBuild(&hb, m) || coopbuild::DecodeBuild(&hb[0], hb.size(), &d) != coopbuild::kBuildDecodeOk
+            || d.hitDoor != 2 || d.hitRepair != 1 || d.hitCut != 0.8f)
+            Fail("t1333 fold4 LOW 2: a town door repair ask does not cross the wire");
+    }
+    /* the holder's answer: run (applied) only by the area's holder; another game answers 'not the writer' */
+    if (bldgrec::BgHitAskVerdict(1, 1, 0, 0, 1, 7, 3, 4) != 1 || bldgrec::BgHitAskVerdict(0, 1, 0, 0, 1, 7, 3, 4) != 7)
+        Fail("t1333 fold4 LOW 2: the holder's answer to a door repair ask");
+    /* the wiring */
+    const std::string d = T313ReadFile("../coop-plugin/doors.cpp"), b = T313ReadFile("../coop-plugin/build.cpp");
+    if (d.empty() || b.empty()) { Fail("t1333 fold4: could not read the sources"); return; }
+    if (d.find("if (::InterlockedExchange(&r->recHealthDirty, 1) != 0) ::InterlockedIncrement64(&g_drHealthPaced);") == std::string::npos
+        || d.find("doorrec::DoorRecHealthPaceDue((int)rq->recHealthHaveLast, (unsigned int)rq->recHealthLastAt, (unsigned int)drNow, doorrec::kDrHealthPaceMs)") == std::string::npos
+        || d.find("r->recHealthLastAt = GetCurrentTickMs(); r->recHealthHaveLast = 1;") == std::string::npos
+        || d.find("if (g_drHealthWaitN != 0 && (long)(GetCurrentTickMs() - g_drHealthWaitDue) >= 0 && !EngineWritesBlocked()) ::InterlockedExchange(&g_dirty, 1);") == std::string::npos
+        || d.find("healthLaid=%lld healthPaced=%lld") == std::string::npos)
+        Fail("t1333 fold4 MED 1: the health pace is not wired (note, tick, write time, wake, REPORT)");
+    if (d.find("doorrec::DoorRecDoorNewer((int)r->recHealthNew, rec.writerSlot, StoreMySlot(), DrHoldOfKey(r->key))") == std::string::npos)
+        Fail("t1333 fold4 LOW 3: the lay does not ask whether this game holds the area now");
+    if (b.find("BdQueueEvent(9, dParent, dh1 - dh0, BdOnMain(), -1, 0, 0.0f, dIndex);") == std::string::npos
+        || b.find("0.0f, 0, 2, 0, e.door, 1); else if (e.door < 0) TbNote(") == std::string::npos
+        || b.find("if (door >= 0 && repair != 0 && reasked == 0) { TbDoorRepairSum(key, door, cut); return; }") == std::string::npos
+        || b.find("((m.hitDoor >= 0) ? TbDoorRepairHere(tg, m.hitCut) : TbRepairHere(m.key, b, m.hitCut))") == std::string::npos
+        || b.find("if (s.town != 0) TbDoorRepairAskDue(s.key, s.door, send);") == std::string::npos
+        || b.find("if (dcs == bldgrec::kBgRunLocalNoHolder && repair != 0) return;") == std::string::npos
+        || b.find("a town door's repair is not asked") != std::string::npos)
+        Fail("t1333 fold4 LOW 2: the town door repair ask, its sum, or the holder's run is not wired");
+}
+
+/* ---- T-1178 (F-T2357-ORIGINSPOT): an own spot at the world origin is not a 'not held' answer (src/common/liverelay.h, worldsync.cpp) ---- */
+void t_t1178_origin_spot()
+{
+    using namespace cooplive;
+    /* the origin test: inside one unit on all three axes (T2357 printed whole units) */
+    if (AnnounceSpotAtOrigin(0.0f, 0.0f, 0.0f) != 1 || AnnounceSpotAtOrigin(0.4f, -0.3f, 0.9f) != 1) Fail("t1178: the world origin was not read as the origin");
+    if (AnnounceSpotAtOrigin(53828.0f, 0.0f, -94590.0f) != 0 || AnnounceSpotAtOrigin(0.0f, 0.0f, 1.0f) != 0 || AnnounceSpotAtOrigin(0.0f, 1500.0f, 0.0f) != 0
+        || AnnounceSpotAtOrigin(-1.0f, 0.0f, 0.0f) != 0)
+        Fail("t1178: a real spot was read as the origin");
+    /* the table: ownRoad x at origin x squad spot read -> own / squad / keep */
+    struct Row { int ownRoad, origin, sqRead, want; };
+    const Row rows[] = {
+        { 0, 0, 0, kAnnSpotOwn },   { 0, 0, 1, kAnnSpotOwn },   /* squad road at a real spot: unchanged */
+        { 0, 1, 0, kAnnSpotOwn },   { 0, 1, 1, kAnnSpotOwn },   /* squad road: the pass already decides by the squad's spot */
+        { 1, 0, 0, kAnnSpotOwn },   { 1, 0, 1, kAnnSpotOwn },   /* own road at a real spot: its own spot stands (a real walk-away still withdraws) */
+        { 1, 1, 1, kAnnSpotSquad },                              /* T2357: the recruit at the origin, its squad's spot read -> the squad's spot */
+        { 1, 1, 0, kAnnSpotKeep }                                /* at the origin with no squad spot: kept this pass, nothing withdrawn */
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
+        if (AnnounceSpotChoice(rows[i].ownRoad, rows[i].origin, rows[i].sqRead) != rows[i].want) { char b[64]; std::sprintf(b, "t1178: the spot choice table, row %d", (int)i); Fail(b); }
+    if (AnnounceSpawnSpotOk(1) != 0 || AnnounceSpawnSpotOk(0) != 1) Fail("t1178: a SPAWN from the origin was allowed (or one from a place refused)");
+    /* fold 2 (L4): rows that fail without the fold. M1 - CharAreaKeyNow's pure part: an own spot at the origin names no area (-1), never
+       area 32,32 (the area the origin's read gave before) */
+    {
+        const int originKey = AreaKey(32, 32);
+        if (CharAreaKeyOfSpot(1, AnnounceSpotAtOrigin(0.0f, 0.0f, 0.0f), originKey) != -1) Fail("t1178 fold2 M1: an own spot at the origin named area 32,32");
+        if (CharAreaKeyOfSpot(1, AnnounceSpotAtOrigin(0.4f, 0.3f, -0.2f), originKey) != -1) Fail("t1178 fold2 M1: an own spot inside the origin band named an area");
+        if (CharAreaKeyOfSpot(1, 0, AreaKey(43, 11)) != AreaKey(43, 11)) Fail("t1178 fold2 M1: a real own spot lost its area");
+        if (CharAreaKeyOfSpot(0, 0, AreaKey(43, 11)) != -1) Fail("t1178 fold2 M1: a refused read named an area");
+    }
+    /* fold 2b - the catch-up's read: a row read at the origin is refused (skipped this round), a real one stands, an unread one refused */
+    if (CatchupSpotUsable(1, AnnounceSpotAtOrigin(0.0f, 0.0f, 0.0f)) != 0 || CatchupSpotUsable(1, AnnounceSpotAtOrigin(0.5f, -0.4f, 0.3f)) != 0
+        || CatchupSpotUsable(1, AnnounceSpotAtOrigin(53828.0f, 1050.0f, -94590.0f)) != 1 || CatchupSpotUsable(0, 0) != 0)
+        Fail("t1178 fold2b: the catch-up's read table (origin refused, real spot kept, unread refused)");
+    {   /* fold 3 (L-a): NO BODY answers (the owner's body read at the origin through a long editor pause) do not use up the visit -
+           the row keeps asking past kLostAsksPerVisit; HELD still stops at the budget */
+        using namespace lostcopy;
+        const int vs[2] = { kRvNoBody, kRvHeld };
+        for (int vi = 0; vi < 2; ++vi)
+        {
+            LostBook b;
+            LostNote(&b, 50u + (unsigned int)vi, 2u, 1, 5.0f, 0.0f, 5.0f);
+            LostRow& r = b.rows[0];
+            int asks = 0;
+            for (int look = 0; look < 60; ++look)
+            {
+                const int a = LostLookDecide(0, 1, 1, r);
+                LostLookApply(&r, 1, a, a == kLaAsk ? 1 : 0, 1);
+                if (a == kLaAsk) { ++asks; LostAnswerApply(&r, vs[vi]); }
+            }
+            if (vi == 0 && (asks <= kLostAsksPerVisit || r.asksThisVisit != 0)) Fail("t1178 fold3 L-a: a NO BODY answer used up the visit's asks");
+            if (vi == 1 && asks != kLostAsksPerVisit) Fail("t1178 fold3 L-a: a HELD answer is no longer bounded by the visit");
+        }
+        if (LostAnswerRefunds(kRvNoBody) != 1 || LostAnswerRefunds(kRvFailed) != 0 || LostAnswerRefunds(kRvSent) != 0) Fail("t1178 fold3 L-a: the refund table");
+    }
+    /* L1 - the squad band: a squad spot inside the origin band is not a usable squad spot (exact 0,0,0 alone was refused before) */
+    if (AnnounceSquadSpotUsable(1, 0.3f, 0.0f, 0.2f) != 0 || AnnounceSquadSpotUsable(1, -0.9f, 0.5f, 0.9f) != 0)
+        Fail("t1178 fold2 L1: a squad spot inside the origin band stood in for the own spot");
+    if (AnnounceSquadSpotUsable(1, 53828.0f, 1050.0f, -94590.0f) != 1 || AnnounceSquadSpotUsable(0, 53828.0f, 1050.0f, -94590.0f) != 0)
+        Fail("t1178 fold2 L1: a real squad spot refused, or an unread one used");
+    if (AnnounceSpotChoice(1, 1, AnnounceSquadSpotUsable(1, 0.3f, 0.0f, 0.2f)) != kAnnSpotKeep)
+        Fail("t1178 fold2 L1: an own spot at the origin with a squad spot in the band was not kept");
+    /* L2 - the re-announce judge: before the fold the drain judged the own spot at the origin as 'not held' and marked the recruit
+       unannounced (withhold); now kept (no mark change) or a squad-judged answer, and never a SPAWN from the origin */
+    {
+        struct RRow { int choice, held, origin, want; };
+        const RRow rr[] = {
+            { kAnnSpotKeep,  0, 1, kReannKeep },       /* at the origin, no squad spot: the mark stands (was: withhold -> unannounced) */
+            { kAnnSpotSquad, 1, 1, kReannKeep },       /* T2357: judged held by the squad's spot, own spot at the origin: no SPAWN from there, the mark stands */
+            { kAnnSpotSquad, 0, 1, kReannWithhold },   /* the squad's area held by nobody: unannounced, as the pass would */
+            { kAnnSpotOwn,   1, 0, kReannSpawn },      /* a real spot, held: the SPAWN as before */
+            { kAnnSpotOwn,   0, 0, kReannWithhold }    /* a real spot, not held: withheld as before */
+        };
+        for (size_t i = 0; i < sizeof(rr) / sizeof(rr[0]); ++i)
+            if (ReannounceSpotDecide(rr[i].choice, rr[i].held, rr[i].origin) != rr[i].want) { char b[64]; std::sprintf(b, "t1178 fold2 L2: the re-announce table, row %d", (int)i); Fail(b); }
+    }
+    /* the wiring */
+    const std::string w = T313ReadFile("../coop-plugin/worldsync.cpp");
+    if (w.empty()) { Fail("t1178: could not read worldsync.cpp"); return; }
+    if (w.find("const int spotChoice = AnnounceJudgeSpot(c, uid, pos, &jp);") == std::string::npos
+        || w.find("if (spotChoice == cooplive::kAnnSpotKeep) continue;") == std::string::npos
+        || w.find("Ogre::Vector3 dp = AnnounceDecisionPos(c, jp);") == std::string::npos
+        || w.find("const bool held = AnnounceHeldByOther(c, jp, &annWhy);") == std::string::npos)
+        Fail("t1178: the 1 Hz pass does not judge by the trusted spot (jp)");
+    if (w.find("const int ch = cooplive::AnnounceSpotChoice(ownRoad, atOrigin, sqRead);") == std::string::npos
+        || w.find("const int ownRoad = (IsPlayerFaction(c->getOwnerFactionDirect()) || sqRead == 0) ? 1 : 0;") == std::string::npos
+        || w.find("if (ch == cooplive::kAnnSpotSquad) { judge->x = sqx; judge->z = sqz; ++g_annOwnSpotSquad; }") == std::string::npos)
+        Fail("t1178: AnnounceJudgeSpot does not take the squad's spot on the own road");
+    if (w.find("if (cooplive::AnnounceSpawnSpotOk(cooplive::AnnounceSpotAtOrigin(pos.x, pos.y, pos.z)) == 0) { ++g_annOwnSpotSpawnHeld; continue; }") == std::string::npos)
+        Fail("t1178: the pass's SPAWN is not refused at the origin");
+    if (w.find("\" announceOwnSpotUnread[squad,kept,spawnHeld]=\" + S(g_annOwnSpotSquad) + \",\" + S(g_annOwnSpotKept) + \",\" + S(g_annOwnSpotSpawnHeld)") == std::string::npos
+        || w.find("g_annOwnSpotLines < kAnnOwnSpotLinesMax") == std::string::npos)
+        Fail("t1178: the counters are not on REPORT or the line is not capped");
+    /* fold 1: the MOVE pass and the stop send use the same test (one shared helper) - rows of spots the senders see */
+    struct SendRow { float x, y, z; int held; };
+    const SendRow sends[] = {
+        { 0.0f, 0.0f, 0.0f, 1 },                 /* T2357: the recruit's spot during the editor pause -> not sent */
+        { 0.5f, 0.2f, -0.6f, 1 },                /* under one unit on every axis -> not sent */
+        { 53828.0f, 1050.0f, -94590.0f, 0 },     /* its real spot -> sent */
+        { 0.0f, 1050.0f, 0.0f, 0 },              /* the origin's x,z at a real height -> sent (a place) */
+        { 2.0f, 0.0f, 0.0f, 0 }                  /* two units off -> sent */
+    };
+    for (size_t i = 0; i < sizeof(sends) / sizeof(sends[0]); ++i)
+        if (AnnounceSpotAtOrigin(sends[i].x, sends[i].y, sends[i].z) != sends[i].held) { char b[64]; std::sprintf(b, "t1178 fold1: the send table, row %d", (int)i); Fail(b); }
+    const std::string r = T313ReadFile("../coop-plugin/replicate.cpp");
+    if (r.empty()) { Fail("t1178 fold1: could not read replicate.cpp"); return; }
+    if (r.find("if (cooplive::AnnounceSpotAtOrigin(p.x, p.y, p.z) == 0) return false;") == std::string::npos
+        || r.find("g_moveOriginLines < kMoveOriginLinesMax") == std::string::npos)
+        Fail("t1178 fold1: MoveSpotAtOrigin does not use the announce pass's origin test, or its line is not capped");
+    {   /* the MOVE pass: the origin test right after its position read, before the velocity sample and the send */
+        const size_t rd = r.find("        if (!SafeReadPosition(c, &p)) continue;");
+        const size_t mo = r.find("        if (MoveSpotAtOrigin(uid, p, 0)) continue;");
+        const size_t ms = r.find("MeasureVelocity(c, uid, p, s, nowSec, &vx, &vz);");
+        if (rd == std::string::npos || mo == std::string::npos || ms == std::string::npos || !(rd < mo && mo < ms) || r.find("if (", rd + 10) != mo + 8)
+            Fail("t1178 fold1: the MOVE pass sends a spot at the origin (no test right after the position read)");
+    }
+    if (r.find("if (MoveSpotAtOrigin(it->first, pos, 1)) { ++it; continue; }") == std::string::npos)
+        Fail("t1178 fold1: the stop send sends a spot at the origin");
+    if (r.find("if (SafeReadPosition(g_ownedChar, &pos) && !MoveSpotAtOrigin(g_ownedUid, pos, 0))") == std::string::npos)
+        Fail("t1178 fold1: the explicit replicate target sends a spot at the origin");
+    if (r.find("\" ownSpotOriginHeld[move,stop]=\" << N2(g_moveOriginHeld[0]) << \",\" << N2(g_moveOriginHeld[1])") == std::string::npos)
+        Fail("t1178 fold1: the held sends are not on REPORT");
+    /* fold 2 wiring: M1 CharAreaKeyNow, L1 the squad band in AnnounceJudgeSpot, L2 the drain's judge, L3 the own-squad writer's hold */
+    {
+        const size_t kn = w.find("int CharAreaKeyNow(unsigned int uid)");
+        const size_t ko = kn == std::string::npos ? kn : w.find("return cooplive::CharAreaKeyOfSpot(1, atOrigin, AreaKeyAt(pos.x, pos.z));", kn);
+        if (ko == std::string::npos || w.find("const int atOrigin = cooplive::AnnounceSpotAtOrigin(pos.x, pos.y, pos.z);", kn) > ko
+            || w.find("\" areaKeyOrigin=\" + S(g_areaKeyOrigin)") == std::string::npos)
+            Fail("t1178 fold2 M1: CharAreaKeyNow does not refuse an own spot at the origin, or its count is not on REPORT");
+    }
+    if (w.find("const int sqRead = cooplive::AnnounceSquadSpotUsable(sqGot, sqx, sqGot ? sv.y : 0.0f, sqz);") == std::string::npos)
+        Fail("t1178 fold2 L1: AnnounceJudgeSpot uses a squad spot inside the origin band");
+    {
+        const size_t dj = w.find("const int linkChoice = AnnounceJudgeSpot(c, row.uid, pos, &jp);");
+        const size_t dh = dj == std::string::npos ? dj : w.find("AnnounceHeldByOther(c, jp, &linkWhy);", dj);
+        const size_t dk = dh == std::string::npos ? dh : w.find("if (reann == cooplive::kReannKeep) { ++g_reannounceOriginKept; continue; }", dh);
+        const size_t dw = dk == std::string::npos ? dk : w.find("if (reann == cooplive::kReannWithhold) {", dk);
+        const size_t ds = dw == std::string::npos ? dw : w.find("net::SendSpawn(row.uid,", dw);
+        if (ds == std::string::npos || w.find("\" reannounceOriginKept=\" + S(g_reannounceOriginKept)") == std::string::npos)
+            Fail("t1178 fold2 L2: the re-announce drain does not judge by AnnounceJudgeSpot before its mark and its SPAWN");
+    }
+    {   /* fold 2b: CatchupCharReads refuses an own spot at the origin after its read and before it names the row's area */
+        const size_t cr = w.find("static bool CatchupCharReads(unsigned int uid, ::Character** c, Ogre::Vector3* pos, int* key)");
+        const size_t co = cr == std::string::npos ? cr : w.find("const int atOrigin = cooplive::AnnounceSpotAtOrigin(pos->x, pos->y, pos->z);", cr);
+        const size_t cu = co == std::string::npos ? co : w.find("if (cooplive::CatchupSpotUsable(1, atOrigin) == 0)", co);
+        const size_t ck = cu == std::string::npos ? cu : w.find("if (key != 0) *key = cooplive::AreaKey(s.x, s.y);", cu);
+        if (ck == std::string::npos || w.find("++g_catchupOriginHeld;", cu) > ck || w.find("g_catchupOriginLines < kCatchupOriginLinesMax", cu) > ck
+            || w.find("\" catchupOriginHeld=\" + S(g_catchupOriginHeld)") == std::string::npos
+            || w.find("+ \" areaKeyOrigin=\" + S(g_areaKeyOrigin) + \" catchupOriginHeld=\" + S(g_catchupOriginHeld) /* T-1178 fold 3 (H1)") == std::string::npos)
+            Fail("t1178 fold2b: the catch-up read does not refuse an own spot at the origin, or its count / capped line is missing");
+    }
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp");
+    if (st.empty()) { Fail("t1178 fold2: could not read store.cpp"); return; }
+    {
+        const size_t ow = st.find("void OwnWriteSquad(void* platoon, OwnSq& s, int why, DWORD now)");
+        const size_t oh = ow == std::string::npos ? ow : st.find("OwnSquadMemberAtOrigin(hq.members, hq.activeChars) != 0)", ow);
+        const size_t os = oh == std::string::npos ? oh : st.find("const int sr = OwnSerialiseThingsPod(q.active, refList, mod);", oh);
+        if (os == std::string::npos || st.find("{ ++g_ownHeldOrigin; s.dirty = 1; s.dirtyNow = 0; s.poke = 0; s.lastMs = now; return; }", oh) > os
+            || st.find("cooplive::AnnounceSpotAtOrigin(p.x, p.y, p.z) != 0") == std::string::npos || st.find("\" ownHeldOrigin=\" + N(g_ownHeldOrigin)") == std::string::npos)
+            Fail("t1178 fold2 L3: the own-squad writer writes a squad while a member's own spot reads the origin");
+    }
 }
 
 }   /* namespace suite */

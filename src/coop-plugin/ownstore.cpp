@@ -16,6 +16,7 @@
 #include "ownstore.h"
 #include "../common/ownrec.h"
 #include "../common/storemeta.h"
+#include "../common/fileprobe.h"   /* T-1280: ProbeFile - a file another program holds is never read as empty and written back */
 #include "../common/diskformat.h"   /* owner 429: the records store's format number */
 #include "../common/restoreguard.h"   /* restore1b1: the checkpoint tag rule and the prune selection */
 
@@ -191,9 +192,18 @@ void CommitOne(const std::string& dir, const std::string& key, const OwnJob& j)
             std::map<std::string, coopown::IndexLine>::const_iterator ix = g_ownIndex.find(key);
             const bool haveIx = ix != g_ownIndex.end();
             std::vector<char> cur;
-            const bool curRead = haveIx && ReadAll(live, &cur);
+            bool curRead = false;
+            if (haveIx)
+            {   /* T-1280 fold 1 (L4): the live file PROBED. One another program holds is not "not what the index names" - rotating nothing
+                   and replacing it would lose the indexed version. The write fails now (counted and said as any failed write, with the
+                   Windows error) and the squad's next write tries again */
+                coopstore::FileProbe lp = coopstore::ProbeFile(live);
+                if (lp.kind == coopstore::kFileUnreadable) { written = false; err = lp.err; }
+                else if (lp.kind == coopstore::kFileReadable) { cur.swap(lp.bytes); curRead = true; }
+            }
             const unsigned int curCrc = curRead && !cur.empty() ? coopstore::Crc32(&cur[0], cur.size()) : 0;
-            if (coopown::RotateToPrev(haveIx, curRead, (long long)cur.size(), curCrc, haveIx ? ix->second.len : 0, haveIx ? ix->second.crc : 0))
+            if (!written) {}   /* T-1280 fold 1 (L4): held - nothing rotated, nothing replaced */
+            else if (coopown::RotateToPrev(haveIx, curRead, (long long)cur.size(), curCrc, haveIx ? ix->second.len : 0, haveIx ? ix->second.crc : 0))
             {
                 if (!MoveReplace(live, prev)) { written = false; err = ::GetLastError(); }
                 else ::InterlockedIncrement64(&g_osRotated);
@@ -336,21 +346,36 @@ void CleanTmp(const std::string& dir)
 
 }   // namespace
 
-bool OwnStoreOpen(const std::string& dir, unsigned long long* maxSeq, int* badLines)
+bool OwnStoreOpen(const std::string& dir, unsigned long long* maxSeq, int* badLines, bool* indexHeld)
 {
     OwnCsInit();
     *maxSeq = 0; *badLines = 0;
+    if (indexHeld != 0) *indexHeld = false;
     ::EnterCriticalSection(&g_ownCs);
     const bool idle = g_ownQ.empty() && g_ownCpJobs.empty() && ::InterlockedCompareExchange(&g_ownBusy, 0, 0) == 0;   /* restore1b1 fold: no checkpoint waiting either */
     ::LeaveCriticalSection(&g_ownCs);
     if (!idle) return false;
     if (!MakeDirs(dir)) return false;
     CleanTmp(dir);   /* mmo1b item 7 */
-    std::vector<char> b;
     std::vector<std::string> lines;
-    if (ReadAll(Join(dir, coopown::IndexFile()), &b) && !b.empty())
+    /* T-1280: the index is PROBED. One that is there and cannot be read (another program holds it) is NOT an empty index - read as
+       one, the first commit would rewrite it with only this session's squads. The store stays closed (records writer off), nothing
+       is written over it, and the open is tried again where it already is: the automatic open every 2 s, or the next load. */
+    const std::string indexPath = Join(dir, coopown::IndexFile());
+    const coopstore::FileProbe ip = coopstore::ProbeFile(indexPath);
+    static int s_indexLockHeld = 0;
+    const int indexStep = coopstore::FileLockedNote(ip.kind, &s_indexLockHeld);
+    if (coopstore::FileLockSkips(indexStep))
     {
-        std::string all(b.begin(), b.end()), cur;
+        if (indexStep == coopstore::kLockSkipFirst)
+            ErrorLog(coopstore::FileLockedLine("[OWNSAVE] records store", indexPath, ip, "the store is NOT opened and nothing is written over its"
+                                               " index; the open is tried again (the automatic open every 2 s, or the next load)"));
+        if (indexHeld != 0) *indexHeld = true;   /* T-1280: the caller's NOT-opened line names the held index */
+        return false;
+    }
+    if (ip.kind == coopstore::kFileReadable && !ip.bytes.empty())
+    {
+        std::string all(ip.bytes.begin(), ip.bytes.end()), cur;
         for (std::string::size_type i = 0; i < all.size(); ++i)
         {
             if (all[i] == '\n') { lines.push_back(cur); cur.clear(); } else cur += all[i];
