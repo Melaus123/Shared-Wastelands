@@ -776,13 +776,58 @@ static void OtherHandsForgetUid(unsigned int uid)
             if (h->second == uid) { o->second.erase(h++); ++g_idxSeq; } else ++h;
         }
 }
+/* T-1046 attempt 2 (design a'): THE ENGINE DISCARDED squad k here (store.cpp destroy hook, kDelDiscard road, via HandedOverUnmark why 2) -
+   its kept part goes with it (the index's keptHere and asleepHere, the not-yet-indexed kept list, their hands), so a later squad under the
+   same id does not inherit "kept" (HandoffSquadKeptPart) and is offered again. People given to another game stay given (that game runs
+   them); the entry goes when nobody is given. Under a live walk the key waits for the next drain. Counted idxDiscard[dropped,deferred]. */
+static std::set<HoKey> g_idxDiscardReq;
+static long long g_idxDiscardDropped = 0, g_idxDiscardDeferred = 0;
+static void IdxDiscardDrop(const HoKey& k)
+{
+    long long kept = 0, asleep = 0, recent = 0, given = 0;
+    std::map<HoKey, KeptRecent>::iterator kr = g_keptRecent.find(k);
+    if (kr != g_keptRecent.end())
+    {
+        recent = (long long)kr->second.uids.size();
+        for (std::set<unsigned int>::const_iterator u = kr->second.uids.begin(); u != kr->second.uids.end(); ++u) g_keptHandOf.erase(*u);
+        g_keptRecent.erase(kr); ++g_idxSeq;
+    }
+    std::map<HoKey, SquadIdx>::iterator s = g_squadIdx.find(k);
+    if (s != g_squadIdx.end())
+    {
+        kept = (long long)s->second.keptHere.size(); asleep = (long long)s->second.asleepHere.size(); given = (long long)s->second.given.size();
+        for (std::set<unsigned int>::const_iterator a = s->second.asleepHere.begin(); a != s->second.asleepHere.end(); ++a) IdxDropUid(*a);
+        if (s->second.given.empty()) { IdxEntryGone(s->first, s->second); g_squadIdx.erase(s); }
+        else
+        {
+            for (std::set<unsigned int>::const_iterator u = s->second.keptHere.begin(); u != s->second.keptHere.end(); ++u) g_keptHandOf.erase(*u);
+            s->second.keptHere.clear(); s->second.asleepHere.clear(); ++g_idxSeq;
+        }
+    }
+    if (kept + asleep + recent == 0) return;
+    ++g_idxDiscardDropped;
+    if (g_idxDiscardDropped <= 40)
+        DebugLog("[RELEASE] squad id='" + k.second + "' - the engine discarded it here: its kept part leaves the squad index (kept " + N(kept) + ", asleep here " + N(asleep) + ", not yet indexed " + N(recent)
+                 + "; given " + N(given) + " stay) - a later squad under this id starts with nothing kept (T-1046 attempt 2; idxDiscard dropped " + N(g_idxDiscardDropped) + ", deferred " + N(g_idxDiscardDeferred) + "; the first 40)");
+}
+/* one discarded squad key: dropped now, or under a live walk at the next drain (the key waits in g_idxDiscardReq) */
+static void IdxDiscardKey(const HoKey& k)
+{
+    if (g_relWalkDepth > 0) { if (g_idxDiscardReq.size() < 4096) g_idxDiscardReq.insert(k); ++g_idxDiscardDeferred; return; }
+    IdxDiscardDrop(k);
+}
 static void ReleaseForgetDrain()
 {
     if (g_relWalkDepth > 0)
     {   /* [a1b2f1-hd3] [review F1]: a nested call under a live walk / reference - never cleared under it; the outermost entry's next drain
            (HandoffTick's, every frame) honours the request */
-        if (g_relForgetReq != 0 || g_idxPeerGoneReq != 0 || !g_relRevokeGoneSlots.empty() || !g_idxGoneSlots.empty()) ++g_relDrainDeferred;   /* [a1b2f2-hd8] */
+        if (g_relForgetReq != 0 || g_idxPeerGoneReq != 0 || !g_relRevokeGoneSlots.empty() || !g_idxGoneSlots.empty() || !g_idxDiscardReq.empty()) ++g_relDrainDeferred;   /* [a1b2f2-hd8] */
         return;
+    }
+    if (!g_idxDiscardReq.empty())
+    {   /* T-1046 attempt 2: discards that came under a live walk */
+        std::set<HoKey> req; req.swap(g_idxDiscardReq);
+        for (std::set<HoKey>::const_iterator k = req.begin(); k != req.end(); ++k) IdxDiscardDrop(*k);
     }
     if (::InterlockedCompareExchange(&g_idxPeerGoneReq, 0, 1) == 1)
     {
@@ -1261,6 +1306,11 @@ int HandoffGivenSlotId(const std::string& id)
 void HandedOverUnmark(void* faction, const std::string& id, int why)
 {
     ReleaseForgetDrain();
+    if (why == 2)
+    {   /* T-1046 attempt 2: the engine discarded the squad here - its kept part goes (IdxDiscardDrop); under a live walk at the next drain */
+        IdxDiscardKey(HoKey(faction, id));
+        return;
+    }
     std::map<HoKey, SquadIdx>::iterator s = g_squadIdx.find(HoKey(faction, id));
     if (s == g_squadIdx.end()) return;
     for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g) IdxDropUid(g->first);
@@ -3527,6 +3577,7 @@ std::string HandoffReleaseReportToken()
            + "," + N(g_idxAsleepRebuilt) + "," + N(g_idxPeerGoneCleared)
            + " indexPlayerGone[squads,people]=" + N(g_idxPlayerGoneSquads) + "," + N(g_idxPlayerGonePeople)
            + " indexNow[squads,given,asleepHere]=" + N((long long)g_squadIdx.size()) + "," + N(given) + "," + N(asleep)
+           + " idxDiscard[dropped,deferred]=" + N(g_idxDiscardDropped) + "," + N(g_idxDiscardDeferred)   /* T-1046 attempt 2 */
            + " passHold[held,empty]=" + N(g_passHeld) + "," + N(g_passHeldEmpty)
            + " releaseFold1[revokeOwedAdded,revokeRetrySent,revokeOwedNow,inRevokeWaited,inRevokeWaitApplied,inRevokeWaitNow,capDropped,rewokeAtAck,rewokeAtSettle,skipNoKey,flightNoKey,puppetNoBody,drainDeferred]="
            + N(g_relRevokeOwedAdded) + "," + N(g_relRevokeRetrySent) + "," + N((long long)g_relRevokeOwed.size()) + "," + N(g_relInRevokeWaited) + "," + N(g_relInRevokeWaitApplied)
@@ -3600,6 +3651,34 @@ int HandoffSquadHasGiven(void* faction, const std::string& id)
     ReleaseForgetDrain();
     std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(HoKey(faction, id));
     return (s != g_squadIdx.end() && !s->second.given.empty()) ? 1 : 0;
+}
+/* T-1046 attempt 2 (design a', manager 2026-11-14; T2369): THE SQUAD'S KEPT PART - the people of squad (faction, id) this game keeps
+   un-offered: the index's keptHere and asleepHere and the not-yet-indexed kept list (g_keptRecent), each person once; NOT the held,
+   undecided put-aways (g_relHeldSq - their first offer is still to come). While it is > 0 whole or none refuses every later offer of the
+   squad (KeptAsleepOf), so the keep question gives the engine's own answer (squadbirth.h OneKeepRule). MAIN THREAD. */
+int HandoffSquadKeptPart(void* faction, const std::string& id)
+{
+    ReleaseForgetDrain();
+    const HoKey k(faction, id);
+    std::set<unsigned int> u;
+    const std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.find(k);
+    if (s != g_squadIdx.end()) { u.insert(s->second.keptHere.begin(), s->second.keptHere.end()); u.insert(s->second.asleepHere.begin(), s->second.asleepHere.end()); }
+    const std::map<HoKey, KeptRecent>::const_iterator kr = g_keptRecent.find(k);
+    if (kr != g_keptRecent.end()) u.insert(kr->second.uids.begin(), kr->second.uids.end());
+    return (int)u.size();
+}
+/* T-1046 attempt 2 fold 1 (review MEDIUM): the engine discarded the squad of world id `id` on a road that no longer has its faction -
+   the held delete's settle (store.cpp RunHeldSettle: T2369's every discard) and the off-thread destroy's drain (DrainGoneEntry, its platoon
+   freed). The index key's id is the squad's world id (SquadKeyOf: StoreWorldIdOf), and a world id names its faction ("<faction>_<n>",
+   SplitGroupId), so every key of this id is that one squad's: each one's kept part goes as at HandedOverUnmark why 2 (IdxDiscardKey -
+   under a live walk at the next drain). No ReleaseForgetDrain here: it is called from inside store.cpp's walk of its held deletes
+   (RunHeldSettle), and a drain from there could reach the release's settle roads; the index read below needs none. MAIN THREAD. */
+void HandoffSquadDiscardedId(const std::string& id)
+{
+    std::set<HoKey> keys;
+    for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s) if (s->first.second == id) keys.insert(s->first);
+    for (std::map<HoKey, KeptRecent>::const_iterator r = g_keptRecent.begin(); r != g_keptRecent.end(); ++r) if (r->first.second == id) keys.insert(r->first);
+    for (std::set<HoKey>::const_iterator k = keys.begin(); k != keys.end(); ++k) IdxDiscardKey(*k);
 }
 /* T-1318: the index has a squad of this id (any faction) with at least one given person - the given-wait's test (store.cpp
    GivenWaitTick: a squad whose copy here was refused its wake and removed is built from its record once nothing of it is given). MAIN THREAD. */

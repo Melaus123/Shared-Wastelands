@@ -59,7 +59,7 @@ void HandoffNoteWokeWithGiven(void* faction, const std::string& id);
 int HandoffWokeWithGiven(void* faction, const std::string& id);
 void HandedOverForgetPlayer(int slot);   /* MAIN THREAD - the player in `slot` left: the people handed to it leave the squad index (-1: the whole index) */
 void HandoffRevokesPlayerGone(int slot);   /* fold 2 [a1b2f2-hh0] [review G2]: MAIN THREAD - a player left: the REVOKEs waiting from it and owed to it drop (-1: none, counted) */
-void HandedOverUnmark(void* faction, const std::string& id, int why);   /* why 0 = a member taken back by hand-over (the one caller); 1 = adopted by the sweep - no caller since T-1318 (the sweep never adopts a given squad) */
+void HandedOverUnmark(void* faction, const std::string& id, int why);   /* why 0 = a member taken back by hand-over; 1 = adopted by the sweep - no caller since T-1318 (the sweep never adopts a given squad); 2 = T-1046 attempt 2: the engine discarded the squad here (store.cpp destroy hook, kDelDiscard) - its kept part goes (people given stay) */
 std::string HandoffReleaseReportToken();     /* [a1b2-hh2]: the release[...] / index[...] tokens of the [net] REPORT line */
 bool HandoffPendingHas(unsigned int uid);   /* M4 fold 2 (re-check L-C): this game's XFER naming uid awaits its ACK - MAIN THREAD */
 /* T-650 fold 2 (the announce pass's hold, worldsync.cpp): MAIN THREAD. HandoffOtherInWorldHasArea - an IN_WORLD game other than this one
@@ -74,7 +74,9 @@ void HandoffKeepReceiverCounts(long long* skipped, long long* asked);
 /* T-1046 fold 2: a sleeping squad taken person by person (its own records' hands all given to one slot; -1 not), the cheap index test,
    and the index's change count. MAIN THREAD. */
 int HandoffSquadHasGiven(void* faction, const std::string& id);
+int HandoffSquadKeptPart(void* faction, const std::string& id);   /* T-1046 attempt 2: the people of the squad this game keeps un-offered (keptHere + asleepHere + not yet indexed; not the held batches). MAIN THREAD */
 int HandoffSquadHasGivenId(const std::string& id);   /* T-1318: any faction, by id - the given-wait's test (store.cpp GivenWaitTick) */
+void HandoffSquadDiscardedId(const std::string& id);   /* T-1046 attempt 2 fold 1: the engine discarded the squad of this world id (held-delete settle, off-thread drain) - its kept part leaves the index. MAIN THREAD */
 int HandoffPersonGiven(void* faction, const std::string& id, const void* character);   /* T-1318 fold 1: this person given, by its hand (1), not (0), hand unread (-1) */
 void HandoffNoteOtherCopyPutAway(unsigned int uid, const void* obj);   /* T-1318 attempt 5 (D1-R3): another game's living copy put away by this engine - its hand and owner slot noted under its given squad. MAIN THREAD */
 int HandoffMembersTakenBy(void* faction, const std::string& id, void* const* members, int n);   /* T-1318 fold 1: an awake squad's members all given to one slot (that slot), else -1 */

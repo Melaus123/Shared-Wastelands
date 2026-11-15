@@ -75,6 +75,8 @@ namespace coop { void P210NoteMade(unsigned int uid, int kind); void P210CopyDes
 #include "../common/cageask.h"     /* a guard's caging asked of the owner until it is answered */
 #include "../common/actowed.h"     /* T-860 / T-859 (owner 1551 a): an act on an away player's character is owed */
 #include "../common/bedhandoff.h"  /* the owner enters a bed from the carry, as the engine does */
+#include "../common/owncarry.h"    /* T-1265: may another game's carrier pick up this game's own character here */
+#include "team.h"                  /* T-1265: TeamSameAnyThread - the carrier's player shares this game's team */
 #include "../common/namewire.h"     /* names1: MSG_NAME */
 #include "../common/uidtable.h"     /* mirror1 (crash T487): the uid table's decisions, offline-tested */
 #include "../common/uidlayout.h"    /* M4 (owner 203): a uid is (the making game's slot << 22) | counter */
@@ -5576,6 +5578,8 @@ struct CarryWant
     bool notedConflict;   // review-k1 item 2: one carryConflictMine per wish
     bool notedBodyMine;   // review-k1 item 3: one carrySkippedBodyMine per wish
     bool notedBedHold;    // one dropHeldForBed per wish
+    bool notedTeamAwake;  // T-1265: one carryTeamAwakeAccepted per wish
+    bool notedOwedEnd;    // fold 1: one carryHeldOwedEnd per wish
 };
 std::map<unsigned int, CarryWant>    g_carryWant;   // copy carrier uid -> its owner's word
 std::map<unsigned int, unsigned int> g_carryLast;   // owned carrier uid -> non-zero carryingUid last pushed
@@ -5613,6 +5617,14 @@ long long g_proneSkippedCarried = 0;    // ApplyState / ProneParkTick: prone NOT
 long long g_carryLogged = 0;
 long long g_carryOwnApplied = 0;        // arrest1: this game's own (helpless) body picked up by a copy carrier here
 long long g_carryOwnAwake = 0;          // arrest1: an own body NOT picked up - awake, standing, or in a bed / cage here
+// T-1265: that refusal by its reason (owncarry.h), and the awake carries taken from a teammate's player character
+long long g_carryRefusedInSomething = 0, g_carryRefusedInsUnread = 0, g_carryRefusedAwake = 0, g_carryRefusedStateUnread = 0;
+long long g_carryTeamAwakeAccepted = 0;
+long long g_carryOwnFactionAwakeAccepted = 0;   // fold 1: an awake own character taken by a copy of this game's own faction
+long long g_carryHeldOwedEnd = 0;   // fold 1: a pick-up of an own body skipped while this game's carry end for it and that carrier is owed
+long long g_carryHeldOwedEndLogged = 0;
+long long g_carryTeamAwakeLogged = 0;
+const long long kCarryTeamAwakeLogLimit = 8;   // the first 8 accepted awake carries are logged
 long long g_carryBreakSent = 0;         // arrest1: MSG_CARRY_BREAK sent (an own body's carry ended here, or refused)
 long long g_carryBreakApplied = 0;      // arrest1: our carrier put a copy down on the body's game's word
 long long g_carryBreakStale = 0;        // arrest1: a break for a carry that had already ended here - nothing to do
@@ -5731,6 +5743,55 @@ bool OwnBodyMayBeCarried(::Character* body)
     return CopyDowned(body) == 1;
 }
 
+// T-1265 (owner 1246 a / 512): the slot whose PLAYER character `carrier` is, read from the carrier's own record - its faction a
+// stand-in met here (StandInSlotOf) or a faction whose record id names a player's slot (StandInRecordSlot, coop-p<n>), the
+// T-840 rule for 'a player character / player-faction person'. -1 = an NPC's faction, -4 = this game's own faction, -3 = unreadable.
+// A teammate game's NPCs (any other faction) are never a player's.
+const int kCarrierSlotOwnFaction = -4;
+int CarrierPlayerSlot(::Character* carrier)
+{
+    if (carrier == 0 || !PlausibleObject(carrier)) return -3;
+    ::Faction* f = GoneCopyFactionPod(carrier);
+    if (!PlausibleObject(f)) return -3;
+    if (IsPlayerFaction(f)) return kCarrierSlotOwnFaction;   // this game's own faction (fold 1: a copy of it may carry - CarrierKindOf)
+    const int si = StandInSlotOf(f);
+    if (si >= 0) return si;
+    const int rs = StandInRecordSlot(f);
+    return rs >= 0 ? rs : (rs == -3 ? -3 : -1);
+}
+// T-1265: what the carrier is, for owncarry::OwnCarryDecide. It must be a copy (another game drives it); then
+//   kCarrierTeamPlayer     - a PLAYER character of a slot that shares this game's team on the mod's own team table (team.cpp
+//                            TeamSameAnyThread = teameffect.h SameTeam on the received table);
+//   kCarrierOwnFactionCopy - (fold 1, review LOW) a member of THIS game's own faction that another game drives: a save-born body
+//                            adopted in place as another game's copy (AdoptExistingTwin; a squad handed over). Single player lets any
+//                            squad member carry another, so no team test;
+//   kCarrierOther          - anything else: an NPC of any other faction, a non-teammate's player character, our own carrier, unreadable.
+int CarrierKindOf(unsigned int carrierUid, ::Character* carrier, int* slotOut)
+{
+    const int slot = CarrierPlayerSlot(carrier);
+    if (slotOut != 0) *slotOut = slot;
+    if (carrierUid == 0 || net::IsUidMine(carrierUid)) return owncarry::kCarrierOther;
+    if (slot == kCarrierSlotOwnFaction) return owncarry::kCarrierOwnFactionCopy;
+    if (slot < 0) return owncarry::kCarrierOther;
+    return TeamSameAnyThread(MySlotForWire(), slot) ? owncarry::kCarrierTeamPlayer : owncarry::kCarrierOther;
+}
+// T-1265: the lying-state values CopyDowned folds (prone +0x0E0, the unconscious byte 0x458+0x161, the wake clock +0x4F8), for the
+// refusal line. Unreadable reads stay -1.
+const size_t kCarryProneOff = 0x0E0, kCarryUncOff = 0x458 + 0x161, kCarryKoTimerOff = 0x4F8;   // appearance.cpp kChar*Off
+std::string CarryLyingText(::Character* body)
+{
+    int prone = -1, koBits = 0;
+    unsigned char unc = 0xFF;
+    float koT = -1.0f;
+    if (!CarryReadInt(body, kCarryProneOff, &prone)) prone = -1;
+    if (!CarryReadByte(body, kCarryUncOff, &unc)) unc = 0xFF;
+    if (CarryReadInt(body, kCarryKoTimerOff, &koBits)) std::memcpy(&koT, &koBits, sizeof(koT));
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "prone=%d unc=%d koT=%.1f", prone, unc == 0xFF ? -1 : (int)(unc != 0), (double)koT);
+    b[sizeof(b) - 1] = 0;
+    return std::string(b);
+}
+
 // The engine lets a knocked-out person be picked up out of a bed. An own character that is helpless (as above) and in a BED
 // (never a cage) is taken out of it here first - setBedMode off at the safe point (BedOutForCarryDrain), as every bed write
 // here - and the copy carrier's pick-up follows on a later tick, once it lies free.
@@ -5839,12 +5900,12 @@ void NoteCarryWant(unsigned int carrier, ::Character* c, unsigned int body, unsi
     if (body == 0 && !CarryFlag(c)) { if (it != g_carryWant.end()) g_carryWant.erase(it); return; }
     if (it == g_carryWant.end())
     {
-        CarryWant w; w.body = body; w.peer = peer; w.notedNotReady = w.notedNoBody = w.notedCapped = w.notedConflict = w.notedBodyMine = w.notedBedHold = false;
+        CarryWant w; w.body = body; w.peer = peer; w.notedNotReady = w.notedNoBody = w.notedCapped = w.notedConflict = w.notedBodyMine = w.notedBedHold = w.notedTeamAwake = w.notedOwedEnd = false;
         g_carryWant.insert(std::make_pair(carrier, w));
         return;
     }
     if (it->second.body != body)
-    { it->second.notedNotReady = it->second.notedNoBody = it->second.notedCapped = it->second.notedConflict = it->second.notedBodyMine = it->second.notedBedHold = false; }
+    { it->second.notedNotReady = it->second.notedNoBody = it->second.notedCapped = it->second.notedConflict = it->second.notedBodyMine = it->second.notedBedHold = it->second.notedTeamAwake = it->second.notedOwedEnd = false; }
     it->second.body = body;
     it->second.peer = peer;
 }
@@ -7140,6 +7201,23 @@ void CarryApplyTick()
         // game's word only when it is helpless here (OwnBodyMayBeCarried). One that is awake, standing or in a bed / cage
         // is not, and the carrier's game is told once (MSG_CARRY_BREAK) so its carrier lets go too.
         const bool bodyMine = net::IsUidMine(w.body);
+        // T-1265 fold 1 (review LOW): this game's engine ended this carrier's carry of this own body (OwnCarryWatch noted the carry end
+        // owed and sent the break). Until the carrier's owner shows it let go (its STATE carrying something else or nothing - settled -
+        // or kStatesSame STATEs still saying it carries, the owner's word then stands), a STATE sent before the break would pick the
+        // body up again here (or take it out of a bed) for one flicker: that wish waits.
+        if (bodyMine && ActOwedCarryEndOwed(w.body, carrierUid))
+        {
+            if (!w.notedOwedEnd)
+            {
+                w.notedOwedEnd = true;
+                ++g_carryHeldOwedEnd;
+                if (++g_carryHeldOwedEndLogged <= 8)
+                    DebugLog("[K1] carry held: body uid=" + S(w.body) + " carrier uid=" + S(carrierUid)
+                             + " - this game ended that carry and its end is still owed; the carrier's STATE predates its put-down");
+            }
+            ++it;
+            continue;
+        }
         // out of its bed at the safe point first; the pick-up follows. A take-out that keeps failing falls through to the break.
         if (bodyMine && OwnBodyInBedMayBeCarried(body) && !BedOutForCarryGivenUp(w.body))
         {
@@ -7147,23 +7225,69 @@ void CarryApplyTick()
             ++it;
             continue;
         }
+        // T-1265 (owner 1246 a, 512): the menu offers carry on an awake teammate's character, as the base game does on one's own -
+        // so an awake, standing own body in nothing is also taken when the carrier is a teammate's PLAYER character
+        // (owncarry.h). OwnBodyMayBeCarried itself is unchanged: the bed roads still need a helpless body.
         if (bodyMine && !OwnBodyMayBeCarried(body))
         {
-            if (!w.notedBodyMine)
+            int ins = 0;
+            const bool insRead = CarryReadInt(body, kCarryInSomethingOff, &ins);
+            const int downed = (insRead && ins == 0) ? CopyDowned(body) : -1;
+            int carrierSlot = -1;
+            const int carrierKind = (insRead && ins == 0 && downed == 0) ? CarrierKindOf(carrierUid, cc, &carrierSlot) : owncarry::kCarrierOther;
+            const int decided = owncarry::OwnCarryDecide(insRead, ins, downed, carrierKind);
+            if (decided == owncarry::kOwnCarryAcceptOwnFaction && !w.notedTeamAwake)
             {
-                w.notedBodyMine = true;
-                ++g_carrySkippedBodyMine;
-                ++g_carryOwnAwake;
-                if (net::SendCarryBreak(w.body, carrierUid)) ++g_carryBreakSent;
-                if (g_carryBodyMineLogged < kCarryBodyMineLogLimit)
+                w.notedTeamAwake = true;
+                ++g_carryOwnFactionAwakeAccepted;
+                if (g_carryTeamAwakeLogged < kCarryTeamAwakeLogLimit)
                 {
-                    ++g_carryBodyMineLogged;
-                    DebugLog("[K1] carry refused: body uid=" + S(w.body) + " is driven by this game and is not helpless here"
-                             " (awake, standing, or in a bed / cage); carrier uid=" + S(carrierUid) + " - break sent");
+                    ++g_carryTeamAwakeLogged;
+                    DebugLog("[K1] carry taken: body uid=" + S(w.body) + " is driven by this game and awake and standing here ("
+                             + CarryLyingText(body) + "); carrier uid=" + S(carrierUid) + " is another game's copy in this game's own faction"
+                             " - picked up as the engine's own carry by a squad member");
                 }
             }
-            ++it;
-            continue;
+            if (decided == owncarry::kOwnCarryAcceptTeamAwake && !w.notedTeamAwake)
+            {
+                w.notedTeamAwake = true;
+                ++g_carryTeamAwakeAccepted;
+                if (g_carryTeamAwakeLogged < kCarryTeamAwakeLogLimit)
+                {
+                    ++g_carryTeamAwakeLogged;
+                    DebugLog("[K1] carry taken: body uid=" + S(w.body) + " is driven by this game and awake and standing here ("
+                             + CarryLyingText(body) + "); carrier uid=" + S(carrierUid) + " is a player character of teammate slot "
+                             + S((long long)carrierSlot) + " - picked up as the engine's own carry");
+                }
+            }
+            if (!owncarry::OwnCarryAccepted(decided))
+            {
+                if (!w.notedBodyMine)
+                {
+                    w.notedBodyMine = true;
+                    ++g_carrySkippedBodyMine;
+                    ++g_carryOwnAwake;
+                    std::string why;
+                    if (decided == owncarry::kOwnCarryRefuseInSomething) { ++g_carryRefusedInSomething; why = "in a bed/cage (inSomething=" + S((long long)ins) + ")"; }
+                    else if (decided == owncarry::kOwnCarryRefuseInsUnread) { ++g_carryRefusedInsUnread; why = "inSomething unreadable"; }
+                    else if (decided == owncarry::kOwnCarryRefuseAwake)
+                    {
+                        ++g_carryRefusedAwake;
+                        why = "awake and standing (" + CarryLyingText(body) + "; carrier is no teammate's player character nor an own-faction copy, slot "
+                            + S((long long)carrierSlot) + ")";
+                    }
+                    else { ++g_carryRefusedStateUnread; why = "state unreadable (" + CarryLyingText(body) + ")"; }
+                    if (net::SendCarryBreak(w.body, carrierUid)) ++g_carryBreakSent;
+                    if (g_carryBodyMineLogged < kCarryBodyMineLogLimit)
+                    {
+                        ++g_carryBodyMineLogged;
+                        DebugLog("[K1] carry refused: body uid=" + S(w.body) + " is driven by this game and is not carried here: " + why
+                                 + "; carrier uid=" + S(carrierUid) + " - break sent");
+                    }
+                }
+                ++it;
+                continue;
+            }
         }
         if (!CharacterBuilt(cc, 0) || !CharacterBuilt(body, 0))
         {
@@ -7250,6 +7374,10 @@ std::string CarryReportToken()
          + S(g_carryOwnApplied) + "," + S(g_carryOwnAwake) + "," + S(g_carryOwnWokeDropped) + "," + S(g_carryBreakSent)
          + "," + S(g_carryBreakApplied) + "," + S(g_carryBreakStale) + "," + S(g_carryBreakRefused) + "," + S(g_carryBreakDropped)
          + "," + S((long long)g_ownCarried.size())
+         + " carryRefusedWhy[inSomething,insUnreadable,awake,stateUnreadable]=" + S(g_carryRefusedInSomething) + "," + S(g_carryRefusedInsUnread)
+         + "," + S(g_carryRefusedAwake) + "," + S(g_carryRefusedStateUnread)
+         + " carryTeamAwakeAccepted=" + S(g_carryTeamAwakeAccepted) + " carryOwnFactionAwakeAccepted=" + S(g_carryOwnFactionAwakeAccepted)
+         + " carryHeldOwedEnd=" + S(g_carryHeldOwedEnd)
          + " handOver[noted,letGo,ended,expired,full,now]=" + S(g_handOverNoted) + "," + S(g_handOverLetGo) + "," + S(g_handOverEnded)
          + "," + S(g_handOverExpired) + "," + S(g_handOverFull) + "," + S((long long)g_handOvers.size())
          // PROBE-START: P158
@@ -7318,11 +7446,38 @@ std::string CarryTestCommand(const std::string& arg)
     unsigned int carrier = 0, body = 0;
     std::string bodyKey;
     int wantDead = 0;
+    /* T-1265 TEST-ONLY (T2372 leg c): the carrier - and the body, unless the `name` form follows - may also be spawned:<Template>[#k],
+       made:<label> or name:<Name>[#k], resolved by coop::LeverNameUid (items.cpp P105NameUid, the resolver koself / attack use), so a
+       character made during the run can carry; a uid ({uid:X}) reads as before. Each resolved word becomes its uid, then the same parse. */
+    std::string argN = arg;
+    if (word == "carry")
+    {
+        std::string cw, bw, tail;
+        is >> cw >> bw;
+        std::getline(is, tail);
+        unsigned int ru = 0;
+        std::string lab;
+        const int cnr = coop::LeverNameUid(cw, &ru, &lab);
+        if (cnr < 0) return "error capturetest carry: the carrier - " + lab;
+        if (cnr > 0) { DebugLog("[CAPT] capturetest carry carrier " + lab); cw = S((long long)ru); }
+        if (bw != "name")
+        {
+            ru = 0;
+            lab.clear();
+            const int bnr = coop::LeverNameUid(bw, &ru, &lab);
+            if (bnr < 0) return "error capturetest carry: the body - " + lab;
+            if (bnr > 0) { DebugLog("[CAPT] capturetest carry body " + lab); bw = S((long long)ru); }
+        }
+        argN = "carry " + cw + " " + bw + tail;
+        is.clear();
+        is.str(argN);
+        is >> word;
+    }
     /* `carry <carrierUid> name <name> [dead]`: the body is picked by name and MAY be this game's own (the carried hand-in fixture
        carries the person this game knocked out); `dead` picks a dead body instead of a down one (T-1262) */
-    const int byName = coopsay::CarryNameParse(arg, &carrier, &bodyKey, &wantDead);
+    const int byName = coopsay::CarryNameParse(argN, &carrier, &bodyKey, &wantDead);
     if (!byName && (word != "carry" || !(is >> carrier >> body) || carrier == 0 || body == 0 || carrier == body))
-        return "error capturetest: usage capturetest carry <carrierUid> <bodyUid> | capturetest carry <carrierUid> name <name, '_' = a space> [dead] | capturetest carried <uid>";
+        return "error capturetest: usage capturetest carry <carrier> <body> | capturetest carry <carrier> name <name, '_' = a space> [dead] | capturetest carried <uid>   (carrier / body = a uid, spawned:<Template>[#k], made:<label> or name:<Name>[#k])";
     if (EngineWritesBlocked()) return "error capturetest carry: engine writes are blocked - try again";
     if (kPickupObjectRva == 0) return "error capturetest carry: PickupObject is not in the address table";
     if (!net::IsUidMine(carrier)) return "error capturetest carry: carrier uid " + S((long long)carrier) + " is not this game's own character";
@@ -16745,6 +16900,16 @@ void ActOwedNoteCarryEnd(unsigned int body, unsigned int carrier)
 {
     ActOwedPay p; p.body = body;
     ActOwedNote(carrier, actowed::kKindCarryEnd, p);
+}
+// T-1265 fold 1: a carry end of `body` by `carrier` (the copy uid its row is bound to now) is still owed - the row is removed when the
+// carrier's owner STATE shows it carries something else or nothing (settled), after kStatesSame STATEs on the same copy still saying
+// it carries (ended), when a re-made copy's resend goes unanswered, and at teardown / this game's link loss (ActOwedClear).
+bool ActOwedCarryEndOwed(unsigned int body, unsigned int carrier)
+{
+    if (g_actOwed.rows.empty() || body == 0 || carrier == 0) return false;
+    for (std::map<actowed::Key, ActOwedEntry>::const_iterator it = g_actOwed.rows.begin(); it != g_actOwed.rows.end(); ++it)
+        if (it->second.kind == actowed::kKindCarryEnd && it->second.payload.body == body && actowed::BoundUid(it->second) == carrier) return true;
+    return false;
 }
 // fold 1 (HIGH-1) / fold 2 (NEW-1): our carrier picked up another game's character here - a newer "where it is held" act that sends
 // nothing of its own (the carrier's STATE carries it): an owed BED IN of that character ends; a release or a caging stays owed.

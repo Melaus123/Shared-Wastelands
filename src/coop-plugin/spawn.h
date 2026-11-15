@@ -732,6 +732,7 @@ void NotePoseWant(unsigned int uid, const coopstate::PoseWire& pose, unsigned in
 // (ActOwedOnCopyReady) and a missing act is sent again once. Cleared at teardown and at the world-server link's loss. Kills are not owed.
 void ActOwedNotePrison(const cooprison::PrisonMsg& m);
 void ActOwedNoteCarryEnd(unsigned int body, unsigned int carrier);
+bool ActOwedCarryEndOwed(unsigned int body, unsigned int carrier);   // T-1265 fold 1: that carry end is still owed (CarryApplyTick waits)
 void ActOwedNotePickup(unsigned int body);                   // fold 1: our carrier picked up another game's character here
 void ActOwedOnRefused(unsigned int uid, bool bed, bool final);  // fold 1: REFUSED / BED REFUSED (final = permanent) for an owed act
 void ActOwedOnCopyReady(unsigned int uid);

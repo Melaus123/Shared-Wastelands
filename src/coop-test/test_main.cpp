@@ -183,6 +183,7 @@
 #include "squadtest.h"     /* statstest: the lever's argument shape and the stat levels */
 #include "bedmatch.h"      /* BED1 (T263/T264): which interior piece a bed key names - PoseBedViaLayout calls this */
 #include "bedhandoff.h"    /* the owner enters a bed from the carry, as the engine does */
+#include "owncarry.h"      /* T-1265: may another game's carrier pick up this game's own character here */
 #include "ownedmirror.h"  /* O1 (recheck-c2b): the owned-uid mirror IsUidMineAnyThread reads from worker threads */
 #include "ragdollrest.h"  /* R3 (read-ragdoll): the pending rest moves the 0x7D38D0 detour takes */
 #include "installtext.h"  /* installer1 (stage 6): Setup's Plugins_x64.cfg edit, the Steam library list, the Workshop rule */
@@ -25806,7 +25807,7 @@ void t_t850f1_reverse_keep()
     const std::string st = T313ReadFile("../coop-plugin/store.cpp");
     const size_t f = st.find("int OneKeepAt(void* platoon, int asleep, float x, float z, void* faction)");   /* T-1046 fix 2: the bare bits are the stale-map answer */
     const size_t u = f == std::string::npos ? f : st.find("const int shows = sqbirth::OtherShowsArea(held, held == 1 ? 0 : OtherLoadedTS(sec));", f);
-    if (f == std::string::npos || u == std::string::npos || u - f > 1200) Fail("t850f1 reverse wiring: the keep question does not read whether another game has the area loaded");
+    if (f == std::string::npos || u == std::string::npos || u - f > 1600) Fail("t850f1 reverse wiring: the keep question does not read whether another game has the area loaded");   /* T-1046 attempt 2: 1200 -> 1600 (the kept-part read ahead of it) */
 }
 
 /* T-850 fold 1b: the held deletes are decided by EVENTS - each release end of a person (RunHeldSettle) and the bind of the id again
@@ -28094,15 +28095,15 @@ void t_t1046_keep_rule()
     /* T2301's strip: 43 from the unloaded west side (P276 'edge=43 box=within170') - the other game's engine puts it away: nobody keeps it */
     const int kStrip = T1046K(minX + 43.0f, mid, 1, 0);
     if (kStrip != 0) Fail("t1046 keep: a squad in the other game's own edge strip is named as kept there");
-    if (OneKeepRule(0, kStrip, 0, 0) != 0 || OneKeepRule(1, kStrip, 0, 0) != 0 || OneKeepRule(1, kStrip, 1, 0) != 0)
+    if (OneKeepRule(0, kStrip, 0, 0, 0) != 0 || OneKeepRule(1, kStrip, 0, 0, 0) != 0 || OneKeepRule(1, kStrip, 1, 0, 0) != 0)
         Fail("t1046 keep: the T2301 strip squad is kept for the other game (awake or asleep) - the wake / put-away loop");
     /* the margin band (160..410 from the side): one margin shared with the hand-over - not offered, so not kept */
-    if (T1046K(minX + 300.0f, mid, 1, 0) != 0 || OneKeepRule(0, T1046K(minX + 300.0f, mid, 1, 0), 0, 0) != 0) Fail("t1046 keep: the margin band keeps a squad the RELEASE would not offer");
+    if (T1046K(minX + 300.0f, mid, 1, 0) != 0 || OneKeepRule(0, T1046K(minX + 300.0f, mid, 1, 0), 0, 0, 0) != 0) Fail("t1046 keep: the margin band keeps a squad the RELEASE would not offer");
     /* inside the other game's box: kept awake; asleep kept once that game took its people, the engine's answer before */
     const int kIn = T1046K(minX + 2000.0f, mid, 1, 0);
     if (kIn != 1) Fail("t1046 keep: a squad well inside the other game's box is not named");
-    if (OneKeepRule(0, kIn, 0, 0) != 1 || OneKeepRule(1, kIn, 1, 0) != 1) Fail("t1046 keep: inside the other game's box with its people taken - not kept both times");
-    if (OneKeepRule(1, kIn, 0, 0) != 0) Fail("t1046 keep: an asleep squad nobody took is kept (nobody would run it)");
+    if (OneKeepRule(0, kIn, 0, 0, 0) != 1 || OneKeepRule(1, kIn, 1, 0, 0) != 1) Fail("t1046 keep: inside the other game's box with its people taken - not kept both times");
+    if (OneKeepRule(1, kIn, 0, 0, 0) != 0) Fail("t1046 keep: an asleep squad nobody took is kept (nobody would run it)");
     /* a loaded west neighbour: the strip is no strip - kept */
     if (T1046K(minX + 43.0f, mid, 1, 1) != 1) Fail("t1046 keep: a squad by a LOADED side is not named");
     /* stale or missing map: today's answer, the same asleep and awake, whatever the records say */
@@ -28110,23 +28111,23 @@ void t_t1046_keep_rule()
     if (kStale != -1) Fail("t1046 keep: a stale map is not a hold");
     for (int shows = 0; shows <= 1; ++shows)
         for (int taken = 0; taken <= 1; ++taken)
-            if (OneKeepRule(0, kStale, taken, shows) != shows || OneKeepRule(1, kStale, taken, shows) != shows) Fail("t1046 keep: a stale map's answer is not today's, or differs asleep / awake");
+            if (OneKeepRule(0, kStale, taken, shows, 0) != shows || OneKeepRule(1, kStale, taken, shows, 0) != shows) Fail("t1046 keep: a stale map's answer is not today's, or differs asleep / awake");
     /* one answer for one spot and map (people taken): both questions agree for every k */
     for (int k = -1; k <= 3; ++k)
         for (int shows = 0; shows <= 1; ++shows)
-            if (OneKeepRule(0, k, 1, shows) != OneKeepRule(1, k, 1, shows)) Fail("t1046 keep: the asleep and awake answers disagree for one spot and map");
+            if (OneKeepRule(0, k, 1, shows, 0) != OneKeepRule(1, k, 1, shows, 0)) Fail("t1046 keep: the asleep and awake answers disagree for one spot and map");
     /* the counters */
-    if (OneKeepVerdict(0, 1, 0, 0) != kOkKeptAwake || OneKeepVerdict(1, 2, 1, 0) != kOkKeptAsleep || OneKeepVerdict(0, 0, 0, 1) != kOkNoGameAwake
-        || OneKeepVerdict(1, 0, 1, 1) != kOkNoGameAsleep || OneKeepVerdict(1, 1, 0, 0) != kOkNotTakenAsleep || OneKeepVerdict(1, -1, 0, 1) != kOkStaleKept
-        || OneKeepVerdict(0, -1, 1, 0) != kOkStaleEngine)
+    if (OneKeepVerdict(0, 1, 0, 0, 0) != kOkKeptAwake || OneKeepVerdict(1, 2, 1, 0, 0) != kOkKeptAsleep || OneKeepVerdict(0, 0, 0, 1, 0) != kOkNoGameAwake
+        || OneKeepVerdict(1, 0, 1, 1, 0) != kOkNoGameAsleep || OneKeepVerdict(1, 1, 0, 0, 0) != kOkNotTakenAsleep || OneKeepVerdict(1, -1, 0, 1, 0) != kOkStaleKept
+        || OneKeepVerdict(0, -1, 1, 0, 0) != kOkStaleEngine)
         Fail("t1046 keep: a verdict counts under the wrong name");
     for (int a = 0; a <= 1; ++a)
         for (int k = -1; k <= 2; ++k)
             for (int t = 0; t <= 1; ++t)
                 for (int sh = 0; sh <= 1; ++sh)
                 {
-                    const int v = OneKeepVerdict(a, k, t, sh), kept = (v == kOkKeptAwake || v == kOkKeptAsleep || v == kOkStaleKept) ? 1 : 0;
-                    if (kept != OneKeepRule(a, k, t, sh)) Fail("t1046 keep: a verdict's name and its answer disagree");
+                    const int v = OneKeepVerdict(a, k, t, sh, 0), kept = (v == kOkKeptAwake || v == kOkKeptAsleep || v == kOkStaleKept) ? 1 : 0;
+                    if (kept != OneKeepRule(a, k, t, sh, 0)) Fail("t1046 keep: a verdict's name and its answer disagree");
                 }
 }
 /* T-1046 fix 2 review fold (cost): the receiver test is skipped only where its answer is already 0 - the same answer as running it */
@@ -28153,7 +28154,7 @@ void t_t1046_keep_skip()
                             if (KeepReceiversKnownNone(live, mySlot, otherLoaded) != 0)
                                 for (int asleep = 0; asleep <= 1; ++asleep)
                                     for (int sh = 0; sh <= 1; ++sh)
-                                        if (sqbirth::OneKeepRule(asleep, 0, 0, sh) != sqbirth::OneKeepRule(asleep, k, 0, sh)) Fail("t1046 skip: the skip changes the keep answer");
+                                        if (sqbirth::OneKeepRule(asleep, 0, 0, sh, 0) != sqbirth::OneKeepRule(asleep, k, 0, sh, 0)) Fail("t1046 skip: the skip changes the keep answer");
                         }
     if (KeepReceiversKnownNone(1, 0, 0) != 1) Fail("t1046 skip: nobody else with the area loaded is not skipped");
     if (KeepReceiversKnownNone(1, 0, -1) != 0 || KeepReceiversKnownNone(1, 0, 1) != 0 || KeepReceiversKnownNone(0, 0, 0) != 0 || KeepReceiversKnownNone(1, -1, 0) != 0)
@@ -28230,6 +28231,108 @@ void t_t1046_sleepers_taken()
     for (size_t i = 0; i < sizeof(needSt) / sizeof(needSt[0]); ++i) if (st.find(needSt[i]) == std::string::npos) Fail(std::string("t1046 taken: store.cpp lacks: ") + needSt[i]);
     if (T313ReadFile("../common/liveowner.h").find("inline int SquadWholeGiven(int givenCount, int asleepHereCount, int keptHereCount, int openHereCount, int liveHereCount)") == std::string::npos) Fail("t1046 taken: SquadWholeGiven changed");
 }
+/* T-1046 attempt 2 (design a', T2369): a squad this game keeps people of un-offered gets the engine's own answer, asleep and awake, and a
+   stale map alike - checked before every other input; fold 2's taken asleep squad (leftovers kept do not block it) keeps its answer */
+void t_t1046_kept_part()
+{
+    using namespace sqbirth;
+    for (int a = 0; a <= 1; ++a)
+        for (int k = -1; k <= 3; ++k)
+            for (int t = 0; t <= 1; ++t)
+                for (int sh = 0; sh <= 1; ++sh)
+                {
+                    /* keptPart 0: the rows from before, unchanged */
+                    const int before = k < 0 ? (sh == 1 ? 1 : 0) : (k == 0 ? 0 : ((a != 0 && t != 1) ? 0 : 1));
+                    if (OneKeepRule(a, k, t, sh, 0) != before) Fail("t1046 kept part: a keptPart 0 row changed");
+                    for (int kp = 1; kp <= 9; kp += 8)
+                    {
+                        const int r = OneKeepRule(a, k, t, sh, kp), v = OneKeepVerdict(a, k, t, sh, kp);
+                        if (a != 0 && t == 1)
+                        {   /* T-1046 fold 2: the sleeping squad's own people were taken - leftovers kept here do not block it */
+                            if (r != OneKeepRule(a, k, t, sh, 0) || v != OneKeepVerdict(a, k, t, sh, 0)) Fail("t1046 kept part: a taken asleep squad's answer changed by leftovers kept here");
+                            continue;
+                        }
+                        if (r != 0) Fail("t1046 kept part: a squad with people kept here un-offered is kept for another game (receivers >= 1, a stale map or taken)");
+                        if (v != (a != 0 ? (int)kOkKeptOutAsleep : (int)kOkKeptOutAwake)) Fail("t1046 kept part: the kept-out answer counts under the wrong name");
+                    }
+                    /* the name and the answer agree for every row */
+                    for (int kp = 0; kp <= 1; ++kp)
+                    {
+                        const int v = OneKeepVerdict(a, k, t, sh, kp), kept = (v == kOkKeptAwake || v == kOkKeptAsleep || v == kOkStaleKept) ? 1 : 0;
+                        if (v < 0 || v >= kOkVerdicts) Fail("t1046 kept part: a verdict outside the counter array");
+                        if (kept != OneKeepRule(a, k, t, sh, kp)) Fail("t1046 kept part: a verdict's name and its answer disagree");
+                    }
+                }
+    /* T2369's Dust Bandits_3: inside the other game's box (receivers 1), awake, 9 kept un-offered - the engine's answer, asleep too */
+    if (OneKeepRule(0, 1, 0, 0, 9) != 0 || OneKeepRule(1, 1, 0, 0, 9) != 0) Fail("t1046 kept part: the T2369 squad is still kept for the other game");
+    if (OneKeepRule(0, -1, 0, 1, 9) != 0 || OneKeepRule(1, -1, 1, 1, 9) != 1) Fail("t1046 kept part: a stale map beats the kept part (or the taken asleep exception is lost)");
+    if (kOkKeptOutAwake != 7 || kOkKeptOutAsleep != 8 || kOkVerdicts != 9) Fail("t1046 kept part: the verdict numbers moved");
+    /* the kept part is read in handoff.cpp from the index's kept, asleep-here and not-yet-indexed lists - never the held batches */
+    const std::string ho = T313ReadFile("../coop-plugin/handoff.cpp"), st = T313ReadFile("../coop-plugin/store.cpp");
+    {
+        const size_t f = ho.find("int HandoffSquadKeptPart(void* faction, const std::string& id)");
+        const size_t e = f == std::string::npos ? f : ho.find("\n}\n", f);
+        if (f == std::string::npos || e == std::string::npos) Fail("t1046 kept part: HandoffSquadKeptPart missing");
+        else
+        {
+            const std::string body = ho.substr(f, e - f);
+            if (body.find("ReleaseForgetDrain();") == std::string::npos || body.find("s->second.keptHere.begin()") == std::string::npos
+                || body.find("s->second.asleepHere.begin()") == std::string::npos || body.find("g_keptRecent.find(k)") == std::string::npos)
+                Fail("t1046 kept part: HandoffSquadKeptPart does not read kept, asleep here and not yet indexed");
+            if (body.find("g_relHeldSq") != std::string::npos) Fail("t1046 kept part: the held, undecided batches are counted (the first offer would be lost)");
+        }
+    }
+    /* the discard's index drop: the engine's discard at the destroy hook takes the squad's kept part out of the index */
+    {
+        const size_t d = st.find("DiscardDeleteSend(worldId, stamp, \"the game discarded a squad born not kept at its area unload\");");
+        const size_t u = d == std::string::npos ? d : st.find("coop::HandedOverUnmark(df, worldId, 2);", d);
+        if (d == std::string::npos || u == std::string::npos || u - d > 400) Fail("t1046 kept part: the destroy hook's discard does not drop the squad's kept part");
+        const size_t h = ho.find("void HandedOverUnmark(void* faction, const std::string& id, int why)");
+        const size_t w = h == std::string::npos ? h : ho.find("if (why == 2)", h);
+        const size_t dd = w == std::string::npos ? w : ho.find("IdxDiscardKey(HoKey(faction, id));", w);
+        if (h == std::string::npos || w == std::string::npos || dd == std::string::npos || dd - h > 900) Fail("t1046 kept part: HandedOverUnmark why 2 does not drop the kept part");
+        if (ho.find("if (g_relWalkDepth > 0) { if (g_idxDiscardReq.size() < 4096) g_idxDiscardReq.insert(k); ++g_idxDiscardDeferred; return; }\n    IdxDiscardDrop(k);") == std::string::npos)
+            Fail("t1046 kept part: a discard under a live walk is not deferred");
+        /* fold 1 (review MEDIUM): the two roads with no faction - the held delete's settle (T2369's every discard) and the off-thread
+           destroy's drain - drop by world id, every key of it, through the same defer-or-drop */
+        {
+            const size_t rh = st.find("void RunHeldSettle(unsigned int uid)");
+            const size_t rd = rh == std::string::npos ? rh : st.find("DiscardDeleteSend(id, h->second.stamp, \"the game discarded a squad born not kept at its area unload (sent after its hand-over: nobody took its people)\");\n            coop::HandoffSquadDiscardedId(id);", rh);
+            if (rh == std::string::npos || rd == std::string::npos || rd - rh > 2000) Fail("t1046 kept part: the held delete's discard does not drop the squad's kept part");
+            if (st.find("DiscardDeleteSend(id, stamp, \"the game discarded a squad born not kept at its area unload (drained off the main thread)\"); coop::HandoffSquadDiscardedId(id);") == std::string::npos)
+                Fail("t1046 kept part: the off-thread destroy's drained discard does not drop the squad's kept part");
+            const size_t bi = ho.find("void HandoffSquadDiscardedId(const std::string& id)");
+            const size_t be = bi == std::string::npos ? bi : ho.find("\n}\n", bi);
+            if (bi == std::string::npos || be == std::string::npos) Fail("t1046 kept part: HandoffSquadDiscardedId missing");
+            else
+            {
+                const std::string body = ho.substr(bi, be - bi);
+                if (body.find("if (s->first.second == id) keys.insert(s->first);") == std::string::npos || body.find("if (r->first.second == id) keys.insert(r->first);") == std::string::npos
+                    || body.find("IdxDiscardKey(*k);") == std::string::npos || body.find("IdxDiscardDrop(") != std::string::npos || body.find("ReleaseForgetDrain()") != std::string::npos)
+                    Fail("t1046 kept part: HandoffSquadDiscardedId does not drop every key of the id through the defer-or-drop (or drains inside the held deletes' walk)");
+            }
+            /* the order: RelAsleep indexes the person asleep BEFORE the held delete is settled */
+            const size_t ra = ho.find("static int RelAsleep(const RelMember& rm, int cancelled, unsigned int settleGen)");
+            const size_t ip = ra == std::string::npos ? ra : ho.find("IdxPut(uid, rm.key, 1, 0);", ra);
+            const size_t rs = ip == std::string::npos ? ip : ho.find("StoreRunHeldSettle(uid);", ra);
+            if (ra == std::string::npos || ip == std::string::npos || rs == std::string::npos || !(ip < rs)) Fail("t1046 kept part: the held delete is settled before RelAsleep indexes the person asleep");
+        }
+        const size_t g = ho.find("static void IdxDiscardDrop(const HoKey& k)");
+        const size_t ge = g == std::string::npos ? g : ho.find("\n}\n", g);
+        if (g == std::string::npos || ge == std::string::npos) Fail("t1046 kept part: IdxDiscardDrop missing");
+        else
+        {
+            const std::string body = ho.substr(g, ge - g);
+            if (body.find("g_keptRecent.erase(kr);") == std::string::npos || body.find("IdxDropUid(*a);") == std::string::npos
+                || body.find("if (s->second.given.empty()) { IdxEntryGone(s->first, s->second); g_squadIdx.erase(s); }") == std::string::npos
+                || body.find("s->second.keptHere.clear(); s->second.asleepHere.clear(); ++g_idxSeq;") == std::string::npos)
+                Fail("t1046 kept part: IdxDiscardDrop does not drop the kept part (or drops people given)");
+        }
+        const size_t r = ho.find("static void ReleaseForgetDrain()");
+        const size_t rq = r == std::string::npos ? r : ho.find("for (std::set<HoKey>::const_iterator k = req.begin(); k != req.end(); ++k) IdxDiscardDrop(*k);", r);
+        if (r == std::string::npos || rq == std::string::npos || rq - r > 1500) Fail("t1046 kept part: the deferred discards are not drained");
+    }
+}
 /* T-1046 fix 2 wiring: both questions go through OneKeepAt; the receiver test is the RELEASE's own ReceiversFor (no second copy of the
    engine rule in store.cpp); the asleep test is the engine's own field pair, guarded */
 void t_t1046_keep_wiring()
@@ -28244,11 +28347,16 @@ void t_t1046_keep_wiring()
                            "if (back != platoon || coopsquad::SquadPosUsable(q.ux, q.uy, q.uz) == 0) return 0;",
                            "const int k = coop::HandoffKeepReceivers(x, z, takenSlot, &names, &holder);",
                            "if (!wid.empty() && coop::HandoffSquadHasGiven(faction, wid) != 0) takenSlot = SleepersTakenSlotNow(platoon, faction, wid);",
-                           "const int kept = sqbirth::OneKeepRule(asleep, k, taken, staleShows);",
+                           "const int kept = sqbirth::OneKeepRule(asleep, k, taken, staleShows, keptPart);",
+                           "const int keptPart = !wid.empty() ? coop::HandoffSquadKeptPart(faction, wid) : 0;",   /* T-1046 attempt 2: read once, both questions */
+                           "OneKeepNote(platoon, sqbirth::OneKeepVerdict(asleep, k, taken, staleShows, keptPart), k, x, z, takenSlot, keptPart);",
                            "if (coop::HandoffSquadKeepPos(q.active, &x, &z) != 1)",
                            "g_keepVerdictOf.erase(platoon); g_oneKeepOf.erase(platoon);",
                            "g_keepVerdictOf.clear(); g_oneKeepOf.clear();",
-                           "oneKeep[keptAwake,keptAsleep,noGameAwake,noGameAsleep,notTakenAsleep,staleKept,staleEngine,asked,posFallback]=",
+                           "oneKeep[keptAwake,keptAsleep,noGameAwake,noGameAsleep,notTakenAsleep,staleKept,staleEngine,keptOutAwake,keptOutAsleep,asked,posFallback]=",
+                           "+ \",\" + N(g_oneKeep[7]) + \",\" + N(g_oneKeep[8]) + \",\" + N(g_oneKeepAsked)",
+                           "long long g_oneKeep[sqbirth::kOkVerdicts] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };",
+                           "|| verdict == sqbirth::kOkKeptOutAwake || verdict == sqbirth::kOkKeptOutAsleep)",
                            "if (!s_squadSaid.insert(std::make_pair(platoon, verdict)).second) return;", "if (n >= 3) return;",   /* review fold: the KEEP-RULE lines per kind per area */
                            " oneKeepRcv[skippedNoOther,asked]=" };
     for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i) if (st.find(need[i]) == std::string::npos) Fail(std::string("t1046 keep: store.cpp lacks: ") + need[i]);
@@ -29356,6 +29464,106 @@ void t_t1119_colour_wiring()
     if (it.find(" itemColour[applied,unknownSid,noField]=") == std::string::npos || it.find(" kitColour[applied,unknownSid,noField]=") == std::string::npos)
         Fail("t1119 wiring: the REPORT counters are missing");
 }
+
+/* T-1265 (owner 1246 a, 512): the body's own game takes a teammate's player character's carry of its AWAKE character; every refusal
+   names its reason */
+void t_t1265_owncarry_rule()
+{
+    using namespace owncarry;
+    const int downs[] = { -1, 0, 1 };
+    for (int insRead = 0; insRead <= 1; ++insRead)
+        for (int ins = 0; ins <= 2; ++ins)
+            for (int d = 0; d < 3; ++d)
+                for (int car = kCarrierOther; car <= kCarrierOwnFactionCopy; ++car)
+                {
+                    const int downed = downs[d];
+                    int want;
+                    if (!insRead) want = kOwnCarryRefuseInsUnread;
+                    else if (ins != 0) want = kOwnCarryRefuseInSomething;
+                    else if (downed == 1) want = kOwnCarryAccept;
+                    else if (downed != 0) want = kOwnCarryRefuseStateUnread;
+                    else want = car == kCarrierTeamPlayer ? kOwnCarryAcceptTeamAwake : car == kCarrierOwnFactionCopy ? kOwnCarryAcceptOwnFaction : kOwnCarryRefuseAwake;
+                    if (OwnCarryDecide(insRead != 0, ins, downed, car) != want) Fail("t1265: the own-carry decision is wrong for a row of the table");
+                    /* the arrest1 rule is kept exactly: helpless and in nothing is taken from any carrier */
+                    const bool arrest1 = insRead != 0 && ins == 0 && downed == 1;
+                    if (arrest1 && OwnCarryDecide(insRead != 0, ins, downed, car) != kOwnCarryAccept) Fail("t1265: a helpless own body in nothing must be taken from any carrier");
+                }
+    if (OwnCarryDecide(true, 0, 0, kCarrierTeamPlayer) != kOwnCarryAcceptTeamAwake) Fail("t1265: a teammate's player character must be able to carry an awake own character");
+    if (OwnCarryDecide(true, 0, 0, kCarrierOwnFactionCopy) != kOwnCarryAcceptOwnFaction) Fail("t1265 fold 1: a copy of this game's own faction (a squad member another game drives) must be able to carry an awake own character");
+    if (OwnCarryDecide(true, 0, 0, kCarrierOther) != kOwnCarryRefuseAwake) Fail("t1265: an awake own character must be refused to a carrier that is no teammate's player character nor own-faction copy");
+    if (OwnCarryDecide(true, 1, 0, kCarrierTeamPlayer) != kOwnCarryRefuseInSomething || OwnCarryDecide(true, 2, 0, kCarrierTeamPlayer) != kOwnCarryRefuseInSomething
+        || OwnCarryDecide(true, 1, 0, kCarrierOwnFactionCopy) != kOwnCarryRefuseInSomething || OwnCarryDecide(true, 2, 0, kCarrierOwnFactionCopy) != kOwnCarryRefuseInSomething)
+        Fail("t1265: a teammate's or squad member's word must never take an awake character out of a bed or cage");
+    if (OwnCarryDecide(true, 0, -1, kCarrierTeamPlayer) != kOwnCarryRefuseStateUnread || OwnCarryDecide(true, 0, -1, kCarrierOwnFactionCopy) != kOwnCarryRefuseStateUnread)
+        Fail("t1265: an unreadable lying-state must be refused, teammate or not");
+    if (OwnCarryDecide(false, 0, 1, kCarrierTeamPlayer) != kOwnCarryRefuseInsUnread) Fail("t1265: an unreadable inSomething must be refused");
+    if (!OwnCarryAccepted(kOwnCarryAccept) || !OwnCarryAccepted(kOwnCarryAcceptTeamAwake) || !OwnCarryAccepted(kOwnCarryAcceptOwnFaction) || OwnCarryAccepted(kOwnCarryRefuseInSomething)
+        || OwnCarryAccepted(kOwnCarryRefuseInsUnread) || OwnCarryAccepted(kOwnCarryRefuseAwake) || OwnCarryAccepted(kOwnCarryRefuseStateUnread))
+        Fail("t1265: OwnCarryAccepted names the wrong answers");
+}
+
+void t_t1265_owncarry_wiring()
+{
+    const std::string sp = T313ReadFile("../coop-plugin/spawn.cpp");
+    /* OwnBodyMayBeCarried is unchanged (the bed roads still need a helpless body) */
+    if (sp.find("bool OwnBodyMayBeCarried(::Character* body)\n{\n    int ins = 0;\n    if (!CarryReadInt(body, kCarryInSomethingOff, &ins) || ins != 0) return false;\n    return CopyDowned(body) == 1;\n}") == std::string::npos
+        && sp.find("bool OwnBodyMayBeCarried(::Character* body)\r\n{\r\n    int ins = 0;\r\n    if (!CarryReadInt(body, kCarryInSomethingOff, &ins) || ins != 0) return false;\r\n    return CopyDowned(body) == 1;\r\n}") == std::string::npos)
+        Fail("t1265 wiring: OwnBodyMayBeCarried changed - the bed roads must keep needing a helpless body");
+    size_t n = 0;
+    for (size_t at = sp.find("OwnCarryDecide("); at != std::string::npos; at = sp.find("OwnCarryDecide(", at + 1)) ++n;
+    if (n != 1) Fail("t1265 wiring: the own-carry decision is used somewhere other than the carry mirror's refusal");
+    /* the decision sits at the carry mirror's refusal, after the bed take-out, before the pick-up */
+    const size_t bo = sp.find("if (bodyMine && OwnBodyInBedMayBeCarried(body) && !BedOutForCarryGivenUp(w.body))");
+    const size_t rf = bo == std::string::npos ? bo : sp.find("if (bodyMine && !OwnBodyMayBeCarried(body))", bo);
+    const size_t tp = rf == std::string::npos ? rf : sp.find("const int carrierKind = (insRead && ins == 0 && downed == 0) ? CarrierKindOf(carrierUid, cc, &carrierSlot) : owncarry::kCarrierOther;", rf);
+    const size_t dc = tp == std::string::npos ? tp : sp.find("const int decided = owncarry::OwnCarryDecide(insRead, ins, downed, carrierKind);", tp);
+    const size_t ac = dc == std::string::npos ? dc : sp.find("if (!owncarry::OwnCarryAccepted(decided))", dc);
+    const size_t br = ac == std::string::npos ? ac : sp.find("if (net::SendCarryBreak(w.body, carrierUid)) ++g_carryBreakSent;", ac);
+    const size_t pk = br == std::string::npos ? br : sp.find("pickup(cc, body);", br);
+    if (bo == std::string::npos || rf == std::string::npos || tp == std::string::npos || dc == std::string::npos || ac == std::string::npos
+        || br == std::string::npos || pk == std::string::npos)
+        Fail("t1265 wiring: the own-carry decision is not between the bed take-out and the pick-up, or a refusal no longer sends the break");
+    /* the carrier test: a copy; this game's own faction (fold 1) or the carrier's own record (stand-in or coop-p<n>) and the team table */
+    if (sp.find("if (IsPlayerFaction(f)) return kCarrierSlotOwnFaction;") == std::string::npos || sp.find("const int si = StandInSlotOf(f);") == std::string::npos
+        || sp.find("const int rs = StandInRecordSlot(f);") == std::string::npos
+        || sp.find("if (carrierUid == 0 || net::IsUidMine(carrierUid)) return owncarry::kCarrierOther;") == std::string::npos
+        || sp.find("if (slot == kCarrierSlotOwnFaction) return owncarry::kCarrierOwnFactionCopy;") == std::string::npos
+        || sp.find("if (slot < 0) return owncarry::kCarrierOther;") == std::string::npos
+        || sp.find("return TeamSameAnyThread(MySlotForWire(), slot) ? owncarry::kCarrierTeamPlayer : owncarry::kCarrierOther;") == std::string::npos)
+        Fail("t1265 wiring: the carrier test does not read its record, a copy and the team table");
+    /* fold 1: a pick-up of an own body waits while this game's carry end for that body and carrier is owed - before the bed take-out */
+    const size_t bm = sp.find("const bool bodyMine = net::IsUidMine(w.body);");
+    const size_t ow = bm == std::string::npos ? bm : sp.find("if (bodyMine && ActOwedCarryEndOwed(w.body, carrierUid))", bm);
+    if (ow == std::string::npos || bo == std::string::npos || ow > bo)
+        Fail("t1265 wiring: the owed carry end does not hold the pick-up before the bed take-out");
+    if (sp.find("if (it->second.kind == actowed::kKindCarryEnd && it->second.payload.body == body && actowed::BoundUid(it->second) == carrier) return true;") == std::string::npos)
+        Fail("t1265 wiring: ActOwedCarryEndOwed does not match the owed carry end by body and bound carrier");
+    /* every refusal names its reason, counted by reason */
+    if (sp.find("why = \"in a bed/cage (inSomething=\"") == std::string::npos || sp.find("why = \"inSomething unreadable\";") == std::string::npos
+        || sp.find("why = \"awake and standing (\" + CarryLyingText(body)") == std::string::npos || sp.find("why = \"state unreadable (\" + CarryLyingText(body)") == std::string::npos)
+        Fail("t1265 wiring: the refusal line does not name its reason");
+    if (sp.find(" carryRefusedWhy[inSomething,insUnreadable,awake,stateUnreadable]=") == std::string::npos || sp.find(" carryTeamAwakeAccepted=") == std::string::npos
+        || sp.find(" carryOwnFactionAwakeAccepted=") == std::string::npos || sp.find(" carryHeldOwedEnd=") == std::string::npos)
+        Fail("t1265 wiring: the REPORT counters are missing");
+    if (sp.find("const long long kCarryTeamAwakeLogLimit = 8;") == std::string::npos || sp.find("if (g_carryTeamAwakeLogged < kCarryTeamAwakeLogLimit)") == std::string::npos)
+        Fail("t1265 wiring: the accepted carry's line is not capped");
+    /* T2372 leg c lever: `capturetest carry` names its carrier (and its body, unless the name form) by the koself / attack resolver,
+       BEFORE the parse, which reads the rewritten argument; a word that does not resolve is refused, not read as uid 0 */
+    const size_t ct = sp.find("std::string CarryTestCommand(const std::string& arg)");
+    const size_t cr = ct == std::string::npos ? ct : sp.find("const int cnr = coop::LeverNameUid(cw, &ru, &lab);", ct);
+    const size_t ce = cr == std::string::npos ? cr : sp.find("if (cnr < 0) return \"error capturetest carry: the carrier - \" + lab;", cr);
+    const size_t bn = ce == std::string::npos ? ce : sp.find("if (bw != \"name\")", ce);
+    const size_t bnr = bn == std::string::npos ? bn : sp.find("const int bnr = coop::LeverNameUid(bw, &ru, &lab);", bn);
+    const size_t be = bnr == std::string::npos ? bnr : sp.find("if (bnr < 0) return \"error capturetest carry: the body - \" + lab;", bnr);
+    const size_t rw = be == std::string::npos ? be : sp.find("argN = \"carry \" + cw + \" \" + bw + tail;", be);
+    const size_t np = rw == std::string::npos ? rw : sp.find("const int byName = coopsay::CarryNameParse(argN, &carrier, &bodyKey, &wantDead);", rw);
+    const size_t pl = np == std::string::npos ? np : sp.find("if (!byName && (word != \"carry\" || !(is >> carrier >> body)", np);
+    const size_t mn = pl == std::string::npos ? pl : sp.find("if (!net::IsUidMine(carrier)) return \"error capturetest carry: carrier uid \"", pl);
+    if (ct == std::string::npos || cr == std::string::npos || ce == std::string::npos || bn == std::string::npos || bnr == std::string::npos
+        || be == std::string::npos || rw == std::string::npos || np == std::string::npos || pl == std::string::npos || mn == std::string::npos)
+        Fail("t1265 wiring: capturetest carry does not resolve spawned:/name: carriers and bodies through LeverNameUid before its parse and its own-carrier check");
+}
+
 
 /* T-1244 (design A, F-T1244-DOWNHOLD): a LIVE HUMAN copy's kit is not held by 'down' or 'the owner says knocked out'; only its
    look waits. Dead / owner-dead / not human keep today's rule; a look the gate would apply now still goes first. */
@@ -31794,6 +32002,7 @@ const TestRow kTests[] =
     , { "t1046_keep_skip", t_t1046_keep_skip }   /* T-1046 fix 2 review fold: the receiver test skipped only where it would answer 0 */
     , { "t1046_sleepers_taken", t_t1046_sleepers_taken }   /* T-1046 fold 2 (T2305 leg N): a sleeping squad taken person by person; leftovers kept here do not block it */
     , { "t1046_keep_wiring", t_t1046_keep_wiring }   /* T-1046 fix 2: both questions through OneKeepAt, the RELEASE's ReceiversFor, the asleep field pair */
+    , { "t1046_kept_part", t_t1046_kept_part }   /* T-1046 attempt 2 (design a', T2369): people kept here un-offered - the engine's answer asleep and awake; the discard drops the kept part */
     , { "t1320_round_queued", t_t1320_round_queued }   /* T-1320 C: no new WRITE while the asker's answer (a RECORD or FRESH of the area) still waits on its link; an unanswered round keeps its retry */
     , { "t1320_answer_bulk", t_t1320_answer_bulk }   /* T-1320 B: the ANSWER-BULK line (after LIVE, ahead of REST, behind barriers, one cut frame at a time), the newest full copy replaces an older waiting forward, the gate's marks */
     , { "t1320_wiring", t_t1320_wiring }   /* T-1320: the world server decides C from its queue and sends B's answers on the ANSWER-BULK line */
@@ -31834,6 +32043,8 @@ const TestRow kTests[] =
     , { "t1293_replay_crime_wiring", t_t1293_replay_crime_wiring }   /* T-1293: the scope wraps the played hit, the capture consults it, the drain, the REPORT */
     , { "t1119_colour_rule", t_t1119_colour_rule }   /* T-1119: a made item's sent colour - applied only when sent, the field reachable and the record found */
     , { "t1119_colour_wiring", t_t1119_colour_wiring }   /* T-1119: the loader's lookup and +0xD0 write; ItCreateItem and the kit call it after the maker; no other maker call; REPORT */
+    , { "t1265_owncarry_rule", t_t1265_owncarry_rule }   /* T-1265: an awake own character is carried by a teammate's player character; refusals name the reason */
+    , { "t1265_owncarry_wiring", t_t1265_owncarry_wiring }   /* T-1265: the decision at the carry mirror only, OwnBodyMayBeCarried unchanged, the team test, the REPORT */
     , { "t1244_kit_down_gate", t_t1244_kit_down_gate }   /* T-1244: a live human copy's kit passes the down / owner-KO hold and a look held for it; dead / owner-dead / animal unchanged */
     , { "t1244_kit_down_wiring", t_t1244_kit_down_wiring }   /* T-1244: the look-hold and down-hold sites, the rebuild guard, the one re-attach, the REPORT and the capped line */
     , { "t1339_interest", t_t1339_interest }   /* T-1339: a game's interest = its reported and held areas, one ring, clipped; what entered */

@@ -117,18 +117,29 @@ inline int OtherShowsArea(int heldByOther, int otherLoaded) { return (heldByOthe
    of this game's own, the link down; 0 nobody; >= 1 that many games named); takenByNamed: 1 = the squad's people were wholly taken by a
    game the order names (asked only asleep); staleShows: today's answer for a stale map (OtherShowsArea over HeldByOtherTS and
    OtherLoadedTS read live - with the map stale both read -1, so the engine's answer), used for BOTH questions so they never disagree.
+   T-1046 attempt 2 (design a', manager 2026-11-14; T2369): keptPart = the people of the squad this game keeps un-offered (the squad
+   index's keptHere + asleepHere + the not-yet-indexed kept list - not the held, undecided put-aways, whose first offer is still to come;
+   handoff.cpp HandoffSquadKeptPart), CHECKED FIRST: while it is > 0 whole or none refuses every later offer of the squad (KeptAsleepOf),
+   so "kept for that game" can never come true - both questions, and a stale map alike, get the engine's own answer (single-player
+   parity: the engine discards a squad no game takes at its area edge; on a refusal the sender keeps the squad under its own rules). The
+   one exception (T-1046 fold 2, the code's own rule): an asleep squad whose own sleepers that game already took (takenByNamed 1 -
+   leftovers kept here that are not among its sleepers do not block it) keeps the answer it had.
    Returns 1 = kept (the mod answers keep), 0 = the engine's own answer. */
-inline int OneKeepRule(int asleep, int receivers, int takenByNamed, int staleShows)
+inline int OneKeepKeptOut(int asleep, int takenByNamed, int keptPart) { return (keptPart > 0 && !(asleep != 0 && takenByNamed == 1)) ? 1 : 0; }
+inline int OneKeepRule(int asleep, int receivers, int takenByNamed, int staleShows, int keptPart)
 {
+    if (OneKeepKeptOut(asleep, takenByNamed, keptPart) != 0) return 0;   /* T-1046 attempt 2: kept here un-offered - no game takes it: the engine's own answer */
     if (receivers < 0) return staleShows == 1 ? 1 : 0;   /* stale or missing map: today's answer, the same asleep and awake */
     if (receivers == 0) return 0;                          /* no game's engine keeps it at this spot: the engine's own answer */
     if (asleep != 0 && takenByNamed != 1) return 0;        /* asleep, its people not taken by a game that keeps it: the engine's answer (it wakes, is put away and offered) */
     return 1;
 }
 /* the counter for one answer (store.cpp oneKeep[...] on the birth REPORT) */
-enum { kOkKeptAwake = 0, kOkKeptAsleep = 1, kOkNoGameAwake = 2, kOkNoGameAsleep = 3, kOkNotTakenAsleep = 4, kOkStaleKept = 5, kOkStaleEngine = 6, kOkVerdicts = 7 };
-inline int OneKeepVerdict(int asleep, int receivers, int takenByNamed, int staleShows)
+enum { kOkKeptAwake = 0, kOkKeptAsleep = 1, kOkNoGameAwake = 2, kOkNoGameAsleep = 3, kOkNotTakenAsleep = 4, kOkStaleKept = 5, kOkStaleEngine = 6,
+       kOkKeptOutAwake = 7, kOkKeptOutAsleep = 8, kOkVerdicts = 9 };   /* T-1046 attempt 2: kept-out - this game keeps people of it un-offered */
+inline int OneKeepVerdict(int asleep, int receivers, int takenByNamed, int staleShows, int keptPart)
 {
+    if (OneKeepKeptOut(asleep, takenByNamed, keptPart) != 0) return asleep != 0 ? (int)kOkKeptOutAsleep : (int)kOkKeptOutAwake;
     if (receivers < 0) return staleShows == 1 ? (int)kOkStaleKept : (int)kOkStaleEngine;
     if (receivers == 0) return asleep != 0 ? (int)kOkNoGameAsleep : (int)kOkNoGameAwake;
     if (asleep != 0) return takenByNamed == 1 ? (int)kOkKeptAsleep : (int)kOkNotTakenAsleep;

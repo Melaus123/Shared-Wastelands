@@ -47,7 +47,7 @@
 #include "../common/boxrec.h"   /* T-823: a box.<sx>.<sy>.#<hash>.<x10>.<z10> record is one box's contents (items.cpp keeps it), never a squad */
 namespace coop { void SameIdWithdrawMarkClearNear(const unsigned int* uids, int n); void SameIdWithdrawDone(); long long SameIdClearNearUnoffered(); }   /* handoff.cpp (handoff.h): the TEST-ONLY clearnear lever's removed squads are never offered to another game */
 namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); int HandedOverSlot(void* faction, const std::string& id); void HandedOverUnmark(void* faction, const std::string& id, int why); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
-namespace coop { int HandoffKeepReceivers(float px, float pz, int wantSlot, int* namesSlot, int* holderOut); int HandoffSquadKeepPos(void* activePlatoon, float* x, float* z); void HandoffKeepReceiverCounts(long long* skipped, long long* asked); int HandoffSquadHasGiven(void* faction, const std::string& id); int HandoffSquadHasGivenId(const std::string& id); int HandoffMembersTakenBy(void* faction, const std::string& id, void* const* members, int n); int HandoffSquadOpen(void* faction, const std::string& id); int HandoffOpenAny(); long long HandoffOpenSeq(); int HandoffGivenSlotId(const std::string& id); int HandoffSleepersTakenBy(void* faction, const std::string& id, const std::vector<std::string>& hands); long long HandoffIdxSeq(); void HandoffNoteWokeWithGiven(void* faction, const std::string& id); }   /* T-1046 fix 2: handoff.cpp (handoff.h) - the keep question's receiver test is the RELEASE's own (ReceiversFor) */
+namespace coop { int HandoffKeepReceivers(float px, float pz, int wantSlot, int* namesSlot, int* holderOut); int HandoffSquadKeepPos(void* activePlatoon, float* x, float* z); void HandoffKeepReceiverCounts(long long* skipped, long long* asked); int HandoffSquadHasGiven(void* faction, const std::string& id); int HandoffSquadKeptPart(void* faction, const std::string& id); void HandoffSquadDiscardedId(const std::string& id); int HandoffSquadHasGivenId(const std::string& id); int HandoffMembersTakenBy(void* faction, const std::string& id, void* const* members, int n); int HandoffSquadOpen(void* faction, const std::string& id); int HandoffOpenAny(); long long HandoffOpenSeq(); int HandoffGivenSlotId(const std::string& id); int HandoffSleepersTakenBy(void* faction, const std::string& id, const std::vector<std::string>& hands); long long HandoffIdxSeq(); void HandoffNoteWokeWithGiven(void* faction, const std::string& id); }   /* T-1046 fix 2: handoff.cpp (handoff.h) - the keep question's receiver test is the RELEASE's own (ReceiversFor) */
 namespace coop { void* SpawnBuildingFromSentHand(const unsigned char* handRaw32); int PlatoonHomeHandPod(const void* platoon, unsigned char* out32); int PlatoonSetHomeHandPod(void* platoon, const unsigned char* handRaw32); }   /* spawn.cpp: a sent building handle resolved here; a squad's home-building hand read and given back [t755-copyhome-decl] */
 namespace coop { void KeptNoteRows(const char* p, size_t n); void KeptSaveFinished(long reqSeq); void KeptAreaWritten(const std::string& zoneId); void KeptAreaEcho(const std::string& worldId, int hasStamp, long long stamp); void KeptAreaSent(const std::string& zoneId, int sent, long long stamp); void KeptAreaStampSent(const std::string& zoneId, long long stamp); }   /* KEPT (src/common/keptwire.h): the rows and their state, and what settles a lay - defined in the kept block at the end of this file */
 namespace coop { int TalkWindowOpenNow(); }
@@ -7527,11 +7527,11 @@ long long g_keepOtherLoaded = 0;
 /* T-1046 fix 2 (owner 1591 a): ONE KEEP RULE FOR BOTH QUESTIONS (squadbirth.h OneKeepRule). Counted per squad when its answer changes
    (oneKeep[...] on the birth REPORT, sqbirth::kOk* order), the first 3 of each kind per area logged (400 a kind at most); asked = every question the rule answered;
    posFallback = an awake squad whose RELEASE position was not read (its Platoon +0x48 spot used). MAIN THREAD. */
-long long g_oneKeep[sqbirth::kOkVerdicts] = { 0, 0, 0, 0, 0, 0, 0 };
-long long g_oneKeepLines[sqbirth::kOkVerdicts] = { 0, 0, 0, 0, 0, 0, 0 };
+long long g_oneKeep[sqbirth::kOkVerdicts] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+long long g_oneKeepLines[sqbirth::kOkVerdicts] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 long long g_oneKeepAsked = 0, g_oneKeepPosFallback = 0;
 std::map<void*, int> g_oneKeepOf;   /* each bound squad's last one-rule answer (sqbirth::kOk*); goes with the platoon, cleared at the world teardown */
-void OneKeepNote(void* platoon, int verdict, int k, float x, float z, int takenSlot)
+void OneKeepNote(void* platoon, int verdict, int k, float x, float z, int takenSlot, int keptPart)
 {
     if (verdict < 0 || verdict >= sqbirth::kOkVerdicts) return;
     std::map<void*, int>::iterator it = g_oneKeepOf.find(platoon);
@@ -7543,7 +7543,8 @@ void OneKeepNote(void* platoon, int verdict, int k, float x, float z, int takenS
         static std::map<int, int> s_linesAt;
         static std::set<std::pair<void*, int> > s_squadSaid;   /* T-1046 fold 2: the kept / not-taken kinds once per squad (a run reads each group's answer) */
         if (g_oneKeepLines[verdict] >= 400) return;
-        if (verdict == sqbirth::kOkKeptAwake || verdict == sqbirth::kOkKeptAsleep || verdict == sqbirth::kOkNotTakenAsleep)
+        if (verdict == sqbirth::kOkKeptAwake || verdict == sqbirth::kOkKeptAsleep || verdict == sqbirth::kOkNotTakenAsleep
+            || verdict == sqbirth::kOkKeptOutAwake || verdict == sqbirth::kOkKeptOutAsleep)   /* T-1046 attempt 2: the kept-out kinds once per squad too */
         {
             if (!s_squadSaid.insert(std::make_pair(platoon, verdict)).second) return;
         }
@@ -7562,9 +7563,11 @@ void OneKeepNote(void* platoon, int verdict, int k, float x, float z, int takenS
         "asleep - no other game's engine keeps it at this spot: the game's own answer",
         "asleep - another game's engine would keep it here but no such game took its people: the game's own answer (it wakes, is put away and offered)",
         "no fresh area map - today's answer (another game holds or has the area loaded by the last map): kept",
-        "no fresh area map - today's answer: the game's own" };
+        "no fresh area map - today's answer: the game's own",
+        "awake - kept-out: this game keeps people of it un-offered (whole or none refuses every offer of it), no game takes it: the game's own answer",
+        "asleep - kept-out: this game keeps people of it un-offered (whole or none refuses every offer of it), no game takes it: the game's own answer" };
     DebugLog(std::string("[STORE] KEEP-RULE squad '") + WorldIdOf(platoon) + "': " + kWhy[verdict] + " (receivers=" + N((long long)k) + " taken by slot "
-             + N((long long)takenSlot) + " spot " + F1(x) + "," + F1(z) + " area " + N((long long)s.x) + "," + N((long long)s.y)
+             + N((long long)takenSlot) + " kept here " + N((long long)keptPart) + " spot " + F1(x) + "," + F1(z) + " area " + N((long long)s.x) + "," + N((long long)s.y)
              + "; T-1046 fix 2, kept / not-taken kinds once per squad, the others the first 3 of the kind in this area; oneKeep[...] on the birth REPORT)");
 }
 /* T-1046 fold 2 (T2305 leg N): THE SLEEPING SQUAD'S OWN PEOPLE, person by person. The sleeping container (UnloadedPlatoon +0x10,
@@ -7627,10 +7630,12 @@ int OneKeepAt(void* platoon, int asleep, float x, float z, void* faction)
 {
     ++g_oneKeepAsked;
     int takenSlot = -1;
+    const std::string wid = Plaus(faction) ? WorldIdOf(platoon) : std::string();
+    /* T-1046 attempt 2 (design a'): the people of this squad this game keeps un-offered - read once, for both questions (OneKeepRule checks it first) */
+    const int keptPart = !wid.empty() ? coop::HandoffSquadKeptPart(faction, wid) : 0;
     if (asleep != 0 && Plaus(faction))
     {   /* T-1046 fold 2 (T2305 leg N): the slot that took every person of this sleeping squad, person by person against its own records
            (RelAccept put them in the squad index's given) - leftovers kept here that are not among its sleepers do not block it */
-        const std::string wid = WorldIdOf(platoon);
         if (!wid.empty() && coop::HandoffSquadHasGiven(faction, wid) != 0) takenSlot = SleepersTakenSlotNow(platoon, faction, wid);
     }
     int names = 0, holder = -1;
@@ -7645,8 +7650,8 @@ int OneKeepAt(void* platoon, int asleep, float x, float z, void* faction)
     }
     else held = (holder >= 0 && holder != StoreMySlot()) ? 1 : 0;
     const int taken = (takenSlot >= 0 && names == 1) ? 1 : 0;
-    const int kept = sqbirth::OneKeepRule(asleep, k, taken, staleShows);
-    OneKeepNote(platoon, sqbirth::OneKeepVerdict(asleep, k, taken, staleShows), k, x, z, takenSlot);
+    const int kept = sqbirth::OneKeepRule(asleep, k, taken, staleShows, keptPart);
+    OneKeepNote(platoon, sqbirth::OneKeepVerdict(asleep, k, taken, staleShows, keptPart), k, x, z, takenSlot, keptPart);
     if (asleep == 0 && kept != 0 && held != 1) ++g_keepOtherLoaded;
     return kept;
 }
@@ -11838,7 +11843,11 @@ void RunHeldSettle(unsigned int uid)
         done.push_back(id);
         if (r == sqbirth::kDelRunKept) { ++g_otherRunHeldKept; OtherRunKeptNote(id, h->second.was, " (after its hand-over: another game took a person)"); continue; }
         ++g_otherRunHeldSent;
-        if (r == sqbirth::kDelDiscard) DiscardDeleteSend(id, h->second.stamp, "the game discarded a squad born not kept at its area unload (sent after its hand-over: nobody took its people)");
+        if (r == sqbirth::kDelDiscard)
+        {
+            DiscardDeleteSend(id, h->second.stamp, "the game discarded a squad born not kept at its area unload (sent after its hand-over: nobody took its people)");
+            coop::HandoffSquadDiscardedId(id);   /* T-1046 attempt 2 fold 1: its kept part (and the person settled asleep just now) leaves the squad index with it */
+        }
         else if (r == sqbirth::kDelModKept) { ModRemovedKeptNote(id, " (after its hand-over)"); if (sqbirth::MadeEmptyPlaceFailed(r, h->second.modMade) != 0) MadeEmptyNotPlacedAgain(id); }
         else if (r == sqbirth::kDelPlain && SwMaySend(id, "engine destroy delete (after its hand-over)"))
         {
@@ -11950,7 +11959,7 @@ void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp,
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelModKept)
     { ModRemovedKeptNote(id, " (drained off the main thread)"); if (sqbirth::MadeEmptyPlaceFailed(offDel, offMade) != 0) MadeEmptyNotPlacedAgain(id); ++g_destroyOffThreadGoneDrained; }   /* this game's own removal emptied it: its record stays */
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelDiscard)
-    { UnloadEmptiedDiscardNote(id, living, offEmptied, " (drained off the main thread)"); DiscardDeleteSend(id, stamp, "the game discarded a squad born not kept at its area unload (drained off the main thread)"); ++g_destroyOffThreadGoneDrained; }
+    { UnloadEmptiedDiscardNote(id, living, offEmptied, " (drained off the main thread)"); DiscardDeleteSend(id, stamp, "the game discarded a squad born not kept at its area unload (drained off the main thread)"); coop::HandoffSquadDiscardedId(id); ++g_destroyOffThreadGoneDrained; }   /* T-1046 attempt 2 fold 1: the drain runs on the main thread - its kept part leaves the squad index */
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelNone)
     { ++g_discardSharedKept; ++g_destroyOffThreadGoneDrained; }   /* another squad here holds the same id: its record stays */
     else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDelShell == sqbirth::kDelShellKept)
@@ -12047,6 +12056,7 @@ void detour_destroyPlatoon(void* faction, void* platoon)
             {
                 UnloadEmptiedDiscardNote(worldId, livingNow, emptiedByUnload, "");
                 DiscardDeleteSend(worldId, stamp, "the game discarded a squad born not kept at its area unload");
+                { Pod dq; void* df = (ReadPod(platoon, &dq) && Plaus(dq.faction)) ? dq.faction : faction; if (Plaus(df)) coop::HandedOverUnmark(df, worldId, 2); }   /* T-1046 attempt 2: its kept part leaves the squad index with it - a later squad under this id is not 'kept' */
             }
             else if (del == sqbirth::kDelModKept) { ModRemovedKeptNote(worldId, ""); if (sqbirth::MadeEmptyPlaceFailed(del, modMade) != 0) MadeEmptyNotPlacedAgain(worldId); }   /* this game's own removal emptied it: its record stays */
             else if (del == sqbirth::kDelNone) ++g_discardSharedKept;   /* another squad here holds the same id: its record stays */
@@ -37243,7 +37253,7 @@ void ReportStore()
              + "," + N(g_hbBound) + "," + N(g_discardSent) + "," + N(g_retiredAtLoad) + "," + N(g_birthKept[6]) + "," + N((long long)g_keepOffThread) + "," + N(g_hbBindIdHeld) + "," + N(g_discardSharedKept) + "," + N(g_birthFilled) + "," + N(g_birthKept[7]) + "," + N((long long)g_liveHomeOf.size()) + "," + N(g_liveHomeHits) + "," + N((long long)g_roamOf.size()) + "," + N(g_roamHits) + " unloadEmptied[noted,offThread,keptMark,discardByIt,capFull,clearedLiving,held]=" + N(g_unloadEmptiedNoted) + "," + N((long long)g_unloadEmptiedOffThread) + "," + N(g_unloadEmptiedKeptMark) + "," + N(g_unloadEmptiedDiscard) + "," + N(g_unloadEmptiedCapFull) + "," + N(g_unloadEmptiedCleared) + "," + N((long long)g_unloadEmptied.size())
              + " otherRun[noted,notedAtGoneDrain,deadSkipped,unbound,capFull,kept,held]=" + N(g_otherRunNoted) + "," + N(g_otherRunNotedDrained) + "," + N(g_otherRunDeadSkipped) + "," + N(g_otherRunUnbound) + "," + N(g_otherRunCapFull) + "," + N(g_otherRunKept) + "," + N((long long)g_otherRunRemoved.size())   /* T-850 */
              + " keepOtherLoaded=" + N(g_keepOtherLoaded)
-             + " oneKeep[keptAwake,keptAsleep,noGameAwake,noGameAsleep,notTakenAsleep,staleKept,staleEngine,asked,posFallback]=" + N(g_oneKeep[0]) + "," + N(g_oneKeep[1]) + "," + N(g_oneKeep[2]) + "," + N(g_oneKeep[3]) + "," + N(g_oneKeep[4]) + "," + N(g_oneKeep[5]) + "," + N(g_oneKeep[6]) + "," + N(g_oneKeepAsked) + "," + N(g_oneKeepPosFallback)   /* T-1046 fix 2 */
+             + " oneKeep[keptAwake,keptAsleep,noGameAwake,noGameAsleep,notTakenAsleep,staleKept,staleEngine,keptOutAwake,keptOutAsleep,asked,posFallback]=" + N(g_oneKeep[0]) + "," + N(g_oneKeep[1]) + "," + N(g_oneKeep[2]) + "," + N(g_oneKeep[3]) + "," + N(g_oneKeep[4]) + "," + N(g_oneKeep[5]) + "," + N(g_oneKeep[6]) + "," + N(g_oneKeep[7]) + "," + N(g_oneKeep[8]) + "," + N(g_oneKeepAsked) + "," + N(g_oneKeepPosFallback)   /* T-1046 fix 2 */
              + " oneKeepRcv[skippedNoOther,asked]=" + OneKeepRcvToken()   /* T-1046 fix 2 review fold (cost) */
              + " oneKeepTaken[reads,cached,noRecords,noHand,taken]=" + SleepTakenToken()   /* T-1046 fold 2 */
              + " otherRunF1[cleared,died,answeredNo,held,heldKept,heldSent,heldRebound,heldNow]=" + N(g_otherRunCleared) + "," + N(g_otherRunDied) + "," + N(g_otherRunAnsweredNo) + "," + N(g_otherRunHeldN) + "," + N(g_otherRunHeldKept) + "," + N(g_otherRunHeldSent) + "," + N(g_otherRunHeldRebound) + "," + N((long long)g_otherRunHeld.size())   /* T-850 fold 1 */
