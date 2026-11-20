@@ -185,11 +185,15 @@ try {
     }
 
     # ---- 2b. THE RELEASE FORM (T-879): a DLL built with `build.bat dev` carries the test-only probes and writes "DEV build" into
-    # its log's first line; players never get one. The text is searched as the mod writes it (ASCII). -AllowDevBuild overrides.
+    # its log's first line; players never get one. -AllowDevBuild overrides. The LABEL is matched as its own string literal
+    # (coop_log.cpp LogBuildLabel: "DEV build" between two NUL bytes), never as text inside another message: a release build
+    # carries "error storetest home: DEV build only" (store.cpp, T-1334's lever refusal), which the plain text search took for
+    # a DEV build (release 0.4.2's T2376 / T2377 refused, 2026-11-14). Checked on the bench DLLs: every DEV one has the
+    # NUL-bounded label, every release one has "release build" bounded the same way and not the DEV one.
     $dllForm = Join-Path $Tree 'src\coop-plugin\SharedWastelands.dll'
     if (Test-Path -LiteralPath $dllForm) {
         $formText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dllForm))
-        if ($formText.IndexOf('DEV build', [System.StringComparison]::Ordinal) -ge 0) {
+        if ($formText.IndexOf("`0DEV build`0", [System.StringComparison]::Ordinal) -ge 0) {
             if ($AllowDevBuild) { Write-Host "WARNING: packaging a DEV build of SharedWastelands.dll (-AllowDevBuild) - not for players" }
             else { $problems.Add("DEV BUILD: src\coop-plugin\SharedWastelands.dll is a DEV build (built with 'build.bat dev'; it carries the test-only probes) - rebuild it with src\coop-plugin\build.bat and no argument, or pass -AllowDevBuild on purpose") }
         }

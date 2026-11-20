@@ -67,6 +67,7 @@
 #include "../common/bugreport.h"           /* coopbug::CaptionToPlain */
 #include "../common/playerstab.h"          /* playerstab::EscapeHash */
 #include "../common/slotwire.h"            /* coopslot::PlaceholderName */
+#include "../common/pingwire.h"          /* T-1393: a ping's chat words */
 #include "../common/chatlink.h"           /* CHATLINK: item links - the words, the colours, the bytes */
 #include "items.h"                        /* CHATLINK: ItemLinkUnderMouse - the item under the mouse */
 
@@ -1911,6 +1912,25 @@ void ChatNoticeLine(int slot, const std::string& name, const std::string& senten
 {
     PushGrey(chatwire::kLineMoney, slot, name, sentence, NowMs());
     DebugLog("[CHAT] notice line kept (slot " + N(slot) + ")");
+}
+/* T-1393: the name a ping shows - this player's own name for this game's slot (or slot -1: this player before the slot is
+   known), else this game's name for that slot, as a chat line names its sender */
+std::string ChatPlayerName(int slot)
+{
+    if (slot < 0 || slot == StoreMySlot()) return MyName();
+    return WordsOf(slot, NowMs()).name;
+}
+/* T-1393: a ping's chat line ("<name> pinged a spot." / "... on the map.", pingwire::ChatLine), kept as a notice line is but in the
+   normal chat text colour (chatwire kLinePing); a
+   teammate's ping (sound true) plays the chat message sound of a teammate's message - the MY FACTION kind, so it is switched off
+   with that chat sound and quiet while the chat window is open, as a message is */
+void ChatPingLine(int slot, int kind, bool sound)
+{
+    const long long now = NowMs();
+    const std::string name = ChatPlayerName(slot);
+    PushGrey(chatwire::kLinePing, slot, name, pingwire::ChatLine(name, kind), now);   /* review fold 10: the normal chat text colour */
+    if (sound) PlayMessageSound(chatwire::kFaction, now);
+    DebugLog("[CHAT] ping line kept (slot " + N(slot) + ", " + pingwire::KindWord(kind) + (sound ? ", sound asked)" : ")"));
 }
 /* T-546: an interface sound by event name on the message sounds' road (PostEventGuarded, kUiSoundObject, g_soundOff) */
 int ChatPlayUiEvent(const char* ev)

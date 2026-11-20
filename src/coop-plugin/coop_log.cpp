@@ -20,6 +20,8 @@
 #include "../common/modversion.h"   /* the mod's version, the log's first line */
 #include "../common/linekeep.h"   /* T-910: the [KEEPER] lines kept in memory for the bug report */
 #include "../common/crashkeep.h"   /* a launch that did not quit normally, kept in the crashes folder at the next start */
+#include "../common/crashline.h"   /* T-1374: the [CRASH] line's own pieces - its time written with no C runtime call */
+#include "../common/winrecords_read.h"   /* T-1344: how that launch ended, from Windows' own records - one more [CRASHKEEP] line */
 #include <vector>
 
 namespace
@@ -90,12 +92,25 @@ namespace
     int  g_versionSaid = 0;   /* guarded by g_lock: the version line is this log's first line */
     /* guarded by g_lock: the start-up's [CRASHKEEP] line (src/common/crashkeep.h), written into the new log after the version line */
     char g_crashNote[640];
+    /* guarded by g_lock: T-1344 - after a launch that did not quit normally, the [CRASHKEEP] line from Windows' own records
+       (src/common/winrecords.h), written by the first log line after it is set, after g_crashNote */
+    char g_winNote[704];
     /* the start-up's crash keep, handed from the rotation (log lock held) to the first log line that has let the lock go:
        0 nothing to do, 1 waiting, 2 claimed by one thread. Plain arrays: a log call may come before any constructor has run. */
     volatile LONG g_ckState = 0;
     wchar_t g_ckFolder[2048];
     wchar_t g_ckName[2048];
     int g_ckPrevMoved = 0;
+    /* T-1374: the entry the start-up's keep made ("" = none), the crash file it holds (kind 0 none, 1 .dmp, 2 .zip) and the kept
+       launch's log end - for CrashKeepSaveRootLook, run once the address table names Kenshi's save root. Written by the keep,
+       read after it on the plugin's start thread. */
+    wchar_t g_ckEntryDir[2048];
+    char g_ckEntryName[64];
+    wchar_t g_ckKeptFile[MAX_PATH];
+    int g_ckKeptKind = 0;
+    long long g_ckPrevEnd = 0;
+    long long g_ckCrashAt = 0;   /* T-1374 fold (F2): the kept launch's [CRASH] line's time, 0 = none (swcrashkeep::CrashLineUtcSec) */
+    volatile LONG g_ckSaveRootLooked = 0;
 
     /* The file part of a path, each wchar_t truncated to a char (the names here are ASCII). Allocates nothing. */
     void NarrowFilePart(const std::wstring& path, char* out, size_t outSize)
@@ -208,9 +223,9 @@ namespace
 
     /* Reads launch 1's log for the judgement (swcrashkeep::Judge): returns swcrashkeep::kLog*, with whether the exit hook's install
        line and a quit route line are there, and the newest part's size. `part` = launch 1's parts (cooplogrot::kPart*). */
-    int CkReadPrevious(const std::wstring part[], bool* hook, bool* route, unsigned long long* size, DWORD* err)
+    int CkReadPrevious(const std::wstring part[], bool* hook, bool* route, bool* crash, long long* crashAt, unsigned long long* size, DWORD* err)
     {
-        *hook = false; *route = false; *size = 0; *err = 0;
+        *hook = false; *route = false; *crash = false; *crashAt = 0; *size = 0; *err = 0;
         /* no write sharing: a game still writing this log holds it open for writing, and the open then fails with a sharing
            violation - a game that is still running, not a crash */
         HANDLE h = ::CreateFileW(part[cooplogrot::kPartCurrent].c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
@@ -232,6 +247,8 @@ namespace
             *size = n;
             tailRead = CkReadAt(h, n > tail ? n - tail : 0, tail, &buf);
             if (tailRead) tailRoute = swcrashkeep::HasText(buf.data(), buf.size(), swcrashkeep::kRouteText);
+            if (tailRead) *crash = swcrashkeep::HasText(buf.data(), buf.size(), swcrashkeep::kCrashLineText);   /* T-1374: the [CRASH] line */
+            if (*crash) *crashAt = swcrashkeep::CrashLineUtcSec(buf.data(), buf.size());   /* T-1374 fold (F2): and its time */
             if (tailRead && CkReadAt(h, 0, swcrashkeep::kHeadBytes, &buf)) headHas = swcrashkeep::HasText(buf.data(), buf.size(), swcrashkeep::kHookOkText) ? 1 : 0;
         }
         if (!tailRead || headHas == -2) *err = ::GetLastError();
@@ -244,9 +261,11 @@ namespace
     }
 
     /* Kenshi's crash file that ended the previous launch, looked for in each of `folders` (swcrashkeep::CrashFolders): one
-       coopbug::CrashFromLastLaunch places in that launch (written within kCrashNearSec of copy 1's last write, and before this
-       launch began), at most 4 MB, a .zip before a .dmp, the newest first - as the bug report picks it. Its full path, or empty. */
-    std::wstring CkFindCrashFile(const std::vector<std::wstring>& folders, long long prevLogEnd, std::wstring* fileName)
+       swcrashkeep::CrashFileOfKeptLaunch places in that launch (written within kCrashNearSec of copy 1's last write, before this
+       launch began and - T-1374 fold F2, when its log holds a [CRASH] line with a time (crashAt > 0) - not before that line:
+       the file's name is fixed, so an older crash's file is still there), at most 4 MB, a .zip before a .dmp, the newest first.
+       Its full path, or empty. */
+    std::wstring CkFindCrashFile(const std::vector<std::wstring>& folders, long long prevLogEnd, long long crashAt, std::wstring* fileName)
     {
         fileName->clear();
         if (prevLogEnd <= 0) return std::wstring();
@@ -269,7 +288,7 @@ namespace
                 const int kind = coopbug::CrashFileKind(narrow);
                 const unsigned long long size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                 const long long t = CkFileTimeSec(fd.ftLastWriteTime);
-                if (kind == 0 || size > (4ull << 20) || !coopbug::CrashFromLastLaunch(t, prevLogEnd, launch)) continue;
+                if (kind == 0 || size > (4ull << 20) || !swcrashkeep::CrashFileOfKeptLaunch(t, crashAt, prevLogEnd, launch)) continue;
                 if (best.empty() || kind > bestKind || (kind == bestKind && t > bestAt))
                 { best = folders[d] + fd.cFileName; *fileName = fd.cFileName; bestKind = kind; bestAt = t; }
             } while (::FindNextFileW(f, &fd));
@@ -303,7 +322,7 @@ namespace
        go into a new entry of <folder>crashes\, built under its ".part" name and renamed when every file is in; then only the
        newest swcrashkeep::kKeepEntries entries stay (older ones, and a ".part" a cut-off copy left, are removed whole). Returns
        the [CRASHKEEP] line. */
-    std::string CkKeep(const std::wstring& folder, const std::wstring part[], unsigned long long logBytes)
+    std::string CkKeep(const std::wstring& folder, const std::wstring part[], unsigned long long logBytes, long long crashAt, std::string* crashSeen)
     {
         using namespace swcrashkeep;
         /* Kenshi's crash file is paired now, while it is there: a later crash writes the same file name again */
@@ -322,7 +341,13 @@ namespace
         WIN32_FILE_ATTRIBUTE_DATA ad;
         if (::GetFileAttributesExW(part[cooplogrot::kPartCurrent].c_str(), GetFileExInfoStandard, &ad)) prevEnd = CkFileTimeSec(ad.ftLastWriteTime);
         std::wstring crashFileName;
-        const std::wstring crashFile = CkFindCrashFile(CrashFolders(program, folder), prevEnd, &crashFileName);
+        const std::wstring crashFile = CkFindCrashFile(CrashFolders(program, folder), prevEnd, crashAt, &crashFileName);
+        if (!crashFileName.empty())
+        {
+            char seen[MAX_PATH];
+            NarrowFilePart(crashFileName, seen, sizeof(seen));
+            *crashSeen = seen;
+        }
 
         const std::wstring root = folder + kFolderW;
         if (!::CreateDirectoryW(root.c_str(), NULL))
@@ -381,6 +406,13 @@ namespace
             CkRemoveFolder(building);   /* never half an entry */
             return NoteLine(kVerdictCrashed, true, err, "", 0, "", "", 0, "");
         }
+        /* T-1374: the entry, for the save-root look once the address table names Kenshi's save root (CrashKeepSaveRootLook) */
+        wcscpy_s(g_ckEntryDir, 2048, (root + L"\\" + CkWiden(entry)).c_str());
+        strcpy_s(g_ckEntryName, sizeof(g_ckEntryName), entry.c_str());
+        wcscpy_s(g_ckKeptFile, MAX_PATH, crashName.empty() ? L"" : crashFileName.c_str());
+        g_ckKeptKind = crashName.empty() ? 0 : coopbug::CrashFileKind(crashName);
+        g_ckPrevEnd = prevEnd;
+        g_ckCrashAt = crashAt;
 
         std::vector<std::string> names, partial;
         WIN32_FIND_DATAW fd;
@@ -411,7 +443,7 @@ namespace
             removed += b;
         }
         for (size_t i = 0; i < partial.size(); ++i) CkRemoveFolder(root + L"\\" + CkWiden(partial[i]));
-        return NoteLine(kVerdictCrashed, false, 0, entry, logBytes, parts, crashName, kept, removed);
+        return NoteLine(kVerdictCrashed, false, 0, entry, logBytes, parts, crashName, kept, removed, crashAt > 0);
     }
 
     /* The [CRASHKEEP] line, for the next log line to write (under the log lock: the line is read under it). */
@@ -421,6 +453,57 @@ namespace
         ::EnterCriticalSection(&g_lock);
         _snprintf_s(g_crashNote, sizeof(g_crashNote), _TRUNCATE, "%s", text);
         ::LeaveCriticalSection(&g_lock);
+    }
+
+    /* T-1344: the [CRASHKEEP] line from Windows' own records, for the next log line to write after the crash note */
+    void SetWinNote(const char* text)
+    {
+        EnsureLock();
+        ::EnterCriticalSection(&g_lock);
+        _snprintf_s(g_winNote, sizeof(g_winNote), _TRUNCATE, "%s", text);
+        ::LeaveCriticalSection(&g_lock);
+    }
+
+    /* T-1344 (owner 1653): after a "did not quit normally" verdict, how that launch ended from Windows' own records - the
+       Application log's fault / error-report / hang entries for this game's exe, the System log's unclean-shutdown and
+       shutdown-started entries, the CrashDumps names (src/common/winrecords.h, winrecords_read.h). The window opens at
+       that launch's start: its log's creation time (the opening part's when there is one), never before the launch before
+       it ended (copy 2's last write). Reads only; at most swwinrec::kBudgetMs of event-log searching. Never throws. */
+    void NoteWindowsRecords(const std::wstring& name, const std::wstring part[], const std::string& kenshiFile)
+    {
+        try
+        {
+            std::string exe;
+            {
+                wchar_t p[2048];
+                const DWORD n = ::GetModuleFileNameW(NULL, p, 2048);
+                char nb[MAX_PATH];
+                nb[0] = 0;
+                if (n != 0 && n < 2048) NarrowFilePart(std::wstring(p, n), nb, sizeof(nb));
+                exe = nb[0] ? nb : "kenshi_x64.exe";
+            }
+            long long created = 0, olderEnd = 0;
+            WIN32_FILE_ATTRIBUTE_DATA ad;
+            const int first[2] = { (int)cooplogrot::kPartStart, (int)cooplogrot::kPartCurrent };
+            for (int i = 0; i < 2; ++i)
+                if (::GetFileAttributesExW(part[first[i]].c_str(), GetFileExInfoStandard, &ad))
+                {
+                    const long long c = CkFileTimeSec(ad.ftCreationTime);
+                    if (c > 0 && (created == 0 || c < created)) created = c;
+                }
+            if (::GetFileAttributesExW(cooplogrot::PartName(name, 2, cooplogrot::kPartCurrent).c_str(), GetFileExInfoStandard, &ad))
+                olderEnd = CkFileTimeSec(ad.ftLastWriteTime);
+            FILETIME nowFt;
+            ::GetSystemTimeAsFileTime(&nowFt);
+            const long long now = CkFileTimeSec(nowFt);
+            DWORD ms = 0;
+            const std::string line = swwinrec::Gather(exe, swwinrec::WindowStart(created, olderEnd, now), now, kenshiFile, &ms);
+            SetWinNote(line.c_str());
+        }
+        catch (...)
+        {
+            SetWinNote("[CRASHKEEP] how the last launch ended (Windows records): stopped - out of memory");
+        }
     }
 
     /* After the start-up rotation: the previous launch's newest part became copy 1 (prevMoved 1), was not there (0) or did not
@@ -433,18 +516,22 @@ namespace
             std::wstring part[cooplogrot::kPartKinds];
             for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k) part[k] = cooplogrot::PartName(name, 1, k);
             int verdict = prevMoved < 0 ? (int)swcrashkeep::kVerdictNotMoved : (int)swcrashkeep::kVerdictNoLog;
-            bool hook = false, route = false;
+            bool hook = false, route = false, crash = false;
+            long long crashAt = 0;
             unsigned long long logBytes = 0;
             DWORD err = 0;
             if (prevMoved > 0)
             {   /* the reading first, then the judgement: a call's arguments have no set order, so hook and route passed beside the
                    reading in one call were copied before it filled them in (T1815: every launch judged "not all marked") */
-                const int logState = CkReadPrevious(part, &hook, &route, &logBytes, &err);
-                verdict = swcrashkeep::Judge(logState, hook, route);
+                const int logState = CkReadPrevious(part, &hook, &route, &crash, &crashAt, &logBytes, &err);
+                verdict = swcrashkeep::JudgeWithCrash(logState, hook, route, crash);   /* T-1374: a [CRASH] line is a crash */
             }
-            const std::string line = verdict == swcrashkeep::kVerdictCrashed ? CkKeep(folder, part, logBytes)
+            std::string kenshiFile;
+            const std::string line = verdict == swcrashkeep::kVerdictCrashed ? CkKeep(folder, part, logBytes, crashAt, &kenshiFile)
                                                                              : swcrashkeep::NoteLine(verdict, false, err, "", 0, "", "", 0, "");
             SetCrashNote(line.c_str());
+            /* T-1344: only after the "did not quit normally" verdict, at this start-up */
+            if (verdict == swcrashkeep::kVerdictCrashed) NoteWindowsRecords(name, part, kenshiFile);
         }
         catch (...)
         {
@@ -720,6 +807,15 @@ namespace
     }
 #endif
 
+    /* Milliseconds from the first log call to `now`; 0 before it. Reads the start, never sets it. */
+    unsigned long long ElapsedMs(const LARGE_INTEGER& now)
+    {
+        if (!g_haveStart || g_freq.QuadPart <= 0 || now.QuadPart < g_start.QuadPart) return 0;
+        const unsigned long long ticks = (unsigned long long)(now.QuadPart - g_start.QuadPart);
+        const unsigned long long freq  = (unsigned long long)g_freq.QuadPart;
+        return (ticks / freq) * 1000ull + ((ticks % freq) * 1000ull) / freq;
+    }
+
     /* Caller holds g_lock. "<sec>.<msec>" since the first log call. */
     void FormatTime(char* out, size_t outSize)
     {
@@ -731,14 +827,24 @@ namespace
             g_start = now;
             g_haveStart = 1;
         }
-        unsigned long long ms = 0;
-        if (g_freq.QuadPart > 0 && now.QuadPart >= g_start.QuadPart)
-        {
-            unsigned long long ticks = (unsigned long long)(now.QuadPart - g_start.QuadPart);
-            unsigned long long freq  = (unsigned long long)g_freq.QuadPart;
-            ms = (ticks / freq) * 1000ull + ((ticks % freq) * 1000ull) / freq;
-        }
+        const unsigned long long ms = ElapsedMs(now);
         _snprintf_s(out, outSize, _TRUNCATE, "%llu.%03llu", ms / 1000ull, ms % 1000ull);
+    }
+
+    /* T-1374 fold (F3): the same "<sec>.<msec>" for the [CRASH] line - no C runtime call (msvcr100's formatting may allocate its
+       per-thread data and end the process when it cannot) and no lock: the start is only read ("0.000" before the first log
+       line). */
+    void CrashTimeText(char* out, size_t outSize)
+    {
+        LARGE_INTEGER now;
+        ::QueryPerformanceCounter(&now);
+        const unsigned long long ms = ElapsedMs(now);
+        size_t len = 0;
+        if (outSize == 0) return;
+        out[0] = 0;
+        swcrash::PutDec(out, outSize, &len, ms / 1000ull);
+        swcrash::Put(out, outSize, &len, ".");
+        swcrash::PutDecPad(out, outSize, &len, ms % 1000ull, 3);
     }
 
     /* T-910: the [KEEPER] lines of this launch (LogKeeperLinesText), made at the first one, under g_lock. */
@@ -817,6 +923,14 @@ namespace
                 g_crashNote[0] = 0;
                 WriteCounted(note, (DWORD)strlen(note));
             }
+            if (g_fileState == 1 && g_winNote[0])
+            {
+                /* T-1344: how that launch ended, from Windows' own records (src/common/winrecords.h), said once */
+                char note[sizeof(g_winNote) + 64];
+                _snprintf_s(note, sizeof(note), _TRUNCATE, "%s KenshiCoop: %s\r\n", timeStr, g_winNote);
+                g_winNote[0] = 0;
+                WriteCounted(note, (DWORD)strlen(note));
+            }
             if (g_fileState == 1)
             {
                 char prefix[kPrefixGap + 1];
@@ -853,6 +967,110 @@ namespace
             return;
         }
         WriteLine(isError, narrow.data(), narrow.size());
+    }
+}
+
+/* T-1374: THE [CRASH] LINE'S WRITE (crashwatch.cpp). Called from inside a crash handler, so: no allocation, no C++ object and no
+   C runtime call (the heap may be what crashed). The caller built the line in its own stack buffer `buf` (cap bytes) after
+   kCrashLinePrefixGap bytes left free; the usual "Error <time> KenshiCoop: " prefix goes into that gap, against the text, and
+   CRLF after it (the text is cut to make room), and the whole line goes to the file in ONE WriteFile - no second line-sized
+   buffer here (a stack overflow leaves little stack, crashwatch.cpp). The log lock is taken only if it comes free within about
+   50 ms - the crashed thread may hold it (a critical section its own thread holds is entered again at once); the handle is
+   append-only, so a write without the lock still lands whole at the end. A file that is not open drops the line. */
+void CrashLogWriteRaw(char* buf, size_t cap, size_t textLen)
+{
+    if (buf == 0 || cap < kCrashLinePrefixGap + 3) return;
+    char timeStr[32];
+    CrashTimeText(timeStr, sizeof(timeStr));
+    char prefix[kCrashLinePrefixGap];
+    size_t plen = 0;
+    swcrash::Put(prefix, sizeof(prefix), &plen, "Error ");
+    swcrash::Put(prefix, sizeof(prefix), &plen, timeStr);
+    swcrash::Put(prefix, sizeof(prefix), &plen, " KenshiCoop: ");
+    const size_t start = kCrashLinePrefixGap - plen;
+    for (size_t i = 0; i < plen; ++i) buf[start + i] = prefix[i];
+    if (textLen > cap - kCrashLinePrefixGap - 2) textLen = cap - kCrashLinePrefixGap - 2;
+    size_t n = kCrashLinePrefixGap;
+    for (size_t i = 0; i < textLen; ++i, ++n) if (buf[n] == '\r' || buf[n] == '\n') buf[n] = ' ';
+    buf[n++] = '\r';
+    buf[n++] = '\n';
+    bool locked = false;
+    if (g_lockState == 2)
+        for (int i = 0; i < 50 && !locked; ++i)
+        {
+            if (::TryEnterCriticalSection(&g_lock)) locked = true;
+            else ::Sleep(1);
+        }
+    if (g_fileState == 1 && g_file != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        ::WriteFile(g_file, buf + start, (DWORD)(n - start), &written, NULL);
+        if (g_shared != 0) ::InterlockedExchangeAdd64(&g_shared->bytes, (LONG64)written);
+    }
+    if (locked) ::LeaveCriticalSection(&g_lock);
+}
+
+/* T-1374: KENSHI'S CRASH ZIP IN ITS SAVE ROOT. Kenshi's crash handling writes crashDump<version>_x64.zip into its save root (the
+   game's global text, row KenshiSaveRootText; F1036) - not into the folders the start-up's keep looks in. The keep runs at the
+   first log line, before the address table is read, so this second look runs once the table is in (coop.cpp startPluginOn), once
+   per process: when the start-up kept an entry, the save root's crash file of that launch (CkFindCrashFile: within kCrashNearSec
+   of its log's end, before this launch began, at most 4 MB, a .zip before a .dmp) is copied into that entry when it is better
+   than what the entry holds (a .zip over a .dmp or nothing; the .dmp it replaces is in the zip and is removed), under a ".part"
+   name renamed when whole. Returns the [CRASHKEEP] line, or "" when there is nothing to say (no entry was kept).
+   T-1374 fold (N8): a look with the save root not known yet and !last does nothing and leaves the look for later (the
+   first world load calls it again with last = true, crashwatch.cpp CrashWatchTick); the look is spent only when it ran. */
+std::string CrashKeepSaveRootLook(const std::wstring& saveRoot, bool last)
+{
+    if (g_ckSaveRootLooked != 0) return std::string();
+    if (saveRoot.empty() && !last) return std::string();
+    if (::InterlockedExchange(&g_ckSaveRootLooked, 1) != 0) return std::string();
+    try
+    {
+        if (g_ckEntryDir[0] == 0) return std::string();
+        const std::string at = std::string(swcrashkeep::kFolder) + "\\" + g_ckEntryName;
+        if (saveRoot.empty())
+            return "[CRASHKEEP] Kenshi's save root is not known (its address row is not filled or its text is empty, at the start and at the first world load) - Kenshi's crash zip was not looked for there; " + at + " keeps what the start-up found";
+        const std::vector<std::wstring> folders(1, swcrashkeep::FolderWithSlash(saveRoot));
+        std::wstring name;
+        const std::wstring found = CkFindCrashFile(folders, g_ckPrevEnd, g_ckCrashAt, &name);
+        char b[160];
+        if (found.empty())
+        {
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "%u", coopbug::kCrashNearSec);
+            return std::string("[CRASHKEEP] Kenshi's save root holds no crash file of the kept launch (none within ") + b + " s of its log's end"
+                   + (g_ckCrashAt > 0 ? " written since its [CRASH] line" : "") + ") - " + at + " unchanged";
+        }
+        char nb[MAX_PATH];
+        NarrowFilePart(name, nb, sizeof(nb));
+        char kept[MAX_PATH];
+        NarrowFilePart(std::wstring(g_ckKeptFile), kept, sizeof(kept));
+        const int kind = coopbug::CrashFileKind(nb);
+        if (kind <= g_ckKeptKind)
+            return std::string("[CRASHKEEP] Kenshi's crash file in its save root (") + nb + ") is no better than the one " + at + " holds (" + kept + ") - unchanged";
+        const std::wstring dir(g_ckEntryDir);
+        const std::wstring tmp = dir + L"\\" + name + CkWiden(swcrashkeep::kPartialSuffix);
+        DWORD e = 0;
+        if (!::CopyFileW(found.c_str(), tmp.c_str(), FALSE)) e = ::GetLastError();
+        else if (!::MoveFileExW(tmp.c_str(), (dir + L"\\" + name).c_str(), MOVEFILE_REPLACE_EXISTING)) e = ::GetLastError();
+        if (e != 0)
+        {
+            ::DeleteFileW(tmp.c_str());
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "%lu", (unsigned long)e);
+            return std::string("[CRASHKEEP] Kenshi's crash file in its save root (") + nb + ") could not be copied into " + at + " (Windows error " + b + ") - unchanged";
+        }
+        std::string replaced;
+        if (g_ckKeptFile[0] != 0 && _wcsicmp(g_ckKeptFile, name.c_str()) != 0)
+        {
+            ::DeleteFileW((dir + L"\\" + g_ckKeptFile).c_str());
+            replaced = std::string(" in place of ") + kept + " (the zip holds Kenshi's dump)";
+        }
+        g_ckKeptKind = kind;
+        wcscpy_s(g_ckKeptFile, MAX_PATH, name.c_str());
+        return std::string("[CRASHKEEP] Kenshi's crash file from its save root kept: ") + nb + " in " + at + replaced;
+    }
+    catch (...)
+    {
+        return "[CRASHKEEP] the save-root look stopped: out of memory - nothing changed";
     }
 }
 

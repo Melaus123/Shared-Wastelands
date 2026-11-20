@@ -416,6 +416,67 @@ inline int CountPlacementsCapped(int sw, int sh, int iw, int ih, CellTaken taken
     const int left = PlaceCapLeft(itemCap, itemCount);
     return CountPlacements(sw, sh, iw, ih, taken, ctx, (want < left) ? want : left);
 }
+/* T-1167 piece 3 build 3 (owner 1641 / 1642): DO ALL OF A LIST OF ITEMS FIT TOGETHER? The trade's receiving game asks it at LOCK (after
+   its own outgoing items were lifted - their squares are free) of the other side's whole offer, nothing placed: CountPlacements' scan
+   extended to a LIST that shares ONE copy of the claimed squares per section, in delivery order. Each item, section by section in the
+   inventory's order (the engine's whole-inventory add offers the sections in turn, and each section's own add merges onto its matching
+   stacks first, then takes the first cell its test accepts, y outer, x inner): first that section's room on matching stacks (stackRoom),
+   then free placements of `per` units each until the item's units are all placed or the section has no accepted, unclaimed footprint
+   left or its item-count cap is reached. refused[s][y * sw + x]: the engine's cell test for THIS item at x,y now (non-zero = refused; a
+   grid of the wrong size counts every cell refused); per[s] <= 0: the stack limit did not read - no cells there; stackRoom[s] < 0 is 0.
+   Rows are distinct things (tradewire.h OfferOk), so one item never merges onto a stack another item of the list made.
+   *left: each item's units that did not fit (0 = all placed). 1 every unit of every item fits; 0 not. */
+struct FitSec { int sw, sh, capLeft; FitSec() : sw(0), sh(0), capLeft(0) {} };
+struct FitItem
+{
+    int iw, ih; long long units;
+    std::vector<int> per, stackRoom;                     /* per section */
+    std::vector<std::vector<unsigned char> > refused;    /* per section: sw * sh */
+    FitItem() : iw(0), ih(0), units(0) {}
+};
+inline int FitList(const std::vector<FitSec>& secs, const std::vector<FitItem>& items, std::vector<long long>* left)
+{
+    left->assign(items.size(), 0);
+    std::vector<std::vector<unsigned char> > claimed(secs.size());
+    std::vector<int> capLeft(secs.size(), 0);
+    for (size_t s = 0; s < secs.size(); ++s)
+    {
+        const bool ok = secs[s].sw >= 1 && secs[s].sh >= 1 && secs[s].sw <= kPlaceGridCap && secs[s].sh <= kPlaceGridCap && secs[s].sw * secs[s].sh <= kPlaceGridCap;
+        if (ok) claimed[s].assign((size_t)(secs[s].sw * secs[s].sh), 0);
+        capLeft[s] = ok ? (secs[s].capLeft > 0 ? secs[s].capLeft : 0) : 0;
+    }
+    int all = 1;
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        const FitItem& it = items[i];
+        long long l = it.units > 0 ? it.units : 0;
+        for (size_t s = 0; s < secs.size() && l > 0; ++s)
+        {
+            if (s < it.stackRoom.size() && it.stackRoom[s] > 0) l -= (l < (long long)it.stackRoom[s]) ? l : (long long)it.stackRoom[s];
+            const int sw = secs[s].sw, sh = secs[s].sh;
+            const int per = s < it.per.size() ? it.per[s] : 0;
+            if (l <= 0 || per <= 0 || claimed[s].empty() || it.iw < 1 || it.ih < 1 || it.iw > sw || it.ih > sh) continue;
+            if (s >= it.refused.size() || it.refused[s].size() != (size_t)(sw * sh)) continue;
+            for (int cy = 0; cy <= sh - it.ih && l > 0 && capLeft[s] > 0; ++cy)
+                for (int cx = 0; cx <= sw - it.iw && l > 0 && capLeft[s] > 0; ++cx)
+                {
+                    if (it.refused[s][(size_t)(cy * sw + cx)] != 0) continue;
+                    int clash = 0;
+                    for (int j = 0; j < it.ih && clash == 0; ++j)
+                        for (int k = 0; k < it.iw && clash == 0; ++k)
+                            if (claimed[s][(size_t)((cy + j) * sw + (cx + k))] != 0) clash = 1;
+                    if (clash != 0) continue;
+                    for (int j = 0; j < it.ih; ++j)
+                        for (int k = 0; k < it.iw; ++k) claimed[s][(size_t)((cy + j) * sw + (cx + k))] = 1;
+                    --capLeft[s];
+                    l -= per;
+                }
+        }
+        (*left)[i] = l > 0 ? l : 0;
+        if (l > 0) all = 0;
+    }
+    return all;
+}
 
 /* ---------------- the item a buy names (review MED 4) ---------------- */
 /* The clicked variant's full description - the same fields the sale's request carries (maker, material, colour, quality,

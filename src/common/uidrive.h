@@ -78,8 +78,15 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "resetworld",    kDriveButton, "SWResetWorldBtn",       0 },
         /* the RESET WORLD? dialog's CANCEL and RESET WORLD - each pressed only while it reads that - and its keep-buildings tick box */
         { "resetcancel",   kDriveButton, "CoopDlgCancelBtn",      0, "CANCEL" },
-        { "resetok",       kDriveButton, "CoopDlgOkBtn",          0, "RESET WORLD" },
+        { "resetok",       kDriveButton, "CoopDlgOkBtn",          0, "RESET" },   /* T-1383 fold: the approved page v3's confirm word */
         { "resetkeep",     kDriveButton, "SWResetKeepTick",       0 },
+        { "resetdead",     kDriveButton, "SWResetDeadTick",       0 },   /* T-1383: "Keep named characters who died" */
+        { "resetrel",      kDriveButton, "SWResetRelTick",        0 },   /* T-1383: "Keep how the factions feel about each other" */
+        /* T-1383: IMPORT FROM SINGLE PLAYER's creator tick boxes (shown only for the world's first profile) and its IMPORT (only while
+           it reads that) */
+        { "impdead",       kDriveButton, "SWImpDeadTick",         0 },
+        { "imprel",        kDriveButton, "SWImpRelTick",          0 },
+        { "impok",         kDriveButton, "CoopDlgOkBtn",          0, "IMPORT" },
         /* HOST GAME's "Keep this world running for others" tick box, and the STOP WORLD? dialog's STOP WORLD - pressed only while it
            reads that, so a world that is no longer running (DELETE WORLD? in its place) is never deleted by it */
         { "keeprun",       kDriveButton, "SWKeepRunTick",         0 },
@@ -91,6 +98,13 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "create",        kDriveButton, "CoopDlgOkBtn",          0, "CREATE" },  /* only while it reads CREATE (new world / profile) */
         { "cancel",        kDriveButton, "CoopDlgCancelBtn",      "CoopCloseBtn", "CANCEL" },   /* T-201 N1: also BACK while it reads CANCEL (a HOST / JOIN in progress) */
         { "boxok",         kDriveButton, "CoopNoticeOk",          0 },            /* T-201 N1: the error box's OK (CAN'T HOST / CAN'T JOIN) */
+        { "boxadmin",      kDriveButton, "CoopNoticeAdmin",       0 },            /* T-247 (owner 1692): the MODS DON'T MATCH box's JOIN AS ADMIN */
+        { "boxorder",      kDriveButton, "CoopNoticeOrder",       0 },            /* T-1375: the MODS DON'T MATCH box's PUT MY MODS IN THE WORLD'S ORDER */
+        { "boxyes",        kDriveButton, "CoopNoticeYes",         0 },            /* T-1375: the MOD ORDER box's YES (its NO is boxok) */
+        { "opttabd",       kDriveButton, "CoopOptTab3",           0 },            /* T-1375: GAME OPTIONS' fourth tab, MODS */
+        { "modsorder",     kDriveButton, "SWOptModsOrder",        0 },            /* T-1375: GAME OPTIONS' MODS tab's PUT MY MODS IN THE WORLD'S ORDER */
+        { "modsyes",       kDriveButton, "SWOptModsYes",          0 },            /* the MODS tab's question box's YES (WORLD'S MODS / MOD ORDER) */
+        { "modsno",        kDriveButton, "SWOptModsNo",           0 },            /* ... its NO (OK on the after-YES MOD ORDER box) */
         /* T-290: PASSWORD REQUIRED's own JOIN and CANCEL (a JOIN refused for its password) */
         { "pwjoin",        kDriveButton, "SWPwJoinBtn",           0 },
         { "pwcancel",      kDriveButton, "SWPwCancelBtn",         0 },
@@ -140,6 +154,10 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "opttickh",      kDriveButton, "CoopOptTick7",          0 },
         { "optticki",      kDriveButton, "CoopOptTick8",          0 },
         { "opttickj",      kDriveButton, "CoopOptTick9",          0 },   /* T-1202: the tenth row's tick box */
+        /* T-1392: the eleventh row (the MULTIPLAYER tab while MENUS AND BUILDING is shown: IMPORT INCLUDES RESEARCH moves there) */
+        { "optdeck",       kDriveButton, "CoopOptDec10",          0 },
+        { "optinck",       kDriveButton, "CoopOptInc10",          0 },
+        { "opttickk",      kDriveButton, "CoopOptTick10",         0 },
         /* T-220: the panel's two close routes that are not a button of ours - the title-bar X and the Escape key */
         { "close",         kDriveWindowClose, "CoopPanel",         0 },
         { "escape",        kDriveEscape,      "CoopPanel",         0 },

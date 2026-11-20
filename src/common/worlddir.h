@@ -632,6 +632,61 @@ inline std::string JoinedDirIn(const std::string& joinedTop, const std::string& 
     if (top[top.size() - 1] == '\\' || top[top.size() - 1] == '/') top.erase(top.size() - 1);
     return top + "\\" + JoinedFolderName(worldName, worldId);
 }
+/* T-1390 (design B): A JOINED WORLD'S KEPT COPY UNDER AN EARLIER NAME OF THE WORLD. A world keeps its id when its name changes (RESET
+   WORLD renames the world as it was "<name> - before reset <n>", worldreset.h), but a joining game's folder is named
+   <name>~<8 hex of the id>, so a game rejoining the renamed world would open a new, empty folder beside the copy it kept. When the
+   folder for the current name is not there, a folder named for an earlier name of the world is used IN PLACE - never renamed: a
+   running game's in-use.lock inside it would refuse a rename - and only when its kept record table (mirrorkeep.h records-kept.txt)
+   names this FULL world id: the 8 hex alone could be another world's (a copied one). Among several accepted folders the one whose
+   table was written last wins (a tie: the first in the caller's order). Pure: the caller looks at the disk. */
+struct JoinedEarlier
+{
+    std::string        name;        /* the earlier world name */
+    bool               there;       /* its folder, <joined top>\<name>~<8 hex>, is on disk */
+    std::string        tableId;     /* the world id its kept table's header names ("" = no kept table read there) */
+    unsigned long long tableTime;   /* that table's last write (compared only) */
+    JoinedEarlier() : there(false), tableTime(0ULL) {}
+};
+enum JoinedPick { kJoinedPickCurrent = 0, kJoinedPickEarlier = 1 };
+/* T-1390 fold (review FIX 1): THE CURRENT NAME'S FOLDER COUNTS AS THIS WORLD'S COPY only when one of its kept tables names the FULL world
+   id, or it holds changes not yet sent (queue.txt). An empty one - an earlier build's first try made it and kept nothing - gives way to
+   the search for an earlier name; it is passed over, never deleted. */
+inline bool JoinedCurrentIsCopy(bool there, const std::string& tableId, const std::string& worldId, bool hasQueue)
+{
+    return there && ((!tableId.empty() && tableId == worldId) || hasQueue);
+}
+enum JoinedEarlierWhy { kEarlierUsed = 0, kEarlierAbsent = 1, kEarlierNoTable = 2, kEarlierOtherId = 3, kEarlierLater = 4 };
+/* kJoinedPickEarlier: *at = the earlier folder to use. kJoinedPickCurrent: the current name's folder (there, or made new). why[i] =
+   each candidate's verdict (filled only when the current folder is missing and the id is usable). */
+inline int JoinedFolderPick(bool currentThere, const std::string& worldId, const std::vector<JoinedEarlier>& earlier, size_t* at,
+                            std::vector<int>* why)
+{
+    if (why != 0) why->clear();
+    if (currentThere || !WorldIdOk(worldId)) return kJoinedPickCurrent;
+    bool found = false; size_t best = 0;
+    for (size_t i = 0; i < earlier.size(); ++i)
+    {
+        int w = kEarlierUsed;
+        if (!earlier[i].there) w = kEarlierAbsent;
+        else if (earlier[i].tableId.empty()) w = kEarlierNoTable;
+        else if (earlier[i].tableId != worldId) w = kEarlierOtherId;
+        if (why != 0) why->push_back(w);
+        if (w != kEarlierUsed) continue;
+        if (!found || earlier[i].tableTime > earlier[best].tableTime) { found = true; best = i; }
+    }
+    if (!found) return kJoinedPickCurrent;
+    if (why != 0)
+        for (size_t i = 0; i < why->size(); ++i) if (i != best && (*why)[i] == kEarlierUsed) (*why)[i] = kEarlierLater;
+    if (at != 0) *at = best;
+    return kJoinedPickEarlier;
+}
+inline const char* JoinedEarlierWhyText(int w)
+{
+    return w == kEarlierUsed ? "used" : w == kEarlierAbsent ? "its folder is not there"
+         : w == kEarlierNoTable ? "it holds no kept record table naming a world id"
+         : w == kEarlierOtherId ? "its kept record table names another world id (the same 8 hex, another world)"
+         : w == kEarlierLater ? "another copy of this world was kept more recently and is used" : "?";
+}
 /* A joined world's first folder takes the outage journal its world's same-name folder holds from before joined folders only
    when that folder is no world this computer runs (no world.txt) and the world existed before ids (upgraded). */
 inline bool JoinedQueueTakeDecide(bool ownHasWorldTxt, bool ownHasQueue, bool upgraded)

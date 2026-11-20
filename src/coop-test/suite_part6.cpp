@@ -4869,16 +4869,19 @@ void t_rk1_hook_guard_pins()
     const std::string a = T313ReadFile("../coop-plugin/addresses.cpp");
     const std::string h = T313ReadFile("../coop-plugin/hooks.cpp");
     if (a.empty() || h.empty()) { Fail("could not read addresses.cpp / hooks.cpp"); return; }
-    const size_t row = a.find("int RowCallOnly(const char* name)");
+    const size_t row = a.find("int RowUse(const char* name)");   /* T-1447: RowCallOnly became RowUse (AddrUsesCombined) */
     const size_t guard = a.find("const char* AddrHookRefusedAt(unsigned long long target)");
-    if (row == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", row) == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", row) - row > 600)
-        Fail("addresses.cpp: RowCallOnly does not decide through AddrUsesAllCallOnly (S2)");
+    if (row == std::string::npos || a.find("AddrUsesCombined(uses, n)", row) == std::string::npos || a.find("AddrUsesCombined(uses, n)", row) - row > 600)
+        Fail("addresses.cpp: RowUse does not decide through AddrUsesCombined (S2 / T-1447)");
     if (guard == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", guard) == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", guard) - guard > 700)
         Fail("addresses.cpp: AddrHookRefusedAt does not decide through AddrUsesAllCallOnly (S3)");
     const size_t ask = h.find("AddrHookRefusedAt((unsigned long long)(uintptr_t)target)");
     const size_t create = h.find("MH_CreateHookEx(ident, target, detour, original)");
     if (ask == std::string::npos || create == std::string::npos || ask > create) Fail("hooks.cpp: AddHook does not ask AddrHookRefusedAt before MH_CreateHookEx (S3)");
     if (h.find("return FAIL;", ask) == std::string::npos || h.find("return FAIL;", ask) > create) Fail("hooks.cpp: a call-only target is not refused before MH_CreateHookEx (S3)");
+    /* T-1447: a chained row's bytes are re-read before MinHook touches it, and a changed one is refused */
+    const size_t chk = h.find("AddrChainedCheck((unsigned long long)(uintptr_t)target, &chainRow)");
+    if (chk == std::string::npos || chk > create || h.find("return FAIL;", chk) > create) Fail("hooks.cpp: a chained row is not re-checked and refused before MH_CreateHookEx (T-1447)");
 }
 /* T-815: the plugin's sound road - the row it binds is in both address tables, and the sound follows the kept line */
 void t_t815_chat_sound_pins()
@@ -8639,6 +8642,37 @@ void t_t1141_door_events()
         || doors.find("if (origin == coopdoor::kDoorOriginHolder) DrWriteRow(") != std::string::npos)
         Fail("door record events: a local change is written only when this game holds the door's position");
     if (sync.find("DoorServesSectorAsk") != std::string::npos) Fail("door record events: the sector ask with no caller is still there");
+}
+
+/* T-36 (F1198): the owner's kept piece matched to its own row both ways - a whole row repairs a ruin here, a ruin row never repairs,
+   a whole row on a whole piece does nothing */
+void t_t36p_owner_kept_match()
+{
+    if (keptwire::OwnKeptMatch(1, 0, 1, 1) != keptwire::kOwnKeptRepair) Fail("owner kept: a whole row on a ruin here was not repaired");
+    if (keptwire::OwnKeptMatch(1, 0, 0, 1) != keptwire::kOwnKeptRepair) Fail("owner kept: a whole row on a ruin reading unfinished here was not repaired");
+    if (keptwire::OwnKeptMatch(1, 1, 1, 1) != keptwire::kOwnKeptNothing || keptwire::OwnKeptMatch(0, 1, 0, 1) != keptwire::kOwnKeptNothing)
+        Fail("owner kept: a ruin row on a ruin here was not left alone");
+    if (keptwire::OwnKeptMatch(1, 1, 1, 0) != keptwire::kOwnKeptRuin || keptwire::OwnKeptMatch(0, 1, 0, 0) != keptwire::kOwnKeptRuin)
+        Fail("owner kept: a ruin row on a whole piece here was not made a ruin");
+    if (keptwire::OwnKeptMatch(1, 0, 1, 0) != keptwire::kOwnKeptNothing) Fail("owner kept: a whole row on a whole piece here did something");
+    if (keptwire::OwnKeptMatch(0, 0, 0, 1) != keptwire::kOwnKeptRepair) Fail("owner kept: an unfinished row on a ruin here was not repaired to its progress (the hand-back repairs it)");
+    if (keptwire::OwnKeptMatch(0, 0, 0, 0) != keptwire::kOwnKeptNothing || keptwire::OwnKeptMatch(0, 0, 1, 0) != keptwire::kOwnKeptNothing)
+        Fail("owner kept: an unfinished row on a piece standing here was written by the owner step");
+    if (keptwire::OwnKeptMatch(1, 0, 0, 0, 1) != keptwire::kOwnKeptFinish || keptwire::OwnKeptMatch(0, 0, 0, 0, 1) != keptwire::kOwnKeptFinish)
+        Fail("owner kept: a deferred repair whose ruin reset landed was not finished from the row");
+    if (keptwire::OwnKeptMatch(1, 0, 1, 1, 1) != keptwire::kOwnKeptRepair) Fail("owner kept: a deferred repair still a ruin was not tried again");
+    if (keptwire::OwnKeptMatch(1, 1, 1, 0, 1) != keptwire::kOwnKeptRuin || keptwire::OwnKeptMatch(1, 1, 1, 1, 1) != keptwire::kOwnKeptNothing)
+        Fail("owner kept: a ruin row was repaired or finished because a repair was owed");
+    if (keptwire::OwnKeptMatch(1, 0, 0, 0) != keptwire::kOwnKeptBelowFull) Fail("owner kept: a whole row on an unfinished piece here was not named");
+    const std::string b = T313ReadFile("../coop-plugin/build.cpp");
+    const size_t at = b.find("int BdKeptOwnerState(");
+    const size_t end = (at == std::string::npos) ? std::string::npos : b.find("void* BdKeptCreate(", at);
+    const std::string body = (end == std::string::npos) ? std::string() : b.substr(at, end - at);
+    if (body.empty()) { Fail("owner kept: BdKeptOwnerState not found in build.cpp"); return; }
+    if (body.find("keptwire::OwnKeptMatch(w.p.complete, w.p.destroyed, c, x, L.ownerRepairOwed)") == std::string::npos || body.find("BdRepairWhole(live, w.p.complete, w.p.progress)") == std::string::npos
+        || body.find("BdRepairFinish(live, w.p.complete, w.p.progress)") == std::string::npos || body.find("BdKeptPutMats(w, live)") == std::string::npos
+        || body.find("BdReadMats(live, rr->second.mats") == std::string::npos)
+        Fail("owner kept: the owner step does not decide by OwnKeptMatch or does not repair through BdRepairWhole");
 }
 
 }   /* namespace suite */

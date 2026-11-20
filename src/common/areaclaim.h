@@ -290,6 +290,96 @@ inline int AreaSweepDecide(int held, int holder, int goneEvent, int restoredUnre
     if (held != 0) gone = (goneEvent != 0 || restoredUnreported != 0 || holder < 0 || heard == 0) ? 1 : 0;
     return AreaChargeDecide(holder, gone, nListers, listers, since, why, loading);
 }
+/* T-1363 (design C, owner 1666): THE HAND-OVER WAIT. When the sweep's answer is kChargePassDropped (the holder's latest report no
+   longer lists the area and another game lists it) and the holder is heard and live, the holder keeps the area while it writes it: the
+   world server sends it an AREA_FRESH WRITE (the existing round, flagged as a hand-over) and passes charge on at the FIRST of
+     - its record stored (the round answered FRESH)            -> kHandOverStored
+     - a CANT of the round, any reason                          -> kHandOverCant
+     - kChargeHandOverMs since the wait began                    -> kHandOverTimeout
+     - the holder gone (link closed, the silence rule, its connection no longer live) -> kHandOverGone
+   While waiting, the holder listing the area again ends the wait and it keeps it (kHandOverBack); nobody else listing it any more ends
+   the wait and the area goes to nobody, as before (kHandOverNobody - release to nobody is unchanged). Never held forever: the wait has
+   its own clock and every other end is an event the sweep sees.
+     chargeWhy   - AreaSweepDecide's *why for the area now.
+     waiting     - 1 a hand-over of this area is in progress (its WRITE out).
+     holderLive  - 1 the holder's game is connected on the connection the wait began with and may be written to.
+     answer      - kHandOverAnswerNone / Stored / Cant: what the round has said since the wait began.
+     waitedMs    - how long the wait has run.
+   The action: kHandOverApply (apply chargeWhy as before; *end says how a wait in progress ended, kHandOverNoEnd when none was),
+   kHandOverStart (keep the holder, send the WRITE, start the clock), kHandOverWait (keep the holder, still waiting). */
+const double kChargeHandOverMs = 8000.0;
+const int kHandOverApply = 0, kHandOverStart = 1, kHandOverWait = 2;
+const int kHandOverAnswerNone = 0, kHandOverAnswerStored = 1, kHandOverAnswerCant = 2;
+const int kHandOverNoEnd = 0, kHandOverStored = 1, kHandOverCant = 2, kHandOverTimeout = 3, kHandOverGone = 4, kHandOverBack = 5, kHandOverNobody = 6;
+inline const char* HandOverEndName(int end)
+{
+    switch (end)
+    {
+    case kHandOverStored: return "stored";
+    case kHandOverCant: return "cant";
+    case kHandOverTimeout: return "timeout";
+    case kHandOverGone: return "gone";
+    case kHandOverBack: return "back";
+    case kHandOverNobody: return "nobody-else";
+    default: return "none";
+    }
+}
+inline int AreaHandOverDecide(int chargeWhy, int waiting, int holderLive, int answer, double waitedMs, int* end)
+{
+    if (end != 0) *end = kHandOverNoEnd;
+    if (waiting == 0) return (chargeWhy == kChargePassDropped && holderLive != 0) ? kHandOverStart : kHandOverApply;
+    int e = kHandOverNoEnd;
+    if (chargeWhy == kChargeKeep) e = kHandOverBack;
+    else if (answer == kHandOverAnswerStored) e = kHandOverStored;
+    else if (answer == kHandOverAnswerCant) e = kHandOverCant;
+    else if (chargeWhy == kChargeReleaseDropped) e = kHandOverNobody;
+    else if (chargeWhy != kChargePassDropped || holderLive == 0) e = kHandOverGone;
+    else if (waitedMs >= kChargeHandOverMs) e = kHandOverTimeout;
+    if (e == kHandOverNoEnd) return kHandOverWait;
+    if (end != 0) *end = e;
+    return kHandOverApply;
+}
+/* T-1363 fold 1 (review 3): may a hand-over's WRITE join the AREA_FRESH round already out for its area? Only a WRITE to this holder
+   (sameHolder) on the connection it holds from (sameConnect), not answered yet, under the round limit (ageMs < limitMs) AND sent at or
+   after the report that dropped the area (sentAt >= dropAt, one clock): an older WRITE's FRESH carries a record written before the drop,
+   and would end the wait 'stored' with every later change lost. 1 = join it, 0 = start a new round (a new WRITE). */
+inline int AreaHandOverJoin(int havePending, int sameHolder, int sameConnect, int answered, double ageMs, double limitMs, double sentAt, double dropAt)
+{
+    return (havePending != 0 && sameHolder != 0 && sameConnect != 0 && answered == 0 && ageMs < limitMs && sentAt >= dropAt) ? 1 : 0;
+}
+/* T-1363 fold 1 (review 5): does the area's wait take a hand-over round's answer? Only while a wait is in progress (hoStart > 0), when
+   the area's holder is still the round's holder, on the connection the WRITE went to, and the wait has no answer yet (the first answer
+   wins). Any other answer of the round leaves the wait as it is. */
+inline int AreaHandOverTakes(int rowFound, double hoStart, int owner, int holder, unsigned rowConnect, unsigned holderConnect, int answer)
+{
+    return (rowFound != 0 && hoStart > 0.0 && owner == holder && rowConnect == holderConnect && answer == kHandOverAnswerNone) ? 1 : 0;
+}
+/* T-1363 fold 2 (re-check 3): AN ANSWER TO THE ROUND A HAND-OVER REPLACED NEVER ENDS THE HAND-OVER. When a new round's WRITE goes to the
+   same holder connection while that connection's earlier WRITE is still unanswered, one answer is owed to the old round. The game answers
+   its WRITEs in the order they came (one queue, store.cpp AfHolderStep) and sends each answer, and each area record, on one ordered
+   reliable channel (AfSend / SendRecordAny: g_link->Send(0, ..., CH_RELIABLE)); the world server sends both WRITEs on one line too. So
+   the first FRESH or CANT from that connection after the new WRITE is the old round's, and is ignored. A record of the area refused as
+   unreadable while an answer is still owed was sent before the old round's answer, so it is the old round's too: ignored, and not
+   counted (the old round's FRESH still comes after it). If the game merged the two WRITEs into one ("one write answers both"), its single
+   answer is ignored and the hand-over ends at its 8 s limit - late, never wrong.
+   AreaRoundOwed: the owed count after a new round goes out - roundOut / answered = the row's round before it, sameHolderConnect = the new
+   WRITE goes to the slot and connection the old one went to (otherwise the old connection's answers fail the row's own check: 0). */
+const int kRoundOwedMax = 8;
+inline int AreaRoundOwed(int owed, int roundOut, int answered, int sameHolderConnect)
+{
+    if (sameHolderConnect == 0) return 0;
+    const int n = (owed > 0 ? owed : 0) + ((roundOut != 0 && answered == 0) ? 1 : 0);
+    return n > kRoundOwedMax ? kRoundOwedMax : n;
+}
+/* what the row does with an answer from its holder's connection: refusal = 1 for its area record refused as unreadable, 0 for a FRESH
+   or CANT. kAnswerTake = this round's answer (as before); kAnswerOwed = the replaced round's answer (ignored, one less owed);
+   kAnswerOldRecord = the replaced round's refused record (ignored, still owed). */
+const int kAnswerTake = 0, kAnswerOwed = 1, kAnswerOldRecord = 2;
+inline int AreaAnswerOwed(int owed, int refusal)
+{
+    if (owed <= 0) return kAnswerTake;
+    return refusal != 0 ? kAnswerOldRecord : kAnswerOwed;
+}
 /* THE LISTING CLOCKS (pure, so the offline suite walks them). The world server keeps per slot two arrival times - `stamp`, its latest
    report WITHOUT the loading mark (what it lists is what it keeps), and `heard`, its latest report of either kind (the silence clock) -
    and per area per slot `lastSeen`, the stamp of the latest unmarked report that listed it, and `since`, when that unbroken listing began.
@@ -308,6 +398,26 @@ inline int AreaListedNow(int haveStamp, double stamp, int haveHeard, double hear
 inline double AreaListedSince(int havePrev, double prevStamp, int haveSeen, double lastSeen, int haveSince, double since, double now)
 {
     return (havePrev != 0 && haveSeen != 0 && haveSince != 0 && lastSeen == prevStamp) ? since : now;
+}
+
+/* T-1442 step 1 (owner: events over timers): THE AREA MAP SENT AT THE CHANGE (store_main.cpp AreaChargeSweep / AreaMapFlush).
+   AreaMapDueMark: the 'map due' mark after a sweep step - set when a holder moved (holderMoved 1), kept when already set; only a map
+   that went out clears it (AreaMapFlush, AreaTick). AreaMapFlushDecide: after an event, kMapFlushSend when a map is due and the maps are
+   not stopped (the TEST-ONLY --stop-areamaps-after); kMapFlushStopped when due but stopped (nothing sent, the mark kept); kMapFlushNone
+   when nothing is due. */
+const int kMapFlushNone = 0, kMapFlushSend = 1, kMapFlushStopped = 2;
+inline int AreaMapDueMark(int due, int holderMoved) { return (due != 0 || holderMoved != 0) ? 1 : 0; }
+inline int AreaMapFlushDecide(int due, int stopped)
+{
+    if (due == 0) return kMapFlushNone;
+    return stopped != 0 ? kMapFlushStopped : kMapFlushSend;
+}
+/* fold 1b (review 5): THE STEP AreaMapFlush RUNS - the decision, and a map sent clears the mark (a stopped flush keeps it) */
+inline int AreaMapFlushStep(int* due, int stopped)
+{
+    const int d = AreaMapFlushDecide(*due, stopped);
+    if (d == kMapFlushSend) *due = 0;
+    return d;
 }
 
 }   /* namespace coopstore */

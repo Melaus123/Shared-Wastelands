@@ -28,6 +28,16 @@ void PlayersTabForgetWorld();
 // line. MAIN THREAD (the command channel). Returns the status.
 std::string PlayersTabCommand(const std::string& args);
 
+// T-1406 (the right-click 'Invite to faction' entry, policy.cpp): 1 = the PLAYERS tab's own rule would show INVITE TO FACTION for
+// player `slot` now (teamscreens.h ViewFor .right == kActInvite, read live). MAIN THREAD.
+int PlayersTabInvites(int slot);
+// T-1406 (T2524 L4): the stance the PLAYERS tab shows for player `slot` (nametag levels; unread = neutral, as shown): this player's
+// towards them, theirs towards this player, and whether that player is a teammate. 0 = no row for `slot`. MAIN THREAD.
+int PlayersTabStance(int slot, int* you, int* them, int* teammate);
+// T-1406: the entry's click - the tab's own invitation request for `slot` while that rule still holds; team.cpp's answer, or why
+// nothing was sent. MAIN THREAD.
+std::string PlayersTabInviteSend(int slot);
+
 // MAIN THREAD (the chat, chat.cpp): a player's name as the PLAYERS tab shows it (the roster's, else the one given earlier this
 // session, else "Player N") and the faction line under it (its faction of players' name when in one, else its Kenshi faction;
 // "" when this game has not seen that player's faction). false = nothing could be read.

@@ -15,7 +15,7 @@ if errorlevel 1 (
 
 cd /d "%~dp0"
 rem /MT: the C runtime is linked in, so the exe runs on a Windows 7+ machine with nothing installed.
-rem No /GL, no /LTCG: the plugin keeps them only so its own code generation matches its earlier builds.
+rem No /GL, no /LTCG, like the plugin since owner decision 1807.
 rem The toolchain has no rc.exe, so the dialog template is built in memory (setup_main.cpp).
 rem The icon (file icon and window icon) is setup_icon.res, which make_icon.py writes directly (no rc.exe needed);
 rem link turns it into the exe's resources with cvtres.exe, which the toolchain does have.

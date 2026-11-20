@@ -624,6 +624,7 @@ std::string CursorTestCommand(const std::string& arg);   /* p105h: TEST-ONLY `cu
 std::string BoxMoveCommand(const std::string& arg);
 std::string HoldTestCommand(const std::string& arg);   /* P105 build 2: TEST-ONLY `holdtest delay <s> [n] | refusenext <gone|busy|policy> | list` - the writer keeps the next n HOLD / LAND requests unprocessed for s seconds (released in arrival order), refuses the next HOLD, or lists its rows */
 void ItemsHoldSave(int phase, int onMainThread);       /* P105 build 2, the save pre-hooks (store.cpp): phase 0 before saveGame (every kept item back into its own square), 1 after it returns (lifted out again), 2 a saveLevelData outside a game save (a zone write: every hold put back and ended) */       /* p105h: TEST-ONLY `boxmove <boxKey> <section> <fx> <fy> <tx> <ty> [n]` - a move of n units (all when omitted) inside one box through the engine's own take-out + add */
+std::string ItemTestBjRefuseCommand(const std::string& arg);   /* T-1346: TEST-ONLY `itemtest bjrefuse <0..100>` - as a box's holder, refuse the next n journal asks received (one log line each) */
 std::string ItemTestUndoFailCommand(const std::string& arg);   /* T-1266: TEST-ONLY `itemtest undofail [off]` - the next plain take from another game's character finds its source square taken at the put-back (a placeholder), so the put-back exit's ending runs */
 std::string ItemTestRefuseHereCommand(const std::string& arg);   /* T-164 B4-2: TEST-ONLY `itemtest refusehere <gate> [n]` - the REQUESTER takes that refusal exit after the early put-back (and refunds) */
 std::string ItemTestPackItemCommand(const std::string& arg);   /* T-215 (owner 177 a): TEST-ONLY `itemtest packitem [n]` - n sellable single items into this game's own seller's general grid */
@@ -638,6 +639,10 @@ std::string ItemTestRcGiveCommand(const std::string& arg);   /* T-1079 TEST-ONLY
 std::string ItemTestLClickCommand(const std::string& arg);   /* T-1191 TEST-ONLY: a named character beside a named box, then the player's left click on it */
 std::string ItemTestBFacCommand(const std::string& arg);     /* T-1191 TEST-ONLY, read-only: the faction a named box carries on this game */
 std::string ItemTestStackGiveCommand(const std::string& arg);   /* T-1079 TEST-ONLY: units off our character onto a box's stack, no window */
+std::string BoxBurstPutStep(const std::string& keyPart, const std::string& sid, int n, int haveQ, float q);   /* T-1346 TEST-ONLY: boxburst put: step */
+/* T-1346 TEST-ONLY: boxburst's cut, armed after its steps and fired by ItemsTick at the end of the next drain (items.cpp BoxBurstCutAfterDrain) */
+int BoxBurstCutArmed();
+void BoxBurstCutArm(const std::string& sec, const std::string& key, int steps, int done);
 std::string ItemTestStolenCommand(const std::string& arg);
 std::string ItemTestGiveStolenCommand(const std::string& arg);
 std::string ItemTestSetCommand(const std::string& arg);   /* items9: TEST-ONLY `itemtest set <any|sid|section:x,y> [q=<0-100>] [ch=<n>]` */
@@ -665,7 +670,8 @@ int ItemOwnerApplyTo(void* item, const coopmark::OwnerId& o, const std::string& 
 void ItemOwnerNoteBadBlock();  /* inv6: session.cpp - an owner that would not encode (the item went clean) */
 void ItemGearOf(void* item, gearwire::GearMarks* out);   /* MAIN THREAD: a gear item's uniform and crafter as they travel (none for any other item) */
 int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string& sid);   /* MAIN THREAD: onto a fresh item, gear items only; 1 written */
-int ItemColourApplyTo(void* item, const std::string& colorSid);   /* T-1119, MAIN THREAD: onto a fresh kit item, the sent colour (coopgarment::kColour*) */
+void ItemColourKitSay(void* item, const std::string* colorSid, void* holder);   /* T-1413, MAIN THREAD, LOG ONLY: right after ItemColourApplyTo (colorSid 0 = the kit row carried no details) - the capped [COLOUR] line when holder is another player's character */
+int ItemColourApplyTo(void* item, const std::string& colorSid, void* holder);   /* T-1119, MAIN THREAD: onto a fresh kit item, the sent colour (coopgarment::kColour*); holder: the kit's character (T-1382: named on the failure line) */
 void ItemGearNoteSent(int blocks, unsigned int dropped);   /* session.cpp: GEM1 blocks written, fields that went empty */
 void ItemGearNoteBadRecv();   /* session.cpp: a RECEIVED GEM1 block that was malformed */
 void ItemBagNestNoteBadRecv();   /* session.cpp / clothing.cpp: a RECEIVED pack-row BAGN tail that was malformed */
@@ -921,6 +927,11 @@ int  ObjectStillActive(void* obj);
    same memo, same generation as ObjectStillActive and the box road, so this adds NO second walk. */
 int  ObjectActiveBuildingCount();
 void* ObjectActiveBuildingAt(int i);
+/* T-1400 (F1184), MAIN THREAD, neither walks: 1 when the last walk of the building list could not settle (a zone was taken apart
+   during both of its passes - it listed nothing, so "not listed" says nothing about a door); and a stamp that moves each time a walk
+   settles with a count other than the last settled one (*n: that count) - the door road's owed keys are looked for again then. */
+int  ObjectWalkUnsettled();
+long long ObjectWalkCountStamp(int* n);
 
 /* B10-b (review-b10 M-6): IS THIS POINT LOADED IN THIS GAME, RIGHT NOW - the box road's own live read, so
    the ZONE-FILE writer's first rung takes the same input a box takes instead of a 1 Hz sector flag. Asks the

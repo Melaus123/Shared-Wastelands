@@ -107,6 +107,7 @@ inline int ResetClassify(const std::string& name, int isDir)
     if (isDir)
     {
         if (l == "repair" || l == "recycle") return kResetMove;
+        if (l == "own") return kResetKeep;   /* T-885 piece 1 (owner 1747 a): the players' own records (ownrecwire.h) - copied whole into the reset world, kept in the old */
         if (ResetPrefixDigits(l, "mirror-")) return kResetMove;               /* old-world copies of records a host game made */
         if (ResetIsKeptMirror(l)) return kResetMove;                         /* T-985 C1 fold 1: and a game's kept mirror-k<16 hex> folder */
         if (ResetPrefixDigits(l, kAsidePrefix)) return kResetUnfinished;      /* an earlier reset's delete that stopped part-way */
@@ -117,11 +118,12 @@ inline int ResetClassify(const std::string& name, int isDir)
     if (worldkeep::EndsWith(l, ".log") || worldkeep::EndsWith(b, ".log")) return kResetKeep;
     static const char* const keep[] = { "world.txt", "format.txt", "slots.txt", "profiles.txt", "aliases.txt", "owner.txt", "options.txt", "rules.txt",
                                         "mods.txt", "uid_seats.txt", "fallen.txt", "teams.txt", "own_high.txt", "world.gen", "server.lock",
-                                        "auth.txt", "admin-auth.txt", "access.txt", "lookalike_list.txt", worldkeep::kRefusedFile };   /* authproof::kAuthFile, adminauth::kAuthFile (T-1255 F), accessrule::kAccessFile, lalist::kListFile */
+                                        "auth.txt", "admin-auth.txt", "access.txt", "lookalike_list.txt", worldkeep::kRefusedFile, "owner-proven.txt" };   /* worldpw::kOwnerProvenFile (T-247 owner 1706 b), authproof::kAuthFile, adminauth::kAuthFile (T-1255 F), accessrule::kAccessFile, lalist::kListFile */
     static const char* const move[] = { "uniques.txt", "world_relations.txt", "town_losses.txt", "town_bars.txt", "owed_people.txt",
                                         "owed_done.txt", "owed_meta.txt", "research_boxes.txt", "research_takes.txt", "clock.txt", "areas.txt", "pendingpos.txt", "repair.txt",
                                         "queue.txt", "kept-pieces.txt", "kept-state.txt", "player-towns.txt", "kept-towns.txt",
-                                        "recorded_areas.txt", "area_holders.txt", "town_versions.txt", "camps.txt" };   /* town_versions.txt: the old world's town versions (store_main.cpp TownVersFile); camps.txt: the old world's camp list (T-929, campwire.h); T-1084 step 3: the area-recorded marks (store_main.cpp RecordedAreasFile) and the holder history (AreaHoldersFile) belong to the old world's records */
+                                        "recorded_areas.txt", "area_holders.txt", "town_versions.txt", "camps.txt", "world_creator.txt" };   /* town_versions.txt: the old world's town versions (store_main.cpp TownVersFile); camps.txt: the old world's camp list (T-929, campwire.h); world_creator.txt: the
+                                        old world's creator claim (T-1383, worldhist.h - a reset world has profiles, so it never has a creator); T-1084 step 3: the area-recorded marks (store_main.cpp RecordedAreasFile) and the holder history (AreaHoldersFile) belong to the old world's records */
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); ++i) if (b == keep[i]) return kResetKeep;
     for (size_t i = 0; i < sizeof(move) / sizeof(move[0]); ++i) if (b == move[i]) return kResetMove;
     if (b.size() > 13 && b.compare(0, 8, "deleted.") == 0 && worldkeep::EndsWith(b, ".bits")) return kResetMove;

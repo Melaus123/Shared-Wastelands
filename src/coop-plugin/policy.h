@@ -145,6 +145,14 @@ std::string PolicyBuildingFactionText(void* building);
 // PlayerInterface::isEnemy, the interaction menu the engine builds on it (the list made and the list shown) and the right-click
 // handler as a hover; one [TEAM] orders line. MAIN THREAD. Returns the status.
 std::string PolicyTeamOrders(int slot);
+// T-1406 TEST-ONLY lever `team invitemenu <slot>|npc [click]` (npc = slot -1: the nearest loaded NPC): the engine's interaction menu
+// built on that player's first loaded character here, whether it shows 'Invite to faction' and its word; `click` takes the menu's own click road with the entry's number (the click
+// hook sends the PLAYERS tab's invitation and closes the menu). One [INVITE] TEST-ONLY line. MAIN THREAD. Returns the status.
+std::string PolicyInviteMenuTest(int slot, bool click);
+// T-1167 piece 1 TEST-ONLY lever `tradetest order <targetUid> [actorUid] | status | press accept|cancel`: order 26 given through the
+// engine's own giveOrder so the trade pre-check decides as for a click; the TRADE window's state read back; its buttons fired as a
+// click. MAIN THREAD (the command channel). Returns the status.
+std::string PolicyTradeTest(const std::string& args);
 // T-805: `faction` (a building's owner) is the faction of a player who shares this game's player's team - the test the cursor hooks
 // make (false while this game's player is in no team). ANY THREAD.
 bool PolicyTeammateFaction(void* faction);

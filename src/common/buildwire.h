@@ -17,6 +17,9 @@
  *   the receiver owes it a whole roster (a PLACE + STATE for every own live piece)
  *
  * A PLACE's rotation must be a plausible quaternion: |q|^2 in [0.5, 2] (review-build1b note 4).
+ * T-1372 decision 1691 (game-to-game protocol 229): a PLACE may end in ONE more byte, kBuildGroundTag, after everything else (the
+ * nonce, the town tail): 'the placement input was measured the engine's way' (placeinput.h ConvertOldInput). Every PLACE this build
+ * writes carries it (groundMark 1); one without it (a record written by an earlier build) is converted where it is used.
  *
  * pos / rot are the exact floats the builder's createBuilding received. Every message carries the piece's WHOLE state.
  * Pure: no engine memory, no Windows; the offline suite hits the same bytes. C++03 (VS2010 v100).
@@ -71,6 +74,11 @@ const unsigned char kBuildHelpGone = 9;        /* help1 fold (review MED 3, prot
                                                   help1 fold 3 (protocol 95): key | u32 seq | u32 applied | u32 nonce | u8 n | n x f32 refused - the placement the
                                                   work was done on (the HELP_WORK's nonce) and that helper slot's CUMULATIVE refused amounts for it (the STATE tail's),
                                                   handed back less what was already handed back; sent only once the owner's record holding them has landed */
+const unsigned char kBuildHelpHeld = 21;       /* T-1408 fold 2 (protocol 234 - the fold's own number, unmerged): kind | key | u8 why - the game that keeps a helper's
+                                                  grouped-wall work HELD (the owner's game with its group not wholly loaded, or the copy's T-23 writer) tells the
+                                                  helpers: why kBuildHeldNotWhole / kBuildHeldWriter = held there (the helpers' builders stop that job),
+                                                  kBuildHeldReleased = no longer held (applied, or the held work dropped). 19 / 20 are powerwire.h's */
+const unsigned char kBuildHeldReleased = 0, kBuildHeldNotWhole = 1, kBuildHeldWriter = 2;
 const unsigned int  kBuildMaxHelpers = 8;      /* help1: helper slots a STATE's confirmation tail carries */
 const unsigned char kBuildHelpTailLive = 0x80;  /* help1 fold 3 (protocol 95): set on a STATE tail's row count - each row carries u32 live after seq */
 const unsigned char kBuildHelpTailWide = 0x40;  /* set on a STATE tail's row count: each row's helper slot is two bytes (little-endian, 0..1023);
@@ -80,6 +88,10 @@ const unsigned char kBuildReasonDismantled = 1;   /* build1-d REMOVE reasons */
 const unsigned char kBuildReasonDestroyed = 2;
 const unsigned char kBuildStateDestroyedBit = 2;   /* P15 (protocol 98): a STATE's complete byte, bit 1 = destroyed */
 const unsigned char kBuildStateBrokenBit = 4;      /* a STATE's complete byte, bit 2 = broken (+0x3B6) */
+const unsigned char kBuildStateStampBit = 8;       /* a STATE's complete byte, bit 3 = a u32 wall group step stamp (not 0) follows the materials */
+const unsigned char kBuildStateGroupBit = 16;      /* T-1408 fold 13 (protocol 235): bit 4 = the wall's GROUP FACT follows the stamp - u8 n + the
+                                                     group lead's key (n 1..kBuildMaxKey), u16 the wall's join index (0 = the wall is the lead) */
+const unsigned short kBuildGroupIdxMax = 1024;    /* T-1408 fold 13: the highest join index a STATE may carry */
 const unsigned char kBuildHostPlain = 0;        /* build1-e: furnitureOf = *(host+0x1F0)+0x30 (the host's interior layout) */
 const unsigned char kBuildHostSub = 1;          /* build1-e: that layout's vt+0x40 (the commit's other branch, 4d6810:176) */
 const unsigned char kBuildHostIndoorsOnly = 2;  /* build1-e: no furnitureOf, isIndoorsOf = host only */
@@ -138,15 +150,20 @@ struct BuildMsg
                                        townPos = that town's centre (x, z) as the world server's outpost list gives it - the owner's game makes the piece
                                        in its own town standing there, at any distance from the piece (a grouped placement's far piece). 0 = none */
     float townPos[2];
+    unsigned char groundMark;       /* T-1372 decision 1691 (protocol 229) PLACE: 1 = the input was measured the engine's way (this build's), the kBuildGroundTag byte; 0 = an older record (converted where used) */
     float hitCut, hitBlunt;         /* HIT: the damage struct's +0 / +4 the hit carried (seq = the asker's number, reason = the verdict) */
     float hitDrop, hitAfter;        /* HIT result: the raw progress the hit (owed: the hits) took, >= 0; the owner's health the writer expects after it, in units of needed */
     unsigned char hitOwed;          /* HIT result: 1 = owed - the writer sends it again to the owner's game only */
     int hitDoor;                    /* HIT ask / answer: the door's index in its piece's door list, -1 = the piece itself */
     unsigned char hitRepair;        /* HIT ask naming a door: 1 = a repair's gained health (hitCut) to add, not a hit */
     std::vector<BuildHelpAck> helpAcks;   /* help1 STATE: the confirmation tail (empty = not written); fold 3: each row landed seq + live */
+    unsigned int groupStamp;        /* STATE: a wall group's step stamp (kBuildStateStampBit; 0 = none - not a wall, or an older build's record) */
+    std::string groupLead;          /* T-1408 fold 13 STATE: the owner's group fact - the key of the wall's group lead (the wall's own key when it leads
+                                       or stands alone); empty = no fact (not a wall, or a record written before fold 13) - kBuildStateGroupBit */
+    unsigned short groupIdx;        /* ... and the wall's join index in the lead's member order (0 = the lead; 1.. = the members, in the owner's order) */
     float mats[kBuildMaxMats];
     BuildMsg() : kind(0), complete(0), destroyed(0), broken(0), progress(0.0f), needed(0.0f), nMats(0), reason(0), hostForm(0), floor(0), outside(0), ownerSlot(0xFFFF),
-                 nonce(0), seq(0), reset(0), applied(0), rmFlags(0), townHand(0), hitCut(0.0f), hitBlunt(0.0f), hitDrop(0.0f), hitAfter(0.0f), hitOwed(0), hitDoor(-1), hitRepair(0)
+                 nonce(0), seq(0), reset(0), applied(0), rmFlags(0), townHand(0), groundMark(0), hitCut(0.0f), hitBlunt(0.0f), hitDrop(0.0f), hitAfter(0.0f), hitOwed(0), hitDoor(-1), hitRepair(0), groupStamp(0), groupIdx(0)
     {
         townPos[0] = townPos[1] = 0.0f;
         for (int i = 0; i < 3; ++i) pos[i] = 0.0f;
@@ -158,6 +175,7 @@ struct BuildMsg
 const unsigned short kBuildOwnerSender = 0xFFFF;   /* a PLACE's ownerSlot meaning "the sender's own piece" */
 const size_t kBuildTownTail = 9;                  /* T-923 (protocol 167): a PLACE's town tail - the tag byte, then the town centre's x and z */
 const unsigned char kBuildTownTag = 1;
+const unsigned char kBuildGroundTag = 0x47;   /* T-1372 decision 1691 (protocol 229): a PLACE's last byte - its input was measured from the engine's ground (0x9B2850) */
 const unsigned short kBuildOwnerSlotMax = 1023;   /* the notebook's slots 0..1023 (slotwire.h kSlotMax) */
 const unsigned char kBuildOwnerSenderOneByte = 0xFF;   /* the sender, in a PLACE whose owner number is one byte (pp.build rows and owed-file rows saved by builds that wrote one byte) */
 
@@ -202,6 +220,7 @@ inline bool BuildEncodable(const BuildMsg& m)
     }
     if (m.kind == kBuildRosterRequest) return m.key.empty() && m.sid.empty() && m.hostKey.empty();   /* build1-f: no body */
     if (m.kind == kBuildHandAck) return !m.key.empty() && m.key.size() <= kBuildMaxKey;   /* house1b: the key only */
+    if (m.kind == kBuildHelpHeld) return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.reason <= kBuildHeldWriter;   /* T-1408 fold 2: key + why */
     if (m.kind == kBuildHit && m.reason == kBuildHitResult)   /* key | seq (> 0) | drop (finite, >= 0), needed (finite, >= 0) | destroyed 0/1, owed 0/1 | after (finite) */
         return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.seq != 0 && BuildFloatOk(m.hitDrop) && m.hitDrop >= 0.0f && BuildFloatOk(m.needed) && m.needed >= 0.0f
             && m.destroyed <= 1 && m.hitOwed <= 1 && BuildFloatOk(m.hitAfter) && m.hitDoor == -1 && m.hitRepair == 0;
@@ -220,6 +239,7 @@ inline bool BuildEncodable(const BuildMsg& m)
         if (m.key.empty() || m.key.size() > kBuildMaxKey || m.complete > 1 || m.destroyed > 1 || m.broken > 1 || m.nMats > kBuildMaxMats) return false;
         for (unsigned int i = 0; i < m.nMats; ++i) if (!BuildFloatOk(m.mats[i])) return false;
         if (!BuildHelpAcksOk(m.helpAcks)) return false;   /* help1 */
+        if (m.groupLead.size() > kBuildMaxKey || m.groupIdx > kBuildGroupIdxMax || (m.groupLead.empty() && m.groupIdx != 0)) return false;   /* T-1408 fold 13 */
         return BuildFloatOk(m.progress) && BuildFloatOk(m.needed);
     }
     if (m.kind != kBuildPlace || m.key.empty() || m.sid.empty() || m.key.size() > kBuildMaxKey
@@ -229,6 +249,7 @@ inline bool BuildEncodable(const BuildMsg& m)
         || m.floor < -kBuildMaxFloor || m.floor > kBuildMaxFloor)   /* build1-e */
         return false;
     if (m.ownerSlot != kBuildOwnerSender && m.ownerSlot > kBuildOwnerSlotMax) return false;
+    if (m.groundMark > 1) return false;   /* T-1372 */
     if (m.townHand > 1 || (m.townHand == 1 && (m.ownerSlot == kBuildOwnerSender || !m.hostKey.empty()
                                                || !BuildFloatOk(m.townPos[0]) || !BuildFloatOk(m.townPos[1]))))
         return false;   /* T-923: a town hand-over names an owner and is an outdoor piece */
@@ -305,6 +326,15 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         else { *h++ = (char)(signed char)m.hitDoor; *h++ = (char)m.hitRepair; }   /* the door and the repair word */
         return true;
     }
+    if (m.kind == kBuildHelpHeld)   /* T-1408 fold 2: kind + key + why */
+    {
+        b->resize(at + 1 + 1 + m.key.size() + 1);
+        char* q = &(*b)[at];
+        *q++ = (char)m.kind;
+        BuildPutS(&q, m.key);
+        *q++ = (char)m.reason;
+        return true;
+    }
     if (m.kind == kBuildDismantleAsk)   /* T-805: kind + key + verdict */
     {
         b->resize(at + 1 + 1 + m.key.size() + 1);
@@ -338,15 +368,22 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
             tail = 1;
             for (size_t j = 0; j < m.helpAcks.size(); ++j) tail += 2 + 4 + 4 + 1 + 4 * (size_t)m.helpAcks[j].nEx;
         }
-        b->resize(at + 1 + 1 + m.key.size() + 4 + 4 + 1 + 1 + 4 * (size_t)m.nMats + tail);
+        b->resize(at + 1 + 1 + m.key.size() + 4 + 4 + 1 + 1 + 4 * (size_t)m.nMats + (m.groupStamp != 0 ? 4 : 0) + (m.groupLead.empty() ? 0 : 1 + m.groupLead.size() + 2) + tail);
         char* q = &(*b)[at];
         *q++ = (char)m.kind;
         BuildPutS(&q, m.key);
         BuildPutF(&q, m.progress);
         BuildPutF(&q, m.needed);
-        *q++ = (char)(m.complete | (m.destroyed != 0 ? kBuildStateDestroyedBit : 0) | (m.broken != 0 ? kBuildStateBrokenBit : 0));   /* bit 1 destroyed, bit 2 broken */
+        *q++ = (char)(m.complete | (m.destroyed != 0 ? kBuildStateDestroyedBit : 0) | (m.broken != 0 ? kBuildStateBrokenBit : 0) | (m.groupStamp != 0 ? kBuildStateStampBit : 0) | (!m.groupLead.empty() ? kBuildStateGroupBit : 0));   /* bit 1 destroyed, bit 2 broken, bit 3 stamp, bit 4 group fact */
         *q++ = (char)m.nMats;
         for (unsigned int i = 0; i < m.nMats; ++i) BuildPutF(&q, m.mats[i]);
+        if (m.groupStamp != 0) { std::memcpy(q, &m.groupStamp, 4); q += 4; }   /* the wall group's step stamp */
+        if (!m.groupLead.empty())   /* T-1408 fold 13: the owner's group fact - the lead's key and the join index */
+        {
+            BuildPutS(&q, m.groupLead);
+            *q++ = (char)(m.groupIdx & 0xFF);
+            *q++ = (char)((m.groupIdx >> 8) & 0xFF);
+        }
         if (tail != 0)
         {
             *q++ = (char)(m.helpAcks.size() | kBuildHelpTailLive | kBuildHelpTailWide);   /* the rows carry live and a two-byte slot */
@@ -364,7 +401,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         }
         return true;
     }
-    b->resize(at + 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 2 + (m.nonce != 0 ? 4 : 0) + (m.townHand != 0 ? kBuildTownTail : 0));   /* + the two owner-number bytes; + the nonce; + T-923's town tail */
+    b->resize(at + 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 2 + (m.nonce != 0 ? 4 : 0) + (m.townHand != 0 ? kBuildTownTail : 0) + (m.groundMark != 0 ? 1 : 0));   /* + the two owner-number bytes; + the nonce; + T-923's town tail; + T-1372's ground mark */
     char* p = &(*b)[at];
     *p++ = (char)m.kind;
     BuildPutS(&p, m.key);
@@ -381,6 +418,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
     *p++ = (char)(m.ownerSlot & 0xFF); *p++ = (char)((m.ownerSlot >> 8) & 0xFF);   /* the owner number, little-endian */
     if (m.nonce != 0) { std::memcpy(p, &m.nonce, 4); p += 4; }   /* house2 fold (protocol 76) */
     if (m.townHand != 0) { *p++ = (char)kBuildTownTag; BuildPutF(&p, m.townPos[0]); BuildPutF(&p, m.townPos[1]); }   /* T-923 (protocol 167) */
+    if (m.groundMark != 0) *p++ = (char)kBuildGroundTag;   /* T-1372 decision 1691 (protocol 229): the last byte */
     return true;
 }
 
@@ -418,7 +456,7 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
     BuildMsg m;
     m.kind = (unsigned char)p[0];
     if (m.kind != kBuildPlace && m.kind != kBuildState && m.kind != kBuildRemove && m.kind != kBuildRosterRequest && m.kind != kBuildHandAck
-        && m.kind != kBuildHelpWork && m.kind != kBuildHelpGone && m.kind != kBuildDismantleAsk && m.kind != kBuildHit) return kBuildDecodeBadKind;
+        && m.kind != kBuildHelpWork && m.kind != kBuildHelpGone && m.kind != kBuildDismantleAsk && m.kind != kBuildHit && m.kind != kBuildHelpHeld) return kBuildDecodeBadKind;
     if (m.kind == kBuildRosterRequest)   /* build1-f: exactly the kind byte */
     {
         if (size != 1) return kBuildDecodeBadValue;
@@ -499,6 +537,15 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
         if (out) *out = m;
         return kBuildDecodeOk;
     }
+    if (m.kind == kBuildHelpHeld)   /* T-1408 fold 2: exactly kind + key + why (0..2) */
+    {
+        if (m.key.empty()) return kBuildDecodeBadKey;
+        if (size - off < 1) return kBuildDecodeTooShort;
+        m.reason = (unsigned char)p[off]; off += 1;
+        if (off != size || m.reason > kBuildHeldWriter) return kBuildDecodeBadValue;
+        if (out) *out = m;
+        return kBuildDecodeOk;
+    }
     if (m.kind == kBuildDismantleAsk)   /* T-805: exactly kind + key + verdict (0..7) */
     {
         if (m.key.empty()) return kBuildDecodeBadKey;
@@ -525,7 +572,7 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
         std::memcpy(&m.progress, p + off, 4); off += 4;
         std::memcpy(&m.needed, p + off, 4); off += 4;
         const unsigned int cb = (unsigned char)p[off]; off += 1;   /* bit 0 complete, bit 1 destroyed, bit 2 broken; any other bit is refused */
-        if ((cb & ~(1u | (unsigned int)kBuildStateDestroyedBit | (unsigned int)kBuildStateBrokenBit)) != 0) return kBuildDecodeBadValue;
+        if ((cb & ~(1u | (unsigned int)kBuildStateDestroyedBit | (unsigned int)kBuildStateBrokenBit | (unsigned int)kBuildStateStampBit | (unsigned int)kBuildStateGroupBit)) != 0) return kBuildDecodeBadValue;
         m.complete = (unsigned char)(cb & 1u);
         m.destroyed = (unsigned char)((cb & kBuildStateDestroyedBit) != 0 ? 1 : 0);
         m.broken = (unsigned char)((cb & kBuildStateBrokenBit) != 0 ? 1 : 0);
@@ -534,6 +581,21 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
         if (size - off < (size_t)(4 * n)) return kBuildDecodeTooShort;
         m.nMats = (unsigned char)n;
         for (unsigned int i = 0; i < n; ++i) { std::memcpy(&m.mats[i], p + off, 4); off += 4; }
+        if ((cb & kBuildStateStampBit) != 0)   /* the wall group's step stamp: written only when not 0 */
+        {
+            if (size - off < 4) return kBuildDecodeTooShort;
+            std::memcpy(&m.groupStamp, p + off, 4); off += 4;
+            if (m.groupStamp == 0) return kBuildDecodeBadValue;
+        }
+        if ((cb & kBuildStateGroupBit) != 0)   /* T-1408 fold 13: the owner's group fact - a lead key (never empty) and a join index */
+        {
+            const int gr = BuildGetS(p, size, &off, kBuildMaxKey, &m.groupLead);
+            if (gr != kBuildDecodeOk) return gr;
+            if (m.groupLead.empty()) return kBuildDecodeBadValue;
+            if (size - off < 2) return kBuildDecodeTooShort;
+            m.groupIdx = (unsigned short)((unsigned char)p[off] | ((unsigned int)(unsigned char)p[off + 1] << 8)); off += 2;
+            if (m.groupIdx > kBuildGroupIdxMax) return kBuildDecodeBadValue;
+        }
         if (size - off > 0)   /* help1 (protocol 90): the confirmation tail - written only when it has a row, then nothing follows it */
         {
             const unsigned int h0 = (unsigned char)p[off]; off += 1;
@@ -592,7 +654,17 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
         m.ownerSlot = (o == kBuildOwnerSenderOneByte) ? kBuildOwnerSender : (unsigned short)o;
     }
     /* the tail, told apart by its length: none (0), the per-placement nonce (4; absent = 0), T-923's town tail (kBuildTownTail, protocol 167),
-       or both, the nonce first; nothing else follows */
+       or both, the nonce first; then (T-1372, protocol 229) the one ground-mark byte when present - the lengths with it (1, 5, 10, 14) are
+       none of the lengths without it, so the byte is told apart by the length too */
+    {
+        const size_t t0 = size - off;
+        if (t0 == 1 || t0 == 5 || t0 == kBuildTownTail + 1 || t0 == 4 + kBuildTownTail + 1)
+        {
+            if ((unsigned char)p[size - 1] != kBuildGroundTag) return kBuildDecodeBadValue;
+            m.groundMark = 1;
+            size -= 1;   /* the rest of the tail ends before the mark */
+        }
+    }
     const size_t tail = size - off;
     if (tail != 0 && tail != 4 && tail != kBuildTownTail && tail != 4 + kBuildTownTail)
         return tail < 4 ? kBuildDecodeTooShort : kBuildDecodeBadValue;
@@ -630,6 +702,54 @@ inline int DecodeBuildSaved(const char* p, size_t size, BuildMsg* out)
     if (r == kBuildDecodeOk || p == 0 || size < 1 || (unsigned char)p[0] != kBuildPlace) return r;
     return DecodeBuildLayout(p, size, out, 1) == kBuildDecodeOk ? kBuildDecodeOk : r;
 }
+
+/* T-1372 decision 1690 (TEST-ONLY lever `bldparts`): IS A BUILDING INTACT? What the lever read off the building (F1038, Read 1.0.65:
+   scene node +0x200, shown +0x19D, model holder +0x228 parts / entities, doors +0x1C0, interior +0x1F0 and its mask model +0x08,
+   material +0x248, the input height +0x278) against what its record says it is made of (the 'parts' list walked deep as 0x55FD60
+   walks it plus the 'interior' entries, each counted only when its 'phs or mesh' name holds ".mesh" - 0x55EC50's own test; the 'doors'
+   list). -1 = not read. F1046 fold (2026-11-16): parts = the holder's first two lists (+0x08 and +0x20 counts); innerWant = the parts
+   the 'interior' entries make - 0x55FF50 makes them with flag 2, which never makes a model (55ff50:395-397, 55ec50:428), so a model
+   is expected only on partsWant - innerWant; mask is reported, never judged (0x561280 makes it only while the interior is shown). */
+struct BuildPartsRead
+{
+    int node, shown, complete, destroyed;
+    int parts, partsWant, entities, visible, doors, doorsWant;
+    int interior, interiorWant, mask, material, lights;
+    int innerWant;             /* F1046 fold: parts of the 'interior' entries (no model by design); -1 unread */
+    int heightRead;            /* 1 = offset and above were read (a free-standing piece) */
+    float offset, above;       /* +0x278, and live y less the engine's ground (0x9B2850) */
+    BuildPartsRead() : node(-1), shown(-1), complete(-1), destroyed(-1), parts(-1), partsWant(-1), entities(-1), visible(-1), doors(-1), doorsWant(-1),
+                       interior(-1), interiorWant(-1), mask(-1), material(-1), lights(-1), innerWant(-1), heightRead(0), offset(0.0f), above(0.0f) {}
+};
+const float kBuildPartsHeightTol = 0.05f;
+/* "INTACT", or "MISSING " + every missing thing (space-separated, in this order): node, shown, parts, entities, visible, doors, interior,
+   material, height, unread. A ruin's or an unfinished piece's state is reported, never missing. entities: at least one model per part
+   the record makes outside the interior (partsWant - innerWant). */
+inline std::string BuildPartsVerdict(const BuildPartsRead& r)
+{
+    std::string w;
+    if (r.node != 1) w += " node";
+    if (r.shown != 1) w += " shown";
+    if (r.parts < 0 || r.partsWant < 0 || r.parts < r.partsWant) w += " parts";
+    if (r.entities < 0 || r.partsWant < 0 || r.innerWant < 0 || r.innerWant > r.partsWant || r.entities < r.partsWant - r.innerWant) w += " entities";
+    if (r.shown == 1 && (r.visible < 0 || r.entities < 0 || r.visible < r.entities)) w += " visible";
+    if (r.doors < 0 || r.doorsWant < 0 || r.doors < r.doorsWant) w += " doors";
+    if (r.interiorWant != 0 && r.interior != 1) w += " interior";
+    if (r.material != 1) w += " material";
+    if (r.heightRead == 1)
+    {
+        const float d = r.above - r.offset;
+        if (!(d <= kBuildPartsHeightTol && d >= -kBuildPartsHeightTol)) w += " height";
+    }
+    if (r.complete < 0 || r.destroyed < 0) w += " unread";
+    return w.empty() ? std::string("INTACT") : std::string("MISSING") + w;
+}
+/* T-1372 (F1057; Read 1.0.68 and 1.0.65): where a part's model pointer sits in each of the model holder's two part lists (+0x10 and
+   +0x28 items). A first-list part keeps it at +0x08. The second list holds the parts with a collision shape (filed at 1.0.68 0x1405604BA):
+   the 0x70-byte one is made by 1.0.68 0x1404CDE30 (1.0.65 0x1404CD3A0) - +0x08 its physics setup, +0x20 the model; the rarer 0xB0-byte
+   one (1.0.68 0x1404CE0C0, 1.0.65 0x1404CD630, through 0x14004FCB4) runs that same maker first with the same model argument, so its
+   model is at +0x20 as well. The same offsets on both game versions. -1 = no such list. */
+inline int BuildPartModelOffset(int list) { return list == 0 ? 0x08 : (list == 1 ? 0x20 : -1); }
 
 /* house2: the order gate (0x7F9280) and the Shift-job gate (0x7F4EF0) share one rule - on a piece this game handed to another
    player's house owner a build, add-materials, repair or dismantle task is refused; every other task (use, per base access) passes */
@@ -733,6 +853,321 @@ inline int BuildWallCopyAction(int ownState, int complete, float p, float n, flo
     if (!(v <= cap)) v = cap;
     *progress = v;
     return kBuildWallProgress;
+}
+/* T-1408 (owner ruling: the shared record is the truth, the save is not the primary source; one source per fact). A wall group's progress
+   is ONE fact with ONE clock, a Lamport stamp: every write of it - the owner's wall step, applied help, finish and dismantle step
+   (BdWallGroupsMark), the helper's writes on any copy (BdWriterGroupNote, own-record copies included), a holder's write (PcrWriteOne) and
+   the owner's apply of a newer record (BdOwnGroupLanded) - carries a GROUP STEP STAMP, the highest stamp this game knows + 1
+   (BuildGroupStampNext), and puts the same value and stamp into every record of the group it can write in that step. A STATE carries
+   it after its materials (kBuildStateStampBit); 0 = an older build's record. Piece generations count per piece, so only the stamp tells
+   a newer group value from an older one.
+   BuildWallRecShare: a record's share of its needed (a finished record 1); 0 = not usable (needed not a number above 0). */
+inline int BuildWallRecShare(float p, float n, int complete, float* share)
+{
+    *share = 0.0f;
+    if (!(n > 0.0f && n < 3.0e38f)) return 0;
+    if (complete != 0) { *share = 1.0f; return 1; }
+    const float s = p / n;
+    *share = (s > 0.0f) ? (s < 1.0f ? s : 1.0f) : 0.0f;   /* a negative or NaN progress reads 0 */
+    return 1;
+}
+inline unsigned int BuildGroupStampNext(unsigned int known) { return known < 0xFFFFFFFFu ? known + 1u : known; }
+/* T-1408 fold 7 (F1283), a Lamport clock: only NEW LOCAL WORK steps a group's stamp (BuildGroupStepWhat); applying a received or loaded
+   record ADOPTS its stamp (the clock's max) and never steps. Two values of one group are ordered by stamp, then - an equal stamp from two
+   games' concurrent steps (or a helper's own-record copies sharing one step, BuildWriterSameOwnerStep) - by the value itself: the higher
+   share wins (the tie key travels inside every record with its stamp, so every game ranks the same pair the same way and an adopted value
+   keeps its key; Cassandra's last-write-wins breaks an equal timestamp by the greater value the same way). Shares within
+   kBuildGroupShareSame are one value; an unusable share (negative or NaN) ranks below a usable one. STAMP 0 (records of builds before
+   fold 6): below every stamped value; among themselves (the live value unstamped too) the older builds' rule decides - the highest share
+   among the unstamped records (BuildWallLegacyShare), kBuildRankLegacy. */
+const float kBuildGroupShareSame = 0.0005f;
+const int kBuildRankOlder = -1, kBuildRankSame = 0, kBuildRankNewer = 1, kBuildRankLegacy = 2;
+inline int BuildGroupRank(unsigned int rec, float recShare, unsigned int live, float liveShare)
+{
+    if (rec == 0 && live == 0) return kBuildRankLegacy;
+    if (rec != live) return rec > live ? kBuildRankNewer : kBuildRankOlder;
+    const int ru = (recShare >= 0.0f) ? 1 : 0, lu = (liveShare >= 0.0f) ? 1 : 0;   /* NaN fails */
+    if (ru == 0 || lu == 0) return ru > lu ? kBuildRankNewer : (ru < lu ? kBuildRankOlder : kBuildRankSame);
+    const float d = recShare - liveShare;
+    if (d > kBuildGroupShareSame) return kBuildRankNewer;
+    if (d < -kBuildGroupShareSame) return kBuildRankOlder;
+    return kBuildRankSame;
+}
+/* a record still queued here can still win over the group's live value (its stamp not below the live one; an unstamped record only while
+   the live value is unstamped too): the group's own rows and records are held, and the owner's own steps owed, until it is applied or
+   dropped (PieceOwnRowHold, BuildGroupStepWhat) */
+inline int BuildGroupStampMayWin(unsigned int rec, unsigned int live) { return rec >= live ? 1 : 0; }
+/* T-1408 fold 8 (F1291): the owner's load decides a wall GROUP once, from all its records at hand - one queue turn for the group whatever
+   its size (BdOwnGroupTurn): every queued record of the group is taken out together and applied in this order, the WINNER first (the
+   highest rank, BuildGroupRank: the stamp, then the share as the tie key), the rest after it, so each later one ranks older or the same
+   against the value the winner left (caught up, never written back). Equal ranks keep their queue (key) order; records of the older
+   builds (stamp 0) among themselves keep it too (their value is the highest unstamped share whichever applies first). order: n indices.
+   Returns the winner's index (-1 = none) */
+inline int BuildGroupApplyOrder(const unsigned int* stamps, const float* shares, int n, int* order)
+{
+    int m = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        int at = m;
+        for (int j = 0; j < m; ++j)
+            if (BuildGroupRank(stamps[i], shares[i], stamps[order[j]], shares[order[j]]) == kBuildRankNewer) { at = j; break; }
+        for (int j = m; j > at; --j) order[j] = order[j - 1];
+        order[at] = i;
+        ++m;
+    }
+    return n > 0 ? order[0] : -1;
+}
+/* T-1408 fold 9 (F1296): a wall group's member areas taken together (every member's area, not only the first wall's): loaded[i] - member
+   i's area is loaded here; applied[i] - that area's record list is complete on this link. *allLoaded = every member's area is loaded
+   (no member = 0); *allApplied = every LOADED member's area has its record list complete */
+inline void BuildGroupAreasFold(const int* loaded, const int* applied, int n, int* allLoaded, int* allApplied)
+{
+    int al = (n > 0) ? 1 : 0, aa = 1;
+    for (int i = 0; i < n; ++i)
+    {
+        if (loaded[i] == 0) al = 0;
+        else if (applied[i] == 0) aa = 0;
+    }
+    *allLoaded = al; *allApplied = aa;
+}
+/* T-1408 fold 8: an OWED owner step (new work while a record of the group could still win, BuildGroupStepWhat) is decided WITH the group:
+   recordWaits - a record of the group is still queued and may win: kept owed (its apply drops it - the work was written over); fold 9
+   (F1296): a member's area not loaded (allLoaded 0, BuildGroupAreasFold) - kept owed WHATEVER the world-server link's state: an
+   area-unload drop of the queued records is no decision, the records come back at the area's next load and decide it then (running it
+   at the drop would stamp the owner's older value over them); the world's leaving ends it; linked (a world server's link with this
+   game's slot) and a loaded member area's record list not complete on this link (allApplied 0) - kept owed; otherwise no record won -
+   it runs (a group step). 1 = run */
+inline int BuildGroupOwedRuns(int recordWaits, int linked, int allLoaded, int allApplied)
+{
+    if (recordWaits != 0) return 0;
+    if (allLoaded == 0) return 0;
+    if (linked != 0 && allApplied == 0) return 0;
+    return 1;
+}
+/* T-1408 fold 8 / 9: help on this player's own GROUPED wall waits behind the group's decision (nothing applied, nothing confirmed; tried
+   at the next safe point - the STATE drain decides the group after the help drain), then applies on top and steps the group - never
+   confirmed and then written over by a record: while a record of the group is still queued here and may win (recordWaits), and fold 9
+   (F1296), as the own-row hold (piecerec::PieceOwnRowHold): while linked and a loaded member area's record list is still loading
+   (allApplied 0, BuildGroupAreasFold) - a record still to come may win. 1 = waits */
+inline int BuildWallHelpWaitsForRecords(int groupedOwnWall, int recordWaits, int linked, int allApplied)
+{
+    if (groupedOwnWall == 0) return 0;
+    if (recordWaits != 0) return 1;
+    return (linked != 0 && allApplied == 0) ? 1 : 0;
+}
+/* T-1408 fold 9 (F1296), THE STATE DRAIN (BuildCopyDrain): what one queue place does - due: its retry gap is over (nextTry <= the safe
+   point); ownRec: an own record's STATE; groupQueued: how many own records of its wall group are queued here (BdOwnGroupQueue, 0 = not
+   a wall group). Skip (not due), one group turn (BdOwnGroupTurn: two or more queued), or the record alone (BdApplyOne) */
+const int kBuildDrainSkip = 0, kBuildDrainOne = 1, kBuildDrainGroup = 2;
+inline int BuildStateDrainStep(int due, int ownRec, int groupQueued)
+{
+    if (due == 0) return kBuildDrainSkip;
+    return (ownRec != 0 && groupQueued >= 2) ? kBuildDrainGroup : kBuildDrainOne;
+}
+/* T-1408 fold 9 (F1296 NIT), ONE GROUP TURN (BdOwnGroupTurn): the queued records of the group in BuildGroupApplyOrder's order, each
+   applied only when its own retry gap is over (nextTry <= drainNo; a record kept by its own road - a deferred engine call, an unfinished
+   complete - waits its gap), and none while the WINNER waits its gap (winner first: a later one is never judged before it). order: n
+   indices (the full order); pick: the indices to apply now, in order. Returns how many */
+inline int BuildGroupTurnPick(const unsigned int* stamps, const float* shares, const unsigned int* nextTry, int n, unsigned int drainNo, int* order, int* pick)
+{
+    const int win = BuildGroupApplyOrder(stamps, shares, n, order);
+    if (win < 0 || nextTry[win] > drainNo) return 0;
+    int k = 0;
+    for (int i = 0; i < n; ++i)
+        if (nextTry[order[i]] <= drainNo) pick[k++] = order[i];
+    return k;
+}
+/* T-1408 fold 9 (F1296), THE OWNER'S GAME: a winning FINISHED own grouped record whose wall the engine's complete-now call left
+   unfinished (the copy reads complete=0 after it) is tried again kRetryGap apart until maxTries tries have failed (tries: this one
+   counted), then ENDED: the record leaves the queue, its row and record are caught down to the wall's real progress (BdOwnGroupCatchUp)
+   and that is logged once - it never holds the wall's help (BuildWallHelpWaitsForRecords) or its group for ever. ownGroupRec: an own
+   grouped wall's record on the finish road (any other STATE keeps the older bounded-then-slow retry). 1 = end it now */
+inline int BuildWallFinishEnds(int ownGroupRec, int tries, int maxTries)
+{
+    return (ownGroupRec != 0 && tries >= maxTries) ? 1 : 0;
+}
+/* T-1408 fold 8: a write that LOWERS a wall (a hit, a dismantle step, a ruin): the share below the last one by more than
+   kBuildGroupShareSame (raw progress / needed - a finished wall's health counts), complete 1 -> 0, or whole -> ruin. Such work always
+   takes its OWN new stamp, never one shared with the helper's untouched own-record copies (it would tie with them and the higher share
+   would win, BuildWriterSameOwnerStep). An unusable needed on either side is no lowering. 1 = lowers */
+inline int BuildWallWriteLowers(float p0, float n0, int c0, int x0, float p, float n, int c, int x)
+{
+    if (x0 == 0 && x != 0) return 1;
+    if (c0 != 0 && c == 0) return 1;
+    if (!(n0 > 0.0f && n0 < 3.0e38f) || !(n > 0.0f && n < 3.0e38f)) return 0;
+    float s0 = p0 / n0, s1 = p / n;
+    if (!(s0 > 0.0f)) s0 = 0.0f;
+    if (s0 > 1.0f) s0 = 1.0f;
+    if (!(s1 > 0.0f)) s1 = 0.0f;
+    if (s1 > 1.0f) s1 = 1.0f;
+    return (s1 < s0 - kBuildGroupShareSame) ? 1 : 0;
+}
+/* T-1408 fold 9 (F1296): a LOWERING write (a hit) on one of the helper's own-record copies is the GROUP's (the engine's rule: a hit lowers
+   the group's one record): every other own-record copy of that owner step the helper holds (BuildWriterSameOwnerStep) is lowered BY THE
+   HIT'S SIZE - fold 10 (F1304 SHOULD 1): the share the hit took (dropShare, 0..1), not down to the hit copy's whole share (a sibling built
+   to 0.8 while the hit copy went 0.5 -> 0.45 is 0.75, the engine's one-record value; fold 9 pulled it to 0.45 and lost the build) -
+   written into its own engine record as its share less dropShare of ITS needed, never below 0, so a later build on a sibling carries the
+   lowered value. Nothing is raised. The lowered copy and its siblings then take ONE step stamp together (fold 7's rule). sibP / sibN: the
+   sibling's progress / needed. 1 = lower the sibling to *to */
+inline int BuildWallSiblingLowerBy(float sibP, float sibN, float dropShare, float* to)
+{
+    *to = sibP;
+    if (!(sibN > 0.0f && sibN < 3.0e38f) || !(dropShare > kBuildGroupShareSame && dropShare <= 1.0f)) return 0;
+    float s = sibP / sibN;
+    if (!(s > 0.0f)) return 0;   /* already at 0 (or unreadable): nothing to lower */
+    if (s > 1.0f) s = 1.0f;
+    float t = s - dropShare;
+    if (t < 0.0f) t = 0.0f;
+    *to = t * sibN;
+    return 1;
+}
+/* T-1408 fold 10 (F1304 SHOULD 1): the share a lowering write took off a copy - its share before less its share after (0 when not a
+   number, a raise or an unusable needed) */
+inline float BuildWallDropShare(float p0, float n0, float p1, float n1)
+{
+    if (!(n0 > 0.0f && n0 < 3.0e38f) || !(n1 > 0.0f && n1 < 3.0e38f)) return 0.0f;
+    float s0 = p0 / n0, s1 = p1 / n1;
+    if (!(s0 > 0.0f)) s0 = 0.0f;
+    if (s0 > 1.0f) s0 = 1.0f;
+    if (!(s1 > 0.0f)) s1 = 0.0f;
+    if (s1 > 1.0f) s1 = 1.0f;
+    const float d = s0 - s1;
+    return (d > 0.0f) ? d : 0.0f;
+}
+/* T-1408 fold 10 (F1331 1c): a piece's progress as it is KEPT - stored in its row, sent, or written to its record: within 0..needed (the
+   engine's hit lowers a wall's record with no floor: 60 blows read -1.71). Not a number = 0; a needed that is not a number above 0
+   floors at 0 only. *clamped = 1 when the value was changed */
+inline float BuildProgressKept(float p, float n, int* clamped)
+{
+    float v = p;
+    if (!(v > -3.0e38f && v < 3.0e38f)) v = 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (n > 0.0f && n < 3.0e38f && v > n) v = n;
+    if (clamped != 0) *clamped = (v != p) ? 1 : 0;
+    return v;
+}
+/* T-1408 fold 10 (F1331 3): a helper's work on a ruin its engine rebuilt during the step: the work past the rebuild - progress after the
+   step less the value the rebuild left (read at the rebuild's own setDestroyed(0), rebuildRead 1); the owner runs the same rebuild before
+   it applies this. Without a rebuild value: 0 (the old rule - nothing but the reset goes) */
+inline float BuildHelpRebuildExtra(float p1, int rebuildRead, float rebuildP)
+{
+    if (rebuildRead == 0 || !(rebuildP > -3.0e38f && rebuildP < 3.0e38f) || !(p1 > -3.0e38f && p1 < 3.0e38f)) return 0.0f;
+    const float d = p1 - rebuildP;
+    return (d > 0.0f) ? d : 0.0f;
+}
+/* T-1408 fold 10 (F1331 3): why the owner kept only the materials of a helper's work on a grouped wall - one reason, the first that holds */
+const int kBuildWallKeepNone = 0, kBuildWallKeepNoWork = 1, kBuildWallKeepRuin = 2, kBuildWallKeepWriter = 3, kBuildWallKeepNotWhole = 4, kBuildWallKeepNeedUnread = 5;
+inline int BuildWallKeepWhy(int wallKeep, float progress, int ruin, int copyWriter, int whole)
+{
+    if (wallKeep == 0) return kBuildWallKeepNone;
+    if (!(progress > 0.0f)) return kBuildWallKeepNoWork;
+    if (ruin != 0) return kBuildWallKeepRuin;
+    if (copyWriter != 0) return kBuildWallKeepWriter;
+    if (whole == 0) return kBuildWallKeepNotWhole;
+    return kBuildWallKeepNeedUnread;
+}
+/* what a change of an own wall's group does to its stamp (BdWallGroupsMark). adopt: a received or loaded record's value was applied - its
+   stamp is taken, no step; newWork: the engine's build step with an amount (not the mod's own amount-0 wall step, not the add-materials
+   amount-0 call), a dismantle step, a hit, help applied (BuildGroupNewWork); recordWaits: a record of the group queued here may still win
+   (BuildGroupStampMayWin) - the step is OWED until that record is applied (then the owed step is dropped: the work it carried was written
+   over by the newer record); fold 8: else decided with the group - it runs once no record of the group is queued and its area's
+   records were applied here (BuildGroupOwedRuns; an area-unload drop of the records keeps it owed) */
+const int kBuildGsNone = 0, kBuildGsStep = 1, kBuildGsOwe = 2, kBuildGsAdopt = 3;
+inline int BuildGroupStepWhat(int adopt, int newWork, int recordWaits)
+{
+    if (adopt != 0) return kBuildGsAdopt;
+    if (newWork == 0) return kBuildGsNone;
+    return recordWaits != 0 ? kBuildGsOwe : kBuildGsStep;
+}
+/* a progress event (BuildTick's kinds: 1 the engine's progress call, 2 a dismantle step, 4 a melee hit on an own wall) that is new work;
+   recApply: queued while the mod applied an own record's STATE (its complete-now path, amount-0 wall step, threshold crossing) - never */
+inline int BuildGroupNewWork(int kind, float amount, int recApply)
+{
+    if (recApply != 0) return 0;
+    return ((kind == 1 && amount != 0.0f) || kind == 2 || kind == 4) ? 1 : 0;
+}
+/* a helper's wall copies that hold their OWN engine records (made here during play): the owner's game grouped them, this game cannot see
+   the group. Two such copies of one owner whose owner's last STATEs carried the same group step stamp were written by ONE step of the
+   owner's (a game's steps are unique on it: each sets its clock to the stamp it gives; the helper writes only while the owner's game is
+   away, so no other game steps that owner's walls meanwhile) - one group: the helper's write steps them together with ONE stamp, each record
+   keeping its own value; at the owner's load the tie key picks the higher share for the group */
+inline int BuildWriterSameOwnerStep(int ownerA, unsigned int lastStampA, int ownerB, unsigned int lastStampB)
+{
+    return (ownerA >= 0 && ownerA == ownerB && lastStampA != 0 && lastStampA == lastStampB) ? 1 : 0;
+}
+/* the older builds' rule, only among the group's UNSTAMPED records: the highest usable share (a negative or NaN entry skipped).
+   *best = that share. Returns its index, -1 = none */
+inline int BuildWallLegacyShare(const float* shares, int n, float* best)
+{
+    int pick = -1;
+    *best = -1.0f;
+    for (int i = 0; i < n; ++i)
+    {
+        const float s = shares[i];
+        if (!(s >= 0.0f)) continue;
+        if (pick < 0 || s > shares[pick]) pick = i;
+    }
+    if (pick >= 0) *best = shares[pick];
+    return pick;
+}
+/* The owner's own grouped wall when one of its group's records is applied here (BdApplyOne, an own record's STATE): judged by its rank
+   (BuildGroupRank) against the group's live value - no waiting for the rest of the group; a member landing later takes the group's current
+   value (BdOwnGroupCatchUp). haveLead: the group's lead here is this player's wall (the value is written through it); rec / live: the
+   record's stamp and the group's live stamp; share: the record's share (a stamped record) or the BuildWallLegacyShare pick (an unstamped
+   one), negative = none; liveP / liveN: the lead's loaded progress / needed (the live share is the tie key's other side). The value is the
+   share of the lead's needed, below 0.999 of it (0x558680 completes at needed); within 0.0005 of needed of the loaded value nothing is
+   written (the stamp is taken). A newer FINISHED record is the finish road's (kBuildStampFinish, BuildWallCopyAction). *progress = the value */
+const int kBuildStampIgnored = 0, kBuildStampWrite = 1, kBuildStampSame = 2, kBuildStampNoLead = 3, kBuildStampNone = 4, kBuildStampFinish = 5;   /* fold 8: no wait verdict */
+inline float BuildGroupLiveShare(float liveP, float liveN)
+{
+    if (!(liveN > 0.0f && liveN < 3.0e38f) || !(liveP == liveP)) return -1.0f;   /* unusable (NaN fails) */
+    const float s = liveP / liveN;
+    return s > 0.0f ? (s < 1.0f ? s : 1.0f) : 0.0f;
+}
+inline int BuildWallStampApply(int haveLead, unsigned int rec, unsigned int live, float share, float liveP, float liveN, float* progress)
+{
+    *progress = 0.0f;
+    const int rank = BuildGroupRank(rec, share, live, BuildGroupLiveShare(liveP, liveN));
+    if (rank != kBuildRankNewer && rank != kBuildRankLegacy) return kBuildStampIgnored;
+    if (haveLead == 0) return kBuildStampNoLead;
+    if (!(share >= 0.0f) || !(liveN > 0.0f && liveN < 3.0e38f)) return kBuildStampNone;   /* NaN fails too */
+    float v = share * liveN;
+    const float cap = liveN * 0.999f;
+    if (!(v <= cap)) v = cap;
+    *progress = v;
+    float d = v - liveP;
+    if (d < 0.0f) d = -d;
+    if (d <= 0.0005f * liveN) return kBuildStampSame;   /* a NaN live value is written over */
+    return kBuildStampWrite;
+}
+/* T-1408 fold 7 / 8: the WHOLE decision BdApplyOne takes for one own grouped wall's record (the real road calls only this) against the
+   group's live value - never a wait (fold 8: the group's queued records come in BuildGroupApplyOrder's order in one turn, BdOwnGroupTurn;
+   a record arriving after the group was decided is judged against the group's current stamp the same way); a finished
+   record that ranks newer takes the finish road (finishedRec: BuildWallCopyAction did not say materials only); else BuildWallStampApply.
+   *after: kBuildGroupAfterAdopt - once the write landed, every record of the group takes the record's value and ITS stamp (no step,
+   BdOwnGroupLanded); kBuildGroupAfterCatchUp - the record ranks older (an older stamp, a tie that loses, an unstamped record under a
+   stamped value): its row and record take the group's current value and live stamp (BdOwnGroupCatchUp); kBuildGroupAfterNone. */
+const int kBuildGroupAfterNone = 0, kBuildGroupAfterAdopt = 1, kBuildGroupAfterCatchUp = 2;
+inline int BuildOwnGroupDecide(int haveLead, int finishedRec, unsigned int rec, float share, unsigned int live, float liveP, float liveN,
+                               float* progress, int* after)
+{
+    *progress = 0.0f; *after = kBuildGroupAfterNone;
+    const int rank = BuildGroupRank(rec, share, live, BuildGroupLiveShare(liveP, liveN));
+    int a = kBuildStampIgnored;
+    if (finishedRec != 0 && (rank == kBuildRankNewer || rank == kBuildRankLegacy)) a = kBuildStampFinish;
+    else a = BuildWallStampApply(haveLead, rec, live, share, liveP, liveN, progress);
+    if (a == kBuildStampWrite || a == kBuildStampFinish) *after = kBuildGroupAfterAdopt;
+    else if (rank == kBuildRankOlder) *after = kBuildGroupAfterCatchUp;
+    return a;
+}
+inline const char* BuildWallStampName(int a)
+{
+    return a == kBuildStampWrite ? "NEWER - the group's value written through the lead (the engine's wall step draws every member)"
+         : (a == kBuildStampSame ? "NEWER - equals the loaded value, its stamp taken"
+         : (a == kBuildStampFinish ? "NEWER and finished - the finish road"
+         : (a == kBuildStampIgnored ? "OLDER than the group's live value (stamp, then share), or the same - ignored, materials only"
+         : (a == kBuildStampNoLead ? "newer, but the group's lead here is not this player's - materials only"
+         : "newer, but no usable share or needed - materials only"))));
 }
 /* A melee hit on a wall (WallBuilding's 0x29D520, hooked): wall = the target is a WallBuilding; playerWall = a player owns it (this
    game's player faction, or another player's stand-in); othersKnown = another player is known here (a stand-in exists); damageRead =
@@ -1037,6 +1472,43 @@ inline const char* BuildHitWord(int v)
     case 7: return "result - the wall's state after the writer's hit";
     default: return "?";
     }
+}
+/* T-1381 (T2436 fix): where a hit's attacker is read. The engine's melee hit can run off the main thread (T2436: every name read
+   '(name not read)'), and the name, faction and goal reads are main-thread reads. 1 = now (the hook is on the main thread),
+   2 = later on the main thread through its uid (the mod tracks it), 0 = not readable (off the main thread and no uid). */
+const int kBuildAtkReadNone = 0, kBuildAtkReadNow = 1, kBuildAtkReadByUid = 2;
+inline int BuildHitAttackerReadWhere(int onMain, unsigned int uid)
+{
+    if (onMain != 0) return kBuildAtkReadNow;
+    return (uid != 0) ? kBuildAtkReadByUid : kBuildAtkReadNone;
+}
+/* T-1381: who swung a hit on a player wall or door, as the HIT lines name it. known 0 = the engine gave no attacker; whose 1 = this
+   game runs it, 0 = another game runs it (slot its game's, -1 not known), -1 no game shares it (it has no uid); name / faction / task
+   empty or 0 = not read. Always ends with a 0 inside cap. */
+inline void BuildHitAttackerWords(char* out, size_t cap, int known, const char* name, const char* faction, int whose, int slot,
+                                  unsigned int uid, const char* task)
+{
+    if (out == 0 || cap == 0) return;
+    std::string w;
+    if (known == 0) w = "by nobody named (the engine gave no attacker)";
+    else
+    {
+        char n[32];
+        std::string run;
+        if (whose == 1) run = "run by this game";
+        else if (whose == 0 && slot >= 0) { std::sprintf(n, "%d", slot); run = std::string("run by slot") + n + "'s game"; }
+        else if (whose == 0) run = "run by another game (slot not known)";
+        else run = "no game shares it";
+        std::string u = "no uid";
+        if (uid != 0) { std::sprintf(n, "%u", uid); u = std::string("uid ") + n; }
+        const std::string nm = (name != 0 && name[0] != 0) ? std::string(name).substr(0, 47) : std::string("(name not read)");
+        const std::string fc = (faction != 0 && faction[0] != 0) ? std::string(faction).substr(0, 47) : std::string("(not read)");
+        const std::string tk = (task != 0 && task[0] != 0) ? std::string(task).substr(0, 63) : std::string("(not read)");
+        w = "by '" + nm + "' (faction '" + fc + "', " + run + ", " + u + ", doing '" + tk + "')";
+    }
+    const size_t k = (w.size() < cap - 1) ? w.size() : cap - 1;
+    std::memcpy(out, w.c_str(), k);
+    out[k] = 0;
 }
 /* T-221: whether a wall's progress record is its alone. recIsOwn: 1 = the record (vt+0x228) is the wall's own (+0x160), 0 = another
    wall's, -1 unreadable; groupCount = the wall's group count (+0x390, the walls the engine's completion 0x561A20 completes after it),
@@ -1385,6 +1857,20 @@ inline int BuildHelpCapsCopy(int writerHere) { return writerHere != 0 ? 0 : 1; }
    the help numbers the record's STATE carries - the owner's last applied work from this game, landed and live, the fact a real STATE
    gives - when this session has not read them yet: 1 = take them. A copy row only (never an own piece), the record standing (no
    removal mark) with a STATE that decoded, of the copy's placement (or one of the two numbers unknown) */
+/* T-1408 fold 12 (F1383): a copy that already read its help numbers takes a record's again when the record names newer ones for this
+   game (seq or live above the known) - a confirmation the owner wrote after this game's first look. 1 = take them (T2589: the record
+   carrying seq 1 reached a copy that already showed its state and knew seq 0, and was left with the confirmation unread) */
+inline int BuildHelpTailRecordNew(int tailKnown, unsigned int recSeq, unsigned int recLive, unsigned int knownSeq, unsigned int knownLive)
+{
+    if (tailKnown == 0) return 1;
+    return (recSeq > knownSeq || recLive > knownLive) ? 1 : 0;
+}
+/* T-1408 fold 12b (F1384 NIT 1): a help number taken from a record over one already known - the larger, so neither the landed seq nor
+   the live one ever goes back (a record with a newer seq and an older live keeps the known live) */
+inline unsigned int BuildHelpTailKeepMax(int known, unsigned int fromRecord, unsigned int knownVal)
+{
+    return (known != 0 && knownVal > fromRecord) ? knownVal : fromRecord;
+}
 inline int BuildHelpTailFromRecord(int copyRow, int own, int removed, int body, int tailKnown, unsigned int recPlacement, unsigned int rowPlacement)
 {
     if (copyRow == 0 || own != 0 || removed != 0 || body == 0 || tailKnown != 0) return 0;
@@ -1570,6 +2056,17 @@ inline int BuildWallHelpKind(int wall, int ownRecord)
     if (wall == 0) return kBuildWallKindNone;
     return ownRecord > 0 ? kBuildWallKindOwnRecord : kBuildWallKindGroup;
 }
+/* T-1408 (F1216 design read): kBuildWallKindGroupOwner - a wall copy whose record is a group's (ownRecord 0, not unreadable), not a
+   ruin, whose group's lead is a wall of the SAME owner (the lead itself, or the wall whose record it holds). The helper's work goes out
+   under the key its hook sees (the engine's wall step 0x5594A0 forwards a member's step to its lead, so that is its lead copy) and the
+   owner's game resolves its own group (its own wall step on its piece of that key). A group of mixed owners, a ruin or an unreadable
+   record stays kBuildWallKindGroup (refused). */
+const int kBuildWallKindGroupOwner = 3;
+inline int BuildWallHelpKindG(int wall, int ownRecord, int leadSameOwner, int ruin)
+{
+    const int k = BuildWallHelpKind(wall, ownRecord);
+    return (k == kBuildWallKindGroup && ownRecord == 0 && leadSameOwner != 0 && ruin == 0) ? kBuildWallKindGroupOwner : k;
+}
 /* a build / add-materials order on a copy owned by another player's stand-in is help (1) on EVERY order road (click, commit, Shift
    job, on the main thread or off it) - a wall copy holding its own progress record too: its work reaches the owner's wall as help work
    (F1011). A wall copy whose record is a group's, or unreadable (wallKind kBuildWallKindGroup), is refused (2): its work lands in the
@@ -1581,6 +2078,120 @@ inline int BuildHelpOrderVerdict(int task, int standIn, int wallKind)
     if (standIn == 0) return kBuildHelpOrderNone;
     return (wallKind == kBuildWallKindGroup) ? kBuildHelpOrderWallRefused : kBuildHelpOrderGiven;
 }
+/* T-1408: the order verdict with the owner's presence - a copy of a group that is the owner's alone (kBuildWallKindGroupOwner) is help
+   only while the owner's game is in the world (ownerInWorld 1): the owner's game resolves its own group, so with it away the work is
+   refused as any grouped wall copy's. Every other kind: BuildHelpOrderVerdict. */
+inline int BuildHelpOrderVerdictW(int task, int standIn, int wallKind, int ownerInWorld)
+{
+    const int v = BuildHelpOrderVerdict(task, standIn, wallKind);
+    if (v == kBuildHelpOrderGiven && wallKind == kBuildWallKindGroupOwner && ownerInWorld != 1) return kBuildHelpOrderWallRefused;
+    return v;
+}
+/* T-1408: one group member's share of its group's progress as the engine's wall step draws it after each step (0x5594A0, Read: the lead's
+   progress +0x164 over its needed +0x188, at most kBuildWallShareCap (DAT_14167B308 - Inferred 1.0), times the member's own needed
+   +0x188, written through the member's vt+0x238). -1 = the lead's needed is not positive or a value is not finite */
+const float kBuildWallShareCap = 1.0f;
+inline float BuildWallMemberShare(float leadP, float leadN, float memberN)
+{
+    if (!BuildFloatOk(leadP) || !BuildFloatOk(leadN) || !BuildFloatOk(memberN) || !(leadN > 0.0f)) return -1.0f;
+    float r = leadP / leadN;
+    if (r > kBuildWallShareCap) r = kBuildWallShareCap;
+    return r * memberN;
+}
+/* T-1408: the owner's group is WHOLE for the owner's wall step when its lead lists at least one entry and every entry resolves to a loaded
+   piece here (the lead itself counted when it is listed): the engine's finish 0x561A20 and its share loop skip an entry that does not
+   resolve, so the helper's work goes onto a group only when all of it is here - otherwise materials only, with a line */
+inline int BuildWallGroupWhole(int leadCount, int resolved) { return (leadCount >= 1 && resolved == leadCount) ? 1 : 0; }
+/* T-1408 fold 1 (review 2): a group is its owner's ALONE when its lead is the piece's owner's and every loaded member reads and has that
+   same owner (membersRead 1 = every listed entry that resolved was read; membersOther = how many of them had another owner) - the helper's
+   verdict and the owner's apply both ask it */
+inline int BuildWallGroupOneOwner(int leadSame, int membersRead, int membersOther) { return (leadSame != 0 && membersRead != 0 && membersOther == 0) ? 1 : 0; }
+/* T-1408 fold 1 (review 1): a running help job on a grouped wall copy is ENDED (the road that ends a job the help rule refuses) when its
+   step is refused for good: a group not its owner's alone (kBuildWallKindGroup), or a group the owner's alone while the owner's game is
+   KNOWN away (ownerInWorld 0, a fresh answer). Not known (-1: no fresh answer) never ends a job - the step refusal still guards the work */
+inline int BuildHelpWallJobEnd(int wallKind, int ownerInWorld)
+{
+    if (wallKind == kBuildWallKindGroup) return 1;
+    return (wallKind == kBuildWallKindGroupOwner && ownerInWorld == 0) ? 1 : 0;
+}
+/* T-1408 fold 1 (review 3, 4; manager's decision 4: the owner resolves its own group): help work carrying build progress for a grouped
+   wall here. PLAIN - not a grouped wall, or no progress: the ordinary road. HOLD - kept and judged again later, nothing applied, nothing
+   confirmed (as the 'area not loaded' wait): this game is not the owner's own game (the T-23 writer of a copy), or the group is the
+   owner's alone but not wholly loaded here. MATS - materials only, confirmed: the group is not its owner's alone (or the scale did not
+   read). STEP - the owner's wall step on its whole group. */
+const int kBuildWallApplyPlain = 0, kBuildWallApplyStep = 1, kBuildWallApplyHold = 2, kBuildWallApplyMats = 3;
+inline int BuildWallGroupApply(int grouped, int hasProgress, int ownerGame, int oneOwner, int whole)
+{
+    if (grouped == 0 || hasProgress == 0) return kBuildWallApplyPlain;
+    if (ownerGame == 0) return kBuildWallApplyHold;
+    if (oneOwner == 0) return kBuildWallApplyMats;
+    return whole != 0 ? kBuildWallApplyStep : kBuildWallApplyHold;
+}
+/* T-1408 fold 1 (review 5): the helper measured its work on its lead copy of THIS key, against that piece's own needed; on the owner's game
+   the key's piece may be a member of a group whose lead is another wall type. The work as the same fraction of the owner's lead's needed:
+   dP x leadNeeded / pieceNeeded (1:1 when the piece is the lead). -1 = a value is not finite or a needed is not positive */
+inline float BuildWallHelpScale(float dP, float leadNeeded, float pieceNeeded)
+{
+    if (!BuildFloatOk(dP) || !BuildFloatOk(leadNeeded) || !BuildFloatOk(pieceNeeded) || !(leadNeeded > 0.0f) || !(pieceNeeded > 0.0f)) return -1.0f;
+    return dP * (leadNeeded / pieceNeeded);
+}
+/* T-1408 fold 2: the helper's step on its grouped wall copy (the lead copy: the engine forwards a member's step to it). RUN - the owner's
+   group, the owner's game in the world, not this game the copy's writer, not told HELD. REFUSE (noted: the job road ends the job) - a
+   group not its owner's alone, the owner's game known away, this game the copy's writer, or the holding game's HELP_HELD. WAIT - the
+   owner's game's status not known (-1, a load): the step is skipped (no work counted) and the job is NOT ended - no stop / restart churn */
+const int kBuildWallStepRun = 0, kBuildWallStepWait = 1, kBuildWallStepRefuse = 2;
+inline int BuildHelpWallStep(int wallKind, int ownerInWorld, int writerHere, int ownerHeld)
+{
+    if (wallKind != kBuildWallKindGroupOwner) return kBuildWallStepRefuse;
+    if (ownerInWorld == 0 || ownerHeld != 0) return kBuildWallStepRefuse;
+    if (ownerInWorld != 1) return kBuildWallStepWait;
+    return writerHere != 0 ? kBuildWallStepRefuse : kBuildWallStepRun;
+}
+/* T-1408 fold 2: the job road's end - fold 1's rule, and a group the owner's alone whose help work the holding game told HELD */
+inline int BuildHelpWallJobEndH(int wallKind, int ownerInWorld, int ownerHeld)
+{
+    if (BuildHelpWallJobEnd(wallKind, ownerInWorld) != 0) return 1;
+    return (wallKind == kBuildWallKindGroupOwner && ownerHeld != 0) ? 1 : 0;
+}
+/* T-1408 fold 2: a HELD grouped-wall entry is PARKED - judged again only on an event that can change the verdict, never on a clock:
+   kBuildWakeAreaLaid (an area's pieces laid here - the zone walk finished: a member may have loaded), kBuildWakeAreaLeft (an area left
+   here: its piece may be gone), kBuildWakeMap (an area map arrived: the copy's writer may have changed - wakes only entries held as the
+   copy's writer) */
+const int kBuildWakeAreaLaid = 1, kBuildWakeAreaLeft = 2, kBuildWakeMap = 3;
+inline int BuildWallHeldWakes(int why, int event)
+{
+    if (why != (int)kBuildHeldNotWhole && why != (int)kBuildHeldWriter) return 0;
+    if (event == kBuildWakeMap) return why == (int)kBuildHeldWriter ? 1 : 0;
+    return (event == kBuildWakeAreaLaid || event == kBuildWakeAreaLeft) ? 1 : 0;
+}
+/* T-1408 fold 2: a parked entry whose piece is not found here any more (its area unloaded) is DROPPED - not confirmed, nothing applied,
+   the helper keeps its materials owed and sends the work again; an entry never held keeps the 'area not loaded' wait */
+const int kBuildHeldJudge = 0, kBuildHeldDrop = 1, kBuildHeldWaitArea = 2;
+inline int BuildWallHeldPieceGone(int parked, int pieceHere)
+{
+    if (pieceHere != 0) return kBuildHeldJudge;
+    return parked != 0 ? kBuildHeldDrop : kBuildHeldWaitArea;
+}
+/* T-1408 fold 3: a copy of a HELD entry that replaces it (the helper's 30 s re-send of unconfirmed work, or a later seq superseding it)
+   inherits its held state - parked, why, told (HELP_HELD sent) and the HOLD line written - so that copy's later apply / drop sends
+   'released' (the helper's mark would otherwise never clear and its builders refuse that wall group for the session), and a re-send
+   neither sends HELD again nor re-writes the HOLD line. A never-held entry passes nothing on; an unsent HELD stays unsent (sent at the
+   next judgement) */
+struct BuildWallHeldCarry { int park; int why; int told; int logged; };
+inline void BuildWallHeldInherit(BuildWallHeldCarry* to, const BuildWallHeldCarry& from)
+{
+    if (to == 0 || from.park == 0) return;
+    to->park = 1; to->why = from.why;
+    if (from.told != 0) to->told = 1;
+    if (from.logged != 0) to->logged = 1;
+}
+/* T-1408 fold 3: an entry leaving the queue (applied, confirmed or dropped) releases its helper when it was parked and HELD was sent */
+inline int BuildWallHeldReleaseOnLeave(int park, int told) { return (park != 0 && told != 0) ? 1 : 0; }
+/* T-1408 fold 3: a re-send of a PARKED entry (waiting for an event) replaces its content and stays parked - a re-send is not an event
+   that can change the verdict (no 30 s clock in disguise); an entry not parked is judged at the next safe point as before */
+inline int BuildWallHeldResendParked(int park, int waitingForEvent) { return (park != 0 && waitingForEvent != 0) ? 1 : 0; }
+/* T-1408 fold 2: the helper's HELD mark is kept until released, or until the holding game is KNOWN away (0; -1 unknown keeps it) */
+inline int BuildWallHeldMarkKeep(int holderInWorld) { return holderInWorld == 0 ? 0 : 1; }
 /* T-903 (decisions 920 / 920 a, owner 2026-10-17): who may help build, add materials to and repair another player's piece - a
    faction-mate (the two players share a team), or a player the piece's owner has set FRIENDLY with the PLAYERS tab's friendly /
    neutral / enemy buttons (or `relate`). kBuildHelpFriendHelps = 0 makes it faction-mates only. Dismantle is not this rule's: it is
@@ -1783,6 +2394,51 @@ inline int BuildHelpHarvestVerdict(int found, int isCopy, int wallGroup, int dis
     if (gained == 0) return kBuildHarvestNoGain;
     return allowed != 0 ? kBuildHarvestRecord : kBuildHarvestRefuse;
 }
+/* T-1408 fold 14 (F1429), THE HELPER'S GAME: a copy's help baseline belongs to the materials RECORD the copy reads (the engine's state
+   accessor vt+0x228), not to the key asked - a grouped wall member reads and writes its lead's record (lead +0x160), so every mod write
+   through a member moves the LEAD's baseline, and the lead's harvest measures that one record once. Which row holds the baseline of a
+   piece: OWN (not a wall, or a wall reading its own record self + ownOff), LEAD (a wall reading another wall's record: the row of the
+   piece rec - ownOff), NONE (a wall whose record does not read: no baseline is usable or written). */
+const int kBuildBaseOwn = 0, kBuildBaseLead = 1, kBuildBaseNone = 2;
+inline int BuildHelpBaseHolder(int wall, unsigned long long self, unsigned long long rec, unsigned long long ownOff)
+{
+    if (wall == 0) return kBuildBaseOwn;
+    if (rec == 0 || rec < ownOff) return kBuildBaseNone;
+    return (rec == self + ownOff) ? kBuildBaseOwn : kBuildBaseLead;
+}
+/* ... and a held baseline is usable only for the record it was read from (baseRec) while that record's group is unchanged (baseCnt: the
+   holding wall's group count +0x390 when read, -1 unread, 0 not a lead / not a wall): a wall that joined a group, or left one, reads another
+   record now, and a join or leave by any road (the engine's own walk too) changes the lead's count - the old baseline measures nothing
+   (NO_BASE until the mod's next write sets it; a main-thread step falls back to the amounts read just before the engine's call) */
+inline int BuildHelpBaseUsable(int baseOk, unsigned long long baseRec, unsigned long long recNow, int baseCnt, int cntNow)
+{
+    return (baseOk != 0 && recNow != 0 && baseRec == recNow && baseCnt == cntNow && cntNow >= 0) ? 1 : 0;
+}
+/* T-1408 fold 14d (review 6): ... and its record's join generation unchanged (baseGen: the generation when read; it only rises - every
+   join the mod performs or sees on that record, the engine's own walk included, bumps it), so a leave then a join that restores the count
+   never passes an old baseline */
+inline int BuildHelpBaseUsable(int baseOk, unsigned long long baseRec, unsigned long long recNow, int baseCnt, int cntNow, unsigned int baseGen, unsigned int genNow)
+{
+    return (baseGen == genNow && BuildHelpBaseUsable(baseOk, baseRec, recNow, baseCnt, cntNow) != 0) ? 1 : 0;
+}
+/* T-1408 fold 14c (review 2): a mod join's effect on the lead's record carried into its baseline - base + (after - before), slot by
+   slot, read just before and after the join; a helper's delivery not yet measured stays above the new baseline (never absorbed). 1 = carried
+   (out[0..nAfter) written); 0 = the baseline was not usable before the join or a read failed - it stays unusable (NO_BASE), never re-read */
+inline int BuildHelpBaseCarry(int usableBefore, const float* base, const float* before, int nBefore, const float* after, int nAfter, float* out)
+{
+    if (usableBefore == 0 || nBefore < 0 || nAfter < 0) return 0;
+    for (int i = 0; i < nAfter; ++i) out[i] = (i < nBefore ? base[i] - before[i] : 0.0f) + after[i];
+    return 1;
+}
+/* T-1408 fold 14b (review 2): where a harvest of piece b measures - on b's own row, or for a grouped member (holder LEAD) on its lead's row
+   when the lead has a live row here (leadRow); a member whose lead has no row is measured nowhere (its harvest skips: a member is never
+   measured on its own). 0 own row, 1 the lead's row, 2 none */
+const int kBuildMeasureOwn = 0, kBuildMeasureLead = 1, kBuildMeasureNone = 2;
+inline int BuildHelpMeasureAt(int holder, int leadRow)
+{
+    if (holder == kBuildBaseOwn) return kBuildMeasureOwn;
+    return (holder == kBuildBaseLead && leadRow != 0) ? kBuildMeasureLead : kBuildMeasureNone;
+}
 /* help1: the whole items a material gain stands for (a refund hands back whole items; the same rounding as a HELP_GONE's) */
 inline int BuildHelpWholeItems(float gain) { return gain > 0.0f ? (int)(gain + 0.001f) : 0; }
 /* the unconfirmed work the helper puts back on its copy after the owner's STATE (no flicker back): *dP and d[] ADD, *n = the widest;
@@ -1977,10 +2633,11 @@ struct BuildCopyRec
     int removed;             /* P87 rf1 (STATE destroyed bit) */
     int emptyLoads;          /* P87 rf1 (STATE progress) */
     int alias;               /* P87 rf1 (STATE complete bit) */
+    unsigned char groundMark;   /* T-1372 decision 1691: the PLACE's ground mark (1 = this build's input; 0 = an older record's, converted where used) */
     int handed;              /* T-23 review fold 5 (STATE broken bit): THIS game placed the piece and handed it to slot at its placement,
                                 and has not yet seen the world server hold its record (piecerec::PieceHandLoadChoice). A row written
                                 before the bit reads 0 = not handed; a build before the bit ignores it. Same row size. */
-    BuildCopyRec() : slot(-1), nonce(0), hostForm(0), floor(0), outside(0), removed(0), emptyLoads(0), alias(0), handed(0)
+    BuildCopyRec() : slot(-1), nonce(0), hostForm(0), floor(0), outside(0), removed(0), emptyLoads(0), alias(0), groundMark(0), handed(0)
     {
         for (int i = 0; i < 3; ++i) pos[i] = 0.0f;
         rot[0] = 1.0f; rot[1] = 0.0f; rot[2] = 0.0f; rot[3] = 0.0f;
@@ -2022,6 +2679,7 @@ inline bool BuildCopyRecSame(const BuildCopyRec& a, const BuildCopyRec& b)
     if (a.key != b.key || a.sid != b.sid || a.hostKey != b.hostKey || a.slot != b.slot || a.nonce != b.nonce) return false;
     if (a.hostForm != b.hostForm || a.floor != b.floor || a.outside != b.outside) return false;
     if (a.removed != b.removed || a.emptyLoads != b.emptyLoads || a.alias != b.alias || a.handed != b.handed) return false;   /* P87 rf1; T-23 fold 5 */
+    if (a.groundMark != b.groundMark) return false;   /* T-1372 */
     for (int i = 0; i < 3; ++i) if (a.pos[i] != b.pos[i]) return false;
     for (int i = 0; i < 4; ++i) if (a.rot[i] != b.rot[i]) return false;
     return true;
@@ -2035,6 +2693,7 @@ inline bool BuildCopyRowMake(const BuildCopyRec& c, std::string* rowKey, std::ve
     for (int i = 0; i < 3; ++i) m.pos[i] = c.pos[i];
     for (int i = 0; i < 4; ++i) m.rot[i] = c.rot[i];
     m.complete = 0; m.ownerSlot = (unsigned short)c.slot; m.nonce = c.nonce;
+    m.groundMark = (unsigned char)(c.groundMark != 0 ? 1 : 0);   /* T-1372 */
     if (!c.hostKey.empty()) { m.hostKey = c.hostKey; m.hostForm = c.hostForm; m.floor = c.floor; m.outside = c.outside; }
     BuildMsg st;
     st.kind = kBuildState; st.key = c.key;
@@ -2057,6 +2716,7 @@ inline bool BuildCopyRowRead(const std::string& rowKey, const std::string& place
     if (DecodeBuild(state.data(), state.size(), &st) != kBuildDecodeOk || st.kind != kBuildState || st.key != m.key) return false;
     BuildCopyRec c;
     c.key = m.key; c.sid = m.sid; c.slot = (int)m.ownerSlot; c.nonce = m.nonce;
+    c.groundMark = m.groundMark;   /* T-1372 */
     for (int i = 0; i < 3; ++i) c.pos[i] = m.pos[i];
     for (int i = 0; i < 4; ++i) c.rot[i] = m.rot[i];
     if (!m.hostKey.empty()) { c.hostKey = m.hostKey; c.hostForm = m.hostForm; c.floor = m.floor; c.outside = m.outside; }
@@ -2093,6 +2753,88 @@ inline int BuildReconcileAct(int listed, int found, int completeNone, int mine, 
     if (sender == 0) return kBuildReconKeepOther;
     if (dismantling != 0) return kBuildReconRetry;
     return kBuildReconRemove;
+}
+/* T-1372 A2: MAY A REMOVE FOR ROW `key` TAKE APART THE PIECE A SEARCH BY POSITION FOUND? The lookup by key ignores height for a single
+   candidate (items.cpp ItBoxResolve), so an old key a re-key retired resolves the piece another row already holds under the new key
+   (F1035: the host's live copy dismantled by the REMOVE for the old key, 31 ms after it was adopted under the new one). pieceKey: the
+   found piece's own position key ("" = unread). rowAtPieceKey: 1 = a live row (listed, not removed) is filed under pieceKey.
+   aliasRow: the row whose live key is pieceKey (a copy found or made at another key; "" = none); aliasLive: 1 = that row is listed,
+   not removed, and still names pieceKey as its live key. Returns 0 = act (the piece is this row's, or no other row is known to hold
+   it); 1 = refuse, a different row is filed under the piece's own key; 2 = refuse, a different row holds it by its live key.
+   T-1372 review fold 1: a refused REMOVE retires its OWN row (BdRemoveOne: removed, no dismantle, its alias dropped), so that row's
+   alias is no longer live for the holder's own later REMOVE. pieceKey == key with another LIVE row holding the piece by its live key
+   still refuses: that is a re-key's new key that adopted the old key's piece where it stands (B's copy at the old key, PLACE new key
+   found it), and the old key's REMOVE must not take it apart. */
+const int kBuildRmHeldNone = 0;
+const int kBuildRmHeldByKey = 1;
+const int kBuildRmHeldByAlias = 2;
+inline int BuildRemoveHeldByOther(const std::string& key, const std::string& pieceKey, int rowAtPieceKey, const std::string& aliasRow, int aliasLive)
+{
+    if (pieceKey.empty()) return kBuildRmHeldNone;   /* unread: nothing known - the REMOVE's own road decides, as before */
+    if (rowAtPieceKey != 0 && pieceKey != key) return kBuildRmHeldByKey;
+    if (aliasLive != 0 && !aliasRow.empty() && aliasRow != key) return kBuildRmHeldByAlias;
+    return kBuildRmHeldNone;
+}
+/* T-1372 (H-T1372-removal, F1037): WHICH ENGINE DESTROY ENDS A PLAYER'S BUILDING FOR GOOD. GameWorld::destroy 0x798F50 (1.0.68 0x799AF0)
+   takes (object, justUnloaded, the caller's reason literal). The removal mark was written only on the dismantle road (0x2A2820), so a
+   piece the engine deleted outright came back at the next load. The reasons, each read at its one caller (1.0.65):
+     for good   "Level Editor" - the Level Editor's delete 0x776D60 (decomp_776d60.txt:24), after it tore the interior down through
+                0x54EA40 (:19); "Building::confirmDismantle" - the panel's dismantle confirm 0x54F410 (decomp_54f410.txt:35): after the
+                piece's own dismantle step (vt+0x248, the marked road) it destroys each building 0x54AF40 gathers from the piece's
+                record references (mask 0x9000 - its mounted pieces, Inferred), which no dismantle step marks.
+     interior   "_destroyAllInternalBuildings" - the interior teardown 0x54EA40, called by the editor's delete, a purchase and the mod's
+                own buyer teardown (build.cpp BdTdDestroyPod): a removal only inside the editor's delete.
+     not one    "dynamicDestroyBuildingsList" (a dismantled piece queued on GameWorld+0x628 - already marked), "ZoneMapContent::deactivate"
+                (an unload, flag 1), "deleteDuplicatedBuildings", "Building::moveMountedBuildings", "Building::setDestroyed",
+                "door in setDestroyed", "destroyDoors", "_clearAndDestroyAllFurniture".
+     other      any other reason, or none - a plugin's own delete would arrive here: logged, never marked.
+   BuildEngineDestroyDecide: justUnloaded (the engine's flag 1 = put away, never a removal), the reason's class, inEditorDelete (1 = the
+   destroy runs inside the Level Editor's delete on the same thread), objType (the object's vt+0x20 data type, 0 = a building; -1
+   unread). Returns 0 nothing, 1 the piece is removed for good (its row is marked removed), 2 an unknown reason ended a building (log). */
+const int kBuildEngReasonOther = 0;
+const int kBuildEngReasonForGood = 1;
+const int kBuildEngReasonInterior = 2;
+const int kBuildEngReasonNotRemoval = 3;
+const int kBuildEngRmNone = 0;
+const int kBuildEngRmRemoved = 1;
+const int kBuildEngRmOther = 2;
+/* T-1372 re-check fold F: MAY A POSTPONED FOR-GOOD CAPTURE STAND FOR THIS DESTROY? The engine postpones a destroy while its world lock is
+   busy (decomp_798f50 :72-76: the object alone is kept, not its reason), and what drains that set is not traced - the object may end
+   by a road that skips the hooked destroy, and its address be used again. Used only when this destroy is no unload (an unload puts the
+   piece away: the capture is freed), the object is a building whose key reads and equals the captured key (the same building, not a
+   new object at the old address), and the capture is younger than kBuildEngPostMaxMs. The age: the lock is held for a worker's pass,
+   not for game seconds (Inferred), so a capture still waiting after 30 s is taken for one whose destroy went by another road - the key
+   check is the guard, the age the backstop for a slot whose address is never seen again. 1 = use it, 0 = free it. */
+const unsigned long kBuildEngPostMaxMs = 30000;
+inline int BuildEngPostponedUse(int justUnloaded, int isBuilding, int keyOk, int keySame, unsigned long ageMs)
+{
+    if (justUnloaded != 0) return 0;
+    if (ageMs > kBuildEngPostMaxMs) return 0;
+    if (isBuilding == 0 || keyOk == 0 || keySame == 0) return 0;
+    return 1;
+}
+inline int BuildEngReasonIs(const char* r, const char* lit)
+{
+    for (int i = 0; ; ++i) { if (r[i] != lit[i]) return 0; if (lit[i] == 0) return 1; }
+}
+inline int BuildEngineDestroyReason(const char* r)
+{
+    if (r == 0) return kBuildEngReasonOther;
+    if (BuildEngReasonIs(r, "Level Editor") || BuildEngReasonIs(r, "Building::confirmDismantle")) return kBuildEngReasonForGood;
+    if (BuildEngReasonIs(r, "_destroyAllInternalBuildings")) return kBuildEngReasonInterior;
+    if (BuildEngReasonIs(r, "dynamicDestroyBuildingsList") || BuildEngReasonIs(r, "ZoneMapContent::deactivate") || BuildEngReasonIs(r, "deleteDuplicatedBuildings")
+        || BuildEngReasonIs(r, "Building::moveMountedBuildings") || BuildEngReasonIs(r, "Building::setDestroyed") || BuildEngReasonIs(r, "door in setDestroyed")
+        || BuildEngReasonIs(r, "destroyDoors") || BuildEngReasonIs(r, "_clearAndDestroyAllFurniture")) return kBuildEngReasonNotRemoval;
+    return kBuildEngReasonOther;
+}
+inline int BuildEngineDestroyDecide(int justUnloaded, int reasonClass, int inEditorDelete, int objType)
+{
+    if (justUnloaded != 0) return kBuildEngRmNone;   /* put away: the piece comes back with its area */
+    if (objType != 0) return kBuildEngRmNone;        /* not a building (or its type unread) */
+    if (reasonClass == kBuildEngReasonForGood) return kBuildEngRmRemoved;
+    if (inEditorDelete != 0) return kBuildEngRmRemoved;   /* the editor's delete takes the piece and everything inside it for good */
+    if (reasonClass == kBuildEngReasonOther) return kBuildEngRmOther;
+    return kBuildEngRmNone;
 }
 /* P87 fold 3 (T651): THE ONE OWNER RULE the PLACE adopt (BdCopyOne), the reconcile (BdReconDrain) and the REMOVE apply (BdRemoveOne)
    share - "whose is this live piece, seen from the game of slot senderSlot?". A game's save names a copy's owner by the stand-in's
@@ -2202,6 +2944,43 @@ inline int BuildOcDepthReset(int* depth) { const int was = *depth; *depth = 0; r
 inline int BuildOwnerAdoptIsPurchase(int adoptFromWorld, int furniture, int forSale, int ownerChanges, int targetNamed)
 {
     return (adoptFromWorld != 0 && furniture == 0 && forSale == 1 && ownerChanges != 0 && targetNamed != 0) ? 1 : 0;
+}
+/* T-1430 (F1224 / F1253): APPLY THE PURCHASE HERE - the one decision every road that writes a house's owner makes BEFORE its first
+   owner write (the place-adopt, a copy-list adopt included; the area rebuild restore R4; the own-row / own-record restore R6;
+   the kept row's hand-back after a world reset, BdKeptHandBack - fold 2). The
+   shared record is the truth: a player (another game's stand-in, or this game's own player) owns the house, the house here is not yet
+   player-owned, and the ENGINE says it is for sale here - so this game never ran the purchase. The copy-list class no longer blocks it
+   (a house the OTHER player bought is on this game's copy list after its first purchase replay; a load whose ordinary save is older
+   than the purchase brings the town's house back - F1224). furniture: the piece is furniture; recordNamesPlayer: the owner the record
+   names is a player's; livePlayerSide: the live owner here is a player's (BdOwnerIsPlayerSide); forSale: the engine's own isForSale
+   (1 yes, 0 no, -1 faulted - an unread answer is no); ownerChanges: the write would change the owner. 1 = run the whole purchase
+   (BuildPurchaseHerePlanOf), 0 = the road's owner write alone. A later load whose save holds the purchase finds the house
+   player-owned, so it does not run there again; a load with no such save (a crash, a relaunch without saving) brings the town's
+   house back for sale and it runs again - see the doors below. NOT decided here (fold 2, Read): a house an OLDER build adopted
+   plain and then saved is player-owned here, so no road repairs its furniture. No real fact tells 'the purchase's tail never ran
+   on this game': the town list 0x928010 empties (town +0x500) holds 'nest' entries (0x928470, added by the building setup
+   0x57E760 for a record with a 'nest' reference, with no owner test, on every creation) and a town-centre entry with no building
+   (0x928470's second caller, 0x9344F0) - no ordinary house has one, and a house that has one gets it back on each load whether it
+   was bought or not. */
+inline int BuildPurchaseApplyHere(int furniture, int recordNamesPlayer, int livePlayerSide, int forSale, int ownerChanges)
+{
+    return (furniture == 0 && recordNamesPlayer != 0 && livePlayerSide == 0 && forSale == 1 && ownerChanges != 0) ? 1 : 0;
+}
+/* T-1430: what a 'yes' runs, the same on every road (BdOwnerRestore's world side): the residents and the town lists, the furniture
+   teardown 0x54EA40's rule, the interior re-own of pieces no player owns only (interiorTownOnly - fold 2: every road, so a player's
+   own piece in the house is never handed to the new owner), the doors re-owned AND opened, and the purchase's tail (location nodes
+   0x38A5E0, the town step 0x296900 / 0x928010, the house's interior walking map 0x4D2340). A 'no' runs nothing of it.
+   THE DOORS (fold 2): the engine's purchase opens them, so a 'yes' opens them. A 'yes' comes only while the house here is for sale
+   and no player's, so a load whose save holds the purchase does not open them again; but a load with NO save that holds it (a crash,
+   or a relaunch without saving) brings the town's house back, the purchase runs again and the doors are opened again, a door a
+   player had shut included. That stays until an ordinary door's open / shut state is kept in the shared record (T-1429's gap). */
+struct BuildPurchaseHerePlan { int worldSide; int teardown; int openDoors; int tail; int interiorTownOnly; };
+inline BuildPurchaseHerePlan BuildPurchaseHerePlanOf(int apply)
+{
+    BuildPurchaseHerePlan p; p.worldSide = 0; p.teardown = 0; p.openDoors = 0; p.tail = 0; p.interiorTownOnly = 0;
+    if (apply != 1) return p;
+    p.worldSide = 1; p.teardown = 1; p.openDoors = 1; p.tail = 1; p.interiorTownOnly = 1;
+    return p;
 }
 /* P18 fold 1 (item 6): the applied line's outcome from the owner write (fixed: 1 written, 0 not written - already the named owner or
    an empty target, -1 faulted). Not written is a SKIP, never a fault. */
@@ -2475,8 +3254,33 @@ const int kBuildTombKillWait = 0, kBuildTombKillMiss = 1, kBuildTombKillCall = 2
    Exclude: left standing (the tombstone ends, counted); Mismatch: not the retired piece - never touched. F3: our call took (dismantling
    after a call) - the engine frees it next frame, or a wall's deferred dismantle runs: Wait, never a miss. */
 const int kBuildTombKillExclude = 6, kBuildTombKillMismatch = 7;
+/* T-1372 attempt 2 (H-T1372-removal, F1045): a retired piece WITH AN INTERIOR is removed the game's own panel way - Building::confirmDismantle
+   0x54F410 (answer 2: the interior's furniture through 0x54EA40(interior, 1), then the dismantle vt+0x248(FLT_MAX), then the mounted
+   pieces) - for its first call (kBuildTombKillPanel); a retry after it is the bare dismantle (kBuildTombKillCall). panelAddr: the
+   confirmDismantle address row reads non-zero - without it the piece is left standing as before (Exclude). innerReady: the interior's
+   piece list was read whole this look (InteriorPieceIds: listed, not cut, not torn, every entry read, the walk generation unmoved) -
+   until then a counted miss (GiveUp at maxTries leaves it standing). Both default 0: the fold-1 callers' answer (Exclude) is kept.
+   Review fold (B1): innerForeign - a resolved entry of either interior set (+0xE8, +0x128) is not this game's own piece (another
+   owner, a listed copy, another player's row, no key) - the panel's teardown never reads an owner (decomp_54ea40 :63-65, :128-139), so
+   the piece is left standing as before (kBuildTombKillForeign: the tombstone ends, counted). (F2, re-check) furnPending - a furniture
+   tombstone of this house still to settle (BuildTombFurnBlocks): a COUNTED miss (the zone walk may not have reached the furniture yet,
+   so it may not be queued), so that piece is removed with its own refund first; at maxTries the give-up keeps the tombstone (N2). */
+const int kBuildTombKillPanel = 8, kBuildTombKillForeign = 9;
+/* T-1372 re-check (F2): does furniture tombstone t hold a house's panel step? furn: t is furniture; hostExact / hostNear: t's host key is
+   the house's tombstone key, or within ItBoxResolve's window of it (BoxKeyNearKey - a furniture row's host key is built from another
+   position read and can drift); queued: t's own removal is queued now; readBack / verified: t was read back at this load and is not yet
+   verified absent (its piece may still stand, not yet reached by the zone walk); settled: t's removal was cancelled, given up or put off
+   in this world (g_tombKillNo / g_tombKillLater). 1 = the panel waits for it. */
+inline int BuildTombFurnBlocks(int furn, int hostExact, int hostNear, int queued, int readBack, int verified, int settled)
+{
+    if (furn == 0 || (hostExact == 0 && hostNear == 0)) return 0;
+    if (queued != 0) return 1;
+    if (settled != 0) return 0;
+    return (readBack != 0 && verified == 0) ? 1 : 0;
+}
 inline int BuildTombKillStep(int zoneLoaded, int look, int own, int listedCopy, int dismantling, int tries, int misses, int maxTries,
-                             int keyExact, int rowNamed, int interior)
+                             int keyExact, int rowNamed, int interior, int panelAddr = 0, int innerReady = 0, int innerForeign = 0,
+                             int furnPending = 0)
 {
     if (zoneLoaded == 0) return kBuildTombKillWait;
     if (look == 0) return kBuildTombKillDone;
@@ -2484,7 +3288,14 @@ inline int BuildTombKillStep(int zoneLoaded, int look, int own, int listedCopy, 
     if (look == 1 && dismantling != 0 && tries > 0) return kBuildTombKillWait;
     if (look != 1 || dismantling != 0) return (misses + 1 >= maxTries) ? kBuildTombKillGiveUp : kBuildTombKillMiss;
     if (keyExact == 0 || rowNamed != 0) return kBuildTombKillMismatch;
-    if (interior != 0 && tries == 0) return kBuildTombKillExclude;
+    if (interior != 0 && tries == 0)
+    {
+        if (panelAddr == 0) return kBuildTombKillExclude;
+        if (furnPending != 0) return (misses + 1 >= maxTries) ? kBuildTombKillGiveUp : kBuildTombKillMiss;
+        if (innerReady == 0) return (misses + 1 >= maxTries) ? kBuildTombKillGiveUp : kBuildTombKillMiss;
+        if (innerForeign != 0) return kBuildTombKillForeign;
+        return kBuildTombKillPanel;
+    }
     return (tries >= maxTries) ? kBuildTombKillGiveUp : kBuildTombKillCall;
 }
 
@@ -3056,6 +3867,8 @@ struct BuildDeadHandleIn
     int areaLoaded;                  /* the host's area reads fully loaded here */
     long long setAge;                /* safe points since this host's dead set (BuildDeadSetSig) was first seen unchanged; -1 = new or changed now */
     int regRow, copyListRow, removedMark;   /* this key: a registry row here, a copy-list ('~c') row, marked removed */
+    int copyRowPlain;                /* T-1343: the copy-list row is a plain copy row - not marked removed here, not a hand-over this game made */
+    int goodMayBeCopy;               /* T-1343 review: 'good' pieces on the host's list that may be this row's copy under another key (BuildGoodMayBeCopy) */
 };
 const long long kBuildDeadHandleWait = 30;   /* safe points the same dead set must persist across two searches */
 /* 1 = count the dead handles as no piece (the copy may be made), only when ALL hold:
@@ -3063,8 +3876,23 @@ const long long kBuildDeadHandleWait = 30;   /* safe points the same dead set mu
    (b) at least one dead handle (none dead = an ordinary search, not this rule's case);
    (c) the host's area reads fully loaded;
    (d) the same dead set was seen at least kBuildDeadHandleWait safe points before (setAge; a new or changed set is -1);
-   (e) a fresh copy: no registry row, no copy-list row, the key not marked removed.
-   0 = keep the hold. */
+   (e) a fresh copy: no registry row, the key not marked removed, and no copy-list row other than a plain one (T-1343, below).
+   0 = keep the hold.
+   T-1343 (F1065) - a plain copy-list row no longer holds the copy. Three designs were compared, each by whether it decides from the
+   real fact or a stand-in for it:
+   (A) count a search cut short only by a stable dead set as complete for the row's empty-loads clearing (BuildCopyEvict) - a stand-in
+       (a load count), and slow: the furniture stays missing for kBuildCopyEmptyLoads restarts;
+   (B) void the row when the area was served from another game's area record (LOAD-OVERRIDE) - the load source is a real fact, but it
+       answers a proxy question and goes stale: once this game saves that area (its copy still missing) the next restart loads its own
+       file, the row reads trusted again and the hold is back; a quit without saving after the copy was made is not covered at all;
+   (C) decide from the pieces actually there - PICKED. A copy-list row says "this game once made this copy"; it is this game's cache,
+       not the world. What the world holds here is answered by (a)-(d): the area's saved pieces are all in (the engine's own loaded
+       byte, (c)), every other piece on the host's list resolved and keyed with none at or near the key, and every handle that did not
+       resolve answers null from BOTH engine lookups - no object exists for it - unchanged for kBuildDeadHandleWait safe points. A copy
+       this game saved would be a live piece on that list (found, or a hit); a real copy present is still refused. As established
+       games treat a stale client cache entry against the server's record: the world's record wins, the cache is refreshed from it
+       (the made copy refreshes the row, BdCopyListNote). A row marked removed here (the reconcile removes a returning copy) or a
+       hand-over this game made (PcrHandLoadPass owns it) is not plain and keeps the hold. */
 inline int BuildDeadHandlesIgnore(const BuildDeadHandleIn& x)
 {
     if (x.listed < 0 || x.n != x.listed || x.cut != 0 || x.torn != 0) return 0;                        /* (a) the list read whole */
@@ -3072,8 +3900,27 @@ inline int BuildDeadHandlesIgnore(const BuildDeadHandleIn& x)
     if (x.dead <= 0) return 0;                                                                         /* (b) */
     if (x.areaLoaded == 0) return 0;                                                                   /* (c) */
     if (x.setAge < kBuildDeadHandleWait) return 0;                                                     /* (d) (-1 fails too) */
-    if (x.regRow != 0 || x.copyListRow != 0 || x.removedMark != 0) return 0;                          /* (e) */
+    if (x.regRow != 0 || x.removedMark != 0) return 0;                                                 /* (e) */
+    if (x.copyListRow != 0 && x.copyRowPlain == 0) return 0;                                           /* (e) T-1343: only a plain row is void */
+    if (x.copyListRow != 0 && x.goodMayBeCopy != 0) return 0;   /* (e) T-1343 review: a saved copy can stand under another key (a key mismatch
+                                                                   at its making, the town-version swap) and reads 'good', not a hit - a
+                                                                   piece of the row's record anywhere in the house keeps the hold (-1 too) */
     return 1;
+}
+/* T-1343 review: one 'good' piece on the host's list, for BuildDeadHandleIn::goodMayBeCopy - 1 = it may be the row's own copy standing
+   under another key: its record id equals the row's (sameSid 1) or did not read (-1), and its own key has no registry row and no
+   copy-list row here (a piece this game already accounts for - another copy of the same type - is not it). The record id is per TYPE,
+   so a house's own set-piece of the same type also counts (Inferred rare; the hold stays then, as before T-1343). */
+inline int BuildGoodMayBeCopy(int sameSid, int ownRegRow, int ownCopyRow)
+{
+    if (sameSid == 0) return 0;
+    if (ownRegRow != 0 || ownCopyRow != 0) return 0;
+    return 1;
+}
+/* T-1343: the copy-list row's kind as BuildDeadHandleIn::copyRowPlain reads it - 1 = listed, not marked removed, not a hand-over */
+inline int BuildCopyRowPlain(int listed, int removed, int handed)
+{
+    return (listed != 0 && removed == 0 && handed == 0) ? 1 : 0;
 }
 /* T-1240: which pending entry may use BuildDeadHandlesIgnore. A copy (restore 0): always (T-903). A restore keeps the hold - a dead
    handle can be this very saved piece, not loaded yet (never an empty twin) - except a piece another game wrote into this game's
@@ -3304,6 +4151,22 @@ inline int BuildEngineGivesInterior(int read, int kind, int interiorPtr, int wal
 {
     return (read != 0 && kind == 0 && interiorPtr != 0 && wallPart == 0 && gate == 0 && interiorFlag == 0) ? 1 : 0;
 }
+/* T-1426 (.modding/05-findings.md F1221 / F1245): furniture (a hosted piece) gets nothing from BuildWalkMapWhat - the engine queues it
+   only through its HOST. The placement confirm's build step 0x4D6810 (decomp_4d6810:365-373) reads each piece's host hand (vt+0x1D8),
+   and unless its type is none (0xB) puts that hand on the list's interior jobs (+0x58, the list 0x4D2340 appends a building's own hand
+   to). So a furniture piece the mod makes, re-makes from a record, makes for a kept row, finishes or removes owes its host's interior
+   walking map - when the engine's own test (BuildEngineGivesInterior) gives the host one. 1 queue the host's interior; 0 not owed (not
+   furniture, or another event: a threshold crossing or a body's arrival - furniture never waits for a body); kWmHostNone the piece
+   names no host building; kWmHostNoInterior the host gets no interior walking map. */
+const int kWmHostNone = -1, kWmHostNoInterior = -2;
+inline int BuildWalkMapHostInterior(int event, int furniture, int hostKnown, int hostInterior)
+{
+    if (furniture == 0) return 0;
+    if (event != kWmCopyMade && event != kWmCopyRestored && event != kWmKeptMade && event != kWmFinished && event != kWmRemoved) return 0;
+    if (hostKnown == 0) return kWmHostNone;
+    if (hostInterior == 0) return kWmHostNoInterior;
+    return 1;
+}
 /* the piece stands solid in the walking map: finished, or its progress at or past its build threshold (a share of needed) */
 inline int BuildWalkMapSolid(int complete, float progress, float needed, float threshold)
 {
@@ -3377,11 +4240,173 @@ inline float BuildWallCrossStep(float needed, float rate, int tryNo)
    +0x228 - the engine step that gives it its body (0x5594A0 crosses a wall's line only with that list set). A piece the mod queues
    while its list is still empty (bodyList 0; 1 set, -1 unreadable) waits, keyed by the piece, and is queued again from that hook
    (kWmBodyArrived) - no timer. Removals, the arrival itself and furniture never wait */
-const int kWmBodyWaitCap = 256;
+const int kWmBodyWaitCap = 384;   /* T-1389: 256 for the walk map plus the piece check's own waits (kPcBodyWaitPcCap 128) */
 inline int BuildWalkMapBodyWait(int event, int bodyList, int furniture)
 {
     if (bodyList != 0 || furniture != 0) return 0;
     return (event == kWmCopyMade || event == kWmCopyRestored || event == kWmKeptMade || event == kWmFinished || event == kWmThreshold) ? 1 : 0;
+}
+/* T-1428 (.modding/05-findings.md F1226 / F1223). The building's box +0x27C (an Ogre::Aabb: centre x,y,z then half-size x,y,z) is the
+   engine's 'nothing' box (half-size minus infinity, decomp_55c000:106-112) until its models are loaded: each model part that finishes
+   loading merges its world box in (0x5580B0 -> 0x546980), and the whole-box recount 0x5489F0 does the same - both only once the
+   physics holder +0x228 is made, and createPhysical writes no box. So a holder set does not mean a box filled in. The engine's
+   job-adding step 0x3C68E0 (decomp_3c68e0:18-20) refuses a box whose half-size is not above zero on all three axes: a box queued
+   before the models load cuts nothing. A NaN or minus infinity half-size is not real */
+inline int BuildWalkMapBoxReal(const float* box)
+{
+    return (box != 0 && box[3] > 0.0f && box[4] > 0.0f && box[5] > 0.0f) ? 1 : 0;
+}
+/* the engine's own asks with a building's box (setDestroyed 0x5567F0 [1.0.68 0x557780]; the upgrade 0x2A49A0 / downgrade 0x2A4D70)
+   grow its half-size +0x288 by the constant at 0x1684340 [1.0.68 0x1685340] before the job and put it back after: 5.0 in both builds
+   (read from both exes, T-1428). The mod queues a grown COPY (the queue 0x4D21F0 copies the box) and leaves the building's own alone */
+const float kWmBoxNudge = 5.0f;
+inline void BuildWalkMapBoxNudged(const float* in, float* out)
+{
+    for (int i = 0; i < 3; ++i) out[i] = in[i];
+    for (int i = 3; i < 6; ++i) out[i] = in[i] + kWmBoxNudge;
+}
+/* T-1428: a walking-map ask that owes the piece's box waits while the box is not real (BuildWalkMapBoxReal) - in the walk-map wait
+   (kWmBodyWaitCap), re-checked each tick beside the T-1389 bodies watch and at the createPhysical arrival - and asks (kWmBodyArrived)
+   the first time it is real. A removal never waits (its box is copied before the dismantle). Replaces the holder test
+   (BuildWalkMapBodyWait) at the ask: the holder is made at creation, the box later. Fold 1: boxReal is BuildWalkMapBoxReady (the grown
+   box real and every model part loaded), and the wait is in its own list (BdBoxWait), re-checked each tick */
+inline int BuildWalkMapBoxWait(int event, int what, int boxReal)
+{
+    if (event == kWmRemoved || (what & kWmBox) == 0) return 0;
+    return (boxReal != 0) ? 0 : 1;
+}
+/* what is queued now. T-1428 fold 1 (review 4): while the box waits NOTHING goes now - the interior (keyed on the building,
+   decomp_4d2340) goes with the box at the re-ask, after the outdoor cut, in the engine's own order (its asks queue the box, then the
+   interior); one interior ask per event, not two. A wait that never gets a real box still sends its interior at the time cap
+   (BuildWalkMapBoxDue kWmBoxNoBox) */
+inline int BuildWalkMapQueueNow(int what, int boxWait) { return (boxWait != 0) ? 0 : what; }
+/* T-1428 fold 1 (review 3): the engine tests the GROWN box (its asks grow +0x288 by kWmBoxNudge before the job-adding test 0x3C68E0,
+   decomp_3c68e0:18-20), so the mod tests the grown copy it queues: a box flat on one side (half-size 0 there) counts, as the engine's
+   would; the 'nothing' box (minus infinity) and NaN stay not real */
+inline int BuildWalkMapBoxGrownReal(const float* box)
+{
+    if (box == 0) return 0;
+    float g[6];
+    BuildWalkMapBoxNudged(box, g);
+    return BuildWalkMapBoxReal(g);
+}
+/* T-1428 fold 1 (review 1): the building's count of model parts still loading, +0x230 (an int). The part maker 0x55D6C0 raises it
+   for each model it asks to load (0x55D8F8; 1.0.68 0x55E388); the part-loaded step 0x5580B0 lowers it (0x5581D9; 1.0.68 0x558C69),
+   merges that part's box into +0x27C, and at 0 sets +0x234 and calls vt+0x490; the constructors 0x55C000 / 0x55C310 and 0x561F10
+   put it to 0. The box grows one part at a time, so the ask waits for the box real AND the count at 0 (every part in). The count
+   can stay above 0 for good: 0x5580B0 lowers it only for a part it finds in the holder, so a load that never comes back, or comes back
+   after the holder was rebuilt, leaves it raised. Give-up: after kWmBoxWaitMs the ask goes with the box it has (some cut beats none),
+   or, with no real box, its interior alone - logged once */
+const unsigned int kWmBoxWaitMs = 60000;
+const int kWmBoxKeep = 0, kWmBoxAsk = 1, kWmBoxAskPartial = 2, kWmBoxNoBox = 3;
+inline int BuildWalkMapBoxReady(int grownReal, int partsLoading) { return (grownReal != 0 && partsLoading <= 0) ? 1 : 0; }
+inline int BuildWalkMapBoxDue(int grownReal, int partsLoading, unsigned int waitedMs)
+{
+    if (BuildWalkMapBoxReady(grownReal, partsLoading) != 0) return kWmBoxAsk;
+    if (waitedMs < kWmBoxWaitMs) return kWmBoxKeep;
+    return (grownReal != 0) ? kWmBoxAskPartial : kWmBoxNoBox;
+}
+/* T-1428 fold 1 (review 2): the box waits have their own list, growable - no cap, no drop (a joiner loading a large base may hold
+   hundreds); the shared kWmBodyWaitCap list keeps only the waits the createPhysical hook must see (a wall's crossing, the piece check).
+   A box wait for a piece whose wall crossing already waits is not added (the arrival asks it), and a crossing wait added later takes
+   the piece's box wait over */
+inline int BuildWalkMapBoxWaitKeep(int crossWaits) { return (crossWaits != 0) ? 0 : 1; }
+/* a waiting ask gives up (logged once with its key): its area ended (area unload: the piece's own area, or any area for a wait with no
+   key - its area is not known; world left: every wait), or the address now holds another object */
+const int kWmGiveUpArea = 1, kWmGiveUpWorld = 2, kWmGiveUpOther = 3;
+inline int BuildWalkMapWaitAreaEnds(int keyKnown, int keySector, const unsigned char* left, int cells)
+{
+    if (left == 0) return 1;
+    if (keyKnown == 0 || keySector < 0 || keySector >= cells) return 1;
+    return (left[keySector] != 0) ? 1 : 0;
+}
+inline const char* BuildWalkMapGiveUpWord(int why)
+{
+    switch (why)
+    {
+    case kWmGiveUpArea: return "its area ended";
+    case kWmGiveUpWorld: return "the world was left";
+    case kWmGiveUpOther: return "another object at that address";
+    default: return "?";
+    }
+}
+/* T-1428 attempt 2 (.modding/06-hypotheses.md H-T1428-nocut; F1339 / F1340): a piece the mod makes from its record into an area that
+   is already loaded (the restore road, a re-make, a world-reset kept row) is never cut out of the area's OUTDOOR walking map - the
+   engine cuts a building out only at its own placement confirm (0x4DA6F0) or when its own area load finds the area's buildings hash
+   changed (0x3ADF30 -> Full). So after an area's restored pieces are made and their models loaded, the mod asks the engine's own
+   whole-area rebuild ONCE for that area: 1.0.65 0x3AB700 (1.0.68 0x3AB840; rows ZoneWalkMapRebuild, NavMeshManagerPtr
+   0x2133560 / 0x21345C0), called as the engine's 'Fixed broken save data' key (0x7875C0) and regenerate-zone (0x76B850) call it - on
+   the main thread, with the ZoneManager's map entry for the area (0xA07C10) - Full for the area plus every building's inside job.
+   0x3AB700 itself first asks 0x3BF360(walkMapJobs = navMgr+0x290, zoneMap) and does nothing when it answers 1: the job running now
+   (+0xE8) is this area's with type (+0x58 & 7) 1, or a QUEUED job (list +0x88, next +0x60) is this area's with type not 1.
+   T-1428 fold 2 (F1361 SHOULD 2): read from the decompile, build/t1428c/dc_3bf360.txt (1.0.65 0x3BF360; 1.0.68 0x3BF4A0 has the same
+   bytes) - running job *(jobs+0xE8), job key at +0, the type dword +0x58 tested as (byte & 7) == 1, the queue *(jobs+0x88), next
+   +0x60; no lock taken (only the adders 0x3C66E0 / 0x3C6E90 take +0x98, so the mod reads unlocked as the engine's own reader does).
+   The job object is 0x3BFB50's 0x68 bytes (dc_3bfb50.txt; 1.0.68 0x3BFC90): key +0, box +0x30, +0x58 zeroed, next +0x60; the type
+   is written by its adder: Full 0 (0x3C66E0), Partial 1 (0x3C68E0), Interior 3 (0x3C6E90).
+   The mod reads the same facts first (fold 2, F1361 SHOULD 1): only a QUEUED FULL job (type 0) of the area covers the pieces (done);
+   any other queued job of the area (an Interior, which does not redo the outdoor map) makes 0x3AB700 skip too, so the mod waits and
+   asks again once it has left the queue; a running Partial may have read the area before the pieces were made - asked again once it
+   has ended. Both waits share the kZoneRbRunWaitMs cap. */
+const unsigned int kZoneRbQuietMs = 2000;    /* no new restored piece noted in the area for this long: its restores are made */
+const unsigned int kZoneRbWaitMs = 60000;    /* pieces whose models still load at this age: the rebuild goes anyway (kWmBoxWaitMs) */
+const unsigned int kZoneRbRunWaitMs = 30000; /* the engine's own running job (or a queued non-Full) for the area: asked again until this, then GAVE UP */
+const int kZoneRbReadRetries = 50;           /* fold 2 (F1361 NIT): a fault reading the area or the job list is tried again next tick, this many times */
+const int kZrbKeep = 0, kZrbAsk = 1, kZrbAskTimedOut = 2;
+/* fold 2 (F1361 NIT): a noted piece is ready when its grown box is real, its model parts are in (BuildWalkMapBoxReady) AND its physics
+   list holds at least one body - the area job carves only the physics objects (dc_3c4250:30-38) and F1315 saw parts loaded with 0
+   bodies. bodies: PcPhysPod's count (-1 unreadable) */
+inline int BuildZoneRebuildPieceReady(int grownReal, int partsLoading, int bodies)
+{
+    return (BuildWalkMapBoxReady(grownReal, partsLoading) != 0 && bodies > 0) ? 1 : 0;
+}
+inline int BuildZoneRebuildReadRetry(int faults) { return (faults < kZoneRbReadRetries) ? 1 : 0; }
+/* when an area's rebuild is due: every noted piece's model parts loaded and its grown box real (BuildWalkMapBoxReady), and the area
+   quiet; at kZoneRbWaitMs it goes with what it has. pieces 0 (every noted piece gone): nothing (kZrbKeep - the caller drops it) */
+inline int BuildZoneRebuildDue(int pieces, int ready, unsigned int quietMs, unsigned int waitedMs)
+{
+    if (pieces <= 0) return kZrbKeep;
+    if (quietMs < kZoneRbQuietMs) return kZrbKeep;
+    if (ready >= pieces) return kZrbAsk;
+    return (waitedMs >= kZoneRbWaitMs) ? kZrbAskTimedOut : kZrbKeep;
+}
+/* the engine's own skip (0x3BF360), read as it reads it. curZone / qZone: the job's area is this one (1), curType / qType: its +0x58 */
+inline int BuildZoneRebuildSkipCur(int curZone, int curType) { return (curZone != 0 && (curType & 7) == 1) ? 1 : 0; }
+inline int BuildZoneRebuildSkipQueued(int qZone, int qType) { return (qZone != 0 && (qType & 7) != 1) ? 1 : 0; }
+/* fold 2 (F1361 SHOULD 1): a queued job of the area that is a Full (type 0, 0x3C66E0) - the only queued job that covers the pieces */
+inline int BuildZoneRebuildQueuedFull(int qZone, int qType) { return (qZone != 0 && (qType & 7) == 0) ? 1 : 0; }
+/* what the mod does with the area now: ask; the engine's queued FULL job covers it (done); the engine's running job, or a queued job of
+   the area that is not a Full - again later (fold 2); or the area is not loaded (its map entry has no area: 0x3AB700 would read through a
+   null) - given up. skipQueued: a queued job 0x3BF360 skips for (type not 1); queuedFull: one of them is a Full */
+const int kZrbDoAsk = 0, kZrbDoneQueued = 1, kZrbAgainRunning = 2, kZrbNoArea = 3, kZrbNoRows = 4, kZrbAgainQueued = 5;
+inline int BuildZoneRebuildAct(int rowsOk, int area, int skipRunning, int skipQueued, int queuedFull)
+{
+    if (rowsOk == 0) return kZrbNoRows;
+    if (area == 0) return kZrbNoArea;
+    if (queuedFull != 0) return kZrbDoneQueued;
+    if (skipRunning != 0) return kZrbAgainRunning;
+    if (skipQueued != 0) return kZrbAgainQueued;
+    return kZrbDoAsk;
+}
+/* the events that note a piece for its area's rebuild: made from its record into a loaded area (restored, a re-make, a kept row); a
+   teammate's single live copy is not one (its own box ask, BdWalkMapNote) and furniture never (its host's inside job is the rebuild's) */
+inline int BuildZoneRebuildNotes(int restored, int remake, int kept, int furniture)
+{
+    if (furniture != 0) return 0;
+    return (restored != 0 || remake != 0 || kept != 0) ? 1 : 0;
+}
+inline const char* BuildZoneRebuildActWord(int act)
+{
+    switch (act)
+    {
+    case kZrbDoAsk: return "asked";
+    case kZrbDoneQueued: return "skipped: the engine's own Full job for this area is queued (0x3BF360) - it covers the pieces";
+    case kZrbAgainQueued: return "waits: a queued engine job for this area is not a Full (0x3BF360 would skip) - asked again when it has left the queue";
+    case kZrbAgainRunning: return "waits: the engine's own job for this area is running (0x3BF360) - asked again when it ends";
+    case kZrbNoArea: return "GAVE UP: the area is not loaded here";
+    case kZrbNoRows: return "NOT ASKED: ZoneWalkMapRebuild / NavMeshManagerPtr / ZoneManagerPtr is not in the address table";
+    default: return "?";
+    }
 }
 /* fold 2 (H2(b)): a wall whose crossing waited for its body gets it at the arrival when it is still unfinished, not destroyed and at
    or past its line (the mod's write landed there): written to just below the line and crossed with its own vt+0x230, then put back */
@@ -3413,6 +4438,8 @@ inline const char* BuildWalkMapEventWord(int event)
 /* how the piece came to be finished on this game, as the SUSPECT line names it */
 const int kPcRoadPlaced = 1, kPcRoadLeverPlace = 2, kPcRoadBuilt = 3, kPcRoadLeverProgress = 4, kPcRoadCopyMade = 5, kPcRoadCopyAdopted = 6,
           kPcRoadRestored = 7, kPcRoadOwnerState = 8, kPcRoadHelp = 9, kPcRoadAreaLoad = 10;
+const int kPcRoadRecord = 11, kPcRoadBodyArrived = 12, kPcRoadHandover = 13, kPcRoadSave = 14, kPcRoadWorldReset = 15, kPcRoadProgressEvent = 16,
+          kPcRoadLever = 17, kPcRoadAreaUnload = 18, kPcRoadWorldLeft = 19, kPcRoadLast = 19;   /* T-1389; 18, 19: the re-check's area-end events */
 inline const char* PieceCheckRoadWord(int road)
 {
     switch (road)
@@ -3427,8 +4454,534 @@ inline const char* PieceCheckRoadWord(int road)
     case kPcRoadOwnerState: return "ownerState";
     case kPcRoadHelp: return "help";
     case kPcRoadAreaLoad: return "areaLoad";
+    case kPcRoadRecord: return "record";
+    case kPcRoadBodyArrived: return "bodyArrived";
+    case kPcRoadHandover: return "handover";
+    case kPcRoadSave: return "save";
+    case kPcRoadWorldReset: return "worldReset";
+    case kPcRoadProgressEvent: return "progressEvent";
+    case kPcRoadLever: return "lever";
+    case kPcRoadAreaUnload: return "areaUnload";
+    case kPcRoadWorldLeft: return "worldLeft";
     default: return "?";
     }
+}
+
+/* ==== T-1389 (owner decision 1712, 2026-11-16): THE BUILDING CHECK BY BUILD STAGE - LOG ONLY ==========================================
+   Owner: "we need the ability to differentiate between a building that is still in construction because in that case it shouldn't be
+   complete, while also being able to make sure a building doesn't revert to a precompleted state as part of a bug."
+   Every player wall, gate and building is judged at each event that touches it, finished or not, by its stage (PieceStageOf: the
+   build state +0x160 complete, +0x162 taken apart, +0x1A1 destroyed; a wall in a group reads its leader's record). Its model parts,
+   models and doors are counted against what its record makes - the same set at every stage (the engine makes the same parts at every
+   stage and fades them by a shader value, decomp_558680:28-65; collision pieces at every stage, decomp_55ec50:485-581; Read). A ruin's
+   models are its 'destroyed mesh' and are not counted. A finished piece's physics body is judged as T-988 judged it; an unfinished
+   one's is not (Inferred: its physics group is the engine's below-threshold one). The came-back rule (PieceCameBack) names a finished
+   building that shows unfinished again with none of the legitimate drops behind it. The roads (kPcRoad*) are above. */
+/* the road in plain words, as the T-1389 lines name it ("at: <road>") */
+inline const char* PieceCheckRoadPlain(int road)
+{
+    switch (road)
+    {
+    case kPcRoadPlaced: return "placement";
+    case kPcRoadLeverPlace: return "placement by a test lever";
+    case kPcRoadBuilt: return "finishing";
+    case kPcRoadLeverProgress: return "a test lever's progress";
+    case kPcRoadCopyMade: return "copy made";
+    case kPcRoadCopyAdopted: return "copy taken on";
+    case kPcRoadRestored: return "remade from the record";
+    case kPcRoadOwnerState: return "the owner's STATE";
+    case kPcRoadHelp: return "a helper's work";
+    case kPcRoadAreaLoad: return "area load";
+    case kPcRoadRecord: return "the shared record applied";
+    case kPcRoadBodyArrived: return "physics arrived";
+    case kPcRoadHandover: return "handover";
+    case kPcRoadSave: return "save";
+    case kPcRoadWorldReset: return "world-reset rebuild";
+    case kPcRoadProgressEvent: return "a progress event that unfinished it";
+    case kPcRoadLever: return "test lever";
+    case kPcRoadAreaUnload: return "area unload";
+    case kPcRoadWorldLeft: return "the world left";
+    default: return "?";
+    }
+}
+const int kPcStageUnread = 0, kPcStageFinished = 1, kPcStageBuilding = 2, kPcStageRuin = 3, kPcStageTakenApart = 4;
+/* the stage the piece's own state reads: taken apart first (it is going), then a ruin (+0x1A1 - complete may still read 1), then
+   finished / under construction */
+inline int PieceStageOf(int stateOk, int complete, int dismantled, int destroyed)
+{
+    if (stateOk == 0) return kPcStageUnread;
+    if (dismantled != 0) return kPcStageTakenApart;
+    if (destroyed != 0) return kPcStageRuin;
+    return (complete != 0) ? kPcStageFinished : kPcStageBuilding;
+}
+inline const char* PieceStageWord(int stage)
+{
+    switch (stage)
+    {
+    case kPcStageFinished: return "finished";
+    case kPcStageBuilding: return "under construction";
+    case kPcStageRuin: return "ruin";
+    case kPcStageTakenApart: return "taken apart";
+    default: return "unread";
+    }
+}
+/* what was read off the piece and what its record makes. -1 = not read (never judged). holder: the model holder +0x228 (1 set, 0 none
+   yet - the piece's physics and models are not made yet, F1046) */
+struct PieceWholeIn
+{
+    int stage, holder;
+    int parts, partsWant, models, modelsWant, doors, doorsWant;
+    int node, material, interior, interiorWant;
+    int bodiesJudged, bodies;
+    int shown;   /* T-1389 fold (NOTE b): +0x19D - 1 shown, 0 hidden (a part's model exists only while the building is shown: models not judged), -1 unread */
+    PieceWholeIn() : stage(kPcStageUnread), holder(-1), parts(-1), partsWant(-1), models(-1), modelsWant(-1), doors(-1), doorsWant(-1),
+                     node(-1), material(-1), interior(-1), interiorWant(-1), bodiesJudged(0), bodies(-1), shown(-1) {}
+};
+/* T-36 (F1186, probe P297; Read 1.0.65 0x54C2A0, run by the model-loaded step 0x5580B0, which keeps its answer at part+0x20): the material
+   set ONE model part of a building is drawn with - its own record's (part+0x28) 'material' list when that list is not empty (its first
+   entry), else the building's material slot +0x248 when set, else the engine's default set kPieceDefaultMaterial. PieceWholeIn::material
+   judges what the parts resolve to, never +0x248 alone: a teammate's copy whose +0x248 is empty while every part carries its own set looks
+   the same to a player (T2497: 'own 11, from +0x248 0, DEFAULT 360 0' on both games) */
+const char* const kPieceDefaultMaterial = "360-gamedata.base";
+const int kPcMatUnread = -1, kPcMatOwn = 0, kPcMatSlot = 1, kPcMatDefault = 2;
+/* one part as read: ownRefs - entries in its record's 'material' list (-1 the record or the list not read); ownSid - the first entry's
+   string id (empty = not read) */
+struct PieceMatPart
+{
+    int ownRefs;
+    std::string ownSid;
+    PieceMatPart() : ownRefs(-1) {}
+};
+/* where the engine takes one part's set from. slotSet: +0x248 set 1 / empty 0 / not read -1 */
+inline int PieceMaterialSource(int ownRefs, int slotSet)
+{
+    if (ownRefs < 0) return kPcMatUnread;
+    if (ownRefs > 0) return kPcMatOwn;
+    if (slotSet < 0) return kPcMatUnread;
+    return slotSet != 0 ? kPcMatSlot : kPcMatDefault;
+}
+/* one part: 1 drawn with a set other than the default, 0 drawn with the default (by the rule's last step, or a set that IS the default),
+   -1 unread. slotSid: +0x248's string id (empty = not read) */
+inline int PieceMaterialPartOk(const PieceMatPart& p, int slotSet, const std::string& slotSid)
+{
+    const int s = PieceMaterialSource(p.ownRefs, slotSet);
+    if (s == kPcMatUnread) return -1;
+    if (s == kPcMatDefault) return 0;
+    const std::string& sid = (s == kPcMatOwn) ? p.ownSid : slotSid;
+    if (sid.empty()) return -1;
+    return sid == kPieceDefaultMaterial ? 0 : 1;
+}
+/* THE MATERIAL VERDICT (PieceWholeIn::material): 0 = some part would be drawn with the default set (the line's 'material' word); else -1
+   (not judged) when any part is unread, the holder has more parts than were read (n < total) or no part was read; else 1. parts: the n
+   parts read; total: the parts in the model holder */
+inline int PieceMaterialVerdict(const PieceMatPart* parts, int n, int total, int slotSet, const std::string& slotSid)
+{
+    int unread = (n <= 0 || n < total || parts == 0) ? 1 : 0;
+    for (int i = 0; parts != 0 && i < n; ++i)
+    {
+        const int v = PieceMaterialPartOk(parts[i], slotSet, slotSid);
+        if (v == 0) return 0;
+        if (v < 0) unread = 1;
+    }
+    return unread != 0 ? -1 : 1;
+}
+/* what is missing, comma-separated in this order (empty = whole for its stage): models and physics (none made), parts, models, doors,
+   scene node, material, interior, physics body. A ruin's parts and models are its destroyed mesh - not counted; its doors are not
+   judged either (Guess: a ruin may lose them). The interior is judged on a finished piece only. Unread values are never judged */
+inline std::string PieceWholeMissing(const PieceWholeIn& x)
+{
+    if (x.holder == 0) return "models and physics (none made)";
+    std::string w;
+    char t[96];
+    if (x.stage != kPcStageRuin)
+    {
+        if (x.parts >= 0 && x.partsWant >= 0 && x.parts < x.partsWant) { std::sprintf(t, "parts (%d of %d)", x.parts, x.partsWant); w += (w.empty() ? "" : ", "); w += t; }
+        if (x.shown != 0 && x.models >= 0 && x.modelsWant >= 0 && x.models < x.modelsWant) { std::sprintf(t, "models (%d of %d)", x.models, x.modelsWant); w += (w.empty() ? "" : ", "); w += t; }
+        if (x.doors >= 0 && x.doorsWant >= 0 && x.doors < x.doorsWant) { std::sprintf(t, "doors (%d of %d)", x.doors, x.doorsWant); w += (w.empty() ? "" : ", "); w += t; }
+    }
+    if (x.node == 0) { w += (w.empty() ? "" : ", "); w += "scene node"; }
+    if (x.material == 0) { w += (w.empty() ? "" : ", "); w += "material"; }
+    if (x.stage == kPcStageFinished && x.interiorWant == 1 && x.interior == 0) { w += (w.empty() ? "" : ", "); w += "interior"; }
+    if (x.bodiesJudged != 0 && x.bodies == 0) { w += (w.empty() ? "" : ", "); w += "physics body"; }
+    return w;
+}
+/* What this game has seen of one piece this session (per key, MAIN THREAD). finished: seen finished (and not since dropped by a
+   legitimate road) - finishedRoad: the road it was first seen finished at (kPcRoad*, 0 unknown); ruin: seen a ruin since it was last
+   seen finished; takenApart: seen taken apart (cleared by a later finished reading - a cancelled dismantle, T-1389 fold NOTE a); dropOk:
+   a legitimate drop was seen (a ruin being repaired - 558b10:60-86 clears complete, lowers progress and clears destroyed - or taken
+   apart) and it has not been seen finished since; said: the came-back line was written for this placement; placement: the placement
+   number last seen */
+struct PieceSeen
+{
+    int finished, ruin, takenApart, dropOk, said, finishedRoad;
+    unsigned int placement;
+    PieceSeen() : finished(0), ruin(0), takenApart(0), dropOk(0), said(0), finishedRoad(0), placement(0u) {}
+};
+/* WHICH TRUTH decided a came-back (T-1389 fold 3) - the line names it */
+const int kPcTruthNone = 0, kPcTruthRecord = 1, kPcTruthSeen = 2, kPcTruthOwner = 3;
+/* THE CAME-BACK RULE for THIS GAME'S OWN piece, judged on a FRESH live read BEFORE that read is noted (PieceSeenNote). Returns the truth
+   that decided (kPcTruthRecord: the shared record says finished - recordFinished, complete and not a ruin; kPcTruthSeen: this game saw it
+   finished this session) or kPcTruthNone. The live piece reads complete 0 - not a ruin now or since it was last finished (a repair), not
+   taken apart, the same placement number (record's, last seen and live, where known). Damage alone lowers progress only (complete stays
+   1) - never a came-back. A teammate's copy is judged by PieceCameBackCopy, never here */
+inline int PieceCameBack(const PieceSeen& s, int recordFinished, unsigned int recordPlacement, int liveOk, int complete, int dismantled,
+                         int destroyed, unsigned int livePlacement)
+{
+    if (liveOk == 0) return kPcTruthNone;
+    if (complete != 0 || dismantled != 0 || destroyed != 0) return kPcTruthNone;
+    if (s.ruin != 0 || s.takenApart != 0 || s.dropOk != 0) return kPcTruthNone;
+    if (recordPlacement != 0u && livePlacement != 0u && recordPlacement != livePlacement) return kPcTruthNone;   /* a new placement at the key */
+    if (recordFinished != 0) return kPcTruthRecord;
+    const int seenSame = (s.placement == 0u || livePlacement == 0u || s.placement == livePlacement) ? 1 : 0;
+    return (s.finished != 0 && seenSame != 0) ? kPcTruthSeen : kPcTruthNone;
+}
+/* T-1389 fold 1: a teammate's copy counts as 'no STATE yet' from each (re)make until an owner's STATE lands AFTER it was made (a re-made
+   copy is made 0 of needed; its owner's last STATE is only queued then). isCopy: another player's piece on this game; ownerKnown: the
+   row's ownerLast holds a STATE; awaitSinceMade: made or re-made here and no owner's STATE applied since */
+inline int PieceCopyNoState(int isCopy, int ownerKnown, int awaitSinceMade)
+{
+    return (isCopy != 0 && (ownerKnown == 0 || awaitSinceMade != 0)) ? 1 : 0;
+}
+/* T-1389 fold 2: THE CAME-BACK RULE for a teammate's COPY - judged by its OWNER's last STATE (ownerLast), never by this game's memory
+   (this game may have missed a ruin and its repair while away: the owner's STATE unfinishing it is legit). kPcTruthOwner only when that
+   STATE says finished (complete, not a ruin) and the live copy reads complete 0, not a ruin, not taken apart, the same placement (the
+   record's, where this event has it, and the row's). A copy with no STATE since its (re)make is never judged */
+inline int PieceCameBackCopy(int copyNoState, int ownerComplete, int ownerDestroyed, unsigned int recordPlacement, int liveOk, int complete,
+                             int dismantled, int destroyed, unsigned int livePlacement)
+{
+    if (copyNoState != 0 || liveOk == 0) return kPcTruthNone;
+    if (complete != 0 || dismantled != 0 || destroyed != 0) return kPcTruthNone;
+    if (ownerComplete == 0 || ownerDestroyed != 0) return kPcTruthNone;
+    if (recordPlacement != 0u && livePlacement != 0u && recordPlacement != livePlacement) return kPcTruthNone;   /* a new placement at the key */
+    return kPcTruthOwner;
+}
+/* a live read noted (after the came-back rule ran on it). road: the road it was read at (kPcRoad*) - kept as finishedRoad when it is
+   first seen finished */
+inline void PieceSeenNote(PieceSeen* s, int complete, int dismantled, int destroyed, unsigned int placement, int road = 0)
+{
+    if (placement != 0u && s->placement != 0u && placement != s->placement) *s = PieceSeen();   /* a new placement: nothing seen of it yet */
+    if (placement != 0u) s->placement = placement;
+    if (dismantled != 0) { s->takenApart = 1; s->dropOk = 1; return; }
+    if (destroyed != 0) { s->ruin = 1; return; }
+    if (complete != 0)
+    {
+        if (s->finished == 0) s->finishedRoad = road;
+        s->finished = 1; s->ruin = 0; s->dropOk = 0; s->said = 0; s->takenApart = 0;   /* fold NOTE a: a cancelled dismantle no longer silences the rule */
+        return;
+    }
+    if (s->ruin != 0) { s->dropOk = 1; s->ruin = 0; s->finished = 0; s->finishedRoad = 0; }   /* a ruin read unfinished and whole again: it is being repaired */
+}
+/* the record's 'finished': complete and not a ruin */
+inline int PieceRecordFinished(int complete, int destroyed) { return (complete != 0 && destroyed == 0) ? 1 : 0; }
+/* the line kinds */
+const int kPcLineWhole = 1, kPcLineBuilding = 2, kPcLineNotWhole = 3, kPcLineRuin = 4, kPcLineCameBack = 5;
+/* one count as the lines print it: '?' when not read */
+inline std::string PieceCheckCount(int v) { if (v < 0) return "?"; char t[16]; std::sprintf(t, "%d", v); return std::string(t); }
+/* T-1389 fold 3: which truth decided a came-back, in the line's words */
+inline std::string PieceCameBackTruthText(int truth, int seenRoad)
+{
+    if (truth == kPcTruthRecord) return "the record says finished";
+    if (truth == kPcTruthOwner) return "the owner's last state says finished";
+    if (truth == kPcTruthSeen) return std::string("this game saw it finished at ") + (seenRoad > 0 ? PieceCheckRoadPlain(seenRoad) : "?");
+    return "?";
+}
+/* T-1389 fold NOTE d: the old SUSPECT line's facts on a NOT whole line: owner (mine / slot N / slot ?), area and position */
+inline std::string PieceCheckFactsText(int mine, int slot, int posOk, int ax, int ay, const float* pos)
+{
+    char t[200];
+    char own[24];
+    if (mine != 0) std::sprintf(own, "mine");
+    else if (slot >= 0) std::sprintf(own, "slot %d", slot);
+    else std::sprintf(own, "slot ?");
+    if (posOk != 0 && pos != 0) std::sprintf(t, " owner=%s area=%d,%d pos=%.1f,%.1f,%.1f", own, ax, ay, pos[0], pos[1], pos[2]);
+    else std::sprintf(t, " owner=%s area=? pos=?", own);
+    return std::string(t);
+}
+/* THE LINE WORDS (after "[PIECECHECK] "): key, kind ("building 'Name'"), and the road in plain words. solid: 1 / 0 / -1 unread. A hidden
+   piece (x.shown 0) says so: its models are not judged (fold NOTE b). truth / seenRoad: the came-back line's deciding truth (fold 3) */
+inline std::string PieceCheckLineText(int line, const std::string& key, const std::string& kind, const PieceWholeIn& x, float progress,
+                                      float needed, int solid, const std::string& missing, int road, int truth = kPcTruthRecord, int seenRoad = 0)
+{
+    std::string s = key + " " + kind + " ";
+    char t[400];
+    switch (line)
+    {
+    case kPcLineWhole:
+        s += "whole - finished, parts " + PieceCheckCount(x.parts) + "/" + PieceCheckCount(x.partsWant) + ", models "
+             + (x.shown == 0 ? std::string("not judged") : PieceCheckCount(x.models) + "/" + PieceCheckCount(x.modelsWant)) + ", doors "
+             + PieceCheckCount(x.doors) + "/" + PieceCheckCount(x.doorsWant) + ", bodies "
+             + (x.bodiesJudged != 0 ? PieceCheckCount(x.bodies) : std::string("not judged"));
+        break;
+    case kPcLineBuilding:
+        std::sprintf(t, "under construction - progress %.2f of %.2f (solid in the walking map: %s), whole for its stage", progress, needed,
+                     solid > 0 ? "yes" : (solid == 0 ? "no" : "?"));
+        s += t;
+        break;
+    case kPcLineRuin:
+        s += "ruin - its models are its destroyed mesh (not counted), whole for a ruin";
+        break;
+    case kPcLineNotWhole:
+        s += "NOT whole - missing: " + missing + " (" + PieceStageWord(x.stage) + ")";
+        break;
+    case kPcLineCameBack:
+        std::sprintf(t, ", this game shows progress %.2f of %.2f; not a ruin, not taken apart, same placement", progress, needed);
+        s += "FINISHED BUILDING CAME BACK UNFINISHED - " + PieceCameBackTruthText(truth, seenRoad) + t;
+        break;
+    default:
+        s += "?";
+        break;
+    }
+    if (x.shown == 0) s += " - hidden (its models not judged)";
+    return s + " (at: " + PieceCheckRoadPlain(road) + ")";
+}
+/* T-1389 fold 4: what a check does with a piece whose physics and models are not made yet (+0x228 empty, holder 0). kPcWaitJudge: judge it
+   now (it has them, or it waited, its wait is over and it still has none: NOT whole); kPcWaitAdd: wait for its physics-arrived event;
+   kPcWaitKeep: it waits already and its wait is pending - a second event (copy made then STATE; record + area load) keeps waiting;
+   kPcWaitDrop: its physics-arrived event found none (counted, no line) */
+const int kPcWaitJudge = 0, kPcWaitAdd = 1, kPcWaitKeep = 2, kPcWaitDrop = 3;
+/* T-1389 (F1114, 2026-11-16): a finished piece whose holder is made but whose physics bodies are not there yet (bodiesPending,
+   PieceBodiesPending) waits like a piece with no holder - the engine makes the bodies after createPhysical returns. Its holder-arrived
+   event (createPhysical) that still finds no bodies waits on for them (kPcWaitAdd), never kPcWaitDrop; the same aged limit and the same
+   'waited <n> s' words apply. bodiesPending 0 is the fold-4 rule unchanged */
+inline int PieceWaitActionFor(int holder, int bodiesPending, int bodyArrivedRoad, int waitedThisObject, int waitPending)
+{
+    if (holder != 0 && bodiesPending == 0) return kPcWaitJudge;
+    if (holder == 0 && bodyArrivedRoad != 0) return kPcWaitDrop;
+    if (bodyArrivedRoad != 0) return kPcWaitAdd;   /* its holder came, its bodies not yet: it waits for them */
+    if (waitedThisObject == 0) return kPcWaitAdd;
+    if (waitPending != 0) return kPcWaitKeep;
+    return kPcWaitJudge;
+}
+inline int PieceWaitAction(int holder, int bodyArrivedRoad, int waitedThisObject, int waitPending)
+{
+    return PieceWaitActionFor(holder, 0, bodyArrivedRoad, waitedThisObject, waitPending);
+}
+/* T-1389 (F1114): 1 = a finished piece whose holder is made and whose bodies were judged and found none - its bodies are not made yet */
+inline int PieceBodiesPending(const PieceWholeIn& x)
+{
+    return (x.stage == kPcStageFinished && x.holder == 1 && x.bodiesJudged != 0 && x.bodies == 0) ? 1 : 0;
+}
+/* T-1389 (F1114): 1 = this NOT whole line was printed already - the same stage AND the same missing set (a stage change prints again) */
+inline int PieceProblemSaid(int saidStage, const std::string& saidMissing, int stage, const std::string& missing)
+{
+    return (saidStage == stage && saidMissing == missing) ? 1 : 0;
+}
+/* T-1389 re-check (2026-11-16): a piece whose physics NEVER arrive must still be named. A wait is kept only while it is younger than
+   kPcBodyWaitLimitMs, counted from the FIRST wait of this object (an evicted wait re-added keeps it: PieceWaitSince); an older wait is
+   judged at the event that finds it (kPcWaitAged: NOT whole, 'waited <n> s for its physics'). The limit is the old SUSPECT point - the
+   T-988 check re-checked a piece with no body kPcRecheckMs (90 s) later, twice, and only one still without a body at 180 s was named.
+   No timer: the age is read at each event, and the events that end an area (area unload, the world left, a save) judge it too
+   (PieceWaitEndJudge) so a piece with no later event is named once */
+const int kPcWaitAged = 4;
+const unsigned int kPcBodyWaitLimitMs = 180000u;
+inline int PieceWaitAged(int action, int sinceKnown, unsigned int waitedMs)
+{
+    if ((action == kPcWaitKeep || action == kPcWaitAdd) && sinceKnown != 0 && waitedMs >= kPcBodyWaitLimitMs) return kPcWaitAged;
+    return action;
+}
+/* the wait's start: the same object waiting again (its wait evicted at the cap, re-added at its next event) keeps its first start */
+inline unsigned int PieceWaitSince(int sameObject, unsigned int firstSince, unsigned int now)
+{
+    return (sameObject != 0) ? firstSince : now;
+}
+/* an event that ends an area: 1 = name the still-waiting piece now (its wait is old enough and it was not named for it yet) */
+inline int PieceWaitEndJudge(int waiting, unsigned int waitedMs, int namedAlready)
+{
+    return (waiting != 0 && namedAlready == 0 && waitedMs >= kPcBodyWaitLimitMs) ? 1 : 0;
+}
+inline std::string PieceWaitedText(unsigned int waitedMs)
+{
+    char t[64];
+    std::sprintf(t, " - waited %u s for its physics", waitedMs / 1000u);
+    return std::string(t);
+}
+/* T-1389 fold 5: the line caps - healthy, problem (NOT whole) and came-back lines each their own kPcLineCap */
+const int kPcSayHealthy = 0, kPcSayProblem = 1, kPcSayCameBack = 2;
+/* the line a judged piece gets (the came-back line is its own) */
+inline int PieceCheckLineFor(int stage, const std::string& missing)
+{
+    if (!missing.empty()) return kPcLineNotWhole;
+    if (stage == kPcStageFinished) return kPcLineWhole;
+    if (stage == kPcStageRuin) return kPcLineRuin;
+    return kPcLineBuilding;
+}
+
+/* ---- T-1427 (F1265): a re-towned building's floor parts move to its new town's floor store ----
+   The engine keeps each building's floor parts (the per-floor model pieces its walk-in hides above the floor looked at) in the floor
+   store of the town it was MADE in: Building+0x1F8 = town+0x250, set only by createPhysical 0x55FF50 (and the town merge 0x926190
+   after 0x930510 moved the whole store). The walk-in 0x561AB0 looks in the store of the building's CURRENT town (0x92B0A0), so a
+   building whose town changed after it was made has no record there, its floor pass is skipped and its roof stays drawn. */
+const int kFsSame = 0, kFsMove = 1, kFsNoModels = 2, kFsNoStore = 3, kFsNoTown = 4;
+/* a top-level building re-towned: hasModels = its model list (+0x228) is made; oldStore = its +0x1F8; newStore = the new town's
+   +0x250 (0 = no town). No models yet: createPhysical will point it at the store of the town its words name then - nothing to move */
+inline int FloorStoreStep(int hasModels, unsigned long long oldStore, unsigned long long newStore)
+{
+    if (newStore == 0) return kFsNoTown;
+    if (hasModels == 0) return kFsNoModels;
+    if (oldStore == 0) return kFsNoStore;
+    return oldStore == newStore ? kFsSame : kFsMove;
+}
+/* a piece inside the moved building: its parts sit in its host's record, found through its OWN +0x1F8 at its teardown (0x92CFF0 asks
+   the store it is given for the host's record) - so a piece in the host's old store moves with it (kFsInsideMove), one already in
+   the new store stays and its parts are its host's (kFsInsideThere), one with no models or no store has nothing anywhere
+   (kFsInsideNone), and one in a third store is not touched (kFsInsideForeign: a part of it in the host's record stops the move) */
+const int kFsInsideNone = 0, kFsInsideMove = 1, kFsInsideThere = 2, kFsInsideForeign = 3;
+inline int FloorStoreInsideStep(int hasModels, unsigned long long store, unsigned long long hostOld, unsigned long long newStore)
+{
+    if (hasModels == 0 || store == 0) return kFsInsideNone;
+    if (store == hostOld) return kFsInsideMove;
+    if (store == newStore) return kFsInsideThere;
+    return kFsInsideForeign;
+}
+/* the moving group (the host and the inside pieces that move with it) is moved only when all of it was read, the reads were not cut
+   short, the new store holds no record of any of them, every part in their records belongs to one of them (or to the host's
+   interior, or to an inside piece already in the new store) - so no owner is left pointing at the old store while its parts sit in
+   the new one - and none of them has a sign highlight in the old store's second list (0x92CFF0 retires those and the re-adding road
+   0x9331D0 is not read) */
+const int kFsGroupGo = 0, kFsGroupFault = 1, kFsGroupCapped = 2, kFsGroupNewHolds = 3, kFsGroupUnknownPart = 4, kFsGroupSigns = 5;
+inline int FloorStoreGroupStep(int readOk, int capped, int newHolds, int unknownParts, int signs)
+{
+    if (readOk == 0) return kFsGroupFault;
+    if (capped != 0) return kFsGroupCapped;
+    if (newHolds != 0) return kFsGroupNewHolds;
+    if (unknownParts != 0) return kFsGroupUnknownPart;
+    if (signs != 0) return kFsGroupSigns;
+    return kFsGroupGo;
+}
+inline const char* FloorStoreGroupWord(int step)
+{
+    switch (step)
+    {
+    case kFsGroupGo: return "moved";
+    case kFsGroupFault: return "its reads FAULTED";
+    case kFsGroupCapped: return "too many parts to read";
+    case kFsGroupNewHolds: return "the new store already holds a record of it";
+    case kFsGroupUnknownPart: return "a part in its records belongs to none of the moving group";
+    case kFsGroupSigns: return "it has sign highlights (re-adding them is not read)";
+    }
+    return "?";
+}
+
+/* ---- T-1427 part 2 (owner request 2026-11-18, F1265 / F1270): THE TOWN A COPY IS CREATED IN ----
+   Every road that makes a copy of a player's outdoor piece used to pass town 0 to createBuilding (0x57C1E0), so the engine chose: the
+   town whose own area holds the spot, else the world default 'Nowhere' (57c1e0:373, 9279c0:18-58), and for an interior piece that got
+   'Nowhere' the nearest NON-player town within 10000 (57c1e0:401-433) - the owner's shack copy came out 'Squin'. Now the copy is made
+   in the town the builder's own rule gives, in this order:
+     record - the town the piece's record names (its outpost id, standing here);
+     named  - the outpost the PLACE names by its centre (townHand / townPos): the owner's town whose centre (here, or as the world
+              server's outpost list gives it) is within sameRadius of it, the nearest; else ...
+     area   - ... the owner's town whose own area holds that centre, nearest by centre;
+     near   - the owner's town nearest the spot, kept within keepRange (the placement confirm's rule, decomp_4d6300:63-87);
+     else Nowhere (*pick = -1) - never the engine's own fallback to an NPC town.
+   Candidates are the owning player's towns here (this player's own, or the towns shown here for that player's outposts). */
+const int kCtNowhere = 0, kCtRecord = 1, kCtNamed = 2, kCtNamedArea = 3, kCtNear = 4;
+struct CopyTownCand
+{
+    float cx, cz;        /* the town's own centre here (x, z) */
+    int hasList;         /* 1 = listX / listZ: its outpost's centre as the world server's list gives it (a shown town) */
+    float listX, listZ;
+    int holdsNamed;      /* 1 = the town's own area holds the named centre (the engine's inside test) */
+    int recordNamed;     /* 1 = the piece's record names this town's outpost */
+    CopyTownCand() : cx(0.0f), cz(0.0f), hasList(0), listX(0.0f), listZ(0.0f), holdsNamed(0), recordNamed(0) {}
+};
+inline float CopyTownD2(float ax, float az, float bx, float bz) { const float dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+/* the rule that picked (kCt*); *pick = the candidate, -1 = Nowhere. namedXZ / spotXZ 0 = not given */
+inline int CopyTownChoose(const CopyTownCand* c, int n, const float* namedXZ, const float* spotXZ, float sameRadius, float keepRange, int* pick)
+{
+    *pick = -1;
+    for (int i = 0; i < n; ++i) if (c[i].recordNamed != 0) { *pick = i; return kCtRecord; }
+    float bd = 0.0f;
+    if (namedXZ != 0)
+    {
+        const float r2 = sameRadius * sameRadius;
+        for (int i = 0; i < n; ++i)
+        {
+            float d = CopyTownD2(c[i].cx, c[i].cz, namedXZ[0], namedXZ[1]);
+            if (c[i].hasList != 0) { const float dl = CopyTownD2(c[i].listX, c[i].listZ, namedXZ[0], namedXZ[1]); if (dl < d) d = dl; }
+            if (d <= r2 && (*pick < 0 || d < bd)) { *pick = i; bd = d; }
+        }
+        if (*pick >= 0) return kCtNamed;
+        for (int i = 0; i < n; ++i)
+        {
+            if (c[i].holdsNamed == 0) continue;
+            const float d = CopyTownD2(c[i].cx, c[i].cz, namedXZ[0], namedXZ[1]);
+            if (*pick < 0 || d < bd) { *pick = i; bd = d; }
+        }
+        if (*pick >= 0) return kCtNamedArea;
+    }
+    if (spotXZ != 0)
+    {   /* T-1427 fold 1 (review LOW): a shown town is measured from its outpost's centre as the world server's list gives it - the
+           builder's own town's centre, which its placement confirm measures (decomp_4d6300:63-87) - not the copy town's own centre */
+        for (int i = 0; i < n; ++i)
+        {
+            const float d = (c[i].hasList != 0) ? CopyTownD2(c[i].listX, c[i].listZ, spotXZ[0], spotXZ[1]) : CopyTownD2(c[i].cx, c[i].cz, spotXZ[0], spotXZ[1]);
+            if (*pick < 0 || d < bd) { *pick = i; bd = d; }
+        }
+        if (*pick >= 0 && bd <= keepRange * keepRange) return kCtNear;   /* the nearest, kept only within range (the confirm's order) */
+        *pick = -1;
+    }
+    return kCtNowhere;
+}
+inline const char* CopyTownRuleWord(int rule)
+{
+    switch (rule)
+    {
+    case kCtNowhere: return "none of the owner's towns - the world default 'Nowhere'";
+    case kCtRecord: return "the town its record names";
+    case kCtNamed: return "the outpost the PLACE names (by its centre)";
+    case kCtNamedArea: return "the outpost the PLACE names (its area holds the centre)";
+    case kCtNear: return "the owner's town nearest the spot within 5000 (the placement confirm's rule)";
+    }
+    return "?";
+}
+/* ---- T-1427 fold 1 (owner request 2026-11-18: '... it can log the discrepancy if one exists and then switch it to match'): THE COPY
+   AGAINST THE BUILDER'S TOWN. After createBuilding (CopyTownMadeStep): chosen - a town was given; nowSame - the engine's town is the
+   given one; wrote - the write of the given town after the engine overrode it (1 written, -1 failed). kCmWriteFailed is not the end:
+   the copy stays owed and the builder's town's arrival (its record) switches it */
+const int kCmTook = 0, kCmWritten = 1, kCmWriteFailed = 2, kCmEnginePick = 3;
+inline int CopyTownMadeStep(int chosen, int nowSame, int wrote)
+{
+    if (chosen == 0) return kCmEnginePick;
+    if (nowSame != 0) return kCmTook;
+    return wrote > 0 ? kCmWritten : kCmWriteFailed;
+}
+/* the builder's town arrives (its record, or the [SHOW] link step): same - the copy's creation town IS the builder's; ownerHere - this
+   game owns the piece (its engine's link rules there, T-1047: compared, never switched); sw - what the caller's switch did (kSw*:
+   none tried, done, the copy already stands in it, refused - the record link refused or skipped as failed before -, the write
+   faulted, the piece stands inside a building - its host's town rules it). kCjOwed* keep the copy's entry: the next event that touches
+   that building (its record's next look or the link step) tries again, each counted once per kind */
+const int kSwNone = 0, kSwDone = 1, kSwAlready = 2, kSwRefused = 3, kSwFault = 4, kSwInside = 5;
+const int kCjMatch = 0, kCjSwitched = 1, kCjOwedRefused = 2, kCjOwedFault = 3, kCjOwedInside = 4, kCjOwnNoSwitch = 5, kCjMax = 5;
+inline int CopyTownJudgeStep(int same, int ownerHere, int sw)
+{
+    if (same != 0) return kCjMatch;
+    if (ownerHere != 0) return kCjOwnNoSwitch;
+    if (sw == kSwDone || sw == kSwAlready) return kCjSwitched;
+    if (sw == kSwFault) return kCjOwedFault;
+    if (sw == kSwInside) return kCjOwedInside;
+    return kCjOwedRefused;
+}
+/* 1 = the copy's entry stays (it is still owed a switch); every other step ends it - compared */
+inline int CopyTownJudgeKeeps(int step) { return (step == kCjOwedRefused || step == kCjOwedFault || step == kCjOwedInside) ? 1 : 0; }
+inline const char* CopyTownJudgeWord(int step)
+{
+    static const char* const n[] = { "MATCH", "DIFFER - switched to the builder's town", "DIFFER - NOT switched yet: the record link refused (tried again at its next look)",
+                                     "DIFFER - NOT switched yet: the link write FAULTED (tried again at its next look)",
+                                     "DIFFER - NOT switched yet: it stands inside a building (its host's town rules it; tried again at its next look)",
+                                     "DIFFER - not switched: this game owns the piece, its engine's link rules here (T-1047)" };
+    return (step >= 0 && step <= kCjMax) ? n[step] : "?";
+}
+/* T-1427 fold 2 (re-review SHOULD 1): a world-town fact's town here - the ONE live world town whose stringID is `want`, out of EVERY
+   world town this game has (sids: their ids, read once; no cap - a list cut short would miss a town and never compare the copy).
+   Returns its index, or -1 (none, or two: never a guess); *hits = how many carry the id */
+inline int WorldTownPick(const std::vector<std::string>& sids, const std::string& want, int* hits)
+{
+    int at = -1, n = 0;
+    if (!want.empty())
+        for (size_t i = 0; i < sids.size(); ++i)
+            if (sids[i] == want) { if (n == 0) at = (int)i; ++n; }
+    if (hits != 0) *hits = n;
+    return n == 1 ? at : -1;
 }
 
 } // namespace coopbuild

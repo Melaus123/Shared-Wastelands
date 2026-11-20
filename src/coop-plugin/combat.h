@@ -204,6 +204,28 @@ void NoteNativeWindowDropped(unsigned int uid, bool regated);
 // current action are KEPT (T-986 fold 1), the owner's OFF edge ends them. MAIN THREAD (ReplicateTick,
 // after the drive walk).
 void CloseNativeWindowForDrift(unsigned int uid, float drift, float bound);
+// T-1422 fix 2 (F1414) - the copy of the window flag the AI worker reads: while a copy's native window is open, detour_ccUpdate
+// stops its walking after every fight update (the drive places it on its authority's route, windowfollow.h). Set by
+// replicate.cpp SetPuppetNativeWindow (ch: the copy's Character, 0 on a close), cleared for a dropped or reset copy (uid) and for all at world
+// teardown. MAIN THREAD. NativeWindowStopsOf: the stops made for uid since its window opened (0 = none / no row).
+void NativeWindowStopMark(unsigned int uid, void* ch, bool on);
+void NativeWindowStopClearAll();
+long long NativeWindowStopsOf(unsigned int uid);
+// T-1422 fix 2b / 2c - a copy on another floor than its owner: while on, the AI worker issues a route request to (x, y, z) after
+// each fight pass instead of the stop (the main thread only publishes the goal, under a seqlock). MAIN THREAD.
+// NativeWindowSwingsOf: changes into the attack state this window (measurement only).
+// Returns the goal's published sequence (-1: no slot or off).
+int NativeWindowWalkSet(unsigned int uid, bool on, float x, float y, float z);
+// fix 2f (F1424) - MAIN THREAD, every windowed frame of the copy: issues the walk's route request itself when no fight pass ran
+// for it since its previous frame (windowfollow::WalkRoadMainFrame); `frame` is the drive's frame number. fold 2g: the AI worker
+// renews after every pass; the two never issue at the same moment (the slot's lock). NativeWindowWalkCounts: fight passes and route requests this window, the main
+// thread's share, and the road of the last request (windowfollow::kWalkRoad*); false = no slot.
+void NativeWindowWalkMainFrame(unsigned int uid, long long frame);
+bool NativeWindowWalkCounts(unsigned int uid, long long* passes, long long* routes, long long* mainRoutes, int* lastRoad);
+const char* NativeWindowRoadName(int road);
+long long NativeWindowSwingsOf(unsigned int uid);
+bool NativeWindowWalkFailed(unsigned int uid);   // fix 2c: the AI worker's renewal was answered 'path failed' (MAIN THREAD reads)
+bool NativeWindowHasSlot(unsigned int uid);      // fix 2d: the copy has a stop slot (a fight object) - only then may it walk
 
 void SetWeaponTask(bool on);
 

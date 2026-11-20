@@ -23,7 +23,7 @@ namespace chatwire {
 
 enum Kind { kEveryone = 0, kFaction = 1, kPrivate = 2 };
 enum Dir { kIn = 0, kOut = 1 };                       /* a private line: received ("From Bob") or sent ("To Bob") */
-enum LineKind { kLineTalk = 0, kLineJoin = 1, kLineLeave = 2, kLineGone = 3, kLineNotConnected = 4, kLineMoney = 5 };   /* kLineMoney (T-810): "You sent Bob c.500" / "Bob sent you c.500" - grey, as the join lines */
+enum LineKind { kLineTalk = 0, kLineJoin = 1, kLineLeave = 2, kLineGone = 3, kLineNotConnected = 4, kLineMoney = 5, kLinePing = 6 };   /* kLinePing (T-1393): "<name> pinged a spot." - the normal chat text colour, as the approved ping page shows it */   /* kLineMoney (T-810): "You sent Bob c.500" / "Bob sent you c.500" - grey, as the join lines */
 /* the TO choice: everyone, my faction, or a player's slot (0 and up) */
 const int kToEveryone = -1;
 const int kToFaction = -2;
@@ -89,6 +89,7 @@ inline Rgb MakeRgb(float r, float g, float b) { Rgb c; c.r = r; c.g = g; c.b = b
 enum Colour { kWhite = 0, kGreen = 1, kPink = 2, kGrey = 3 };
 inline int LineColour(int lineKind, int kind)
 {
+    if (lineKind == kLinePing) return kWhite;   /* T-1393 review fold 10: a ping's line is in the normal chat text colour (the approved page) */
     if (lineKind != kLineTalk) return kGrey;
     if (kind == kFaction) return kGreen;
     if (kind == kPrivate) return kPink;

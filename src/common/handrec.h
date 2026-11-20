@@ -54,7 +54,7 @@ const unsigned int kHandPerOtherOff = 0xFFFFFFFFu;   /* T-1181 review: no per-pl
 inline std::string HandFile() { return "pp.handover"; }
 /* T-1181: lines this build cannot read, moved out of pp.handover (same records folder) - kept, never read back, never deleted */
 inline std::string HandSideFile() { return "pp.handover.unread"; }
-const unsigned int kGameProtocol = 227;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it) */
+const unsigned int kGameProtocol = 237;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it) */
 
 
 const unsigned int kMsgHandover  = 79;     /* MSG_ITEM_HANDOVER (net/transport.h, liveenvelope.h kInnerItemHandover assert it) */
@@ -62,6 +62,8 @@ const unsigned int kMsgHandover  = 79;     /* MSG_ITEM_HANDOVER (net/transport.h
 const int kRoleSrc = 0, kRoleDst = 1;
 const int kStHeld = 0, kStIn = 1, kStClosed = 2, kStReturned = 3;
 const int kKindTake = 0, kKindGive = 1, kKindGround = 2, kKindBox = 3;
+const int kKindTrade = 4;   /* T-1167 piece 3 build 2: an object a player trade's LOCK lifted (HandTradeLine, below) */
+const int kKindCount = 5;
 const int kVNone = -1, kVNot = 0, kVHolds = 1, kVUnknown = 2;
 
 struct HandLine
@@ -190,7 +192,7 @@ inline int HrUnesc(const std::string& t, std::string* out)
 }
 inline const char* RoleName(int r) { return r == kRoleSrc ? "src" : (r == kRoleDst ? "dst" : 0); }
 inline const char* StateName(int s) { return s == kStHeld ? "held" : s == kStIn ? "in" : s == kStClosed ? "closed" : s == kStReturned ? "returned" : 0; }
-inline const char* KindName(int k) { return k == kKindTake ? "take" : k == kKindGive ? "give" : k == kKindGround ? "ground" : k == kKindBox ? "box" : 0; }
+inline const char* KindName(int k) { return k == kKindTake ? "take" : k == kKindGive ? "give" : k == kKindGround ? "ground" : k == kKindBox ? "box" : k == kKindTrade ? "trade" : 0; }
 inline int NameIndex(const std::string& t, const char* (*nameOf)(int), int n)
 {
     for (int i = 0; i < n; ++i) { const char* s = nameOf(i); if (s != 0 && t == s) return i; }
@@ -326,7 +328,7 @@ inline int HandLineParse(const std::string& line, HandLine* out)
     if (l.role < 0 || l.state < 0 || RoleStateOk(l.role, l.state) == 0) return 0;
     unsigned long long a = 0ULL, h = 0ULL, e = 0ULL;
     if (HrGetU(g[3], 2147483647ULL, &a) == 0 || HrGetU(g[4], 2147483647ULL, &h) == 0) return 0;
-    l.kind = NameIndex(g[5], KindName, 4);
+    l.kind = NameIndex(g[5], KindName, kKindCount);   /* T-1167 piece 3: 5 kinds (trade); a build of 4 refuses a trade line (unread side file) */
     if (l.kind < 0) return 0;
     if (HrUnesc(g[6], &l.where) == 0 || WhereOk(l.where) == 0) return 0;
     if (HrUnesc(g[7], &l.section) == 0) return 0;
@@ -710,6 +712,319 @@ inline int HolderAction(int lineState, int verdict, int haveLiveObject, int hold
     if (liveHere < 0) return kActKeep;
     return (liveHere != 0) ? kActCloseNoRebuild : kActRebuild;
 }
+/* ---- T-1167 piece 3 build 2: A PLAYER TRADE'S LIFTED OBJECTS ----
+   A trade's LOCK lifts the offered units out of this game's character into no inventory and writes ONE `held` line per lifted object
+   (role src, kind trade), its bytes (the ITEM_CONFIRM body every line carries) and E_h, before LOCKED goes. THE KEY: the transfer id
+   of a trade line is (kHandTradeSlot, n, kHandTradeSlot) - asker and holder both kHandTradeSlot, above every slot a game can hold
+   (slotwire.h kSlotMax 1023) and not the handtest lever's kHandTestSlot - so no live hand-over's (asker, request id, holder), whose
+   slots are real slots, can ever equal it, whatever its request id; n is one past the largest n of the trade lines on file
+   (HandTradeNextId), so two trade lines never share one either. The trade's own 64-bit id and the object's place in its LOCKED body
+   list ride in the section field, "t:<trade id>:<index>" (TradeSection): the lines are found by the trade id, never by n. otherSlot
+   is the other player of the trade. QUERY / VERDICT / CLOSED never go for a trade line: the world server's one decision replaces
+   them (items.cpp HovTick and the handlers skip kKindTrade). Given back on ABORT: closed (droppable by the cap, never re-sent). */
+const int kHandTradeSlot = 7358;
+inline int HandIsTrade(const HandLine& l) { return (l.kind == kKindTrade) ? 1 : 0; }
+inline std::string TradeSection(unsigned long long tradeId, unsigned int index)
+{
+    std::string s = "t:";
+    HrPutU(&s, tradeId); s += ':'; HrPutU(&s, (unsigned long long)index);
+    return s;
+}
+/* 1 = "t:<id>:<index>" with an id above 0 - T-1167 piece 3 fold 1: optionally followed by ":<before>:<after>:<section>" (TradeSectionAt) */
+inline int TradeSectionParse(const std::string& t, unsigned long long* tradeId, unsigned int* index)
+{
+    if (t.size() < 5 || t.compare(0, 2, "t:") != 0) return 0;
+    const std::string::size_type c = t.find(':', 2);
+    if (c == std::string::npos) return 0;
+    const std::string::size_type d = t.find(':', c + 1);
+    if (d != std::string::npos && d + 1 >= t.size()) return 0;
+    unsigned long long id = 0ULL, ix = 0ULL;
+    if (HrGetU(t.substr(2, c - 2), 0xFFFFFFFFFFFFFFFFULL, &id) == 0 || id == 0ULL
+        || HrGetU(d == std::string::npos ? t.substr(c + 1) : t.substr(c + 1, d - c - 1), 0xFFFFFFFFULL, &ix) == 0) return 0;
+    if (tradeId != 0) *tradeId = id;
+    if (index != 0) *index = (unsigned int)ix;
+    return 1;
+}
+/* one lifted object's line: where = the character's save-stable id (CharWhere), squadKey its squad record, eh reserved right after the
+   lift, item the object's bytes */
+inline HandLine HandTradeLine(unsigned long long tradeId, unsigned int index, unsigned int n, int otherSlot, long long atUnix,
+                              const std::string& where, const std::string& squadKey, unsigned long long eh, const std::string& item)
+{
+    HandLine l;
+    l.role = kRoleSrc; l.state = kStHeld; l.kind = kKindTrade;
+    l.askerSlot = kHandTradeSlot; l.holderSlot = kHandTradeSlot; l.otherSlot = otherSlot;
+    l.reqId = n; l.atUnix = atUnix;
+    l.where = where; l.section = TradeSection(tradeId, index); l.squadKey = squadKey; l.seqE = eh; l.item = item;
+    return l;
+}
+/* the next n - one past the largest of the trade lines in `lines`; 0 = none left (the 32-bit range is used up) */
+inline unsigned int HandTradeNextId(const std::vector<std::string>& lines)
+{
+    unsigned int m = 0;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        HandLine l;
+        if (HandLineParse(lines[i], &l) != 0 && HandIsTrade(l) != 0 && l.askerSlot == kHandTradeSlot && l.reqId > m) m = l.reqId;
+    }
+    return (m == 0xFFFFFFFFu) ? 0u : m + 1u;
+}
+/* the indexes in `lines` of trade `tradeId`'s lines (open or not), in file order */
+inline std::vector<size_t> HandTradeLinesOf(const std::vector<std::string>& lines, unsigned long long tradeId)
+{
+    std::vector<size_t> v;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        HandLine l; unsigned long long id = 0ULL;
+        if (HandLineParse(lines[i], &l) != 0 && HandIsTrade(l) != 0 && TradeSectionParse(l.section, &id, 0) != 0 && id == tradeId) v.push_back(i);
+    }
+    return v;
+}
+/* ALL of one trade's lines added in one change of `lines` (the caller writes the file once): each a NEW open trade line - a line of
+   that key already on file refuses the whole set (it never rewrites one); then the cap (open lines are never dropped). No per-player
+   limit: the set is all or nothing, and the lock refuses when it does not fit. 1 added; 0 a line would not format or is not a new
+   open trade line; -1 it does not fit the cap (the vector is then as it was). */
+inline int HandTradeAddAll(std::vector<std::string>* lines, const std::vector<HandLine>& add, unsigned int cap)
+{
+    std::vector<std::string> v = *lines;
+    for (size_t i = 0; i < add.size(); ++i)
+    {
+        const HandLine& l = add[i];
+        std::string s;
+        if (HandIsTrade(l) == 0 || l.state != kStHeld || l.askerSlot != kHandTradeSlot || HandLineFormat(l, &s) == 0) return 0;
+        if (HandFind(v, l.askerSlot, l.reqId, l.holderSlot, l.role, 0) >= 0) return 0;
+        while (!s.empty() && (s[s.size() - 1] == '\n' || s[s.size() - 1] == '\r')) s.erase(s.size() - 1);
+        v.push_back(s);
+    }
+    if (HandFit(&v, cap, 0) == 0) return -1;
+    lines->swap(v);
+    return 1;
+}
+/* one trade's OPEN lines set closed in one change of `lines` (the give-back; fold 1: also the end of a COMMIT once this game's record
+   holds it); returns how many changed (0: none open - a repeat). Fold 1: the trade's marks (role dst, HandTradeMarkLine - a placed or a
+   give-back mark) are taken out with them: they only served the trade until its end. Fold 2 (re-check p3f1 HIGH): the receiving line
+   of an applied COMMIT (closed with E) is marked DONE in this same write - frozen kVHolds - so a COMMIT sent again after a crash builds
+   nothing (tradelock.h RecvObjAct recvDone); the flag sits on the receiving line itself, so it lasts as long as that line does. */
+inline int HandTradeCloseAll(std::vector<std::string>* lines, unsigned long long tradeId)
+{
+    const std::vector<size_t> at = HandTradeLinesOf(*lines, tradeId);
+    int n = 0;
+    std::vector<size_t> marks;
+    for (size_t k = 0; k < at.size(); ++k)
+    {
+        HandLine l;
+        if (HandLineParse((*lines)[at[k]], &l) != 0 && l.role == kRoleDst) { marks.push_back(at[k]); ++n; continue; }
+        unsigned int rix = 0;
+        if (HandLineParse((*lines)[at[k]], &l) != 0 && l.state == kStClosed && l.seqE != 0ULL && l.item.empty() && l.frozen != kVHolds
+            && TradeSectionParse(l.section, 0, &rix) != 0 && rix == 0xFFFFFFFFu)
+        {   /* the applied COMMIT's receiving line (index kTradeRecvIndex, defined below): DONE */
+            l.frozen = kVHolds;
+            std::string d;
+            if (HandLineFormat(l, &d) == 0) continue;
+            while (!d.empty() && (d[d.size() - 1] == '\n' || d[d.size() - 1] == '\r')) d.erase(d.size() - 1);
+            (*lines)[at[k]] = d;
+            ++n;
+            continue;
+        }
+        if (HandLineParse((*lines)[at[k]], &l) == 0 || IsOpen(l.state) == 0) continue;
+        l.state = kStClosed;
+        std::string s;
+        if (HandLineFormat(l, &s) == 0) continue;
+        while (!s.empty() && (s[s.size() - 1] == '\n' || s[s.size() - 1] == '\r')) s.erase(s.size() - 1);
+        (*lines)[at[k]] = s;
+        ++n;
+    }
+    for (size_t k = marks.size(); k > 0; --k) lines->erase(lines->begin() + (std::vector<std::string>::difference_type)marks[k - 1]);
+    return n;
+}
+/* AFTER A RELOAD: a trade line's object. The world server's decision stands where the receiver's VERDICT stands for a hand-over:
+   COMMITTED = the other side has it (kVHolds), ABORTED = it comes back here (kVNot), not decided yet = keep (the object stays out and
+   the line held; nothing is looked at). Then HolderAction's own rule, with HolderStateAfterLoad for the reloaded state: COMMITTED -
+   the reloaded state HAS the object: remove that copy, then close (wait while its place is not loaded); LACKS it: close; unknown:
+   remove a copy found at the character, then close. ABORTED - HAS: close with no rebuild; LACKS: rebuild it into the character;
+   unknown: rebuild only when it is not found at the character (wait while not loaded). A live object (no reload since the lift) is
+   put back on ABORTED and closed on COMMITTED. Build 2 writes the rule; build 3 applies COMMIT and the reload. */
+const int kTdUndecided = 0, kTdCommitted = 1, kTdAborted = 2;
+inline int TradeVerdictOf(int decision) { return decision == kTdCommitted ? kVHolds : (decision == kTdAborted ? kVNot : kVUnknown); }
+inline int TradeHolderAction(int lineState, int decision, int haveLiveObject, int holderState, int liveHere)
+{
+    return HolderAction(lineState, TradeVerdictOf(decision), haveLiveObject, holderState, liveHere);
+}
+/* ---- T-1167 piece 3 build 3: THE RECEIVING LINE - which character takes the other side's objects, and whether COMMIT was applied ----
+   The LOCK writes, in the same one write as the held lines (and also when this side gives no object), ONE more trade line: role src,
+   kind trade, state held, NO item bytes, section "t:<trade id>:<kTradeRecvIndex>", where = the trading character, E 0. It names the
+   character the COMMIT builds into after a reload, and it is the durable "applied" mark:
+     held                 COMMIT not applied yet (an ABORT closes it with E 0, as it closes the held lines)
+     closed, E above 0    COMMIT applied: E was reserved BEFORE the other side's objects were built, so a record of the squad at or past
+                          E carries them (the after-load check, tradelock.h RecvAfterLoad); frozen 1 (kVHolds) = DONE: the APPLIED
+                          gate closed the trade's lines (fold 2, HandTradeCloseAll) - nothing is ever built for it again
+     closed, E 0          given back (ABORTED)
+   The held lines of the lifted objects carry index 0.. (TradeSection); this line's index is kTradeRecvIndex, never an object's. */
+const unsigned int kTradeRecvIndex = 0xFFFFFFFFu;
+inline int HandIsTradeRecv(const HandLine& l)
+{
+    unsigned int ix = 0;
+    return (HandIsTrade(l) != 0 && l.item.empty() && TradeSectionParse(l.section, 0, &ix) != 0 && ix == kTradeRecvIndex) ? 1 : 0;
+}
+inline HandLine HandTradeRecvLine(unsigned long long tradeId, unsigned int n, int otherSlot, long long atUnix, const std::string& where, const std::string& squadKey)
+{
+    HandLine l;
+    l.role = kRoleSrc; l.state = kStHeld; l.kind = kKindTrade;
+    l.askerSlot = kHandTradeSlot; l.holderSlot = kHandTradeSlot; l.otherSlot = otherSlot;
+    l.reqId = n; l.atUnix = atUnix;
+    l.where = where; l.section = TradeSection(tradeId, kTradeRecvIndex); l.squadKey = squadKey; l.seqE = 0;
+    return l;
+}
+/* the trade's receiving line: 1 found (*out), 0 none */
+inline int HandTradeRecvOf(const std::vector<std::string>& lines, unsigned long long tradeId, HandLine* out, size_t* at)
+{
+    const std::vector<size_t> v = HandTradeLinesOf(lines, tradeId);
+    for (size_t k = 0; k < v.size(); ++k)
+    {
+        HandLine l;
+        if (HandLineParse(lines[v[k]], &l) != 0 && HandIsTradeRecv(l) != 0) { if (out != 0) *out = l; if (at != 0) *at = v[k]; return 1; }
+    }
+    return 0;
+}
+/* one line of `lines` rewritten (state / E / frozen); 1 done */
+inline int HandRewriteAt(std::vector<std::string>* lines, size_t at, const HandLine& l)
+{
+    std::string s;
+    if (at >= lines->size() || HandLineFormat(l, &s) == 0) return 0;
+    while (!s.empty() && (s[s.size() - 1] == '\n' || s[s.size() - 1] == '\r')) s.erase(s.size() - 1);
+    (*lines)[at] = s;
+    return 1;
+}
+/* COMMIT BEING APPLIED (one change of `lines`, the caller writes once): the receiving line closed with E (reserved before the build).
+   T-1167 piece 3 fold 1 (review A H1): the held lines are NOT closed here - they stay open until this game's own record holds the result
+   (tradelock.h AppliedGate), then HandTradeCloseAll ends them; a crash before that leaves them for the after-reload rule. 1 changed;
+   0 = a repeat (closed with E already); -1 the receiving line is not open (missing, or given back) - nothing changed. */
+inline int HandTradeCommitAll(std::vector<std::string>* lines, unsigned long long tradeId, unsigned long long e)
+{
+    std::vector<std::string> v = *lines;
+    HandLine r; size_t ra = 0;
+    if (e == 0ULL || HandTradeRecvOf(v, tradeId, &r, &ra) == 0) return -1;
+    if (r.state != kStHeld) return (r.state == kStClosed && r.seqE != 0ULL) ? 0 : -1;
+    r.state = kStClosed; r.seqE = e;
+    if (HandRewriteAt(&v, ra, r) == 0) return -1;
+    lines->swap(v);
+    return 1;
+}
+/* ---- T-1167 piece 3 fold 1 (reviews p3a M2 / H1): WHERE A TRADE'S OBJECT LANDED, AND THE MARKS THAT SAY WHEN ----
+   THE LIFT'S SQUARE: the lock writes into each held line the square the object was lifted from - its section, x, y (the line's own x / y)
+   and that square's stack before and after the lift (after 0: the whole stack left) - in the section field after the trade key:
+   "t:<id>:<index>:<before>:<after>:<section>" (TradeSectionAt). THE MARKS: a trade line of role dst (state in - open, so the cap never
+   drops it while the trade is unsettled; HandTradeCloseAll takes it out at the end), item = the object's bytes, E = the seq reserved
+   just BEFORE an engine change of that object, written in the SAME main-thread call as the change: every record of this game handed to
+   the writer after E (so built after the change) carries the change, and none can be on disk before the mark is.
+     placed  (index kTradePlacedBase + i): object i of the other side BUILT here; its square (plPre / plGot: the square's stack before and
+             after the add) when where the add ended could be told
+     back    (index kTradeBackBase + i): this side's lifted object i PUT BACK (a give-back, or a rebuild after a reload) */
+const unsigned int kTradePlacedBase = 0x40000000u, kTradeBackBase = 0x60000000u;
+/* T-1167 (2026-11-17, pack fold): bagHas / bagSec / bagX / bagY - the object sat inside a pack the character carries: the pack's own
+   section and square in the character (the line's bag path, HandLine bagHas / bagSection / bagX / bagY); sec / x / y are then the square
+   inside the pack */
+struct TradeSquare { int has; std::string sec; int x, y, before, after; int bagHas; std::string bagSec; int bagX, bagY;
+                     TradeSquare() : has(0), x(0), y(0), before(0), after(0), bagHas(0), bagX(0), bagY(0) {} };
+inline std::string TradeSectionAt(unsigned long long tradeId, unsigned int index, const TradeSquare& sq)
+{
+    std::string s = TradeSection(tradeId, index);
+    if (sq.has == 0 || sq.sec.empty() || sq.before < 0 || sq.after < 0) return s;
+    s += ':'; HrPutU(&s, (unsigned long long)sq.before); s += ':'; HrPutU(&s, (unsigned long long)sq.after); s += ':'; s += sq.sec;
+    return s;
+}
+/* the square a trade line carries (its x / y and the section field's tail); 1 known */
+inline int TradeSquareOf(const HandLine& l, TradeSquare* sq)
+{
+    *sq = TradeSquare();
+    if (TradeSectionParse(l.section, 0, 0) == 0) return 0;
+    const std::string::size_type c = l.section.find(':', 2), d = l.section.find(':', c + 1);
+    if (d == std::string::npos) return 0;
+    const std::string::size_type e = l.section.find(':', d + 1), f = e == std::string::npos ? e : l.section.find(':', e + 1);
+    if (f == std::string::npos || f + 1 >= l.section.size()) return 0;
+    unsigned long long b = 0ULL, a = 0ULL;
+    if (HrGetU(l.section.substr(d + 1, e - d - 1), 0x7FFFFFFFULL, &b) == 0 || HrGetU(l.section.substr(e + 1, f - e - 1), 0x7FFFFFFFULL, &a) == 0) return 0;
+    sq->has = 1; sq->before = (int)b; sq->after = (int)a; sq->sec = l.section.substr(f + 1); sq->x = l.x; sq->y = l.y;
+    return 1;
+}
+inline unsigned int HandTradeIndexOf(const HandLine& l) { unsigned int ix = 0xFFFFFFFFu; TradeSectionParse(l.section, 0, &ix); return ix; }
+/* a mark of `base` (kTradePlacedBase / kTradeBackBase) for object `obj`, E `e`; a placed mark carries where the add ended (sq) */
+inline HandLine HandTradeMarkLine(unsigned long long tradeId, unsigned int base, unsigned int obj, int otherSlot, long long atUnix, const std::string& where,
+                                  const std::string& squadKey, unsigned long long e, const std::string& item, const TradeSquare& sq)
+{
+    HandLine l;
+    l.role = kRoleDst; l.state = kStIn; l.kind = kKindTrade;
+    l.askerSlot = kHandTradeSlot; l.holderSlot = kHandTradeSlot; l.otherSlot = otherSlot;
+    l.atUnix = atUnix; l.where = where; l.squadKey = squadKey; l.seqE = e; l.item = item;
+    l.section = TradeSectionAt(tradeId, base + obj, sq);
+    if (sq.has != 0 && sq.after > sq.before && sq.before >= 0) { l.x = sq.x; l.y = sq.y; l.plHas = 1; l.plPre = sq.before; l.plGot = sq.after; }
+    return l;
+}
+/* object `obj`'s mark of `base` for the trade: 1 found (*out), 0 none */
+inline int HandTradeMarkOf(const std::vector<std::string>& lines, unsigned long long tradeId, unsigned int base, unsigned int obj, HandLine* out)
+{
+    const std::vector<size_t> v = HandTradeLinesOf(lines, tradeId);
+    for (size_t k = 0; k < v.size(); ++k)
+    {
+        HandLine l;
+        if (HandLineParse(lines[v[k]], &l) != 0 && l.role == kRoleDst && HandTradeIndexOf(l) == base + obj) { if (out != 0) *out = l; return 1; }
+    }
+    return 0;
+}
+/* marks put in ONE change of `lines`: a mark of the same trade and index replaced (its key kept), else added with the next key; then the
+   cap. 1 done; 0 a line would not format; -1 it does not fit the cap (the vector is then as it was) */
+inline int HandTradeMarkPut(std::vector<std::string>* lines, const std::vector<HandLine>& marks, unsigned long long tradeId, unsigned int cap)
+{
+    std::vector<std::string> v = *lines;
+    for (size_t i = 0; i < marks.size(); ++i)
+    {
+        HandLine m = marks[i];
+        if (HandIsTrade(m) == 0 || m.role != kRoleDst) return 0;
+        const std::vector<size_t> at = HandTradeLinesOf(v, tradeId);
+        size_t found = v.size();
+        for (size_t k = 0; k < at.size() && found == v.size(); ++k)
+        {
+            HandLine l;
+            if (HandLineParse(v[at[k]], &l) != 0 && l.role == kRoleDst && HandTradeIndexOf(l) == HandTradeIndexOf(m)) { found = at[k]; m.reqId = l.reqId; }
+        }
+        if (found == v.size())
+        {
+            const unsigned int n = HandTradeNextId(v);
+            if (n == 0) return 0;
+            m.reqId = n;
+            std::string s;
+            if (HandLineFormat(m, &s) == 0) return 0;
+            while (!s.empty() && (s[s.size() - 1] == '\n' || s[s.size() - 1] == '\r')) s.erase(s.size() - 1);
+            v.push_back(s);
+        }
+        else if (HandRewriteAt(&v, found, m) == 0) return 0;
+    }
+    if (HandFit(&v, cap, 0) == 0) return -1;
+    lines->swap(v);
+    return 1;
+}
+/* THE LOOK AT THE LIFT'S SQUARE (the holder's own state, when its records cannot tell - kHsUnknown): the stack from before the lift -
+   HAS (kHsHas); the stack after it, or - when the whole stack left - nothing / another item there: LACKS (kHsLacks); anything else, no
+   square written down, not loaded or unreadable: unknown (the line WAITS and is logged - never a guess) */
+inline int LiftLook(int loaded, int squareKnown, int squareRead, int itemThere, int kindRead, int sameKind, int haveQty, int before, int after)
+{
+    if (loaded == 0 || squareKnown == 0 || squareRead == 0 || before <= 0 || after < 0 || after >= before) return kHsUnknown;
+    if (itemThere == 0) return after == 0 ? kHsLacks : kHsUnknown;
+    if (kindRead == 0) return kHsUnknown;
+    if (sameKind == 0) return after == 0 ? kHsLacks : kHsUnknown;
+    if (haveQty == before) return kHsHas;
+    if (haveQty == after) return kHsLacks;
+    return kHsUnknown;
+}
+/* the holder's state after a reload, fold 1: a give-back mark (back) first - written since the last load (live), or a record / the save
+   (under the mark rule) at or past its E: HAS (the object came back after the lift); then the records (HolderStateAfterLoad's answer, hs);
+   then, only when those cannot tell, the lift's square (LiftLook) */
+inline int HolderStateTrade(int hs, int haveBack, unsigned long long eb, int backLive, unsigned long long applied, int markRule, unsigned long long markSeq, int liftLook)
+{
+    if (haveBack != 0 && eb != 0ULL && (backLive != 0 || applied >= eb || (markRule != 0 && markSeq >= eb))) return kHsHas;
+    if (hs != kHsUnknown) return hs;
+    return (liftLook == kHsHas || liftLook == kHsLacks) ? liftLook : kHsUnknown;
+}
+
 /* CLOSED's value: 1 closed (the holder destroyed its copy); 2 returned (the holder has the item back); T-889 fold 1: 3 the holder keeps
    NO record lines (its records writer is off - review 6: the receiver's line has nothing to settle against); 4 unknown (the holder's
    writer is on but it has no such line and nothing in memory - review 10: never taken as "placed"). */

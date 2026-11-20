@@ -180,7 +180,7 @@ void SetRecordHomeLookup(std::string (*fn)(const std::string&));   /* the store 
    DELETED - the notebook carries all six, and the session link drops any that still arrive (nbOnlyDropped). */
 bool SendRelation(const std::string& ownerSid, const std::string& otherSid, float relation, float trust, float trustNeg, unsigned int flags, unsigned int reason);   // P3 piece 2
 void EncodeRecordPayload(std::vector<char>* b, const std::string& worldId, const std::string& squadSid, const std::string& factionName, float x, float y, float z,
-                         long long writtenAt, int owner, const std::vector<char>& bytes, unsigned flags = 0);   /* the store link's RECORD payload - since M2 the only link that carries one; flags: factionkey.h kRecFacCode */
+                         long long writtenAt, int owner, const std::vector<char>& bytes, unsigned flags = 0, unsigned long long seq = 0);   /* T-1429 s2 fold 3: seq - an area record's base (areafresh.h ContentBaseOnLoad / ContentBaseOnEcho), 0 for every other record; the store link's RECORD payload - since M2 the only link that carries one; flags: factionkey.h kRecFacCode */
 bool DecodeRecordPayload(const std::vector<char>& p, std::string* worldId, std::string* squadSid, std::string* factionName, float* x, float* y, float* z,
                          long long* writtenAt, int* owner, std::vector<char>* bytes, std::string* town,
                          unsigned long long* seq, unsigned* flags = 0, std::string* home = 0);   /* B12 / store protocol 41: the NOTEBOOK'S sequence number for the record, or 0; `seq` may be null; flags: the byte after it (factionkey.h), 0 when absent; home: the group's home building key after the flags byte, "" when absent */

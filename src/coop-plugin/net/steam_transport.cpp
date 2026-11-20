@@ -1675,7 +1675,7 @@ private:
            server sends them on (livefirst.h AreaFreshLine), decided again here from what waits on THIS link (sendbound.h AnswerGate):
            a CANT on the ANSWER line unless a RECORD of its area - whole or any piece of one - still waits here (or a piece whose
            record's area this link could not read, or a piece of a WELCOME), then REST behind it; a WRITE on the LIVE line (held by a
-           waiting AREAMAP barrier, whole or its last piece - HandOn / MapRepeat above); a FRESH on REST behind its record. Every
+           waiting AREAMAP barrier, whole or its last piece - HandOn / MapRepeat above); a FRESH as a CANT (s2 fold 2; before it, always REST). Every
            frame goes through the gate (Direct ones too), so a record handed on in pieces is followed from its first piece. */
         int lfHold = coopsb::AnswerGate::kHoldNone;
         if (lfHandOn_ && lfDir_ == livefirst::kDirDown && reliable && !frame->empty())
@@ -1684,7 +1684,7 @@ private:
             areafresh::Msg am;
             if (it.type == livefirst::kTypeAreaFresh && areafresh::Decode(data, len, &am))
             {
-                const int waiting = (am.kind == (unsigned int)areafresh::kCant && lfGate_.Holds(areafresh::Key(am.x, am.y), box_)) ? 1 : 0;
+                const int waiting = ((am.kind == (unsigned int)areafresh::kCant || am.kind == (unsigned int)areafresh::kFresh) && lfGate_.Holds(areafresh::Key(am.x, am.y), box_)) ? 1 : 0;   /* T-1429 s2 fold 2 (review F1364 B): a FRESH as a CANT - the ANSWER line unless a record of its area waits here */
                 it.line = livefirst::AreaFreshLine(am.kind, waiting);
                 if (waiting != 0) ++g_lf.answerBehind;
                 if (it.line == livefirst::kLineAnswer) ++g_lf.answerOut;

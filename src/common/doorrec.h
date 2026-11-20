@@ -1,8 +1,8 @@
 #pragma once
 /* src/common/doorrec.h - ONE WORLD DOOR AS ONE WORLD-SERVER RECORD.
  *
- * One record per door (a town's house doors and its gates; T-1082: a player's piece's doors too, carrying only the lock word, a gate's
- * open / closed state and the lock's hardness - DoorRecPlayerFields - and health -1 as its mark), id `door.<sx>.<sy>.#<hash8>`: the door's
+ * One record per door (a town's house doors and its gates; T-1082: a player's piece's doors too, carrying only the lock word, its
+ * open / closed state (T-1429 s4: every door's; a gate's only before) and the lock's hardness - DoorRecPlayerFields - and health -1 as its mark), id `door.<sx>.<sy>.#<hash8>`: the door's
  * area square (the "@x,y@" field of its position key, 0..63 each, plain decimal) and the FNV-1a hash of its whole key in eight
  * lower-case hex digits. The key is the door road's own (doors.cpp DoorKeyBuild: a house door's position key, a gate's gateway
  * building key with "gate" appended) and travels in the record, so a reader checks that the record it holds names that very door
@@ -10,8 +10,11 @@
  * record's bytes (the `.platoon` file on the world server, message 28 RECORD on the wire), little-endian:
  *
  *   u32 marker 'DOR1' | u32 format (kDrFormat) | u32 flags (kDrFlagSeed: written at the holder's first load of the area, not for a
- *   change) | u32 generation | i32 writer slot | u32 length + the door's key (1..kDrKeyMax bytes, no control byte) | u8 gate |
- *   u8 state (0 closed, 1 open - the world's fact for a gate only; an ordinary door's swing is each game's own) | u8 lock word
+ *   change; kDrFlagState, T-1429 s4 review B1: the state byte is the door's real open / shut state - set on every write of game protocol
+ *   237 and later; a record without it was written before, when an ordinary door's state byte was not its fact) | u32 generation | i32 writer slot | u32 length + the door's key (1..kDrKeyMax bytes, no control byte) | u8 gate |
+ *   u8 state (0 closed, 1 open - the world's fact for EVERY door since T-1429 s4 (owner 1788: everything is saved to the server); a
+ *   gate's only before, when an ordinary door's swing was each game's own; a door between the two is stored at the end it is moving
+ *   to, DoorRecSettledState) | u8 lock word
  *   (bit 0 locked, bit 1 wants to lock - doorsync.h DoorLockWord) | u8 broken | u8 has a lock | i32 lock level (0..kDrLevelMax) |
  *   u8 lock broken | f32 lock hardness | f32 door health. Nothing follows.
  *
@@ -34,16 +37,20 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <map>
+#include <set>
 #include "boxrec.h"   /* the refusal reasons and the BOX_REFUSE message the door record shares */
 
 namespace doorrec {
 
-const unsigned int kProtocol = 153;            /* the world-server protocol that carries door records */
+const unsigned int kProtocol = 170;            /* the world-server protocol that carries door records */
+
 
 
 const unsigned int kDrMarker = 0x31524F44u;    /* 'D','O','R','1' little-endian */
 const unsigned int kDrFormat = 1u;
 const unsigned int kDrFlagSeed = 1u;
+const unsigned int kDrFlagState = 2u;          /* T-1429 s4 review B1: the state byte is real for every door (a 237 write); absent = only a gate's is */
 const unsigned int kDrKeyMax = 63u;            /* doors.cpp kDoorKeyCap - 1 */
 const unsigned int kDrMaxBytes = 256u;
 const int kDrMaxSector = 63;
@@ -150,7 +157,7 @@ inline bool DrNumberOk(float f) { return f == f && f > -kDrMaxNumber && f < kDrM
 inline bool DrBit(int v) { return v == 0 || v == 1; }
 inline bool DoorRecValid(const DoorRec& r)
 {
-    return (r.flags & ~kDrFlagSeed) == 0 && !MakeDoorRecId(r.key).empty() && DrBit(r.gate) && DrBit(r.state) && r.lockWord >= 0 && r.lockWord <= 3
+    return (r.flags & ~(kDrFlagSeed | kDrFlagState)) == 0 && !MakeDoorRecId(r.key).empty() && DrBit(r.gate) && DrBit(r.state) && r.lockWord >= 0 && r.lockWord <= 3
         && DrBit(r.broken) && DrBit(r.hasLock) && r.lockLevel >= 0 && r.lockLevel <= kDrLevelMax && DrBit(r.lockBroken)
         && DrNumberOk(r.hardness) && DrNumberOk(r.health);
 }
@@ -266,7 +273,15 @@ inline int DrKeyArea(const char* key)
     if (DrKeySector(key, &sx, &sy) == 0) return -1;
     return DrAreaIndex(sx, sy);
 }
-/* which of the record's facts a door's live values change: the open / closed state (a gate's only), the lock word, broken, the lock's
+/* T-1429 s4: THE SETTLED STATE. The engine's door state (doorsync.h: 0 closed, 1 open, 2 opening, 3 closing) as the record's: a door
+   between the two is stored at the end it is moving to - opening is open, closing is closed - so a door caught mid-swing is laid where
+   its swing would have left it, and a swing and its landing are one change (the landing moves nothing). Any other value reads closed. */
+inline int DoorRecSettledState(int engineState) { return (engineState == 1 || engineState == 2) ? 1 : 0; }
+/* T-1429 s4 review B1: 1 = the record's state byte is the door's real state (kDrFlagState). A record without the mark was written by a game
+   of protocol 236 or older: its state byte is real for a gate only (an ordinary town door's held a seed's stale state, a player's door's a
+   forced 0) - such a record never moves an ordinary door's open / shut, and its first write by this build carries the door's own state. */
+inline int DoorRecStateReal(unsigned int flags) { return ((flags & kDrFlagState) != 0) ? 1 : 0; }
+/* which of the record's facts a door's live values change: the open / closed state (every door's since T-1429 s4), the lock word, broken, the lock's
    level or hardness, the lock's broken flag, and (T-1333 fold 3, owner 1083 a) a town door's health - a hit's or a repair's health
    alone writes the record, so a half-bashed door looks the same on every game. Health rides with any write. */
 const int kDrChState = 1, kDrChLock = 2, kDrChBroken = 4, kDrChLevel = 8, kDrChLockBroken = 16;
@@ -281,9 +296,9 @@ inline int DrHealthDiffers(float a, float b)
 }
 inline int DoorRecChangeMask(int haveRec, const DoorRec& rec, const DoorRec& live)
 {
-    if (haveRec == 0) return (live.gate != 0 ? kDrChState : 0) | kDrChLock | kDrChBroken | kDrChLevel | kDrChLockBroken;
+    if (haveRec == 0) return kDrChState | kDrChLock | kDrChBroken | kDrChLevel | kDrChLockBroken;   /* T-1429 s4: the state of every door */
     int m = 0;
-    if (live.gate != 0 && live.state != rec.state) m |= kDrChState;
+    if (live.state != rec.state) m |= kDrChState;   /* T-1429 s4: an ordinary door's open / shut too */
     if (live.lockWord != rec.lockWord) m |= kDrChLock;
     if (live.broken != rec.broken) m |= kDrChBroken;
     if (live.hasLock != 0 && (live.lockLevel != rec.lockLevel || live.hardness != rec.hardness)) m |= kDrChLevel;
@@ -310,7 +325,7 @@ inline std::string DoorRecChangeWords(int m)
    hashed to one id). A change made before the lay, while the holder is not known, or while the stored record is awaited is HELD: the
    row is marked with the facts it moved and its lay writes only those over the record it has then (kDrLayWriteHeld,
    DoorRecHeldMerge) - nothing is ever written above a generation this game has not received. A change that moves none of the stored
-   facts (an ordinary door's swing) is neither written nor held; mask is measured from the record for a laid door and from the door's
+   facts (a swing's landing: the record keeps the settled state) is neither written nor held; mask is measured from the record for a laid door and from the door's
    facts before any held change for one not laid. awaitStored also covers this game's own seed not yet confirmed (DoorRecAwaitWrite). */
 const int kDrWrite = 0, kDrSkipNotHolder = 1, kDrHoldUntilLaid = 2, kDrSkipNoChange = 3, kDrSkipKeyClash = 4;
 inline int DoorRecWriteDecide(int weHold, int laid, int mask, int awaitStored, int keyClash)
@@ -364,6 +379,32 @@ inline int DoorRecHealthPaceDue(int haveLast, unsigned int lastAt, unsigned int 
 {
     return (haveLast == 0 || (unsigned int)(now - lastAt) >= gapMs) ? 1 : 0;
 }
+/* T-1429 s4 review S2: a STATE-ONLY change of a door (its open / shut alone, every door's) is written at most once every kDrStatePaceMs
+   per door; one settled sooner waits on the door tick until its time is up and is then written from the door as it is (the trailing
+   write: the last settled state is always written - a door that came back to its record's state writes nothing). A change carrying any
+   other fact is not paced and carries the state. 1000 ms: a door an NPC walks through (open, then shut a few seconds later) writes each
+   settle; a door flapping faster writes once a second, never at the tick rate. 1 = this write waits. */
+const unsigned int kDrStatePaceMs = 1000u;
+inline int DoorRecStatePaceWaits(int words, int haveLast, unsigned int lastAt, unsigned int now)
+{
+    return (words == kDrChState && DoorRecHealthPaceDue(haveLast, lastAt, now, kDrStatePaceMs) == 0) ? 1 : 0;
+}
+/* T-1429 s4 review fold 2: A STATE CHANGE OWED BY ITS PACE when the door's area is left (the tick's trailing write needs a laid row, and the
+   door may be gone with the area): written at once, from the state kept when the write was made to wait (no door read), over the record
+   this game keeps - only while this game still holds the key's area (weHold 1; the world server takes no other game's write), with a record
+   of the door kept here (haveRec), nothing awaited (a refused seed's stored record or this game's unconfirmed seed), and only when the owed
+   state differs from that record's (a door that came back to it writes nothing). owedState: 0 / 1, else nothing owed. 1 = write it now.
+   A hand-over seen only by a later area map (this game no longer holds the area) cannot be written by this game: dropped and counted -
+   the live sync has carried the state to every game, and the new holder writes the door's next change. */
+inline int DoorRecStateOwedFlush(int owedState, int weHold, int haveRec, int recState, int awaitStored)
+{
+    if (owedState != 0 && owedState != 1) return 0;
+    if (weHold != 1 || haveRec == 0 || awaitStored != 0) return 0;
+    return (owedState != recState) ? 1 : 0;
+}
+/* T-1429 s4 review S1: a record arriving from another game marks its door's next lay as an arrival's (DoorRecLayState) only when the
+   door's area is already laid here - an arrival before the area's lay is part of that lay. 1 = mark it. */
+inline int DoorRecArrivalMarks(int areaLaid) { return (areaLaid != 0) ? 1 : 0; }
 /* a door laid showing its own (no record; another game or nobody held the key's area): once this game holds that area and still has
    no record, the door is laid again, which seeds it. 1 = lay it again. */
 inline int DoorRecOwnRecheck(int ownShown, int haveRec, int weHold) { return (ownShown != 0 && haveRec == 0 && weHold == 1) ? 1 : 0; }
@@ -371,13 +412,24 @@ inline int DoorRecOwnRecheck(int ownShown, int haveRec, int weHold) { return (ow
    that door is neither laid from it nor written, and counted) */
 const int kDrKeptNone = 0, kDrKeptSame = 1, kDrKeptClash = 2;
 inline int DoorRecKeptFor(int haveKept, int sameKey) { return (haveKept == 0) ? kDrKeptNone : ((sameKey != 0) ? kDrKeptSame : kDrKeptClash); }
-/* the state a lay gives the door road's held word: a gate's comes from its record; an ordinary door keeps a word already held for it,
-   else its own resting state (opening counts as open, closing as closed) - its swing is each game's own */
-inline int DoorRecLayState(int gate, int recState, int heldState, int liveState)
+/* the state a lay gives the door road's held word (T-1429 s4, with review B1 / S1). heldState: the door road's live word for the door here
+   (0 / 1 known, else not); liveState: the door's own settled state; arrival: the lay follows ANOTHER game's record arriving for an area
+   already laid here (not the area's own lay at its load). The rule:
+   - a record whose state is not real (no kDrFlagState, an older build's) and an ordinary door: the old rule - a word already held, else the
+     door's own (it is not moved by the record);
+   - a record arriving after the area's lay while this game holds a live word for the door: the live word stays. The live sync and the
+     record share no clock (the live word carries the holder's per-game publish count, the record its own generation), so their ages
+     cannot be compared; the holder publishes a change live BEFORE it writes its record, so the live word is never older than the record
+     that follows it, and a later swing's live word would otherwise be swung back by the record of the one before (review S1);
+   - otherwise the record's: every door's at the area's lay (a relaunch, a new joiner, a rebuild), a gate's as always.
+   The door road applies it through the engine's own setter or open / close call (doors.cpp ApplyToRow, the record's reason) - the road a
+   gate's laid state always took. */
+inline int DoorRecLayState(int gate, int stateReal, int arrival, int recState, int heldState, int liveState)
 {
-    if (gate != 0) return recState;
-    if (heldState == 0 || heldState == 1) return heldState;
-    return (liveState == 1 || liveState == 2) ? 1 : 0;
+    const int heldKnown = (heldState == 0 || heldState == 1) ? 1 : 0;
+    if (gate == 0 && stateReal == 0) return (heldKnown != 0) ? heldState : DoorRecSettledState(liveState);
+    if (arrival != 0 && heldKnown != 0) return heldState;
+    return (recState == 1) ? 1 : 0;
 }
 /* A queued removal of a door record (a ruined building's door, or a rebuilt town's record that names no door): kept while the key's
    area has no complete record list here or its holder is not known (a record not yet arrived is not a missing one); then sent by the
@@ -432,11 +484,13 @@ inline int DoorRecRefuseRestores(int pending, int confHave, unsigned int confGen
 /* The facts the holder writes at the lay for a change held before it: the stored facts the held changes moved (heldMask, the
    DoorRecChangeMask bits) from the door's live values, every other fact from the record - the save's lock, level or health never ride
    above the world's record. Health comes with the broken flag (a break or a mend carries it) or its own bit (T-1333 fold 3: a hit's or
-   a repair's health held before the lay), else the record's. An ordinary door's swing is no bit, so it never rides. */
+   a repair's health held before the lay), else the record's. The open / closed state rides its bit for every door (T-1429 s4). */
 inline DoorRec DoorRecHeldMerge(const DoorRec& rec, const DoorRec& live, int heldMask)
 {
     DoorRec m = rec;
-    if ((heldMask & kDrChState) != 0 && live.gate != 0) m.state = live.state;
+    /* T-1429 s4: every door's; review B1: over an older build's record (no kDrFlagState) an ordinary door's state byte is no fact, so the
+       write that marks the record real carries the door's own state, whatever the held changes were */
+    if ((heldMask & kDrChState) != 0 || (live.gate == 0 && DoorRecStateReal(rec.flags) == 0)) m.state = live.state;
     if ((heldMask & kDrChLock) != 0) m.lockWord = live.lockWord;
     if ((heldMask & kDrChBroken) != 0) { m.broken = live.broken; m.health = live.health; }
     if ((heldMask & kDrChHealth) != 0) m.health = live.health;   /* T-1333 fold 3 */
@@ -475,7 +529,8 @@ inline std::vector<std::string> DoorRecRebuiltRemoveList(const std::vector<std::
 /* ---- T-1082: A PLAYER'S PIECE'S DOOR ----
    A door of a player's piece (a house or gate a player built, or a house a player bought in town - the buyer's piece from the purchase)
    has its lock level, broken flags and health on its piece record (piecerec.h, the LIVE part's doors) - their one source. Its door
-   record carries only the facts no piece record holds: the lock word, a gate's open / closed state and the lock's hardness (with
+   record carries only the facts no piece record holds: the lock word, its open / closed state (T-1429 s4: every door's - the piece
+   record's LIVE doors carry health, level and flags only, no state, so the door record stays its one source) and the lock's hardness (with
    whether the door has a lock, which says only whether the hardness means anything). Its other fields are 0, and nothing of them is
    compared, merged or laid for it. A bought house's door keeps the record its town door had (same key, same id): the purchase changes
    which fields are read, and its first write as a player's door drops the rest.
@@ -507,7 +562,7 @@ inline DoorRec DoorRecPlayerFields(const DoorRec& live)
     p.flags = live.flags; p.generation = live.generation; p.writerSlot = live.writerSlot;
     p.key = live.key;
     p.gate = live.gate;
-    p.state = (live.gate != 0) ? live.state : 0;
+    p.state = live.state;   /* T-1429 s4: every door's (a gate's only before) */
     p.lockWord = live.lockWord;
     p.hasLock = live.hasLock;
     p.hardness = (live.hasLock != 0) ? live.hardness : 0.0f;
@@ -517,9 +572,9 @@ inline DoorRec DoorRecPlayerFields(const DoorRec& live)
 /* which of a player door's facts its live values change (both read through DoorRecPlayerFields) */
 inline int DoorRecPlayerChangeMask(int haveRec, const DoorRec& rec, const DoorRec& live)
 {
-    if (haveRec == 0) return (live.gate != 0 ? kDrChState : 0) | kDrChLock | (live.hasLock != 0 ? kDrChHardness : 0);
+    if (haveRec == 0) return kDrChState | kDrChLock | (live.hasLock != 0 ? kDrChHardness : 0);   /* T-1429 s4: every door's state */
     int m = 0;
-    if (live.gate != 0 && live.state != rec.state) m |= kDrChState;
+    if (live.state != rec.state) m |= kDrChState;
     if (live.lockWord != rec.lockWord) m |= kDrChLock;
     if (live.hasLock != 0 && live.hardness != rec.hardness) m |= kDrChHardness;
     return m;
@@ -557,7 +612,7 @@ struct DoorRecTickWrite { std::string key; int state; int lockWord; int entries;
 inline DoorRecTickEntry DoorRecTickMake(const std::string& key, int state, int lockWord)
 {
     DoorRecTickEntry e;
-    e.key = key; e.state = state; e.lockWord = lockWord;
+    e.key = key; e.state = (state >= 0) ? DoorRecSettledState(state) : -1; e.lockWord = lockWord;   /* T-1429 s4: a swing counts at its end */
     return e;
 }
 inline std::vector<DoorRecTickWrite> DoorRecTickMerge(const std::vector<DoorRecTickEntry>& in)
@@ -591,12 +646,73 @@ inline std::vector<DoorRecTickWrite> DoorRecTickMerge(const std::vector<DoorRecT
     return out;
 }
 /* the facts a merged write names: those it moved since the door's record (mask) and those moved between the tick's entries (tickMoved;
-   the open / closed state only for a gate, the one door whose state is a stored fact). Nothing when the write moved nothing since the
-   record - a change and its undo inside one tick is no change, and no write. */
-inline int DoorRecTickWords(int mask, int tickMoved, int gate)
+   the open / closed state of every door since T-1429 s4). Nothing when the write moved nothing since the record - a change and its
+   undo inside one tick is no change, and no write. */
+inline int DoorRecTickWords(int mask, int tickMoved)
 {
     if (mask == 0) return 0;
-    return mask | (tickMoved & ((gate != 0) ? (kDrChState | kDrChLock) : kDrChLock));
+    return mask | (tickMoved & (kDrChState | kDrChLock));
 }
+/* T-1429 s4: a write that carries an ORDINARY door's open / closed state (its state moved, the door is no gate) - the one the record
+   line '[DOOR] record state' names. 1 = it does. */
+inline int DoorRecOrdinaryStateWrite(int gate, int words) { return (gate == 0 && (words & kDrChState) != 0) ? 1 : 0; }
+
+/* T-1400 (T-1353 folded, owner 1750 a; F1184 design A): THE OWED DOOR KEYS. A door record of a laid area whose door has no entry in the
+   door road here is OWED: its key is kept per area until the door is found by its key (one walk of the listed buildings, on an event) or
+   registers by itself, its record is removed, or the area is left. Who adds a key: the lay (a record with no entry), a record arriving for
+   a laid area with no entry, and the five drop sites (the dropped entry has a record and its area is laid - a drop before the lay is the
+   lay's to add). Never a clock. */
+inline int DoorRecOwedAtLay(int haveRec, int hasRow) { return (haveRec != 0 && hasRow == 0) ? 1 : 0; }
+inline int DoorRecOwedAtArrive(int areaLaid, int hasRow) { return (areaLaid != 0 && hasRow == 0) ? 1 : 0; }
+inline int DoorRecOwedAtDrop(int haveRec, int areaLaid) { return (haveRec != 0 && areaLaid != 0) ? 1 : 0; }
+struct DrOwedSet
+{
+    std::map<int, std::set<std::string> > a;   /* area index -> its owed door keys */
+    /* 1 = newly owed */
+    int Add(int c, const std::string& key)
+    {
+        if (c < 0 || key.empty()) return 0;
+        return a[c].insert(key).second ? 1 : 0;
+    }
+    /* the key is owed no more (its door found, or registered); 1 = it was owed. An area left with no key is forgotten. */
+    int Found(int c, const std::string& key)
+    {
+        std::map<int, std::set<std::string> >::iterator it = a.find(c);
+        if (it == a.end() || it->second.erase(key) == 0) return 0;
+        if (it->second.empty()) a.erase(it);
+        return 1;
+    }
+    /* its record was removed: owed in no area */
+    int ForgetKey(const std::string& key)
+    {
+        int n = 0;
+        for (std::map<int, std::set<std::string> >::iterator it = a.begin(); it != a.end();)
+        {
+            n += (int)it->second.erase(key);
+            if (it->second.empty()) a.erase(it++); else ++it;
+        }
+        return n;
+    }
+    /* the area was left (or the link reset): its keys are dropped; returns how many */
+    int Leave(int c)
+    {
+        std::map<int, std::set<std::string> >::iterator it = a.find(c);
+        if (it == a.end()) return 0;
+        const int n = (int)it->second.size();
+        a.erase(it);
+        return n;
+    }
+    int Count(int c) const
+    {
+        std::map<int, std::set<std::string> >::const_iterator it = a.find(c);
+        return (it == a.end()) ? 0 : (int)it->second.size();
+    }
+    int Has(int c, const std::string& key) const
+    {
+        std::map<int, std::set<std::string> >::const_iterator it = a.find(c);
+        return (it != a.end() && it->second.find(key) != it->second.end()) ? 1 : 0;
+    }
+    int Areas() const { return (int)a.size(); }
+};
 
 }   /* namespace doorrec */

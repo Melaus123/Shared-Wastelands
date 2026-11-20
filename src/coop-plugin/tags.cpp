@@ -56,6 +56,7 @@
 #include "relations.h"      // RelationsTagLevel - the colour
 #include "team.h"           // TeamTagFor - a teammate's team blue, and the team's name on line 2 (T-546 step 4)
 #include "addresses.h"
+#include "ui.h"             // UiPlayerTyping - the typing guard (T-1393)
 #include "../common/nametag.h"   // the two lines and the colour - pure, swept by the offline suite
 #include "../common/teameffect.h"   // TagColourClass - team blue or the standing's colour (T-546 step 4)
 #include "../common/tagstack.h"     // line 2 with the character's own name; one player's tags standing together
@@ -538,9 +539,9 @@ void PollKey()
     HWND fg = ::GetForegroundWindow();
     DWORD pid = 0;
     if (fg == 0 || (::GetWindowThreadProcessId(fg, &pid), pid) != ::GetCurrentProcessId()) return;
-    /* The same guard the engine's own hotkeys obey (F707): not while the player is typing into a text box. */
-    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
-    if (im != 0 && im->isFocusKey()) return;
+    /* Not while the player is typing into a text box (F707's guard, made exact by T-1393): a writable text box holds the key
+       focus - not merely any widget, such as the world map after a click. */
+    if (UiPlayerTyping()) return;
     ++g_keyToggles;
     TagsSetOn(!g_on);
 }
@@ -841,5 +842,25 @@ std::string TagsReportLine()
          + " lift=" + Fl(g_liftSet > 0.0f ? g_liftSet : (g_liftAuto > 0.0f ? g_liftAuto : kLiftFallback))
          + (g_liftSet > 0.0f ? "(set)" : (g_liftAuto > 0.0f ? "(own-tag)" : "(fallback)"));
 }
+
+/* T-1393 (ping.cpp): a world point on the screen the way the labels place theirs - the scene's relative origin taken off, the
+   view matrix, then the engine's own projectToScreen. 1 = in front of the camera and projected (*sx, *sy pixels); 0 = behind the
+   camera or the engine says not on screen; -1 = not readable now. *vx, *vy, *vz = the point in view space whenever it read (>= 0). */
+int TagsScreenSpot(float x, float y, float z, float* sx, float* sy, float* vx, float* vy, float* vz)
+{
+    float ox = 0, oy = 0, oz = 0;
+    if (!RelativeOriginPod(RelativeOriginFn(), &ox, &oy, &oz)) return -1;
+    if (!ViewSpacePod(x - ox, y - oy, z - oz, vx, vy, vz)) return -1;
+    if (*vz >= 0.0f) return 0;
+    const int pr = ProjectPod(x, y, z, sx, sy);
+    return pr < 0 ? -1 : pr;
+}
+/* T-1393: the scene's relative origin now (the space Ogre's camera works in is the world less it). false = not readable */
+bool TagsSceneOrigin(float* ox, float* oy, float* oz)
+{
+    return RelativeOriginPod(RelativeOriginFn(), ox, oy, oz);
+}
+/* T-1393: the game's own "the interface is shown" byte, as the labels obey it: 1 shown, 0 hidden, -1 not readable */
+int TagsInterfaceShown() { return ReadUiShownPod(); }
 
 } // namespace coop

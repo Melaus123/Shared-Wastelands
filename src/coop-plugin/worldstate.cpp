@@ -975,7 +975,7 @@ void detour_declareDead(void* self)
     orig_declareDead(self);
     if (copyDeath) RelationsCopyDeathMark(deathMarkWas);
     coop::ResurrectNoteDeath(self, ret, unique != 0 ? 1 : 0);   /* T-556: this game's own dead are snapshotted on the main thread */
-    if (!WsApplying()) coop::StoreNoteSquadEvent(self);   /* T-1084: the world squad this game writes that holds the dead member is marked due on the early road (queued off the main thread); a death this game applies from the shared state is not a change it publishes */
+    if (!WsApplying()) { coop::StoreNoteSquadEvent(self); coop::StoreNoteDeath(self); }   /* T-1442 step 3: the dead character noted for the wipe-out decision the next frame (store.cpp DeadEventDrainTick; interlocked only, any thread) */   /* T-1084: the world squad this game writes that holds the dead member is marked due on the early road (queued off the main thread); a death this game applies from the shared state is not a change it publishes */
     if (unique == 0) return;
     if (gd != 0 && !WsApplying()) WsQueue(gd);
 }
@@ -1235,6 +1235,68 @@ void WsLogQueueDrain(WsLogQueue& q, std::set<void*>& logged, int refused)
 
 } // namespace
 
+// T-1383 (F1049; decomp_9a7790.txt:32-80): THE NAMED-CHARACTER TABLE WALK - the global GameHashMap at kMapPtrRva: count +0x20, bucket
+// count +0x18, buckets +0x38; first node = buckets[bucket count], next = node +0; the entry at node +0x10 (key: the template GameData*,
+// its text id at +0x58), state at entry + kStateOff (0 dead / 1 alive / 2 imprisoned), player-involved at entry + kPlayerOff. Read only:
+// nothing is created or inserted. No std::string in the __try (C2712).
+namespace {
+struct WsWalkRow { void* gd; int state; int involved; };
+int WsDeadWalkPod(WsWalkRow* rows, int cap, long long* count)
+{
+    *count = 0;
+    void* map = WsMapPod();
+    if (map == 0) return 0;
+    __try
+    {
+        const char* m = (const char*)map;
+        const unsigned long long bc = *(const unsigned long long*)(m + 0x18);
+        const long long cnt = *(const long long*)(m + 0x20);
+        *count = cnt;
+        if (cnt == 0) return 0;
+        if (cnt < 0 || cnt > 1000000 || bc == 0 || bc > (1ULL << 26)) return -1;
+        const char* const* buckets = *(const char* const* const*)(m + 0x38);
+        if (!WsPlaus(buckets)) return -1;
+        const char* node = buckets[bc];
+        int n = 0;
+        for (long long g = 0; node != 0 && g < cnt; ++g)
+        {
+            if (!WsPlaus(node)) return -1;
+            if (n < cap)
+            {
+                const char* e = node + 0x10;
+                rows[n].gd = *(void* const*)e;
+                rows[n].state = *(const int*)(e + kStateOff);
+                rows[n].involved = *(const unsigned char*)(e + kPlayerOff) != 0 ? 1 : 0;
+                ++n;
+            }
+            node = *(const char* const*)node;
+        }
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+}
+int WorldStateDeadWalk(std::vector<std::pair<std::string, int> >* dead, long long counts[6], long long* tableCount)
+{
+    dead->clear();
+    for (int i = 0; i < 6; ++i) counts[i] = 0;
+    *tableCount = 0;
+    if (kMapPtrRva == 0) return -1;
+    const int kCap = 65536;
+    std::vector<WsWalkRow> rows(kCap);
+    const int n = WsDeadWalkPod(&rows[0], kCap, tableCount);
+    if (n < 0) return -1;
+    for (int i = 0; i < n; ++i)
+    {
+        ++counts[0];
+        char sid[256];
+        if (!WsPlaus(rows[i].gd) || WsSidPod(rows[i].gd, sid, (int)sizeof(sid)) == 0) { ++counts[5]; continue; }
+        const int st = rows[i].state;
+        if (st == 0) { ++counts[1]; dead->push_back(std::make_pair(std::string(sid), rows[i].involved)); }
+        else if (st == 1) ++counts[2]; else if (st == 2) ++counts[3]; else ++counts[4];
+    }
+    return n;
+}
 // T-1096: the import window (worldstate.h).
 int WorldStateImportLoading() { return ::InterlockedCompareExchange(&g_wsImportLoad, 0, 0) != 0 ? 1 : 0; }
 void WorldStateImportLoad(int on)

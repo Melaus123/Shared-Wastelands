@@ -39,7 +39,8 @@
 namespace cooptv {
 
 const unsigned int kMsgTownVer = 87u;   /* 28-86 are taken on the world-server link (store_main.cpp's enum) */
-const unsigned int kTvProtocol = 153u;   /* the world-server protocol that carries TOWN_VER */
+const unsigned int kTvProtocol = 170u;   /* the world-server protocol that carries TOWN_VER */
+
 
 
 

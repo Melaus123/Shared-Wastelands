@@ -33,6 +33,13 @@ void ChatOpenTo(int slot);
 // kept for the window as a join line is; `slot` is the other player's (-1 none). MAIN THREAD.
 void ChatMoneyLine(int slot, const std::string& name, const std::string& sentence);
 
+// T-1393 (ping.cpp): the name a ping shows for `slot` - this player's own name for this game's slot (or -1), else this game's name for
+// that slot as a chat line names its sender. MAIN THREAD.
+std::string ChatPlayerName(int slot);
+// T-1393: a ping's chat line "<name> pinged a spot." / "<name> pinged a spot on the map." (kind pingwire::kWorld / kMap), kept as a
+// notice line is; `sound` (a teammate's ping) plays the chat message sound of the MY FACTION kind - off with that chat sound,
+// quiet while the chat window is open. MAIN THREAD.
+void ChatPingLine(int slot, int kind, bool sound);
 // A grey notice line of this game's own, kept as a money line is (hire.cpp: "That character already belongs to Bob.");
 // `slot` is the player it names (-1 none). MAIN THREAD.
 void ChatNoticeLine(int slot, const std::string& name, const std::string& sentence);

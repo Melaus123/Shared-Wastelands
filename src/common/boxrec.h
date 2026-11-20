@@ -67,7 +67,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 153;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
+const unsigned int kProtocol = 170;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
                                                  list, kBrFlagUndos, and its ledger, kBrFlagLedger) */
 
 
@@ -1602,6 +1602,9 @@ inline int BoxGoneAtDismantle(int haveNew, int sentNew, int haveLegacy)
    that pack. The move already happened here, so the answer only keeps or undoes it (BoxJrnEnding), on this game's characters that took
    part (its hints). */
 const int kBjTake = 0, kBjPut = 1;
+/* T-1346: ONE CHARACTER A PUT'S UNITS CAME FROM (BoxJrnOriginSplit): its uid this session (0 after a load until mapped), its save-stable
+   id (hovrec::CharWhere), the section it held the item in, and the units */
+struct BoxJrnFrom { std::string where, section; unsigned int uid; int units; BoxJrnFrom() : uid(0), units(0) {} };
 struct BoxJrnDelta
 {
     int dir;                    /* kBjTake: units the box lost; kBjPut: units it gained */
@@ -1612,6 +1615,8 @@ struct BoxJrnDelta
     int packX, packY;
     std::string packSid;
     unsigned long long askId;   /* the id an ask of this part carries (reserved at a save or at the hand-over; 0 none yet) */
+    std::vector<BoxJrnFrom> from;   /* T-1346, a put only: the characters of this game its units came from, newest first (BoxJrnOriginSplit) -
+                                       a refused put is made again only on them, never on another */
     BoxJrnDelta() : dir(0), quantity(0), inPack(0), packX(0), packY(0), askId(0ULL) {}
 };
 /* an item's identity: everything but its cell and quantity (its record, numbers, marks, uniform, crafter); withBag 1 also a pack's
@@ -2213,6 +2218,373 @@ inline int BoxJrnMergeOnto(const std::vector<cooppar::ParityItem>& onto, const s
     merged->swap(keep);
     return 1;
 }
+/* T-1346: THE BOX'S ORIGIN LEDGER. One row per move of this game's character into (units > 0) or out of (units < 0) a player's box this
+   game writes, noted in the drain where the move is tied to that character (the same object, the object merged in, the split's new
+   object, the item held on the cursor): uid / at / where / section the character's (as BoxJrnHintRow), the box cell it landed on or left
+   (section / x / y; inPack: inside the pack at packSection / packX / packY), the item's record (baseSid, "" unread), and op (0 a whole
+   object, 1 a whole object out, 2 a stack's rise, 3 a split). ident is the item's identity as the journal's own diff reads it
+   (BoxJrnLedResolve), "" until the box is read. Items made in the box (a restock, a craft, ore, another box's move) have no row. */
+struct BoxJrnLedRow
+{
+    unsigned int uid, at;
+    std::string where, section, cell, baseSid, ident;
+    int units, op;
+    std::string boxSec, packSec;
+    int bx, by, inPack, px, py;
+    int tried;   /* T-1346 fold 1: 1 = matched at its own reading (BoxJrnLedMatchAt / BoxJrnLedOnRead) - never matched again by a later one; left
+                    unmatched it is kept and matched by its kind (baseSid) at the split */
+    BoxJrnLedRow() : uid(0), at(0), units(0), op(0), bx(0), by(0), inPack(0), px(0), py(0), tried(0) {}
+};
+inline std::string BoxJrnPackKey(const std::string& section, int x, int y)
+{
+    char n[48];
+    std::sprintf(n, "\x02%d,%d", x, y);
+    return section + n;
+}
+/* the key a put's units are matched to their ledger rows by: the identity, and the pack's cell for a part inside a pack. "" = an item
+   that cannot be encoded */
+inline std::string BoxJrnOriginKey(const BoxJrnDelta& d)
+{
+    std::string id;
+    if (BoxJrnIdentity(d.row, &id) == 0) return std::string();
+    return (d.inPack != 0) ? id + "\x03" + BoxJrnPackKey(d.packSection, d.packX, d.packY) : id;
+}
+/* a ledger row's cell key (BoxJrnLedRow::cell) */
+inline std::string BoxJrnLedCell(const BoxJrnLedRow& r)
+{
+    char n[48];
+    std::sprintf(n, "\x01%d,%d", r.bx, r.by);
+    return (r.inPack != 0) ? BoxJrnPackKey(r.packSec, r.px, r.py) + "\x03" + r.boxSec + n : r.boxSec + n;
+}
+/* the row's identity from the box as the journal reads it: a rise of a stack (op 2) and a move out read the box BEFORE the move (was),
+   a whole object or a split's object landing read it AFTER (now). The item at the row's cell (of the row's record when it is known);
+   else the one identity of that record in the box (in the pack); else unresolved. 1 = r->ident set; 0 = unresolved */
+inline int BoxJrnLedResolve(BoxJrnLedRow* r, const std::vector<cooppar::ParityItem>& was, const std::vector<cooppar::ParityItem>& now,
+                            int passFrom = 0, int passTo = 2)
+{
+    if (r == 0) return 0;
+    const std::vector<cooppar::ParityItem>& v = (r->op == 2 || r->units < 0) ? was : now;
+    std::string found, foundSid;
+    std::set<std::string> bySid;
+    for (int pass = passFrom; pass < passTo && found.empty(); ++pass)
+        for (size_t i = 0; i < v.size() && found.empty(); ++i)
+        {
+            if (r->inPack == 0)
+            {
+                const cooppar::ParityItem& it = v[i];
+                if (!r->baseSid.empty() && it.baseSid != r->baseSid) continue;
+                if (pass == 0 && (it.section != r->boxSec || it.x != r->bx || it.y != r->by)) continue;
+                std::string id;
+                if (BoxJrnIdentity(it, &id) == 0) continue;
+                if (pass == 0) { found = id; foundSid = it.baseSid; } else bySid.insert(id);
+                continue;
+            }
+            if (v[i].section != r->packSec || v[i].x != r->px || v[i].y != r->py) continue;
+            for (size_t b = 0; b < v[i].bag.size() && found.empty(); ++b)
+            {
+                const coopbag::BagRow& br = v[i].bag[b];
+                if (br.parent != 0 || br.qty == 0) continue;
+                if (!r->baseSid.empty() && br.baseSid != r->baseSid) continue;
+                if (pass == 0 && (br.section != r->boxSec || (int)br.x != r->bx || (int)br.y != r->by)) continue;
+                std::string id;
+                if (BoxJrnIdentity(BoxJrnRowItem(br), &id) == 0) continue;
+                if (pass == 0) { found = id; foundSid = br.baseSid; } else bySid.insert(id);
+            }
+        }
+    if (found.empty() && !r->baseSid.empty() && bySid.size() == 1) found = *bySid.begin();
+    if (found.empty()) return 0;
+    if (r->baseSid.empty()) r->baseSid = foundSid;   /* fold 1: the record read, so the row has a kind */
+    r->ident = (r->inPack != 0) ? found + "\x03" + BoxJrnPackKey(r->packSec, r->px, r->py) : found;
+    return 1;
+}
+/* T-1346 fold 1 (review H1): A ROW IS MATCHED AT ITS MOVE, AGAINST THE RIGHT READING. The drain reads each box of its moves (its marks)
+   before it notes their rows, and the box may be read again later with the item moved on, so a row is matched at its note: a landing
+   against the box just after this drain's moves (the newest reading, when it is of this drain); a move out or a stack's rise against the
+   box before this drain's first move (BoxJrnLedReads::before - the reading kept at the drain's first reading). The readings a box's rows
+   use: */
+struct BoxJrnLedReads
+{
+    std::vector<cooppar::ParityItem> before;   /* the box as read before the first reading of drain `drain` */
+    int beforeHave;
+    unsigned int drain;                        /* the drain of the box's newest reading (0 none) */
+    BoxJrnLedReads() : beforeHave(0), drain(0) {}
+};
+/* a row's kind: its record (and the pack's cell inside a pack); "" unread */
+inline std::string BoxJrnLedKind(const BoxJrnLedRow& r)
+{
+    if (r.baseSid.empty()) return std::string();
+    return (r.inPack != 0) ? r.baseSid + "\x03" + BoxJrnPackKey(r.packSec, r.px, r.py) : r.baseSid;
+}
+inline std::string BoxJrnDeltaKind(const BoxJrnDelta& d)
+{
+    if (d.row.baseSid.empty()) return std::string();
+    return (d.inPack != 0) ? d.row.baseSid + "\x03" + BoxJrnPackKey(d.packSection, d.packX, d.packY) : d.row.baseSid;
+}
+/* the row at its note in drain `drain` (latest: the box's newest reading, 0 none). A landing (units > 0, not a rise) is matched against
+   latest when that reading is of this drain; else it waits for the box's next reading (tried 0: BoxJrnLedOnRead). A move out or a rise:
+   read in this drain - against rd.before; not read in this drain - its newest reading is before the move, and an item held across drains
+   left the box before that drain's reading (rd.before): each by the cell first, then by the one identity of its record. 1 = matched;
+   0 = not matched - kept, matched by its kind at the split; -1 = waits for the next reading */
+inline int BoxJrnLedMatchAt(BoxJrnLedRow* r, const BoxJrnLedReads& rd, const std::vector<cooppar::ParityItem>* latest, unsigned int drain)
+{
+    if (r == 0) return 0;
+    const std::vector<cooppar::ParityItem> none;
+    const int fresh = (latest != 0 && rd.drain == drain) ? 1 : 0;
+    if (r->op != 2 && r->units > 0)
+    {
+        if (fresh == 0) { r->tried = 0; return -1; }
+        r->tried = 1;
+        return BoxJrnLedResolve(r, none, *latest);
+    }
+    r->tried = 1;
+    const std::vector<cooppar::ParityItem>* bf = (rd.beforeHave != 0) ? &rd.before : 0;
+    if (fresh != 0)
+    {   /* a stack's rise keeps its stack: else the stack at its cell just after the drain */
+        if (bf != 0 && BoxJrnLedResolve(r, *bf, none) != 0) return 1;
+        return (r->op == 2 && BoxJrnLedResolve(r, *latest, none, 0, 1) != 0) ? 1 : 0;
+    }
+    if (latest != 0 && BoxJrnLedResolve(r, *latest, none, 0, 1) != 0) return 1;
+    if (bf != 0 && BoxJrnLedResolve(r, *bf, none, 0, 1) != 0) return 1;
+    /* fold 2 (re-check N1): a move out is never matched by "the one identity of its record" on this road - the readings may postdate
+       the move (a write read the box between a held pickup and its drop), so that one identity can be another item: kept unmatched */
+    if (r->units < 0) return 0;
+    if (bf != 0 && BoxJrnLedResolve(r, *bf, none, 1, 2) != 0) return 1;
+    if (latest != 0 && BoxJrnLedResolve(r, *latest, none, 1, 2) != 0) return 1;
+    return 0;
+}
+/* fold 2 (re-check N1): AN ITEM HELD ON THE CURSOR OUT OF THE BOX is matched at its PICKUP drain (pick: a move-out row built at the
+   pickup and matched there by BoxJrnLedMatchAt, against that drain's reading of the box before the move) - the box may be written and
+   read again before the drop, and the drop (the row r, noted then with the character it landed on) takes the pickup's identity and
+   record. 1 = matched; 0 = the pickup could not match it - kept, matched by its kind at the split */
+inline int BoxJrnLedHeldTake(BoxJrnLedRow* r, const BoxJrnLedRow& pick)
+{
+    if (r == 0) return 0;
+    r->tried = 1;
+    r->ident = pick.ident;
+    if (!pick.baseSid.empty()) r->baseSid = pick.baseSid;
+    return r->ident.empty() ? 0 : 1;
+}
+/* a reading of the box (items) in drain `drain`; prev the reading before it (0 none). The drain's first reading keeps prev as the box
+   before the drain's moves (rd->before). Each row still waiting (tried 0) is matched now, once: a landing against items, a move out or a
+   rise against prev. The count left unmatched (their indexes in *unmatched) - kept, matched by their kind at the split */
+inline int BoxJrnLedOnRead(std::vector<BoxJrnLedRow>* led, BoxJrnLedReads* rd, const std::vector<cooppar::ParityItem>* prev,
+                           const std::vector<cooppar::ParityItem>& items, unsigned int drain, std::vector<size_t>* unmatched)
+{
+    if (rd == 0) return 0;
+    if (rd->drain != drain || drain == 0)
+    {
+        if (prev != 0) { rd->before = *prev; rd->beforeHave = 1; } else { rd->before.clear(); rd->beforeHave = 0; }
+        rd->drain = drain;
+    }
+    if (led == 0) return 0;
+    const std::vector<cooppar::ParityItem> none;
+    int n = 0;
+    for (size_t i = 0; i < led->size(); ++i)
+    {
+        BoxJrnLedRow& r = (*led)[i];
+        if (r.tried != 0 || !r.ident.empty()) continue;
+        r.tried = 1;
+        int ok = 0;
+        if (r.op != 2 && r.units > 0) ok = BoxJrnLedResolve(&r, none, items);
+        else if (prev != 0) ok = BoxJrnLedResolve(&r, *prev, none);
+        if (ok == 0) { ++n; if (unmatched != 0) unmatched->push_back(i); }
+    }
+    return n;
+}
+/* fold 2 (re-check N2): the send times of this game's writes of the box not stored yet - waiting, and answered not stored whose echo may
+   still come (done). A stored write's time prunes the ledger (BoxJrnLedAfter) and cuts a save's change (BoxOwedFromPark) */
+inline std::vector<unsigned int> BoxJrnLedCuts(const BoxJrnState& s)
+{
+    std::vector<unsigned int> c;
+    for (size_t i = 0; i < s.waiting.size(); ++i) c.push_back(s.waiting[i].at);
+    for (size_t i = 0; i < s.done.size(); ++i) c.push_back(s.done[i].at);
+    return c;
+}
+/* review M2: AT THE LEDGER'S CAP, rows of one character and one item (its identity; a row kept for the kind match: its kind) become one -
+   the units summed, the newest row's time and place; a sum of 0 leaves, and so does a row that can never be matched (no identity, no
+   record). Rows still waiting for a reading are left as they are. Fold 2 (re-check N2): only rows on the same side of every write sent
+   and not stored (cuts, BoxJrnLedCuts) become one, so a stored write's time still prunes exactly the rows it carried. The count of rows
+   removed */
+inline size_t BoxJrnLedCombine(std::vector<BoxJrnLedRow>* v, const std::vector<unsigned int>* cuts = 0)
+{
+    if (v == 0) return 0;
+    std::map<std::string, size_t> at;
+    std::vector<BoxJrnLedRow> out;
+    for (size_t i = v->size(); i-- > 0;)
+    {
+        const BoxJrnLedRow& r = (*v)[i];
+        if (r.tried == 0 && r.ident.empty()) { out.push_back(r); continue; }
+        std::string g = r.ident.empty() ? BoxJrnLedKind(r) : r.ident;
+        if (g.empty()) continue;   /* never matchable */
+        char n[24];
+        std::sprintf(n, "%u", r.uid);
+        std::string side;   /* the row's time bracket: which unstored writes it stays after */
+        if (cuts != 0) for (size_t c = 0; c < cuts->size(); ++c) side += (BoxJrnHintStays(r.at, (*cuts)[c]) != 0) ? "1" : "0";
+        g = ((r.uid != 0) ? std::string("u") + n : "w" + r.where) + "\x06" + side + (r.ident.empty() ? "\x06K" : "\x06I") + g;
+        std::map<std::string, size_t>::iterator f = at.find(g);
+        if (f != at.end()) { out[f->second].units += r.units; continue; }
+        at[g] = out.size();
+        out.push_back(r);
+    }
+    std::vector<BoxJrnLedRow> keep;
+    for (size_t i = out.size(); i-- > 0;) if (out[i].units != 0 || (out[i].tried == 0 && out[i].ident.empty())) keep.push_back(out[i]);
+    const size_t removed = v->size() - keep.size();
+    v->swap(keep);
+    return removed;
+}
+/* review LOW: a put's origins over the save file's cap (kBoxOwedMaxWho) - origins of one character are summed, then the oldest past the
+   cap leave with their units (the put owes less). The units left out */
+inline long long BoxJrnFromCap(std::vector<BoxJrnDelta>* d, size_t cap)
+{
+    long long out = 0;
+    if (d == 0) return 0;
+    for (size_t k = 0; k < d->size(); ++k)
+    {
+        std::vector<BoxJrnFrom>& f = (*d)[k].from;
+        if (f.size() <= cap) continue;
+        std::vector<BoxJrnFrom> m;
+        for (size_t i = 0; i < f.size(); ++i)
+        {
+            size_t j = 0;
+            for (; j < m.size(); ++j) if (!f[i].where.empty() && m[j].where == f[i].where) break;
+            if (j < m.size()) m[j].units += f[i].units; else m.push_back(f[i]);
+        }
+        while (m.size() > cap) { out += (long long)m.back().units; (*d)[k].quantity -= m.back().units; m.pop_back(); }
+        if ((*d)[k].quantity < 0) (*d)[k].quantity = 0;
+        f.swap(m);
+    }
+    return out;
+}
+/* T-1346: EACH PUT OF THE BOX'S CHANGE IS GIVEN ONLY THE UNITS THIS GAME'S CHARACTERS PUT IN (led: the box's origin ledger). Per key
+   (BoxJrnOriginKey) every character's net (its units in less its units out) is taken; a put of q units keeps G = min(q, the sum of the
+   nets, at least 0), given to the characters with a positive net, the newest first, into its `from` (the nets are used up, so two puts
+   never share units). The rest (q - G) was made in the box - a restock, a craft, ore - not by a character of this game: it is never
+   asked and never made again (*dropped). A put left with no units leaves the list. Takes are not changed. The count of puts changed */
+struct BoxJrnOriginNet { unsigned int uid; std::string where, section; long long net; size_t ord; };   /* one character's net in a key */
+inline int BoxJrnOriginNetAt(const std::vector<BoxJrnOriginNet>& v, unsigned int uid, const std::string& where)
+{
+    for (size_t j = 0; j < v.size(); ++j) if ((uid != 0 && v[j].uid == uid) || (uid == 0 && v[j].uid == 0 && v[j].where == where)) return (int)j;
+    return -1;
+}
+inline void BoxJrnOriginNetAdd(std::vector<BoxJrnOriginNet>* v, const BoxJrnLedRow& r, size_t i, long long units)
+{
+    int j = BoxJrnOriginNetAt(*v, r.uid, r.where);
+    if (j < 0) { BoxJrnOriginNet n; n.uid = r.uid; n.where = r.where; n.section = r.section; n.net = 0; n.ord = i; v->push_back(n); j = (int)v->size() - 1; }
+    BoxJrnOriginNet& n = (*v)[(size_t)j];
+    n.net += units;
+    if (units > 0) { n.ord = i; if (!r.section.empty()) n.section = r.section; if (!r.where.empty()) n.where = r.where; }
+}
+struct BoxJrnOriginCand { int e, k, b; long long avail; size_t ord; };
+/* fold 1 (review H1): a row that could not be matched to an item at its reading is kept and matched by its kind (BoxJrnLedKind, the
+   delta's BoxJrnDeltaKind): it adds to a put of that kind what its character put in, bounded by the character's net of that kind (its
+   positive nets of each identity of the kind plus its unmatched rows' net), so an unmatched move out still offsets that character's puts
+   and an unmatched landing still goes back to it. *byKind: the units given by kind */
+inline int BoxJrnOriginSplit(std::vector<BoxJrnDelta>* d, const std::vector<BoxJrnLedRow>& led, long long* dropped, long long* byKind = 0)
+{
+    if (d == 0) return 0;
+    typedef BoxJrnOriginNet Net;
+    typedef std::map<std::string, std::vector<Net> > NetMap;
+    NetMap nets, kinds, budget;
+    std::map<std::string, std::string> kindOf;
+    for (size_t i = 0; i < led.size(); ++i)
+    {
+        const BoxJrnLedRow& r = led[i];
+        if (r.units == 0) continue;
+        const std::string kk = BoxJrnLedKind(r);
+        if (!r.ident.empty()) { BoxJrnOriginNetAdd(&nets[r.ident], r, i, r.units); if (!kk.empty()) kindOf[r.ident] = kk; }
+        else if (!kk.empty()) BoxJrnOriginNetAdd(&kinds[kk], r, i, r.units);
+    }
+    for (NetMap::iterator ki = kinds.begin(); ki != kinds.end(); ++ki) budget[ki->first] = ki->second;
+    for (NetMap::iterator ni = nets.begin(); ni != nets.end(); ++ni)
+    {
+        std::map<std::string, std::string>::iterator ko = kindOf.find(ni->first);
+        if (ko == kindOf.end() || kinds.count(ko->second) == 0) continue;
+        std::vector<Net>& bv = budget[ko->second];
+        for (size_t j = 0; j < ni->second.size(); ++j)
+        {
+            const Net& n = ni->second[j];
+            if (n.net <= 0) continue;
+            int b = BoxJrnOriginNetAt(bv, n.uid, n.where);
+            if (b < 0) { Net z = n; z.net = 0; bv.push_back(z); b = (int)bv.size() - 1; }
+            bv[(size_t)b].net += n.net;
+        }
+    }
+    int changed = 0;
+    std::vector<BoxJrnDelta> keep;
+    for (size_t k = 0; k < d->size(); ++k)
+    {
+        BoxJrnDelta x = (*d)[k];
+        if (x.dir != kBjPut) { keep.push_back(x); continue; }
+        x.from.clear();
+        const std::string key = BoxJrnOriginKey(x), kk = BoxJrnDeltaKind(x);
+        std::vector<Net>* v = 0;
+        std::vector<Net>* kv = 0;
+        std::vector<Net>* bv = 0;
+        if (!key.empty()) { NetMap::iterator f = nets.find(key); if (f != nets.end()) v = &f->second; }
+        if (!kk.empty()) { NetMap::iterator f = kinds.find(kk); if (f != kinds.end()) { kv = &f->second; bv = &budget[kk]; } }
+        long long sum = 0;
+        std::vector<BoxJrnOriginCand> cand;
+        for (int side = 0; side < 2; ++side)
+        {
+            std::vector<Net>* s0 = (side == 0) ? v : kv;
+            if (s0 == 0) continue;
+            for (size_t j = 0; j < s0->size(); ++j)
+            {
+                const Net& n = (*s0)[j];
+                sum += n.net;
+                if (side == 1 && v != 0 && BoxJrnOriginNetAt(*v, n.uid, n.where) >= 0) continue;   /* the same character: one candidate */
+                BoxJrnOriginCand c;
+                c.e = (side == 0) ? (int)j : -1;
+                c.k = (side == 1) ? (int)j : ((kv != 0) ? BoxJrnOriginNetAt(*kv, n.uid, n.where) : -1);
+                c.b = (bv != 0) ? BoxJrnOriginNetAt(*bv, n.uid, n.where) : -1;
+                const long long e = (c.e >= 0 && (*v)[(size_t)c.e].net > 0) ? (*v)[(size_t)c.e].net : 0;
+                const long long kn = (c.k >= 0 && (*kv)[(size_t)c.k].net > 0) ? (*kv)[(size_t)c.k].net : 0;
+                c.avail = e + kn;
+                if (bv != 0) { const long long b = (c.b >= 0) ? (*bv)[(size_t)c.b].net : 0; if (b < c.avail) c.avail = (b > 0) ? b : 0; }
+                c.ord = 0;
+                if (e > 0) c.ord = (*v)[(size_t)c.e].ord;
+                if (kn > 0 && (*kv)[(size_t)c.k].ord > c.ord) c.ord = (*kv)[(size_t)c.k].ord;
+                if (c.avail > 0) cand.push_back(c);
+            }
+        }
+        const long long q = (x.quantity > 0) ? (long long)x.quantity : 0;
+        long long g = (sum < q) ? sum : q;
+        if (g < 0) g = 0;
+        long long left = g;
+        while (left > 0 && !cand.empty())
+        {   /* the newest character first */
+            size_t best = 0;
+            for (size_t j = 1; j < cand.size(); ++j) if (cand[j].ord > cand[best].ord) best = j;
+            const BoxJrnOriginCand c = cand[best];
+            cand.erase(cand.begin() + (long)best);
+            const long long t = (c.avail < left) ? c.avail : left;
+            long long te = 0;
+            if (c.e >= 0) { Net& n = (*v)[(size_t)c.e]; te = (n.net > 0) ? ((n.net < t) ? n.net : t) : 0; n.net -= te; }
+            if (t > te && c.k >= 0) (*kv)[(size_t)c.k].net -= (t - te);
+            if (c.b >= 0) (*bv)[(size_t)c.b].net -= t;
+            if (byKind != 0) *byKind += t - te;
+            const Net& who = (c.e >= 0) ? (*v)[(size_t)c.e] : (*kv)[(size_t)c.k];
+            BoxJrnFrom o; o.uid = who.uid; o.where = who.where; o.section = who.section; o.units = (int)t;
+            x.from.push_back(o);
+            left -= t;
+        }
+        g -= left;
+        if (dropped != 0) *dropped += q - g;
+        if (g != q) ++changed;
+        if (g <= 0) continue;
+        x.quantity = (int)g;
+        keep.push_back(x);
+    }
+    d->swap(keep);
+    return changed;
+}
+/* the ledger rows a write sent at writeAt did not read (BoxJrnHintStays): those of the change left after it is stored */
+inline std::vector<BoxJrnLedRow> BoxJrnLedAfter(const std::vector<BoxJrnLedRow>& led, unsigned int writeAt)
+{
+    std::vector<BoxJrnLedRow> v;
+    for (size_t i = 0; i < led.size(); ++i) if (BoxJrnHintStays(led[i].at, writeAt) != 0) v.push_back(led[i]);
+    return v;
+}
 inline int BoxJrnWaiting(const BoxJrnState& s) { return s.waiting.empty() ? 0 : 1; }
 /* the box's change as asks: latest (the box as this game last had it as its writer) against the base. 1 = *out holds it (empty: no
    change); 0 = no base, or an item cannot be encoded */
@@ -2246,7 +2618,8 @@ inline void BoxJrnClose(BoxJrnState* s)
    only on those characters. */
 const char* const kBoxOwedFile = "multiplayer.boxowed";
 const unsigned int kBoxOwedMarker = 0x574F4A42u;   /* 'BJOW' */
-const unsigned int kBoxOwedFormat = 2u;
+const unsigned int kBoxOwedFormat = 3u;      /* T-1346: 3 - each part carries its origins (BoxJrnDelta::from); 2 is still read (no origins) */
+const unsigned int kBoxOwedFormatOld = 2u;
 const unsigned int kBoxOwedMaxRows = 1024u, kBoxOwedMaxWho = 64u, kBoxOwedMaxIds = 64u, kBoxOwedMaxDeltas = 4096u, kBoxOwedMaxStr = 1024u;
 struct BoxOwedWho { std::string where; std::string section; };
 struct BoxOwedRow
@@ -2257,11 +2630,12 @@ struct BoxOwedRow
     int slot;                                         /* the ledger slot this game's ids are recorded under (-1 unknown) */
     unsigned long long line;                          /* the ledger line those ids go to (0 unknown: an absent id reads unsure) */
     int decided;                                      /* 1 = an undo already decided (ifNone): done as it is */
+    int oldForm;                                      /* T-1346: 1 = read from a format-2 file (its puts have no origins: the who rule, once) */
     std::vector<unsigned long long> ids;              /* this game's writes that may hold the change, oldest first - the last may be the id
                                                          the save sealed for the box as it stood (BoxSeal), no write of it sent yet */
     std::vector<std::vector<BoxJrnDelta> > ifStored;  /* by ids: the change left on the character when that write is the newest stored */
     std::vector<BoxJrnDelta> ifNone;                  /* the change left when none of them is (each part with its ask's id, 0 none) */
-    BoxOwedRow() : slot(-1), line(0ULL), decided(0) { pos[0] = 0; pos[1] = 0; pos[2] = 0; }
+    BoxOwedRow() : slot(-1), line(0ULL), decided(0), oldForm(0) { pos[0] = 0; pos[1] = 0; pos[2] = 0; }
 };
 /* an unsure change's row beside a save (BoxJrnUnsureParts on each of its lists): its takes never undone or asked at the load, its puts
    kept. The count dropped */
@@ -2276,11 +2650,13 @@ inline int BoxOwedRowUnsure(BoxOwedRow* r)
    stored whose echo may still come - oldest first, each by its id with the change left when it is the newest stored; then the change
    not written yet, under the id the save sealed for the box as it stands (pendId, BoxSeal; 0 none), with nothing left. 1 = made; 0 = no base, an item cannot be
    encoded, or a write with no id (that row could never be settled) */
-inline int BoxOwedFromPark(const BoxJrnState& s, const std::vector<cooppar::ParityItem>& latest, unsigned long long pendId, BoxOwedRow* r)
+inline int BoxOwedFromPark(const BoxJrnState& s, const std::vector<cooppar::ParityItem>& latest, unsigned long long pendId, BoxOwedRow* r,
+                           const std::vector<BoxJrnLedRow>* led = 0, long long* dropped = 0)
 {
     if (r == 0) return 0;
     r->ids.clear(); r->ifStored.clear(); r->ifNone.clear();
     if (BoxJrnPlan(s, latest, &r->ifNone) == 0) return 0;
+    if (led != 0) (void)BoxJrnOriginSplit(&r->ifNone, *led, dropped);   /* T-1346: a put keeps only its characters' units, with them */
     std::vector<const BoxJrnWrite*> ws;
     for (int pass = 0; pass < 2; ++pass)
     {
@@ -2296,6 +2672,7 @@ inline int BoxOwedFromPark(const BoxJrnState& s, const std::vector<cooppar::Pari
     {
         std::vector<BoxJrnDelta> left;
         if (ws[i]->chg == 0ULL || BoxJrnDiffAll(ws[i]->items, latest, &left, 0) == 0) { r->ids.clear(); r->ifStored.clear(); r->ifNone.clear(); return 0; }
+        if (led != 0) (void)BoxJrnOriginSplit(&left, BoxJrnLedAfter(*led, ws[i]->at), 0);   /* the rows after that write's read */
         r->ids.push_back(ws[i]->chg);
         r->ifStored.push_back(left);
     }
@@ -2312,10 +2689,11 @@ inline int BoxOwedParkRow(int act, int writesWaiting)
 }
 /* the box's journal at a save (this game the writer): its change against its base as an owed row (BoxOwedFromPark). 1 = made; 0 = no
    change, no base, or a row that cannot be made */
-inline int BoxOwedFromJournal(const BoxJrnState& s, int latestHave, const std::vector<cooppar::ParityItem>& latest, unsigned long long pendId, BoxOwedRow* r)
+inline int BoxOwedFromJournal(const BoxJrnState& s, int latestHave, const std::vector<cooppar::ParityItem>& latest, unsigned long long pendId, BoxOwedRow* r,
+                              const std::vector<BoxJrnLedRow>* led = 0, long long* dropped = 0)
 {
     if (latestHave == 0 || s.open == 0 || r == 0) return 0;
-    if (BoxOwedFromPark(s, latest, pendId, r) == 0) return 0;
+    if (BoxOwedFromPark(s, latest, pendId, r, led, dropped) == 0) return 0;
     return r->ifNone.empty() ? 0 : 1;
 }
 /* A SAVE SEALS THE ID ITS ROW NAMES. A row names the change not written yet under one id, with nothing left when that id is stored; the
@@ -2520,10 +2898,17 @@ inline bool BoxOwedPutDeltas(std::vector<char>* b, const std::vector<BoxJrnDelta
         BrPutStr(b, d[k].packSection); BrPutU32(b, (unsigned int)d[k].packX); BrPutU32(b, (unsigned int)d[k].packY); BrPutStr(b, d[k].packSid);
         BrPutU32(b, (unsigned int)body.size());
         b->insert(b->end(), body.begin(), body.end());
+        const size_t nf = (d[k].from.size() > kBoxOwedMaxWho) ? (size_t)kBoxOwedMaxWho : d[k].from.size();   /* fold 1: the newest (BoxJrnFromCap first) */
+        BrPutU32(b, (unsigned int)nf);   /* format 3: the part's origins */
+        for (size_t f = 0; f < nf; ++f)
+        {
+            if (d[k].from[f].where.size() > kBoxOwedMaxStr || d[k].from[f].section.size() > kBoxOwedMaxStr || d[k].from[f].units < 0) return false;
+            BrPutStr(b, d[k].from[f].where); BrPutStr(b, d[k].from[f].section); BrPutU32(b, (unsigned int)d[k].from[f].units);
+        }
     }
     return true;
 }
-inline bool BoxOwedGetDeltas(const char* p, size_t size, size_t* off, std::vector<BoxJrnDelta>* out)
+inline bool BoxOwedGetDeltas(const char* p, size_t size, size_t* off, std::vector<BoxJrnDelta>* out, unsigned int format = kBoxOwedFormat)
 {
     unsigned int n = 0;
     if (!BrGet4(p, size, off, &n) || n > kBoxOwedMaxDeltas) return false;
@@ -2541,14 +2926,28 @@ inline bool BoxOwedGetDeltas(const char* p, size_t size, size_t* off, std::vecto
         if (cooppar::DecodeParityBox(p + *off, len, &m) != cooppar::kParityDecodeOk || m.items.size() != 1) return false;
         *off += len;
         d.dir = (int)dir; d.quantity = (int)q; d.inPack = (int)ip; d.packX = (int)px; d.packY = (int)py; d.row = m.items[0];
+        if (format >= 3u)
+        {
+            unsigned int nf = 0;
+            if (!BrGet4(p, size, off, &nf) || nf > kBoxOwedMaxWho) return false;
+            for (unsigned int f = 0; f < nf; ++f)
+            {
+                BoxJrnFrom o;
+                unsigned int u = 0;
+                if (!BrGetStr(p, size, off, kBoxOwedMaxStr, &o.where) || !BrGetStr(p, size, off, kBoxOwedMaxStr, &o.section) || !BrGet4(p, size, off, &u)
+                    || u > 0x7FFFFFFFu) return false;
+                o.units = (int)u;
+                d.from.push_back(o);
+            }
+        }
         out->push_back(d);
     }
     return true;
 }
 /* marker | format | u32 rows | per row: str id | str key | 3 x f32 pos | u32 n | n x (str where | str section) | u32 slot | u64 line |
    u32 decided | u32 g | g x (u64 id | deltas) | deltas (ifNone); deltas: u32 n | n x (u64 ask id | u32 dir | u32 quantity | u32 inPack |
-   str packSection | u32 packX | u32 packY | str packSid | u32 len | the item as a one-item PARITY_BOX). false = nothing usable (a cap
-   passed, an item not encodable) */
+   str packSection | u32 packX | u32 packY | str packSid | u32 len | the item as a one-item PARITY_BOX | u32 nf | nf x (str where |
+   str section | u32 units) - its origins, format 3 only). false = nothing usable (a cap passed, an item not encodable) */
 inline bool EncodeBoxOwed(const std::vector<BoxOwedRow>& rows, std::vector<char>* out)
 {
     if (out == 0) return false;
@@ -2581,7 +2980,8 @@ inline bool EncodeBoxOwed(const std::vector<BoxOwedRow>& rows, std::vector<char>
     out->swap(b);
     return true;
 }
-/* 1 = *out holds the rows; 0 = not a file of this form (nothing kept) */
+/* 1 = *out holds the rows; 0 = not a file of this form (nothing kept). Format 2 is read too: its rows are oldForm, their parts with no
+   origins */
 inline int DecodeBoxOwed(const char* p, size_t size, std::vector<BoxOwedRow>* out)
 {
     if (out == 0) return 0;
@@ -2589,8 +2989,8 @@ inline int DecodeBoxOwed(const char* p, size_t size, std::vector<BoxOwedRow>* ou
     if (p == 0) return 0;
     size_t off = 0;
     unsigned int mk = 0, fm = 0, n = 0;
-    if (!BrGet4(p, size, &off, &mk) || mk != kBoxOwedMarker || !BrGet4(p, size, &off, &fm) || fm != kBoxOwedFormat || !BrGet4(p, size, &off, &n)
-        || n > kBoxOwedMaxRows) return 0;
+    if (!BrGet4(p, size, &off, &mk) || mk != kBoxOwedMarker || !BrGet4(p, size, &off, &fm) || (fm != kBoxOwedFormat && fm != kBoxOwedFormatOld)
+        || !BrGet4(p, size, &off, &n) || n > kBoxOwedMaxRows) return 0;
     std::vector<BoxOwedRow> rows;
     for (unsigned int i = 0; i < n; ++i)
     {
@@ -2608,16 +3008,16 @@ inline int DecodeBoxOwed(const char* p, size_t size, std::vector<BoxOwedRow>* ou
         }
         if (!BrGet4(p, size, &off, &sl) || !BrGet8(p, size, &off, &r.line) || !BrGet4(p, size, &off, &dc) || dc > 1u || !BrGet4(p, size, &off, &ng)
             || ng > kBoxOwedMaxIds) return 0;
-        r.slot = (int)sl; r.decided = (int)dc;
+        r.slot = (int)sl; r.decided = (int)dc; r.oldForm = (fm == kBoxOwedFormatOld) ? 1 : 0;
         for (unsigned int g = 0; g < ng; ++g)
         {
             unsigned long long id = 0ULL;
             std::vector<BoxJrnDelta> d;
-            if (!BrGet8(p, size, &off, &id) || !BoxOwedGetDeltas(p, size, &off, &d)) return 0;
+            if (!BrGet8(p, size, &off, &id) || !BoxOwedGetDeltas(p, size, &off, &d, fm)) return 0;
             r.ids.push_back(id);
             r.ifStored.push_back(d);
         }
-        if (!BoxOwedGetDeltas(p, size, &off, &r.ifNone)) return 0;
+        if (!BoxOwedGetDeltas(p, size, &off, &r.ifNone, fm)) return 0;
         rows.push_back(r);
     }
     if (off != size) return 0;
@@ -2734,5 +3134,10 @@ inline int BoxOwedArmTake(BoxOwedArm* a, long worldGen)
     a->armed = 0; a->gen = -1;
     return take;
 }
+
+/* T-1346 TEST-ONLY (boxburst, read-T2396): 1 = boxburst's armed cut fires now. armedAt is the drain number when the steps ran (the
+   steps run in the command channel's call, after that frame's drain); drainNow the number of the drain that has just ended. The cut
+   waits for the first drain that started after the steps - the one that carries their moves - and fires at its end. */
+inline int BoxBurstCutDue(int armed, unsigned int armedAt, unsigned int drainNow) { return (armed != 0 && drainNow != armedAt) ? 1 : 0; }
 
 }   /* namespace coopbrec */

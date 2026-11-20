@@ -56,6 +56,7 @@
 
 #include "admin.h"
 #include "store.h"
+#include "settings.h"   /* T-247 (owner 1699): SettingsModsReadFacts - the refused USE MY MODS's log line */
 #include "chat.h"
 #include "kapi.h"
 #include "coop_log.h"
@@ -236,6 +237,7 @@ void OnResult(const char* p, size_t n)
     PendingWipe("a RESULT came");
     const bool autoOwner = g_pendingAuto != 0;
     g_pendingAuto = 0;
+    coop::StoreJoinAdminAnswered(code);   /* T-247 (owner 1692): JOIN AS ADMIN's password, remembered when it was taken */
     {   /* REMEMBERED (owner 1380 / 1379): a typed login the world server took, that made this game the owner or an admin it was not */
         if (!autoOwner && adminwords::LoginRemembers(code, g_typedFrom) && !g_typedLogin.empty() && g_typedLoginGen == coop::StoreLinkGen()) coop::StoreLoginPasswordRemember(coop::StoreLinkWorldId(), g_typedLogin);
         Wipe(&g_typedLogin);
@@ -256,6 +258,7 @@ void OnStanding(const char* p, size_t n)
 {
     unsigned standing = 0, why = 0;
     if (!adminauth::DecodeStanding(p, n, &standing, &why)) { ++g_malformed; ErrorLog("[ADMIN] an ADMIN_STANDING of " + N((long long)n) + " bytes did not decode - ignored"); return; }
+    if (why == (unsigned)adminauth::kWhyWelcome) coop::StoreJoinAdminEnded("let in without a login at the door (the WELCOME's standing)");   /* T-247 review fold (FIX 1) */
     std::string line;
     const bool changed = adminwords::StandingTake(&g_stand, coop::StoreLinkGen(), standing, why, &line);
     DebugLog("[ADMIN] the world server says this game is " + StandingName(standing) + " (" + WhyName(why) + ")"
@@ -838,6 +841,8 @@ void OnReply(const char* p, size_t n)
     admincmd::Reply r;
     if (!admincmd::DecodeReply(p, n, &r)) { ++g_malformed; ErrorLog("[ADMIN] an ADMIN_REPLY of " + N((long long)n) + " bytes did not decode - ignored"); return; }
     DebugLog("[ADMIN] answer to " + std::string(admincmd::VerbName((int)r.verb)) + " (request " + N((long long)r.req) + "): code " + N((long long)r.code));
+    if (r.verb == (unsigned)admincmd::kVerbUseMyMods && r.code == (unsigned)admincmd::kRepModsUnreadable)
+        DebugLog(coopmods::ModsUseRefusedLine(coop::SettingsModsReadFacts()));   /* T-247 (owner 1699): which part of this game's own list could not be read */
     if (adminwords::AddItemEnds(g_addWait, coop::StoreLinkGen(), r))
     {
         const adminwords::AddItemWait w = g_addWait;
@@ -1067,6 +1072,14 @@ int AdminListChange(int slot, bool make, const char* from)
     return sent;
 }
 
+int AdminUseMyMods(const char* from)
+{
+    const int sent = AdminRequest((unsigned)admincmd::kVerbUseMyMods, std::string(), 0u, 0);
+    if (sent == 0) Say(adminwords::NotLinkedLine());
+    DebugLog(std::string("[MODS] USE MY MODS FOR THIS WORLD ") + (sent == 1 ? "sent" : sent == 0 ? "not sent (not linked)" : "not sent (it would not encode)") + " from " + from);
+    return sent;
+}
+
 std::string AdminTestCommand(const std::string& args)
 {
     admincmd::TestAsk a;
@@ -1074,7 +1087,7 @@ std::string AdminTestCommand(const std::string& args)
     if (!admincmd::TestParse(args, &a))
     {
         DebugLog("[ADMIN] TEST-ONLY admintest REFUSED - not a form it knows (" + N((long long)shown.size()) + " characters, not logged: they may hold a password)");
-        return "error admintest usage: setpw sample | makeadmin <slot> | removeadmin <slot> | type login right|login wrong|logout|kick <slot>|ban <slot>|ban nobody|unban <slot>|stop | typeline <words: name:<uid> player:<slot> q:<text> hash:<text> filled in>";
+        return "error admintest usage: setpw sample | usemymods | makeadmin <slot> | removeadmin <slot> | type login right|login wrong|logout|kick <slot>|ban <slot>|ban nobody|unban <slot>|stop | typeline <words: name:<uid> player:<slot> q:<text> hash:<text> filled in>";
     }
     if (a.kind == admincmd::kTestSetPw)
     {
@@ -1082,6 +1095,11 @@ std::string AdminTestCommand(const std::string& args)
         const int done = AdminSetPassword(&pw, "the TEST-ONLY admintest lever");
         DebugLog("[ADMIN] TEST-ONLY admintest " + shown + " - the sample password through the MULTIPLAYER window's DONE road");
         return done == adminwords::kPwSend ? "ok admintest " + shown : "error admintest " + shown + " not-sent";
+    }
+    if (a.kind == admincmd::kTestUseMyMods)
+    {
+        DebugLog("[ADMIN] TEST-ONLY admintest usemymods - GAME OPTIONS' MODS tab's USE MY MODS FOR THIS WORLD YES road");
+        return AdminUseMyMods("the TEST-ONLY admintest lever") == 1 ? "ok admintest usemymods" : "error admintest usemymods not-sent";
     }
     if (a.kind == admincmd::kTestMakeAdmin || a.kind == admincmd::kTestRemoveAdmin)
     {

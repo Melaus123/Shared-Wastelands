@@ -231,6 +231,96 @@ inline std::string WorkshopGameFolder(const std::string& folder)
     return base + "\\steamapps\\common\\Kenshi";
 }
 
+/* T-1364 (owner 1667 / 1668): DOES SETUP HAVE TO COPY THE MOD'S FOLDER INTO <Kenshi>\mods\?
+   The loader (src/kenshi-loader/loader.cpp) looks for its marker only in <Kenshi>\mods\*\ and in
+   <Kenshi>\..\..\workshop\content\233860\*\ - one folder level below each.  Setup run from any other folder
+   must copy its own folder to <Kenshi>\mods\<swnames::kModName>, or nothing ever loads.
+   The CALLER passes full paths (GetFullPathName, then GetLongPathName so a short 8.3 name compares equal to
+   its long name); here they are compared without case, either slash, repeated and trailing slashes ignored. */
+
+/* The comparison form of a full path: '\' only, ASCII lower case, no repeated '\' (a leading "\\" of a UNC
+   path is kept), no trailing '\'. */
+inline std::string InstPathKey(const std::string& path)
+{
+    std::string out;
+    out.reserve(path.size());
+    for (size_t i = 0; i < path.size(); ++i)
+    {
+        char c = path[i];
+        if (c == '/') c = '\\';
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c == '\\' && !out.empty() && out[out.size() - 1] == '\\' && out.size() > 1) continue;
+        out += c;
+    }
+    while (out.size() > 2 && out[out.size() - 1] == '\\') out.erase(out.size() - 1);
+    if (out == "\\") out.clear();
+    return out;
+}
+
+/* The folder one level up (keys only); a root stays itself, as Windows resolves "C:\.." to "C:\". */
+inline std::string InstParentKey(const std::string& key)
+{
+    const size_t at = key.rfind('\\');
+    if (at == std::string::npos || at < 2) return key;
+    return key.substr(0, at);
+}
+
+/* `path` is `folder` itself or anywhere below it. */
+inline bool InstInside(const std::string& path, const std::string& folder)
+{
+    const std::string p = InstPathKey(path), f = InstPathKey(folder);
+    if (p.empty() || f.empty()) return false;
+    if (p == f) return true;
+    return p.size() > f.size() && p.compare(0, f.size(), f) == 0 && p[f.size()] == '\\';
+}
+
+/* `dir` is exactly one level below `parent` (a folder the loader's one-level search sees). */
+inline bool InstDirectChild(const std::string& dir, const std::string& parent)
+{
+    const std::string d = InstPathKey(dir), p = InstPathKey(parent);
+    if (d.empty() || p.empty() || d.size() <= p.size() + 1) return false;
+    if (d.compare(0, p.size(), p) != 0 || d[p.size()] != '\\') return false;
+    return d.find('\\', p.size() + 1) == std::string::npos;
+}
+
+/* The Workshop folder the loader of <kenshi> searches: <kenshi>\..\..\workshop\content\233860 (keys). */
+inline std::string LoaderWorkshopKey(const std::string& kenshi)
+{
+    const std::string k = InstPathKey(kenshi);
+    if (k.empty()) return "";
+    return InstParentKey(InstParentKey(k)) + "\\workshop\\content\\233860";
+}
+
+/* COPY NEEDED: Setup's own folder is neither a direct subfolder of <kenshi>\mods\ nor a direct subfolder of the
+   Workshop folder the loader of THAT Kenshi searches (a Workshop copy in another Steam library is not seen). */
+inline bool CopyNeeded(const std::string& selfDir, const std::string& kenshi)
+{
+    const std::string k = InstPathKey(kenshi);
+    if (k.empty() || InstPathKey(selfDir).empty()) return true;
+    if (InstDirectChild(selfDir, k + "\\mods")) return false;
+    if (InstDirectChild(selfDir, LoaderWorkshopKey(k))) return false;
+    return true;
+}
+
+/* THE NOTE (owner 1668 "Uninstall moves the copy Setup made"): a one-line file Setup writes into a mods folder copy it
+   makes NEW.  An existing folder Setup only overwrote gets none, so a folder the player placed by hand never carries it. */
+inline const char* SetupNoteName() { return "made-by-setup.txt"; }
+inline const char* SetupNoteText() { return "made by " SW_NAME " Setup\r\n"; }
+
+/* UNINSTALL recycles <Kenshi>\mods\<mod folder> only when it is there, holds the note, and Setup is not running from
+   inside it (it cannot recycle its own folder). */
+inline bool UninstallRecyclesCopy(bool folderExists, bool notePresent, bool setupInside)
+{
+    return folderExists && notePresent && !setupInside;
+}
+
+/* INSTALLED (decision 1668): the game, the loader DLL, our Plugins_x64.cfg line AND a usable marker where the
+   loader looks.  Loader + line with no mod folder found is NOT installed: Setup shows the Install screen. */
+inline bool SetupInstalled(bool hasGame, bool hasLoader, bool hasLine, bool markerFound)
+{
+    return hasGame && hasLoader && hasLine && markerFound;
+}
+
 }   /* namespace coopinst */
 
 #endif

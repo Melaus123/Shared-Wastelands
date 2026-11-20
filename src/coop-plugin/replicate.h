@@ -159,6 +159,15 @@ std::string FloorPlaceLever(unsigned int uid, int floorArg, float dx, float dz);
 // released by combat.cpp), the drive must not push it: two locomotion writers on one body is the
 // T070/T071 drift. The drive keeps MEASURING drift during the window; it stops CORRECTING it.
 bool  SetPuppetNativeWindow(unsigned int uid, bool on);
+// T-1422 fix 2: stop a character's walking (CharMovement::steerDirectly with a zero vector, the drive's own stop), guarded. mv: the
+// CharMovement. ANY THREAD the engine moves characters on (combat.cpp detour_ccUpdate calls it on the AI worker). false = refused.
+bool  StopCopyWalking(void* mv);
+// T-1422 fix 2b: ask the engine's route finder for a route to (x, y, z) (CharMovement::setPathGoal, the path drive's own
+// request), guarded. ANY THREAD the engine moves characters on. PuppetWindowFollowed: the copy records its owner's route (a copy
+// of another game's character) - no window close of it places it (fix 2d).
+bool  RouteCopyTo(void* mv, float x, float y, float z);
+int   CopyPathFailed(void* mv);   // fix 2c: CharMovement::lastPathFailed, guarded: 1 failed, 0 not, -1 unread. ANY THREAD as above
+bool  PuppetWindowFollowed(unsigned int uid);
 // H016 - continuous reconciliation inside a native window: every frame the released copy is moved a
 // small fraction of its error toward the authority's position, through the SAME two position writes
 // the teleport makes (CharMovement's setter, then the animation node) but WITHOUT the halt, so the

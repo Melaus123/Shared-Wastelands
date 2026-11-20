@@ -92,7 +92,9 @@ struct KeptRow
     int birth;
     unsigned long long size, mtime;
     unsigned int crc;
-    KeptRow() : x(0), y(0), z(0), writtenAt(0), posAt(0), owner(0), seq(0), birth(-1), size(0), mtime(0), crc(0) {}
+    unsigned long long mirrorSeq;   /* T-1429 s2 fold 5 (review F1378): the world server's version (seq) of the copy the mirror file holds -
+                                       0 = not known (this game's own copy before its echo, or a row from a table written before fold 5) */
+    KeptRow() : x(0), y(0), z(0), writtenAt(0), posAt(0), owner(0), seq(0), birth(-1), size(0), mtime(0), crc(0), mirrorSeq(0) {}
 };
 
 inline bool FieldOk(const std::string& s) { return s.find_first_of("\t\r\n") == std::string::npos; }
@@ -153,8 +155,11 @@ inline void SplitTabs(const std::string& line, std::vector<std::string>* f)
 }
 
 /* "r <key> <writtenAt> <posAt> <owner> <x> <y> <z> <seq> <birth> <size> <mtime> <crc> <squadSid> <faction> <town> <home>", tabs between.
-   x, y, z are the float's bits in hex (exact). false = not written: an empty key, a tab or line break in a text field, or no file stamp. */
+   x, y, z are the float's bits in hex (exact). false = not written: an empty key, a tab or line break in a text field, or no file stamp.
+   T-1429 s2 fold 5: then "<mirrorSeq>" (kRowFieldsBase), written in the same row as the file's stamp; a row of 17 fields (a table
+   written before fold 5) reads with mirrorSeq 0 - its copy's version is not known, never guessed from a time. */
 const size_t kRowFields = 17;
+const size_t kRowFieldsBase = 18;
 inline bool RowFormat(const KeptRow& r, std::string* line)
 {
     if (r.key.empty() || r.writtenAt <= 0) return false;
@@ -162,14 +167,14 @@ inline bool RowFormat(const KeptRow& r, std::string* line)
     *line = "r\t" + r.key + "\t" + I64Text(r.writtenAt) + "\t" + I64Text(r.posAt) + "\t" + U64Text(r.owner)
           + "\t" + Hex8(FloatBits(r.x)) + "\t" + Hex8(FloatBits(r.y)) + "\t" + Hex8(FloatBits(r.z))
           + "\t" + U64Text(r.seq) + "\t" + I64Text(r.birth) + "\t" + U64Text(r.size) + "\t" + U64Text(r.mtime) + "\t" + Hex8(r.crc)
-          + "\t" + r.squadSid + "\t" + r.factionName + "\t" + r.town + "\t" + r.home + "\n";
+          + "\t" + r.squadSid + "\t" + r.factionName + "\t" + r.town + "\t" + r.home + "\t" + U64Text(r.mirrorSeq) + "\n";
     return true;
 }
 inline bool RowParse(const std::string& line, KeptRow* out)
 {
     std::vector<std::string> f;
     SplitTabs(line, &f);
-    if (f.size() != kRowFields || f[0] != "r" || f[1].empty()) return false;
+    if ((f.size() != kRowFields && f.size() != kRowFieldsBase) || f[0] != "r" || f[1].empty()) return false;
     KeptRow r;
     unsigned long long owner = 0; unsigned int xb = 0, yb = 0, zb = 0; long long birth = 0;
     r.key = f[1];
@@ -181,8 +186,22 @@ inline bool RowParse(const std::string& line, KeptRow* out)
     r.owner = (unsigned int)owner; r.birth = (int)birth;
     r.x = BitsFloat(xb); r.y = BitsFloat(yb); r.z = BitsFloat(zb);
     r.squadSid = f[13]; r.factionName = f[14]; r.town = f[15]; r.home = f[16];
+    if (f.size() == kRowFieldsBase && !ParseU64(f[17], &r.mirrorSeq)) return false;   /* fold 5: absent = 0 (KeptRow()) */
     *out = r;
     return true;
+}
+
+/* T-1429 s2 fold 6 (review F1380 BLOCKER a): AN AREA ROW WITH NO VERSION IS REJECTED AT LOAD, as a changed row is - its copy's version is not
+   known (a table from before fold 5, or this game's own save written before its echo), so the launch fetches the world's copy instead of
+   loading one whose first save would be refused. A deleted row and an area row while area records are off are left to RowLoad. 1 = reject. */
+inline int RowNoBaseRejects(int isZone, unsigned long long mirrorSeq, int deleted, int zoneOff)
+{
+    return (isZone != 0 && deleted == 0 && zoneOff == 0 && mirrorSeq == 0ULL) ? 1 : 0;
+}
+/* fold 5 / 6: the version MirrorKeepWrite puts in an area row - the mirror's version only for the stamp it was taken for, else 0 */
+inline unsigned long long RowMirrorSeq(int known, long long baseStamp, unsigned long long baseSeq, long long rowStamp)
+{
+    return (known != 0 && baseStamp == rowStamp) ? baseSeq : 0ULL;
 }
 
 /* THE TABLE: "swkept 1 <worldId> <idHash>", the rows, then "end <rows> <FNV-64 hex of every byte above this line>". false = no table
@@ -203,6 +222,15 @@ inline bool TableFormatSeq(const std::string& worldId, const std::string& idHash
     t += "end\t" + U64Text(n) + "\t" + Hex16(Fnv64(t)) + "\n";
     *out = t;
     return true;
+}
+/* T-1390: THE WORLD ID A TABLE'S HEADER NAMES ("" = no table header). The header line alone, no checksum: a joining game's folder search
+   (store.cpp JoinedDirChosen, coopworld::JoinedFolderPick) asks only whose table it is; the table itself is checked whole when it is read. */
+inline std::string TableHeaderWorldId(const std::string& text)
+{
+    std::vector<std::string> f;
+    SplitTabs(text.substr(0, text.find_first_of("\r\n")), &f);
+    if (f.size() < 4 || f[0] != kTableMagic) return std::string();
+    return f[2];
 }
 inline bool TableFormat(const std::string& worldId, const std::string& idHash, const std::vector<KeptRow>& rows, std::string* out, long long* refused)
 {

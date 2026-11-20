@@ -31,6 +31,7 @@
 #include "playerstab.h"   /* T-545: the TEST-ONLY playerstab lever, [PLAYERS] REPORT */
 #include "chat.h"   /* the TEST-ONLY chat lever */
 #include "bugreport.h"   /* the TEST-ONLY bugpack lever */
+#include "crashwatch.h"   /* T-1374: the TEST-ONLY crashtest lever */
 #include "admin.h"   /* the TEST-ONLY admintest lever */
 #include "peace.h"
 #include "towngen.h"
@@ -66,9 +67,11 @@ namespace coop { int FocusCameraPod(float x, float y, float z); int GroundTerrai
 #include "ui.h"   /* uishot: the TEST-ONLY uipreview verb */
 #include "net/steam_friends.h"   /* the TEST-ONLY steamfriends and steamjoin levers */
 #include "../common/uidrive.h"   /* pp1: the TEST-ONLY UI driver verbs (uiclick / uipick / uitype / uistate) */
+#include "../common/cmdforlog.h"   /* T-247: a command line as the log shows it (CmdForLog) */
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include "ping.h"     /* T-1393: PingTestCommand - the TEST-ONLY pingtest lever */
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls - PathNextToDll's answer is UTF-8 */
 
 #include <fstream>
@@ -98,12 +101,29 @@ std::string Trim(const std::string& s)
     return s.substr(b, e - b + 1);
 }
 
-/* TEST-ONLY `boxburst <box key or part> <seconds 5-600> <step> [<step> ...]` (1 to 6 steps), MAIN THREAD: in this one call - one frame,
-   so no box write cycle runs between them - each step on that one loaded box in order, then this game's world-server link cut exactly as
-   `worldaway <seconds>` cuts it. A step: `take:<section>:<x>:<y>[:<qty>]` - the item at that cell of the box into this game's own
+/* TEST-ONLY `boxburst <box key or part> <seconds 5-600> <step> [<step> ...]` (1 to 6 steps), MAIN THREAD: in this one call each step on
+   that one loaded box in order; then this game's world-server link is cut exactly as `worldaway <seconds>` cuts it, at the END OF THE
+   NEXT DRAIN (T-1346, read-T2396): this call runs after this frame's drain, so the steps' moves are drained in the next frame, and the
+   cut is armed here (BoxBurstCutArm) and fired by ItemsTick right after that drain (BoxBurstCutAfterDrain) - the drain reads the moves
+   while this game still writes the box, and no record write of the box comes between the steps and the cut (it waits while a move is
+   not yet drained, and runs at a drain's start). A step: `take:<section>:<x>:<y>[:<qty>]` - the item at that cell of the box into this game's own
    character, as `itemtake box:<key> <section> <x> <y> [qty]` (no qty: the whole stack); `add:<base sid>[:<count>]` - that item made and
-   put into the box, as `boxtest <key> <sid> [count]`. Every step is read and the cut checked before anything runs (a bad step or a cut
-   that would be refused runs nothing). One [BOXBURST] line per step and one for the cut. */
+   put into the box, as `boxtest <key> <sid> [count]`; (T-1346, owner 1669) `put:<sid>:<n>[:q=<v>]` - n units of a stack this game's
+   own character carries (the one nearest the box; with q=, the stack of that quality, the number `itemtest set q=` writes) put into the
+   box through the engine's take-out and add, as `itemtest stackgive` puts them (BoxBurstPutStep), so the next drain - before the cut -
+   ties the box's change to the character as a hand put. Every step is read and the cut checked before anything runs (a bad step, a cut
+   that would be refused or a cut still armed runs nothing). One [BOXBURST] line per step and one for the cut when it fires. */
+/* T-1346: a put: step's `q=<v>` (0-100, as `itemtest set q=` reads it) */
+int BurstQual(const std::string& t, float* v)
+{
+    if (t.size() < 3 || t.size() > 12 || t.compare(0, 2, "q=") != 0) return 0;
+    const std::string r = t.substr(2);
+    char* e = 0;
+    const double d = std::strtod(r.c_str(), &e);
+    if (e == 0 || *e != 0 || !(d == d) || d < 0.0 || d > 100.0) return 0;
+    *v = (float)d;
+    return 1;
+}
 int BurstNum(const std::string& t, int* v)
 {
     if (t.empty() || t.size() > 6) return 0;
@@ -114,7 +134,7 @@ int BurstNum(const std::string& t, int* v)
 }
 std::string BoxBurstLever(const std::string& args)
 {
-    const char* const usage = "error boxburst usage: boxburst <box key or part> <seconds 5-600> <take:<section>:<x>:<y>[:<qty>] | add:<sid>[:<count>]> (1 to 6 steps)";
+    const char* const usage = "error boxburst usage: boxburst <box key or part> <seconds 5-600> <take:<section>:<x>:<y>[:<qty>] | add:<sid>[:<count>] | put:<sid>:<n>[:q=<v>]> (1 to 6 steps)";
     std::istringstream is(args);
     std::string key, secText, t;
     std::vector<std::string> steps;
@@ -124,6 +144,8 @@ std::string BoxBurstLever(const std::string& args)
     if (steps.empty() || steps.size() > 6) return usage;
     std::vector<int> take(steps.size(), 0), n1(steps.size(), 0), n2(steps.size(), 0), n3(steps.size(), 0);
     std::vector<std::string> what(steps.size());
+    std::vector<int> hq(steps.size(), 0);      /* T-1346: a put: step's quality pick given */
+    std::vector<float> qv(steps.size(), 0.0f);
     for (size_t i = 0; i < steps.size(); ++i)
     {
         std::vector<std::string> f;
@@ -139,67 +161,43 @@ std::string BoxBurstLever(const std::string& args)
         { take[i] = 1; what[i] = f[1]; ok = 1; }
         else if (f[0] == "add" && (f.size() == 2 || f.size() == 3) && !f[1].empty() && (f.size() == 2 || BurstNum(f[2], &n1[i]) != 0))
         { what[i] = f[1]; if (f.size() == 2) n1[i] = 1; ok = (n1[i] >= 1) ? 1 : 0; }
+        else if (f[0] == "put" && (f.size() == 3 || f.size() == 4) && !f[1].empty() && BurstNum(f[2], &n1[i]) != 0 && n1[i] >= 1
+                 && (f.size() == 3 || BurstQual(f[3], &qv[i]) != 0))
+        { take[i] = 2; what[i] = f[1]; hq[i] = (f.size() == 4) ? 1 : 0; ok = 1; }
         if (ok == 0) return std::string(usage) + " - step " + steps[i] + " does not read";
     }
     const std::string refused = coop::StoreWorldAwayRefusal((long long)sec);
     if (!refused.empty()) return "error boxburst: nothing done - the cut would be refused (" + refused + ")";
+    if (BoxBurstCutArmed() != 0) return "error boxburst: nothing done - an earlier boxburst's cut is still armed";
     int done = 0;
     for (size_t i = 0; i < steps.size(); ++i)
     {
-        const bool ok = (take[i] != 0) ? coop::ItemTake("box:" + key, what[i], n1[i], n2[i], n3[i]) : coop::BoxTest(key, what[i], n1[i]);
+        bool ok = false;
+        if (take[i] == 1) ok = coop::ItemTake("box:" + key, what[i], n1[i], n2[i], n3[i]);
+        else if (take[i] == 2) ok = BoxBurstPutStep(key, what[i], n1[i], hq[i], qv[i]).compare(0, 3, "ok ") == 0;   /* T-1346 */
+        else ok = coop::BoxTest(key, what[i], n1[i]);
         if (ok) ++done;
         std::ostringstream ln;
         ln << "[BOXBURST] step " << (i + 1) << "/" << steps.size() << " " << steps[i] << " on box '" << key << "': " << (ok ? "ok" : "error")
-           << " (TEST-ONLY; the same frame as the cut)";
+           << " (TEST-ONLY; the cut fires at the end of the next drain)";
         DebugLog(ln.str());
     }
     std::ostringstream secArg;
     secArg << sec;
-    const std::string cut = coop::StoreWorldAwayLever(secArg.str());
+    BoxBurstCutArm(secArg.str(), key, (int)steps.size(), done);   /* T-1346: fired by ItemsTick at the end of the next drain */
     std::ostringstream ln;
-    ln << "[BOXBURST] cut: " << cut << " - in the same frame as the " << steps.size() << " steps (" << done << " ok; TEST-ONLY)";
+    ln << "[BOXBURST] cut: armed worldaway " << sec << " - it fires at the end of the next drain, the one that carries the " << steps.size()
+       << " steps (" << done << " ok; TEST-ONLY)";
     DebugLog(ln.str());
     std::ostringstream st;
-    st << ((done == (int)steps.size() && cut.compare(0, 3, "ok ") == 0) ? "ok" : "error") << " boxburst steps=" << done << "/" << steps.size() << " cut=" << cut;
+    st << ((done == (int)steps.size()) ? "ok" : "error") << " boxburst steps=" << done << "/" << steps.size() << " cut=armed worldaway " << sec
+       << " (fires at the end of the next drain)";
     return st.str();
 }
 
-/* A command line as the log shows it. hostpw and joinpw carry a password, so for them the verb alone is shown, then <hidden>; so does
-   `uitype <field> <text>` into a password box (coopui::UiDriveTypedHidden), shown as `uitype <field> <hidden>` (a nonce before the bar
-   stays: it names the write, not the password). Every other line is shown whole. */
-static bool CmdIsPasswordVerb(const std::string& body)
-{
-    const std::string t = Trim(body);
-    const std::string::size_type sp = t.find_first_of(" \t");
-    const std::string verb = sp == std::string::npos ? t : t.substr(0, sp);
-    return verb == "hostpw" || verb == "joinpw" || verb == "steamjoin";   /* steamjoin: its connect string carries a Steam id */
-}
-static std::string CmdVerbOnly(const std::string& body)
-{
-    const std::string t = Trim(body);
-    const std::string::size_type sp = t.find_first_of(" \t");
-    return (sp == std::string::npos ? t : t.substr(0, sp)) + " <hidden>";
-}
-static bool CmdIsHiddenType(const std::string& body, std::string* shown)
-{
-    std::string verb, args, field, text;
-    coopui::UiDriveSplit(body, &verb, &args);
-    if (verb != "uitype") return false;
-    coopui::UiDriveSplit(args, &field, &text);
-    if (coopui::UiDriveTypedHidden(field) == 0) return false;
-    if (shown != 0) *shown = "uitype " + field + " <hidden>";
-    return true;
-}
-std::string CmdForLog(const std::string& line)
-{
-    std::string typed;
-    if (CmdIsPasswordVerb(line)) return CmdVerbOnly(line);   /* the verb first: a password may itself hold a bar */
-    if (CmdIsHiddenType(line, &typed)) return typed;
-    const std::string::size_type bar = line.find('|');   /* a nonce before the first bar, then the verb */
-    if (bar != std::string::npos && CmdIsPasswordVerb(line.substr(bar + 1))) return line.substr(0, bar + 1) + CmdVerbOnly(line.substr(bar + 1));
-    if (bar != std::string::npos && CmdIsHiddenType(line.substr(bar + 1), &typed)) return line.substr(0, bar + 1) + typed;
-    return line;
-}
+/* A command line as the log shows it: common/cmdforlog.h (hostpw / joinpw / steamjoin, uitype into a password box, and T-247 a
+   chat /login line typed by a lever such as admintest typeline - each shown with <hidden> in place of the secret). */
+std::string CmdForLog(const std::string& line) { return cmdforlog::CmdForLog(line); }
 
 void WriteStatus(const std::string& text)
 {
@@ -394,6 +392,11 @@ void ReportEverything()
 
 } // namespace
 
+/* T-1401 (F1156 COUNTERS): a bug report writes EVERY report counter set into the log before it packs it - the same set `report`
+   writes. MAIN THREAD (bugreport.cpp StartJob, the REPORT A BUG window's SEND - the thread and pumps `report` runs in). */
+void ReportEverythingForReport() { ReportEverything(); coop::OwnSaveReport(); }   /* T-1401 fold (F1161 LEG P): the [OWNSAVE] line
+                                                                                 too - `report` wrote it after ReportEverything, so a pack lacked it */
+
 std::string PathNextToDll(const char* filename)
 {
     /* The DLL's own file name through the wide call, handed back as UTF-8: an install folder holding letters outside the ANSI
@@ -455,6 +458,42 @@ static void PeerTpWaitStep()
         CommandStatusLate("error playerteleport peer: no copy of the other player's characters loaded after " + wo.str() + " s (peerCopies=0)");
     }
     else CommandStatusLate("error playerteleport peer: " + why);
+}
+
+/* T-1385 TEST-ONLY `lentcopytp <units> [waitS]`: while this game (the borrower) has no lent copy that woke here and now sleeps
+   KEPT, the command waits up to waitS seconds and retries every 500 ms here - the same thread and place the commands run - then moves the
+   player to the point (store.cpp LentCopyKeptAsleepPoint) on the terrain and writes the late result to the status file. */
+static bool g_lentTpArmed = false;
+static DWORD g_lentTpUntil = 0, g_lentTpNext = 0;
+static int g_lentTpWaitS = 0;
+static float g_lentTpUnits = 0.0f;
+static int LentTpTry(std::string* line)
+{
+    float x = 0, z = 0; std::string what;
+    if (coop::LentCopyKeptAsleepPoint(g_lentTpUnits, &x, &z, &what) != 1) return 0;
+    const bool ok = coop::PlayerTeleportAbsY(x, z, true, 0.0f);
+    *line = what + (ok ? "" : " - the teleport FAILED");
+    DebugLog("[RAIDLEND] T-1385 TEST-ONLY lentcopytp: " + *line);
+    return ok ? 1 : -1;
+}
+static void LentTpWaitStep()
+{
+    if (!g_lentTpArmed) return;
+    const DWORD now = ::GetTickCount();
+    if ((long)(now - g_lentTpNext) < 0) return;
+    g_lentTpNext = now + 500;
+    std::string line;
+    const int rc = LentTpTry(&line);
+    if (rc == 0 && (long)(now - g_lentTpUntil) < 0) return;
+    g_lentTpArmed = false;
+    std::ostringstream wo; wo << g_lentTpWaitS;
+    if (rc == 1) CommandStatusLate("ok lentcopytp (after waiting up to " + wo.str() + " s) " + line);
+    else if (rc == -1) CommandStatusLate("error lentcopytp: " + line);
+    else
+    {
+        DebugLog("[RAIDLEND] T-1385 TEST-ONLY lentcopytp MISSED: no lent copy that woke here sleeps kept here after " + wo.str() + " s");
+        CommandStatusLate("error lentcopytp: no lent copy that woke here sleeps kept here after " + wo.str() + " s");
+    }
 }
 
 /* P26 T718 (TEST-ONLY): a pending `playerteleport near` / `talksight` wait re-checks every 500 ms (speech.cpp TalkWaitTick) - here,
@@ -590,6 +629,7 @@ void CommandChannelTick()
     coop::SnapshotTick();    /* snap1 (user decision 2026-09-26): an armed snapshot is taken at its world minute; its block is written 64 lines a tick */
     TalkWaitStep();          /* P26 T718 (TEST): a pending playerteleport near / talksight wait for a character to load, every 500 ms */
     PeerTpWaitStep();        /* TEST: a pending playerteleport peer wait for a copy of the other player's character, every 500 ms */
+    LentTpWaitStep();        /* T-1385 TEST-ONLY: a pending lentcopytp wait for a kept sleeping lent copy, every 500 ms */
 #ifdef SW_DEV_BUILD
     CamFollowStep();         /* TEST-ONLY camfollow: the camera re-aimed at the followed character, every frame */
     FileHoldStep();          /* T-1280 TEST-ONLY filehold: a held file let go once its time is up */
@@ -623,6 +663,8 @@ void CommandChannelTick()
     // Throttled here rather than inside StateTick so the cadence is visible at the call
     // site. Rides the same main-thread pump as everything else that touches the transport.
     static long long s_stateTicks = 0;
+    coop::LimbEventDrainTick();   /* T-1442 step 2: an owned character's amputation (noted by the hook) -> STATE the next frame, every frame */
+    coop::CrimeEventDrainTick();  /* T-1442 step 5: an owned character's crime (noted by the setCrime hook) -> MSG_CRIME the next frame; CrimeTick below the backstop */
     if (++s_stateTicks % 120 == 0)
     {
         coop::RestWatchTick();   // R3 (read-ragdoll): an owned body whose ragdoll settled (or moved > 20) -> STATE at once
@@ -748,6 +790,14 @@ void CommandChannelTick()
             while (is >> more) arg += " " + more;
         }
         coop::OwnSaveCommand(arg, &st);
+        WriteStatus(st);
+        finished = true;
+    }
+    else if (verb == "ownrec")   /* T-885 piece 1 TEST-ONLY: ownrec compare (each key: local W, the W / R the world server confirmed) | ownrec hold on|off (nothing sent while on; local writes go on) */
+    {
+        std::string arg, more, st;
+        while (is >> more) arg += (arg.empty() ? "" : " ") + more;
+        coop::OwnUpCommand(arg, &st);
         WriteStatus(st);
         finished = true;
     }
@@ -971,8 +1021,7 @@ void CommandChannelTick()
     }
     else if (verb == "report")
     {
-        ReportEverything();
-        coop::OwnSaveReport();   /* mmo1 */
+        ReportEverythingForReport();   /* the set a bug report writes, [OWNSAVE] (mmo1) among them - one list for both (T-1401 fold, F1161) */
         WriteStatus("ok report");
         finished = true;
     }
@@ -1377,6 +1426,12 @@ void CommandChannelTick()
         WriteStatus(coop::StoreAccessTest(Trim(rest)));
         finished = true;
     }
+    else if (verb == "walkslow")   /* T-1403 TEST-ONLY: walkslow <seconds 1-600> | hold <entry> | off - the next world server this game starts has its start-up record walk slowed / held (ui.cpp UiWalkSlowLever; [UI] T-1403 lines) */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(UiWalkSlowLever(rest));
+        finished = true;
+    }
     else if (verb == "netthrottle")   /* T-1168 (owner 1425 a) TEST-ONLY: netthrottle off|on - off = every live ENet link of this game keeps ENet's packet throttle at its full value (acceleration 32, deceleration 0, the throttle set to its limit), on = ENet's default terms back (src/common/netthrottle.h); the hosting game also writes netthrottle.request for its world server (store.cpp StoreNetThrottle) */
     {
         std::string w; is >> w;
@@ -1391,7 +1446,7 @@ void CommandChannelTick()
         finished = true;
     }
     else if (verb == "boxburst")   /* TEST-ONLY: boxburst <box key or part> <seconds 5-600> <step> [<step> ...] - box steps on one box, then the
-                                      worldaway cut, all in one frame ([BOXBURST] lines; BoxBurstLever) */
+                                      worldaway cut at the end of the next drain ([BOXBURST] lines; BoxBurstLever) */
     {
         std::string rest; std::getline(is, rest);
         WriteStatus(BoxBurstLever(Trim(rest)));
@@ -1777,7 +1832,10 @@ void CommandChannelTick()
         // crash file, the world server's log, the launches kept in the crashes folder), but asking no nearby game and sent to
         // nobody; the worker thread writes one [BUGREPORT] TEST PACK line naming every file in the zip with its sizes. Nothing on
         // screen. (The UI driver's bugreport / bugsend really post a report.)
-        WriteStatus(coop::BugReportTestPack() ? "ok bugpack" : "error bugpack (a test pack is still being made, or no worker thread - see the log)");
+        // bugpack <sid>   - T-1402: the same, and for each map-square file it carries (the reporter's stored square) the line counts
+        // the records whose string id holds <sid> (an item put in a box there, read by the area records' own reader).
+        std::string sidArg; std::getline(is, sidArg); sidArg = Trim(sidArg);
+        WriteStatus(coop::BugReportTestPack(sidArg) ? "ok bugpack" : "error bugpack (a test pack is still being made, or no worker thread - see the log)");
         finished = true;
     }
     else if (verb == "uipreview")
@@ -1898,6 +1956,8 @@ void CommandChannelTick()
         const bool refuseHere = (rest.compare(0, 10, "refusehere") == 0 && (rest.size() == 10 || rest[10] == ' '));
         /* T-1266: `itemtest undofail [off]` - TEST-ONLY: the next plain take from another game's character finds its source square taken at the put-back. */
         const bool undoFail = (rest.compare(0, 8, "undofail") == 0 && (rest.size() == 8 || rest[8] == ' '));
+        /* T-1346: `itemtest bjrefuse <0..100>` - TEST-ONLY: as a box's HOLDER, refuse the next n journal asks it receives. */
+        const bool bjRefuse = (rest.compare(0, 8, "bjrefuse") == 0 && (rest.size() == 8 || rest[8] == ' '));
         /* T-164 211: `itemtest boxmove <fromBoxKey|peer> <toBoxKey> <sid|any>` - TEST-ONLY: one whole stack across the authority line
            (a box the other game holds / its character -> a box this game holds, or the reverse) through the engine's own calls. */
         const bool boxMove = (rest.compare(0, 7, "boxmove") == 0 && (rest.size() == 7 || rest[7] == ' '));
@@ -1951,6 +2011,7 @@ void CommandChannelTick()
         else if (refuseNext) WriteStatus(coop::ItemTestRefuseNextCommand(Trim(rest.substr(10))));
         else if (refuseHere) WriteStatus(coop::ItemTestRefuseHereCommand(Trim(rest.substr(10))));
         else if (undoFail) WriteStatus(coop::ItemTestUndoFailCommand(Trim(rest.substr(8))));   /* T-1266 */
+        else if (bjRefuse) WriteStatus(coop::ItemTestBjRefuseCommand(Trim(rest.substr(8))));   /* T-1346 */
         else if (packItem) WriteStatus(coop::ItemTestPackItemCommand(Trim(rest.substr(8))));
         else if (cfDelay) WriteStatus(coop::ItemTestConfirmDelayCommand(Trim(rest.substr(12))));
         else if (shopLapse) WriteStatus(coop::ItemTestShopLapseCommand(Trim(rest.substr(9))));
@@ -2281,9 +2342,18 @@ void CommandChannelTick()
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::ZoneDamageLever(Trim(rest))); finished = true;
     }
+    else if (verb == "announce")
+    {
+        // announce name <Name> [peer] | announce <uid> [peer]   - T-1379 TEST-ONLY: this game's own NPC starts an announcement through
+        // the arrival task's own entry (event 2) at the next safe point; [TALK] announce lines (speech.cpp AnnounceArm / AnnounceDrain)
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::AnnounceArm(arg)); finished = true;
+    }
     else if (verb == "platoonnudge")
     {
         // platoonnudge <worldId words...> <dx> <dz>   - move a named awake platoon (the id may contain spaces: the last two tokens are dx dz)
+        // platoonnudge raid <dx> <dz>                 - T-1379: the newest own raid squad noted on this game ([STORE] own raid squad noted .. id=)
+        // platoonnudge raidat <x> <z>                 - T-1381: the newest raid squad run here (own noted or a lent copy built here) moved so its first member stands at x, z ([STORE] platoonnudge raidat line)
         std::vector<std::string> toks; std::string tk; while (is >> tk) toks.push_back(tk);
         if (toks.size() < 3) { WriteStatus("error platoonnudge usage"); }
         else
@@ -2333,8 +2403,14 @@ void CommandChannelTick()
         bool ok = false;
         if (sub == "new") ok = coop::StoreProfileRequest(1, 0, rest);
         else if (sub == "import") ok = coop::StoreSpImportRequest(rest, rest);   /* T-1096 TEST-ONLY: NEW PROFILE's IMPORT road - a new profile named after the single-player save folder <rest> */
+        else if (sub == "importwith")   /* T-1383 TEST-ONLY: `profile importwith <ask 0-3> <folder>` - the same road with the creator's tick boxes (1 dead, 2 relations, 3 both); the world decides whether this profile is its creator */
+        {
+            const size_t sp = rest.find(' ');
+            const std::string a = sp == std::string::npos ? std::string() : rest.substr(0, sp), f = sp == std::string::npos ? std::string() : rest.substr(sp + 1);
+            if (a.size() == 1 && a[0] >= '0' && a[0] <= '3' && !f.empty()) ok = coop::StoreSpImportRequest(f, f, (unsigned)(a[0] - '0'));
+        }
         else if (sub == "delete") ok = coop::StoreProfileRequest(2, (unsigned)std::atoi(rest.c_str()), std::string());
-        WriteStatus(ok ? "ok profile " + sub : std::string("error profile (use: profile new <name> | profile import <folder> | profile delete <n>; the notebook link must be up)"));
+        WriteStatus(ok ? "ok profile " + sub : std::string("error profile (use: profile new <name> | profile import <folder> | profile importwith <0-3> <folder> | profile delete <n>; the notebook link must be up)"));
         finished = true;
     }
     else if (verb == "renamemyfaction")
@@ -2390,6 +2466,35 @@ void CommandChannelTick()
         // offer still goes up so the notebook logs its own refusal.
         std::string k, v; is >> k >> v;
         WriteStatus(coop::SettingsGtSetCommand(k, v)); finished = true;
+    }
+    else if (verb == "lentcopytp")   /* T-1385 TEST-ONLY */
+    {
+        // lentcopytp <units 0..3000> [waitS 0..600, default 300] - T-1385 (TEST-ONLY): this game's player to <units> from its newest
+        // lent copy that woke here and now sleeps KEPT, toward its area's centre (store.cpp LentCopyKeptAsleepPoint), on the terrain;
+        // WAITS up to waitS s for one (LentTpWaitStep); [RAIDLEND] T-1385 lines
+        std::string us, ws, extra; int waitS = 300; long units = -1;
+        if (is >> us) { char* e = 0; const long v = std::strtol(us.c_str(), &e, 10); units = (e != us.c_str() && *e == 0 && v >= 0 && v <= 3000) ? v : -1; }
+        if (is >> ws) { char* e = 0; const long v = std::strtol(ws.c_str(), &e, 10); waitS = (e != ws.c_str() && *e == 0 && v >= 0 && v <= 600) ? (int)v : -1; }
+        if (units < 0 || waitS < 0 || (is >> extra)) WriteStatus("error lentcopytp usage: lentcopytp <units 0..3000> [waitS 0..600, default 300]");
+        else
+        {
+            g_lentTpArmed = false;   /* a new command replaces a wait still pending */
+            g_lentTpUnits = (float)units; g_lentTpWaitS = waitS;
+            std::string line;
+            const int rc = LentTpTry(&line);
+            std::ostringstream wo; wo << waitS;
+            if (rc == 1) WriteStatus("ok lentcopytp " + line);
+            else if (rc == -1) WriteStatus("error lentcopytp: " + line);
+            else if (waitS > 0)
+            {
+                const DWORD now = ::GetTickCount();
+                g_lentTpUntil = now + (DWORD)waitS * 1000; g_lentTpNext = now + 500; g_lentTpArmed = true;
+                DebugLog("[RAIDLEND] T-1385 TEST-ONLY lentcopytp: waiting up to " + wo.str() + " s for a lent copy that woke here to sleep kept here");
+                WriteStatus("ok lentcopytp: waiting up to " + wo.str() + " s for a lent copy that woke here to sleep kept here");
+            }
+            else WriteStatus("error lentcopytp: no lent copy that woke here sleeps kept here");
+        }
+        finished = true;
     }
     else if (verb == "raidnow")
     {
@@ -2793,6 +2898,8 @@ void CommandChannelTick()
         //  holder; the lever writes no record - T-1333)
         // (canbuild <sid> [dx dz | abs <x> <z>]: the engine's "Can't build too close to another town." decision re-asked at my first character
         //  + (dx, 0, dz), nothing placed; one [BUILD] canbuild line - T-923)
+        // (keptruin <key part> | off: T-36 - armed only, also at the title; the owner's kept step after a keep-buildings reset ruins this
+        //  player's piece whose key holds the part right before it lays the row's state, once - build.cpp BdKeptRuinLever)
         // (build1-a, docs/design-build1.md s3): armed here, run at the K2 safe point (build.cpp BuildTestDrain).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuildTestArm(Trim(arg))); finished = true;
@@ -2828,6 +2935,22 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuildStateCommand(Trim(arg))); finished = true;
     }
+#ifdef SW_DEV_BUILD
+    else if (verb == "bldparts")
+    {
+        // bldparts <key-substring|key> - TEST-ONLY (DEV build), read-only, T-1372 decision 1690: is the building intact - scene node, shown,
+        // model parts and their Ogre entities (made / visible) against its record's parts, doors, interior and mask, material, and its
+        // height against its input. One [BUILD] bldparts line ending INTACT or MISSING <what>.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::BuildPartsCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "editorkey")
+    {
+        // editorkey - TEST-ONLY (DEV build), T-1414: on the next game frame, what the Level Editor key (Shift+F12) does after the key
+        // read - key command 9's two guards, then the editor toggle on the object the key step passes (build.cpp BdEditorKeyTick).
+        WriteStatus(coop::BdEditorKeyArm()); finished = true;
+    }
+#endif
     else if (verb == "bldset")
     {
         // bldset <key-substring|key> pause|power 0|1 | battery|progress|stock <value> | locklvl|doorlvl <0-100> - TEST-ONLY lever: one
@@ -3040,10 +3163,28 @@ void CommandChannelTick()
         WriteStatus(coop::ChatCommand("test " + rest));
         finished = true;
     }
+    else if (verb == "tradetest")
+    {
+        // tradetest order <targetUid> [actorUid] | status | press accept|cancel   - TEST-ONLY (T-1167 piece 1, policy.cpp PolicyTradeTest):
+        // order gives the actor (actorUid, else the first selected character, else this game's first player character) order 26
+        // on the target through the engine's own giveOrder, so the trade pre-check hook decides as for a click ([TRADE] precheck
+        // line; the TRADE window or "Out of trading range"); status reads the TRADE window back; press fires ACCEPT / CANCEL's own
+        // handler as a click. One `ok tradetest ...` line. Main thread.
+        // T-1167 piece 2: | offer <itemKey|name> <n> | cats <n> - this side's offer of one item of this character's set to n (0 takes it
+        // out; never past what the character holds), as the window's clicks would; the money box set to the text as if typed (checked
+        // against the purse: "You don't have that much." / "Type an amount."). An NPC target of `order` is refused (no real loot order).
+        // T-1167 piece 3 build 4: | drop [x y] - the engine's mouse set to (x, y) (default: the middle of this player's offer pane) around
+        // the HOOKED release-over-no-window 0x712AD0 on the cursor (an item put there first: cursortest pick me <section> <x> <y> [all]),
+        // so the mod's drop decision, the offer-add and the put-back run as for a person's let-go; road=offered|back|engine on the line.
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::PolicyTradeTest(Trim(rest)));
+        finished = true;
+    }
     else if (verb == "renametest")
     {
         // renametest <name> [uid]   - TEST-ONLY (T-1153, spawn.cpp RenameTestCommand): this game's own character <uid> (none given:
         // T-1228: `renametest <name> bought` = the newest character a T478 animal / slave buy put in this game's player faction;
+        // T-1398: `renametest <name> hired` = the person the newest own hire took on (its `joined=1` line's uid; never a dead one);
         // the first selected one) renamed
         // through Character::setName's hooked entry (NameSetOwn), the setter the name sync hooks; the other games apply it
         // (NameApplyToCopy). One `[NAME] ok renametest uid=.. name=.. was=..` line.
@@ -3692,6 +3833,17 @@ void CommandChannelTick()
         else WriteStatus(coop::MirrorTestCapLever(cap));
         finished = true;
     }
+    else if (verb == "squadset")
+    {
+        // squadset [<radius>]   - T-1429 s10 TEST lever, READ-ONLY (store.cpp StoreSquadSetLever): every squad bound to a world id within
+        // radius (default 3000) of this game's player character, awake or asleep, and its six settings read off it now (type, base town,
+        // resident, imprisoned, squad number, restock time) - one [SQSET] line each. Writes, sends and changes nothing.
+        std::string rest; std::getline(is, rest);
+        const std::string sum = coop::StoreSquadSetLever(Trim(rest));
+        DebugLog("[SQSET] " + sum);   /* T-1429 copy settings (F1457): the summary in the game log too, so a plan can match it */
+        WriteStatus(sum);
+        finished = true;
+    }
     else if (verb == "p113squad")
     {
         // p113squad <cycles 1..50> [awake|sleep|alt] [sourceWorldId] | report | stop  - T-341 TEST-ONLY lever (store.cpp, PROBE P113):
@@ -3772,7 +3924,8 @@ void CommandChannelTick()
     {
         // koself <uid> [seconds]  - P11 fold 1 TEST-ONLY lever (appearance.cpp KoSelfLever): on the game that DRIVES <uid>,
         // knock it out with the engine's own knockout (medical.cpp KnockOutOwned) and push its STATE; seconds (0..600, default
-        // 0 = the engine's own clock) holds the wake-up clock at least that long. [P11] koself lines: the call, then a check
+        // 0 = the engine's own clock) holds the wake-up clock at least that long (T-1411: kept through the engine's own resets of
+        // the clock, e.g. a put-down - appearance.cpp KoSelfHoldTick). [P11] koself lines: the call, then a check
         // one tick and 2 s later (prone / unconcious / took). T652: `wound` did not knock the character out.
         // koself name <name> [seconds]  - TEST-ONLY (the carried hand-in fixture): the uid is the nearest own, living, non-player
         // character with that name ('_' = a space) within 300 units of this game's first player character (speech.cpp
@@ -3782,8 +3935,42 @@ void CommandChannelTick()
         // (a spawned pet) has a uid that differs run to run, and `koself name` / `bodydown` skip player-faction characters.
         // Then the same KoSelfLever; [P11] koself spawned:<Template> -> uid=.. names the pick.
         std::string rest; std::getline(is, rest);
-        std::string nameKey; int nameSeconds = 0;
-        if (coopsay::KoSelfNameParse(rest, &nameKey, &nameSeconds))
+        std::string nameKey; int nameSeconds = 0; unsigned int nearUid = 0;
+        if (coopsay::KoSelfNameNearParse(rest, &nameKey, &nearUid, &nameSeconds))
+        {
+            // koself name <name> near <anchorUid> [seconds]  - T-1422 TEST-ONLY (DEV build; a release build refuses it): as `koself
+            // name`, but the uid is the nearest own, living, non-player character with that name that is NOT already down
+            // (speech.cpp LeverNearestNamed, kLeverPickOwnStanding; `#<k>` = the k-th nearest) within 300 units of the anchor
+            // character AS THIS GAME SEES IT - e.g. the copy of another player's character - so the game that runs a guard (the
+            // far host) can knock out one fighting next to the other player. [P11] koself name .. near lines; then KoSelfLever.
+#ifdef SW_DEV_BUILD
+            ::Character* anchor = coop::FindSpawned(nearUid);
+            unsigned int nu = 0; float nd = -1.0f; std::string nn, why;
+            std::ostringstream an; an << nearUid;
+            if (anchor == 0)
+            {
+                DebugLog("[P11] koself name '" + nameKey + "' near " + an.str() + " refused: no character with that uid on this game");
+                WriteStatus("error koself name near: no anchor character " + an.str() + " on this game");
+            }
+            else if (coop::LeverNearestNamed(nameKey, coop::kLeverPickOwnStanding, anchor, 300.0f, &nu, &nd, &nn, &why) == 0)
+            {
+                DebugLog("[P11] koself name '" + nameKey + "' near " + an.str() + " refused: " + why);
+                WriteStatus("error koself name near: " + why);
+            }
+            else
+            {
+                std::ostringstream pk;
+                pk << "[P11] koself name '" << nameKey << "' near " << nearUid << " -> uid=" << nu << " '" << nn << "' dist=" << (int)nd;
+                DebugLog(pk.str());
+                WriteStatus(coop::KoSelfLever(nu, (float)nameSeconds));
+            }
+#else
+            DebugLog("[P11] koself name '" + nameKey + "' near .. refused: a TEST-ONLY form - this is not a test (DEV) build");
+            WriteStatus("error koself name near: TEST-ONLY, not a test build");
+#endif
+            finished = true;
+        }
+        else if (coopsay::KoSelfNameParse(rest, &nameKey, &nameSeconds))
         {
             unsigned int nu = 0; float nd = -1.0f; std::string nn, why;
             if (coop::LeverNearestNamed(nameKey, coop::kLeverPickOwnLiving, 0, 300.0f, &nu, &nd, &nn, &why) == 0)
@@ -3827,7 +4014,7 @@ void CommandChannelTick()
             if (spawnedRefused) {}   // the refusal above is the status
             else if (uid == 0 || seconds < 0 || seconds > 600)
             {
-                DebugLog("[cmd] usage: koself <uid> [seconds 0..600] | koself spawned:<Template> [seconds 0..600] | koself name <name, '_' = a space> [seconds 0..600]");
+                DebugLog("[cmd] usage: koself <uid> [seconds 0..600] | koself spawned:<Template> [seconds 0..600] | koself name <name, '_' = a space> [seconds 0..600] | koself name <name> near <anchorUid> [seconds 0..600] (DEV)");
                 WriteStatus("error koself usage");
             }
             else WriteStatus(coop::KoSelfLever(uid, (float)seconds));
@@ -4153,6 +4340,18 @@ void CommandChannelTick()
         }
         finished = true;
     }
+    else if (verb == "pingtest")
+    {
+        /* TEST-ONLY lever (DEV build), T-1393: pingtest world <x> <z> | map <x> <z> | burst <n 1-8> world|map <x> <z> [nogate] | press
+           | show - a ping fired as G fires one after its spot is picked (ping.cpp Fire: the sender's 3-in-5-s limit unless nogate, one
+           copy to each online teammate, this player's own marker and chat line); a world ping stands on the terrain's height at x,z.
+           press runs G's own handler on the mouse where it is (the map's spot when the map is open). show: the [PING] counts. */
+        std::string rest; std::getline(is, rest); rest = Trim(rest);
+        const std::string r = coop::PingTestCommand(rest);
+        DebugLog("[PING] pingtest " + rest + " -> " + r);
+        WriteStatus(r);
+        finished = true;
+    }
     else if (verb == "camturn")
     {
         /* TEST-ONLY lever (DEV build), T-890: camturn [<yaw>] [yaw <deg>] [pitch <deg>] [dist <d>] | camturn show - the camera's facing,
@@ -4311,6 +4510,16 @@ void CommandChannelTick()
         else { std::string rest; std::getline(is, rest); WriteStatus(coop::NpcMoneyCommand(amount, Trim(rest))); }
         finished = true;
     }
+    else if (verb == "crashtest")
+    {
+        /* T-1374 TEST-ONLY lever (DEV build): crashtest av-main | av-worker | throw-main | throw-worker | purecall | abort - the main
+           kinds fault in the next main-loop frame (crashwatch.cpp CrashWatchTick, outside any __try of the mod), the worker kinds on
+           a new thread now; the game then ends through its own crash handling, writing the [CRASH] line first */
+        std::string kind;
+        is >> kind;
+        WriteStatus(coop::CrashTestCommand(kind));
+        finished = true;
+    }
     else if (verb == "filehold")
     {
         /* T-1280 TEST-ONLY lever (DEV build): filehold <name> <seconds 1-600> | filehold off - <name> held open with no sharing for
@@ -4363,6 +4572,13 @@ void CommandChannelTick()
             }
         }
         finished = true;
+    }
+    else if (verb == "zoneownnext")
+    {
+        /* T-1372 TEST-ONLY lever (DEV build): zoneownnext <x.y> | off | show - the NEXT game start loads area x.y from the save's own
+           file once, not the shared world's copy (store.cpp ZoneOwnNextRead), so an own building the save lacks is remade from its record */
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::ZoneOwnNextCommand(Trim(arg))); finished = true;
     }
 #endif
     else if (verb == "aifreeze")

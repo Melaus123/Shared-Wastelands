@@ -330,6 +330,167 @@ bool FindGameFolder()
     return true;
 }
 
+/* ---- T-1447 TEST-ONLY: ANOTHER MOD'S JUMP ON THE GAME-DATA LOAD ------------------------------------------------------
+   A player's other mod (with RE_Kenshi, F1474) hooks GameDataContainer::load (GdcLoad) before our plugin starts, and before
+   T-1447 the address gate refused the whole mod for it. This lever reproduces that on a bench: ONLY when the environment
+   variable KENSHI_SW_TEST_FOREIGN_HOOK is set (the harness's `run options: foreign-hook=relay|stub`, set for the launched
+   test games only - nothing in the release package sets it), and only when the 16 bytes at GdcLoad are the ones both
+   address tables carry (Steam 1.0.68 rva 0x6C0B50, Steam 1.0.65 rva 0x6C0800), the loader hooks GdcLoad itself BEFORE it
+   loads the plugin:
+     relay - as multihook does (hook.c:87-93): a page within reach below the game's image, its slot holding at +0x10 the
+             14-byte jump FF 25 00000000 <address of the test detour in this DLL>; GdcLoad's first 5 bytes become E9 -> that
+             relay. The [ADDR] line must follow the relay to name this DLL.
+     stub  - a plain E9 straight to a counting stub in a page near the game's image (no module, no relay: `lock inc` of its
+             own counter, then FF 25 to the trampoline) - as a mod whose hook code lives in memory it allocated; the [ADDR] line
+             then names 'unknown'. (A plain E9 into this DLL cannot reach: a 64-bit DLL loads more than 2 GB from the game.)
+   The relay's test detour counts its calls, the stub its own; export swTestForeignHookCalls returns the sum (read by the
+   plugin's chained-GdcLoad line). Both reach the game's function through the test trampoline (the 5 copied bytes 48 8B C4
+   55 56 - mov rax,rsp; push rbp; push rsi - then FF 25 back to GdcLoad + 5). The relay's first call appends one line to
+   this loader's log. Never removed.
+   No test build form gates it: the loader has none (only the plugin has SW_DEV_BUILD, "build.bat dev"); the variable alone
+   switches it, as KENSHI_SW_TEST_PRELOAD_SLOW does in the release plugin, and nothing in the package sets it. */
+wchar_t g_fhLog[kPath];
+char g_fhLine[600];
+int  g_fhLen = 0;
+typedef unsigned char (*FhGdcFn)(void*, void*, void*, int, void*, unsigned char);
+FhGdcFn g_fhOrig = 0;
+volatile LONG g_fhCalls = 0;
+volatile LONG64* g_fhStubCalls = 0;   /* the stub's own counter (stub shape), in its page */
+const unsigned char kFhWant[16] = { 0x48, 0x8B, 0xC4, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D };
+
+void FhA(const char* s) { while (*s != 0 && g_fhLen < (int)sizeof(g_fhLine) - 3) g_fhLine[g_fhLen++] = *s++; }
+void HexOut(unsigned long long v, void (*out)(const char*))
+{
+    char b[20];
+    int i = 0, k;
+    const char* d = "0123456789ABCDEF";
+    b[i++] = '0'; b[i++] = 'x';
+    for (k = 60; k > 0 && ((v >> k) & 0xF) == 0; k -= 4) {}
+    for (; k >= 0; k -= 4) b[i++] = d[(v >> k) & 0xF];
+    b[i] = 0;
+    out(b);
+}
+void FhAppendLine()
+{
+    g_fhLine[g_fhLen++] = '\r';
+    g_fhLine[g_fhLen++] = '\n';
+    if (g_fhLog[0] == 0) return;
+    HANDLE h = ::CreateFileW(g_fhLog, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    ::WriteFile(h, g_fhLine, (DWORD)g_fhLen, &wrote, 0);
+    ::CloseHandle(h);
+}
+unsigned char FhDetour(void* a, void* b, void* c, int d, void* e, unsigned char f)
+{
+    if (::InterlockedIncrement(&g_fhCalls) == 1)
+    {
+        g_fhLen = 0;
+        FhA("TEST-ONLY foreign hook: the first call of the game-data load (GdcLoad) reached the loader's test detour; it calls"
+            " the game's function through its own trampoline (the count: swTestForeignHookCalls, in the mod's [ADDR] GdcLoad line)");
+        FhAppendLine();
+    }
+    return g_fhOrig(a, b, c, d, e, f);
+}
+
+/* A page within reach below the game's image, as multihook places its slots: 64 KB steps down, at most ~1.75 GB. */
+unsigned char* FhAllocNear(unsigned long long base)
+{
+    unsigned long long a = (base & ~0xFFFFull) - 0x10000ull;
+    for (; base > 0x70000000ull && a > base - 0x70000000ull; a -= 0x10000ull)
+    {
+        void* p = ::VirtualAlloc((void*)a, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (p != 0) return (unsigned char*)p;
+    }
+    return 0;
+}
+void FhPut64(unsigned char* p, unsigned long long v) { int i; for (i = 0; i < 8; ++i) p[i] = (unsigned char)(v >> (8 * i)); }
+
+/* Appends its outcome to the decision line (g_log). Nothing at all - not even a word in the log - without the variable. */
+void FhPlace()
+{
+    char v[16];
+    const DWORD n = ::GetEnvironmentVariableA("KENSHI_SW_TEST_FOREIGN_HOOK", v, (DWORD)sizeof(v));
+    if (n == 0 || n >= (DWORD)sizeof(v)) return;
+    const bool relay = (v[0] == 'r' && v[1] == 'e' && v[2] == 'l' && v[3] == 'a' && v[4] == 'y' && v[5] == 0);
+    const bool stub  = (v[0] == 's' && v[1] == 't' && v[2] == 'u' && v[3] == 'b' && v[4] == 0);
+    LogA("; TEST-ONLY KENSHI_SW_TEST_FOREIGN_HOOK=");
+    LogA(v);
+    if (!relay && !stub) { LogA(" is neither relay nor stub - nothing placed"); return; }
+    WJoin(g_fhLog, g_game, swnames::kLoaderLogW, 0);
+    const unsigned long long base = (unsigned long long)::GetModuleHandleW(0);
+    const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + (unsigned long long)((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const unsigned long rvas[2] = { 0x6C0B50ul, 0x6C0800ul };
+    unsigned char* site = 0;
+    int r, i;
+    for (r = 0; r < 2 && site == 0; ++r)
+    {
+        if ((unsigned long long)rvas[r] + 16ull > (unsigned long long)nt->OptionalHeader.SizeOfImage) continue;
+        const unsigned char* p = (const unsigned char*)(base + rvas[r]);
+        for (i = 0; i < 16 && p[i] == kFhWant[i]; ++i) {}
+        if (i == 16) site = (unsigned char*)p;
+    }
+    if (site == 0) { LogA(" - GdcLoad's bytes are not at either known place (Steam 1.0.68 / 1.0.65) - nothing placed"); return; }
+    LogA(" - GdcLoad at rva "); HexOut((unsigned long long)(site - (unsigned char*)base), LogA);
+    unsigned char* page = FhAllocNear(base);   /* both shapes: within a 5-byte jump of GdcLoad */
+    if (page == 0) { LogA(": no page for the test's code - nothing placed"); return; }
+    /* the test detour's trampoline at +0x40: the 5 bytes the jump replaces, then FF 25 back to GdcLoad + 5 */
+    unsigned char* tr = page + 0x40;
+    for (i = 0; i < 5; ++i) tr[i] = site[i];
+    tr[5] = 0xFF; tr[6] = 0x25; tr[7] = 0; tr[8] = 0; tr[9] = 0; tr[10] = 0;
+    FhPut64(tr + 11, (unsigned long long)(site + 5));
+    g_fhOrig = (FhGdcFn)(void*)tr;
+    unsigned long long dest = (unsigned long long)(void*)&FhDetour;
+    if (relay)
+    {
+        unsigned char* rl = page + 0x10;   /* multihook's slot: two 8-byte fields, then the relay at +0x10 */
+        rl[0] = 0xFF; rl[1] = 0x25; rl[2] = 0; rl[3] = 0; rl[4] = 0; rl[5] = 0;
+        FhPut64(rl + 6, dest);
+        dest = (unsigned long long)rl;
+    }
+    else
+    {
+        /* the stub at +0x10: lock inc qword [rip+d] (its counter at +0x80), then FF 25 00000000 <the trampoline> */
+        unsigned char* sb = page + 0x10;
+        const unsigned int d = (unsigned int)(0x80 - (0x10 + 8));
+        sb[0] = 0xF0; sb[1] = 0x48; sb[2] = 0xFF; sb[3] = 0x05;
+        sb[4] = (unsigned char)d; sb[5] = (unsigned char)(d >> 8); sb[6] = (unsigned char)(d >> 16); sb[7] = (unsigned char)(d >> 24);
+        sb[8] = 0xFF; sb[9] = 0x25; sb[10] = 0; sb[11] = 0; sb[12] = 0; sb[13] = 0;
+        FhPut64(sb + 14, (unsigned long long)tr);
+        g_fhStubCalls = (volatile LONG64*)(page + 0x80);
+        dest = (unsigned long long)sb;
+    }
+    const long long dist = (long long)dest - (long long)(unsigned long long)(site + 5);
+    if (dist > 0x7FFFFFFFll || dist < -0x80000000ll)
+    {
+        LogA(": the test page is out of a 5-byte jump's reach - nothing placed");
+        g_fhStubCalls = 0;
+        ::VirtualFree(page, 0, MEM_RELEASE);
+        return;
+    }
+    ::FlushInstructionCache(::GetCurrentProcess(), page, 0x1000);
+    DWORD old = 0;
+    if (!::VirtualProtect(site, 8, PAGE_EXECUTE_READWRITE, &old)) { LogA(": VirtualProtect failed - nothing placed"); return; }
+    {
+        /* one 8-byte write (GdcLoad's start is 16-byte aligned): E9 rel32, then the 3 bytes that were there */
+        unsigned long long now = 0, val = 0;
+        for (i = 7; i >= 0; --i) now = (now << 8) | site[i];
+        const unsigned int rel = (unsigned int)(int)dist;
+        val = 0xE9ull | ((unsigned long long)rel << 8) | (now & 0xFFFFFF0000000000ull);
+        ::InterlockedExchange64((volatile LONG64*)site, (LONG64)val);
+    }
+    ::VirtualProtect(site, 8, old, &old);
+    ::FlushInstructionCache(::GetCurrentProcess(), site, 8);
+    LogA(relay ? ": PLACED E9 -> a relay page in no module (FF 25 -> the test detour in this DLL)"
+               : ": PLACED E9 straight to a counting stub in a page in no module (then FF 25 -> the test trampoline)");
+}
+
+/* T-1447 TEST-ONLY: how often the test detour ran (0 without the lever). Read by the plugin (store.cpp GdcLoadChainNote). */
+extern "C" __declspec(dllexport) long swTestForeignHookCalls(void)
+{
+    return (long)g_fhCalls + (g_fhStubCalls != 0 ? (long)*g_fhStubCalls : 0L);
+}
+
 /* THE DECISION - from the plugin object's initialise(), inside Ogre's Root::initialise, after the launcher's OK. */
 void Decide()
 {
@@ -400,6 +561,8 @@ void Decide()
     if (g_switchedOff > 0) { LogA("; "); LogU((unsigned long)g_switchedOff); LogA(" switched-off cop(ies) skipped, first: "); LogA(g_firstOff); }
     LogA("]");
     if (g_mr.ignoredKeys > 0) { LogA(" ["); LogU((unsigned long)g_mr.ignoredKeys); LogA(" unknown key(s) ignored]"); }
+
+    FhPlace();   /* T-1447 TEST-ONLY: another mod's jump on GdcLoad, before the plugin starts - nothing without its variable */
 
     /* Load by full path. The mod's own folder is searched for ITS dependencies first, then the game folder and System32
        (LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS). A system without those flags answers

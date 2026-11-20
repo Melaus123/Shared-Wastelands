@@ -3360,7 +3360,7 @@ void t_t1285_area_charge()
         if (on == std::string::npos || lz == std::string::npos || el == std::string::npos || rep_ == std::string::npos || !(lz < el && el < rep_) || sw == std::string::npos || st == std::string::npos
             || sw > nx || st > nx || rep_ > nx)
             Fail("d1556 wiring: OnAreas marks a player reported, stamps the listing and decides the charge only on a report without the loading mark");
-        if (sm.find("const unsigned int kProtocol = 153;") == std::string::npos) Fail("d1556 wiring: the world server speaks protocol 153");
+        if (sm.find("const unsigned int kProtocol = 170;") == std::string::npos) Fail("d1556 wiring: the world server speaks protocol 170");
     }
     /* the game's own step-aside (fold 1, review M3) */
     if (loadedzones::LoadedHereGrants(1) != 0) Fail("t1285 fold 1: another player beside an unheld loaded area - not mine until the server names a holder");
@@ -5017,7 +5017,7 @@ void t_p15_destroyed_state()
         coopbuild::BuildDeadHandleIn ok;
         ok.listed = 26; ok.n = 26; ok.cut = 0; ok.torn = 0;
         ok.typed = 26; ok.good = 13; ok.hits = 0; ok.dead = 13; ok.other = 0;
-        ok.areaLoaded = 1; ok.setAge = coopbuild::kBuildDeadHandleWait; ok.regRow = 0; ok.copyListRow = 0; ok.removedMark = 0;
+        ok.areaLoaded = 1; ok.setAge = coopbuild::kBuildDeadHandleWait; ok.regRow = 0; ok.copyListRow = 0; ok.removedMark = 0; ok.copyRowPlain = 0; ok.goodMayBeCopy = 0;
         if (coopbuild::BuildDeadHandlesIgnore(ok) != 1) Fail("T-903 F1026: every condition held but the dead handles still held the copy");
         coopbuild::BuildDeadHandleIn x;
         x = ok; x.listed = -1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a): an unreadable list size was taken as read whole");
@@ -5033,8 +5033,48 @@ void t_p15_destroyed_state()
         x = ok; x.setAge = coopbuild::kBuildDeadHandleWait - 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (d): a dead set younger than the wait was trusted");
         x = ok; x.setAge = 1000; if (coopbuild::BuildDeadHandlesIgnore(x) != 1) Fail("T-903 F1026 (d): an older unchanged dead set still held the copy");
         x = ok; x.regRow = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (e): a key with a registry row here was made again");
-        x = ok; x.copyListRow = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (e): a key with a copy-list row was made again");
+        x = ok; x.copyListRow = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (e): a key with a copy-list row that is not plain was made again");
         x = ok; x.removedMark = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (e): a key marked removed was made again");
+        /* T-1343 (F1065): a plain copy-list row is void once the world answers - the reporter's restart: the area served from the host's
+           record (LOAD-OVERRIDE), 15 pieces resolved, 12 handles dead, the same set long enough, 4 keys on the copy list */
+        {
+            coopbuild::BuildDeadHandleIn r = ok;
+            r.listed = 27; r.n = 27; r.typed = 27; r.good = 15; r.dead = 12; r.setAge = 300;
+            r.copyListRow = 1; r.copyRowPlain = coopbuild::BuildCopyRowPlain(1, 0, 0);
+            if (r.copyRowPlain != 1) Fail("T-1343: a listed copy row, not removed, not a hand-over, did not read as plain");
+            if (coopbuild::BuildDeadHandlesIgnore(r) != 1) Fail("T-1343: a plain copy-list row still held the copy when the area holds no piece at the key (stable dead set, area loaded)");
+            x = r; x.setAge = coopbuild::kBuildDeadHandleWait - 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 (d): a plain row's dead set younger than the wait was trusted");
+            x = r; x.setAge = -1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 (d): a plain row's changed dead set was trusted");
+            x = r; x.areaLoaded = 0; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 (c): a plain row voided before the area's saved pieces were all in");
+            x = r; x.good = 14; x.hits = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343: a real copy present at or near the key - a second one would be made");
+            x = r; x.good = 14; x.other = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343: a handle that answered an object (not dead) was ignored for a plain row");
+            x = r; x.copyRowPlain = coopbuild::BuildCopyRowPlain(1, 1, 0); if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343: a copy-list row marked removed here was voided (the copy would come back)");
+            x = r; x.copyRowPlain = coopbuild::BuildCopyRowPlain(1, 0, 1); if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343: a hand-over row this game made was voided");
+            x = r; x.regRow = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343: a key with a registry row here was made again beside a plain copy-list row");
+            x = r; x.removedMark = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343: a key marked removed was made again beside a plain copy-list row");
+            if (coopbuild::BuildCopyRowPlain(0, 0, 0) != 0) Fail("T-1343: no copy-list row read as a plain row");
+            /* review fold: a saved copy standing under another key reads 'good' - a good piece of the row's record keeps the hold */
+            x = r; x.goodMayBeCopy = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 review: a good piece of the row's record in the house - the copy may stand under another key - was made again");
+            x = r; x.goodMayBeCopy = 2; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 review: a good piece whose record id did not read was taken as not the row's");
+            x = r; x.goodMayBeCopy = 0; if (coopbuild::BuildDeadHandlesIgnore(x) != 1) Fail("T-1343 review: good pieces of other records only still held the copy");
+            x = ok; x.goodMayBeCopy = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 1) Fail("T-1343 review: the same-record test held a key with no copy-list row (a fresh copy, T-903 unchanged)");
+            /* re-check fold: the record id is per type - only a piece this game does not account for may be the row's copy */
+            if (coopbuild::BuildGoodMayBeCopy(1, 0, 1) != 0) Fail("T-1343 re-check: a second copied piece of the same type (its own copy-list row) was taken as this row's copy");
+            if (coopbuild::BuildGoodMayBeCopy(1, 1, 0) != 0) Fail("T-1343 re-check: a same-type piece with its own registry row was taken as this row's copy");
+            if (coopbuild::BuildGoodMayBeCopy(1, 0, 0) != 1) Fail("T-1343 re-check: an unmatched same-type piece was not taken as possibly this row's copy");
+            if (coopbuild::BuildGoodMayBeCopy(-1, 0, 0) != 1) Fail("T-1343 re-check: an unmatched piece whose record id did not read was not held");
+            if (coopbuild::BuildGoodMayBeCopy(0, 0, 0) != 0) Fail("T-1343 re-check: a piece of another type was taken as this row's copy");
+            {   /* two copies of one type: the first stands (its own copy-list row), the second is made */
+                x = r; x.goodMayBeCopy = coopbuild::BuildGoodMayBeCopy(1, 0, 1);
+                if (coopbuild::BuildDeadHandlesIgnore(x) != 1) Fail("T-1343 re-check: the second copied piece of a type was held by the first one's copy");
+                x = r; x.goodMayBeCopy = coopbuild::BuildGoodMayBeCopy(1, 0, 0);
+                if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 re-check: an unmatched same-type piece did not hold the row");
+            }
+            /* review fold: rules (a) and (b) for a plain row */
+            x = r; x.good = 27; x.dead = 0; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 (b): a plain row with no dead slot (an ordinary search) was voided");
+            x = r; x.cut = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 (a): a plain row voided on a list walk cut short");
+            x = r; x.n = 26; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-1343 (a): a plain row voided on a list read short of its size");
+        }
         /* the set's signature: order-free, any change shows */
         std::vector<unsigned int> t1, t2, t3;
         t1.push_back(2069); t1.push_back(387); t1.push_back(11); t1.push_back(2069); t1.push_back(552); t1.push_back(12);
@@ -5238,8 +5278,10 @@ void t_build1c_state_wire()
         Fail("a STATE did not survive the round trip");
     for (size_t cut = 0; cut < b.size(); ++cut)
         if (coopbuild::DecodeBuild(&b[0], cut, &o) == coopbuild::kBuildDecodeOk) { Fail("a truncated STATE was accepted"); break; }
-    std::vector<char> c(b); c[1 + 1 + s.key.size() + 8] = 8;   /* the complete byte: bit 0 complete, bit 1 destroyed, bit 2 broken - bit 3 is refused */
-    if (coopbuild::DecodeBuild(&c[0], c.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a STATE complete byte with bit 3 set was accepted");
+    std::vector<char> c(b); c[1 + 1 + s.key.size() + 8] = 32;   /* the complete byte: bit 0 complete, bit 1 destroyed, bit 2 broken, bit 3 a group step stamp, bit 4 a group fact (T-1408 fold 13) - bit 5 is refused */
+    if (coopbuild::DecodeBuild(&c[0], c.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a STATE complete byte with bit 5 set was accepted");
+    c[1 + 1 + s.key.size() + 8] = 8;   /* bit 3 with no stamp after the materials: cut short */
+    if (coopbuild::DecodeBuild(&c[0], c.size(), &o) != coopbuild::kBuildDecodeTooShort) Fail("a STATE complete byte with bit 3 and no stamp was accepted");
     std::vector<char> n17(b); n17[1 + 1 + s.key.size() + 9] = 17; n17.resize(n17.size() + 14 * 4, 0);
     if (coopbuild::DecodeBuild(&n17[0], n17.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a STATE with 17 materials was accepted");
     std::vector<char> ek(b); ek[1] = 0;
@@ -5614,16 +5656,17 @@ void t_t988_piececheck()
     if (blk.find("return coopbuild::PieceCheckFindPathMode(m.begin(), m.end(), coopbuild::kPcFieldWalkMax, v);") == std::string::npos
         || blk.find("it != m.end(); ++it)") != std::string::npos)
         Fail("T-988 fold 2: the path-mode walk over the record's fields has no count limit");
-    if (blk.find("coopbuild::PieceCheckNext(v, tries, kPcRechecks)") == std::string::npos
-        || blk.find("g_pcDue.Push(key, (unsigned int)(::GetTickCount() + kPcRecheckMs), road, tries + 1)") == std::string::npos
-        || blk.find("const DWORD kPcRecheckMs = 90000;") == std::string::npos || blk.find("const int kPcRechecks = 2;") == std::string::npos)
-        Fail("T-988 fold 1: a piece with no body is not re-checked later");
+    /* T-1389: no timer - a piece with no physics yet waits for its physics-arrived event */
+    if (blk.find("if (PcBodyWaitAdd(b, key) != 0) { row.waitB = b; ++g_pcRechecks; }") == std::string::npos
+        || blk.find("const DWORD kPcRecheckMs") != std::string::npos || blk.find("const DWORD kPcLaterMs") != std::string::npos)
+        Fail("T-988 / T-1389: a piece with no body does not wait for its physics-arrived event (or a timer is left)");
     if (blk.find("const int kPcPiecesPerTick = 8;") == std::string::npos
         || blk.find("g_pcDue.TakeDue((unsigned int)now, kPcPiecesPerTick, &due);") == std::string::npos
         || blk.find("g_pcDue.Push(it->first, (unsigned int)now, coopbuild::kPcRoadAreaLoad, 0)") == std::string::npos)
         Fail("T-988 fold 1: the per-tick cursor is not wired (an area is still checked in one tick)");
-    const size_t rp = src.find("pieceCheck[checked,suspect,noShapes,excludedOnly,notCarved,faults,capped,other,rechecks,lateBody,dropped]", b1);
-    if (rp == std::string::npos || rp > b1 + 400) Fail("T-988 fold 1: the REPORT fields are not the old seven then the four new");
+    const size_t rp = src.find("pieceCheck[checked,suspect,noShapes,excludedOnly,notCarved,faults,capped,other,rechecks,lateBody,dropped,", b1);
+    const size_t rp2 = (rp != std::string::npos) ? src.find("whole,building,notWhole,cameBack,ruin,takenApart,waitAged,waitEndYoung,copyNoState,bodiesCame]", rp) : std::string::npos;
+    if (rp == std::string::npos || rp > b1 + 400 || rp2 == std::string::npos || rp2 > rp + 200) Fail("T-988 fold 1 / T-1389: the REPORT fields are not the old eleven then the six new");
 }
 /* T-274: the per-zone scan's mark / clear / retry rule (coopbuild::BuildZoneScan*); T-274 fold: round-robin pick and the give-up */
 void t_t274_zonescan()
@@ -6576,8 +6619,42 @@ void t_p14_tombstone_kill()
     /* F2 (key mismatch): the found piece's own key is not the tombstone's, or a registry row names it - never touched */
     if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 0, 0, 0) != coopbuild::kBuildTombKillMismatch) Fail("p14f1: a piece within the window (another key) was removed");
     if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 1, 0) != coopbuild::kBuildTombKillMismatch) Fail("p14f1: a piece a registry row names was removed");
-    /* F4: a building with an interior is left standing */
+    /* F4: a building with an interior is left standing - T-1372 attempt 2: only when the panel's confirmDismantle has no address row */
     if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1) != coopbuild::kBuildTombKillExclude) Fail("p14f1: a building with an interior was dismantled");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 0, 1) != coopbuild::kBuildTombKillExclude) Fail("t1372: an interior house was removed with no confirmDismantle address");
+    /* T-1372 attempt 2: with the address, the first call is the panel's own removal once the interior's list read whole */
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 1) != coopbuild::kBuildTombKillPanel) Fail("t1372: an interior house was not removed the panel way");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 0) != coopbuild::kBuildTombKillMiss) Fail("t1372: an interior house was called before its list read whole");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, M - 1, M, 1, 0, 1, 1, 0) != coopbuild::kBuildTombKillGiveUp) Fail("t1372: an interior list that never read whole never gave up");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, M - 2, M, 1, 0, 1, 1, 1) != coopbuild::kBuildTombKillPanel) Fail("t1372: earlier misses blocked a whole read's panel call");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 1, 0, M, 1, 0, 1, 1, 1) != coopbuild::kBuildTombKillCall) Fail("t1372: a retry after the panel call was not the bare dismantle");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 1, 0, M, 1, 0, 1, 1, 0) != coopbuild::kBuildTombKillCall) Fail("t1372: a retry waited for the interior list");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 1, 1, 0, M, 1, 0, 1, 1, 1) != coopbuild::kBuildTombKillWait) Fail("t1372: a house the panel call took down was not waited for");
+    if (coopbuild::BuildTombKillStep(1, 0, 0, 0, 0, 1, 0, M, 0, 0, 0, 1, 0) != coopbuild::kBuildTombKillDone) Fail("t1372: a freed house did not finish the removal");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 0, 1, 0) != coopbuild::kBuildTombKillCall) Fail("t1372: a piece with no interior waited for an interior list");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 0, 0, 1, 1, 1) != coopbuild::kBuildTombKillMismatch) Fail("t1372: another key's interior house was removed");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 1, 0, 0, 0, M, 1, 0, 1, 1, 1) != coopbuild::kBuildTombKillCancel) Fail("t1372: another game's listed interior house was removed");
+    if (coopbuild::BuildTombKillStep(0, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 0) != coopbuild::kBuildTombKillWait) Fail("t1372: an unloaded zone's interior house counted a miss");
+    /* review fold B1: another player's piece inside (the panel reads no owner) - left standing, never the panel */
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 1, 1, 0) != coopbuild::kBuildTombKillForeign) Fail("t1372f: a house holding another player's piece was removed the panel way");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 0, 1, 0) != coopbuild::kBuildTombKillMiss) Fail("t1372f: a foreign verdict from an unwhole read was trusted");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 0, 1, 1, 0) != coopbuild::kBuildTombKillExclude) Fail("t1372f: no address row did not exclude");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 1, 0, 0) != coopbuild::kBuildTombKillPanel) Fail("t1372f: an all-own interior was not removed the panel way");
+    /* review fold F2 + re-check: a furniture tombstone of this house still to settle - a counted miss before any read verdict, bounded */
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 1, 0, 1) != coopbuild::kBuildTombKillMiss) Fail("t1372f: the panel ran while its furniture's removal was to settle");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, M - 1, M, 1, 0, 1, 1, 1, 0, 1) != coopbuild::kBuildTombKillGiveUp) Fail("t1372f: the furniture wait never gave up");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 0, 0, M, 1, 0, 1, 1, 1, 1, 1) != coopbuild::kBuildTombKillMiss) Fail("t1372f: a foreign verdict ended the house before its furniture settled");
+    /* (furn, hostExact, hostNear, queued, readBack, verified, settled) */
+    if (coopbuild::BuildTombFurnBlocks(1, 1, 0, 1, 1, 0, 0) != 1) Fail("t1372f: a queued furniture removal did not hold the panel");
+    if (coopbuild::BuildTombFurnBlocks(1, 0, 1, 1, 1, 0, 0) != 1) Fail("t1372f: a furniture tombstone with a NEAR host key (drift) did not hold the panel");
+    if (coopbuild::BuildTombFurnBlocks(1, 1, 0, 0, 1, 0, 0) != 1) Fail("t1372f: a read-back furniture tombstone not yet queued (walk not reached) did not hold the panel");
+    if (coopbuild::BuildTombFurnBlocks(1, 0, 1, 0, 1, 0, 0) != 1) Fail("t1372f: a near-key furniture tombstone not yet queued did not hold the panel");
+    if (coopbuild::BuildTombFurnBlocks(1, 1, 0, 0, 1, 1, 0) != 0) Fail("t1372f: a furniture tombstone verified absent held the panel");
+    if (coopbuild::BuildTombFurnBlocks(1, 1, 0, 0, 1, 0, 1) != 0) Fail("t1372f: a furniture removal given up / put off held the panel");
+    if (coopbuild::BuildTombFurnBlocks(1, 1, 0, 0, 0, 0, 0) != 0) Fail("t1372f: a this-world furniture tombstone (nothing to restore) held the panel");
+    if (coopbuild::BuildTombFurnBlocks(1, 0, 0, 1, 1, 0, 0) != 0) Fail("t1372f: another house's furniture held the panel");
+    if (coopbuild::BuildTombFurnBlocks(0, 1, 0, 1, 1, 0, 0) != 0) Fail("t1372f: a free-standing tombstone held the panel");
+    if (coopbuild::BuildTombKillStep(1, 1, 1, 0, 0, 1, 0, M, 1, 0, 1, 1, 1, 1, 1) != coopbuild::kBuildTombKillCall) Fail("t1372f: a retry after the panel call was held by the interior rules");
 }
 /* P14 fold 1: the escape ledger - refund items, pickups (partial ones add up to at most the refund), the reload count, the subtraction */
 void t_p14f1_ledger()
@@ -8570,6 +8647,15 @@ void t_t430_lever_shapes_parse()
     if (coopsay::KoSelfNameParse("name", &p, &sec)) Fail("koself name without a name must be refused");
     if (coopsay::KoSelfNameParse("name Bar Thug", &p, &sec)) Fail("koself name: a name with a real space must be refused");
     if (coopsay::KoSelfNameParse("4194305 30", &p, &sec)) Fail("koself <uid> is not the name form");
+    {   /* T-1422: koself name <name> near <anchorUid> [seconds] */
+        unsigned int an = 0;
+        if (!coopsay::KoSelfNameNearParse("name Hundred_Guardian#1 near 4194305", &p, &an, &sec) || p != "hundred guardian#1" || an != 4194305 || sec != 0) Fail("koself name near must parse");
+        if (!coopsay::KoSelfNameNearParse("name Thug near 7 30", &p, &an, &sec) || an != 7 || sec != 30) Fail("koself name near with seconds");
+        if (coopsay::KoSelfNameNearParse("name Thug near 0", &p, &an, &sec)) Fail("koself name near: anchor 0 must be refused");
+        if (coopsay::KoSelfNameNearParse("name Thug near 7 601", &p, &an, &sec)) Fail("koself name near: seconds over 600 must be refused");
+        if (coopsay::KoSelfNameNearParse("name Thug 30", &p, &an, &sec)) Fail("koself name <n> <s> is not the near form");
+        if (coopsay::KoSelfNameParse("name Thug near 7", &p, &sec)) Fail("the near form is not the plain name form");
+    }
     if (!coopsay::CarryNameParse("carry 4194305 name Bar_Thug", &c, &p) || c != 4194305 || p != "bar thug") Fail("carry name must parse");
     if (!coopsay::CarryNameParse("carry 0x10 name thug", &c, &p) || c != 16 || p != "thug") Fail("carry name: a hex carrier");
     if (coopsay::CarryNameParse("carry 4194305 4194306", &c, &p)) Fail("carry <carrier> <body> is not the name form");
@@ -8968,6 +9054,24 @@ void t_t1038_editor_reset_population()
         if (EditorResetButtonName(n[i].name) != n[i].want) Fail(std::string("editor reset button name: '") + n[i].name + "'");
     if (std::string(kEditorResetRefusedText) != "Reset Population is turned off in a multiplayer world. It deletes your own squad, and the other players would keep the old townspeople.")
         Fail("editor reset: the hover note's words are not the approved text");
+    /* T-1414 (owner 1763 / 1764): the whole Level Editor is closed when shown in a multiplayer world; single player, a hide and the
+       TEST-ONLY lever's own open are left; fed by the same HandSaveBlockedDecide; the message word for word as approved. */
+    struct ORow { bool mp, shown, lever; int want; const char* what; };
+    static const ORow o[] = {
+        { true,  true,  false, kEditorOpenClose, "multiplayer world, shown by the key: closed" },
+        { true,  false, false, kEditorOpenLeave, "multiplayer world, hidden: left (the close's own hide is not acted on)" },
+        { true,  true,  true,  kEditorOpenLeave, "multiplayer world, the editordelete lever's own open: left (it closes it itself)" },
+        { false, true,  false, kEditorOpenLeave, "single player, shown: untouched" },
+        { false, false, false, kEditorOpenLeave, "single player, hidden: untouched" },
+        { false, true,  true,  kEditorOpenLeave, "single player, the lever's open: untouched" } };
+    for (size_t i = 0; i < sizeof(o) / sizeof(o[0]); ++i)
+        if (EditorOpenDecide(o[i].mp, o[i].shown, o[i].lever) != o[i].want) Fail(std::string("editor off: ") + o[i].what);
+    if (EditorOpenDecide(HandSaveBlockedDecide(0, true), true, false) != kEditorOpenClose) Fail("editor off: title down in a multiplayer world: closed");
+    if (EditorOpenDecide(HandSaveBlockedDecide(0, false), true, false) != kEditorOpenLeave) Fail("editor off: title down in single player: untouched");
+    if (EditorOpenDecide(HandSaveBlockedDecide(1, true), true, false) != kEditorOpenLeave || EditorOpenDecide(HandSaveBlockedDecide(-1, true), true, false) != kEditorOpenLeave)
+        Fail("editor off: title up or unreadable: untouched");
+    if (std::string(kEditorOffText) != "The Level Editor is turned off in a multiplayer world.")
+        Fail("editor off: the message's words are not the approved text");
 }
 
 /* T-478 step 3: the bail line (43) - the NPC's game ends the conversation with END endsType 43 and the line's id; the talker's game
@@ -9139,7 +9243,7 @@ void t_t478_sell()
             || t65.find("TradingWindowCurrent                           var  02131BE0 02131BE0 -") == std::string::npos
             || t68.find("TradingWindowCurrent                           var  02132C30 02132C30 -") == std::string::npos)
             Fail("T-478 sell: an address table lacks the selling confirm or the trading window row");
-        if (t65.find("!count 759") == std::string::npos || t68.find("!count 759") == std::string::npos) Fail("T-478 sell: both address tables declare 759 rows (T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction; T-1122 cursorjoin: + PlacementPieceTown, PlacementRegionAdd, TownListNearestPlayer, PlacementGroupTownRange, TerrainHeightAt; decision 1556: + ZoneActivationDefaults (the fold reads it); T-1250: - the nine rows only its use-filter probe read (BuildingScorer and the eight MayUseRet* caller returns); T-1250 fix attempt 2: + TownUpdateOwnSearchRet, GetFoodTownGateTest; T-918 (main): + Character_setupAI; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1122: - the four rows only its assault-start probe read; T-1260: + RClickAutoTradeEnd; T-1150: + HaulStoreSearchOwnerTest, HaulCandidatesGather, OwnershipsMayUse, HaulSearchGatherRet; T-1242: + ResearchBenchList, ResearchCanPay, ResearchHasItems, ResearchPay; T-478 step 6: + the two buying confirms; T-1131 design A: + PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet; T-1131 fold 1: + TheftCaughtNotifyRet; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: + BuildingCreatePhysical; T-1294: + WalkMapDeferInterior (its box queue binds PlacementRegionAdd, the same function); T-1082: + UnlockDoorTaskStep; T-1309: + TaskObjectMineFactionTest; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet)");
+        if (t65.find("!count 809") == std::string::npos || t68.find("!count 809") == std::string::npos) Fail("T-478 sell: both address tables declare 809 rows (T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction; T-1122 cursorjoin: + PlacementPieceTown, PlacementRegionAdd, TownListNearestPlayer, PlacementGroupTownRange, TerrainHeightAt; decision 1556: + ZoneActivationDefaults (the fold reads it); T-1250: - the nine rows only its use-filter probe read (BuildingScorer and the eight MayUseRet* caller returns); T-1250 fix attempt 2: + TownUpdateOwnSearchRet, GetFoodTownGateTest; T-918 (main): + Character_setupAI; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1122: - the four rows only its assault-start probe read; T-1260: + RClickAutoTradeEnd; T-1150: + HaulStoreSearchOwnerTest, HaulCandidatesGather, OwnershipsMayUse, HaulSearchGatherRet; T-1242: + ResearchBenchList, ResearchCanPay, ResearchHasItems, ResearchPay; T-478 step 6: + the two buying confirms; T-1131 design A: + PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet; T-1131 fold 1: + TheftCaughtNotifyRet; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: + BuildingCreatePhysical; T-1294: + WalkMapDeferInterior (its box queue binds PlacementRegionAdd, the same function); T-1082: + UnlockDoorTaskStep; T-1309: + TaskObjectMineFactionTest; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet; T-1372: + BuildingPlaceGround; T-1372 removal: + LevelEditorDeleteSelected, PlayerInterfaceToggleEditor; T-1355 attempt 2 (main): + AbstractMovementBaseVt; T-1374 (main): + KenshiCrashFilter, KenshiSaveRootText; T-1379: + CampaignArrivalAnnounce; T-1343: + BuildingAtPoint; T-1381 probe P294: + MayUseRetSpecialFinder; T-1381 P294 removed: - MayUseRetSpecialFinder; T-1381 probe P295: + ShopGoalTargetPick, ShopFindForItem, ShopFallbackRandom; T-1381 P295 removed: - ShopGoalTargetPick, ShopFindForItem (ShopFallbackRandom kept, the fix's row); T-1167 piece 1: + LektorIntPushBack, ContextMenu_orderLabel, Character_orderPreCheck, TradeRangeSq; T-1167 piece 3 build 4: + MouseReleaseNoWindow; T-1167 v3: + RightReleaseItem; merge of effort/t1167b and main: both sides' rows, 774; T-1406: + PlayerInterface_newPlayerTask, StdString_assign, ForgottenGui_refreshSelected; merge of effort/t1167b into effort/t1406a: 777; T-1411 probe P306 c: + CarryFollowGateGlobal; T-1411 fold 2: + CharacterKeepUpdatedTest; T-1430: + NodeListDestroyByBuilding, TownForgetBuilding: 779; T-1430 fold 2: + BuildingGetTownStrict (0x296900, the purchase's own town lookup): 780; T-1437: + InputHandlerInit, InputHandlerAddCommand, InputHandlerFind, InputHandlerBind, InputHandlerParseKey, InputHandlerKeyBound, InputHandlerKeyName, InputHandlerGlobal, KeyConfigLineCtor, DatapanelAddLine, DatapanelAddSpacer, OptionsControlsEndRet (the Ping key and its Controls row): 792; T-1437 fold 1: + InputHandlerKeyDown (the key-down dispatch, hooked - a quick tap is not lost): 793; merge of main into effort/t1437a: both sides' rows, 795; T-1437 fold 2: + GameFreeStub (the game's own free, for the key word): 796; merge of main into effort/t1437a again (T-1427 fix: + TownFloorStoreRemove, TownFloorStoreAddPart): 798; merge of main into effort/t1437a a third time (T-1428 attempt 2: + ZoneWalkMapRebuild, NavMeshManagerPtr): 800; merge of main into effort/t1408a a fourth time: + WallEndPoint, PreviewRotate (T-1408 chain lever), 802; T-1408 fold 13: + WallJoinArea (0x29AC10, the engine's wall join - hooked: held for a wall whose record carries its owner's group), WallJoinTo (0x29A850, the engine's join of one wall to a lead - called in the owner's order), 804; merge of main into effort/t1408a a fifth time: + ZoneMapUpdate (T-1442 step 1b): 805; T-1422 window floor step: + NavClosestFaceQuery, HavokCharacterSetPosition: 807; merge of main into effort/t1422b again: + GuiKeyCommandGuard (T-1414 editorkey, 0x6E1C80), 808; merge of main into effort/t1422b a third time: + SetCrimeTimeLeft (0x851070, the time-left setter, hooked - T-1442 step 5), both sides' rows, 809)");
         if (sw.find("AddrReg kSellConfirmRva_reg(\"SlaveSellingConfirm\"") == std::string::npos || sw.find("AddrReg kTradingWindowRva_reg(\"TradingWindowCurrent\"") == std::string::npos)
             Fail("T-478 sell: spawn.cpp does not bind the two rows");
         const size_t tk = sw.find("void SellWindowTick()\n{"), tkEnd = (tk == std::string::npos) ? tk : sw.find("\n}\n", tk);
@@ -9312,7 +9416,7 @@ void t_t478_buy()
             Fail("T-478 buy: a REQ with join type 42 / 48 must round-trip");
     }
     /* the protocol */
-    if (hovrec::kGameProtocol != 227u) Fail("T-478 buy: the game-to-game protocol is not 227");
+    if (hovrec::kGameProtocol != 237u) Fail("T-478 buy: the game-to-game protocol is not 237");
     /* the address rows (1.0.68 from tools/gen_table_1068.py, forward and --reverse 'same'; signatures regenerated and proven) */
     {
         std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt");

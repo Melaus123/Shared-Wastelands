@@ -55,7 +55,8 @@
 
 namespace towntime {
 
-const unsigned int kProtocol = 153;            /* the world-server protocol that carries town clock records */
+const unsigned int kProtocol = 170;            /* the world-server protocol that carries town clock records */
+
 
 const unsigned int kTtMarker = 0x314D5454u;    /* 'T','T','M','1' little-endian */
 const unsigned int kTtFormat = 3u;             /* 2: the owed list; 3: the marked list (neither 1 nor 2 left an unmerged branch) */

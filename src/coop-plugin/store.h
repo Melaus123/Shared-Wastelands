@@ -13,10 +13,13 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <map>
 #include "../common/townrefill.h"   /* townrefill::Tally - StoreTownRecordTally */
+#include "../common/playermods.h"   /* T-247: coopmods::ModList, playermods flags - StoreWorldMods */
 class Faction;
 namespace moneyw { struct Ledger; }   /* T-810: src/common/moneywire.h */
 namespace swteam { struct WorkSum; }   /* teamwire.h: one topic's steps and level (a pointer here, so no include) */
+namespace coopwrel { struct Row; }   /* T-1383: worldrelwire.h - the creator's save standings (saverel.h's Table), a pointer here */
 namespace coop {
 void InstallStore();                         // hooks Platoon::deactivate (post) and Platoon::activate (pre)
 void InstallFontGuard();                     // T-730 (fontguard.cpp, fontguard.h): InstallStore calls it before the title screen is built
@@ -29,6 +32,7 @@ int  StoreWelcomePushDone();
 // held when this game asked, then the last page's END marker - been applied by the drain? 0 at the title, through a load and
 // until then; reset at every load, quit to menu and new link. Until it is 1, "the notebook does not know this id" is unanswerable.
 int  StoreSnapshotApplied();
+int  StoreStandInCapFull();   // T-1443 fold 3, MAIN THREAD: the area stand-in pass may make no more placeholder stand-ins in this world (kStandInTableCap / 2 made)
 // T-985 step 2B: have the world server's records of ONE area all arrived here (its AREA_DONE, or the whole feed's AREA_DONE all=1)?
 // Cleared where StoreSnapshotApplied is reset. sec = an items.cpp sector index (x * 64 + y); -1 = no area (only the whole feed
 // answers); kStoreAreaAny = any area done. oldAnswer = the whole-feed answer the gate used before 2B: a differing answer is counted
@@ -43,6 +47,9 @@ void StorePumpCapSet(int n);                 // TEST-ONLY (verb pumpcap): n > 0 
 // multiplayer world (SaveRedirectWanted). Every hand-save road asks this one function (store.cpp: the save funnel, the quickload
 // hook, the new-game pump refusal; ui.cpp: the pause menu greying). MAIN THREAD.
 bool HandSaveBlocked();
+// T-1414 (owner 1763 / 1764): a Level Editor shown in a multiplayer world is closed here, on the frame after its show, through the
+// engine's own editor toggle; one capped [EDITOR] line per close. Called each frame after the engine loop. MAIN THREAD.
+void StoreEditorOffTick();
 // T-927: the game menu's show or hide has just run; `visible` is its panel read then (UiPauseMenuPanelVisible: 1 shown, anything
 // else taken as closed). Under Slowest wins, in a session, in a world, an open game menu is this player's pause vote. MAIN THREAD.
 void ClockGameMenuVisible(int visible);
@@ -51,6 +58,9 @@ void ClockGameMenuVisible(int visible);
 void StorePeerGone();
 void SetStoreOn(bool on);
 void SetZoneStateOn(bool on);   // piece 3a: zone capture + load override (default OFF until piece 3b)
+#ifdef SW_DEV_BUILD
+std::string ZoneOwnNextCommand(const std::string& arg);   // T-1372 TEST-ONLY, DEV build, MAIN THREAD: `zoneownnext <x.y>|off|show` - the next game start loads that area from the save's own file, not the shared world's copy (one [ZONE] zoneownnext line)
+#endif
 /* T-948 b: Character::moveToNewSquad 0x5CDA50 refuses another game's character (store.cpp detour_sqMove) - except inside this pair, on
    this thread: the mod's own deliberate move of a copy. Nests. Nothing calls it today. Any thread. */
 void StoreSquadMovePassBegin();
@@ -69,6 +79,10 @@ const int kHbCauseItem = 0, kHbCauseWake = 1, kHbCauseSquad = 2, kHbCauseMoney =
    that holds it is marked due (kHbCauseSquad). ANY THREAD - off the main thread the address is queued, never read, and the store's
    1 Hz block marks its squad (store.cpp SqEventDrainTick). */
 void StoreNoteSquadEvent(void* character);
+/* T-1442 step 3: a character died (worldstate.cpp detour_declareDead, after the engine's call, not a death applied from the shared
+   state): noted for store.cpp DeadEventDrainTick, which judges its group the next frame and, on a wipe-out, deletes it then. ANY THREAD -
+   interlocked only (src/common/deadevent.h), nothing read, allocated, locked or logged. */
+void StoreNoteDeath(void* character);
 /* T-1084: a pot's home building changed (spawn.cpp detour_setHomeBuilding: the 28 bytes of its home hand differ after the engine's
    call) / a shop squad's stock and money were set (items.cpp detour_refreshBuildingInventory: the squad's own address, or its active
    part). The world squad this game writes that owns it is marked due. ANY THREAD - off the main thread the address is queued, never read. */
@@ -84,6 +98,14 @@ bool PlatoonNudge(const std::string& worldId, float dx, float dz);
 // A copy of another game's squad carries that squad's id (CONTEXT) and its birth flag (squadbirth.h): the copy's kept byte is set from
 // the flag (unknown: kept, so this engine puts it to sleep instead of destroying it).
 void StoreBindPlatoon(void* platoon, const std::string& worldId, int birth);
+// T-1429 copy settings (F1457): a copy of another game's squad gets the settings its newest record carries (base town, resident,
+// imprisoned, squad number, a trader's restock; the type stays the announce's) - why: "made" (spawn.cpp, after the bind), "record",
+// "takeover". The take-over only OWES the fill (CopySettingsOwe); it runs at the store's tick (CopySetOwedTick) or before any record
+// write of the copy (CopySettingsOwedRun). MAIN THREAD.
+void CopySettingsFromRecord(void* platoon, const std::string& worldId, const char* why);
+void CopySettingsOwe(void* platoon, const char* why);
+void CopySettingsOwedRun(void* platoon, const std::string& worldId, const char* road);
+void CopySetOwedTick();
 // A squad's birth flag (squadbirth.h: 1 born kept, 0 born not kept) noted at its creation. ANY THREAD.
 void StoreBirthNote(void* platoon, int birth);
 // The birth flag CONTEXT publishes for a squad: the one noted at its creation, copy or record, else its bound record's known flag; a
@@ -109,6 +131,16 @@ std::string StoreWorldStamp();   /* MAIN THREAD - the world this game is in now 
 std::string StoreGoneTownReport();   /* the goneTown[...] counts for the [TG] report line (plain counter reads) */
 int StoreTownGoneUnsent(const std::string& townSid);   /* MAIN THREAD - this game's gones naming this town not sent to the world server yet */
 int StoreRecordFacts(const std::string& worldId, int* owner, long long* writtenAt, int* gone, std::string* home);   /* T-984 (TEST lever's read), MAIN THREAD: 1 = a record of this world id is held here (*owner = the slot that wrote it, *writtenAt its stamp - 0 = a position-only entry, *gone = wiped out / thrown away); *home = the home key the records carry (g_homeOf: "" none, "-" cleared) either way */
+/* T-1402 (owner 1740 a), MAIN THREAD: what a bug report reads of map square x,y - *mirrorFile = this game's mirror copy of its area
+   file, <world>\<mirror>\zone.X.Y.zone ("" = no mirror folder yet); *serverDir = the world server's folder (where it writes <id>.platoon
+   and <id>.meta) only when this game runs the world server - the hosting game, in a world folder of its own (not a joined one) - else "";
+   returns 1 with *owner / *writtenAt / *seq = this game's record of zone.X.Y (who wrote it, when, the world server's seq), 0 = none held
+   here (*owner -1). Names only: no file is opened. */
+int StoreAreaReportFiles(int x, int y, std::string* mirrorFile, std::string* serverDir, int* owner, long long* writtenAt, unsigned long long* seq);
+/* T-1402 (run T2493, F1163), MAIN THREAD: why StoreAreaReportFiles names no world-server folder, in words - not the hosting game; the
+   hosting game whose world is kept here as joined (the world server keeps the world in another folder: this game's own folder for it
+   holds no world.txt naming the world's id - the bench's world server, started with its own --root); no folder for the world. */
+std::string StoreAreaServerNoneWhy();
 int StoreRecordsHomedAt(const std::string& buildingKey);   /* MAIN THREAD - living world records whose group's home building is this key (the town refill's home test) */
 int StoreTownGoneThisLaunch(const std::string& townSid);   /* MAIN THREAD - groups of this town this game deleted since it started */
 std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z, const std::string& kind = std::string(), const std::string& homeKey = std::string());   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set; kind "" / stale / asleep picks the note's id; kind home (T-1099): a note homed at building homeKey */
@@ -154,6 +186,11 @@ bool PlatoonWipe(const std::string& worldId);
 // `ok clearnear wiped=<n> base=<n> kept=<n> (players=<n> runSpawned=<n> notHolder=<n> town=<n>) faults=<n>`.
 // MAIN THREAD.
 std::string ClearNearLever(const std::string& args);
+// T-1385 TEST-ONLY `lentcopytp <units> [waitS]` (command_channel.cpp): the point <units> from this game's newest lent copy
+// that woke here before and now sleeps KEPT (its lend open, asleep, not given back), toward the centre of the copy's own area, so this
+// game's player stands beside it and the copy's spot lies inside this game's wake box. 1 = found (*x, *z the point, *what the copy,
+// its spot and area); 0 = no such copy now. MAIN THREAD.
+int LentCopyKeptAsleepPoint(float units, float* x, float* z, std::string* what);
 // T-1243 TEST-ONLY lever `zonedamage <zone id> before|after <offset> <length>` (src/common/zonecheck.h): the next send of that area
 // record by this game has <length> bytes from <offset> set to zero, before this game's own check (it must refuse the send) or after it
 // (the world server must refuse it). One use per arming. Returns the status line. MAIN THREAD.
@@ -198,8 +235,10 @@ int  StoreLobbyAnswerGen();        /* T552, MAIN THREAD: the link generation the
 long long StoreProfilesPanel(std::vector<StoreProfRow>* rows, unsigned* cap, unsigned* select, std::string* say, int* verdict);   /* the last answer handed to the screen; returns its change number (0 = none yet) */
 int  StoreOpenSaveName(char* out, int cap);   /* PP6 fold-2 F2, MAIN THREAD: SaveFileSystem+0x120, the open save's name (the PP5 redirect's read) - 1 = read into out, 0 = unreadable */
 int  StoreAutoLoadFacts(std::string* folder, int* found, int* quickSave, int* neverPlayed, std::string* profName);   /* T-201 PP6': MAIN THREAD - 1 = the pick is admitted and its folder decided */
-bool StoreSpImportRequest(const std::string& name, const std::string& folder);   /* T-1096, MAIN THREAD: NEW PROFILE with import from a single-player save (PROFILES kind 7); false = not a single-player save or the link is down */
+bool StoreSpImportRequest(const std::string& name, const std::string& folder, unsigned ask = 0);   /* T-1383: ask - the creator's tick boxes (worldhist::kAskDead 1 / kAskRelations 2) */   /* T-1096, MAIN THREAD: NEW PROFILE with import from a single-player save (PROFILES kind 7); false = not a single-player save or the link is down */
 unsigned StoreSpImportWord();   /* T-1096: the last PROFILES answer's import word (spimport::kWord*; 0 = none sent) */
+unsigned StoreSpAnswerGen();    /* T-1383 fold: answers carrying an import word so far */
+bool StoreSpImportReask();      /* T-1383 fold: ask the world again what this player may import (PROFILES kind 8) - false = not sent */
 int  StoreSpImportMoving();   /* T-1096 part 3, MAIN THREAD: 1 while the carry StoreResetCarryMoving reports is an import from single player */
 int  StoreSpImportSaves(std::vector<std::pair<std::string, unsigned long long> >* rows);   /* T-1096, MAIN THREAD: the single-player saves (folder, quick.save FILETIME), newest first */
 int  StoreResetCarryPost(const std::string& folder);   /* T-36 S2, MAIN THREAD: PostLoadChecked(folder), or Kenshi's IMPORT GAME in its place when the pick is carried into the reset world - the same return codes */
@@ -279,6 +318,7 @@ int  StoreMoneyPay(int amount);
 bool StoreMoneyWriteNow(unsigned long long* seq);
 bool StoreMoneyOnDisk(unsigned long long seq);
 bool StoreSendMoney(unsigned type, const std::vector<char>& payload);
+bool StoreSendTrade(const std::vector<char>& payload);   /* T-1167 piece 2: MAIN THREAD - one TRADE up message (src/common/tradewire.h); false = the link is down */
 long StoreMoneyLink();
 // StoreMoneyEdge: a number raised by every WELCOME, link going down and profile pick - what came on the link before it is
 // another WELCOME's. StoreMoneyBaseReads: raised each time the ledger is taken anew (another world load, store or profile).
@@ -287,6 +327,10 @@ long StoreMoneyLink();
 long StoreMoneyEdge();
 long long StoreMoneyBaseReads();
 bool StoreSendWorldRel(const std::vector<char>& payload);   /* par24: MAIN THREAD - an encoded WORLD_REL (SEED or CHANGE) to the notebook; false = the link is down */
+/* T-1383 (F1069): MAIN THREAD - the save's own faction standings (saverel.h) while this world is the one the creator's import with
+   "bring relations" made: 1 = *table holds them (read once per world from the source save's quick.save), 0 = not that world,
+   -1 = that world but the save could not be read (the walk offers today's values). *pairs: the table's size. */
+int StoreCreatorSaveRelations(const std::map<std::string, coopwrel::Row>** table, long long* pairs);
 bool StoreSendTownVer(const std::vector<char>& b);   /* MAIN THREAD - an encoded TOWN_VER WRITE to the world server; false = the link is down */
 bool StoreTownVerLinkUp();                           /* MAIN THREAD - the world-server link is up and speaks this protocol */
 bool StoreSendCamp(const std::vector<char>& b);      /* T-929, MAIN THREAD - an encoded CAMP message to the world server; false = the link is down */
@@ -306,6 +350,25 @@ int StoreSleepersHands(void* platoon, std::vector<std::string>* hands, std::vect
 int StoreIsDeadPod(void* character);        /* par6 fold (review-par6 #3): Character::hasDied under SEH - 1 dead, 0 alive, -1 fault */
 int StoreDeclareDeadPod(void* character);   /* review-p5j HIGH-2, MAIN THREAD: Character::declareDead 0x7A5660 under SEH - the platoonkill lever's own path, now shared with the world-state apply */
 std::string StoreModsRefusal(long long* seq);   // settings5 S5, MAIN THREAD: the player-facing mods refusal ("" = none) and its change number
+// T-247, MAIN THREAD: the last mods REFUSE's login note (coopstore kModsLogin*) and its change number - the JOIN AS ADMIN box's line
+unsigned StoreModsRefusalLogin(long long* seq);
+int StoreModsRefusalLoginWrong();   // T-247, MAIN THREAD: 1 = the last mods REFUSE says the login shown at the door was wrong (or locked out)
+unsigned StoreModsRefusalLockWait(); // T-247 review fold (FIX 2), MAIN THREAD: the login lockout's wait (s) the last mods REFUSE named; 0 = not locked out
+int StoreModsRefusalOrderOnly(coopmods::ModList* world);   // T-1375, MAIN THREAD: 1 = the last mods REFUSE was the same mods in another order; *world = the world's list it carried
+unsigned StoreModsRefusalFlags();    // owner 1703, MAIN THREAD: the last mods REFUSE's flags (playermods kRefuseListed: JOIN AS ADMIN is offered)
+int StoreModsRefusalLoginNotListed(); // owner 1703, MAIN THREAD: 1 = the last mods REFUSE says the admin password was right but this player is not on the admin list
+// T-247 (owner 1692), MAIN THREAD: JOIN AS ADMIN's typed password, shown as the login part of the next door answer ("" = none, the
+// remembered one as before). Memory only, never logged. Remembered for this world like a typed /login when the world server takes it
+// (StoreJoinAdminAnswered, from admin.cpp's RESULT), wiped either way.
+void SetJoinAdminPassword(const std::string& password);
+void StoreJoinAdminAnswered(unsigned code);
+// T-247 review fold (FIX 1), MAIN THREAD: the password is kept only for the world whose mods REFUSE it answers, and wiped at every end of
+// that join attempt - the RESULT, a refused retry, the WELCOME's standing without a login, the title, another world's door.
+void StoreJoinAdminEnded(const char* why);
+// T-247, MAIN THREAD: the world's mod list as PLAYER_MODS last said it on this link (GAME OPTIONS' MODS tab); 0 = none said yet
+int StoreWorldMods(int* haveList, coopmods::ModList* list, std::string* by, std::string* at, unsigned* flags, long long* seq);
+// T-247: the mod list this game's HELLO carried (its own mods)
+const coopmods::ModList& StoreOwnMods();
 int StoreWrongWorldRefusal(std::string* opened, std::string* theirs);   // T-201 N1 fold, MAIN THREAD: 1 = a WELCOME was refused as another world since the last leave
 void StoreLeftAtTitle();                       // T-201 N1, MAIN THREAD: ConfigLeave - the refusal and the profile lobby belong to the link just closed
 /* M11a S1 (store protocol 61; src/common/joinstage.h) - THE WORLD ROAD (every joining game). MAIN THREAD. */
@@ -367,6 +430,7 @@ std::string StoreNetThrottle(const std::string& word);   // T-1168 TEST-ONLY `ne
 int  StoreMySlot();                                      // decision 32: my slot in the relay's order (-1 unknown)
 void OwnGiveSaveArm(const std::string& why);             // T-1135, MAIN THREAD: a character was given or received - the save after character creation's road is armed (it starts as soon as the leave save is wanted)
 void* StoreLookalikeEnsure(const std::string& copySid);  // T-1096 (owner 1234 e), MAIN THREAD: the look-alike record a copy id ('<original id>~i<slot>') names - found, or made from its original; 0 = none
+void* StoreBackLookalike(const std::string& copySid, std::string* why, bool* made);  // T-1021, MAIN THREAD: a bring-back's race look-alike ('<template id>~r<f|m><race id>') found or made now and put on the world's look-alike list; 0 = none (*why)
 void* StoreLookalikeAtBuild(const std::string& copySid); // T-1096, MAIN THREAD: the look-alike a squad member's build needs (worldstate.cpp detour_loadInstance) - found, or made now; 0 = none
 void StoreLookalikeLeftOut(const char* copySid, void* activePlatoon);         // T-1096, ANY THREAD: a member of the build's group (its ActivePlatoon) on this look-alike was left out of its build (counted with its squad; its copy is made at the next tick)
 void StoreLookalikeBuilt(const char* copySid);           // T-1096, ANY THREAD: a member on this look-alike was built - it is no longer left out
@@ -786,5 +850,7 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
 std::string TickWaitToken();
 /* PROBE P113 (T-341): the p113squad lever (store.cpp, end of file) and its 1 Hz tick */
 std::string P113SquadLever(const std::string& args);
+/* T-1429 s10 TEST lever, read-only: squadset [<radius>] - the bound squads near the player and their six settings ([SQSET] lines) */
+std::string StoreSquadSetLever(const std::string& args);
 void P113LeverTick();
 }

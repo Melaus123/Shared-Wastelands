@@ -86,7 +86,7 @@ enum StoreRefuseReason
     kRefuseDuplicateId = 2,   /* that player id is ALREADY connected on another peer - a copied settings file */
     kRefuseFull        = 3,   /* M1 (protocol 43): the notebook already has its limit of games connected; words 4-5 = connected, limit */
     kRefuseLifetimeFull = 4,  /* M1 (protocol 43): this id is new and the world has admitted its lifetime limit of players; word 4 = the limit */
-    kRefuseMods        = 5,  /* settings5 S5 (protocol 46): this game's mod list is not the world's (src/common/modlist.h); words 4-5 are 0 and the world's list follows them. T-246: sent for a differing list only under coopmods::kModsMismatchRefuse (T-247); under the warn default the game is admitted with kModsDiffers */
+    kRefuseMods        = 5,  /* settings5 S5 (protocol 46): this game's mod list is not the world's (src/common/modlist.h); word 4 is the login note (kModsLogin*, protocol 158), word 5 is the login lockout's wait in seconds under kModsLoginLocked (else 0), word 6 the flags (playermods::kRefuseListed, owner 1703), and the world's list follows them (playermods::ModsRefuseTail). T-247: sent under DIFFERENT MODS Rejected to a differing game that is not a proven admin (coopmods::ModsHelloDecideWorld) */
     kRefuseSamePerson  = 6,  /* prof1 (protocol 48): this PERSON already plays in this world (any of their profiles) on a connection that is live right now; words 4-5 are 0 */
     kRefuseLiveProtocol = 7,  /* M11a S1 (protocol 61; manager decision 1(a)): this game's GAME-TO-GAME protocol (the STORE_HELLO's tail, src/common/joinstage.h) differs from the games already in this world; words 4-5 = theirs, this game's. A game that does not know 7 reads it as the protocol refusal, which names the same fix (the same mod version) */
     kRefusePasswordNeeded = 8,  /* the world has a password (auth.txt) and this game showed none - it has no password for this world; words 4-5 are 0 */
@@ -99,6 +99,9 @@ enum StoreRefuseReason
     kRefuseKicked         = 15, /* an admin removed this player from the world (the kick verb); a game that does not know 15 reads it as the protocol refusal */
     kRefuseBanned         = 16  /* this player is in the world's bans.txt (the ban verb, and every later HELLO of that player); a game that does not know 16 reads it as the protocol refusal */
 };
+/* T-247 (owner 1692; protocol 158): a mods REFUSE's fourth word - what a login password shown at the door did, for the JOIN AS ADMIN box */
+/* kModsLoginLocked (T-247 review fold, FIX 2): the login road is locked out for this address - word 5 is the wait (s); the box says /login's own lockout line */
+enum ModsLoginNote { kModsLoginNone = 0, kModsLoginWrong = 1, kModsLoginNotListed = 2, kModsLoginLocked = 3 };
 
 /* A count with thousands commas, so the sentence reads "65,520" as the limit is named everywhere else. */
 inline std::string StoreRefuseCount(unsigned int v)
@@ -252,6 +255,39 @@ inline int TitleRedialDecide(int isClient, int hasDoor, int sockState, long long
     if (sinceDialMs < paceMs) return kTitleRedialWait;
     if (sockState == kSockConnecting && sinceDialMs < connectBudgetMs) return kTitleRedialWait;
     return (dials + 1 >= dialCap) ? kTitleRedialLast : kTitleRedialAgain;
+}
+/* T-1403 (T2520 LEG 1) - A HOSTING GAME DIALS ITS OWN WORLD SERVER AGAIN WHEN THAT SERVER SAYS IT IS LISTENING. The HOST press dials
+   at once (config.cpp ConfigTitleTick's arming), and ENet gives a connect up after about 31.5 s (its CONNECT re-sent at 0.5, 1, 2, 4, 8,
+   16 s; protocol.c enet_protocol_check_timeouts: 1 << (attempts-1) >= ENET_PEER_TIMEOUT_LIMIT 32). The world server opens its port
+   before its record walk but answers nothing until its main loop, so a start-up longer than that left the host's link down for good:
+   TitleRedialDecide above dials again for a joining game only. The event is the server's own "listening" - its start-up progress file
+   removed after the press read a row of it (ui.cpp PressHostProgress -> ConfigHostStartListening; `pending` = 1 from then): a link not
+   answered then (down, failed, or a dial still connecting) gets ONE fresh dial at once; after it, only a link that reads down again
+   before any answer is dialled again, at most `cap` dials since the listening. `pending` ends at the first answer - up at all counts,
+   welcomed, refused in words, or connected and not yet welcomed (a stalled handshake is the late box's, not this) - or when there is
+   nothing to dial. In practice the cap is ONE dial: a failed connect reads down only after ENet's ~31.5 s, later than the press's 30 s
+   late box after the listening, so dials 2 and 3 are a bound, not a road. kHostListenDial: dial now; kHostListenDone: clear `pending`. */
+enum HostListenDialAction { kHostListenNone = 0, kHostListenDial = 1, kHostListenDone = 2 };
+/* the listening is taken once per press: not while one is pending, nor after a dial was made for one (a new press / leave clears both) */
+inline int HostListenArm(int pending, long long dials) { return (pending == 0 && dials == 0) ? 1 : 0; }
+inline int HostListenDialDecide(int isHost, int hasDoor, int pending, int sockState, long long dials, long long cap)
+{
+    if (!pending) return kHostListenNone;
+    if (!isHost || !hasDoor || cap <= 0) return kHostListenDone;
+    if (sockState != kSockDownOrFailed && sockState != kSockConnecting) return kHostListenDone;   /* the world server answered */
+    if (dials == 0) return kHostListenDial;                      /* it listens now: a fresh dial, whatever the press's dial is doing */
+    if (sockState == kSockConnecting) return kHostListenNone;    /* that dial is in flight */
+    return (dials < cap) ? kHostListenDial : kHostListenDone;    /* down again before any answer */
+}
+/* T-247 (T2420, B's third life): A MODS REFUSAL IS AN ANSWER. The world server says no in words and then closes the link, so the link
+   reads down and the title re-dial took it for silence: it dialled 12 more times, was refused 12 more times, and then logged that the
+   world server "did not answer". Dialling again gets the same answer until the player acts (a JOIN press, JOIN AS ADMIN, leaving -
+   each starts from ConfigLeave, which clears the refusal). So the title re-dial reads the link as refused in words while the last
+   refusal on it is the mods one (refusedReason: StoreRefusedReason(), -1 none). Other refusals keep their own handling: the password
+   and access ones already read as refused (StoreLinkSockState), a full world keeps dialling by design. */
+inline int TitleRedialSock(int sockState, int refusedReason)
+{
+    return (refusedReason == (int)kRefuseMods) ? (int)kSockUpRefused : sockState;
 }
 
 /* CAN THE WORLD-SERVER LINK STILL DELIVER A WELCOME? Yes while it is connecting (ENet may still get an answer), up with the

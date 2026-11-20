@@ -340,6 +340,7 @@ void ForgetEmptiedCopySquad(void* oldActive)
 }
 
 // Hire on the game that runs the person (design step 2, and the lever's positive control). MAIN THREAD, K2.
+unsigned int g_hireLastHiredUid = 0;   /* T-1398 TEST-ONLY aim: the person the newest own hire (hiretest's road too) took into this game's player faction - the uid on its `own hire .. joined=1` line (renametest <name> hired) */
 void LocalHire(unsigned int uid, ::Character* person, ::Character* hirer, unsigned int hirerUid, int price, int joinType)
 {
     if (OwnedVerdict(person) != recruitguard::kRecruitAllow)
@@ -369,6 +370,7 @@ void LocalHire(unsigned int uid, ::Character* person, ::Character* hirer, unsign
     const bool joined = rec == 1 && IsPlayerFaction(FactionOfPod(person));
     DebugLog("[HIRE] own hire uid=" + N(uid) + " recruit=" + N(rec) + " paid=" + N(paid == 1 ? price : 0) + " joined=" + N(joined ? 1 : 0)
              + " (this game runs the person: vanilla, no ownership moves)");
+    if (joined) g_hireLastHiredUid = uid;   /* T-1398 TEST-ONLY: renametest <name> hired */
     if (joined) SendDone(net::kHireNoAsker, 0, uid, hirerUid, 0, 1);   // the other game re-files its copy (G3)
 }
 
@@ -3297,5 +3299,6 @@ void SplitSquadDrain()
 }
 
 unsigned int HireLastBoughtUid() { return g_buyLastUid; }
+unsigned int HireLastHiredUid() { return g_hireLastHiredUid; }   /* T-1398 TEST-ONLY: renametest <name> hired */
 
 } // namespace coop

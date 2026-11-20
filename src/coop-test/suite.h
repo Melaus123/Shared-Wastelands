@@ -24,6 +24,9 @@
 #include "addrhooked.h"  /* rk1: a call-only row another mod has hooked - accepted or refused */
 #include "sigtable.h"    /* T-63 stage 7: every address row by its byte pattern when no table matches */
 #include "modlist.h"   /* settings5 S5: the mod list, its diff and its words */
+#include "playermods.h"   /* T-938 / T-247: PLAYER_MODS */
+#include "admincmd.h"   /* T-247: USE MY MODS is admin verb 21 */
+#include "rulesfile.h"   /* T-247: DIFFERENT MODS in rules.txt */
 #include "storelink.h"   /* B10-b (review-b10 M-3 / M-7): the store link's two pure decisions */
 #include "queuejournal.h"   /* B12 (decision 52): the outage queue's conflict rule and its journal line */
 #include "writerladder.h"
@@ -253,6 +256,8 @@
 #include "corpsedecay.h"   /* T-653: a copy's dead body is held short of the rot limit; its owner decides */
 #include "spawnpace.h"   /* T-599: copies made under a frame budget, in arrival order */
 #include "fontguard.h"   /* T-730: the font guard - MyGUI's getFontName body, the jumps to it, the empty name */
+#include "writefail.h"   /* T-1028 (log only): why a store write failed, in words */
+#include "zonediff.h"    /* T-1351 (owner 1664): what differs between a refused save of an area and the newest saved copy - log only */
 #include "zonekeep.h"    /* RESET WORLD's kept pieces: the area record container, the players' pieces, the kept list (and poskey.h) */
 #include "keptwire.h"    /* KEPT: the kept pieces laid back - the wire, the row state and both sides' decisions */
 #include "townkeep.h"    /* TOWNS: the players' outposts carried into a reset world */
@@ -281,6 +286,7 @@
 #include "shoprec.h"   /* one shop building's restock state as one world-server record, and the restock gate's rules */
 #include "setupstock.h"   /* a shop's set-up restock and a keeper's unknown money when the counters hold the world server's stock */
 #include "windowbound.h"   /* T-986 (drift bound): the native combat window's distance bound */
+#include "windowfollow.h"   /* T-1422 fix 2: the native combat window's 3D route follow step */
 #include "townmove.h"   /* T-924 fault 2: a teammate's outpost copy moved to the sent centre */
 #include "squadsplit.h"   /* T-948 b: a squad of copies is not split; a copy is not moved to a new squad */
 #include "sameidpair.h"   /* T-1097: one live platoon per world squad id - the same-id copy yield, its twin step and the pair guard */
@@ -331,7 +337,7 @@ void GearTabFields(const std::string& s, std::vector<std::string>* f);
 void Mmo2PutKeyI(coopown::PodBuf* b, const char* k, int v);
 void T802Rec(std::vector<char>* v, int type, const std::string& sid, int handS, int charCount, const std::vector<std::string>& refs,
              const std::vector<std::string>& targets, const std::vector<std::vector<std::string> >& states, const char* handPrefix = 0, int handTo = 0,
-             const int* money = 0);
+             const int* money = 0, const float* anchor = 0, const float* anchorSpot = 0, const coopown::RecSettings* set = 0);
 std::vector<char> T802Squad(bool withA, bool withB, int charCount, bool shareItem, bool listA, int variant = 0);
 
 /* suite_part4.cpp */
@@ -529,6 +535,7 @@ void t_t296_state_wake_decide();
 void t_addr_pattern_refusal_clears_every_slot();
 void t_rk1_addr_hooked_call_only_verdict();
 void t_rk1_addr_uses_all_call_only();
+void t_t1447_addr_hook_chain();
 void t_addr_signatures_resolve_every_kind_and_refuse_anything_less();
 void t_addr_fingerprint_is_the_four_numbers_and_a_bad_header_writes_nothing();
 void t_addr_table_parser_reads_every_kind_and_names_what_it_refuses();
@@ -823,6 +830,7 @@ void t_w3_a_game_confirms_adopts_or_refuses_the_notebooks_world();
 void t_t318_plugin_rows();
 void t_settings5_mod_check();
 void t_t246_mods_warn_and_admit();
+void t_t247_world_list();
 void t_t246_fold_notice();
 void t_settings5_fold_operator_only_and_recheck();
 void t_loot2d_retract_reasons();
@@ -866,6 +874,7 @@ void t_t251p2_created_save();
 void t_mmo8a_build_record();
 void t_ui5_panel_screens();
 void t_n1_press();
+void t1403_start_progress();
 void t_m11flip_world_door_press_and_redial();
 void t_reset_world_panel();
 void t_t810_money_fold();
@@ -956,6 +965,7 @@ void t_sneak_copy_action();
 void t_crawl1_goal_name();
 void t_installer1_pcfg_add_remove();
 void t_installer1_steam_paths();
+void t_t1364_copy_needed();
 void t_mig6_marker_parse();
 void t_mig6_modscfg_lists();
 void t_t522_modscfg_after_ok();
@@ -1406,6 +1416,7 @@ void t_t651_crash_launch();
 void t_t651_earlier_log_order();
 void t_t461_nearby_messages();
 void t_t461_answer_manners();
+void t_t1401b_nearby_reply();   /* T-1401 step 2b: LOG_REPLY, the asked game's queue, the wait and the note */
 void t_t53_upnp_text_and_start();
 void t_t1158_router_owner();
 void t_t53_routerport_cfg_key();
@@ -1593,6 +1604,7 @@ void t_t595_fresh_sample();
 void t_t596_first_sighting();
 void t_t596_key_sector();
 void t_t1141_door_events();
+void t_t36p_owner_kept_match();
 void t_t596_gen_forget();
 void t_t596_giveup_rearm();
 void t_t596_held_evict();
@@ -1773,6 +1785,7 @@ void t_t799_keeper_repair();
 void t_t801_sell_no_room();
 void t_t799_money_load_rule();
 void t_t799_record_money();
+void t_t1385_record_anchor();
 void t_t799_holder_restock();
 void t_t799_money_list();
 void t_t805_dismantle_gate();
@@ -1856,6 +1869,8 @@ void t_t609_area_holder_rule();
 void t_t609_zone_recv_holder();
 void t_t609_held_sender();
 void t_t609_zone_kept_adopt();
+void t_t1351_landed_time_sets();
+void t_t1351_refused_diff_line();
 void t_t609_gone_guard();
 void t_t923_build_near_town();
 void t_t923_town_pick_takes_mate();
@@ -1888,6 +1903,8 @@ void t_t1018_setup_restock();
 void t_t1018_keeper_unknown_money();
 void t_t986_window_drift_bound();
 void t_t986f1_close_kind();
+void t_t1422_window_follow_step();   /* T-1422 fix 2: the window follow's 3D step toward the replayed route */
+void t_t1422_window_floor_step();   /* T-1422 fix 3: the window step's floor (found / held / plain), its line rule and wiring */
 void t_t937_kept_town_choice();
 void t_t985c1_mirror_name();
 void t_t985c1_table_round_trip();
@@ -1990,6 +2007,7 @@ void t_t1061_wiring();
 void t_t860_cage_record();
 void t_t860_cage_decide();
 void t_t860_cage_wiring();
+void t_t1296_freed_take_out();   /* T-1296 */
 void t_t1333_bldg_record();   /* T-1333 */
 void t_t1333_bldg_decide();
 void t_t1333_bldg_wiring();
@@ -1998,6 +2016,8 @@ void t_t1333_fold1();   /* T-1333 fold 1 (the review's A-E) */
 void t_t1333_door_health();   /* T-1333 fold 3 (owner 1083 a): a town door's health */
 void t_t1333_fold4();   /* T-1333 fold 4: the fold 3 review's MED 1 / LOW 2 / LOW 3 */
 void t_t1178_origin_spot();   /* T-1178: an own spot at the world origin is not a 'not held' answer */
+void t_t1303_mark_list();   /* T-1303: the om3 mark's list, the overlay rule's branches, no mark -> the played flag */
+void t_t1303_rebuild();   /* T-1303 item (2): the head fill, the rebuild decision, the roster with the rebuilt squad, the wiring */
 void t_t1333_fold2();   /* T-1333 fold 2 (the re-check: one road, kept hits per wall, laid after the lay) */
 void t_t1122_roller_rule();     /* T-1122 roller (owner 1577 c) */
 void t_t1122_roller_wiring();
@@ -2024,7 +2044,19 @@ void t_t1077_wiring();   /* T-1077: TcHover's copy filter, the NPC's game's full
 void t_t1187_hold_end();   /* T-1187: the end waits for any held line (as TkHoldEndFor calls it); which held lines a lost answer or a run that did not happen lists as unrun */
 void t_t1235_wander_line();   /* T-1235: the [SPAWN] wander line's distances, cap and wandering-call test, and its wiring in towngen.cpp */
 void t_t1235_keepaway();   /* T-1235 (owner 1478 b): a new wandering group kept 1382.4 on the ground from every live player character and out of other players' bases; the stale snapshot refuses; its wiring */
+void t_cursorpiece_y();   /* T-1343 / T-1388: `buildtest cursor` puts its test piece at the floor when a building stands at the character's height (0x9B1CD0), else the ground (buildnear::CursorPieceY) */
 void t_cursorjoin_confirm();   /* T-1122 (effort cursorjoin): `buildtest cursor .. commit` runs the placement confirm 0x4DA6F0's own steps (town pick 0x4D6300, region add, group step) before the commit, and leaves the list's state 2 */
+void t_t1408_chain();   /* T-1408: the TEST-ONLY `buildtest cursor <sid> chain <wall|last>` lever - its checks, the end read, the turn before the move, the rows */
+void t_t1408_chainend();   /* T-1408 chain fold: the chain lever's free end and heading, both orientations; forward across the seam */
+void t_t1408_fold8();   /* T-1408 fold 8 (F1291): one queue turn per wall group, winner first; owed steps decided with the group; help behind records; lowering work's own stamp */
+void t_t1408_fold10();   /* T-1408 fold 10 (F1331, F1304, F1312): a member's change is its group's, progress kept in range, a grouped copy's ruin puts the group back, work past a rebuild, group lines' cap, siblings lowered by the hit's size, a waiting turn takes no slot, a short group not whole, a refused repair's job ended */
+void t_t1408_fold14();   /* T-1408 fold 14 (F1429): a copy's help baseline follows the materials record it reads - grouped members' writes, a delivery counted once, join / leave */
+void t_t1408_fold13();   /* T-1408 fold 13 (F1418 / F1419): wall groups shared from the owner - the group fact, the held engine join, the join order, the lead copy's progress */
+void t_t1408_fold9();   /* T-1408 fold 9 (F1296): help behind a loading area list, an unfinished winner ended, a hit lowers the helper copies' group, owed steps per member area whatever the link, each record's retry gap in a group turn */
+void t_t1408_fold7();   /* T-1408 fold 7 (F1283): the owner's load adopts a record's stamp (no step), newest first, ties by the higher share, owed steps */
+void t_t1408_fold6();   /* T-1408: a wall group's progress carries one group step stamp in every record; the newest stamp wins at the owner's apply; holds end on real events */
+void t_t1408_heldresend();   /* T-1408 fold 3: a re-send of parked (HELD) help work keeps the held state; the later apply sends released */
+void t_t1408_wallhelp();   /* T-1408: help on a grouped wall copy - the order rows, the member share redraw, the owner's wall step wiring */
 void t_t1240_cursor_commit();   /* T-1240: `buildtest cursor ... commit` - the commit word, the click's own refusal checks in its order (the engine's texts), the place-then-PlacementCommit wiring */
 void t_t1187_wiring();   /* T-1187: TkHoldEndFor's decision, the unrun list and cap drop through TalkHoldMayListUnrun, the fold-2 note, the held run's [TALK] line */
 void t_t1130_plainkind_lever();   /* T-1130 TEST-ONLY boxtest plainkind: the plan (shop, nobody's, no undos), the world server takes both kind changes, the arm's window */
@@ -2034,6 +2066,7 @@ void t_t860_act_owed_cases();   /* T-860 fold 1: two opposite acts, a refusal, a
 void t_t860_act_owed_step();    /* T-860: settled / resent once / ended from the owner's STATEs, no clock */
 void t_t860_act_owed_wiring();  /* T-860: the note, the judge, the binding, the clears, the counter and line in the sources */
 void t_t1078_town_mismatch();   /* T-1078: the [BUILD] town mismatch decision, its link word, the session cap, once per piece per state; the line's sites in build.cpp */
+void t_t36_piece_material();   /* T-36 (F1186): the [PIECECHECK] material verdict by each part's own set (own / +0x248 / default / unread); its wiring */
 
 }   /* namespace suite */
 

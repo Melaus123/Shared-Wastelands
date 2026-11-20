@@ -12,6 +12,7 @@
 #include <set>
 #include <vector>
 #include "../common/limbwire.h"   /* LIMBS: the limb block and the copy's plan per limb */
+#include "../common/limbevent.h"   /* T-1442 step 2: the amputate hook's note list and the drain's rule */
 #include <map>   /* LIMBS: the copy limbs whose owner sid made no item here */
 #include "store.h"   /* LIMBS: EngineWritesBlocked, StoreIsDeadPod */
 #include "policy.h"   /* LIMBS: PolicyVtableRvaPod / PolicyClassNamePod - the made limb item's RTTI class */
@@ -633,7 +634,9 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
         }
         ++created;
         /* T-1119 (F-T2356-COLOURDROP): the maker ignores the record's "color sid" - the holder's colour goes on as the engine's loader puts it */
-        if (haveDetail) coop::ItemColourApplyTo((void*)item, set.details[i].colorSid);
+        if (haveDetail) coop::ItemColourApplyTo((void*)item, set.details[i].colorSid, (void*)c);
+        if (i >= set.sections.size() || IsWornSection(set.sections[i]))   /* T-1413: a garment's [COLOUR] line - log only */
+            coop::ItemColourKitSay((void*)item, haveDetail ? &set.details[i].colorSid : 0, (void*)c);
 
         /* quality1: the owner's quality, charges, stack size, item function and unique flag, written onto the fresh item
            before it enters the inventory (the fields ItCreateItem writes for a live move with setFields=1). The add below is
@@ -1210,8 +1213,9 @@ void LimbOwnWatchTick()
         if (ReadLimbsPod(c, st, it) < 0) continue;
         const unsigned long long sig = LimbSignature(st, it);
         std::map<unsigned int, unsigned long long>::iterator k = s_limbOwnSig.find(uid);
-        if (k == s_limbOwnSig.end()) { s_limbOwnSig[uid] = sig; continue; }
-        if (k->second == sig) continue;
+        const int says = cooplimbev::LimbWatchSays(k != s_limbOwnSig.end() ? 1 : 0, k != s_limbOwnSig.end() ? k->second : 0, sig);
+        if (says == cooplimbev::kWatchFirstSight) { s_limbOwnSig[uid] = sig; continue; }
+        if (says == cooplimbev::kWatchSilent) continue;
         k->second = sig;
         const bool sent = StatePush(uid);
         if (sent) ++g_limbOwnPushed;
@@ -1220,6 +1224,53 @@ void LimbOwnWatchTick()
                      + " (first 16 logged)");
     }
     s_limbOwnCursor = (s_limbOwnCursor + n) % mine.size();
+}
+
+/* T-1442 step 2 (F1427 design B): A LOST LIMB GOES OUT AT THE AMPUTATION. detour_limbAmputate's owner branch notes the uid in
+   g_limbEvNotes after the engine's amputate returns (any thread; limbevent.h); here, every frame on the MAIN THREAD, each noted uid
+   still this game's and spawned is read as the watch reads it, and a fingerprint that differs from the watch's (s_limbOwnSig) is
+   pushed with the watch's own StatePush and stored there, so the watch finds it unchanged and does not send it twice. The watch is
+   unchanged: it stays the road for a robotic limb fitted / taken off and the /restore regrow, and the backstop for an overflow. */
+cooplimbev::LimbEvTable g_limbEvNotes;   /* zero-initialised static: empty */
+long long g_limbEvPushed = 0, g_limbEvUnchanged = 0, g_limbEvGone = 0, g_limbEvNotSent = 0, g_limbEvLogged = 0, g_limbEvNoRoad = 0;
+static std::string LimbStatesText(const int* st)
+{
+    std::string t;
+    for (unsigned int i = 0; i < cooplimb::kLimbCount; ++i) { if (i != 0) t += ","; t += S((long long)st[i]); }
+    return t;
+}
+void LimbEventDrainTick()
+{
+    if (g_limbEvNotes.pending == 0) return;   /* the every-frame fast path: one load */
+    unsigned int got[cooplimbev::kLimbEvSlots];
+    const int n = cooplimbev::LimbEvDrain(&g_limbEvNotes, got, (int)cooplimbev::kLimbEvSlots);
+    /* fold 2b: no road to another player (single player, or the link down): nothing to send - counted, not logged (solo fights would
+       spend the line cap); OwnedUidCount is 0 exactly when no road carries the characters (session.cpp CharRoadOpen) */
+    if (n > 0 && net::OwnedUidCount() == 0) { g_limbEvNoRoad += n; return; }
+    for (int j = 0; j < n; ++j)
+    {
+        const unsigned int uid = got[j];
+        const int mine = net::IsUidMine(uid) ? 1 : 0;
+        ::Character* c = mine ? FindSpawned(uid) : 0;
+        int st[cooplimb::kLimbCount] = { 0, 0, 0, 0 }; void* it[cooplimb::kLimbCount] = { 0, 0, 0, 0 };
+        const int readOk = (c != 0 && ReadLimbsPod(c, st, it) >= 0) ? 1 : 0;
+        const unsigned long long sig = readOk ? LimbSignature(st, it) : 0;
+        std::map<unsigned int, unsigned long long>::iterator k = s_limbOwnSig.find(uid);
+        const int have = (k != s_limbOwnSig.end()) ? 1 : 0;
+        const int v = cooplimbev::LimbEvVerdict(mine && c != 0, readOk, have, have ? k->second : 0, sig);
+        if (v == cooplimbev::kEvGone) { ++g_limbEvGone; continue; }
+        if (v == cooplimbev::kEvUnchanged) { ++g_limbEvUnchanged; continue; }
+        const bool sent = StatePush(uid);
+        if (cooplimbev::LimbEvStores(v, sent ? 1 : 0)) s_limbOwnSig[uid] = sig;
+        if (sent) ++g_limbEvPushed; else ++g_limbEvNotSent;
+        if (++g_limbEvLogged <= cooplimbev::kLimbEvLogCap)
+            DebugLog("[LIMBS] event uid=" + S((long long)uid) + " limbs now=" + LimbStatesText(st) + " (watch "
+                     + (have ? "had another fingerprint" : "had not seen it yet") + ") - STATE "
+                     + (sent ? "pushed at the amputation"
+                             : (have ? "NOT pushed (the watch keeps its old fingerprint and sends it on its next look)"
+                                     : "NOT pushed (the watch's first look records it without sending; the periodic STATE refresh carries it)"))
+                     + " (line " + S(g_limbEvLogged) + " of " + S(cooplimbev::kLimbEvLogCap) + ")");
+    }
 }
 
 /* The owner's latest limb block per copy uid, recorded by OnState and applied by LimbSafePointDrain. A newer STATE
@@ -1286,6 +1337,7 @@ void LimbsForgetUid(unsigned int uid)
 void LimbsWorldTeardown()
 {
     s_limbOwnSig.clear();
+    cooplimbev::LimbEvReset(&g_limbEvNotes);   /* T-1442 step 2: notes of the old world are not drained into the next */
     s_limbOwnCursor = 0;
     g_limbForgot += (long long)s_limbWant.size();
     s_limbWant.clear();
@@ -1868,6 +1920,7 @@ void detour_limbAmputate(void* med, int limb, bool createSeveredItem, const floa
 {
     const void* who = (med != 0) ? *(void* const*)((const char*)med + kLimbMedOwner) : 0;
     const unsigned int uid = (who != 0) ? FindSpawnedUid(who) : 0;
+    bool noteOwn = false;   /* T-1442 step 2: this game's own character (not /god, not the mod's apply onto a copy) */
     if (uid != 0 && !net::IsUidMineAnyThread(uid))
     {
         if (g_limbApplyThread == 0 || g_limbApplyThread != (LONG)::GetCurrentThreadId())
@@ -1878,8 +1931,11 @@ void detour_limbAmputate(void* med, int limb, bool createSeveredItem, const floa
         InterlockedIncrement64(&g_copyAmputateApplying);
     }
     else if (uid != 0 && GodOn(uid)) { InterlockedIncrement64(&g_godAmputateRefused); return; }   /* T-1205 /god: no lost limbs */
-    else InterlockedIncrement64(&g_copyAmputatePassed);
+    else { InterlockedIncrement64(&g_copyAmputatePassed); noteOwn = (uid != 0); }
     orig_limbAmputate(med, limb, createSeveredItem, force);
+    /* T-1442 step 2: after the original - the new limb state exists only now. Interlocked only (limbevent.h); the main thread's
+       LimbEventDrainTick sends the STATE next frame. */
+    if (noteOwn) cooplimbev::LimbEvAdd(&g_limbEvNotes, uid);
 }
 
 void InstallCopyAmputateGate()
@@ -1902,6 +1958,9 @@ static void ReportLimbCounters()
              + S(g_limbNoCopy) + "," + S(g_limbDeferredRebuild)
              + " deferred[carrying,writerChanged]=" + S(g_limbDeferredCarry) + "," + S(g_limbWriterChanged) + " fitFaultKept=" + S(g_limbFitFaultKept)
              + " ownPushed=" + S(g_limbOwnPushed)
+             + " event[noted,already,overflow,pushed,unchanged,gone,notSent,noRoad]=" + S((long long)g_limbEvNotes.noted) + ","
+             + S((long long)g_limbEvNotes.already) + "," + S((long long)g_limbEvNotes.overflow) + "," + S(g_limbEvPushed) + ","
+             + S(g_limbEvUnchanged) + "," + S(g_limbEvGone) + "," + S(g_limbEvNotSent) + "," + S(g_limbEvNoRoad)
              + " applied[amputated,unfitted,fitted]=" + S(g_limbAmputated) + "," + S(g_limbUnfitted) + "," + S(g_limbFitted)
              + " failed[fitUnresolved,fitKnownBad,callFault,noRow,noEffect,itemDestroyFault]=" + S(g_limbFitUnresolved) + ","
              + S(g_limbFitKnownBad) + "," + S(g_limbCallFault) + "," + S(g_limbNoRow) + "," + S(g_limbNoEffect) + "," + S(g_limbItemDestroyFault)

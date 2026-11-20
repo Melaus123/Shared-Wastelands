@@ -1330,6 +1330,14 @@ std::string TeamCommand(const std::string& args)
         if (slot < 0 || slot > 4095) return "error team orders usage: team orders <slot> (the engine's order decisions on this game's own character and on that player's)";
         return PolicyTeamOrders((int)slot);
     }
+    if (sub == "invitemenu")   /* T-1406 TEST-ONLY: the right-click menu's 'Invite to faction' on that player's character, built and (click) taken */
+    {
+        std::string what, how; is >> what >> how;
+        long long slot = -1;
+        if (what != "npc") { std::istringstream ws(what); if (!(ws >> slot)) slot = -1; if (slot < 0 || slot > 4095) slot = -2; }
+        if (slot == -2 || (!how.empty() && how != "click")) return "error team invitemenu usage: team invitemenu <slot>|npc [click]";
+        return PolicyInviteMenuTest((int)slot, how == "click");
+    }
     if (sub == "research")
     {
         std::string what, sid; is >> what >> sid;

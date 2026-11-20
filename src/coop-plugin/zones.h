@@ -92,6 +92,11 @@ int SectorHoldersTS(const Sector& s, unsigned* words, int n);
 /* P97 (p97-zonesh, owner 334 a / 337 a): F666's bounded no-map wait is RETIRED - with no fresh area map every
    gate refuses on every game until the map is back. */
 void ZonesInitLocks();
+/* T-1442 step 1b (F1421): the area update hook 0xA0A960 (preload, main thread; logs its state) and the unload hook's mark (items.cpp
+   detour_zoneDeactivate, ANY THREAD - two interlocked writes): the area report is owed and ZonesTick sends it at its next run */
+void InstallZonesAreaUpdate();
+void ZonesAreaUnloadBegin();   /* fold 1b-3: at the unload hook's entry - the event (unnamed outside the area update) and the unload in flight */
+void ZonesAreaUnloadEnd();     /* fold 1b-3: at the unload hook's return (both arms' __finally) */
 /* P6j (verify-p6c HIGH-2): MAIN THREAD - the notebook process's player-sector table and its clock, dropped. Called
    at link-down beside the slot reset, because the table is that link's numbering: the relay broadcasts every row to
    every game INCLUDING the one that wrote it, and once this game has no slot of its own it can no longer recognise
@@ -183,6 +188,8 @@ int ZoneMapOfSectorPod(int sx, int sy, void** zone, int* rx, int* ry);
 int EngineKeepsHere(float x, float z);
 void ZoneBuildingsGateRefusals(long long* offMain, long long* noZm);   /* mmo8a3: ZoneBuildingsInHereTri's -1s off the main thread / with no ZoneManager */
 Sector MyPlayerSector();
+Sector MyLastPlayerSector();   /* T-1402, MAIN THREAD: the player's square as last seen this launch - kept after the world closes (-1,-1 = none yet); a bug report's stored square */
+void ForgetLastPlayerSector();   /* T-1402 fold 4, MAIN THREAD: the store's folders now name another world (store.cpp SetStoreDirsFor) - the last square is -1,-1 until this world's first tick */
 // PROBE-START: P119 - MAIN THREAD: the engine's activation text for a sector; the distance to the nearest sector this game has not loaded
 std::string P119ZoneText(int sx, int sy);
 float P119EdgeDist(float x, float z);

@@ -57,8 +57,8 @@ void TalkWindowBeforeRemove(void* c);
    modRemoval 1): an open trade window whose trader is obj closes first, while obj is whole (src/common/tradewinguard.h).
    reason: the engine's debug string, for the line. MAIN THREAD acts; elsewhere the safe point's check closes it. */
 void TradeWindowBeforeDestroy(void* obj, int unload, int modRemoval, const char* reason);
-/* T-978 (owner 1445 a, C): 1 = this game's conversation window shows a conversation now; store.cpp's ClockTick polls it for the
-   Slowest wins pause vote (src/common/clockmath.h MenuPauseNoteTalkWindow). Any thread. */
+/* T-978 (owner 1445 a): 1 = this game's conversation window shows a conversation now (hire.cpp's NotMine line reads it; since
+   T-1386 nothing votes pause from it). Any thread. */
 int TalkWindowOpenNow();
 /* T-978 A (owner 1445 a): the frozen NPC's hold goes when the engine destroys it (spawn.cpp NotifyDespawn), and the slot is forgotten
    at the world teardown (store.cpp, beside AiSpikeWorldTeardown). MAIN THREAD. */
@@ -90,7 +90,11 @@ std::string TalkCarriersCommand(float x, float z, float radius);
    name; 0 = none (*why says so in words). T-1218: only when exactly ONE such character is within maxDist, or nameKey ends in
    `#<k>` (the k-th nearest); several -> 0 with *why = the refusal naming the count and the five nearest (leverpick.h). */
 const int kLeverPickOwnLiving = 0, kLeverPickAny = 1, kLeverPickDowned = 2, kLeverPickDead = 3;
+/* T-1422 TEST-ONLY (koself name .. near): kLeverPickOwnLiving that also skips one already down (prone or ragdoll), so a second
+   call near the same spot picks a guard still standing. */
+const int kLeverPickOwnStanding = 4;
 std::string TalkCarriersActCommand(float x, float z, float radius, int ev, int act);
+std::string AnnounceArm(const std::string& arg);   /* T-1379 TEST-ONLY lever `announce` (speech.cpp) - command channel, MAIN THREAD */
 ::Character* LeverNearestNamed(const std::string& nameKey, int pick, ::Character* from, float maxDist, unsigned int* uid, float* dist,
                                std::string* name, std::string* why);
 int TalkNearPoint(const std::string& arg, float* x, float* z, std::string* why);

@@ -46,4 +46,5 @@ std::string PathNextToDll(const char* filename);
 // P008 (defined in coop.cpp): flip the engine's world-wide AI freeze flag (F064).
 bool SetWorldAIFreeze(bool on);
 
+void ReportEverythingForReport();   /* T-1401: every REPORT counter set, for a bug report (command_channel.cpp). MAIN THREAD */
 } // namespace coop

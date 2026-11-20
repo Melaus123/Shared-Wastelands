@@ -155,16 +155,19 @@ inline bool NodeTakeClearsStealing(int engineAnswer, int nodeA, int whoA, int no
      a box, or a character DOWN or carried (the engine's own test there, Character_inRagdoll 0x7D08A0, decomp_790d00.txt:61):
          never a shop window - a loot window (2); the owner test at 0x790DD8 gives a teammate's / allowed friend's the free flags
          (no stealing label), anyone else's shows stealing (no crime between players);
-     an AWAKE character: a teammate's / allowed friend's opens as this player's own (2, free flags); anyone else's opens NO window
-         (kNoWindow: the call is skipped - pickpocketing is the game's own road, not this one).
+     an AWAKE character (T-1167, owner 1633 / 1634: one trade system for every player, teammates included - T-942's teammate
+         "like own" window is retired): the engine's window is never opened (kTradeWin: the call is skipped); the caller's
+         divert opens the mod's TRADE window when the player trade's own checks pass (policy.cpp TradeDivertAwake), else no window
+         (kNoWindow; pickpocketing is the game's own road, not this one).
    Every other owner keeps the caller's choice. */
 const int kTradeNever = 2;
 const int kNoWindow = -1;
+const int kTradeWin = -2;
 inline int WindowFor(int who, bool character, bool downOrCarried, int mode)
 {
     if (who != kTeam && who != kFriendAllowed && who != kFriendRefused && who != kStranger) return mode;
     if (!character || downOrCarried) return kTradeNever;
-    return LikeOwn(who) ? kTradeNever : kNoWindow;
+    return kTradeWin;
 }
 
 /* the counter a judged move is added to: 0 team, 1 friend (allowed), 2 friend refused, 3 stranger, -1 none (own, not a player) */

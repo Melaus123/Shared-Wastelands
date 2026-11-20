@@ -30,4 +30,11 @@ void TagsSetLift(float lift);
 // world and again on each of its tick boxes. A part switched off is left out; all three off hides the tag. Every tag is built again.
 void TagPartsSet(bool player, bool character, bool faction);
 std::string TagsReportLine();   // "[TAGS] REPORT ..."
+// T-1393 (ping.cpp), MAIN THREAD, after the engine loop: a world point on the screen as the labels place theirs. 1 = projected
+// (*sx, *sy pixels), 0 = behind the camera or off the screen, -1 = not readable; *vx, *vy, *vz = its view-space position (>= 0).
+int TagsScreenSpot(float x, float y, float z, float* sx, float* sy, float* vx, float* vy, float* vz);
+// T-1393: the scene's relative origin (Ogre's camera space is the world less it). false = not readable now.
+bool TagsSceneOrigin(float* ox, float* oy, float* oz);
+// T-1393: the game's "the interface is shown" byte the labels obey: 1 shown, 0 hidden, -1 not readable.
+int TagsInterfaceShown();
 }

@@ -67,4 +67,7 @@ int  PieceRecFarmNote(const std::string& key, void* piece, float growth, float d
 // MAIN THREAD (defined beside it; FarmDrain's FARM apply): 1 = the stored piece record of the farm at the key carries its crop (a fact
 // every game shares) - its crop comes from that record alone; 0 = not (no record, or no crop in it yet, or a single-player world)
 int  PieceRecFarmIsPlayer(const std::string& key);
+// T-1361 (F1083) LOG ONLY, MAIN THREAD (defined beside it; FarmTick's [FARM] state line): the stored piece record of the farm at key -
+// 1 = a player farm (PieceRecFarmIsPlayer's test) with *ownerSlot, *gen and *recGrown (its record's crop growth) and *mySlot set; 0 = not
+int  PieceRecFarmStateOf(const std::string& key, int* ownerSlot, unsigned int* gen, float* recGrown, int* mySlot);
 }

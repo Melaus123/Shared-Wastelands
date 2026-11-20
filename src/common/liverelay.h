@@ -228,14 +228,22 @@ const unsigned int kInnerChat = 205;
    teammate, every one route SLOT (src/common/mapdots.h). Read by the receiving game's store layer and handed to mapdots.cpp;
    it touches no engine state. */
 const unsigned int kInnerMapDots = 206;
+/* T-1393 (game-to-game protocol 233; owner 1725 / 1726 a / 1728): a ping - one spot in the world or on the map, route SLOT to each
+   online teammate (src/common/pingwire.h). Read by the receiving game's store layer and handed to ping.cpp; it touches no engine state. */
+const unsigned int kInnerSpotPing = 207;
+/* T-1401 step 2b (game-to-game protocol 232; owner 1741 b): LOG_REPLY - an asked game's at-once answer to a LOG_ASK (sending, or not
+   and why), route SLOT back to the asker (src/common/bugreport.h). Read by the receiving game's store layer and handed to
+   bugreport.cpp; it touches no engine state. (208, not 207: effort/t1393a's SPOT_PING takes 207.) */
+const unsigned int kInnerLogReply = 208;
 inline bool LiveInnerRoadLocal(unsigned int innerType)
 {
     return innerType == kInnerLiveProbe || innerType == kInnerCatchupEnd
         || innerType == kInnerPing || innerType == kInnerPong || innerType == kInnerHostClosing   /* M11a S3 */
         || innerType == kInnerOwnerMoved   /* M7a2 item 3 [m7a2-lr2] */
-        || innerType == kInnerLogAsk || innerType == kInnerLogPart   /* T-461 */
+        || innerType == kInnerLogAsk || innerType == kInnerLogPart || innerType == kInnerLogReply   /* T-461; T-1401 2b */
         || innerType == kInnerChat
-        || innerType == kInnerMapDots;   /* T-930 */
+        || innerType == kInnerMapDots   /* T-930 */
+        || innerType == kInnerSpotPing;   /* T-1393 */
 }
 
 /* M7a (T-197 piece 7a; game-to-game protocol 108; owner decisions 54(a), 57) - THE CHARACTER STREAM ON THE NOTEBOOK ROAD.

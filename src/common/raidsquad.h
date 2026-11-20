@@ -416,9 +416,10 @@ inline int SpotAlongLine(const WakeBox& b, int into, float x, float z, float tx,
 /* ==== T-1122 attempt 2 (owner 1619 a, 2026-11-13; run T2334, F-T2334-LENDLOOP): A LENT SQUAD'S PEOPLE ARE PLACED WELL PAST THE STRIP ====
    T2334: the lend moved only the squad's marker; its people stayed where the borrower's engine had last put them away (5 u inside the
    area's edge, inside the engine's 160 u strip), so the borrower's engine put every copy away again seconds after its wake (it tests the
-   squad's CENTRE - cooplo::EngineKeepsAt's comment) and the squad bounced between the two games. Owner 1619 a: move the PEOPLE with the
+   squad's own stored position, ActivePlatoon +0xB4/+0xBC - cooplo::EngineKeepsAt's comment; T-1355) and the squad bounced between the two games. Owner 1619 a: move the PEOPLE with the
    marker, to a point well past the strip - the release rule's margin, kLendDeep = the strip + the keep margin (410 u from the area's
-   edge on a side whose neighbour is not loaded); judge by where the people stand; the borrower keeps it until it is that margin outside.
+   edge on a side whose neighbour is not loaded); judge by where the people stand (at the borrower's put-away that is now the engine's own
+   sleeping spot - owner 1684, T-1355 design E, LentKeepRule); the borrower keeps it until it is that margin outside.
    DeepOf: the borrower's wake box (WakeBoxOf) with each pulled-in side moved to kLendDeep from the area's edge (a loaded side keeps its
    edge - the engine does not narrow it). The deep box lies inside the wake box (410 > 176) and inside the area. */
 const float kLendDeep = cooplo::kEngineEdgeStrip + cooplo::kKeepMarginUnits;   /* 410: the release rule's keep line (liveowner.h) */
@@ -427,7 +428,7 @@ const float kLendPlaceMax = 2.0f * kLendDeep;                                   
 const int kLendPlaceFrames = 600;                                               /* frames a woken copy's people are waited for (steady) before its placement is given up (~10 s) */
 const int kLendPlaceWatchFrames = 300;                                          /* frames after the placement in which people made later are placed too (~5 s) */
 const float kLendSteadyEps = 0.01f;                                             /* a person 'the same two frames running': within this on each axis */
-/* fold 1 (review MED 1): THE BORROWER'S GIVE-BACK LINE - its people's centre this far OUTSIDE the areas it holds (the release rule's keep
+/* fold 1 (review MED 1): THE BORROWER'S GIVE-BACK LINE - its sleeping spot (T-1355 design E: the engine's own spot; before, its people's centre) this far OUTSIDE the areas it holds (the release rule's keep
    margin, owner 1619 a: "a margin past the edge"). With the lend line (kLendDeep inside) the two lines are 660 u apart. */
 const float kLendGiveBack = cooplo::kKeepMarginUnits;                           /* 250 */
 const unsigned long kLendShortBackoffMs = 60000;                                /* fold 2: the lender's first wait after a short return from one holder (LendShortQuietMs) */
@@ -445,7 +446,8 @@ inline WakeBox DeepOf(const WakeBox& b)
     if (d.x0 > d.x1 || d.z0 > d.z1) return WakeBox();
     return d;
 }
-/* THE PEOPLE'S CENTRE - the point the engine's keep test reads for an awake squad (the mean of its members' positions, Character+0x48).
+/* THE PEOPLE'S CENTRE - the mean of an awake squad's members' positions (Character+0x48); where a lend's people are placed from at its first
+   wake. NOT the point the engine's keep test reads (that is the squad's stored position, ActivePlatoon +0xB4/+0xBC - T-1355).
    n positions (x, z); a NaN one is skipped. Returns the number used (0 = none: *cx / *cz untouched). */
 inline int PeopleCentre(const float* xs, const float* zs, int n, float* cx, float* cz)
 {
@@ -507,9 +509,9 @@ inline float OutsideBy(const WakeBox& b, float x, float z)
    engine judges them - the single rule. The lender moves its sleeping squad's spot (its people, asleep) there before the lend's write when
    it knows the borrower's box (LendLineDecide kBoxShallow / kBoxTravel, LendTargetPoint, at most kLendPlaceMax); when it does not, the
    borrower's placement at the lend's FIRST wake does it (the people are built where the spot was).
-   THE GIVE-BACK LINE (the borrower, A): the copy is kept - asleep or awake - while A holds an area within kLendGiveBack of its people's
-   centre (inside such an area, or less than kLendGiveBack outside its edge); it is given back only when the centre is kLendGiveBack or
-   more outside every area A holds, or A holds none of them - fold 2: a raid's end is no reason (LentKeepRule at a put-away,
+   THE GIVE-BACK LINE (the borrower, A): the copy is kept - asleep or awake - while A holds an area within kLendGiveBack of its sleeping
+   spot (owner 1684, T-1355 design E: the engine's own spot, the stored squad position its put-away tested - inside such an area, or less
+   than kLendGiveBack outside its edge); it is given back only when that spot is kLendGiveBack or more outside every area A holds, or A holds none of them - fold 2: a raid's end is no reason (LentKeepRule at a put-away,
    LentAsleepRule each tick). Measured against the AREA edges A holds, never a wake box.
    NO LOOP: the placement runs once per lend (its first wake), never at a re-wake of a kept copy, so nothing but the squad's own walk
    moves it once it is lent; a give-back past the line leaves the squad kLendGiveBack outside the area, and the lender lends it again
@@ -542,14 +544,15 @@ inline float HeldOutsideBy(const int* held, float x, float z)
         }
     return best;
 }
-/* THE BORROWER AT ITS ENGINE'S PUT-AWAY of a lent copy (haveCentre: its people's centre was read just before the sleep; heldOutside:
-   HeldOutsideBy at that centre; fold 2: whether its raid runs is no reason - only where the people stand): kSlKeep = kept here asleep (its sleeping spot written to
-   that centre; this game's own off-screen update travels it on, and its engine wakes it if it comes back into the wake box); otherwise
-   given back (RETURN) with the reason */
-enum { kSlKeep = 0, kSlPastMargin = 1, kSlNotHeld = 2, kSlRaidEnded = 3, kSlNoCentre = 4, kSlCount = 5 };
-inline int LentKeepRule(int haveCentre, float heldOutside)   /* kSlRaidEnded is no longer answered (fold 2) - kept for the REPORT's order */
+/* THE BORROWER AT ITS ENGINE'S PUT-AWAY of a lent copy (owner 1684, T-1355 design E - it supersedes owner 1619 a's people's centre here:
+   haveSpot: the engine's own sleeping spot was read just after the sleep (LentSleepSpotUsable); heldOutside: HeldOutsideBy at that spot;
+   fold 2: whether its raid runs is no reason): kSlKeep = kept here asleep where the engine put it, nothing written (this game's own
+   off-screen update travels it on, and its engine wakes it if it comes back into the wake box, moving its people by spot minus anchor);
+   otherwise given back (RETURN at that spot) with the reason */
+enum { kSlKeep = 0, kSlPastMargin = 1, kSlNotHeld = 2, kSlRaidEnded = 3, kSlNoSpot = 4, kSlCount = 5 };
+inline int LentKeepRule(int haveSpot, float heldOutside)   /* kSlRaidEnded is no longer answered (fold 2) - kept for the REPORT's order */
 {
-    if (haveCentre != 1) return kSlNoCentre;
+    if (haveSpot != 1) return kSlNoSpot;
     if (!(heldOutside >= 0.0f)) return kSlNotHeld;
     if (heldOutside >= kLendGiveBack) return kSlPastMargin;
     return kSlKeep;
@@ -558,12 +561,161 @@ inline const char* LentSleepWhy(int k)
 {
     switch (k)
     {
-    case kSlKeep:       return "kept (its people inside this game's areas or less than the give-back line outside them)";
-    case kSlPastMargin: return "its people's centre is the give-back line (250 u) or more outside every area this game holds";
-    case kSlNotHeld:    return "this game holds no area within the give-back line of its people (or they stand in an area loaded here that another game holds)";
+    case kSlKeep:       return "kept (its sleeping spot inside this game's areas or less than the give-back line outside them)";
+    case kSlPastMargin: return "its sleeping spot is the give-back line (250 u) or more outside every area this game holds";
+    case kSlNotHeld:    return "this game holds no area within the give-back line of its sleeping spot (or it lies in an area loaded here that another game holds)";
     case kSlRaidEnded:  return "its raid ended here (not a reason since fold 2)";
-    case kSlNoCentre:   return "its people's centre was not read";
+    case kSlNoSpot:     return "its engine's sleeping spot was not read after the sleep";
     default:            return "?";
+    }
+}
+/* T-1355 design E (owner 1684): the engine's own sleeping spot of a lent copy just put away - the sleeping object's +0x64 (Platoon::deactivate
+   0x7EE910 builds it at the squad's stored position ActivePlatoon +0xB4, the point its keep test just rejected; decomp_7ee910:30-31, 66-70).
+   sleepRead: the sleeping object was read after the sleep; x, y, z: its spot. 1 = usable (all finite, not the unset 0,0,0); 0 = not read */
+inline int LentSpotFinite(float f) { union { float f; unsigned int u; } b; b.f = f; return (b.u & 0x7F800000u) != 0x7F800000u ? 1 : 0; }
+inline int LentSleepSpotUsable(int sleepRead, float x, float y, float z)
+{
+    if (sleepRead != 1) return 0;
+    if (LentSpotFinite(x) == 0 || LentSpotFinite(y) == 0 || LentSpotFinite(z) == 0) return 0;
+    return (x != 0.0f || y != 0.0f || z != 0.0f) ? 1 : 0;
+}
+/* T-1355: THE WAKE LINE of a kept lent copy (sleeping spot, anchor, people's centre, squad position, grace) - said for the first
+   kLentWakeLineMax wakes of a lend, then only counted, so a copy that cycles cannot flood the log. shownSoFar: lines said for this lend */
+const int kLentWakeLineMax = 6;
+inline int LentWakeLineShown(int shownSoFar) { return (shownSoFar >= 0 && shownSoFar < kLentWakeLineMax) ? 1 : 0; }
+/* T-1355 fold 1 (review 1): WHAT A WAKE OF A LENT COPY DOES TO ITS PLACEMENT ENTRY (the borrower's g_lentPlace). placed: placements tried
+   this lend; line: this wake owes a wake line (a KEPT copy's, under the cap); haveEntry: an entry is there already - a first placement still
+   watching for people made later (~5 s), or a wake line still waiting for steady people. kWeNew = a new entry (the lend's first placement,
+   replacing one not finished - as before T-1355; or a wake line with no entry there); kWeAddLine = the entry is KEPT and only the wake-line
+   duty added to it, so a first placement's watch for late people goes on (before T-1355 a re-wake left the entry alone); kWeNone =
+   nothing (a re-wake that owes no line) */
+enum { kWeNone = 0, kWeNew = 1, kWeAddLine = 2 };
+inline int LentWokeEntry(int placed, int line, int haveEntry)
+{
+    if (placed == 0) return kWeNew;
+    if (line == 0) return kWeNone;
+    return haveEntry != 0 ? kWeAddLine : kWeNew;
+}
+/* T-1355 attempt 2 (F1032): MOVING A SLEEPING SQUAD. The engine's off-screen update (0x7EDBF0, decomp_7edbf0:214-217; the same tail bytes at 1.0.68 0x7EED96)
+   runs the sleeping object's travel object (UnloadedPlatoon +0x58, AbstractMovementBase: position +0xC4, destination +0xDC, road follower
+   +0xF8) and copies its position into the sleeping spot +0x64 - so a write of the spot alone is undone at the next update. The move writes
+   Platoon +0x48, the spot +0x64 (and the anchor +0x80 when asked) and the travel position +0xC4, then the engine's own stop (vtable +0x98:
+   destination := position, speed 0, road follower cleared) and set-destination (vtable +0x90: the old destination again - a far one plans
+   its road from the new position). sleepingOk: the sleeping object read; travelOk: its travel object read; tableOk: that object's table and
+   both slots inside the game's own image. kSmMoved = all of it; kSmSpotOnly = no usable travel object - the spot (and anchor) written as
+   before, travel untouched; kSmNoSleeping = no sleeping object - +0x48 alone; kSmFault = a fault (crash-guarded) */
+/* Review fold (2026-11-15): classOk - the object's table IS AbstractMovementBase's for the running version (the address table's
+   AbstractMovementBaseVt row), else kSmOtherClass: the spot (and anchor) written as before, counted apart. kSmMovedStill - moved, but the
+   squad stood still (its old destination within kSleepMoveStillU of its old travel position - a fresh or engine-stopped travel object,
+   decomp_7ee4a0:53-54, :67): the destination is NOT set again (it would plan a road back to the old spot); stop leaves it at the new one */
+enum { kSmFault = -1, kSmNoSleeping = 0, kSmMoved = 1, kSmSpotOnly = 2, kSmOtherClass = 3, kSmMovedStill = 4, kSmCodes = 6 };
+inline int SleepMovePlan(int sleepingOk, int travelOk, int classOk, int tableOk)
+{
+    if (sleepingOk != 1) return kSmNoSleeping;
+    if (travelOk != 1) return kSmSpotOnly;
+    if (classOk != 1) return kSmOtherClass;
+    if (tableOk != 1) return kSmSpotOnly;
+    return kSmMoved;
+}
+/* the old destination is set again only when it lies more than kSleepMoveStillU from the old travel position (d: destination minus
+   position); NaN = not set again. 1 = set again (kSmMoved), 0 = it stood still (kSmMovedStill) */
+const float kSleepMoveStillU = 1.0f;
+inline int SleepMoveDestAgain(float dx, float dy, float dz) { const float d2 = dx * dx + dy * dy + dz * dz; return (d2 == d2 && d2 > kSleepMoveStillU * kSleepMoveStillU) ? 1 : 0; }
+/* 1 = the position was written (the caller's old 'moved' - SetSleepPosPod's 1): every code but a fault */
+inline int SleepMoveWritten(int code) { return (code == kSmMoved || code == kSmMovedStill || code == kSmSpotOnly || code == kSmOtherClass || code == kSmNoSleeping) ? 1 : 0; }
+inline const char* SleepMoveWhy(int code)
+{
+    switch (code)
+    {
+    case kSmMoved: return "moved (spot, travel position, stop, destination set again)";
+    case kSmMovedStill: return "moved (spot, travel position, stop; it stood still - no destination set)";
+    case kSmSpotOnly: return "spot only (no usable travel object - the next off-screen update may undo it)";
+    case kSmOtherClass: return "spot only (its travel object is not AbstractMovementBase for this game version - the next off-screen update may undo it)";
+    case kSmNoSleeping: return "platoon position only (no sleeping object)";
+    case kSmFault: return "FAULTED (nothing more written)";
+    default: return "?";
+    }
+}
+/* the road follower (+0xF8) is active unless its state +0x18 is 0, 3 or 4 (0x45A240 / 1.0.68 0x45A5E0); while active the step takes the
+   position from the route, never from +0xC4. haveFollower: +0xF8 not null */
+inline int SleepRoadActive(int haveFollower, int state) { return (haveFollower != 0 && state != 0 && state != 3 && state != 4) ? 1 : 0; }
+/* the follow-up: the spot after the next off-screen update is within kSleepMoveHeldU of the point moved to (one update's own travel is
+   short; F1032's undo put it back on its old travel line, hundreds of units away). NaN = not held */
+const float kSleepMoveHeldU = 100.0f;
+inline int SleepMoveHeld(float dx, float dz) { const float d2 = dx * dx + dz * dz; return (d2 == d2 && d2 <= kSleepMoveHeldU * kSleepMoveHeldU) ? 1 : 0; }
+/* T-1385 (F1142 / F1143; replaces T-1355 attempt 2 (b)'s put-away memory): THE ANCHOR OF A SQUAD WOKEN FROM A RECORD. The engine relocates a
+   woken squad's people by spot minus anchor (F456); a sleep serialises the people where they stand and sets the anchor to the squad's
+   stored position (0x7EE910:30-31, 66-70), and a sleeping squad travels on (its spot moves, its anchor stays) - so a record's people
+   stand around the anchor of the copy that was saved, not around the record's spot. Every save of a sleeping squad's record carries
+   that RAW anchor and the sleeping spot read with it as the squad record's vector fields (coopown::kRecAnchorKey / kRecAnchorSpotKey, read
+   live at the save), so a game that wakes the record sets its own anchor from them (AnchorPick): kBaRecord. A record without them (an
+   older record, or one whose anchor could not be read at its save):
+   kBaLendPos - the anchor is the spot it is woken at (the lend's position, the RETURN's, the record's), wake move 0, today's rule.
+   kBaUnread: the bytes did not parse (or not one squad record) - the same fallback. recAnchor: coopown::RecordAnchorOf's answer
+   (kRecAnchorCarried 1, kRecAnchorNone 0, kRecAnchorUnread -1). */
+enum { kBaLendPos = 0, kBaRecord = 1, kBaUnread = 2, kBaCount = 3 };
+inline int LentBuildAnchor(int recAnchor)
+{
+    if (recAnchor == 1) return kBaRecord;
+    return recAnchor == 0 ? kBaLendPos : kBaUnread;
+}
+/* T-1385 fold 2: does a record's wake shift the saved anchor by (its point - the saved spot)? Only while the record's position is still the
+   one its full write gave it (posAt not after writtenAt: a member's position at the save, not the sleeping spot). Once a position has been
+   published since the write (posAt > writtenAt - PublishSleepingPositions: the squad's CURRENT sleeping spot), the saved anchor is used as
+   it is, so the wake moves the people by that spot minus the saved anchor - the engine's own wake of a squad that travelled on asleep. */
+inline int AnchorShifts(long long posAt, long long writtenAt) { return posAt > writtenAt ? 0 : 1; }
+/* the anchor a record's wake uses - out[3]. ref: the point today's rule uses as the anchor (the point the wake treats the record's people as
+   standing around: the lend's position, the record's position, a kept sleeping spot). kBaRecord with shift 1: the record's raw anchor moved
+   by (ref - the spot saved with it), so the wake moves the people by (its spot - ref) + (saved spot - saved anchor) - the engine's own
+   pending move at the save, however far the record's position (a member's) is from the spot (T-1385 fold 1). kBaRecord with shift 0: the
+   raw anchor (AnchorShifts: a published spot; the RETURN, which moves the people to the spot it sets). Otherwise (fallback): ref itself,
+   wake move 0 at ref. */
+inline int AnchorPick(int recAnchor, const float* saved, const float* savedSpot, const float* ref, int shift, float* out)
+{
+    const int k = LentBuildAnchor(recAnchor);
+    if (k == kBaRecord && saved != 0 && savedSpot != 0)
+    {
+        for (int i = 0; i < 3; ++i) out[i] = saved[i] + (shift != 0 ? ref[i] - savedSpot[i] : 0.0f);
+        return kBaRecord;
+    }
+    out[0] = ref[0]; out[1] = ref[1]; out[2] = ref[2];
+    return k == kBaRecord ? kBaUnread : k;   /* a carried anchor with no point handed over is not used */
+}
+inline const char* LentBuildAnchorWhy(int k)
+{
+    switch (k)
+    {
+    case kBaLendPos: return "missing - the lend spot (the record carries no people anchor - wake move 0)";
+    case kBaRecord: return "from the record (the anchor its people were saved around - the wake moves them to the spot)";
+    case kBaUnread: return "unread - the lend spot (the record's bytes did not parse - wake move 0)";
+    default: return "?";
+    }
+}
+/* T-1385 (secondary guard): THE POINT A WOKEN LENT COPY'S PLACEMENT IS JUDGED FROM - the squad's stored position (ActivePlatoon +0xB4/+0xBC,
+   the point the engine's keep test reads; squadRead 1 and no NaN) when the copy's build anchor came from its record (buildAnchor kBaRecord -
+   its people were moved to the lend's spot by the wake): kPfSquad; otherwise the people's centre (cx, cz): kPfCentre (fold 2: a copy built
+   without the record's anchor has its people where the bytes put them, and +0xB4 is the lend's spot - judging from it would call them in
+   place wherever they stand). Every person is then moved by the same offset (target point minus this point: PlaceMember with this point as
+   the centre) - formation kept. */
+enum { kPfCentre = 0, kPfSquad = 1 };
+inline int PlaceFrom(int squadRead, int buildAnchor, float px, float pz, float cx, float cz, float* fx, float* fz)
+{
+    if (squadRead == 1 && buildAnchor == kBaRecord && px == px && pz == pz) { *fx = px; *fz = pz; return kPfSquad; }
+    *fx = cx; *fz = cz; return kPfCentre;
+}
+/* T-1355 fold 1 (review 3): the sleeping spot and anchor before a wake - kPreRead read on the main thread just before the engine's wake;
+   kPreUnreadable woken on the main thread but its sleeping object could not be read; kPreOffThread woken off the main thread (the wake is
+   queued and its handling run later on the main thread, after the engine woke it - nothing left to read). Words for the wake line */
+enum { kPreUnreadable = 0, kPreRead = 1, kPreOffThread = 2 };
+inline int LentPreState(int offThread, int readOk) { return offThread != 0 ? kPreOffThread : (readOk == 1 ? kPreRead : kPreUnreadable); }
+inline const char* LentPreWhy(int s)
+{
+    switch (s)
+    {
+    case kPreRead:       return "read just before the wake";
+    case kPreUnreadable: return "its sleeping object could not be read just before the wake";
+    case kPreOffThread:  return "woken off the main thread - handled later on the main thread, nothing left to read";
+    default:             return "?";
     }
 }
 /* MED 3: the people are steady - the same n people (the caller compares who they are) at the same positions as the last frame, each axis
@@ -662,9 +814,9 @@ inline int LentAsleepGiveBack(int held, int inWake, int awake, unsigned long sin
     if (awake == 0 && sinceBuiltMs > kLendAsleepMaxMs) return kAsleepNeverWoke;
     return kAsleepKeep;
 }
-/* T-1122 attempt 2 fold 1 (review MED 1): THE ASLEEP COPY EACH TICK - the give-back line on where its people stand (heldOutside:
-   HeldOutsideBy at its sleeping spot, which is its people's centre written at the put-away and moved since only by this game's own
-   off-screen travel; -1 none held). No clock decides a kept copy: it is kept until it crosses the line (this game's off-screen update
+/* T-1122 attempt 2 fold 1 (review MED 1): THE ASLEEP COPY EACH TICK - the give-back line at its sleeping spot (heldOutside:
+   HeldOutsideBy at its sleeping spot, the engine's own spot from the put-away (T-1355 design E: nothing is written there) moved since only
+   by this game's own off-screen travel; -1 none held). No clock decides a kept copy: it is kept until it crosses the line (this game's off-screen update
    travels it there - also through the band outside its areas, LentBandUpdate), it stands in another game's area, or this game no longer
    holds near it (fold 2: a raid's end is no reason); it
    wakes only by this game's engine, inside the wake box. kAsleepNeverWoke stays the last resort for a cause not known, as before attempt

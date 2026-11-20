@@ -106,6 +106,7 @@
 #include "fallentab.h"       // FallenTabCommand - `resurrect tab ...`
 #include "../common/nametag.h"
 #include "../common/fallenwire.h"
+#include "../common/spimport.h"   // T-1021: RaceCopySid, IsCopySid - the bring-back's race look-alike id
 #include "../common/admintool.h"   // FallenPick - /revive's row by name (the world server counts by the same rule)
 #include "../common/resurrectfee.h"
 #include "../common/statswire.h"
@@ -187,13 +188,58 @@ swfallen::BackCount g_feeLast;           // the last bring-back's (or `resurrect
 const size_t kFacOwnershipsOff = 0x80;   // Faction -> Ownerships (hire.cpp kFacOwnershipsOff, Confirmed bytes 0x682865)
 const size_t kOwnMoneyOff = 0x88;        // Ownerships money (hire.cpp kOwnMoneyOff, items.cpp, Confirmed)
 
-struct Pending { unsigned int uid; unsigned int deadUid; std::string name, raceBefore, tmpl; int road; int animal; DWORD at;
-                 int statsHave; unsigned int stats[swfallen::kStatsCount]; };
+struct Pending { unsigned int uid; unsigned int deadUid; std::string name, raceBefore, tmpl, made; int road; int animal; DWORD at;
+                 int statsHave; unsigned int stats[swfallen::kStatsCount]; };   /* made: T-1021's template words (chosen, id, race, sex) */
 std::vector<Pending> g_pending;   // bring-backs whose look waits (MAIN THREAD)
 
 std::string N(long long v) { std::ostringstream o; o << v; return o.str(); }
 std::string F1(float v) { std::ostringstream o; o.imbue(std::locale::classic()); o.setf(std::ios::fixed); o.precision(1); o << v; return o.str(); }
 std::string X(const void* p) { std::ostringstream o; o << p; return o.str(); }
+
+// ---- T-1021: the template the bring-back creates on (fallenwire.h BackTemplateChoice) ----
+/* the record with string id *sid (GameDataContainer::getData, a lookup that creates nothing); 0 = none or a fault */
+void* RecordByIdPod(const std::string* sid)
+{
+    __try { return coop::GameWorldPtr() != 0 ? (void*)coop::GameWorldPtr()->gamedata.getData(*sid) : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the CHARACTER record with shown name *name (findRecordByName - the road a row from before T-1021 takes); 0 = none or a fault */
+void* RecordByNamePod(const std::string* name)
+{
+    __try { return coop::GameWorldPtr() != 0 ? (void*)coop::GameWorldPtr()->gamedata.findRecordByName(*name, RECORD_CHARACTER) : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the string ids of record g's reference list *key, in its order (plain C++; RefSidsPod is its __try). 1 = read (an absent list is
+   empty), -1 = a fault */
+int RefSidsImpl(const ::GameData* g, const std::string* key, std::vector<std::string>* out)
+{
+    typedef GameHashMap<std::string, Ogre::vector<GameDataReference>::type>::type M;
+    M::const_iterator it = g->referenceLists.find(*key);
+    if (it == g->referenceLists.end()) return 1;
+    for (size_t i = 0; i < it->second.size(); ++i) out->push_back(it->second[i].sid);
+    return 1;
+}
+int RefSidsPod(const void* g, const std::string* key, std::vector<std::string>* out)
+{
+    if (g == 0) return -1;
+    __try { return RefSidsImpl((const ::GameData*)g, key, out); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the squad record (GameData) of a squad container: ActivePlatoon +0x78 -> Platoon +0x108 - the record whose 'race override' list
+   the engine's race roll reads first (0x7FE600 from the factory 0x580CE0, F1332 / F1336); 0 = none or unreadable */
+void* SquadRecordPod(const void* activePlatoon)
+{
+    if (activePlatoon == 0) return 0;
+    __try { const char* p = *(const char* const*)((const char*)activePlatoon + 0x78); return p != 0 ? *(void* const*)(p + 0x108) : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+std::string SidListWords(const std::vector<std::string>& v)
+{
+    if (v.empty()) return "none";
+    std::string w;
+    for (size_t i = 0; i < v.size(); ++i) w += (i ? "," : "") + v[i];
+    return w;
+}
 
 // ---- POD reads (no objects with destructors in a __try frame: C2712) ----
 int IntAtPod(const void* c, size_t objOff, size_t fieldOff)   // *( *(c+objOff) + fieldOff ), -1 unreadable
@@ -674,7 +720,7 @@ __declspec(noinline) void TakeSnapshot(unsigned int uid, int cause, int unique)
     NameOf(c, &s.name);
     s.race = GroundRaceName(c);
     s.unique = unique ? 1 : 0;
-    if (s.unique) s.sid = gd->stringID;   /* the key the world server keeps a named character's state under */
+    s.sid = gd->stringID;   /* T-1021: every character's template id (the bring-back finds its own template by it); a named character's is also the key the world server keeps its state under */
     float age = 0.0f;
     s.animal = ReadAnimalAge01(c, &age) ? 1 : 0;
     s.age = s.animal ? age : 0.0f;
@@ -715,7 +761,7 @@ __declspec(noinline) void TakeSnapshot(unsigned int uid, int cause, int unique)
     if (s.animal) ++g_snapAnimals;
     if (s.unique) ++g_snapUniques;
     DebugLog("[FALLEN] snapshot #" + N(g_snaps) + " uid=" + N(uid) + " name='" + s.name + "' template='" + s.templateName
-             + "' race='" + s.race + "' unique=" + N(s.unique) + (s.unique ? " sid='" + s.sid + "'" : std::string()) + " animal=" + N(s.animal) + " age=" + F1(s.age)
+             + "' race='" + s.race + "' unique=" + N(s.unique) + " sid='" + s.sid + "'" + " animal=" + N(s.animal) + " age=" + F1(s.age)
              + " stats=" + StatsWords(s.statsHave, s.stats) + " look=" + N(rec.Entries()) + " entries"
              + " at=" + F1(s.x) + "," + F1(s.y) + "," + F1(s.z) + " place='" + swfallen::PlaceWords(s.place) + "'"
              + " cause=" + swfallen::CauseWord(s.cause) + " day=" + N(s.day) + " how='" + swtab::CauseWords(s.why) + "' (blood=" + F1(blood)
@@ -767,7 +813,7 @@ void FinishPending()
                               : r == 4 ? "the apply FAILED - own look and empty kit handed to the settle send"
                               : "NOT applied (character gone)";
         DebugLog("[FALLEN] bring-back done uid=" + N(p.uid) + " (was uid " + N(p.deadUid) + ") name='" + p.name + "' template='"
-                 + p.tmpl + "' road=" + swfallen::RoadWord(p.road) + " look=" + lookWords
+                 + p.tmpl + "' " + p.made + " road=" + swfallen::RoadWord(p.road) + " look=" + lookWords
                  + " race before death='" + p.raceBefore + "' after='" + raceAfter + "' (" + (p.raceBefore == raceAfter ? "same" : "DIFFERENT") + ")"
                  + " stats before=" + StatsWords(p.statsHave, p.stats) + " after=" + statsAfter
                  + " all44Equal=" + N(statsMatch) + " limbs=" + limbs + " items=" + items);
@@ -1399,9 +1445,45 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
         camPlatoon = newPlatoon;
     }
 
+    // 0. T-1021 (F1329 / F1336 design A): the template it is created on - its own when that template's race list is exactly its
+    //    race, else a race look-alike of its own (its race alone, 'female chance' from its saved sex), so the engine's own creation
+    //    sets its race, anatomy, wearable slots, health and stats on its real race. The squad record's race override (read first by the
+    //    engine's race roll) is said with it. One line per bring-back.
+    RecordCopy look;
+    const bool haveLook = !s.look.empty() && DeserialiseRecord(s.look, 0, &look);
+    std::string lookRace; bool lookFemale = false;
+    const int sexKnown = haveLook ? swfallen::LookRaceSex(look.refKeys, look.refCounts, look.refSids, look.boolKeys, look.boolVals, &lookRace, &lookFemale) : 0;
+    void* ownRec = 0;
+    if (!s.sid.empty())
+    {
+        ownRec = RecordByIdPod(&s.sid);
+        if (ownRec == 0 && spimport::IsCopySid(s.sid)) ownRec = StoreLookalikeEnsure(s.sid);   /* a look-alike it was made on, not made here yet */
+    }
+    else ownRec = RecordByNamePod(&s.templateName);
+    std::vector<std::string> ownRaces;
+    const std::string raceKey("race"), overrideKey("race override");
+    const int ownRacesRead = ownRec != 0 ? RefSidsPod(ownRec, &raceKey, &ownRaces) : -1;
+    const std::string copyId = spimport::RaceCopySid(s.sid, lookRace, lookFemale);
+    int choice = swfallen::BackTemplateChoice(s.animal, s.sid, ownRaces, lookRace, sexKnown, !copyId.empty());
+    std::string createSid = s.sid, laWords;
+    if (choice == swfallen::kBackLookalike)
+    {
+        std::string why; bool laMade = false;
+        if (StoreBackLookalike(copyId, &why, &laMade) != 0) { createSid = copyId; laWords = laMade ? " look-alike=made" : " look-alike=found"; }
+        else { choice = swfallen::kBackOwnNoCopyId; laWords = " look-alike '" + copyId + "' could NOT be made (" + why + ") - its own template instead"; }
+    }
+    std::vector<std::string> overrides;
+    void* const squadRec = SquadRecordPod((const void*)squad);
+    const int overridesRead = squadRec != 0 ? RefSidsPod(squadRec, &overrideKey, &overrides) : -1;
+    const std::string madeWords = std::string("made on=") + swfallen::BackTemplateWord(choice) + " id='" + (createSid.empty() ? std::string("(by shown name)") : createSid)
+        + "' race='" + (lookRace.empty() ? std::string("?") : lookRace) + "' sex=" + (sexKnown ? (lookFemale ? "female" : "male") : "unknown");
+    DebugLog("[FALLEN] " + tag + "bring-back template (T-1021) entry " + N(n) + " '" + s.name + "' " + madeWords + laWords
+             + " | dead character's race shown='" + s.race + "' template id='" + s.sid + "' its race list=" + (ownRacesRead == 1 ? SidListWords(ownRaces) : std::string("unreadable"))
+             + " | squad record " + X(squadRec) + " race override=" + (overridesRead == 1 ? SidListWords(overrides) : std::string("unreadable"))
+             + (overridesRead == 1 && !overrides.empty() ? " (the engine's race roll reads it FIRST)" : std::string()));
     // 1. create
     unsigned int uid = 0;
-    if (!CreateOwnInSquad(s.templateName, pos, squad, s.age, &uid))
+    if (!CreateOwnInSquad(s.templateName, createSid, pos, squad, s.age, &uid))
     {
         ++g_backRefused;
         out->refusal = swtab::kRefFailed;
@@ -1418,6 +1500,7 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
         DebugLog("[FALLEN] " + tag + "entry " + N(n) + " FAILED: uid " + N(uid) + " was created but is not registered here" + dropped);
         return "error resurrect: the created character is not registered";
     }
+    const std::string raceMade = GroundRaceName(c);   /* T-1021: the race it was created on (before the queued look) */
     // the price, now that the person exists
     int moneyAfter = moneyBefore, paid = 0;
     if (fee.price > 0)
@@ -1477,8 +1560,6 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     SendContextFor(uid, c);   // CONTEXT before SPAWN, as every announce: the copy is built in the squad's context
     const bool sent = net::SendSpawn(uid, s.templateName, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c);
     if (sent) NoteAnnouncedOnTake(uid); else NoteNotAnnounced(uid);
-    RecordCopy look;
-    const bool haveLook = !s.look.empty() && DeserialiseRecord(s.look, 0, &look);
     if (haveLook) OwnLookQueue(uid, look);
     else WatchLocalRoll(uid);   // no record kept: its own look and its empty kit go out by the settle send
     // 6. off the list: out of this game's copy, and the TAKE to the world server
@@ -1504,7 +1585,7 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     }
     ++g_backs;
     Pending p;
-    p.uid = uid; p.deadUid = s.uid; p.name = s.name; p.raceBefore = s.race; p.tmpl = s.templateName; p.road = road;
+    p.uid = uid; p.deadUid = s.uid; p.name = s.name; p.raceBefore = s.race; p.tmpl = s.templateName; p.made = madeWords; p.road = road;
     p.animal = s.animal; p.at = ::GetTickCount(); p.statsHave = s.statsHave;
     std::memcpy(p.stats, s.stats, sizeof(p.stats));
     if (haveLook) g_pending.push_back(p);
@@ -1520,6 +1601,7 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
                    + ", unreadable near=" + N(enemies.unknown) + ")")
         + " at=" + F1(pos.x) + "," + F1(pos.y) + "," + F1(pos.z)
         + " items rolled=" + N(itemsRolled) + " cleared=" + N(cleared) + " after=" + N(itemsAfterStrip)
+        + " race at creation='" + raceMade + "'"
         + " named=" + N(named ? 1 : 0) + " stats=" + N(statsSet ? 1 : 0) + "(rc " + N(statsRc) + ")"
         + " | probe L3 after create: own-faction characters " + N(countBefore) + " -> " + N(alive1)
         + " move+0x20 new/member=" + N(newMove) + "/" + N(refMove) + " +0x1A0+0xDC new/member=" + N(newAi) + "/" + N(refAi)

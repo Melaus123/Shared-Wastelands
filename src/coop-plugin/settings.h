@@ -17,6 +17,12 @@ std::string SettingsAdvSetCommand(const std::string& key, const std::string& val
 std::string SettingsGtSetCommand(const std::string& key, const std::string& value);    // settings4 S4: the TEST-ONLY `gtset` verb (gt.* twin of advset)
 // settings5 S5 (design section 4): this game's mod list, the S1 fingerprint's rows, for the store HELLO. MAIN THREAD. Returns out->known.
 int SettingsModList(coopmods::ModList* out);
+/* T-247 (owner 1699): which part of the list SettingsModList last handed out could not be read (a refused USE MY MODS logs it) */
+coopmods::ModsReadFacts SettingsModsReadFacts();
+/* T-1375 (owner 1654 / 1692): PUT MY MODS IN THE WORLD'S ORDER - data\mods.cfg and data\__mods.list rewritten in `world`'s order (the
+   same mods, each file backed up beside itself, atomic). 1 = done (or already in that order), 0 = refused, nothing written (one [MODS]
+   line says why). MAIN THREAD. */
+int SettingsModsPutInWorldOrder(const coopmods::ModList& world);
 // mp5 (docs/design-mpmenu1.md section 5): the Game options screen. MAIN THREAD. The rows the host CHANGED there, as
 // (notebook key, value); replaces any earlier hand-over (empty = withdraw). Sent through the authority record path the
 // moment this game is the world's authority with the record in hand, and written over the host's live values at its

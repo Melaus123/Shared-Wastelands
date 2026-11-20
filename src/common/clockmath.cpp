@@ -370,7 +370,22 @@ int DialoguePauseLetThrough(int site, int linked, int* suppressed)
     return 1;
 }
 
-int MenuPauseDecide(int site, int linked, int inWorld, int mode, MenuPauseState* st)
+int MenusPauseOfWire(const char* wire)
+{
+    if (wire == 0) return -1;
+    if (std::strcmp(wire, "run") == 0) return kMenusKeepRunning;
+    if (std::strcmp(wire, "pause") == 0) return kMenusPauseEveryone;
+    return -1;
+}
+const char* MenusPauseWire(int v)
+{
+    if (v == kMenusKeepRunning) return "run";
+    if (v == kMenusPauseEveryone) return "pause";
+    return "";
+}
+int MenuPauseVotes(int mode, int menusPause) { return (mode == kTimeModeSlowest && menusPause == kMenusPauseEveryone) ? 1 : 0; }
+
+int MenuPauseDecide(int site, int linked, int inWorld, int mode, int menusPause, MenuPauseState* st)
 {
     if (st == 0) return kMenuPass;
     if (site == kMenuSiteMenuOpen || site == kMenuSiteBuildEnter)
@@ -378,7 +393,7 @@ int MenuPauseDecide(int site, int linked, int inWorld, int mode, MenuPauseState*
         int* const mine = (site == kMenuSiteMenuOpen) ? &st->menuSkipped : &st->buildSkipped;
         if (!linked || !inWorld) { *mine = 0; return kMenuPass; }
         *mine = 1;
-        if (site == kMenuSiteBuildEnter && mode == kTimeModeSlowest && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
+        if (site == kMenuSiteBuildEnter && MenuPauseVotes(mode, menusPause) && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
         return kMenuSkip;
     }
     if (site == kMenuSiteMenuClose || site == kMenuSiteBuildLeave)
@@ -386,51 +401,34 @@ int MenuPauseDecide(int site, int linked, int inWorld, int mode, MenuPauseState*
         int* const mine = (site == kMenuSiteMenuClose) ? &st->menuSkipped : &st->buildSkipped;
         if (*mine == 0) return kMenuPass;
         *mine = 0;
-        if (site == kMenuSiteBuildLeave && st->voteHeld && st->menuOpen == 0 && st->talkOpen == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
+        if (site == kMenuSiteBuildLeave && st->voteHeld && st->menuOpen == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
         return kMenuSkip;
     }
     return kMenuPass;
 }
 
-int MenuPauseNoteGameMenu(int open, int linked, int inWorld, int mode, MenuPauseState* st)
+int MenuPauseNoteGameMenu(int open, int linked, int inWorld, int mode, int menusPause, MenuPauseState* st)
 {
     if (st == 0) return kMenuPass;
     if (open && linked && inWorld)
     {
         st->menuOpen = 1;
-        if (mode == kTimeModeSlowest && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
+        if (MenuPauseVotes(mode, menusPause) && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
         return kMenuPass;
     }
     {
         const int was = st->menuOpen;
         st->menuOpen = 0;
-        if (was && st->voteHeld && st->buildSkipped == 0 && st->talkOpen == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
+        if (was && st->voteHeld && st->buildSkipped == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
     }
     return kMenuPass;
 }
 
-int MenuPauseNoteTalkWindow(int open, int linked, int inWorld, int mode, MenuPauseState* st)
-{
-    if (st == 0) return kMenuPass;
-    if (open && linked && inWorld)
-    {
-        if (st->talkOpen) return kMenuPass;   /* polled every frame: only the opening edge votes */
-        st->talkOpen = 1;
-        if (mode == kTimeModeSlowest && !st->voteHeld) { st->voteHeld = 1; return kMenuSkipVote; }
-        return kMenuPass;
-    }
-    {
-        const int was = st->talkOpen;
-        st->talkOpen = 0;
-        if (was && st->voteHeld && st->buildSkipped == 0 && st->menuOpen == 0) { st->voteHeld = 0; return kMenuSkipRestore; }
-    }
-    return kMenuPass;
-}
 void MenuPauseNotePress(MenuPauseState* st) { if (st != 0) st->voteHeld = 0; }
 void MenuPauseNoteWorldClosed(MenuPauseState* st)
 {
     if (st == 0) return;
-    st->menuSkipped = 0; st->buildSkipped = 0; st->voteHeld = 0; st->menuOpen = 0; st->talkOpen = 0;
+    st->menuSkipped = 0; st->buildSkipped = 0; st->voteHeld = 0; st->menuOpen = 0;
 }
 int TimeSkipDecide(double localAbs, double sharedAbs, int joinJumpOwed, double hours, double maxAheadHours,
                    double* targetAbs, int* day, float* hourOfDay)

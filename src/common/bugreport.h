@@ -16,7 +16,8 @@
  *     cut last of the two; with no crash, the log from two launches ago goes first), then nearby players' logs, then this
  *     launch's log, then the crash file, oldest part first within each log;
  *   - the zip and multipart/form-data layouts;
- *   - the nearby-log message pair LOG_ASK / LOG_PART (game-to-game, through the world server) and the bundle it carries;
+ *   - the nearby-log messages LOG_ASK / LOG_REPLY / LOG_PART (game-to-game, through the world server) and the bundle LOG_PART
+ *     carries; an asked game's short queue of waiting asks and the report's 'Nearby players:' note built from the replies (T-1401 2b);
  *   - which crash file counts, and which of the two earlier launches it ended (367 a, 581), and when the wait for nearby
  *     players ends.
  *
@@ -60,6 +61,7 @@ const unsigned int kNearbyFirstMs  = 5000;              /* a nearby game that ha
 const unsigned int kNearbyTotalMs  = 20000;             /* and none is waited for longer than this */
 const unsigned int kCrashNearSec   = 600;               /* a crash file this close to an earlier launch's log's last line belongs to that launch */
 const unsigned int kNameMaxBytes   = 64;                /* a nearby player's name in a bundle */
+const unsigned int kAnswerQueueMax = 4;                 /* T-1401 2b: an asked game that is busy keeps at most this many asks waiting */
 
 /* ---------------------------------------------------------------------------------------------------------------------
    THE APPROVED WORDS (build/pages/bug-report-mockup.html, owner 368; nothing about what is attached, owner 2026-10-02)
@@ -659,7 +661,7 @@ inline void JoinPack(const LogPack& p, size_t first, std::vector<unsigned char>*
 
 /* ---------------------------------------------------------------------------------------------------------------------
    THE SIZE BUDGET (372). Each part of the zip is `fixed` bytes that are never cut (its headers, its final block, a whole
-   crash file) plus its segments' bytes. Orders, cut first to last: kOrderOlderLog, kOrderPrevLog, kOrderNearby,
+   crash file) plus its segments' bytes. Orders, cut first to last: kOrderOlderLog, kOrderPrevLog, kOrderArea, kOrderNearby,
    kOrderServerLog, kOrderThisLog, kOrderCrash; kOrderKeep is never cut. kOrderServerLog is the log of the world server this
    computer runs, so a report from the host also shows the server's side. The two earlier launches' logs take kOrderOlderLog and kOrderPrevLog
    by EarlierLogOrder. A part may carry a `floor`: segment bytes it keeps through pass 1 (SetBudgetFloors shares the room
@@ -675,7 +677,9 @@ inline void JoinPack(const LogPack& p, size_t first, std::vector<unsigned char>*
    ------------------------------------------------------------------------------------------------------------------ */
 /* kOrderKeptCrash: a file of a launch that did not quit normally, kept in the mod's crashes folder (src/common/crashkeep.h) -
    below every other order, so it is cut before any other part loses a byte, and SetBudgetFloors gives it no floor. */
-enum { kOrderKeptCrash = -1, kOrderOlderLog = 0, kOrderPrevLog = 1, kOrderNearby = 2, kOrderServerLog = 3, kOrderThisLog = 4, kOrderCrash = 5, kOrderKeep = 9 };
+/* kOrderArea (T-1402, owner 1740 a): the stored copy of the reporter's map square (src/common/areareport.h) - each file whole or not
+   at all, cut after the two earlier launches' logs and before the nearby players' logs, the world server's log and this launch's log. */
+enum { kOrderKeptCrash = -1, kOrderOlderLog = 0, kOrderPrevLog = 1, kOrderArea = 2, kOrderNearby = 3, kOrderServerLog = 4, kOrderThisLog = 5, kOrderCrash = 6, kOrderKeep = 9 };
 /* The budget order of kept earlier launch `launch`'s log (1 = the previous launch, 2 = the one before it), given which of them
    the attached crash file ended (`crashLaunch` 1, 2, or 0 = none): the crashed launch's log is cut after the other one; with no
    crash, or a crash that ended launch 1, the log from two launches ago is cut first. */
@@ -718,13 +722,31 @@ inline bool PartLeftOut(const std::vector<BudgetPart>& parts, const BudgetCut& c
    rest, a share with no log, rounding) goes to the logs that have more, this launch's log first, then kOrderServerLog,
    kOrderPrevLog, kOrderNearby, kOrderOlderLog (parts of one order in list order), each up to its whole size. With no world
    server log its share is room no log takes, so this launch's log then gets what it got before that log had a share. The floors never add up to
-   more than the room; with no room every floor is 0. */
+   more than the room; with no room every floor is 0.
+   T-1402: the area files (kOrderArea) are taken first: up to kAreaShare percent of the room, each file whole, in list order (the
+   reporter's own stored square first), a file that does not fit in what is left gets floor 0; the logs share the room less what the
+   area files took. With no area file the logs' floors are exactly what they were before. */
+const unsigned int kAreaShare = 15u;   /* T-1402: percent of the room the area files may keep through pass 1 */
 inline void SetBudgetFloors(std::vector<BudgetPart>* parts, unsigned long long limit)
 {
     std::vector<BudgetPart>& p = *parts;
     unsigned long long fixed = 0;
     for (size_t i = 0; i < p.size(); ++i) { fixed += p[i].fixed; p[i].floor = 0; }
-    const unsigned long long room = fixed < limit ? limit - fixed : 0;
+    unsigned long long room = fixed < limit ? limit - fixed : 0;
+    {   /* T-1402: the area files' floors, each file whole or 0 */
+        unsigned long long areaLeft = room * kAreaShare / 100u, areaGiven = 0;
+        for (size_t i = 0; i < p.size(); ++i)
+        {
+            if (p[i].order != kOrderArea) continue;
+            unsigned long long w = 0;
+            for (size_t k = 0; k < p[i].segBytes.size(); ++k) w += p[i].segBytes[k];
+            if (w == 0 || w > areaLeft) continue;
+            p[i].floor = w;
+            areaLeft -= w;
+            areaGiven += w;
+        }
+        room -= areaGiven;
+    }
     static const int kFloorKinds = 5;
     static const int kFloorOrders[kFloorKinds] = { kOrderThisLog, kOrderServerLog, kOrderPrevLog, kOrderNearby, kOrderOlderLog };
     static const unsigned int kFloorShare[kFloorKinds] = { 35u, 10u, 20u, 25u, 10u };   /* percent of the room; they add up to 100 */
@@ -961,22 +983,105 @@ inline int CrashFileKind(const std::string& name)
    players. Each answers, without telling its player, with its CURRENT log (scrubbed, compressed, capped to kNearbyLogMax) as
    a bundle in LOG_PARTs by LIVE route SLOT back to the asker. Both are game-to-game messages the world server only relays;
    the receiving game reads them in its store layer (liverelay.h LiveInnerRoadLocal), never in the arrival queue.
-     LOG_ASK  (cooplive::kInnerLogAsk)  {u32 ask id, u32 most bytes wanted}                                    8 bytes
-     LOG_PART (cooplive::kInnerLogPart) {u32 ask id, u32 part, u32 parts, u32 bundle length, part bytes}       16 + up to kLogPartMax
+     LOG_ASK   (cooplive::kInnerLogAsk)   {u32 ask id, u32 most bytes wanted, i32 sector x, i32 sector y,
+                                          16-byte report label}                                                32 bytes
+     LOG_REPLY (cooplive::kInnerLogReply) {u32 ask id, u32 code, u32 detail}                                   12 bytes
+     LOG_PART  (cooplive::kInnerLogPart)  {u32 ask id, u32 part, u32 parts, u32 bundle length, part bytes}     16 + up to kLogPartMax
+   T-1401 step 2b (owner 1741 b, design D1, F1168; game-to-game protocol 232): every asked game answers AT ONCE with one
+   LOG_REPLY (route SLOT back to the asker), decided from its own state when the ask arrives and sent before any packing:
+     1 sending        detail = its current log's size in bytes before packing (the parts follow)
+     2 busy, queued   detail = its place in its queue of waiting asks (1..kAnswerQueueMax); 0 = the queue is full, not answered.
+                      When its turn comes (within kNearbyTotalMs of the ask) it replies again - 1 sending, or another code.
+     3 answered you   detail = seconds since it last answered this asker (one answer per asker per kAnswerSlotGapMs)
+     4 log unreadable detail 0
+     5 not loaded     detail 0 - the asked sector is only in its delivery ring, not loaded there; nothing is sent (1741 b)
+   The sector lets the asked game tell 5 from the others; the report label is for step 2c (the asked game's own upload, 1742 a).
+   The 8-byte LOG_ASK of protocols before 232 is no longer sent or read.
      bundle  {u32 'KMLB', u32 1, u32 name length, name, u64 raw total, u64 raw dropped, u32 IPs scrubbed, u32 segments,
               segments x {u32 raw length, u32 CRC, u32 compressed length}, the segments' bytes in order}
    ------------------------------------------------------------------------------------------------------------------ */
 const unsigned int kBundleMagic = 0x424C4D4Bu;   /* "KMLB" */
-const size_t kLogAskBytes = 8, kLogPartHeader = 16;
+const size_t kLogLabelBytes = 16, kLogAskBytes = 16 + kLogLabelBytes, kLogReplyBytes = 12, kLogPartHeader = 16;
+const int kAskSectorGrid = 64;   /* = cooplive::kAreaGrid (liverelay.h; the offline suite checks) */
 inline void PutLe32(std::vector<char>* b, unsigned int v) { char t[4]; std::memcpy(t, &v, 4); b->insert(b->end(), t, t + 4); }
 inline unsigned int GetLe32(const char* p) { unsigned int v = 0; std::memcpy(&v, p, 4); return v; }
-inline void LogAskEncode(std::vector<char>* b, unsigned int askId, unsigned int maxBytes) { b->clear(); PutLe32(b, askId); PutLe32(b, maxBytes); }
-inline bool LogAskDecode(const char* p, size_t n, unsigned int* askId, unsigned int* maxBytes)
+struct LogAsk
 {
-    if (p == 0 || n != kLogAskBytes) return false;
-    *askId = GetLe32(p); *maxBytes = GetLe32(p + 4);
-    return *askId != 0;
+    unsigned int askId, maxBytes;
+    int sx, sy;                          /* the asker's player sector - the part of the map the report is about */
+    unsigned char label[kLogLabelBytes]; /* the report's label (step 2c: the asked game's own upload carries it) */
+    LogAsk() : askId(0), maxBytes(0), sx(-1), sy(-1) { std::memset(label, 0, sizeof(label)); }
+};
+inline void LogAskEncode(std::vector<char>* b, const LogAsk& a)
+{
+    b->clear(); PutLe32(b, a.askId); PutLe32(b, a.maxBytes); PutLe32(b, (unsigned int)a.sx); PutLe32(b, (unsigned int)a.sy);
+    b->insert(b->end(), (const char*)a.label, (const char*)a.label + kLogLabelBytes);
 }
+/* false for any other length, ask id 0, or a sector off the 64 x 64 grid */
+inline bool LogAskDecode(const char* p, size_t n, LogAsk* out)
+{
+    if (p == 0 || out == 0 || n != kLogAskBytes) return false;
+    LogAsk a;
+    a.askId = GetLe32(p); a.maxBytes = GetLe32(p + 4); a.sx = (int)GetLe32(p + 8); a.sy = (int)GetLe32(p + 12);
+    std::memcpy(a.label, p + 16, kLogLabelBytes);
+    if (a.askId == 0 || a.sx < 0 || a.sx >= kAskSectorGrid || a.sy < 0 || a.sy >= kAskSectorGrid) return false;
+    *out = a;
+    return true;
+}
+/* The label as 32 lower-case hex characters (log lines). */
+inline std::string LabelHex(const unsigned char* l)
+{
+    static const char* const h = "0123456789abcdef";
+    std::string o;
+    for (size_t i = 0; i < kLogLabelBytes; ++i) { o += h[l[i] >> 4]; o += h[l[i] & 15]; }
+    return o;
+}
+enum { kReplySending = 1, kReplyQueued = 2, kReplyAnsweredYou = 3, kReplyLogUnreadable = 4, kReplyNotLoaded = 5 };
+inline void LogReplyEncode(std::vector<char>* b, unsigned int askId, unsigned int code, unsigned int detail)
+{ b->clear(); PutLe32(b, askId); PutLe32(b, code); PutLe32(b, detail); }
+/* false for any other length, ask id 0, a code outside 1..5, a queue place past kAnswerQueueMax, an 'answered you' older than the
+   one-minute rule allows, or a detail on codes 4 / 5 */
+inline bool LogReplyDecode(const char* p, size_t n, unsigned int* askId, unsigned int* code, unsigned int* detail)
+{
+    if (p == 0 || n != kLogReplyBytes) return false;
+    const unsigned int id = GetLe32(p), c = GetLe32(p + 4), d = GetLe32(p + 8);
+    if (id == 0 || c < (unsigned int)kReplySending || c > (unsigned int)kReplyNotLoaded) return false;
+    if (c == (unsigned int)kReplyQueued && d > kAnswerQueueMax) return false;
+    if (c == (unsigned int)kReplyAnsweredYou && d > kAnswerSlotGapMs / 1000u) return false;
+    if ((c == (unsigned int)kReplyLogUnreadable || c == (unsigned int)kReplyNotLoaded) && d != 0) return false;
+    *askId = id; *code = c; *detail = d;
+    return true;
+}
+/* THE ASKED GAME'S QUEUE: asks that came while it was busy, oldest first, at most kAnswerQueueMax. A slot already waiting is not
+   added twice - its entry takes the newer ask and keeps its place. Add gives the place (1..max), 0 when full. */
+struct AskWaiting { LogAsk ask; unsigned int slot; unsigned int arrivedMs; };
+struct AskQueue
+{
+    std::vector<AskWaiting> q;
+    unsigned int Add(const AskWaiting& w)
+    {
+        for (size_t i = 0; i < q.size(); ++i)
+            if (q[i].slot == w.slot) { q[i] = w; return (unsigned int)i + 1u; }
+        if (q.size() >= kAnswerQueueMax) return 0;
+        q.push_back(w);
+        return (unsigned int)q.size();
+    }
+    /* every waiting ask of `slot` (a player who left); how many */
+    size_t DropSlot(unsigned int slot)
+    {
+        size_t n = 0;
+        for (size_t i = q.size(); i-- > 0;) if (q[i].slot == slot) { q.erase(q.begin() + (long)i); ++n; }
+        return n;
+    }
+    bool Take(AskWaiting* out)
+    {
+        if (q.empty() || out == 0) return false;
+        *out = q[0];
+        q.erase(q.begin());
+        return true;
+    }
+    size_t Size() const { return q.size(); }
+};
 /* How many parts a bundle of `total` bytes travels in (at least one). */
 inline unsigned int PartCountFor(unsigned int total) { return total == 0 ? 1u : (total + kLogPartMax - 1u) / kLogPartMax; }
 /* Part `k` of `bundle`. */
@@ -1074,12 +1179,71 @@ inline bool BundleDecode(const std::vector<char>& b, std::string* name, LogPack*
     p->segs.swap(segs);
     return true;
 }
-/* The wait for nearby answers is over: kNearbyTotalMs since the ask, or kNearbyFirstMs since it with every game that began
-   answering finished. `started` / `finished` count games. */
-inline bool NearbyWaitOver(unsigned int sinceAskMs, int started, int finished)
+/* T-1401 2b: is the asker still owed something by this game? Its last reply said 'sending' and its log is not all here, or 'queued'
+   (place 1..4) - or it sent parts with no reply and they are not all here. */
+inline bool ReplyStillOwed(unsigned int lastCode, unsigned int lastDetail, bool partsStarted, bool logComplete)
+{
+    if (logComplete) return false;
+    if (lastCode == (unsigned int)kReplySending) return true;
+    if (lastCode == (unsigned int)kReplyQueued) return lastDetail != 0;
+    return lastCode == 0 && partsStarted;
+}
+/* The wait for nearby answers is over: kNearbyTotalMs since the ask, or kNearbyFirstMs since it with no game still owing its
+   log (`owed` = games for which ReplyStillOwed holds). Replies are collected for the first kNearbyFirstMs either way. */
+inline bool NearbyWaitOver(unsigned int sinceAskMs, int owed)
 {
     if (sinceAskMs >= kNearbyTotalMs) return true;
-    return sinceAskMs >= kNearbyFirstMs && finished >= started;
+    return sinceAskMs >= kNearbyFirstMs && owed <= 0;
+}
+/* One game's part in the 'Nearby players:' note. firstCode / lastCode 0 = no reply; logState 0 = no part, 1 = its log is here and
+   read, 2 = parts came but not all of them, or they could not be read. */
+struct NearbyReply
+{
+    unsigned int slot;
+    std::string name;
+    unsigned int firstCode, firstDetail, lastCode, lastDetail;
+    int logState;
+    NearbyReply() : slot(0), firstCode(0), firstDetail(0), lastCode(0), lastDetail(0), logState(0) {}
+};
+inline std::string NoteNum(unsigned long long v) { char b[32]; std::sprintf(b, "%llu", v); return b; }
+/* What one replier did, in the report's words. */
+inline std::string NearbyReplyText(const NearbyReply& r)
+{
+    std::string pre;
+    if (r.firstCode == (unsigned int)kReplyQueued && r.firstDetail != 0 && r.lastCode != (unsigned int)kReplyQueued)
+        pre = "busy, queued (place " + NoteNum(r.firstDetail) + "), then ";
+    switch (r.lastCode)
+    {
+    case kReplySending:
+        if (r.logState == 1) return pre + "answered - its log is attached (" + NoteNum(r.lastDetail) + " bytes before packing)";
+        if (r.logState == 2) return pre + "answered, but its log did not all arrive or could not be read within " + NoteNum(kNearbyTotalMs / 1000u) + " s - left out";
+        return pre + "said it was sending, but no part of its log arrived within " + NoteNum(kNearbyTotalMs / 1000u) + " s";
+    case kReplyQueued:
+        if (r.lastDetail == 0) return "busy, its queue of " + NoteNum(kAnswerQueueMax) + " waiting asks full - not answered";
+        return "busy, queued (place " + NoteNum(r.lastDetail) + ") - its turn did not come within " + NoteNum(kNearbyTotalMs / 1000u) + " s";
+    case kReplyAnsweredYou:
+        return pre + "answered you " + NoteNum(r.lastDetail) + " s ago - not sent again (one answer per player a minute)";
+    case kReplyLogUnreadable:
+        return pre + "its log could not be read";
+    case kReplyNotLoaded:
+        return pre + "has this part of the map only in its outer ring, not loaded - not asked to send";
+    default:
+        break;
+    }
+    if (r.logState == 1) return "answered - its log is attached";
+    if (r.logState == 2) return "its log did not all arrive or could not be read - left out";
+    return "no answer";
+}
+/* The whole 'Nearby players:' note: the asked sector, then every replier (and every game whose parts came) with what it did, then
+   HOW MANY other players in the world did not reply - counted, never named (most were never asked: not near this part of the map). */
+inline std::string NearbyNoteText(int sx, int sy, const std::vector<NearbyReply>& replies, unsigned int silentCount)
+{
+    std::string n = "asked (sector " + NoteNum((unsigned long long)(sx < 0 ? 0 : sx)) + "," + NoteNum((unsigned long long)(sy < 0 ? 0 : sy)) + ")";
+    if (replies.empty()) n += "; no game replied within " + NoteNum(kNearbyFirstMs / 1000u) + " s";
+    for (size_t i = 0; i < replies.size(); ++i)
+        n += "; slot " + NoteNum(replies[i].slot) + (replies[i].name.empty() ? std::string() : " (" + replies[i].name + ")") + ": " + NearbyReplyText(replies[i]);
+    if (silentCount != 0) n += "; " + NoteNum(silentCount) + (silentCount == 1 ? " other player" : " other players") + " in the world: no answer";
+    return n;
 }
 
 /* ---------------------------------------------------------------------------------------------------------------------
@@ -1115,6 +1279,15 @@ inline std::string SafeName(const std::string& s)
     }
     while (!o.empty() && (o[o.size() - 1] == ' ' || o[o.size() - 1] == '.')) o.erase(o.size() - 1);
     return o.empty() ? std::string("player") : o;
+}
+
+/* T-885 piece 1 (privacy): the players' own records at the top of the world server's folder ("own", src/common/ownrecwire.h) are never
+   listed among its files, so another player's records never reach a bug report - whatever the entry's attributes say */
+inline bool OwnRecName(const std::string& name)
+{
+    std::string l;
+    for (std::string::size_type i = 0; i < name.size(); ++i) { const char c = name[i]; l += (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+    return l == "own" || l.compare(0, 4, "own\\") == 0 || l.compare(0, 4, "own/") == 0;
 }
 
 }   /* namespace coopbug */

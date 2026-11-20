@@ -563,6 +563,24 @@ inline int KoSelfNameParse(const std::string& arg, std::string* name, int* secon
     return 1;
 }
 
+/* T-1422 TEST-ONLY: `koself name <name> near <anchorUid> [seconds]` - arg is what follows `koself`: the word name, one name token
+   (`#<k>` allowed), the word near, the anchor character's uid (non-zero; any character loaded on this game - a copy of another
+   player's character too), then seconds 0..600 (default 0, as `koself <uid>`). 1 parsed, 0 not this form or malformed. */
+inline int KoSelfNameNearParse(const std::string& arg, std::string* name, unsigned int* anchor, int* seconds)
+{
+    name->clear(); *anchor = 0; *seconds = 0;
+    std::string tok[6];
+    unsigned long long v = 0, a = 0;
+    const int n = TalkSplit(arg, tok, 6);
+    if (n < 4 || n > 5 || tok[0] != "name" || tok[2] != "near") return 0;
+    const std::string k = TalkLeverNameKey(tok[1]);
+    if (k.empty()) return 0;
+    if (!TalkParseNumber(tok[3], &a) || a == 0 || a > 0xFFFFFFFFull) return 0;
+    if (n == 5 && (!TalkParseNumber(tok[4], &v) || v > (unsigned long long)kLeverKoMaxSeconds)) return 0;
+    *name = k; *anchor = (unsigned int)a; *seconds = (int)v;
+    return 1;
+}
+
 /* `capturetest carry <carrierUid> name <name> [dead]` - arg is the whole capturetest argument. 1 parsed (carrier non-zero), 0 not
    this form or malformed. *dead (when given) = 1 when the trailing word `dead` is there (T-1262 TEST-ONLY: the body is a DEAD
    character, not a down one), else 0. */

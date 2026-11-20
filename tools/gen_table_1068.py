@@ -72,6 +72,17 @@ HAND = {
     # GameWorld::processKeys: changed in 1.0.68 (new calls in its key handling); the mod only uses it as the start
     # of a return-address window, and its setGameSpeed x3 / userPause x1 calls sit at the same offsets.
     'ProcessKeys': 0x788100,
+    # T-1437: InputHandler::initialise changed in 1.0.68 (more default actions); the first 1918 bytes agree at 0x3636C0 only,
+    # and the neighbour InputHandler 0x3635F0 -> 0x363650 puts it there. Hooked at its entry; its only argument is the handler.
+    'InputHandlerInit': 0x3636C0,
+    # T-1437: OptionsWindow::create changed in 1.0.68 (more Controls rows), so the return address after its spacer call
+    # under the last key row moved inside it: 1.0.65 0x3FAB2E (+0xAA0E), 1.0.68 0x3FAE4B (+0xABEB), the call after the last
+    # KeyConfig row and before the "Defaults" button, to DatapanelAddSpacer's 1.0.68 match (hand_ret_moved_ok checks it).
+    'OptionsControlsEndRet': 0x3FAE4B,
+    # T-1437 (review F1355): the game's free stub, a 6-byte `jmp [IAT]` in a run of 210 such stubs, so its masked bytes agree
+    # at 124 places; both neighbours (ED5560->ED6430, ED5B10->ED69E0) put it at 0xED64F8, and the import tables agree: in both
+    # builds it is the only stub that jumps through the slot importing mfc100u.dll ordinal 1278 (build/imports_free_t1437.txt).
+    'GameFreeStub': 0xED64F8,
 }
 
 # =================================================================================================================
@@ -672,8 +683,54 @@ def row68(b, row, rva68, res):
     return fmt_row(row['name'], k, rva68, rva68, '-')
 
 
-def hand_ok(row, res, rva68):
+def hand_ret_moved_ok(M, row, res, rva68):
+    """T-1437: a hand-decided return address inside a CHANGED function, where the call moved within it. Accepted only when
+    the bytes before rva68 are a direct call of the row's length, the call lies in one of the tool's function candidates
+    (its exception-table fragment starts there), and its (stub-followed) callee is the 1.0.68 match of the 1.0.65 call's
+    (stub-followed) callee."""
+    a, b = M.a, M.b
+    n = len(row['bytes']) // 2
+    call65, call68 = row['rva'] - n, rva68 - n
+    if a.mm[call65] != 0xE8 or b.mm[call68] != 0xE8:
+        return False
+    fr = b.fragment(call68)
+    if fr is None or fr[0] not in res.get('func68s', []):
+        return False
+    c65 = next(MD.disasm(a.rd(call65, 16), call65))
+    c68 = next(MD.disasm(b.rd(call68, 16), call68))
+    if c65.size != n or c68.size != n:
+        return False
+    callee65, callee68 = final_target(a, c65.operands[0].imm), final_target(b, c68.operands[0].imm)
+    mt = M.match_checked(callee65)
+    if mt['status'] != 'same' or mt['rva68'] != callee68:
+        return False
+    # review F1323 SHOULD 3: the SAME call - the k-th call to that callee in the 1.0.65 function and the k-th in the 1.0.68
+    # one (OptionsWindow::create calls the spacer many times; any of them would pass the checks above)
+    fr65 = a.fragment(call65)
+    if fr65 is None or fr65[0] != res['func65']:
+        return False
+    k65, k68 = call_rank(a, fr65[0], call65, callee65), call_rank(b, fr[0], call68, callee68)
+    return k65 is not None and k65 == k68
+
+
+def call_rank(img, lo, call, callee):
+    """How many direct calls to `callee` (stub-followed) come before the call at `call` in [lo, call), by a linear decode
+    from lo; None when the decode does not land on `call` exactly (a desynced decode is refused, never guessed)."""
+    k = 0
+    for ins in MD.disasm(img.rd(lo, call - lo + 16), lo):
+        if ins.address >= call:
+            return k if ins.address == call else None
+        if img.mm[ins.address] == 0xE8 and ins.size == 5:
+            t = ins.operands[0].imm
+            if 0 <= t < len(img.mm) and final_target(img, t) == callee:
+                k += 1
+    return None
+
+
+def hand_ok(row, res, rva68, M=None):
     """A HAND decision must be one of the tool's own candidates or suggestions (typo guard)."""
+    if row['kind'] == 'ret' and M is not None and res.get('func65') is not None and hand_ret_moved_ok(M, row, res, rva68):
+        return True
     pool = set()
     for key in ('rva68', 'best'):
         if res.get(key):
@@ -726,7 +783,7 @@ def generate(args):
             if h is None:
                 refused.append(row['name'])
                 tag = st + ' -> REFUSED (hand)'
-            elif not hand_ok(row, res, h):
+            elif not hand_ok(row, res, h, M):
                 sys.exit('HAND %s = %X is none of the tool\'s candidates - check table-1068.md' % (row['name'], h))
             else:
                 rva68 = h

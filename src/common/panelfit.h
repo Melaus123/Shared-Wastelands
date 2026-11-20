@@ -296,11 +296,13 @@ enum PanelSlotId
     kSlotDlgTail,                                         /* RESET WORLD?'s last paragraph, under the tick box (PanelLive::tail) */
     kSlotStartRow,                                        /* T-1096 part 3: NEW PROFILE's START WITH row (label, <, value, >), under PROFILE NAME */
     kSlotStartHint,                                       /* T-1096 part 3: its hint line, only while it has one */
-    kSlotImpBoxes,                                        /* T-1096 part 3: IMPORT FROM SINGLE PLAYER's COMES ALONG / STAYS BEHIND, side by side */
+    kSlotImpCarry,                                        /* T-1383: IMPORT FROM SINGLE PLAYER's one sentence (it replaced T-1096's two boxes; PanelLive::carry) */
     kSlotImpArrival,                                      /* T-1096 part 3: its arrival line */
     kSlotKeepTick,                                        /* HOST GAME's "Keep this world running for others" tick box and its label */
     kSlotKeepNote,                                        /* its note under the label - and, ticked, the home-network warning (PanelLive::keep) */
-    kSlotOptNote                                          /* GAME OPTIONS in a running world: "Only an admin can change these." over DEFAULTS / DONE */
+    kSlotOptNote,                                         /* GAME OPTIONS in a running world: "Only an admin can change these." over DEFAULTS / DONE */
+    kSlotDlgTick2, kSlotDlgTick3,                         /* T-1383: RESET WORLD?'s keep-dead and keep-relations tick boxes, under keep-buildings */
+    kSlotImpTick1, kSlotImpTick2, kSlotImpNote            /* T-1383: IMPORT FROM SINGLE PLAYER's creator tick boxes and their note (PanelLive::creator / note) */
 };
 struct PanelSlot { int slot; int halves; };
 const int kPanelMaxHalves = kPanelRows * 2;
@@ -394,7 +396,8 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
     static const PanelSlot options[]  = { { kSlotTabs, 2 }, { kSlotGap, 1 }, { kSlotOptRows, 20 }, { kSlotGap, 1 },
                                           { kSlotButtons, 2 } };
     /* GAME OPTIONS in a running world: the same window height, the two half-row gaps given to one full row for the admin line, so its
-       words have a whole row (Kenshi's line height fits it at every row height the panel allows) under the tenth option row. */
+       words have a whole row (Kenshi's line height fits it at every row height the panel allows) under the option rows (the tenth
+       slot's; the eleventh row's while MENUS AND BUILDING is shown - PanelOptRowBand). */
     static const PanelSlot optionsWorld[] = { { kSlotTabs, 2 }, { kSlotOptRows, 20 }, { kSlotOptNote, 2 }, { kSlotButtons, 2 } };
     static const PanelSlot profiles[] = { { kSlotList, 8 }, { kSlotGap, 1 }, { kSlotListBtns, 2 }, { kSlotGap, 1 },
                                           { kSlotStatus, 8 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
@@ -405,7 +408,10 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
        is 17 lines and the last paragraph 3 at 1280x720 (rowH 34): Kenshi's own line of about 14 px needs 15 and 3 half-rows; the
        fallback estimate's 18 px lines fill the 18 and 4 here exactly, without its 9 px spare.  The list is the 26 half-rows the
        window has.  Swept in test_main.cpp at 1280x720 and 1920x1080. */
-    static const PanelSlot resetWorld[] = { { kSlotDlgText, 18 }, { kSlotDlgTick, 2 }, { kSlotDlgTail, 4 }, { kSlotButtons, 2 } };
+    /* T-1383 (the approved page, version 3): the two sentences, the three tick boxes together (one row each), the old world's name and
+       the players who aren't here, then CANCEL / RESET WORLD. */
+    static const PanelSlot resetWorld[] = { { kSlotDlgText, 8 }, { kSlotGap, 1 }, { kSlotDlgTick, 2 }, { kSlotDlgTick2, 2 }, { kSlotDlgTick3, 2 },
+                                            { kSlotGap, 1 }, { kSlotDlgTail, 6 }, { kSlotButtons, 2 } };
     /* T-1096 part 3 (owner 1224; the approved page): NEW PROFILE - its line, PROFILE NAME, START WITH right under it with no gap (one
        label column, as HOST GAME's PASSWORD / PORT / PROFILE group), the hint's line while it has one (one line at the window's width),
        then CANCEL / CREATE or NEXT. */
@@ -415,8 +421,11 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
                                              { kSlotGap, 1 }, { kSlotButtons, 2 } };
     /* IMPORT FROM SINGLE PLAYER: its line, the saves list (SAVE / LAST PLAYED - or the line in its place), COMES ALONG / STAYS BEHIND
        side by side (a head and up to five lines each), the arrival line, CANCEL / IMPORT. */
-    static const PanelSlot spImport[]    = { { kSlotDlgText, 3 }, { kSlotGap, 1 }, { kSlotList, 7 }, { kSlotGap, 1 }, { kSlotImpBoxes, 8 },
-                                             { kSlotImpArrival, 2 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
+    /* T-1383 (the approved page, version 3): the two boxes became one sentence; the creator's two tick boxes (one row each) and their
+       note show only for the world's first profile (PanelLive::creator 0 and note 0 otherwise - the window is that much shorter). */
+    static const PanelSlot spImport[]    = { { kSlotDlgText, 3 }, { kSlotGap, 1 }, { kSlotList, 6 }, { kSlotGap, 1 }, { kSlotImpCarry, 4 },
+                                             { kSlotImpTick1, 2 }, { kSlotImpTick2, 2 }, { kSlotImpNote, 3 }, { kSlotImpArrival, 2 },
+                                             { kSlotButtons, 2 } };
     const PanelSlot* s = landing;
     int n = (int)(sizeof(landing) / sizeof(landing[0]));
     switch (layout)
@@ -492,7 +501,10 @@ struct PanelLive
     int steam; /* HOSTING's STEAM row (kSlotSteamRow): PanelSteamRowHalves */
     int tail;  /* RESET WORLD?'s last paragraph (kSlotDlgTail), under its tick box */
     int keep;  /* HOST GAME's keep-running note (kSlotKeepNote): the note, and while ticked the warning under it */
-    PanelLive(int textHalves = -1) : text(textHalves), players(-1), net(-1), steam(-1), tail(-1), keep(-1) {}
+    int carry;   /* T-1383: IMPORT FROM SINGLE PLAYER's sentence (kSlotImpCarry) */
+    int creator; /* T-1383: its two creator tick rows (kSlotImpTick1 / 2): 0 = not the world's creator (no rows), else the list's value */
+    int note;    /* T-1383: the creator note under them (kSlotImpNote): 0 with no boxes */
+    PanelLive(int textHalves = -1) : text(textHalves), players(-1), net(-1), steam(-1), tail(-1), keep(-1), carry(-1), creator(-1), note(-1) {}
 };
 /* HOST GAME's keep-running note: its listed half-rows (both HOST GAME lists), and how many more it may take from the status area
    under it while the box is ticked (the warning's lines); the status area's ceiling shrinks by what is taken. */
@@ -512,6 +524,9 @@ inline int PanelSlotHalves(const PanelSlot& s, const PanelLive& live)
     else if (s.slot == kSlotPlayers) v = live.players;
     else if (s.slot == kSlotNetAddr) v = live.net;
     else if (s.slot == kSlotDlgTail) v = live.tail;
+    else if (s.slot == kSlotImpCarry) v = live.carry;
+    else if (s.slot == kSlotImpTick1 || s.slot == kSlotImpTick2) v = live.creator;
+    else if (s.slot == kSlotImpNote) v = live.note;
     else if (s.slot == kSlotKeepNote) { v = live.keep; cap = s.halves + kPanelKeepBorrow; }
     if (s.slot == kSlotStatus) { cap -= PanelKeepOver(live); if (cap < 0) cap = 0; }
     if (v >= 0) return v < cap ? v : cap;
@@ -547,6 +562,33 @@ inline PanelBand PanelSlotBand(int layout, int slot, int rowH, const PanelLive& 
         }
         before += halves;
     }
+    return b;
+}
+/* T-1392 review fix 4: GAME OPTIONS' option row r. Every tab - and MULTIPLAYER while MENUS AND BUILDING is hidden - has main's ten
+   row slots: the option rows' band split in ten (kOptRowSlots). Only MULTIPLAYER with the row shown (`eleven`) has eleven rows
+   (kOptRowSlotsTall): from the tabs' bottom to the buttons' top, the title screen's two half-row gaps and, in a running world, the
+   admin line's row taken in - eleven whole rows, rowH each. While the admin line is up (`noteUp`: in a running world, not an admin)
+   its row stays, and the eleven share the band above it: 10 * rowH / 11, under the 14 px floor at rowH 14 and 15 (it holds from
+   rowH 16; T-1392 review fix 4 - said, not hidden). A row past the state's rows: { 0, 0 }. */
+const int kOptRowSlots = 10, kOptRowSlotsTall = 11;
+inline PanelBand PanelOptRowBand(int layout, int rowH, int r, int eleven, int noteUp)
+{
+    PanelBand b;
+    b.top = 0;
+    b.h = 0;
+    const int n = eleven != 0 ? kOptRowSlotsTall : kOptRowSlots;
+    if (r < 0 || r >= n) return b;
+    const PanelBand rb = PanelSlotBand(layout, kSlotOptRows, rowH);
+    int top = rb.top, h = rb.h;
+    if (eleven != 0)
+    {
+        const PanelBand tb = PanelSlotBand(layout, kSlotTabs, rowH), nb = PanelSlotBand(layout, kSlotOptNote, rowH),
+                        bb = PanelSlotBand(layout, kSlotButtons, rowH);
+        top = tb.top + tb.h;
+        h = ((nb.h > 0 && noteUp != 0) ? nb.top : bb.top) - top;
+    }
+    b.top = top + (h * r) / n;
+    b.h = top + (h * (r + 1)) / n - b.top;
     return b;
 }
 
@@ -589,6 +631,17 @@ inline int PanelInviteBtnW(int innerW)
 {
     const int w = (innerW * 24) / 100, least = 14 * kPanelTextCharW + 2 * kPanelAddrBtnPadPx;
     return w < least ? least : w;
+}
+/* T-1375: the MODS tab's PUT MY MODS IN THE WORLD'S ORDER - USE MY MODS FOR THIS WORLD's 60 % of the width, never narrower than its
+   32-letter caption at kPanelTextCharW plus kPanelAddrBtnPadPx each side, never wider than the row; the MODS DON'T MATCH box gives it
+   the row left beside OK (ui.cpp NoticeBuild), at least kModsOrderBtnLeastPx too. */
+const int kModsOrderCaptionChars = 32;   /* "PUT MY MODS IN THE WORLD'S ORDER" */
+const int kModsOrderBtnLeastPx = kModsOrderCaptionChars * kPanelTextCharW + 2 * kPanelAddrBtnPadPx;
+inline int PanelModsOrderBtnW(int innerW)
+{
+    int w = (innerW * 60) / 100;
+    if (w < kModsOrderBtnLeastPx) w = kModsOrderBtnLeastPx;
+    return w > innerW ? innerW : w;
 }
 /* How far the Steam line's text area starts below the STEAM row's top, so its first line is level with the label and INVITE
    FRIENDS (one row tall, text centred): Kenshi's body line is about 0.4 of a row at 1280x720 and a third at 1920x1080

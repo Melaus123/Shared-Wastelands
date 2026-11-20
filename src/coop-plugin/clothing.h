@@ -131,6 +131,9 @@ void LimbsForgetUid(unsigned int uid);
 void LimbsWorldTeardown();
 /* MAIN THREAD, every RestWatchTick: an owned character's limb change sends its STATE at once. */
 void LimbOwnWatchTick();
+/* T-1442 step 2: MAIN THREAD, every frame (CommandChannelTick): the uids the amputate hook noted - a changed one's STATE pushed at once,
+   its fingerprint stored for the watch. */
+void LimbEventDrainTick();
 
 // LIMBS. TEST-ONLY lever, MAIN THREAD (command channel). `cut <ownUid> <limb 0-3>` / `fit <ownUid> <limb 0-3> <sid>` arm one
 // request for the K2 safe point; `show <uid>` logs any character's four limbs now. Returns the status line.

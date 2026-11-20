@@ -157,6 +157,21 @@ inline int PlayerGoneHoldDecide(double heldAt, double now, double graceSec, bool
     if (admittedAgain) return kPgHoldCancel;
     return (now - heldAt >= graceSec) ? kPgHoldSend : kPgHoldWait;
 }
+/* T-1350 (design C): A PLAYER BACK WITH NO WORLD RUNNING HAS LEFT. At its admission the world server decides each hold it keeps for that
+   player's slot - the PLAYER_GONE news, the SLOT GONE note and the owed-row hold (store_main.cpp PlayerGoneHoldReturned,
+   SquadNoteSlotGoneReturned, RowHoldReturned). A HELLO whose clock is negative says the returning game ticks no world (the plugin's
+   ClockHelloFields sends -1 whenever its main loop runs no world: at the title after a crash or a quit), so it runs none of its old
+   life's people: the held news is SENT, through the hold's own expiry road, after the roster that lists that player again
+   (ReturnedNewLifeSend), exactly as a leave. A real clock (a re-dial from inside the world) or no clock carried keeps the cancel.
+   held: a hold of that kind waits for the slot (0 none); hasClock: the HELLO carried a clock; helloClock: its hours. */
+const int kRhNone = 0;     /* no hold of that kind for the slot: nothing to decide */
+const int kRhCancel = 1;   /* the same game life is back: the hold is cancelled (kept as its own), nothing sent */
+const int kRhSend = 2;     /* a new game life with no world running: the hold is sent as a leave, after the roster */
+inline int ReturnHoldDecide(int held, int hasClock, double helloClock)
+{
+    if (held == 0) return kRhNone;
+    return (hasClock != 0 && helloClock < 0.0) ? kRhSend : kRhCancel;
+}
 /* THE HOLD AS A GAME KNOWS IT: the world server's kGraceSec (store_main.cpp), the same number. A game cannot read the world server's
    constant; it uses this one where it must judge "away longer than the hold" itself (lostcopy.h ReturnGiveUpOwnerGone). */
 const double kPlayerGoneHoldSec = 10.0;

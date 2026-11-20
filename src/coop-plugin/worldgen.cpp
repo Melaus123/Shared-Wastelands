@@ -26,6 +26,7 @@ std::string P072ReportToken();                  /* PROBE P072: counters for the 
 #include "worldsync.h"   // F322: WorldPtr   // P038 / F319: RetireOnDestroy
 #include "zones.h"        /* P4z: SectorOf / HeldByOtherTS - the decision-33 area question */
 #include "../common/removalreason.h"   /* M7a3: the engine's removal reason - an unload is never sent as a death */
+namespace coop { int BuildEngineDestroyNote(void* obj, int justUnloaded, const char* reason); void BuildEngineDestroyDone(void* obj, int ticket, int destroyed); }   /* build.cpp (build.h), T-1372 */
 #include "towngen.h"      /* T-392 (owner 335 a): TownGenResidentsGate - the residents gate */
 #include "townver.h"      /* TownVerChoose / TownVerInstall / TownVerReportToken */
 #include "camp.h"         /* T-929: CampInstall / CampReportToken */
@@ -413,17 +414,21 @@ RootObject* detour_createRandomCharacter(RootObjectFactory* self, Faction* facti
     return orig_createRandomCharacter(self, faction, position, owner, characterTemplate, home, age);
 }
 
-// P038 / F319. THE DESTRUCTION EVENT, and this detour is deliberately about as small as a detour
-// can be: retire the pointer, then call the original.
+// P038 / F319. THE DESTRUCTION EVENT. The detour retires the pointer, notes what the mod must know
+// about the object while it is whole, then calls the original.
 //
 // It runs BEFORE the engine frees anything, so at this instant the object is still valid and
 // `MirrorRetire` only needs to compare addresses - it does no dereference at all, and it publishes
 // with `InterlockedExchange`, which is what makes it legal here when the calling thread is unknown.
 //
-// NOTHING ELSE HAPPENS HERE. No logging, no allocation, no engine calls, no lock. That is the
-// standing rule for every detour in this file and it matters more here than anywhere else: a
-// destroy can happen on a worker thread during region streaming, and a logging call on a game's
-// worker thread is exactly how this project would deadlock the engine.
+// THE RULE, as it stands now (T-1372 review fold 4): no logging and no lock that any engine code also
+// takes. Each call below states its own thread rule. The building note (BuildEngineDestroyNote /
+// BuildEngineDestroyDone) does pointer compares, interlocked counters and guarded (SEH) reads of the
+// whole object into a fixed slot - no allocation - and takes one lock of the mod's own, the build
+// event queue's (BdQueuePush), which covers a memory copy of one record and nothing else: no engine
+// call is made while it is held, so a worker thread cannot wait on the engine inside it. A destroy
+// can happen on a worker thread during region streaming, and a logging call on a game's worker
+// thread is exactly how this project would deadlock the engine - logging stays out.
 //
 // This CLOSES the window P034 cannot close. P034 samples two rows per tick through the engine's
 // handle registry, so a character stays "alive" in our tables for a fraction of a second after it
@@ -511,9 +516,15 @@ bool detour_destroy(GameWorld* self, RootObject* obj, bool justUnloaded, const c
     /* A character whose destroy the engine accepts waits on the kill list; LiveCharacter refuses that address with that handle
        (spawn.h DoomNote). Its handle is read while the object is whole, and noted only when the engine answered true (false =
        postponed, still live). */
+    /* T-1372: an own building the engine ends for good (the Level Editor's delete, the panel's confirm) is marked removed - the cheap
+       tests (the flag, the reason, the editor's scope) come first; a building's key is read here while it is whole. Any thread.
+       Review fold 3: nothing is queued before the engine answers - a destroy it postpones (false) is not an end yet (a zone scan before
+       the free would bring the row back); BuildEngineDestroyDone keeps such a for-good capture for the same object's completing destroy. */
+    const int engRm = coop::BuildEngineDestroyNote((void*)obj, justUnloaded ? 1 : 0, debugInfo);
     coop::DoomTicket doom;
     const bool doomCaptured = coop::DoomCapture(obj, &doom);
     const bool destroyed = orig_destroy(self, obj, justUnloaded, debugInfo);
+    coop::BuildEngineDestroyDone((void*)obj, engRm, destroyed ? 1 : 0);
     if (destroyed && doomCaptured) coop::DoomNote(doom);
     return destroyed;
 }

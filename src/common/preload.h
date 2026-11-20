@@ -8,19 +8,25 @@
  * game's copy is only a cache, brought up to date BEFORE the world loads; decision 256 (a): the loading screen may wait.
  *
  * THE EXCHANGE. Four more kinds inside RECORD_FEED (58), after recordfeed.h's 1-4, on reliable channel 0:
- *   up   5 INDEX_ASK  {u32 token, str afterKey, u8 aoiVersion (1), u8 ring, u16 n, n * (u8 x, u8 y)}   the next page of the
+ *   up   5 INDEX_ASK  {u32 token, str afterKey, u8 aoiVersion (1 | 2), u8 ring, u16 n, n * (u8 x, u8 y) [, str town]}   the next page of the
  *                                                     world server's record INDEX after that key ("" first). The areas are
  *                                                     this game's area list (its area file, areafile.h); n = 0 (ring 0) when
  *                                                     it has none. The world server only counts the rows against them; the
- *                                                     game itself picks the rows it fetches (PreRowChoose)
- *   down 6 INDEX_PAGE {u32 token, u8 last, u32 n, n * (str key, u64 fileStamp, u64 posAt, u8 x, u8 y, u32 bytes, u8 flags)}   keys
+ *                                                     game itself picks the rows it fetches (PreRowChoose). aoiVersion 2
+ *                                                     (T-1365, protocol 157) adds town: a NEW GAME's start record's town
+ *                                                     reference (its record id), whose areas the world server names on its
+ *                                                     answer (starttown.h); version 1 = no town
+ *   down 6 INDEX_PAGE {u32 token, u8 last, u32 n, n * (str key, u64 fileStamp, u64 posAt, u8 x, u8 y, u32 bytes, u8 flags), u16 t, t * (u8 x, u8 y)}   keys
  *                                                     ascending; x,y = the record's area (0xFF,0xFF = none: no area in its
  *                                                     key and no usable position); bytes = its payload's size; flags bit 0
  *                                                     (kPreRowOwn, T-985 C2b fold 3) = a group record whose faction field carries a
  *                                                     name of the asking game's player faction (PreAskerFactionNames: its own, and
  *                                                     the clash and placeholder names a stand-in for the asker's slot takes on
  *                                                     another game), fetched wherever it is (no other bit is valid); fileStamp = the
- *                                                     record's file time (0 = a position-only record), posAt = its position's
+ *                                                     record's file time (0 = a position-only record), posAt = its position's;
+ *                                                     t pairs (T-1365, protocol 157) = the areas of the asked town's placements
+ *                                                     (the first page of an ask naming a town; none on any other page, and none
+ *                                                     when no area record's note names that town)
  *   up   7 FETCH      {u32 token, u8 resume, u32 n, n * str key}   send these records now (n <= kPreFetchBatch); resume = 1:
  *                                                     the rest of a batch the last FETCH_END cut short (the world server writes
  *                                                     its queue out only on a batch's first FETCH, as the feed on its first page)
@@ -43,6 +49,7 @@
 #define COOP_COMMON_PRELOAD_H
 
 #include <cstddef>
+#include <cstdio>   /* T-1390: std::sprintf (PreMbText) */
 #include <map>
 #include <set>
 #include <string>
@@ -53,7 +60,8 @@
 
 namespace cooppre {
 
-const unsigned int kPreProtocol = 153;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
+const unsigned int kPreProtocol = 170;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
+
 
 
 
@@ -71,6 +79,7 @@ const int kPreRing = 2;                            /* the ring round the area li
 const int kPreRingMax = 8;                         /* the widest ring an INDEX_ASK may name */
 const size_t kPreAreaMax = 4096;                   /* the most areas an INDEX_ASK may carry (areafile::kMaxAreas) */
 const unsigned int kPreAoiVersion = 1u;            /* INDEX_ASK's area field */
+const unsigned int kPreAoiVersionTown = 2u;        /* T-1365: the area field followed by a NEW GAME's start town (its record id) */
 const int kPreNoArea = -1;                         /* an index row's x and y when its record has no area */
 const unsigned int kPreRowOwn = 1u;                /* T-985 C2b fold 3: index row flag - a group record carrying a name of the asking game's player faction (PreAskerFactionNames, PreRowOfAskersFaction) */
 const unsigned int kPreRowFlagsKnown = 1u;         /* every row flag this build knows; a row with another is refused */
@@ -92,6 +101,8 @@ struct PreMsg
     std::string key;                    /* INDEX_ASK: afterKey */
     unsigned int ring;                  /* INDEX_ASK: the ring the game fetches round its areas (0 with no areas) */
     std::vector<int> areas;             /* INDEX_ASK: the game's area list, x,y pairs (empty = none) */
+    std::string town;                   /* INDEX_ASK (aoiVersion 2, T-1365): a NEW GAME's start town record id ("" = none) */
+    std::vector<int> townAreas;         /* INDEX_PAGE (T-1365): the asked town's areas, x,y pairs (empty = none) */
     std::vector<IndexEntry> entries;    /* INDEX_PAGE */
     std::vector<std::string> keys;      /* FETCH */
     PreMsg() : kind(0), token(0), last(0), resume(0), answered(0), sent(0), ring(0) {}
@@ -108,16 +119,22 @@ inline bool IsPreKind(const char* p, size_t n)
 inline bool PreAreaOnGrid(int x, int y) { return x >= 0 && x < kPreGrid && y >= 0 && y < kPreGrid; }
 /* areas = x,y pairs, each on the grid, at most kPreAreaMax (empty = no list: ring is sent as 0). Anything else is not encodable
    (appends nothing). */
-inline bool PreEncodeIndexAsk(std::vector<char>* b, unsigned int token, const std::string& afterKey, int ring, const std::vector<int>& areas)
+inline bool PreEncodeIndexAsk(std::vector<char>* b, unsigned int token, const std::string& afterKey, int ring, const std::vector<int>& areas, const std::string& town)
 {
-    if (afterKey.size() > coopfeed::kFeedKeyMax || ring < 0 || ring > kPreRingMax || areas.size() % 2 != 0 || areas.size() / 2 > kPreAreaMax) return false;
+    if (afterKey.size() > coopfeed::kFeedKeyMax || town.size() > coopfeed::kFeedKeyMax || ring < 0 || ring > kPreRingMax || areas.size() % 2 != 0 || areas.size() / 2 > kPreAreaMax) return false;
     for (size_t k = 0; k < areas.size(); k += 2) if (!PreAreaOnGrid(areas[k], areas[k + 1])) return false;
     coopfeed::FeedHead(b, kPreIndexAsk); coopfeed::FeedPut32(b, token); coopfeed::FeedPutKey(b, afterKey);
     const unsigned int n = (unsigned int)(areas.size() / 2);
-    b->push_back((char)kPreAoiVersion); b->push_back((char)(areas.empty() ? 0 : ring));
+    b->push_back((char)(town.empty() ? kPreAoiVersion : kPreAoiVersionTown)); b->push_back((char)(areas.empty() ? 0 : ring));
     b->push_back((char)(n & 0xFFu)); b->push_back((char)((n >> 8) & 0xFFu));
     for (size_t k = 0; k < areas.size(); k += 2) { b->push_back((char)areas[k]); b->push_back((char)areas[k + 1]); }
+    if (!town.empty()) coopfeed::FeedPutKey(b, town);   /* T-1365: version 2 only */
     return true;
+}
+/* an INDEX_ASK with an area list and no town (version 1) */
+inline bool PreEncodeIndexAsk(std::vector<char>* b, unsigned int token, const std::string& afterKey, int ring, const std::vector<int>& areas)
+{
+    return PreEncodeIndexAsk(b, token, afterKey, ring, areas, std::string());
 }
 /* an INDEX_ASK with no area list */
 inline bool PreEncodeIndexAsk(std::vector<char>* b, unsigned int token, const std::string& afterKey)
@@ -125,9 +142,11 @@ inline bool PreEncodeIndexAsk(std::vector<char>* b, unsigned int token, const st
     return PreEncodeIndexAsk(b, token, afterKey, 0, std::vector<int>());
 }
 /* entries with a key over the bound are not encodable - the whole page is refused (appends nothing) */
-inline bool PreEncodeIndexPage(std::vector<char>* b, unsigned int token, bool last, const std::vector<IndexEntry>& es)
+inline bool PreEncodeIndexPage(std::vector<char>* b, unsigned int token, bool last, const std::vector<IndexEntry>& es, const std::vector<int>& townAreas)
 {
     for (size_t i = 0; i < es.size(); ++i) if (es[i].key.size() > coopfeed::kFeedKeyMax) return false;
+    if (townAreas.size() % 2 != 0 || townAreas.size() / 2 > kPreAreaMax) return false;   /* T-1365: the town's areas, each on the grid */
+    for (size_t k = 0; k < townAreas.size(); k += 2) if (!PreAreaOnGrid(townAreas[k], townAreas[k + 1])) return false;
     coopfeed::FeedHead(b, kPreIndexPage); coopfeed::FeedPut32(b, token); b->push_back(last ? (char)1 : (char)0);
     coopfeed::FeedPut32(b, (unsigned int)es.size());
     for (size_t i = 0; i < es.size(); ++i)
@@ -138,7 +157,15 @@ inline bool PreEncodeIndexPage(std::vector<char>* b, unsigned int token, bool la
         coopfeed::FeedPut32(b, es[i].bytes);
         b->push_back((char)(es[i].flags & kPreRowFlagsKnown));
     }
+    const unsigned int t = (unsigned int)(townAreas.size() / 2);   /* T-1365 */
+    b->push_back((char)(t & 0xFFu)); b->push_back((char)((t >> 8) & 0xFFu));
+    for (size_t k = 0; k < townAreas.size(); k += 2) { b->push_back((char)townAreas[k]); b->push_back((char)townAreas[k + 1]); }
     return true;
+}
+/* an INDEX_PAGE naming no town areas */
+inline bool PreEncodeIndexPage(std::vector<char>* b, unsigned int token, bool last, const std::vector<IndexEntry>& es)
+{
+    return PreEncodeIndexPage(b, token, last, es, std::vector<int>());
 }
 inline bool PreEncodeFetch(std::vector<char>* b, unsigned int token, bool resume, const std::vector<std::string>& keys)
 {
@@ -172,7 +199,7 @@ inline bool PreDecode(const char* p, size_t n, PreMsg* out)
         if (!PreGetKey(p, n, &at, &m.key) || n - at < 4) return false;   /* the area field is required: a short ask is refused */
         const unsigned int ver = (unsigned int)(unsigned char)p[at], ring = (unsigned int)(unsigned char)p[at + 1];
         const unsigned int cnt = (unsigned int)(unsigned char)p[at + 2] | ((unsigned int)(unsigned char)p[at + 3] << 8); at += 4;
-        if (ver != kPreAoiVersion || ring > (unsigned int)kPreRingMax || cnt > kPreAreaMax || (cnt == 0 && ring != 0) || n - at < (size_t)cnt * 2) return false;
+        if ((ver != kPreAoiVersion && ver != kPreAoiVersionTown) || ring > (unsigned int)kPreRingMax || cnt > kPreAreaMax || (cnt == 0 && ring != 0) || n - at < (size_t)cnt * 2) return false;
         for (unsigned int i = 0; i < cnt; ++i)
         {
             const int x = (int)(unsigned char)p[at], y = (int)(unsigned char)p[at + 1]; at += 2;
@@ -180,6 +207,7 @@ inline bool PreDecode(const char* p, size_t n, PreMsg* out)
             m.areas.push_back(x); m.areas.push_back(y);
         }
         m.ring = ring;
+        if (ver == kPreAoiVersionTown && (!PreGetKey(p, n, &at, &m.town) || m.town.empty())) return false;   /* T-1365: version 2 names a town */
     }
     else if (m.kind == (unsigned int)kPreIndexPage)
     {
@@ -200,6 +228,15 @@ inline bool PreDecode(const char* p, size_t n, PreMsg* out)
             else if (PreAreaOnGrid(x, y)) { e.ax = x; e.ay = y; }
             else return false;   /* half an area, or one off the grid */
             m.entries.push_back(e);
+        }
+        if (n - at < 2) return false;   /* T-1365: the town's areas follow the rows */
+        const unsigned int t = (unsigned int)(unsigned char)p[at] | ((unsigned int)(unsigned char)p[at + 1] << 8); at += 2;
+        if (t > kPreAreaMax || n - at < (size_t)t * 2) return false;
+        for (unsigned int i = 0; i < t; ++i)
+        {
+            const int x = (int)(unsigned char)p[at], y = (int)(unsigned char)p[at + 1]; at += 2;
+            if (!PreAreaOnGrid(x, y)) return false;
+            m.townAreas.push_back(x); m.townAreas.push_back(y);
         }
     }
     else if (m.kind == (unsigned int)kPreFetch)
@@ -297,6 +334,33 @@ inline int PreAoiClass(int ax, int ay, const std::vector<int>& xy, int ring)
 }
 /* 1 = the load's fetch may take a row of this class (every class but OUT) */
 inline int PreAoiFetches(int cls) { return cls != kPreAoiOut ? 1 : 0; }
+
+/* T-1365 (owner decision 1675): A NEW GAME'S FETCH (game, store.cpp PreloadAoiBegin / PreWantHere). A NEW GAME never uses this
+   game's area file or its last save's list - they belong to an older character. Where the list comes from (store.cpp g_preAoiSource):
+   0 none, 1 the area file read at the join, 2 the lists noted since, kPreSrcNewGameTown a NEW GAME's start-town areas, kPreSrcNewGameAll
+   a NEW GAME with no start-town list. With no start-town list (everyAreas = 1) a row's class is: an area record (isZone) its own class
+   (NOLIST: every one newer on the world server is fetched), any other row OUT - left for the feed after the load (the owner's fallback:
+   every area record, the rest later). With a start-town list (everyAreas = 0) the row's own class stands (the town's areas and
+   kPreRing round them). A NEW GAME's rows are never fetched as the player's own (PreNewGameOwn): an older character's groups are not
+   this game's start. */
+const int kPreSrcNewGameTown = 3, kPreSrcNewGameAll = 4;
+inline int PreSrcIsNewGame(int src) { return (src == kPreSrcNewGameTown || src == kPreSrcNewGameAll) ? 1 : 0; }
+inline int PreNewGameClass(int cls, int isZone, int everyAreas) { return (everyAreas != 0 && isZone == 0) ? (int)kPreAoiOut : cls; }
+inline int PreNewGameOwn(int own, int newGame) { return newGame != 0 ? 0 : own; }
+/* T-1365 fold (review H1): A NEW GAME'S HOLD ANSWERS (store.cpp PreloadHoldsNewGame) and WHEN THE PUMP ASKS ITS PROFILE GATE. The gate
+   (ProfileLoadGate) says JOIN_STAGE LOADING to the world server once per LINK; a hold can outlive its link (a re-dial), so the gate is
+   asked on the NEW GAME's first frame (kPreNgNotAsked: no hold answer yet) and again on the frame a hold lets it go (kPreNgGoAfterHold) -
+   the LOADING then goes on the link in use, and an operator or gate change during a long hold is judged again. Never on a held frame
+   (kPreNgHold) nor on a dead-link refusal (kPreNgRefuse); kPreNgGo (let go with no hold) follows a gate asked that same frame. */
+enum { kPreNgNotAsked = -1, kPreNgGo = 0, kPreNgHold = 1, kPreNgRefuse = 2, kPreNgGoAfterHold = 3 };
+inline int PreNewGameGateAsk(int holdAnswer) { return (holdAnswer == kPreNgNotAsked || holdAnswer == kPreNgGoAfterHold) ? 1 : 0; }
+/* T-1365 stage 2: THE FIRST INDEX PAGE OF A NEW GAME'S EXCHANGE THAT ASKED FOR A TOWN. 1 = take the page's town areas as the list
+   (kPreSrcNewGameTown) before its rows are judged; 0 = keep every area record (kPreSrcNewGameAll: no town asked, the world server
+   named no area for it, or not the first page). */
+inline int PreTownListTake(int src, int townAsked, int firstPage, const std::vector<int>& townAreas)
+{
+    return (src == kPreSrcNewGameAll && townAsked != 0 && firstPage != 0 && townAreas.size() >= 2 && townAreas.size() % 2 == 0 && townAreas.size() / 2 <= kPreAreaMax) ? 1 : 0;
+}
 
 /* T-985 C2b fold 2 (re-check MED 1) + fold 3: AN INDEX ROW'S AREA AND FLAGS (world server, store_main.cpp PreIndexAreas). x, y = the
    record's area (off the grid = none); named = its key names its area (an area, ground, box or piece record); ofAskersFaction =
@@ -554,6 +618,82 @@ inline int PreMalformedBreaks(int phase) { return (phase == kPhIndex || phase ==
 /* T-1279 fold 2 (re-check A): the DONE line's "since the first index ask" - taken when the exchange finishes (PreloadFinish), BEFORE
    the first-ask time is zeroed there; 0 = no index ask was sent */
 inline unsigned int PreSinceFirstAsk(unsigned int firstAskMs, unsigned int nowMs) { return firstAskMs != 0 ? (unsigned int)(nowMs - firstAskMs) : 0u; }
+
+/* T-1390 part 2 (owner decision 1715): THE LOADING SCREEN'S PROGRESS LINE while a held load gets the world's records. While the index is
+   read (no total yet) "Syncing world..."; while records are fetched "Downloading world  <a> / <b> MB" (owner 1743 a), one decimal each - a = the record bytes received in
+   THIS exchange, b = the sum of the byte sizes of the rows this exchange wants (each exchange its own starting point). MB = 1048576
+   bytes, rounded to the nearest tenth; a is shown no higher than b (a re-asked row can bring its bytes twice). "" = no line. Pure. */
+const unsigned long long kPreProgMb = 1048576ULL;
+const unsigned long long kPreProgLogStep = 10ULL * 1048576ULL;   /* one [PRELOAD] progress line at most every 10 MB received ... */
+const int kPreProgLogCap = 40;                                     /* ... and at the end; at most this many a session */
+inline std::string PreMbText(unsigned long long bytes)
+{
+    const unsigned long long tenths = (bytes / kPreProgMb) * 10ULL + ((bytes % kPreProgMb) * 10ULL + kPreProgMb / 2ULL) / kPreProgMb;
+    char b[48]; std::sprintf(b, "%llu.%llu", tenths / 10ULL, tenths % 10ULL);
+    return std::string(b);
+}
+inline std::string PreProgressText(int phase, unsigned long long got, unsigned long long want)
+{
+    if (phase == kPhIndex) return "Syncing world...";   /* owner 1743 a (1739: the earlier words too long, unlike other online games) */
+    if (phase != kPhFetch && phase != kPhDone) return std::string();
+    return "Downloading world  " + PreMbText(got < want ? got : want) + " / " + PreMbText(want) + " MB";   /* owner 1743 a */
+}
+/* 1 = log the progress line now: at the end of the fetch, or once got has passed the last logged amount by kPreProgLogStep; never past the cap */
+inline int PreProgressLogDue(unsigned long long got, unsigned long long loggedAt, int end, int loggedCount)
+{
+    if (loggedCount >= kPreProgLogCap) return 0;
+    if (end) return 1;
+    return got >= loggedAt + kPreProgLogStep ? 1 : 0;
+}
+/* T-1390 TEST LEVER (owner decision 1720 a; F1105): KENSHI_SW_TEST_PRELOAD_SLOW=<seconds 5-120> keeps the real progress line up
+   long enough to be photographed - two holds of that many seconds in a joining game's held load: before the index ask (the checking
+   words up) and after the last record, before the load starts ("<b> of <b> MB" up). Test tooling only: no record or world is
+   touched. Parse: whole seconds, digits only, 5 to 120; anything else (unset, empty, out of range, not a number) = 0 = off. */
+const int kPreTestSlowMinSec = 5, kPreTestSlowMaxSec = 120;
+inline int PreTestSlowParse(const char* s)
+{
+    if (s == 0 || *s == 0) return 0;
+    int v = 0;
+    for (const char* p = s; *p != 0; ++p)
+    {
+        if (*p < '0' || *p > '9' || p - s >= 4) return 0;
+        v = v * 10 + (*p - '0');
+    }
+    return (v >= kPreTestSlowMinSec && v <= kPreTestSlowMaxSec) ? v : 0;
+}
+/* 1 = keep holding this frame: the lever is armed (sec > 0), the exchange's link is up (a lost link ends the hold - the normal rules
+   decide), and fewer than sec seconds have passed since the hold began. Off (sec 0) never holds. */
+inline int PreTestHold(int sec, int linkOk, unsigned int sinceMs)
+{
+    return (sec > 0 && linkOk != 0 && sinceMs < (unsigned int)sec * 1000u) ? 1 : 0;
+}
+/* T-1390 TEST LEVER, the HALF-WAY hold (brief 2026-11-16, item 1): the fetch waits the same seconds once the fetched bytes first pass
+   half of the wanted bytes, so a picture shows a part-filled bar. A FETCH asks up to kPreFetchBatch keys, and the world server sends a
+   batch's records back to back - a small world (T2472: 46 records, one batch) passes half INSIDE its one batch, where nothing can wait
+   without holding records on their road. So, with the lever armed only, the FIRST batch is cut where the wanted bytes (the index's
+   sizes, in want order) first reach half: PreTestHalfCut = how many keys it asks (0 = no cut: fewer than 2 keys, nothing wanted, or
+   the natural batch ends before half). The world server answers a shorter FETCH as any other; the records' road is not touched. */
+inline size_t PreTestHalfCut(const std::vector<unsigned long long>& sizes, size_t batch)
+{
+    const size_t n = sizes.size();
+    if (n < 2 || batch == 0) return 0;
+    unsigned long long total = 0ULL;
+    for (size_t i = 0; i < n; ++i) total += sizes[i];
+    if (total == 0ULL) return 0;
+    unsigned long long acc = 0ULL; size_t k = n;
+    for (size_t i = 0; i < n; ++i) { acc += sizes[i]; if (acc >= total - acc) { k = i + 1; break; } }   /* acc * 2 >= total, no overflow */
+    if (k >= n) k = n - 1;   /* at least one key is left for after the hold */
+    return k < batch ? k : 0;
+}
+/* 1 = the half-way hold begins at this FETCH_END: armed, not taken yet in this load, more is to be fetched, and the fetched bytes have
+   reached half of the wanted bytes - or the lever's cut first batch has just been answered (the index's sizes and the records'
+   bytes can differ by a little). Off (sec 0) never holds. */
+inline int PreTestMidDue(int sec, int done, unsigned long long got, unsigned long long want, int more, int cutAnswered)
+{
+    if (sec <= 0 || done != 0 || more == 0) return 0;
+    if (cutAnswered != 0) return 1;
+    return (want > 0ULL && (got >= want || got >= want - got)) ? 1 : 0;   /* got * 2 >= want, no overflow */
+}
 
 }   /* namespace cooppre */
 

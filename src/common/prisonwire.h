@@ -44,7 +44,10 @@
  * and asks the freer's game to hire the prisoner through the hire handshake (MSG_HIRE REQ to the owner). kind kPrisonJoinNo (the
  * freer's game -> owner): that game did not ask (u8 reason, kJoinNo*). All three carry no keys (empty); after the outer key: u32
  * freerUid (not 0, not `uid`); for kPrisonFreed one more byte, the locks the freer's game read open on its copy as it sent the
- * message (kFreedLock* bits: 1 shackles, 2 cage); for kPrisonJoinNo one more byte, the reason (1..kJoinNoMax).
+ * message (kFreedLock* bits: 1 shackles, 2 cage), then (game-to-game protocol 228, T-1296) one more byte, freedLeft: 1 when the
+ * freer's copy had left the cage the event found it in by the send (the release task takes it out; a pick leaves it in), else 0 -
+ * a FREED without that byte (an older game's 12 bytes) reads as 0, no take-out; for kPrisonJoinNo one more byte, the reason
+ * (1..kJoinNoMax).
  *
  * A kPrisonRelease whose cage key is kPrisonBailKey ("@bail") is a bail paid on the sender's game
  * (CharacterTrading_PrisonerBailout's confirm, 1.0.68 0x6AE170): the owner releases its own character as that confirm does - every
@@ -92,6 +95,7 @@ const int kPrisonDecodeBadSlave = 8;   /* kPrisonSlaveAsk with a state outside 0
 const int kPrisonDecodeBadFreer = 9;   /* kPrisonFreed / kPrisonJoinAsk / kPrisonJoinNo with a freer uid of 0 or equal to the prisoner's */
 const int kPrisonDecodeBadReason = 10; /* kPrisonJoinNo with a reason outside 1..kJoinNoMax */
 const int kPrisonDecodeBadLocks = 11;  /* kPrisonFreed with a lock bit other than kFreedLockShackles / kFreedLockCage */
+const int kPrisonDecodeBadLeft = 12;   /* kPrisonFreed with a freedLeft byte other than 0 or 1 (T-1296) */
 /* kPrisonFreed's lock byte: the restraints the freer's game read open on its copy as it sent the message */
 const unsigned char kFreedLockShackles = 1, kFreedLockCage = 2, kFreedLocksAll = 3;
 /* kPrisonJoinNo reasons (the freer's game: JoinAskDecide below, or the hire road's own refusal to ask) */
@@ -134,8 +138,9 @@ struct PrisonMsg
     unsigned int freerUid;    /* kPrisonFreed / kPrisonJoinAsk / kPrisonJoinNo only: the freeing player's character */
     unsigned char joinNo;     /* kPrisonJoinNo only: kJoinNo* (1..kJoinNoMax) */
     unsigned char freedLocks; /* kPrisonFreed only: kFreedLock* bits */
+    unsigned char freedLeft;  /* kPrisonFreed only (T-1296, protocol 228): 1 the freer's copy left its cage after the event (absent: 0) */
     PrisonMsg() : uid(0), kind(0), sentence(2), permanent(0), lockFlags(0), lockLevel(0), slaveFrom(0), slaveWant(0), freerUid(0), joinNo(0),
-                  freedLocks(0)
+                  freedLocks(0), freedLeft(0)
     { pos[0] = 0.0f; pos[1] = 0.0f; pos[2] = 0.0f; }
 };
 
@@ -167,11 +172,11 @@ inline bool EncodePrison(std::vector<char>* b, const PrisonMsg& m)
     if (m.kind == kPrisonSlaveAsk && !PrisonSlaveAskOk(m.slaveFrom, m.slaveWant)) return false;
     if (PrisonCarriesFreer(m.kind) && !PrisonFreerOk(m.uid, m.freerUid)) return false;
     if (m.kind == kPrisonJoinNo && (m.joinNo < 1 || m.joinNo > kJoinNoMax)) return false;
-    if (m.kind == kPrisonFreed && (m.freedLocks & ~kFreedLocksAll) != 0) return false;
+    if (m.kind == kPrisonFreed && ((m.freedLocks & ~kFreedLocksAll) != 0 || m.freedLeft > 1)) return false;
     const size_t at = b->size();
     b->resize(at + 4 + 1 + 1 + m.cageKey.size() + 1 + m.outerKey.size() + (m.kind == kPrisonIn ? 1 : 0) + (m.kind == kPrisonBedIn ? 12 : 0)
               + (m.kind == kPrisonBedRefused ? 1 : 0) + (PrisonIsLockKind(m.kind) ? 5 : 0) + (m.kind == kPrisonSlaveAsk ? 2 : 0)
-              + (PrisonCarriesFreer(m.kind) ? 4 : 0) + ((m.kind == kPrisonJoinNo || m.kind == kPrisonFreed) ? 1 : 0));
+              + (PrisonCarriesFreer(m.kind) ? 4 : 0) + (m.kind == kPrisonJoinNo ? 1 : 0) + (m.kind == kPrisonFreed ? 2 : 0));
     char* p = &(*b)[at];
     std::memcpy(p, &m.uid, 4); p += 4;
     *p++ = (char)m.kind;
@@ -186,7 +191,7 @@ inline bool EncodePrison(std::vector<char>* b, const PrisonMsg& m)
     if (m.kind == kPrisonSlaveAsk) { p[m.outerKey.size()] = (char)m.slaveFrom; p[m.outerKey.size() + 1] = (char)m.slaveWant; }
     if (PrisonCarriesFreer(m.kind)) std::memcpy(p + m.outerKey.size(), &m.freerUid, 4);
     if (m.kind == kPrisonJoinNo) p[m.outerKey.size() + 4] = (char)m.joinNo;
-    if (m.kind == kPrisonFreed) p[m.outerKey.size() + 4] = (char)m.freedLocks;
+    if (m.kind == kPrisonFreed) { p[m.outerKey.size() + 4] = (char)m.freedLocks; p[m.outerKey.size() + 5] = (char)m.freedLeft; }
     return true;
 }
 
@@ -262,6 +267,8 @@ inline int DecodePrison(const char* p, size_t size, PrisonMsg* out)
             if (size - off < 5) return kPrisonDecodeTooShort;
             m.freedLocks = (unsigned char)p[off + 4];
             if ((m.freedLocks & ~kFreedLocksAll) != 0) return kPrisonDecodeBadLocks;
+            m.freedLeft = (size - off >= 6) ? (unsigned char)p[off + 5] : (unsigned char)0;   /* T-1296: an older game's FREED has none - 0 */
+            if (m.freedLeft > 1) return kPrisonDecodeBadLeft;
         }
     }
     if (out) *out = m;
@@ -563,6 +570,10 @@ inline int FreedCageAtEvent(int cagedAtEvent, int lockRead, bool lockOpen)
     if (lockRead == 0) return kFreedCageNone;
     return lockOpen ? kFreedCageOpen : kFreedCageLocked;
 }
+/* T-1296 review M1, the freer's game, main thread, at the send: the copy left its cage - in a cage at the event (cagedAtEvent 1)
+   and not in anything now (insNow 0). The release task takes the prisoner out right after the event (decomp_357040 :116-121);
+   the pick task (0x359100) raises the same event and leaves it in the opened cage. insNow -1 (unreadable) or 1 (a bed): 0. */
+inline unsigned char FreedCopyLeftCage(int cagedAtEvent, int insNow) { return (cagedAtEvent == 1 && insNow == 0) ? 1 : 0; }
 inline const char* FreedCageName(int cageAtEvent)
 {
     return cageAtEvent == kFreedCageOpen ? "open" : cageAtEvent == kFreedCageLocked ? "locked" : cageAtEvent == kFreedCageUnread ? "unread" : "none";
@@ -594,6 +605,23 @@ inline int FreedOwnerDecide(bool prisonerMine, bool prisonerHere, bool freerHere
     if (!freerFromSender) return kFreedFreerNotSender;
     if ((freedLocks & lockedHere & kFreedLocksAll) != 0) return kFreedLockShut;
     return kFreedRaise;
+}
+
+/* T-1296 (T2403, Confirmed): the owner, right after it raised a freeing on its own prisoner (FreedOwnerDecide kFreedRaise): the
+   unlock event takes no one out (for a player's character the engine raises nothing at all), while the freer's engine's release
+   task (0x357040) took its copy out with the walk-out order 0x85 and setPrisonMode(prisoner, 0, 0). So the owner takes its own
+   character out the same way - only when the message says the freer's copy left its cage (copyLeft, review M1: a cage PICK raises
+   the same event and only opens the cage, in the base game too), the character is alive (review L4), still reads caged here
+   (in-something 2), and its cage is found with its lock reading open here. */
+const int kFreedOutTake = 0, kFreedOutCopyStayed = 1, kFreedOutNotCaged = 2, kFreedOutNoCage = 3, kFreedOutCageLocked = 4, kFreedOutDead = 5;
+inline int FreedTakeOutDecide(unsigned char copyLeft, bool dead, int inSomething, bool cageFound, bool cageLockedHere)
+{
+    if (copyLeft == 0) return kFreedOutCopyStayed;
+    if (dead) return kFreedOutDead;
+    if (inSomething != 2) return kFreedOutNotCaged;
+    if (!cageFound) return kFreedOutNoCage;
+    if (cageLockedHere) return kFreedOutCageLocked;
+    return kFreedOutTake;
 }
 
 /* The owner, any thread, a line about to run its actions: a line carrying the join act (18) whose speaker is this game's own

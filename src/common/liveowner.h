@@ -947,9 +947,11 @@ inline bool ReleaseAckDecode(const char* p, size_t n, ReleaseAckMsg* out)
    stopped listing the area (review HIGH-1). *notInWorld (may be 0) = games skipped only because they are not IN_WORLD.
    The receiver's own engine-loaded check stays the final say: a map lagging it costs one refused offer (the RELEASE adds it to tried). */
 /* T-650 fold 2 (T1056; Read from the engine's ActivePlatoon frame check 0x4FE140 and the keep-rectangle builder 0xA088A0, exe constants
-   Confirmed). THE ENGINE'S KEEP RULE: each frame a squad's CENTRE is tested against its area's square widened by 10 on every side, then
-   narrowed by 170 on each SIDE whose neighbour area is not loaded (the neighbour's ZoneMap +0xB1 and +0xB0 both clear; diagonal areas are
-   never read) - a centre within 160 of such a side is put away after a 4 s grace even inside a loaded area. EngineKeepsAt asks that
+   Confirmed). THE ENGINE'S KEEP RULE: each frame a squad's own stored position (ActivePlatoon +0xB4/+0xBC as the previous update left
+   it - not its people's centre: T-1355, decomp_4fe140 / decomp_4ff930) is tested against its area's square widened by 10 on every side,
+   then narrowed by 170 on each SIDE whose neighbour area is not loaded (the neighbour's ZoneMap +0xB1 and +0xB0 both clear; diagonal areas
+   are never read) - a position within 160 of such a side is put away after a 4 s grace (ActivePlatoon +0xB0) even inside a loaded area,
+   and the squad sleeps at that same position (Platoon::deactivate copies it to its sleeping spot). EngineKeepsAt asks that
    question with a margin: 1 = the area is loaded and, for each side, the neighbour is loaded or (x, z) is at least kEngineEdgeStrip +
    margin from that side; 0 = not kept; -1 = the area's own flag, or a side flag that would decide, unreadable (< 0).
    minX / minZ = the area's low corner, size = its side (AreaMinUnits / kAreaSizeUnits); W = low x, E = high x, S = low z, N = high z. */

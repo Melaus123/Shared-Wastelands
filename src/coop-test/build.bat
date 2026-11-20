@@ -3,8 +3,7 @@ rem Build and RUN coop_test.exe - the offline suite (P7u, design-offline-tests 4
 rem P7y: it also sweeps src\common\loadlatch.h (the world-generation latch, F610). That header is
 rem header-only and pure, so it needs no extra translation unit here - only the /I ..\common below.
 rem Keep this file pure ASCII (see note in tools\vc2010-env.bat). VS2010 cl wants /FeNAME with NO colon (F025).
-rem NO /GL and NO /LTCG: the plugin keeps them only so its own code generation matches its earlier builds; this
-rem exe links nothing but the CRT.
+rem NO /GL and NO /LTCG, like the plugin since owner decision 1807; this exe links nothing but the CRT.
 setlocal
 call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
 cd /d "%~dp0"

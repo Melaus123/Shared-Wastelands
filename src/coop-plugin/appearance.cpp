@@ -2352,6 +2352,7 @@ static int          g_koSelfChecks  = 0;
 static bool         g_koSelfTook    = false;
 static LONG         g_koSelfCalls = 0, g_koSelfKnocks = 0;
 
+static void KoHoldArm(unsigned int uid, float seconds);   // T-1411 (below)
 std::string KoSelfLever(unsigned int uid, float seconds)
 {
     if (uid == 0) return "error koself usage: koself <uid> [seconds]";
@@ -2370,6 +2371,7 @@ std::string KoSelfLever(unsigned int uid, float seconds)
     ::InterlockedIncrement(&g_koSelfCalls);
     g_koSelfLastUid = uid;
     g_koSelfUid = (ko >= 0) ? uid : 0; g_koSelfAt = P10Now(); g_koSelfChecks = 0; g_koSelfTook = false;
+    if (clock >= 0.0f) KoHoldArm(uid, seconds);   // T-1411: the hold lasts (KoSelfHoldTick)
     const std::string line = "uid=" + S((long long)uid) + " knockout=" + S((long long)ko) + " holdS=" + P10F(seconds)
         + " clockAfterHold=" + P10F(clock) + " before[" + beforeLine + " ]"
         + " calls,knocks=" + S((long long)g_koSelfCalls) + "," + S((long long)g_koSelfKnocks);
@@ -2379,9 +2381,81 @@ std::string KoSelfLever(unsigned int uid, float seconds)
 
 unsigned int KoSelfLastUid() { return g_koSelfLastUid; }
 
+// T-1411 TEST-ONLY: the `koself <uid> <seconds>` hold LASTS. T2533: the hold was one write of the wake-up clock (420 s), and
+// the engine's own put-down (an NPC's order 69) set the clock again to 14.48 s - the body stood up 9 s later, 86 s into a
+// 420 s hold. Now each hold is kept (at most kKoHoldMax uids, a new koself of a held uid re-arms it) until its real-time end:
+// every kKoHoldTickMs, while the character is this game's, alive and still unconscious, a clock below kKoHoldBelowS is set to
+// the hold's seconds left (at least kKoHoldMinS - "at least that long" may run up to a minute over). The hold ends at its end
+// time, or when the character is gone / not this game's / dead / awake (one line). Only uids `koself` named with seconds > 0:
+// no other character is touched. [P11] koself hold renewed / ended lines, at most kKoHoldLinesMax a launch. MAIN THREAD.
+static const int   kKoHoldMax = 8;
+static const DWORD kKoHoldTickMs = 250;
+static const float kKoHoldBelowS = 30.0f, kKoHoldMinS = 60.0f;
+static const LONG  kKoHoldLinesMax = 40;
+static const DWORD kKoHoldAwakeGraceMs = 5000;   // read awake this soon after the koself call: not yet unconscious, kept
+struct KoHold { unsigned int uid; DWORD armed; DWORD until; int renewals; };
+static KoHold g_koHold[kKoHoldMax];
+static DWORD  g_koHoldLastTick = 0;
+static LONG   g_koHoldLines = 0;
+static void KoHoldLog(const std::string& line)
+{
+    if (::InterlockedIncrement(&g_koHoldLines) <= kKoHoldLinesMax) DebugLog(line);
+}
+static void KoHoldArm(unsigned int uid, float seconds)
+{
+    int at = -1;
+    for (int i = 0; i < kKoHoldMax; ++i) if (g_koHold[i].uid == uid) { at = i; break; }
+    if (at < 0) for (int i = 0; i < kKoHoldMax; ++i) if (g_koHold[i].uid == 0) { at = i; break; }
+    if (at < 0)
+    {
+        KoHoldLog("[P11] koself hold (TEST) uid=" + S((long long)uid) + " NOT kept: " + S((long long)kKoHoldMax)
+                  + " holds already run (the one-write hold above still stands)");
+        return;
+    }
+    g_koHold[at].uid = uid; g_koHold[at].armed = P10Now(); g_koHold[at].until = P10Now() + (DWORD)(seconds * 1000.0f); g_koHold[at].renewals = 0;
+    KoHoldLog("[P11] koself hold kept (TEST) uid=" + S((long long)uid) + " forS=" + P10F(seconds)
+              + " - a wake-up clock below " + P10F(kKoHoldBelowS) + " is set to the hold's seconds left while it lasts");
+}
+static void KoSelfHoldTick()
+{
+    const DWORD now = P10Now();
+    if (now - g_koHoldLastTick < kKoHoldTickMs) return;
+    g_koHoldLastTick = now;
+    for (int i = 0; i < kKoHoldMax; ++i)
+    {
+        KoHold& h = g_koHold[i];
+        if (h.uid == 0) continue;
+        const long left = (long)(h.until - now);
+        if (left <= 0)
+        {
+            KoHoldLog("[P11] koself hold ended (TEST) uid=" + S((long long)h.uid) + " why=time renewals=" + S((long long)h.renewals));
+            h.uid = 0; continue;
+        }
+        float leftS = (float)left / 1000.0f;
+        if (leftS < kKoHoldMinS) leftS = kKoHoldMinS;
+        float before = -1.0f;
+        const float after = KnockClockRenewOwned(h.uid, kKoHoldBelowS, leftS, &before);
+        if (after <= -3.0f && now - h.armed < kKoHoldAwakeGraceMs) continue;   // `unconcious` follows the knockout at the medical update
+        if (after < 0.0f)
+        {
+            const char* why = after <= -3.0f ? "awake" : (after <= -2.0f ? "dead" : "gone or not this game's");
+            KoHoldLog("[P11] koself hold ended (TEST) uid=" + S((long long)h.uid) + " why=" + why + " koTimer=" + P10F(before)
+                      + " holdLeftS=" + P10F((float)left / 1000.0f) + " renewals=" + S((long long)h.renewals));
+            h.uid = 0; continue;
+        }
+        if (after != before)
+        {
+            ++h.renewals;
+            KoHoldLog("[P11] koself hold renewed (TEST) uid=" + S((long long)h.uid) + " koTimer " + P10F(before) + " -> "
+                      + P10F(after) + " holdLeftS=" + P10F((float)left / 1000.0f) + " renewals=" + S((long long)h.renewals));
+        }
+    }
+}
+
 // owner half: did the knockout take? Checked one tick after the call and again 2 s after it (P10KnockCheck's rule).
 static void KoSelfTick()
 {
+    KoSelfHoldTick();   // T-1411: returns at once unless a `koself` hold is kept
     if (g_koSelfUid == 0) return;
     const DWORD now = P10Now();
     const DWORD due = (g_koSelfChecks == 0) ? kP10TickMs : kP10KoCheck2Ms;

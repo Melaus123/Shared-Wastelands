@@ -16,6 +16,7 @@
 #include "money.h"
 #include "store.h"
 #include "chat.h"
+#include "tradewin.h"   /* T-1167 piece 3 build 3: TradeWinQuietMoney */
 #include "playerstab.h"
 #include "coop_log.h"
 #include "../common/moneywire.h"
@@ -52,6 +53,7 @@ unsigned long long g_appliedSent = 0;                         /* the applied num
 long g_appliedSentOn = -1;                                    /* ... and the link it went on (-1: send it again) */
 std::string g_waitSaid;                                       /* the reason the last "wait" line gave */
 bool g_roomSaid = false;                                      /* the "no room in the purse" line said for the waiting rows */
+std::set<unsigned long long> g_tradeInbox;                    /* T-1167 piece 3 build 3: inbox numbers a trade's COMMIT credited (no "sent you" line) */
 long long g_sent = 0, g_sendRefused = 0, g_sendsOut = 0, g_acks = 0, g_refunds = 0, g_delivers = 0, g_applied = 0, g_repeats = 0,
           g_appliedOut = 0, g_malformed = 0, g_notSaved = 0, g_writeFails = 0;
 
@@ -191,6 +193,11 @@ void Apply(moneyw::Ledger* l)
         if (w[i].inbox <= before.applied || w[i].inbox > upTo) continue;
         g_waiting.erase(w[i].inbox); ++g_applied;
         const std::string name = NameOf(w[i].fromSlot);
+        if (g_tradeInbox.count(w[i].inbox) != 0 || coop::TradeWinQuietMoney(w[i].fromSlot, w[i].amount, w[i].inbox))
+        {   /* T-1167 piece 3 build 3: a trade's money - the trade's own chat line names it */
+            DebugLog("[MONEY] inbox " + U(w[i].inbox) + ": " + N(w[i].amount) + " from slot " + N((long long)w[i].fromSlot) + " added - a player trade's money (no 'sent you' line)");
+            continue;
+        }
         coop::ChatMoneyLine(w[i].fromSlot == 0xFFFFFFFFu ? -1 : (int)w[i].fromSlot, name, moneyw::GotLine(name, w[i].amount));
         DebugLog("[MONEY] inbox " + U(w[i].inbox) + ": " + N(w[i].amount) + " from slot " + N((long long)w[i].fromSlot) + " added");
     }
@@ -377,6 +384,56 @@ std::string MoneyTestCommand(const std::string& args)
 }
 
 int MoneyHave(int* money) { return coop::StoreMoneyRead(money) == 1 ? 1 : 0; }
+
+int MoneyTradeSettle(unsigned long long tradeId, unsigned long long inbox, int cats, unsigned fromSlot, unsigned long long* seq)
+{
+    *seq = 0;
+    moneyw::Ledger* l = coop::StoreMoneyLedger();
+    if (l == 0) return 0;
+    const moneyw::Ledger before = *l;
+    moneyw::HoldRow h;
+    const bool dropped = moneyw::LedgerDropHold(l, tradeId, &h);   /* this side's held money: the other side's now (booked by the world server) */
+    long long sum = 0;
+    std::vector<moneyw::Deliver> w;
+    if (cats > 0 && inbox != 0 && moneyw::InDecide(l->applied, inbox) == moneyw::kInApply)
+    {
+        for (std::map<unsigned long long, moneyw::Deliver>::const_iterator it = g_waiting.begin(); it != g_waiting.end(); ++it) if (it->first < inbox) w.push_back(it->second);
+        moneyw::Deliver d; d.inbox = inbox; d.fromSlot = fromSlot; d.amount = cats; w.push_back(d);
+        int money = 0;
+        if (coop::StoreMoneyRead(&money) != 1) { *l = before; return 0; }
+        unsigned long long upTo = 0; size_t repeats = 0;
+        moneyw::ApplyPlan(w, l->applied, money, &sum, &upTo, &repeats);
+        if (upTo < inbox) { *l = before; return 0; }   /* the purse has no room for it yet: tried again */
+        if (coop::StoreMoneyAdjust((int)sum) != 1) { *l = before; return 0; }
+        l->applied = upTo;
+    }
+    if (!dropped && w.empty()) return 1;   /* nothing to write: a repeat (the applied number covers it, no held row left) */
+    const bool wrote = coop::StoreMoneyWriteNow(seq);
+    if (!wrote)
+    {
+        if (sum == 0 || coop::StoreMoneyAdjust(-(int)sum) == 1) { *l = before; if (++g_writeFails <= 5) DebugLog("[MONEY] trade " + U(tradeId) + ": its money could not be written to pp.money - nothing changed, tried again"); return 0; }
+        g_owed = true; if (!w.empty()) g_owedApplied = true;   /* the money could not be taken out again: it stands, the write owed (PayOwed) */
+        *seq = 0;
+    }
+    else if (!w.empty()) g_appliedSeq = *seq;
+    if (!w.empty())
+    {
+        g_appliedSentOn = -1;
+        g_tradeInbox.insert(inbox);
+        for (size_t i = 0; i < w.size(); ++i)
+        {
+            if (w[i].inbox <= before.applied || w[i].inbox > l->applied) continue;
+            g_waiting.erase(w[i].inbox); ++g_applied;
+            if (w[i].inbox == inbox) continue;
+            const std::string name = NameOf(w[i].fromSlot);
+            coop::ChatMoneyLine(w[i].fromSlot == 0xFFFFFFFFu ? -1 : (int)w[i].fromSlot, name, moneyw::GotLine(name, w[i].amount));
+        }
+    }
+    DebugLog("[MONEY] trade " + U(tradeId) + ": " + (dropped ? "the held " + N(h.amount) + " c. dropped (the other side's now)" : std::string("no held row"))
+             + (w.empty() ? std::string(", their money already in the balance or none") : ", " + N(sum) + " added up to inbox " + U(l->applied) + " (their " + N(cats) + " under inbox " + U(inbox) + ")")
+             + " - one pp.money write" + (wrote ? " (seq " + U(*seq) + ")" : std::string(" owed")));
+    return 1;
+}
 
 int MoneySend(int slot, const std::string& name, const std::string& typed, std::string* hint)
 {

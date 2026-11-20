@@ -53,6 +53,7 @@
 #include "../common/aimstamp.h"   /* T-330: the owner's aim word and the copy's raise / lower step */
 #include "effect.h"   /* T-327: InstallEffectHook, EffectSafePointDrain */
 #include "../common/windowbound.h"   /* T-986 fold 1: which close leaves combat mode (winbound::CloseKind) */
+#include "../common/windowfollow.h"   /* T-1422 fix 2f: which road issues the floor walk's route request */
 #include "../common/physqueued.h"   /* T-1046 fix 1: is a physics piece already queued for delete (its first-ready setup skipped) */
 namespace coop { void RestockNowDrain(); }   /* par2: items.cpp - the `restocknow` lever runs at this same safe point */
 namespace coop { void TraderSpawnDrain(); }   /* traderspawn: items.cpp - the `traderspawn` lever runs at this same safe point */
@@ -5056,6 +5057,37 @@ int GroundTerrainHeightAt(float x, float z, float* out)
 {
     return GlHeight(x, z, out);
 }
+// T-1393 (ping.cpp): the physics scene's first hit along a ray - GlTrace, the same UtilityT::trace call and group mask groundline
+// uses (world space; its traces count in the GROUNDLINE REPORT). 1 a hit (*pt the point), 0 no hit or the engine refused to trace
+// now, -1 no address row / the call faulted. MAIN THREAD.
+int GroundTraceAt(const float* origin, const float* dir, float* pt)
+{
+    GlHit h;
+    const int r = GlTrace(origin, dir, &h);
+    if (r != 1) return r < 0 ? -1 : 0;
+    if (h.hit == 0) return 0;
+    pt[0] = h.pt[0]; pt[1] = h.pt[1]; pt[2] = h.pt[2];
+    return 1;
+}
+
+// T-1372 A1: the ground a building's createPhysical 0x55FF50 adds to its placement input (decomp_55ff50.txt:186, 205; a
+// building standing inside nothing (hand +0x88 = 0xB), with no layout link (+0x238) and its +0x1A0 byte 0).
+// Row BuildingPlaceGround: Steam 1.0.65 0x9B2850 / 1.0.68 0x9B3720 (the same 66-byte function, gen_table_1068 'same'):
+// x XMM0, z XMM1; it calls getTerrainHeightFast 0x9B2420 (map 0, through the stub 0x217F6 / 0x21800) and answers the
+// larger of that height and the exe's 100.0 (0x1682250 / 0x1683250) - so where the terrain is lower than 100, or none
+// answers (-99), the engine adds 100. Called here as the engine calls it. 1 = *out holds it; -1 no row / the call faulted.
+// MAIN THREAD.
+static unsigned long long kGlPlaceGround = 0; static coop::AddrReg kGlPlaceGround_reg("BuildingPlaceGround", &kGlPlaceGround);   /* Steam_1.0.65 0x9B2850 */
+int GroundPlaceHeightAt(float x, float z, float* out)
+{
+    *out = 0.0f;
+    const unsigned long long a = (kGlPlaceGround != 0) ? coop::AddrAbs(kGlPlaceGround) : 0;
+    if (a == 0) return -1;
+    typedef float (*Fn)(float x, float z);
+    __try { *out = ((Fn)a)(x, z); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return 1;
+}
 
 static int GlPointsInRing(int ring)
 {
@@ -7651,7 +7683,149 @@ int UpdHash(const void* p)
     return (int)(((uintptr_t)p >> 4) & (uintptr_t)kUpdMask);
 }
 
+// T-1422 fix 2 (F1412 / F1414; owner 1771 a/b) - A COPY IN A NATIVE WINDOW IS NOT WALKED BY ITS FIGHT ROUTINE. The fight routine
+// sets the movement mode on every pass while the copy keeps its melee task (decomp_60cc10.txt:94-96) and chases this game's copy of
+// its target, so a fight on stairs settled where the local copies were, floors from the owner. After each pass the copy's walking
+// is stopped here; the drive places it on its authority's route (replicate.cpp, windowfollow.h). The window flag the AI worker
+// reads is this table's copy of the drive's (NativeWindowStopMark, main thread): the fight object published last, read unlocked -
+// a stale read costs one stop of a copy whose window has just closed (the drive moves it again on its next frame).
+// Fix 2b / 2c: a slot whose copy is on another floor than its owner carries a walk (walk = 1, the goal under a seqlock: the main
+// thread only publishes it; the route request is issued HERE on the AI worker after each pass instead of the stop - the fight
+// routine cancels a route by setting the movement mode on every pass, F1414). A renewal the engine answers 'path failed' marks the
+// slot failed (the main thread ends the walk and says why) and the copy is stopped again. Swings: CHANGES into the attack state
+// (+0x1F0 == 0) after a pass, this window - the first read only primes (review SHOULD 4 / 8: measured, behaviour unchanged). No hook frees a fight object here: a slot is cleared by the
+// window's close, the copy's drop or reset, and world teardown (the copy's fight object lives as long as the copy).
+// Fix 2f (F1424): the route request is ALSO issued by the main thread on a frame where no fight pass ran for the copy since its
+// previous frame (the copy's own engine ended its fighting: no pass, the walk froze for 29.5 s in T2602). `passes` counts this
+// slot's fight passes (AI worker); the main thread compares it frame to frame (passesPrev, main only). Both roads issue under the
+// slot's lock, which also guards walkSeq / renewals / failSeenClear, lastRoad. fold 2g: the worker renews
+// after EVERY pass (a pass cancels the route, F1414); mainFrame is the main thread's frame number.
+struct NwStopSlot { const void* volatile cc; volatile LONG uid; volatile LONG64 stops; volatile LONG walk; volatile LONG failed;
+                    volatile LONG seq; volatile float wx, wy, wz;   // seqlock: odd while the main thread writes the goal
+                    volatile LONG64 routes; volatile LONG lastSt; volatile LONG64 swings;
+                    LONG walkSeq; int renewals; int failSeenClear;   // under the lock: the goal's sequence these renewals are for
+                    volatile LONG64 passes; volatile LONG lock; volatile LONG64 mainFrame; volatile LONG64 mainRoutes;   // fix 2f
+                    volatile LONG lastRoad;   // fix 2f, under the lock: the last request's road (information)
+                    LONG64 passesPrev; };   // fix 2f, main thread only: `passes` at its previous frame (-1 none yet)
+const LONG kNwStUnread = -2;   // lastSt before the first read of this window
+// fix 2d: 'path failed' can still be the PREVIOUS route's right after a request (replicate.cpp PathDriveStep's D2-c note): a 1 is
+// trusted only from the second renewal of a goal on, and only once the flag has read 0 since the goal was published or this many
+// renewals later (the path drive's own rule, kPathFailTrustTicks there, counted here in fight passes).
+const int kNwFailTrustRenewals = 2;
+const int kNwStopSlots = 64;
+NwStopSlot g_nwStop[kNwStopSlots];
+volatile LONG g_nwStopActive = 0;     // slots with a fight object: the detour's cheap filter
+volatile LONG64 g_nwStopsTotal = 0;   // stops made (all copies, all windows)
+volatile LONG64 g_nwStopRefused = 0;  // stops refused (movement unreadable or the call faulted)
+volatile LONG64 g_nwRoutesTotal = 0;  // fix 2b: route requests renewed after a pass (copies walking back to their owner's floor)
+volatile LONG64 g_nwRouteRefused = 0; // fix 2b: renewals refused
+volatile LONG64 g_nwRoutesMain = 0;   // fix 2f: of the renewals, those the main thread issued (no fight pass since its last frame)
+volatile LONG64 g_nwRouteBusy = 0;    // fix 2f / fold 2g: a pass whose bounded wait for the slot lock gave up: no renewal after it
+long long g_nwMainBusy = 0;           // fix 2f: main-thread frames that found the slot locked (a pass renewing): no main request
+long long g_nwStopNoSlot = 0;         // main thread: a window opened with all slots taken (that copy is not stopped)
+long long g_nwStopNoCc = 0;           // main thread: a window opened on a copy with no fight object (not stopped)
+static void* NwReadMovement(const void* cc)
+{
+    __try { return *(void* const*)((const char*)cc + kMovementOff); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static bool NwTryLock(int i) { return InterlockedCompareExchange(&g_nwStop[i].lock, 1, 0) == 0; }
+static void NwUnlock(int i) { InterlockedExchange(&g_nwStop[i].lock, 0); }
+// UNDER THE SLOT LOCK (either road): one route request to the walk's published goal; the 'path failed' trust rule of fix 2d / 2e.
+static void NwIssueWalk(int i, void* mv, int road)
+{
+    float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+    bool got = false;
+    LONG readSeq = -1;   // fix 2e: the goal version this request is for (the one read below, not a later one)
+    for (int k = 0; k < 4 && !got; ++k)   // seqlock read: an even, unchanged sequence around the copy
+    {
+        const LONG s1 = g_nwStop[i].seq;
+        if (s1 & 1) { YieldProcessor(); continue; }
+        MemoryBarrier();
+        gx = g_nwStop[i].wx; gy = g_nwStop[i].wy; gz = g_nwStop[i].wz;
+        MemoryBarrier();
+        got = g_nwStop[i].seq == s1;
+        if (got) readSeq = s1;
+    }
+    if (got && mv != 0 && RouteCopyTo(mv, gx, gy, gz))
+    {
+        InterlockedIncrement64(&g_nwStop[i].routes); InterlockedIncrement64(&g_nwRoutesTotal);
+        if (road == windowfollow::kWalkRoadMain) { InterlockedIncrement64(&g_nwStop[i].mainRoutes); InterlockedIncrement64(&g_nwRoutesMain); }
+        InterlockedExchange(&g_nwStop[i].lastRoad, (LONG)road);
+        const LONG sq = readSeq;   // fix 2e: the version read before the request
+        if (sq != g_nwStop[i].walkSeq) { g_nwStop[i].walkSeq = sq; g_nwStop[i].renewals = 0; g_nwStop[i].failSeenClear = 0; }   // a new goal
+        ++g_nwStop[i].renewals;
+        const int f = CopyPathFailed(mv);
+        if (f == 0) g_nwStop[i].failSeenClear = 1;
+        else if (f == 1 && g_nwStop[i].renewals >= 2 && (g_nwStop[i].failSeenClear || g_nwStop[i].renewals > kNwFailTrustRenewals))
+            InterlockedExchange(&g_nwStop[i].failed, 1);   // ended by the main thread, reason logged
+        return;
+    }
+    InterlockedIncrement64(&g_nwRouteRefused);
+}
+// fix 2f, AI WORKER: before the fight routine's pass - a copy with a stop slot holds the slot's lock for the whole pass, so the main
+// thread's route request (a try-lock that never waits) does not run while this copy's fight routine does - EXCEPT when this bounded
+// wait gives up (the pass then runs unlocked as before fix 2f, counted nwPassUnlocked) or the slot was reused and its lock reset
+// while a pass held it. The main thread holds the lock only for one request. Returns the slot locked, or -1.
+volatile LONG64 g_nwPassNoLock = 0;
+const int kNwPassLockSpins = 4000;
+static int NwPassBegin(const void* cc)
+{
+    if (g_nwStopActive == 0 || cc == 0) return -1;
+    for (int i = 0; i < kNwStopSlots; ++i)
+    {
+        if (g_nwStop[i].cc != cc) continue;
+        for (int k = 0; k < kNwPassLockSpins; ++k) { if (NwTryLock(i)) return i; YieldProcessor(); }
+        InterlockedIncrement64(&g_nwPassNoLock);
+        return -1;
+    }
+    return -1;
+}
+// AI WORKER: after the fight routine's pass - a copy with its window open has its walking stopped. `locked`: the slot NwPassBegin
+// locked (-1 none); the caller releases it.
+static void NwStopAfterPass(const void* cc, int locked)
+{
+    if (g_nwStopActive == 0 || cc == 0) return;
+    for (int i = 0; i < kNwStopSlots; ++i)
+    {
+        if (g_nwStop[i].cc != cc) continue;
+        InterlockedIncrement64(&g_nwStop[i].passes);   // fix 2f: before any lock - the main thread's 'a pass ran' test reads it
+        int st = -1, flag = -1; float timer = 0.0f;
+        if (CrReadCc(cc, &st, &timer, &flag))
+        {
+            if (st == 0 && g_nwStop[i].lastSt != 0 && g_nwStop[i].lastSt != kNwStUnread) InterlockedIncrement64(&g_nwStop[i].swings);
+            InterlockedExchange(&g_nwStop[i].lastSt, (LONG)st);
+        }
+        void* mv = NwReadMovement(cc);
+        if (g_nwStop[i].walk && !g_nwStop[i].failed)
+        {
+            // fold 2g: EVERY pass is followed by a renewal (the pass set the movement mode, F1414); a same-goal request in a frame the
+            // main thread also issued in is harmless (0x6607E0 returns early near the same destination). The lock is held since the
+            // pass began (NwPassBegin); else a bounded wait for the main thread's one request.
+            const bool held = (locked == i);
+            bool have = held;
+            for (int k = 0; k < kNwPassLockSpins && !have; ++k) { have = NwTryLock(i); if (!have) YieldProcessor(); }
+            if (!have) { InterlockedIncrement64(&g_nwRouteBusy); return; }
+            if (windowfollow::WalkRoadAfterPass(g_nwStop[i].walk != 0, g_nwStop[i].failed != 0) == windowfollow::kWalkRoadWorker)
+                NwIssueWalk(i, mv, windowfollow::kWalkRoadWorker);
+            if (!held) NwUnlock(i);
+            return;
+        }
+        if (mv != 0 && StopCopyWalking(mv)) { InterlockedIncrement64(&g_nwStop[i].stops); InterlockedIncrement64(&g_nwStopsTotal); }
+        else InterlockedIncrement64(&g_nwStopRefused);
+        return;
+    }
+}
+
 void (*orig_ccUpdate)(CombatClassAI*, float) = 0;
+
+// fold 2g: the fight pass under the slot lock - an exception leaving the fight routine releases the lock on its way out
+// (__finally, AbnormalTermination); a normal end keeps it for NwStopAfterPass and detour_ccUpdate releases it. No C++ object (C2712).
+static void NwOrigPass(CombatClassAI* self, float frameTIME, int locked)
+{
+    __try { orig_ccUpdate(self, frameTIME); }
+    __finally { if (AbnormalTermination() && locked >= 0) NwUnlock(locked); }
+}
 
 void detour_ccUpdate(CombatClassAI* self, float frameTIME)
 {
@@ -7670,8 +7844,11 @@ void detour_ccUpdate(CombatClassAI* self, float frameTIME)
 
     CopyReadyUpd cru;   /* T-890: a followed copy's swing state and timer around the fight routine */
     CopyReadyBefore(self, &cru);
-    orig_ccUpdate(self, frameTIME);
+    const int nwLocked = NwPassBegin(self);   // T-1422 fix 2f: no main-thread route request while this pass runs
+    NwOrigPass(self, frameTIME, nwLocked);   // fold 2g: the lock released if the pass leaves by an exception
     if (cru.have) CopyReadyAfter(self, &cru, frameTIME);
+    NwStopAfterPass(self, nwLocked);   // T-1422 fix 2: a copy in a native window is placed by the drive, not walked by this routine
+    if (nwLocked >= 0) NwUnlock(nwLocked);
 }
 
 // Main thread ONLY. Returns the slot for this object, claiming a free one on first sight, and
@@ -8906,7 +9083,7 @@ void detour_endAction(CharBody* self)
     //
     // An earlier version of this comment said the intrinsic had to be the first statement or the
     // result could change. **That is false** - `_ReturnAddress()` resolves against the frame layout
-    // the compiler already knows, and under `/O2 /GL` it is scheduled wherever the optimiser likes.
+    // the compiler already knows, and under `/O2` it is scheduled wherever the optimiser likes.
     // Harmless in itself, but it stated a rule that is not true, which invites a future session to
     // preserve it at the cost of a real change.
     const void* ret = _ReturnAddress();
@@ -9556,7 +9733,158 @@ void CountSwingGate(int gate)
     }
 }
 
+
 } // namespace
+
+// T-1422 fix 2 - see combat.h. MAIN THREAD (the only writer). A slot is published uid first, then its fight object; it is cleared
+// fight object first, so the worker never matches a slot whose uid is being changed.
+void NativeWindowStopMark(unsigned int uid, void* ch, bool on)
+{
+    if (uid == 0) return;
+    int have = -1, freeSlot = -1;
+    for (int i = 0; i < kNwStopSlots; ++i)
+    {
+        if ((unsigned int)g_nwStop[i].uid == uid && g_nwStop[i].cc != 0) { have = i; break; }
+        if (freeSlot < 0 && g_nwStop[i].cc == 0) freeSlot = i;
+    }
+    if (!on)
+    {
+        if (have < 0) return;
+        InterlockedExchangePointer((void* volatile*)&g_nwStop[have].cc, 0);
+        InterlockedExchange(&g_nwStop[have].uid, 0);
+        InterlockedExchange(&g_nwStop[have].walk, 0);
+        InterlockedExchange(&g_nwStop[have].failed, 0);
+        InterlockedDecrement(&g_nwStopActive);
+        return;
+    }
+    const void* cc = (const void*)CombatOf((::Character*)ch);
+    if (cc == 0) { ++g_nwStopNoCc; return; }
+    if (have >= 0)
+    {
+        if (g_nwStop[have].cc == cc) return;   // already marked on this fight object
+        InterlockedExchangePointer((void* volatile*)&g_nwStop[have].cc, (void*)cc);   // the copy's fight object changed
+        return;
+    }
+    if (freeSlot < 0) { ++g_nwStopNoSlot; return; }
+    InterlockedExchange(&g_nwStop[freeSlot].uid, (LONG)uid);
+    InterlockedExchange64(&g_nwStop[freeSlot].stops, 0);
+    InterlockedExchange64(&g_nwStop[freeSlot].routes, 0);
+    InterlockedExchange64(&g_nwStop[freeSlot].swings, 0);
+    InterlockedExchange(&g_nwStop[freeSlot].walk, 0);
+    InterlockedExchange(&g_nwStop[freeSlot].failed, 0);
+    InterlockedExchange(&g_nwStop[freeSlot].lastSt, kNwStUnread);
+    g_nwStop[freeSlot].walkSeq = -1; g_nwStop[freeSlot].renewals = 0; g_nwStop[freeSlot].failSeenClear = 0;   // not yet read by the worker
+    InterlockedExchange64(&g_nwStop[freeSlot].passes, 0); InterlockedExchange64(&g_nwStop[freeSlot].mainRoutes, 0);   // fix 2f
+    InterlockedExchange64(&g_nwStop[freeSlot].mainFrame, 0); InterlockedExchange(&g_nwStop[freeSlot].lastRoad, 0);
+    InterlockedExchange(&g_nwStop[freeSlot].lock, 0);   // fold 2g: a lock left behind is cleared when the slot is reused
+    g_nwStop[freeSlot].passesPrev = -1;
+    InterlockedExchangePointer((void* volatile*)&g_nwStop[freeSlot].cc, (void*)cc);
+    InterlockedIncrement(&g_nwStopActive);
+}
+void NativeWindowStopClearAll()
+{
+    for (int i = 0; i < kNwStopSlots; ++i)
+    {
+        InterlockedExchangePointer((void* volatile*)&g_nwStop[i].cc, 0);
+        InterlockedExchange(&g_nwStop[i].uid, 0);
+        InterlockedExchange(&g_nwStop[i].walk, 0);
+    }
+    InterlockedExchange(&g_nwStopActive, 0);
+}
+long long NativeWindowStopsOf(unsigned int uid)
+{
+    if (uid == 0) return 0;
+    for (int i = 0; i < kNwStopSlots; ++i)
+        if ((unsigned int)g_nwStop[i].uid == uid && g_nwStop[i].cc != 0) return (long long)g_nwStop[i].stops;
+    return 0;
+}
+// T-1422 fix 2b / 2c - see combat.h. MAIN THREAD (the only writer): the goal under the seqlock (odd while written), then the walk
+// flag; a new goal clears the failed mark.
+int NativeWindowWalkSet(unsigned int uid, bool on, float x, float y, float z)
+{
+    if (uid == 0) return -1;
+    for (int i = 0; i < kNwStopSlots; ++i)
+    {
+        if ((unsigned int)g_nwStop[i].uid != uid || g_nwStop[i].cc == 0) continue;
+        LONG published = -1;
+        if (on)
+        {
+            InterlockedIncrement(&g_nwStop[i].seq);   // odd: writing
+            g_nwStop[i].wx = x; g_nwStop[i].wy = y; g_nwStop[i].wz = z;
+            published = InterlockedIncrement(&g_nwStop[i].seq);   // even: published
+            InterlockedExchange(&g_nwStop[i].failed, 0);
+        }
+        InterlockedExchange(&g_nwStop[i].walk, on ? 1 : 0);
+        return (int)published;
+    }
+    return -1;
+}
+// fix 2f - see combat.h. MAIN THREAD. The worker's pass count is read under the lock, so 'unchanged since the previous frame' means
+// no pass finished in between; a pass that ends after this frame's request renews again (fold 2g: every pass is followed by one).
+void NativeWindowWalkMainFrame(unsigned int uid, long long frame)
+{
+    if (uid == 0) return;
+    for (int i = 0; i < kNwStopSlots; ++i)
+    {
+        if ((unsigned int)g_nwStop[i].uid != uid || g_nwStop[i].cc == 0) continue;
+        InterlockedExchange64(&g_nwStop[i].mainFrame, (LONG64)frame);
+        if (!NwTryLock(i)) { g_nwStop[i].passesPrev = (LONG64)g_nwStop[i].passes; ++g_nwMainBusy; return; }   // a pass is running now
+        const long long passesNow = (long long)g_nwStop[i].passes;
+        const int road = windowfollow::WalkRoadMainFrame(g_nwStop[i].walk != 0, g_nwStop[i].failed != 0, passesNow, (long long)g_nwStop[i].passesPrev);
+        g_nwStop[i].passesPrev = (LONG64)passesNow;
+        if (road == windowfollow::kWalkRoadMain) NwIssueWalk(i, NwReadMovement(g_nwStop[i].cc), road);
+        NwUnlock(i);
+        return;
+    }
+}
+bool NativeWindowWalkCounts(unsigned int uid, long long* passes, long long* routes, long long* mainRoutes, int* lastRoad)
+{
+    *passes = 0; *routes = 0; *mainRoutes = 0; *lastRoad = 0;
+    if (uid == 0) return false;
+    for (int i = 0; i < kNwStopSlots; ++i)
+    {
+        if ((unsigned int)g_nwStop[i].uid != uid || g_nwStop[i].cc == 0) continue;
+        *passes = (long long)g_nwStop[i].passes; *routes = (long long)g_nwStop[i].routes;
+        *mainRoutes = (long long)g_nwStop[i].mainRoutes; *lastRoad = (int)g_nwStop[i].lastRoad;
+        return true;
+    }
+    return false;
+}
+const char* NativeWindowRoadName(int road)
+{
+    return road == windowfollow::kWalkRoadMain ? "main" : (road == windowfollow::kWalkRoadWorker ? "worker" : "none");
+}
+bool NativeWindowHasSlot(unsigned int uid)
+{
+    if (uid == 0) return false;
+    for (int i = 0; i < kNwStopSlots; ++i)
+        if ((unsigned int)g_nwStop[i].uid == uid && g_nwStop[i].cc != 0) return true;
+    return false;
+}
+bool NativeWindowWalkFailed(unsigned int uid)
+{
+    if (uid == 0) return false;
+    for (int i = 0; i < kNwStopSlots; ++i)
+        if ((unsigned int)g_nwStop[i].uid == uid && g_nwStop[i].cc != 0) return g_nwStop[i].failed != 0;
+    return false;
+}
+long long NativeWindowSwingsOf(unsigned int uid)
+{
+    if (uid == 0) return 0;
+    for (int i = 0; i < kNwStopSlots; ++i)
+        if ((unsigned int)g_nwStop[i].uid == uid && g_nwStop[i].cc != 0) return (long long)g_nwStop[i].swings;
+    return 0;
+}
+// T-1422 fix 2: the stop counts for the [NC] report line.
+std::string NativeWindowStopCounts()
+{
+    return " nwStop[stops,refused,noSlot,noFightObject]=" + N3((long long)g_nwStopsTotal) + "," + N3((long long)g_nwStopRefused)
+         + "," + N3(g_nwStopNoSlot) + "," + N3(g_nwStopNoCc)
+         + " nwRoute[renewed,refused]=" + N3((long long)g_nwRoutesTotal) + "," + N3((long long)g_nwRouteRefused)
+         + " nwRoad[main,passBusy,mainBusy]=" + N3((long long)g_nwRoutesMain) + "," + N3((long long)g_nwRouteBusy)   // fix 2f / fold 2g
+         + "," + N3(g_nwMainBusy) + " nwPassUnlocked=" + N3((long long)g_nwPassNoLock);
+}
+
 
 /* M7a: the catch-up's combat mode (worldsync.cpp WorldsyncCatchupAsk) - the rows live in the namespace above. */
 bool CombatModeResendOwned(unsigned int uid) { return CombatModeResendRow(uid); }
@@ -10943,7 +11271,8 @@ void CombatModeTick()
     }
 }
 
-// P059 - the tail every close shares: place the body, record the window, clear the row. The GATE
+// P059 - the tail every close shares: place the body when it must (T-1422 fix 2d: never for a copy that records its owner's route -
+// SnapPuppetToAuthority only for a copy that does not), record the window, clear the row. The GATE
 // and the order/goal clears happen BEFORE this, at the call site, in that order.
 void FinishNativeClose(unsigned int uid, CombatWatch* w, const char* reason, bool charResolved)
 {
@@ -10953,7 +11282,10 @@ void FinishNativeClose(unsigned int uid, CombatWatch* w, const char* reason, boo
     // ~1-2 units (T104), and a 2-unit snap is itself the hop the visible metric cannot see (it lands
     // between windows). Below kNcSnapOnlyAbove the ordinary drive closes the gap at walking pace.
     const float driftNow = PuppetWindowDriftNow(uid);
-    const bool snapNeeded = !(driftNow >= 0.0f && driftNow < kNcSnapOnlyAbove);
+    // T-1422 fix 2b / 2d (owner 1771 b): NO window close of a copy that records its owner's route (every copy of another game's
+    // character) places it - owner OFF and the distance close alike: the ordinary follow drive carries on from where it stands
+    // (answer 8, not needed). The close line gives its height and flat gaps ([WINDOWFOLLOW] close ownerDY / lastDXZ).
+    const bool snapNeeded = !PuppetWindowFollowed(uid) && !(driftNow >= 0.0f && driftNow < kNcSnapOnlyAbove);
     const int snap = !charResolved ? 7 : (snapNeeded ? SnapPuppetToAuthority(uid, &before, &sameCall) : 8);
     if (snap >= 0 && snap < 9) ++g_ncSnapReason[snap];
     if (snap == 0) ++g_ncSnapDone; else if (snap != 8) ++g_ncSnapDeclined;
@@ -11077,7 +11409,7 @@ void CloseAllNativeWindows(const char* reason)
 
 // T-986 (drift bound) / T-986 fold 1 - THE CLOSE THE OWNER'S OFF EDGE AND THE DRIVE'S DISTANCE BOUND SHARE, in one order: gate,
 // wait out the AI pass in flight, [OFF only: leave combat mode], take the order back, [OFF only: take the task back], then the
-// shared tail (FinishNativeClose places the copy and hands it back to the drive). What each kind undoes is winbound's
+// shared tail (FinishNativeClose hands the copy back to the drive - placing it only if it records no owner's route, fix 2d). What each kind undoes is winbound's
 // (src/common/windowbound.h). `wasNative` false (an OFF edge for a copy with no open window) runs the clears only, as the OFF edge
 // always did. MAIN THREAD: the OFF edge arrives through InQueueDrain and the drift close runs in ReplicateTick, one after the
 // other in the frame pump (command_channel.cpp), never at once.
@@ -11885,7 +12217,7 @@ void ReportCombatMode()
                  + " orphanedByRebind=" + N3(g_ncOrphanedByRebind)
                  + " switchRefused=" + N3(g_ncSwitchRefused)
                  + " closedBySwitch=" + N3(g_ncClosedBySwitch) + " closedByDrop=" + N3(g_ncClosedByDrop)
-                 + " closedByOff=" + N3(g_ncClosedByOff) + " closedByDrift=" + N3(g_ncClosedDrift) + " driftNoRow=" + N3(g_ncDriftNoRow)
+                 + " closedByOff=" + N3(g_ncClosedByOff) + " closedByDrift=" + N3(g_ncClosedDrift) + " driftNoRow=" + N3(g_ncDriftNoRow) + NativeWindowStopCounts()   // T-1422 fix 2
                  + " driftReopened=" + N3(g_ncDriftReopened)
                  + " closedByDropNoRegate=" + N3(g_ncClosedByDropNoRegate) + " closeNoChar=" + N3(g_ncCloseNoChar)
                  + " closeWaitedForPass=" + N3(g_ncCloseWaitedForPass) + " closeQuiesceTimedOut=" + N3(g_ncCloseQuiesceTimedOut)
@@ -12508,7 +12840,7 @@ void ReportCombatMode()
                  // **RAW BITS, not a formatted float.** `F1` rounds to one decimal, which prints
                  // the clamp value 0.05 as "0.1" - and the two readings this field exists to tell
                  // apart are 0.0 and 0.05. It also dodges type-punning a uint through a float* on
-                 // a /GL build. `0x00000000` = never written; `0x3d4ccccd` = pinned at the 0.05
+                 // an optimised build. `0x00000000` = never written; `0x3d4ccccd` = pinned at the 0.05
                  // clamp; anything else = a live varying delta.
                  + " lastBodyFtBits=" + Ptr((const void*)(uintptr_t)w->ccLastBodyFtSeen)
                  // P054 - denominator is inCombatFrames (off `cc`, not `body`).

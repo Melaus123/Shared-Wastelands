@@ -52,6 +52,7 @@ namespace {
 
 unsigned long long kCrNotifyRva = 0; static AddrReg kCrNotifyRva_reg("NotifyCrimeWitnessed", &kCrNotifyRva);   /* Steam_1.0.65 0x851F40 */
 unsigned long long kCrSetRva = 0;    static AddrReg kCrSetRva_reg("SetCrime", &kCrSetRva);                     /* Steam_1.0.65 0x851DB0 */
+unsigned long long kCrTimeSetRva = 0; static AddrReg kCrTimeSetRva_reg("SetCrimeTimeLeft", &kCrTimeSetRva);   /* Steam_1.0.65 0x851070 (1.0.68 0x851F40) */
 typedef void (*CrNotifyFn)(void* bountyManager, void* againstFaction, const hand& againstWho, int expirySeconds, int crime);
 typedef bool (*CrSetFn)(void* bountyManager, int crime, void* againstFaction, const hand& againstWho);
 
@@ -69,7 +70,13 @@ const int    kCrimeExpiryMax   = 600;  /* game seconds; a larger expiry is clamp
 
 /* owner, per owned uid: what was last SENT, and what the last SAMPLE saw (review-crime3 2 and 6: the re-set test compares
    with the last sampled expiry; the victim lookup is cached on the last sampled hand whether or not anything was sent) */
-struct Last { coopcrime::CrimeState sent; float sampledExpiry; unsigned int hand5[5]; unsigned int victimUid; bool victimIsPlayer; };
+struct Last { coopcrime::CrimeState sent; float sampledExpiry; unsigned int hand5[5]; unsigned int victimUid; bool victimIsPlayer;
+              int origin; bool evSent; bool evSawNoTime; int evCrime; unsigned int evHand5[5]; void* evFac; bool failedSend; };
+/* fix attempt 2 review S1: failedSend - a send of this record failed (either road) and none has gone since: the backstop's retry of it
+   is 'retryAfterFailedSend', not 'missed' */
+/* T-1442 step 5, the backstop's why (crimewire.h CrimeBackstopWhy): origin - made after a link change or not; evSent - the event
+   drain sent this record's state since the sampler's last look; evSawNoTime + evCrime / evHand5 / evFac - the drain read a crime with
+   no time left since then (what it read) */
 std::map<unsigned int, Last> g_last;
 long g_lastLinkGen = -1;                           /* review-crime3 4: a new link forgets what was sent (copies are re-made) */
 std::vector<unsigned int> g_scan;
@@ -645,6 +652,13 @@ volatile LONG g_pvpNotifyHook = 0;
 void* volatile g_crimePeer = 0;
 typedef void (*NotifyHookFn)(void* bountyManager, void* againstFaction, const void* againstWho, int expirySeconds, int crime);
 NotifyHookFn orig_notify = 0;
+/* T-1442 step 5 fix attempt 2 (F1466): BountyManager's direct time-left setter 0x851070 (this, float seconds in XMM1 - the
+   disassembly: movaps xmm6, xmm1 ... movss [rbx+0x90], xmm6; the decompile's 'undefined4' is that float). It writes +0x90 (the
+   character's +0x180) unless the character's vt+0x30 test holds, with no setCrime: the reaction 0x853E40 and the dialogue
+   action 0x21 re-raise a thief's time left through it. ANY THREAD. */
+typedef void (*TimeSetHookFn)(void* bountyManager, float seconds);
+TimeSetHookFn orig_timeSet = 0;
+volatile LONG g_timeSetHook = 0;   /* 0 not installed, 1 installed, -1 failed / no row */
 
 int CrOffenderFactionPod(const void* bountyManager, void** faction)
 {
@@ -736,6 +750,65 @@ void TrespassSetNote(void* bountyManager, bool recorded)
     if (recorded) ::InterlockedIncrement64(&g_trespassSet[3]);
 }
 
+/* T-1442 step 5 (F1453 design A): every setCrime the engine makes notes its character here, after the original returns (ANY THREAD -
+   crime.cpp:636; the copy-capture table's locking: a critical section made in InstallCrime before the hook). No lookup in the
+   detour: the main thread's CrimeEventDrainTick finds the uid next frame and decides as the sampler does (CrimeDecideSend). Not
+   noted: this game writing the owner's state onto a copy (CrimeApplyDrain's thread) - that is a copy, never sent from here.
+   The note is made BEFORE setCrime's caller writes the time left (notifyCrimeWitnessed writes it after, decomp_851f40:22): for a
+   main-thread caller the drain reads it finished; for an AI-worker caller it may not be - the sampler corrects that (lateExpiry). */
+coopcrime::CrimeEvTable g_crEv;   /* zero-initialised static: empty */
+CRITICAL_SECTION g_crEvLock;
+volatile LONG g_crEvLockInit = 0;
+/* fix attempt 2 (F1466): who noted - setCrime's detour, notifyCrimeWitnessed's after its original, the time-left setter's */
+enum { kCrNoteSetCrime = 0, kCrNoteNotifyAfter = 1, kCrNoteTimeSet = 2 };
+long long g_crEvNotedBy[3] = { 0, 0, 0 };   /* LOCK HELD: notes that reached the table (a slot taken or already waiting), by kCrNote* */
+/* a time-left set's old and new time, for the drain's one line per character per crime; one record per noted character */
+struct CrTimeSetRec { const void* who; float oldT; float newT; };
+const int kCrTimeSetRecs = coopcrime::kCrimeEvSlots;
+CrTimeSetRec g_crTsRec[kCrTimeSetRecs];
+int g_crTsN = 0;                 /* LOCK HELD */
+long long g_crTsLost = 0;        /* LOCK HELD: a record that found the list full (its note still went) */
+int CrimeEvNoteAs(void* bountyManager, int by, float oldT, float newT)
+{
+    if (g_crEvLockInit == 0) return coopcrime::kCrimeEvNone;
+    if (g_crApplyingThread != 0 && g_crApplyingThread == ::GetCurrentThreadId()) return coopcrime::kCrimeEvNone;   /* the owner's state, from the wire */
+    const void* c = 0;
+    if (!CrBmCharPod(bountyManager, &c) || c == 0) return coopcrime::kCrimeEvNone;
+    ::EnterCriticalSection(&g_crEvLock);
+    const int r = coopcrime::CrimeEvAdd(&g_crEv, c);
+    if (r == coopcrime::kCrimeEvNoted || r == coopcrime::kCrimeEvAlready)
+    {
+        ++g_crEvNotedBy[by];
+        if (by == kCrNoteTimeSet)
+        {
+            int i = 0;
+            while (i < g_crTsN && g_crTsRec[i].who != c) ++i;
+            if (i < g_crTsN) g_crTsRec[i].newT = newT;   /* already waiting: keep the first old time, the latest new one */
+            else if (g_crTsN < kCrTimeSetRecs) { g_crTsRec[g_crTsN].who = c; g_crTsRec[g_crTsN].oldT = oldT; g_crTsRec[g_crTsN].newT = newT; ++g_crTsN; }
+            else ++g_crTsLost;
+        }
+    }
+    ::LeaveCriticalSection(&g_crEvLock);
+    return r;
+}
+void CrimeEvNote(void* bountyManager) { CrimeEvNoteAs(bountyManager, kCrNoteSetCrime, 0.0f, 0.0f); }
+/* the BountyManager's time left (+0x90, the character's +0x180) */
+int CrBmTimePod(const void* bountyManager, float* t)
+{
+    *t = 0.0f;
+    __try { *t = *(const float*)((const char*)bountyManager + 0x90); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1442 step 5 fix attempt 2: the time-left setter notes its character after the original returns, as setCrime's detour does */
+void detour_timeSet(void* bountyManager, float seconds)
+{
+    float oldT = 0.0f, newT = 0.0f;
+    CrBmTimePod(bountyManager, &oldT);
+    orig_timeSet(bountyManager, seconds);
+    CrBmTimePod(bountyManager, &newT);
+    CrimeEvNoteAs(bountyManager, kCrNoteTimeSet, oldT, newT);
+}
+
 DWORD g_caughtInNotifyTid = 0;   /* T-1131 fold 2: the main thread inside the caught roll's notifyCrimeWitnessed (0 none) */
 int g_caughtRecorded = 0;         /* ... and the crime its setCrime recorded there (0 = none / refused) */
 bool detour_setCrime(void* bountyManager, int crime, void* againstFaction, const void* againstWho)
@@ -749,6 +822,7 @@ bool detour_setCrime(void* bountyManager, int crime, void* againstFaction, const
     if (crime == 11) TrespassSetNote(bountyManager, r);   /* TRESPASSING */
     if (r) CopyCapNote(bountyManager, CrRecordedCrime(bountyManager));   /* what the engine recorded (5 may become 9) */
     if (g_caughtInNotifyTid != 0 && g_caughtInNotifyTid == ::GetCurrentThreadId()) g_caughtRecorded = r ? CrRecordedCrime(bountyManager) : 0;   /* T-1131 fold 2 */
+    CrimeEvNote(bountyManager);   /* T-1442 step 5: after the original, recorded or not - the drain reads what the engine left */
     return r;
 }
 uintptr_t g_caughtNotifyAt = 0;   /* T-1131: absolute return address of the caught roll's notifyCrimeWitnessed call (0 = no row) */
@@ -765,6 +839,7 @@ void detour_notify(void* bountyManager, void* againstFaction, const void* agains
     }
     if (atRoll) { g_caughtRecorded = 0; g_caughtInNotifyTid = ::GetCurrentThreadId(); }
     orig_notify(bountyManager, againstFaction, againstWho, expirySeconds, crime);   /* its own setCrime call (0x851DB0) goes through detour_setCrime, which notes what was recorded */
+    CrimeEvNoteAs(bountyManager, kCrNoteNotifyAfter, 0.0f, 0.0f);   /* T-1442 step 5 fix attempt 2: again, now its time left is written (decomp_851f40:22) */
     if (atRoll) { g_caughtInNotifyTid = 0; CaughtAfterNotify(againstFaction, againstWho, expirySeconds, g_caughtRecorded); }   /* T-1131 fold 2: after the record */
 }
 
@@ -1561,6 +1636,172 @@ std::string P158CrimeText(const void* c)
 }
 // PROBE-END: P158
 
+/* T-1442 step 5 (F1453 design A): ONE per-character decision for both roads - the event drain (the first main-thread frame after
+   setCrime; the time left may still be unwritten for an AI-worker caller, see CrimeEvNote) and the
+   sampler (every 15 frames, the backstop). MAIN THREAD. Reads the fields live and updates the same last-sent record (g_last: sent,
+   sampledExpiry), so whichever road sends first, the other then finds nothing new. Every rule is the sampler's own: not mine or not
+   announced forgets the record (H030); a crime against a PLAYER is held back (decision 4) and one already sent is cleared; the 1 s
+   re-set rule (CrimeShouldSend). A failed send leaves the record, so the next look sends it again. */
+enum { kCrFromEvent = 0, kCrFromSampler = 1 };
+/* kCrOutFailed: a send of a new crime / victim / faction that failed - the record keeps the old state, so the next look sends it;
+   kCrOutFailedReSet: a failed send of a re-set only (the time back up) - the sampled time has moved; the next look sends it while
+   the time left is still over 1 s above the last SENT one (CrimeShouldSend, fix attempt 2), else a link reset or the next change */
+enum { kCrOutUnchanged = 0, kCrOutSent = 1, kCrOutGone = 2, kCrOutNotMine = 3, kCrOutFailed = 4, kCrOutFailedReSet = 5 };
+long long g_crEvOut[6] = { 0, 0, 0, 0, 0, 0 };   /* event drain, by kCrOut* */
+long long g_crEvDropped = 0;                  /* notes dropped while the world loads or tears down */
+long long g_backstop[coopcrime::kCrimeBackstopKinds] = { 0, 0, 0, 0, 0, 0, 0, 0 };   /* sampler sends, by coopcrime::kCrimeBackstop* */
+int g_linkResetPasses = 0;   /* > 0: a record made now is a link reset's (set at a reset; down one at each sampler pass start) */
+long long g_crEvLines = 0, g_backstopLines = 0;
+const long long kCrEvLineCap = 60, kBackstopLineCap = 60;
+long long g_crTsLines = 0;                    /* fix attempt 2: 'time-left set .. noted' lines (one per character per crime) */
+const long long kCrTsLineCap = 60;
+std::map<unsigned int, int> g_crTsLogged;     /* uid -> the crime its time-left line was printed for */
+
+static void CrimeLinkGenCheck()
+{
+    const long gen = StorePeerEpoch();   /* M11 C2: moves at every arrival and every old-link down (two games: exactly as the link generation) */
+    if (gen != g_lastLinkGen) { g_last.clear(); g_bKnown.clear(); CopyForget(); if (g_lastLinkGen != -1) { StoreArrivalNoteServed(kArrServeCrime); g_linkResetPasses = 2; } g_lastLinkGen = gen; }   /* review-crime3 4; crime5: copies are re-made; T-1442 step 5: the rest of this pass and the next are 'linkReset' */
+}
+
+static int CrimeDecideSend(unsigned int uid, int from, coopcrime::CrimeState* sentState)
+{
+    if (!net::IsUidMine(uid) || !AnnouncedToPeerQuiet(uid)) { g_last.erase(uid); return kCrOutNotMine; }   // H030; a re-announce sends afresh
+    ::Character* c = FindSpawned(uid);
+    if (c == 0) return kCrOutGone;
+    int crime = 0; void* fac = 0; unsigned int hand5[5]; float expiry = 0.0f;
+    if (!CrReadOwner(c, &crime, &fac, hand5, &expiry)) return kCrOutGone;
+    std::map<unsigned int, Last>::iterator it = g_last.find(uid);
+    bool created = false;
+    if (it == g_last.end())
+    {
+        Last fresh; fresh.sampledExpiry = 0.0f; std::memset(fresh.hand5, 0, sizeof(fresh.hand5)); fresh.victimUid = 0; fresh.victimIsPlayer = false;
+        fresh.origin = g_linkResetPasses > 0 ? coopcrime::kCrimeOriginLinkReset : coopcrime::kCrimeOriginFresh;
+        fresh.failedSend = false; fresh.evSent = false; fresh.evSawNoTime = false; fresh.evCrime = 0; std::memset(fresh.evHand5, 0, sizeof(fresh.evHand5)); fresh.evFac = 0;
+        it = g_last.insert(std::make_pair(uid, fresh)).first;
+        created = true;   /* this look is the record's first: only its send can be 'fresh' / 'linkReset' */
+    }
+    Last& l = it->second;
+    const float exp = coopcrime::CrimeExpiryOk(expiry) ? expiry : 0.0f;
+    coopcrime::CrimeState cur;
+    /* anything but a known crime reads as none; so does a crime whose expiry has run out - the owner ends the copy's crime
+       itself rather than trusting the engine to zero +0x148 (review-crime3 1; T275 saw it do so: crime 0 at expiry -0.1) */
+    if (crime > 0 && crime <= coopcrime::kCrimeMaxEnum && exp > 0.0f)
+    {
+        ::Faction* f = (::Faction*)fac;
+        if (!SameHand(l.hand5, hand5))
+        {
+            std::memcpy(l.hand5, hand5, sizeof(l.hand5));
+            l.victimUid = VictimUidOf(hand5, &l.victimIsPlayer);
+            if (l.victimUid == 0 && !NullHand(hand5)) ++g_victimUnresolved;
+        }
+        /* decision 4 (design-crime.md section 4) is the user's: a crime against a PLAYER - by its faction or by the
+           character it names - is held back, and one already sent is cleared on the copy (review-crime3 5) */
+        if ((f != 0 && (IsPlayerFaction(f) || IsPeerFaction(f))) || l.victimIsPlayer) ++g_playerVictimSamples;
+        else
+        {
+            cur.crime = crime;
+            cur.expiry = exp;
+            cur.victimUid = l.victimUid;
+            cur.factionSid = (f != 0) ? RelationsWireSid(f) : std::string();
+            if (cur.factionSid.size() > (size_t)coopcrime::kCrimeMaxSid) { ++g_sidTooLong; cur = coopcrime::CrimeState(); }
+        }
+    }
+    else if (crime != 0 && l.sent.crime != 0) ++g_expiredSamples;   /* set but run out: the clear below ends it on the copy */
+    const bool liveRunOut = (crime == 0 || exp <= 0.0f);   /* the live fields hold no crime, or its time has run out */
+    const bool onlyTime = cur.crime != 0 && cur.crime == l.sent.crime && cur.victimUid == l.sent.victimUid && cur.factionSid == l.sent.factionSid;
+    coopcrime::CrimeBackstopIn bi;
+    bi.sentCrime = l.sent.crime; bi.curCrime = cur.crime; bi.liveRunOut = liveRunOut; bi.onlyTime = onlyTime; bi.firstLook = created;
+    bi.origin = l.origin; bi.pendingNote = false; bi.evSent = l.evSent; bi.retryAfterFailed = l.failedSend;
+    bi.evSawSameNoTime = l.evSawNoTime && crime != 0 && crime == l.evCrime && fac == l.evFac && SameHand(l.evHand5, hand5);
+    if (from == kCrFromEvent)
+    {   /* what the drain read, for the sampler's why: a crime with no time left yet (its caller writes the time after setCrime) */
+        l.evSawNoTime = crime > 0 && crime <= coopcrime::kCrimeMaxEnum && liveRunOut;
+        if (l.evSawNoTime) { l.evCrime = crime; l.evFac = fac; std::memcpy(l.evHand5, hand5, sizeof(l.evHand5)); }
+    }
+    else { l.evSent = false; l.evSawNoTime = false; }   /* the sampler's look closes the drain's window */
+    if (sentState != 0) *sentState = cur;
+    if (!coopcrime::CrimeDecide(l.sent, &l.sampledExpiry, cur)) return kCrOutUnchanged;
+    if (!net::SendCrime(uid, cur)) { ++g_sendFailed; l.failedSend = true; return onlyTime ? kCrOutFailedReSet : kCrOutFailed; }
+    l.sent = cur;
+    l.failedSend = false;   /* bi above keeps what held before this send */
+    if (from == kCrFromEvent) l.evSent = true;
+    ++g_sent;
+    if (from == kCrFromSampler)
+    {
+        if (g_crEvLockInit != 0)   /* noted and not yet drained: the drain would have sent it at its next frame */
+        {
+            ::EnterCriticalSection(&g_crEvLock);
+            bi.pendingNote = coopcrime::CrimeEvHas(&g_crEv, c);
+            ::LeaveCriticalSection(&g_crEvLock);
+        }
+        const int why = coopcrime::CrimeBackstopWhy(bi);
+        ++g_backstop[why];
+        if (++g_backstopLines <= kBackstopLineCap)
+        {
+            char b[200];
+            std::sprintf(b, "[CRIME] backstop -> uid=%u crime=%d expiry=%.1f (%s) (line %lld of %lld)", uid, cur.crime, cur.expiry,
+                         coopcrime::CrimeBackstopWord(why), g_backstopLines, kBackstopLineCap);
+            DebugLog(std::string(b));
+        }
+    }
+    return kCrOutSent;
+}
+
+void CrimeEventDrainTick()
+{
+    if (g_crEv.n == 0 || g_crEvLockInit == 0) return;   /* the every-frame fast path: one load */
+    const bool blocked = EngineWritesBlocked();
+    const void* got[kCrimeMaxPerTick];
+    bool tsHas[kCrimeMaxPerTick]; float tsOld[kCrimeMaxPerTick], tsNew[kCrimeMaxPerTick];
+    int n = 0;
+    ::EnterCriticalSection(&g_crEvLock);
+    if (blocked) { g_crEvDropped += (long long)coopcrime::CrimeEvReset(&g_crEv); g_crTsN = 0; }   /* the world is going: its characters with it */
+    else n = coopcrime::CrimeEvTake(&g_crEv, got, kCrimeMaxPerTick);   /* at most the sampler's per-pass send cap; the rest wait a frame */
+    for (int j = 0; j < n; ++j)   /* fix attempt 2: a taken character's time-left record leaves the list with its note */
+    {
+        tsHas[j] = false; tsOld[j] = 0.0f; tsNew[j] = 0.0f;
+        for (int i = 0; i < g_crTsN; ++i)
+            if (g_crTsRec[i].who == got[j]) { tsHas[j] = true; tsOld[j] = g_crTsRec[i].oldT; tsNew[j] = g_crTsRec[i].newT; g_crTsRec[i] = g_crTsRec[g_crTsN - 1]; --g_crTsN; break; }
+    }
+    ::LeaveCriticalSection(&g_crEvLock);
+    if (n == 0) return;
+    CrimeLinkGenCheck();   /* review-crime3 4: a new link forgets what was sent - before this decides, as in the sampler */
+    for (int j = 0; j < n; ++j)
+    {
+        const unsigned int uid = FindSpawnedUid(got[j]);
+        if (uid == 0) { ++g_crEvOut[kCrOutGone]; continue; }   /* not a character this game registers (or gone since the note) */
+        if (tsHas[j])
+        {   /* fix attempt 2: the first time-left set per character per crime gets a line (the event line follows when it is sent) */
+            int lc = 0; float le = 0.0f;
+            if (!CrReadCrime(got[j], &lc, &le)) lc = -1;
+            std::map<unsigned int, int>::iterator tl = g_crTsLogged.find(uid);
+            if ((tl == g_crTsLogged.end() || tl->second != lc) && g_crTsLines < kCrTsLineCap)
+            {
+                g_crTsLogged[uid] = lc;
+                ++g_crTsLines;
+                char b[200];
+                std::sprintf(b, "[CRIME] time-left set uid=%u %.1f -> %.1f noted crime=%d mine=%d (line %lld of %lld)", uid, CrClampForLog(tsOld[j]),
+                             CrClampForLog(tsNew[j]), lc, net::IsUidMine(uid) ? 1 : 0, g_crTsLines, kCrTsLineCap);
+                DebugLog(std::string(b));
+            }
+        }
+        coopcrime::CrimeState cur;
+        const int out = CrimeDecideSend(uid, kCrFromEvent, &cur);
+        ++g_crEvOut[out];
+        if (out != kCrOutSent && out != kCrOutFailed && out != kCrOutFailedReSet) continue;   /* gone / notMine / unchanged: counted only */
+        if (++g_crEvLines <= kCrEvLineCap)
+        {
+            char b[240];
+            std::sprintf(b, "[CRIME] event -> uid=%u crime=%d expiry=%.1f %s (line %lld of %lld)", uid, cur.crime, cur.expiry,
+                         out == kCrOutSent ? "sent"
+                             : (out == kCrOutFailed ? "send FAILED (the record keeps the old state: the next look sends it)"
+                                                    : "send FAILED (a re-set only: the next look sends it while the time is over 1 s above the last sent)"),
+                         g_crEvLines, kCrEvLineCap);
+            DebugLog(std::string(b));
+        }
+    }
+}
+
 void CrimeTick()
 {
     if (EngineWritesBlocked())
@@ -1574,6 +1815,8 @@ void CrimeTick()
         if (g_trespassCells != 0)   /* the trespass test's cells */
             for (int k = 0; k < coopcrime::kSightCellCap; ++k) if (g_trespassCells->peer[k] != 0) g_trespassCells->peer[k] = 0;
         CopyForget();   /* kind 1: the world is going - its copies with it */
+        if (g_crEvLockInit != 0) { ::EnterCriticalSection(&g_crEvLock); g_crEvDropped += (long long)coopcrime::CrimeEvReset(&g_crEv); g_crTsN = 0; ::LeaveCriticalSection(&g_crEvLock); }   /* T-1442 step 5 */
+        g_crTsLogged.clear();   /* fix attempt 2: a load re-makes every character */
         /* review-crime5 7: a load re-makes every character - both sides start over */
         if (!g_bWasBlocked) { g_bSent.clear(); g_bKnown.clear(); g_bWasBlocked = true; }
         return;
@@ -1635,67 +1878,27 @@ void CrimeTick()
         g_bOut.erase(g_bOut.begin());
         ++bsent;
     }
-    const long gen = StorePeerEpoch();   /* M11 C2: moves at every arrival and every old-link down (two games: exactly as the link generation) */
-    if (gen != g_lastLinkGen) { g_last.clear(); g_bKnown.clear(); CopyForget(); if (g_lastLinkGen != -1) StoreArrivalNoteServed(kArrServeCrime); g_lastLinkGen = gen; }   /* review-crime3 4; crime5: copies are re-made */
+    CrimeLinkGenCheck();   /* review-crime3 4: a new link forgets what was sent - shared with the event drain (T-1442 step 5) */
     CopyWriteDrain();   /* kind 1: crimes this game's witnesses recorded on copies, to their owners */
     if (g_scanPos >= g_scan.size())
     {
         net::OwnedUidsSnapshot(&g_scan);
         g_scanPos = 0;
+        if (g_linkResetPasses > 0) --g_linkResetPasses;   /* T-1442 step 5: a link reset's records - the pass it struck in and the next */
         ForgetUnowned();
         BountyForget();
         if (g_scan.empty()) return;
     }
+    /* T-1442 step 5: the sampler, unchanged in cadence, is the BACKSTOP - a crime set through setCrime goes out at the first
+       main-thread frame after it (CrimeEventDrainTick); each send this makes is counted by why (crimewire.h CrimeBackstopWhy) */
     int scanned = 0, sent = 0;
     while (g_scanPos < g_scan.size() && scanned < kCrimeScanPerTick && sent < kCrimeMaxPerTick)
     {
         const unsigned int uid = g_scan[g_scanPos++];
         ++scanned;
-        if (!net::IsUidMine(uid) || !AnnouncedToPeerQuiet(uid)) { g_last.erase(uid); continue; }   // H030; a re-announce sends afresh
-        ::Character* c = FindSpawned(uid);
-        if (c == 0) continue;
-        int crime = 0; void* fac = 0; unsigned int hand5[5]; float expiry = 0.0f;
-        if (!CrReadOwner(c, &crime, &fac, hand5, &expiry)) continue;
-        std::map<unsigned int, Last>::iterator it = g_last.find(uid);
-        if (it == g_last.end())
-        {
-            Last fresh; fresh.sampledExpiry = 0.0f; std::memset(fresh.hand5, 0, sizeof(fresh.hand5)); fresh.victimUid = 0; fresh.victimIsPlayer = false;
-            it = g_last.insert(std::make_pair(uid, fresh)).first;
-        }
-        Last& l = it->second;
-        const float exp = coopcrime::CrimeExpiryOk(expiry) ? expiry : 0.0f;
-        coopcrime::CrimeState cur;
-        /* anything but a known crime reads as none; so does a crime whose expiry has run out - the owner ends the copy's crime
-           itself rather than trusting the engine to zero +0x148 (review-crime3 1; T275 saw it do so: crime 0 at expiry -0.1) */
-        if (crime > 0 && crime <= coopcrime::kCrimeMaxEnum && exp > 0.0f)
-        {
-            ::Faction* f = (::Faction*)fac;
-            if (!SameHand(l.hand5, hand5))
-            {
-                std::memcpy(l.hand5, hand5, sizeof(l.hand5));
-                l.victimUid = VictimUidOf(hand5, &l.victimIsPlayer);
-                if (l.victimUid == 0 && !NullHand(hand5)) ++g_victimUnresolved;
-            }
-            /* decision 4 (design-crime.md section 4) is the user's: a crime against a PLAYER - by its faction or by the
-               character it names - is held back, and one already sent is cleared on the copy (review-crime3 5) */
-            if ((f != 0 && (IsPlayerFaction(f) || IsPeerFaction(f))) || l.victimIsPlayer) ++g_playerVictimSamples;
-            else
-            {
-                cur.crime = crime;
-                cur.expiry = exp;
-                cur.victimUid = l.victimUid;
-                cur.factionSid = (f != 0) ? RelationsWireSid(f) : std::string();
-                if (cur.factionSid.size() > (size_t)coopcrime::kCrimeMaxSid) { ++g_sidTooLong; cur = coopcrime::CrimeState(); }
-            }
-        }
-        else if (crime != 0 && l.sent.crime != 0) ++g_expiredSamples;   /* set but run out: the clear below ends it on the copy */
-        const int due = coopcrime::CrimeShouldSend(l.sent, l.sampledExpiry, cur);
-        l.sampledExpiry = cur.expiry;
-        if (!due) continue;
-        if (!net::SendCrime(uid, cur)) { ++g_sendFailed; --g_scanPos; return; }   // link down: retry this uid next tick
-        l.sent = cur;
-        ++g_sent; ++sent;
-        CrLog("->", uid, cur, "");
+        const int out = CrimeDecideSend(uid, kCrFromSampler, 0);
+        if (out == kCrOutFailed || out == kCrOutFailedReSet) { --g_scanPos; return; }   // link down: retry this uid next tick
+        if (out == kCrOutSent) ++sent;
     }
 }
 
@@ -2013,6 +2216,7 @@ void CrimeApplyDrain()
 void InstallCrime()
 {
     if (g_copyCapLockInit == 0) { ::InitializeCriticalSection(&g_copyCapLock); g_copyCapLockInit = 1; }   /* before the detours note a write */
+    if (g_crEvLockInit == 0) { ::InitializeCriticalSection(&g_crEvLock); g_crEvLockInit = 1; }   /* T-1442 step 5: before the setCrime detour notes */
     CaughtInstall();   /* T-1131: before the pvp1 hooks' early return */
     if (g_pvpHook != 0) return;
     if (kCrSetRva == 0) { g_pvpHook = -1; ErrorLog("[CRIME] pvp1: SetCrime is not in the address table - player-vs-player crimes are NOT suppressed"); return; }
@@ -2025,9 +2229,16 @@ void InstallCrime()
         g_pvpNotifyHook = (sn == coop::SUCCESS) ? 1 : -1;
     }
     else g_pvpNotifyHook = -1;
+    if (kCrTimeSetRva != 0)   /* T-1442 step 5 fix attempt 2 (F1466): the time-left setter notes its character after the original */
+    {
+        const coop::HookStatus sts = coop::AddHook((void*)(base + (uintptr_t)kCrTimeSetRva), (void*)&detour_timeSet, (void**)&orig_timeSet);
+        g_timeSetHook = (sts == coop::SUCCESS) ? 1 : -1;
+    }
+    else g_timeSetHook = -1;
     DebugLog(std::string("[CRIME] pvp1 hooks setCrime 0x851DB0: ") + (g_pvpHook == 1 ? "installed" : "FAILED")
              + ", notifyCrimeWitnessed 0x851F40: " + (g_pvpNotifyHook == 1 ? "installed" : "FAILED")
-             + " (a player's crime against a player's faction is never recorded)");
+             + " (a player's crime against a player's faction is never recorded)"
+             + "; time-left setter 0x851070 (T-1442 step 5 note): " + (g_timeSetHook == 1 ? "installed" : (kCrTimeSetRva == 0 ? "NOT IN THE TABLE" : "FAILED")));
     /* sight1: the senses' player test also passes for every other player's faction (wanted on sight; T-356: one cell each) */
     if (g_sightState == 0)
     {
@@ -2084,7 +2295,17 @@ void ReportCrime()
     char rp[160];   /* T-1293 */
     std::sprintf(rp, " copyCrimeInReplaySkipped=%lld copyReplayHeld[skipped,now]=%lld,%u", (long long)g_copyCrimeInReplaySkipped,
                  g_copyReplayHeldSkipped, (unsigned int)g_copyReplayHeld.size());
-    DebugLog(std::string(b) + " " + PeerFactionCopies() + pv + hv + cw + rp + RelationsEvText() + CaughtReportText());
+    char ev[768];   /* T-1442 step 5; fix attempt 2 (F1466): notes by who (the setter's and notify's after-notes), lost time-left records, the setter's hook */
+    std::sprintf(ev, " crimeEvent[noted,sent,unchanged,gone,notMine,overflow,already,failed,failedReSet,dropped,notedSetCrime,notedNotifyAfter,notedTimeSet,timeSetLost,timeSetHook]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%ld"
+                 " backstop[expiry,heldBack,pendingNote,lateExpiry,linkReset,fresh,missed,retryAfterFailedSend]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_crEv.noted, g_crEvOut[kCrOutSent], g_crEvOut[kCrOutUnchanged], g_crEvOut[kCrOutGone], g_crEvOut[kCrOutNotMine], g_crEv.overflow,
+                 g_crEv.already, g_crEvOut[kCrOutFailed], g_crEvOut[kCrOutFailedReSet], g_crEvDropped,
+                 g_crEvNotedBy[kCrNoteSetCrime], g_crEvNotedBy[kCrNoteNotifyAfter], g_crEvNotedBy[kCrNoteTimeSet], g_crTsLost, (long)g_timeSetHook,
+                 g_backstop[coopcrime::kCrimeBackstopExpiry], g_backstop[coopcrime::kCrimeBackstopHeldBack], g_backstop[coopcrime::kCrimeBackstopPendingNote],
+                 g_backstop[coopcrime::kCrimeBackstopLateExpiry], g_backstop[coopcrime::kCrimeBackstopLinkReset],
+                 g_backstop[coopcrime::kCrimeBackstopFresh], g_backstop[coopcrime::kCrimeBackstopMissed],
+                 g_backstop[coopcrime::kCrimeBackstopRetryAfterFailedSend]);
+    DebugLog(std::string(b) + ev + " " + PeerFactionCopies() + pv + hv + cw + rp + RelationsEvText() + CaughtReportText());
     char bb[640];
     std::sprintf(bb, "[BOUNTY] REPORT sent[lists,adds,preApplyAdds]=%lld,%lld,%lld applied[lists,adds,addsGated,erased]=%lld,%lld,%lld,%lld"
                  " refused[notOwner,noCopy,noFaction,readFault,writeFault,malformed,queueDropped,noAddr,droppedBlocked]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"

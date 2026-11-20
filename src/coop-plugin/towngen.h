@@ -48,6 +48,10 @@ void TownLossNoteRows(const std::vector<char>& payload);
    1 while the world-server link is admitted with its opening push in (an owed DONE can go now). */
 void TownGenOwedSaveFinished(const std::string& saveName, long reqSeq);
 void TownGenOwedNotThisSave();
+/* T-1363: a write of area zoneId went to the world server with stamp (prior = the highest stamp sent for it before) / the world server
+   echoed this game's record worldId with stamp - an owed make of that area settles only once a record written after it is taken. ANY THREAD */
+void TownGenOwedAreaWritten(const std::string& zoneId, long long stamp, long long prior);
+void TownGenOwedAreaEcho(const std::string& worldId, int hasStamp, long long stamp);
 int TownGenOwedSettling();
 int TownGenOwedCanSend();
 std::string TownGenOwedLever(const std::string& arg);

@@ -742,7 +742,7 @@ void t_t1279f_refuse_restart_cap()
         || ui.find("coopui::kPressJoinNoAnswerText : coopui::kPressHostLateText") == std::string::npos) Fail("t1279f: the refused load does not show the existing CAN'T JOIN / CAN'T HOST box");
     if (plugin.find("return (!g_storeTargetAddr.empty() && g_storeTargetPort != 0 && !g_storeProtoMismatch") == std::string::npos) Fail("t1279f (finding 3): 'a server is set' is not the target address and port");
     if (plugin.find("PreFetchClass") != std::string::npos) Fail("t1279f (design B): the all-zones pre-load fetch is still there");
-    if (plugin.find("UiQuietNotice(coopown::HostQuietLine(), 1);") == std::string::npos) Fail("t1279f: the held load shows no connection-problem notice");
+    if (plugin.find("UiLoadPanel(coopown::HostQuietLine(), coopui::kLoadFillHidden, 1);") == std::string::npos)   /* T-1390 (decision 1730): in the progress panel */ Fail("t1279f: the held load shows no connection-problem notice");
     if (plugin.find("areafresh::WaitEndOrNoServer(") == std::string::npos || plugin.find("verdict != areafresh::kWaitRecord") == std::string::npos) Fail("t1279f (design B): the game does not wait for the record of an area nobody holds");
     if (server.find("{ AfAnswerFromRecords(from, slot, m, why, holder); return; }") == std::string::npos || server.find("areafresh::ServerRecordAnswer(") == std::string::npos)
         Fail("t1279f (design B): the world server does not answer an ASK from its records");
@@ -810,7 +810,7 @@ void t_t1279_answer_line()
     if (AreaFreshLine(areafresh::kCant, 0) != kLineAnswer) Fail("t1279 answer line: a CANT with no record of its area waiting is not on the ANSWER line");
     if (AreaFreshLine(areafresh::kCant, 1) != kLineRest) Fail("t1279 answer line: a CANT passed a waiting record of its own area");
     if (AreaFreshLine(areafresh::kWrite, 0) != kLineLive || AreaFreshLine(areafresh::kWrite, 1) != kLineLive) Fail("t1279 answer line: a WRITE is not on the LIVE line");
-    if (AreaFreshLine(areafresh::kFresh, 0) != kLineRest || AreaFreshLine(areafresh::kFresh, 1) != kLineRest) Fail("t1279 answer line: a FRESH left the REST line (it would pass its own record)");
+    if (AreaFreshLine(areafresh::kFresh, 0) != kLineAnswer || AreaFreshLine(areafresh::kFresh, 1) != kLineRest) Fail("t1279 answer line: a FRESH is not on the ANSWER line, or passed a waiting record of its own area (T-1429 s2 fold 2)");
     if (AreaFreshLine(areafresh::kAsk, 0) != kLineRest || AreaFreshLine(99, 0) != kLineRest) Fail("t1279 answer line: an unknown kind left the REST line");
     if (LineOf(kTypeAreaFresh, "x", 1, kDirDown) != kLineRest) Fail("t1279 answer line: LineOf moved AREA_FRESH (its line is chosen by kind and by what waits: AreaFreshLine)");
 
@@ -3595,12 +3595,21 @@ void t_t461_nearby_messages()
 {
     using namespace coopbug;
     std::vector<char> b;
-    unsigned int id = 0, mx = 0;
-    LogAskEncode(&b, 77, kNearbyLogMax);
-    if (b.size() != kLogAskBytes || !LogAskDecode(&b[0], b.size(), &id, &mx) || id != 77 || mx != kNearbyLogMax) Fail("LOG_ASK round trip");
-    if (LogAskDecode(&b[0], 7, &id, &mx)) Fail("a short LOG_ASK was read");
-    LogAskEncode(&b, 0, 5);
-    if (LogAskDecode(&b[0], b.size(), &id, &mx)) Fail("ask id 0 was read");
+    LogAsk a, askBack;
+    a.askId = 77; a.maxBytes = kNearbyLogMax; a.sx = 12; a.sy = 40;
+    for (size_t k = 0; k < kLogLabelBytes; ++k) a.label[k] = (unsigned char)(0xA0 + k);
+    LogAskEncode(&b, a);
+    if (b.size() != kLogAskBytes || kLogAskBytes != 32 || !LogAskDecode(&b[0], b.size(), &askBack) || askBack.askId != 77 || askBack.maxBytes != kNearbyLogMax
+        || askBack.sx != 12 || askBack.sy != 40 || std::memcmp(askBack.label, a.label, kLogLabelBytes) != 0) Fail("LOG_ASK round trip");
+    if (LogAskDecode(&b[0], 31, &askBack) || LogAskDecode(&b[0], 8, &askBack)) Fail("a short LOG_ASK (or the 8-byte one before protocol 232) was read");
+    LogAsk askBad = a; askBad.askId = 0; LogAskEncode(&b, askBad);
+    if (LogAskDecode(&b[0], b.size(), &askBack)) Fail("ask id 0 was read");
+    askBad = a; askBad.sx = 64; LogAskEncode(&b, askBad);
+    if (LogAskDecode(&b[0], b.size(), &askBack)) Fail("a sector off the grid was read");
+    askBad = a; askBad.sy = -1; LogAskEncode(&b, askBad);
+    if (LogAskDecode(&b[0], b.size(), &askBack)) Fail("a negative sector was read");
+    if (LabelHex(a.label).size() != 32 || LabelHex(a.label).compare(0, 4, "a0a1") != 0) Fail("the label's hex");
+    if (kAskSectorGrid != cooplive::kAreaGrid) Fail("the ask's sector grid is not the notebook's");
     /* a bundle: name, sizes and two segments, through parts and back */
     LogPack p;
     p.rawTotal = 5000000000ull; p.rawDropped = 123; p.ipsScrubbed = 9;
@@ -3649,13 +3658,99 @@ void t_t461_nearby_messages()
     LogPartEncode(&ep, 5, empty, 0);
     if (!LogPartDecode(&ep[0], ep.size(), &lp) || lp.parts != 1 || lp.len != 0) Fail("an empty answer is not one empty part");
     /* the wait */
-    if (NearbyWaitOver(4999, 0, 0) || !NearbyWaitOver(5000, 0, 0)) Fail("nobody answering is not waited for 5 s");
-    if (NearbyWaitOver(8000, 2, 1) || !NearbyWaitOver(8000, 2, 2) || !NearbyWaitOver(20000, 3, 0)) Fail("a started answer is not waited for, up to 20 s");
+    if (NearbyWaitOver(4999, 0) || !NearbyWaitOver(5000, 0)) Fail("nobody answering is not waited for 5 s");
+    if (NearbyWaitOver(8000, 1) || !NearbyWaitOver(8000, 0) || !NearbyWaitOver(20000, 3)) Fail("an owed answer is not waited for, up to 20 s");
     /* the largest answer, paced, arrives inside the wait with time left for the answering game to compress its log */
     if (PartCountFor(kNearbyLogMax + 4096u) * kPartGapMs + kNearbyFirstMs > kNearbyTotalMs) Fail("the largest answer cannot arrive inside the wait");
     if (SafeName("A/b:c*") != "A-b-c-" || SafeName("") != "player" || SafeName(std::string(40, 'z')).size() != 24 || SafeName("x. ") != "x") Fail("folder names");
     if (cooplive::kInnerLogAsk != 203 || cooplive::kInnerLogPart != 204 || !cooplive::LiveInnerRoadLocal(203) || cooplive::LiveInnerAccepted(204))
         Fail("LOG_ASK / LOG_PART are not the store layer's own (never the session layer's)");
+}
+/* T-1401 step 2b (owner 1741 b, design D1, F1168): the asked game's at-once LOG_REPLY, its queue, the wait and the report's note */
+void t_t1401b_nearby_reply()
+{
+    using namespace coopbug;
+    std::vector<char> b;
+    unsigned int id = 0, code = 0, det = 0;
+    /* round trips, every code */
+    const unsigned int good[6][2] = { { 1, 123456 }, { 2, 1 }, { 2, 4 }, { 2, 0 }, { 3, 42 }, { 4, 0 } };
+    for (int i = 0; i < 6; ++i)
+    {
+        LogReplyEncode(&b, 9, good[i][0], good[i][1]);
+        if (b.size() != kLogReplyBytes || kLogReplyBytes != 12 || !LogReplyDecode(&b[0], b.size(), &id, &code, &det) || id != 9 || code != good[i][0] || det != good[i][1])
+            Fail("t1401b: LOG_REPLY code " + I((int)good[i][0]) + " did not come back");
+    }
+    LogReplyEncode(&b, 9, 5, 0);
+    if (!LogReplyDecode(&b[0], b.size(), &id, &code, &det) || code != (unsigned int)kReplyNotLoaded) Fail("t1401b: 'not loaded here' did not come back");
+    /* bad bytes refused */
+    const unsigned int bad[8][3] = { { 0, 1, 0 }, { 9, 0, 0 }, { 9, 6, 0 }, { 9, 2, 5 }, { 9, 3, 61 }, { 9, 4, 1 }, { 9, 5, 7 }, { 9, 0xFFFFFFFFu, 0 } };
+    for (int i = 0; i < 8; ++i)
+    {
+        LogReplyEncode(&b, bad[i][0], bad[i][1], bad[i][2]);
+        if (LogReplyDecode(&b[0], b.size(), &id, &code, &det)) Fail("t1401b: a bad LOG_REPLY was read (case " + I(i) + ")");
+    }
+    LogReplyEncode(&b, 9, 1, 5);
+    if (LogReplyDecode(&b[0], 11, &id, &code, &det) || LogReplyDecode(0, 12, &id, &code, &det)) Fail("t1401b: a short LOG_REPLY was read");
+    b.push_back(0);
+    if (LogReplyDecode(&b[0], b.size(), &id, &code, &det)) Fail("t1401b: a long LOG_REPLY was read");
+    if (cooplive::kInnerLogReply != 208u || !cooplive::LiveInnerRoadLocal(cooplive::kInnerLogReply) || cooplive::LiveInnerAccepted(cooplive::kInnerLogReply)
+        || cooplive::kInnerLogReply == cooplive::kInnerMapDots || cooplive::kInnerLogReply == cooplive::kInnerLogAsk || cooplive::kInnerLogReply == cooplive::kInnerLogPart)
+        Fail("t1401b: LOG_REPLY is not inner type 208, the store layer's own");
+    if (hovrec::kGameProtocol != 237u) Fail("t1401b: the game-to-game protocol is not 237 (T-1401 step 2b took 232, T-1393 233, T-1408 235, T-1429 s10 merge 236)");
+    /* the queue: oldest first, at most 4, a slot waiting once */
+    AskQueue q;
+    AskWaiting w;
+    for (unsigned int s = 1; s <= 4; ++s) { w.slot = s; w.ask.askId = 100 + s; w.arrivedMs = s; if (q.Add(w) != s) Fail("t1401b: queue place " + I((int)s)); }
+    w.slot = 5; w.ask.askId = 105;
+    if (q.Add(w) != 0 || q.Size() != 4) Fail("t1401b: a fifth ask was queued");
+    w.slot = 3; w.ask.askId = 203;
+    if (q.Add(w) != 3 || q.Size() != 4) Fail("t1401b: a slot already waiting was queued twice, or lost its place");
+    AskWaiting t;
+    if (!q.Take(&t) || t.slot != 1 || t.ask.askId != 101) Fail("t1401b: the oldest ask was not taken first");
+    if (!q.Take(&t) || t.slot != 2) Fail("t1401b: the second ask was not next");
+    if (!q.Take(&t) || t.slot != 3 || t.ask.askId != 203) Fail("t1401b: the replaced ask did not keep its place with its newer id");
+    w.slot = 6; w.ask.askId = 106;
+    if (q.Add(w) != 2) Fail("t1401b: a freed place was not given");
+    if (!q.Take(&t) || t.slot != 4 || !q.Take(&t) || t.slot != 6 || q.Take(&t) || q.Size() != 0) Fail("t1401b: the queue's order at its end");
+    /* a player who left: his waiting asks go, the others keep their order */
+    for (unsigned int s = 1; s <= 3; ++s) { w.slot = s; w.ask.askId = 300 + s; q.Add(w); }
+    if (q.DropSlot(2) != 1 || q.DropSlot(9) != 0 || q.Size() != 2 || !q.Take(&t) || t.slot != 1 || !q.Take(&t) || t.slot != 3) Fail("t1401b: dropping a gone player's asks");
+    /* the wait: replies collected 5 s; 'sending' / 'queued' waited for up to 20 s; the rest not */
+    if (ReplyStillOwed(kReplySending, 100, false, false) != true || ReplyStillOwed(kReplySending, 100, true, true) != false) Fail("t1401b: a 'sending' reply's debt");
+    if (ReplyStillOwed(kReplyQueued, 2, false, false) != true || ReplyStillOwed(kReplyQueued, 0, false, false) != false) Fail("t1401b: a 'queued' reply's debt (0 = queue full, nothing owed)");
+    if (ReplyStillOwed(kReplyAnsweredYou, 30, false, false) || ReplyStillOwed(kReplyLogUnreadable, 0, false, false) || ReplyStillOwed(kReplyNotLoaded, 0, false, false))
+        Fail("t1401b: a refusing reply was waited for");
+    if (ReplyStillOwed(0, 0, true, false) != true || ReplyStillOwed(0, 0, false, false) != false) Fail("t1401b: parts with no reply");
+    if (NearbyWaitOver(4999, 0) || !NearbyWaitOver(5000, 0) || NearbyWaitOver(19999, 1) || !NearbyWaitOver(20000, 1)) Fail("t1401b: the wait-over rule");
+    /* the note, one line per code */
+    NearbyReply r; r.slot = 2; r.name = "Bo";
+    r.firstCode = 2; r.firstDetail = 1; r.lastCode = 1; r.lastDetail = 5000; r.logState = 1;
+    if (NearbyReplyText(r) != "busy, queued (place 1), then answered - its log is attached (5000 bytes before packing)") Fail("t1401b: note 'queued then answered': " + NearbyReplyText(r));
+    r.firstCode = 1; r.firstDetail = 5000;
+    if (NearbyReplyText(r) != "answered - its log is attached (5000 bytes before packing)") Fail("t1401b: note 'answered'");
+    r.logState = 2;
+    if (NearbyReplyText(r).find("did not all arrive") == std::string::npos) Fail("t1401b: note 'sending, not all arrived'");
+    r.logState = 0;
+    if (NearbyReplyText(r).find("no part of its log arrived") == std::string::npos) Fail("t1401b: note 'sending, nothing arrived'");
+    r.firstCode = 2; r.firstDetail = 3; r.lastCode = 2; r.lastDetail = 3;
+    if (NearbyReplyText(r) != "busy, queued (place 3) - its turn did not come within 20 s") Fail("t1401b: note 'queued, never its turn'");
+    r.lastDetail = 0; r.firstDetail = 0;
+    if (NearbyReplyText(r).find("queue of 4 waiting asks full") == std::string::npos) Fail("t1401b: note 'queue full'");
+    r.firstCode = 3; r.lastCode = 3; r.lastDetail = 17;
+    if (NearbyReplyText(r) != "answered you 17 s ago - not sent again (one answer per player a minute)") Fail("t1401b: note 'answered you'");
+    r.firstCode = 4; r.lastCode = 4; r.lastDetail = 0;
+    if (NearbyReplyText(r) != "its log could not be read") Fail("t1401b: note 'log unreadable'");
+    r.firstCode = 5; r.lastCode = 5;
+    if (NearbyReplyText(r).find("only in its outer ring, not loaded") == std::string::npos) Fail("t1401b: note 'not loaded here'");
+    r.firstCode = 0; r.lastCode = 0;
+    if (NearbyReplyText(r) != "no answer") Fail("t1401b: note 'no answer'");
+    std::vector<NearbyReply> said;
+    if (NearbyNoteText(3, 4, said, 0) != "asked (sector 3,4); no game replied within 5 s") Fail("t1401b: the empty note: " + NearbyNoteText(3, 4, said, 0));
+    if (NearbyNoteText(3, 4, said, 1) != "asked (sector 3,4); no game replied within 5 s; 1 other player in the world: no answer") Fail("t1401b: one silent player");
+    r.slot = 2; r.firstCode = 2; r.firstDetail = 1; r.lastCode = 1; r.lastDetail = 10; r.logState = 1; said.push_back(r);
+    const std::string note = NearbyNoteText(3, 4, said, 2);
+    if (note != "asked (sector 3,4); slot 2 (Bo): busy, queued (place 1), then answered - its log is attached (10 bytes before packing); 2 other players in the world: no answer")
+        Fail("t1401b: the whole note: " + note);
 }
 void t_t461_answer_manners()
 {
@@ -4185,19 +4280,23 @@ void t_t346_place_input_height()
 {
     using namespace placeinput;
     float y = 123.0f;
-    /* the copy that landed one ground height too high: live 3059.0 over ground 1527.0 -> input 1532.0 */
-    if (InputYFromLive(3059.0f, 1, 1527.0f, &y) != 1 || y != 1532.0f)          Fail("live less ground");
+    /* the copy that landed one ground height too high: live 3059.0 over ground 1527.0 (above the engine's floor: its ground is the
+       terrain) -> input 1532.0 */
+    if (InputYFromLive(3059.0f, 1, 1527.0f, 1, 1527.0f, &y) != 1 || y != 1532.0f)          Fail("live less ground");
     /* created again at that input, the piece stands at the same live height (the key's height) */
-    if (y + 1527.0f != 3059.0f)                                                 Fail("round trip");
+    if (y + EngineGroundOf(1527.0f, kEngineGroundFloor) != 3059.0f)                         Fail("round trip");
     y = 123.0f;
-    if (InputYFromLive(3059.0f, 0, kNoGround, &y) != 0 || y != 123.0f)         Fail("no terrain answered");
-    if (InputYFromLive(3059.0f, -1, 0.0f, &y) != 0 || y != 123.0f)             Fail("no row / faulted");
-    if (InputYFromLive(3059.0f, 1, kNoGround, &y) != 0 || y != 123.0f)         Fail("-99 is no ground even when read");
+    if (InputYFromLive(3059.0f, 0, kNoGround, 1, 100.0f, &y) != 0 || y != 123.0f)          Fail("no terrain answered");
+    if (InputYFromLive(3059.0f, -1, 0.0f, 1, 100.0f, &y) != 0 || y != 123.0f)              Fail("no row / faulted");
+    if (InputYFromLive(3059.0f, 1, kNoGround, 1, 100.0f, &y) != 0 || y != 123.0f)          Fail("-99 is no ground even when read (the engine would add 100 now)");
+    if (InputYFromLive(3059.0f, 1, 1527.0f, -1, 0.0f, &y) != 0 || y != 123.0f)             Fail("T-1372: the engine's ground not read (no row / faulted)");
+    if (InputYFromLive(3059.0f, 1, 1527.0f, 0, 1527.0f, &y) != 0 || y != 123.0f)           Fail("T-1372: an engine read other than 1");
     const float nan = std::numeric_limits<float>::quiet_NaN();
-    if (InputYFromLive(3059.0f, 1, nan, &y) != 0 || y != 123.0f)               Fail("NaN ground");
-    if (InputYFromLive(nan, 1, 1527.0f, &y) != 0 || y != 123.0f)               Fail("NaN live");
+    if (InputYFromLive(3059.0f, 1, nan, 1, 1527.0f, &y) != 0 || y != 123.0f)               Fail("NaN terrain");
+    if (InputYFromLive(3059.0f, 1, 1527.0f, 1, nan, &y) != 0 || y != 123.0f)               Fail("T-1372: NaN engine ground");
+    if (InputYFromLive(nan, 1, 1527.0f, 1, 1527.0f, &y) != 0 || y != 123.0f)               Fail("NaN live");
     /* a piece below the ground height (a cellar floor) keeps a negative input */
-    if (InputYFromLive(1500.0f, 1, 1527.0f, &y) != 1 || y != -27.0f)          Fail("below ground");
+    if (InputYFromLive(1500.0f, 1, 1527.0f, 1, 1527.0f, &y) != 1 || y != -27.0f)          Fail("below ground");
 }
 
 void t_t346_record_file_names()
@@ -5611,6 +5710,11 @@ void t_t546h_bottom_line()
     using namespace teamscreen;
     Sel s; s.faction = "Iron Wolves"; s.name = "Kim"; s.online = true; s.you = nametag::kHostile;
     View v = ViewFor(true, s);
+    /* T-1406 (F1214, the owner 2026-11-18): no INVITE TO FACTION while either side is HOSTILE - and no words in its place */
+    if (v.lineKind != kLineStance || v.line != "YOUR STANCE TOWARDS IRON WOLVES" || !v.stance || v.left != kActNone || v.right != kActNone || !v.note.empty()) Fail("in no faction, this side hostile: the stance line, the buttons, no INVITE TO FACTION");
+    s.you = nametag::kNeutral; s.them = nametag::kHostile; v = ViewFor(true, s);
+    if (!v.stance || v.right != kActNone || !v.note.empty()) Fail("in no faction, their side hostile: no INVITE TO FACTION");
+    s.them = nametag::kNeutral; v = ViewFor(true, s);
     if (v.lineKind != kLineStance || v.line != "YOUR STANCE TOWARDS IRON WOLVES" || !v.stance || v.left != kActNone || v.right != kActInvite) Fail("in no faction: the stance line, the buttons, INVITE TO FACTION");
     s.online = false; v = ViewFor(true, s);
     if (v.right != kActNone || !v.stance) Fail("an offline player: no INVITE TO FACTION, the stance buttons stay");
@@ -5618,6 +5722,8 @@ void t_t546h_bottom_line()
     if (v.right != kActNone || !v.stance) Fail("a player in another faction: no INVITE TO FACTION");
     s.inTeam = false; s.myRole = kRoleFounder; v = ViewFor(true, s);
     if (!v.stance || v.right != kActInvite || v.left != kActNone || v.lineKind != kLineStance) Fail("the founder towards a player outside: stance and INVITE");
+    s.you = nametag::kHostile; v = ViewFor(true, s);
+    if (!v.stance || v.right != kActNone) Fail("the founder towards a player outside, hostile: no INVITE (T-1406 F1214)");
     s.mate = true; s.name = "Sam"; v = ViewFor(true, s);
     if (v.lineKind != kLineMember || v.line != "SAM IS A MEMBER OF YOUR FACTION" || v.stance || v.left != kActDisband || v.right != kActRemove) Fail("B7.1: the founder with a member selected");
     s.myRole = kRoleMember; s.name = "Alex"; v = ViewFor(true, s);
@@ -5714,17 +5820,20 @@ void t_t546l_invite_refused_lines()
     if (NoticeLine(swteam::kEvInvite, swteam::kRefInvitePending, false, "Sam", T) != "Sam already has an invitation.") Fail("516 a: an invitation waiting");
     if (NoticeLine(swteam::kEvInvite, swteam::kRefInTeam, false, "Sam", T) != "Sam is in another faction.") Fail("516 a: in another faction");
     if (NoticeLine(swteam::kEvInvite, swteam::kRefNotOnline, false, "Sam", T) != "Sam is offline.") Fail("516 a: offline");
-    const int general[8] = { swteam::kRefDeclined, swteam::kRefUnknownPlayer, swteam::kRefSelf, swteam::kRefOwedFull, swteam::kRefTeamFull,
+    if (NoticeLine(swteam::kEvInvite, swteam::kRefDeclined, false, "Sam", T) != "Sam declined your last invitation. You can invite them again in a minute.") Fail("1768: declined recently");
+    const int general[7] = { swteam::kRefUnknownPlayer, swteam::kRefSelf, swteam::kRefOwedFull, swteam::kRefTeamFull,
                              swteam::kRefTooMany, swteam::kRefNotSaved, swteam::kRefNoSnapshot };
     if (NoticeLine(swteam::kEvInvite, swteam::kRefNotFounder, false, "Sam", T) != "Only the founder can invite players." || NoticeLine(swteam::kEvInvite, swteam::kRefNotFounder, false, "", T) != "Only the founder can invite players.")
         Fail("522: a member who is not the founder is told only the founder can invite");
-    for (int k = 0; k < 8; ++k)
+    for (int k = 0; k < 7; ++k)
         if (NoticeLine(swteam::kEvInvite, general[k], false, "Sam", T) != "The invitation could not be sent. Try again in a moment.") Fail("516 a: the general line for reason " + I(general[k]));
     if (NoticeLine(swteam::kEvInvite, swteam::kRefInvitePending, false, "", T) != "The invitation could not be sent. Try again in a moment.") Fail("516 a: a named reason with no name gives the general line");
     if (NoticeLine(swteam::kEvInvite, swteam::kRefNotOnline, true, "Sam", T) != "The invitation could not be sent. Try again in a moment.") Fail("516 a: a refusal naming this player itself names nobody");
     if (NoticeLine(swteam::kEvInvite, swteam::kRefInTeam, false, "S#m", T) != "S##m is in another faction.") Fail("516 a: the name escaped");
     if (NoticeLine(swteam::kEvAnswer, swteam::kRefNoInvite, true, "Sam", T) != "" || NoticeLine(swteam::kEvLeave, swteam::kRefNotInTeam, true, "Sam", T) != "") Fail("other refusals stay without a line");
     if (InviteRefusedLine(swteam::kOk, "Sam") != "") Fail("no refusal, no line");
+    if (InviteRefusedLine(swteam::kRefDeclined, "Sam") != "Sam declined your last invitation. You can invite them again in a minute.") Fail("1768: the declined-recently line names the player");
+    if (InviteRefusedLine(swteam::kRefDeclined, "") != "The invitation could not be sent. Try again in a moment.") Fail("1768: no name known - the general line");
 }
 void t_t546l_invitation_ended()
 {

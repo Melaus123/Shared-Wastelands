@@ -5,7 +5,15 @@
  *   1. copies SharedWastelandsLoader.dll from its own folder into the Kenshi folder (an older copy is overwritten);
  *   2. in Plugins_x64.cfg: saves Plugins_x64.cfg.multiplayer-backup (only if none exists), then adds the line
  *      Plugin=SharedWastelandsLoader after the last Plugin= line, once (src/common/installtext.h, offline-tested).
- * Uninstall takes our line out (only ours), moves the loader DLL to the Recycle Bin and leaves the backup.
+ * T-1364 (owner 1667 / 1668): when Setup runs from a folder the loader does not search (anything but a direct subfolder
+ * of <Kenshi>\mods\ or of that Kenshi's Steam Workshop folder - coopinst::CopyNeeded), install FIRST copies every file
+ * and subfolder of its own folder to <Kenshi>\mods\Shared Wastelands (a new copy is made in a temporary sibling folder
+ * and renamed into place; an older copy has its files overwritten and keeps any extra ones), then does 1. and 2.
+ * A NEW copy gets a one-line note file (coopinst::SetupNoteName); an overwritten folder gets none.
+ * Uninstall takes our line out (only ours), moves the loader DLL to the Recycle Bin and leaves the backup; then it moves
+ * <Kenshi>\mods\Shared Wastelands to the Recycle Bin too when it holds that note (a copy Setup made), unless Setup is
+ * running from inside it (coopinst::UninstallRecyclesCopy).
+ * Installed = the loader, our line AND a usable marker where the loader looks (coopinst::SetupInstalled).
  * Order matters: install copies the DLL BEFORE it adds the line, uninstall removes the line BEFORE the DLL -
  * a Plugin= line naming a missing DLL stops the game starting, so no failure in between can leave one.
  *
@@ -15,6 +23,7 @@
  *   /test-install <kenshi folder>     exit 0 done, 2 not a Kenshi folder, 3 Kenshi running, 4 could not change files
  *   /test-uninstall <kenshi folder>   same codes
  *   /test-status <kenshi folder>      exit 0 installed, 1 not installed
+ *   /test-copyneeded <kenshi folder>  exit 0 install would copy the mod's folder, 1 it would not
  *   /test-install-skiprun, /test-uninstall-skiprun <folder>   the same without the "Kenshi is running" check
  *
  * VS2010 v100, C++03.  Static CRT (/MT) so it needs nothing installed; only Windows system DLLs are imported.
@@ -29,6 +38,7 @@
 #include <vector>
 
 #include "installtext.h"
+#include "loadermarker.h"   /* the marker the loader looks for, and its parser (IsInstalled) */
 #include "names.h"   /* the on-disk names (mod folder, files, window texts) */
 
 namespace {
@@ -37,7 +47,8 @@ namespace {
 const wchar_t* const kTitle        = swnames::kSetupTitleW;
 const wchar_t* const kMsgInstall   = L"";   /* the install screen: the folder row and Install only */
 const wchar_t* const kLabelFolder  = L"Kenshi folder:";
-const wchar_t* const kMsgInstalled = SW_NAME_W L" is installed.";
+const wchar_t* const kMsgCopy      = L"The mod's files will be copied into Kenshi's mods folder.";   /* decision 1668: install screen, copy needed only */
+const wchar_t* const kMsgInstalled = SW_NAME_W L" is installed. Turn it on in the Mods tab of Kenshi's launcher.";   /* decision 1668 */
 const wchar_t* const kMsgAlready   = SW_NAME_W L" is already installed.";
 const wchar_t* const kMsgRemoved   = SW_NAME_W L" has been removed from your Kenshi folder. Your saves are not affected.";
 const wchar_t* const kMsgNotFound  = L"Kenshi (kenshi_x64.exe) wasn't found in this folder.";
@@ -56,6 +67,8 @@ const wchar_t* const kLoaderDll = swnames::kLoaderDllW;
 const wchar_t* const kCfgName   = L"Plugins_x64.cfg";
 const wchar_t* const kCfgBackup = L"Plugins_x64.cfg.multiplayer-backup";
 const wchar_t* const kCfgNew    = L"Plugins_x64.cfg.multiplayer-new";
+const wchar_t* const kModFolder = SW_NAME_W;            /* <Kenshi>\mods\<this>: the folder whose .mod Kenshi's launcher lists */
+const wchar_t* const kCopyNew   = L".setup-new";        /* suffix of the temporary sibling a new copy is made in */
 
 enum Result { kOk = 0, kNotKenshi = 2, kRunning = 3, kWriteFail = 4 };
 
@@ -83,6 +96,30 @@ bool FileExists(const std::wstring& path)
 
 bool HasGame(const std::wstring& folder) { return !folder.empty() && FileExists(Join(folder, kGameExe)); }
 
+bool DirExists(const std::wstring& path)
+{
+    const DWORD a = GetFileAttributesW(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool PathExists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+/* The full path (GetFullPathName); the path unchanged when that fails. */
+std::wstring FullPath(const std::wstring& p)
+{
+    std::vector<wchar_t> buf(MAX_PATH * 4);
+    const DWORD n = GetFullPathNameW(p.c_str(), (DWORD)buf.size(), &buf[0], 0);
+    return (n > 0 && n < buf.size()) ? std::wstring(&buf[0], n) : p;
+}
+
+/* The marker's file name, widened (it is ASCII, loadermarker.h). */
+std::wstring MarkerNameW()
+{
+    std::wstring w;
+    for (const char* p = cooploader::MarkerFileName(); *p; ++p) w += (wchar_t)(unsigned char)*p;
+    return w;
+}
+
 std::string ToUtf8(const std::wstring& w)
 {
     if (w.empty()) return std::string();
@@ -99,6 +136,24 @@ std::wstring FromUtf8(const std::string& s)
     std::wstring w(n > 0 ? n : 0, L'\0');
     if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
+}
+
+/* A path in the form coopinst:: compares: full, long (an 8.3 short name expanded where the folder exists), upper-cased
+   by Windows' own table so a non-ASCII case difference compares equal too, then UTF-8. */
+std::string PathKey(const std::wstring& p)
+{
+    std::wstring w = FullPath(p);
+    std::vector<wchar_t> buf(MAX_PATH * 4);
+    const DWORD n = GetLongPathNameW(w.c_str(), &buf[0], (DWORD)buf.size());
+    if (n > 0 && n < buf.size()) w.assign(&buf[0], n);
+    if (!w.empty()) CharUpperBuffW(&w[0], (DWORD)w.size());
+    return ToUtf8(w);
+}
+
+/* T-1364: install would copy Setup's own folder into <folder>\mods\ (coopinst::CopyNeeded). */
+bool CopyNeeded(const std::wstring& selfDir, const std::wstring& folder)
+{
+    return coopinst::CopyNeeded(PathKey(selfDir), PathKey(folder));
 }
 
 /* The whole file as bytes; false when it cannot be opened or is over 4 MB (Plugins_x64.cfg is a few hundred bytes). */
@@ -148,15 +203,118 @@ bool KenshiRunning()
     return found;
 }
 
-/* Already installed = our line in Plugins_x64.cfg AND the loader file in the folder. */
+/* A subfolder of `dir` holds a marker the loader would use: it parses (loadermarker.h) and the DLL it names is beside it.
+   The loader (loader.cpp SearchDir) also skips a folder switched off in Kenshi's mod list; switching it on is the
+   player's step in the launcher, which the installed screen tells them. */
+bool MarkerIn(const std::wstring& dir)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW(Join(dir, L"*").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do
+    {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+        const std::wstring n = fd.cFileName;
+        if (n == L"." || n == L"..") continue;
+        const std::wstring sub = Join(dir, n);
+        std::string text;
+        if (!ReadBytes(Join(sub, MarkerNameW()), &text)) continue;
+        cooploader::MarkerResult r;
+        cooploader::MarkerParse(text.data(), (long)text.size(), &r);
+        if (r.ok == 1 && FileExists(Join(sub, FromUtf8(r.dll)))) found = true;
+    } while (!found && FindNextFileW(f, &fd));
+    FindClose(f);
+    return found;
+}
+
+/* The loader's two places (loader.cpp): <Kenshi>\mods\*\, then <Kenshi>\..\..\workshop\content\233860\*\. */
+bool ModFolderFound(const std::wstring& folder)
+{
+    return MarkerIn(Join(folder, L"mods")) || MarkerIn(FullPath(Join(folder, L"..\\..\\workshop\\content\\233860")));
+}
+
+/* Installed = the loader file, our line in Plugins_x64.cfg AND a usable mod folder where the loader looks (decision 1668).
+   Loader + line with no mod folder found -> not installed: the Install screen shows. */
 bool IsInstalled(const std::wstring& folder)
 {
     if (!HasGame(folder) || !FileExists(Join(folder, kLoaderDll))) return false;
     std::string text;
-    return ReadBytes(Join(folder, kCfgName), &text) && coopinst::PcfgHasOurLine(text);
+    const bool line = ReadBytes(Join(folder, kCfgName), &text) && coopinst::PcfgHasOurLine(text);
+    return coopinst::SetupInstalled(true, true, line, line && ModFolderFound(folder));
 }
 
 /* ----------------------------------- install / uninstall ----------------------------------- */
+/* SHFileOperation on one file or folder: to the Recycle Bin (recycle) or, for Setup's own temporary folder only, gone. */
+bool ShellDelete(const std::wstring& path, bool recycle)
+{
+    std::vector<wchar_t> from(path.begin(), path.end());
+    from.push_back(L'\0');
+    from.push_back(L'\0');   /* SHFileOperation wants a double-NUL-terminated list */
+    SHFILEOPSTRUCTW op;
+    ZeroMemory(&op, sizeof(op));
+    op.wFunc = FO_DELETE;
+    op.pFrom = &from[0];
+    op.fFlags = (FILEOP_FLAGS)((recycle ? FOF_ALLOWUNDO : 0) | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI);
+    const int rc = SHFileOperationW(&op);
+    return rc == 0 && !op.fAnyOperationsAborted && !PathExists(path);
+}
+
+bool RecycleFile(const std::wstring& path) { return ShellDelete(path, true); }
+
+/* Every file and subfolder of `from` into `to` (made when missing); a file already there is overwritten, an extra one
+   is kept.  Linked folders (reparse points) are not followed. */
+bool CopyTree(const std::wstring& from, const std::wstring& to)
+{
+    if (!CreateDirectoryW(to.c_str(), 0) && !DirExists(to)) return false;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW(Join(from, L"*").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    bool ok = true;
+    do
+    {
+        const std::wstring n = fd.cFileName;
+        if (n == L"." || n == L"..") continue;
+        const std::wstring s = Join(from, n), d = Join(to, n);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) ok = CopyTree(s, d);
+        }
+        else ok = CopyFileW(s.c_str(), d.c_str(), FALSE) != 0;
+    } while (ok && FindNextFileW(f, &fd));
+    FindClose(f);
+    return ok;
+}
+
+/* The note, written in place of any file of that name (one Setup made earlier). */
+bool WriteNote(const std::wstring& dir)
+{
+    const std::wstring path = Join(dir, FromUtf8(coopinst::SetupNoteName()));
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const char* text = coopinst::SetupNoteText();
+    const DWORD len = (DWORD)lstrlenA(text);
+    DWORD put = 0;
+    const bool ok = WriteFile(h, text, len, &put, 0) != 0 && put == len;
+    CloseHandle(h);
+    return ok;
+}
+
+/* T-1364: Setup's own folder -> <folder>\mods\<kModFolder>.  A new copy is made in <that>.setup-new and renamed into place,
+   so a failed copy leaves no half folder; an existing copy has its files overwritten in place (extra files kept). */
+bool CopyModFolder(const std::wstring& folder, const std::wstring& selfDir)
+{
+    if (!FileExists(Join(selfDir, MarkerNameW()))) return false;            /* not the mod's folder: nothing to copy */
+    const std::wstring mods = Join(folder, L"mods"), dest = Join(mods, kModFolder), tmp = dest + kCopyNew;
+    if (!CreateDirectoryW(mods.c_str(), 0) && !DirExists(mods)) return false;
+    if (coopinst::InstInside(PathKey(mods), PathKey(selfDir))) return false;   /* mods\ below Setup's folder: the copy would hold itself */
+    if (DirExists(dest)) return CopyTree(selfDir, dest);
+    if (PathExists(tmp) && !ShellDelete(tmp, false)) return false;          /* a temporary folder a failed run left */
+    if (CopyTree(selfDir, tmp) && WriteNote(tmp) && MoveFileExW(tmp.c_str(), dest.c_str(), MOVEFILE_WRITE_THROUGH)) return true;
+    ShellDelete(tmp, false);   /* our own temporary folder only */
+    return false;
+}
+
 Result Install(const std::wstring& folder, const std::wstring& selfDir, bool checkRunning)
 {
     if (!HasGame(folder)) return kNotKenshi;
@@ -165,6 +323,8 @@ Result Install(const std::wstring& folder, const std::wstring& selfDir, bool che
     if (!FileExists(src)) return kWriteFail;   /* packaging defect: the loader must ship next to Setup */
     std::string text;
     if (!ReadBytes(cfg, &text)) return kWriteFail;
+    /* the mod's folder first, then the DLL, then the line: no failure can leave a line naming a missing DLL */
+    if (CopyNeeded(selfDir, folder) && !CopyModFolder(folder, selfDir)) return kWriteFail;
     const std::wstring backup = Join(folder, kCfgBackup);
     if (!FileExists(backup) && !CopyFileW(cfg.c_str(), backup.c_str(), TRUE)) return kWriteFail;
     if (lstrcmpiW(src.c_str(), dst.c_str()) != 0 && !CopyFileW(src.c_str(), dst.c_str(), FALSE)) return kWriteFail;
@@ -174,21 +334,7 @@ Result Install(const std::wstring& folder, const std::wstring& selfDir, bool che
     return kOk;
 }
 
-bool RecycleFile(const std::wstring& path)
-{
-    std::vector<wchar_t> from(path.begin(), path.end());
-    from.push_back(L'\0');
-    from.push_back(L'\0');   /* SHFileOperation wants a double-NUL-terminated list */
-    SHFILEOPSTRUCTW op;
-    ZeroMemory(&op, sizeof(op));
-    op.wFunc = FO_DELETE;
-    op.pFrom = &from[0];
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
-    const int rc = SHFileOperationW(&op);
-    return rc == 0 && !op.fAnyOperationsAborted && !FileExists(path);
-}
-
-Result Uninstall(const std::wstring& folder, bool checkRunning)
+Result Uninstall(const std::wstring& folder, const std::wstring& selfDir, bool checkRunning)
 {
     if (!HasGame(folder)) return kNotKenshi;
     if (checkRunning && KenshiRunning()) return kRunning;
@@ -202,6 +348,12 @@ Result Uninstall(const std::wstring& folder, bool checkRunning)
         if (changed && !WriteCfg(folder, after)) return kWriteFail;
     }
     if (FileExists(dll) && !RecycleFile(dll)) return kWriteFail;
+    /* T-1364 (decision 1668): the mod's folder last - only a copy Setup made (the note), never the folder Setup runs from */
+    const std::wstring mod = Join(Join(folder, L"mods"), kModFolder);
+    const bool exists = DirExists(mod);
+    const bool note = exists && FileExists(Join(mod, FromUtf8(coopinst::SetupNoteName())));
+    const bool inside = exists && coopinst::InstInside(PathKey(selfDir), PathKey(mod));
+    if (coopinst::UninstallRecyclesCopy(exists, note, inside) && !RecycleFile(mod)) return kWriteFail;
     return kOk;
 }
 
@@ -318,7 +470,7 @@ void Show(HWND dlg, Screen s)
     const wchar_t* main = kBtnFinish;
     switch (s)
     {
-    case kScrInstall:   msg = kMsgInstall;   left = kBtnCancel;    main = kBtnInstall;  break;
+    case kScrInstall:   msg = CopyNeeded(g.selfDir, g.folder) ? kMsgCopy : kMsgInstall; left = kBtnCancel; main = kBtnInstall; break;
     case kScrInstalled: msg = kMsgInstalled;                       main = kBtnFinish;   break;
     case kScrAlready:   msg = kMsgAlready;   left = kBtnUninstall; main = kBtnClose;    break;
     case kScrRemoved:   msg = kMsgRemoved;                         main = kBtnFinish;   break;
@@ -395,7 +547,7 @@ void Act(HWND dlg, Pending what)
 {
     g.pending = what;
     HCURSOR prev = SetCursor(LoadCursor(0, IDC_WAIT));
-    const Result r = (what == kDoInstall) ? Install(g.folder, g.selfDir, true) : Uninstall(g.folder, true);
+    const Result r = (what == kDoInstall) ? Install(g.folder, g.selfDir, true) : Uninstall(g.folder, g.selfDir, true);
     SetCursor(prev);
     if (r == kOk) Show(dlg, what == kDoInstall ? kScrInstalled : kScrRemoved);
     else if (r == kNotKenshi) Show(dlg, kScrNotFound);
@@ -510,14 +662,16 @@ HANDLE ThemeContext(ULONG_PTR* cookie)
     return h;
 }
 
-int TestMode(const std::wstring& verb, const std::wstring& folder, const std::wstring& selfDir)
+int TestMode(const std::wstring& verb, const std::wstring& given, const std::wstring& selfDir)
 {
+    const std::wstring folder = FullPath(given);   /* the Recycle Bin and the path comparisons want a full path */
     if (verb == L"/test-install") return (int)Install(folder, selfDir, true);
-    if (verb == L"/test-uninstall") return (int)Uninstall(folder, true);
+    if (verb == L"/test-uninstall") return (int)Uninstall(folder, selfDir, true);
     /* the same two with the "Kenshi is running" check left out, so a scratch folder can be tested while a game runs elsewhere */
     if (verb == L"/test-install-skiprun") return (int)Install(folder, selfDir, false);
-    if (verb == L"/test-uninstall-skiprun") return (int)Uninstall(folder, false);
+    if (verb == L"/test-uninstall-skiprun") return (int)Uninstall(folder, selfDir, false);
     if (verb == L"/test-status") return IsInstalled(folder) ? 0 : 1;
+    if (verb == L"/test-copyneeded") return CopyNeeded(selfDir, folder) ? 0 : 1;
     return 64;
 }
 

@@ -13,6 +13,7 @@
 #include "resurrectfee.h"   /* swfee::IsOptionKey / OptionValueOk */
 #include "kapirules.h"      /* kapi::IsOptionKey */
 #include "spimport.h"       /* spimport::IsOptionKey / OptionValueOk */
+#include "modlist.h"        /* T-247: coopmods::kModsRuleKey / ModsRuleValueOk */
 
 namespace worldopt {
 
@@ -25,6 +26,8 @@ inline bool ValueOk(const std::string& key, const std::string& value)
     /* E40 / decision 45 - THE PACE IS A HOSTING OPTION, and it lives here with the base policy for the same
        reason: it is a rule about the WORLD, so it has to outlive whichever game happens to be running. */
     if (key == "timemode") return coopclock::TimeModeOfWire(value.c_str()) >= 0;   /* fixed, consensus, vote, locked */
+    /* T-1392 (owner 1722 / 1723): MENUS AND BUILDING - run / pause (absent = run, coopclock::kMenusPauseAbsent); an admin sets it (OnOptions) */
+    if (key == coopclock::kMenusPauseKey) return coopclock::MenusPauseOfWire(value.c_str()) >= 0;
     /* settings2 S2 (docs/design-settings1.md section 2): THE WORLD'S ADVANCED OPTIONS (gp.*) and, accepted now so S4
        needs no notebook rebuild, its world-changing gameplay-tab values (gt.*). The authority alone may set them
        (OnOptions refuses every other game before this is asked), and it may REPLACE them whenever its own values
@@ -47,6 +50,8 @@ inline bool ValueOk(const std::string& key, const std::string& value)
     /* T-1096 (owner 1224): HOST options - who may start a profile from a single-player save (all / owner / off, absent = all; the old "host" is kept as owner) and
        whether its money and research come along (yes / no, absent = yes); spimport.h holds the legal values. */
     if (spimport::IsOptionKey(key)) return spimport::OptionValueOk(key, value);
+    /* T-247 (owner 1679): DIFFERENT MODS - Accepted / Rejected (absent = accepted); an admin sets it (OnOptions) */
+    if (key == coopmods::kModsRuleKey) return coopmods::ModsRuleValueOk(value);
     if (key.compare(0, 3, "gp.") == 0) return coopgp::GpValueOk(key, value, 0);
     if (key.compare(0, 3, "gt.") == 0) return coopgp::GtValueOk(key, value);
     return false;

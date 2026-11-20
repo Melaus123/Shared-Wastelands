@@ -27,8 +27,10 @@ rem NOTE: VS2010 cl wants /FeNAME (no colon). "/Fe:name" silently produces ":nam
 rem UNICODE/_UNICODE select the W (wide-character) variants of the Windows API; every build so far has used
 rem them, so dropping them is its own change.
 rem
-rem /GL + /LTCG (whole program optimization) are kept so the code generation matches every build run so far -
-rem dropping them is its own change.
+rem No /GL and no /LTCG (whole program optimization) - owner decision 1807, for test and release builds alike: the
+rem build takes about 7 min instead of 18-25, nearly all of the saving in the link step (F1393). F031 once made them
+rem mandatory for KenshiLib's stubs; this DLL no longer links KenshiLib (see the link line). /bigobj on the plugin
+rem compile: without /GL, store.cpp holds more sections than the default object format allows (error C1128).
 rem OgreMain_x64.lib is required for Ogre::Vector3's dllimport ctor; it and MyGUIEngine_x64.lib are import
 rem libraries made from the game's own DLLs (third_party\ogre-mygui\lib, SOURCE.txt - T-373).
 rem --- Step 0: THE OFFLINE SUITE, and it is a GATE and not a report -----------------
@@ -51,7 +53,7 @@ rem linkage identical - the symbols stay unmangled and our C++ links against the
 rem WINVER/_WIN32_WINNT 0x0501: ENet needs the XP-era socket API surface under v100.
 rem win32.c/unix.c self-guard on _WIN32, so both may be listed; only win32 compiles.
 echo [STEP] enet %time%
-cl /nologo /MP8 /c /TP /O2 /GL /MD /D_CRT_SECURE_NO_WARNINGS ^
+cl /nologo /MP8 /c /TP /O2 /MD /D_CRT_SECURE_NO_WARNINGS ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include ^
    third_party\enet\callbacks.c third_party\enet\compress.c third_party\enet\host.c ^
@@ -71,7 +73,7 @@ rem character set (hook.c passes a wide string to GetModuleHandle). NDEBUG/STRIC
 rem The objects go to obj\minhook\ so none can collide with the ENet objects in this folder.
 if not exist obj\minhook mkdir obj\minhook
 echo [STEP] minhook %time%
-cl /nologo /MP8 /c /TP /O2 /GL /EHsc /MD /DSTRICT /DNDEBUG /DUNICODE /D_UNICODE /FIstddef.h ^
+cl /nologo /MP8 /c /TP /O2 /EHsc /MD /DSTRICT /DNDEBUG /DUNICODE /D_UNICODE /FIstddef.h ^
    /I third_party\minhook\include /Foobj\minhook\ ^
    third_party\minhook\src\buffer.c third_party\minhook\src\hook.c third_party\minhook\src\trampoline.c ^
    third_party\minhook\src\hde\hde32.c third_party\minhook\src\hde\hde64.c
@@ -124,7 +126,7 @@ rem game\decl_check.cpp static_asserts OUR declarations (game\*.h) against the n
 rem list is game\layout_asserts.inl). Compiled with the DLL's flags plus /c; the object goes to obj\layout\ and is
 rem NEVER linked. A declaration that drifts from its number stops the build here, before the DLL step.
 if not exist obj\layout mkdir obj\layout
-cl /nologo /c /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
+cl /nologo /c /O2 /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 /Foobj\layout\ game\decl_check.cpp
 if errorlevel 1 (
     echo BUILD FAILED ^(layout check: our declarations disagree with game\gamelayout.h^)
@@ -133,20 +135,20 @@ if errorlevel 1 (
 
 rem --- Step 2: our plugin, linked against the ENet objects --------------------------
 rem /MP8 (owner decision 1202): up to 8 files compile at once - each file's code is made as before; 8, not every core,
-rem because test games run on this machine while it builds. /GL + /LTCG stay (the link step is unchanged).
+rem because test games run on this machine while it builds. No /GL or /LTCG (owner decision 1807 - see the top).
 rem Owner decision 1204: compile and link are two calls, so the log times each. The compile is the one-call form's cl
 rem with /c added and the objects sent to obj\plugin\ (the same flags, /LD included). The link is what that cl handed
 rem the linker: /DLL (from /LD), /OUT (from /Fe), the objects in the order the sources are listed and then ENet's and
-rem MinHook's, and the same /LTCG, map, machine and libraries - so the DLL and its map come out as before. A source
+rem MinHook's, and the same map, machine and libraries. A source
 rem added to PLUGIN_SRC is compiled and linked; nothing else lists it.
 set PLUGIN_SRC=coop.cpp hooks.cpp coop_log.cpp config.cpp addresses.cpp command_channel.cpp ai_spike.cpp spawn.cpp replicate.cpp combat.cpp medical.cpp ^
-   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp townver.cpp camp.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp fontguard.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp chat.cpp money.cpp admin.cpp kapi.cpp u8file.cpp teammap.cpp ^
+   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp ownupload.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp townver.cpp camp.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp fontguard.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp tradewin.cpp chat.cpp money.cpp admin.cpp kapi.cpp u8file.cpp teammap.cpp ping.cpp crashwatch.cpp ^
    net\enet_transport.cpp net\session.cpp net\homeaddr.cpp net\routerask.cpp net\steam_probe.cpp net\steam_transport.cpp net\relay_test.cpp net\relay_bridge.cpp net\steam_friends.cpp ^
    ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
    ..\common\fileprobe.cpp
 if not exist obj\plugin mkdir obj\plugin
 echo [STEP] plugin compile %time%
-cl /nologo /MP8 /c /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
+cl /nologo /MP8 /c /bigobj /LD /O2 /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include /I third_party\minhook\include ^
    /Foobj\plugin\ %PLUGIN_SRC%
@@ -157,7 +159,7 @@ if errorlevel 1 (
 set PLUGIN_OBJ=
 for %%F in (%PLUGIN_SRC%) do call :plugin_obj %%~nF
 echo [STEP] plugin link %time%
-link /nologo /DLL /LTCG /OUT:SharedWastelands.dll /MAP:SharedWastelands.map /MACHINE:X64 %PLUGIN_OBJ% ^
+link /nologo /DLL /OUT:SharedWastelands.dll /MAP:SharedWastelands.map /MACHINE:X64 %PLUGIN_OBJ% ^
    callbacks.obj compress.obj host.obj list.obj packet.obj peer.obj protocol.obj win32.obj ^
    obj\minhook\buffer.obj obj\minhook\hook.obj obj\minhook\trampoline.obj obj\minhook\hde32.obj obj\minhook\hde64.obj ^
    OgreMain_x64.lib MyGUIEngine_x64.lib ws2_32.lib winmm.lib user32.lib ole32.lib oleaut32.lib

@@ -31,6 +31,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -348,6 +349,166 @@ inline int TalkP25RequestWhy(int on, int npcOurs, int npcDown, int copyOk, int b
     if (busy) return kTalkWhyBusy;
     if (!nearNpc) return kTalkWhyFar;
     return 0;
+}
+
+/* T-1379 (owner 1709 a): A, a REQUEST's busy gate - "the NPC is in a conversation", decided from the fact the game's own talk start
+   uses. Single player: a player's Talk on an NPC that is announcing itself (its own event-2 conversation, e.g. a caravan leader's or
+   a priest's arrival speech, started by the campaign's arrival task 0x355710 -> 0x684CC0 -> 0x684BD0) is NOT refused: the start
+   (0x683890:25-30, 1.0.68 +0xA90) sees 'not ended (Dialogue +0x148 == 0) and event (+0x188) == 2', notes the announcement as
+   interrupted for the arrival task and starts the talk over it; sendEvent's refusal before it (0x683F00:25-30) runs only with no
+   current conversation. So a conversation whose event is 2 does not make the NPC busy for the other player's talk either - the
+   other player gets what single player gives. Any other live conversation (a player's talk, event 1; an NPC-to-NPC talk) still
+   does. Single player talks over those too (its start refuses none of them): refusing them is a two-player rule kept from T-978
+   B2 - one conversation per NPC across both games, so one player's talk never takes over a conversation the other player (or the
+   NPC's own game) is running - not something the engine does. ended: +0x148 (-1 unreadable, counted as not busy as before); ev: +0x188; hasLine: +0x198 non-zero. 1 = busy. */
+const int kTalkEvAnnounce = 2;   /* the NPC's own announcement event (0x684BD0 sends it with no listener) */
+inline int TalkNpcConvBusy(int ended, int ev, int hasLine)
+{
+    if (ended != 0) return 0;
+    if (ev == kTalkEvAnnounce) return 0;   /* the game's own talk start interrupts it (0x683890:25) */
+    return (hasLine || ev != 0) ? 1 : 0;
+}
+
+/* T-1379 sibling (B, the joiner's own game): a talk order on an NPC copy the OTHER game drives that the engine refused before
+   choosing a line ONLY by its lead test (sendEvent 0x683F00:25-30: no current conversation +0x190, no parked line +0xC8, and the
+   conversation master's hand +0x2A0 names a character whose own Dialogue is still running). That test reads the COPY's Dialogue,
+   whose fields describe what the copy is doing here (mirrored bubbles, its own AI), not the real NPC's conversation - the real
+   NPC announcing itself has +0x190 set, so on its own game the same test is skipped (single player starts the talk). The fact
+   lives on the owner's game, so the click goes there as a REQUEST and the owner decides (A's busy gate, TalkNpcConvBusy, and the
+   engine's own start there) - the rule TalkP25ClickEvent already follows for a no-line copy. Every other refusal (repeat timer,
+   dead, down, indoors) stays the engine's. copyOfOther: the NPC is a copy another game drives and not a player's character;
+   talkerMine: this game's own player's character; repeatOk: the repeat timer passes; died / down / indoors: TkOrderGates' values
+   (1 refuses, -1 unread); leadBusy: 1 = the lead test refused. 1 = send it as a REQUEST. */
+inline int TalkP25CopyLeadHandOver(int on, int copyOfOther, int talkerMine, int repeatOk, int died, int down, int indoors, int leadBusy)
+{
+    return (on && copyOfOther && talkerMine && repeatOk && died == 0 && down == 0 && indoors == 0 && leadBusy == 1) ? 1 : 0;
+}
+
+/* T-1379 TEST-ONLY lever `announce name <Name> [peer]` | `announce <uid> [peer]` | `announce nearest [peer]` (speech.cpp
+   AnnounceArm / AnnounceDrain): this game's own NPC starts an announcement through the arrival task's own entry 0x684BD0(dlg, who,
+   2, 0) (0x684CC0:15 passes who 0). nearest: this game's own living NPCs nearest its first own player character are tried in turn
+   (at most kTalkAnnNearestTries, within 3000 u) until one is in an event-2 conversation after the call - the NPCs with no event-2
+   line answer 'no line' and nothing happens to them. peer: who = the other player's nearest character copy instead of none.
+   with <dialogSid> (last two words): the whole arrival call 0x684CC0(dlg, that DIALOGUE record) instead - it adds the record to
+   the NPC's event-2 list (unless its name holds 'Unfinished') and then calls 0x684BD0(dlg, 0, 2) itself (decomp_684cc0:7-15), as
+   the arrival task does with the campaign's 'dialog announcement' record (0x9C60F0 reads that field); who is then always none.
+   Parse: 1 = ok (*name set for the name form, *nearest for that form, else *uid; *dialogSid the record's string id or empty), 0 =
+   usage. The name runs to the end of the line except the trailing `peer` and `with <sid>`. */
+const int kTalkAnnNearestTries = 12;
+inline int TalkAnnounceArgs(const std::string& argIn, std::string* name, unsigned int* uid, int* peer, int* nearest, std::string* dialogSid)
+{
+    *name = ""; *uid = 0; *peer = 0; *nearest = 0; *dialogSid = "";
+    std::vector<std::string> w;
+    std::string cur;
+    for (size_t i = 0; i <= argIn.size(); ++i)
+    {
+        const char c = (i < argIn.size()) ? argIn[i] : ' ';
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { if (!cur.empty()) { w.push_back(cur); cur.clear(); } }
+        else cur += c;
+    }
+    if (w.size() >= 2 && w[w.size() - 2] == "with") { *dialogSid = w.back(); w.pop_back(); w.pop_back(); }
+    if (!w.empty() && w.back() == "peer") { *peer = 1; w.pop_back(); }
+    if (w.empty() || (!dialogSid->empty() && *peer)) return 0;   /* the arrival call names no listener */
+    if (w[0] == "nearest") { if (w.size() != 1) return 0; *nearest = 1; return 1; }
+    if (w[0] == "name")
+    {
+        if (w.size() < 2) return 0;
+        for (size_t i = 1; i < w.size(); ++i) { if (i > 1) *name += " "; *name += w[i]; }
+        return 1;
+    }
+    if (w.size() != 1) return 0;
+    unsigned long v = 0;
+    for (size_t i = 0; i < w[0].size(); ++i) { const char c = w[0][i]; if (c < '0' || c > '9' || v > 400000000UL) return 0; v = v * 10 + (unsigned long)(c - '0'); }
+    if (v == 0) return 0;
+    *uid = (unsigned int)v;
+    return 1;
+}
+
+/* The announce lever's outcome from the Dialogue read after the call: 2 = announcing (not ended, +0x188 == 2 - the state A's busy gate
+   lets the other player's talk through), 1 = no line (the call ran, the NPC is not in an event-2 conversation: it has no event-2 line
+   it may say now), 0 = the call faulted or did not run. */
+const int kTalkAnnFaulted = 0, kTalkAnnNoLine = 1, kTalkAnnAnnouncing = 2;
+inline int TalkAnnounceOutcome(int called, int ended, int ev)
+{
+    if (!called) return kTalkAnnFaulted;
+    return (ended == 0 && ev == kTalkEvAnnounce) ? kTalkAnnAnnouncing : kTalkAnnNoLine;
+}
+inline const char* TalkAnnounceOutcomeName(int o)
+{
+    return o == kTalkAnnAnnouncing ? "ANNOUNCING (ev=2, not ended)" : (o == kTalkAnnNoLine ? "no line (not in an event-2 conversation)" : "FAULTED / not run");
+}
+
+/* The busy gate's four tests (speech.cpp TkApplyRequest) that refused: names joined by '+', 'none' when none did (1 = refused). */
+inline std::string TalkBusyWhich(int npcInTalk, int windowShowsNpc, int npcMarked, int talkerInTalk)
+{
+    std::string r;
+    if (npcInTalk == 1) r += "npcInTalk";
+    if (windowShowsNpc == 1) r += (r.empty() ? "" : "+") + std::string("windowShowsNpc");
+    if (npcMarked == 1) r += (r.empty() ? "" : "+") + std::string("npcMarked");
+    if (talkerInTalk == 1) r += (r.empty() ? "" : "+") + std::string("talkerInTalk");
+    return r.empty() ? std::string("none") : r;
+}
+
+/* Who the NPC's current conversation is with, and who started it, for the refusal line: 0 none / unknown, 1 this game's player
+   (the window shows it, or this game's player started it), 2 the other player (its REQUEST's mark, or the partner is its character's
+   copy), 3 an NPC / the game itself (the NPC's own event, an NPC partner). */
+const int kTalkWhoNone = 0, kTalkWhoThisPlayer = 1, kTalkWhoOtherPlayer = 2, kTalkWhoNpc = 3;
+inline const char* TalkWhoName(int w)
+{
+    switch (w)
+    {
+    case kTalkWhoThisPlayer:  return "thisPlayer";
+    case kTalkWhoOtherPlayer: return "otherPlayer";
+    case kTalkWhoNpc:         return "npc";
+    default:                  return "none";
+    }
+}
+
+/* The refusal line's cap: at most kTalkBusyLogCap lines a launch, then TalkBusyCapLine once. k = this line's number this launch,
+   counted before it is written: 0 drop, 1 write, 2 write and then the cap line. */
+const long kTalkBusyLogCap = 40;
+inline int TalkBusyCapStep(long k)
+{
+    if (k < 1 || k > kTalkBusyLogCap) return 0;
+    return (k == kTalkBusyLogCap) ? 2 : 1;
+}
+inline std::string TalkBusyCapLine()
+{
+    char b[96];
+    std::sprintf(b, "[TALK] P25 busy refusal lines: cap reached - no more this launch (%ld)", kTalkBusyLogCap);
+    return std::string(b);
+}
+
+/* A game string on one line: breaks and tabs as spaces, a quote as a backtick, at most 40 characters. */
+inline std::string TalkLogName(const std::string& s)
+{
+    std::string r = s.substr(0, 40);
+    for (size_t i = 0; i < r.size(); ++i)
+    {
+        if (r[i] == '\r' || r[i] == '\n' || r[i] == '\t') r[i] = ' ';
+        else if (r[i] == '\'') r[i] = '`';
+    }
+    return r;
+}
+
+/* T-1379: A, a REQUEST refused busy - WHICH test refused it and the NPC's current conversation (its event +0x188, ended +0x148,
+   current line +0x198, the partner its target hand +0x158 names, who started it). One line, same ids as the NOT started line. */
+inline std::string TalkBusyLine(unsigned int reqId, unsigned int npcUid, int npcInTalk, int windowShowsNpc, int npcMarked, int talkerInTalk,
+                                int ev, int ended, int hasLine, const std::string& partner, int partnerIs, int startedBy)
+{
+    char b[160];
+    std::sprintf(b, "[TALK] P25 request req=%u npc uid=%u refused busy by=", reqId, npcUid);
+    std::string s = b;
+    s += TalkBusyWhich(npcInTalk, windowShowsNpc, npcMarked, talkerInTalk);
+    std::sprintf(b, " npcConv[ev=%d ended=%d line=%d partner='", ev, ended, hasLine ? 1 : 0);
+    s += b;
+    s += partner.empty() ? std::string("-") : TalkLogName(partner);
+    s += "' partnerIs=";
+    s += TalkWhoName(partnerIs);
+    s += " startedBy=";
+    s += TalkWhoName(startedBy);
+    s += "]";
+    return s;
 }
 
 /* P25 fold 2 [p25f2-nsw]: A, a REQUEST's start that opened nothing - the reason, in this order. called: sendEvent ran (no fault);

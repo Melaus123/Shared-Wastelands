@@ -38,7 +38,8 @@
 
 namespace cagerec {
 
-const unsigned int kProtocol = 153;            /* the world-server protocol that carries cage records */
+const unsigned int kProtocol = 170;            /* the world-server protocol that carries cage records */
+
 
 const unsigned int kCrMarker = 0x31474143u;    /* 'C','A','G','1' little-endian */
 const unsigned int kCrFormat = 1u;

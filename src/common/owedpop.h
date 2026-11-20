@@ -47,7 +47,8 @@
 namespace owedpop {
 
 const unsigned kMsgOwed = 63;
-const unsigned kProtocol = 153;   /* the world-server protocol that carries OWED */
+const unsigned kProtocol = 170;   /* the world-server protocol that carries OWED */
+
 
 
 
@@ -457,15 +458,75 @@ inline int KeepClaim(int zoneLive, int may, int lever)
 // the engine had accepted when the make was noted (store.cpp counts them); a finished save covers the make when its own request
 // number is higher. held = this game held the row when it made it. closed = the world it was made in has closed; closeSeq = the
 // highest save request still being written at that moment - only a save numbered up to it can hold the make (SaveSettles).
-struct Settle { unsigned kind; std::string key; long seq, closeSeq; int held, closed; Settle() : kind(0), seq(0), closeSeq(0), held(0), closed(0) {} };
+// T-1363 (the OWED sibling of design C, owner 1666): a make whose row names an area (area = its record's id, "zone.X.Y"; ax / ay its
+// sector) also waits for the world server to accept a record of that area written after the make, as KEPT settles a lay (store.cpp
+// KeptAreaWritten / KeptAreaEcho): saved = a finished save of this game's own covers it; wrote = a write of the area after the make was
+// sent (needStamp its stamp, priorStamp the highest stamp sent for the area before it); echoed = the world server's echo answered that
+// write or a later one. DONE made goes when saved AND echoed; if this game's hold of the area ends first AND the map names another
+// holder, DONE fault (SettleFaultDue; fold 1: after kSettleFaultGraceMs when a write went after the make). lostSeen / lostMs = when this
+// game's hold was first seen ended (SettleHoldClock; 0 = held, or not seen ended).
+// area "" = no area known: the save alone settles it, as before.
+struct Settle { unsigned kind; std::string key; long seq, closeSeq; int held, closed; std::string area; int ax, ay, saved, wrote, echoed; long long needStamp, priorStamp; int lostSeen; unsigned lostMs;
+                Settle() : kind(0), seq(0), closeSeq(0), held(0), closed(0), ax(-1), ay(-1), saved(0), wrote(0), echoed(0), needStamp(0), priorStamp(0), lostSeen(0), lostMs(0) {} };
 typedef std::map<std::string, Settle> SettleSet;   /* keyed by TableKey(kind, key) */
-// a make noted; a second make of the same row keeps the later request count (the later make must be in the save) and held if either was
-inline void SettleNote(SettleSet* s, unsigned kind, const std::string& key, long seq, int held)
+// a make noted; a second make of the same row keeps the later request count (the later make must be in the save) and held if either was;
+// T-1363: every make starts its save and its echoed record again (the later make must be in both)
+inline void SettleNote(SettleSet* s, unsigned kind, const std::string& key, long seq, int held, const std::string& area = std::string(), int ax = -1, int ay = -1)
 {
     Settle& e = (*s)[TableKey(kind, key)];
     e.kind = kind; e.key = key;
     if (seq > e.seq) e.seq = seq;
     e.held = (e.held != 0 || held != 0) ? 1 : 0;
+    if (!area.empty()) { e.area = area; e.ax = ax; e.ay = ay; }
+    e.saved = 0; e.wrote = 0; e.echoed = 0; e.needStamp = 0; e.priorStamp = 0; e.lostSeen = 0; e.lostMs = 0;
+}
+// T-1363: settled = DONE made may go - saved, and the area's record accepted after the make (or no area known)
+inline int SettleSettled(const Settle& e) { return (e.saved != 0 && (e.area.empty() || e.echoed != 0)) ? 1 : 0; }
+// T-1363: a write of `area` was sent with `stamp` (`prior` = the highest stamp sent for it before): every make of that area noted before
+// it, not yet armed or echoed, waits for this write's echo (or a later write's)
+inline void SettleAreaWritten(SettleSet* s, const std::string& area, long long stamp, long long prior)
+{
+    for (SettleSet::iterator it = s->begin(); it != s->end(); ++it)
+        if (!area.empty() && it->second.area == area && it->second.wrote == 0 && it->second.echoed == 0)
+        { it->second.wrote = 1; it->second.needStamp = stamp; it->second.priorStamp = prior; }
+}
+// T-1363: the world server's echo of this game's record `area` with `stamp` (keptwire::EchoAnswersWrite's rule): the armed makes it
+// answers are echoed; those already saved leave the set and are returned (each is sent as DONE made)
+inline std::vector<Settle> SettleAreaEcho(SettleSet* s, const std::string& area, int hasStamp, long long stamp)
+{
+    std::vector<Settle> out;
+    for (SettleSet::iterator it = s->begin(); it != s->end(); )
+    {
+        Settle& e = it->second;
+        if (!area.empty() && e.area == area && e.wrote != 0 && e.echoed == 0 && hasStamp != 0 && stamp >= e.needStamp && stamp > e.priorStamp) e.echoed = 1;
+        if (e.area == area && SettleSettled(e) != 0) { out.push_back(e); s->erase(it++); }
+        else ++it;
+    }
+    return out;
+}
+// T-1363 fold 1 (review 4a / 4b): the grace for a make whose area record went out after the make but is not echoed yet when this
+// game's hold ends. The record (RECORD_SEQ, the REST line) goes out before the world server passes the area on, but the changed
+// AREAMAP rides the LIVE line and can overtake it on a busy link, so the hold can read ended while the record is still on its way;
+// the world server's hand-over waits at most 8 s (areaclaim.h kChargeHandOverMs) for that record, so 10 s covers that wait plus a
+// one-second map period and the echo's trip back. Past it with no echo the record was not taken: fault.
+const unsigned kSettleFaultGraceMs = 10000u;
+// T-1363 fold 1: this game's hold of the make's area as the map says it (mine: MineHeldTS - 1 holds, 0 does not, -1 no fresh map,
+// -2 frozen): held clears the clock; first seen not held starts it (nowMs, GetTickCount); not known leaves it as it is
+inline void SettleHoldClock(Settle* e, int mine, unsigned nowMs)
+{
+    if (mine == 1) { e->lostSeen = 0; e->lostMs = 0; }
+    else if (mine == 0 && e->lostSeen == 0) { e->lostSeen = 1; e->lostMs = nowMs; }
+}
+// T-1363 (fold 1): this game's hold of the make's area ended (mine 0; 1 holds, -1 no fresh map, -2 frozen - not known, waits) before a
+// record of it written after the make was accepted, AND the map names ANOTHER holder (other: HeldByOtherTS 1), AND either no write of
+// the area went out after the make (wrote 0) or kSettleFaultGraceMs passed since the hold was first seen ended with no echo: the row
+// goes back as DONE fault (the counted retry, kTriesMax). Nobody holding the area waits (the world close lapses the make, towngen.cpp
+// T392Teardown / OwedTick). A make with no area, or one echoed already, never faults here.
+inline int SettleFaultDue(const Settle& e, int mine, int other, unsigned nowMs)
+{
+    if (e.area.empty() || e.echoed != 0 || mine != 0 || other != 1) return 0;
+    if (e.wrote == 0) return 1;
+    return (e.lostSeen != 0 && (unsigned)(nowMs - e.lostMs) >= kSettleFaultGraceMs) ? 1 : 0;
 }
 inline int SaveCovers(long noted, long saveReq) { return saveReq > noted ? 1 : 0; }
 // SaveIsThisOne: the folder's quick.save was written by the save asked for at requestFt (FILETIMEs, 100 ns units; 2 s of slack),
@@ -499,13 +560,15 @@ inline int DoneStep(long sentGen, long gen, int inTable)
     if (sentGen == gen) return kDoneKeep;
     return inTable != 0 ? kDoneSend : kDoneDrop;
 }
-// a save asked for as request `saveReq` has finished: the makes it covers leave the set and are returned (each is sent as DONE made)
+// a save asked for as request `saveReq` has finished: the makes it covers are saved; those settled (T-1363: and their area's record
+// accepted, SettleSettled) leave the set and are returned (each is sent as DONE made); a saved make still waiting for its echo stays
 inline std::vector<Settle> SettleDue(SettleSet* s, long saveReq)
 {
     std::vector<Settle> out;
     for (SettleSet::iterator it = s->begin(); it != s->end(); )
     {
-        if (SaveSettles(it->second, saveReq) != 0) { out.push_back(it->second); s->erase(it++); }
+        if (SaveSettles(it->second, saveReq) != 0) it->second.saved = 1;
+        if (SettleSettled(it->second) != 0) { out.push_back(it->second); s->erase(it++); }
         else ++it;
     }
     return out;

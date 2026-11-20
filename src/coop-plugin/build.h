@@ -25,6 +25,11 @@ void PowerNoteRecv(const powerwire::PowerMsg& m, unsigned int fromPeer);   // P4
 int  CraftAskOf(void* b, int slot, int op, const std::string& sid, const std::string& extra, int mode, unsigned int index);   // T-1192 (c), MAIN THREAD: the crafting window's add / entry removal / repeat asked of the bench's writer at slot (CRAFT_ASK, op powerwire::kCraftOp*); 1 asked, 2 a like ask already waits (not sent again), 0 not sent (said)
 void BuildTestDrain();                                // K2 safe point (combat.cpp detour_tsRagdollUpdates): runs the armed request
 std::string BuildListCommand();
+#ifdef SW_DEV_BUILD
+std::string BuildPartsCommand(const std::string& arg);   // T-1372 decision 1690, TEST-ONLY, DEV build, MAIN THREAD, read-only: `bldparts <key-substring|key>` - is a building intact (one [BUILD] bldparts line)
+std::string BdEditorKeyArm();   // T-1414, TEST-ONLY, DEV build, MAIN THREAD: `editorkey` - the Level Editor key's own call runs on the next game frame
+void BdEditorKeyTick();         // T-1414, TEST-ONLY, DEV build: each frame after the engine loop - runs an armed editorkey press (one [EDITOR] line)
+#endif
 std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAIN THREAD, read-only: `bldstate <key-substring|key>` - a piece's own state as the kept lay writes it
 std::string BuildSetArm(const std::string& arg);         // KEPT, TEST-ONLY, MAIN THREAD: `bldset <key-substring|key> <field> <value>` - armed, written at the K2 safe point
 std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | refound <name> <dx> <dz> | link <key-substring> | list` - found / refound / link armed for the K2 safe point, list read now; `found relink <name> [dx dz]` (T-1332) also links the own pieces the new town is now nearest to, as the engine's founding does
@@ -46,6 +51,16 @@ int  BuildRowPendingFor(void* building);              // MAIN THREAD: another ga
 int  BuildHomeDropPod(void* platoon, void* building);   // MAIN THREAD, review MED 2: the group's home dropped when it names the building (Ownerships::removeOwnedObject, the engine purchase's first step) - 1 called, 0 no row / nothing, -1 faulted
 int  BuildKeyPlayerPiece(const char* key);            // MAIN THREAD: the build records name a player as the owner of the piece at this P7n key (a live row of this world, an own row waiting to be restored, a copy-list entry) - 1 yes, 0 no, -1 off the main thread or no key
 void ReportBuild();                                   // one [BUILD] REPORT line (the `report` fan-out)
+/* T-1372 (H-T1372-removal), ANY THREAD - worldgen.cpp's GameWorld::destroy detour, before the engine's destroy: the engine's own reason
+   (and the Level Editor's delete around it) decides whether this game's own building ends for good; such a piece's row is marked
+   removed at the next BuildTick as a finished dismantle's is (coopbuild::BuildEngineDestroyDecide).
+   T-1372 review fold 3: two halves. BuildEngineDestroyNote reads the piece (key, state, its doors' keys) while it is whole and keeps
+   them in a ticket; BuildEngineDestroyDone, after the engine's destroy, queues the event only when the destroy answered true. A
+   building's destroy the engine POSTPONED (false: it queued the object while the world lock was busy, decomp_798f50 :72-76 - the
+   object alone is kept, not its reason) keeps its for-good capture; the same object's later destroy that completes, whatever its
+   reason, queues it. ticket: 0 = nothing captured. */
+int  BuildEngineDestroyNote(void* obj, int justUnloaded, const char* reason);
+void BuildEngineDestroyDone(void* obj, int ticket, int destroyed);
 /* mmo8a (mmo8-buildings-read.md 5): the buildings this player owns, kept in the own-records store as pp.build (store.cpp writes it) */
 void BuildOwnRows(std::vector<coopown::BuildRow>* rows, std::vector<std::string>* retired, int* skipped);   // MAIN THREAD: own rows (own, not a copy, not removed) as PLACE + STATE bytes; retired = own keys taken down here
 int  BuildLedgerHandNow();                            // P14 fold 2 (D5), MAIN THREAD: 1 = pp.build handed to the writer (a parked ground-pickup hold ends)
@@ -72,6 +87,8 @@ void BuildRefundLanded(void* who, const char* gkey, int qty);             // P14
 int  BuildRefundTaken(const char* gkey, int qty, void* picker, int peer);   // P14 fold 1, MAIN THREAD (items.cpp): qty taken from the ground at gkey - by our picker (peer 0) or the other player (peer 1)
 int  BuildRefundHanded(const char* gkey, int qty);   // P14 fold 5, MAIN THREAD (items.cpp GroundNoteConfirm): qty of our PUT at gkey applied by the area's holder - on its ground, never re-owed at reload
 int  BuildGroundSource(void* b);                      // P3, MAIN THREAD (ground5 fold 1: LocalPlayerFaction walks the faction list): coopground::kGroundSrc* of a building's spill / refund
+int  BuildPieceRecordOwner(const std::string& id, int* removed);   // T-1443 fold 3, MAIN THREAD: the owner slot a piece record held here names; -2 none; *removed = a removal mark
+long BuildPieceRecordsGen();   // T-1443 fold 3, MAIN THREAD: moves at every change of the piece record table
 void PieceRecordArrive(const std::string& id, const std::vector<char>& bytes);   // MAIN THREAD (store.cpp): a piece record from the world server - kept per id, never applied
 void PieceRecordGone(const std::string& id, const char* from);   // MAIN THREAD (store.cpp): a piece record's removal - its kept copy is forgotten
 void PieceRecordEcho(const std::string& id, int hasStamp, long long stamp);   // MAIN THREAD (store.cpp RECORD_SEQ): this game's piece write sent with that stamp is on the world server's disk

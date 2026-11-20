@@ -124,13 +124,15 @@ inline std::string Lower(const std::string& s)
    does except the world lock, the old password key files at the top (auth.txt - the world password's saved lock, T-1255 - and admin-auth.txt: a
    copy would only carry an old key away; access.txt, the host's list, travels), the owner's secret at the top (host.key, keeprun.h
    kKeyFile: it lets its holder in as the owner without the password, and the owner's game writes it anew each time it hosts), the
+   record of who last proved the owner password (owner-proven.txt, worldpw::kOwnerProvenFile - T-247 re-check: it names a person and
+   holds a check of the owner password; it belongs to this world server's copy only), the
    logs, temp files, a manifest.txt at the top and the recycle folder (removed records). The top rules.txt travels with its password
    lines emptied (worldpw::ExportBytes, applied by the export as it copies). */
 inline int ExportTakes(const std::string& rel, int isDir)
 {
     const std::string l = Lower(rel);
     if (isDir) return l == "recycle" ? 0 : 1;
-    if (l.find('/') == std::string::npos && (l == "server.lock" || l == kManifestFile || l == "auth.txt" || l == "admin-auth.txt" || l == "host.key")) return 0;
+    if (l.find('/') == std::string::npos && (l == "server.lock" || l == kManifestFile || l == "auth.txt" || l == "admin-auth.txt" || l == "host.key" || l == "owner-proven.txt")) return 0;
     if (EndsWith(l, ".log") || EndsWith(l, ".tmp")) return 0;
     return 1;
 }

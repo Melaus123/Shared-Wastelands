@@ -99,14 +99,146 @@ inline int DecodeCrime(const char* p, size_t size, unsigned int* uid, CrimeState
  *     target);
  *   - or the expiry went UP by more than kCrimeReSetSec since the last SAMPLE (the same crime set again - a second theft of
  *     the same kind; the engine re-sets it to 20, so comparing with the last SENT expiry, 20, never fired - review-crime3 2):
- *     the copy's expiry would otherwise run out while the owner's is fresh.
- * A falling expiry is the engine counting down on both games and is never sent. */
+ *     the copy's expiry would otherwise run out while the owner's is fresh;
+ *   - or (T-1442 step 5 fix attempt 2, F1466) the expiry is more than kCrimeReSetSec above the last SENT expiry: a look that
+ *     stored a raised time without sending it (a failed re-set send) does not hide the raise from the next look.
+ * A falling expiry is the engine counting down on both games: it is below both the last look and the last value sent, so it
+ * is never sent; a raise of 1 s or less over the last look (the countdown's own jitter) is not a change. */
 const float kCrimeReSetSec = 1.0f;
 inline int CrimeShouldSend(const CrimeState& lastSent, float lastSampledExpiry, const CrimeState& cur)
 {
     if (cur.crime != lastSent.crime || cur.victimUid != lastSent.victimUid || cur.factionSid != lastSent.factionSid) return 1;
-    if (cur.crime != 0 && cur.expiry > lastSampledExpiry + kCrimeReSetSec) return 1;
+    if (cur.crime != 0 && (cur.expiry > lastSampledExpiry + kCrimeReSetSec || cur.expiry > lastSent.expiry + kCrimeReSetSec)) return 1;
     return 0;
+}
+
+/* T-1442 step 5 (F1453 design A): A CRIME GOES OUT AT THE FIRST MAIN-THREAD FRAME AFTER setCrime, NOT ON THE 15-FRAME SAMPLER.
+ * The setCrime detour (any thread) notes the offender's address in a CrimeEvTable under the caller's lock; the main thread takes
+ * the notes at its next frame (crime.cpp CrimeEventDrainTick) and runs the sampler's own per-character decision (CrimeDecide below,
+ * through crime.cpp CrimeDecideSend) on the live fields, updating the same last-sent record - so the sampler then finds nothing
+ * new. The note is made when setCrime returns, BEFORE its caller writes the time left (notifyCrimeWitnessed writes it after,
+ * decomp_851f40:22): a main-thread caller has finished by the drain, so the crime goes with its time; a caller on the AI worker
+ * may not have, and the drain may see the crime with no time yet (read as none) or the old time - the sampler then sends it,
+ * counted 'lateExpiry'. The sampler stays, on its own clock, as the backstop, every send counted by why (CrimeBackstopWhy).
+ * Fix attempt 2 (F1466): two more notes, both after the original returns - notifyCrimeWitnessed's own (its time left is written
+ * by then) and the direct time-left setter 0x851070's (the engine re-raises the time with no setCrime) - so the drain always
+ * reads the caller's written time left.
+ *
+ * The table holds no uid (the detour does no lookup); a plain array, every call made with the caller's lock held. */
+const int kCrimeEvSlots = 64;
+enum { kCrimeEvOverflow = 0, kCrimeEvNoted = 1, kCrimeEvAlready = 2, kCrimeEvNone = -1 };
+struct CrimeEvTable
+{
+    const void* who[kCrimeEvSlots];   /* noted characters, oldest first */
+    volatile long n;                  /* how many are noted now (read unlocked only as the drain's every-frame fast path) */
+    long long noted, already, overflow;   /* all time: took a slot / was already noted / found the table full (the sampler sends those) */
+};
+/* LOCK HELD. kCrimeEvNoted, kCrimeEvAlready (that character waits in the table now), kCrimeEvOverflow (full - counted) or
+   kCrimeEvNone (no character). */
+inline int CrimeEvAdd(CrimeEvTable* t, const void* who)
+{
+    if (t == 0 || who == 0) return kCrimeEvNone;
+    for (long i = 0; i < t->n; ++i) if (t->who[i] == who) { ++t->already; return kCrimeEvAlready; }
+    if (t->n >= (long)kCrimeEvSlots) { ++t->overflow; return kCrimeEvOverflow; }
+    t->who[t->n] = who;
+    t->n = t->n + 1;
+    ++t->noted;
+    return kCrimeEvNoted;
+}
+/* LOCK HELD. Takes up to `max` notes, oldest first, into out[]; the rest move up and wait for the next drain. */
+inline int CrimeEvTake(CrimeEvTable* t, const void** out, int max)
+{
+    if (t == 0 || out == 0 || max <= 0) return 0;
+    const long n = t->n;
+    const long k = n < (long)max ? n : (long)max;
+    for (long i = 0; i < k; ++i) out[i] = t->who[i];
+    for (long i = k; i < n; ++i) t->who[i - k] = t->who[i];
+    t->n = n - k;
+    return (int)k;
+}
+/* LOCK HELD. Is that character noted and not yet taken by the drain? (the sampler's 'pendingNote': a crime set after this frame's
+   drain, before the sampler reached the character - the drain would have sent it at its next frame) */
+inline bool CrimeEvHas(const CrimeEvTable* t, const void* who)
+{
+    if (t == 0 || who == 0) return false;
+    for (long i = 0; i < t->n; ++i) if (t->who[i] == who) return true;
+    return false;
+}
+/* LOCK HELD (a load or teardown, a link change keeps them). Drops every note; returns how many. The all-time counters stay. */
+inline long CrimeEvReset(CrimeEvTable* t)
+{
+    if (t == 0) return 0;
+    const long d = t->n;
+    t->n = 0;
+    return d;
+}
+
+/* The one per-character decision both roads use (crime.cpp CrimeDecideSend): CrimeShouldSend against what was last SENT and the
+   last SAMPLED expiry, and the sampled expiry moves to `cur` whether or not anything goes. 1 = send `cur` now (the caller then
+   records it as sent when the send went out). */
+inline int CrimeDecide(const CrimeState& lastSent, float* lastSampledExpiry, const CrimeState& cur)
+{
+    const int due = CrimeShouldSend(lastSent, *lastSampledExpiry, cur);
+    *lastSampledExpiry = cur.expiry;
+    return due;
+}
+/* Why a SAMPLER send happened (it is the backstop now), first that holds:
+ *   kCrimeBackstopExpiry      a crime that was sent is now none and the live fields hold no crime or a run-out time (the engine's
+ *                             countdown clears by plain stores; the hook never sees it);
+ *   kCrimeBackstopHeldBack    a crime that was sent is now none while the live crime still runs - it is held back now (its victim or
+ *                             the victim's faction became a player's, decision 4; or its faction sid is too long);
+ *   kCrimeBackstopPendingNote the character waits in the note table (setCrime ran after this frame's drain, before the sampler reached
+ *                             it): the drain would have sent it at its next frame - the sampler sends it now and the drain finds nothing;
+ *   kCrimeBackstopLateExpiry  only the time left differs from the crime the event drain handled in this window: the drain SENT this
+ *                             crime (same crime, victim and faction) and the time went up after, or the drain read this same crime (same
+ *                             crime, victim hand and faction) with no time yet - setCrime's caller wrote the time after the note;
+ *   kCrimeBackstopLinkReset   the record's FIRST look (made in this very look) after a link change forgot what was sent;
+ *   kCrimeBackstopFresh       the record's FIRST look otherwise (a character newly owned / announced: a crime it already carried);
+ *   kCrimeBackstopRetryAfterFailedSend  a send of this record failed since its last successful one (either road) and this is the
+ *                             retry (review S1 of fix attempt 2: the last-sent rule retries a failed re-set - not a writer the notes missed);
+ *   kCrimeBackstopMissed      anything else - a change the hook should have noted (an overflow, a note dropped at a load).
+ * A victim or faction change on an already-sent crime falls to 'missed': only setCrime writes the victim hand (Inferred). */
+enum { kCrimeBackstopExpiry = 0, kCrimeBackstopHeldBack = 1, kCrimeBackstopPendingNote = 2, kCrimeBackstopLateExpiry = 3,
+       kCrimeBackstopLinkReset = 4, kCrimeBackstopFresh = 5, kCrimeBackstopMissed = 6, kCrimeBackstopRetryAfterFailedSend = 7,
+       kCrimeBackstopKinds = 8 };   /* a new reason goes at the END: the REPORT's backstop[...] order is the enum's */
+enum { kCrimeOriginFresh = 0, kCrimeOriginLinkReset = 1 };   /* how a last-sent record came to be */
+struct CrimeBackstopIn
+{
+    int sentCrime;      /* the record's last SENT crime */
+    int curCrime;       /* what is being sent now */
+    bool liveRunOut;    /* the live fields: no crime, or its time run out */
+    bool onlyTime;      /* cur has the sent crime, victim and faction - only the time left differs */
+    bool firstLook;     /* the record was made in this very look */
+    int origin;         /* kCrimeOrigin* */
+    bool pendingNote;   /* the character is noted and not yet drained */
+    bool evSent;        /* the event drain SENT this record's state since the sampler's last look */
+    bool evSawSameNoTime;   /* the event drain read this same crime (crime, victim hand, faction) with no time left, since the sampler's last look */
+    bool retryAfterFailed;  /* a send of this record failed (either road) and none has gone since */
+    CrimeBackstopIn() : sentCrime(0), curCrime(0), liveRunOut(false), onlyTime(false), firstLook(false), origin(kCrimeOriginFresh),
+                        pendingNote(false), evSent(false), evSawSameNoTime(false), retryAfterFailed(false) {}
+};
+inline int CrimeBackstopWhy(const CrimeBackstopIn& in)
+{
+    if (in.sentCrime != 0 && in.curCrime == 0) return in.liveRunOut ? kCrimeBackstopExpiry : kCrimeBackstopHeldBack;
+    if (in.pendingNote) return kCrimeBackstopPendingNote;
+    if (in.curCrime != 0 && ((in.evSent && in.onlyTime) || in.evSawSameNoTime)) return kCrimeBackstopLateExpiry;
+    if (in.retryAfterFailed) return kCrimeBackstopRetryAfterFailedSend;
+    if (in.firstLook) return in.origin == kCrimeOriginLinkReset ? kCrimeBackstopLinkReset : kCrimeBackstopFresh;
+    return kCrimeBackstopMissed;
+}
+inline const char* CrimeBackstopWord(int why)
+{
+    switch (why)
+    {
+    case kCrimeBackstopExpiry: return "expiry";
+    case kCrimeBackstopHeldBack: return "heldBack";
+    case kCrimeBackstopPendingNote: return "pendingNote";
+    case kCrimeBackstopLateExpiry: return "lateExpiry";
+    case kCrimeBackstopLinkReset: return "linkReset";
+    case kCrimeBackstopFresh: return "fresh";
+    case kCrimeBackstopRetryAfterFailedSend: return "retryAfterFailedSend";
+    default: return "missed";
+    }
 }
 
 /* MSG_CRIME KINDS. A byte after the sid says which; a message that ends with the sid (every kind-0 send, and every older

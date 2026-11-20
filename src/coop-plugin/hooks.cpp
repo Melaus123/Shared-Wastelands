@@ -72,6 +72,40 @@ namespace coop
             }
             return FAIL;
         }
+        /* T-1447 (F1476 design A): a row where the gate accepted ANOTHER MOD'S jump.
+           The live bytes are read again first: the jump still there and the rest unchanged, or the hook is refused. Then
+           our MinHook hooks on top as usual - it copies the leading E9 into our trampoline as an absolute jump to its real
+           target (third_party/minhook/src/trampoline.c:200-229), so the call runs our detour -> our trampoline -> the other
+           mod's relay -> its detour -> the game.
+           A "hooks, may chain" row is any row at a game function's start (src/common/addrhooked.h AddrForeignVerdict).
+           NEVER UNHOOK such a hook (and this mod unhooks nothing - no MH_DisableHook / MH_RemoveHook / MH_Uninitialize
+           outside the library): multihook's disable reads the E9 at the target and, when its relay is not ours, treats the
+           memory around it as another multihook buffer and CALLS a pointer stored there (hook.c:554-560) - over a foreign
+           jump that is a foreign pointer. */
+        {
+            const char* chainRow = 0;
+            const int chained = AddrChainedCheck((unsigned long long)(uintptr_t)target, &chainRow);
+            if (chained == 0)
+            {
+                ::InterlockedIncrement(&g_failed);
+                const char* other = AddrChainedModule((unsigned long long)(uintptr_t)target);
+                char line[400];
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[HOOK] AddHook REFUSED: row %s carried another mod's jump (to %s) the address gate accepted (hooks,"
+                            " may chain), and its bytes changed before our hook - not hooked", chainRow != 0 ? chainRow : "?",
+                            other != 0 ? other : "unknown");
+                ErrorLog(line);
+                return FAIL;
+            }
+            if (chained == 1)
+            {
+                char line[300];
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[HOOK] row %s: the other mod's jump is still in place and the rest unchanged - our hook goes on top of it"
+                            " (hooks, may chain)", chainRow != 0 ? chainRow : "?");
+                DebugLog(line);
+            }
+        }
         EnsureMinHook();
         const ULONG_PTR ident = (ULONG_PTR)::InterlockedIncrement64(&g_hookIdent);
         MH_STATUS status = MH_CreateHookEx(ident, target, detour, original);
@@ -89,6 +123,7 @@ namespace coop
             return FAIL;
         }
         ::InterlockedIncrement(&g_installed);
+        AddrChainedHooked((unsigned long long)(uintptr_t)target);   /* T-1447: a chained row now carries OUR jump - a later AddHook there re-checks against it */
         return SUCCESS;
     }
 

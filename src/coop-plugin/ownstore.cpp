@@ -19,6 +19,7 @@
 #include "../common/fileprobe.h"   /* T-1280: ProbeFile - a file another program holds is never read as empty and written back */
 #include "../common/diskformat.h"   /* owner 429: the records store's format number */
 #include "../common/restoreguard.h"   /* restore1b1: the checkpoint tag rule and the prune selection */
+#include "../common/ownrecwire.h"   /* T-885 piece 1: which text files travel */
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -71,6 +72,9 @@ volatile long    g_osFailPending = 0;
 /* mmo1b (review-mmo1 item 4): key -> the last COMMITTED record's length and CRC; under g_ownCs. */
 std::map<std::string, std::pair<long long, unsigned int> > g_ownCommitted;
 std::map<std::string, unsigned long long> g_ownCommittedSeq;   /* mmo6: key -> the last COMMITTED seq; under g_ownCs */
+std::map<std::string, long long> g_ownCommittedAt;   /* T-885 piece 2 review fold (finding 5): key -> the last COMMITTED record's write time (its OWNREC PUT carries it); under g_ownCs */
+std::map<std::string, int> g_ownCommittedChars;   /* T-885 piece 1: key -> the last COMMITTED record's people count (its OWNREC PUT carries it); under g_ownCs */
+std::vector<std::string> g_ownUpNotes;   /* T-885 piece 1: keys committed (and the travelling text files written) since the uploader last looked; under g_ownCs, drained by OwnStoreUpNotes */
 std::string      g_ownIdWorld, g_ownIdProfile;              /* mmo2 fold: the index header's identity; under g_ownCs */
 volatile LONG64  g_osRotated = 0, g_osRotateSkipped = 0, g_osTmpDeleted = 0, g_osTmpKept = 0;
 
@@ -247,6 +251,9 @@ void CommitOne(const std::string& dir, const std::string& key, const OwnJob& j)
     ::EnterCriticalSection(&g_ownCs);   /* mmo1b item 4: the skip-unchanged test's reference is set only here, on a commit */
     g_ownCommitted[key] = std::make_pair(l.len, l.crc);
     g_ownCommittedSeq[key] = l.seq;   /* mmo6 */
+    g_ownCommittedChars[key] = l.chars;   /* T-885 piece 1 */
+    g_ownCommittedAt[key] = l.writtenAt;   /* T-885 piece 2 fold */
+    if (g_ownUpNotes.size() < 4096) g_ownUpNotes.push_back(key);   /* T-885 piece 1: the uploader sends it now its index line is on disk (a full list loses nothing: every unconfirmed key is found again at the next WELCOME) */
     ::LeaveCriticalSection(&g_ownCs);
     ::QueryPerformanceCounter(&t1);
     const LONG64 us = f.QuadPart ? (LONG64)((t1.QuadPart - t0.QuadPart) * 1000000LL / f.QuadPart) : 0;
@@ -387,10 +394,13 @@ bool OwnStoreOpen(const std::string& dir, unsigned long long* maxSeq, int* badLi
     g_ownIndex.clear();
     g_ownCommitted.clear();   /* mmo1b item 4: what the index names IS the last committed record */
     g_ownCommittedSeq.clear();   /* mmo6 */
+    g_ownCommittedChars.clear();   /* T-885 piece 1 */
+    g_ownCommittedAt.clear();   /* T-885 piece 2 fold */
+    g_ownUpNotes.clear();   /* T-885 piece 1: notes of the store left behind */
     for (std::vector<std::string>::size_type i = 0; i < lines.size(); ++i)
     {
         coopown::IndexLine l;
-        if (coopown::ParseIndexLine(lines[i], &l)) { g_ownIndex[l.key] = l; g_ownCommitted[l.key] = std::make_pair(l.len, l.crc); g_ownCommittedSeq[l.key] = l.seq; /* mmo6 */ }
+        if (coopown::ParseIndexLine(lines[i], &l)) { g_ownIndex[l.key] = l; g_ownCommitted[l.key] = std::make_pair(l.len, l.crc); g_ownCommittedSeq[l.key] = l.seq; /* mmo6 */ g_ownCommittedChars[l.key] = l.chars; /* T-885 piece 1 */ g_ownCommittedAt[l.key] = l.writtenAt; }
     }
     g_ownDir = dir;
     ::LeaveCriticalSection(&g_ownCs);
@@ -502,6 +512,81 @@ bool OwnStoreLastSeqFor(const std::string& key, unsigned long long* seq)
     return have;
 }
 
+/* T-1303 fold 2: OwnStoreLastFor and its record's seq in ONE locked read (the writer cannot take the job off the queue in between). */
+bool OwnStoreLastWithSeq(const std::string& key, long long* len, unsigned int* crc, unsigned long long* seq)
+{
+    OwnCsInit();
+    bool have = false;
+    ::EnterCriticalSection(&g_ownCs);
+    std::map<std::string, OwnJob>::const_iterator q = g_ownQ.find(key);
+    if (q != g_ownQ.end()) { *len = (long long)q->second.bytes.size(); *crc = q->second.crc; *seq = q->second.seq; have = true; }
+    else
+    {
+        std::map<std::string, std::pair<long long, unsigned int> >::const_iterator k = g_ownCommitted.find(key);
+        std::map<std::string, unsigned long long>::const_iterator ks = g_ownCommittedSeq.find(key);
+        if (k != g_ownCommitted.end()) { *len = k->second.first; *crc = k->second.second; *seq = ks != g_ownCommittedSeq.end() ? ks->second : 0ULL; have = true; }
+    }
+    ::LeaveCriticalSection(&g_ownCs);
+    return have;
+}
+/* T-1303 fold 2: the seq of key's last COMMITTED record only (not a queued job). false = none committed. MAIN THREAD. */
+bool OwnStoreCommittedSeqFor(const std::string& key, unsigned long long* seq)
+{
+    OwnCsInit();
+    bool have = false;
+    ::EnterCriticalSection(&g_ownCs);
+    std::map<std::string, unsigned long long>::const_iterator k = g_ownCommittedSeq.find(key);
+    if (k != g_ownCommittedSeq.end()) { *seq = k->second; have = true; }
+    ::LeaveCriticalSection(&g_ownCs);
+    return have;
+}
+/* T-1303: every key the store holds - the last committed records and the jobs still queued. MAIN THREAD. */
+void OwnStoreKeys(std::vector<std::string>* out)
+{
+    OwnCsInit();
+    out->clear();
+    ::EnterCriticalSection(&g_ownCs);
+    for (std::map<std::string, std::pair<long long, unsigned int> >::const_iterator k = g_ownCommitted.begin(); k != g_ownCommitted.end(); ++k) out->push_back(k->first);
+    for (std::map<std::string, OwnJob>::const_iterator q = g_ownQ.begin(); q != g_ownQ.end(); ++q) out->push_back(q->first);
+    ::LeaveCriticalSection(&g_ownCs);
+}
+
+/* T-885 piece 1: the uploader's two doors into this file. MAIN THREAD (the lock is taken: the writer thread adds notes). */
+void OwnStoreUpNotes(std::vector<std::string>* out)
+{
+    OwnCsInit();
+    ::EnterCriticalSection(&g_ownCs);
+    out->insert(out->end(), g_ownUpNotes.begin(), g_ownUpNotes.end());
+    g_ownUpNotes.clear();
+    ::LeaveCriticalSection(&g_ownCs);
+}
+void OwnStoreUpNoteText(const std::string& name)
+{
+    if (!ownrecw::IsTextKey(name)) return;
+    OwnCsInit();
+    ::EnterCriticalSection(&g_ownCs);
+    if (g_ownUpNotes.size() < 4096) g_ownUpNotes.push_back(name);
+    ::LeaveCriticalSection(&g_ownCs);
+}
+bool OwnStoreCommittedLine(const std::string& key, unsigned long long* seq, long long* len, unsigned int* crc, int* chars, long long* writtenAt)
+{
+    OwnCsInit();
+    bool have = false;
+    ::EnterCriticalSection(&g_ownCs);
+    std::map<std::string, unsigned long long>::const_iterator k = g_ownCommittedSeq.find(key);
+    std::map<std::string, std::pair<long long, unsigned int> >::const_iterator c = g_ownCommitted.find(key);
+    if (k != g_ownCommittedSeq.end() && c != g_ownCommitted.end())
+    {
+        *seq = k->second; *len = c->second.first; *crc = c->second.second;
+        std::map<std::string, int>::const_iterator p = g_ownCommittedChars.find(key);
+        *chars = p != g_ownCommittedChars.end() ? p->second : 0;
+        if (writtenAt != 0) { std::map<std::string, long long>::const_iterator a = g_ownCommittedAt.find(key); *writtenAt = a != g_ownCommittedAt.end() ? a->second : 0; }
+        have = true;
+    }
+    ::LeaveCriticalSection(&g_ownCs);
+    return have;
+}
+
 void OwnStoreDrainFailLog()
 {
     if (::InterlockedCompareExchange(&g_ownCsInit, 0, 0) == 0 || ::InterlockedExchange(&g_osFailPending, 0) == 0) return;
@@ -584,6 +669,7 @@ bool OwnLedgerAppend(const std::string& line, unsigned int cap, int* linesNow)
     }
     if (!moved) { U8DeleteFile(tmp.c_str()); return false; }
     if (linesNow != 0) *linesNow = (int)lines.size();
+    OwnStoreUpNoteText(coopown::LedgerFile());   /* T-885 piece 1: pp.ledger travels whole */
     return true;
 }
 
@@ -622,6 +708,7 @@ bool OwnTextReplace(const std::string& name, const std::string& all)
         if (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) { ::Sleep(20); moved = MoveReplace(tmp, path); }
     }
     if (!moved) { U8DeleteFile(tmp.c_str()); return false; }
+    OwnStoreUpNoteText(name);   /* T-885 piece 1: pp.handover travels whole (a name that does not travel is ignored there) */
     return true;
 }
 

@@ -40,6 +40,7 @@ volatile long g_role = 0;   /* kRoleSingle */
 bool g_fileSeen = false;
 bool g_titleDone = false;
 long long g_dials = 0;          /* a joining game's world-server dials at the title that went unanswered (bounded) */
+int g_modsStopSaid = 0;         /* T-247 (T2420): the title re-dial's "refused for its mods - no more dials" line has been said since the last arm or leave */
 /* The bound on those, which is what ends a JOIN with CAN'T JOIN. 12 dials of at most kTitleConnectBudgetMs each is about
    the minute the JOIN has always had before it gave up; a dial that fails at once (an address that does not resolve) is
    re-dialled once a second, so that case ends in about 12 s. */
@@ -48,6 +49,9 @@ const DWORD kTitleRedialPaceMs    = 1000;   /* at most one dial a second */
 const DWORD kTitleConnectBudgetMs = 5000;   /* a dial still connecting is left alone this long: ENet's own minimum timeout */
 long long g_armGen = 0;         /* U2: how many times the arming below has actually run (0 = never) */
 DWORD g_lastDialMs = 0;
+int g_hostListenPending = 0;          /* T-1403 (T2520): the world server this HOST press started said it is listening, and no answer yet */
+long long g_hostListenDials = 0;      /* T-1403: dials made since that listening (coopstore::HostListenDialDecide) */
+const long long kHostListenDialCap = 3;
 std::string g_doorAddr; unsigned short g_doorPort = 0;   /* the world server the last arming rang ("" = none) - the title re-dial rings it again */
 std::string g_hostAddr; unsigned short g_hostPort = 0;
 std::string g_storeAddr; unsigned short g_storePort = 0;
@@ -84,7 +88,7 @@ std::string N(long long v) { std::ostringstream o; o.imbue(std::locale::classic(
 
 /* B13 - WHERE THE ID COMES FROM, AND WHY IT IS NOT THE WINDOWS CRYPTO. CryptGenRandom lives in
    advapi32, which this DLL does not link, and B13 does not add a library to a link line that is already
-   the fussiest thing in this build (F031's /GL mandate, Ogre and MyGUI all sit on it). So the
+   the fussiest thing in this build (Ogre and MyGUI both sit on it). So the
    32 hex characters are built from the performance counter (which counts at the CPU's own rate and is
    different on every read), this process's id and the tick count, stirred by a 64-bit multiply-and-add
    step of the function's own (a fresh performance-counter read is mixed in every 8 characters); rand() is
@@ -995,7 +999,9 @@ bool ConfigRearmFromFile(const char* why, std::string* err)
 
     g_titleDone = false;
     g_dials = 0;
+    g_modsStopSaid = 0;
     g_lastDialMs = 0;
+    g_hostListenPending = 0; g_hostListenDials = 0;   /* T-1403 */
 
     DebugLog(std::string("[CFG] U2 re-arm requested by ") + (why ? why : "?") + ": role="
              + RoleName(now) + " host=" + AddrText(g_hostAddr, g_hostPort)
@@ -1058,8 +1064,44 @@ void ConfigTitleTick()
        stops as well when the player cancels or a failure leaves (ConfigLeave: role single, this tick returns above) and when the
        world loads (this tick rides the title pump only). The decision is coopstore::TitleRedialDecide (pure, swept offline). */
     const DWORD now = ::GetTickCount();
+    /* T-1403 (T2520 LEG 1): A HOSTING GAME DIALS ITS WORLD SERVER AGAIN WHEN THAT SERVER SAYS IT IS LISTENING - the press's dial gives up
+       after ENet's ~31.5 s and the client re-dial below is a joining game's only (coopstore::HostListenDialDecide, swept offline) */
+    if (g_hostListenPending != 0)
+    {
+        const int hsock = StoreLinkSockState();
+        const int hact = coopstore::HostListenDialDecide(role == kRoleHost ? 1 : 0, (!g_doorAddr.empty() && g_doorPort != 0) ? 1 : 0, g_hostListenPending,
+                                                         hsock, g_hostListenDials, kHostListenDialCap);
+        if (hact == coopstore::kHostListenDone)
+        {
+            g_hostListenPending = 0;
+            DebugLog("[CFG] T-1403 world road: the wait on the world server's listening ends - " + std::string(hsock != coopstore::kSockDownOrFailed && hsock != coopstore::kSockConnecting
+                     ? "it answered" : (role != kRoleHost || g_doorAddr.empty() || g_doorPort == 0) ? "nothing to dial" : "no answer to " + N(g_hostListenDials) + " dials since it listened")
+                     + " (link state " + N((long long)hsock) + ")");
+        }
+        else if (hact == coopstore::kHostListenDial)
+        {
+            ++g_hostListenDials;
+            g_lastDialMs = now;
+            DebugLog("[CFG] T-1403 world road: dialling the world server at " + AddrText(g_doorAddr, g_doorPort) + " again (dial " + N(g_hostListenDials) + " of at most "
+                     + N(kHostListenDialCap) + " since it listened) - " + (g_hostListenDials == 1
+                         ? std::string(hsock == coopstore::kSockConnecting ? "it says it is listening and the press's dial is still connecting: a fresh dial"
+                                                                           : "it says it is listening and the press's dial had given up (ENet's connect timeout)")
+                         : std::string("the link went down again before any answer")));
+            RedialClearAndDial(g_doorAddr, g_doorPort, 1);
+        }
+    }
+    /* T-247 (T2420): a mods refusal is an answer - no dial follows it (coopstore::TitleRedialSock), and the log says so once */
+    const int refusedReason = StoreRefusedReason();
+    const int sock = coopstore::TitleRedialSock(StoreLinkSockState(), refusedReason);
+    if (refusedReason == (int)coopstore::kRefuseMods && g_modsStopSaid == 0 && role == kRoleClient)
+    {
+        g_modsStopSaid = 1;
+        DebugLog("[CFG] world road: the world server at " + AddrText(g_doorAddr, g_doorPort) + " refused this game for its mods - an answer,"
+                 " not silence: no more dials are made (" + N(g_dials) + " made before it); the refusal stands until the player acts"
+                 " (a JOIN press, JOIN AS ADMIN or leaving starts from nothing).");
+    }
     const int act = coopstore::TitleRedialDecide(role == kRoleClient ? 1 : 0, (!g_doorAddr.empty() && g_doorPort != 0) ? 1 : 0,
-                                                 StoreLinkSockState(), g_dials, kDialCap, (unsigned int)(now - g_lastDialMs),
+                                                 sock, g_dials, kDialCap, (unsigned int)(now - g_lastDialMs),
                                                  (unsigned int)kTitleRedialPaceMs, relaybridge::ConnectBudgetMs(net::RelayRouteFor(g_doorAddr), (unsigned int)kTitleConnectBudgetMs));   /* a Steam dial outlasts Steam's own first-connect timeout */
     if (act != coopstore::kTitleRedialAgain && act != coopstore::kTitleRedialLast) return;
     ++g_dials;
@@ -1076,6 +1118,15 @@ void ConfigTitleTick()
     RedialClearAndDial(g_doorAddr, g_doorPort, 1);
 }
 
+/* T-1403 (config.h): the HOST press's world server said it is listening - the next title tick decides the dial */
+void ConfigHostStartListening(const char* why)
+{
+    if (!coopstore::HostListenArm(g_hostListenPending, g_hostListenDials)) return;   /* once per press (ConfigRearmFromFile / ConfigLeave clear it) */
+    g_hostListenPending = 1;
+    DebugLog(std::string("[CFG] T-1403 world road: the world server says it is listening (") + (why ? why : "?") + ") - link state "
+             + N((long long)StoreLinkSockState()) + "; the next title tick dials it again unless it has answered");
+}
+
 /* T-201 N1 - LEAVE WITHOUT A RESTART (config.h). */
 void ConfigLeave(const char* why)
 {
@@ -1089,7 +1140,9 @@ void ConfigLeave(const char* why)
     ::InterlockedExchange(&g_role, (long)kRoleSingle);
     g_titleDone = false;
     g_dials = 0;
+    g_modsStopSaid = 0;
     g_lastDialMs = 0;
+    g_hostListenPending = 0; g_hostListenDials = 0;   /* T-1403 */
     DebugLog(std::string("[CFG] T-201 N1: LEFT (") + (why ? why : "?") + "): role " + RoleName(was) + " -> single, the session "
              + (linked ? "was linked and is closed (BYE sent)" : "is closed") + ", the store link is closed, the title-screen latch and the"
              " dial count are reset - the next HOST / JOIN press arms from nothing, no restart. A world server this game started is stopped by"

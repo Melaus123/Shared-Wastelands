@@ -13,6 +13,7 @@
 #define SW_WORLDPW_H
 
 #include <string>
+#include <cstring>        /* memset */
 #include "rulesfile.h"    /* the password lines, ExportText, IsTopRulesFile */
 #include "authproof.h"    /* the world password's key (PBKDF2, kIterations) */
 #include "adminauth.h"    /* the admin password's key (kIterDefault), Space */
@@ -183,6 +184,68 @@ inline bool KeepsOldPassword(bool keepRunning, bool hadPassword, bool nowPasswor
 inline std::string ExportBytes(const std::string& rel, const std::string& bytes)
 {
     return rulesfile::IsTopRulesFile(rel) ? rulesfile::ExportText(bytes) : bytes;
+}
+
+/* T-247 (owner 1706 b): THE PERSON WHO LAST PROVED THE OWNER PASSWORD - kOwnerProvenFile beside rules.txt and admins.txt, one line
+   "own2 <rounds> <salt hex> <check hex> <person id>", so a later start can tell whether rules.txt's owner password is still the one
+   that person proved (OwnerProvenStillHolds) without keeping the password. A changed or emptied owner password clears the record;
+   whoever proves the new one is recorded.
+   T-247 re-check fold (item 1): the check is NEVER a login key. A login key is adminauth::DeriveKey(password, the run's login salt) and
+   that key plus a CHALLENGE's nonce is a valid owner door proof (authproof::LoginDoorProof). The record's check goes the same stored-
+   password road (adminauth::DeriveKey, PBKDF2-HMAC-SHA256, as admin-auth.txt's adm1 line) but with its OWN salt, fresh from Windows'
+   random source at every write, and over the password with kOwnerProvenLabel in front - a text no typed or rules.txt password can be
+   (it holds a line break) - so it is not the key of any password under any salt a CHALLENGE may name. An "own1" line (this branch's
+   first form, which held the login key itself; never shipped) is no record. The file never travels with a world export
+   (worldkeep::ExportTakes). */
+const char* const kOwnerProvenFile = "owner-proven.txt";
+const char* const kOwnerProvenTag = "own2";
+const char kOwnerProvenLabel[] = "shared-wastelands owner-proven record\n";
+/* the record's check for an owner password (rules.txt's text; the spaces at both ends dropped as everywhere) with the record's salt */
+inline void OwnerProvenCheck(const std::string& ownerPwText, const unsigned char salt[adminauth::kSaltBytes], unsigned rounds, unsigned char check[adminauth::kKeyBytes])
+{
+    adminauth::DeriveKey(std::string(kOwnerProvenLabel) + OwnerPassword(ownerPwText), salt, rounds, check);
+}
+inline std::string OwnerProvenText(const std::string& person, unsigned rounds, const unsigned char salt[adminauth::kSaltBytes], const unsigned char check[adminauth::kKeyBytes])
+{
+    return adminauth::AuthLine(rounds, salt, check).replace(0, 4, kOwnerProvenTag) + " " + person + "\n";
+}
+/* the line a write puts in the file: the owner password's check under freshSalt (made by the caller from Windows' random source) */
+inline std::string OwnerProvenMake(const std::string& ownerPwText, const std::string& person, const unsigned char freshSalt[adminauth::kSaltBytes])
+{
+    unsigned char c[adminauth::kKeyBytes];
+    OwnerProvenCheck(ownerPwText, freshSalt, adminauth::kIterDefault, c);
+    const std::string text = OwnerProvenText(person, adminauth::kIterDefault, freshSalt, c);
+    std::memset(c, 0, sizeof c);
+    return text;
+}
+/* true = one well-formed record line (a person id of letters and digits only); anything else - an "own1" line too - is no record */
+inline bool OwnerProvenParse(const std::string& text, std::string* person, unsigned* rounds, unsigned char salt[adminauth::kSaltBytes], unsigned char check[adminauth::kKeyBytes])
+{
+    person->clear();
+    std::string line = text.substr(0, text.find('\n'));
+    while (!line.empty() && adminauth::Space(line[line.size() - 1])) line.erase(line.size() - 1);
+    const size_t sp = line.rfind(' ');
+    if (line.compare(0, 5, std::string(kOwnerProvenTag) + " ") != 0 || sp == std::string::npos || sp + 1 >= line.size()) return false;
+    const std::string who = line.substr(sp + 1);
+    for (size_t i = 0; i < who.size(); ++i)
+    {
+        const char c = who[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
+    }
+    const std::string adm = "adm1" + line.substr(4, sp - 4);
+    if (adminauth::AuthTextParse(adm, rounds, salt, check) != adminauth::kFileKey) return false;
+    *person = who;
+    return true;
+}
+/* the record still names the owner: rules.txt's owner password now (its text) makes the record's check with the record's salt and rounds */
+inline bool OwnerProvenStillHolds(const std::string& ownerPwText, unsigned rounds, const unsigned char salt[adminauth::kSaltBytes], const unsigned char check[adminauth::kKeyBytes])
+{
+    if (OwnerPassword(ownerPwText).empty()) return false;
+    unsigned char k[adminauth::kKeyBytes];
+    OwnerProvenCheck(ownerPwText, salt, rounds, k);
+    const bool same = authproof::SameBytes(k, check, sizeof k);
+    std::memset(k, 0, sizeof k);
+    return same;
 }
 
 }   /* namespace worldpw */

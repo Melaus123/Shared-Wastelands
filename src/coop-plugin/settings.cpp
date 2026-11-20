@@ -42,6 +42,8 @@
 #include "store.h"   /* EngineWritesBlocked */
 #include "config.h"  /* settings5 S5: ConfigModFingerprintSalt */
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
+#include "../common/modsenabled.h"   /* T-1375: kModsCfgMaxBytes, the mods.cfg read cap */
+#include "../common/modorder.h"   /* T-1375: PUT MY MODS IN THE WORLD'S ORDER - the reorder rule and its words */
 #include "admin.h"   /* AdminNow: the rule-setter is an admin now */
 #include "ui.h"      /* T-1055: UiNewGameStartNote - the start name BEGIN committed, for the [WORLD] started line */
 #include "../common/stewardrules.h"   /* KeepsWorldRules: a game made the steward mid-world keeps the world's rules */
@@ -237,6 +239,8 @@ struct Fp
     std::vector<std::string> detail;   /* logged once, in full */
     int known;                         /* settings5 S5: 1 = the active list was read (base mods are always in it) */
     std::vector<std::string> activeRows, pluginRows;   /* settings5 S5: the rows the hash is made of - the store HELLO carries them */
+    coopmods::ModsReadFacts facts;     /* T-247 (owner 1699): which part could not be read - a refused USE MY MODS logs it */
+    std::vector<std::string> uncountedLower;   /* T-1375: the mods loaded but not counted (base game, our own), lower case - mods.cfg's set check */
 };
 Fp g_fp;   /* static storage: done starts 0; the rest is set by ComputeFingerprint before any use */
 
@@ -244,8 +248,10 @@ void ComputeFingerprint()
 {
     g_fp.detail.clear(); g_fp.list.clear(); g_fp.n = -1; g_fp.plugins = -1; g_fp.hash = "unreadable";
     g_fp.activeRows.clear(); g_fp.pluginRows.clear(); g_fp.known = 0;   /* settings5 S5 */
+    g_fp.facts = coopmods::ModsReadFacts();
+    g_fp.uncountedLower.clear();   /* T-1375 */
     const unsigned long long gwRva = Rva("GameWorldGlobal");
-    if (gwRva == 0) { g_fp.detail.push_back("[MODS] detail: GameWorldGlobal not in the address table"); return; }
+    if (gwRva == 0) { g_fp.facts.noWorld = 1; g_fp.detail.push_back("[MODS] detail: GameWorldGlobal not in the address table"); return; }
     const unsigned char* gw = (const unsigned char*)(Base() + gwRva);
 
     std::string canon = "A:";
@@ -253,24 +259,28 @@ void ComputeFingerprint()
     int total = -1;
     if (!SafePtrLektor(gw + kGwActiveMods, &act[0], kMaxMods, &total))
     {
+        g_fp.facts.activeWhole = 1;
         g_fp.detail.push_back("[MODS] detail: GameWorld+0x528 activeMods unreadable");
         return;
     }
     int n = 0, skippedBase = 0, skippedCoop = 0, bad = 0;
     const int lim = total < kMaxMods ? total : kMaxMods;
     ModPod m;
+    /* T-1238: the ticked mods' names, lower-cased - the same ModPod name the active rows write - for the Plugins rows below */
+    std::vector<std::string> tickedLower;
     for (int i = 0; i < lim; ++i)
     {
         ReadMod(act[i], &m);
+        if (m.ok) tickedLower.push_back(Lower(m.name));
         if (!m.ok)
         {
-            ++bad; canon += "?;"; g_fp.detail.push_back("[MODS] active i=" + I(i) + " unreadable");
+            ++bad; canon += "?;"; g_fp.detail.push_back("[MODS] active i=" + I(i) + " unreadable"); g_fp.facts.slots.push_back(i);
             /* settings5 fold (review-settings5 4): a placeholder row, never skipped - its "?" checksum matches nothing (modlist.h) */
             g_fp.activeRows.push_back("(unreadable mod " + I(i) + ")|?|?");
             continue;
         }
-        if (m.isBase == 1) { ++skippedBase; continue; }
-        if (Lower(m.name) == swnames::kModNameLower) { ++skippedCoop; continue; }
+        if (m.isBase == 1) { ++skippedBase; g_fp.uncountedLower.push_back(Lower(m.name)); continue; }
+        if (Lower(m.name) == swnames::kModNameLower) { ++skippedCoop; g_fp.uncountedLower.push_back(Lower(m.name)); continue; }
         const std::string mf = ModFileOf(m);
         unsigned int crc = 0;
         const int crcOk = mf.empty() ? 0 : FileCrc32(mf, &crc);
@@ -285,16 +295,18 @@ void ComputeFingerprint()
     if (n > 20) g_fp.list += ",+" + I(n - 20) + " more";
     g_fp.n = n;
 
-    /* plugins: every available mod's RE_Kenshi.json, "Plugins" and "PreloadPlugins" (a PreloadPlugins DLL runs while its
-       mod is merely available - design 4), sorted by DLL name. T-318: only rows that can load in THIS game count
-       (coopmods::PluginRowDecide): none while RE_Kenshi is not loading plugins in this process, and never our own mod's -
-       each left-out row is logged with its reason. */
+    /* plugins: every available mod's RE_Kenshi.json, "Plugins" and "PreloadPlugins", sorted by DLL name. Only rows that
+       load in THIS game count (coopmods::PluginRowDecide): none while RE_Kenshi is not loading plugins in this process
+       (T-318), never our own mod's (T-318), and a "Plugins" row only while its mod is ticked - RE_Kenshi loads an
+       unticked mod's PreloadPlugins DLLs but not its Plugins DLLs (T-1238, run T2383), so a PreloadPlugins row counts
+       for every available mod (design 4). Each left-out row is logged with its reason. */
     canon += "P:";
     std::vector<void*> av(kMaxMods, (void*)0);
     int avTotal = -1;
     if (!SafePtrLektor(gw + kGwAvailOrdered, &av[0], kMaxMods, &avTotal))
     {
         canon += "unreadable";
+        g_fp.facts.pluginsUnreadable = 1;
         g_fp.detail.push_back("[MODS] detail: GameWorld+0x568 available list unreadable - plugins=-1");
     }
     else
@@ -307,7 +319,7 @@ void ComputeFingerprint()
         const char* cmdLine = ::GetCommandLineA();
         const int rkFlagOff = coopmods::CmdLineHasArg(cmdLine ? std::string(cmdLine) : std::string(), "--norekenshi") ? 1 : 0;
         const int rkLoads = coopmods::ReKenshiLoadsPlugins(rkModule, rkFlagOff);
-        int leftOwn = 0, leftNoRk = 0;
+        int leftOwn = 0, leftNoRk = 0, leftNotTicked = 0;
         for (int i = 0; i < avLim; ++i)
         {
             ReadMod(av[i], &m);
@@ -318,40 +330,51 @@ void ComputeFingerprint()
             if (!ReadText(Join(folder, "RE_Kenshi.json"), &json)) continue;
             ++folders;
             const char* keys[2] = { "PreloadPlugins", "Plugins" };
+            const int ticked = (std::find(tickedLower.begin(), tickedLower.end(), Lower(m.name)) != tickedLower.end()) ? 1 : 0;
             for (int k = 0; k < 2; ++k)
             {
                 std::vector<std::string> dlls;
                 JsonArray(json, keys[k], &dlls);
                 for (size_t d = 0; d < dlls.size(); ++d)
                 {
-                    const int verdict = coopmods::PluginRowDecide(rkLoads, std::string(m.name), dlls[d]);
+                    /* T-1238 (way 5): a json name with no ending names "<name>.dll" (KEP's "kep-core-preload-x64") */
+                    const std::string dllFile = coopmods::PluginDllFileName(dlls[d]);
+                    const int verdict = coopmods::PluginRowDecide(rkLoads, std::string(m.name), dllFile, k == 0 ? 1 : 0, ticked);
                     if (verdict != coopmods::kPluginRowCounted)
                     {
-                        if (verdict == coopmods::kPluginRowOwnMod) ++leftOwn; else ++leftNoRk;
-                        g_fp.detail.push_back("[MODS] plugin left out " + Lower(BaseName(dlls[d])) + "|" + keys[k] + "|" + m.name
+                        if (verdict == coopmods::kPluginRowOwnMod) ++leftOwn;
+                        else if (verdict == coopmods::kPluginRowNotTicked) ++leftNotTicked;
+                        else ++leftNoRk;
+                        g_fp.detail.push_back("[MODS] plugin left out " + Lower(BaseName(dllFile)) + "|" + keys[k] + "|" + m.name
                                               + " - " + coopmods::PluginRowWhy(verdict));
                         continue;
                     }
                     unsigned int crc = 0;
-                    const int ok = FileCrc32(Join(folder, dlls[d]), &crc);
-                    rows.push_back(Lower(BaseName(dlls[d])) + "|" + (ok ? H32(crc) : std::string("-1")) + "|" + keys[k] + "|" + m.name);
+                    /* the name as written first; only when that file is missing and the name had no ending, the name + ".dll" */
+                    int ok = FileCrc32(Join(folder, dlls[d]), &crc);
+                    if (!ok && dllFile != dlls[d]) ok = FileCrc32(Join(folder, dllFile), &crc);
+                    rows.push_back(Lower(BaseName(dllFile)) + "|" + (ok ? H32(crc) : std::string("-1")) + "|" + keys[k] + "|" + m.name);
                 }
             }
         }
         std::sort(rows.begin(), rows.end());
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
         for (size_t r = 0; r < rows.size(); ++r)
-        {
-            const size_t p2 = rows[r].find('|', rows[r].find('|') + 1);
-            canon += rows[r].substr(0, p2) + ";";   /* dll|crc only: which mod carries it is detail */
-            g_fp.pluginRows.push_back(rows[r].substr(0, p2));   /* settings5 S5 */
             g_fp.detail.push_back("[MODS] plugin " + rows[r]);
+        /* dll|crc only: which mod carries it is detail. T-1238 (way 6): cut, then sorted and de-duplicated, so one DLL
+           named by two mods' jsons is one row (coopmods::PluginRowsCut) */
+        std::vector<std::string> cut;
+        coopmods::PluginRowsCut(rows, &cut);
+        for (size_t r = 0; r < cut.size(); ++r)
+        {
+            canon += cut[r] + ";";
+            g_fp.pluginRows.push_back(cut[r]);   /* settings5 S5 */
         }
-        g_fp.plugins = (int)rows.size();
+        g_fp.plugins = (int)cut.size();
         g_fp.detail.push_back("[MODS] detail: available=" + I(avTotal) + " withReKenshiJson=" + I(folders)
                               + " reKenshiModule=" + I(rkModule) + " noReKenshiFlag=" + I(rkFlagOff)
                               + " reKenshiLoadsPlugins=" + I(rkLoads) + " leftOutNoReKenshi=" + I(leftNoRk)
-                              + " leftOutOwnMod=" + I(leftOwn));
+                              + " leftOutOwnMod=" + I(leftOwn) + " leftOutNotTicked=" + I(leftNotTicked));
         if (!rkLoads)
             g_fp.detail.push_back(std::string("[MODS] detail: RE_Kenshi is not loading plugins in this game (")
                                   + (rkModule ? "started with --norekenshi" : "RE_Kenshi.dll is not loaded in this process")
@@ -368,6 +391,7 @@ void ComputeFingerprint()
                               + "' is added to this game's list so the notebook refuses it at join");
     }
     g_fp.known = (total > 0) ? 1 : 0;   /* settings5 S5: the active list always holds the base mods once it is filled */
+    if (total <= 0) g_fp.facts.activeEmpty = 1;
     unsigned long long h = 1469598103934665603ull;
     for (size_t i = 0; i < canon.size(); ++i) { h ^= (unsigned char)canon[i]; h *= 1099511628211ull; }
     char hb[24]; _snprintf_s(hb, sizeof hb, _TRUNCATE, "%016llx", h);
@@ -1670,6 +1694,8 @@ std::string SettingsDumpCommand()
 
 /* settings5 S5 (design section 4): the list the store HELLO carries - the fingerprint's own rows, so the notebook compares
    exactly what S1 hashed. MAIN THREAD (store.cpp PumpLink, at the link-up edge, i.e. at the title screen). */
+/* T-247 (owner 1699): the facts behind the list SettingsModList hands out (computed once, as the list is) */
+coopmods::ModsReadFacts SettingsModsReadFacts() { return g_fp.facts; }
 int SettingsModList(coopmods::ModList* out)
 {
     if (!g_fp.done)
@@ -1683,6 +1709,139 @@ int SettingsModList(coopmods::ModList* out)
              + " plugins=" + I((long long)g_fp.pluginRows.size()) + " known=" + I(g_fp.known)
              + (ConfigModFingerprintSalt() != 0 ? std::string(" (TEST salt row included)") : std::string()));
     return g_fp.known;
+}
+
+/* ---- T-1375 (owner 1654 / 1692; modorder.h holds the design compare and the rule): PUT MY MODS IN THE WORLD'S ORDER ----
+   Both of Kenshi's own list files in the world's order - data\mods.cfg (what the game loads) and data\__mods.list (the launcher's
+   record, whose order its next Launch writes into mods.cfg) - each backed up beside itself (<file>.before-world-order) and replaced
+   atomically (a temp file renamed over it). Nothing is written unless BOTH files pass the set check; a file that cannot be read or
+   written refuses with one [MODS] line, and a mods.cfg already replaced is put back when __mods.list then fails. MAIN THREAD. */
+namespace {
+/* <game>\data: the exe's folder, or its parent when RE_Kenshi relaunched the game from <game>\RE_Kenshi\ - the first that holds
+   data\mods.cfg (the same rule coop.cpp's switched-on check uses). "" when neither does. */
+std::string OrderDataDir()
+{
+    wchar_t buf[2048];
+    const DWORD n = ::GetModuleFileNameW(0, buf, 2048);
+    if (n == 0 || n >= 2048) return std::string();
+    const std::string exeDir = DirName(U8FromW(std::wstring(buf, n).c_str()));
+    if (exeDir.empty()) return std::string();
+    if (IsFile(exeDir + "\\data\\mods.cfg")) return exeDir + "\\data";
+    const std::string up = DirName(exeDir);
+    if (!up.empty() && IsFile(up + "\\data\\mods.cfg")) return up + "\\data";
+    return std::string();
+}
+/* 1 read whole (at most cap bytes), 0 absent, -1 present but unreadable or larger than cap */
+int OrderReadFile(const std::string& path, size_t cap, std::string* out)
+{
+    out->clear();
+    if (U8GetFileAttributes(path.c_str()) == INVALID_FILE_ATTRIBUTES) return 0;
+    HANDLE h = U8CreateFile(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    std::string b(cap + 1, '\0');
+    DWORD got = 0;
+    const BOOL ok = ::ReadFile(h, &b[0], (DWORD)b.size(), &got, 0);
+    ::CloseHandle(h);
+    if (!ok || got > cap) return -1;
+    out->assign(b.data(), got);
+    return 1;
+}
+/* a temp file beside the target, flushed, then renamed over it */
+bool OrderWriteAtomic(const std::string& path, const std::string& body, std::string* err)
+{
+    char pidb[32]; _snprintf_s(pidb, sizeof pidb, _TRUNCATE, ".new.%lu", (unsigned long)::GetCurrentProcessId());
+    const std::string tmp = path + pidb;
+    HANDLE h = U8CreateFile(tmp.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) { *err = "could not open " + tmp + " for writing (Windows error " + I((long long)::GetLastError()) + ")"; return false; }
+    DWORD wrote = 0;
+    const BOOL wok = body.empty() ? TRUE : ::WriteFile(h, body.data(), (DWORD)body.size(), &wrote, 0);
+    const BOOL fok = ::FlushFileBuffers(h);
+    ::CloseHandle(h);
+    if (!wok || wrote != (DWORD)body.size() || !fok) { *err = "the write to " + tmp + " failed"; U8DeleteFile(tmp.c_str()); return false; }
+    if (!U8MoveFileEx(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        *err = "could not replace " + path + " (Windows error " + I((long long)::GetLastError()) + ")";
+        U8DeleteFile(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+/* backups = "" when nothing was written; else the backups already made (the list files themselves are unchanged or put back) */
+int OrderRefuse(const std::string& why, const std::string& backups = std::string())
+{
+    ErrorLog("[MODS] T-1375: PUT MY MODS IN THE WORLD'S ORDER refused - " + (backups.empty() ? std::string("nothing was written: ")
+             : "the mod list files were not changed, but backups were made (" + backups.substr(0, 300) + "): ") + why.substr(0, 400));
+    return 0;
+}
+/* T-1375 review NOTE: the backup beside `path` NEVER overwrites an earlier one - the player's first order is kept in
+   <file>.before-world-order; a later press backs up to <file>.before-world-order.2, .3 ... (up to .99). "" when all are taken. */
+std::string OrderBackupPath(const std::string& path)
+{
+    const std::string base = path + coopmods::kModsOrderBackupSuffix;
+    if (U8GetFileAttributes(base.c_str()) == INVALID_FILE_ATTRIBUTES) return base;
+    for (int n = 2; n <= 99; ++n)
+    {
+        const std::string p = base + "." + I((long long)n);
+        if (U8GetFileAttributes(p.c_str()) == INVALID_FILE_ATTRIBUTES) return p;
+    }
+    return std::string();
+}
+}   /* namespace */
+
+int SettingsModsPutInWorldOrder(const coopmods::ModList& world)
+{
+    if (!g_fp.done || !g_fp.known) return OrderRefuse("this game could not read its own mod list");
+    coopmods::ModList mine;
+    mine.known = g_fp.known; mine.hash = g_fp.hash; mine.active = g_fp.activeRows; mine.plugins = g_fp.pluginRows;
+    if (!world.known || !coopmods::ModsOrderOnly(coopmods::ModListDiff(world, mine)))   /* the live check at the press: the same mods, another order */
+        return OrderRefuse("this game's mods are not the world's mods in another order");
+    std::vector<std::string> names;
+    for (size_t i = 0; i < world.active.size(); ++i) names.push_back(coopmods::ModRowName(world.active[i]));
+    const std::string dir = OrderDataDir();
+    if (dir.empty()) return OrderRefuse("data\\mods.cfg was not found beside the game's exe nor one folder up");
+    const std::string cfgPath = dir + "\\mods.cfg", listPath = dir + "\\__mods.list";
+    std::string cfgText, listText;
+    if (OrderReadFile(cfgPath, (size_t)coopmods::kModsCfgMaxBytes, &cfgText) != 1) return OrderRefuse(cfgPath + " could not be read (or is larger than 64 KB)");
+    const int listHave = OrderReadFile(listPath, (size_t)coopmods::kModsListMaxBytes, &listText);
+    if (listHave < 0) return OrderRefuse(listPath + " could not be read (or is larger than 1 MB)");
+    coopmods::ModsLines cfgIn, cfgOut, listIn, listOut;
+    coopmods::ModsOrderFacts cf, lf;
+    coopmods::ModsLinesParse(cfgText, &cfgIn);
+    const int cv = coopmods::ModsOrderApply(names, cfgIn, 1, &g_fp.uncountedLower, &cfgOut, &cf);
+    if (cv != coopmods::kMoChanged && cv != coopmods::kMoSame) return OrderRefuse(cfgPath + ": " + coopmods::ModsOrderWhy(cf));
+    int lv = coopmods::kMoSame;
+    if (listHave == 1)
+    {
+        coopmods::ModsLinesParse(listText, &listIn);
+        lv = coopmods::ModsOrderApply(names, listIn, 0, 0, &listOut, &lf);
+        if (lv != coopmods::kMoChanged && lv != coopmods::kMoSame) return OrderRefuse(listPath + ": " + coopmods::ModsOrderWhy(lf));
+    }
+    const std::string cfgBak = cv == coopmods::kMoChanged ? OrderBackupPath(cfgPath) : std::string();
+    const std::string listBak = lv == coopmods::kMoChanged ? OrderBackupPath(listPath) : std::string();
+    if ((cv == coopmods::kMoChanged && cfgBak.empty()) || (lv == coopmods::kMoChanged && listBak.empty()))
+        return OrderRefuse("every backup name up to " + std::string(coopmods::kModsOrderBackupSuffix) + ".99 is taken beside the list files");
+    std::string err, made;
+    if (cv == coopmods::kMoChanged && !OrderWriteAtomic(cfgBak, cfgText, &err)) return OrderRefuse("the backup " + cfgBak + ": " + err);
+    if (cv == coopmods::kMoChanged) made = cfgBak;
+    if (lv == coopmods::kMoChanged && !OrderWriteAtomic(listBak, listText, &err)) return OrderRefuse("the backup " + listBak + ": " + err, made);
+    if (lv == coopmods::kMoChanged) made += (made.empty() ? "" : ", ") + listBak;
+    if (cv == coopmods::kMoChanged && !OrderWriteAtomic(cfgPath, coopmods::ModsLinesJoin(cfgOut), &err)) return OrderRefuse(err, made);
+    if (lv == coopmods::kMoChanged && !OrderWriteAtomic(listPath, coopmods::ModsLinesJoin(listOut), &err))
+    {
+        std::string err2;
+        const bool back = cv != coopmods::kMoChanged || OrderWriteAtomic(cfgPath, cfgText, &err2);
+        return OrderRefuse(err + (cv == coopmods::kMoChanged ? (back ? std::string("; mods.cfg was put back as it was") : " - and mods.cfg could NOT be put back (" + err2 + "); its backup is " + cfgBak) : std::string()), made);
+    }
+    const std::string cfgSaid = cv == coopmods::kMoChanged
+        ? " written in the world's order - " + I((long long)cf.modLines) + " mod lines before, " + I((long long)cf.modLinesAfter) + " after, " + I((long long)cf.moved) + " moved; backup " + cfgBak
+        : std::string(" already in the world's order - not written");
+    const std::string listSaid = listHave == 0 ? std::string(" absent - not written (the launcher keeps no record yet)")
+        : lv == coopmods::kMoChanged
+        ? " written in the world's order - " + I((long long)lf.modLines) + " mod lines before, " + I((long long)lf.modLinesAfter) + " after, " + I((long long)lf.moved) + " moved; backup " + listBak
+        : std::string(" already in the world's order - not written");
+    DebugLog("[MODS] T-1375: " + cfgPath + cfgSaid + ". " + listPath + listSaid);
+    DebugLog(coopmods::ModsOrderDoneLogLine((unsigned)names.size()));
+    return 1;
 }
 
 } // namespace coop

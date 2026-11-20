@@ -80,10 +80,11 @@ struct Sel
     bool inTeam;           /* the selected player is in a faction of players that is not this player's */
     bool online;
     int you;               /* this player's own level towards them (nametag levels) */
+    int them;              /* T-1406 (F1214): their level towards this player (the THEM cell's; unread = neutral, as shown) */
     std::string name;      /* the selected player's name as this game knows it ("" = not known) */
     std::string faction;   /* the selected player's faction as the table shows it */
     std::string founder;   /* this player's founder's name ("" = not known, or no faction) */
-    Sel() : myRole(kRoleNone), mate(false), inTeam(false), online(false), you(nametag::kNeutral) {}
+    Sel() : myRole(kRoleNone), mate(false), inTeam(false), online(false), you(nametag::kNeutral), them(nametag::kNeutral) {}
 };
 enum LineKind { kLineSelect = 0, kLineStance = 1, kLineMember = 2, kLineFounders = 3 };
 struct View
@@ -104,6 +105,11 @@ inline std::string NotInvitableNote(bool online, bool inTeam, const std::string&
     if (inTeam) return n + " is in another faction.";
     return std::string();
 }
+/* T-1406 (F1214, the owner 2026-11-18): THE invite stance rule - no INVITE TO FACTION between two players while EITHER has set the
+   other HOSTILE (this player's ticked button, or their THEM cell). Read by ViewFor below, so the PLAYERS tab's button, its press
+   (ActBody), the right-click menu's entry (policy.cpp InviteMenuOffer -> PlayersTabInvites) and that entry's click
+   (PlayersTabInviteSend) all answer from it. No new words: the button is simply not there. */
+inline bool InviteStanceAllows(int you, int them) { return you != nametag::kHostile && them != nametag::kHostile; }
 inline View ViewFor(bool selected, const Sel& s)
 {
     View v;
@@ -125,7 +131,7 @@ inline View ViewFor(bool selected, const Sel& s)
     v.lineKind = kLineStance;
     v.line = playerstab::StanceLine(s.faction);
     v.stance = true;
-    if (s.online && !s.inTeam) v.right = kActInvite;
+    if (s.online && !s.inTeam) { if (InviteStanceAllows(s.you, s.them)) v.right = kActInvite; }
     else v.note = NotInvitableNote(s.online, s.inTeam, s.name);
     return v;
 }
@@ -203,6 +209,7 @@ inline std::string InviteRefusedLine(int result, const std::string& who)
         if (result == swteam::kRefInvitePending) return w + " already has an invitation.";
         if (result == swteam::kRefInTeam) return w + " is in another faction.";
         if (result == swteam::kRefNotOnline) return w + " is offline.";
+        if (result == swteam::kRefDeclined) return w + " declined your last invitation. You can invite them again in a minute.";   /* owner 1768 */
     }
     return kInviteNotSent;
 }

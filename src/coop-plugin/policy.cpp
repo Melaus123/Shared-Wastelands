@@ -124,9 +124,16 @@
 #include "hooks.h"   /* coop::AddHook (own MinHook) / HookStatus - same include items.cpp uses for its four hooks */
 #include "speech.h"  /* T-737: TalkCursorHoverEnter / Leave - the talk cursor's test runs only inside characterSelected */
 #include "../common/teamstub.h"   /* T-1128: the house / research bench sites' expected bytes and the teammate cells' write */
+#include "../common/shopfallback.h"   /* T-1381 fix attempt 1: the shopping fallback refused in another player's town */
 #include "../common/farmwire.h"   /* T-1128 HIGH 1: WorkerIsCopy / MineWorkerSkip - the copy worker's step skipped, as factory work */
 #include "spawn.h"                /* T-1128 HIGH 1: FindSpawnedUid (address compares, any thread) */
 #include "config.h"               /* T-1128 HIGH 1: RoleIsSingle (any thread) */
+#include "replicate.h"            /* T-1167: IsDownedCharacter - the mod's one downed predicate (the trade's awake test) */
+#include "tradewin.h"             /* T-1167: the TRADE window */
+#include "playerstab.h"            /* T-1406: the PLAYERS tab's own invite rule and request (PlayersTabInvites / PlayersTabInviteSend) */
+#include "../common/tradewin.h"   /* T-1167: the approved mock-up's words ("Out of trading range") */
+#include "../common/tradewire.h"  /* T-1167 piece 2: the answers to the other player's ASK (tradew::Answer) */
+
 #include "../common/takeone.h"    /* T-1199: cooptake1::DoorOpenRefuse / OpenRefuse / OtherPlayerOwner - the pure decisions */
 #include <Windows.h>
 #include <intrin.h>   /* _ReturnAddress: which of OwnedByAPlayerFaction's sixteen callers is asking */
@@ -1104,6 +1111,86 @@ volatile LONGLONG g_mayUseJobHits = 0;
 volatile LONGLONG g_mayUseJobLastRet = 0;
 volatile LONGLONG g_mayUseBedLeft = 0;
 
+
+const char* g_shopFbWhy = "not tried";   /* T-1381 fix attempt 1: the shopping fallback detour's install (detour_ShopFallback) */
+
+/* ---- T-1381 FIX ATTEMPT 1 (H-T1381-shopfallback; F1124, F1146, F1147): NO SHOPPING FALLBACK INTO ANOTHER PLAYER'S TOWN -------------
+   The 'Shopping' goal's target pick (1.0.65 0x998920 / 1.0.68 0x9997F0) asks findShop for each needed item, else - only when the
+   town owner's player-interface pointer (+0x250) is 0 - asks 0x9FB2E0 / 0x9FC1B0 (row ShopFallbackRandom) for a random building of
+   that town (decomp build/decomp_998920.txt). On each game only this game's player faction has that pointer, so the copy of the
+   other player's town (owned here by that player's stand-in, build.cpp's town founding) took the fallback and NPCs went for that
+   player's house (T2481: 42 picks of the joiner's house on the host's game). This detour reads the town's owner (vt+0x58, the
+   read the pick makes, under the crash guard): a player's stand-in -> counted, a capped line (src/common/shopfallback.h), and 'no
+   building' without calling the engine - what the engine does for this game's own player's town (the pick then has no target);
+   every other town (NPC-owned, this player's own, owner unread) asks the engine as before. The fallback's only caller is that
+   pick (both exes: one call each, through the thunk 1.0.65 0x754F / 1.0.68 0x7554). ANY THREAD (the AI worker runs the pick):
+   guarded reads, interlocked counters; the line's names are read only for a line that is written. */
+unsigned long long kShopFallbackRva = 0; static AddrReg kShopFallbackRva_reg("ShopFallbackRandom", &kShopFallbackRva);   /* Steam_1.0.65 0x9FB2E0 */
+typedef void* (*ShopFallbackFn)(void* mgr, void* town, void* a3, void* a4);
+ShopFallbackFn orig_ShopFallback = 0;
+volatile LONGLONG g_shopFbRefused = 0;   /* another player's towns answered 'no building' */
+volatile LONGLONG g_shopFbAsked = 0;     /* towns passed to the engine's fallback */
+}   // namespace (T-1381 review fold: closed for the declaration below, reopened at once)
+int PolicyOtherPlayerFaction(void* fac);   /* namespace coop, defined below (T-1199 fold 1): a stand-in, or a saved player faction not this game's */
+namespace {   /* the same unnamed namespace, reopened (T-1381) */
+/* is the faction another player's here - a stand-in, or a saved player faction not yet resolved to one (after a load, before that
+   player joins, or alone in a world holding other players' towns) - PolicyOtherPlayerFaction, pointer compares and guarded reads, under
+   the crash guard (T-1381 review fold MED); 1 yes */
+int ShopOtherPlayerPod(void* f)
+{
+    if (f == 0) return 0;
+    __try { return PolicyOtherPlayerFaction(f) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the faction's name (Faction::getName) copied as plain bytes under the crash guard; 1 read, 0 not */
+int ShopFacNamePod(void* f, char* out, int cap)
+{
+    out[0] = 0;
+    if (f == 0) return 0;
+    __try
+    {
+        const char* s = (const char*)&((::Faction*)f)->getName();
+        const size_t n = *(const size_t*)(s + 0x10), res = *(const size_t*)(s + 0x18);
+        if (n > 4096 || res < n) return 0;
+        const char* p = (res >= 16) ? *(const char* const*)s : s;
+        int i = 0;
+        for (; i < cap - 1 && (size_t)i < n; ++i) out[i] = p[i];
+        out[i] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+/* the refusal's line (no __try here: std::string) */
+void ShopFallbackSay(void* town, void* owner, long long n)
+{
+    std::string tn;
+    if (!NameOf(town, &tn)) tn = "(unread)";
+    char on[64];
+    if (ShopFacNamePod(owner, on, (int)sizeof on) == 0) _snprintf_s(on, sizeof on, _TRUNCATE, "%s", "(unread)");
+    char line[420];
+    _snprintf_s(line, sizeof line, _TRUNCATE,
+                "[POLICY] shopping fallback refused: town '%.60s' owned by %s (another player's town) - as single player for a player's town;"
+                " refused=%lld%s",
+                tn.c_str(), on, n, n == shopfb::kSayFirst ? " (the first 10 refusals are written; from here the 100th, 1000th, 10000th ...; the count is on the policy REPORT)" : "");
+    DebugLog(std::string(line));
+}
+void* detour_ShopFallback(void* mgr, void* town, void* a3, void* a4)
+{
+    void* const owner = FactionOfBuildingPod(town);   /* the town's owner faction: vt+0x58 under the crash guard */
+    void* b = 0;
+    if (shopfb::Decide(owner != 0 ? 1 : 0, ShopOtherPlayerPod(owner)) == shopfb::kRefuse)
+    {
+        const LONGLONG n = ::InterlockedIncrement64(&g_shopFbRefused);
+        if (shopfb::SayRefusal(n) != 0) ShopFallbackSay(town, owner, n);
+    }
+    else
+    {
+        ::InterlockedIncrement64(&g_shopFbAsked);
+        b = orig_ShopFallback(mgr, town, a3, a4);
+    }
+    return b;
+}
+
 /* ANY THREAD: the storage search's own call marks this thread for the gather's length; every other caller runs the engine's as is */
 void detour_HaulGather(void* who, void* list, unsigned int kinds)
 {
@@ -1596,8 +1683,10 @@ int FoliageTownTestPatch(uintptr_t site)
       and no shop window: the same cell stub; and a function hook that picks the window for another player's thing
       (swaccess::WindowFor): a box, or a character down or carried (the function's own test, Character_inRagdoll 0x7D08A0,
       decomp_790d00.txt:61), opens as a loot window (2) - stealing shown for anyone but a teammate or an allowed friend, no crime
-      (crime.cpp refuses crimes between players); an awake character opens as this player's own for a teammate or an allowed
-      friend, and opens NO window for anyone else (the call is skipped).
+      (crime.cpp refuses crimes between players); an AWAKE character (T-1167, owner 1633 / 1634: one trade system, teammates
+      included - T-942's teammate "like own" window is retired) never opens the engine's window: the call is skipped and the
+      player trade's own checks (TradeDivertAwake, the T-1167 block) open the mod's TRADE window, show "Out of trading range",
+      or open nothing.
    4  the box click (buildingSelected's inline owner test 0x7FC241, the box stub above): its cells now hold the same teammate +
       allowed-friend set, written here.
    OWNER-MESSAGE HOOK POINT (not built here): the moves these sites allow reach the other player's box or character through
@@ -1624,6 +1713,7 @@ volatile LONG64 g_stealWorldNode = 0;                  /* site 1: a rock's windo
 volatile LONG64 g_tradeJudged[swaccess::kCounters];   /* site 3: window opens on another player's thing */
 volatile LONG64 g_tradeNoWindow = 0;                   /* site 3: an awake character of a stranger / refused friend: no window */
 volatile LONG64 g_tradeNever = 0;                      /* site 3: the caller's choice changed to 'never a shop window' */
+volatile LONG64 g_tradeDivert = 0;                     /* site 3 (T-1167): an awake character of another player - the engine's window skipped, the TRADE road asked */
 int g_stealHook = 0, g_tradeHook = 0;
 FoliageCells* g_hoverCells = 0;
 const char* g_hoverWhy = "not-tried";
@@ -2094,6 +2184,8 @@ int KitCharacterPod(void* obj, int* down)
     __except (EXCEPTION_EXECUTE_HANDLER) { *down = 0; return -1; }
 }
 /* site 3: the trade / loot window choice for another player's thing (swaccess::WindowFor) */
+int TradeDivertAwake(void* player, void* other);   /* T-1167: defined in the T-1167 block below (this same unnamed namespace) */
+const int kTrDivertLoot = 100;   /* T-1167 fold (review MEDIUM): TradeDivertAwake's answer for a character the trade road does not count as awake */
 typedef void (*KitShowTradeFn)(void*, void*, void*, int);
 KitShowTradeFn orig_KitShowTrade = 0;
 volatile LONG64 g_ownOnlyOpenRefused = 0;   /* T-1199 fold 1: loot window opens refused under Owner only (design B) */
@@ -2130,8 +2222,19 @@ void detour_KitShowTrade(void* gui, void* player, void* other, int type)
                 int down = 0;
                 const int character = KitCharacterPod(other, &down);
                 const int want = swaccess::WindowFor(who, character == 1, down != 0, type);
-                if (want == swaccess::kNoWindow) { ::InterlockedIncrement64(&g_tradeNoWindow); return; }
-                if (want != type) { ::InterlockedIncrement64(&g_tradeNever); type = want; }
+                if (want == swaccess::kTradeWin)
+                {   /* T-1167: the TRADE window, "Out of trading range", or no window (an awake enemy); a character the trade road does not
+                       count as awake (its one awake test: knocked out, dead, or down by IsDownedCharacter - a pose, a bed, crawling) gets the
+                       loot window as before, never no window (T-1167 fold, review MEDIUM) */
+                    ::InterlockedIncrement64(&g_tradeDivert);
+                    if (TradeDivertAwake(player, other) != kTrDivertLoot) return;
+                    ::InterlockedIncrement64(&g_tradeNever); type = swaccess::kTradeNever;
+                }
+                else
+                {
+                    if (want == swaccess::kNoWindow) { ::InterlockedIncrement64(&g_tradeNoWindow); return; }
+                    if (want != type) { ::InterlockedIncrement64(&g_tradeNever); type = want; }
+                }
             }
         }
     }
@@ -2392,10 +2495,18 @@ volatile DWORD g_clickTid = 0;
 /* inside showContextMenu (main thread): the build's depth and thread; the isEnemy mark; what was found before the build */
 volatile LONG g_menuDepth = 0, g_menuOrdMark = 0, g_menuForTarget = 0, g_menuForOcc = 0, g_menuTargetCage = 0, g_menuOccCage = 0;
 volatile LONG g_menuPeerTarget = 0, g_menuPeerOcc = 0;   /* T-1022: the character found before the build is another player's outside the team (clicked: sub 0; in the clicked furniture: sub 1) */
+volatile LONG g_menuTradeAdd = 0;   /* T-1167: the clicked character (sub 0) is another player's, awake and no enemy - its list gets order 26 ('Trade') */
+int TradeMenuOffer(void* who);      /* T-1167: defined in the T-1167 block below (this same unnamed namespace) */
+int TradeFillPod(void* list);
+volatile LONG g_menuInviteAdd = 0;   /* T-1406: the clicked character's list (sub 0) gets 'Invite to faction' */
+int InviteMenuOffer(void* who, LONG* slot);   /* T-1406: defined in the T-1406 block below (this same unnamed namespace) */
+int InviteFillPod(void* list);
+int InviteLabelPod(void* out);
 volatile DWORD g_menuTid = 0;
 /* the `team orders` lever's capture of the last list the menu was handed (main thread) */
 int g_capOn = 0, g_capBuilt = 0, g_capRawN = 0, g_capShownN = 0, g_capSub = 0, g_capCage = 0;
 int g_capRaw[64], g_capShown[64];
+void* g_capMenu = 0;   /* T-1406: the menu object the fill was handed in a captured build (sub 0) - the invite lever's click */
 
 unsigned long long RvaOfRet(const void* ret)
 {
@@ -2516,13 +2627,14 @@ unsigned long long detour_sneakTest(void* ch)
 }
 struct MenuScope    /* showContextMenu's build state, put back on every exit (a build inside a build included) */
 {
-    LONG depth, ordMark, forTarget, forOcc, targetCage, occCage, peerTarget, peerOcc; DWORD tid;
+    LONG depth, ordMark, forTarget, forOcc, targetCage, occCage, peerTarget, peerOcc, tradeAdd, inviteAdd; DWORD tid;
     MenuScope() : depth(g_menuDepth), ordMark(g_menuOrdMark), forTarget(g_menuForTarget), forOcc(g_menuForOcc), targetCage(g_menuTargetCage),
-                  occCage(g_menuOccCage), peerTarget(g_menuPeerTarget), peerOcc(g_menuPeerOcc), tid(g_menuTid) {}
+                  occCage(g_menuOccCage), peerTarget(g_menuPeerTarget), peerOcc(g_menuPeerOcc), tradeAdd(g_menuTradeAdd),
+                  inviteAdd(g_menuInviteAdd), tid(g_menuTid) {}
     ~MenuScope()
     {
         g_menuOrdMark = ordMark; g_menuForTarget = forTarget; g_menuForOcc = forOcc; g_menuTargetCage = targetCage; g_menuOccCage = occCage;
-        g_menuPeerTarget = peerTarget; g_menuPeerOcc = peerOcc;
+        g_menuPeerTarget = peerTarget; g_menuPeerOcc = peerOcc; g_menuTradeAdd = tradeAdd; g_menuInviteAdd = inviteAdd;
         g_menuTid = tid; g_menuDepth = depth;
     }
 };
@@ -2531,10 +2643,13 @@ void detour_showMenu(void* menu, char show, void* target)
     TalkHoverScope talk(target, coop::kTalkScopeMenu);   /* T-737: the menu's Talk entry follows the talk cursor's answer, as a click */
     MenuScope keep;
     g_menuOrdMark = 0; g_menuForTarget = 0; g_menuForOcc = 0; g_menuTargetCage = 0; g_menuOccCage = 0; g_menuPeerTarget = 0; g_menuPeerOcc = 0;
+    g_menuTradeAdd = 0; g_menuInviteAdd = 0;
     if (show != 0 && target != 0)
     {
         int nested = 0, cage = 0;
         void* who = OrdersForPod(target, &nested, &cage);
+        if (who != 0 && nested == 0 && TradeMenuOffer(who) != 0) g_menuTradeAdd = 1;   /* T-1167: the clicked character's own list (sub 0) */
+        if (who != 0 && nested == 0) { LONG is = -1; if (InviteMenuOffer(who, &is) != 0) g_menuInviteAdd = 1; }   /* T-1406: the menu's checks (this player's stance) + the PLAYERS tab's rule */
         if (who != 0 && g_ordHeld != 0 && TeammateObjPod(who, 1) != 0)
         {
             ::InterlockedIncrement64(&g_ordForFound);
@@ -2594,11 +2709,14 @@ void MenuListPod(void* list, int filter, int cage, unsigned long long sub)
 }
 void detour_menuFill(void* menu, void* list, void* name, unsigned long long sub)
 {
+    if (g_capOn != 0 && sub == 0) g_capMenu = menu;   /* T-1406: the invite lever */
     const bool inBuild = g_menuDepth > 0 && ::GetCurrentThreadId() == g_menuTid;
     const bool filter = inBuild && swteamord::MenuFiltered(g_menuOrdMark != 0, sub, g_menuForTarget != 0, g_menuForOcc != 0);
     const bool cage = filter && g_menuOrdMark == 0 && (sub != 0 ? g_menuOccCage : g_menuTargetCage) != 0;
     const bool peer = inBuild && !filter && swteamord::MenuFiltered(false, sub, g_menuPeerTarget != 0, g_menuPeerOcc != 0);   /* T-1022 */
     if (list != 0 && (filter || peer || g_capOn != 0)) MenuListPod(list, filter ? 1 : (peer ? 2 : 0), cage ? 1 : 0, sub);
+    if (list != 0 && inBuild && sub == 0 && g_menuTradeAdd != 0) TradeFillPod(list);   /* T-1167: after the filters (the lever's 'shown' capture is updated there) */
+    if (list != 0 && inBuild && sub == 0 && g_menuInviteAdd != 0) InviteFillPod(list);   /* T-1406: 'Invite to faction', after Trade (shown last: the largest number) */
     orig_menuFill(menu, list, name, sub);
 }
 int OrdHook(unsigned long long rva, void* detour, void** orig, const char* what)
@@ -2631,6 +2749,660 @@ std::string TeamOrdersTokens()
          + "," + PN(g_ordPeerFound) + "," + PN(g_ordPeerMenus) + "," + PN(g_ordPeerTalkHidden);
 }
 }   // namespace
+
+/* ---- T-1167 piece 1 (owner 1633 / 1634 / 1635): THE PLAYER TRADE WINDOW - THE RIGHT-CLICK ENTRY, ITS LABEL AND THE CLICK ----------
+   One trade system with every other player whose characters are not hostile, teammates included (1633); the approved mock-up is
+   src/common/tradewin.h's words, the window tradewin.cpp. Pure rules: src/common/teamorders.h (TradeOffered, TradeFillAdds,
+   TradeToFront, TradeLabel, InTradeRange, TradeClick). The sites (Steam 1.0.65 addresses; build/decomp_*.txt):
+     THE ENTRY: the menu's fill 0x7A7440 (hooked above) - the list built for the clicked character (sub 0) of ANOTHER player (its
+       faction a player's stand-in or coop-p<n> record, StandInSlotAnyPod), AWAKE (not knocked out +0x5B9, not dead +0x5BC, not down
+       - the mod's one downed predicate IsDownedCharacter) and not an enemy (PlayerInterface::isEnemy through its hooked entry, which
+       answers no for a teammate) gets order 26 when it lacks it, through the engine's own list add (lektor<int> push 0xEE210: count
+       +8, capacity +0xC, array +0x10, grows by doubling; row LektorIntPushBack), moved to the front. The fill copies the list into
+       an ordered set (0x7A7440 :150-230), so the menu shows its entries by number either way.
+     THE LABEL: the order's word 0x79A730 (std::string* (out, task, target); its only caller is the fill, :274; row
+       ContextMenu_orderLabel) - order 26 on another player's AWAKE character reads 'Trade' (owner 1634), written in place over the
+       engine's answer (its 'Loot' word, DAT_141713b84 :249: a stand-in faction has no player interface); knocked out the engine's
+       word stays. The word is English, as the approved mock-up (the engine's own 'Trade' passes its translation, 0x1400A9580).
+     THE CLICK: the order pre-check 0x5D0EB0 (char (actor, task, target), 1 = refused; row Character_orderPreCheck) - giveOrder
+       0x5D1640 asks it first and gives nothing and clears nothing when it answers 1 (decomp_5d1640.txt:28-50). Order 26 from this
+       player's own character to another player's awake, not-hostile character answers 1 and opens the TRADE window, or shows
+       "Out of trading range" (the game's own words) when the two stand further apart on the ground (x, z) than the engine's trade
+       range: the squared distance against its own constant (0x70C6C0 :67 / :93-95, DAT_1416878B4 = 1000000.0, i.e. 1000 units;
+       row TradeRangeSq, read live, logged once). Everything else - a knocked-out character's loot road included - is the
+       engine's own pre-check. Main thread only (another thread's ask is the engine's).
+     THE FALLBACK: an awake player's character reaching the engine's window 0x790D00 by any other road (site 3 above,
+       swaccess::WindowFor kTradeWin) takes the same decision (TradeDivertAwake): the TRADE window, the range words, or none.
+   PIECE 2: the window opens on the clicking game, which asks the other player's game through the world server (TRADE 94,
+   src/common/tradewire.h; tradewin.cpp); that game answers through PolicyTradeAsked below. */
+namespace {
+unsigned long long kLektorIntPushRva = 0; static AddrReg kLektorIntPushRva_reg("LektorIntPushBack", &kLektorIntPushRva);          /* Steam_1.0.65 0xEE210, 1.0.68 0xEE250 */
+unsigned long long kOrderLabelRva = 0;    static AddrReg kOrderLabelRva_reg("ContextMenu_orderLabel", &kOrderLabelRva);           /* Steam_1.0.65 0x79A730, 1.0.68 0x79B2D0 */
+unsigned long long kOrderPreCheckRva = 0; static AddrReg kOrderPreCheckRva_reg("Character_orderPreCheck", &kOrderPreCheckRva);    /* Steam_1.0.65 0x5D0EB0, 1.0.68 0x5D1940 */
+unsigned long long kTradeRangeSqRva = 0;  static AddrReg kTradeRangeSqRva_reg("TradeRangeSq", &kTradeRangeSqRva);                 /* Steam_1.0.65 0x16878B4, 1.0.68 0x16888B4 (ro) */
+unsigned long long kTrAddOrderRva = 0;    static AddrReg kTrAddOrderRva_reg("AddOrder", &kTrAddOrderRva);                         /* Steam_1.0.65 0x5D1640 - the lever's giveOrder */
+unsigned long long kTrAddOrderArgRva = 0; static AddrReg kTrAddOrderArgRva_reg("AddOrderArgGlobal", &kTrAddOrderArgRva);          /* Steam_1.0.65 0x2246C68 - its 7th argument */
+typedef void (*LektorIntPushFn)(void* list, int value);
+typedef void* (*OrderLabelFn)(void* out, int task, void* target);
+typedef char (*OrderPreCheckFn)(void* actor, int task, void* target);
+typedef void (*TrAddOrderFn)(void* who, void* a2, int taskType, void* target, char shift, char clearOld, unsigned long long a7);
+OrderLabelFn orig_orderLabel = 0;
+OrderPreCheckFn orig_orderPreCheck = 0;
+int g_trHooks = 0;
+std::string g_trWhy = "not tried";
+const size_t kTrKo = 0x5B9, kTrDead = 0x5BC;           /* Character: knocked out / dead bytes (hire.cpp KoDeadPod) */
+const size_t kTrStrSize = 0x10, kTrStrCap = 0x18;      /* the engine's std::string: text inline under 16, else a pointer at +0 */
+const int kTrSayCap = 40;                              /* [TRADE] precheck / divert lines a game prints; the rest are counted */
+volatile LONG64 g_trMenuAsked = 0, g_trMenuOffered = 0, g_trAdded = 0, g_trAddFault = 0, g_trLabels = 0, g_trLabelFault = 0;
+volatile LONG64 g_trPrechecks = 0, g_trWindow = 0, g_trRefused = 0, g_trEngine = 0, g_trOffMain = 0, g_trDiverts = 0, g_trDivertNone = 0, g_trDivertLoot = 0, g_trMenuNoOwnSel = 0;
+int g_trSaid = 0, g_trUnsaid = 0;
+int g_trLast = -1;                                     /* the last decision (swteamord::kClick*), -1 none - the lever reads it */
+float g_trRangeSq = 0.0f;
+int g_trRangeRead = 0;                                 /* 0 not yet, 1 read, -1 no row / unreadable */
+
+/* what the trade decisions read about one character (MAIN THREAD) */
+struct TrFacts { int character; int slot; int other; int teammate; int awake; int enemy; unsigned int uid; int stance; int you; int them; int engine; };   /* T-1406: stance (1 read from the PLAYERS tab, 0 no row, -1 off main), you / them (nametag levels), engine (isEnemy, -1 unread) */
+int TrTypeFacPod(void* obj, int* type, void** fac)
+{
+    *type = -1; *fac = 0;
+    __try
+    {
+        void** vt = *(void***)obj;
+        if (!Plaus(vt)) return 0;
+        *type = ((int (*)(void*))vt[0x20 / 8])(obj);
+        *fac = ((void* (*)(void*))vt[0x58 / 8])(obj);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *type = -1; *fac = 0; return 0; }
+}
+int TrKoDeadPod(void* ch, int* ko, int* dead)
+{
+    __try { const unsigned char* p = (const unsigned char*)ch; *ko = p[kTrKo] != 0 ? 1 : 0; *dead = p[kTrDead] != 0 ? 1 : 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ko = 1; *dead = 1; return 0; }
+}
+int TrIsEnemyCallPod(void* pi, void* ch, int* ans)
+{
+    __try { *ans = ((PiIsEnemyFn)(g_base + (uintptr_t)kPiIsEnemyRva))(pi, ch) != 0 ? 1 : 0; return 1; }   /* the hooked entry: a teammate is no enemy */
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ans = 1; return 0; }
+}
+int TrIsEnemyPod(void* ch, int* ans)
+{
+    *ans = 1;
+    void* pi = 0;
+    if (kPiIsEnemyRva == 0 || g_base == 0 || IsPlayerFieldPod((void*)coop::LocalPlayerFaction(), &pi) != 1 || !Plaus(pi)) return 0;
+    return TrIsEnemyCallPod(pi, ch, ans);
+}
+/* T-1406 (T2524 L4, F1206): THE hostile answer for ANOTHER player's character (f filled by TrFactsOf, f->other == 1), shared by the
+   menu's Trade and Invite offers, Trade's word, Trade's click, Invite's click and the other game's ASKED: the stance the PLAYERS tab
+   shows (swteamord::PeerHostile - Trade and Invite: either side hostile, F1214), the engine's isEnemy only when the tab has
+   no row for that player or off the main thread. Fills f->stance / you / them / engine for the decision lines. 1 = hostile. */
+int TrPeerHostile(void* who, TrFacts* f, int kind)
+{
+    int e = 1;
+    f->engine = TrIsEnemyPod(who, &e) == 1 ? e : -1;   /* the hooked entry (a teammate is no enemy); unread = an enemy */
+    int you = nametag::kUnknown, them = nametag::kUnknown, mate = 0;
+    const unsigned long m = coop::StoreMainThreadId();
+    f->stance = (m != 0 && ::GetCurrentThreadId() == (DWORD)m) ? coop::PlayersTabStance(f->slot, &you, &them, &mate) : -1;
+    f->you = you; f->them = them;
+    return swteamord::PeerHostile(kind, f->stance == 1, f->teammate != 0 || mate != 0, you == nametag::kHostile, them == nametag::kHostile, e != 0) ? 1 : 0;
+}
+/* the stance values a decision used, for the [TRADE] / [INVITE] lines */
+std::string TrStanceText(const TrFacts& f)
+{
+    return " stance: tab=" + PN((long long)f.stance) + " you=" + PN((long long)f.you) + " them=" + PN((long long)f.them)
+         + " (0 ally, 1 neutral, 2 hostile, -1 unread) engineEnemy=" + PN((long long)f.engine);
+}
+int TrPosPod(void* obj, float* pos)
+{
+    __try { void** vt = *(void***)obj; float v[3] = { 0, 0, 0 }; ((void (*)(void*, float*))vt[0x40 / 8])(obj, v); pos[0] = v[0]; pos[1] = v[1]; pos[2] = v[2]; return 1; }   /* vt+0x40 getPosition */
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int TrRangeSqPod(float* out)
+{
+    __try { *out = *(const float*)(g_base + (uintptr_t)kTradeRangeSqRva); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0.0f; return 0; }
+}
+/* the engine's trade range constant, read once and logged once (0 = no row or unreadable: never in range) */
+float TrRangeSq()
+{
+    if (g_trRangeRead != 0) return g_trRangeSq;
+    float v = 0.0f;
+    g_trRangeRead = (kTradeRangeSqRva != 0 && g_base != 0 && TrRangeSqPod(&v) == 1) ? 1 : -1;
+    g_trRangeSq = g_trRangeRead == 1 ? v : 0.0f;
+    char b[96];
+    _snprintf(b, sizeof b, "%.1f (squared; %.1f units on the ground)", (double)g_trRangeSq, g_trRangeSq > 0.0f ? std::sqrt((double)g_trRangeSq) : 0.0);
+    b[sizeof b - 1] = 0;
+    DebugLog(std::string("[TRADE] the engine's trade range constant (row TradeRangeSq) = ") + (g_trRangeRead == 1 ? std::string(b) : std::string("NOT READ - every trade click reads out of range")));
+    return g_trRangeSq;
+}
+/* who: its player slot when it is ANOTHER player's character, its awake state and (wantEnemy) the engine's isEnemy answer */
+void TrFactsOf(void* who, bool wantEnemy, TrFacts* f)
+{
+    f->character = 0; f->slot = -1; f->other = 0; f->teammate = 0; f->awake = 0; f->enemy = 1; f->uid = 0;
+    f->stance = 0; f->you = nametag::kUnknown; f->them = nametag::kUnknown; f->engine = -1;
+    if (!Plaus(who)) return;
+    int type = -1; void* fac = 0;
+    if (TrTypeFacPod(who, &type, &fac) != 1 || type != 1) return;
+    f->character = 1;
+    const int me = coop::MySlotForWire();
+    const int s = StandInSlotAnyPod(fac);
+    f->slot = s;
+    f->other = (me >= 0 && s >= 0 && s != me) ? 1 : 0;
+    if (f->other == 0) return;
+    f->teammate = coop::TeamSameAnyThread(me, s) ? 1 : 0;
+    int ko = 1, dead = 1;
+    TrKoDeadPod(who, &ko, &dead);
+    f->awake = (ko == 0 && dead == 0 && !coop::IsDownedCharacter((::Character*)who)) ? 1 : 0;
+    if (wantEnemy) f->enemy = TrPeerHostile(who, f, swteamord::kHostileForTrade);   /* T-1406: the PLAYERS tab's stance, either side */
+    f->uid = coop::FindSpawnedUid(who);
+}
+/* the actor is this game's player's own character (its faction holds the player interface) */
+int TrActorOwn(void* actor)
+{
+    int type = -1; void* fac = 0; void* pi = 0;
+    if (!Plaus(actor) || TrTypeFacPod(actor, &type, &fac) != 1 || type != 1) return 0;
+    return (IsPlayerFieldPod(fac, &pi) == 1 && pi != 0) ? 1 : 0;
+}
+int TrInRange(void* a, void* b, int* read)
+{
+    float pa[3], pb[3];
+    *read = (TrPosPod(a, pa) == 1 && TrPosPod(b, pb) == 1) ? 1 : 0;
+    return (*read == 1 && swteamord::InTradeRange(pa[0], pa[2], pb[0], pb[2], TrRangeSq())) ? 1 : 0;
+}
+void TrSay(const std::string& line)
+{
+    if (g_trSaid >= kTrSayCap) { ++g_trUnsaid; return; }
+    ++g_trSaid;
+    DebugLog(line + (g_trSaid == kTrSayCap ? std::string(" (the last such line this game prints; the rest are counted on the REPORT line)") : std::string()));
+}
+/* the decision for order 26 from `actor` on `target`, acted on: the window opened, or the range words shown. MAIN THREAD. `road` =
+   "precheck" or "divert". Returns swteamord::kClick*. */
+int TrDecideAndAct(void* actor, void* target, int task, const char* road)
+{
+    TrFacts f;
+    TrFactsOf(target, true, &f);
+    const int own = TrActorOwn(actor);
+    int posRead = 0;
+    const int inRange = (own != 0 && f.other != 0 && f.awake != 0 && f.enemy == 0) ? TrInRange(actor, target, &posRead) : 0;
+    const int d = swteamord::TradeClick(task, own != 0, f.other != 0, f.awake != 0, f.enemy != 0, inRange != 0);
+    g_trLast = d;
+    int opened = 0;
+    if (d == swteamord::kClickWindow) opened = coop::TradeWinOpen(actor, target, f.slot);
+    else if (d == swteamord::kClickRefused) coop::StoreShowPlayerLine(swtrade::OutOfRange());
+    if (f.other != 0 || std::strcmp(road, "divert") == 0)
+        TrSay("[TRADE] " + std::string(road) + " task=" + PN((long long)task) + " actor=" + PN((long long)coop::FindSpawnedUid(actor)) + " target=" + PN((long long)f.uid)
+              + " awake=" + PN((long long)f.awake) + " enemy=" + PN((long long)f.enemy) + " range=" + PN((long long)inRange) + " -> " + swteamord::ClickWord(d)
+              + " (own actor=" + PN((long long)own) + " slot=" + PN((long long)f.slot) + " teammate=" + PN((long long)f.teammate)
+              + (d == swteamord::kClickWindow ? std::string(" window ") + (opened == 1 ? "opened" : opened == 2 ? "already open" : "NOT opened") : std::string())
+              + (d == swteamord::kClickRefused ? std::string(posRead ? " - 'Out of trading range' shown" : " - a position did not read; 'Out of trading range' shown") : std::string()) + ";"
+              + TrStanceText(f) + ")");
+    return d;
+}
+
+/* T-1167 fold (review LOW): one of this player's OWN characters is selected - the click roads give the order from a selected
+   character of this player's faction only (0x7FA870 :150-169), so a teammate's selected character alone would get an entry that
+   does nothing. Shared by Trade's and Invite's menu offers (T-1406). */
+int TrOwnSelected()
+{
+    void* sel[32];
+    const int ns = coop::SelectedCharacters(sel, 32);
+    int own = 0;
+    for (int i = 0; i < ns && own == 0; ++i) own = TrActorOwn(sel[i]);
+    return own;
+}
+/* THE ENTRY: called by showMenu's detour for the clicked character - 1 = its list gets order 26 */
+int TradeMenuOffer(void* who)
+{
+    TrFacts f;
+    TrFactsOf(who, true, &f);   /* T-1406 (T2524 L4): the enemy answer is the PLAYERS tab's stance, either side (TrPeerHostile) */
+    if (f.other == 0) return 0;
+    ::InterlockedIncrement64(&g_trMenuAsked);
+    if (f.awake == 0) return 0;
+    if (!swteamord::TradeOffered(true, true, f.enemy != 0)) return 0;
+    const int own = TrOwnSelected();
+    if (own == 0) { ::InterlockedIncrement64(&g_trMenuNoOwnSel); return 0; }
+    ::InterlockedIncrement64(&g_trMenuOffered);
+    return 1;
+}
+/* the list (the fill's lektor<int>): 26 added through the engine's own list add when it lacks it, then moved to the front; the
+   lever's 'shown' capture updated. 1 added, 0 not needed, -1 no row or a fault. Never faults. */
+int TradeFillPod(void* list)
+{
+    if (kLektorIntPushRva == 0 || g_base == 0) return -1;
+    __try
+    {
+        int n = (int)*(unsigned*)((char*)list + kListCount);
+        int* d = *(int**)((char*)list + kListData);
+        if (n < 0 || n > 4096 || (n > 0 && !Plaus(d))) return -1;
+        if (!swteamord::TradeFillAdds(true, d, n)) return 0;
+        ((LektorIntPushFn)(g_base + (uintptr_t)kLektorIntPushRva))(list, swteamord::kLoot);
+        n = (int)*(unsigned*)((char*)list + kListCount);   /* read again: the add may have moved the array */
+        d = *(int**)((char*)list + kListData);
+        if (n <= 0 || n > 4096 || !Plaus(d)) return -1;
+        swteamord::TradeToFront(d, n);
+        if (g_capOn != 0) { g_capShownN = 0; for (int i = 0; i < n && i < 64; ++i) g_capShown[g_capShownN++] = d[i]; }
+        ::InterlockedIncrement64(&g_trAdded);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ::InterlockedIncrement64(&g_trAddFault); return -1; }
+}
+/* THE LABEL: 'Trade' written over the engine's answer in place (its capacity always holds 5 letters: 15 inline at least) */
+int TrLabelWritePod(void* out, const char* w, size_t n)
+{
+    __try
+    {
+        char* s = (char*)out;
+        const unsigned long long cap = *(const unsigned long long*)(s + kTrStrCap);
+        char* buf = cap >= 16 ? *(char**)s : s;
+        if (cap < (unsigned long long)n || !Plaus(buf)) return 0;
+        std::memcpy(buf, w, n); buf[n] = 0;
+        *(unsigned long long*)(s + kTrStrSize) = (unsigned long long)n;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+void* detour_orderLabel(void* out, int task, void* target)
+{
+    void* const r = orig_orderLabel(out, task, target);
+    if (swteamord::InviteLabelled(task)) { if (out != 0) InviteLabelPod(out); return r; }   /* T-1406: 'Invite to faction' (the engine's word for the number is "") */
+    if (task != swteamord::kLoot || target == 0 || out == 0) return r;
+    TrFacts f;
+    TrFactsOf(target, true, &f);   /* T-1167 fold (review LOW): the isEnemy answer too - an enemy keeps the engine's word, as the entry and the click */
+    if (swteamord::TradeLabel(task, f.character != 0, f.other != 0, f.awake != 0, f.enemy != 0) != swteamord::kLabelTrade) return r;
+    const char* w = swteamord::TradeWord();
+    if (TrLabelWritePod(out, w, std::strlen(w)) == 1) ::InterlockedIncrement64(&g_trLabels);
+    else ::InterlockedIncrement64(&g_trLabelFault);
+    return r;
+}
+/* THE CLICK */
+char detour_orderPreCheck(void* actor, int task, void* target)
+{
+    if (task != swteamord::kLoot || actor == 0 || target == 0) return orig_orderPreCheck(actor, task, target);
+    const unsigned long m = coop::StoreMainThreadId();
+    if (m == 0 || ::GetCurrentThreadId() != (DWORD)m) { ::InterlockedIncrement64(&g_trOffMain); return orig_orderPreCheck(actor, task, target); }
+    ::InterlockedIncrement64(&g_trPrechecks);
+    const int d = TrDecideAndAct(actor, target, task, "precheck");
+    if (d == swteamord::kClickEngine) { ::InterlockedIncrement64(&g_trEngine); return orig_orderPreCheck(actor, task, target); }
+    ::InterlockedIncrement64(d == swteamord::kClickWindow ? &g_trWindow : &g_trRefused);
+    return (char)1;   /* no order given, nothing cleared (giveOrder stops at a refusal) */
+}
+int TrHook(unsigned long long rva, void* detour, void** orig, const char* what)
+{
+    if (rva == 0) { g_trWhy += std::string(" ") + what + ":no-row"; return 0; }
+    if (coop::AddHook((void*)(g_base + (uintptr_t)rva), detour, orig) != coop::SUCCESS) { g_trWhy += std::string(" ") + what + ":hook-failed"; return 0; }
+    ++g_trHooks;
+    return 1;
+}
+void InstallTradeHooks()
+{
+    g_trWhy.clear();
+    TrHook(kOrderLabelRva, (void*)&detour_orderLabel, (void**)&orig_orderLabel, "orderLabel");
+    TrHook(kOrderPreCheckRva, (void*)&detour_orderPreCheck, (void**)&orig_orderPreCheck, "orderPreCheck");
+    if (kLektorIntPushRva == 0) g_trWhy += " listAdd:no-row";
+    if (kTradeRangeSqRva == 0) g_trWhy += " tradeRange:no-row";
+    if (g_trHooks == 2 && kLektorIntPushRva != 0 && kTradeRangeSqRva != 0)
+        DebugLog("[POLICY] T-1167 player trade: 2 of 2 hooks installed (the order's label, the order pre-check; the engine's list add and trade range found) - another player's awake, not-hostile character offers 'Trade', which opens the TRADE window");
+    else ErrorLog("[POLICY] T-1167 player trade: " + PN((long long)g_trHooks) + " of 2 hooks installed (" + g_trWhy + ") - the Trade entry or its window may be missing");
+}
+std::string TradeTokens()
+{
+    return " trade[hooks,menuAsked,menuOffered,added,addFault,labels,labelFault,prechecks,window,refused,engine,offMain,diverts,divertNone,unsaid]="
+         + PN((long long)g_trHooks) + "," + PN(g_trMenuAsked) + "," + PN(g_trMenuOffered) + "," + PN(g_trAdded) + "," + PN(g_trAddFault)
+         + "," + PN(g_trLabels) + "," + PN(g_trLabelFault) + "," + PN(g_trPrechecks) + "," + PN(g_trWindow) + "," + PN(g_trRefused)
+         + "," + PN(g_trEngine) + "," + PN(g_trOffMain) + "," + PN(g_trDiverts) + "," + PN(g_trDivertNone) + "," + PN((long long)g_trUnsaid)
+         + " tradeFold[divertLoot,menuNoOwnSelected]=" + PN(g_trDivertLoot) + "," + PN(g_trMenuNoOwnSel)
+         + coop::TradeWinReportToken();
+}
+/* THE FALLBACK (site 3): an awake player's character reached the engine's window by another road - the same decision, as order 26 */
+int TradeDivertAwake(void* player, void* other)
+{
+    ::InterlockedIncrement64(&g_trDiverts);
+    TrFacts f;
+    TrFactsOf(other, false, &f);
+    if (f.other == 0 || f.awake == 0) { ::InterlockedIncrement64(&g_trDivertLoot); return kTrDivertLoot; }   /* not awake by the trade's own test: the loot window */
+    const unsigned long m = coop::StoreMainThreadId();
+    if (m == 0 || ::GetCurrentThreadId() != (DWORD)m) { ::InterlockedIncrement64(&g_trDivertNone); return swteamord::kClickEngine; }
+    const int d = TrDecideAndAct(player, other, swteamord::kLoot, "divert");
+    if (d == swteamord::kClickEngine) ::InterlockedIncrement64(&g_trDivertNone);   /* no window at all: the engine's is skipped */
+    return d;
+}
+/* the `team orders` lever's label of one order on `target`, through the label's hooked entry; "" unreadable. The engine's string is
+   made in a raw buffer and read; a word of 16 letters or more is left on the engine's heap (TEST-ONLY lever: a few bytes a call). */
+int TrLabelOfPod(int task, void* target, char* out, int cap)
+{
+    out[0] = 0;
+    if (kOrderLabelRva == 0 || g_base == 0) return 0;
+    unsigned char raw[32];
+    std::memset(raw, 0, sizeof raw);
+    *(unsigned long long*)(raw + kTrStrCap) = 15;
+    __try
+    {
+        ((OrderLabelFn)(g_base + (uintptr_t)kOrderLabelRva))(raw, task, target);
+        const unsigned long long n = *(const unsigned long long*)(raw + kTrStrSize), c = *(const unsigned long long*)(raw + kTrStrCap);
+        const char* p = c >= 16 ? *(const char* const*)raw : (const char*)raw;
+        if (!Plaus(p) || n >= (unsigned long long)cap) return 0;
+        std::memcpy(out, p, (size_t)n); out[n] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return -1; }
+}
+std::string TrLabelsOf(const int* t, int n, void* target)
+{
+    if (t == 0 || n <= 0 || target == 0) return "none";
+    std::string s;
+    for (int i = 0; i < n; ++i)
+    {
+        char w[96];
+        const int ok = TrLabelOfPod(t[i], target, w, (int)sizeof w);
+        if (i) s += ",";
+        s += PN((long long)t[i]) + ":" + (ok == 1 ? std::string(w) : ok < 0 ? std::string("FAULTED") : std::string("?"));
+    }
+    return s;
+}
+/* the lever's giveOrder: shift 0, the old orders cleared, as a plain right-click order (medical.cpp PlayerOrderGivePod). 1 given, -1 faulted */
+int TrGiveOrderPod(void* actor, void* target)
+{
+    __try
+    {
+        const unsigned long long a7 = *(const unsigned long long*)(g_base + (uintptr_t)kTrAddOrderArgRva);
+        ((TrAddOrderFn)(g_base + (uintptr_t)kTrAddOrderRva))(actor, 0, swteamord::kLoot, target, 0, 1, a7);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+}   // namespace
+
+/* ---- T-1406 (owner 1757, mock-up 1758): 'INVITE TO FACTION' IN THE RIGHT-CLICK MENU ON ANOTHER PLAYER'S CHARACTER ---------------
+   The PLAYERS tab's INVITE TO FACTION, offered on the character itself. Pure rules: src/common/teamorders.h (kInviteOrder,
+   InviteOffered, InviteFillAdds, InviteLabelled, InviteWord, InviteCaught). The sites (Steam 1.0.65 addresses; build/decomp_*.txt):
+     THE ENTRY: the menu's fill 0x7A7440 (hooked above, the same detour as Trade's) - the clicked character's list (sub 0) gets the
+       mod-chosen number kInviteOrder (0x1406, unused by the engine) through the engine's list add 0xEE210, only when Trade's own
+       checks passed (TradeMenuOffer: another player's, awake, not an enemy, one of this player's own characters selected), the
+       PLAYERS tab's own rule would show INVITE TO FACTION for that player (playerstab.cpp PlayersTabInvites: teamscreens.h ViewFor
+       .right == kActInvite - online, in no faction of players, this player not a mere member), and all three hooks are in.
+     THE WORD: the order's word 0x79A730 (Trade's detour, never a second hook) - 'Invite to faction' (17 letters, more than the 15
+       an inline string holds) set through the engine's own string assign 0x69CD0 (row StdString_assign).
+     THE CLICK: newPlayerTask 0x7F9AB0 (row PlayerInterface_newPlayerTask; the menu's click 0x7A7370 calls it with the button's number
+       and the menu's target hand +0xA8) - the number is caught and never passed on (it would reach the task table 0x281F90, which
+       adds an empty row): the hand's character's player is sent the tab's own invitation (PlayersTabInviteSend -> Request "invite",
+       as INVITE TO FACTION's press), then the menu is closed as 0x7F9AB0 closes it: showContextMenu(pi + 0x48, 0, 0), then
+       0x6E1D00(&ForgottenGUI) (row ForgottenGui_refreshSelected; decomp_6e1d00.txt / decomp_729040.txt: it hands the object whose
+       hand the GUI keeps at +0x2C0 to the panel at +0x10's refresh 0x729040 - that panel's item box emptied and refilled for it).
+   MAIN THREAD (the menu's build and its click). */
+namespace {
+unsigned long long kNewPlayerTaskRva = 0;  static AddrReg kNewPlayerTaskRva_reg("PlayerInterface_newPlayerTask", &kNewPlayerTaskRva);   /* Steam_1.0.65 0x7F9AB0, 1.0.68 0x7FA650 */
+unsigned long long kStrAssignRva = 0;      static AddrReg kStrAssignRva_reg("StdString_assign", &kStrAssignRva);                         /* Steam_1.0.65 0x69CD0, 1.0.68 0x69D10 */
+unsigned long long kGuiRefreshSelRva = 0;  static AddrReg kGuiRefreshSelRva_reg("ForgottenGui_refreshSelected", &kGuiRefreshSelRva);    /* Steam_1.0.65 0x6E1D00, 1.0.68 0x6E2050 */
+unsigned long long kInvGuiRva = 0;         static AddrReg kInvGuiRva_reg("ForgottenGui", &kInvGuiRva);                                   /* Steam_1.0.65 0x2132750: the GUI object itself */
+typedef void (*NewPlayerTaskFn)(void* pi, int task, void* hand, void* a4, void* a5, char a6);
+typedef void* (*StrAssignFn)(void* str, const char* text, unsigned long long n);
+typedef void (*GuiRefreshSelFn)(void* gui);
+NewPlayerTaskFn orig_newPlayerTask = 0;
+int g_invHooks = 0;                                    /* the click hook (the entry and the word ride the menu's and Trade's) */
+std::string g_invWhy = "not tried";
+const int kInvSayCap = 40;                             /* [INVITE] lines a game prints; the rest are counted */
+const size_t kInvHandType = 8;                         /* hand: its type (+8), 1 = a character (0x7F9AB0 reads the same field) */
+volatile LONG64 g_invAsked = 0, g_invOffered = 0, g_invNoTrade = 0, g_invNoRule = 0, g_invNoHooks = 0, g_invAdded = 0, g_invAddFault = 0;
+volatile LONG64 g_invLabels = 0, g_invLabelFault = 0, g_invClicks = 0, g_invSent = 0, g_invNotSent = 0, g_invNoTarget = 0, g_invCloseFault = 0;
+int g_invSaid = 0, g_invUnsaid = 0;
+
+void InvSay(const std::string& line)
+{
+    if (g_invSaid >= kInvSayCap) { ++g_invUnsaid; return; }
+    ++g_invSaid;
+    DebugLog(line + (g_invSaid == kInvSayCap ? std::string(" (the last such line this game prints; the rest are counted on the REPORT line)") : std::string()));
+}
+/* every piece the entry needs is in: the menu's build and fill hooks, Trade's word hook, the click hook, and the engine functions */
+bool InviteHooksAll()
+{
+    return orig_showMenu != 0 && orig_menuFill != 0 && orig_orderLabel != 0 && orig_newPlayerTask != 0 && g_invHooks == 1
+        && kLektorIntPushRva != 0 && kStrAssignRva != 0 && kGuiRefreshSelRva != 0 && kInvGuiRva != 0 && kShowMenuRva != 0 && kOrdHandCharRva != 0 && g_base != 0;
+}
+/* T-1406 (T2516 leg 4, log only): the engine's own isEnemy answer under the hook (the hook says 'no' only for a teammate). -1 unread.
+   Never faults. MAIN THREAD. */
+int InvEngineEnemyPod(void* who)
+{
+    void* pi = 0;
+    if (orig_piIsEnemy == 0 || IsPlayerFieldPod((void*)coop::LocalPlayerFaction(), &pi) != 1 || !Plaus(pi)) return -1;
+    __try { return orig_piIsEnemy(pi, who) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1406 (T2516 leg 4, log only): the menu check's own enemy answer (the hooked entry Trade's check reads, `menuEnemy`), the engine's
+   answer under it, the TEST peace switch, and the clicked character's faction against the factions `relate @slot:<n>` and
+   `relate @peer` name, with this player's standing towards the character's own faction (the same inserting accessor the engine's
+   enemy test reads). MAIN THREAD (the menu's build). */
+std::string InvEnemyFactionText(void* who, int slot, int menuEnemy)
+{
+    int type = -1; void* fv = 0;
+    TrTypeFacPod(who, &type, &fv);
+    ::Faction* f = Plaus(fv) ? (::Faction*)fv : 0;
+    ::Faction* me = coop::LocalPlayerFaction();
+    ::Faction* rs = slot >= 0 ? coop::RelationsFactionFromWire(coopslot::SlotWire(slot, std::string())) : 0;
+    ::Faction* rp = coop::PeerFaction();
+    float v = 0.0f; unsigned fl = 0u;
+    const int read = (f != 0 && Plaus(me)) ? coop::RelationsTheirSideRaw(me, f, &v, &fl) : 0;
+    char b[48];
+    _snprintf(b, sizeof b, "%.1f", (double)v);
+    b[sizeof b - 1] = 0;
+    return " enemy: menu=" + PN((long long)menuEnemy) + " engine=" + PN((long long)InvEngineEnemyPod(who)) + " peace=" + PN((long long)(coop::PeaceOnAnyThread() ? 1 : 0))
+         + "; faction: target='" + (f != 0 ? coop::RelationsWireSid(f) : std::string("(none)")) + "'"
+         + " relate@slot:" + PN((long long)slot) + "='" + (Plaus(rs) ? coop::RelationsWireSid(rs) : std::string("(none)")) + "' same=" + PN((long long)((f != 0 && f == rs) ? 1 : 0))
+         + " relate@peer='" + (Plaus(rp) ? coop::RelationsWireSid(rp) : std::string("(none)")) + "' same=" + PN((long long)((f != 0 && f == rp) ? 1 : 0))
+         + "; me->target faction=" + (read == 1 ? std::string(b) + " flags=" + PN((long long)fl) : std::string("unread"));
+}
+/* THE ENTRY: called by showMenu's detour for the clicked character (sub 0) - 1 = its list gets the entry (*slot = that player).
+   Another player's character only (an NPC or this player's own says nothing); one [INVITE] line per decision on one. */
+int InviteMenuOffer(void* who, LONG* slot)
+{
+    *slot = -1;
+    TrFacts f;
+    TrFactsOf(who, false, &f);
+    if (f.other == 0) return 0;
+    ::InterlockedIncrement64(&g_invAsked);
+    /* T-1406 (T2524 L4, owner 1758 a; F1214): the menu's own checks - awake, NEITHER side hostile as the PLAYERS tab shows it
+       (TrPeerHostile; the tab's rule below answers the same, teamscreens.h InviteStanceAllows), one of this player's own characters
+       selected */
+    const int hostile = TrPeerHostile(who, &f, swteamord::kHostileForInvite);
+    const int own = (f.awake != 0 && hostile == 0) ? TrOwnSelected() : 0;
+    const int menuChecks = (f.awake != 0 && hostile == 0 && own != 0) ? 1 : 0;
+    const bool hooks = InviteHooksAll();
+    const int tab = (menuChecks != 0 && hooks) ? coop::PlayersTabInvites(f.slot) : 0;
+    const bool offered = swteamord::InviteOffered(menuChecks != 0, tab != 0, hooks);
+    if (offered) { ::InterlockedIncrement64(&g_invOffered); *slot = (LONG)f.slot; }
+    else ::InterlockedIncrement64(menuChecks == 0 ? &g_invNoTrade : !hooks ? &g_invNoHooks : &g_invNoRule);
+    const int e = f.engine;   /* the hooked isEnemy entry's answer (log only) */
+    std::string why;
+    if (offered) why = "'Invite to faction' offered";
+    else if (menuChecks == 0) why = "not offered - the menu's checks failed (awake=" + PN((long long)f.awake) + " hostile=" + PN((long long)hostile) + "; else none of this player's own characters selected)";
+    else if (!hooks) why = "not offered - " + PN((long long)g_invHooks) + " of 1 click hook in (" + g_invWhy + ") or a menu / word hook missing";
+    else why = "not offered - the PLAYERS tab's rule shows no INVITE TO FACTION for that player (in a faction of players, offline, or this player a member)";
+    InvSay("[INVITE] right-click on slot " + PN((long long)f.slot) + "'s character uid=" + PN((long long)f.uid) + ": " + why + " (teammate=" + PN((long long)f.teammate) + " trade=" + PN((long long)(g_menuTradeAdd != 0 ? 1 : 0)) + ";"
+           + TrStanceText(f) + ";" + InvEnemyFactionText(who, f.slot, e) + ")");
+    return offered ? 1 : 0;
+}
+/* the list (the fill's lektor<int>): the number added through the engine's own list add when it lacks it; the lever's 'shown'
+   capture updated. 1 added, 0 not needed, -1 no row or a fault. Never faults. */
+int InviteFillPod(void* list)
+{
+    if (kLektorIntPushRva == 0 || g_base == 0) return -1;
+    __try
+    {
+        int n = (int)*(unsigned*)((char*)list + kListCount);
+        int* d = *(int**)((char*)list + kListData);
+        if (n < 0 || n > 4096 || (n > 0 && !Plaus(d))) return -1;
+        if (!swteamord::InviteFillAdds(true, d, n)) return 0;
+        ((LektorIntPushFn)(g_base + (uintptr_t)kLektorIntPushRva))(list, swteamord::kInviteOrder);
+        n = (int)*(unsigned*)((char*)list + kListCount);   /* read again: the add may have moved the array */
+        d = *(int**)((char*)list + kListData);
+        if (g_capOn != 0 && n > 0 && n <= 4096 && Plaus(d)) { g_capShownN = 0; for (int i = 0; i < n && i < 64; ++i) g_capShown[g_capShownN++] = d[i]; }
+        ::InterlockedIncrement64(&g_invAdded);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ::InterlockedIncrement64(&g_invAddFault); return -1; }
+}
+/* THE WORD: 'Invite to faction' set through the engine's own string assign (it grows the string with the engine's allocator) */
+int InviteLabelPod(void* out)
+{
+    if (kStrAssignRva == 0 || g_base == 0) { ::InterlockedIncrement64(&g_invLabelFault); return 0; }
+    const char* w = swteamord::InviteWord();
+    const unsigned long long n = (unsigned long long)std::strlen(w);
+    __try
+    {
+        ((StrAssignFn)(g_base + (uintptr_t)kStrAssignRva))(out, w, n);
+        ::InterlockedIncrement64(&g_invLabels);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ::InterlockedIncrement64(&g_invLabelFault); return -1; }
+}
+/* the click's target: the character the menu's hand names (hand::getCharacter), 0 when it is not a character or does not read */
+void* InvHandCharPod(void* hand)
+{
+    if (hand == 0 || kOrdHandCharRva == 0 || g_base == 0) return 0;
+    __try
+    {
+        if (*(const int*)((const char*)hand + kInvHandType) != 1) return 0;
+        typedef void* (*HandCharFn)(const void*);
+        void* who = ((HandCharFn)(g_base + (uintptr_t)kOrdHandCharRva))(hand);
+        return Plaus(who) ? who : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the engine's own closing steps of 0x7F9AB0: the menu closed (showContextMenu(pi + 0x48, 0, 0)), then 0x6E1D00(&ForgottenGUI) */
+int InvClosePod(void* pi)
+{
+    if (pi == 0 || kShowMenuRva == 0 || kGuiRefreshSelRva == 0 || kInvGuiRva == 0 || g_base == 0) return 0;
+    __try
+    {
+        ((ShowMenuFn)(g_base + (uintptr_t)kShowMenuRva))((char*)pi + kPiMenu, 0, 0);
+        ((GuiRefreshSelFn)(g_base + (uintptr_t)kGuiRefreshSelRva))((void*)(g_base + (uintptr_t)kInvGuiRva));
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* THE CLICK */
+void InviteClick(void* pi, void* hand)
+{
+    ::InterlockedIncrement64(&g_invClicks);
+    void* who = InvHandCharPod(hand);
+    TrFacts f;
+    TrFactsOf(who, false, &f);
+    const int slot = f.other != 0 ? f.slot : -1;   /* review fold: only the slot the click itself names - never an earlier menu's */
+    std::string r;
+    if (slot < 0) { ::InterlockedIncrement64(&g_invNoTarget); r = "not sent: the menu's target is not another player's character"; }
+    else if (TrPeerHostile(who, &f, swteamord::kHostileForInvite) != 0)   /* T-1406 (T2524 L4): the menu's own answer, again at the click */
+    { ::InterlockedIncrement64(&g_invNotSent); r = "not sent: a side between this player and slot " + PN((long long)slot) + " is hostile (" + TrStanceText(f) + ")"; }
+    else
+    {
+        r = coop::PlayersTabInviteSend(slot);
+        ::InterlockedIncrement64(r.compare(0, 3, "ok ") == 0 ? &g_invSent : &g_invNotSent);
+    }
+    const int closed = InvClosePod(pi);
+    if (closed != 1) ::InterlockedIncrement64(&g_invCloseFault);
+    InvSay("[INVITE] right-click 'Invite to faction' clicked: slot " + PN((long long)slot)
+           + (slot >= 0 ? " (the menu's target uid=" + PN((long long)f.uid) + ")" : std::string(" (the menu's target did not read as another player's character)"))
+           + " -> " + r + (closed == 1 ? std::string(" (menu closed)") : std::string(" (the menu's closing steps did not run: ") + (closed < 0 ? "FAULTED)" : "a row missing)")));
+}
+void detour_newPlayerTask(void* pi, int task, void* hand, void* a4, void* a5, char a6)
+{
+    if (!swteamord::InviteCaught(task)) { orig_newPlayerTask(pi, task, hand, a4, a5, a6); return; }
+    InviteClick(pi, hand);   /* never passed on: the task table would add an empty row for the number */
+}
+void InstallInviteHooks()
+{
+    g_invWhy.clear();
+    if (kNewPlayerTaskRva == 0) g_invWhy += " newPlayerTask:no-row";
+    else if (coop::AddHook((void*)(g_base + (uintptr_t)kNewPlayerTaskRva), (void*)&detour_newPlayerTask, (void**)&orig_newPlayerTask) != coop::SUCCESS) g_invWhy += " newPlayerTask:hook-failed";
+    else ++g_invHooks;
+    if (kStrAssignRva == 0) g_invWhy += " stringAssign:no-row";
+    if (kGuiRefreshSelRva == 0) g_invWhy += " guiRefresh:no-row";
+    if (kInvGuiRva == 0) g_invWhy += " forgottenGui:no-row";
+    if (InviteHooksAll())
+        DebugLog("[POLICY] T-1406 right-click invite: the click hook installed (newPlayerTask); the menu's build / fill and the order's word hooks in; the engine's list add, string assign and closing step found - another player's character the PLAYERS tab could invite offers 'Invite to faction'");
+    else ErrorLog("[POLICY] T-1406 right-click invite: NOT offered - " + PN((long long)g_invHooks) + " of 1 click hook (" + g_invWhy + "); menu build " + PN((long long)(orig_showMenu != 0 ? 1 : 0))
+                  + ", fill " + PN((long long)(orig_menuFill != 0 ? 1 : 0)) + ", word " + PN((long long)(orig_orderLabel != 0 ? 1 : 0)));
+}
+std::string InviteTokens()
+{
+    return " invite[hooks,all,asked,offered,noTrade,noRule,noHooks,added,addFault,labels,labelFault,clicks,sent,notSent,noTarget,closeFault,unsaid]="
+         + PN((long long)g_invHooks) + "," + PN((long long)(InviteHooksAll() ? 1 : 0)) + "," + PN(g_invAsked) + "," + PN(g_invOffered) + "," + PN(g_invNoTrade)
+         + "," + PN(g_invNoRule) + "," + PN(g_invNoHooks) + "," + PN(g_invAdded) + "," + PN(g_invAddFault) + "," + PN(g_invLabels) + "," + PN(g_invLabelFault)
+         + "," + PN(g_invClicks) + "," + PN(g_invSent) + "," + PN(g_invNotSent) + "," + PN(g_invNoTarget) + "," + PN(g_invCloseFault) + "," + PN((long long)g_invUnsaid);
+}
+}   // namespace
+
+/* TEST-ONLY lever `tradetest order <targetUid> [actorUid] | status | press accept|cancel` (command_channel.cpp). order: the actor
+   (actorUid, else the first selected character, else this game's first player character) is given order 26 on the target through
+   the engine's own giveOrder 0x5D1640 - shift 0, the old orders cleared, as a plain right-click order - so the pre-check hook
+   decides as for a click. MAIN THREAD. (This part of the file is already inside namespace coop.) */
+std::string PolicyTradeTest(const std::string& args)
+{
+    std::istringstream is(args);
+    std::string sub; is >> sub;
+    if (sub == "status") return TradeWinStatus();
+    if (sub == "press") { std::string w; is >> w; return TradeWinPress(w); }
+    if (sub == "offer")
+    {   /* T-1167 piece 2: offer <itemKey|name> <n> - the name may hold spaces; the last word is n */
+        std::string rest; std::getline(is, rest);
+        while (!rest.empty() && (rest[rest.size() - 1] == ' ' || rest[rest.size() - 1] == '\r' || rest[rest.size() - 1] == '\n' || rest[rest.size() - 1] == '\t')) rest.erase(rest.size() - 1);
+        size_t b = 0; while (b < rest.size() && rest[b] == ' ') ++b;
+        rest = rest.substr(b);
+        const size_t sp = rest.rfind(' ');
+        if (sp == std::string::npos) return "error tradetest offer: usage offer <itemKey|name> <n>";
+        std::string item = rest.substr(0, sp);
+        while (!item.empty() && item[item.size() - 1] == ' ') item.erase(item.size() - 1);
+        return TradeWinOfferLever(item, rest.substr(sp + 1));
+    }
+    if (sub == "cats") { std::string t; is >> t; return TradeWinCatsLever(t); }
+    if (sub == "drop") { std::string rest; std::getline(is, rest); return TradeWinDropLever(rest); }   /* T-1167 piece 3 build 4 */
+    if (sub != "order") return "error tradetest: order <targetUid> [actorUid] | status | press accept|cancel | offer <itemKey|name> <n> | cats <n> | drop [x y]";
+    unsigned int targetUid = 0, actorUid = 0;
+    is >> targetUid;
+    if (!(is >> actorUid)) actorUid = 0;
+    if (EngineWritesBlocked()) return "error tradetest order: no world loaded";
+    if (kTrAddOrderRva == 0 || kTrAddOrderArgRva == 0 || g_base == 0) return "error tradetest order: giveOrder is not in the address table (AddOrder / AddOrderArgGlobal)";
+    if (g_trHooks != 2) return "error tradetest order: " + PN((long long)g_trHooks) + " of 2 trade hooks installed (" + g_trWhy + ")";
+    void* target = targetUid != 0 ? (void*)FindSpawned(targetUid) : 0;
+    if (target == 0) return "error tradetest order: no loaded character uid " + PN((long long)targetUid);
+    {   /* T-1167 fold (review LOW): an NPC (or this player's own) target is refused - the lever never gives a real loot order there */
+        TrFacts tf;
+        TrFactsOf(target, false, &tf);
+        if (tf.other == 0) return "error tradetest order: uid " + PN((long long)targetUid) + " is not another player's character - no order given";
+    }
+    void* actor = actorUid != 0 ? (void*)FindSpawned(actorUid) : FirstSelectedCharacter();
+    if (actor == 0) actor = (void*)SpawnFirstPlayerCharacter();
+    if (actor == 0) return "error tradetest order: no character of this game to give the order";
+    const LONG64 pre0 = g_trPrechecks;
+    g_trLast = -1;
+    const int g = TrGiveOrderPod(actor, target);
+    const std::string r = "tradetest order actor=" + PN((long long)FindSpawnedUid(actor)) + " target=" + PN((long long)targetUid)
+                        + " prechecks+" + PN((long long)(g_trPrechecks - pre0)) + " last=" + (g_trLast < 0 ? std::string("none") : std::string(swteamord::ClickWord(g_trLast)))
+                        + " windowOpen=" + (TradeWinIsOpen() ? "1" : "0");
+    DebugLog("[TRADE] TEST-ONLY " + r + (g == 1 ? std::string() : std::string(" (giveOrder FAULTED)")));
+    return (g == 1 ? "ok " : "error ") + r;
+}
+
+/* T-1167 piece 2: the other player's game asked (ASKED): may this game open the window for the asker's character `askerUid` (player
+   `fromSlot`) and this player's own character `myUid`? The same facts as the click: the asker's character loaded here, of that
+   player, awake and no enemy by this game's isEnemy; this player's own character loaded, its own and awake; the two in the engine's
+   trade range on the ground. MAIN THREAD (tradewin.cpp's tick). */
+int PolicyTradeAsked(unsigned askerUid, unsigned myUid, int fromSlot, void** mine, void** theirs)
+{
+    *mine = 0; *theirs = 0;
+    void* t = askerUid != 0 ? (void*)FindSpawned(askerUid) : 0;
+    void* m = myUid != 0 ? (void*)FindSpawned(myUid) : 0;
+    if (t == 0) return tradew::kAnsGone;                                       /* the asker's character is not loaded here */
+    if (m == 0 || TrActorOwn(m) == 0) return tradew::kAnsNotPlayers;           /* the named character is not this player's own */
+    TrFacts f;
+    TrFactsOf(t, true, &f);
+    if (f.other == 0 || f.slot != fromSlot || f.enemy != 0) return tradew::kAnsNotPlayers;   /* not that player's, or an enemy here (piece 4: its own word) */
+    int ko = 1, dead = 1;
+    TrKoDeadPod(m, &ko, &dead);
+    if (f.awake == 0 || ko != 0 || dead != 0 || coop::IsDownedCharacter((::Character*)m)) return tradew::kAnsGone;   /* either side is not awake */
+    int posRead = 0;
+    if (TrInRange(m, t, &posRead) == 0) return tradew::kAnsRange;
+    *mine = m; *theirs = t;
+    return tradew::kAnsOpen;
+}
 
 long long PolicyGroupTownHits(const char** why)
 {
@@ -2823,6 +3595,8 @@ void InstallPolicy()
     /* P7c / review-p6u MEDIUM-3: the P029 walk's bound, read from our own PE header rather than guessed at. */
     g_imageSize = PolicySizeOfImagePod(g_base);
     InstallTeamOrders();   /* T-546 step 7 */
+    InstallTradeHooks();   /* T-1167 piece 1: the order's label and the order pre-check (the entry rides the menu fill above) */
+    InstallInviteHooks();  /* T-1406: the right-click 'Invite to faction' entry's click (its entry and word ride the two above) */
     coop::HookStatus h = coop::AddHook((void*)(g_base + kOwnedByAPlayerFactionRva), (void*)&detour_OwnedByAPlayerFaction, (void**)&orig_OwnedByAPlayerFaction);
     if (h != coop::SUCCESS)
         ErrorLog("[POLICY] AddHook OwnedByAPlayerFaction 0x546340 FAILED - the `shared` base policy cannot make the other player's STORAGE BOXES behave as ours, so a LOCKED peer box will still refuse to open (an unlocked one is lootable either way, which is the engine's own rule). Doors, beds, benches and turrets are the engine's stranger behaviour either way (doors1)");
@@ -2904,6 +3678,15 @@ void InstallPolicy()
              + (g_haulPoolHooked == 0 ? "off (the filter is not hooked) - a teammate's buildings stay refused for those jobs"
                 : kBedCostRetRva == 0 ? "off (no BedCostMayUseRet row) - a teammate's buildings stay refused for those jobs"
                                       : "on - this player's characters may use a teammate's buildings for every job but a bed's cost; NPCs', copies' and other factions' questions as before"));
+    /* T-1381 fix attempt 1: the shopping goal's random-building fallback refuses another player's town */
+    if (kShopFallbackRva == 0) g_shopFbWhy = "no address row";
+    else if (coop::AddHook((void*)(g_base + kShopFallbackRva), (void*)&detour_ShopFallback, (void**)&orig_ShopFallback) != coop::SUCCESS)
+        g_shopFbWhy = "AddHook 0x9FB2E0 FAILED";
+    else g_shopFbWhy = "hooked";
+    DebugLog(std::string("[POLICY] T-1381 shopping fallback (1.0.65 0x9FB2E0): ") + g_shopFbWhy
+             + (std::strcmp(g_shopFbWhy, "hooked") == 0
+                ? " - an NPC shopping in another player's town gets no random building there (as single player for a player's town); NPC towns as before"
+                : " - an NPC shopping in another player's town may still pick a random building there, that player's house too"));
     /* T-1250: the eating search's building owner test - this player's hungry characters eat from a teammate's food stores */
     if (kFoodSearchTestRva == 0) g_eatWhy = "no address row";
     else EatTestPatch(g_base + (uintptr_t)kFoodSearchTestRva);
@@ -3880,6 +4663,7 @@ std::string OrdersOn(void* pi, void* ch, std::string* shownOut, std::string* wit
          + " menu=" + (!m ? std::string("FAULTED") : g_capBuilt ? std::string("built sub=") + PN((long long)g_capSub) + " cage=" + PN((long long)g_capCage)
                                                                + " engineList=[" + raw + "] shown=[" + shown + "] withheldShown=[" + notOwn + "]"
                                                                : std::string("not built (no selected character?)"))
+         + (g_capBuilt != 0 ? " labels=[" + TrLabelsOf(g_capShown, g_capShownN, ch) + "]" : std::string())   /* T-1167: the word each shown entry gets */
          + " hover=" + (h == 1 ? std::string("ok") : h == 2 ? std::string("skipped (picking a target)") : std::string("FAULTED"))
          + " teammateClicks+" + PN((long long)(g_ordClicks - clicks0)) + " sneakForced+" + PN((long long)(g_ordSneakForced - sneak0));
 }
@@ -3908,6 +4692,96 @@ std::string PolicyTeamOrders(int slot)
          + " theirShown=" + mateShown + " theirWithheld=" + mateWithheld;
 }
 
+/* T-1406 TEST-ONLY lever `team invitemenu <slot>|npc [click]`: the engine's own interaction menu built on the first loaded character of
+   player <slot>'s faction on this game (npc: the loaded character of no player's faction nearest this game's first character) (ContextMenu::showContextMenu(pi + 0x48, 1, it), the same build as `team orders`), the list it
+   was shown and whether it holds 'Invite to faction' (the number kInviteOrder) with the word it reads; with `click`, while the
+   entry is shown, the menu's own click road is taken as 0x7A7370 takes it - newPlayerTask through its hooked entry with the entry's
+   number and the menu's target hand (+0xA8 of the menu object the fill was handed) - so the click hook sends the invitation and
+   closes the menu; otherwise the menu is closed as newPlayerTask closes it. MAIN THREAD. */
+namespace {
+int InvLeverClickPod(void* pi, void* menu)
+{
+    __try
+    {
+        ((NewPlayerTaskFn)(g_base + (uintptr_t)kNewPlayerTaskRva))(pi, swteamord::kInviteOrder, (char*)menu + 0xA8, 0, 0, 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int InvLeverClosePod(void* pi)
+{
+    __try { ((ShowMenuFn)(g_base + (uintptr_t)kShowMenuRva))((char*)pi + kPiMenu, 0, 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { coop::TalkCursorFaultReset(); return -1; }
+}
+/* the loaded character nearest `from` whose faction is no player's (not this game's, no stand-in or record of another player) */
+void* InvNearestNpc(void* from)
+{
+    float p[3];
+    if (from == 0 || TrPosPod(from, p) != 1 || coop::GameWorldPtr() == 0) return 0;
+    void* const mine = (void*)LocalPlayerFaction();
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() > 20000) return 0;
+    void* best = 0; float bestD = 0.0f;
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+    {
+        void* ch = (void*)*it;
+        if (!Plaus(ch) || ch == from) continue;
+        void* f = FactionOfPod(ch);
+        if (f == 0 || f == mine || StandInSlotAnyPod(f) >= 0) continue;
+        float q[3];
+        if (TrPosPod(ch, q) != 1) continue;
+        const float d = (q[0] - p[0]) * (q[0] - p[0]) + (q[2] - p[2]) * (q[2] - p[2]);
+        if (best == 0 || d < bestD) { best = ch; bestD = d; }
+    }
+    return best;
+}
+int InvLeverOpenPod(void* pi, void* ch)
+{
+    __try { ((ShowMenuFn)(g_base + (uintptr_t)kShowMenuRva))((char*)pi + kPiMenu, 1, ch); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { coop::TalkCursorFaultReset(); return -1; }   /* T-737: the scope's destructor did not run */
+}
+}
+std::string PolicyInviteMenuTest(int slot, bool click)
+{
+    const std::string who = slot < 0 ? std::string("npc") : "s" + PN((long long)slot);   /* slot -1: the nearest loaded NPC */
+    if (EngineWritesBlocked()) return "error team invitemenu: no world loaded";
+    if (kShowMenuRva == 0 || kNewPlayerTaskRva == 0 || g_base == 0) return "error team invitemenu: an address row is missing";
+    if (slot >= 0 && slot == MySlotForWire()) return "error team invitemenu: " + who + " is this game's own player";
+    void* pi = PlayerInterfacePod((void*)LocalPlayerFaction());
+    if (!Plaus(pi)) return "error team invitemenu: this game's player faction has no player interface";
+    void* ch = 0;
+    if (slot < 0) ch = InvNearestNpc(FirstCharacterOf((void*)LocalPlayerFaction()));
+    else
+    {
+        ::Faction* theirs = StandInForSlot(slot);
+        if (theirs == 0) theirs = StandInRecordFaction(slot);
+        ch = theirs != 0 ? FirstCharacterOf((void*)theirs) : 0;
+    }
+    if (ch == 0) return slot < 0 ? std::string("error team invitemenu: no loaded NPC near this game's first character") : "error team invitemenu: no loaded character of " + who + "'s faction on this game";
+    const unsigned uid = FindSpawnedUid(ch);
+    const LONG64 sent0 = g_invSent, notSent0 = g_invNotSent, clicks0 = g_invClicks;
+    g_capOn = 1; g_capBuilt = 0; g_capRawN = 0; g_capShownN = 0; g_capSub = 0; g_capCage = 0; g_capMenu = 0;
+    const int opened = InvLeverOpenPod(pi, ch);
+    g_capOn = 0;
+    void* const menu = g_capMenu;
+    const bool shown = g_capBuilt != 0 && swteamord::HasOrder(g_capShown, g_capShownN, swteamord::kInviteOrder);
+    const int inv = swteamord::kInviteOrder;
+    const std::string word = shown ? TrLabelsOf(&inv, 1, ch) : std::string("none");
+    const std::string list = g_capBuilt != 0 ? swteamord::ListText(g_capShown, g_capShownN) : std::string("not built");
+    int clicked = 0;
+    if (opened == 1 && click && shown && menu != 0) clicked = InvLeverClickPod(pi, menu);   /* the click hook closes the menu */
+    const int closed = clicked == 1 ? 1 : InvLeverClosePod(pi);
+    const std::string r = "team invitemenu " + who + " target uid=" + PN((long long)uid) + " menu=" + (opened == 1 ? std::string("built") : std::string("FAULTED"))
+                        + " shown=[" + list + "] invite=" + (shown ? "1" : "0") + " word=" + word
+                        + (click ? std::string(" click=") + (clicked == 1 ? "taken" : clicked < 0 ? "FAULTED" : shown ? "no menu object" : "no entry")
+                                   + " clicks+" + PN((long long)(g_invClicks - clicks0)) + " sent+" + PN((long long)(g_invSent - sent0)) + " notSent+" + PN((long long)(g_invNotSent - notSent0))
+                                 : std::string())
+                        + " closed=" + (closed == 1 ? "1" : "FAULTED")
+                        + (clicked == 1 ? std::string(" (TEST-ONLY: unlike the real click 0x7A7370, the menu is not closed a second time and its three mouse-state values are not cleared after newPlayerTask)") : std::string());
+    DebugLog("[INVITE] TEST-ONLY " + r);
+    return (opened == 1 && closed == 1 && clicked >= 0 ? "ok " : "error ") + r;
+}
+
 std::string PolicyReport()
 {
     /* ` basepolicy=` itself is printed by store.cpp's ReportStore, beside the link state it belongs with. */
@@ -3921,6 +4795,8 @@ std::string PolicyReport()
          + " teamWindow[opened,faults,offMain,notMate,mates]=" + PN(g_teamLeftOpen) + "," + PN(g_teamLeftFault) + "," + PN(g_teamLeftOffMain)
          + "," + PN(g_teamLeftNotMate) + "," + PN((long long)g_kitMatesN)
          + TeamOrdersTokens()
+         + TradeTokens()   /* T-1167: the player trade's entry, label, click and window */
+         + InviteTokens()  /* T-1406: the right-click 'Invite to faction' entry */
          + " nearTownTeammateHits=" + (g_nearCells != 0 ? PN((long long)g_nearCells->hits) : std::string("n/a")) + " nearTownCellsHeld=" + PN((long long)g_nearHeld)
          + " foliageTown[patched,why,cells,hits,drops]=" + PN(g_foliageCells != 0 ? 1 : 0) + "," + g_foliageWhy + "," + PN((long long)g_foliageHeld)
          + "," + PN(g_foliageCells != 0 ? (long long)g_foliageCells->hits : 0) + "," + PN((long long)g_foliageDrops)
@@ -3959,13 +4835,15 @@ std::string PolicyReport()
          + " kitSteal[hook,team,friend,friendRefused,stranger,offMain]=" + PN((long long)g_stealHook) + "," + PN((long long)g_stealJudged[0]) + "," + PN((long long)g_stealJudged[1])
          + "," + PN((long long)g_stealJudged[2]) + "," + PN((long long)g_stealJudged[3]) + "," + PN((long long)g_stealOffMain)
          + " kitStealWorldNode=" + PN((long long)g_stealWorldNode)
-         + " kitTrade[hook,team,friend,friendRefused,stranger,madeNever,noWindow]=" + PN((long long)g_tradeHook) + "," + PN((long long)g_tradeJudged[0]) + "," + PN((long long)g_tradeJudged[1])
-         + "," + PN((long long)g_tradeJudged[2]) + "," + PN((long long)g_tradeJudged[3]) + "," + PN((long long)g_tradeNever) + "," + PN((long long)g_tradeNoWindow)
+         + " kitTrade[hook,team,friend,friendRefused,stranger,madeNever,noWindow,tradeDivert]=" + PN((long long)g_tradeHook) + "," + PN((long long)g_tradeJudged[0]) + "," + PN((long long)g_tradeJudged[1])
+         + "," + PN((long long)g_tradeJudged[2]) + "," + PN((long long)g_tradeJudged[3]) + "," + PN((long long)g_tradeNever) + "," + PN((long long)g_tradeNoWindow) + "," + PN((long long)g_tradeDivert)
          + " ownOnlyOpenRefused=" + PN((long long)g_ownOnlyOpenRefused)   /* T-1199 fold 1 */
          + " kitHover[why,hits]=" + std::string(g_hoverWhy) + "," + PN(g_hoverCells != 0 ? (long long)g_hoverCells->hits : -1)
          + " kitTradeOwner[why,hits]=" + std::string(g_tradeWhy) + "," + PN(g_tradeCells != 0 ? (long long)g_tradeCells->hits : -1)
          + " kitNpc[patched,sites,mates,cellDrops]=" + PN((long long)g_npcPatched) + "," + PN((long long)swnpc::kSites) + "," + PN((long long)g_npcHeld)
          + "," + PN((long long)g_npcDrops) + " kitNpcHits[site1..site26]=" + NpcHitsText()
+         + " shopFallbackRefused=" + PN((long long)g_shopFbRefused) + " shopFallback[hooked,asked]="
+         + PN(std::strcmp(g_shopFbWhy, "hooked") == 0 ? 1 : 0) + "," + PN((long long)g_shopFbAsked)   /* T-1381 fix attempt 1 */
          );
 }
 

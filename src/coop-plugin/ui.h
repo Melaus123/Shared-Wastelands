@@ -53,6 +53,11 @@ int UiModsWarnHide();
 // ui1 (connection trouble step 2): the small non-blocking notice - on 1 shows `text`, on 0 takes it down. 1 done, 0 refused,
 // -1 a MyGUI throw, -2 a fault. MAIN THREAD only.
 int UiQuietNotice(const char* text, int on);
+// T-1390: the loading screen's progress panel above Kenshi's LOADING box - on 1 shows `text` over a bar (fill 0-100, or
+// coopui::kLoadFillSliding / kLoadFillHidden), on 0 takes it down. 1 done, 0 refused, -1 a MyGUI throw, -2 a fault. MAIN THREAD only.
+int UiLoadPanel(const char* text, int fill, int on);
+// T-1390: MAIN THREAD, each held frame - moves the sliding piece (the drawing only). 1 moved, 0 nothing to move, -1 / -2 as above.
+int UiLoadPanelTick();
 // T-1279 fold: MAIN THREAD - a held title load refused (the world server's link down, no dial pending): the existing CAN'T JOIN
 // box (joining = 1) or CAN'T HOST box (0), as the one press's failure when that press started the load.
 void UiPreloadRefusedBox(int joining);
@@ -89,6 +94,7 @@ int  UiHostingNow(std::string* world);
 // MAIN THREAD: the log file of the world server this game started in this launch (it may have ended since); "" when this game
 // started none. The bug report packs it when it is there (bugreport.cpp).
 std::string UiServerLogPath();
+std::string UiWalkSlowLever(const std::string& args);   /* T-1403 TEST ONLY: walkslow - the next world server started gets --walk-slow-sec / --walk-hold-at */
 // MAIN THREAD: CAN'T JOIN drawn in a RUNNING WORLD (the MODS DON'T MATCH notice's recipe, one OK) for a Steam join request that came
 // while in a world. 1 shown, 0 refused, -1 a MyGUI throw, -2 a fault. The tick closes it on its OK or when the world goes.
 int  UiJoinRefuseShow(const char* text);
@@ -99,6 +105,10 @@ bool UiHostAddrCommand(const std::string& args);
 // T-461: the first widget at or under `root` whose name ends in "_<suffix>" after Kenshi's per-instance layout prefix (the match
 // the title column uses), or 0. MAIN THREAD, inside the caller's SEH frame.
 MyGUI::Widget* UiFindLayoutSuffix(MyGUI::Widget* root, const char* suffix);
+// T-1393 (G after the map): true when the player is typing - the widget holding MyGUI's key focus is a shown, enabled, writable
+// text box (a MyGUI EditBox, by its type; src/common/typingfocus.h). Not MyGUI's isFocusKey(), which is true for ANY focus widget
+// (the world map keeps it after a click). The guard of the game keys we add (ping.cpp G, tags.cpp Insert). MAIN THREAD.
+bool UiPlayerTyping();
 // RESET POPULATION in a multiplayer world: the Level Editor's button greyed with its hover note. UiEditorPanelShown is called after
 // the engine's LevelEditor::setVisible (1 shown, 0 hidden), UiEditorResetTick each in-world frame, UiEditorForgetWorld at world
 // teardown. UiEditorResetCount(k): k 0 greyed, 1 lit again, 2 button not found, 3 notes shown, 4 faults. MAIN THREAD.

@@ -41,7 +41,8 @@
 namespace rulesfile {
 
 const unsigned int kMsgRulesChanged = 92u;   /* down only: {u32 count, [str key, str value]...}, an empty value = the row was removed */
-const unsigned int kProtocol = 153u;          /* the world-server protocol that carries RULES_CHANGED */
+const unsigned int kProtocol = 170u;          /* the world-server protocol that carries RULES_CHANGED */
+
 
 const char* const kFile = "rules.txt";
 const char* const kOldFile = "options.txt";
@@ -57,7 +58,7 @@ const int kShownLines = 3;                    /* the chat lines one change shows
 
 enum Kind { kNumber = 0, kTick = 1, kPick = 2, kAmount = 3, kWhole = 4, kOnOff = 5, kRace = 6, kHidden = 7 };
 struct Rule { const char* key; const char* label; int kind; const char* note; };
-const int kRuleCount = 25;
+const int kRuleCount = 27;   /* T-1392: + MENUS AND BUILDING */
 /* The GAME OPTIONS rows, in the screen's order (panelstatus.h OptDefs - the offline suite checks the two agree), each with its note.
    Decision 1360 (2026-11-02): EXTRA RECRUITS IN BARS, BASE ACCESS, RESURRECTION FEE and FEE GROWTH say what their GAME OPTIONS hover
    notes say (panelstatus.h OptHoverText). A note is written only into a new file or with a rule the file lacks (WriteBack): an
@@ -83,18 +84,20 @@ inline const Rule* Rules()
         { "recruitmult", "EXTRA RECRUITS IN BARS", kPick, "how many times the usual recruits bars offer - Auto is one set per player, up to 4. Auto, 1, 2, 3 or 4." },
         { "basepolicy", "BASE ACCESS", kPick, "who may open a player's chests - teammates always share the whole base. Everyone, Owner only or Locked." },
         { "timemode", "GAME SPEED CONTROL", kPick, "who sets the game speed. Admin only, Slowest wins, Everyone agrees or Normal speed only." },
+        { "menupause", "MENUS AND BUILDING", kPick, "with Slowest wins, whether a player's open menu or build mode pauses everyone. Keep running or Pause everyone." },   /* T-1392 (the approved page) */
         { "profilecap", "PROFILES PER PLAYER", kWhole, "how many profiles one player may have. 1 to 16." },
         { "resurrect", "RESURRECTION", kOnOff, "fallen characters can be brought back. on or off." },
         { "resurrectfee", "RESURRECTION FEE", kAmount, "the price of bringing one back, in cats - the first is free, then it rises with each one currently reanimated. 0 or more." },
         { "resurrectgrowth", "FEE GROWTH", kPick, "how the price rises with each one currently reanimated. Steady or Steep." },
         { "spimport", "IMPORT FROM SINGLE PLAYER", kPick, "who may start a profile from a single-player save. Allowed for everyone, Owner and admins only or Not allowed." },
         { "spimportmoney", "IMPORT INCLUDES MONEY", kPick, "an imported profile keeps its money. Yes or No." },
-        { "spimportresearch", "IMPORT INCLUDES RESEARCH", kPick, "an imported profile keeps its research. Yes or No." } };
+        { "spimportresearch", "IMPORT INCLUDES RESEARCH", kPick, "an imported profile keeps its research. Yes or No." },
+        { "modcheck", "DIFFERENT MODS", kPick, "what happens when a joining player's mods are not exactly the world's - Accepted: they join with a warning; Rejected: they are turned away. Accepted or Rejected." } };
     return r;
 }
 /* The words a pick row shows for each value the world server stores (panelstatus.h OptChoices). */
 struct Word { const char* key; const char* wire; const char* word; };
-const int kWordCount = 28;
+const int kWordCount = 32;   /* T-1392: + MENUS AND BUILDING's two */
 inline const Word* Words()
 {
     static const Word w[kWordCount] = {
@@ -105,11 +108,13 @@ inline const Word* Words()
         { "basepolicy", "shared", "Everyone" }, { "basepolicy", "owner", "Owner only" }, { "basepolicy", "locked", "Locked" },
         { "timemode", "fixed", "Admin only" }, { "timemode", "consensus", "Slowest wins" },
         { "timemode", "vote", "Everyone agrees" }, { "timemode", "locked", "Normal speed only" },
+        { "menupause", "run", "Keep running" }, { "menupause", "pause", "Pause everyone" },   /* T-1392 */
         { "resurrectgrowth", "steady", "Steady" }, { "resurrectgrowth", "steep", "Steep" },
         { "spimport", "all", "Allowed for everyone" }, { "spimport", "owner", "Owner and admins only" }, { "spimport", "off", "Not allowed" },
         { "spimportmoney", "yes", "Yes" }, { "spimportmoney", "no", "No" },
         { "spimportresearch", "yes", "Yes" }, { "spimportresearch", "no", "No" },
-        { "researchmode", "on", "on" }, { "researchmode", "off", "off" } };
+        { "researchmode", "on", "on" }, { "researchmode", "off", "off" },
+        { "modcheck", "accepted", "Accepted" }, { "modcheck", "rejected", "Rejected" } };
     return w;
 }
 /* The rules the world server keeps that GAME OPTIONS does not show (their file name is their key). */

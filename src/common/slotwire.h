@@ -228,6 +228,34 @@ inline int ZoneFileNamedSlots(const unsigned char* p, size_t n, std::vector<int>
     }
     return hits;
 }
+/* T-1443 (F1379 design a): the shared player-faction id an area record's file carries for its WRITER's own buildings (zonekeep.h's
+   kPlayerFactionSid; the offline suite checks the two agree) */
+const char* const kPlayerSidShared = "204-gamedata.base";
+/* T-1443: whether an area record FILE names `sid` as an engine string (int32 little-endian length + exactly those bytes) - the
+   writer's own player-faction buildings when sid is kPlayerSidShared. Raw text that is not such a string is never read. */
+inline bool ZoneFileNamesSid(const unsigned char* p, size_t n, const char* sid)
+{
+    if (p == 0 || sid == 0) return false;
+    size_t sl = 0; while (sid[sl] != 0) ++sl;
+    if (sl == 0 || n < 4 + sl) return false;
+    for (size_t i = 4; i + sl <= n; ++i)
+    {
+        if (p[i] != (unsigned char)sid[0]) continue;
+        const unsigned int len = (unsigned int)p[i - 4] | ((unsigned int)p[i - 3] << 8) | ((unsigned int)p[i - 2] << 16) | ((unsigned int)p[i - 1] << 24);
+        if (len != (unsigned int)sl) continue;
+        size_t j = 1; while (j < sl && p[i + j] == (unsigned char)sid[j]) ++j;
+        if (j == sl) return true;
+    }
+    return false;
+}
+/* T-1443 (F1379 design a): whose area record this is, as a slot. The RECORD owner field when it is a player number; an unknown
+   owner is read as the one other game on the old direct session link ONLY while that link is up (sessionUp) - on the world
+   server's road that link is down and its remembered slot is not this record's writer, so the answer is -1, writer unknown. */
+inline int ZoneWriterOf(long long owner, int linkPeerSlot, bool sessionUp)
+{
+    if (owner >= 0 && owner <= kSlotMax) return (int)owner;
+    return (sessionUp && linkPeerSlot >= 0 && linkPeerSlot <= kSlotMax) ? linkPeerSlot : -1;
+}
 /* the players a record by `writerSlot` needs a stand-in for on the game of `mySlot`: the writer (its own buildings carry the shared
    id) and every number the file names, except me */
 inline void SlotsNeedingStandIn(const std::vector<int>& named, int mySlot, int writerSlot, std::vector<int>* out)
@@ -241,6 +269,14 @@ inline void SlotsNeedingStandIn(const std::vector<int>& named, int mySlot, int w
 inline bool ZoneOwnersReady(int mySlot, int writerSlot, bool writerStandInExists, int namedMissing)
 {
     return ZoneSwapReady(mySlot, writerSlot, writerStandInExists) && namedMissing == 0;
+}
+/* T-1443 (F1379 design a): ZoneOwnersReady for a record whose writer may be unknown. A record by no known writer whose file names no
+   player-faction building of its writer (namesPlayerSid false) needs no writer - only this game's own number and every named
+   player's stand-in; any other record is judged as before. */
+inline bool ZoneOwnersReadyW(int mySlot, int writerSlot, bool writerStandInExists, bool namesPlayerSid, int namedMissing)
+{
+    if (writerSlot < 0 && !namesPlayerSid) return mySlot >= 0 && mySlot <= kSlotMax && namedMissing == 0;
+    return ZoneOwnersReady(mySlot, writerSlot, writerStandInExists, namedMissing);
 }
 /* a protocol-67 "coop-peer" owner in a record another game wrote is this game's only while the world has never had more than two
    players. `worldPlayers` is the WORLD SERVER's count - every number its slots.txt holds, carried on the PLAYERS roster

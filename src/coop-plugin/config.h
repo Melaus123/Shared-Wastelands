@@ -180,6 +180,9 @@ bool ConfigWorldSwitchRefused(const std::string& fileWorld, const char* why, std
 // to single, ConfigTitleTick's latch and the dial count reset - so the next HOST / JOIN press arms cleanly. CANCEL, every
 // failure, a new press and BACK on the HOSTING screen call it. The world server process is left running. MAIN THREAD.
 void ConfigLeave(const char* why);
+// T-1403 (T2520): the world server this HOST press started says it is listening (its start-up progress file is gone after the press
+// read a row of it). The next title tick dials it again when the link has not been answered (coopstore::HostListenDialDecide). MAIN THREAD.
+void ConfigHostStartListening(const char* why);
 
 // How many times ConfigTitleTick has performed the arming in this process.  0 = never.  T-201 N1: the panel reads a
 // change of it as "the title tick has opened the links since the press"; a second press leaves first (ConfigLeave).

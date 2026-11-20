@@ -1418,13 +1418,16 @@ static void OwedSettleNote(unsigned kind, const std::string& key)
 {
     const long seq = StoreSaveRequestSeq();
     int held = 0;
+    std::string area; Sector sc; sc.x = -1; sc.y = -1;   /* T-1363: the row's area - DONE made also waits for a record of it accepted after this make */
     TgLockInit(); ::EnterCriticalSection(&g_tgLock);
-    { const owedpop::Table::const_iterator it = g_owed.find(owedpop::TableKey(kind, key)); held = (it != g_owed.end() && it->second.claimant == (int)owedpop::kClaimYou) ? 1 : 0; }
-    owedpop::SettleNote(&g_owedSettle, kind, key, seq, held);
+    { const owedpop::Table::const_iterator it = g_owed.find(owedpop::TableKey(kind, key)); held = (it != g_owed.end() && it->second.claimant == (int)owedpop::kClaimYou) ? 1 : 0;
+      if (it != g_owed.end()) { sc = SectorOf(it->second.x, it->second.z); area = "zone." + N((long long)sc.x) + "." + N((long long)sc.y); } }
+    owedpop::SettleNote(&g_owedSettle, kind, key, seq, held, area, sc.x, sc.y);
     ++g_owedSettleNoted;
     ::LeaveCriticalSection(&g_tgLock);
     OwedLine(std::string("[OWED] made kind=") + owedpop::KindName(kind) + (kind == owedpop::kKindBar ? " town=" : " building=") + key + " held=" + N((long long)held)
-             + " - the row stays on the world server, this game's, until this game's next save (asked for after save request " + N((long long)seq) + ") has finished");
+             + " - the row stays on the world server, this game's, until this game's next save (asked for after save request " + N((long long)seq) + ") has finished"
+             + (area.empty() ? std::string(" (no row here: the save alone settles it)") : " and the world server has taken a record of " + area + " written after this make (else DONE fault when this game's hold of it ends)"));
 }
 /* is this row held back here - made by this game and no finished save of its own holds it yet, or settled by such a save with its
    DONE not yet answered by the world server's GONE? ANY THREAD */
@@ -4836,6 +4839,39 @@ static void OwedTick()
     { const owedpop::Table::const_iterator r = g_owed.find(it->first); if (r != g_owed.end() && owedpop::SettleStep(1, it->second.held, r->second.claimant) == owedpop::kSetReclaim) again.push_back(it->second); }
     ::LeaveCriticalSection(&g_tgLock);
     for (size_t i = 0; i < again.size(); ++i) { ++g_owedReclaims; OwedSendKey(owedpop::kOpClaim, again[i].kind, again[i].key, " why=made-here-not-saved"); }
+    {   /* T-1363 (fold 1, review 4a / 4b): a make whose area this game no longer holds (MineHeldTS 0; -1 / -2 not known - it waits) while
+           the map names ANOTHER holder (HeldByOtherTS 1), before a record of that area written after the make was accepted, goes back as
+           DONE fault (owedpop::SettleFaultDue; the counted retry, kTriesMax) - at once when no write went out after the make, else after
+           owedpop::kSettleFaultGraceMs from the hold's end (owedpop::SettleHoldClock) with no echo. Nobody holding it: it waits (the world
+           close lapses it). The map reads are taken outside g_tgLock (each takes g_heldLock), then the live row is judged under it. */
+        std::vector<owedpop::Settle> waitEcho, fault; std::vector<int> wMine, wOther;
+        TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+        for (owedpop::SettleSet::const_iterator it = g_owedSettle.begin(); it != g_owedSettle.end(); ++it) if (!it->second.area.empty() && it->second.echoed == 0) waitEcho.push_back(it->second);
+        ::LeaveCriticalSection(&g_tgLock);
+        for (size_t i = 0; i < waitEcho.size(); ++i)
+        {
+            Sector s; s.x = waitEcho[i].ax; s.y = waitEcho[i].ay;
+            wMine.push_back(MineHeldTS(s)); wOther.push_back(HeldByOtherTS(s));
+        }
+        TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+        for (size_t i = 0; i < waitEcho.size(); ++i)
+        {
+            const owedpop::SettleSet::iterator e = g_owedSettle.find(owedpop::TableKey(waitEcho[i].kind, waitEcho[i].key));
+            if (e == g_owedSettle.end() || e->second.echoed != 0) continue;
+            owedpop::SettleHoldClock(&e->second, wMine[i], (unsigned)now);
+            if (owedpop::SettleFaultDue(e->second, wMine[i], wOther[i], (unsigned)now) != 0) { fault.push_back(e->second); g_owedSettle.erase(e); ++g_owedSettleDropped; }
+        }
+        ::LeaveCriticalSection(&g_tgLock);
+        for (size_t i = 0; i < fault.size(); ++i)
+        {
+            const std::string tk = owedpop::TableKey(fault[i].kind, fault[i].key);
+            const std::string after = fault[i].wrote == 0 ? std::string("no write of it went out after the make")
+                                                         : "its write after the make was not echoed within " + N((long long)owedpop::kSettleFaultGraceMs) + " ms of the hold's end";
+            OwedLine("[OWED] " + tk + ": this game's hold of " + fault[i].area + " ended, the map names another holder, and " + after + " (saved="
+                     + N((long long)fault[i].saved) + " wrote=" + N((long long)fault[i].wrote) + ") - DONE fault, the row goes back (T-1363)");
+            OwedSendDone(fault[i].kind, fault[i].key, owedpop::kWhyFault, false);
+        }
+    }
     for (size_t i = 0; i < mine.size(); ++i)
     {
         if (owedpop::SettleStep(mineSettling[i], 1, (int)owedpop::kClaimYou) == owedpop::kSetHold) continue;   /* made here and not saved - kept wherever the player goes */
@@ -6748,6 +6784,26 @@ namespace coop { void TownGenOwedReset() { OwedReset(); } }   /* T-581: see town
 namespace coop { int TownGenRecipeUnique(void* platoon) { T2Recipe r; T2RecipeUnique(platoon, &r); if (r.step != coopt2::kRecipeRead) return -1; if (r.uniq != 0) return 1; return (r.subs != r.subRead || r.subNested != 0) ? -1 : 0; } }
 namespace coop { void TownGenOwedArrive(const std::vector<char>& payload) { OwedArrive(payload); } }
 namespace coop { void TownGenOwedSaveFinished(const std::string& saveName, long reqSeq) { OwedSaveFinished(saveName, reqSeq); } }   /* see towngen.h */
+/* T-1363: store.cpp's KEPT hooks - a write of an area went to the world server (KeptAreaWritten) / the world server's echo of one
+   (KeptAreaEcho). ANY THREAD: the settle set is under g_tgLock; a make now settled is DONE-owed and goes from OwedTick (main thread). */
+namespace coop { void TownGenOwedAreaWritten(const std::string& zoneId, long long stamp, long long prior)
+{
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    owedpop::SettleAreaWritten(&g_owedSettle, zoneId, stamp, prior);
+    ::LeaveCriticalSection(&g_tgLock);
+} }
+namespace coop { void TownGenOwedAreaEcho(const std::string& worldId, int hasStamp, long long stamp)
+{
+    std::vector<owedpop::Settle> due;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    if (!g_owedSettle.empty())
+    {
+        due = owedpop::SettleAreaEcho(&g_owedSettle, worldId, hasStamp, stamp); g_owedSettled += (long long)due.size();
+        for (size_t i = 0; i < due.size(); ++i) { OwedDoneOwed d; d.kind = due[i].kind; d.key = due[i].key; g_owedDoneOwed[owedpop::TableKey(d.kind, d.key)] = d; }
+    }
+    ::LeaveCriticalSection(&g_tgLock);
+    for (size_t i = 0; i < due.size(); ++i) OwedLine("[OWED] " + owedpop::TableKey(due[i].kind, due[i].key) + ": saved, and the world server took a record of " + due[i].area + " written after the make (stamp " + N(stamp) + ") - DONE made is owed (T-1363)");
+} }
 namespace coop { void TownGenOwedNotThisSave() { ++g_owedNotThisSave; } }   /* see towngen.h */
 namespace coop { int TownGenOwedCanSend() { return g_linkedCached != 0 ? 1 : 0; } }   /* see towngen.h */
 namespace coop { int TownGenOwedSettling() { int n = 0; TgLockInit(); ::EnterCriticalSection(&g_tgLock); n = (int)g_owedSettle.size(); ::LeaveCriticalSection(&g_tgLock); return n; } }   /* see towngen.h */

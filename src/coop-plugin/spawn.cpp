@@ -32,6 +32,7 @@
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
 #include "../common/poselayer.h"  /* T-307: the layer table's held state as a pose - the pick and the settle rule */
 #include "../common/aimstamp.h"   /* T-330: the owner's aim stamp, its word and the copy's step */
+#include "../common/carrykeep.h"  /* T-1411 (F1274): a body copy the copy carry holds is kept updated as if on this game's camera */
 #include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
 #include "money.h"   // T-478 step 5: MoneyHave - the purse around the selling confirm
@@ -76,6 +77,7 @@ namespace coop { void P210NoteMade(unsigned int uid, int kind); void P210CopyDes
 #include "../common/actowed.h"     /* T-860 / T-859 (owner 1551 a): an act on an away player's character is owed */
 #include "../common/bedhandoff.h"  /* the owner enters a bed from the carry, as the engine does */
 #include "../common/owncarry.h"    /* T-1265: may another game's carrier pick up this game's own character here */
+#include "../common/carrystatelog.h"   /* T-1360 LOG ONLY: the carry drop state and owner-unconscious STATE lines */
 #include "team.h"                  /* T-1265: TeamSameAnyThread - the carrier's player shares this game's team */
 #include "../common/namewire.h"     /* names1: MSG_NAME */
 #include "../common/uidtable.h"     /* mirror1 (crash T487): the uid table's decisions, offline-tested */
@@ -1690,8 +1692,9 @@ int SquadLeaderLivingPod(::Character* c)   // 1 a living member of this game's p
 
 /* T-556 (resurrect.cpp): a new character of this player's own faction made at `pos` into `squad` (the shared creation core,
    the faction from the reference character as `spawn`), owned by this game and NOT announced - the caller writes what it
-   carries first and then sends the SPAWN. The new uid is handed back. */
-bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos, ActivePlatoon* squad, float age, unsigned int* uidOut)
+   carries first and then sends the SPAWN. The new uid is handed back. T-1021: `templateSid` is tried first (ResolveTemplate: a race
+   look-alike id is made from the template it names), the shown name only when it is "" or not found. */
+bool CreateOwnInSquad(const std::string& templateName, const std::string& templateSid, const Ogre::Vector3& pos, ActivePlatoon* squad, float age, unsigned int* uidOut)
 {
     if (uidOut) *uidOut = 0;
     const unsigned int uid = AllocateUid();
@@ -1707,7 +1710,7 @@ bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos,
         ErrorLog("[M1] spawn (own squad) refused: this game has no player faction");
         return false;
     }
-    if (!CreateAt(uid, templateName, std::string(), pos, "own squad", std::string(), true, (RootObjectContainer*)squad, 0, age, mine))
+    if (!CreateAt(uid, templateName, templateSid, pos, "own squad", std::string(), true, (RootObjectContainer*)squad, 0, age, mine))   /* T-1021: the template by its id first ("" = by shown name) */
         return false;
     net::SetLocalOwner(uid);
     if (uidOut) *uidOut = uid;
@@ -5562,8 +5565,8 @@ const size_t kHandIdBytes     = 20;      // type, container, containerStamp, ind
 const size_t kBeingCarriedOff = 0x3D4;   // bool _isBeingCarried (getPickedUp 0x5CE300 sets it)
 const int    kCarryCapCount   = 3;       // at most 3 pick-ups per carrier ...
 const DWORD  kCarryCapMs      = 30000;   // ... per 30 s (carryRateCapped)
-const long long kCarryLogLimit = 16;     // the first 16 applies / drops are logged
-const long long kCarryBodyMineLogLimit = 8;   // review-k1 item 3: the first 8 skipped bodies are logged
+const long long kCarryLogLimit = 400;    // owner 1783: every pick-up and drop with its reason, up to 400 lines a launch
+const long long kCarryBodyMineLogLimit = 200;   // owner 1783: every refusal with its reason, up to 200 lines a launch
 
 typedef void (*PickupObjectFn)(::Character* carrier, ::Character* who);
 typedef void (*DropCarriedObjectFn)(::Character* carrier, bool ragdollHim, bool removeOnly);
@@ -5583,6 +5586,10 @@ struct CarryWant
 };
 std::map<unsigned int, CarryWant>    g_carryWant;   // copy carrier uid -> its owner's word
 std::map<unsigned int, unsigned int> g_carryLast;   // owned carrier uid -> non-zero carryingUid last pushed
+// PROBE-START: P303 - T-1411: the owner's live carry word per body (body uid -> the carrier its STATE names, and when). LOG ONLY
+struct P303Word { unsigned int carrier; DWORD at; };
+std::map<unsigned int, P303Word> g_p303Word;
+// PROBE-END: P303
 struct CarryCap { DWORD t[kCarryCapCount]; int n; };
 std::map<unsigned int, CarryCap>     g_carryCap;
 // arrest1 (docs/design-arrest.md 3): this game's OWN bodies a copy carrier picked up here, body uid -> carrier uid. When
@@ -5615,6 +5622,8 @@ long long g_carryBodyMineLogged = 0;
 long long g_proneStandSkippedUnconscious = 0;   // ApplyState: prone=0 not written over an owner latch 'unconscious' (the clock is not asked: it reads 0 while carried)
 long long g_proneSkippedCarried = 0;    // ApplyState / ProneParkTick: prone NOT written while the copy is carried
 long long g_carryLogged = 0;
+// T-1360 (F1082) LOG ONLY: the carry drop state line and the owner-unconscious STATE line - written / seen (carrystatelog.h caps)
+long long g_t1360DropLogged = 0, g_t1360DropSeen = 0, g_t1360UncLogged = 0, g_t1360UncSeen = 0;
 long long g_carryOwnApplied = 0;        // arrest1: this game's own (helpless) body picked up by a copy carrier here
 long long g_carryOwnAwake = 0;          // arrest1: an own body NOT picked up - awake, standing, or in a bed / cage here
 // T-1265: that refusal by its reason (owncarry.h), and the awake carries taken from a teammate's player character
@@ -5622,7 +5631,6 @@ long long g_carryRefusedInSomething = 0, g_carryRefusedInsUnread = 0, g_carryRef
 long long g_carryTeamAwakeAccepted = 0;
 long long g_carryOwnFactionAwakeAccepted = 0;   // fold 1: an awake own character taken by a copy of this game's own faction
 long long g_carryHeldOwedEnd = 0;   // fold 1: a pick-up of an own body skipped while this game's carry end for it and that carrier is owed
-long long g_carryHeldOwedEndLogged = 0;
 long long g_carryTeamAwakeLogged = 0;
 const long long kCarryTeamAwakeLogLimit = 8;   // the first 8 accepted awake carries are logged
 long long g_carryBreakSent = 0;         // arrest1: MSG_CARRY_BREAK sent (an own body's carry ended here, or refused)
@@ -5727,11 +5735,527 @@ bool CarryCapAllows(unsigned int carrier, DWORD now)
     return true;
 }
 
+long long g_carryWishDropped = 0;   // owner 1783: wishes dropped because the carrier is gone or its game no longer drives it here
+std::map<unsigned int, unsigned int> g_carryMineSaid;   // owner 1783: carrier -> the body its 'driven by this game' refusal was said for
+
 void CarryLog(const char* what, unsigned int carrier, unsigned int body)
 {
     if (g_carryLogged >= kCarryLogLimit) return;
     ++g_carryLogged;
-    DebugLog(std::string("[K1] carry ") + what + " carrier uid=" + S(carrier) + " body uid=" + S(body));
+    DebugLog(std::string("[K1] carry ") + what + " carrier uid=" + S(carrier) + " body uid=" + S(body)
+             + " (carry line " + S(g_carryLogged) + " of " + S(kCarryLogLimit) + ")");
+}
+
+// owner 1783 (T-1411): a carry wish this game does not carry out (now, or at all), with its reason - once per wish and reason
+// (the engine's own refusal: each try, at most 3 per carrier per 30 s). Shares the refusal cap with the own-body refusals.
+void CarryRefuseLog(const std::string& s)
+{
+    if (g_carryBodyMineLogged >= kCarryBodyMineLogLimit) return;
+    ++g_carryBodyMineLogged;
+    DebugLog(s + " (refusal line " + S(g_carryBodyMineLogged) + " of " + S(kCarryBodyMineLogLimit) + ")");
+}
+
+// owner 1783: why the mod itself made one of this game's OWN carriers let go (carrier uid -> reason, when), so CarryWatchTick's
+// let-go line names it; a let-go with no such note within 2 s was not one of these mod drops.
+struct OwnDropWhy { const char* why; DWORD at; };
+std::map<unsigned int, OwnDropWhy> g_ownDropWhy;
+void OwnDropWhyNote(unsigned int carrier, const char* why)
+{
+    OwnDropWhy w; w.why = why; w.at = ::GetTickCount();
+    g_ownDropWhy[carrier] = w;
+}
+std::string OwnDropWhyTake(unsigned int carrier)
+{
+    std::map<unsigned int, OwnDropWhy>::iterator it = g_ownDropWhy.find(carrier);
+    std::string why = "the engine here (a player order, an AI job, or the body's own state; no carry drop of the mod's named it)";
+    if (it != g_ownDropWhy.end())
+    {
+        if (::GetTickCount() - it->second.at <= 2000) why = it->second.why;
+        g_ownDropWhy.erase(it);
+    }
+    return why;
+}
+
+// T-1411 (owner 1783 carry log lines; LOG ONLY, MAIN THREAD): just before each of the mod's drops of a carried body, where the
+// body's saved position Character +0x48 and its carrier here stand, and the gap between them (CarryDropSpotLine). Reads only:
+// nothing is written. Fix attempt 1 (F1229), which wrote +0x48 before the drop, failed (F1235: +0x48 was already current) and is
+// removed; the fix is the keep-updated test hook below (F1286, carrykeep.h). Capped per launch.
+long long g_dropSpotLogged = 0;
+const long long kDropSpotLogLimit = 400;
+// 1 = read, 0 = faulted. SEH only: no object with a destructor lives here (C2712).
+int DropSpotReadPod(const ::Character* body, float* out)
+{
+    __try
+    {
+        const float* l = (const float*)((const char*)body + 0x48);   // Character +0x48: the saved (logical) position - read only
+        out[0] = l[0]; out[1] = l[1]; out[2] = l[2];
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// PROBE-START: P306 - T-1411 (F1236) LOG ONLY, MAIN THREAD: what a body looks like on this game right after a put-down and during
+// a carry. Per character: Character +0x48; AnimationClass (+0x448) +0x88 (has-body byte, appearance.cpp), +0xA8 entity, +0x98
+// (getPosition while ragdolled), +0xB0 scene node (its world position by OgreMain's exported Node::_getDerivedPosition); the
+// rag-doll (+0x2E8) settled +0x10 / active +0x59 / carried +0x5A and its limb bodies (rag +0x08, the map at +0x10 walked as
+// translate 0x7D1580 walks it, each body's own position getter vt+0x50 - the read translate makes; their centre = a proxy for the
+// root body, which 0x7D08F0 finds by a lookup the mod has no row for); the rag-doll flag (inRagdoll); the entity's Ogre
+// MovableObject::isVisible (its show / hide setting - NOT a camera-cull result: no readable cull flag is known); the nearest own
+// player character here. Reads only (getters); nothing is written in the engine and no decision changes.
+struct P306Read
+{
+    int p48Ok, animOk, a88, hasEnt, nodeOk, visOk, vis, ragOk, settled, active, ragCarried, nBodies;
+    float p48[3], a98[3], node[3], centre[3], spread;
+};
+typedef float* (*P306OgreOutFn)(const void* node, float* out);   /* Ogre 2.x Node getter returning Vector3 by value (hidden out) */
+typedef bool (*P306OgreVisFn)(const void* obj);                  /* Ogre::MovableObject::isVisible */
+typedef float* (*P306BodyPosFn)(void* body, float* out);         /* a rag-doll limb body's position getter, vt+0x50 (0x7D1580) */
+P306OgreOutFn g_p306DerPos = 0;
+P306OgreVisFn g_p306Vis = 0;
+int g_p306Looked = 0;
+void P306OgreLook()
+{
+    if (g_p306Looked != 0) return;
+    g_p306Looked = 1;
+    HMODULE og = ::GetModuleHandleA("OgreMain_x64.dll");
+    if (og == 0) return;
+    g_p306DerPos = (P306OgreOutFn)::GetProcAddress(og, "?_getDerivedPosition@Node@Ogre@@QEBA?AVVector3@2@XZ");
+    g_p306Vis = (P306OgreVisFn)::GetProcAddress(og, "?isVisible@MovableObject@Ogre@@QEBA_NXZ");
+}
+// 1 = read (fields that could not be read stay 0), 0 = faulted. SEH only: no object with a destructor here (C2712).
+int P306ReadPod(::Character* c, P306Read* o)
+{
+    std::memset(o, 0, sizeof(*o));
+    o->vis = -1;
+    float pts[64][3];
+    __try
+    {
+        const float* l = (const float*)((const char*)c + 0x48);
+        o->p48[0] = l[0]; o->p48[1] = l[1]; o->p48[2] = l[2]; o->p48Ok = 1;
+        const char* anim = *(const char* const*)((const char*)c + 0x448);
+        if (anim == 0) return 1;
+        o->animOk = 1;
+        o->a88 = *(const unsigned char*)(anim + 0x88);
+        const float* a = (const float*)(anim + 0x98);
+        o->a98[0] = a[0]; o->a98[1] = a[1]; o->a98[2] = a[2];
+        const void* ent = *(void* const*)(anim + 0xA8);
+        o->hasEnt = ent != 0 ? 1 : 0;
+        const void* node = *(void* const*)(anim + 0xB0);
+        if (node != 0 && g_p306DerPos != 0)
+        {
+            float out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const float* r = g_p306DerPos(node, out);
+            if (r != 0) { o->node[0] = r[0]; o->node[1] = r[1]; o->node[2] = r[2]; o->nodeOk = 1; }
+        }
+        if (ent != 0 && g_p306Vis != 0) { o->vis = g_p306Vis(ent) ? 1 : 0; o->visOk = 1; }
+        const unsigned char* rag = *(const unsigned char* const*)(anim + 0x2E8);
+        if (rag == 0) return 1;
+        o->ragOk = 1;
+        o->settled = rag[0x10]; o->active = rag[0x59]; o->ragCarried = rag[0x5A];
+        const char* bodies = *(const char* const*)(rag + 0x08);
+        if (bodies == 0) return 1;
+        const char* head = *(const char* const*)(bodies + 0x10);   /* the map's head node; *head = its first node (0x7D1580) */
+        const char* n = *(const char* const*)head;
+        int k = 0, steps = 0;
+        while (n != 0 && n != head && steps < 128)
+        {
+            ++steps;
+            const char* v = *(const char* const*)(n + 0x40);   /* the node's value (0x7D1580: plVar11[8]) */
+            void* b = v != 0 ? *(void* const*)(v + 0x08) : 0;  /* its body (0x7D1580: *(lVar6 + 8)) */
+            if (b != 0 && k < 64)
+            {
+                float out[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                P306BodyPosFn get = *(P306BodyPosFn*)(*(const char* const*)b + 0x50);
+                const float* p = get(b, out);
+                if (p != 0) { pts[k][0] = p[0]; pts[k][1] = p[1]; pts[k][2] = p[2]; ++k; }
+            }
+            /* the next node in order, as 0x7D1580 steps (+0x08 parent, +0x10 right, +0x49 is-head byte) */
+            const char* r = *(const char* const*)(n + 0x10);
+            if (*(r + 0x49) == 0) { n = r; while (*(*(const char* const*)n + 0x49) == 0) n = *(const char* const*)n; }
+            else
+            {
+                const char* p = *(const char* const*)(n + 0x08);
+                while (*(p + 0x49) == 0 && n == *(const char* const*)(p + 0x10)) { n = p; p = *(const char* const*)(p + 0x08); }
+                n = p;
+            }
+        }
+        o->nBodies = k;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (o->nBodies > 0)
+    {
+        float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+        for (int i = 0; i < o->nBodies; ++i) { sx += pts[i][0]; sy += pts[i][1]; sz += pts[i][2]; }
+        o->centre[0] = sx / o->nBodies; o->centre[1] = sy / o->nBodies; o->centre[2] = sz / o->nBodies;
+        float farD = 0.0f;
+        for (int i = 0; i < o->nBodies; ++i)
+        {
+            const float dx = pts[i][0] - o->centre[0], dy = pts[i][1] - o->centre[1], dz = pts[i][2] - o->centre[2];
+            const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d > farD) farD = d;
+        }
+        o->spread = farD;
+    }
+    return 1;
+}
+std::string P306V(const float* v) { return "(" + F1(v[0]) + "," + F1(v[1]) + "," + F1(v[2]) + ")"; }
+// T-1411 (F1247) P306 b: the walking layer Character+0x640 (CharMovement): its position field +0xC4 (CharMovement::pos, the read
+// replicate.cpp makes) and the value its own getter vt+0x40 returns - the getter the engine's position read 0x7D0B50 calls on
+// param_1[200] (decomp_7d0b50:31-34), the value a full update writes into +0x48 when the rag-doll root is not used (decomp_5ce6a0:35-38);
+// the every-frame update flag Character+0xE4 (isVisibleUpdateMode, ReadCharFrameTimesPod's `vum`); the queued state change
+// Character+0x410 (0x5C7E90's 3-byte request, BedDropPendingPod; the full update applies and frees it, decomp_5ce6a0:25-31).
+// Reads and one getter call; nothing written.
+struct P306Move { int mvOk, posOk, getOk, getIsPos, vumOk, vum, qOk, qPending, q[3]; float pos[3], get[3]; };
+typedef const float* (*P306MoveGetFn)(void* mv);   /* CharMovement vt+0x40: a pointer to its position (decomp_7d0b50:31) */
+void P306ReadMovePod(::Character* c, P306Move* o)
+{
+    std::memset(o, 0, sizeof(*o));
+    __try { o->vum = (int)*(const unsigned char*)((const char*)c + 0xE4); o->vumOk = 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        const unsigned char* q = *(const unsigned char* const*)((const char*)c + 0x410);
+        o->qOk = 1;
+        if (q != 0) { o->qPending = 1; o->q[0] = q[0]; o->q[1] = q[1]; o->q[2] = q[2]; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        char* mv = *(char* const*)((const char*)c + 0x640);
+        if (mv == 0) return;
+        o->mvOk = 1;
+        const float* p = (const float*)(mv + 0xC4);
+        o->pos[0] = p[0]; o->pos[1] = p[1]; o->pos[2] = p[2]; o->posOk = 1;
+        P306MoveGetFn get = *(P306MoveGetFn*)(*(const char* const*)mv + 0x40);
+        const float* g = get(mv);
+        if (g != 0) { o->get[0] = g[0]; o->get[1] = g[1]; o->get[2] = g[2]; o->getOk = 1; o->getIsPos = g == p ? 1 : 0; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+std::string P306Off(const float* v, const float* p48) { const float dx = v[0] - p48[0], dz = v[2] - p48[2]; return F1(sqrtf(dx * dx + dz * dz)); }
+// this game's own player characters' x, z (registered, owned here, of this game's player faction)
+void P306OwnPcs(std::vector<float>* xz)
+{
+    xz->clear();
+    for (int i = 0; i < MirrorCapacity(); ++i)
+    {
+        unsigned int u = 0;
+        ::Character* ch = 0;
+        if (!MirrorSlot(i, &u, &ch) || !net::IsUidMine(u) || !PlausibleObject(ch) || !IsPlayerFaction(GoneCopyFactionPod(ch))) continue;
+        Ogre::Vector3 v;
+        if (!SafeReadPosition(ch, &v)) continue;
+        xz->push_back(v.x); xz->push_back(v.z);
+    }
+}
+// one character's reads as text; `prev98` / `havePrev` = the same watch's previous +0x98 (a98moved), may be 0
+std::string P306Text(::Character* c, const std::vector<float>& own, float* prev98, int* havePrev)
+{
+    P306Read r;
+    if (P306ReadPod(c, &r) == 0) return " reads=FAULTED";
+    if (r.p48Ok == 0) return " reads=unread";
+    float nearD = -1.0f;
+    for (size_t i = 0; i + 1 < own.size(); i += 2)
+    {
+        const float dx = own[i] - r.p48[0], dz = own[i + 1] - r.p48[2];
+        const float d = sqrtf(dx * dx + dz * dz);
+        if (nearD < 0.0f || d < nearD) nearD = d;
+    }
+    std::string t = " p48=" + P306V(r.p48);
+    if (r.animOk == 0) t += " anim=none";
+    else
+    {
+        t += " anim88=" + S(r.a88) + " ent=" + S(r.hasEnt) + " a98=" + P306V(r.a98) + " a98off=" + P306Off(r.a98, r.p48);
+        if (prev98 != 0 && havePrev != 0)
+        {
+            const float dx = r.a98[0] - prev98[0], dy = r.a98[1] - prev98[1], dz = r.a98[2] - prev98[2];
+            t += std::string(" a98moved=") + (*havePrev == 0 ? "first" : (dx * dx + dy * dy + dz * dz > 0.0f ? "1" : "0"));
+            prev98[0] = r.a98[0]; prev98[1] = r.a98[1]; prev98[2] = r.a98[2]; *havePrev = 1;
+        }
+        t += " node=" + (r.nodeOk != 0 ? P306V(r.node) + " nodeOff=" + P306Off(r.node, r.p48)
+                                       : std::string(g_p306DerPos == 0 ? "unresolved" : "unread"));
+        t += std::string(" vis=") + (r.visOk != 0 ? S(r.vis) : std::string(g_p306Vis == 0 ? "unresolved" : "unread"));
+        if (r.ragOk == 0) t += " rag=none";
+        else
+            t += " rag(settled=" + S(r.settled) + " active=" + S(r.active) + " carried=" + S(r.ragCarried) + " bodies=" + S(r.nBodies)
+               + (r.nBodies > 0 ? " centre=" + P306V(r.centre) + " centreOff=" + P306Off(r.centre, r.p48) + " spread=" + F1(r.spread)
+                                : std::string()) + ")";
+    }
+    t += " ragdollFlag=" + S(GetupIsRagdoll(c)) + " nearestOwnPC=" + (nearD >= 0.0f ? F1(nearD) : std::string("none"));
+    P306Move m;
+    P306ReadMovePod(c, &m);
+    if (m.mvOk == 0) t += " mv=none";
+    else
+    {
+        t += " mv(pos=" + (m.posOk != 0 ? P306V(m.pos) + " posOff=" + P306Off(m.pos, r.p48) : std::string("unread"));
+        if (m.posOk != 0 && r.nodeOk != 0) t += " posToNode=" + P306Off(m.pos, r.node);
+        t += " get40=" + (m.getOk != 0 ? P306V(m.get) + " get40IsPos=" + S(m.getIsPos) : std::string("unread")) + ")";
+    }
+    t += " vum=" + (m.vumOk != 0 ? S(m.vum) : std::string("unread"))
+       + " queued=" + (m.qOk == 0 ? std::string("unread") : m.qPending == 0 ? std::string("0")
+                       : "1(" + S(m.q[0]) + "," + S(m.q[1]) + "," + S(m.q[2]) + ")");
+    return t;
+}
+struct P306Watch { unsigned int uid; ::Character* ch; DWORD t0; DWORD lastLine; int phase; int drop; float prev98[3]; int havePrev; std::string road; };
+const int kP306Slots = 4, kP306DropCap = 900, kP306CarryCap = 400;   /* P306 c: carry lines once a second (was 2 s, cap 200) */
+P306Watch g_p306W[kP306Slots];
+int g_p306Drops = 0, g_p306Lines = 0, g_p306CarryLines = 0;
+DWORD g_p306CarryAt = 0;
+// a put-down of `body` (CarryDropSpotLine's roads; the engine's own drop by an own carrier, CarryWatchTick): watch it for 8 s
+void P306Start(const char* road, ::Character* body, unsigned int uid)
+{
+    if (body == 0 || uid == 0 || !PlausibleObject(body) || g_p306Lines >= kP306DropCap) return;
+    int slot = -1;
+    for (int i = 0; i < kP306Slots; ++i) if (g_p306W[i].uid == uid) slot = i;
+    for (int i = 0; i < kP306Slots && slot < 0; ++i) if (g_p306W[i].uid == 0) slot = i;
+    if (slot < 0) { DebugLog("[PROBE] P306 drop of uid=" + S(uid) + " (" + road + ") NOT watched: all 4 watches busy"); return; }
+    P306Watch& w = g_p306W[slot];
+    w.uid = uid; w.ch = body; w.t0 = ::GetTickCount(); w.lastLine = 0; w.phase = 0; w.drop = ++g_p306Drops; w.havePrev = 0; w.road = road;
+    ++g_p306Lines;
+    DebugLog("[PROBE] P306 drop#" + S(w.drop) + " START road=" + road + " body uid=" + S(uid) + " mine=" + S(net::IsUidMine(uid) ? 1 : 0)
+             + " - read every frame (at most ~60 a second) for 2.5 s, then at 5 s and 8 s (line " + S(g_p306Lines) + " of " + S(kP306DropCap) + ")");
+}
+// T-1411 (F1259) P306 c: the engine carry step's gates. During a carry the carried body's vt+0x268 routine (0x5CCF90, every frame)
+// moves the body's scene node only through 0x5B4EF0 -> 0x5B0FA0, past these gates, in this order (decomp_5ccf90:32-80, 5b4ef0:28-57):
+// anim+0x1A8 or Character+0x3D4 set (:32); the hand kind Character+0x388 is 1 or 0x5B and finds the carrier (:36-63); the global
+// 0x2132910 (1.0.65; a qword - `cmp qword ptr [rip+..], 0`) is 0 (:65); Character+0x1A9 set and the bone name at anim+0x1B0 not empty
+// (its std::string size anim+0x1C0) (:78-79); Character vt+0x248 returns 0 (:80; asAnimal - 0x5E4EC0 `xor eax,eax; ret` on Character
+// and CharacterHuman, 0x5E14C0 `mov rax,rcx; ret` on CharacterAnimal: a pure getter, called); then in 0x5B4EF0 anim+0x88, +0xA8 (the
+// entity) and +0xB8 set (:28) and the skeleton's vt+0x190 not 0 (:57). vt+0x190 is OgreMain's Skeleton::getRootBone, NOT a pure getter
+// (when its root list Skeleton+0x1C0..+0x1C8 is empty it derives and stores it): it is NOT called - the slot is compared with the exported
+// getRootBone (vt190=getRootBone|other) and, when it is that, the list is read (roots=<n>, root=<the first: what it returns>). The
+// skeleton by OgreMain's exported Entity::getSkeleton (returns Entity+0x300). The node's OWN position by OgreMain's exported
+// Node::getPosition (the node's local position read from its transform - not the cached world one `node=` shows). Also Character+0x2F8
+// and anim+0x2F8 (both: 'bit 0' fields), the rag-doll (anim+0x2E8) byte +0x5A, the walking layer (+0x640) byte +0x330 (0x661500:45).
+// 1.0.68: 0x5CCF90, 0x5B4EF0, 0x5B0FA0, 0x5B5E30, 0x5CDBF0 and 0x7D08A0 match 1.0.68 unchanged (gen_table_1068's whole-function match),
+// so these offsets hold there; the global is the address-table row CarryFollowGateGlobal (1.0.68 0x2133970, 21 of 21 referencing
+// functions agree). Unseen gates: the carrier lookup's result, 0x5B10A0 (the carrier's bone spot) and 0x9B0B10 (a vector test).
+// Reads and pure getters only; nothing written.
+unsigned long long kP306GateGlobRva = 0; static coop::AddrReg kP306GateGlobRva_reg("CarryFollowGateGlobal", &kP306GateGlobRva);   /* Steam_1.0.65 0x2132910, a qword var - PROBE P306 only */
+struct P306Gate
+{
+    int ok, b1a9, b3d4, hand, animOk, a1a8, a88, hasA8, hasB8, nameOk, animalOk, animal, skelOk, hasSkel, vtOk, vtIsRoot, rootsOk,
+        ragOk, rag5a, mvOk, mv330, globOk, ownOk;
+    unsigned int c2f8, a2f8;
+    unsigned long long nameLen, roots, glob;
+    const void* root;
+    float own[3], p48[3];
+    char name[24];
+};
+typedef void* (*P306AnimalFn)(void* c);          /* Character vt+0x248 (asAnimal) */
+typedef void* (*P306SkelFn)(const void* ent);    /* Ogre::Entity::getSkeleton */
+P306SkelFn g_p306Skel = 0;
+P306OgreOutFn g_p306OwnPos = 0;
+const void* g_p306RootFn = 0;
+int g_p306GLooked = 0;
+void P306GateLook()
+{
+    if (g_p306GLooked != 0) return;
+    g_p306GLooked = 1;
+    HMODULE og = ::GetModuleHandleA("OgreMain_x64.dll");
+    if (og == 0) return;
+    g_p306Skel = (P306SkelFn)::GetProcAddress(og, "?getSkeleton@Entity@Ogre@@QEBAPEAVOldSkeletonInstance@2@XZ");
+    g_p306OwnPos = (P306OgreOutFn)::GetProcAddress(og, "?getPosition@Node@Ogre@@QEBA?AVVector3@2@XZ");
+    g_p306RootFn = (const void*)::GetProcAddress(og, "?getRootBone@Skeleton@Ogre@@UEBAPEAVOldBone@2@XZ");
+}
+// SEH only (C2712): every read guarded on its own; a read that faults leaves its ...Ok 0.
+void P306GateReadPod(::Character* c, P306Gate* o)
+{
+    std::memset(o, 0, sizeof(*o));
+    const char* cb = (const char*)c;
+    __try
+    {
+        const float* l = (const float*)(cb + 0x48);
+        o->p48[0] = l[0]; o->p48[1] = l[1]; o->p48[2] = l[2];
+        o->b1a9 = *(const unsigned char*)(cb + 0x1A9);
+        o->b3d4 = *(const unsigned char*)(cb + 0x3D4);
+        o->hand = *(const int*)(cb + 0x388);
+        o->c2f8 = *(const unsigned int*)(cb + 0x2F8);
+        o->ok = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        P306AnimalFn f = *(P306AnimalFn*)(*(const char* const*)c + 0x248);
+        o->animal = f(c) != 0 ? 1 : 0;
+        o->animalOk = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        const char* mv = *(const char* const*)(cb + 0x640);
+        if (mv != 0) { o->mv330 = *(const unsigned char*)(mv + 0x330); o->mvOk = 1; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        if (kP306GateGlobRva != 0) { o->glob = *(const unsigned long long*)coop::AddrAbs(kP306GateGlobRva); o->globOk = 1; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const char* anim = 0;
+    __try { anim = *(const char* const*)(cb + 0x448); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { anim = 0; }
+    if (anim == 0) return;
+    __try
+    {
+        o->a1a8 = *(const unsigned char*)(anim + 0x1A8);
+        o->a88 = *(const unsigned char*)(anim + 0x88);
+        o->hasA8 = *(void* const*)(anim + 0xA8) != 0 ? 1 : 0;
+        o->hasB8 = *(void* const*)(anim + 0xB8) != 0 ? 1 : 0;
+        o->a2f8 = *(const unsigned int*)(anim + 0x2F8);
+        o->animOk = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        /* MSVC std::string at anim+0x1B0: 16-byte buffer (or a pointer when capacity > 15), size +0x10, capacity +0x18 */
+        const unsigned long long len = *(const unsigned long long*)(anim + 0x1C0);
+        const unsigned long long cap = *(const unsigned long long*)(anim + 0x1C8);
+        o->nameLen = len;
+        const char* s = cap > 15 ? *(const char* const*)(anim + 0x1B0) : anim + 0x1B0;
+        unsigned long long k = 0;
+        for (; k < len && k < sizeof(o->name) - 1; ++k) { const char ch = s[k]; o->name[k] = (ch > 32 && ch < 127) ? ch : '_'; }
+        o->name[k] = 0;
+        o->nameOk = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        const unsigned char* rag = *(const unsigned char* const*)(anim + 0x2E8);
+        if (rag != 0) { o->rag5a = rag[0x5A]; o->ragOk = 1; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        const void* node = *(void* const*)(anim + 0xB0);
+        if (node != 0 && g_p306OwnPos != 0)
+        {
+            float out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const float* r = g_p306OwnPos(node, out);
+            if (r != 0) { o->own[0] = r[0]; o->own[1] = r[1]; o->own[2] = r[2]; o->ownOk = 1; }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try
+    {
+        const void* ent = *(void* const*)(anim + 0xA8);
+        if (ent != 0 && g_p306Skel != 0)
+        {
+            const char* sk = (const char*)g_p306Skel(ent);
+            o->skelOk = 1;
+            o->hasSkel = sk != 0 ? 1 : 0;
+            if (sk != 0)
+            {
+                const void* slot = *(const void* const*)(*(const char* const*)sk + 0x190);
+                o->vtOk = 1;
+                o->vtIsRoot = g_p306RootFn != 0 && slot == g_p306RootFn ? 1 : 0;
+                if (o->vtIsRoot != 0)
+                {
+                    const char* b = *(const char* const*)(sk + 0x1C0);
+                    const char* e = *(const char* const*)(sk + 0x1C8);
+                    o->roots = e >= b ? (unsigned long long)(e - b) / 8 : 0;
+                    if (o->roots > 0 && o->roots < 4096) o->root = *(void* const*)b;
+                    o->rootsOk = 1;
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+std::string P306Hex(unsigned long long v) { char b[24]; sprintf_s(b, sizeof(b), "0x%llX", v); return b; }
+// the gates as text; firstShut = the first gate (in the engine's order) these reads show shut, `none` = every read gate open
+std::string P306GateText(::Character* c)
+{
+    P306GateLook();
+    P306Gate g;
+    P306GateReadPod(c, &g);
+    if (g.ok == 0) return " gates=FAULTED";
+    std::string shut;
+    if (g.a1a8 == 0 && g.b3d4 == 0) shut = g.animOk != 0 ? "a1a8+b3d4" : "unread(anim)";
+    else if (g.hand != 1 && g.hand != 0x5B) shut = "hand";
+    else if (g.globOk == 0) shut = kP306GateGlobRva == 0 ? "unresolved(glob)" : "unread(glob)";
+    else if (g.glob != 0) shut = "glob";
+    else if (g.b1a9 == 0) shut = "b1a9";
+    else if (g.nameOk == 0) shut = "unread(bone)";
+    else if (g.nameLen == 0) shut = "bone";
+    else if (g.animalOk == 0) shut = "unread(animal)";
+    else if (g.animal != 0) shut = "animal";
+    else if (g.animOk == 0) shut = "unread(anim)";
+    else if (g.a88 == 0) shut = "a88";
+    else if (g.hasA8 == 0) shut = "aA8";
+    else if (g.hasB8 == 0) shut = "aB8";
+    else if (g.skelOk == 0) shut = g_p306Skel == 0 ? "unresolved(skel)" : "unread(skel)";
+    else if (g.hasSkel == 0) shut = "skel";
+    else if (g.rootsOk == 0) shut = "unread(root)";
+    else if (g.roots == 0) shut = "roots0";
+    else shut = "none";
+    std::string t = " gates(a1a8=" + S(g.a1a8) + " b3d4=" + S(g.b3d4) + " hand=" + S(g.hand)
+                  + " glob=" + (g.globOk != 0 ? P306Hex(g.glob) : std::string(kP306GateGlobRva == 0 ? "unresolved" : "unread"))
+                  + " b1a9=" + S(g.b1a9) + " bone=" + (g.nameOk != 0 ? S((long long)g.nameLen) + "'" + g.name + "'" : std::string("unread"))
+                  + " animal=" + (g.animalOk != 0 ? S(g.animal) : std::string("unread"))
+                  + " a88=" + S(g.a88) + " aA8=" + S(g.hasA8) + " aB8=" + S(g.hasB8)
+                  + " skel=" + (g.skelOk != 0 ? S(g.hasSkel) : std::string(g_p306Skel == 0 ? "unresolved" : "unread"))
+                  + " vt190=" + (g.vtOk != 0 ? std::string(g.vtIsRoot != 0 ? "getRootBone" : "other") : std::string("unread"))
+                  + " roots=" + (g.rootsOk != 0 ? S((long long)g.roots) + " root=" + S(g.root != 0 ? 1 : 0) : std::string("unread"))
+                  + " firstShut=" + shut + ")";
+    t += " nodeOwn=" + (g.ownOk != 0 ? P306V(g.own) + " nodeOwnOff=" + P306Off(g.own, g.p48)
+                                     : std::string(g_p306OwnPos == 0 ? "unresolved" : "unread"));
+    t += " c2f8=" + P306Hex(g.c2f8) + " a2f8=" + (g.animOk != 0 ? P306Hex(g.a2f8) : std::string("unread"))
+       + " rag5a=" + (g.ragOk != 0 ? S(g.rag5a) : std::string("none")) + " mv330=" + (g.mvOk != 0 ? S(g.mv330) : std::string("none"));
+    return t;
+}
+// T-1411 P306 c: every frame (at most ~60 a second) for the first 0.5 s after each pick-up (P306Pickup's after / own-carrier lines) -
+// `[PROBE] P306 carryfast#<n> t=<ms>ms ..`. Cap 150 lines a launch.
+struct P306Fast { unsigned int uid; ::Character* ch; DWORD t0; DWORD last; int n; };
+const int kP306FastSlots = 4, kP306FastCap = 150;
+P306Fast g_p306F[kP306FastSlots];
+int g_p306FastLines = 0, g_p306FastN = 0;
+void P306FastStart(::Character* body, unsigned int uid)
+{
+    if (body == 0 || uid == 0 || g_p306FastLines >= kP306FastCap) return;
+    int slot = -1;
+    for (int i = 0; i < kP306FastSlots; ++i) if (g_p306F[i].uid == uid) slot = i;
+    for (int i = 0; i < kP306FastSlots && slot < 0; ++i) if (g_p306F[i].uid == 0) slot = i;
+    if (slot < 0) return;
+    P306Fast& f = g_p306F[slot];
+    f.uid = uid; f.ch = body; f.t0 = ::GetTickCount(); f.last = 0; f.n = ++g_p306FastN;
+}
+// T-1411 P306 b: a pick-up of `body` by `carrier` here - the same reads of both, `when` = before / after the engine's pick-up
+// (CarryApplyTick's copy pick-up) or the own carrier's pick-up edge (CarryWatchTick). Cap 120 lines a launch.
+int g_p306PickLines = 0, g_p306Picks = 0;
+const int kP306PickCap = 120;
+void P306Pickup(const char* when, ::Character* body, unsigned int bodyUid, ::Character* carrier, unsigned int carrierUid)
+{
+    if (body != 0 && std::strncmp(when, "before", 6) != 0 && PlausibleObject(body)) P306FastStart(body, bodyUid);   /* P306 c */
+    if (body == 0 || g_p306PickLines >= kP306PickCap || !PlausibleObject(body)) return;
+    P306OgreLook();
+    std::vector<float> own;
+    P306OwnPcs(&own);
+    ++g_p306PickLines;
+    if (std::strncmp(when, "after", 5) != 0) ++g_p306Picks;
+    DebugLog("[PROBE] P306 pickup#" + S(g_p306Picks) + " " + when + " body uid=" + S(bodyUid) + " mine=" + S(net::IsUidMine(bodyUid) ? 1 : 0)
+             + " carried=" + S(BeingCarried(body) ? 1 : 0) + P306Text(body, own, 0, 0)
+             + " | carrier " + (carrier != 0 && PlausibleObject(carrier) ? "uid=" + S(carrierUid) + " mine=" + S(net::IsUidMine(carrierUid) ? 1 : 0) + P306Text(carrier, own, 0, 0) : std::string("none"))
+             + " (line " + S(g_p306PickLines) + " of " + S(kP306PickCap) + ")");
+}
+// PROBE-END: P306
+
+void CarryDropSpotLine(const char* road, ::Character* carrier, unsigned int carrierUid, ::Character* body, unsigned int bodyUid)
+{
+    if (body == 0 || !PlausibleObject(body)) bodyUid = 0;
+    if (bodyUid != 0) P306Start(road, body, bodyUid);   // PROBE P306
+    if (g_dropSpotLogged >= kDropSpotLogLimit) return;
+    ++g_dropSpotLogged;
+    float b[3] = { 0.0f, 0.0f, 0.0f };
+    const bool bodyRead = bodyUid != 0 && DropSpotReadPod(body, b) == 1;
+    Ogre::Vector3 cp(0.0f, 0.0f, 0.0f);
+    const bool carrierRead = carrier != 0 && PlausibleObject(carrier) && SafeReadPosition(carrier, &cp);
+    DebugLog(std::string("[K1] put-down spot (") + road + "): body uid=" + S(bodyUid)
+             + (bodyUid == 0 ? std::string(" (not named)") : net::IsUidMine(bodyUid) ? std::string(" (this game's)") : std::string(" (another game's)"))
+             + " +0x48=" + (bodyRead ? "(" + F1(b[0]) + "," + F1(b[1]) + "," + F1(b[2]) + ")" : std::string("unread"))
+             + " carrier uid=" + S(carrierUid)
+             + (carrierUid == 0 ? std::string() : net::IsUidMine(carrierUid) ? std::string(" (this game's)") : std::string(" (another game's)"))
+             + " here=" + (carrierRead ? "(" + F1(cp.x) + "," + F1(cp.y) + "," + F1(cp.z) + ")" : std::string("unread"))
+             + (bodyRead && carrierRead ? " gap=" + F1(sqrtf((cp.x - b[0]) * (cp.x - b[0]) + (cp.z - b[2]) * (cp.z - b[2]))) : std::string())
+             + " - read only, just before the engine's drop (line " + S(g_dropSpotLogged) + " of " + S(kDropSpotLogLimit) + ")");
 }
 
 // arrest1: may a copy carrier pick up this game's OWN body here? Only a helpless one - knocked out, lying or limp (crash1's
@@ -5827,6 +6351,7 @@ bool OwnBodyInBedMayBeCarried(::Character* body)
 // or not, the body's own game (the engine) decides whether it stays carried; the real game keeps a waking carried
 // character carried (the owner). The old review-arrest1 MEDIUM 1 rule (put an own body down 2 s after it woke) is removed:
 // it changed the authority game's behaviour.
+void CarryKeepNote(bool on, unsigned int bodyUid, unsigned int carrierUid, const char* why);   // T-1411 (F1286), defined below
 void OwnCarryWatch(DropCarriedObjectFn drop)
 {
     (void)drop;
@@ -5838,11 +6363,12 @@ void OwnCarryWatch(DropCarriedObjectFn drop)
         ::Character* cc = FindSpawned(carrierUid);
         const bool mine = net::IsUidMine(bodyUid);
         if (body != 0 && cc != 0 && mine && Carries(cc, body)) { ++it; continue; }   // still carried here: the engine decides (owner 333 a)
+        CarryKeepNote(false, bodyUid, carrierUid, "this game's engine ended the copy carrier's carry of this game's own body");   // T-1411 (F1286)
         if (body != 0 && mine) ActOwedNoteCarryEnd(bodyUid, carrierUid);   // T-859 (owner 1551 a): owed until the carrier's owner shows it
         if (body != 0 && mine && net::SendCarryBreak(bodyUid, carrierUid))
         {
             ++g_carryBreakSent;
-            CarryLog("ended here (break sent)", carrierUid, bodyUid);
+            CarryLog("ended here (engine ended: this game's engine no longer has the copy carrier holding this game's own body; break sent to the carrier's game)", carrierUid, bodyUid);
         }
         g_ownCarried.erase(it++);
     }
@@ -5858,9 +6384,18 @@ void CarryBreakApply(DropCarriedObjectFn drop)
         ::Character* body = FindSpawned(bodyUid);
         if (cc == 0 || body == 0 || !PlausibleObject(cc) || !net::IsUidMine(carrierUid) || !Carries(cc, body))
         { ++g_carryBreakStale; continue; }
+        // T-1360 (F1082) LOG ONLY: the body's pose, unconscious flag, wake timer and inRagdoll() just before and after the drop
+        const bool t1360Line = swcarrystate::Take(&g_t1360DropSeen, &g_t1360DropLogged, swcarrystate::kDropLineCap);
+        const std::string t1360Before = t1360Line ? swcarrystate::Lying(CarryLyingText(body), GetupIsRagdoll(body)) : std::string();
+        CarryDropSpotLine("the body's game let go", cc, carrierUid, body, bodyUid);   // owner 1783: where the body and its carrier stand (log only)
         drop(cc, false, false);   // review-arrest1 LOW 6: a full drop, no ragdoll - the body is usually awake on its game
+        CarryKeepNote(false, bodyUid, carrierUid, "the body's game let go (MSG_CARRY_BREAK: this game's carrier put it down)");   // T-1411 (F1286)
         ++g_carryBreakApplied;
-        CarryLog("drop (the body's game let go)", carrierUid, bodyUid);
+        CarryLog("drop (the body's game let go: its owner ended the carry, MSG_CARRY_BREAK)", carrierUid, bodyUid);
+        OwnDropWhyNote(carrierUid, "the body's game let go (its owner ended the carry, MSG_CARRY_BREAK)");
+        if (t1360Line)
+            DebugLog(swcarrystate::DropLine(carrierUid, bodyUid, t1360Before,
+                                            swcarrystate::Lying(CarryLyingText(body), GetupIsRagdoll(body)), g_t1360DropLogged));
     }
     g_carryBreakIn.clear();
 }
@@ -5896,6 +6431,14 @@ void HandOverSweep(DWORD now)
 // ApplyState's half: remember the owner's word; CarryApplyTick acts on it (latest wins).
 void NoteCarryWant(unsigned int carrier, ::Character* c, unsigned int body, unsigned int peer)
 {
+    // PROBE-START: P303 - the owner's word: this carrier names `body` now (0 = nothing); its earlier word is dropped. LOG ONLY
+    for (std::map<unsigned int, P303Word>::iterator pw = g_p303Word.begin(); pw != g_p303Word.end(); )
+    {
+        if (pw->second.carrier == carrier && pw->first != body) g_p303Word.erase(pw++);
+        else ++pw;
+    }
+    if (body != 0) { P303Word nw; nw.carrier = carrier; nw.at = GetTickCount() | 1u; g_p303Word[body] = nw; }
+    // PROBE-END: P303
     std::map<unsigned int, CarryWant>::iterator it = g_carryWant.find(carrier);
     if (body == 0 && !CarryFlag(c)) { if (it != g_carryWant.end()) g_carryWant.erase(it); return; }
     if (it == g_carryWant.end())
@@ -5910,7 +6453,158 @@ void NoteCarryWant(unsigned int carrier, ::Character* c, unsigned int body, unsi
     it->second.peer = peer;
 }
 
+// T-1411 fix attempt 2, fold 2 (F1274, F1286; carrykeep.h): THE KEEP-UPDATED TEST ANSWERS 'KEEP' FOR EVERY CARRIED CHARACTER.
+// The engine's keep-updated test 0x5C6F30 (row CharacterKeepUpdatedTest; 1.0.68 0x5C79C0) decides, inside the AI worker's view
+// pass 0x5C94D0 (decomp_5c94d0:38-40), whether a character counts as on this game's camera however far it is - then its view byte
+// +0x1A9 stays 1 and the carry step 0x5CCF90 keeps moving a carried body with its carrier's hand (decomp_5ccf90:78). The detour
+// calls the engine's test and answers 'keep' also while the character's own being-carried byte Character +0x3D4 is set (set by
+// the engine's pick-up 0x5CE300, cleared by its drop 0x5CD750 / reset 0x5CC110). Every carry, own or copy, near another player or
+// not; nothing is written in the engine. ANY THREAD (the AI worker): no allocation, no lock, no log line - a guarded byte read and
+// a plain counter (approximate: only the AI worker's pass adds to it in practice).
+unsigned long long kKeepUpdatedTestRva = 0; static coop::AddrReg kKeepUpdatedTestRva_reg("CharacterKeepUpdatedTest", &kKeepUpdatedTestRva);   /* Steam_1.0.65 0x5C6F30 */
+typedef unsigned long long (*KeepUpdatedTestFn)(void* character);   // the answer is the low byte (al): non-zero = keep updated
+KeepUpdatedTestFn g_keepTestOrig = 0;
+int g_keepTestHook = carrykeep::kHookNotTried;
+volatile long long g_keepTestTurned = 0;   // answers the hook turned from 'no' to 'keep' (a carried character)
+long long g_carryKeepOn = 0, g_carryKeepOff = 0, g_carryKeepLogged = 0;
+const long long kCarryKeepLogLimit = 400;   // one line per carry start and per carry end, per launch
+const size_t kInViewOff = 0x1A9;        // Character +0x1A9: in this game's camera view (0x5C94D0; the carry step's gate) - read only
+
+unsigned long long detour_KeepUpdatedTest(void* character)
+{
+    const unsigned long long r = g_keepTestOrig(character);
+    const bool engineKeeps = (unsigned char)r != 0;
+    if (engineKeeps) return r;
+    unsigned char carried = 0;
+    if (!CarryReadByte(character, kBeingCarriedOff, &carried)) carried = 0;
+    if (!carrykeep::HookTurnedToKeep(engineKeeps, (int)carried)) return r;
+    ++g_keepTestTurned;
+    return 1;
+}
+
+// MAIN THREAD, at the mod's carry log points (a pick-up or a drop of `bodyUid` by `carrierUid`): one [K1] carry keep line - whether
+// the being-carried byte is set now (so the hook keeps the body updated) and whether it is in this game's view now. Capped per launch.
+void CarryKeepNote(bool on, unsigned int bodyUid, unsigned int carrierUid, const char* why)
+{
+    if (on) ++g_carryKeepOn; else ++g_carryKeepOff;
+    if (g_carryKeepLogged >= kCarryKeepLogLimit) return;
+    ++g_carryKeepLogged;
+    ::Character* const body = bodyUid != 0 ? FindSpawned(bodyUid) : 0;
+    unsigned char carried = 0, inView = 0;
+    const bool readable = body != 0 && PlausibleObject(body);
+    const int c3d4 = (readable && CarryReadByte(body, kBeingCarriedOff, &carried)) ? (int)carried : -1;
+    const int c1a9 = (readable && CarryReadByte(body, kInViewOff, &inView)) ? (int)inView : -1;
+    DebugLog(std::string("[K1] carry keep ") + (on ? "on" : "off") + ": body uid=" + S(bodyUid) + " carrier uid=" + S(carrierUid) + " - " + why
+             + "; being-carried byte now " + (c3d4 < 0 ? std::string("unread") : S((long long)c3d4))
+             + (c3d4 == 1 ? " (kept updated as if on this game's camera)" : c3d4 == 0 ? " (no longer kept by the hook)" : "")
+             + ", in view now " + (c1a9 < 0 ? std::string("unread") : S((long long)c1a9))
+             + "; " + carrykeep::HookText(g_keepTestHook)
+             + " (keep line " + S(g_carryKeepLogged) + " of " + S(kCarryKeepLogLimit) + ")");
+}
+
 }   // namespace (K1)
+
+// T-1411 fold 2 (F1286): hook the engine's keep-updated test (carrykeep.h). Once, at plugin start.
+void InstallCarryKeep()
+{
+    if (g_keepTestHook != carrykeep::kHookNotTried) return;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    if (kKeepUpdatedTestRva == 0) g_keepTestHook = carrykeep::kHookNoRow;
+    else g_keepTestHook = (coop::AddHook((void*)(base + kKeepUpdatedTestRva), (void*)&detour_KeepUpdatedTest, (void**)&g_keepTestOrig) == coop::SUCCESS)
+                          ? carrykeep::kHookOn : carrykeep::kHookFailed;
+    DebugLog(std::string("[K1] T-1411 carry keep (keep-updated test 1.0.65 0x5C6F30 / 1.0.68 0x5C79C0): ") + carrykeep::HookText(g_keepTestHook));
+}
+
+// PROBE-START: P303 - T-1411 (F1199 / F1200) LOG ONLY: the reads replicate.cpp's [PROBE] P303 lines use; nothing written.
+unsigned int P303OwnerWord(unsigned int body, double* ageSec)
+{
+    std::map<unsigned int, P303Word>::const_iterator it = g_p303Word.find(body);
+    if (it == g_p303Word.end()) { if (ageSec) *ageSec = -1.0; return 0; }
+    if (ageSec) *ageSec = (double)(GetTickCount() - it->second.at) / 1000.0;
+    return it->second.carrier;
+}
+
+unsigned int P303CarrierHere(::Character* body, ::Character** carrier)
+{
+    unsigned int u = 0;
+    ::Character* c = PlausibleObject(body) ? LocalCarrierOf(body, &u) : 0;
+    if (carrier) *carrier = c;
+    return c != 0 ? u : 0;
+}
+
+int P303Carried(::Character* c) { return BeingCarried(c) ? 1 : 0; }
+// PROBE-END: P303
+
+// PROBE-START: P306 - T-1411 (F1236) LOG ONLY, MAIN THREAD (coop.cpp, after RestApplyTick): the watched put-downs' lines, and every
+// 2 s (P306 c: every 1 s, with the carry step's gates; and every frame for 0.5 s after each pick-up) each carried body here with its carrier. Reads only.
+void P306Tick()
+{
+    const DWORD now = ::GetTickCount();
+    bool any = false;
+    for (int i = 0; i < kP306Slots; ++i) if (g_p306W[i].uid != 0) any = true;
+    for (int i = 0; i < kP306FastSlots; ++i) if (g_p306F[i].uid != 0) any = true;   /* P306 c */
+    const bool carryDue = g_p306CarryLines < kP306CarryCap && now - g_p306CarryAt >= 1000;   /* P306 c: once a second */
+    if (!any && !carryDue) return;
+    P306OgreLook();
+    std::vector<float> own;
+    P306OwnPcs(&own);
+    for (int i = 0; i < kP306Slots; ++i)
+    {
+        P306Watch& w = g_p306W[i];
+        if (w.uid == 0) continue;
+        if (FindSpawned(w.uid) != w.ch || !PlausibleObject(w.ch))
+        {
+            if (g_p306Lines < kP306DropCap) { ++g_p306Lines; DebugLog("[PROBE] P306 drop#" + S(w.drop) + " END body uid=" + S(w.uid) + " gone (no longer this registered character)"); }
+            w.uid = 0; continue;
+        }
+        const DWORD age = now - w.t0;
+        bool due = false;
+        if (age <= 2500) due = w.lastLine == 0 || now - w.lastLine >= 16;   /* every frame, at most ~60 lines a second */
+        else if (w.phase == 0 && age >= 5000) { due = true; w.phase = 1; }
+        else if (w.phase == 1 && age >= 8000) { due = true; w.phase = 2; }
+        if (due && g_p306Lines < kP306DropCap)
+        {
+            ++g_p306Lines;
+            w.lastLine = now;
+            DebugLog("[PROBE] P306 drop#" + S(w.drop) + " t=" + S((long long)age) + "ms body uid=" + S(w.uid) + " mine=" + S(net::IsUidMine(w.uid) ? 1 : 0)
+                     + " carried=" + S(BeingCarried(w.ch) ? 1 : 0) + P306Text(w.ch, own, w.prev98, &w.havePrev)
+                     + " (line " + S(g_p306Lines) + " of " + S(kP306DropCap) + ")");
+        }
+        if (w.phase == 2 || g_p306Lines >= kP306DropCap) w.uid = 0;
+    }
+    /* P306 c: the first 0.5 s after each pick-up, every frame (at most ~60 a second), with the carry step's gates */
+    for (int i = 0; i < kP306FastSlots; ++i)
+    {
+        P306Fast& f = g_p306F[i];
+        if (f.uid == 0) continue;
+        const DWORD age = now - f.t0;
+        if (age > 500 || g_p306FastLines >= kP306FastCap || FindSpawned(f.uid) != f.ch || !PlausibleObject(f.ch)) { f.uid = 0; continue; }
+        if (f.last != 0 && now - f.last < 16) continue;
+        f.last = now;
+        ++g_p306FastLines;
+        unsigned int fcu = 0;
+        ::Character* flc = BeingCarried(f.ch) ? LocalCarrierOf(f.ch, &fcu) : 0;
+        DebugLog("[PROBE] P306 carryfast#" + S(f.n) + " t=" + S((long long)age) + "ms body uid=" + S(f.uid) + " mine=" + S(net::IsUidMine(f.uid) ? 1 : 0)
+                 + " carried=" + S(BeingCarried(f.ch) ? 1 : 0) + P306Text(f.ch, own, 0, 0) + P306GateText(f.ch)
+                 + " | carrier " + (flc != 0 ? "uid=" + S(fcu) + " mine=" + S(net::IsUidMine(fcu) ? 1 : 0) + P306Text(flc, own, 0, 0) : std::string("none here"))
+                 + " (line " + S(g_p306FastLines) + " of " + S(kP306FastCap) + ")");
+    }
+    if (!carryDue) return;
+    g_p306CarryAt = now;
+    for (int i = 0; i < MirrorCapacity() && g_p306CarryLines < kP306CarryCap; ++i)
+    {
+        unsigned int u = 0;
+        ::Character* c = 0;
+        if (!MirrorSlot(i, &u, &c) || !BeingCarried(c)) continue;
+        unsigned int cu = 0;
+        ::Character* lc = LocalCarrierOf(c, &cu);
+        ++g_p306CarryLines;
+        DebugLog("[PROBE] P306 carry body uid=" + S(u) + " mine=" + S(net::IsUidMine(u) ? 1 : 0) + " carried=1" + P306Text(c, own, 0, 0) + P306GateText(c)
+                 + " | carrier " + (lc != 0 ? "uid=" + S(cu) + " mine=" + S(net::IsUidMine(cu) ? 1 : 0) + P306Text(lc, own, 0, 0) : std::string("none here (hand link)"))
+                 + " (line " + S(g_p306CarryLines) + " of " + S(kP306CarryCap) + ")");
+    }
+}
+// PROBE-END: P306
 
 // ---- R3 (read-ragdoll 2026-09-22): a downed body's RESTING position is shared --------------------------------------
 // A ragdolled character's position lives only in its physics bodies: getPosition 0x5CDBF0 returns AnimationClass +0x98
@@ -6758,6 +7452,12 @@ bool ApplyState(unsigned int uid, const float* parts, int count, float blood,
     NoteSneakWant(uid, latchBits, fromPeer);
     // The owner's stance buttons (bits 8-13): set on a player character's copy through the engine's own setter (combat.cpp).
     ApplyRemoteStance(uid, c, latchBits);
+    // T-1360 (F1082) LOG ONLY: a standing, uncarried copy its owner says is unconscious - the owner's pose / unconscious bit /
+    // wake timer / what it carries, and what the copy reads now (after the latch above). First kUncStandLineCap per launch.
+    if (before == 0 && (latchBits & coop::kLatchUnconcious) != 0 && !BeingCarried(c)
+        && swcarrystate::Take(&g_t1360UncSeen, &g_t1360UncLogged, swcarrystate::kUncStandLineCap))
+        DebugLog(swcarrystate::UncStandLine(uid, prone, true, koTimer, carryingUid,
+                                            swcarrystate::Lying(CarryLyingText(c), GetupIsRagdoll(c)), g_t1360UncLogged));
     // K1 item 3: while the copy is carried its prone state is NOT written - the owner reads prone=0 while
     // carried. Health and the latch (above) still apply.
     if (before != prone && BeingCarried(c)) { ++g_proneSkippedCarried; return false; }
@@ -6984,7 +7684,17 @@ void CarryWatchTick()
         const unsigned int was = (last == g_carryLast.end()) ? 0 : last->second;
         if (now == was) continue;
         if (now == 0) g_carryLast.erase(last); else g_carryLast[uid] = now;
+        // owner 1783: this game's own carrier's carry edges, both the let-go and the pick-up (a swap logs both)
+        if (was != 0)
+            CarryLog((std::string("own let go (this game's carrier; ") + (net::IsUidMine(was) ? "this game's own body" : "another game's body")
+                     + "; reason: " + OwnDropWhyTake(uid) + ")").c_str(), uid, was);
+        if (now != 0)
+            CarryLog((std::string("own pick-up (this game's carrier picked up ") + (net::IsUidMine(now) ? "this game's own body" : "another game's body")
+                     + " - the engine here: a player order, this game's AI, or a test lever)").c_str(), uid, now);
         if (now != 0) ActOwedNotePickup(now);   // T-860 fold 1: a pick-up here is the newest "where it is held" act of that character
+        // T-1411 fold 2 (F1286; carrykeep.h): the hook keeps any carried body updated; one keep line per edge
+        if (was != 0) CarryKeepNote(false, was, uid, "this game's own carrier let go");
+        if (now != 0) CarryKeepNote(true, now, uid, "this game's own carrier picked it up");
         if (was != 0)   /* T-1262: the let-go memo (BurnCarrierOf) */
         {
             g_carryLetGo[g_carryLetGoNext].body = was; g_carryLetGo[g_carryLetGoNext].carrier = uid; g_carryLetGo[g_carryLetGoNext].at = ::GetTickCount();
@@ -6998,6 +7708,8 @@ void CarryWatchTick()
         // that game can hold its carry mirror's drop and enter the bed from the carry. The request goes on the reliable channel
         // and the STATE on the unreliable one, so it can still arrive after the STATE: that game then has the carrier copy it
         // dropped the body from pick it up again (BedApplyOwn).
+        if (now == 0 && was != 0) P306Start("own carrier let go (the engine's drop)", FindSpawned(was), was);   // PROBE P306
+        if (now != 0 && was == 0) P306Pickup("own carrier picked up (the engine's pick-up)", FindSpawned(now), now, c, uid);   // PROBE P306
         if (now == 0 && was != 0 && !net::IsUidMine(was)) BedAskAtPutDown(was);
         if (StatePush(uid)) ++g_carrySent;   // like prone/dead (F140): at once, not on the round-robin
     }
@@ -7091,6 +7803,7 @@ int BurnOwnBody(unsigned int bodyUid, unsigned int carrierUid, unsigned int* hel
         const int r = BurnLetGoPod((DropCarriedObjectFn)((uintptr_t)::GetModuleHandleA(0) + kDropCarriedObjectRva), lc);
         if (letGo != 0) *letGo = r;
         if (r != 1) return -1;
+        if (net::IsUidMine(cu)) OwnDropWhyNote(cu, "burn (the body's game asked: fed into a corpse furnace there)");
     }
     g_ownCarried.erase(bodyUid);   /* arrest1's watch of an own body carried by a copy ends with the body */
     ::GameWorld* w = GameWorldPtr();
@@ -7122,11 +7835,38 @@ void CarryApplyTick()
         const unsigned int carrierUid = it->first;
         CarryWant& w = it->second;
         ::Character* cc = FindSpawned(carrierUid);
-        if (cc == 0 || !PlausibleObject(cc)) { g_carryWant.erase(it++); continue; }
+        if (cc == 0 || !PlausibleObject(cc))
+        {
+            ++g_carryWishDropped;   // owner 1783: with its reason
+            CarryRefuseLog("[K1] carry wish dropped: carrier uid=" + S(carrierUid) + " is not a character here (gone or not yet made) - its game's word (body uid="
+                           + S(w.body) + ") is dropped");
+            g_carryWant.erase(it++);
+            continue;
+        }
         // The wish was authorised when its STATE arrived; a handoff since may have made us the owner.
-        if (!net::RemoteMayWriteStill(carrierUid, w.peer)) { g_carryWant.erase(it++); continue; }
+        if (!net::RemoteMayWriteStill(carrierUid, w.peer))
+        {
+            ++g_carryWishDropped;   // owner 1783: with its reason
+            CarryRefuseLog("[K1] carry wish dropped: carrier uid=" + S(carrierUid) + " - the game that sent its word (body uid=" + S(w.body)
+                           + ") no longer drives it here (a handoff since); the word is dropped");
+            g_carryWant.erase(it++);
+            continue;
+        }
         // review-k1 item 2: a carrier THIS game drives decides its own carry - never dropped, swapped or handed over here.
-        if (net::IsUidMine(carrierUid)) { ++g_carryConflictMine; g_carryWant.erase(it++); continue; }
+        if (net::IsUidMine(carrierUid))
+        {
+            ++g_carryConflictMine;
+            // owner 1783 (F1286 NIT): each STATE after a handoff renews this wish - one line per carrier and body, then counted only
+            std::map<unsigned int, unsigned int>::iterator said = g_carryMineSaid.find(carrierUid);
+            if (said == g_carryMineSaid.end() || said->second != w.body)
+            {
+                g_carryMineSaid[carrierUid] = w.body;
+                CarryRefuseLog("[K1] carry refused: carrier uid=" + S(carrierUid) + " is driven by this game now - its own carry stands; the other game's word (body uid="
+                               + S(w.body) + ") is dropped (said once per carrier and body; repeats counted in carryConflictMine)");
+            }
+            g_carryWant.erase(it++);
+            continue;
+        }
 
         if (w.body == 0)
         {
@@ -7138,7 +7878,11 @@ void CarryApplyTick()
                 // review-k1 item 5: the drop waits for CharacterBuilt on the carrier and on what it holds.
                 if (!CharacterBuilt(cc, 0) || (heldCh != 0 && !CharacterBuilt(heldCh, 0)))
                 {
-                    if (!w.notedNotReady) { w.notedNotReady = true; ++g_carryNotReady; }
+                    if (!w.notedNotReady)
+                    {
+                        w.notedNotReady = true; ++g_carryNotReady;
+                        CarryRefuseLog("[K1] carry drop waiting: carrier uid=" + S(carrierUid) + " body uid=" + S(held) + " - the carrier or what it holds is not fully built here yet; tried again each frame");
+                    }
                     ++it;
                     continue;
                 }
@@ -7148,19 +7892,26 @@ void CarryApplyTick()
                 const bool heldMine = held != 0 && net::IsUidMine(held);
                 if (bedhandoff::CarryEndHoldsDrop(heldMine, heldMine && BedPendingFor(held, carrierUid)))
                 {
-                    if (!w.notedBedHold) { w.notedBedHold = true; ++g_bedDropHeldForBed; }
+                    if (!w.notedBedHold)
+                    {
+                        w.notedBedHold = true; ++g_bedDropHeldForBed;
+                        CarryRefuseLog("[K1] carry drop held: carrier uid=" + S(carrierUid) + " body uid=" + S(held)
+                                       + " - a bed request from the carrier's game is pending; the bed is entered from this carry");
+                    }
                     ++it;
                     continue;
                 }
+                CarryDropSpotLine("put-down", cc, carrierUid, heldCh, held);   // owner 1783: where the body and its carrier stand (log only)
                 drop(cc, true, false);   // the owner put it down: ragdoll it where it is
                 ++g_carryDropped;
+                if (held != 0) CarryKeepNote(false, held, carrierUid, "put-down (the carrier's game says it carries nothing)");   // T-1411 (F1286)
                 if (held != 0) g_ownCarried.erase(held);   // arrest1 (review MEDIUM 2): the carrier's game ended it - no break
                 if (heldMine)   // a bed request soon after this put-down has this copy pick it up again
                 {
                     OwnDrop od; od.carrier = carrierUid; od.at = now | 1u;
                     g_ownDroppedBy[held] = od;
                 }
-                CarryLog("drop", carrierUid, held);
+                CarryLog("drop (put-down: the carrier's game says it carries nothing)", carrierUid, held);
             }
             g_carryWant.erase(it++);
             continue;
@@ -7169,11 +7920,19 @@ void CarryApplyTick()
         ::Character* body = FindSpawned(w.body);
         if (body == 0 || !PlausibleObject(body))
         {
-            if (!w.notedNoBody) { w.notedNoBody = true; ++g_carryNoLocalBody; }
+            if (!w.notedNoBody)
+            {
+                w.notedNoBody = true; ++g_carryNoLocalBody;
+                CarryRefuseLog("[K1] carry waiting: carrier uid=" + S(carrierUid) + " should carry body uid=" + S(w.body) + " - that body is not a character here yet");
+            }
             ++it;
             continue;
         }
-        if (Carries(cc, body)) { g_carryWant.erase(it++); continue; }   // already so
+        if (Carries(cc, body))   // already so
+        {
+            g_carryWant.erase(it++);
+            continue;
+        }
         if (CarryFlag(cc))
         {
             // Carrying something else: put that down first (pickupObject refuses while +0x348 is set);
@@ -7184,14 +7943,21 @@ void CarryApplyTick()
             // review-k1 item 5: the swap waits for CharacterBuilt on the carrier and on what it holds.
             if (!CharacterBuilt(cc, 0) || (heldCh != 0 && !CharacterBuilt(heldCh, 0)))
             {
-                if (!w.notedNotReady) { w.notedNotReady = true; ++g_carryNotReady; }
+                if (!w.notedNotReady)
+                {
+                    w.notedNotReady = true; ++g_carryNotReady;
+                    CarryRefuseLog("[K1] carry swap waiting: carrier uid=" + S(carrierUid) + " holds body uid=" + S(held) + ", should carry body uid=" + S(w.body)
+                                   + " - the carrier or what it holds is not fully built here yet; tried again each frame");
+                }
                 ++it;
                 continue;
             }
+            CarryDropSpotLine("swap", cc, carrierUid, heldCh, held);   // owner 1783 (log only)
             drop(cc, true, false);
             ++g_carryDropped;
+            if (held != 0) CarryKeepNote(false, held, carrierUid, "swap (the carrier's game says it carries another body)");   // T-1411 (F1286)
             if (held != 0) g_ownCarried.erase(held);   // arrest1 (review MEDIUM 2)
-            CarryLog("drop (swap)", carrierUid, held);
+            CarryLog("drop (swap: the carrier's game says it carries another body)", carrierUid, held);
             ++it;
             continue;
         }
@@ -7211,9 +7977,8 @@ void CarryApplyTick()
             {
                 w.notedOwedEnd = true;
                 ++g_carryHeldOwedEnd;
-                if (++g_carryHeldOwedEndLogged <= 8)
-                    DebugLog("[K1] carry held: body uid=" + S(w.body) + " carrier uid=" + S(carrierUid)
-                             + " - this game ended that carry and its end is still owed; the carrier's STATE predates its put-down");
+                CarryRefuseLog("[K1] carry held: body uid=" + S(w.body) + " carrier uid=" + S(carrierUid)
+                               + " - this game ended that carry and its end is still owed; the carrier's STATE predates its put-down");
             }
             ++it;
             continue;
@@ -7221,7 +7986,12 @@ void CarryApplyTick()
         // out of its bed at the safe point first; the pick-up follows. A take-out that keeps failing falls through to the break.
         if (bodyMine && OwnBodyInBedMayBeCarried(body) && !BedOutForCarryGivenUp(w.body))
         {
-            if (g_bedOutForCarry.insert(w.body).second) ++g_bedOutForCarryQueued;
+            if (g_bedOutForCarry.insert(w.body).second)
+            {
+                ++g_bedOutForCarryQueued;
+                CarryRefuseLog("[K1] carry held: body uid=" + S(w.body) + " carrier uid=" + S(carrierUid)
+                               + " - this game's own body is in a bed or cage here; taken out at the safe point first, the pick-up follows");
+            }
             ++it;
             continue;
         }
@@ -7291,7 +8061,12 @@ void CarryApplyTick()
         }
         if (!CharacterBuilt(cc, 0) || !CharacterBuilt(body, 0))
         {
-            if (!w.notedNotReady) { w.notedNotReady = true; ++g_carryNotReady; }
+            if (!w.notedNotReady)
+            {
+                w.notedNotReady = true; ++g_carryNotReady;
+                CarryRefuseLog("[K1] carry waiting: carrier uid=" + S(carrierUid) + " body uid=" + S(w.body) + " - "
+                               + (!CharacterBuilt(cc, 0) ? "the carrier" : "the body") + " is not fully built here yet (CharacterBuilt); tried again each frame");
+            }
             ++it;
             continue;
         }
@@ -7304,7 +8079,13 @@ void CarryApplyTick()
             other = LocalCarrierOf(body, &otherUid);
             if (other == 0 || !CharacterBuilt(other, 0))   // review-k1 item 5
             {
-                if (!w.notedNotReady) { w.notedNotReady = true; ++g_carryNotReady; }
+                if (!w.notedNotReady)
+                {
+                    w.notedNotReady = true; ++g_carryNotReady;
+                    CarryRefuseLog("[K1] carry waiting: carrier uid=" + S(carrierUid) + " body uid=" + S(w.body) + " - the body is carried here by "
+                                   + (other == 0 ? std::string("a carrier not found here") : "carrier uid=" + S(otherUid) + ", not fully built here yet")
+                                   + "; tried again each frame");
+                }
                 ++it;
                 continue;
             }
@@ -7315,7 +8096,12 @@ void CarryApplyTick()
                 handOver = HandOverFind(w.body, otherUid, carrierUid, now);
                 if (handOver < 0)
                 {
-                    if (!w.notedConflict) { w.notedConflict = true; ++g_carryConflictMine; }
+                    if (!w.notedConflict)
+                    {
+                        w.notedConflict = true; ++g_carryConflictMine;
+                        CarryRefuseLog("[K1] carry refused: body uid=" + S(w.body) + " is carried here by this game's own carrier uid=" + S(otherUid)
+                                       + " - it does not let go on the other game's word (no hand-over mark); carrier uid=" + S(carrierUid) + " not given it");
+                    }
                     ++it;
                     continue;
                 }
@@ -7323,7 +8109,11 @@ void CarryApplyTick()
         }
         if (!CarryCapAllows(carrierUid, now))
         {
-            if (!w.notedCapped) { w.notedCapped = true; ++g_carryRateCapped; }
+            if (!w.notedCapped)
+            {
+                w.notedCapped = true; ++g_carryRateCapped;
+                CarryRefuseLog("[K1] carry held: carrier uid=" + S(carrierUid) + " body uid=" + S(w.body) + " - 3 pick-ups per carrier per 30 s reached; tried again later");
+            }
             ++it;
             continue;
         }
@@ -7332,17 +8122,23 @@ void CarryApplyTick()
             // review-k1 item 1: a FULL drop (ragdoll 0, removeOnly 0). removeOnly=1 skips getDropped (0x5CD750 runs it
             // only when removeOnly == 0), which leaves the body's +0x3D4 set and its carry mode on - pickupObject then
             // refuses and the body is stranded.
+            CarryDropSpotLine("handover", other, otherUid, body, w.body);   // owner 1783 (log only)
             drop(other, false, false);
             ++g_carryDropped;
-            CarryLog("drop (handover)", otherUid, w.body);
+            CarryKeepNote(false, w.body, otherUid, "handover (another carrier here takes the body)");   // T-1411 (F1286)
+            CarryLog("drop (handover: another carrier here takes the body)", otherUid, w.body);
+            if (handOver >= 0) OwnDropWhyNote(otherUid, "handover (a conversation's hand-over: the NPC's copy takes the person)");
         }
+        P306Pickup("before (copy pick-up, CarryApplyTick)", body, w.body, cc, carrierUid);   // PROBE P306
         pickup(cc, body);
+        P306Pickup("after (copy pick-up, CarryApplyTick)", body, w.body, cc, carrierUid);   // PROBE P306
         if (BeingCarried(body))
         {
             ++g_carryApplied;
             if (bodyMine) { ++g_carryOwnApplied; OwnCarry oc; oc.carrier = carrierUid; oc.awakeSince = 0; g_ownCarried[w.body] = oc; }   // arrest1: watched from here on
             if (bodyMine) g_ownDroppedBy.erase(w.body);   // carried again: no earlier put-down left to pick it up from
-            CarryLog(bodyMine ? "apply (own body)" : "apply", carrierUid, w.body);
+            CarryLog(bodyMine ? "apply (own body)" : "apply", carrierUid, w.body);   // pick-up on the carrier's game's word (owner 1783: 'apply' = picked up)
+            CarryKeepNote(true, w.body, carrierUid, bodyMine ? "the copy carrier picked up this game's own body" : "the copy carrier picked up the body");   // T-1411 (F1286)
             if (handOver >= 0)
             {
                 ++g_handOverLetGo;
@@ -7355,6 +8151,8 @@ void CarryApplyTick()
         else
         {
             ++g_carryRefusedByEngine;   // retried on a later tick, inside the cap
+            CarryRefuseLog("[K1] carry refused by the engine: carrier uid=" + S(carrierUid) + " body uid=" + S(w.body)
+                           + " - pickupObject left the body uncarried; tried again within the cap");
             ++it;
         }
     }
@@ -7377,9 +8175,13 @@ std::string CarryReportToken()
          + " carryRefusedWhy[inSomething,insUnreadable,awake,stateUnreadable]=" + S(g_carryRefusedInSomething) + "," + S(g_carryRefusedInsUnread)
          + "," + S(g_carryRefusedAwake) + "," + S(g_carryRefusedStateUnread)
          + " carryTeamAwakeAccepted=" + S(g_carryTeamAwakeAccepted) + " carryOwnFactionAwakeAccepted=" + S(g_carryOwnFactionAwakeAccepted)
-         + " carryHeldOwedEnd=" + S(g_carryHeldOwedEnd)
+         + " carryHeldOwedEnd=" + S(g_carryHeldOwedEnd) + " carryWishDropped=" + S(g_carryWishDropped)
+         // T-1411 fold 2 (F1286): the keep-updated test hook (1 on, -1 failed, -2 no row), answers it turned to 'keep', keep lines
+         + " carryKeep[hook,turned,on,off]=" + S((long long)g_keepTestHook) + "," + S((long long)g_keepTestTurned) + "," + S(g_carryKeepOn)
+         + "," + S(g_carryKeepOff)
          + " handOver[noted,letGo,ended,expired,full,now]=" + S(g_handOverNoted) + "," + S(g_handOverLetGo) + "," + S(g_handOverEnded)
          + "," + S(g_handOverExpired) + "," + S(g_handOverFull) + "," + S((long long)g_handOvers.size())
+         + swcarrystate::ReportToken(g_t1360DropLogged, g_t1360DropSeen, g_t1360UncLogged, g_t1360UncSeen)   // T-1360 LOG ONLY
          // PROBE-START: P158
          + P158ReportToken()
          // PROBE-END: P158
@@ -10189,6 +10991,7 @@ long long g_prisonReleaseRecv = 0;     // arrest3 owner: the guard's game releas
 long long g_prisonReleased = 0;        // arrest3 owner: our own character released (bounty cleared, pardon, unlocked, out)
 long long g_prisonReleaseNotCaged = 0; // arrest3 owner: a RELEASE for a character not in a cage here
 long long g_prisonReleaseFailed = 0;   // arrest3 owner: no cage from its hand / faulted / still in the cage
+long long g_prisonReleaseAlreadyOut = 0;   // T-1296 review L2: a RELEASED for our character already out of any cage (a teammate's FREED took it out first)
 long long g_prisonRefusedSent = 0;     // arrest3 owner: told the guard's game we could not cage our character
 long long g_prisonRefusedRecv = 0;     // arrest3 guard's game: the owner could not cage it
 long long g_prisonRefusedApplied = 0;  // arrest3 guard's game: our copy taken out of its cage on that word
@@ -12047,33 +12850,6 @@ void BedHandoffStart(const PrisonOp& op, ::Character* c, ::Character* cc)
     g_bedHandoffs.push_back(h);
 }
 
-/* PROBE P144 BEGIN */
-/* T-875: a character this game put in a bed for the other game's rescuer - its height against the ground when it is put there and when
-   it leaves the bed (a bed above the ground may leave it standing on a roof). Log only; at most 16 watched, each for up to 10 min. */
-struct P144Watch { unsigned int uid; float spotY; DWORD since; };
-std::vector<P144Watch> g_p144;
-float P144Ground(float x, float z) { float g = 0.0f; return coop::GroundTerrainHeightAt(x, z, &g) == 1 ? g : -99999.0f; }
-void P144Tick()
-{
-    if (g_p144.empty()) return;
-    const DWORD now = ::GetTickCount();
-    for (size_t i = 0; i < g_p144.size(); )
-    {
-        ::Character* c = FindSpawned(g_p144[i].uid);
-        const bool gone = c == 0 || !PlausibleObject(c);
-        const int inBed = gone ? -1 : PoseInSomethingPod(c);
-        if (inBed == 1 && now - g_p144[i].since < 600000u) { ++i; continue; }
-        Ogre::Vector3 at;
-        if (!gone && SafeReadPosition(c, &at))
-            DebugLog("[P144] bed " + std::string(inBed == 1 ? "watch ended (still in it after 10 min)" : "left") + " uid=" + S((long long)g_p144[i].uid)
-                     + " at y=" + S((long long)at.y) + " ground y=" + S((long long)P144Ground(at.x, at.z)) + " (put in at y=" + S((long long)g_p144[i].spotY) + ")");
-        else
-            DebugLog("[P144] bed watch ended uid=" + S((long long)g_p144[i].uid) + " (the character is gone or its position unreadable)");
-        g_p144.erase(g_p144.begin() + i);
-    }
-}
-/* PROBE P144 END */
-
 // stage 3: the second look
 void BedHandoffConfirm(const BedHandoff& h, ::Character* c, SetBedModeFn setBed)
 {
@@ -12088,17 +12864,6 @@ void BedHandoffConfirm(const BedHandoff& h, ::Character* c, SetBedModeFn setBed)
         return;
     }
     ++g_bedApplied;
-    /* PROBE P144 BEGIN */
-    {
-        Ogre::Vector3 at;
-        if (SafeReadPosition(c, &at))
-        {
-            DebugLog("[P144] bed put-in uid=" + S((long long)op.uid) + " spot y=" + S((long long)op.pos[1]) + " at y=" + S((long long)at.y)
-                     + " ground y=" + S((long long)P144Ground(at.x, at.z)));
-            if (g_p144.size() < 16) { P144Watch w; w.uid = op.uid; w.spotY = at.y; w.since = ::GetTickCount(); g_p144.push_back(w); }
-        }
-    }
-    /* PROBE P144 END */
     PrisonLog("<- BED uid=" + S((long long)op.uid) + " put in the bed on the rescuer's spot (distance " + S((long long)dist)
               + ", still there a second later" + std::string(h.op.fromCarry != 0 ? ", entered from the carry" : "") + ") - the other game's rescuer put its copy there");
     StatePush(op.uid);   // a STATE at once; the bed itself travels in the next POSE push
@@ -12106,7 +12871,6 @@ void BedHandoffConfirm(const BedHandoff& h, ::Character* c, SetBedModeFn setBed)
 
 void BedHandoffDrain()
 {
-    P144Tick();   /* PROBE P144 */
     if (g_bedHandoffs.empty()) return;
     if (EngineWritesBlocked() || kSetBedModeRva == 0) { g_bedHandoffs.clear(); return; }
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -12660,6 +13424,12 @@ void PrisonSafePointDrain()
             if (op.release && op.own)   // arrest3: the guard's game released its copy - release our own character the same way
             {
                 void* cage = PrisonCageOf(c);
+                if (cage == 0 && PoseInSomethingPod(c) == 0)   // T-1296 review L2: already out here - nothing to release, not a failure
+                {
+                    ++g_prisonReleaseAlreadyOut;
+                    PrisonLog("<- PRISON uid=" + S((long long)op.uid) + " RELEASED - already out of any cage here (a teammate's freeing took it out first); nothing done");
+                    continue;
+                }
                 const bool pardons = cooprison::PrisonReleasePardons(op.relMode);
                 const double nowH = LocalWorldHours();
                 if (nowH < 0.0 && pardons) ++g_releaseNoClock;
@@ -12677,6 +13447,7 @@ void PrisonSafePointDrain()
                     PrisonLog("<- PRISON uid=" + S((long long)op.uid) + " RELEASED (releaser " + std::string(bail ? "a bail paid on another game - every bounty cleared" : (op.relMode == 2 ? "a player - no bounty cleared" : (op.relMode == 1 ? "named" : "unknown - cage faction")))
                               + (bail ? ", no pardon" : ", pardon") + ", unlocked, walk-out order" + slaveNote + ") - "
                               + (bail ? "the other game paid its bail" : "the other game's guard let its copy go"));
+                    g_poseOwn.erase(op.uid);   // T-1296 review L1: the STATE below says "no pose", not the cached caged pose
                     StatePush(op.uid);
                 }
                 else ++g_prisonReleaseFailed;
@@ -15008,6 +15779,14 @@ unsigned char FreedCageAtEventSend(unsigned int uid, int cagedAtEvent, const uns
     return locks;
 }
 
+// T-1296 review M1, MAIN THREAD (speech.cpp FreedSendDrain): the freed message's freedLeft - the copy was in a cage at the event and
+// is in nothing now (a release took it out; a pick leaves it in the opened cage). cooprison::FreedCopyLeftCage decides.
+unsigned char FreedCopyLeftCageNow(unsigned int uid, int cagedAtEvent)
+{
+    ::Character* const c = FindSpawned(uid);
+    return cooprison::FreedCopyLeftCage(cagedAtEvent, (c != 0 && PlausibleObject(c)) ? PoseInSomethingPod(c) : -1);
+}
+
 #ifdef SW_DEV_BUILD
 // PROBE-START: P214
 /* PROBE P214: the characters speech.cpp's P214 watches - each prisoner a locktest pick|release order was given on this launch
@@ -15086,11 +15865,13 @@ static void LockTestPickRun(const RestraintOp& op)
 // a copy's game's request, and the TEST-ONLY lever's writes and escape order. Each is read again here first.
 namespace {
 /* T-980: kPrisonFreed messages for our own prisoners, waiting for the safe point in arrival order. MAIN THREAD. */
-struct FreedIn { unsigned int uid; unsigned int freerUid; unsigned int peer; DWORD at; unsigned char locks; };   // locks: the message's kFreedLock* byte
+struct FreedIn { unsigned int uid; unsigned int freerUid; unsigned int peer; DWORD at; unsigned char locks; unsigned char left; };   // locks: the message's kFreedLock* byte; left: its freedLeft (T-1296)
 std::vector<FreedIn> g_freedIn;
 const size_t kFreedInMax = 16;
 long long g_fdRecv = 0, g_fdReplaced = 0, g_fdFull = 0, g_fdBlocked = 0, g_fdRaised = 0, g_fdEngineRefused = 0, g_fdNotRaised = 0,
           g_fdLockShut = 0, g_fdNotOurs = 0, g_fdGone = 0, g_fdNoFreer = 0, g_fdNotSender = 0;
+long long g_fdTakenOut = 0, g_fdOutFailed = 0, g_fdOutNotCaged = 0, g_fdOutLocked = 0,   /* T-1296: the take-out after a raise */
+          g_fdOutNoCage = 0, g_fdOutCopyStayed = 0, g_fdOutDead = 0;
 /* True when `c`'s shackles (or its cage's lock) read locked now; none worn, not caged or unreadable reads as not locked. */
 bool RestraintLockedHere(::Character* c, unsigned char kind)
 {
@@ -15102,17 +15883,64 @@ bool RestraintLockedHere(::Character* c, unsigned char kind)
 }
 }   // namespace (T-980)
 
+/* T-1296, MAIN THREAD at the K2 safe point (FreedInDrain, right after the raise): the freer's engine's release task took its copy
+   out of the cage (setPrisonMode off, the walk-out order 0x85 - T2403); the unlock event alone takes no one out, so our own
+   character is taken out here with the same call the arrest road's release of our own character makes for a player's release
+   ("@player", PrisonReleasePod): no bounty cleared, the same pardon from the cage's faction (review L3: one rule, whichever of the
+   two messages comes first), the lock written open, out of the cage, the walk-out order. Its cached pose is dropped before its
+   state is sent at once, so that STATE already says "no pose" and the copies follow it out in the same push (review L1).
+   cooprison::FreedTakeOutDecide decides (only after a release - the freer's copy left its cage, review M1). One line per freeing. */
+static void FreedTakeOut(::Character* c, unsigned int uid, unsigned int freerUid, unsigned char left)
+{
+    const bool dead = c->hasDied();
+    const int before = PoseInSomethingPod(c);
+    void* const cage = (left != 0 && !dead && before == 2) ? PrisonCageOf(c) : 0;
+    const bool locked = cage != 0 && RestraintLockedHere(c, cooprison::kPrisonCageLock);
+    const int d = cooprison::FreedTakeOutDecide(left, dead, before, cage != 0, locked);
+    const std::string who = "[PRISON] freed uid=" + S((long long)uid) + " freer=" + S((long long)freerUid) + ": ";
+    if (d != cooprison::kFreedOutTake)
+    {
+        const char* why = "?";
+        if (d == cooprison::kFreedOutCopyStayed) { ++g_fdOutCopyStayed; why = "the freer's copy stayed in its cage (a pick: the cage only opens)"; }
+        else if (d == cooprison::kFreedOutDead) { ++g_fdOutDead; why = "dead"; }
+        else if (d == cooprison::kFreedOutNotCaged) { ++g_fdOutNotCaged; why = "not caged here"; }
+        else if (d == cooprison::kFreedOutNoCage) { ++g_fdOutNoCage; why = "its cage not found here"; }
+        else { ++g_fdOutLocked; why = "its cage still reads locked here"; }
+        DebugLog(who + "not taken out (in-something=" + S((long long)before) + ", " + why + ")");
+        return;
+    }
+    const bool pardons = cooprison::PrisonReleasePardons(cooprison::kReleaseModePlayer);
+    const double nowH = LocalWorldHours();
+    if (nowH < 0.0 && pardons) ++g_releaseNoClock;
+    const int r = PrisonReleasePod(c, cage, (nowH < 0.0 || !pardons) ? -1.0 : nowH + kPardonHours, 0, cooprison::kReleaseModePlayer);
+    const int after = PoseInSomethingPod(c);
+    if (r == 1 && after == 0)
+    {
+        ++g_fdTakenOut;
+        g_poseOwn.erase(uid);   /* review L1: the STATE below says "no pose", not the cached caged pose */
+        StatePush(uid);
+        DebugLog(who + "taken out of the cage here as the freer's engine did (in-something " + S((long long)before) + " -> " + S((long long)after)
+                 + ", cage open, " + (nowH < 0.0 ? "no pardon (no clock)" : "pardon") + ", out of the cage, walk-out order) - the state sent at once");
+    }
+    else
+    {
+        ++g_fdOutFailed;
+        ErrorLog(who + "take-out FAILED (release " + S((long long)r) + ", in-something " + S((long long)before) + " -> " + S((long long)after)
+                 + ") - our character stays in the open cage");
+    }
+}
+
 /* T-980, MAIN THREAD (ApplyRemotePrison): another game's engine raised the unlock event on its copy of `m.uid` with that game's
    character `m.freerUid` as the freer. Queued; a second one for the same prisoner before the safe point takes the newer freer. */
 void FreedRecv(const cooprison::PrisonMsg& m, unsigned int fromPeer)
 {
     ++g_fdRecv;
     const std::string who = "uid=" + S((long long)m.uid) + " freer=" + S((long long)m.freerUid) + " from game " + S((long long)fromPeer)
-                          + " readOpen=" + S((long long)m.freedLocks);
+                          + " readOpen=" + S((long long)m.freedLocks) + " copyLeftCage=" + S((long long)m.freedLeft);
     for (size_t i = 0; i < g_freedIn.size(); ++i)
         if (g_freedIn[i].uid == m.uid)
         {
-            g_freedIn[i].freerUid = m.freerUid; g_freedIn[i].peer = fromPeer; g_freedIn[i].locks = m.freedLocks;
+            g_freedIn[i].freerUid = m.freerUid; g_freedIn[i].peer = fromPeer; g_freedIn[i].locks = m.freedLocks; g_freedIn[i].left = m.freedLeft;
             ++g_fdReplaced;
             DebugLog("[PRISON] <- freed " + who + " - one already waits for this prisoner; the newer freer kept");
             return;
@@ -15123,7 +15951,7 @@ void FreedRecv(const cooprison::PrisonMsg& m, unsigned int fromPeer)
         ErrorLog("[PRISON] <- freed " + who + " DROPPED: " + S((long long)kFreedInMax) + " already wait for the safe point");
         return;
     }
-    FreedIn f; f.uid = m.uid; f.freerUid = m.freerUid; f.peer = fromPeer; f.at = ::GetTickCount(); f.locks = m.freedLocks;
+    FreedIn f; f.uid = m.uid; f.freerUid = m.freerUid; f.peer = fromPeer; f.at = ::GetTickCount(); f.locks = m.freedLocks; f.left = m.freedLeft;
     g_freedIn.push_back(f);
     DebugLog("[PRISON] <- freed " + who + " - the unlock event is raised on our own prisoner at the safe point");
 }
@@ -15173,6 +16001,7 @@ void FreedInDrain()
         {
             const int rc = FreedRaiseEvent(c, fr, f.uid, f.freerUid, f.locks);
             if (rc == 1) ++g_fdRaised; else if (rc == 0) ++g_fdEngineRefused; else ++g_fdNotRaised;
+            FreedTakeOut(c, f.uid, f.freerUid, f.left);   /* T-1296: whatever the raise answered, as the engine's release task */
             continue;
         }
         const char* why = "?";
@@ -15268,10 +16097,11 @@ std::string RestraintReportToken()
          + S(g_rsGone) + "," + S(g_rsKeyMismatch) + "," + S(g_rsOpsDropped) + "," + S(g_rsLever) + "," + S(g_cageRescueSent) + ","
          + S((long long)g_restraint.size()) + "," + S(g_rsDropped)
          + " restraintScan[passes,usLast,usMax]=" + S(g_rsScans) + "," + S(g_rsScanUsLast) + "," + S(g_rsScanUsMax)
-         + " freedIn[recv,replaced,full,blocked,raised,engineRefused,notRaised,lockShut,notOurs,gone,noFreer,notSender,waiting]="
+         + " freedIn[recv,replaced,full,blocked,raised,engineRefused,notRaised,lockShut,notOurs,gone,noFreer,notSender,waiting,takenOut,outFailed,outNotCaged,outLocked,outNoCage,outCopyStayed,outDead]="
          + S(g_fdRecv) + "," + S(g_fdReplaced) + "," + S(g_fdFull) + "," + S(g_fdBlocked) + "," + S(g_fdRaised) + "," + S(g_fdEngineRefused) + ","
          + S(g_fdNotRaised) + "," + S(g_fdLockShut) + "," + S(g_fdNotOurs) + "," + S(g_fdGone) + "," + S(g_fdNoFreer) + "," + S(g_fdNotSender) + ","
-         + S((long long)g_freedIn.size())
+         + S((long long)g_freedIn.size()) + "," + S(g_fdTakenOut) + "," + S(g_fdOutFailed) + "," + S(g_fdOutNotCaged) + "," + S(g_fdOutLocked)
+         + "," + S(g_fdOutNoCage) + "," + S(g_fdOutCopyStayed) + "," + S(g_fdOutDead)
          + FreedSendReportToken() + CageRecReportToken();
 }
 
@@ -15540,11 +16370,11 @@ std::string PrisonReportToken()
          + S(g_prisonReleaseSent) + "," + S(g_prisonReleaseSendFailed) + "," + S(g_prisonReleaseRecv) + "," + S(g_prisonReleased)
          + "," + S(g_prisonReleaseNotCaged) + "," + S(g_prisonReleaseFailed) + "," + S(g_prisonRefusedSent) + ","
          + S(g_prisonRefusedRecv) + "," + S(g_prisonRefusedApplied) + "," + S((long long)g_releaseHold.size())
-         + " arrest3b[guardCagedNow,copyHoldSentence,copyHoldSentenceFailed,copyLeftNotReleased,releaseNoClock,releaseFacUnknown,releaseOrdered,releaseOrderFailed,refusedPardon,ownSentenceMargin,guardArrestKept,guardSentenceRestored,guardKeptOutsCapped]="
+         + " arrest3b[guardCagedNow,copyHoldSentence,copyHoldSentenceFailed,copyLeftNotReleased,releaseNoClock,releaseFacUnknown,releaseOrdered,releaseOrderFailed,refusedPardon,ownSentenceMargin,guardArrestKept,guardSentenceRestored,guardKeptOutsCapped,releaseAlreadyOut]="
          + S((long long)g_guardCaged.size()) + "," + S(g_copyHoldSentence) + "," + S(g_copyHoldSentenceFailed) + ","
          + S(g_copyLeftNotReleased) + "," + S(g_releaseNoClock) + "," + S(g_releaseFacUnknown) + "," + S(g_releaseOrdered) + ","
          + S(g_releaseOrderFailed) + "," + S(g_refusedPardon) + "," + S(g_ownSentenceMargin) + "," + S(g_guardArrestKept)
-         + "," + S(g_guardSentenceRestored) + "," + S(g_guardKeptOutsCapped)
+         + "," + S(g_guardSentenceRestored) + "," + S(g_guardKeptOutsCapped) + "," + S(g_prisonReleaseAlreadyOut)
          + " bed[sent,recv,applied,refused,noAnswer,leftUnexplained]=" + S(g_bedSent) + "," + S(g_bedRecv) + "," + S(g_bedApplied)
          + "," + S(g_bedRefused) + "," + S(g_bedNoAnswer) + "," + S(g_bedLeftUnexplained)
          + " bed2[refusalStale,notAtSpot,copyMoved,copyNotMoved,outForCarryQueued,outForCarryDone,outForCarryFailed]="
@@ -17362,6 +18192,7 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
         if (IsStandInFaction(faction) || IsPlayerFaction(faction)) CopySquadIdCheck(faction, platoon, engineId, &copyId, "context");
         if (!pc.platoonId.empty() && !IsPlayerFaction(faction) && !IsPeerFaction(faction)) CarryPeerPlatoonId(faction, platoon, pc.platoonId);   /* inv7e: before the bind, so the clash test sees only OTHER squads */
         if (!pc.platoonId.empty()) StoreBindPlatoon(platoon, pc.platoonId, pc.birth);   // P1: world id + the kept byte its birth flag says
+        if (!pc.platoonId.empty()) CopySettingsFromRecord(platoon, pc.platoonId, "made");   /* T-1429 copy settings: the settings its newest record carries (the announce carries the type only) */
         StoreNoteCopyHome(platoon, pc.platoonId, noteHand, haveBuilding ? 1 : 0, building != 0 ? 1 : 0);   /* a building sent that is not loaded here: the copy's home is owed and given by the store's once-a-second owed-home check once that building is loaded [t755-copyhome-call] */
         CtxCampHomeOwe(platoon, key, pc.campKey, pc.squadType, homeWay, town);   /* T-929: a home camp not built here - its town owed */
         if (homePH != 0)
@@ -17784,6 +18615,7 @@ void SpawnWorldTeardown()
     g_koPoseLeft.clear();
     // review-k1 item 4: the carry maps are claims about the same characters.
     g_carryWant.clear();
+    g_p303Word.clear();   // PROBE P303
     g_ownCarried.clear();     // arrest1 (review-arrest1 LOW 4)
     g_ownDroppedBy.clear();   // the carrier copies own bodies were last put down from are per world
     g_bedHoldTest = false;    // the TEST-ONLY bedhold lever lasts one world
@@ -18159,11 +18991,14 @@ int SelectedCharacters(void** out, int cap)
 }
 /* TEST-ONLY `renametest <name> [uid]` (command_channel): the loaded character <uid> (the last word, when it is a number 1..4294967295;
    T-1228: or the word `bought` - the newest uid a T478 buy's BOUGHT confirm put in this game's player faction, hire.cpp HireLastBoughtUid;
+   T-1398: or the word `hired` - the person the newest own hire on this game took on (the uid on its `[HIRE] own hire .. joined=1`
+   line, hire.cpp HireLastHiredUid); refused when none joined this session or that person is dead or gone, never a dead one;
    so a name whose last word is a number needs the uid after it) or, with none, the first selected character - when it is this
    game's own - renamed through
    Character::setName's hooked entry (NameSetOwn) - the setter the name sync hooks: detour_setName marks the uid, NameTick sends
    MSG_NAME, and the other games run NameApplyToCopy (which rebuilds their name tags). One [NAME] line. MAIN THREAD. */
 unsigned int HireLastBoughtUid();   /* hire.cpp (namespace coop, as here) */
+unsigned int HireLastHiredUid();    /* hire.cpp: T-1398 TEST-ONLY - the uid of the newest own hire's `joined=1` */
 std::string RenameTestCommand(const std::string& arg)
 {
     std::string name = arg;
@@ -18171,6 +19006,7 @@ std::string RenameTestCommand(const std::string& arg)
     while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t' || name[name.size() - 1] == '\r')) name.erase(name.size() - 1);
     unsigned int want = 0;   /* the optional last word: the character's uid */
     bool bought = false;     /* T-1228: the last word `bought` = the newest animal or slave a T478 buy put in this game's player faction */
+    bool hired = false;      /* T-1398: the last word `hired` = the person the newest own hire took on (never a dead one) */
     const size_t sp = name.find_last_of(" \t");
     if (sp != std::string::npos)
     {
@@ -18183,6 +19019,19 @@ std::string RenameTestCommand(const std::string& arg)
             want = (unsigned int)v;
             name.erase(sp);
             while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t')) name.erase(name.size() - 1);
+        }
+        else if (w == "hired")
+        {
+            hired = true;
+            want = HireLastHiredUid();
+            name.erase(sp);
+            while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t')) name.erase(name.size() - 1);
+            if (want == 0)
+            {
+                const std::string r = "error renametest hired: no own hire joined this game's player faction this session";
+                DebugLog("[NAME] " + r);
+                return r;
+            }
         }
         else if (w == "bought")
         {
@@ -18208,6 +19057,12 @@ std::string RenameTestCommand(const std::string& arg)
         DebugLog("[NAME] " + r);
         return r;
     }
+    if (hired && coop::StoreIsDeadPod(c) != 0)   /* T-1398: a dead person (or a faulted read) is never renamed by `hired` */
+    {
+        const std::string r = "error renametest hired uid=" + S((long long)want) + ": the newest own hire is dead (or the read faulted) - nobody renamed";
+        DebugLog("[NAME] " + r);
+        return r;
+    }
     const unsigned int uid = FindSpawnedUid(c);
     if (uid == 0 || !net::IsUidMineAnyThread(uid))
     {
@@ -18225,7 +19080,8 @@ std::string RenameTestCommand(const std::string& arg)
     }
     std::string now;
     if (!NameOf(c, &now)) now = "?";
-    const std::string r = "ok renametest uid=" + S((long long)uid) + " name=" + now + " was=" + was + (bought ? " (bought: the newest T478 buy)" : "");
+    const std::string r = "ok renametest uid=" + S((long long)uid) + " name=" + now + " was=" + was + (bought ? " (bought: the newest T478 buy)" : "")
+                          + (hired ? " (hired: the newest own hire)" : "");
     DebugLog("[NAME] " + r);
     return r;
 }

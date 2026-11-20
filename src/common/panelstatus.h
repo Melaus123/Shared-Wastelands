@@ -150,7 +150,9 @@ inline const char* PanelLinkStateName(int state)
 
 /* T-201 N1 (owner-approved wording, 2026-09-29) - THE PRESS: HOST / JOIN connect when pressed, and CANCEL or a failure
    disconnects with no restart. `mode` is 0 HOST, 1 JOIN. World and profile names are always in "double" quotes. */
-const unsigned kPressHostStartMs = 60000u;   /* HOST: the world must answer within this after the press */
+const unsigned kPressHostStartMs = 60000u;   /* HOST: the profile / load step after the world answered (LoadStep); the press itself waits on kPressHostStallMs */
+const unsigned kPressHostStallMs = 30000u;   /* T-1403 (owner 1755 a): HOST fails when the world server's start-up progress has not moved for this long
+                                                (startprogress.h; the same as startprog::kStallMs) - no fixed total limit */
 const unsigned kPressJoinWorldMs = 60000u;   /* JOIN: the host's world must answer within this after the host did */
 inline std::string PressQuoted(const std::string& name) { return "\"" + name + "\""; }
 /* T-290 - THE PASSWORD ON SCREEN.  HOST GAME's PASSWORD box (empty = no password).  PASSWORD
@@ -309,7 +311,7 @@ inline std::string PanelRefusalText(int reason, const std::string& modsText, int
                        : hostMode != 0 ? std::string("Couldn't host: no profile is available.")   /* T-201 N1b (owner 165) */
                        : std::string("Couldn't join: no profile is available.");   /* prof1 fold: this game's own profile dead end; store.cpp's sentence */
         case 5:  return !modsText.empty() ? modsText
-                      : std::string("Mod mismatch: your mods are different from the host's.");
+                      : std::string("This world only accepts players whose mods match the world's, and yours don't.");
         /* T-290: the password and the access list - the same sentence under CAN'T JOIN and CAN'T HOST.  A JOIN refused with 8 or 9
            shows PASSWORD REQUIRED instead (PressPasswordAsk); these two are its lines. */
         case 8:  return kPwNeededLine;
@@ -355,12 +357,13 @@ struct PressFacts
     int       refusal;          /* StoreRefusedReason(), -1 none */
     unsigned  elapsedMs;        /* since the press */
     unsigned  linkedMs;         /* JOIN: since the world-server link first came up after the press, 0 = not yet */
+    unsigned  stillMs;          /* HOST (T-1403): since the world server's start-up progress last moved - since the press when none was read yet */
     int       wrongWorld;       /* a WELCOME was refused since the last leave (StoreWrongWorldRefusal): a kWrongWorld* kind, 0 = none */
     std::string openedWorld, theirWorld;   /* ... the world this game already opened, and the one the WELCOME named */
     long      lobbyGen;         /* T552: the store link generation the world's profile LOBBY list arrived on (StoreLobbyAnswerGen), -1 none */
     long      linkGen;          /* T552: the store link's current generation (StoreLinkGen) - a lobby list counts only when the two agree */
     PressFacts() : mode(0), armed(0), nbState(kNbNotOurs), nbExit(0), nbPort(27016), port(7777),
-                   worldLinked(0), notebookUp(0), dials(0), dialCap(60), refusal(-1), elapsedMs(0), linkedMs(0), wrongWorld(0),
+                   worldLinked(0), notebookUp(0), dials(0), dialCap(60), refusal(-1), elapsedMs(0), linkedMs(0), stillMs(0), wrongWorld(0),
                    lobbyGen(-1), linkGen(0) {}
 };
 /* T-201 N1 fold - config.cpp ConfigWorldSwitchRefused's sentence, word for word (already approved). */
@@ -404,7 +407,7 @@ inline int PressVerdictOf(const PressFacts& f, const std::string& modsText, std:
         if (f.nbState == kNbNoExe || f.nbState == kNbSpawnFailed || f.nbState == kNbStoppedEarly)
             b = PanelNotebookText(f.nbState, f.nbPort, f.nbExit);
         else if (f.armed != 0 && (f.notebookUp != 0 || lobbyAnswered != 0)) return kPressDone;   /* T552: WELCOME or lobby */
-        else if (f.elapsedMs >= kPressHostStartMs) b = kPressHostLateText;
+        else if (f.stillMs >= kPressHostStallMs) b = kPressHostLateText;   /* T-1403 (owner 1755 a): no fixed total - its start-up progress stood still that long */
     }
     else
     {
@@ -908,8 +911,8 @@ inline std::string NoticeTitle(const std::string& text)
     { const std::string autoLoad("In multiplayer your game loads automatically."); if (text.compare(0, autoLoad.size(), autoLoad) == 0) return "CAN'T LOAD"; }
     std::string low(text);
     for (size_t i = 0; i < low.size(); ++i) if (low[i] >= 'A' && low[i] <= 'Z') low[i] = (char)(low[i] - 'A' + 'a');
-    { const std::string w1("Your mods don't match the host's"), w2("Your mods are the same as the host's");   /* T-246 (owner 200): coopmods::ModWarnText */
-      if (text.compare(0, w1.size(), w1) == 0 || text.compare(0, w2.size(), w2) == 0) return "MODS DON'T MATCH"; }
+    { const std::string w1("Your mods don't match the world's"), w2("Your mods are the same as the world's"), w3("This world only accepts players whose mods match");   /* T-246 (owner 200): coopmods::ModWarnText; T-247: the world's, and the Rejected box */
+      if (text.compare(0, w1.size(), w1) == 0 || text.compare(0, w2.size(), w2) == 0 || text.compare(0, w3.size(), w3) == 0) return "MODS DON'T MATCH"; }
     if (low.compare(0, 12, "mod mismatch") == 0 || low.find("mods") != std::string::npos) return "MOD MISMATCH";   /* the refusal's words (T-247 path) */
     return "MULTIPLAYER";
 }
@@ -1073,32 +1076,25 @@ const char* const kProfDeleteFailTitle = "CAN'T DELETE";
 inline std::string WorldDeletedText(const std::string& world) { return "\"" + world + "\" deleted."; }
 inline std::string WorldDeleteFailText(const std::string& world)
 { return "Couldn't delete \"" + world + "\": another program is using its files."; }
-/* RESET WORLD (HOST GAME): the confirm dialog's words, in two pieces around its keep-buildings tick box (kResetKeepLabel, unticked
+/* RESET WORLD (HOST GAME): the confirm dialog's words, in two pieces around its keep-buildings tick box (kResetKeepLabel, ticked
    each time the dialog opens): ResetWorldDlgHead above it - the question, what starts over and what every player keeps - and
    ResetWorldDlgTail under it, oldName being the name the world as it was keeps ("<name> - before reset <n>"); then the status line
    while the world server's --reset-world runs, and the line its exit code gives (exitCode -1 = it was not started). */
+/* T-1383 (decision 1704; the approved page, version 3 - word for word): one sentence on what happens, one on what every player keeps,
+   the three tick boxes (all ticked each time the dialog opens - T-1424, owners 1772 / 1773), the old world's name and the players who aren't here. */
 inline std::string ResetWorldDlgHead(const std::string& world)
 {
-    return "Reset \"" + world + "\"?\n\n"
-           "The world goes back to how it was at the start, for every player.\n\n"
-           "Starts over:\n"
-           "  Towns, outposts and the people living in them\n"
-           "  Named characters who died, and who rules each town\n"
-           "  How the factions feel about each other\n"
-           "  The day and time\n"
-           "  Ruins, loot and everything left on the ground\n"
-           "  Buildings and what is stored in them, unless kept below\n\n"
-           "Kept for every player:\n"
-           "  Characters, with their skills, health and equipment\n"
-           "  Money and research\n"
-           "  What each player's map shows\n"
-           "  How each player's faction stands with others";
+    return "Reset \"" + world + "\" for every player? Towns, people, loot and the time of day start over.\n\n"
+           "Every player keeps their characters, gear, money, research, map and their own faction's standings.";
 }
-const char* const kResetKeepLabel = "Keep players' buildings, furniture and stored items";
+const char* const kResetKeepLabel = "Keep players' buildings and stored items";
+const char* const kResetKeepDeadLabel = "Keep named characters who died";
+const char* const kResetKeepRelLabel = "Keep how the factions feel about each other";
+const char* const kResetHoverDead = "Named characters who are dead in this world stay dead after the reset.";
+const char* const kResetHoverRel = "Factions keep the standings they have with each other now.";
 inline std::string ResetWorldDlgTail(const std::string& oldName)
 {
-    return "Players who aren't here now are moved into the reset world the next time they join. The old world is kept as \""
-           + oldName + "\".";
+    return "The old world is saved as \"" + oldName + "\". Players who aren't here join the reset world the next time they connect.";
 }
 inline std::string ResetWorldBusyText(const std::string& world)  { return "Resetting \"" + world + "\"..."; }
 inline std::string ResetWorldDoneText(const std::string& world)  { return "\"" + world + "\" was reset."; }
@@ -1195,11 +1191,11 @@ inline std::string PanelPlayersText(const std::string& me, const std::vector<std
    accepts the wider range of gpoptions.h GpValueOk / GtValueOk) is shown as it is, a word row's as its number, and a step
    from it goes to the nearest choice in that direction.
    gp.ae, gp.dh, gt.civ (no visible effect, design-settings1) and researchmode (hidden until L2c') are not rows. */
-enum { kOptTabDifficulty = 0, kOptTabWorld = 1, kOptTabCoop = 2, kOptTabCount = 3 };
+enum { kOptTabDifficulty = 0, kOptTabWorld = 1, kOptTabCoop = 2, kOptTabMods = 3, kOptTabCount = 4 };   /* T-247 (owner 1679): MODS, the fourth tab */
 /* kOptKindSwitch: a tick box whose values are "on" / "off" (the world server's words); kOptKindAmount: a typing box of digits. */
 enum { kOptKindDifficulty = 0, kOptKindWorld = 1, kOptKindTick = 2, kOptKindPick = 3, kOptKindSwitch = 4, kOptKindAmount = 5 };
-const int kOptCount = 25;   /* ui5: + PROFILES PER PLAYER; T-556: + RESURRECTION, RESURRECTION FEE, FEE GROWTH; T-1096: + the three import rows */
-const int kOptRowsShown = 10;   /* the most rows one tab has (MULTIPLAYER since T-1096) */
+const int kOptCount = 27;   /* T-1392: + MENUS AND BUILDING; ui5: + PROFILES PER PLAYER; T-556: + RESURRECTION, RESURRECTION FEE, FEE GROWTH; T-1096: + the three import rows; T-247: + DIFFERENT MODS */
+const int kOptRowsShown = 11;   /* the most rows one tab has (MULTIPLAYER since T-1096; T-1392: 11 with MENUS AND BUILDING shown) */
 struct OptDef { int tab; const char* key; const char* label; int kind; const char* dflt; };
 inline const OptDef* OptDefs()
 {
@@ -1221,7 +1217,10 @@ inline const OptDef* OptDefs()
         { kOptTabWorld, "gt.limbloss", "LIMB LOSS", kOptKindPick, "" },
         { kOptTabCoop, "recruitmult", "EXTRA RECRUITS IN BARS", kOptKindPick, "auto" },
         { kOptTabCoop, "basepolicy", "BASE ACCESS", kOptKindPick, "shared" },
-        { kOptTabCoop, "timemode", "GAME SPEED CONTROL", kOptKindPick, "fixed" },
+        { kOptTabCoop, "timemode", "GAME SPEED CONTROL", kOptKindPick, "consensus" },   /* T-1423: coopclock::kTimeModeAbsent's word (the suite checks the two agree) */
+        /* T-1392 (owner 1722 / 1723, the approved page): right under GAME SPEED CONTROL, shown only while it is Slowest wins
+           (OptRowShown); the default is coopclock::kMenusPauseAbsent's word (owner 969 / 1724 a) - the suite checks the two agree */
+        { kOptTabCoop, "menupause", "MENUS AND BUILDING", kOptKindPick, "run" },
         /* ui5 (approved 2026-09-27): the host option prof1 reads (profiles.h kCapMin..kCapMax, default kCapDefault); the
            world server accepts it from the host (store_main.cpp OptionValueOk "profilecap"). */
         { kOptTabCoop, "profilecap", "PROFILES PER PLAYER", kOptKindPick, "3" },
@@ -1234,11 +1233,13 @@ inline const OptDef* OptDefs()
            research come along - the world server keeps them (spimport.h; store_main.cpp OptionValueOk). */
         { kOptTabCoop, "spimport", "IMPORT FROM SINGLE PLAYER", kOptKindPick, "all" },
         { kOptTabCoop, "spimportmoney", "IMPORT INCLUDES MONEY", kOptKindPick, "yes" },
-        { kOptTabCoop, "spimportresearch", "IMPORT INCLUDES RESEARCH", kOptKindPick, "yes" } };
+        { kOptTabCoop, "spimportresearch", "IMPORT INCLUDES RESEARCH", kOptKindPick, "yes" },
+        /* T-247 (owner 1679, the approved page): the MODS tab's one row - the world server keeps it (modlist.h kModsRuleKey) */
+        { kOptTabMods, "modcheck", "DIFFERENT MODS", kOptKindPick, "accepted" } };
     return d;
 }
 struct OptChoice { const char* key; const char* wire; const char* shown; };
-const int kOptChoiceCount = 46;   /* ui5: + profilecap 1..16; T-556: + resurrectgrowth; T-1096: + the import rows; + timemode vote and locked */
+const int kOptChoiceCount = 50;   /* T-1392: + MENUS AND BUILDING; ui5: + profilecap 1..16; T-556: + resurrectgrowth; T-1096: + the import rows; + timemode vote and locked */
 inline const OptChoice* OptChoices()
 {
     static const OptChoice c[kOptChoiceCount] = {
@@ -1250,6 +1251,7 @@ inline const OptChoice* OptChoices()
         { "basepolicy", "shared", "Everyone" }, { "basepolicy", "owner", "Owner only" }, { "basepolicy", "locked", "Locked" },
         { "timemode", "fixed", "Admin only" }, { "timemode", "consensus", "Slowest wins" },
         { "timemode", "vote", "Everyone agrees" }, { "timemode", "locked", "Normal speed only" },
+        { "menupause", "run", "Keep running" }, { "menupause", "pause", "Pause everyone" },   /* T-1392 */
         { "profilecap", "1", "1" }, { "profilecap", "2", "2" }, { "profilecap", "3", "3" }, { "profilecap", "4", "4" },
         { "profilecap", "5", "5" }, { "profilecap", "6", "6" }, { "profilecap", "7", "7" }, { "profilecap", "8", "8" },
         { "profilecap", "9", "9" }, { "profilecap", "10", "10" }, { "profilecap", "11", "11" }, { "profilecap", "12", "12" },
@@ -1257,7 +1259,8 @@ inline const OptChoice* OptChoices()
         { "resurrectgrowth", "steady", "Steady" }, { "resurrectgrowth", "steep", "Steep" },
         { "spimport", "all", "Allowed for everyone" }, { "spimport", "owner", "Owner and admins only" }, { "spimport", "off", "Not allowed" },
         { "spimportmoney", "yes", "Yes" }, { "spimportmoney", "no", "No" },
-        { "spimportresearch", "yes", "Yes" }, { "spimportresearch", "no", "No" } };
+        { "spimportresearch", "yes", "Yes" }, { "spimportresearch", "no", "No" },
+        { "modcheck", "accepted", "Accepted" }, { "modcheck", "rejected", "Rejected" } };
     return c;
 }
 inline const double* OptLadder(int kind, int* n)
@@ -1286,6 +1289,65 @@ inline int OptIndexOfKey(const char* key)
 {
     for (int i = 0; i < kOptCount; ++i) if (std::string(OptDefs()[i].key) == key) return i;
     return -1;
+}
+/* T-1392: whether row i is on its tab at all with the screen's values `vals` (indexed like OptDefs) - not greyed, absent: MENUS AND
+   BUILDING only while GAME SPEED CONTROL is Slowest wins. Every other row always is. A hidden row's value is kept. */
+inline bool OptRowShown(int i, const std::string* vals)
+{
+    if (i < 0 || i >= kOptCount) return false;
+    if (std::string(OptDefs()[i].key) != "menupause") return true;
+    const int tm = OptIndexOfKey("timemode");
+    return vals != 0 && tm >= 0 && vals[tm] == "consensus";
+}
+/* The option on screen row `row` of `tab` with the values `vals` - the tab's shown rows top to bottom, with no gap where a hidden
+   row would be - or -1 for an empty row. */
+inline int OptIndexShown(int tab, int row, const std::string* vals)
+{
+    int k = 0;
+    for (int i = 0; i < kOptCount; ++i)
+    {
+        if (OptDefs()[i].tab != tab || !OptRowShown(i, vals)) continue;
+        if (k == row) return i;
+        ++k;
+    }
+    return -1;
+}
+/* The screen row option i is on with the values `vals`, or -1 (another tab, or hidden). */
+inline int OptRowShownOf(int tab, int i, const std::string* vals)
+{
+    for (int r = 0; r < kOptRowsShown; ++r) if (OptIndexShown(tab, r, vals) == i) return r;
+    return -1;
+}
+/* T-1392 review fix 1: GAME OPTIONS' click codes, as numbers the offline suite can read (ui.cpp UiActionCode holds the same ones and
+   checks they agree when it compiles). Rows 0..8 have a code range each for the minus, the plus and the tick box; the tenth row's
+   (T-1096) and the eleventh row's (T-1392) codes are past those ranges. 83..87 are the MODS tab's (T-247, T-1375). */
+enum { kOptActOpen = 20, kOptActTab0 = 21, kOptActDec0 = 24, kOptActInc0 = 33, kOptActTick0 = 42, kOptActDone = 52, kOptActLowRows = 9,
+       kOptActDec9 = 75, kOptActInc9 = 76, kOptActTick9 = 77, kOptActTab3 = 83, kOptActModsOrder = 87,
+       kOptActDec10 = 88, kOptActInc10 = 89, kOptActTick10 = 90 };
+enum { kOptPartDec = 0, kOptPartInc = 1, kOptPartTick = 2 };
+/* The click code of screen row r's minus, plus or tick box (kOptPart*), or -1 for a row past kOptRowsShown. */
+inline int OptRowAct(int part, int r)
+{
+    if (r < 0 || r >= kOptRowsShown || part < kOptPartDec || part > kOptPartTick) return -1;
+    if (r < kOptActLowRows) return (part == kOptPartDec ? kOptActDec0 : part == kOptPartInc ? kOptActInc0 : kOptActTick0) + r;
+    if (r == 9) return part == kOptPartDec ? kOptActDec9 : part == kOptPartInc ? kOptActInc9 : kOptActTick9;
+    if (r == 10) return part == kOptPartDec ? kOptActDec10 : part == kOptPartInc ? kOptActInc10 : kOptActTick10;
+    return -1;
+}
+/* The screen row a row click code names (and *dir = -1 for a minus, 1 for a plus or a tick box), or -1 for any other code. */
+inline int OptActRow(int act, int* dir)
+{
+    for (int r = 0; r < kOptRowsShown; ++r)
+        for (int p = kOptPartDec; p <= kOptPartTick; ++p)
+            if (OptRowAct(p, r) == act) { if (dir) *dir = (p == kOptPartDec) ? -1 : 1; return r; }
+    return -1;
+}
+/* 1 = the click code goes to GAME OPTIONS' handler (ui.cpp PanelOptAction): the screen's own range, every row's codes, the MODS tab's. */
+inline bool OptActRouted(int act)
+{
+    if (act >= kOptActOpen && act <= kOptActDone) return true;
+    if (act >= kOptActTab3 && act <= kOptActModsOrder) return true;
+    return OptActRow(act, 0) >= 0;
 }
 /* How many rows `tab` shows. */
 inline int OptTabRows(int tab)
@@ -1417,6 +1479,7 @@ inline std::string OptHoverText(int i, const std::string* vals)
     if (k == "gt.raidfreq") return "How often raids come.";
     if (k == "gt.attacks") return "How often factions attack player bases.";
     if (k == "gt.limbloss") return "How easily a bad wound costs an arm or a leg.";
+    if (k == "modcheck") return "What happens when a joining player's mods are not exactly\nthe world's. Accepted: they join with a warning.\nRejected: they are turned away.";   /* T-247 (the approved page's words, three lines of at most 60: they do not fit in two) */
     if (k == "recruitmult")
     {
         if (v == "1") return "Bars offer the usual recruits.";
@@ -1440,6 +1503,12 @@ inline std::string OptHoverText(int i, const std::string* vals)
         if (v == "consensus") return "The slowest player's choice is used.\nOne player pausing pauses everyone.";
         if (v == "vote") return "The speed changes only when every player picks it.";
         if (v == "locked") return "Always normal speed. Nobody can pause.";
+        return std::string();
+    }
+    if (k == "menupause")   /* T-1392 (the approved page's words) */
+    {
+        if (v == "run") return "A player's open menu or build mode pauses nobody.\nThe world keeps running for everyone.";
+        if (v == "pause") return "A player's open menu or build mode pauses everyone,\nas if they had pressed pause.";
         return std::string();
     }
     if (k == "profilecap") return "Most profiles one player can have here.";
@@ -1681,6 +1750,157 @@ inline const char* PrepCancelWhy(int phase)
     if (phase == kPrepPosted) return "the load did not start a world";
     if (phase == kPrepWindowWait) return "the NEW GAME window did not come up";
     return "the MULTIPLAYER panel closed before a world started";
+}
+
+/* T-1390 (F1116) - THE QUIET NOTICE'S STRIP (the loading screen's progress line and the connection-problem notice).
+   Its layers, tried in this order: the first one the game's layer list knows is the one it is made on. Kenshi's loading screen
+   is a full-window picture whose root is on "Top" (Kenshi_LoadingScreen.layout:3-4, Read), and core_layer.xml draws only
+   "Pointer" above "Top" (Read). "Top" is a SharedLayer: MyGUI draws a shared layer's widgets in texture batches, not one above
+   another, so raising the strip inside Top cannot put it over the loading picture (Inferred from MyGUI's layer design; a
+   picture whose texture is set after the strip is batched after it). "Pointer" holds only the mouse pointer and takes no
+   clicks (Pick=false, Read) - the strip takes none either. Info and Popup stay as the fall-backs for a layer list that has
+   no Pointer. */
+const int kQuietLayerCount = 3;
+inline const char* QuietLayerAt(int k)
+{
+    if (k == 0) return "Pointer";
+    if (k == 1) return "Info";
+    if (k == 2) return "Popup";
+    return "";
+}
+/* The strip's approved width: 30% of the view, at least 360 px, never wider than the view less 20. */
+inline int QuietBaseWidth(int viewW)
+{
+    int w = (viewW * 30) / 100;
+    if (w < 360) w = 360;
+    if (w > viewW - 20) w = viewW - 20;
+    return w;
+}
+/* The strip's width for its words: the approved width, or wider - the MEASURED text width plus the text skin's margin, the
+   strip's inset around the line and 8 px of slack - never wider than the view less 20. A text width of 0 or less (nothing
+   measured) keeps the approved width. */
+inline int QuietStripWidth(int viewW, int textW, int marginW, int inset)
+{
+    const int base = QuietBaseWidth(viewW);
+    int want = textW > 0 ? textW + (marginW > 0 ? marginW : 0) + (inset > 0 ? inset : 0) + 8 : base;
+    if (want < base) want = base;
+    if (want > viewW - 20) want = viewW - 20;
+    return want;
+}
+
+/* T-1390 (owner decision 1730, mock-up build/pages/load-progress-panel-mockup.html): THE LOADING SCREEN'S PROGRESS PANEL - the words
+   (cooppre::PreProgressText, unchanged from decision 1715) over a bar, in a panel just above Kenshi's LOADING box, centred on it and a
+   little wider. The box: Kenshi_LoadingScreen.layout's LoadingPanel, position_real 0.34375 0.657407 0.3125 0.277778 of the window (Read),
+   kept here in millionths. Pure: every rectangle below is from the window size and the measured words. */
+const int kLoadBoxXm = 343750, kLoadBoxYm = 657407, kLoadBoxWm = 312500, kLoadBoxHm = 277778;
+inline int LoadBoxPart(int v, int m) { return (int)(((long long)v * m + 500000LL) / 1000000LL); }
+inline int LoadBoxLeft(int vw) { return LoadBoxPart(vw, kLoadBoxXm); }
+inline int LoadBoxTop(int vh) { return LoadBoxPart(vh, kLoadBoxYm); }
+inline int LoadBoxWidth(int vw) { return LoadBoxPart(vw, kLoadBoxWm); }
+/* the panel's fixed parts (px): the words' and the bar's inset from the panel's edges, the space between them, the bar's height
+   (Kenshi_ProgressBarEmptySkin's own 16), and the space between the panel's bottom and the box's top */
+const int kLoadPanelPadX = 16, kLoadPanelPadY = 10, kLoadPanelGap = 8, kLoadPanelBarH = 16, kLoadPanelPct = 52;
+inline int LoadPanelGapAbove(int vh) { const int g = vh / 150; return g < 4 ? 4 : g; }
+/* its width: 52% of the window (the mock-up), never narrower than the box plus 40, and as wide as the measured words need (words +
+   both insets + 8 slack); never wider than the window less 20 */
+inline int LoadPanelWidth(int vw, int textW)
+{
+    int w = (vw * kLoadPanelPct) / 100;
+    const int box = LoadBoxWidth(vw) + 40;
+    if (w < box) w = box;
+    const int need = textW > 0 ? textW + 2 * kLoadPanelPadX + 8 : 0;
+    if (need > w) w = need;
+    if (w > vw - 20) w = vw - 20;
+    return w < 0 ? 0 : w;
+}
+/* 1 = words of this measured width fit on one line in the widest panel this window allows (else the next smaller font is tried) */
+inline int LoadPanelWordsFit(int vw, int textW) { return textW + 2 * kLoadPanelPadX + 8 <= vw - 20 ? 1 : 0; }
+/* the fonts tried for the words, largest first: Kenshi's own floater fonts (data/gui/fonts: 26, 22 and the small one) - the first whose
+   words fit is used; the largest is about twice the strip's line */
+const int kLoadPanelFontCount = 3;
+inline const char* LoadPanelFontAt(int k)
+{
+    if (k == 0) return "Kenshi_FloaterFont_Large";
+    if (k == 1) return "Kenshi_FloaterFont_Medium";
+    if (k == 2) return "Kenshi_FloaterFont_Small";
+    return "";
+}
+/* T-1390 (T2477 look; the page's words are ~22 px at 960 wide, twice the font's own 14 px line as built): the words' line height - twice the
+   font's own, less only when the words (defTextW wide at the font's own height) would not fit on one line in the widest panel the window
+   allows; never below the font's own. 0 = no own height known. */
+inline int LoadPanelWordsHeight(int vw, int defH, int defTextW)
+{
+    if (defH <= 0) return 0;
+    int h = 2 * defH;
+    const int maxText = vw - 20 - 2 * kLoadPanelPadX - 8;
+    if (defTextW > 0 && maxText > 0 && (long long)defTextW * h > (long long)maxText * defH) h = (int)(((long long)maxText * defH) / defTextW);
+    return h < defH ? defH : h;
+}
+struct LoadPanelBox { int x, y, w, h; int tx, ty, tw, th; int bx, by, bw, bh; };
+/* the panel's rectangle (window coordinates) and its words' and bar's (the panel's own): centred on the box, its bottom
+   LoadPanelGapAbove above the box's top, never above the window's top; lineH = the measured words' height (0 = 32) */
+inline LoadPanelBox LoadPanelLayout(int vw, int vh, int textW, int lineH)
+{
+    LoadPanelBox b;
+    const int lh = lineH > 0 ? lineH : 32;
+    b.w = LoadPanelWidth(vw, textW);
+    b.h = kLoadPanelPadY + lh + kLoadPanelGap + kLoadPanelBarH + kLoadPanelPadY;
+    const int cx = LoadBoxLeft(vw) + LoadBoxWidth(vw) / 2;
+    b.x = cx - b.w / 2;
+    if (b.x > vw - 10 - b.w) b.x = vw - 10 - b.w;
+    if (b.x < 10) b.x = 10;
+    b.y = LoadBoxTop(vh) - LoadPanelGapAbove(vh) - b.h;
+    if (b.y < 0) b.y = 0;
+    b.tx = kLoadPanelPadX; b.ty = kLoadPanelPadY; b.tw = b.w - 2 * kLoadPanelPadX; b.th = lh;
+    b.bx = kLoadPanelPadX; b.by = kLoadPanelPadY + lh + kLoadPanelGap; b.bw = b.w - 2 * kLoadPanelPadX; b.bh = kLoadPanelBarH;
+    return b;
+}
+/* THE BAR: a fill of 0-100 (a / b), or one of these */
+const int kLoadFillSliding = -1;   /* the size is not known yet: a short piece slides back and forth */
+const int kLoadFillHidden = -2;    /* the connection-problem words are up: no bar until the link is back */
+const int kLoadFillNone = -100;    /* nothing shown or logged yet */
+/* the fill from the bytes in and the bytes wanted: floor(got * 100 / want), never above 100; nothing wanted is full (nothing to get) */
+inline int LoadPanelFillPct(unsigned long long got, unsigned long long want)
+{
+    if (want == 0ULL || got >= want) return 100;
+    const unsigned long long p = want > 184467440737095ULL ? got / (want / 100ULL) : (got * 100ULL) / want;   /* no overflow past 2^64 / 100 */
+    return p >= 100ULL ? 99 : (int)p;   /* got < want here: never full (the big-size division can round up) */
+}
+inline int LoadPanelFillW(int trackW, int pct)
+{
+    if (trackW <= 0 || pct <= 0) return 0;
+    return pct >= 100 ? trackW : (int)(((long long)trackW * pct) / 100LL);
+}
+/* the sliding piece: 22% of the track (the mock-up), there and back once every 2 * kLoadSlideMs - moved by the drawing each frame,
+   decides nothing */
+const unsigned int kLoadSlideMs = 1800u;
+inline int LoadPanelSlidePieceW(int trackW) { const int p = (trackW * 22) / 100; return p < 1 ? (trackW > 0 ? 1 : 0) : p; }
+inline int LoadPanelSlideX(int trackW, int pieceW, unsigned int ms, unsigned int periodMs)
+{
+    const int travel = trackW - pieceW;
+    if (travel <= 0 || periodMs == 0u) return 0;
+    const unsigned int ph = ms % (2u * periodMs);
+    const unsigned int t = ph < periodMs ? ph : 2u * periodMs - ph;
+    return (int)(((long long)travel * t) / periodMs);
+}
+/* the panel's log line: due at each ON (the caller's), and at each bar change - a change of kind (filling / sliding / hidden), a move of
+   10 points or more since the last logged fill, or the bar becoming full; never past the cap */
+inline int LoadPanelLogDue(int fill, int loggedFill, int logged, int cap)
+{
+    if (logged >= cap) return 0;
+    if (loggedFill == kLoadFillNone) return 1;
+    if (fill < 0 || loggedFill < 0) return fill != loggedFill ? 1 : 0;
+    if (fill == 100 && loggedFill != 100) return 1;
+    const int d = fill > loggedFill ? fill - loggedFill : loggedFill - fill;
+    return d >= 10 ? 1 : 0;
+}
+inline std::string LoadPanelFillText(int fill)
+{
+    if (fill == kLoadFillSliding) return "sliding";
+    if (fill == kLoadFillHidden) return "hidden";
+    if (fill < 0) return "none";
+    char b[16]; std::sprintf(b, "%d", fill > 100 ? 100 : fill);
+    return std::string(b);
 }
 
 }   /* namespace coopui */

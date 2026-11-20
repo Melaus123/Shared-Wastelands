@@ -90,6 +90,15 @@ inline std::string RolesLine(int ownerSlot, int stewardSlot, const std::vector<i
     return s + "]";
 }
 
+/* T-247 (owner 1703, 1706 b): JOIN AS ADMIN IS OFFERED at a mods refusal to a joiner whose person is on admins.txt while an admin
+   password is set (1703), or who is the person that last proved the owner password (worldpw::kOwnerProvenFile) while an owner password
+   is set (1706 b). The box's password is checked against both at the retry's door. */
+inline bool ModsRefuseOffersLogin(bool adminPwSet, const std::string& person, const std::vector<std::string>& named, bool ownerPwSet, const std::string& ownerProven)
+{
+    if (adminPwSet && IsListed(person, named)) return true;
+    return ownerPwSet && !person.empty() && person == ownerProven;
+}
+
 }   /* namespace worldroles */
 
 #endif

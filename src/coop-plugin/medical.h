@@ -78,6 +78,10 @@ int StealthKnockOutOwned(unsigned int uid, float skill01, float* koTimerOut);
 // P11 fold 1 (T652) TEST-ONLY (`koself`): hold an owned character's wake-up clock at least `seconds` (never shorter),
 // then push its STATE. The clock after, -1 = not ours / no character / unreadable. MAIN THREAD.
 float KnockClockAtLeastOwned(unsigned int uid, float seconds);
+// T-1411 TEST-ONLY (`koself` hold renewal): an owned, still-unconscious character whose wake-up clock reads below `below` gets
+// it set to `to` and its STATE pushed. The clock after (>= 0); -1 not ours / unreadable, -2 dead, -3 awake (nothing written).
+// *beforeOut = the clock read. MAIN THREAD.
+float KnockClockRenewOwned(unsigned int uid, float below, float to, float* beforeOut);
 // T-1205 the admin toolbox's /medic, /heal and /restore (level, below) on a character THIS game drives, then its STATE at once (see
 // medical.cpp). 1 healed (*stillOut = still knocked out; /restore: *grown = the lost limbs grown back, *robot = the robotic limbs
 // left on), -2 dead (nothing done), -1 not driven here / unreadable / no road to grow a lost limb back (nothing done). MAIN THREAD,

@@ -42,7 +42,8 @@
 
 namespace livefirst {
 
-const unsigned int kProtocol = 153;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
+const unsigned int kProtocol = 170;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
+
 
 
 const unsigned int kMsgChunk = 88;      /* CHUNK - one piece of a frame too big to go whole; either way, world-server link only */
@@ -143,15 +144,18 @@ inline int LineOf(unsigned int type, const char* p, size_t n, int dir)
        ZoneRecvJudge takes a holder's copy even when it is not newer).
      - WRITE (to the holder): the LIVE line - ahead of the records, but held by a waiting barrier like any live message: the
        holder's gate reads its area map (areafresh.h HolderGate), so it must not pass a changed AREAMAP.
-     - FRESH: the REST line, behind the record it names. The wait it is for ends only when that record is in the game's swap
-       (areafresh.h WaitEndDecide kEndFresh), so going first would end no wait sooner - and every 10 s re-ask told another FRESH
-       before the bytes came would count as an unmet FRESH (FreshUnmetNote's error line after 3).
+     - FRESH: as a CANT (T-1429 s2 fold 2, review F1364 B): the ANSWER line, unless a RECORD of its area still waits on that link -
+       then REST, behind the record it names (its wait ends only when that record is in the game's swap, areafresh.h WaitEndDecide
+       kEndFresh; every 10 s re-ask told another FRESH before the bytes came would count as an unmet FRESH). Before fold 2 every FRESH
+       went on REST, so a pre-load's settle FRESH - the decision only, no record behind it - waited behind the whole record stream.
    The world server's own constants (= areafresh::kMsgAreaFresh / kWrite / kCant; store_main.cpp and the offline suite check). */
 const unsigned int kTypeAreaFresh = 89;
 const unsigned int kFreshKindWrite = 2, kFreshKindCant = 3;
+const unsigned int kFreshKindLease = 5, kFreshKindWait = 6;   /* T-1429 s2: = areafresh::kLease / kWait - answers, on a CANT's line (s2 fold 1, review F1337 item 6: the Steam bridge's AreaFreshLine too) */
+const unsigned int kFreshKindFresh = 4;   /* = areafresh::kFresh (store_main.cpp checks) */
 inline int AreaFreshLine(unsigned int kind, int zoneRecordWaiting)
 {
-    if (kind == kFreshKindCant) return zoneRecordWaiting != 0 ? (int)kLineRest : (int)kLineAnswer;
+    if (kind == kFreshKindCant || kind == kFreshKindLease || kind == kFreshKindWait || kind == kFreshKindFresh) return zoneRecordWaiting != 0 ? (int)kLineRest : (int)kLineAnswer;   /* s2 fold 2 (review F1364 B): FRESH too */
     if (kind == kFreshKindWrite) return kLineLive;
     return kLineRest;
 }
@@ -165,11 +169,10 @@ inline int AreaFreshLine(unsigned int kind, int zoneRecordWaiting)
        there; otherwise the ANSWER line.
      - WRITE: the LIVE line, as AreaFreshLine.
    onRest / onAnswerBulk: a RECORD of the answer's area waits on that line of the game's link (sendbound.h AnswerGate). */
-const unsigned int kFreshKindFresh = 4;   /* = areafresh::kFresh (store_main.cpp checks) */
 inline int AreaAnswerLine(unsigned int kind, int onRest, int onAnswerBulk)
 {
     if (kind == kFreshKindWrite) return kLineLive;
-    if (kind == kFreshKindCant) return onRest != 0 ? (int)kLineRest : (onAnswerBulk != 0 ? (int)kLineAnswerBulk : (int)kLineAnswer);
+    if (kind == kFreshKindCant || kind == kFreshKindLease || kind == kFreshKindWait) return onRest != 0 ? (int)kLineRest : (onAnswerBulk != 0 ? (int)kLineAnswerBulk : (int)kLineAnswer);
     if (kind == kFreshKindFresh) return onRest != 0 ? (int)kLineRest : (int)kLineAnswerBulk;
     return kLineRest;
 }

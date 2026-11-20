@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 
 namespace coop {
 
@@ -29,7 +30,8 @@ void BugReportLiveIn(unsigned int innerType, unsigned int originSlot, const char
 // TEST-ONLY (the command channel's `bugpack`): packs a bug report on a worker thread exactly as SEND packs one - every file it
 // would carry, cut to the same limit - but asks no nearby game, shows nothing and SENDS NOTHING; the worker writes one
 // [BUGREPORT] TEST PACK line naming every file in the zip with its sizes. 1 = started, 0 = one is still being made or no worker
-// thread. MAIN THREAD.
-int BugReportTestPack();
+// thread. MAIN THREAD. T-1402: `sid` (may be empty) - for each map-square file the pack carries, the line also counts its records
+// whose string id holds that text (the area file read by the area records' own reader, zonecheck / dupsquad).
+int BugReportTestPack(const std::string& sid = std::string());
 
 }

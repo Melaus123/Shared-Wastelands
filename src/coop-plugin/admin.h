@@ -59,6 +59,10 @@ int AdminSetPassword(std::string* pw, const char* from);
 // chat (not linked: said here). 1 = sent. MAIN THREAD.
 int AdminListChange(int slot, bool make, const char* from);
 
+// T-247: GAME OPTIONS' MODS tab - USE MY MODS FOR THIS WORLD's YES (and the TEST-ONLY lever's same road): ADMIN_REQ verb 21, sent at
+// once; the world server writes this game's greeting list as the world's and every game is told (PLAYER_MODS). 1 = sent. MAIN THREAD.
+int AdminUseMyMods(const char* from);
+
 // TEST-ONLY `admintest` (command_channel.cpp; the forms are admincmd.h's TestParse): "ok admintest .." or "error admintest ..". MAIN THREAD.
 std::string AdminTestCommand(const std::string& args);
 

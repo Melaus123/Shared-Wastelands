@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstring>
 #include "teammap.h"
+#include "ping.h"                          /* T-1393: PingMapFrame - the pings' map markers ride this frame */
 #include "hooks.h"                         /* AddHook */
 #include "addresses.h"                     /* AddrReg, AddrAbs */
 #include "store.h"                         /* StoreSendLive, StoreLiveReady, StoreLiveGen, StoreMySlot, StoreRosterSlotInWorld */
@@ -71,6 +72,12 @@ unsigned long long kTmPiRva = 0;     AddrReg kTmPiRva_reg("PlayerInterfaceGlobal
 
 /* ---- the engine's layout (Read; header comment) ---- */
 const size_t kWinWidget = 0x8, kWinMapScreen = 0xA8;
+/* T-1393 (F1214): MapScreen+0x60 is the map's "MapOverlaysMin" overlay and +0x78 "MapOverlaysCharacters" (0x48F780 makes both
+   under the map image +0x20 with the same call: relative 0,0,1,1, Align Stretch - one full-canvas holder each). The zoom step
+   0x4907E0 sets the zoom tier +0x58 (0 below +0x84, 1 below +0x88, else 2) and hides +0x78 at tier 0 - fully zoomed out the
+   game hides its own character dots, and so the teammates' dots (game parity). +0x60 it never hides: the pings' map marker
+   rides that holder so it shows at every zoom (Read, scratch decompiles 1.0.65 0x48F780 / 0x4907E0). */
+const size_t kMsOverlayMin = 0x60;
 const size_t kMsPage = 0x10, kMsImage = 0x20, kMsDotParent = 0x78, kMsOriginX = 0x194, kMsOriginZ = 0x198, kMsSpanX = 0x1A4, kMsSpanZ = 0x1A8;
 const size_t kPiCharCount = 0x2B8, kPiCharArray = 0x2C0;   /* PlayerInterface+0x2B0: the player's own characters (lektor) */
 const unsigned kPiCharMax = 1024;
@@ -93,6 +100,7 @@ long long g_opensSent = 0, g_closesSent = 0, g_dotsIn = 0, g_dotsRefused = 0, g_
 struct MapView
 {
     MyGUI::Widget* windowW; void* screen; MyGUI::Widget* page; MyGUI::Widget* image; MyGUI::Widget* parent;
+    MyGUI::Widget* always;   /* T-1393: MapScreen+0x60, the overlay the zoom never hides (kMsOverlayMin) - the pings' holder */
     float ox, oz, sx, sz;
 };
 struct Dot
@@ -135,6 +143,7 @@ int MapReadPod(void* window, MapView* v)
         v->page = *(MyGUI::Widget* const*)(s + kMsPage);
         v->image = *(MyGUI::Widget* const*)(s + kMsImage);
         v->parent = *(MyGUI::Widget* const*)(s + kMsDotParent);
+        v->always = *(MyGUI::Widget* const*)(s + kMsOverlayMin);
         v->ox = *(const float*)(s + kMsOriginX); v->oz = *(const float*)(s + kMsOriginZ);
         v->sx = *(const float*)(s + kMsSpanX);   v->sz = *(const float*)(s + kMsSpanZ);
         return (v->page != 0 && v->image != 0 && v->parent != 0) ? 1 : 0;
@@ -454,9 +463,23 @@ void FrameWork(void* window)
     HoverTick(v);
 }
 
+/* T-1393 (review fold 2): the pings' map frame - the map window's own "open" test read here for every window object, apart from
+   the teammates' dots' work (its fault switch and its one-window latch): an open map is always known to the pings, so G never
+   pings the ground behind it and no world marker draws over it */
+void PingWindowFrame(void* window)
+{
+    MapView v;
+    std::memset(&v, 0, sizeof(v));
+    if (MapReadPod(window, &v) != 1 || MapOpenPod(v.windowW, v.page) != 1) return;
+    /* T-1393 (F1214): the marker's holder is the overlay the zoom never hides (+0x60), not the character dots' holder (+0x78,
+       hidden fully zoomed out); both cover the whole canvas, so the same canvas sums place it. Without +0x60, the dots' holder. */
+    PingMapFrame(v.windowW, v.page, v.image, v.always != 0 ? v.always : v.parent, v.ox, v.oz, v.sx, v.sz);
+}
+
 void FrameDetour(void* window)
 {
     g_frameOrig(window);
+    PingWindowFrame(window);   /* T-1393: before the dots' off switch - the pings keep their own (ping.cpp) */
     if (g_off != 0) return;
     __try { FrameWork(window); }
     __except (EXCEPTION_EXECUTE_HANDLER) { g_off = 1; }

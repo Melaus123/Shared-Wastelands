@@ -48,7 +48,12 @@ namespace coop {
    must match exactly. kAddrUseCallOnly = this mod only CALLS (or reads) the address, never hooks or writes it - the
    gate then also accepts another mod's 5-byte jump at its start (src/common/addrhooked.h). Give kAddrUseCallOnly only
    when EVERY use of the bound constant is a plain call through it; a name registered twice is call-only only when
-   every registration says so. */
+   every registration says so.
+   T-1447 (F1476 design A, re-check fold 2): a row that is NOT all call-only may still carry another mod's jump, decided
+   by construction rather than by a mark: only at the start of a GAME FUNCTION (the address is an entry of the executable's
+   own function table, .pdata - a patch site inside a function never is), the jump leaving the game's image and every later
+   byte matching (src/common/addrhooked.h AddrForeignVerdict). The gate logs the module behind the jump; coop::AddHook
+   re-reads the bytes before hooking on top of it (hooks.cpp). */
 enum { kAddrUseStrict = 0, kAddrUseCallOnly = 1 };
 struct AddrReg
 {
@@ -77,6 +82,21 @@ unsigned long long Rva(const char* name);
    refuses. 0 when the hook is allowed: no registration is bound there (unbound, or an address no row names), or at
    least one is strict. ANY THREAD after AddrInit (reads slots written once, before any hook). */
 const char* AddrHookRefusedAt(unsigned long long target);
+
+/* T-1447: BEFORE HOOKING ON TOP OF ANOTHER MOD'S JUMP. `target` is an absolute address about to be hooked (coop::AddHook).
+   Returns -1 when the gate accepted no other mod's jump there (the usual case: hook as always); 1 when it did ("hooks, may
+   chain") and the live bytes are still exactly what the gate accepted (the jump still there, the rest unchanged); 0 when
+   they changed since - AddHook then refuses. *row (may be 0) gets the row's name when it is not -1. ANY THREAD after
+   AddrInit. */
+int AddrChainedCheck(unsigned long long target, const char** row);
+
+/* T-1447: after AddHook installed on top of an accepted chained row, the live bytes are OUR jump; the kept bytes become those,
+   so a second AddHook on the same target compares against them. No effect on any other address. */
+void AddrChainedHooked(unsigned long long target);
+
+/* T-1447: the file name of the module another mod's jump at `target` leads to, as the gate named it ("unknown" when it lies
+   in no module), or 0 when the gate accepted no other mod's jump there. For error lines. ANY THREAD after AddrInit. */
+const char* AddrChainedModule(unsigned long long target);
 
 /* One token for the periodic title-pump line, and the counters this build is judged by. */
 std::string AddrReportToken();

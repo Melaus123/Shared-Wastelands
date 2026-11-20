@@ -17,6 +17,7 @@
 #include "../common/townnear.h"   /* T-795 step 4: the townnear reply line, swept by the offline suite */
 #include "../common/groundsync.h"   /* T-1100: GsHolderStep - the holder before this game per area, swept by the offline suite */
 #include "coop_log.h"
+#include "hooks.h"   /* T-1442 step 1b: coop::AddHook for the area update 0xA0A960 */
 namespace { swlogbudget::Gate g_qZonesPlayer; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "game/RootObjectBase.h"
@@ -63,6 +64,9 @@ static unsigned long long kZnDeactivationCountdownRva = 0; static coop::AddrReg 
 static unsigned long long kZnActivationDefaultsRva = 0; static coop::AddrReg kZnActivationDefaultsRva_reg("ZoneActivationDefaults", &kZnActivationDefaultsRva);   /* Steam_1.0.65 0x17477A0, 1.0.68 0x1748740 */
 static unsigned long long kZnGetAllActiveZonesRva = 0; static coop::AddrReg kZnGetAllActiveZonesRva_reg("ZoneGetAllActiveZones", &kZnGetAllActiveZonesRva);   /* stage 7/9: the address table fills this. Steam_1.0.65 0xA09840 */
 static unsigned long long kZnTownListRva = 0; static coop::AddrReg kZnTownListRva_reg("TownList", &kZnTownListRva);   /* stage 7/9: the address table fills this. Steam_1.0.65 0x21330A0 */
+/* T-1442 step 1b (F1421): the engine's per-frame area update (one call per listed area per frame, main thread; 0 = the area was unloaded
+   and removed) - hooked by detour_ZoneMapUpdate to raise the early area report's mark */
+static unsigned long long kZnMapUpdateRva = 0; static coop::AddrReg kZnMapUpdateRva_reg("ZoneMapUpdate", &kZnMapUpdateRva);   /* Steam_1.0.65 0xA0A960, 1.0.68 0xA0B830 */
 typedef void  (*GetAllActiveZonesFn)(void* zm, lektor<void*>* out);
 typedef bool  (*IsActivationTypeFn)(void* zoneMap, int type);
 typedef float (*DeactivationCountdownFn)(void* zoneMap);
@@ -292,6 +296,7 @@ long long g_tick = 0;
 std::vector<Sector> g_loaded;              // this instance's loaded set, last computed
 std::string g_zonesListShown;              /* the loaded list the last [ZONES] summary printed - it prints again on a change */
 Sector g_playerSector = { -1, -1 };
+Sector g_lastPlayerSector = { -1, -1 };   /* T-1402: the last g_playerSector this launch, NOT cleared when the world closes (a bug report from the title screen still carries it); memory only */
 /* T-772 T1544 (TEST-ONLY lever `areaquiet <x>,<y> on|off`, command_channel.cpp; ZonesAreaQuietCommand below): the areas this game LEAVES
    OUT of its AREAS report. Only the report changes - the area stays in g_loaded / g_loadedHere, the player-sector list and the party halo
    are built as before, and the people this game runs stay its own - so at this game's next report another game whose latest report
@@ -327,7 +332,41 @@ int g_orphanCentreValid = 0; float g_orphanX = 0.0f, g_orphanY = 0.0f, g_orphanZ
 int g_orphanRun = 0;   /* consecutive orphaned ticks in the current spell, this one included; 0 = the tick is live */
 long long g_orphanTicks = 0, g_orphanEntered = 0, g_orphanEnded = 0, g_orphanSentUnknown = 0;
 int g_areasLastNonEmpty = 0; volatile LONG g_areasLeaveOwed = 0; long long g_areasLeaveSent = 0;   /* M6 fold 1: the last AREAS sent listed sectors / a teardown owes one empty AREAS / how many went (ZonesAreasLeave) */
+/* T-1442 step 1: the holder each applied area map named per area (ApplyRelayAreaMap, an empty map too) - one [ZONES] holder line per
+   area whose holder changed, to or from nobody included (-1 = nobody: no row, or a row naming nobody); the first kHolderLinesMax, the
+   rest counted (holderLines[changes,quiet] on the REPORT line). The first map on a link seeds it, no lines (loadedzones::HolderSeedOnLink). */
+int g_holderSeen[64][64]; struct HolderSeenInit { HolderSeenInit() { for (int x = 0; x < 64; ++x) for (int y = 0; y < 64; ++y) g_holderSeen[x][y] = -1; } } g_holderSeenInit;
+long g_holderSeenLinkGen = -1; long long g_holderLines = 0, g_holderLinesQuiet = 0, g_holderChanges = 0;
+const long long kHolderLinesMax = 300;
 int g_lastSentAny = 0, g_lastSentX = 0, g_lastSentY = 0;   /* the player sector the last AREAS that reached the wire carried (x < 0 = unknown) */
+/* T-1442 step 1b (F1421): THE EARLY AREA REPORT - this game reports its loaded areas when an area becomes loaded or stops being loaded,
+   not only on its 1 s clock. Two hooks raise the 'report owed' mark: the engine's per-frame area update (detour_ZoneMapUpdate, MAIN
+   THREAD: the area's 'loaded' byte 0 -> 1, or the update unloading the area) names the area; ZoneMapContent::deactivate (items.cpp, any
+   thread) names none. ZonesTick sends the early report on its next run (ZonesEarlyReport) without touching the 1 s clock state
+   (lastReport, g_ticks, g_zonesSeconds, g_zlPrevCd / g_zlPrevTick, g_orphan*). The mark is cleared only when a report that reflects
+   the change is on the wire: a regular report read after it, or an early read showing every named change whose list is sent or
+   already the wire's (loadedzones::EarlyClears). No timer.
+   g_areaEvSeq: events raised (interlocked, any thread); g_areaEvCleared: the seq the last such report reflected (main thread). */
+volatile LONG g_areaEvSeq = 0; LONG g_areaEvCleared = 0;
+const int kAreaEvMax = 32;
+int g_areaEv[kAreaEvMax * 3]; int g_areaEvN = 0;   /* MAIN THREAD: the named events (x, y, kind) since the last clear; past kAreaEvMax counted, not kept */
+volatile LONG64 g_areaEvLoaded = 0, g_areaEvUnloaded = 0, g_areaEvUnnamed = 0, g_areaEvDropped = 0;
+/* the last REGULAR report of this world, read from the engine's list: its judged areas, loading mark, height and player-sector list -
+   what an early report carries for every area it listed (the fold 1c BLOCKER). g_earlyHaveRegular 0 = none (a new world, a probe-only
+   read, or an empty leave report since): no early report. MAIN THREAD. */
+int g_earlyHaveRegular = 0, g_earlyLastLoading = 0; float g_earlyLastPy = 0.0f;
+std::vector<loadedzones::Area> g_earlyLastAreas; std::vector<int> g_earlyLastPs;
+std::vector<int> g_lastSentXY; int g_lastSentLoading = 0;   /* the areas and loading mark of the last AREAS on the wire (regular or early) */
+long long g_areasEarlySent = 0, g_areasEarlySame = 0, g_areasEarlyReads = 0, g_areasEarlyCleared = 0, g_areasRegularSent = 0, g_earlyLines = 0, g_earlyLinesQuiet = 0;
+LONG g_earlyLoggedSeq = -1;
+const long long kEarlyLinesMax = 300;
+int g_zoneMapUpdateHook = 0;   /* 0 not installed, 1 on, -1 no address row, -2 the hook failed */
+/* fold 1b-2 (review SHOULD 2): events no area could be named for (the unload hook outside the area update or off the main thread, an
+   unplaced area, past kAreaEvMax) - only a regular report read after them clears them. Interlocked (any thread) / main thread. */
+volatile LONG g_areaEvUnnamedSeq = 0; LONG g_areaEvUnnamedCleared = 0;
+volatile LONG g_unloadInFlight = 0;   /* fold 1b-3: unload hooks entered and not yet returned (any thread) */
+int g_zoneMapUpdateDepth = 0;   /* MAIN THREAD: inside the area update's original - its unload hook call is named by the update's 0 answer */
+int g_liveLoadingPrev = -1, g_loadEndPending = 0; long long g_areaEvLoadEnd = 0;   /* fold 1b-2 (review SHOULD 1): the loading field's last live value; a load end owed */
 /* THE LOADED SET, FROM THE ENGINE'S OWN LIST. ZoneManager::getAllActiveZones (FillActiveZonesPod) copies every ZoneMap of the
    manager's active set - the areas its engine keeps for any player character, the camera or a town; ZoneManager::deactivateZone
    removes an area from that set in the same call that unloads it. Each listed ZoneMap's area is where it sits in the manager's
@@ -394,48 +433,61 @@ int ReadZoneRawPod(void* m, int* why, float* cd)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { *why = 0; return 0; }
 }
-int EngineLoadedAreas(void* zm, float py, std::vector<loadedzones::Area>* out)
+/* T-1442 step 1b: THE RAW READ OF THE ENGINE'S LIST, shared by the regular read (EngineLoadedAreas, which adds `c` to its counters) and
+   the early report's read (ZonesEarlyReport, which counts nothing on the regular read's counters): each listed, placed, loaded area
+   once, with its reason bits and countdowns; *maxCamera = the freshest readable camera countdown. 0 = the list could not be read. */
+struct ZlReadCounts { long long faults, reads, listed, unplaced, notInArray, headerDiffers, probes, probeFaults, notLoaded; };
+int EngineReadRaw(void* zm, float py, std::vector<ZlRawArea>* raw, float* maxCamera, ZlReadCounts* c)
 {
-    out->clear();
+    std::memset(c, 0, sizeof(*c));
+    raw->clear(); *maxCamera = 0.0f;
     static lektor<void*> zones;   /* one reused list, as ActiveZoneReasons keeps: the engine's grow allocates it, the mod never frees it */
     zones.clear();
-    if (!FillActiveZonesPod(zm, &zones)) { ++g_zlFaults; return 0; }
-    ++g_zlReads;
+    if (!FillActiveZonesPod(zm, &zones)) { ++c->faults; return 0; }
+    ++c->reads;
     unsigned char seen[loadedzones::kGrid][loadedzones::kGrid];
     std::memset(seen, 0, sizeof(seen));
     const unsigned n = zones.size(), cap = (unsigned)(loadedzones::kGrid * loadedzones::kGrid);
-    static std::vector<ZlRawArea> raw;   /* fold 3: read the whole list, then judge each area with this read's renewal lag */
-    raw.clear();
-    float maxCamera = 0.0f;
     for (unsigned i = 0; i < n && i < cap; ++i)
     {
         void* m = zones[i];
-        if (!PlausiblePod(m)) { ++g_zlUnplaced; continue; }
-        ++g_zlListed;
+        if (!PlausiblePod(m)) { ++c->unplaced; continue; }
+        ++c->listed;
         int sx = -1, sy = -1, hx = -1, hy = -1;
         const int header = ReadZoneHeaderSectorPod(m, &hx, &hy);
         if (loadedzones::SectorOfZoneAt((unsigned long long)(uintptr_t)zm, (unsigned long long)(uintptr_t)m, &sx, &sy) == 1)
         {
-            if (header == 1 && (hx != sx || hy != sy)) ++g_zlHeaderDiffers;
+            if (header == 1 && (hx != sx || hy != sy)) ++c->headerDiffers;
         }
         else
         {
-            ++g_zlNotInArray;
-            if (header != 1 || loadedzones::InGrid(hx, hy) == 0) { ++g_zlUnplaced; continue; }
+            ++c->notInArray;
+            if (header != 1 || loadedzones::InGrid(hx, hy) == 0) { ++c->unplaced; continue; }
             sx = hx; sy = hy;
         }
         if (seen[sx][sy] != 0) continue;
         seen[sx][sy] = 1;
         const float cx = (sx + 0.5f) * kSectorSize - kSectorOrigin, cz = (sy + 0.5f) * kSectorSize - kSectorOrigin;
-        ++g_probes;
+        ++c->probes;
         const int r = IsLoadedAt(zm, cx, py, cz);
-        if (r < 0) { ++g_probeFaults; ++g_zlProbeFaults; continue; }
-        if (r == 0) { ++g_zlNotLoaded; continue; }
+        if (r < 0) { ++c->probeFaults; continue; }
+        if (r == 0) { ++c->notLoaded; continue; }
         ZlRawArea ra; ra.x = sx; ra.y = sy;
         ra.read = ReadZoneRawPod(m, &ra.why, ra.cd);
-        if (ra.read != 0 && loadedzones::CountdownsReadable(ra.cd) != 0 && ra.cd[0] > maxCamera) maxCamera = ra.cd[0];
-        raw.push_back(ra);
+        if (ra.read != 0 && loadedzones::CountdownsReadable(ra.cd) != 0 && ra.cd[0] > *maxCamera) *maxCamera = ra.cd[0];
+        raw->push_back(ra);
     }
+    return 1;
+}
+int EngineLoadedAreas(void* zm, float py, std::vector<loadedzones::Area>* out)
+{
+    out->clear();
+    static std::vector<ZlRawArea> raw;   /* fold 3: read the whole list, then judge each area with this read's renewal lag */
+    float maxCamera = 0.0f; ZlReadCounts c;
+    const int got = EngineReadRaw(zm, py, &raw, &maxCamera, &c);
+    g_zlFaults += c.faults; g_zlReads += c.reads; g_zlListed += c.listed; g_zlUnplaced += c.unplaced; g_zlNotInArray += c.notInArray;
+    g_zlHeaderDiffers += c.headerDiffers; g_probes += c.probes; g_probeFaults += c.probeFaults; g_zlProbeFaults += c.probeFaults; g_zlNotLoaded += c.notLoaded;
+    if (got == 0) return 0;
     /* fold 3: KEPT = renewed by the engine (loadedzones::CountdownRenewed): at full now and not fallen since this area's read at the
        previous report; widened only by the engine's own lag (the freshest camera countdown below full), never by a frame timer */
     g_zlLag = (g_zlFullKnown != 0 && g_zlLoading == 0) ? loadedzones::RenewLagSec(maxCamera, g_zlFull[0]) : 0.0f;
@@ -485,6 +537,7 @@ struct AreaBookBoot { AreaBookBoot() { coopdrop::AreaBookInit(&g_areaBook); } } 
 unsigned char g_areaCellFlags[64 * 64];   /* M9f1: AreaApplyMapCore's per-cell answer (kAreaCell*), cell = x * 64 + y. Under g_heldLock */
 long long g_areaMapPendingArmed = 0, g_areaMapPendingDropped = 0, g_areaMapPendingExpired = 0;   /* M9f1: areaMapOdd[...,pendingArmed,pendingDropped,pendingExpired]. Under g_heldLock */
 long long g_areaMapRows = 0, g_areaMapSeats = 0, g_areaMapRekeyed = 0, g_areaMapBytes = 0, g_areaMapRekeyDropped = 0, g_areaMapMalformed = 0;   /* M9: areaMap[rows,seats,rekeyed,bytes] (latest map, rekeyed cumulative) and areaMapOdd[rekeyDropped,malformed] */
+long long g_areaMineMarkLines = 0, g_areaMineMarkSuppressed = 0;   /* T-1351: areaMineMarkLines[lines,suppressed] (AreaMineMarkSay) */
 long long g_announceAbsentReporter = 0;  /* maps in which a slot other than mine held something in the effective map and was absent from the map. Under g_heldLock */
 /* M9f1: the W1-c arms (seat-indexed words, moved by the rekey with their columns) live in g_areaBook.dropOnAbsence */
 long long g_effDroppedAfterPeerGone = 0; /* W1-c: maps in which an armed slot was absent and its bits were dropped. Under g_heldLock */
@@ -952,6 +1005,7 @@ void ZonesAreasLeave(const char* why)
     if (g_areasLastNonEmpty == 0) { g_areasLeaveOwed = 0; return; }
     if (!StoreSendAreas(0, 0, 0, 0, 0)) return;   /* no notebook link: its PeerGone already dropped the sets; tried again on the next bail-out */
     g_areasLastNonEmpty = 0; g_areasLeaveOwed = 0; ++g_areasLeaveSent;
+    g_earlyHaveRegular = 0; g_lastSentXY.clear(); g_lastSentLoading = 0;   /* T-1442 step 1b: no early report until a regular one names areas again */
     DebugLog(std::string("[ZONES] M6 fold 1: one empty AREAS sent (") + (why != 0 ? why : "?") + ") - the world server stops sending this game AREA traffic now (areasLeaveSent "
              + N(g_areasLeaveSent) + ")");
 }
@@ -982,13 +1036,196 @@ static void ZonesLogLoadedChange(const std::vector<loadedzones::Area>& areas, in
     DebugLog("[ZONES] loaded set: " + N((long long)src.total) + " area(s) from " + from + "; outside the watched character's 7x7 around "
              + SectorString(g_playerSector) + ": " + N((long long)src.outsideRing) + " list=" + list);
 }
+/* T-1442 step 1b (F1421): THE EARLY AREA REPORT'S EVENTS. ZonesAreaEventNamed: an area update changed the area's loaded byte or unloaded
+   it (main thread - the area is named and kept for the clear test; off the main thread, unplaced or past kAreaEvMax it is UNNAMED);
+   ZonesAreaUnloadBegin (below): the unload hook (items.cpp detour_zoneDeactivate, any thread) - inside the area update's original on the main
+   thread the update's own answer names it; anywhere else it is UNNAMED. An unnamed event is cleared only by a regular report (fold 1b-2,
+   review SHOULD 2: an early read racing an off-thread unload must not clear it). Interlocked writes only; nothing is read or sent here. */
+static void ZonesAreaEventUnnamed() { ::InterlockedIncrement64(&g_areaEvUnnamed); ::InterlockedIncrement(&g_areaEvUnnamedSeq); }
+/* fold 1b-3: an event is fully recorded (named, or the unnamed count raised) BEFORE g_areaEvSeq moves, so a read between the two can
+   never take it as done */
+static void ZonesAreaEventNamed(void* m, int before, int after, int ret)
+{
+    if (before < 0 || after < 0) { before = 1; after = 1; }   /* an unreadable byte: only the original's 0 answer counts */
+    const int kind = loadedzones::AreaUpdateEvent(before, after, ret);
+    if (kind == loadedzones::kAreaEvNone) return;
+    ::InterlockedIncrement64(kind == loadedzones::kAreaEvLoaded ? &g_areaEvLoaded : &g_areaEvUnloaded);
+    const unsigned long mainId = StoreMainThreadId();
+    int sx = -1, sy = -1, hx = -1, hy = -1, named = 0;
+    if (mainId != 0 && ::GetCurrentThreadId() == (DWORD)mainId)
+    {
+        void* zm = ZoneManagerPtr();
+        if (loadedzones::SectorOfZoneAt((unsigned long long)(uintptr_t)zm, (unsigned long long)(uintptr_t)m, &sx, &sy) == 1) named = 1;
+        else if (ReadZoneHeaderSectorPod(m, &hx, &hy) == 1 && loadedzones::InGrid(hx, hy) != 0) { sx = hx; sy = hy; named = 1; }
+        if (named != 0 && g_areaEvN >= kAreaEvMax) { ::InterlockedIncrement64(&g_areaEvDropped); named = 0; }   /* overflow: owed until a regular report */
+    }
+    if (named != 0) { g_areaEv[g_areaEvN * 3] = sx; g_areaEv[g_areaEvN * 3 + 1] = sy; g_areaEv[g_areaEvN * 3 + 2] = kind; ++g_areaEvN; }
+    else ZonesAreaEventUnnamed();
+    ::InterlockedIncrement(&g_areaEvSeq);
+}
+/* the area's 'loaded' byte (ZoneMap +0xB3, written only by the copy routine the update runs, F1421): 1 / 0, -1 unreadable */
+static int ZoneMapLoadedBytePod(void* m)
+{
+    __try { return *((const unsigned char*)m + loadedzones::kZoneMapLoadedByte) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+typedef unsigned long long (*ZoneMapUpdateFn)(void* zoneMap);
+static ZoneMapUpdateFn g_zoneMapUpdateOrig = 0;
+static unsigned long long ZoneMapUpdateCallOrig(void* m)
+{
+    ++g_zoneMapUpdateDepth;
+    unsigned long long r = 0;
+    __try { r = g_zoneMapUpdateOrig(m); }
+    __finally { --g_zoneMapUpdateDepth; }
+    return r;
+}
+/* EVERY FRAME, EVERY LISTED AREA (0xA11B70 calls the update once per area, main thread): two byte reads and a compare; the event path
+   runs only when the byte moved or the original unloaded the area (the caller reads the answer's low byte, decomp_a11b70.txt:88) */
+static unsigned long long detour_ZoneMapUpdate(void* m)
+{
+    const int before = ZoneMapLoadedBytePod(m);
+    const unsigned long long r = ZoneMapUpdateCallOrig(m);
+    const int after = ZoneMapLoadedBytePod(m);
+    if (before == after && (r & 0xFF) != 0) return r;
+    ZonesAreaEventNamed(m, before, after, (int)(r & 0xFF));
+    return r;
+}
+/* fold 1b-3 (review item 2): THE UNLOAD HOOK runs BEFORE the engine's unload clears the loaded byte and drops the area (F1421: 0x9FDAB0 is
+   called from 0xA09620 / 0xA098E0 before +0xB3 is cleared). Inside the area update's original (main thread) the update's own 0 answer
+   names the area once the unload is done - nothing here. Anywhere else the area is not known (the hook gets the ZoneMapContent, no proven
+   way to its area): the event is UNNAMED (raised before g_areaEvSeq moves) and the unload is IN FLIGHT until the hook returns - a regular
+   read that saw an unload in flight clears no unnamed event, and no early read ever does (EarlyClears). */
+void ZonesAreaUnloadBegin()
+{
+    ::InterlockedIncrement(&g_unloadInFlight);
+    const unsigned long mainId = StoreMainThreadId();
+    if (mainId != 0 && ::GetCurrentThreadId() == (DWORD)mainId && g_zoneMapUpdateDepth > 0) return;   /* the area update's own 0 answer names it */
+    ZonesAreaEventUnnamed();
+    ::InterlockedIncrement(&g_areaEvSeq);
+}
+void ZonesAreaUnloadEnd() { ::InterlockedDecrement(&g_unloadInFlight); }
+void InstallZonesAreaUpdate()
+{
+    if (g_zoneMapUpdateHook != 0) return;
+    if (kZnMapUpdateRva == 0) g_zoneMapUpdateHook = -1;
+    else g_zoneMapUpdateHook = (coop::AddHook((void*)coop::AddrAbs(kZnMapUpdateRva), (void*)&detour_ZoneMapUpdate, (void**)&g_zoneMapUpdateOrig) == coop::SUCCESS) ? 1 : -2;
+    if (g_zoneMapUpdateHook == 1) DebugLog("[ZONES] T-1442 step 1b: hook installed: the area update (1.0.65 0xA0A960 / 1.0.68 0xA0B830) - an area loaded or unloaded marks the area report owed; ZonesTick sends it at its next run");
+    else ErrorLog(std::string("[ZONES] T-1442 step 1b: the area update hook is NOT installed (") + (g_zoneMapUpdateHook == -1 ? "no ZoneMapUpdate row in the address table" : "AddHook failed")
+                  + ") - this game reports its areas on its 1 s clock only, as before");
+}
+/* THE EARLY READ: the engine's loaded areas now, each judged as a FIRST SIGHT (no previous read; the report's loading mark and the default
+   lengths; this read's own lag) - nothing of the 1 s clock state is read or written (g_zlPrevCd / g_zlPrevTick / g_zlLag / the regular
+   read's counters stay as they are). 0 = the list could not be read. MAIN THREAD. */
+static int EngineLoadedNowFirstSight(void* zm, float py, int loading, std::vector<loadedzones::Area>* out)
+{
+    out->clear();
+    static std::vector<ZlRawArea> raw;
+    float maxCamera = 0.0f; ZlReadCounts c;
+    if (EngineReadRaw(zm, py, &raw, &maxCamera, &c) == 0) return 0;
+    const float lag = (g_zlFullKnown != 0 && loading == 0) ? loadedzones::RenewLagSec(maxCamera, g_zlFull[0]) : 0.0f;
+    for (size_t i = 0; i < raw.size(); ++i)
+    {
+        loadedzones::Area a; a.x = raw[i].x; a.y = raw[i].y;
+        a.why = raw[i].read == 0 ? loadedzones::kWhyKept : loadedzones::WhyFromCountdowns(raw[i].why, g_zlFullKnown, loading, raw[i].cd, g_zlFull, 0, 0, lag);
+        out->push_back(a);
+    }
+    loadedzones::Normalise(out);
+    return 1;
+}
+static void ZonesAreaEvClear(LONG seq) { g_areaEvCleared = seq; g_areaEvN = 0; g_loadEndPending = 0; }
+/* THE EARLY REPORT (ZonesTick, every frame the 1 s clock is not due): with an event owed and a regular report of this world to build on,
+   read the engine's list, carry the last regular read's judgement for every area it listed (loadedzones::EarlyMerge), add an area newly
+   loaded with its first-sight judgement and drop one no longer loaded; send it when it differs from the last report on the wire. One
+   read a frame at most. The 1 s clock state is not touched. MAIN THREAD.
+   fold 1b-2 (review SHOULD 1): THE LOADING MARK. The engine's load sets the areas' loaded bytes at its 4 -> 5 step while the zone
+   manager's loading field stays 5 (decomp_a0e950.txt:77-91) and drops to 0 only later (:42, :59) - so the field is read live here (no
+   global written) and the report carries the loading mark when the last regular report OR the live field says loading; the field's
+   change to 'not loading' (the load's end) is itself an event that marks the report owed. */
+static void ZonesEarlyReport()
+{
+    int liveLoading = -1;
+    void* zm = 0;
+    if (g_earlyHaveRegular != 0)
+    {
+        zm = ZoneManagerPtr();
+        int f = 0;
+        if (PlausiblePod(zm)) { const int known = ReadZoneMgrFieldPod(zm, &f); liveLoading = known != 0 ? loadedzones::ZonesLoading(known, f) : 1; }   /* fold 1b-3: unreadable = loading (no false load end) */
+        if (liveLoading == 0 && g_liveLoadingPrev == 1) { ::InterlockedIncrement(&g_areaEvSeq); ++g_areaEvLoadEnd; g_loadEndPending = 1; }   /* the load's end */
+        if (liveLoading >= 0) g_liveLoadingPrev = liveLoading;
+    }
+    const LONG seq = g_areaEvSeq;
+    if (loadedzones::EarlyReportRuns(seq != g_areaEvCleared ? 1 : 0, 0, g_earlyHaveRegular) == 0) return;
+    if (!StoreRelayLinked()) return;   /* no link: the mark stays for the first report after it */
+    if (!PlausiblePod(zm) || liveLoading < 0) return;
+    ++g_areasEarlyReads;
+    /* fold 1b-3 (review item 1): THE MARK IS THE LIVE FIELD ALONE - the regular report's mark comes from nothing else (ZonesReadKeepInputs:
+       g_zlLoading = ZonesLoading(field known, field), sent as StoreSendAreas' loading); a stale regular value would keep the load-END early
+       report marked. The last regular read's judgements are carried only when that read was not loading (EarlyMerge lastJudged). */
+    const int mark = liveLoading != 0 ? 1 : 0;
+    static std::vector<loadedzones::Area> now, merged;
+    if (EngineLoadedNowFirstSight(zm, g_earlyLastPy, mark, &now) == 0) return;
+    int added = 0, removed = 0;
+    loadedzones::EarlyMerge(g_earlyLastAreas, now, &merged, &added, &removed, g_earlyLastLoading == 0 ? 1 : 0);
+    const int reflects = (loadedzones::EarlyReflects(merged, g_areaEv, g_areaEvN) != 0 && (g_loadEndPending == 0 || liveLoading == 0)) ? 1 : 0;
+    const int unnamedOwed = g_areaEvUnnamedSeq != g_areaEvUnnamedCleared ? 1 : 0;
+    std::vector<int> xy; std::vector<Sector> reported;
+    for (size_t i = 0; i < merged.size(); ++i)
+    {
+        const loadedzones::Area& a = merged[i];
+        if (loadedzones::ReportsArea(a.why, mark) == 0) continue;
+        if (loadedzones::InGrid(a.x, a.y) != 0 && g_areaQuiet[a.x][a.y] != 0) continue;   /* T-772 TEST-ONLY: left out as the regular report leaves it */
+        Sector s; s.x = a.x; s.y = a.y; reported.push_back(s); xy.push_back(a.x); xy.push_back(a.y);
+    }
+    const int action = loadedzones::EarlyAction(xy, mark, g_lastSentXY, g_lastSentLoading);
+    const int fresh = seq != g_earlyLoggedSeq ? 1 : 0;   /* the first read since this event (counts are per event, not per frame) */
+    int sent = 0;
+    if (action == loadedzones::kEarlySend)
+    {
+        sent = StoreSendAreas(xy.empty() ? 0 : &xy[0], (int)reported.size(), g_earlyLastPs.empty() ? 0 : &g_earlyLastPs[0], (int)(g_earlyLastPs.size() / 2), mark) ? 1 : 0;
+        if (sent != 0)
+        {
+            ++g_areasSent; ++g_areasEarlySent;
+            if (xy.empty()) ++g_areasSentEmpty;
+            if (mark != 0) ++g_areasSentLoading;
+            StoreAreaFileNote(xy.empty() ? 0 : &xy[0], (int)reported.size(), g_earlyLastPs.empty() ? 0 : &g_earlyLastPs[0], (int)(g_earlyLastPs.size() / 2));
+            if (StoreAreasTaken() != 0 && mark == 0) ZonesNoteReported(reported);
+            g_areasLastNonEmpty = xy.empty() ? 0 : 1;
+            g_lastSentXY = xy; g_lastSentLoading = mark;
+        }
+    }
+    else if (fresh != 0) ++g_areasEarlySame;
+    const int clears = loadedzones::EarlyClears(reflects, action, sent, unnamedOwed);
+    if (sent != 0 || fresh != 0)   /* one line per send, and one per new event that sent nothing */
+    {
+        g_earlyLoggedSeq = seq;
+        if (g_earlyLines < kEarlyLinesMax)
+        {
+            ++g_earlyLines;
+            std::string why;
+            for (int k = 0; k < g_areaEvN; ++k)
+            {
+                if (k != 0) why += ";";
+                why += std::string(g_areaEv[k * 3 + 2] == loadedzones::kAreaEvLoaded ? "loaded " : "unloaded ") + N((long long)g_areaEv[k * 3]) + "," + N((long long)g_areaEv[k * 3 + 1]);
+            }
+            if (g_loadEndPending != 0) why += std::string(why.empty() ? "" : ";") + "load end";
+            if (unnamedOwed != 0) why += std::string(why.empty() ? "" : ";") + "unloaded ?";   /* the unload hook, no area named: a regular report clears it */
+            std::string named;
+            for (size_t i = 0; i < reported.size(); ++i) { if (i) named += " "; named += SectorString(reported[i]); }
+            DebugLog(std::string(action == loadedzones::kEarlySend ? (sent != 0 ? "[ZONES] AREAS early why=" : "[ZONES] AREAS early-unsent why=") : "[ZONES] AREAS early-same why=")
+                     + why + " listed=" + N((long long)reported.size()) + " mark=" + (mark != 0 ? "L" : "K") + " live=" + N((long long)liveLoading) + " added=" + N((long long)added)
+                     + " removed=" + N((long long)removed) + " reflects=" + N((long long)reflects) + " cleared=" + N((long long)clears) + " names=" + named);
+        }
+        else ++g_earlyLinesQuiet;
+    }
+    if (clears != 0) { ZonesAreaEvClear(seq); ++g_areasEarlyCleared; }
+}
 long long g_zonesSeconds = 0;   /* T-492, MAIN THREAD: the seconds ZonesTick spent (its once-a-second work ran) */
 long long ZonesSecondCount() { return g_zonesSeconds; }
 void ZonesTick()
 {
     ++g_tick;
     static double lastReport = 0.0; const double nowR = NowSec();
-    if (nowR - lastReport < 1.0) return;   /* P4s: once a second by the clock */
+    if (nowR - lastReport < 1.0) { ZonesEarlyReport(); return; }   /* P4s: once a second by the clock; T-1442 step 1b: between them, the early report of an area loaded / unloaded (no clock state touched) */
     void* zm = ZoneManagerPtr();
     /* E25.7 (review-p5p MEDIUM-2): a tick that cannot answer "where is my player" must not leave the last answer
        standing as though it still held. Both bail-outs clear the halo, so `ring1` reads 0 rather than granting nine
@@ -1020,12 +1257,15 @@ void ZonesTick()
     ++g_zonesSeconds;
     ++g_ticks;   /* review-p5a MEDIUM-3: the clock is spent here, so the count belongs here too - g_ticks is REPORTS again, not frames spent inside a bail-out window (the bail-out counters below stay frames, which is what they are) */
     g_playerSector = SectorOf(px, pz);
+    g_lastPlayerSector = g_playerSector;   /* T-1402 */
     std::vector<Sector> loaded;
     /* The loaded set is every area this game's engine has loaded - around each of its player characters, its camera and its
        towns - read from the engine's own active-zone list (EngineLoadedAreas). Only when that list cannot be read does the tick
        probe the 7x7 block around the watched character instead. */
     std::vector<loadedzones::Area> areas;
+    const LONG evSeqAtRead = g_areaEvSeq, evUnnamedAtRead = g_areaEvUnnamedSeq, unloadInFlightAtRead = g_unloadInFlight;   /* T-1442 step 1b: the events this read reflects (a report sent from it clears them) */
     ZonesReadKeepInputs(zm);   /* decision 1556: the loading field and the default lengths, before the list is judged */
+    g_liveLoadingPrev = g_zlFieldKnown != 0 ? g_zlLoading : 1;   /* fold 1b-2: the early path's load-end edge starts from this read (fold 1b-3: unreadable = loading) */
     const int fromList = EngineLoadedAreas(zm, py, &areas);
     if (fromList == 0)
     {
@@ -1213,6 +1453,15 @@ void ZonesTick()
         if (sentAreas) g_areasLastNonEmpty = xy.empty() ? 0 : 1;   /* M6 fold 1: what ZonesAreasLeave reads */
         if (sentAreas && g_zlLoading != 0) ++g_areasSentLoading;
         if (sentAreas && !leaving.empty()) ++g_areasSentLeftOut;
+        if (sentAreas)   /* T-1442 step 1b: what an early report builds on until the next regular one, and the events this read reflects are cleared */
+        {
+            ++g_areasRegularSent;
+            g_lastSentXY = xy; g_lastSentLoading = g_zlLoading;
+            g_earlyHaveRegular = fromList == 1 ? 1 : 0;   /* the probe fallback carries no judgements to build on */
+            g_earlyLastAreas = areas; g_earlyLastLoading = g_zlLoading; g_earlyLastPy = py; g_earlyLastPs = psXY;
+            ZonesAreaEvClear(evSeqAtRead);
+            if (unloadInFlightAtRead == 0 && g_unloadInFlight == 0) g_areaEvUnnamedCleared = evUnnamedAtRead;   /* fold 1b-3: not over an unload still running */
+        }
         /* decision 1556: one line whenever what the report names changes - the kept list, the areas left out as leaving, the loading mark */
         std::string named;
         for (size_t i = 0; i < reported.size(); ++i) { if (i) named += " "; named += SectorString(reported[i]); }
@@ -1337,6 +1586,8 @@ int ZoneBuildingsInHereTri(float x, float y, float z)
 }
 void ZoneBuildingsGateRefusals(long long* offMain, long long* noZm) { *offMain = g_zbOffMain; *noZm = g_zbNoZm; }
 Sector MyPlayerSector() { return g_playerSector; }
+Sector MyLastPlayerSector() { return g_lastPlayerSector; }   /* T-1402: see zones.h */
+void ForgetLastPlayerSector() { const Sector none = { -1, -1 }; g_lastPlayerSector = none; }   /* T-1402 fold 4: see zones.h */
 bool SectorInMyRing(const Sector& s, int ring) { return g_playerSector.x >= 0 && abs(s.x - g_playerSector.x) <= ring && abs(s.y - g_playerSector.y) <= ring; }
 bool SectorLoadedHere(const Sector& s) { for (size_t i = 0; i < g_loaded.size(); ++i) if (g_loaded[i].x == s.x && g_loaded[i].y == s.y) return true; return false; }   /* review-p4w HIGH-1: the 7x7 probe box is NOT what the relay knows; g_loaded is */
 
@@ -1351,8 +1602,10 @@ void ReportZones()
              + "," + N(g_zlNotLoaded) + "," + N(g_zlNotInArray) + "," + N(g_zlHeaderDiffers) + "," + N(g_zlUnplaced) + "," + N(g_zlProbeFaults) + "," + N(g_zlChanges)
              + " playerSector=" + SectorString(g_playerSector) + " loaded=" + N((long long)g_loaded.size())
              + " yieldedNearPeer=" + N((long long)g_yieldedNearPeer) + " peerSect[recv,valid,ring1Relay,ring1Puppet,presumedEmptyGranted,preWelcomeIgnored]=" + N((long long)g_peerSectRecv) + "," + N((long long)g_peerSectValid) + "," + N((long long)g_peerSectRing1Relay) + "," + N((long long)g_peerSectRing1Puppet) + "," + N((long long)g_peerSectPresumedEmpty) + "," + N((long long)g_peerSectPreWelcomeIgnored) + "   (P6q: presumedEmptyGranted is NOT the old presumedEmpty - it counts ring-1 presumptions actually GRANTED, where the old name counted views on which one was on offer; preWelcomeIgnored is PLAYERSECTORS tables dropped because this link's WELCOME had not been processed yet)"
-             + " areasSent=" + N(g_areasSent) + " areasSentEmpty=" + N(g_areasSentEmpty) + " areasSentLoading=" + N(g_areasSentLoading) + " areasSentLeftOut=" + N(g_areasSentLeftOut) + " playerSecSent[entries,capped,unknown]=" + N(g_psSentEntries) + "," + N(g_psSentCapped) + "," + N(g_psSentNone) + " areasLeaveSent=" + N(g_areasLeaveSent) + " inventRefusedTeardown=" + N((long long)g_inventRefusedTeardown)
+             + " areasSent=" + N(g_areasSent) + " areasSentEmpty=" + N(g_areasSentEmpty) + " areasSentLoading=" + N(g_areasSentLoading) + " areasSentLeftOut=" + N(g_areasSentLeftOut) + " playerSecSent[entries,capped,unknown]=" + N(g_psSentEntries) + "," + N(g_psSentCapped) + "," + N(g_psSentNone) + " areasLeaveSent=" + N(g_areasLeaveSent) + " holderLines[changes,quiet]=" + N(g_holderChanges) + "," + N(g_holderLinesQuiet) + " inventRefusedTeardown=" + N((long long)g_inventRefusedTeardown)
              + " areaMapHold[armed,mapsHeld,released,now]=" + N(g_amHoldArmed) + "," + N(g_amHoldMaps) + "," + N(g_amHoldReleased) + "," + N((long long)g_amHoldN)   /* T-1100 TEST-ONLY */
+             + " areasEarly[sent,same,reads,cleared,regularSent,lines,linesQuiet]=" + N(g_areasEarlySent) + "," + N(g_areasEarlySame) + "," + N(g_areasEarlyReads) + "," + N(g_areasEarlyCleared) + "," + N(g_areasRegularSent) + "," + N(g_earlyLines) + "," + N(g_earlyLinesQuiet)   /* T-1442 step 1b */
+             + " areaEv[loaded,unloaded,unnamed,dropped,owed,hook]=" + N((long long)g_areaEvLoaded) + "," + N((long long)g_areaEvUnloaded) + "," + N((long long)g_areaEvUnnamed) + "," + N((long long)g_areaEvDropped) + "," + N((long long)(g_areaEvSeq != g_areaEvCleared ? 1 : 0)) + "," + N((long long)g_zoneMapUpdateHook) + " areaEvLoadEnd=" + N(g_areaEvLoadEnd)
              + "   (P8a: areasSent is AREAS messages this game got onto the wire to the NOTEBOOK; areasSentEmpty is"
                " the span of those whose loaded set was empty. A zero here on a linked game is a game never reporting"
                " its areas. M2: mapSent, mapRecv, mapSkippedRelay, sent and recv - the session-link SECTORMAP / ZONES"
@@ -1828,6 +2081,7 @@ namespace coop { void ZonesForgetHeldGrid(int keepRelayGrid)
     ::LeaveCriticalSection(&g_heldLock);
     g_loaded.clear(); g_playerSector.x = -1; g_playerSector.y = -1;
     g_orphanCentreValid = 0; g_orphanRun = 0; g_lastSentAny = 0; g_areasLeaveOwed = 1;   /* T-306: the last known centre (and what the last report said) belong to the world being freed */
+    g_earlyHaveRegular = 0;   /* T-1442 step 1b: the last regular report is the freed world's - no early report until the new world's first regular one (which clears the marks) */
 } }   /* review-p4y MEDIUM-3: the loaded set and the player sector are stale world state too (-1,-1 = unset, as SectorInMyRing reads it) */   /* world teardown: the grid under its lock; the loaded set unlocked because every reader of it is main-thread (the any-thread readers read only the locked grids; M2 deleted the no-notebook maps that stood beside it) - TeardownBroadcast probes and logs an off-thread call (review-p4n) */
 namespace coop { int HeldByOtherTS(const Sector& s) { return HostHoldsSectorTS(s); } }   /* decision 31(b): on either side, "held by someone other than me" (the grid is filled from each side's own view) */
 namespace coop {
@@ -2240,7 +2494,8 @@ std::string ZonesAreaMapCounters()   /* M9 (T-197): areaMap[rows,seats,rekeyed,b
     const std::string v = N(g_areaMapRows) + "," + N(g_areaMapSeats) + "," + N(g_areaMapRekeyed) + "," + N(g_areaMapBytes)
         + " areaMapOdd[rekeyDropped,malformed,pendingArmed,pendingDropped,pendingExpired]=" + N(g_areaMapRekeyDropped) + "," + N(g_areaMapMalformed)
         + "," + N(g_areaMapPendingArmed) + "," + N(g_areaMapPendingDropped) + "," + N(g_areaMapPendingExpired)   /* M9f1 */
-        + " areaFrozen[cells,maps,answers]=" + N(g_areaFrozenCells) + "," + N(g_areaFrozenMaps) + "," + N(g_areaFrozenAnswers);
+        + " areaFrozen[cells,maps,answers]=" + N(g_areaFrozenCells) + "," + N(g_areaFrozenMaps) + "," + N(g_areaFrozenAnswers)
+        + " areaMineMarkLines[lines,suppressed]=" + N(g_areaMineMarkLines) + "," + N(g_areaMineMarkSuppressed);   /* T-1351 */
     ::LeaveCriticalSection(&g_heldLock);
     return v;
 }
@@ -2249,6 +2504,18 @@ int ZonesEffCarriedCells() { HeldLockInit(); ::EnterCriticalSection(&g_heldLock)
 // decision 32: the relay's owner map (x, y, slot triples). The locked grid becomes "held by a slot other than mine"; while the relay
 // is present its map wins over the host-computed one (both games see the same map from one clock).
 double g_mySince[64][64];   /* inv4 fold 4: when my slot's bit appeared in each cell's effective mask (0 = clear); under g_heldLock */
+/* T-1351: one line each time an area's own loaded mark (g_mySince) is set, said after g_heldLock is left (capped 200 a session,
+   the rest counted in areaMineMarkLines[...]) */
+static void AreaMineMarkSay(const std::vector<int>& cells, double at)
+{
+    for (size_t i = 0; i + 1 < cells.size(); i += 2)
+    {
+        if (g_areaMineMarkLines >= 200) { ++g_areaMineMarkSuppressed; continue; }
+        ++g_areaMineMarkLines;
+        DebugLog("[ZONES] T-1351 area loaded mark SET zone." + N((long long)cells[i]) + "." + N((long long)cells[i + 1]) + ": this game's own map bit appeared; atMs="
+                 + N((long long)(at * 1000.0)) + " (performance clock, ms - the clock the kept-in-step test compares with the record-landed time)");
+    }
+}
 /* MAIN THREAD (ApplyRelayAreaMap): one line each time the set of frozen areas changes - x, y, holder triples. */
 static std::string g_areaFrozenSaid;
 static void AreaFrozenSay(const std::vector<int>& cells)
@@ -2261,6 +2528,25 @@ static void AreaFrozenSay(const std::vector<int>& cells)
     if (cells.empty()) DebugLog("[ZONES] no area is frozen now - every holder the area map names is in the world on this link's roster");
     else DebugLog("[ZONES] AREAS FROZEN: " + N((long long)(cells.size() / 3)) + " area(s) named for a player who is not in the world on this link's roster"
                   " - nothing is created, adopted, removed, woken or loaded from a record there until that player is in the world:" + t);
+}
+/* T-1442: UNDER g_heldLock - the holder each area's applied view names now (g_ownerSlot; < 0 = nobody) against the last map's; moves
+   appended as x, y, before, after (loadedzones::HolderMovesDiff). The first map on a link seeds the grid and says nothing. */
+static void HolderMovesStep(std::vector<int>* moves)
+{
+    const int seed = loadedzones::HolderSeedOnLink(&g_holderSeenLinkGen, (long)StoreLinkGen());
+    loadedzones::HolderMovesDiff(&g_holderSeen[0][0], &g_ownerSlot[0][0], 64, seed, moves);
+}
+/* T-1442: after the lock - one line per area whose holder this map changed (-1 = nobody), the first kHolderLinesMax; the rest counted */
+static void HolderMovesSay(const std::vector<int>& m, double nowSec)
+{
+    for (size_t i = 0; i + 3 < m.size(); i += 4)
+    {
+        ++g_holderChanges;
+        if (g_holderLines >= kHolderLinesMax) { ++g_holderLinesQuiet; continue; }
+        ++g_holderLines;
+        DebugLog("[ZONES] holder " + N((long long)m[i]) + "," + N((long long)m[i + 1]) + " " + N((long long)m[i + 2]) + "->" + N((long long)m[i + 3])
+                 + " atMs=" + N((long long)(nowSec * 1000.0 + 0.5)) + (g_holderLines == kHolderLinesMax ? " (the last such line - the rest counted, holderLines[quiet] on the REPORT line)" : ""));
+    }
 }
 int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
 {
@@ -2327,8 +2613,10 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
         g_hostHeldAt = 0.0;
         g_otherLoadedAt = 0.0;
         g_areaFrozenCells = 0;
+        std::vector<int> holderMoves; HolderMovesStep(&holderMoves);   /* T-1442: an empty map names nobody - a move to nobody is said too */
         ::LeaveCriticalSection(&g_heldLock);
         AreaFrozenSay(frozenCells);
+        HolderMovesSay(holderMoves, nowSec);
         return 1;
     }
     /* M9f1 (M9 review M2): rows are variable length - walked with a cursor over the payload AreaMapLayout has already walked */
@@ -2367,16 +2655,19 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
         for (int x = 0; x < 64; ++x)
             for (int y = 0; y < 64; ++y) coopgsync::GsHolderStep(&g_ahLast[x][y], &g_ahBefore[x][y], g_ownerSlot[x][y]);
     }
+    std::vector<int> holderMoves;   /* T-1442: x, y, before, after - said after the lock */
+    HolderMovesStep(&holderMoves);
     /* M9f1 (M9 review LOW "apply core"): THE REKEY, the pending slots, my own seat, every cell (W1-b: a present reporter is taken
        exactly - ANDed with the seats the map's table lists; an absent one keeps its last known bits; W1-c: an armed seat's absence
        drops them), the spent arms and the freed columns - one pure function, swept offline (m9f1_restart_sequence, m9f1_pending_*). */
     coopdrop::AreaApplyTally t;
     coopdrop::AreaApplyMapCore(&g_areaBook, listed, mySlot, nowSec, &g_effMask[0][0][0], &g_areaNewMask[0][0][0], 64 * 64, g_areaCellFlags, &t);
+    std::vector<int> mineMarkCells;   /* T-1351: the cells whose own loaded mark is set by this map (AreaMineMarkSay, after the lock) */
     for (int x = 0; x < 64; ++x)
         for (int y = 0; y < 64; ++y)
         {
             const unsigned char f = g_areaCellFlags[x * 64 + y];
-            if ((f & coopdrop::kAreaCellMineNow) != 0) { if ((f & coopdrop::kAreaCellMineBefore) == 0 || g_mySince[x][y] == 0.0) g_mySince[x][y] = nowSec; }   /* inv4 fold 4 */
+            if ((f & coopdrop::kAreaCellMineNow) != 0) { if ((f & coopdrop::kAreaCellMineBefore) == 0 || g_mySince[x][y] == 0.0) { g_mySince[x][y] = nowSec; mineMarkCells.push_back(x); mineMarkCells.push_back(y); } }   /* inv4 fold 4 */
             else g_mySince[x][y] = 0.0;
             g_otherLoaded[x][y] = ((f & coopdrop::kAreaCellOther) != 0) ? 1 : 0;
         }
@@ -2392,6 +2683,8 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
     if (!frozenCells.empty()) ++g_areaFrozenMaps;
     ::LeaveCriticalSection(&g_heldLock);
     AreaFrozenSay(frozenCells);
+    AreaMineMarkSay(mineMarkCells, nowSec);   /* T-1351 */
+    HolderMovesSay(holderMoves, nowSec);   /* T-1442 */
     for (size_t i = 0; i + 3 < amReleased.size(); i += 4)
     {   /* T-1100 (TEST-ONLY areamaphold): one line per release */
         Sector rs; rs.x = amReleased[i]; rs.y = amReleased[i + 1];

@@ -46,12 +46,16 @@ inline bool ImportAllowed(int mode, bool isStaff)
 
 /* ---- the switch word Kenshi's import is posted with (worldreset.h): always the crew (the screen's own 0x02) and the fixed import
    spot (0x01, decision 1226 a); research (0x08) only while the host includes it; never buildings (0x04), dead / named characters'
-   save state (0x10 - the shared world's own unique-character table decides) or faction relations (0x20). ---- */
+   save state (0x10 - the shared world's own unique-character table decides) or faction relations (0x20) - T-1383: except the world's
+   creator's import, when it ticked them (ImportFlagsFor). ---- */
 /* worldreset.h's kImportScreenBit / kImportResetPositions / kImportResearch, repeated so this header needs no other (the suite checks they agree) */
 const unsigned int kSwitchFixedSpot = 0x01u, kSwitchCrew = 0x02u, kSwitchResearch = 0x08u;
-inline unsigned int ImportFlags(bool research)
+/* T-1383 (decision 1704): the world's CREATOR (worldhist.h) may also tick dead named characters (0x10, Kenshi's own town pass kept -
+   F1049) and faction relations (0x20); no other import ever carries them. */
+const unsigned int kSwitchDead = 0x10u, kSwitchRelations = 0x20u;
+inline unsigned int ImportFlags(bool research, bool dead = false, bool relations = false)
 {
-    return kSwitchCrew | kSwitchFixedSpot | (research ? kSwitchResearch : 0u);
+    return kSwitchCrew | kSwitchFixedSpot | (research ? kSwitchResearch : 0u) | (dead ? kSwitchDead : 0u) | (relations ? kSwitchRelations : 0u);
 }
 
 /* ---- the save picker's list: SINGLE-PLAYER saves only (design read: a folder with quick.save and no multiplayer-world.key). A
@@ -175,16 +179,62 @@ inline std::vector<std::string> SquadIdPlan(const std::vector<std::string>& impo
    meets the copy id (a SPAWN, a later load) makes the copy from the original it names - never by the shown name. ---- */
 const char* const kCopyMark = "~i";
 const unsigned int kCopySidMax = 95u;   /* templatekey::kMaxSid (factionkey.h) - repeated so this header needs no other (the suite checks they agree) */
-/* a copy id: '~i' then one or more digits at the very end, with a non-empty original id before it */
-inline bool IsCopySid(const std::string& s)
+/* ---- T-1021 (owner 2026-11-18 'use the correct template rather than generic ones that we switch over'; F1336 design A): A RACE
+   LOOK-ALIKE - the template a brought-back character (resurrect.cpp) is made from when its own template's 'race' list does not give
+   exactly its race: a copy of that template (the same fill as an import copy, 'unique' off) whose 'race' list is the dead character's
+   race alone and whose 'female chance' is 0 or 100 from its saved sex, so the engine's own creation runs every step on the right race.
+   Its id carries all three - '<template id>~r<f|m><race id>' - so every load and every other game (a SPAWN, the world's look-alike
+   list) makes the same record from the id alone. The race id holds no '~' (the last '~' starts the race part); the template id may be
+   an import copy ('<id>~i<slot>') but never a race look-alike itself. ---- */
+const char* const kRaceMark = "~r";
+/* the parts of a race look-alike id; false = not one (the caller's outputs are then untouched) */
+inline bool RaceCopyParts(const std::string& s, std::string* base, std::string* raceSid, bool* female)
+{
+    const size_t at = s.rfind('~');
+    if (at == std::string::npos || at == 0 || at + 3 >= s.size() || s[at + 1] != 'r' || (s[at + 2] != 'f' && s[at + 2] != 'm')) return false;
+    const std::string b = s.substr(0, at);
+    const size_t bt = b.rfind('~');
+    if (bt != std::string::npos && bt + 1 < b.size() && b[bt + 1] == 'r') return false;   /* a race look-alike of a race look-alike is never made */
+    if (bt == 0) return false;   /* the template id must not start with '~' */
+    if (base != 0) *base = b;
+    if (raceSid != 0) *raceSid = s.substr(at + 3);
+    if (female != 0) *female = s[at + 2] == 'f';
+    return true;
+}
+inline bool IsRaceCopySid(const std::string& s) { return RaceCopyParts(s, 0, 0, 0); }
+/* an import copy id: '~i' then one or more digits at the very end, with a non-empty original id before it */
+inline bool IsImportCopySid(const std::string& s)
 {
     const size_t at = s.rfind(kCopyMark);
     if (at == std::string::npos || at == 0 || at + 2 >= s.size()) return false;
     for (size_t i = at + 2; i < s.size(); ++i) if (s[i] < '0' || s[i] > '9') return false;
     return true;
 }
-/* the original's id inside a copy id ("" = not a copy id) */
-inline std::string OrigOfCopySid(const std::string& s) { return IsCopySid(s) ? s.substr(0, s.rfind(kCopyMark)) : std::string(); }
+/* a look-alike id of either kind - the record is made from the id it names (OrigOfCopySid), never looked up by its shown name */
+inline bool IsCopySid(const std::string& s) { return IsImportCopySid(s) || IsRaceCopySid(s); }
+/* the id a look-alike is filled from ("" = not a copy id): an import copy's original, or a race look-alike's template (which may itself
+   be an import copy - made first) */
+inline std::string OrigOfCopySid(const std::string& s)
+{
+    std::string b;
+    if (RaceCopyParts(s, &b, 0, 0)) return b;
+    return IsImportCopySid(s) ? s.substr(0, s.rfind(kCopyMark)) : std::string();
+}
+/* the race look-alike id of `templateSid` for race `raceSid` and the sex: "" = none can be made (no template or race id, a race id
+   holding '~' or a control byte, a template id that is not a usable id (empty, a control byte, starting with '~') or longer than
+   kCopySidMax bytes all told). A template that is itself a race look-alike is replaced by its own template first (a character brought
+   back from a race look-alike gets one of the same template). */
+inline std::string RaceCopySid(const std::string& templateSid, const std::string& raceSid, bool female)
+{
+    std::string base = templateSid;
+    std::string inner;
+    if (RaceCopyParts(base, &inner, 0, 0)) base = inner;
+    if (base.empty() || raceSid.empty() || base[0] == '~') return std::string();
+    for (size_t i = 0; i < raceSid.size(); ++i) if (raceSid[i] == '~' || (unsigned char)raceSid[i] < 0x20) return std::string();
+    for (size_t i = 0; i < base.size(); ++i) if ((unsigned char)base[i] < 0x20) return std::string();
+    const std::string c = base + kRaceMark + (female ? "f" : "m") + raceSid;
+    return c.size() > kCopySidMax ? std::string() : c;
+}
 /* the copy id for an importer's slot: "" = none can be made (no original, no slot, the original is itself a copy, or the id would be
    longer than kCopySidMax bytes - the import is then held, as the squad-id rename's no-free-id case is) */
 inline std::string CopySid(const std::string& origSid, int slot)
@@ -289,31 +339,24 @@ const char* const kPickText         = "Choose the single-player save to import f
 const char* const kPickColSave      = "SAVE";
 const char* const kPickColPlayed    = "LAST PLAYED";
 const char* const kPickNone         = "No single-player saves found.";
-const char* const kComesAlong       = "COMES ALONG";
-const char* const kStaysBehind      = "STAYS BEHIND";
-const char* const kAlongCrew        = "Your characters and their gear";
-const char* const kAlongAnimals     = "Your animals";
-const char* const kAlongMoney       = "Your money";
-const char* const kAlongResearch    = "Your research";
-const char* const kBehindBuildings  = "Buildings and outposts";
-const char* const kBehindRelations  = "Faction relations";
-const char* const kBehindDead       = "Characters who died";
-const char* const kBehindMoney      = "Money (you start with the usual new-game amount)";
-const char* const kBehindResearch   = "Research (you start fresh)";
-const char* const kArrival          = "Your imported characters arrive together at the starting spot for imports.";
+/* T-1383 (decision 1704; the approved page, version 3 - word for word): the COMES ALONG / STAYS BEHIND boxes became ONE sentence by the
+   host's money / research options; the creator's two tick boxes, their hovers and the note; the arrival line. */
+const char* const kCarryBoth        = "Brings your characters with their gear and animals, your money and your research. Buildings stay behind.";
+const char* const kCarryNoMoney     = "Brings your characters with their gear and animals, and your research. You start with the usual new-game money. Buildings stay behind.";
+const char* const kCarryNoResearch  = "Brings your characters with their gear and animals, and your money. Research starts fresh. Buildings stay behind.";
+const char* const kCarryNeither     = "Brings your characters with their gear and animals. You start with the usual new-game money, and research starts fresh. Buildings stay behind.";
+inline const char* CarrySentence(bool money, bool research)
+{
+    return money ? (research ? kCarryBoth : kCarryNoResearch) : (research ? kCarryNoMoney : kCarryNeither);
+}
+const char* const kTickDead         = "Also bring named characters who died";
+const char* const kTickRelations    = "Also bring how the factions feel about each other";
+const char* const kCreatorNote      = "Only the world's first player can choose these, because they set the world for everyone who joins later.";
+const char* const kHoverDead        = "Named characters who are dead in this save start dead in the new world.";
+const char* const kHoverRelations   = "Factions start with the standings they have in this save, including with your faction.";
+const char* const kArrival          = "Your characters arrive together at the starting spot for imports.";
 const char* const kBtnCancel        = "CANCEL";
 const char* const kBtnImport        = "IMPORT";
-/* The two boxes' lines with the host's money / research options: an option turned off moves its line to STAYS BEHIND. */
-inline void BoxLines(bool money, bool research, std::vector<std::string>* along, std::vector<std::string>* behind)
-{
-    along->clear(); behind->clear();
-    along->push_back(kAlongCrew); along->push_back(kAlongAnimals);
-    if (money) along->push_back(kAlongMoney);
-    if (research) along->push_back(kAlongResearch);
-    behind->push_back(kBehindBuildings); behind->push_back(kBehindRelations); behind->push_back(kBehindDead);
-    if (!money) behind->push_back(kBehindMoney);
-    if (!research) behind->push_back(kBehindResearch);
-}
 /* NEW PROFILE's START WITH row: whether import may be picked (else the row is fixed on "A new character", arrows greyed), the
    hint under it ("" = none) and the right button's word. */
 inline const char* StartHint(bool importPicked, bool allowed)
@@ -333,9 +376,14 @@ inline const char* StartHintAs(bool importPicked, bool allowed, bool isHost)
 /* ---- the PROFILES answer's import word (store protocol 129): bit 0 = this asker may import, bit 1 = money included, bit 2 =
    research included, bit 3 = the word is present (an older world sends none: import is then not offered). ---- */
 const unsigned int kWordAllowed = 1u, kWordMoney = 2u, kWordResearch = 4u, kWordPresent = 8u;
-inline unsigned int AnswerWord(int mode, bool isHost, bool money, bool research)
+/* T-1383 (world-server protocol 159): bit 4 CREATOR - in any answer, an import this asker makes now would make the world's creator
+   (worldhist::CreatorOpen; the save picker shows its two tick boxes); in the answer to this game's own NEW with import, the profile
+   just made holds the creator claim (its import may carry 0x10 / 0x20). Never set while this asker may not import. */
+const unsigned int kWordCreator = 16u;
+inline unsigned int AnswerWord(int mode, bool isHost, bool money, bool research, bool creator = false)
 {
-    return kWordPresent | (ImportAllowed(mode, isHost) ? kWordAllowed : 0u) | (money ? kWordMoney : 0u) | (research ? kWordResearch : 0u);
+    return kWordPresent | (ImportAllowed(mode, isHost) ? kWordAllowed : 0u) | (money ? kWordMoney : 0u) | (research ? kWordResearch : 0u)
+         | ((creator && ImportAllowed(mode, isHost)) ? kWordCreator : 0u);
 }
 
 /* ---- T-1096 part 3: NEW PROFILE's START WITH row - whether import may be picked here and the host's money / research options, from
@@ -343,21 +391,42 @@ inline unsigned int AnswerWord(int mode, bool isHost, bool money, bool research)
    CHANGE, the world not running - the world's own options.txt values (the host always asks as the host). ---- */
 struct StartRowState
 {
-    bool allowed, money, research;
-    StartRowState() : allowed(false), money(true), research(true) {}
+    bool allowed, money, research, creator;   /* T-1383: creator - the picker shows the two tick boxes and the note */
+    StartRowState() : allowed(false), money(true), research(true), creator(false) {}
 };
 inline StartRowState StartRowFromWord(unsigned word)
 {
     StartRowState s;
     if ((word & kWordPresent) == 0) return s;   /* an older world sends no word: import is not offered */
     s.allowed = (word & kWordAllowed) != 0; s.money = (word & kWordMoney) != 0; s.research = (word & kWordResearch) != 0;
+    s.creator = s.allowed && (word & kWordCreator) != 0;
     return s;
 }
-inline StartRowState StartRowFromOptions(const std::string& mode, const std::string& money, const std::string& research)
+inline StartRowState StartRowFromOptions(const std::string& mode, const std::string& money, const std::string& research, bool worldFresh = false)
 {
     StartRowState s;
     s.allowed = ImportAllowed(ModeOf(mode), true); s.money = IncludesOf(money); s.research = IncludesOf(research);
+    s.creator = s.allowed && worldFresh;   /* T-1383: HOST GAME's CHANGE - the world folder holds no profile and no history (WorldFolderFresh) */
     return s;
+}
+/* T-1383: HOST GAME's CHANGE, the world not running - whether the world folder would grant the creator claim: no profiles.txt row, no
+   line in uniques.txt or world_relations.txt, and no record file (<id>.meta). The world server decides again when the HOST press asks
+   (worldhist::CreatorOpen); this decides only whether the picker shows the two boxes. */
+inline bool WorldFolderFresh(int profileRows, bool uniquesLines, bool relationLines, bool recordFiles)
+{
+    return profileRows == 0 && !uniquesLines && !relationLines && !recordFiles;
+}
+/* T-1383: what this import asks of the world - the two ticks count only while the picker shows them (the creator's) */
+inline unsigned int CreatorAsk(bool creatorShown, bool deadTicked, bool relationsTicked)
+{
+    if (!creatorShown) return 0u;
+    return (deadTicked ? 1u : 0u) | (relationsTicked ? 2u : 0u);   /* worldhist::kAskDead / kAskRelations (the suite checks they agree) */
+}
+/* T-1383: this import's switch word - the asked parts only once the world's answer says the profile holds the creator claim */
+inline unsigned int ImportFlagsFor(bool research, unsigned int ask, unsigned int answerWord)
+{
+    const bool creator = (answerWord & kWordPresent) != 0 && (answerWord & kWordCreator) != 0;
+    return ImportFlags(research, creator && (ask & 1u) != 0, creator && (ask & 2u) != 0);
 }
 /* The row's two values: either arrow switches between them while import may be picked; otherwise the row stays on "A new character"
    with both arrows greyed (the approved page). */

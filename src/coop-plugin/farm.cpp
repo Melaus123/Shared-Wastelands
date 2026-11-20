@@ -50,6 +50,7 @@
 #include "net/session.h"    /* SessionLinked, SendFarm */
 #include "../common/farmwire.h"
 #include "../common/keptwire.h"   /* KEPT: the kept farm's plant ages (FarmKeptLay) */
+#include "../common/farmstatelog.h"   /* T-1361 LOG ONLY: the [FARM] state line per player farm */
 #include "coop_log.h"
 #include "hooks.h"     /* coop::AddHook (own MinHook) */
 #include "policy.h"    /* T-1125: PolicyVtableRvaPod / PolicyClassNamePod - the torture building's class */
@@ -2522,6 +2523,50 @@ int FarmWorkerListedPod(const void* b, const void* c)
     return SpListed(b, ids);
 }
 
+/* T-1361 (F1083) LOG ONLY: the engine's 'built' byte (+0x160, fold #4's guard), -1 unreadable. No C++ object here (C2712). */
+int FmPhysicalRead(void* b)
+{
+    __try { return (int)*((const unsigned char*)b + kFmPhysical); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1361 (F1083) LOG ONLY, MAIN THREAD (the end of FarmTick's round, a pass every 2 s): one [FARM] state line per PLAYER farm (its piece
+   record stored) this game tracks - at the first look, when the farm table's writer verdict changes, when its plants harvested change
+   or its crop starts again, else every swfarmstate::kEveryMs; swfarmstate::kStateLineCap lines per launch, the rest counted. Reads only:
+   the farm's own fields (FmReadPod), the writer ladder's slot (FmWriterNow), the stored record (PieceRecFarmStateOf). */
+std::map<std::string, swfarmstate::Last> g_fsLast;
+long long g_fsLogged = 0, g_fsSeen = 0;
+DWORD g_fsAt = 0;   /* the last state pass: one every 2 s at most (the events are seen within 2 s) */
+void FmStateRound(DWORD now)
+{
+    if (now - g_fsAt < 2000) return;
+    g_fsAt = now;
+    const int n = FmSnapshot(g_cp);
+    for (int i = 0; i < n; ++i)
+    {
+        const FmCopy& c = g_cp[i];
+        if (now - c.seenAt > kFmForgetMs) continue;
+        const std::string key(c.key);
+        swfarmstate::Vals v;
+        v.hasRec = PieceRecFarmStateOf(key, &v.ownerSlot, &v.recGen, &v.recGrown, &v.mySlot);
+        if (v.hasRec == 0) continue;   /* not a player farm */
+        void* b = FmResolve(key);
+        if (b == 0 || FmReadPod(b, &g_pod) == 0) continue;
+        v.grown = g_pod.grown; v.died = g_pod.died; v.harvested = g_pod.harvested;
+        v.water = (g_pod.nIn > 0) ? g_pod.inStock[0] : -1.0f;
+        v.verdict = c.verdict;
+        std::map<std::string, swfarmstate::Last>::iterator it = g_fsLast.find(key);
+        if (it == g_fsLast.end() && g_fsLast.size() < swfarmstate::kKeysCap) it = g_fsLast.insert(std::make_pair(key, swfarmstate::Last())).first;
+        if (it == g_fsLast.end()) continue;   /* past the farms remembered: no line (counted nowhere - 256 player farms on one game) */
+        const int why = swfarmstate::Due(it->second, v, (unsigned int)now);
+        if (why == swfarmstate::kNone) continue;
+        swfarmstate::Book(&it->second, v, (unsigned int)now);
+        if (!swfarmstate::Take(&g_fsSeen, &g_fsLogged, swfarmstate::kStateLineCap)) continue;
+        v.physical = FmPhysicalRead(b);
+        FmWriterNow(key, b, &v.writerSlot);
+        DebugLog(swfarmstate::Line(key, v, why, g_fsLogged));
+    }
+}
+
 void FarmTick()
 {
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
@@ -2685,6 +2730,7 @@ void FarmTick()
         }
         if (toSelf != 0) ++g_opHandedToSelf;
     }
+    FmStateRound(now);   /* T-1361 LOG ONLY: the [FARM] state line per player farm */
 }
 
 /* T-1211, MAIN THREAD (spawn.cpp PrisonSafePointDrain): 1 = hold the refusal of an own character's caging (ownOp) for another
@@ -3067,7 +3113,7 @@ void FarmDrain()
 
 void FarmForgetWorld()
 {
-    g_inFarm.clear(); g_inOp.clear(); g_last.clear(); g_hint.clear(); g_ftKind = 0; g_said = 0; g_saidFull = 0; g_saidNoWorker = 0;
+    g_inFarm.clear(); g_inOp.clear(); g_last.clear(); g_hint.clear(); g_ftKind = 0; g_fsLast.clear(); g_said = 0; g_saidFull = 0; g_saidNoWorker = 0;
     g_inMine.clear(); g_mnSaid = 0; g_inMineState.clear();
     g_inSpot.clear(); g_spRun.clear(); g_spSaid = 0;   /* T-674: the world's buildings and sets are gone with it */
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
@@ -3293,7 +3339,7 @@ void ReportFarm()
         std::sprintf(rb, "[FARM] REPORT recordRoad[playerFarmLooks,keepAliveSkipped,cropSendSkipped,applyCropKept,recordLaid,catchUpDropped,catchUpRetimed,catchUpWaitLay,catchUpHeldWriter]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
                      g_pubPlayerFarm, g_pubKeepSkipped, g_pubCropSkipped, g_applyCropKept, g_recLaid, g_tsRecordDropped, g_tsRecordRetimed, g_tsWaitLay,
                      (long long)g_tsHeldWriter);
-        DebugLog(std::string(rb));
+        DebugLog(std::string(rb) + swfarmstate::StateToken(g_fsLogged, g_fsSeen, (unsigned int)g_fsLast.size()));   /* T-1361 LOG ONLY */
         std::sprintf(rb, "[FARM] REPORT catchUpLoose[kept,adopted,replaced,full,single,waiting]=%lld,%lld,%lld,%lld,%lld,%ld",
                      (long long)g_tlKept, (long long)g_tlAdopted, (long long)g_tlReplaced, (long long)g_tlFull, (long long)g_tlSingle,
                      (long)::InterlockedCompareExchange(&g_tlN, 0, 0));

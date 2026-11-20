@@ -29,6 +29,8 @@
 // the commonest one once two games have converged and previously established nothing at all.
 #pragma once
 #include <string>
+#include <vector>
+#include <utility>
 namespace coop {
 void InstallWorldState();     // preload, main thread: the FIVE hooks (declareDead, uniqueStateUpdate, the squad-unload writer, the shared setter, and the respawn clear)
 void WorldStateTick();        // MAIN THREAD, every frame: drains the detours' ring, reads the state map (E19: the only reader) and sends what changed
@@ -39,6 +41,10 @@ int WsUniqueMarkMade(void* gd);          // TEST-ONLY squadtest, MAIN THREAD: th
 void* WsLoadedBodyOf(void* gd, int* dead);   // TEST-ONLY squadtest, MAIN THREAD: a loaded body of that template (0 none); *dead 1 dead, 0 alive, -1 unreadable
 void WorldStateImportLoad(int on);   // T-1096, MAIN THREAD (store.cpp): 1 from a single-player import's post to its first save's arm; 0 otherwise
 int WorldStateImportLoading();       // T-1096 (owner 1234 e), ANY THREAD: 1 while that window is open - store.cpp's look-alike pass makes the import's named characters copies
+// T-1383 (F1049), MAIN THREAD: the engine's named-character table walked (read only) - *dead = (text id, player involved) of every
+// state-0 row; counts = entries read, dead, alive, imprisoned, other, no text id; *tableCount = the table's own count. Returns the
+// entries read, or -1 (no address, or a table this walk does not understand: nothing is used).
+int WorldStateDeadWalk(std::vector<std::pair<std::string, int> >* dead, long long counts[6], long long* tableCount);
 long long WorldStateGeneration();   // MAIN THREAD: grows by one whenever a named character's state changes on this game (seen in the drain, or applied from the world); towns2 reads it
 void WorldStateWorldTeardown();   // MAIN THREAD, from the store's teardown broadcast: the shadow, the register and the ring all name the world being destroyed
 void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolved, unsigned int back);   // MAIN THREAD: a state from the notebook; back = how many times the world server says that character was brought back

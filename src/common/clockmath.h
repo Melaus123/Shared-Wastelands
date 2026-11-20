@@ -213,6 +213,10 @@ const int kTimeModeSlowest = 1;   /* `consensus`: the slowest choice among the g
 const int kTimeModeAgree   = 2;   /* `vote`: the speed every game in the world chose; any disagreement = 1x */
 const int kTimeModeNormal  = 3;   /* `locked`: always 1x */
 const int kTimeModeCount   = 4;
+/* THE ONE PLACE A WORLD WITH NO STORED GAME SPEED CONTROL IS DECIDED (T-1423, owner 1770, 2026-11-18): Slowest wins. The world
+   server writes a missing `timemode` row at this mode's word, and GAME OPTIONS' row default is the same word (the suite checks
+   the two agree). A world whose rules name a mode keeps it. */
+const int kTimeModeAbsent  = kTimeModeSlowest;
 /* "fixed" / "consensus" / "vote" / "locked" -> the mode byte; -1 for any other text */
 int TimeModeOfWire(const char* wire);
 /* the mode byte -> its `timemode` value; "" for a byte no mode has */
@@ -274,34 +278,43 @@ const int kMenuPass = 0, kMenuSkip = 1, kMenuSkipVote = 2, kMenuSkipRestore = 3;
    pairing). `voteHeld`: a menu's pause vote stands for this player and is owed back when the last menu holding it
    closes. `menuOpen`: the game menu is open in a session, in a world - its vote follows this, not its togglePause
    calls, because the menu's show calls togglePause only when the game is running (an Esc opened over a world another
-   player's vote has paused makes no call, and neither does its hide). `talkOpen` (T-978, owner decision 1445 a): an NPC
-   conversation window is open in a session, in a world - under Slowest wins it is this player's pause vote like the menus;
-   the vote is given back only when the game menu, build mode and the conversation window are all closed. */
-struct MenuPauseState { int menuSkipped; int buildSkipped; int voteHeld; int menuOpen; int talkOpen; };
+   player's vote has paused makes no call, and neither does its hide). An NPC conversation window is NOT a pause vote
+   (T-1386, owner 2026-11-16: T-978 C's window vote removed); its own pause stays skipped in a session (T-288). */
+struct MenuPauseState { int menuSkipped; int buildSkipped; int voteHeld; int menuOpen; };
+/* T-1392 (owner decisions 1722 / 1723, the approved page): the world's MENUS AND BUILDING rule (key `menupause`), shown on GAME
+   OPTIONS only under Slowest wins. Keep running (`run`): an open Esc menu or build mode pauses nobody, under every speed setting.
+   Pause everyone (`pause`): under Slowest wins an open one is this player's pause vote (T-927's behaviour). An NPC conversation
+   never pauses either way (T-1386). The two functions below take it as `menusPause`. */
+const int kMenusKeepRunning = 0, kMenusPauseEveryone = 1;
+const char* const kMenusPauseKey = "menupause";
+/* THE ONE PLACE A WORLD WITH NO STORED MENUS AND BUILDING VALUE IS DECIDED (owner 1724 a, 2026-11-16): Keep running, for a new
+   world and for a world already on Slowest wins alike. Every reader of a missing value (the game's OPTIONS map, GAME OPTIONS'
+   row default) takes it from here. */
+const int kMenusPauseAbsent = kMenusKeepRunning;
+/* `run` -> kMenusKeepRunning, `pause` -> kMenusPauseEveryone, anything else (absent included) -> -1 */
+int MenusPauseOfWire(const char* wire);
+/* the value byte -> its wire word; "" for a byte no value has */
+const char* MenusPauseWire(int v);
+/* 1 = an open Esc menu or build mode is this player's pause vote: the world's GAME SPEED CONTROL is Slowest wins AND its MENUS
+   AND BUILDING is Pause everyone. */
+int MenuPauseVotes(int mode, int menusPause);
 /* `linked` = this game is in a session (a host alone included); `inWorld` = a world is running here (the title
-   screen is not one); `mode` = the world's GAME SPEED CONTROL (kTimeMode*). In a session, in a world: an opening
-   call is skipped; build mode's entry under Slowest wins is also this player's pause vote (one vote however many
+   screen is not one); `mode` = the world's GAME SPEED CONTROL (kTimeMode*); `menusPause` = its MENUS AND BUILDING
+   (kMenus*). In a session, in a world: an opening call is skipped; build mode's entry while MenuPauseVotes is also this
+   player's pause vote (one vote however many
    menus are open - the game menu's vote is cast by MenuPauseNoteGameMenu instead); a closing call is skipped when
-   its opening call was, and build mode's exit gives the vote back when neither the game menu nor the conversation window
-   is open (whatever the mode is by then). Anywhere else the call passes. A null state passes. */
-int MenuPauseDecide(int site, int linked, int inWorld, int mode, MenuPauseState* st);
+   its opening call was, and build mode's exit gives the vote back when the game menu is not open (whatever the
+   mode is by then). Anywhere else the call passes. A null state passes. */
+int MenuPauseDecide(int site, int linked, int inWorld, int mode, int menusPause, MenuPauseState* st);
 /* the game menu's own state after its show or hide ran (`open` = its panel is visible). Opened in a session, in a
-   world, under Slowest wins with no vote standing: kMenuSkipVote (cast this player's pause vote). Closed (or shown
-   outside a session) after a session open, with the vote standing and neither build mode nor the conversation window
-   holding it: kMenuSkipRestore
+   world, while MenuPauseVotes, with no vote standing: kMenuSkipVote (cast this player's pause vote). Closed (or shown
+   outside a session) after a session open, with the vote standing and build mode not holding it: kMenuSkipRestore
    (give the older choice back). Otherwise kMenuPass (nothing to do). Nothing here skips an engine call; the answers
    name only their vote half. A null state passes. */
-int MenuPauseNoteGameMenu(int open, int linked, int inWorld, int mode, MenuPauseState* st);
+int MenuPauseNoteGameMenu(int open, int linked, int inWorld, int mode, int menusPause, MenuPauseState* st);
 /* the player chose a speed (a key, a button, a speed mod) while a menu's vote stood: that choice is theirs now, and
    closing the menu does not give back the older one */
 void MenuPauseNotePress(MenuPauseState* st);
-/* T-978 (owner decision 1445 a, rule 'Conversations and the world clock'): the conversation window's state, polled every
-   frame (`open` = the window shows a conversation). Only a change acts: opened in a session, in a world, under Slowest wins
-   with no vote standing: kMenuSkipVote; closed (or no longer in a session or a world) after it counted as open, with the
-   vote standing and neither the game menu nor build mode holding it: kMenuSkipRestore; otherwise kMenuPass. Being called
-   again while open never casts the vote twice - a speed the player chose with the window open (MenuPauseNotePress) stands.
-   Under any other mode nothing is voted (host-controlled speed: nothing changes). A null state passes. */
-int MenuPauseNoteTalkWindow(int open, int linked, int inWorld, int mode, MenuPauseState* st);
 /* this game's world closed: its standing vote was reset with it, so nothing is owed back; and no menu mark outlives
    it - a world can close with a menu open by a road that never runs the menu's hide, and a mark left set would swallow
    the next session's vote give-back or skip a single-player unpause */

@@ -37,6 +37,7 @@
 #include "items.h"
 #include "farm.h"              /* MineStepRelay / MineLinked - a worker's step on a building another game writes */
 #include "../common/farmwire.h"   /* coopfarm::MineStepRoute, the three-way production writer */
+#include "../common/keycap.h"   /* T-1401: the [ITEMS] box lines per box per minute; each box change received, per box */
 #include "build.h"          /* build1h: BuildRecordedOwnerSlot - the shared build record */
 #include "../common/bldgrec.h"   /* T-1333: IsBldgRecId - a building record's refusal is routed to build.cpp */
 #include "../common/paritywire.h"   /* par1: MSG_PARITY_REQ / MSG_PARITY_BOX payloads and the box digest */
@@ -156,6 +157,8 @@
 #include "../common/garmentdetail.h"   /* T-1119: GarmentColourDecide - a made item's sent colour, applied as the engine's loader does */
 #include <mygui/MyGUI_Widget.h>     /* T-1192 TEST-ONLY jobtest craftwin: the crafting window's recipe rows are found among its widgets */
 #include <mygui/MyGUI_InputManager.h>   /* T-1224: the widget under the mouse for the loot release line (chat.cpp's LinkTick reads it the same way) */
+#include "tradewin.h"   /* T-1167 piece 2: ItemsTradeRows' row (TradeInvRow) */
+#include "../common/tradewin.h"   /* T-1167 v3 fold 2: swtrade::SecHit / GridCell - the right-click's square, shared with the offline suite */
 
 namespace coop {
 /* inv2a (user decision 2026-09-26): THE INVENTORY SAFETY NET - defined just above ItemsTick. EVERY ITEM_MOVE this file
@@ -361,6 +364,8 @@ unsigned long long kGuiPickupRva = 0; static coop::AddrReg kGuiPickupRva_reg("Gu
 unsigned long long kGuiPlaceRva = 0; static coop::AddrReg kGuiPlaceRva_reg("GuiPlace", &kGuiPlaceRva);   /* P8h: the address table fills this. Steam_1.0.65 0x714990 */   // bool InventoryGUI::placeItemFromMouse(std::string section, const MyGUI::TPoint<int>&)
 unsigned long long kMouseReturnItemRva = 0; static coop::AddrReg kMouseReturnItemRva_reg("MouseReturnItem", &kMouseReturnItemRva);   /* T-164 part 2: the address table fills this. Steam_1.0.65 0x70D000 */   // void MouseInventory::returnItem() - the cursor item back to the window it came from (0x70CC90 + 0x70CE50)
 unsigned long long kMouseGiveToObjectRva = 0; static coop::AddrReg kMouseGiveToObjectRva_reg("MouseGiveToObject", &kMouseGiveToObjectRva);   /* T-164 part 2 fold 2 (HIGH): the address table fills this. Steam_1.0.65 0x7118C0 */   // bool (InventoryGUI* srcWindow, Item* item, RootObject* target) - the cursor item into a world object's inventory (0x712AD0)
+unsigned long long kMouseReleaseNoWindowRva = 0; static coop::AddrReg kMouseReleaseNoWindowRva_reg("MouseReleaseNoWindow", &kMouseReleaseNoWindowRva);   /* T-1167 piece 3 build 4: Steam_1.0.65 0x712AD0, 1.0.68 0x7136A0 (prologue 40534883EC404883793000488BD90F84, capstone) */  // void MouseInventory::(release with no inventory window under the mouse) - 0x715DD0 / 0x715C30 call it when the hovered window +0xB0 is 0
+unsigned long long kRightReleaseItemRva = 0; static coop::AddrReg kRightReleaseItemRva_reg("RightReleaseItem", &kRightReleaseItemRva);   /* T-1167 v3 (owner 1678): Steam_1.0.65 0x713E50, 1.0.68 0x714A20 (prologue 488BC4554154415541564157488DA8E8, gen_table_1068 same) */  // void InventoryGUI::(right release over this window) - 0x715DD0 calls it (and 0x7145F0 with a position it stored): the item at the cell under the engine's mouse floats, one unit (Shift: the stack) to another open window, or with none open some items used (a map read, two other kinds)
 unsigned long long kMouseClearItemRva = 0; static coop::AddrReg kMouseClearItemRva_reg("MouseClearItem", &kMouseClearItemRva);   /* T-1184 (owner 1467 a): the address table fills this. Steam_1.0.65 0x70CE50 / 1.0.68 0x70DA20 */   // void MouseInventory clear(MouseInventory*) - empties the cursor: deletes its icon (+0x38), zeroes the item (+0x30) and source window (+0x68), empties both strings; the ITEM itself is untouched (decomp_70ce50). returnItem 0x70D000 runs it after its put-back
 unsigned long long kMousePutBackItemRva = 0; static coop::AddrReg kMousePutBackItemRva_reg("MousePutBackItem", &kMousePutBackItemRva);   /* T-164 part 2 fold (H2): the address table fills this. Steam_1.0.65 0x70CC90 */   // void MouseInventory put-back (InventoryGUI* window, Item* item, const std::string& section) - the item into the window's inventory
 unsigned long long kInvGuiRecordMapRva = 0; static coop::AddrReg kInvGuiRecordMapRva_reg("InvGuiRecordMap", &kInvGuiRecordMapRva);   /* T-164 part 2 fold (L2): the address table fills this. Steam_1.0.65 0x2131B90 (DAT_142131b90) */   // std::map<InventoryGUI*, window record> - 0x6F4D90 is its operator[]
@@ -663,6 +668,8 @@ typedef char  (*GuiPlaceFn)(void* gui, void* sectionStr, void* point);
 typedef void  (*MouseReturnFn)(void* mouse);   /* T-164 part 2 (I4): 0x70D000, the cursor item back to its window */
 typedef void  (*MouseClearFn)(void* mouse);    /* T-1184: 0x70CE50, the cursor emptied (the item untouched) */
 typedef void  (*MousePutBackFn)(void* gui, void* item, const void* sectionRef);   /* T-164 part 2 fold (H2): 0x70CC90, an item into a window's inventory */
+typedef void  (*MouseReleaseNoWindowFn)(void* mouse);   /* T-1167 piece 3 build 4: 0x712AD0, the cursor item let go over no inventory window */
+typedef void  (*RightReleaseItemFn)(void* gui);   /* T-1167 v3 (owner 1678): 0x713E50, the right release over an inventory window */
 typedef char  (*MouseGiveFn)(void* srcGui, void* item, void* target);   /* T-164 part 2 fold 2 (HIGH): 0x7118C0, the cursor item into a world object's inventory */
 typedef void  (*SecAddItemFn)(void* sec, void* item, int x, int y);
 typedef char  (*SecRemoveItemFn)(void* sec, void* item);
@@ -727,6 +734,8 @@ GuiPickupFn      orig_guiPickup = 0;
 GuiPlaceFn       orig_guiPlace = 0;
 MousePutBackFn   orig_putBack = 0;   /* T-164 part 2 fold (H2): 0x70CC90 */
 MouseGiveFn      orig_mouseGive = 0;   /* T-164 part 2 fold 2 (HIGH): 0x7118C0 */
+MouseReleaseNoWindowFn orig_mouseReleaseNoWindow = 0;   /* T-1167 piece 3 build 4: 0x712AD0 */
+RightReleaseItemFn orig_rightReleaseItem = 0;   /* T-1167 v3: 0x713E50 */
 GuiTakeCertainFn orig_guiTakeCertain = 0;
 RClickAutoTradeFn orig_rclickTrade = 0;   /* T-164 B4-1: 0 = the right-click charge hook is not installed */
 
@@ -4114,6 +4123,7 @@ void detour_zoneDeactivate(void* content, char saveFirst)
        same function - DoorsOnZoneDeactivate is two interlocked integer writes and nothing else, which
        is what an off-thread detour may safely do inside the engine's own teardown. */
     DoorsOnZoneDeactivate();
+    coop::ZonesAreaUnloadBegin();   /* T-1442 step 1b: the area report is owed and an unload is in flight (interlocked writes; ZonesTick sends it, nothing here) */
     const int here = ItOnMainThread();
     if (here == 0)
     {
@@ -4134,7 +4144,7 @@ void detour_zoneDeactivate(void* content, char saveFirst)
         ::InterlockedIncrement64(&g_zoneDeactivateOffThread);
         ItemsLootZoneOffThread();   /* loot2c fold (review 1f): live research copies cannot be taken out off the main thread - counted (retractMissedOffThread), said loudly at the next tick */
         __try { orig_zoneDeactivate(content, saveFirst); }
-        __finally { ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); ::InterlockedIncrement64(&g_grZoneTornGen); DoorsOnZoneDeactivate(); }
+        __finally { ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); ::InterlockedIncrement64(&g_grZoneTornGen); DoorsOnZoneDeactivate(); coop::ZonesAreaUnloadEnd(); }
         return;
     }
     ItemsLootRetractAll(kLootWhyUnload);   /* loot2c: research copies leave their boxes BEFORE the original writes the zone record (a no-op with none registered) */
@@ -4148,7 +4158,8 @@ void detour_zoneDeactivate(void* content, char saveFirst)
        these cover a main-thread resolve that ran DURING the original call and re-filled the memo behind us. */
     __try { orig_zoneDeactivate(content, saveFirst); }
     __finally { if (g_zoneUnloadDepth > 0) --g_zoneUnloadDepth;
-                ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); ::InterlockedIncrement64(&g_grZoneTornGen); DoorsOnZoneDeactivate(); }
+                ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); ::InterlockedIncrement64(&g_grZoneTornGen); DoorsOnZoneDeactivate();
+                coop::ZonesAreaUnloadEnd(); }
 }
 
 // ---- T-164 B4-1 charge: THE REAL CHARGE OF EVERY PLAYER TRADE, measured at the moment the engine makes it ----
@@ -4604,6 +4615,29 @@ char detour_mouseGive(void* srcGui, void* item, void* target)
     if (lootRel != 0) LootRelGiveEnd(item, refused, r);
     return r;
 }
+/* T-1167 piece 3 build 4 (owner 1638 / 1639, mock-up 1642): THE DRAG ONTO THE TRADE WINDOW. 0x712AD0 is the engine's code for a cursor
+   item let go where no inventory window is under the mouse (the release handlers 0x715DD0 / 0x715C30 call it when the cursor's
+   hovered window +0xB0 is 0; 0x70F930 sets +0xB0 each frame from the MyGUI widget under the mouse - an InventoryGUI's widget or its
+   root, else 0 - so over the TRADE window it is 0). The TRADE window decides first (tradewin.cpp TradeWinDrop: the item out of the
+   trading character's own window let go over this player's offer pane is offered and put back on its square); anything else is the
+   engine's own release, unchanged. MAIN THREAD only: off it the engine's release runs. */
+void detour_mouseReleaseNoWindow(void* mouse)
+{
+    if (ItOnMainThread() != 0 && TradeWinDrop(mouse) == 1) return;
+    orig_mouseReleaseNoWindow(mouse);
+}
+/* T-1167 v3 (owner 1678): a right release over an inventory window - while the TRADE window is open, an item of the trading
+   character's own window is offered (tradewin.cpp TradeWinRightClick) and the engine's own right-click does not run; anything else is
+   the engine's, unchanged. The engine's right-click is more than a move to another open window: with only the character's window open it
+   USES some items (a map's locations learned - "location added to the map" - and two other kinds, decomp_713e50 ~:244-300). While
+   trading, that use is replaced too by the offer for the trading character's own items (owner 1678; fold 1, review LOW-5). Called from
+   0x715DD0 (the release) and 0x7145F0 (a position it stored, written into the engine's mouse floats first): ItemsTradeRightItem names the
+   item from those same floats. */
+void detour_rightReleaseItem(void* gui)
+{
+    if (ItOnMainThread() != 0 && TradeWinRightClick(gui) == 1) return;
+    orig_rightReleaseItem(gui);
+}
 
 // ---- E22b-2 (P6b): the two GUI ends of a mouse drag ----
 // THE SAME RULE AS THE OTHER FOUR: book the sighting and the thread, call the original, read PODs, ring
@@ -4946,6 +4980,8 @@ long long g_boxWalkListGen = -1;
 int g_boxWalkLastTrunc = 0;   /* build1-e (recheck-build1d F2): the last fresh walk could not list everything (truncated or unsettled) */
 int g_boxLastVerdict = 0;     /* build1-e: why the last ItBoxResolve returned what it did (items.h kObjKey*) */
 int g_boxLastEmptyWalk = 0;   /* T-492: 1 = the last ItBoxResolve answered kObjKeyTruncated because its walk was empty or unsettled (n <= 0), not cut */
+int g_boxWalkLastSettledN = -1;      /* T-1400: the count of the last walk that settled */
+long long g_boxWalkCountStamp = 0;   /* T-1400: one more each time a walk settles with a count other than the last settled one (ObjectWalkCountStamp) */
 int ItBoxWalkNow()   /* a FRESH walk; it also becomes this generation's memo */
 {
     int zonesSeen = 0;
@@ -4993,6 +5029,7 @@ int ItBoxWalkNow()   /* a FRESH walk; it also becomes this generation's memo */
             g_boxWalkN = (n > 0) ? n : 0;
             g_boxWalkListGen = gen0;
             g_boxWalkLastTrunc = trunc;   /* build1-e */
+            if (g_boxWalkN != g_boxWalkLastSettledN) { g_boxWalkLastSettledN = g_boxWalkN; ++g_boxWalkCountStamp; }   /* T-1400 */
             return g_boxWalkN;
         }
         ++g_boxWalkGenMoved;
@@ -6142,18 +6179,99 @@ int ItColourFindPod(const std::string* sid, void** out)
     __try { *out = ((ItGdcGetTypedFn)(g_base + (uintptr_t)kItColGetTypedRva))((void*)(g_base + (uintptr_t)kItColContainerRva), sid, kItColourRecordType); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return 0; }
 }
-/* MAIN THREAD, onto a fresh item in no inventory yet. road 0 = ItCreateItem (every live / box / shop / ground road), 1 = the kit. */
-int ItColourApply(void* item, const std::string& colorSid, int road)
+int ItNamePod(void* c, char* name, int nameCap);      /* defined below (the same namespace) */
+int ItBaseSidPod(void* item, char* out, int cap);     /* defined below (the same namespace) */
+long g_itemColourFailLines = 0;   /* T-1382: the colour-failure lines written this launch (coopgarment::kColourFailLineCap) - MAIN THREAD */
+/* T-1382 / T-1413, MAIN THREAD: whose the character `holder` is (coopgarment::kColourWho*), its name into `name` ("" unread) */
+int ItColourWhoPod(void* holder, char* name, int nameCap)
 {
-    if (colorSid.empty()) return coopgarment::kColourNone;
+    name[0] = 0;
+    if (holder == 0) return coopgarment::kColourWhoNone;
+    int who;
+    void* f = 0;
+    if (!ItPlaus(holder) || ItFactionOfObjPod(holder, &f) == 0 || !ItPlaus(f)) who = coopgarment::kColourWhoUnread;
+    else if (f == (void*)LocalPlayerFaction() || IsPlayerFaction((::Faction*)f)) who = coopgarment::kColourWhoMine;
+    else if (IsPeerFaction((::Faction*)f)) who = coopgarment::kColourWhoOther;
+    else who = coopgarment::kColourWhoNpc;
+    if (ItPlaus(holder) && ItNamePod(holder, name, nameCap) != 1) name[0] = 0;
+    return who;
+}
+/* T-1382 (owner 1702), MAIN THREAD: one capped [ITEMS] line naming a colour that did not go on - the item, the colour asked for,
+   the character it is made for (ItCreateItem's / the kit's character; 0 on a box, shop or ground road) and whose that is, the
+   road and the cause. Log only. */
+void ItColourFailSay(void* item, const std::string& colorSid, int road, void* holder, int why)
+{
+    const int step = coopgarment::ColourFailCapStep(++g_itemColourFailLines);
+    if (step == 0) return;
+    char sid[kSidCap]; sid[0] = 0;
+    char itemName[128]; itemName[0] = 0;
+    if (item != 0 && ItPlaus(item))
+    {
+        if (ItBaseSidPod(item, sid, kSidCap) == 0) sid[0] = 0;
+        if (ItNamePod(item, itemName, (int)sizeof itemName) != 1) itemName[0] = 0;
+    }
+    char holderName[128];
+    const int who = ItColourWhoPod(holder, holderName, (int)sizeof holderName);
+    DebugLog(coopgarment::ColourFailLine(g_itemColourFailLines, road, sid, itemName, colorSid, holderName, who, why));
+    if (step == 2) DebugLog(coopgarment::ColourFailCapLine());
+}
+int ItGdSidPod(void* gd, char* out, int cap);         /* defined below (the same namespace) */
+int g_itColourLastD = 0, g_itColourLastWhy = 0;   /* T-1413: ItColourApply's last answer and its cause (coopgarment::kColour* / kColourWhy*) - MAIN THREAD */
+long g_itemColourSeenLines = 0;   /* T-1413: the garments put on another player's character's copy this launch (the [COLOUR] cap) - MAIN THREAD */
+/* T-1413 (F1209), MAIN THREAD, LOG ONLY: one capped [COLOUR] line - written in the release build too, like the T-1382 line above -
+   for a garment put on another player's character's copy: the character, the item, the colour sid the owner sent (0 = the kit row
+   carried no details), what the colour step did (d, why: ItColourApply's answer) and the colour record the item holds now, read back
+   off +0xD0 the way the sender reads it (ItSidOf / ItReadFields). Any other holder (this game's, an NPC, none) writes nothing. */
+void ItColourSeenSay(void* item, const std::string* colorSid, int road, void* holder, int d, int why)
+{
+    if (holder == 0) return;
+    char holderName[128];
+    const int who = ItColourWhoPod(holder, holderName, (int)sizeof holderName);
+    if (who != coopgarment::kColourWhoOther && who != coopgarment::kColourWhoUnread) return;
+    const long n = ++g_itemColourSeenLines;
+    if (!coopgarment::ColourSeenCapPass(n)) return;
+    char sid[kSidCap]; sid[0] = 0;
+    char itemName[128]; itemName[0] = 0;
+    int nowState = coopgarment::kColourNowUnread;
+    char now[kSidCap]; now[0] = 0;
+    if (item != 0 && ItPlaus(item))
+    {
+        if (ItBaseSidPod(item, sid, kSidCap) == 0) sid[0] = 0;
+        if (ItNamePod(item, itemName, (int)sizeof itemName) != 1) itemName[0] = 0;
+        void* gd = 0;
+        if (ItPtrPod(item, kItemColorise, &gd) != 0)
+        {
+            if (gd == 0 || !ItPlaus(gd)) nowState = coopgarment::kColourNowNone;
+            else if (ItGdSidPod(gd, now, kSidCap) == 1) nowState = coopgarment::kColourNowSid;
+        }
+    }
+    DebugLog(coopgarment::ColourSeenLine(n, road, holderName, who, itemName, sid, colorSid != 0 ? *colorSid : std::string(),
+                                         colorSid != 0 ? d : coopgarment::kColourSeenNoDetail, why, nowState, now));
+}
+/* MAIN THREAD, onto a fresh item in no inventory yet. road 0 = ItCreateItem (every live / box / shop / ground road), 1 = the kit.
+   holder: the character the item is made for (0 = none: a box, shop or ground road) - named only on the T-1382 failure line. */
+int ItColourApply(void* item, const std::string& colorSid, int road, void* holder)
+{
+    if (colorSid.empty()) { g_itColourLastD = coopgarment::kColourNone; g_itColourLastWhy = 0; return coopgarment::kColourNone; }
     void* gd = 0;
+    const bool itemOk = item != 0 && ItPlaus(item);
     const bool asked = item != 0 && ItPlaus(item) && ItColourFindPod(&colorSid, &gd) != 0;
     int d = coopgarment::GarmentColourDecide(true, asked, asked && gd != 0 && ItPlaus(gd));
     if (d == coopgarment::kColourApply && ItWritePtrPod(item, kItemColorise, gd) == 0) d = coopgarment::kColourNoField;
+    int why = 0;   /* T-1382: the cause, for the failure line (read in the decision's own order) */
+    if (d == coopgarment::kColourApply) why = 0;
+    else if (!itemOk) why = coopgarment::kColourWhyNoItem;
+    else if (g_base == 0 || kItColGetTypedRva == 0 || kItColContainerRva == 0) why = coopgarment::kColourWhyNoRow;
+    else if (!asked) why = coopgarment::kColourWhyLookupFault;
+    else if (gd == 0) why = coopgarment::kColourWhyUnknownSid;
+    else if (!ItPlaus(gd)) why = coopgarment::kColourWhyBadRecord;
+    else why = coopgarment::kColourWhyWriteFault;
     const int r = road != 0 ? 1 : 0;
     if (d == coopgarment::kColourApply) ++g_itemColour[r][0];
     else if (d == coopgarment::kColourUnknownSid) ++g_itemColour[r][1];
     else if (d == coopgarment::kColourNoField) ++g_itemColour[r][2];
+    if (d != coopgarment::kColourApply) ItColourFailSay(item, colorSid, r, holder, why);
+    g_itColourLastD = d; g_itColourLastWhy = why;   /* T-1413: for the [COLOUR] line */
     return d;
 }
 ::Item* ItCreateItem(::Character* c, const ItemMoveMsg& m, int setFields, int ownerAfterFill = 0)
@@ -6171,7 +6289,9 @@ int ItColourApply(void* item, const std::string& colorSid, int road)
     state->intFields["level"] = m.level;
     ::Item* item = (::Item*)coop::GameWorldPtr()->objectFactory->createItem(state);
     if (!ItObj(item)) { ++g_applyCreateFailed; return 0; }
-    ItColourApply((void*)item, m.colorSid, 0);   /* T-1119: the maker ignores "color sid" - the sent colour, as the engine's loader puts it */
+    ItColourApply((void*)item, m.colorSid, 0, (void*)c);   /* T-1119: the maker ignores "color sid" - the sent colour, as the engine's loader puts it */
+    if (c != 0 && m.bagPath.has == 0 && ClothingIsWornSection(m.section))   /* T-1413: a garment going into a worn section - log only */
+        ItColourSeenSay((void*)item, &m.colorSid, 0, (void*)c, g_itColourLastD, g_itColourLastWhy);
     ItWriteIntPod(item, kItemQuantity, m.quantity > 0 ? m.quantity : 1);
     if (setFields != 0)
     {
@@ -6801,12 +6921,41 @@ const int kSayProduction = 15;   /* B1 */
 /* T-1 B5: slot 16 (kSayPackBuy, par23's pack-buy refusal) is RETIRED and left unused - a slot is a throttle key, never renumbered */
 const int kSayCap = 17;
 int g_boxSaid[kSayCap] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-void ItBoxSay(int which, const std::string& text)
+/* T-1401 (F1156 CAP): a box line was written ONCE PER SESSION per event class, so a second box's (or a later) event was never seen.
+   Now one line a minute per event class per box (ItBoxSayKey; a line with no box key: per event class), the count of the lines not
+   written carried on the next one, and ItLogCapsFlush writing what a quiet box held. The R4 banner (kSayNoNotebookRefuse) stays once
+   per outage. MAIN THREAD. */
+swkeycap::Cap g_boxSayCap(1, 1024);
+const char* ItBoxSayName(int which)
 {
-    if (which < 0 || which >= kSayCap || g_boxSaid[which] != 0) return;
-    g_boxSaid[which] = 1;
-    DebugLog("[ITEMS] box " + text);
+    switch (which)
+    {
+    case kSayPublished: return "published"; case kSayRequest: return "request sent"; case kSayApplied: return "applied";
+    case kSayTakerBox: return "refused (taker box)"; case kSayPolicy: return "refused (access policy)"; case kSayUnowned: return "refused (no holder)";
+    case kSayReqApplied: return "request applied"; case kSayKeeperBroke: return "sale refused (keeper could not pay)"; case kSayRestock: return "restock skipped";
+    case kSayProduction: return "production skipped";
+    default: return "line";
+    }
 }
+void ItBoxSayKey(const std::string& box, int which, const std::string& text)
+{
+    if (which < 0 || which >= kSayCap) return;
+    if (which == kSayNoNotebookRefuse)
+    {
+        if (g_boxSaid[which] != 0) return;
+        g_boxSaid[which] = 1;
+        DebugLog("[ITEMS] box " + text);
+        return;
+    }
+    g_boxSaid[which] = 1;
+    swkeycap::Summary s;
+    const int v = swkeycap::Judge(&g_boxSayCap, N((long long)which) + "|" + box, ::GetTickCount(), std::string(), &s);
+    if (v == swkeycap::kWrite) DebugLog("[ITEMS] box " + text);
+    else if (v == swkeycap::kSummaryDue)
+        DebugLog("[ITEMS] box " + text + " (" + N((long long)s.held) + " lines like this for " + std::string(box.empty() ? "this kind of line" : "this box")
+                 + " in the last " + N((long long)(s.spanMs / 1000u)) + " s, this one included; one a minute per box is written)");
+}
+void ItBoxSay(int which, const std::string& text) { ItBoxSayKey(std::string(), which, text); }
 /* B9 (design-e46-store 2.2, decision 44): R4's BANNER. The two no-relay banners that stood here -
    the "no relay: host holds" banner and its client-publishes twin - are RETIRED with C7, and so are the
    two [ITEMS] noRelay log lines they wrote. What replaces them is one line said once per process: past the
@@ -15220,7 +15369,7 @@ void ItCrossTransfer(int dir, const ItEntry& src, unsigned int srcUid, const ItE
         if (p->ghostIsBox != 0)
         {
             ++g_boxRequested;
-            ItBoxSay(kSayRequest, "request sent for '" + std::string(p->ghostBoxKey) + "' " + std::string(p->ghostSection)
+            ItBoxSayKey(std::string(p->ghostBoxKey), kSayRequest, "request sent for '" + std::string(p->ghostBoxKey) + "' " + std::string(p->ghostSection)
                      + " " + N((long long)p->ghostX) + "," + N((long long)p->ghostY)
                      + " - this game does not hold that patch of map, so the move was undone here and the holder"
                      " was asked to make it");
@@ -15419,7 +15568,7 @@ void ItTakeOneConsume(const ItEntry& cur, unsigned int addUid, const ItEntry* ad
         ++g_showTake[1]; ++g_showTake[14];
     }
     else if (bsec == 0 || ItTakeOneUndo(bsec, binv, cur.item, cur.x, cur.y) == 0) ++g_t1UndoFailed;   /* F6: relative */
-    ItBoxSay(kSayRequest, "take-one request sent for '" + std::string(p->ghostBoxKey) + "' " + std::string(p->ghostSection)
+    ItBoxSayKey(std::string(p->ghostBoxKey), kSayRequest, "take-one request sent for '" + std::string(p->ghostBoxKey) + "' " + std::string(p->ghostSection)
              + " " + N((long long)p->ghostX) + "," + N((long long)p->ghostY)
              + " - an AI took one unit from a box the other game writes and used it (or kept it after the undo failed); the writer"
                " is asked to remove one '" + std::string(sid) + "' (par1)"
@@ -17726,6 +17875,7 @@ void HovTick(unsigned int now)
         if (hovrec::HandLineParse(lines[i], &l) == 0) continue;
         const int resend = (l.role == hovrec::kRoleSrc && l.state == hovrec::kStReturned) ? 1 : 0;
         if (hovrec::IsOpen(l.state) == 0 && resend == 0) continue;
+        if (hovrec::HandIsTrade(l) != 0) continue;   /* T-1167 piece 3: a trade line is settled by the world server's one decision - never QUERY */
         if (HovOtherHere(l.otherSlot) == 0) continue;
         const std::string key = HovKey(l.askerSlot, l.reqId, l.holderSlot, l.role);
         if (l.role == hovrec::kRoleDst)
@@ -17774,6 +17924,7 @@ void HovOnQueryAsReceiver(const hovrec::HandMsg& m, int from)
     }
     hovrec::HandLine l;
     const int f = HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleDst, &l);
+    if ((int)m.asker == hovrec::kHandTradeSlot || (f == 1 && hovrec::HandIsTrade(l) != 0)) { ++g_hovMsgRefused; return; }   /* T-1167 piece 3: no VERDICT for a trade line's key */
     const int have = (f == 1) ? 1 : 0;
     const unsigned long long mark = coop::OwnOverlayMarkSeq();
     const int markRule = coop::OwnOverlayMarkRule();
@@ -17793,6 +17944,7 @@ void HovOnQueryAsHolder(const hovrec::HandMsg& m, int from)
     hovrec::HandLine l;
     const int f = HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc, &l);
     if (f < 0) return;
+    if ((int)m.asker == hovrec::kHandTradeSlot || (f == 1 && hovrec::HandIsTrade(l) != 0)) { ++g_hovMsgRefused; return; }   /* T-1167 piece 3: no CLOSED for a trade line - the world server's decision settles it */
     if ((f == 1 && from != l.otherSlot) || (f == 0 && HovMe() != (int)m.holder)) { ++g_hovMsgRefused; return; }
     const std::string key = HovKey((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc);
     if (HovSettlePending(key) != 0) return;
@@ -17806,6 +17958,7 @@ void HovOnVerdict(const hovrec::HandMsg& m, int from)
 {
     hovrec::HandLine l;
     if (HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc, &l) != 1) return;
+    if (hovrec::HandIsTrade(l) != 0) { ++g_hovMsgRefused; return; }   /* T-1167 piece 3: a VERDICT never settles a trade line */
     if (from != l.otherSlot) { ++g_hovMsgRefused; return; }
     const std::string key = HovKey(l.askerSlot, l.reqId, l.holderSlot, hovrec::kRoleSrc);
     if (HovSettlePending(key) != 0) return;   /* review 1: its own settle is still being written - nothing else acts on it */
@@ -17946,6 +18099,7 @@ void HovOnAck(const hovrec::HandMsg& m, int from)
 {
     hovrec::HandLine l;
     if (HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc, &l) != 1) return;
+    if (hovrec::HandIsTrade(l) != 0) { ++g_hovMsgRefused; return; }   /* T-1167 piece 3: an ACK never drops a trade line */
     if (from != l.otherSlot) { ++g_hovMsgRefused; return; }
     if (l.state == hovrec::kStHeld) return;
     const std::string key = HovKey(l.askerSlot, l.reqId, l.holderSlot, hovrec::kRoleSrc);
@@ -18847,6 +19001,26 @@ std::string RangedHeldItems(unsigned int uid)
     return out + (cnt > shown ? std::string(" ...") : std::string()) + "]";
 }
 
+/* T-1432 (T2567): the names itemtest matches - the character's OWN name (what a player sees and a rename writes, NameOf) and
+   its record's name (the template's, the only one read before). A rename, or a bring-back made from the 'Wanderer' template,
+   leaves the record's name at the template's, so the record alone never found a renamed or brought-back character (T2567:
+   'itemtest Tfirst' -> nameHits=0 while the brought-back character was named Tfirst). -1 = neither name readable, 0 = no hit,
+   1 = a name holds the text, 2 = a name equals it (wins, as before); *shown = the name that matched. */
+static int ItTestNameHit(::Character* c, const std::string& needle, std::string* shown)
+{
+    std::string own;
+    char rec[256]; rec[0] = 0;
+    const bool ownOk = NameOf(c, &own) && !own.empty();
+    const bool recOk = ItNamePod(c, rec, 256) == 1;
+    if (!ownOk && !recOk) return -1;
+    const std::string recStr(recOk ? rec : "");
+    if (ownOk && own == needle) { *shown = own; return 2; }
+    if (recOk && recStr == needle) { *shown = recStr; return 2; }
+    if (ownOk && own.find(needle) != std::string::npos) { *shown = own; return 1; }
+    if (recOk && recStr.find(needle) != std::string::npos) { *shown = recStr; return 1; }
+    return 0;
+}
+
 bool ItemTest(const std::string& needleIn, const std::string& baseSid, int count)
 {
     std::string needle; int lpK = 0;   /* T-1218: `<name>#<k>` */
@@ -18868,11 +19042,13 @@ bool ItemTest(const std::string& needleIn, const std::string& baseSid, int count
         for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
         {
             ::Character* c = *it;
-            char nm[256];
-            if (!ItObj(c) || ItNamePod(c, nm, 256) != 1 || std::string(nm).find(needle) == std::string::npos) continue;
+            std::string nm;
+            if (!ItObj(c)) continue;
+            const int hit = ItTestNameHit(c, needle, &nm);   /* T-1432: the own name or the record's */
+            if (hit < 1) continue;
             const unsigned int u = FindSpawnedUid(c);
             if (u == 0 || !net::IsUidMine(u)) continue;
-            pk.Add(c, std::string(nm) == needle ? 0 : 1, 0.0, "'" + std::string(nm) + "' uid=" + N((long long)u));
+            pk.Add(c, hit == 2 ? 0 : 1, 0.0, "'" + nm + "' uid=" + N((long long)u));
         }
         std::string amb;
         if (pk.Decide(&lpPicked, "own characters whose name holds '" + needle + "'", "load order", &amb) > leverpick::kOne)
@@ -18883,10 +19059,10 @@ bool ItemTest(const std::string& needleIn, const std::string& baseSid, int count
         ::Character* c = *it;
         if (!ItObj(c)) { ++unreadable; continue; }
         ++walked;
-        char nm[256];
-        if (ItNamePod(c, nm, 256) != 1) { ++unreadable; continue; }
-        const std::string nameStr(nm);
-        if (nameStr.find(needle) == std::string::npos) continue;
+        std::string nameStr;
+        const int hit = ItTestNameHit(c, needle, &nameStr);   /* T-1432: the own name or the record's */
+        if (hit < 0) { ++unreadable; continue; }
+        if (hit == 0) continue;
         ++nameHits;
         const unsigned int uid = FindSpawnedUid(c);
         if (uid == 0 || !net::IsUidMine(uid)) { ++notMine; continue; }
@@ -25730,6 +25906,22 @@ void InstallItems()
         else DebugLog("[ITEMS] hook installed: give-to-object 0x7118C0 (T-164 part 2 fold 2: a shop copy released over a character or container is put back under the guard)");
     }
     else ErrorLog("[ITEMS] the address table has no MouseGiveToObject row - a drag out of a shop the other game holds is refused at the pick-up (T-164 part 2 fold 2)");
+    /* T-1167 piece 3 build 4: 0x712AD0, the cursor item let go over no inventory window - a drag onto the TRADE window's offer pane */
+    if (kMouseReleaseNoWindowRva != 0)
+    {
+        coop::HookStatus h6r = coop::AddHook((void*)(g_base + kMouseReleaseNoWindowRva), (void*)&detour_mouseReleaseNoWindow, (void**)&orig_mouseReleaseNoWindow);
+        if (h6r != coop::SUCCESS) { orig_mouseReleaseNoWindow = 0; ErrorLog("[ITEMS] AddHook release-over-no-window 0x712AD0 FAILED - an item dragged onto the TRADE window is not offered (the engine's own release runs: put back or dropped at the feet) (T-1167)"); }
+        else DebugLog("[ITEMS] hook installed: release-over-no-window 0x712AD0 (T-1167 piece 3 build 4: an item of the trading character dragged onto the TRADE window's offer pane is offered and put back)");
+    }
+    else ErrorLog("[ITEMS] the address table has no MouseReleaseNoWindow row - an item dragged onto the TRADE window is not offered (T-1167)");
+    /* T-1167 v3 (owner 1678): 0x713E50, the right release over an inventory window - a right-click offers an item while the TRADE window is open */
+    if (kRightReleaseItemRva != 0)
+    {
+        coop::HookStatus h6q = coop::AddHook((void*)(g_base + kRightReleaseItemRva), (void*)&detour_rightReleaseItem, (void**)&orig_rightReleaseItem);
+        if (h6q != coop::SUCCESS) { orig_rightReleaseItem = 0; ErrorLog("[ITEMS] AddHook right-release 0x713E50 FAILED - a right-click does not offer an item to the TRADE window (dragging still does) (T-1167 v3)"); }
+        else DebugLog("[ITEMS] hook installed: right-release 0x713E50 (T-1167 v3: a right-click on an item of the trading character's own window offers it while the TRADE window is open)");
+    }
+    else ErrorLog("[ITEMS] the address table has no RightReleaseItem row - a right-click does not offer an item to the TRADE window (T-1167 v3)");
     /* T-164 B4-1: the right-click trade, measured for its real charge (the existing RClickAutoTrade row). */
     std::memset(g_charge, 0, sizeof(g_charge));
     if (kRClickAutoTradeRva != 0)
@@ -29154,6 +29346,24 @@ void ItRcGiveRun(int j, int* consumed, int curK)
     }
     if (jb.backTaken != 0) ItRcBackTail(jb);
 }
+/* T-1346 fold 2 (re-check N1): THE ITEM HELD ON THE CURSOR OUT OF A PLAYER'S BOX THIS GAME WRITES, matched at its pickup drain against
+   that drain's reading of the box before the move ([0] g_heldPend's row, [1] the staged row's; item and seq name the pickup) - the box
+   may be written and read again while it is held, so its drop's ledger row takes this identity (coopbrec::BoxJrnLedHeldTake) */
+struct BoxJrnHeldPick
+{
+    void* item;
+    long seq;
+    int have;
+    coopbrec::BoxJrnLedRow r;
+    BoxJrnHeldPick() : item(0), seq(0), have(0) {}
+};
+BoxJrnHeldPick g_bjHeldPick[2];
+void BoxJrnLedNote(const std::string& key, unsigned int uid, const char* section, const ItEntry& bx, int units, int op, const char* sid,
+                   const BoxJrnHeldPick* pick = 0);   /* below */
+void BoxJrnLedPick(const ItEntry& re, int slot);   /* below */
+int g_bjRefuseLeft = 0;            /* T-1346 TEST-ONLY `itemtest bjrefuse <n>`: journal asks this game, the holder, still refuses */
+long long g_bjRefuseFired = 0;
+unsigned int g_bjDrain = 0;        /* T-1346 fold 1: the drain's number - a box's reading in this drain is the one its moves' rows are matched at */
 /* MAIN THREAD (the drain): an item moved between a box and a character, both this game's to write - when the box is a player's box the
    character is a hint of its change (BoxJrnHint): re the REMOVE half (reUid its character's uid), ad the ADD half. */
 void BoxJrnFromPair(const ItEntry& re, unsigned int reUid, const ItEntry& ad, unsigned int adUid)
@@ -29170,6 +29380,7 @@ void BoxJrnFromPair(const ItEntry& re, unsigned int reUid, const ItEntry& ad, un
 void ItemsTickDrain()
 {
     if (g_base == 0) return;
+    ++g_bjDrain;   /* T-1346 fold 1: before any mark of this drain reads a box */
     ItCcSayDrain();   /* kit2: the first refusal of each kind, said on the main thread */
     ItBuyGateDrain();   /* T-608 / T-534: the NPC purchase gate's lines and owner reads */
     ItProdCopySayDrain();   /* T-610: the first skipped worker step of each copy */
@@ -29427,6 +29638,8 @@ void ItemsTickDrain()
             slot->pubAtPick = 0;
             slot->recHoldSaid = 0; slot->recHoldAt = 0;
             if (ownpick::PublishAtPickup(slot->mine, (slot->hdHold != 0) ? 1 : 0) != 0) s_ownPick[c1] = (slot == &stage) ? 2 : 1;   /* out of a container this game writes */
+            g_bjHeldPick[(slot == &stage) ? 1 : 0] = BoxJrnHeldPick();
+            if (slot->re.kind == kKindBox && slot->box == kBoxMine && slot->mine != 0) BoxJrnLedPick(slot->re, (slot == &stage) ? 1 : 0);   /* T-1346 fold 2 */
             DebugLog("[ITEMS] held recorded uid=" + N((long long)s_uid[c1]) + " " + std::string(slot->re.section)
                      + " " + N((long long)slot->re.x) + "," + N((long long)slot->re.y)
                      + " mine=" + N((long long)s_mine[c1])
@@ -29675,6 +29888,52 @@ void ItemsTickDrain()
             s_cov[ki] = 1;
         }
     }
+    /* T-1346: THE ORIGIN OF A MOVE OF A PLAYER'S BOX THIS GAME WRITES - the character of this game it is tied to in this drain: an object
+       landing (op 0) or a stack's rise (op 2, the object merged in) - that object's removal off the character, the object a split of the
+       character's stack handed back, the item held on the cursor (g_heldPend) or the units lifted off its own stack (g_ownSplitHeld); an
+       object out (op 1) - its add onto the character; a split (op 3) - the new object's add or merge onto the character. Read here,
+       before the send loop frees the ring's slots; noted at the move's own turn (BoxJrnLedNote). A move tied to none (a restock, a craft,
+       ore, another box) has no origin. A drop held from a box onto a character is noted at its drop (the held pair below). */
+    static unsigned int s_src[kRing];
+    static char s_srcSec[kRing][kSecCap];
+    static char s_srcSid[kRing][kSidCap];
+    for (int k0 = 0; k0 < n; ++k0)
+    {
+        s_src[k0] = 0; s_srcSec[k0][0] = 0; s_srcSid[k0][0] = 0;
+        const ItEntry& be = g_ring[idx[k0]];
+        if (be.kind != kKindBox || s_box[k0] != kBoxMine || s_mine[k0] == 0 || be.shopFacade != 0 || be.fill != 0) continue;
+        void* tie = 0;
+        int out = 0;
+        if (be.op == 0) tie = be.item;
+        else if (be.op == 2 && be.qtyBefore > 0 && be.quantity > be.qtyBefore) tie = be.relObj;
+        else if (be.op == 1) { tie = be.item; out = 1; }
+        else if (be.op == 3) { tie = be.relObj; out = 1; }
+        if (tie == 0) continue;
+        for (int c = 0; c < n && s_src[k0] == 0; ++c)
+        {
+            const ItEntry& ce = g_ring[idx[c]];
+            if (c == k0 || ce.kind == kKindBox || ce.kind == kKindBag || s_mine[c] == 0 || s_uid[c] == 0) continue;
+            const int hit = (out == 0) ? (((ce.op == 1 && ce.item == tie) || (ce.op == 3 && ce.relObj == tie)) ? 1 : 0)
+                                       : (((ce.op == 0 && ce.item == tie) || (ce.op == 2 && ce.relObj == tie)) ? 1 : 0);
+            if (hit == 0) continue;
+            s_src[k0] = s_uid[c];
+            std::strncpy(s_srcSec[k0], ce.section, kSecCap - 1); s_srcSec[k0][kSecCap - 1] = 0;
+            if (ce.fields != 0) { std::strncpy(s_srcSid[k0], ce.baseSid, kSidCap - 1); s_srcSid[k0][kSidCap - 1] = 0; }
+        }
+        if (s_src[k0] != 0 || out != 0) continue;
+        if (g_heldPend.used != 0 && g_heldPend.re.item == tie && g_heldPend.re.kind != kKindBox && g_heldPend.re.kind != kKindBag
+            && g_heldPend.uid != 0 && net::IsUidMine(g_heldPend.uid))
+        {
+            s_src[k0] = g_heldPend.uid;
+            std::strncpy(s_srcSec[k0], g_heldPend.re.section, kSecCap - 1); s_srcSec[k0][kSecCap - 1] = 0;
+        }
+        else if (g_ownSplitHeld.used != 0 && g_ownSplitHeld.cloneItem == tie && g_ownSplitHeld.re.kind != kKindBox && g_ownSplitHeld.re.kind != kKindBag
+                 && g_ownSplitHeld.uid != 0 && net::IsUidMine(g_ownSplitHeld.uid))
+        {
+            s_src[k0] = g_ownSplitHeld.uid;
+            std::strncpy(s_srcSec[k0], g_ownSplitHeld.re.section, kSecCap - 1); s_srcSec[k0][kSecCap - 1] = 0;
+        }
+    }
     for (int k = 0; k < n; ++k)
     {
         ItEntry& e = g_ring[idx[k]];
@@ -29742,6 +30001,10 @@ void ItemsTickDrain()
         if (s_hd[k] >= 0) { HdOneTick(cur, g_ring[idx[s_hd[k]]], s_uid[k]); continue; }   /* P105 build 2: HOLD + LAND (the ADD's slot is freed at its own turn) */   /* loot2c: a registered research copy never reaches the wire (lootInjectLeak) */
         /* units lifted off our own stack and dropped into a container another game writes: the give road (ownpick::SplitDropRoad);
            dropped into our own, the ADD goes on down the ordinary road below */
+        if (k == ownSplitAdd && g_ownSplitHeld.used != 0 && g_ownSplitHeld.re.kind == kKindBox && cur.kind != kKindBox && cur.kind != kKindBag
+            && s_mine[k] != 0 && s_uid[k] != 0 && ItBoxVerdict(g_ownSplitHeld.re) == kBoxMine)
+            BoxJrnLedNote(std::string(g_ownSplitHeld.re.boxKey, strnlen(g_ownSplitHeld.re.boxKey, kBoxKeyCap)), s_uid[k], cur.section, g_ownSplitHeld.re,
+                          -g_ownSplitHeld.re.quantity, 3, cur.fields != 0 ? cur.baseSid : "");   /* T-1346: units split off a box stack onto a character */
         if (k == ownSplitAdd && ItOwnSplitDrop(cur, s_uid[k], s_mine[k], s_addr[k], s_box[k]) != 0) continue;
         // E22b-3: the ADD that ends a STACK drag. The held split is its other half, and because only splits
         // off stacks this game does NOT write are ever held, an ADD on an inventory we DO write is a TAKE -
@@ -29846,6 +30109,10 @@ void ItemsTickDrain()
                 continue;
             }
             if (hp.mine != 0 && s_mine[k] != 0) BoxJrnFromPair(hp.re, hp.uid, cur, s_uid[k]);   /* a drag between a player's box this game writes and its character */
+            if (hp.mine != 0 && s_mine[k] != 0 && hp.re.kind == kKindBox && hp.box == kBoxMine && cur.kind != kKindBox && cur.kind != kKindBag && s_uid[k] != 0)
+                BoxJrnLedNote(std::string(hp.re.boxKey, strnlen(hp.re.boxKey, kBoxKeyCap)), s_uid[k], cur.section, hp.re, -hp.re.quantity, 1,
+                              cur.fields != 0 ? cur.baseSid : "",
+                              (g_bjHeldPick[0].item == hp.re.item && g_bjHeldPick[0].seq == hp.re.seq) ? &g_bjHeldPick[0] : 0);   /* T-1346: an item held out of the box, dropped on a character - matched at its pickup (fold 2) */
             // SAME OWNER - an ordinary drag inside inventories on one side of the line. Nothing is reverted and
             // nothing is requested, but the remove we suppressed IS news if the character is ours, so it is
             // published now, before the add falls through to the ordinary path below. Order is preserved.
@@ -29941,6 +30208,14 @@ void ItemsTickDrain()
                             const ItEntry& he = g_ring[idx[a]];
                             if (he.kind != kKindBox && he.kind != kKindBag && s_mine[a] != 0 && s_uid[a] != 0) BoxJrnHint(hk, s_uid[a], he.section);
                         }
+                    if (s_src[k] != 0)
+                    {   /* T-1346: the character this move is tied to (the pass above) - a row of the box's origin ledger */
+                        int units = 0;
+                        if (cur.op == 0) units = cur.quantity;
+                        else if (cur.op == 2) units = cur.quantity - cur.qtyBefore;
+                        else if (cur.op == 1 || cur.op == 3) units = -cur.quantity;
+                        BoxJrnLedNote(hk, s_src[k], s_srcSec[k], cur, units, cur.op, cur.fields != 0 ? cur.baseSid : s_srcSid[k]);
+                    }
                 }
                 if (ItNetSendMove(m))
                 {
@@ -29995,7 +30270,7 @@ void ItemsTickDrain()
                                    " about - but since doors1 the `shared` remap answers StorageBuilding only, so a"
                                    " UseableStuff box gets the engine's stranger answer and ownedByPeerAnswered stays 0");
                     }
-                    ItBoxSay(kSayPublished, "published '" + std::string(cur.boxKey) + "' " + std::string(cur.section)
+                    ItBoxSayKey(std::string(cur.boxKey), kSayPublished, "published '" + std::string(cur.boxKey) + "' " + std::string(cur.section)
                              + " " + N((long long)cur.x) + "," + N((long long)cur.y) + " op=" + N((long long)cur.op)
                              + " - this game holds that patch of map, so it is the writer (decision 38 part 3)");
                 }
@@ -30109,7 +30384,7 @@ void ItemsTickDrain()
        still on the cursor and leaves it standing. */
     if (stageUsed != 0)
     {
-        if (g_heldPend.used == 0) std::memcpy(&g_heldPend, &stage, sizeof(ItHeldPend));
+        if (g_heldPend.used == 0) { std::memcpy(&g_heldPend, &stage, sizeof(ItHeldPend)); g_bjHeldPick[0] = g_bjHeldPick[1]; }   /* T-1346 fold 2: its pickup's match with it */
         else ++g_heldStageLost;
     }
     /* E22b-2: the held remove's release test, run every tick whether or not the ring had anything, and AFTER
@@ -30975,8 +31250,89 @@ int HandFindItem(::Character* c, const char* sec, int x, int y, const char* sid,
     return 0;
 }
 int SpSpotSenderOk(const ItemMoveMsg& m, unsigned int fromPeer);   /* T-1214 review fold 1: defined with the spot sync */
+/* T-1401 (F1156 SILENT, F1137): EACH BOX CHANGE RECEIVED FROM ANOTHER GAME, ONE LINE - applied, or refused with the reason (the counter
+   that rose, else the step it stopped at), with the box key and the cell's unit count before / after (-2 no such cell, -3 not read,
+   -9 not reached). Each box's first 20 lines in full, then one summary a minute per box (swkeycap) naming the outcomes. The final form
+   of P296's rock-box trace (effort/t1378a), for every box. Ground keys are the ground's own road and not written here. MAIN THREAD. */
+swkeycap::Cap g_boxRecvCap(20, 2048);
+long long g_boxRecvApplied = 0, g_boxRecvRefused = 0;
+int ItCellQty(::InventorySection* sec, int x, int y)
+{
+    if (sec == 0 || !ItObj(sec)) return -2;
+    if (ItSlotInSectionWhy(sec, x, y) != 1) return -2;
+    void* at = 0;
+    if (ItGetAtPod(sec, x, y, &at) == 0) return -3;
+    if (at == 0) return 0;
+    int q = 0;
+    if (ItIntPod(at, kItemQuantity, &q) == 0) return -3;
+    return q;
+}
+void ItBoxRecvSummary(const swkeycap::Summary& s)
+{
+    DebugLog("[ITEMS] box changes from other games on key=" + s.key + ": " + N((long long)s.held) + " more in the last " + N((long long)(s.spanMs / 1000u))
+             + " s were not written (each box's first 20 are, then this summary a minute) - " + (s.kinds.empty() ? std::string("no outcome") : s.kinds));
+}
+void ItBoxRecvLine(const std::string& box, int fromSlot, int applied, const char* why, const std::string& what, int before, int after)
+{
+    if (applied != 0) ++g_boxRecvApplied; else ++g_boxRecvRefused;
+    const std::string outcome = (applied != 0) ? std::string("APPLIED") : std::string("REFUSED ") + (why != 0 ? why : "?");
+    swkeycap::Summary s;
+    const int v = swkeycap::Judge(&g_boxRecvCap, box, ::GetTickCount(), outcome, &s);
+    if (v == swkeycap::kWrite)
+        DebugLog("[ITEMS] box change from slot" + N((long long)fromSlot) + " " + outcome + " key=" + box + " " + what + ": cell before=" + N((long long)before)
+                 + " after=" + N((long long)after) + "; boxRecv[applied,refused]=" + N(g_boxRecvApplied) + "," + N(g_boxRecvRefused));
+    else if (v == swkeycap::kSummaryDue) ItBoxRecvSummary(s);
+}
+/* the ITEM_MOVE watch: counters read at the start and at the end; stage the last mark passed (1 at HdAbsorb, 2 at the player-box
+   test, 3 the cell known, 4 the move applied or not - ok) */
+enum { kMoveWhyN = 9 };
+struct ItMoveRecvWatch
+{
+    const ItemMoveMsg& m;
+    unsigned int peer;
+    int on, stage, ok, before;
+    ::InventorySection* sec;
+    long long c0[kMoveWhyN];
+    static void Take(long long* d)
+    {
+        d[0] = g_itemMoveNotOwner; d[1] = g_keyUnresolved; d[2] = g_boxNoInventory; d[3] = g_boxPosFault; d[4] = g_boxApplyNotHolder;
+        d[5] = g_bagApplyNoPath; d[6] = g_applyNoSection; d[7] = g_applyBadOp; d[8] = g_refused;
+    }
+    ItMoveRecvWatch(const ItemMoveMsg& mm, unsigned int p) : m(mm), peer(p), on(0), stage(0), ok(0), before(-9), sec(0)
+    {
+        on = (mm.uid == 0 && !mm.boxKey.empty()) ? 1 : 0;
+        Take(c0);
+    }
+    void Cell(::InventorySection* s) { stage = 3; sec = s; if (on != 0) before = ItCellQty(s, m.x, m.y); }
+    ~ItMoveRecvWatch()
+    {
+        if (on == 0 || GrIsGroundKey(m.boxKey.c_str()) != 0) return;
+        static const char* const kWhy[kMoveWhyN] = { "senderNotWriter (that game neither owns nor writes it)", "keyUnresolved (the box is not loaded here)",
+            "noInventory", "posFault (the box's position was not read)", "bothWriters (this game holds the box's area too)", "bagNoPath (no such pack here)",
+            "noSection", "badOp", "notReady" };
+        long long d[kMoveWhyN];
+        Take(d);
+        int applied = 0;
+        const char* why = "other";
+        if (stage >= 4) { applied = (ok != 0) ? 1 : 0; why = "applyFailed (the move did not take on this copy)"; }
+        else
+        {
+            const int i = swkeycap::FirstRise(c0, d, kMoveWhyN);
+            if (i >= 0) why = kWhy[i];
+            else if (stage == 3) why = "showAbsorbSplit (the holder's split, shown here already)";
+            else if (stage == 2) why = "playerBox (a player's box follows its record only)";
+            else if (stage == 1) why = "hdAbsorb (this game's own HOLD / LAND, shown already)";
+        }
+        const int after = (sec != 0) ? ItCellQty(sec, m.x, m.y) : -9;
+        ItBoxRecvLine(m.boxKey, net::PlayerSlotOfKey(peer), applied, why, "move op=" + N((long long)m.op) + " item='" + m.baseSid + "' at " + m.section + " "
+                      + N((long long)m.x) + "," + N((long long)m.y) + " qty=" + N((long long)m.quantity), before, after);
+    }
+private:
+    ItMoveRecvWatch& operator=(const ItMoveRecvWatch&);
+};
 void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
 {
+    ItMoveRecvWatch rw(m, fromPeer);   /* T-1401: a box move's line at every return (applied, or refused and why) */
 #ifdef SW_DEV_BUILD
     // PROBE-START: P190 - a weapon move, or a move in a weapon section, of a player character: applied here or dropped
     P190ApplyWatch p190w(m);
@@ -31005,7 +31361,9 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
         return;
     }
     if (m.uid == 0 && !m.boxKey.empty()) ItParityNoteBoxMove(m.boxKey);   /* review-par1 6b: a queued parity answer for this box is now older than this move */
+    rw.stage = 1;
     if (HdAbsorb(m) != 0) return;   /* P105 build 2 (design 3.4): the writer's effect of OUR HOLD / LAND - already shown here, never applied */
+    rw.stage = 2;
     if (m.uid == 0 && !m.boxKey.empty() && BoxMoveIsPlayerBox(m.boxKey) != 0) { BoxLiveMoveRefused(); return; }   /* a player's box follows its record only */
     /* inv2a: the other game moved it, so it is that game's to write - the net stops speaking for it. While this game's hand-back of
        the box waits, the move is laid on the baseline saved for the wait instead, once it is applied here (InvNetHoldFollow). */
@@ -31113,6 +31471,7 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
     }
     else sec = inv->getSection(m.section);
     if (!ItObj(sec)) { ++g_applyNoSection; ++g_refused; return; }
+    rw.Cell(sec);
     if (ItShowAbsorbSplit(m, sec) != 0) return;   /* t338-f2-apply: the holder's own split of units we hold - shown already, not applied twice */
     ItShowNoteHolderMove(m, sec);   /* T-164 fold (H2): a take held off this cell - the holder's own move is marked before it lands */
     /* T-172 apply: the copy container's one-time leftover sweep, then the move; an add that met drift is noted (and a box re-asked). */
@@ -31120,6 +31479,7 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
     if (m.uid == 0 || !net::IsUidMine(m.uid)) ItLeftoverSweepOnce(inv, driftKey, desc);
     std::memset(&g_driftLast, 0, sizeof(g_driftLast));
     const int ok = ItApplyMoveTo(inv, sec, c, m, desc);
+    rw.stage = 4; rw.ok = ok;
 #ifdef SW_DEV_BUILD
     // PROBE-START: P190
     p190w.Applied(ok);
@@ -31134,7 +31494,7 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
     if (m.uid == 0 && ok != 0)
     {
         ++g_boxApplied;
-        ItBoxSay(kSayApplied, "applied '" + m.boxKey + "' " + m.section + " " + N((long long)m.x) + ","
+        ItBoxSayKey(m.boxKey, kSayApplied, "applied '" + m.boxKey + "' " + m.section + " " + N((long long)m.x) + ","
                  + N((long long)m.y) + " op=" + N((long long)m.op) + " - the holder's move, on our copy of the box");
     }
 }
@@ -31370,6 +31730,80 @@ void NoticeFlush()
     }
 }
 
+/* T-1401: the ITEM_REQUEST watch (a request on a box this game is asked to write): applied = the answer's ok at the end; refused =
+   the counter that rose, else the refusal code, else the step it stopped at. Cell: the asked cell, read before the take / give. */
+enum { kReqWhyN = 21 };
+struct ItReqRecvWatch
+{
+    const ItemRequestMsg& r;
+    unsigned int peer;
+    const ItemConfirmMsg& cf;
+    const int& reason;
+    int on, before, cellRead;
+    ::InventorySection* sec;
+    long long c0[kReqWhyN];
+    static void Take(long long* d)
+    {
+        d[0] = g_reqRefBadDir; d[1] = g_requesterNotOwner; d[2] = g_reqRefTakerSlot; d[3] = g_ownerFullRefused; d[4] = g_bagReqWrongPack;
+        d[5] = g_bagReqNoPath; d[6] = g_boxPosFault; d[7] = g_reqRefNotOwned; d[8] = g_bjRefuseFired; d[9] = g_boxRefusedPolicy;
+        d[10] = g_shopTradeMismatch; d[11] = g_shopNotACounter; d[12] = g_reqRefNoItemAtSlot; d[13] = g_reqRefShort; d[14] = g_reqRefUnreadable;
+        d[15] = g_reqRefCreateFailed; d[16] = g_reqRefPlaceFailed; d[17] = g_reqRefOutOfRange; d[18] = g_reqRefFault; d[19] = g_reqRefWrongItem;
+        d[20] = g_bagReqShadowed;
+    }
+    ItReqRecvWatch(const ItemRequestMsg& rr, unsigned int p, const ItemConfirmMsg& c, const int& why)
+        : r(rr), peer(p), cf(c), reason(why), on(0), before(-9), cellRead(0), sec(0)
+    {
+        on = (rr.ownerUid == 0 && !rr.ownerBoxKey.empty() && GrIsGroundKey(rr.ownerBoxKey.c_str()) == 0) ? 1 : 0;
+        Take(c0);
+    }
+    void Cell(::InventorySection* s) { sec = s; cellRead = 1; if (on != 0) before = ItCellQty(s, r.ownerX, r.ownerY); }
+    ~ItReqRecvWatch()
+    {
+        if (on == 0) return;
+        static const char* const kWhy[kReqWhyN] = { "badDirOrNotReady", "requesterNotOwner (the asker does not run the taker)", "takerSlot",
+            "ownerTableFull (busy - ask again)", "wrongPack", "bagNoPath (no such pack here)", "posFault (the box's position was not read)",
+            "notHolder (this game does not hold the box's area)", "bjrefuse (TEST-ONLY lever)", "accessPolicy", "shopTradeMismatch", "shopNotACounter",
+            "noItemAtCell", "short (fewer units than asked)", "unreadable", "createFailed", "placeFailed (no room)", "outOfRange", "fault",
+            "wrongItem", "bagShadowed" };
+        long long d[kReqWhyN];
+        Take(d);
+        const int applied = (cf.ok != 0) ? 1 : 0;
+        std::string why = "other";
+        if (applied == 0)
+        {
+            const int i = swkeycap::FirstRise(c0, d, kReqWhyN);
+            if (i >= 0) why = kWhy[i];
+            else if (reason != 0) why = "refusal code " + N((long long)reason);
+            else if (cellRead != 0) why = "refused after the move (the hand-over record, or the answer)";
+            else why = "notReached (the box or its section did not resolve here, or a shop / test refusal)";
+        }
+        const int after = (sec != 0) ? ItCellQty(sec, r.ownerX, r.ownerY) : -9;
+        ItBoxRecvLine(r.ownerBoxKey, net::PlayerSlotOfKey(peer), applied, why.c_str(), std::string(r.dir == 0 ? "take" : "give") + " request " + N((long long)r.id)
+                      + " item='" + r.baseSid + "' at " + r.ownerSection + " " + N((long long)r.ownerX) + "," + N((long long)r.ownerY) + " qty=" + N((long long)r.quantity),
+                      before, after);
+    }
+private:
+    ItReqRecvWatch& operator=(const ItReqRecvWatch&);
+};
+/* T-1401: the held counts of the [ITEMS] box lines and the box changes received - all: every box holding lines (a REPORT, so a bug
+   report carries them); else the boxes a minute old (ItemsTick, every 5 s). MAIN THREAD. */
+void ItLogCapsFlush(bool all)
+{
+    std::vector<swkeycap::Summary> v;
+    const unsigned int now = ::GetTickCount();
+    swkeycap::Flush(&g_boxRecvCap, now, all, &v);
+    for (size_t i = 0; i < v.size(); ++i) ItBoxRecvSummary(v[i]);
+    v.clear();
+    swkeycap::Flush(&g_boxSayCap, now, all, &v);
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        const size_t bar = v[i].key.find('|');
+        const int which = std::atoi(v[i].key.substr(0, bar).c_str());
+        const std::string box = (bar == std::string::npos) ? std::string() : v[i].key.substr(bar + 1);
+        DebugLog("[ITEMS] box " + std::string(ItBoxSayName(which)) + (box.empty() ? std::string() : " '" + box + "'") + ": " + N((long long)v[i].held)
+                 + " more lines like this in the last " + N((long long)(v[i].spanMs / 1000u)) + " s were not written (one a minute per box)");
+    }
+}
 void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
 {
     /* T-823: a request served here changes this game's box - the writer writes what it carried out (a key that names no box, or a
@@ -31391,6 +31825,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     cf.id = r.id; cf.ok = 0; cf.quantity = r.quantity;
     cf.toKey = fromPeer; cf.toHave = 1;   /* M7b slice 2: the answer goes back to the asker */
     int reason = kRefNone;
+    ItReqRecvWatch qw(r, fromPeer, cf, reason);   /* T-1401: a box request's line at every return (applied, or refused and why) */
     int ok = 0;
     void* kept = 0;                       // E22b-2: the TAKE's object, alive and in no inventory
     int landedX = r.ownerX, landedY = r.ownerY;   // E22b-2: where a GIVE's item actually went
@@ -31487,6 +31922,16 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         if (ItBoxVerdict(be) != kBoxMine)
         {
             ++g_reqRefNotOwned; ++g_reqRefused;
+            cf.ok = 0;
+            if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
+            return;
+        }
+        if (r.askId != 0ULL && g_bjRefuseLeft > 0)
+        {   /* T-1346 TEST-ONLY `itemtest bjrefuse <n>`: a journal ask (it carries its change's ask id) refused here, as a box not yet this
+               game's refuses it - only after that lever is sent; no player's road reaches it */
+            --g_bjRefuseLeft; ++g_bjRefuseFired; ++g_reqRefused;
+            DebugLog("[ITEMS] T-1346 bjrefuse TEST-ONLY lever: journal ask " + N((long long)r.id) + " (" + std::string(r.dir == 0 ? "take" : "put") + " of "
+                     + N((long long)r.quantity) + " '" + r.baseSid + "' box " + r.ownerBoxKey + ") REFUSED (" + N((long long)g_bjRefuseLeft) + " refusals left)");
             cf.ok = 0;
             if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
             return;
@@ -31601,6 +32046,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                 KeeperPublishCounter(bld);   /* T-1 B3: the keeper paid - its new cats go out before the CONFIRM */
             }
         }
+        qw.Cell(sec);   /* T-1401: the asked cell's count before the take / give */
         if (r.dir == 0)
         {
             ItEntry fe; ItClear(&fe);
@@ -31779,7 +32225,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                     op->askId = r.askId; op->askSlot = r.askSlot;
                     BoxLedgerServe(r.ownerBoxKey, r.askSlot, r.askId, r.askCarry, 1);
                 }
-                ItBoxSay(kSayReqApplied, "request applied on '" + r.ownerBoxKey + "' " + r.ownerSection + " "
+                ItBoxSayKey(r.ownerBoxKey, kSayReqApplied, "request applied on '" + r.ownerBoxKey + "' " + r.ownerSection + " "
                          + N((long long)r.ownerX) + "," + N((long long)r.ownerY)
                          + " - this game holds that patch of map and made the move through the engine's own path");
             }
@@ -38011,7 +38457,12 @@ void ItemGearOf(void* item, gearwire::GearMarks* out)
 /* MAIN THREAD: a fresh item (in no inventory yet) takes a list row's uniform and crafter (ItGearApply). 1 written. */
 int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string& sid) { return ItGearApply((::Item*)item, g, sid); }
 /* T-1119: MAIN THREAD, onto a fresh kit item (clothing.cpp ApplyGarmentsBody): the sent colour, as the engine's loader puts it */
-int ItemColourApplyTo(void* item, const std::string& colorSid) { return ItColourApply(item, colorSid, 1); }
+int ItemColourApplyTo(void* item, const std::string& colorSid, void* holder) { return ItColourApply(item, colorSid, 1, holder); }
+/* T-1413: MAIN THREAD, right after the kit's colour step (colorSid 0: the kit row carried no details - no step ran): the [COLOUR] line */
+void ItemColourKitSay(void* item, const std::string* colorSid, void* holder)
+{
+    ItColourSeenSay(item, colorSid, 1, holder, colorSid != 0 ? g_itColourLastD : coopgarment::kColourSeenNoDetail, colorSid != 0 ? g_itColourLastWhy : 0);
+}
 void ItemGearNoteSent(int blocks, unsigned int dropped) { g_gearCarried += blocks; g_gearDropped += (long long)dropped; }
 void ItemGearNoteBadRecv() { ++g_gearBadRecv; }
 
@@ -38310,6 +38761,18 @@ std::string ItemTestRefuseHereCommand(const std::string& arg)
     return "ok itemtest refusehere " + std::string(tradecharge::GateName(gate)) + " " + N((long long)n);
 }
 /* T-1266: TEST-ONLY `itemtest undofail [off]` (command channel) - arms g_undoFailArmed for one take (see there); off disarms. */
+/* T-1346 TEST-ONLY `itemtest bjrefuse <0..100>` (command channel): this game, as a box's holder, refuses the next n journal asks it
+   receives (an ask carrying its change's ask id), one log line each; 0 disarms. Nothing happens unless the verb is sent. MAIN THREAD */
+std::string ItemTestBjRefuseCommand(const std::string& arg)
+{
+    int v = (arg.empty() || arg.size() > 3) ? -1 : 0;
+    for (size_t i = 0; i < arg.size() && v >= 0; ++i) v = (arg[i] >= '0' && arg[i] <= '9') ? v * 10 + (arg[i] - '0') : -1;
+    if (v < 0 || v > 100) return "error itemtest bjrefuse usage: itemtest bjrefuse <0..100>";
+    g_bjRefuseLeft = v;
+    DebugLog("[ITEMS] T-1346 bjrefuse " + N((long long)v) + " (TEST-ONLY lever: the next " + N((long long)v) + " journal asks this game receives as a box's"
+             " holder are refused; refused so far " + N(g_bjRefuseFired) + ")");
+    return "ok itemtest bjrefuse " + N((long long)v);
+}
 std::string ItemTestUndoFailCommand(const std::string& arg)
 {
     if (!arg.empty() && arg != "off") return "error itemtest undofail usage: itemtest undofail [off]";
@@ -39440,6 +39903,14 @@ void* ObjectActiveBuildingAt(int i)
 {
     if (i < 0 || i >= g_boxWalkN) return 0;
     return g_boxWalkList[i];
+}
+/* T-1400 (F1184), declared in items.h: whether the last walk of the building list could not settle (ItBoxWalkNow's
+   unsettled end: it listed nothing it can vouch for), and the stamp of the list's settled count - neither walks. */
+int ObjectWalkUnsettled() { return (g_boxWalkListGen < 0) ? 1 : 0; }
+long long ObjectWalkCountStamp(int* n)
+{
+    if (n != 0) *n = g_boxWalkLastSettledN;
+    return g_boxWalkCountStamp;
 }
 void ObjectKeyDoorCounts(long long* unbuildable, long long* sidHashed)
 {
@@ -44652,6 +45123,97 @@ std::string ItemTestStackGiveCommand(const std::string& arg)
     if (added == 1) return "ok itemtest stackgive " + line;
     return "error itemtest stackgive: the box did not take every unit - " + line;
 }
+/* T-1346 TEST-ONLY (owner 1669): boxburst's `put:<sid>:<n>[:q=<v>]` step - n units of an item this game's own character carries put
+   into the one loaded box whose key holds <keyPart>, through the calls `itemtest stackgive` makes: Inventory::takeItemOut 0x749E10 off
+   the character (fewer than the stack: a split - op 3 and a new object; the whole stack: the object itself - op 1), then the box's
+   Inventory::addItem 0x745140 (onto a stack of that record where it has room - op 2, the object merged in - else a free cell - op 0).
+   The next frame's drain - boxburst's cut waits for its end (BoxBurstCutAfterDrain) - ties the box's change to the character (T-1346
+   origin ledger, BoxJrnLedNote) as it ties a hand put. The character is
+   stackgive's: this game's own player-faction character nearest the box. The item: the first non-money stack in its general grid whose
+   record holds <sid> and, with q=, whose quality is that value within 0.005 (the number `itemtest set q=` writes). Unlike stackgive
+   the box needs no stack of that record. Units the box refuses go back onto the character; units both refuse are destroyed and named.
+   One [ITEMS] boxburst put line, whatever the outcome. MAIN THREAD (boxburst, the command channel). */
+std::string BoxBurstPutStep(const std::string& keyPart, const std::string& sidWant, int n, int haveQ, float qWant)
+{
+    char qb[48]; qb[0] = 0;
+    if (haveQ != 0) { _snprintf(qb, 47, " q=%.2f", (double)qWant); qb[47] = 0; }
+    const std::string head = "[ITEMS] boxburst put '" + sidWant + "' x" + N((long long)n) + std::string(qb) + " into box '" + keyPart + "'";
+    std::string why;
+    if (keyPart.empty() || sidWant.empty() || n < 1) why = "needs a box key part, a sid and n 1 or more";
+    else if (g_base == 0 || kRemoveDontDestRva == 0) why = "the take-out call is not installed";
+    else if (ItOnMainThread() == 0) why = "not on the main thread";
+    else if (StoreTearingDown() != 0) why = "the engine is tearing the world down";
+    else if (ItParityCursorBusy() != 0) why = "something is on the cursor";
+    if (!why.empty()) { DebugLog(head + ": REFUSED - " + why + " (TEST-ONLY)"); return "error put: " + why; }
+    long long ps = 0, kl = 0;
+    g_furnTriedGen = -1;
+    const int rn = ItParityBoxes(g_parityRefs, kParityRefCap, &ps, &kl, kPbAll);
+    int hits = 0;
+    std::string key;
+    for (int r = 0; r < rn; ++r)
+        if (std::string(g_parityRefs[r].key).find(keyPart) != std::string::npos) { ++hits; if (key.empty()) key = g_parityRefs[r].key; }
+    if (hits != 1) why = N((long long)hits) + " loaded boxes match (exactly one is needed)";
+    void* box = (hits == 1) ? ItBoxResolve(key.c_str()) : 0;
+    ::Inventory* binv = (box != 0) ? ItBoxInventory(box) : 0;
+    if (why.empty() && binv == 0) why = "the box " + key + " does not resolve";
+    unsigned int cu = 0; float cd = -1.0f;
+    ::Character* ch = (binv != 0) ? ItRcLevClicker(box, &cu, &cd) : 0;
+    ::Inventory* oinv = (ch != 0) ? ItInventoryOf(ch) : 0;
+    if (why.empty() && oinv == 0) why = "no player-faction character with a uid this game owns and a readable position";
+    std::string sn;
+    ::InventorySection* sec = (oinv != 0) ? ItGeneralSection(oinv, &sn) : 0;
+    ::Item* it = 0;
+    int x = -1, y = -1, q0 = 0;
+    float ql = -1.0f;
+    char sid[kSidCap]; sid[0] = 0;
+    if (why.empty() && ItObj(sec) && sec->items.size() <= 4096)
+    {
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        for (size_t k = 0; k < si.size() && it == 0; ++k)
+        {
+            ::Item* c = si[k].item;
+            if (!ItObj(c)) continue;
+            char cs[kSidCap]; std::memset(cs, 0, sizeof(cs));
+            ItBaseSidPod(c, cs, kSidCap);
+            if (cs[0] == 0 || std::string(cs).find(sidWant) == std::string::npos) continue;
+            int fn = 0, cq0 = 0;
+            float cq = -1.0f;
+            if (ItIntPod(c, kItemFunction, &fn) == 0 || fn == kItemFunctionMoney) continue;
+            if (ItFloatPod(c, kItemQuality, &cq) == 0 || ItIntPod(c, kItemQuantity, &cq0) == 0 || cq0 < 1) continue;
+            if (haveQ != 0 && !(cq > qWant - 0.005f && cq < qWant + 0.005f)) continue;
+            it = c; x = (int)si[k].x; y = (int)si[k].y; ql = cq; q0 = cq0; std::memcpy(sid, cs, kSidCap);
+        }
+    }
+    if (why.empty() && it == 0) why = "uid " + N((long long)cu) + " has no non-money stack of '" + sidWant + "'" + std::string(qb) + " in its general grid";
+    if (why.empty() && n > q0) why = "uid " + N((long long)cu) + " holds " + N((long long)q0) + " of '" + std::string(sid) + "' there, fewer than " + N((long long)n);
+    if (!why.empty()) { DebugLog(head + ": REFUSED - " + why + "; nothing moved (TEST-ONLY)"); return "error put: " + why; }
+    char qs[32]; _snprintf(qs, 31, "%.2f", (double)ql); qs[31] = 0;
+    void* out = 0;
+    if (ItTakeOutPod(oinv, it, (n < q0) ? n : -1, &out) == 0 || out == 0)
+    { DebugLog(head + ": takeItemOut faulted or handed nothing back - nothing moved (TEST-ONLY)"); return "error put: takeItemOut faulted"; }
+    int placed = 0, back = 0;
+    const int added = ItAddAnywhereCount(binv, out, &placed);
+    int lost = 0;
+    if (added != 1)
+    {
+        int rest = 0;
+        if (added == 0 && ItIntPod(out, kItemQuantity, &rest) != 0 && rest > 0)
+        {
+            if (ItAddAnywhereCount(oinv, out, &back) != 1) { lost = rest - back; ItDestroyPod(out, "boxburst put: refused by the box and by the character"); }
+        }
+        else if (added < 0) lost = n - placed;
+    }
+    int q1 = 0;
+    void* at = 0;
+    const int still = (ItSlotInSectionWhy(sec, x, y) == 1 && ItGetAtPod(sec, x, y, &at) == 1 && at == (void*)it && ItIntPod(it, kItemQuantity, &q1) != 0) ? 1 : 0;
+    const std::string line = "'" + std::string(sid) + "' x" + N((long long)n) + " q=" + qs + " from uid " + N((long long)cu) + " (" + sn + " "
+                           + N((long long)x) + "," + N((long long)y) + " " + N((long long)q0) + " -> " + (still != 0 ? N((long long)q1) : std::string("gone"))
+                           + ", " + std::string(n < q0 ? "a split" : "the whole stack") + ") into box " + key + " placed=" + N((long long)placed)
+                           + " backOnCharacter=" + N((long long)back) + " lost=" + N((long long)lost);
+    DebugLog("[ITEMS] boxburst put " + line + " - the drain ties the box's change to this character as a hand put (TEST-ONLY)");
+    if (added == 1) return "ok put " + line;
+    return "error put: the box did not take every unit - " + line;
+}
 std::string ItemTestStolenCommand(const std::string& who)
 {
     if (who.empty()) return "error itemtest stolen: usage itemtest stolen <me|peer|name>";
@@ -46734,9 +47296,16 @@ std::string InvNetReportLine()
 }
 /* review-par1 4a: THE TICK IS THE DRAIN, THEN THE PARITY ANSWERS - so a holder never reads a box for an answer while one of
    its own moves on it is still in the ring, unpublished. */
+void BoxBurstCutAfterDrain();   /* T-1346 TEST-ONLY: below, beside the origin ledger */
 void ItemsTick()
 {
+    {   /* T-1401: the box lines' counts a minute old, looked at every 5 s */
+        static DWORD s_itFlushAt = 0;
+        const DWORD nowF = ::GetTickCount();
+        if (nowF - s_itFlushAt >= 5000u) { s_itFlushAt = nowF; ItLogCapsFlush(false); }
+    }
     ItemsTickDrain();
+    BoxBurstCutAfterDrain();   /* T-1346 TEST-ONLY: boxburst's armed cut, at the end of the drain that carried its steps (nothing unless armed) */
     TortOwedTick();        /* T-1192 re-check fold (finding 2): a torture output owed with no writer named, run once this game writes it */
     NoticeFlush();         /* T-942 / owner 1191: item notice lines whose 5 s are over */
     ItTraderHomeTick();    /* T-164 B4-3 (M4): the trader homes' pieces are decided at the home, on both games */
@@ -47905,6 +48474,11 @@ void ItKeeperUndoOwn(const ItPending& p, const char* why, void* bldInHand)
 
 void ReportParity()
 {
+    ItLogCapsFlush(true);   /* T-1401: every held count first, so a report (and a bug report) carries them */
+    DebugLog("[ITEMS] REPORT log caps (T-1401): boxRecv[applied,refused,boxes,linesFull,linesHeld,summaries]=" + N(g_boxRecvApplied) + "," + N(g_boxRecvRefused) + ","
+             + N((long long)g_boxRecvCap.rows.size()) + "," + N((long long)g_boxRecvCap.full) + "," + N((long long)g_boxRecvCap.held) + "," + N((long long)g_boxRecvCap.summaries)
+             + " boxLines[keys,full,held,summaries]=" + N((long long)g_boxSayCap.rows.size()) + "," + N((long long)g_boxSayCap.full) + "," + N((long long)g_boxSayCap.held)
+             + "," + N((long long)g_boxSayCap.summaries) + " (each box's first 20 changes received in full, the [ITEMS] box lines one a minute per box)");
     DebugLog("[LOOT2] REPORT researchmode=" + std::string(g_researchMode != 0 ? "on" : "off") + " lootLifted=" + N(g_lootLifted) + ItLootReportPart()
              + " research_boxes[rowsWritten,boxesLifted,emptyBoxes,knownBoxes,knownRows]=" + N(g_lootRowsWritten) + "," + N(g_lootLiftBoxes) + ","
              + N(g_lootLiftEmptyBoxes) + "," + N((long long)g_researchKnown.size()) + "," + N(g_researchKnownRows)
@@ -50052,6 +50626,20 @@ int P105NameUid(const std::string& w, unsigned int* uid, std::string* label)
     unsigned int u = 0; float d = -1.0f; std::string shown, why;
     ::Character* c = coop::LeverNearestNamed(coopsay::TalkPersonKey(nm), (dead != 0) ? coop::kLeverPickDead : coop::kLeverPickAny,
                                              ItBoxOpenOpener(), 1000.0f, &u, &d, &shown, &why);
+    if (c == 0 && why.compare(0, 3, "no ") == 0)
+    {   /* T-1398 (T2502): nobody of that name within the loot range of the opener - THIS game's own character of that name is taken at
+           any distance (and the opener itself counts), so `kill name:<N>` reaches a far own character. The 1000-unit range stays for
+           every other match: the box levers (cursortest, P105Container) want a character beside the opener. One own match only. */
+        unsigned int fu = 0; float fd = -1.0f; std::string fs, fw;
+        ::Character* fc = coop::LeverNearestNamed(coopsay::TalkPersonKey(nm), (dead != 0) ? coop::kLeverPickDead : coop::kLeverPickAny,
+                                                  0, 1.0e30f, &fu, &fd, &fs, &fw);
+        if (fc != 0 && fu != 0 && net::IsUidMine(fu))
+        {
+            *uid = fu;
+            *label = w + " -> uid " + N((long long)fu) + " '" + fs + "' " + N((long long)(fd + 0.5f)) + " units from this game's player (own character, any distance)";
+            return 1;
+        }
+    }
     if (c == 0 && (why.find(" match (") != std::string::npos || why.compare(0, 11, "a malformed") == 0))
     {   /* T-1218: several within 1000 units (or #k past them) - the helper's refusal words, whole */
         *label = w + ": " + why;
@@ -50073,8 +50661,8 @@ int P105NameUid(const std::string& w, unsigned int* uid, std::string* label)
 {
     if (!ItPlaus(coop::GameWorldPtr())) { *desc = "no GameWorld"; return 0; }
     if (who == "me")
-    {
-        ::Character* c = ItBoxOpenOpener();
+    {   /* T-1167 piece 3 fold 1 (review p3b L3): while a TRADE window is open, the trading character (its uid) */
+        ::Character* c = TradeWinMineUid() != 0 ? (::Character*)FindSpawned(TradeWinMineUid()) : ItBoxOpenOpener();
         if (c == 0) { *desc = "no player-faction character with a uid this game owns"; return 0; }
         *desc = "this game's character uid " + N((long long)FindSpawnedUid(c));
         return ItInventoryOf(c);
@@ -56733,6 +57321,8 @@ struct BoxRecW
     std::vector<BoxOwnWrite> ownChain;        /* this game's own writes not answered yet, oldest first (at most coopbrec::kBrChainMax) */
     coopbrec::BoxJrnState jrn;                /* a player's box this game writes: its base and its writes waiting for an answer (coopbrec::BoxJrn*) */
     std::vector<BoxJrnHintRow> hints;            /* the characters that took part in its change since the base */
+    std::vector<coopbrec::BoxJrnLedRow> orig;    /* T-1346: its origin ledger since the base (coopbrec::BoxJrnLedRow; BoxJrnLedNote) - lives as the hints do */
+    coopbrec::BoxJrnLedReads ledReads;           /* T-1346 fold 1: the box before this drain's first reading, and that reading's drain */
     int jrnLatestHave;                        /* the box as this game last had it as its writer (read at each mark and write) */
     int jrnAskMix;                            /* marked since by this game not its writer: the box shows its asks at once (no read again) */
     int jrnUnsure, jrnParkUnsure;             /* a guarded write noted the box and the latest (the park's) could not be read again */
@@ -56743,6 +57333,7 @@ struct BoxRecW
     coopbrec::BoxJrnState jrnPark;            /* is kept with its own base and waiting writes until none waits (BoxJrnParkEnd) */
     std::vector<cooppar::ParityItem> jrnParkLatest, jrnParkRecord;
     std::vector<BoxJrnHintRow> jrnParkHints;
+    std::vector<coopbrec::BoxJrnLedRow> jrnParkOrig;   /* T-1346: the parked change's origin ledger */
     int jrnParkHow; unsigned int jrnParkGen;
     DWORD jrnParkGateAt;                      /* the parked lay-again waits for the swap's gates since (0 = not waiting); logged then and each 5 min */
     unsigned long long jrnParkPend;           /* the parked change's id not written yet (its next write's, reserved) */
@@ -57042,6 +57633,41 @@ int ItBoxOwnRequestOpen(const std::string& key)
 const int kBlvTownSkipSaid = coopbrec::kBlvMax + 1;   /* liveWhy: a player's record over a box that reads as nobody's was said */
 long long g_blvOwnKept = 0, g_blvChainFull = 0, g_blvSnapWritten = 0, g_blvSnapSkipped = 0, g_blvGoneOwed = 0, g_blvTownSkip = 0,
           g_blvMovedGone = 0;
+/* T-1346: THE ORIGIN LEDGER'S COUNTERS (boxJournalOrigin) */
+long long g_bjLedRows = 0, g_bjLedUnresolved = 0, g_bjLedCapped = 0, g_bjPutNoOrigin = 0, g_bjPutNoOriginSaid = 0, g_bjRemakeNoOrigin = 0,
+          g_bjOwedOldFormat = 0, g_bjOwedOriginDropped = 0, g_bjLedCombined = 0, g_bjLedByKind = 0, g_bjFromCapped = 0;
+const size_t kBjLedCap = 256u;   /* the newest origin rows of one box */
+/* T-1346 fold 1 (review H1): a row that cannot be matched to an item of the box at its own reading is KEPT, with its record and units, and
+   matched by its kind at the split (coopbrec::BoxJrnOriginSplit) - counted and logged */
+void BoxJrnLedKindSay(const BoxRecW& w, const coopbrec::BoxJrnLedRow& r, const char* when)
+{
+    ++g_bjLedUnresolved;
+    if (g_bjLedUnresolved <= 20 || (g_bjLedUnresolved % 100) == 0)
+        ErrorLog("[BOXJRN] box " + w.key + ": a move of " + N((long long)r.units) + " '" + r.baseSid + "' by uid " + N((long long)r.uid) + " at "
+                 + r.boxSec + " " + N((long long)r.bx) + "," + N((long long)r.by) + " cannot be matched to an item of the box " + when + " - kept, matched by"
+                 " its record at the split (boxJournalLedUnresolved=" + N(g_bjLedUnresolved) + ")");
+}
+/* T-1346 fold 1: a reading of the box as the journal has it (items), before the latest is replaced: the drain's first reading keeps the
+   box before it (the journal's latest, else its base) for this drain's moves out (coopbrec::BoxJrnLedOnRead); rows noted while the box
+   had no reading of their drain are matched now, once. No row is ever erased because a later reading lacks its item */
+void BoxJrnLedResolveAll(BoxRecW& w, const std::vector<cooppar::ParityItem>& items)
+{
+    const std::vector<cooppar::ParityItem>* prev = (w.jrnLatestHave != 0) ? &w.jrnLatest : &w.jrn.base;
+    std::vector<size_t> um;
+    (void)coopbrec::BoxJrnLedOnRead(&w.orig, &w.ledReads, prev, items, g_bjDrain, &um);
+    for (size_t i = 0; i < um.size(); ++i) BoxJrnLedKindSay(w, w.orig[um[i]], "at its first reading");
+}
+/* T-1346: units of a put no character of this game put in (made in the box: a restock, a craft, ore) - dropped, never asked or made
+   again: counted, logged (the first 20, then every 100th) */
+void BoxJrnNoOriginSay(const std::string& key, long long units, const char* what)
+{
+    if (units <= 0) return;
+    g_bjPutNoOrigin += units;
+    ++g_bjPutNoOriginSaid;
+    if (g_bjPutNoOriginSaid <= 20 || (g_bjPutNoOriginSaid % 100) == 0)
+        ErrorLog("[BOXJRN] box " + key + ": " + N(units) + " units of " + std::string(what) + " were made in the box, not by a character of this game -"
+                 " dropped, never made again (boxJournalPutNoOrigin=" + N(g_bjPutNoOrigin) + ")");
+}
 /* THIS GAME'S OWN WRITE BECOMES THE BOX'S RECORD HERE WHEN THE WORLD SERVER SAYS IT IS STORED. The world server forwards a taken record
    only to the other games, so the writer keeps what it sent in its chain of writes waiting for an answer; BOX_TAKEN puts it into the
    kept table (BoxTakenArrive), BOX_REFUSE drops it (BoxRefuseArrive) - a record never stored is never kept. Each write is also a write
@@ -57058,6 +57684,7 @@ void BoxRecKeepOwn(const std::string& id, BoxRecW& w, const coopbrec::BoxHeader&
     (void)coopbrec::BoxJrnWrote(&w.jrn, h.generation, items, (unsigned int)::GetTickCount(), chg);   /* at the cap the oldest goes, as in the chain */
     if (chg != 0ULL && w.chgPend == chg) w.chgPend = 0ULL;              /* sent: the next change takes a new id */
     if (led.line != 0ULL && led.line == w.ledFresh) w.ledFresh = 0ULL;   /* the new line is started */
+    BoxJrnLedResolveAll(w, items);   /* T-1346: before the latest moves */
     w.jrnLatest = items; w.jrnLatestHave = 1;   /* the box as this game wrote it */
     ++g_blvOwnKept;
 }
@@ -57144,7 +57771,8 @@ struct BoxJrnAskRow
     float boxPos[3];                 /* where the box was read (0,0,0 unknown) */
     int lapsed;                      /* the request's time ran out: its ending ran; a later answer ends it again as a late one */
     DWORD at;                        /* when it was asked (GetTickCount) */
-    BoxJrnAskRow() : lapsed(0), at(0) { boxPos[0] = 0; boxPos[1] = 0; boxPos[2] = 0; }
+    int whoRule;                     /* T-1346: 1 = a put of a format-2 save's row (no origins): made again by the who rule, once (BoxOwedSettle) */
+    BoxJrnAskRow() : lapsed(0), at(0), whoRule(0) { boxPos[0] = 0; boxPos[1] = 0; boxPos[2] = 0; }
 };
 std::map<unsigned int, BoxJrnAskRow> g_bjAsk;   /* request id -> the journalled ask it carries */
 const size_t kBjLapsedCap = 64u;                /* lapsed asks kept for a late answer */
@@ -57187,17 +57815,18 @@ std::string BoxJrnWhat(const BoxJrnQ& q, const std::string& key)
 /* the box as this game has it now as its writer (read at a mark or a write) */
 void BoxJrnLatestSet(BoxRecW& w, const std::vector<cooppar::ParityItem>& items)
 {
+    BoxJrnLedResolveAll(w, items);   /* T-1346: before the latest moves */
     w.jrnLatest = items; w.jrnLatestHave = 1; w.jrnAskMix = 0; w.jrnUnsure = 0;   /* read as the writer: the whole box, nothing unsure */
 }
 long long g_bjRebaseHandOver = 0, g_bjRebaseUndo = 0;
 long long g_bjNested = 0, g_bjParkedN = 0, g_bjParkEnded = 0;
 long long g_bjUnsureMarked = 0, g_bjUnsureDropped = 0;   /* changes made unsure by a note; their takes left on the character */
 void BoxJrnHandOver(const std::string& id, BoxRecW& w);   /* below */
-int BoxJrnReapply(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d, const std::vector<BoxJrnHintRow>& hints, unsigned int gen,
-                  const std::vector<coopbrec::BoxLedgerEntry>& led);   /* below */
+int BoxJrnReapply(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d, const std::vector<BoxJrnHintRow>& hints,
+                  const std::vector<coopbrec::BoxJrnLedRow>& orig, unsigned int gen, const std::vector<coopbrec::BoxLedgerEntry>& led);   /* below */
 int BoxJrnReapplyReady(BoxRecW& w, size_t n);   /* below */
-void BoxJrnUndoHere(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d, const std::vector<BoxJrnHintRow>& hints, unsigned int gen,
-                    const std::vector<coopbrec::BoxLedgerEntry>& led);   /* below */
+void BoxJrnUndoHere(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d, const std::vector<BoxJrnHintRow>& hints,
+                    const std::vector<coopbrec::BoxJrnLedRow>& orig, unsigned int gen, const std::vector<coopbrec::BoxLedgerEntry>& led);   /* below */
 void BoxJrnDo(const BoxJrnAskRow& row, unsigned int reqId, int act, const char* why);   /* below */
 /* the box is the stored record of generation gen (how: 0 it already held it, 1 it was laid over the box, 2 laid with this game's held
    moves on top): the journal's base. A change of the box not yet stored is never dropped silently (coopbrec::BoxJrnRebaseDo): another
@@ -57224,7 +57853,7 @@ void BoxJrnRebase(const std::string& id, BoxRecW& w, const std::vector<cooppar::
                                                                 : ": laid again if the box can be swapped now, otherwise undone on the character"));
         else
         {
-            w.jrnParked = 1; w.jrnPark = w.jrn; w.jrnParkLatest = w.jrnLatest; w.jrnParkRecord = items; w.jrnParkHints = w.hints; w.jrnParkHow = how; w.jrnParkGen = gen;
+            w.jrnParked = 1; w.jrnPark = w.jrn; w.jrnParkLatest = w.jrnLatest; w.jrnParkRecord = items; w.jrnParkHints = w.hints; w.jrnParkOrig = w.orig; w.jrnParkHow = how; w.jrnParkGen = gen;
             w.jrnParkPend = w.chgPend; w.chgPend = 0ULL; w.jrnParkLed = ledWas;   /* the park keeps its ids; a change made after it takes new ones */
             w.jrnParkAskIdOf.swap(w.askIdOf); w.askIdOf.clear();
             {   /* the park takes the box as last read: unsure when the change was, or when the box is still noted - the apply's read consumed
@@ -57248,17 +57877,18 @@ void BoxJrnRebase(const std::string& id, BoxRecW& w, const std::vector<cooppar::
         BoxJrnHandOver(id, w);
     }
     const std::vector<BoxJrnHintRow> hintsWere = w.hints;
+    const std::vector<coopbrec::BoxJrnLedRow> origWas = w.orig;
     if (act == coopbrec::kRbReapply && w.jrnUnsure != 0) g_bjUnsureDropped += coopbrec::BoxJrnUnsureParts(&d);   /* unsure: its takes stay on the character */
     coopbrec::BoxJrnOpen(&w.jrn, items, gen);
     w.jrnLatestHave = 0; w.jrnLatest.clear(); w.jrnAskMix = 0; w.jrnUnsure = 0;
-    if (act != coopbrec::kRbKeep) w.hints.clear();
+    if (act != coopbrec::kRbKeep) { w.hints.clear(); w.orig.clear(); }
     ++g_bjRebased;
-    if (act == coopbrec::kRbReapply && BoxJrnReapply(id, w, d, hintsWere, gen, ledWas) != 1)
+    if (act == coopbrec::kRbReapply && BoxJrnReapply(id, w, d, hintsWere, origWas, gen, ledWas) != 1)
     {   /* cannot be laid (the box not loaded here, unreadable, its swap did not start), or a second record over a change already parked whose
            gates do not pass now: undone here, logged */
         ErrorLog("[BOXJRN] box " + w.key + ": this game's change could not be laid again on top of the stored record gen=" + N((long long)gen)
                  + " (the box not loaded here, unreadable or not swappable now) - undone on the character");
-        BoxJrnUndoHere(id, w, d, hintsWere, gen, ledWas);
+        BoxJrnUndoHere(id, w, d, hintsWere, origWas, gen, ledWas);
         w.chgPend = 0ULL;   /* the change is undone: a later change takes a new id */
     }
     if (act == coopbrec::kRbKeep && BoxRecSnapTake(id, w, w.key) != 0) BoxJrnLatestSet(w, w.snapItems);   /* the held moves laid on top are the change */
@@ -57300,6 +57930,114 @@ void BoxJrnHint(const std::string& key, unsigned int uid, const char* section)
     h.push_back(e);
     ++g_bjHints;
 }
+/* the ledger row of a move at the box entry bx (BoxJrnLedNote; uid 0: no character yet - a held pickup's) */
+coopbrec::BoxJrnLedRow BoxJrnLedRowAt(unsigned int uid, const char* section, const ItEntry& bx, int units, int op, const char* sid)
+{
+    coopbrec::BoxJrnLedRow r;
+    r.uid = uid; r.at = (::GetTickCount() != 0) ? ::GetTickCount() : 1;
+    r.section = (section != 0) ? std::string(section, strnlen(section, kSecCap)) : std::string();
+    {
+        ::Character* hc = (uid != 0) ? FindSpawned(uid) : 0;
+        if (ItObj(hc)) { const std::string cw = HovCharWhereOf(hc); if (cw != hovrec::CharWhereUnknown()) r.where = cw; }
+    }
+    r.units = units; r.op = op;
+    r.baseSid = (sid != 0) ? std::string(sid, strnlen(sid, kSidCap)) : std::string();
+    r.boxSec = std::string(bx.section, strnlen(bx.section, kSecCap)); r.bx = bx.x; r.by = bx.y;
+    if (bx.bagPath.has != 0)
+    {
+        r.inPack = 1;
+        r.packSec = std::string(bx.bagPath.section, strnlen(bx.bagPath.section, kSecCap)); r.px = bx.bagPath.x; r.py = bx.bagPath.y;
+    }
+    r.cell = coopbrec::BoxJrnLedCell(r);
+    return r;
+}
+/* T-1346 fold 2 (re-check N1), MAIN THREAD (the drain, after its marks read the boxes): the item re just lifted onto the cursor out of a
+   player's box this game writes is matched now, against this drain's reading of the box before the move (BoxJrnLedMatchAt), into
+   g_bjHeldPick[slot] - its drop's row takes it */
+void BoxJrnLedPick(const ItEntry& re, int slot)
+{
+    if (slot < 0 || slot > 1) return;
+    BoxJrnHeldPick& p = g_bjHeldPick[slot];
+    p = BoxJrnHeldPick();
+    p.item = re.item; p.seq = re.seq;
+    if (re.kind != kKindBox || re.boxKey[0] == 0 || re.quantity <= 0 || ItOnMainThread() == 0) return;
+    const std::string key(re.boxKey, strnlen(re.boxKey, kBoxKeyCap));
+    if (BoxMoveIsPlayerBox(key) == 0) return;
+    std::map<std::string, BoxRecW>::iterator it = g_boxRecW.find(BoxRecIdLookup(key));
+    if (it == g_boxRecW.end()) return;
+    BoxRecW& w = it->second;
+    p.r = BoxJrnLedRowAt(0, "", re, -re.quantity, 1, re.fields != 0 ? re.baseSid : "");
+    (void)coopbrec::BoxJrnLedMatchAt(&p.r, w.ledReads, (w.jrnLatestHave != 0) ? &w.jrnLatest : 0, g_bjDrain);
+    p.have = 1;
+}
+/* T-1346, MAIN THREAD (the drain): character uid of this game moved units (> 0 into, < 0 out of) the player's box at key, at the box
+   entry bx's cell (its pack's path when inside a pack); op the box entry's; sid the item's record ("" unread). A row of the box's origin
+   ledger, its identity read at the box's next read (BoxJrnLedResolveAll). Only for a box this game writes the journal of. pick: an item held
+   across drains, matched at its pickup (fold 2) */
+void BoxJrnLedNote(const std::string& key, unsigned int uid, const char* section, const ItEntry& bx, int units, int op, const char* sid,
+                   const BoxJrnHeldPick* pick)
+{
+    if (key.empty() || uid == 0 || units == 0 || ItOnMainThread() == 0 || !net::IsUidMine(uid) || BoxMoveIsPlayerBox(key) == 0) return;
+    std::map<std::string, BoxRecW>::iterator it = g_boxRecW.find(BoxRecIdLookup(key));
+    if (it == g_boxRecW.end()) return;
+    BoxRecW& w = it->second;
+    std::vector<coopbrec::BoxJrnLedRow>& v = w.orig;
+    coopbrec::BoxJrnLedRow r = BoxJrnLedRowAt(uid, section, bx, units, op, sid);
+    /* fold 1 (review H1): matched now - a landing against this drain's reading (the box just after its moves), a move out against the box
+       before this drain's first move; a landing with no reading of this drain waits for the box's next one */
+    if (pick != 0 && pick->have != 0) { if (coopbrec::BoxJrnLedHeldTake(&r, pick->r) == 0) BoxJrnLedKindSay(w, r, "at its pickup"); }   /* fold 2: held across drains */
+    else if (coopbrec::BoxJrnLedMatchAt(&r, w.ledReads, (w.jrnLatestHave != 0) ? &w.jrnLatest : 0, g_bjDrain) == 0) BoxJrnLedKindSay(w, r, "at its move");
+    if (v.size() >= kBjLedCap)
+    {   /* review M2: one row per character and item first; only then does the oldest leave - each logged */
+        const std::vector<unsigned int> cuts = coopbrec::BoxJrnLedCuts(w.jrn);   /* fold 2 (re-check N2): never across a write not stored */
+        g_bjLedCombined += (long long)coopbrec::BoxJrnLedCombine(&v, &cuts);
+        while (v.size() >= kBjLedCap)
+        {
+            const coopbrec::BoxJrnLedRow& o = v.front();
+            ++g_bjLedCapped;
+            if (g_bjLedCapped <= 20 || (g_bjLedCapped % 100) == 0)
+                ErrorLog("[BOXJRN] box " + w.key + ": the origin ledger is full (" + N((long long)kBjLedCap) + " rows of different characters and items) -"
+                         " its oldest row (" + N((long long)o.units) + " '" + o.baseSid + "' by uid " + N((long long)o.uid) + ") leaves: a refused put of"
+                         " it is not made again on that character, a move out of it no longer offsets a put (boxJournalLedCapped=" + N(g_bjLedCapped) + ")");
+            v.erase(v.begin());
+        }
+    }
+    v.push_back(r);
+    ++g_bjLedRows;
+}
+/* T-1346 TEST-ONLY (boxburst; read-T2396): THE CUT COMES AFTER THE DRAIN THAT CARRIES THE STEPS. boxburst's steps run in the command
+   channel's call, which CommandChannelTick makes AFTER ItemsTick - so the moves they ring are drained in the NEXT frame's
+   ItemsTickDrain. That drain is where a put by this game's character into a player's box this game writes becomes a row of the box's
+   origin ledger (the kBoxMine arm, BoxJrnLedNote), and only while this game is still the box's writer: with the link already cut
+   (T2396, the cut in the steps' own frame) the box answered 'no answer', the moves were undone or held and no row was written. So
+   boxburst only arms the cut (BoxBurstCutArm) and ItemsTick fires it right after the next drain ends (coopbrec::BoxBurstCutDue): the
+   rows are noted with the link up, and the box's next record write - BoxRecTick, from GroundDrain at the START of a drain, which also
+   waits while the box has a move not yet drained (ItBoxHasPendingMoves) - comes after the cut, with the link down, so the change stays
+   unstored for the hand-over. The cut line names the drain and the origin rows noted since the steps. MAIN THREAD. */
+struct BoxBurstCut
+{
+    int armed, steps, done;
+    unsigned int drain;
+    long long rows0;
+    std::string sec, key;
+    BoxBurstCut() : armed(0), steps(0), done(0), drain(0), rows0(0) {}
+};
+BoxBurstCut g_bbCut;
+int BoxBurstCutArmed() { return g_bbCut.armed; }
+void BoxBurstCutArm(const std::string& sec, const std::string& key, int steps, int done)
+{
+    g_bbCut.armed = 1; g_bbCut.drain = g_bjDrain; g_bbCut.rows0 = g_bjLedRows;
+    g_bbCut.sec = sec; g_bbCut.key = key; g_bbCut.steps = steps; g_bbCut.done = done;
+}
+void BoxBurstCutAfterDrain()
+{
+    if (coopbrec::BoxBurstCutDue(g_bbCut.armed, g_bbCut.drain, g_bjDrain) == 0) return;
+    g_bbCut.armed = 0;
+    const std::string cut = StoreWorldAwayLever(g_bbCut.sec);
+    DebugLog("[BOXBURST] cut: " + cut + " - at the end of drain " + N((long long)g_bjDrain) + ", the first after the " + N((long long)g_bbCut.steps)
+             + " steps (" + N((long long)g_bbCut.done) + " ok) on box '" + g_bbCut.key + "', while this game still wrote it: origin rows noted since the steps="
+             + N(g_bjLedRows - g_bbCut.rows0) + " (TEST-ONLY)");
+}
 /* everything the journal holds of the box goes (its piece taken down, its id moved, the world torn down): a change not yet asked is
    counted and logged */
 void BoxJrnForget(BoxRecW& w, const char* why)
@@ -57312,8 +58050,8 @@ void BoxJrnForget(BoxRecW& w, const char* why)
                       + "): " + std::string(why != 0 ? why : "?"));
     }
     w.jrn = coopbrec::BoxJrnState();
-    w.jrnParked = 0; w.jrnParkUnsure = 0; w.jrnPark = coopbrec::BoxJrnState(); w.jrnParkLatest.clear(); w.jrnParkRecord.clear(); w.jrnParkHints.clear(); w.jrnParkGateAt = 0;
-    w.jrnLatestHave = 0; w.jrnLatest.clear(); w.jrnAskMix = 0; w.jrnUnsure = 0; w.hints.clear(); w.jrnQueue.clear(); w.jrnAskSent = 0; w.jrnAskAt = 0;
+    w.jrnParked = 0; w.jrnParkUnsure = 0; w.jrnPark = coopbrec::BoxJrnState(); w.jrnParkLatest.clear(); w.jrnParkRecord.clear(); w.jrnParkHints.clear(); w.jrnParkOrig.clear(); w.jrnParkGateAt = 0;
+    w.jrnLatestHave = 0; w.jrnLatest.clear(); w.jrnAskMix = 0; w.jrnUnsure = 0; w.hints.clear(); w.orig.clear(); w.jrnQueue.clear(); w.jrnAskSent = 0; w.jrnAskAt = 0;
     w.jrnParkPend = 0ULL; w.jrnParkLed.clear(); w.jrnParkAskIdOf.clear(); w.askIdOf.clear();   /* the ledger entries stay: a write from the box's
                                                                                                   read at its mark still carries them */
     BoxSealForget(w);
@@ -57329,6 +58067,7 @@ void BoxJrnHintsStored(BoxRecW& w, unsigned int writeAt)
         ++k;
     }
     w.hints.resize(k);
+    w.orig = coopbrec::BoxJrnLedAfter(w.orig, writeAt);   /* T-1346: the origin rows of the changes it read go too */
 }
 /* this game's write of generation gen is stored: the waiting writes up to it leave the chain, and it is the journal's base */
 void BoxRecOwnStored(BoxRecW& w, unsigned int gen)
@@ -57597,30 +58336,11 @@ int BoxJrnMakePod(::Character* c, ::Inventory* inv, ::InventorySection* s1, ::In
     __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
     return ok;
 }
-/* q's item made again on a character of this game that took part (else this game's own character nearest the box); no room drops
-   it at the character's feet. 1 = done or failed for good; 0 = no such character loaded here (kept for later) */
-int BoxJrnRemakeUnits(const BoxJrnAskRow& row, std::string* done)
+/* units of q's item made again on character c (sec1: the section it held them in, first); no room drops them at its feet. 1 = done or
+   failed for good; 0 = cannot now (engine writes blocked, no inventory) */
+int BoxJrnRemakeOn(const BoxJrnAskRow& row, ::Character* c, const std::string& sec1, int units, std::string* done)
 {
     const coopbrec::BoxJrnDelta& d = row.q.d;
-    ::Character* c = 0;
-    std::string sec1;
-    int mineHints = 0;
-    for (size_t hi = row.hints.size(); hi-- > 0 && c == 0;)
-    {
-        const unsigned int uid = row.hints[hi].uid;
-        if (!net::IsUidMine(uid)) continue;
-        ++mineHints;
-        ::Character* hc = FindSpawned(uid);
-        if (ItObj(hc)) { c = hc; sec1 = row.hints[hi].section; }
-    }
-    if (c == 0 && mineHints > 0) return 0;
-    if (c == 0)
-    {
-        ::Character* cand[4]; unsigned int cuid[4];
-        const int known = (row.boxPos[0] != 0 || row.boxPos[1] != 0 || row.boxPos[2] != 0) ? 1 : 0;
-        if (ItLootOwnChars(known != 0 ? row.boxPos : 0, cand, cuid, 4) <= 0) return 0;
-        c = cand[0];
-    }
     if (EngineWritesBlocked()) return 0;
     ::Inventory* inv = ItInventoryOf(c);
     if (inv == 0) return 0;
@@ -57631,17 +58351,67 @@ int BoxJrnRemakeUnits(const BoxJrnAskRow& row, std::string* done)
     ItemMoveMsg mm;
     mm.baseSid = d.row.baseSid; mm.companySid = d.row.companySid; mm.materialSid = d.row.materialSid; mm.colorSid = d.row.colorSid;
     mm.quality = d.row.quality; mm.charges = d.row.charges; mm.functionKind = d.row.functionKind; mm.level = d.row.level; mm.unique = d.row.unique;
-    mm.quantity = (d.quantity > 0) ? d.quantity : 1;
+    mm.quantity = (units > 0) ? units : 1;
     if (d.row.owner.kind != coopmark::kOwnNone) { mm.owner = d.row.owner; mm.ownerFrom = 1; }
     mm.gear = d.row.gear;
     const int r = BoxJrnMakePod(c, inv, s1, s2, &mm, d.row.bag.empty() ? 0 : &d.row.bag);
-    if (r == 1) { ++g_bjRemade; *done += " the item made again on a character of this game;"; return 1; }
-    if (r == 2) { ++g_bjRemadeFeet; *done += " the item made again and dropped at a character's feet (no room);"; return 1; }
+    if (r == 1) { ++g_bjRemade; *done += " " + N((long long)mm.quantity) + " made again on the character they came from;"; return 1; }
+    if (r == 2) { ++g_bjRemadeFeet; *done += " " + N((long long)mm.quantity) + " made again and dropped at the feet of the character they came from (no room);"; return 1; }
     ++g_bjRemakeFailed;
-    ErrorLog("[BOXJRN] " + BoxJrnWhat(row.q, row.key) + ": the item could not be made again on this game's character, nor dropped at its feet - it is LOST"
-             " (boxJournalRemakeFailed=" + N(g_bjRemakeFailed) + ")");
-    *done += " the item could NOT be made again (lost);";
+    ErrorLog("[BOXJRN] " + BoxJrnWhat(row.q, row.key) + ": " + N((long long)mm.quantity) + " units could not be made again on this game's character, nor dropped"
+             " at its feet - LOST (boxJournalRemakeFailed=" + N(g_bjRemakeFailed) + ")");
+    *done += " " + N((long long)mm.quantity) + " could NOT be made again (lost);";
     return 1;
+}
+/* T-1346: A REFUSED (UNSENT, TIMED OUT, UNDONE) PUT IS MADE AGAIN ONLY ON THE CHARACTERS ITS UNITS CAME FROM (d.from, newest first): each
+   loaded one gets its own units and leaves the list; one not loaded here keeps its units waiting (BoxJrnPendKeep, at most 30 minutes). A
+   put with no origin was made in the box (a restock, a craft, ore) - never made again on anyone: counted, logged. whoRule (a format-2
+   save's put, no origins): on a character of this game that took part (its hints), never another. 1 = done or failed for good; 0 = some
+   units wait for their character */
+unsigned int BoxOwedUid(const std::string& where);   /* below */
+int BoxJrnRemakeUnits(BoxJrnAskRow& row, std::string* done)
+{
+    coopbrec::BoxJrnDelta& d = row.q.d;
+    if (row.whoRule != 0)
+    {
+        ::Character* c = 0;
+        std::string sec1;
+        int mineHints = 0;
+        for (size_t hi = row.hints.size(); hi-- > 0 && c == 0;)
+        {
+            const unsigned int uid = row.hints[hi].uid;
+            if (!net::IsUidMine(uid)) continue;
+            ++mineHints;
+            ::Character* hc = FindSpawned(uid);
+            if (ItObj(hc)) { c = hc; sec1 = row.hints[hi].section; }
+        }
+        if (c == 0 && mineHints > 0) return 0;
+        if (c != 0) return BoxJrnRemakeOn(row, c, sec1, d.quantity, done);
+    }
+    if (d.from.empty() && d.quantity <= 0) { *done += " nothing left to make again;"; return 1; }   /* review LOW: every origin dropped - not "made in the box" */
+    if (d.from.empty())
+    {
+        ++g_bjRemakeNoOrigin;
+        if (g_bjRemakeNoOrigin <= 20 || (g_bjRemakeNoOrigin % 100) == 0)
+            ErrorLog("[BOXJRN] " + BoxJrnWhat(row.q, row.key) + ": no character of this game put it in the box (made in the box) - not made again on anyone"
+                     " (boxJournalRemakeNoOrigin=" + N(g_bjRemakeNoOrigin) + ")");
+        *done += " not made again (no character of this game put it in the box);";
+        return 1;
+    }
+    if (EngineWritesBlocked()) return 0;
+    size_t i = 0;
+    while (i < d.from.size())
+    {
+        if (d.from[i].uid == 0 && !d.from[i].where.empty()) d.from[i].uid = BoxOwedUid(d.from[i].where);   /* review M1: a loaded save's origin, mapped once its character loads */
+        const coopbrec::BoxJrnFrom f = d.from[i];
+        ::Character* c = (f.uid != 0 && net::IsUidMine(f.uid)) ? FindSpawned(f.uid) : 0;
+        if (!ItObj(c) || f.units <= 0) { if (f.units <= 0) d.from.erase(d.from.begin() + (long)i); else ++i; continue; }   /* not loaded here: it waits */
+        if (BoxJrnRemakeOn(row, c, f.section, f.units, done) == 0) { ++i; continue; }
+        d.from.erase(d.from.begin() + (long)i);
+        d.quantity -= f.units;   /* what the put still owes */
+        if (d.quantity < 0) d.quantity = 0;
+    }
+    return d.from.empty() ? 1 : 0;
 }
 /* the character half of an ending (kBjDoRemoveChar / kBjDoRemake). 1 = done; 0 = kept until a character loads */
 int BoxJrnCharEnd(BoxJrnAskRow& row, int act, std::string* done)
@@ -57729,9 +58499,16 @@ int BoxJrnAsk(const std::string& id, BoxRecW& w, const BoxJrnQ& q)
     row.boxPos[0] = w.snapPos[0]; row.boxPos[1] = w.snapPos[1]; row.boxPos[2] = w.snapPos[2];
     unsigned int taker = 0;
     std::string takerSec("main");
-    for (size_t hi = row.hints.size(); hi-- > 0 && taker == 0;)
+    if (q.d.dir == coopbrec::kBjPut)
+    {   /* T-1346: a put is asked by the first of its own origins - the character its units came from - never by another (no own origin
+           loaded: no taker, and the ending makes them again only on their characters) */
+        for (size_t fi = 0; fi < q.d.from.size() && taker == 0; ++fi)
+            if (q.d.from[fi].uid != 0 && net::IsUidMine(q.d.from[fi].uid))
+            { taker = q.d.from[fi].uid; if (!q.d.from[fi].section.empty()) takerSec = q.d.from[fi].section; }
+    }
+    else for (size_t hi = row.hints.size(); hi-- > 0 && taker == 0;)
         if (net::IsUidMine(row.hints[hi].uid)) { taker = row.hints[hi].uid; if (!row.hints[hi].section.empty()) takerSec = row.hints[hi].section; }
-    if (taker == 0)
+    if (taker == 0 && q.d.dir != coopbrec::kBjPut)
     {   /* no character of this game took part (an item made or used up in the box): this game's own character nearest the box asks */
         ::Character* cand[4]; unsigned int cuid[4];
         const int known = (row.boxPos[0] != 0 || row.boxPos[1] != 0 || row.boxPos[2] != 0) ? 1 : 0;
@@ -57861,12 +58638,18 @@ int BoxJrnAnswer(unsigned int id, int what)
 }
 /* a journal's change (st's base against latest) goes into the box's ask queue, each ask with hints */
 void BoxJrnQueueFrom(const std::string& id, BoxRecW& w, const coopbrec::BoxJrnState& st, const std::vector<cooppar::ParityItem>& latest,
-                     const std::vector<BoxJrnHintRow>& hints, std::map<std::string, unsigned long long>* askIdOf,
-                     const std::vector<coopbrec::BoxLedgerEntry>& carry, int unsure)
+                     const std::vector<BoxJrnHintRow>& hints, const std::vector<coopbrec::BoxJrnLedRow>& orig,
+                     std::map<std::string, unsigned long long>* askIdOf, const std::vector<coopbrec::BoxLedgerEntry>& carry, int unsure)
 {
     std::vector<coopbrec::BoxJrnDelta> d;
     int nested = 0;
     const int ok = coopbrec::BoxJrnPlan(st, latest, &d, &nested);
+    if (ok != 0)
+    {   /* T-1346: a put is asked only for the units this game's characters put in, with them (coopbrec::BoxJrnOriginSplit) */
+        long long nd = 0;
+        (void)coopbrec::BoxJrnOriginSplit(&d, orig, &nd, &g_bjLedByKind);
+        BoxJrnNoOriginSay(w.key, nd, "its change handed to the box's new writer");
+    }
     const int dropped = (ok != 0 && unsure != 0) ? coopbrec::BoxJrnUnsureParts(&d) : 0;
     if (dropped > 0)
     {   /* a guarded write noted the box after its last read and it could not be read again: its takes stay on the character */
@@ -57912,17 +58695,23 @@ void BoxJrnQueueFrom(const std::string& id, BoxRecW& w, const coopbrec::BoxJrnSt
 void BoxJrnHandOver(const std::string& id, BoxRecW& w)
 {
     const std::vector<coopbrec::BoxLedgerEntry> led = BoxJrnLedOf(w, w.jrn, w.chgPend, 1);
-    BoxJrnQueueFrom(id, w, w.jrn, w.jrnLatest, w.hints, &w.askIdOf, BoxJrnCarryOf(led), w.jrnUnsure);
+    BoxJrnQueueFrom(id, w, w.jrn, w.jrnLatest, w.hints, w.orig, &w.askIdOf, BoxJrnCarryOf(led), w.jrnUnsure);
     BoxJrnLedDrop(w, led);   /* the change is the new writer's now: no write of this game carries its entries */
     w.chgPend = 0ULL; w.askIdOf.clear();
     coopbrec::BoxJrnClose(&w.jrn);
-    w.jrnLatestHave = 0; w.jrnLatest.clear(); w.jrnAskMix = 0; w.jrnUnsure = 0; w.hints.clear();
+    w.jrnLatestHave = 0; w.jrnLatest.clear(); w.jrnAskMix = 0; w.jrnUnsure = 0; w.hints.clear(); w.orig.clear();
 }
 /* the character side of a change (d) undone here, error-logged: a stored record is the box now and no writer takes the change */
-void BoxJrnUndoHere(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d, const std::vector<BoxJrnHintRow>& hints, unsigned int gen,
-                    const std::vector<coopbrec::BoxLedgerEntry>& led)
+void BoxJrnUndoHere(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d0, const std::vector<BoxJrnHintRow>& hints,
+                    const std::vector<coopbrec::BoxJrnLedRow>& orig, unsigned int gen, const std::vector<coopbrec::BoxLedgerEntry>& led)
 {
     BoxJrnLedDrop(w, led);   /* the change is out of the box: no write carries its entries */
+    std::vector<coopbrec::BoxJrnDelta> d(d0);
+    {   /* T-1346: a put is made again only for the units this game's characters put in, on them */
+        long long nd = 0;
+        (void)coopbrec::BoxJrnOriginSplit(&d, orig, &nd, &g_bjLedByKind);
+        BoxJrnNoOriginSay(w.key, nd, "its change a stored record replaced");
+    }
     ++g_bjRebaseUndo;
     ErrorLog("[BOXJRN] box " + w.key + ": the stored record gen=" + N((long long)gen) + " replaced this game's change not yet stored (" + N((long long)d.size())
              + " parts) - its character side is undone so one copy stays (boxJournalRebaseUndo=" + N(g_bjRebaseUndo) + ")");
@@ -57974,8 +58763,8 @@ int BoxJrnReapplyReady(BoxRecW& w, size_t n)
    refreshes an open window or shop as that apply does. 1 = laid; -1 = wait (a fill running or a swap gate holds: nothing changed, tried
    again later); 0 = cannot be laid (the box not loaded here, its contents unreadable, an item not encodable, the swap did not start):
    nothing changed in the box, and the caller undoes the change on the character (coopbrec::BoxJrnReapplyStep) */
-int BoxJrnReapply(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d, const std::vector<BoxJrnHintRow>& hints, unsigned int gen,
-                  const std::vector<coopbrec::BoxLedgerEntry>& led)
+int BoxJrnReapply(const std::string& id, BoxRecW& w, const std::vector<coopbrec::BoxJrnDelta>& d, const std::vector<BoxJrnHintRow>& hints,
+                  const std::vector<coopbrec::BoxJrnLedRow>& orig, unsigned int gen, const std::vector<coopbrec::BoxLedgerEntry>& led)
 {
     if (d.empty()) return 1;
     const int fill = (::InterlockedCompareExchange(&g_fillsActive, 0, 0) != 0) ? 1 : 0;   /* a box mid-fill is never read */
@@ -58004,6 +58793,12 @@ int BoxJrnReapply(const std::string& id, BoxRecW& w, const std::vector<coopbrec:
     if (coopbrec::BoxJrnReapplyStep(0, 1, 1, coopbrec::kSwGo, ran) == coopbrec::kRlUndo) { ++g_bjReapplyFailed; return 0; }   /* the swap did not start: nothing changed in the box */
     for (size_t k = 0; k < d.size(); ++k)
         if (putAt[k] >= 0 && putAt[k] < (int)placed.size() && placed[putAt[k]] == 0) undo.push_back(d[k]);   /* its cell is taken: back on the character */
+    const int conflicted = undo.empty() ? 0 : 1;
+    {   /* T-1346: a put in conflict is made again only for the units this game's characters put in, on them */
+        long long nd = 0;
+        (void)coopbrec::BoxJrnOriginSplit(&undo, orig, &nd, &g_bjLedByKind);
+        BoxJrnNoOriginSay(w.key, nd, "its change in conflict with a newer stored record");
+    }
     ++g_bjReapplied; g_bjReapplyParts += (long long)d.size();
     BoxJrnSay("box " + w.key + ": this game's change (" + N((long long)d.size()) + " parts) laid again on top of the stored record gen=" + N((long long)gen)
               + " as the box's writer (" + N((long long)undo.size()) + " in conflict" + std::string(sw == 1 ? ")" : "; the lay's digest differs)"));
@@ -58021,13 +58816,14 @@ int BoxJrnReapply(const std::string& id, BoxRecW& w, const std::vector<coopbrec:
     }
     for (size_t i = 0; i < led.size(); ++i)   /* the next write carries the change's ids (an earlier doubt of one stays) */
         if (coopbrec::BoxLedgerEntryHas(w.ledAdd, led[i].slot, led[i].id) == 0) (void)coopbrec::BoxLedgerEntrySet(&w.ledAdd, led[i].slot, led[i].id);
-    if (!undo.empty())
+    if (conflicted != 0)
     {   /* a part of it is not in the box: its ids no longer say all of it is - doubt */
         coopbrec::BoxLedgerEntryDoubt(&w.ledAdd, led);
         ++g_bjLedDoubted;
     }
     BoxRecMark(w.key);   /* written as the writer: the mark reads the box as it is now (the journal's latest) */
     w.hints = hints;
+    w.orig = orig;   /* T-1346: the origins of the change laid again stay with it */
     return 1;
 }
 /* the parked change once no write of it waits: decided as at the rebase (coopbrec::BoxJrnRebaseDo) with what is known now */
@@ -58040,7 +58836,7 @@ void BoxJrnParkEnd(const std::string& id, BoxRecW& w)
     if (act == coopbrec::kRbReapply && w.jrnParkUnsure != 0) g_bjUnsureDropped += coopbrec::BoxJrnUnsureParts(&d);   /* unsure: its takes stay on the character */
     if (act == coopbrec::kRbReapply)
     {
-        const int r = BoxJrnReapply(id, w, d, w.jrnParkHints, w.jrnParkGen, w.jrnParkLed);
+        const int r = BoxJrnReapply(id, w, d, w.jrnParkHints, w.jrnParkOrig, w.jrnParkGen, w.jrnParkLed);
         if (r < 0)
         {   /* a fill runs or a swap gate holds (its window open with an item on the cursor, a move unpublished, ...): the park stays and the
                tick tries again every 500 ms - said when it starts waiting and every 5 minutes it still does (boxJournalReapplyWait); a save
@@ -58055,18 +58851,18 @@ void BoxJrnParkEnd(const std::string& id, BoxRecW& w)
             }
             return;
         }
-        if (r == 0) BoxJrnUndoHere(id, w, d, w.jrnParkHints, w.jrnParkGen, w.jrnParkLed);
+        if (r == 0) BoxJrnUndoHere(id, w, d, w.jrnParkHints, w.jrnParkOrig, w.jrnParkGen, w.jrnParkLed);
     }
     ++g_bjParkEnded;
     if (act == coopbrec::kRbHandOver)
     {
         ++g_bjRebaseHandOver;
-        BoxJrnQueueFrom(id, w, w.jrnPark, w.jrnParkLatest, w.jrnParkHints, &w.jrnParkAskIdOf, BoxJrnCarryOf(w.jrnParkLed), w.jrnParkUnsure);
+        BoxJrnQueueFrom(id, w, w.jrnPark, w.jrnParkLatest, w.jrnParkHints, w.jrnParkOrig, &w.jrnParkAskIdOf, BoxJrnCarryOf(w.jrnParkLed), w.jrnParkUnsure);
         BoxJrnLedDrop(w, w.jrnParkLed);
     }
     else if (act != coopbrec::kRbReapply) BoxJrnSay("box " + w.key + ": the change kept while its writes waited is stored or held by the record - nothing to ask");
     w.jrnParkGateAt = 0;
-    w.jrnParked = 0; w.jrnParkUnsure = 0; w.jrnPark = coopbrec::BoxJrnState(); w.jrnParkLatest.clear(); w.jrnParkRecord.clear(); w.jrnParkHints.clear();
+    w.jrnParked = 0; w.jrnParkUnsure = 0; w.jrnPark = coopbrec::BoxJrnState(); w.jrnParkLatest.clear(); w.jrnParkRecord.clear(); w.jrnParkHints.clear(); w.jrnParkOrig.clear();
     w.jrnParkPend = 0ULL; w.jrnParkLed.clear(); w.jrnParkAskIdOf.clear();
 }
 /* the saveGame / saveLevelData pre-hooks (store.cpp), before anything is serialised: a parked change that waits only for the box's swap
@@ -58091,9 +58887,9 @@ void ItemsBoxJrnBeforeSave(int onMainThread)
         ++g_bjParkSaveUndo; ++g_bjParkEnded;
         ErrorLog("[BOXJRN] box " + w.key + ": a save is written while this game's change still waits to be laid again on top of the stored record gen="
                  + N((long long)w.jrnParkGen) + " - undone on the character first (boxJournalParkSaveUndo=" + N(g_bjParkSaveUndo) + ")");
-        BoxJrnUndoHere(it->first, w, d, w.jrnParkHints, w.jrnParkGen, w.jrnParkLed);
+        BoxJrnUndoHere(it->first, w, d, w.jrnParkHints, w.jrnParkOrig, w.jrnParkGen, w.jrnParkLed);
         w.jrnParkGateAt = 0;
-        w.jrnParked = 0; w.jrnParkUnsure = 0; w.jrnPark = coopbrec::BoxJrnState(); w.jrnParkLatest.clear(); w.jrnParkRecord.clear(); w.jrnParkHints.clear();
+        w.jrnParked = 0; w.jrnParkUnsure = 0; w.jrnPark = coopbrec::BoxJrnState(); w.jrnParkLatest.clear(); w.jrnParkRecord.clear(); w.jrnParkHints.clear(); w.jrnParkOrig.clear();
         w.jrnParkPend = 0ULL; w.jrnParkLed.clear(); w.jrnParkAskIdOf.clear();
     }
 }
@@ -58159,9 +58955,26 @@ unsigned int BoxOwedUid(const std::string& where)
 }
 /* one row into the save's rows, named by the characters that took part; none can be named - not written (an undo never goes to another
    character), counted and logged. 1 = written */
+/* T-1346: a row's parts' origins named by their save-stable ids (one read now when not yet), and those ids among the row's characters */
+void BoxOwedWhoAddFrom(std::vector<coopbrec::BoxJrnDelta>* d, std::vector<coopbrec::BoxOwedWho>* who)
+{
+    for (size_t k = 0; k < d->size(); ++k)
+        for (size_t f = 0; f < (*d)[k].from.size(); ++f)
+        {
+            coopbrec::BoxJrnFrom& o = (*d)[k].from[f];
+            if (o.where.empty()) o.where = BoxOwedWhere(o.uid);
+            if (o.where.empty() || who->size() >= coopbrec::kBoxOwedMaxWho) continue;
+            int dup = 0;
+            for (size_t j = 0; j < who->size(); ++j) if ((*who)[j].where == o.where) dup = 1;
+            if (dup == 0) { coopbrec::BoxOwedWho w; w.where = o.where; w.section = o.section; who->push_back(w); }
+        }
+}
 int BoxOwedRowPush(std::vector<coopbrec::BoxOwedRow>* rows, coopbrec::BoxOwedRow& r, const std::vector<BoxJrnHintRow>& hints, const char* what)
 {
     BoxOwedWhoOf(hints, &r.who);
+    if (r.who.size() > coopbrec::kBoxOwedMaxWho) r.who.resize(coopbrec::kBoxOwedMaxWho);
+    BoxOwedWhoAddFrom(&r.ifNone, &r.who);   /* T-1346: the characters a put came from name the row too */
+    for (size_t g = 0; g < r.ifStored.size(); ++g) BoxOwedWhoAddFrom(&r.ifStored[g], &r.who);
     if (r.who.empty())
     {
         ++g_bjOwedNoWho;
@@ -58189,7 +59002,7 @@ std::string BoxOwedSnapshot()
             coopbrec::BoxOwedRow r;
             if (act != coopbrec::kRbNone && coopbrec::BoxOwedParkRow(act, coopbrec::BoxJrnWaiting(w.jrnPark)) != 0)
             {
-                if (coopbrec::BoxOwedFromPark(w.jrnPark, w.jrnParkLatest, w.jrnParkPend, &r) == 0)
+                if (coopbrec::BoxOwedFromPark(w.jrnPark, w.jrnParkLatest, w.jrnParkPend, &r, &w.jrnParkOrig) == 0)
                 {
                     ++g_bjOwedSnapSkipped;
                     ErrorLog("[BOXJRN] box " + w.key + ": a save is written while this game's change is parked, and the change cannot be read as a row beside"
@@ -58219,7 +59032,7 @@ std::string BoxOwedSnapshot()
             unsigned long long pend = (w.jrnLatestHave != 0) ? coopbrec::BoxSealMatch(w.seals, w.jrnLatest, keptLed, kl, StoreMySlot(), w.ledAdd) : 0ULL;
             const int sealNow = (pend == 0ULL && w.chgPend != 0ULL) ? 1 : 0;
             if (sealNow != 0) pend = w.chgPend;
-            if (coopbrec::BoxOwedFromJournal(w.jrn, w.jrnLatestHave, w.jrnLatest, pend, &r) != 0)
+            if (coopbrec::BoxOwedFromJournal(w.jrn, w.jrnLatestHave, w.jrnLatest, pend, &r, &w.orig) != 0)
             {
                 if (sealNow != 0) { BoxSealKeep(w, pend, w.jrnLatest); w.chgPend = 0ULL; }
                 r.id = it->first; r.key = w.key;
@@ -58265,6 +59078,20 @@ std::string BoxOwedSnapshot()
     for (size_t i = 0; i < g_bjOwed.size(); ++i) if (g_bjOwed[i].gen == world) rows.push_back(g_bjOwed[i].r);
     if (coopbrec::BoxOwedArmBound(g_bjOwedArm, world) != 0) rows.insert(rows.end(), g_bjOwedNext.begin(), g_bjOwedNext.end());
     if (rows.empty()) return std::string();
+    {   /* review LOW: a put's origins over the file's cap - one character's summed, the oldest past it left out (counted, logged), never the file */
+        long long cut = 0;
+        for (size_t i = 0; i < rows.size(); ++i)
+        {
+            cut += coopbrec::BoxJrnFromCap(&rows[i].ifNone, coopbrec::kBoxOwedMaxWho);
+            for (size_t g = 0; g < rows[i].ifStored.size(); ++g) cut += coopbrec::BoxJrnFromCap(&rows[i].ifStored[g], coopbrec::kBoxOwedMaxWho);
+        }
+        if (cut > 0)
+        {
+            g_bjFromCapped += cut;
+            ErrorLog("[BOXJRN] the save's box changes: a put came from more than " + N((long long)coopbrec::kBoxOwedMaxWho) + " characters - " + N(cut)
+                     + " units of its oldest origins are left out of the file beside the save (boxOwedFromCapped=" + N(g_bjFromCapped) + ")");
+        }
+    }
     std::vector<char> b;
     if (!coopbrec::EncodeBoxOwed(rows, &b) || b.empty())
     {
@@ -58366,10 +59193,38 @@ int BoxOwedSettle(BoxOwedLive& l, DWORD now)
                  + " characters of this game and none is here - left as it is, never undone on another character (boxOwedDropped=" + N(g_bjOwedDropped) + ")");
         return 1;
     }
+    if (l.r.oldForm != 0)
+    {   /* T-1346 (manager ruling 1, 2026-11-14): a format-2 save's row - its puts have no origins: the who rule once, counted */
+        ++g_bjOwedOldFormat;
+        BoxJrnSay("box " + l.r.key + ": the loaded save's change is of the format before origins - its puts are made again by the characters that took part,"
+                  " once (boxOwedOldFormat=" + N(g_bjOwedOldFormat) + ")");
+    }
     long long undone = 0, unsure = 0, stored = 0;
     for (size_t k = 0; k < left.size(); ++k)
     {
         if (how[k] == coopbrec::kOpStored) { ++stored; continue; }
+        if (left[k].dir == coopbrec::kBjPut && l.r.oldForm == 0)
+        {   /* T-1346: each origin of a put by its save-stable id; one not loaded after the row's wait is dropped, counted, never another's */
+            std::vector<coopbrec::BoxJrnFrom> fm;
+            int q = 0;
+            for (size_t f = 0; f < left[k].from.size(); ++f)
+            {
+                coopbrec::BoxJrnFrom o = left[k].from[f];
+                o.uid = o.where.empty() ? 0u : BoxOwedUid(o.where);   /* review M1: 0 = not loaded yet - kept by its where, mapped at the remake */
+                if (o.where.empty() || (o.uid != 0 && !net::IsUidMine(o.uid)))
+                {
+                    g_bjOwedOriginDropped += (long long)o.units;
+                    ErrorLog("[BOXJRN] box " + l.r.key + ": " + N((long long)o.units) + " '" + left[k].row.baseSid + "' of the loaded save's put came from a"
+                             " character with no save id, or not this game's - dropped, never made on another (boxOwedOriginDropped=" + N(g_bjOwedOriginDropped) + ")");
+                    continue;
+                }
+                q += o.units;
+                fm.push_back(o);
+            }
+            left[k].from = fm;
+            left[k].quantity = q;
+            if (q <= 0) continue;   /* review LOW: every origin dropped - nothing to make again (not "made in the box") */
+        }
         const int act = coopbrec::BoxOwedAct(left[k].dir, how[k]);
         if (how[k] == coopbrec::kOpUnsure)
         {
@@ -58382,6 +59237,7 @@ int BoxOwedSettle(BoxOwedLive& l, DWORD now)
         row.q.d = left[k]; row.q.hints = hints;
         row.hints = hints; row.id = l.r.id; row.key = l.r.key;
         row.boxPos[0] = l.r.pos[0]; row.boxPos[1] = l.r.pos[1]; row.boxPos[2] = l.r.pos[2];
+        row.whoRule = (l.r.oldForm != 0) ? 1 : 0;
         BoxJrnDo(row, 0, act, how[k] == coopbrec::kOpUndo ? "the loaded save's box change its stored record does not hold"
                                                           : "the loaded save's box put its stored record cannot show either way - made again (at worst a copy too many)");
     }
@@ -58478,7 +59334,7 @@ void BoxJrnPermRefused(const std::string& id, BoxRecW& w, int reason)
     }
     ++g_bjPermDrop;
     BoxJrnDropSay("box " + w.key + ": its writes are refused for good (reason " + N((long long)reason) + ") (boxJournalPermDrop=" + N(g_bjPermDrop) + ")");
-    w.jrnLatestHave = 0; w.jrnLatest.clear(); w.jrnAskMix = 0; w.jrnUnsure = 0; w.hints.clear();
+    w.jrnLatestHave = 0; w.jrnLatest.clear(); w.jrnAskMix = 0; w.jrnUnsure = 0; w.hints.clear(); w.orig.clear();   /* review LOW: the ledger with the hints */
     coopbrec::BoxJrnClose(&w.jrn);
 }
 /* MAIN THREAD (BoxRecTick, its first step): the queued asks of each box handed over are sent while the request table has room */
@@ -58576,6 +59432,9 @@ std::string BoxJrnReport()
          + "," + N(g_bjOwedBad) + "," + N(g_bjOwedDisarmed) + "," + N(g_bjOwedAsks) + "," + N(g_bjOwedHeld) + "," + N(g_bjOwedUndone) + "," + N(g_bjOwedParts) + ","
          + N(g_bjOwedKept) + "," + N(g_bjOwedDropped) + "," + N((long long)g_bjOwed.size())
          + " boxOwedSettle[unsure,unsureRemade,recordLate]=" + N(g_bjOwedUnsure) + "," + N(g_bjOwedUnsureRemade) + "," + N(g_bjOwedRecLate)
+         + " boxJournalOrigin[rows,unresolved,capped,putNoOrigin,remakeNoOrigin,owedOldFormat,owedOriginDropped,bjRefused,combined,byKind,fromCapped]=" + N(g_bjLedRows) + ","
+         + N(g_bjLedUnresolved) + "," + N(g_bjLedCapped) + "," + N(g_bjPutNoOrigin) + "," + N(g_bjRemakeNoOrigin) + "," + N(g_bjOwedOldFormat) + ","
+         + N(g_bjOwedOriginDropped) + "," + N(g_bjRefuseFired) + "," + N(g_bjLedCombined) + "," + N(g_bjLedByKind) + "," + N(g_bjFromCapped)
          + " boxLedger[writes,freshLines,served,unserved,carried,doubted,noSlot]=" + N(g_bjLedWrites) + "," + N(g_bjLedFresh) + "," + N(g_bjLedServed) + ","
          + N(g_bjLedUnserved) + "," + N(g_bjLedCarried) + "," + N(g_bjLedDoubted) + "," + N(g_bjLedNoSlot)
          + " boxSeal[sealed,gone]=" + N(g_bjSealed) + "," + N(g_bjSealGone) + " boxJournalReread=" + N(g_bjGuardReread) + " boxJournalUnsure[marked,dropped]=" + N(g_bjUnsureMarked) + "," + N(g_bjUnsureDropped)
@@ -63379,4 +64238,1174 @@ std::string JobTargetWords(unsigned int uid, double x, double y, double z) { ret
 int ObjRecordNamePod(const void* obj, char* out, int cap) { return JobObjNamePod(obj, out, cap); }
 /* T-1228: is a money trade window open now (items.h) - ItTradeWindowSide, the engine's InventoryGUI::isTradingForMoney_static */
 int TradeWindowSideNow(void** side) { return ItTradeWindowSide(side); }
+}   /* namespace coop */
+
+// ===================== T-1167 piece 2: the TRADE window's own-items list (tradewin.cpp) =====================
+namespace {
+/* T-1167 piece 2 fold 1 (review MEDIUM 1): THE ENGINE'S OWN NAME FOR AN ITEM. RootObjectBase's name getter is vtable slot +0x08
+   (1.0.65 0x0D3CA0, the address table's RootObjectBase_getShownName row; 1.0.68 0x0D3CE0): it copies the object's own name string at
+   +0x18 (gamelayout RootObjectBase_shownName) and nothing else, and Item, Weapon and Armour all keep it in that slot (their vtables
+   0x170CD78 / 0x1722B78 / 0x17233F8 read 2026-11-14; Read). So the string at +0x18 is the name the engine itself gives the item; it
+   is read here directly (crash-guarded), as NoticeCharPod reads a character's. 1 read, 0 empty / too long / unreadable. */
+int ItTradeShownNamePod(const void* item, char* out, int cap)
+{
+    out[0] = 0;
+    if (item == 0) return 0;
+    __try
+    {
+        const std::string* s = (const std::string*)((const char*)item + gamelayout::RootObjectBase_shownName);
+        const char* np = s->c_str(); const size_t nl = s->size();
+        if (np == 0 || nl == 0 || nl >= (size_t)cap) return 0;
+        std::memcpy(out, np, nl); out[nl] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+}   /* namespace */
+namespace coop {
+namespace {
+/* T-1167 piece 3 build 4: ONE item's row - its thing (its record key = base string id, its maker / material / colour records -
+   ItSidOf, "" for none - its quality's and charges' float bits and its unique flag: tradewire.h Item), the engine's own name for it
+   (ItTradeShownNamePod; its record's name, NoticeItemNamePod, when that does not read) and its count. ItemsTradeRows' rows and the
+   drag's cursor item (ItemsTradeCursor) are read by this one function. 1 read; 0 a research copy the other games were never told of
+   (left out, as the digests leave it out) or a field that does not read. */
+int ItTradeRowOf(void* item, TradeInvRow* out)
+{
+    if (ItLootUnpublished(item) != 0) return 0;
+    char base[kSidCap]; base[0] = 0;
+    char name[160]; name[0] = 0;
+    char co[kSidCap], mat[kSidCap], col[kSidCap];
+    int q = 0, un = 0;
+    float ql = 0.0f, ch = 0.0f;
+    if (!ItPlaus(item) || ItBaseSidPod(item, base, kSidCap) == 0 || base[0] == 0 || ItIntPod(item, kItemQuantity, &q) == 0
+        || ItFloatPod(item, kItemQuality, &ql) == 0 || ItFloatPod(item, kItemCharges, &ch) == 0 || ItBytePod(item, kItemUnique, &un) == 0) return 0;
+    ItSidOf(item, kItemManu, co, kSidCap); ItSidOf(item, kItemMaterial, mat, kSidCap); ItSidOf(item, kItemColorise, col, kSidCap);
+    if (ItTradeShownNamePod(item, name, (int)sizeof name) != 1 && NoticeItemNamePod(item, name, (int)sizeof name) != 1) std::strcpy(name, base);
+    TradeInvRow r; r.key = base; r.company = co; r.material = mat; r.colour = col; std::memcpy(&r.q, &ql, sizeof r.q);
+    std::memcpy(&r.charges, &ch, sizeof r.charges); r.unique = un != 0 ? 1u : 0u;   /* fold 2: charges and unique, as SameDesc */
+    r.name = name; r.qty = q > 0 ? q : 1;
+    ItemLinkFacts f;   /* T-1167 v3: the grade facts (chat-link's read): the type, the level, the weapon's model */
+    f.name[0] = 0; f.model[0] = 0; f.sid[0] = 0; f.type = -1; f.level = 0; f.artifact = 0;
+    if (ClkItemFacts(item, &f) == kLinkFound) { r.type = f.type; r.level = f.level; r.model = f.model; }
+    *out = r;
+    return 1;
+}
+/* T-1167 (owner's hands-on 2026-11-17): the packs `inv` holds - every top-level item of its sections (a worn backpack's slot is one of
+   them) that has its own inventory (ItBagInvPod: the pack's inventory names the pack as its owner). packs[i] the pack, invs[i] its
+   inventory. One level, as ItBagRowsOf (no pack inside a pack). */
+void ItTrPacksOf(::Inventory* inv, std::vector<void*>* packs, std::vector<const void*>* invs)
+{
+    packs->clear(); invs->clear();
+    if (!ItObj(inv)) return;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size() && packs->size() < 16; ++k)
+        {
+            void* bag = 0;
+            if (ItBagInvPod((void*)si[k].item, &bag) == 1 && ItObj((::Inventory*)bag)) { packs->push_back((void*)si[k].item); invs->push_back(bag); }
+        }
+    }
+}
+/* 1 = `item` sits in one of `inv`'s own sections (top level) */
+int ItTrHasTop(::Inventory* inv, const void* item)
+{
+    if (!ItObj(inv) || item == 0) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size(); ++k) if ((const void*)si[k].item == item) return 1;
+    }
+    return 0;
+}
+/* where `item` is now: the character's inventory `inv` itself (*pack 0), or the inventory of a pack `inv` holds (*pack that pack);
+   0 = in neither */
+::Inventory* ItTrHolder(::Inventory* inv, const void* item, void** pack)
+{
+    *pack = 0;
+    if (ItTrHasTop(inv, item) == 1) return inv;
+    std::vector<void*> packs; std::vector<const void*> invs;
+    ItTrPacksOf(inv, &packs, &invs);
+    for (size_t i = 0; i < invs.size(); ++i)
+        if (ItTrHasTop((::Inventory*)invs[i], item) == 1) { *pack = packs[i]; return (::Inventory*)invs[i]; }
+    return 0;
+}
+/* one inventory's items into rows / items (each section, in its order). 1 read, 0 a section map that does not read. */
+int ItTrRowsIn(::Inventory* inv, std::vector<TradeInvRow>* rows, std::vector<void*>* items)
+{
+    if (!ItObj(inv)) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size() && rows->size() < 512; ++k)
+        {
+            void* item = (void*)si[k].item;
+            TradeInvRow r;
+            if (ItTradeRowOf(item, &r) != 1) continue;   /* T-1167 piece 3 build 4: one item's row, the drag's own read */
+            rows->push_back(r);
+            if (items != 0) items->push_back(item);   /* T-1167 piece 3: the lock lifts exactly this object */
+        }
+    }
+    return 1;
+}
+}   /* namespace */
+/* MAIN THREAD. The character's top-level items (every section of its own inventory - SnapInvRows' depth-0 walk, the same trust), then
+   (T-1167, owner's hands-on 2026-11-17) the items inside each pack it carries (a worn backpack, a pack among its items: ItTrPacksOf) -
+   an offer from a pack's window is kept, re-checked and lifted by the same object list: each item's thing (its record key = base string id, its maker / material / colour records - ItSidOf, "" for
+   none - its quality's and charges' float bits and its unique flag: tradewire.h Item), the engine's own name for it (ItTradeShownNamePod; its record's name,
+   NoticeItemNamePod, when that does not read) and its count, one row per stack, in the inventory's order. A research copy the
+   other games were never told of is left out, as the digests leave it out. 1 = read (rows may be empty), 0 = no inventory or a
+   section map that does not read. */
+int ItemsTradeRows(void* character, std::vector<TradeInvRow>* rows, std::vector<void*>* items)
+{
+    rows->clear();
+    if (items != 0) items->clear();
+    ::Inventory* inv = ItInventoryOf((::Character*)character);
+    if (!ItObj(inv)) return 0;
+    if (ItTrRowsIn(inv, rows, items) != 1) return 0;
+    std::vector<void*> packs; std::vector<const void*> pinvs;   /* T-1167 2026-11-17: then each carried pack's items */
+    ItTrPacksOf(inv, &packs, &pinvs);
+    for (size_t p = 0; p < pinvs.size(); ++p) ItTrRowsIn((::Inventory*)pinvs[p], rows, items);
+    return 1;
+}
+}   /* namespace coop */
+
+// ===================== T-1167 piece 3 build 2: THE TRADE LOCK'S ENGINE WORK (tradewin.cpp's lock; tradewin.h says each call) =====================
+#include "../common/tradewire.h"   /* kMaxBody: one object's bytes on LOCKED */
+namespace coop {
+namespace {
+long long g_trLifts = 0, g_trLiftFail = 0, g_trPutBack = 0, g_trAtFeet = 0, g_trPutLost = 0, g_trLinesWritten = 0, g_trLinesFail = 0, g_trLinesClosed = 0;
+/* T-1167 2026-11-17: a lifted object that came out of a pack the character carries -> that pack (the give-back puts it there again) */
+std::map<const void*, const void*> g_trPackOf;
+long long g_trPackLifts = 0, g_trPackBack = 0;
+/* a lifted object's bytes in the confirm body's shape (HovItemBytes - the shape every hand-over line keeps and HovDecode reads back):
+   the 0x2A fields, its count, the owner mark, the gear marks and, for a pack, its rows. 1 made; 0 a field, the count or a pack's rows
+   could not be read (the lock refuses: a body that loses a field is never sent). */
+int ItTradeBodyOf(void* obj, std::string* body)
+{
+    ItEntry e; ItClear(&e);
+    if (ItReadFields(obj, &e) != 1) return 0;
+    int q = 0;
+    if (ItIntPod(obj, kItemQuantity, &q) == 0 || q < 1) return 0;
+    ItemConfirmMsg cf;
+    cf.ok = 1; cf.quantity = q;
+    cf.baseSid = e.baseSid; cf.companySid = e.companySid; cf.materialSid = e.materialSid; cf.colorSid = e.colorSid;
+    cf.quality = e.quality; cf.charges = e.charges; cf.functionKind = e.functionKind; cf.level = e.level; cf.unique = e.unique;
+    ItOwnerTranslate(e.ownerRaw, e.ownerHave, &cf.owner);
+    ItGearOf(e, &cf.gear);
+    int why = 0;
+    if (ItBagRowsOf(obj, &cf.bag, &why) < 0) return 0;
+    return HovItemBytes(cf, body);
+}
+}   /* namespace */
+
+/* T-1167 piece 3 fold 1 (review p3a M2): the square `item` sits on in the inventory's own sections (top level only - inside a pack it is
+   not told), its section's name and its stack now. 1 found. */
+int ItTrSquareOf(::Inventory* inv, void* item, hovrec::TradeSquare* sq)
+{
+    *sq = hovrec::TradeSquare();
+    if (!ItObj(inv) || item == 0) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            if ((void*)si[k].item != item) continue;
+            char nm[kSecCap]; nm[0] = 0;
+            if (ItStrPod(&it->first, nm, kSecCap) == 0 || nm[0] == 0) return 0;
+            sq->has = 1; sq->sec = nm; sq->x = (int)si[k].x; sq->y = (int)si[k].y;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int ItemsTradeLift(void* character, void* item, int units, int whole, void** obj, std::string* body, hovrec::TradeSquare* from)
+{
+    *obj = 0; body->clear();
+    if (from != 0) *from = hovrec::TradeSquare();
+    ::Inventory* inv = ItInventoryOf((::Character*)character);
+    int q = 0;
+    void* pack = 0;
+    /* T-1167 2026-11-17: where the object is NOW - the character's own sections or a pack it carries (the live re-check: not there, nothing lifted) */
+    ::Inventory* hold = ItObj(inv) ? ItTrHolder(inv, item, &pack) : 0;
+    if (!ItObj(inv) || hold == 0 || !ItPlaus(item) || units < 1 || ItIntPod(item, kItemQuantity, &q) == 0 || q < units) return 0;
+    const int part = (whole == 0 && units < q) ? 1 : 0;
+    if (from != 0 && ItTrSquareOf(hold, item, from) == 1)   /* fold 1: the lift's square, read before it (pack fold: in the inventory that holds it) */
+    {
+        from->before = q; from->after = part != 0 ? q - units : 0;
+        if (pack != 0)
+        {   /* pack fold (review 2026-11-17): inside a carried pack - the pack's own square in the character, else no square at all */
+            hovrec::TradeSquare ps;
+            if (ItTrSquareOf(inv, pack, &ps) == 1) { from->bagHas = 1; from->bagSec = ps.sec; from->bagX = ps.x; from->bagY = ps.y; }
+            else *from = hovrec::TradeSquare();
+        }
+    }
+    /* the shop's lift (ItShowLiftPod): takeItemOut 0x749E10 - the whole arm takes the object itself (hook B publishes the remove), the
+       split arm a new object with the units (hook D publishes the split); not behind the guard, so the loss is published as a give's */
+    void* got = ItShowLiftPod(hold, item, 0, part != 0 ? units : -1);
+    if (got == 0) { ++g_trLiftFail; return 0; }
+    *obj = got;
+    ++g_trLifts;
+    if (pack != 0) { g_trPackOf[got] = pack; ++g_trPackLifts; } else g_trPackOf.erase(got);   /* a give-back puts it into that pack again */
+    int gq = 0;
+    if ((part != 0 && got == item) || ItIntPod(got, kItemQuantity, &gq) == 0 || gq != units) { ++g_trLiftFail; return -1; }
+    if (ItTradeBodyOf(got, body) != 1 || body->empty() || body->size() > tradew::kMaxBody) { ++g_trLiftFail; return -1; }
+    return 1;
+}
+
+int ItemsTradePutBack(void* character, void* obj)
+{
+    if (obj == 0) return 0;
+    ::Inventory* inv = character != 0 ? ItInventoryOf((::Character*)character) : 0;
+    std::map<const void*, const void*>::iterator pk = g_trPackOf.find(obj);
+    if (pk != g_trPackOf.end())
+    {   /* T-1167 2026-11-17: lifted out of a pack - back into that pack while the character still carries it, else into the character */
+        const void* pack = pk->second;
+        g_trPackOf.erase(pk);
+        std::vector<void*> packs; std::vector<const void*> pinvs;
+        if (ItObj(inv)) ItTrPacksOf(inv, &packs, &pinvs);
+        for (size_t i = 0; i < packs.size(); ++i)
+        {
+            if (packs[i] != pack) continue;
+            int pplaced = 0;
+            if (ItAddAnywhereCount((::Inventory*)pinvs[i], obj, &pplaced) == 1) { ++g_trPutBack; ++g_trPackBack; return 1; }
+            break;   /* what did not fit the pack goes into the character below */
+        }
+    }
+    if (ItObj(inv))
+    {
+        int placed = 0;
+        const int a = ItAddAnywhereCount(inv, obj, &placed);   /* not behind the guard: the add is published */
+        if (a == 1) { ++g_trPutBack; return 1; }
+        if (a == 0 || a == -2)
+        {   /* no room (the object keeps what did not fit): at the character's feet, through the inventory's own drop (the ground road) */
+            if (ItShowDropAtFeetPod((void*)inv, obj) == 1)
+            {
+                ++g_trAtFeet;
+                DebugLog("[TRADE] a lifted object did not fit back into the character - " + N((long long)placed) + " unit(s) went in, the rest is at its feet (atFeet " + N(g_trAtFeet) + ")");
+                return 2;
+            }
+        }
+    }
+    ++g_trPutLost;
+    ErrorLog("[TRADE] a lifted object could not be put back into the character nor at its feet - it stays in no inventory (putLost " + N(g_trPutLost) + ")");
+    return 0;
+}
+
+int ItemsTradeLinesWrite(unsigned long long tradeId, int otherSlot, void* character, const std::vector<std::string>& bodies, std::string* why,
+                         const std::vector<hovrec::TradeSquare>& squares)
+{
+    why->clear();
+    if (!coop::OwnWriterOn()) { *why = "records-writer-off"; return 0; }   /* fold 1 (review p3a L1): no receiving line could be kept - the lock refuses */
+    if (tradeId == 0 || otherSlot < 0 || !ItObj((::Character*)character)) { *why = "bad-call"; return 0; }
+    const std::string where = HovCharWhereOf((::Character*)character);
+    if (where == hovrec::CharWhereUnknown()) { *why = "character-id-unread"; return 0; }   /* a line naming no character never resolves after a reload */
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) { *why = "file-unreadable"; ++g_trLinesFail; return 0; }
+    const unsigned int n = hovrec::HandTradeNextId(lines);
+    if (n == 0 || (unsigned long long)n + (unsigned long long)bodies.size() + 1ULL > 0xFFFFFFFFULL) { *why = "no-key-left"; ++g_trLinesFail; return 0; }
+    std::string sk;
+    if (coop::OwnSquadKeyOfCharNow(character, &sk) == 0) sk.clear();
+    const unsigned long long eh = coop::OwnSeqReserve();   /* E_h, right after the lift: a record of the squad at or past it lacks the objects */
+    const long long now = (long long)std::time(0);
+    std::vector<hovrec::HandLine> add;
+    for (size_t i = 0; i < bodies.size(); ++i)
+    {
+        add.push_back(hovrec::HandTradeLine(tradeId, (unsigned int)i, n + (unsigned int)i, otherSlot, now, where, sk, eh, bodies[i]));
+        if (i < squares.size() && squares[i].has != 0)
+        {   /* fold 1 (review p3a M2): the square it was lifted from, its stack before and after - the after-reload look is there only */
+            add.back().section = hovrec::TradeSectionAt(tradeId, (unsigned int)i, squares[i]); add.back().x = squares[i].x; add.back().y = squares[i].y;
+            if (squares[i].bagHas != 0) { add.back().bagHas = 1; add.back().bagSection = squares[i].bagSec; add.back().bagX = squares[i].bagX; add.back().bagY = squares[i].bagY; }   /* pack fold: the pack's square */
+        }
+    }
+    /* build 3: the RECEIVING line (handrec.h HandTradeRecvLine) - the character COMMIT builds into, and the durable "applied" mark */
+    add.push_back(hovrec::HandTradeRecvLine(tradeId, n + (unsigned int)bodies.size(), otherSlot, now, where, sk));
+    const int a = hovrec::HandTradeAddAll(&lines, add, hovrec::kHandCap);
+    if (a != 1) { *why = a < 0 ? "cap-full" : "line-would-not-format"; ++g_trLinesFail; return 0; }
+    if (HovSave(lines) == 0) { *why = "file-unwritable"; ++g_trLinesFail; return 0; }   /* OwnTextReplace: temp file, flush, rename - on disk when it returns */
+    for (size_t i = 0; i < add.size(); ++i) g_hovLive[HovKey(hovrec::kHandTradeSlot, add[i].reqId, hovrec::kHandTradeSlot, hovrec::kRoleSrc)] = coop::OwnLoadGen();
+    g_trLinesWritten += (long long)add.size();
+    DebugLog("[TRADE] trade " + tradew::N(tradeId) + ": " + N((long long)add.size()) + " line(s) (" + N((long long)bodies.size()) + " held, 1 receiving) written to pp.handover in one write (keys "
+             + N((long long)hovrec::kHandTradeSlot) + "/" + N((long long)n) + ".." + N((long long)(n + (unsigned int)add.size() - 1)) + ", E_h " + N((long long)eh) + "; written " + N(g_trLinesWritten) + ")");
+    return 1;
+}
+
+int ItemsTradeLinesClose(unsigned long long tradeId, int* closed)
+{
+    *closed = 0;
+    if (!coop::OwnWriterOn()) return 1;   /* no lines are kept (none were written: the lock refuses with the writer off) */
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) { ++g_trLinesFail; return 0; }
+    const int n = hovrec::HandTradeCloseAll(&lines, tradeId);
+    if (n == 0) return 1;
+    if (HovSave(lines) == 0) { ++g_trLinesFail; return 0; }
+    *closed = n;
+    g_trLinesClosed += n;
+    return 1;
+}
+
+int ItemsTradeLinesOpen(unsigned long long tradeId)
+{
+    if (!coop::OwnWriterOn()) return 0;
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return -1;
+    const std::vector<size_t> at = hovrec::HandTradeLinesOf(lines, tradeId);
+    int n = 0;
+    for (size_t k = 0; k < at.size(); ++k) { hovrec::HandLine l; if (hovrec::HandLineParse(lines[at[k]], &l) != 0 && hovrec::IsOpen(l.state) != 0) ++n; }
+    return n;
+}
+}   /* namespace coop */
+
+// ===================== T-1167 piece 3 build 3: COMMIT APPLIED, THE ROOM CHECK, THE ROAD AFTER A RELOAD (tradewin.h says each call) =====================
+#include "../common/tradelock.h"   /* NoRoomRows */
+namespace coop {
+namespace {
+long long g_trBuilt = 0, g_trBuiltFeet = 0, g_trBuildFail = 0, g_trDestroyed = 0, g_trRoomFits = 0, g_trRoomNo = 0, g_trRoomUnread = 0, g_trSettled = 0, g_trSettleWait = 0;
+/* a held line's engine step (a copy removed, an object rebuilt) done in this load: its rewrite is tried again without redoing it */
+std::map<std::string, std::pair<long, int> > g_trActed;
+/* the object an ITEM_CONFIRM body names, as ItOwnerGive makes one: created with its fields, its pack rows filled, its owner mark - in
+   no inventory. No std::string here (C2712): the caller decoded the body. 1 made (*out), 0 not (nothing left behind). */
+static int ItTradeCreatePod(::Character* c, const ItemMoveMsg* m, const std::vector<coopbag::BagRow>* bag, int packAfter, ::Item** out)
+{
+    *out = 0;
+    __try
+    {
+        ::Item* item = ItCreateItem(c, *m, 1, packAfter);
+        if (item == 0) return 0;
+        if (bag != 0 && ItBagFill(item, bag, c, 0) == 0)
+        {
+            ItOwnParkForget(item);
+            if (coop::GameWorldPtr() != 0) coop::GameWorldPtr()->destroy(item, false, "coop T-1167 trade: a pack row could not be placed in the new pack");
+            return 0;
+        }
+        if (packAfter != 0) ItOwnerApply(item, *m);
+        *out = item;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the body's fields as a move message (HovRebuild's own copy of every field: quality, charges, maker, material, colour, owner, gear) */
+int ItTradeMsgOf(const std::string& body, ItemConfirmMsg* cf, ItemMoveMsg* mm)
+{
+    std::vector<char> b(body.begin(), body.end());
+    if (b.empty() || !net::DecodeItemConfirmBody(b, cf) || cf->ok == 0 || cf->baseSid.empty()) return 0;
+    mm->baseSid = cf->baseSid; mm->companySid = cf->companySid; mm->materialSid = cf->materialSid; mm->colorSid = cf->colorSid;
+    mm->quality = cf->quality; mm->charges = cf->charges; mm->functionKind = cf->functionKind; mm->level = cf->level; mm->unique = cf->unique;
+    mm->quantity = (cf->quantity > 0) ? cf->quantity : 1; mm->owner = cf->owner; mm->gear = cf->gear;
+    return 1;
+}
+/* the engine's cell test for `item` at every square of `sec` (ItCellRefusedAt: non-zero = refused now) */
+static int ItTradeGridPod(::InventorySection* sec, ::Item* item, int sw, int sh, unsigned char* out)
+{
+    __try
+    {
+        ItCellCtx ctx; ctx.sec = sec; ctx.item = item;
+        for (int y = 0; y < sh; ++y) for (int x = 0; x < sw; ++x) out[y * sw + x] = ItCellRefusedAt(&ctx, x, y) != 0 ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+}   /* namespace */
+
+/* fold 1 (review p3a M2): every top-level section's stacks of the body's item, before or after an add (HovSecSnap); 0 = one could not be read */
+int ItTrSnapAll(::Inventory* inv, const ItemConfirmMsg& cf, std::vector<std::string>* names, std::vector<std::vector<hovrec::PlStack> >* snaps)
+{
+    names->clear(); snaps->clear();
+    if (!ItObj(inv)) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        char nm[kSecCap]; nm[0] = 0;
+        if (!ItObj(it->second) || ItStrPod(&it->first, nm, kSecCap) == 0 || nm[0] == 0) return 0;
+        std::vector<hovrec::PlStack> v;
+        if (HovSecSnap(it->second, cf, &v) == 0) return 0;
+        names->push_back(nm); snaps->push_back(v);
+    }
+    return 1;
+}
+bool ItTrSameSnap(const std::vector<hovrec::PlStack>& a, const std::vector<hovrec::PlStack>& b)
+{
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) if (a[i].id != b[i].id || a[i].x != b[i].x || a[i].y != b[i].y || a[i].qty != b[i].qty) return false;
+    return true;
+}
+int ItemsTradeBodyDecodes(const std::string& body)
+{
+    ItemConfirmMsg cf; ItemMoveMsg mm;
+    return ItTradeMsgOf(body, &cf, &mm);
+}
+
+int ItemsTradeBuild(void* character, const std::string& body, hovrec::TradeSquare* where)
+{
+    if (where != 0) *where = hovrec::TradeSquare();
+    ::Character* c = (::Character*)character;
+    ItemConfirmMsg cf; ItemMoveMsg mm;
+    if (!ItObj(c) || ItTradeMsgOf(body, &cf, &mm) != 1)
+    {
+        ++g_trBuildFail;
+        ErrorLog("[TRADE] an object of the other side could NOT be built: " + std::string(ItObj(c) ? "its bytes would not decode" : "no character") + " (buildFail " + N(g_trBuildFail) + ")");
+        return 0;
+    }
+    const int packAfter = coopmark::OwnerPackMarkAfterFill(!cf.bag.empty(), mm.owner, mm.ownerLocal != 0 && coopmark::RawHandIsOwner(mm.ownerLocalRaw));
+    ::Item* item = 0;
+    if (ItTradeCreatePod(c, &mm, &cf.bag, packAfter, &item) != 1 || item == 0)
+    {
+        ++g_trBuildFail;
+        ErrorLog("[TRADE] '" + cf.baseSid + "' x" + N((long long)mm.quantity) + " of the other side could NOT be made here (buildFail " + N(g_trBuildFail) + ")");
+        return 0;
+    }
+    /* fold 1 (review p3a M2): every section's stacks of this item before the add, then after - exactly one section changed by exactly
+       this stack (hovrec::PlacedWhere) tells where the add ended; anything else leaves it untold (the after-reload look then waits) */
+    ::Inventory* inv = ItInventoryOf(c);
+    std::vector<std::string> nb, na; std::vector<std::vector<hovrec::PlStack> > sb, sa;
+    const int snapOk = ItTrSnapAll(inv, cf, &nb, &sb);
+    /* the engine's whole-inventory add (published): onto matching stacks first, then the first free square - the room check's order */
+    const int r = ItemsTradePutBack(character, (void*)item);
+    if (r == 1)
+    {
+        ++g_trBuilt;
+        if (where != 0 && snapOk != 0 && ItTrSnapAll(inv, cf, &na, &sa) != 0 && na == nb)
+        {
+            int hits = 0, other = 0, x = 0, y = 0, pre = 0, got = 0; size_t at = 0;
+            for (size_t s = 0; s < sa.size(); ++s)
+            {
+                if (ItTrSameSnap(sb[s], sa[s])) continue;
+                int px = 0, py = 0, pp = 0, pg = 0;
+                if (hovrec::PlacedWhere(sb[s], sa[s], mm.quantity, &px, &py, &pp, &pg) != 0) { ++hits; at = s; x = px; y = py; pre = pp; got = pg; } else ++other;
+            }
+            if (hits == 1 && other == 0) { where->has = 1; where->sec = na[at]; where->x = x; where->y = y; where->before = pre; where->after = got; }
+        }
+    }
+    else if (r == 2)
+    {
+        ++g_trBuiltFeet;
+        ErrorLog("[TRADE] '" + cf.baseSid + "' x" + N((long long)mm.quantity) + " of the other side did not all fit - the rest is at the character's feet: the"
+                 " inventory filled between the room check and the delivery (the rare fallback; builtAtFeet " + N(g_trBuiltFeet) + ")");
+    }
+    else
+    {   /* fold 1 (review p3a M1): made, but neither in the inventory nor at the feet (ItemsTradePutBack logged putLost) - some units may
+           have gone onto stacks, so it is NOT made again (that could double them): settled as partly placed, logged */
+        ++g_trBuildFail;
+        ErrorLog("[TRADE] '" + cf.baseSid + "' x" + N((long long)mm.quantity) + " of the other side was made but could not be placed (putLost) - not made again (buildFail " + N(g_trBuildFail) + ")");
+        return 2;
+    }
+    return r;
+}
+
+int ItemsTradeDestroy(void* obj)
+{
+    if (obj == 0) return 0;
+    ItOwnParkForget(obj);
+    g_trPackOf.erase(obj);   /* T-1167 2026-11-17 */
+    const int d = ItDestroyPod(obj, "coop T-1167 trade COMMIT: a lifted object is the other side's now");
+    ++g_trDestroyed;
+    return d;
+}
+
+int ItemsTradeRoom(void* character, const std::vector<tradew::Item>& rows, std::vector<unsigned>* noFit, std::string* why)
+{
+    noFit->clear(); why->clear();
+    ::Character* c = (::Character*)character;
+    ::Inventory* inv = ItObj(c) ? ItInventoryOf(c) : 0;
+    if (!ItObj(inv)) { ++g_trRoomUnread; *why = "no inventory"; return -1; }
+    if (rows.empty()) { ++g_trRoomFits; return 1; }
+    const ItSecMap& secMap = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secMap.size() > 64) { ++g_trRoomUnread; *why = "sections unreadable"; return -1; }
+    std::vector< ::InventorySection*> secs;
+    std::vector<coopshop::FitSec> fs;
+    for (ItSecMap::const_iterator it = secMap.begin(); it != secMap.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        coopshop::FitSec f;
+        int cw = 0, chh = 0, cap = 0;
+        if (ItObj(sec) && ItIntPod(sec, kSecContentW, &cw) != 0 && ItIntPod(sec, kSecContentH, &chh) != 0 && ItIntPod(sec, 0xA8, &cap) != 0
+            && cw > 0 && chh > 0 && (long long)cw * (long long)chh <= coopshop::kPlaceGridCap && cap <= 0x100000 && sec->items.size() <= 4096)
+        { f.sw = cw; f.sh = chh; f.capLeft = coopshop::PlaceCapLeft(cap, (int)sec->items.size()); }
+        secs.push_back(sec); fs.push_back(f);   /* an unreadable section: sw 0 - no cells there (fail safe: less room, never more) */
+    }
+    std::vector<coopshop::FitItem> items(rows.size());
+    for (size_t r = 0; r < rows.size(); ++r)
+    {
+        /* a DISPLAY COPY of the row's thing (ShopBuyerRoom asks the shop's own copy): its size and stack limits read, nothing placed */
+        const tradew::Item& t = rows[r];
+        ItemMoveMsg mm;
+        mm.baseSid = t.key; mm.companySid = t.company; mm.materialSid = t.material; mm.colorSid = t.colour;
+        std::memcpy(&mm.quality, &t.q, sizeof mm.quality); std::memcpy(&mm.charges, &t.charges, sizeof mm.charges);
+        mm.unique = (int)t.unique; mm.quantity = 1;
+        ::Item* copy = 0;
+        if (ItTradeCreatePod(c, &mm, 0, 0, &copy) != 1 || copy == 0) { ++g_trRoomUnread; *why = "no display copy of '" + t.name + "' could be made"; return -1; }
+        coopshop::FitItem& fi = items[r];
+        fi.units = (long long)t.count;
+        int iw = 0, ih = 0;
+        const bool sized = ItIntPod(copy, kItemWidth, &iw) != 0 && ItIntPod(copy, kItemHeight, &ih) != 0 && iw > 0 && ih > 0;
+        fi.iw = iw; fi.ih = ih;
+        ItEntry ce; ItClear(&ce);
+        const bool descOk = ItReadFields(copy, &ce) == 1;
+        const coopshop::Desc want = ShopDescOfEntry(ce);
+        fi.per.assign(secs.size(), 0); fi.stackRoom.assign(secs.size(), 0); fi.refused.resize(secs.size());
+        for (size_t s = 0; s < secs.size(); ++s)
+        {
+            if (fs[s].sw <= 0 || !sized) continue;
+            int mx = -1;
+            if (ShopStackMaxRead(copy, (void*)secs[s], &mx) != 0) fi.per[s] = coopshop::CellUnits(mx);
+            fi.refused[s].assign((size_t)(fs[s].sw * fs[s].sh), 1);
+            if (ItTradeGridPod(secs[s], copy, fs[s].sw, fs[s].sh, &fi.refused[s][0]) != 1) fi.refused[s].assign((size_t)(fs[s].sw * fs[s].sh), 1);
+            if (!descOk) continue;
+            const Ogre::vector< ::InventorySection::SectionItem>::type& si = secs[s]->items;
+            for (size_t k = 0; k < si.size() && k < 4096; ++k)
+            {   /* every matching stack's room under the engine's limit (ShopBuyerRoom's own count, per section) */
+                void* mine = (void*)si[k].item;
+                char cs[kSidCap]; cs[0] = 0; int iq = 0;
+                if (!ItObj(mine) || ItBaseSidPod(mine, cs, kSidCap) == 0 || want.baseSid != cs || ItIntPod(mine, kItemQuantity, &iq) == 0) continue;
+                ItEntry fe; ItClear(&fe);
+                if (ItReadFields(mine, &fe) != 1 || coopshop::SameDesc(want, ShopDescOfEntry(fe)) == 0) continue;
+                int smx = -1;
+                if (ShopStackMaxRead(mine, (void*)secs[s], &smx) != 0 && smx > 0) fi.stackRoom[s] = coopshop::RoomAdd(fi.stackRoom[s], coopshop::StackRoom(smx, iq));
+            }
+        }
+        ItOwnParkForget((void*)copy);
+        ItDestroyPod((void*)copy, "coop T-1167 trade room check: a display copy");
+        if (!sized) { ++g_trRoomUnread; *why = "the size of '" + t.name + "' did not read"; return -1; }
+    }
+    std::vector<long long> left;
+    const int all = coopshop::FitList(fs, items, &left);
+    *noFit = tradel::NoRoomRows(left);
+    if (all == 1) { ++g_trRoomFits; return 1; }
+    ++g_trRoomNo;
+    for (size_t i = 0; i < noFit->size(); ++i)
+        *why += (i ? ", " : "") + rows[(*noFit)[i]].name + " (" + N(left[(*noFit)[i]]) + " of " + N((long long)rows[(*noFit)[i]].count) + " without room)";
+    return 0;
+}
+
+/* ---- T-1167 piece 3 fold 1 (review p3a H1 / M1 / M2): THE MARKS, THE RECORD CHECK, THE LOOKS AT A SQUARE ---- */
+/* marks whose write did not land: written again before anything else of their trade (ItemsTradeDurable waits for them) */
+struct TrMarkPend { unsigned long long id; unsigned int base; std::vector<unsigned> objs; std::vector<std::string> bodies; unsigned long long e; std::vector<hovrec::TradeSquare> sqs; };
+std::vector<TrMarkPend> g_trMarkPend;
+long long g_trMarks = 0, g_trMarkFail = 0, g_trLiftLooks = 0, g_trSquareRemoved = 0, g_trWaitRecord = 0;
+/* one write of marks (handrec.h HandTradeMarkPut) - the where / squad / other player of the trade's receiving line (else its first line);
+   each mark live in this load. 1 written (or nothing kept: the records writer off), 0 not (kept to be written again) */
+int ItTrMarkWrite(const TrMarkPend& m)
+{
+    if (!coop::OwnWriterOn()) return 1;
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return 0;
+    hovrec::HandLine ref;
+    if (hovrec::HandTradeRecvOf(lines, m.id, &ref, 0) == 0)
+    {
+        const std::vector<size_t> at = hovrec::HandTradeLinesOf(lines, m.id);
+        if (at.empty() || hovrec::HandLineParse(lines[at[0]], &ref) == 0) return 1;   /* no line of the trade on file: nothing to mark */
+    }
+    const long long now = (long long)std::time(0);
+    std::vector<hovrec::HandLine> mk;
+    for (size_t i = 0; i < m.objs.size(); ++i)
+        mk.push_back(hovrec::HandTradeMarkLine(m.id, m.base, m.objs[i], ref.otherSlot, now, ref.where, ref.squadKey, m.e, i < m.bodies.size() ? m.bodies[i] : std::string(),
+                                               i < m.sqs.size() ? m.sqs[i] : hovrec::TradeSquare()));
+    if (hovrec::HandTradeMarkPut(&lines, mk, m.id, hovrec::kHandCap) != 1 || HovSave(lines) == 0) return 0;
+    for (size_t i = 0; i < m.objs.size(); ++i)
+    {
+        hovrec::HandLine w;
+        if (hovrec::HandTradeMarkOf(lines, m.id, m.base, m.objs[i], &w) != 0) g_hovLive[HovKey(w.askerSlot, w.reqId, w.holderSlot, hovrec::kRoleDst)] = coop::OwnLoadGen();
+    }
+    g_trMarks += (long long)m.objs.size();
+    return 1;
+}
+/* the marks of `base` for objects `objs` (E `e`, reserved just BEFORE their engine change, written in the same main-thread call) */
+void ItTrMarkPut(unsigned long long id, unsigned int base, const std::vector<unsigned>& objs, const std::vector<std::string>& bodies, unsigned long long e,
+                 const std::vector<hovrec::TradeSquare>& sqs)
+{
+    if (objs.empty()) return;
+    TrMarkPend m; m.id = id; m.base = base; m.objs = objs; m.bodies = bodies; m.e = e; m.sqs = sqs;
+    if (ItTrMarkWrite(m) == 1) return;
+    ++g_trMarkFail;
+    g_trMarkPend.push_back(m);
+    ErrorLog("[TRADE] trade " + tradew::N(id) + ": " + N((long long)objs.size()) + " mark(s) (E " + N((long long)e) + ") could not be written to pp.handover - written again before the trade goes on (markFail " + N(g_trMarkFail) + ")");
+}
+/* 1 none of trade `id`'s marks is waiting to be written */
+int ItTrMarksFlush(unsigned long long id)
+{
+    int left = 0;
+    for (size_t i = 0; i < g_trMarkPend.size(); )
+    {
+        if (ItTrMarkWrite(g_trMarkPend[i]) == 1) { g_trMarkPend.erase(g_trMarkPend.begin() + (std::vector<TrMarkPend>::difference_type)i); continue; }
+        if (g_trMarkPend[i].id == id) ++left;
+        ++i;
+    }
+    return left == 0 ? 1 : 0;
+}
+/* THE LOOK AT A HELD LINE'S LIFT SQUARE (hovrec::LiftLook): kHsHas / kHsLacks / kHsUnknown; *at the item on that square when it HAS it
+   (its stack from before the lift: the copy to take the lifted units off), *c its character */
+int ItTrLiftLook(const hovrec::HandLine& l, void** at, ::Character** c)
+{
+    *at = 0; *c = 0;
+    hovrec::TradeSquare sq;
+    if (hovrec::TradeSquareOf(l, &sq) == 0) return hovrec::kHsUnknown;
+    unsigned int uid = 0;
+    ::Character* ch = HovLineChar(l, &uid);
+    if (!ItObj(ch) || !net::IsUidMine(uid)) return hovrec::kHsUnknown;
+    ItemConfirmMsg cf;
+    if (HovDecode(l, &cf) == 0) return hovrec::kHsUnknown;
+    hovrec::HandLine top = l; top.section = sq.sec;   /* pack fold (2026-11-17): the line's bag path kept - a square inside a carried pack is looked at there */
+    ::Character* c2 = 0; ::Inventory* iv = 0;
+    ::InventorySection* sec = ItResolvePath(uid, 0, sq.sec, HovBagOf(top), &c2, &iv);
+    if (sec == 0 || iv == 0 || ItSlotInSectionWhy(sec, sq.x, sq.y) != 1) return hovrec::kHsUnknown;
+    void* it = 0;
+    const int readOk = ItGetAtPod(sec, sq.x, sq.y, &it) != 0 ? 1 : 0;
+    const int there = (readOk != 0 && it != 0 && ItPlaus(it)) ? 1 : 0;
+    int kindRead = 0, sameKind = 0, haveQty = -1;
+    if (there != 0) HovKindAt(it, cf, &kindRead, &sameKind, &haveQty);
+    ++g_trLiftLooks;
+    const int hs = hovrec::LiftLook(1, 1, readOk, there, kindRead, sameKind, haveQty, sq.before, sq.after);
+    if (hs == hovrec::kHsHas) { *at = it; *c = ch; }
+    return hs;
+}
+
+int ItemsTradeSettleHeld(unsigned long long tradeId, int decision, int* waiting, unsigned long long* eMax)
+{
+    *waiting = 0;
+    if (!coop::OwnWriterOn()) return 1;
+    if (ItTrMarksFlush(tradeId) == 0) { ++*waiting; return 0; }
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return -1;
+    const std::vector<size_t> at = hovrec::HandTradeLinesOf(lines, tradeId);
+    const long gen = coop::OwnLoadGen();
+    std::vector<unsigned> backObjs; unsigned long long eBack = 0;
+    for (size_t k = 0; k < at.size(); ++k)
+    {
+        hovrec::HandLine l;
+        if (hovrec::HandLineParse(lines[at[k]], &l) == 0 || l.role != hovrec::kRoleSrc || hovrec::IsOpen(l.state) == 0 || hovrec::HandIsTradeRecv(l) != 0) continue;
+        const std::string key = HovKey(l.askerSlot, l.reqId, l.holderSlot, hovrec::kRoleSrc);
+        std::map<std::string, std::pair<long, int> >::const_iterator done = g_trActed.find(key);
+        if (done != g_trActed.end() && done->second.first == gen) { if (done->second.second < 0) ++*waiting; continue; }   /* settled in this load (-2: a rebuild that failed) */
+        const unsigned int obj = hovrec::HandTradeIndexOf(l);
+        int squadKnown = 0;
+        const unsigned long long applied = HovAppliedFor(l, &squadKnown);
+        const int hs0 = hovrec::HolderStateAfterLoad(HovLiveNow(key), l.seqE, squadKnown, applied, coop::OwnOverlayMarkRule(), coop::OwnOverlayMarkSeq());
+        /* fold 1 (review p3a M2): the give-back's mark first, the records next, and only when those cannot tell the lift's own square - never
+           a search for the object's identity and count anywhere in the character */
+        hovrec::HandLine bm;
+        const int haveBack = hovrec::HandTradeMarkOf(lines, tradeId, hovrec::kTradeBackBase, obj, &bm);
+        const int backLive = haveBack != 0 ? HovLiveNow(HovKey(bm.askerSlot, bm.reqId, bm.holderSlot, hovrec::kRoleDst)) : 0;
+        void* sqItem = 0; ::Character* sqChar = 0;
+        const int look = ItTrLiftLook(l, &sqItem, &sqChar);
+        const int hs = hovrec::HolderStateTrade(hs0, haveBack, bm.seqE, backLive, applied, coop::OwnOverlayMarkRule(), coop::OwnOverlayMarkSeq(), look);
+        int here = -1;
+        if (decision == hovrec::kTdCommitted && hs == hovrec::kHsHas) here = sqItem != 0 ? 1 : HovLiveCopy(l, 1, 0, 0);   /* T-889's rule for a state that HAS it */
+        const int act = hovrec::TradeHolderAction(l.state, decision, 0, hs, here);
+        const std::string said = "[TRADE] trade " + tradew::N(tradeId) + " line " + N((long long)l.reqId) + " (object " + N((long long)obj) + ", " + (decision == hovrec::kTdCommitted ? "COMMITTED" : "ABORTED")
+                               + ", records " + N((long long)hs0) + ", give-back mark " + N((long long)haveBack) + ", lift square " + N((long long)look) + " -> state " + N((long long)hs) + "): ";
+        if (act == hovrec::kActKeep)
+        {
+            ++*waiting; ++g_trSettleWait;
+            DebugLog(said + (hs == hovrec::kHsUnknown ? "neither its records, a give-back mark nor its lift square can tell whether this state has it - the line WAITS (never a guess)"
+                                                      : "its character is not loaded here (or not ours now) - the line waits"));
+            continue;
+        }
+        if (act == hovrec::kActRemoveThenClose)
+        {   /* COMMITTED and this reloaded state HAS it: the lifted units taken off again (at the lift's square when it shows them; else T-889's
+               own removal of its exact item). Fold 2 (re-check p3f1 MEDIUM): E reserved just before the removal and the gate's E raised to
+               it (as the rebuild below does) - APPLIED then waits for a record that lacks the object, even when nothing is received */
+            const unsigned long long eRm = coop::OwnSeqReserve();
+            int r = 0; ::Character* cc = 0;
+            if (sqItem != 0)
+            {
+                hovrec::TradeSquare sq; hovrec::TradeSquareOf(l, &sq);
+                void* ob = 0; std::string b;
+                const int lr = ItemsTradeLift((void*)sqChar, sqItem, sq.before - sq.after, sq.after == 0 ? 1 : 0, &ob, &b, 0);
+                if (ob != 0 && lr == 1) { ItemsTradeDestroy(ob); r = 1; cc = sqChar; ++g_trSquareRemoved; }
+                else { if (ob != 0) ItemsTradePutBack((void*)sqChar, ob); r = 2; }
+            }
+            else r = HovLiveCopy(l, 1, 1, &cc);
+            if (hovrec::HolderRemoveOutcome(r) == hovrec::kRmWait) { ++*waiting; ++g_trSettleWait; DebugLog(said + "this game's reloaded copy cannot be removed now - the line waits"); continue; }
+            if (r == 1 && cc != 0) coop::OwnMarkCharDirtyNow((void*)cc);
+            *eMax = tradel::GateERaise(*eMax, eRm, (r == 1 && cc != 0) ? 1 : 0);
+            DebugLog(said + (r == 1 ? "the other side has it - this game's reloaded copy REMOVED" : "the other side has it - the reloaded copy was gone already"));
+        }
+        else if (act == hovrec::kActRebuild)
+        {   /* ABORTED and this state LACKS it: built again; E_b reserved just before, the give-back mark written in this same call */
+            unsigned int uid = 0;
+            ::Character* ch = HovLineChar(l, &uid);
+            if (ch == 0 || !net::IsUidMine(uid)) { ++*waiting; ++g_trSettleWait; DebugLog(said + "to be rebuilt, but its character is not loaded here (or not ours now) - the line waits"); continue; }
+            const unsigned long long e = coop::OwnSeqReserve();
+            const int b = ItemsTradeBuild((void*)ch, l.item, 0);
+            if (b == 0) { ++*waiting; DebugLog(said + "the rebuild did not take - the line waits (not tried again this load)"); g_trActed[key] = std::make_pair(gen, -2); continue; }
+            coop::OwnMarkCharDirtyNow((void*)ch);
+            backObjs.push_back(obj); eBack = e;
+            if (*eMax < e) *eMax = e;
+            DebugLog(said + "given back - REBUILT into its character" + (b == 2 ? std::string(" (part at its feet)") : std::string()));
+        }
+        else DebugLog(said + (act == hovrec::kActCloseNoRebuild ? "given back - this game's reloaded state still has it (no rebuild)" : "the other side has it - nothing to do"));
+        g_trActed[key] = std::make_pair(gen, 1);
+        ++g_trSettled;
+    }
+    ItTrMarkPut(tradeId, hovrec::kTradeBackBase, backObjs, std::vector<std::string>(backObjs.size()), eBack, std::vector<hovrec::TradeSquare>());   /* the same call as the rebuilds */
+    return *waiting > 0 ? 0 : 1;
+}
+
+int ItemsTradeDurable(unsigned long long tradeId, unsigned long long e)
+{
+    if (ItTrMarksFlush(tradeId) == 0) return 0;
+    if (!coop::OwnWriterOn() || e == 0ULL) return 1;
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return -1;
+    hovrec::HandLine l;
+    if (hovrec::HandTradeRecvOf(lines, tradeId, &l, 0) == 0)
+    {
+        const std::vector<size_t> at = hovrec::HandTradeLinesOf(lines, tradeId);
+        if (at.empty() || hovrec::HandLineParse(lines[at[0]], &l) == 0) return 1;
+    }
+    l.seqE = e;
+    int squadKnown = 0;
+    const int dur = HovInDurable(l, &squadKnown);
+    if (tradel::RecordHolds(1, squadKnown, dur != hovrec::kDurNo ? 1 : 0) == 1) return 1;
+    ++g_trWaitRecord;
+    return 0;
+}
+
+int ItemsTradeRecvObj(unsigned long long tradeId, unsigned int obj, std::string* why)
+{
+    why->clear();
+    if (!coop::OwnWriterOn()) { *why = "no records kept"; return tradel::kBdTodo; }
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) { *why = "pp.handover unreadable"; return tradel::kBdWait; }
+    hovrec::HandLine r, pm;
+    if (hovrec::HandTradeRecvOf(lines, tradeId, &r, 0) == 0) { *why = "no receiving line"; return tradel::kBdWait; }
+    const int havePlaced = hovrec::HandTradeMarkOf(lines, tradeId, hovrec::kTradePlacedBase, obj, &pm);
+    int squadKnown = 0;
+    const unsigned long long applied = HovAppliedFor(havePlaced != 0 ? pm : r, &squadKnown);
+    const int live = havePlaced != 0 ? HovLiveNow(HovKey(pm.askerSlot, pm.reqId, pm.holderSlot, hovrec::kRoleDst)) : 0;
+    const int act = tradel::RecvObjAct(hovrec::IsOpen(r.state), r.seqE, r.frozen == hovrec::kVHolds ? 1 : 0, havePlaced, havePlaced != 0 ? pm.seqE : 0ULL, live, squadKnown, applied,
+                                       coop::OwnOverlayMarkRule(), coop::OwnOverlayMarkSeq());
+    *why = (havePlaced != 0 ? "placed mark E " + N((long long)pm.seqE) : std::string("no placed mark")) + ", record " + N((long long)applied) + ", act " + N((long long)act);
+    if (act != tradel::kRvLook) return tradel::RecvActState(act);
+    /* the record cannot tell: the placed mark's square only (T-889 fold 3's look, with its wide check that never says 'not placed' on a guess) */
+    hovrec::TradeSquare sq;
+    if (hovrec::TradeSquareOf(pm, &sq) == 0 || pm.plHas == 0) { *why += ", where its build landed was not told - waits"; return tradel::kBdWait; }
+    hovrec::HandLine lk = pm; lk.section = sq.sec; lk.bagHas = 0;
+    const int lookAt = HovLiveCopy(lk, 0, 0, 0);
+    *why += ", its square " + sq.sec + " " + N((long long)sq.x) + "," + N((long long)sq.y) + " look " + N((long long)lookAt);
+    return tradel::RecvLookState(lookAt);
+}
+
+int ItemsTradeBuildObj(unsigned long long tradeId, unsigned int obj, void* character, const std::string& body, int* result)
+{
+    *result = 0;
+    if (ItemsTradeBodyDecodes(body) != 1) return tradel::kBdGiveUp;
+    const unsigned long long e = coop::OwnSeqReserve();   /* E_i, just before the build */
+    hovrec::TradeSquare sq;
+    const int b = ItemsTradeBuild(character, body, &sq);
+    *result = b;
+    if (b == 0) return tradel::kBdTodo;
+    std::vector<unsigned> o(1, obj); std::vector<std::string> bs(1, body); std::vector<hovrec::TradeSquare> sqs(1, sq);
+    ItTrMarkPut(tradeId, hovrec::kTradePlacedBase, o, bs, e, sqs);   /* the placed mark, in this same call */
+    return tradel::BuildAfterTry(1, b);
+}
+
+int ItemsTradeBackMark(unsigned long long tradeId, const std::vector<unsigned>& objs, unsigned long long e)
+{
+    ItTrMarkPut(tradeId, hovrec::kTradeBackBase, objs, std::vector<std::string>(objs.size()), e, std::vector<hovrec::TradeSquare>());
+    return ItTrMarksFlush(tradeId);
+}
+
+int ItemsTradeRecvInfo(unsigned long long tradeId, TradeRecvInfo* out)
+{
+    *out = TradeRecvInfo();
+    if (!coop::OwnWriterOn()) return 0;
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return -1;
+    hovrec::HandLine l;
+    if (hovrec::HandTradeRecvOf(lines, tradeId, &l, 0) == 0) return 0;
+    out->open = hovrec::IsOpen(l.state);
+    out->e = l.seqE;
+    out->frozenHolds = l.frozen == hovrec::kVHolds ? 1 : 0;
+    out->live = HovLiveNow(HovKey(l.askerSlot, l.reqId, l.holderSlot, hovrec::kRoleSrc));
+    out->applied = HovAppliedFor(l, &out->squadKnown);
+    unsigned int uid = 0;
+    ::Character* c = HovLineChar(l, &uid);
+    out->character = (c != 0 && net::IsUidMine(uid)) ? (void*)c : 0;
+    out->uid = uid;
+    return 1;
+}
+
+int ItemsTradeCommitWrite(unsigned long long tradeId, unsigned long long e, int* changed)
+{
+    *changed = 0;
+    if (!coop::OwnWriterOn()) return 2;
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) { ++g_trLinesFail; return 0; }
+    const int n = hovrec::HandTradeCommitAll(&lines, tradeId, e);
+    if (n < 0) return -1;
+    if (n == 0) return 1;
+    if (HovSave(lines) == 0) { ++g_trLinesFail; return 0; }
+    hovrec::HandLine r;
+    if (hovrec::HandTradeRecvOf(lines, tradeId, &r, 0) != 0) g_hovLive[HovKey(r.askerSlot, r.reqId, r.holderSlot, hovrec::kRoleSrc)] = coop::OwnLoadGen();   /* written in this load: live */
+    *changed = n;
+    g_trLinesClosed += n;
+    return 1;
+}
+
+std::string ItemsTradeToken()
+{
+    return " tradeItems2[marks,markFail,markPend,liftLooks,squareRemoved,waitRecord]=" + N(g_trMarks) + "," + N(g_trMarkFail) + "," + N((long long)g_trMarkPend.size()) + "," + N(g_trLiftLooks)
+         + "," + N(g_trSquareRemoved) + "," + N(g_trWaitRecord)
+         + " tradeItems[lifts,liftFail,putBack,atFeet,putLost,linesWritten,linesFail,linesClosed,built,builtFeet,buildFail,destroyed,roomFits,roomNo,roomUnread,settled,settleWait]="
+         + N(g_trLifts) + "," + N(g_trLiftFail) + "," + N(g_trPutBack) + "," + N(g_trAtFeet) + "," + N(g_trPutLost) + "," + N(g_trLinesWritten) + "," + N(g_trLinesFail)
+         + "," + N(g_trLinesClosed) + "," + N(g_trBuilt) + "," + N(g_trBuiltFeet) + "," + N(g_trBuildFail) + "," + N(g_trDestroyed) + "," + N(g_trRoomFits) + "," + N(g_trRoomNo)
+         + "," + N(g_trRoomUnread) + "," + N(g_trSettled) + "," + N(g_trSettleWait);
+}
+}   /* namespace coop */
+
+// ===================== T-1167 piece 3 build 4: THE DRAG'S ENGINE WORK (tradewin.cpp TradeWinDrop; tradewin.h says each call) =====================
+namespace coop {
+namespace {
+const size_t kTrCurItem   = 0x30;   /* MouseInventory: the item on the cursor (decomp_712ad0 / 715dd0: +0x30 == 0 means none) */
+const size_t kTrCurSrcGui = 0x68;   /* MouseInventory: the InventoryGUI the item came out of (decomp_712ad0: its getInventory +0x70, and the put-back 0x70CC90's window) */
+const size_t kTrGuiWidget = 0x08;   /* InventoryGUI: its MyGUI window widget (decomp_6e45a0 sets its position through it) */
+const size_t kTrSecNodeKey = 0x18;  /* the section table's node: its key std::string - the section's name as the engine reads it (decomp_70dc90:35 plVar5+3) */
+const int kTrKeyCap = 96;
+long long g_tdCursorReads = 0, g_tdReturns = 0, g_tdShows = 0, g_tdCloses = 0, g_tdLevers = 0;
+bool g_tdKeyNameSaid = false;   /* fold 2: the one line when a section widget's name is not its table key (finding F-15863's prefix) */
+/* T-1167 v3: the section widgets of InventoryGUI `gui` (its +0x60 map): up to cap SectionGUI widgets and each entry's own KEY (fold 2,
+   re-check MEDIUM: the section's name as the engine takes it, never the widget's name), walked IN KEY ORDER - left, the node, right - as
+   0x70DC90 walks it, so the first hit is the engine's first hit (fold 2, re-check LOW). An entry whose key does not read is left out.
+   -1 unread. */
+int ItTrGuiSectionWidgets(void* gui, void** out, char (*keys)[kTrKeyCap], int cap)
+{
+    void* head = 0; void* root = 0;
+    if (ItPtrPod(gui, kClkGuiSecMap + kClkMapHead, &head) == 0 || !ItPlaus(head)) return -1;
+    if (ItPtrPod(head, kClkNodeParent, &root) == 0) return -1;
+    void* st[64];
+    int sp = 0, steps = 0, n = 0;
+    void* cur = (ItPlaus(root) && root != head) ? root : 0;
+    while ((cur != 0 || sp > 0) && ++steps <= kClkMaxNodes)
+    {
+        if (cur != 0)
+        {   /* down the left side first */
+            if (sp >= 64) return -1;
+            st[sp++] = cur;
+            void* l = 0;
+            cur = (ItPtrPod(cur, 0, &l) != 0 && ItPlaus(l) && l != head) ? l : 0;
+            continue;
+        }
+        void* node = st[--sp];
+        void* sg = 0; void* w = 0;
+        if (n < cap && ItPtrPod(node, kClkSecNodeValue, &sg) != 0 && ItPlaus(sg) && ItPtrPod(sg, 0, &w) != 0 && ItPlaus(w)
+            && ItStrPodWhy((const char*)node + kTrSecNodeKey, keys[n], kTrKeyCap) == 1)
+            out[n++] = w;
+        void* r = 0;
+        cur = (ItPtrPod(node, kClkNodeRight, &r) != 0 && ItPlaus(r) && r != head) ? r : 0;
+    }
+    return n;
+}
+/* fold 2: one line a launch when a section widget's own name is not its table key (the section is always named by the key) */
+void ItTrKeyNameNote(const char* widgetName, const char* key)
+{
+    if (g_tdKeyNameSaid || std::strcmp(widgetName, key) == 0) return;
+    g_tdKeyNameSaid = true;
+    DebugLog(std::string("[ITEMS] T-1167 a section widget's name '") + widgetName + "' is not its section-table key '" + key
+             + "' - the section is named by the key, as the engine does (finding F-15863's layout prefix; logged once)");
+}
+/* a section widget's name and absolute rectangle (MyGUI). 1 read. */
+int ItTrWidgetPod(void* w, char* name, int cap, int* l, int* t, int* wd, int* ht)
+{
+    name[0] = 0;
+    __try
+    {
+        const MyGUI::Widget* mw = (const MyGUI::Widget*)w;
+        const std::string& nm = mw->getName();
+        if (nm.size() + 1 > (size_t)cap) return 0;
+        std::memcpy(name, nm.c_str(), nm.size() + 1);
+        const MyGUI::IntCoord c = mw->getAbsoluteCoord();
+        *l = c.left; *t = c.top; *wd = c.width; *ht = c.height;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { name[0] = 0; return 0; }
+}
+/* the SectionItem of `obj` in `sec`: its cell and size in cells. 1 found. */
+int ItTrItemCellIn(::InventorySection* sec, const void* obj, int* x, int* y, int* w, int* h)
+{
+    __try
+    {
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) return 0;
+        for (size_t k = 0; k < si.size(); ++k)
+            if ((const void*)si[k].item == obj) { *x = (int)si[k].x; *y = (int)si[k].y; *w = (int)si[k].w; *h = (int)si[k].h; return 1; }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1167 (owner's hands-on 2026-11-17): the inventory window `gui` - the trading character's own (kSrcOwn, *inv its inventory) or the
+   window of a pack it carries (kSrcPack, *inv the pack's inventory, *pack the pack); kSrcNone anything else (swtrade::SrcWindow). The
+   window's inventory read from the window (InventoryGUI::getInventory, vt +0x70) and asked back (the window of that inventory is `gui`),
+   as ItSameWindow does. */
+int ItTrSrcInv(void* gui, void* character, ::Inventory** inv, void** pack)
+{
+    *inv = 0; *pack = 0;
+    ::Inventory* own = character != 0 ? ItInventoryOf((::Character*)character) : 0;
+    void* shown = 0; void* g = 0;
+    const bool read = gui != 0 && ItGuiInventoryCall(gui, &shown) != 0 && shown != 0 && ItInventoryGuiPod(shown, &g) == 1 && g == gui;
+    std::vector<void*> packs; std::vector<const void*> pinvs;
+    if (ItObj(own)) ItTrPacksOf(own, &packs, &pinvs);
+    size_t at = 0;
+    const int k = swtrade::SrcWindow(read, shown, ItObj(own) ? (const void*)own : 0, pinvs, &at);
+    if (k == swtrade::kSrcOwn) *inv = own;
+    else if (k == swtrade::kSrcPack) { *inv = (::Inventory*)pinvs[at]; *pack = packs[at]; }
+    return k;
+}
+long long g_tdRightReads = 0, g_tdRightFound = 0, g_tdRightOther = 0, g_tdRightNoPos = 0;   /* fold 1: rightOther = the engine's position was not MyGUI's (0x7145F0's stored-position road, or a mouse moved since) */
+/* the cursor's item and source window. 1 read; 0 no cursor or it faulted. */
+int ItTrCursorPod(void* mouse, void** item, void** src)
+{
+    *item = 0; *src = 0;
+    if (!ItPlaus(mouse)) return 0;
+    __try
+    {
+        void* it = *(void* const*)((const char*)mouse + kTrCurItem);
+        void* sg = *(void* const*)((const char*)mouse + kTrCurSrcGui);
+        *item = ItPlaus(it) ? it : 0; *src = ItPlaus(sg) ? sg : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *item = 0; *src = 0; return 0; }
+}
+/* the engine's own mouse position - the floats 0x712AD0 and the pickup read (P105GlobalsOk resolves them from the pickup's own
+   instructions). 1 read. */
+int ItTrMousePod(float* x, float* y)
+{
+    *x = 0.0f; *y = 0.0f;
+    if (P105GlobalsOk() == 0) return 0;
+    __try { *x = *g_p105G.mouseX; *y = *g_p105G.mouseY; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* ForgottenGUI::showInventory's own entry (hooked: the mod's detour runs as for any open), autoPosition 1 - the engine's own place,
+   as _showTradeWindow 0x790D00 opens the player's window for a shop. The window's MyGUI widget in *widget (0 unread). 1 called. */
+int ItTrShowInvPod(const void* hand, void** widget)
+{
+    typedef void* (*ShowInvEntryFn)(void* gui, const void* owner, char autoPosition, float x, float y);
+    *widget = 0;
+    __try
+    {
+        void* g = ((ShowInvEntryFn)(g_base + kShowInventoryRva))((void*)(g_base + kForgottenGuiRva), hand, 1, 0.0f, 0.0f);
+        if (ItPlaus(g)) { void* w = *(void* const*)((const char*)g + kTrGuiWidget); *widget = ItPlaus(w) ? w : 0; }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *widget = 0; return 0; }
+}
+int ItTrCloseInvPod(const void* hand)
+{
+    __try { ((CloseInventoryFn)(g_base + kCloseInventoryRva))((void*)(g_base + kForgottenGuiRva), hand); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* TEST-ONLY: the engine's mouse floats set to (x, y) around the hooked 0x712AD0 entry, then put back. 1 called, 0 faulted. */
+int ItTrDropCallPod(void* mouse, float x, float y)
+{
+    float ox = 0.0f, oy = 0.0f; int saved = 0;
+    __try
+    {
+        __try
+        {
+            ox = *g_p105G.mouseX; oy = *g_p105G.mouseY; saved = 1;
+            *g_p105G.mouseX = x; *g_p105G.mouseY = y;
+            ((MouseReleaseNoWindowFn)(g_base + kMouseReleaseNoWindowRva))(mouse);
+        }
+        __finally { if (saved != 0) { *g_p105G.mouseX = ox; *g_p105G.mouseY = oy; } }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+}   /* namespace */
+int ItemsTradeCursor(void* mouse, void* character, TradeCursor* out)
+{
+    *out = TradeCursor();
+    void* item = 0; void* src = 0;
+    if (ItTrCursorPod(mouse, &item, &src) != 1 || item == 0) return 0;
+    ++g_tdCursorReads;
+    out->rowRead = ItTradeRowOf(item, &out->row) == 1 ? 1 : 0;
+    out->obj = item;   /* T-1167 v3: the object on the cursor (the whole object, or a one-unit copy) */
+    ::Inventory* sinv = 0; void* spack = 0;
+    out->fromMine = (src != 0 && ItTrSrcInv(src, character, &sinv, &spack) != swtrade::kSrcNone) ? 1 : 0;   /* 2026-11-17: its own window or a carried pack's */
+    out->mouseRead = ItTrMousePod(&out->mx, &out->my);
+    return 1;
+}
+int ItemsTradeCursorReturn(void* mouse)
+{
+    if (ShopReturnPod(mouse, 0) != 1) return 0;   /* the engine's own returnItem 0x70D000: put back on its square (0x70CC90), cursor cleared */
+    ++g_tdReturns;
+    return 1;
+}
+/* T-1167 piece 3 fold 1 (review p3b HIGH / M1 / M2): the cursor now - 1 an item is on it (or a drag is under way), 0 empty, -1 unread */
+int ItemsTradeCursorBusy()
+{
+    void* mouse = ShopMousePod();
+    void* item = 0; void* src = 0;
+    if (mouse == 0 || ItTrCursorPod(mouse, &item, &src) != 1) return -1;
+    return (item != 0 || ItParityCursorBusy() != 0) ? 1 : 0;
+}
+int ItemsTradeCursorNow(void* character, TradeCursor* out)
+{
+    *out = TradeCursor();
+    void* mouse = ShopMousePod();
+    return mouse != 0 ? ItemsTradeCursor(mouse, character, out) : 0;
+}
+int ItemsTradeCursorHome(void* character)
+{   /* any item on the cursor goes home - from that window, or from a window inside it (a pack) the close may take down with it */
+    (void)character;
+    void* mouse = ShopMousePod();
+    void* item = 0; void* src = 0;
+    if (mouse == 0 || ItTrCursorPod(mouse, &item, &src) != 1 || item == 0) return 0;
+    return ItemsTradeCursorReturn(mouse) == 1 ? 1 : -1;
+}
+int ItemsTradeShowInventory(void* character, int* wasOpen, void** widget)
+{
+    *wasOpen = 0; *widget = 0;
+    if (g_base == 0 || kShowInventoryRva == 0 || kForgottenGuiRva == 0 || !ItObj((::Character*)character)) return 0;
+    if (ItemsTradeCursorBusy() != 0) return 0;   /* fold 1 (review p3b M2): only with an empty cursor - a close can destroy a cursor item */
+    *wasOpen = ItRcLevWindowOpen(ItInventoryOf((::Character*)character));
+    if (ItCloseAllInventories() == 0) return 0;   /* fold 1: the shop's way (_showTradeWindow) - every inventory window closed first, the cursor empty */
+    if (ItTrShowInvPod((const char*)character + 0x58, widget) != 1) return 0;   /* the character's hand (RootObject +0x58), as ItLClickShowPackPod */
+    ++g_tdShows;
+    return 1;
+}
+int ItemsTradeCloseInventory(void* character)
+{
+    if (g_base == 0 || kCloseInventoryRva == 0 || kForgottenGuiRva == 0 || !ItObj((::Character*)character)) return 0;
+    if (ItRcLevWindowOpen(ItInventoryOf((::Character*)character)) == 0) return 0;
+    if (ItTrCloseInvPod((const char*)character + 0x58) != 1) return 0;
+    ++g_tdCloses;
+    return 1;
+}
+int ItemsTradeDropLever(int x, int y, std::string* why)
+{
+    if (g_base == 0 || kMouseReleaseNoWindowRva == 0) { *why = "the MouseReleaseNoWindow row is not bound"; return 0; }
+    if (P105GlobalsOk() == 0) { *why = "the engine's mouse position did not resolve"; return 0; }
+    void* mouse = ShopMousePod();
+    void* item = 0; void* src = 0;
+    if (mouse == 0 || ItTrCursorPod(mouse, &item, &src) != 1 || item == 0) { *why = "no item on the cursor (cursortest pick me <section> <x> <y> [all] first)"; return 0; }
+    ++g_tdLevers;
+    if (ItTrDropCallPod(mouse, (float)x, (float)y) != 1) { *why = "the release faulted"; return 0; }
+    return 1;
+}
+int ItemsTradeRightItem(void* gui, void* character, void** obj, TradeInvRow* row, int* rowRead)
+{
+    *obj = 0; *rowRead = 0;
+    ::Inventory* inv = 0; void* pack = 0;
+    if (ItTrSrcInv(gui, character, &inv, &pack) == swtrade::kSrcNone) return 0;   /* 2026-11-17: its own window or a carried pack's (inv: that pack's) */
+    ++g_tdRightReads;
+    /* fold 1 (review LOW-5): the engine's own mouse floats, truncated as it truncates them - 0x713E50's section test (0x70DC90) and cell
+       sum (0x70FF10) read these, and 0x7145F0 writes its stored position into them before it calls 0x713E50 */
+    float fx = 0.0f, fy = 0.0f; int sw = 0, sh = 0;
+    if (ItTrMousePod(&fx, &fy) != 1 || P105SlotSizePod(&sw, &sh) != 1) { ++g_tdRightNoPos; return 2; }
+    const int mx = (int)fx, my = (int)fy;
+    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+    if (im != 0) { const MyGUI::IntPoint mp = im->getMousePosition(); if (mp.left != mx || mp.top != my) ++g_tdRightOther; }
+    void* ws[64]; char keys[64][kTrKeyCap];
+    const int n = ItTrGuiSectionWidgets(gui, ws, keys, 64);
+    for (int i = 0; i < n; ++i)   /* the table's key order: the first hit is the engine's (an edge two sections share) */
+    {
+        char nm[96]; int l = 0, t = 0, ww = 0, hh = 0;
+        if (ItTrWidgetPod(ws[i], nm, (int)sizeof nm, &l, &t, &ww, &hh) != 1) continue;
+        if (!swtrade::SecHit(mx, my, l, t, ww, hh)) continue;   /* 0x70DC90's test: the section widget's absolute rectangle, edges in */
+        ItTrKeyNameNote(nm, keys[i]);
+        ::InventorySection* sec = (::InventorySection*)ClkSectionNamed(inv, keys[i]);   /* fold 2: the table's KEY, as the engine names it */
+        int gl = 0, gt = 0, gw = 0, gh = 0;
+        if (sec == 0 || P105GridLeftTopPod(gui, keys[i], &gl, &gt) != 1 || ItIntPod(sec, kP105SecGridW, &gw) == 0 || ItIntPod(sec, kP105SecGridH, &gh) == 0
+            || gw <= 0 || gh <= 0 || gw > 256 || gh > 256) return 2;
+        int cx = 0, cy = 0;
+        if (!swtrade::GridCell(mx, my, gl, gt, sw, sh, gw, gh, &cx, &cy)) return 2;   /* 0x70FF10: (mouse - grid corner) / slot size, clamped */
+        void* item = 0;
+        if (ClkItemAtCell(sec, cx, cy, &item) == 0 || !ItPlaus(item)) return 2;
+        *obj = item;
+        *rowRead = ItTradeRowOf(item, row) == 1 ? 1 : 0;
+        ++g_tdRightFound;
+        return 1;
+    }
+    return 2;
+}
+int ItemsTradeKeys(int* shift, int* ctrl)
+{
+    *shift = 0; *ctrl = 0;
+    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+    if (im != 0) { *shift = im->isShiftPressed() ? 1 : 0; *ctrl = im->isControlPressed() ? 1 : 0; }
+    if (g_base == 0 || kRClickAllFlagRva == 0) return 0;
+    *shift = ShopAllFlagPod();
+    return 1;
+}
+/* T-1167 v3 (the fade). THE PACK'S OWN WINDOW (owner's hands-on 2026-11-18; the measuring test found an item in a carried pack was in none of the
+   character's window's sections): the engine keeps ONE InventoryGUI PER OWNER'S HAND in ForgottenGUI's hash map at +0xA0 -
+   showInventory 0x6E6080 looks the hand up there (decomp_6e6080:22-29) and makes a new window for it when it is not there (:66,
+   0x6E5CE0); getInventoryWindow 0x6E4AC0 finds it by the same hand (decomp_6e4ac0:22-27); Inventory::getInventoryGUI 0x14DA40 asks it
+   with the inventory's own owner hand (decomp_14da40: 0x7450B0 then 0x6E4AC0). A pack's inventory names the pack as its owner
+   (ItBagInvPod), so ItInventoryGuiPod(the pack's inventory) is the pack's own window, with its own section table at +0x60 - walked
+   exactly as the character's (ItTrGuiSectionWidgets, the section named by the table's key, its grid corner P105GridLeftTopPod). */
+int ItemsTradeShadeBox(void* character, const void* obj, int* l, int* t, int* w, int* h, void** win, int* inPack)
+{
+    *l = 0; *t = 0; *w = 0; *h = 0; *win = 0; *inPack = 0;
+    ::Inventory* inv = character != 0 ? ItInventoryOf((::Character*)character) : 0;
+    if (!ItObj(inv) || obj == 0) return 0;
+    void* pack = 0;
+    ::Inventory* hold = ItTrHolder(inv, obj, &pack);   /* compared by pointer only: the object is never read through */
+    void* g = 0;
+    if (hold == 0 || ItInventoryGuiPod(hold, &g) != 1 || g == 0 || ItSameWindow(g, hold) == 0) return 0;
+    int sw = 0, sh = 0;
+    if (P105GlobalsOk() == 0 || P105SlotSizePod(&sw, &sh) != 1) return 0;   /* the engine's own slot size (0x70FF10's divisors) */
+    void* ws[64]; char keys[64][kTrKeyCap];
+    const int n = ItTrGuiSectionWidgets(g, ws, keys, 64);
+    for (int i = 0; i < n; ++i)
+    {
+        ::InventorySection* sec = (::InventorySection*)ClkSectionNamed(hold, keys[i]);   /* the table's KEY, as the engine names it */
+        int x = 0, y = 0, iw = 0, ih = 0, gl = 0, gt = 0, gw = 0, gh = 0;
+        if (sec == 0 || ItTrItemCellIn(sec, obj, &x, &y, &iw, &ih) != 1) continue;
+        swtrade::ShadeBox b;
+        if (P105GridLeftTopPod(g, keys[i], &gl, &gt) != 1 || ItIntPod(sec, kP105SecGridW, &gw) == 0 || ItIntPod(sec, kP105SecGridH, &gh) == 0
+            || swtrade::ShadeRect(gl, gt, sw, sh, gw, gh, x, y, iw, ih, &b) != 1) return 0;
+        void* ww = 0;
+        if (ItPtrPod(g, kTrGuiWidget, &ww) == 0 || !ItPlaus(ww)) return 0;
+        *l = b.l; *t = b.t; *w = b.w; *h = b.h; *win = ww; *inPack = pack != 0 ? 1 : 0;
+        return 1;
+    }
+    return 0;
+}
+int ItemsTradeHolderName(void* character, const void* obj, std::string* name)
+{
+    if (name != 0) name->clear();
+    ::Inventory* inv = character != 0 ? ItInventoryOf((::Character*)character) : 0;
+    void* pack = 0;
+    if (!ItObj(inv) || obj == 0) return 0;
+    ::Inventory* hold = ItTrHolder(inv, obj, &pack);
+    if (hold == 0) return 0;
+    if (pack == 0) return 1;
+    if (name != 0)
+    {
+        char nm[160]; nm[0] = 0;
+        if (ItTradeShownNamePod(pack, nm, (int)sizeof nm) != 1 && NoticeItemNamePod(pack, nm, (int)sizeof nm) != 1) std::strcpy(nm, "a pack");
+        *name = nm;
+    }
+    return 2;
+}
+std::string ItemsTradeDragToken()
+{
+    return " tradeDragEngine[cursorReads,returns,shows,closes,levers,rightReads,rightFound,rightOther,rightNoPos]=" + N(g_tdCursorReads) + "," + N(g_tdReturns) + "," + N(g_tdShows) + "," + N(g_tdCloses) + "," + N(g_tdLevers)
+         + "," + N(g_tdRightReads) + "," + N(g_tdRightFound) + "," + N(g_tdRightOther) + "," + N(g_tdRightNoPos)
+         + " tradePack[lifts,backs]=" + N(g_trPackLifts) + "," + N(g_trPackBack);
+}
 }   /* namespace coop */

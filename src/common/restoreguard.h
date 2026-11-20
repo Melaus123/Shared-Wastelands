@@ -313,6 +313,10 @@ inline WorldMsg RowOf(const WorldBook& b, const std::string& profile)
 const unsigned int kCheckpointCap = 10;
 const unsigned int kOwnHighPeriodMs = 30000;   /* a changed high-water is reported at most once per 30 s (and at once at a leave) */
 
+/* T-885 piece 2 (fold round 2, 2026-11-17): the take no longer switches this check off. A take that took every key leaves the folder's
+   highest number at least the world's highest W, so this same rule allows it whenever the world's copies reach the notebook's number
+   (the old 'taken' switch only ever allowed what this rule allows - re-check finding); a take that did not take a key the world holds
+   newer refuses the load itself (ownrecw::TakeRefuses, store.cpp's load gate), with these same words. */
 enum { kOhAllow = 0, kOhAllowNoNumber = 1, kOhAllowNoStore = 2, kOhRefuseOlderRecords = 3 };
 inline int OwnHighDecide(bool storeChosen, unsigned long long ownHigh, unsigned long long notebookHigh)
 {
@@ -566,6 +570,12 @@ inline bool OwnHighRejudgePending(int rejudge, bool rowArrived, unsigned int msS
 inline bool OwnHighLoadHeld(int blocked, bool rejudgePending, bool storeChosen, unsigned long long ownHigh, unsigned long long notebookHigh)
 {
     return rejudgePending || OwnHighLoadRefused(blocked, storeChosen, ownHigh, notebookHigh);
+}
+/* T-885 piece 2: the older-records judge of the player's own store waits, at the title, for the take on this link (the world's copies
+   come first, then the judge) - in a live world it is judged at once as before (no load follows a mid-world WELCOME). */
+inline bool OwnHighJudgeDeferred(bool ownSaveOn, bool storeIsPlayersOwn, bool worldLive, bool takeDoneThisLink)
+{
+    return ownSaveOn && storeIsPlayersOwn && !worldLive && !takeDoneThisLink;
 }
 /* The notebook's small non-record files copied into repair\<tag>\ at each new operator world save (a missing one is skipped). */
 inline std::vector<std::string> RepairCopyFiles()

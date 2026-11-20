@@ -27,7 +27,7 @@
  * (F480), and a record the game wrote itself never counts. ZoneKeptAdoptJudge names the first condition that fails, or adopt.
  *
  * PURE C++03 (VS2010 v100), header-only: no engine, no OS header. Swept by the offline suite (t609_zone_stamp, t609_zone_holder, t609_area_holder_rule, t609_zone_recv_holder,
- * t609_held_sender, t609_zone_kept_adopt, t1279_refused_save_fault, t1329_empty_record, t1329_read_decision). */
+ * t609_held_sender, t609_zone_kept_adopt, t1279_refused_save_fault, t1329_empty_record, t1329_read_decision, t1351_landed_time_sets). */
 #ifndef ZONEREC_H_INCLUDED
 #define ZONEREC_H_INCLUDED
 
@@ -58,6 +58,19 @@ inline int ZoneRecIdParse(const std::string& id, int* sx, int* sy)
     if (sx != 0) *sx = x;
     if (sy != 0) *sy = y;
     return 1;
+}
+
+/* T-1372 TEST-ONLY lever zoneownnext (DEV build): its area argument - `16.0`, `16,0` or `zone.16.0` - as the zone record id
+   (`zone.16.0`); "" = not an area. */
+inline std::string ZoneOwnNextArea(const std::string& arg)
+{
+    std::string a = arg;
+    if (a.compare(0, 5, "zone.") == 0) a = a.substr(5);
+    for (size_t i = 0; i < a.size(); ++i) if (a[i] == ',') a[i] = '.';
+    int x = 0, y = 0; char tail = 0;
+    if (a.empty() || a.size() > 24 || std::sscanf(a.c_str(), "%d.%d%c", &x, &y, &tail) != 2) return std::string();
+    char b[48]; std::sprintf(b, "zone.%d.%d", x, y);
+    return std::string(b);
 }
 
 const int kZrAccept = 0;               /* the sender holds the area */
@@ -177,6 +190,25 @@ inline const char* ZoneKeptAdoptWhy(int why)
     }
     return "unknown";
 }
+/* T-1351: is a record (curWrittenAt, curSeq) NEWER than the copy loaded from record (loadedWrittenAt, loadedSeq)? The save gate's own
+   test (store.cpp ZoneLoadedCopyOlder calls this): a later stamp, or the same stamp and a higher notebook seq when the loaded seq is
+   known (loaded seq 0 = this game's own write, never read as older). 1 = newer. */
+inline int ZoneRecordNewerThanLoaded(long long loadedWrittenAt, unsigned long long loadedSeq, long long curWrittenAt, unsigned long long curSeq)
+{
+    if (curWrittenAt != loadedWrittenAt) return (curWrittenAt > loadedWrittenAt) ? 1 : 0;
+    return (loadedSeq != 0 && curSeq > loadedSeq) ? 1 : 0;
+}
+/* T-1351 (run T2381): may a record of a zone with a kept mark, written by ANOTHER slot, set the mark's "a newer record landed" time
+   (the sinceLimit ZoneKeptAdoptJudge is given)? hasFromEntry: this game holds a loaded-from-record entry for the zone (the record its
+   copy was loaded from, or adopted as); then only a record NEWER than that one sets it - a re-publish of the same record (the
+   end-of-first-snapshot loop re-publishes every kept record) or of an older one leaves it unset, else the landed time lands before
+   the area's own loaded mark and the kept-in-step test refuses every save for good. No entry: set (the behaviour before T-1351).
+   1 = set it. */
+inline int ZoneRecordLandedSets(int hasFromEntry, long long loadedWrittenAt, unsigned long long loadedSeq, long long curWrittenAt, unsigned long long curSeq)
+{
+    if (hasFromEntry == 0) return 1;
+    return ZoneRecordNewerThanLoaded(loadedWrittenAt, loadedSeq, curWrittenAt, curSeq);
+}
 
 /* T-1279 (owner decision 1580, 2026-11-09: "a save of your own area that gets refused will be logged as a fault rather than only
    counted"; owner rule 1556: a game is in charge of an area it has loaded). A zone save this game refused as a stale copy is a FAULT
@@ -250,6 +282,30 @@ inline int ZoneEmptyMayPublish(int hasFile, int readDue) { return (hasFile == 0 
    dropped when a main-thread save of the same area came after it was queued (a newer state - it must not be overwritten). queuedSeq /
    lastMainSaveSeq: one counter both draw from (0 = no main-thread save of the area). 1 = drop it. */
 inline int ZoneQueuedEmptyStale(long long queuedSeq, long long lastMainSaveSeq) { return lastMainSaveSeq > queuedSeq ? 1 : 0; }
+
+/* T-1443 (F1379 design b; fold 1, F1382 SHOULD 2): NO AREA RECORD OF THIS GAME'S OWN SAVE LEAVES WITH AN UNKNOWN OWNER. The owner field
+   (storemeta.h) is the writer's slot, 0xFFFFFFFF unknown. At the send (store.cpp SendRecordAny) an unknown owner is stamped with this
+   game's own owner field (myField) ONLY on a record this game's own area save produced while it had no slot (ownSlotlessSave - marked
+   on the save road, ZoneOwnSaveMarked, never by the WELCOME's re-push); while this game still has none that record is not sent (kept
+   here, file and record, for a later send). Any other record keeps its owner as it is - an unknown one included (another game's record
+   re-pushed): its writer is not this game. */
+const unsigned int kZoneOwnerUnknown = 0xFFFFFFFFu;
+enum { kZsSendAsIs = 0, kZsSendStamped = 1, kZsHoldNoSlot = 2 };
+inline int ZoneSendOwnerDecide(unsigned int owner, unsigned int myField, int ownSlotlessSave, unsigned int* out)
+{
+    if (out) *out = owner;
+    if (owner != kZoneOwnerUnknown || ownSlotlessSave == 0) return kZsSendAsIs;
+    if (myField == kZoneOwnerUnknown) return kZsHoldNoSlot;
+    if (out) *out = myField;
+    return kZsSendStamped;
+}
+/* the save road's mark: this game's own area save of `stamp` (its writtenAt) was made with no slot (markStamp = the stamp marked) */
+inline int ZoneOwnSaveMarked(int haveMark, long long markStamp, long long stamp) { return (haveMark != 0 && markStamp == stamp) ? 1 : 0; }
+/* the copy held here takes the stamped owner too only when it IS that save (unknown owner, the same stamp) - never another record */
+inline int ZoneHeldRelabel(int decision, unsigned int heldOwner, long long heldWrittenAt, long long stamp)
+{
+    return (decision == kZsSendStamped && heldOwner == kZoneOwnerUnknown && heldWrittenAt == stamp) ? 1 : 0;
+}
 
 }   /* namespace zonerec */
 

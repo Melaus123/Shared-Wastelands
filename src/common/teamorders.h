@@ -107,6 +107,101 @@ inline bool MenuEnemySite(bool inBuild, bool sameThread, unsigned long long retR
 {
     return inBuild && sameThread && siteRva != 0 && retRva == siteRva;
 }
+// ---- T-1167 piece 1 (owner 1633 / 1634 / 1635): THE PLAYER TRADE WINDOW's right-click entry, its label and the click ----
+// LOOT_TARGET 26 is the engine's own order on a character that is down (decomp_7a6b76.txt:581, the word 'Loot'). On ANOTHER player's
+// character (a teammate's or not) that is AWAKE and that isEnemy says is not an enemy, the menu offers it too, labelled 'Trade', and
+// the click opens the mod's TRADE window instead of giving the order (policy.cpp T-1167 block; tradewin.cpp the window).
+const int kLoot = 26;
+// The list built for a character gets order 26: another player's character, awake, not an enemy (the engine's isEnemy answer).
+inline bool TradeOffered(bool otherPlayer, bool awake, bool enemy) { return otherPlayer && awake && !enemy; }
+inline bool HasLoot(const int* t, int n)
+{
+    if (t == 0 || n <= 0) return false;
+    for (int i = 0; i < n; ++i) if (t[i] == kLoot) return true;
+    return false;
+}
+// The fill hook adds 26 (through the engine's own list add) only when it is offered and the list does not hold it yet.
+inline bool TradeFillAdds(bool offered, const int* t, int n) { return offered && n >= 0 && !HasLoot(t, n); }
+// After the engine's list add appended 26: the first 26 in the list moved to the front, every other order kept in its order.
+// Returns the index the 26 was at (0 = already first), -1 when the list holds none (nothing moved).
+inline int TradeToFront(int* t, int n)
+{
+    if (t == 0 || n <= 0) return -1;
+    int at = -1;
+    for (int i = 0; i < n && at < 0; ++i) if (t[i] == kLoot) at = i;
+    if (at <= 0) return at;
+    for (int i = at; i > 0; --i) t[i] = t[i - 1];
+    t[0] = kLoot;
+    return at;
+}
+// The label (owner 1634): order 26 on another player's character reads 'Trade' while the character is awake (the trade window);
+// knocked out it keeps the engine's own word ('Loot': a stand-in faction has no player interface, decomp_79a730.txt:249). Any
+// other order, target or owner keeps the engine's word.
+const int kLabelEngine = 0, kLabelTrade = 1;
+inline int TradeLabel(int task, bool character, bool otherPlayer, bool awake, bool enemy)   /* T-1167 fold: an enemy keeps the engine's word */
+{
+    return (task == kLoot && character && otherPlayer && awake && !enemy) ? kLabelTrade : kLabelEngine;
+}
+inline const char* TradeWord() { return "Trade"; }
+// The squared distance on the ground (x, z) is under the engine's trade range constant (0x70C6C0 compares the same way, strictly);
+// a range that was not read (0 or less) is never in range.
+inline bool InTradeRange(float ax, float az, float bx, float bz, float rangeSq)
+{
+    if (!(rangeSq > 0.0f)) return false;
+    const float dx = bx - ax, dz = bz - az;
+    return dx * dx + dz * dz < rangeSq;
+}
+// The order pre-check's decision (0x5D0EB0, hooked): order 26 given by this player's own character to another player's AWAKE
+// character that is not an enemy -> the TRADE window (in range) or the refusal "Out of trading range"; either way the engine's
+// order is not given. Everything else -> the engine's own pre-check, unchanged (a knocked-out character keeps the loot road).
+const int kClickEngine = 0, kClickWindow = 1, kClickRefused = 2;
+inline int TradeClick(int task, bool actorOwn, bool otherPlayer, bool awake, bool enemy, bool inRange)
+{
+    if (task != kLoot || !actorOwn || !otherPlayer || !awake || enemy) return kClickEngine;
+    return inRange ? kClickWindow : kClickRefused;
+}
+inline const char* ClickWord(int d) { return d == kClickWindow ? "window" : d == kClickRefused ? "refused" : "engine"; }
+// ---- T-1406 (owner 1757, mock-up 1758): 'Invite to faction' in the right-click menu on another player's character ----
+// The entry carries a mod-chosen order number that no engine order uses: the order-word switch 0x79A730 ends at 0x122 and answers ""
+// for any other number (decomp_79a730.txt:116-125, 179-184), the restricted-orders filter 0x7F1810 passes every number while that
+// mode is off, and the per-entry test 0x7F5A40 answers 0 for it. It is the largest number in the list, so the menu (an ordered set)
+// shows it last. The engine never acts on it: the click hook on newPlayerTask 0x7F9AB0 takes it before the task table 0x281F90.
+const int kInviteOrder = 0x1406;   /* 5126 */
+// Shown only when (1) the menu's own checks passed for the clicked character (another player's, awake, NEITHER side
+// hostile by PeerHostile below, one of this player's own characters selected - policy.cpp InviteMenuOffer), (2) the PLAYERS tab's own rule would show INVITE TO FACTION
+// for that player (teamscreen::ViewFor(..).right == kActInvite: online, in no faction of players, this player not a mere member),
+// and (3) all three hooks (fill, word, click) are in - without the click hook the number would reach the engine's task table.
+inline bool InviteOffered(bool tradeChecks, bool tabInvites, bool allHooks) { return tradeChecks && tabInvites && allHooks; }
+// ---- T-1406 (T2524 leg 4, F1206; owner 1633 / 1758 a): 'hostile' for ANOTHER player's character, as the menu, the label and the
+// click read it ----
+// The engine's isEnemy answered 'not an enemy' with this player's standing -100 towards that player's faction (T2524 L4), so a
+// player set HOSTILE on the PLAYERS tab was still offered Trade and Invite. For another player's character the answer is the stance
+// the PLAYERS tab shows (playerstab.cpp PlayersTabStance: its own rows): Trade is hidden when EITHER side is hostile (a trade needs
+// both sides, owner 1633), and so is Invite (F1214, the owner 2026-11-18: 'invite ... shouldn't be available for hostile') - the
+// same answer as the tab's own invite rule, teamscreens.h InviteStanceAllows, which PlayersTabInvites reads after this check. A teammate is never
+// hostile (its side is held at ally, as the isEnemy hook already answered). No row on the tab (stance not read): the engine's answer.
+// NPCs never come here (policy.cpp TrFactsOf: another player's character only).
+const int kHostileForTrade = 0, kHostileForInvite = 1;
+inline bool PeerHostile(int kind, bool stanceRead, bool teammate, bool youHostile, bool themHostile, bool engineEnemy)
+{
+    if (teammate) return false;
+    if (!stanceRead) return engineEnemy;
+    (void)kind;   /* T-1406 (F1214): Trade and Invite now give the same either-side answer; the kind stays for the callers' lines */
+    return youHostile || themHostile;
+}
+inline bool HasOrder(const int* t, int n, int task)
+{
+    if (t == 0 || n <= 0) return false;
+    for (int i = 0; i < n; ++i) if (t[i] == task) return true;
+    return false;
+}
+// The fill adds the number (through the engine's own list add) only when offered and the list does not hold it yet.
+inline bool InviteFillAdds(bool offered, const int* t, int n) { return offered && n >= 0 && !HasOrder(t, n, kInviteOrder); }
+// The word (approved text, exactly) for the entry's number; every other number keeps the engine's word.
+inline bool InviteLabelled(int task) { return task == kInviteOrder; }
+inline const char* InviteWord() { return "Invite to faction"; }
+// The click: the entry's number is caught (the invitation sent, the menu closed as the engine closes it) and never passed on.
+inline bool InviteCaught(int task) { return task == kInviteOrder; }
 // "61,45,31" (the order numbers as listed), "none" for an empty list.
 inline std::string ListText(const int* t, int n)
 {

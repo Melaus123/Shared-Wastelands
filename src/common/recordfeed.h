@@ -45,7 +45,8 @@
 
 namespace coopfeed {
 
-const unsigned int kFeedProtocol = 153;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+const unsigned int kFeedProtocol = 170;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+
 
 
 
@@ -247,6 +248,20 @@ inline int FeedHeldCoversKey(const std::string& key, long long heldFile, long lo
 {
     if (!FeedHeldKeyListed(key)) return 0;
     return FeedHeldCovers(heldFile, heldPos, heldOwner, srvHasFile, srvFile, srvPos, srvOwner);
+}
+/* T-1421 (F1215): A HEADER-ONLY RECORD IS 'YOU ALREADY HOLD IT', NOT 'NO RECORD'. The game's receive of a record with no contents of a
+   kind whose receiver needs the whole contents (a door, a building, a cage or a town clock record: store.cpp ApplyRemoteRecord) - as
+   a conditional fetch's 'not modified' - takes the contents from the copy this game holds: the row its HELD list named (store.cpp
+   StoreFeedTick), when that row has a file time, its later time is at least the header's stamp (the world server's own judgement,
+   FeedHeldCovers / FeedHeldHeaderStamp) and its file was read with contents. Else the record is asked for in full once (the
+   records-before-the-load FETCH, preload.h kPreFetch, which the world server answers with whole RECORDs) and logged; asked once
+   already, logged only. A record with contents, or of another kind, is unchanged. */
+enum { kHoPass = 0, kHoOwnCopy = 1, kHoAsk = 2, kHoLogOnly = 3 };
+inline int FeedHeaderOnlyDecide(int bytesEmpty, int kindNeedsBytes, int heldHave, long long heldFile, long long heldPos, long long headerStamp, int ownRead, int askedBefore)
+{
+    if (!bytesEmpty || !kindNeedsBytes) return kHoPass;
+    if (heldHave && heldFile > 0 && heldPos >= headerStamp && ownRead) return kHoOwnCopy;
+    return askedBefore ? kHoLogOnly : kHoAsk;
 }
 
 /* WHO GETS A LIVE FORWARD. RECORD and UNIQUE_STATE go only to a subscribed connection; every other type (RECORD_GONE - review H1 - and the

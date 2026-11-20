@@ -26,6 +26,13 @@ namespace coop {
 // are sampled (at most kCrimeScanPerTick a call) and a change goes out as MSG_CRIME. Does nothing while EngineWritesBlocked().
 void CrimeTick();
 
+// T-1442 step 5 (F1453 design A): MAIN THREAD, every frame. The characters the setCrime detour noted (any thread) are decided at
+// the next main-thread frame with the sampler's own per-character decision and sent if changed. The note is made before setCrime's
+// caller writes the time left: a main-thread caller's crime goes with its time; an AI-worker caller's may go before its time is
+// written (then the sampler corrects it, counted lateExpiry). The sampler above is the backstop (the countdown's clear, link resets,
+// newly announced characters, anything missed), each send counted by why. Nothing while EngineWritesBlocked() (notes dropped).
+void CrimeEventDrainTick();
+
 // MAIN THREAD (the session drain). A decoded MSG_CRIME: checked against the sender's ownership and queued (latest per uid
 // wins) for CrimeApplyDrain.
 void ApplyRemoteCrime(unsigned int uid, const coopcrime::CrimeState& s, unsigned int fromPeer);

@@ -68,6 +68,8 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
 void DoorsRecAreaLay(int c);
 // ... area c left this game's loaded areas (its doors are laid again at its next load); a new world-server link lays every area again.
 void DoorsRecAreaLeft(int c);
+/* T-1400 review 1, MAIN THREAD: a zone of area c finished loading (build.cpp's zone scan) - the area's owed door keys are looked up by key */
+void DoorsRecAreaLoaded(int c);
 void DoorsRecLinkReset();
 // townver.cpp: area c's town was rebuilt here (its saved buildings replaced) - at the area's lay (or, laid already, the next area map)
 // its holder removes the area's door records whose key names no live door here.

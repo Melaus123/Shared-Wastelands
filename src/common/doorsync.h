@@ -804,4 +804,14 @@ inline const char* DoorTestRecWhy(int why)
     }
     return "?";
 }
+/* T-1400 (F1184 design C): IS THIS DOOR ENTRY'S DOOR STILL LOADED - yes, no, or UNSURE. The engine's building list is the test (a
+   pointer compare); a list that could not settle (a zone was taken apart during both of its walks, items.cpp ItBoxWalkNow) lists
+   nothing, and "not listed" then says nothing about the door. Unsure: no drop site drops the entry that tick and nothing is called
+   through its pointer either - the site asks again later. */
+const int kDoorActiveNo = 0, kDoorActiveYes = 1, kDoorActiveUnsure = 2;
+inline int DoorActiveAnswer(int listed, int walkUnsettled)
+{
+    if (listed != 0) return kDoorActiveYes;
+    return (walkUnsettled != 0) ? kDoorActiveUnsure : kDoorActiveNo;
+}
 }   /* namespace coopdoor */

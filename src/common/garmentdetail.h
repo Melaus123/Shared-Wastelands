@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -191,6 +192,119 @@ inline int GarmentColourDecide(bool sent, bool fieldOk, bool sidFound)
     if (!fieldOk) return kColourNoField;
     if (!sidFound) return kColourUnknownSid;
     return kColourApply;
+}
+
+/* T-1382 (owner 1702): ONE LOG LINE FOR A COLOUR THAT DID NOT GO ON. The REPORT line counts the failures (itemColour / kitColour);
+ * this names each one, at most kColourFailLineCap a launch, then ColourFailCapLine once:
+ *   [ITEMS] colour not applied #<n> road=<live|kit> item='<name>' sid=<base sid> colour='<colour sid>' holder='<name>' (<whose>)
+ *           - <cause>: the item keeps its own colour
+ * whose: this game's character / another game's character / an NPC / no character (a box, shop or ground item) / unreadable. */
+const int kColourWhyNoItem = 1, kColourWhyNoRow = 2, kColourWhyLookupFault = 3, kColourWhyUnknownSid = 4, kColourWhyBadRecord = 5,
+          kColourWhyWriteFault = 6;
+const int kColourWhoNone = 0, kColourWhoMine = 1, kColourWhoOther = 2, kColourWhoNpc = 3, kColourWhoUnread = 4;
+const long kColourFailLineCap = 40;
+
+/* k = this line's number this launch, counted before it is written (1 = the first): 0 drop it, 1 write it, 2 write it and then
+   the cap line (the last one allowed). */
+inline int ColourFailCapStep(long k)
+{
+    if (k < 1 || k > kColourFailLineCap) return 0;
+    return (k == kColourFailLineCap) ? 2 : 1;
+}
+inline const char* ColourWhyWords(int why)
+{
+    switch (why)
+    {
+    case kColourWhyNoItem:      return "the made item could not be read, so no colour was looked up";
+    case kColourWhyNoRow:       return "this game version has no address for the colour lookup, so no colour was looked up";
+    case kColourWhyLookupFault: return "looking the colour up crashed and was caught";
+    case kColourWhyUnknownSid:  return "this game has no colour by that id (most likely a mod the other game has and this one lacks)";
+    case kColourWhyBadRecord:   return "the lookup's answer does not look like a colour record";
+    case kColourWhyWriteFault:  return "the colour was found but writing it onto the item crashed and was caught";
+    default:                    return "unknown cause";
+    }
+}
+inline const char* ColourWhoWords(int who)
+{
+    switch (who)
+    {
+    case kColourWhoNone:  return "no character: a box, shop or ground item";
+    case kColourWhoMine:  return "this game's character";
+    case kColourWhoOther: return "another game's character";
+    case kColourWhoNpc:   return "an NPC";
+    default:              return "whose could not be read";
+    }
+}
+/* a game string on the line: line breaks, tabs and other control bytes become spaces, a quote becomes a backtick, at most maxLen;
+   empty prints as ? */
+inline std::string ColourClean(const std::string& s, size_t maxLen)
+{
+    std::string r = s.substr(0, maxLen);
+    for (size_t i = 0; i < r.size(); ++i)
+    {
+        if ((unsigned char)r[i] < 0x20 || r[i] == 0x7F) r[i] = ' ';
+        else if (r[i] == '\'') r[i] = '`';
+    }
+    return r.empty() ? std::string("?") : r;
+}
+inline std::string ColourFailLine(long n, int road, const std::string& baseSid, const std::string& itemName, const std::string& colorSid,
+                                  const std::string& holderName, int who, int why)
+{
+    char num[24];
+    std::sprintf(num, "%ld", n);
+    return std::string("[ITEMS] colour not applied #") + num + " road=" + (road != 0 ? "kit" : "live") + " item='" + ColourClean(itemName, 64)
+         + "' sid=" + ColourClean(baseSid, 64) + " colour='" + ColourClean(colorSid, kGarmentMaxColor) + "' holder='"
+         + (who == kColourWhoNone ? std::string("-") : ColourClean(holderName, 64)) + "' (" + ColourWhoWords(who) + ") - "
+         + ColourWhyWords(why) + ": the item keeps its own colour";
+}
+inline std::string ColourFailCapLine()
+{
+    char num[24];
+    std::sprintf(num, "%ld", kColourFailLineCap);
+    return std::string("[ITEMS] colour not applied: line cap reached (") + num
+         + ") - further ones are counted on the REPORT itemColour / kitColour tokens only";
+}
+
+/* T-1413 (F1209): ONE LINE PER GARMENT PUT ON ANOTHER PLAYER'S CHARACTER'S COPY, written in the release build too (log only):
+ *   [COLOUR] #<n> road=<live|kit> char='<name>' (<whose>) item='<name>' sid=<base sid> sent='<colour sid>'|none -> <result> now=<...>
+ * result: what the colour step did (ColourSeenResultWords); now: the colour record the garment holds right after the step, read back
+ * off the item (its sid, 'none' = no colour record on it, 'unread' = the read failed). Cap: the first kColourSeenFirst lines a
+ * launch, then every kColourSeenEvery-th (the number counts every such garment, written or not). */
+const long kColourSeenFirst = 200, kColourSeenEvery = 100;
+const int kColourSeenNoDetail = -1;   /* the result for a kit row that carried no garment details (no colour sent) */
+const int kColourNowUnread = 0, kColourNowNone = 1, kColourNowSid = 2;
+/* k = this garment's number this launch (1 = the first): true = write its line */
+inline bool ColourSeenCapPass(long k)
+{
+    return k >= 1 && (k <= kColourSeenFirst || k % kColourSeenEvery == 0);
+}
+/* d: the colour step's answer (kColourNone / kColourApply / kColourUnknownSid / kColourNoField, or kColourSeenNoDetail); why: its
+   cause (kColourWhy*) when not applied */
+inline std::string ColourSeenResultWords(int d, int why)
+{
+    if (d == kColourSeenNoDetail) return "skipped: the kit row carried no garment details, so no colour was sent";
+    if (d == kColourNone) return "no colour in the record: the garment keeps the engine's own colour";
+    if (d == kColourApply) return "applied";
+    return std::string("not applied: ") + ColourWhyWords(why);
+}
+inline std::string ColourSeenLine(long n, int road, const std::string& charName, int who, const std::string& itemName,
+                                  const std::string& baseSid, const std::string& sent, int d, int why, int nowState, const std::string& nowSid)
+{
+    char num[24];
+    std::sprintf(num, "%ld", n);
+    std::string r = std::string("[COLOUR] #") + num + " road=" + (road != 0 ? "kit" : "live") + " char='" + ColourClean(charName, 64)
+                  + "' (" + ColourWhoWords(who) + ") item='" + ColourClean(itemName, 64) + "' sid=" + ColourClean(baseSid, 64)
+                  + " sent=" + (sent.empty() ? std::string("none") : "'" + ColourClean(sent, kGarmentMaxColor) + "'")
+                  + " -> " + ColourSeenResultWords(d, why) + " now="
+                  + (nowState == kColourNowSid ? "'" + ColourClean(nowSid, kGarmentMaxColor) + "'"
+                                               : std::string(nowState == kColourNowNone ? "none" : "unread"));
+    if (n == kColourSeenFirst)
+    {
+        char every[24];
+        std::sprintf(every, "%ld", kColourSeenEvery);
+        r += std::string(" (line cap: from here only every ") + every + "th garment's line is written)";
+    }
+    return r;
 }
 
 } // namespace coopgarment

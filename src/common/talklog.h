@@ -146,4 +146,51 @@ inline std::string CapLine()
     return "[TALKLOG] cap reached - no more conversation window lines this launch (" + Num(kCap) + ")";
 }
 
+/* T-1379 / T-1380: a player's conversation window that ends within kEarlyEndMs of opening (the reporter's host talk ended 8 ms
+   after it opened, on the AI thread) gets one EARLY END line naming the end's caller and thread, so a later report says what cut it:
+     [TALKLOG] EARLY END #<n> at=<s> fin=<0|1> caller=<module>+0x<offset> tid=<n> <thread name> paused= thread=
+   At most kEarlyCap a launch (its own count, apart from kCap), then EarlyCapLine once. */
+const unsigned int kEarlyEndMs = 1000;
+const long kEarlyCap = 20;
+
+/* 1 = an end at nowMs of a window opened at openMs is early (ticks wrap like GetTickCount) */
+inline int EarlyEnd(unsigned int nowMs, unsigned int openMs) { return ((unsigned int)(nowMs - openMs) < kEarlyEndMs) ? 1 : 0; }
+
+inline int EarlyCapStep(long k)
+{
+    if (k < 1 || k > kEarlyCap) return 0;
+    return (k == kEarlyCap) ? 2 : 1;
+}
+
+inline std::string EarlyCapLine()
+{
+    return "[TALKLOG] EARLY END cap reached - no more early end lines this launch (" + Num(kEarlyCap) + ")";
+}
+
+/* the file name of a module path (after the last '\\', '/' or ':'); '?' for none */
+inline std::string FileNameOnly(const char* path)
+{
+    if (path == 0 || path[0] == 0) return "?";
+    const char* s = path;
+    for (const char* p = path; *p != 0; ++p) if (*p == '\\' || *p == '/' || *p == ':') s = p + 1;
+    return (*s == 0) ? std::string("?") : std::string(s);
+}
+
+/* module+0x<offset>; an address in no module (known 0): '?+0x<address>' */
+inline std::string Place(const std::string& module, unsigned long long off, int known)
+{
+    char b[48];
+    std::sprintf(b, "+0x%llX", off);
+    return (known ? module : std::string("?")) + b;
+}
+
+inline std::string EarlyEndLine(long n, const std::string& at, int fin, const std::string& caller, unsigned long tid, const char* thread,
+                                int paused, int mainThread)
+{
+    char b[48];
+    std::sprintf(b, " tid=%lu ", tid);
+    return "[TALKLOG] EARLY END #" + Num(n) + " at=" + at + " fin=" + Num(fin ? 1 : 0) + " caller=" + caller + b
+         + std::string(thread != 0 && thread[0] != 0 ? thread : "?") + Tail(paused, mainThread);
+}
+
 }   /* namespace talklog */

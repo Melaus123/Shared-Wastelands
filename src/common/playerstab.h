@@ -134,11 +134,12 @@ struct RowView
     std::string cell[kColumns];   /* PLAYER is coloured (ColouredName), the others plain */
     std::string faction;          /* the faction name as shown, for the stance line, the box and the message lines */
     int you, tag;                 /* this player's own level towards them (the ticked button), and the tag's level */
+    int them;                     /* T-1406: their level towards this player (the THEM cell's; unread = neutral, as shown) */
     bool teammate;                /* T-546 step 4: a teammate - ALLY ticked, NEUTRAL and HOSTILE disabled */
     bool founderSets;             /* T-546 step 5 (476): the founder's stance - the founder's value ticked, every button disabled */
     bool online, inTeam;          /* the faction screens' bottom line (teamscreens.h): INVITE TO FACTION only to an online player in no faction of players */
     std::string name;             /* the player's name as this game knows it, for the faction screens' words ("" = not known) */
-    RowView() : slot(-1), you(nametag::kNeutral), tag(nametag::kNeutral), teammate(false), founderSets(false), online(false), inTeam(false) {}
+    RowView() : slot(-1), you(nametag::kNeutral), tag(nametag::kNeutral), them(nametag::kNeutral), teammate(false), founderSets(false), online(false), inTeam(false) {}
 };
 inline RowView RowFor(const RowIn& in)
 {
@@ -150,6 +151,7 @@ inline RowView RowFor(const RowIn& in)
     r.tag = nametag::WorseLevel(in.you, in.them);
     r.you = (in.you >= nametag::kFriendly && in.you <= nametag::kHostile) ? in.you : nametag::kNeutral;
     const int them = (in.them >= nametag::kFriendly && in.them <= nametag::kHostile) ? in.them : nametag::kNeutral;
+    r.them = them;
     r.online = in.online;
     r.inTeam = in.inTeam && !in.teammate;
     r.name = PlayerWords(in.rosterName, in.rememberedName, std::string());

@@ -37,6 +37,7 @@
 // feature down for the rest of the process after removing whatever of it was on screen.
 
 #include "coop_log.h"
+#include "crashwatch.h"   /* T-1374: KenshiSaveRoot */
 #include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_Widget.h>
 #include <mygui/MyGUI_Button.h>
@@ -61,6 +62,7 @@
 #include "soak.h"                          /* GameplayRunning */
 #include "doors.h"                         /* ReportDoors - the door totals go into the log a report packs */
 namespace coop { std::string ItemsKeeperRepairToken(); }   /* T-910: items.cpp (declared in items.h) - the empty-shop repairs on the report's header */
+#include "command_channel.h"               /* T-1401: ReportEverythingForReport - every REPORT counter set into the log a report packs */
 #include "farm.h"                          /* ReportFarm - the [FARM] / [MINE] totals go into the log a report packs */
 #include "net/session.h"                   /* SessionProtocolVersion */
 #include "../common/bugreport.h"
@@ -72,6 +74,8 @@ namespace coop { std::string ItemsKeeperRepairToken(); }   /* T-910: items.cpp (
 #include "../common/liveenvelope.h"        /* kRouteArea, kRouteSlot */
 #include "../common/panelstatus.h"         /* NoticeBoxH / NoticeLayoutIn - the message-box layout the other boxes use */
 #include "../common/storemeta.h"           /* coopstore::Crc32 */
+#include "../common/areareport.h"          /* T-1402: the reporter's stored map square - its file list, the .meta check, the budget part */
+#include "../common/zonecheck.h"           /* T-1402: an area file read to its end (ReadableBytes) */
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -189,6 +193,9 @@ volatile long g_stop[64];
 volatile long* StopOf(long gen) { return &g_stop[(unsigned long)gen % 64u]; }
 volatile long g_testStop = 0;   /* the TEST-ONLY bugpack lever's stop flag: never raised, a test pack runs to its end */
 volatile long g_testBusy = 0;   /* 1 while a test pack is being made */
+/* T-1401 2b: the test pack asks nearby games too; the main thread hands their answers over here (g_cs) */
+struct TestNearby { int done; std::vector<NearbyLog> nearby; std::string note; TestNearby() : done(1) {} };
+TestNearby g_testNb;
 
 /* ---- the nearby players' answers to this game's ask: MAIN THREAD ---- */
 struct Collect
@@ -199,7 +206,9 @@ struct Collect
     DWORD askAt;
     int sx, sy;
     std::map<unsigned int, coopbug::PartsJoin> joins;   /* by the answering game's slot */
-    Collect() : active(0), gen(0), askId(0), askAt(0), sx(-1), sy(-1) {}
+    std::map<unsigned int, coopbug::NearbyReply> replies;   /* T-1401 2b: each asked game's LOG_REPLY codes, by its slot */
+    int test;               /* 1 = asked by the TEST-ONLY bugpack lever: answers go to g_testNb, no report generation */
+    Collect() : active(0), gen(0), askId(0), askAt(0), sx(-1), sy(-1), test(0) {}
 };
 Collect g_col;
 unsigned int g_askNext = 0;
@@ -221,6 +230,7 @@ long long g_ansRefused = 0;                  /* asks refused since this game sta
 long long g_ansRefusedUnlogged = 0;          /* ... of which no log line has spoken yet */
 int g_ansRefusalLogged = 0;
 DWORD g_ansRefusalLogAt = 0;
+coopbug::AskQueue g_ansQueue;                /* MAIN THREAD (T-1401 2b): asks that came while this game was busy, oldest first (at most 4) */
 
 std::string Num(unsigned long long v) { char b[32]; _snprintf(b, 31, "%llu", v); b[31] = 0; return b; }
 std::string NumI(long long v) { char b[32]; _snprintf(b, 31, "%lld", v); b[31] = 0; return b; }
@@ -298,8 +308,11 @@ std::wstring GameFolder()
 /* Kenshi's crash file that ended one of the two kept earlier launches (coopbug::CrashLaunch), looked for in each of `folders`
    (swcrashkeep::CrashFolders: the running program's folder and the main game folder): launch 1's before launch 2's, then a .zip
    before a .dmp, the newest first. Returns the launch it ended (1 = the previous launch, 2 = the one before it), or 0 when none
-   is attached. `log1End` / `log2End`: the kept copies' last-write times, 0 = that copy is absent. */
-int FindCrash(const std::vector<std::wstring>& folders, long long log1End, long long log2End, std::string* name, std::vector<unsigned char>* bytes)
+   is attached. `log1End` / `log2End`: the kept copies' last-write times, 0 = that copy is absent. T-1374 fold: `crash1At` /
+   `crash2At` - the time on that copy's [CRASH] line (swcrashkeep::CrashLineUtcSec), 0 = none: Kenshi's file has ONE fixed
+   name, so a launch with a [CRASH] time takes only a file written at or after it (swcrashkeep::CrashLaunchOfLines). */
+int FindCrash(const std::vector<std::wstring>& folders, long long log1End, long long log2End, long long crash1At, long long crash2At,
+              std::string* name, std::vector<unsigned char>* bytes)
 {
     if (folders.empty()) return 0;
     FILETIME ct, et, kt, ut;
@@ -319,7 +332,7 @@ int FindCrash(const std::vector<std::wstring>& folders, long long log1End, long 
             const unsigned long long size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             /* Kenshi's own file is about 0.3-0.6 MB; anything far bigger is not it (367 a: no Windows full dumps) */
             if (kind == 0 || size > (4ull << 20)) continue;
-            const int ended = coopbug::CrashLaunch(t, launch, log1End, log2End);
+            const int ended = swcrashkeep::CrashLaunchOfLines(t, launch, log1End, log2End, crash1At, crash2At);
             if (ended == 0) continue;
             if (bestLaunch == 0 || ended < bestLaunch
                 || (ended == bestLaunch && (kind > bestKind || (kind == bestKind && t > bestAt))))
@@ -464,6 +477,20 @@ struct Job
     std::string keeperText;  /* T-910: every [KEEPER] line of this launch (LogKeeperLinesText), for keeper-lines.txt */
     std::wstring crashFolder;   /* <mod folder>\crashes\ (src/common/crashkeep.h); empty = the mod folder could not be read */
     int testPack;               /* 1 = the TEST-ONLY bugpack lever: packed as a report is, listed in the log, never sent */
+    /* T-1402 (owner 1740 a): the stored copy of the reporter's map square, named on the main thread (FillJob), read on the worker */
+    int haveArea, areaX, areaY;                 /* the square (zones.cpp MyLastPlayerSector); haveArea 0 = none seen this launch */
+    std::string areaMirror, areaServerDir;      /* its mirror file; the world server's folder, only on the game that runs it */
+    std::string areaStamp;                      /* this game's record of the square's area, in words */
+    std::string areaServerWhy;                  /* run T2493: why areaServerDir is "" (store.cpp StoreAreaServerNoneWhy) */
+    std::vector<int> ringX, ringY;              /* the eight squares around it: listed, never attached */
+    std::vector<std::string> ringMirror, ringStamp;
+    std::string testSid;                        /* the bugpack lever's <sid>: each area file's records naming it are counted */
+    /* T-1402 fold 1: the mirror file's BYTES, read in FillJob ON THE MAIN THREAD - the one thread that writes mirror area files
+       (store.cpp ZoneMirrorCommit / ZoneIndexMirrorCopy, temp + MoveFileEx with no retry): a read held open on the worker could make
+       that replace fail and leave the game serving an old copy. areaMirrorState: coopstore::FileState (kFileAbsent when not read). */
+    std::vector<char> areaMirrorBytes;
+    int areaMirrorState, areaMirrorTooBig;
+    unsigned long areaMirrorErr;
 };
 const char* const kKeeperLinesFile = "keeper-lines.txt";   /* T-910 */
 struct ZipPart
@@ -476,7 +503,213 @@ struct ZipPart
     int cutFirst;                           /* coopbug::BudgetPart::cutFirst (0 when left out of the initialiser) */
     int keptAge, keptKind;                  /* a kept launch's file (order kOrderKeptCrash): its entry's age (0 = newest) and
                                                swcrashkeep::kKind* - the budget part is swcrashkeep::KeptLogPart / KeptFilePart */
+    int areaServer;                         /* T-1402: an area file (order kOrderArea): 1 = a world-server copy (areareport::AreaPart) */
 };
+/* T-1402: ONE FILE OF THE REPORTER'S STORED MAP SQUARE. Read whole (binary - never PackLog, whose address scrub would change its bytes),
+   compressed as ONE segment so it goes into the report whole or not at all. */
+struct AreaFile
+{
+    std::string zipName, what;
+    coopbug::LogPack pack;
+    int serverCopy;
+    std::string sidNote;   /* the bugpack lever's count (empty otherwise) */
+    AreaFile() : serverCopy(0) {}
+};
+/* A whole file, at most `cap` bytes, shared with its writer. Its state as coopstore::FileState (a file over `cap` is kFileUnreadable,
+   *tooBig 1); *err = the Windows error when it could not be read. Reading only. */
+int ReadWhole(const std::wstring& path, unsigned long long cap, std::vector<char>* out, unsigned long* err, int* tooBig)
+{
+    out->clear(); *err = 0; if (tooBig) *tooBig = 0;
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        *err = ::GetLastError();
+        return (*err == ERROR_FILE_NOT_FOUND || *err == ERROR_PATH_NOT_FOUND) ? (int)coopstore::kFileAbsent : (int)coopstore::kFileUnreadable;
+    }
+    LARGE_INTEGER sz; sz.QuadPart = 0;
+    if (!::GetFileSizeEx(h, &sz)) { *err = ::GetLastError(); ::CloseHandle(h); return (int)coopstore::kFileUnreadable; }
+    if ((unsigned long long)sz.QuadPart > cap) { ::CloseHandle(h); if (tooBig) *tooBig = 1; return (int)coopstore::kFileUnreadable; }
+    out->resize((size_t)sz.QuadPart);
+    size_t got = 0;
+    while (got < out->size())
+    {
+        DWORD want = (DWORD)((out->size() - got) > (4u << 20) ? (4u << 20) : (out->size() - got)), n = 0;
+        if (!::ReadFile(h, &(*out)[got], want, &n, NULL) || n == 0) { *err = ::GetLastError(); break; }
+        got += n;
+    }
+    ::CloseHandle(h);
+    if (got != out->size()) { out->clear(); return (int)coopstore::kFileUnreadable; }   /* a short read: not what the file holds */
+    return (int)coopstore::kFileReadable;
+}
+/* The bugpack lever's count: the records of `b` (read by the area records' own reader) that hold `sid` - in their own id or any string
+   they carry (areareport::RecordsHolding) - and the raw occurrences of `sid` in the bytes. */
+std::string SidNote(const std::vector<char>& b, const std::string& sid)
+{
+    if (sid.empty()) return std::string();
+    std::vector<dupsquad::Rec> recs;
+    size_t at = 0;
+    const bool parsed = !b.empty() && dupsquad::ParseAllAt((const unsigned char*)&b[0], b.size(), &recs, &at);
+    unsigned long long n = 0, raw = 0;
+    n = areareport::RecordsHolding(recs, sid);   /* T2493 fix: its own id or any string it holds (an item names its kind in 'base data sid') */
+    for (size_t i = 0; i + sid.size() <= b.size(); ++i) if (std::memcmp(&b[i], sid.data(), sid.size()) == 0) ++raw;
+    return std::string("sid '") + sid + "': " + (parsed ? Num(n) + " record(s) of " + Num((unsigned long long)recs.size()) : std::string("not readable as records"))
+           + ", " + Num(raw) + " raw occurrence(s)";
+}
+/* One area file into *out: compressed whole as one segment. */
+void PackArea(const std::vector<char>& b, AreaFile* out)
+{
+    coopbug::Seg s;
+    s.rawLen = (unsigned int)b.size();
+    s.crc = coopstore::Crc32(b.empty() ? 0 : &b[0], b.size());
+    coopbug::CompressSegment(b.empty() ? 0 : (const unsigned char*)&b[0], b.size(), &s.bytes);
+    out->pack.rawTotal = b.size();
+    out->pack.segs.push_back(s);
+}
+/* The world server's folder's file names (no folders). False = the folder could not be listed (*err). T-885 piece 1 (privacy): the players'
+   own records folder (own\<profile id>\, ownrecwire.h) is a folder, so it is never listed, read or attached - keep it that way. */
+bool ListFolder(const std::wstring& dir, std::vector<std::string>* names, unsigned long* err)
+{
+    names->clear(); *err = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = ::FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) { *err = ::GetLastError(); return false; }
+    do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !coopbug::OwnRecName(Narrow(fd.cFileName))) names->push_back(Narrow(fd.cFileName)); } while (::FindNextFileW(f, &fd));
+    ::FindClose(f);
+    return true;
+}
+/* One world-server record's .meta line read and checked against its .platoon; *data = the .platoon's bytes when read. */
+/* T-1402 fold 2: the .meta line is read again after the .platoon; when the two reads differ (the world server wrote the record
+   meanwhile) the pair is read once more, and a second difference is areareport::kCheckChanged - 'changed while it was read', never torn. */
+int CheckServerRecord(const std::wstring& dir, const std::string& stem, std::vector<char>* data, coopstore::MetaLine* m, int* tooBig)
+{
+    const std::wstring metaPath = dir + L"\\" + Widen(stem) + L".meta", dataPath = dir + L"\\" + Widen(stem) + L".platoon";
+    std::vector<char> meta, metaAfter;
+    unsigned long err = 0;
+    int metaState = 0, dataState = 0;
+    bool same = false;
+    for (int attempt = 0; attempt < 2 && !same; ++attempt)
+    {
+        metaState = ReadWhole(metaPath, 65536u, &meta, &err, 0);
+        dataState = ReadWhole(dataPath, areareport::kFileMax, data, &err, tooBig);
+        const int afterState = ReadWhole(metaPath, 65536u, &metaAfter, &err, 0);
+        same = areareport::MetaSameBothReads(metaState, std::string(meta.begin(), meta.end()), afterState, std::string(metaAfter.begin(), metaAfter.end()));
+    }
+    const unsigned int crc = dataState == (int)coopstore::kFileReadable ? coopstore::Crc32(data->empty() ? 0 : &(*data)[0], data->size()) : 0u;
+    const int c = areareport::MetaCheck(metaState, std::string(meta.begin(), meta.end()), dataState, (long long)data->size(), crc, m);
+    return same ? c : (int)areareport::kCheckChanged;
+}
+std::string MetaWords(int check, const coopstore::MetaLine& m)
+{
+    if (check == areareport::kCheckNoMeta || check == areareport::kCheckMetaBad || check == areareport::kCheckUnreadable || check == areareport::kCheckChanged) return std::string();
+    return areareport::StampWords(m.owner == coopstore::kOwnerUnknown ? -1 : (int)m.owner, m.writtenAt, m.seq)
+           + ", .meta length " + NumI(m.len);
+}
+/* THE STORED SQUARE, READ ON THE WORKER: every file attached (*files: the mirror copy first) and report.txt's lines for what is not a
+   file in the zip (*text: the square, the files not attached and why, the ring). False = the report was stopped. */
+bool ReadArea(const Job& j, volatile long* stop, std::vector<AreaFile>* files, std::string* text)
+{
+    files->clear(); text->clear();
+    if (!j.haveArea) { *text = "Map square: none (no player character was seen in a world this launch)\r\n"; return true; }
+    const std::string sq = NumI(j.areaX) + "," + NumI(j.areaY);
+    *text = "Map square: " + sq + " (the reporter's, as last seen this launch; this game's record of its area: " + j.areaStamp + ")\r\n";
+    std::vector<char> b;
+    unsigned long err = 0;
+    int tooBig = 0;
+    unsigned long long areaPacked = 0;   /* fold 3: the compressed bytes of the area files read so far (areareport::AreaReadFull) */
+    /* this game's mirror copy - every game; its bytes were read on the main thread (FillJob, fold 1), never opened here */
+    const std::vector<char>& mb = j.areaMirrorBytes;
+    if (j.areaMirror.empty()) *text += areareport::MirrorZipName(j.areaX, j.areaY) + ": not attached - this game has no mirror folder\r\n";
+    else
+    {
+        const int st = j.areaMirrorState;
+        if (st == (int)coopstore::kFileAbsent) *text += areareport::MirrorZipName(j.areaX, j.areaY) + ": not attached - this game holds no stored copy of the square\r\n";
+        else if (st != (int)coopstore::kFileReadable)
+            *text += areareport::MirrorZipName(j.areaX, j.areaY) + ": not attached - " + (j.areaMirrorTooBig ? "over " + Num(areareport::kFileMax) + " bytes" : "it could not be read (Windows error " + Num((unsigned long long)j.areaMirrorErr) + ")") + "\r\n";
+        else
+        {
+            size_t at = 0;
+            const int ok = zonecheck::ReadableBytes(mb, &at);
+            AreaFile f;
+            f.zipName = areareport::MirrorZipName(j.areaX, j.areaY);
+            f.what = "this game's stored copy of map square " + sq + " (its mirror file), " + Num((unsigned long long)mb.size()) + " bytes, "
+                     + (ok ? std::string("check passed (read to its end)") : "CHECK FAILED: not readable to its end (reading stops at byte " + Num((unsigned long long)at) + ")");
+            f.sidNote = SidNote(mb, j.testSid);
+            if (*stop != 0) return false;
+            PackArea(mb, &f);
+            areaPacked += f.pack.segs.empty() ? 0 : f.pack.segs[0].bytes.size();
+            files->push_back(f);
+        }
+    }
+    /* the ring: names and stamps only */
+    for (size_t r = 0; r < j.ringX.size(); ++r)
+    {
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        std::string has = "no mirror file";
+        if (!j.ringMirror[r].empty() && ::GetFileAttributesExW(Widen(j.ringMirror[r]).c_str(), GetFileExInfoStandard, &a))
+            has = "mirror file " + Num(((unsigned long long)a.nFileSizeHigh << 32) | a.nFileSizeLow) + " bytes";
+        *text += "Ring square " + NumI(j.ringX[r]) + "," + NumI(j.ringY[r]) + " (listed, not attached): zone." + NumI(j.ringX[r]) + "." + NumI(j.ringY[r])
+                 + ".zone " + has + "; this game's record: " + j.ringStamp[r] + "\r\n";
+    }
+    if (j.areaServerDir.empty()) { *text += "World-server files: none (" + j.areaServerWhy + ")\r\n"; return true; }
+    /* the world server's files of the square - only on the game that runs it */
+    const std::wstring dir = Widen(j.areaServerDir);
+    std::vector<std::string> names;
+    if (!ListFolder(dir, &names, &err)) { *text += "World-server files: the world server's folder could not be listed (Windows error " + Num((unsigned long long)err) + ")\r\n"; return true; }
+    const std::vector<std::string> stems = areareport::SquareStems(names, j.areaX, j.areaY);
+    if (stems.empty()) *text += "World-server files of square " + sq + ": none in the world server's folder\r\n";
+    if (stems.size() > areareport::kSquareFilesMax)
+        *text += "World-server files of square " + sq + ": " + Num((unsigned long long)stems.size()) + " records, the first " + Num((unsigned long long)areareport::kSquareFilesMax) + " read\r\n";
+    for (size_t i = 0; i < stems.size() && i < areareport::kSquareFilesMax; ++i)
+    {
+        if (*stop != 0) return false;
+        if (areareport::AreaReadFull(areaPacked))
+        {   /* fold 3: the area share of the report is spent - the rest are not read */
+            *text += areareport::ServerZipName(stems[i]) + ": not attached (size) - the area files read before it already come to " + Num(areaPacked)
+                     + " compressed bytes, the area share of the report (" + Num(areareport::AreaReadLimit()) + "); not read\r\n";
+            continue;
+        }
+        coopstore::MetaLine m;
+        tooBig = 0;
+        const int c = CheckServerRecord(dir, stems[i], &b, &m, &tooBig);
+        const std::string zn = areareport::ServerZipName(stems[i]);
+        const std::string stamp = MetaWords(c, m);
+        if (b.empty())
+        {
+            *text += zn + ": not attached - " + (tooBig ? "over " + Num(areareport::kFileMax) + " bytes; " : std::string("no bytes; ")) + areareport::CheckWords(c)
+                     + (stamp.empty() ? std::string() : "; " + stamp) + "\r\n";
+            continue;
+        }
+        AreaFile f;
+        f.zipName = zn;
+        f.serverCopy = 1;
+        f.what = "the world server's record " + stems[i] + " of map square " + sq + ", " + Num((unsigned long long)b.size()) + " bytes, " + areareport::CheckWords(c)
+                 + (stamp.empty() ? std::string() : "; " + stamp);
+        f.sidNote = SidNote(b, j.testSid);
+        PackArea(b, &f);
+        areaPacked += f.pack.segs.empty() ? 0 : f.pack.segs[0].bytes.size();
+        files->push_back(f);
+    }
+    /* the ring's world-server records: names and stamps (their .meta lines), no files */
+    for (size_t r = 0; r < j.ringX.size(); ++r)
+    {
+        const std::vector<std::string> rs = areareport::SquareStems(names, j.ringX[r], j.ringY[r]);
+        if (rs.empty()) continue;
+        *text += "Ring square " + NumI(j.ringX[r]) + "," + NumI(j.ringY[r]) + " world-server records (listed, not attached):";
+        for (size_t i = 0; i < rs.size() && i < areareport::kSquareFilesMax; ++i)
+        {
+            std::vector<char> meta;
+            coopstore::MetaLine m;
+            const int st = ReadWhole(dir + L"\\" + Widen(rs[i]) + L".meta", 65536u, &meta, &err, 0);
+            const bool parsed = st == (int)coopstore::kFileReadable && coopstore::MetaParse(areareport::FirstLine(std::string(meta.begin(), meta.end())), &m);
+            *text += std::string(i == 0 ? " " : "; ") + rs[i] + " ("
+                     + (parsed ? areareport::StampWords(m.owner == coopstore::kOwnerUnknown ? -1 : (int)m.owner, m.writtenAt, m.seq) : std::string("no .meta line read")) + ")";
+        }
+        if (rs.size() > areareport::kSquareFilesMax) *text += "; and " + Num((unsigned long long)(rs.size() - areareport::kSquareFilesMax)) + " more";
+        *text += "\r\n";
+    }
+    return true;
+}
 /* ONE LAUNCH THAT DID NOT QUIT NORMALLY, kept in the crashes folder (src/common/crashkeep.h; coop_log.cpp keeps it at the next
    start). state: 0 read, 1 not repeated (its log is the same file as copy 1 or 2, which the report carries anyway), 2 nothing in
    it could be read, 3 left out because its newest log part is missing or could not be read (`why`): without it the entry cannot
@@ -606,8 +839,10 @@ void RunJob(Job& j)
         const bool haveCur = ReadTail(j.log0, coopbug::kRawLogWindow, &raw, &cur.rawTotal, &cur.rawDropped, 0);
         if (haveCur && !coopbug::PackLog(raw, &cur, stop)) return;
         const bool havePrev = ReadTail(j.log1, coopbug::kRawLogWindow, &raw, &prev.rawTotal, &prev.rawDropped, &prevEnd);
+        const long long prevCrashAt = havePrev ? swcrashkeep::CrashLineUtcSec(raw.data(), raw.size()) : 0;   /* T-1374 fold: its [CRASH] time */
         if (havePrev && !coopbug::PackLog(raw, &prev, stop)) return;
         const bool haveOlder = ReadTail(j.log2, coopbug::kRawLogWindow, &raw, &older.rawTotal, &older.rawDropped, &olderEnd);
+        const long long olderCrashAt = haveOlder ? swcrashkeep::CrashLineUtcSec(raw.data(), raw.size()) : 0;
         if (haveOlder && !coopbug::PackLog(raw, &older, stop)) return;
         /* the world server's log, newest bytes kept like the game's logs, scrubbed by the same PackLog (it names players by their
            identity code); no file there (no world server started, or one that never wrote) = no part and no line */
@@ -627,17 +862,33 @@ void RunJob(Job& j)
         }
         raw.clear();
         std::string crashName; std::vector<unsigned char> crash;
-        const int crashLaunch = FindCrash(j.crashFolders, havePrev ? prevEnd : 0, haveOlder ? olderEnd : 0, &crashName, &crash);
+        const int crashLaunch = FindCrash(j.crashFolders, havePrev ? prevEnd : 0, haveOlder ? olderEnd : 0, prevCrashAt, olderCrashAt, &crashName, &crash);
         const bool haveCrash = crashLaunch != 0;
         /* the launches that did not quit normally, kept in the crashes folder, newest first; one whose log is copy 1 or 2 is not
            repeated (that log is in the report already) */
         std::vector<KeptLaunch> kept;
         if (!ReadKept(j.crashFolder, havePrev ? prev.rawTotal : 0, havePrev ? prevEnd : 0, haveOlder ? older.rawTotal : 0, haveOlder ? olderEnd : 0,
                       stop, &kept)) return;
+        /* T-1402: the stored copy of the reporter's map square (reading only; the files whole, never scrubbed) */
+        std::vector<AreaFile> area;
+        std::string areaText;
+        if (!ReadArea(j, stop, &area, &areaText)) return;
         /* the nearby players' logs: the main thread hands them over when its wait is over (coopbug::NearbyWaitOver) */
         std::vector<NearbyLog> nearby;
         std::string nearbyNote;
-        if (j.testPack) nearbyNote = "none asked (a test pack asks no nearby game)";
+        if (j.testPack)
+        {
+            /* T-1401 2b: the test pack asks nearby games too (BugReportTestPack); the main thread hands their answers over in
+               g_testNb. Never waited for past kNearbyTotalMs + 10 s (a player's report that asks takes the ask over and hands it on). */
+            const DWORD waitFrom = ::GetTickCount();
+            for (;;)
+            {
+                { Lock l; if (g_testNb.done) { nearby.swap(g_testNb.nearby); nearbyNote = g_testNb.note; break; } }
+                if ((unsigned int)(::GetTickCount() - waitFrom) >= coopbug::kNearbyTotalMs + 10000u)
+                { nearbyNote = "asked; no answers handed over within " + Num((coopbug::kNearbyTotalMs + 10000u) / 1000u) + " s"; break; }
+                ::Sleep(50);
+            }
+        }
         else for (;;)
         {
             if (*stop != 0) return;
@@ -734,6 +985,12 @@ void RunJob(Job& j)
                 parts.push_back(p);
             }
         }
+        /* T-1402: the stored square's files, under area/ - order kOrderArea, each whole or not at all */
+        for (size_t i = 0; i < area.size(); ++i)
+        {
+            ZipPart p = { area[i].zipName, coopbug::kOrderArea, &area[i].pack, 0, area[i].what, 0, 0, 0, area[i].serverCopy };
+            parts.push_back(p);
+        }
         /* T-910: every [KEEPER] line of this launch, kept in memory (coop_log.h LogKeeperLinesText); its IP addresses removed as a log's are; never cut */
         std::string keeperClean;
         coopbug::ScrubIps(j.keeperText, &keeperClean);
@@ -747,6 +1004,11 @@ void RunJob(Job& j)
         std::vector<coopbug::BudgetPart> bp(parts.size() + 1);
         for (size_t k = 0; k < parts.size(); ++k)
         {
+            if (parts[k].order == coopbug::kOrderArea)
+            {   /* T-1402: one compressed segment - whole or not at all */
+                bp[k] = areareport::AreaPart(coopbug::ZipEntryOverhead(parts[k].name), parts[k].pack->segs.empty() ? 0 : parts[k].pack->segs[0].bytes.size(), parts[k].areaServer);
+                continue;
+            }
             if (parts[k].order == coopbug::kOrderKeptCrash)
             {
                 /* a kept launch's file: cut before every other part and given no floor; its crash file whole or not at all */
@@ -804,7 +1066,8 @@ void RunJob(Job& j)
                 coopbug::JoinPackRange(*parts[k].pack, first, end, &e.data, &rawLen, &e.crc);
                 e.method = 8;
                 e.rawLen = (unsigned int)rawLen;
-                m += LogLine(parts[k].name, parts[k].what, *parts[k].pack, cutRaw, atEnd);
+                if (parts[k].order == coopbug::kOrderArea) m += parts[k].name + ": " + parts[k].what + "\r\n";   /* T-1402: a binary file, nothing scrubbed */
+                else m += LogLine(parts[k].name, parts[k].what, *parts[k].pack, cutRaw, atEnd);
             }
             else
             {
@@ -838,6 +1101,7 @@ void RunJob(Job& j)
                 m += at + ": a launch that did not quit normally, kept at its next start - its files are listed above" + c + kept[i].note + "\r\n";
             }
         }
+        m += "\r\n" + areaText;   /* T-1402: the stored square, its ring and the files not attached */
         m += "\r\nNearby players: " + nearbyNote + "\r\n";
         es[0] = coopbug::StoredEntry("report.txt", m);
         SYSTEMTIME lt; ::GetLocalTime(&lt);
@@ -854,6 +1118,17 @@ void RunJob(Job& j)
             DebugLog("[BUGREPORT] TEST PACK zip " + Num(zip.size()) + " bytes (limit " + Num(coopbug::kPackLimit) + ", "
                      + (cut.fits ? "within it" : "STILL OVER it") + "), " + Num(es.size()) + " files (name zip-bytes/raw-bytes): " + list
                      + "; left out: " + (out.empty() ? std::string("none") : out) + "; NOT SENT");
+            /* T-1402: the stored square - report.txt's area lines and each attached file's line (with the lever's sid count) */
+            std::string at;
+            for (size_t k = 0; k < parts.size(); ++k)
+            {
+                if (parts[k].order != coopbug::kOrderArea) continue;
+                at += (at.empty() ? "" : " | ") + parts[k].name + (coopbug::PartLeftOut(bp, cut, k) ? " LEFT OUT: " : ": ") + parts[k].what;
+            }
+            for (size_t i = 0; i < area.size(); ++i) if (!area[i].sidNote.empty()) at += " | " + area[i].zipName + " " + area[i].sidNote;
+            std::string lines = areaText;
+            for (size_t c = 0; c < lines.size(); ++c) { if (lines[c] == '\r') lines[c] = ' '; else if (lines[c] == '\n') lines[c] = '|'; }
+            DebugLog("[BUGREPORT] TEST PACK area: " + lines + " files: " + (at.empty() ? std::string("none") : at));
             return;
         }
         DebugLog("[BUG] report packed: zip " + Num(zip.size()) + " bytes (limit " + Num(coopbug::kPackLimit) + "), " + Num(es.size()) + " files, "
@@ -928,32 +1203,137 @@ void AnswerRefused(unsigned int slot, const char* why)
              + Num(coopbug::kRefusalLogGapMs / 1000u) + " s)");
     g_ansRefusalLogged = 1; g_ansRefusalLogAt = now; g_ansRefusedUnlogged = 0;
 }
-void AnswerStart(unsigned int askId, unsigned int slot, unsigned int maxBytes)
+/* T-1401 2b: this game's LOG_REPLY to an ask (bugreport.h kReply*), sent at once - before any packing. */
+const char* ReplyWords(unsigned int code)
 {
-    if (g_ans.state != 0) { AnswerRefused(slot, "an answer is already being made"); return; }
+    switch (code)
+    {
+    case coopbug::kReplySending:       return "sending";
+    case coopbug::kReplyQueued:        return "busy, queued";
+    case coopbug::kReplyAnsweredYou:   return "answered you recently";
+    case coopbug::kReplyLogUnreadable: return "log unreadable";
+    case coopbug::kReplyNotLoaded:     return "not loaded here";
+    default: break;
+    }
+    return "unknown";
+}
+bool SendReply(unsigned int slot, unsigned int askId, unsigned int code, unsigned int detail)
+{
+    std::vector<char> b;
+    coopbug::LogReplyEncode(&b, askId, code, detail);
+    if (StoreSendLive(cooplive::kRouteSlot, slot, cooplive::kInnerLogReply, b, true)) return true;
+    DebugLog("[BUG] the reply to slot " + Num(slot) + " (ask " + Num(askId) + ": " + ReplyWords(code) + ") could not be sent: the world server road is down");
+    return false;
+}
+/* Is this game busy? Only while an answer is being made, or while its own report's / test pack's packing runs AFTER its own wait
+   for nearby logs is over (review HIGH, T-1401 2b fold): a game still WAITING for nearby logs answers - the answer has its own
+   worker - so two players who report within 20 s of each other each carry the other's log (decision 1741 b). */
+bool AnswerBusy(std::string* why)
+{
+    if (g_ans.state != 0) { *why = "an answer to slot " + Num(g_ans.slot) + " is being made"; return true; }
+    Lock l;
+    if (::InterlockedCompareExchange(&g_testBusy, 0, 0) != 0 && g_testNb.done) { *why = "a test pack is being packed"; return true; }
+    if (g_gen != 0 && g_sh.gen == g_gen && g_sh.phase == kPhPreparing && g_sh.nearbyFinal) { *why = "its own bug report is being packed"; return true; }
+    return false;
+}
+/* MAIN THREAD. Decide an ask from this game's own state NOW and reply at once: 5 the sector is not loaded here (only in the
+   delivery ring), 3 this asker was answered under a minute ago, 2 busy (queued; 0 = the queue is full), 4 the log cannot be read,
+   or 1 sending - and only then does the packing start. `fromQueue` = its turn came after a 'busy, queued' reply. */
+void AnswerDecide(const coopbug::AskWaiting& w, bool fromQueue)
+{
+    const unsigned int slot = w.slot, askId = w.ask.askId;
     const DWORD now = ::GetTickCount();
+    const std::string head = "[BUG] slot " + Num(slot) + " asked for this game's current log for a bug report (ask " + Num(askId) + ", sector "
+                             + NumI(w.ask.sx) + "," + NumI(w.ask.sy) + ", report label " + coopbug::LabelHex(w.ask.label)
+                             + (fromQueue ? ", its turn in the queue came " + Num((unsigned int)(now - w.arrivedMs)) + " ms after the ask" : std::string()) + ")";
+    Sector sec; sec.x = w.ask.sx; sec.y = w.ask.sy;
+    if (SectorLoadedHereTS(sec) != 1)
+    {
+        SendReply(slot, askId, coopbug::kReplyNotLoaded, 0);
+        AnswerRefused(slot, ("replied 'not loaded here' (5): that sector is only in this game's outer ring (ask " + Num(askId) + ")").c_str());
+        return;
+    }
     const std::map<unsigned int, DWORD>::const_iterator last = g_ansBySlot.find(slot);
     if (!coopbug::AskerMayBeAnswered(last != g_ansBySlot.end(), last != g_ansBySlot.end() ? (unsigned int)(now - last->second) : 0u))
-    { AnswerRefused(slot, "that slot was answered less than a minute ago"); return; }
+    {
+        const unsigned int secs = (unsigned int)(now - last->second) / 1000u;
+        SendReply(slot, askId, coopbug::kReplyAnsweredYou, secs);
+        AnswerRefused(slot, ("replied 'answered you " + Num(secs) + " s ago' (3): that slot was answered less than a minute ago (ask " + Num(askId) + ")").c_str());
+        return;
+    }
+    std::string why;
+    if (AnswerBusy(&why))
+    {
+        const unsigned int place = g_ansQueue.Add(w);
+        SendReply(slot, askId, coopbug::kReplyQueued, place);
+        if (place != 0) DebugLog(head + " - busy (" + why + "): replied 'busy, queued' (2), place " + Num(place) + " of at most " + Num(coopbug::kAnswerQueueMax));
+        else AnswerRefused(slot, ("replied 'busy, queue full' (2, place 0): " + why + ", and " + Num(coopbug::kAnswerQueueMax) + " asks already wait (ask " + Num(askId) + ")").c_str());
+        return;
+    }
+    const std::wstring log0 = LogFilePath(0);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (log0.empty() || !::GetFileAttributesExW(log0.c_str(), GetFileExInfoStandard, &fa))
+    {
+        SendReply(slot, askId, coopbug::kReplyLogUnreadable, 0);
+        AnswerRefused(slot, ("replied 'log unreadable' (4): Windows error " + NumI((long long)::GetLastError()) + " (ask " + Num(askId) + ")").c_str());
+        return;
+    }
+    const unsigned long long logBytes = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    const unsigned int sizeNote = logBytes > 0xFFFFFFFFull ? 0xFFFFFFFFu : (unsigned int)logBytes;
+    if (!SendReply(slot, askId, coopbug::kReplySending, sizeNote)) return;   /* the road is down: the parts could not go either */
+    const unsigned int maxBytes = w.ask.maxBytes;
     AnswerJob* a = new AnswerJob;
     a->name = ConfigFilePlayerName();
-    a->log0 = LogFilePath(0);
+    a->log0 = log0;
     a->cap = maxBytes < coopbug::kNearbyLogMax ? maxBytes : coopbug::kNearbyLogMax;
     { Lock l; g_ans.ready = 0; g_ans.bundle.clear(); }
-    g_ans.askId = askId; g_ans.slot = slot; g_ans.next = 0; g_ans.parts = 0; g_ans.askAtMs = now;
+    g_ans.askId = askId; g_ans.slot = slot; g_ans.next = 0; g_ans.parts = 0; g_ans.askAtMs = w.arrivedMs;   /* the asker's 20 s count from its ask */
     g_ans.state = 1;
     coop::ReportDoors();   /* the door totals and reload[...] line go into the log this answer sends */
     coop::ReportFarm();    /* the [FARM] / [MINE] totals too */
     const uintptr_t t = _beginthreadex(NULL, 0, &AnswerMain, a, 0, NULL);
-    if (t == 0) { delete a; g_ans.state = 0; ErrorLog("[BUG] a nearby log ask from slot " + Num(slot) + " not answered: no worker thread"); return; }
+    if (t == 0)
+    {   /* 'sending' has gone out: say 'log unreadable' (4) so the asker stops waiting for this game (review LOW) */
+        delete a; g_ans.state = 0;
+        SendReply(slot, askId, coopbug::kReplyLogUnreadable, 0);
+        ErrorLog("[BUG] a nearby log ask from slot " + Num(slot) + " not answered: no worker thread (replied 'log unreadable' (4) after 'sending')");
+        return;
+    }
     ::CloseHandle((HANDLE)t);
     g_ansBySlot[slot] = now;
-    DebugLog("[BUG] slot " + Num(slot) + " asked for this game's current log for a bug report (ask " + Num(askId) + ") - it is being sent; the player is not told");
+    DebugLog(head + " - replied 'sending' (1, its log " + Num(logBytes) + " bytes before packing); it is being sent; the player is not told");
+}
+void AnswerStart(const coopbug::LogAsk& ask, unsigned int slot)
+{
+    coopbug::AskWaiting w;
+    w.ask = ask; w.slot = slot; w.arrivedMs = ::GetTickCount();
+    AnswerDecide(w, false);
 }
 /* MAIN THREAD: the next part only when coopbug::AnswerPartDue says the world-server link is nearly idle, so the answer never
    crowds the play that uses that link; an answer the asker has stopped waiting for ends (coopbug::AnswerExpired). */
 void AnswerTick()
 {
+    for (size_t i = 0; i < g_ansQueue.q.size(); ++i)   /* review LOW: a player who left takes his waiting asks with him */
+        if (StoreRosterSlotInWorld((int)g_ansQueue.q[i].slot) == 0)
+        {
+            const unsigned int gone = g_ansQueue.q[i].slot;
+            const size_t n = g_ansQueue.DropSlot(gone);
+            DebugLog("[BUG] slot " + Num(gone) + " left the world: its " + Num(n) + " waiting ask(s) dropped from the queue");
+            break;   /* the rest are looked at next frame */
+        }
+    if (g_ans.state == 0 && g_ansQueue.Size() != 0)   /* T-1401 2b: free again - the oldest waiting ask */
+    {
+        std::string why;
+        coopbug::AskWaiting w;
+        if (!AnswerBusy(&why) && g_ansQueue.Take(&w))
+        {
+            const unsigned int waited = (unsigned int)(::GetTickCount() - w.arrivedMs);
+            if (coopbug::AnswerExpired(waited))
+                DebugLog("[BUG] the queued ask from slot " + Num(w.slot) + " (ask " + Num(w.ask.askId) + ", report label " + coopbug::LabelHex(w.ask.label)
+                         + ") waited " + Num(waited / 1000u) + " s - past the asker's " + Num(coopbug::kNearbyTotalMs / 1000u) + " s wait; not answered (written here only)");
+            else AnswerDecide(w, true);
+        }
+    }
     if (g_ans.state == 1)
     {
         Lock l;
@@ -998,8 +1378,13 @@ void AnswerTick()
    THIS GAME'S ASK (MAIN THREAD)
    ========================================================================================================================= */
 /* 1 = asked: the nearby players' answers are awaited; 0 = nobody to ask (the main thread hands over an empty list at once). */
-int AskNearby(long gen, std::string* note)
+int AskNearby(long gen, int test, std::string* note)
 {
+    if (g_col.active && g_col.test)   /* a test pack's ask is taken over: its pack gets what is known (nothing) at once */
+    {
+        Lock l;
+        g_testNb.nearby.clear(); g_testNb.note = "asked; cut short by a player's own report"; g_testNb.done = 1;
+    }
     g_col = Collect();
     if (!GameplayRunning()) { *note = "none asked (the report was made at the title screen)"; return 0; }
     if (!StoreLiveReady() || StoreRosterOtherInWorldTS() != 1) { *note = "none asked (no other player was in this world)"; return 0; }
@@ -1007,39 +1392,75 @@ int AskNearby(long gen, std::string* note)
     const int key = cooplive::AreaKey(s.x, s.y);
     if (key < 0) { *note = "none asked (this game has no player sector)"; return 0; }
     if (++g_askNext == 0) ++g_askNext;
+    coopbug::LogAsk ask;
+    ask.askId = g_askNext; ask.maxBytes = coopbug::kNearbyLogMax; ask.sx = s.x; ask.sy = s.y;
+    {   /* the report's label (for step 2c): 16 bytes mixed from the clocks, the process and the ask number - a tag, nothing personal */
+        LARGE_INTEGER qpc; qpc.QuadPart = 0; ::QueryPerformanceCounter(&qpc);
+        unsigned int x = (unsigned int)qpc.LowPart ^ ((unsigned int)qpc.HighPart * 2654435761u) ^ (::GetTickCount() * 40503u) ^ (::GetCurrentProcessId() << 7) ^ (g_askNext * 97u);
+        for (size_t k = 0; k < coopbug::kLogLabelBytes; ++k)
+        {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            if (x == 0) x = 1u;   /* xorshift never leaves 0 */
+            ask.label[k] = (unsigned char)(x >> 24);
+        }
+    }
     std::vector<char> in;
-    coopbug::LogAskEncode(&in, g_askNext, coopbug::kNearbyLogMax);
+    coopbug::LogAskEncode(&in, ask);
     if (!StoreSendLive(cooplive::kRouteArea, cooplive::AreaTarget(key, -1), cooplive::kInnerLogAsk, in, true))
     { *note = "none asked (the world server road is down)"; return 0; }
-    g_col.active = 1; g_col.gen = gen; g_col.askId = g_askNext; g_col.askAt = ::GetTickCount(); g_col.sx = s.x; g_col.sy = s.y;
-    DebugLog("[BUG] nearby players asked for their current logs (ask " + Num(g_askNext) + ", sector " + NumI(s.x) + "," + NumI(s.y) + ")");
+    g_col.active = 1; g_col.gen = gen; g_col.test = test; g_col.askId = g_askNext; g_col.askAt = ::GetTickCount(); g_col.sx = s.x; g_col.sy = s.y;
+    DebugLog(std::string("[BUG] nearby players asked for their current logs") + (test ? " (TEST PACK)" : "") + " (ask " + Num(g_askNext) + ", sector "
+             + NumI(s.x) + "," + NumI(s.y) + ", report label " + coopbug::LabelHex(ask.label) + ")");
     return 1;
 }
 void CollectTick()
 {
     if (!g_col.active) return;
-    if (g_col.gen != g_gen) { g_col = Collect(); return; }   /* CANCEL ended the report it was for */
-    int started = 0, finished = 0;
-    for (std::map<unsigned int, coopbug::PartsJoin>::const_iterator it = g_col.joins.begin(); it != g_col.joins.end(); ++it)
-    { ++started; if (it->second.Complete()) ++finished; }
-    if (!coopbug::NearbyWaitOver((unsigned int)(::GetTickCount() - g_col.askAt), started, finished)) return;
-    std::vector<NearbyLog> logs;
-    std::string note = "asked (sector " + NumI(g_col.sx) + "," + NumI(g_col.sy) + ")";
-    std::string answered, partial;
-    for (std::map<unsigned int, coopbug::PartsJoin>::const_iterator it = g_col.joins.begin(); it != g_col.joins.end(); ++it)
+    if (!g_col.test && g_col.gen != g_gen) { g_col = Collect(); return; }   /* CANCEL ended the report it was for */
+    /* T-1401 2b: every game heard from - by a reply, by parts, or both */
+    std::map<unsigned int, int> heard;
+    for (std::map<unsigned int, coopbug::PartsJoin>::const_iterator it = g_col.joins.begin(); it != g_col.joins.end(); ++it) heard[it->first] = 1;
+    for (std::map<unsigned int, coopbug::NearbyReply>::const_iterator it = g_col.replies.begin(); it != g_col.replies.end(); ++it) heard[it->first] = 1;
+    int owed = 0;
+    for (std::map<unsigned int, int>::const_iterator h = heard.begin(); h != heard.end(); ++h)
     {
-        NearbyLog n;
-        n.slot = it->first;
-        if (it->second.Complete() && coopbug::BundleDecode(it->second.data, &n.name, &n.pack))
-        { logs.push_back(n); answered += (answered.empty() ? "" : ", ") + std::string("slot ") + Num(n.slot) + " (" + n.name + ")"; }
-        else partial += (partial.empty() ? "" : ", ") + std::string("slot ") + Num(it->first);
+        const std::map<unsigned int, coopbug::PartsJoin>::const_iterator j = g_col.joins.find(h->first);
+        const std::map<unsigned int, coopbug::NearbyReply>::const_iterator r = g_col.replies.find(h->first);
+        if (coopbug::ReplyStillOwed(r == g_col.replies.end() ? 0u : r->second.lastCode, r == g_col.replies.end() ? 0u : r->second.lastDetail,
+                                    j != g_col.joins.end() && j->second.parts != 0, j != g_col.joins.end() && j->second.Complete())) ++owed;
     }
-    note += answered.empty() ? "; none answered within " + Num(coopbug::kNearbyFirstMs / 1000u) + " s" : "; answered: " + answered;
-    if (!partial.empty()) note += "; left out (its log did not all arrive or could not be read): " + partial;
-    DebugLog("[BUG] nearby logs: " + note);
+    if (!coopbug::NearbyWaitOver((unsigned int)(::GetTickCount() - g_col.askAt), owed)) return;
+    std::vector<NearbyLog> logs;
+    std::vector<coopbug::NearbyReply> said;
+    for (std::map<unsigned int, int>::const_iterator h = heard.begin(); h != heard.end(); ++h)
+    {
+        const std::map<unsigned int, coopbug::PartsJoin>::const_iterator j = g_col.joins.find(h->first);
+        const std::map<unsigned int, coopbug::NearbyReply>::const_iterator r = g_col.replies.find(h->first);
+        coopbug::NearbyReply one;
+        if (r != g_col.replies.end()) one = r->second;
+        one.slot = h->first;
+        if (j != g_col.joins.end())
+        {
+            NearbyLog n;
+            n.slot = h->first;
+            if (j->second.Complete() && coopbug::BundleDecode(j->second.data, &n.name, &n.pack)) { one.name = n.name; one.logState = 1; logs.push_back(n); }
+            else one.logState = 2;
+        }
+        if (one.name.empty()) StoreRosterNameOf((int)one.slot, &one.name);
+        said.push_back(one);
+    }
+    /* the other players in the world that did not reply are only COUNTED, never named (review LOW, privacy): most were never
+       asked (not near this part of the map) */
+    const int mine = StoreMySlot();
+    unsigned int silentCount = 0;
+    for (int sl = 0; sl < 64; ++sl)
+        if (sl != mine && heard.find((unsigned int)sl) == heard.end() && StoreRosterSlotInWorld(sl) == 1) ++silentCount;
+    const std::string note = coopbug::NearbyNoteText(g_col.sx, g_col.sy, said, silentCount);
+    DebugLog(std::string("[BUG] nearby logs") + (g_col.test ? " (TEST PACK)" : "") + ": " + note);
     {
         Lock l;
-        if (g_sh.gen == g_col.gen) { g_sh.nearby.swap(logs); g_sh.nearbyNote = note; g_sh.nearbyFinal = 1; }
+        if (g_col.test) { g_testNb.nearby.swap(logs); g_testNb.note = note; g_testNb.done = 1; }
+        else if (g_sh.gen == g_col.gen) { g_sh.nearby.swap(logs); g_sh.nearbyNote = note; g_sh.nearbyFinal = 1; }
     }
     g_col = Collect();
 }
@@ -1073,11 +1494,36 @@ void FillJob(Job* j)
         j->keeperHead = "Empty-shop repairs this launch: " + coop::ItemsKeeperRepairToken() + "; [KEEPER] lines this launch: " + Num(keeperSeen)
                         + (j->keeperText.empty() ? std::string() : std::string(" (") + kKeeperLinesFile + ")");
     }
-    j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->crashFolders = swcrashkeep::CrashFolders(GameFolder(), FolderOfPath(j->log0));
+    j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->crashFolders = swcrashkeep::CrashFolders(GameFolder(), FolderOfPath(j->log0), coop::KenshiSaveRoot());   /* T-1374: and Kenshi's save root, where its crash zip goes */
     for (int L = 0; L < 3; ++L) { j->logStart[L] = LogPartPath(L, cooplogrot::kPartStart); j->logMiddle[L] = LogPartPath(L, cooplogrot::kPartPrev); }
     j->serverLog = Widen(UiServerLogPath());
     const std::wstring modFolder = FolderOfPath(j->log0);
     j->crashFolder = modFolder.empty() ? std::wstring() : modFolder + swcrashkeep::kFolderW + L"\\";
+    /* T-1402: the stored copy of the reporter's map square - its names here, its files read on the worker */
+    const Sector sq = MyLastPlayerSector();
+    j->haveArea = (sq.x >= 0 && sq.y >= 0) ? 1 : 0;
+    j->areaX = sq.x; j->areaY = sq.y;
+    j->areaMirror.clear(); j->areaServerDir.clear(); j->areaStamp.clear(); j->areaServerWhy.clear();
+    j->ringX.clear(); j->ringY.clear(); j->ringMirror.clear(); j->ringStamp.clear();
+    j->areaMirrorBytes.clear(); j->areaMirrorState = (int)coopstore::kFileAbsent; j->areaMirrorTooBig = 0; j->areaMirrorErr = 0;
+    if (j->haveArea)
+    {
+        int owner = -1; long long at = 0; unsigned long long seq = 0;
+        std::string dir;
+        j->areaStamp = StoreAreaReportFiles(sq.x, sq.y, &j->areaMirror, &j->areaServerDir, &owner, &at, &seq) ? areareport::StampWords(owner, at, seq) : "none held here";
+        if (j->areaServerDir.empty()) j->areaServerWhy = StoreAreaServerNoneWhy();
+        areareport::RingSquares(sq.x, sq.y, &j->ringX, &j->ringY);
+        for (size_t r = 0; r < j->ringX.size(); ++r)
+        {
+            std::string mf;
+            j->ringStamp.push_back(StoreAreaReportFiles(j->ringX[r], j->ringY[r], &mf, &dir, &owner, &at, &seq) ? areareport::StampWords(owner, at, seq) : "none held here");
+            j->ringMirror.push_back(mf);
+        }
+        /* fold 1: the mirror file is read HERE, on the main thread - the thread that writes it - so the worker never holds it open
+           while the game replaces it (usually ~60 KB, at most kFileMax). Not for TRY AGAIN, which posts what was packed before. */
+        if (!j->areaMirror.empty() && !j->sendOnly)
+            j->areaMirrorState = ReadWhole(Widen(j->areaMirror), areareport::kFileMax, &j->areaMirrorBytes, &j->areaMirrorErr, &j->areaMirrorTooBig);
+    }
 }
 void StartJob(const std::string& desc, int sendOnly)
 {
@@ -1085,7 +1531,7 @@ void StartJob(const std::string& desc, int sendOnly)
     *StopOf(gen) = 0;
     g_gen = gen;
     std::string note;
-    const int asked = sendOnly ? 0 : AskNearby(gen, &note);
+    const int asked = sendOnly ? 0 : AskNearby(gen, 0, &note);
     {
         Lock l;
         g_sh.gen = gen; g_sh.phase = sendOnly ? kPhSending : kPhPreparing; g_sh.pct = 0; g_sh.ok = 0; g_sh.failKind = 0; g_sh.failCode = 0;
@@ -1095,7 +1541,9 @@ void StartJob(const std::string& desc, int sendOnly)
     Job* j = new Job;
     j->gen = gen; j->sendOnly = sendOnly; j->desc = desc;
     FillJob(j);
-    if (!sendOnly) { coop::ReportDoors(); coop::ReportFarm(); }   /* the door totals, reload[...] and the [FARM] / [MINE] totals go into the log this report packs */
+    if (!sendOnly) { coop::ReportEverythingForReport(); coop::ReportFarm(); }   /* T-1401: EVERY report counter set (building hits, items, doors, store ... -
+                                                                                 what `report` writes, the door totals and reload[...] among them) and the
+                                                                                 [FARM] / [MINE] totals go into the log this report packs */
     const uintptr_t t = _beginthreadex(NULL, 0, &JobMain, j, 0, NULL);
     if (t == 0)
     {
@@ -1115,7 +1563,7 @@ void CancelJob(const char* why)
     { Lock l; g_sh.gen = 0; }
     DebugLog(std::string("[BUG] report ") + NumI(g_gen) + " cancelled (" + why + ")");
     g_gen = 0;
-    g_col = Collect();
+    if (!g_col.test) g_col = Collect();   /* a test pack's ask is not the report's */
 }
 
 /* =========================================================================================================================
@@ -1893,9 +2341,22 @@ void BugReportLiveIn(unsigned int innerType, unsigned int originSlot, const char
     {
         if (innerType == cooplive::kInnerLogAsk)
         {
-            unsigned int askId = 0, maxBytes = 0;
-            if (!coopbug::LogAskDecode(data, len, &askId, &maxBytes)) { DebugLog("[BUG] a malformed nearby log ask from slot " + Num(originSlot) + " - dropped"); return; }
-            AnswerStart(askId, originSlot, maxBytes);
+            coopbug::LogAsk ask;
+            if (!coopbug::LogAskDecode(data, len, &ask)) { DebugLog("[BUG] a malformed nearby log ask from slot " + Num(originSlot) + " (" + Num(len) + " bytes) - dropped"); return; }
+            AnswerStart(ask, originSlot);
+            return;
+        }
+        if (innerType == cooplive::kInnerLogReply)   /* T-1401 2b: an asked game's at-once answer */
+        {
+            unsigned int askId = 0, code = 0, detail = 0;
+            if (!coopbug::LogReplyDecode(data, len, &askId, &code, &detail)) { DebugLog("[BUG] a malformed nearby log reply from slot " + Num(originSlot) + " (" + Num(len) + " bytes) - dropped"); return; }
+            if (!g_col.active || askId != g_col.askId)
+            { DebugLog("[BUG] slot " + Num(originSlot) + " replied '" + ReplyWords(code) + "' to ask " + Num(askId) + " after this game's wait for it was over - not counted"); return; }
+            coopbug::NearbyReply& r = g_col.replies[originSlot];
+            if (r.firstCode == 0) { r.firstCode = code; r.firstDetail = detail; }
+            r.lastCode = code; r.lastDetail = detail;
+            DebugLog("[BUG] slot " + Num(originSlot) + " replied to ask " + Num(askId) + " " + Num((unsigned int)(::GetTickCount() - g_col.askAt)) + " ms after it: '"
+                     + ReplyWords(code) + "' (code " + Num(code) + ", detail " + Num(detail) + ")");
             return;
         }
         if (innerType == cooplive::kInnerLogPart)
@@ -1909,7 +2370,7 @@ void BugReportLiveIn(unsigned int innerType, unsigned int originSlot, const char
     catch (...) { DebugLog("[BUG] a C++ exception reading a nearby log message; it is dropped"); }
 }
 
-int BugReportTestPack()
+int BugReportTestPack(const std::string& sid)
 {
     CsInit();
     if (::InterlockedCompareExchange(&g_testBusy, 1, 0) != 0) return 0;
@@ -1919,7 +2380,16 @@ int BugReportTestPack()
     j->desc = "(a TEST PACK made by the bugpack lever, not a player's report - nothing is sent)";
     FillJob(j);
     j->testPack = 1;
-    coop::ReportDoors(); coop::ReportFarm();   /* as a report does: their totals go into the log it packs */
+    j->testSid = sid;   /* T-1402 */
+    {   /* T-1401 2b: the test pack asks the nearby games as a report does (their answers go into its zip; nothing is ever sent) */
+        std::string note;
+        int asked = 0;
+        if (g_col.active && !g_col.test) note = "none asked (a player's own report was asking at the time)";
+        else asked = AskNearby(0, 1, &note);
+        Lock l;
+        g_testNb.nearby.clear(); g_testNb.note = note; g_testNb.done = asked ? 0 : 1;
+    }
+    coop::ReportEverythingForReport(); coop::ReportFarm();   /* as a report does (T-1401): every REPORT counter set and the farm totals go into the log it packs */
     const uintptr_t t = _beginthreadex(NULL, 0, &TestPackMain, j, 0, NULL);
     if (t == 0)
     {

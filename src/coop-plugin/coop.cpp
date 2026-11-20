@@ -6,6 +6,7 @@
 //   - PROBE P001: hook the main-loop function - the main-thread pump the sync layer needs.
 
 #include "coop_log.h"
+#include "crashwatch.h"   /* T-1374: the [CRASH] line */
 #include "game/GameWorld.h"
 #include "game/TitleScreen.h"
 #include "command_channel.h"
@@ -16,6 +17,7 @@
 #include "relations.h"
 #include "peace.h"
 #include "towngen.h"
+#include "zones.h"   /* T-1442 step 1b: InstallZonesAreaUpdate */
 #include "playerfaction.h"
 #include "worldgen.h"
 #include "worldstate.h"
@@ -36,8 +38,10 @@
 #include "bugreport.h" /* T-461: REPORT A BUG */
 #include "playerstab.h" /* T-545: the PLAYERS tab, other players' factions on the FACTION tab */
 #include "fallentab.h"   /* T-556: the FALLEN tab */
+#include "tradewin.h"    /* T-1167: the TRADE window (taken down at the title) */
 #include "chat.h"        /* in-game text chat */
 #include "teammap.h"     /* T-930: teammates' characters on the world map */
+#include "ping.h"        /* T-1393: pings */
 #include "money.h"       /* T-810: money between players */
 #include "admin.h"       /* the admin login and the admin commands */
 #include "kapi.h"        /* per-race rules: kenshi_api.cfg, the world's race.* options, the equip and XP hooks */
@@ -221,6 +225,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     // save loads (T008), so without this the channel would go dead exactly when in-game
     // testing begins. Both pumps are main-thread, and the tick is internally throttled.
     coop::CommandChannelTick();
+    coop::CrashWatchTick();   /* T-1374: the main thread noted, the unhandled-exception filter set again at a world load; the DEV build's crashtest faults here (no __try of ours around it) */
     coop::SteamProbeTick();   /* the Steam relay status, polled here too while a save loaded before it settled; and every frame the host's Steam bridge (net/relay_bridge.cpp RelayBridgeTick) */
 
     // P011 order-lifecycle watch. In-game pump only - there are no characters at the
@@ -237,6 +242,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::CaptureTick();      /* P11: what the slaver bodies recorded about a copy -> MSG_CAPTURE; timeouts */
     coop::SlaveTick();        // slave1: an owned character's slave-state change (marked by the hooks) -> MSG_SLAVE
     coop::RestApplyTick();    // R3 (read-ragdoll): post / verify the move of a settled copy's ragdoll to its owner's rest
+    coop::P306Tick();         // PROBE P306 (LOG ONLY): a body after a put-down and during a carry
     coop::GetupPulseTick();   // G1 (read-getup): a copy still ragdolled after its owner got up gets one AI decision pulse
     coop::SneakApplyTick();   // copies sneak or stand as their owners' STATE says, through the engine's setStealthMode
     coop::PoseWatchTick();    // POSE (read-poses): an owned character's in-place pose changed -> STATE at once
@@ -264,10 +270,16 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::PlayersTabTick();   /* T-545: other players' factions made known; the PLAYERS tab's table kept current while it shows */
     coop::FallenTabTick();    /* T-556: the FALLEN tab after PLAYERS, kept current while it shows; a confirmed bring-back runs */
     coop::UiEditorResetTick();   /* the Level Editor's Reset Population: greyed with its hover note in a multiplayer world */
+    coop::StoreEditorOffTick();  /* T-1414: a Level Editor shown in a multiplayer world is closed, through the engine's own toggle */
+#ifdef SW_DEV_BUILD
+    coop::BdEditorKeyTick();     /* T-1414 TEST-ONLY: an armed `editorkey` press - the close above acts on it the frame after */
+#endif
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
+    coop::PingTick();         /* T-1393: G pings the spot under the mouse; the pings' world markers, edge arrows and fades */
     coop::TeamMapTick();      /* T-930: this player's characters to teammates whose world map is open; the map's close when its frame stopped */
     coop::MoneyTick();        /* T-810: money between players - given back, added, acknowledged, sent once on disk */
+    coop::TradeWinTick();     /* T-1167 piece 2: the player trade - the other player's ask, answers, offers, accepts and cancels acted on; the window's lists and money box read */
     coop::AdminTick();        /* the admin login: an unused typed password wiped; a link that ended ends this game's admin standing */
     coop::UiDriveEngineClickFlush(0);   /* pp1b: a queued `uiclick engine:` fires at the tail of the in-world pump; T-201 PP6': never the one-press load */
 }
@@ -422,6 +434,7 @@ static void detour_titleUpdate(TitleScreen* thisptr)
        below services the link it just opened in this same tick rather than the next one. Self-latched: it does
        its work once and returns immediately every frame after. */
     coop::ConfigTitleTick();
+    coop::PingTitleTick();   /* T-1437: once - the Ping action in Kenshi's key list, its key from controls.cfg (none -> G) */
     coop::StoreUnfinishedDeletesFinish();   /* once, with the title screen up: deletes a stop left unfinished are finished (log lines only) */
 
     // Command channel rides this pump: it is the only main-thread function known to
@@ -440,6 +453,7 @@ static void detour_titleUpdate(TitleScreen* thisptr)
     coop::ChatTitleTick();         /* the chat of the world just left is taken down */
     coop::AdminTick();             /* and at the title too */
     coop::FallenTabTitleTick();    /* T-556: a BRING BACK box left up from the world is taken down */
+    coop::TradeWinTitleTick();     /* T-1167: a TRADE window left up from the world is taken down */
     coop::TagsTitleTick();   /* tags1: no world at the title - a name label still standing is destroyed */
     coop::SteamProbeTick();  /* T-290 S0 title: the first title frame looks Steam up (the game's SteamAPI_Init has run); later frames poll the relay status until it settles. Logs only. */
 
@@ -819,6 +833,13 @@ static void startPluginOn(const char* road)
     }
     if (!claimStart(road)) return;   /* mig6 fold (F6): the start is claimed only once the gate has ACCEPTED this exe */
     logEnvironment();   /* mig2 fold: after AddrInit, so it carries the fingerprint AddrInit computed */
+    /* T-1374: the [CRASH] line's three roads, first of the installs so a crash in any later start-up step is named; then Kenshi's
+       crash zip in its save root joins the start-up's crash keep (the keep ran at the first log line, before the table was read) */
+    coop::InstallCrashWatch();
+    {
+        const std::string ck = CrashKeepSaveRootLook(coop::KenshiSaveRoot(), false);   /* not known yet: again at the first world load */
+        if (!ck.empty()) DebugLog(ck);
+    }
     /* E38 / decisions 42-43. FIRST, so every install below can see the role: InstallStore must know whether to read
        the notebook's record index at all (role=single must not - the folder belongs to a co-op world), and the slot
        has to be known before the first store HELLO can be sent. Reading a text file cannot fault the start the
@@ -846,6 +867,7 @@ static void startPluginOn(const char* road)
     // thread is executing them continuously. Installing here and testing a flag there is the safe order.
     coop::InstallPeace();          // E42: peace on|off - read-time is-enemy / is-ally overrides, writes nothing
     coop::InstallTownGen();        // P4: the client refuses town squad generation in host-held sectors (decision 25)
+    coop::InstallZonesAreaUpdate();   /* T-1442 step 1b: the area update 0xA0A960 - an area loaded / unloaded marks the area report owed */
     // P032: counts world population generation. Counters only by default - `worldGenOn` starts at
     // 1, meaning the engine generates its world exactly as it does today. Phrased as the ENGINE's
     // state rather than "the gate is off", because two log labels have already cost a reader time
@@ -863,7 +885,9 @@ static void startPluginOn(const char* road)
     coop::InstallCrime();      /* pvp1: no crime is recorded between players (user decision 2026-09-24) */
     coop::InstallBuild();      /* build1-a: observe construction (P082); nothing is sent */
     coop::InstallSettings();   /* settings2 S2: GameplayOptions::load 0x3EEDE0 post-hook - the world's advanced options over the save's */
+    coop::InstallPing();       /* T-1437: InputHandler::initialise post-hook + the Controls list's spacer - the Ping key, a rebindable 'Ping' row */
     coop::InstallNames();      /* names1: Character::setName 0x5CB840 - an owned character's rename is sent */
+    coop::InstallCarryKeep();  /* T-1411 fold 2 (F1286): the keep-updated test 0x5C6F30 keeps every carried character updated */
     coop::InstallFactionNameHooks();   /* T-368: the FACTION tab refuses a faction name another player of this world holds (Kenshi's own box) */
     coop::InstallCapture();    /* P11: task bodies 0x35A9C0 / 0x34E750 + the strip / dress / owner / shave hooks */
     coop::InstallSlaves();     /* slave1: setSlaveState 0x5A3EB0 + StateBroadcastData::periodicUpdate 0x5A44C0 */

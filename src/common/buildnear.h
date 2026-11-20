@@ -356,5 +356,61 @@ enum { kGroupNone = 0, kGroupKept = 1, kGroupNearest = 2 };
 inline int ConfirmGroupStep(int count, int interior, int kept) { return (count == 0 || interior != 0) ? kGroupNone : (kept >= 0 ? kGroupKept : kGroupNearest); }
 /* the group step gives the town to this piece (decomp_4da6f0.txt:151-157) */
 inline int ConfirmGroupTakes(const ConfirmPiece& p) { return (p.vt98 != 0 && p.hasTown == 0) ? 1 : 0; }
+/* T-1343 / T-1388: the height `buildtest cursor` moves its test piece to. The game's cursor update 0x4D4990 keeps its ray's hit point
+   and asks the bare-ground height 0x9B10B0 only for an open-ground hit (kind 2, decomp_4d4990.txt:46-48): a ray that hits a house's
+   floor keeps the floor. The lever has no ray (the ray call 0x9B6710 needs the engine's whole hit record, decomp_4e1d50.txt:314-331),
+   so: a building named by the engine's building-at-point 0x9B1CD0 at (x, the character's height, z) stands for a floor hit - the
+   character's own height (it stands on that floor); else the ground height; no ground answer (-99) keeps the character's height.
+   No own character (haveChar 0): never the floor road. Pure. */
+enum { kPieceYGround = 0, kPieceYFloor = 1, kPieceYCharacter = 2 };
+inline int CursorPieceY(int haveChar, float charY, int buildingAtChar, float groundY, float* out)
+{
+    if (haveChar != 0 && buildingAtChar != 0) { *out = charY; return kPieceYFloor; }
+    if (groundY != -99.0f) { *out = groundY; return kPieceYGround; }
+    *out = charY;
+    return kPieceYCharacter;
+}
+inline const char* CursorPieceYText(int src)
+{
+    return src == kPieceYFloor ? "floor: the building-at-point 0x9B1CD0 names a building at the character's height - the character's height"
+         : (src == kPieceYGround ? "ground: the cursor update's ground height 0x9B10B0" : "character: no ground answer - the character's height");
+}
+/* T-1408 TEST-ONLY `buildtest cursor <sid> chain` (chain fold, T2540 VACUOUS / F1240): the line's geometry, x and z only. A heading is
+   Ogre's yaw about +Y in degrees (0 = +z, 90 = +x) - the direction a wall's END lies from its START (WallEndPoint 0x4D0580 = position +
+   orientation * (0, 0, length), decomp_4d0580.txt; Read). ChainFreeEnd: of the named wall's start (its position) and its end, the line's
+   FREE end is the one farther from the line's origin (its first piece's position); start / end are swapped so that end is the free one
+   (1 = swapped). The new wall starts at end and heads ChainHeadingDeg(start, end) - away from the line. ChainForward: a heading within
+   kChainForwardTol degrees of the line's */
+inline float ChainWrapDeg(float d)
+{
+    if (!(d > -100000.0f && d < 100000.0f)) return d;
+    while (d > 180.0f) d -= 360.0f;
+    while (d <= -180.0f) d += 360.0f;
+    return d;
+}
+inline float ChainHeadingDeg(const float* from, const float* to) { return (float)(std::atan2(to[0] - from[0], to[2] - from[2]) * 57.29577951); }
+inline int ChainFreeEnd(const float* origin, float* start, float* end)
+{
+    const float sx = start[0] - origin[0], sz = start[2] - origin[2], ex = end[0] - origin[0], ez = end[2] - origin[2];
+    if (sx * sx + sz * sz <= ex * ex + ez * ez) return 0;
+    for (int i = 0; i < 3; ++i) { const float t = start[i]; start[i] = end[i]; end[i] = t; }
+    return 1;
+}
+const float kChainForwardTol = 10.0f;
+inline int ChainForward(float heading, float lineHeading) { return std::fabs(ChainWrapDeg(heading - lineHeading)) <= kChainForwardTol ? 1 : 0; }
+/* T-1408 fold 4 (F1254 / F1256): ChainSpotAt - before the click, the preview's start (read: its position was read) lies within tol of the
+   spot it was moved to (the named wall's free end), x and z; an unread or NaN position is not. ChainForwardPlaced - 'forward' only when
+   the new wall heads along the line (headingForward), starts within tol of the named wall's free end (gap) AND landed on another key than
+   the named wall's (sameKey 0: T2553's fourth wall took the third's spot and key) */
+inline int ChainSpotAt(int read, const float* at, const float* spot, float tol)
+{
+    if (read == 0) return 0;
+    const float dx = at[0] - spot[0], dz = at[2] - spot[2];
+    return (dx <= tol && dx >= -tol && dz <= tol && dz >= -tol) ? 1 : 0;
+}
+inline int ChainForwardPlaced(int headingForward, float gap, float tol, int sameKey)
+{
+    return (headingForward != 0 && gap <= tol && sameKey == 0) ? 1 : 0;
+}
 }   // namespace buildnear
 #endif

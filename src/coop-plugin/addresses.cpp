@@ -67,6 +67,13 @@ long long g_unreadable  = 0;      /* addrUnreadable     - the read itself raised
 long long g_hookedFirst = 0;      /* addrLooksHooked    - a mismatch whose first byte is a jump: someone else's hook */
 long long g_hookedAccepted = 0;   /* addrHookedAccepted - rk1: a call-only row hooked by another mod, the rest matching:
                                      accepted, NOT in addrMismatch nor addrLooksHooked (src/common/addrhooked.h) */
+long long g_hookedChained = 0;    /* addrHookedChained  - T-1447: a row this mod does more than call, at a game function's start,
+                                     another mod's jump on it, the rest matching: accepted - our hook goes on top (not in
+                                     addrHookedAccepted, addrMismatch nor addrLooksHooked) */
+/* T-1447: the rows accepted chained - where, the bytes the gate accepted (for AddrChainedCheck) and the module named. One
+   per such row, sized at the table load (written only inside AddrInit, before any hook exists). */
+struct ChainedRow { unsigned long long abs; const char* name; int nbytes; unsigned char got[kAddrBytesMax]; std::string module; };
+std::vector<ChainedRow> g_chained;
 long long g_bindMissing = 0;      /* addrBindMissing    - a registered name the table does not carry */
 long long g_badLines    = 0;
 std::string g_firstMismatch;      /* the FIRST mismatching entry, named - a refusal that names nothing is not a measurement */
@@ -152,8 +159,9 @@ int ReadWholeFile(const std::string& path, std::string* out)
 }
 
 /* rk1: 1 when EVERY registration of `name` is kAddrUseCallOnly - and there is at least one, and none was lost to a
-   registry overflow (an unregistered row may still be read through Rva(name), whose use nobody declared). 0 otherwise. */
-int RowCallOnly(const char* name)
+   registry overflow (an unregistered row may still be read through Rva(name), whose use nobody declared). T-1447: 2 when
+   any one is not call-only (accepted only at a game function's start, AddrForeignVerdict). 0 otherwise. */
+int RowUse(const char* name)
 {
     unsigned char uses[kMaxRegs];
     int i, n = 0;
@@ -163,7 +171,98 @@ int RowCallOnly(const char* name)
         if (g_regs[i].name == 0 || std::strcmp(g_regs[i].name, name) != 0) continue;
         uses[n++] = g_regUse[i];
     }
-    return AddrUsesAllCallOnly(uses, n);   /* review S2: the rule itself, offline-tested (src/common/addrhooked.h) */
+    return AddrUsesCombined(uses, n);   /* review S2 / T-1447: the rule itself, offline-tested (src/common/addrhooked.h) */
+}
+
+/* T-1447: IS `rva` THE START OF A GAME FUNCTION? A binary search of the executable's own exception directory (.pdata,
+   RUNTIME_FUNCTION entries sorted by BeginAddress - every non-leaf x64 function has one). 1 yes, 0 no or unreadable. */
+int IsFunctionStartPod(uintptr_t base, unsigned long rva)
+{
+    __try
+    {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + (uintptr_t)dos->e_lfanew);
+        const IMAGE_DATA_DIRECTORY* d = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (d->VirtualAddress == 0 || d->Size < sizeof(RUNTIME_FUNCTION)) return 0;
+        const RUNTIME_FUNCTION* f = (const RUNTIME_FUNCTION*)(base + (uintptr_t)d->VirtualAddress);
+        const unsigned long count = d->Size / (unsigned long)sizeof(RUNTIME_FUNCTION);
+        unsigned long lo = 0, hi = count;
+        while (lo < hi)
+        {
+            const unsigned long mid = lo + (hi - lo) / 2;
+            if (f[mid].BeginAddress < rva) lo = mid + 1; else hi = mid;
+        }
+        return (lo < count && f[lo].BeginAddress == rva) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+unsigned long long ImageSizePod(uintptr_t base)
+{
+    __try
+    {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        return (unsigned long long)((const IMAGE_NT_HEADERS64*)(base + (uintptr_t)dos->e_lfanew))->OptionalHeader.SizeOfImage;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* T-1447: where another mod's jump (`got`, read at `site`) goes, and 1 when that lies OUTSIDE the game's image (a DLL or
+   memory that mod allocated) - E9 rel32, FF 25 rip-relative (the 8-byte pointer read), FF 25 00000000 + address. */
+int ForeignJumpOutside(uintptr_t base, uintptr_t site, const unsigned char* got, int n, unsigned long long* dest)
+{
+    unsigned long long d = 0;
+    *dest = 0;
+    const int k = AddrJumpDest(got, n, (unsigned long long)site, &d);
+    if (k == 0) return 0;
+    if (k == 2 && !ReadPtrPod((const void*)(uintptr_t)d, &d)) return 0;
+    *dest = d;
+    const unsigned long long size = ImageSizePod(base);
+    return (size != 0 && (d < (unsigned long long)base || d >= (unsigned long long)base + size)) ? 1 : 0;
+}
+
+/* T-1447: WHICH MODULE IS BEHIND ANOTHER MOD'S JUMP. GetModuleHandleEx on the address; the log takes the FILE NAME only (never
+   a folder that may hold a user's name). "" when the address lies in no module (a relay page). */
+std::string ModuleFileAt(unsigned long long addr)
+{
+    HMODULE m = 0;
+    if (addr == 0 || !::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           (LPCWSTR)(uintptr_t)addr, &m) || m == 0)
+        return std::string();
+    std::wstring buf(32768, L'\0');
+    const DWORD n = ::GetModuleFileNameW(m, &buf[0], (DWORD)buf.size());
+    if (n == 0 || n >= (DWORD)buf.size()) return std::string("(a module whose name could not be read)");
+    buf.resize((size_t)n);
+    const std::string full = U8FromW(buf.c_str());
+    return std::string(AddrFileNamePart(full.c_str()));
+}
+
+/* T-1447: the module another mod's jump at `site` leads to: the E9's target when it lies in a module; else (a relay page,
+   as multihook's slots below the game's image, hook.c:87-93) ONE more jump is followed - FF 25 00000000 + address (the
+   14-byte form), FF 25 [rip+d], or mov rax / jmp rax - and THAT module is named. "unknown" when neither lands in one.
+   *how gets the walk, for the log. Every read is guarded (ReadBytesPod / ReadPtrPod). */
+std::string ForeignJumpModule(uintptr_t site, std::string* how)
+{
+    unsigned char b[14];
+    unsigned long long d1 = 0, d2 = 0;
+    const int k0 = ReadBytesPod((const void*)site, b, 14) ? AddrJumpDest(b, 14, (unsigned long long)site, &d1) : 0;
+    if (k0 == 0 || (k0 == 2 && !ReadPtrPod((const void*)(uintptr_t)d1, &d1)))
+    { *how = "the jump could not be read"; return "unknown"; }
+    *how = "jump -> " + H(d1);
+    std::string m = ModuleFileAt(d1);
+    if (!m.empty()) return m;
+    if (!ReadBytesPod((const void*)(uintptr_t)d1, b, 14)) { *how += " (in no module; its bytes could not be read)"; return "unknown"; }
+    const int k = AddrJumpDest(b, 14, d1, &d2);
+    if (k == 2)
+    {
+        unsigned long long p = 0;
+        if (!ReadPtrPod((const void*)(uintptr_t)d2, &p)) { *how += " (in no module; its jump's pointer could not be read)"; return "unknown"; }
+        d2 = p;
+    }
+    if (k == 0) { *how += " (in no module, and no jump there: " + Hex(b, 14) + ")"; return "unknown"; }
+    *how += " (in no module: a relay) -> " + H(d2);
+    m = ModuleFileAt(d2);
+    return m.empty() ? std::string("unknown") : m;
 }
 
 /* ---- one entry, verified -------------------------------------------------------------------------------- */
@@ -171,7 +270,7 @@ int RowCallOnly(const char* name)
    first instruction another mod replaced with its 5-byte jump, every later byte matching, and callOnly != 0 (every
    registration of the row only calls it - RowCallOnly; always 0 on the signature road). Fills `detail` on a mismatch
    with what was EXPECTED and what was THERE - the inputs, not only the answer - and on an accepted row with both. */
-int VerifyEntry(uintptr_t base, const AddrEntry& e, int callOnly, std::string* detail)
+int VerifyEntry(uintptr_t base, const AddrEntry& e, int callOnly /* T-1447: the row's use (RowUse): 0 none, 1 call-only, 2 any other */, std::string* detail)
 {
     if (e.kind == kAddrVar) return -1;
 
@@ -214,7 +313,11 @@ int VerifyEntry(uintptr_t base, const AddrEntry& e, int callOnly, std::string* d
             /* rk1: somebody else's 5-byte jump at the entry of a row this mod only calls, the rest the same function -
                accepted (src/common/addrhooked.h). Every other difference still refuses, below. */
             const int atEntry = (e.kind == kAddrCode && e.verifyAt == e.rva) ? 1 : 0;
-            if (AddrHookedVerdict(e.bytes, got, e.nbytes, atEntry, callOnly) == kHookAccepted) return 2;
+            unsigned long long dest = 0;
+            const int outside = ForeignJumpOutside(base, base + (uintptr_t)e.verifyAt, got, e.nbytes, &dest);
+            const int fstart = (atEntry != 0 && callOnly == 2) ? IsFunctionStartPod(base, e.rva) : 0;
+            int why = kWhyAccepted;
+            if (AddrForeignVerdict(e.bytes, got, e.nbytes, atEntry, callOnly, fstart, outside, &why) == kHookAccepted) return 2;
             /* A jump as the FIRST byte is not a different game build - it is somebody else's hook, and it
                is a different repair (that address needs a shadow window in the table). Say which it is. */
             if (atEntry != 0 && (got[0] == 0xE9 || got[0] == 0xEB || got[0] == 0xFF || got[0] == 0x68))
@@ -222,10 +325,8 @@ int VerifyEntry(uintptr_t base, const AddrEntry& e, int callOnly, std::string* d
                 ++g_hookedFirst;
                 *detail += " - and the first byte is a jump, so this address is most likely ALREADY HOOKED by"
                            " another mod rather than being a different game build";
-                if (AddrHookedVerdict(e.bytes, got, e.nbytes, atEntry, 1) == kHookAccepted)
-                    *detail += "; the rest of its bytes match, but it is still refused: a registration of this row hooks,"
-                               " patches or does not declare its use, or the row came from the signature search (which"
-                               " accepts no hooked row)";
+                *detail += std::string("; refused: ") + AddrWhyText(why)
+                         + (outside != 0 ? " (the jump leads to " : " (the jump leads to rva/address ") + H(dest) + ")";
             }
             return 0;
         }
@@ -313,7 +414,7 @@ AddrReg::AddrReg(const char* name, unsigned long long* slot, int use)
     if (g_regCount >= kMaxRegs) { ++g_regOverflow; return; }
     g_regs[g_regCount].name = name;
     g_regs[g_regCount].slot = slot;
-    g_regUse[g_regCount] = (unsigned char)(use == kAddrUseCallOnly ? 1 : 0);   /* rk1: anything else is strict */
+    g_regUse[g_regCount] = (unsigned char)(use == kAddrUseCallOnly ? kHookUseCallOnly : 0);   /* rk1: anything else is strict */
     ++g_regCount;
 }
 
@@ -361,6 +462,39 @@ const char* AddrHookRefusedAt(unsigned long long target)
         uses[n++] = g_regUse[i];
     }
     return AddrUsesAllCallOnly(uses, n) != 0 ? (first != 0 ? first : "?") : 0;
+}
+
+/* T-1447 - see addresses.h. The list is written once inside AddrInit, before any hook exists. */
+int AddrChainedCheck(unsigned long long target, const char** row)
+{
+    int i;
+    if (row) *row = 0;
+    if (target == 0) return -1;
+    for (i = 0; i < (int)g_chained.size(); ++i)
+    {
+        if (g_chained[i].abs != target) continue;
+        if (row) *row = g_chained[i].name;
+        unsigned char now[kAddrBytesMax];
+        if (!ReadBytesPod((const void*)(uintptr_t)target, now, (unsigned int)g_chained[i].nbytes)) return 0;
+        return std::memcmp(now, g_chained[i].got, (size_t)g_chained[i].nbytes) == 0 ? 1 : 0;
+    }
+    return -1;
+}
+
+void AddrChainedHooked(unsigned long long target)
+{
+    size_t i;
+    for (i = 0; i < g_chained.size(); ++i)
+        if (g_chained[i].abs == target)
+            ReadBytesPod((const void*)(uintptr_t)target, g_chained[i].got, (unsigned int)g_chained[i].nbytes);
+}
+
+const char* AddrChainedModule(unsigned long long target)
+{
+    size_t i;
+    for (i = 0; i < g_chained.size(); ++i)
+        if (g_chained[i].abs == target) return g_chained[i].module.c_str();
+    return 0;
 }
 
 const char* AddrRefusalCaption() { return g_caption; }
@@ -542,10 +676,37 @@ static int AddrInitBody()
             std::string detail;
             /* rk1: the signature road keeps the strict check for every row (callOnly 0) - its bytes come from the file's
                own signature match, and a hooked row there is refused exactly as before */
-            const int callOnly = byPattern ? 0 : RowCallOnly(g_entries[i].name);
-            const int v = VerifyEntry(base, g_entries[i], callOnly, &detail);
+            const int use = byPattern ? 0 : RowUse(g_entries[i].name);   /* T-1447: 0 strict, 1 call-only, 2 hooks, may chain */
+            const int v = VerifyEntry(base, g_entries[i], use, &detail);
             if (v < 0) { ++g_varEntries; continue; }
             ++g_checked;
+            if (v == 2 && use == 2)
+            {
+                /* T-1447: a row we HOOK, another mod hooked first - our hook goes on top (AddHook re-reads these bytes first,
+                   AddrChainedCheck). The bytes are kept for that check; more such rows than the list holds refuse. */
+                const uintptr_t at = base + (uintptr_t)g_entries[i].verifyAt;
+                ChainedRow cr;
+                cr.abs = (unsigned long long)at;
+                cr.name = g_entries[i].name;
+                cr.nbytes = g_entries[i].nbytes;
+                if (!ReadBytesPod((const void*)at, cr.got, (unsigned int)cr.nbytes))
+                {
+                    ++g_mismatch;
+                    if (g_firstMismatch.empty())
+                        g_firstMismatch = std::string(g_entries[i].name) + ": another mod's jump at a game function's start,"
+                                          " but its bytes could not be read again to keep them - " + detail;
+                    continue;
+                }
+                std::string how;
+                const std::string mod = ForeignJumpModule(at, &how);
+                cr.module = mod;
+                if (g_chained.empty()) g_chained.reserve((size_t)g_entryCount);
+                g_chained.push_back(cr);
+                ++g_hookedChained;
+                DebugLog(std::string("[ADDR] ") + g_entries[i].name + " (rva " + H(g_entries[i].rva) + ") starts with another"
+                         " mod's jump to " + mod + " - our hook is chained on top (hooks, may chain) [" + how + "; " + detail + "]");   /* a row we only read at its start: its own check skips that one hook, logged there */
+                continue;
+            }
             if (v == 2)
             {
                 ++g_hookedAccepted;
@@ -584,7 +745,7 @@ static int AddrInitBody()
                  + N(g_checked) + " addrMismatch=" + N(g_mismatch) + " addrVarEntries=" + N(g_varEntries)
                  + " addrBindMissing=" + N(g_bindMissing) + " addrUnreadable=" + N(g_unreadable)
                  + " addrLooksHooked=" + N(g_hookedFirst) + " addrHookedAccepted=" + N(g_hookedAccepted)
-                 + " addrRegOverflow=" + N(g_regOverflow)
+                 + " addrHookedChained=" + N(g_hookedChained) + " addrRegOverflow=" + N(g_regOverflow)
                  + ". FIRST MISMATCH: " + g_firstMismatch
                  + ". Nothing was hooked and no link was opened; Kenshi runs exactly as it does without this mod.");
         if (byPattern)
@@ -607,7 +768,8 @@ static int AddrInitBody()
     ::InterlockedExchange(&g_ok, 1);
     DebugLog("[ADDR] address table '" + g_version + "' matched this executable: fingerprint " + g_fingerprint
              + ", addrTableLoaded=1 addrEntriesChecked=" + N(g_checked) + " addrMismatch=0 addrVarEntries="
-             + N(g_varEntries) + " addrHookedAccepted=" + N(g_hookedAccepted) + " addrBound=" + N(g_regCount)
+             + N(g_varEntries) + " addrHookedAccepted=" + N(g_hookedAccepted) + " addrHookedChained=" + N(g_hookedChained)
+             + " addrBound=" + N(g_regCount)
              + " from '" + g_tablePath + "'."
              " addrVarEntries are writable globals - they have no constant bytes to compare and are NOT part of"
              " addrEntriesChecked; they ride on the other entries and on the fingerprint (build/prep-p8h.md).");
@@ -661,6 +823,7 @@ std::string AddrReportToken()
       << ",unreadable=" << g_unreadable
       << ",looksHooked=" << g_hookedFirst
       << ",hookedAccepted=" << g_hookedAccepted
+      << ",hookedChained=" << g_hookedChained
       << ",bindMissing=" << g_bindMissing
       << ",bound=" << g_regCount
       << ",badLines=" << g_badLines

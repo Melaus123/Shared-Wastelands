@@ -5,6 +5,8 @@
  * than one file uses is in suite.h. New tests go in test_main.cpp.
  */
 #include "suite.h"
+#include "adminwords.h"   /* T-247 owner 1703: /login's not-an-admin line */
+#include "startprogress.h"   /* T-1403: the world server's start-up progress file and the HOST move watch */
 
 namespace suite {
 
@@ -470,9 +472,11 @@ bool Mp5NotebookOk(const std::string& k, const std::string& v)
     if (k == "recruitmult") return coopr::RecruitMultValueOk(v);
     if (k == "basepolicy") return v == "shared" || v == "owner" || v == "locked";
     if (k == "timemode") return coopclock::TimeModeOfWire(v.c_str()) >= 0;
+    if (k == coopclock::kMenusPauseKey) return coopclock::MenusPauseOfWire(v.c_str()) >= 0;   /* T-1392: the world server's own check (optionvalue.h) */
     if (k == "profilecap") return coopprof::CapValueOk(v) != 0;   /* ui5: store_main.cpp OptionValueOk's own check */
     if (swfee::IsOptionKey(k)) return swfee::OptionValueOk(k, v);   /* T-556: the world server's own check */
     if (spimport::IsOptionKey(k)) return spimport::OptionValueOk(k, v);   /* T-1096: the world server's own check */
+    if (k == coopmods::kModsRuleKey) return coopmods::ModsRuleValueOk(v);   /* T-247: the world server's own check (optionvalue.h) */
     return false;
 }
 void t_mp5_game_options_rows()
@@ -516,14 +520,16 @@ void t_mp5_game_options_rows()
         else if (k == "recruitmult") { wantLow = "auto"; wantHigh = "4"; wantN = 5; }
         else if (k == "basepolicy") { wantLow = "shared"; wantHigh = "locked"; wantN = 3; }
         else if (k == "timemode") { wantLow = "fixed"; wantHigh = "locked"; wantN = 4; }
+        else if (k == "menupause") { wantLow = "run"; wantHigh = "pause"; wantN = 2; }   /* T-1392 */
         else if (k == "profilecap") { wantLow = "1"; wantHigh = "16"; wantN = 16; }   /* ui5 */
         else if (k == "spimport") { wantLow = "all"; wantHigh = "off"; wantN = 3; }   /* T-1096 */
         else if (k == "spimportmoney" || k == "spimportresearch") { wantLow = "yes"; wantHigh = "no"; wantN = 2; }   /* T-1096 */
+        else if (k == "modcheck") { wantLow = "accepted"; wantHigh = "rejected"; wantN = 2; }   /* T-247 */
         if (low != wantLow || high != wantHigh || values != wantN)
             Fail(k + ": steps " + low + ".." + high + " (" + I(values) + ") - wanted " + wantLow + ".." + wantHigh + " (" + I(wantN) + ")");
         if (d.kind == coopui::kOptKindTick && (coopui::OptStep(i, "0", 1) != "1" || coopui::OptStep(i, "1", 1) != "0")) Fail(k + ": a tick box flips");
     }
-    if (perTab[0] != 9 || perTab[1] != 6 || perTab[2] != 10) Fail("rows per tab: " + I(perTab[0]) + "/" + I(perTab[1]) + "/" + I(perTab[2]));
+    if (perTab[0] != 9 || perTab[1] != 6 || perTab[2] != 11 || perTab[3] != 1)   /* T-1392: + MENUS AND BUILDING (on screen only under Slowest wins) */ Fail("rows per tab: " + I(perTab[0]) + "/" + I(perTab[1]) + "/" + I(perTab[2]) + "/" + I(perTab[3]));   /* T-247: MODS holds DIFFERENT MODS */
     for (int t = 0; t < coopui::kOptTabCount; ++t) if (perTab[t] > coopui::kOptRowsShown || coopui::OptIndexOf(t, perTab[t]) != -1) Fail("a tab has more rows than the screen");
     const int gdm = coopui::OptIndexOf(coopui::kOptTabDifficulty, 0);
     if (coopui::OptShown(gdm, "1") != "1.0x" || coopui::OptShown(gdm, "0.25") != "0.25x" || coopui::OptShown(gdm, "1.5") != "1.5x"
@@ -543,15 +549,29 @@ void t_mp5_game_options_rows()
     if (ch.size() != 1 || ch[0].first != "gp.gdm" || ch[0].second != "2") Fail("only the changed rows are handed on: " + I((int)ch.size()));
 }
 
-/* GAME OPTIONS' resurrection rows - the MULTIPLAYER tab's rows 5 to 7, the fee box's rule, the fee rows' hover note word
+/* GAME OPTIONS' resurrection rows - the MULTIPLAYER tab's rows 6 to 8 with the defaults (5 to 7 under Admin only), the fee box's rule, the fee rows' hover note word
    for word, the greying, which rows have hover notes, the hover notes' hit test, DEFAULTS and the hand-over. */
 void t_t556f_fee_rows()
 {
     const int on = coopui::OptIndexOfKey("resurrect"), fee = coopui::OptIndexOfKey("resurrectfee"), gr = coopui::OptIndexOfKey("resurrectgrowth");
     if (on < 0 || fee < 0 || gr < 0) { Fail("the three rows exist"); return; }
-    if (coopui::OptIndexOf(coopui::kOptTabCoop, 4) != on || coopui::OptIndexOf(coopui::kOptTabCoop, 5) != fee || coopui::OptIndexOf(coopui::kOptTabCoop, 6) != gr
-        || coopui::OptRowOf(coopui::kOptTabCoop, fee) != 5 || coopui::OptTabRows(coopui::kOptTabCoop) != 10)   /* T-1096: + the three import rows after them */
-        Fail("RESURRECTION, RESURRECTION FEE, FEE GROWTH are the MULTIPLAYER tab's rows 5, 6, 7");
+    /* T-1423: the rows on screen with the defaults - GAME SPEED CONTROL Slowest wins, so MENUS AND BUILDING is shown (screen row
+       index 3, under GAME SPEED CONTROL) and the three resurrection rows sit at screen row indexes 5, 6, 7 (the 6th, 7th, 8th rows) */
+    std::string d0[coopui::kOptCount];
+    for (int i = 0; i < coopui::kOptCount; ++i) d0[i] = coopui::OptCanon(i, coopui::OptDefs()[i].dflt);
+    const int mp = coopui::OptIndexOfKey("menupause"), tm = coopui::OptIndexOfKey("timemode");
+    if (mp < 0 || tm < 0 || d0[tm] != "consensus" || coopui::OptIndexShown(coopui::kOptTabCoop, 3, d0) != mp
+        || coopui::OptIndexShown(coopui::kOptTabCoop, 5, d0) != on || coopui::OptIndexShown(coopui::kOptTabCoop, 6, d0) != fee || coopui::OptIndexShown(coopui::kOptTabCoop, 7, d0) != gr
+        || coopui::OptRowShownOf(coopui::kOptTabCoop, fee, d0) != 6 || coopui::OptTabRows(coopui::kOptTabCoop) != 11)   /* T-1096: + the three import rows after them; T-1392: + MENUS AND BUILDING */
+        Fail("defaults (Slowest wins): MENUS AND BUILDING shown; RESURRECTION, RESURRECTION FEE, FEE GROWTH are the MULTIPLAYER tab's rows 6, 7, 8");
+    /* T-1392's hiding: GAME SPEED CONTROL Admin only - MENUS AND BUILDING absent, the three rows move up one, to indexes 4, 5, 6 */
+    std::string dA[coopui::kOptCount];
+    for (int i = 0; i < coopui::kOptCount; ++i) dA[i] = d0[i];
+    if (tm >= 0) dA[tm] = "fixed";
+    if (mp < 0 || coopui::OptRowShownOf(coopui::kOptTabCoop, mp, dA) != -1
+        || coopui::OptIndexShown(coopui::kOptTabCoop, 4, dA) != on || coopui::OptIndexShown(coopui::kOptTabCoop, 5, dA) != fee || coopui::OptIndexShown(coopui::kOptTabCoop, 6, dA) != gr
+        || coopui::OptRowShownOf(coopui::kOptTabCoop, fee, dA) != 5)
+        Fail("Admin only: MENUS AND BUILDING absent; RESURRECTION, RESURRECTION FEE, FEE GROWTH are the MULTIPLAYER tab's rows 5, 6, 7");
     if (std::string(coopui::OptDefs()[on].label) != "RESURRECTION" || std::string(coopui::OptDefs()[fee].label) != "RESURRECTION FEE"
         || std::string(coopui::OptDefs()[gr].label) != "FEE GROWTH") Fail("the approved labels");
     if (!coopui::OptIsTick(on) || coopui::OptIsTick(fee) || coopui::OptIsTick(gr) || coopui::OptDefs()[fee].kind != coopui::kOptKindAmount)
@@ -636,9 +656,13 @@ void t_t556f_fee_rows()
     for (size_t k = 0; k < ch.size(); ++k) if (!swfee::OptionValueOk(ch[k].first, ch[k].second)) Fail("the world server refuses " + ch[k].first);
     /* the test driver reaches the tick box and the fee box */
     const coopui::UiDriveName* t = coopui::UiDriveFind("opttick", coopui::kDriveButton);
-    const coopui::UiDriveName* te = coopui::UiDriveFind("opttick" + std::string(1, (char)('a' + coopui::OptRowOf(coopui::kOptTabCoop, on))), coopui::kDriveButton);
+    /* T-1392: the row on screen - T-1423: with the defaults (Slowest wins) RESURRECTION's tick is the sixth row's, opttickf;
+       with Admin only it is the fifth row's, optticke */
+    const coopui::UiDriveName* te = coopui::UiDriveFind("opttick" + std::string(1, (char)('a' + coopui::OptRowShownOf(coopui::kOptTabCoop, on, was))), coopui::kDriveButton);
+    const coopui::UiDriveName* teA = coopui::UiDriveFind("opttick" + std::string(1, (char)('a' + coopui::OptRowShownOf(coopui::kOptTabCoop, on, dA))), coopui::kDriveButton);
     const coopui::UiDriveName* fb = coopui::UiDriveFind("fee", coopui::kDriveEdit);
-    if (t != 0 || te == 0 || std::string(te->w1) != "CoopOptTick4" || fb == 0 || std::string(fb->w1) != "SWOptFeeEdit") Fail("the driver's opttick / fee names");
+    if (t != 0 || te == 0 || std::string(te->w1) != "CoopOptTick5" || teA == 0 || std::string(teA->w1) != "CoopOptTick4"
+        || fb == 0 || std::string(fb->w1) != "SWOptFeeEdit") Fail("the driver's opttick / fee names");
 }
 
 /* mp4 (design-mpmenu1 section 6): the Hosting screen's address pick, its words and the players list. */
@@ -975,15 +999,57 @@ void t_w3_a_game_confirms_adopts_or_refuses_the_notebooks_world()
 void t_t318_plugin_rows()
 {
     /* the T710 bench: vanilla 1.0.68 started by SharedWastelandsLoader, RE_Kenshi.dll renamed .off - our own test DLL is not a mod difference */
-    if (coopmods::PluginRowDecide(0, "Shared Wastelands", "KenshiCoopHello.dll") != coopmods::kPluginRowOwnMod) Fail("T-318: our test DLL is left out without RE_Kenshi");
-    if (coopmods::PluginRowDecide(1, "Shared Wastelands", "KenshiCoopHello.dll") != coopmods::kPluginRowOwnMod) Fail("T-318: our test DLL is left out with RE_Kenshi too");
-    if (coopmods::PluginRowDecide(1, "SHARED wastelands", "sub\\KenshiCoopHello.dll") != coopmods::kPluginRowOwnMod) Fail("T-318: our mod's name matches in any case");
-    if (coopmods::PluginRowDecide(1, "SomeMod", "sub/SharedWastelands.dll") != coopmods::kPluginRowOwnMod) Fail("T-318: our DLL named by another mod's file is ours");
+    if (coopmods::PluginRowDecide(0, "Shared Wastelands", "KenshiCoopHello.dll", 1, 1) != coopmods::kPluginRowOwnMod) Fail("T-318: our test DLL is left out without RE_Kenshi");
+    if (coopmods::PluginRowDecide(1, "Shared Wastelands", "KenshiCoopHello.dll", 1, 1) != coopmods::kPluginRowOwnMod) Fail("T-318: our test DLL is left out with RE_Kenshi too");
+    if (coopmods::PluginRowDecide(1, "SHARED wastelands", "sub\\KenshiCoopHello.dll", 1, 1) != coopmods::kPluginRowOwnMod) Fail("T-318: our mod's name matches in any case");
+    if (coopmods::PluginRowDecide(1, "SomeMod", "sub/SharedWastelands.dll", 1, 1) != coopmods::kPluginRowOwnMod) Fail("T-318: our DLL named by another mod's file is ours");
     /* another mod's rows: counted only while RE_Kenshi loads plugins (today's rule kept then) */
-    if (coopmods::PluginRowDecide(0, "SomeMod", "Other.dll") != coopmods::kPluginRowNoReKenshi) Fail("T-318: a leftover RE_Kenshi.json is no plugin without RE_Kenshi");
-    if (coopmods::PluginRowDecide(1, "SomeMod", "Other.dll") != coopmods::kPluginRowCounted) Fail("T-318: another mod's DLL counts while RE_Kenshi runs");
-    if (coopmods::PluginRowDecide(1, "Shared Wastelands extras", "x.dll") != coopmods::kPluginRowCounted) Fail("T-318: a mod merely named like ours is not ours");
+    if (coopmods::PluginRowDecide(0, "SomeMod", "Other.dll", 1, 1) != coopmods::kPluginRowNoReKenshi) Fail("T-318: a leftover RE_Kenshi.json is no plugin without RE_Kenshi");
+    if (coopmods::PluginRowDecide(1, "SomeMod", "Other.dll", 1, 1) != coopmods::kPluginRowCounted) Fail("T-318: another mod's DLL counts while RE_Kenshi runs");
+    if (coopmods::PluginRowDecide(1, "Shared Wastelands extras", "x.dll", 1, 1) != coopmods::kPluginRowCounted) Fail("T-318: a mod merely named like ours is not ours");
     if (std::string(coopmods::PluginRowWhy(coopmods::kPluginRowOwnMod)) == coopmods::PluginRowWhy(coopmods::kPluginRowNoReKenshi)) Fail("T-318: the two reasons read differently");
+    /* T-1238 (run T2383): RE_Kenshi loads an unticked mod's PreloadPlugins DLLs, not its Plugins DLLs */
+    if (coopmods::PluginRowDecide(1, "SomeMod", "pre.dll", 1, 0) != coopmods::kPluginRowCounted) Fail("T-1238: a Preload row of an unticked mod counts");
+    if (coopmods::PluginRowDecide(1, "SomeMod", "post.dll", 0, 0) != coopmods::kPluginRowNotTicked) Fail("T-1238: a Plugins row of an unticked mod is left out");
+    if (coopmods::PluginRowDecide(1, "SomeMod", "post.dll", 0, 1) != coopmods::kPluginRowCounted) Fail("T-1238: a Plugins row of a ticked mod counts");
+    if (coopmods::PluginRowDecide(1, "SomeMod", "pre.dll", 1, 1) != coopmods::kPluginRowCounted) Fail("T-1238: a Preload row of a ticked mod counts");
+    if (coopmods::PluginRowDecide(1, "Shared Wastelands", "post.dll", 0, 0) != coopmods::kPluginRowOwnMod) Fail("T-1238: our own unticked mod stays our own");
+    if (coopmods::PluginRowDecide(1, "SomeMod", "SharedWastelands.dll", 0, 0) != coopmods::kPluginRowOwnMod) Fail("T-1238: our DLL stays ours unticked");
+    if (coopmods::PluginRowDecide(0, "SomeMod", "post.dll", 0, 0) != coopmods::kPluginRowNoReKenshi) Fail("T-1238: without RE_Kenshi nothing loads, ticked or not");
+    if (coopmods::PluginRowDecide(0, "SomeMod", "pre.dll", 1, 1) != coopmods::kPluginRowNoReKenshi) Fail("T-1238: without RE_Kenshi a ticked Preload row loads nothing");
+    if (std::string(coopmods::PluginRowWhy(coopmods::kPluginRowNotTicked)).find("not ticked") == std::string::npos) Fail("T-1238: the not-ticked reason says so");
+    /* T-1238 way 5: a json name with no ending names "<name>.dll" */
+    if (coopmods::PluginDllFileName("kep-core-preload-x64") != "kep-core-preload-x64.dll") Fail("T-1238: a bare json name gets .dll");
+    if (coopmods::PluginDllFileName("x.dll") != "x.dll") Fail("T-1238: a name ending .dll is kept");
+    if (coopmods::PluginDllFileName("X.DLL") != "X.DLL") Fail("T-1238: a name ending .DLL is kept as written");
+    if (coopmods::PluginDllFileName("sub/x") != "sub/x.dll") Fail("T-1238: the base-name rule covers a folder");
+    if (coopmods::PluginDllFileName("sub.d\\x") != "sub.d\\x.dll") Fail("T-1238: a '.' in the folder is not an ending");
+    if (coopmods::PluginDllFileName("sub/x.asi") != "sub/x.asi") Fail("T-1238: another ending is kept");
+    if (coopmods::PluginDllFileName("") != "") Fail("T-1238: an empty name stays empty");
+    /* T-1238 way 6: one DLL under two mods is one row */
+    {
+        std::vector<std::string> full, cut;
+        full.push_back("x.dll|0a0b0c0d|Plugins|ModB");
+        full.push_back("x.dll|0a0b0c0d|Plugins|ModA");
+        coopmods::PluginRowsCut(full, &cut);
+        if (cut.size() != 1 || cut[0] != "x.dll|0a0b0c0d") Fail("T-1238: two rows differing only in mod name cut to one dll|crc row");
+        full.push_back("a.dll|11111111|PreloadPlugins|ModA");
+        coopmods::PluginRowsCut(full, &cut);
+        if (cut.size() != 2 || cut[0] != "a.dll|11111111" || cut[1] != "x.dll|0a0b0c0d") Fail("T-1238: the cut rows are sorted");
+        /* the worked example: A carries x.dll under two mods, B under one - the same plugin list */
+        std::vector<std::string> fa, fb;
+        fa.push_back("x.dll|0a0b0c0d|Plugins|ModA"); fa.push_back("x.dll|0a0b0c0d|Plugins|ModB");
+        fb.push_back("x.dll|0a0b0c0d|Plugins|ModA");
+        coopmods::ModList a, b;
+        a.known = 1; b.known = 1;
+        a.active.push_back("ModA|1|00000001"); b.active.push_back("ModA|1|00000001");
+        coopmods::PluginRowsCut(fa, &a.plugins);
+        coopmods::PluginRowsCut(fb, &b.plugins);
+        if (!coopmods::ModListSame(a, b)) Fail("T-1238: one DLL under two mods vs under one - the lists are the same");
+        b.plugins[0] = "x.dll|0a0b0c0e";
+        if (coopmods::ModListSame(a, b)) Fail("T-1238: a different checksum still differs");
+    }
+    if (std::string(coopmods::PluginRowWhy(coopmods::kPluginRowNotTicked)) == coopmods::PluginRowWhy(coopmods::kPluginRowNoReKenshi)) Fail("T-1238: the not-ticked reason reads differently");
     /* RE_Kenshi's presence: its module in this process AND no --norekenshi */
     if (coopmods::ReKenshiLoadsPlugins(1, 0) != 1) Fail("T-318: module loaded, no flag - RE_Kenshi loads plugins");
     if (coopmods::ReKenshiLoadsPlugins(1, 1) != 0) Fail("T-318: --norekenshi - RE_Kenshi loads nothing");
@@ -1023,7 +1089,7 @@ void t_settings5_mod_check()
     if (d.extra.size() != 1 || d.extra[0] != "coop-test-salt" || !d.missing.empty() || !d.changed.empty() || d.orderDiffers)
         Fail("the salted game has exactly one extra mod, coop-test-salt");
     std::string txt = coopmods::ModRefusalText(d);
-    if (txt.find("Mod mismatch: extra coop-test-salt.") != 0) Fail("the salted sentence reads '" + txt + "'");
+    if (txt != "This world only accepts players whose mods match the world's. Yours don't: extra coop-test-salt.") Fail("the salted sentence reads '" + txt + "'");
     /* missing, extra, a different version, and the order */
     coopmods::ModList m; m.known = 1;
     m.active.push_back("Alpha|4|0000aaaa"); m.active.push_back("Delta|1|0000dddd"); m.active.push_back("Gamma|2|0000cccc");
@@ -1032,7 +1098,7 @@ void t_settings5_mod_check()
         || d.changed.size() != 1 || d.changed[0] != "Alpha")
         Fail("missing Beta and helper.dll, extra Delta, a different Alpha");
     txt = coopmods::ModRefusalText(d);
-    if (txt.find("missing Beta, helper.dll; extra Delta; different version of Alpha.") == std::string::npos) Fail("the mixed sentence reads '" + txt + "'");
+    if (txt != "This world only accepts players whose mods match the world's, and yours don't.") Fail("T-247: a version difference is never named - the mixed sentence reads '" + txt + "'");
     if (coopmods::ModDetailText(d).find("missing (2): Beta, helper.dll | extra (1): Delta | different version or file (1): Alpha") == std::string::npos)
         Fail("the detail line counts and names every kind");
     /* words1 (wording audit 10): the player's detail - one line per kind that differs, no counts */
@@ -1041,7 +1107,7 @@ void t_settings5_mod_check()
         Fail("words1: the player's detail lines read '" + coopmods::ModDetailPlayerText(d) + "'");
     coopmods::ModList o = w; std::swap(o.active[0], o.active[2]);
     d = coopmods::ModListDiff(w, o);
-    if (!d.orderDiffers || !d.missing.empty() || !d.extra.empty() || coopmods::ModRefusalText(d).find("different load order") == std::string::npos)
+    if (!d.orderDiffers || !d.missing.empty() || !d.extra.empty() || coopmods::ModRefusalText(d) != "This world only accepts players whose mods match the world's. Yours are the same mods in a different order.")
         Fail("the same mods in another order are refused as an order difference");
     if (coopmods::ModDetailPlayerText(d) != "Load order is different.") Fail("words1: an order-only detail reads '" + coopmods::ModDetailPlayerText(d) + "'");
     if (!coopmods::ModListDiff(w, w).missing.empty() || coopmods::ModListDiff(w, w).orderDiffers) Fail("a list against itself has no difference");
@@ -1050,11 +1116,11 @@ void t_settings5_mod_check()
     coopmods::ModList empty; empty.known = 1;
     if (coopmods::ModRefusalText(coopmods::ModListDiff(many, empty)).find("missing p, q, r and 2 more") == std::string::npos) Fail("five missing names say three and 2 more");
     /* mods.txt round trip; known=0 or no file is no record */
-    if (!coopmods::ModListFromText(coopmods::ModListToText(w), &r) || !coopmods::ModListSame(w, r) || r.hash != w.hash) Fail("mods.txt reads back as written");
-    std::string crlfText = coopmods::ModListToText(w); for (size_t i = 0; i < crlfText.size(); ++i) if (crlfText[i] == '\n') { crlfText.insert(i, "\r"); ++i; }
+    if (!coopmods::ModListFromText(coopmods::ModListToText(w, "Ana", "2026-11-15"), &r) || !coopmods::ModListSame(w, r) || r.hash != w.hash) Fail("mods.txt reads back as written");
+    std::string crlfText = coopmods::ModListToText(w, "Ana", "2026-11-15"); for (size_t i = 0; i < crlfText.size(); ++i) if (crlfText[i] == '\n') { crlfText.insert(i, "\r"); ++i; }
     if (!coopmods::ModListFromText(crlfText, &r) || !coopmods::ModListSame(w, r)) Fail("a CRLF mods.txt reads back as written");
     coopmods::ModList unk = w; unk.known = 0;
-    if (coopmods::ModListFromText(coopmods::ModListToText(unk), &r) || coopmods::ModListFromText("", &r)) Fail("known=0 or an empty file is no record");
+    if (coopmods::ModListFromText(coopmods::ModListToText(unk, std::string(), std::string()), &r) || coopmods::ModListFromText("", &r)) Fail("known=0 or an empty file is no record");
     /* the refusal reason and the WELCOME verdict */
     if (coopstore::StoreRefuseReasonText((unsigned)coopstore::kRefuseMods, 46, 46).find("mods do not match") == std::string::npos) Fail("kRefuseMods has its own words");
     coopstore::StoreWelcome a; a.protocol = 46; a.authority = 0; a.recordCount = 2; a.slot = 1; a.hasWorld = true; a.world = "W";
@@ -1079,51 +1145,37 @@ void t_t246_mods_warn_and_admit()
 {
     using namespace coopmods;
     const std::string tail(" You can still play, but some things may look or work differently for you than for the host.");
-    /* the verdict path: the warn default admits, the refusal constant still refuses */
-    if (kModsMismatchPolicyNow != kModsMismatchWarn) Fail("T-246: the policy constant's default is warn (owner 199 b)");
-    if (ModsHelloDecidePolicy(1, 1, 0, 0, kModsMismatchWarn) != kModsHelloAdmitDiffers) Fail("T-246: under warn a differing list is admitted");
-    if (ModsHelloDecidePolicy(1, 1, 0, 0, kModsMismatchRefuse) != kModsHelloRefuseDiffers) Fail("T-246: under refuse a differing list is still refused (T-247)");
-    if (ModsHelloDecidePolicy(1, 1, 0, 0, kModsMismatchPolicyNow) != kModsHelloAdmitDiffers) Fail("T-246: the shipped constant admits");
-    if (ModsHelloDecidePolicy(1, 1, 0, 1, kModsMismatchWarn) != kModsHelloMatch || ModsHelloDecidePolicy(1, 1, 1, 0, kModsMismatchWarn) != kModsHelloRecord
-     || ModsHelloDecidePolicy(1, 0, 0, 0, kModsMismatchWarn) != kModsHelloProvisional || ModsHelloDecidePolicy(0, 0, 0, 0, kModsMismatchWarn) != kModsHelloAdmitUnchecked)
-        Fail("T-246: match, record, provisional and unchecked are unchanged under warn");
-    if (ModsHelloDecidePolicy(0, 1, 0, 0, kModsMismatchWarn) != kModsHelloAdmitUnreadable || ModsHelloDecidePolicy(0, 1, 1, 0, kModsMismatchWarn) != kModsHelloOperatorUnreadable)
-        Fail("T-246 fold (owner 201) / fold 2: under warn an unreadable own list is let in when the world has one - a joiner warned, the operator silently");
-    if (ModsHelloDecidePolicy(0, 1, 0, 0, kModsMismatchRefuse) != kModsHelloRefuseUnreadable) Fail("T-246 fold: under refuse an unreadable own list is still refused (T-247)");
-    ModList op; op.known = 1; op.active.push_back("Alpha|1|0000aaaa");
-    ModList other = op; other.active.push_back(kSaltRow);
-    if (ModsRecheckRefusesPolicy(op, other, kModsMismatchWarn) != 0) Fail("T-246: under warn the re-check keeps a differing game");
-    if (ModsRecheckRefusesPolicy(op, other, kModsMismatchRefuse) != 1) Fail("T-246: under refuse the re-check still refuses it");
+    /* the verdict path: t_t247_world_list (owner 1686 superseded the policy constant, the first-game list and the owner's rewrite) */
     /* the notice text: missing + extra */
     ModList w; w.known = 1;
     w.active.push_back("Alpha|3|0000aaaa"); w.active.push_back("Beta|1|0000bbbb"); w.active.push_back("Gamma|2|0000cccc");
     ModList m; m.known = 1;
     m.active.push_back("Alpha|3|0000aaaa"); m.active.push_back("Delta|1|0000dddd"); m.active.push_back("Gamma|2|0000cccc");
     std::string t = ModWarnText(ModListDiff(w, m));
-    if (t != "Your mods don't match the host's: missing Beta; extra Delta." + tail) Fail("T-246: missing+extra reads '" + t + "'");
+    if (t != "Your mods don't match the world's: missing Beta; extra Delta." + tail) Fail("T-246: missing+extra reads '" + t + "'");
     /* changed */
     ModList c = w; c.active[0] = "Alpha|4|0000aaaa";
     t = ModWarnText(ModListDiff(w, c));
-    if (t != "Your mods don't match the host's." + tail) Fail("T-246 fold (owner 201): a version difference reads the plain sentence, got '" + t + "'");
+    if (t != "Your mods don't match the world's." + tail) Fail("T-246 fold (owner 201): a version difference reads the plain sentence, got '" + t + "'");
     /* all three kinds, in the approved order */
     ModList x = m; x.active[0] = "Alpha|4|0000aaaa";
     t = ModWarnText(ModListDiff(w, x));
-    if (t != "Your mods don't match the host's." + tail) Fail("T-246 fold (owner 201): with a version difference among others the notice is plain, got '" + t + "'");
+    if (t != "Your mods don't match the world's." + tail) Fail("T-246 fold (owner 201): with a version difference among others the notice is plain, got '" + t + "'");
     /* order only */
     ModList o = w; std::swap(o.active[0], o.active[2]);
     t = ModWarnText(ModListDiff(w, o));
-    if (t != "Your mods are the same as the host's but in a different order." + tail) Fail("T-246: order-only reads '" + t + "'");
+    if (t != "Your mods are the same as the world's but in a different order." + tail) Fail("T-246: order-only reads '" + t + "'");
     /* the 'and N more' cut */
     ModList many; many.known = 1; for (int i = 0; i < 5; ++i) many.active.push_back(std::string(1, (char)('p' + i)) + "|1|0");
     ModList empty; empty.known = 1;
     t = ModWarnText(ModListDiff(many, empty));
-    if (t != "Your mods don't match the host's: missing p, q, r and 2 more." + tail) Fail("T-246: five missing read '" + t + "'");
-    /* the titles: the warning is MODS DON'T MATCH, the refusal's words (T-247 path) untouched and still MOD MISMATCH */
+    if (t != "Your mods don't match the world's: missing p, q, r and 2 more." + tail) Fail("T-246: five missing read '" + t + "'");
+    /* the titles: the warning and the Rejected box (T-247) are both MODS DON'T MATCH */
     if (coopui::NoticeTitle(ModWarnText(ModListDiff(w, m))) != "MODS DON'T MATCH" || coopui::NoticeTitle(ModWarnText(ModListDiff(w, o))) != "MODS DON'T MATCH"
      || std::string(kModsWarnTitle) != "MODS DON'T MATCH")
         Fail("T-246: the notice is titled MODS DON'T MATCH");
-    if (ModRefusalText(ModListDiff(w, m)).find("Mod mismatch: missing Beta; extra Delta.") != 0 || coopui::NoticeTitle(ModRefusalText(ModListDiff(w, m))) != "MOD MISMATCH")
-        Fail("T-246: the refusal's words and title are untouched");
+    if (ModRefusalText(ModListDiff(w, m)) != "This world only accepts players whose mods match the world's. Yours don't: missing Beta; extra Delta." || coopui::NoticeTitle(ModRefusalText(ModListDiff(w, m))) != "MODS DON'T MATCH")
+        Fail("T-247: the Rejected box's words (version 3 section 4) and its title MODS DON'T MATCH");
     /* the WELCOME: kModsDiffers carries the world's list, and the world guard's tail still reads after it */
     coopstore::StoreWelcome a; a.protocol = 57; a.recordCount = 2; a.slot = 1; a.hasWorld = true; a.world = "W";
     a.hasMods = true; a.modsVerdict = coopstore::kModsDiffers; a.modsActive = 3; a.modsPlugins = 0; a.modsWorld = w;
@@ -1144,7 +1196,7 @@ void t_t246_mods_warn_and_admit()
 void t_t246_fold_notice()
 {
     using namespace coopmods;
-    const std::string plain("Your mods don't match the host's. You can still play, but some things may look or work differently for you than for the host.");
+    const std::string plain("Your mods don't match the world's. You can still play, but some things may look or work differently for you than for the host.");
     /* 1: a version difference (or nothing nameable) reads the plain sentence; missing/extra are still named; the log keeps versions */
     if (ModWarnPlainText() != plain || coopui::NoticeTitle(ModWarnPlainText()) != "MODS DON'T MATCH") Fail("fold 1: the plain sentence is owner 201's, titled MODS DON'T MATCH");
     ModList w; w.known = 1; w.active.push_back("Alpha|3|0000aaaa"); w.active.push_back("Beta|1|0000bbbb");
@@ -1154,27 +1206,17 @@ void t_t246_fold_notice()
     if (ModDetailText(ModListDiff(w, v)).find("Beta") == std::string::npos) Fail("fold 1: the log's detail still names the version difference");
     if (ModWarnText(ModDiff()) != plain) Fail("fold 1: nothing nameable reads plain");
     ModList mi = w; mi.active.pop_back();
-    if (ModWarnText(ModListDiff(w, mi)) != "Your mods don't match the host's: missing Beta. You can still play, but some things may look or work differently for you than for the host.")
+    if (ModWarnText(ModListDiff(w, mi)) != "Your mods don't match the world's: missing Beta. You can still play, but some things may look or work differently for you than for the host.")
         Fail("fold 1: missing only is still named");
     /* 2: an unreadable own list is admitted under warn and shown the plain notice */
     ModList unread;
     if (ModWarnNoticeText(0, 1, ModListDiff(w, unread)) != plain) Fail("fold 2: an unreadable own list gets the plain notice");
     if (ModWarnNoticeText(1, 0, ModDiff()) != plain) Fail("fold 2: no world list to compare with gets the plain notice");
     if (ModWarnNoticeText(1, 1, ModListDiff(w, mi)) != ModWarnText(ModListDiff(w, mi))) Fail("fold 2: a readable list names what it can");
-    if (ModsHelloDecidePolicy(0, 1, 0, 0, kModsMismatchPolicyNow) != kModsHelloAdmitUnreadable) Fail("fold 2: the shipped constant admits an unreadable list");
-    /* T-1158 step 7b (owner 1369 b): the saved list decides; none saved = the first game's list is saved; the owner's list replaces it */
-    if (ModsHelloDecideWorld(1, 0, 0, 0, kModsMismatchWarn) != kModsHelloRecord) Fail("7b: with no list saved the first game's list is not saved");
-    if (ModsHelloDecideWorld(0, 0, 0, 0, kModsMismatchWarn) != kModsHelloAdmitUnchecked) Fail("7b: an unreadable list with none saved is not let in unchecked");
-    if (ModsHelloDecideWorld(1, 1, 0, 0, kModsMismatchWarn) != kModsHelloAdmitDiffers) Fail("7b: a differing non-owner game is not judged against the saved list");
-    if (ModsHelloDecideWorld(1, 1, 0, 1, kModsMismatchWarn) != kModsHelloMatch || ModsHelloDecideWorld(1, 1, 1, 1, kModsMismatchWarn) != kModsHelloMatch) Fail("7b: a match is a match");
-    if (ModsHelloDecideWorld(1, 1, 1, 0, kModsMismatchWarn) != kModsHelloRecord) Fail("7b: the owner's differing list does not replace the saved one");
-    if (ModsHelloDecideWorld(1, 1, 0, 0, kModsMismatchRefuse) != kModsHelloRefuseDiffers) Fail("7b: the refuse policy is untouched");
-    if (ModsOwnerLoginWrites(1, 1, 0) != 1 || ModsOwnerLoginWrites(1, 0, 0) != 1) Fail("7b: an owner login does not write its differing list");
-    if (ModsOwnerLoginWrites(1, 1, 1) != 0 || ModsOwnerLoginWrites(0, 1, 0) != 0) Fail("7b: an owner login rewrote the same list, or wrote an unreadable one");
     /* 7: the admit line and count only once admitted */
     if (ModsCountAdmittedDiffers(kModsHelloAdmitDiffers, 0) != 0 || ModsCountAdmittedDiffers(kModsHelloAdmitUnreadable, 0) != 0) Fail("fold 7: not counted before admission");
     if (ModsCountAdmittedDiffers(kModsHelloAdmitDiffers, 1) != 1 || ModsCountAdmittedDiffers(kModsHelloAdmitUnreadable, 1) != 1) Fail("fold 7: counted once admitted");
-    if (ModsCountAdmittedDiffers(kModsHelloMatch, 1) != 0 || ModsCountAdmittedDiffers(kModsHelloProvisional, 1) != 0 || ModsCountAdmittedDiffers(-1, 1) != 0)
+    if (ModsCountAdmittedDiffers(kModsHelloMatch, 1) != 0 || ModsCountAdmittedDiffers(kModsHelloNoList, 1) != 0 || ModsCountAdmittedDiffers(-1, 1) != 0)
         Fail("fold 7: only a differing game is counted");
     /* 3: never on screen with the host-left window */
     ModsNoticeState s;
@@ -1209,27 +1251,6 @@ void t_t246_fold_notice()
     if (ModsNoticeOnWelcome(&s, 0, std::string()) != 0 || !s.up) Fail("fold 6: one on screen stays until its OK");
 
     /* ---- T-246 fold 2 ---- */
-    /* item 1: the operator (host) is never given a verdict that shows the notice */
-    for (int lk = 0; lk < 2; ++lk) for (int hr = 0; hr < 2; ++hr) for (int sm = 0; sm < 2; ++sm)
-    {
-        const int v = ModsHelloDecideWorld(lk, hr, 1, (hr && lk) ? sm : 0, kModsMismatchWarn);
-        if (v == kModsHelloAdmitDiffers || v == kModsHelloAdmitUnreadable) Fail("fold 2 item 1: the owner is never warned");
-    }
-    if (ModsHelloDecideWorld(0, 1, 1, 0, kModsMismatchPolicyNow) != kModsHelloOperatorUnreadable) Fail("fold 2 item 1: the owner's unreadable list is let in silently");
-    if (ModsCountAdmittedDiffers(kModsHelloOperatorUnreadable, 1) != 0) Fail("fold 2 item 1: the operator is not counted as let in with differing mods");
-    if (ModsHelloDecideWorld(0, 1, 0, 0, kModsMismatchWarn) != kModsHelloAdmitUnreadable) Fail("fold 2 item 1: a joiner's unreadable list still gets the notice");
-    if (ModsHelloDecidePolicy(0, 1, 1, 0, kModsMismatchRefuse) != kModsHelloRefuseUnreadable) Fail("fold 2 item 1: the refuse policy is untouched (T-247)");
-    /* item 2: the re-check of a provisional game at the first operator, written or not */
-    {
-        ModList wl; wl.known = 1; wl.active.push_back("Alpha|1|0000aaaa");
-        ModList same = wl, diff = wl; diff.active.push_back("Beta|1|0000bbbb");
-        ModList unk;
-        if (ModsProvisionalRecheck(0, ModList(), diff, kModsMismatchWarn) != kMprNone) Fail("fold 2 item 2: no world list, nothing to check");
-        if (ModsProvisionalRecheck(1, wl, unk, kModsMismatchWarn) != kMprNone) Fail("fold 2 item 2: an unreadable list is not judged");
-        if (ModsProvisionalRecheck(1, wl, same, kModsMismatchWarn) != kMprMatch) Fail("fold 2 item 2: a matching provisional game matches");
-        if (ModsProvisionalRecheck(1, wl, diff, kModsMismatchPolicyNow) != kMprAdmitDiffers) Fail("fold 2 item 2: a differing provisional game is let in with differing mods (warn)");
-        if (ModsProvisionalRecheck(1, wl, diff, kModsMismatchRefuse) != kMprRefused) Fail("fold 2 item 2: under refuse it is refused (T-247)");
-    }
     /* item 3: the told-once mark is set when shown, not when queued */
     ModsNoticeState q;
     if (ModsNoticeOnWelcome(&q, 1, "D") != 1 || !q.said.empty()) Fail("fold 2 item 3: queuing does not mark it said");
@@ -1258,27 +1279,241 @@ void t_t246_fold_notice()
     if (ModsNoticeShown(&q, 0, h0 + 65000u) != 2) Fail("fold 2 item 5: given up after 10 s of actual trying");
 }
 
+/* ================= T-247 / T-938 (owner 1679 / 1680 / 1681 / 1686 / 1692): the world's list, DIFFERENT MODS, PLAYER_MODS ================= */
+void t_t247_world_list()
+{
+    using namespace coopmods;
+    ModList w; w.known = 1; w.active.push_back("Alpha|3|0000aaaa"); w.active.push_back("Beta|1|0000bbbb"); w.plugins.push_back("x.dll|1234");
+    ModList same = w;
+    ModList diff = w; diff.active.push_back("Delta|1|0000dddd");
+    ModList none; none.known = 1;   /* a list of no mods */
+    ModList unk;                    /* an unreadable own list */
+    ModList unrW = w; unrW.plugins[0] = "x.dll|-1";   /* the world's copy of x.dll could not be read */
+    ModList unrM = w; unrM.active[1] = "Beta|1|-1";   /* this game's Beta could not be read */
+    /* 1680's predicate: only unreadable rows differ */
+    if (ModListDiffersOnlyUnreadable(w, unrW) != 1 || ModListDiffersOnlyUnreadable(unrW, w) != 1 || ModListDiffersOnlyUnreadable(w, unrM) != 1) Fail("t247: an unreadable row on either side is an unreadable-only difference");
+    if (ModListDiffersOnlyUnreadable(w, same) != 0) Fail("t247: two identical readable lists are a match, not unreadable-only");
+    {   /* review fold (FIX 3): a placeholder row (an active slot that could not be read) on either side is unreadable, never a real missing / extra mod */
+        const std::string ph = "(unreadable mod 5)|?|?";
+        if (!ModRowPlaceholder(ph) || ModRowPlaceholder("Beta|1|-1") || ModRowPlaceholder("(unreadable mod 5)|1|0000aaaa")) Fail("t247 fold: what a placeholder row is");
+        ModList m1 = w; m1.active[1] = ph;                                                   /* this game: Beta's slot unreadable */
+        ModList w1 = w; w1.active[0] = "(unreadable mod 2)|?|?";                             /* the world's list: Alpha's slot unreadable */
+        ModList m2 = w; m2.active.insert(m2.active.begin() + 1, "(unreadable mod 0)|?|?");   /* this game: one more slot (a base mod) unreadable */
+        ModList w2 = w; w2.active[1] = "(unreadable mod 4)|?|?";
+        ModList m3 = w; m3.active[0] = "(unreadable mod 1)|?|?";                             /* both sides: a placeholder, at different rows */
+        if (ModListDiffersOnlyUnreadable(w, m1) != 1) Fail("t247 fold: a placeholder in this game's list is unreadable-only, not Beta missing");
+        if (ModListDiffersOnlyUnreadable(w1, w) != 1) Fail("t247 fold: a placeholder in the world's list is unreadable-only, not Alpha extra");
+        if (ModListDiffersOnlyUnreadable(w, m2) != 1) Fail("t247 fold: a placeholder with no row against it is unreadable-only, not an extra mod");
+        if (ModListDiffersOnlyUnreadable(w2, m3) != 1) Fail("t247 fold: placeholders on both sides are unreadable-only");
+        if (ModListDiffersOnlyUnreadable(w2, w2) != 1) Fail("t247 fold: the same placeholder on both sides is unreadable-only (never a match)");
+        ModList v1 = m1; v1.active[0] = "Alpha|4|0000aaaa";
+        if (ModListDiffersOnlyUnreadable(w, v1) != 0) Fail("t247 fold: a placeholder does not hide a readable version difference");
+        ModList x1 = m3; x1.active.push_back("Delta|1|0000dddd");
+        if (ModListDiffersOnlyUnreadable(w, x1) != 0) Fail("t247 fold: a placeholder does not hide a real extra mod");
+        ModList x2 = m1; x2.plugins[0] = "y.dll|1234";
+        if (ModListDiffersOnlyUnreadable(w, x2) != 0) Fail("t247 fold: a placeholder does not hide a plugin difference");
+        if (ModsHelloDecideWorld(1, 1, 0, ModListSame(w, m1) ? 1 : 0, ModListDiffersOnlyUnreadable(w, m1), kModsMismatchRefuse) != kModsHelloAdmitDiffers) Fail("t247 fold (1680): Rejected lets in a game whose only difference is a placeholder");
+        {   /* T-247 fold (the 1680 notice): the let-in notice and the log line say the slot could not be read - never the placeholder as
+               an extra mod nor the slot's real mod as missing */
+            const ModDiff u = ModListDiff(w, m1);
+            if (!u.missing.empty() || !u.extra.empty() || !u.changed.empty() || u.orderDiffers || u.unreadable.size() != 1 || u.unreadable[0] != "(unreadable mod 5)")
+                Fail("t247 fold (1680 notice): a placeholder-only difference is one unreadable slot");
+            if (ModWarnText(u) != "Your mods don't match the world's: 1 mod could not be read. You can still play, but some things may look or work differently for you than for the host.")
+                Fail("t247 fold (1680 notice): the notice reads '" + ModWarnText(u) + "'");
+            if (ModDetailText(u) != "Details: missing (0): none | extra (0): none | different version or file (0): none | load order: same | could not be read (1): (unreadable mod 5)")
+                Fail("t247 fold (1680 notice): the log line reads '" + ModDetailText(u) + "'");
+            const ModDiff uw = ModListDiff(w1, w);   /* the world's slot unreadable */
+            if (!uw.missing.empty() || !uw.extra.empty() || uw.unreadable.size() != 1 || uw.unreadable[0] != "(unreadable mod 2)") Fail("t247 fold (1680 notice): the world's placeholder is not Alpha extra");
+            const ModDiff ub = ModListDiff(w2, m3);  /* both sides */
+            if (!ub.missing.empty() || !ub.extra.empty() || ub.orderDiffers || ub.unreadable.size() != 2) Fail("t247 fold (1680 notice): placeholders on both sides are two unreadable slots");
+            if (ModWarnText(ub) != "Your mods don't match the world's: 2 mods could not be read. You can still play, but some things may look or work differently for you than for the host.")
+                Fail("t247 owner 1708: two unreadable slots are counted in the plural - '" + ModWarnText(ub) + "'");
+            if (ModWarnText(u).find("(unreadable mod") != std::string::npos) Fail("t247 owner 1708: a slot is named to the player");
+            const ModDiff uf = ModListDiff(w, unrM);   /* a file this game could not read */
+            if (!uf.changed.empty() || uf.unreadable.size() != 1 || uf.unreadable[0] != "Beta" || ModWarnText(uf).find("Your mods don't match the world's: 1 mod could not be read.") != 0 || ModWarnText(uf).find("Beta") != std::string::npos)
+                Fail("t247 fold (1680 notice; owner 1708): an unreadable file is counted, never named, to the player - '" + ModWarnText(uf) + "'");
+            const ModDiff ux = ModListDiff(w, x1);   /* a real extra mod beside a placeholder: the extra is named, the placeholder is not an extra */
+            if (ux.extra.size() != 1 || ux.extra[0] != "Delta" || ux.unreadable.size() != 1) Fail("t247 fold (1680 notice): a placeholder beside a real extra mod");
+            /* T-247 re-check fold (item 2): in a mixed list the placeholder's own mod (Alpha) is not ALSO missing, and an unreadable file
+               is not "different version or file" - the real differences are named as ever */
+            if (ModDetailText(ux) != "Details: missing (0): none | extra (1): Delta | different version or file (0): none | load order: same | could not be read (1): (unreadable mod 1)")
+                Fail("t247 re-check (item 2): x1's log line reads '" + ModDetailText(ux) + "'");
+            if (ModWarnText(ux).find("Your mods don't match the world's: extra Delta; 1 mod could not be read.") != 0) Fail("t247 re-check (item 2): x1's notice reads '" + ModWarnText(ux) + "'");
+            if (ModWarnText(ux).find("(unreadable mod") != std::string::npos) Fail("t247 owner 1708: a slot is named to the player in a mixed list");
+            ModList mf = unrM; mf.active[0] = "Alpha|4|0000aaaa"; mf.active.push_back("Delta|1|0000dddd");   /* a real version difference, an unreadable file, an extra mod */
+            const ModDiff um = ModListDiff(w, mf);
+            if (ModDetailText(um) != "Details: missing (0): none | extra (1): Delta | different version or file (1): Alpha | load order: same | could not be read (1): Beta")
+                Fail("t247 re-check (item 2): a mixed list with an unreadable file reads '" + ModDetailText(um) + "'");
+            ModList mg = m1; mg.active.insert(mg.active.begin(), "Gamma|1|0000cccc");   /* the world's Beta behind a placeholder, a real extra before it */
+            ModList wg = w; wg.active.insert(wg.active.begin(), "Zeta|1|0000ffff");     /* and a real missing mod in the world's list */
+            const ModDiff ug = ModListDiff(wg, mg);
+            if (ug.missing.size() != 1 || ug.missing[0] != "Zeta" || ug.extra.size() != 1 || ug.extra[0] != "Gamma" || !ug.changed.empty() || ug.unreadable.size() != 1 || ug.unreadable[0] != "(unreadable mod 5)")
+                Fail("t247 re-check (item 2): a real missing and extra beside a placeholder - '" + ModDetailText(ug) + "'");
+            const ModDiff uh = ModListDiff(w, m2);   /* a placeholder with no row against it takes no mod's place */
+            if (!uh.missing.empty() || !uh.extra.empty() || uh.unreadable.size() != 1) Fail("t247 re-check (item 2): an added placeholder slot");
+            if (ModsOrderOnly(ux) || ModDetailText(ModListDiff(w, diff)).find("could not be read") != std::string::npos) Fail("t247 fold (1680 notice): a line with nothing unreadable reads as before");
+            if (coopui::NoticeTitle(ModWarnText(u)) != "MODS DON'T MATCH") Fail("t247 fold (1680 notice): the notice keeps its title");
+        }
+        /* USE MY MODS: any unreadable active slot is refused as an unreadable list (1698's sentence, 1699's line names the slot) */
+        if (ModListReadableWhole(w) != 1 || ModListReadableWhole(none) != 1 || ModListReadableWhole(unk) != 0 || ModListReadableWhole(m1) != 0 || ModListReadableWhole(unrM) != 1)
+            Fail("t247 fold: a list USE MY MODS may set is read whole with no placeholder row");
+        if (ModsSetDecide(1, 1, ModListReadableWhole(m1), 0) != kMsOwnUnreadable) Fail("t247 fold: USE MY MODS with an unreadable slot is refused as unreadable");
+        if (coopstore::kModsLoginLocked != 3 || coopstore::kModsLoginNotListed != 2) Fail("t247 fold (FIX 2): the mods REFUSE's lockout note");
+    }
+    {   /* owner 1703: the mods REFUSE's tail - the login note, the lockout's wait, the listed flag, the world's list - and the box's buttons */
+        std::vector<char> b; b.resize(12, (char)0);   /* {proto, gameProto, reason} */
+        playermods::ModsRefuseTail t; t.loginNote = coopstore::kModsLoginLocked; t.lockWait = 300; t.flags = playermods::kRefuseListed; t.world = w;
+        playermods::ModsRefuseTailEncode(t, &b);
+        playermods::ModsRefuseTail r;
+        if (!playermods::ModsRefuseTailDecode(b, &r) || r.loginNote != 3 || r.lockWait != 300 || r.flags != playermods::kRefuseListed || !r.haveWorld || !ModListSame(r.world, w))
+            Fail("t247 1703: a mods REFUSE's tail round-trips (note, wait, listed, list)");
+        std::vector<char> c(b.begin(), b.begin() + 20);   /* cut inside the flags word */
+        if (playermods::ModsRefuseTailDecode(c, &r) || r.flags != 0 || r.loginNote != 0) Fail("t247 1703: a REFUSE without its three words says nothing (no listed flag)");
+        std::vector<char> d(b.begin(), b.begin() + 24);   /* the words, no list */
+        if (!playermods::ModsRefuseTailDecode(d, &r) || r.haveWorld || r.flags != playermods::kRefuseListed) Fail("t247 1703: the words without a list decode, with no list");
+        playermods::ModsRefuseTail u; u.flags = 0xFFFFFFFEu; std::vector<char> e(12, (char)0); playermods::ModsRefuseTailEncode(u, &e);
+        if (!playermods::ModsRefuseTailDecode(e, &r) || r.flags != 0) Fail("t247 1703: unknown flag bits are not read as listed");
+        if (playermods::ModsRefuseBoxButtons(playermods::kRefuseListed) != (playermods::kBoxOk | playermods::kBoxJoinAsAdmin)) Fail("t247 1703: listed - JOIN AS ADMIN and OK");
+        if (playermods::ModsRefuseBoxButtons(0) != playermods::kBoxOk) Fail("t247 1703: not listed - OK only");
+        if (adminwords::ResultLine(adminauth::kResNotAdmin, 0) != "You're not an admin in this world.") Fail("t247 1703: a right password, not listed, is /login's own line");
+    }
+    if (ModListDiffersOnlyUnreadable(w, diff) != 0) Fail("t247: an extra mod is not unreadable-only");
+    { ModList v = unrM; v.active[0] = "Alpha|4|0000aaaa"; if (ModListDiffersOnlyUnreadable(w, v) != 0) Fail("t247: a readable version difference beside an unreadable row is not unreadable-only"); }
+    { ModList o = unrM; std::swap(o.active[0], o.active[1]); if (ModListDiffersOnlyUnreadable(w, o) != 0) Fail("t247: another order is not unreadable-only"); }
+    if (ModListDiffersOnlyUnreadable(w, unk) != 0 || ModListDiffersOnlyUnreadable(ModList(), w) != 0) Fail("t247: an unreadable whole list is not unreadable-only");
+    /* every branch of the door's decision: no list / a list; Accepted / Rejected; proven admin / player; unreadable-only */
+    for (int pol = 0; pol < 2; ++pol) for (int adm = 0; adm < 2; ++adm) for (int lk = 0; lk < 2; ++lk) for (int sm = 0; sm < 2; ++sm) for (int ou = 0; ou < 2; ++ou)
+        if (ModsHelloDecideWorld(lk, 0, adm, sm, ou, pol) != kModsHelloNoList) Fail("t247: with no list nobody is checked (1686)");
+    for (int adm = 0; adm < 2; ++adm)
+    {
+        if (ModsHelloDecideWorld(1, 1, adm, 1, 0, kModsMismatchWarn) != kModsHelloMatch || ModsHelloDecideWorld(1, 1, adm, 1, 0, kModsMismatchRefuse) != kModsHelloMatch) Fail("t247: a match is a match");
+        if (ModsHelloDecideWorld(1, 1, adm, 0, 0, kModsMismatchWarn) != kModsHelloAdmitDiffers) Fail("t247: Accepted lets a differing game in, warned");
+        if (ModsHelloDecideWorld(1, 1, adm, 0, 1, kModsMismatchRefuse) != kModsHelloAdmitDiffers) Fail("t247 (1680): Rejected lets in an unreadable-only difference, warned");
+        if (ModsHelloDecideWorld(0, 1, adm, 0, 0, kModsMismatchWarn) != kModsHelloAdmitUnreadable) Fail("t247: Accepted lets in an unreadable own list, warned");
+    }
+    if (ModsHelloDecideWorld(1, 1, 0, 0, 0, kModsMismatchRefuse) != kModsHelloRefuseDiffers) Fail("t247: Rejected turns a differing player away");
+    if (ModsHelloDecideWorld(1, 1, 1, 0, 0, kModsMismatchRefuse) != kModsHelloAdmitAdmin) Fail("t247 (1686): Rejected lets a proven admin in");
+    if (ModsHelloDecideWorld(0, 1, 0, 0, 0, kModsMismatchRefuse) != kModsHelloRefuseUnreadable) Fail("t247: Rejected turns away a player whose own list is unreadable");
+    if (ModsHelloDecideWorld(0, 1, 1, 0, 0, kModsMismatchRefuse) != kModsHelloAdmitAdmin) Fail("t247 (1686): Rejected lets in a proven admin whose own list is unreadable");
+    /* no list is not a list of no mods (1686) */
+    if (ModsHelloDecideWorld(1, 1, 0, ModListSame(none, w) ? 1 : 0, ModListDiffersOnlyUnreadable(none, w), kModsMismatchRefuse) != kModsHelloRefuseDiffers) Fail("t247: a list of no mods checks a modded joiner (Rejected)");
+    if (ModsHelloDecideWorld(1, 1, 0, ModListSame(none, w) ? 1 : 0, 0, kModsMismatchWarn) != kModsHelloAdmitDiffers) Fail("t247: a list of no mods warns a modded joiner (Accepted)");
+    if (ModsHelloDecideWorld(1, 1, 0, ModListSame(none, none) ? 1 : 0, 0, kModsMismatchRefuse) != kModsHelloMatch) Fail("t247: a game with no mods matches a list of no mods");
+    {
+        ModList r; std::string by, at;
+        if (!ModListFromText(ModListToText(none, "Ana", "2026-11-15"), &r, &by, &at) || !r.known || !r.active.empty() || !r.plugins.empty() || by != "Ana" || at != "2026-11-15")
+            Fail("t247: a list of no mods is written and read back as a list (known=1, no rows, by=, at=)");
+        if (ModListFromText(std::string(), &r) || ModListFromText("# only a comment\n", &r)) Fail("t247: no file (or a torn one) is no list");
+        if (!ModListFromText("known=1\nhash=\na=Alpha|3|0000aaaa\n", &r, &by, &at) || by != "" || at != "" || r.active.size() != 1) Fail("t247: a hand-made file with no by= / at= is a list");
+        if (ModListToText(w, "A\nB", "2026-11-15").find("by=A B\n") == std::string::npos) Fail("t247: a name's line break never splits the file");
+    }
+    /* the rule */
+    if (std::string(kModsRuleKey) != "modcheck" || !ModsRuleValueOk("accepted") || !ModsRuleValueOk("rejected") || ModsRuleValueOk("") || ModsRuleValueOk("Rejected"))
+        Fail("t247: modcheck takes accepted / rejected");
+    if (ModsPolicyOfRule("") != kModsMismatchWarn || ModsPolicyOfRule("accepted") != kModsMismatchWarn || ModsPolicyOfRule("rejected") != kModsMismatchRefuse) Fail("t247: absent = Accepted (owner 1679)");
+    if (!worldopt::ValueOk("modcheck", "rejected") || worldopt::ValueOk("modcheck", "maybe")) Fail("t247: the world server's option check knows modcheck");
+    { const int i = coopui::OptIndexOfKey("modcheck"); if (i < 0 || coopui::OptDefs()[i].tab != coopui::kOptTabMods || std::string(coopui::OptDefs()[i].label) != "DIFFERENT MODS" || std::string(coopui::OptDefs()[i].dflt) != "accepted" || coopui::OptTabRows(coopui::kOptTabMods) != 1)
+        Fail("t247: the MODS tab holds DIFFERENT MODS, default accepted"); }
+    if (rulesfile::RuleIndex("modcheck") < 0) Fail("t247: rules.txt knows DIFFERENT MODS");
+    /* the re-check never disconnects (1681): its verdicts */
+    if (ModsRecheck(0, w, diff) != kMrNotChecked || ModsRecheck(1, w, same) != kMrMatch || ModsRecheck(1, w, diff) != kMrDiffers || ModsRecheck(1, w, unk) != kMrUnreadable
+        || ModsRecheck(1, none, w) != kMrDiffers)
+        Fail("t247: the re-check's verdicts (no list / match / differs / unreadable / a list of no mods)");
+    /* USE MY MODS */
+    if (ModsSetDecide(0, 1, 1, 0) != kMsNotAdmin || ModsSetDecide(1, 0, 0, 0) != kMsNoList || ModsSetDecide(1, 1, 0, 0) != kMsOwnUnreadable || ModsSetDecide(1, 1, 1, 1) != kMsFileHeld || ModsSetDecide(1, 1, 1, 0) != kMsSet)
+        Fail("t247: USE MY MODS's decision");
+    if (admincmd::kVerbUseMyMods != 21 || admincmd::kVerbCount != 22 || admincmd::kRepModsUnreadable != 51 || admincmd::MayAsk(admincmd::kVerbUseMyMods, admincmd::Asker()) != admincmd::kRepNotAdmin)
+        Fail("t247: USE MY MODS is admin verb 21, for admins only");
+    { admincmd::Asker a; a.loggedIn = true; if (admincmd::MayAsk(admincmd::kVerbUseMyMods, a) != admincmd::kRepOk) Fail("t247: any admin may press USE MY MODS (not the owner only)"); }
+    /* the words (the approved page, version 3) */
+    const ModDiff dd = ModListDiff(w, diff);
+    if (ModAdminLetInText(dd, 1) != "Your mods don't match the world's: extra Delta. You were let in because you are an admin of this world. You can change the world's list in GAME OPTIONS > MODS.")
+        Fail("t247: section 5's words read '" + ModAdminLetInText(dd, 1) + "'");
+    if (ModNoListAdminText() != "This world has no mod list yet, so nobody's mods are checked. You can set it in GAME OPTIONS > MODS.") Fail("t247: section 3's words");
+    if (ModChangedMatchText("Ana") != "The world's mod list was changed by Ana. Your mods match.") Fail("t247: section 7's match line");
+    if (ModChangedDiffersText(dd, 1, kModsMismatchWarn) != ModWarnText(dd)) Fail("t247: section 7 Accepted is the let-in notice again");
+    if (ModChangedDiffersText(dd, 1, kModsMismatchRefuse) != ModWarnText(dd) + " This world rejects players whose mods differ, so you will be turned away the next time you join.") Fail("t247: section 7 Rejected adds its sentence");
+    if (ModsWorldLine(0, ModList(), "", "", 0) != "World's mods: none set yet \xE2\x80\x94 nobody's mods are checked. An admin can set them with the button below.") Fail("t247: the no-list line");
+    if (ModsWorldLine(1, none, "Ana", "2026-11-15", 0) != "World's mods: no mods \xE2\x80\x94 set by Ana, 15 Nov") Fail("t247: the list-of-no-mods line reads '" + ModsWorldLine(1, none, "Ana", "2026-11-15", 0) + "'");
+    if (ModsWorldLine(1, w, "Ana", "2026-11-15", 1) != "World's mods: 2 mods, 1 plugins \xE2\x80\x94 set by you, 15 Nov") Fail("t247: the list line reads '" + ModsWorldLine(1, w, "Ana", "2026-11-15", 1) + "'");
+    if (ModsYourLine(1, w, same) != "Your mods: match" || ModsYourLine(1, w, diff) != "Your mods: differ \xE2\x80\x94 extra Delta" || ModsYourLine(0, w, diff) != "") Fail("t247: the your-mods line");
+    { ModList o = w; std::swap(o.active[0], o.active[1]); if (ModsYourLine(1, w, o) != "Your mods: same mods, different order") Fail("t247: the order-only line"); }
+    if (ModsDateShown("2026-01-05") != "5 Jan" || ModsDateShown("bad") != "bad") Fail("t247: the date");
+    {   /* the button's hover note and the two boxes' words (version 2 sections 1-2, version 3 section 4): exact, lines of 1..60, no '#' */
+        const std::string h(kModsUseHover);
+        if (h != "Makes your mods the world's mod list.\nPlayers already connected stay.") Fail("t247: the button's hover note");
+        for (size_t a = 0;;)
+        {
+            const size_t e = h.find('\n', a);
+            const std::string L = h.substr(a, e == std::string::npos ? std::string::npos : e - a);
+            if (L.empty() || L.size() > 60 || L.find('#') != std::string::npos) Fail("t247: a hover line empty, over 60 or with a '#': '" + L + "'");
+            if (e == std::string::npos) break;
+            a = e + 1;
+        }
+        if (std::string(kModsAskTitle) != "WORLD'S MODS" || std::string(kModsAskText) != "Replace the world's mod list with yours? Players already connected stay."
+         || std::string(kModsAdminJoinTitle) != "JOIN AS ADMIN" || std::string(kModsAdminJoinLine) != "Enter this world's admin password."
+         || std::string(kModsAdminWrongLine) != "That isn't this world's admin password.") Fail("t247: the WORLD'S MODS and JOIN AS ADMIN boxes' words");
+        ModList o = w; std::swap(o.active[0], o.active[1]);
+        if (!ModsOrderOnly(ModListDiff(w, o)) || ModsOrderOnly(ModListDiff(w, diff)) || ModsOrderOnly(ModListDiff(w, w))) Fail("t247: order only (T-1375's place)");
+    }
+    {   /* owner 1699: a USE MY MODS refused for an unreadable own list logs which part could not be read - each part named */
+        ModsReadFacts f; f.activeWhole = 1;
+        if (ModsUseRefusedLine(f) != "[MODS] USE MY MODS refused: own mod list unreadable (active list GameWorld+0x528 unreadable)") Fail("t247 1699: the whole active list reads '" + ModsUseRefusedLine(f) + "'");
+        ModsReadFacts g; g.slots.push_back(17); g.pluginsUnreadable = 1;
+        if (ModsUseRefusedLine(g) != "[MODS] USE MY MODS refused: own mod list unreadable (active i=17 unreadable; plugins=-1, GameWorld+0x568 unreadable)") Fail("t247 1699: a slot and the plugin list read '" + ModsUseRefusedLine(g) + "'");
+        ModsReadFacts e; e.activeEmpty = 1; ModsReadFacts z;
+        if (ModsUseRefusedLine(e).find("active list read with no rows") == std::string::npos || ModsUseRefusedLine(z).find("the failed part was not recorded") == std::string::npos) Fail("t247 1699: an empty list and no facts are said");
+    }
+    if (coopui::NoticeTitle(ModAdminLetInText(dd, 1)) != "MODS DON'T MATCH" || coopui::NoticeTitle(ModRefusalText(dd)) != "MODS DON'T MATCH") Fail("t247: the boxes are titled MODS DON'T MATCH");
+    /* PLAYER_MODS (T-938): the wire and the log lines */
+    {
+        playermods::World a; a.hasList = 1; a.flags = playermods::kFlagChanged; a.policy = 1; a.by = "Ana"; a.at = "2026-11-15"; a.list = w;
+        std::vector<char> b; playermods::EncodeWorld(a, &b);
+        playermods::World r;
+        if (playermods::KindOf(b) != (unsigned)playermods::kKindWorld || !playermods::DecodeWorld(b, &r) || r.by != "Ana" || r.at != a.at || !ModListSame(r.list, w) || r.policy != 1 || r.flags != a.flags)
+            Fail("t938: a WORLD round-trips");
+        b.push_back(0); if (playermods::DecodeWorld(b, &r)) Fail("t938: a WORLD with trailing bytes is refused");
+        a.hasList = 0; a.list = ModList(); playermods::EncodeWorld(a, &b);
+        if (!playermods::DecodeWorld(b, &r) || r.hasList) Fail("t938: a no-list WORLD round-trips");
+        playermods::Player p; p.slot = 3; p.name = "Cy"; p.verdict = playermods::kVDiffers; p.policy = 0; p.nActive = 42; p.nPlugins = 3; p.detail = "Details: x";
+        playermods::EncodePlayer(p, &b);
+        playermods::Player q;
+        if (playermods::KindOf(b) != (unsigned)playermods::kKindPlayer || !playermods::DecodePlayer(b, &q) || q.slot != 3 || q.name != "Cy" || q.verdict != 2 || q.nActive != 42 || q.detail != "Details: x")
+            Fail("t938: a PLAYER round-trips");
+        std::vector<std::string> l = playermods::PlayerLines(q);
+        if (l.size() != 2 || l[0] != "[MODS] player 'Cy' (slot 3): mods differ from the world's list (42 mods, 3 DLLs). Details: x" || l[1] != "[MODS] player 'Cy' (slot 3): let in (DIFFERENT MODS: Accepted)")
+            Fail("t938: the differs lines (section 8)");
+        q.verdict = playermods::kVMatch; l = playermods::PlayerLines(q);
+        if (l.size() != 1 || l[0] != "[MODS] player 'Cy' (slot 3): mods match the world's list (42 mods, 3 DLLs)") Fail("t938: the match line");
+        q.verdict = playermods::kVAdminLetIn; q.policy = 1; l = playermods::PlayerLines(q);
+        if (l.size() != 2 || l[1] != "[MODS] player 'Cy' (slot 3): mods differ - let in as an admin (DIFFERENT MODS: Rejected)") Fail("t938: the admin line");
+        if (playermods::SetLine("Ana", none, 0) != "[MODS] the world's mod list was set by 'Ana' (0 mods, 0 DLLs - a list of no mods); connected players stay") Fail("t938: the set line");
+        if (playermods::NoListLine() != "[MODS] the world has no mod list yet - nobody's mods are checked; admins are told") Fail("t938: the no-list line");
+        std::vector<std::pair<unsigned, std::string> > seen;
+        if (!playermods::RowIsNew(&seen, q) || playermods::RowIsNew(&seen, q)) Fail("t938: a row is logged once");
+        q.verdict = playermods::kVMatch; if (!playermods::RowIsNew(&seen, q)) Fail("t938: a changed row is logged again");
+        if (playermods::VerdictOfHello(kModsHelloAdmitAdmin) != (unsigned)playermods::kVAdminLetIn || playermods::VerdictOfHello(kModsHelloNoList) != (unsigned)playermods::kVNotChecked
+            || playermods::VerdictOfRecheck(kMrDiffers) != (unsigned)playermods::kVDiffers) Fail("t938: the verdict maps");
+        /* the notices a WORLD raises */
+        playermods::World c; c.hasList = 1; c.flags = playermods::kFlagChanged; c.by = "Ana"; c.list = w;
+        if (playermods::NoticeOfWorld(c, same) != ModChangedMatchText("Ana")) Fail("t247: a change that matches is the one-line notice");
+        if (playermods::NoticeOfWorld(c, diff) != ModChangedDiffersText(dd, 1, 0)) Fail("t247: a change that differs is the let-in notice");
+        c.flags |= playermods::kFlagYouSetIt; if (!playermods::NoticeOfWorld(c, diff).empty()) Fail("t247: the admin who set it gets no notice");
+        c.flags = 0; if (!playermods::NoticeOfWorld(c, diff).empty()) Fail("t247: the list at admission is no change notice");
+        playermods::World n; n.hasList = 0; n.flags = playermods::kFlagTellAdmin;
+        if (playermods::NoticeOfWorld(n, diff) != ModNoListAdminText()) Fail("t247: an admin is told the world has no list");
+        n.flags = 0; if (!playermods::NoticeOfWorld(n, diff).empty()) Fail("t247: a player who is not an admin is told nothing about no list");
+        if (playermods::kMsgPlayerMods != 104u || playermods::kProtocol != 170u || playermods::kProtocol != authproof::kProtocol) Fail("t938: PLAYER_MODS is message 104 of world-server protocol 170");
+    }
+}
+
 /* ================= settings5 fold (review-settings5 1a/1b/4) ================= */
 void t_settings5_fold_operator_only_and_recheck()
 {
     using namespace coopmods;
-    /* 1a: only the operator writes; a non-operator with no record is PROVISIONAL, never recorded */
-    if (ModsHelloDecide(1, 0, 1, 0) != kModsHelloRecord)      Fail("the operator with no record writes the world's list");
-    if (ModsHelloDecide(1, 1, 1, 0) != kModsHelloRecord)      Fail("the operator whose mods changed replaces the list");
-    if (ModsHelloDecide(1, 0, 0, 0) != kModsHelloProvisional) Fail("a non-operator into a world with no list is provisional, not recorded");
-    if (ModsHelloDecide(1, 1, 0, 1) != kModsHelloMatch || ModsHelloDecide(1, 1, 1, 1) != kModsHelloMatch) Fail("a matching list is a match");
-    if (ModsHelloDecide(1, 1, 0, 0) != kModsHelloRefuseDiffers) Fail("a non-operator that differs is refused");
-    /* 4: an unreadable own list - refused with a record, admitted without */
-    if (ModsHelloDecide(0, 1, 0, 0) != kModsHelloRefuseUnreadable || ModsHelloDecide(0, 1, 1, 0) != kModsHelloRefuseUnreadable) Fail("an unreadable list is refused when the world has one");
-    if (ModsHelloDecide(0, 0, 0, 0) != kModsHelloAdmitUnchecked || ModsHelloDecide(0, 0, 1, 0) != kModsHelloAdmitUnchecked) Fail("an unreadable list is admitted when the world has none");
-    if (ModUnreadableText() != "Your game could not read its own mod list, so it can't be checked against the host's.") Fail("the unreadable sentence");
-    /* 1b: provisional admit, then the operator's list is written: the re-check refuses a differing game, keeps a matching one */
+    if (ModUnreadableText() != "Your game could not read its own mod list, so it can't be checked against the world's.") Fail("the unreadable sentence");
     ModList op; op.known = 1; op.active.push_back("Alpha|1|0000aaaa");
-    ModList same = op, other = op; other.active.push_back(kSaltRow);
-    ModList unread; unread.known = 0;
-    if (ModsRecheckRefuses(op, same) != 0) Fail("a provisional game with the operator's list stays");
-    if (ModsRecheckRefuses(op, other) != 1) Fail("a provisional game whose list differs is refused at the re-check");
-    if (ModsRecheckRefuses(op, unread) != 0) Fail("an unreadable list is judged at its next greeting, not at the re-check");
+    ModList same = op;
     /* 4: placeholder rows and unreadable files never match - not even each other */
     ModList p1; p1.known = 1; p1.active.push_back("(unreadable mod 0)|?|?");
     ModList p2 = p1;
@@ -1288,8 +1523,9 @@ void t_settings5_fold_operator_only_and_recheck()
     ModList pl; pl.known = 1; pl.plugins.push_back("x.dll|-1"); ModList pl2 = pl;
     if (ModListSame(pl, pl2)) Fail("two unreadable plugin DLLs are not the same DLL");
     ModDiff d = ModListDiff(c1, c2);
-    if (d.changed.size() != 1 || d.changed[0] != "Beta") Fail("an unreadable file is named as a different version");
-    if (ModsHelloDecide(1, 1, 0, ModListSame(c1, c2) ? 1 : 0) != kModsHelloRefuseDiffers) Fail("a world list with an unreadable file admits nobody else");
+    if (!d.changed.empty() || d.unreadable.size() != 1 || d.unreadable[0] != "Beta") Fail("T-247 fold (1680): an unreadable file is named as could not be read, not as a different version");
+    if (ModsHelloDecideWorld(1, 1, 0, ModListSame(c1, c2) ? 1 : 0, ModListDiffersOnlyUnreadable(c1, c2), kModsMismatchRefuse) != kModsHelloAdmitDiffers)
+        Fail("1680: a world list with an unreadable file still lets in a game whose only difference is that file, under Rejected");
     if (!ModListSame(op, same)) Fail("readable identical lists still match");
     /* nit: the salt knob's off words */
     const char* offs[5] = { "modfingerprint_salt=0\n", "modfingerprint_salt=false\n", "modfingerprint_salt=OFF\n", "modfingerprint_salt=no\n", "modfingerprint_salt=\n" };
@@ -3669,7 +3905,7 @@ void t_ui5_panel_screens()
         Fail("ui5: the LOCAL ADDRESS value: " + coopui::PanelHomeAddrLine("192.168.1.20", 7777));
     /* the error box: explicit CAN'T JOIN titles, the rest unchanged */
     if (coopui::NoticeTitle(coopui::NameTakenText("Anna")) != "CAN'T JOIN"
-        || coopui::NoticeTitle("Your game could not read its own mod list, so it can't be checked against the host's.") != "CAN'T JOIN"
+        || coopui::NoticeTitle("Your game could not read its own mod list, so it can't be checked against the world's.") != "CAN'T JOIN"
         || coopui::NoticeTitle("The multiplayer menu couldn't open.") != "MULTIPLAYER"
         || coopui::NoticeTitle("Profile deleted. Its save couldn't be moved to the Recycle Bin and is still at C:\\x.") != "MULTIPLAYER"
         || coopui::NoticeTitle(coopui::kSaveNotHereText) != "CAN'T LOAD" || coopui::NoticeTitle(coopui::kSaveNoBackupText) != "CAN'T LOAD"
@@ -4027,8 +4263,9 @@ void t_ui5_panel_screens()
         || coopui::StanceChangedText("Anna", coopui::kStanceAlly) != "Anna now treats you as an ALLY."
         || coopui::StanceChangedText("Anna", coopui::kStanceNeutral) != "Anna now treats you as NEUTRAL.")
         Fail("ui5: an approved text for a later effort");
-    /* GAME OPTIONS: PROFILES PER PLAYER is the MULTIPLAYER tab's fourth row, 1-16, default 3 */
-    const int pc = coopui::OptIndexOf(coopui::kOptTabCoop, 3);
+    /* GAME OPTIONS: PROFILES PER PLAYER is the MULTIPLAYER tab's fourth row on screen with the default GAME SPEED CONTROL (the fifth in
+       the table since T-1392's MENUS AND BUILDING, which is on screen only under Slowest wins), 1-16, default 3 */
+    const int pc = coopui::OptIndexOf(coopui::kOptTabCoop, 4);
     if (pc < 0 || std::string(coopui::OptDefs()[pc].key) != "profilecap" || std::string(coopui::OptDefs()[pc].label) != "PROFILES PER PLAYER"
         || coopui::OptCanon(pc, coopui::OptDefs()[pc].dflt) != "3" || coopui::OptShown(pc, "16") != "16" || !coopui::OptCanon(pc, "17").empty())
         Fail("ui5: the PROFILES PER PLAYER row");
@@ -4041,6 +4278,93 @@ static int N1Verdict(const coopui::PressFacts& f, const std::string& mods, std::
 {
     box->clear();
     return coopui::PressVerdictOf(f, mods, box);
+}
+/* T-1403 (owner 1755 a / 1756 a): the start-up progress file, the move watch and the HOST line with counts */
+void t1403_start_progress()
+{
+    startprog::Row r; r.pid = 4242; r.step = "records"; r.n = 8400; r.m = 19156;
+    startprog::Row q;
+    if (!startprog::Parse(startprog::Format(r), &q) || q.pid != 4242 || q.step != "records" || q.n != 8400 || q.m != 19156) Fail("T-1403: the progress file does not read back");
+    if (startprog::Parse("pid 4242\nstep records\nn 84", &q)) Fail("T-1403: a torn progress file (no m line) was taken");
+    if (startprog::Parse("pid -1\nstep records\nn 1\nm 2\n", &q)) Fail("T-1403: a signed pid was taken");
+    if (!startprog::Parse("pid 1\r\nstep loads\r\nn 0\r\nm 0\r\n", &q) || q.step != "loads") Fail("T-1403: CRLF lines not read");
+    if (startprog::Grouped(8400) != "8,400" || startprog::Grouped(19156) != "19,156" || startprog::Grouped(0) != "0" || startprog::Grouped(999) != "999"
+     || startprog::Grouped(1000000) != "1,000,000") Fail("T-1403: the thousands separators");
+    /* the approved line: `Starting "<world>"...  <n> / <m>`; before any count the line as it is */
+    const std::string plain = coopui::PressStatusText(0, "Kenshi-1", "");
+    if (startprog::StatusWithCounts(plain, true, r) != "Starting \"Kenshi-1\"...  8,400 / 19,156") Fail("T-1403: the HOST line with counts: '" + startprog::StatusWithCounts(plain, true, r) + "'");
+    if (startprog::StatusWithCounts(plain, false, r) != plain) Fail("T-1403: no progress read changed the HOST line");
+    startprog::Row l = r; l.step = "loads"; l.n = 0; l.m = 0;
+    if (startprog::StatusWithCounts(plain, true, l) != plain) Fail("T-1403: a step without counts changed the HOST line");
+    startprog::Row z = r; z.n = 0; z.m = 0;
+    if (startprog::StatusWithCounts(plain, true, z) != plain) Fail("T-1403: a walk with no total showed counts");
+    if (!startprog::RowIsOurs(r, 4242) || startprog::RowIsOurs(r, 4243)) Fail("T-1403: whose progress file it is");
+    /* review fold: no server started by this press (pid 0) - no file is its, whatever pid the file names, 0 included */
+    { startprog::Row z0 = r; z0.pid = 0; if (startprog::RowIsOurs(r, 0) || startprog::RowIsOurs(z0, 0)) Fail("T-1403 fold: a progress file taken for a press that started no server"); }
+    /* the watch: no progress file yet counts as not moved from the press */
+    startprog::Watch w; startprog::WatchStart(&w, 1000u);
+    startprog::Row none;
+    if (startprog::WatchStill(&w, false, none, 30999u) != 29999u) Fail("T-1403: no progress file yet is not measured from the press");
+    if (startprog::WatchStill(&w, false, none, 31000u) < coopui::kPressHostStallMs) Fail("T-1403: no progress file for 30 s is not a stall");
+    /* moving */
+    startprog::WatchStart(&w, 1000u);
+    if (startprog::WatchStill(&w, true, r, 20000u) != 0u) Fail("T-1403: the first row read is not a move");
+    if (startprog::WatchStill(&w, true, r, 49000u) != 29000u) Fail("T-1403: the same row 29 s later is not 29 s still");
+    if (startprog::WatchStill(&w, true, r, 50000u) != 30000u) Fail("T-1403: the same row 30 s later is not 30 s still");
+    startprog::Row r2 = r; r2.n = 8500;
+    if (startprog::WatchStill(&w, true, r2, 50001u) != 0u) Fail("T-1403: a new count is not a move");
+    if (startprog::WatchStill(&w, false, none, 60001u) != 10000u) Fail("T-1403: a failed read moved the watch");
+    startprog::Row r3 = r2; r3.step = "loads"; r3.n = 0; r3.m = 0;
+    if (startprog::WatchStill(&w, true, r3, 70000u) != 0u) Fail("T-1403: a new step is not a move");
+    /* GetTickCount wraps */
+    startprog::WatchStart(&w, 0xFFFFF000u);
+    if (startprog::WatchStill(&w, false, none, 0x00001000u) != 0x2000u) Fail("T-1403: the watch across the tick wrap");
+    /* the server side */
+    if (!startprog::WriteDue(5, 4, 10.0, 9.0) || startprog::WriteDue(5, 4, 10.0, 9.5) || startprog::WriteDue(5, 5, 20.0, 9.0)) Fail("T-1403: the write cadence");
+    if (startprog::TenthOf(0, 100) != 0 || startprog::TenthOf(10, 100) != 1 || startprog::TenthOf(99, 100) != 9 || startprog::TenthOf(100, 100) != 10 || startprog::TenthOf(5, 0) != 0) Fail("T-1403: the tenths");
+    if (startprog::SlowEntryMs(90.0, 900) != 100u || startprog::SlowEntryMs(90.0, 3) != 10000u || startprog::SlowEntryMs(0.0, 10) != 0u || startprog::SlowEntryMs(90.0, 0) != 0u) Fail("T-1403: the TEST-ONLY slow walk's wait");
+    /* review fold: the walk's last write is the whole count; files added or gone while it ran */
+    { startprog::Row d = r; d.n = 19150; d.m = 19156; startprog::WalkDone(&d); if (d.n != 19156 || d.m != 19156) Fail("T-1403 fold: the walk's final count is not its total");
+      d.n = 19160; d.m = 19156; startprog::WalkDone(&d); if (d.n != 19160 || d.m != 19160) Fail("T-1403 fold: a walk that found more than it listed ends past its total");
+      if (startprog::StatusWithCounts(plain, true, d) != "Starting \"Kenshi-1\"...  19,160 / 19,160") Fail("T-1403 fold: the final line"); }
+    /* review fold: the slowed walk's target times are not rounded to a sleep step - 90 s over 19,156 entries ends at 90 s */
+    { const double t = startprog::SlowTargetSec(90.0, 19156, 19156); if (t < 89.999 || t > 90.001) Fail("T-1403 fold: the slowed walk's last target is not 90 s");
+      const double t1 = startprog::SlowTargetSec(90.0, 19156, 1); if (t1 <= 0.0 || t1 > 0.005) Fail("T-1403 fold: the slowed walk's first target");
+      if (startprog::SlowTargetSec(90.0, 3, 3) != 30.0 || startprog::SlowTargetSec(0.0, 10, 5) != 0.0 || startprog::SlowTargetSec(90.0, 0, 5) != 0.0) Fail("T-1403 fold: the slowed walk's cap / off"); }
+    /* review fold: the file gone after a row was read is one move, once; gone before any row is none */
+    { startprog::Watch g; startprog::WatchStart(&g, 1000u);
+      startprog::WatchGone(&g, 5000u); if (startprog::WatchStill(&g, false, none, 6000u) != 5000u) Fail("T-1403 fold: a file never seen counted as gone");
+      startprog::WatchStill(&g, true, r, 7000u); startprog::WatchGone(&g, 20000u);
+      if (startprog::WatchStill(&g, false, none, 21000u) != 1000u) Fail("T-1403 fold: the file gone is not a move");
+      startprog::WatchGone(&g, 40000u); if (startprog::WatchStill(&g, false, none, 50000u) != 30000u) Fail("T-1403 fold: the file gone moved the watch twice"); }
+    /* T2520 LEG 1: a hosting game dials its world server again when that server says it is listening
+       coopstore::HostListenDialDecide(isHost, hasDoor, pending, sock, dialsSinceListening, cap) */
+    { using namespace coopstore;
+      if (HostListenDialDecide(1, 1, 0, kSockDownOrFailed, 0, 3) != kHostListenNone) Fail("T-1403 T2520: dialled before the server said it listens");
+      if (HostListenDialDecide(1, 1, 1, kSockDownOrFailed, 0, 3) != kHostListenDial) Fail("T-1403 T2520: the given-up press dial was not dialled again at the listening (the T2520 defect)");
+      if (HostListenDialDecide(1, 1, 1, kSockConnecting, 0, 3) != kHostListenDial) Fail("T-1403 T2520: a press dial still connecting at the listening got no fresh dial");
+      if (HostListenDialDecide(1, 1, 1, kSockConnecting, 1, 3) != kHostListenNone) Fail("T-1403 T2520: the listening's own dial in flight was torn down");
+      if (HostListenDialDecide(1, 1, 1, kSockDownOrFailed, 1, 3) != kHostListenDial) Fail("T-1403 T2520: a link down again before any answer was not dialled again");
+      if (HostListenDialDecide(1, 1, 1, kSockDownOrFailed, 3, 3) != kHostListenDone) Fail("T-1403 T2520: dialled past the cap");
+      if (HostListenDialDecide(1, 1, 1, kSockUpNotWelcomed, 0, 3) != kHostListenDone || HostListenDialDecide(1, 1, 1, kSockUpWelcomed, 1, 3) != kHostListenDone
+          || HostListenDialDecide(1, 1, 1, kSockUpRefused, 0, 3) != kHostListenDone) Fail("T-1403 T2520: an answered link was dialled again");
+      if (HostListenDialDecide(0, 1, 1, kSockDownOrFailed, 0, 3) != kHostListenDone || HostListenDialDecide(1, 0, 1, kSockDownOrFailed, 0, 3) != kHostListenDone
+          || HostListenDialDecide(1, 1, 1, kSockDownOrFailed, 0, 0) != kHostListenDone) Fail("T-1403 T2520: a joining game, no door or a cap of 0 dialled");
+      /* the sweep: at most cap dials since the listening, whatever the link does */
+      for (int seq = 0; seq < 64; ++seq)
+      { long long d = 0; int pend = 1;
+        for (int step = 0; step < 6 && pend; ++step)
+        { const int sk = ((seq >> step) & 1) ? kSockDownOrFailed : kSockConnecting;
+          const int a = HostListenDialDecide(1, 1, pend, sk, d, 3);
+          if (a == kHostListenDial) ++d; else if (a == kHostListenDone) pend = 0; }
+        if (d > 3) Fail("T-1403 T2520 sweep: more than 3 dials since the listening"); }
+      /* review fold: once per press, and an early exit's removal is no listening */
+      if (HostListenArm(0, 0) != 1) Fail("T-1403 T2520 fold: the first listening of a press was not taken");
+      if (HostListenArm(1, 0) != 0 || HostListenArm(0, 1) != 0 || HostListenArm(1, 2) != 0) Fail("T-1403 T2520 fold: a second listening in one press was taken");
+      if (startprog::ListeningOf(1, 0, 1) != 1) Fail("T-1403 T2520 fold: the file gone with the server running is not its listening");
+      if (startprog::ListeningOf(1, 0, 0) != 0) Fail("T-1403 T2520 fold: the file removed by an early exit (process ended) was taken for listening");
+      if (startprog::ListeningOf(0, 0, 1) != 0) Fail("T-1403 T2520 fold: a file never read was taken for listening");
+      if (startprog::ListeningOf(1, 1, 1) != 0) Fail("T-1403 T2520 fold: the file gone was taken for listening twice"); }
 }
 void t_n1_press()
 {
@@ -4059,11 +4383,19 @@ void t_n1_press()
     if (N1Verdict(h, "", &box) != coopui::kPressWait) Fail("N1: a welcome before the title tick armed counted for this press");
     h.armed = 1;
     if (N1Verdict(h, "", &box) != coopui::kPressDone) Fail("N1: an armed host the world answered is not done");
-    h.notebookUp = 0; h.elapsedMs = coopui::kPressHostStartMs - 1;
-    if (N1Verdict(h, "", &box) != coopui::kPressWait) Fail("N1: a host inside its start time is not waiting");
-    h.elapsedMs = coopui::kPressHostStartMs;
+    /* T-1403 (owner 1755 a): HOST fails only when the start-up progress stood still 30 s (or the server ended) - no fixed total */
+    h.notebookUp = 0; h.elapsedMs = 600000u; h.stillMs = 1000u;
+    if (N1Verdict(h, "", &box) != coopui::kPressWait) Fail("T-1403: a host whose progress moves failed at a fixed total (10 min elapsed, moved 1 s ago)");
+    h.stillMs = 29000u;
+    if (N1Verdict(h, "", &box) != coopui::kPressWait) Fail("T-1403: a host stalled 29 s is not waiting");
+    h.stillMs = 30000u;
+    if (coopui::kPressHostStallMs != 30000u || coopui::kPressHostStallMs != startprog::kStallMs) Fail("T-1403: the stall limit is not 30 s in both headers");
     if (N1Verdict(h, "", &box) != coopui::kPressFailed || box != "The world didn't start in time.") Fail("N1: the host's late box: '" + box + "'");
     shown.push_back(box);
+    h.stillMs = 0;
+    h.nbState = coopui::kNbStoppedEarly; h.nbExit = 1;
+    if (N1Verdict(h, "", &box) != coopui::kPressFailed || box == "The world didn't start in time.") Fail("T-1403: a world server that ended while its progress moved is not failed at once with its own box");
+    h.nbState = coopui::kNbNotOurs; h.nbExit = 0;
     h.elapsedMs = 0;
     h.nbState = coopui::kNbNoExe;
     if (N1Verdict(h, "", &box) != coopui::kPressFailed || box != "A multiplayer file is missing.") Fail("N1: the missing-file box: '" + box + "'");
@@ -4163,9 +4495,9 @@ void t_n1_press()
         if (N1Verdict(l, "", &box) != coopui::kPressWait) Fail("T552: no lobby list (generation -1 / 0) counted");
         l.lobbyGen = 2; l.linkGen = 2; l.armed = 0;
         if (N1Verdict(l, "", &box) != coopui::kPressWait) Fail("T552: a lobby list before this press armed counted");
-        l.armed = 1; l.lobbyGen = 1; l.elapsedMs = coopui::kPressHostStartMs;
+        l.armed = 1; l.lobbyGen = 1; l.elapsedMs = coopui::kPressHostStartMs; l.stillMs = coopui::kPressHostStallMs;
         if (N1Verdict(l, "", &box) != coopui::kPressFailed || box != "The world didn't start in time.") Fail("T552: a stale lobby list stopped the host's late box");
-        l.lobbyGen = 2; l.elapsedMs = 0; l.nbState = coopui::kNbStoppedEarly;
+        l.lobbyGen = 2; l.elapsedMs = 0; l.stillMs = 0; l.nbState = coopui::kNbStoppedEarly;
         if (N1Verdict(l, "", &box) != coopui::kPressFailed) Fail("T552: a lobby answer hid a stopped world server");
         l.nbState = coopui::kNbStarting; l.refusal = 100;
         if (N1Verdict(l, "", &box) != coopui::kPressFailed || box != "Couldn't host: no profile is available.") Fail("T552: a lobby answer hid a profile dead end");   /* T-201 N1b (owner 165): a HOST press */
@@ -4208,6 +4540,13 @@ void t_m11flip_world_door_press_and_redial()
     if (coopstore::TitleRedialDecide(1, 1, coopstore::kSockUpNotWelcomed, 0, 12, 99999u, 1000u, 5000u) != coopstore::kTitleRedialNone) Fail("flip: an up link (lobby / handshake) was re-dialled");
     if (coopstore::TitleRedialDecide(1, 1, coopstore::kSockUpWelcomed, 0, 12, 99999u, 1000u, 5000u) != coopstore::kTitleRedialNone) Fail("flip: a welcomed link was re-dialled");
     if (coopstore::TitleRedialDecide(1, 1, coopstore::kSockUpRefused, 0, 12, 99999u, 1000u, 5000u) != coopstore::kTitleRedialNone) Fail("flip: a refusal in words was re-dialled");
+    /* T-247 (T2420): a mods refusal is an answer - the link the world server closed after it reads as refused, so no dial follows */
+    if (coopstore::TitleRedialSock(coopstore::kSockDownOrFailed, (int)coopstore::kRefuseMods) != coopstore::kSockUpRefused) Fail("t247 redial: a link closed after a mods refusal did not read as refused");
+    if (coopstore::TitleRedialSock(coopstore::kSockConnecting, (int)coopstore::kRefuseMods) != coopstore::kSockUpRefused) Fail("t247 redial: a dial after a mods refusal did not read as refused");
+    if (coopstore::TitleRedialDecide(1, 1, coopstore::TitleRedialSock(coopstore::kSockDownOrFailed, (int)coopstore::kRefuseMods), 1, 12, 99999u, 1000u, 5000u) != coopstore::kTitleRedialNone) Fail("t247 redial: a mods refusal was re-dialled");
+    if (coopstore::TitleRedialSock(coopstore::kSockDownOrFailed, -1) != coopstore::kSockDownOrFailed) Fail("t247 redial: no refusal changed the link state");
+    if (coopstore::TitleRedialSock(coopstore::kSockDownOrFailed, (int)coopstore::kRefuseFull) != coopstore::kSockDownOrFailed) Fail("t247 redial: a full world stopped the re-dial (it keeps dialling by design)");
+    if (coopstore::TitleRedialSock(coopstore::kSockUpWelcomed, -1) != coopstore::kSockUpWelcomed) Fail("t247 redial: a welcomed link changed state with no refusal");
     if (coopstore::TitleRedialDecide(0, 1, coopstore::kSockDownOrFailed, 0, 12, 99999u, 1000u, 5000u) != coopstore::kTitleRedialNone) Fail("flip: a host / single game was re-dialled at the title");
     if (coopstore::TitleRedialDecide(1, 0, coopstore::kSockDownOrFailed, 0, 12, 99999u, 1000u, 5000u) != coopstore::kTitleRedialNone) Fail("flip: a game with no world server to ring dialled");
     if (coopstore::TitleRedialDecide(1, 1, coopstore::kSockDownOrFailed, 10, 12, 1000u, 1000u, 5000u) != coopstore::kTitleRedialAgain) Fail("flip: dial 11 of 12 was not made");
@@ -4269,30 +4608,20 @@ void t_m11flip_world_door_press_and_redial()
    button, the dialog's two and its tick box. */
 void t_reset_world_panel()
 {
+    /* T-1383 (decision 1704; the approved page, version 3 - word for word): two sentences, three tick boxes, the old world's name */
     const std::string dlg = coopui::ResetWorldDlgHead("World 1");
     const std::string want =
-        "Reset \"World 1\"?\n"
+        "Reset \"World 1\" for every player? Towns, people, loot and the time of day start over.\n"
         "\n"
-        "The world goes back to how it was at the start, for every player.\n"
-        "\n"
-        "Starts over:\n"
-        "  Towns, outposts and the people living in them\n"
-        "  Named characters who died, and who rules each town\n"
-        "  How the factions feel about each other\n"
-        "  The day and time\n"
-        "  Ruins, loot and everything left on the ground\n"
-        "  Buildings and what is stored in them, unless kept below\n"
-        "\n"
-        "Kept for every player:\n"
-        "  Characters, with their skills, health and equipment\n"
-        "  Money and research\n"
-        "  What each player's map shows\n"
-        "  How each player's faction stands with others";
-    if (dlg != want) Fail("reset: the RESET WORLD? dialog's words above the tick box are not the approved ones:\n" + dlg);
-    if (std::string(coopui::kResetKeepLabel) != "Keep players' buildings, furniture and stored items") Fail("reset: the tick box's label");
+        "Every player keeps their characters, gear, money, research, map and their own faction's standings.";
+    if (dlg != want) Fail("reset: the RESET WORLD? dialog's words above the tick boxes are not the approved ones:\n" + dlg);
+    if (std::string(coopui::kResetKeepLabel) != "Keep players' buildings and stored items") Fail("reset: the keep-buildings tick box's label");
+    if (std::string(coopui::kResetKeepDeadLabel) != "Keep named characters who died" || std::string(coopui::kResetKeepRelLabel) != "Keep how the factions feel about each other")
+        Fail("T-1383: the reset's two new tick boxes' labels");
+    if (std::string(coopui::kResetHoverDead) != "Named characters who are dead in this world stay dead after the reset."
+        || std::string(coopui::kResetHoverRel) != "Factions keep the standings they have with each other now.") Fail("T-1383: the reset's two hover notes");
     const std::string tail = coopui::ResetWorldDlgTail(worldreset::ResetOldWorldName("World 1", 1));
-    if (tail != "Players who aren't here now are moved into the reset world the next time they join. The old world is kept as"
-                " \"World 1 - before reset 1\".")
+    if (tail != "The old world is saved as \"World 1 - before reset 1\". Players who aren't here join the reset world the next time they connect.")
         Fail("reset: the RESET WORLD? dialog's last paragraph is not the approved one:\n" + tail);
     if (coopui::ResetWorldBusyText("World 1") != "Resetting \"World 1\"...") Fail("reset: the line while the reset runs");
     if (coopui::ResetWorldOutcomeText("World 1", 0) != "\"World 1\" was reset.") Fail("reset: the finished line");
@@ -4366,10 +4695,15 @@ void t_reset_world_panel()
             const coopui::PanelBand lb = coopui::PanelSlotBand(coopui::kLayResetWorld, coopui::kSlotDlgTail, g.rowH, live);
             const coopui::PanelBand bb = coopui::PanelSlotBand(coopui::kLayResetWorld, coopui::kSlotButtons, g.rowH, live);
             if (tb.h < headLines * coopui::kPanelTextLinePx || kb.top < tb.top + tb.h) Fail("reset: RESET WORLD?'s text runs into its tick box" + what);
-            if (kb.h < g.rowH || lb.top < kb.top + kb.h) Fail("reset: RESET WORLD?'s tick-box row is not a whole row above the last paragraph" + what);
+            const coopui::PanelBand k2 = coopui::PanelSlotBand(coopui::kLayResetWorld, coopui::kSlotDlgTick2, g.rowH, live);   /* T-1383 */
+            const coopui::PanelBand k3 = coopui::PanelSlotBand(coopui::kLayResetWorld, coopui::kSlotDlgTick3, g.rowH, live);
+            if (kb.h < g.rowH || k2.h < g.rowH || k3.h < g.rowH || k2.top != kb.top + kb.h || k3.top != k2.top + k2.h || lb.top < k3.top + k3.h)
+                Fail("reset: RESET WORLD?'s three tick-box rows are not whole rows together above the last paragraph" + what);
             if (lb.h < tailLines * coopui::kPanelTextLinePx || bb.top < lb.top + lb.h) Fail("reset: RESET WORLD?'s last paragraph runs into CANCEL / RESET WORLD" + what);
-            if (coopui::NoticeLinesFor(coopui::kResetKeepLabel, (g.innerW - kb.h - coopui::PanelGapOf(g.rowH)) / coopui::kPanelTextCharW) != 1)
-                Fail("reset: the tick box's label does not fit one line beside it" + what);
+            const char* const labs[3] = { coopui::kResetKeepLabel, coopui::kResetKeepDeadLabel, coopui::kResetKeepRelLabel };
+            for (int li = 0; li < 3; ++li)
+                if (coopui::NoticeLinesFor(labs[li], (g.innerW - kb.h - coopui::PanelGapOf(g.rowH)) / coopui::kPanelTextCharW) != 1)
+                    Fail(std::string("reset: the tick box's label does not fit one line beside it: ") + labs[li] + what);
         }
         /* HOST GAME's four world buttons: each wide enough for its caption (GAME OPTIONS, the longest, at the text estimate) */
         const int gap = coopui::PanelGapOf(g.rowH);
@@ -4377,13 +4711,13 @@ void t_reset_world_panel()
         if (4 * qw + 3 * gap > g.innerW) Fail("reset: the four world buttons overflow the panel at " + at);
         if (qw < 12 * coopui::kPanelTextCharW + 2 * coopui::kPanelAddrBtnPadPx) Fail("reset: a world button is narrower than GAME OPTIONS at " + at);
     }
-    /* the driver: resetworld presses the button; resetcancel / resetok press the dialog's two only while they read CANCEL / RESET WORLD */
+    /* the driver: resetworld presses the button; resetcancel / resetok press the dialog's two only while they read CANCEL / RESET (the approved v3 confirm word) */
     const coopui::UiDriveName* rb = coopui::UiDriveFind("resetworld", coopui::kDriveButton);
     const coopui::UiDriveName* rc = coopui::UiDriveFind("resetcancel", coopui::kDriveButton);
     const coopui::UiDriveName* ro = coopui::UiDriveFind("resetok", coopui::kDriveButton);
     if (rb == 0 || std::string(rb->w1) != "SWResetWorldBtn" || rb->caption != 0) Fail("reset: uiclick resetworld");
     if (rc == 0 || std::string(rc->w1) != "CoopDlgCancelBtn" || rc->caption == 0 || std::string(rc->caption) != "CANCEL") Fail("reset: uiclick resetcancel");
-    if (ro == 0 || std::string(ro->w1) != "CoopDlgOkBtn" || ro->caption == 0 || std::string(ro->caption) != "RESET WORLD") Fail("reset: uiclick resetok");
+    if (ro == 0 || std::string(ro->w1) != "CoopDlgOkBtn" || ro->caption == 0 || std::string(ro->caption) != "RESET") Fail("reset: uiclick resetok (the approved v3 confirm word RESET)");
     const coopui::UiDriveName* rk = coopui::UiDriveFind("resetkeep", coopui::kDriveButton);
     if (rk == 0 || std::string(rk->w1) != "SWResetKeepTick" || rk->caption != 0) Fail("reset: uiclick resetkeep");
 }
@@ -5035,19 +5369,33 @@ std::vector<std::string> T802V(const char* a, const char* b = 0, const char* c =
    reference list when refs is not empty, one instance per target with its state list */
 void T802Rec(std::vector<char>* v, int type, const std::string& sid, int handS, int charCount, const std::vector<std::string>& refs,
              const std::vector<std::string>& targets, const std::vector<std::vector<std::string> >& states, const char* handPrefix /* = 0 */, int handTo /* = 0 */,
-             const int* money /* = 0 */)
+             const int* money /* = 0 */, const float* anchor /* = 0 */, const float* anchorSpot /* = 0 */, const coopown::RecSettings* set /* = 0 */)
 {
     using namespace coopown;
+    const int sh = set != 0 ? set->has : 0;   /* T-1429 s10: the settings fields the squad record carries, at the engine's kinds */
     RecPutI32(v, 0); RecPutI32(v, type); RecPutI32(v, 7); RecPutStr(v, "0"); RecPutStr(v, sid); RecPutI32(v, 0);
-    if (type == 0x1E) RecPutI32(v, 0); else { RecPutI32(v, 1); RecPutStr(v, "dead"); v->push_back(0); }   /* a squad record: "char count" only */
-    RecPutI32(v, 0);
-    RecPutI32(v, (handS != 0 ? 2 : 0) + (charCount >= 0 ? 1 : 0) + (handPrefix != 0 ? 2 : 0) + (money != 0 ? 1 : 0));
+    if (type == 0x1E)
+    {
+        RecPutI32(v, ((sh & kRecSetResident) != 0 ? 1 : 0) + ((sh & kRecSetPrison) != 0 ? 1 : 0));   /* a squad record: "char count" only (and T-1429 s10's) */
+        if ((sh & kRecSetResident) != 0) { RecPutStr(v, kRecSetResidentKey); v->push_back((char)(set->resident != 0 ? 1 : 0)); }
+        if ((sh & kRecSetPrison) != 0) { RecPutStr(v, kRecSetPrisonKey); v->push_back((char)(set->prison != 0 ? 1 : 0)); }
+    }
+    else { RecPutI32(v, 1); RecPutStr(v, "dead"); v->push_back(0); }
+    RecPutI32(v, (sh & kRecSetRestock) != 0 ? 1 : 0);
+    if ((sh & kRecSetRestock) != 0) { RecPutStr(v, kRecSetRestockKey); int bits = 0; std::memcpy(&bits, &set->restock, 4); RecPutI32(v, bits); }
+    RecPutI32(v, (handS != 0 ? 2 : 0) + (charCount >= 0 ? 1 : 0) + (handPrefix != 0 ? 2 : 0) + (money != 0 ? 1 : 0) + ((sh & kRecSetType) != 0 ? 1 : 0) + ((sh & kRecSetIndex) != 0 ? 1 : 0));
     if (handS != 0) { RecPutStr(v, "handleS"); RecPutI32(v, handS); RecPutStr(v, "handleTYPE"); RecPutI32(v, 1); }
     if (charCount >= 0) { RecPutStr(v, "char count"); RecPutI32(v, charCount); }
     if (money != 0) { RecPutStr(v, kRecMoneyKey); RecPutI32(v, *money); }   /* T-799 D2: the group's money */
+    if ((sh & kRecSetType) != 0) { RecPutStr(v, kRecSetTypeKey); RecPutI32(v, set->type); }
+    if ((sh & kRecSetIndex) != 0) { RecPutStr(v, kRecSetIndexKey); RecPutI32(v, set->index); }
     if (handPrefix != 0) { RecPutStr(v, std::string(handPrefix) + "handleS"); RecPutI32(v, handTo); RecPutStr(v, std::string(handPrefix) + "handleTYPE"); RecPutI32(v, 1); }
-    RecPutI32(v, 0); RecPutI32(v, 0);
-    if (type == 0x1E) RecPutI32(v, 0); else { RecPutI32(v, 1); RecPutStr(v, "name"); RecPutStr(v, sid + "-name"); }
+    RecPutI32(v, (anchor != 0 ? 1 : 0) + (anchorSpot != 0 ? 1 : 0));   /* vector fields: T-1385's people anchor and the spot read with it */
+    if (anchor != 0) { RecPutStr(v, kRecAnchorKey); for (int a = 0; a < 3; ++a) { int bits = 0; std::memcpy(&bits, &anchor[a], 4); RecPutI32(v, bits); } }
+    if (anchorSpot != 0) { RecPutStr(v, kRecAnchorSpotKey); for (int a = 0; a < 3; ++a) { int bits = 0; std::memcpy(&bits, &anchorSpot[a], 4); RecPutI32(v, bits); } }
+    RecPutI32(v, 0);
+    if (type == 0x1E) { RecPutI32(v, (sh & kRecSetTown) != 0 ? 1 : 0); if ((sh & kRecSetTown) != 0) { RecPutStr(v, kRecSetTownKey); RecPutStr(v, set->town); } }
+    else { RecPutI32(v, 1); RecPutStr(v, "name"); RecPutStr(v, sid + "-name"); }
     RecPutI32(v, 0);
     RecPutI32(v, refs.empty() ? 0 : 1);
     if (!refs.empty())
@@ -5068,7 +5416,8 @@ void T802Rec(std::vector<char>* v, int type, const std::string& sid, int handS, 
    b24, b43), then the squad record "sq" with one instance per character. charCount < 0: the true count. shareItem: B's
    record also names A's item. listA = false: A's instance does not name a24. variant 1: B's AI record holds a hand to A;
    2: the squad record holds one more field; 3: one more character record (x24) that no instance names; 4: the squad record carries
-   the group's money, 2500 (T-799 D2). */
+   the group's money, 2500 (T-799 D2); 5: the money and the people anchor -73954.3,5,902.1 saved at spot -73500,5,450 (T-1385); 6: the
+   money and the six settings (T-1429 s10: type 3, base town 'tw-1', resident, not imprisoned, squad number 7, restock 1234.5). */
 std::vector<char> T802Squad(bool withA, bool withB, int charCount, bool shareItem, bool listA, int variant /* = 0 */)
 {
     std::vector<std::string> none;
@@ -5095,7 +5444,10 @@ std::vector<char> T802Squad(bool withA, bool withB, int charCount, bool shareIte
     }
     if (variant == 3) T802Rec(&v, 0x24, "x24", 33, -1, none, none, noSt);
     const int money4 = 2500;
-    T802Rec(&v, 0x1E, "sq", 0, charCount >= 0 ? charCount : (int)tg.size(), none, tg, st, variant == 2 ? "extra" : 0, 5, variant == 4 ? &money4 : 0);
+    const float anchor5[3] = { -73954.3f, 5.0f, 902.1f }, spot5[3] = { -73500.0f, 5.0f, 450.0f };   /* T-1385: variant 5 - the money, the people anchor and its spot */
+    coopown::RecSettings set6; set6.has = coopown::kRecSetAll; set6.type = 3; set6.town = "tw-1"; set6.resident = 1; set6.prison = 0; set6.index = 7; set6.restock = 1234.5f;
+    T802Rec(&v, 0x1E, "sq", 0, charCount >= 0 ? charCount : (int)tg.size(), none, tg, st, variant == 2 ? "extra" : 0, 5, (variant == 4 || variant == 5 || variant == 6) ? &money4 : 0, variant == 5 ? anchor5 : 0, variant == 5 ? spot5 : 0,
+            variant == 6 ? &set6 : 0);
     return v;
 }
 void t_t802_moved_after_save()

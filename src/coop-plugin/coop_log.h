@@ -28,6 +28,16 @@ void DebugLog(const char* message);
 void ErrorLog(const std::wstring& message);
 void ErrorLog(const std::string& message);
 void ErrorLog(const char* message);
+/* T-1374 (crashwatch.cpp): the [CRASH] line, written from inside a crash handler - no allocation, no C runtime call, one
+   WriteFile, the log lock taken only if it comes free within about 50 ms. The caller's buffer `buf` (cap bytes) holds the
+   line's text (textLen bytes) after kCrashLinePrefixGap free bytes, which take the "Error <time> KenshiCoop: " prefix; CRLF
+   goes after the text (cut to fit cap). ANY THREAD. */
+enum { kCrashLinePrefixGap = 48 };   /* "Error " + up to 24 time characters + " KenshiCoop: " = at most 43 */
+void CrashLogWriteRaw(char* buf, size_t cap, size_t textLen);
+/* T-1374: once per process, after the address table is read: Kenshi's crash zip in its save root (`saveRoot`, "" = not known)
+   copied into the entry the start-up's crash keep made, when better than what it holds. With the save root not known and
+   !last it waits (nothing done, "" returned) for the call at the first world load (last = true). The [CRASHKEEP] line, or "". */
+std::string CrashKeepSaveRootLook(const std::wstring& saveRoot, bool last);
 
 /* T-461: the path of this launch's log (copy 0) or of an earlier launch's kept copy (1 = the previous launch;
    src/common/logrotate.h), beside SharedWastelands.dll; empty when the DLL's folder cannot be read. ANY THREAD. */

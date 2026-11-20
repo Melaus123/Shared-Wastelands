@@ -7,7 +7,9 @@
  *   templateName   its template GameData NAME (CreateAt looks it up as CHARACTER, else RECORD_ANIMAL)
  *   name           its shown name (cut to 64 bytes at a UTF-8 boundary, as MSG_NAME)
  *   race           the race record name the engine reports (the appearance object's race; "?" when unreadable)
- *   sid            a named character's GameData string id (the key uniques.txt keeps its state under); "" for any other
+ *   sid            its template's GameData string id (T-1021: kept for every character, so the bring-back finds its own template by
+ *                  id, never by shown name; for a named character also the key uniques.txt keeps its state under). A row made
+ *                  before T-1021 has "" for a character that is not named - its template is then found by shown name, as before
  *   unique         1 = a named unique (the engine's own "unique" property), 0 = not
  *   animal         1 = an animal (pet / pack animal), 0 = a person
  *   age            an animal's age 0..1 (what a SPAWN carries); 0 for a person
@@ -221,6 +223,64 @@ inline bool FallenTake(std::vector<Fallen>* list, int n, Fallen* out)
 inline bool FallenNoteOnce(std::set<unsigned int>* seen, unsigned int uid)
 {
     return uid != 0 && seen->insert(uid).second;
+}
+
+/* ---- T-1021 (F1329 / F1336 design A): THE TEMPLATE THE BRING-BACK CREATES ON ----
+   Which items a character may wear in the head / shirt / boots slots, its anatomy, scale, health and stats are set once, at creation,
+   from its race then (F1329); so the brought-back character is created ON the dead character's real race and sex. Its own template
+   is used unchanged when that template's 'race' list is exactly its race (one entry: the engine's roll then can only give it, and a
+   named character stays named); otherwise a race look-alike of its own template (spimport::RaceCopySid: that race alone, 'female
+   chance' 0 / 100 from the saved sex). Race and sex come from the saved look record (its 'race' reference, its 'sex female' bool).
+   A row without a template id (made before T-1021), without the race or the sex in its look, or whose look-alike id cannot be made
+   is created on its own template found as before (the queued look then changes it, as before T-1021) - the caller says which. */
+const int kBackOwnExact = 0;       /* the own template: its race list is exactly the dead character's race */
+const int kBackLookalike = 1;      /* a race look-alike of the own template */
+const int kBackOwnNoId = 2;        /* the own template by shown name: the row keeps no template id (made before T-1021) */
+const int kBackOwnNoRace = 3;      /* the own template: the saved look holds no race (or no look was kept) */
+const int kBackOwnNoSex = 4;       /* the own template: the saved look holds no sex */
+const int kBackOwnNoCopyId = 5;    /* the own template: no race look-alike id can be made from these ids (spimport::RaceCopySid "") */
+const int kBackOwnAnimal = 6;      /* the own template: an animal (a look-alike is a CHARACTER record; an animal's template is kept) */
+inline int BackTemplateChoice(int animal, const std::string& templateSid, const std::vector<std::string>& templateRaces, const std::string& raceSid,
+                              int sexKnown, bool copyIdOk)
+{
+    if (animal) return kBackOwnAnimal;
+    if (raceSid.empty()) return kBackOwnNoRace;
+    if (templateRaces.size() == 1 && templateRaces[0] == raceSid) return kBackOwnExact;
+    if (templateSid.empty()) return kBackOwnNoId;
+    if (!sexKnown) return kBackOwnNoSex;
+    if (!copyIdOk) return kBackOwnNoCopyId;
+    return kBackLookalike;
+}
+inline const char* BackTemplateWord(int c)
+{
+    switch (c)
+    {
+    case kBackOwnExact:    return "own (its race list is exactly this race)";
+    case kBackLookalike:   return "race look-alike of its own";
+    case kBackOwnNoId:     return "own by shown name (no template id kept - a row from before T-1021)";
+    case kBackOwnNoRace:   return "own (no race in the saved look)";
+    case kBackOwnNoSex:    return "own (no sex in the saved look)";
+    case kBackOwnNoCopyId: return "own (no race look-alike id can be made from these ids)";
+    case kBackOwnAnimal:   return "own (an animal)";
+    default:               return "?";
+    }
+}
+/* the race and the sex a saved look record holds, from its flattened lists (appearance_record.h RecordCopy): the first reference of
+   key 'race' and the bool 'sex female'. *raceSid "" = none; returns 1 when the sex was found (*female set), else 0. */
+inline int LookRaceSex(const std::vector<std::string>& refKeys, const std::vector<int>& refCounts, const std::vector<std::string>& refSids,
+                       const std::vector<std::string>& boolKeys, const std::vector<unsigned char>& boolVals, std::string* raceSid, bool* female)
+{
+    raceSid->clear();
+    size_t at = 0;
+    for (size_t k = 0; k < refKeys.size() && k < refCounts.size(); ++k)
+    {
+        const int n = refCounts[k] < 0 ? 0 : refCounts[k];
+        if (refKeys[k] == "race" && n > 0 && at < refSids.size()) { *raceSid = refSids[at]; break; }
+        at += (size_t)n;
+    }
+    for (size_t k = 0; k < boolKeys.size() && k < boolVals.size(); ++k)
+        if (boolKeys[k] == "sex female") { *female = boolVals[k] != 0; return 1; }
+    return 0;
 }
 
 /* ---- the squad the bring-back joins ----

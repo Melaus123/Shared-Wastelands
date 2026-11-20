@@ -62,7 +62,7 @@ const unsigned kNumMax = 9999;                                /* profile numbers
 const unsigned kWireRowsMax = 64;                             /* active rows in one PROFILES answer (cap <= 16) */
 const size_t   kWireStrMax = 64;
 
-enum Kind { kReqNew = 1, kReqDelete = 2, kReqFaction = 3, kReqSaved = 4, kReqRename = 5, kReqFactionSeen = 6, kReqNewImport = 7 };   /* T-1096: 7 NEW with import from single player (store protocol 129) */   /* T-368: 5 RENAME - the player renamed its faction; 6 FACTION SEEN - the game has a FACTION answer */   /* T-201 PP6' (owner 175): 4 SAVED - a game's own save of its profile finished */   /* names2a: 3 FACTION - a playing game's faction name for its own row */
+enum Kind { kReqNew = 1, kReqDelete = 2, kReqFaction = 3, kReqSaved = 4, kReqRename = 5, kReqFactionSeen = 6, kReqNewImport = 7, kReqImportWord = 8 };   /* T-1383 fold (store protocol 159): 8 IMPORT WORD - ask again what this player may import (answered as LIST) */   /* T-1096: 7 NEW with import from single player (store protocol 129) */   /* T-368: 5 RENAME - the player renamed its faction; 6 FACTION SEEN - the game has a FACTION answer */   /* T-201 PP6' (owner 175): 4 SAVED - a game's own save of its profile finished */   /* names2a: 3 FACTION - a playing game's faction name for its own row */
 enum Answers { kAnsList = 0, kAnsNew = 1, kAnsDelete = 2, kAnsPick = 3, kAnsFaction = 4, kAnsTaken = 5 };   /* T-368: 4 and 5 have their own bodies */
 enum Verdict
 {
@@ -747,6 +747,16 @@ inline bool EditorResetButtonName(const std::string& name)
 }
 /* The greyed button's hover note, word for word as approved. */
 const char* const kEditorResetRefusedText = "Reset Population is turned off in a multiplayer world. It deletes your own squad, and the other players would keep the old townspeople.";
+/* T-1414 (owner decisions 1763 / 1764): THE WHOLE LEVEL EDITOR IS OFF IN A MULTIPLAYER WORLD, for every player; single player is
+   untouched. The editor has no button - its key (Shift+F12) runs the engine's toggle, which makes the editor and shows it. Each show
+   in a multiplayer world is closed on the next frame through that same toggle (the close a second press makes) and the approved
+   line goes on the game's message line once. mpWorld = HandSaveBlocked(), the test the Reset Population refusal and the hand save /
+   load refusals use; shown = the setVisible call shows (a hide is never acted on); leverOpening = the TEST-ONLY editordelete lever
+   (DEV build) is opening the editor for its own call, and closes it itself. */
+const int kEditorOpenLeave = 0, kEditorOpenClose = 1;
+inline int EditorOpenDecide(bool mpWorld, bool shown, bool leverOpening) { return (mpWorld && shown && !leverOpening) ? kEditorOpenClose : kEditorOpenLeave; }
+/* The short message, word for word as approved (decision 1763 / 1764). */
+const char* const kEditorOffText = "The Level Editor is turned off in a multiplayer world.";
 /* T-201 PP6' (player-path-plan.md PP6 + the one-press revision): WHAT THE ONE PRESS DOES ONCE THE WORLD HAS ADMITTED THE PICKED
    PROFILE. folderFound = this (world, profile)'s save folder was FOUND by its key file (SaveFolderScanChoose, not the name rule's new
    name - a folder of another world or profile under the rule's name is never found); quickSave = <save root>\<folder>\quick.save
@@ -1097,17 +1107,24 @@ inline bool WGetStr(const std::vector<char>& b, size_t* at, std::string* s)
     s->assign(b.begin() + (long)*at, b.begin() + (long)(*at + n)); *at += n; return true;
 }
 
-inline void EncodeRequest(std::vector<char>* b, int kind, unsigned num, const std::string& name)
+/* T-1383 (store protocol 159): kind 7 may end with a u32 - the parts the world's creator asks for (worldhist.h kAskDead 1 /
+   kAskRelations 2; sent only when not 0, and only on kind 7). */
+inline void EncodeRequest(std::vector<char>* b, int kind, unsigned num, const std::string& name, unsigned ask = 0)
 {
     b->push_back((char)(unsigned char)kind); WPutU32(b, num); WPutStr(b, name.size() > kWireStrMax ? name.substr(0, kWireStrMax) : name);
+    if (kind == kReqNewImport && ask != 0) WPutU32(b, ask);
 }
-inline bool DecodeRequest(const std::vector<char>& b, int* kind, unsigned* num, std::string* name)
+inline bool DecodeRequest(const std::vector<char>& b, int* kind, unsigned* num, std::string* name, unsigned* ask = 0)
 {
     if (b.empty()) return false;
     size_t at = 1;
     const int k = (unsigned char)b[0];
-    if (k != kReqNew && k != kReqDelete && k != kReqFaction && k != kReqSaved && k != kReqRename && k != kReqFactionSeen && k != kReqNewImport) return false;   /* names2a: kind 3; T-201 PP6': kind 4; T-368: kinds 5, 6; T-1096: kind 7 */
-    if (!WGetU32(b, &at, num) || !WGetStr(b, &at, name) || at != b.size()) return false;
+    if (k != kReqNew && k != kReqDelete && k != kReqFaction && k != kReqSaved && k != kReqRename && k != kReqFactionSeen && k != kReqNewImport && k != kReqImportWord) return false;   /* names2a: kind 3; T-201 PP6': kind 4; T-368: kinds 5, 6; T-1096: kind 7 */
+    if (!WGetU32(b, &at, num) || !WGetStr(b, &at, name)) return false;
+    unsigned a = 0;
+    if (at != b.size() && (k != kReqNewImport || !WGetU32(b, &at, &a) || a > 3u)) return false;   /* T-1383: the creator's ask, kind 7 only */
+    if (at != b.size()) return false;
+    if (ask != 0) *ask = a;
     *kind = k; return true;
 }
 

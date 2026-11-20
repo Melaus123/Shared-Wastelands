@@ -38,7 +38,12 @@
        | u32 the list's size 0..kPrCraftTotalMax | u32 n entries carried 0..kPrCraftMax (the list's first ones; fewer than the size only
        when n is kPrCraftMax) | n x (u32 length + the product's record id 1..kPrCraftSidMax | u32 length + the row record's id 0..
        kPrCraftSidMax | f32 progress | u32 mode 0..kPrCraftModeMax). A part without bit 7 leaves the list NOT KNOWN; a peer before 141
-       refuses a part with bit 7, and a work state of 3. A format-1 record carries no LIVE
+       refuses a part with bit 7, and a work state of 3.
+       T-1427 fold 1 (world-server protocol 165): flags bit 8 (kPrLiveFlagTownFact) adds, after the craft part, THE BUILDER'S TOWN when it is
+       no player outpost: u32 kind (kPrTownFactWorld: a world town, then u32 length + its game-data stringID 1..kPrTownSidMax bytes, no
+       control byte; kPrTownFactNowhere: the wilderness town 'Nowhere', nothing more). Never with bit 5 (an outpost is named by bit 5). A
+       part with neither bit 5 nor bit 8 leaves the town NOT KNOWN (an older record: the copy keeps part 2's rule). A peer before
+       protocol 165 refuses a part with bit 8 (an unknown bit). A format-1 record carries no LIVE
  *       part: its live values are NOT KNOWN (never "off"). A removal mark is always format 1.
  *   BODY, a removal mark: u32 reason (buildwire.h kBuildReasonDismantled / kBuildReasonDestroyed) and nothing else.
  *   Nothing may follow the body. The whole record is at most kPrMaxBytes.
@@ -70,7 +75,8 @@
 
 namespace piecerec {
 
-const unsigned int kProtocol = 153;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
+const unsigned int kProtocol = 170;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
+
 
 
 
@@ -81,9 +87,12 @@ const unsigned int kPrMarker = 0x31454350u;       /* 'P','C','E','1' little-endi
 const unsigned int kPrFormat = 1u;                /* a record with no LIVE part */
 const unsigned int kPrFormatLive = 2u;            /* a live piece's record with its LIVE part (switch, gets battery, battery, input stocks) */
 const unsigned int kPrLiveMaxStocks = 16u;        /* a piece's input records carried (powerwire.h kPowerMaxStocks) */
-const unsigned int kPrLiveFlagOn = 1u, kPrLiveFlagGets = 2u, kPrLiveFlagBar = 4u, kPrLiveFlagDoors = 8u, kPrLiveFlagNoPower = 16u, kPrLiveFlagTown = 32u, kPrLiveFlagFarm = 64u, kPrLiveFlagCraft = 128u, kPrLiveFlagsAll = 255u;   /* bit 2 = the bar and work state follow the stocks; bit 3 = the doors part follows them; bit 4 = no power values (else they are the piece's); bit 5 = the outpost link ends the part (T-1047 step 5) */
+const unsigned int kPrLiveFlagOn = 1u, kPrLiveFlagGets = 2u, kPrLiveFlagBar = 4u, kPrLiveFlagDoors = 8u, kPrLiveFlagNoPower = 16u, kPrLiveFlagTown = 32u, kPrLiveFlagFarm = 64u, kPrLiveFlagCraft = 128u, kPrLiveFlagTownFact = 256u, kPrLiveFlagsAll = 511u;   /* bit 2 = the bar and work state follow the stocks; bit 3 = the doors part follows them; bit 4 = no power values (else they are the piece's); bit 5 = the outpost link ends the part (T-1047 step 5) */
 const unsigned int kPrLiveFlagsBeforeTown = 31u;  /* the bits a peer before T-1047 step 5 (protocol 115) reads: it refuses any other */
 const unsigned int kPrLiveFlagsBeforeFarm = 63u;  /* the bits a peer before protocol 132 reads: it refuses a part with a farm's crop */
+const unsigned int kPrLiveFlagsBeforeTownFact = 255u;   /* T-1427 fold 1: the bits a peer before protocol 165 reads: it refuses a part with the builder's world town / 'Nowhere' */
+const unsigned int kPrTownFactWorld = 1u, kPrTownFactNowhere = 2u;   /* bit 8's kind: a world (NPC) town by its stringID; the wilderness town */
+const unsigned int kPrTownSidMax = 64u;            /* a world town's stringID carried: 1..this bytes */
 const unsigned int kPrLiveFlagsBeforeCraft = 127u; /* T-1192: the bits a peer before protocol 141 reads: it refuses a part with a crafting bench's list */
 /* T-1192: A CRAFTING BENCH'S CRAFT PART (flag bit 7, after everything else): the bench's craft list (+0x498, count +0x4B8), its repeat flag
    +0x4CC and the on/off byte (+0xD0) of each input section (+0x480 count, +0x488 records, stride 0x20, section +0x18) and of the output
@@ -106,7 +115,7 @@ const unsigned int kPrLiveMaxDoors = 16u;         /* a piece's doors carried, by
 const unsigned int kPrLiveDoorBroken = 1u, kPrLiveDoorLockBroken = 2u, kPrLiveDoorHasLock = 4u, kPrLiveDoorFlagsAll = 7u;   /* a door's flags word */
 const int kPrLiveLockLevelMax = 100;              /* a lock level carried: 0..100 */
 const unsigned int kPrLiveMaxBytes = 12u + 4u * kPrLiveMaxStocks + 8u + 4u + 12u * kPrLiveMaxDoors + 4u + 20u
-                                    + kPrCraftFixedBytes + kPrCraftMax * kPrCraftEntryMaxBytes;   /* 20: a farm's crop and its clock minute; then a bench's craft part */
+                                    + kPrCraftFixedBytes + kPrCraftMax * kPrCraftEntryMaxBytes + 4u + kPrTownSidMax;   /* T-1427 fold 1: a world town's fact (8 + its id) in place of the 4-byte outpost link - never both */   /* 20: a farm's crop and its clock minute; then a bench's craft part */
 const int kPieceLiveDoorBands = 20;               /* a door's health is written when it crosses a twentieth of its max */
 const float kPrLiveBarLimit = 2.0f;               /* T-1047 step 2b: a production bar carried: [0, 2] */
 const int kPrLiveStateMax = 3;                    /* T-1047 step 2b: a work state +0x468 carried: 0..3 (2 working, 1 blocked; T-1192: 3 a crafting bench with an empty list, 0x2B5640) */
@@ -173,6 +182,8 @@ struct PieceLive
     unsigned int doorFlags[kPrLiveMaxDoors];  /* kPrLiveDoorBroken | kPrLiveDoorLockBroken | kPrLiveDoorHasLock */
     int hasTown;                              /* T-1047 step 5: 1 = the outpost link is known (flag bit 5) */
     unsigned int town;                        /* T-1047 step 5: the outpost id the piece is linked to (1..kPrTownIdMax; 0 with hasTown 0) */
+    unsigned int townFact;                    /* T-1427 fold 1 (flag bit 8): 0 not carried, kPrTownFactWorld (townSid names it), kPrTownFactNowhere */
+    std::string townSid;                      /* T-1427 fold 1: the world town's game-data stringID (kPrTownFactWorld only) */
     int hasFarm;                              /* 1 = a player farm's crop is known (flag bit 6): the four values below; 0 = not known (all zero) */
     float farmGrowth, farmDeath, farmStart;   /* growth +0x518, death +0x51C, plant start +0x524 */
     int farmHarvested;                        /* plants harvested +0x528 */
@@ -181,7 +192,7 @@ struct PieceLive
     unsigned int craftFlags, craftInOn;       /* kPrCraftRepeat | kPrCraftOutOn | kPrCraftOutHas; bit i = input section i switched on */
     int craftIn, craftTotal;                  /* the input sections; the entries the bench holds (the first kPrCraftMax carried) */
     std::vector<PieceCraftEntry> craft;
-    PieceLive() : have(0), hasPower(1), on(0), gets(0), n(0), battery(0.0f), hasBar(0), state(0), bar(0.0f), hasDoors(0), nd(0), hasTown(0), town(0u),
+    PieceLive() : have(0), hasPower(1), on(0), gets(0), n(0), battery(0.0f), hasBar(0), state(0), bar(0.0f), hasDoors(0), nd(0), hasTown(0), town(0u), townFact(0u),
                   hasFarm(0), farmGrowth(0.0f), farmDeath(0.0f), farmStart(0.0f), farmHarvested(0), farmAt(0u),
                   hasCraft(0), craftFlags(0u), craftInOn(0u), craftIn(0), craftTotal(0)
     {
@@ -189,6 +200,13 @@ struct PieceLive
         for (unsigned int i = 0; i < kPrLiveMaxDoors; ++i) { doorHealth[i] = 0.0f; doorLevel[i] = 0; doorFlags[i] = 0u; }
     }
 };
+/* T-1427 fold 1: 1 = a world town's stringID as carried: 1..kPrTownSidMax bytes, none a control byte */
+inline int PrTownSidOk(const std::string& s)
+{
+    if (s.empty() || s.size() > kPrTownSidMax) return 0;
+    for (size_t i = 0; i < s.size(); ++i) { const unsigned char c = (unsigned char)s[i]; if (c < 0x20u || c == 0x7Fu) return 0; }
+    return 1;
+}
 struct PieceBody
 {
     std::string place, state;        /* a live piece: the pp.build row's PLACE and STATE bytes */
@@ -258,6 +276,8 @@ inline bool PieceLiveValid(const PieceLive& l)
     }
     if (l.hasTown != 0 && l.hasTown != 1) return false;
     if (l.hasTown != 0 ? (l.town == 0u || l.town > kPrTownIdMax) : (l.town != 0u)) return false;   /* T-1047 step 5: a known link names an outpost */
+    if (l.townFact > kPrTownFactNowhere || (l.townFact != 0u && l.hasTown != 0)) return false;   /* T-1427 fold 1: one town - an outpost OR a fact */
+    if (l.townFact == kPrTownFactWorld ? (PrTownSidOk(l.townSid) == 0) : !l.townSid.empty()) return false;
     if (l.hasFarm != 0 && l.hasFarm != 1) return false;
     if (l.hasFarm != 0)
     {   /* a known crop: every float finite and in range, plants harvested 0..kPrLiveFarmMaxHarvested */
@@ -272,7 +292,7 @@ inline void PieceLivePut(std::vector<char>* out, const PieceLive& l)
 {
     coopbrec::BrPutU32(out, (l.on != 0 ? kPrLiveFlagOn : 0u) | (l.gets != 0 ? kPrLiveFlagGets : 0u) | (l.hasBar != 0 ? kPrLiveFlagBar : 0u)
                             | (l.hasDoors != 0 ? kPrLiveFlagDoors : 0u) | (l.hasPower == 0 ? kPrLiveFlagNoPower : 0u) | (l.hasTown != 0 ? kPrLiveFlagTown : 0u)
-                            | (l.hasFarm != 0 ? kPrLiveFlagFarm : 0u) | (l.hasCraft != 0 ? kPrLiveFlagCraft : 0u));
+                            | (l.hasFarm != 0 ? kPrLiveFlagFarm : 0u) | (l.hasCraft != 0 ? kPrLiveFlagCraft : 0u) | (l.townFact != 0u ? kPrLiveFlagTownFact : 0u));
     PrPutF32(out, l.battery);
     coopbrec::BrPutU32(out, (unsigned int)l.n);
     for (int i = 0; i < l.n; ++i) PrPutF32(out, l.stock[i]);
@@ -305,6 +325,11 @@ inline void PieceLivePut(std::vector<char>* out, const PieceLive& l)
             PrPutF32(out, e.prog); coopbrec::BrPutU32(out, (unsigned int)e.mode);
         }
     }
+    if (l.townFact != 0u)
+    {   /* T-1427 fold 1: the builder's town when it is no outpost ends the part */
+        coopbrec::BrPutU32(out, l.townFact);
+        if (l.townFact == kPrTownFactWorld) { coopbrec::BrPutU32(out, (unsigned int)l.townSid.size()); out->insert(out->end(), l.townSid.begin(), l.townSid.end()); }
+    }
 }
 /* 1 = the bytes are exactly one LIVE part in range (into *out, have 1); 0 = refused, *out untouched. T-1047 step 2b: flag bit 2 adds the
    bar (f32) and the work state (i32) after the stocks; a part without it reads with the bar not known (hasBar 0); any other unknown bit,
@@ -322,9 +347,11 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
     const size_t townAt0 = ((fl & kPrLiveFlagTown) != 0) ? 4u : 0u;    /* T-1047 step 5: the outpost link */
     const size_t farmAt = ((fl & kPrLiveFlagFarm) != 0) ? 20u : 0u;    /* a player farm's crop and its clock minute, last */
     const size_t craftAt = ((fl & kPrLiveFlagCraft) != 0) ? (size_t)kPrCraftFixedBytes : 0u;   /* T-1192: a bench's craft part, last (its entries measured as read) */
-    const size_t townAt = townAt0 + farmAt + craftAt;                  /* the bytes after the doors (at least, with a craft part) */
+    const size_t factAt = ((fl & kPrLiveFlagTownFact) != 0) ? 4u : 0u; /* T-1427 fold 1: the town fact's kind, last (a world town's id measured as read) */
+    const size_t townAt = townAt0 + farmAt + craftAt + factAt;         /* the bytes after the doors (at least, with a craft part or a town fact) */
+    const int varTail = (craftAt != 0 || factAt != 0) ? 1 : 0;         /* a part whose size is known only as it is read */
     if ((fl & ~kPrLiveFlagsAll) != 0 || n > kPrLiveMaxStocks) return 0;
-    if (doorsAt == 0 ? (craftAt == 0 ? (size - at != (size_t)n * 4u + tail + townAt) : (size - at < (size_t)n * 4u + tail + townAt))
+    if (doorsAt == 0 ? (varTail == 0 ? (size - at != (size_t)n * 4u + tail + townAt) : (size - at < (size_t)n * 4u + tail + townAt))
                      : (size - at < (size_t)n * 4u + tail + doorsAt + townAt)) return 0;
     for (unsigned int i = 0; i < n; ++i) if (!coopbrec::BrGet4(p, size, &at, &l.stock[i])) return 0;
     if (tail != 0)
@@ -337,7 +364,7 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
     {   /* the doors: exactly nd x (health, lock level, flags) to the end */
         unsigned int nd = 0;
         if (!coopbrec::BrGet4(p, size, &at, &nd) || nd > kPrLiveMaxDoors) return 0;
-        if (craftAt == 0 ? (size - at != (size_t)nd * 12u + townAt) : (size - at < (size_t)nd * 12u + townAt)) return 0;
+        if (varTail == 0 ? (size - at != (size_t)nd * 12u + townAt) : (size - at < (size_t)nd * 12u + townAt)) return 0;
         for (unsigned int i = 0; i < nd; ++i)
         {
             unsigned int lv = 0;
@@ -377,6 +404,17 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
             l.craft.push_back(e);
         }
         l.hasCraft = 1; l.craftFlags = cf; l.craftIn = (int)ci; l.craftInOn = con; l.craftTotal = (int)tot;
+    }
+    if (factAt != 0)
+    {   /* T-1427 fold 1: the town fact (a kind out of range or a bad id refused here or by PieceLiveValid below) */
+        unsigned int kind = 0, len = 0;
+        if (!coopbrec::BrGet4(p, size, &at, &kind) || kind == 0u || kind > kPrTownFactNowhere) return 0;
+        if (kind == kPrTownFactWorld)
+        {
+            if (!coopbrec::BrGet4(p, size, &at, &len) || len == 0u || len > kPrTownSidMax || size - at < (size_t)len) return 0;
+            l.townSid.assign(p + at, len); at += len;
+        }
+        l.townFact = kind;
     }
     if (at != size) return 0;
     l.have = 1; l.hasPower = (fl & kPrLiveFlagNoPower) != 0 ? 0 : 1; l.on = (fl & kPrLiveFlagOn) != 0 ? 1 : 0; l.gets = (fl & kPrLiveFlagGets) != 0 ? 1 : 0; l.n = (int)n;
@@ -900,10 +938,12 @@ inline int PieceSeedDecide(int haveKept, unsigned int keptGen, int keptRemoved, 
     return removed != 0 ? 1 : 0;
 }
 /* 1 = the first look in this world at an own piece writes nothing (only its snapshot): the kept copy is the newest stored record
-   known, live, this game's, and its body is the piece's own row byte for byte */
-inline int PieceFirstLookSkip(int event, int haveKept, int keptRemoved, int keptNewest, int keptOwnerMine, int sameBody)
+   known, live, this game's, WRITTEN by this game, and its body is the piece's own row byte for byte. T-1347: a stored record another
+   game wrote (a hand-over seed, or a piece written while its owner was away) is written once by the owner even when the body is the
+   same - a helper takes its starting help number from the owner's record (the record road), and the owner becomes the writer */
+inline int PieceFirstLookSkip(int event, int haveKept, int keptRemoved, int keptNewest, int keptOwnerMine, int keptWriterMine, int sameBody)
 {
-    return (event == kPeFirst && haveKept != 0 && keptRemoved == 0 && keptNewest != 0 && keptOwnerMine != 0 && sameBody != 0) ? 1 : 0;
+    return (event == kPeFirst && haveKept != 0 && keptRemoved == 0 && keptNewest != 0 && keptOwnerMine != 0 && keptWriterMine != 0 && sameBody != 0) ? 1 : 0;
 }
 /* BUILD STOPPED: 1 = an own piece whose progress moved since its last write in this world is written - asked when its area unloads
    here (PieceStopMoment; no clock) */
@@ -1405,13 +1445,29 @@ inline void PieceOwnMakeNoMats(coopbuild::BuildMsg* st)
     for (unsigned int i = 0; i < coopbuild::kBuildMaxMats; ++i) st->mats[i] = 0.0f;
 }
 /* the state of a piece made from its record goes on the STATE road (every kind, walls included); a restore from the save keeps its own
-   write (not for walls) */
+   write - a WALL rebuilt from its build-list row takes the row's state on the STATE road too (T-1408 fold 4, F1256 check: it got no
+   progress at all; the STATE road writes a wall the wall's way - an own record's share, a group through its lead) */
 const int kMsStateRoad = 0, kMsInline = 1, kMsNone = 2;
 inline int PieceMadeStateRoad(int fromRecord, int hasState, int wall)
 {
     if (hasState == 0) return kMsNone;
-    if (fromRecord != 0) return kMsStateRoad;
-    return wall != 0 ? kMsNone : kMsInline;
+    if (fromRecord != 0 || wall != 0) return kMsStateRoad;
+    return kMsInline;
+}
+/* T-1408: an own piece's state is not written out (its pp.build row, its piece record) while a shared record NEWER than its value is still
+   to be applied over it here - the save is not the primary source (owner ruling) - and every hold ends on a real event, never 'never'.
+   linked: a world server's link with this game's slot known (no slot: nothing is applied on this link, nothing held); areaLoaded: the
+   piece's area is loaded here (its leaving ends the hold - a queued own STATE is dropped then, applied again at the next load);
+   newerQueued: a record's STATE of the piece, or of any piece of its wall group, waits on the STATE list with a stamp not below the
+   group's live stamp - it may still win (coopbuild::BuildGroupStampMayWin; its apply or drop ends the hold); areaApplied: the area's record list is complete
+   on this link (the world server's AREA_DONE names every area, those with no record too - recordfeed.h kFeedAreaDone). The owner's own
+   group step is OWED while such a record waits (coopbuild::BuildGroupStepWhat), so its new work never outruns a record still to apply.
+   A removed piece is never held (its removal mark is not asked). 1 = held */
+inline int PieceOwnRowHold(int linked, int areaLoaded, int newerQueued, int areaApplied)
+{
+    if (linked == 0 || areaLoaded == 0) return 0;
+    if (newerQueued != 0) return 1;
+    return areaApplied == 0 ? 1 : 0;
 }
 /* the first look yields only while the apply it waits for is still to come or still running (the area not applied yet, or a state,
    placement or removal of the piece queued): afterwards it books its baseline from the piece itself and writes where it differs */
@@ -1729,8 +1785,89 @@ inline void PieceTownSet(PieceLive* l, unsigned int id)
     if (l == 0) return;
     if (id == 0u || id > kPrTownIdMax) { l->hasTown = 0; l->town = 0u; return; }
     l->hasTown = 1; l->town = id;
+    l->townFact = 0u; l->townSid.clear();   /* T-1427 fold 1: an outpost replaces a town fact */
 }
 inline unsigned int PieceTownOf(const PieceLive& l) { return (l.have != 0 && l.hasTown != 0) ? l.town : 0u; }
+/* ---- T-1427 fold 1 (owner request 2026-11-18: 'the shared building record carries every important fact, town included'): THE
+   BUILDER'S TOWN, WHATEVER IT IS. The record names its town by a key every game resolves to the same town: a player outpost by the
+   world server's outpost id (bit 5, above); a world (NPC) town by its game-data stringID (bit 8, kPrTownFactWorld - fixed game data,
+   the same on every game of one world, which plays one mod list; the key decision 34 already gives a squad's home town, store.cpp
+   PlatoonTownSid; the engine's own TownList::getTownBySID 0x928330 looks a town up by it); the wilderness town 'Nowhere' as an
+   explicit kind (kPrTownFactNowhere). A town fact is written by the owner's game only while the record names no outpost (an outpost
+   link wins: T-1332's move of an own piece out of a non-player town keeps working); any other writer keeps the stored one.
+   PieceTownFact is the one form a game handles. */
+const int kPtfNone = 0, kPtfOutpost = 1, kPtfWorld = 2, kPtfNowhere = 3;
+struct PieceTownFact
+{
+    int kind;            /* kPtf* */
+    unsigned int id;     /* kPtfOutpost: the outpost id */
+    std::string sid;     /* kPtfWorld: the town's stringID */
+    PieceTownFact() : kind(kPtfNone), id(0u) {}
+};
+inline PieceTownFact PieceTownFactOf(const PieceLive& l)
+{
+    PieceTownFact f;
+    if (l.have == 0) return f;
+    if (l.hasTown != 0 && l.town != 0u) { f.kind = kPtfOutpost; f.id = l.town; return f; }
+    if (l.townFact == kPrTownFactWorld && PrTownSidOk(l.townSid) != 0) { f.kind = kPtfWorld; f.sid = l.townSid; return f; }
+    if (l.townFact == kPrTownFactNowhere) f.kind = kPtfNowhere;
+    return f;
+}
+/* T-1427 fold 2 (re-review SHOULD 2): THE ONE DECIDER FOR WHO SETS A COPY'S TOWN - the record's town wins: kTownByOutpost (it names
+   its outpost by id) or kTownByFact (the builder's world town / 'Nowhere') - the record link (TlTick) sets it and the [SHOW] link step
+   defers; kTownByShow (no record, a removal mark, or a record naming no town - an older build's): the [SHOW] link step may link it
+   into its teammate's shown outpost */
+const int kTownByShow = 0, kTownByOutpost = 1, kTownByFact = 2;
+inline int PieceTownDecider(int haveRecord, int removed, const PieceLive& l)
+{
+    if (haveRecord == 0 || removed != 0) return kTownByShow;
+    const PieceTownFact f = PieceTownFactOf(l);
+    if (f.kind == kPtfOutpost) return kTownByOutpost;
+    if (f.kind == kPtfWorld || f.kind == kPtfNowhere) return kTownByFact;
+    return kTownByShow;
+}
+/* writes fact f into a LIVE part (kPtfNone: the outpost and the fact both cleared); 0 = f is not carriable (nothing changed) */
+inline int PieceTownFactPut(PieceLive* l, const PieceTownFact& f)
+{
+    if (l == 0) return 0;
+    if (f.kind == kPtfOutpost) { if (f.id == 0u || f.id > kPrTownIdMax) return 0; PieceTownSet(l, f.id); return 1; }
+    if (f.kind == kPtfWorld && PrTownSidOk(f.sid) == 0) return 0;
+    if (f.kind != kPtfNone && f.kind != kPtfWorld && f.kind != kPtfNowhere) return 0;
+    l->hasTown = 0; l->town = 0u;
+    l->townFact = (f.kind == kPtfWorld) ? kPrTownFactWorld : (f.kind == kPtfNowhere ? kPrTownFactNowhere : 0u);
+    l->townSid = (f.kind == kPtfWorld) ? f.sid : std::string();
+    return 1;
+}
+inline int PieceTownFactSame(const PieceTownFact& a, const PieceTownFact& b)
+{
+    if (a.kind != b.kind) return 0;
+    if (a.kind == kPtfOutpost) return a.id == b.id ? 1 : 0;
+    if (a.kind == kPtfWorld) return a.sid == b.sid ? 1 : 0;
+    return 1;
+}
+inline const char* PieceTownFactWord(int kind)
+{
+    static const char* const n[] = { "not known", "an outpost", "a world town", "'Nowhere'" };
+    return (kind >= kPtfNone && kind <= kPtfNowhere) ? n[kind] : "?";
+}
+/* the owner's game, one own top-level piece: 1 = a write is marked for its town fact - this game is its writer, the record names no
+   outpost (keptLink 0: an outpost link is the ordinary mark's), the engine's town is a world town or 'Nowhere' (engine), the stored
+   record does not say so (kept) and no write of it is marked (marked). Looked at on the own-piece check's events, never a timer */
+inline int PieceTownFactMarkDue(int ownerHere, int writerHere, unsigned int keptLink, const PieceTownFact& engine, const PieceTownFact& kept,
+                                const PieceTownFact& marked)
+{
+    if (ownerHere == 0 || writerHere == 0 || keptLink != 0u) return 0;
+    if (engine.kind != kPtfWorld && engine.kind != kPtfNowhere) return 0;
+    return (PieceTownFactSame(engine, kept) == 0 && PieceTownFactSame(engine, marked) == 0) ? 1 : 0;
+}
+/* the fact a write carries when it names no outpost (link 0): on the owner's game its engine's world town or 'Nowhere' (engine, read
+   there - kPtfNone when not read or a player's town); any other writer, or nothing read, keeps the stored record's (kept) */
+inline PieceTownFact PieceTownFactWrite(int writerIsOwner, const PieceTownFact& engine, const PieceTownFact& kept)
+{
+    if (writerIsOwner != 0 && (engine.kind == kPtfWorld || engine.kind == kPtfNowhere)) return engine;
+    PieceTownFact none;
+    return (kept.kind == kPtfWorld || kept.kind == kPtfNowhere) ? kept : none;
+}
 /* the link a write carries: on the owner's game (writerIsOwner) its engine's link when its outpost id is known (engineId != 0); else -
    another writer, or an outpost whose id is not known here yet - the stored record's (keptId; 0 = not known: none carried) */
 inline unsigned int PieceTownWriteId(int writerIsOwner, unsigned int engineId, unsigned int keptId)

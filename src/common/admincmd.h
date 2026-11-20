@@ -62,7 +62,8 @@ const unsigned kMsgReservedFirst = 96, kMsgReservedLast = 103;   /* 96 and 102 s
 enum Verb { kVerbNone = 0, kVerbKick = 1, kVerbBan = 2, kVerbUnban = 3, kVerbStop = 4, kVerbMakeAdmin = 5, kVerbRemoveAdmin = 6,
             kVerbSetPassword = 7, kVerbWhere = 8, kVerbMedic = 9, kVerbHeal = 10, kVerbAddItem = 11, kVerbBring = 12, kVerbTp = 13,
             kVerbGoto = 14, kVerbSetHome = 15, kVerbHome = 16, kVerbJail = 17, kVerbRevive = 18, kVerbRestore = 19, kVerbGod = 20,
-            kVerbCount = 21 };
+            kVerbUseMyMods = 21,   /* T-247: USE MY MODS FOR THIS WORLD (GAME OPTIONS' MODS tab) - the asker's greeting list becomes the world's */
+            kVerbCount = 22 };
 const unsigned kFlagSlot = 1u;          /* target is a slot number in decimal */
 const unsigned kFlagPickPlayer = 2u;    /* target was typed as @name: a player only (admintool.h kPickPlayer) */
 const unsigned kFlagPickChar = 4u;      /* target was typed as #name: a character only; extra = the player of #name@player */
@@ -131,7 +132,8 @@ enum Rep { kRepOk = 0,              /* done: kick / ban / unban (name = who), st
            kRepNoCharSelected = 48, /* /additem: the admin's own game has no character selected (section 14) */
            kRepAskerNotInWorld = 49,/* a move or /additem: the admin's OWN game is not in the world now (name = the admin) (section 15) */
            kRepWhereNobody = 50,    /* /where for everyone: no player is in the world now (section 15) */
-           kRepCount = 51 };
+           kRepModsUnreadable = 51, /* USE MY MODS: the asker's game could not read its own mod list - the world's list is unchanged */
+           kRepCount = 52 };
 /* kRepOk for a toolbox verb: /medic, /heal and /restore name = the character healed (/restore: num = the lost limbs grown back,
    num2 = the robotic limbs left on); /additem name = the admin's lead character and num = the
    items that went in (the admin's game knows the item and the count it asked) */
@@ -180,6 +182,7 @@ inline const char* VerbName(int v)
     case kVerbRevive: return "/revive";
     case kVerbRestore: return "/restore";
     case kVerbGod: return "/god";
+    case kVerbUseMyMods: return "use-my-mods";
     default: return "unknown";
     }
 }
@@ -523,7 +526,7 @@ inline bool ReadPieceKeep(std::string* out, const char* buf, size_t got, size_t 
 static const char kTestPassword[] = "sample-admin";        /* 12 characters, made up: the test admin password (never logged) */
 static const char kTestWrongPassword[] = "sample-wrong";   /* 12 characters, made up: not the test admin password */
 static const char kTestNobody[] = "Nobody-Here";           /* a made-up name for "no player by that name" */
-enum { kTestNone = 0, kTestSetPw = 1, kTestMakeAdmin = 2, kTestRemoveAdmin = 3, kTestType = 4, kTestTypeLine = 5 };
+enum { kTestNone = 0, kTestSetPw = 1, kTestMakeAdmin = 2, kTestRemoveAdmin = 3, kTestType = 4, kTestTypeLine = 5, kTestUseMyMods = 6 };   /* 6: `admintest usemymods` (T-247) - USE MY MODS FOR THIS WORLD's YES road */
 enum { kTypeNone = 0, kTypeLoginRight = 1, kTypeLoginWrong = 2, kTypeLogout = 3, kTypeKick = 4, kTypeBan = 5, kTypeBanNobody = 6,
        kTypeUnban = 7, kTypeStop = 8 };
 /* ---- `admintest typeline <words>` (TEST-ONLY, T-1205): ANY line typed through the road a typed chat line starting with '/' takes
@@ -603,6 +606,7 @@ inline bool TestParse(const std::string& args, TestAsk* out)
     if (w.empty()) return false;
     int slot = -1;
     if (w[0] == "setpw") { if (w.size() != 2 || w[1] != "sample") return false; out->kind = kTestSetPw; return true; }
+    if (w[0] == "usemymods") { if (w.size() != 1) return false; out->kind = kTestUseMyMods; return true; }
     if (w[0] == "makeadmin" || w[0] == "removeadmin")
     {
         if (w.size() != 2 || !SlotText(w[1], &slot)) return false;

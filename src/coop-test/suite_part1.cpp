@@ -1043,10 +1043,10 @@ void t_clock_menu_pause_by_mode_site_session()
                     const int wantClose = !session ? kMenuPass : (menu && mode == kTimeModeSlowest ? kMenuSkipRestore : kMenuSkip);
                     const int wantShown = (session && !menu && mode == kTimeModeSlowest) ? kMenuSkipVote : kMenuPass;
                     const int wantHidden = (session && !menu && mode == kTimeModeSlowest) ? kMenuSkipRestore : kMenuPass;
-                    const int a = MenuPauseDecide(openSite, linked, inWorld, mode, &st);
-                    const int s = menu ? kMenuPass : MenuPauseNoteGameMenu(1, linked, inWorld, mode, &st);
-                    const int b = MenuPauseDecide(closeSite, linked, inWorld, mode, &st);
-                    const int h = menu ? kMenuPass : MenuPauseNoteGameMenu(0, linked, inWorld, mode, &st);
+                    const int a = MenuPauseDecide(openSite, linked, inWorld, mode, kMenusPauseEveryone, &st);
+                    const int s = menu ? kMenuPass : MenuPauseNoteGameMenu(1, linked, inWorld, mode, kMenusPauseEveryone, &st);
+                    const int b = MenuPauseDecide(closeSite, linked, inWorld, mode, kMenusPauseEveryone, &st);
+                    const int h = menu ? kMenuPass : MenuPauseNoteGameMenu(0, linked, inWorld, mode, kMenusPauseEveryone, &st);
                     const std::string in = std::string(" - inputs mode=") + I(mode) + " linked=" + I(linked) + " inWorld=" + I(inWorld) + " menu=" + (menu ? "build" : "game menu");
                     if (a != wantOpen) Fail(std::string("opening call answered ") + actName[a & 3] + " expected " + actName[wantOpen] + in);
                     if (s != wantShown) Fail(std::string("game menu shown answered ") + actName[s & 3] + " expected " + actName[wantShown] + in);
@@ -1057,36 +1057,36 @@ void t_clock_menu_pause_by_mode_site_session()
     /* not a menu call: always through, state untouched */
     {
         MenuPauseState st = { 1, 1, 1, 1 };
-        if (MenuPauseDecide(kMenuSiteNone, 1, 1, kTimeModeSlowest, &st) != kMenuPass || st.menuSkipped != 1 || st.buildSkipped != 1 || st.voteHeld != 1 || st.menuOpen != 1)
+        if (MenuPauseDecide(kMenuSiteNone, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuPass || st.menuSkipped != 1 || st.buildSkipped != 1 || st.voteHeld != 1 || st.menuOpen != 1)
             Fail("another caller of togglePause was affected");
-        if (MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, 0) != kMenuPass) Fail("a null state did not fall back to pass");
-        if (MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, 0) != kMenuPass) Fail("a null state: the game menu's open did not fall back to pass");
+        if (MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, 0) != kMenuPass) Fail("a null state did not fall back to pass");
+        if (MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, 0) != kMenuPass) Fail("a null state: the game menu's open did not fall back to pass");
     }
     /* opened before connecting (a real pause), closed in a session: the unpause passes and lifts it */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        if (MenuPauseDecide(kMenuSiteBuildEnter, 0, 1, kTimeModeSlowest, &st) != kMenuPass) Fail("offline build entry was not passed");
-        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, &st) != kMenuPass) Fail("pre-link build mode: its exit was skipped, leaving the game paused");
+        if (MenuPauseDecide(kMenuSiteBuildEnter, 0, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuPass) Fail("offline build entry was not passed");
+        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuPass) Fail("pre-link build mode: its exit was skipped, leaving the game paused");
     }
     /* opened in a session, link dropped before it closed: the unpause stays paired and skipped, the vote is given back */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
-        int r = MenuPauseDecide(kMenuSiteBuildLeave, 0, 0, kTimeModeSlowest, &st);
+        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        int r = MenuPauseDecide(kMenuSiteBuildLeave, 0, 0, kTimeModeSlowest, kMenusPauseEveryone, &st);
         if (r != kMenuSkipRestore) Fail(std::string("link dropped mid-build: exit answered ") + actName[r & 3] + " expected skip+restore");
-        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, &st);
-        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        r = MenuPauseDecide(kMenuSiteMenuClose, 0, 0, kTimeModeSlowest, &st);
-        const int h = MenuPauseNoteGameMenu(0, 0, 0, kTimeModeSlowest, &st);
+        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        r = MenuPauseDecide(kMenuSiteMenuClose, 0, 0, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int h = MenuPauseNoteGameMenu(0, 0, 0, kTimeModeSlowest, kMenusPauseEveryone, &st);
         if (r != kMenuSkip || h != kMenuSkipRestore)
             Fail(std::string("link dropped mid-menu: close answered ") + actName[r & 3] + " / hidden " + actName[h & 3] + " expected skip / skip+restore");
     }
     /* a stale flag (session open, no close, then single player): an offline open lowers it and its close passes */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeAdmin, &st);
-        if (MenuPauseDecide(kMenuSiteMenuOpen, 0, 1, kTimeModeAdmin, &st) != kMenuPass || st.menuSkipped != 0) Fail("stale flag: an offline open did not lower it");
-        if (MenuPauseDecide(kMenuSiteMenuClose, 0, 1, kTimeModeAdmin, &st) != kMenuPass) Fail("stale flag: an offline close was skipped, leaving single player paused");
+        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeAdmin, kMenusPauseEveryone, &st);
+        if (MenuPauseDecide(kMenuSiteMenuOpen, 0, 1, kTimeModeAdmin, kMenusPauseEveryone, &st) != kMenuPass || st.menuSkipped != 0) Fail("stale flag: an offline open did not lower it");
+        if (MenuPauseDecide(kMenuSiteMenuClose, 0, 1, kTimeModeAdmin, kMenusPauseEveryone, &st) != kMenuPass) Fail("stale flag: an offline close was skipped, leaving single player paused");
     }
     /* two menus at once under Slowest wins: one vote, given back only when the last one closes (either menu first, either order) */
     {
@@ -1098,27 +1098,27 @@ void t_clock_menu_pause_by_mode_site_session()
                 int r[6];
                 if (first == 0)
                 {
-                    r[0] = MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
-                    r[1] = MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, &st);
-                    r[2] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
+                    r[0] = MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[1] = MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[2] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
                 }
                 else
                 {
-                    r[1] = MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, &st);
-                    r[2] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-                    r[0] = MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
+                    r[1] = MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[2] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[0] = MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
                 }
                 if (order == 0)
                 {
-                    r[3] = MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, &st);
-                    r[4] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);
-                    r[5] = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, &st);
+                    r[3] = MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[4] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[5] = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
                 }
                 else
                 {
-                    r[5] = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, &st);
-                    r[3] = MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, &st);
-                    r[4] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);
+                    r[5] = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[3] = MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+                    r[4] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
                 }
                 const int votes = (r[0] == kMenuSkipVote) + (r[2] == kMenuSkipVote);
                 const int lastClose = order == 0 ? r[5] : r[4];
@@ -1133,26 +1133,26 @@ void t_clock_menu_pause_by_mode_site_session()
     /* the mode changes while a menu is open: a vote cast under Slowest wins is still given back; none cast, none given */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
-        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeAgree, &st) != kMenuSkipRestore) Fail("mode changed mid-menu: the menu's vote was not given back");
-        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeAgree, &st);
-        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, &st) != kMenuSkip) Fail("mode changed mid-menu: a vote never cast was given back");
-        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        if (MenuPauseNoteGameMenu(0, 1, 1, kTimeModeAdmin, &st) != kMenuSkipRestore) Fail("mode changed mid-menu: the game menu's vote was not given back");
-        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeAgree, &st);
-        if (MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st) != kMenuPass) Fail("mode changed mid-menu: a game menu vote never cast was given back");
+        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeAgree, kMenusPauseEveryone, &st) != kMenuSkipRestore) Fail("mode changed mid-menu: the menu's vote was not given back");
+        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeAgree, kMenusPauseEveryone, &st);
+        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuSkip) Fail("mode changed mid-menu: a vote never cast was given back");
+        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        if (MenuPauseNoteGameMenu(0, 1, 1, kTimeModeAdmin, kMenusPauseEveryone, &st) != kMenuSkipRestore) Fail("mode changed mid-menu: the game menu's vote was not given back");
+        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeAgree, kMenusPauseEveryone, &st);
+        if (MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuPass) Fail("mode changed mid-menu: a game menu vote never cast was given back");
     }
     /* a press while a menu's vote stands: the close skips but gives nothing back; a later open under Slowest votes again */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
+        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         MenuPauseNotePress(&st);
-        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, &st);
-        if (MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st) != kMenuSkipVote) Fail("after a press, a further menu did not vote");
-        MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, &st);
+        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        if (MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuSkipVote) Fail("after a press, a further menu did not vote");
+        MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         MenuPauseNotePress(&st);
-        if (MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st) != kMenuPass) Fail("a press with the game menu open was undone by the menu closing");
-        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, &st) != kMenuSkip) Fail("a press with a menu open was undone by build mode closing");
+        if (MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuPass) Fail("a press with the game menu open was undone by the menu closing");
+        if (MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st) != kMenuSkip) Fail("a press with a menu open was undone by build mode closing");
     }
 }
 
@@ -1167,38 +1167,38 @@ void t_clock_menu_pause_world_close_clears_marks()
     /* the world closed with a menu open: its vote went with it and every mark is down */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, &st);
-        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
+        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         MenuPauseNoteWorldClosed(&st);
         if (st.menuSkipped != 0 || st.buildSkipped != 0 || st.voteHeld != 0 || st.menuOpen != 0)
             Fail("world closed: a mark outlived it - menuSkipped=" + I(st.menuSkipped) + " buildSkipped=" + I(st.buildSkipped) + " voteHeld=" + I(st.voteHeld) + " menuOpen=" + I(st.menuOpen));
-        const int r = MenuPauseDecide(kMenuSiteMenuClose, 1, 0, kTimeModeSlowest, &st);
-        const int h = MenuPauseNoteGameMenu(0, 1, 0, kTimeModeSlowest, &st);
+        const int r = MenuPauseDecide(kMenuSiteMenuClose, 1, 0, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int h = MenuPauseNoteGameMenu(0, 1, 0, kTimeModeSlowest, kMenusPauseEveryone, &st);
         if (r != kMenuPass || h != kMenuPass)
             Fail(std::string("world closed mid-menu: a later hide answered ") + actName[r & 3] + " / " + actName[h & 3] + " expected pass / pass (nothing owed)");
     }
     /* leftover game menu mark, world closed, next session: build mode under Slowest wins casts and gives back its vote */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, &st);
-        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
+        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         MenuPauseNoteWorldClosed(&st);
-        const int a = MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
-        const int b = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, &st);
+        const int a = MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int b = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         if (a != kMenuSkipVote || b != kMenuSkipRestore)
             Fail(std::string("next session after a world close: build entry ") + actName[a & 3] + ", exit " + actName[b & 3] + " expected skip+vote, skip+restore (everyone left paused)");
     }
     /* leftover game menu mark, world closed, single player: the menu's hide (after a load, or during setup) unpauses as Kenshi does */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeAgree, &st);
+        MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeAgree, kMenusPauseEveryone, &st);
         MenuPauseNoteWorldClosed(&st);
-        const int r = MenuPauseDecide(kMenuSiteMenuClose, 0, 1, kTimeModeAgree, &st);
+        const int r = MenuPauseDecide(kMenuSiteMenuClose, 0, 1, kTimeModeAgree, kMenusPauseEveryone, &st);
         if (r != kMenuPass) Fail(std::string("single player after a world close: the hide's unpause answered ") + actName[r & 3] + " expected pass (left paused)");
-        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeAgree, &st);
+        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeAgree, kMenusPauseEveryone, &st);
         MenuPauseNoteWorldClosed(&st);
-        if (MenuPauseDecide(kMenuSiteBuildLeave, 0, 1, kTimeModeAgree, &st) != kMenuPass) Fail("single player after a world close: build mode's exit unpause was skipped");
+        if (MenuPauseDecide(kMenuSiteBuildLeave, 0, 1, kTimeModeAgree, kMenusPauseEveryone, &st) != kMenuPass) Fail("single player after a world close: build mode's exit unpause was skipped");
     }
     MenuPauseNoteWorldClosed(0);   /* a null state is a no-op, not a crash */
 }
@@ -1216,8 +1216,8 @@ void t_clock_menu_pause_game_menu_follows_state()
     /* opened while already paused: no togglePause call at all, yet a vote, and closing gives it back */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        const int s = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        const int h = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);
+        const int s = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int h = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         if (s != kMenuSkipVote || h != kMenuSkipRestore)
             Fail(std::string("opened over a paused world: shown ") + actName[s & 3] + ", hidden " + actName[h & 3] + " expected skip+vote, skip+restore");
         if (st.voteHeld != 0 || st.menuOpen != 0 || st.menuSkipped != 0) Fail("opened over a paused world: state not back to rest");
@@ -1226,12 +1226,12 @@ void t_clock_menu_pause_game_menu_follows_state()
     {
         MenuPauseState st = { 0, 0, 0, 0 };
         int r[6];
-        r[0] = MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, &st);
-        r[1] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        r[2] = MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, &st);
-        r[3] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);
-        r[4] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);   /* reopened: the pause byte still set, so no call */
-        r[5] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);   /* its hide makes no call either */
+        r[0] = MenuPauseDecide(kMenuSiteMenuOpen, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        r[1] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        r[2] = MenuPauseDecide(kMenuSiteMenuClose, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        r[3] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        r[4] = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);   /* reopened: the pause byte still set, so no call */
+        r[5] = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);   /* its hide makes no call either */
         const int want[6] = { kMenuSkip, kMenuSkipVote, kMenuSkip, kMenuSkipRestore, kMenuSkipVote, kMenuSkipRestore };
         int k;
         for (k = 0; k < 6; ++k)
@@ -1241,10 +1241,10 @@ void t_clock_menu_pause_game_menu_follows_state()
     /* a show that leaves the menu open again (shown twice) votes once; one close gives it back */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        const int a = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        const int b = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        const int c = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);
-        const int d = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);
+        const int a = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int b = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int c = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int d = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         if (a != kMenuSkipVote || b != kMenuPass || c != kMenuSkipRestore || d != kMenuPass)
             Fail(std::string("shown twice: ") + actName[a & 3] + ", " + actName[b & 3] + ", " + actName[c & 3] + ", " + actName[d & 3] + " expected skip+vote, pass, skip+restore, pass");
     }
@@ -1257,8 +1257,8 @@ void t_clock_menu_pause_game_menu_follows_state()
                 {
                     if (mode == kTimeModeSlowest && linked && inWorld) continue;
                     MenuPauseState st = { 0, 0, 0, 0 };
-                    const int s = MenuPauseNoteGameMenu(1, linked, inWorld, mode, &st);
-                    const int h = MenuPauseNoteGameMenu(0, linked, inWorld, mode, &st);
+                    const int s = MenuPauseNoteGameMenu(1, linked, inWorld, mode, kMenusPauseEveryone, &st);
+                    const int h = MenuPauseNoteGameMenu(0, linked, inWorld, mode, kMenusPauseEveryone, &st);
                     if (s != kMenuPass || h != kMenuPass || st.voteHeld != 0)
                         Fail(std::string("no vote expected: shown ") + actName[s & 3] + ", hidden " + actName[h & 3] + " - inputs mode=" + I(mode) + " linked=" + I(linked) + " inWorld=" + I(inWorld));
                 }
@@ -1266,10 +1266,10 @@ void t_clock_menu_pause_game_menu_follows_state()
     /* build mode holds the vote: the game menu opening over it neither casts a second vote nor gives it back on closing */
     {
         MenuPauseState st = { 0, 0, 0, 0 };
-        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, &st);
-        const int s = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, &st);
-        const int h = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, &st);
-        const int l = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, &st);
+        MenuPauseDecide(kMenuSiteBuildEnter, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int s = MenuPauseNoteGameMenu(1, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int h = MenuPauseNoteGameMenu(0, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
+        const int l = MenuPauseDecide(kMenuSiteBuildLeave, 1, 1, kTimeModeSlowest, kMenusPauseEveryone, &st);
         if (s != kMenuPass || h != kMenuPass || l != kMenuSkipRestore)
             Fail(std::string("game menu over build mode: shown ") + actName[s & 3] + ", hidden " + actName[h & 3] + ", build exit " + actName[l & 3] + " expected pass, pass, skip+restore");
     }
@@ -4457,7 +4457,7 @@ void t_panel_notebook_and_give_up_sentences_name_their_numbers()
     if (coopui::PanelRefusalText(coopstore::kRefuseProtocol, "").find("different version") == std::string::npos)
         Fail("mp1: the version refusal lost its words");
     if (coopui::PanelRefusalText(coopstore::kRefuseMods, "MODS SENTENCE") != "MODS SENTENCE"
-     || coopui::PanelRefusalText(coopstore::kRefuseMods, "").find("Mod mismatch") != 0)
+     || coopui::PanelRefusalText(coopstore::kRefuseMods, "").find("This world only accepts players whose mods match the world's") != 0)
         Fail("mp1: the mods refusal does not carry store.cpp's sentence, or has no fallback");
     /* words1 (owner wording audit 2026-09-27): the game is MULTIPLAYER - no refusal says co-op or "your friend". */
     {
@@ -4481,7 +4481,7 @@ void t_panel_notebook_and_give_up_sentences_name_their_numbers()
         || coopui::NoticeTitle("You could not join this world: the host is full.") != "CAN'T JOIN"
         || coopui::NoticeTitle("Mod mismatch: extra coop-test-salt. Use the same mods as the host, in the same order, then restart Kenshi and join again.") != "MOD MISMATCH"
         || coopui::NoticeTitle("Mod mismatch: extra Beta. Use the same mod list as the host, then restart Kenshi.") != "MOD MISMATCH"   /* words1b: the start alone */
-        || coopui::NoticeTitle(coopui::PanelRefusalText(coopstore::kRefuseMods, "")) != "MOD MISMATCH"
+        || coopui::NoticeTitle(coopui::PanelRefusalText(coopstore::kRefuseMods, "")) != "MODS DON'T MATCH"   /* T-247: the Rejected box's title (the approved page, version 3 section 4) */
         || coopui::NoticeTitle(coopui::PanelRefusalText(1, "")) != "CAN'T JOIN" || coopui::NoticeTitle(coopui::PanelRefusalText(100, "")) != "CAN'T JOIN"
         || coopui::NoticeTitle("The Multiplayer screen could not be opened.") != "MULTIPLAYER" || coopui::NoticeTitle("") != "MULTIPLAYER")
         Fail("ui1: the title-screen error box's title");
@@ -5193,6 +5193,88 @@ void t_rk1_addr_uses_all_call_only()
     if (AddrUsesAllCallOnly(lastStrict, 2) != 0) Fail("S2: a strict last registration did not make the row strict");
     if (AddrUsesAllCallOnly(odd, 2) != 0) Fail("S2: an unknown use value was taken as call-only");
     if (AddrUsesAllCallOnly(allCall, 0) != 0 || AddrUsesAllCallOnly(0, 3) != 0) Fail("S2: no registrations at all was taken as call-only");
+}
+
+/* T-1447 (F1476 design A, re-check fold 2): src/common/addrhooked.h AddrForeignVerdict - another mod's jump is accepted
+   only at the start of a game function (.pdata) for a row this mod does more than call, only when the jump leaves the game's
+   image, and only for E9 / FF 25 rip-relative with the rest matching. The player's GdcLoad bytes (evidence/
+   report-20261119-rekenshi, Steam 1.0.65 rva 0x6C0800). Then the jump walk that names the module, and the file-name part. */
+void t_t1447_addr_hook_chain()
+{
+    using namespace coopaddr;
+    unsigned char want[16], got[16];
+    int why = -1;
+    Rk1Hex("488BC45556574154415541564157488D", want, 16);
+    Rk1Hex("E94B0193FF574154415541564157488D", got, 16);
+    const unsigned char gdc[2] = { kHookUseCallOnly, 0 };   /* store.cpp:702 called, :728 hooked */
+    const unsigned char callOnly[2] = { kHookUseCallOnly, kHookUseCallOnly };
+    if (AddrUsesCombined(gdc, 2) != 2) Fail("T-1447: a hooked row's set is not use 2");
+    if (AddrUsesCombined(callOnly, 2) != 1) Fail("T-1447: an all call-only set is not use 1");
+    if (AddrUsesCombined(gdc, 0) != 0 || AddrUsesCombined(0, 2) != 0) Fail("T-1447: no registrations at all was not use 0");
+    if (AddrUsesAllCallOnly(gdc, 2) != 0) Fail("T-1447: a hooked row was taken as call-only (AddHook would refuse our own hook)");
+    /* a hooked row at a game function's start, the jump out of the image: accepted */
+    if (AddrForeignVerdict(want, got, 16, 1, 2, 1, 1, &why) != kHookAccepted || why != kWhyAccepted)
+        Fail("T-1447: the player's GdcLoad jump at a function start was not accepted");
+    /* the same bytes at a PATCH SITE (no .pdata entry: inside a function): refused */
+    if (AddrForeignVerdict(want, got, 16, 1, 2, 0, 1, &why) != kHookRefuse || why != kWhyNotFunction)
+        Fail("T-1447: a jump over a patch site (not a function start) was accepted");
+    /* a call-only row: accepted without the function table, as before */
+    if (AddrForeignVerdict(want, got, 16, 1, 1, 0, 1, &why) != kHookAccepted) Fail("T-1447: a call-only row's jump is no longer accepted");
+    /* no declared use, read away from the entry, a jump that stays inside the game's image: refused */
+    if (AddrForeignVerdict(want, got, 16, 1, 0, 1, 1, &why) != kHookRefuse || why != kWhyNoUse) Fail("T-1447: a row with no registration was accepted");
+    if (AddrForeignVerdict(want, got, 16, 0, 2, 1, 1, &why) != kHookRefuse || why != kWhyNotEntry) Fail("T-1447: a row read away from its start was accepted");
+    if (AddrForeignVerdict(want, got, 16, 1, 2, 1, 0, &why) != kHookRefuse || why != kWhyInImage) Fail("T-1447: a jump inside the game's image was accepted");
+    /* the rest differs: refused */
+    Rk1Hex("E94B0193FF574154415541564157488E", got, 16);
+    if (AddrForeignVerdict(want, got, 16, 1, 2, 1, 1, &why) != kHookRefuse || why != kWhyRestDiffers) Fail("T-1447: a hooked row whose rest differs was accepted");
+    Rk1Hex("E94B0193FF584154415541564157488D", got, 16);
+    if (AddrForeignVerdict(want, got, 16, 1, 2, 1, 1, &why) != kHookRefuse) Fail("T-1447: a hooked row whose byte 5 differs was accepted");
+    /* FF 25 rip-relative (6 bytes) with the rest matching: accepted; FF 25 00000000 + address (14 bytes): refused, too long */
+    Rk1Hex("488BC45556574154415541564157488D", want, 16);
+    {
+        unsigned char w2[16], g2[16];
+        Rk1Hex("488BC45556574154415541564157488D", w2, 16);
+        Rk1Hex("FF251234567841544155415641574800", g2, 16);
+        g2[15] = w2[15];
+        for (int i = 6; i < 15; ++i) g2[i] = w2[i];
+        if (AddrForeignJumpLen(g2, 16) != 6) Fail("T-1447: FF 25 rip-relative is not 6 bytes");
+        if (AddrForeignVerdict(w2, g2, 16, 1, 2, 1, 1, &why) != kHookAccepted) Fail("T-1447: FF 25 rip-relative with the rest matching was not accepted");
+        Rk1Hex("FF2500000000008000000100000041", g2, 15);
+        g2[15] = w2[15];
+        if (AddrForeignJumpLen(g2, 16) != 14) Fail("T-1447: FF 25 00000000 is not 14 bytes");
+        if (AddrForeignVerdict(w2, g2, 16, 1, 2, 1, 1, &why) != kHookRefuse || why != kWhyLongJump) Fail("T-1447: the 14-byte FF 25 form was accepted");
+        Rk1Hex("EB0E5556574154415541564157488D00", g2, 16);
+        if (AddrForeignVerdict(w2, g2, 16, 1, 2, 1, 1, &why) != kHookRefuse || why != kWhyNoJump) Fail("T-1447: an EB jump was accepted");
+        Rk1Hex("E9000000004889742410574883EC2049", w2, 16);
+        Rk1Hex("E9111111114889742410574883EC2049", g2, 16);
+        if (AddrForeignVerdict(w2, g2, 16, 1, 2, 1, 1, &why) != kHookRefuse || why != kWhyExpectedJump) Fail("T-1447: a jump-started function with a changed jump was accepted");
+    }
+    if (AddrForeignVerdict(want, want, 16, 1, 2, 0, 0, &why) != kHookExact) Fail("T-1447: matching bytes are not exact");
+    if (std::string(AddrWhyText(kWhyNotFunction)).find("function") == std::string::npos) Fail("T-1447: the reason text is missing");
+
+    /* the walk: the player's jump at 0x1406C0800 lands 0x10 into a 64-byte slot below the image (multihook's relay) */
+    unsigned long long d = 0;
+    Rk1Hex("E94B0193FF574154415541564157488D", got, 16);
+    if (AddrJumpDest(got, 5, 0x1406C0800ull, &d) != 1 || d != 0x13FFF0950ull) Fail("T-1447: the E9 destination is wrong: " + I((int)(d & 0x7FFFFFFF)));
+    unsigned char relay[14];
+    Rk1Hex("FF25000000000080FA7FF87F0000", relay, 14);   /* FF 25 00000000 + 0x7FF87FFA8000 */
+    if (AddrJumpDest(relay, 14, d, &d) != 1 || d != 0x7FF87FFA8000ull) Fail("T-1447: the relay's 14-byte jump was not followed");
+    if (AddrJumpDest(relay, 13, 0x1000ull, &d) != 0) Fail("T-1447: a cut 14-byte jump was followed");
+    Rk1Hex("FF2510000000", relay, 6);   /* jmp [rip+0x10]: the pointer's address */
+    if (AddrJumpDest(relay, 6, 0x2000ull, &d) != 2 || d != 0x2016ull) Fail("T-1447: FF 25 [rip+d] did not give the pointer's address");
+    Rk1Hex("48B80080FA7FF87F0000FFE0", relay, 12);   /* mov rax, imm64; jmp rax */
+    if (AddrJumpDest(relay, 12, 0x3000ull, &d) != 1 || d != 0x7FF87FFA8000ull) Fail("T-1447: mov rax / jmp rax was not followed");
+    Rk1Hex("E9FBFFFFFF", relay, 5);   /* a jump to itself: -5 */
+    if (AddrJumpDest(relay, 5, 0x5000ull, &d) != 1 || d != 0x5000ull) Fail("T-1447: a backward E9 was decoded wrongly");
+    Rk1Hex("488BC45556", relay, 5);
+    if (AddrJumpDest(relay, 5, 0x5000ull, &d) != 0) Fail("T-1447: a function's own first bytes were taken for a jump");
+    if (AddrJumpDest(relay, 4, 0x5000ull, &d) != 0 || AddrJumpDest(0, 5, 0x5000ull, &d) != 0) Fail("T-1447: too few bytes were decoded");
+    /* the log names a file, never a folder */
+    if (std::string(AddrFileNamePart("C:\\Users\\someone\\Kenshi\\SharedWastelandsLoader.dll")) != "SharedWastelandsLoader.dll")
+        Fail("T-1447: the file name was not cut from a backslash path");
+    if (std::string(AddrFileNamePart("a/b/other.dll")) != "other.dll") Fail("T-1447: the file name was not cut from a slash path");
+    if (std::string(AddrFileNamePart("plain.dll")) != "plain.dll" || std::string(AddrFileNamePart(0)) != "")
+        Fail("T-1447: a bare name or no name was changed");
 }
 
 void t_addr_signatures_resolve_every_kind_and_refuse_anything_less()

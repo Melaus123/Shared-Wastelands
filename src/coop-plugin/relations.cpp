@@ -22,6 +22,7 @@
 #include "../common/ownrec.h"   /* mmo3: the pp.faction record */
 #include "../common/slotwire.h"   /* stand1: @slot:<n> wire names */
 #include "../common/worldrelwire.h"   /* par24: the notebook's world-vs-world table (WORLD_REL) */
+#include "../common/saverel.h"   /* T-1383 (F1069): the creator's save standings - the merge rule and the walk line's tail */
 #include "../common/crimewire.h"   /* MSG_CRIME kind 2: standing events against another player */
 #include "../common/relside.h"   /* the entry a changer wrote: on the player faction's relations, the other faction's side */
 #include "net/session.h"
@@ -722,6 +723,7 @@ void WorldRelTick()
         }
     }
 }
+std::string g_wrMoves; long long g_wrMovesN = 0, g_wrMovesAll = 0; int g_wrSeedMoveLines = 0;   /* T-1383: see WorldRelApplyRow's bulk branch */
 /* 1 written, 0 already the same, -1 unresolved here, -2 fault. K2 safe point (worker paused). */
 int WorldRelApplyRow(const std::string& key, const coopwrel::Row& r, bool bulk)   /* bulk: the whole table or a seed row - counted, not logged per row; the 20 lines are for another game's engine CHANGEs */
 {
@@ -737,6 +739,11 @@ int WorldRelApplyRow(const std::string& key, const coopwrel::Row& r, bool bulk) 
     g_applying = true; const int w = WriteEntry(rel, fb, e); g_applying = false;
     if (w != 1) return -2;
     g_wrLastApplied = a + "->" + b + "=" + S(r.relation);
+    if (bulk)
+    {   /* T-1383: the first rows a table / seed write MOVED here, for that write's own line (the run reads a named pair) */
+        ++g_wrMovesAll;
+        if (g_wrMovesN < 12) { ++g_wrMovesN; g_wrMoves += std::string(g_wrMoves.empty() ? "" : " ") + a + "->" + b + " " + (rd == 1 ? S(cur.relation) : std::string("n/a")) + "->" + S(r.relation); }
+    }
     if (!bulk && g_wrAppliedLines < 20)
     {
         ++g_wrAppliedLines;
@@ -789,13 +796,20 @@ int WalkCheckPod(void* rel, ::Faction* key, char* val, Entry* e)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
-/* K2 safe point: every world pair THIS game's save holds and the notebook's table lacks becomes a SEED row */
+/* K2 safe point: every world pair THIS game's save holds and the notebook's table lacks becomes a SEED row.
+   T-1383 (F1069; saverel.h's design compare, A): in the world the creator's import with "bring relations" made, a pair the SAVE
+   holds is offered with the save's relation / trust / trustNeg (this game's flags kept - saverel::FromSave) and written here
+   too (the notebook sends a taken seed to the OTHER games only), and a save pair this game's maps lack is offered when both
+   factions resolve here as a world pair; every other pair keeps today's value. */
 void WorldRelSeedWalk()
 {
     ++g_wrSeedWalks;
     g_wrSeedOut.clear();
     void** arr = 0; unsigned n = 0;
     g_wrSeedEndSent = false;
+    const std::map<std::string, coopwrel::Row>* sv = 0; long long svPairs = 0;
+    const int svUse = coop::StoreCreatorSaveRelations(&sv, &svPairs);
+    saverel::WalkSave ws; std::set<std::string> svMet; std::string svMoves;
     if (!ReadFactionArrayPod(&arr, &n) || !Plaus(arr) || n > 4096) { ++g_wrWalkFaults; g_wrSeedState = 1; DebugLog("[WREL] seed walk: no faction list - nothing offered (the walk's end still goes up, S2-62)"); return; }
     std::set<void*> known;
     for (unsigned i = 0; i < n; ++i) if (Plaus(arr[i])) known.insert(arr[i]);
@@ -824,17 +838,54 @@ void WorldRelSeedWalk()
             if (WalkCheckPod(rel, o, vals[k], &e) != 1) { ++g_wrWalkFaults; continue; }
             ++held;
             const std::string key = coopwrel::Key(a, b);
+            if (sv != 0) svMet.insert(key);
             if (g_wr.count(key)) { ++inTable; continue; }
             coopwrel::WireRow w; w.a = a; w.b = b; w.row.relation = e.relation; w.row.trust = e.trust; w.row.trustNeg = e.trustNeg; w.row.flags = e.flags & 3u;
+            if (sv != 0 && saverel::FromSave(*sv, a, b, &w.row))   /* T-1383: the save's own value */
+            {
+                if (!coopwrel::RowOk(w.a, w.b, w.row)) continue;
+                ++ws.fromSave;
+                if (w.row.relation != e.relation || w.row.trust != e.trust || w.row.trustNeg != e.trustNeg)
+                {
+                    Entry se; se.relation = w.row.relation; se.trust = w.row.trust; se.trustNeg = w.row.trustNeg; se.flags = e.flags;
+                    g_applying = true; const int wrc = WriteEntry(rel, o, se); g_applying = false;
+                    if (wrc == 1) { ++ws.written; if (ws.written <= 12) svMoves += std::string(svMoves.empty() ? "" : " ") + a + "->" + b + " " + S(e.relation) + "->" + S(se.relation); }
+                    else ++g_wrApplyFaults;
+                }
+            }
             if (!coopwrel::RowOk(w.a, w.b, w.row)) continue;
             if (g_wrSeedOut.size() >= (size_t)coopwrel::kWrMaxTable) break;
             g_wrSeedOut.push_back(w); ++offered;
         }
     }
+    if (sv != 0)
+    {   /* T-1383: the save's pairs this game's maps lack - offered (and written here) when both sides resolve here as a world pair */
+        const std::vector<std::string> rest = saverel::NotMet(*sv, svMet);
+        for (size_t i = 0; i < rest.size(); ++i)
+        {
+            ++ws.notMet;
+            std::string a, b;
+            if (!coopwrel::SplitKey(rest[i], &a, &b) || !WorldSidOk(a, b) || g_wr.count(rest[i])) { ++ws.unresolved; continue; }
+            ::Faction* fa = coop::GameWorldPtr()->factionDirectory->findFactionById(a); ::Faction* fb = coop::GameWorldPtr()->factionDirectory->findFactionById(b);
+            if (!Plaus(fa) || !Plaus(fb) || fa == fb || coop::IsPlayerFaction(fa) || coop::IsPeerFaction(fa) || !WorldPair(fa, fb)) { ++ws.unresolved; continue; }
+            void* rel = RelationsOfPod(fa);
+            if (!Plaus(rel)) { ++ws.unresolved; continue; }
+            coopwrel::WireRow w; w.a = a; w.b = b;
+            if (!saverel::FromSave(*sv, a, b, &w.row) || !coopwrel::RowOk(w.a, w.b, w.row)) { ++ws.unresolved; continue; }
+            if (g_wrSeedOut.size() >= (size_t)coopwrel::kWrMaxTable) break;
+            Entry se; se.relation = w.row.relation; se.trust = w.row.trust; se.trustNeg = w.row.trustNeg; se.flags = 0;
+            g_applying = true; const int wrc = WriteEntry(rel, fb, se); g_applying = false;   /* the engine's getData makes the entry, as a table row's write does */
+            if (wrc != 1) { ++g_wrApplyFaults; ++ws.unresolved; continue; }
+            ++ws.written;
+            g_wrSeedOut.push_back(w); ++offered; ++ws.notMetOffered;
+        }
+    }
     g_wrSeedHeldHere = held; g_wrSeedKnown = inTable; g_wrSeedOffered += offered;
     g_wrSeedState = 1;
     DebugLog("[WREL] seed walk: factions=" + S(factions) + " worldPairsHeldHere=" + S(held) + " alreadyInTable=" + S(inTable) + " offered=" + S(offered)
-             + " walkFaults=" + S(g_wrWalkFaults) + " (the engine's own relation maps, read only; the notebook keeps the first offer of each pair)");
+             + " walkFaults=" + S(g_wrWalkFaults) + " (the engine's own relation maps, read only; the notebook keeps the first offer of each pair)"
+             + (svUse < 0 ? std::string(" fromSave=0 (the creator's import with relations, but its save could not be read)") : saverel::WalkTail(sv != 0, svPairs, ws))
+             + (sv != 0 ? " savedMoved[first 12]=" + svMoves : std::string()));
 }
 }
 
@@ -1988,11 +2039,13 @@ void WorldRelSafePointDrain()
     if (g_wrApplyAll)
     {
         long long a0 = g_wrApplied, s0 = g_wrSame, u0 = g_wrUnresolved, f0 = g_wrApplyFaults;
+        g_wrMoves.clear(); g_wrMovesN = 0; g_wrMovesAll = 0;
         for (coopwrel::Table::const_iterator it = g_wr.begin(); it != g_wr.end(); ++it) WorldRelCountApply(WorldRelApplyRow(it->first, it->second, true));
         g_wrPending.clear(); g_wrPendingChange.clear(); g_wrApplyAll = false; g_wrTableApplied = true; ++g_wrTableApplies;
         DebugLog("[WREL] table applied: rows=" + S((long long)g_wr.size()) + " written=" + S(g_wrApplied - a0) + " same=" + S(g_wrSame - s0)
                  + " unresolved=" + S(g_wrUnresolved - u0) + " faults=" + S(g_wrApplyFaults - f0)
-                 + " (the notebook's world-vs-world standings over this save's; engine changes to world pairs go to the notebook from now on)");
+                 + " (the notebook's world-vs-world standings over this save's; engine changes to world pairs go to the notebook from now on)"
+                 + " moved[first " + S(g_wrMovesN) + " of " + S(g_wrMovesAll) + "]=" + g_wrMoves);
     }
     else if (!g_wrPending.empty())
     {
@@ -2000,6 +2053,7 @@ void WorldRelSafePointDrain()
            last send the notebook has not answered, is older than this game's value: it stays pending, and is written once
            the echo of the last send is back (g_wr then holds the notebook's latest row for it) */
         WorldRelTakeOffQueue();
+        g_wrMoves.clear(); g_wrMovesN = 0; g_wrMovesAll = 0;
         std::set<std::string> keep, keepChange;
         for (std::set<std::string>::const_iterator it = g_wrPending.begin(); it != g_wrPending.end(); ++it)
         {
@@ -2007,6 +2061,11 @@ void WorldRelSafePointDrain()
             coopwrel::Table::const_iterator r = g_wr.find(*it); if (r != g_wr.end()) WorldRelCountApply(WorldRelApplyRow(r->first, r->second, g_wrPendingChange.count(*it) == 0));
         }
         g_wrPending.swap(keep); g_wrPendingChange.swap(keepChange);
+        if (g_wrMovesAll > 0 && g_wrSeedMoveLines < 5)
+        {   /* T-1383: another game's seed rows (counted, not logged per row) - the first few it moved here, capped */
+            ++g_wrSeedMoveLines;
+            DebugLog("[WREL] seed rows written: moved[first " + S(g_wrMovesN) + " of " + S(g_wrMovesAll) + "]=" + g_wrMoves);
+        }
     }
     if (g_wrTableApplied && g_wrSeedState == 0) WorldRelSeedWalk();
 }

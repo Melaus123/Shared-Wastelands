@@ -145,6 +145,7 @@ inline std::string ReplyLine(const admincmd::Reply& r)
         case admincmd::kVerbMakeAdmin:    return n + " is now an admin.";
         case admincmd::kVerbRemoveAdmin:  return n + " is no longer an admin.";
         case admincmd::kVerbSetPassword:  return "The admin password is set.";
+        case admincmd::kVerbUseMyMods:    return std::string();   /* T-247: the MODS tab's line says it ("set by you") */
         case admincmd::kVerbMedic:        return n + "'s wounds are closed and the bleeding has stopped.";
         case admincmd::kVerbHeal:         return n + " is fully healed: wounds, blood, crippled limbs and hunger.";
         case admincmd::kVerbRestore:      return RestoredText(n, r.num, r.num2);
@@ -152,6 +153,7 @@ inline std::string ReplyLine(const admincmd::Reply& r)
         }
     case admincmd::kRepNotAdmin:      return "Only an admin can do that.";
     case admincmd::kRepOwnerOnly:     return "Only the owner can do that.";
+    case admincmd::kRepModsUnreadable: return "Your game could not read its own mod list, so it can't be the world's.";
     case admincmd::kRepNoSuchPlayer:  return "No player by that name.";
     case admincmd::kRepNotBanned:     return "No player by that name.";
     case admincmd::kRepManyPlayers:   return "More than one player is called " + n + ". Nothing was done.";

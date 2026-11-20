@@ -65,6 +65,7 @@ static unsigned long long kMig3AiIsEnemy = 0; static coop::AddrReg kMig3AiIsEnem
 #include "../common/pathlead.h"   // D3 (read-pathend): the path drive's lead / near-end / too-close / landed arithmetic
 #include "../common/runboost.h"   // T-189 runboost (H051): the raise decision and the boost arithmetic
 #include "../common/windowbound.h"   // T-986 (drift bound): the native combat window's distance bound
+#include "../common/windowfollow.h"   // T-1422 fix 2: the native combat window's 3D route follow step
 #include "../common/followplay.h"   // the follow drive: the owner's stamped route, the playback target, the stop rules
 #include "../common/p124stop.h"   // PROBE P124: the stop reading and the overshoot measure, swept by the offline suite
 #include "../common/getupcrawl.h"   // T-178 crawl1 (H050): MoveDrivesProne - a crawler (prone 2, not a ragdoll) is driven
@@ -496,6 +497,15 @@ struct Puppet
                                     // including prone/ragdoll - the cohort where the layers diverge (F193)
     double rcDriftSum; long long rcDriftN;   // mean drift over the window (steady state, not the transient)
     long long rcSatSteps, rcBoostedSteps;    // H028: steps capped / steps with the boosted rate, this window
+    // T-1422 fix 2 (windowfollow.h): this window's route follow - when it opened, the next [WINDOWFOLLOW] second, the last and
+    // largest height / flat gaps to the replayed target, frames with no route (the newest report aimed at instead)
+    double wfOpenAt, wfLineAt; float wfDY, wfDXZ, wfMaxDY, wfMaxDXZ; long long wfNoRoute;
+    bool wfBehind;                  // fix 2b: the window aim is behind schedule (windowfollow::RouteTarget, as FollowFrame's fBehind)
+    bool wfWalk; double wfWalkAt; int wfWalks;   // fix 2b: walking back to its owner's floor by the route finder; since; walks this window
+    float wfGoalX, wfGoalY, wfGoalZ;   // fix 2c / 2d: the walk's published goal (moved on another floor band or 2 x reach flat)
+    bool wfFailBlock; float wfFailY;   // fix 2d: a walk ended on 'route failed' at owner height wfFailY: none starts until the band changes
+    bool wfNoSlotSaid;              // fix 2d: the no-fight-object line was written for this window
+    long long wfAfterPlaces;        // fix 2e: the ordinary drive's placements of this copy after it had a window (information)
     float authDesired;              // F419: the authority's commanded desiredSpeed (gait intent). -1 = unknown; 0 is a real level
     float authDesiredApplied;       // review 4 item 10: the level last written to a STOPPED puppet (-2 = never)
     // H019 / M-C - the authority's current goal for this puppet, as last received. type 0 = the authority has
@@ -1166,6 +1176,238 @@ static bool SafeCallSetPos(MvSetPosFn fn, CharMovement* mv, const Ogre::Vector3*
     __try { fn(mv, *np); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
+}
+
+// T-1422 fix 3 (F1447, design A): THE WINDOW STEP KEEPS THE COPY ON ITS OWN FLOOR. The setter (0x65DDE0, build/decomp_65dde0.txt)
+// writes movement +0xC4 / +0xC8 and, when the movement has a physics body (+0x320), re-places it with 0x145E10(body, pos, key -1)
+// (decomp_145e10: body +0x14 = key, then 0x3A1F70(*NavMeshManagerPtr, body +0x20, body +0x14, 500)); with key -1 that searches the
+// whole walking map along a vertical line and can take the floor above (decomp_3a1f70 / decomp_cf2cf0: a valid key is tried on its
+// own piece first, 'Stfull' searches everything). So each step: (1) the walking map's nearest point to the step's point, at the step's
+// own height, by its closest-point query 0x3A2E60 (radius 1000, door filter, the character's size as the engine passes it - so the
+// point is pulled in from the map's edge - setDestination's first try, decomp_6607e0:120-134, decomp_65e6d0:243); (2) the setter with that point (its writes and its area tail kept); (3) 0x145E10(body,
+// movement +0xC4, that point's key) - the point lies on that piece, so the body stays on it. Nothing found: the copy stays where it
+// is this frame (windowfollow::FloorStepDecide) - the engine's own callers likewise skip the body placement when the query finds
+// nothing (decomp_65e6d0:236-249; decomp_6607e0 first retries at radius 10000). MAIN THREAD (the window step). Counted on
+// [FLOOR] REPORT windowFollow[floor..]; a [WINFLOOR] line per sampled step, own cap.
+namespace {
+unsigned long long kWinFloorNavRva = 0;     static coop::AddrReg kWinFloorNavRva_reg("NavMeshManagerPtr", &kWinFloorNavRva, coop::kAddrUseCallOnly);   /* Steam_1.0.65 0x2133560 (var), 1.0.68 0x21345C0: a POINTER to the walking map */
+unsigned long long kWinFloorQueryRva = 0;   static coop::AddrReg kWinFloorQueryRva_reg("NavClosestFaceQuery", &kWinFloorQueryRva, coop::kAddrUseCallOnly);   /* Steam_1.0.65 0x3A2E60, 1.0.68 0x3A2FA0 */
+unsigned long long kWinFloorBodySetRva = 0; static coop::AddrReg kWinFloorBodySetRva_reg("HavokCharacterSetPosition", &kWinFloorBodySetRva, coop::kAddrUseCallOnly);   /* Steam_1.0.65 0x145E10, 1.0.68 0x145E50 */
+typedef unsigned long long (*WinFloorQueryFn)(void* nav, const float* pos, float radius, float charRadius, char doorFilter, float* outPt, int* outKey);
+typedef void (*WinFloorBodySetFn)(void* body, const float* pos, int key);
+typedef float (*WinFloorCharSizeFn)(void* chr);
+const float kWinFloorRadius = 1000.0f;   // setDestination's first radius (1.0.65 DAT_14168af28 = 1000.0, read from the exe's bytes)
+const size_t kWinFloorBodyOff = 0x320, kWinFloorBodyKeyOff = 0x14, kWinFloorBodyYOff = 0x24;
+const float kWinFloorBodyScale = 10.0f;   // the body keeps its position x 0.1 (decomp_145e10: DAT_141689318 = 0.1)
+const long long kWinFloorLineCap = 2000, kWinFloorHoldLineCap = 200;
+}
+// T-1422 fix attempt 5 (F1472 / F1473, design D; owner 1771): the engine's ground ray of a character's movement - ONE definition, read
+// by GroundRayReask below. Offsets (Read, 1.0.65 decompiles; the same reads T-1422's localization probes made on 1.0.68):
+//   movement +0x328 -> the ray handle R: R +0 'asked' (the physics thread casts and sets it 0, 0x4CCEB0:65-71), R +8 -> the main copy
+//   M, R +0x10 -> the physics thread's copy P, R +0x18 'ready' (the movement update uses M's answer only when it is set).
+//   M and P: +0x00..+0x5F the answer (+7 hit, +0x0C hit height), +0x60 start, +0x6C direction, +0x78 filter (0: no cast), +0x7C done.
+//   ask, CharMovement::update 0x65E6D0:86-101: M start = the body's position (body +0x20 x 10; no body: movement +0xC4) with y + 20
+//     (DAT_141682188), M direction -Y, M filter, M done 0, R asked 1 - then it uses M's answer if ready, with no check that the
+//     answer belongs to that start (:102-166).
+//   cast 0x4CB9D0 on P: from P's start; P done = 1 at its end. Nothing read clears P done again (0x4CAC30, the cast's own reset,
+//     leaves +0x7C; the ask clears M's done only).
+//   collect 0x4CD040:30-43 (main thread, each frame, over every ray): M start / direction / filter -> P, P's answer -> M (0x4CACF0,
+//     +0x00..+0x5F), P done -> M done, ready |= M done.
+//   teleport 0x65DEB0:11-13: ready = 0 only.
+// So after an ask the FIRST collect copies the new start to P but brings back P's answer from the cast of the OLD start and sets
+// ready again (P done stays 1) - an engine teleport's clear lasts only until that collect. The re-ask therefore also writes P's start
+// and clears P's done: ready comes back only after a cast that started after the re-ask, from the new start.
+const size_t kMvGroundRayOff = 0x328, kMvPosOff = 0xC4;
+const size_t kGrRayAskedOff = 0x00, kGrRayMainOff = 0x08, kGrRayBackOff = 0x10, kGrRayReadyOff = 0x18;
+const size_t kGrQHitOff = 0x07, kGrQHitPosOff = 0x08, kGrQStartOff = 0x60, kGrQDoneOff = 0x7C;
+const float kGrRayStartLift = 20.0f;   // the ask's start height above the body (1.0.65 DAT_141682188 = 20; T2624: start = body + ~20)
+long long g_grAsked = 0, g_grReadyCleared = 0, g_grBackDoneCleared = 0, g_grNoRay = 0, g_grFaults = 0;
+// 1 asked, 0 no ray / no position, -1 faulted. MAIN THREAD (the window step), as the engine's ask and teleport.
+static int GroundRayReaskPod(const CharMovement* mv, int* readyWas, int* backDoneWas)
+{
+    *readyWas = 0; *backDoneWas = 0;
+    __try
+    {
+        const char* m = (const char*)mv;
+        unsigned char* r = *(unsigned char* const*)(m + kMvGroundRayOff);
+        if (r == 0) return 0;
+        unsigned char* q = *(unsigned char* const*)(r + kGrRayMainOff);
+        unsigned char* p = *(unsigned char* const*)(r + kGrRayBackOff);
+        if (q == 0) return 0;
+        float s[3];
+        const char* body = *(const char* const*)(m + kWinFloorBodyOff);
+        if (body != 0)
+        {
+            s[0] = *(const float*)(body + 0x20) * kWinFloorBodyScale;
+            s[1] = *(const float*)(body + 0x24) * kWinFloorBodyScale;
+            s[2] = *(const float*)(body + 0x28) * kWinFloorBodyScale;
+        }
+        else { s[0] = *(const float*)(m + kMvPosOff); s[1] = *(const float*)(m + kMvPosOff + 4); s[2] = *(const float*)(m + kMvPosOff + 8); }
+        s[1] += kGrRayStartLift;
+        if (!Finite(s[0]) || !Finite(s[1]) || !Finite(s[2])) return 0;
+        if (p != 0)
+        {
+            float* ps = (float*)(p + kGrQStartOff); ps[0] = s[0]; ps[1] = s[1]; ps[2] = s[2];
+            // review S2: this writes the physics thread's copy outside the collect (the engine writes it only there). If that thread is
+            // casting this ray right now, its cast started from P's previous start - the previous re-ask's spot, one window step back
+            // (each under 50, F1472) - and it sets done again: the next collect then brings an answer one step old, as the engine's own
+            // lag, never one from hundreds of units back. The re-ask's asked = 1 then makes the following pass cast from this start.
+            *backDoneWas = p[kGrQDoneOff] != 0 ? 1 : 0;
+            p[kGrQDoneOff] = 0;
+        }
+        float* qs = (float*)(q + kGrQStartOff); qs[0] = s[0]; qs[1] = s[1]; qs[2] = s[2];   // direction and filter: the engine's last ask
+        q[kGrQDoneOff] = 0;
+        r[kGrRayAskedOff] = 1;
+        *readyWas = r[kGrRayReadyOff] != 0 ? 1 : 0;
+        r[kGrRayReadyOff] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+// after a window placement moved the body: the engine's own ask from the body's new spot, and its teleport's clear of ready
+static void GroundRayReask(const CharMovement* mv)
+{
+    int readyWas = 0, backDoneWas = 0;
+    const int r = GroundRayReaskPod(mv, &readyWas, &backDoneWas);
+    if (r > 0) { ++g_grAsked; if (readyWas) ++g_grReadyCleared; if (backDoneWas) ++g_grBackDoneCleared; }
+    else if (r == 0) ++g_grNoRay;
+    else ++g_grFaults;
+}
+long long g_wflPlaced = 0, g_wflPlain = 0, g_wflHeld = 0, g_wflNoMap = 0, g_wflFaults = 0, g_wflBigDy = 0, g_wflKeyKept = 0;
+long long g_wflSteps = 0, g_wflLines = 0, g_wflHoldLines = 0, g_wflBigPull = 0;
+long long g_wflBusy = 0, g_wflKeyLost = 0, g_wflNoSize = 0;   // review of 9f540218c: NIT, S1, S2
+float g_wflMaxPull = 0.0f;
+struct WinFloorStep { int haveBody, query, act, keyBefore, keyFound, keyAfter, fault; float bodyY0, bodyY1, fx, fy, fz, size; };
+// review S2: the character's size as the engine passes it to this query - decomp_65e6d0:243 and decomp_6607e0:122 (FUN_65d1a0):
+// the movement's character (+0x3A8) vtable +0x390, times movement +0x364. 0 when it cannot be read (the query then does no refine).
+static float WinFloorCharSizePod(const CharMovement* mv)
+{
+    __try
+    {
+        void* chr = *(void* const*)((const char*)mv + 0x3A8);
+        if (chr == 0 || g_rcImageBase == 0) return 0.0f;
+        const uintptr_t fn = (*(const uintptr_t* const*)chr)[0x390 / 8];
+        if (fn < g_rcImageBase || fn - g_rcImageBase >= coop::AddrTextEnd()) return 0.0f;   // the running exe's own .text only
+        const float r = ((WinFloorCharSizeFn)fn)(chr) * *(const float*)((const char*)mv + 0x364);
+        return (r == r && r > 0.0f && r < 1000.0f) ? r : 0.0f;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
+}
+// the body's height (game units) and key; 0 = no body or faulted
+static int WinFloorBodyPod(const CharMovement* mv, float* y, int* key)
+{
+    __try
+    {
+        const char* b = *(const char* const*)((const char*)mv + kWinFloorBodyOff);
+        if (b == 0) return 0;
+        *y = *(const float*)(b + kWinFloorBodyYOff) * kWinFloorBodyScale;
+        *key = *(const int*)(b + kWinFloorBodyKeyOff);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// windowfollow::kFloorQuery*: found, nothing found, no walking map / no address, busy (0xFFFFFFFF), faulted
+static int WinFloorQueryPod(const float* pos, float size, float* out, int* key)
+{
+    *key = -1; out[0] = out[1] = out[2] = 0.0f;
+    if (g_rcImageBase == 0 || kWinFloorNavRva == 0 || kWinFloorQueryRva == 0) return windowfollow::kFloorQueryNoMap;
+    __try
+    {
+        void* nav = *(void**)(g_rcImageBase + (uintptr_t)kWinFloorNavRva);
+        if (nav == 0) return windowfollow::kFloorQueryNoMap;
+        float p[3] = { pos[0], pos[1], pos[2] };
+        const unsigned long long r = ((WinFloorQueryFn)(g_rcImageBase + (uintptr_t)kWinFloorQueryRva))(nav, p, kWinFloorRadius, size, (char)1, out, key);
+        return windowfollow::FloorQueryResult((unsigned int)r);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *key = -1; return windowfollow::kFloorQueryFault; }
+}
+static bool WinFloorBodySetPod(CharMovement* mv, int key)
+{
+    if (g_rcImageBase == 0 || kWinFloorBodySetRva == 0) return false;
+    __try
+    {
+        char* m = (char*)mv;
+        void* body = *(void**)(m + kWinFloorBodyOff);
+        if (body == 0) return false;
+        ((WinFloorBodySetFn)(g_rcImageBase + (uintptr_t)kWinFloorBodySetRva))(body, (const float*)(m + 0xC4), key);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// the step: windowfollow::kFloorStepPlace / kFloorStepPlain moved the copy (setOk false = the setter faulted); kFloorStepHold left it
+enum { kWinFloorFaultNone = 0, kWinFloorFaultQuery = 1, kWinFloorFaultSetter = 2, kWinFloorFaultBody = 3 };
+static int WindowFloorSet(MvSetPosFn setter, CharMovement* mv, const Ogre::Vector3& np, WinFloorStep* o, bool* setOk)
+{
+    o->query = 0; o->keyBefore = o->keyFound = o->keyAfter = -1; o->fault = kWinFloorFaultNone;
+    o->bodyY0 = o->bodyY1 = 0.0f; o->fx = o->fy = o->fz = 0.0f; o->size = 0.0f;
+    *setOk = false;
+    o->haveBody = WinFloorBodyPod(mv, &o->bodyY0, &o->keyBefore);
+    if (o->haveBody)
+    {
+        const float q[3] = { np.x, np.y, np.z };   // the step's own height: the copy's floor (the body sits ~7-10 above it, F1447)
+        float f[3]; int key = -1;
+        o->size = WinFloorCharSizePod(mv);
+        o->query = WinFloorQueryPod(q, o->size, f, &key);
+        if (o->query == windowfollow::kFloorQueryFound) { o->fx = f[0]; o->fy = f[1]; o->fz = f[2]; o->keyFound = key; }
+        if (o->query == windowfollow::kFloorQueryFault) o->fault = kWinFloorFaultQuery;
+    }
+    o->act = windowfollow::FloorStepDecide(o->haveBody != 0, o->query, o->keyFound);
+    if (o->act == windowfollow::kFloorStepPlain) *setOk = SafeCallSetPos(setter, mv, &np);
+    else if (o->act == windowfollow::kFloorStepPlace)
+    {
+        const Ogre::Vector3 fp(o->fx, o->fy, o->fz);
+        *setOk = SafeCallSetPos(setter, mv, &fp);
+        if (!*setOk) o->fault = kWinFloorFaultSetter;
+        else if (!WinFloorBodySetPod(mv, o->keyFound)) o->fault = kWinFloorFaultBody;
+        int k = -1;
+        if (WinFloorBodyPod(mv, &o->bodyY1, &k)) o->keyAfter = k;
+    }
+    if (*setOk) GroundRayReask(mv);   // fix attempt 5 (F1473 design D): win-setter / win-keyset / win-place / win-plain all pass here
+    return o->act;
+}
+// counts, and the capped [WINFLOOR] line
+// ownerY: the owner's height at the aim (the replayed route point), so a run can judge the copy's floor against the owner's
+static void WindowFloorNote(unsigned int uid, const Ogre::Vector3& np, float ownerY, const WinFloorStep& s)
+{
+    ++g_wflSteps;
+    const bool found = s.act == windowfollow::kFloorStepPlace;
+    if (s.act == windowfollow::kFloorStepPlain) { ++g_wflPlain; return; }
+    if (s.fault != kWinFloorFaultNone) ++g_wflFaults;
+    if (s.haveBody && s.size <= 0.0f) ++g_wflNoSize;
+    const float dy = found ? s.fy - np.y : 0.0f;
+    const float pull = found ? windowfollow::FlatPull(np.x, np.z, s.fx, s.fz) : 0.0f;
+    bool lost = false;
+    if (found)
+    {
+        ++g_wflPlaced;
+        lost = s.fault == kWinFloorFaultNone && windowfollow::FloorKeyLost(s.keyFound, s.keyAfter, s.bodyY1, s.fy);
+        if (s.keyAfter == s.keyFound) ++g_wflKeyKept;
+        if (lost) ++g_wflKeyLost;
+        if (!Finite(dy) || dy > windowfollow::kWinFloorDy || dy < -windowfollow::kWinFloorDy) ++g_wflBigDy;
+        if (pull > windowfollow::kWinFloorDy) ++g_wflBigPull;
+        if (pull > g_wflMaxPull) g_wflMaxPull = pull;
+    }
+    else
+    {
+        ++g_wflHeld;
+        if (s.query == windowfollow::kFloorQueryNoMap) ++g_wflNoMap;
+        else if (s.query == windowfollow::kFloorQueryBusy) ++g_wflBusy;
+    }
+    long long* lines = found ? &g_wflLines : &g_wflHoldLines;
+    const long long cap = found ? kWinFloorLineCap : kWinFloorHoldLineCap;
+    if (found && !windowfollow::WinFloorLineDue(g_wflPlaced, true, dy, lost)) return;
+    ++*lines;
+    if (*lines == cap + 1) { DebugLog(std::string("[WINFLOOR] ") + (found ? "step" : "hold") + " line cap reached (" + N2(cap) + ") - counts go on in [FLOOR] REPORT"); return; }
+    if (*lines > cap) return;
+    const char* why = found ? (lost ? "keyLost" : "placed")
+                            : (s.query == windowfollow::kFloorQueryBusy ? "busy" : s.query == windowfollow::kFloorQueryNoMap ? "noMap"
+                               : s.query == windowfollow::kFloorQueryFault ? "fault" : s.query == windowfollow::kFloorQueryFound ? "noKey" : "none");
+    char buf[480];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "[WINFLOOR] %s uid=%u n=%lld why=%s npY=%.2f ownerY=%.2f bodyY0=%.2f bodyY1=%.2f foundY=%.2f dY=%.2f key[before,found,after]=%08X,%08X,%08X pull=%.2f size=%.2f found=%s query=%d fault=%d",
+                found ? "step" : "hold", uid, found ? g_wflPlaced : g_wflHeld, why, np.y, ownerY, s.bodyY0, s.bodyY1, s.fy, dy,
+                (unsigned)s.keyBefore, (unsigned)s.keyFound, (unsigned)s.keyAfter, pull, s.size, found ? "yes" : "no", s.query, s.fault);
+    DebugLog(std::string(buf));
 }
 
 bool SafeStopMovement(CharMovement* mv)
@@ -3409,6 +3651,21 @@ bool FloorLineDue(long long* n) { ++*n; return QuietLogPass(&g_qFloor, "[FLOOR] 
 
 std::string FloorNum(int read, int v) { return read ? N2(v) : std::string("?"); }
 
+// T-1422 fix 2e - INFORMATION: a placement by the ordinary drive (floor placement, far snap) of a copy that has had a fight window
+// since it was made: kind, the copy's height gap to the height it is placed at, this copy's count. Own cap; counted on [FLOOR] REPORT.
+long long g_wfAfterPlaces = 0, g_wfAfterPlaceLines = 0;
+const long long kWfAfterPlaceLineCap = 300;
+void WindowFollowAfterPlace(unsigned int uid, Puppet& p, const char* kind, float copyY, float placeY)
+{
+    if (!(p.wfOpenAt > 0.0)) return;   // never in a window: not this measurement
+    ++p.wfAfterPlaces; ++g_wfAfterPlaces;
+    ++g_wfAfterPlaceLines;
+    if (g_wfAfterPlaceLines <= kWfAfterPlaceLineCap)
+        DebugLog("[WINDOWFOLLOW] after-close place uid=" + N2(uid) + " kind=" + kind + " dY=" + (Finite(copyY - placeY) ? F2(copyY - placeY) : std::string("?"))
+                 + " n=" + N2(p.wfAfterPlaces) + (p.nativeWindow ? " inWindow=1" : ""));
+    else if (g_wfAfterPlaceLines == kWfAfterPlaceLineCap + 1) DebugLog("[WINDOWFOLLOW] after-close place line cap reached - counts go on in [FLOOR] REPORT");
+}
+
 // The character's floor through its own vt+0x60 (getFloor - the read TsFloorPod in speech.cpp makes) and its movement's
 // floor group (CharMovement+0x334 - the value the engine's downward ray writes). Bit 1 = the floor was read, bit 2 = the
 // floor group was read. No C++ object in this function (C2712).
@@ -3553,6 +3810,7 @@ bool FloorStep(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector
                  + " flat=" + F2(flatLive) + " why=" + (arrived ? "arrived" : "stalled") + " floorBefore=" + FloorNum(got0 & 1, fl0) + " -> placed");
     // The catch-up placements' call: self-guarding, it halts the copy first; floor -1 leaves the floor to the engine's ray.
     P071NotePlacement(uid, p.ch, 6, plX, ownerY, plZ);   // PROBE P071
+    WindowFollowAfterPlace(uid, p, "floor", live.y, ownerY);   // T-1422 fix 2e: information
     mv->teleportTo(Ogre::Vector3(plX, ownerY, plZ), -1);
     if (p.unsticking) { p.unsticking = false; p.orderActive = false; ClearAttackOrder(p.ch); }   // as the far placement: an unstick order no longer pushes
     p.unstickEnded = false;
@@ -3574,6 +3832,154 @@ void FloorPendingDrop(unsigned int uid, Puppet& p, const char* road)
     p.floorPending = false;
     ++g_floorPendingDropped;
     if (p.floorSaid) DebugLog("[FLOOR] copy uid=" + N2(uid) + " result dropped: " + road + " took the copy over before it was judged");
+}
+
+// T-1422 fix 2 (F1412 / F1414; owner 1771 a/b) - THE WINDOW FOLLOW. Inside a native fight window the copy is placed each frame
+// toward its authority's recorded route replayed on the follow clock (FollowFrame's: now - clock offset - playback delay), in 3D,
+// by windowfollow::StepToward with the reconcile's tuning; combat.cpp detour_ccUpdate stops the fight routine's walking. A copy
+// with no recording (not a follow copy, or an empty route) aims at its owner's newest report. Final-form diagnostics: a
+// [WINDOWFOLLOW] line per copy in a window once a second, one at each close, each with its own cap (the counts go on in
+// [FLOOR] REPORT windowFollow[..]).
+long long g_wfLines = 0, g_wfCloseLines = 0, g_wfWindows = 0, g_wfNoRouteFrames = 0;
+long long g_wfDropCloses = 0, g_wfWalkStarts = 0, g_wfWalkEnds = 0, g_wfWalkFailed = 0, g_wfBehindFrames = 0, g_wfWalkLines = 0;   // fix 2b / 2c
+long long g_wfWalkNoSlot = 0, g_wfWalkFailHeld = 0, g_wfGoalMoves = 0;   // fix 2d
+const long long kWfLineCap = 2000;       // per-second [WINDOWFOLLOW] lines a launch: one a second per copy (6 guards x 120 s = 720), fix 2b
+const long long kWfCloseLineCap = 400;   // [WINDOWFOLLOW] close lines a launch (fix 2c: their own cap)
+const long long kWfWalkLineCap = 400;    // [WINDOWFOLLOW] walk lines a launch
+windowfollow::Tuning WindowFollowTuning()
+{
+    windowfollow::Tuning t;
+    t.tau = kReconcileTau; t.baseRate = kReconcileMaxRate; t.boostErr = kReconcileBoostErr; t.boostSlope = kReconcileBoostSlope;
+    t.maxRateBoost = kReconcileMaxRateBoost; t.maxStepAbs = kReconcileMaxStepAbs; t.deadband = kReconcileDeadband; t.maxDt = kReconcileMaxDt;
+    return t;
+}
+// The aim and the owner's speed there, as FollowFrame takes it (windowfollow::RouteTarget: the stated stop, the replayed route, or
+// behind schedule the newest report). false = no recording and no stop: the outputs are left as given (the newest report).
+// advance: carry the behind-schedule state (once a frame - the placement's call; the line's call only reads).
+bool WindowFollowTarget(Puppet& p, double now, bool advance, float* x, float* y, float* z, float* speed)
+{
+    if (!p.follow) return false;
+    bool behind = p.wfBehind;
+    const int a = windowfollow::RouteTarget(p.trk, now - p.fClkOff - p.followD, p.followD, p.stopHeld, p.stopX, p.stopY, p.stopZ,
+                                            p.tx, p.ty, p.tz, &behind, x, y, z, speed);
+    if (advance) { p.wfBehind = behind; if (a == windowfollow::kAimBehind) ++g_wfBehindFrames; }
+    return a != windowfollow::kAimNone;
+}
+void WindowFollowCappedLine(long long* n, long long cap, const char* what, const std::string& line)
+{
+    ++*n;
+    if (*n <= cap) DebugLog(line);
+    else if (*n == cap + 1) DebugLog(std::string("[WINDOWFOLLOW] ") + what + " line cap reached (" + N2(cap) + ") - counts go on in [FLOOR] REPORT");
+}
+void WindowFollowWalkLine(const std::string& line) { WindowFollowCappedLine(&g_wfWalkLines, kWfWalkLineCap, "walk", line); }
+// fix 2b / 2c (review BLOCKER 1b): a copy over half a floor from a fresh owner report is walked by the engine's route finder to
+// the owner's point: this (main) thread only publishes the goal (NativeWindowWalkSet, a seqlock); the AI worker issues the route
+// request after each fight pass. The goal moves when the owner's newest point is on another floor band or more than twice the
+// follow's reach flat from it (fix 2d). Ends on a fresh report within a quarter floor and the follow's flat reach, or when the
+// engine answers 'path failed' (trusted as combat.cpp's worker says; reason logged, counted; no timer) - then no walk starts
+// again until the owner's floor band changes. A copy with no fight object (no stop slot) never walks: it keeps the flat follow.
+// true = walking this frame (no placement). Never a ragdolled or downed copy; no placement, no teleport.
+// fix 2f (F1424): WindowFloorWalkStep below also lets the main thread issue the route request on a frame with no fight pass.
+std::string WindowWalkCounts(unsigned int uid)
+{
+    long long passes = 0, routes = 0, mainRoutes = 0; int road = 0;
+    if (!NativeWindowWalkCounts(uid, &passes, &routes, &mainRoutes, &road)) return " passes=- routes=- mainRoutes=- road=-";
+    return " passes=" + N2(passes) + " routes=" + N2(routes) + " mainRoutes=" + N2(mainRoutes) + " road=" + NativeWindowRoadName(road);
+}
+bool WindowFloorWalkDecide(unsigned int uid, Puppet& p, const Ogre::Vector3& cur, double now)
+{
+    float fx = 0.0f, fz = 0.0f;
+    const bool fresh = PuppetFreshAuthorityPos(uid, &fx, &fz);
+    const float dy = cur.y - p.ty;
+    const float ox = cur.x - p.tx, oz = cur.z - p.tz;
+    const float flat = sqrtf(ox * ox + oz * oz);
+    if (p.wfWalk)
+    {
+        const bool failed = NativeWindowWalkFailed(uid);
+        if (failed || windowfollow::FloorWalkEnds(fresh, dy, flat))
+        {
+            p.wfWalk = false;
+            if (failed) { ++g_wfWalkFailed; p.wfFailBlock = true; p.wfFailY = p.ty; } else ++g_wfWalkEnds;
+            NativeWindowWalkSet(uid, false, 0.0f, 0.0f, 0.0f);
+            WindowFollowWalkLine("[WINDOWFOLLOW] walk end uid=" + N2(uid) + " by=" + (failed ? "route-failed" : "arrived") + " dY=" + F2(dy) + " dXZ=" + F2(flat)
+                                 + " after=" + F2((float)(now - p.wfWalkAt)) + "s - back to the route follow");
+            return false;
+        }
+        if (fresh && windowfollow::GoalMoves(p.wfGoalX, p.wfGoalY, p.wfGoalZ, p.tx, p.ty, p.tz))   // another floor, or walked off
+        {
+            p.wfGoalX = p.tx; p.wfGoalY = p.ty; p.wfGoalZ = p.tz; ++g_wfGoalMoves;
+            const int gseq = NativeWindowWalkSet(uid, true, p.tx, p.ty, p.tz);
+        }
+        return true;
+    }
+    if (!windowfollow::FloorWalkStarts(fresh, dy)) return false;
+    if (p.wfFailBlock)
+    {
+        if (!windowfollow::GoalBandChanged(p.wfFailY, p.ty)) { ++g_wfWalkFailHeld; return false; }   // the same band failed: no loop
+        p.wfFailBlock = false;
+    }
+    if (SafeIsRagdoll(p.ch) || ReadProneStatePod(p.ch) != 0) return false;
+    if (!NativeWindowHasSlot(uid))
+    {
+        ++g_wfWalkNoSlot;
+        if (!p.wfNoSlotSaid)
+        {
+            p.wfNoSlotSaid = true;
+            WindowFollowWalkLine("[WINDOWFOLLOW] walk not started uid=" + N2(uid) + " dY=" + F2(dy) + " - no fight object (no stop slot): it keeps the flat follow");
+        }
+        return false;
+    }
+    p.wfWalk = true; p.wfWalkAt = now; ++p.wfWalks; ++g_wfWalkStarts; p.wfGoalX = p.tx; p.wfGoalY = p.ty; p.wfGoalZ = p.tz;
+    const int gseq = NativeWindowWalkSet(uid, true, p.tx, p.ty, p.tz);
+    WindowFollowWalkLine("[WINDOWFOLLOW] walk start uid=" + N2(uid) + " dY=" + F2(dy) + " copyY=" + F2(cur.y) + " ownerY=" + F2(p.ty)
+                         + WindowWalkCounts(uid) + " - another floor than its owner: the route finder walks it to the owner's point");
+    return true;
+}
+// fix 2f: the walk decision, then the main thread's road for this frame (it issues the route request itself when no fight pass ran
+// for the copy since its previous frame; combat.cpp NativeWindowWalkMainFrame). Every windowed frame, walking or not, so the pass
+// count's previous-frame value is always the last frame's.
+bool WindowFloorWalkStep(unsigned int uid, Puppet& p, const Ogre::Vector3& cur, double now)
+{
+    const bool walking = WindowFloorWalkDecide(uid, p, cur, now);
+    NativeWindowWalkMainFrame(uid, g_tick);
+    return walking;
+}
+// Every windowed frame (before the placement): the gaps to the target, and once a second the copy's line.
+void WindowFollowTick(unsigned int uid, Puppet& p, const Ogre::Vector3& cur, double now)
+{
+    float tx = p.tx, ty = p.ty, tz = p.tz, spd = 0.0f;
+    const bool route = WindowFollowTarget(p, now, false, &tx, &ty, &tz, &spd);
+    if (!route) { ++p.wfNoRoute; ++g_wfNoRouteFrames; }
+    const float dy = cur.y - ty, fx = cur.x - tx, fz = cur.z - tz;
+    const float dxz = sqrtf(fx * fx + fz * fz);
+    if (!Finite(dy) || !Finite(dxz)) return;
+    p.wfDY = dy; p.wfDXZ = dxz;
+    if (fabsf(dy) > p.wfMaxDY) p.wfMaxDY = fabsf(dy);
+    if (dxz > p.wfMaxDXZ) p.wfMaxDXZ = dxz;
+    if (now < p.wfLineAt) return;
+    p.wfLineAt = now + 1.0;
+    ++g_wfLines;
+    if (g_wfLines > kWfLineCap + 1) return;
+    if (g_wfLines == kWfLineCap + 1) { DebugLog("[WINDOWFOLLOW] line cap reached (" + N2(kWfLineCap) + ") - counts go on in [FLOOR] REPORT"); return; }
+    int fl = -1, sf = -1;
+    const int got = FloorReadPod(p.ch, PlausibleObj(p.ch->movement) ? (const void*)p.ch->movement : 0, &fl, &sf);
+    DebugLog("[WINDOWFOLLOW] uid=" + N2(uid) + " dY=" + F2(dy) + " dXZ=" + F2(dxz) + " fl=" + FloorNum(got & 1, fl) + " +0x334=" + FloorNum(got & 2, sf)
+             + " copyY=" + F2(cur.y) + " routeY=" + F2(ty) + " ownerY=" + F2(p.ty) + " ownerSpd=" + F2(spd) + " route=" + (route ? "1" : "0")
+             + " stops=" + N2(NativeWindowStopsOf(uid)) + " steps=" + N2(p.rcSteps) + " sat=" + N2(p.rcSatSteps)
+             + " walk=" + (p.wfWalk ? "1" : "0")
+             + " behind=" + (p.wfBehind ? "1" : "0") + WindowWalkCounts(uid));
+}
+// At the window's close (SetPuppetNativeWindow, before the AI worker's stop row is cleared): the window's counts.
+void WindowFollowCloseLine(unsigned int uid, const Puppet& p, const char* road)
+{
+    ++g_wfWindows;
+    const double secs = p.wfOpenAt > 0.0 ? NowSeconds() - p.wfOpenAt : 0.0;
+    Ogre::Vector3 now3;   // fix 2c: the copy's height against its owner's newest report as the window ends (a floor off shows here)
+    const std::string ownerDY = (PlausibleObj(p.ch) && SafeReadPosition(p.ch, &now3) && Finite(now3.y - p.ty)) ? F2(now3.y - p.ty) : std::string("?");
+    WindowFollowCappedLine(&g_wfCloseLines, kWfCloseLineCap, "close", "[WINDOWFOLLOW] close uid=" + N2(uid) + " by=" + road + " secs=" + F2((float)secs)
+             + " ownerDY=" + ownerDY + " swings=" + N2(NativeWindowSwingsOf(uid)) + " walks=" + N2(p.wfWalks) + " walking=" + (p.wfWalk ? "1" : "0") + " stops=" + N2(NativeWindowStopsOf(uid)) + " steps=" + N2(p.rcSteps)
+             + " sat=" + N2(p.rcSatSteps) + " boosted=" + N2(p.rcBoostedSteps) + " lastDY=" + F2(p.wfDY) + " lastDXZ=" + F2(p.wfDXZ)
+             + " maxDY=" + F2(p.wfMaxDY) + " maxDXZ=" + F2(p.wfMaxDXZ) + " noRouteFrames=" + N2(p.wfNoRoute));
 }
 
 // T-986 floorplace TEST-ONLY - THE FLOOR MEASUREMENT (`floorplace <uid|name:<Name>|spawned:<T>> <floor -1..3> [dx dz]`,
@@ -3654,6 +4060,84 @@ bool FloorPlaceTestStep(unsigned int uid, Puppet& p)
     return true;
 }
 
+// PROBE-START: P303 - T-1411 (F1199 / F1200): where a carried body and its carrier are on each game. LOG ONLY - reads (positions,
+// the being-carried byte, the carrier hand link, the copy rows' targets), writes nothing in the engine and changes no drive.
+// The copy side: a copy the owner's word names as carried, or whose being-carried byte is set, every 6 s ('watch'), and at the
+// LOST line's decline for a ragdolled / carried copy ('declined: <why>'). The owner side: an owned body whose byte is set, every
+// 6 s. kP303Cap lines a launch on each game, shared.
+const int kP303Cap = 120;
+const double kP303EverySec = 6.0;
+int g_p303Lines = 0;
+std::map<unsigned int, double> g_p303Last;   // uid -> NowSeconds() of its last P303 line
+
+std::string P303Pos(const Ogre::Vector3& v) { return "(" + F2(v.x) + "," + F2(v.y) + "," + F2(v.z) + ")"; }
+
+// One copy row's facts here: its position, its owner's target, its drift, the age of the owner's sample, its last placement.
+std::string P303CopyBits(unsigned int u)
+{
+    std::map<unsigned int, Puppet>::iterator it = g_puppets.find(u);
+    if (it == g_puppets.end()) return " (no copy row here)";
+    Puppet& q = it->second;
+    Ogre::Vector3 at;
+    const bool got = SafeReadPosition(q.ch, &at);
+    const double now = NowSeconds();
+    const double lastPl = q.snapTimes[(q.snapTimesNext + kSnapRateMax - 1) % kSnapRateMax];
+    return " here=" + (got ? P303Pos(at) : std::string("unread"))
+         + " ownerTarget=(" + F2(q.tx) + "," + F2(q.ty) + "," + F2(q.tz) + ")"
+         + " drift=" + F2(q.lastDrift)
+         + " sampleAge=" + (q.ownerSampleAt > 0.0 ? F2((float)(now - q.ownerSampleAt)) : std::string("none"))
+         + " lastPlaced=" + (lastPl > 0.0 ? F2((float)(now - lastPl)) + "s ago cause=" + N2(q.snapCause) : std::string("never"));
+}
+
+bool P303Due(unsigned int uid, bool force)
+{
+    if (g_p303Lines >= kP303Cap) return false;
+    const double now = NowSeconds();
+    std::map<unsigned int, double>::iterator l = g_p303Last.find(uid);
+    if (!force && l != g_p303Last.end() && now - l->second < kP303EverySec) return false;
+    g_p303Last[uid] = now;
+    ++g_p303Lines;
+    return true;
+}
+
+// The copy side (DrivePuppet): body copy `uid`.
+void P303CopyLine(unsigned int uid, Puppet& p, const Ogre::Vector3& cur, float dist, const std::string& why, bool force)
+{
+    if (!P303Due(uid, force)) return;
+    ::Character* lc = 0;
+    const unsigned int here = P303CarrierHere(p.ch, &lc);
+    double wordAge = -1.0;
+    const unsigned int word = P303OwnerWord(uid, &wordAge);
+    std::string line = "[PROBE] P303 copy body uid=" + N2(uid) + " #" + N2(g_p303Lines) + " why=" + why
+        + " bodyHere=" + P303Pos(cur) + " bodyOwnerTarget=(" + F2(p.tx) + "," + F2(p.ty) + "," + F2(p.tz) + ")"
+        + " drift=" + F2(dist)
+        + " sampleAge=" + (p.ownerSampleAt > 0.0 ? F2((float)(NowSeconds() - p.ownerSampleAt)) : std::string("none"))
+        + " ragdoll=" + N2(SafeIsRagdoll(p.ch) ? 1 : 0) + " carriedByte=" + N2(P303Carried(p.ch))
+        + " | carrier here (hand link): " + (here != 0 ? "uid=" + N2(here) + P303CopyBits(here) : std::string("none"))
+        + " | owner's word: " + (word != 0 ? "carrier uid=" + N2(word) + " age=" + F2((float)wordAge) + "s"
+                                          + (word == here ? std::string(" (the same)") : " (DIFFERENT)" + P303CopyBits(word))
+                                        : std::string("none"));
+    ErrorLog(line);
+}
+
+// The owner side (ReplicateTick's send loop): owned body `uid` at `at`.
+void P303OwnerWatch(unsigned int uid, Character* c, const Ogre::Vector3& at)
+{
+    if (g_p303Lines >= kP303Cap || !P303Carried(c) || !P303Due(uid, false)) return;
+    ::Character* cc = 0;
+    const unsigned int cu = P303CarrierHere(c, &cc);
+    Ogre::Vector3 cp;
+    const bool got = cc != 0 && SafeReadPosition(cc, &cp);
+    const float gx = got ? cp.x - at.x : 0.0f, gz = got ? cp.z - at.z : 0.0f;
+    ErrorLog("[PROBE] P303 owner body uid=" + N2(uid) + " #" + N2(g_p303Lines) + " bodyAt=" + P303Pos(at)
+             + " ragdoll=" + N2(SafeIsRagdoll(c) ? 1 : 0)
+             + " carrier uid=" + (cu != 0 ? N2(cu) : std::string("none"))
+             + " carrierOwn=" + N2(cu != 0 && net::IsUidMine(cu) ? 1 : 0)
+             + " carrierAt=" + (got ? P303Pos(cp) : std::string("unread"))
+             + " gap=" + (got ? F2(sqrtf(gx * gx + gz * gz)) : std::string("unread")));
+}
+// PROBE-END: P303
+
 void DrivePuppet(unsigned int uid, Puppet& p)
 {
     if (!PlausibleObj(p.ch)) { if (p.nativeWindow) { ++g_rcSkippedNoChar; p.rcVisPrimed = false; } return; }
@@ -3691,6 +4175,11 @@ void DrivePuppet(unsigned int uid, Puppet& p)
     p.lastDriftY = p.ty - cur.y;
     if (dist > p.maxDrift) p.maxDrift = dist;
     if (fabsf(p.lastDriftY) > fabsf(p.maxDriftY)) p.maxDriftY = p.lastDriftY;
+    // PROBE-START: P303 - a copy carried by its owner's word or by its byte: where it and its carrier are, every 6 s (LOG ONLY)
+    if (g_p303Lines < kP303Cap && ((unsigned long long)g_tick + uid) % 120ull == 0ull
+        && (P303OwnerWord(uid, 0) != 0 || P303Carried(p.ch) != 0))
+        P303CopyLine(uid, p, cur, dist, "watch", false);
+    // PROBE-END: P303
 
     // POSE (read-poses): a copy in its owner's bed, seat or work pose is not moved - the owner's position is streamed
     // and the seat snap is its own. Out of path mode and stopped once. POSE-b: held only once posed - an action pose first
@@ -3721,9 +4210,17 @@ void DrivePuppet(unsigned int uid, Puppet& p)
     // simulation runs again, so the first running frame carries on as if no time had passed.
     if (g_simHeld) { ++g_judgeHeldFrames; return; }
 
-    // H015 / P059 - INSIDE A NATIVE COMBAT WINDOW THE AI OWNS THE LEGS. Measured, not driven: the AI closes on the same target
-    // the owner's character is closing on, and any gap is the window's own drift number. Correction happens at window close
-    // (SnapPuppetToAuthority). T-986 (drift bound): THE WINDOW IS BOUNDED BY DISTANCE. The two bodies track each other only
+    // H015 / P059 - INSIDE A NATIVE COMBAT WINDOW THE AI FIGHTS, THE DRIVE PLACES. T-1422 fix 2 (F1412 / F1414; owner 1771 a/b):
+    // the fight routine no longer walks the copy - combat.cpp detour_ccUpdate stops its walking after every pass (it chased this
+    // game's copy of its target, so a fight on stairs settled floors from the owner) - and each frame the copy is placed
+    // toward its authority's recorded route replayed ~0.3 s back (followplay::TargetAt on the FollowFrame clock), smoothly
+    // (windowfollow.h: the reconcile's tau, the step capped at the owner's speed plus the reconcile's rate). The height moves the
+    // walking body; the engine's own ground check (a downward ray from above it - its offset DAT_141682188 unread) then sets the
+    // height and the floor record (+0x334) from the surface under the copy (CharMovement::update, decomp_65e6d0:81-166). Fix 2b:
+    // so the step is FLAT (the height is never set: the ground check applies its hit on and off camera, windowfollow.h), and a
+    // copy a floor from its owner is walked by the route finder (WindowFloorWalkStep, fix 2b / 2c). The drift number is still the gap to the newest report.
+    // Fix 2d: no window close of such a copy places it (combat.cpp FinishNativeClose); the ordinary drive carries on from where it
+    // stands, and its own later placements are logged ([WINDOWFOLLOW] after-close place). T-986 (drift bound): THE WINDOW IS BOUNDED BY DISTANCE. The two bodies track each other only
     // while the owner moves too: in T1425 the owners stood in attack mode, no OFF edge was ever sent, and the copies ran to their
     // target and stayed 5,000-6,700 units away until the game quit - this branch returns before the far snap, so nothing
     // brought them back. A copy past kLostDist (the far snap's own distance), on a FRESH owner sample (the far snap's 3 s rule,
@@ -3733,7 +4230,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
     // owner opens a window again.
     if (p.nativeWindow)
     {
-        FloorPendingDrop(uid, p, "a fight window");   // T-986 g3: the fight AI walks the copy itself
+        FloorPendingDrop(uid, p, "a fight window");   // T-986 g3: the window places the copy itself (T-1422 fix 2)
         if (dist > p.nativeMaxDrift) p.nativeMaxDrift = dist;
         float freshX = 0.0f, freshZ = 0.0f;   // T-986 fold 1: unused; the call is the far snap's freshness test
         if (winbound::DriftClosesWindow(true, dist, kLostDist) && PuppetFreshAuthorityPos(uid, &freshX, &freshZ))
@@ -3817,9 +4314,11 @@ void DrivePuppet(unsigned int uid, Puppet& p)
         // animation is fed from pos by that same update. The loop READS the field it WRITES
         // (CharMovement::pos, +0xC4), so the read and the write are one quantity.
         //
-        // KNOWN, NOT YET ADDRESSED (review 3, finding 2): the aim point here is the last STREAMED
-        // sample, not the lead-extrapolated point the ordinary drive uses below, so for a fast-moving
-        // character the error floor is speed x send interval. Fighters move slowly; walkers do not.
+        // T-1422 fix 2 / 2c: the aim is the owner's recorded route replayed on the follow clock (WindowFollowTarget) and the step is
+        // windowfollow::StepToward's, FLAT (the owner's speed plus the reconcile's rate) - the copy keeps pace with a running owner
+        // (review 3 finding 2's error floor is gone); the height is the engine's ground check's, the floor comes from the route.
+        WindowFollowTick(uid, p, cur, tickNow);   // T-1422 fix 2: the [WINDOWFOLLOW] line once a second
+        if (WindowFloorWalkStep(uid, p, cur, tickNow)) { p.rcLastTickAt = tickNow; return; }   // fix 2b / 2c: the route finder walks it
         if (!g_reconcileOn) ++g_rcSkippedOff;
         else if (!Finite(dist) || !Finite(cur.x) || !Finite(cur.y) || !Finite(cur.z)) ++g_rcSkippedNonFiniteVisible;
         else if (IsRetiredObject(p.ch)) ++g_rcSkippedRetired;
@@ -3833,10 +4332,17 @@ void DrivePuppet(unsigned int uid, Puppet& p)
             else
             {
                 const Ogre::Vector3 mp = *(const Ogre::Vector3*)((const char*)mv + 0xC4);   // CharMovement::pos
-                const float ex = p.tx - mp.x, ez = p.tz - mp.z;
-                const float err = sqrtf(ex * ex + ez * ez);
-                if (!Finite(mp.x) || !Finite(mp.y) || !Finite(mp.z) || !Finite(err)) ++g_rcSkippedNonFiniteField;
-                else if (err <= kReconcileDeadband) ++g_rcSkippedDeadband;
+                // T-1422 fix 2: the replayed route point in 3D and the owner's speed there; one frame's smooth step toward it.
+                // Frame-rate free: the gain is 1 - exp(-dt/tau) and the cap is a RATE times dt, both on the FRAME interval
+                // (stamped every windowed tick, stepping or not). Elapsed skip time is never banked into one step (dt is held at
+                // kReconcileMaxDt): a correction owed from a prone stretch is paid over the following frames, never at once.
+                float wtx = p.tx, wty = p.ty, wtz = p.tz, ownSpd = 0.0f;
+                WindowFollowTarget(p, tickNow, true, &wtx, &wty, &wtz, &ownSpd);
+                // fix 2b / 2c: FLAT on x / z; the height is the engine's ground check's (windowfollow.h says why)
+                windowfollow::Step ws;
+                const int wr = windowfollow::StepToward(mp.x, mp.y, mp.z, wtx, wty, wtz, frameDt, ownSpd, WindowFollowTuning(), &ws);
+                if (wr == windowfollow::kStepBad) ++g_rcSkippedNonFiniteField;
+                else if (wr == windowfollow::kStepDeadband) ++g_rcSkippedDeadband;
                 else
                 {
                     if (g_rcImageBase == 0) g_rcImageBase = (uintptr_t)::GetModuleHandleA(0);
@@ -3864,26 +4370,23 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                         else if (setter == 0 || fa < g_rcImageBase || fa - g_rcImageBase >= coop::AddrTextEnd()) ++g_rcSkippedBadSetter;   // stage 7/9: the running exe's own .text end
                         else
                         {
-                            // Frame-rate free: the gain is 1 - exp(-dt/tau) and the cap is a RATE times dt,
-                            // both on the FRAME interval (stamped every windowed tick, stepping or not).
-                            // Elapsed skip time is never banked into one step: a correction owed from a
-                            // prone stretch is paid over the following frames at tau, never at once.
-                            double dt = frameDt; if (dt > kReconcileMaxDt) dt = kReconcileMaxDt;
-                            const float requested = err * (1.0f - expf((float)(-dt / kReconcileTau)));
-                            float rate = kReconcileMaxRate;
-                            if (err > kReconcileBoostErr) { rate = kReconcileMaxRate + (err - kReconcileBoostErr) * kReconcileBoostSlope; if (rate > kReconcileMaxRateBoost) rate = kReconcileMaxRateBoost; ++g_rcBoostedSteps; ++p.rcBoostedSteps; }
-                            float cap = rate * (float)dt; if (cap > kReconcileMaxStepAbs) cap = kReconcileMaxStepAbs;
-                            float step = requested;
-                            bool sat = false;
-                            if (step > cap) { step = cap; sat = true; }
-                            if (step <= 0.0f) ++g_rcSkippedZeroStep;   // a zero-length frame; normal, not a defect
+                            const float requested = ws.requested, step = ws.step;
+                            const bool sat = ws.sat;
+                            if (ws.boosted) { ++g_rcBoostedSteps; ++p.rcBoostedSteps; }
+                            if (wr != windowfollow::kStepMoved) ++g_rcSkippedZeroStep;   // a zero-length frame; normal, not a defect
                             else
                             {
-                                const Ogre::Vector3 np(mp.x + (ex / err) * step, mp.y, mp.z + (ez / err) * step);
-                                if (!Finite(np.x) || !Finite(np.z)) ++g_rcSkippedBadTarget;
+                                const Ogre::Vector3 np(ws.x, ws.y, ws.z);   // fix 2c: ws.y is the copy's own height
+                                if (!Finite(np.x) || !Finite(np.y) || !Finite(np.z)) ++g_rcSkippedBadTarget;
                                 else
                                 {
-                                    if (!SafeCallSetPos(setter, mv, &np)) ++g_rcSetterFaulted;   // review 4 item 3
+                                    // fix 3 (F1447): the walking map's point and piece for the step, the setter there, the body on that piece;
+                                    // nothing found - the copy stays where it is this frame
+                                    WinFloorStep wfl; bool setOk = false;
+                                    const int wflAct = WindowFloorSet(setter, mv, np, &wfl, &setOk);
+                                    WindowFloorNote(uid, np, wty, wfl);
+                                    if (wflAct == windowfollow::kFloorStepHold) {}   // held: counted in WindowFloorNote
+                                    else if (!setOk) ++g_rcSetterFaulted;   // review 4 item 3
                                     else
                                     {
                                         if (sat) { ++g_rcSaturated; ++p.rcSatSteps; }
@@ -4619,6 +5122,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                 if (p.fBehind) ++g_followSnapBehind;
             }
             P071NotePlacement(uid, p.ch, 2, plX, p.ty, plZ);   // PROBE P071
+            WindowFollowAfterPlace(uid, p, "far", cur.y, p.ty);   // T-1422 fix 2e: information
             mv->teleportTo(Ogre::Vector3(plX, p.ty, plZ), -1);
             PlaceHoldStart(p, cur);   // T-986 s: no push from the stale spot until the placement shows
             PathForgetDest(p);   // D1 item 3 (snap 2)
@@ -4637,6 +5141,10 @@ void DrivePuppet(unsigned int uid, Puppet& p)
             p.lastLostTick = g_tick;
             ErrorLog("[M2] puppet uid=" + N2(uid) + " LOST: drift " + F2(dist)
                      + " exceeds " + F2(kLostDist) + " - NOT teleported: " + whyNot);
+            // PROBE-START: P303 - the decline of a ragdolled or carried copy: where it and its carrier are (LOG ONLY)
+            if (farRagdolled || P303Carried(p.ch) != 0 || P303OwnerWord(uid, 0) != 0)
+                P303CopyLine(uid, p, cur, dist, std::string("declined: ") + whyNot, true);
+            // PROBE-END: P303
         }
     }
 
@@ -4834,7 +5342,7 @@ void ApplyRemoteMove(unsigned int uid, float x, float y, float z, float velX, fl
         p.progressFromTX = 0.0f; p.progressFromTZ = 0.0f; p.snapCause = 0; p.snapWatchWindows = -1; p.snapStrikes = 0;
         for (int si = 0; si < kSnapRateMax; ++si) p.snapTimes[si] = -1.0e9;
         p.snapTimesNext = 0; p.unstickEnded = false;
-        p.nativeWindow = false; p.nativeMaxDrift = 0.0f; p.nativeSnapScorePending = false; p.nativeSnapTick = 0; p.rcSteps = 0; p.rcMaxStep = 0.0f; p.rcSumStep = 0.0f; p.rcLastTickAt = 0.0; p.rcReqMax = 0.0f; p.rcVisMaxStep = 0.0f; p.rcVisMaxRate = 0.0f; p.rcVisMaxRateDowned = 0.0f; p.rcVisMaxRateAny = 0.0f; p.rcVisLastX = p.rcVisLastY = p.rcVisLastZ = 0.0f; p.rcVisPrimed = false; p.rcLayerGapMax = 0.0f; p.rcLayerGapLast = 0.0f; p.rcDriftSum = 0.0; p.rcDriftN = 0; p.rcSatSteps = 0; p.rcBoostedSteps = 0; p.authDesired = -1.0f; p.authDesiredApplied = -2.0f; p.intentType = 0; p.intentSubject = 0; p.intentX = p.intentY = p.intentZ = 0.0f; p.intentPriority = 0; p.intentAt = 0.0; p.intentSeq = 0; p.insideSaid = -1; p.insideKey[0] = 0; p.insideAt = 0.0; p.insideHint = 0; p.catchingUp = false; p.orderActive = false; p.orderX = p.orderZ = 0.0f; p.orderTick = 0; p.orderCount = 0; p.orderSpeed = -1; p.unsticking = false; p.unstickTick = 0; p.faceX = p.faceZ = 0.0f; p.faceTick = 0;
+        p.nativeWindow = false; p.nativeMaxDrift = 0.0f; p.nativeSnapScorePending = false; p.nativeSnapTick = 0; p.rcSteps = 0; p.rcMaxStep = 0.0f; p.rcSumStep = 0.0f; p.rcLastTickAt = 0.0; p.rcReqMax = 0.0f; p.rcVisMaxStep = 0.0f; p.rcVisMaxRate = 0.0f; p.rcVisMaxRateDowned = 0.0f; p.rcVisMaxRateAny = 0.0f; p.rcVisLastX = p.rcVisLastY = p.rcVisLastZ = 0.0f; p.rcVisPrimed = false; p.rcLayerGapMax = 0.0f; p.rcLayerGapLast = 0.0f; p.rcDriftSum = 0.0; p.rcDriftN = 0; p.rcSatSteps = 0; p.rcBoostedSteps = 0; p.wfOpenAt = p.wfLineAt = 0.0; p.wfDY = p.wfDXZ = p.wfMaxDY = p.wfMaxDXZ = 0.0f; p.wfNoRoute = 0; p.wfBehind = false; p.wfWalk = false; p.wfWalkAt = 0.0; p.wfWalks = 0; p.wfGoalX = p.wfGoalY = p.wfGoalZ = 0.0f; p.wfFailBlock = false; p.wfFailY = 0.0f; p.wfNoSlotSaid = false; p.wfAfterPlaces = 0; NativeWindowStopMark(uid, 0, false);   /* T-1422 fix 2 */ p.authDesired = -1.0f; p.authDesiredApplied = -2.0f; p.intentType = 0; p.intentSubject = 0; p.intentX = p.intentY = p.intentZ = 0.0f; p.intentPriority = 0; p.intentAt = 0.0; p.intentSeq = 0; p.insideSaid = -1; p.insideKey[0] = 0; p.insideAt = 0.0; p.insideHint = 0; p.catchingUp = false; p.orderActive = false; p.orderX = p.orderZ = 0.0f; p.orderTick = 0; p.orderCount = 0; p.orderSpeed = -1; p.unsticking = false; p.unstickTick = 0; p.faceX = p.faceZ = 0.0f; p.faceTick = 0;
         p.pathMode = false; p.pathHaveDest = false; p.pathDestX = p.pathDestZ = 0.0f; p.pathIssueAt = 0.0; p.pathAwait = false; p.pathAwaitTick = 0; p.pathFailNoted = false; p.pathLastX = p.pathLastZ = 0.0f; p.pathLastAt = 0.0; p.pathHoldUntil = 0.0; p.pathProgArmed = false; p.pathProgTick = 0; p.pathProgFromDistA = 0.0f; p.pathWantIssue = false; p.pathWantSince = 0.0; p.pathGrant = false; p.pathOwnerStillSince = 0.0; p.pathProgOwnerMoved = false; p.pathProgFromX = p.pathProgFromZ = 0.0f; p.pathDestLead = false; p.pathDestDirX = p.pathDestDirZ = p.pathLineX = p.pathLineZ = 0.0f; p.pathOwnerWasMoving = false; p.pathStopDue = false; p.pathArrivedNoted = false; p.pathWantPriority = false; p.pathTurnSince = 0.0; p.pathRetryAim = 0; p.ownPrimed = false; p.ownSpd = p.ownHdgX = p.ownHdgZ = 0.0f; p.pathIssueTick = 0; p.pathFailSeenClear = false; p.pathSeenPending = p.pathLanded = p.pathLandedFaultNoted = p.pathTooCloseNoted = p.pathLeadWalking = false;   // D1 / D1-b / D1-c / D1-d / D2 / D2-b / D2-c / D3
         p.follow = false; p.followPlayer = false; FollowReset(p);   // the follow drive starts empty; the first report decides whether it applies
         // PROBE-START: P093
@@ -5742,6 +6250,13 @@ void P071Tick()
 }
 // PROBE-END: P071
 
+
+
+
+
+
+
+
 // THE OWNER'S STOP (followplay): any character this game owns and streams (its player faction and every NPC it runs) that
 // produced a moving report is ARMED; every frame (not only on the send pass) an armed one whose engine moving flag reads 0
 // with its body still
@@ -6570,6 +7085,7 @@ void ReplicateTick()
         MeasureVelocity(c, uid, p, s, nowSec, &vx, &vz);
 
         if (net::SendMove(uid, p.x, p.y, p.z, vx, vz, AuthorityDesiredSpeed(c), fx0, fz0, FollowStampMs(nowSec))) { ++g_sent; ++streamed; }
+        P303OwnerWatch(uid, c, p);   // PROBE P303 (LOG ONLY): an owned carried body and its carrier, every 6 s
         FollowOwnerNoteSample(uid, s.sampleVerdict, p.x, p.z);   // a moving report arms this character's stated stop
         // H019 - the authority's CURRENT GOAL: sent when it changes, refreshed every 5 s. A Move order's goal that moved more
         // than 2 u is sent too (cooppath::GoalResendDue): the other game ends its copy's path at that goal, and a second
@@ -6694,7 +7210,7 @@ void AdoptRemotePuppet(unsigned int uid)
         p.progressFromTX = 0.0f; p.progressFromTZ = 0.0f; p.snapCause = 0; p.snapWatchWindows = -1; p.snapStrikes = 0;
         for (int si = 0; si < kSnapRateMax; ++si) p.snapTimes[si] = -1.0e9;
         p.snapTimesNext = 0; p.unstickEnded = false;
-        p.nativeWindow = false; p.nativeMaxDrift = 0.0f; p.nativeSnapScorePending = false; p.nativeSnapTick = 0; p.rcSteps = 0; p.rcMaxStep = 0.0f; p.rcSumStep = 0.0f; p.rcLastTickAt = 0.0; p.rcReqMax = 0.0f; p.rcVisMaxStep = 0.0f; p.rcVisMaxRate = 0.0f; p.rcVisMaxRateDowned = 0.0f; p.rcVisMaxRateAny = 0.0f; p.rcVisLastX = p.rcVisLastY = p.rcVisLastZ = 0.0f; p.rcVisPrimed = false; p.rcLayerGapMax = 0.0f; p.rcLayerGapLast = 0.0f; p.rcDriftSum = 0.0; p.rcDriftN = 0; p.rcSatSteps = 0; p.rcBoostedSteps = 0; p.authDesired = -1.0f; p.authDesiredApplied = -2.0f; p.intentType = 0; p.intentSubject = 0; p.intentX = p.intentY = p.intentZ = 0.0f; p.intentPriority = 0; p.intentAt = 0.0; p.intentSeq = 0; p.insideSaid = -1; p.insideKey[0] = 0; p.insideAt = 0.0; p.insideHint = 0; p.catchingUp = false; p.orderActive = false; p.orderX = p.orderZ = 0.0f; p.orderTick = 0; p.orderCount = 0; p.orderSpeed = -1; p.unsticking = false; p.unstickTick = 0; p.faceX = p.faceZ = 0.0f; p.faceTick = 0;
+        p.nativeWindow = false; p.nativeMaxDrift = 0.0f; p.nativeSnapScorePending = false; p.nativeSnapTick = 0; p.rcSteps = 0; p.rcMaxStep = 0.0f; p.rcSumStep = 0.0f; p.rcLastTickAt = 0.0; p.rcReqMax = 0.0f; p.rcVisMaxStep = 0.0f; p.rcVisMaxRate = 0.0f; p.rcVisMaxRateDowned = 0.0f; p.rcVisMaxRateAny = 0.0f; p.rcVisLastX = p.rcVisLastY = p.rcVisLastZ = 0.0f; p.rcVisPrimed = false; p.rcLayerGapMax = 0.0f; p.rcLayerGapLast = 0.0f; p.rcDriftSum = 0.0; p.rcDriftN = 0; p.rcSatSteps = 0; p.rcBoostedSteps = 0; p.wfOpenAt = p.wfLineAt = 0.0; p.wfDY = p.wfDXZ = p.wfMaxDY = p.wfMaxDXZ = 0.0f; p.wfNoRoute = 0; p.wfBehind = false; p.wfWalk = false; p.wfWalkAt = 0.0; p.wfWalks = 0; p.wfGoalX = p.wfGoalY = p.wfGoalZ = 0.0f; p.wfFailBlock = false; p.wfFailY = 0.0f; p.wfNoSlotSaid = false; p.wfAfterPlaces = 0; NativeWindowStopMark(uid, 0, false);   /* T-1422 fix 2 */ p.authDesired = -1.0f; p.authDesiredApplied = -2.0f; p.intentType = 0; p.intentSubject = 0; p.intentX = p.intentY = p.intentZ = 0.0f; p.intentPriority = 0; p.intentAt = 0.0; p.intentSeq = 0; p.insideSaid = -1; p.insideKey[0] = 0; p.insideAt = 0.0; p.insideHint = 0; p.catchingUp = false; p.orderActive = false; p.orderX = p.orderZ = 0.0f; p.orderTick = 0; p.orderCount = 0; p.orderSpeed = -1; p.unsticking = false; p.unstickTick = 0; p.faceX = p.faceZ = 0.0f; p.faceTick = 0;
         p.pathMode = false; p.pathHaveDest = false; p.pathDestX = p.pathDestZ = 0.0f; p.pathIssueAt = 0.0; p.pathAwait = false; p.pathAwaitTick = 0; p.pathFailNoted = false; p.pathLastX = p.pathLastZ = 0.0f; p.pathLastAt = 0.0; p.pathHoldUntil = 0.0; p.pathProgArmed = false; p.pathProgTick = 0; p.pathProgFromDistA = 0.0f; p.pathWantIssue = false; p.pathWantSince = 0.0; p.pathGrant = false; p.pathOwnerStillSince = 0.0; p.pathProgOwnerMoved = false; p.pathProgFromX = p.pathProgFromZ = 0.0f; p.pathDestLead = false; p.pathDestDirX = p.pathDestDirZ = p.pathLineX = p.pathLineZ = 0.0f; p.pathOwnerWasMoving = false; p.pathStopDue = false; p.pathArrivedNoted = false; p.pathWantPriority = false; p.pathTurnSince = 0.0; p.pathRetryAim = 0; p.ownPrimed = false; p.ownSpd = p.ownHdgX = p.ownHdgZ = 0.0f; p.pathIssueTick = 0; p.pathFailSeenClear = false; p.pathSeenPending = p.pathLanded = p.pathLandedFaultNoted = p.pathTooCloseNoted = p.pathLeadWalking = false;   // D1 / D1-b / D1-c / D1-d / D2 / D2-b / D2-c / D3
         p.follow = false; p.followPlayer = false; FollowReset(p);   // the follow drive starts empty; the first report decides whether it applies
         // PROBE-START: P093
@@ -6982,9 +7498,11 @@ void DropPuppet(unsigned int uid, bool restoreSpeed)
             ErrorLog("[NC] window dropped WITHOUT re-gate uid=" + N2(uid)
                      + (restoreSpeed ? " - character unreadable" : " - stale-uid path (address may belong to a stranger)"));
         }
+        WindowFollowCloseLine(uid, p, "drop"); ++g_wfDropCloses; p.wfWalk = false;   // T-1422 fix 2b: the drop road closes a window too
         p.nativeWindow = false;
         NoteNativeWindowDropped(uid, regated);
     }
+    NativeWindowStopMark(uid, 0, false);   // T-1422 fix 2: the AI worker no longer stops this copy (its fight object may be freed)
 
     // F353 - **STOP THE CHARACTER BEFORE FORGETTING IT.**
     //
@@ -7065,9 +7583,35 @@ bool SetPuppetNativeWindow(unsigned int uid, bool on)
         // AI starts from a standing body rather than one still walking our stale push.
         if (LiveCharacter(p.ch) != 0 && PlausibleObj(p.ch->movement)) SafeStopMovement(p.ch->movement);   // the engine still knows it this frame
         p.driving = false;
+        p.wfOpenAt = NowSeconds(); p.wfLineAt = p.wfOpenAt + 1.0; p.wfDY = p.wfDXZ = p.wfMaxDY = p.wfMaxDXZ = 0.0f; p.wfNoRoute = 0;   // T-1422 fix 2
+        p.wfBehind = false; p.wfWalk = false; p.wfWalkAt = 0.0; p.wfWalks = 0; p.wfGoalX = p.wfGoalY = p.wfGoalZ = 0.0f;   // fix 2b / 2c
+        p.wfFailBlock = false; p.wfFailY = 0.0f; p.wfNoSlotSaid = false;   // fix 2d
+    }
+    if (!on && p.nativeWindow)   // T-1422 fix 2: the window's counts, before its stop row is cleared
+    {
+        WindowFollowCloseLine(uid, p, "close");
+        if (p.wfWalk)   // fold 2g: a walk the window's close ends says so (no placement - the ordinary drive takes the copy back)
+            WindowFollowWalkLine("[WINDOWFOLLOW] walk end uid=" + N2(uid) + " by=close after=" + F2((float)(NowSeconds() - p.wfWalkAt)) + "s" + WindowWalkCounts(uid));
+        p.wfWalk = false;
     }
     p.nativeWindow = on;
+    NativeWindowStopMark(uid, on ? (void*)LiveCharacter(p.ch) : 0, on);   // T-1422 fix 2: the AI worker's copy of the flag
     return true;
+}
+
+// T-1422 fix 2 - see replicate.h.
+bool StopCopyWalking(void* mv) { return SafeStopMovement((CharMovement*)mv); }
+// T-1422 fix 2b - see replicate.h.
+bool RouteCopyTo(void* mv, float x, float y, float z)
+{
+    if (!PlausibleObj(mv) || !Finite(x) || !Finite(y) || !Finite(z)) return false;
+    return SafeSetDestination((CharMovement*)mv, Ogre::Vector3(x, y, z));
+}
+int CopyPathFailed(void* mv) { return PlausibleObj(mv) ? SafePathFailed((CharMovement*)mv) : -1; }
+bool PuppetWindowFollowed(unsigned int uid)
+{
+    std::map<unsigned int, Puppet>::const_iterator it = g_puppets.find(uid);
+    return it != g_puppets.end() && it->second.follow;   // fix 2d: every copy that records its owner's route
 }
 
 // PROBE-START: P019 - the last authoritative prone write per uid (spawn.cpp's correction), for the vis_peak line
@@ -8078,7 +8622,18 @@ void ReportReplication()
     DebugLog("[FLOOR] REPORT floorPlace[checked,placed,ok,again,gaveUp,gated,faults]=" + N2(g_floorChecked) + "," + N2(g_floorPlaced)
              + "," + N2(g_floorOk) + "," + N2(g_floorAgain) + "," + N2(g_floorGaveUp) + "," + N2(g_floorGated) + "," + N2(g_floorFaults)
              + " judged[landed,waited]=" + N2(g_floorJudgedLanded) + "," + N2(g_floorJudgedWaited)
-             + " pendingDropped=" + N2(g_floorPendingDropped));   // T-986 g3: results dropped by the pose hold or a fight window
+             + " pendingDropped=" + N2(g_floorPendingDropped)   // T-986 g3: results dropped by the pose hold or a fight window
+             + " windowFollow[windows,lines,closeLines,noRouteFrames]=" + N2(g_wfWindows) + "," + N2(g_wfLines) + "," + N2(g_wfCloseLines) + "," + N2(g_wfNoRouteFrames)   // T-1422 fix 2
+             + " windowFollow[dropCloses,walkStarts,walkArrived,walkRouteFailed,behindFrames,walkLines]=" + N2(g_wfDropCloses) + "," + N2(g_wfWalkStarts)
+             + "," + N2(g_wfWalkEnds) + "," + N2(g_wfWalkFailed) + "," + N2(g_wfBehindFrames) + "," + N2(g_wfWalkLines)   // fix 2b / 2c
+             + " windowFollow[walkNoFightObject,walkFailHeld,goalMoves]=" + N2(g_wfWalkNoSlot) + "," + N2(g_wfWalkFailHeld) + "," + N2(g_wfGoalMoves)   // fix 2d
+             + " windowFollow[afterClosePlaces]=" + N2(g_wfAfterPlaces)   // fix 2e
+             + " windowFollow[floorSteps,floorPlaced,floorKeyKept,floorKeyLost,floorHeld,floorNoMap,floorBusy,floorPlain,floorFaults,floorNoSize,floorBigDy,floorBigPull,floorLines,floorHoldLines]="
+             + N2(g_wflSteps) + "," + N2(g_wflPlaced) + "," + N2(g_wflKeyKept) + "," + N2(g_wflKeyLost) + "," + N2(g_wflHeld) + "," + N2(g_wflNoMap)
+             + "," + N2(g_wflBusy) + "," + N2(g_wflPlain) + "," + N2(g_wflFaults) + "," + N2(g_wflNoSize) + "," + N2(g_wflBigDy) + "," + N2(g_wflBigPull)
+             + "," + N2(g_wflLines) + "," + N2(g_wflHoldLines) + " windowFollow[floorMaxPull]=" + F2(g_wflMaxPull)   // fix 3
+             + " windowFollow[rayReask[asked,readyCleared,backDoneCleared,noRay,faults]]=" + N2(g_grAsked) + "," + N2(g_grReadyCleared)
+             + "," + N2(g_grBackDoneCleared) + "," + N2(g_grNoRay) + "," + N2(g_grFaults));   // fix attempt 5
     // PROBE-START: P093
     DebugLog(P093SummaryLine());
     // PROBE-END: P093
@@ -8110,6 +8665,7 @@ void ReplicateWorldTeardown()
     for (std::map<unsigned int, Puppet>::const_iterator it = g_puppets.begin(); it != g_puppets.end(); ++it)
         if (it->second.nativeWindow) ++windows;
     g_fpTests.clear();   // T-986 floorplace fold: open floorplace readings end with the table
+    NativeWindowStopClearAll();   // T-1422 fix 2: no fight object of the world that is going is stopped again
     g_puppets.clear();
     g_goalRefillQ.clear();   // T-918: a queued refill names a uid of the world that is going (uids restart with each world)
     g_followClk.clear(); g_followOwn.clear(); g_followOwnSent.clear();   // the owners' clocks and this game's stop watch belong to the world that is going

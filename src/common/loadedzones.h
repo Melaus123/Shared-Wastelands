@@ -352,5 +352,91 @@ inline int AreaFlagOf(int zoneMapOk, int areaReadOk, unsigned long long area, in
     if (byteReadOk == 0) return kFlagUnread;
     return byteVal != 0 ? 1 : 0;
 }
+/* T-1442: THE HOLDER MOVES OF ONE APPLIED AREA MAP (zones.cpp ApplyRelayAreaMap -> HolderMovesStep). HolderSeedOnLink: 1 when this
+   map is the first on its link (linkGen differs from the one the grid was last filled on - the grid is then seeded, no lines), and the
+   grid's link is taken. HolderMovesDiff: seen / owner are n*n grids (owner < 0 = nobody, stored as -1); every area whose holder differs
+   from seen appends x, y, before, after, and seen takes the new holder; seed 1 takes the holders and appends nothing. Returns the moves. */
+inline int HolderSeedOnLink(long* seenLinkGen, long linkGen)
+{
+    const int seed = *seenLinkGen != linkGen ? 1 : 0;
+    *seenLinkGen = linkGen;
+    return seed;
+}
+inline int HolderMovesDiff(int* seen, const int* owner, int n, int seed, std::vector<int>* moves)
+{
+    int c = 0;
+    for (int x = 0; x < n; ++x)
+        for (int y = 0; y < n; ++y)
+        {
+            const int now = owner[x * n + y] >= 0 ? owner[x * n + y] : -1;
+            int& was = seen[x * n + y];
+            if (seed == 0 && was != now) { moves->push_back(x); moves->push_back(y); moves->push_back(was); moves->push_back(now); ++c; }
+            was = now;
+        }
+    return c;
+}
+/* T-1442 step 1b (F1421): THE EARLY AREA REPORT - a game reports its loaded areas when an area becomes loaded or stops being loaded, not
+   only on its 1 s clock. The engine's per-frame area update (0xA0A960, zones.cpp detour_ZoneMapUpdate) copies the area's 'loaded' byte
+   +0xB3; its value before and after the original, and the original's answer (0 = the area was unloaded and removed), make the event: */
+enum { kAreaEvNone = 0, kAreaEvLoaded = 1, kAreaEvUnloaded = 2 };
+const unsigned long long kZoneMapLoadedByte = 0xB3;   // ZoneMap + 0xB3: the loaded byte (the copy routine 0xA1C8D0 copies +0xB1 onto it, F1421)
+inline int AreaUpdateEvent(int before, int after, int ret)
+{
+    if (ret == 0 || (before != 0 && after == 0)) return kAreaEvUnloaded;
+    if (before == 0 && after != 0) return kAreaEvLoaded;
+    return kAreaEvNone;
+}
+/* the early path runs only when an event is owed, the 1 s clock is not due (the regular report runs then and clears the mark), and a
+   regular report of this world was sent (its judgements are what the early report carries) */
+inline int EarlyReportRuns(int owed, int clockDue, int haveRegular) { return (owed != 0 && clockDue == 0 && haveRegular != 0) ? 1 : 0; }
+/* THE MERGE (the fold 1c BLOCKER): an early read judges nothing it can avoid. last = the last REGULAR read's judged areas; now = the
+   engine's loaded areas at this read, each with a FIRST SIGHT's judgement (WhyFromCountdowns with no previous read, the last regular
+   read's loading mark). out = every area of now, carrying last's judgement when last lists it (its 'kept' etc. unchanged) and now's
+   first-sight judgement only for an area last did not list; an area of last that now lacks is dropped. Both inputs Normalise'd; out is.
+   *added / *removed count the areas new to / gone from last.
+   fold 1b-3: lastJudged 0 = the last regular read was taken while LOADING, so its judgements carry no 'kept' at all (loading never sets
+   it) - they are then not carried: an area both list takes now's first-sight judgement (under an unmarked early report the loading
+   read's judgements would drop every area - the fold 1c BLOCKER the other way round). */
+inline void EarlyMerge(const std::vector<Area>& last, const std::vector<Area>& now, std::vector<Area>* out, int* added, int* removed, int lastJudged = 1)
+{
+    out->clear(); int a = 0, r = 0;
+    size_t i = 0, j = 0;
+    while (i < last.size() || j < now.size())
+    {
+        if (j >= now.size() || (i < last.size() && AreaBefore(last[i], now[j]))) { ++r; ++i; continue; }
+        if (i >= last.size() || AreaBefore(now[j], last[i])) { out->push_back(now[j]); ++a; ++j; continue; }
+        out->push_back(lastJudged != 0 ? last[i] : now[j]); ++i; ++j;   /* the same area: the regular read's judgement (when it judged) */
+    }
+    if (added) *added = a;
+    if (removed) *removed = r;
+}
+/* 1 = the merged read shows every named event's latest state: a loaded area in it, an unloaded one not (an area named twice counts by
+   its LAST event). ev = n triples x, y, kind in the order raised. */
+inline int EarlyReflects(const std::vector<Area>& merged, const int* ev, int n)
+{
+    for (int k = 0; k < n; ++k)
+    {
+        int later = 0;
+        for (int m = k + 1; m < n; ++m) if (ev[m * 3] == ev[k * 3] && ev[m * 3 + 1] == ev[k * 3 + 1]) { later = 1; break; }
+        if (later != 0) continue;
+        int in = 0;
+        for (size_t i = 0; i < merged.size(); ++i) if (merged[i].x == ev[k * 3] && merged[i].y == ev[k * 3 + 1]) { in = 1; break; }
+        if (ev[k * 3 + 2] == kAreaEvLoaded && in == 0) return 0;
+        if (ev[k * 3 + 2] == kAreaEvUnloaded && in != 0) return 0;
+    }
+    return 1;
+}
+/* what an early read does: kEarlySend = its list differs from the last report on the wire - send it; kEarlySame = the wire already
+   says this; and the owed mark is cleared (EarlyClears) only when the read reflects every named event and the wire carries it (sent
+   now, or the last report equal). A read that does not reflect an event keeps the mark (the next frame reads again; the next regular
+   report clears it). One read a frame at most - ZonesTick runs once a frame; no time limit. */
+enum { kEarlySend = 1, kEarlySame = 2 };
+inline int EarlyAction(const std::vector<int>& xy, int loading, const std::vector<int>& lastSentXY, int lastSentLoading)
+{
+    return (xy == lastSentXY && (loading != 0) == (lastSentLoading != 0)) ? kEarlySame : kEarlySend;
+}
+// fold 1b-2 (review SHOULD 2): an UNNAMED event owed (the unload hook off the main thread or outside the area update, an unplaced area,
+// past the named list's cap) is never cleared by an early read - only by a regular report read after it.
+inline int EarlyClears(int reflects, int action, int sent, int unnamedOwed) { return (reflects != 0 && unnamedOwed == 0 && (action == kEarlySame || sent != 0)) ? 1 : 0; }
 }   // namespace loadedzones
 #endif

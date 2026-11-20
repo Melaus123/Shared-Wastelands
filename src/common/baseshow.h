@@ -62,7 +62,8 @@
 namespace baseshow {
 
 const unsigned kMsgShow = 78;
-const unsigned kProtocol = 153;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+const unsigned kProtocol = 170;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+
 
 
 
@@ -1191,6 +1192,83 @@ inline int TownLinkTickPlan(int ready, int mySlot, unsigned sinceLook, unsigned 
 {
     if (ready == 0) return 0;
     return (mySlot >= 0 ? kTickOwnCheck : 0) | (sinceLook >= lookMs ? kTickLook : 0);
+}
+/* T-1442 step 4 (F1442 design A): a copy of another player's outpost this apply founded, took, founded again, or tracks with this
+   id for the first time (step a kRow* step; refound 1 = founded again far away; prevId = the id the base carried before this apply,
+   0 = not tracked; going 1 = the base is being put back) - 1 = the id is OWED: the pieces standing here whose records name it are
+   linked into it at the next ready frame (TlOwedTick), not at the 5 s look. A copy kept as it was owes nothing (its pieces are in it) */
+inline int OwedOnApply(int step, int refound, unsigned prevId, unsigned rowId, int going)
+{
+    if (rowId == 0 || going != 0) return 0;
+    return (step != kRowKeep || refound != 0 || prevId != rowId) ? 1 : 0;
+}
+/* the owed pass's step for one record: kOwedUntouched = it names no owed id (left to the look); kOwedApply = linked now (TlApplyPiece:
+   a piece already in it is a no-op, kTlSame); kOwedLater = the frame's relinks reached the cap - the pass stops, the id stays owed and
+   the next frame goes on from this record */
+const int kOwedUntouched = 0, kOwedApply = 1, kOwedLater = 2;
+inline int OwedPieceStep(int idOwed, int relinks, int cap)
+{
+    if (idOwed == 0) return kOwedUntouched;
+    return relinks >= cap ? kOwedLater : kOwedApply;
+}
+/* one owed id's pass, across the frames it takes: where the next frame goes on (a record id, "" = the first), and its tally */
+struct OwedPass
+{
+    std::string from;
+    long linked, already, left, away, frames;
+    OwedPass() : linked(0), already(0), left(0), away(0), frames(0) {}
+};
+/* one record's outcome: relinked 1 = moved into the town; same 1 = found in it already (kTlSame); notLinkable 1 = a piece the look
+   would not link either (not standing here, inside a building, this game's own piece); else left to the 5 s look (refused, no town
+   here yet, a failed relink) */
+const int kOwedLinked = 0, kOwedAlready = 1, kOwedLeft = 2, kOwedAway = 3;
+inline int OwedOutcome(int relinked, int same, int notLinkable)
+{
+    if (relinked != 0) return kOwedLinked;
+    if (same != 0) return kOwedAlready;
+    return notLinkable != 0 ? kOwedAway : kOwedLeft;
+}
+inline void OwedTally(OwedPass* p, int outcome)
+{
+    if (outcome == kOwedLinked) ++p->linked;
+    else if (outcome == kOwedAlready) ++p->already;
+    else if (outcome == kOwedAway) ++p->away;
+    else ++p->left;
+}
+/* T-1442 step 4 fold 4: one ready frame of the owed pass (TlOwedTick). recs: the records by record id (a sorted map); ops->LinkOf(rec)
+   = the outpost id the record names; ops->Apply(recId, rec) = its outcome (kOwed*; kOwedLinked spends the frame's budget). The ids
+   are walked in order, one budget of cap relinks for the frame over all of them; the cap is checked at a record naming the id, before
+   it is applied: there the id's pass stops, notes where it goes on (p.from) and the frame ends - that id and the ones after it stay
+   owed. An id whose walk reached the end leaves the owed map (into *done, for its line) */
+template <class Recs, class Ops>
+inline void OwedFrame(std::map<unsigned, OwedPass>* owed, const Recs& recs, int cap, Ops* ops, std::vector<std::pair<unsigned, OwedPass> >* done)
+{
+    int relinks = 0;
+    for (std::map<unsigned, OwedPass>::iterator o = owed->begin(); o != owed->end(); )
+    {
+        OwedPass& p = o->second;
+        ++p.frames;
+        for (typename Recs::const_iterator it = recs.lower_bound(p.from); it != recs.end(); ++it)
+        {
+            if (ops->LinkOf(it->second) != o->first) continue;   /* another outpost's record: untouched */
+            if (OwedPieceStep(1, relinks, cap) == kOwedLater) { p.from = it->first; return; }   /* the rest at the next frame */
+            const int out = ops->Apply(it->first, it->second);
+            if (out == kOwedLinked) ++relinks;
+            OwedTally(&p, out);
+        }
+        if (done != 0) done->push_back(*o);
+        owed->erase(o++);
+    }
+}
+/* T-1442 step 4 fold 2 (the kept road): a kept outpost row's pass at its town's founding or taking (BdTownsOwedTick). Progress = a
+   piece SETTLED (linked, already in its town, or inside a building - never looked at again this world), so a capped drain that
+   settled any piece goes on at the next drain for a row that settled one or that the cap stopped before it was reached (attempted
+   0); a row that was reached and settled nothing (only refused pieces), a whole drain, or a capped drain that settled nothing ends
+   the pass and the 5 s look is the backstop. Each staying drain settles a piece, so the pass ends (re-check fold) */
+inline int KeptOwedStays(int capped, int anySettled, int rowSettled, int rowAttempted)
+{
+    if (capped == 0 || anySettled == 0) return 0;
+    return (rowSettled != 0 || rowAttempted == 0) ? 1 : 0;
 }
 /* an allowed load (store.cpp LoadGamePrepared): the world generation read BEFORE the prepare (which arms the save's discovered set),
    then the engine's load, then its end with that generation (a load that made no world is disarmed) */

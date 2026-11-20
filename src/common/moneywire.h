@@ -30,7 +30,8 @@
 namespace moneyw {
 
 /* ---- message numbers and the world-server protocol (store_main.cpp and store.cpp check these at compile time) ---- */
-const unsigned kProtocol = 153;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
+const unsigned kProtocol = 170;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
+
 
 
 
@@ -225,13 +226,46 @@ inline HintSpot PlaceHint(int W, int textLeft, int editRight, int rowY, int lh, 
 
 /* ---- the sender's and receiver's own ledger, carried in the pp.money record ---- */
 struct OutRow { unsigned long long transfer; unsigned toSlot; int amount; OutRow() : transfer(0), toSlot(0), amount(0) {} };
+/* T-1167 piece 3 build 2: A HELD ROW - money a player trade's LOCK took out of the purse and holds until the world server's one
+   decision: COMMITTED (the world server books it into the other side's inbox under `transfer`, a number reserved from this ledger's
+   transfer numbers, so its seen set makes a retry a repeat) or ABORTED (given back to the purse in one write with the row's removal).
+   It is never sent as MONEY_SEND (an outbox row is re-sent on every link: a gift before any decision). */
+struct HoldRow { unsigned long long trade, transfer; int amount; HoldRow() : trade(0), transfer(0), amount(0) {} };
 struct Ledger
 {
     unsigned long long nextTransfer;   /* the lowest transfer number the next SEND may take (NextNumber) */
     unsigned long long applied;        /* the highest inbox number whose money is in the balance beside it */
     std::vector<OutRow> out;           /* sent money the world server has not acknowledged yet, oldest first */
+    std::vector<HoldRow> held;         /* T-1167 piece 3: a trade lock's money, out of the purse until the decision (pp.money version 3) */
     Ledger() : nextTransfer(0), applied(0) {}
 };
+const size_t kHeldMax = 16;   /* held rows at most (a game holds one lock at a time; a crash may leave a few until their decisions) */
+inline int LedgerFindHold(const Ledger& l, unsigned long long trade)
+{
+    for (size_t i = 0; i < l.held.size(); ++i) if (l.held[i].trade == trade) return (int)i;
+    return -1;
+}
+/* a trade's held row: 1 made (*made; its transfer number reserved - nextTransfer moves past it), 2 that trade already holds one
+   (*made = it, nothing changed: a repeated LOCK_NOW), 0 refused (no trade id, nothing to hold, or the rows are full) */
+inline int LedgerAddHold(Ledger* l, unsigned long long nowSec, unsigned long long trade, int amount, HoldRow* made)
+{
+    const int at = LedgerFindHold(*l, trade);
+    if (at >= 0) { *made = l->held[(size_t)at]; return 2; }
+    if (trade == 0 || amount <= 0 || l->held.size() >= kHeldMax) return 0;
+    HoldRow r; r.trade = trade; r.transfer = NextNumber(l->nextTransfer, nowSec); r.amount = amount;
+    l->nextTransfer = r.transfer + 1;
+    l->held.push_back(r);
+    *made = r;
+    return 1;
+}
+inline bool LedgerDropHold(Ledger* l, unsigned long long trade, HoldRow* gone)
+{
+    const int at = LedgerFindHold(*l, trade);
+    if (at < 0) return false;
+    if (gone) *gone = l->held[(size_t)at];
+    l->held.erase(l->held.begin() + (long)at);
+    return true;
+}
 const size_t kOutMax = 64;   /* outbox rows at most; a SEND past it is refused (not now) */
 inline bool LedgerAddOut(Ledger* l, unsigned long long nowSec, unsigned toSlot, int amount, OutRow* made)
 {
@@ -251,19 +285,28 @@ inline bool LedgerDropOut(Ledger* l, unsigned long long transfer, OutRow* gone)
 
 /* THE pp.money RECORD. Version 1 (mmo3, ownrec.h EncodeMoney): the tag "om3m" (int32 length + bytes) and the int32 balance.
    Version 2 (T-810) adds, after the balance: int32 2, u64 nextTransfer, u64 applied, u32 rows, rows * {u64 transfer, u32
-   receiver slot, i32 amount}. A version-1 record reads as an empty ledger. */
+   receiver slot, i32 amount}. A version-1 record reads as an empty ledger.
+   Version 3 (T-1167 piece 3 build 2) is version 2 with, after the outbox rows: u32 held rows, rows * {u64 trade id, u64 transfer,
+   i32 amount} - a trade lock's money (HoldRow), in the SAME record and so the same write as the balance it left. It is written only
+   while a row is held; with none held the record is written as version 2, so a build that knows no version 3 reads it as before.
+   Versions 1 and 2 read as no holds. A build without version 3 cannot decode a version-3 record, and the store never writes over a
+   pp.money it could not read (store.cpp OwnMoneyBaseLoad, "ledger-unreadable": no money moves that load). */
 const int kRecVersion = 2;
+const int kRecVersionHeld = 3;
 inline void EncodeRec(int money, const Ledger& l, std::vector<char>* out)
 {
     out->clear();
     PutU32(out, 4u); out->insert(out->end(), "om3m", "om3m" + 4);
     PutU32(out, (unsigned)money);
-    PutU32(out, (unsigned)kRecVersion);
+    PutU32(out, (unsigned)(l.held.empty() ? kRecVersion : kRecVersionHeld));
     PutU64(out, l.nextTransfer); PutU64(out, l.applied);
     PutU32(out, (unsigned)l.out.size());
     for (size_t i = 0; i < l.out.size(); ++i) { PutU64(out, l.out[i].transfer); PutU32(out, l.out[i].toSlot); PutU32(out, (unsigned)l.out[i].amount); }
+    if (l.held.empty()) return;
+    PutU32(out, (unsigned)l.held.size());
+    for (size_t i = 0; i < l.held.size(); ++i) { PutU64(out, l.held[i].trade); PutU64(out, l.held[i].transfer); PutU32(out, (unsigned)l.held[i].amount); }
 }
-/* *version: 1 (no ledger: *l empty) or 2. false = not a money record of either version. */
+/* *version: 1 (no ledger: *l empty), 2 (no holds) or 3. false = not a money record of any of them. */
 inline bool DecodeRec(const std::vector<char>& b, int* money, Ledger* l, int* version)
 {
     Cur c = CurOf(b.empty() ? 0 : &b[0], b.size());
@@ -273,7 +316,8 @@ inline bool DecodeRec(const std::vector<char>& b, int* money, Ledger* l, int* ve
     if (c.bad) return false;
     Ledger o;
     if (CurEnd(c)) { *money = m; *l = o; *version = 1; return true; }
-    if ((int)GetU32(&c) != kRecVersion) return false;
+    const int ver = (int)GetU32(&c);
+    if (c.bad || (ver != kRecVersion && ver != kRecVersionHeld)) return false;
     o.nextTransfer = GetU64(&c); o.applied = GetU64(&c);
     const unsigned rows = GetU32(&c);
     if (c.bad || rows > (unsigned)kOutMax) return false;
@@ -283,8 +327,19 @@ inline bool DecodeRec(const std::vector<char>& b, int* money, Ledger* l, int* ve
         if (c.bad || r.amount <= 0) return false;
         o.out.push_back(r);
     }
+    if (ver == kRecVersionHeld)
+    {   /* version 3: at least one held row (an empty list is written as version 2), each a trade, a transfer and money; no trade twice */
+        const unsigned holds = GetU32(&c);
+        if (c.bad || holds == 0 || holds > (unsigned)kHeldMax) return false;
+        for (unsigned i = 0; i < holds; ++i)
+        {
+            HoldRow h; h.trade = GetU64(&c); h.transfer = GetU64(&c); h.amount = (int)GetU32(&c);
+            if (c.bad || h.trade == 0 || h.transfer == 0 || h.amount <= 0 || LedgerFindHold(o, h.trade) >= 0) return false;
+            o.held.push_back(h);
+        }
+    }
     if (!CurEnd(c)) return false;
-    *money = m; *l = o; *version = 2;
+    *money = m; *l = o; *version = ver;
     return true;
 }
 
@@ -539,6 +594,14 @@ inline std::string SaveLedgerText(const std::string& store, const std::string& w
         if (l.out[i].amount <= 0) return std::string();
         t += "o\t" + U64Text(l.out[i].transfer) + "\t" + U64Text((unsigned long long)l.out[i].toSlot) + "\t" + U64Text((unsigned long long)l.out[i].amount) + "\n";
     }
+    /* T-1167 piece 3 build 2: h <trade id> <transfer> <amount> per held row, after the outbox rows (none held: none written, so the
+       file reads in a build without held rows as before) */
+    if (l.held.size() > kHeldMax) return std::string();
+    for (size_t i = 0; i < l.held.size(); ++i)
+    {
+        if (l.held[i].amount <= 0 || l.held[i].trade == 0 || l.held[i].transfer == 0) return std::string();
+        t += "h\t" + U64Text(l.held[i].trade) + "\t" + U64Text(l.held[i].transfer) + "\t" + U64Text((unsigned long long)l.held[i].amount) + "\n";
+    }
     return t;
 }
 /* false = not a whole ledger file of this version (nothing set) */
@@ -574,6 +637,16 @@ inline bool SaveLedgerParse(const std::string& text, std::string* store, std::st
         size_t a = 0;
         for (;;) { const size_t tb = ln[i].find('\t', a); f.push_back(ln[i].substr(a, tb == std::string::npos ? std::string::npos : tb - a)); if (tb == std::string::npos) break; a = tb + 1; }
         unsigned long long tr = 0, sl = 0, am = 0;
+        if (f.size() == 4 && f[0] == "h")
+        {   /* T-1167 piece 3 build 2: a held row (they follow the outbox rows) */
+            if (!U64Of(f[1], &tr) || !U64Of(f[2], &sl) || !U64Of(f[3], &am) || tr == 0 || sl == 0 || am == 0 || am > 2147483647ULL
+                || o.held.size() >= kHeldMax || LedgerFindHold(o, tr) >= 0)
+                return false;
+            HoldRow h; h.trade = tr; h.transfer = sl; h.amount = (int)am;
+            o.held.push_back(h);
+            continue;
+        }
+        if (!o.held.empty()) return false;   /* an outbox row after a held row: not a file this header writes */
         if (f.size() != 4 || f[0] != "o" || !U64Of(f[1], &tr) || !U64Of(f[2], &sl) || !U64Of(f[3], &am) || sl > 0xFFFFFFFFULL || am == 0 || am > 2147483647ULL)
             return false;
         if (o.out.size() >= kOutMax) return false;

@@ -11,7 +11,7 @@
 //   up   ADD  {u32 op = 2, u32 count, count x (u32 len, bytes)} - copy ids this game made (1..kMaxIds)
 //   down LIST {u32 op = 1, u32 count, ...} - the world's whole list (0..kMaxIds); further ids of a long list follow as ADD
 //   down ADD  - ids another game made
-// Every id is a copy id (spimport::IsCopySid) of at most spimport::kCopySidMax bytes; a message with any other is malformed whole.
+// Every id is a copy id (spimport::IsCopySid: an import copy, or since T-1021 / protocol 166 a race look-alike) of at most spimport::kCopySidMax bytes; a message with any other is malformed whole.
 #pragma once
 #include <string>
 #include <vector>
@@ -21,7 +21,8 @@
 namespace lalist {
 
 const unsigned kMsgLookalike = 90;
-const unsigned kProtocol = 153;          /* the world-server protocol that carries LOOKALIKE */
+const unsigned kProtocol = 170;          /* the world-server protocol that carries LOOKALIKE */
+
 
 const unsigned kOpList = 1, kOpAdd = 2;
 const unsigned kMaxIds = 256;            /* ids in one message; a longer list goes as one LIST and then ADD messages */

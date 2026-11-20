@@ -114,6 +114,25 @@ void t_t904_wall_hit()
     if (coopbuild::BuildHitVerdict(0, 1, 1, 1, 1) != coopbuild::kBuildHitRuin) Fail("T-904: a hit on a ruin is not refused");
     if (coopbuild::BuildHitVerdict(0, 1, 1, 0, 0) != coopbuild::kBuildHitNotWriter) Fail("T-904: a hit on a game that does not write the wall is not answered 'not writer'");
     if (std::string(coopbuild::BuildHitWord(6)).find("writer") == std::string::npos) Fail("T-904: verdict 6 has no word");
+    {   /* T-1381: the attacker words the HIT lines carry */
+        char aw[200];
+        coopbuild::BuildHitAttackerWords(aw, sizeof aw, 1, "Drone", "The Hive", 1, -1, 4194470u, "Caravan");
+        if (std::string(aw) != "by 'Drone' (faction 'The Hive', run by this game, uid 4194470, doing 'Caravan')") Fail("T-1381: own attacker words: " + std::string(aw));
+        coopbuild::BuildHitAttackerWords(aw, sizeof aw, 1, "Drone", "", 0, 1, 1025u, 0);
+        if (std::string(aw) != "by 'Drone' (faction '(not read)', run by slot1's game, uid 1025, doing '(not read)')") Fail("T-1381: copy attacker words: " + std::string(aw));
+        coopbuild::BuildHitAttackerWords(aw, sizeof aw, 1, "", "Hounds", -1, -1, 0u, "");
+        if (std::string(aw).find("no game shares it, no uid") == std::string::npos || std::string(aw).find("(name not read)") == std::string::npos) Fail("T-1381: no-uid attacker words: " + std::string(aw));
+        coopbuild::BuildHitAttackerWords(aw, sizeof aw, 0, "x", "y", 1, 0, 5u, "z");
+        if (std::string(aw) != "by nobody named (the engine gave no attacker)") Fail("T-1381: no attacker words: " + std::string(aw));
+        char tiny[8];
+        coopbuild::BuildHitAttackerWords(tiny, sizeof tiny, 1, "Drone", "The Hive", 1, -1, 1u, "Caravan");
+        if (std::string(tiny).size() != 7) Fail("T-1381: attacker words not cut inside the buffer");
+        /* T2436 fix: a hit seen off the main thread is read later by its uid; with no uid it cannot be read */
+        if (coopbuild::BuildHitAttackerReadWhere(1, 0u) != coopbuild::kBuildAtkReadNow) Fail("T-1381: a main-thread hit is not read at once");
+        if (coopbuild::BuildHitAttackerReadWhere(1, 543u) != coopbuild::kBuildAtkReadNow) Fail("T-1381: a main-thread hit with a uid is not read at once");
+        if (coopbuild::BuildHitAttackerReadWhere(0, 543u) != coopbuild::kBuildAtkReadByUid) Fail("T-1381: an off-thread hit with a uid is not read later by its uid");
+        if (coopbuild::BuildHitAttackerReadWhere(0, 0u) != coopbuild::kBuildAtkReadNone) Fail("T-1381: an off-thread hit with no uid is said readable");
+    }
     /* the RESULT form: kind | key | seq | drop | needed | 7 | flags | after */
     {
         coopbuild::BuildMsg r;
@@ -1145,6 +1164,54 @@ void t_installer1_steam_paths()
     if (coopinst::WorkshopGameFolder("D:\\SteamLibrary\\steamapps\\workshop\\content\\233860\\") != "") Fail("no item id is not the layout");
     if (coopinst::WorkshopGameFolder("D:\\SteamLibrary\\steamapps\\workshop\\content\\294100\\1") != "") Fail("another game's Workshop folder was taken");
     if (coopinst::WorkshopGameFolder("C:\\Kenshi\\mods\\Shared Wastelands") != "") Fail("a mods folder is not the Workshop layout");
+}
+
+/* T-1364 (owner 1667 / 1668): does Setup copy its own folder into <Kenshi>\mods\?  And when is it installed? */
+void t_t1364_copy_needed()
+{
+    const std::string gog = "C:\\GOG Games\\Kenshi";
+    /* a folder outside Kenshi: the GOG report (SteamCMD unpacked the mod elsewhere) */
+    if (!coopinst::CopyNeeded("D:\\Downloads\\steamapps\\workshop\\content\\233860\\3001234567", gog)) Fail("another library's Workshop folder must copy");
+    if (!coopinst::CopyNeeded("D:\\Downloads\\Shared Wastelands", gog)) Fail("an outside folder must copy");
+    if (!coopinst::CopyNeeded("C:\\GOG Games\\Kenshi", gog)) Fail("the Kenshi folder itself must copy");
+    if (!coopinst::CopyNeeded("C:\\GOG Games\\Kenshi\\mods", gog)) Fail("the mods folder itself must copy");
+    if (!coopinst::CopyNeeded("C:\\GOG Games\\Kenshi\\mods\\Shared Wastelands\\sub", gog)) Fail("two levels below mods must copy (the loader looks one level down)");
+    if (!coopinst::CopyNeeded("C:\\GOG Games\\Kenshi2\\mods\\Shared Wastelands", gog)) Fail("a similar-named game folder must copy");
+    if (!coopinst::CopyNeeded("", gog) || !coopinst::CopyNeeded("D:\\x", "")) Fail("an empty path must copy");
+    /* <Kenshi>\mods\<any name>: no copy, any case, either slash, trailing or repeated slashes */
+    if (coopinst::CopyNeeded("C:\\GOG Games\\Kenshi\\mods\\Shared Wastelands", gog)) Fail("<Kenshi>\\mods\\Shared Wastelands copied");
+    if (coopinst::CopyNeeded("c:/gog games/KENSHI/Mods/shared wastelands/", gog)) Fail("case / slashes / trailing slash copied");
+    if (coopinst::CopyNeeded("C:\\GOG Games\\Kenshi\\mods\\\\Shared Wastelands\\\\", "C:\\GOG Games\\Kenshi\\")) Fail("repeated slashes copied");
+    if (coopinst::CopyNeeded("C:\\GOG Games\\Kenshi\\mods\\SW-0.4.2", gog)) Fail("another folder name under mods copied");
+    /* short names: Setup expands them (GetLongPathName) before asking; the rule itself compares text */
+    if (coopinst::CopyNeeded("C:\\PROGRA~2\\Kenshi\\mods\\SHARED~1", "c:\\progra~2\\kenshi")) Fail("short names that match copied");
+    if (!coopinst::CopyNeeded("C:\\PROGRA~2\\Kenshi\\mods\\SHARED~1", "C:\\Program Files (x86)\\Kenshi")) Fail("unexpanded short names compared equal");
+    /* the Workshop folder this Kenshi's loader searches: <Kenshi>\..\..\workshop\content\233860\<id> */
+    const std::string steam = "D:\\SteamLibrary\\steamapps\\common\\Kenshi";
+    if (coopinst::CopyNeeded("D:\\SteamLibrary\\steamapps\\workshop\\content\\233860\\3001234567", steam)) Fail("the Workshop copy copied");
+    if (coopinst::CopyNeeded("d:/steamlibrary/SteamApps/Workshop/Content/233860/3001234567/", steam + "\\")) Fail("Workshop case / slashes copied");
+    if (!coopinst::CopyNeeded("D:\\SteamLibrary\\steamapps\\workshop\\content\\233860", steam)) Fail("the Workshop root itself must copy");
+    if (!coopinst::CopyNeeded("D:\\SteamLibrary\\steamapps\\workshop\\content\\233860\\1\\inner", steam)) Fail("below a Workshop item must copy");
+    if (!coopinst::CopyNeeded("E:\\Steam\\steamapps\\workshop\\content\\233860\\3001234567", steam)) Fail("another library's Workshop item must copy");
+    if (coopinst::LoaderWorkshopKey("D:\\Kenshi") != "d:\\workshop\\content\\233860") Fail("a root-level Kenshi's Workshop folder");
+    if (coopinst::LoaderWorkshopKey(steam) != "d:\\steamlibrary\\steamapps\\workshop\\content\\233860") Fail("the Steam Workshop folder");
+    /* the path helpers */
+    if (coopinst::InstPathKey("C:\\") != "c:" || coopinst::InstPathKey("\\\\Srv\\Share\\") != "\\\\srv\\share") Fail("InstPathKey root / UNC");
+    if (!coopinst::InstInside("C:\\K\\mods\\Shared Wastelands\\x", "c:/k/mods/shared wastelands") || !coopinst::InstInside("C:\\K", "c:\\k\\"))
+        Fail("InstInside below / equal");
+    if (coopinst::InstInside("C:\\K\\mods\\Shared Wastelands2", "C:\\K\\mods\\Shared Wastelands") || coopinst::InstInside("C:\\K", "C:\\K\\mods"))
+        Fail("InstInside sibling / parent");
+    /* installed = game + loader + line + a usable marker where the loader looks (decision 1668) */
+    if (!coopinst::SetupInstalled(true, true, true, true)) Fail("all four: installed");
+    if (coopinst::SetupInstalled(true, true, true, false)) Fail("loader + line with no mod folder must show the Install screen");
+    if (coopinst::SetupInstalled(true, false, true, true) || coopinst::SetupInstalled(true, true, false, true) || coopinst::SetupInstalled(false, true, true, true))
+        Fail("a missing loader / line / game is not installed");
+    /* uninstall recycles only a copy Setup made (owner 1668): the note present, Setup not inside it */
+    if (!coopinst::UninstallRecyclesCopy(true, true, false)) Fail("a Setup-made copy (note present) must be recycled");
+    if (coopinst::UninstallRecyclesCopy(true, false, false)) Fail("a hand-placed folder (no note) must be kept");
+    if (coopinst::UninstallRecyclesCopy(true, true, true)) Fail("the folder Setup runs from must be kept");
+    if (coopinst::UninstallRecyclesCopy(false, false, false)) Fail("no folder: nothing to recycle");
+    if (std::string(coopinst::SetupNoteName()) == swnames::kLoaderMarker || std::string(coopinst::SetupNoteName()).empty()) Fail("the note's name");
 }
 
 /* mig6 (owner 118): the loader's marker file - src/common/loadermarker.h, the code SharedWastelandsLoader.dll runs. */
@@ -7970,7 +8037,7 @@ void t_m6_road_local_inner_types()
     for (unsigned int t = 0; t < 256; ++t)
     {
         const bool local = cooplive::LiveInnerRoadLocal(t);
-        if (local != (t == 200 || t == 201 || t == 202 || t == 3 || t == 4 || t == 56 || t == 203 || t == 204 || t == 205 || t == 206)) { Fail("the notebook road's own inner types are not exactly 200, 201, OWNER_MOVED 202, PING 3, PONG 4, SESSION_CLOSING 56, LOG_ASK 203, LOG_PART 204, CHAT 205 and MAP_DOTS 206"); break; }
+        if (local != (t == 200 || t == 201 || t == 202 || t == 3 || t == 4 || t == 56 || t == 203 || t == 204 || t == 205 || t == 206 || t == 207 || t == 208)) { Fail("the notebook road's own inner types are not exactly 200, 201, OWNER_MOVED 202, PING 3, PONG 4, SESSION_CLOSING 56, LOG_ASK 203, LOG_PART 204, CHAT 205, MAP_DOTS 206, SPOT_PING 207 (T-1393) and LOG_REPLY 208"); break; }
         if (local && cooplive::LiveInnerAccepted(t)) { Fail("a road-local inner type would also be dispatched to the session layer"); break; }
     }
 }

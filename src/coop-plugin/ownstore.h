@@ -48,6 +48,9 @@ std::string OwnStoreDir();
    set by the writer thread under the queue lock). false = nothing to compare against. */
 bool OwnStoreLastFor(const std::string& key, long long* len, unsigned int* crc);
 bool OwnStoreLastSeqFor(const std::string& key, unsigned long long* seq);   /* T-889 fold 5, MAIN THREAD: OwnStoreLastFor's record's seq (the queued job's, else the last committed) */
+void OwnStoreKeys(std::vector<std::string>* out);   /* T-1303, MAIN THREAD: every key the store holds (committed or queued) */
+bool OwnStoreCommittedSeqFor(const std::string& key, unsigned long long* seq);   /* T-1303 fold 2, MAIN THREAD: the last COMMITTED record's seq only */
+bool OwnStoreLastWithSeq(const std::string& key, long long* len, unsigned int* crc, unsigned long long* seq);   /* T-1303 fold 2, MAIN THREAD: OwnStoreLastFor plus its seq, one locked read */
 /* mmo1b (review-mmo1 item 1). MAIN THREAD. The writer thread never logs (the logger is not thread-safe); it records the
    first failure of each kind as plain data and this writes the line. */
 void OwnStoreDrainFailLog();
@@ -164,8 +167,27 @@ long long OwnStoreCheckpointNotesDropped();       /* fold 2: results lost becaus
 void OwnStoreCheckpointResults(std::vector<OwnCpResult>* out);   /* MAIN THREAD: the finished jobs' results since the last call (appended) */
 
 bool OwnStoreIdleNow();                           /* ANY THREAD: no record or checkpoint job waiting and the writer idle */
+/* ---- T-885 piece 1 (docs/design-ownrec.md): every record goes to the world server (ownupload.cpp) ---- */
+void OwnStoreUpNotes(std::vector<std::string>* out);   /* MAIN THREAD: the keys committed / text files written since the last call (appended) */
+void OwnStoreUpNoteText(const std::string& name);      /* MAIN THREAD: a travelling text file (pp.left.notes, pp.ledger, pp.handover) was written */
+bool OwnStoreCommittedLine(const std::string& key, unsigned long long* seq, long long* len, unsigned int* crc, int* chars, long long* writtenAt = 0);   /* MAIN THREAD: key's last COMMITTED index line */
+void OwnUpTick();                                 /* MAIN THREAD, every frame from OwnTick: the outbox - send what is unconfirmed */
+void OwnUpOnWelcome();                            /* MAIN THREAD, every WELCOME: every unconfirmed record is sent again */
+void OwnUpOnOk(const std::vector<char>& payload);  /* MAIN THREAD, an OWNREC OK from the world server */
+std::string OwnUpReportToken();                   /* MAIN THREAD: ownrec[...] on the REPORT line */
+int  OwnUpCommand(const std::string& arg, std::string* status);   /* MAIN THREAD, the TEST-ONLY `ownrec compare | hold on|off` lever */
 /* store.cpp */
 std::string OwnAutoStoreWant();                                          /* T-490: MAIN THREAD - the player's records store name for this link's world */
 void OwnAutoStoreBeforeLoad();                                           /* T-251 fold 2: MAIN THREAD, the load gate and loadGame - the player's store opened before the load */
+bool OwnWorldLive();                                                     /* mmo1b: MAIN THREAD - a live world the records writer may touch */
+/* ---- T-885 piece 2 "Take" (docs/design-ownrec.md section 3): the world server's copy restores the player's records before every load ---- */
+bool OwnTakeRefusedFor(const std::string& store, long linkGen);   /* ownupload.cpp, MAIN THREAD: fold round 2 - the take on this link for this store ended refused (a key the world holds newer not taken): the load gate refuses */
+void OwnTakeLoadGone();                           /* ownupload.cpp, MAIN THREAD (PreloadNoRequest): the load request went away - a refused take is forgotten, the next load takes again */
+void OwnTakeHeard();                              /* ownupload.cpp, MAIN THREAD (PumpLink): a message arrived on the world server's link - progress for the take's stall timer */
+int  OwnTakeHold(long linkGen);                   /* ownupload.cpp, MAIN THREAD, PreloadHoldsTitleLoad: 1 = the load stays held this frame (the take runs), 0 = taken (or nothing to take) on this link */
+bool OwnTakeDoneFor(const std::string& store, long linkGen);   /* ownupload.cpp, MAIN THREAD: the take of this store finished on this link */
+int  OwnTakeStoreReady(std::string* want);        /* store.cpp, MAIN THREAD: 1 = the player's own store is open (opened here if not), 0 = nothing to take (records off, no profile folder, a test's store), -1 = it did not open */
+void OwnTakeRaise(unsigned long long w);          /* store.cpp, MAIN THREAD: own.index's identity set and the write counter raised to at least w */
+void OwnTakeGuard(const std::string& store, bool fetchedAny);   /* store.cpp, MAIN THREAD: a store refused earlier is judged again when the take fetched anything (the take never switches the older-records check off - fold round 2) */
 
 }   // namespace coop

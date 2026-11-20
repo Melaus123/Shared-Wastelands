@@ -691,7 +691,7 @@ teamscreen::View ViewNow(const std::vector<playerstab::RowView>& rows, int selSl
     if (i >= 0)
     {
         const playerstab::RowView& r = rows[(size_t)i];
-        s.mate = r.teammate; s.inTeam = r.inTeam; s.online = r.online; s.you = r.you; s.name = r.name; s.faction = r.faction;
+        s.mate = r.teammate; s.inTeam = r.inTeam; s.online = r.online; s.you = r.you; s.them = r.them; s.name = r.name; s.faction = r.faction;
     }
     return teamscreen::ViewFor(i >= 0, s);
 }
@@ -1294,13 +1294,14 @@ void StanceBody(MyGUI::Widget* w)
     }
 }
 /* a request the box or the bottom line sends, through team.cpp's own request (the TEST lever's `team ...` sends the same) */
-void Request(const std::string& sub, int slot, const std::string& what)
+std::string Request(const std::string& sub, int slot, const std::string& what)   /* T-1406: returns team.cpp's answer (the right-click entry logs it) */
 {
     const std::string r = coop::TeamRequestSend(sub, slot);
     const bool ok = r.compare(0, 3, "ok ") == 0;
     if (ok) ++g_requestsSent; else ++g_requestsRefused;
     if (ok && sub == "invite") ++g_invitesSent;
     DebugLog("[PLAYERS] " + what + ": " + r + " (requests sent " + S(g_requestsSent) + ", not sent " + S(g_requestsRefused) + ")");
+    return r;
 }
 /* the left button: CANCEL closes the box (nothing changes); the invitation's DECLINE answers it */
 void BoxCancelBody()
@@ -1646,6 +1647,48 @@ void PlayersTabForgetWorld()
 }
 
 std::string PlayersTabCommand(const std::string& args) { return LeverCatching(args); }
+
+/* T-1406: the PLAYERS tab's own invite rule for player `slot`, read live: the bottom line would show INVITE TO FACTION with that
+   player's row selected (teamscreens.h ViewFor: online, in no faction of players, this player not a mere member, neither side
+   HOSTILE - InviteStanceAllows, T-1406 F1214). The same rows and
+   view the bottom line's button is read from at its press (ActBody). MAIN THREAD. */
+int PlayersTabInvites(int slot)
+{
+    if (slot < 0 || EngineWritesBlocked()) return 0;
+    try
+    {
+        const std::vector<playerstab::RowView> rows = BuildRows();
+        if (playerstab::RowOfSlot(rows, slot) < 0) return 0;
+        return ViewNow(rows, slot).right == teamscreen::kActInvite ? 1 : 0;
+    }
+    catch (...) { ++g_throws; return 0; }
+}
+/* T-1406 (T2524 L4): the stance the PLAYERS tab shows for player `slot`, read live from the same rows: *you this player's level
+   towards them (the ticked button; the tab's own hostile test, HostileConfirm), *them theirs towards this player (the THEM cell),
+   *teammate that player shares this player's faction. Unread levels are neutral, as the tab shows them. 0 = no row (nothing read).
+   MAIN THREAD. */
+int PlayersTabStance(int slot, int* you, int* them, int* teammate)
+{
+    *you = nametag::kUnknown; *them = nametag::kUnknown; *teammate = 0;
+    if (slot < 0 || EngineWritesBlocked()) return 0;
+    try
+    {
+        const std::vector<playerstab::RowView> rows = BuildRows();
+        const int i = playerstab::RowOfSlot(rows, slot);
+        if (i < 0) return 0;
+        *you = rows[(size_t)i].you; *them = rows[(size_t)i].them; *teammate = rows[(size_t)i].teammate ? 1 : 0;
+        return 1;
+    }
+    catch (...) { ++g_throws; return 0; }
+}
+/* T-1406: the right-click entry's click - the bottom line's own invitation (Request "invite", as INVITE TO FACTION sends it), only
+   while the rule above still holds at the click. Returns team.cpp's answer, or why nothing was sent. MAIN THREAD. */
+std::string PlayersTabInviteSend(int slot)
+{
+    if (PlayersTabInvites(slot) == 0) return "not sent: the PLAYERS tab's rule no longer offers INVITE TO FACTION for slot " + S(slot);
+    try { return Request("invite", slot, "right-click Invite to faction (slot " + S(slot) + ")"); }
+    catch (...) { ++g_throws; return "not sent: the request threw"; }
+}
 
 bool PlayersTabPlayerWords(int slot, std::string* name, std::string* faction)
 {

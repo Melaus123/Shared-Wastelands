@@ -1060,6 +1060,30 @@ float KnockClockAtLeastOwned(unsigned int uid, float seconds)
     return med->knockoutClock;
 }
 
+// T-1411 TEST-ONLY (`koself` hold renewal, appearance.cpp KoSelfHoldTick): while a `koself <uid> <seconds>` hold lasts, an
+// engine step that SETS the wake-up clock again (T2533: the engine's put-down set it to 14.48 s from 264, and the body woke
+// 9 s later) is overruled - when the character is still unconscious and its clock reads below `below`, the clock is set to
+// `to` and its STATE pushed. Writes nothing otherwise. Returns the clock after (>= 0), -1 not ours / no character /
+// unreadable, -2 dead, -3 awake (unconcious=0: nothing written - the lever never knocks out again). *beforeOut = the clock
+// read. MAIN THREAD.
+float KnockClockRenewOwned(unsigned int uid, float below, float to, float* beforeOut)
+{
+    if (beforeOut != 0) *beforeOut = -1.0f;
+    if (!net::IsUidMine(uid)) return -1.0f;
+    ::Character* c = FindSpawned(uid);
+    if (c == 0) return -1.0f;
+    MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
+    if (!PlausiblePtr(med)) return -1.0f;
+    if (med->dead) return -2.0f;
+    const float before = med->knockoutClock;
+    if (beforeOut != 0) *beforeOut = before;
+    if (!med->unconcious) return -3.0f;
+    if (before >= below || before >= to) return before;
+    med->knockoutClock = to;
+    StatePush(uid);
+    return med->knockoutClock;
+}
+
 // crash1b (T323): the owner's last STATE said this character is knocked out (the table OwnerSaysKo reads). ANY THREAD.
 bool CopyOwnerSaysKo(unsigned int uid) { return OwnerSaysKo(uid); }
 

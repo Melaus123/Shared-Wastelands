@@ -100,6 +100,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "../common/upnpplan.h"          /* T-53: MapOnHostStart */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "settings.h"                     /* mp5: SettingsHostChoices / SettingsLiveValue - the Game options screen */
+#include "../common/modorder.h"           /* T-1375: PUT MY MODS IN THE WORLD'S ORDER - its words */
 #include "../common/rulesfile.h"          /* rules.txt: the world's rules as GAME OPTIONS opens on them */
 #include "../common/optionvalue.h"        /* T-1202: the world server's own check of a row (store_main.cpp OptionValueOk's body) */
 #include "../common/stewardrules.h"       /* FirstHostingPress: only a world's first hosting puts this game's values in its rules */
@@ -119,6 +120,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "../common/ownrec.h"            /* uishot: the host-left texts the uipreview verb shows (coopown::HostLeftTitle ...) */
 #include "../common/worldreset.h"        /* RESET WORLD: the name the world as it was keeps (ResetCountNext, ResetOldWorldPick) */
 #include "../common/keeprun.h"           /* HOST GAME's keep-running box: host.key, "running now", stop.request and their words */
+#include "../common/typingfocus.h"      /* T-1393: is the player typing - the key-focus widget a writable text box */
 #include "../common/datadir.h"           /* PP3d: IdentityRefusesHostJoin / IdentityMayReplace, the identity box's buttons */
 #include "soak.h"                         /* uishot: GameplayRunning - a title preview is refused in a world and back */
 #include "bugreport.h"                    /* T-461: REPORT A BUG - its ESC at the title and its pause-menu row */
@@ -142,6 +144,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include <string>
 #include <cstdio>   // P8a: _snprintf for the fault line (no C++ object in a frame that must stay simple)
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
+#include "../common/startprogress.h"   /* T-1403: the world server's start-up progress file, read while HOST waits */
 
 namespace coop {
 extern unsigned char g_hostToken[];   /* store.cpp: this hosting's secret (the Steam bridge shows it in each STEAM_ID) - a re-join takes host.key's */
@@ -188,6 +191,7 @@ struct UiNames
     std::string landGroup, nameLabel, nameEdit, nameHint, landBackBtn, screenTitle, tryBtn;   /* mp1 */
     std::string worldsLabel, worldList, worldEmpty, newWorldBtn, optionsBtn, deleteBtn, resetBtn;   /* mp3; ui2: one scrolling list */
     std::string resetKeepTick, resetKeepLabel, resetTail;   /* RESET WORLD?'s keep-buildings tick box, its label, its last paragraph */
+    std::string resetDeadTick, resetDeadLabel, resetRelTick, resetRelLabel;   /* T-1383: RESET WORLD?'s keep-dead and keep-relations tick boxes */
     std::string keepTick, keepLabel, keepNote;              /* HOST GAME's keep-running tick box, its label, its note */
     std::string dlgGroup, dlgText, dlgNameLabel, dlgNameEdit, dlgOk, dlgCancel;                         /* mp3 */
     std::string hostingGroup, homeAddr, copyBtn, playersBox, chooseBtn, homeAddrLabel;     /* mp4; ui5: homeAddrLabel */
@@ -201,7 +205,8 @@ struct UiNames
     std::string profGroup, profList, profPlay, profNew, profDelete;          /* prof3; ui2: one scrolling list */
     std::string hostProfLabel, hostProfValue, hostProfChangeBtn;             /* T-201 PP6': HOST GAME's PROFILE row */
     std::string startLabel, startDec, startVal, startInc, startHint;         /* T-1096 part 3: NEW PROFILE's START WITH row and its hint */
-    std::string impList, impEmpty, impAlong, impBehind, impArrival;          /* T-1096 part 3: IMPORT FROM SINGLE PLAYER */
+    std::string impList, impEmpty, impCarry, impArrival;                    /* T-1096 part 3: IMPORT FROM SINGLE PLAYER (T-1383: one sentence for its two boxes) */
+    std::string impDeadTick, impDeadLabel, impRelTick, impRelLabel, impNote;   /* T-1383: its creator tick boxes and their note */
     std::string skinWindow, skinBtn1, skinBtn2, skinEdit, skinFlat, skinTick, skinWrap, skinPanel;
     std::string skinSolid, skinMulti, skinCaption;   /* ui3: skinCaption */
     std::string typeWindow, typeWidget, typeButton, typeEdit, typeText, typeMulti;
@@ -257,6 +262,7 @@ struct UiNames
         skinCaption = "Kenshi_TextboxPaintedText";
         newWorldBtn = "CoopNewWorldBtn"; optionsBtn = "CoopGameOptionsBtn"; deleteBtn = "CoopDeleteWorldBtn"; resetBtn = "SWResetWorldBtn";
         resetKeepTick = "SWResetKeepTick"; resetKeepLabel = "SWResetKeepLabel"; resetTail = "SWResetDlgTail";
+        resetDeadTick = "SWResetDeadTick"; resetDeadLabel = "SWResetDeadLabel"; resetRelTick = "SWResetRelTick"; resetRelLabel = "SWResetRelLabel";   /* T-1383 */
         keepTick = "SWKeepRunTick"; keepLabel = "SWKeepRunLabel"; keepNote = "SWKeepRunNote";
         dlgGroup = "CoopDlgGroup"; dlgText = "CoopDlgText"; dlgNameLabel = "CoopDlgNameLabel"; dlgNameEdit = "CoopDlgNameEdit";
         dlgOk = "CoopDlgOkBtn"; dlgCancel = "CoopDlgCancelBtn";
@@ -285,7 +291,8 @@ struct UiNames
         /* T-1096 part 3: NEW PROFILE's START WITH row (label, <, value, >) and its hint; IMPORT FROM SINGLE PLAYER's list, the line in its
            place, COMES ALONG / STAYS BEHIND and the arrival line. */
         startLabel = "SWStartLabel"; startDec = "SWStartDecBtn"; startVal = "SWStartVal"; startInc = "SWStartIncBtn"; startHint = "SWStartHintText";
-        impList = "SWImpList"; impEmpty = "SWImpEmptyText"; impAlong = "SWImpAlongList"; impBehind = "SWImpBehindList"; impArrival = "SWImpArrivalText";
+        impList = "SWImpList"; impEmpty = "SWImpEmptyText"; impCarry = "SWImpCarryText"; impArrival = "SWImpArrivalText";
+        impDeadTick = "SWImpDeadTick"; impDeadLabel = "SWImpDeadLabel"; impRelTick = "SWImpRelTick"; impRelLabel = "SWImpRelLabel"; impNote = "SWImpNoteText";   /* T-1383 */
         /* mp5 (design-mpmenu1 section 5): the Game options screen - three tab buttons, nine rows of label / < / value / >
            or a tick box, Defaults and Done. */
         optGroup = "CoopOptGroup";
@@ -294,7 +301,7 @@ struct UiNames
         for (int t = 0; t < coopui::kOptTabCount; ++t) optTab[t] = std::string("CoopOptTab") + (char)('0' + t);
         for (int r = 0; r < coopui::kOptRowsShown; ++r)
         {
-            const char d = (char)('0' + r);
+            const std::string d = coopui::PanelNum((long long)r);   /* T-1392: "10" for the eleventh row (0..9 as before) */
             optLabel[r] = std::string("CoopOptLabel") + d; optDec[r] = std::string("CoopOptDec") + d;
             optVal[r] = std::string("CoopOptVal") + d;     optInc[r] = std::string("CoopOptInc") + d;
             optTick[r] = std::string("CoopOptTick") + d;
@@ -583,8 +590,49 @@ enum UiActionCode
     kActResetKeep = 74,                                               /* RESET WORLD?'s keep-buildings tick box */
     kActOptDec9 = 75, kActOptInc9 = 76, kActOptTick9 = 77,            /* T-1096: GAME OPTIONS' tenth row (the MULTIPLAYER tab's import rows) */
     kActStartDec = 78, kActStartInc = 79, kActImpPick = 80, kActImpBox = 81,  /* T-1096 part 3: START WITH's arrows; the save picked; a box row clicked */
-    kActKeepTick = 82                                                 /* HOST GAME's keep-running tick box */
+    kActKeepTick = 82,                                                /* HOST GAME's keep-running tick box */
+    kActOptTab3 = 83,                                                 /* T-247: GAME OPTIONS' fourth tab, MODS (21..23 are the first three) */
+    kActModsUse = 84, kActModsYes = 85, kActModsNo = 86,              /* T-247: the MODS tab's USE MY MODS FOR THIS WORLD and its question's YES / NO */
+    kActModsOrder = 87,                                               /* T-1375: the MODS tab's PUT MY MODS IN THE WORLD'S ORDER */
+    kActOptDec10 = 88, kActOptInc10 = 89, kActOptTick10 = 90,         /* T-1392: GAME OPTIONS' eleventh row (MULTIPLAYER with MENUS AND BUILDING shown) */
+    kActResetDead = 91, kActResetRel = 92, kActImpDead = 93, kActImpRel = 94   /* T-1383's four tick boxes; T-1394 (F1117): were 83..86, the MODS tab's numbers, so GAME OPTIONS took their clicks */
 };
+/* T-1394 (F1117): EVERY CLICK CODE IS ONE NUMBER.  A switch may not hold two cases of one value (MSVC C2196), so two codes that share a
+   number stop the build here.  Every UiActionCode name is a case, and every member of a range (GAME OPTIONS' rows 0..8, its first three
+   tabs) and the retired row-button numbers (11..14, 54..58) too.  A new code is added to the enum AND here; the offline suite
+   (t1394_act_codes_unique) fails when an enum name is missing from this list.  Never called. */
+inline int UiActionCodesUnique(int a)
+{
+    switch (a)
+    {
+    case kActNone: case kActToggle: case kActClose: case kActGo: case kActPaste:
+    case kActModeHost: case kActModeJoin: case kActNotebookMine: case kActNotebookFar: case kActBack:
+    case kActWorldPick: case kActWorldPick + 1: case kActWorldPick + 2: case kActWorldPick + 3: case kActWorldPick + 4:
+    case kActNewWorld: case kActDeleteWorld: case kActDlgOk: case kActDlgCancel: case kActCopy:
+    case kActGameOptions: case kActOptTab0: case kActOptTab0 + 1: case kActOptTab0 + 2:
+    case kActOptDec0: case kActOptDec0 + 1: case kActOptDec0 + 2: case kActOptDec0 + 3: case kActOptDec0 + 4: case kActOptDec0 + 5: case kActOptDec0 + 6: case kActOptDec0 + 7: case kActOptDec0 + 8:
+    case kActOptInc0: case kActOptInc0 + 1: case kActOptInc0 + 2: case kActOptInc0 + 3: case kActOptInc0 + 4: case kActOptInc0 + 5: case kActOptInc0 + 6: case kActOptInc0 + 7: case kActOptInc0 + 8:
+    case kActOptTick0: case kActOptTick0 + 1: case kActOptTick0 + 2: case kActOptTick0 + 3: case kActOptTick0 + 4: case kActOptTick0 + 5: case kActOptTick0 + 6: case kActOptTick0 + 7: case kActOptTick0 + 8:
+    case kActOptDefaults: case kActOptDone:
+    case kActProfPick: case kActProfPick + 1: case kActProfPick + 2: case kActProfPick + 3: case kActProfPick + 4: case kActProfPick + 5:
+    case kActProfPlay: case kActProfNew: case kActProfDelete: case kActChooseProfile: case kActHostProfChange:
+    case kActNetShow: case kActNetCopy: case kActVpnCopy: case kActHostPwShow: case kActFriendPick: case kActFriendRefresh:
+    case kActInviteOpen: case kActInvitePick: case kActInviteSend: case kActResetWorld: case kActResetKeep:
+    case kActOptDec9: case kActOptInc9: case kActOptTick9:
+    case kActStartDec: case kActStartInc: case kActImpPick: case kActImpBox: case kActKeepTick:
+    case kActOptTab3: case kActModsUse: case kActModsYes: case kActModsNo: case kActModsOrder:
+    case kActOptDec10: case kActOptInc10: case kActOptTick10:
+    case kActResetDead: case kActResetRel: case kActImpDead: case kActImpRel:
+        return 1;
+    }
+    return 0;
+}
+/* T-1392 review fix 1: a compile error here = panelstatus.h's GAME OPTIONS click codes (the routing table the offline suite tests) and this enum disagree */
+typedef char OptActCodesAgree[(kActGameOptions == coopui::kOptActOpen && kActOptTab0 == coopui::kOptActTab0 && kActOptDec0 == coopui::kOptActDec0
+    && kActOptInc0 == coopui::kOptActInc0 && kActOptTick0 == coopui::kOptActTick0 && kActOptDone == coopui::kOptActDone
+    && kActOptDec9 == coopui::kOptActDec9 && kActOptInc9 == coopui::kOptActInc9 && kActOptTick9 == coopui::kOptActTick9
+    && kActOptTab3 == coopui::kOptActTab3 && kActModsOrder == coopui::kOptActModsOrder
+    && kActOptDec10 == coopui::kOptActDec10 && kActOptInc10 == coopui::kOptActInc10 && kActOptTick10 == coopui::kOptActTick10) ? 1 : -1];
 
 /* TITLE PUMP ONLY, and deliberately NOT behind a lock.  design-ui-panel 1.4.3 asks for a CRITICAL_SECTION.
    In U1 the only code that runs off the title pump is the click handlers, and they touch nothing but the
@@ -672,6 +720,9 @@ static std::string      g_dlgTail;             /* RESET WORLD?'s last paragraph,
 static std::string      g_nbWorld;             /* the folder of the world this computer's helper was started for ("" = none) */
 static std::string      g_nbLogPath;           /* the log file of the world server this game last started; kept after it ends, so a bug
                                                   report made after the server stopped or crashed still carries its log ("" = none) */
+static std::string      g_nbProgressPath;      /* T-1403: that server's start-up progress file (startprogress.h; "" = this game started none) */
+static long             g_walkSlowSec = 0;     /* T-1403 TEST ONLY (walkslow): the next world server started gets --walk-slow-sec this (0 = none) */
+static long             g_walkHoldAt  = 0;     /* T-1403 TEST ONLY (walkslow hold): ... --walk-hold-at this (0 = none); both used once */
 static volatile LONG64  g_worldScans = 0, g_worldsListed = 0, g_worldsSkipped = 0, g_worldsCreated = 0, g_worldCreateFailed = 0;
 static volatile LONG64  g_worldsDeleted = 0, g_worldDeleteRefused = 0, g_worldDeleteFailed = 0;
 static long            g_worldDlg = 0;         /* the dialog screen 4 shows: coopui::kWorldDlgReset = RESET WORLD?, else DELETE WORLD? */
@@ -741,12 +792,38 @@ static std::vector<std::pair<std::string, std::string> > g_optHanded;   /* ... a
 static volatile LONG64 g_optOpened = 0, g_optDoneCount = 0, g_optHandedOver = 0, g_optFileRead = 0;
 /* Screen 6 IN A RUNNING WORLD (mockups-t1158.md screen 6), opened from the pause menu's MULTIPLAYER window and shown in the HOSTING
    window's place over the pause menu (UiOptWorldOpen). MAIN THREAD (the in-world pump's tail). */
+static int         g_optBuiltLay = -1, g_optBuiltRowH = 0;   /* T-1392 review fix 4: the GAME OPTIONS layout and row height the panel was built with */
 static int         g_optInWorld = 0;      /* 1 = screen 6 shows the running world's rules (not a title-screen world's) */
 static std::string g_optWorldTitle;       /* the running world's name, for the window's title */
 static int         g_optWorldDone = 0;    /* 1 = its DONE was pressed: the window closes */
 static int         g_optCtlShown = -1;    /* the controls' state the rows were last pushed with (1 lit, 0 greyed) */
 static long        g_optWorldGen = 0;     /* the world's OPTIONS map the rows were last read from (SettingsWorldValuesGen) */
 static const char* const kOptAdminLineName = "SWOptAdminOnlyLine";   /* "Only an admin can change these." over DEFAULTS and DONE */
+/* T-247 (the approved page, version 3 sections 1-2): the MODS tab's lines under DIFFERENT MODS, its button, and the button's question in
+   a box of its own titled WORLD'S MODS (YES / NO) */
+static const char* const kOptModsWorldName = "SWOptModsWorld";
+static const char* const kOptModsYourName  = "SWOptModsYour";
+static const char* const kOptModsUseName   = "SWOptModsUse";
+static const char* const kOptModsAskName   = "SWOptModsAsk";
+static const char* const kOptModsYesName   = "SWOptModsYes";
+static const char* const kOptModsNoName    = "SWOptModsNo";
+static const char* const kOptModsAskTextName = "SWOptModsAskText";
+static int g_optModsAsking = 0;   /* T-247: USE MY MODS FOR THIS WORLD was pressed - its WORLD'S MODS box is up until YES or NO; T-1375: kOptModsAskOrder / kOptModsAskOrderDone */
+static const char* const kOptModsOrderName = "SWOptModsOrder";   /* T-1375: the MODS tab's PUT MY MODS IN THE WORLD'S ORDER (row 4) */
+/* T-1375: the tab's question box serves both buttons - 1 WORLD'S MODS (USE MY MODS, admins), 2 MOD ORDER's question (anyone), 3 MOD ORDER's
+   after-YES sentence with OK in NO's place (anyone) */
+enum { kOptModsAskUse = 1, kOptModsAskOrder = 2, kOptModsAskOrderDone = 3, kOptModsAskOrderFailed = 4 };   /* T-1375: Done / Failed are the after-YES box (sentence and OK) */
+static bool OptModsAfterYes() { return g_optModsAsking == kOptModsAskOrderDone || g_optModsAsking == kOptModsAskOrderFailed; }
+/* T-1375: the world list's active rows this game last put its mod list files in the order of (either road) - the MODS tab then says
+   the new order waits for a restart (coopmods::ModsOrderTabState) */
+static std::vector<std::string> g_modsOrderWrittenFor;
+/* T-1375: a YES whose order could not be written. Owner 1710 a: the player sees coopmods::kModsOrderFailed where the after-YES
+   words would have shown (shown = 1); the [MODS] refused line above says why, this line says which road. */
+static void ModsOrderWriteFailed(const char* road, int shown)
+{
+    ErrorLog(std::string("[UI] T-1375: YES on the MOD ORDER box (") + road + ") - the mod order was NOT changed (the [MODS] line above says why); "
+             + (shown != 0 ? "the 'could not be changed' words are shown (owner 1710 a)" : "nothing is shown - the order no longer differs"));
+}
 static int UiOptAdminNow() { return (g_optInWorld != 0 && AdminNow()) ? 1 : 0; }
 static int UiOptControlsLit() { return coopui::OptControlsLit(g_optInWorld, UiOptAdminNow()); }
 static std::string g_panelStatus;
@@ -809,6 +886,10 @@ static void OnCoopNewWorldClicked(MyGUI::Widget*)     { UiQueue(kActNewWorld); }
 static void OnCoopDeleteWorldClicked(MyGUI::Widget*)  { UiQueue(kActDeleteWorld); }
 static void OnResetWorldClicked(MyGUI::Widget*)       { UiQueue(kActResetWorld); }
 static void OnResetKeepClicked(MyGUI::Widget*)        { UiQueue(kActResetKeep); }
+static void OnResetDeadClicked(MyGUI::Widget*)        { UiQueue(kActResetDead); }   /* T-1383 */
+static void OnResetRelClicked(MyGUI::Widget*)         { UiQueue(kActResetRel); }
+static void OnImpDeadClicked(MyGUI::Widget*)          { UiQueue(kActImpDead); }
+static void OnImpRelClicked(MyGUI::Widget*)           { UiQueue(kActImpRel); }
 static void OnKeepRunClicked(MyGUI::Widget*)          { UiQueue(kActKeepTick); }
 static void OnCoopDlgOkClicked(MyGUI::Widget*)        { UiQueue(kActDlgOk); }
 static void OnCoopDlgCancelClicked(MyGUI::Widget*)    { UiQueue(kActDlgCancel); }
@@ -829,12 +910,15 @@ COOP_OPT_CLICK(OnCoopOptTick6, kActOptTick0 + 6) COOP_OPT_CLICK(OnCoopOptTick7, 
 COOP_OPT_CLICK(OnCoopOptDefaults, kActOptDefaults)
 COOP_OPT_CLICK(OnCoopOptDone, kActOptDone)
 COOP_OPT_CLICK(OnCoopOptDec9, kActOptDec9) COOP_OPT_CLICK(OnCoopOptInc9, kActOptInc9) COOP_OPT_CLICK(OnCoopOptTick9, kActOptTick9)   /* T-1096 */
+COOP_OPT_CLICK(OnCoopOptTab3, kActOptTab3) COOP_OPT_CLICK(OnCoopModsUse, kActModsUse) COOP_OPT_CLICK(OnCoopModsYes, kActModsYes) COOP_OPT_CLICK(OnCoopModsNo, kActModsNo)   /* T-247 */
+COOP_OPT_CLICK(OnCoopModsOrder, kActModsOrder)   /* T-1375 */
+COOP_OPT_CLICK(OnCoopOptDec10, kActOptDec10) COOP_OPT_CLICK(OnCoopOptInc10, kActOptInc10) COOP_OPT_CLICK(OnCoopOptTick10, kActOptTick10)   /* T-1392 */
 #undef COOP_OPT_CLICK
 typedef void (*CoopClickFn)(MyGUI::Widget*);
-static const CoopClickFn kOptTabFns[coopui::kOptTabCount] = { OnCoopOptTab0, OnCoopOptTab1, OnCoopOptTab2 };
-static const CoopClickFn kOptDecFns[coopui::kOptRowsShown] = { OnCoopOptDec0, OnCoopOptDec1, OnCoopOptDec2, OnCoopOptDec3, OnCoopOptDec4, OnCoopOptDec5, OnCoopOptDec6, OnCoopOptDec7, OnCoopOptDec8, OnCoopOptDec9 };
-static const CoopClickFn kOptIncFns[coopui::kOptRowsShown] = { OnCoopOptInc0, OnCoopOptInc1, OnCoopOptInc2, OnCoopOptInc3, OnCoopOptInc4, OnCoopOptInc5, OnCoopOptInc6, OnCoopOptInc7, OnCoopOptInc8, OnCoopOptInc9 };
-static const CoopClickFn kOptTickFns[coopui::kOptRowsShown] = { OnCoopOptTick0, OnCoopOptTick1, OnCoopOptTick2, OnCoopOptTick3, OnCoopOptTick4, OnCoopOptTick5, OnCoopOptTick6, OnCoopOptTick7, OnCoopOptTick8, OnCoopOptTick9 };
+static const CoopClickFn kOptTabFns[coopui::kOptTabCount] = { OnCoopOptTab0, OnCoopOptTab1, OnCoopOptTab2, OnCoopOptTab3 };
+static const CoopClickFn kOptDecFns[coopui::kOptRowsShown] = { OnCoopOptDec0, OnCoopOptDec1, OnCoopOptDec2, OnCoopOptDec3, OnCoopOptDec4, OnCoopOptDec5, OnCoopOptDec6, OnCoopOptDec7, OnCoopOptDec8, OnCoopOptDec9, OnCoopOptDec10 };
+static const CoopClickFn kOptIncFns[coopui::kOptRowsShown] = { OnCoopOptInc0, OnCoopOptInc1, OnCoopOptInc2, OnCoopOptInc3, OnCoopOptInc4, OnCoopOptInc5, OnCoopOptInc6, OnCoopOptInc7, OnCoopOptInc8, OnCoopOptInc9, OnCoopOptInc10 };
+static const CoopClickFn kOptTickFns[coopui::kOptRowsShown] = { OnCoopOptTick0, OnCoopOptTick1, OnCoopOptTick2, OnCoopOptTick3, OnCoopOptTick4, OnCoopOptTick5, OnCoopOptTick6, OnCoopOptTick7, OnCoopOptTick8, OnCoopOptTick9, OnCoopOptTick10 };
 /* prof3: the Your profiles screen's buttons, one handler each, and the Hosting screen's Choose my profile. */
 static void OnCoopProfListPicked(MyGUI::MultiListBox*, size_t) { UiQueue(kActProfPick); }   /* ui2: as the worlds list's */
 /* ui2b - THE COLUMN HEADS' SORT.  A click on a head sorts the list by that column with MultiListBox's own compare, a plain
@@ -1151,10 +1235,15 @@ static bool PanelRulesNamed(const std::string& folder);   /* below: the world's 
 static std::string g_startWorld;   /* the world folder whose rules.txt g_startState was last read from ("" = none) */
 static std::string g_startHintShown;        /* the hint line under the row ("" = none) - PanelLayout's NEW PROFILE layout follows it */
 static std::string g_impName;               /* the new profile's name NEXT carried to the picker */
+static std::string g_impCarryShown, g_impNoteShown;   /* T-1383: the picker's sentence and the creator note on screen ("" = none) - PanelLayout follows them */
 static std::vector<std::pair<std::string, unsigned long long> > g_impSaves;   /* the picker's rows: (save folder, quick.save FILETIME), newest first */
 static std::string g_impSelFolder;          /* the picked row's save folder ("" = none) */
 static long        g_impListGen = 0, g_impListShown = -1;
 static std::string g_hostProfImport;        /* CHANGE's NEW PROFILE with import: the save folder the HOST press imports ("" = none) */
+static int         g_impListLines = 0;  /* T-1383: the picker's rows line, said at most 10 times a session */
+static unsigned    g_hostProfImportAsk = 0; /* T-1383: ...and what its creator tick boxes asked (worldhist::kAskDead / kAskRelations) */
+static int         g_impDeadTicked = 0, g_impRelTicked = 0;   /* T-1383: the picker's creator tick boxes (unticked each time it opens) */
+static int         g_impReasked = 0; static unsigned g_impReaskGen = 0;   /* T-1383 fold (review item 4): the picker asked the world again when it opened, at this answer count */
 static void PanelStartLoad();
 static void LoadBegin(int mode);
 static const coopworld::WorldRow* PanelPickedRow();
@@ -1173,6 +1262,11 @@ static void PanelProfModeEnd(const char* why)
     DebugLog(std::string("[UI] T-201 PP6': PROFILES leaves SELECT mode (") + why + ") - its main button is PLAY again");
 }
 static DWORD       g_pressAtMs       = 0;
+static startprog::Watch g_pressWatch;           /* T-1403: when the world server's start-up progress last moved (from the press) */
+static DWORD       g_pressProgReadMs = 0;      /* T-1403: the last read of the progress file (at most every 250 ms) */
+static std::string g_pressProgStep;            /* T-1403: the step last logged ("" = none yet) */
+static int         g_pressProgTenth  = -1;     /* T-1403: the tenth of the record walk last logged */
+static std::string g_pressProgLine;            /* T-1403: the status line last shown with counts ("" = the plain line) */
 static int         g_pressWaitStop   = 0;   /* 1 = the press is busy until the world server this game is stopping has ended, then goes on */
 static void PanelGo();
 static DWORD       g_pressLinkedAtMs = 0;   /* JOIN: when the world-server link first came up after the press, 0 = not yet */
@@ -1182,6 +1276,19 @@ static int         g_nameTakenBox    = 0;   /* T-201 N1b (owner 166): the box up
 static int         g_nameFocusWanted = 0;   /* T-201 N1b: JOIN GAME's PLAYER NAME box takes the key focus once the panel is up */
 static volatile LONG64 g_pressStarted = 0, g_pressDone = 0, g_pressFailed = 0, g_pressCancelled = 0, g_pressIgnored = 0;
 static std::string g_noticeTitle;           /* T-201 N1: the error box's title when its raiser names one ("" = coopui::NoticeTitle) */
+/* T-247 (owner 1692, the approved page version 3 section 4): a JOIN refused for its mods shows the MODS DON'T MATCH box with JOIN AS ADMIN
+   beside OK; JOIN AS ADMIN opens the JOIN AS ADMIN box (PASSWORD REQUIRED's screen 8 with its own title and line), whose JOIN dials again
+   with the typed password as the door's login (SetJoinAdminPassword). */
+static int g_noticeAdminOffer = 0;                  /* the error box being raised carries JOIN AS ADMIN */
+static volatile LONG g_noticeAdminPressed = 0;      /* JOIN AS ADMIN pressed, not yet handled (PressBoxReturnTick) */
+/* T-1375 (the approved page version 3 sections 2 and 4): the MODS DON'T MATCH box of an order-only refusal carries PUT MY MODS IN THE
+   WORLD'S ORDER beside OK; it opens the MOD ORDER box (YES / NO - NO is the box's OK button), whose YES writes the two list files
+   (SettingsModsPutInWorldOrder) and shows the after-YES sentence in a MOD ORDER box with OK. */
+enum { kNoticeOrderNone = 0, kNoticeOrderPut = 1, kNoticeOrderAsk = 2 };
+static int g_noticeOrderOffer = kNoticeOrderNone;   /* the error box being raised carries the order button (1) or is the MOD ORDER question (2) */
+static volatile LONG g_noticeOrderPressed = 0;      /* 1 PUT MY MODS IN THE WORLD'S ORDER, 2 YES - not yet handled (PressBoxReturnTick) */
+static int g_pwAdmin = 0;                           /* screen 8 is the JOIN AS ADMIN box, not PASSWORD REQUIRED */
+static int g_adminJoinPending = 0;                  /* the press under way was JOIN AS ADMIN's JOIN */
 /* A PRESS PREPARES (owner 470, coopui::PrepStep): the phase of the last press's preparation - the role it armed is kept only into a
    world; PrepTick cancels it when the title is back with no world on its way. */
 static int g_prepPhase = coopui::kPrepNone;
@@ -1200,6 +1307,8 @@ static int UiNewGameWindowShown(MyGUI::Gui* gui);
 static void UiRaiseNotice(const std::string& s)
 {
     g_noticeTitle.clear();
+    g_noticeAdminOffer = 0;
+    g_noticeOrderOffer = kNoticeOrderNone;   /* T-1375 */
     g_noticeText = s;
     g_nameTakenBox = coopui::NoticeIsNameTaken(s) ? 1 : 0;   /* T-201 N1b */
     ++g_noticeSeq;
@@ -1720,6 +1829,30 @@ static void PanelKeepPush(MyGUI::Gui* gui)
     PanelLayout(gui);     /* the note as tall as its text */
 }
 
+/* T-1392 review fix 4: GAME OPTIONS' option row r onto the band b - each widget's left and width kept, its top and height moved only when
+   they differ (the tick box: square, centred in the row, as PanelBuild makes it). A { 0, 0 } band (a row the state has not) moves nothing. */
+static void UiOptRowPlace(MyGUI::Gui* gui, int r, const coopui::PanelBand& b)
+{
+    if (b.h <= 0 || r < 0 || r >= coopui::kOptRowsShown) return;
+    const UiNames& n = NM();
+    MyGUI::Widget* ws[4] = { UiFind(gui, n.optLabel[r]), UiFind(gui, n.optDec[r]), UiFind(gui, n.optVal[r]), UiFind(gui, n.optInc[r]) };
+    int stepW = 0;
+    for (int k = 0; k < 4; ++k)
+    {
+        if (ws[k] == 0) continue;
+        const MyGUI::IntCoord c = ws[k]->getCoord();
+        if (k == 1) stepW = c.width;
+        if (c.top != b.top || c.height != b.h) ws[k]->setCoord(c.left, b.top, c.width, b.h);
+    }
+    MyGUI::Widget* t = UiFind(gui, n.optTick[r]);
+    if (t != 0 && stepW > 0)
+    {
+        const int tickW = b.h < stepW ? b.h : stepW;
+        const int ty = b.top + (b.h - tickW) / 2;
+        const MyGUI::IntCoord c = t->getCoord();
+        if (c.top != ty || c.width != tickW || c.height != tickW) t->setCoord(c.left, ty, tickW, tickW);
+    }
+}
 static void PanelPushOptions(MyGUI::Gui* gui)
 {
     const UiNames& n = NM();
@@ -1727,9 +1860,16 @@ static void PanelPushOptions(MyGUI::Gui* gui)
     const int adm = UiOptAdminNow();
     const int ctl = coopui::OptControlsLit(g_optInWorld, adm);   /* in a running world only an admin's controls work */
     for (int t = 0; t < coopui::kOptTabCount; ++t) { b = UiBtn(gui, n.optTab[t]); if (b) b->setStateSelected(t == (int)g_optTab); }
+    {   /* T-1392 review fix 4: main's ten row slots, eleven rows only while the open tab shows an eleventh (MULTIPLAYER with MENUS AND
+           BUILDING); with the admin line up the eleven share the band above it (panelfit.h PanelOptRowBand) */
+        const int eleven = coopui::OptIndexShown((int)g_optTab, coopui::kOptRowSlots, g_optVal) >= 0 ? 1 : 0;
+        const int noteUp = coopui::OptAdminOnlyLine(g_optInWorld, adm).empty() ? 0 : 1;
+        if (g_optBuiltRowH > 0)
+            for (int r = 0; r < coopui::kOptRowsShown; ++r) UiOptRowPlace(gui, r, coopui::PanelOptRowBand(g_optBuiltLay, g_optBuiltRowH, r, eleven, noteUp));
+    }
     for (int r = 0; r < coopui::kOptRowsShown; ++r)
     {
-        const int i = coopui::OptIndexOf((int)g_optTab, r);
+        const int i = coopui::OptIndexShown((int)g_optTab, r, g_optVal);   /* T-1392: a hidden row leaves no gap */
         const bool on = i >= 0;
         const bool tick = on && coopui::OptIsTick(i);
         const bool typed = on && coopui::OptDefs()[i].kind == coopui::kOptKindAmount;   /* T-556: the fee box stands in the value's place */
@@ -1759,6 +1899,15 @@ static void PanelPushOptions(MyGUI::Gui* gui)
     if (e && fee >= 0)
     {
         const bool shown = coopui::OptDefs()[fee].tab == (int)g_optTab;
+        {   /* T-1392: the box stands on its row's slot, which moves down one while MENUS AND BUILDING is shown - its label's band */
+            const int fr = coopui::OptRowShownOf(coopui::OptDefs()[fee].tab, fee, g_optVal);
+            MyGUI::Widget* lw = fr >= 0 ? UiFind(gui, n.optLabel[fr]) : 0;
+            if (lw != 0)
+            {
+                const MyGUI::IntCoord lc = lw->getCoord(), ec = e->getCoord();
+                if (ec.top != lc.top || ec.height != lc.height) e->setCoord(ec.left, lc.top, ec.width, lc.height);
+            }
+        }
         e->setVisible(shown);
         e->setEnabled(shown && coopui::OptRowChangeable(fee, g_optVal, ctl));
         UiGreyText(e, coopui::OptRowChangeable(fee, g_optVal, ctl));
@@ -1767,6 +1916,42 @@ static void PanelPushOptions(MyGUI::Gui* gui)
     b = UiBtn(gui, n.optDefaultsBtn); if (b) { b->setEnabled(ctl != 0); UiGreyText(b, ctl != 0); }
     const std::string only = coopui::OptAdminOnlyLine(g_optInWorld, adm);
     PanelSetTextBox(gui, std::string(kOptAdminLineName), only, !only.empty());
+    {   /* T-247 (the approved page, version 3 sections 1-2): the MODS tab in a running world - the world's list, this game's mods, the
+           button (admins only: greyed for others, option a) and its question. On the title screen the tab holds DIFFERENT MODS alone. */
+        const bool modsTab = (int)g_optTab == coopui::kOptTabMods && g_optInWorld != 0;
+        int haveList = 0; coopmods::ModList wl; std::string by, at; unsigned flags = 0; long long seq = 0;
+        const bool known = modsTab && StoreWorldMods(&haveList, &wl, &by, &at, &flags, &seq) != 0;
+        const std::string worldLine = known ? coopmods::ModsWorldLine(haveList, wl, by, at, (flags & playermods::kFlagYouSetIt) ? 1 : 0) : std::string();
+        const std::string yourLine = known ? coopmods::ModsOrderYourLine(haveList, wl, StoreOwnMods(), g_modsOrderWrittenFor) : std::string();   /* T-1375: after YES */
+        PanelSetTextBox(gui, std::string(kOptModsWorldName), worldLine, !worldLine.empty());
+        PanelSetTextBox(gui, std::string(kOptModsYourName), yourLine, !yourLine.empty());
+        /* T-1375: the order question and its after-YES box are anyone's; USE MY MODS's question is an admin's */
+        const int orderSt = known ? coopmods::ModsOrderTabState(haveList, wl, StoreOwnMods(), g_modsOrderWrittenFor) : coopmods::kMoTabNone;
+        const bool orderAsk = g_optModsAsking == kOptModsAskOrder || OptModsAfterYes();
+        if (!modsTab || (g_optModsAsking == kOptModsAskUse && adm == 0) || (g_optModsAsking == kOptModsAskOrder && orderSt != coopmods::kMoTabButton)) g_optModsAsking = 0;
+        const bool asking = modsTab && g_optModsAsking != 0;
+        MyGUI::Widget* askBox = UiFind(gui, std::string(kOptModsAskName)); if (askBox) askBox->setVisible(asking);   /* section 2: the WORLD'S MODS / MOD ORDER box */
+        if (asking)
+        {   /* T-1375: the box's title, sentence and buttons for the question it is asking */
+            MyGUI::Window* aw = askBox != 0 ? askBox->castType<MyGUI::Window>(false) : 0;
+            const char* const title = orderAsk ? coopmods::kModsOrderTitle : coopmods::kModsAskTitle;
+            if (aw != 0 && aw->getCaption() != MyGUI::UString(title)) aw->setCaption(MyGUI::UString(title));
+            const char* const said = g_optModsAsking == kOptModsAskOrderDone ? coopmods::kModsOrderDone : g_optModsAsking == kOptModsAskOrderFailed ? coopmods::kModsOrderFailed : g_optModsAsking == kOptModsAskOrder ? coopmods::kModsOrderAsk : coopmods::kModsAskText;
+            MyGUI::EditBox* ae = UiEdit(gui, std::string(kOptModsAskTextName));
+            if (ae != 0 && ae->getCaption() != MyGUI::UString(said)) ae->setCaption(MyGUI::UString(said));
+        }
+        b = UiBtn(gui, std::string(kOptModsUseName)); if (b) { b->setVisible(modsTab); b->setEnabled(modsTab && adm != 0 && !asking); UiGreyText(b, adm != 0); }
+        b = UiBtn(gui, std::string(kOptModsOrderName));   /* T-1375 (section 1): never greyed for a non-admin - it changes only this game */
+        if (b) { const bool on = modsTab && orderSt == coopmods::kMoTabButton; b->setVisible(on); b->setEnabled(on && !asking); UiGreyText(b, true); }
+        b = UiBtn(gui, std::string(kOptModsYesName)); if (b) { b->setVisible(!OptModsAfterYes()); b->setEnabled(asking && !OptModsAfterYes()); }
+        b = UiBtn(gui, std::string(kOptModsNoName));
+        if (b)
+        {
+            const char* const cap = OptModsAfterYes() ? "OK" : coopmods::kModsOrderNo;   /* T-1375: the after-YES box's OK (done or could not) */
+            if (b->getCaption() != MyGUI::UString(cap)) b->setCaption(MyGUI::UString(cap));
+            b->setEnabled(asking);
+        }
+    }
     g_optCtlShown = ctl;
 }
 
@@ -1827,6 +2012,13 @@ static void PanelPushProfiles(MyGUI::Gui* gui)
 /* T-1096 part 3 (owner 1224; the approved page) - NEW PROFILE's START WITH row and IMPORT FROM SINGLE PLAYER, pushed with the rest. The
    row's words, its greying and the two boxes' lines are spimport.h's (swept offline); a running world's answer word is read at every
    push, CHANGE's options.txt when NEW PROFILE opened (PanelStartLoad). */
+/* T-1383 fold (review item 4): the creator tick boxes show only while this game would hold the claim NOW - on HOST GAME's CHANGE the
+   world folder (the HOST press asks the world again); with a running world only an answer that came after the picker's own re-ask */
+static bool ImpCreatorShown()
+{
+    if (!g_startState.creator) return false;
+    return g_profMode == 1 || (g_impReasked != 0 && StoreSpAnswerGen() != g_impReaskGen);
+}
 static void PanelPushStart(MyGUI::Gui* gui)
 {
     const UiNames& n = NM();
@@ -1872,10 +2064,18 @@ static void PanelPushStart(MyGUI::Gui* gui)
                 UiPlayedKeyNote(g_impPlayedKey, coopui::PanelPlayedText(u, nowUnix, 0), u > 0 ? u : kPlayedKeyNone);
             }
             ml->removeAllItems();
+            std::string shown;   /* T-1383 (F1068): the rows as the picker shows them - SAVE and LAST PLAYED - for the run's log */
             for (size_t k = 0; k < g_impSaves.size(); ++k)
             {
+                const std::string played = coopui::PanelPlayedText(coopworld::FileTimeToUnix(g_impSaves[k].second), nowUnix, 0);
                 ml->addItem(MyGUI::UString(g_impSaves[k].first.c_str()));
-                ml->setSubItemNameAt(1, k, MyGUI::UString(coopui::PanelPlayedText(coopworld::FileTimeToUnix(g_impSaves[k].second), nowUnix, 0).c_str()));
+                ml->setSubItemNameAt(1, k, MyGUI::UString(played.c_str()));
+                if (k < 8) shown += std::string(k ? " | " : "") + "'" + g_impSaves[k].first + "' = '" + played + "'";
+            }
+            if (g_impListLines < 10)
+            {
+                ++g_impListLines;
+                DebugLog("[UI] T-1383: the import picker shows " + coopui::PanelNum((long long)g_impSaves.size()) + " row(s), first 8 (SAVE = LAST PLAYED): " + shown);
             }
             g_impListShown = g_impListGen;
         }
@@ -1886,23 +2086,17 @@ static void PanelPushStart(MyGUI::Gui* gui)
         ml->setVisible(onPick);
     }
     e = UiEdit(gui, n.impEmpty); if (e) e->setVisible(onPick && g_impSaves.empty());   /* "No single-player saves found." */
-    {
-        std::vector<std::string> along, behind;
-        spimport::BoxLines(g_startState.money, g_startState.research, &along, &behind);
-        const std::string* const boxes[2] = { &n.impAlong, &n.impBehind };
-        for (int bx = 0; bx < 2; ++bx)
-        {
-            MyGUI::MultiListBox* bl = UiMulti(gui, *boxes[bx]);
-            if (bl == 0) continue;
-            if (onPick)
-            {
-                const std::vector<std::string>& lines = bx == 0 ? along : behind;
-                bl->removeAllItems();
-                for (size_t k = 0; k < lines.size(); ++k) bl->addItem(MyGUI::UString(lines[k].c_str()));
-            }
-            bl->setVisible(onPick);
-        }
-    }
+    /* T-1383 (the approved page, version 3): the one sentence by the host's money / research options; the two tick boxes and their note
+       only for the world's first profile (the answer word's CREATOR, or on CHANGE a world folder with no profile and no history) */
+    g_impCarryShown = onPick ? std::string(spimport::CarrySentence(g_startState.money, g_startState.research)) : std::string();
+    e = UiEdit(gui, n.impCarry); if (e) { e->setCaption(MyGUI::UString(g_impCarryShown.c_str())); e->setVisible(onPick); }
+    const bool boxes = onPick && ImpCreatorShown();
+    g_impNoteShown = boxes ? std::string(spimport::kCreatorNote) : std::string();
+    e = UiEdit(gui, n.impNote); if (e) { e->setCaption(MyGUI::UString(g_impNoteShown.c_str())); e->setVisible(boxes); }
+    b = UiBtn(gui, n.impDeadTick); if (b) { b->setStateSelected(g_impDeadTicked != 0); b->setVisible(boxes); }
+    b = UiBtn(gui, n.impRelTick);  if (b) { b->setStateSelected(g_impRelTicked != 0); b->setVisible(boxes); }
+    w = UiFind(gui, n.impDeadLabel); if (w) w->setVisible(boxes);
+    w = UiFind(gui, n.impRelLabel);  if (w) w->setVisible(boxes);
     w = UiFind(gui, n.impArrival); if (w) w->setVisible(onPick);
 }
 static void PanelProfOpen()
@@ -1986,10 +2180,20 @@ static void PanelImpOpen(const std::string& name)
     StoreSpImportSaves(&g_impSaves);
     g_impSelFolder = g_impSaves.empty() ? std::string() : g_impSaves[0].first;
     ++g_impListGen;
+    g_impDeadTicked = 0; g_impRelTicked = 0;   /* T-1383: the creator's boxes open unticked */
+    g_impReasked = 0;
+    if (g_profMode != 1 && g_startState.creator)
+    {   /* T-1383 fold (review item 4): the last answer said CREATOR - it may be from before another player's first profile; ask again */
+        g_impReaskGen = StoreSpAnswerGen();
+        g_impReasked = StoreSpImportReask() ? 1 : 0;
+        DebugLog(std::string("[UI] T-1383: the import picker asks the world again whether this import would make the world's creator")
+                 + (g_impReasked ? std::string() : std::string(" - NOT SENT (no link): no creator tick boxes this time")));
+    }
     g_dlgText = spimport::kPickText;
     g_profDlg = coopui::kProfDlgImport;
     DebugLog("[UI] T-1096: NEXT on NEW PROFILE for '" + name + "' - IMPORT FROM SINGLE PLAYER with " + coopui::PanelNum((long long)g_impSaves.size())
-             + " single-player save(s)" + (g_profMode == 1 ? std::string(" (CHANGE - made at the HOST press)") : std::string()));
+             + " single-player save(s)" + (g_profMode == 1 ? std::string(" (CHANGE - made at the HOST press)") : std::string())
+             + (g_startState.creator ? std::string(" - T-1383: the world's first profile, the two creator tick boxes show") : std::string(" - T-1383: not the world's first profile, no creator tick boxes")));
 }
 /* T-1096 part 3: IMPORT - the road `profile import <folder>` takes (StoreSpImportRequest: the world decides whether this player may);
    on HOST GAME's CHANGE the world is not running, so the HOST press makes the profile with import (LoadHostPickStep). */
@@ -1997,7 +2201,10 @@ static void PanelImpConfirm()
 {
     std::string folder;
     for (size_t k = 0; k < g_impSaves.size(); ++k) if (!g_impSelFolder.empty() && g_impSaves[k].first == g_impSelFolder) folder = g_impSelFolder;
-    DebugLog("[UI] T-1096: IMPORT pressed for '" + g_impName + "' from single-player save '" + folder + "'");
+    const unsigned ask = spimport::CreatorAsk(ImpCreatorShown(), g_impDeadTicked != 0, g_impRelTicked != 0);   /* T-1383; fold: only while the boxes show */
+    DebugLog("[UI] T-1096: IMPORT pressed for '" + g_impName + "' from single-player save '" + folder + "'"
+             + (ImpCreatorShown() ? std::string(" - the world's first profile: ") + spimport::kTickDead + " " + (g_impDeadTicked != 0 ? "ticked" : "unticked")
+                                       + ", " + spimport::kTickRelations + " " + (g_impRelTicked != 0 ? "ticked" : "unticked") : std::string()));
     if (folder.empty()) return;
     if (g_profMode == 1)
     {
@@ -2005,11 +2212,12 @@ static void PanelImpConfirm()
         g_hostProfNum = 0;
         g_hostProfNew = g_impName;
         g_hostProfImport = folder;
+        g_hostProfImportAsk = ask;
         g_profMode = 0;
         g_panelScreen = 1;
         return;
     }
-    if (!StoreSpImportRequest(g_impName, folder))
+    if (!StoreSpImportRequest(g_impName, folder, ask))
     {
         std::vector<std::pair<std::string, unsigned long long> > now;
         StoreSpImportSaves(&now);
@@ -2133,6 +2341,7 @@ static int g_layPlayersShown = -1;   /* ui5d: HOSTING's PLAYERS half-rows last l
 static int g_layNetShown = -1;                            /* T-510: HOSTING's INTERNET ADDRESS row half-rows last laid out */
 static int g_laySteamShown = -1;   /* HOSTING's STEAM row half-rows last laid out */
 static int g_layTailShown = -1;    /* RESET WORLD?'s last paragraph half-rows last laid out */
+static int g_layCarryShown = -2, g_layCreatorShown = -2, g_layImpNoteShown = -2;   /* T-1383: the picker's sentence, creator rows and note last laid out */
 static int g_layKeepShown = -1;    /* HOST GAME's keep-running note half-rows last laid out */
 static void PanelPlace(MyGUI::Gui* gui, const std::string& name, int l, int t, int w, int h)
 {
@@ -2221,6 +2430,12 @@ static void PanelLayout(MyGUI::Gui* gui)
     coopui::PanelLive live(PanelLiveTextHalves(gui, lay, W, g.rowH));   /* ui5c: -1 = no text area on this screen */
     if (lay == coopui::kLayResetWorld)   /* RESET WORLD?'s last paragraph, under its tick box: as tall as its text too */
         live.tail = PanelTextAreaHalves(gui, NM().resetTail, 6, "dialog tail", lay, g_dlgTail, W, g.rowH);
+    if (lay == coopui::kLaySpImport)   /* T-1383: the picker's sentence, and the creator's two rows and note only while shown */
+    {
+        live.carry = PanelTextAreaHalves(gui, NM().impCarry, 6, "import sentence", lay, g_impCarryShown, W, g.rowH);
+        live.creator = g_impNoteShown.empty() ? 0 : -1;
+        live.note = g_impNoteShown.empty() ? 0 : PanelTextAreaHalves(gui, NM().impNote, 6, "import note", lay, g_impNoteShown, W, g.rowH);
+    }
     if (lay == coopui::kLayHost || lay == coopui::kLayHostHint)   /* HOST GAME's keep-running note (ticked: and its warning) - as tall as its text */
         live.keep = PanelTextAreaHalves(gui, NM().keepNote, 7, "keep note", lay, g_keepNoteShown, W - g.rowH - coopui::PanelGapOf(g.rowH), g.rowH);
     if (coopui::PanelLayIsHosting(lay) != 0)
@@ -2234,7 +2449,8 @@ static void PanelLayout(MyGUI::Gui* gui)
     const int txt = live.text;
     if (lay == g_layShown && addr == g_layAddrShown && txt == g_layTextShown
         && live.players == g_layPlayersShown && live.net == g_layNetShown && live.steam == g_laySteamShown
-        && live.tail == g_layTailShown && live.keep == g_layKeepShown) return;
+        && live.tail == g_layTailShown && live.keep == g_layKeepShown
+        && live.carry == g_layCarryShown && live.creator == g_layCreatorShown && live.note == g_layImpNoteShown) return;
     const UiNames& n = NM();
     const coopui::PanelRect r = coopui::PanelScreenRect(g, g_layParentH, lay, g_layChromeH, live);
     PanelPlace(gui, n.backdrop, r.left, r.top, r.w, r.h);
@@ -2260,6 +2476,12 @@ static void PanelLayout(MyGUI::Gui* gui)
         PanelPlace(gui, n.resetKeepTick,  0,          kb.top, kb.h,           kb.h);
         PanelPlace(gui, n.resetKeepLabel, kb.h + gap, kb.top, W - kb.h - gap, kb.h);
         PanelPlace(gui, n.resetTail,      0,          lb.top, W,              lb.h);
+        const coopui::PanelBand k2 = coopui::PanelSlotBand(lay, coopui::kSlotDlgTick2, rowH, live);   /* T-1383: the two under it */
+        const coopui::PanelBand k3 = coopui::PanelSlotBand(lay, coopui::kSlotDlgTick3, rowH, live);
+        PanelPlace(gui, n.resetDeadTick,  0,          k2.top, k2.h,           k2.h);
+        PanelPlace(gui, n.resetDeadLabel, k2.h + gap, k2.top, W - k2.h - gap, k2.h);
+        PanelPlace(gui, n.resetRelTick,   0,          k3.top, k3.h,           k3.h);
+        PanelPlace(gui, n.resetRelLabel,  k3.h + gap, k3.top, W - k3.h - gap, k3.h);
     }
     PanelPlace(gui, n.pwEdit,       nr.boxX,   nr.top, nr.boxW,   nr.h);   /* T-290: PASSWORD REQUIRED's box on the name row */
     PanelPlace(gui, n.pwCancelBtn,  0,         bb.top, btnW,      bb.h);   /* ...its CANCEL bottom-left */
@@ -2282,10 +2504,14 @@ static void PanelLayout(MyGUI::Gui* gui)
         const coopui::PanelBand lb = coopui::PanelSlotBand(lay, coopui::kSlotList, rowH, live);
         PanelPlace(gui, n.impList,    0,  lb.top,            W,      lb.h);
         PanelPlace(gui, n.impEmpty,   12, lb.top + rowH / 2, W - 24, lb.h - rowH / 2);
-        const coopui::PanelBand xb = coopui::PanelSlotBand(lay, coopui::kSlotImpBoxes, rowH, live);
-        const int half = (W - gap) / 2;
-        PanelPlace(gui, n.impAlong,   0,        xb.top, half, xb.h);
-        PanelPlace(gui, n.impBehind,  W - half, xb.top, half, xb.h);
+        const coopui::PanelBand xb = coopui::PanelSlotBand(lay, coopui::kSlotImpCarry, rowH, live);   /* T-1383: the one sentence */
+        PanelPlace(gui, n.impCarry,   0,        xb.top, W,    xb.h);
+        const coopui::PanelBand t1 = coopui::PanelSlotBand(lay, coopui::kSlotImpTick1, rowH, live);
+        const coopui::PanelBand t2 = coopui::PanelSlotBand(lay, coopui::kSlotImpTick2, rowH, live);
+        const coopui::PanelBand nb = coopui::PanelSlotBand(lay, coopui::kSlotImpNote, rowH, live);
+        if (t1.h > 0) { PanelPlace(gui, n.impDeadTick, 0, t1.top, t1.h, t1.h); PanelPlace(gui, n.impDeadLabel, t1.h + gap, t1.top, W - t1.h - gap, t1.h); }
+        if (t2.h > 0) { PanelPlace(gui, n.impRelTick,  0, t2.top, t2.h, t2.h); PanelPlace(gui, n.impRelLabel,  t2.h + gap, t2.top, W - t2.h - gap, t2.h); }
+        if (nb.h > 0) PanelPlace(gui, n.impNote, 0, nb.top, W, nb.h);
         const coopui::PanelBand ab = coopui::PanelSlotBand(lay, coopui::kSlotImpArrival, rowH, live);
         PanelPlace(gui, n.impArrival, 0, ab.top, W, ab.h);
     }
@@ -2442,6 +2668,7 @@ static void PanelLayout(MyGUI::Gui* gui)
     g_laySteamShown = live.steam;
     g_layTailShown = live.tail;
     g_layKeepShown = live.keep;
+    g_layCarryShown = live.carry; g_layCreatorShown = live.creator; g_layImpNoteShown = live.note;   /* T-1383 */
 }
 static const coopui::PanelGeom& PanelGeomNow() { return g_layGeom; }
 
@@ -2494,7 +2721,7 @@ static void PanelPush(MyGUI::Gui* gui)
     e = UiEdit(gui, n.resetTail);   if (e) e->setCaption(MyGUI::UString(g_dlgTail.c_str()));   /* RESET WORLD?'s last paragraph */
 
     MyGUI::Button* b;
-    b = UiBtn(gui, n.dlgOk);       if (b) b->setCaption(MyGUI::UString(g_panelScreen == 4 ? (g_worldDlg == coopui::kWorldDlgReset ? "RESET WORLD" : g_worldDlg == coopui::kWorldDlgStop ? keeprun::kStopBtn : "DELETE WORLD") : (g_panelScreen == 7 && g_profDlg == 2) ? "DELETE PROFILE" : "CREATE"));   /* ui1 */
+    b = UiBtn(gui, n.dlgOk);       if (b) b->setCaption(MyGUI::UString(g_panelScreen == 4 ? (g_worldDlg == coopui::kWorldDlgReset ? "RESET" : g_worldDlg == coopui::kWorldDlgStop ? keeprun::kStopBtn : "DELETE WORLD") : (g_panelScreen == 7 && g_profDlg == 2) ? "DELETE PROFILE" : "CREATE"));   /* ui1 */
     /* T-290: HOST GAME's PASSWORD box - stars, or its text while SHOW is pressed (the engine's password mode, set before the text) -
        and SHOW / HIDE; PASSWORD REQUIRED's box, always stars. */
     e = UiEdit(gui, n.hostPwEdit); if (e) { e->setEditPassword(g_hostPwShown == 0); e->setCaption(MyGUI::UString(coopui::PanelPwCaption(g_fHostPw).c_str())); }
@@ -2534,7 +2761,8 @@ static void PanelPush(MyGUI::Gui* gui)
     g = UiFind(gui, n.dlgGroup);  if (g) g->setVisible(g_panelScreen == 3 || g_panelScreen == 4 || g_panelScreen == 8 || (g_panelScreen == 7 && g_profDlg != 0));   /* prof3: its two dialogs; T-290: PASSWORD REQUIRED */
     {   /* RESET WORLD?'s keep-buildings tick box, its label and its last paragraph: on that dialog only */
         const bool resetDlg = (g_panelScreen == 4 && g_worldDlg == coopui::kWorldDlgReset);
-        const std::string* const resetOnly[] = { &n.resetKeepTick, &n.resetKeepLabel, &n.resetTail };
+        const std::string* const resetOnly[] = { &n.resetKeepTick, &n.resetKeepLabel, &n.resetTail,
+                                                  &n.resetDeadTick, &n.resetDeadLabel, &n.resetRelTick, &n.resetRelLabel };   /* T-1383 */
         for (size_t rk = 0; rk < sizeof(resetOnly) / sizeof(resetOnly[0]); ++rk) { g = UiFind(gui, *resetOnly[rk]); if (g) g->setVisible(resetDlg); }
     }
     {   /* T-290: PASSWORD REQUIRED - its own box and JOIN / CANCEL in place of the dialogs' name box and two buttons */
@@ -2566,13 +2794,14 @@ static void PanelPush(MyGUI::Gui* gui)
         g = UiFind(gui, n.dlgNameEdit);  if (g) g->setVisible(g_panelScreen == 3 || (g_panelScreen == 7 && g_profDlg == 1));
         g = UiFind(gui, n.dlgNameLabel);   /* prof3: the name row is the profile's on screen 7 */
         MyGUI::TextBox* nl = g ? g->castType<MyGUI::TextBox>(false) : 0;
-        if (nl) nl->setCaption(MyGUI::UString(g_panelScreen == 8 ? "PASSWORD" : g_panelScreen == 7 ? "PROFILE NAME" : "WORLD NAME"));   /* T-290: PASSWORD REQUIRED's row */
+        if (nl) nl->setCaption(MyGUI::UString(g_panelScreen == 8 ? (g_pwAdmin != 0 ? "ADMIN PASSWORD" : "PASSWORD") : g_panelScreen == 7 ? "PROFILE NAME" : "WORLD NAME"));   /* T-290: PASSWORD REQUIRED's row; T-247: JOIN AS ADMIN's */
     }
     /* ui5 (panel-mockups.md): ONE title - the window's own caption names the screen; there is no repeated first row. */
     g = UiFind(gui, n.panel);
     {
         MyGUI::Window* pwin = (g != 0) ? g->castType<MyGUI::Window>(false) : 0;
-        const std::string title = coopui::PanelTitleFit(coopui::PanelScreenTitle((int)g_panelScreen, PanelDlgSub(), g_panelMode == 0 ? 1 : 0, PanelProfTitleWorld(), PanelOptWorldName()),
+        const std::string title = coopui::PanelTitleFit((g_panelScreen == 8 && g_pwAdmin != 0) ? std::string(coopmods::kModsAdminJoinTitle)   /* T-247 */
+                                                        : coopui::PanelScreenTitle((int)g_panelScreen, PanelDlgSub(), g_panelMode == 0 ? 1 : 0, PanelProfTitleWorld(), PanelOptWorldName()),
                                                         g_layGeom.maxRect.w);   /* ui5b: a long world name is cut with "..." */
         if (pwin) pwin->setCaption(MyGUI::UString(title.c_str()));
         else ::InterlockedIncrement64(&g_panelCastNull);
@@ -2840,6 +3069,7 @@ static int PanelStartNotebook(unsigned short port)
     if (coopdata::IdentityRefusesHostJoin(IdentitySessionOnlyKind()))   /* PP3d: never a world server under a session-only owner id */
     {
         ErrorLog("[UI] PP3d: the world's notebook was NOT started - this game's identity is unusable (session-only).");
+        g_nbProgressPath.clear();   /* T-1403 review fold: no server of this press */
         return 0;
     }
     if (g_nbProc != 0)
@@ -2856,6 +3086,7 @@ static int PanelStartNotebook(unsigned short port)
         g_nbProc = 0;
         g_nbStopFailedKept = 0;
     }
+    g_nbPid = 0; g_nbProgressPath.clear();   /* T-1403 review fold: no server of this start yet - a failed start reads no progress file */
     const int keep = g_keepTicked;   /* the keep-running box as it reads at this press; with an empty PASSWORD box the world kept running keeps the password it has and is open only when it has none (owner 1508 b / 1516 a) */
     g_nbPort = (int)port;
 
@@ -2921,15 +3152,25 @@ static int PanelStartNotebook(unsigned short port)
     const std::wstring wHostRules = U8GetFileAttributes(ownRules.c_str()) != INVALID_FILE_ATTRIBUTES ? L" --host-rules \"" + std::wstring(U8W(ownRules.c_str())) + L"\"" : std::wstring();
     /* the line is made with --host-rules first; when that path makes it too long, it is made again without it - the world starts with
        what its folder holds (no copy) and this log says why, instead of HOST failing over an optional file */
+    /* T-1403 TEST ONLY (walkslow): the world server's start-up record walk slowed or held, for this one start */
+    wchar_t wWalk[64] = L"";
+    if (g_walkSlowSec > 0 || g_walkHoldAt > 0)
+    {
+        _snwprintf(wWalk, 63, g_walkHoldAt > 0 ? L" --walk-hold-at %ld" : L" --walk-slow-sec %ld", g_walkHoldAt > 0 ? g_walkHoldAt : g_walkSlowSec);
+        wWalk[63] = 0;
+        DebugLog("[UI] T-1403 TEST-ONLY walkslow: this world server is started with " + std::string(g_walkHoldAt > 0 ? "--walk-hold-at " : "--walk-slow-sec ")
+                 + coopui::PanelNum((long long)(g_walkHoldAt > 0 ? g_walkHoldAt : g_walkSlowSec)) + " (used once)");
+        g_walkSlowSec = 0; g_walkHoldAt = 0;
+    }
     int cmdLen = -1;
     for (int withRules = wHostRules.empty() ? 0 : 1; withRules >= 0 && cmdLen < 0; --withRules)
     {
         const wchar_t* const hr = withRules != 0 ? wHostRules.c_str() : L"";
         cmdLen = keep != 0
-            ? _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --keep-running%ls --host-token %ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(),
-                         hr, wRouterOff, wToken.c_str())
-            : _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --parent %lu --host-token %ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(),
-                         hr, (unsigned long)::GetCurrentProcessId(), wToken.c_str());
+            ? _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --keep-running%ls --host-token %ls%ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(),
+                         hr, wRouterOff, wToken.c_str(), wWalk)
+            : _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --parent %lu --host-token %ls%ls", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(),
+                         hr, (unsigned long)::GetCurrentProcessId(), wToken.c_str(), wWalk);
         if (cmdLen < 0 && withRules != 0)
             ErrorLog("[UI] HOST: this game's kenshi_api.cfg (" + ownRules + ") is NOT handed to the world server - with its path the command line does"
                      " not fit 1024 characters (a very long folder name is the usual cause). The world starts with the race rules its own folder holds.");
@@ -3042,6 +3283,7 @@ static int PanelStartNotebook(unsigned short port)
     {
         const std::string serverDir = coopworld::WorldDirIn(rootArg, worldArg);
         g_nbLogPath = serverDir.empty() ? std::string() : serverDir + "\\" + swnames::kServerLog;
+        g_nbProgressPath = serverDir.empty() ? std::string() : serverDir + "\\" + startprog::kFile;   /* T-1403: read while HOST waits (PressTick) */
     }
     g_nbExitCode = 0;
     ::InterlockedIncrement64(&g_panelNbSpawned);
@@ -3100,7 +3342,7 @@ static int PanelStopNotebookStep()
                  + " other game(s) were connected to it (a port it still holds fails the next HOST into its failure box)");
         ::CloseHandle(g_nbProc);
         g_nbProc = 0;
-        g_nbPid = 0;
+        g_nbPid = 0; g_nbProgressPath.clear();   /* T-1403 review fold */
         g_nbStopping = 0;
         g_nbStopEndedIt = 0;
         g_nbStopFailedKept = 0;
@@ -3145,7 +3387,7 @@ static int PanelStopNotebookStep()
              + coopui::PanelNum((long long)g_nbStopEnded) + "," + coopui::PanelNum((long long)g_nbStopFailed) + ")");
     ::CloseHandle(g_nbProc);
     g_nbProc = 0;
-    g_nbPid = 0;
+    g_nbPid = 0; g_nbProgressPath.clear();   /* T-1403 review fold */
     g_nbStopping = 0;
     g_nbStopEndedIt = 0;
     g_nbStopFailedKept = 0;
@@ -3649,6 +3891,20 @@ static void PanelResetKeepToggle(MyGUI::Gui* gui)
     b->setStateSelected(!b->getStateSelected());
     DebugLog(std::string("[UI] RESET WORLD? keep players' buildings ") + (b->getStateSelected() ? "ticked" : "unticked"));
 }
+/* T-1383: a RESET WORLD? tick box (keep-dead, keep-relations): ticked <-> unticked, on that dialog only; read as it shows on screen */
+static void PanelResetTickToggle(MyGUI::Gui* gui, const std::string& name, const char* what)
+{
+    if (g_panelScreen != 4 || g_worldDlg != coopui::kWorldDlgReset) return;
+    MyGUI::Button* b = gui != 0 ? UiBtn(gui, name) : 0;
+    if (b == 0) return;
+    b->setStateSelected(!b->getStateSelected());
+    DebugLog(std::string("[UI] RESET WORLD? ") + what + " " + (b->getStateSelected() ? "ticked" : "unticked"));
+}
+static int PanelResetTicked(MyGUI::Gui* gui, const std::string& name)
+{
+    MyGUI::Button* b = gui != 0 ? UiBtn(gui, name) : 0;
+    return (b != 0 && b->getStateSelected()) ? 1 : 0;
+}
 /* The button: the confirm dialog - its text above the keep-buildings tick box, the tick box unticked, the last paragraph under it -
    with the old world's name as the world server will pick it (world.txt line 3's count, moved up past a world folder of that name
    already listed). Nothing is changed. */
@@ -3666,7 +3922,10 @@ static void PanelResetPress(MyGUI::Gui* gui)
     g_dlgText = coopui::ResetWorldDlgHead(r->name);
     g_dlgTail = coopui::ResetWorldDlgTail(oldName);
     MyGUI::Button* kb = gui != 0 ? UiBtn(gui, NM().resetKeepTick) : 0;
-    if (kb != 0) kb->setStateSelected(false);   /* unticked each time the dialog opens */
+    if (kb != 0) kb->setStateSelected(true);   /* T-1424 (owners 1772 / 1773): ticked each time the dialog opens - a reset keeps what
+                                                players built and earned unless the host unticks it */
+    kb = gui != 0 ? UiBtn(gui, NM().resetDeadTick) : 0; if (kb != 0) kb->setStateSelected(true);   /* T-1383 / T-1424: all three ticked */
+    kb = gui != 0 ? UiBtn(gui, NM().resetRelTick) : 0;  if (kb != 0) kb->setStateSelected(true);
     g_worldDlg = coopui::kWorldDlgReset;
     g_panelScreen = 4;
     DebugLog("[UI] RESET WORLD? opened for '" + r->name + "' (the world as it was would be kept as '" + oldName + "')");
@@ -3689,6 +3948,7 @@ static void PanelResetEnd(long long exitCode)
 static void PanelResetConfirmed(MyGUI::Gui* gui)
 {
     const int keep = PanelResetKeepTicked(gui);
+    const int keepDead = PanelResetTicked(gui, NM().resetDeadTick), keepRel = PanelResetTicked(gui, NM().resetRelTick);   /* T-1383 */
     if (gui == 0) { DebugLog("[UI] RESET WORLD confirmed with no panel to read the keep-buildings tick box from - nothing started"); g_panelScreen = 1; g_worldDlg = 0; return; }
     const coopworld::WorldRow* r = PanelPickedRow();
     g_panelScreen = 1;
@@ -3714,8 +3974,9 @@ static void PanelResetConfirmed(MyGUI::Gui* gui)
     const std::string root = StoreTopDir();
     const std::wstring wExe = U8W(exe.c_str()), wDir = U8W(dir.c_str()), wWorld = U8W(r->name.c_str()), wRoot = U8W(root.c_str());
     wchar_t cmd[1024];   /* CreateProcessW writes into its command line: never a literal or a c_str() */
-    const int cmdLen = _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --world \"%ls\" --root \"%ls\" --reset-world%ls",
-                                  wExe.c_str(), wWorld.c_str(), wRoot.c_str(), keep != 0 ? L" --keep-buildings" : L"");
+    const int cmdLen = _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --world \"%ls\" --root \"%ls\" --reset-world%ls%ls%ls",
+                                  wExe.c_str(), wWorld.c_str(), wRoot.c_str(), keep != 0 ? L" --keep-buildings" : L"",
+                                  keepDead != 0 ? L" --keep-dead" : L"", keepRel != 0 ? L" --keep-relations" : L"");   /* T-1383: worldhist::kArgKeepDead / kArgKeepRelations */
     cmd[sizeof(cmd) / sizeof(cmd[0]) - 1] = 0;
     if (cmdLen < 0)
     {
@@ -3740,8 +4001,10 @@ static void PanelResetConfirmed(MyGUI::Gui* gui)
     g_resetLastPollMs = ::GetTickCount();
     g_resetSay = coopui::ResetWorldBusyText(r->name);
     PanelSetStatus(g_resetSay);
-    DebugLog("[UI] RESET WORLD '" + r->name + "': the world server runs (pid " + coopui::PanelNum((long long)pi.dwProcessId) + ", keep=" + (keep != 0 ? "1" : "0") + "): " + exe
-             + " --world \"" + r->name + "\" --root \"" + root + "\" --reset-world" + (keep != 0 ? " --keep-buildings" : ""));
+    DebugLog("[UI] RESET WORLD '" + r->name + "': the world server runs (pid " + coopui::PanelNum((long long)pi.dwProcessId) + ", keep=" + (keep != 0 ? "1" : "0")
+             + " keepDead=" + (keepDead != 0 ? "1" : "0") + " keepRelations=" + (keepRel != 0 ? "1" : "0") + "): " + exe
+             + " --world \"" + r->name + "\" --root \"" + root + "\" --reset-world" + (keep != 0 ? " --keep-buildings" : "") + (keepDead != 0 ? " --keep-dead" : "")
+             + (keepRel != 0 ? " --keep-relations" : ""));
 }
 /* Title tick: has the reset's world server ended? Asked at most every kPanelStatusMs (a cost throttle, as PanelPollNotebook's); its
    end is the process handle signalled, never a time. 1 = it ended now (the panel is pushed). */
@@ -3765,6 +4028,8 @@ static void PressBegin(int mode, const std::string& world, const std::string& ad
 {
     g_pressBusy = mode;
     g_pressAtMs = ::GetTickCount();
+    startprog::WatchStart(&g_pressWatch, (unsigned)g_pressAtMs);   /* T-1403: no progress read yet = not moved since the press */
+    g_pressProgReadMs = 0; g_pressProgStep.clear(); g_pressProgTenth = -1; g_pressProgLine.clear();
     g_pressLinkedAtMs = 0;
     g_pressArmGen = ConfigArmGen();
     g_pressBoxReturn = 0;
@@ -3787,6 +4052,79 @@ static void PressCancel(const char* how)
              + coopui::PanelNum((long long)(DWORD)(::GetTickCount() - g_pressAtMs)) + " ms; back to the screen's opening line");
     if (mode == 1) HostLeave("CANCEL on HOST GAME"); else ConfigLeave("CANCEL on JOIN GAME");
     PanelIntro();
+}
+/* T-1403 (owner 1755 a / 1756 a): HOST's read of the world server's start-up progress file - at most every 250 ms; ms since it last
+   moved (since the press when none was read). The status line takes the walk's counts (startprog::StatusWithCounts); *pushed = 1
+   when it changed. One [UI] line per step, one per tenth of the record walk. */
+static unsigned PressHostProgress(DWORD now, int* pushed)
+{
+    startprog::Row row;
+    bool have = false;
+    bool gone = false;   /* review fold: the file is not there (removed at "listening"); a torn read or a sharing clash is not "gone" */
+    if (!g_nbProgressPath.empty() && g_nbPid != 0 && (g_pressProgReadMs == 0 || (DWORD)(now - g_pressProgReadMs) >= 250))
+    {
+        g_pressProgReadMs = (now != 0) ? now : 1;
+        HANDLE h = U8CreateFile(g_nbProgressPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            char buf[512]; DWORD got = 0;
+            const BOOL ok = ::ReadFile(h, buf, sizeof(buf) - 1, &got, 0);
+            ::CloseHandle(h);
+            have = ok != FALSE && startprog::Parse(std::string(buf, got), &row) && startprog::RowIsOurs(row, (unsigned long)g_nbPid);
+        }
+        else
+        {
+            const DWORD e = ::GetLastError();
+            gone = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND);
+        }
+    }
+    if (gone)
+    {
+        if (g_pressWatch.seen != 0 && g_pressWatch.key != "gone")
+        {
+            const int running = PanelNotebookRunningPort() != 0 ? 1 : 0;
+            DebugLog("[UI] T-1403 HOST: the world server's start-up progress file is gone after " + coopui::PanelNum((long long)(DWORD)(now - g_pressAtMs))
+                     + " ms (last step '" + g_pressProgStep + "') - waiting for the world's answer" + (running ? std::string() : std::string(" (its process has ended: no listening)")));
+            /* T2520: the press's dial may have given up (ENet's ~31.5 s). Review fold: the server removes the file on its early exits too - only a
+               server still running is listening (a removal in the instant before an early exit can still pass: its dial then meets no port) */
+            if (startprog::ListeningOf(g_pressWatch.seen, g_pressWatch.key == "gone" ? 1 : 0, running)) ConfigHostStartListening("its start-up progress file is gone");
+        }
+        startprog::WatchGone(&g_pressWatch, (unsigned)now);
+        if (!g_pressProgLine.empty())   /* the counts come down: the plain line, as the press showed it */
+        {
+            g_pressProgLine.clear();
+            PanelSetStatus(PanelPressLine(1, g_fWorld, std::string()));
+            if (pushed) *pushed = 1;
+        }
+    }
+    const unsigned still = startprog::WatchStill(&g_pressWatch, have, row, (unsigned)now);
+    if (have)
+    {
+        const std::string ms = coopui::PanelNum((long long)(DWORD)(now - g_pressAtMs));
+        if (row.step != g_pressProgStep)
+        {
+            g_pressProgStep = row.step; g_pressProgTenth = -1;
+            DebugLog("[UI] T-1403 HOST: the world server's start-up step '" + row.step + "' after " + ms + " ms"
+                     + (row.m > 0 ? " (" + coopui::PanelNum(row.n) + " / " + coopui::PanelNum(row.m) + ")" : std::string()));
+        }
+        if (row.step == startprog::kStepRecords && row.m > 0)
+        {
+            const int t = startprog::TenthOf(row.n, row.m);
+            if (t > g_pressProgTenth)
+            {
+                g_pressProgTenth = t;
+                DebugLog("[UI] T-1403 HOST: the world server has gone through " + coopui::PanelNum(row.n) + " / " + coopui::PanelNum(row.m) + " records after " + ms + " ms");
+            }
+        }
+        const std::string line = startprog::StatusWithCounts(PanelPressLine(1, g_fWorld, std::string()), true, row);
+        if (line != g_pressProgLine && !(g_pressProgLine.empty() && line == PanelPressLine(1, g_fWorld, std::string())))
+        {
+            g_pressProgLine = line;
+            PanelSetStatus(line);
+            if (pushed) *pushed = 1;
+        }
+    }
+    return still;
 }
 /* Title pump, every tick while a press is in progress. 1 = the screen changed and wants a push. */
 static int PressTick()
@@ -3832,9 +4170,15 @@ static int PressTick()
     }
     p.elapsedMs = (unsigned)(DWORD)(now - g_pressAtMs);
     p.linkedMs  = (g_pressLinkedAtMs != 0) ? (unsigned)(DWORD)(now - g_pressLinkedAtMs) : 0u;
+    int progPushed = 0;
+    p.stillMs   = (p.mode == 0) ? PressHostProgress(now, &progPushed) : 0u;   /* T-1403 */
     std::string box;
     const int v = coopui::PressVerdictOf(p, mods, &box);
-    if (v == coopui::kPressWait) return 0;
+    if (v == coopui::kPressWait) return progPushed;
+    if (p.mode == 0 && v == coopui::kPressFailed && box == coopui::kPressHostLateText)
+        DebugLog("[UI] T-1403 HOST: the world server's start-up progress did not move for " + coopui::PanelNum((long long)p.stillMs) + " ms"
+                 + (g_pressWatch.seen != 0 ? " (last step '" + g_pressProgStep + "')" : std::string(" (no progress read since the press)"))
+                 + " - the late box");
     const int mode = g_pressBusy;
     g_pressBusy = 0;
     const std::string what = (mode == 1) ? "HOST" : "JOIN";
@@ -3848,7 +4192,9 @@ static int PressTick()
                  + (p.notebookUp != 0 ? std::string(" (WELCOME)")
                                       : " with its profile lobby on link generation " + coopui::PanelNum((long long)p.linkGen) + " - the WELCOME follows a profile pick (T552)"));
         g_pressKeepFolder.clear(); g_pressKeepToken.clear();   /* T-1254 B1 */
+        g_adminJoinPending = 0;   /* T-247: JOIN AS ADMIN's password stays with store.cpp until the world server's RESULT, or its standing at the WELCOME without a login, or a leave (review fold FIX 1) */
         if (mode == 1) { g_fHostPw.clear(); g_hostPwShown = 0; }   /* T-290: hosting started - the box empties (store.cpp keeps this hosting's password) */
+        if (mode == 1 && !g_pressProgLine.empty()) { g_pressProgLine.clear(); PanelSetStatus(PanelPressLine(1, g_fWorld, std::string())); }   /* T-1403 review fold: no counts left up */
         if (mode == 1) LoadBegin(1);   /* T-201 PP6': no HOSTING screen - Starting "<world>"... stays up while the profile is picked and admitted */
         if (mode == 2) PanelSetStatus(std::string());   /* T-201 N1 fold (finding 5): Connecting comes down, CANCEL is BACK again, JOIN greys while linked (PanelPush); PROFILES follows when its list arrives */
         return 1;
@@ -3863,6 +4209,28 @@ static int PressTick()
                  + ") - an older version's world server runs it; while this run is picked HOST writes no password line into its rules.txt and HOST GAME says so");
     }
     g_pressKeepFolder.clear(); g_pressKeepToken.clear();
+    const bool modsJoin = (p.mode == 1 && p.refusal == 5);   /* coopstore::kRefuseMods: turned away under DIFFERENT MODS Rejected */
+    const bool adminRetry = g_adminJoinPending != 0;   /* owner 1703: the answer is to JOIN AS ADMIN's JOIN */
+    if (g_adminJoinPending != 0)
+    {   /* T-247 (owner 1692): the answer to JOIN AS ADMIN's JOIN - a wrong admin password (or the lockout) keeps the box, with its line */
+        g_adminJoinPending = 0;
+        SetJoinAdminPassword(std::string());
+        if (modsJoin && StoreModsRefusalLoginWrong() != 0)
+        {   /* T-247 review fold (FIX 2): during the login lockout the box says what /login says - the wait (adminwords::LockedLine) */
+            const unsigned lockWait = StoreModsRefusalLockWait();
+            DebugLog("[UI] JOIN AS ADMIN refused after " + ms + " ms - " + (lockWait != 0 ? "the login lockout holds (" + coopui::PanelNum((long long)lockWait) + " s);"
+                     " the JOIN AS ADMIN box again with /login's lockout line" : std::string("the world server did not take the admin password;"
+                     " the JOIN AS ADMIN box again with its wrong-password line")));
+            ConfigLeave("a failed JOIN AS ADMIN");
+            g_fJoinPw.clear();
+            g_dlgText = lockWait != 0 ? adminwords::LockedLine(lockWait) : std::string(coopmods::kModsAdminWrongLine);
+            g_pwAdmin = 1;
+            g_panelMode = 1;
+            g_panelScreen = 8;
+            g_pwFocusWanted = 1;
+            return 1;
+        }
+    }
     {   /* T-290: a JOIN refused because the world needs a password (8) or the one given was wrong (9) shows PASSWORD REQUIRED in place
            of the CAN'T JOIN box - the join is left as for any failure, and that screen's JOIN makes JOIN GAME's press again */
         const int ask = coopui::PressPasswordAsk(p.mode, p.refusal);
@@ -3873,6 +4241,7 @@ static int PressTick()
             ConfigLeave("a failed JOIN");
             g_fJoinPw.clear();
             g_dlgText = coopui::PressPasswordLine(ask);
+            g_pwAdmin = 0;
             g_panelMode = 1;
             g_panelScreen = 8;
             g_pwFocusWanted = 1;   /* the PASSWORD box selected (PanelPwFocusTick) */
@@ -3882,7 +4251,24 @@ static int PressTick()
     ErrorLog("[UI] T-201 N1: " + what + " FAILED after " + ms + " ms - the " + coopui::PressBoxTitle(p.mode) + " box: " + box);
     if (mode == 1) HostLeave("a failed HOST"); else ConfigLeave("a failed JOIN");
     ::InterlockedExchange(&g_panelWanted, 0);   /* the box shows once the panel is down; its OK brings the screen back */
-    UiRaiseNoticeTitled(box, coopui::PressBoxTitle(p.mode));
+    if (modsJoin)
+    {   /* T-247 (version 3 section 4): titled MODS DON'T MATCH, with JOIN AS ADMIN beside OK. An order-only refusal (coopmods::ModsOrderOnly)
+           gets T-1375's PUT MY MODS IN THE WORLD'S ORDER beside OK instead (below). */
+        /* owner 1703: JOIN AS ADMIN only for a player the world server says is on its admin list; everyone else's box has OK only. A JOIN AS
+           ADMIN whose password was right but whose player is not listed (removed since) is answered with /login's own line, not this box. */
+        const bool adminRetryNotListed = adminRetry && StoreModsRefusalLoginNotListed() != 0;
+        const std::string shown = adminRetryNotListed ? adminwords::ResultLine(adminauth::kResNotAdmin, 0) : box;
+        UiRaiseNoticeTitled(shown, coopmods::kModsWarnTitle);
+        g_noticeAdminOffer = (playermods::ModsRefuseBoxButtons(StoreModsRefusalFlags()) & playermods::kBoxJoinAsAdmin) != 0 && !adminRetryNotListed ? 1 : 0;
+        /* T-1375 (the approved page version 3 section 4, WHEN ONLY THE ORDER DIFFERS): PUT MY MODS IN THE WORLD'S ORDER and OK - the page's
+           order-only box has those two buttons, so it takes JOIN AS ADMIN's place */
+        const int orderOnly = !adminRetryNotListed && StoreModsRefusalOrderOnly(0) != 0 ? 1 : 0;
+        if (orderOnly != 0) { g_noticeOrderOffer = kNoticeOrderPut; g_noticeAdminOffer = 0; }
+        DebugLog(std::string("[UI] MODS DON'T MATCH box: ") + (adminRetryNotListed ? "JOIN AS ADMIN's password was right but this player is not on the admin list - /login's line; "
+                 : std::string()) + (orderOnly != 0 ? "PUT MY MODS IN THE WORLD'S ORDER and OK (the same mods in another order, T-1375)"
+                 : g_noticeAdminOffer != 0 ? "JOIN AS ADMIN and OK (the world server offers it: on its admin list or the last owner-password prover)" : "OK only (the world server does not offer JOIN AS ADMIN)"));
+    }
+    else UiRaiseNoticeTitled(box, coopui::PressBoxTitle(p.mode));
     g_pressBoxReturn = mode;
     PanelIntro();
     return 1;
@@ -3890,8 +4276,48 @@ static int PressTick()
 /* Title pump: a failure box that has been closed (OK or Escape) returns to HOST GAME / JOIN GAME with its opening line. */
 static void PressBoxReturnTick()
 {
-    if (g_pressBoxReturn == 0 && g_nameTakenBox == 0) return;
+    if (g_pressBoxReturn == 0 && g_nameTakenBox == 0 && ::InterlockedCompareExchange(&g_noticeAdminPressed, 0, 0) == 0
+        && ::InterlockedCompareExchange(&g_noticeOrderPressed, 0, 0) == 0) return;
     if (::InterlockedCompareExchange(&g_noticeWanted, 0, 0) != 0) return;
+    {   /* T-1375 (the approved page version 3 section 2): PUT MY MODS IN THE WORLD'S ORDER asks first; YES writes the two list files */
+        const LONG order = ::InterlockedExchange(&g_noticeOrderPressed, 0);
+        if (order == 1)
+        {
+            UiRaiseNoticeTitled(coopmods::kModsOrderAsk, coopmods::kModsOrderTitle);
+            g_noticeOrderOffer = kNoticeOrderAsk;
+            DebugLog("[UI] T-1375: PUT MY MODS IN THE WORLD'S ORDER pressed on the MODS DON'T MATCH box - the MOD ORDER box asks first (YES / NO)");
+            return;   /* g_pressBoxReturn kept: the last box's OK (or NO) returns to JOIN GAME */
+        }
+        if (order == 2)
+        {
+            coopmods::ModList w;
+            const int have = StoreModsRefusalOrderOnly(&w);
+            if (have != 0 && SettingsModsPutInWorldOrder(w) != 0)
+            {
+                g_modsOrderWrittenFor = w.active;
+                UiRaiseNoticeTitled(coopmods::kModsOrderDone, coopmods::kModsOrderTitle);
+                DebugLog("[UI] T-1375: YES on the MOD ORDER box - this game's mod order now matches the world's; the after-YES MOD ORDER box is shown (a restart is needed)");
+                return;
+            }
+            /* owner 1710 a: the 'could not be changed' words in the MOD ORDER box when the write was tried; its OK goes back to JOIN GAME
+               as after the after-YES box (g_pressBoxReturn kept) */
+            ModsOrderWriteFailed(have != 0 ? "the MODS DON'T MATCH box" : "the MODS DON'T MATCH box - the last refusal was not the same mods in another order; back to JOIN GAME", have != 0 ? 1 : 0);
+            if (have != 0) { UiRaiseNoticeTitled(coopmods::kModsOrderFailed, coopmods::kModsOrderTitle); return; }
+        }
+    }
+    if (::InterlockedExchange(&g_noticeAdminPressed, 0) != 0)
+    {   /* T-247 (owner 1692): JOIN AS ADMIN on the MODS DON'T MATCH box - the JOIN AS ADMIN box asks the admin password */
+        g_pressBoxReturn = 0; g_nameTakenBox = 0;
+        g_fJoinPw.clear();
+        g_dlgText = coopmods::kModsAdminJoinLine;
+        g_pwAdmin = 1;
+        g_panelMode = 1;
+        g_panelScreen = 8;
+        g_pwFocusWanted = 1;
+        ::InterlockedExchange(&g_panelWanted, 1);
+        DebugLog("[UI] JOIN AS ADMIN pressed on the MODS DON'T MATCH box - the JOIN AS ADMIN box asks this world's admin password");
+        return;
+    }
     const int mode = g_nameTakenBox != 0 ? 2 : g_pressBoxReturn;   /* T-201 N1b (owner 166): the name-taken box returns to JOIN GAME */
     if (g_nameTakenBox != 0) g_nameFocusWanted = 1;               /* ...with the PLAYER NAME box selected (PanelNameFocusTick) */
     g_nameTakenBox = 0;
@@ -3980,7 +4406,7 @@ static void LoadHostPickStep(unsigned select, int verdict, const std::string& sa
         {
             if (g_loadNewAsked != 0) return;
             const bool imp = !g_hostProfImport.empty() && coopprof::NameSame(c.name, g_hostProfNew);   /* T-1096 part 3: CHANGE's NEW PROFILE with import */
-            if (!(imp ? StoreSpImportRequest(c.name, g_hostProfImport) : StoreProfileRequest(kProfReqNew, 0, c.name)))
+            if (!(imp ? StoreSpImportRequest(c.name, g_hostProfImport, g_hostProfImportAsk) : StoreProfileRequest(kProfReqNew, 0, c.name)))   /* T-1383: the creator's ask */
             {
                 LoadFail(coopui::kPressHostLateText, "CAN'T HOST", imp ? "the import's save is not a single-player save any more, or the world's link went down, before the new profile was asked for"
                                                                        : "the world's link went down before the new profile was asked for");
@@ -4320,6 +4746,7 @@ static void PanelGo()
         if (keeprun::KeyTokenBytes(g_keepPickToken, tok, (unsigned int)sizeof tok)) { memcpy(g_hostToken, tok, sizeof tok); g_hostTokenSet = true; }
         else g_hostTokenSet = false;
         g_nbState = coopui::kNbNotOurs;
+        g_nbProgressPath.clear();   /* T-1403 review fold: no world server started - no progress file is this press's */
         /* the owner password this game logs in with by itself (owner 1369 b): rules.txt's, or a long random one written there now when
            its line is empty - the running world server reads it within seconds, like any edit of the file; the world password line
            is left as it is */
@@ -4382,6 +4809,25 @@ static bool PanelReadWorldFile(const std::string& folder, const char* file, std:
     return true;
 }
 static bool PanelReadProfilesFile(const std::string& folder, std::string* out) { return PanelReadWorldFile(folder, "profiles.txt", out); }
+/* T-1383: HOST GAME's CHANGE, the world not running - the world folder would make its first import the world's creator
+   (spimport::WorldFolderFresh): profiles.txt holds no row (a deleted one counts), uniques.txt and world_relations.txt hold no line,
+   and there is no record file (<id>.meta). The world server decides again when the HOST press asks. */
+static bool PanelWorldFolderFresh(const std::string& folder)
+{
+    std::string t;
+    int dropped = 0;
+    const int rows = PanelReadProfilesFile(folder, &t) ? (int)coopprof::RowsParseFile(t, &dropped).size() + dropped : 0;
+    const bool uq = PanelReadWorldFile(folder, "uniques.txt", &t) && t.find_first_not_of("\r\n") != std::string::npos;
+    const bool rl = PanelReadWorldFile(folder, "world_relations.txt", &t) && t.find_first_not_of("\r\n") != std::string::npos;
+    U8FindData fd;
+    HANDLE h = U8FindFirstFile((StoreTopDir() + "\\" + folder + "\\*.meta").c_str(), &fd);
+    const bool rec = h != INVALID_HANDLE_VALUE;
+    if (rec) ::FindClose(h);
+    const bool fresh = spimport::WorldFolderFresh(rows, uq, rl, rec);
+    DebugLog("[UI] T-1383: CHANGE - world folder '" + folder + "' " + (fresh ? "has no profile and no history: an import there makes the world's creator"
+             : "has a profile or history: an import there is not the world's creator") + " (profile rows " + coopui::PanelNum((long long)rows) + ")");
+    return fresh;
+}
 /* The world's rules.txt names a rule (rulesfile::NamesARule): a file of only the password lines HOST writes is a world whose rules no
    world server has stored yet; a file that is there and cannot be read counts as naming one (never taken for none). */
 static bool PanelRulesNamed(const std::string& folder)
@@ -4453,7 +4899,7 @@ static void PanelStartLoad()
         if (g_startWorld != g_hostProfWorld) { g_startState = spimport::StartRowState(); g_startWorld.clear(); }   /* import not offered until the file can be read */
         return;
     }
-    g_startState = spimport::StartRowFromOptions(om[spimport::kKeyMode], om[spimport::kKeyMoney], om[spimport::kKeyResearch]);
+    g_startState = spimport::StartRowFromOptions(om[spimport::kKeyMode], om[spimport::kKeyMoney], om[spimport::kKeyResearch], PanelWorldFolderFresh(g_hostProfWorld));
     g_startWorld = g_hostProfWorld;
 }
 static void PanelProfSelectOpen()
@@ -4715,7 +5161,47 @@ static void PanelOptAction(int act)
 {
     if (act == kActGameOptions) { if (g_panelScreen == 1) PanelOptOpen(); return; }
     if (g_panelScreen != 6) return;
-    if (act >= kActOptTab0 && act < kActOptTab0 + coopui::kOptTabCount) { g_optTab = act - kActOptTab0; return; }
+    if (act >= kActOptTab0 && act <= kActOptTab0 + 2) { g_optTab = act - kActOptTab0; g_optModsAsking = 0; return; }
+    if (act == kActOptTab3) { g_optTab = coopui::kOptTabMods; return; }   /* T-247: the fourth tab's code is past the first three's range */
+    if (act == kActModsOrder || ((act == kActModsYes || act == kActModsNo) && (g_optModsAsking == kOptModsAskOrder || OptModsAfterYes())))
+    {   /* T-1375 (the approved page version 3 sections 1 and 2): PUT MY MODS IN THE WORLD'S ORDER - anyone (it changes only this game), in
+           a running world, while only the order differs; asked first (MOD ORDER, YES / NO); after YES the sentence with OK */
+        int haveList = 0; coopmods::ModList wl; std::string by, at; unsigned flags = 0; long long seq = 0;
+        const bool known = g_optInWorld != 0 && StoreWorldMods(&haveList, &wl, &by, &at, &flags, &seq) != 0;
+        const int st = known ? coopmods::ModsOrderTabState(haveList, wl, StoreOwnMods(), g_modsOrderWrittenFor) : coopmods::kMoTabNone;
+        if (act == kActModsOrder)
+        {
+            if (st != coopmods::kMoTabButton) { DebugLog("[UI] MODS tab: PUT MY MODS IN THE WORLD'S ORDER refused - " + std::string(g_optInWorld == 0 ? "not in a world" : "only the order does not differ now (or the new order already waits for a restart)")); g_optModsAsking = 0; return; }
+            g_optModsAsking = kOptModsAskOrder;
+            DebugLog("[UI] T-1375: MODS tab: PUT MY MODS IN THE WORLD'S ORDER pressed - the MOD ORDER box asks first (YES / NO)");
+            return;
+        }
+        if (OptModsAfterYes() || act == kActModsNo)
+        {
+            DebugLog(OptModsAfterYes() ? "[UI] T-1375: MODS tab: the after-YES MOD ORDER box closed (OK)" : "[UI] T-1375: MODS tab: MOD ORDER - NO, nothing written");
+            g_optModsAsking = 0;
+            return;
+        }
+        if (st == coopmods::kMoTabButton && SettingsModsPutInWorldOrder(wl) != 0)
+        {
+            g_modsOrderWrittenFor = wl.active;
+            g_optModsAsking = kOptModsAskOrderDone;
+            DebugLog("[UI] T-1375: MODS tab: YES on the MOD ORDER box - this game's mod order now matches the world's; the after-YES sentence is shown and the tab's line says the new order waits for a restart");
+            return;
+        }
+        g_optModsAsking = st == coopmods::kMoTabButton ? kOptModsAskOrderFailed : 0;
+        ModsOrderWriteFailed(st == coopmods::kMoTabButton ? "MODS tab" : "MODS tab - only the order no longer differs", st == coopmods::kMoTabButton ? 1 : 0);
+        return;
+    }
+    if (act == kActModsUse || act == kActModsYes || act == kActModsNo)
+    {   /* T-247 (section 2): USE MY MODS FOR THIS WORLD - admins only, in a running world; asked first */
+        if (g_optInWorld == 0 || UiOptAdminNow() == 0) { DebugLog("[UI] MODS tab: USE MY MODS refused - " + std::string(g_optInWorld == 0 ? "not in a world" : "this game is not an admin now")); g_optModsAsking = 0; return; }
+        if (act == kActModsUse) { g_optModsAsking = kOptModsAskUse; DebugLog("[UI] MODS tab: USE MY MODS FOR THIS WORLD pressed - the question is up"); return; }
+        g_optModsAsking = 0;
+        if (act == kActModsNo) { DebugLog("[UI] MODS tab: USE MY MODS - NO, nothing sent"); return; }
+        AdminUseMyMods("GAME OPTIONS' MODS tab (YES)");
+        return;
+    }
     if (act == kActOptDone) { if (g_optInWorld != 0) PanelOptDoneInWorld(); else PanelOptDone(); return; }
     if (UiOptControlsLit() == 0)   /* in a running world a game that is not an admin now changes nothing here (its controls are greyed) */
     {
@@ -4736,13 +5222,9 @@ static void PanelOptAction(int act)
         }
         return;
     }
-    int row = -1, dir = 1;
-    if (act == kActOptDec9) { row = 9; dir = -1; }   /* T-1096: the tenth row's codes are past the first nine's ranges */
-    else if (act == kActOptInc9 || act == kActOptTick9) row = 9;
-    else if (act >= kActOptDec0 && act < kActOptDec0 + 9) { row = act - kActOptDec0; dir = -1; }
-    else if (act >= kActOptInc0 && act < kActOptInc0 + 9) row = act - kActOptInc0;
-    else if (act >= kActOptTick0 && act < kActOptTick0 + 9) row = act - kActOptTick0;
-    const int i = row < 0 ? -1 : coopui::OptIndexOf((int)g_optTab, row);
+    int dir = 1;
+    const int row = coopui::OptActRow(act, &dir);   /* T-1392 review fix 1: the row codes' one table (the tenth and eleventh rows' are past the first nine's ranges) */
+    const int i = row < 0 ? -1 : coopui::OptIndexShown((int)g_optTab, row, g_optVal);   /* T-1392: the row as it is on screen */
     if (i >= 0 && coopui::OptRowLit(i, g_optVal)) g_optVal[i] = coopui::OptStep(i, g_optVal[i], dir);   /* T-1096: a greyed row cannot be changed */
 }
 
@@ -4751,7 +5233,8 @@ static void PanelOptAction(int act)
    brings this screen back.  CANCEL (or BACK): JOIN GAME with its opening line.  Either way the box is emptied. */
 static void PanelPwCancel()
 {
-    DebugLog("[UI] CANCEL on PASSWORD REQUIRED - JOIN GAME with its opening line");
+    DebugLog(std::string("[UI] CANCEL on ") + (g_pwAdmin != 0 ? "JOIN AS ADMIN" : "PASSWORD REQUIRED") + " - JOIN GAME with its opening line");
+    g_pwAdmin = 0;
     g_fJoinPw.clear();
     g_panelMode = 1;
     g_panelScreen = 2;
@@ -4761,10 +5244,20 @@ static void PanelPwJoin()
 {
     if (g_fJoinPw.empty()) return;   /* JOIN is greyed while the box is empty (PanelPwJoinLit) */
     if (IdBoxRefuseHostJoin("JOIN")) { g_fJoinPw.clear(); return; }   /* PP3d, as on JOIN GAME; the panel closes, the text goes */
-    SetJoinPassword(g_fJoinPw);
-    g_joinPwFromLever = 0;   /* the typed password, not a lever's, goes with this press (PanelGo below keeps it) */
-    DebugLog(std::string("[UI] JOIN on PASSWORD REQUIRED - ") + (g_fJoinPw.empty() ? "no password typed" : "a password typed")
-             + "; JOIN GAME's join again, to the same address");
+    if (g_pwAdmin != 0)
+    {   /* T-247 (owner 1692): JOIN AS ADMIN's JOIN - the world's password (if any) stays as the last join had it; the typed one is the door's login */
+        SetJoinAdminPassword(g_fJoinPw);
+        g_adminJoinPending = 1;
+        g_pwAdmin = 0;
+        DebugLog("[UI] JOIN on JOIN AS ADMIN - an admin password typed (never logged); JOIN GAME's join again, to the same address, the password shown at the door as a login");
+    }
+    else
+    {
+        SetJoinPassword(g_fJoinPw);
+        g_joinPwFromLever = 0;   /* the typed password, not a lever's, goes with this press (PanelGo below keeps it) */
+        DebugLog(std::string("[UI] JOIN on PASSWORD REQUIRED - ") + (g_fJoinPw.empty() ? "no password typed" : "a password typed")
+                 + "; JOIN GAME's join again, to the same address");
+    }
     g_fJoinPw.clear();
     g_panelMode = 1;
     g_panelScreen = 2;
@@ -4947,7 +5440,7 @@ static void PanelApply(MyGUI::Gui* gui, int act, int havePanel)
         if (canCancel == 0 || (act != kActToggle && act != kActClose)) { ::InterlockedIncrement64(&g_pressIgnored); return; }
         LoadCancel(act == kActClose ? "X / Escape" : "the MULTIPLAYER button");
     }
-    if ((act >= kActGameOptions && act <= kActOptDone) || act == kActOptDec9 || act == kActOptInc9 || act == kActOptTick9) { PanelOptAction(act); if (havePanel) PanelPush(gui); return; }   /* mp5; T-1096: the tenth row */
+    if (coopui::OptActRouted(act)) { PanelOptAction(act); if (havePanel) PanelPush(gui); return; }   /* mp5; T-1096: the tenth row; T-1392 review fix 1: the eleventh row's codes too - one pure table (panelstatus.h, tested offline) */
     if (act >= kActProfPick && act <= kActChooseProfile)   /* prof3; ui2: the list's pick is read back here, on the title pump */
     { PanelProfAction(act, (act == kActProfPick && havePanel) ? UiListPicked(gui, NM().profList) : MyGUI::ITEM_NONE); if (havePanel) PanelPush(gui);
       if (havePanel && act == kActProfPick) UiFocusPanel(gui);   /* ui2b: Escape reaches the window again after a pick */
@@ -5163,6 +5656,18 @@ static void PanelApply(MyGUI::Gui* gui, int act, int havePanel)
         case kActDeleteWorld:  PanelDeletePress();      if (havePanel) PanelPush(gui); return;
         case kActResetWorld:   PanelResetPress(havePanel ? gui : 0); if (havePanel) PanelPush(gui); return;
         case kActResetKeep:    PanelResetKeepToggle(havePanel ? gui : 0); return;
+        case kActResetDead:    PanelResetTickToggle(havePanel ? gui : 0, NM().resetDeadTick, "keep named characters who died"); return;   /* T-1383 */
+        case kActResetRel:     PanelResetTickToggle(havePanel ? gui : 0, NM().resetRelTick, "keep how the factions feel about each other"); return;
+        case kActImpDead:   /* T-1383: the creator's tick boxes, only while the picker shows them */
+        case kActImpRel:
+            if (g_panelScreen == 7 && g_profDlg == coopui::kProfDlgImport && ImpCreatorShown())
+            {
+                int& v = act == kActImpDead ? g_impDeadTicked : g_impRelTicked;
+                v = v != 0 ? 0 : 1;
+                DebugLog(std::string("[UI] T-1383: IMPORT FROM SINGLE PLAYER - ") + (act == kActImpDead ? spimport::kTickDead : spimport::kTickRelations) + (v != 0 ? " ticked" : " unticked"));
+            }
+            if (havePanel) PanelPushStart(gui);
+            return;
         case kActKeepTick:     /* HOST GAME's keep-running tick box: ticked <-> unticked */
             if (g_panelScreen != 1 || g_pressBusy != 0) return;
             g_keepTicked = g_keepTicked != 0 ? 0 : 1;
@@ -5577,17 +6082,20 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         const coopui::PanelBand tb = coopui::PanelSlotBand(optLay, coopui::kSlotTabs, rowH);
         const coopui::PanelBand rb = coopui::PanelSlotBand(optLay, coopui::kSlotOptRows, rowH);
         const coopui::PanelBand bb = coopui::PanelSlotBand(optLay, coopui::kSlotButtons, rowH);
+        const int tabW = coopui::PanelQuarterBtnW(W, gap);   /* T-247: four tabs (MODS the fourth) */
         for (int t = 0; t < coopui::kOptTabCount; ++t)
-            Mk(og, n.typeButton, n.skinBtn1, t * (thirdW + gap), tb.top, thirdW, tb.h, n.optTab[t]);
+            Mk(og, n.typeButton, n.skinBtn1, t * (tabW + gap), tb.top, tabW, tb.h, n.optTab[t]);
         const int stepW = (W * 8) / 100;
         const int decX  = (W * 51) / 100;
         const int incX  = W - stepW;
         const int valX  = decX + stepW + gap;
         const int valW  = incX - gap - valX;
+        g_optBuiltLay = optLay; g_optBuiltRowH = rowH;   /* T-1392 review fix 4: PanelPushOptions places the rows for the state shown */
         for (int r = 0; r < coopui::kOptRowsShown; ++r)
-        {
-            const int y  = rb.top + (rb.h * r) / coopui::kOptRowsShown;
-            const int rh = rb.top + (rb.h * (r + 1)) / coopui::kOptRowsShown - y;
+        {   /* main's ten row slots; the eleventh row on the eleven-row band (PanelPushOptions moves them while MENUS AND BUILDING is shown) */
+            const coopui::PanelBand ob = coopui::PanelOptRowBand(optLay, rowH, r, r >= coopui::kOptRowSlots ? 1 : 0, 0);
+            const int y  = ob.top;
+            const int rh = ob.h;
             const int tickW = rh < stepW ? rh : stepW;
             Mk(og, n.typeText,   std::string("Kenshi_TextboxStandardText"), 0, y, (W * 50) / 100, rh, n.optLabel[r]);   /* ui3b: the painted font overflowed 50% at 1280x720 */
             Mk(og, n.typeButton, n.skinBtn1, decX, y,                    stepW, rh,    n.optDec[r]);
@@ -5598,9 +6106,62 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         {
             const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);
             const int fr  = fee < 0 ? 0 : coopui::OptRowOf(coopui::OptDefs()[fee].tab, fee);
-            const int fy  = rb.top + (rb.h * fr) / coopui::kOptRowsShown;
-            const int fh  = rb.top + (rb.h * (fr + 1)) / coopui::kOptRowsShown - fy;
+            const coopui::PanelBand fb = coopui::PanelOptRowBand(optLay, rowH, fr, fr >= coopui::kOptRowSlots ? 1 : 0, 0);   /* T-1392 review fix 4: its row's slot as the rows are built (PanelPushOptions follows its label) */
+            const int fy  = fb.top;
+            const int fh  = fb.h;
             Mk(og, n.typeEdit, n.skinEdit, decX, fy, W - decX, fh, n.optFeeEdit);   /* the PORT box's skin (HOST GAME) */
+        }
+        {   /* T-247 (section 1): the MODS tab under its one row - the world's list line, this game's line and USE MY MODS FOR THIS WORLD,
+               each in a row slot of its own, full width (row 4 is left for T-1375's PUT MY MODS IN THE WORLD'S ORDER); section 2: the
+               button's question, a box of its own titled WORLD'S MODS with YES / NO over the tab, hidden until the button is pressed */
+            const int kModsSlots = coopui::kOptRowSlots;   /* T-1392: the MODS tab's lines on main's ten row slots, as its own top row (PanelOptRowBand) */
+            const char* const lines[2] = { kOptModsWorldName, kOptModsYourName };
+            const int at[2] = { 1, 2 };
+            for (int k = 0; k < 2; ++k)
+            {
+                const int y  = rb.top + (rb.h * at[k]) / kModsSlots;
+                const int rh = rb.top + (rb.h * (at[k] + 1)) / kModsSlots - y;
+                MyGUI::Widget* lw = Mk(og, n.typeText, std::string("Kenshi_TextboxStandardText"), 0, y, W, rh, std::string(lines[k]));
+                MyGUI::TextBox* lt = lw != 0 ? lw->castType<MyGUI::TextBox>(false) : 0;
+                if (lt != 0) { lt->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); lt->setVisible(false); }
+            }
+            const int uy = rb.top + (rb.h * 3) / kModsSlots, uh = rb.top + (rb.h * 4) / kModsSlots - uy;
+            const int useW = (W * 60) / 100;
+            MyGUI::Widget* ub = Mk(og, n.typeButton, n.skinBtn1, 0, uy, useW, uh, std::string(kOptModsUseName)); if (ub) ub->setVisible(false);
+            {   /* T-1375 (section 1): PUT MY MODS IN THE WORLD'S ORDER in row 4, under USE MY MODS - its caption's width (panelfit.h) */
+                const int oy = rb.top + (rb.h * 4) / kModsSlots, oh = rb.top + (rb.h * 5) / kModsSlots - oy;
+                MyGUI::Widget* ob = Mk(og, n.typeButton, n.skinBtn1, 0, oy, coopui::PanelModsOrderBtnW(W), oh, std::string(kOptModsOrderName)); if (ob) ob->setVisible(false);
+            }
+            /* the WORLD'S MODS box: the error box's recipe (Kenshi_WindowC titled in caps, the sentence centred in the message box's
+               colour, Kenshi_Button2 buttons lit by hand), an overlapped child of the tab so it draws over the rows' text */
+            const int aw = (W * 3) / 4, ax = (W - aw) / 2;
+            const int ay = rb.top + (rb.h * 4) / kModsSlots, ah = rb.top + (rb.h * 9) / kModsSlots - ay;
+            MyGUI::Widget* araw = MkOver(og, n.typeWindow, std::string("Kenshi_WindowC"), ax, ay, aw, ah, std::string(kOptModsAskName));
+            MyGUI::Window* awin = (araw != 0) ? araw->castType<MyGUI::Window>(false) : 0;
+            MyGUI::Widget* ac = (awin != 0) ? awin->getClientWidget() : 0;
+            if (awin != 0 && ac != 0)
+            {
+                awin->setMovable(false);
+                awin->setCaption(MyGUI::UString(coopmods::kModsAskTitle));
+                const int cw = ac->getWidth(), ch = ac->getHeight();
+                const int bh = rowH, bw = cw / 3 < 120 ? 120 : cw / 3, by = ch - bh - 6;
+                MyGUI::Widget* tw = Mk(ac, n.typeEdit, n.skinWrap, 8, 4, cw - 16, by - 8, std::string(kOptModsAskTextName));
+                MyGUI::EditBox* te = (tw != 0) ? tw->castType<MyGUI::EditBox>(false) : 0;
+                if (te != 0)
+                {
+                    te->setEditStatic(true); te->setEditReadOnly(true); te->setEditMultiLine(true); te->setEditWordWrap(true);
+                    te->setTextAlign(MyGUI::Align::Center);
+                    te->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
+                    te->setCaption(MyGUI::UString(coopmods::kModsAskText));
+                }
+                MyGUI::Widget* yb = Mk(ac, n.typeButton, std::string("Kenshi_Button2"), 8, by, bw, bh, std::string(kOptModsYesName));
+                MyGUI::Widget* nb2 = Mk(ac, n.typeButton, std::string("Kenshi_Button2"), cw - bw - 8, by, bw, bh, std::string(kOptModsNoName));
+                MyGUI::Button* yb2 = (yb != 0) ? yb->castType<MyGUI::Button>(false) : 0;
+                MyGUI::Button* nb3 = (nb2 != 0) ? nb2->castType<MyGUI::Button>(false) : 0;
+                if (yb2 != 0) yb2->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
+                if (nb3 != 0) nb3->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
+            }
+            if (araw != 0) araw->setVisible(false);
         }
         Mk(og, n.typeButton, n.skinBtn1, 0,        bb.top, btnW, bb.h,                                   n.optDefaultsBtn);
         Mk(og, n.typeButton, n.skinBtn1, W - btnW, bb.top, btnW, bb.h,                                   n.optDoneBtn);
@@ -5673,6 +6234,10 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     Mk(dg, n.typeButton, n.skinTick,    0, 0, rowH, rowH, n.resetKeepTick);   /* RESET WORLD?'s keep-buildings tick box, its label, its last paragraph */
     Mk(dg, n.typeText,   std::string("Kenshi_TextboxStandardText"), 0, 0, W, rowH, n.resetKeepLabel);
     Mk(dg, n.typeEdit,   n.skinWrap,    0, 0, W,    rowH, n.resetTail);
+    Mk(dg, n.typeButton, n.skinTick,    0, 0, rowH, rowH, n.resetDeadTick);   /* T-1383: keep-dead and keep-relations, each as keep-buildings */
+    Mk(dg, n.typeText,   std::string("Kenshi_TextboxStandardText"), 0, 0, W, rowH, n.resetDeadLabel);
+    Mk(dg, n.typeButton, n.skinTick,    0, 0, rowH, rowH, n.resetRelTick);
+    Mk(dg, n.typeText,   std::string("Kenshi_TextboxStandardText"), 0, 0, W, rowH, n.resetRelLabel);
     /* T-1096 part 3 (owner 1224; the approved page): NEW PROFILE's START WITH row - its label as PROFILE NAME's, then GAME OPTIONS'
        < / value / > (the same skins) - and the hint line under it; IMPORT FROM SINGLE PLAYER's saves list (Kenshi's Load Game list, as
        the worlds list), the line in its place, COMES ALONG / STAYS BEHIND (the same list look, one column each, nothing to pick) and the
@@ -5684,8 +6249,12 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     Mk(dg, n.typeEdit,   n.skinWrap,    0, 0, W,    rowH, n.startHint);
     Mk(dg, n.typeMulti,  n.skinMulti,   0, 0, W,    rowH, n.impList);
     Mk(dg, n.typeEdit,   n.skinWrap,    0, 0, W,    rowH, n.impEmpty);
-    Mk(dg, n.typeMulti,  n.skinMulti,   0, 0, W,    rowH, n.impAlong);
-    Mk(dg, n.typeMulti,  n.skinMulti,   0, 0, W,    rowH, n.impBehind);
+    Mk(dg, n.typeEdit,   n.skinWrap,    0, 0, W,    rowH, n.impCarry);   /* T-1383: the one sentence, the creator's two tick boxes and the note */
+    Mk(dg, n.typeButton, n.skinTick,    0, 0, rowH, rowH, n.impDeadTick);
+    Mk(dg, n.typeText,   std::string("Kenshi_TextboxStandardText"), 0, 0, W, rowH, n.impDeadLabel);
+    Mk(dg, n.typeButton, n.skinTick,    0, 0, rowH, rowH, n.impRelTick);
+    Mk(dg, n.typeText,   std::string("Kenshi_TextboxStandardText"), 0, 0, W, rowH, n.impRelLabel);
+    Mk(dg, n.typeEdit,   n.skinWrap,    0, 0, W,    rowH, n.impNote);
     Mk(dg, n.typeEdit,   n.skinWrap,    0, 0, W,    rowH, n.impArrival);
 
     /* The status area, in ordinary sentences - an EditBox on the game's own Kenshi_WordWrapEmpty skin, which is exactly what
@@ -5744,6 +6313,12 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     w = UiFind(gui, n.joinPortLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("PORT")); else ::InterlockedIncrement64(&g_panelCastNull); }   /* T-793 */
     w = UiFind(gui, n.nameLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString("PLAYER NAME")); else ::InterlockedIncrement64(&g_panelCastNull); }
     w = UiFind(gui, n.resetKeepLabel); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString(coopui::kResetKeepLabel)); else ::InterlockedIncrement64(&g_panelCastNull); }
+    {   /* T-1383: the new tick boxes' labels (the approved page's words) */
+        const std::string* const nm[4] = { &n.resetDeadLabel, &n.resetRelLabel, &n.impDeadLabel, &n.impRelLabel };
+        const char* const cap[4] = { coopui::kResetKeepDeadLabel, coopui::kResetKeepRelLabel, spimport::kTickDead, spimport::kTickRelations };
+        for (int li = 0; li < 4; ++li)
+        { w = UiFind(gui, *nm[li]); if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString(cap[li])); else ::InterlockedIncrement64(&g_panelCastNull); } }
+    }
     w = UiFind(gui, n.keepLabel);   if (w) { t = w->castType<MyGUI::TextBox>(false); if (t) t->setCaption(MyGUI::UString(keeprun::kKeepLabel)); else ::InterlockedIncrement64(&g_panelCastNull); }
     /* ui5 - EVERY LABEL LEVEL WITH ITS BOX: the label is as tall as the box (coopui::PanelLabelBoxIn) and its text is centred
        in it here - Kenshi_TextboxPaintedText / StandardText carry no vertical align of their own.  TextBox::setTextAlign is
@@ -5753,14 +6328,15 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
                                             &n.hostProfLabel, &n.hostProfValue, &n.netAddrLabel, &n.netAddr,
                                             &n.vpnAddrLabel, &n.vpnAddr, &n.hostPwLabel,   /* T-201 PP6'; T-510; T-631; T-290 */
                                             &n.joinByAddrLabel, &n.steamLabel,   /* JOIN GAME's JOIN BY ADDRESS; HOSTING's STEAM */
-                                            &n.resetKeepLabel, &n.keepLabel };   /* RESET WORLD?'s and HOST GAME's tick boxes */
+                                            &n.resetKeepLabel, &n.keepLabel,   /* RESET WORLD?'s and HOST GAME's tick boxes */
+                                            &n.resetDeadLabel, &n.resetRelLabel, &n.impDeadLabel, &n.impRelLabel };   /* T-1383 */
         for (size_t li = 0; li < sizeof(labs) / sizeof(labs[0]); ++li)
         { w = UiFind(gui, *labs[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); }
         for (int li = 0; li < coopui::kOptRowsShown; ++li)
         { w = UiFind(gui, n.optLabel[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); }
         /* Kenshi_TextboxStandardText's own text colour is near-black, unreadable on the dark window: these labels take the
            light body-text colour the status area's sentences use (above). */
-        const std::string* const plain[] = { &n.hostProfValue, &n.resetKeepLabel, &n.keepLabel };
+        const std::string* const plain[] = { &n.hostProfValue, &n.resetKeepLabel, &n.keepLabel, &n.resetDeadLabel, &n.resetRelLabel, &n.impDeadLabel, &n.impRelLabel };
         for (size_t li = 0; li < sizeof(plain) / sizeof(plain[0]); ++li)
         { w = UiFind(gui, *plain[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f)); }
         for (int li = 0; li < coopui::kOptRowsShown; ++li)
@@ -5791,9 +6367,13 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     b = UiBtn(gui, n.optionsBtn);  if (b) { b->setCaption(MyGUI::UString("GAME OPTIONS")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopGameOptionsClicked); }
     {
         /* mp5: the Game options screen's buttons. */
-        static const char* const kTabWords[coopui::kOptTabCount] = { "DIFFICULTY", "WORLD", "MULTIPLAYER" };   /* ui1 */
+        static const char* const kTabWords[coopui::kOptTabCount] = { "DIFFICULTY", "WORLD", "MULTIPLAYER", "MODS" };   /* ui1; T-247: MODS */
         for (int t = 0; t < coopui::kOptTabCount; ++t)
         { b = UiBtn(gui, n.optTab[t]); if (b) { b->setCaption(MyGUI::UString(kTabWords[t])); b->eventMouseButtonClick += MyGUI::newDelegate(kOptTabFns[t]); } }
+        b = UiBtn(gui, std::string(kOptModsUseName)); if (b) { b->setCaption(MyGUI::UString("USE MY MODS FOR THIS WORLD")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopModsUse); }   /* T-247 */
+        b = UiBtn(gui, std::string(kOptModsOrderName)); if (b) { b->setCaption(MyGUI::UString(coopmods::kModsOrderButton)); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopModsOrder); }   /* T-1375 */
+        b = UiBtn(gui, std::string(kOptModsYesName)); if (b) { b->setCaption(MyGUI::UString("YES")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopModsYes); }
+        b = UiBtn(gui, std::string(kOptModsNoName));  if (b) { b->setCaption(MyGUI::UString("NO")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopModsNo); }
         for (int r = 0; r < coopui::kOptRowsShown; ++r)
         {
             b = UiBtn(gui, n.optDec[r]);  if (b) { b->setCaption(MyGUI::UString("<")); b->eventMouseButtonClick += MyGUI::newDelegate(kOptDecFns[r]); }
@@ -5806,6 +6386,10 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     b = UiBtn(gui, n.deleteBtn);   if (b) { b->setCaption(MyGUI::UString("DELETE WORLD")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopDeleteWorldClicked); }
     b = UiBtn(gui, n.resetBtn);    if (b) { b->setCaption(MyGUI::UString("RESET WORLD")); b->eventMouseButtonClick += MyGUI::newDelegate(OnResetWorldClicked); }
     b = UiBtn(gui, n.resetKeepTick); if (b) b->eventMouseButtonClick += MyGUI::newDelegate(OnResetKeepClicked);   /* RESET WORLD?'s keep-buildings tick box */
+    b = UiBtn(gui, n.resetDeadTick); if (b) b->eventMouseButtonClick += MyGUI::newDelegate(OnResetDeadClicked);   /* T-1383 */
+    b = UiBtn(gui, n.resetRelTick);  if (b) b->eventMouseButtonClick += MyGUI::newDelegate(OnResetRelClicked);
+    b = UiBtn(gui, n.impDeadTick);   if (b) b->eventMouseButtonClick += MyGUI::newDelegate(OnImpDeadClicked);
+    b = UiBtn(gui, n.impRelTick);    if (b) b->eventMouseButtonClick += MyGUI::newDelegate(OnImpRelClicked);
     b = UiBtn(gui, n.keepTick);      if (b) b->eventMouseButtonClick += MyGUI::newDelegate(OnKeepRunClicked);     /* HOST GAME's keep-running tick box */
     b = UiBtn(gui, n.dlgCancel);   if (b) { b->setCaption(MyGUI::UString("CANCEL")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopDlgCancelClicked); }
     b = UiBtn(gui, n.dlgOk);       if (b) { b->setCaption(MyGUI::UString("CREATE")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopDlgOkClicked); }
@@ -5816,7 +6400,7 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         else ::InterlockedIncrement64(&g_panelCastNull);
         b = UiBtn(gui, n.startDec); if (b) { b->setCaption(MyGUI::UString("<")); b->eventMouseButtonClick += MyGUI::newDelegate(OnStartDecClicked); }
         b = UiBtn(gui, n.startInc); if (b) { b->setCaption(MyGUI::UString(">")); b->eventMouseButtonClick += MyGUI::newDelegate(OnStartIncClicked); }
-        const std::string* const texts[] = { &n.startHint, &n.impEmpty, &n.impArrival };
+        const std::string* const texts[] = { &n.startHint, &n.impEmpty, &n.impArrival, &n.impCarry, &n.impNote };   /* T-1383: the sentence and the note */
         for (size_t ti = 0; ti < sizeof(texts) / sizeof(texts[0]); ++ti)
         {
             e = UiEdit(gui, *texts[ti]);
@@ -5830,9 +6414,6 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         if (im) { im->addColumn(MyGUI::UString(spimport::kPickColSave), (inner * 60) / 100); im->addColumn(MyGUI::UString(spimport::kPickColPlayed), inner - (inner * 60) / 100);
                   im->eventListChangePosition += MyGUI::newDelegate(OnImpListPicked);
                   im->requestOperatorLess = MyGUI::newDelegate(OnImpListLess); }
-        const int boxInner = (W - gap) / 2 - 32;
-        im = UiMulti(gui, n.impAlong);  if (im) { im->addColumn(MyGUI::UString(spimport::kComesAlong), boxInner);  im->eventListChangePosition += MyGUI::newDelegate(OnImpBoxPicked); }
-        im = UiMulti(gui, n.impBehind); if (im) { im->addColumn(MyGUI::UString(spimport::kStaysBehind), boxInner); im->eventListChangePosition += MyGUI::newDelegate(OnImpBoxPicked); }
         g_impListShown = -1;
     }
     b = UiBtn(gui, n.pasteBtn);   if (b) { b->setCaption(MyGUI::UString("PASTE")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopPasteClicked); }
@@ -5985,6 +6566,11 @@ static void UiLogRect(const char* name, MyGUI::Widget* w, int* seen)
 }
 /* ui1 (ui-polish-audit 3.3): the OK button takes the error box down (the tick destroys it on its next pass). */
 static void OnCoopNoticeOkClicked(MyGUI::Widget* /*sender*/) { UiClearNotice(); }
+/* T-247 (owner 1692): JOIN AS ADMIN on the MODS DON'T MATCH box - recorded here, acted on by the title tick (PressBoxReturnTick) */
+static void OnCoopNoticeAdminClicked(MyGUI::Widget* /*sender*/) { ::InterlockedExchange(&g_noticeAdminPressed, 1); UiClearNotice(); }
+/* T-1375: PUT MY MODS IN THE WORLD'S ORDER (1) and the MOD ORDER box's YES (2) - recorded here, acted on by PressBoxReturnTick */
+static void OnCoopNoticeOrderClicked(MyGUI::Widget* /*sender*/) { ::InterlockedExchange(&g_noticeOrderPressed, 1); UiClearNotice(); }
+static void OnCoopNoticeYesClicked(MyGUI::Widget* /*sender*/)   { ::InterlockedExchange(&g_noticeOrderPressed, 2); UiClearNotice(); }
 
 /* ui7 - A BOX RE-FITTED TO ITS MEASURED TEXT.  The builders make the error / identity box at the estimate (coopui::NoticeBoxH),
    set its sentence, and call this: the body's text is measured (UiMeasureText - MyGUI's wrapped size at the body's real
@@ -6038,7 +6624,9 @@ static void NoticeBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     const int ph = parent->getHeight();
     if (pw < 120 || ph < 60) { NoticeFailed("the title screen's own parent is smaller than 120 x 60"); return; }
     const size_t len = g_noticeText.size();
-    int nw = (pw * (len > 160 ? 40 : 30)) / 100; if (nw < 380) nw = 380; if (nw > pw - 20) nw = pw - 20;
+    int nw = (pw * (len > 160 ? 40 : 30)) / 100; if (nw < 380) nw = 380;
+    if (g_noticeOrderOffer == kNoticeOrderPut && nw < 540) nw = 540;   /* T-1375: room for PUT MY MODS IN THE WORLD'S ORDER beside OK */
+    if (nw > pw - 20) nw = pw - 20;
     /* ui5 (panel-mockups.md section 10): as tall as its text, not a share of the screen - built at coopui::NoticeBoxH (the
        estimate) and re-fitted to the measured text below (ui7, BoxFitToText).
        ui6: its text, one blank line, OK - ui5's 150 px floor is gone (it stretched a short box's text area). */
@@ -6059,6 +6647,14 @@ static void NoticeBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     int btnW = W / 4; if (btnW < 120) btnW = 120; if (btnW > W - 16) btnW = W - 16;
     MyGUI::Widget* bodyW = Mk(c, NM().typeEdit, NM().skinWrap, 8, lay.textY, W - 16, lay.textH, std::string("CoopNoticeBody"));
     MyGUI::Widget* okW = Mk(c, NM().typeButton, NM().skinBtn2, W - btnW - 8, lay.btnY, btnW, lay.btnH, std::string("CoopNoticeOk"));   /* ui5: OK bottom-right */
+    int admBtnW = (btnW * 3) / 2; if (admBtnW > W / 2 - 16) admBtnW = W / 2 - 16;
+    MyGUI::Widget* admW = g_noticeAdminOffer != 0 ? Mk(c, NM().typeButton, NM().skinBtn2, 8, lay.btnY, admBtnW, lay.btnH, std::string("CoopNoticeAdmin")) : 0;   /* T-247: JOIN AS ADMIN bottom-left */
+    /* T-1375: PUT MY MODS IN THE WORLD'S ORDER bottom-left, as wide as the row leaves beside OK; the MOD ORDER box's YES bottom-left, OK's size */
+    int ordBtnW = W - btnW - 24; if (ordBtnW < coopui::kModsOrderBtnLeastPx) ordBtnW = coopui::kModsOrderBtnLeastPx;   /* panelfit.h: never narrower than its caption */
+    if (ordBtnW > W - 16) ordBtnW = W - 16;
+    const char* const ordName = g_noticeOrderOffer == kNoticeOrderPut ? "CoopNoticeOrder" : "CoopNoticeYes";
+    MyGUI::Widget* ordW = g_noticeOrderOffer != kNoticeOrderNone
+        ? Mk(c, NM().typeButton, NM().skinBtn2, 8, lay.btnY, g_noticeOrderOffer == kNoticeOrderPut ? ordBtnW : btnW, lay.btnH, std::string(ordName)) : 0;
     MyGUI::EditBox* e = (bodyW != 0) ? bodyW->castType<MyGUI::EditBox>(false) : 0;
     MyGUI::Button* ok = (okW != 0) ? okW->castType<MyGUI::Button>(false) : 0;
     if (e == 0 || ok == 0) { gui->destroyWidget(raw); NoticeFailed("the error box's text or OK button could not be made"); return; }
@@ -6070,11 +6666,25 @@ static void NoticeBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     e->setTextAlign(MyGUI::Align::Center);   /* ui5b: centred, as Kenshi's own message box (manager decision 2026-09-27) */
     e->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
     e->setCaption(MyGUI::UString(g_noticeText.c_str()));
-    ok->setCaption(MyGUI::UString("OK"));
+    ok->setCaption(MyGUI::UString(g_noticeOrderOffer == kNoticeOrderAsk ? coopmods::kModsOrderNo : "OK"));   /* T-1375: the MOD ORDER question's NO */
     ok->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));   /* ui3: lit by hand, as UiHostLeftBody lights EXIT GAME */
     ok->eventMouseButtonClick += MyGUI::newDelegate(OnCoopNoticeOkClicked);
+    MyGUI::Button* ord = (ordW != 0) ? ordW->castType<MyGUI::Button>(false) : 0;
+    if (ord != 0)
+    {   /* T-1375 */
+        ord->setCaption(MyGUI::UString(g_noticeOrderOffer == kNoticeOrderPut ? coopmods::kModsOrderButton : coopmods::kModsOrderYes));
+        ord->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
+        ord->eventMouseButtonClick += MyGUI::newDelegate(g_noticeOrderOffer == kNoticeOrderPut ? OnCoopNoticeOrderClicked : OnCoopNoticeYesClicked);
+    }
+    MyGUI::Button* adm = (admW != 0) ? admW->castType<MyGUI::Button>(false) : 0;
+    if (adm != 0)
+    {
+        adm->setCaption(MyGUI::UString(coopmods::kModsAdminJoinTitle));
+        adm->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
+        adm->eventMouseButtonClick += MyGUI::newDelegate(OnCoopNoticeAdminClicked);
+    }
     ++g_boxFitBuilds;
-    BoxFitToText(gui, raw, ph, "CoopNoticeBody", "CoopNoticeOk", 0, 4, "errorbox");   /* ui7: as tall as its MEASURED text */
+    BoxFitToText(gui, raw, ph, "CoopNoticeBody", "CoopNoticeOk", adm != 0 ? "CoopNoticeAdmin" : ord != 0 ? ordName : 0, 4, "errorbox");   /* ui7: as tall as its MEASURED text */
     g_noticeRefit = 3;
     g_noticeShown = g_noticeSeq;
     ::InterlockedIncrement64(&g_noticeBuilt);
@@ -6333,6 +6943,13 @@ static MyGUI::Widget* FindByLayoutSuffix(MyGUI::Widget* w, const char* suffix, i
     return 0;
 }
 MyGUI::Widget* UiFindLayoutSuffix(MyGUI::Widget* root, const char* suffix) { return FindByLayoutSuffix(root, suffix, 0); }
+bool UiPlayerTyping()
+{
+    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+    MyGUI::Widget* w = im != 0 ? im->getKeyFocusWidget() : 0;
+    MyGUI::EditBox* e = w != 0 ? w->castType<MyGUI::EditBox>(false) : 0;
+    return typingfocus::Typing(e != 0, e != 0 && e->getInheritedVisible(), e != 0 && e->getInheritedEnabled(), e != 0 && e->getEditReadOnly());
+}
 
 /* U3 - THE COLUMN, FOUND LIVE.  col[0] = NEW GAME, col[1..5] = LOAD GAME, IMPORT GAME, OPTIONS, CREDITS, EXIT.
    Each must be a DIRECT child of `parent` (the title art ImageBox that holds the column), or it is treated as
@@ -6981,6 +7598,7 @@ static std::string g_optTipText;        /* the text the note on screen was built
 static volatile LONG64 g_uiOptTipShows = 0;   /* times a note was put up - the ui[] readout's optNotes= */
 static int  g_optTipForced = -1;        /* TEST LEVER (KENSHI_SW_TEST_OPT_NOTE=<row key>, e.g. resurrectgrowth or gp.nnm): that row's note stays up while its tab is open, placed for a pointer at its label's centre */
 static bool g_optTipForcedRead = false;
+static bool g_optTipForcedOrder = false;   /* T-1375 TEST LEVER (KENSHI_SW_TEST_OPT_NOTE=modsorder): the MODS tab's PUT MY MODS IN THE WORLD'S ORDER note stays up while the button is on screen, placed for a pointer at its centre */
 static int  g_rectOptTip[4] = { -1, -1, -1, -1 };
 
 static void UiOptTipDrop(MyGUI::Gui* gui)
@@ -7003,7 +7621,7 @@ static int UiOptHovered(MyGUI::Gui* gui, MyGUI::IntPoint* at)
     const UiNames& n = NM();
     for (int r = 0; r < coopui::kOptRowsShown; ++r)
     {
-        const int i = coopui::OptIndexOf((int)g_optTab, r);
+        const int i = coopui::OptIndexShown((int)g_optTab, r, g_optVal);   /* T-1392 */
         if (i < 0) break;
         if (!coopui::OptHasHoverNote(i)) continue;
         MyGUI::Widget* lw = UiFind(gui, n.optLabel[r]);
@@ -7044,7 +7662,12 @@ static void UiOptTipTick(MyGUI::Gui* gui, MyGUI::Widget* panel)
         if (ln > 0 && ln < (DWORD)sizeof(lv))
         {
             const int fi = coopui::OptIndexOfKey(lv);
-            if (fi >= 0 && coopui::OptHasHoverNote(fi))
+            if (std::strcmp(lv, "modsorder") == 0)
+            {
+                g_optTipForcedOrder = true;
+                DebugLog("[UI] TEST LEVER: the MODS tab's PUT MY MODS IN THE WORLD'S ORDER hover note is forced visible while the button is on screen (KENSHI_SW_TEST_OPT_NOTE=modsorder)");
+            }
+            else if (fi >= 0 && coopui::OptHasHoverNote(fi))
             {
                 g_optTipForced = fi;
                 DebugLog(std::string("[UI] TEST LEVER: the GAME OPTIONS hover note of ") + lv + " is forced visible while its tab is open (KENSHI_SW_TEST_OPT_NOTE)");
@@ -7053,7 +7676,23 @@ static void UiOptTipTick(MyGUI::Gui* gui, MyGUI::Widget* panel)
     }
     MyGUI::IntPoint m;
     const int i = (panel != 0 && g_panelScreen == 6 && g_optTipFails < 3) ? UiOptHovered(gui, &m) : -1;
-    const std::string text = i >= 0 ? coopui::OptHoverText(i, g_optVal) : std::string();
+    bool useHover = false;   /* T-247: USE MY MODS FOR THIS WORLD's own note (the approved page, version 2 section 1), greyed or lit */
+    bool orderHover = false;   /* T-1375: PUT MY MODS IN THE WORLD'S ORDER's own note (version 3 section 1) */
+    if (i < 0 && panel != 0 && g_panelScreen == 6 && g_optTipFails < 3 && (int)g_optTab == coopui::kOptTabMods && g_optModsAsking == 0)
+    {
+        MyGUI::Widget* ub = UiFind(gui, std::string(kOptModsUseName));
+        useHover = ub != 0 && ub->getInheritedVisible() && UiPointerOver(ub, &m);
+        MyGUI::Widget* ob = useHover ? 0 : UiFind(gui, std::string(kOptModsOrderName));
+        if (ob != 0 && ob->getInheritedVisible() && g_optTipForcedOrder)
+        {   /* T-1375 TEST LEVER: as if the pointer sat at the button's centre */
+            const MyGUI::IntCoord c = ob->getAbsoluteCoord();
+            m = MyGUI::IntPoint(c.left + c.width / 2, c.top + c.height / 2);
+            orderHover = true;
+        }
+        else orderHover = ob != 0 && ob->getInheritedVisible() && UiPointerOver(ob, &m);
+    }
+    const std::string text = i >= 0 ? coopui::OptHoverText(i, g_optVal) : useHover ? std::string(coopmods::kModsUseHover)
+                           : orderHover ? std::string(coopmods::kModsOrderHover) : std::string();
     if (text.empty()) { UiOptTipDrop(gui); return; }
     MyGUI::Widget* tip = (g_optTipUp != 0) ? gui->findWidgetT(std::string(kOptTipName), false) : 0;
     if (tip != 0 && text != g_optTipText) { gui->destroyWidget(tip); tip = 0; }
@@ -7082,9 +7721,63 @@ static void UiOptTipTick(MyGUI::Gui* gui, MyGUI::Widget* panel)
         UiRectForget(g_rectOptTip);
         /* harness screenshots: where it went up, once per showing - "nestsnote" for NESTS AND CAMPS, "feenote" for the fee rows,
            "optnote" for every other row */
-        const std::string key = coopui::OptDefs()[i].key;
-        UiLogRect(key == "gp.nnm" ? "nestsnote" : (key == swfee::kKeyAmount || key == swfee::kKeyGrowth) ? "feenote" : "optnote", tip, g_rectOptTip);
+        const std::string key = i >= 0 ? std::string(coopui::OptDefs()[i].key) : std::string(orderHover ? "modsorder" : "modsuse");
+        UiLogRect(key == "gp.nnm" ? "nestsnote" : (key == swfee::kKeyAmount || key == swfee::kKeyGrowth) ? "feenote" : key == "modsorder" ? "modsordernote" : "optnote", tip, g_rectOptTip);
     }
+}
+
+/* T-1383 (the approved page, version 3): THE HOVER NOTES of RESET WORLD?'s keep-dead / keep-relations tick boxes and of the import
+   picker's two creator tick boxes - GAME OPTIONS' mechanism and look: polled every title tick, up while the pointer is over the tick
+   box or its label, down otherwise; a child of the MULTIPLAYER panel window. */
+static const char* const kDlgTipName     = "SWDlgHoverTip";
+static const char* const kDlgTipTextName = "SWDlgHoverTipText";
+static int  g_dlgTipUp = 0, g_dlgTipFails = 0;
+static std::string g_dlgTipText;
+static void UiDlgTipDrop(MyGUI::Gui* gui)
+{
+    if (g_dlgTipUp == 0) return;
+    g_dlgTipUp = 0;
+    g_dlgTipText.clear();
+    MyGUI::Widget* tip = gui->findWidgetT(std::string(kDlgTipName), false);
+    if (tip != 0) gui->destroyWidget(tip);
+}
+static const char* UiDlgHovered(MyGUI::Gui* gui, MyGUI::IntPoint* at)
+{
+    const UiNames& n = NM();
+    const std::string* parts[4] = { 0, 0, 0, 0 };
+    const char* texts[2] = { 0, 0 };
+    if (g_panelScreen == 4 && g_worldDlg == coopui::kWorldDlgReset)
+    { parts[0] = &n.resetDeadTick; parts[1] = &n.resetDeadLabel; parts[2] = &n.resetRelTick; parts[3] = &n.resetRelLabel; texts[0] = coopui::kResetHoverDead; texts[1] = coopui::kResetHoverRel; }
+    else if (g_panelScreen == 7 && g_profDlg == coopui::kProfDlgImport && ImpCreatorShown())
+    { parts[0] = &n.impDeadTick; parts[1] = &n.impDeadLabel; parts[2] = &n.impRelTick; parts[3] = &n.impRelLabel; texts[0] = spimport::kHoverDead; texts[1] = spimport::kHoverRelations; }
+    else return 0;
+    for (int k = 0; k < 4; ++k)
+    {
+        MyGUI::Widget* w = UiFind(gui, *parts[k]);
+        if (w != 0 && UiPointerOver(w, at)) return texts[k / 2];
+    }
+    return 0;
+}
+static void UiDlgTipTick(MyGUI::Gui* gui, MyGUI::Widget* panel)
+{
+    MyGUI::IntPoint m;
+    const char* text = (panel != 0 && g_dlgTipFails < 3) ? UiDlgHovered(gui, &m) : 0;
+    if (text == 0) { UiDlgTipDrop(gui); return; }
+    MyGUI::Widget* tip = (g_dlgTipUp != 0) ? gui->findWidgetT(std::string(kDlgTipName), false) : 0;
+    if (tip != 0 && g_dlgTipText != text) { gui->destroyWidget(tip); tip = 0; }
+    if (tip == 0)
+    {
+        g_dlgTipUp = 0;
+        tip = UiHoverTipBuild(gui, panel, kDlgTipName, kDlgTipTextName, text);
+        if (tip == 0)
+        {
+            if (++g_dlgTipFails == 3) ErrorLog("[UI] T-1383: the tick boxes' hover note could not be built 3 times in a row - given up for this run");
+            return;
+        }
+        g_dlgTipFails = 0; g_dlgTipUp = 1; g_dlgTipText = text;
+        DebugLog(std::string("[UI] T-1383: hover note up: '") + text + "'");
+    }
+    UiHoverTipPlace(tip, m);
 }
 
 /* RESET POPULATION IN A MULTIPLAYER WORLD - THE LOOK. The refusal itself is store.cpp's hook on ZoneManager's reset; this greys
@@ -7523,6 +8216,7 @@ static __declspec(noinline) void UiTitleTickInner()
     }
     if (panel != 0 && g_profPushWanted != 0) { g_profPushWanted = 0; PanelPush(gui); }   /* prof3: a PROFILES answer came in (UiProfilesPoll) */
     UiOptTipTick(gui, panel);   /* GAME OPTIONS' hover notes: up while a noted row is hovered, down otherwise */
+    UiDlgTipTick(gui, panel);   /* T-1383: the new tick boxes' hover notes */
 
     const LONG wanted = ::InterlockedCompareExchange(&g_panelWanted, 0, 0);
     if (panel != 0 && (wanted == 0 || ::InterlockedCompareExchange(&g_panelBuiltOk, 0, 0) == 0))
@@ -7559,7 +8253,11 @@ static __declspec(noinline) void UiTitleTickInner()
     }
     if (notice != 0) UiLogRect("errorbox", notice, g_rectNotice);   /* ui1: harness screenshots */
     /* T-201 N1: the press in progress - done, failed (a box), or still waiting; a closed failure box returns to its screen. */
-    if (::InterlockedCompareExchange(&g_panelWanted, 0, 0) == 0) PanelProfModeEnd("the panel closed");   /* T-201 PP6' fold: every close route passes here */
+    if (::InterlockedCompareExchange(&g_panelWanted, 0, 0) == 0)
+    {
+        PanelProfModeEnd("the panel closed");   /* T-201 PP6' fold: every close route passes here */
+        g_optModsAsking = 0;                     /* T-247 review fold (NOTE 7): a WORLD'S MODS question open when the panel closed is not up when it opens again */
+    }
     PanelFriendTick(gui, panel != 0 ? 1 : 0);   /* JOIN GAME's friends list; a Steam join request starts its JOIN */
     if (PressTick() != 0 && panel != 0) PanelPush(gui);
     if (LoadTick() != 0 && panel != 0) PanelPush(gui);   /* T-201 PP6' */
@@ -8324,25 +9022,59 @@ int UiModsWarnHide() { return UiModsWarnHideGuarded(); }
    colour. Taken down as soon as the host is heard again. The panel's recipe, behind the same SEH frame. */
 static const char* const kQnName     = "CoopQuietNotice";
 static const char* const kQnTextName = "CoopQuietNoticeText";
+/* T-1390 (F1116): one line at each ON of the strip (each time it is built), capped: the layer it is on, its visible flag and
+   rectangle, its measured text width, and Kenshi's loading screen - Kenshi_LoadingScreen.layout's root, found by its
+   LoadingPanel (a name only that layout has, Read), its visible flag and layer - so a run's log says whether the strip was
+   made above a loading screen that was up. */
+static int g_qnOnLogged = 0;
+static const int kQnOnLogCap = 20;
+/* T-1390: Kenshi's loading screen in words for a log line - Kenshi_LoadingScreen.layout's root, found by its LoadingPanel (a name only
+   that layout has, Read): its name, visible flag and layer; "none" when no loading screen is made. Event rate only (each ON / bar line). */
+static std::string UiLoadingScreenText(MyGUI::Gui* gui)
+{
+    MyGUI::Widget* lp = 0;
+    MyGUI::EnumeratorWidgetPtr roots = gui->getEnumerator();
+    while (lp == 0 && roots.next()) lp = FindByLayoutSuffix(roots.current(), "LoadingPanel", 0);
+    if (lp == 0) lp = gui->findWidgetT(std::string("LoadingPanel"), false);   /* a layout loaded with no name prefix */
+    MyGUI::Widget* lr = lp;
+    for (int d = 0; lr != 0 && lr->getParent() != 0 && d < 16; ++d) lr = lr->getParent();
+    if (lr == 0) return "none";
+    MyGUI::ILayer* ll = lr->getLayer();
+    return "root='" + lr->getName() + "' visible=" + (lr->getVisible() ? "1" : "0") + " layer='" + (ll != 0 ? ll->getName() : std::string("none")) + "'";
+}
+static void UiQuietOnLog(MyGUI::Gui* gui, MyGUI::Widget* raw, int textW)
+{
+    if (g_qnOnLogged >= kQnOnLogCap) return;
+    ++g_qnOnLogged;
+    const std::string ls = UiLoadingScreenText(gui);
+    MyGUI::ILayer* ly = raw->getLayer();
+    const MyGUI::IntCoord c = raw->getAbsoluteCoord();
+    DebugLog(std::string("[UI] quietnotice ON: layer='") + (ly != 0 ? ly->getName() : std::string("none")) + "' visible=" + (raw->getVisible() ? "1" : "0")
+             + " x=" + coopui::PanelNum((long long)c.left) + " y=" + coopui::PanelNum((long long)c.top) + " w=" + coopui::PanelNum((long long)c.width)
+             + " h=" + coopui::PanelNum((long long)c.height) + " textW=" + coopui::PanelNum((long long)textW) + " | loading screen: " + ls
+             + " (ON line " + coopui::PanelNum((long long)g_qnOnLogged) + " of at most " + coopui::PanelNum((long long)kQnOnLogCap) + ")");
+}
 static int UiQuietBody(const char* text, int on)
 {
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (gui == 0) return 0;
     MyGUI::Widget* raw = gui->findWidgetT(std::string(kQnName), false);
     if (on == 0) { if (raw != 0) gui->destroyWidget(raw); UiRectForget(g_rectQuiet); return 1; }
+    const int built = (raw == 0) ? 1 : 0;
     if (raw == 0)
     {
         const UiNames& n = NM();
         int vw = 1280, vh = 720;
         MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
         if (rm != 0) { const MyGUI::IntSize& vs = rm->getViewSize(); if (vs.width > 0 && vs.height > 0) { vw = vs.width; vh = vs.height; } }
-        int w = (vw * 30) / 100; if (w < 360) w = 360; if (w > vw - 20) w = vw - 20;
+        const int w = coopui::QuietBaseWidth(vw);
         const int h = 44;
-        const char* layers[2] = { kHlLayer, kHlLayerAlt };
-        for (int k = 0; k < 2 && raw == 0; ++k)
+        /* T-1390 (F1116): made on "Pointer", the one layer drawn above Kenshi's loading screen ("Top", a shared layer, where a
+           raise cannot be relied on) - coopui::QuietLayerAt says why; Info, then Popup, if the layer list has no Pointer. */
+        for (int k = 0; k < coopui::kQuietLayerCount && raw == 0; ++k)
         {
             raw = gui->createWidgetT(n.typeWidget, std::string("Kenshi_FloatingPanelThinSkin"), MyGUI::IntCoord((vw - w) / 2, vh / 12, w, h),
-                                     MyGUI::Align::Default, std::string(layers[k]), std::string(kQnName));
+                                     MyGUI::Align::Default, std::string(coopui::QuietLayerAt(k)), std::string(kQnName));
             if (raw == 0) { ::InterlockedIncrement64(&g_uiCreateNull); return 0; }
             if (raw->getLayer() == 0) { gui->destroyWidget(raw); raw = 0; }
         }
@@ -8359,8 +9091,32 @@ static int UiQuietBody(const char* text, int on)
     MyGUI::TextBox* tb = (tw != 0) ? tw->castType<MyGUI::TextBox>(false) : 0;
     if (tb == 0) return 0;
     tb->setCaption(MyGUI::UString(text));
+    int textW = 0;
+    {   /* T-1390 fold (review NOTE): the strip is the approved size (30% of the view, at least 360 px) or wider - as wide as its MEASURED
+           text (TextBox::getTextSize, virtual - no import) plus the line skin's margins, as the refused-version note is sized (UiRefuseTip
+           above); the loading screen's progress words are longer than the connection words and are never clipped. Centred again.
+           T-1390 (F1116): measured right after setCaption on every call, the first show included - MyGUI's EditText marks its layout
+           out of date at a caption change and lays it out again inside getTextSize (MyGUI_EditText.h mTextOutDate), so it is not
+           stale; it is 0 only with no font on the line, which keeps the approved width. textW is logged on the ON line. */
+        int vw = 1280;
+        MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
+        if (rm != 0) { const MyGUI::IntSize& vs = rm->getViewSize(); if (vs.width > 0) { vw = vs.width; } }
+        const MyGUI::IntSize ts = tb->getTextSize();
+        textW = ts.width;
+        const MyGUI::IntCoord tr = tb->getTextRegion();
+        const int mw = (tr.width > 0 && tr.width <= tw->getWidth()) ? tw->getWidth() - tr.width : 0;
+        const int inset = raw->getWidth() - tw->getWidth();   /* the strip's own inset and frame around the line */
+        const int want = coopui::QuietStripWidth(vw, ts.width, mw, inset);
+        if (want != raw->getWidth())
+        {
+            raw->setCoord(MyGUI::IntCoord((vw - want) / 2, raw->getTop(), want, raw->getHeight()));
+            tw->setSize(MyGUI::IntSize(want - inset, tw->getHeight()));
+            UiRectForget(g_rectQuiet);   /* its new rectangle is logged below */
+        }
+    }
     raw->setVisible(true);
     UiLogRect("quietnotice", raw, g_rectQuiet);   /* ui1: harness screenshots */
+    if (built != 0) UiQuietOnLog(gui, raw, textW);
     return 1;
 }
 static int UiQuietCatching(const char* text, int on)
@@ -8375,6 +9131,166 @@ static int UiQuietGuarded(const char* text, int on)
     __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
 }
 int UiQuietNotice(const char* text, int on) { return UiQuietGuarded(text != 0 ? text : "", on); }
+/* T-1390 (owner decision 1730; mock-up build/pages/load-progress-panel-mockup.html) - THE LOADING SCREEN'S PROGRESS PANEL: the words
+   (cooppre::PreProgressText) over a bar, in a Kenshi_FloatingPanelSkin panel (the LOADING box's own skin) just above Kenshi's LOADING
+   box, centred on it and a little wider (coopui::LoadPanelLayout). The words in Kenshi's floater font, the largest that fits on one
+   line (coopui::LoadPanelFontAt). The bar is Kenshi's own progress-bar pair (Kenshi_ProgressBarEmptySkin track, Kenshi_ProgressBarFilledSkin
+   fill - Kenshi_ProgressBarFill's parts, kenshi_templates.xml, Read): filled to `fill` percent, a short sliding piece while the size is
+   not known (coopui::kLoadFillSliding - moved each frame by UiLoadPanelTick, the drawing only), or hidden while the connection-problem
+   words are up (coopui::kLoadFillHidden). Made on Pointer, the one layer drawn above the loading screen's Top (coopui::QuietLayerAt,
+   F1116/F1122), taking no mouse. One capped [UI] loadpanel line at its ON and at each bar change of 10 points or more. */
+static const char* const kLpName      = "CoopLoadPanel";
+static const char* const kLpTextName  = "CoopLoadPanelText";
+static const char* const kLpTrackName = "CoopLoadPanelTrack";
+static const char* const kLpFillName  = "CoopLoadPanelFill";
+static int g_rectLoadPanel[4] = { -1, -1, -1, -1 };
+/* the panel's parts, kept from its build to its take-down: the per-frame slide moves the piece through them (no widget search each
+   frame); re-checked by name twice a second (UiLoadPanelTickBody), so a panel the game removed is forgotten */
+static MyGUI::Widget* g_lpRoot = 0; static MyGUI::Widget* g_lpTrack = 0; static MyGUI::Widget* g_lpFill = 0;
+static int g_lpFillNow = coopui::kLoadFillNone, g_lpLoggedFill = coopui::kLoadFillNone, g_lpLogged = 0;
+static const int kLpLogCap = 40;
+static DWORD g_lpSlideFrom = 0, g_lpCheckedAt = 0;
+static int g_lpFontDefH = 0;   /* T-1390 (T2477 look): the words' font's own line height, measured once at the build */
+static std::string g_lpWords;   /* the words on the panel now (the uistate line) */
+static void UiLoadPanelForget() { g_lpRoot = 0; g_lpTrack = 0; g_lpFill = 0; g_lpFillNow = coopui::kLoadFillNone; g_lpLoggedFill = coopui::kLoadFillNone; g_lpWords.clear(); UiRectForget(g_rectLoadPanel); }
+static void UiLoadPanelLog(MyGUI::Gui* gui, MyGUI::Widget* raw, const char* why, const std::string& font)
+{
+    ++g_lpLogged; g_lpLoggedFill = g_lpFillNow;
+    MyGUI::ILayer* ly = raw->getLayer();
+    const MyGUI::IntCoord c = raw->getAbsoluteCoord();
+    DebugLog(std::string("[UI] loadpanel ") + why + ": layer='" + (ly != 0 ? ly->getName() : std::string("none")) + "' visible=" + (raw->getVisible() ? "1" : "0")
+             + " x=" + coopui::PanelNum((long long)c.left) + " y=" + coopui::PanelNum((long long)c.top) + " w=" + coopui::PanelNum((long long)c.width)
+             + " h=" + coopui::PanelNum((long long)c.height) + " fill=" + coopui::LoadPanelFillText(g_lpFillNow) + " font=" + font + " words='" + g_lpWords + "'"
+             + " | loading screen: " + UiLoadingScreenText(gui)
+             + " (line " + coopui::PanelNum((long long)g_lpLogged) + " of at most " + coopui::PanelNum((long long)kLpLogCap) + ")");
+}
+/* the piece / fill inside the track for g_lpFillNow */
+static void UiLoadPanelBar(MyGUI::Widget* track, MyGUI::Widget* fw)
+{
+    const int tw = track->getWidth(), th = track->getHeight();
+    if (g_lpFillNow == coopui::kLoadFillHidden) { track->setVisible(false); return; }
+    track->setVisible(true);
+    if (g_lpFillNow == coopui::kLoadFillSliding)
+    {
+        const int pw = coopui::LoadPanelSlidePieceW(tw);
+        fw->setCoord(MyGUI::IntCoord(coopui::LoadPanelSlideX(tw, pw, (unsigned int)(DWORD)(::GetTickCount() - g_lpSlideFrom), coopui::kLoadSlideMs), 0, pw, th));
+        fw->setVisible(pw > 0);
+        return;
+    }
+    const int w = coopui::LoadPanelFillW(tw, g_lpFillNow);
+    fw->setCoord(MyGUI::IntCoord(0, 0, w, th));
+    fw->setVisible(w > 0);
+}
+static int UiLoadPanelBody(const char* text, int fill, int on)
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui == 0) return 0;
+    MyGUI::Widget* raw = gui->findWidgetT(std::string(kLpName), false);
+    if (on == 0) { UiLoadPanelForget(); if (raw != 0) gui->destroyWidget(raw); return 1; }
+    const UiNames& n = NM();
+    const int built = (raw == 0) ? 1 : 0;
+    if (raw == 0)
+    {
+        UiLoadPanelForget();
+        for (int k = 0; k < coopui::kQuietLayerCount && raw == 0; ++k)
+        {
+            raw = gui->createWidgetT(n.typeWidget, std::string("Kenshi_FloatingPanelSkin"), MyGUI::IntCoord(0, 0, 400, 80),
+                                     MyGUI::Align::Default, std::string(coopui::QuietLayerAt(k)), std::string(kLpName));
+            if (raw == 0) { ::InterlockedIncrement64(&g_uiCreateNull); return 0; }
+            if (raw->getLayer() == 0) { gui->destroyWidget(raw); raw = 0; }
+        }
+        if (raw == 0) return 0;
+        raw->setNeedMouseFocus(false);
+        /* T-1390 (T2477 look): the words straight on the panel - Kenshi_TextBoxEmptySkin, the LOADING... title's own clear skin
+           (Kenshi_LoadingScreen.layout), not the flat text skin's grey strip */
+        MyGUI::Widget* tw0 = Mk(raw, n.typeText, "Kenshi_TextBoxEmptySkin", coopui::kLoadPanelPadX, coopui::kLoadPanelPadY, 368, 32, kLpTextName);
+        MyGUI::TextBox* tb0 = (tw0 != 0) ? tw0->castType<MyGUI::TextBox>(false) : 0;
+        MyGUI::Widget* tr0 = Mk(raw, n.typeWidget, "Kenshi_ProgressBarEmptySkin", coopui::kLoadPanelPadX, 50, 368, coopui::kLoadPanelBarH, kLpTrackName);
+        MyGUI::Widget* fw0 = tr0 != 0 ? Mk(tr0, n.typeWidget, "Kenshi_ProgressBarFilledSkin", 0, 0, 0, coopui::kLoadPanelBarH, kLpFillName) : 0;
+        if (tb0 == 0 || tr0 == 0 || fw0 == 0) { gui->destroyWidget(raw); return 0; }
+        tw0->setNeedMouseFocus(false); tr0->setNeedMouseFocus(false); fw0->setNeedMouseFocus(false);
+        tb0->setTextAlign(MyGUI::Align::Center);
+        tb0->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));   /* the LOADING... words' colour (Kenshi_LoadingScreen.layout) */
+        g_lpSlideFrom = ::GetTickCount();
+        g_lpFontDefH = 0;
+    }
+    MyGUI::Widget* tw = gui->findWidgetT(std::string(kLpTextName), false);
+    MyGUI::TextBox* tb = (tw != 0) ? tw->castType<MyGUI::TextBox>(false) : 0;
+    MyGUI::Widget* track = gui->findWidgetT(std::string(kLpTrackName), false);
+    MyGUI::Widget* fw = gui->findWidgetT(std::string(kLpFillName), false);
+    if (tb == 0 || track == 0 || fw == 0) return 0;
+    int vw = 1280, vh = 720;
+    MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
+    if (rm != 0) { const MyGUI::IntSize& vs = rm->getViewSize(); if (vs.width > 0 && vs.height > 0) { vw = vs.width; vh = vs.height; } }
+    tb->setCaption(MyGUI::UString(text));
+    /* T-1390 (T2477 look): Kenshi_FloaterFont_Large (Exo2-SemiBold - the page's 600 weight) drawn at TWICE its own line height (the page's
+       ~22 px words at 960 wide; T2477 measured the font's own line at 14 px, about the old strip's), less only if the words would not fit
+       on one line in the widest panel (coopui::LoadPanelWordsHeight). The height is set on the text sub-widget (ISubWidgetText::
+       setFontHeight, virtual; Kenshi's own layouts set FontHeight too) and measured again (TextBox::getTextSize lays the words out
+       again after a caption or height change, MyGUI_EditText.h mTextOutDate). */
+    const char* fontName = coopui::LoadPanelFontAt(0);
+    tb->setFontName(std::string(fontName));
+    MyGUI::ISubWidgetText* st = tw->getSubWidgetText();
+    if (st != 0 && g_lpFontDefH > 0) st->setFontHeight(g_lpFontDefH);   /* measured at the font's own height first */
+    MyGUI::IntSize ts = tb->getTextSize();
+    if (g_lpFontDefH <= 0) g_lpFontDefH = (st != 0 && st->getFontHeight() > 0) ? st->getFontHeight() : ts.height;
+    const int wantH = coopui::LoadPanelWordsHeight(vw, g_lpFontDefH, ts.width);
+    if (st != 0 && wantH > 0) { st->setFontHeight(wantH); ts = tb->getTextSize(); }
+    const std::string font = std::string(fontName) + "@" + coopui::PanelNum((long long)(st != 0 ? st->getFontHeight() : 0)) + "px(own "
+                             + coopui::PanelNum((long long)g_lpFontDefH) + ")";
+    const coopui::LoadPanelBox b = coopui::LoadPanelLayout(vw, vh, ts.width, ts.height > 0 ? ts.height + 4 : 0);
+    raw->setCoord(MyGUI::IntCoord(b.x, b.y, b.w, b.h));
+    tw->setCoord(MyGUI::IntCoord(b.tx, b.ty, b.tw, b.th));
+    track->setCoord(MyGUI::IntCoord(b.bx, b.by, b.bw, b.bh));
+    g_lpFillNow = fill;
+    g_lpWords = text;
+    UiLoadPanelBar(track, fw);
+    raw->setVisible(true);
+    g_lpRoot = raw; g_lpTrack = track; g_lpFill = fw; g_lpCheckedAt = ::GetTickCount();
+    UiLogRect("loadpanel", raw, g_rectLoadPanel);   /* ui1: harness screenshots */
+    if (built != 0 ? g_lpLogged < kLpLogCap : coopui::LoadPanelLogDue(fill, g_lpLoggedFill, g_lpLogged, kLpLogCap) != 0)
+        UiLoadPanelLog(gui, raw, built != 0 ? "ON" : "bar", font);
+    return 1;
+}
+static int UiLoadPanelCatching(const char* text, int fill, int on)
+{
+    try { return UiLoadPanelBody(text, fill, on); }
+    catch (...) { return -1; }
+}
+// The SEH frame. No local object with a destructor may appear here, and none does.
+static int UiLoadPanelGuarded(const char* text, int fill, int on)
+{
+    __try { return UiLoadPanelCatching(text, fill, on); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+int UiLoadPanel(const char* text, int fill, int on) { return UiLoadPanelGuarded(text != 0 ? text : "", fill, on); }
+/* each held frame: the sliding piece moved to where the time puts it (the drawing only - nothing is decided from it); the kept parts
+   re-checked by name twice a second */
+static int UiLoadPanelTickBody()
+{
+    if (g_lpRoot == 0 || g_lpFillNow != coopui::kLoadFillSliding) return 0;
+    const DWORD now = ::GetTickCount();
+    if ((DWORD)(now - g_lpCheckedAt) >= 500)
+    {
+        g_lpCheckedAt = now;
+        MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+        if (gui == 0 || gui->findWidgetT(std::string(kLpName), false) != g_lpRoot) { UiLoadPanelForget(); return 0; }
+    }
+    UiLoadPanelBar(g_lpTrack, g_lpFill);
+    return 1;
+}
+static int UiLoadPanelTickCatching()
+{
+    try { return UiLoadPanelTickBody(); }
+    catch (...) { return -1; }
+}
+// The SEH frame. No local object with a destructor may appear here, and none does.
+static int UiLoadPanelTickGuarded()
+{
+    __try { return UiLoadPanelTickCatching(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+int UiLoadPanelTick() { return UiLoadPanelTickGuarded(); }
 /* ui1: the in-world dialog's and notice's rectangles, re-read (the view can be resized while they are up). ui1c: one found
    gone (by name - the game can remove it itself, e.g. a world unload) is forgotten, so a rebuild logs its [UI] rect again. */
 static int UiDialogRectBody()
@@ -9170,12 +10086,19 @@ static bool UiDriveState(MyGUI::Gui* gui)
         + " role=" + ConfigRoleName() + " prep=" + coopui::PanelNum((long long)g_prepPhase)   /* owner 470: coopui::PrepPhase */
         + " newGameWindow=" + coopui::PanelNum((long long)UiNewGameWindowShown(gui))
         + " status='" + UiStateOneLine(g_panelStatusCaption) + "'";
+    {   /* T-1390: the small quiet notice's words as drawn (the loading screen's progress line, or the connection-problem notice) */
+        MyGUI::Widget* qw = gui != 0 ? gui->findWidgetT(std::string(kQnTextName), false) : 0;
+        MyGUI::TextBox* qb = qw != 0 ? qw->castType<MyGUI::TextBox>(false) : 0;
+        const char* qp = qb != 0 ? qb->getCaption().asUTF8_c_str() : 0;
+        line += " quiet='" + (qp != 0 ? std::string(qp) : std::string()) + "'";
+        line += " loadpanel='" + g_lpWords + "' fill=" + coopui::LoadPanelFillText(g_lpFillNow);   /* T-1390: the progress panel's words and bar */
+    }
     if (g_panelScreen == 6)   /* GAME OPTIONS - the open tab's rows (key=value, * = greyed), the fee box, the open tab's hover notes and the one on screen */
     {
         line += " opttab=" + coopui::PanelNum((long long)g_optTab) + " optrows=";
         for (int r = 0; r < coopui::kOptRowsShown; ++r)
         {
-            const int i = coopui::OptIndexOf((int)g_optTab, r);
+            const int i = coopui::OptIndexShown((int)g_optTab, r, g_optVal);   /* T-1392: the rows on screen (MENUS AND BUILDING only under Slowest wins) */
             if (i < 0) break;
             line += (r ? "," : "") + std::string(coopui::OptDefs()[i].key) + "=" + g_optVal[i] + (coopui::OptRowLit(i, g_optVal) ? "" : "*");
         }
@@ -9183,7 +10106,7 @@ static bool UiDriveState(MyGUI::Gui* gui)
         std::string notes;   /* key=note for every row of the open tab that has a hover note now */
         for (int r = 0; r < coopui::kOptRowsShown; ++r)
         {
-            const int i = coopui::OptIndexOf((int)g_optTab, r);
+            const int i = coopui::OptIndexShown((int)g_optTab, r, g_optVal);   /* T-1392 */
             if (i < 0) break;
             const std::string t = coopui::OptHoverText(i, g_optVal);
             if (!t.empty()) notes += (notes.empty() ? "" : ";") + std::string(coopui::OptDefs()[i].key) + "=" + t;
@@ -9195,6 +10118,11 @@ static bool UiDriveState(MyGUI::Gui* gui)
               + " feeboxLit=" + (fe && fe->getEnabled() ? "1" : "0")
               + " feeboxAlpha=" + (fe ? std::to_string((long long)(fe->getAlpha() * 100.0f + 0.5f)) : std::string("?"))
               + " rownotes='" + notes + "' hovernote='" + shownNote + "'";
+        {   /* T-1375: the MODS tab's two lines as they read, and which box its question box is (0 none, 1 WORLD'S MODS, 2 MOD ORDER, 3 after YES) */
+            MyGUI::Widget* yw = UiFind(gui, std::string(kOptModsYourName));
+            MyGUI::TextBox* yt = yw != 0 ? yw->castType<MyGUI::TextBox>(false) : 0;
+            line += " modsyour='" + (yt != 0 && yw->getVisible() ? UiStateOneLine(yt->getCaption().asUTF8()) : std::string()) + "' modsask=" + coopui::PanelNum((long long)g_optModsAsking);
+        }
     }
     if (g_panelScreen == 8) line += " pwline='" + g_dlgText + "'";   /* T-290: PASSWORD REQUIRED's line (never the box's text) */
     line += " reset='" + g_resetSay + "' resetBusy=" + (g_resetProc != 0 ? "1" : "0") + " resetLit=" + (PanelResetLit() != 0 ? "1" : "0")
@@ -9256,7 +10184,26 @@ void UiTitleScreenNote(void* title)   /* T-220: title pump only (detour_titleUpd
     g_titleSeenAtMs = ::GetTickCount();
 }
 void UiJoinPasswordFromLeverOnce() { g_joinPwFromLever = 1; }   /* T-290: TEST-ONLY, the joinpw lever (MAIN THREAD) */
-std::string UiServerLogPath() { return g_nbLogPath; }   /* MAIN THREAD: see ui.h */
+std::string UiServerLogPath() { return g_nbLogPath; }
+/* T-1403 TEST ONLY: walkslow <seconds 1-600> | walkslow hold <entry 1-1000000> | walkslow off - the NEXT world server this game starts
+   gets --walk-slow-sec / --walk-hold-at (store_main.cpp WalkLeverWait), once. MAIN THREAD (the command channel). */
+std::string UiWalkSlowLever(const std::string& args)
+{
+    std::string a = args;
+    while (!a.empty() && a[0] == ' ') a.erase(0, 1);
+    while (!a.empty() && a[a.size() - 1] == ' ') a.erase(a.size() - 1);
+    if (a == "off") { g_walkSlowSec = 0; g_walkHoldAt = 0; DebugLog("[UI] T-1403 TEST-ONLY walkslow off"); return "ok walkslow off"; }
+    const bool hold = a.compare(0, 5, "hold ") == 0;
+    const std::string num = hold ? a.substr(5) : a;
+    char* end = 0;
+    const long v = num.empty() ? 0 : strtol(num.c_str(), &end, 10);
+    if (num.empty() || end == num.c_str() || *end != 0 || v < 1 || v > (hold ? 1000000L : 600L))
+        return "error walkslow usage: walkslow <seconds 1-600> | walkslow hold <entry 1-1000000> | walkslow off";
+    if (hold) { g_walkHoldAt = v; g_walkSlowSec = 0; } else { g_walkSlowSec = v; g_walkHoldAt = 0; }
+    DebugLog("[UI] T-1403 TEST-ONLY walkslow ARMED: the next world server this game starts gets " + std::string(hold ? "--walk-hold-at " : "--walk-slow-sec ")
+             + coopui::PanelNum((long long)v) + " (once)");
+    return std::string("ok walkslow ") + (hold ? "hold " : "") + coopui::PanelNum((long long)v);
+}   /* MAIN THREAD: see ui.h */
 int UiHostingNow(std::string* world)   /* MAIN THREAD: the HOSTING rule (PanelHostingNow); the world's listed name, else its folder */
 {
     if (!PanelHostingNow()) return 0;
@@ -9621,6 +10568,7 @@ static void UiHostingWorldClose(MyGUI::Gui* gui, MyGUI::Widget* panel, MyGUI::Wi
     if (opts != 0) UiOptTipDrop(gui);   /* GAME OPTIONS' hover note is the panel's child: its state goes with it */
     g_optInWorld = 0;
     g_optWorldDone = 0;
+    g_optModsAsking = 0;   /* T-247 review fold (NOTE 7): the WORLD'S MODS question goes with the in-world panel (every close road passes here) */
     if (panel != 0) PanelDestroy(gui, panel);
     if (root != 0) gui->destroyWidget(root);
     ::InterlockedExchange(&g_panelWanted, 0);

@@ -91,6 +91,7 @@
 //   upgrade|downgrade <sub> vt+0x258 / vt+0x260 on an own, complete piece - the engine's own in-place upgrade (T-609 U).
 #include "build.h"
 #include "../common/leverpick.h"   /* T-1218: TEST-ONLY picks by key - exactly one, or `#<k>` */
+#include "../common/keycap.h"   /* T-1401: each kind of [BUILD] line and each piece's hit lines their own cap */
 #include "farm.h"           /* par16: farms ride this channel (MSG_BUILD kinds 6 / 7) */
 #include "addresses.h"      /* the five names below come from the address table */
 #include "store.h"          /* EngineWritesBlocked, StoreMainThreadId */
@@ -127,6 +128,7 @@ namespace coop { long DoorsApplyingSet(long v); }   /* doors.cpp (T-1199 fold 1)
 #include "../common/boxowner.h"    /* build1h: HouseOwnerOfNewPiece */
 #include "../common/ownrec.h"      /* mmo8a: pp.build rows (EncodeBuildRec / BuildRow) */
 #include "../common/piecerec.h"    /* each piece as one world-server record */
+#include "../common/farmstatelog.h"   /* T-1361 LOG ONLY: the farm crop lines' own cap */
 #include "../common/placeinput.h"  /* a placement input height = live y less the ground height */
 #include "../common/tradecharge.h" /* buyhouse cats=<n>: ParseCats / PayToSet, the purse set the buytest levers use */
 #include "../common/townreoffer.h" /* T-805 b: BuyHeldAsk / PurseCovers - the buy callback's held-residents question */
@@ -154,6 +156,7 @@ namespace coop { long DoorsApplyingSet(long v); }   /* doors.cpp (T-1199 fold 1)
 #include <set>        /* house2: the removed-keys list */
 #include "../common/groundkey.h"   /* P3: coopground::GroundBuildingSource - BuildGroundSource */
 #include "../common/walkdrop.h"   /* T-609 fold 1 (F4): GoneAfterDismantle - a building leaves the walk list only when it reads dismantled */
+#include "../common/wallgroup.h"   /* T-1408 fold 13: wall groups shared from the owner (the pure decisions) */
 #include <deque>
 #include <io.h>         /* house2 fold: _commit / _fileno */
 #include <sstream>
@@ -168,6 +171,7 @@ int TownGenBuyHeld(void* building);   /* towngen.cpp, MAIN THREAD (owner 809 b /
 int TownGenBuyHeldGroups(void** out, int cap);   /* towngen.cpp, MAIN THREAD: the groups the last TownGenBuyHeld run made */
 int TownGenPlatoonHomeKey(const void* platoon, char* out, int cap);   /* towngen.cpp: the group's home building key - 1 key, 0 no home, -1 unreadable */
 int GroundTerrainHeightAt(float x, float z, float* out);   /* combat.cpp - the terrain height at (x,z) (getTerrainHeight, SEH-wrapped): 1 height, 0 no terrain (-99), -1 no row / faulted. MAIN THREAD */
+int GroundPlaceHeightAt(float x, float z, float* out);   /* combat.cpp (T-1372) - the ground createPhysical adds to a placement input (0x9B2850, SEH-wrapped): 1 read, -1 no row / faulted. MAIN THREAD */
 long long ZoneTornGen();   /* items.cpp: one more each time a zone is taken apart (either thread) */
 int PowerSwitchNow(void* b);   /* P47 (H-P47b): below - a power piece's switch (1 / 0), -1 not a power piece or unreadable. MAIN THREAD */
 void PowerCompletionPutBack(void* b, int before);   /* P47 (H-P47b): below - after the mod's own completion apply. MAIN THREAD */
@@ -212,6 +216,33 @@ int BdJobFinderInstall(uintptr_t base);   /* below, after BdTownPickInstall: the
 int BdBuyTdInstall(uintptr_t base);   /* below, after BdJobFinderInstall: the purchase's teardown call redirected to BdBuyTdRedirect */
 extern const char* g_tpWhy;   /* T-923: below - the town pick redirect's install answer */
 void* BdBuildingTownPod(void* b);   /* below, with the outposts */
+void BdTownStoreNote(void* b, const char* key, const char* when);   /* T-1427 (decision 1782): below, with the floor-store move */
+/* T-1427 part 2 (owner request 2026-11-18): the town a copy is created in - below, after BdOwnTownAt. MAIN THREAD */
+struct BdCopyTown { int rule; void* town; float dist; float off; };   /* rule coopbuild::kCt*; town 0 = not even 'Nowhere' read (the engine picks) */
+BdCopyTown BdCopyTownFor(int slot, int mySlot, const float* namedXZ, const float* pos, void* recordTown);
+void BdCopyTownMade(const std::string& key, void* b, const BdCopyTown& ct, int fresh);
+void BdCopyTownJudge(const std::string& key, void* builderTown, const char* road, int sw, int ownerHere);   /* T-1427 fold 1: sw coopbuild::kSw* */
+std::string BdCopyTownReportText();
+void* TlTownOfId(unsigned id, int recordOwner, int* words, int* ownerBad);   /* below, with the outposts' show code */
+unsigned TlRecordLinkOf(const std::string& key);                             /* below, with the outposts' show code */
+/* T-1427 fold 1 (owner request 2026-11-18: the shared record carries the builder's town, whatever it is): below, with the outposts */
+int BdBuildingTownFactPod(void* b, piecerec::PieceTownFact* f);   /* the town building b's own words name, as a record carries it */
+void* TlFactTownHere(const piecerec::PieceTownFact& f);           /* this game's town for a world-town / 'Nowhere' fact (0 = none here) */
+void* TlRecordFactTown(const std::string& key);                   /* the same for the town fact a key's kept record names */
+int BdCopyTownOwed(const std::string& key);                       /* 1 = that copy's creation town is still to be compared */
+void BdCopyTownSweep();                                           /* entries whose copy is gone leave */
+void BdCopyTownForgetWorld();
+void* BdWildTownPod();                                            /* the wilderness town 'Nowhere' (TownList+0x180F8) */
+/* T-1408 fold 13 (F1418 / F1419, design B): wall groups shared from the owner - defined beside BdGroupKeysOf (namespace coop) */
+void detour_wallJoinArea(void* wall, void* area);                 /* the hook on the engine's wall join 0x29AC10 (any thread) */
+void BdWallFactFromEngine(void* b, const char* why);               /* the owner: the group fact of b's group read from the engine, MAIN THREAD */
+void BdWallJoinFromRecord(const std::string& key, void* b, const char* road);   /* every game: join a wall by its fact, MAIN THREAD */
+void BdWallJoinArea(int c, const char* road);                     /* ... every fact wall of area c, MAIN THREAD */
+void WgFactFromKept(const std::string& id, const std::string& state, int removed);   /* a kept record's fact noted (or dropped), MAIN THREAD */
+int BuildBuildingIsPlayers(void* building);                       /* below (doors.cpp's too): 1 = a player owns the building, -1 unreadable. ANY THREAD */
+void BdHeldResolve(int c, const char* road);                      /* T-1408 fold 13d: the held walls of area c (-1 = every area whose records are applied) decided, MAIN THREAD */
+void BdWgLeadReset(const std::string& key);                       /* T-1408 fold 13d: a lead copy made again takes the record's value afresh */
+void BdWgLeadPassesAll(const char* road);                         /* T-1408 fold 13e: every lead here runs its pass again (an area left: an order wait may end) */
 
 // PROBE-START: P082
 static unsigned long long kBdCommitRva = 0;    static AddrReg kBdCommitRva_reg("PlacementCommit", &kBdCommitRva);              /* Steam_1.0.65 0x4D6810 */
@@ -219,12 +250,15 @@ static unsigned long long kBdCommitRva = 0;    static AddrReg kBdCommitRva_reg("
 static unsigned long long kBdPieceTownRva = 0;  static AddrReg kBdPieceTownRva_reg("PlacementPieceTown", &kBdPieceTownRva);       /* Steam_1.0.65 0x4D6300: a placed preview's own town pick (preview+0x90) */
 static unsigned long long kBdRegionAddRva = 0;  static AddrReg kBdRegionAddRva_reg("PlacementRegionAdd", &kBdRegionAddRva);       /* Steam_1.0.65 0x4D21F0: (list, Aabb*) - a region for the list's later update */
 static unsigned long long kBdTownNearPlRva = 0; static AddrReg kBdTownNearPlRva_reg("TownListNearestPlayer", &kBdTownNearPlRva);  /* Steam_1.0.65 0x926F70: (TownList*, Vector3*, char, float) - the nearest player town within the range */
+static unsigned long long kBdBuildingAtRva = 0;  static AddrReg kBdBuildingAtRva_reg("BuildingAtPoint", &kBdBuildingAtRva);   /* T-1343: Steam_1.0.65 0x9B1CD0 / 1.0.68 0x9B2BA0: (Vector3*) -> the building standing at that point, 0 none - the place test's own per-node call (decomp_4d5f30.txt:67-71) */
 static unsigned long long kBdTerrainAtRva = 0;  static AddrReg kBdTerrainAtRva_reg("TerrainHeightAt", &kBdTerrainAtRva);          /* Steam_1.0.65 0x9B10B0: (Vector3*, char, int) -> the ground height at x/z (-99 none) - the cursor update's own height for a ground hit */
 static unsigned long long kBdGroupRangeRva = 0; static AddrReg kBdGroupRangeRva_reg("PlacementGroupTownRange", &kBdGroupRangeRva); /* Steam_1.0.65 0x16E0158 (ro): the confirm's group step range, 16000.0 */
 static unsigned long long kBdCreateRva = 0;    static AddrReg kBdCreateRva_reg("CreateBuilding", &kBdCreateRva);               /* Steam_1.0.65 0x57C1E0 */
 static unsigned long long kBdProgressRva = 0;  static AddrReg kBdProgressRva_reg("AddConstructionProgress", &kBdProgressRva);  /* Steam_1.0.65 0x558B10 */
 static unsigned long long kBdDismantleRva = 0; static AddrReg kBdDismantleRva_reg("AddDismantleProgress", &kBdDismantleRva);   /* Steam_1.0.65 0x2A2820 */
 static unsigned long long kBdConfirmDismantleRva = 0; static AddrReg kBdConfirmDismantleRva_reg("BuildingConfirmDismantle", &kBdConfirmDismantleRva);   /* Steam_1.0.65 0x54F410, 1.0.68 0x54FEA0 - T-805 */
+static unsigned long long kBdEditorDeleteRva = 0; static AddrReg kBdEditorDeleteRva_reg("LevelEditorDeleteSelected", &kBdEditorDeleteRva);   /* Steam_1.0.65 0x776D60, 1.0.68 0x7778A0 - T-1372: (LevelEditor*, hand* selected) */
+static unsigned long long kBdEditorToggleRva = 0; static AddrReg kBdEditorToggleRva_reg("PlayerInterfaceToggleEditor", &kBdEditorToggleRva);   /* Steam_1.0.65 0x7F2B80, 1.0.68 0x7F3720 - T-1372 lever: (PlayerInterface*) */
 static unsigned long long kBdDestroyRva = 0;   static AddrReg kBdDestroyRva_reg("SetDestroyed", &kBdDestroyRva);               /* Steam_1.0.65 0x5567F0 */
 static unsigned long long kBdCreatePhysRva = 0; static AddrReg kBdCreatePhysRva_reg("BuildingCreatePhysical", &kBdCreatePhysRva);   /* Steam_1.0.65 0x55FF50, 1.0.68 0x5609E0 - T-1294 fold 2 (M2): Building::createPhysical (vt+0x200), hooked - it makes and fills the piece's physics list +0x228 */
 // PROBE-END: P082
@@ -236,6 +270,11 @@ void P165Tick(unsigned long now);
 void P165Forget();
 // PROBE-END: P165
 #endif
+/* T-1408 fold 13: the engine's wall join - 0x29AC10 (wall, area building set): joins the wall to the first neighbour that accepts, from the
+   placement commit 0x4D6810 and once per wall at area load 0x9FEC00 (hooked: held for a wall whose record carries its owner's group);
+   0x29A850 (lead, wall): one wall joined to a lead (its own lead when the target has one), 0 = refused (called in the owner's order) */
+static unsigned long long kBdWallJoinAreaRva = 0;  static AddrReg kBdWallJoinAreaRva_reg("WallJoinArea", &kBdWallJoinAreaRva);   /* Steam_1.0.65 0x29AC10, 1.0.68 0x29AC50 */
+static unsigned long long kBdWallJoinToRva = 0;    static AddrReg kBdWallJoinToRva_reg("WallJoinTo", &kBdWallJoinToRva);         /* Steam_1.0.65 0x29A850, 1.0.68 0x29A890 */
 static unsigned long long kBdWallHitRva = 0;  static AddrReg kBdWallHitRva_reg("WallHitByMelee", &kBdWallHitRva);   /* Steam_1.0.65 0x29D520, 1.0.68 0x29D560: WallBuilding's melee hit (vt+0x1F0), hooked */
 static unsigned long long kBdDoorHitRva = 0;  static AddrReg kBdDoorHitRva_reg("DoorHitByMelee", &kBdDoorHitRva);   /* Steam_1.0.65 0x29D650, 1.0.68 0x29D690: DoorStuff's melee hit (vt+0x1F0), hooked */
 static unsigned long long kBdSwapPickRva = 0; static AddrReg kBdSwapPickRva_reg("BuildingSwapPick", &kBdSwapPickRva);  /* Steam_1.0.65 0x7F3BD0, 1.0.68 0x7F4770 - T-906: the owner faction's building-swap pick, hooked */
@@ -275,6 +314,8 @@ static unsigned long long kBdTaskRecordRva = 0; static AddrReg kBdTaskRecordRva_
 void BdOwnerWordIn(const coopbuild::BuildMsg& m, int fromSlot, int fromAddr);   /* a piece's placement, state or removal as its owner's word (beside BuildNoteRecv) */
 void BdClassOf(void* b, char* cls, int cap);   /* below, in this namespace */
 int BdIsPowerClass(const char* cls);           /* below, in this namespace */
+int PcPartsRead(void* b, coopbuild::PieceWholeIn* x);   /* T-1389: beside the bldparts reads (T-1372), in this namespace - 1 read, 0 a fault */
+void PcPartsCacheClear();                               /* T-1389: the same */
 
 namespace {
 
@@ -333,7 +374,11 @@ const size_t kVtLayoutSub = 0x40;      /* build1-e: the Layout virtual the commi
 const size_t kVtOrient = 0xC0;         /* build1-e: the host orientation the commit inverts for the local frame */
 const int    kBdInteriorCap = 512;     /* build1-e: interior pieces looked at per host search */
 const int    kBdHostMissing = 6;       /* build1-e: a furniture row's host does not resolve here (a verdict beside items.h kObjKey*) */
-const int    kLineCap = 60;            /* [BUILD] placed / dismantled / destroyed / PLACE / copy lines per run */
+const int    kLineCap = 40;            /* T-1401 (owner 1735 a): [BUILD] lines other than hits - EACH KIND of line its own cap (swkeycap::LineKind,
+                                          the words before its first '=', ':' or '('): its first 40, then one count a minute. Was one
+                                          60-line budget shared by every kind, hits included (F1156 CAP) */
+const int    kHitLinesPerPiece = 5;    /* T-1401 (owner 1735 a): a piece's hit lines - its first 5 in full, then one summary a minute per piece
+                                          while it is hit; a failed, dropped or lost hit is ALWAYS written (BdLogHit) */
 const int    kProgLineCap = 20;        /* review-build1a B5: progress lines have their own cap, so they never starve the lines above */
 const int    kQueueCap = 512;          /* build1-b (T321 queueDropped 1141): headroom for an area load in play; see detour_progress */
 const int    kPendCap = 4096;          /* build1-c (review-build1b M1): PLACEs waiting for their copy, both lists together; STATEs held */
@@ -370,6 +415,10 @@ int g_hkCreatePhys = 0;
 typedef unsigned long long (*BdWallHitFn)(void* t, unsigned long long hand, void* dmg, void* attacker, unsigned long long five, unsigned long long six);
 BdWallHitFn orig_wallHit = 0;
 int g_hkWallHit = 0;
+typedef void (*BdWallJoinAreaFn)(void* wall, void* area);   /* T-1408 fold 13: 0x29AC10 */
+BdWallJoinAreaFn orig_wallJoinArea = 0;
+int g_hkWallJoin = 0;
+typedef unsigned long long (*BdWallJoinToFn)(void* lead, void* wall);   /* T-1408 fold 13: 0x29A850 - the low byte is the answer */
 BdWallHitFn orig_doorHit = 0;   /* DoorStuff's melee hit 0x29D650 (vt+0x1F0), the same shape */
 int g_hkDoorHit = 0;
 /* P18 (parity P18): a building's owner CHANGE. Building::setFaction (vt+0xA0, 0x556EC0) is hooked; a change TO this game's player faction
@@ -456,6 +505,9 @@ std::map<int, BdRrWait> g_rrWait;       /* MAIN THREAD: sectors whose restore le
 std::map<std::string, int> g_rrCounted; /* MAIN THREAD: rows counted notMine / ambiguous / noOwner -> their sector; forgotten when it leaves the active list */
 unsigned int g_rrSiSeen = 0;            /* MAIN THREAD: StandInRegistrations() when last looked at */
 long long g_keptRepaired = 0, g_keptRepairWallKept = 0, g_keptRepairNotSet = 0;   /* MAIN THREAD (BdKeptHandBack): a kept whole piece found a ruin here - made whole / a wall ruin kept / still a ruin or its progress write faulted */
+std::string g_keptRuinPart;   /* MAIN THREAD, TEST-ONLY (T-36, `buildtest keptruin <key part>`): the owner's kept step ruins its own piece whose key holds
+                                 this part right before it lays the row's state (BdKeptRuinLever) - the fresh world's ruin, made on demand; empty = off */
+int g_keptRuinTries = 0;      /* MAIN THREAD, TEST-ONLY: the lever's ruin calls on the armed piece (the engine may defer one - message 16) */
 const size_t kBInteriorObj = 0xF8;     /* P18 fold 1: Building::isAnInteriorObject */
 const size_t kBResidentSquad = 0xD0;   /* P18 fold 1: Building::residentSquad (a hand: +0x8 its type, 0xB = none) - the buy callback clears it:
    buyMeCallback 0x7ACB20 writes +0xD8 = 0xB, +0xE4 = 0 (8 bytes), +0xE0 = 0 (4 bytes); setResidentSquad 0x552780 fills the same hand (1.0.65, T-902) */
@@ -508,8 +560,9 @@ long long g_hitInDropped = 0, g_hitStateApplied = 0, g_hitExpired = 0, g_hitStal
 long long g_hitNoWriter = 0, g_hitReasked = 0, g_hitNotWriterDropped = 0, g_hitResultSent = 0, g_hitResultNotSent = 0, g_hitResultRecv = 0;
 long long g_hitResultApplied = 0, g_hitResultSkipped = 0, g_hitNoRowRan = 0, g_hitHere = 0;
 int g_hitReplay = 0;   /* MAIN THREAD: > 0 while the mod replays a hit (BdHitReplayHere) - the hook lets the engine's hit run (asked with BdOnMain) */
-struct BdHitOut { std::string key; unsigned int seq; float cut, blunt; int slot; DWORD sentAt; int sent; DWORD madeAt; int reasked; int door, repair; };   /* door: -1 the piece, else its door index; repair 1: cut is a repair's gain */
-struct BdHitLocal { std::string key; float cut, blunt; int reasked, noRow; DWORD at; int door, repair; };
+struct BdAtk { unsigned int uid; int known, whose, slot, where; char name[48], fac[48], task[64], tgt[192], aim[300]; float aimPos[3]; int aimPosOk; BdAtk() { std::memset(this, 0, sizeof *this); slot = -1; } };   /* T-1381: who swung a hit on a player wall or door (BdAttackerRead); known 1 read, 0 the engine gave none, -1 none carried (a repair's gain) */
+struct BdHitOut { std::string key; unsigned int seq; float cut, blunt; int slot; DWORD sentAt; int sent; DWORD madeAt; int reasked; int door, repair; BdAtk atk; };   /* door: -1 the piece, else its door index; repair 1: cut is a repair's gain */
+struct BdHitLocal { std::string key; float cut, blunt; int reasked, noRow; DWORD at; int door, repair; BdAtk atk; };
 std::vector<BdHitLocal> g_hitLocal;                       /* MAIN THREAD: hits on player walls here, waiting for the K2 safe point's writer ask */
 std::vector<BdHitOut> g_hitOut;                           /* MAIN THREAD, the asking game: HITs not yet answered by the writer's game */
 struct BdHitIn { coopbuild::BuildMsg m; int slot; DWORD at; };
@@ -536,6 +589,38 @@ long long g_wallRepHeldSet = 0, g_wallRepHeldCleared = 0, g_wallRepHeldDropped =
 std::vector<std::string> g_wallRepHeld;                   /* MAIN THREAD, the helper's game: own-record wall copies whose repair the owner's game refused -
                                                              repair orders and work on them are refused until the owner's health changes */
 const size_t kWallRepHeldCap = 64;
+/* T-1408 fold 10 (F1312), ANY THREAD mirror: the wall copies whose repair step detour_progress skipped for the owner's refusal
+   (BdWallRepairHeld) - the help job gate (BdHelpJobGate) ends a repair job on one through the engine's own job end, as it does for a
+   held grouped wall (the job body never reads the skipped step). Filled at the skipped step (main thread); emptied when a hold clears
+   (the others are added again at their next skipped step) and when the world goes. */
+const int kRhCap = 64;
+void* g_rhPiece[kRhCap];
+int g_rhN = 0;
+volatile LONG g_rhLock = 0;
+volatile LONG64 g_hjRepHeldEnded = 0;
+void BdRepHeldMirrorAdd(void* b)
+{
+    while (::InterlockedCompareExchange(&g_rhLock, 1, 0) != 0) YieldProcessor();
+    int have = 0;
+    for (int i = 0; i < g_rhN; ++i) if (g_rhPiece[i] == b) { have = 1; break; }
+    if (have == 0 && g_rhN < kRhCap) g_rhPiece[g_rhN++] = b;
+    ::InterlockedExchange(&g_rhLock, 0);
+}
+void BdRepHeldMirrorClear()
+{
+    while (::InterlockedCompareExchange(&g_rhLock, 1, 0) != 0) YieldProcessor();
+    g_rhN = 0;
+    ::InterlockedExchange(&g_rhLock, 0);
+}
+int BdRepHeldMirrorHas(void* b)
+{
+    if (b == 0) return 0;
+    int r = 0;
+    while (::InterlockedCompareExchange(&g_rhLock, 1, 0) != 0) YieldProcessor();
+    for (int i = 0; i < g_rhN; ++i) if (g_rhPiece[i] == b) { r = 1; break; }
+    ::InterlockedExchange(&g_rhLock, 0);
+    return r;
+}
 long long g_wallGroupMarked = 0, g_wallGroupResolves = 0, g_wallGroupLooks = 0, g_wallGroupCacheCleared = 0, g_wallOwnApplied = 0,
           g_wallSharedApplied = 0, g_wallCompleteApplied = 0, g_wallCompleteNoop = 0, g_wallCompleteSlow = 0, g_keptOwnRecComplete = 0,
           g_keptOwnRefused = 0;   /* T-221: wall progress */
@@ -622,7 +707,13 @@ struct BdEvent
     char key[kKeyCap];
     float amount2;       /* a hit (4 / 5): amount = the damage's cut (+0), amount2 its blunt (+4) */
     int door;            /* a hit (5) or a door change here (6, amount = a repair's gained health): the door's index in its piece's door list; -1 the piece itself */
+    BdAtk atk;           /* T-1381: a hit (5): who swung it, read where it landed */
+    char why[48];        /* T-1372 (12): the engine's reason literal, copied (amount 1 = removed for good, 0 = another reason; dismBefore 1 = inside the editor's delete) */
+    int engSlot;         /* T-1372 review fold 2 (12): 1 + the capture slot holding the piece's door keys until BuildTick takes them; 0 none */
+    int recApply;        /* T-1408 fold 7: queued on the main thread while the mod applied an own record's STATE (g_gsRecApply) - the engine calls of
+                            that apply (the complete-now path, the amount-0 wall step, the threshold crossing) are no new work: no group step */
 };
+int g_gsRecApply = 0;    /* T-1408 fold 7, MAIN THREAD: > 0 while BdApplyOne writes an own record's STATE onto a wall */
 BdEvent g_q[kQueueCap];
 int g_qn = 0;
 CRITICAL_SECTION g_qcs;
@@ -651,6 +742,7 @@ struct BdReg
     int keySame;                                 /* build1-e (F2): 0 = the copy's created key differed from the builder's */
     int placeOk;                                 /* build1-f: an own piece's placement inputs below are known (the roster's PLACE) */
     float placePos[3], placeRot[4];              /* build1-f: as createBuilding received them (furniture: host-local), or read by the scan */
+    int placeMark;                               /* T-1372 decision 1691: 1 = placePos was measured the engine's way (this build); 0 = taken from an older record unconverted - its PLACE carries no ground mark */
     int floor, outside;                          /* build1-f: furniture's floor / outside flag, as createBuilding received them */
     int ownerSlot;                               /* build1h: the owner slot the PLACE named (-1 not recorded; an own row answers MySlotForWire) */
     int handed;                                  /* build1h: 1 = placed here and handed to the house owner (a copy row), 2 = handed to THIS game (own), 3 = to a third slot */
@@ -658,6 +750,9 @@ struct BdReg
     unsigned int nonce;                          /* house2 fold: the placement's nonce (drawn by the placer; a copy / handed row keeps the PLACE's; 0 = unknown) */
     int helpBaseOk;                              /* help1: a copy's delivered amounts after the mod's own last write (helpBase) are known */
     float helpBase[coopbuild::kBuildMaxMats];    /* help1: ... - the helper's deliveries are measured against them, never the mod's writes */
+    unsigned long long helpBaseRec;              /* T-1408 fold 14 (F1429): the materials record (vt+0x228) helpBase was read from - usable only while the piece reads that record */
+    int helpBaseCnt;                             /* T-1408 fold 14b (review 5): that record's group count when read (coopbuild::BuildHelpBaseUsable) */
+    unsigned int helpBaseGen;                    /* T-1408 fold 14d (review 6): that record's join generation when read (BdRecGenOf) */
     std::vector<coopbuild::BuildHelpAck> helpAcks;   /* help1: an own piece - per helper slot the last HELP_WORK seq applied and the refused materials */
     int helpForce;                               /* help1: an own piece - the next STATE goes now (it carries a confirmation) */
     std::vector<coopbuild::BuildHelpAck> helpAcksLanded;    /* help1 fold (review MED 4): an own piece - the confirmation rows pp.build holds ON DISK (what a STATE's tail carries) */
@@ -669,6 +764,11 @@ struct BdReg
     unsigned int helpTailSeq;                               /* ... and the last seq it says it applied from this game (0 = none) */
     unsigned int helpTailLive;                              /* help1 fold 3 (finding 1): ... and its LIVE last applied (>= helpTailSeq) - new entries go past it */
     float helpOverP;                                        /* T-23 fix: a copy - the help work recorded above its cap since the owner's last STATE on it (BuildHelpRetireCompletes) */
+    /* T-1408 fold 14c (sibling of F1429, SAFE): helpOverP / helpBaseP stay per key - neither is a baseline of the mod's own writes compared
+       with the shared record: helpOverP is the cap's cut of THIS game's one step on this key (p1 - cap inside one call), helpBaseP is the
+       owner's value from its STATE for this key (the owner sends the group's value for every member); the retire's d = helpBaseP +
+       this key's own unapplied work - the copy's progress, so a member's work on the shared record can only lower another key's d (an
+       under-count at the retire), never invent work */
     float helpBaseP;                                        /* T-23 review fold 2: a copy - the owner's progress in the last STATE (or record) whose help numbers this game read */
     int helpBaseKnown;                                      /* T-23 review fold 2: helpBaseP read this session (a re-made copy keeps it - it is the owner's) */
     int stateAnnounce;                                      /* help1 fold 5 (T-269): an own piece - its first real STATE after the PLACE is owed */
@@ -678,10 +778,13 @@ struct BdReg
     int broken, sentBroken;                                 /* an own piece: +0x3B6 as last read, and what the other games were last sent */
     unsigned long long born;                                /* T-904 levers: rows numbered as they are made (the newest = the highest), for the `@last` key form */
     int hitForce;                                           /* an own wall was hit: its next STATE goes at once (why=hit), not at the progress step */
+    unsigned int gStamp;                                    /* T-1408: the wall group step stamp of the value this piece holds now (0 = none: a value from the save) */
+    unsigned int wgLeadStamp;                               /* T-1408 fold 13b: a lead copy - the stamp of the owner's STATE whose progress it last wrote (only a newer one writes) */
+    int wgLeadHave;                                         /* T-1408 fold 13c: 0 = none written yet (a first STATE passes whatever its stamp) */
     BdReg() : progress(0.0f), needed(0.0f), complete(0), dismantled(0), destroyed(0), via(0), own(0), nMats(0), sentOk(0),
-              sentComplete(0), sentN(0), sentProgress(0.0f), removed(0), hasPos(0), hostForm(0), keySame(1), placeOk(0), floor(0), outside(0), ownerSlot(-1), handed(0),
-              nonce(0), gen(g_bdGen), helpBaseOk(0), helpForce(0), helpAckDirty(0), helpAckWait(0), helpAckSeq(0), helpAckAt(0),
-              helpTailKnown(0), helpTailSeq(0), helpTailLive(0), helpOverP(0.0f), helpBaseP(0.0f), helpBaseKnown(0), stateAnnounce(0), sentDestroyed(0), ownerKnown(0), broken(0), sentBroken(0), hitForce(0), born(++g_bdBornNext)
+              sentComplete(0), sentN(0), sentProgress(0.0f), removed(0), hasPos(0), hostForm(0), keySame(1), placeOk(0), placeMark(1), floor(0), outside(0), ownerSlot(-1), handed(0),
+              nonce(0), gen(g_bdGen), helpBaseOk(0), helpBaseRec(0), helpBaseCnt(0), helpBaseGen(0), helpForce(0), helpAckDirty(0), helpAckWait(0), helpAckSeq(0), helpAckAt(0),
+              helpTailKnown(0), helpTailSeq(0), helpTailLive(0), helpOverP(0.0f), helpBaseP(0.0f), helpBaseKnown(0), stateAnnounce(0), sentDestroyed(0), ownerKnown(0), broken(0), sentBroken(0), hitForce(0), gStamp(0), wgLeadStamp(0), wgLeadHave(0), born(++g_bdBornNext)
     {
         for (unsigned int i = 0; i < coopbuild::kBuildMaxMats; ++i) { mats[i] = 0.0f; sentMats[i] = 0.0f; helpBase[i] = 0.0f; }
         pos[0] = 0.0f; pos[1] = 0.0f; pos[2] = 0.0f;
@@ -690,6 +793,58 @@ struct BdReg
     }
 };
 std::map<std::string, BdReg> g_reg;   /* MAIN THREAD */
+/* T-1408 fold 13: the GROUP FACTS this game holds - a wall's key (the builder's; a copy's own live key too when it differs) -> its owner's
+   group lead key and join index (buildwire.h kBuildStateGroupBit), from the kept records, pp.build rows, applied STATEs and (the owner) its
+   commit's join. Under g_wgLock: the hook on 0x29AC10 reads it on whatever thread the engine joins walls on. */
+struct WgFact { std::string lead; unsigned idx; WgFact() : idx(0) {} };
+std::map<std::string, WgFact> g_wgFact;
+std::map<std::string, std::string> g_wgIdKey;   /* MAIN THREAD: record id -> the key its fact was noted under (a removal drops it) */
+volatile LONG g_wgLock = 0;
+void WgLock() { while (::InterlockedCompareExchange(&g_wgLock, 1, 0) != 0) YieldProcessor(); }
+void WgUnlock() { ::InterlockedExchange(&g_wgLock, 0); }
+int WgFactGet(const std::string& key, std::string* lead, unsigned* idx)   /* 1 = the key has a fact */
+{
+    WgLock();
+    std::map<std::string, WgFact>::const_iterator it = g_wgFact.find(key);
+    const int have = (it != g_wgFact.end()) ? 1 : 0;
+    if (have != 0) { if (lead != 0) *lead = it->second.lead; if (idx != 0) *idx = it->second.idx; }
+    WgUnlock();
+    return have;
+}
+int WgFactPut(const std::string& key, const std::string& lead, unsigned idx)   /* 1 = new or changed */
+{
+    if (key.empty() || lead.empty()) return 0;
+    WgLock();
+    WgFact& f = g_wgFact[key];
+    const int ch = (f.lead != lead || f.idx != idx) ? 1 : 0;
+    f.lead = lead; f.idx = idx;
+    WgUnlock();
+    return ch;
+}
+void WgFactDrop(const std::string& key)
+{
+    WgLock();
+    g_wgFact.erase(key);
+    WgUnlock();
+}
+/* the facts naming lead (index > 0): (index, key) */
+void WgFactMembersOf(const std::string& lead, std::vector<std::pair<unsigned, std::string> >* out)
+{
+    out->clear();
+    WgLock();
+    for (std::map<std::string, WgFact>::const_iterator it = g_wgFact.begin(); it != g_wgFact.end(); ++it)
+        if (it->second.idx != 0 && it->second.lead == lead) out->push_back(std::pair<unsigned, std::string>(it->second.idx, it->first));
+    WgUnlock();
+}
+volatile long long g_wgHookCalls = 0, g_wgHookRun = 0, g_wgHookHeld = 0, g_wgEngineOnRecorded = 0, g_wgHookNoKey = 0;   /* ANY THREAD (Interlocked) */
+long long g_wgJoined = 0, g_wgRefused = 0, g_wgWaits = 0, g_wgDone = 0, g_wgBusy = 0, g_wgLeadElse = 0, g_wgFactsOwner = 0, g_wgFactsKept = 0, g_wgLines = 0, g_wgLinesCut = 0, g_wgLeadTook = 0;
+const long long kWgLineCap = 400;
+/* the walls the hook held (under g_wgLock, waiting for the main thread): logged, and an own wall with no fact takes the
+   engine's held join once its area's records are applied (fold 13b) */
+struct WgHeld { void* wall; void* area; char key[64]; };
+std::vector<WgHeld> g_wgHeldQ;   /* fold 13c: unbounded - a held wall is never lost */
+long long g_wgFactLines = 0, g_wgFactLinesCut = 0, g_wgOwnDeferred = 0, g_wgLeadGone = 0, g_wgHeldDropped = 0, g_wgPlaceHeldN = 0, g_wgLegacy = 0, g_wgHeldAlone = 0;
+volatile long long g_wgEngineOnPlayer = 0;   /* ANY THREAD: every engine join 0x29AC10 run on a player's wall (the owner's placements, its held joins) */
 /* MAIN THREAD: own pieces this game placed itself (the commit or the placing lever) in the world now loaded -> the area's "loaded
    since" stamp (MyMapLoadedSinceTS of the piece's own sector) at the placement (BdMadeHereMark); at most kMadeHereCap - a piece
    not marked is asked about as usual */
@@ -736,7 +891,7 @@ std::map<std::string, BdHelpRow> g_help;          /* the helper's rows by the ow
 std::map<BdPlKey, BdHelpRow> g_helpOld;           /* help1 fold 3 (findings 2, 3), the helper's: rows of a placement the owner replaced at its key, by (key, nonce) - their
                                                      entries stay owed under their own nonce, sent on, until the owner's HELP_GONE for that placement settles them (O lines) */
 std::string g_helpFor, g_helpTried;               /* the file the map was loaded from / last tried (never saved unread) */
-struct BdHelpIn { coopbuild::BuildMsg m; int slot; unsigned int nextTry; int waitLogged; int heldLogged; };
+struct BdHelpIn { coopbuild::BuildMsg m; int slot; unsigned int nextTry; int waitLogged; int heldLogged; int wallLogged; int wallPark; int wallWhy; int wallTold; int recWaitLogged; };   /* T-1408 fold 8: recWaitLogged = the 'waits behind its group's records' line written (its own flag, F1291 NIT) */   /* T-1408 fold 1: wallLogged = the grouped wall HOLD line written; fold 2: wallPark = HELD and parked (re-judged on an event only), wallWhy = kBuildHeld*, wallTold = HELP_HELD sent for it */
 std::vector<BdHelpIn> g_helpIn;                   /* the owner's: HELP_WORK received, applied at the K2 safe point in arrival order */
 struct BdAckRestore { unsigned int nonce; std::vector<coopbuild::BuildHelpAck> acks; BdAckRestore() : nonce(0) {} };
 std::map<std::string, BdAckRestore> g_helpAckRestore;   /* the owner's: confirmation rows pp.build brought back; help1 fold 3 (finding 2): with the nonce of their row's PLACE - used only for that placement */
@@ -791,6 +946,39 @@ long long g_helpResynced = 0, g_helpSuperseded = 0, g_helpUnencodable = 0, g_hel
 long long g_goneRowsKept = 0, g_goneRowsRead = 0, g_goneRowUnkept = 0;   /* help1 fold 2 (MED 3): pp.build gone markers */
 volatile LONG g_helpWallRefusedOff = 0;           /* wall-copy help orders refused off the main thread: build / materials on a grouped wall copy, repair on a wall ruin or grouped wall copy (counted, no line) */
 long long g_helpWallGroupKept = 0;                 /* MAIN THREAD, the owner's game: help work whose build progress a grouped (or unreadable-record) wall did not take - materials only */
+/* T-1408, MAIN THREAD: pp.build rows and piece records held while a newer shared record was still to be applied over them; walls rebuilt
+   from the build list on the STATE road; own STATEs dropped as their area left. The wall group step stamps (coopbuild::BuildWallStampApply):
+   steps written; records applied (newer); newer and equal to the loaded value; ignored (equal or older); newer but not applied (no lead of
+   this player's, no usable share); applied by the older builds' rule (unstamped); members' rows caught up to the group's value; the
+   highest stamp this game has seen (any record, any group) */
+long long g_ogRowsHeld = 0, g_ogRecsHeld = 0, g_ogListWall = 0, g_ogStateAreaLeft = 0;
+long long g_gsSteps = 0, g_gsApplied = 0, g_gsSame = 0, g_gsIgnored = 0, g_gsNotApplied = 0, g_gsLegacy = 0, g_gsCatchUp = 0;
+unsigned int g_gsClock = 0;
+/* T-1408 fold 7 (F1283), MAIN THREAD: own wall groups whose step is OWED (new work while a record of the group queued here may still win -
+   coopbuild::BuildGroupStepWhat), keyed by the wall the work was on; owed steps made, run after their record's drop, dropped by the
+   record's apply (its value written over the work), dropped with their row; records whose stamp the group adopted (no step); changes
+   that were no new work (the mod's amount-0 wall step, add-materials). Fold 8: the value = 1 once the step was kept owed for its area
+   (BuildGroupOwedRuns: the area left or its record list is not complete - the records decide it at the next load); the group turns
+   (BdOwnGroupTurn: one queue turn for every queued record of a group) and the records they took; the owed steps kept for their area */
+std::map<std::string, int> g_gsOwed;
+long long g_gsOwedN = 0, g_gsOwedRun = 0, g_gsOwedAdopted = 0, g_gsOwedGone = 0, g_gsGroupTurns = 0, g_gsAdopted = 0, g_gsNoWork = 0;
+long long g_gsGroupTurnRecs = 0, g_gsOwedKeptArea = 0;
+long long g_gsFinishEnded = 0, g_writerSibLowered = 0, g_helpBehindList = 0;
+/* T-1408 fold 10: group changes taken from a MEMBER to its lead (F1331 1b); progress values kept within 0..needed (1c); a grouped copy's
+   shared value put back after a ruin applied to it (1d); a helper's work past a rebuild sent (3); group turns that waited for their winner
+   (F1304 SHOULD 2); ended finished records' catch-downs stepped (SHOULD 3) */
+long long g_gsFromMember = 0, g_progKeptClamped = 0, g_ruinGroupRestored = 0, g_ruinGroupRestoreFailed = 0, g_helpRebuildExtra = 0;
+long long g_gsTurnWaits = 0, g_gsFinishStepped = 0;
+int g_gsTurnNp = 0;   /* T-1408 fold 9: finished records ended unfinished; helper siblings lowered with a hit; help behind a loading area list */
+/* T-1408 fold 8: help on an own grouped wall that waited behind its group's queued records (BuildWallHelpWaitsForRecords), once per entry;
+   the helper's own-record wall copies whose write LOWERED them (BuildWallWriteLowers) - each steps alone from then on, never sharing one
+   stamp with its untouched siblings (BuildWriterSameOwnerStep), until the owner's next STATE lands on it */
+long long g_helpBehindRecords = 0, g_writerSolo = 0;
+std::set<std::string> g_wrSolo;
+int g_ownRowsHeldNow = 0;   /* the rows the last pp.build write held (its release marks pp.build dirty) */
+long long g_helpWallGroupStep = 0, g_helpWallStepRefused = 0, g_wallSharesRedrawn = 0, g_wallStepNoRate = 0;   /* T-1408 (F1216 design read), MAIN THREAD: the owner's wall step on its group; a helper's grouped-wall step refused; member shares redrawn; a wall step not run (rate 0 or below) */
+long long g_helpWallStepWait = 0, g_wallHeldSent = 0, g_wallHeldReleaseSent = 0, g_wallHeldRecv = 0, g_wallHeldCleared = 0, g_wallHeldWoken = 0, g_wallHeldDropped = 0;   /* T-1408 fold 2, MAIN THREAD: helper steps waiting on an unknown owner status; HELP_HELD sent (held / released); received; marks cleared; parked entries woken by an event; parked entries dropped (area left, world left) */
+long long g_helpWallGroupHeld = 0, g_helpWallScaled = 0, g_wallStateRedrawn = 0;   /* T-1408 fold 1, MAIN THREAD: grouped-wall help work held (every judgement); work scaled to the owner's lead's needed; member shares redrawn after the owner's STATE on the helper's lead copy */
 /* T-903: help per kind - [0] build, [1] add materials, [2] repair. given = an order on a copy let through as help; refused = the
    owner is neither a faction-mate nor has set this player friendly (decision 920 a). repairDamagedHelp = repair orders on a complete
    damaged copy given; repairWorkRec = repair work recorded on such a copy (it goes as HELP_WORK); on the owner's game repairApplied /
@@ -802,6 +990,9 @@ long long g_helpApplyRefused = 0;     /* T-903 fold (review MED 2): the owner's 
 long long g_helpApplyHeld = 0;        /* T-903 re-check fold (item 2): help work held - this game's slot or the sender's standing not known yet */
 long long g_rsHandedDead = 0;   /* T-1240: restores of a handed piece (never made here) whose dead handles counted as no piece */
 long long g_deadHandlesIgnored = 0;   /* T-903 (F1026): copy searches inside a host whose dead handles counted as no piece (BuildDeadHandlesIgnore) - the copy made */
+long long g_copyRowVoided = 0;        /* T-1343 (F1065): of those, searches whose key had a plain copy-list row - the row void, the copy made */
+const long long kCopyRowVoidLineCap = 40;   /* keys said (the line is once per key) */
+std::set<std::string> g_copyRowVoidSaid;
 long long g_helpRunRefused = 0;       /* T-903 fold (review MED 2): the helper's game - the engine's work on a copy of a player who allows no help, not done */
 long long g_helpHarvested = 0, g_helpHarvestRefused = 0;   /* the helper's game: materials put into a copy off the main thread - recorded as help / refused and put back */
 long long g_helpHarvestCarried = 0, g_helpHarvestLost = 0;   /* refused items not handed back at once: carried as an owed entry (handed back through the owner's refund) / the engine's add faulted (never retried) */
@@ -898,6 +1089,9 @@ int g_ownDirty = 0;
 long long g_rsRows = 0, g_rsPresent = 0, g_rsRecreated = 0, g_rsRefused = 0, g_rsFailed = 0, g_rsQueued = 0, g_rsLines = 0, g_rsSuppressed = 0;
 long long g_rsPresentRegistered = 0, g_stateAnnounced = 0;   /* help1 fold 5 (T-268 / T-269) */
 long long g_placeFromLive = 0, g_placeFromLiveNoGround = 0, g_placeFromLiveRetried = 0;   /* live positions turned into placement inputs; no ground height read; read again by a later scan */
+long long g_placeOldConverted = 0, g_placeOldKept = 0, g_placeOldNoGround = 0, g_placeOldNoKeyY = 0;   /* T-1372 decisions 1691 + 1694: older (unmarked) placement records judged when used - converted (measured the old way), kept (the game's own, or a tie); not placed then: no ground answered; placed unjudged: no height in the key */
+long long g_placeFromLiveFloor = 0;   /* T-1372 A1: of those, measured where the terrain is below the engine's 100 floor (the engine's ground is 100 there) */
+long long g_rmOtherRowRemove = 0, g_rmOtherRowRecon = 0;   /* T-1372 A2: a REMOVE / the reconcile refused - the piece found by position is another live row's */
 const long long kRsLineCap = 40;
 void BdOwnDirty(int level) { if (level > g_ownDirty) g_ownDirty = level; }
 /* P87 (to-do P87): pieces dismantled while the other player was away. THE OWNER'S SIDE: every own piece dismantled here is a
@@ -967,11 +1161,17 @@ struct BdTombKill
     long long refunded;        /* P14 fold 2 (D4): refund calls seen during this removal's calls - a retry zeroes the mats */
     int wall;
     int unread;                /* P14 fold 4 (L1): safe points whose mats could not be read (no call made) */
-    BdTombKill() : nextTry(0), tries(0), misses(0), waitLogged(0), matsBefore(0.0f), refunded(0), wall(0), unread(0) {}
+    int panel;                 /* T-1372 attempt 2: the first call was the panel's confirmDismantle 0x54F410 (the piece has an interior) */
+    int innerLogged;           /* T-1372 attempt 2: the 'interior list not read whole' line was written for this key */
+    BdTombKill() : nextTry(0), tries(0), misses(0), waitLogged(0), matsBefore(0.0f), refunded(0), wall(0), unread(0), panel(0), innerLogged(0) {}
 };
 std::map<std::string, BdTombKill> g_tombKill;
 /* P14 fold 1: keys whose removal was cancelled or given up in this world - an own piece there ends the tombstone as before P14 */
 std::set<std::string> g_tombKillNo;
+/* T-1372 review fold (N2): keys whose removal is put off to the NEXT load - the interior gate never read whole, or the panel call
+   faulted part-way: the tombstone is KEPT (held, neither dropped nor sent) and the piece is neither removed nor registered here, so the
+   next load tries again. Cleared with the world, and with its tombstone (BdTombDrop). */
+std::set<std::string> g_tombKillLater;
 /* P14 fold 1 (the escape ledger): an own piece's refund bracket - the building pointer -> its key, until its items land (<= 30 s); the
    refund items of a piece whose tombstone is not made yet (BdTombNote takes them) */
 struct BdRefundSrc { std::string key; DWORD at; };
@@ -986,6 +1186,7 @@ long long g_ledUnkeyed = 0, g_ledMatEsc = 0, g_ledEscMerged = 0, g_ledBlind = 0,
 long long g_ledRefuseAll = 0, g_ledSpillBlind = 0;   /* P14 fold 3 (N2/N1) */
 long long g_ledZoneUnread = 0, g_ledMatShared = 0, g_p14MatsUnread = 0;   /* P14 fold 4 (e5/L2/L1) */
 long long g_p14Interior = 0, g_p14KeyMismatch = 0, g_p14Waits = 0, g_p14Rescans = 0, g_p14NearPlaced = 0;
+long long g_p14Panel = 0, g_p14InnerMiss = 0, g_p14Foreign = 0, g_p14FurnWait = 0, g_p14Later = 0;   /* T-1372 attempt 2: panel removals of a house with an interior; looks whose interior list was not read whole */
 void BdLogLedger(const char* line)   /* P14 fold 1: the ledger's own cap */
 {
     if (g_ledLines < 40) { ++g_ledLines; DebugLog(std::string(line)); }
@@ -1119,6 +1320,7 @@ void BdCopyListNote(const std::string& key, const BdReg& r, const coopbuild::Bui
     if (slot < 0 || slot > (int)coopbuild::kBuildOwnerSlotMax) { ++g_clNoSlot; return; }
     coopbuild::BuildCopyRec c;
     c.key = key; c.sid = r.sid.empty() ? m.sid : r.sid; c.slot = slot; c.nonce = m.nonce;
+    c.groundMark = m.groundMark;   /* T-1372 */
     for (int i = 0; i < 3; ++i) c.pos[i] = m.pos[i];
     for (int i = 0; i < 4; ++i) c.rot[i] = m.rot[i];
     if (!m.hostKey.empty()) { c.hostKey = m.hostKey; c.hostForm = m.hostForm; c.floor = m.floor; c.outside = m.outside; }
@@ -1162,6 +1364,7 @@ void BdCopyListHandNote(const std::string& key, const BdReg& r)
     if (r.ownerSlot < 0 || r.ownerSlot > (int)coopbuild::kBuildOwnerSlotMax || r.placeOk == 0 || r.sid.empty()) { ++g_handNoRow; return; }
     coopbuild::BuildCopyRec c;
     c.key = key; c.sid = r.sid; c.slot = r.ownerSlot; c.nonce = r.nonce; c.handed = 1;
+    c.groundMark = (unsigned char)(r.placeMark != 0 ? 1 : 0);   /* T-1372 */
     for (int i = 0; i < 3; ++i) c.pos[i] = r.placePos[i];
     for (int i = 0; i < 4; ++i) c.rot[i] = r.placeRot[i];
     if (!r.hostKey.empty()) { c.hostKey = r.hostKey; c.hostForm = (unsigned char)r.hostForm; c.floor = r.floor; c.outside = (unsigned char)(r.outside != 0 ? 1 : 0); }
@@ -1339,6 +1542,7 @@ void BdTombDrop(const std::string& key, const char* why, int unOwe)
     if (coopbuild::BuildOweRemoveDrop(&g_tomb, key) == 0) return;
     g_tombInfo.erase(key);
     g_tombKill.erase(key);   /* P14: no removal without its tombstone */
+    g_tombKillLater.erase(key);
     if (unOwe != 0 && coopbuild::BuildOweRemoveDrop(&g_dmOweRemove, key) != 0) ++g_tombUnowed;   /* P87 fold 1: an own piece stands there - its queued REMOVE never goes */
     g_tombRetire.push_back(coopbuild::BuildTombRowKey(key));
     ++g_tombDropListed;
@@ -1425,6 +1629,9 @@ struct BdStatePend
     int completeTries;   /* T-221: tries this STATE was kept because a wall copy's complete-now call left it unfinished */
     int ownRec;          /* 1 = an own piece's state from its piece record (PcaOwnStateQueue): written as a copy's is, onto this game's own piece */
     int landed;          /* 1 = BdApplyOne's last answer laid the state on the piece (0 = dropped or not laid) */
+    int ruinPutPend;     /* T-1408 fold 11 (F1343 SHOULD 1): 1 = a grouped wall copy's ruin the engine postponed (message 16): its group's
+                            record value (ruinPutVal, read before the ruin) goes back on the retry that finds the ruin */
+    float ruinPutVal;
 };
 std::map<std::string, BdStatePend> g_pendState;
 /* build1-d: REMOVEs waiting for the K2 safe point (MAIN THREAD), one per key */
@@ -1634,6 +1841,32 @@ void* BdFindPiece(const std::string& key, const BdReg& r, int* verdict)
     if (host == 0) { *verdict = kBdHostMissing; return 0; }
     return BdFindInHost(host, key.c_str(), r.liveKey.c_str(), verdict);
 }
+/* T-1372 A2, MAIN THREAD: does ANOTHER live row already hold piece b, found by position for the REMOVE of row `key`? The piece's own
+   key is read and looked up as a row and as a copy's live key (g_liveAlias, still named by that row). coopbuild::BuildRemoveHeldByOther's
+   answer; *holder = the other row's key. */
+int BdPieceHeldByOther(void* b, const std::string& key, std::string* holder)
+{
+    holder->clear();
+    char pk[kKeyCap];
+    pk[0] = 0;
+    if (b == 0 || ObjectPositionKey(b, pk, kKeyCap, "", 3, 1) == 0) return coopbuild::kBuildRmHeldNone;
+    const std::string pieceKey(pk);
+    std::map<std::string, BdReg>::const_iterator at = g_reg.find(pieceKey);
+    const int rowAt = (at != g_reg.end() && at->second.removed == 0) ? 1 : 0;
+    std::string aliasRow;
+    int aliasLive = 0;
+    std::map<std::string, std::string>::const_iterator al = g_liveAlias.find(pieceKey);
+    if (al != g_liveAlias.end())
+    {
+        aliasRow = al->second;
+        std::map<std::string, BdReg>::const_iterator ar = g_reg.find(aliasRow);
+        aliasLive = (ar != g_reg.end() && ar->second.removed == 0 && ar->second.liveKey == pieceKey) ? 1 : 0;
+    }
+    const int h = coopbuild::BuildRemoveHeldByOther(key, pieceKey, rowAt, aliasRow, aliasLive);
+    if (h == coopbuild::kBuildRmHeldByKey) *holder = pieceKey;
+    else if (h == coopbuild::kBuildRmHeldByAlias) *holder = aliasRow;
+    return h;
+}
 const char* BdVerdictWord(int v)
 {
     switch (v)
@@ -1677,6 +1910,19 @@ float g_btIntoDx = 25.0f, g_btIntoDz = 25.0f;
 float g_btDx = 30.0f, g_btDz = 0.0f, g_btAmount = 0.0f;
 int g_btTownPlace = 0;   /* T-923 townpick: 1 = `place` - the piece is made with the teammate's town and handed; 2 = `hold`, 3 = `confirm` (review MED 1 / MED 2 legs) */
 int g_btCursorCommit = 0;   /* T-1240 cursor: 1 = `commit` - an allowed preview is placed (vt+0xC0) and handed to PlacementCommit */
+int g_btChain = 0;          /* T-1408 cursor `chain`: 1 = the spot and turn come from the named wall's end (always commits) */
+std::string g_btChainArg;   /* T-1408: the named wall's key part, or `last` */
+std::string g_btChainLast;  /* T-1408: the key of the first piece the last `buildtest cursor` commit placed (what `chain last` names) */
+/* T-1408 chain fix (F1216: `chain last` laid W2 back onto W1, W3 landed on W1's key): the line's first piece's position (its origin),
+   the positions (x, z) of every piece a `buildtest cursor` commit placed this launch, and the turn between the preview's yaw and the
+   heading the placed wall gets (T2535 B 294.837: preview yaw 0.0 -> the new wall's heading -180.0 - one reading, Inferred constant) */
+float g_btChainOrigin[3] = { 0.0f, 0.0f, 0.0f };
+int g_btChainOriginOk = 0;
+std::vector<float> g_btChainPlacedXZ;
+const float kBtChainYawOffset = 0.0f, kBtChainSpotTol = 1.0f;   /* chain fold (T2540): 0 - the 180 was read from a turn made BEFORE the move, which the placed wall did not keep (T2535 yaw 0 and T2540 yaw -180 both gave heading -180); the turn is now made after the move, and the wall's heading is its yaw (WallEndPoint: position + orientation * (0, 0, length)) */
+const size_t kBtChainPlacedCap = 512;
+int g_btCursorPreview = 0;   /* T-1428 TEST-ONLY cursor: 1 = `preview` - the preview made, moved and tested, then LEFT standing (list+0x30) for a later `commit` */
+void* g_btHeldPreview = 0; void* g_btHeldGd = 0; unsigned long g_btHeldAt = 0;   /* T-1428: the held preview, its record, GetTickCount when it was made */
 int g_btCanAbs = 0;   /* T-923 canbuild: 1 = g_btDx / g_btDz are a world x / z (`abs`), 0 = offsets from the first own character */
 float g_btHitCut = 0.0f, g_btHitBlunt = 0.0f;   /* T-904 `buildtest hit`: the two damage numbers (damage +0 / +4) */
 int g_btHitDoor = 0, g_btHitTimes = 1;          /* T-904 `buildtest hit`: 1 = hit the piece's first door; how many hits in one safe point */
@@ -1871,7 +2117,9 @@ int BdSetFactionPod(void* b, void* f)
    +0x88 / +0x90 list is setFaction'd; (8) each resident platoon finds a new home (Platoon 0x99D810(p, &hand)). The SAME engine
    functions run here with the sender's stand-in as the new owner. 0x7EB550 blanks the home itself when it equals the house (its
    tail), which is what step 1's blanking does. On the friend's replay of a purchase (BdBuyFx.tdWant) the purchase's room step and its
-   furniture teardown run too, after step 6 as the engine runs them (BdBuyTeardown). NOT REPEATED (counted fxStepsSkipped, 5 per
+   furniture teardown run too, after step 6 as the engine runs them (BdBuyTeardown). [T-1430: a purchase BuildPurchaseApplyHere says yes
+   to now runs 0x38A5E0, the town step and 0x4D2340 (BdBuyNodesPod / BdBuyTownStepPod / BdBuyWalkMap); fxStepsSkipped counts the two
+   still not run.] NOT REPEATED before T-1430 (counted fxStepsSkipped, 5 per
    purchase, named in the line): 0x38A5E0 on the global at 0x2133568 (location nodes - no var row, its effect not read); the town
    step 0x296900 / 0x928010; interior+0x30 vt+0x60; 0x4D2340; and the residents' AI orders 0x5D1640(c, 0, 0x16|0x13) - the call
    site sets all 7 of its arguments (the disassembly; the decompile shows 3) and the other four are not read here, so it is not
@@ -1904,6 +2152,9 @@ struct BdBuyFx
     int noOpen;             /* 1 = the doors are re-owned but not opened (the rebuild restore: the doors keep the state the area's load gave them) */
     int interiorTownOnly;   /* 1 = the interior step re-owns only pieces no player owns (BdOwnerIsPlayerSide); the rest are counted in interiorKept */
     unsigned interiorKept;
+    int tail;               /* T-1430: 1 = coopbuild::BuildPurchaseApplyHere said yes - the purchase's tail runs (BdBuyFxAfter) and BdOwnerRestore writes the one line */
+    const char* road;       /* T-1430: the road's word for that line */
+    int tlNodes, tlTown, tlWalk, tlWalkHeld;   /* T-1430: the tail's steps - 1 done, 0 nothing to do, 2 no town (town step), -1 faulted, -2 no address row / list */
 };
 int BdIsForSalePod(void* b)   /* Building::isForSale through the vtable (vt+0x2C0) - with the hook, this mod's answer: 1 / 0, -1 faulted */
 {
@@ -2406,6 +2657,53 @@ void BdBuyTeardown(void* b, BdBuyFx* fx)
     const int n2 = InteriorPieceIds(b, g_tdIds, kBdInteriorCap, &listed2, &trunc2, &torn2);
     for (int i = 0; i < n2; ++i) if (BdTdResolve(g_tdIds + (size_t)i * 5) != 0) ++fx->tdAlive;   /* entries still standing */
 }
+/* T-1430: THE PURCHASE'S TAIL (decomp_7acb20 :167, :180-204, :255), run by BdBuyFxAfter when fx->tail (coopbuild::BuildPurchaseApplyHere
+   said yes) in the engine's order. (a) after the furniture teardown, NodeList::destroyNodesByBuilding 0x38A5E0(*BuildingRegistryGlobal,
+   &house.handle, false) (decomp_38a5e0: the house's location nodes go through GameWorld::destroy 'NodeList::destroyNodesByBuilding');
+   (b) after the interior re-own, the town step: the house's town by the PURCHASE's own lookup 0x296900 (fold 2: decomp_7acb20 :180-197
+   climbs to the top parent - +0x238 parent's +0x90, else type 0xB vt+0x3D0, type 0 0x9F8050 - and asks 0x9F82B0 (hand +0x1D0 of type 0xD
+   ONLY, the object converted through vt+0x268; else the nearest town by position); 0x296900(house) runs exactly those steps from the
+   house. NOT BuildingGetTown 0xF6BE0 (coop::TownOfBuilding): it ends in 0x9F8230, which also accepts a hand of type 0x55 and returns the
+   object UNconverted - a different answer), its +0x3D0 byte set and 0x928010(town, house) (decomp_928010: the house's entries leave the
+   town's +0x500 list); (c) last, the house's
+   interior walking map 0x4D2340(list, house, 0) on the engine's deferred list (the T-1294 road, BdWalkMapPod). NOT RUN (named in the
+   line): interior+0x30 vt+0x60 (a virtual on an object of a class not identified - its effect unread) and the residents' AI orders
+   0x5D1640 (seven arguments, four unread). MAIN THREAD, every step guarded. */
+static unsigned long long kBdNodesByBldRva = 0;  static AddrReg kBdNodesByBldRva_reg("NodeListDestroyByBuilding", &kBdNodesByBldRva);   /* Steam_1.0.65 0x38A5E0 */
+static unsigned long long kBdTownForgetRva = 0;  static AddrReg kBdTownForgetRva_reg("TownForgetBuilding", &kBdTownForgetRva);         /* Steam_1.0.65 0x928010 */
+static unsigned long long kBdTownStrictRva = 0;  static AddrReg kBdTownStrictRva_reg("BuildingGetTownStrict", &kBdTownStrictRva);      /* Steam_1.0.65 0x296900 (1.0.68 0x296940) - the purchase's own town lookup */
+static unsigned long long kBdBldRegistryRva = 0; static AddrReg kBdBldRegistryRva_reg("BuildingRegistryGlobal", &kBdBldRegistryRva);   /* Steam_1.0.65 0x2133568 (var) - towngen.cpp binds the same row */
+const size_t kTownSaleDirty = 0x3D0;
+typedef void (*BdNodesByBldFn)(void* registry, void* handle, char all);
+typedef char (*BdTownForgetFn)(void* town, void* b);
+typedef void* (*BdTownStrictFn)(void* b);
+int BdBuyNodesPod(void* b)   /* (a): 1 run, 0 no registry yet, -2 no row, -1 faulted */
+{
+    if (kBdNodesByBldRva == 0 || kBdBldRegistryRva == 0) return -2;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    __try
+    {
+        void* const reg = *(void* const*)(base + (uintptr_t)kBdBldRegistryRva);
+        if (reg == 0) return 0;
+        ((BdNodesByBldFn)(base + (uintptr_t)kBdNodesByBldRva))(reg, (char*)b + kRootHandle, 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdBuyTownStepPod(void* b)   /* (b): 1 the town forgot the house, 0 the town held no entry for it, 2 no town, -2 no row, -1 faulted */
+{
+    if (kBdTownForgetRva == 0 || kBdTownStrictRva == 0) return -2;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    __try
+    {
+        void* const t = ((BdTownStrictFn)(base + (uintptr_t)kBdTownStrictRva))(b);   /* 0x296900(house): the engine purchase's town */
+        if (t == 0) return 2;
+        *((unsigned char*)t + kTownSaleDirty) = 1;
+        return ((BdTownForgetFn)(base + (uintptr_t)kBdTownForgetRva))(t, b) != 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdBuyWalkMap(void* b, int* held);   /* (c), defined with the walking-map road below */
 void BdBuyFxBefore(void* b, void* o, BdBuyFx* fx)   /* steps 1 - 2, before the owner write */
 {
     if (fx->tdWant != 0) BdTdOwnerSnap(b, fx);   /* the furniture's owners before the write re-owns the interior (the teardown's owner step) */
@@ -2418,8 +2716,66 @@ void BdBuyFxAfter(void* b, void* want, BdBuyFx* fx)   /* steps 4 - 8, after it *
     fx->squad = BdBuySquadClearPod(b);
     fx->doors = BdBuyDoorsPod(b, want, fx);
     if (fx->tdWant != 0) { BdBuyTeardown(b, fx); fx->td = 1; }   /* the purchase's room step and furniture teardown, after the doors as the engine runs them */
+    if (fx->tail != 0) fx->tlNodes = BdBuyNodesPod(b);   /* T-1430 (a) */
     fx->interior = BdBuyInteriorPod(b, want, fx);
+    if (fx->tail != 0) fx->tlTown = BdBuyTownStepPod(b);   /* T-1430 (b) */
     fx->homes = (fx->res == 1) ? BdBuyNewHomesPod(fx) : 0;
+    if (fx->tail != 0) fx->tlWalk = BdBuyWalkMap(b, &fx->tlWalkHeld);   /* T-1430 (c) */
+}
+/* T-1430: the one line and the counters of a purchase applied here (BdOwnerRestore, fx->tail) - any road */
+long long g_phApplied = 0, g_phFaulted = 0, g_phAdopt = 0, g_phCopyList = 0, g_phRebuild = 0, g_phOwn = 0, g_phKeptBack = 0, g_phTeardown = 0, g_phDoorsOpened = 0,
+          g_phNodes = 0, g_phTown = 0, g_phTownForgot = 0, g_phWalk = 0, g_phStepFaults = 0, g_phLines = 0;
+const long long kPhLineCap = 40;
+std::string BdPurchaseHereReportText()
+{
+    char b[340];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, " purchaseHere[applied,faulted,placeAdopt,copyList,rebuild,ownRestore,keptHandBack,teardown,doorsOpened,nodes,town,townForgot,walkMap,stepFaults]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                g_phApplied, g_phFaulted, g_phAdopt, g_phCopyList, g_phRebuild, g_phOwn, g_phKeptBack, g_phTeardown, g_phDoorsOpened, g_phNodes, g_phTown, g_phTownForgot, g_phWalk, g_phStepFaults);
+    return std::string(b);
+}
+std::string BdFactionName(void* f);   /* below (T-1430's line) */
+const char* BdTlWord(int r) { return r == 1 ? "done" : (r == 0 ? "nothing" : (r == 2 ? "no town" : (r == -2 ? "NO ROW / LIST" : "FAULTED"))); }
+void BdPurchaseNote(void* want, const BdBuyFx* fx, int wrote)
+{
+    const char* const road = (fx->road != 0) ? fx->road : "?";
+    if (wrote < 0) ++g_phFaulted;
+    else
+    {
+        ++g_phApplied;
+        if (std::strcmp(road, "place-adopt") == 0) ++g_phAdopt; else if (std::strcmp(road, "copy-list adopt") == 0) ++g_phCopyList;
+        else if (std::strcmp(road, "rebuild restore") == 0) ++g_phRebuild; else if (std::strcmp(road, "kept hand-back") == 0) ++g_phKeptBack; else ++g_phOwn;
+        if (fx->td != 0) ++g_phTeardown;
+        g_phDoorsOpened += fx->doorsOpened;
+        if (fx->tlNodes == 1) ++g_phNodes;
+        if (fx->tlTown == 1 || fx->tlTown == 0) ++g_phTown;
+        if (fx->tlTown == 1) ++g_phTownForgot;
+        if (fx->tlWalk == 1) ++g_phWalk;
+        if (fx->tlNodes < 0 || fx->tlTown < 0 || fx->tlWalk < 0 || fx->doors < 0 || fx->interior < 0 || fx->tdFaults != 0) ++g_phStepFaults;
+    }
+    if (g_phLines >= kPhLineCap) return;
+    ++g_phLines;
+    char line[900];
+    if (wrote < 0)
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1430 purchase applied here key=%.63s road=%s: the owner write FAULTED - nothing after it ran; purchaseHereFaulted=%lld",
+                    fx->tdKey != 0 ? fx->tdKey : "-", road, g_phFaulted);
+    else
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1430 purchase applied here key=%.63s road=%s owner -> '%.60s' (the shared record names a player; the engine said for sale here):"
+                    " residents=%d (%u platoons, %u new homes) townList out=%d in=%d teardown=%d (removed %u kept %u faults %u) doors %u re-owned / %u open (%d)"
+                    " interior=%u (%d) locationNodes=%s townStep=%s walkMap=%s%s; not run: interior+0x30 vt+0x60, residents' AI orders 0x5D1640; purchaseHereApplied=%lld",
+                    fx->tdKey != 0 ? fx->tdKey : "-", road, BdFactionName(want).c_str(), fx->res, fx->resN, fx->newHomes, fx->townOut, fx->townIn,
+                    fx->td, fx->tdRemoved, fx->tdKeptPlayer + fx->tdKeptEngine + fx->tdKeptNoKey, fx->tdFaults, fx->doorsN, fx->doorsOpened, fx->doors,
+                    fx->interiorN, fx->interior, BdTlWord(fx->tlNodes), BdTlWord(fx->tlTown), BdTlWord(fx->tlWalk),
+                    fx->tlWalkHeld != 0 ? " (build mode: the list waits)" : "", g_phApplied);
+    DebugLog(std::string(line));
+}
+/* T-1430 fold 2: THE ONE PLACE a road's BdBuyFx takes the decision's plan (coopbuild::BuildPurchaseHerePlanOf) - the teardown, the doors
+   opened, the interior re-own of no player's pieces only, the tail and the road's word for the line - so every road runs the same */
+void BdPurchaseFxOf(BdBuyFx* fx, const coopbuild::BuildPurchaseHerePlan& php, const char* road, const char* key)
+{
+    fx->tdWant = php.teardown; fx->tdKey = key;
+    fx->noOpen = (php.openDoors != 0) ? 0 : 1;
+    fx->interiorTownOnly = php.interiorTownOnly;
+    fx->tail = php.tail; fx->road = road;
 }
 /* MAIN THREAD: the owner write the mod makes on a piece whose owner here is not the one a PLACE, a kept row or a copy row names - for
    a house for sale with the purchase's world side around it (BdBuyFxBefore -> setFaction -> BdBuyFxAfter: the residents, the town
@@ -2429,8 +2785,9 @@ int BdOwnerRestore(void* live, void* o, void* want, int sale, BdBuyFx* fx)
 {
     if (o == want) return 0;
     if (sale != 0) BdBuyFxBefore(live, o, fx);
-    if (BdSetFactionPod(live, want) == 0) return -1;
+    if (BdSetFactionPod(live, want) == 0) { if (sale != 0 && fx->tail != 0) BdPurchaseNote(want, fx, -1); return -1; }
     if (sale != 0) BdBuyFxAfter(live, want, fx);
+    if (sale != 0 && fx->tail != 0) BdPurchaseNote(want, fx, 1);   /* T-1430: one line per purchase applied here, every road */
     return 1;
 }
 int BdMiningPod(void* b)
@@ -2445,7 +2802,7 @@ int BdProgressPod(void* b, float amount)
 }
 /* T-1294 design A: defined below with the piece check, in this same unnamed namespace */
 std::string BdWalkMapReportText();
-int BdWalkMapNote(void* b, int event, const char* key);
+int BdWalkMapNote(void* b, int event, const char* key, int road = 0, long waitedMs = -1, int force = 0);   /* T-1428: road = the event a re-ask answers, waitedMs = how long its box waited; fold 1: force = the wait timed out (coopbuild::BuildWalkMapBoxDue) - asks with the box it has, or without one */
 int BdWalkMapSolidNow(void* b);
 int BdCompleteNowPod(void* b);
 const char* BdCompleteNowWord();
@@ -2454,6 +2811,8 @@ int BdWalkMapSolidAt(void* b, float progress, float needed);   /* T-1294 fold 3:
 void BdWalkMapHeldTick();
 void BdBodyWaitClear();       /* T-1294 fold 2 (M2): the pieces waiting for their physics body, below BdWalkMapSolidNow */
 void BdBodyArrivedTick();     /* T-1294 fold 2 (M2): MAIN THREAD, defined beside BdSelfScope */
+void BdZoneRebuildTick();     /* T-1428 attempt 2: MAIN THREAD, beside BdBoxWaitAdd */
+void BdZoneRebuildNote(void* b, const char* key, int road);   /* T-1428 attempt 2: road 1 restored, 2 a re-make, 4 a kept row */
 /* P15: the engine's own setDestroyed (vt+0x340 -> 0x5567F0) through the vtable, so the hook (detour_destroy) sees it like any call */
 int BdDestroyPod(void* b, bool v)
 {
@@ -2543,10 +2902,17 @@ int BdConfirmDismantleCallPod(void* b)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* T-1372 review fold (F1): the panel's own dismantle is a removal scope, as the Level Editor's delete is - every flag-0 destroy of an
+   own building inside it on this thread (the interior's pieces, reason '_destroyAllInternalBuildings'; the mounted ones) marks its
+   row removed and sends its REMOVE (detour_destroy's note reads the depth with its thread). */
+volatile LONG g_panelDepth = 0, g_panelTid = 0;
 int BdConfirmDismantlePod(void* b)
 {
     if (kBdConfirmDismantleRva == 0 || b == 0) return 0;
-    const int ok = BdConfirmDismantleCallPod(b);
+    if (::InterlockedCompareExchange(&g_panelDepth, 0, 0) == 0) ::InterlockedExchange(&g_panelTid, (LONG)::GetCurrentThreadId());
+    ::InterlockedIncrement(&g_panelDepth);
+    const int ok = BdConfirmDismantleCallPod(b);   /* faults are caught inside: the depth always comes down */
+    ::InterlockedDecrement(&g_panelDepth);
     BdGoneIfDismantled(b, ok);   /* T-609 (H4), fold 1 (F4): as BdDismantlePod. Its MOUNTED pieces (handed to GameWorld::destroy inside
                                     0x54F410) are not dropped: this project has no reader of a building's mounted list (0x54AF40 only
                                     counts them) and GameWorld::destroy is not hooked, so they leave at the next drain's fresh walk -
@@ -2615,10 +2981,74 @@ int BdWallRepairHeld(void* b)
 }
 /* coopbuild::BuildWallHelpKind of the live piece: not a wall, a wall holding its own progress record, or any other wall (a group's
    record, or unreadable) - the build / materials help rules' wall input. ANY THREAD: the guarded reads BdIsWall and BdWallOwnRecord make */
+/* T-1408 (F1216 design read): the lead of b's wall group (b's record less kWallOwnRecord: the wall whose own record IS the group's) is b
+   itself or a wall of the same owner as b, and not a ruin. ANY THREAD: guarded POD reads, RTTI and pointer compares */
+/* T-1408 fold 1 (review 2): every listed entry of the lead's group that resolves here (the walk BdWallGroupPod / the engine's wall step
+   0x5594A0 make: +0x390 count, +0x398 entries of 0x20 - kWallGroupCount / kWallGroupArr / kWallGroupStride - resolved by 0x9F8050 on the
+   handle table 0x2132F50) read for its owner: *other = how many have an owner other than fo. 1 = the walk read, 0 = a fault or no address.
+   ANY THREAD: the engine's own wall step runs this resolve on the thread that steps the wall (the AI worker too - Inferred) */
+int BdWallMembersOwnerPod(void* lead, void* fo, int* other)
+{
+    typedef void* (*ResFn)(void* table, const void* handle);
+    const size_t kArr = 0x398, kStride = 0x20;
+    *other = 0;
+    const unsigned long long rRes = Rva("CraftSelectedBuilding"), rTab = Rva("CraftSelectionGlobal");
+    if (rRes == 0 || rTab == 0) return 0;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    __try
+    {
+        const unsigned int n = *(const unsigned int*)((const char*)lead + kWallGroupCount);
+        const char* arr = *(const char* const*)((const char*)lead + kArr);
+        if (n > 100000u || (n > 0 && arr == 0)) return 0;
+        for (unsigned int i = 0; i < n; ++i)
+        {
+            const char* e = arr + (size_t)i * kStride;
+            if (*(const int*)(e + 8) != 0) continue;
+            void* q = ((ResFn)(base + (uintptr_t)rRes))((void*)(base + (uintptr_t)rTab), e);
+            if (q == 0 || q == lead) continue;
+            if (BdOwnerPod(q) != fo) ++*other;
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1408 fold 1 (review 2): ... and every loaded member of that group has the same owner too (coopbuild::BuildWallGroupOneOwner) - the
+   helper's verdict (BdWallHelpKind) and the owner's apply (BdWallGroupWholePod, BdApplyHelp) both ask it */
+int BdWallLeadSameOwner(void* b)
+{
+    const uintptr_t rec = BdWallRecordPod(b);
+    if (rec == 0 || rec < (uintptr_t)kWallOwnRecord) return 0;
+    void* lead = (void*)(rec - kWallOwnRecord);
+    if (lead != b && BdIsWall(lead) != 1) return 0;
+    void* fo = BdOwnerPod(b);
+    if (fo == 0 || BdOwnerPod(lead) != fo) return 0;
+    int ruin = 1;
+    __try { ruin = (*((const unsigned char*)lead + kBDestroyed) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (ruin != 0) return 0;
+    int other = 0;
+    const int read = BdWallMembersOwnerPod(lead, fo, &other);
+    return coopbuild::BuildWallGroupOneOwner(1, read, other);
+}
+/* T-1408: a grouped wall whose group is its owner's alone answers kBuildWallKindGroupOwner (coopbuild::BuildWallHelpKindG) */
 int BdWallHelpKind(void* b)
 {
     const int wall = BdIsWall(b);
-    return coopbuild::BuildWallHelpKind(wall, wall != 0 ? BdWallOwnRecord(b) : -1);
+    const int own = (wall != 0) ? BdWallOwnRecord(b) : -1;
+    int same = 0, ruin = 0;
+    if (wall != 0 && own == 0)
+    {
+        same = BdWallLeadSameOwner(b);
+        __try { ruin = (*((const unsigned char*)b + kBDestroyed) != 0) ? 1 : 0; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ruin = 1; }
+    }
+    return coopbuild::BuildWallHelpKindG(wall, own, same, ruin);
+}
+/* T-1408: b is its group's lead (its record is its own +0x160 and it lists a group). ANY THREAD, POD */
+int BdWallIsLead(void* b)
+{
+    const uintptr_t rec = BdWallRecordPod(b);
+    return (rec != 0 && rec == (uintptr_t)b + kWallOwnRecord && BdWallGroupCountPod(b) > 0) ? 1 : 0;
 }
 /* coopbuild::BuildRepairHelpVerdict's wall input: not a wall, a wall holding its own progress record, or any other wall (a group's
    record, or unreadable). ANY THREAD: the guarded reads BdIsWall and BdWallOwnRecord make; on the main thread a wall copy whose repair
@@ -2996,10 +3426,25 @@ void BdRotateInv(const float* q, const float* v, float* out)
     out[2] = v[2] + 2.0f * (w * uz + uuz);
 }
 
+/* T-1401 (owner 1735 a): each kind of [BUILD] line its own cap, and each piece's hit lines theirs (BdLogHit), so hits cannot spend
+   the other lines' budget and the other lines cannot spend the hits'. MAIN THREAD (both tables). */
+swkeycap::Cap g_bdKindCap((unsigned int)kLineCap, 256);
+swkeycap::Cap g_bdHitCap((unsigned int)kHitLinesPerPiece, 4096);
+long long g_hitLinesAlways = 0;   /* failed / dropped / lost hit lines, written whatever the cap */
+void BdKindSummaryLine(const swkeycap::Summary& s)
+{
+    char t[400];
+    _snprintf_s(t, sizeof(t), _TRUNCATE, "[BUILD] lines '%s': %u more in the last %u s were not written (each kind of [BUILD] line writes its first %d in full, then this count at most once a minute)",
+                s.key.c_str(), s.held, s.spanMs / 1000u, kLineCap);
+    DebugLog(std::string(t));
+}
 void BdLogCapped(const char* line)
 {
-    if (g_lines < kLineCap) { ++g_lines; DebugLog(std::string(line)); }
-    else ++g_linesSuppressed;
+    swkeycap::Summary s;
+    const int v = swkeycap::Judge(&g_bdKindCap, swkeycap::LineKind(line), ::GetTickCount(), std::string(), &s);
+    if (v == swkeycap::kWrite) { ++g_lines; DebugLog(std::string(line)); return; }
+    ++g_linesSuppressed;
+    if (v == swkeycap::kSummaryDue) BdKindSummaryLine(s);
 }
 void BdLogProg(const char* line)
 {
@@ -3010,6 +3455,24 @@ void BdLogState(const char* line)   /* build1-c: its own cap, so the engine's ow
 {
     if (g_stateLines < kStateLineCap) { ++g_stateLines; DebugLog(std::string(line)); }
     else ++g_stateSuppressed;
+}
+/* T-1408 fold 10 (F1331 4): the wall group's step, group-turn and writer lines have their own cap - under BdLogProg's 20 they were cut by
+   148 s (T2576) though the steps ran */
+const long long kGroupLineCap = 80;
+long long g_grpLines = 0, g_grpSuppressed = 0;
+void BdLogGroup(const char* line)
+{
+    if (g_grpLines < kGroupLineCap) { ++g_grpLines; DebugLog(std::string(line)); }
+    else ++g_grpSuppressed;
+}
+/* T-1408 fold 10 (F1331 1c): ONE rule for every writer of a piece's progress - its row before a STATE / record note (BdMaybeSendState),
+   the record and pp.build bytes (BdOwnRowMsgs), the area holder's writes (PieceRecHolderNote): kept within 0..needed */
+float BdProgressKeep(float p, float n)
+{
+    int c = 0;
+    const float v = coopbuild::BuildProgressKept(p, n, &c);
+    if (c != 0) ++g_progKeptClamped;
+    return v;
 }
 /* build1-c: a difference in any delivered amount (a missing slot reads as 0) */
 int BdMatsDiffer(int na, const float* a, int nb, const float* b)
@@ -3025,11 +3488,13 @@ int BdMatsDiffer(int na, const float* a, int nb, const float* b)
 
 // PROBE-START: P082
 // ANY THREAD, no allocation: one POD record into the queue BuildTick drains.
-void BdQueueEvent(int kind, void* b, float amount, int onMain, int dismBefore, int harvest = 0, float amount2 = 0.0f, int door = -1)
+void BdEventFill(BdEvent& e, int kind, void* b, float amount, int onMain, int dismBefore, int harvest, float amount2, int door, const char* why)
 {
-    BdEvent e;
     std::memset(&e, 0, sizeof e);
+    e.atk = BdAtk();   /* T-1381 */
     e.kind = kind;
+    e.recApply = (onMain != 0 && g_gsRecApply > 0) ? 1 : 0;   /* T-1408 fold 7 */
+    if (why != 0) { for (int i = 0; i < (int)sizeof(e.why) - 1 && why[i] != 0; ++i) e.why[i] = why[i]; }   /* T-1372: a copy the caller made */
     e.door = door;
     e.amount2 = amount2;
     e.harvest = harvest;
@@ -3043,12 +3508,24 @@ void BdQueueEvent(int kind, void* b, float amount, int onMain, int dismBefore, i
     e.broken = (e.stateOk != 0) ? BdBrokenRead(b) : 0;   /* the piece's broken flag, carried by its STATE */
     int matTotal = -1;
     e.nMats = BdReadMats(b, e.mats, (int)coopbuild::kBuildMaxMats, &matTotal);   /* build1-c */
-    if (::InterlockedCompareExchange(&g_qInit, 0, 0) == 0) { ::InterlockedIncrement64(&g_queueDropped); return; }
+}
+/* ANY THREAD: the lock covers the record's copy into the queue only. 1 = queued, 0 = dropped (counted) */
+int BdQueuePush(const BdEvent& e)
+{
+    if (::InterlockedCompareExchange(&g_qInit, 0, 0) == 0) { ::InterlockedIncrement64(&g_queueDropped); return 0; }
     ::EnterCriticalSection(&g_qcs);
     const int ok = (g_qn < kQueueCap) ? 1 : 0;
     if (ok) g_q[g_qn++] = e;
     ::LeaveCriticalSection(&g_qcs);
     ::InterlockedIncrement64(ok ? &g_queued : &g_queueDropped);
+    return ok;
+}
+void BdQueueEvent(int kind, void* b, float amount, int onMain, int dismBefore, int harvest = 0, float amount2 = 0.0f, int door = -1, const char* why = 0, const BdAtk* atk = 0)
+{
+    BdEvent e;
+    BdEventFill(e, kind, b, amount, onMain, dismBefore, harvest, amount2, door, why);
+    if (atk != 0) e.atk = *atk;   /* T-1381: who swung a hit (5) */
+    BdQueuePush(e);
 }
 // PROBE-END: P082
 
@@ -3185,19 +3662,118 @@ void BdHelpOldJoin(std::map<BdPlKey, BdHelpRow>& into, const std::string& key, c
 struct BdHelpSidLine { std::string key; int i; std::string sid; unsigned int nonce; };   /* help1 fold 3: an owed file S line, placed once every row is read */
 /* a copy's baseline: its delivered amounts now (as made, or after the mod's own write) */
 /* a copy's baseline set to the amounts given (n slots; the rest 0) */
-void BdHelpBaseSet(BdReg& r, const float* m, int n)
+/* T-1408 fold 14 (F1429), MAIN THREAD: the row that holds the help baseline of piece b (row r) - the row of the piece whose materials
+   record b reads (coopbuild::BuildHelpBaseHolder): r itself, or for a grouped wall member its lead's row (0 = none: the record does not
+   read, or the lead has no live row here). *recOut = the record's address (0 unread). A member's own baseline is dropped the moment it is
+   seen reading another record: if it leaves the group, its own record starts with none (set by the mod's next write). */
+std::map<std::string, BdReg>::iterator BdLeadRowOf(void* lead)   /* the live row of wall piece lead (g_reg.end() = none) */
 {
-    for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i) r.helpBase[i] = (i < n) ? m[i] : 0.0f;
-    r.helpBaseOk = 1;
+    if (lead == 0 || BdIsWall(lead) != 1) return g_reg.end();
+    char lk[kKeyCap];
+    lk[0] = 0;
+    if (ObjectPositionKey(lead, lk, kKeyCap, "", 3, 0) == 0 || lk[0] == 0) return g_reg.end();
+    std::map<std::string, BdReg>::iterator it = BdRowByLiveKey(std::string(lk));
+    return (it != g_reg.end() && it->second.removed == 0) ? it : g_reg.end();
+}
+/* T-1408 fold 14d (review 6), ANY THREAD: a wall record's join generation - bumped on every join the mod performs (BdWallJoinOne) or
+   lets the engine run (detour_wallJoinArea, BdWallEngineJoinPod), on the record the wall reads after it; it only rises */
+std::map<uintptr_t, unsigned int> g_recGen;
+volatile LONG g_recGenLock = 0;
+void BdRecGenBump(uintptr_t rec)
+{
+    if (rec == 0) return;
+    while (::InterlockedCompareExchange(&g_recGenLock, 1, 0) != 0) YieldProcessor();
+    ++g_recGen[rec];
+    ::InterlockedExchange(&g_recGenLock, 0);
+}
+unsigned int BdRecGenOf(uintptr_t rec)
+{
+    unsigned int g = 0;
+    while (::InterlockedCompareExchange(&g_recGenLock, 1, 0) != 0) YieldProcessor();
+    std::map<uintptr_t, unsigned int>::const_iterator it = g_recGen.find(rec);
+    if (it != g_recGen.end()) g = it->second;
+    ::InterlockedExchange(&g_recGenLock, 0);
+    return g;
+}
+int BdHelpRecCount(void* b, uintptr_t rec)   /* fold 14b (review 5): the group count of the wall holding record rec (0: not a wall) */
+{
+    if (b == 0 || rec < (uintptr_t)kWallOwnRecord || BdIsWall(b) != 1) return 0;
+    return BdWallGroupCountPod((void*)(rec - kWallOwnRecord));
+}
+BdReg* BdHelpBaseHolder(BdReg& r, void* b, unsigned long long* recOut)
+{
+    const uintptr_t rec = (b != 0) ? BdWallRecordPod(b) : 0;
+    if (recOut != 0) *recOut = (unsigned long long)rec;
+    const int k = coopbuild::BuildHelpBaseHolder((b != 0 && BdIsWall(b) == 1) ? 1 : 0, (unsigned long long)(uintptr_t)b, (unsigned long long)rec, (unsigned long long)kWallOwnRecord);
+    if (k == coopbuild::kBuildBaseOwn) return &r;
+    r.helpBaseOk = 0;
+    if (k != coopbuild::kBuildBaseLead) return 0;
+    std::map<std::string, BdReg>::iterator it = BdLeadRowOf((void*)(rec - kWallOwnRecord));
+    return (it != g_reg.end()) ? &it->second : 0;
+}
+/* a copy's baseline set to the amounts given (n slots; the rest 0), read from piece b's record - on the row that holds it */
+void BdHelpBaseSet(BdReg& r, void* b, const float* m, int n)
+{
+    unsigned long long rec = 0;
+    BdReg* h = BdHelpBaseHolder(r, b, &rec);
+    if (h == 0) return;
+    for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i) h->helpBase[i] = (i < n) ? m[i] : 0.0f;
+    h->helpBaseOk = 1;
+    h->helpBaseRec = rec;
+    h->helpBaseCnt = BdHelpRecCount(b, (uintptr_t)rec);
+    h->helpBaseGen = BdRecGenOf((uintptr_t)rec);
 }
 void BdHelpBaseRead(BdReg& r, void* b)
 {
     float m[coopbuild::kBuildMaxMats];
     int tot = -1;
     const int n = BdReadMats(b, m, (int)coopbuild::kBuildMaxMats, &tot);
-    if (n < 0) { r.helpBaseOk = 0; return; }
-    BdHelpBaseSet(r, m, n);
+    if (n < 0) { BdReg* h = BdHelpBaseHolder(r, b, 0); if (h != 0) h->helpBaseOk = 0; return; }
+    BdHelpBaseSet(r, b, m, n);
 }
+/* T-1408 fold 14 (F1429), MAIN THREAD: wall b joined lead L's group by the mod (0x29A850) - b's own record's baseline no longer measures
+   anything (a later leave starts it with none), and the lead's record, which the join may have changed, is the mod's write: its baseline
+   is read again on the lead's row */
+/* fold 14c (review 2): never a live re-read - the join's own change (before / after, read around 0x29A850) is carried into the lead's
+   baseline (coopbuild::BuildHelpBaseCarry), so a delivery not yet measured stays a delivery; no usable baseline before: left unusable */
+void BdHelpBaseJoined(void* b, void* L, int usableBefore, const float* before, int nBefore)
+{
+    std::map<std::string, BdReg>::iterator mr = BdLeadRowOf(b);
+    if (mr != g_reg.end()) mr->second.helpBaseOk = 0;
+    std::map<std::string, BdReg>::iterator lr = BdLeadRowOf(L);
+    if (lr == g_reg.end() || lr->second.via != 3) return;
+    float after[coopbuild::kBuildMaxMats], out[coopbuild::kBuildMaxMats];
+    int tot = -1;
+    const int nAfter = BdReadMats(L, after, (int)coopbuild::kBuildMaxMats, &tot);
+    if (coopbuild::BuildHelpBaseCarry(usableBefore, lr->second.helpBase, before, nBefore, after, nAfter, out) != 0) BdHelpBaseSet(lr->second, L, out, nAfter);
+    else lr->second.helpBaseOk = 0;
+}
+/* the baseline piece b's deliveries are measured against: its holder's, when held for the record b reads now (0 = none usable) */
+const BdReg* BdHelpBaseOf(BdReg& r, void* b)
+{
+    unsigned long long rec = 0;
+    const BdReg* h = BdHelpBaseHolder(r, b, &rec);
+    return (h != 0 && coopbuild::BuildHelpBaseUsable(h->helpBaseOk, h->helpBaseRec, rec, h->helpBaseCnt, BdHelpRecCount(b, (uintptr_t)rec), h->helpBaseGen, BdRecGenOf((uintptr_t)rec)) != 0) ? h : 0;
+}
+void BdHelpHarvestRecord(const std::string& key, BdReg* r, void* b, const char* why, std::string* measuredKey);   /* fold 14c: below, with the harvest */
+/* fold 14b (review BLOCKER 1), MAIN THREAD: the baseline read again from key's live piece (a mod write landed; no piece: untouched) */
+void BdHelpBaseFollowKey(const std::string& key)
+{
+    std::map<std::string, BdReg>::iterator row = g_reg.find(key);
+    if (row == g_reg.end() || row->second.removed != 0) return;
+    int fv = 0;
+    void* p = BdFindPiece(key, row->second, &fv);
+    if (p != 0) BdHelpBaseRead(row->second, p);
+}
+/* ... at the end of an owner's STATE apply, whatever road it leaves by (an applied STATE, a complete kept for a retry, a fault after a
+   partial write, a ruin road): armed by each materials write, so no early return leaves a written record's baseline behind */
+struct BdHelpBaseFollowScope
+{
+    std::string key;
+    int armed;
+    BdHelpBaseFollowScope() : armed(0) {}
+    ~BdHelpBaseFollowScope() { if (armed != 0) BdHelpBaseFollowKey(key); }
+};
 void BdHelpMsgOf(const std::string& key, const coopbuild::BuildHelpEntry& e, coopbuild::BuildMsg* m)
 {
     m->kind = coopbuild::kBuildHelpWork; m->key = key; m->seq = e.seq; m->progress = e.dP; m->reset = e.reset;
@@ -3559,6 +4135,22 @@ void BdHelpRecordWork(const std::string& key, const BdReg& r, void* b, float dP,
     }
     h.pos[0] = r.pos[0]; h.pos[1] = r.pos[1]; h.pos[2] = r.pos[2]; h.posOk = 1;
 }
+const char* BdWallKeepWord(int why)   /* T-1408 fold 10 (F1331 3): coopbuild::BuildWallKeepWhy in words */
+{
+    if (why == coopbuild::kBuildWallKeepNoWork) return "the work carried no build progress (materials, or a rebuild's reset alone)";
+    if (why == coopbuild::kBuildWallKeepRuin) return "the wall is a ruin here";
+    if (why == coopbuild::kBuildWallKeepWriter) return "this game writes the copy for its absent owner - only the owner's game resolves its group";
+    if (why == coopbuild::kBuildWallKeepNotWhole) return "its group is not wholly loaded here or not this player's alone";
+    if (why == coopbuild::kBuildWallKeepNeedUnread) return "its needed could not be read";
+    return "-";
+}
+/* T-1408 fold 10 (F1331 3), MAIN THREAD: the ruin a helper's step works on (set in detour_progress before the engine's call) and the
+   progress its rebuild left - read in detour_destroy at that piece's own setDestroyed(0) inside the call (the engine's ruin reset) */
+void* g_rbPiece = 0;
+float g_rbP = 0.0f;
+int g_rbRead = 0;
+uintptr_t g_rbRec = 0;   /* T-1408 fold 11 (F1343 SHOULD 2): g_rbPiece's wall record - a member's step the engine forwards to its lead resets the lead */
+long long g_helpRebuildUnread = 0;   /* T-1408 fold 11: a helper's rebuild whose value was not caught (its work past the rebuild goes as 0) */
 /* help1, MAIN THREAD, from detour_progress right after the engine's call on a copy (the owner's stand-in holds it; not the mod's own
    write). p0 / n0 / m0 were read before the call; needed was raised for it (not on a ruin). */
 void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0, int repair)   /* T-903: repair = a complete damaged copy */
@@ -3605,16 +4197,27 @@ void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0
     int tot = -1;
     const int m1n = BdReadMats(b, m1, (int)coopbuild::kBuildMaxMats, &tot);
     const int reset = (ruin != 0 && x1 == 0) ? 1 : 0;   /* the engine rebuilt a ruin (part-built, mats scaled) - the owner runs the same reset */
-    float dP = (reset != 0) ? 0.0f : p1 - p0;
+    float dP = (reset != 0) ? coopbuild::BuildHelpRebuildExtra(p1, (g_rbPiece == b) ? g_rbRead : 0, g_rbP) : p1 - p0;   /* T-1408 fold 10 (F1331 3): the work past the rebuild - the owner runs the same rebuild, then applies it */
+    if (reset != 0 && dP > 0.0f) ++g_helpRebuildExtra;
+    if (reset != 0 && !(g_rbPiece == b && g_rbRead != 0))
+    {   /* T-1408 fold 11 (F1343 SHOULD 2): the rebuild's value was not caught at a setDestroyed(0) on this wall's record on the main
+           thread - the work past the rebuild goes as 0 (the owner keeps the materials only; never doubled) */
+        ++g_helpRebuildUnread;
+        char ul[300];
+        _snprintf_s(ul, sizeof(ul), _TRUNCATE, "[BUILD] T-1408 fold 11 help rebuild key=%s: the rebuild's value was not read (no setDestroyed(0) on its record caught here) - the work past it (to %.2f) goes as 0; helpRebuildUnread=%lld",
+                    keyOk != 0 ? k : "?", p1, g_helpRebuildUnread);
+        BdLogHelp(ul);
+    }
     if (!(dP > 0.0f)) dP = 0.0f;
     float dm[coopbuild::kBuildMaxMats];
     int nd = 0, any = (dP > 0.0f || reset != 0) ? 1 : 0;
     if (m1n > 0 && reset == 0)
     {
-        if (coopbuild::BuildHelpMatGain(m1, m1n, r.helpBaseOk, r.helpBase, m0n, m0, dm) != 0) any = 1;
+        const BdReg* hb = BdHelpBaseOf(r, b);   /* T-1408 fold 14 (F1429): the baseline of the record this step changed (a member's: its lead's) */
+        if (coopbuild::BuildHelpMatGain(m1, m1n, hb != 0 ? 1 : 0, hb != 0 ? hb->helpBase : r.helpBase, m0n, m0, dm) != 0) any = 1;
         nd = m1n;
     }
-    if (m1n >= 0) BdHelpBaseSet(r, m1, m1n);
+    if (m1n >= 0) BdHelpBaseSet(r, b, m1, m1n);
     if (any == 0) return;
     if (repair != 0)   /* T-903: repair on a complete damaged copy - the health it restored goes to the owner's game as help work */
     {
@@ -3815,12 +4418,117 @@ int BdHelpRefuse(int t, ::Faction* owner, const char* key, const char* road)
     BdLogHelp(line);
     return 2;
 }
+/* T-1408 fold 2: HELP_HELD. THE HOLDING GAME (the owner's with its group not wholly loaded, or the copy's T-23 writer) tells the helpers
+   its grouped-wall help work is held (why kBuildHeld*), and released once applied or dropped - sent to the helper's game (the work's
+   sender) only. Not sent (link down): sent again at the entry's next judgement. 1 = sent */
+int BdSendHelpHeld(const std::string& key, int why, int slot)
+{
+    coopbuild::BuildMsg h;
+    h.kind = coopbuild::kBuildHelpHeld; h.key = key; h.reason = (unsigned char)why;
+    const bool sent = slot >= 0 && coopbuild::BuildEncodable(h) && net::SendBuildToSlot(h, slot);
+    if (sent) { if (why == (int)coopbuild::kBuildHeldReleased) ++g_wallHeldReleaseSent; else ++g_wallHeldSent; }
+    return sent ? 1 : 0;
+}
+/* T-1408 fold 2, THE HELPER'S GAME: the grouped wall keys (this game's lead copies - the work's key) whose help work a holding game said
+   it keeps HELD. MAIN THREAD rows; their leads mirrored under g_whLock for the any-thread roads (the job road, the job finder, the
+   off-main order road). A held group's step is refused (its job ends on fold 1's road, its standing job is removed) and no new job or
+   order is given on it, until released or the holding game is known away. */
+struct BdWhRow { std::string key; int slot; int why; };
+std::vector<BdWhRow> g_wh;
+const int kWhCap = 32;
+void* g_whLead[kWhCap];
+int g_whLeadN = 0;
+volatile LONG g_whLock = 0;
+void* BdWallLeadOf(void* b)   /* the piece whose record b uses (a member's lead; a piece holding its own record: itself) */
+{
+    const uintptr_t rec = BdWallRecordPod(b);
+    return (rec >= (uintptr_t)kWallOwnRecord) ? (void*)(rec - kWallOwnRecord) : b;
+}
+/* ANY THREAD: 1 = piece b's group (its lead) is told HELD */
+int BdWallOwnerHeldAt(void* b)
+{
+    if (b == 0) return 0;
+    void* lead = BdWallLeadOf(b);
+    int r = 0;
+    while (::InterlockedCompareExchange(&g_whLock, 1, 0) != 0) YieldProcessor();
+    for (int i = 0; i < g_whLeadN; ++i) if (g_whLead[i] == lead || g_whLead[i] == b) { r = 1; break; }
+    ::InterlockedExchange(&g_whLock, 0);
+    return r;
+}
+/* MAIN THREAD: the rows' leads read again from their keys (a load moves them; a key not found here mirrors nothing) */
+void BdWallHeldLeads()
+{
+    void* leads[kWhCap];
+    int n = 0;
+    for (size_t i = 0; i < g_wh.size() && n < kWhCap; ++i)
+    {
+        std::map<std::string, BdReg>::const_iterator row = g_reg.find(g_wh[i].key);
+        int fv = 0;
+        void* p = (row != g_reg.end()) ? BdFindPiece(g_wh[i].key, row->second, &fv) : 0;
+        if (p != 0) leads[n++] = BdWallLeadOf(p);
+    }
+    while (::InterlockedCompareExchange(&g_whLock, 1, 0) != 0) YieldProcessor();
+    for (int i = 0; i < n; ++i) g_whLead[i] = leads[i];
+    g_whLeadN = n;
+    ::InterlockedExchange(&g_whLock, 0);
+}
+/* MAIN THREAD (session dispatch): a HELP_HELD from slot */
+void BdWallHeldOnRecv(const std::string& key, int slot, int why)
+{
+    ++g_wallHeldRecv;
+    size_t at = g_wh.size();
+    for (size_t i = 0; i < g_wh.size(); ++i) if (g_wh[i].key == key && g_wh[i].slot == slot) { at = i; break; }
+    char line[420];
+    if (why == (int)coopbuild::kBuildHeldReleased)
+    {
+        if (at == g_wh.size()) return;
+        g_wh.erase(g_wh.begin() + (std::ptrdiff_t)at);
+        ++g_wallHeldCleared;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 -> HELP key=%.63s: slot%d RELEASED its held grouped-wall work - this game's builders may take that group again; wallHeldCleared=%lld",
+                    key.c_str(), slot, g_wallHeldCleared);
+    }
+    else
+    {
+        const int full = (at == g_wh.size() && g_wh.size() >= (size_t)kWhCap) ? 1 : 0;
+        if (at < g_wh.size()) g_wh[at].why = why;
+        else if (full == 0) { BdWhRow w; w.key = key; w.slot = slot; w.why = why; g_wh.push_back(w); }
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 -> HELP key=%.63s: slot%d HOLDS this game's grouped-wall help work (%s) - its step here is refused and its running build job ended; wallHeldRecv=%lld%s",
+                    key.c_str(), slot, why == (int)coopbuild::kBuildHeldWriter ? "that game writes the copy; the owner's game has not the area" : "the owner's group is not wholly loaded there",
+                    g_wallHeldRecv, full != 0 ? " (the table is full - not kept)" : "");
+    }
+    BdLogHelp(line);
+    BdWallHeldLeads();
+}
+/* MAIN THREAD, the K2 safe point (BdJobFinderRefresh): a mark whose holding game is KNOWN away goes (the owner-away rule takes over);
+   the leads are read again */
+void BdWallHeldSweep()
+{
+    for (size_t i = 0; i < g_wh.size(); )
+    {
+        if (coopbuild::BuildWallHeldMarkKeep(StoreRosterSlotInWorld(g_wh[i].slot)) != 0) { ++i; continue; }
+        ++g_wallHeldCleared;
+        char line[300];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 held grouped-wall mark key=%.63s cleared: slot%d (the holding game) is not in the world; wallHeldCleared=%lld",
+                    g_wh[i].key.c_str(), g_wh[i].slot, g_wallHeldCleared);
+        BdLogHelp(line);
+        g_wh.erase(g_wh.begin() + (std::ptrdiff_t)i);
+    }
+    if (!g_wh.empty() || g_whLeadN != 0) BdWallHeldLeads();
+}
+void BdWallHeldForget()
+{
+    g_wh.clear();
+    while (::InterlockedCompareExchange(&g_whLock, 1, 0) != 0) YieldProcessor();
+    g_whLeadN = 0;
+    ::InterlockedExchange(&g_whLock, 0);
+}
 /* help1 (owner 172): a build or add-materials order on a COPY of another player's piece (its faction is that player's stand-in) is help
    - given and counted (orderOnCopy); the helper's game then sends the work to the owner (HELP_WORK). A wall copy holding its own progress
    record is help as any piece: its progress call (0x5594A0) reaches the hook on that wall itself (F1011), the copy's needed is raised
    for the call so it never completes here, and the owner's own-record wall takes the work. A wall copy whose record is a group's (or
    unreadable) is refused and counted (helpWallRefused): its work lands in the group's shared record under the lead's key, not shown to
    reach the owner's wall. 1 = help given, 2 = refused (a grouped wall copy), 0 = not such an order. */
+int BdCopyWriterAt(void* b);   /* T-23: defined below in this same unnamed namespace (MAIN THREAD) */
 int BdHelpOrder(int t, void* subject, const char* road)
 {
     if (t == coopbuild::kBuildTaskRepair)   /* P15: a repair on a RUIN copy - help (the owner's game runs the ruin reset first); a wall ruin copy - refused */
@@ -3866,7 +4574,13 @@ int BdHelpOrder(int t, void* subject, const char* road)
     }
     if (t != coopbuild::kBuildTaskBuild && t != coopbuild::kBuildTaskAddMaterials) return 0;
     ::Faction* f = (::Faction*)BdOwnerPod(subject);
-    const int v = coopbuild::BuildHelpOrderVerdict(t, (f != 0 && IsStandInFaction(f)) ? 1 : 0, BdWallHelpKind(subject));   /* the rule every road shares: a grouped wall copy is refused */
+    const int wk = BdWallHelpKind(subject);
+    int inW = (wk == coopbuild::kBuildWallKindGroupOwner && f != 0) ? StoreRosterSlotInWorld(StandInSlotOf(f)) : 1;   /* T-1408: the owner's game resolves its own group - it must be in the world */
+    const int wWriter = (wk == coopbuild::kBuildWallKindGroupOwner && inW == 1 && BdCopyWriterAt(subject) != 0) ? 1 : 0;   /* T-1408 fold 1 (review 4): this game writes the copy (the owner's game has not the area) - only the owner's game resolves its group */
+    if (wWriter != 0) inW = 0;
+    const int wHeld = (wk == coopbuild::kBuildWallKindGroupOwner && inW == 1) ? BdWallOwnerHeldAt(subject) : 0;   /* T-1408 fold 2: the holding game said HELD */
+    if (wHeld != 0) inW = 0;
+    const int v = coopbuild::BuildHelpOrderVerdictW(t, (f != 0 && IsStandInFaction(f)) ? 1 : 0, wk, inW == 1 ? 1 : 0);   /* the rule every road shares: a grouped wall copy is refused unless its group is the owner's alone and the owner is in the world (T-1408) */
     if (v == coopbuild::kBuildHelpOrderNone) return 0;
     char k[kKeyCap];
     k[0] = 0;
@@ -3875,8 +4589,13 @@ int BdHelpOrder(int t, void* subject, const char* road)
     if (v == coopbuild::kBuildHelpOrderWallRefused)
     {
         ++g_helpWallRefused;
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] order task=%d on a grouped WALL copy of slot%d key=%s NOT GIVEN (%s) - its progress record is a group's (or unreadable): the work would land in the group's shared record, not shown to reach the owner's wall; helpWallRefused=%lld",
-                    t, StandInSlotOf(f), k, road, g_helpWallRefused);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] order task=%d on a grouped WALL copy of slot%d key=%s NOT GIVEN (%s) - %s; helpWallRefused=%lld",
+                    t, StandInSlotOf(f), k, road,
+                    wHeld != 0 ? "T-1408 fold 2: its group is the owner's, and the game holding its help work said HELD (the owner's group not wholly loaded there, or another game writes the copy)"
+                    : wWriter != 0 ? "T-1408: its group is the owner's, and this game writes the copy (the owner's game has not the area loaded; that game resolves its own group)"
+                    : wk == coopbuild::kBuildWallKindGroupOwner ? "T-1408: its group is the owner's, and the owner's game is not in the world (that game resolves its own group)"
+                                                              : "its group is not its owner's alone (mixed owners), a ruin, or its record unreadable: the work would land in a shared record the owner's game does not resolve",
+                    g_helpWallRefused);
         BdLogHelp(line);
         return 2;
     }
@@ -3884,8 +4603,8 @@ int BdHelpOrder(int t, void* subject, const char* road)
     if (BdHelpAllowedHere(f, &hmate, &hfr) == 0) return BdHelpRefuse(t, f, k, road);   /* T-903 (decision 920 a) */
     ++g_helpGivenK[BdHelpKind(t)];
     ++g_orderOnCopy;
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] order task=%d on a copy of slot%d key=%s - help (%s); orderOnCopy=%lld",
-                t, StandInSlotOf(f), k, road, g_orderOnCopy);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] order task=%d on a copy of slot%d key=%s - help (%s)%s; orderOnCopy=%lld",
+                t, StandInSlotOf(f), k, road, wk == coopbuild::kBuildWallKindGroupOwner ? " - T-1408 a grouped WALL copy: the owner's game resolves its own group" : "", g_orderOnCopy);
     BdLogHelp(line);
     return 1;
 }
@@ -3895,12 +4614,18 @@ int BdHelpOrder(int t, void* subject, const char* road)
 /* T-903: off the main thread a help order (build / add materials / repair) on a copy of a player who is no faction-mate is refused
    too (helpRefusedOff, no line): the friendly setting is not read there - its accessor is main-thread only - so off the main thread
    only a faction-mate may help. A repair on a wall ruin copy or a grouped wall copy is refused here too, as on the main thread. */
+int BdJfOwnerInWorld(void* f);   /* T-1408 fold 1: defined below in this same unnamed namespace (the job finder's table) */
 int BdHelpWallOff(int t, void* subject)
 {
     if (t != coopbuild::kBuildTaskBuild && t != coopbuild::kBuildTaskAddMaterials && t != coopbuild::kBuildTaskRepair) return 0;
     ::Faction* f = (::Faction*)BdOwnerPod(subject);
     const int standIn = (f != 0 && IsStandInFaction(f)) ? 1 : 0;
-    if (t != coopbuild::kBuildTaskRepair && coopbuild::BuildHelpOrderVerdict(t, standIn, BdWallHelpKind(subject)) == coopbuild::kBuildHelpOrderWallRefused)
+    /* T-1408 fold 1 (review 1): the main thread's verdict (BdHelpOrder): a group the owner's alone only while the owner's game is in the
+       world - read here from the K2 safe point's answer (BdJfOwnerInWorld; no fresh answer = not in the world: refused) */
+    const int wk = (t != coopbuild::kBuildTaskRepair) ? BdWallHelpKind(subject) : coopbuild::kBuildWallKindNone;
+    int inW = (wk == coopbuild::kBuildWallKindGroupOwner && f != 0) ? BdJfOwnerInWorld((void*)f) : 1;
+    if (inW == 1 && wk == coopbuild::kBuildWallKindGroupOwner && BdWallOwnerHeldAt(subject) != 0) inW = 0;   /* T-1408 fold 2: told HELD */
+    if (t != coopbuild::kBuildTaskRepair && coopbuild::BuildHelpOrderVerdictW(t, standIn, wk, inW == 1 ? 1 : 0) == coopbuild::kBuildHelpOrderWallRefused)
     {
         ::InterlockedIncrement(&g_helpWallRefusedOff);
         return 1;
@@ -4301,35 +5026,103 @@ int BdHandToTownOwner(void* b, void* town, int* why, int posOk, void** handTown)
    groups are not read (fold 1: no call into PhysXCore64 - buildwire.h), so excludedOnly stays 0.
    It writes nothing to the game, sends nothing and changes no record. MAIN THREAD (BdRosterTick), not while engine writes are
    blocked. Every read is a plain read inside a guard with count limits; nothing is called on the physics objects. */
-const DWORD kPcLaterMs = 10000;
-const DWORD kPcRecheckMs = 90000;   /* wall time, independent of the game's speed */
-const int kPcRechecks = 2;
+/* T-1389 (owner decision 1712, 2026-11-16; coopbuild::PieceStageOf / PieceWholeMissing / PieceCameBack in buildwire.h): the check is
+   now made on EVERY player wall, gate and building, finished or not, at each event that touches it - and it is still log only. The
+   kPcLaterMs (10 s) and kPcRecheckMs (90 s, twice) delays are gone: a check runs at the next tick after its event, and a piece whose
+   physics and models are not made yet (+0x228 empty) waits for its physics-arrived event (the createPhysical hook, BdBodyArrivedTick,
+   PcBodyWaitAdd) - no timer. A piece that waited and still has none at a later event of the same object is NOT whole. One healthy line
+   per building per road and stage, one problem line per building per stage and missing set (each kind of line kPcLineCap, then counted).
+   F1114: a finished piece whose holder is made but whose bodies are not yet waits too, ended by its bodies-arrived event (BdBodyArrivedTick) */
 const long long kPcLineCap = 20;
 const size_t kPcQueueCap = 2048, kPcAreaQueueCap = 64;
 const int kPcPiecesPerTick = 8;
 const size_t kPcPhysList = 0x228, kPcPhysN = 0x20, kPcPhysArr = 0x28, kPcEntActN = 0x58, kPcEntActArr = 0x60;
 const int kPcEntMax = 256, kPcActMax = 64;
+const int kPcBodyWaitPcCap = 128;   /* T-1389: the piece check's own waits for a body - the walk map keeps the rest of kWmBodyWaitCap */
 long long g_pcChecked = 0, g_pcSuspect = 0, g_pcNoShapes = 0, g_pcExclOnly = 0, g_pcNotCarved = 0, g_pcFaults = 0, g_pcCapped = 0, g_pcLines = 0;
 long long g_pcOther = 0, g_pcRechecks = 0, g_pcLateBody = 0, g_pcDropped = 0;
+long long g_pcWhole = 0, g_pcBuilding = 0, g_pcNotWhole = 0, g_pcCameBack = 0, g_pcRuin = 0, g_pcTakenApart = 0, g_pcProblemLines = 0;   /* T-1389 */
+long long g_pcCameBackLines = 0, g_pcSaveLines = 0;   /* T-1389 fold 5: the came-back lines' own cap; fold NOTE c: the save-queue lines */
+long long g_pcWaitAged = 0, g_pcWaitEndYoung = 0;   /* T-1389 re-check: waits named for their age; waits an area end stopped younger than the limit */
+long long g_pcBodiesCame = 0;   /* T-1389 (F1114): bodies-arrived events - a waiting piece's bodies found made (BdBodyArrivedTick) */
 struct PcAreaDue { int sx, sy; DWORD due; };
 coopbuild::PieceCheckQueue g_pcDue(kPcQueueCap);   /* MAIN THREAD: one waiting check per key */
 std::vector<PcAreaDue> g_pcAreaDue;                /* MAIN THREAD: one waiting sweep per area */
-/* MAIN THREAD: piece `key` (a registry key) became finished on this game by `road` - checked kPcLaterMs from now (once; a key already
+/* T-1389: what this game saw of each piece this session (MAIN THREAD, per registry key): the came-back memory, the object that waits
+   for its body, and which lines it already had (one healthy line per road and stage: bit road of saidHealthy[stage]; the last missing
+   set its problem line named) */
+struct PcSeenRow
+{
+    coopbuild::PieceSeen s;
+    void* waitB;
+    unsigned int saidHealthy[5];
+    std::string saidMissing;
+    int saidStage;   /* T-1389 (F1114): the stage of the last NOT whole line - the line is printed again when the stage changes */
+    int copyAwait;   /* T-1389 fold 1: a copy made or re-made here and no owner's STATE applied since (coopbuild::PieceCopyNoState) */
+    /* T-1389 re-check: the object whose wait for its physics began at waitSince (kept when the wait is evicted and re-added; cleared when
+       its physics come, it is removed or its area ends) and what an area-end event names it by without reading the piece */
+    void* waitFirstB;
+    DWORD waitSince;
+    std::string waitKind, waitFacts;
+    coopbuild::PieceWholeIn waitX;
+    float waitP, waitN;
+    PcSeenRow() : waitB(0), saidStage(-1), copyAwait(0), waitFirstB(0), waitSince(0), waitP(0.0f), waitN(0.0f) { for (int i = 0; i < 5; ++i) saidHealthy[i] = 0u; }
+};
+std::map<std::string, PcSeenRow> g_pcSeen;
+/* MAIN THREAD: an event touched piece `key` (a registry key) on this game by `road` - checked at the next tick (once; a key already
    waiting keeps its first road) */
 void PcQueue(const std::string& key, int road)
 {
-    if (g_pcDue.Push(key, (unsigned int)(::GetTickCount() + kPcLaterMs), road, 0) < 0) ++g_pcDropped;
+    if (g_pcDue.Push(key, (unsigned int)::GetTickCount(), road, 0) < 0) ++g_pcDropped;
 }
-/* MAIN THREAD: the zone scan walked area sx,sy at its load - its player pieces are queued kPcLaterMs from now */
+/* MAIN THREAD: the zone scan walked area sx,sy at its load - its player pieces are queued at the next tick (a piece whose physics is
+   not made yet waits for it - PcCheckPiece) */
 void PcQueueArea(int sx, int sy)
 {
     for (size_t i = 0; i < g_pcAreaDue.size(); ++i) if (g_pcAreaDue[i].sx == sx && g_pcAreaDue[i].sy == sy) return;
     if (g_pcAreaDue.size() >= kPcAreaQueueCap) { ++g_pcDropped; return; }
     PcAreaDue a;
-    a.sx = sx; a.sy = sy; a.due = ::GetTickCount() + kPcLaterMs;
+    a.sx = sx; a.sy = sy; a.due = ::GetTickCount();
     g_pcAreaDue.push_back(a);
 }
-void PcForgetWorld() { g_pcDue.Clear(); g_pcAreaDue.clear(); BdBodyWaitClear(); }
+/* MAIN THREAD (BuildSaveAccepted): a save - every live registry row is queued (a row whose piece is not loaded is dropped unchecked).
+   T-1389 fold NOTE c: a save can fill the queue (kPcQueueCap) - every row that did not fit is counted in `dropped` and the save says how
+   many (one line per save that dropped any, kPcLineCap of them, then counted in `capped`) */
+void PcWaitEndSweep(const unsigned char* left, int road, int ends);   /* T-1389 re-check, below PcrSecOfId (this unnamed namespace) */
+void PcQueueAll(int road)
+{
+    PcWaitEndSweep(0, road, 0);   /* T-1389 re-check: a save names each piece whose wait for its physics is older than the limit */
+    const unsigned int now = (unsigned int)::GetTickCount();
+    long long queued = 0, full = 0;
+    for (std::map<std::string, BdReg>::const_iterator it = g_reg.begin(); it != g_reg.end(); ++it)
+    {
+        if (it->second.removed != 0) continue;
+        if (g_pcDue.Push(it->first, now, road, 0) < 0) { ++g_pcDropped; ++full; }
+        else ++queued;
+    }
+    if (full == 0) return;
+    if (g_pcSaveLines >= kPcLineCap) { ++g_pcCapped; return; }
+    ++g_pcSaveLines;
+    char l[220];
+    _snprintf_s(l, sizeof(l), _TRUNCATE, "[PIECECHECK] save: %lld pieces queued for a check, %lld NOT queued (the check queue is full, %d); pieceCheck dropped=%lld",
+                queued, full, (int)kPcQueueCap, g_pcDropped);
+    DebugLog(std::string(l));
+}
+/* MAIN THREAD: a live reading of piece `key` noted in its came-back memory (coopbuild::PieceSeenNote) - the build events' drain notes
+   each ruin / repair / taken-apart reading here, so a legitimate drop is known whenever the check runs. road: the road it was read at */
+void PcSeenNoteKey(const std::string& key, int complete, int dismantled, int destroyed, unsigned int placement, int road)
+{
+    coopbuild::PieceSeenNote(&g_pcSeen[key].s, complete, dismantled, destroyed, placement, road);
+}
+/* T-1389 fold 1, MAIN THREAD: a teammate's copy made or re-made here (BdCopyOneBody) - 'no STATE yet' until an owner's STATE lands */
+void PcCopyMadeNote(const std::string& key) { g_pcSeen[key].copyAwait = 1; }
+/* T-1389 fold 1, MAIN THREAD: an owner's STATE applied to the copy (BdApplyOne, where ownerLast takes it) */
+void PcOwnerStateLanded(const std::string& key)
+{
+    std::map<std::string, PcSeenRow>::iterator it = g_pcSeen.find(key);
+    if (it != g_pcSeen.end()) it->second.copyAwait = 0;
+}
+void PcForgetWorld() { PcWaitEndSweep(0, coopbuild::kPcRoadWorldLeft, 1); g_pcDue.Clear(); g_pcAreaDue.clear(); BdBodyWaitClear(); g_pcSeen.clear(); PcPartsCacheClear(); }
 /* the piece's kind (coopbuild::kPcKind*): the RTTI class of its vtable (read as BdIsWall reads it) and whether it is furniture
    (fold 2, coopbuild::PieceCheckFurniture): its layout-furniture link +0x238 (kBFurnitureOf) or interior-object flag +0xF8
    (kBInteriorObj), read as detour_setfaction reads them, or its registry row's host (r.hostKey / r.hostForm, as BdTombNote reads them) */
@@ -4387,69 +5180,162 @@ int PcPathModePod(const void* b, int* v)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
-/* MAIN THREAD: one check of live piece b (registry key `key`, row r), `tries` re-checks made before this one. Nothing for a piece not
-   finished; another kind is counted in `other`; a fault is counted, no line; no body before the last re-check queues a re-check */
-void PcCheckPiece(void* b, const std::string& key, const BdReg& r, int road, int tries)
+int BdFloatAtOr0(const void* p, size_t off, float* out);   /* below, beside the walk map's reads */
+int BdBodyListPod(const void* b);                        /* below: the piece's physics list +0x228 (1 set, 0 empty, -1 unreadable) */
+int PcBodyWaitAdd(void* b, const std::string& key);      /* T-1389: below, beside BdBodyWaitAdd - 1 = waits for its physics-arrived event */
+int PcBodyWaitPending(const void* b);                    /* T-1389 fold 4: below - 1 = piece b's piece-check wait is still in the list */
+const size_t kPcThreshold = 0x194;                       /* the build threshold, a share of needed (kBWmThreshold, 0x5594A0) */
+/* "building 'Name'" - the kind word and the record's name */
+std::string PcKindText(void* b, int kind)
 {
-    coopbuild::PieceCheckIn in;
-    float p = 0.0f, n = 0.0f;
-    in.stateOk = BdReadState(b, &p, &n, &in.complete, &in.dismantled, &in.destroyed);
-    if (in.stateOk != 0) in.dismantled = BdDismOf(b, in.dismantled);
-    if (in.stateOk != 0 && coopbuild::PieceCheckVerdict(in) == coopbuild::kPieceCheckSkip) return;
-    const int kind = PcKindOf(b, r);
-    if (kind == coopbuild::kPcKindOther) { if (tries == 0) ++g_pcOther; return; }
-    if (in.stateOk != 0)
-    {
-        in.pathModeOk = PcPathModePod(b, &in.pathMode);
-        if (!(in.pathModeOk == 1 && in.pathMode == 0))   /* IGNORE: never in the walk map, its physics is not read */
-            in.physOk = PcPhysPod(b, &in.entities, &in.bodies);
-    }
-    const int v = coopbuild::PieceCheckVerdict(in);
-    if (v == coopbuild::kPieceCheckSkip) return;
-    ++g_pcChecked;
-    if (v == coopbuild::kPieceCheckFault) { ++g_pcFaults; return; }
-    const int next = coopbuild::PieceCheckNext(v, tries, kPcRechecks);
-    if (next == coopbuild::kPcNextDone)
-    {
-        if (tries > 0) ++g_pcLateBody;   /* it had no body at an earlier check (T-1294 fold 2: queued again from createPhysical, BdBodyArrivedTick) */
-        return;
-    }
-    if (next == coopbuild::kPcNextRecheck)
-    {
-        const int q = g_pcDue.Push(key, (unsigned int)(::GetTickCount() + kPcRecheckMs), road, tries + 1);
-        if (q > 0) ++g_pcRechecks;
-        else if (q < 0) ++g_pcDropped;
-        return;
-    }
-    ++g_pcSuspect;
-    ++g_pcNoShapes;
-    if (g_pcLines >= kPcLineCap) { ++g_pcCapped; return; }
-    ++g_pcLines;
-    char sid[96], name[96], own[24], pm[16];
-    BdSidOf(b, sid, (int)sizeof sid);
+    char name[96];
     name[0] = 0;
     void* gd = BdPtrAt(b, kObjData);
     if (gd != 0) BdStrPod((const char*)gd + kGdName, name, (int)sizeof name);
-    if (r.own != 0 && r.via != 3) _snprintf_s(own, sizeof own, _TRUNCATE, "mine");
-    else
+    return std::string(coopbuild::PieceCheckKindWord(kind)) + " '" + name + "'";
+}
+/* one [PIECECHECK] line: healthy lines, problem lines and came-back lines (coopbuild::kPcSay*) each kPcLineCap per session, then counted in
+   `capped` (T-1389 fold 5: a came-back line never waits behind NOT whole lines) */
+void PcSay(int sayKind, const std::string& text)
+{
+    long long& n = (sayKind == coopbuild::kPcSayCameBack) ? g_pcCameBackLines : (sayKind == coopbuild::kPcSayProblem ? g_pcProblemLines : g_pcLines);
+    if (n >= kPcLineCap) { ++g_pcCapped; return; }
+    ++n;
+    DebugLog("[PIECECHECK] " + text);
+}
+/* T-1389, MAIN THREAD: the came-back rule on a FRESH read of piece b, then the read noted. This game's own piece: coopbuild::PieceCameBack
+   (recordFinished: the shared record's 'finished' where this event has the record (PcaApplyOne), else 0 - this game's own memory
+   decides). A teammate's copy (fold 2): coopbuild::PieceCameBackCopy - its owner's last STATE (ownerLast) decides, and a copy with no
+   owner's STATE since its (re)make (fold 1: coopbuild::PieceCopyNoState) is never judged. 1 = came back */
+int PcCameBackJudge(void* b, const std::string& key, const BdReg& r, int kind, int recordFinished, unsigned int recordPlacement, int road)
+{
+    float p = 0.0f, n = 0.0f;
+    int c = 0, d = 0, x = 0;
+    const int ok = BdReadState(b, &p, &n, &c, &d, &x);
+    if (ok == 0) return 0;
+    d = BdDismOf(b, d);
+    PcSeenRow& row = g_pcSeen[key];
+    const int isCopy = (r.via == 3 || r.own == 0) ? 1 : 0;   /* another player's piece on this game */
+    int truth = coopbuild::kPcTruthNone;
+    if (isCopy != 0)
     {
-        const int slot = (r.ownerSlot >= 0) ? r.ownerSlot : StandInSlotOf((::Faction*)BdOwnerPod(b));
-        if (slot >= 0) _snprintf_s(own, sizeof own, _TRUNCATE, "slot %d", slot);
-        else _snprintf_s(own, sizeof own, _TRUNCATE, "slot ?");
+        const int copyNoState = coopbuild::PieceCopyNoState(1, r.ownerKnown, row.copyAwait);
+        truth = coopbuild::PieceCameBackCopy(copyNoState, (int)r.ownerLast.complete, (int)r.ownerLast.destroyed, recordPlacement, ok, c, d, x, r.nonce);
     }
-    if (in.pathModeOk == 1) _snprintf_s(pm, sizeof pm, _TRUNCATE, "%d", in.pathMode);
-    else _snprintf_s(pm, sizeof pm, _TRUNCATE, "%s", in.pathModeOk == 0 ? "none" : "?");
+    else truth = coopbuild::PieceCameBack(row.s, recordFinished, recordPlacement, ok, c, d, x, r.nonce);
+    const int said = row.s.said;
+    const int seenRoad = row.s.finishedRoad;
+    coopbuild::PieceSeenNote(&row.s, c, d, x, r.nonce, road);
+    if (truth == coopbuild::kPcTruthNone) return 0;
+    if (said != 0) return 1;   /* this placement's came-back line was written already */
+    row.s.said = 1;
+    ++g_pcCameBack;
+    coopbuild::PieceWholeIn none;
+    PcSay(coopbuild::kPcSayCameBack, coopbuild::PieceCheckLineText(coopbuild::kPcLineCameBack, key, PcKindText(b, kind), none, p, n, -1, std::string(), road,
+                                                                 truth, seenRoad));
+    return 1;
+}
+/* T-1389 fold NOTE d: the old SUSPECT line's facts for a NOT whole line - owner, area, position */
+std::string PcFactsText(void* b, const BdReg& r)
+{
+    const int mine = (r.own != 0 && r.via != 3) ? 1 : 0;
+    const int slot = (mine != 0) ? -1 : ((r.ownerSlot >= 0) ? r.ownerSlot : StandInSlotOf((::Faction*)BdOwnerPod(b)));
     float pos[3] = { 0.0f, 0.0f, 0.0f };
     const int posOk = BdCopyF((const char*)b + kObjPos, pos, 3);
-    char ar[32];
-    if (posOk != 0) { const Sector s = SectorOf(pos[0], pos[2]); _snprintf_s(ar, sizeof ar, _TRUNCATE, "%d,%d", s.x, s.y); }
-    else _snprintf_s(ar, sizeof ar, _TRUNCATE, "?");
-    char line[640];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[PIECECHECK] SUSPECT key=%.63s kind=%.80s name='%.80s' type=%s owner=%s road=%s bodies=0 entities=%d"
-                " carved=? area=%s why=%s checks=%d pathMode=%s pos=%.1f,%.1f,%.1f progress=%.2f/%.2f; pieceCheck[suspect]=%lld",
-                key.c_str(), sid[0] != 0 ? sid : "?", name, coopbuild::PieceCheckKindWord(kind), own, coopbuild::PieceCheckRoadWord(road),
-                in.entities, ar, in.physOk == 0 ? "noPhysics" : "noBody", tries + 1, pm, pos[0], pos[1], pos[2], p, n, g_pcSuspect);
-    DebugLog(std::string(line));
+    int ax = 0, ay = 0;
+    if (posOk != 0) { const Sector s = SectorOf(pos[0], pos[2]); ax = s.x; ay = s.y; }
+    return coopbuild::PieceCheckFactsText(mine, slot, posOk, ax, ay, pos);
+}
+/* T-1389, MAIN THREAD (PcaApplyOne): the shared record meets the live piece - compared with a FRESH read before the apply corrects it */
+void PcRecordMeetsLive(void* b, const std::string& key, const BdReg& r, int recComplete, int recDestroyed, unsigned int recPlacement)
+{
+    if (b == 0 || BdOnMain() == 0) return;
+    const int kind = PcKindOf(b, r);
+    if (kind == coopbuild::kPcKindOther) return;
+    PcCameBackJudge(b, key, r, kind, coopbuild::PieceRecordFinished(recComplete, recDestroyed), recPlacement, coopbuild::kPcRoadRecord);
+}
+/* MAIN THREAD: one check of live piece b (registry key `key`, row r) by `road`. Another kind is counted in `other`; a fault is counted,
+   no line. T-1389: every stage is judged (coopbuild::PieceStageOf); taken apart is counted, no line */
+void PcCheckPiece(void* b, const std::string& key, const BdReg& r, int road, int tries)
+{
+    const int kind = PcKindOf(b, r);
+    if (kind == coopbuild::kPcKindOther) { if (tries == 0) ++g_pcOther; return; }
+    coopbuild::PieceCheckIn in;
+    float p = 0.0f, n = 0.0f;
+    in.stateOk = BdReadState(b, &p, &n, &in.complete, &in.dismantled, &in.destroyed);
+    if (in.stateOk == 0) { ++g_pcChecked; ++g_pcFaults; return; }
+    in.dismantled = BdDismOf(b, in.dismantled);
+    PcCameBackJudge(b, key, r, kind, 0, 0u, road);
+    const int stage = coopbuild::PieceStageOf(in.stateOk, in.complete, in.dismantled, in.destroyed);
+    if (stage == coopbuild::kPcStageTakenApart) { ++g_pcTakenApart; return; }
+    coopbuild::PieceWholeIn x;
+    x.stage = stage;
+    if (PcPartsRead(b, &x) == 0) { ++g_pcChecked; ++g_pcFaults; return; }
+    PcSeenRow& row = g_pcSeen[key];
+    if (stage == coopbuild::kPcStageFinished && x.holder == 1)
+    {   /* a finished piece's physics body, as T-988 judged it: a path mode 0 (IGNORE) piece is never in the walk map. T-1389 (F1114): read
+           BEFORE the wait - a holder whose bodies are not made yet waits for them */
+        in.pathModeOk = PcPathModePod(b, &in.pathMode);
+        if (!(in.pathModeOk == 1 && in.pathMode == 0))
+        {
+            in.physOk = PcPhysPod(b, &in.entities, &in.bodies);
+            const int v = coopbuild::PieceCheckVerdict(in);
+            if (v == coopbuild::kPieceCheckFault) { ++g_pcChecked; ++g_pcFaults; return; }
+            x.bodiesJudged = 1;
+            x.bodies = (v == coopbuild::kPieceCheckNoBody) ? 0 : in.bodies;
+        }
+    }
+    const int bodiesPending = coopbuild::PieceBodiesPending(x);
+    const int ready = (x.holder != 0 && bodiesPending == 0) ? 1 : 0;   /* its physics (holder and, finished, its bodies) are made */
+    /* no physics and no models made yet - or (F1114) a finished piece's bodies not made yet: judged at its physics-arrived event
+       (coopbuild::PieceWaitActionFor). T-1389 fold 4: a second event while its wait is pending keeps waiting; one that waited (this same
+       object), whose wait is over and still has none is NOT whole */
+    const int wa0 = coopbuild::PieceWaitActionFor(x.holder == 0 ? 0 : 1, bodiesPending, road == coopbuild::kPcRoadBodyArrived ? 1 : 0, row.waitB == b ? 1 : 0,
+                                              (row.waitB == b && PcBodyWaitPending(b) != 0) ? 1 : 0);
+    /* T-1389 re-check: a wait is kept only while younger than coopbuild::kPcBodyWaitLimitMs from this object's FIRST wait (an evicted
+       wait re-added keeps it); an older one is judged now (kPcWaitAged: NOT whole, 'waited <n> s for its physics') */
+    const DWORD pcNow = ::GetTickCount();
+    const unsigned int waitMs = (row.waitFirstB == b) ? (unsigned int)(pcNow - row.waitSince) : 0u;
+    const int wa = coopbuild::PieceWaitAged(wa0, row.waitFirstB == b ? 1 : 0, waitMs);
+    if (wa == coopbuild::kPcWaitDrop) { ++g_pcDropped; return; }
+    if (wa == coopbuild::kPcWaitKeep) return;
+    if (wa == coopbuild::kPcWaitAdd)
+    {
+        row.waitSince = (DWORD)coopbuild::PieceWaitSince(row.waitFirstB == b ? 1 : 0, (unsigned int)row.waitSince, (unsigned int)pcNow);
+        row.waitFirstB = b;
+        row.waitKind = PcKindText(b, kind); row.waitFacts = PcFactsText(b, r); row.waitX = x; row.waitP = p; row.waitN = n;   /* named by these at an area end */
+        if (PcBodyWaitAdd(b, key) != 0) { row.waitB = b; ++g_pcRechecks; }
+        return;
+    }
+    if (wa == coopbuild::kPcWaitAged) ++g_pcWaitAged;
+    const std::string waited = (ready == 0 && row.waitFirstB == b) ? coopbuild::PieceWaitedText(waitMs) : std::string();
+    if (ready == 0 && row.waitFirstB == b) row.waitX = x;   /* F1114: an area end names it by what it was judged with */
+    if (ready != 0 && row.waitFirstB == b) row.waitFirstB = 0;   /* its physics came: it waits no more */
+    if (ready != 0 && row.waitB == b) { row.waitB = 0; ++g_pcLateBody; }   /* its body came after an earlier check */
+    ++g_pcChecked;
+    const std::string missing = coopbuild::PieceWholeMissing(x);
+    const int line = coopbuild::PieceCheckLineFor(stage, missing);
+    float t = 0.0f;
+    const int solid = (BdFloatAtOr0(b, kPcThreshold, &t) != 0) ? coopbuild::BuildWalkMapSolid(0, p, n, t) : -1;
+    if (line == coopbuild::kPcLineNotWhole)
+    {
+        ++g_pcNotWhole;
+        if (stage == coopbuild::kPcStageFinished && x.bodiesJudged != 0 && x.bodies == 0) { ++g_pcSuspect; ++g_pcNoShapes; }   /* T-988's count */
+        if (coopbuild::PieceProblemSaid(row.saidStage, row.saidMissing, stage, missing) != 0) return;   /* F1114: this stage's missing set was named already */
+        row.saidMissing = missing;
+        row.saidStage = stage;
+        PcSay(coopbuild::kPcSayProblem, coopbuild::PieceCheckLineText(line, key, PcKindText(b, kind), x, p, n, solid, missing, road) + waited + PcFactsText(b, r));
+        return;
+    }
+    row.saidMissing.clear();
+    row.saidStage = -1;
+    if (line == coopbuild::kPcLineWhole) ++g_pcWhole;
+    else if (line == coopbuild::kPcLineRuin) ++g_pcRuin;
+    else ++g_pcBuilding;
+    const unsigned int bit = (road >= 0 && road < 32) ? (1u << road) : 0u;
+    if (stage >= 0 && stage < 5 && (row.saidHealthy[stage] & bit) != 0) return;   /* one healthy line per road and stage */
+    if (stage >= 0 && stage < 5) row.saidHealthy[stage] |= bit;
+    PcSay(coopbuild::kPcSayHealthy, coopbuild::PieceCheckLineText(line, key, PcKindText(b, kind), x, p, n, solid, std::string(), road));
 }
 /* MAIN THREAD (BdRosterTick, every tick): at most kPcPiecesPerTick checks whose time came. A key whose piece is no longer found
    (unloaded, removed) is dropped unchecked. An area whose time came puts its player pieces in the queue (one area per tick, no
@@ -4496,13 +5382,21 @@ void PcTick()
         return;
     }
 }
+long long PcCopyNoStateN()   /* T-1389 re-check NOTE: teammates' copies made here that no owner's STATE has reached yet */
+{
+    long long n = 0;
+    for (std::map<std::string, PcSeenRow>::const_iterator it = g_pcSeen.begin(); it != g_pcSeen.end(); ++it) if (it->second.copyAwait != 0) ++n;
+    return n;
+}
 std::string PcReportText()
 {
-    char b[260];
-    _snprintf_s(b, sizeof(b), _TRUNCATE, " pieceCheck[checked,suspect,noShapes,excludedOnly,notCarved,faults,capped,other,rechecks,lateBody,dropped]"
-                "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+    char b[512];
+    const long long copyNoState = PcCopyNoStateN();
+    _snprintf_s(b, sizeof(b), _TRUNCATE, " pieceCheck[checked,suspect,noShapes,excludedOnly,notCarved,faults,capped,other,rechecks,lateBody,dropped,"
+                "whole,building,notWhole,cameBack,ruin,takenApart,waitAged,waitEndYoung,copyNoState,bodiesCame]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
                 g_pcChecked, g_pcSuspect, g_pcNoShapes, g_pcExclOnly, g_pcNotCarved, g_pcFaults, g_pcCapped, g_pcOther, g_pcRechecks, g_pcLateBody,
-                g_pcDropped);
+                g_pcDropped, g_pcWhole, g_pcBuilding, g_pcNotWhole, g_pcCameBack, g_pcRuin, g_pcTakenApart, g_pcWaitAged, g_pcWaitEndYoung, copyNoState,
+                g_pcBodiesCame);   /* T-1389: rechecks = waits for a body, lateBody = bodies that came after */
     return std::string(b) + BdWalkMapReportText();
 }
 
@@ -4517,6 +5411,7 @@ static unsigned long long kBdWmListRva = 0; static AddrReg kBdWmListRva_reg("Bui
 typedef void (*BdWmBoxFn)(void* list, const void* box);
 typedef void (*BdWmIntFn)(void* list, void* b, char all);
 const size_t kBWmBox = 0x27C;        /* the building's box, as 0x2A5DE0 / 0x29C120 pass it */
+const size_t kBPartsLoading = 0x230; /* T-1428 fold 1: an int, the building's model parts still loading (coopbuild::BuildWalkMapBoxDue) */
 const size_t kBWmThreshold = 0x194;  /* build threshold, a share of needed (0x5594A0) */
 const size_t kWmListBuildMode = 0x28;
 const size_t kWmListState = 0x38;     /* 0 idle, 1 the confirm's 'build the confirmed pieces', 2 due (decomp_4e3690:10-15) */
@@ -4529,6 +5424,11 @@ long long g_wmBox = 0, g_wmInterior = 0, g_wmNone = 0, g_wmNoList = 0, g_wmHeld 
 long long g_wmBodyWaitAdded = 0, g_wmBodyArrived = 0, g_wmBodyCrossReplayed = 0, g_wmBodyWaitDropped = 0, g_wallCrossWait = 0, g_wallNbrPutBack = 0;
 volatile LONG g_wmArrivedLost = 0;   /* an arrival found no free slot (any thread) */
 long long g_wmInteriorEngineNo = 0, g_wmInteriorFaulted = 0;   /* T-1309: an interior pointer the engine's own test gives no interior walking map; the test unreadable */
+long long g_wmBoxWait = 0, g_wmBoxCame = 0, g_wmBoxGaveUp = 0;   /* T-1428: asks whose box was not real yet; boxes found real later; waits given up (area end, world left, address reused) */
+long long g_wmBoxTimedOut = 0;   /* T-1428 fold 1: waits that reached coopbuild::kWmBoxWaitMs (asked with the box they had, or the interior alone) */
+size_t g_wmBoxWaitsMax = 0;   /* T-1428 fold 1: the most box waits at once */
+long long g_zrbNoted = 0, g_zrbAsked = 0, g_zrbSkipQueued = 0, g_zrbAgain = 0, g_zrbTimedOut = 0, g_zrbNoArea = 0, g_zrbGaveUp = 0,
+          g_zrbFaulted = 0, g_zrbNoRows = 0, g_zrbGone = 0;   /* T-1428 attempt 2: the area walking-map rebuilds (BdZoneRebuildTick) */
 std::string BdWalkMapReportText()
 {
     char b[400];
@@ -4541,7 +5441,12 @@ std::string BdWalkMapReportText()
                 g_wmBodyWaitAdded, g_wmBodyArrived, g_wmBodyCrossReplayed, g_wmBodyWaitDropped, (long)g_wmArrivedLost, g_wallCrossWait, g_wallNbrPutBack);
     char b3[120];
     _snprintf_s(b3, sizeof(b3), _TRUNCATE, " walkMapInterior[engineNo,faulted]=%lld,%lld", g_wmInteriorEngineNo, g_wmInteriorFaulted);   /* T-1309 */
-    return std::string(b) + b2 + b3;
+    char b4[200];
+    _snprintf_s(b4, sizeof(b4), _TRUNCATE, " walkMapBox[wait,came,gaveUp]=%lld,%lld,%lld walkMapBox[timedOut,mostWaiting]=%lld,%d", g_wmBoxWait, g_wmBoxCame, g_wmBoxGaveUp, g_wmBoxTimedOut, (int)g_wmBoxWaitsMax);   /* T-1428 (fold 1: timedOut, mostWaiting) */
+    char b5[220];
+    _snprintf_s(b5, sizeof(b5), _TRUNCATE, " zoneRebuild[noted,asked,skipQueued,againRunning,timedOut,noArea,gaveUp,faulted,noRows,piecesGone]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                g_zrbNoted, g_zrbAsked, g_zrbSkipQueued, g_zrbAgain, g_zrbTimedOut, g_zrbNoArea, g_zrbGaveUp, g_zrbFaulted, g_zrbNoRows, g_zrbGone);   /* T-1428 attempt 2 */
+    return std::string(b) + b2 + b3 + b4 + b5;
 }
 int BdFloatAtOr0(const void* p, size_t off, float* out)
 {
@@ -4550,14 +5455,14 @@ int BdFloatAtOr0(const void* p, size_t off, float* out)
 }
 /* fold 1 (review H1): the list's state is read first; a 1 (the player's confirm, one frame before its drain builds the confirmed
    pieces) is put back after the calls, which set 2 (*kept = 1) */
-int BdWalkMapPod(void* list, void* b, int what, uintptr_t fBox, uintptr_t fInt, int* held, int* kept)
+int BdWalkMapPod(void* list, void* b, const float* box, int what, uintptr_t fBox, uintptr_t fInt, int* held, int* kept)   /* T-1428: box = the grown copy queued */
 {
     __try
     {
         *held = (*(void* const*)((const char*)list + kWmListBuildMode) != 0) ? 1 : 0;
         int* st = (int*)((char*)list + kWmListState);
         const int before = *st;
-        if ((what & coopbuild::kWmBox) != 0) ((BdWmBoxFn)fBox)(list, (const char*)b + kBWmBox);
+        if ((what & coopbuild::kWmBox) != 0) ((BdWmBoxFn)fBox)(list, box);   /* T-1428: the queue copies it (decomp_4d21f0) */
         if ((what & coopbuild::kWmInterior) != 0) ((BdWmIntFn)fInt)(list, b, 0);
         const int after = coopbuild::BuildWalkMapStateAfter(before, *st);
         *kept = (after != *st) ? 1 : 0;
@@ -4581,9 +5486,12 @@ int BdWmDuePod(void* list, int pending, int* set)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+long long g_wmHostTickNo = 0;   /* T-1426: main ticks, so a host is queued once per tick (BdWalkMapHostNote) */
 void BdWalkMapHeldTick()
 {
+    ++g_wmHostTickNo;
     BdBodyArrivedTick();   /* T-1294 fold 2 (M2): the bodies createPhysical gave waiting pieces since the last tick */
+    BdZoneRebuildTick();   /* T-1428 attempt 2: an area whose restored pieces are made and loaded - the engine's own whole-area rebuild */
     if (g_wmHeldPending == 0 || BdOnMain() == 0 || kBdWmListRva == 0) return;
     void* list = BdPtrAt((const void*)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kBdWmListRva), 0);
     if (list == 0) return;
@@ -4612,7 +5520,7 @@ int BdWalkMapSolidNow(void* b)
    (coopbuild::BuildWalkMapBodyWait), keyed by the piece and its game data. The createPhysical hook (detour_createPhys, any thread)
    matches the piece against g_wmWaitPtr - a copy of the list's pointers it may read on any thread - and leaves it in a free
    g_wmArrivedOff slot; the next main tick (BdBodyArrivedTick) takes it: the waiting wall's crossing, then its box again. No timer */
-struct BdBodyWait { void* b; void* data; std::string key; int cross; DWORD since; };
+struct BdBodyWait { void* b; void* data; std::string key; int cross; DWORD since; int walk; int pc; std::string pcKey; int bodies; int road; void* vt; };   /* T-1389: walk = the walk map waits, pc = the piece check waits (pcKey: its registry key); F1114: bodies = it waits for the bodies of a holder already made (BdBodyArrivedTick reads them) */
 std::vector<BdBodyWait> g_wmBodyWait;                          /* MAIN THREAD */
 void* volatile g_wmWaitPtr[coopbuild::kWmBodyWaitCap];          /* written on the main thread, read by the hook */
 volatile LONG g_wmBodyWaitN = 0;
@@ -4624,42 +5532,343 @@ int BdBodyListPod(const void* b)
     __try { return (*(const void* const*)((const char*)b + kPcPhysList) != 0) ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* T-1428: the building's box +0x27C (six floats) and (fold 1) its count of model parts still loading +0x230; 1 read, 0 a fault
+   (out zeroed, loading 1) */
+int BdBoxPod(const void* b, float* out, int* loading)
+{
+    __try
+    {
+        for (int i = 0; i < 6; ++i) out[i] = *(const float*)((const char*)b + kBWmBox + 4 * (size_t)i);
+        *loading = *(const int*)((const char*)b + kBPartsLoading);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { for (int i = 0; i < 6; ++i) out[i] = 0.0f; *loading = 1; return 0; }
+}
+/* T-1428 fold 1 (review 2): the walking-map asks waiting for their box - their own growable list (no cap, no drop), MAIN THREAD; the
+   tick reads each (BdBoxPod) and asks when coopbuild::BuildWalkMapBoxDue says so. The createPhysical hook never reads it */
+struct BdBoxWait { void* b; void* data; void* vt; std::string key; DWORD since; int road; };
+std::vector<BdBoxWait> g_wmBoxWaits;
+unsigned char g_wmZonePrev[coopbuild::kBuildZoneSectorCells];   /* T-1428 fold 1 (review 5): BdWalkWaitZonesNow's last active list */
+int g_wmZonePrevHave = 0;
+/* MAIN THREAD: piece b's box wait taken out (1 = it had one) */
+int BdBoxWaitTake(void* b)
+{
+    for (size_t i = 0; i < g_wmBoxWaits.size(); ++i)
+        if (g_wmBoxWaits[i].b == b) { g_wmBoxWaits.erase(g_wmBoxWaits.begin() + (std::ptrdiff_t)i); return 1; }
+    return 0;
+}
 void BdBodyWaitSync()   /* MAIN THREAD: the hook's copy of the pointers */
 {
     const int n = (int)g_wmBodyWait.size();
     for (int i = 0; i < coopbuild::kWmBodyWaitCap; ++i) g_wmWaitPtr[i] = (i < n) ? g_wmBodyWait[(size_t)i].b : 0;
     ::InterlockedExchange(&g_wmBodyWaitN, (LONG)n);
 }
+/* T-1428 fold 1 (review 2), MAIN THREAD: piece b's walking-map ask waits for its box (its own list, no cap). Not added while its wall
+   crossing waits in the body list (that arrival asks it again); a second ask for a piece already waiting keeps the first wait */
+void BdBoxWaitAdd(void* b, const char* key, int road, DWORD since)
+{
+    int crossWaits = 0;
+    for (size_t i = 0; i < g_wmBodyWait.size(); ++i) if (g_wmBodyWait[i].b == b && g_wmBodyWait[i].walk != 0) crossWaits = 1;
+    if (coopbuild::BuildWalkMapBoxWaitKeep(crossWaits) == 0) return;
+    for (size_t i = 0; i < g_wmBoxWaits.size(); ++i) if (g_wmBoxWaits[i].b == b) return;
+    BdBoxWait w;
+    w.b = b; w.data = BdPtrAt(b, kObjData); w.vt = BdPtrAt(b, 0); w.key = (key != 0) ? key : ""; w.since = since; w.road = road;   /* its game data and vtable, checked before the tick asks */
+    g_wmBoxWaits.push_back(w);
+    if (g_wmBoxWaits.size() > g_wmBoxWaitsMax) g_wmBoxWaitsMax = g_wmBoxWaits.size();
+}
+/* T-1428 attempt 2 (coopbuild::BuildZoneRebuildDue has the rules and the engine road): the areas whose pieces were made here from their
+   record (restored, a re-make, a kept row) wait for one engine whole-area walking-map rebuild 0x3AB700(*NavMeshManagerPtr, zoneMap),
+   asked once per area after its pieces are made and their models loaded. MAIN THREAD (the engine's own callers are its key and editor
+   handlers on the main thread) */
+static unsigned long long kBdZoneRbRva = 0;  static AddrReg kBdZoneRbRva_reg("ZoneWalkMapRebuild", &kBdZoneRbRva);   /* Steam_1.0.65 0x3AB700, 1.0.68 0x3AB840 */
+static unsigned long long kBdNavMgrRva = 0;  static AddrReg kBdNavMgrRva_reg("NavMeshManagerPtr", &kBdNavMgrRva);    /* Steam_1.0.65 0x2133560 (var), 1.0.68 0x21345C0: a POINTER to the walking-map manager */
+const size_t kNavJobs = 0x290;      /* the manager's job holder, as 0x3AB700 passes it to 0x3BF360 / 0x3C66E0 */
+const size_t kNavJobCur = 0xE8, kNavJobQueue = 0x88, kNavJobNext = 0x60, kNavJobType = 0x58;   /* 0x3BF360: the running job, the queue, a job's next and type */
+typedef void (*BdZoneRbFn)(void* nav, void* zoneMap);
+struct BdZrbPiece { void* b; void* data; void* vt; std::string key; };
+struct BdZoneRb { int sx; int sy; std::vector<BdZrbPiece> p; int noted; int roads; DWORD firstAt; DWORD lastAt; DWORD runSince; std::string firstKey;
+                  int faults; int noBox; int partsLoading; int noBodies; };   /* fold 2: read faults so far; the pieces still missing each condition */
+std::vector<BdZoneRb> g_zoneRb;   /* MAIN THREAD */
+/* road 1 restored, 2 a re-make, 4 a kept row (coopbuild::BuildZoneRebuildNotes): piece b noted for its area's rebuild */
+void BdZoneRebuildNote(void* b, const char* key, int road)
+{
+    if (b == 0 || BdOnMain() == 0) return;
+    const int furn = (BdPtrAt(b, kBFurnitureOf) != 0 || BdByteAtOr0(b, kBInteriorObj) != 0) ? 1 : 0;
+    if (coopbuild::BuildZoneRebuildNotes(road == 1 ? 1 : 0, road == 2 ? 1 : 0, road == 4 ? 1 : 0, furn) == 0) return;
+    float pos[3] = { 0.0f, 0.0f, 0.0f };
+    if (BdCopyF((const char*)b + kObjPos, pos, 3) == 0) { ++g_zrbFaulted; return; }
+    const Sector s = SectorOf(pos[0], pos[2]);
+    const DWORD now = ::GetTickCount();
+    ++g_zrbNoted;
+    BdZrbPiece q;
+    q.b = b; q.data = BdPtrAt(b, kObjData); q.vt = BdPtrAt(b, 0); q.key = (key != 0) ? key : "";
+    for (size_t i = 0; i < g_zoneRb.size(); ++i)
+        if (g_zoneRb[i].sx == s.x && g_zoneRb[i].sy == s.y)
+        {
+            BdZoneRb& z = g_zoneRb[i];
+            for (size_t k = 0; k < z.p.size(); ++k) if (z.p[k].b == b) { z.p[k] = q; z.lastAt = now; return; }
+            z.p.push_back(q); ++z.noted; z.roads |= road; z.lastAt = now;
+            return;
+        }
+    BdZoneRb z;
+    z.sx = s.x; z.sy = s.y; z.p.push_back(q); z.noted = 1; z.roads = road; z.firstAt = now; z.lastAt = now; z.runSince = 0; z.firstKey = q.key;
+    z.faults = 0; z.noBox = 0; z.partsLoading = 0; z.noBodies = 0;
+    g_zoneRb.push_back(z);
+}
+/* the area's map entry and the engine's own skip facts (0x3BF360), read as it reads them; 1 read, 0 a fault */
+int BdZoneRbReadPod(void* nav, void* zmap, int* area, int* curType, int* qType, int* skipRun, int* skipQ, int* qFull)
+{
+    *area = 0; *curType = -1; *qType = -1; *skipRun = 0; *skipQ = 0; *qFull = 0;
+    __try
+    {
+        *area = (*(void* const*)zmap != 0) ? 1 : 0;
+        const char* jobs = *(const char* const*)((const char*)nav + kNavJobs);
+        if (jobs == 0) return 0;
+        const char* cur = *(const char* const*)(jobs + kNavJobCur);
+        if (cur != 0 && *(void* const*)cur == zmap)
+        {
+            *curType = *(const int*)(cur + kNavJobType);
+            *skipRun = coopbuild::BuildZoneRebuildSkipCur(1, *curType);
+        }
+        int n = 0;
+        for (const char* q = *(const char* const*)(jobs + kNavJobQueue); q != 0 && n < 100000; q = *(const char* const*)(q + kNavJobNext), ++n)
+        {
+            if (*(void* const*)q != zmap) continue;
+            const int t = *(const int*)(q + kNavJobType);
+            if (coopbuild::BuildZoneRebuildSkipQueued(1, t) == 0) continue;
+            *qType = t; *skipQ = 1;
+            if (coopbuild::BuildZoneRebuildQueuedFull(1, t) != 0) { *qFull = 1; break; }   /* fold 2: only a queued Full covers the pieces */
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int BdZoneRbCallPod(uintptr_t fn, void* nav, void* zmap)
+{
+    __try { ((BdZoneRbFn)fn)(nav, zmap); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+std::string BdZoneRbRoads(int roads)
+{
+    std::string r;
+    if ((roads & 1) != 0) r += "restored";
+    if ((roads & 2) != 0) r += r.empty() ? "re-make" : "+re-make";
+    if ((roads & 4) != 0) r += r.empty() ? "kept row" : "+kept row";
+    return r.empty() ? std::string("-") : r;
+}
+void BdZoneRbLine(const BdZoneRb& z, const char* what, int ready, int timedOut, int curType, int qType)
+{
+    char line[700];
+    const DWORD now = ::GetTickCount();
+    const std::string roads = BdZoneRbRoads(z.roads);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1428 zone rebuild zone %d,%d: %s; pieces restored=%d (standing %d, models loaded %d) roads=%s first key=%.63s waited=%lu ms quiet=%lu ms%s;"
+                " not ready: no real box %d, parts loading %d, no physics body %d; read faults %d;"
+                " engine job running type=%d queued type=%d; zoneRebuild[asked,skipQueued,againRunning,timedOut,noArea,gaveUp,faulted]=%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                z.sx, z.sy, what, z.noted, (int)z.p.size(), ready, roads.c_str(), z.firstKey.empty() ? "-" : z.firstKey.c_str(),
+                (unsigned long)(now - z.firstAt), (unsigned long)(now - z.lastAt), timedOut != 0 ? " (TIMED OUT: pieces not ready at the cap - asked with what stands; see not ready)" : "",
+                z.noBox, z.partsLoading, z.noBodies, z.faults, curType, qType, g_zrbAsked, g_zrbSkipQueued, g_zrbAgain, g_zrbTimedOut, g_zrbNoArea, g_zrbGaveUp, g_zrbFaulted);
+    BdLogCapped(line);
+}
+void BdZoneRebuildTick()   /* MAIN THREAD, every tick (BdWalkMapHeldTick) */
+{
+    if (g_zoneRb.empty() || BdOnMain() == 0) return;
+    const DWORD now = ::GetTickCount();
+    for (size_t i = 0; i < g_zoneRb.size(); )
+    {
+        BdZoneRb& z = g_zoneRb[i];
+        int ready = 0;
+        z.noBox = 0; z.partsLoading = 0; z.noBodies = 0;
+        for (size_t k = 0; k < z.p.size(); )
+        {
+            const BdZrbPiece& q = z.p[k];
+            if (q.data != BdPtrAt(q.b, kObjData) || q.vt != BdPtrAt(q.b, 0)) { ++g_zrbGone; z.p.erase(z.p.begin() + (std::ptrdiff_t)k); continue; }   /* removed since: another object or none at its address */
+            float bx[6];
+            int loading = 1;
+            const int boxRd = BdBoxPod(q.b, bx, &loading);
+            const int grown = (boxRd != 0) ? coopbuild::BuildWalkMapBoxGrownReal(bx) : 0;
+            int ents = 0, bodies = 0;   /* fold 2 (F1361 NIT): its physics bodies, read as the piece check reads them */
+            if (PcPhysPod(q.b, &ents, &bodies) != 1) bodies = -1;
+            if (grown == 0) ++z.noBox;
+            if (boxRd == 0 || loading > 0) ++z.partsLoading;
+            if (bodies <= 0) ++z.noBodies;
+            if (boxRd != 0 && coopbuild::BuildZoneRebuildPieceReady(grown, loading, bodies) != 0) ++ready;
+            ++k;
+        }
+        if (z.p.empty())
+        {
+            ++g_zrbGaveUp;
+            BdZoneRbLine(z, "GAVE UP: every noted piece is gone", 0, 0, -1, -1);
+            g_zoneRb.erase(g_zoneRb.begin() + (std::ptrdiff_t)i);
+            continue;
+        }
+        const int due = (z.runSince != 0) ? coopbuild::kZrbAsk : coopbuild::BuildZoneRebuildDue((int)z.p.size(), ready, now - z.lastAt, now - z.firstAt);
+        if (due == coopbuild::kZrbKeep) { ++i; continue; }
+        const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+        const unsigned long long rZm = Rva("ZoneManagerPtr");
+        const int rowsOk = (kBdZoneRbRva != 0 && kBdNavMgrRva != 0 && rZm != 0) ? 1 : 0;
+        void* nav = (rowsOk != 0) ? BdPtrAt((const void*)(base + (uintptr_t)kBdNavMgrRva), 0) : 0;
+        void* zm = (rowsOk != 0) ? BdPtrAt((const void*)(base + (uintptr_t)rZm), 0) : 0;
+        void* zmap = (void*)(uintptr_t)loadedzones::ZoneMapAddr((unsigned long long)(uintptr_t)zm, z.sx, z.sy);
+        int area = 0, curType = -1, qType = -1, skipRun = 0, skipQ = 0, qFull = 0;
+        const int rd = (rowsOk != 0 && nav != 0 && zmap != 0) ? BdZoneRbReadPod(nav, zmap, &area, &curType, &qType, &skipRun, &skipQ, &qFull) : 0;
+        if (rowsOk != 0 && rd == 0)
+        {
+            ++g_zrbFaulted;
+            /* fold 2 (F1361 NIT): a fault reading the area or the job list (read without the engine's lock, as 0x3BF360 reads it) is
+               tried again next tick, kZoneRbReadRetries times, before the area is given up */
+            if (nav != 0 && zmap != 0 && coopbuild::BuildZoneRebuildReadRetry(++z.faults) != 0) { ++i; continue; }
+            BdZoneRbLine(z, nav == 0 ? "NOT ASKED: the walking-map manager is not made" : zmap == 0 ? "NOT ASKED: the area is off the zone grid" : "NOT ASKED: the area or the engine's job list could not be read", ready, 0, curType, qType);
+            g_zoneRb.erase(g_zoneRb.begin() + (std::ptrdiff_t)i);
+            continue;
+        }
+        const int act = coopbuild::BuildZoneRebuildAct(rowsOk, area, skipRun, skipQ, qFull);
+        if (act == coopbuild::kZrbAgainRunning || act == coopbuild::kZrbAgainQueued)   /* fold 2: a queued non-Full waits as a running job does */
+        {
+            if (z.runSince == 0) { z.runSince = now; ++g_zrbAgain; BdZoneRbLine(z, coopbuild::BuildZoneRebuildActWord(act), ready, 0, curType, qType); }
+            else if ((unsigned int)(now - z.runSince) >= coopbuild::kZoneRbRunWaitMs)
+            {
+                ++g_zrbGaveUp;
+                BdZoneRbLine(z, act == coopbuild::kZrbAgainRunning ? "GAVE UP: the engine's own job for this area kept running (0x3BF360)"
+                                                                   : "GAVE UP: a queued engine job for this area that is not a Full stayed queued (0x3BF360)", ready, 0, curType, qType);
+                g_zoneRb.erase(g_zoneRb.begin() + (std::ptrdiff_t)i);
+                continue;
+            }
+            ++i;
+            continue;
+        }
+        const int timedOut = (due == coopbuild::kZrbAskTimedOut) ? 1 : 0;
+        if (act == coopbuild::kZrbDoAsk)
+        {
+            if (timedOut != 0) ++g_zrbTimedOut;
+            if (BdZoneRbCallPod(base + (uintptr_t)kBdZoneRbRva, nav, zmap) != 0) { ++g_zrbAsked; BdZoneRbLine(z, "ASKED the engine's own area rebuild 0x3AB700 (Full + every building's inside)", ready, timedOut, curType, qType); }
+            else { ++g_zrbFaulted; BdZoneRbLine(z, "FAULTED in the engine's area rebuild 0x3AB700", ready, timedOut, curType, qType); }
+        }
+        else
+        {
+            if (act == coopbuild::kZrbDoneQueued) ++g_zrbSkipQueued;
+            else if (act == coopbuild::kZrbNoArea) ++g_zrbNoArea;
+            else if (act == coopbuild::kZrbNoRows) ++g_zrbNoRows;
+            BdZoneRbLine(z, coopbuild::BuildZoneRebuildActWord(act), ready, timedOut, curType, qType);
+        }
+        g_zoneRb.erase(g_zoneRb.begin() + (std::ptrdiff_t)i);
+    }
+}
+/* MAIN THREAD: an area ended here (left: its sectors; 0 = the world was left) - its rebuild gives up, logged once */
+void BdZoneRebuildAreaEnd(const unsigned char* left)
+{
+    for (size_t i = 0; i < g_zoneRb.size(); )
+    {
+        const int sec = g_zoneRb[i].sx * 64 + g_zoneRb[i].sy;
+        if (left != 0 && (sec < 0 || sec >= coopbuild::kBuildZoneSectorCells || left[sec] == 0)) { ++i; continue; }
+        ++g_zrbGaveUp;
+        BdZoneRbLine(g_zoneRb[i], left != 0 ? "GAVE UP: its area ended" : "GAVE UP: the world was left", 0, 0, -1, -1);
+        g_zoneRb.erase(g_zoneRb.begin() + (std::ptrdiff_t)i);
+    }
+}
 /* MAIN THREAD: piece b waits for its body (cross 1: a wall's crossing waits too) */
 void BdBodyWaitAdd(void* b, const char* key, int event, int cross)
 {
     for (size_t i = 0; i < g_wmBodyWait.size(); ++i)
-        if (g_wmBodyWait[i].b == b) { g_wmBodyWait[i].cross |= cross; return; }
+        if (g_wmBodyWait[i].b == b)
+        {
+            BdBoxWaitTake(b);   /* T-1428 fold 1: its crossing's arrival asks its box again (BdBodyArrivedMain) */
+            g_wmBodyWait[i].cross |= cross;
+            if (g_wmBodyWait[i].walk == 0) { g_wmBodyWait[i].since = ::GetTickCount(); g_wmBodyWait[i].road = event; }   /* T-1428: the walk map's wait starts now */
+            g_wmBodyWait[i].walk = 1;
+            return;
+        }
     char line[400];
     if ((int)g_wmBodyWait.size() >= coopbuild::kWmBodyWaitCap)
     {
         ++g_wmBodyWaitDropped;
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1294 body wait key=%.63s event=%s NOT KEPT: %d pieces already wait; walkMapBodyDropped=%lld",
+        ++g_wmBoxGaveUp;   /* T-1428: a give-up, logged once with its key */
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1294 body wait key=%.63s event=%s NOT KEPT (GAVE UP: its walking-map ask is not made): %d pieces already wait; walkMapBodyDropped=%lld",
                     key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), coopbuild::kWmBodyWaitCap, g_wmBodyWaitDropped);
         BdLogCapped(line);
         return;
     }
     BdBodyWait w;
-    w.b = b; w.data = BdPtrAt(b, kObjData); w.key = (key != 0) ? key : ""; w.cross = cross; w.since = ::GetTickCount();
+    w.b = b; w.data = BdPtrAt(b, kObjData); w.key = (key != 0) ? key : ""; w.cross = cross; w.since = ::GetTickCount(); w.walk = 1; w.pc = 0; w.bodies = 0; w.road = event; w.vt = BdPtrAt(b, 0);   /* T-1428: its vtable, checked with its game data before the tick asks */
     g_wmBodyWait.push_back(w);
     BdBodyWaitSync();
+    BdBoxWaitTake(b);   /* T-1428 fold 1: its crossing's arrival asks its box again (BdBodyArrivedMain) */
     ++g_wmBodyWaitAdded;
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1294 body wait key=%.63s event=%s: no physics body yet (+0x228 empty)%s - queued again when createPhysical gives it one; waiting=%d",
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1294 body wait key=%.63s event=%s: no physics body yet (+0x228 empty)%s - asked again at createPhysical; waiting=%d",
                 key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), cross != 0 ? ", its wall crossing too" : "", (int)g_wmBodyWait.size());
     BdLogCapped(line);
 }
+/* T-1389, MAIN THREAD: the piece check's wait for piece b's physics-arrived event (the same createPhysical hook; the arrival queues a check
+   of `key`). At most kPcBodyWaitPcCap such waits that the walk map does not share - the oldest is let go for a new one (a piece of an
+   area since unloaded never gets its arrival). 1 = waits */
+int PcBodyWaitAdd(void* b, const std::string& key)
+{
+    const int bodies = (BdBodyListPod(b) == 1) ? 1 : 0;   /* T-1389 (F1114): its holder is made - it waits for its bodies (BdBodyArrivedTick) */
+    for (size_t i = 0; i < g_wmBodyWait.size(); ++i)
+        if (g_wmBodyWait[i].b == b) { g_wmBodyWait[i].pc = 1; g_wmBodyWait[i].pcKey = key; g_wmBodyWait[i].bodies = bodies; return 1; }
+    int pcOnly = 0;
+    size_t oldest = g_wmBodyWait.size();
+    for (size_t i = 0; i < g_wmBodyWait.size(); ++i)
+        if (g_wmBodyWait[i].walk == 0) { ++pcOnly; if (oldest == g_wmBodyWait.size()) oldest = i; }
+    if (pcOnly >= kPcBodyWaitPcCap && oldest < g_wmBodyWait.size())
+    {   /* T-1389 fold 4: the piece let go waits again at its next event (never NOT whole for a wait it never finished) */
+        std::map<std::string, PcSeenRow>::iterator ev = g_pcSeen.find(g_wmBodyWait[oldest].pcKey);
+        if (ev != g_pcSeen.end() && ev->second.waitB == g_wmBodyWait[oldest].b) ev->second.waitB = 0;
+        g_wmBodyWait.erase(g_wmBodyWait.begin() + (std::ptrdiff_t)oldest);
+        ++g_pcDropped;
+    }
+    if ((int)g_wmBodyWait.size() >= coopbuild::kWmBodyWaitCap) { ++g_pcDropped; BdBodyWaitSync(); return 0; }
+    BdBodyWait w;
+    w.b = b; w.data = BdPtrAt(b, kObjData); w.cross = 0; w.since = ::GetTickCount(); w.walk = 0; w.pc = 1; w.pcKey = key; w.bodies = bodies; w.road = 0; w.vt = BdPtrAt(b, 0);
+    g_wmBodyWait.push_back(w);
+    BdBodyWaitSync();
+    return 1;
+}
+int PcBodyWaitPending(const void* b)   /* T-1389 fold 4, MAIN THREAD */
+{
+    for (size_t i = 0; i < g_wmBodyWait.size(); ++i) if (g_wmBodyWait[i].b == b && g_wmBodyWait[i].pc != 0) return 1;
+    return 0;
+}
 void BdBodyWaitForget(void* b)   /* MAIN THREAD: a piece being removed waits no more */
 {
+    for (std::map<std::string, PcSeenRow>::iterator it = g_pcSeen.begin(); it != g_pcSeen.end(); ++it)   /* T-1389 re-check: nor its age */
+        if (it->second.waitFirstB == b) it->second.waitFirstB = 0;
+    BdBoxWaitTake(b);   /* T-1428 fold 1: nor its box */
     for (size_t i = 0; i < g_wmBodyWait.size(); ++i)
         if (g_wmBodyWait[i].b == b) { g_wmBodyWait.erase(g_wmBodyWait.begin() + (std::ptrdiff_t)i); BdBodyWaitSync(); return; }
 }
+/* T-1389 (F1114), MAIN THREAD: piece b's area ended - the piece check's watch of its bodies ends (its reload is a new object and a new
+   wait); a walk-map wait on it is kept */
+void PcBodiesWatchForget(void* b)
+{
+    if (b == 0) return;
+    for (size_t i = 0; i < g_wmBodyWait.size(); ++i)
+    {
+        if (g_wmBodyWait[i].b != b || g_wmBodyWait[i].bodies == 0) continue;
+        if (g_wmBodyWait[i].walk != 0) { g_wmBodyWait[i].pc = 0; g_wmBodyWait[i].bodies = 0; return; }
+        g_wmBodyWait.erase(g_wmBodyWait.begin() + (std::ptrdiff_t)i);
+        BdBodyWaitSync();
+        return;
+    }
+}
+/* T-1428: a walk-map wait given up, logged once with its key */
+void BdWalkWaitGiveUpLine(const std::string& key, int road, DWORD since, int why)
+{
+    ++g_wmBoxGaveUp;
+    char line[300];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1428 walking map key=%.63s road=%s GAVE UP after %lu ms: %s before its box was real; walkMapBoxGaveUp=%lld",
+                key.empty() ? "-" : key.c_str(), coopbuild::BuildWalkMapEventWord(road), (unsigned long)(::GetTickCount() - since),
+                coopbuild::BuildWalkMapGiveUpWord(why), g_wmBoxGaveUp);
+    BdLogCapped(line);
+}
 void BdBodyWaitClear()   /* MAIN THREAD: a world left */
 {
+    for (size_t i = 0; i < g_wmBodyWait.size(); ++i)   /* T-1428: each walk-map wait gives up, logged once with its key */
+        if (g_wmBodyWait[i].walk != 0) BdWalkWaitGiveUpLine(g_wmBodyWait[i].key, g_wmBodyWait[i].road, g_wmBodyWait[i].since, coopbuild::kWmGiveUpWorld);
+    for (size_t i = 0; i < g_wmBoxWaits.size(); ++i)   /* T-1428 fold 1: the box waits' own list too */
+        BdWalkWaitGiveUpLine(g_wmBoxWaits[i].key, g_wmBoxWaits[i].road, g_wmBoxWaits[i].since, coopbuild::kWmGiveUpWorld);
+    BdZoneRebuildAreaEnd(0);   /* T-1428 attempt 2: every area rebuild still waiting */
+    g_wmBoxWaits.clear();
+    g_wmZonePrevHave = 0;   /* T-1428 fold 1 (review 5): the next world's active list starts afresh */
     g_wmBodyWait.clear();
     BdBodyWaitSync();
     for (int i = 0; i < kWmArrivedSlots; ++i) ::InterlockedExchangePointer((void* volatile*)&g_wmArrivedOff[i], 0);
@@ -4690,13 +5899,139 @@ int BdEngineInteriorPod(void* b, int* kind, int* ptr, int* wallPart, int* gate, 
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+
+/* T-1426 (coopbuild::BuildWalkMapHostInterior): a furniture piece's host, read as the confirm's build step 0x4D6810 reads it
+   (decomp_4d6810:365-373) - the piece's own vt+0x1D8 answers its host hand, type word +8 (0xB = none) - and turned into the building
+   with hand::asBuilding (row HandGetBuilding 0x791D70 [the same row doors.cpp / items.cpp bind]; it answers a building only for a
+   building hand). MAIN THREAD (it calls the piece's own vtable). 1 read (*host 0 = none / not a building), 0 a fault or no row */
+static unsigned long long kBdHostHandBldRva = 0; static AddrReg kBdHostHandBldRva_reg("HandGetBuilding", &kBdHostHandBldRva);   /* Steam_1.0.65 0x791D70 */
+const size_t kBVtHostHand = 0x1D8, kHostHandType = 0x08;
+const int kHostHandNone = 0xB;
+int BdHostOfPod(void* b, void** host, int* type)
+{
+    typedef void* (*BdVtHandFn)(void*);
+    typedef void* (*BdHandBldFn)(const void*);
+    *host = 0; *type = -1;
+    if (kBdHostHandBldRva == 0) return 0;
+    __try
+    {
+        void* const* vt = *(void* const* const*)b;
+        void* h = ((BdVtHandFn)vt[kBVtHostHand / 8])(b);
+        if (h == 0) return 1;
+        *type = *(const int*)((const char*)h + kHostHandType);
+        if (*type == kHostHandNone) return 1;
+        void* hb = ((BdHandBldFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kBdHostHandBldRva))(h);
+        *host = (hb != b) ? hb : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *host = 0; return 0; }
+}
+long long g_wmHostQueued = 0, g_wmHostNone = 0, g_wmHostNoInterior = 0, g_wmHostSameTick = 0, g_wmHostFaulted = 0, g_wmHostNoList = 0;
+const int kWmHostTickCap = 16;
+void* g_wmHostTick[kWmHostTickCap];   /* MAIN THREAD: the hosts queued this tick (g_wmHostTickNo) */
+int g_wmHostTickN = 0;
+long long g_wmHostTickAt = -1;
+std::string BdWalkMapHostReportText()
+{
+    char b[200];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, " walkMapHost[queued,none,noInterior,sameTick,faulted,noList]=%lld,%lld,%lld,%lld,%lld,%lld",
+                g_wmHostQueued, g_wmHostNone, g_wmHostNoInterior, g_wmHostSameTick, g_wmHostFaulted, g_wmHostNoList);
+    return std::string(b);
+}
+/* MAIN THREAD, from BdWalkMapNote. A furniture piece's event owes its HOST's interior walking map (the engine's confirm queues it so):
+   queued once per host per tick (the list drains on a later frame, so one job covers every piece of the tick). 1 = queued */
+int BdWalkMapHostNote(void* b, int event, const char* key)
+{
+    const int furn = (BdPtrAt(b, kBFurnitureOf) != 0 || BdByteAtOr0(b, kBInteriorObj) != 0) ? 1 : 0;
+    if (coopbuild::BuildWalkMapHostInterior(event, furn, 1, 1) == 0) return 0;   /* not owed: nothing read */
+    char line[400];
+    void* host = 0;
+    int htype = -1;
+    if (BdHostOfPod(b, &host, &htype) == 0)
+    {
+        ++g_wmHostFaulted;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1426 host walking map key=%.63s event=%s NOT QUEUED: the piece's host hand could not be read%s; walkMapHostFaulted=%lld",
+                    key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), kBdHostHandBldRva == 0 ? " (HandGetBuilding is not in the address table)" : "", g_wmHostFaulted);
+        BdLogCapped(line);
+        return 0;
+    }
+    int eiKind = 0, eiPtr = 0, eiWallPart = 0, eiGate = 0, eiFlag = 0, eiRead = 0, hostInterior = 0;
+    if (host != 0)
+    {
+        eiRead = BdEngineInteriorPod(host, &eiKind, &eiPtr, &eiWallPart, &eiGate, &eiFlag);
+        hostInterior = coopbuild::BuildEngineGivesInterior(eiRead, eiKind, eiPtr, eiWallPart, eiGate, eiFlag);
+    }
+    const int act = coopbuild::BuildWalkMapHostInterior(event, furn, host != 0 ? 1 : 0, hostInterior);
+    char hk[kKeyCap];
+    hk[0] = 0;
+    if (host != 0 && ObjectPositionKey(host, hk, kKeyCap, "", 3, 0) == 0) hk[0] = 0;
+    if (act != 1)
+    {
+        if (act == coopbuild::kWmHostNone) ++g_wmHostNone; else ++g_wmHostNoInterior;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1426 host walking map key=%.63s event=%s host=%.63s NOT QUEUED: %s (hand type %d, interior read=%d ptr=%d wall=%d gate=%d flag=%d); walkMapHost[none,noInterior]=%lld,%lld",
+                    key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), hk[0] != 0 ? hk : "-",
+                    act == coopbuild::kWmHostNone ? "the piece names no host building" : "the engine gives the host no interior walking map",
+                    htype, eiRead, eiPtr, eiWallPart, eiGate, eiFlag, g_wmHostNone, g_wmHostNoInterior);
+        BdLogCapped(line);
+        return 0;
+    }
+    if (g_wmHostTickAt != g_wmHostTickNo) { g_wmHostTickAt = g_wmHostTickNo; g_wmHostTickN = 0; }
+    for (int i = 0; i < g_wmHostTickN; ++i) if (g_wmHostTick[i] == host) { ++g_wmHostSameTick; return 0; }
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    void* list = (kBdWmListRva != 0) ? BdPtrAt((const void*)(base + (uintptr_t)kBdWmListRva), 0) : 0;
+    if (kBdWmBoxRva == 0 || kBdWmIntRva == 0 || list == 0)
+    {
+        ++g_wmHostNoList;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1426 host walking map key=%.63s event=%s host=%.63s NOT QUEUED: %s; walkMapHostNoList=%lld",
+                    key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), hk[0] != 0 ? hk : "-",
+                    list == 0 && kBdWmListRva != 0 ? "the engine's build list is not made yet" : "WalkMapDeferInterior / BuildPreviewListGlobal is not in the address table", g_wmHostNoList);
+        BdLogCapped(line);
+        return 0;
+    }
+    int held = 0, kept = 0;
+    if (BdWalkMapPod(list, host, 0, coopbuild::kWmInterior, base + (uintptr_t)kBdWmBoxRva,   /* interior only: no box (T-1428's box is the outline step's) */ base + (uintptr_t)kBdWmIntRva, &held, &kept) == 0)
+    {
+        ++g_wmHostFaulted;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1426 host walking map key=%.63s event=%s host=%.63s FAULTED; walkMapHostFaulted=%lld",
+                    key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), hk[0] != 0 ? hk : "-", g_wmHostFaulted);
+        BdLogCapped(line);
+        return 0;
+    }
+    if (g_wmHostTickN < kWmHostTickCap) g_wmHostTick[g_wmHostTickN++] = host;
+    ++g_wmHostQueued;
+    if (held != 0) { ++g_wmHeld; g_wmHeldPending = 1; }
+    if (kept != 0) ++g_wmConfirmKept;
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1426 host walking map key=%.63s event=%s host=%.63s queued interior=1 (furniture: the host's interior, as the engine's confirm); walkMapHostQueued=%lld%s",
+                key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), hk[0] != 0 ? hk : "-", g_wmHostQueued,
+                held != 0 ? " - this player is in build mode: the list waits for the next queue made outside it" : "");
+    BdLogCapped(line);
+    return 1;
+}
+/* T-1430 (c): a purchase applied here queues the HOUSE's interior walking map as the engine purchase does (0x4D2340(list, house, 0),
+   decomp_7acb20:255 - unconditionally, as there). 1 queued, -2 no row / the list not made yet, -1 faulted; *held = queued in build mode */
+int BdBuyWalkMap(void* b, int* held)
+{
+    *held = 0;
+    if (BdOnMain() == 0) { ++g_wmOffMain; return -1; }
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    void* list = (kBdWmListRva != 0) ? BdPtrAt((const void*)(base + (uintptr_t)kBdWmListRva), 0) : 0;
+    if (kBdWmBoxRva == 0 || kBdWmIntRva == 0 || list == 0) { ++g_wmNoList; return -2; }
+    int kept = 0;
+    if (BdWalkMapPod(list, b, 0, coopbuild::kWmInterior,   /* interior only: no box */  base + (uintptr_t)kBdWmBoxRva, base + (uintptr_t)kBdWmIntRva, held, &kept) == 0) { ++g_wmFaulted; return -1; }
+    ++g_wmInterior;
+    if (*held != 0) { ++g_wmHeld; g_wmHeldPending = 1; }
+    if (kept != 0) ++g_wmConfirmKept;
+    return 1;
+}
 /* MAIN THREAD. The engine's own walking-map steps one mod event owes for piece b (coopbuild::BuildWalkMapWhat), queued on the engine's
    deferred list. Returns what was queued (kWmBox | kWmInterior), 0 = nothing owed or not queued (counted, logged) */
-int BdWalkMapNote(void* b, int event, const char* key)
+int BdWalkMapNote(void* b, int event, const char* key, int road, long waitedMs, int force)
 {
     if (b == 0) return 0;
     if (BdOnMain() == 0) { ++g_wmOffMain; return 0; }
+    if (event == coopbuild::kWmFinished) BdTownStoreNote(b, key, "finished (by the mod)");   /* T-1427 (decision 1782): every mod finish road ends here */
     if (event == coopbuild::kWmRemoved) BdBodyWaitForget(b);   /* T-1294 fold 2 */
+    BdWalkMapHostNote(b, event, key);   /* T-1426: a furniture piece owes its host's interior (the engine's confirm queues it so) */
     float p = 0, n = 0, t = 0;
     int c = 0, d = 0, x = 0;
     char line[400];
@@ -4716,9 +6051,43 @@ int BdWalkMapNote(void* b, int event, const char* key)
     if (eiRead == 0) ++g_wmInteriorFaulted;
     else if (eiPtr != 0 && interior == 0) ++g_wmInteriorEngineNo;
     const int furn = (BdPtrAt(b, kBFurnitureOf) != 0 || BdByteAtOr0(b, kBInteriorObj) != 0) ? 1 : 0;
-    const int what = coopbuild::BuildWalkMapWhat(event, solid, interior, furn, wall);
-    if (coopbuild::BuildWalkMapBodyWait(event, BdBodyListPod(b), furn) != 0) BdBodyWaitAdd(b, key, event, 0);   /* T-1294 fold 2 (M2): queued again at its body */
-    if (what == 0) { ++g_wmNone; return 0; }
+    int what0 = coopbuild::BuildWalkMapWhat(event, solid, interior, furn, wall);
+    float bx[6] = { 0, 0, 0, 0, 0, 0 };   /* the building's box (+0x27C, six floats as the engine stores them: centre, half-size) */
+    int loading = 1;   /* T-1428 fold 1: its model parts still loading (+0x230) */
+    const int boxRead = BdBoxPod(b, bx, &loading);
+    const int boxReal = (boxRead != 0) ? coopbuild::BuildWalkMapBoxGrownReal(bx) : 0;   /* fold 1 (review 3): the grown copy, as the engine tests it */
+    const int boxReady = (boxRead != 0) ? coopbuild::BuildWalkMapBoxReady(boxReal, loading) : 0;
+    /* T-1428 (F1226): the wait is decided by the box itself (the engine's job-adding test), not the physics holder - a box not ready
+       (fold 1: not real, or model parts still loading) waits in its own list and is asked again the first tick it is ready
+       (BdBodyArrivedTick); nothing goes now (fold 1, review 4: its interior goes after its box, as the engine orders them). force: the
+       wait timed out - asked with the box it has, or its interior alone */
+    if (force != 0 && boxReal == 0) what0 &= ~coopbuild::kWmBox;
+    const int boxWait = (force != 0) ? 0 : coopbuild::BuildWalkMapBoxWait(event, what0, boxReady);
+    if (boxWait != 0) { BdBoxWaitAdd(b, key, road != 0 ? road : event, ::GetTickCount() - (DWORD)(waitedMs > 0 ? waitedMs : 0)); ++g_wmBoxWait; }
+    const int what = coopbuild::BuildWalkMapQueueNow(what0, boxWait);
+    char wt[160];
+    wt[0] = 0;
+    if (road != 0 || waitedMs >= 0) _snprintf_s(wt, sizeof(wt), _TRUNCATE, " road=%s waited=%ld ms", coopbuild::BuildWalkMapEventWord(road != 0 ? road : event), waitedMs);
+    if (force != 0)
+    {   /* T-1428 fold 1: the give-up, logged once */
+        ++g_wmBoxTimedOut;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1428 walking map key=%.63s%s TIMED OUT (%u ms): %s; partsLoading=%d aabb=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f; walkMapBoxTimedOut=%lld",
+                    key != 0 ? key : "-", wt, coopbuild::kWmBoxWaitMs, boxReal != 0 ? "asked with the box it has (model parts still loading)" : "no real box - its interior alone, its box GAVE UP",
+                    loading, bx[0], bx[1], bx[2], bx[3], bx[4], bx[5], g_wmBoxTimedOut);
+        BdLogCapped(line);
+    }
+    if (what == 0)
+    {
+        ++g_wmNone;
+        if (boxWait != 0)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1428 walking map key=%.63s event=%s%s box WAITS: not ready aabb=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f partsLoading=%d%s (solid=%d complete=%d); boxWaiting=%d",
+                        key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), wt, bx[0], bx[1], bx[2], bx[3], bx[4], bx[5], loading,
+                        boxRead == 0 ? " (unreadable)" : "", solid, c, (int)g_wmBoxWaits.size());
+            BdLogCapped(line);
+        }
+        return 0;
+    }
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     void* list = (kBdWmListRva != 0) ? BdPtrAt((const void*)(base + (uintptr_t)kBdWmListRva), 0) : 0;
     if (kBdWmBoxRva == 0 || kBdWmIntRva == 0 || list == 0)
@@ -4731,7 +6100,9 @@ int BdWalkMapNote(void* b, int event, const char* key)
         return 0;
     }
     int held = 0, kept = 0;
-    if (BdWalkMapPod(list, b, what, base + (uintptr_t)kBdWmBoxRva, base + (uintptr_t)kBdWmIntRva, &held, &kept) == 0)
+    float nb[6];
+    coopbuild::BuildWalkMapBoxNudged(bx, nb);   /* T-1428: grown as the engine's own asks grow it (+0x288 by 5.0) */
+    if (BdWalkMapPod(list, b, nb, what, base + (uintptr_t)kBdWmBoxRva, base + (uintptr_t)kBdWmIntRva, &held, &kept) == 0)
     {
         ++g_wmFaulted;
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1294 walking map key=%.63s event=%s FAULTED; walkMapFaulted=%lld",
@@ -4739,14 +6110,13 @@ int BdWalkMapNote(void* b, int event, const char* key)
         BdLogCapped(line);
         return 0;
     }
-    float bx[6] = { 0, 0, 0, 0, 0, 0 };   /* the box queued (+0x27C, six floats as the engine stores them) - the readout's wall extent and facing */
-    for (int i = 0; i < 6; ++i) BdFloatAtOr0(b, kBWmBox + 4 * (size_t)i, &bx[i]);
     if ((what & coopbuild::kWmBox) != 0) ++g_wmBox;
     if ((what & coopbuild::kWmInterior) != 0) ++g_wmInterior;
     if (held != 0) { ++g_wmHeld; g_wmHeldPending = 1; }
     if (kept != 0) ++g_wmConfirmKept;
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1294 walking map key=%.63s event=%s queued box=%d interior=%d%s (solid=%d progress %.2f/%.2f threshold %.2f complete=%d) aabb=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f%s",
-                key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), (what & coopbuild::kWmBox) != 0 ? 1 : 0, (what & coopbuild::kWmInterior) != 0 ? 1 : 0,
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1294 walking map key=%.63s event=%s%s queued box=%d%s interior=%d%s (solid=%d progress %.2f/%.2f threshold %.2f complete=%d) aabb=%.1f,%.1f,%.1f,%.1f,%.1f,%.1f%s",
+                key != 0 ? key : "-", coopbuild::BuildWalkMapEventWord(event), wt, (what & coopbuild::kWmBox) != 0 ? 1 : 0,
+                boxWait != 0 ? " (WAITS: its box is not real yet)" : "", (what & coopbuild::kWmInterior) != 0 ? 1 : 0,
                 eiRead == 0 ? " (the engine's interior test unreadable)" : (eiPtr != 0 && interior == 0)
                     ? (eiGate != 0 ? " (has an interior pointer; the engine gives a gate none)" : eiWallPart != 0 ? " (has an interior pointer; the engine gives a wall none)"
                        : " (has an interior pointer; the engine's test says no)") : "",
@@ -4885,6 +6255,131 @@ int BdWallCrossPod(void* b, float target, uintptr_t upd, const char* key, int re
     BdLogCapped(line);
     return ok != 0 ? 1 : -3;
 }
+/* T-1408 (F1216 design read). A wall group as the engine walks it (BdWallNbrPod's walk): b's lead (b's record less kWallOwnRecord), its
+   listed entries (+0x390) and how many resolve here; the members other than the lead with their own needed (+0x188). POD, any thread
+   that may call the handle lookup (the main thread here). 1 = the lead read */
+const int kWallGrpCap = 64;
+int BdWallGroupPod(void* b, uintptr_t fRes, uintptr_t tab, void** lead, int* listed, int* resolved, void** mem, float* memN, int cap, int* nMem)
+{
+    *lead = 0; *listed = -1; *resolved = 0; *nMem = 0;
+    const uintptr_t rec = BdWallRecordPod(b);
+    if (rec == 0 || rec < (uintptr_t)kWallOwnRecord || fRes == 0 || tab == 0) return 0;
+    void* L = (void*)(rec - kWallOwnRecord);
+    if (L != b && BdIsWall(L) != 1) return 0;
+    __try
+    {
+        const unsigned int n = *(const unsigned int*)((const char*)L + kWallGroupCount);
+        const char* arr = *(const char* const*)((const char*)L + kWallGroupArr);
+        if (n > 100000u || (n > 0 && arr == 0)) return 0;
+        *lead = L;
+        *listed = (int)n;
+        for (unsigned int i = 0; i < n; ++i)
+        {
+            const char* e = arr + (size_t)i * kWallGroupStride;
+            if (*(const int*)(e + 8) != 0) continue;
+            void* q = ((BdHandleResFn)fRes)((void*)tab, e);
+            if (q == 0) continue;
+            ++*resolved;
+            if (q == L || *nMem >= cap) continue;
+            mem[*nMem] = q;
+            memN[*nMem] = *(const float*)((const char*)q + kWallOwnRecord + 0x28);
+            ++*nMem;
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int BdWallShareWritePod(void* q, float v, uintptr_t upd)   /* a member's own progress +0x164 (what its vt+0x238 0x559040 writes), then 0x558680 */
+{
+    __try
+    {
+        *(float*)((char*)q + kBOwnProgress) = v;
+        if (upd != 0) ((BdVoidFn)upd)(q);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1408, MAIN THREAD, inside the mod's own writes: every member of b's group drawn again from its lead's progress / needed
+   (coopbuild::BuildWallMemberShare - the share the engine's wall step 0x5594A0 draws after each step), one capped line. On the helper's
+   game after its help step on its lead copy (BdHelpAfter has capped the lead and its raised needed is back), on the owner's game after its
+   wall step. Returns how many were drawn, -1 the group did not read */
+int BdWallSharesRedraw(void* b, const char* road, const char* key)
+{
+    const unsigned long long rRes = Rva("CraftSelectedBuilding"), rTab = Rva("CraftSelectionGlobal"), rUpd = Rva("UpdatePhysicalWithProgress");
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    void* L = 0;
+    void* mem[kWallGrpCap];
+    float memN[kWallGrpCap];
+    int listed = -1, resolved = 0, nm = 0;
+    if (BdWallGroupPod(b, rRes != 0 ? base + (uintptr_t)rRes : 0, rTab != 0 ? base + (uintptr_t)rTab : 0, &L, &listed, &resolved, mem, memN, kWallGrpCap, &nm) == 0) return -1;
+    float lp = 0.0f, ln = 0.0f;
+    int lc = 0, ld = 0, lx = 0;
+    if (BdReadState(L, &lp, &ln, &lc, &ld, &lx) == 0) return -1;
+    const uintptr_t upd = (rUpd != 0) ? base + (uintptr_t)rUpd : 0;
+    int drawn = 0;
+    float sum = 0.0f, sumN = 0.0f, lo = -1.0f;
+    ++g_bdSelf;
+    for (int i = 0; i < nm; ++i)
+    {
+        const float v = coopbuild::BuildWallMemberShare(lp, ln, memN[i]);
+        if (v < 0.0f) continue;
+        if (BdWallShareWritePod(mem[i], v, upd) == 0) continue;
+        ++drawn;
+        sum += v;
+        sumN += memN[i];
+        if (lo < 0.0f || v < lo) lo = v;
+    }
+    --g_bdSelf;
+    g_wallSharesRedrawn += drawn;
+    char line[420];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 grouped wall key=%.63s (%s): lead %.2f/%.2f complete=%d - %d member share(s) drawn from it, sum %.2f of their needed %.2f (lowest %.2f); listed %d, loaded %d; wallSharesRedrawn=%lld",
+                key != 0 ? key : "-", road, lp, ln, lc, drawn, sum, sumN, lo, listed, resolved, g_wallSharesRedrawn);
+    BdLogHelpFreq(line);
+    return drawn;
+}
+/* T-1408, MAIN THREAD, THE OWNER'S GAME: b's group is whole here (coopbuild::BuildWallGroupWhole), its lead is b or a wall of b's owner and
+   not a ruin. *lead = the lead. 1 = whole */
+int BdWallGroupWholePod(void* b, void** lead, int* listed, int* resolved)
+{
+    const unsigned long long rRes = Rva("CraftSelectedBuilding"), rTab = Rva("CraftSelectionGlobal");
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    void* mem[kWallGrpCap];
+    float memN[kWallGrpCap];
+    int nm = 0;
+    *lead = 0; *listed = -1; *resolved = 0;
+    if (BdWallLeadSameOwner(b) == 0) return 0;
+    if (BdWallGroupPod(b, rRes != 0 ? base + (uintptr_t)rRes : 0, rTab != 0 ? base + (uintptr_t)rTab : 0, lead, listed, resolved, mem, memN, kWallGrpCap, &nm) == 0) return 0;
+    return coopbuild::BuildWallGroupWhole(*listed, *resolved);
+}
+/* T-1408, MAIN THREAD, THE OWNER'S GAME, inside the mod's own writes: the engine's own wall step on the group's lead with amount 0, after
+   the help's progress was written to the group's record - 0x5594A0 runs 0x558B10 (which adds rate x scaled amount = 0, finishes only at
+   needed) and draws every member's share from the lead (decomp_5594a0.txt). 0x558B10 sets progress to needed when the rate +0x18C is 0 or
+   below, so then no call (counted). Its call counter +0x190 (the damping of later calls) is put back. 1 = ran */
+const size_t kBStepCount = 0x190;
+int BdWallStepZero(void* lead, const char* key)
+{
+    float rate = 0.0f;
+    if (BdFloatAtOr0(lead, kBWmRate, &rate) == 0 || !(rate > 0.0f))
+    {
+        ++g_wallStepNoRate;
+        char line[300];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 owner's wall step key=%.63s NOT RUN: rate %.3f (0x558B10 would complete the group) - the member shares are drawn by the mod; wallStepNoRate=%lld",
+                    key != 0 ? key : "-", rate, g_wallStepNoRate);
+        BdLogHelpFreq(line);
+        return 0;
+    }
+    int cnt = 0;
+    const int cntOk = BdIntAt(lead, kBStepCount, &cnt);
+    ++g_bdSelf;
+    const int ok = BdProgressPod(lead, 0.0f);
+    --g_bdSelf;
+    if (cntOk != 0)
+    {
+        __try { *(int*)((char*)lead + kBStepCount) = cnt; }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return ok;
+}
 
 // MAIN THREAD. A piece that has just been created (the commit's createBuilding, or the lever's): registry + one line.
 // build1-b: `pos` / `rot` are the floats createBuilding received; `meta` bit 0 = they were read, bit 1 = furniture.
@@ -4948,6 +6443,7 @@ void BdOnNewPiece(void* b, int via, const float* pos, const float* rot, int meta
                 /* build1-f: what the PLACE carries, kept so the link-up roster can send it again */
                 r.placeOk = ((meta & 1) != 0 && pos != 0 && rot != 0 && ((meta & 2) == 0 || hkOk != 0)) ? 1 : 0;
                 for (int i = 0; i < 3; ++i) r.placePos[i] = ((meta & 1) != 0 && pos != 0) ? pos[i] : 0.0f;
+                r.placeMark = 1;   /* T-1372: createBuilding's own input (or one this build measured) */
                 for (int i = 0; i < 4; ++i) r.placeRot[i] = ((meta & 1) != 0 && rot != 0) ? rot[i] : 0.0f;
                 r.floor = ((meta & 2) != 0) ? floor : 0;
                 r.outside = ((meta & 2) != 0 && outside != 0) ? 1 : 0;
@@ -4968,7 +6464,8 @@ void BdOnNewPiece(void* b, int via, const float* pos, const float* rot, int meta
         }
     }
     else ++g_keyFailed;
-    if (keyOk != 0 && stOk != 0 && c != 0 && d == 0) PcQueue(std::string(key), via == 1 ? coopbuild::kPcRoadPlaced : coopbuild::kPcRoadLeverPlace);   /* T-988: made finished at its placement */
+    if (keyOk != 0) PcQueue(std::string(key), via == 1 ? coopbuild::kPcRoadPlaced : coopbuild::kPcRoadLeverPlace);   /* T-988; T-1389: at its placement, at any stage */
+    BdTownStoreNote(b, keyOk != 0 ? key : 0, via == 1 ? "placed here (the engine's placement)" : "placed here (not the engine's commit)");   /* T-1427 (decision 1782) */
     char line[512];
     std::sprintf(line, "[BUILD] placed key=%s sid=%s owner='%.60s' complete=%d progress=%.2f/%.2f via=%s%s",
                  keyOk != 0 ? key : "?", sid[0] != 0 ? sid : "?", owner.c_str(), c, p, n, via == 1 ? "hook" : (wasCopy ? "copy" : "test"),
@@ -5006,6 +6503,7 @@ void BdOnNewPiece(void* b, int via, const float* pos, const float* rot, int meta
     coopbuild::BuildMsg m;
     m.kind = coopbuild::kBuildPlace;
     m.key = key; m.sid = sid;
+    m.groundMark = 1;   /* T-1372 decision 1691: createBuilding's own input */
     for (int i = 0; i < 3; ++i) m.pos[i] = pos[i];
     for (int i = 0; i < 4; ++i) m.rot[i] = rot[i];
     m.complete = (unsigned char)(c != 0 ? 1 : 0);
@@ -5079,6 +6577,7 @@ void BdMaybeSendState(const std::string& key, BdReg& r)
 {
     if (r.own == 0 || r.via == 3 || r.dismantled != 0 || r.removed != 0) return;   /* a dismantle is build1-d's REMOVE */
     if (r.complete != 0) BdTwmFinished(key);   /* T-1078: once per piece */
+    r.progress = BdProgressKeep(r.progress, r.needed);   /* T-1408 fold 10 (F1331 1c): kept within 0..needed before it is noted, sent or written */
     PieceRecNoteState(key, r);   /* the world-server record: one write per change, whatever the other games were sent */
     if (r.sentOk == 0) { ++g_stateNoPlace; return; }
     const char* why = 0;
@@ -5194,6 +6693,7 @@ struct PcrKept
     PcrKept() : bytes(0) {}
 };
 std::map<std::string, PcrKept> g_pcrKept;   /* record id -> the newest record of that piece this game received (applied by PieceRecApplyTick) */
+long g_pcrKeptGen = 0;   /* T-1443 fold 3: moves at every change of g_pcrKept (an arrival, this game's own accepted write, a removal, a clear) - store.cpp's piece-owner cache */
 const DWORD kPcrBarTakeOpenMs = 12000;   /* fold 2: two of each game's 5 s writer re-decides plus margin - a hand-off written after the take lands within it */
 struct PcrW
 {
@@ -5202,6 +6702,7 @@ struct PcrW
     int haveSent; unsigned int sentGen;   /* this game's last write of it (or the stored generation a refusal named) */
     std::vector<char> lastProbe;     /* the last write's record at generation 0: the same record is not written again */
     int snapHave, snapComplete, snapDestroyed, snapBroken, snapN;   /* the own piece as last written */
+    std::string snapGLead; unsigned snapGIdx;   /* T-1408 fold 13: the group fact as last written (a change is a write of its own) */
     float snapProgress, snapMats[coopbuild::kBuildMaxMats];
     int moving;                      /* progress moved since the last write that was not a progress step */
     int removed, rmReason; unsigned int rmNonce;   /* a removal mark is owed (kept here: the row may be swept before the drain) */
@@ -5265,16 +6766,18 @@ struct PcrW
     float wkP;
     int wkOwe;                       /* T-23 review fold 4: a build step on this game's copy as its writer since the last work note */
     int wkFlush;                     /* T-23 review fold 4: that work noted at its area's unload - written with no piece here to ask */
+    int hcOn, hcWhy;                 /* T-1408 fold 11 (F1353, log only): a help confirmation marked to go in this record; the last reason logged */
+    unsigned int hcSeq;              /* its highest confirmed help number */
     PcrW() : marked(0), event(0), haveSent(0), sentGen(0), snapHave(0), snapComplete(0), snapDestroyed(0), snapBroken(0), snapN(0),
              snapProgress(0.0f), moving(0), removed(0), rmReason(0), rmNonce(0), holder(0), hComplete(0), hDestroyed(0), hProgress(0.0f),
              hNeeded(0.0f), retryWait(0), retrySeq(0), seedWait(0), lastHolder(0), writerSaid(0), held(0), waitEv(0), recheck(0), confirm(0), confirmSeq(0), confirmHolder(-1), confirmBit(-1)
-    { yieldSeen = 0; for (unsigned int i = 0; i < coopbuild::kBuildMaxMats; ++i) snapMats[i] = 0.0f;
+    { yieldSeen = 0; snapGIdx = 0; for (unsigned int i = 0; i < coopbuild::kBuildMaxMats; ++i) snapMats[i] = 0.0f;
       for (unsigned int i = 0; i < piecerec::kPrLiveMaxStocks; ++i) livePeak[i] = 0.0f;
       liveGridNow = -1; liveGridSnap = -1; liveGridMarked = -1; liveHolder = 0;
       liveNowLoad = 0; liveNowGen = 0; liveUnload = 0; liveWall = 0; liveFly = 0; liveFlyPrevGrid = -1; lastHit = 0; liveWallWait = 0;
       liveHandOff = 0; liveWorked = 0; liveStateHave = 0; liveStateSeen = 0; liveStateAt = 0u; barTake = 0; barLoadHave = 0; barLoad = 0u; barTakenGen = 0u; barTakeOpen = 0; barTakeAt = 0; doorNowLoad = 0u; doorNowGen = 0u; farmNowLoad = 0u; farmNowGen = 0u;
       for (unsigned int i = 0; i < piecerec::kPrLiveMaxStocks; ++i) liveFlyPrevPeak[i] = 0.0f;
-      hMatsN = -1; hAcksHave = 0; wkHave = 0; wkC = 0; wkD = 0; wkP = 0.0f; wkOwe = 0; wkFlush = 0;
+      hMatsN = -1; hAcksHave = 0; wkHave = 0; wkC = 0; wkD = 0; wkP = 0.0f; wkOwe = 0; wkFlush = 0; hcOn = 0; hcWhy = -1; hcSeq = 0u;
       for (unsigned int i = 0; i < coopbuild::kBuildMaxMats; ++i) hMats[i] = 0.0f; }
 };
 std::map<std::string, PcrW> g_pcrW;   /* record id -> this game's write state of that piece */
@@ -5305,9 +6808,101 @@ long long g_pcaOwnMade = 0, g_pcaOwnStateLaid = 0, g_pcaOwnMatsSave = 0, g_pcaOw
 long long g_pcaOwnMatsUnknown = 0, g_pcaOwnStateNoted = 0, g_pcaLookUnknown = 0;
 long long g_pcaStateDroppedNoLook = 0, g_pcaLookRetried = 0, g_pcaLookDropped = 0, g_pcaEdgeAreas = 0, g_pcaHeldKeptForLook = 0;
 long long g_pcaLookRewalk = 0, g_pcaLookRewalkCapped = 0;
+/* T-1408 fold 11 (F1353, log only): a help confirmation travels only inside the owner's own per-piece record (BdMaybeSendState writes
+   no message). Marked here when BdMaybeSendState's record note carries one; one line when the record carrying it is sent, and one per
+   new reason while it is not (BdLogHelp's cap) */
+long long g_hcMarked = 0, g_hcSent = 0, g_hcNotSent = 0;
+std::set<std::string> g_hcIds;   /* record ids with a confirmation marked and not yet sent */
+const char* PcrHcText(int why)
+{
+    switch (why)
+    {
+    case 1: return "this game writes no piece records (a lone game)";
+    case 2: return "the key makes no piece-record id";
+    case 3: return "the piece-record write table is full";
+    case 4: return "the world-server link is down (the mark stays)";
+    case 5: return "this game's slot is not known yet (the mark stays)";
+    case 6: return "held: waits for an event in its area (not the writer when last asked)";
+    case 7: return "held: refused before as not the writer - waits for that answer to turn";
+    case 8: return "dropped: not this game's own piece and this game is not its writer";
+    case 9: return "held: this game is not the piece's writer now";
+    case 10: return "held: its area's records are not all here yet";
+    case 11: return "held: T-1408 fold 4 - its shared record is not applied over it here yet";
+    case 12: return "dropped: the seed pass writes nothing (the piece has a record)";
+    case 13: return "dropped: a removal mark with no record to mark";
+    case 14: return "dropped: its row is removed or dismantled";
+    case 15: return "dropped: its placement inputs were never read";
+    case 16: return "dropped: the record could not be built (encode / decode)";
+    case 17: return "dropped: a kept record outranks it and its apply is still to come (first look yields)";
+    case 18: return "dropped: first look - the stored record already is this state (snapshot only)";
+    case 19: return "dropped: another player's piece with no live kept record";
+    case 20: return "dropped: another player's piece - the box rule does not name this game its writer";
+    case 21: return "dropped: no generation to write (gave up)";
+    case 22: return "dropped: larger than the 4 KB cap";
+    case 23: return "dropped: the very record this game wrote last, nothing newer stored since (no change to write)";
+    case 24: return "the send failed - no link (the mark stays)";
+    }
+    return "PcrWriteOne wrote nothing (no skip counter moved)";
+}
+void PcrHcSay(PcrW& w, const std::string& id, int why, int done)   /* why 0 = sent */
+{
+    if (w.hcOn == 0) return;
+    if (why == 0 || why != w.hcWhy)
+    {
+        char hl[420];
+        if (why == 0)
+        {
+            ++g_hcSent;
+            _snprintf_s(hl, sizeof(hl), _TRUNCATE, "[HELP] confirm key=%.63s seq<=%u: record write sent (event=%s); hc[marked,sent,notSent]=%lld,%lld,%lld",
+                        w.key.c_str(), w.hcSeq, piecerec::PieceEventName(w.event), g_hcMarked, g_hcSent, g_hcNotSent);
+        }
+        else
+        {
+            ++g_hcNotSent;
+            _snprintf_s(hl, sizeof(hl), _TRUNCATE, "[HELP] confirm key=%.63s seq<=%u: record write NOT sent: %s (event=%s); hc[marked,sent,notSent]=%lld,%lld,%lld",
+                        w.key.c_str(), w.hcSeq, PcrHcText(why), piecerec::PieceEventName(w.event), g_hcMarked, g_hcSent, g_hcNotSent);
+        }
+        BdLogHelp(hl);
+    }
+    w.hcWhy = why;
+    if (done != 0) { w.hcOn = 0; w.hcWhy = -1; g_hcIds.erase(id); }
+}
+void PcrHcAll(int why)   /* a reason that holds every marked confirmation at this drain */
+{
+    for (std::set<std::string>::iterator i = g_hcIds.begin(); i != g_hcIds.end(); )
+    {
+        std::map<std::string, PcrW>::iterator w = g_pcrW.find(*i);
+        if (w == g_pcrW.end()) { g_hcIds.erase(i++); continue; }
+        ++i;
+        PcrHcSay(w->second, w->first, why, 0);
+    }
+}
+/* the confirmations a record note of an own piece carries: 1 and the highest number when its rows hold any */
+int PcrHcSeqOf(const std::string& key, const BdReg& r, unsigned int* seq)
+{
+    *seq = 0u;
+    int have = 0;
+    const std::vector<coopbuild::BuildHelpAck>* a = BdHelpAcksRead(key, r);
+    if (a != 0) for (size_t i = 0; i < a->size(); ++i) { have = 1; if ((*a)[i].seq > *seq) *seq = (*a)[i].seq; }
+    return have;
+}
+/* PcrWriteOne's skip counters, read before and after one call: the first that moved names the reason (12..24; 25 = none moved) */
+void PcrHcTake(long long* v)
+{
+    v[0] = g_pcrSeedHasRecord; v[1] = g_pcrRmNoRecord; v[2] = g_pcrRowGone; v[3] = g_pcrNoPlace; v[4] = g_pcrBad; v[5] = g_pcaFirstYield;
+    v[6] = g_pcrFirstSame; v[7] = g_pcrHolderNoRecord; v[8] = g_pcrNotWriter; v[9] = g_pcrGaveUp; v[10] = g_pcrTooBig; v[11] = g_pcrRepeat; v[12] = g_pcrSendFail;
+}
+int PcrHcWhyOf(const long long* before)
+{
+    long long now[13];
+    PcrHcTake(now);
+    for (int i = 0; i < 13; ++i) if (now[i] != before[i]) return 12 + i;
+    return 25;
+}
 void PcaApplyOneCarried(const std::string& id, const PcrKept& k, int mySlot);
 int BdPlacePending(const std::string& key);
 int PcaOwnStateQueue(const coopbuild::BuildMsg& st);
+int BdOwnRowRecordWait(const std::string& key);   /* T-1408 fold 4: below, beside PcaOwnStateQueue */
 void PcaOwnStateDone(const std::string& key);
 /* each unanswered write's bytes stay only while the write is unanswered */
 void PcrFlyBytesPrune(PcrW& w)
@@ -5353,12 +6948,99 @@ void PcrSay(const char* text)
     ++g_pcrLines;
     DebugLog(std::string("[PIECEREC] ") + text);
 }
+/* T-1361 (F1083) LOG ONLY: a player farm's crop write / lay lines - the same [PIECEREC] line, under their own per-launch cap
+   (swfarmstate::kCropLineCap) so the other piece lines never use it up */
+long long g_pcfLines = 0, g_pcfLinesQuiet = 0;
+void PcfSay(const char* text)
+{
+    long long seen = 0;
+    if (!swfarmstate::Take(&seen, &g_pcfLines, swfarmstate::kCropLineCap)) { ++g_pcfLinesQuiet; return; }
+    DebugLog(std::string("[PIECEREC] ") + text);
+}
 /* the area of a piece record id (sx * 64 + sy, the store's sector index); -1 = not a piece record id */
 int PcrSecOfId(const std::string& id)
 {
     int sx = 0, sy = 0;
     if (piecerec::PieceRecIdParse(id, &sx, &sy, 0, 0, 0, 0) == 0) return -1;
     return sx * 64 + sy;
+}
+/* T-1389 re-check, MAIN THREAD: an event that ends an area for this game - the area unload (left: its sectors), the world left or a save
+   (left 0: every area). Each piece still waiting for its physics whose wait is older than coopbuild::kPcBodyWaitLimitMs and was not named
+   for it is named NOT whole once (coopbuild::PieceWaitEndJudge), from what its wait noted - the piece is not read (its area may be gone).
+   ends 1: the wait ends here (a younger one is counted in waitEndYoung, and a piece of an unloaded area stops waiting - its reload is a
+   new object and a new wait) */
+void PcWaitEndSweep(const unsigned char* left, int road, int ends)
+{
+    const DWORD now = ::GetTickCount();
+    const std::string noneMade = "models and physics (none made)";
+    for (std::map<std::string, PcSeenRow>::iterator it = g_pcSeen.begin(); it != g_pcSeen.end(); ++it)
+    {
+        PcSeenRow& row = it->second;
+        if (row.waitFirstB == 0) continue;
+        if (left != 0)
+        {
+            const int c = PcrSecOfId(piecerec::MakePieceRecId(it->first));
+            if (c < 0 || c >= coopbuild::kBuildZoneSectorCells || left[c] == 0) continue;
+        }
+        const unsigned int ms = (unsigned int)(now - row.waitSince);
+        /* F1114: a holder-less wait is named 'models and physics (none made)'; a bodies wait by what its judge noted ('physics body', ...) */
+        const std::string missing = (row.waitX.holder == 0) ? noneMade : coopbuild::PieceWholeMissing(row.waitX);
+        const int named = coopbuild::PieceProblemSaid(row.saidStage, row.saidMissing, row.waitX.stage, missing);
+        if (coopbuild::PieceWaitEndJudge(1, ms, named) != 0)   /* never empty: a bodies wait names 'physics body' */
+        {
+            ++g_pcChecked; ++g_pcNotWhole; ++g_pcWaitAged;
+            row.saidMissing = missing;
+            row.saidStage = row.waitX.stage;
+            PcSay(coopbuild::kPcSayProblem, coopbuild::PieceCheckLineText(coopbuild::kPcLineNotWhole, it->first, row.waitKind, row.waitX, row.waitP, row.waitN, -1,
+                                                                        missing, road) + coopbuild::PieceWaitedText(ms) + row.waitFacts);
+        }
+        else if (ends != 0 && named == 0) ++g_pcWaitEndYoung;
+        if (left != 0) { PcBodiesWatchForget(row.waitFirstB); row.waitFirstB = 0; }
+    }
+}
+/* T-1428, MAIN THREAD: an area unload (left: its sectors). Each walk-map wait of a piece in an area that ended - or with no key (its
+   area unknown) - gives up, logged once with its key; its object is gone or going, and the tick's box watch must not read it again */
+void BdWalkWaitAreaEnd(const unsigned char* left)
+{
+    int changed = 0;
+    for (size_t i = 0; i < g_wmBodyWait.size(); )
+    {
+        BdBodyWait& w = g_wmBodyWait[i];
+        if (w.walk == 0) { ++i; continue; }
+        const int sec = w.key.empty() ? -1 : PcrSecOfId(piecerec::MakePieceRecId(w.key));
+        if (coopbuild::BuildWalkMapWaitAreaEnds(w.key.empty() ? 0 : 1, sec, left, coopbuild::kBuildZoneSectorCells) == 0) { ++i; continue; }
+        BdWalkWaitGiveUpLine(w.key, w.road, w.since, coopbuild::kWmGiveUpArea);
+        changed = 1;
+        if (w.pc != 0) { w.walk = 0; w.cross = 0; ++i; }
+        else g_wmBodyWait.erase(g_wmBodyWait.begin() + (std::ptrdiff_t)i);
+    }
+    if (changed != 0) BdBodyWaitSync();
+    for (size_t i = 0; i < g_wmBoxWaits.size(); )   /* T-1428 fold 1: the box waits' own list */
+    {
+        const BdBoxWait& w = g_wmBoxWaits[i];
+        const int sec = w.key.empty() ? -1 : PcrSecOfId(piecerec::MakePieceRecId(w.key));
+        if (coopbuild::BuildWalkMapWaitAreaEnds(w.key.empty() ? 0 : 1, sec, left, coopbuild::kBuildZoneSectorCells) == 0) { ++i; continue; }
+        BdWalkWaitGiveUpLine(w.key, w.road, w.since, coopbuild::kWmGiveUpArea);
+        g_wmBoxWaits.erase(g_wmBoxWaits.begin() + (std::ptrdiff_t)i);
+    }
+}
+/* T-1428 fold 1 (review 5), MAIN THREAD (BdZoneScanTick, every role - a lone game too): the sectors active now; each sector active at the
+   last scan and not now has ended here - its walk-map waits give up (BdWalkWaitAreaEnd). Its own last list, so a lone game (where
+   PieceRecZonesNow returns at once) ends its waits on the same road as a multiplayer one */
+void BdWalkWaitZonesNow(const unsigned char* now)
+{
+    if (now == 0) return;
+    static unsigned char left[coopbuild::kBuildZoneSectorCells];
+    int n = 0;
+    for (int c = 0; c < coopbuild::kBuildZoneSectorCells; ++c)
+    {
+        left[c] = (g_wmZonePrevHave != 0 && g_wmZonePrev[c] != 0 && now[c] == 0) ? 1 : 0;
+        if (left[c] != 0) ++n;
+        g_wmZonePrev[c] = now[c];
+    }
+    g_wmZonePrevHave = 1;
+    if (n != 0 && (g_wmBoxWaits.empty() == false || g_wmBodyWait.empty() == false)) BdWalkWaitAreaEnd(left);
+    if (n != 0 && g_zoneRb.empty() == false) BdZoneRebuildAreaEnd(left);   /* T-1428 attempt 2 */
 }
 /* this piece's write state, made when new; 0 = no write here (a lone game, a key that makes no piece id, the table full) */
 PcrW* PcrWOf(const std::string& key)
@@ -5404,7 +7086,7 @@ void PieceRecHolderNote(const std::string& key, float progress, float needed, in
 {
     PcrW* w = PcrWOf(key);
     if (w == 0) return;
-    w->holder = 1; w->hProgress = progress; w->hNeeded = needed; w->hComplete = complete != 0 ? 1 : 0; w->hDestroyed = destroyed != 0 ? 1 : 0;
+    w->holder = 1; w->hProgress = BdProgressKeep(progress, needed); w->hNeeded = needed;   /* T-1408 fold 10 (F1331 1c) */ w->hComplete = complete != 0 ? 1 : 0; w->hDestroyed = destroyed != 0 ? 1 : 0;
     w->hMatsN = -1; w->hAcksHave = 0; w->hAcks.clear();   /* T-23: a hit carries no materials or helper numbers - the record's stay */
     PcrMarkW(*w, key, piecerec::kPeHit);
 }
@@ -5874,7 +7556,7 @@ void PcfDrain()
         {
             ++g_pcfFault;
             _snprintf_s(line, sizeof(line), _TRUNCATE, "farm %.90s: its record's crop (gen=%u) faulted at the lay - left as it is; pcfFault=%lld", key.c_str(), gen, g_pcfFault);
-            PcrSay(line);
+            PcfSay(line);
             PcfLaidBook(key, c, gen);   /* booked as this load's lay: the farm's held catch-up no longer waits for it (PieceRecFarmLayOwed) */
             g_pcfPend.erase(it++);
             continue;
@@ -5884,7 +7566,7 @@ void PcfDrain()
         _snprintf_s(line, sizeof(line), _TRUNCATE, "farm %.90s: the record's crop laid (gen=%u, %s) growth=%.3f death=%.3f start=%.3f harvested=%d plants=%d; pcfApplied=%lld",
                     key.c_str(), gen, laidThisLoad == 0 ? "the area's first lay this load" : "a newer record, this game not its writer",
                     lv.farmGrowth, lv.farmDeath, lv.farmStart, lv.farmHarvested, plants, g_pcfApplied);
-        PcrSay(line);
+        PcfSay(line);
         g_pcfPend.erase(it++);
     }
 }
@@ -5957,11 +7639,25 @@ void PcrLiveRollBack(PcrW& w)
 }
 /* BdMaybeSendState's own piece measured against its last written record: a change marks it, a progress step smaller than a tenth
    of the piece does not */
+int BdFactDiffersFromSnap(const std::string& key, const PcrW& w);   /* T-1408 fold 13, below */
 void PieceRecNoteState(const std::string& key, const BdReg& r)
 {
     if (r.own == 0 || r.via == 3 || r.removed != 0 || r.dismantled != 0) return;
+    unsigned int hcSeq = 0u;
+    const int hc = (r.helpForce != 0) ? PcrHcSeqOf(key, r, &hcSeq) : 0;   /* T-1408 fold 11 (F1353): a help confirmation goes in this record */
     PcrW* w = PcrWOf(key);
-    if (w == 0) return;
+    if (w == 0)
+    {
+        if (hc != 0)
+        {
+            ++g_hcNotSent;
+            char hl[300];
+            _snprintf_s(hl, sizeof(hl), _TRUNCATE, "[HELP] confirm key=%.63s seq<=%u: record write NOT sent: %s; hc[marked,sent,notSent]=%lld,%lld,%lld",
+                        key.c_str(), hcSeq, PcrHcText(RoleIsSingle() ? 1 : (piecerec::MakePieceRecId(key).empty() ? 2 : 3)), g_hcMarked, g_hcSent, g_hcNotSent);
+            BdLogHelp(hl);
+        }
+        return;
+    }
     const int n = (r.nMats < 0) ? -1 : (r.nMats > (int)coopbuild::kBuildMaxMats ? (int)coopbuild::kBuildMaxMats : r.nMats);
     int ev = piecerec::kPeNone;
     if (w->snapHave == 0) ev = piecerec::kPeFirst;   /* nothing written from this piece in this world yet */
@@ -5971,6 +7667,7 @@ void PieceRecNoteState(const std::string& key, const BdReg& r)
     else if (r.hitForce != 0) ev = piecerec::kPeHit;
     else if (n >= 0 && BdMatsDiffer(n, r.mats, w->snapN, w->snapMats) != 0) ev = piecerec::kPeMats;
     else if (r.helpForce != 0) ev = piecerec::kPeHelp;
+    else if (w->snapHave != 0 && BdFactDiffersFromSnap(key, *w) != 0) ev = piecerec::kPeAgain;   /* T-1408 fold 13: the owner's group fact changed - written once */
     else if (r.progress != w->snapProgress)
     {
         if (w->moving == 0) ev = piecerec::kPeStarted;
@@ -5979,6 +7676,20 @@ void PieceRecNoteState(const std::string& key, const BdReg& r)
     }
     if (ev == piecerec::kPeNone) return;
     PcrMarkW(*w, key, ev);
+    if (hc != 0)
+    {   /* T-1408 fold 11 (F1353): marked - its write is followed to a sent or NOT sent line */
+        if (w->hcOn == 0) ++g_hcMarked;
+        w->hcOn = 1; w->hcSeq = hcSeq; w->hcWhy = -1;
+        g_hcIds.insert(piecerec::MakePieceRecId(key));
+    }
+}
+/* T-1408 fold 13: 1 = the key's group fact differs from the one its last write carried */
+int BdFactDiffersFromSnap(const std::string& key, const PcrW& w)
+{
+    std::string l;
+    unsigned i = 0;
+    if (WgFactGet(key, &l, &i) == 0) return w.snapGLead.empty() ? 0 : 1;
+    return (l != w.snapGLead || i != w.snapGIdx) ? 1 : 0;
 }
 /* the own piece's values as written (what the next change is measured against) */
 void PcrSnap(PcrW& w, const BdReg& r)
@@ -5988,6 +7699,8 @@ void PcrSnap(PcrW& w, const BdReg& r)
     const int n = (r.nMats < 0) ? 0 : (r.nMats > (int)coopbuild::kBuildMaxMats ? (int)coopbuild::kBuildMaxMats : r.nMats);
     w.snapN = n;
     for (int i = 0; i < n; ++i) w.snapMats[i] = r.mats[i];
+    w.snapGLead.clear(); w.snapGIdx = 0;
+    (void)WgFactGet(w.key, &w.snapGLead, &w.snapGIdx);   /* T-1408 fold 13 */
     if (piecerec::PieceEventEndsMoving(w.event) != 0) w.moving = 0;   /* a materials or helper write mid-build leaves the build moving */
 }
 /* an own piece's pp.build row as its PLACE and STATE (the helper tail is the caller's): the record's body and pp.build's row are
@@ -5997,9 +7710,10 @@ void BdOwnRowMsgs(const std::string& key, const BdReg& r, coopbuild::BuildMsg* m
     m->kind = coopbuild::kBuildPlace;
     m->key = key; m->sid = r.sid;
     for (int i = 0; i < 3; ++i) m->pos[i] = r.placePos[i];
+    m->groundMark = (unsigned char)(r.placeMark != 0 ? 1 : 0);   /* T-1372 */
     for (int i = 0; i < 4; ++i) m->rot[i] = r.placeRot[i];
     m->complete = (unsigned char)(r.complete != 0 ? 1 : 0);
-    m->progress = r.progress; m->needed = r.needed;
+    m->progress = BdProgressKeep(r.progress, r.needed); m->needed = r.needed;   /* T-1408 fold 10 (F1331 1c) */
     m->ownerSlot = coopbuild::kBuildOwnerSender;
     m->nonce = r.nonce;
     if (!r.hostKey.empty())
@@ -6011,16 +7725,33 @@ void BdOwnRowMsgs(const std::string& key, const BdReg& r, coopbuild::BuildMsg* m
     }
     st->kind = coopbuild::kBuildState;
     st->key = key;
-    st->progress = r.progress; st->needed = r.needed;
+    st->progress = m->progress; st->needed = r.needed;
     st->complete = m->complete;
     st->destroyed = (unsigned char)(r.destroyed != 0 ? 1 : 0);   /* the ruin survives a save */
     st->broken = (unsigned char)(r.broken != 0 ? 1 : 0);
+    st->groupStamp = r.gStamp;   /* T-1408: the wall group step stamp of this value */
+    {   /* T-1408 fold 13: the owner's group fact (the lead's key, the join index) */
+        std::string gl;
+        unsigned gi = 0;
+        if (WgFactGet(key, &gl, &gi) != 0 && gl.size() <= coopbuild::kBuildMaxKey && gi <= coopbuild::kBuildGroupIdxMax) { st->groupLead = gl; st->groupIdx = (unsigned short)gi; }
+    }
     const int k = (r.nMats < 0) ? 0 : (r.nMats > (int)coopbuild::kBuildMaxMats ? (int)coopbuild::kBuildMaxMats : r.nMats);
     st->nMats = (unsigned char)k;
     for (int i = 0; i < k; ++i) st->mats[i] = r.mats[i];
 }
 }   /* T-1047 step 5: TlTeamIdOfTownWords is defined with the outposts' show code below, outside this unnamed namespace */
 unsigned TlTeamIdOfTownWords(const int* w);
+/* T-1408: the wall group step stamps - namespace coop, defined beside BdWallGroupOf (the C2668 class) */
+std::vector<std::string> BdGroupKeysOf(const std::string& key);
+int BdKeptState(const std::string& key, coopbuild::BuildMsg* st);
+unsigned int BdGroupStampLive(const std::vector<std::string>& keys);
+unsigned int BdGroupStampStep(const std::vector<std::string>& keys, const char* road, const std::string& key);
+void BdGroupStampTake(const std::vector<std::string>& keys, unsigned int stamp);
+void BdOwnGroupCatchUp(const std::string& key, const std::vector<std::string>& keys, void* lead);
+int BdGroupRecordWaits(const std::vector<std::string>& keys);
+void BdGroupAreas(const std::vector<std::string>& keys, int* allLoaded, int* allApplied);   /* T-1408 fold 9 */
+void BdGroupStepFor(const std::vector<std::string>& gk, int adopt, unsigned int adoptStamp, int newWork, const char* road);
+void BdWallGroupsMark(const std::vector<std::string>& keys, std::vector<std::string>& touched, const std::vector<std::string>* stepKeys, int adopt, unsigned int adoptStamp);
 unsigned TlHandSeedTownId(const int* w, int owner);   /* T-23 review fold 2: below, beside TlTeamIdOfTownWords */
 int BdBuildingTopLevelPod(void* b);              /* below, with the building pods (fold 2: used here before its definition) */
 int BdBuildingTownHandPod(void* b, int* hand);   /* below, with the building pods */
@@ -6058,12 +7789,24 @@ void PcrTownFill(const std::string& id, PcrW& w, int slot, piecerec::PieceLive* 
         if (handRow != 0 && top == 1 && BdBuildingTownHandPod(pc, bh) != 0) engineId = TlHandSeedTownId(bh, row->second.ownerSlot);   /* T-23 review fold 2 */
         if (TlRestoredWaits(w.key) != 0) engineId = 0;   /* T-1158 step 6: a rebuilt piece waiting for its outpost carries its record's link, not the engine's pick for a townless piece */
     }
-    const unsigned link = piecerec::PieceTownWriteId((own != 0 || handRow != 0) ? 1 : 0, engineId, keptLink);
-    if (link == 0) return;
-    if (own != 0 && pc != 0 && TlRsDropFill(w.key, pc, keptLink, engineId) != 0)
-    {   /* T-1158 step 6 (D3): a released rebuilt piece standing in no live outpost - its record lets go of the dead outpost's id */
+    unsigned link = piecerec::PieceTownWriteId((own != 0 || handRow != 0) ? 1 : 0, engineId, keptLink);
+    if (link != 0 && own != 0 && pc != 0 && TlRsDropFill(w.key, pc, keptLink, engineId) != 0)
+    {   /* T-1158 step 6 (D3): a released rebuilt piece standing in no live outpost - its record lets go of the dead outpost's id
+           (T-1427 fold 1: and names the town it stands in, below) */
         if (lv->have != 0) piecerec::PieceTownSet(lv, 0u);
-        return;
+        link = 0;
+    }
+    piecerec::PieceTownFact fact;
+    if (link == 0)
+    {   /* T-1427 fold 1 (owner request 2026-11-18): no outpost - the builder's ACTUAL town, read from its building after the engine set
+           it: a world town (its stringID) or 'Nowhere' (piecerec::PieceTownFactWrite: the owner's game writes its engine's, any other
+           writer keeps the stored one); a player's town whose id is not known yet: nothing (the outpost mark writes it) */
+        piecerec::PieceTownFact eng;
+        if (own != 0 && pc != 0 && handRow == 0 && TlRestoredWaits(w.key) == 0 && BdBuildingTopLevelPod(pc) == 1) BdBuildingTownFactPod(pc, &eng);
+        piecerec::PieceTownFact keptF;
+        if (kept != g_pcrKept.end() && (kept->second.h.flags & piecerec::kPrFlagRemoved) == 0) keptF = piecerec::PieceTownFactOf(kept->second.b.live);
+        fact = piecerec::PieceTownFactWrite(own, eng, keptF);
+        if (fact.kind == piecerec::kPtfNone) return;
     }
     if (lv->have == 0)
     {
@@ -6076,7 +7819,8 @@ void PcrTownFill(const std::string& id, PcrW& w, int slot, piecerec::PieceLive* 
         *lv = piecerec::PieceLive();
         lv->have = 1; lv->hasPower = 0;   /* the link only: the part says it carries no power values */
     }
-    piecerec::PieceTownSet(lv, link);
+    if (link != 0) piecerec::PieceTownSet(lv, link);
+    else piecerec::PieceTownFactPut(lv, fact);   /* T-1427 fold 1 */
 }
 /* one marked piece: 1 = its record was sent */
 /* T-23 (owner 1460 a): 1 = the piece's next write is this game's HAND-OVER SEED - a copy row of a piece this game placed and handed to
@@ -6158,6 +7902,7 @@ int PcrWriteOne(const std::string& id, PcrW& w, int slot)
         if (w.yieldSeen != 0 && w.event == piecerec::kPeFirst) { w.yieldSeen = 0; ++g_pcaBaselineFromPiece; }   /* booked below from the piece */
         if (piecerec::PieceFirstLookSkip(w.event, haveKept, keptRemoved, (haveKept != 0 && keptGen >= baseGen) ? 1 : 0,
                                          (haveKept != 0 && kept->second.h.ownerSlot == slot) ? 1 : 0,
+                                         fyMine,   /* T-1347: a record another game wrote is written once - the helper's number comes from it */
                                          (haveKept != 0 && kept->second.b.place == b.place && kept->second.b.state == b.state
                                           && piecerec::PieceLiveEqual(kept->second.b.live, b.live) != 0) ? 1 : 0) != 0)
         {   /* the first look in this world at a piece the stored record already is: only the snapshot, no write */
@@ -6220,9 +7965,13 @@ int PcrWriteOne(const std::string& id, PcrW& w, int slot)
         {   /* the state after the hit, over the newest state chosen above */
             coopbuild::BuildMsg st;
             if (coopbuild::DecodeBuild(b.state.data(), b.state.size(), &st) != coopbuild::kBuildDecodeOk) { ++g_pcrBad; w.marked = 0; return 0; }
+            const int hValNew = (st.progress != w.hProgress || st.needed != w.hNeeded || (int)st.complete != w.hComplete || (int)st.destroyed != w.hDestroyed) ? 1 : 0;   /* T-1408 fold 7 */
             st.progress = w.hProgress; st.needed = w.hNeeded; st.complete = (unsigned char)w.hComplete; st.destroyed = (unsigned char)w.hDestroyed;
             if (w.hMatsN >= 0) { st.nMats = (unsigned char)w.hMatsN; for (int i = 0; i < w.hMatsN; ++i) st.mats[i] = w.hMats[i]; }   /* T-23: the writer's copy's materials */
             if (w.hAcksHave != 0) st.helpAcks = w.hAcks;   /* T-23 (step 4): the helpers' last applied work numbers */
+            if (row->second.gStamp > st.groupStamp) st.groupStamp = row->second.gStamp;   /* T-1408: the writer's group step (BdWriterGroupNote) */
+            else if (hValNew != 0 && pc != 0 && BdIsWall(pc) == 1)   /* T-1408 fold 7: only a new value (a hit) is a step of its own; the same value keeps its stamp */
+                st.groupStamp = BdGroupStampStep(std::vector<std::string>(1, w.key), "holder", w.key);
             std::vector<char> sb;
             if (!coopbuild::BuildEncodable(st) || !coopbuild::EncodeBuild(&sb, st)) { ++g_pcrBad; w.marked = 0; return 0; }
             b.state.assign(sb.begin(), sb.end());
@@ -6405,6 +8154,124 @@ void BdWriterLine(const std::string& key, const BdReg& r, const char* road, floa
                 key.c_str(), r.ownerSlot, p, n, c, x, (unsigned int)r.helpAcks.size(), road, g_pcrWriterWork, g_pcrWriterLines);
     DebugLog(std::string(line));
 }
+/* T-1408 (F1261, F1272 A), MAIN THREAD: a wall copy this game writes (its owner's game away) - each write of it is a GROUP STEP: one new
+   stamp (BdGroupStampStep) on the copy and on every other copy of its group this game writes, and the value just noted for the copy at
+   `key` written into every one of those records in the same step (a member's record carries the group's value, as the owner's
+   BdWallGroupsMark writes it). A copy that holds its own engine record (made here during play) has no group here: T-1408 fold 7 (F1283) -
+   the other own-record wall copies this game writes that were of its owner group (coopbuild::BuildWriterSameOwnerStep: same owner, the
+   owner's last STATEs carried one step stamp) take the SAME step stamp, each record keeping its own value; at the owner's load the tie key
+   (the higher share) picks the group's value. Each record's materials stay its own.
+   T-1408 fold 8 (F1291): a write that LOWERS an own-record copy (lowers: coopbuild::BuildWallWriteLowers - a hit, a dismantle step, a
+   ruin) takes its OWN new stamp: the copy steps alone, and from then on (g_wrSolo, until the owner's next STATE lands on it) never shares
+   a step with its siblings, so it never ties with an untouched sibling whose higher share would win. Fold 9 (F1296): only a RUIN steps alone now - a hit lowers
+   the group (the engine's rule: one record): the siblings above the lowered share are lowered to it (BdWriterSiblingLower) and step with it.
+   force: the caller's (1 when the copy's own write was due) */
+long long g_writerGroupSteps = 0, g_writerGroupNoted = 0;
+/* T-1408 fold 9 (F1296), MAIN THREAD: a lowering write (a hit) on the own-record copy L (at lkey) is its group's - the sibling copy w (its
+   row r) whose share is above the lowered one is lowered to it in its OWN engine record (coopbuild::BuildWallSiblingLowerTo, as that
+   share of its needed), so a later build on it carries the lowered value; its row takes what it reads now. 1 = lowered */
+int BdWriterSiblingLower(const std::string& key, BdReg& r, void* w, const BdReg& L, const std::string& lkey, float dropShare)
+{
+    (void)L;
+    float p = 0.0f, n = 0.0f;
+    int c = 0, d = 0, x = 0;
+    if (BdReadState(w, &p, &n, &c, &d, &x) == 0 || x != 0) return 0;
+    float to = p;
+    if (coopbuild::BuildWallSiblingLowerBy(p, n, dropShare, &to) == 0) return 0;   /* T-1408 fold 10 (F1304 SHOULD 1): by the hit's size */
+    const unsigned long long rUpd = Rva("UpdatePhysicalWithProgress");
+    if (rUpd == 0) return 0;
+    const uintptr_t upd = (uintptr_t)::GetModuleHandleA(0) + (uintptr_t)rUpd;
+    const float wv = coopbuild::BuildRepairFinishSafe(to, n, BdByteAtOr0(w, kBOwnComplete));
+    int ml = -1, stage = 0;   /* a lowering never crosses the wall's line upward - no BdWallCrossPod */
+    const int ok = BdApplyStatePod(w, 1, wv, 0, 0, &ml, upd, &stage);
+    float p2 = p, n2 = n;
+    int c2 = c, d2 = d, x2 = x;
+    if (BdReadState(w, &p2, &n2, &c2, &d2, &x2) != 0) { r.progress = p2; r.needed = n2; r.complete = c2; r.destroyed = x2; }
+    if (ok != 0) ++g_writerSibLowered;
+    char line[400];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 fold 10 writer key=%.63s: own-record sibling of the hit copy %.63s %s from %.3f/%.2f to %.3f (by the hit's share %.3f) - the hit is the group's; writerSibLowered=%lld",
+                key.c_str(), lkey.c_str(), ok != 0 ? "LOWERED" : "NOT lowered (faulted)", p, n, p2, dropShare, g_writerSibLowered);
+    BdLogGroup(line);
+    return ok != 0 ? 1 : 0;
+}
+void BdWriterGroupNote(const std::string& key, void* b, const BdReg& L, int force, int lowers, float dropShare)
+{
+    if (b == 0 || BdIsWall(b) != 1) return;
+    std::vector<std::string> keys(1, key);
+    int listed = -1, resolved = 0, ownRecs = 0;
+    const int ownRec = (BdWallOwnRecord(b) > 0) ? 1 : 0;
+    const int ruinLow = (lowers != 0 && L.destroyed != 0) ? 1 : 0;   /* T-1408 fold 9: a hit lowers the group (its siblings below); only a ruin steps alone */
+    if (ownRec != 0 && ruinLow != 0 && g_wrSolo.insert(key).second) ++g_writerSolo;   /* T-1408 fold 8: a ruined copy steps alone from now on */
+    const int solo = (ownRec != 0 && g_wrSolo.find(key) != g_wrSolo.end()) ? 1 : 0;
+    if (ownRec != 0 && solo == 0 && L.ownerKnown != 0 && L.ownerLast.groupStamp != 0)
+    {   /* T-1408 fold 7: the own-record copies of the same owner step (fold 8: never a lowered one) */
+        for (std::map<std::string, BdReg>::iterator it = g_reg.begin(); it != g_reg.end(); ++it)
+        {
+            const BdReg& r = it->second;
+            if (it->first == key || r.via != 3 || r.removed != 0 || r.ownerKnown == 0 || g_wrSolo.find(it->first) != g_wrSolo.end()
+                || coopbuild::BuildWriterSameOwnerStep(L.ownerSlot, L.ownerLast.groupStamp, r.ownerSlot, r.ownerLast.groupStamp) == 0) continue;
+            if (BdCopyWriterHere(it->first) == 0) continue;
+            int fv = 0;
+            void* w = BdFindPiece(it->first, r, &fv);
+            if (w == 0 || BdIsWall(w) != 1 || BdWallOwnRecord(w) <= 0) continue;
+            keys.push_back(it->first);
+            ++ownRecs;
+            if (lowers != 0 && ruinLow == 0) BdWriterSiblingLower(it->first, it->second, w, L, key, dropShare);   /* T-1408 fold 9: the hit is the group's; fold 10: by its size */
+        }
+    }
+    if (ownRec == 0)
+    {
+        const unsigned long long rRes = Rva("CraftSelectedBuilding"), rTab = Rva("CraftSelectionGlobal");
+        const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+        void* lead = 0;
+        void* mem[kWallGrpCap];
+        float memN[kWallGrpCap];
+        int nm = 0;
+        if (BdWallGroupPod(b, rRes != 0 ? base + (uintptr_t)rRes : 0, rTab != 0 ? base + (uintptr_t)rTab : 0, &lead, &listed, &resolved, mem, memN, kWallGrpCap, &nm) != 0)
+        {
+            void* all[kWallGrpCap + 1];
+            int na = 0;
+            all[na++] = lead;
+            for (int i = 0; i < nm; ++i) all[na++] = mem[i];
+            for (int i = 0; i < na; ++i)
+            {
+                char k[kKeyCap];
+                k[0] = 0;
+                if (all[i] == 0 || ObjectPositionKey(all[i], k, kKeyCap, "", 3, 0) == 0) continue;
+                std::map<std::string, BdReg>::iterator row = BdRowByLiveKey(std::string(k));
+                if (row == g_reg.end() || BdCopyWriterHere(row->first) == 0) continue;
+                size_t t = 0;
+                while (t < keys.size() && keys[t] != row->first) ++t;
+                if (t == keys.size()) keys.push_back(row->first);
+            }
+        }
+    }
+    const unsigned int stamp = BdGroupStampStep(keys, "writer", key);
+    int noted = 0;
+    for (size_t i = 1; i < keys.size(); ++i)
+    {
+        std::map<std::string, BdReg>::iterator row = g_reg.find(keys[i]);
+        if (row == g_reg.end()) continue;
+        BdReg& r = row->second;
+        if (ownRecs == 0) { r.progress = L.progress; r.needed = L.needed; r.complete = L.complete; r.destroyed = L.destroyed; }   /* an own-record copy keeps its own value */
+        if (PieceRecWriterNote(row->first, r.progress, r.needed, r.complete, r.destroyed, r.mats, r.nMats, r.helpAcks.empty() ? 0 : &r.helpAcks, force) != 0) ++noted;
+    }
+    ++g_writerGroupSteps;
+    g_writerGroupNoted += noted;
+    char line[420];
+    if (solo != 0 && lowers != 0)
+    {   /* T-1408 fold 8: the lowered copy's own step (keys.size() == 1 here) */
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 writer key=%.63s: own-record copy LOWERED to %.3f/%.2f complete=%d ruin=%d - its OWN stamp %u (no sibling shares it); writerSolo=%lld",
+                    key.c_str(), L.progress, L.needed, L.complete, L.destroyed, stamp, g_writerSolo);
+        BdLogGroup(line);
+        return;
+    }
+    if (keys.size() < 2) return;   /* the step line says the rest */
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 writer key=%.63s: %s %.3f/%.2f complete=%d stamp %u into %d other record(s) of its group (%d due now, the rest owed; listed %d, loaded %d); writerGroup[steps,noted]=%lld,%lld",
+                key.c_str(), ownRecs != 0 ? "own-record copies of one owner step: ONE stamp, each its own value; this one" : "the group's value", L.progress, L.needed, L.complete, stamp,
+                (int)keys.size() - 1, noted, listed, resolved, g_writerGroupSteps, g_writerGroupNoted);
+    BdLogGroup(line);
+}
 /* T-23, MAIN THREAD: the copy's live state written over the record of the piece this game writes (b: the piece, 0 = found by its row) */
 void BdWriterNoteRow(const std::string& key, BdReg& r, void* b, int force)
 {
@@ -6414,13 +8281,16 @@ void BdWriterNoteRow(const std::string& key, BdReg& r, void* b, int force)
     int c = 0, d = 0, x = 0;
     if (BdReadState(b, &p, &n, &c, &d, &x) == 0) return;
     int tot = -1;
+    const int lowers = coopbuild::BuildWallWriteLowers(r.progress, r.needed, r.complete, r.destroyed, p, n, c, x);   /* T-1408 fold 8: against the row's last value */
+    const float dropShare = coopbuild::BuildWallDropShare(r.progress, r.needed, p, n);   /* T-1408 fold 10 (F1304 SHOULD 1): the hit's size */
     r.progress = p; r.needed = n; r.complete = c; r.destroyed = x;
     r.nMats = BdReadMats(b, r.mats, (int)coopbuild::kBuildMaxMats, &tot);
     const int noted = PieceRecWriterNote(key, p, n, c, x, r.mats, r.nMats, r.helpAcks.empty() ? 0 : &r.helpAcks, force);
     /* T-23 review fold 3: the materials this write carries are the record's now - the help baseline follows them, so the harvest before
        the owner's STATE (BdHelpHarvest) never counts them again as help; a step not written yet leaves it (owed: PcrWorkFlush) */
-    if (noted != 0 && r.nMats >= 0) BdHelpBaseSet(r, r.mats, r.nMats);
+    if (noted != 0 && r.nMats >= 0) BdHelpBaseSet(r, b, r.mats, r.nMats);
     if (noted != 0) BdWriterLine(key, r, force != 0 ? "forced" : "step", p, n, c, x);
+    BdWriterGroupNote(key, b, r, noted != 0 ? 1 : force, lowers, dropShare);   /* T-1408: a wall copy's write is a group step - every record of its group takes the same value and stamp; fold 8: a lowering write on an own-record copy steps alone */
 }
 /* T-23, MAIN THREAD (detour_progress): the piece `b` is another player's that this game writes now */
 int BdCopyWriterAt(void* b)
@@ -6644,7 +8514,9 @@ int PcrWorkFlush(PcrW& w, int moment)
     if (PieceRecWriterNote(w.key, r.progress, r.needed, r.complete, r.destroyed, r.mats, r.nMats, r.helpAcks.empty() ? 0 : &r.helpAcks, 1) == 0) return 0;
     BdWriterLine(w.key, r, "unload flush", r.progress, r.needed, r.complete, r.destroyed);
     w.wkFlush = 1;
-    if (r.nMats >= 0) BdHelpBaseSet(r, r.mats, r.nMats);
+    int fvw = 0;
+    void* wp = BdFindPiece(w.key, r, &fvw);   /* T-1408 fold 14 (F1429) / 14b (review 4): the live record read, on the row holding its baseline; no piece left: untouched (its record's next piece reads it again) */
+    if (wp != 0) BdHelpHarvestRecord(w.key, &r, wp, "before an unload flush", 0);   /* fold 14c / 14d (review 3): the flush writes a record, not the piece's materials - the baseline moves only where the harvest measured (a delivery it could not measure is never absorbed) */
     ++g_pcrWorkFlushed;
     return 1;
 }
@@ -6663,6 +8535,7 @@ void PieceRecZonesNow(const unsigned char* now)
         g_pcrZonePrev[c] = now[c];
     }
     g_pcrZonePrevHave = 1;
+    if (n != 0) PcWaitEndSweep(left, coopbuild::kPcRoadAreaUnload, 1);   /* T-1389 re-check: the area's still-waiting pieces judged at its unload */
     if (n == 0 || g_pcrW.empty()) return;
     for (std::map<std::string, PcrW>::iterator it = g_pcrW.begin(); it != g_pcrW.end(); ++it)
     {
@@ -6765,6 +8638,7 @@ void PcrHandLoadPass()
         r.nMats = BdReadMats(pc, r.mats, (int)coopbuild::kBuildMaxMats, &tot);
         r.placeOk = 1; r.floor = rec.floor; r.outside = rec.outside;
         for (int i = 0; i < 3; ++i) r.placePos[i] = rec.pos[i];
+        r.placeMark = rec.groundMark != 0 ? 1 : 0;   /* T-1372 */
         r.pos[0] = kx; r.pos[1] = ky; r.pos[2] = kz;   /* the REMOVE's zone check: the piece's own area */
         for (int i = 0; i < 4; ++i) r.placeRot[i] = rec.rot[i];
         r.hasPos = 1;
@@ -6882,9 +8756,11 @@ void PieceRecDrain()
             DebugLog(std::string(line));
             g_pcrKept.clear();
             g_pcrKeptBytes = 0;
+            ++g_pcrKeptGen;   /* T-1443 fold 3 */
         }
         g_pcrSeedSeen.clear(); g_pcrSeedSize = (size_t)-1;   /* the next link looks at every own piece again */
         memset(g_pcaDone, 0, sizeof(g_pcaDone)); memset(g_pcaWaitSeen, 0, sizeof(g_pcaWaitSeen));   /* nothing is applied until the next link's list is complete */
+        PcrHcAll(4);   /* T-1408 fold 11 (F1353) */
         return;
     }
     PieceRecApplyTick();   /* each loaded area whose record list is complete: its records applied, once a load and link */
@@ -6893,7 +8769,7 @@ void PieceRecDrain()
     PcrHandLoadPass();   /* T-23 review fold 5: the hand-overs pp.build kept */
     if (g_pcrW.empty()) return;
     const int slot = StoreMySlot();
-    if (slot < 0) return;
+    if (slot < 0) { PcrHcAll(5); return; }   /* T-1408 fold 11 (F1353): PcrHcAll */
     const int snap = StoreSnapshotApplied() != 0 ? 1 : 0;
     PcrRecheckOnEvents();   /* fold 4 (review): held pieces are asked again only on an event */
     int sent = 0;
@@ -6901,7 +8777,7 @@ void PieceRecDrain()
     {
         PcrW& w = it->second;
         if (w.marked == 0) continue;
-        if (w.waitEv != 0 && w.recheck == 0) continue;   /* fold 4 (review): a held change waits for its event - never asked on time alone */
+        if (w.waitEv != 0 && w.recheck == 0) { PcrHcSay(w, it->first, 6, 0); continue; }   /* fold 4 (review): a held change waits for its event - never asked on time alone */
         w.recheck = 0;
         /* fold 3 (T1506): EVERY write, the first and any again, goes only while this game is the piece's writer (PcrWriterNow, the
            world server's rule over the same inputs). Not the writer: the change is held - the piece stays marked and its latest state
@@ -6909,7 +8785,7 @@ void PieceRecDrain()
            turns from no to yes, or the piece changes (PcrMarkW). No clock and no write per area map. */
         const int retrying = w.retryWait;
         const int gate = piecerec::PieceSendGate(PcrWriterNow(it->first, w), &w.writerSaid, &w.retryWait);
-        if (gate == piecerec::kPsgWaitEdge) { ++g_pcrRetryNotWriter; w.waitEv = 1; PcrWatch(it->first); continue; }
+        if (gate == piecerec::kPsgWaitEdge) { ++g_pcrRetryNotWriter; w.waitEv = 1; PcrWatch(it->first); PcrHcSay(w, it->first, 7, 0); continue; }
         if (gate == piecerec::kPsgHold)
         {
             std::map<std::string, BdReg>::const_iterator hr = g_reg.find(w.key);
@@ -6921,8 +8797,9 @@ void PieceRecDrain()
             /* another player's piece hit while this game is not its writer: its owner's game writes it (as before). A LIVE change noted here
                as its holder and not yet written is dropped the same way when its owner comes back: the owner's game is then the record's
                writer and its own looks note the piece's values */
-            if (ownPiece == 0) { ++g_pcrNotWriter; w.marked = 0; w.holder = 0; w.liveHolder = 0; w.liveUnload = 0; w.liveHandOff = 0; w.wkFlush = 0; w.held = 0; w.waitEv = 0; continue; }
+            if (ownPiece == 0) { PcrHcSay(w, it->first, 8, 1); ++g_pcrNotWriter; w.marked = 0; w.holder = 0; w.liveHolder = 0; w.liveUnload = 0; w.liveHandOff = 0; w.wkFlush = 0; w.held = 0; w.waitEv = 0; continue; }
             w.waitEv = 1; PcrWatch(it->first);   /* fold 4 (review): asked again at the next event for its area */
+            PcrHcSay(w, it->first, 9, 0);   /* T-1408 fold 11 (F1353) */
             if (w.held == 0)
             {
                 w.held = 1;
@@ -6936,9 +8813,31 @@ void PieceRecDrain()
         }
         w.waitEv = 0;
         if (retrying != 0 && w.retryWait == 0) { ++g_pcrRetry; w.seedWait = 0; }   /* the answer turned from no to yes after a refusal */
-        if (StoreAreaDoneSec(PcrSecOfId(it->first), snap, kAreaGateBoxTick) == 0) continue;   /* its area's records are not all here: the write's base is not known */
+        if (StoreAreaDoneSec(PcrSecOfId(it->first), snap, kAreaGateBoxTick) == 0) { PcrHcSay(w, it->first, 10, 0); continue; }   /* its area's records are not all here: the write's base is not known */
+        if (w.removed == 0)
+        {   /* T-1408 fold 4 (F1256): an own piece's record is not written while its shared record is still to be applied over it here (T2553:
+               the owner's game wrote the save's 0.03 over the good record) - asked again next drain */
+            std::map<std::string, BdReg>::const_iterator orw = g_reg.find(w.key);
+            if (orw != g_reg.end() && orw->second.own != 0 && orw->second.via != 3 && BdOwnRowRecordWait(w.key) != 0)
+            {
+                ++g_ogRecsHeld;
+                PcrHcSay(w, it->first, 11, 0);   /* T-1408 fold 11 (F1353) */
+                if (g_ogRecsHeld <= 20)
+                {
+                    char ol[300];
+                    _snprintf_s(ol, sizeof(ol), _TRUNCATE, "record %.90s HELD (event=%s): T-1408 fold 4 - an own piece whose shared record is not applied over it here yet; written after it (the first 20 holds); ownGroupRecsHeld=%lld",
+                                it->first.c_str(), piecerec::PieceEventName(w.event), g_ogRecsHeld);
+                    PcrSay(ol);
+                }
+                continue;
+            }
+        }
         const int wasHeld = w.held;
+        long long hcB[13] = { 0 };
+        const int hcOn = w.hcOn;
+        if (hcOn != 0) PcrHcTake(hcB);   /* T-1408 fold 11 (F1353): which skip road, if the write does not go */
         const int one = PcrWriteOne(it->first, w, slot);
+        if (hcOn != 0) PcrHcSay(w, it->first, one != 0 ? 0 : PcrHcWhyOf(hcB), (one != 0 || w.marked == 0) ? 1 : 0);
         if (one != 0 && wasHeld != 0) ++g_pcrHeldSent;
         if (one != 0) PcrWatch(it->first);   /* fold 4 (review): in flight - its writer answer is tracked until it is answered */
         if (w.marked == 0) w.held = 0;
@@ -6973,6 +8872,8 @@ void PcrArrive(const std::string& id, const std::vector<char>& bytes)
     slot.b.place.swap(k.b.place); slot.b.state.swap(k.b.state); slot.b.reason = k.b.reason; slot.b.live = k.b.live;
     slot.bytes = bytes.size();
     g_pcrKeptBytes += (long long)bytes.size();
+    ++g_pcrKeptGen;   /* T-1443 fold 3 */
+    WgFactFromKept(id, std::string(slot.b.state.begin(), slot.b.state.end()), (slot.h.flags & piecerec::kPrFlagRemoved) != 0 ? 1 : 0);   /* T-1408 fold 13 */
     const int c = PcrSecOfId(id);
     if (c >= 0 && c < coopbuild::kBuildZoneSectorCells && g_pcaDone[c] != 0 && !RoleIsSingle())
     {   /* its area is loaded and applied here: the new record takes the same apply now */
@@ -6986,6 +8887,8 @@ void PcrGone(const std::string& id, const char* from)
     if (it == g_pcrKept.end()) return;
     g_pcrKeptBytes -= (long long)it->second.bytes;
     g_pcrKept.erase(it);
+    ++g_pcrKeptGen;   /* T-1443 fold 3 */
+    WgFactFromKept(id, std::string(), 1);   /* T-1408 fold 13: the piece is gone - its fact too */
     char line[260];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[PIECEREC] record %.90s removed (from %.40s): its kept copy is forgotten", id.c_str(), from != 0 ? from : "?");
     DebugLog(std::string(line));
@@ -7008,6 +8911,8 @@ void PcrKeepOwn(const std::string& id, const std::vector<char>& bytes)
     slot.b.place.swap(k.b.place); slot.b.state.swap(k.b.state); slot.b.reason = k.b.reason; slot.b.live = k.b.live;
     slot.bytes = bytes.size();
     g_pcrKeptBytes += (long long)bytes.size();
+    ++g_pcrKeptGen;   /* T-1443 fold 3 */
+    WgFactFromKept(id, std::string(slot.b.state.begin(), slot.b.state.end()), (slot.h.flags & piecerec::kPrFlagRemoved) != 0 ? 1 : 0);   /* T-1408 fold 13 */
 }
 void PcrEcho(const std::string& id, int hasStamp, long long stamp)
 {
@@ -7165,6 +9070,7 @@ void detour_commit(void* list)
         BdOnNewPiece(g_commitNew[i], 1, g_commitPos[i], g_commitRot[i], g_commitMeta[i], g_commitHost[i],
                      g_commitForm[i], g_commitFloor[i], g_commitOutside[i], g_commitHanded[i], g_commitHandWhy[i], g_commitTown[i]);   /* the same call, so the pointers are still live */
     }
+    for (int i = 0; i < n; ++i) if (BdIsWall(g_commitNew[i]) == 1) BdWallFactFromEngine(g_commitNew[i], "placement");   /* T-1408 fold 13: the commit's own join is the owner's group fact */
     int handedN = 0;   /* house2 (item 5): the commit issues ONE build order (4d6810:452) - counted once, not once per handed piece */
     for (int i = 0; i < n; ++i) if (g_commitHanded[i] >= 0) ++handedN;
     g_orderKept += coopbuild::BuildCommitOrderKept(handedN, g_hkOrder == 1 ? 1 : 0);   /* house1b: no order gate - the build order went to the placer's workers */
@@ -7244,6 +9150,37 @@ void BdHelpOffMainSeen(void* b, float amount)
 }
 int BdFactionIsPlayerPod(void* f);   /* T-1333: defined below in this same unnamed namespace (detour_wallHit's neighbour); the town wall repair check reads it */
 int TbHoldAnyThread(void* b, int* area);   /* T-1333 fold 4: defined below in this same unnamed namespace; the town door repair ask reads it */
+/* T-1408 fold 1 (review 1): the leads of grouped wall copies whose help step detour_progress refused (MAIN THREAD writes), read by the job
+   road (BdHelpJobGate, ANY THREAD) - a running build job whose piece's lead had a step refused within kWrFreshMs is ended */
+const int kWrCap = 16;
+const DWORD kWrFreshMs = 2000;
+struct BdWrRow { void* lead; DWORD at; };
+BdWrRow g_wr[kWrCap];
+volatile LONG g_wrLock = 0;
+void BdWallRefusedNote(void* lead)
+{
+    const DWORD now = ::GetTickCount();
+    while (::InterlockedCompareExchange(&g_wrLock, 1, 0) != 0) YieldProcessor();
+    int at = -1, old = 0;
+    for (int i = 0; i < kWrCap; ++i)
+    {
+        if (g_wr[i].lead == lead) { at = i; break; }
+        if ((DWORD)(now - g_wr[i].at) > (DWORD)(now - g_wr[old].at)) old = i;
+    }
+    if (at < 0) at = old;
+    g_wr[at].lead = lead; g_wr[at].at = now;
+    ::InterlockedExchange(&g_wrLock, 0);
+}
+int BdWallRefusedRecently(void* lead)
+{
+    if (lead == 0) return 0;
+    const DWORD now = ::GetTickCount();
+    int r = 0;
+    while (::InterlockedCompareExchange(&g_wrLock, 1, 0) != 0) YieldProcessor();
+    for (int i = 0; i < kWrCap; ++i) if (g_wr[i].lead == lead && (DWORD)(now - g_wr[i].at) <= kWrFreshMs) { r = 1; break; }
+    ::InterlockedExchange(&g_wrLock, 0);
+    return r;
+}
 void detour_progress(void* b, float amount)
 {
     if (amount < FLT_MAX * 0.5f && BdOnMain() == 0) BdHelpOffMainSeen(b, amount);   /* the measurement only */
@@ -7266,9 +9203,10 @@ void detour_progress(void* b, float amount)
             hk[0] = 0;
             if (ObjectPositionKey(b, hk, kKeyCap, "", 3, 0) == 0) { hk[0] = '?'; hk[1] = 0; }
             char hl[360];
-            _snprintf_s(hl, sizeof(hl), _TRUNCATE, "[BUILD] repair work on a wall copy key=%s NOT DONE: the owner's game refused this wall's repair and its health has not changed since - the engine's step is skipped; wallRepHeldRefused=%lld",
+            _snprintf_s(hl, sizeof(hl), _TRUNCATE, "[BUILD] repair work on a wall copy key=%s NOT DONE: the owner's game refused this wall's repair and its health has not changed since - the engine's step is skipped, its repair job ended at the job's next turn; wallRepHeldRefused=%lld",
                         hk, g_wallRepHeldRefused);
             BdLogHelpFreq(hl);
+            BdRepHeldMirrorAdd(b);   /* T-1408 fold 10 (F1312): BdHelpJobGate ends the job on the engine's own road */
             ::InterlockedIncrement64(&g_progressSeen);
             return;
         }
@@ -7298,6 +9236,38 @@ void detour_progress(void* b, float amount)
         ::InterlockedIncrement64(&g_progressSeen);
         return;
     }
+    /* T-1408 (F1216 design read): a grouped wall copy's step (the engine forwards a member's step to its lead, so b is the helper's lead
+       copy) is help only when the group is its owner's alone and the owner's game is in the world - that game resolves its own group. A
+       mixed-owner group's, a ruin's or an away owner's step is not run here (every order road refuses them too; this catches a job given
+       before) */
+    const int gWall = (cand != 0 && c0 == 0 && x0 == 0 && BdIsWall(b) == 1 && BdWallOwnRecord(b) <= 0) ? 1 : 0;
+    if (gWall != 0)
+    {
+        const int gk = BdWallHelpKind(b);
+        const int gin = (gk == coopbuild::kBuildWallKindGroupOwner) ? StoreRosterSlotInWorld(StandInSlotOf((::Faction*)BdOwnerPod(b))) : 0;
+        const int gwr = (gk == coopbuild::kBuildWallKindGroupOwner && gin == 1 && BdCopyWriterAt(b) != 0) ? 1 : 0;   /* T-1408 fold 1 (review 4): this game writes the copy - its own step would write only the lead's record; the owner's game resolves its group */
+        const int gho = (gk == coopbuild::kBuildWallKindGroupOwner && !g_wh.empty()) ? BdWallOwnerHeldAt(b) : 0;   /* T-1408 fold 2: the holding game said HELD */
+        const int gsv = coopbuild::BuildHelpWallStep(gk, gin, gwr, gho);
+        if (gsv != coopbuild::kBuildWallStepRun)
+        {
+            if (gsv == coopbuild::kBuildWallStepRefuse) { ++g_helpWallStepRefused; BdWallRefusedNote(b); }   /* T-1408 fold 1 (review 1): the job road ends the job whose step this was */
+            else ++g_helpWallStepWait;   /* T-1408 fold 2: the owner's status unknown (a load) - skipped, never noted: the job is kept, no stop / restart churn */
+            char gkk[kKeyCap];
+            gkk[0] = 0;
+            if (ObjectPositionKey(b, gkk, kKeyCap, "", 3, 0) == 0) { gkk[0] = '?'; gkk[1] = 0; }
+            char gl[520];
+            _snprintf_s(gl, sizeof(gl), _TRUNCATE, "[BUILD] T-1408 help work on a grouped WALL copy of slot%d key=%s NOT DONE: %s - the engine's step is skipped; helpWallStepRefused=%lld stepWait=%lld",
+                        StandInSlotOf((::Faction*)BdOwnerPod(b)), gkk,
+                        gsv == coopbuild::kBuildWallStepWait ? "the owner's game's status is not known yet (a load) - the step WAITS, no work counted, the job is kept"
+                        : gho != 0 ? "the game holding this group's help work said HELD (the owner's group not wholly loaded there, or another game writes the copy) - the job ends"
+                        : gwr != 0 ? "this game writes the copy (the owner's game has not the area loaded; it resolves its own group)"
+                        : gk == coopbuild::kBuildWallKindGroupOwner ? "the owner's game is not in the world (it resolves its own group)" : "its group is not its owner's alone (mixed owners), a ruin, or its record unreadable",
+                        g_helpWallStepRefused, g_helpWallStepWait);
+            BdLogHelpFreq(gl);
+            ::InterlockedIncrement64(&g_progressSeen);
+            return;
+        }
+    }
     /* T-23 (owner 1460 a): this game writes the piece (its owner's game away, this game the area's holder) - asked live at the step: no
        raised needed, no cap, no help entry; the engine's own step finishes it here and its state goes to the record (BdWriterStepAfter) */
     const int wHere = (cand != 0 && coopbuild::BuildHelpCapsCopy(BdCopyWriterAt(b)) == 0) ? 1 : 0;
@@ -7316,6 +9286,8 @@ void detour_progress(void* b, float amount)
     float tbP0 = 0.0f, tbN0 = 0.0f;   /* T-1333: a town wall's health before the engine's repair step */
     int tbC0 = 0, tbD0 = 0, tbX0 = 0;
     const int tbWall = (g_bdSelf == 0 && cand == 0 && amount > 0.0f && amount < FLT_MAX * 0.5f && BdIsWall(b) == 1 && BdReadState(b, &tbP0, &tbN0, &tbC0, &tbD0, &tbX0) != 0) ? 1 : 0;
+    if (help != 0) { g_rbPiece = (x0 != 0) ? b : 0; g_rbRead = 0; }   /* T-1408 fold 10 (F1331 3): a ruin's rebuild value, read at its setDestroyed(0) */
+    if (help != 0) g_rbRec = (x0 != 0 && BdIsWall(b) == 1) ? BdWallRecordPod(b) : 0;   /* T-1408 fold 11 (F1343 SHOULD 2): and its group's record */
     if (raisedTo > 0.0f) BdProgressRaised(b, amount, raisedTo, n0);   /* help1 fold (review LOW 11): put back in __finally */
     else orig_progress(b, amount);
     if (tbWall != 0 && !RoleIsSingle())
@@ -7333,6 +9305,15 @@ void detour_progress(void* b, float amount)
     }
     if (help != 0) BdHelpAfter(b, p0, n0, x0, m0n, m0, rep);
     else if (wHere != 0) BdWriterStepAfter(b);   /* T-23 */
+    if (help != 0) { g_rbPiece = 0; g_rbRead = 0; g_rbRec = 0; }
+    if (help != 0 && gWall != 0)
+    {   /* T-1408: the raised needed stays the copy's guard (never complete here) and is back now; the members are drawn from the lead's own
+           progress / needed - not from the raised needed - so the helper's member copies show the group's real share */
+        char gk2[kKeyCap];
+        gk2[0] = 0;
+        if (ObjectPositionKey(b, gk2, kKeyCap, "", 3, 0) == 0) { gk2[0] = '?'; gk2[1] = 0; }
+        BdWallSharesRedraw(b, "the helper's step on its lead copy", gk2);
+    }
     if (dDoor != 0)
     {   /* the health the engine's repair step gained on the door (event 6): its writer takes it (BdDoorChangedHere) */
         float dh1 = dh0, dmx1 = 0.0f;
@@ -7421,11 +9402,12 @@ struct BdHjRow { void* owner; DWORD seenAt; DWORD verdictAt; int verdict; };
 BdHjRow g_hj[kHjCap];
 const int kHjEndCap = 32;
 /* POD, filled where the job ended (any thread): the line's facts and what the K2 safe point needs to find the standing jobs */
-struct BdHjEnd { unsigned int uid; int slot; int kind; int taskType; int onMain; int handOk; unsigned int hf[5]; char key[kKeyCap]; };
+struct BdHjEnd { unsigned int uid; int slot; int kind; int taskType; int onMain; int handOk; unsigned int hf[5]; char key[kKeyCap]; int wall; };   /* T-1408 fold 1: wall 1 = ended by the grouped wall rule (BuildHelpWallJobEnd), not the help rule */
 BdHjEnd g_hjEnd[kHjEndCap];
 int g_hjEndN = 0;
 volatile LONG g_hjLock = 0;       /* g_hj and g_hjEnd */
 volatile LONG64 g_helpJobEnded = 0, g_hjRowsLost = 0, g_hjFull = 0, g_hjEndFault = 0;
+volatile LONG64 g_hjWallEnded = 0;   /* T-1408 fold 1: help jobs ended by the grouped wall rule (counted with helpJobEnded too) */
 volatile LONG64 g_hjNoUid = 0, g_hjNotMine = 0, g_hjNotAsked = 0, g_hjRuleUnknown = 0, g_hjStale = 0;   /* a stand-in's piece, the job let run: why */
 long long g_hjLines = 0;          /* MAIN THREAD: ENDED lines asked for (BuildHelpFreqLine) */
 long long g_hjStandingRemoved = 0, g_hjStandingOther = 0;                          /* MAIN THREAD: standing jobs removed / left (another TaskType) */
@@ -7517,7 +9499,30 @@ int BdHelpJobGate(int kind, void* task, void* ctx)
     }
     BdHjUnlock();
     if (at < 0) { ::InterlockedIncrement64(&g_hjFull); return 0; }
-    if (coopbuild::BuildHelpJobEnd(1, 1, verdict, age, kHjFreshMs) == 0)
+    /* T-1408 fold 1 (review 1): a build job on an unfinished grouped wall copy whose step detour_progress refuses for good (a group not its
+       owner's alone, or the owner's game known away - the K2 safe point's fresh answer) is ended on this same road */
+    int wallEnd = 0;
+    if (kind == 0 && BdIsWall(b) == 1 && BdWallOwnRecord(b) <= 0)
+    {
+        float wp = 0.0f, wn = 0.0f;
+        int wc = 0, wd = 0, wx = 0;
+        if (BdReadState(b, &wp, &wn, &wc, &wd, &wx) != 0 && wc == 0 && wd == 0 && wx == 0)
+        {
+            const int wk = BdWallHelpKind(b);
+            wallEnd = coopbuild::BuildHelpWallJobEndH(wk, wk == coopbuild::kBuildWallKindGroupOwner ? BdJfOwnerInWorld(owner) : -1, wk == coopbuild::kBuildWallKindGroupOwner ? BdWallOwnerHeldAt(b) : 0);   /* T-1408 fold 2: + told HELD; an unknown status never ends it (the step waits) */
+            const uintptr_t wrec = BdWallRecordPod(b);   /* the step ran on the lead (0x5594A0 forwards a member's step to it) */
+            if (wallEnd == 0 && wrec >= (uintptr_t)kWallOwnRecord && BdWallRefusedRecently((void*)(wrec - kWallOwnRecord)) != 0) wallEnd = 1;
+        }
+    }
+    if (wallEnd == 0 && kind == 0 && BdRepHeldMirrorHas(b) != 0)
+    {   /* T-1408 fold 10 (F1312): a repair the owner's game refused - detour_progress skips its step and the job body never reads that, so
+           the job would repair forever; ended here on the engine's own road (BdHjEndPod), while the copy is still a complete whole wall */
+        float rp = 0.0f, rn = 0.0f;
+        int rc = 0, rd = 0, rx = 0;
+        if (BdReadState(b, &rp, &rn, &rc, &rd, &rx) != 0 && rc != 0 && rd == 0 && rx == 0) { wallEnd = 1; ::InterlockedIncrement64(&g_hjRepHeldEnded); }
+    }
+    if (wallEnd != 0) ::InterlockedIncrement64(&g_hjWallEnded);
+    else if (coopbuild::BuildHelpJobEnd(1, 1, verdict, age, kHjFreshMs) == 0)
     {
         if (verdict == coopbuild::kBuildHelpJobUnknown) ::InterlockedIncrement64(asked != 0 ? &g_hjRuleUnknown : &g_hjNotAsked);   /* the rule could not tell / not asked yet */
         else if (verdict == coopbuild::kBuildHelpJobRefused) ::InterlockedIncrement64(&g_hjStale);
@@ -7526,7 +9531,7 @@ int BdHelpJobGate(int kind, void* task, void* ctx)
     if (BdHjEndPod(ctx) == 0) { ::InterlockedIncrement64(&g_hjEndFault); return 0; }   /* not ended: the body runs (its step is refused) */
     ::InterlockedIncrement64(&g_helpJobEnded);
     BdHjEnd e;
-    e.uid = uid; e.slot = StandInSlotOf((::Faction*)owner); e.kind = kind; e.onMain = BdOnMain();
+    e.uid = uid; e.slot = StandInSlotOf((::Faction*)owner); e.kind = kind; e.onMain = BdOnMain(); e.wall = wallEnd;
     e.taskType = BdHjTaskTypePod(task);
     e.handOk = BdHjHandPod(task, e.hf);
     e.key[0] = 0;
@@ -7653,13 +9658,24 @@ int BdHjDropStanding(const BdHjEnd& e, int blocked, int* other, const char** why
     if (b == 0) { ++g_hjDropPieceGone; *why = "the piece is gone"; return -1; }
     ::Faction* owner = (::Faction*)BdOwnerPod(b);
     int v = coopbuild::kBuildHelpJobUnknown;
-    if (owner != 0 && IsStandInFaction(owner))
+    if (owner != 0 && IsStandInFaction(owner) && e.wall != 0)
+    {   /* T-1408 fold 1: ended by the grouped wall rule - asked again here, on the main thread's own answers */
+        float wp = 0.0f, wn = 0.0f;
+        int wc = 0, wd = 0, wx = 0;
+        const int wk = BdWallHelpKind(b);
+        const int win = (wk == coopbuild::kBuildWallKindGroupOwner) ? StoreRosterSlotInWorld(StandInSlotOf(owner)) : -1;
+        const int wwr = (wk == coopbuild::kBuildWallKindGroupOwner && win == 1 && BdCopyWriterAt(b) != 0) ? 1 : 0;   /* the step's own writer refusal */
+        if (BdReadState(b, &wp, &wn, &wc, &wd, &wx) != 0 && wc == 0 && wd == 0 && wx == 0
+            && (wwr != 0 || coopbuild::BuildHelpWallJobEndH(wk, win, wk == coopbuild::kBuildWallKindGroupOwner ? BdWallOwnerHeldAt(b) : 0) != 0))   /* T-1408 fold 2: + told HELD */
+            v = coopbuild::kBuildHelpJobRefused;
+    }
+    else if (owner != 0 && IsStandInFaction(owner))
     {
         int mate = 0, fr = 0, known = 0;
         const int allowed = BdHelpAllowedHere(owner, &mate, &fr, &known);
         v = coopbuild::BuildHelpJobVerdict((MySlotForWire() >= 0 && TeamTableKnown()) ? 1 : 0, allowed, known);
     }
-    if (v != coopbuild::kBuildHelpJobRefused) { ++g_hjDropNotRefused; *why = "the help rule no longer refuses (allowed, not known, or no stand-in's piece)"; return -1; }
+    if (v != coopbuild::kBuildHelpJobRefused) { ++g_hjDropNotRefused; *why = e.wall != 0 ? "the grouped wall rule no longer refuses (the owner's game is back, or the wall changed)" : "the help rule no longer refuses (allowed, not known, or no stand-in's piece)"; return -1; }
     void* ai = GetCharacterAI(c);
     void* orders = (ai != 0) ? BdHjOrdersPod(ai) : 0;
     if (orders == 0 || BdHjJobCountPod(orders) < 0) { ++g_hjDropOrdersFault; *why = "the character's order system was unreadable"; return -1; }
@@ -7740,11 +9756,13 @@ void BdHelpJobDrain()
                                       why[0] != 0 ? " fault=" : "", why, other);
         else _snprintf_s(drop, sizeof(drop), _TRUNCATE, "standing jobs not looked at: %s", why);
         char line[700];
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help job ENDED for %.40s uid=%u on a copy of slot%d key=%.63s: %s (decision 920 a) - the %s job (task %d, %s) was stopped through the engine's stop flag, its step not run; %s; thread=%s; helpJobEnded=%lld standingRemoved=%lld",
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help job ENDED for %.40s uid=%u on a copy of slot%d key=%.63s: %s - the %s job (task %d, %s) was stopped through the engine's stop flag, its step not run; %s; thread=%s; helpJobEnded=%lld standingRemoved=%lld wallJobEnded=%lld",
                     nm.c_str(), e.uid, e.slot, e.key,
-                    coopbuild::kBuildHelpFriendHelps != 0 ? "not a faction-mate and not set friendly by that player" : "not a faction-mate",
+                    e.wall != 0 ? "T-1408 a grouped WALL copy - its group is not its owner's alone, the owner's game is not in the world, or this game writes the copy (the owner's game resolves its own group)"
+                    : (coopbuild::kBuildHelpFriendHelps != 0 ? "not a faction-mate and not set friendly by that player (decision 920 a)" : "not a faction-mate (decision 920 a)"),
                     BdHjTaskWord(e.taskType), e.taskType, e.kind == 0 ? "Task_Build" : "Task_AddMaterialsToBuilding", drop,
-                    e.onMain != 0 ? "main" : "OTHER", (long long)::InterlockedCompareExchange64(&g_helpJobEnded, 0, 0), g_hjStandingRemoved);
+                    e.onMain != 0 ? "main" : "OTHER", (long long)::InterlockedCompareExchange64(&g_helpJobEnded, 0, 0), g_hjStandingRemoved,
+                    (long long)::InterlockedCompareExchange64(&g_hjWallEnded, 0, 0));
         if (coopbuild::BuildHelpFreqLine(++g_hjLines) || removed > 0 || (removed >= 0 && why[0] != 0)) DebugLog(std::string(line));   /* the first 10, then every 30th - and every one that removed a standing job or stopped on a fault */
     }
 }
@@ -7774,7 +9792,7 @@ void BdHelpJobForget()
    (BdJobFinderRefresh) writes one row per current stand-in with its answer and the time, and this game's player faction. Nothing is
    refreshed while engine writes are blocked (a load / teardown): the rows age past kHjFreshMs and the finder keeps the engine's skip. */
 const int kJfCap = kStandInTableCap;
-struct BdJfRow { void* f; int slot; int verdict; int mate; int friendly; DWORD at; long long taken; };
+struct BdJfRow { void* f; int slot; int verdict; int mate; int friendly; DWORD at; long long taken; int inWorld; };   /* T-1408 fold 1: inWorld = StoreRosterSlotInWorld of the stand-in's slot (1 in, 0 not, -1 unknown) */
 BdJfRow g_jf[kJfCap];
 int g_jfN = 0;
 void* g_jfMine = 0;                 /* this game's player faction at the last refresh (compared only) */
@@ -7792,16 +9810,22 @@ int BdJobFinderTakes(void* charFaction, void* buildingFaction, void* building)
 {
     ::InterlockedIncrement64(&g_jfAsked);
     const DWORD now = ::GetTickCount();
-    int mine = 0, row = 0, verdict = coopbuild::kBuildHelpJobUnknown, at = -1;
+    int mine = 0, row = 0, verdict = coopbuild::kBuildHelpJobUnknown, at = -1, inW = -1;
     DWORD age = 0xFFFFFFFFu;
     BdJfLock();
     mine = (g_jfMine != 0 && charFaction == g_jfMine) ? 1 : 0;
     if (mine != 0)
         for (int i = 0; i < g_jfN; ++i)
-            if (g_jf[i].f == buildingFaction) { at = i; row = 1; verdict = g_jf[i].verdict; age = now - g_jf[i].at; break; }
+            if (g_jf[i].f == buildingFaction) { at = i; row = 1; verdict = g_jf[i].verdict; age = now - g_jf[i].at; inW = g_jf[i].inWorld; break; }
     BdJfUnlock();
     int v = coopbuild::BuildJobFinderVerdict(0, mine, row, verdict, age, kHjFreshMs, 0);
-    if (v == coopbuild::kBuildJobFinderAllowed && BdWallHelpKind(building) == coopbuild::kBuildWallKindGroup) v = coopbuild::BuildJobFinderVerdict(0, mine, row, verdict, age, kHjFreshMs, 1);   /* a grouped wall: refused, as on every order road */
+    /* a grouped wall: the main-thread order's verdict (BdHelpOrder) - refused unless its group is the owner's alone and the owner's game is
+       in the world (T-1408 fold 1, review 1: the row's answer, as fresh as the row's - a stale row is refused above) */
+    const int jwk = (v == coopbuild::kBuildJobFinderAllowed) ? BdWallHelpKind(building) : coopbuild::kBuildWallKindNone;
+    if (v == coopbuild::kBuildJobFinderAllowed && coopbuild::BuildHelpOrderVerdictW(coopbuild::kBuildTaskBuild, 1, jwk, inW == 1 ? 1 : 0) == coopbuild::kBuildHelpOrderWallRefused)
+        v = coopbuild::BuildJobFinderVerdict(0, mine, row, verdict, age, kHjFreshMs, 1);
+    if (v == coopbuild::kBuildJobFinderAllowed && jwk == coopbuild::kBuildWallKindGroupOwner && BdWallOwnerHeldAt(building) != 0)   /* T-1408 fold 2: told HELD - no new job */
+        v = coopbuild::BuildJobFinderVerdict(0, mine, row, verdict, age, kHjFreshMs, 1);
     if (v == coopbuild::kBuildJobFinderAllowed && BdIsWall(building) != 0 && BdByteAtOr0(building, kBDestroyed) != 0) v = coopbuild::BuildJobFinderVerdict(0, mine, row, verdict, age, kHjFreshMs, 1);   /* a wall ruin: refused, as the repair order road refuses it - the work step would run its repair as this game's own */
     if (v == coopbuild::kBuildJobFinderAllowed)
     {
@@ -7835,6 +9859,7 @@ void BdJobFinderRefresh()
         const int allowed = BdHelpAllowedHere(fs[i], &mate, &fr, &known);
         rows[i].f = (void*)fs[i]; rows[i].slot = slots[i]; rows[i].mate = mate; rows[i].friendly = fr; rows[i].at = now; rows[i].taken = 0;
         rows[i].verdict = coopbuild::BuildHelpJobVerdict(meKnown, allowed, known);
+        rows[i].inWorld = StoreRosterSlotInWorld(slots[i]);   /* T-1408 fold 1: the owner's game in the world (its group's resolver) */
     }
     BdJfRow old[kJfCap];
     BdJfLock();
@@ -7844,6 +9869,7 @@ void BdJobFinderRefresh()
     g_jfN = n;
     g_jfMine = mine;
     BdJfUnlock();
+    BdWallHeldSweep();   /* T-1408 fold 2: the HELD marks of a holding game known away go; the leads read again */
     for (int i = 0; i < oldN; ++i)
     {
         if (old[i].taken == 0) continue;
@@ -7856,6 +9882,19 @@ void BdJobFinderRefresh()
                     old[i].slot, old[i].mate, old[i].friendly, (long long)::InterlockedCompareExchange64(&g_jfAllowed, 0, 0));
         BdLogCapped(line);
     }
+}
+/* T-1408 fold 1 (review 1), ANY THREAD: stand-in f's owner's game in the world, from the K2 safe point's row (BdJobFinderRefresh): 1 in,
+   0 known not in, -1 no row or a row older than kHjFreshMs (a load: nothing refreshed) */
+int BdJfOwnerInWorld(void* f)
+{
+    if (f == 0) return -1;
+    const DWORD now = ::GetTickCount();
+    int r = -1;
+    BdJfLock();
+    for (int i = 0; i < g_jfN; ++i)
+        if (g_jf[i].f == f) { if ((DWORD)(now - g_jf[i].at) <= kHjFreshMs) r = (g_jf[i].inWorld == 1) ? 1 : (g_jf[i].inWorld == 0 ? 0 : -1); break; }
+    BdJfUnlock();
+    return r;
 }
 /* the world is going away: its stand-ins, its player faction and the logged stand-ins go with it */
 void BdJobFinderForget()
@@ -7930,6 +9969,226 @@ int TbHoldAnyThread(void* b, int* area = 0)
     if (h < 0 || me < 0) return -1;
     return (h == me) ? 1 : 0;
 }
+/* T-1381: who swung a hit on a player wall or door, read where it lands (the queued road). ANY THREAD: its uid and whether this
+   game runs it (FindSpawnedUid, the owned mirror). MAIN THREAD only: its name (any object's), and - for a character the spawn index
+   holds at that address (FindSpawned) - its faction, the game that runs a copy and its current goal (describeCurrentGoal). */
+void BdAttackerFill(void* attacker, BdAtk* a);   /* T-1381: below */
+void BdAttackerAim(void* c, BdAtk* a);   /* T-1381 (F1089): below */
+unsigned long long kBdHandVtRva = 0; static coop::AddrReg kBdHandVtRva_reg("HandVt", &kBdHandVtRva);   /* T-1381: hand's vtable (Steam_1.0.65 0x16842D0, items.cpp's row) - a task's +0x78 is read as a hand only when it carries it */
+/* T-1381: c's current task (CharBody +0x648 -> +0x68, as clothing.cpp's tool read) and the 0x20 bytes at its +0x78 (the shopping
+   step's target hand, decomp 0x337CC0:18-32). 2 = task and bytes read, 1 = no current task, 0 = no body, -1 faulted. */
+int BdTaskHandPod(void* c, void** task, unsigned char* hb, unsigned char* hb10)
+{
+    *task = 0;
+    __try
+    {
+        const char* body = *(const char* const*)((const char*)c + 0x648);
+        if (body == 0) return 0;
+        void* t = *(void* const*)(body + 0x68);
+        if (t == 0) return 1;
+        *task = t;
+        std::memcpy(hb10, (const char*)t + 0x10, 0x20);   /* T-1381 (F1089 'left'): every task's own target hand, decomp_32eb90 tail */
+        std::memcpy(hb, (const char*)t + 0x78, 0x20);
+        return 2;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *task = 0; return -1; }
+}
+/* T-1381 (F1089 'left'): the target object's position (RootObjectBase +kObjPos, the field getPosition copies). 1 read, 0 faulted. */
+int BdAimPosPod(void* o, float* p)
+{
+    __try { const char* q = (const char*)o; p[0] = *(const float*)(q + kObjPos); p[1] = *(const float*)(q + kObjPos + 4); p[2] = *(const float*)(q + kObjPos + 8); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1381 (F1089 'left': what the attacker was going for): the words for the target hand in hb (a task's +0x10, which the task builder
+   0x32EB90 fills from its target hand for every task it makes - decomp_32eb90 tail) - "'<name>' (<class>, faction '<f>', uid <u> |
+   key <k>)", or why not; *pos / *posOk its position for the distance to the hit piece. The hand is checked to carry the hand vtable
+   before it is used and resolved by the engine's own hand::asObjectBase (guarded); the faction is read only for a character (its
+   owner faction) or a building (its owner), by the object's own class name. MAIN THREAD. */
+void BdAimHandWords(const unsigned char* hb, char* out, size_t cap, float* pos, int* posOk)
+{
+    *posOk = 0;
+    unsigned long long hv = 0;
+    std::memcpy(&hv, hb, 8);
+    if (kBdHandVtRva == 0 || hv != (unsigned long long)(uintptr_t)::GetModuleHandleA(0) + kBdHandVtRva) { _snprintf_s(out, cap, _TRUNCATE, "%s", "not read (the task's +0x10 is not a hand)"); return; }
+    unsigned int f[5];
+    std::memcpy(f, hb + 8, sizeof f);   /* type, container, containerStamp, index, serial */
+    if (f[3] == 0 && f[4] == 0) { _snprintf_s(out, cap, _TRUNCATE, "%s", "nothing (a null hand)"); return; }
+    hand h(f[3], f[4], (itemType)f[0], f[1], f[2]);
+    void* o = 0;
+    if (BdHandLookupPod(&h, 1, &o) == 0 || o == 0) { _snprintf_s(out, cap, _TRUNCATE, "hand type %u not found here", f[0]); return; }
+    std::string nm;
+    if (!NameOf(o, &nm)) nm = "(name not read)";
+    char cls[64];
+    cls[0] = 0;
+    const unsigned int vt = PolicyVtableRvaPod(o);
+    if (vt == 0 || PolicyClassNamePod(vt, cls, (int)sizeof cls) == 0 || cls[0] == 0) _snprintf_s(cls, sizeof cls, _TRUNCATE, "vt 0x%X", vt);
+    char fn[64];
+    fn[0] = 0;
+    const bool isChar = std::strstr(cls, "Character") != 0;
+    const bool isBldg = std::strstr(cls, "Building") != 0 || std::strstr(cls, "Door") != 0;
+    if (isChar) { ::Faction* cf = BdCharFaction((::Character*)o); if (cf != 0) BdFacNamePod(cf, fn, (int)sizeof fn); }
+    else if (isBldg) { void* bf = BdOwnerPod(o); if (bf != 0) BdFacNamePod(bf, fn, (int)sizeof fn); }
+    const unsigned int u = FindSpawnedUid(o);
+    char k[kKeyCap];
+    k[0] = 0;
+    if (u == 0 && ObjectPositionKey(o, k, kKeyCap, "", 3, 0) == 0) k[0] = 0;
+    char idw[96];
+    if (u != 0) _snprintf_s(idw, sizeof idw, _TRUNCATE, "uid %u", u);
+    else _snprintf_s(idw, sizeof idw, _TRUNCATE, "key %.63s", k[0] != 0 ? k : "none");
+    _snprintf_s(out, cap, _TRUNCATE, "'%.47s' (%.40s, faction '%.47s', %s)", nm.c_str(), cls, fn[0] != 0 ? fn : (isChar || isBldg ? "(not read)" : "(not a character or building)"), idw);
+    *posOk = BdAimPosPod(o, pos);
+}
+/* T-1381 (F1075 'who was the target'): the words for c's current task and what its hand points at - "task '<class>' -> '<name>'
+   (uid <u>|key <k>)", or why not. The hand is resolved by the engine's own hand::asObjectBase (guarded). MAIN THREAD. */
+void BdAttackerTaskTarget(void* c, char* out, size_t cap)
+{
+    void* t = 0;
+    unsigned char hb[0x20];
+    std::memset(hb, 0, sizeof hb);
+    unsigned char hb10[0x20];
+    std::memset(hb10, 0, sizeof hb10);
+    const int r = BdTaskHandPod(c, &t, hb, hb10);
+    if (r <= 1) { _snprintf_s(out, cap, _TRUNCATE, "%s", r < 0 ? "task unreadable" : (r == 0 ? "no body" : "no current task")); return; }
+    char cls[64];
+    cls[0] = 0;
+    const unsigned int vt = PolicyVtableRvaPod(t);
+    if (vt == 0 || PolicyClassNamePod(vt, cls, (int)sizeof cls) == 0 || cls[0] == 0) _snprintf_s(cls, sizeof cls, _TRUNCATE, "vt 0x%X", vt);
+    unsigned long long hv = 0;
+    std::memcpy(&hv, hb, 8);
+    if (kBdHandVtRva == 0 || hv != (unsigned long long)(uintptr_t)::GetModuleHandleA(0) + kBdHandVtRva)
+    {
+        _snprintf_s(out, cap, _TRUNCATE, "task '%s' (its +0x78 is not a hand)", cls);
+        return;
+    }
+    unsigned int f[5];
+    std::memcpy(f, hb + 8, sizeof f);   /* type, container, containerStamp, index, serial */
+    if (f[3] == 0 && f[4] == 0) { _snprintf_s(out, cap, _TRUNCATE, "task '%s' -> no target (a null hand)", cls); return; }
+    hand h(f[3], f[4], (itemType)f[0], f[1], f[2]);
+    void* o = 0;
+    if (BdHandLookupPod(&h, 1, &o) == 0 || o == 0) { _snprintf_s(out, cap, _TRUNCATE, "task '%s' -> hand type %u not found here", cls, f[0]); return; }
+    std::string nm;
+    if (!NameOf(o, &nm)) nm = "(name not read)";
+    const unsigned int u = FindSpawnedUid(o);
+    char k[kKeyCap];
+    k[0] = 0;
+    if (u == 0 && ObjectPositionKey(o, k, kKeyCap, "", 3, 0) == 0) k[0] = 0;
+    if (u != 0) _snprintf_s(out, cap, _TRUNCATE, "task '%s' -> '%.47s' (hand type %u, uid %u)", cls, nm.c_str(), f[0], u);
+    else _snprintf_s(out, cap, _TRUNCATE, "task '%s' -> '%.47s' (hand type %u, key %.63s)", cls, nm.c_str(), f[0], k[0] != 0 ? k : "none");
+}
+/* T-1381 (F1089): the current task's own target (its +0x10 hand) into a->aim / aimPos. The goal's target (the 'Shopping' person, F1074)
+   has no field this mod knows how to read safely - only the goal's words (a->task) and the current task's target are logged. MAIN THREAD. */
+void BdAttackerAim(void* c, BdAtk* a)
+{
+    void* t = 0;
+    unsigned char hb[0x20], hb10[0x20];
+    std::memset(hb, 0, sizeof hb);
+    std::memset(hb10, 0, sizeof hb10);
+    a->aimPosOk = 0;
+    const int r = BdTaskHandPod(c, &t, hb, hb10);
+    if (r <= 1) { _snprintf_s(a->aim, sizeof a->aim, _TRUNCATE, "%s", r < 0 ? "not read (task unreadable)" : (r == 0 ? "not read (no body)" : "nothing (no current task)")); return; }
+    BdAimHandWords(hb10, a->aim, sizeof a->aim, a->aimPos, &a->aimPosOk);
+}
+void BdAttackerRead(void* attacker, int onMain, BdAtk* a)
+{
+    *a = BdAtk();
+    if (attacker == 0) return;
+    a->known = 1;
+    a->uid = FindSpawnedUid(attacker);
+    a->whose = (a->uid == 0) ? -1 : (net::IsUidMineAnyThread(a->uid) ? 1 : 0);
+    a->where = coopbuild::BuildHitAttackerReadWhere(onMain, a->uid);   /* T2436: the hook ran off the main thread - then read later by uid */
+    if (a->where == coopbuild::kBuildAtkReadNow) BdAttackerFill(attacker, a);
+}
+/* T-1381: an attacker held for a later read (off the main thread when it swung) read now through its uid. MAIN THREAD. */
+void BdAttackerResolve(BdAtk* a)
+{
+    if (a->known != 1 || a->uid == 0 || a->name[0] != 0) return;   /* off the main thread when it swung, or the read there found no name */
+    ::Character* c = FindSpawned(a->uid);
+    if (c != 0) BdAttackerFill(c, a);
+}
+/* T-1381: name (any object's), then - for the character the spawn index holds under its uid - faction, the game that runs a copy and
+   its current goal. MAIN THREAD. */
+void BdAttackerFill(void* attacker, BdAtk* a)
+{
+    std::string s;
+    if (NameOf(attacker, &s)) _snprintf_s(a->name, sizeof a->name, _TRUNCATE, "%s", s.c_str());
+    if (a->uid == 0 || (const void*)FindSpawned(a->uid) != (const void*)attacker) return;
+    if (a->whose == 0) a->slot = net::OwnerSlotOf(a->uid);
+    ::Faction* f = BdCharFaction((::Character*)attacker);
+    if (f != 0) BdFacNamePod(f, a->fac, (int)sizeof a->fac);
+    std::string g;
+    if (TaskGoalOfChar((::Character*)attacker, &g, 0)) _snprintf_s(a->task, sizeof a->task, _TRUNCATE, "%s", g.c_str());
+    BdAttackerTaskTarget(attacker, a->tgt, sizeof a->tgt);   /* T-1381: what its current task points at */
+    BdAttackerAim(attacker, a);   /* T-1381 (F1089): what its current task is going for (the task's own target) */
+}
+/* T-1401 (owner 1735 a): a hit line on a player piece. failed 1 (a hit failed, dropped or lost): always written. Otherwise each
+   piece's first kHitLinesPerPiece lines in full, then one summary a minute per piece while it is hit, naming the attackers' kinds
+   (AttackerKind: their factions). MAIN THREAD. */
+void BdHitSummaryLine(const swkeycap::Summary& s)
+{
+    char t[900];
+    _snprintf_s(t, sizeof(t), _TRUNCATE, "[BUILD] hits on key=%.63s: %u more hit lines in the last %u s were not written (each piece's first %d are, then this summary a minute while it is hit; a failed, dropped or lost hit is always written) - attackers: %s",
+                s.key.c_str(), s.held, s.spanMs / 1000u, kHitLinesPerPiece, s.kinds.empty() ? "none carried" : s.kinds.c_str());
+    DebugLog(std::string(t));
+}
+void BdLogHit(const char* line, const std::string& key, int failed, const BdAtk* atk)
+{
+    if (failed != 0) { ++g_hitLinesAlways; DebugLog(std::string(line)); return; }
+    std::string kind;
+    if (atk != 0) { BdAtk r = *atk; BdAttackerResolve(&r); kind = swkeycap::AttackerKind(r.known, r.fac, r.name); }
+    swkeycap::Summary s;
+    const int v = swkeycap::Judge(&g_bdHitCap, key, ::GetTickCount(), kind, &s);
+    if (v == swkeycap::kWrite) DebugLog(std::string(line));
+    else if (v == swkeycap::kSummaryDue) BdHitSummaryLine(s);
+}
+/* T-1401: the held counts of both tables - all: every key holding lines (a REPORT, so a bug report carries them); else the keys a
+   minute old (BuildTick, every 5 s). MAIN THREAD. */
+void BdLogFlush(bool all)
+{
+    std::vector<swkeycap::Summary> v;
+    const unsigned int now = ::GetTickCount();
+    swkeycap::Flush(&g_bdHitCap, now, all, &v);
+    for (size_t i = 0; i < v.size(); ++i) BdHitSummaryLine(v[i]);
+    v.clear();
+    swkeycap::Flush(&g_bdKindCap, now, all, &v);
+    for (size_t i = 0; i < v.size(); ++i) BdKindSummaryLine(v[i]);
+}
+/* T-1381: the HIT lines' attacker words (" by ..."; nothing for a repair's gain, which has no attacker) and piece words (" piece
+   '<its record name>' of '<its owner faction>'"; nothing when the piece is not found here) */
+void BdHitWhoWords(char* aw, size_t awCap, const BdAtk* atk, char* pw, size_t pwCap, void* b)
+{
+    aw[0] = 0; pw[0] = 0;
+    if (atk != 0)
+    {
+        BdAtk r = *atk;
+        BdAttackerResolve(&r);   /* T2436: a hit seen off the main thread is read here, by its uid */
+        char w[960];
+        coopbuild::BuildHitAttackerWords(w, sizeof w, r.known, r.name, r.fac, r.whose, r.slot, r.uid, r.task);
+        if (r.known == 1) { const size_t wl = std::strlen(w); _snprintf_s(w + wl, sizeof w - wl, _TRUNCATE, "; %s [swung on %s]", r.tgt[0] != 0 ? r.tgt : "task not read", atk->where == coopbuild::kBuildAtkReadNow ? "the main thread" : "another thread"); }
+        if (r.known == 1)   /* T-1381 (F1089): what it was going for - its current task's own target, and how far that stands from the hit piece */
+        {
+            char dw[64];
+            float pp[3];
+            if (r.aimPosOk != 0 && b != 0 && BdAimPosPod(b, pp) != 0)
+            {
+                const float dx = r.aimPos[0] - pp[0], dy = r.aimPos[1] - pp[1], dz = r.aimPos[2] - pp[2];
+                _snprintf_s(dw, sizeof dw, _TRUNCATE, ", %.1f m from the hit piece", std::sqrt(dx * dx + dy * dy + dz * dz));
+            }
+            else _snprintf_s(dw, sizeof dw, _TRUNCATE, "%s", ", distance not read");
+            const size_t wl = std::strlen(w);
+            _snprintf_s(w + wl, sizeof w - wl, _TRUNCATE, "; going for %s%s (goal '%s' - its own target not read)", r.aim[0] != 0 ? r.aim : "not read (no main-thread read)", r.aim[0] != 0 ? dw : "", r.task[0] != 0 ? r.task : "not read");
+        }
+        _snprintf_s(aw, awCap, _TRUNCATE, " %s", w);
+    }
+    if (b != 0)
+    {
+        char rn[64], fn[64];
+        rn[0] = 0; fn[0] = 0;
+        ObjRecordNamePod(b, rn, (int)sizeof rn);
+        void* f = BdOwnerPod(b);
+        if (f != 0) BdFacNamePod(f, fn, (int)sizeof fn);
+        _snprintf_s(pw, pwCap, _TRUNCATE, " piece '%s' of '%s'", rn[0] != 0 ? rn : "(name not read)", fn[0] != 0 ? fn : "(owner not read)");
+    }
+}
 /* T-1333 fold 1 B: the blow's attacker is a COPY here of a character another game runs - a uid this game does not own (a player's
    character or an NPC), the very test combat.cpp's melee hit makes for a blow on a character (F349). ANY THREAD: the index and the
    owned mirror only. 1 = a copy (*uid its uid), 0 = not (this game's own, or no uid - a world NPC no game replicates) */
@@ -7989,7 +10248,9 @@ unsigned long long detour_wallHit(void* t, unsigned long long hand, void* dmg, v
     if (coopbuild::BuildWallHitRoute(BdIsWall(t) == 1 ? 1 : 0, player, others, dmgOk, replay) == coopbuild::kBuildHitRouteQueue)
     {
         ::InterlockedIncrement64(&g_hitCopySeen);
-        BdQueueEvent(5, t, cut, onMain, -1, 0, blunt);
+        BdAtk atk;
+        BdAttackerRead(attacker, onMain, &atk);   /* T-1381 */
+        BdQueueEvent(5, t, cut, onMain, -1, 0, blunt, -1, 0, &atk);
         return 1ULL;   /* what 0x29D520 returns on every road */
     }
     /* T-1333: a TOWN wall's hit while another player is known. Fold 1 B: a blow whose attacker is a copy here (another game runs that
@@ -8082,7 +10343,9 @@ unsigned long long detour_doorHit(void* t, unsigned long long hand, void* dmg, v
     if (coopbuild::BuildDoorHitRoute(isDoor, index, player, others, dmgOk, replay) == coopbuild::kBuildHitRouteQueue)
     {
         ::InterlockedIncrement64(&g_doorHitQueued);
-        BdQueueEvent(5, parent, cut, onMain, -1, 0, blunt, index);
+        BdAtk atk;
+        BdAttackerRead(attacker, onMain, &atk);   /* T-1381 */
+        BdQueueEvent(5, parent, cut, onMain, -1, 0, blunt, index, 0, &atk);
         return BdDoorHitQueuedRc(t);
     }
     /* T-1333: a TOWN building's door hit, while another player is known, on a game that does not hold the building's area is held for the
@@ -8132,6 +10395,13 @@ void detour_destroy(void* b, bool destroyed)
     BdByteAt(b, kBDestroyed, &after);
     if (!((before == 0 && after > 0) || (before > 0 && after == 0))) { ::InterlockedIncrement64(&g_destroyNoChange); return; }   /* P15: a real flip either way */
     ::InterlockedIncrement64(after > 0 ? &g_destroySeen : &g_wholeSeen);
+    if (before > 0 && after == 0 && g_rbPiece != 0 && (b == g_rbPiece || (g_rbRec != 0 && BdIsWall(b) == 1 && BdWallRecordPod(b) == g_rbRec)))
+    {   /* T-1408 fold 10 (F1331 3): the helper's step rebuilt this ruin - the value the rebuild left (the step's work comes on top).
+           T-1408 fold 11 (F1343 SHOULD 2): or the wall sharing its record - the engine forwards a member's step to its group's lead */
+        float rp = 0.0f, rn = 0.0f;
+        int rc = 0, rd = 0, rx = 0;
+        if (BdReadState(b, &rp, &rn, &rc, &rd, &rx) != 0) { g_rbP = rp; g_rbRead = 1; }
+    }
     if (before == 0 && after > 0) DoorsRecRuinAfter(b, 1);   /* its doors' records leave the world server (by the area's holder) */
     BdQueueEvent(3, b, g_bdSelf > 0 ? 1.0f : 0.0f, 1, -1);   /* P15: amount 1 = the mod's own write (a STATE applied here), 0 = this game's engine */
 }
@@ -9209,7 +11479,7 @@ void BdQueuePlaceState(const coopbuild::BuildMsg& m)
     BdStatePend& s = g_pendState[m.key];
     s.m = coopbuild::BuildMsg();
     s.m.kind = coopbuild::kBuildState; s.m.key = m.key; s.m.progress = m.progress; s.m.needed = m.needed; s.m.complete = 0; s.m.nMats = 0;
-    s.nextTry = 0; s.fromPlace = 1; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0;   /* P15 fold 1 */
+    s.nextTry = 0; s.fromPlace = 1; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0; s.ruinPutPend = 0; s.ruinPutVal = 0.0f;   /* P15 fold 1 */
 }
 
 /* mmo8a3 (A), MAIN THREAD (the K2 safe point): is a pending entry's area loaded here. A RESTORE row asks the engine's own
@@ -9240,10 +11510,12 @@ void BdMarkOwner(BdReg& r, const coopbuild::BuildMsg& m, int toMe, int slot)
     if (toMe == 0) { BdCopyListNote(m.key, r, m, slot); return; }   /* P87 root: a copy made or adopted here - listed ('~c' in pp.build) */
     BdCopyListRetire(m.key, "handed to this game (its own piece now)");   /* P87 root */
     r.via = 5; r.own = 1;
+    PcQueue(m.key, coopbuild::kPcRoadHandover);   /* T-1389: handed to this game */
     BdTombDrop(m.key, "a PLACE handed to this game landed at the key", 0);   /* P87 fold 1 (H2): the owner holds a piece there again */
     r.sentOk = 1; r.sentProgress = r.progress; r.sentComplete = r.complete; r.sentN = 0;
     r.placeOk = 1;
     for (int i = 0; i < 3; ++i) r.placePos[i] = m.pos[i];
+    r.placeMark = m.groundMark != 0 ? 1 : 0;   /* T-1372: the PLACE's mark (BdCopyOne converted an older one first) */
     for (int i = 0; i < 4; ++i) r.placeRot[i] = m.rot[i];
     r.floor = m.floor; r.outside = (m.outside != 0) ? 1 : 0;
     ++g_handedRecv;
@@ -9277,6 +11549,7 @@ void BdMarkRestored(BdReg& r, BdPending& p, void* b, int slot)
     p.keptMade = b;   /* KEPT: the object made here - its destroyed flag and overlap check go on it, not on a search by key */
     r.placeOk = 1;
     for (int i = 0; i < 3; ++i) r.placePos[i] = m.pos[i];
+    r.placeMark = m.groundMark != 0 ? 1 : 0;   /* T-1372: the PLACE's mark (BdCopyOne converted an older one first) */
     for (int i = 0; i < 4; ++i) r.placeRot[i] = m.rot[i];
     r.floor = m.floor; r.outside = (m.outside != 0) ? 1 : 0;
     int applied = 0, stage = 0;
@@ -9284,8 +11557,18 @@ void BdMarkRestored(BdReg& r, BdPending& p, void* b, int slot)
        piece made finished holds what a new piece holds; progress is written only to an unfinished one */
     const int msRoad = piecerec::PieceMadeStateRoad(p.recMake, p.rsHasState, BdIsWall(b));
     if (msRoad == piecerec::kMsStateRoad)
-    {   /* made from its piece record: the record's state goes on the STATE road every piece kind takes (BdApplyOne - walls too) */
-        if (PcaOwnStateQueue(p.st) != 0) ++g_pcaOwnStateLaid;
+    {   /* made from its piece record: the record's state goes on the STATE road every piece kind takes (BdApplyOne - walls too); T-1408 fold 4:
+           a wall rebuilt from its build-list row (no record) takes the row's state on the same road */
+        const int q = PcaOwnStateQueue(p.st);
+        if (q != 0) ++g_pcaOwnStateLaid;
+        if (p.recMake == 0)
+        {
+            if (q != 0) ++g_ogListWall;
+            char wl[360];
+            _snprintf_s(wl, sizeof(wl), _TRUNCATE, "[BUILD] T-1408 fold 4 wall key=%.63s rebuilt from its build-list row (no record): the row's state %.3f/%.2f complete=%d %s; ownGroupListWall=%lld",
+                        m.key.c_str(), p.st.progress, p.st.needed, (int)p.st.complete, q != 0 ? "queued on the STATE road (BdApplyOne writes it the wall's way)" : "NOT queued (the STATE list is full)", g_ogListWall);
+            BdLogState(wl);
+        }
     }
     else if (msRoad == piecerec::kMsInline)
     {
@@ -9316,11 +11599,20 @@ void BdMarkRestored(BdReg& r, BdPending& p, void* b, int slot)
     p.rsOutcome = 2;
     ++g_rsRecreated;
     BdOwnDirty(1);
-    char line[400];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] restore key=%.63s recreated owner=mine progress=%.2f/%.2f complete=%d state=%s (stage %d) via=restored",
-                m.key.c_str(), r.progress, r.needed, r.complete, applied > 0 ? "applied" : (applied < 0 ? "FAULTED" : "none"), stage);
+    char hgt[200];   /* T-1372 A1: the input it was made from and the engine's ground createPhysical added (free-standing only) */
+    {
+        float lv[3] = { 0.0f, 0.0f, 0.0f }, eg = 0.0f;
+        const int lvOk = BdCopyF((const char*)b + kObjPos, lv, 3) ? 1 : 0;
+        if (!m.hostKey.empty()) _snprintf_s(hgt, sizeof(hgt), _TRUNCATE, " input y=%.1f (host-local: no ground added)", m.pos[1]);
+        else if (GroundPlaceHeightAt(m.pos[0], m.pos[2], &eg) == 1)
+            _snprintf_s(hgt, sizeof(hgt), _TRUNCATE, " input y=%.1f + engine ground %.1f -> live y %s%.1f", m.pos[1], eg, lvOk != 0 ? "" : "? ", lv[1]);
+        else _snprintf_s(hgt, sizeof(hgt), _TRUNCATE, " input y=%.1f engine ground NOT read -> live y %s%.1f", m.pos[1], lvOk != 0 ? "" : "? ", lv[1]);
+    }
+    char line[520];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] restore key=%.63s recreated owner=mine progress=%.2f/%.2f complete=%d state=%s (stage %d) via=restored;%s",
+                m.key.c_str(), r.progress, r.needed, r.complete, applied > 0 ? "applied" : (applied < 0 ? "FAULTED" : "none"), stage, hgt);
     BdLogRestore(line);
-    if (r.complete != 0) PcQueue(m.key, coopbuild::kPcRoadRestored);   /* T-988 */
+    PcQueue(m.key, coopbuild::kPcRoadRestored);   /* T-988; T-1389: remade from the record, at any stage */
     if (applied > 0) BdWalkMapNote(b, coopbuild::kWmCopyRestored, m.key.c_str());   /* T-1294 design A: the state written after the re-make */
     /* the materials the rebuilt piece holds now, beside those its kept row / pp.build STATE carried and whether the write above
        ran: taking the piece apart refunds what it holds. Index order is the engine's material list. First kRsMatLineCap pieces. */
@@ -9340,32 +11632,41 @@ void BdMarkRestored(BdReg& r, BdPending& p, void* b, int slot)
     ItFurnMarkStale(1);   /* T-454: the restore made the piece again here */
 }
 
-/* MAIN THREAD. createBuilding puts a piece at the ground height under its (x,z) plus the y it is given, so a placement input is a
-   height above the ground. A standing piece's live position becomes its placement input by taking away the ground height at its
-   (x,z), read with getTerrainHeight (the call the engine's own town placement reads the ground with). 1 = in[] holds the input;
-   0 = no ground height was answered there (in[] untouched). The first 8 of each are logged. */
+/* MAIN THREAD. createBuilding's createPhysical 0x55FF50 puts a free-standing piece at the ENGINE'S ground under its (x,z) plus the y
+   it is given (T-1372: 0x9B2850 = the larger of the terrain height and 100.0, GroundPlaceHeightAt), so a placement input is a height
+   above that ground. A standing piece's live position becomes its placement input by taking away the engine's ground at its (x,z)
+   (placeinput::InputYFromLive); the terrain height is read too, because where no terrain answers (-99) the engine would add 100 now
+   and the real ground later. The input is always made by createBuilding with isDoorOf 0 (BdCallCreateTownRaw / BdCallCreateExRaw),
+   so the made piece is never a DoorStuff - the only class found that sets +0x1A0 (its constructor 0x29FB00, the one call to it
+   createBuilding's isDoorOf branch) - and createPhysical always adds the ground to it. 1 = in[] holds the input; 0 = no input
+   (in[] untouched). The first 8 of each are logged.
+   T-1372 decision 1691 (was review fold 5's 'not corrected'): every input this build writes carries the ground mark (BdReg placeMark,
+   a PLACE's kBuildGroundTag byte); a record written before the fix carries none and is converted exactly when it is used
+   (BdConvertOldPlace). */
 int BdPlaceInputFromLive(const std::string& key, const float* live, float* in)
 {
-    float g = 0.0f, y = 0.0f;
-    const int gr = GroundTerrainHeightAt(live[0], live[2], &g);
+    float t = 0.0f, g = 0.0f, y = 0.0f;
+    const int tr = GroundTerrainHeightAt(live[0], live[2], &t);
+    const int gr = (tr == 1) ? GroundPlaceHeightAt(live[0], live[2], &g) : 0;
     char line[400];
-    if (placeinput::InputYFromLive(live[1], gr, g, &y) == 0)
+    if (placeinput::InputYFromLive(live[1], tr, t, gr, g, &y) == 0)
     {
         ++g_placeFromLiveNoGround;
         if (g_placeFromLiveNoGround <= 8)
         {
-            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] placement input key=%.63s NOT read: no ground height answered at (%.1f, %.1f) (read %d) - its PLACE is not sent until a scan reads it; placeFromLiveNoGround=%lld (first 8 logged)",
-                        key.c_str(), live[0], live[2], gr, g_placeFromLiveNoGround);
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] placement input key=%.63s NOT read: %s at (%.1f, %.1f) (terrain read %d, engine ground read %d) - its PLACE is not sent until a scan reads it; placeFromLiveNoGround=%lld (first 8 logged)",
+                        key.c_str(), tr != 1 ? "no terrain height answered" : "the engine's ground (0x9B2850) was not read", live[0], live[2], tr, gr, g_placeFromLiveNoGround);
             DebugLog(std::string(line));
         }
         return 0;
     }
     in[0] = live[0]; in[1] = y; in[2] = live[2];
     ++g_placeFromLive;
+    if (g < placeinput::kEngineGroundFloor + 0.001f && t < g) ++g_placeFromLiveFloor;
     if (g_placeFromLive <= 8)
     {
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] placement input key=%.63s from its live position: live y %.1f - ground %.1f = %.1f, the height above the ground createBuilding takes; placeFromLive=%lld (first 8 logged)",
-                    key.c_str(), live[1], g, y, g_placeFromLive);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] placement input key=%.63s from its live position: live y %.1f - the engine's ground %.1f (terrain %.1f) = %.1f, the height createPhysical adds that ground to; placeFromLive=%lld (first 8 logged)",
+                    key.c_str(), live[1], g, t, y, g_placeFromLive);
         DebugLog(std::string(line));
     }
     return 1;
@@ -9396,6 +11697,7 @@ BdReg& BdRegisterOwnLive(void* b, const std::string& key, const float* pos, cons
     for (int j = 0; j < 3; ++j) in[j] = pos[j];
     r.placeOk = (liveAbs == 0 || BdPlaceInputFromLive(key, pos, in) != 0) ? 1 : 0;
     for (int j = 0; j < 3; ++j) r.placePos[j] = in[j];
+    r.placeMark = 1;   /* T-1372: measured here, or a PLACE's input BdCopyOne converted / furniture's host-local one */
     for (int j = 0; j < 4; ++j) r.placeRot[j] = rot[j];
     r.floor = 0; r.outside = 0;
     BdRestoreNonce(key, r, 1);   /* help1 fold 4 (re-check #1): its placement nonce, when pp.build was read first */
@@ -9446,9 +11748,11 @@ void BdRsRekey(const std::string& oldKey, const std::string& liveKey)
     { int owed = 0; for (size_t i = 0; i < g_rsOweRemove.size(); ++i) if (g_rsOweRemove[i] == oldKey) owed = 1; if (owed == 0) g_rsOweRemove.push_back(oldKey); }   /* mmo8a3 (C) */
     ++g_rsRekeyed;
     BdOwnDirty(2);
-    char line[300];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] restore key=%.63s re-keyed to %.63s (the created piece's own key) - the old key is retired from pp.build and its REMOVE is owed to the other game",
-                oldKey.c_str(), liveKey.c_str());
+    float eg = 0.0f;   /* T-1372 A1: the row's placement input and the engine's ground at it (free-standing only) */
+    const int egOk = (moved.hostKey.empty() && GroundPlaceHeightAt(moved.placePos[0], moved.placePos[2], &eg) == 1) ? 1 : 0;
+    char line[420];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] restore key=%.63s re-keyed to %.63s (the created piece's own key) - the old key is retired from pp.build and its REMOVE is owed to the other game; input y=%.1f engine ground %s%.1f",
+                oldKey.c_str(), liveKey.c_str(), moved.placePos[1], egOk != 0 ? "" : (moved.hostKey.empty() ? "NOT read " : "none (host-local) "), eg);
     BdLogRestore(line);
 }
 
@@ -9482,12 +11786,15 @@ int BdHandLookupPod(const hand* h, int which, void** out)
     __try { *out = (which == 0) ? (void*)h->asBuilding() : (void*)h->asObjectBase(); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return 0; }
 }
+void BdOwnGroupLanded(const std::string& key, void* lead, unsigned int stamp);   /* T-1408 fold 4 / 5 / 7: namespace coop, below BdWallGroupsMark (the C2668 class) */
+std::vector<std::string> BdWallGroupOf(const std::string& lead, const BdReg& lr);   /* T-1408 fold 5: the same namespace, below */
 namespace {   /* the same unnamed namespace, reopened (T-1130 re-check) */
 /* T-903 (F1026), MAIN THREAD: a host's interior list read again and every BUILDING handle on it sorted for BuildDeadHandlesIgnore -
    good, hit (at `key` or within BoxKeyNearKey's window of it), dead (both lookups null, neither faulted) or other - with the list's
    read counts. *sig = the dead handles' set (BuildDeadSetSig). Fills every field of *x except areaLoaded, setAge and the row flags. */
-void BdHostDeadScan(void* host, const char* key, coopbuild::BuildDeadHandleIn* x, std::string* sig)
+void BdHostDeadScan(void* host, const char* key, coopbuild::BuildDeadHandleIn* x, std::string* sig, const std::string& rowSid = std::string())
 {
+    x->goodMayBeCopy = 0;   /* T-1343 review: 'good' pieces that may be the copy-list row's copy (rowSid; empty = no row, not counted) */
     int listed = -1, cut = 0, torn = 0;
     const int n = InteriorPieceIds(host, g_bdIds, kBdInteriorCap, &listed, &cut, &torn);
     x->listed = listed; x->n = n; x->cut = cut; x->torn = torn;
@@ -9515,7 +11822,18 @@ void BdHostDeadScan(void* host, const char* key, coopbuild::BuildDeadHandleIn* x
         k[0] = 0;
         if (ObjectPositionKey(b, k, kKeyCap, "", 3, 1) == 0) { ++x->other; continue; }
         if (std::strcmp(k, key) == 0 || BoxKeyNearKey(k, key) != 0) ++x->hits;
-        else ++x->good;
+        else
+        {
+            ++x->good;
+            if (!rowSid.empty())
+            {
+                char gs[160];
+                BdSidOf(b, gs, (int)sizeof(gs));
+                const int same = (gs[0] == 0) ? -1 : (rowSid == gs ? 1 : 0);   /* unread: may be it (the hold stays) */
+                const std::string gk(k);
+                x->goodMayBeCopy += coopbuild::BuildGoodMayBeCopy(same, g_reg.find(gk) != g_reg.end() ? 1 : 0, BdCopyListFind(gk, 0) != 0 ? 1 : 0);
+            }
+        }
     }
     *sig = coopbuild::BuildDeadSetSig(deadIds);
 }
@@ -9540,16 +11858,35 @@ int BdDeadHandlesNoPiece(const BdPending& p, void* host, const float* hostPos)
     const coopbuild::BuildMsg& m = p.m;
     coopbuild::BuildDeadHandleIn x;
     std::string sig;
-    BdHostDeadScan(host, m.key.c_str(), &x, &sig);
+    std::map<std::string, BdCopyEnt>::const_iterator cl = g_copyList.find(m.key);
+    const std::string rowSid = (cl == g_copyList.end()) ? std::string() : (!cl->second.rec.sid.empty() ? cl->second.rec.sid : m.sid);   /* T-1343 review */
+    BdHostDeadScan(host, m.key.c_str(), &x, &sig, rowSid);
     x.areaLoaded = (BdAreaReady(p, hostPos[0], hostPos[1], hostPos[2]) != 0 && ZoneBuildingsInHereTri(hostPos[0], hostPos[1], hostPos[2]) > 0) ? 1 : 0;
     if (g_deadSets.size() >= kDeadSetsCap && g_deadSets.find(m.hostKey) == g_deadSets.end()) g_deadSets.clear();
     BdDeadSetMem& mem = g_deadSets[m.hostKey];
     x.setAge = coopbuild::BuildDeadSetStep(&mem.had, &mem.sig, &mem.at, sig, g_drainNo);
     x.regRow = g_reg.find(m.key) != g_reg.end() ? 1 : 0;
-    x.copyListRow = g_copyList.find(m.key) != g_copyList.end() ? 1 : 0;
+    x.copyListRow = cl != g_copyList.end() ? 1 : 0;
+    x.copyRowPlain = (cl != g_copyList.end()) ? coopbuild::BuildCopyRowPlain(1, cl->second.rec.removed, cl->second.rec.handed) : 0;   /* T-1343 */
     x.removedMark = (BdRemovedAnyNonce(m.key) != 0 || g_recentRemoved.find(m.key) != g_recentRemoved.end()) ? 1 : 0;
     if (coopbuild::BuildDeadHandlesIgnore(x) == 0) return 0;
     ++g_deadHandlesIgnored;
+    if (x.copyListRow != 0)
+    {   /* T-1343 (F1065): the plain copy-list row was this game's memory of a copy the area does not hold - void for this search; the copy
+           made below refreshes it (BdCopyListNote). Every voided search counted; the line once per key (a retried make does not say it
+           again), for the first kCopyRowVoidLineCap keys. */
+        ++g_copyRowVoided;
+        if ((long long)g_copyRowVoidSaid.size() < kCopyRowVoidLineCap && g_copyRowVoidSaid.insert(m.key).second)
+        {
+            char vl[900];
+            _snprintf_s(vl, sizeof(vl), _TRUNCATE, "[BUILD] copy key=%.63s host=%.63s: its copy-list row (slot %d's copy, read back from pp.build=%d, emptyLoads=%d) is VOID for this search -"
+                        " the row says this game made the copy once, but the area's saved pieces are all in, the host's other %d pieces resolved with none at or near the key, and"
+                        " its %d unresolved handles answer null from both engine lookups (the same set for %lld safe points): the copy is not here, so it is made and the row"
+                        " refreshed by it; no unaccounted piece of its type in the house (copyRowVoided=%lld searches; said once per key, first %lld keys)", m.key.c_str(), m.hostKey.c_str(), cl->second.rec.slot, cl->second.readBack,
+                        (int)cl->second.rec.emptyLoads, x.good, x.dead, x.setAge, g_copyRowVoided, kCopyRowVoidLineCap);
+            DebugLog(std::string(vl));
+        }
+    }
     if (g_deadSaid.size() < kDeadSetsCap && g_deadSaid.insert(m.hostKey).second)
     {
         char line[600];
@@ -9570,7 +11907,7 @@ int BdHostInsidePod(void* host);   /* with the after-load pass below: 1 = the ho
    BdOwnerRestore - the engine's own setFaction (vt+0xA0), marked as the mod's write so the owner-change hook never sends it; no charge,
    no sale callback; with the purchase's world side when the engine says the house is for sale (coopbuild::BuildOwnRestorePlanOf - fold
    MED 2: as the purchase's replay runs it - the residents on hold made first (TownGenBuyHeld), then residents out, the town lists,
-   doors re-owned (not opened), the furniture teardown by the keep rule (BdBuyTeardown, tdRoad 2, with the room step) BEFORE the
+   doors re-owned (T-1430: and opened - a purchase applied here), the furniture teardown by the keep rule (BdBuyTeardown, tdRoad 2, with the room step) BEFORE the
    interior's no-player pieces are re-owned, new homes), so the house matches the other games'. A world resource node is never
    written (fold MED 1, owner rule 1444). Another player's piece is never taken.
    ownRestore[checked = an own row / record met its standing piece owned by someone else, restored, notPlayerOwned = of those, no
@@ -9614,9 +11951,11 @@ int BdOwnRestoreLive(void* live, const std::string& key, const std::string& rowS
     }
     static BdBuyFx fx;   /* MAIN THREAD; 2 KB - not on the stack */
     std::memset(&fx, 0, sizeof(fx));
-    fx.noOpen = 1; fx.interiorTownOnly = 1;
     const int forSale = (furn == 0) ? BdIsForSaleOrigPod(live) : 0;   /* the ENGINE's isForSale, asked before the held residents are made (as the replay asks it) */
-    const coopbuild::BuildOwnRsPlan pl = coopbuild::BuildOwnRestorePlanOf(act, furn != 0 ? 1 : 0, forSale == 1 ? 1 : 0);
+    const int buy = coopbuild::BuildPurchaseApplyHere(furn != 0 ? 1 : 0, 1, BdOwnerIsPlayerSide(o), forSale, 1);   /* T-1430: this game's own word names its player; the one decision, before the owner write */
+    const coopbuild::BuildPurchaseHerePlan php = coopbuild::BuildPurchaseHerePlanOf(buy);
+    BdPurchaseFxOf(&fx, php, "own restore", key.c_str());   /* the teardown wish is the own-restore plan's below (the same answer on a restore act) */
+    const coopbuild::BuildOwnRsPlan pl = coopbuild::BuildOwnRestorePlanOf(act, furn != 0 ? 1 : 0, buy);
     const int sale = pl.worldSide;
     int held = 0;
     void* ow = o;
@@ -9636,10 +11975,10 @@ int BdOwnRestoreLive(void* live, const std::string& key, const std::string& rowS
             _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] own house owner restore FAULTED key=%.63s from '%.60s' (road=%s): the engine's setFaction faulted inside the guard - left as it is",
                         key.c_str(), before.c_str(), road);
         else
-            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] own house owner restored key=%.63s from '%.60s' -> '%.60s' (road=%s; this game's own word names it the owner) sale=%d held=%d residents=%s (%u platoons, %u new homes) doors=%u (re-owned, not opened)"
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] own house owner restored key=%.63s from '%.60s' -> '%.60s' (road=%s; this game's own word names it the owner) sale=%d held=%d residents=%s (%u platoons, %u new homes) doors=%u (re-owned, %u open)"
                         " furniture teardown=%d furnitureRemoved=%u kept=%u (players' pieces %u, the engine's rule %u, no key %u) usersFreed=%u faults=%u interior=%u kept=%u - no charge",
                         key.c_str(), before.c_str(), BdFactionName(BdOwnerPod(live)).c_str(), road, sale, held,
-                        sale == 0 ? "not run" : (fx.res == 1 ? "moved" : (fx.res == 0 ? "none" : "SKIPPED or FAULTED")), fx.resN, fx.newHomes, fx.doorsN,
+                        sale == 0 ? "not run" : (fx.res == 1 ? "moved" : (fx.res == 0 ? "none" : "SKIPPED or FAULTED")), fx.resN, fx.newHomes, fx.doorsN, fx.doorsOpened,
                         fx.td, fx.tdRemoved, fx.tdKeptPlayer + fx.tdKeptEngine + fx.tdKeptNoKey, fx.tdKeptPlayer, fx.tdKeptEngine, fx.tdKeptNoKey, fx.tdUsersFreed, fx.tdFaults,
                         fx.interiorN, fx.interiorKept);
         DebugLog(std::string(line));
@@ -9674,7 +12013,7 @@ void BdRemakeLanded(BdPending& p, const std::string& key, BdReg& r, int made)
     else
     {
         BdStatePend& s = g_pendState[key];
-        s.m = (p.remake == 2) ? p.st : r.ownerLast; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0;
+        s.m = (p.remake == 2) ? p.st : r.ownerLast; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0; s.ruinPutPend = 0; s.ruinPutVal = 0.0f;
     }
     if (g_rrLines >= kRrLineCap) { ++g_rrSuppressed; return; }
     ++g_rrLines;
@@ -9683,6 +12022,60 @@ void BdRemakeLanded(BdPending& p, const std::string& key, BdReg& r, int made)
                 p.remake == 2 ? "made from record" : "re-made from the copy list", key.c_str(), r.ownerSlot, r.sid.c_str(), made != 0 ? "created" : "the piece stood when the re-make ran: taken on as the copy",
                 r.owner.c_str(), st, g_rrRemade, g_rrRemadeFound);
     DebugLog(std::string(line));
+}
+/* T-1372 decisions 1691 + 1694, MAIN THREAD (BdCopyOneBody, after the area gate, before the piece is made): a PLACE without the ground
+   mark is an older record. Its free-standing input is judged by its own key's height (placeinput::ConvertOldInput): nearer the old way
+   (keyY - the terrain) it is converted - input - (the engine's ground - the terrain), both read at its (x,z) as BdPlaceInputFromLive
+   reads them; nearer the game's own (keyY - the engine's ground), or the two within the key's precision, it is kept. Judged, it carries
+   the mark from then on - every row, copy-list entry, pp.build row and piece record written from it. A key with no height: placed as it
+   is, unconverted and unmarked, counted. No ground answered: not placed now (asked again after kRetryGap), never placed unjudged. */
+int BdConvertOldPlace(BdPending& p)
+{
+    coopbuild::BuildMsg& m = p.m;
+    if (m.kind != coopbuild::kBuildPlace || m.groundMark != 0) return 1;
+    float t = 0.0f, g = 0.0f, ky = 0.0f;
+    const int hostEmpty = m.hostKey.empty() ? 1 : 0;
+    const int kr = (hostEmpty != 0) ? placeinput::KeyHeightOf(m.key, &ky) : 0;
+    const int tr = (hostEmpty != 0 && kr == 1) ? GroundTerrainHeightAt(m.pos[0], m.pos[2], &t) : 0;
+    const int gr = (tr == 1) ? GroundPlaceHeightAt(m.pos[0], m.pos[2], &g) : 0;
+    const float oldY = m.pos[1];
+    const int cv = placeinput::ConvertOldInput(hostEmpty, &m.groundMark, &m.pos[1], kr, ky, tr, t, gr, g);
+    char line[440];
+    if (cv == placeinput::kOldNoGround)
+    {
+        ++g_placeOldNoGround;
+        if (g_placeOldNoGround <= 16)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] old placement key=%.63s NOT judged: %s at (%.1f, %.1f) (terrain read %d, engine ground read %d) - not placed now, asked again; placeOldNoGround=%lld (first 16 logged)",
+                        m.key.c_str(), tr != 1 ? "no terrain height answered" : "the engine's ground (0x9B2850) was not read", m.pos[0], m.pos[2], tr, gr, g_placeOldNoGround);
+            DebugLog(std::string(line));
+        }
+        p.nextTry = g_drainNo + kRetryGap;
+        return 0;
+    }
+    if (cv == placeinput::kOldNoKeyY)
+    {
+        ++g_placeOldNoKeyY;
+        if (g_placeOldNoKeyY <= 16)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] old placement key=%.63s NOT judged: its key holds no height - placed as it is (input %.2f, unconverted, unmarked); placeOldNoKeyY=%lld (first 16 logged)",
+                        m.key.c_str(), oldY, g_placeOldNoKeyY);
+            DebugLog(std::string(line));
+        }
+        return 1;
+    }
+    if (cv == placeinput::kOldNothing) return 1;
+    long long* const n = (cv == placeinput::kOldConverted) ? &g_placeOldConverted : &g_placeOldKept;
+    ++*n;
+    if (*n <= 200)
+    {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] old placement judged key=%.63s keyY=%.2f terrain=%.2f engineGround=%.2f input %.2f -> %.2f: %s; placeOld[converted,kept]=%lld,%lld",
+                    m.key.c_str(), ky, t, g, oldY, m.pos[1],
+                    cv == placeinput::kOldConverted ? "old-way -> converted" : (cv == placeinput::kOldTie ? "within the key's precision -> kept" : "game's own -> kept"),
+                    g_placeOldConverted, g_placeOldKept);
+        DebugLog(std::string(line));
+    }
+    return 1;
 }
 int BdCopyOne(BdPending& p, int* called)
 {
@@ -9880,6 +12273,10 @@ static int BdCopyOneBody(BdPending& p, int* called)
         }
         return 2;
     }
+    /* T-1372 decisions 1691 + 1694: an older record's input is judged here - after the area gate (an unloaded area moves to the not-loaded
+       list unjudged; no height of an area not loaded here is ever written into a marked record) and before the piece is made; no
+       ground answered in a loaded area = not placed now, asked again after kRetryGap */
+    if (BdConvertOldPlace(p) == 0) return 0;
     if (p.restore != 0)   /* mmo8a3 (A): the gate above read ZoneMap+0xB1 - the zone's saved pieces are all in, so the search runs now */
     {
         if (g_rsSearches >= kRsSearchPerDrain) { ++g_rsSearchCapped; p.nextTry = g_drainNo + 1; return 0; }   /* LOW: at most 4 restore searches per safe point */
@@ -9911,7 +12308,7 @@ static int BdCopyOneBody(BdPending& p, int* called)
     /* T-903 (F1026): a copy's search held as truncated only because some handles on the host's list resolve to nothing. A handle that
        answers null from both engine lookups, unchanged across two searches at least kBuildDeadHandleWait safe points apart, in a fully
        loaded area, with every other piece resolved and keyed and none at or near the key, for a key this game holds no row of and never
-       removed, counts as no piece (BdDeadHandlesNoPiece / coopbuild::BuildDeadHandlesIgnore): the search is complete and empty and the
+       removed (T-1343: a plain copy-list row does not count - it is void, the world's pieces answer; coopbuild::BuildDeadHandlesIgnore), counts as no piece (BdDeadHandlesNoPiece / coopbuild::BuildDeadHandlesIgnore): the search is complete and empty and the
        copy is made below. Any condition short - the hold stays (it may be this very piece not loaded yet: never an empty twin). Copies
        only; a restore keeps the hold - T-1240: except a piece another game wrote into this game's ownership and never made here
        (coopbuild::BuildDeadHandlesEntryOk: from its record, own rows read - or no own record at all, T2039 LEG F - no own pp.build row
@@ -10089,7 +12486,11 @@ static int BdCopyOneBody(BdPending& p, int* called)
            (coopbuild::BuildOwnerAdoptIsPurchase); only then the bought house's world side runs (BdBuyFxBefore / BdBuyFxAfter) and the
            applied counter / line is written. Every other adopt from nobody / a third party is the ordinary adopt, counted adoptOther. */
         const int ocWorld = (furn == 0 && coopbuild::BuildOwnerAdoptFromWorld(ocls) != 0) ? 1 : 0;
-        const int ocBuy = (ocWorld != 0) ? coopbuild::BuildOwnerAdoptIsPurchase(1, 0, BdIsForSaleOrigPod(live), (o != (void*)want) ? 1 : 0, (want != 0 && (IsStandInFaction(want) || toMe != 0)) ? 1 : 0) : 0;   /* the new owner: a player's stand-in, or this game's own player for a house handed to it (never a third owner a record names); T-805 b: the ENGINE's isForSale, not this mod's answer */
+        const int ocCl = (ocls == coopbuild::kBuildLiveOwnSenderList) ? 1 : 0;
+        /* T-1430 (F1224 / F1253): the one decision, before the first owner write - the copy-list class no longer blocks it: a house the
+           other player bought, on this game's copy list, that this load brought back as the town's (for sale here) is bought here too */
+        const int ocBuy = coopbuild::BuildPurchaseApplyHere(furn != 0 ? 1 : 0, (want != 0 && (IsStandInFaction(want) || toMe != 0)) ? 1 : 0, BdOwnerIsPlayerSide(o),
+                                                            (furn == 0) ? BdIsForSaleOrigPod(live) : 0, (o != (void*)want) ? 1 : 0);   /* the new owner: a player's stand-in, or this game's own player for a house handed to it (never a third owner a record names); T-805 b: the ENGINE's isForSale, not this mod's answer */
         /* T-805 b (owner 809 b / 813 b): residents on hold for the house are made first (the re-offer's own steps - a game that holds the
            area makes them; otherwise the entry is dropped), so the world side below collects and rehomes them as the buyer's game did.
            Asked after the sale test: residents made fill the house's resident hand, which isForSale also reads (vt+0x1D8,
@@ -10097,8 +12498,9 @@ static int BdCopyOneBody(BdPending& p, int* called)
         if (ocBuy != 0 && TownGenBuyHeld(live) > 0) { void* const o2 = BdOwnerPod(live); if (o2 != 0) o = o2; }
         static BdBuyFx fx;   /* MAIN THREAD; 2 KB of resident pointers - not on the stack */
         std::memset(&fx, 0, sizeof(fx));
-        fx.tdWant = (ocBuy != 0) ? 1 : 0; fx.tdKey = m.key.c_str();   /* the buyer's engine removed the house's furniture: so does this game */
-        fixed = BdOwnerRestore(live, (void*)o, (void*)want, ocBuy, &fx);   /* build1h: the owner the PLACE names - a purchase with the bought house's world side */
+        const coopbuild::BuildPurchaseHerePlan php = coopbuild::BuildPurchaseHerePlanOf(ocBuy);   /* T-1430 */
+        BdPurchaseFxOf(&fx, php, (ocCl != 0) ? "copy-list adopt" : "place-adopt", m.key.c_str());   /* the buyer's engine removed the house's furniture: so does this game; fold 2: a player's own piece in the house is kept (interiorTownOnly) */
+        fixed = BdOwnerRestore(live, (void*)o, (void*)want, php.worldSide, &fx);   /* build1h: the owner the PLACE names - a purchase with the bought house's world side */
         if (fixed != 0) ++g_copyOwnerFixed;
         if (ocBuy != 0)   /* P18: a town / NPC house the sender's player bought - the owner change applied here */
         {
@@ -10109,7 +12511,7 @@ static int BdCopyOneBody(BdPending& p, int* called)
             g_ocFxDoorsOpened += fx.doorsOpened; g_ocFxInterior += fx.interiorN; g_ocFxNewHomes += fx.newHomes;
             if (fx.res == 1) g_ocFxResidents += fx.resN; else if (fx.res != 0) ++g_ocFxResSkipped;
             if (fx.res == -1 || fx.townOut < 0 || fx.townIn < 0 || fx.squad < 0 || fx.doors < 0 || fx.interior < 0 || fx.homes < 0 || fx.tdFaults != 0) ++g_ocFxFaulted;
-            g_ocFxStepsSkipped += 5;
+            g_ocFxStepsSkipped += 2;   /* T-1430: interior+0x30 vt+0x60 and the residents' AI orders (the tail's other three now run) */
             g_ocFxFurnRemoved += fx.tdRemoved; g_ocFxFurnKeptPlayer += fx.tdKeptPlayer; g_ocFxFurnKeptEngine += fx.tdKeptEngine;
             g_ocFxFurnKeptOther += fx.tdKeptNoKey; g_ocFxUsersFreed += fx.tdUsersFreed; g_ocFxTdFaults += fx.tdFaults;
             g_ocFxTdBlind += fx.tdBlind; g_ocFxTdNotRun += (fx.tdWant != 0 && fx.td == 0) ? 1 : 0; g_ocFxTdDead += fx.tdDead;
@@ -10122,7 +12524,7 @@ static int BdCopyOneBody(BdPending& p, int* called)
                         " furniture (0x54EA40's rule, piece by piece): teardown=%d furnitureRemoved=%u kept=%u (players' pieces %u, the engine's rule %u, no key %u) destroyYes=%u gone=%u deadHands=%u otherType=%u set=%lld->%lld alive=%u set128=%lld->%lld listed=%d complete=%d blind=%d faults=%u;"
                         " kept by: ownerBefore %u (recorded=%d entries=%u listed=%d notRecorded=%u), near key %u, host row %u (house rows %u, not found %u); second set (+0x128): entries %u listed=%d complete=%d dead=%u kept=%u notErased=%u;"
                         " room step (0x32E2B0 / 0x3305C0): usersFreed=%u;"
-                        " NOT repeated: 0x38A5E0 location nodes, town step 0x296900/0x928010, interior+0x30 vt+0x60, 0x4D2340, residents' AI orders 0x5D1640; group homes cleared=%d",
+                        " tail (T-1430): location nodes 0x38A5E0 %s, town step 0x296900/0x928010 %s, 0x4D2340 %s; NOT repeated: interior+0x30 vt+0x60, residents' AI orders 0x5D1640; road=%s; group homes cleared=%d",
                         m.key.c_str(), BdFactionName((void*)o).c_str(), BdFactionName(BdOwnerPod(live)).c_str(),
                         oa == coopbuild::kBuildOaApplied ? "applied" : (oa == coopbuild::kBuildOaSkip ? "SKIP (not written: already the named owner or an empty target)" : "FAULTED"),
                         fx.res == 1 ? "moved" : (fx.res == 0 ? "none / no address row" : (fx.res == -2 ? "SKIPPED (too many platoons to list safely)" : "FAULTED")), fx.resN, fx.newHomes,
@@ -10130,7 +12532,7 @@ static int BdCopyOneBody(BdPending& p, int* called)
                         fx.td, fx.tdRemoved, fx.tdKeptPlayer + fx.tdKeptEngine + fx.tdKeptNoKey, fx.tdKeptPlayer, fx.tdKeptEngine, fx.tdKeptNoKey,
                         fx.tdDestroyYes, fx.tdGone, fx.tdDead, fx.tdOther, fx.tdSetBefore, fx.tdSetAfter, fx.tdAlive, fx.tdSet128, fx.tdSet128After, fx.tdListed, fx.tdComplete, fx.tdBlind, fx.tdFaults,
                         fx.tdKeptOwner, fx.tdOwnSnap, fx.tdOwnSnapN, fx.tdOwnSnapListed, fx.tdOwnMissing, fx.tdKeptNear, fx.tdKeptHost, fx.tdHostRows, fx.tdHostLost, fx.tdS2N, fx.tdS2Listed, fx.tdS2Complete, fx.tdS2Dead, fx.tdS2Kept, fx.tdS2NoErase,
-                        fx.tdUsersFreed, hc);
+                        fx.tdUsersFreed, BdTlWord(fx.tlNodes), BdTlWord(fx.tlTown), BdTlWord(fx.tlWalk), fx.road != 0 ? fx.road : "-", hc);
             BdLogOc(ol);
         }
         else if (ocWorld != 0) ++g_ocAdoptOther;   /* P18 fold 1 (item 6): not for sale here - an ordinary adopt from nobody / a third party */
@@ -10162,7 +12564,8 @@ static int BdCopyOneBody(BdPending& p, int* called)
                      m.key.c_str(), furn != 0 ? m.hostKey.c_str() : "-", r.owner.c_str(), coopbuild::BuildOwnerWord(ocls), fixed, lc, lp, ln, toMe, handed);
         BdLogCapped(line);
         ItFurnMarkStale(2);   /* T-454: a live piece taken on as the copy */
-        if (lc != 0) PcQueue(m.key, coopbuild::kPcRoadCopyAdopted);   /* T-988 */
+        if (toMe == 0) PcCopyMadeNote(m.key);   /* T-1389 fold 1: taken on as the copy - the owner's (last) STATE follows */
+        PcQueue(m.key, coopbuild::kPcRoadCopyAdopted);   /* T-988; T-1389: at any stage */
 #ifdef SW_DEV_BUILD
         // PROBE-START: P165
         P165Note(live, m.key, "copy made (a standing piece taken on)", "-", -2, "");
@@ -10212,23 +12615,42 @@ static int BdCopyOneBody(BdPending& p, int* called)
        T-923 (decision 967 a): an outdoor piece handed to this game (placed by a teammate in this player's outpost) is made in this
        player's own town nearest its spot within 5000 - the rule this player's own placement confirm applies (0x4D6300: the nearest
        town of this game's player faction, kept within 5000, 0x4D642F) - so it joins the outpost it was placed in; none within 5000:
-       town 0, the engine picks it as before.
+       'Nowhere' (T-1427 part 2 below; was town 0, the engine's own pick).
        T-923 review MED 2 (protocol 167): a PLACE that carries a town hand-over (m.townHand) names the outpost by its centre as the world
        server's outpost list has it; the piece is made in this player's own town standing there (BdOwnTownAt, within the shown-base
        radius of that centre) at ANY distance from the piece - a grouped placement gives the group's town to its far pieces too
        (0x4DA6F0). That town not standing here: the 5000 rule above. */
+    /* T-1427 part 2 (owner request 2026-11-18): EVERY outdoor copy is made in the town the builder's rule gives (BdCopyTownFor,
+       coopbuild::CopyTownChoose) - a restore in the town its record names; the outpost the PLACE names; the owner's town nearest
+       within 5000 (for a handed piece this player's own: T-923's two rules above, unchanged); else 'Nowhere', passed explicitly -
+       never town 0, whose engine fallback can give an interior piece a NON-player town within 10000 (57c1e0:401-433, F1270) */
+    BdCopyTown ct;
+    ct.rule = coopbuild::kCtNowhere; ct.town = 0; ct.dist = -1.0f; ct.off = -1.0f;
     void* handTown = 0;
-    float handTownD = -1.0f, handTownOff = -1.0f;
+    float handTownD = -1.0f;
     int handTownBy = 0;   /* 1 = the hand-over's outpost centre, 2 = the nearest own town within 5000 */
     int handTownRoute = 0;   /* fold 3 (b): 1 = a town within the shown-base radius of the centre, 2 = an own town whose own area holds the centre */
-    if (toMe != 0 && furn == 0 && p.restore == 0)
+    if (furn == 0)
     {
-        if (m.townHand != 0) { handTown = BdOwnTownAt(m.townPos, &handTownOff, &handTownRoute); if (handTown != 0) { handTownBy = 1; handTownD = BdTownDistXZ(handTown, pos); ++g_handTownByCentre; if (handTownRoute == 2) ++g_handTownByArea; } else ++g_handTownCentreMissed; }
-        if (handTown == 0) { handTown = BdOwnTownNear(pos, buildnear::kTownKeepRange, &handTownD); if (handTown != 0) handTownBy = 2; }
+        void* recT = 0;
+        {   /* T-1427 fold 1: the town the piece's record names - its outpost by id, else its town fact (a world town by its stringID, or
+               'Nowhere'); a record from an older build names neither: the rule below (part 2) */
+            int rw[5] = { 0, 0, 0, 0, 0 }; int bad = 0;
+            const unsigned lk = TlRecordLinkOf(m.key);
+            if (lk != 0) recT = TlTownOfId(lk, p.restore != 0 ? mySlot : recSlot, rw, &bad);
+            else recT = TlRecordFactTown(m.key);
+        }
+        ct = BdCopyTownFor(recSlot, mySlot, m.townHand != 0 ? m.townPos : 0, pos, recT);
+        if (toMe != 0 && p.restore == 0)
+        {
+            if (ct.rule == coopbuild::kCtNamed || ct.rule == coopbuild::kCtNamedArea) { handTown = ct.town; handTownBy = 1; handTownRoute = (ct.rule == coopbuild::kCtNamedArea) ? 2 : 1; handTownD = ct.dist; }
+            else if (ct.rule == coopbuild::kCtNear) { handTown = ct.town; handTownBy = 2; handTownD = ct.dist; }
+            if (m.townHand != 0) { if (handTownBy == 1) { ++g_handTownByCentre; if (handTownRoute == 2) ++g_handTownByArea; } else ++g_handTownCentreMissed; }
+        }
     }
     void* b = (furn != 0)   /* build1-e: furnitureOf rebuilt from THIS game's host in the builder's form, isIndoorsOf = host */
         ? BdCallCreateEx(fn, factory, gd, pos, (void*)want, rot, fo, host, m.complete != 0, m.floor, m.outside != 0, &faulted)
-        : BdCallCreateTown(fn, factory, gd, pos, handTown, (void*)want, rot, m.complete != 0, &faulted);
+        : BdCallCreateTown(fn, factory, gd, pos, ct.town, (void*)want, rot, m.complete != 0, &faulted);
     if (b == 0)
     {
         ++g_copyFailed;
@@ -10248,6 +12670,7 @@ static int BdCopyOneBody(BdPending& p, int* called)
     const char* at = BdWhose(o, (void*)want);
     int fixed = 0;
     if (o != (void*)want) { fixed = BdSetFactionPod(b, (void*)want) ? 1 : -1; ++g_copyOwnerFixed; }   /* the engine's own fix-up, 57c1e0:1127 */
+    if (furn == 0) BdCopyTownMade(m.key, b, ct, fresh);   /* T-1427 part 2: the town it was made in, kept for the builder's town's arrival; the engine's override put right */
     const int mined = BdMiningPod(b);
     char k2[kKeyCap];
     k2[0] = 0;
@@ -10275,7 +12698,7 @@ static int BdCopyOneBody(BdPending& p, int* called)
     if (p.restore != 0)
     {
         BdMarkRestored(r, p, b, recSlot);   /* mmo8a: via 6 "restored", no HAND_ACK, the row's STATE */
-        if (furn == 0) TlRestoredNote(m.key);   /* T-1158 step 6: made with town 0 - linked to the outpost its record names once that town stands here */
+        if (furn == 0) TlRestoredNote(m.key);   /* T-1158 step 6: made in its record's town when it stands here (T-1427 part 2), else 'Nowhere' - linked to the outpost its record names once that town stands here */
     }
     else
     {
@@ -10295,8 +12718,11 @@ static int BdCopyOneBody(BdPending& p, int* called)
                  (toMe != 0 || p.restore != 0) ? 1 : 0, handed, p.restore,
                  keySame != 0 ? "" : " KEY MISMATCH live=", keySame != 0 ? "" : (k2ok != 0 ? k2 : "?"));
     BdLogCapped(line);
-    if (cc != 0) PcQueue(m.key, p.restore != 0 ? coopbuild::kPcRoadRestored : coopbuild::kPcRoadCopyMade);   /* T-988 */
+    if (p.restore == 0) PcCopyMadeNote(m.key);   /* T-1389 fold 1: made or re-made here - no owner's STATE since */
+    PcQueue(m.key, p.restore != 0 ? coopbuild::kPcRoadRestored : coopbuild::kPcRoadCopyMade);   /* T-988; T-1389: at any stage */
     BdWalkMapNote(b, p.restore != 0 ? coopbuild::kWmCopyRestored : coopbuild::kWmCopyMade, m.key.c_str());   /* T-1294 design A: as the placement confirm (an upgrade's replacement on this game is a copy made) */
+    if (p.restore != 0 || remake != 0) BdZoneRebuildNote(b, m.key.c_str(), p.restore != 0 ? 1 : 2);   /* T-1428 attempt 2: made from its record into a loaded area - the area's own rebuild once its pieces are in (a teammate's live copy keeps its box ask alone) */
+    BdTownStoreNote(b, m.key.c_str(), p.restore != 0 ? "copy re-made from its record" : "copy made of another game's piece");   /* T-1427 (decision 1782) */
 #ifdef SW_DEV_BUILD
     // PROBE-START: P165
     P165Note(b, m.key, p.restore != 0 ? "copy made (restored)" : "copy made (created)", "-", -2, "");
@@ -10324,6 +12750,7 @@ static int BdCopyOneBody(BdPending& p, int* called)
         BdLogCapped(line);
     }
     if (p.restore != 0 && keySame == 0 && k2ok != 0) BdRsRekey(m.key, std::string(k2));   /* mmo8a2 (LOW): the next load searches the created piece's own key */
+    if (BdIsWall(b) == 1) { BdWgLeadReset(m.key); BdWallJoinFromRecord(m.key, b, "copy"); }   /* T-1408 fold 13: a copy made - joined by its owner's group fact */
     return 1;
 }
 
@@ -10354,6 +12781,8 @@ void BdBodyArrivedMain(void* b)
     BdBodyWaitSync();
     char line[400];
     const int list = BdBodyListPod(b);
+    if (w.pc != 0 && w.data == BdPtrAt(b, kObjData) && list == 1) PcQueue(w.pcKey, coopbuild::kPcRoadBodyArrived);   /* T-1389: its physics-arrived event */
+    if (w.walk == 0) return;   /* T-1389: only the piece check waited */
     if (w.data != BdPtrAt(b, kObjData) || list != 1)
     {
         ++g_wmBodyWaitDropped;
@@ -10378,7 +12807,9 @@ void BdBodyArrivedMain(void* b)
             if (BdWallCrossPod(b, p, upd, w.key.empty() ? 0 : w.key.c_str(), 1) == 1) ++g_wmBodyCrossReplayed;
         }
     }
-    BdWalkMapNote(b, coopbuild::kWmBodyArrived, w.key.empty() ? 0 : w.key.c_str());
+    /* T-1428: its box asked again; a box not ready yet (fold 1: not real, or parts still loading) goes to the box waits' own list from
+       BdWalkMapNote, its wait counted from its first wait's time */
+    BdWalkMapNote(b, coopbuild::kWmBodyArrived, w.key.empty() ? 0 : w.key.c_str(), w.road, (long)(::GetTickCount() - w.since));
 }
 void BdBodyArrivedTick()   /* MAIN THREAD, every tick (BdWalkMapHeldTick) */
 {
@@ -10388,6 +12819,58 @@ void BdBodyArrivedTick()   /* MAIN THREAD, every tick (BdWalkMapHeldTick) */
         if (g_wmArrivedOff[i] == 0) continue;
         void* b = ::InterlockedExchangePointer((void* volatile*)&g_wmArrivedOff[i], 0);
         if (b != 0) BdBodyArrivedMain(b);
+    }
+    /* T-1389 (F1114): the bodies-arrived event of a finished piece whose holder is made but whose bodies are not. createPhysical
+       (0x55FF50) makes the holder and hands each part's physics object to the physics manager's list (0x55EC50 -> 0x0F1630); the bodies
+       are made later, off this call (the physics thread's list, 0x4CBB90), so no createPhysical event comes for them and the mod hooks
+       nothing there. Each tick the waiting piece's body count is read (PcPhysPod: plain guarded reads, as the check reads it); the first
+       tick that finds a body queues its check. A watch older than coopbuild::kPcBodyWaitLimitMs, or whose address now holds another
+       piece, ends (its next event judges it: NOT whole, 'waited <n> s for its physics') */
+    const DWORD now = ::GetTickCount();
+    for (size_t i = 0; i < g_wmBodyWait.size(); )
+    {
+        BdBodyWait& w = g_wmBodyWait[i];
+        if (w.bodies == 0 || w.pc == 0) { ++i; continue; }
+        int ents = 0, bodies = 0;
+        const int same = (w.data == BdPtrAt(w.b, kObjData)) ? 1 : 0;
+        const int came = (same != 0 && PcPhysPod(w.b, &ents, &bodies) == 1 && bodies > 0) ? 1 : 0;
+        const int old = ((unsigned int)(now - w.since) >= coopbuild::kPcBodyWaitLimitMs) ? 1 : 0;
+        if (came == 0 && same != 0 && old == 0) { ++i; continue; }
+        const std::string key = w.pcKey;
+        if (w.walk != 0) { w.pc = 0; w.bodies = 0; ++i; }   /* the walk map's own wait stays */
+        else { g_wmBodyWait.erase(g_wmBodyWait.begin() + (std::ptrdiff_t)i); BdBodyWaitSync(); }
+        if (came != 0) { ++g_pcBodiesCame; PcQueue(key, coopbuild::kPcRoadBodyArrived); }
+    }
+    /* T-1428 (F1226): a walking-map ask waiting for its box (+0x27C filled as its models load, 0x5580B0 / 0x5489F0 - no createPhysical
+       event comes for it). Each tick each waiting piece's box and (fold 1) its count of model parts still loading are read (plain
+       guarded reads, BdBoxPod); coopbuild::BuildWalkMapBoxDue decides: the first tick its grown box is real and every part is in, it
+       asks (kWmBodyArrived, the road and the wait in its line); at kWmBoxWaitMs it asks with what it has (force). Its own list (fold 1,
+       review 2): no cap, nothing dropped. An address now holding another object gives up, logged once */
+    std::vector<BdBoxWait> due;
+    std::vector<int> dueHow;
+    for (size_t i = 0; i < g_wmBoxWaits.size(); )
+    {
+        const BdBoxWait& w = g_wmBoxWaits[i];
+        const int same = (w.data == BdPtrAt(w.b, kObjData) && w.vt == BdPtrAt(w.b, 0)) ? 1 : 0;   /* its game data and vtable as at its wait */
+        int how = -1;   /* -1: given up (another object) */
+        if (same != 0)
+        {
+            float bx[6];
+            int loading = 1;
+            const int rd = BdBoxPod(w.b, bx, &loading);
+            how = coopbuild::BuildWalkMapBoxDue(rd != 0 ? coopbuild::BuildWalkMapBoxGrownReal(bx) : 0, rd != 0 ? loading : 1, (unsigned int)(now - w.since));
+            if (how == coopbuild::kWmBoxKeep) { ++i; continue; }
+        }
+        due.push_back(w);
+        dueHow.push_back(how);
+        g_wmBoxWaits.erase(g_wmBoxWaits.begin() + (std::ptrdiff_t)i);
+    }
+    for (size_t i = 0; i < due.size(); ++i)
+    {
+        const long ms = (long)(now - due[i].since);
+        if (dueHow[i] < 0) { BdWalkWaitGiveUpLine(due[i].key, due[i].road, due[i].since, coopbuild::kWmGiveUpOther); continue; }
+        if (dueHow[i] == coopbuild::kWmBoxAsk) ++g_wmBoxCame;
+        BdWalkMapNote(due[i].b, coopbuild::kWmBodyArrived, due[i].key.empty() ? 0 : due[i].key.c_str(), due[i].road, ms, dueHow[i] != coopbuild::kWmBoxAsk ? 1 : 0);
     }
 }
 /* T-1294 fold 2 (M2): Building::createPhysical (0x55FF50, vt+0x200) - any thread. Only while pieces wait: one made with its body
@@ -10855,6 +13338,15 @@ int BdApplyHelp(BdHelpIn& in)
     }
     int fv = 0;
     void* b = BdFindPiece(m.key, r, &fv);
+    if (b == 0 && coopbuild::BuildWallHeldPieceGone(in.wallPark, 0) == coopbuild::kBuildHeldDrop)
+    {   /* T-1408 fold 2: parked HELD grouped-wall work whose area has left here - dropped once, nothing applied, not confirmed (the helper
+           keeps its materials owed and sends the work again); BdHelpDrain sends the release */
+        ++g_wallHeldDropped;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 <- HELP key=%.63s from=slot%d seq=%u held grouped-wall work DROPPED: the piece's area left here - not confirmed, the helper sends it again; wallHeldDropped=%lld",
+                    m.key.c_str(), in.slot, m.seq, g_wallHeldDropped);
+        BdLogHelp(line);
+        return 1;
+    }
     if (b == 0)
     {
         if (in.waitLogged == 0)
@@ -10955,6 +13447,55 @@ int BdApplyHelp(BdHelpIn& in)
         BdHelpAckChanged(m.key, r);
         return 1;
     }
+    /* T-1408 fold 1 (review 3, 4; the manager's decision: the owner resolves its own group): build progress for a grouped wall is applied
+       only on the owner's own game with its whole group loaded. Another writer (the T-23 area holder of a copy), or the owner's game with
+       its group not wholly loaded, HOLDS the work - nothing applied, nothing confirmed, judged again every kRetryGap safe points, as the
+       'area not loaded' wait (a copy's writer that stops being the writer drops it unconfirmed, and the helper sends it to the owner) */
+    const int gGrp = (BdIsWall(b) != 0 && coopbuild::BuildRepairWallApplies(1, BdWallOwnRecord(b)) == 0 && x0 == 0 && m.reset == 0) ? 1 : 0;
+    const int gOne = (gGrp != 0 && cw == 0) ? BdWallLeadSameOwner(b) : 0;
+    void* hLead = 0;
+    int hListed = -1, hRes = 0;
+    const int gWhole = (gOne != 0) ? BdWallGroupWholePod(b, &hLead, &hListed, &hRes) : 0;
+    if (coopbuild::BuildWallGroupApply(gGrp, m.progress > 0.0f ? 1 : 0, cw == 0 ? 1 : 0, gOne, gWhole) == coopbuild::kBuildWallApplyHold)
+    {
+        ++g_helpWallGroupHeld;
+        const int hWhy = (cw != 0) ? (int)coopbuild::kBuildHeldWriter : (int)coopbuild::kBuildHeldNotWhole;
+        if (in.wallTold == 0 && BdSendHelpHeld(m.key, hWhy, in.slot) != 0) in.wallTold = 1;   /* T-1408 fold 2: the helpers' builders stop that job instead of working on with progress this game does not have */
+        if (in.wallLogged == 0)
+        {
+            in.wallLogged = 1;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 <- HELP key=%.63s from=slot%d seq=%u on a grouped wall HELD: %s (listed %d, loaded %d) - nothing applied, not confirmed; PARKED until an area's pieces are laid or an area leaves here%s; HELP_HELD %s; helpWallGroupHeld=%lld",
+                        m.key.c_str(), in.slot, m.seq,
+                        cw != 0 ? "this game writes the copy (the owner's game has not the area) - only the owner's game resolves its own group" : "the owner's group is not wholly loaded here",
+                        hListed, hRes, cw != 0 ? " or an area map arrives" : "", in.wallTold != 0 ? "sent" : "NOT SENT (link down - sent at its next judgement)", g_helpWallGroupHeld);
+            BdLogHelp(line);
+        }
+        in.wallPark = 1; in.wallWhy = hWhy;
+        in.nextTry = 0xFFFFFFFFu;   /* T-1408 fold 2: parked - judged again on an event (BdHelpWallWake), never on a clock */
+        return 0;
+    }
+    const int hOwnG = (gGrp != 0 && cw == 0) ? 1 : 0;
+    std::vector<std::string> hgk;
+    int hAllL = 1, hAllA = 1, hRecW = 0;
+    if (hOwnG != 0) { hgk = BdGroupKeysOf(m.key); BdGroupAreas(hgk, &hAllL, &hAllA); hRecW = BdGroupRecordWaits(hgk); }
+    const int hLinked = (!RoleIsSingle() && StoreRelayLinked() && StoreMySlot() >= 0) ? 1 : 0;
+    if (coopbuild::BuildWallHelpWaitsForRecords(hOwnG, hRecW, hLinked, hAllA) != 0)
+    {   /* T-1408 fold 8 (F1291 SHOULD): a record of this own wall's group is still queued and may win - the help waits behind the group's
+           decision (the STATE drain, after this one, takes the group's records in one turn), then applies on top and steps the group:
+           nothing applied or confirmed now, so it is never confirmed and then written over. Fold 9 (F1296): also while a member area's
+           record list is still loading on this link (a record still to come may win - the own-row hold's rule) */
+        if (in.recWaitLogged == 0)
+        {
+            in.recWaitLogged = 1;
+            if (hRecW != 0) ++g_helpBehindRecords; else ++g_helpBehindList;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 <- HELP key=%.63s from=slot%d seq=%u on an own grouped wall WAITS: %s - applied after the group is decided; help[behindRecords,behindList]=%lld,%lld",
+                        m.key.c_str(), in.slot, m.seq, hRecW != 0 ? "a record of its group is still queued here" : "its group's area record list is still loading on this link",
+                        g_helpBehindRecords, g_helpBehindList);
+            BdLogHelp(line);
+        }
+        in.nextTry = g_drainNo + 1;
+        return 2;
+    }
     const unsigned long long rUpd = Rva("UpdatePhysicalWithProgress");
     if (rUpd == 0)
     {
@@ -10987,21 +13528,67 @@ int BdApplyHelp(BdHelpIn& in)
        lands on this wall alone. A wall whose record is a group's (or unreadable) takes the materials only - a progress write there lands
        in every member's shared record - counted (helpWallGroupKept) */
     const int wall = BdIsWall(b);
-    const int wallKeep = (wall != 0 && coopbuild::BuildRepairWallApplies(1, BdWallOwnRecord(b)) == 0) ? 1 : 0;
-    if (wallKeep != 0 && m.progress > 0.0f) ++g_helpWallGroupKept;
-    const int completes = (wallKeep == 0) ? coopbuild::BuildHelpCompletes(p0, m.progress, n0) : 0;
+    const int wallGrp = (wall != 0 && coopbuild::BuildRepairWallApplies(1, BdWallOwnRecord(b)) == 0) ? 1 : 0;
+    /* T-1408 (F1216 design read): the owner resolves its own group - work for a grouped wall (from the helper's lead copy, or from an
+       ungrouped helper copy) is written to this game's group record through its lead and the engine's own wall step draws every member,
+       when the group is whole here and its own; else materials only, with a line */
+    void* gLead = 0;
+    int gListed = -1, gRes = 0;
+    int wallStep = (wallGrp != 0 && m.progress > 0.0f && x0 == 0 && cw == 0) ? BdWallGroupWholePod(b, &gLead, &gListed, &gRes) : 0;
+    const int gWholeOk = wallStep;   /* T-1408 fold 10: the group whole and its owner's alone (BuildWallKeepWhy) */
+    /* T-1408 fold 1 (review 5): the helper's work was measured on its lead copy of this key against that piece's own needed (+0x188); b's
+       record is its group's lead's here (n0 = the lead's needed), which may be another wall type - the same fraction of the lead's needed */
+    float mp = m.progress, bOwnN = 0.0f;
+    if (wallStep != 0)
+    {
+        const float sc = (BdFloatAtOr0(b, kWallOwnRecord + 0x28, &bOwnN) != 0) ? coopbuild::BuildWallHelpScale(m.progress, n0, bOwnN) : -1.0f;
+        if (sc < 0.0f) wallStep = 0;
+        else
+        {
+            if (b != gLead) ++g_helpWallScaled;
+            mp = sc;
+        }
+    }
+    const int wallKeep = (wallGrp != 0 && wallStep == 0) ? 1 : 0;
+    const int keepWhy = coopbuild::BuildWallKeepWhy(wallKeep, m.progress, x0, cw, gWholeOk);   /* T-1408 fold 10 (F1331 3): one reason, the real one */
+    if (wallKeep != 0 && m.progress > 0.0f)
+    {
+        ++g_helpWallGroupKept;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 <- HELP key=%.63s from=slot%d seq=%u on a grouped wall: MATERIALS ONLY - %s (lead %s, listed %d, loaded %d%s, own needed %.2f); progress %.2f not applied; helpWallGroupKept=%lld",
+                    m.key.c_str(), in.slot, m.seq, BdWallKeepWord(keepWhy), gLead != 0 ? "read" : "not read", gListed, gRes, x0 != 0 ? ", a ruin" : "", bOwnN, m.progress, g_helpWallGroupKept);
+        BdLogHelp(line);
+    }
+    else if (wallStep != 0 && b != gLead)
+    {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 <- HELP key=%.63s from=slot%d seq=%u on a member of its group here: work %.3f of this piece's needed %.2f -> %.3f of the lead's needed %.2f; helpWallScaled=%lld",
+                    m.key.c_str(), in.slot, m.seq, m.progress, bOwnN, mp, n0, g_helpWallScaled);
+        BdLogHelpFreq(line);
+    }
+    const int completes = (wallKeep == 0) ? coopbuild::BuildHelpCompletes(p0, mp, n0) : 0;
     const int wmSolid0 = BdWalkMapSolidNow(b);   /* T-1294: solid before the write (-1 unread = taken as solid) */
     int ok = 0, stage = 0, ml = -1;
     if (wallKeep != 0 || !(m.progress > 0.0f)) ok = BdApplyStatePod(b, 0, 0.0f, n, nw, &ml, upd, &stage);
     else if (completes != 0)
     {
         ok = BdApplyStatePod(b, 0, 0.0f, n, nw, &ml, upd, &stage);
-        if (ok) ok = BdCompleteNowPod(b);   /* the engine's own complete-now path (T-1294: a wall through its threshold crossing) */
+        if (ok)
+        {
+            if (wallStep != 0) ++g_bdSelf;
+            ok = BdCompleteNowPod(wallStep != 0 ? gLead : b);   /* the engine's own complete-now path (T-1294: a wall through its threshold crossing); T-1408: a group through its lead, whose finish 0x561A20 finishes every member */
+            if (wallStep != 0) --g_bdSelf;
+        }
     }
     else
     {
-        if (wall != 0) BdWallCrossPod(b, p0 + m.progress, upd, m.key.c_str());   /* T-1294 fold 1 (H2): help crossing a wall's line */
-        ok = BdApplyStatePod(b, 1, p0 + m.progress, n, nw, &ml, upd, &stage);   /* below needed (BuildHelpCompletes) */
+        void* wb = (wallStep != 0) ? gLead : b;   /* T-1408: the group's record through its lead (b's record is the lead's) */
+        if (wall != 0) BdWallCrossPod(wb, p0 + mp, upd, m.key.c_str());   /* T-1294 fold 1 (H2): help crossing a wall's line */
+        ok = BdApplyStatePod(wb, 1, p0 + mp, n, nw, &ml, upd, &stage);   /* below needed (BuildHelpCompletes); T-1408 fold 1: mp = m.progress but on a member of another type than its lead */
+        if (ok && wallStep != 0 && BdWallStepZero(gLead, m.key.c_str()) == 0) BdWallSharesRedraw(gLead, "the owner's wall step not run - drawn by the mod", m.key.c_str());
+    }
+    if (ok && wallStep != 0)
+    {
+        ++g_helpWallGroupStep;
+        BdWallSharesRedraw(gLead, "the owner's wall step", m.key.c_str());
     }
     if (!ok)
     {
@@ -11025,14 +13612,54 @@ int BdApplyHelp(BdHelpIn& in)
     else if (coopbuild::BuildWalkMapCrossed(wmSolid0 != 0 ? 1 : 0, BdWalkMapSolidNow(b) > 0 ? 1 : 0) != 0) BdWalkMapNote(b, coopbuild::kWmThreshold, m.key.c_str());
     r.nMats = BdReadMats(b, r.mats, (int)coopbuild::kBuildMaxMats, &t1);
     r.gen = g_bdGen;
+    if (wall != 0 && (p1 != p0 || completes != 0)) BdGroupStepFor(BdGroupKeysOf(m.key), 0, 0, 1, "help");   /* T-1408 fold 7: help applied is new work (the amount-0 wall step after it is not) */
     ++g_helpApplied;
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u applied %.2f->%.2f/%.2f mats+%.2f clamped=%d complete=%d%s (confirmed once pp.build holds it)",
+    char kw[220];
+    _snprintf_s(kw, sizeof(kw), _TRUNCATE, " grouped wall (mats only: %s)", BdWallKeepWord(keepWhy));
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u applied %.2f->%.2f/%.2f mats+%.2f clamped=%d complete=%d%s%s (confirmed once pp.build holds it)",
                 m.key.c_str(), in.slot, m.seq, p0, p1, n1, added, clamped, c1,
-                wallKeep != 0 ? " grouped wall (mats only: its progress record is a group's)" : (wall != 0 ? " wall" : ""));
+                wallKeep != 0 ? kw : (wallStep != 0 ? " grouped wall: T-1408 the owner's group took it (its lead's record, the engine's wall step)" : (wall != 0 ? " wall" : "")),
+                m.reset != 0 ? " after the owner's own rebuild of the ruin" : "");
     BdLogHelp(line);
     if (completes != 0 && c1 != 0) ItFurnMarkStale(3);   /* T-454: the help completed the piece (0 -> 1) */
     BdHelpAckChanged(m.key, r);   /* help1 fold (MED 4): pp.build now (progress + last applied), the confirmation once it has landed */
     return 1;
+}
+/* T-1408 fold 2, MAIN THREAD: the events that can change a parked HELD entry's verdict (coopbuild::BuildWallHeldWakes) - each woken entry is
+   judged at the next K2 safe point */
+unsigned int g_whMapSeq = 0;
+void BdHelpWallWake(int event, const char* what)
+{
+    int n = 0;
+    for (size_t i = 0; i < g_helpIn.size(); ++i)
+        if (g_helpIn[i].wallPark != 0 && g_helpIn[i].nextTry == 0xFFFFFFFFu && coopbuild::BuildWallHeldWakes(g_helpIn[i].wallWhy, event) != 0) { g_helpIn[i].nextTry = g_drainNo; ++n; }
+    if (n == 0) return;
+    g_wallHeldWoken += n;
+    char line[260];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 held grouped-wall help: %d parked entr%s judged again - %s; wallHeldWoken=%lld", n, n == 1 ? "y" : "ies", what, g_wallHeldWoken);
+    BdLogHelpFreq(line);
+}
+/* T-1408 fold 3: 'to' replaces 'from' (a re-send of the same seq, resend 1; a later seq superseding it, resend 0) - the held state goes
+   with it (coopbuild::BuildWallHeldInherit), and a re-send of a parked entry stays parked */
+static void BdHelpWallCarry(BdHelpIn& to, const BdHelpIn& from, int resend)
+{
+    coopbuild::BuildWallHeldCarry t;
+    t.park = to.wallPark; t.why = to.wallWhy; t.told = to.wallTold; t.logged = to.wallLogged;
+    coopbuild::BuildWallHeldCarry f;
+    f.park = from.wallPark; f.why = from.wallWhy; f.told = from.wallTold; f.logged = from.wallLogged;
+    coopbuild::BuildWallHeldInherit(&t, f);
+    to.wallPark = t.park; to.wallWhy = t.why; to.wallTold = t.told; to.wallLogged = t.logged;
+    if (resend != 0 && coopbuild::BuildWallHeldResendParked(from.wallPark, from.nextTry == 0xFFFFFFFFu ? 1 : 0) != 0) to.nextTry = 0xFFFFFFFFu;
+}
+/* T-1408 fold 2: a HELD entry left the queue (applied, confirmed, or dropped): its helper is released - unless another entry of that helper
+   for that key is still parked */
+void BdHelpWallRelease(const std::string& key, int slot)
+{
+    for (size_t i = 0; i < g_helpIn.size(); ++i) if (g_helpIn[i].wallPark != 0 && g_helpIn[i].nextTry == 0xFFFFFFFFu && g_helpIn[i].m.key == key && g_helpIn[i].slot == slot) return;
+    const int sent = BdSendHelpHeld(key, coopbuild::kBuildHeldReleased, slot);
+    char line[260];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 held grouped-wall help key=%.63s no longer held here - HELP_HELD release %s", key.c_str(), sent != 0 ? "sent" : "NOT SENT (link down; the helper's mark goes when this game is known away)");
+    BdLogHelpFreq(line);
 }
 /* help1, the K2 safe point: the owners' HELP_GONE answers first; then the received work in arrival order - an entry waiting for its area
    holds the later ones of its slot + key; help1 fold (HIGH 1): an entry held for its gap (BdApplyHelp 2) stays and is not a turn of the
@@ -11042,6 +13669,8 @@ void BdHelpDrain()
     for (size_t g = 0; g < g_helpGoneIn.size(); ++g) BdHelpOnGone(g_helpGoneIn[g]);
     g_helpGoneIn.clear();
     if (g_helpIn.empty()) return;
+    const unsigned int mapSeq = PieceMapSeqTS();
+    if (mapSeq != g_whMapSeq) { g_whMapSeq = mapSeq; BdHelpWallWake(coopbuild::kBuildWakeMap, "an area map arrived (the copy's writer may have changed)"); }   /* T-1408 fold 2 */
     std::set<std::string> held;
     int done = 0;
     for (size_t i = 0; i < g_helpIn.size() && done < kStateApplyPerDrain; )
@@ -11060,15 +13689,23 @@ void BdHelpDrain()
                 _snprintf_s(sl, sizeof(sl), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u (held) superseded by seq=%u arriving later - dropped (the helper renumbered or re-sent from lower; it sends again what it still owes) superseded=%lld",
                             g_helpIn[j].m.key.c_str(), g_helpIn[j].slot, g_helpIn[j].m.seq, g_helpIn[i].m.seq, g_helpSuperseded);
                 BdLogHelp(sl);
+                BdHelpWallCarry(g_helpIn[i], g_helpIn[j], 0);   /* T-1408 fold 3: the held state goes to the superseding entry, so its apply / drop sends released */
                 g_helpIn.erase(g_helpIn.begin() + (std::ptrdiff_t)j);
                 --i;
             }
             else ++j;
         }
         const int res = BdApplyHelp(g_helpIn[i]);
-        if (res == 2) { ++i; continue; }
+        if (res == 2) { held.insert(hk); ++i; continue; }   /* T-1408 fold 8: the same placement's later entries wait behind it (strictly in order) */
         ++done;
-        if (res != 0) g_helpIn.erase(g_helpIn.begin() + (std::ptrdiff_t)i);
+        if (res != 0)
+        {
+            const int rel = coopbuild::BuildWallHeldReleaseOnLeave(g_helpIn[i].wallPark, g_helpIn[i].wallTold);   /* T-1408 fold 2; fold 3 */
+            const std::string rk = g_helpIn[i].m.key;
+            const int rs = g_helpIn[i].slot;
+            g_helpIn.erase(g_helpIn.begin() + (std::ptrdiff_t)i);
+            if (rel != 0) BdHelpWallRelease(rk, rs);
+        }
         else { held.insert(hk); ++i; }
     }
 }
@@ -11237,12 +13874,22 @@ void BdHelpOnState(const std::string& key, BdReg& r, void* b, const coopbuild::B
    live) as a real STATE gives them (coopbuild::BuildHelpTailFromRecord decides), so this game's work waiting for them goes to the
    piece's writer (BdHelpTick). Entries the owner applied are confirmed, the rest renumbered past its live last applied
    (BdHelpTailResync); a refund waits for a real STATE (it hands items at the K2 safe point) */
+/* T-1408 fold 12 (F1383): the copy's help numbers count as known for a record only when the record names none newer for this game */
+int BdRecTailKnown(const BdReg& r, const coopbuild::BuildMsg& st)
+{
+    const int me = MySlotForWire();
+    unsigned int t = 0, tl = 0;
+    if (me >= 0) for (size_t j = 0; j < st.helpAcks.size(); ++j) if ((int)st.helpAcks[j].slot == me) { t = st.helpAcks[j].seq; tl = (st.helpAcks[j].live > t) ? st.helpAcks[j].live : t; }
+    return coopbuild::BuildHelpTailRecordNew(r.helpTailKnown, t, tl, r.helpTailSeq, r.helpTailLive) != 0 ? 0 : 1;
+}
 void BdHelpTailFromRecord(const std::string& key, BdReg& r, const coopbuild::BuildMsg& st)
 {
     const int me = MySlotForWire();
     if (me < 0) return;
     unsigned int t = 0, tl = 0;
     for (size_t j = 0; j < st.helpAcks.size(); ++j) if ((int)st.helpAcks[j].slot == me) { t = st.helpAcks[j].seq; tl = (st.helpAcks[j].live > t) ? st.helpAcks[j].live : t; }
+    t = coopbuild::BuildHelpTailKeepMax(r.helpTailKnown, t, r.helpTailSeq);     /* T-1408 fold 12b (F1384 NIT 1): neither number goes back */
+    tl = coopbuild::BuildHelpTailKeepMax(r.helpTailKnown, tl, r.helpTailLive);
     r.helpTailKnown = 1; r.helpTailSeq = t; r.helpTailLive = tl;
     BdHelpLoad();
     if (coopbuild::BuildFloatOk(st.progress)) { r.helpBaseP = st.progress; r.helpBaseKnown = 1; }   /* T-23 review fold 2: the base this game's saved help work stands on */
@@ -11280,13 +13927,15 @@ void BdHelpHarvest(const std::string& key, BdReg* r, void* b, const char* why)
     const int found = (r != 0 && r->removed == 0 && b != 0 && BdReadState(b, &p, &n, &c, &d, &x) != 0) ? 1 : 0;
     ::Faction* owner = (found != 0) ? (::Faction*)BdOwnerPod(b) : 0;
     const int isCopy = (found != 0 && r->via == 3 && IsStandInFaction(owner)) ? 1 : 0;
-    const int wall = (isCopy != 0 && BdWallHelpKind(b) == coopbuild::kBuildWallKindGroup) ? 1 : 0;   /* a grouped wall copy: its materials are not carried */
+    const int hwk = (isCopy != 0) ? BdWallHelpKind(b) : coopbuild::kBuildWallKindNone;
+    const int wall = (isCopy != 0 && (hwk == coopbuild::kBuildWallKindGroup || (hwk == coopbuild::kBuildWallKindGroupOwner && BdWallIsLead(b) == 0))) ? 1 : 0;   /* a grouped wall copy: its materials are not carried; T-1408: a group the owner's alone - carried from its lead's row only (every member shares that record) */
     float now[coopbuild::kBuildMaxMats], gain[coopbuild::kBuildMaxMats];
     for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i) { now[i] = 0.0f; gain[i] = 0.0f; }
     int tot = -1;
     const int nNow = (isCopy != 0 && wall == 0 && d == 0) ? BdReadMats(b, now, (int)coopbuild::kBuildMaxMats, &tot) : -1;
-    const int baseOk = (isCopy != 0) ? r->helpBaseOk : 0;
-    const int gained = (nNow > 0 && baseOk != 0) ? coopbuild::BuildHelpMatGain(now, nNow, 1, r->helpBase, -1, 0, gain) : 0;
+    const BdReg* hb = (isCopy != 0) ? BdHelpBaseOf(*r, b) : 0;   /* T-1408 fold 14 (F1429): the baseline of the record b reads (the lead's own row for a lead), moved by every mod write through any member */
+    const int baseOk = (hb != 0) ? 1 : 0;
+    const int gained = (nNow > 0 && baseOk != 0) ? coopbuild::BuildHelpMatGain(now, nNow, 1, hb->helpBase, -1, 0, gain) : 0;
     int mate = 0, fr = 0;
     const int allowed = (gained != 0) ? BdHelpAllowedHere(owner, &mate, &fr) : 0;
     const int v = coopbuild::BuildHelpHarvestVerdict(found, isCopy, wall, d, baseOk, gained, allowed);
@@ -11302,7 +13951,7 @@ void BdHelpHarvest(const std::string& key, BdReg* r, void* b, const char* why)
     }
     if (v == coopbuild::kBuildHarvestNoGain)
     {
-        if (nNow >= 0) BdHelpBaseSet(*r, now, nNow);   /* as a main-thread help step: the baseline follows the amounts read */
+        if (nNow >= 0) BdHelpBaseSet(*r, b, now, nNow);   /* as a main-thread help step: the baseline follows the amounts read */
         return;
     }
     float sum = 0.0f;
@@ -11310,7 +13959,7 @@ void BdHelpHarvest(const std::string& key, BdReg* r, void* b, const char* why)
     if (v == coopbuild::kBuildHarvestRecord)
     {
         BdHelpRecordWork(key, *r, b, 0.0f, 0, n, gain, nNow);
-        BdHelpBaseSet(*r, now, nNow);
+        BdHelpBaseSet(*r, b, now, nNow);
         ++g_helpHarvested;
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help materials (off the main thread) key=%.63s dMats=%.2f recorded for slot%d (%s) - they go to the owner's game as help work; helpHarvested=%lld",
                     key.c_str(), sum, StandInSlotOf(owner), why, g_helpHarvested);
@@ -11322,7 +13971,7 @@ void BdHelpHarvest(const std::string& key, BdReg* r, void* b, const char* why)
     float back[coopbuild::kBuildMaxMats];
     for (int i = 0; i < nNow; ++i)
     {
-        back[i] = (gain[i] > 0.0f) ? r->helpBase[i] : now[i];
+        back[i] = (gain[i] > 0.0f) ? hb->helpBase[i] : now[i];
         if (!(gain[i] > 0.0f)) continue;
         char s[128];
         s[0] = 0;
@@ -11340,7 +13989,7 @@ void BdHelpHarvest(const std::string& key, BdReg* r, void* b, const char* why)
         return;
     }
     ++g_helpHarvestRefused;
-    BdHelpBaseSet(*r, back, nNow);
+    BdHelpBaseSet(*r, b, back, nNow);
     ::Character* ch = BdNearestOwnChar(r->pos);
     int whole[coopbuild::kBuildMaxMats];
     int givenAt[coopbuild::kBuildMaxMats];   /* 1 given, 0 not taken (carried below), < 0 the engine's add faulted */
@@ -11389,11 +14038,46 @@ void BdHelpHarvest(const std::string& key, BdReg* r, void* b, const char* why)
                 key.c_str(), sum, why, StandInSlotOf(owner), items, miss, g_helpHarvestRefused, g_helpHarvestCarried, g_helpHarvestLost);
     BdLogHelpFreq(line);
 }
+/* T-1408 fold 14b (review 2), MAIN THREAD: piece b's materials measured where its record's baseline lives - a grouped member on its
+   lead's row (coopbuild::BuildHelpMeasureAt), never on its own; *measuredKey = the row measured (empty: none) */
+long long g_helpHarvestNoLead = 0;   /* T-1408 fold 14c: harvests of a grouped member whose lead has no row here */
+void BdHelpHarvestRecord(const std::string& key, BdReg* r, void* b, const char* why, std::string* measuredKey)
+{
+    if (measuredKey != 0) measuredKey->clear();
+    if (r == 0) return;
+    void* L = (b != 0 && BdIsWall(b) == 1) ? BdWallLeadOf(b) : b;
+    const int holder = (b == 0 || L == b || L == 0) ? coopbuild::kBuildBaseOwn : coopbuild::kBuildBaseLead;
+    std::map<std::string, BdReg>::iterator lr = (holder == coopbuild::kBuildBaseLead) ? BdLeadRowOf(L) : g_reg.end();
+    const int at = coopbuild::BuildHelpMeasureAt(holder, lr != g_reg.end() ? 1 : 0);
+    if (at == coopbuild::kBuildMeasureNone)
+    {   /* fold 14c (review 5): a member whose lead has no row here - counted, logged once per key (capped) */
+        ++g_helpHarvestNoLead;
+        static std::set<std::string> logged;
+        if (logged.size() < 64 && logged.insert(key).second)
+        {
+            char nl[300];
+            _snprintf_s(nl, sizeof(nl), _TRUNCATE, "[BUILD] help materials key=%.63s NOT MEASURED (%s): a grouped member whose lead has no row here - measured on its lead's row only; helpHarvestNoLead=%lld",
+                        key.c_str(), why, g_helpHarvestNoLead);
+            BdLogHelpFreq(nl);
+        }
+        return;
+    }
+    if (at == coopbuild::kBuildMeasureLead)
+    {
+        if (measuredKey != 0) *measuredKey = lr->first;
+        char w2[160];
+        _snprintf_s(w2, sizeof(w2), _TRUNCATE, "%s, on a member - its lead's record", why);
+        BdHelpHarvest(lr->first, &lr->second, L, w2);
+        return;
+    }
+    if (measuredKey != 0) *measuredKey = key;
+    BdHelpHarvest(key, r, b, why);
+}
 /* T-903, MAIN THREAD, the K2 safe point: the copies an off-main add-materials step changed (marked by BuildTick), each once */
 void BdHarvestDrain()
 {
     if (g_bdHarvestDue.empty()) return;
-    std::vector<std::string> due;
+    std::vector<std::string> due, measured;
     due.swap(g_bdHarvestDue);
     for (size_t i = 0; i < due.size(); ++i)
     {
@@ -11401,7 +14085,13 @@ void BdHarvestDrain()
         if (it == g_reg.end()) continue;
         int fv = 0;
         void* b = (it->second.removed == 0) ? BdFindPiece(it->first, it->second, &fv) : 0;   /* re-found: never a kept pointer */
-        BdHelpHarvest(it->first, &it->second, b, "after an add-materials step");
+        std::string mk = it->first;   /* T-1408 fold 14 (F1429): a grouped member's materials are its lead's record - measured once, on the lead's row */
+        if (b != 0 && BdIsWall(b) == 1) { void* L = BdWallLeadOf(b); std::map<std::string, BdReg>::iterator lr = (L != 0 && L != b) ? BdLeadRowOf(L) : g_reg.end(); if (lr != g_reg.end()) mk = lr->first; }
+        size_t q = 0;
+        while (q < measured.size() && measured[q] != mk) ++q;
+        if (q < measured.size()) continue;
+        measured.push_back(mk);
+        BdHelpHarvestRecord(it->first, &it->second, b, "after an add-materials step", 0);
     }
 }
 
@@ -11431,10 +14121,27 @@ void BdWallRepairHoldOnState(const std::string& key, int wallOwn, int copyComple
     else if (act == coopbuild::kBuildWallRepHoldClear && coopbuild::BuildKeyMarkClear(&g_wallRepHeld, key) != 0)
     {
         ++g_wallRepHeldCleared;
+        BdRepHeldMirrorClear();   /* T-1408 fold 10: the rest come back at their next skipped step */
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] wall copy key=%.63s: the owner's health changed %.2f -> %.2f - its repair is open again; wallRepHeldCleared=%lld",
                     key.c_str(), prevP, newP, g_wallRepHeldCleared);
         BdLogHelp(line);
     }
+}
+/* T-1408, MAIN THREAD (BdApplyOne): the shares of the group's records written by older builds (no stamp) - the arriving record `m` for
+   its own key, each other key's newest kept record (coopbuild::BuildWallRecShare). Returns the shares read */
+int BdOwnGroupLegacyShares(const std::vector<std::string>& keys, const std::string& key, const coopbuild::BuildMsg& m, float* shares, int cap)
+{
+    int n = 0;
+    float sh = 0.0f;
+    if (m.groupStamp == 0 && coopbuild::BuildWallRecShare(m.progress, m.needed, (int)m.complete, &sh) != 0 && n < cap) shares[n++] = sh;
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        if (keys[i] == key) continue;
+        coopbuild::BuildMsg st;
+        if (BdKeptState(keys[i], &st) == 0 || st.groupStamp != 0) continue;
+        if (coopbuild::BuildWallRecShare(st.progress, st.needed, (int)st.complete, &sh) != 0 && n < cap) shares[n++] = sh;
+    }
+    return n;
 }
 int BdApplyOne(const std::string& key, BdStatePend& s)
 {
@@ -11465,6 +14172,18 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
     void* b = BdFindPiece(key, row->second, &fv);   /* re-found every time: never a kept pointer (build1-e: furniture in its host) */
     if (b == 0)
     {
+        if (s.ownRec != 0)
+        {   /* T-1408 fold 5 (F1261 SHOULD 2): an own record's STATE whose piece's area is not loaded here is dropped - applied again at the
+               area's next load (PcaApplyArea), and nothing is held for it meanwhile (BdOwnRowRecordWait) */
+            const int dc = PcrSecOfId(piecerec::MakePieceRecId(key));
+            if (dc < 0 || dc >= coopbuild::kBuildZoneSectorCells || g_bdZoneActiveNow[dc] == 0)
+            {
+                ++g_ogStateAreaLeft;
+                std::sprintf(line, "[BUILD] T-1408 fold 5 own STATE key=%.63s dropped: its area is not loaded here (applied again at its next load); ownGroupStateAreaLeft=%lld", key.c_str(), g_ogStateAreaLeft);
+                BdLogState(line);
+                return 1;
+            }
+        }
         if (s.waitLogged == 0) { s.waitLogged = 1; ++g_stateWaitArea; }
         s.nextTry = g_drainNo + kRetryGap;   /* the copy's area is not loaded here: kept, the latest wins */
         return 0;
@@ -11480,7 +14199,9 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
         BdLogState(line);
         return 1;
     }
-    if (s.ownRec == 0) BdHelpHarvest(key, &row->second, b, "before the owner's STATE");   /* a helper's materials not yet measured are recorded or refused before the STATE overwrites them */
+    if (s.ownRec == 0) BdHelpHarvestRecord(key, &row->second, b, "before the owner's STATE", 0);   /* a helper's materials not yet measured are recorded or refused before the STATE overwrites them; T-1408 fold 14b (review 2): a member's on its lead's row */
+    BdHelpBaseFollowScope baseFollow;   /* T-1408 fold 14b (review BLOCKER 1): every materials write below moves the baseline, whatever road the apply leaves by */
+    baseFollow.key = key;
     if (m.needed > 0.0f && ln > 0.0f && std::fabs(ln - m.needed) > 0.001f * m.needed && BdIsWall(b) == 0 && BdSetNeededPod(b, m.needed) != 0)
     {   /* help1 fold (review LOW 11): a copy's needed off the owner's (a raise never put back) heals to the STATE's */
         ++g_neededHealed;
@@ -11500,15 +14221,53 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
     if (dAct == coopbuild::kBuildDestroyApply || dAct == coopbuild::kBuildDestroyAlready)
     {
         int mlD = -1, stD = 0;
-        const int okM = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &mlD, 0, &stD);   /* delivered mats only (stage 1; no progress, no 0x558680) */
+        const int okM = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &mlD, 0, &stD);   /* delivered mats only (stage 1; no progress, no 0x558680) */   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
         if (dAct == coopbuild::kBuildDestroyApply) DoorsForgetOwner(b);   /* P15 fold 1 (CRASH 1a): the door rows go before the doors do */
         const int okD = (dAct == coopbuild::kBuildDestroyApply) ? BdDestroyPod(b, true) : 1;
         float dp = 0, dn = 0;
         int dc = 0, dd = 0, dx = 0;
         BdReadState(b, &dp, &dn, &dc, &dd, &dx);
+        /* T-1408 fold 10 (F1331 1d): the ruin is this wall's - the engine's setDestroyed(1) zeroes the record it uses, its GROUP's; the
+           group's value read before it goes back (as the hit road's BdWallRecordProgressPut); the group's own STATEs carry any change.
+           T-1408 fold 11 (F1343 SHOULD 1): put back only once the ruin flag reads 1 - a ruin the engine postponed (message 16) keeps the
+           value with the queued STATE, and the retry that finds the ruin ('already a ruin') puts it back */
+        int gWant = 0;
+        float gVal = 0.0f;
+        const char* gWhen = "at the ruin";
+        if (dAct == coopbuild::kBuildDestroyApply && okD != 0 && BdIsWall(b) == 1 && BdWallOwnRecord(b) == 0)
+        {
+            if (dx != 0) { gWant = 1; gVal = lp; s.ruinPutPend = 0; }
+            else
+            {   /* the latest value read before the ruin is the one kept (a newer owner word while it is still postponed reads it again) */
+                if (s.ruinPutPend == 0)
+                {
+                    char gl[300];
+                    _snprintf_s(gl, sizeof(gl), _TRUNCATE, "[BUILD] T-1408 fold 11 ruin on a grouped copy key=%.63s postponed by the engine: its group's record value %.3f kept with the STATE (put back when the ruin is found)",
+                                key.c_str(), lp);
+                    BdLogGroup(gl);
+                }
+                s.ruinPutPend = 1; s.ruinPutVal = lp;
+            }
+        }
+        else if (dAct == coopbuild::kBuildDestroyAlready && s.ruinPutPend != 0)
+        {
+            s.ruinPutPend = 0;
+            if (BdIsWall(b) == 1 && BdWallOwnRecord(b) == 0) { gWant = 1; gVal = s.ruinPutVal; gWhen = "at the postponed ruin's retry"; }
+        }
+        if (gWant != 0)
+        {
+            const int gPut = BdWallRecordProgressPut(b, gVal);   /* T-1408 fold 11: after the ruin flag reads 1 */
+            if (gPut != 0) ++g_ruinGroupRestored; else ++g_ruinGroupRestoreFailed;
+            char gl[300];
+            _snprintf_s(gl, sizeof(gl), _TRUNCATE, "[BUILD] T-1408 fold 10 ruin on a grouped copy key=%.63s: its group's record %s at %.3f (%s); ruinGroup[restored,failed]=%lld,%lld",
+                        key.c_str(), gPut != 0 ? "put back" : "NOT put back (the write faulted)", gVal, gWhen, g_ruinGroupRestored, g_ruinGroupRestoreFailed);
+            BdLogGroup(gl);
+            if (gPut != 0) BdReadState(b, &dp, &dn, &dc, &dd, &dx);   /* the row below reads the put-back value */
+        }
         BdReg& rdr = row->second;
         rdr.progress = dp; rdr.needed = dn; rdr.complete = dc; rdr.dismantled = dd; rdr.destroyed = dx;
         rdr.ownerLast = m; rdr.ownerKnown = 1;
+        PcOwnerStateLanded(key);   /* T-1389 fold 1 */
         const char* how = "APPLIED via setDestroyed(1) vt+0x340";
         if (!okD || !okM) { ++g_destroyFaulted; how = "FAULTED"; }
         else if (dAct == coopbuild::kBuildDestroyAlready) { ++g_destroyAlready; how = "already a ruin here (mats only)"; }
@@ -11558,6 +14317,7 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
             /* P15 fold 1 (MED 3): the owner's word is recorded now, before any early return below - it is what BdCopyDestroyedHere
                reverts to, and a wall repaired here reads complete=1 against the STATE's complete=0 (the stale test is skipped for it) */
             row->second.ownerLast = m; row->second.ownerKnown = 1;
+            PcOwnerStateLanded(key);   /* T-1389 fold 1 */
         }
         else if (repDeferred != 0) ++g_repairDeferred;
         else ++g_destroyFaulted;
@@ -11572,7 +14332,7 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
     if (s.ownRec != 0 && lc != 0)
     {   /* an own finished piece takes its record's delivered materials only: its progress (a wall's health) stays its own */
         int mlO = -1, stO = 0;
-        const int okO = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &mlO, 0, &stO);
+        const int okO = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &mlO, 0, &stO);   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
         std::sprintf(line, "[BUILD] <- record STATE key=%.63s own finished piece: materials %s (%d), progress kept", key.c_str(),
                      okO != 0 ? "written" : "NOT written (faulted)", (int)m.nMats);
         BdLogState(line);
@@ -11604,7 +14364,18 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
     int matsLive = -1, stage = 0, ok = 0, completeCalled = 0;
     const int wall = BdIsWall(b);
     const int wmSolid0 = BdWalkMapSolidNow(b);   /* T-1294: solid before the write (-1 unread = taken as solid) */
+    if (wall != 0 && !m.groupLead.empty())
+    {   /* T-1408 fold 13: the record's group fact - noted, and the wall joined by it (in the owner's order) before its value is taken */
+        const int wgCh = WgFactPut(key, m.groupLead, m.groupIdx);
+        BdWallJoinFromRecord(key, b, "record");
+        if (wgCh != 0) BdHeldResolve(-1, "record");   /* fold 13d: a fact landed - the held walls waiting for it */
+    }
     int wallOwn = -1;   /* a wall copy: 1 = its progress record is its alone, 0 = a group's, -1 = unreadable (taken as a group's) */
+    int ogAct = -1;     /* T-1408: the owner's own grouped wall's verdict (coopbuild::BuildWallStampApply), -1 = not that road */
+    std::vector<std::string> ogKeys;   /* T-1408: that group's keys here */
+    unsigned int ogLive = 0;           /* T-1408: that group's live stamp before the apply */
+    void* ogLead = 0;   /* T-1408 fold 5: that group's lead (BdOwnGroupLanded after the read-back) */
+    int ogAfter = coopbuild::kBuildGroupAfterNone;   /* T-1408 fold 7: adopt the record's stamp / catch up / nothing (coopbuild::BuildOwnGroupDecide) */
     if (wall != 0)
     {   /* coopbuild::BuildWallCopyAction. A wall copy made here at runtime keeps its own record, which 0x558680 redraws it from, so it
            takes the owner's progress as a share of its OWN needed (the owner's STATE carries its group's record), kept below 0.999 of it.
@@ -11614,22 +14385,87 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
            needed (the owner's wall was hit) writes the owner's share of the own-record copy's needed as a progress write - the copy
            stays complete, and is finished first when it is not; a group-record copy keeps materials only (completed, never written). */
         wallOwn = BdWallOwnRecord(b);
+        if (s.ownRec != 0) ++g_gsRecApply;   /* T-1408 fold 7: the engine calls below apply a record - no new work (BuildGroupNewWork) */
         float wp = 0.0f;
-        const int wa = coopbuild::BuildWallCopyAction(wallOwn > 0 ? 1 : 0, (int)m.complete, m.progress, m.needed, ln, &wp);
-        if (wa == coopbuild::kBuildWallProgress)
+        /* T-1408 fold 13 (step 5): a lead copy whose group the record's fact names (this key, index 0) takes the owner's progress - once, into
+           the record every joined member copy here reads; a member's record keeps materials only (wallgroup::CopyOwnState) */
+        const int wgLeads = (s.ownRec == 0 && wallOwn == 0 && wallgroup::RecNamesLead(m.groupLead, m.groupIdx, key) != 0 && BdWallLeadOf(b) == b) ? 1 : 0;
+        const int wgNewer = wallgroup::LeadStampNewer(row->second.wgLeadHave, row->second.wgLeadStamp, m.groupStamp);   /* fold 13b / 13c: never an older value over a newer one (a hit) */
+        const int wgOwn = wallgroup::CopyOwnState(wallOwn, s.ownRec, wgLeads, wgLeads, wgNewer);
+        int wa = coopbuild::BuildWallCopyAction(wgOwn, (int)m.complete, m.progress, m.needed, ln, &wp);
+        float ogV = 0.0f, ogLp = lp, ogLn = ln, ogShare = -1.0f;
+        int ogListed = -1, ogRes = 0, ogLegacy = 0;
+        if (m.groupStamp > g_gsClock) g_gsClock = m.groupStamp;   /* T-1408: the highest stamp seen here */
+        if (s.ownRec == 0 && m.groupStamp > row->second.gStamp) row->second.gStamp = m.groupStamp;   /* a copy holds the owner's value and stamp */
+        if (s.ownRec != 0 && wallOwn == 0 && lx == 0)
+        {   /* T-1408: THIS player's own grouped wall under its shared records - each arriving record judged by its group step stamp alone
+               against the group's live stamp here (coopbuild::BuildWallStampApply): newer = the group's value through the lead (BdHelpApply's
+               order), or the finish road below for a finished record; equal or older = materials only, and a member's older record takes the
+               group's current value (BdOwnGroupCatchUp). No waiting for the rest of the group. */
+            (void)BdWallGroupWholePod(b, &ogLead, &ogListed, &ogRes);   /* the lead: b or a wall of b's owner; 0 = another player's lead */
+            ogKeys = BdGroupKeysOf(key);
+            ogLive = BdGroupStampLive(ogKeys);
+            if (m.groupStamp != 0)
+            {
+                float sh = 0.0f;
+                if (coopbuild::BuildWallRecShare(m.progress, m.needed, (int)m.complete, &sh) != 0) ogShare = sh;
+            }
+            else if (ogLive == 0)
+            {   /* records of older builds while the live value is unstamped too: their rule, the highest share among the unstamped records */
+                float lsh[kWallGrpCap + 2];
+                const int nl = BdOwnGroupLegacyShares(ogKeys, key, m, lsh, kWallGrpCap + 2);
+                float best = -1.0f;
+                if (coopbuild::BuildWallLegacyShare(lsh, nl, &best) >= 0) ogShare = best;
+                ogLegacy = 1;
+            }
+            if (ogLead != 0 && ogLead != b)
+            {
+                int oc0 = 0, od0 = 0, ox0 = 0;
+                if (BdReadState(ogLead, &ogLp, &ogLn, &oc0, &od0, &ox0) == 0) ogLn = 0.0f;   /* unread: no usable needed */
+            }
+            /* T-1408 fold 8 (F1291 BLOCKER): no waiting - the group's queued records come here winner first in ONE queue turn (BdOwnGroupTurn,
+               coopbuild::BuildGroupApplyOrder), so each later one is judged against the value the winner left; a record arriving after its
+               group was decided is judged against the group's current stamp the same way (newer: applied for the group; older: caught up) */
+            ogAct = coopbuild::BuildOwnGroupDecide(ogLead != 0 ? 1 : 0, wa != coopbuild::kBuildWallMatsOnly ? 1 : 0, m.groupStamp, ogShare, ogLive, ogLp, ogLn, &ogV, &ogAfter);
+            if (ogAct != coopbuild::kBuildStampWrite && ogAct != coopbuild::kBuildStampFinish) wa = coopbuild::kBuildWallMatsOnly;   /* materials only */
+        }
+        if (ogAct == coopbuild::kBuildStampWrite)
+        {   /* this record's materials on its own piece; then the group's value into the lead's record, the engine's own wall step on the lead
+               draws every member, then the mod's draw (BdHelpApply's order) */
+            ok = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &matsLive, upd, &stage);   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
+            int ogMl = -1, ogStage = 0;
+            if (ok)
+            {
+                BdWallCrossPod(ogLead, ogV, upd, key.c_str());   /* T-1294 fold 1 (H2) */
+                ok = BdApplyStatePod(ogLead, 1, ogV, 0, 0, &ogMl, upd, &ogStage);
+            }
+            if (ok && BdWallStepZero(ogLead, key.c_str()) == 0) BdWallSharesRedraw(ogLead, "the owner's records at load: wall step not run - drawn by the mod", key.c_str());
+            if (ok) BdWallSharesRedraw(ogLead, "the owner's records through its lead", key.c_str());
+        }
+        else if (wa == coopbuild::kBuildWallProgress)
         {
             BdWallCrossPod(b, wp, upd, key.c_str());   /* T-1294 fold 1 (H2): a gradual build crossing its line goes through 0x5594A0 */
-            ok = BdApplyStatePod(b, 1, wp, (int)m.nMats, m.mats, &matsLive, upd, &stage);
+            ok = BdApplyStatePod(b, 1, wp, (int)m.nMats, m.mats, &matsLive, upd, &stage);   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
+            if (ok && wgOwn != 0 && wallOwn == 0)
+            {   /* T-1408 fold 13c: the stamp advances only after the write worked; the members draw from it */
+                (void)BdWallSharesRedraw(b, "the owner's progress on the lead copy (fold 13)", key.c_str());
+                row->second.wgLeadStamp = m.groupStamp; row->second.wgLeadHave = 1; ++g_wgLeadTook;
+            }
         }
         else if (wa == coopbuild::kBuildWallCompleteDamaged && lc != 0)
         {
             const float wr = coopbuild::BuildRepairFinishSafe(wp, ln, BdByteAtOr0(b, kBOwnComplete));
             BdWallCrossPod(b, wr, upd, key.c_str());   /* T-1294 fold 1 (H2): a damaged wall re-finished */
-            ok = BdApplyStatePod(b, 1, wr, (int)m.nMats, m.mats, &matsLive, upd, &stage);
+            ok = BdApplyStatePod(b, 1, wr, (int)m.nMats, m.mats, &matsLive, upd, &stage);   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
+            if (ok && wgOwn != 0 && wallOwn == 0)
+            {   /* T-1408 fold 13c: the damaged-but-finished value on the lead copy - its members drawn again, the stamp advanced */
+                (void)BdWallSharesRedraw(b, "the owner's damaged value on the lead copy (fold 13c)", key.c_str());
+                row->second.wgLeadStamp = m.groupStamp; row->second.wgLeadHave = 1; ++g_wgLeadTook;
+            }
         }
         else
         {
-            ok = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &matsLive, upd, &stage);
+            ok = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &matsLive, upd, &stage);   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
             if (ok && (wa == coopbuild::kBuildWallComplete || wa == coopbuild::kBuildWallCompleteDamaged) && lc == 0) { ok = BdCompleteNowPod(b); completeCalled = 1; }   /* T-1294: through the wall's threshold crossing */
             int ml2 = -1;
             if (ok && wa == coopbuild::kBuildWallCompleteDamaged)   /* finished, then the hit share */
@@ -11642,19 +14478,39 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
             }
         }
         if (ok && wa == coopbuild::kBuildWallCompleteDamaged) ++g_hitStateApplied;
+        if (ogAct >= 0)
+        {   /* T-1408: the stamp in, the stamp live, the verdict */
+            const int took = ((ok && (ogAct == coopbuild::kBuildStampWrite || ogAct == coopbuild::kBuildStampFinish)) || ogAct == coopbuild::kBuildStampSame) ? 1 : 0;
+            if (took != 0) BdGroupStampTake(ogKeys, m.groupStamp);   /* the group's live stamp is the record's now */
+            if (ogAct == coopbuild::kBuildStampWrite || ogAct == coopbuild::kBuildStampFinish) { if (ok) ++g_gsApplied; }
+            else if (ogAct == coopbuild::kBuildStampSame) ++g_gsSame;
+            else if (ogAct == coopbuild::kBuildStampIgnored) ++g_gsIgnored;
+            else ++g_gsNotApplied;
+            if (took != 0 && ogLegacy != 0) ++g_gsLegacy;
+            float op = 0.0f, on = 0.0f;
+            int oc = 0, od = 0, ox = 0;
+            const int oRead = BdReadState(ogLead != 0 ? ogLead : b, &op, &on, &oc, &od, &ox);
+            char ogl[700];
+            _snprintf_s(ogl, sizeof(ogl), _TRUNCATE, "[BUILD] T-1408 own grouped wall key=%.63s record %.3f/%.2f complete=%d stamp in %u, stamp live %u%s (keys %d), share %.3f, lead loaded %.3f/%.2f: %s%s -> lead now %.3f/%.2f%s (listed %d, loaded %d); groupStamp[applied,same,ignored,notApplied,legacy]=%lld,%lld,%lld,%lld,%lld",
+                        key.c_str(), m.progress, m.needed, (int)m.complete, m.groupStamp, ogLive, ogLegacy != 0 ? " (unstamped: the older builds' rule)" : "", (int)ogKeys.size(), ogShare,
+                        ogLp, ogLn, coopbuild::BuildWallStampName(ogAct), ok ? "" : " - FAULTED", op, on, oRead != 0 ? "" : " (UNREAD)",
+                        ogListed, ogRes, g_gsApplied, g_gsSame, g_gsIgnored, g_gsNotApplied, g_gsLegacy);
+            BdLogState(ogl);
+        }
         ++g_stateWall;
         if (wallOwn > 0) ++g_wallOwnApplied; else ++g_wallSharedApplied;
+        if (s.ownRec != 0) --g_gsRecApply;
     }
     else if (m.complete == 0)
     {
         float pr = m.progress;
         if (pr < 0.0f) pr = 0.0f;
         if (pr > need * 0.999f) pr = need * 0.999f;   /* answers R2 trap: 0x558680 completes a piece at progress >= needed */
-        ok = BdApplyStatePod(b, 1, pr, (int)m.nMats, m.mats, &matsLive, upd, &stage);
+        ok = BdApplyStatePod(b, 1, pr, (int)m.nMats, m.mats, &matsLive, upd, &stage);   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
     }
     else
     {
-        ok = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &matsLive, upd, &stage);
+        ok = BdApplyStatePod(b, 0, 0.0f, (int)m.nMats, m.mats, &matsLive, upd, &stage);   baseFollow.armed = (s.ownRec == 0) ? 1 : 0;   /* fold 14b */
         if (ok && lc == 0)
         {
             const int pwBefore = PowerSwitchNow(b);   /* P47 (H-P47b): a power piece's switch before the engine's complete-now path switches it on */
@@ -11692,6 +14548,33 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
                          key.c_str(), wallOwn > 0 ? "own" : "group", BdCompleteNowWord(), cr != 0 ? "still reads complete=0" : "could not be read back", gap, s.completeTries, kWallCompleteTries,
                          g_wallCompleteNoop, g_wallCompleteSlow);
             BdLogState(line);
+            if (coopbuild::BuildWallFinishEnds((s.ownRec != 0 && ogAct == coopbuild::kBuildStampFinish) ? 1 : 0, s.completeTries, kWallCompleteTries) != 0)
+            {   /* T-1408 fold 9 (F1296): the winning finished record of this own group did not finish its wall in kWallCompleteTries tries - ended:
+                   its row and record take the wall's real progress (caught down), it leaves the queue, the wall's help is free */
+                ++g_gsFinishEnded;
+                BdOwnGroupCatchUp(key, ogKeys, ogLead != 0 ? ogLead : b);
+                {   /* T-1408 fold 10 (F1304 SHOULD 3): the caught-down value takes a NEW step stamp above the finished record's (still queued
+                       here, so counted as known), on every record of the group - with the same stamp the finished record would win again at
+                       the next load and start another 10 tries */
+                    const std::vector<std::string> fk = ogKeys.empty() ? BdGroupKeysOf(key) : ogKeys;
+                    BdGroupStampStep(fk, "finishEnded", key);
+                    for (size_t q = 0; q < fk.size(); ++q)
+                    {
+                        std::map<std::string, BdReg>::iterator fr = g_reg.find(fk[q]);
+                        if (fr == g_reg.end()) continue;
+                        fr->second.helpForce = 1;   /* its record is written now, with the new stamp */
+                        BdMaybeSendState(fr->first, fr->second);
+                    }
+                    ++g_gsFinishStepped;
+                }
+                float ep = 0.0f, en = 0.0f;
+                int ec = 0, ed = 0, ex = 0;
+                const int eRead = BdReadState(ogLead != 0 ? ogLead : b, &ep, &en, &ec, &ed, &ex);
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 fold 9 own grouped wall key=%.63s finished record stamp %u ENDED after %d tries: the wall stays unfinished (%.3f/%.2f%s) - its row and record caught down to it, the record leaves the queue, the wall's help is free; groupStamp[finishEnded]=%lld",
+                            key.c_str(), m.groupStamp, s.completeTries, ep, en, eRead != 0 ? "" : ", UNREAD", g_gsFinishEnded);
+                BdLogState(line);
+                return 1;
+            }
             s.nextTry = g_drainNo + gap;
             return 0;
         }
@@ -11700,7 +14583,7 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
     if (m.nMats > 0 && matsLive >= 0 && matsLive != (int)m.nMats) ++g_matsCountDiff;
     ++g_stateApplied;
     if (completeCalled) ++g_completeApplied;
-    if (completeCalled) PcQueue(key, coopbuild::kPcRoadOwnerState);   /* T-988: the owner's STATE finished the copy here */
+    PcQueue(key, coopbuild::kPcRoadOwnerState);   /* T-988; T-1389: every owner's STATE applied here (one healthy line per road and stage) */
     if (completeCalled) BdWalkMapNote(b, coopbuild::kWmFinished, key.c_str());   /* T-1294 design A */
     else if (coopbuild::BuildWalkMapCrossed(wmSolid0 != 0 ? 1 : 0, BdWalkMapSolidNow(b) > 0 ? 1 : 0) != 0) BdWalkMapNote(b, coopbuild::kWmThreshold, key.c_str());
     int brokenNow = BdBrokenRead(b);
@@ -11716,10 +14599,14 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
     r.progress = ap; r.needed = an; r.complete = ac; r.dismantled = ad; r.destroyed = ax;
     r.broken = brokenNow;
     r.nMats = BdReadMats(b, r.mats, (int)coopbuild::kBuildMaxMats, &aTotal);
+    if (ok && ogAfter == coopbuild::kBuildGroupAfterAdopt) BdOwnGroupLanded(key, ogLead, m.groupStamp);   /* T-1408 fold 7: every record of the group takes the lead's value and the RECORD's stamp - adopted, no step */
+    else if (ogAfter == coopbuild::kBuildGroupAfterCatchUp) BdOwnGroupCatchUp(key, ogKeys, ogLead);   /* T-1408: an older record (a tie that loses too) takes the group's current value */
     int refundNow = 0;
     if (s.ownRec == 0) BdHelpOnState(key, r, b, m, upd, wall, s.fromPlace, &refundNow);   /* help1: the confirmation, the refund, this game's unconfirmed work back on, the baseline */
+    if (s.fromPlace == 0 && s.ownRec == 0 && wall != 0 && wallOwn == 0 && BdWallIsLead(b) != 0 && BdWallSharesRedraw(b, "the owner's STATE on the lead copy", key.c_str()) >= 0) ++g_wallStateRedrawn;   /* T-1408 fold 1 (review 7): the helper's member copies drawn again from its lead copy */
     if (s.fromPlace == 0 && s.ownRec == 0 && wall != 0) BdWallRepairHoldOnState(key, wallOwn, ac, refundNow, r.ownerKnown, r.ownerLast.progress, m.progress);   /* before ownerLast takes this STATE */
-    if (s.fromPlace == 0 && s.ownRec == 0) { r.ownerLast = m; r.ownerKnown = 1; }   /* P15: the owner's last state - put back if this game's engine makes the copy a ruin */
+    if (s.fromPlace == 0 && s.ownRec == 0) { r.ownerLast = m; r.ownerKnown = 1; PcOwnerStateLanded(key); }   /* P15: the owner's last state - put back if this game's engine makes the copy a ruin; T-1389 fold 1 */
+    if (s.fromPlace == 0 && s.ownRec == 0 && !g_wrSolo.empty()) g_wrSolo.erase(key);   /* T-1408 fold 8: the owner's word ends a lowered copy's own steps */   /* P15: the owner's last state - put back if this game's engine makes the copy a ruin; T-1389 fold 1 */
     std::sprintf(line, "[BUILD] <- STATE applied key=%.63s %.2f/%.2f complete=%d broken=%d mats=%d/%d (sent %.2f/%.2f complete=%d broken=%d)%s%s%s", key.c_str(),
                  ap, an, ac, brokenNow, (int)m.nMats, matsLive, m.progress, m.needed, (int)m.complete, (int)m.broken,
                  completeCalled ? (std::strcmp(BdCompleteNowWord(), "999") == 0 ? " via vt+0x230(999)" : " via vt+0x230(FLT_MAX)") : "", s.fromPlace ? " from=PLACE" : "", wall != 0 ? (wallOwn > 0 ? " wall(own)" : " wall(group)") : "");
@@ -11737,12 +14624,21 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
    full through 0x558680, an unfinished row its progress below 0.999 of needed through 0x558680. The mod's own writes (BdSelfScope).
    1 = whole, 2 = a wall ruin kept, -1 = still a ruin (the engine deferred the reset - message 16 - or it faulted), -2 = whole but the
    progress write faulted or could not run */
+int BdRepairFinish(void* b, int complete, float progress);
 int BdRepairWhole(void* b, int complete, float progress)
 {
     const int wall = BdIsWall(b);
     if (wall == 1 && BdWallRuinKept(b) != 0) return 2;
     BdSelfScope self;
     if (BdRepairRuin(b, wall) == 0 || BdByteAtOr0(b, kBDestroyed) != 0) return -1;
+    return BdRepairFinish(b, complete, progress);
+}
+/* T-36 fold 1: BdRepairWhole's writes after the ruin reset - the row's completion or progress - on a piece that is no longer a ruin;
+   also run alone by the owner's kept step when a reset the engine deferred (message 16) has landed. 1 = done, -2 = a write faulted */
+int BdRepairFinish(void* b, int complete, float progress)
+{
+    const int wall = BdIsWall(b);
+    BdSelfScope self;
     float lp = 0, ln = 0;
     int lc = 0, ld = 0, lx = 0;
     if (BdReadState(b, &lp, &ln, &lc, &ld, &lx) == 0) return -2;
@@ -11862,6 +14758,34 @@ int BdRemoveOne(const std::string& key, BdRemovePend& rp)
         }
         rp.nextTry = g_drainNo + kRetryGap;
         return 0;
+    }
+    {   /* T-1372 A2: the piece found by position already belongs to ANOTHER live row (a re-key's new key adopted it): never taken apart
+           for this key. T-1372 review fold 1: the REMOVE still ends ITS OWN row - the sender retired the key - so the row is marked removed
+           without any dismantle, as a row whose piece is already gone is (removed, dismantled, BdNoteRemoved: a copy row's '~c' entry is
+           marked REMOVED and retires after a later save; an own row's pp.build record is retired by BdSweepRemoved). Its live-key alias
+           goes first: left in place, the retired row would still claim the piece by that key and the holder's own later REMOVE would be
+           refused for it (K1 made at K2, PLACE K2 adopted, REMOVE K1 refused, REMOVE K2 refused forever). The holder row and the piece stay. */
+        std::string holder;
+        const int held = BdPieceHeldByOther(b, key, &holder);
+        if (held != coopbuild::kBuildRmHeldNone)
+        {
+            ++g_rmOtherRowRemove;
+            if (!r.liveKey.empty())
+            {
+                std::map<std::string, std::string>::iterator al = g_liveAlias.find(r.liveKey);
+                if (al != g_liveAlias.end() && al->second == key) g_liveAlias.erase(al);
+                std::map<std::string, BdCopyEnt>::iterator ce = g_copyList.find(key);
+                if (ce != g_copyList.end()) ce->second.aliasKey.clear();   /* the REMOVED mark must not spread to the alias entry of a piece another row holds */
+                r.liveKey.clear();
+            }
+            r.removed = 1; r.dismantled = 1;
+            BdNoteRemoved(key);
+            std::sprintf(line, "[BUILD] REMOVE %.63s refused - the piece it finds is row %.63s (%s); this key's own row is retired without a dismantle; removeRefusedOtherRow[remove,reconcile]=%lld,%lld",
+                         key.c_str(), holder.c_str(), held == coopbuild::kBuildRmHeldByKey ? "filed under the piece's own key" : "that row's live key",
+                         g_rmOtherRowRemove, g_rmOtherRowRecon);
+            BdLogRemove(line);
+            return 1;
+        }
     }
     float lp = 0, ln = 0;
     int lc = 0, ld = 0, lx = 0;
@@ -12017,6 +14941,7 @@ int BdTombSeenOwn(const std::string& key, const char* road)
 {
     std::map<std::string, BdTombInfo>::const_iterator ti = g_tombInfo.find(key);
     if (ti == g_tombInfo.end()) return 0;
+    if (g_tombKillLater.count(key) != 0) return 1;   /* T-1372 review fold (N2): put off to the next load - held, not registered */
     if (g_tombKillNo.count(key) != 0) return 0;   /* P14 fold 1: its removal was cancelled or given up in this world - the tombstone ends as before P14 */
     if (coopbuild::BuildTombSeenAct(ti->second.readBack, ti->second.tail, BdOwnLiveRow(key), BdPlacePending(key)) != coopbuild::kBuildTombKill) return 0;
     if (g_tombKill.find(key) != g_tombKill.end()) return 1;
@@ -12184,6 +15109,7 @@ int BdScanPiece(void* b, ::Faction* mine, long long gen0, int zoneScan)   /* T-2
                 {
                     kn->second.placeOk = 1;
                     for (int j = 0; j < 3; ++j) kn->second.placePos[j] = in[j];
+                    kn->second.placeMark = 1;   /* T-1372 */
                     for (int j = 0; j < 4; ++j) kn->second.placeRot[j] = lrot[j];
                     ++g_placeFromLiveRetried;
                     BdOwnDirty(1);
@@ -12658,8 +15584,8 @@ void BdOwnerChangeDrain()
    createBuilding give a piece no player owns the town's faction. Each copy row in the area is judged by
    coopbuild::BuildRebuildRestoreAct - furniture rows first, so a house restored after them finds its kept furniture already its
    owners': its live piece - found by its key (a copy's own key first), of the row's record - that now has no player's owner gets the
-   row's owner back through BdOwnerRestore (a house for sale with the purchase's world side, except: the doors are re-owned but not
-   opened, the interior step re-owns only pieces no player owns, and no furniture teardown), and the owner's last STATE goes on through
+   row's owner back through BdOwnerRestore (T-1430: a house coopbuild::BuildPurchaseApplyHere calls bought-here gets the whole purchase -
+   the teardown, the doors opened, the tail; the interior step re-owns only pieces no player owns), and the owner's last STATE goes on through
    the STATE road (BdApplyOne: the ruin or the repair, progress, materials - BuildRebuildRestoreState). A row whose owner's stand-in is
    not here marks its sector in g_rrNoOwnerZones. A row judged notMine / ambiguous / noOwner is counted once an area a load. A lone
    game has no copy rows, so nothing is done. Returns the rows not answerable yet; *waitKinds = what they wait for (kBuildRrWait*). */
@@ -12763,10 +15689,13 @@ int BdRebuildRestoreZone(int zsx, int zsy, int zc, int* waitKinds)
         if (act == coopbuild::kBuildRrNoOwner) { if (BdRrCountOnce(key, zc) != 0) ++g_rrNoOwner; if (zc >= 0) g_rrNoOwnerZones.insert(zc); continue; }
         static BdBuyFx fx;   /* MAIN THREAD; 2 KB - not on the stack */
         std::memset(&fx, 0, sizeof(fx));
-        fx.noOpen = 1; fx.interiorTownOnly = 1;
-        const int sale = (r.hostKey.empty() && BdIsForSaleOrigPod(live) == 1) ? 1 : 0;   /* the ENGINE's isForSale, as place-adopt asks it */
+        /* T-1430: the one decision, before the owner write - the row's stand-in owns it, the house here is no player's, the ENGINE says
+           for sale (as place-adopt asks it): the whole purchase (teardown, doors opened, tail); else the owner write alone */
+        const int sale = coopbuild::BuildPurchaseApplyHere(r.hostKey.empty() ? 0 : 1, want != 0 ? 1 : 0, BdOwnerIsPlayerSide(o), r.hostKey.empty() ? BdIsForSaleOrigPod(live) : 0, (o != want) ? 1 : 0);
+        const coopbuild::BuildPurchaseHerePlan php = coopbuild::BuildPurchaseHerePlanOf(sale);
+        BdPurchaseFxOf(&fx, php, "rebuild restore", key.c_str());
         const std::string before = BdFactionName(o);
-        const int wrote = BdOwnerRestore(live, o, want, sale, &fx);
+        const int wrote = BdOwnerRestore(live, o, want, php.worldSide, &fx);
         const int wall = BdIsWall(live);
         g_rrInteriorKept += fx.interiorKept;
         const char* st = "faulted";
@@ -12781,9 +15710,9 @@ int BdRebuildRestoreZone(int zsx, int zsy, int zc, int* waitKinds)
         if (g_rrLines >= kRrLineCap) { ++g_rrSuppressed; continue; }
         ++g_rrLines;
         char line[600];
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] rebuild restore key=%.63s owner '%.60s' -> '%.60s' state=%s wall=%d sale=%d residents=%s doors=%u (re-owned, not opened) interior=%u kept=%u",
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] rebuild restore key=%.63s owner '%.60s' -> '%.60s' state=%s wall=%d sale=%d residents=%s doors=%u (re-owned, %u open) teardown=%d removed=%u interior=%u kept=%u",
                     key.c_str(), before.c_str(), BdFactionName(BdOwnerPod(live)).c_str(), st, wall, sale,
-                    sale == 0 ? "not run" : (fx.res == 1 ? "moved" : (fx.res == 0 ? "none" : "SKIPPED or FAULTED")), fx.doorsN, fx.interiorN, fx.interiorKept);
+                    sale == 0 ? "not run" : (fx.res == 1 ? "moved" : (fx.res == 0 ? "none" : "SKIPPED or FAULTED")), fx.doorsN, fx.doorsOpened, fx.td, fx.tdRemoved, fx.interiorN, fx.interiorKept);
         DebugLog(std::string(line));
     }
     return notYet;
@@ -12935,8 +15864,24 @@ int PcaOwnStateQueue(const coopbuild::BuildMsg& st)
     std::map<std::string, BdStatePend>::iterator it = g_pendState.find(st.key);
     if (it == g_pendState.end() && (int)g_pendState.size() >= kPendCap) { ++g_stateDropped; return 0; }
     BdStatePend& s = g_pendState[st.key];
-    s.m = st; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0; s.ownRec = 1;
+    s.m = st; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0; s.ruinPutPend = 0; s.ruinPutVal = 0.0f; s.ownRec = 1;
+    if (st.groupStamp > g_gsClock) g_gsClock = st.groupStamp;   /* T-1408: the highest stamp seen here */
     return 1;
+}
+/* T-1408 fold 4 (F1256), MAIN THREAD: 1 = this own piece's state is not written out yet (pp.build row, piece record) - the shared record is
+   still to be applied over it here (piecerec::PieceOwnRowHold: its record's STATE queued, or its area loaded and its records not applied
+   on this link) */
+int BdOwnRowRecordWait(const std::string& key)
+{
+    const int linked = (!RoleIsSingle() && StoreRelayLinked() && StoreMySlot() >= 0) ? 1 : 0;   /* T-1408 fold 5: no slot - nothing applies on this link */
+    if (linked == 0) return 0;
+    const int c = PcrSecOfId(piecerec::MakePieceRecId(key));
+    const int inRange = (c >= 0 && c < coopbuild::kBuildZoneSectorCells) ? 1 : 0;
+    const int loaded = (inRange != 0 && g_bdZoneActiveNow[c] != 0) ? 1 : 0;
+    if (loaded == 0) return 0;
+    /* T-1408: a record's STATE of the piece, or of any piece of its wall group, waits and may still win over the group's live value */
+    const int newer = g_pendState.empty() ? 0 : BdGroupRecordWaits(BdGroupKeysOf(key));
+    return piecerec::PieceOwnRowHold(linked, loaded, newer, (inRange != 0 && g_pcaDone[c] != 0) ? 1 : 0);
 }
 /* an own piece under a removal mark of its own placement: the REMOVE road takes it down through the engine's own dismantle
    (BdRemoveOne, ownRec: the owner test is this game's player faction). 1 = queued */
@@ -13041,12 +15986,14 @@ int PcaApplyOne(const std::string& id, const PcrKept& k, int mySlot)
     if (own != 0 && writerMine == 0 && removed == 0 && body != 0) PcaHelpAcksTake(key, k.h.placement, st);   /* T-23 (step 4): the writer's helper numbers */
     int lookFound = 0, lookNone = 0;
     void* ownLive = 0;   /* T-1335: an own piece standing at its key */
+    void* recLive = 0;   /* T-1389: the piece the record meets (an own piece or a copy) */
     if ((own == 0 && copyRow != 0) || (own != 0 && ownRow != 0))
     {   /* a copy, or an own piece whose row outlived an unload: does it stand in the area as loaded now? */
         int fv = 0;
         void* live = BdFindPiece(key, row->second, &fv);
         lookFound = (live != 0) ? 1 : 0; lookNone = (live == 0 && fv == kObjKeyNone) ? 1 : 0;
         if (own != 0) ownLive = live;
+        recLive = live;
     }
     else if (own == 0 && removed != 0)
     {   /* another player's piece with no copy row here: does anything stand at its key (a piece the save brought back)? */
@@ -13055,6 +16002,11 @@ int PcaApplyOne(const std::string& id, const PcrKept& k, int mySlot)
         lookFound = (o != 0 && v == kObjKeyFound) ? 1 : 0; lookNone = (v == kObjKeyNone) ? 1 : 0;
     }
     const int present = piecerec::PieceApplyPresentLive(own, ownRow, copyRow, removed, lookFound, lookNone);
+    if (present == 1 && recLive != 0 && removed == 0 && body != 0 && row != g_reg.end())
+    {   /* T-1389: the record's 'finished' against a FRESH read of the live piece, before the apply below corrects it; then its check */
+        PcRecordMeetsLive(recLive, key, row->second, (int)st.complete, (int)st.destroyed, k.h.placement);
+        PcQueue(key, coopbuild::kPcRoadRecord);
+    }
     if (own != 0 && ownRow != 0 && removed == 0 && present == 1 && ownLive != 0   /* T-1335: this game's own record over its own piece, standing with the town's (or an NPC's) owner after an older area copy loaded */
         && BdOwnRestoreLive(ownLive, key, row->second.sid, row->second.hostKey.empty() ? 0 : 1, "record") > 0)
         row->second.owner = BdFactionName(BdOwnerPod(ownLive));
@@ -13127,7 +16079,7 @@ int PcaApplyOne(const std::string& id, const PcrKept& k, int mySlot)
         else
         {
             ++g_pcaNone; why = removed != 0 ? "a removal mark, and nothing stands or waits at the key" : "the standing piece already shows the record (or is at or past it)";
-            if (coopbuild::BuildHelpTailFromRecord(present == 1 ? copyRow : 0, own, removed, body, copyRow != 0 ? row->second.helpTailKnown : 1, k.h.placement, copyRow != 0 ? row->second.nonce : 0u) != 0)
+            if (coopbuild::BuildHelpTailFromRecord(present == 1 ? copyRow : 0, own, removed, body, copyRow != 0 ? BdRecTailKnown(row->second, st) : 1, k.h.placement, copyRow != 0 ? row->second.nonce : 0u) != 0)
                 BdHelpTailFromRecord(key, row->second, st);   /* T-23 fix: the record's STATE is the owner's - its help numbers, as a real STATE gives them */
         }
     }
@@ -13425,6 +16377,8 @@ void PieceRecApplyTick()
         g_pcaDone[c] = 1;
         PcaApplyArea(c, me);
         TlOwnAreaApplied(c);   /* T-1047 step 5 fold 2: its own pieces' outpost links checked once (an event, not a sweep) */
+        BdWallJoinArea(c, "load");   /* T-1408 fold 13: the area's records are applied - its walls joined by their owner's group facts */
+        if (g_ownRowsHeldNow > 0) BdOwnDirty(1);   /* T-1408 fold 4: pp.build rows held for this apply are looked at again */
         DoorsRecAreaLay(c);   /* the area's record list is complete: its world doors are laid from their records (doors.cpp) */
         TbAreaLay(c);   /* T-1333: and its town buildings from theirs - records over the area file (T-1175's order) */
         g_pcaSeen[c] = 1;   /* a later apply in this world (an arrival, a reconnect, a reload) is not the first since the load */
@@ -13458,7 +16412,10 @@ void BdZoneScanTick()
     const int n = ActiveZoneSectors(sx, sy, 64);
     if (n < 0) { ++g_zsRefused; return; }   /* the zone list would not read: nothing cleared, asked again next tick */
     if (n == 64) ++g_zsListFull;   /* T-274 fold (LOW-3): the list filled its 64 entries - more active zones may have been cut */
-    coopbuild::BuildZoneScanClearGone(g_bdZoneScanned, g_bdZoneMoves, g_bdZoneActiveNow, sx, sy, n);
+    const int zsGone = coopbuild::BuildZoneScanClearGone(g_bdZoneScanned, g_bdZoneMoves, g_bdZoneActiveNow, sx, sy, n);
+    if (zsGone > 0 && !g_helpIn.empty()) BdHelpWallWake(coopbuild::kBuildWakeAreaLeft, "an area left here");   /* T-1408 fold 2 */
+    if (zsGone > 0) BdWgLeadPassesAll("area left");   /* T-1408 fold 13e: a member waited for in an area that left is not waited for any more */
+    BdWalkWaitZonesNow(g_bdZoneActiveNow);   /* T-1428 fold 1 (review 5): an area that left here ends its walk-map waits - every role, a lone game too */
     PieceRecZonesNow(g_bdZoneActiveNow);   /* an area that left here: its moved pieces' records are written (build stopped) */
     BdRrWakeTick(sx, sy, n);   /* T-492: the restore's waiting areas whose event came are walked again */
     for (int i = 0; i < n; ++i)
@@ -13482,6 +16439,7 @@ void BdZoneScanTick()
     if (coopbuild::BuildZoneScanDone(g_bdZoneScanned, g_bdZoneMoves, sx[pick], sy[pick], moved) != 0)
     {
         ++g_zsGaveUp;   /* T-274 fold (LOW-2): marked after kBuildZoneScanGiveUp moved walks in a row */
+        if (!g_helpIn.empty()) BdHelpWallWake(coopbuild::kBuildWakeAreaLaid, "an area's walk ended (given up)");   /* T-1408 fold 2 */
         BdRebuildRestoreArea(sx[pick], sy[pick]);   /* T-492: the restore looks rows up by key, not through this walk's list - it runs for a given-up area too */
         if (g_zsLines < kZoneScanLineCap)
         {
@@ -13495,6 +16453,9 @@ void BdZoneScanTick()
     }
     if (moved != 0) return;   /* counted in g_zsWalkMoved; walked again on its turn (round-robin) unless it was given up */
     ++g_zsZones;
+    DoorsRecAreaLoaded(g_bdZoneLastPick);   /* T-1400 review 1: an area with owed door keys - looked up by key now its zone has loaded */
+    if (!g_helpIn.empty()) BdHelpWallWake(coopbuild::kBuildWakeAreaLaid, "an area's pieces were laid here");   /* T-1408 fold 2: the event that can make a group whole */
+    BdWallJoinArea(g_bdZoneLastPick, "load");   /* T-1408 fold 13: the area's walls joined by their owner's group facts */
     PcQueueArea(sx[pick], sy[pick]);   /* T-988: the area's finished player pieces are checked once its load settles */
     if (!g_pcaLookAgain.empty()) PcaLookAgainArea(g_bdZoneLastPick, piecerec::kPlEvWalk);   /* the area's walk finished: its unfinished searches are asked again */
     BdRebuildRestoreArea(sx[pick], sy[pick]);   /* T-492: a kept piece the area's fresh flag gave the town gets its row's owner and state back */
@@ -13633,7 +16594,7 @@ void BdTombQueue(const char* why, int verifyOnly)
                 const int inZone = (g_tombVerifyZone >= 0 && BdTombZone(key, ti, 0, 0) == g_tombVerifyZone) ? 1 : 0;
                 if ((pass == 0 ? 1 : 0) != inZone) continue;
                 if (BdOwnLiveRow(key) != 0 || BdPlacePending(key) != 0) continue;   /* dropped below, no lookup */
-                if (g_tombKill.find(key) != g_tombKill.end()) continue;   /* P14: its removal is queued - held below, no lookup */
+                if (g_tombKill.find(key) != g_tombKill.end() || g_tombKillLater.count(key) != 0) continue;   /* P14: its removal is queued (or put off to the next load) - held below, no lookup */
                 int looked = 0;
                 const int vv = BdTombVerify(key, ti, budget > 0 ? 1 : 0, &looked);
                 if (looked > 0) { --budget; if (pass != 0) g_tombVerifyCursor = (i + 1) % nt; }
@@ -13653,13 +16614,14 @@ void BdTombQueue(const char* why, int verifyOnly)
         const int pend = BdPlacePending(key);
         if (seen.count(key) != 0) ownHere = 1;   /* P87 fold 2: the lookup above found an own piece at the key */
         const int act = coopbuild::BuildTombSendAct(ti.readBack, ti.verified, ownHere, pend);
-        if (act != coopbuild::kBuildTombDrop && g_tombKill.find(key) != g_tombKill.end()) { ++i; ++h; continue; }   /* P14: the removal first - held */
+        if (act != coopbuild::kBuildTombDrop && (g_tombKill.find(key) != g_tombKill.end() || g_tombKillLater.count(key) != 0)) { ++i; ++h; continue; }   /* P14: the removal first - held */
         if (act == coopbuild::kBuildTombDrop)
         {
             g_tombRetire.push_back(coopbuild::BuildTombRowKey(key));
             g_tomb.erase(g_tomb.begin() + (std::ptrdiff_t)i);
             g_tombInfo.erase(key);
             g_tombKill.erase(key);   /* P14: a new placement at the key - nothing to remove */
+            g_tombKillLater.erase(key);
             if (coopbuild::BuildOweRemoveDrop(&g_dmOweRemove, key) != 0) ++g_tombUnowed;   /* P87 fold 1: a REMOVE queued earlier never goes */
             ++d; ++g_tombDropListed;
             BdOwnDirty(2);
@@ -13820,6 +16782,73 @@ void BdP14MatsBack(void* b, int found, const BdTombKill& kl)
     if (act == coopbuild::kBuildTombMatsZero) { float s = 0.0f; if (BdMatsSumZero(b, 1, &s) >= 0) ++g_p14MatsZeroBack; }
     else if (kl.wall == 0) ++g_p14MatsLeft;
 }
+/* T-1372 review fold (B1): MAIN THREAD - is a resolved interior entry this game's own piece, safe for the panel's teardown (which
+   reads no owner)? 0 = own; 1 = not (*why set): another owner (RootObjectBase owner slot, every type), or for a building piece no key,
+   a listed copy (another game's), or a registry row that is not this game's own (a copy row or another player's). */
+int BdPanelEntryForeign(void* pc, int building, void* mine, const char** why)
+{
+    void* o = 0;
+    if (BdOwnerReadPod(pc, &o) == 0 || o != mine) { *why = "its owner is not this game's player faction"; return 1; }
+    if (building == 0) return 0;
+    char k[kKeyCap];
+    k[0] = 0;
+    if (ObjectPositionKey(pc, k, kKeyCap, "", 3, 1) == 0) { *why = "its key does not read"; return 1; }
+    std::string lk;
+    if (BdCopyListFind(std::string(k), &lk) != 0) { *why = "it is in this game's copy list (another game's copy)"; return 1; }
+    std::map<std::string, BdReg>::const_iterator r = g_reg.find(std::string(k));
+    if (r == g_reg.end()) r = BdRowByLiveKey(std::string(k));
+    if (r != g_reg.end() && (r->second.own == 0 || r->second.via == 3)) { *why = "a registry row names it as another player's piece"; return 1; }
+    return 0;
+}
+/* T-1372 review fold (B1): MAIN THREAD - both interior sets of house b read whole (the first +0xE8 by InteriorPieceIds, the second +0x128
+   by BdTdSet2Pod - 0x54EA40 empties both, decomp_54ea40 :47-139) with no zone teardown during the read; *ready 1 = whole. Every
+   resolved entry judged (BdPanelEntryForeign); a second-set entry that does not resolve counts foreign (the engine destroys it all the
+   same, :137). Returns the foreign count (first reason in *why); *n1 / *n2 the entries read. */
+int BdPanelInnerRead(void* b, void* mine, int* ready, int* n1, int* n2, int* listed1, int* listed2, const char** why)
+{
+    *why = "";
+    const long long g0 = BoxWalkGen();
+    int cut = 0, torn = 0, cut2 = 0;
+    *n1 = InteriorPieceIds(b, g_bdIds, kBdInteriorCap, listed1, &cut, &torn);
+    *n2 = BdTdSet2Pod(b, g_tdS2, kBdInteriorCap, listed2, &cut2);
+    *ready = (*listed1 >= 0 && cut == 0 && torn == 0 && *n1 == *listed1 && *listed2 >= 0 && cut2 == 0 && *n2 == *listed2 && BoxWalkGen() == g0) ? 1 : 0;
+    if (*ready == 0) return 0;
+    int foreign = 0;
+    for (int i = 0; i < *n1; ++i)
+    {
+        const unsigned int* f = g_bdIds + (size_t)i * 5;
+        void* pc = BdTdResolve(f);
+        if (pc == 0) continue;   /* an entry that does not resolve is only dropped from the set by the engine (:51-61) */
+        const char* w = "";
+        if (BdPanelEntryForeign(pc, f[0] == 0 ? 1 : 0, mine, &w) != 0) { if (foreign == 0) *why = w; ++foreign; }
+    }
+    for (int i = 0; i < *n2; ++i)
+    {
+        void* const p = g_tdS2[i];
+        unsigned int ids[5] = { 0, 0, 0, 0, 0 };
+        void* const pc = (p != 0 && ObjectHandIds(p, ids) != 0 && BdTdResolve(ids) == p) ? p : 0;
+        const char* w = "a second-set entry that does not resolve";
+        if (pc == 0 || BdPanelEntryForeign(pc, ids[0] == 0 ? 1 : 0, mine, &w) != 0) { if (foreign == 0) *why = w; ++foreign; }
+    }
+    if (BoxWalkGen() != g0) *ready = 0;
+    return foreign;
+}
+/* T-1372 review fold (F2) + re-check: MAIN THREAD - a furniture tombstone of house hostKey still to settle (coopbuild::BuildTombFurnBlocks):
+   queued, or read back and not yet verified absent (the walk may not have reached it); its host key exact or near (BoxKeyNearKey) */
+int BdTombFurnPending(const std::string& hostKey)
+{
+    for (std::map<std::string, BdTombInfo>::const_iterator ti = g_tombInfo.begin(); ti != g_tombInfo.end(); ++ti)
+    {
+        if (ti->second.furn == 0 || ti->first == hostKey) continue;
+        const std::string& hk = ti->second.hostKey;
+        const int exact = (hk == hostKey) ? 1 : 0;
+        const int nearK = (exact == 0 && !hk.empty() && BoxKeyNearKey(hk.c_str(), hostKey.c_str()) != 0) ? 1 : 0;
+        const int queued = (g_tombKill.find(ti->first) != g_tombKill.end()) ? 1 : 0;
+        const int settled = (g_tombKillNo.count(ti->first) != 0 || g_tombKillLater.count(ti->first) != 0) ? 1 : 0;
+        if (coopbuild::BuildTombFurnBlocks(1, exact, nearK, queued, ti->second.readBack, ti->second.verified, settled) != 0) return 1;
+    }
+    return 0;
+}
 /* P14 (mmo8b, mmo8-buildings-read.md 4b), K2 SAFE POINT (BuildCopyDrain; link or not - no stand-in needed): the queued removals. The
    key is looked up again every time (never a kept pointer): free-standing by ObjectByPositionKey, furniture in its host (the exact key,
    then ItBoxResolve's window - BdTombNearOwnInHost). Only while the key's zone is loaded NOW (ZoneMap+0xB1), only THIS game's own piece
@@ -13860,6 +16889,8 @@ void BdTombKillDrain()
         const int zoneLoaded = (BdTombZone(key, tinfo, &sx, &sy) >= 0 && ZoneLoadedSectorTri(sx, sy) == 1) ? 1 : 0;
         void* b = 0;
         int look = 2, own = 0, listed = 0, dism = 0, exact = 0, named = 0, inner = 0;   /* P14 fold 1: + the found piece's key / row / interior */
+        int innerReady = 0, innerListed = -1, innerN = 0, innerListed2 = -1, innerN2 = 0, innerForeign = 0, furnPend = 0;   /* T-1372 attempt 2 + review fold: both interior sets, read whole and judged */
+        const char* foreignWhy = "";
         std::string foundKey;
         if (zoneLoaded != 0)
         {
@@ -13908,9 +16939,17 @@ void BdTombKillDrain()
                 }
                 else if (look == 1) look = 2;   /* its key unreadable: not settled */
                 inner = (look == 1 && BdPtrAt(b, kBInterior) != 0) ? 1 : 0;   /* F4 */
+                if (inner != 0 && kl.tries == 0)
+                {   /* T-1372 attempt 2 + review fold (B1, F2): the panel's teardown walks both interior sets and reads no owner - it is called
+                       only once both read whole here with every resolved entry this game's own, and no furniture removal waits on this house */
+                    furnPend = BdTombFurnPending(key);
+                    innerForeign = BdPanelInnerRead(b, (void*)mine, &innerReady, &innerN, &innerN2, &innerListed, &innerListed2, &foreignWhy);
+                }
             }
         }
-        const int step = coopbuild::BuildTombKillStep(zoneLoaded, look, own, listed, dism, kl.tries, kl.misses, kRemoveTries, exact, named, inner);
+        const int step = coopbuild::BuildTombKillStep(zoneLoaded, look, own, listed, dism, kl.tries, kl.misses, kRemoveTries, exact, named, inner,
+                                                      kBdConfirmDismantleRva != 0 ? 1 : 0, innerReady, innerForeign != 0 ? 1 : 0, furnPend);
+        const int innerGate = (zoneLoaded != 0 && look == 1 && dism == 0 && inner != 0 && kl.tries == 0 && (innerReady == 0 || furnPend != 0)) ? 1 : 0;
         if (step == coopbuild::kBuildTombKillWait)
         {
             if (zoneLoaded != 0 && look == 1 && dism != 0 && kl.tries > 0)
@@ -13927,7 +16966,33 @@ void BdTombKillDrain()
             kl.nextTry = g_drainNo + kRetryGap;
             continue;
         }
-        if (step == coopbuild::kBuildTombKillMiss) { ++kl.misses; kl.nextTry = g_drainNo + kRetryGap; continue; }
+        if (step == coopbuild::kBuildTombKillMiss)
+        {
+            if (innerGate != 0 && furnPend != 0)
+            {   /* review fold F2 + re-check: a furniture tombstone of this house still to settle - removed first (its own refund); a counted miss */
+                ++g_p14FurnWait;
+                if (kl.innerLogged == 0)
+                {
+                    kl.innerLogged = 1;
+                    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: a furniture tombstone of this house is still to settle - the panel removal waits for it"
+                                " (its own refund first; miss %d of %d); p14FurnWait=%lld", key.c_str(), kl.misses + 1, kRemoveTries, g_p14FurnWait);
+                    BdLogP14(line);
+                }
+            }
+            else if (innerGate != 0)
+            {   /* T-1372 attempt 2: a house whose interior sets did not read whole - not called yet (a counted miss) */
+                ++g_p14InnerMiss;
+                if (kl.innerLogged < 2)
+                {
+                    kl.innerLogged = 2;
+                    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: the save's piece has an interior whose piece sets did not read whole"
+                                " (first set listed=%d read=%d, second set listed=%d read=%d) - the panel removal waits (miss %d of %d); p14InnerMiss=%lld",
+                                key.c_str(), innerListed, innerN, innerListed2, innerN2, kl.misses + 1, kRemoveTries, g_p14InnerMiss);
+                    BdLogP14(line);
+                }
+            }
+            ++kl.misses; kl.nextTry = g_drainNo + kRetryGap; continue;
+        }
         if (step == coopbuild::kBuildTombKillDone)
         {
             if (kl.tries > 0) ++g_p14Removed; else ++g_p14Gone;
@@ -13972,6 +17037,29 @@ void BdTombKillDrain()
             BdP14Rescan(key, tinfo);
             continue;
         }
+        if (step == coopbuild::kBuildTombKillForeign)
+        {   /* review fold B1: the panel's teardown would destroy a piece that is not this game's own - left standing as before (Exclude) */
+            ++g_p14Interior; ++g_p14Foreign;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s NOT removed: %d of its %d + %d interior entries are not this game's own (first: %s) - the panel's"
+                        " teardown reads no owner; left standing as before P14 (leftover); p14Foreign=%lld p14Interior=%lld",
+                        key.c_str(), innerForeign, innerN, innerN2, foreignWhy, g_p14Foreign, g_p14Interior);
+            BdLogP14(line);
+            g_tombKill.erase(it);
+            BdTombDrop(key, "P14: the save's piece holds another player's piece - left standing", 1);
+            BdP14Rescan(key, tinfo);
+            continue;
+        }
+        if (step == coopbuild::kBuildTombKillGiveUp && innerGate != 0)
+        {   /* review fold N2: the interior never read whole in this world - the tombstone is KEPT and the removal put off to the next load */
+            ++g_p14GaveUp; ++g_p14Later;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: %s in %d looks - the removal is put off to the NEXT load"
+                        " (the tombstone kept, the piece not registered here); p14Later=%lld p14GaveUp=%lld", key.c_str(),
+                        furnPend != 0 ? "a furniture tombstone of it never settled" : "its interior never read whole", kl.misses + 1, g_p14Later, g_p14GaveUp);
+            BdLogP14(line);
+            g_tombKill.erase(it);
+            g_tombKillLater.insert(key);
+            continue;
+        }
         if (step == coopbuild::kBuildTombKillGiveUp)
         {
             ++g_p14GaveUp;
@@ -13984,7 +17072,7 @@ void BdTombKillDrain()
             BdP14Rescan(key, tinfo);   /* P14 fold 1 (F5): the piece is registered by the scan again */
             continue;
         }
-        /* kBuildTombKillCall - P14 fold 1 (manager decision 2026-09-30): the engine's refund drops again, less the escape ledger: each
+        /* kBuildTombKillCall / kBuildTombKillPanel (T-1372 attempt 2) - P14 fold 1 (manager decision 2026-09-30): the engine's refund drops again, less the escape ledger: each
            material slot keeps at most the first drop's quantity less the counted escapes (BdMatsLedgerApply) - a wall run's shared
            state is never refunded (0x29DBD0), only read */
         const int wall = BdIsWall(b);
@@ -14033,8 +17121,14 @@ void BdTombKillDrain()
         }
         const long long rf0 = g_refundSeen;
         int ret = -1;
+        /* T-1372 attempt 2: a house with an interior, first call - the panel's confirmDismantle 0x54F410 (decomp_54f410 :15-50): the
+           interior's pieces through 0x54EA40(interior, 1) (GameWorld::destroy, no refund - the contents of its boxes are lost, as the
+           game's own panel warns), then the SAME vt+0x248(FLT_MAX) as the bare call (its one refund 0x29DBD0, from the mats reduced
+           above), then the mounted pieces. A retry is the bare dismantle, as for any piece. */
+        const int panel = (step == coopbuild::kBuildTombKillPanel) ? 1 : 0;
         BdWalkMapNote(b, coopbuild::kWmRemoved, 0);   /* T-1294 design A */
-        const int ok = BdDismantlePod(b, kl.tries == 0 ? FLT_MAX : kRemoveRetryAmount, &ret);
+        const int ok = (panel != 0) ? BdConfirmDismantlePod(b) : BdDismantlePod(b, kl.tries == 0 ? FLT_MAX : kRemoveRetryAmount, &ret);
+        if (panel != 0) { kl.panel = 1; ++g_p14Panel; }
         ++kl.tries;
         ++g_p14Calls;
         if (g_refundSeen - rf0 > 0) kl.refunded += g_refundSeen - rf0;   /* P14 fold 2 (D4): this call's refund fired */
@@ -14042,6 +17136,16 @@ void BdTombKillDrain()
         {   /* P14 fold 1 (F6): a faulted vt+0x248 is not called again */
             ++g_p14Faulted; ++g_p14GaveUp;
             BdP14MatsBack(b, 1, kl);   /* P14 fold 3 (D7): the piece stays - 0 once a refund fired, else the ledger-reduced mats stay */
+            if (panel != 0)
+            {   /* review fold N2: a fault part-way (the interior may be gone, the house standing) - the tombstone is KEPT, the removal put off to the next load */
+                ++g_p14Later;
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: the panel's confirmDismantle FAULTED (try %d) - not called again in this world; the removal is put off to"
+                            " the NEXT load (the tombstone kept, the piece not registered here); p14Faulted=%lld p14Later=%lld", key.c_str(), kl.tries, g_p14Faulted, g_p14Later);
+                BdLogP14(line);
+                g_tombKill.erase(it);
+                g_tombKillLater.insert(key);
+                continue;
+            }
             _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: vt+0x248 FAULTED (try %d) - removal GIVEN UP, the save's piece stays and the tombstone ends; p14Faulted=%lld",
                         key.c_str(), kl.tries, g_p14Faulted);
             BdLogP14(line);
@@ -14056,25 +17160,36 @@ void BdTombKillDrain()
         if (stOk != 0) ad = BdDismOf(b, ad);
         BdMatsSumZero(b, 0, &after);
         kl.nextTry = g_drainNo + 1;   /* the next safe point looks again: freed = done */
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: the save's own piece dismantled here (try %d) wall=%d mats(%d) %.1f -> %.1f"
-                    " refundCalls=%lld dismantled=%d returned=%d - its refund drops again less the escape ledger", key.c_str(),
-                    kl.tries, wall, nz, before, after, g_refundSeen - rf0, stOk != 0 ? ad : -1, ret);
+        if (panel != 0)
+        {   /* review fold N4: what the sets held before the call and what they hold after it (-1 not read) - never a count assumed deleted */
+            int l1 = -1, l2 = -1, a1 = 0, a2 = 0, aRd = 0;
+            const char* aw = "";
+            BdPanelInnerRead(b, (void*)mine, &aRd, &a1, &a2, &l1, &l2, &aw);
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: the save's own piece WITH AN INTERIOR removed the panel way (confirmDismantle, try %d):"
+                        " interior entries before %d + %d, after %d + %d (their contents lost, as the game's panel warns), mats(%d) %.1f -> %.1f refundCalls=%lld dismantled=%d"
+                        " - its refund drops again less the escape ledger; p14Panel=%lld", key.c_str(),
+                        kl.tries, innerN, innerN2, l1, l2, nz, before, after, g_refundSeen - rf0, stOk != 0 ? ad : -1, g_p14Panel);
+        }
+        else
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] P14 tombstone key=%.63s: the save's own piece dismantled here (try %d) wall=%d mats(%d) %.1f -> %.1f"
+                        " refundCalls=%lld dismantled=%d returned=%d - its refund drops again less the escape ledger", key.c_str(),
+                        kl.tries, wall, nz, before, after, g_refundSeen - rf0, stOk != 0 ? ad : -1, ret);
         BdLogP14(line);
     }
 }
 std::string BdP14Text()
 {
-    char b[1400];
+    char b[1600];
     long long hc[5] = { 0, 0, 0, 0, 0 };
     GroundPickHoldCounts(hc);   /* P14 fold 2 (D5/D8) */
     _snprintf_s(b, sizeof(b), _TRUNCATE, " p14[pending=%u,queued=%lld,removed=%lld,gone=%lld,cancelled=%lld,gaveUp=%lld,calls=%lld,faulted=%lld,matsLedgered=%lld,"
-                "keyMismatch=%lld,interior=%lld,waits=%lld,rescans=%lld,nearPlaced=%lld,lines=%lld,suppressed=%lld,retryZeroed=%lld,matsLeft=%lld,matsZeroBack=%lld]"
+                "keyMismatch=%lld,interior=%lld,waits=%lld,rescans=%lld,nearPlaced=%lld,lines=%lld,suppressed=%lld,retryZeroed=%lld,matsLeft=%lld,matsZeroBack=%lld,panel=%lld,innerMiss=%lld,foreign=%lld,furnWait=%lld,later=%lld]"
                 " ledger[refund=%lld,noPiece=%lld,missed=%lld,spill=%lld,escOwn=%lld,escPeer=%lld,escNoRec=%lld,escFull=%lld,escOver=%lld,writeNow=%lld,writeLate=%lld,"
                 "read=%lld,unkept=%lld,counted=%lld,peerCounted=%lld,notCounted=%lld,noSid=%lld,lines=%lld,suppressed=%lld,unkeyed=%lld,matEsc=%lld,merged=%lld,blind=%lld,"
                 "pruned=%lld,keptRefuse=%lld,refused=%lld,handRetry=%lld,holdExpired=%lld,holdNoSlot=%lld,holdParked=%lld,holdParkHanded=%lld,holdParkExpired=%lld,"
                 "refuseAll=%lld,spillBlind=%lld,zoneUnread=%lld,matShared=%lld,matsUnread=%lld,escHolder=%lld,holderCounted=%lld]",
                 (unsigned int)g_tombKill.size(), g_p14Queued, g_p14Removed, g_p14Gone, g_p14Cancelled, g_p14GaveUp, g_p14Calls, g_p14Faulted, g_p14MatsZeroed,
-                g_p14KeyMismatch, g_p14Interior, g_p14Waits, g_p14Rescans, g_p14NearPlaced, g_p14Lines, g_p14Suppressed, g_p14RetryZeroed, g_p14MatsLeft, g_p14MatsZeroBack,
+                g_p14KeyMismatch, g_p14Interior, g_p14Waits, g_p14Rescans, g_p14NearPlaced, g_p14Lines, g_p14Suppressed, g_p14RetryZeroed, g_p14MatsLeft, g_p14MatsZeroBack, g_p14Panel, g_p14InnerMiss, g_p14Foreign, g_p14FurnWait, g_p14Later,
                 g_ledRefund, g_ledRefundNoPiece, g_ledMissed, g_ledSpill, g_ledEscOwn, g_ledEscPeer, g_ledEscNoRec, g_ledEscFull, g_ledEscOver, g_ledWriteNow, g_ledWriteLate,
                 g_ledRead, g_ledUnkept, g_ledCounted, g_ledPeerCounted, g_ledNotCounted, g_ledNoSid, g_ledLines, g_ledSuppressed, g_ledUnkeyed, g_ledMatEsc, g_ledEscMerged,
                 g_ledBlind, g_ledPruned, g_ledKeptRefuse, g_ledRefused, g_ledHandRetry, hc[0], hc[1], hc[2], hc[3], hc[4], g_ledRefuseAll, g_ledSpillBlind,
@@ -14144,7 +17259,17 @@ void BdReconDrain()
             ++it;
             continue;
         }
-        if (act == coopbuild::kBuildReconRemove)
+        std::string holder;   /* T-1372 A2: the piece the unlisted key resolves by position may be another live row's (a re-key's new key) */
+        const int held = (act == coopbuild::kBuildReconRemove) ? BdPieceHeldByOther(live, key, &holder) : coopbuild::kBuildRmHeldNone;
+        if (held != coopbuild::kBuildRmHeldNone)
+        {
+            ++g_rmOtherRowRecon;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] REMOVE %.63s refused - the piece it finds is row %.63s (%s; the reconcile takes no copy row for it); removeRefusedOtherRow[remove,reconcile]=%lld,%lld",
+                        key.c_str(), holder.c_str(), held == coopbuild::kBuildRmHeldByKey ? "filed under the piece's own key" : "that row's live key",
+                        g_rmOtherRowRemove, g_rmOtherRowRecon);
+            BdLogP87(line);
+        }
+        else if (act == coopbuild::kBuildReconRemove)
         {
             if ((int)g_reg.size() >= kRegCap) { ++g_regFull; rc.nextTry = g_drainNo + kRetryGap; ++it; continue; }
             char sid[160];
@@ -14271,6 +17396,7 @@ int BdRosterOne(const std::string& key, int to)   /* [m11c2f1-1] to: the one slo
     m.kind = coopbuild::kBuildPlace;
     m.key = key; m.sid = r.sid;
     for (int i = 0; i < 3; ++i) m.pos[i] = r.placePos[i];
+    m.groundMark = (unsigned char)(r.placeMark != 0 ? 1 : 0);   /* T-1372 */
     for (int i = 0; i < 4; ++i) m.rot[i] = r.placeRot[i];
     m.complete = (unsigned char)(c != 0 ? 1 : 0);
     m.progress = p; m.needed = nd;
@@ -14498,8 +17624,255 @@ void BdRosterTick()
 }
 
 } // namespace
+/* ===== T-1372 (H-T1372-removal, F1037): AN OWN BUILDING THE ENGINE ENDS FOR GOOD STAYS REMOVED =====
+   GameWorld::destroy's own reason decides (coopbuild::BuildEngineDestroyDecide, buildwire.h): the Level Editor's delete ("Level
+   Editor", and every flag-0 destroy of a building inside that call on its thread - the interior's furniture goes through
+   "_destroyAllInternalBuildings") and the building panel's confirm ("Building::confirmDismantle", the pieces it takes with the
+   dismantled one) mark the piece's row removed as a finished dismantle does (BdSendRemove, reason 1 - the receiver ignores 2); the
+   door records go as on the dismantle road. Any other flag-0 reason that ends an own, not-removed piece is logged (capped) and never
+   marked: that is how another road (a plugin's delete) shows itself. The scope: the editor's delete 0x776D60 is hooked
+   (detour_editorDelete) and counts its depth with its thread. */
+typedef void (*BdEditorDeleteFn)(void* editor, void* selected);
+static BdEditorDeleteFn orig_editorDelete = 0;
+static int g_hkEditorDelete = 0;
+static volatile LONG g_edDelDepth = 0;
+static volatile LONG g_edDelTid = 0;
+static volatile LONGLONG g_edDelRuns = 0, g_engRmQueued = 0, g_engRmOtherQueued = 0, g_engRmOtherCapped = 0, g_engRmOffMain = 0, g_engRmReasonFault = 0;
+static volatile LONGLONG g_engRmDeferred = 0, g_engRmDeferTaken = 0, g_engRmSlotFull = 0, g_engRmNotDestroyed = 0;
+static volatile LONG g_engRmPostLive = 0;   /* postponed captures held now (state 3): the destroy note scans the slots only while one is */
+static volatile LONGLONG g_engRmPostFreed = 0, g_engRmPostAged = 0;   /* re-check fold F: postponed captures dropped (an unload, another object at the address), aged out */
+static volatile LONG g_engRmLock = 0;       /* re-check fold N3: one spin lock over every move into or out of state 3 (memory only, no engine call inside) */
+static volatile LONG g_engRmOtherPending = 0;   /* re-check fold N2: log-only events queued since BuildTick's last drain */
+static const LONG kEngRmOtherPerTick = 16;      /* at most this many of the 512-entry queue's places between two drains */
+static long long g_engRmMarked = 0, g_engRmSkipped = 0, g_engRmLost = 0, g_engRmOtherOwn = 0, g_engRmLever = 0;
+static int g_engRmOtherLines = 0;
+static const int kEngRmOtherLineCap = 20;
+/* T-1372 review fold 4: the log-only events of OWN rows are counted at BuildTick; past this many in a game life the destroy note stops
+   queuing log-only events at all (the queue serves progress too). Other players' copies and town buildings never count toward it. */
+static const long long kEngRmOtherQueueCap = 200;
+static volatile LONG g_engRmOtherStop = 0;
+/* T-1372 review folds 2 + 3: the capture slots. 0 free; 1 captured (between the note and the engine's answer, the noting thread's own);
+   2 queued with door keys (BuildTick takes the keys and frees it); 3 postponed (a for-good capture whose destroy the engine queued -
+   kept until the same object's destroy completes, or taken back when every slot is in use). */
+struct BdEngRmSlot { volatile LONG state; void* obj; DWORD postT; BdEvent e; DoorsPieceKeys dk; };
+static const int kEngRmSlots = 32;
+static BdEngRmSlot g_engRmSlot[kEngRmSlots];
+static void BdEngRmLockTake() { while (::InterlockedCompareExchange(&g_engRmLock, 1, 0) != 0) ::SwitchToThread(); }
+static void BdEngRmLockGive() { ::InterlockedExchange(&g_engRmLock, 0); }
+/* ANY THREAD: under the one lock, every postponed capture past its age is freed, and obj's (if any) is taken (state 1). 1 + its slot, 0
+   none; *ageMs = how long it was postponed. Nothing is flipped and put back, so no other thread can miss its own slot meanwhile. */
+static int BdEngRmPostponed(void* obj, unsigned long* ageMs)
+{
+    int found = 0;
+    const DWORD now = ::GetTickCount();
+    BdEngRmLockTake();
+    for (int i = 0; i < kEngRmSlots; ++i)
+    {
+        BdEngRmSlot& s = g_engRmSlot[i];
+        if (s.state != 3) continue;
+        const unsigned long age = (unsigned long)(now - s.postT);
+        if (found == 0 && s.obj == obj) { s.state = 1; *ageMs = age; found = i + 1; ::InterlockedDecrement(&g_engRmPostLive); continue; }
+        if (age > coopbuild::kBuildEngPostMaxMs) { s.state = 0; ::InterlockedDecrement(&g_engRmPostLive); ::InterlockedIncrement64(&g_engRmPostAged); }
+    }
+    BdEngRmLockGive();
+    return found;
+}
+static int BdEngRmClaim()   /* ANY THREAD: 1 + a free slot (now held), 0 none */
+{
+    for (int i = 0; i < kEngRmSlots; ++i)
+        if (::InterlockedCompareExchange(&g_engRmSlot[i].state, 1, 0) == 0) return i + 1;
+    int got = 0;
+    BdEngRmLockTake();   /* every slot in use: a postponed capture is given up (counted) */
+    for (int i = 0; i < kEngRmSlots && got == 0; ++i)
+        if (g_engRmSlot[i].state == 3) { g_engRmSlot[i].state = 1; ::InterlockedDecrement(&g_engRmPostLive); got = i + 1; }
+    BdEngRmLockGive();
+    ::InterlockedIncrement64(&g_engRmSlotFull);
+    return got;
+}
+/* MAIN THREAD (the editor's frame update): the delete runs with its depth raised; __finally lowers it whatever the call does */
+static void detour_editorDelete(void* editor, void* selected)
+{
+    ::InterlockedIncrement64(&g_edDelRuns);
+    if (::InterlockedCompareExchange(&g_edDelDepth, 0, 0) == 0) ::InterlockedExchange(&g_edDelTid, (LONG)::GetCurrentThreadId());
+    ::InterlockedIncrement(&g_edDelDepth);
+    __try { orig_editorDelete(editor, selected); }
+    __finally { ::InterlockedDecrement(&g_edDelDepth); }
+}
+static int BdReasonCopyPod(const char* r, char* out, int cap)   /* 1 copied, 0 no reason, -1 faulted */
+{
+    out[0] = 0;
+    if (r == 0) return 0;
+    __try
+    {
+        int i = 0;
+        for (; i < cap - 1 && r[i] != 0; ++i) out[i] = r[i];
+        out[i] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return -1; }
+}
+static int BdObjTypePod(void* o)   /* the object's data type (vt+0x20, the call GameWorld::destroy makes; 0 a building), -1 faulted */
+{
+    __try { return ((BdTdTypeFn)((*(void***)o)[0x20 / 8]))(o); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* ANY THREAD (worldgen.cpp detour_destroy, before the engine's destroy - the object is whole): the cheap tests first, then the piece is
+   read into a capture slot (its key, state and doors' keys) and nothing is queued yet - BuildEngineDestroyDone queues it once the engine
+   answered. Returns the ticket (1 + the slot; 0 nothing captured). A postponed for-good capture of the same object is carried. */
+int BuildEngineDestroyNote(void* obj, int justUnloaded, const char* reason)
+{
+    if (obj == 0) return 0;
+    if (::InterlockedCompareExchange(&g_engRmPostLive, 0, 0) > 0)
+    {   /* re-check fold F: a postponed for-good capture at this address stands for this destroy, whatever its reason - only while it is
+           the same building (a building, its key the captured one) and younger than kBuildEngPostMaxMs; an unload frees it (put away,
+           not removed). Otherwise it is freed, and this destroy is noted as any other. */
+        unsigned long age = 0;
+        const int pt = BdEngRmPostponed(obj, &age);
+        if (pt != 0)
+        {
+            BdEngRmSlot& ps = g_engRmSlot[pt - 1];
+            const int isBld = (justUnloaded == 0 && BdObjTypePod(obj) == 0) ? 1 : 0;
+            char pk[kKeyCap];
+            pk[0] = 0;
+            const int pkOk = (isBld != 0 && ps.e.keyOk != 0 && ObjectPositionKey(obj, pk, kKeyCap, "", 3, 0) != 0) ? 1 : 0;
+            if (coopbuild::BuildEngPostponedUse(justUnloaded, isBld, pkOk, (pkOk != 0 && std::strcmp(pk, ps.e.key) == 0) ? 1 : 0, age) != 0)
+            {
+                ::InterlockedIncrement64(&g_engRmDeferTaken);
+                return pt;
+            }
+            ::InterlockedIncrement64(&g_engRmPostFreed);
+            ::InterlockedExchange(&ps.state, 0);
+        }
+    }
+    if (justUnloaded != 0) return 0;
+    char why[64];
+    const int rc = BdReasonCopyPod(reason, why, (int)sizeof why);
+    if (rc < 0) ::InterlockedIncrement64(&g_engRmReasonFault);
+    const int cls = coopbuild::BuildEngineDestroyReason(rc > 0 ? why : 0);
+    int inEd = (::InterlockedCompareExchange(&g_edDelDepth, 0, 0) > 0
+                && ::InterlockedCompareExchange(&g_edDelTid, 0, 0) == (LONG)::GetCurrentThreadId()) ? 1 : 0;
+    if (inEd == 0 && ::InterlockedCompareExchange(&g_panelDepth, 0, 0) > 0
+        && ::InterlockedCompareExchange(&g_panelTid, 0, 0) == (LONG)::GetCurrentThreadId()) inEd = 2;   /* review fold F1: inside the panel's confirmDismantle */
+    if (inEd == 0 && cls != coopbuild::kBuildEngReasonForGood && cls != coopbuild::kBuildEngReasonOther) return 0;   /* a known non-removal: the object is not read */
+    const int v = coopbuild::BuildEngineDestroyDecide(0, cls, inEd != 0 ? 1 : 0, BdObjTypePod(obj));
+    if (v == coopbuild::kBuildEngRmNone) return 0;
+    if (v == coopbuild::kBuildEngRmOther && ::InterlockedCompareExchange(&g_engRmOtherStop, 0, 0) != 0) { ::InterlockedIncrement64(&g_engRmOtherCapped); return 0; }
+    const int t = BdEngRmClaim();
+    if (t == 0) return 0;
+    BdEngRmSlot& s = g_engRmSlot[t - 1];
+    const int onMain = BdOnMain();
+    s.obj = obj;
+    BdEventFill(s.e, 12, obj, v == coopbuild::kBuildEngRmRemoved ? 1.0f : 0.0f, onMain, inEd, 0, 0.0f, -1, rc > 0 ? why : (rc < 0 ? "(unreadable)" : "(none)"));
+    s.dk.n = 0;
+    if (v == coopbuild::kBuildEngRmRemoved)
+    {   /* the doors' keys are read while the doors live; their records go at BuildTick, only for a row that is this game's own (fold 2).
+           On the main thread the door rows (this game's registry, in memory) are dropped before the doors: doors.h's rule for
+           DoorsForgetOwner is that no row outlives the door it names, and the engine's destroy deletes the doors inside the call. When
+           the engine postpones instead, the building's doors live on and the next funnel call on each re-registers it (doors.h) - a
+           row dropped early costs a re-registration, a row kept late could name a freed door (T-1372 re-check N1: kept here). */
+        if (onMain == 0) ::InterlockedIncrement64(&g_engRmOffMain);
+        DoorsRecPieceKeysRead(obj, &s.dk, onMain);
+        if (onMain != 0) DoorsForgetOwner(obj);
+    }
+    return t;
+}
+/* ANY THREAD (detour_destroy, after the engine's destroy): destroyed = the engine's answer. True: the capture is queued (its door keys stay
+   in the slot for BuildTick). False for a for-good capture: postponed - kept for the same object's completing destroy. Else freed. */
+void BuildEngineDestroyDone(void* obj, int ticket, int destroyed)
+{
+    if (ticket <= 0 || ticket > kEngRmSlots) return;
+    BdEngRmSlot& s = g_engRmSlot[ticket - 1];
+    const int forGood = (s.e.amount > 0.5f) ? 1 : 0;
+    if (destroyed == 0)
+    {
+        ::InterlockedIncrement64(&g_engRmNotDestroyed);
+        if (forGood != 0 && s.obj == obj)
+        {
+            ::InterlockedIncrement64(&g_engRmDeferred);
+            BdEngRmLockTake();
+            s.postT = ::GetTickCount();
+            s.state = 3;
+            ::InterlockedIncrement(&g_engRmPostLive);
+            BdEngRmLockGive();
+        }
+        else ::InterlockedExchange(&s.state, 0);
+        return;
+    }
+    if (forGood == 0 && ::InterlockedIncrement(&g_engRmOtherPending) > kEngRmOtherPerTick)
+    {   /* re-check fold N2: log-only events never take more than kEngRmOtherPerTick of the queue between two drains */
+        ::InterlockedIncrement64(&g_engRmOtherCapped);
+        ::InterlockedExchange(&s.state, 0);
+        return;
+    }
+    if (forGood != 0) ::InterlockedIncrement64(&g_engRmQueued);
+    else ::InterlockedIncrement64(&g_engRmOtherQueued);
+    const int keep = (forGood != 0 && s.dk.n > 0) ? 1 : 0;
+    s.e.engSlot = keep != 0 ? ticket : 0;
+    if (keep != 0) ::InterlockedExchange(&s.state, 2);
+    const int ok = BdQueuePush(s.e);
+    if (keep == 0 || ok == 0) ::InterlockedExchange(&s.state, 0);
+}
+/* MAIN THREAD (BuildTick): an event 12's door keys, copied out of its slot (the slot is freed). 0 = none */
+static int BdEngRmDoorKeysTake(const BdEvent& e, DoorsPieceKeys* out)
+{
+    out->n = 0;
+    if (e.kind != 12 || e.engSlot <= 0 || e.engSlot > kEngRmSlots) return 0;
+    BdEngRmSlot& s = g_engRmSlot[e.engSlot - 1];
+    if (::InterlockedCompareExchange(&s.state, 2, 2) != 2) return 0;
+    *out = s.dk;
+    ::InterlockedExchange(&s.state, 0);
+    return out->n;
+}
+/* MAIN THREAD (BuildTick): event 12 on its row. BdSendRemove's own exits skip other players' pieces, copies, handed copies and removed rows.
+   T-1372 review fold 2: the door records of a piece removed for good go only here, after the row is known to be this game's own. */
+static void BdEngineRemovedTake(const std::string& key, BdReg& r, const BdEvent& e, const DoorsPieceKeys& dk)
+{
+    const int own = (r.own != 0 && r.via != 3 && r.removed == 0) ? 1 : 0;
+    char line[400];
+    if (e.amount > 0.5f)
+    {
+        if (own == 0) { ++g_engRmSkipped; return; }
+        ++g_engRmMarked;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] removed by the engine key=%.63s reason=%s thread=%s%s doorKeys=%d - marked removed as a finished dismantle; engineRemoved=%lld",
+                    key.c_str(), e.why, e.onMain != 0 ? "main" : "OTHER", e.dismBefore == 2 ? " (inside the panel's confirmDismantle)" : (e.dismBefore != 0 ? " (inside the Level Editor's delete)" : ""), dk.n, g_engRmMarked);
+        BdLogRemove(line);
+        DoorsRecPieceDismantled(&dk, 0, 1, 1);   /* the doors' records go as a dismantle's do - main thread only */
+        BdSendRemove(key, r, (int)coopbuild::kBuildReasonDismantled);
+        return;
+    }
+    if (own == 0) return;
+    ++g_engRmOtherOwn;
+    if (g_engRmOtherOwn >= kEngRmOtherQueueCap) ::InterlockedExchange(&g_engRmOtherStop, 1);
+    if (g_engRmOtherLines >= kEngRmOtherLineCap) return;
+    ++g_engRmOtherLines;
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1372 an own piece ended by the engine for another reason key=%.63s reason='%s' thread=%s - NOT marked removed (log only); engineOtherOwn=%lld",
+                key.c_str(), e.why, e.onMain != 0 ? "main" : "OTHER", g_engRmOtherOwn);
+    DebugLog(std::string(line));
+}
+static std::string BdEngineRemovalReport()
+{
+    char t[400];
+    _snprintf_s(t, sizeof(t), _TRUNCATE, " engineRemoval[hook,editorDeletes,queued,marked,skipped,lost,offMain,otherQueued,otherCapped,otherOwn,reasonFault,lever,notDestroyed,postponed,postponedTaken,slotFull,postponedFreed,postponedAged]=%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                g_hkEditorDelete, (long long)g_edDelRuns, (long long)g_engRmQueued, g_engRmMarked, g_engRmSkipped, g_engRmLost, (long long)g_engRmOffMain,
+                (long long)g_engRmOtherQueued, (long long)g_engRmOtherCapped, g_engRmOtherOwn, (long long)g_engRmReasonFault, g_engRmLever,
+                (long long)g_engRmNotDestroyed, (long long)g_engRmDeferred, (long long)g_engRmDeferTaken, (long long)g_engRmSlotFull,
+                (long long)g_engRmPostFreed, (long long)g_engRmPostAged);
+    return std::string(t);
+}
 /* the piece records' routes from the store link (build.h), on the writer in the unnamed namespace above */
 void PieceRecordArrive(const std::string& id, const std::vector<char>& bytes) { PcrArrive(id, bytes); }
+/* T-1443 fold 3 (owner 1804 a; F1385 BLOCKER): the owner player a piece record held here names - the ONE table every game keeps them in:
+   a record from the world server (PcrArrive: the feed and live records, a joiner's and a host's alike) and this game's own accepted
+   write (PcrKeepOwn). -2 = no record of that id here; *removed = 1 for a removal mark (a deleted piece: no owner to give). MAIN THREAD. */
+int BuildPieceRecordOwner(const std::string& id, int* removed)
+{
+    if (removed != 0) *removed = 0;
+    std::map<std::string, PcrKept>::const_iterator k = g_pcrKept.find(id);
+    if (k == g_pcrKept.end()) return -2;
+    if (removed != 0) *removed = (k->second.h.flags & piecerec::kPrFlagRemoved) != 0 ? 1 : 0;
+    return k->second.h.ownerSlot;
+}
+long BuildPieceRecordsGen() { return g_pcrKeptGen; }
 void PieceRecordGone(const std::string& id, const char* from) { PcrGone(id, from); }
 void PieceRecordEcho(const std::string& id, int hasStamp, long long stamp) { PcrEcho(id, hasStamp, stamp); }
 void PieceRefuseArrive(const std::vector<char>& payload) { PcrRefuseArrive(payload); }
@@ -14578,6 +17951,12 @@ void InstallBuild()
     }
     g_hkProgress = BdHook(base, kBdProgressRva, (void*)&detour_progress, (void**)&orig_progress);
     g_hkDismantle = BdHook(base, kBdDismantleRva, (void*)&detour_dismantle, (void**)&orig_dismantle);
+    g_hkEditorDelete = BdHook(base, kBdEditorDeleteRva, (void*)&detour_editorDelete, (void**)&orig_editorDelete);   /* T-1372 */
+    {
+        const std::string el = std::string("[BUILD] T-1372 the Level Editor's delete 0x776D60 (row LevelEditorDeleteSelected) ") + HkWord(g_hkEditorDelete)
+            + (g_hkEditorDelete == 1 ? " - a piece it deletes, and every piece inside it, is marked removed for good" : " - only its own reason ('Level Editor') marks the piece; its interior's pieces are not marked");
+        if (g_hkEditorDelete == 1) DebugLog(el); else ErrorLog(el);
+    }
     g_hkDestroy = BdHook(base, kBdDestroyRva, (void*)&detour_destroy, (void**)&orig_destroy);
     g_hkCreatePhys = BdHook(base, kBdCreatePhysRva, (void*)&detour_createPhys, (void**)&orig_createPhys);   /* T-1294 fold 2 (M2) */
     {
@@ -14627,6 +18006,12 @@ void InstallBuild()
     else ErrorLog(msg);
     // PROBE-END: P082
     g_hkWallHit = BdHook(base, kBdWallHitRva, (void*)&detour_wallHit, (void**)&orig_wallHit);
+    g_hkWallJoin = BdHook(base, kBdWallJoinAreaRva, (void*)&detour_wallJoinArea, (void**)&orig_wallJoinArea);   /* T-1408 fold 13 */
+    {
+        const std::string jm = std::string("[WALLGROUP] the engine's wall join 0x29AC10 ") + HkWord(g_hkWallJoin) + ", join-to 0x29A850 "
+            + (kBdWallJoinToRva != 0 ? "found" : "MISSING") + " (T-1408 fold 13: a wall whose record carries its owner's group is joined by that fact, never by the engine's own walk)";
+        if (g_hkWallJoin == 1 && kBdWallJoinToRva != 0) DebugLog(jm); else ErrorLog(jm);
+    }
     g_hkDoorHit = BdHook(base, kBdDoorHitRva, (void*)&detour_doorHit, (void**)&orig_doorHit);
     {
         const std::string dm = std::string("[BUILD] door melee hit 0x29D650 (vt+0x1F0) ") + HkWord(g_hkDoorHit)
@@ -14776,7 +18161,7 @@ void BdCopyDestroyedHere(const std::string& key, BdReg& r, int modsOwn, int dest
     {
         if ((int)g_pendState.size() >= kPendCap) { ++g_stateDropped; return; }
         BdStatePend& s = g_pendState[key];
-        s.m = r.ownerLast; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0;   /* P15 fold 1 */
+        s.m = r.ownerLast; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0; s.ruinPutPend = 0; s.ruinPutVal = 0.0f;   /* P15 fold 1 */
     }
     ++g_copyDestroyReverted;
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] copy key=%.63s made a ruin HERE by this game's engine - the owner's game is the writer: its last STATE (whole, %.2f/%.2f complete=%d) goes back on at the next safe point; copyDestroyReverted=%lld",
@@ -14795,6 +18180,7 @@ void BdCopyDestroyedHere(const std::string& key, BdReg& r, int modsOwn, int dest
    area loads. A resolution made while the lead's own zone is not marked loaded is not kept. */
 std::map<std::string, std::vector<std::string> > g_wallGroups;   /* lead key -> the other own wall keys sharing its record */
 std::map<std::string, int> g_wallKeyIs;   /* own free-standing keys looked at since the cache was last cleared: 1 a wall, 0 not, 2 not found */
+std::map<std::string, int> g_wallGroupShort;   /* T-1408 fold 10 (F1304 claim 4): lead key -> 1 when fewer members were found here than its group count (a member's area not loaded) */
 size_t g_wallCacheRows = 0;
 long g_wallCacheGen = -1;
 long long g_wallCacheWalkGen = -1, g_wallCacheZones = -1;
@@ -14804,7 +18190,7 @@ std::vector<std::string> BdWallGroupOf(const std::string& lead, const BdReg& lr)
     if (g_wallCacheRows != g_reg.size() || g_wallCacheGen != g_bdGen || g_wallCacheWalkGen != wg || g_wallCacheZones != g_zsZones)
     {
         if (!g_wallGroups.empty() || !g_wallKeyIs.empty()) ++g_wallGroupCacheCleared;
-        g_wallGroups.clear(); g_wallKeyIs.clear();
+        g_wallGroups.clear(); g_wallKeyIs.clear(); g_wallGroupShort.clear();
         g_wallCacheRows = g_reg.size(); g_wallCacheGen = g_bdGen; g_wallCacheWalkGen = wg; g_wallCacheZones = g_zsZones;
     }
     std::map<std::string, int>::const_iterator lk = g_wallKeyIs.find(lead);
@@ -14843,17 +18229,836 @@ std::vector<std::string> BdWallGroupOf(const std::string& lead, const BdReg& lr)
         g_wallKeyIs[it->first] = isWall;
         if (isWall != 0 && BdWallRecordPod(w) == rec) members.push_back(it->first);
     }
+    g_wallGroupShort[lead] = (gc > 0 && (int)members.size() < gc) ? 1 : 0;   /* T-1408 fold 10: a member not found here is still the group's */
     if (keep != 0) g_wallGroups[lead] = members;
     return members;
 }
-void BdWallGroupsMark(const std::vector<std::string>& keys, std::vector<std::string>& touched)
+/* T-1408, MAIN THREAD: the wall group step stamps. The keys of an own piece's wall group here, the piece first (members whose area is not
+   loaded here are not listed - the world server's one-writer rule lets the owner write only records of areas it holds; such a member
+   takes the group's current value when it lands, BdOwnGroupCatchUp) */
+/* T-1408 fold 10 (F1331 1b), MAIN THREAD: the key of the own wall whose record the wall at key uses - its group's LEAD. A member's own
+   group count is 0, so its group is looked up from the lead (as the helper's copy road finds the record through the piece, BdHitReplayHere).
+   The key itself when it leads, keeps its own record, is not found, or the lead is not an own row here. */
+std::string BdGroupLeadKey(const std::string& key, const BdReg& r)
 {
+    if (r.own == 0 || r.via == 3 || r.removed != 0 || !r.hostKey.empty()) return key;
+    int fv = 0;
+    void* b = BdFindPiece(key, r, &fv);
+    if (b == 0 || BdIsWall(b) != 1) return key;
+    void* lead = BdWallLeadOf(b);
+    if (lead == 0 || lead == b || BdIsWall(lead) != 1) return key;
+    char lk[kKeyCap];
+    lk[0] = 0;
+    if (ObjectPositionKey(lead, lk, kKeyCap, "", 3, 0) == 0 || lk[0] == 0) return key;
+    std::map<std::string, BdReg>::iterator lr = BdRowByLiveKey(std::string(lk));
+    if (lr == g_reg.end() || lr->second.own == 0 || lr->second.via == 3 || lr->second.removed != 0) return key;
+    return lr->first;
+}
+std::vector<std::string> BdGroupKeysOf(const std::string& key)
+{
+    std::vector<std::string> out(1, key);
+    std::map<std::string, BdReg>::const_iterator r = g_reg.find(key);
+    if (r == g_reg.end() || r->second.own == 0 || r->second.via == 3) return out;
+    const std::string lk = BdGroupLeadKey(r->first, r->second);   /* T-1408 fold 10 (F1331 1b): a member's group is its lead's */
+    std::map<std::string, BdReg>::const_iterator lr = (lk == key) ? r : g_reg.find(lk);
+    if (lr == g_reg.end()) return out;
+    if (lk != key) out.push_back(lk);
+    const std::vector<std::string> mem = BdWallGroupOf(lr->first, lr->second);
+    for (size_t i = 0; i < mem.size(); ++i) if (mem[i] != key) out.push_back(mem[i]);
+    return out;
+}
+/* ==== T-1408 fold 13 (F1418 / F1419, design B chosen 2026-11-19): wall groups shared from the owner ==========================================
+   fold 13b / 13c (reviews of ad1ec53e0 and 2347feac0): the engine's load-time join 0x29AC10 is held for EVERY wall a player owns - decided
+   at the hook from the wall's own owner (this game's faction, a stand-in, or a saved faction whose record id names a player slot - the
+   stand-in table is empty after a world load), never from the fact table (facts arrive by messages the world load does not wait for, and
+   the engine has no leave routine, so a wrong group could never be repaired). A held wall is never dropped silently: it stays held until
+   its area's records are applied and is then joined from its fact, or - an own wall with no fact, on its owner's game - given the held
+   engine join with the result read back and published. Player wall groups form only from the OWNER's facts: the owner reads its group from
+   the engine after every engine join of its walls and after every join from its records, and publishes a fact for each own wall whose
+   group changed - the TOP lead's key (any player's wall) and the wall's place in the lead's list. Every game joins its walls through the
+   engine's 0x29A850 in that order on events: a fact arrives or is removed, a record is applied, a copy (or kept copy) is made, an area's
+   pieces are laid. A member waits for its TOP lead's piece and for every lower-index member whose copy can still come here; a join the
+   engine refuses is logged once, never forced. fold 13d LIMITATION (manager decision 2026-11-19): the engine's walk 0x29AC10 cannot be told
+   to leave out a held wall, so an own wall (or an own placement) next to a wall held alone with no fact - a wall of an offline owner whose
+   records carry no group (an older save), or two owners' fact-less walls within reach - stays ALONE and is logged once ('[WALLGROUP]
+   legacy no fact ..'); every game leaves it alone the same way, so the games do not differ. Such walls group once their owner's game loads
+   the area and publishes their facts. */
+std::set<std::string> g_wgWaitLogged;    /* MAIN THREAD: members whose wait was logged (once per key until it joins) */
+std::set<std::string> g_wgOnceLogged;    /* MAIN THREAD: "<kind>|<key>" lines already logged - once per wall and reason */
+std::vector<WgHeld> g_wgHeldMain;        /* MAIN THREAD: walls the hook held, kept until resolved (joined from a fact, or the owner's engine join) */
+const long long kWgFactLineCap = 300;
+void BdWgLine(const char* line)
+{
+    if (g_wgLines >= kWgLineCap) { ++g_wgLinesCut; return; }
+    ++g_wgLines;
+    DebugLog(std::string(line));
+}
+void BdWgFactLine(const char* line)   /* the owner's fact lines: their own cap */
+{
+    if (g_wgFactLines >= kWgFactLineCap) { ++g_wgFactLinesCut; return; }
+    ++g_wgFactLines;
+    DebugLog(std::string(line));
+}
+void BdWgOnce(const char* kind, const std::string& key, const char* line)   /* once per wall and reason */
+{
+    if (g_wgOnceLogged.insert(std::string(kind) + "|" + key).second) BdWgLine(line);
+}
+/* a wall's lead link as 0x29A850 reads it (decomp_29a850.txt:19-37): 0 = none (+0x370 == 0xB); 1 = a link (+0x370 == 0) that resolves
+   through 0x9F8050 on the handle table; 2 = a link that does not resolve; 3 = any other value; -1 = unreadable. As a JOINER any value but
+   0 refuses (:19-20); as a TARGET 1 forwards the join to that lead and 2 / 3 refuse (:33-37). ANY THREAD */
+int BdWallLeadLinkPod(void* b, int asLead)
+{
+    typedef void* (*ResFn)(void* table, const void* handle);
+    const unsigned long long rRes = Rva("CraftSelectedBuilding"), rTab = Rva("CraftSelectionGlobal");
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    __try
+    {
+        const int t = *(const int*)((const char*)b + 0x370);
+        if (t == 0xB) return 0;
+        if (asLead != 0 && std::memcmp((const char*)b + 0x370, (const char*)b + 0x60, 20) == 0) return 0;   /* a link to itself: 0x29A850 resets it to none first (decomp_29a850.txt:25-30, the handle at +0x368 against the wall's own +0x58) */
+        if (t != 0) return 3;
+        if (rRes == 0 || rTab == 0) return 2;
+        void* q = ((ResFn)(base + (uintptr_t)rRes))((void*)(base + (uintptr_t)rTab), (const char*)b + 0x368);
+        return q != 0 ? 1 : 2;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdWallIntAtPod(void* b, size_t off)   /* a plain int field (+0x360 the wall's state; -1 = unreadable) */
+{
+    __try { return *(const int*)((const char*)b + off); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdWallDoneBytePod(void* b)   /* the first byte of the wall's own record (+0x160): the finished flag 0x29A850 compares (decomp_29a850.txt:53) */
+{
+    __try { return *(const unsigned char*)((const char*)b + kWallOwnRecord); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdWallJoinToPod(void* lead, void* wall)   /* the engine's 0x29A850(lead, wall): 1 joined, 0 refused, -1 a fault, -2 no address. MAIN THREAD */
+{
+    if (kBdWallJoinToRva == 0) return -2;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    __try { return ((((BdWallJoinToFn)(base + (uintptr_t)kBdWallJoinToRva))(lead, wall)) & 0xFFull) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdWallEngineJoinPod(void* wall, void* area)   /* a held engine join 0x29AC10 run now (an own wall with no fact; a held placement). 1 = ran */
+{
+    if (orig_wallJoinArea == 0) return 0;
+    ::InterlockedIncrement64(&g_wgEngineOnPlayer);
+    __try { orig_wallJoinArea(wall, area); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    BdRecGenBump(BdWallRecordPod(wall));   /* T-1408 fold 14d (review 6): the record the wall reads after the engine's walk */
+    BdRecGenBump((uintptr_t)wall + kWallOwnRecord);
+    return 1;
+}
+/* the lead's members in its list order (+0x390 count, +0x398 entries of 0x20, resolved by 0x9F8050 on the handle table as the engine's
+   wall step does); pos[k] = the entry's place in the list (an entry that does not resolve keeps its place). Returns how many were read */
+int BdWallMemberListPod(void* lead, void** out, unsigned* pos, int cap)
+{
+    typedef void* (*ResFn)(void* table, const void* handle);
+    const unsigned long long rRes = Rva("CraftSelectedBuilding"), rTab = Rva("CraftSelectionGlobal");
+    if (rRes == 0 || rTab == 0) return 0;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    int k = 0;
+    __try
+    {
+        const unsigned int n = *(const unsigned int*)((const char*)lead + kWallGroupCount);
+        const char* arr = *(const char* const*)((const char*)lead + kWallGroupArr);
+        if (n > 100000u || (n > 0 && arr == 0)) return 0;
+        for (unsigned int i = 0; i < n && k < cap; ++i)
+        {
+            const char* e = arr + (size_t)i * kWallGroupStride;
+            if (*(const int*)(e + 8) != 0) continue;
+            void* q = ((ResFn)(base + (uintptr_t)rRes))((void*)(base + (uintptr_t)rTab), e);
+            if (q == 0 || q == lead) continue;
+            out[k] = q; pos[k] = i; ++k;
+        }
+        return k;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return k; }
+}
+std::string BdWallKeyOf(void* p)   /* the builder's key of a live wall: its row's (a copy's own key resolved), else its own position key */
+{
+    char k[kKeyCap];
+    k[0] = 0;
+    if (p == 0 || ObjectPositionKey(p, k, kKeyCap, "", 3, 0) == 0 || k[0] == 0) return std::string();
+    std::map<std::string, BdReg>::iterator r = BdRowByLiveKey(std::string(k));
+    return (r != g_reg.end()) ? r->first : std::string(k);
+}
+void* BdWallPieceByKey(const std::string& key)   /* the live wall at key here (its row's piece, else the position key's), 0 = none */
+{
+    void* p = 0;
+    std::map<std::string, BdReg>::iterator r = g_reg.find(key);
+    if (r != g_reg.end())
+    {
+        if (r->second.removed != 0) return 0;
+        int fv = 0;
+        p = BdFindPiece(key, r->second, &fv);
+    }
+    if (p == 0) p = ObjectByPositionKey(key.c_str());
+    return (p != 0 && BdIsWall(p) == 1) ? p : 0;
+}
+int BdRowOwnWall(const BdReg& r) { return (r.own != 0 && r.via != 3 && r.removed == 0 && r.dismantled == 0 && r.hostKey.empty()) ? 1 : 0; }
+std::string BdWgRowKey(const char* liveKey)   /* a held wall's builder key (its row's), else its own */
+{
+    std::map<std::string, BdReg>::iterator r = BdRowByLiveKey(std::string(liveKey));
+    return (r != g_reg.end()) ? r->first : std::string(liveKey);
+}
+int BdWgKeyXZ(const std::string& key, double* x, double* z)   /* the position a P7n key carries ("..@sx,sy@x10,z10,y10"). 1 = read */
+{
+    const size_t at = key.rfind('@');
+    if (at == std::string::npos) return 0;
+    long long a = 0, b = 0;
+    if (std::sscanf(key.c_str() + at + 1, "%lld,%lld", &a, &b) != 2) return 0;
+    *x = (double)a / 10.0; *z = (double)b / 10.0;
+    return 1;
+}
+/* 1 = a wall held alone waiting for its owner's fact (not this game's own: an own wall waits for this game's own engine join) stands within
+   70 of key - a placement join there could attach to it and it could never join its real group (decomp_29a850.txt:19). MAIN THREAD */
+int BdHeldNear(const std::string& key, std::string* legacyKey)
+{
+    double x = 0.0, z = 0.0;
+    int legacy = 0;
+    if (BdWgKeyXZ(key, &x, &z) == 0) return 0;
+    std::vector<std::string> ks;
+    for (size_t i = 0; i < g_wgHeldMain.size(); ++i) ks.push_back(std::string(g_wgHeldMain[i].key));
+    WgLock();
+    for (size_t i = 0; i < g_wgHeldQ.size(); ++i) ks.push_back(std::string(g_wgHeldQ[i].key));
+    WgUnlock();
+    for (size_t i = 0; i < ks.size(); ++i)
+    {
+        if (ks[i].empty()) continue;
+        const std::string rk = BdWgRowKey(ks[i].c_str());
+        if (rk == key) continue;
+        std::map<std::string, BdReg>::iterator r = g_reg.find(rk);
+        if ((r != g_reg.end() && BdRowOwnWall(r->second) != 0) || WgFactGet(rk, 0, 0) != 0) continue;
+        double hx = 0.0, hz = 0.0;
+        if (BdWgKeyXZ(ks[i], &hx, &hz) == 0 || (hx - x) * (hx - x) + (hz - z) * (hz - z) >= 70.0 * 70.0) continue;
+        const int nc = PcrSecOfId(piecerec::MakePieceRecId(rk));
+        if (nc >= 0 && nc < coopbuild::kBuildZoneSectorCells && g_pcaDone[nc] != 0) { legacy = 1; if (legacyKey != 0) *legacyKey = rk; continue; }   /* its area's records are here and carry no fact: legacy */
+        return 1;   /* its fact may still come */
+    }
+    return legacy != 0 ? 2 : 0;
+}
+void BdWgLegacy(const std::string& key, const std::string& nb, const char* why)
+{
+    ++g_wgLegacy;
+    char line[400];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] legacy no fact - stays alone until its owner's game loads the area: key=%.63s (%s; the neighbour held alone %.63s); legacy=%lld",
+                key.c_str(), why, nb.c_str(), g_wgLegacy);
+    BdWgOnce("legacy", key, line);
+}
+void BdWgLeadReset(const std::string& key)
+{
+    std::map<std::string, BdReg>::iterator r = g_reg.find(key);
+    if (r != g_reg.end()) { r->second.wgLeadHave = 0; r->second.wgLeadStamp = 0; }
+}
+/* THE OWNER DECIDES: b's group as the engine holds it now - its TOP lead (the wall whose record b uses: 0x29A850 forwards a join to the
+   target's own lead, so the list lives on the top lead) and that lead's list - and a fact published for every OWN wall of the group whose
+   fact changed (lead index 0, a member its list place + 1). MAIN THREAD */
+void BdWallFactFromEngine(void* b, const char* why)
+{
+    if (b == 0 || BdIsWall(b) != 1) return;
+    void* L = BdWallLeadOf(b);
+    if (L == 0 || BdIsWall(L) != 1) return;
+    const std::string lk = BdWallKeyOf(L);
+    if (lk.empty() || lk.size() > coopbuild::kBuildMaxKey) return;
+    void* mem[128];
+    unsigned pos[128];
+    const int n = BdWallMemberListPod(L, mem, pos, 128);
+    std::vector<std::pair<std::string, unsigned> > own;
+    std::map<std::string, BdReg>::iterator lr = g_reg.find(lk);
+    const int leadOwn = (lr != g_reg.end() && BdRowOwnWall(lr->second) != 0) ? 1 : 0;
+    if (leadOwn != 0) own.push_back(std::pair<std::string, unsigned>(lk, 0u));
+    for (int i = 0; i < n; ++i)
+    {
+        const std::string mk = BdWallKeyOf(mem[i]);
+        std::map<std::string, BdReg>::iterator mr = g_reg.find(mk);
+        if (!mk.empty() && mr != g_reg.end() && BdRowOwnWall(mr->second) != 0) own.push_back(std::pair<std::string, unsigned>(mk, wallgroup::IdxOfListPos(pos[i])));
+    }
+    char line[400];
+    for (size_t i = 0; i < own.size(); ++i)
+    {
+        if (own[i].second > coopbuild::kBuildGroupIdxMax || WgFactPut(own[i].first, lk, own[i].second) == 0) continue;
+        ++g_wgFactsOwner;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] fact key=%.63s lead=%.63s idx=%u (%s; the lead's list %d resolved here, group count %d%s); factsOwner=%lld",
+                    own[i].first.c_str(), lk.c_str(), own[i].second, why, n, BdWallGroupCountPod(L), leadOwn != 0 ? "" : ", the lead another player's", g_wgFactsOwner);
+        BdWgFactLine(line);
+        std::map<std::string, BdReg>::iterator cr = g_reg.find(own[i].first);
+        if (cr != g_reg.end()) BdMaybeSendState(cr->first, cr->second);   /* the fact goes into its record (one write per change) */
+    }
+}
+/* one member joined to its lead by the engine's 0x29A850 (wallgroup::JoinStep). b / L may be 0 (looked up here). On the owner's game a join
+   from its own records that the engine did not take is read back and what the engine has is published. MAIN THREAD */
+void BdWallJoinOne(const std::string& key, void* b, const std::string& lead, unsigned idx, void* L, const char* road)
+{
+    if (b == 0) b = BdWallPieceByKey(key);
+    if (b == 0) return;   /* not here: its own event (copy made, record, area laid) joins it */
+    if (L == 0) L = BdWallPieceByKey(lead);
+    const int leadHere = (L != 0 && L != b) ? 1 : 0;
+    const int inLead = (leadHere != 0 && BdWallLeadOf(b) == L) ? 1 : 0;
+    const int wLink = BdWallLeadLinkPod(b, 0), wMem = BdWallGroupCountPod(b), lLink = (leadHere != 0) ? BdWallLeadLinkPod(L, 1) : 0;
+    const int st = wallgroup::JoinStep(1, idx, leadHere, inLead, wLink != 0 ? 1 : 0, wMem != 0 ? 1 : 0, lLink != 0 ? 1 : 0);   /* unreadable (-1) is taken as busy */
+    std::map<std::string, BdReg>::iterator own = g_reg.find(key);
+    const int mine = (own != g_reg.end() && BdRowOwnWall(own->second) != 0) ? 1 : 0;
+    char line[500];
+    if (st == wallgroup::kJsDone) { ++g_wgDone; g_wgWaitLogged.erase(key); return; }
+    if (st == wallgroup::kJsNone) return;
+    if (st == wallgroup::kJsWaitLead)
+    {
+        ++g_wgWaits;
+        if (g_wgWaitLogged.insert(key).second)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] JOIN key=%.63s lead=%.63s idx=%u road=%s result=waits: its lead's piece is not here (joined at the lead's event); waits=%lld",
+                        key.c_str(), lead.c_str(), idx, road, g_wgWaits);
+            BdWgLine(line);
+        }
+        return;
+    }
+    if (st == wallgroup::kJsMemberBusy || st == wallgroup::kJsLeadElsewhere)
+    {
+        if (st == wallgroup::kJsMemberBusy) ++g_wgBusy; else ++g_wgLeadElse;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] JOIN key=%.63s lead=%.63s idx=%u road=%s result=NOT JOINED: %s (wall's lead link %d, its members %d, lead's lead link %d; link 1 resolves, 2 does not, 3 other) - the engine never takes a wall out; busy=%lld leadElsewhere=%lld",
+                    key.c_str(), lead.c_str(), idx, road, wallgroup::JoinStepName(st), wLink, wMem, lLink, g_wgBusy, g_wgLeadElse);
+        BdWgOnce("notjoined", key, line);
+        if (mine != 0) BdWallFactFromEngine(b, "own join from its fact not taken - the engine's group published");
+        return;
+    }
+    {   /* T-1408 fold 14b (review 3): deliveries due on the wall's record and the lead's measured before the join moves the baselines */
+        std::map<std::string, BdReg>::iterator hw = BdLeadRowOf(b), hl = BdLeadRowOf(L);
+        if (hw != g_reg.end() && hw->second.via == 3) BdHelpHarvestRecord(hw->first, &hw->second, b, "before a join", 0);
+        if (hl != g_reg.end() && hl->second.via == 3) BdHelpHarvestRecord(hl->first, &hl->second, L, "before a join", 0);
+    }
+    std::map<std::string, BdReg>::iterator jl = BdLeadRowOf(L);   /* fold 14c (review 2): the lead's record as measured just before the join */
+    const int jUsable = (jl != g_reg.end() && BdHelpBaseOf(jl->second, L) != 0) ? 1 : 0;
+    float jBefore[coopbuild::kBuildMaxMats];
+    int jTot = -1;
+    const int jN = BdReadMats(L, jBefore, (int)coopbuild::kBuildMaxMats, &jTot);
+    const int lb = BdWallDoneBytePod(L), wb = BdWallDoneBytePod(b), ws = BdWallIntAtPod(b, 0x360);
+    const int r = BdWallJoinToPod(L, b);
+    const int now = (BdWallLeadOf(b) == L) ? 1 : 0;
+    BdRecGenBump(BdWallRecordPod(L)); BdRecGenBump((uintptr_t)b + kWallOwnRecord);   /* T-1408 fold 14d (review 6): both records' generations rise */
+    if (r == 1 && now != 0)
+    {
+        ++g_wgJoined;
+        g_wgWaitLogged.erase(key);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] JOIN key=%.63s lead=%.63s idx=%u road=%s result=joined (lead count now %d, wall state %d); joined=%lld",
+                    key.c_str(), lead.c_str(), idx, road, BdWallGroupCountPod(L), ws, g_wgJoined);
+        BdWgLine(line);
+        (void)BdWallSharesRedraw(L, "a member joined by its owner's group fact", key.c_str());   /* the member draws from the group's record now */
+        BdHelpBaseJoined(b, L, jUsable, jBefore, jN);   /* T-1408 fold 14 (F1429): the help baseline moves with the record the member reads now */
+        return;
+    }
+    ++g_wgRefused;
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] JOIN key=%.63s lead=%.63s idx=%u road=%s result=REFUSED by the engine (answer %d, in the lead's group %d; finished bytes lead=%d wall=%d, wall state %d) - not forced; refused=%lld",
+                key.c_str(), lead.c_str(), idx, road, r, now, lb, wb, ws, g_wgRefused);
+    BdWgOnce("refused", key, line);
+    if (mine != 0) BdWallFactFromEngine(b, "own join from its fact refused - the engine's group published");
+}
+std::string BdWgTopLead(const std::string& lead)   /* the chain of lead facts walked to its top (at most 8 steps) */
+{
+    std::string top = lead;
+    for (int h = 0; h < 8; ++h)
+    {
+        std::string l2;
+        unsigned i2 = 0;
+        if (WgFactGet(top, &l2, &i2) == 0 || i2 == 0 || l2.empty() || l2 == top) break;
+        top = l2;
+    }
+    return top;
+}
+/* the members of the group whose TOP lead is leadKey (a member whose lead fact names a further lead belongs to the top lead's list) */
+void BdWgMembersTop(const std::string& top, std::vector<std::pair<unsigned, std::string> >* out)
+{
+    out->clear();
+    std::vector<std::pair<std::string, WgFact> > all;
+    WgLock();
+    for (std::map<std::string, WgFact>::const_iterator it = g_wgFact.begin(); it != g_wgFact.end(); ++it) if (it->second.idx != 0) all.push_back(*it);
+    WgUnlock();
+    for (size_t i = 0; i < all.size(); ++i)
+        if (all[i].first != top && (all[i].second.lead == top || BdWgTopLead(all[i].second.lead) == top)) out->push_back(std::pair<unsigned, std::string>(all[i].second.idx, all[i].first));
+}
+/* the lead's pass: the members of its group in the owner's index order (ties by key, the same on every game); the pass stops at the first
+   member not here whose copy can still come (its record is here and its area is loaded on this game - event: its copy appears, or its
+   fact is removed), so every later member waits for it; a member whose area is not loaded here cannot come now and is not waited for. MAIN THREAD */
+void BdWallLeadPass(const std::string& leadKey, void* L, const char* road)
+{
+    std::vector<std::pair<unsigned, std::string> > mem;
+    BdWgMembersTop(leadKey, &mem);
+    wallgroup::JoinOrder(&mem);
+    char line[300];
+    for (size_t i = 0; i < mem.size(); ++i)
+    {
+        if (BdWallPieceByKey(mem[i].second) == 0)
+        {
+            const int mc = PcrSecOfId(piecerec::MakePieceRecId(mem[i].second));
+            if (wallgroup::OrderWaits(mc >= 0 && mc < coopbuild::kBuildZoneSectorCells && g_bdZoneActiveNow[mc] != 0 ? 1 : 0) == 0) continue;   /* cannot come now: not waited for */
+            if (i + 1 < mem.size())
+            {
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] lead=%.63s: members from idx %u wait for key=%.63s idx %u (its area is loaded here, its copy not yet) - the owner's order",
+                            leadKey.c_str(), mem[i + 1].first, mem[i].second.c_str(), mem[i].first);
+                BdWgOnce("orderwait", leadKey + "#" + mem[i].second, line);
+            }
+            break;
+        }
+        BdWallJoinOne(mem[i].second, 0, leadKey, mem[i].first, L, road);
+    }
+}
+void BdWallJoinFromRecord(const std::string& key, void* b, const char* road)
+{
+    std::string lead;
+    unsigned idx = 0;
+    if (WgFactGet(key, &lead, &idx) == 0) return;
+    if (b == 0) b = BdWallPieceByKey(key);
+    if (b == 0 || BdIsWall(b) != 1) return;
+    if (idx == 0) { BdWallLeadPass(key, b, road); return; }
+    const std::string top = BdWgTopLead(lead);
+    void* L = BdWallPieceByKey(top);
+    if (top != lead) { if (L != 0 && L != b) BdWallLeadPass(top, L, road); else BdWallJoinOne(key, b, top, idx, 0, road); return; }   /* its lead is itself a member: it waits on and is woken by the TOP lead, in its order */
+    if (L != 0 && L != b) { BdWallLeadPass(lead, L, road); return; }   /* the lead is here: joined in its order */
+    BdWallJoinOne(key, b, lead, idx, 0, road);   /* waits for its lead */
+}
+/* a lead's record removed: the owner re-reads each own member's group from its engine (and publishes); a copy member stops waiting */
+void BdWallLeadGone(const std::string& leadKey, const std::vector<std::pair<unsigned, std::string> >& mem)
+{
+    ++g_wgLeadGone;
+    char line[300];
+    for (size_t i = 0; i < mem.size(); ++i)
+    {
+        std::map<std::string, BdReg>::iterator r = g_reg.find(mem[i].second);
+        void* p = (r != g_reg.end() && BdRowOwnWall(r->second) != 0) ? BdWallPieceByKey(mem[i].second) : 0;
+        if (p != 0) { BdWallFactFromEngine(p, "its lead's record was removed - the group read again"); continue; }
+        g_wgWaitLogged.erase(mem[i].second);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] lead=%.63s removed: member key=%.63s idx=%u stops waiting (its owner publishes its group again); leadGone=%lld",
+                    leadKey.c_str(), mem[i].second.c_str(), mem[i].first, g_wgLeadGone);
+        BdWgLine(line);
+    }
+}
+void BdWallJoinArea(int c, const char* road)
+{
+    if (c < 0 || c >= coopbuild::kBuildZoneSectorCells) return;
+    std::vector<WgHeld> got;
+    WgLock();
+    got.swap(g_wgHeldQ);
+    WgUnlock();
+    char line[400];
+    for (size_t i = 0; i < got.size(); ++i)
+    {
+        got[i].key[63] = 0;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] load-join held key=%.63s: a player's wall - joined only by its owner's group fact; loadJoinHeld=%lld engineJoins=%lld engineOnRecorded=%lld",
+                    got[i].key, (long long)::InterlockedCompareExchange64(&g_wgHookHeld, 0, 0), (long long)::InterlockedCompareExchange64(&g_wgHookRun, 0, 0),
+                    (long long)::InterlockedCompareExchange64(&g_wgEngineOnRecorded, 0, 0));
+        BdWgLine(line);
+        g_wgHeldMain.push_back(got[i]);
+    }
+    std::vector<std::pair<unsigned, std::string> > ks;
+    WgLock();
+    for (std::map<std::string, WgFact>::const_iterator it = g_wgFact.begin(); it != g_wgFact.end(); ++it) ks.push_back(std::pair<unsigned, std::string>(it->second.idx, it->first));
+    WgUnlock();
+    for (int pass = 0; pass < 2; ++pass)   /* the leads first (each joins its members in order), then members whose lead is in another area */
+        for (size_t i = 0; i < ks.size(); ++i)
+            if ((pass == 0) == (ks[i].first == 0) && PcrSecOfId(piecerec::MakePieceRecId(ks[i].second)) == c) BdWallJoinFromRecord(ks[i].second, 0, road);
+    for (size_t i = 0; i < got.size(); ++i) if (got[i].key[0] != 0) BdWgLeadReset(BdWgRowKey(got[i].key));   /* a reloaded lead copy takes the record afresh */
+    if (g_pcaDone[c] == 0) return;   /* the held walls are decided once the area's records are applied (the event) */
+    BdHeldResolve(-1, road);   /* fold 13e: every area whose records are applied - a held wall's neighbour may be in another area */
+}
+void BdWgLeadPassesAll(const char* road)
+{
+    std::vector<std::string> leads;
+    WgLock();
+    for (std::map<std::string, WgFact>::const_iterator it = g_wgFact.begin(); it != g_wgFact.end(); ++it) if (it->second.idx == 0) leads.push_back(it->first);
+    WgUnlock();
+    for (size_t i = 0; i < leads.size(); ++i) { void* L = BdWallPieceByKey(leads[i]); if (L != 0) BdWallLeadPass(leads[i], L, road); }
+}
+void BdHeldResolve(int c, const char* road)
+{
+    char line[400];
+    std::vector<WgHeld> keep;
+    std::vector<void*> joined;
+    for (size_t i = 0; i < g_wgHeldMain.size(); ++i)
+    {
+        const WgHeld& h = g_wgHeldMain[i];
+        const int hc = (h.key[0] != 0) ? PcrSecOfId(piecerec::MakePieceRecId(std::string(h.key))) : -1;
+        if (hc < 0 || hc >= coopbuild::kBuildZoneSectorCells)
+        {
+            ++g_wgHeldDropped;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] held wall %.63s DROPPED: its key did not read at the hook - it stays alone until its area loads again; heldDropped=%lld", h.key[0] != 0 ? h.key : "(no key)", g_wgHeldDropped);
+            BdWgLine(line);
+            continue;
+        }
+        if (g_bdZoneActiveNow[hc] == 0)
+        {
+            ++g_wgHeldDropped;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] held key=%.63s DROPPED: its area left here - held again at its next load; heldDropped=%lld", h.key, g_wgHeldDropped);
+            BdWgLine(line);
+            continue;
+        }
+        if ((c >= 0 && hc != c) || g_pcaDone[hc] == 0) { keep.push_back(h); continue; }
+        const std::string rk = BdWgRowKey(h.key);
+        if (WgFactGet(rk, 0, 0) != 0) { BdWallJoinFromRecord(rk, 0, road); continue; }   /* resolved: joined from its fact */
+        std::map<std::string, BdReg>::iterator r = g_reg.find(rk);
+        if (r == g_reg.end() || BdRowOwnWall(r->second) == 0)
+        {   /* another player's wall (or no row yet): alone until its owner's fact arrives (WgFactFromKept joins it then) */
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] held key=%.63s stays alone: %s - joined when its owner's fact arrives", h.key, r == g_reg.end() ? "no row here yet" : "no fact from its owner yet");
+            if (g_wgOnceLogged.count(std::string("heldalone|") + rk) == 0) ++g_wgHeldAlone;
+            BdWgOnce("heldalone", rk, line);
+            keep.push_back(h);
+            continue;
+        }
+        int fv = 0;
+        void* p = BdFindPiece(r->first, r->second, &fv);
+        if (p == 0 || BdIsWall(p) != 1)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] held own key=%.63s: its piece is not found yet - kept held until the next area event", h.key);
+            BdWgOnce("heldnopiece", rk, line);
+            keep.push_back(h);
+            continue;
+        }
+        if (p != h.wall)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] held own key=%.63s: its piece changed since the hook - the held join runs on the piece found now", h.key);
+            BdWgOnce("heldmoved", rk, line);
+        }
+        std::string lg;
+        const int heldKind = BdHeldNear(rk, &lg);
+        if (heldKind == 2) { BdWgLegacy(rk, lg, "an own wall next to it"); joined.push_back(p); continue; }   /* left alone, published as the engine has it */
+        if (heldKind == 1)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] held own key=%.63s waits: a neighbour held alone has no fact yet - its join runs when that fact arrives (or its area's records)", h.key);
+            BdWgOnce("heldnear", rk, line);
+            keep.push_back(h);
+            continue;
+        }
+        if (BdWallEngineJoinPod(p, h.area) != 0) { ++g_wgOwnDeferred; joined.push_back(p); }   /* the owner's engine decides an own wall with no fact */
+        else
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[WALLGROUP] held own key=%.63s: the engine's held join did NOT run (a fault or no address) - published as the engine has it (alone)", h.key);
+            BdWgOnce("heldjoinfail", rk, line);
+            joined.push_back(p);
+        }
+    }
+    g_wgHeldMain.swap(keep);
+    for (size_t i = 0; i < joined.size(); ++i) BdWallFactFromEngine(joined[i], "an own wall with no fact - the engine's held join run (or left alone)");
+}
+/* a kept record's fact noted under its STATE's key - a fact that arrives or changes joins the wall now when its piece is here (and runs
+   the held owner joins that waited for it); a removal mark or a gone record drops it (a lead's: BdWallLeadGone; a member's: its lead's
+   pass runs again, the later members no longer wait for it). MAIN THREAD */
+void WgFactFromKept(const std::string& id, const std::string& state, int removed)
+{
+    if (removed != 0 || state.empty())
+    {
+        std::map<std::string, std::string>::iterator k = g_wgIdKey.find(id);
+        if (k == g_wgIdKey.end()) return;
+        const std::string key = k->second;
+        g_wgIdKey.erase(k);
+        std::string l;
+        unsigned i = 0;
+        if (WgFactGet(key, &l, &i) == 0) return;
+        std::vector<std::pair<unsigned, std::string> > mem;
+        if (i == 0) WgFactMembersOf(key, &mem);
+        WgFactDrop(key);
+        if (!mem.empty()) BdWallLeadGone(key, mem);
+        if (i != 0) { void* L = BdWallPieceByKey(l); if (L != 0) BdWallLeadPass(l, L, "record"); }
+        return;
+    }
+    coopbuild::BuildMsg st;
+    if (coopbuild::DecodeBuild(state.data(), state.size(), &st) != coopbuild::kBuildDecodeOk || st.kind != coopbuild::kBuildState || st.groupLead.empty()) return;
+    g_wgIdKey[id] = st.key;
+    if (WgFactPut(st.key, st.groupLead, st.groupIdx) == 0) return;
+    ++g_wgFactsKept;
+    BdWallJoinFromRecord(st.key, 0, "record");   /* the fact arrived: joined now when its piece is here */
+    BdHeldResolve(-1, "record");   /* fold 13d: the held own walls that waited for this fact */
+}
+/* the hook on the engine's wall join 0x29AC10 (any thread: the placement commit on the main thread, the area loader where it runs) */
+void detour_wallJoinArea(void* wall, void* area)
+{
+    ::InterlockedIncrement64(&g_wgHookCalls);
+    const int inCommit = (g_commitDepth > 0 && ::GetCurrentThreadId() == g_commitTid) ? 1 : 0;
+    int player = 0;
+    if (wall != 0 && area != 0 && !RoleIsSingle() && BdIsWall(wall) == 1)
+    {   /* the wall's own owner: this game's faction or a stand-in (BuildBuildingIsPlayers), or a saved faction whose record id names a player
+           slot - read before the stand-in table has it (empty after a world load; StandInRecordSlot reads the id, any thread); unreadable counts */
+        void* f = 0;
+        if (BuildBuildingIsPlayers(wall) != 0) player = 1;
+        else if (BdOwnerReadPod(wall, &f) == 0) player = 1;
+        else if (f != 0 && StandInRecordSlot((::Faction*)f) != -1) player = 1;
+    }
+    char k[kKeyCap];
+    k[0] = 0;
+    if (wallgroup::LoadJoinDecide(inCommit, player, kBdWallJoinToRva != 0 ? 1 : 0) == wallgroup::kLoadJoinRun)
+    {
+        if (player != 0 && inCommit != 0 && BdOnMain() != 0 && ObjectPositionKey(wall, k, kKeyCap, "", 3, 1) != 0)
+        {
+            const std::string ks(k);
+            if (WgFactGet(ks, 0, 0) != 0) ::InterlockedIncrement64(&g_wgEngineOnRecorded);
+            std::string lg;
+            const int heldKind = BdHeldNear(ks, &lg);
+            if (heldKind != 0)
+            {   /* fold 13d (manager decision): the engine's walk cannot leave out a held wall, so the placement stays alone (the same on every
+                   game) and is logged. fold 13e: running the walk ourselves (0x2AB470 / 0x9FA9B0 and 0x29A850 on the candidates not held) is not
+                   done - it needs the area tree's candidate list layout (decomp_9fa9b0.txt), which no run has read back */
+                ++g_wgPlaceHeldN;
+                if (heldKind == 2) BdWgLegacy(ks, lg, "a placement next to a wall held alone whose records carry no fact - the placement stays alone");
+                else
+                {
+                    char pl[300];
+                    _snprintf_s(pl, sizeof(pl), _TRUNCATE, "[WALLGROUP] placement key=%.63s stays alone: a wall held alone next to it (%.63s) waits for its owner's fact, which may still come; placeAlone=%lld",
+                                k, lg.empty() ? "-" : lg.c_str(), g_wgPlaceHeldN);
+                    BdWgOnce("placealone", ks, pl);
+                }
+                return;
+            }
+        }
+        ::InterlockedIncrement64(&g_wgHookRun);
+        if (player != 0) ::InterlockedIncrement64(&g_wgEngineOnPlayer);
+        orig_wallJoinArea(wall, area);
+        if (wall != 0) { BdRecGenBump(BdWallRecordPod(wall)); BdRecGenBump((uintptr_t)wall + kWallOwnRecord); }   /* T-1408 fold 14d (review 6) */
+        return;
+    }
+    ::InterlockedIncrement64(&g_wgHookHeld);
+    if (ObjectPositionKey(wall, k, kKeyCap, "", 3, 1) == 0) { k[0] = 0; ::InterlockedIncrement64(&g_wgHookNoKey); }
+    WgHeld h;
+    h.wall = wall; h.area = area;
+    strncpy_s(h.key, sizeof(h.key), k, _TRUNCATE);
+    WgLock();
+    g_wgHeldQ.push_back(h);   /* unbounded: a held wall is never lost */
+    WgUnlock();
+}
+/* the newest kept record's STATE of the piece at key (not a removal mark). 1 = read */
+int BdKeptState(const std::string& key, coopbuild::BuildMsg* st)
+{
+    std::map<std::string, PcrKept>::const_iterator kp = g_pcrKept.find(piecerec::MakePieceRecId(key));
+    if (kp == g_pcrKept.end() || (kp->second.h.flags & piecerec::kPrFlagRemoved) != 0 || kp->second.b.state.empty()) return 0;
+    return (coopbuild::DecodeBuild(kp->second.b.state.data(), kp->second.b.state.size(), st) == coopbuild::kBuildDecodeOk && st->kind == coopbuild::kBuildState) ? 1 : 0;
+}
+/* the group's LIVE stamp: the stamp of the value its pieces hold now (0 after a load: the save's value carries none) */
+unsigned int BdGroupStampLive(const std::vector<std::string>& keys)
+{
+    unsigned int s = 0;
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        std::map<std::string, BdReg>::const_iterator r = g_reg.find(keys[i]);
+        if (r != g_reg.end() && r->second.gStamp > s) s = r->second.gStamp;
+    }
+    return s;
+}
+/* a GROUP STEP: stamp = the highest stamp this game knows for the group (its live stamp, its kept and queued records' stamps) and any stamp
+   seen here (g_gsClock - a Lamport stamp is never wrong for being higher) + 1, set on every key's row; each record written from those rows
+   carries it with the same value (BdOwnRowMsgs, PcrWriteOne). Returns the stamp */
+unsigned int BdGroupStampStep(const std::vector<std::string>& keys, const char* road, const std::string& key)
+{
+    unsigned int known = g_gsClock;
+    const unsigned int live = BdGroupStampLive(keys);
+    if (live > known) known = live;
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        coopbuild::BuildMsg st;
+        if (BdKeptState(keys[i], &st) != 0 && st.groupStamp > known) known = st.groupStamp;
+        std::map<std::string, BdStatePend>::const_iterator pm = g_pendState.find(keys[i]);
+        if (pm != g_pendState.end() && pm->second.m.groupStamp > known) known = pm->second.m.groupStamp;
+    }
+    const unsigned int stamp = coopbuild::BuildGroupStampNext(known);
+    int set = 0;
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        std::map<std::string, BdReg>::iterator r = g_reg.find(keys[i]);
+        if (r != g_reg.end()) { r->second.gStamp = stamp; ++set; }
+    }
+    g_gsClock = stamp;
+    ++g_gsSteps;
+    char line[300];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 group step key=%.63s road=%s stamp %u (known %u, live was %u) on %d record(s); groupStamp[steps]=%lld",
+                key.c_str(), road != 0 ? road : "-", stamp, known, live, set, g_gsSteps);
+    BdLogGroup(line);   /* T-1408 fold 10 (F1331 4) */
+    return stamp;
+}
+/* an applied record's stamp becomes the group's live stamp (never lowered) */
+void BdGroupStampTake(const std::vector<std::string>& keys, unsigned int stamp)
+{
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        std::map<std::string, BdReg>::iterator r = g_reg.find(keys[i]);
+        if (r != g_reg.end() && stamp > r->second.gStamp) r->second.gStamp = stamp;
+    }
+    if (stamp > g_gsClock) g_gsClock = stamp;
+}
+/* T-1408 fold 7, MAIN THREAD: 1 = a record of the group (any of its keys) queued here may still win over its live value
+   (coopbuild::BuildGroupStampMayWin) - its apply or drop ends it */
+int BdGroupRecordWaits(const std::vector<std::string>& keys)
+{
+    if (g_pendState.empty()) return 0;
+    const unsigned int live = BdGroupStampLive(keys);
+    for (size_t j = 0; j < keys.size(); ++j)
+    {
+        std::map<std::string, BdStatePend>::const_iterator pm = g_pendState.find(keys[j]);
+        if (pm != g_pendState.end() && pm->second.ownRec != 0 && coopbuild::BuildGroupStampMayWin(pm->second.m.groupStamp, live) != 0) return 1;
+    }
+    return 0;
+}
+/* T-1408 fold 9 (F1296), MAIN THREAD: EVERY member's area of a wall group (keys) folded (coopbuild::BuildGroupAreasFold): loaded here, and
+   its record list complete on this link (g_pcaDone) */
+void BdGroupAreas(const std::vector<std::string>& keys, int* allLoaded, int* allApplied)
+{
+    std::vector<int> ld(keys.size() + 1, 0), ap(keys.size() + 1, 0);
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        const int c = PcrSecOfId(piecerec::MakePieceRecId(keys[i]));
+        const int inRange = (c >= 0 && c < coopbuild::kBuildZoneSectorCells) ? 1 : 0;
+        ld[i] = (inRange != 0 && g_bdZoneActiveNow[c] != 0) ? 1 : 0;
+        ap[i] = (inRange != 0 && g_pcaDone[c] != 0) ? 1 : 0;
+    }
+    int shortG = 0;   /* T-1408 fold 10 (F1304 claim 4): members are found live, so one whose area is not loaded here is never listed - the lead's
+                         group count says it exists: the group counts as not wholly loaded */
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        std::map<std::string, int>::const_iterator sg = g_wallGroupShort.find(keys[i]);
+        if (sg != g_wallGroupShort.end() && sg->second != 0) shortG = 1;
+    }
+    ld[keys.size()] = (shortG != 0) ? 0 : 1; ap[keys.size()] = 1;
+    coopbuild::BuildGroupAreasFold(&ld[0], &ap[0], (int)keys.size() + 1, allLoaded, allApplied);
+}
+/* T-1408 fold 7, MAIN THREAD: what a change of an own wall's group (gk: the wall first, then its members here) does to its stamp -
+   coopbuild::BuildGroupStepWhat: adopt the applied record's stamp, step for new work, owe the step while a record of the group may still
+   win (run at its drop, BdGroupOwedTick; dropped at its apply), nothing for no new work */
+void BdGroupStepFor(const std::vector<std::string>& gk, int adopt, unsigned int adoptStamp, int newWork, const char* road)
+{
+    if (gk.empty()) return;
+    const int waits = (adopt == 0 && newWork != 0) ? BdGroupRecordWaits(gk) : 0;
+    const int what = coopbuild::BuildGroupStepWhat(adopt, newWork, waits);
+    if (what == coopbuild::kBuildGsAdopt || what == coopbuild::kBuildGsStep)
+    {
+        if (what == coopbuild::kBuildGsAdopt) { BdGroupStampTake(gk, adoptStamp); ++g_gsAdopted; }
+        else BdGroupStampStep(gk, road, gk[0]);
+        for (size_t i = 0; i < gk.size(); ++i)
+            if (g_gsOwed.erase(gk[i]) != 0 && what == coopbuild::kBuildGsAdopt) ++g_gsOwedAdopted;   /* the owed work was written over by the newer record */
+    }
+    else if (what == coopbuild::kBuildGsOwe)
+    {
+        if (g_gsOwed.insert(std::make_pair(gk[0], 0)).second)
+        {
+            ++g_gsOwedN;
+            char line[300];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] T-1408 group step key=%.63s road=%s OWED: a record of its group queued here may still win - decided with the group: dropped if a record wins, run if none does (kept over an area-unload drop); groupStamp[owed]=%lld",
+                        gk[0].c_str(), road != 0 ? road : "-", g_gsOwedN);
+            BdLogGroup(line);
+        }
+    }
+    else ++g_gsNoWork;
+}
+/* T-1408 fold 7 / 8, MAIN THREAD (BuildTick): owed steps DECIDED WITH THEIR GROUP (coopbuild::BuildGroupOwedRuns): a record of the group
+   still queued that may win keeps it (its apply drops it, BdGroupStepFor); the wall's area not loaded or its record list not complete on
+   this link keeps it too - an area-unload drop of the queued records is no decision (they come back at the next load and decide it; run
+   at the drop it would stamp the owner's older value over them); else no record won and it runs now (its key joins the tick's progress
+   keys as new work). A row gone takes its owed step with it */
+void BdGroupOwedTick(std::vector<std::string>& progKeys, std::vector<std::string>& stepKeys, std::vector<std::string>& touched)
+{
+    const int linked = (!RoleIsSingle() && StoreRelayLinked() && StoreMySlot() >= 0) ? 1 : 0;
+    for (std::map<std::string, int>::iterator it = g_gsOwed.begin(); it != g_gsOwed.end(); )
+    {
+        const std::string ok = it->first;
+        std::map<std::string, BdReg>::const_iterator r = g_reg.find(ok);
+        if (r == g_reg.end() || r->second.own == 0 || r->second.via == 3 || r->second.removed != 0) { ++g_gsOwedGone; g_gsOwed.erase(it++); continue; }
+        const std::vector<std::string> ogk = BdGroupKeysOf(ok);
+        int loaded = 0, allApplied = 0;
+        BdGroupAreas(ogk, &loaded, &allApplied);   /* T-1408 fold 9 (F1296): every member's area, whatever the link's state */
+        const int waits = BdGroupRecordWaits(ogk);
+        if (coopbuild::BuildGroupOwedRuns(waits, linked, loaded, allApplied) == 0)
+        {
+            if (waits == 0 && it->second == 0)
+            {   /* kept for its area (once per owed step) */
+                it->second = 1;
+                ++g_gsOwedKeptArea;
+                char kl[300];
+                _snprintf_s(kl, sizeof(kl), _TRUNCATE, "[BUILD] T-1408 fold 8 group step key=%.63s still OWED: its area %s - its records decide it at the next load; groupStamp[owedKeptArea]=%lld",
+                            ok.c_str(), loaded == 0 ? "(or a member's) is not loaded here (its queued records were dropped with it)" : "(or a member's) has its record list still to complete", g_gsOwedKeptArea);
+                BdLogGroup(kl);
+            }
+            ++it;
+            continue;
+        }
+        size_t t = 0;
+        while (t < progKeys.size() && progKeys[t] != ok) ++t;
+        if (t == progKeys.size()) progKeys.push_back(ok);
+        t = 0;
+        while (t < stepKeys.size() && stepKeys[t] != ok) ++t;
+        if (t == stepKeys.size()) stepKeys.push_back(ok);
+        t = 0;
+        while (t < touched.size() && touched[t] != ok) ++t;
+        if (t == touched.size()) touched.push_back(ok);
+        ++g_gsOwedRun;
+        g_gsOwed.erase(it++);   /* BdWallGroupsMark steps it now */
+    }
+}
+/* an own member's record landed OLDER than its group's live stamp (its area was not loaded at the group's steps): its row takes the
+   group's current value and live stamp from the lead and its record goes so - no new step, the value is not new */
+void BdOwnGroupCatchUp(const std::string& key, const std::vector<std::string>& keys, void* lead)
+{
+    std::map<std::string, BdReg>::iterator r = g_reg.find(key);
+    if (r == g_reg.end() || r->second.own == 0 || r->second.via == 3 || r->second.removed != 0 || lead == 0) return;
+    float p = 0.0f, n = 0.0f;
+    int c = 0, d = 0, x = 0;
+    if (BdReadState(lead, &p, &n, &c, &d, &x) == 0) return;
+    r->second.progress = p; r->second.needed = n; r->second.complete = c;
+    r->second.gStamp = BdGroupStampLive(keys);
+    ++g_gsCatchUp;
+    BdOwnDirty(1);
+    BdMaybeSendState(r->first, r->second);
+}
+/* T-1408 fold 7: stepKeys = the keys whose change was new work (0 = every key: a hit result); adopt = a record's value was applied - the
+   group takes adoptStamp, no step (BdOwnGroupLanded) */
+void BdWallGroupsMark(const std::vector<std::string>& keys, std::vector<std::string>& touched, const std::vector<std::string>* stepKeys, int adopt, unsigned int adoptStamp)
+{
+    std::set<std::string> leadsDone;   /* T-1408 fold 10: each group marked once */
     for (size_t i = 0; i < keys.size(); ++i)
     {
         std::map<std::string, BdReg>::iterator lr = g_reg.find(keys[i]);
         if (lr == g_reg.end() || lr->second.own == 0 || lr->second.via == 3 || lr->second.removed != 0) continue;
+        const int hitF = lr->second.hitForce;   /* T-1408 fold 10: a hit's value goes into every record of the group now */
+        {   /* T-1408 fold 10 (F1331 1b): a change on a MEMBER (a hit, help, a build) is its GROUP's - marked from its lead, whose row takes
+               the lead's live value (the engine's one shared record); every member's row and record and the group stamp step with it */
+            const std::string lk = BdGroupLeadKey(lr->first, lr->second);
+            std::map<std::string, BdReg>::iterator ld = (lk != lr->first) ? g_reg.find(lk) : g_reg.end();
+            if (ld != g_reg.end())
+            {
+                int fv = 0;
+                void* lb = BdFindPiece(ld->first, ld->second, &fv);
+                float lp = 0.0f, ln = 0.0f;
+                int lc = 0, lsd = 0, lx = 0;
+                const int lRead = (lb != 0) ? BdReadState(lb, &lp, &ln, &lc, &lsd, &lx) : 0;
+                if (lRead != 0) { ld->second.progress = lp; ld->second.needed = ln; ld->second.complete = lc; }
+                if (hitF != 0) ld->second.hitForce = 1;
+                ld->second.gen = g_bdGen;
+                BdOwnDirty(1);
+                size_t t = 0;
+                while (t < touched.size() && touched[t] != ld->first) ++t;
+                if (t == touched.size()) touched.push_back(ld->first);
+                ++g_gsFromMember;
+                char ml[400];
+                _snprintf_s(ml, sizeof(ml), _TRUNCATE, "[BUILD] T-1408 fold 10 group from member key=%.63s -> lead %.63s %s%.3f/%.2f complete=%d%s; groupFromMember=%lld",
+                            lr->first.c_str(), ld->first.c_str(), lRead != 0 ? "" : "(UNREAD, its row's) ", ld->second.progress, ld->second.needed, ld->second.complete,
+                            hitF != 0 ? " - a hit: every record of the group written" : "", g_gsFromMember);
+                BdLogGroup(ml);
+                lr = ld;
+            }
+        }
+        if (!leadsDone.insert(lr->first).second) continue;
         const std::vector<std::string> mem = BdWallGroupOf(lr->first, lr->second);
         const BdReg& L = lr->second;
+        {   /* T-1408 fold 7: a wall's NEW work (build with an amount, finish, dismantle, hit) is a group step - one stamp for it and every
+               member marked below, owed while a record of the group may still win; an applied record's stamp is adopted, never stepped */
+            std::map<std::string, int>::const_iterator wk = g_wallKeyIs.find(lr->first);
+            if (!mem.empty() || (wk != g_wallKeyIs.end() && wk->second == 1) || g_wallGroups.find(lr->first) != g_wallGroups.end())
+            {
+                std::vector<std::string> gk(1, lr->first);
+                gk.insert(gk.end(), mem.begin(), mem.end());
+                int work = 1;
+                if (stepKeys != 0)
+                {
+                    work = 0;
+                    for (size_t q = 0; q < stepKeys->size() && work == 0; ++q) if ((*stepKeys)[q] == lr->first || (*stepKeys)[q] == keys[i]) work = 1;   /* fold 10: the member's work is the group's */
+                }
+                BdGroupStepFor(gk, adopt, adoptStamp, work, adopt != 0 ? "adopt" : "owner");
+            }
+        }
         for (size_t j = 0; j < mem.size(); ++j)
         {
             std::map<std::string, BdReg>::iterator mr = g_reg.find(mem[j]);
@@ -14861,6 +19066,7 @@ void BdWallGroupsMark(const std::vector<std::string>& keys, std::vector<std::str
             BdReg& r = mr->second;
             if (L.complete != 0 && r.complete == 0) ItFurnMarkStale(3);   /* T-454: complete 0 -> 1 against the row's last state */
             r.progress = L.progress; r.needed = L.needed; r.complete = L.complete;
+            if (hitF != 0) r.hitForce = 1;   /* T-1408 fold 10: the hit's value in this member's record too */
             if (L.nMats >= 0)
             {
                 r.nMats = L.nMats > (int)coopbuild::kBuildMaxMats ? (int)coopbuild::kBuildMaxMats : L.nMats;
@@ -14874,6 +19080,34 @@ void BdWallGroupsMark(const std::vector<std::string>& keys, std::vector<std::str
             if (t == touched.size()) touched.push_back(mr->first);
         }
     }
+}
+/* T-1408 fold 4, MAIN THREAD (BdApplyOne): the owner's own group's lead took its shared record - every member's row takes the lead's
+   (BdWallGroupsMark), and the lead's and members' STATEs and records go (BdMaybeSendState), pp.build after the writer's gap */
+void BdOwnGroupLanded(const std::string& key, void* lead, unsigned int stamp)
+{
+    std::string k = key;
+    char lk[kKeyCap];
+    lk[0] = 0;
+    if (lead != 0 && ObjectPositionKey(lead, lk, kKeyCap, "", 3, 0) != 0)
+    {   /* T-1408 fold 5: the lead's row takes the lead's value as read now, and every record of the group is marked from it */
+        std::map<std::string, BdReg>::iterator lr = BdRowByLiveKey(std::string(lk));
+        float p = 0.0f, n = 0.0f;
+        int c = 0, d = 0, x = 0;
+        if (lr != g_reg.end() && lr->second.own != 0 && lr->second.via != 3 && BdReadState(lead, &p, &n, &c, &d, &x) != 0)
+        {
+            lr->second.progress = p; lr->second.needed = n; lr->second.complete = c;
+            k = lr->first;
+        }
+    }
+    std::vector<std::string> keys(1, k), touched(1, k);
+    if (k != key) touched.push_back(key);
+    BdWallGroupsMark(keys, touched, 0, 1, stamp);   /* T-1408 fold 7: the record's stamp adopted (F1283 BLOCKER: never a fresh step) */
+    for (size_t t = 0; t < touched.size(); ++t)
+    {
+        std::map<std::string, BdReg>::iterator it = g_reg.find(touched[t]);
+        if (it != g_reg.end()) BdMaybeSendState(it->first, it->second);
+    }
+    BdOwnDirty(1);
 }
 
 /* T-609 U fix, MAIN THREAD (the hook on the main thread, or BdRekeyDrain): building b's key changed from k0 to k1 under the engine's
@@ -14940,6 +19174,7 @@ void BdRekeyMain(const char* k0, const char* k1, const char* sid, int down, long
             nr.hostKey = r.hostKey; nr.hostForm = r.hostForm; nr.liveKey.clear(); nr.keySame = 1;
             nr.placeOk = r.placeOk;
             for (int i = 0; i < 3; ++i) nr.placePos[i] = r.placePos[i];
+            nr.placeMark = r.placeMark;   /* T-1372 */
             for (int i = 0; i < 4; ++i) nr.placeRot[i] = r.placeRot[i];
             nr.floor = r.floor; nr.outside = r.outside; nr.ownerSlot = r.ownerSlot; nr.handed = r.handed;
             nr.broken = r.broken;
@@ -15068,7 +19303,7 @@ int BdHitReplayHere(const std::string& key, BdReg& r, void* b, float cut, float 
         ++g_hitGroupUnread;
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a copy wall key=%.63s seq=%u NOT RUN: its progress could not be read before the hit (no drop to send%s); hitGroupUnread=%lld",
                     key.c_str(), seq, groupRec != 0 ? ", and its group's record could not be put back" : "", g_hitGroupUnread);
-        BdLogCapped(line);
+        BdLogHit(line, key, 1, 0);
         return 0;
     }
     ++g_hitReplay;
@@ -15113,7 +19348,7 @@ int BdHitReplayHere(const std::string& key, BdReg& r, void* b, float cut, float 
                 key.c_str(), res.seq, drop, p0, p1, n1, x1, sent ? "" : " NOT SENT",
                 put < 0 ? "" : (put != 0 ? "; its group's record put back" : "; its group's record NOT put back (the write faulted)"),
                 owedNow != 0 ? "; owed to the owner's game until it takes it" : (enc ? "; NOT owed (the owner's slot is not known)" : ""), res.hitAfter, res.needed, g_hitResultSent);
-    BdLogCapped(line);
+    BdLogHit(line, key, sent ? 0 : 1, 0);
     return 1;
 }
 /* the HIT lines' door words: " door <i>" (and " repair" for a repair's gain) for a door's hit, nothing for a wall's */
@@ -15144,38 +19379,42 @@ int BdDoorHitHere(const std::string& key, void* b, void* door, float cut, float 
 }
 /* MAIN THREAD (BuildTick): a hit the hook kept from the engine, for the K2 safe point (noRow: the wall has no registry row here; at:
    when the hit was made, 0 = now - an ask made again keeps it, so kHitLifeMs counts from the hit) */
-void BdHitLocalQueue(const std::string& key, float cut, float blunt, int reasked, int noRow, DWORD at = 0, int door = -1, int repair = 0)
+void BdHitLocalQueue(const std::string& key, float cut, float blunt, int reasked, int noRow, DWORD at = 0, int door = -1, int repair = 0, const BdAtk* atk = 0)
 {
     if (g_hitLocal.size() >= kHitInCap) { ++g_hitInDropped; return; }
     BdHitLocal h;
     h.key = key; h.cut = cut; h.blunt = blunt; h.reasked = reasked; h.noRow = noRow; h.at = (at != 0) ? at : ::GetTickCount(); h.door = door; h.repair = repair;
+    h.atk = BdAtk(); h.atk.known = -1;   /* T-1381: -1 none carried (a repair's gain) */
+    if (atk != 0) h.atk = *atk;
     g_hitLocal.push_back(h);
 }
 /* K2 safe point: who writes this player wall (the machines' writer). This game: the hit runs here. Another game: a HIT ask to it,
    numbered and sent again until answered or kHitLifeMs after the hit was made (madeAt). Nobody now: dropped (hitNoWriter). A piece at
    the key that is not a wall here now is not hit (hitNotWall). reasked = the ask a 'not the writer' answer gives once more. */
-void BdHitDecide(const std::string& key, BdReg& r, float cut, float blunt, int reasked, DWORD madeAt, int door = -1, int repair = 0)
+void BdHitDecide(const std::string& key, BdReg& r, float cut, float blunt, int reasked, DWORD madeAt, int door = -1, int repair = 0, const BdAtk* atk = 0)
 {
-    char line[420];
+    char line[1700];
     char dt[48];
     BdHitDoorTag(dt, sizeof dt, door, repair);
     int tv = 0;
     void* b = (r.removed == 0) ? BdFindPiece(key, r, &tv) : 0;
+    char aw[1000], pw[160];   /* T-1381: who swung it, what it was going for, and the piece's name and owner */
+    BdHitWhoWords(aw, sizeof aw, atk, pw, sizeof pw, b);
     if (b == 0)
     {
         ++g_hitNoOwner;
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s cut=%g blunt=%g LOST: the piece is %s here now; hitNoOwner=%lld",
-                    key.c_str(), dt, cut, blunt, r.removed != 0 ? "removed" : "not loaded", g_hitNoOwner);
-        BdLogCapped(line);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s cut=%g blunt=%g%s LOST: the piece is %s here now; hitNoOwner=%lld",
+                    key.c_str(), dt, cut, blunt, aw, r.removed != 0 ? "removed" : "not loaded", g_hitNoOwner);
+        BdLogHit(line, key, 1, atk);
         return;
     }
     void* dr = (door >= 0) ? DoorsKeptDoorAt(b, door) : 0;   /* a door's hit (or repair) lands on that door of the piece */
     if ((door >= 0) ? (dr == 0) : (BdIsWall(b) != 1))
     {
         ++g_hitNotWall;
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s cut=%g blunt=%g DROPPED: the piece at that key is not a wall here now; hitNotWall=%lld",
-                    key.c_str(), dt, cut, blunt, g_hitNotWall);
-        BdLogCapped(line);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s cut=%g blunt=%g%s%s DROPPED: the piece at that key is not a wall here now; hitNotWall=%lld",
+                    key.c_str(), dt, cut, blunt, pw, aw, g_hitNotWall);
+        BdLogHit(line, key, 1, atk);
         return;
     }
     FarmWriterView v;
@@ -15184,9 +19423,9 @@ void BdHitDecide(const std::string& key, BdReg& r, float cut, float blunt, int r
     {
         ++g_hitHere;
         const int ran = (door >= 0) ? BdDoorHitHere(key, b, dr, cut, blunt, repair != 0 ? 2 : 0) : BdHitReplayHere(key, r, b, cut, blunt, BdHitNewSeq());
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s (%s) cut=%g blunt=%g: this game writes it - the engine's hit %s%s; hitHere=%lld",
-                    key.c_str(), dt, (r.own != 0 && r.via != 3) ? "own" : "a copy", cut, blunt, ran != 0 ? "ran here" : "FAULTED", reasked != 0 ? " (asked again)" : "", g_hitHere);
-        BdLogCapped(line);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s (%s)%s cut=%g blunt=%g%s: this game writes it - the engine's hit %s%s; hitHere=%lld",
+                    key.c_str(), dt, (r.own != 0 && r.via != 3) ? "own" : "a copy", pw, cut, blunt, aw, ran != 0 ? "ran here" : "FAULTED", reasked != 0 ? " (asked again)" : "", g_hitHere);
+        BdLogHit(line, key, ran != 0 ? 0 : 1, atk);
         return;
     }
     if (v.verdict == 2 && v.slot >= 0)
@@ -15194,19 +19433,21 @@ void BdHitDecide(const std::string& key, BdReg& r, float cut, float blunt, int r
         BdHitOut o;
         o.key = key; o.seq = BdHitNewSeq(); o.cut = cut; o.blunt = blunt; o.slot = v.slot; o.sentAt = 0; o.sent = 0; o.madeAt = (madeAt != 0) ? madeAt : ::GetTickCount(); o.reasked = reasked;
         o.door = door; o.repair = repair;
+        o.atk = BdAtk(); o.atk.known = -1;
+        if (atk != 0) o.atk = *atk;   /* T-1381: a re-ask names it too */
         if (g_hitOut.size() >= kHitOutCap) { g_hitOut.erase(g_hitOut.begin()); ++g_hitDropped; }
         g_hitOut.push_back(o);
         ++g_hitAsked;
         if (door >= 0 && repair == 0) ++g_doorHitAsked;
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s (%s) cut=%g blunt=%g - asked of slot%d's game (its writer now) as HIT seq=%u%s; hitAsked=%lld",
-                    key.c_str(), dt, (r.own != 0 && r.via != 3) ? "own" : "a copy", cut, blunt, v.slot, o.seq, reasked != 0 ? " (asked again)" : "", g_hitAsked);
-        BdLogCapped(line);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s (%s)%s cut=%g blunt=%g%s - asked of slot%d's game (its writer now) as HIT seq=%u%s; hitAsked=%lld",
+                    key.c_str(), dt, (r.own != 0 && r.via != 3) ? "own" : "a copy", pw, cut, blunt, aw, v.slot, o.seq, reasked != 0 ? " (asked again)" : "", g_hitAsked);
+        BdLogHit(line, key, 0, atk);
         return;
     }
     ++g_hitNoWriter;
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s cut=%g blunt=%g DROPPED: no game writes it now (writer ask %d, slot %d); hitNoWriter=%lld",
-                key.c_str(), dt, cut, blunt, v.verdict, v.slot, g_hitNoWriter);
-    BdLogCapped(line);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s%s cut=%g blunt=%g%s DROPPED: no game writes it now (writer ask %d, slot %d); hitNoWriter=%lld",
+                key.c_str(), dt, pw, cut, blunt, aw, v.verdict, v.slot, g_hitNoWriter);
+    BdLogHit(line, key, 1, atk);
 }
 /* MAIN THREAD (BuildTick, event 6): a door of a player piece changed here - its repair ran here (gain: the health it added), or the
    engine's hit ran here unasked. The piece's record writer here (a game with no other player known included): the record takes the
@@ -15322,7 +19563,7 @@ void BdHitTick()
             char el[300];
             _snprintf_s(el, sizeof(el), _TRUNCATE, "[BUILD] HIT seq=%u key=%.63s to slot%d EXPIRED: %s within %lu ms - dropped; hitExpired=%lld",
                         o.seq, o.key.c_str(), o.slot, o.sent != 0 ? "no answer" : "the writer's game was not reachable", (unsigned long)kHitLifeMs, g_hitExpired);
-            BdLogCapped(el);
+            BdLogHit(el, o.key, 1, 0);
             o.seq = 0;
             continue;
         }
@@ -15363,7 +19604,7 @@ void BdHitOwedOnState(const coopbuild::BuildMsg& m, int from)
                 ++g_hitOwedCleared;
                 _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] HIT drop %.2f on key=%.63s owed to slot%d cleared: its STATE shows %.2f/%.2f (destroyed %d), at or below the expected %.2f/%.2f; hitOwedCleared=%lld",
                             o.sum, o.key.c_str(), from, m.progress, m.needed, (int)m.destroyed, o.expectP, o.needN, g_hitOwedCleared);
-                BdLogCapped(line);
+                BdLogHit(line, o.key, 0, 0);
             }
             else if (act == coopbuild::kBuildHitOwedResend && net::BuildSlotTarget(from) == from)
             {
@@ -15375,7 +19616,7 @@ void BdHitOwedOnState(const coopbuild::BuildMsg& m, int from)
                     ++g_hitOwedSent;
                     _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] -> HIT owed key=%.63s seq=%u drop=%.2f (%u hits) to slot%d: its STATE shows %.2f/%.2f, above the expected %.2f/%.2f; hitOwedSent=%lld",
                                 o.key.c_str(), o.seq, o.sum, (unsigned int)o.hitSeqs.size(), from, m.progress, m.needed, o.expectP, o.needN, g_hitOwedSent);
-                    BdLogCapped(line);
+                    BdLogHit(line, o.key, 0, 0);
                 }
             }
         }
@@ -15410,7 +19651,7 @@ void BdHitOnRecv(const coopbuild::BuildMsg& m, int from)
                     m.key.c_str(), m.seq, from, coopbuild::BuildHitWord((int)m.reason),
                     owedAns == coopbuild::kBuildHitOwedTaken ? "the owner's game took that owed hit" : "the owner's game did not take it - kept owed for its next STATE",
                     g_hitOwedAcked, g_hitOwedKept);
-        BdLogCapped(line);
+        BdLogHit(line, m.key, 0, 0);
         return;
     }
     if (i < g_hitOut.size() && g_hitOut[i].slot != from)
@@ -15419,7 +19660,7 @@ void BdHitOnRecv(const coopbuild::BuildMsg& m, int from)
         char wl[300];
         _snprintf_s(wl, sizeof(wl), _TRUNCATE, "[BUILD] <- HIT answer key=%.63s seq=%u from slot%d DROPPED: the ask went to slot%d; hitAnsWrongSlot=%lld",
                     m.key.c_str(), m.seq, from, g_hitOut[i].slot, g_hitAnsWrongSlot);
-        BdLogCapped(wl);
+        BdLogHit(wl, m.key, 1, 0);
         return;
     }
     const int had = (i < g_hitOut.size()) ? 1 : 0;
@@ -15427,19 +19668,19 @@ void BdHitOnRecv(const coopbuild::BuildMsg& m, int from)
     if (had != 0) { o = g_hitOut[i]; g_hitOut.erase(g_hitOut.begin() + (std::ptrdiff_t)i); }
     if (m.reason == coopbuild::kBuildHitNotWriter && had != 0)
     {
-        if (o.reasked == 0) { ++g_hitReasked; BdHitLocalQueue(o.key, o.cut, o.blunt, 1, 0, o.madeAt, o.door, o.repair); }
+        if (o.reasked == 0) { ++g_hitReasked; BdHitLocalQueue(o.key, o.cut, o.blunt, 1, 0, o.madeAt, o.door, o.repair, &o.atk); }
         else ++g_hitNotWriterDropped;
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HIT answer key=%.63s seq=%u from slot%d: %s - %s; hitReasked=%lld hitNotWriterDropped=%lld",
                     m.key.c_str(), m.seq, from, coopbuild::BuildHitWord((int)m.reason), o.reasked == 0 ? "the writer is asked once more" : "already asked twice, dropped",
                     g_hitReasked, g_hitNotWriterDropped);
-        BdLogCapped(line);
+        BdLogHit(line, m.key, o.reasked != 0 ? 1 : 0, 0);
         return;
     }
     if (m.reason == coopbuild::kBuildHitApplied) ++g_hitAcked; else ++g_hitAnsRefused;
     if (had != 0) TbRepairAnswer(o.key, o.door, o.repair, (int)m.reason);   /* T-1333 fold 1 D: a town wall repair answered 'ruin' - the wall laid a ruin again here */
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HIT answer key=%.63s seq=%u from slot%d: %s%s; hitAcked=%lld hitAnsRefused=%lld",
                 m.key.c_str(), m.seq, from, coopbuild::BuildHitWord((int)m.reason), had != 0 ? "" : " (nothing owed here - answered before)", g_hitAcked, g_hitAnsRefused);
-    BdLogCapped(line);
+    BdLogHit(line, m.key, m.reason == coopbuild::kBuildHitApplied ? 0 : 1, 0);
 }
 /* K2 safe point: a writer's HIT result on a game that did not run the hit. Taken only from the game this game's own writer ask names
    (coopbuild::BuildHitResultAccept): a stale writer (during a holder change) or any other game is refused, and the owner's game refuses
@@ -15472,7 +19713,7 @@ void BdHitResultApply(const coopbuild::BuildMsg& m, int from)
         ++g_hitResultSkipped;
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HIT result key=%.63s seq=%u from slot%d%s skipped: no live wall row loaded here (not answered); hitResultSkipped=%lld",
                     m.key.c_str(), m.seq, from, m.hitOwed != 0 ? " (owed)" : "", g_hitResultSkipped);
-        BdLogCapped(line);
+        BdLogHit(line, m.key, 1, 0);
         return;
     }
     FarmWriterView wv;
@@ -15487,7 +19728,7 @@ void BdHitResultApply(const coopbuild::BuildMsg& m, int from)
                         m.key.c_str(), m.seq, from, m.hitOwed != 0 ? " (owed)" : "",
                         wv.verdict == 1 ? "this game writes it" : (wv.verdict == 2 ? "another game writes it" : "no game writes it now"), wv.slot,
                         own != 0 ? (told ? " - the writer is told" : " - the answer found no road") : "", g_hitResultRefused, kHitRefuseLogs);
-            BdLogCapped(line);
+            BdLogHit(line, m.key, 1, 0);
         }
         return;
     }
@@ -15503,7 +19744,7 @@ void BdHitResultApply(const coopbuild::BuildMsg& m, int from)
                     m.key.c_str(), m.seq, from, m.hitOwed != 0 ? " (owed)" : "",
                     seen != 0 ? "taken here already (sent again)" : "this game's health share is not above the writer's expected share - the zone record it loaded carries the hits",
                     lp, ln, m.hitAfter, m.needed, own != 0 ? (told ? " - answered" : " - the answer found no road") : "", g_hitResultDup, g_hitOwedGated);
-        BdLogCapped(line);
+        BdLogHit(line, m.key, 0, 0);
         return;
     }
     const int recOk = (own != 0 || BdWallOwnRecord(b) > 0) ? 1 : 0;
@@ -15536,14 +19777,20 @@ void BdHitResultApply(const coopbuild::BuildMsg& m, int from)
         r.progress = p1; r.needed = n1; r.complete = c1; r.destroyed = x1;
         r.hitForce = 1;
         BdOwnDirty(1);
-        BdMaybeSendState(it->first, r);
+        std::vector<std::string> hk(1, it->first), htouched(1, it->first);
+        BdWallGroupsMark(hk, htouched, 0, 0, 0);   /* T-1408 fold 7 (F1283): a hit is new work - a group step, every record of the group takes it */
+        for (size_t t = 0; t < htouched.size(); ++t)
+        {
+            std::map<std::string, BdReg>::iterator ht = g_reg.find(htouched[t]);
+            if (ht != g_reg.end()) BdMaybeSendState(ht->first, ht->second);
+        }
         told = BdHitAnswer(m.key, m.seq, ok != 0 ? coopbuild::kBuildHitApplied : coopbuild::kBuildHitFaulted, from);
     }
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HIT result key=%.63s seq=%u from slot%d%s (%s): drop %.2f destroyed=%d -> %s%s; here %.2f -> %.2f/%.2f destroyed %d->%d%s; hitResultApplied=%lld",
                 m.key.c_str(), m.seq, from, m.hitOwed != 0 ? " (owed)" : "", own != 0 ? "own piece" : (recOk != 0 ? "own-record copy" : "group-record copy"), m.hitDrop, (int)m.destroyed,
                 act == coopbuild::kBuildHitResDestroy ? "ruined" : (act == coopbuild::kBuildHitResProgress ? "health lowered" : "nothing to write"),
                 ok != 0 ? "" : " FAULTED", lp, p1, n1, lx, x1, own != 0 ? (told ? "; answered" : "; the answer found no road") : "", g_hitResultApplied);
-    BdLogCapped(line);
+    BdLogHit(line, m.key, 0, 0);
 }
 /* ==== T-1333 (design a): A TOWN BUILDING'S RUIN FLAG AND WALL HEALTH AS ONE WORLD-SERVER RECORD EACH (src/common/bldgrec.h) ==========
    A town wall (a WallBuilding no player owns) is written by the HOLDER of its area only, from the engine's own writers: its melee hit
@@ -16321,16 +20568,17 @@ void BdHitDrain()
                 else
                 {
                     ++g_hitNoRow;
-                    char nl[300], dt[48];
+                    char nl[1600], dt[48], aw[1000], pw[160];
                     BdHitDoorTag(dt, sizeof dt, h.door, h.repair);
-                    _snprintf_s(nl, sizeof(nl), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s LOST: no registry row for it here and not this game's own; hitNoRow=%lld", h.key.c_str(), dt, g_hitNoRow);
-                    BdLogCapped(nl);
+                    BdHitWhoWords(aw, sizeof aw, h.atk.known >= 0 ? &h.atk : 0, pw, sizeof pw, b);   /* T-1381 */
+                    _snprintf_s(nl, sizeof(nl), _TRUNCATE, "[BUILD] hit on a player wall key=%.63s%s%s%s LOST: no registry row for it here and not this game's own; hitNoRow=%lld", h.key.c_str(), dt, pw, aw, g_hitNoRow);
+                    BdLogHit(nl, h.key, 1, h.atk.known >= 0 ? &h.atk : 0);
                 }
                 continue;
             }
             std::map<std::string, BdReg>::iterator it = g_reg.find(h.key);
             if (it == g_reg.end()) { ++g_hitNoRow; continue; }
-            BdHitDecide(it->first, it->second, h.cut, h.blunt, h.reasked, h.at, h.door, h.repair);
+            BdHitDecide(it->first, it->second, h.cut, h.blunt, h.reasked, h.at, h.door, h.repair, h.atk.known >= 0 ? &h.atk : 0);
         }
     }
     {
@@ -16350,7 +20598,7 @@ void BdHitDrain()
             char sl[300];
             _snprintf_s(sl, sizeof(sl), _TRUNCATE, "[BUILD] <- HIT key=%.63s seq=%u from slot%d STALE: arrived over %lu ms ago - dropped, not replayed; hitStale=%lld",
                         m.key.c_str(), m.seq, from, (unsigned long)kHitLifeMs, g_hitStale);
-            BdLogCapped(sl);
+            BdLogHit(sl, m.key, 1, 0);
             continue;
         }
         std::map<std::string, BdReg>::iterator it = g_reg.find(m.key);
@@ -16374,6 +20622,10 @@ void BdHitDrain()
         int c0 = 0, d0 = 0, x0 = 0, c1 = 0, d1 = 0, x1 = 0;
         if (b != 0) BdReadState(b, &p0, &n0, &c0, &d0, &x0);
         p1 = p0; n1 = n0; x1 = x0;
+        float dh0 = 0.0f, dh1 = 0.0f, dmx = 0.0f;   /* T-1381 (F1073): the door's own health - the piece's above is the house's */
+        int db0 = 0, db1 = 0, dhl = 0, dlv = 0, dlb0 = 0, dlb1 = 0;
+        const int dRead0 = (dr != 0 && b != 0) ? DoorsRecReadPod(dr, &dh0, &dmx, &db0, &dhl, &dlv, &dlb0) : 0;
+        dh1 = dh0; db1 = db0; dlb1 = dlb0;
         const int writer = (b != 0 && WallWriterDecide(b, 0) == 1) ? 1 : 0;
         const int dup = coopbuild::BuildHitSeenBy(g_hitSeenBy, from, m.seq);
         int v = coopbuild::BuildHitVerdict(dup, held, b != 0 ? 1 : 0, x0, writer);
@@ -16385,6 +20637,7 @@ void BdHitDrain()
             {
                 coopbuild::BuildHitRememberBy(&g_hitSeenBy, from, m.seq, kHitSeenCap);
                 BdReadState(b, &p1, &n1, &c1, &d1, &x1);
+                if (dRead0 != 0 && DoorsRecReadPod(dr, &dh1, &dmx, &db1, &dhl, &dlv, &dlb1) == 0) { dh1 = -1.0f; }   /* T-1381 */
             }
         }
         else if (dup != 0) ++g_hitDup;
@@ -16397,17 +20650,32 @@ void BdHitDrain()
         const bool sent = from >= 0 && net::BuildSlotTarget(from) == from && coopbuild::BuildEncodable(a) && net::SendBuildToSlot(a, from);   /* the asker by its own slot only */
         if (!sent) ++g_hitAnswerNotSent;
         else if (m.hitDoor >= 0) ++g_doorHitAnswered;
-        char line[520], dt[48];
+        char line[900], dt[48], aw[8], pw[160], dw[120];
         BdHitDoorTag(dt, sizeof dt, m.hitDoor, m.hitRepair);
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HIT key=%.63s%s seq=%u from slot%d cut=%g blunt=%g (%s): %s%s; health %.2f -> %.2f/%.2f destroyed %d->%d; answer %s; hitReplayed=%lld hitDup=%lld hitRefused=%lld hitFaulted=%lld",
-                    m.key.c_str(), dt, m.seq, from, m.hitCut, m.hitBlunt, ownRow != 0 ? "own piece" : "a copy", coopbuild::BuildHitWord(v), dup != 0 ? " (a resend: answered again, not hit again)" : "",
-                    p0, p1, n1, x0, x1, sent ? "sent" : "NOT SENT (no road to the asker)", g_hitReplayed, g_hitDup, g_hitRefused, g_hitFaulted);
-        BdLogCapped(line);
+        dw[0] = 0;
+        if (m.hitDoor >= 0)
+        {
+            if (dRead0 != 0) _snprintf_s(dw, sizeof dw, _TRUNCATE, "; door health %.2f -> %.2f/%.2f broken %d->%d lockBroken %d->%d", dh0, dh1, dmx, db0, db1, dlb0, dlb1);
+            else _snprintf_s(dw, sizeof dw, _TRUNCATE, "; door health not read (%s)", dr == 0 ? "no such door here" : "the read faulted");
+        }
+        void* pb = b;   /* T-1381: the piece's name and owner - the found piece, else what stands at the key here */
+        if (pb == 0) pb = ObjectByPositionKey(m.key.c_str());
+        BdHitWhoWords(aw, sizeof aw, 0, pw, sizeof pw, pb);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HIT key=%.63s%s%s seq=%u from slot%d cut=%g blunt=%g (%s; %s - slot%d's 'asked of' line for this seq names it): %s%s; health %.2f -> %.2f/%.2f destroyed %d->%d (the piece)%s; answer %s; hitReplayed=%lld hitDup=%lld hitRefused=%lld hitFaulted=%lld",
+                    m.key.c_str(), dt, pw, m.seq, from, m.hitCut, m.hitBlunt, ownRow != 0 ? "own piece" : "a copy",
+                    m.hitRepair != 0 ? "a repair's gain" : "the ask carries no attacker", from, coopbuild::BuildHitWord(v), dup != 0 ? " (a resend: answered again, not hit again)" : "",
+                    p0, p1, n1, x0, x1, dw, sent ? "sent" : "NOT SENT (no road to the asker)", g_hitReplayed, g_hitDup, g_hitRefused, g_hitFaulted);
+        BdLogHit(line, m.key, (sent && v == coopbuild::kBuildHitApplied) ? 0 : 1, 0);
     }
 }
 
 void BuildTick()
 {
+    {   /* T-1401: the hit and line-kind counts a minute old, looked at every 5 s */
+        static DWORD s_bdFlushAt = 0;
+        const DWORD nowF = ::GetTickCount();
+        if (nowF - s_bdFlushAt >= 5000u) { s_bdFlushAt = nowF; BdLogFlush(false); }
+    }
     BdSweepRemoved();   /* review-build1d D5 */
     TbTick();   /* T-1333: town building lays that waited for the engine's writes */
     BdTwmTick();   /* T-1078: the [BUILD] town mismatch checks */
@@ -16420,11 +20688,16 @@ void BuildTick()
     if (n > 0) std::memcpy(g_drain, g_q, sizeof(BdEvent) * (size_t)n);
     g_qn = 0;
     ::LeaveCriticalSection(&g_qcs);
+    ::InterlockedExchange(&g_engRmOtherPending, 0);   /* T-1372 re-check fold N2: the queue is drained - the log-only allowance starts again */
     std::vector<std::string> touched;   /* build1-c: own pieces whose progress event arrived this tick - one STATE check per key */
     std::vector<std::string> progKeys;   /* own keys with a progress event this tick - a wall group's lead among them marks its group */
+    std::vector<std::string> stepKeys;   /* T-1408 fold 7: those whose event was new work (coopbuild::BuildGroupNewWork) - only they step the group's stamp */
     for (int i = 0; i < n; ++i)
     {
         const BdEvent& e = g_drain[i];
+        DoorsPieceKeys engDk;   /* T-1372 review fold 2: an event 12's door keys, out of its capture slot (freed whatever happens next) */
+        engDk.n = 0;
+        if (e.kind == 12) BdEngRmDoorKeysTake(e, &engDk);
         if (e.kind == 11) { if (e.keyOk != 0) TbCopyDropLine(std::string(e.key), e.door, (unsigned int)e.dismBefore, e.amount, e.amount2, e.harvest); continue; }   /* T-1333 fold 1 B */
         if (e.kind >= 7 && e.kind <= 10)
         {   /* T-1333: a town building's hit held (7 wall, 10 door) or repair gain (9) - decided at the K2 safe point (TbHitLocalTake);
@@ -16435,6 +20708,7 @@ void BuildTick()
             else BdHitLocalQueue(std::string(e.key), e.amount, e.amount2, 0, 2, 0, e.kind == 10 ? e.door : -1, 0);
             continue;
         }
+        if (e.kind == 12 && (e.keyOk == 0 || e.stateOk == 0)) { if (e.amount > 0.5f) ++g_engRmLost; continue; }   /* T-1372: the piece's key or state did not read */
         if (e.kind == 3 && e.keyOk != 0 && e.amount < 0.5f && g_reg.find(std::string(e.key)) == g_reg.end())
             TbNote(std::string(e.key), bldgrec::kBgCauseRuin);   /* T-1333: the engine's own ruin flip of a building with no registry row - a town wall's record */
         if (e.kind == 1 && e.harvest != 0 && e.keyOk != 0)
@@ -16462,6 +20736,9 @@ void BuildTick()
             {
                 if (e.complete != 0 && it->second.complete == 0) ItFurnMarkStale(3);   /* T-454: complete 0 -> 1 against the row's last state */
                 if (e.complete != 0 && it->second.complete == 0) PcQueue(it->first, coopbuild::kPcRoadBuilt);   /* T-988 */
+                if (e.complete != 0 && it->second.complete == 0 && e.kind == 1) BdTownStoreNote(ObjectByPositionKey(e.key), e.key, "finished (by the engine)");   /* T-1427 (decision 1782) */
+                if (e.complete == 0 && it->second.complete != 0) PcQueue(it->first, coopbuild::kPcRoadProgressEvent);   /* T-1389: unfinished by an engine event (a repair, or the bug) */
+                PcSeenNoteKey(it->first, e.complete, e.dismantled, e.destroyed, it->second.nonce, coopbuild::kPcRoadBuilt);   /* T-1389: a ruin / repair / taking apart is known to the came-back rule */
 #ifdef SW_DEV_BUILD
                 // PROBE-START: P165
                 if (e.complete != 0 && it->second.complete == 0) P165NoteKey(std::string(e.key), "complete (a progress event)", "engine completion");
@@ -16500,17 +20777,21 @@ void BuildTick()
                     size_t ph = 0;
                     while (ph < progKeys.size() && progKeys[ph] != it->first) ++ph;
                     if (ph == progKeys.size()) progKeys.push_back(it->first);
+                    ph = 0;
+                    while (ph < stepKeys.size() && stepKeys[ph] != it->first) ++ph;
+                    if (ph == stepKeys.size()) stepKeys.push_back(it->first);   /* T-1408 fold 7: a hit is new work */
                     ++g_hitOwn;
                     char hl[400];
                     _snprintf_s(hl, sizeof(hl), _TRUNCATE, "[BUILD] hit on an own wall key=%.63s cut=%g blunt=%g -> %.2f/%.2f complete=%d destroyed=%d thread=%s - its STATE goes now (why=hit); hitOwn=%lld",
                                 it->first.c_str(), e.amount, e.amount2, e.progress, e.needed, e.complete, e.destroyed, e.onMain ? "main" : "OTHER", g_hitOwn);
-                    BdLogCapped(hl);
+                    BdLogHit(hl, it->first, 0, &e.atk);
                 }
-                if (e.kind == 5) { hitAsked = 1; BdHitLocalQueue(it->first, e.amount, e.amount2, 0, 0, 0, e.door); }
+                if (e.kind == 5) { hitAsked = 1; BdHitLocalQueue(it->first, e.amount, e.amount2, 0, 0, 0, e.door, 0, &e.atk); }
                 if (e.kind == 2 && e.dismBefore == 0 && e.dismantled != 0) BdSendRemove(it->first, it->second, (int)coopbuild::kBuildReasonDismantled);
+                if (e.kind == 12) BdEngineRemovedTake(it->first, it->second, e, engDk);   /* T-1372: the engine ended the piece (for good, or another reason: log) */
                 if (e.kind == 1 && it->second.via == 3 && it->second.handed == 1) ++g_progressOnHandedCopy;   /* build1h: work on a piece handed away here */
                 if (it->second.own != 0 && it->second.via != 3) it->second.gen = g_bdGen;   /* mmo8a2 (H1): an event on the piece - it stands in THIS world */
-                if (e.kind == 1 && it->second.own != 0 && it->second.via != 3)
+                if ((e.kind == 1 || e.kind == 2) && it->second.own != 0 && it->second.via != 3)   /* T-1408: a dismantle step is a group step too */
                 {
                     BdOwnDirty(1);   /* mmo8a: progress on an own piece - pp.build after the writer's 2 s gap */
                     size_t t = 0;
@@ -16519,12 +20800,18 @@ void BuildTick()
                     size_t pk = 0;
                     while (pk < progKeys.size() && progKeys[pk] != it->first) ++pk;
                     if (pk == progKeys.size()) progKeys.push_back(it->first);
+                    if (coopbuild::BuildGroupNewWork(e.kind, e.amount, e.recApply) != 0)   /* T-1408 fold 7: an amount-0 call (the mod's wall step, add-materials) or a record's apply is no new work */
+                    {
+                        pk = 0;
+                        while (pk < stepKeys.size() && stepKeys[pk] != it->first) ++pk;
+                        if (pk == stepKeys.size()) stepKeys.push_back(it->first);
+                    }
                 }
             }
         }
         if (e.kind == 5 && hitAsked == 0)
         {
-            if (e.keyOk != 0) BdHitLocalQueue(std::string(e.key), e.amount, e.amount2, 0, 1, 0, e.door);   /* no row: the K2 safe point runs this game's own, drops another's */
+            if (e.keyOk != 0) BdHitLocalQueue(std::string(e.key), e.amount, e.amount2, 0, 1, 0, e.door, 0, &e.atk);   /* no row: the K2 safe point runs this game's own, drops another's */
             else ++g_hitNoRow;
         }
         if (e.kind == 6)
@@ -16547,7 +20834,8 @@ void BuildTick()
         if (e.kind == 1) BdLogProg(line);
         else BdLogCapped(line);
     }
-    if (!progKeys.empty()) BdWallGroupsMark(progKeys, touched);   /* each grouped own wall takes its lead's record and sends its own STATE */
+    if (!g_gsOwed.empty()) BdGroupOwedTick(progKeys, stepKeys, touched);   /* T-1408 fold 7: owed steps whose record left the queue unapplied */
+    if (!progKeys.empty()) BdWallGroupsMark(progKeys, touched, &stepKeys, 0, 0);   /* each grouped own wall takes its lead's record and sends its own STATE */
     for (size_t t = 0; t < touched.size(); ++t)   /* coalesced: the registry now holds the tick's last whole state */
     {
         std::map<std::string, BdReg>::iterator it = g_reg.find(touched[t]);
@@ -16971,6 +21259,336 @@ void BdPowerGridLine(void* b, const std::string& key)
                 tstate, areas, vt270, inSet, setN);
     DebugLog(std::string(l));
 }
+/* T-1389: the reads below are in the release build too - the building check (PcPartsRead) uses them; the `bldparts` command stays DEV.
+   T-1372 decision 1690, TEST-ONLY (DEV build), read-only `bldparts <key-substring|key>`: is a building intact. Read in 1.0.65 (F1038;
+   build/decomp_55ff50.txt, decomp_55fd60.txt, decomp_55ec50.txt): the record is Building+0x40 (createPhysical's param_1[8]); its
+   reference lists map +0x2B8 and file fields map +0x1F8 are walked as TkLineAiRefPod walks them (count +0x20, buckets +0x38 at +0x18;
+   node: next +0, key +0x10, value +0x38); a reference entry is 0x40 bytes, its target's string id at +0x10 (store.cpp OwnPutRefs), the
+   target found by the engine's own GdcGetData (BdGetData, as the copy road). A part is made only with a 'phs or mesh' file name (0x55EC50);
+   'parts' is walked deep (0x55FD60 recurses into each part's own 'parts'); the 'interior' entries are parts too, each with its own deep
+   'parts' (0x55FF50:383-405). A part is made only when its 'phs or mesh' name holds ".mesh" (55ec50:425-426, the string at 0x141685D88
+   in 1.0.65). The model holder +0x228 (F1046, 1.0.68 0x561058 / 0x56F380: a 0x48-byte object, three lists at +0x00 / +0x18 / +0x30, each
+   count +0x08, items +0x10): parts are the first two lists (+0x08 / +0x10 and +0x20 / +0x28 - a part with collision goes to the second,
+   Inferred from 6 + 5 = 11), each item a part whose Ogre entity is at part+0x08; the lights list's count at +0x38. The 'interior' parts
+   are made with flag 2 and no model (55ff50:395-397, 55ec50:428): counted apart (innerWant). Doors +0x1C0 (count) against the record's
+   'doors' list length. Interior +0x1F0 (mask model +0x08 - made by 0x561280:80-109 only while the interior is shown and the record has
+   'interior mask': reported, not judged; shown floor +0x2D). Material +0x248. Height: +0x278 against live y less the engine's ground.
+   An Ogre entity's visibility: Ogre::MovableObject::isVisible from OgreMain_x64.dll - exported non-virtual const ('QEBA_NXZ', F1046)
+   (GetProcAddress, as appearance.cpp resolves getParentSceneNode), called under __try. Offsets: 1.0.65 read, the holder re-read on 1.0.68 (F1046). */
+typedef bool (*BdOgreVisFn)(const void*);
+static BdOgreVisFn BdOgreIsVisible()
+{
+    static int tried = 0;
+    static BdOgreVisFn fn = 0;
+    if (tried == 0)
+    {
+        tried = 1;
+        HMODULE h = ::GetModuleHandleA("OgreMain_x64.dll");
+        if (h != 0) fn = (BdOgreVisFn)::GetProcAddress(h, "?isVisible@MovableObject@Ogre@@QEBA_NXZ");
+    }
+    return fn;
+}
+/* a std::string's text at s (MSVC layout: length +0x10, capacity +0x18, inline when capacity <= 15) into out; 0 = not read */
+static int BdPartsStrPod(const char* s, char* out, int cap)
+{
+    __try
+    {
+        const unsigned long long len = *(const unsigned long long*)(s + 0x10), sc = *(const unsigned long long*)(s + 0x18);
+        if (len >= (unsigned long long)cap) return 0;
+        const char* t = (sc > 15) ? *(const char* const*)s : s;
+        std::memcpy(out, t, (size_t)len); out[len] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+/* the node of map m (+0x2B8 / +0x1F8 form) whose key is name; 0 = none or unreadable (*bad set on a fault) */
+static const char* BdPartsMapNodePod(const char* m, const char* name, int* bad)
+{
+    __try
+    {
+        if (*(const unsigned long long*)(m + 0x20) == 0) return 0;
+        const char* node = *(const char* const*)(*(const char* const*)(m + 0x38) + *(const long long*)(m + 0x18) * 8);
+        const size_t nl = std::strlen(name);
+        for (int guard = 0; node != 0 && guard < 4096; ++guard, node = *(const char* const*)node)
+        {
+            const char* k = node + 0x10;
+            const unsigned long long len = *(const unsigned long long*)(k + 0x10), cap = *(const unsigned long long*)(k + 0x18);
+            const char* txt = (cap > 15) ? *(const char* const*)k : k;
+            if (len == nl && std::memcmp(txt, name, nl) == 0) return node;
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *bad = 1; return 0; }
+}
+const int kBdPartsMaxRefs = 64, kBdPartsSidCap = 128;
+/* the record's reference list 'name': each entry's target string id; the entry count is returned (-1 unreadable), at most kBdPartsMaxRefs ids copied */
+static int BdPartsRefSidsPod(const char* gd, const char* name, char (*sids)[kBdPartsSidCap], int* nCopied)
+{
+    *nCopied = 0;
+    int bad = 0;
+    const char* node = BdPartsMapNodePod(gd + 0x2B8, name, &bad);
+    if (bad != 0) return -1;
+    if (node == 0) return 0;
+    __try
+    {
+        const char* b = *(const char* const*)(node + 0x38);
+        const char* e = *(const char* const*)(node + 0x40);
+        if (e < b || (e - b) % 0x40 != 0 || (e - b) / 0x40 > 100000) return -1;
+        const int n = (int)((e - b) / 0x40);
+        for (int i = 0; i < n && *nCopied < kBdPartsMaxRefs; ++i)
+            if (BdPartsStrPod(b + i * 0x40 + 0x10, sids[*nCopied], kBdPartsSidCap) != 0) ++*nCopied;
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* 1 = the record's 'phs or mesh' file name holds ".mesh" (0x55EC50 makes a part for it only then - 55ec50:425-426), 0 = none, -1 unreadable */
+static int BdPartsHasMeshPod(const char* gd)
+{
+    int bad = 0;
+    const char* node = BdPartsMapNodePod(gd + 0x1F8, "phs or mesh", &bad);
+    if (bad != 0) return -1;
+    if (node == 0) return 0;
+    char name[260];
+    if (BdPartsStrPod(node + 0x38, name, (int)sizeof name) == 0) return -1;
+    return std::strstr(name, ".mesh") != 0 ? 1 : 0;
+}
+/* the parts 0x55FD60 makes for record gd's 'parts' list, deep; -1 unreadable */
+static int BdPartsDeepCount(const char* gd, int depth)
+{
+    if (depth > 8) return -1;
+    static char sids[9][kBdPartsMaxRefs][kBdPartsSidCap];   /* one table per depth; MAIN THREAD */
+    int nc = 0;
+    const int n = BdPartsRefSidsPod(gd, "parts", sids[depth], &nc);
+    if (n < 0 || nc < n) return -1;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const unsigned long long rGet = Rva("GdcGetData"), rCont = Rva("GdContainer");
+    if (rGet == 0 || rCont == 0) return -1;
+    int total = 0;
+    for (int i = 0; i < nc; ++i)
+    {
+        const std::string sid(sids[depth][i]);
+        const char* child = (const char*)BdGetData(base + (uintptr_t)rGet, base + (uintptr_t)rCont, &sid);
+        if (child == 0) continue;   /* an entry whose record is not in the data makes nothing (0x5590F0 lists found records) */
+        const int hm = BdPartsHasMeshPod(child);
+        const int sub = BdPartsDeepCount(child, depth + 1);
+        if (hm < 0 || sub < 0) return -1;
+        total += hm + sub;
+    }
+    return total;
+}
+/* the record's 'interior' entries as parts (each with a mesh name, plus its own deep parts) and the entry count; -1 unreadable */
+static int BdPartsInteriorCount(const char* gd, int* entries)
+{
+    static char sids[kBdPartsMaxRefs][kBdPartsSidCap];
+    int nc = 0;
+    const int n = BdPartsRefSidsPod(gd, "interior", sids, &nc);
+    *entries = n;
+    if (n < 0 || nc < n) return -1;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const unsigned long long rGet = Rva("GdcGetData"), rCont = Rva("GdContainer");
+    if (rGet == 0 || rCont == 0) return -1;
+    int total = 0;
+    for (int i = 0; i < nc; ++i)
+    {
+        const std::string sid(sids[i]);
+        const char* child = (const char*)BdGetData(base + (uintptr_t)rGet, base + (uintptr_t)rCont, &sid);
+        if (child == 0) continue;
+        const int hm = BdPartsHasMeshPod(child);
+        const int sub = BdPartsDeepCount(child, 1);
+        if (hm < 0 || sub < 0) return -1;
+        total += hm + sub;
+    }
+    return total;
+}
+/* the building's own fields (no record walk); 0 = a fault (what was read before it stays) */
+static int BdPartsLivePod(const char* b, coopbuild::BuildPartsRead* r, const char** gd)
+{
+    __try
+    {
+        *gd = *(const char* const*)(b + 0x40);
+        r->node = *(void* const*)(b + 0x200) != 0 ? 1 : 0;
+        r->shown = *(const unsigned char*)(b + 0x19D) != 0 ? 1 : 0;
+        r->destroyed = *(const unsigned char*)(b + 0x1A1) != 0 ? 1 : 0;
+        r->complete = *(const unsigned char*)(b + 0x160) != 0 ? 1 : 0;
+        r->material = *(void* const*)(b + 0x248) != 0 ? 1 : 0;
+        r->doors = (int)*(const unsigned int*)(b + 0x1C0);
+        const char* in = *(const char* const*)(b + 0x1F0);
+        r->interior = (in != 0) ? 1 : 0;
+        r->mask = (in != 0 && *(void* const*)(in + 0x08) != 0) ? 1 : 0;
+        r->offset = *(const float*)(b + 0x278);
+        const char* h = *(const char* const*)(b + 0x228);
+        if (h == 0) { r->parts = 0; r->entities = 0; r->visible = 0; r->lights = 0; return 1; }
+        const unsigned int n1 = *(const unsigned int*)(h + 0x08), n2 = *(const unsigned int*)(h + 0x20), nl = *(const unsigned int*)(h + 0x38);
+        if (n1 > 4096 || n2 > 4096 || nl > 4096) return 0;
+        r->parts = (int)(n1 + n2);   /* F1046: both part lists (+0x08 / +0x10 and +0x20 / +0x28) */
+        r->lights = (int)nl;         /* F1046: the lights list's count +0x38 (+0x40 is its items pointer) */
+        const BdOgreVisFn vis = BdOgreIsVisible();
+        int made = 0, seen = 0;
+        for (int L = 0; L < 2; ++L)
+        {
+            const unsigned int n = (L == 0) ? n1 : n2;
+            const char* const* a = *(const char* const* const*)(h + (L == 0 ? 0x10 : 0x28));
+            if (n > 0 && a == 0) return 0;
+            for (unsigned int i = 0; i < n; ++i)
+            {
+                const char* part = a[i];
+                const void* ent = (part != 0) ? *(void* const*)(part + coopbuild::BuildPartModelOffset(L)) : 0;   /* F1057: +0x08 in the first list, +0x20 in the second (collision pieces) */
+                if (ent == 0) continue;
+                ++made;
+                if (vis != 0 && vis(ent)) ++seen;
+            }
+        }
+        r->entities = made;
+        r->visible = (vis != 0) ? seen : -1;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1389 (release): what a building record makes - the record walk above, kept per record (GameData*) for this world: the walk calls
+   the engine's GdcGetData per part and does not change while the world stays loaded */
+struct PcPartsWant { int parts, inner, doors, interiorEntries; };
+std::map<const void*, PcPartsWant> g_pcWantCache;   /* MAIN THREAD */
+const size_t kPcWantCacheCap = 1024;
+void PcPartsCacheClear() { g_pcWantCache.clear(); }
+/* T-36 (F1186; the offsets probe P297 read on both games in T2497): building b's material slot +0x248 and each model part's own record.
+   Parts: the model holder +0x228's two lists (+0x08 / +0x10 and +0x20 / +0x28); 0x547BA0 hands the part at the item itself (first list)
+   or at item+0x18 (second list), its record at part+0x28. A pointer whose first word is not a record's vtable (the building's own record's,
+   b+0x40) is taken as not read. Plain reads under a guard; nothing is called or written. Returns the parts copied (at most cap), -1 a fault;
+   *total = the parts in the holder, *slotNull = 1 when +0x248 is empty */
+const int kPcMatPartsCap = 256;
+static int PcMaterialPartsPod(const char* b, const char** recs, int cap, int* total, const char** slot, int* slotNull)
+{
+    __try
+    {
+        *total = 0;
+        const char* bgd = *(const char* const*)(b + 0x40);
+        const void* gdVt = (bgd != 0) ? *(const void* const*)bgd : 0;
+        const char* m = *(const char* const*)(b + 0x248);
+        *slotNull = (m == 0) ? 1 : 0;
+        *slot = (m != 0 && gdVt != 0 && *(const void* const*)m == gdVt) ? m : 0;
+        const char* h = *(const char* const*)(b + 0x228);
+        if (h == 0) return 0;
+        const unsigned int n1 = *(const unsigned int*)(h + 0x08), n2 = *(const unsigned int*)(h + 0x20);
+        if (n1 > 4096 || n2 > 4096) return -1;
+        int k = 0;
+        for (int L = 0; L < 2; ++L)
+        {
+            const unsigned int n = (L == 0) ? n1 : n2;
+            const char* const* a = *(const char* const* const*)(h + (L == 0 ? 0x10 : 0x28));
+            if (n > 0 && a == 0) return -1;
+            for (unsigned int i = 0; i < n; ++i)
+            {
+                ++*total;
+                const char* item = a[i];
+                if (item == 0 || k >= cap) continue;   /* not counted as read: the verdict stays unread */
+                const char* part = (L == 0) ? item : item + 0x18;
+                const char* gd = *(const char* const*)(part + 0x28);
+                recs[k++] = (gd != 0 && gdVt != 0 && *(const void* const*)gd == gdVt) ? gd : 0;
+            }
+        }
+        return k;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-36, MAIN THREAD: PieceWholeIn::material for building b by the engine's per-part rule (coopbuild::PieceMaterialVerdict) - 0 some part
+   would be drawn with the default set, 1 none, -1 not judged (a fault, an unread part or record) */
+static int PcMaterialRead(void* b)
+{
+    static const char* recs[kPcMatPartsCap];
+    static coopbuild::PieceMatPart parts[kPcMatPartsCap];
+    static char sids[kBdPartsMaxRefs][kBdPartsSidCap];
+    int total = 0, slotNull = 1;
+    const char* slot = 0;
+    const int k = PcMaterialPartsPod((const char*)b, recs, kPcMatPartsCap, &total, &slot, &slotNull);
+    if (k < 0) return -1;
+    char t[kBdPartsSidCap];
+    std::string slotSid;
+    if (slot != 0 && BdStrPod(slot + kGdStringId, t, (int)sizeof t) != 0) slotSid = t;
+    const int slotSet = (slotNull != 0) ? 0 : (slot != 0 ? 1 : -1);
+    for (int i = 0; i < k; ++i)
+    {
+        coopbuild::PieceMatPart& p = parts[i];
+        p.ownRefs = -1; p.ownSid.clear();
+        if (recs[i] == 0) continue;
+        int nc = 0;
+        p.ownRefs = BdPartsRefSidsPod(recs[i], "material", sids, &nc);
+        if (p.ownRefs > 0 && nc > 0) p.ownSid = sids[0];
+    }
+    return coopbuild::PieceMaterialVerdict(parts, k, total, slotSet, slotSid);
+}
+/* T-1389, MAIN THREAD: piece b's model holder, parts, models, doors, scene node, material and interior (BdPartsLivePod - the bldparts
+   reads) and what its record makes (cached). 1 read, 0 a fault. holder: BdBodyListPod (+0x228) */
+int PcPartsRead(void* b, coopbuild::PieceWholeIn* x)
+{
+    x->holder = BdBodyListPod(b);
+    if (x->holder < 0) return 0;
+    coopbuild::BuildPartsRead r;
+    const char* gd = 0;
+    if (BdPartsLivePod((const char*)b, &r, &gd) == 0) return 0;
+    x->node = r.node; x->interior = r.interior; x->shown = r.shown;   /* T-1389 fold NOTE b: +0x19D */
+    x->material = (x->holder == 1) ? PcMaterialRead(b) : -1;   /* T-36 (F1186): each part's own set by the engine's rule, not +0x248 alone */
+    x->doors = r.doors; x->parts = r.parts; x->models = r.entities;
+    if (gd == 0) return 1;
+    std::map<const void*, PcPartsWant>::const_iterator c = g_pcWantCache.find((const void*)gd);
+    PcPartsWant w;
+    if (c != g_pcWantCache.end()) w = c->second;
+    else
+    {
+        w.parts = BdPartsDeepCount(gd, 0);
+        w.inner = BdPartsInteriorCount(gd, &w.interiorEntries);
+        int nc = 0;
+        static char dsids[kBdPartsMaxRefs][kBdPartsSidCap];
+        w.doors = BdPartsRefSidsPod(gd, "doors", dsids, &nc);
+        if (w.parts >= 0 && w.inner >= 0 && w.doors >= 0 && g_pcWantCache.size() < kPcWantCacheCap) g_pcWantCache[(const void*)gd] = w;   /* an unread walk is tried again */
+    }
+    x->partsWant = (w.parts < 0 || w.inner < 0) ? -1 : w.parts + w.inner;
+    x->modelsWant = (x->partsWant < 0) ? -1 : w.parts;   /* F1046: the 'interior' entries' parts are made with no model */
+    x->doorsWant = w.doors;
+    x->interiorWant = (w.interiorEntries < 0) ? -1 : (w.interiorEntries > 0 ? 1 : 0);
+    return 1;
+}
+#ifdef SW_DEV_BUILD
+static int BdPartsFloorPod(const char* b)
+{
+    __try { const char* in = *(const char* const*)(b + 0x1F0); return in != 0 ? (int)*(const unsigned char*)(in + 0x2D) : -1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+std::string BuildPartsCommand(const std::string& arg)
+{
+    if (arg.empty()) return "error bldparts: usage bldparts <key-substring|key>";
+    std::string key;
+    void* b = BdBldPick(arg, &key);
+    if (b == 0 && !g_bdFindWhy.empty()) { DebugLog("[BUILD] bldparts '" + arg + "' -> error bldparts: " + g_bdFindWhy); return "error bldparts: " + g_bdFindWhy; }
+    if (b == 0) { DebugLog("[BUILD] bldparts '" + arg + "' -> no loaded piece (no registry key holds it and no piece stands at that key)"); return "error bldparts no such piece"; }
+    coopbuild::BuildPartsRead r;
+    const char* gd = 0;
+    const int liveOk = BdPartsLivePod((const char*)b, &r, &gd);
+    int intEntries = -1;
+    if (gd != 0)
+    {
+        const int deep = BdPartsDeepCount(gd, 0);
+        const int inner = BdPartsInteriorCount(gd, &intEntries);
+        r.partsWant = (deep < 0 || inner < 0) ? -1 : deep + inner;
+        r.innerWant = inner;   /* F1046: made with flag 2 - no model */
+        int nc = 0;
+        static char dsids[kBdPartsMaxRefs][kBdPartsSidCap];
+        r.doorsWant = BdPartsRefSidsPod(gd, "doors", dsids, &nc);
+    }
+    r.interiorWant = (intEntries < 0) ? 1 : (intEntries > 0 ? 1 : 0);
+    std::map<std::string, BdReg>::const_iterator rg = g_reg.find(key);
+    const int furn = (rg != g_reg.end() && !rg->second.hostKey.empty()) ? 1 : 0;
+    float lp[3], g = 0.0f;
+    if (liveOk != 0 && furn == 0 && BdCopyF((const char*)b + kObjPos, lp, 3) && GroundPlaceHeightAt(lp[0], lp[2], &g) == 1) { r.heightRead = 1; r.above = lp[1] - g; }
+    const std::string v = coopbuild::BuildPartsVerdict(r);
+    char l[900];
+    _snprintf_s(l, sizeof(l), _TRUNCATE, "[BUILD] bldparts key=%.63s node=%d shown=%d complete=%d destroyed=%d parts=%d/%d entities=%d/%d(+%d no-model interior) visible=%d doors=%d/%d interior=%d mask=%d floor=%d lights=%d material=%d offset=%.2f above=%s%.2f%s -> %s",
+                key.c_str(), r.node, r.shown, r.complete, r.destroyed, r.parts, r.partsWant, r.entities, (r.partsWant >= 0 && r.innerWant >= 0) ? r.partsWant - r.innerWant : -1, r.innerWant, r.visible, r.doors, r.doorsWant, r.interior, r.mask,
+                BdPartsFloorPod((const char*)b), r.lights, r.material, r.offset, r.heightRead != 0 ? "" : "(not read) ", r.above,
+                liveOk != 0 ? "" : " (a read FAULTED)", v.c_str());
+    DebugLog(std::string(l));
+    return std::string("ok bldparts ") + v;
+}
+#endif
 /* TEST-ONLY, read-only `bldstate <key-substring|key>`: the piece's own state as the kept lay writes it - its class, name and layout
    names, pause, power switch, gets battery, battery, broken and destroyed; a production machine's bar and input stocks; a farm's
    growth, death, start, plants harvested and plant count; its own lock; each door's lock (level, hardness, locked, broken) and state.
@@ -17099,6 +21717,9 @@ std::string BuildSetArm(const std::string& arg)
     else if (field == "battery" || field == "progress" || field == "stock") { if (!(v >= 0.0f && v <= 1000000.0f)) return "error bldset: the value must be in [0, 1e6]"; }
     else if (field == "locklvl" || field == "doorlvl") { if (!(v >= 0.0f && v <= 100.0f)) return "error bldset: a lock level must be in [0, 100]"; }
     else if (field == "doorlock" || field == "doorpick") { }
+#ifdef SW_DEV_BUILD
+    else if (field == "unfinish") { if (val != "1") return "error bldset: usage bldset <key-substring|key> unfinish 1"; }   /* T-1389 TEST-ONLY (DEV build) */
+#endif
     else return usage;
     if (EngineWritesBlocked()) return "error bldset: engine writes are blocked";
     g_bsArg = key; g_bsField = field; g_bsVal = v; g_bsIdx = idx;
@@ -17146,6 +21767,14 @@ std::string BdBldField(void* b, const std::string& field)
 }
 std::string DoorsKeptApply(void* door, int state, int locked, int wants);   /* doors.cpp: the bldset doorlock lever uses the kept lay's lock route */
 int DoorsLeverLockMark(void* door);   /* doors.cpp (T-1082): the door's row marked for the lock sweep after the lever's calls; 1 = marked */
+#ifdef SW_DEV_BUILD
+/* T-1389 TEST-ONLY (DEV build, bldset unfinish): the build state's complete byte (+0) set to 0; 1 written */
+int BdCompleteZeroPod(uintptr_t st)
+{
+    __try { *(unsigned char*)st = 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+#endif
 void BdBldSetDrain()
 {
     if (::InterlockedExchange(&g_bsPending, 0) == 0) return;
@@ -17157,6 +21786,37 @@ void BdBldSetDrain()
     char cls[64];
     BdClassOf(b, cls, (int)sizeof cls);
     const std::string f = g_bsField;
+#ifdef SW_DEV_BUILD
+    if (f == "unfinish")
+    {   /* T-1389 TEST-ONLY (DEV build): a FINISHED building's live complete set to 0 - its build state's complete byte (vt+0x228 +0, the
+           piece's own +0x160 or its wall group lead's), nothing else - so the building check's came-back line can be seen once. The read
+           before the write is noted as this game's own (finished), then the piece is queued on the lever road */
+        float p0 = 0.0f, n0 = 0.0f;
+        int c0 = 0, d0 = 0, x0 = 0;
+        const int rd = BdReadState(b, &p0, &n0, &c0, &d0, &x0);
+        std::map<std::string, BdReg>::const_iterator rg = g_reg.find(key);
+        char l[400];
+        if (rd == 0 || c0 == 0 || x0 != 0 || rg == g_reg.end())
+        {
+            _snprintf_s(l, sizeof(l), _TRUNCATE, "[BUILD] bldset REFUSED key=%.63s unfinish: %s", key.c_str(),
+                        rd == 0 ? "the build state did not read" : (rg == g_reg.end() ? "no registry row" : (x0 != 0 ? "a ruin" : "not finished")));
+            DebugLog(std::string(l));
+            return;
+        }
+        PcSeenNoteKey(key, c0, BdDismOf(b, d0), x0, rg->second.nonce, coopbuild::kPcRoadLever);
+        const uintptr_t st = BdWallRecordPod(b);
+        int wrote = 0;
+        if (st != 0) wrote = BdCompleteZeroPod(st);
+        int c1 = -1, d1 = 0, x1 = 0;
+        float p1 = 0.0f, n1 = 0.0f;
+        BdReadState(b, &p1, &n1, &c1, &d1, &x1);
+        if (wrote != 0) PcQueue(key, coopbuild::kPcRoadLever);
+        _snprintf_s(l, sizeof(l), _TRUNCATE, "[BUILD] bldset %s key=%.63s unfinish: complete %d -> %d, progress %.2f of %.2f (T-1389 TEST-ONLY)",
+                    wrote != 0 ? "CALLED" : "FAULTED", key.c_str(), c0, c1, p1, n1);
+        DebugLog(std::string(l));
+        return;
+    }
+#endif
     const std::string before = BdBldField(b, f);
     std::string result = "CALLED";
     int ok = 1, called = 0;
@@ -17351,12 +22011,21 @@ std::string BdTestArmAnswer(const std::string& arg)
     const char* usage = "error buildtest: usage buildtest place <sid> [dx dz] | progress <key-substring|placed> <amount> | dismantle <key-substring|placed>"
                         " | into <near|host-key-substring> <sid> [indoors|<dx>,<dz>] | mats <key-substring> <n> | destroy <key-substring> | broken <key-substring> 0|1"
                         " | order <key-substring> repair|dismantle|build|materials | town <sid|key-substring> | upgrade|downgrade <key-substring> [wall]"
-                        " | canbuild <sid> [dx dz | abs <x> <z>] | cursor <sid> abs <x> <z> [commit] | townpick <sid> abs <x> <z> [place | hold | confirm]"
-                        " | hit <key-substring> <cut> <blunt> [door] [times] | townhit <key> <cut> <blunt> [door|door=<i>] [times] | areaflag <x,y>";
+                        " | canbuild <sid> [dx dz | abs <x> <z>] | cursor <sid> abs <x> <z> [commit | preview] | cursor <sid> chain <wall key part|last> | townpick <sid> abs <x> <z> [place | hold | confirm]"
+                        " | hit <key-substring> <cut> <blunt> [door] [times] | townhit <key> <cut> <blunt> [door|door=<i>] [times] | areaflag <x,y>"
+                        " | editordelete <key-substring> (DEV build)";
     if (sub == "farm")   /* par16: the farm lever (farm.cpp FarmTestArm) */
     {
         const std::string::size_type at = arg.find("farm");
         return FarmTestArm(arg.substr(at + 4));
+    }
+    if (sub == "keptruin")   /* T-36 TEST-ONLY: armed only - the owner's kept step runs it (BdKeptRuinLever); writes nothing now */
+    {
+        if (a1.empty() || !a2.empty()) return "error buildtest: usage buildtest keptruin <key part> | off";
+        if (a1 == "off") g_keptRuinPart.clear(); else g_keptRuinPart = a1;
+        g_keptRuinTries = 0;
+        DebugLog("[KEPT] T-36 TEST-ONLY keptruin " + (g_keptRuinPart.empty() ? std::string("OFF") : "ARMED for key part '" + g_keptRuinPart + "' - the owner's kept step ruins this player's piece before it lays the row's state, once"));
+        return "ok buildtest keptruin " + (g_keptRuinPart.empty() ? std::string("off") : g_keptRuinPart);
     }
     if (EngineWritesBlocked())
     {
@@ -17407,12 +22076,21 @@ std::string BdTestArmAnswer(const std::string& arg)
     }
     else if (sub == "cursor")   /* T-923: TEST-ONLY - the build cursor's real preview made, moved, tested and destroyed in one call */
     {
-        if (a1.empty() || a2 != "abs" || a4.empty()) return usage;
-        const int cw = buildnear::CursorCommitWord(a5.c_str());   /* T-1240: `commit` - an allowed preview placed and handed to PlacementCommit */
-        if (cw < 0) return usage;
-        const float x = (float)std::atof(a3.c_str()), z = (float)std::atof(a4.c_str());
-        if (!(x >= -1.0e6f && x <= 1.0e6f && z >= -1.0e6f && z <= 1.0e6f)) return "error buildtest: abs x / z out of range";
-        g_btDx = x; g_btDz = z; g_btCursorCommit = cw; kind = 12;
+        if (!a1.empty() && a2 == "chain")   /* T-1408 TEST-ONLY: a wall placed and committed starting at the named wall's END, turned along it */
+        {
+            if (a3.empty() || !a4.empty()) return usage;
+            g_btChain = 1; g_btChainArg = a3; g_btCursorCommit = 1; g_btCursorPreview = 0; kind = 12;
+        }
+        else
+        {
+            if (a1.empty() || a2 != "abs" || a4.empty()) return usage;
+            const int pw = (a5 == "preview") ? 1 : 0;   /* T-1428 TEST-ONLY: `preview` - the preview left standing (as a player's cursor stands) for a later `commit` */
+            const int cw = buildnear::CursorCommitWord(pw != 0 ? "" : a5.c_str());   /* T-1240: `commit` - an allowed preview placed and handed to PlacementCommit */
+            if (cw < 0) return usage;
+            const float x = (float)std::atof(a3.c_str()), z = (float)std::atof(a4.c_str());
+            if (!(x >= -1.0e6f && x <= 1.0e6f && z >= -1.0e6f && z <= 1.0e6f)) return "error buildtest: abs x / z out of range";
+            g_btChain = 0; g_btDx = x; g_btDz = z; g_btCursorCommit = cw; g_btCursorPreview = pw; kind = 12;
+        }
     }
     else if (sub == "townpick")   /* T-923: TEST-ONLY - the placement confirm's town pick asked at a world position; `place` makes and hands a piece there */
     {
@@ -17497,6 +22175,13 @@ std::string BdTestArmAnswer(const std::string& arg)
         g_btIntoOff = offGiven; g_btIntoDx = ox; g_btIntoDz = oz;
         kind = 4;
     }
+#ifdef SW_DEV_BUILD
+    else if (sub == "editordelete")   /* T-1372: TEST-ONLY (DEV build) - the Level Editor's own delete on this game's own piece */
+    {
+        if (a1.empty() || !a2.empty()) return usage;
+        kind = 16;
+    }
+#endif
     else return usage;
     g_btArg = (kind == 4) ? a2 : a1;
     ::InterlockedExchange(&g_btPending, kind);
@@ -17583,6 +22268,169 @@ void BdTestTownHit()
     DebugLog(std::string(l));
 }
 void BdOutpostDrain();   /* outposttest (TEST-ONLY), below with the outposts */
+/* T-1414 (owner 1763 / 1764): the close of a Level Editor shown in a multiplayer world (store.cpp StoreEditorOffTick) - the engine's
+   own toggle 0x7F2B80 on the PlayerInterface (GameWorld+0x580) while its +0x298 still holds that editor: the toggle's other branch
+   frees it and clears +0x298 (decomp_7f2b80), the close a second Shift+F12 makes. 1 closed, 0 not (*why), -1 faulted. MAIN THREAD. */
+typedef void (*BdEdCloseFn)(void* playerInterface);
+static int g_bdEdLeverOpening = 0;   /* 1 while the TEST-ONLY editordelete lever's own toggle opens the editor (it closes it itself) */
+int BdEditorLeverOpening() { return g_bdEdLeverOpening; }
+int BdEditorClosePod(void* editor, const char** why)
+{
+    *why = "";
+    if (kBdEditorToggleRva == 0) { *why = "no PlayerInterfaceToggleEditor row in this build's table"; return 0; }
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    __try
+    {
+        void* gw = (void*)coop::GameWorldPtr();
+        char* pi = (gw != 0) ? *(char**)((char*)gw + 0x580) : 0;
+        if (pi == 0) { *why = "no PlayerInterface (GameWorld+0x580)"; return 0; }
+        if (*(void* const*)(pi + 0x298) != editor) { *why = (*(void* const*)(pi + 0x298) == 0) ? "already closed by the engine" : "the PlayerInterface holds another editor (not the key's)"; return 0; }
+        ((BdEdCloseFn)(base + (uintptr_t)kBdEditorToggleRva))(pi);
+        if (*(void* const*)(pi + 0x298) != 0) { *why = "the toggle ran but the PlayerInterface still holds an editor"; return 0; }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+#ifdef SW_DEV_BUILD
+/* T-1414 TEST-ONLY (DEV build) `editorkey`: the Level Editor key's own call, for a run - the harness cannot press a key (F010). The
+   key step 0x7875C0 reads its key commands; command 9 (decomp_7875c0:109-111) calls the toggle 0x7F2B80 on DAT_142133630 (row
+   PlayerInterfaceGlobal, this file's kBdPlayerIfaceRva) only when cVar7 == 0 and cVar5 == 0, where cVar5 = *(PlayerInterface +0x2F0)
+   and cVar7 = 0x6E1C80(&ForgottenGui) (decomp_7875c0:72-73, read in that order: +0x2F0 first). Here, once, on the frame after the
+   arming (after the engine loop, MAIN THREAD): the same two reads in the same order and on the same objects, then the toggle on
+   the same object. Not the editordelete lever's pass: the multiplayer close (store.cpp StoreEditorOffTick) acts on this open the
+   frame after. One [EDITOR] T-1414 editorkey line per press. */
+typedef char (*BdGuiKeyGuardFn)(void* gui);
+bool GameplayRunning();   /* soak.h: a world is running (the `handkey` lever's test) */
+static unsigned long long kBdGuiKeyGuardRva = 0; static AddrReg kBdGuiKeyGuardRva_reg("GuiKeyCommandGuard", &kBdGuiKeyGuardRva);   /* Steam_1.0.65 0x6E1C80, 1.0.68 0x6E1FD0 - T-1414: key command 9's second guard (ForgottenGui*) */
+static unsigned long long kBdForgottenGuiRva = 0; static AddrReg kBdForgottenGuiRva_reg("ForgottenGui", &kBdForgottenGuiRva);   /* Steam_1.0.65 0x2132750 (var): the GUI object itself (&DAT_142132750) */
+static int g_bdEdKeyArmed = 0;
+static long long g_bdEdKeyPresses = 0;
+/* 1 toggled, 0 held by a guard or no object (*why), -1 faulted; *hadEditor = PlayerInterface+0x298 was set before the toggle */
+static int BdEditorKeyPod(uintptr_t base, int* hadEditor, int* g1, int* g2, const char** why)
+{
+    *hadEditor = -1; *g1 = -1; *g2 = -1; *why = "";
+    __try
+    {
+        char* pi = *(char**)(base + (uintptr_t)kBdPlayerIfaceRva);
+        if (pi == 0) { *why = "no PlayerInterface (PlayerInterfaceGlobal is 0)"; return 0; }
+        *g1 = *(const char*)(pi + 0x2F0);
+        *g2 = ((BdGuiKeyGuardFn)(base + (uintptr_t)kBdGuiKeyGuardRva))((void*)(base + (uintptr_t)kBdForgottenGuiRva));
+        if (*g2 != 0 || *g1 != 0) { *why = "held by key command 9's guards, as the key would be"; return 0; }
+        *hadEditor = (*(void* const*)(pi + 0x298) != 0) ? 1 : 0;
+        ((BdEdCloseFn)(base + (uintptr_t)kBdEditorToggleRva))(pi);   /* the toggle's type (above): void (PlayerInterface*) */
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+std::string BdEditorKeyArm()
+{
+    if (kBdEditorToggleRva == 0 || kBdPlayerIfaceRva == 0 || kBdGuiKeyGuardRva == 0 || kBdForgottenGuiRva == 0)
+        return "error editorkey no-row (PlayerInterfaceToggleEditor / PlayerInterfaceGlobal / GuiKeyCommandGuard / ForgottenGui)";
+    if (!coop::GameplayRunning()) return "error editorkey no-world";
+    g_bdEdKeyArmed = 1;
+    return "ok editorkey armed (the press runs on the next game frame)";
+}
+void BdEditorKeyTick()
+{
+    if (g_bdEdKeyArmed == 0) return;
+    g_bdEdKeyArmed = 0;
+    ++g_bdEdKeyPresses;
+    int had = -1, g1 = -1, g2 = -1;
+    const char* why = "";
+    const int r = BdEditorKeyPod((uintptr_t)::GetModuleHandleA(0), &had, &g1, &g2, &why);
+    DebugLog("[EDITOR] T-1414 editorkey press " + std::to_string(g_bdEdKeyPresses) + ": "
+             + (r == 1 ? std::string("the toggle ran (") + (had == 1 ? "an editor was open - this press closes it" : "no editor was open - this press opens one") + ")"
+                       : (r == 0 ? std::string("NOT run: ") + why : std::string("NOT run: faulted")))
+             + " guards[pi+0x2F0=" + std::to_string((long long)g1) + ",gui=" + std::to_string((long long)g2) + "] mpWorld=" + (coop::HandSaveBlocked() ? "1" : "0"));
+}
+/* T-1372 TEST-ONLY (DEV build) `buildtest editordelete <key-substring>`: the Level Editor's own delete (0x776D60, the call its Delete key
+   makes from the editor's frame update 0x777E40 with the editor's selection hand at +0x20) runs on this game's own piece, so the run
+   takes the real road: the hooked entry (detour_editorDelete's scope), its interior teardown and GameWorld::destroy(piece, false,
+   "Level Editor"). The editor is the PlayerInterface's +0x298 (GameWorld+0x580; the editor toggle 0x7F2B80 makes it and frees it, the
+   frame loop 0x800A80 updates it while it is set). When it is not open the lever opens it with the engine's toggle and closes it after.
+   The selection is not written: the delete is handed a copy of the piece's own hand (RootObject+0x58, the hand GameWorld::destroy itself
+   reads), as the editor's own call hands it its selection's. The delete then deselects (0x776560 with 0). Refused: no own live piece,
+   no editor, or an editor whose +0x10 is unset (the delete reads it unguarded). One [BUILD] buildtest editordelete line. MAIN THREAD. */
+typedef void (*BdEdToggleFn)(void* playerInterface);
+typedef void (*BdEdDeleteFn)(void* editor, void* selected);
+/* 1 called, 0 refused (*why), -1 faulted; opened / closed: the lever's own toggles */
+static int BdEdDeletePod(uintptr_t base, void* b, int* opened, int* closed, const char** why)
+{
+    *opened = 0; *closed = 0; *why = "";
+    __try
+    {
+        void* gw = (void*)coop::GameWorldPtr();
+        char* pi = (gw != 0) ? *(char**)((char*)gw + 0x580) : 0;
+        if (pi == 0) { *why = "no PlayerInterface (GameWorld+0x580)"; return 0; }
+        char* ed = *(char**)(pi + 0x298);
+        if (ed == 0)
+        {
+            g_bdEdLeverOpening = 1;   /* T-1414: the lever's own open is not closed by the multiplayer refusal - it closes it itself below */
+            ((BdEdToggleFn)(base + (uintptr_t)kBdEditorToggleRva))(pi);
+            g_bdEdLeverOpening = 0;
+            *opened = 1;
+            ed = *(char**)(pi + 0x298);
+        }
+        if (ed == 0) { *why = "the editor toggle made no editor (PlayerInterface+0x298 stays 0)"; return 0; }
+        if (*(void* const*)(ed + 0x10) == 0)
+        {
+            if (*opened != 0) { ((BdEdToggleFn)(base + (uintptr_t)kBdEditorToggleRva))(pi); *closed = 1; }
+            *why = "the editor's +0x10 is unset (the delete reads it unguarded)";
+            return 0;
+        }
+        unsigned long long h[4];
+        std::memcpy(h, (const char*)b + 0x58, sizeof h);   /* the piece's own hand: vtable, type, container, stamp, index, serial */
+        ((BdEdDeleteFn)(base + (uintptr_t)kBdEditorDeleteRva))(ed, h);
+        if (*opened != 0) { ((BdEdToggleFn)(base + (uintptr_t)kBdEditorToggleRva))(pi); *closed = 1; }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_bdEdLeverOpening = 0; return -1; }
+}
+void BdTestEditorDelete()
+{
+    std::string key;
+    long long regHits = 0;
+    const int lastForm = BuildRegLastKey(g_btArg, &key, &regHits);   /* `<substring>@last`: the newest row containing it */
+    if (lastForm < 0 || (lastForm == 0 && !BdFindReg(g_btArg, &key)))
+    {
+        ++g_testNoEntry;
+        DebugLog("[BUILD] buildtest editordelete SKIPPED: " + BdFindMiss(g_btArg));
+        return;
+    }
+    if (kBdEditorDeleteRva == 0 || kBdEditorToggleRva == 0)
+    {
+        DebugLog("[BUILD] buildtest editordelete REFUSED: key=" + key + " - the LevelEditorDeleteSelected / PlayerInterfaceToggleEditor address row is missing");
+        return;
+    }
+    std::map<std::string, BdReg>::iterator trow = g_reg.find(key);
+    if (trow == g_reg.end() || trow->second.own == 0 || trow->second.via == 3 || trow->second.removed != 0)
+    {
+        DebugLog("[BUILD] buildtest editordelete REFUSED: key=" + key + " - not this game's own standing piece (a copy, another player's, or removed)");
+        return;
+    }
+    int tv = 0;
+    void* b = BdFindPiece(key, trow->second, &tv);
+    char k2[kKeyCap];
+    k2[0] = 0;
+    if (b == 0 || ObjectPositionKey(b, k2, kKeyCap, "", 3, 0) == 0 || key != std::string(k2))
+    {
+        ++g_testNotLoaded;
+        DebugLog("[BUILD] buildtest editordelete SKIPPED: key=" + key + (b == 0 ? " is not loaded here (no live piece)" : " live piece's key reads '" + std::string(k2) + "'"));
+        return;
+    }
+    const long long runs0 = (long long)g_edDelRuns, q0 = (long long)g_engRmQueued;
+    int opened = 0, closed = 0;
+    const char* why = "";
+    const int r = BdEdDeletePod((uintptr_t)::GetModuleHandleA(0), b, &opened, &closed, &why);
+    if (r < 0) ++g_testFaulted;
+    if (r > 0) ++g_engRmLever;
+    char l[520];
+    _snprintf_s(l, sizeof(l), _TRUNCATE, "[BUILD] buildtest editordelete %s key=%.63s editor=%s%s hookRuns+%lld removalsQueued+%lld (the Level Editor's delete 0x776D60, hook %s)%s%s",
+                r > 0 ? "CALLED" : (r == 0 ? "REFUSED" : "FAULTED"), key.c_str(), opened != 0 ? "opened by the lever" : "already open", closed != 0 ? " (closed again)" : "",
+                (long long)g_edDelRuns - runs0, (long long)g_engRmQueued - q0, HkWord(g_hkEditorDelete), why[0] != 0 ? " - " : "", why);
+    DebugLog(std::string(l));
+}
+#endif
 void BuildTestDrain()
 {
     BdOutpostDrain();   /* TEST-ONLY outposttest found / link, armed apart from buildtest */
@@ -17608,6 +22456,9 @@ void BuildTestDrain()
     else if (kind == 13) BdTestTownPick();   /* T-923 */
     else if (kind == 14) BdTestHit();   /* T-904 */
     else if (kind == 15) BdTestTownHit();   /* T-1333 */
+#ifdef SW_DEV_BUILD
+    else if (kind == 16) BdTestEditorDelete();   /* T-1372 */
+#endif
     else BdTestOnEntry(kind);
 }
 
@@ -17649,6 +22500,7 @@ void ItKeptWaitTokens(const char* key, std::vector<std::string>* out);   /* item
 void ItKeptForget(const char* why);                                   /* items.cpp: a world teardown - the waiting kept items are left, named */
 int KeptHereRead(std::string* text, std::string* where);              /* store.cpp: this game's record of what it laid in this world */
 int KeptHereWrite(const std::string& text);
+std::string KeptHereWriteWhy();   /* store.cpp, T-1028: why the last store write on this thread failed (log only) */
 std::string KeptWorldIdNow();
 int ItKeptBoxMine(void* b, const float* pos, const char* key);
 int ItKeptBoxCount(void* b);
@@ -17679,7 +22531,8 @@ struct BdKeptLoc
     unsigned extrasWant;                   /* the own state parts the row holds (keptwire::ExtrasWanted), as last seen */
     int layHere;                           /* the own state is laid on this game's piece (keptwire::ExtrasLayHere), as last seen */
     int sx, sy;
-    BdKeptLoc() : pieceClaimAt(0), itemsClaimAt(0), nextLook(0), pieceQueued(0), pieceHow(0), itemsHow(0), ownerStep(0), ownerSeq(0), refusals(0),
+    int ownerRepairOwed, ownerRepairTries;   /* T-36 fold 1: the owner step's repair the engine deferred (message 16), and its tries */
+    BdKeptLoc() : ownerRepairOwed(0), ownerRepairTries(0), pieceClaimAt(0), itemsClaimAt(0), nextLook(0), pieceQueued(0), pieceHow(0), itemsHow(0), ownerStep(0), ownerSeq(0), refusals(0),
                   saidWait(0), saidGrant(0), overlapSaid(0), extrasDone(0), extrasEnded(0), doorsDone(0), extrasNext(0), extrasTries(0), extrasSaid(0),
                   itemsWaiting(0), waitNext(0), extrasWant(0), layHere(0), sx(-1), sy(-1) {}
 };
@@ -17772,7 +22625,7 @@ void BdKeptHereWrite()
     if (r < 0) return;   /* no records store: written once one is open */
     ++g_keptHereWriteFails;
     ErrorLog("[KEPT] laid-here record could NOT be written (writes=" + zonekeep::ZkNum(g_keptHereWrites) + " failed=" + zonekeep::ZkNum(g_keptHereWriteFails)
-             + ") - written again at the next finished save or teardown");
+             + ") - written again at the next finished save or teardown" + KeptHereWriteWhy());
 }
 /* the changes a finished save request reqSeq holds go into the record (keptwire::HereFinishAction); a change from before the last
    world teardown that only a later save could hold, or one of another world, is dropped. A change this game's table does not know
@@ -18319,28 +23172,91 @@ void BdKeptExtrasStep(const keptwire::Row& w, BdKeptLoc& L)
     if (live == 0 || BdByteAtOr0(live, kBOwnDismantled) != 0) return;   /* not loaded here: no look counted */
     BdKeptExtrasNow(w, L, live, "this game's piece");
 }
+/* T-36 fold 3: the row's delivered materials (what taking it apart refunds) onto a kept piece just repaired - BdRepairWhole writes
+   none; delivered materials only, no progress (BdApplyStatePod stage 1, as the STATE road writes a ruin's). A wall's are not the
+   row's to write (BdKeptApplyState skips walls). 1 = written, 0 = nothing to write or a wall, -1 = faulted */
+int BdKeptPutMats(const keptwire::Row& w, void* b)
+{
+    if (BdIsWall(b) != 0) return 0;
+    float mats[coopbuild::kBuildMaxMats];
+    const int nm = keptwire::MatsArray(w.p.mats, mats, (int)coopbuild::kBuildMaxMats);
+    if (nm <= 0) return 0;
+    BdSelfScope self;
+    int ml = -1, st = 0;
+    return BdApplyStatePod(b, 0, 0.0f, nm, mats, &ml, 0, &st) != 0 ? 1 : -1;
+}
 /* THE OWNER'S GAME puts the row's ruin and broken flag on its own piece, so its own STATE carries them to every game (a hand-over
-   PLACE has no destroyed field: without this the owner's STATE would repair the ruin the laying game made) */
-void BdKeptOwnerState(const keptwire::Row& w, void* live, const std::string& lk)
+   PLACE has no destroyed field: without this the owner's STATE would repair the ruin the laying game made). T-36 (F1198): both ways -
+   a row that says whole on a piece this game's fresh world ruined is repaired through BdRepairWhole, the hand-back's road
+   (keptwire::OwnKeptMatch); without it the owner keeps the ruin and its STATE spreads it to the other games */
+int BdKeptOwnerState(const keptwire::Row& w, void* live, const std::string& lk, BdKeptLoc& L)
 {
     float p = 0, n = 0;
     int c = 0, d = 0, x = 0;
-    if (BdReadState(live, &p, &n, &c, &d, &x) == 0 || d != 0) return;
-    const int ruin = (w.p.destroyed != 0 && x == 0) ? 1 : 0;
+    if (BdReadState(live, &p, &n, &c, &d, &x) == 0 || d != 0) return 1;
+    const int match = keptwire::OwnKeptMatch(w.p.complete, w.p.destroyed, c, x, L.ownerRepairOwed);
+    const int ruin = (match == keptwire::kOwnKeptRuin) ? 1 : 0;
     if (ruin != 0) { DoorsForgetOwner(live); BdDestroyPod(live, true); }   /* the building's door rows go before its doors do */
+    int fixedNow = 0;   /* 1 = this call made the piece whole / its row's progress (a STATE goes out) */
+    if (match == keptwire::kOwnKeptRepair || match == keptwire::kOwnKeptFinish || match == keptwire::kOwnKeptBelowFull)
+    {
+        int rpr = 0;   /* 1 whole, 2 wall ruin kept, -1 still a ruin (deferred), -2 progress not written; 0 = not run */
+        if (match == keptwire::kOwnKeptRepair) rpr = BdRepairWhole(live, w.p.complete, w.p.progress);
+        else if (match == keptwire::kOwnKeptFinish) rpr = BdRepairFinish(live, w.p.complete, w.p.progress);
+        const char* how = (match == keptwire::kOwnKeptRepair) ? "a ruin here, REPAIRED as the row says"
+                        : (match == keptwire::kOwnKeptFinish) ? "the deferred ruin reset has landed, FINISHED as the row says"
+                        : "standing here unfinished, not a ruin - NOT written (only named)";
+        if (rpr == -1)
+        {   /* T-36 fold 1: the engine deferred the ruin reset (message 16) - the step stays open, bounded as the STATE road's deferral */
+            L.ownerRepairOwed = 1;
+            ++L.ownerRepairTries;
+            if (L.ownerRepairTries < kDestroyDeferTries)
+            {
+                char wl[400];
+                _snprintf_s(wl, sizeof(wl), _TRUNCATE, "[KEPT] row %u owner: the repair of key=%.63s NOT SET yet (the engine deferred the ruin reset - message 16): looked at again in %u safe points (%d of %d)",
+                            w.row, lk.c_str(), kRetryGap, L.ownerRepairTries, kDestroyDeferTries);
+                BdKeptLog(wl);
+                return 0;
+            }
+            how = "a ruin here, repair GIVEN UP (the engine deferred every ruin reset)";
+        }
+        if (rpr != -1 && rpr != 0) L.ownerRepairOwed = 0;
+        if (rpr == 1) ++g_keptRepaired; else if (rpr == 2) ++g_keptRepairWallKept; else if (rpr != 0) ++g_keptRepairNotSet;
+        const int mw = (rpr == 1) ? BdKeptPutMats(w, live) : 0;   /* fold 3 */
+        float p1 = 0, n1 = 0;
+        int c1 = 0, d1 = 0, x1 = 0;
+        BdReadState(live, &p1, &n1, &c1, &d1, &x1);
+        std::map<std::string, BdReg>::iterator rr = g_reg.find(lk);
+        if (rr != g_reg.end() && rpr != 0)
+        {   /* fold 2: the record takes what the piece holds now - its materials too - so its STATE carries the repair */
+            int mt = -1;
+            rr->second.progress = p1; rr->second.needed = n1; rr->second.complete = c1;
+            rr->second.nMats = BdReadMats(live, rr->second.mats, (int)coopbuild::kBuildMaxMats, &mt);
+        }
+        fixedNow = (rpr != 0) ? 1 : 0;
+        char rl[700];
+        _snprintf_s(rl, sizeof(rl), _TRUNCATE, "[KEPT] row %u owner: kept row complete=%d destroyed=0 progress %.2f on key=%.63s - %s: before %.2f/%.2f complete=%d destroyed=%d, after %.2f/%.2f complete=%d destroyed=%d; repair=%d (1 whole, 2 wall ruin kept, -1 still a ruin, -2 progress not written, 0 not run), tries %d, materials %s",
+                    w.row, w.p.complete, w.p.progress, lk.c_str(), how, p, n, c, x, p1, n1, c1, x1, rpr, L.ownerRepairTries,
+                    mw == 1 ? "written from the row" : (mw == -1 ? "NOT written (faulted)" : "not written"));
+        BdKeptLog(rl);
+    }
     const int br0 = BdBrokenRead(live);
     if (w.p.broken != br0) BdSetBrokenPod(live, w.p.broken != 0);
-    if (ruin == 0 && w.p.broken == br0) return;
-    BdKeptNoteBroken(lk, live);
+    if (fixedNow != 0) BdKeptNoteBroken(lk, live);   /* T-36: the repair's STATE goes to every game */
+    if (ruin == 0 && w.p.broken == br0) return 1;
+    if (fixedNow == 0) BdKeptNoteBroken(lk, live);
     int x1 = 0;
     BdReadState(live, &p, &n, &c, &d, &x1);
     char line[500];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] row %u owner: the kept state put on this player's own piece %.63s - destroyed %d -> %d, broken %d -> %d; its STATE carries it to the other games",
                 w.row, lk.c_str(), x, x1, br0, BdBrokenRead(live));
     BdKeptLog(line);
+    return 1;
 }
-/* createBuilding for another player's kept piece, owned by `owner` (the recipe BdCopyOneBody uses). 0 = not made (*why) */
-void* BdKeptCreate(const keptwire::Row& w, int furn, void* host, float* pos, float* rot, void* owner, const char** why)
+/* createBuilding for another player's kept piece, owned by `owner` (the recipe BdCopyOneBody uses). 0 = not made (*why). T-1427 part 2:
+   an outdoor piece is made in `town` (its outpost, BdKeptTownFor) through the copies' one town rule (BdCopyTownFor: the record's
+   town, else 'Nowhere') - never town 0, the engine's own pick */
+void* BdKeptCreate(const keptwire::Row& w, int furn, void* host, float* pos, float* rot, void* owner, void* town, const char** why)
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     const unsigned long long rGet = Rva("GdcGetData"), rCont = Rva("GdContainer");
@@ -18359,15 +23275,23 @@ void* BdKeptCreate(const keptwire::Row& w, int furn, void* host, float* pos, flo
     }
     const BdCreateFn fn = (orig_create != 0) ? orig_create : (BdCreateFn)(base + (uintptr_t)kBdCreateRva);
     int faulted = 0;
+    BdCopyTown ct;
+    ct.rule = coopbuild::kCtNowhere; ct.town = 0; ct.dist = -1.0f; ct.off = -1.0f;
+    if (furn == 0) ct = BdCopyTownFor(-2, MySlotForWire(), 0, pos, town != 0 ? town : TlRecordFactTown(w.p.key));   /* slot -2: no candidate but the row's own town (T-1427 fold 1: its outpost, else its record's town fact) */
     void* b = (furn != 0) ? BdCallCreateEx(fn, factory, gd, pos, owner, rot, fo, host, w.p.complete != 0, w.p.floor, false, &faulted)
-                          : BdCallCreate(fn, factory, gd, pos, owner, rot, w.p.complete != 0, &faulted);
+                          : BdCallCreateTown(fn, factory, gd, pos, ct.town, owner, rot, w.p.complete != 0, &faulted);
     if (b == 0) { *why = faulted != 0 ? "createBuilding FAULTED" : "createBuilding returned null"; return 0; }
     if (BdOwnerPod(b) != owner) BdSetFactionPod(b, owner);
+    if (furn == 0) BdCopyTownMade(w.p.key, b, ct, BdAreaFlag(SectorOf(pos[0], pos[2]).x, SectorOf(pos[0], pos[2]).y));   /* T-1427 part 2 */
     return b;
 }
-/* an unowned town piece that matches the row: given back to its player at no charge - for a house for sale the purchase's world side
-   without the money (BdBuyFxBefore -> the owner write -> BdBuyFxAfter); this game's own slot registers it as its own, another
-   slot's is handed to that player. 1 = given back */
+/* an unowned town piece that matches the row: given back to its player at no charge - this game's own slot registers it as its own,
+   another slot's is handed to that player. 1 = given back. T-1430 fold 2: the fifth owner-writing road makes the one decision
+   (coopbuild::BuildPurchaseApplyHere with the ENGINE's isForSale, not this mod's hooked answer) before its owner write; a yes runs
+   the whole purchase through the one routine (BdPurchaseFxOf -> BdOwnerRestore: the held residents first, the world side, the
+   furniture teardown by the keep rule, the interior's no-player pieces, the doors, the tail), so a house bought before a world
+   reset and handed back loses the town's furniture as the engine's purchase did (F1224). The doors are then laid by the kept row's
+   door step (BdKeptExtras), over the purchase's open doors. */
 int BdKeptHandBack(const keptwire::Row& w, void* live, int furn, void* host, const float* hostPos, const float* hostQ, int mySlot)
 {
     const int slot = w.p.ownerSlot;
@@ -18376,7 +23300,11 @@ int BdKeptHandBack(const keptwire::Row& w, void* live, int furn, void* host, con
     void* o = BdOwnerPod(live);
     static BdBuyFx fx;   /* MAIN THREAD; 2 KB - not on the stack */
     std::memset(&fx, 0, sizeof(fx));
-    const int sale = (furn == 0 && BdIsForSalePod(live) == 1) ? 1 : 0;
+    const int buy = coopbuild::BuildPurchaseApplyHere(furn != 0 ? 1 : 0, 1, BdOwnerIsPlayerSide(o), (furn == 0) ? BdIsForSaleOrigPod(live) : 0, (o != (void*)to) ? 1 : 0);   /* the row names a player (this one, or its slot's stand-in); the ENGINE's isForSale, asked before the held residents are made */
+    const coopbuild::BuildPurchaseHerePlan php = coopbuild::BuildPurchaseHerePlanOf(buy);
+    if (buy != 0 && TownGenBuyHeld(live) > 0) { void* const o2 = BdOwnerPod(live); if (o2 != 0) o = o2; }   /* as the copy adopt: the residents on hold made first; populateBuilding may set the owner */
+    BdPurchaseFxOf(&fx, php, "kept hand-back", w.p.key.c_str());   /* the kept row's key names the house in the purchase's lines */
+    const int sale = php.worldSide;
     if (BdOwnerRestore(live, o, (void*)to, sale, &fx) < 0) return 0;
     int rpr = 0;   /* BdRepairWhole's answer for a kept whole piece found a ruin here; 0 = not needed */
     if (w.p.destroyed != 0 && BdByteAtOr0(live, kBDestroyed) == 0) { DoorsForgetOwner(live); BdDestroyPod(live, true); }   /* the kept ruin */
@@ -18384,13 +23312,19 @@ int BdKeptHandBack(const keptwire::Row& w, void* live, int furn, void* host, con
     {
         rpr = BdRepairWhole(live, w.p.complete, w.p.progress);
         if (rpr == 1) ++g_keptRepaired; else if (rpr == 2) ++g_keptRepairWallKept; else ++g_keptRepairNotSet;
+        if (rpr == 1 && BdKeptPutMats(w, live) < 0) ++g_keptRepairNotSet;   /* T-36 fold 3: the row's delivered materials, which the repair does not write */
     }
     if (w.p.broken != BdBrokenRead(live)) BdSetBrokenPod(live, w.p.broken != 0);
     BdKeptRuinDoors(w);   /* the doors' owner, lock and open state are laid by the door step right after (BdKeptExtras), over the purchase's open doors */
     float lp[3], lq[4], in[3], rq[4];
     if (!BdCopyF((const char*)live + kObjPos, lp, 3) || BdOrientPod(live, lq) == 0) { for (int i = 0; i < 3; ++i) lp[i] = w.p.pos[i]; for (int i = 0; i < 4; ++i) lq[i] = w.p.rot[i]; }
+    int inOk = 1;   /* T-1372 A1: 0 = no placement input was read (no ground answered) - never the world y in its place */
     if (furn != 0) keptwire::LocalOfWorld(hostPos, hostQ, lp, lq, in, rq);
-    else { for (int i = 0; i < 4; ++i) rq[i] = lq[i]; if (BdPlaceInputFromLive(w.p.key, lp, in) == 0) for (int i = 0; i < 3; ++i) in[i] = lp[i]; }
+    else
+    {
+        for (int i = 0; i < 4; ++i) rq[i] = lq[i];
+        if (BdPlaceInputFromLive(w.p.key, lp, in) == 0) { inOk = 0; for (int i = 0; i < 3; ++i) in[i] = lp[i]; }   /* in[] kept defined; placeOk 0 below */
+    }
     float p = 0, n = 0;
     int c = 0, d = 0, x = 0;
     BdReadState(live, &p, &n, &c, &d, &x);
@@ -18400,18 +23334,19 @@ int BdKeptHandBack(const keptwire::Row& w, void* live, int furn, void* host, con
     if (slot == mySlot)
     {
         BdReg& r = BdRegisterOwnLive(live, key, in, rq, p, n, c, x, 0);
+        if (inOk == 0) r.placeOk = 0;   /* T-1372 A1: no PLACE from it until a scan reads its input (the scan's retry: an own via-4 row, no host) */
         r.broken = BdBrokenRead(live);
         if (furn != 0) { char hk[kKeyCap]; hk[0] = 0; if (ObjectPositionKey(host, hk, kKeyCap, "", 3, 0) != 0) r.hostKey = hk; r.hostForm = coopbuild::kBuildHostPlain; r.floor = w.p.floor; r.outside = 0; }
         g_rsOwePlace.push_back(key);   /* the other games are owed its PLACE + STATE (BdRosterTick) */
         BdOwnDirty(2);
     }
-    else BdOnNewPiece(live, 2, in, rq, furn != 0 ? 3 : 1, furn != 0 ? host : 0, coopbuild::kBuildHostPlain, w.p.floor, 0, slot, 0);
+    else BdOnNewPiece(live, 2, inOk != 0 ? in : 0, rq, furn != 0 ? 3 : 1, furn != 0 ? host : 0, coopbuild::kBuildHostPlain, w.p.floor, 0, slot, 0);   /* T-1372 A1: no input read -> no placement kept (placeOk 0) */
     ++g_keptHandedBack;
     if (sale != 0) g_ocLastKey = key;   /* KEPT: `buyhouse show last` names the house given back */
     char line[700];
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] row %u handed back key=%.63s: the matching piece was '%.60s' (nobody's player) - now '%.60s' (slot %d), no charge; repair=%d (1 whole, 2 wall ruin kept, -1 still a ruin, -2 progress not written); for sale=%d, world side: residents %s, town list out=%d in=%d, doors %u, interior %u; handedBack=%lld",
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] row %u handed back key=%.63s: the matching piece was '%.60s' (nobody's player) - now '%.60s' (slot %d), no charge; repair=%d (1 whole, 2 wall ruin kept, -1 still a ruin, -2 progress not written); purchase here=%d (the T-1430 line names its steps), world side: residents %s, town list out=%d in=%d, doors %u, interior %u; handedBack=%lld",
                 w.row, key.c_str(), BdFactionName(o).c_str(), BdFactionName(BdOwnerPod(live)).c_str(), slot, rpr, sale,
-                sale == 0 ? "not run (not a house for sale)" : (fx.res == 1 ? "moved" : (fx.res == 0 ? "none" : "SKIPPED or FAULTED")), fx.townOut, fx.townIn, fx.doorsN, fx.interiorN, g_keptHandedBack);
+                sale == 0 ? "not run (not a house for sale here, or already a player's)" : (fx.res == 1 ? "moved" : (fx.res == 0 ? "none" : "SKIPPED or FAULTED")), fx.townOut, fx.townIn, fx.doorsN, fx.interiorN, g_keptHandedBack);
     BdKeptLog(line);
     return 1;
 }
@@ -18479,6 +23414,18 @@ long long g_ktDupMerged = 0, g_ktDupRemoved = 0, g_ktKnownGone = 0, g_ktDupHeld 
 std::vector<char> g_townSaid;                   /* the last SAY sent */
 int g_townSaidSlot = -1;
 DWORD g_townSaidAt = 0, g_townLookAt = 0;
+char g_townSayEvent[96] = { 0 };   /* T-1427 (F1346 / F1347): an event that changed this player's outpost list - the next SAY look runs at once */
+long long g_townSayEventLines = 0;
+const long long kTownSayEventLineCap = 40;
+/* T-1427: arm the SAY look for an event (MAIN THREAD). Events found in the mod: the TownFoundPlayer hook's founding of a town of this
+   player's faction (the player's own outpost, a kept outpost founded again on the restore road, the outposttest lever), drained in
+   BdTownWake. A rename, a centre move or a removal of this player's outpost has no hook in the mod: the 5 s look (and the 60 s resend)
+   stays the cover for those and for any missed event. */
+void BdTownsSayEvent(const char* ev)
+{
+    if (ev == 0 || ev[0] == 0) return;
+    _snprintf_s(g_townSayEvent, sizeof g_townSayEvent, _TRUNCATE, "%s", ev);
+}
 long long g_townRowsIn = 0, g_townBad = 0, g_townFounded = 0, g_townStanding = 0, g_townLinked = 0, g_townFoundFail = 0, g_townSays = 0;
 long long g_townSaysWhole = 0;   /* T-1158 step 6: the SAYs sent read whole on this link (TlRestoredTick: armed at this count) */
 long long g_townSaysHeard = 0;   /* T-1158 step 6 (protocol 137): the whole SAYs the world server answered with HEARD on this link (TlRestoredTick: released past the armed count) */
@@ -18605,10 +23552,9 @@ int BdPowerLeaveGrid(void* b, long long* offNet = 0)   /* offNet: the off-networ
     return BdPowerSwitchPod(b, 0);
 }
 /* a town's five handle words (t+0x60) copied to Building +0x1D8, nothing else: the way the engine's own outpost founding 0x4D6300
-   re-towns a standing building (0x791A70(b+0x1D0, town)). The pointer into a town's model-piece store at +0x1F8 is left as it is: it
-   names the store that holds this building's models (createPhysical 0x55FF50 set it), and the model teardown frees them through it.
-   (The engine's set-town routine 0x926190, used only by its town merge, moves +0x1F8 but not the pieces - with it the teardown would
-   free nothing; the merge moves the store first, 0x930510.) 1 = written, 0 = no town or a fault */
+   re-towns a standing building (0x791A70(b+0x1D0, town)). The pointer into a town's floor store at +0x1F8 is not written here: its
+   records move with it after the copy (T-1427, BdFloorStoreFollow - the engine's set-town routine 0x926190 moves the pointer only,
+   after its town merge moved the whole store, 0x930510). 1 = written, 0 = no town or a fault */
 int BdTownWordsCopyPod(void* b, void* t)
 {
     if (b == 0 || t == 0) return 0;
@@ -18620,7 +23566,7 @@ int BdTownWordsCopyPod(void* b, void* t)
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 /* a building linked to town t as the engine re-towns a standing building (BdTownWordsCopyPod: t's five handle words to Building
-   +0x1D8; +0x1F8 stays with the store holding its models - a town still holding pieces is not destroyed, baseshow::StoreKeep).
+   +0x1D8), then its floor-store records and +0x1F8 moved to t's floor store with the pieces inside it (T-1427, BdFloorStoreFollow).
    1 = written; -1 = the piece stands inside a building (BdBuildingTopLevelPod) - its town is its host's, nothing written; 0 = a fault
    (or no town: nothing written).
    A complete, switched-on power piece (BdPowerLeaveGrid; one under construction is left as it is) is switched off before the
@@ -18797,6 +23743,294 @@ std::string InsideFollowReportToken()
                 g_inFollowListUnread, g_inFollowOffNet, g_inFollowLookSet);
     return std::string(b);
 }
+/* ---- T-1427 (F1265 / F1262): A RE-TOWNED BUILDING'S FLOOR PARTS MOVE TO ITS NEW TOWN'S FLOOR STORE ----
+   The engine keeps each building's per-floor parts (the model pieces its walk-in hides above the floor looked at) in a record keyed by
+   the building in the floor store of the town it was MADE in (Building+0x1F8 = town+0x250, createPhysical 0x55FF50; parts added by
+   0x92E760 from the per-model step 0x5580B0, removed by 0x92CFF0 from the teardown 0x561F10). The walk-in 0x561AB0 asks the store of
+   the building's CURRENT town (0x92B0A0): a copy made in one town and linked to another has no record there, its floor pass is skipped
+   and its roof stays drawn (T2561, the owner's report). The engine's own move is its town merge: 0x930510 moves every record, then
+   0x926190 points +0x1F8 at the new store. For one building the same is done record by record: its record's parts per floor and floor
+   byte read, 0x92CFF0 on the old store (the teardown's own removal), +0x1F8 = t+0x250, 0x92E760 per part and floor into the new store
+   (as 0x5580B0 adds them), the floor byte copied as the merge copies the whole record. An interior's parts (0x54A6A0 removes them with
+   0x929CE0 through the host's +0x1F8) sit in the host's record and move with it.
+   A piece inside it (on its interior list, g_inPcs) has its parts in its HOST's record and finds it through its own +0x1F8 at its
+   teardown (0x92CFF0, its second half), so each one in the host's old store moves with it (its own record too, the same way); the
+   group moves only when every part in the moved records belongs to it (coopbuild::FloorStoreGroupStep) - no part is left in the new
+   store whose owner still names the old one. Sign highlights (the old store's second list +0x88, added by 0x9331D0) are not re-added:
+   a group holding one is not moved (logged). MAIN THREAD; the buffers are this road's own */
+static unsigned long long kFsRemoveRva = 0; static AddrReg kFsRemoveRva_reg("TownFloorStoreRemove", &kFsRemoveRva);   /* Steam_1.0.65 0x92CFF0, 1.0.68 0x92DEC0: (store, building) - its record, its sign highlights, its parts in its host's record */
+static unsigned long long kFsAddRva = 0;    static AddrReg kFsAddRva_reg("TownFloorStoreAddPart", &kFsAddRva);       /* Steam_1.0.65 0x92E760, 1.0.68 0x92F630: (store, building, part, floor 0-3) */
+typedef void (*FsRemoveFn)(void* store, void* b);
+typedef void (*FsAddFn)(void* store, void* b, void* part, unsigned int floor);
+const size_t kBFloorStore = 0x1F8, kTownFloorStore = 0x250, kBModels = 0x228, kInModels = 0x10;   /* Building, town, Building's model list, interior's (0x54A6A0) */
+const size_t kFsMapBucketCount = 0x20, kFsMapSize = 0x28, kFsMapBuckets = 0x40;   /* the store's record map (0x929CE0 / 0x92CFF0) */
+const size_t kFsNodeKey = 0x10, kFsNodeFloors = 0x18, kFsNodeFloorStride = 0x18, kFsNodeByte = 0x78;   /* a record: key, four {parts, count, cap}, floor byte */
+const size_t kFsSignList = 0x88, kFsSignCount = 0x90;   /* the store's second list: {building, highlight} pairs (0x9331D0 / 0x92CFF0) */
+const size_t kMlCountA = 0x20, kMlArrA = 0x28, kMlPartA = 0x20, kMlCountB = 0x08, kMlArrB = 0x10, kMlPartB = 0x08;   /* a model list's two arrays, as 0x92CFF0 reads them */
+const int kFsFloors = 4, kFsObjCap = kBdInteriorCap + 1, kFsPartCap = 2048, kFsOwnCap = 4096;
+const long long kFsLineCap = 60;
+struct FsObj { void* o; int hasRec; int byte; int first; int n[kFsFloors]; };
+struct FsPlan { int readOk, capped, newHolds, unknown, signs, objN, parts, foreign, hostParts; };
+FsObj g_fsObjs[kFsObjCap];
+void* g_fsParts[kFsPartCap];
+void* g_fsOwn[kFsOwnCap];
+int g_fsObjN = 0, g_fsOwnN = 0;
+long long g_fsMoved = 0, g_fsInsideMoved = 0, g_fsPartsMoved = 0, g_fsSame = 0, g_fsNoModels = 0, g_fsNoStore = 0, g_fsSkipped = 0, g_fsSkipSigns = 0,
+          g_fsSkipUnknown = 0, g_fsReadFault = 0, g_fsApplyFault = 0, g_fsNoAddr = 0, g_fsOffMain = 0, g_fsLines = 0;
+/* the record of o in store s, or 0 (buckets[bucket count] is the first node of the one list every node hangs on, as 0x930510 walks
+   it). Faults reach the caller's guard */
+const char* FsFindNode(const char* s, const void* o)
+{
+    if (*(const long long*)(s + kFsMapSize) <= 0) return 0;
+    const long long bc = *(const long long*)(s + kFsMapBucketCount);
+    const char* const* buckets = *(const char* const* const*)(s + kFsMapBuckets);
+    if (buckets == 0 || bc <= 0) return 0;
+    const char* node = buckets[bc];
+    for (int guard = 0; node != 0 && guard < 65536; ++guard)
+    {
+        if (*(void* const*)(node + kFsNodeKey) == o) return node;
+        node = *(const char* const*)node;
+    }
+    return 0;
+}
+/* a model list's parts onto the owned list; 0 = the list is full. Faults reach the caller's guard */
+int FsOwnAdd(const char* m)
+{
+    if (m == 0) return 1;
+    const unsigned na = *(const unsigned*)(m + kMlCountA), nb = *(const unsigned*)(m + kMlCountB);
+    const char* const* aa = *(const char* const* const*)(m + kMlArrA);
+    const char* const* ab = *(const char* const* const*)(m + kMlArrB);
+    for (unsigned i = 0; aa != 0 && i < na; ++i) { if (g_fsOwnN >= kFsOwnCap) return 0; g_fsOwn[g_fsOwnN++] = *(void* const*)(aa[i] + kMlPartA); }
+    for (unsigned i = 0; ab != 0 && i < nb; ++i) { if (g_fsOwnN >= kFsOwnCap) return 0; g_fsOwn[g_fsOwnN++] = *(void* const*)(ab[i] + kMlPartB); }
+    return 1;
+}
+/* b's +0x1F8 and whether its model list is made: 1 = read, 0 = a fault */
+int FsHostPod(void* b, char** store, int* models)
+{
+    __try { *store = *(char**)((char*)b + kBFloorStore); *models = *(void**)((char*)b + kBModels) != 0 ? 1 : 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the moving group read (nothing written): host b, the nIn inside pieces of g_inPcs, their records in oldS (parts copied to g_fsParts),
+   the owned parts, the new store's records and the old store's sign highlights of the group */
+void FsPlanPod(void* b, char* oldS, char* newS, int nIn, FsPlan* p)
+{
+    std::memset(p, 0, sizeof *p);
+    g_fsObjN = 0; g_fsOwnN = 0;
+    int partN = 0;
+    __try
+    {
+        g_fsObjs[g_fsObjN++].o = b;
+        if (FsOwnAdd(*(const char* const*)((char*)b + kBModels)) == 0) p->capped = 1;
+        const char* in = *(const char* const*)((char*)b + kBInterior);
+        if (in != 0 && FsOwnAdd(*(const char* const*)(in + kInModels)) == 0) p->capped = 1;
+        for (int i = 0; i < nIn; ++i)
+        {
+            char* x = (char*)g_inPcs[i];
+            const char* xm = *(const char* const*)(x + kBModels);
+            const int st = coopbuild::FloorStoreInsideStep(xm != 0 ? 1 : 0, (unsigned long long)*(char**)(x + kBFloorStore), (unsigned long long)oldS, (unsigned long long)newS);
+            if (st == coopbuild::kFsInsideForeign) { ++p->foreign; continue; }
+            if (st == coopbuild::kFsInsideNone) continue;
+            if (FsOwnAdd(xm) == 0) p->capped = 1;
+            if (st != coopbuild::kFsInsideMove) continue;
+            if (g_fsObjN < kFsObjCap) g_fsObjs[g_fsObjN++].o = x; else p->capped = 1;
+        }
+        for (int k = 0; k < g_fsObjN; ++k)
+        {
+            FsObj* o = &g_fsObjs[k];
+            o->hasRec = 0; o->byte = 0; o->first = partN;
+            for (int f = 0; f < kFsFloors; ++f) o->n[f] = 0;
+            if (FsFindNode(newS, o->o) != 0) ++p->newHolds;
+            const char* node = FsFindNode(oldS, o->o);
+            if (node != 0)
+            {
+                o->hasRec = 1;
+                o->byte = (int)*(const unsigned char*)(node + kFsNodeByte);
+                for (int f = 0; f < kFsFloors; ++f)
+                {
+                    void* const* arr = *(void* const* const*)(node + kFsNodeFloors + kFsNodeFloorStride * (size_t)f);
+                    const unsigned long long cnt = *(const unsigned long long*)(node + kFsNodeFloors + kFsNodeFloorStride * (size_t)f + 8);
+                    for (unsigned long long i = 0; arr != 0 && i < cnt; ++i)
+                    {
+                        if (partN >= kFsPartCap) { p->capped = 1; break; }
+                        void* part = arr[i];
+                        g_fsParts[partN++] = part;
+                        ++o->n[f];
+                        int own = 0;
+                        for (int j = 0; j < g_fsOwnN && own == 0; ++j) if (g_fsOwn[j] == part) own = 1;
+                        if (own == 0) ++p->unknown;
+                    }
+                }
+            }
+            if (k == 0) p->hostParts = partN;
+        }
+        const char* sl = *(const char* const*)(oldS + kFsSignList);
+        const unsigned long long sc = *(const unsigned long long*)(oldS + kFsSignCount);
+        for (unsigned long long i = 0; sl != 0 && i < sc && i < 65536; ++i)
+        {
+            const void* who = *(void* const*)(sl + 16 * i);
+            for (int k = 0; k < g_fsObjN; ++k) if (g_fsObjs[k].o == who) { ++p->signs; break; }
+        }
+        p->objN = g_fsObjN;
+        p->parts = partN;
+        p->readOk = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { p->readOk = 0; }
+}
+/* the group moved (FsPlanPod's read): each one's removal from the old store, +0x1F8 = newS, its parts per floor into newS, its floor
+   byte. 0 = done; else the step that FAULTED (1 removal, 2 the pointer, 3 the parts, 4 the floor byte).
+   T-1427 fold 1 (review LOW): a fault midway leaves the group half moved - g_fsHalfObj / g_fsHalfParts say how far the faulting step
+   got (objects done in it, parts added before it), for the line. It is NOT undone: the only undo is the same engine store routines
+   (0x92CFF0 / 0x92E760) on a store just left in an unknown state - a second fault inside the engine's store is worse than a roof
+   drawn at a walk-in, which is what a half move costs (F1265) */
+int g_fsHalfObj = 0, g_fsHalfParts = 0;
+int FsApplyPod(char* oldS, char* newS, FsRemoveFn rm, FsAddFn add)
+{
+    int step = 1;
+    g_fsHalfObj = 0; g_fsHalfParts = 0;
+    __try
+    {
+        for (int k = 0; k < g_fsObjN; ++k) { rm(oldS, g_fsObjs[k].o); g_fsHalfObj = k + 1; }   /* the host first: an inside piece's own removal then finds no host record left there */
+        step = 2; g_fsHalfObj = 0;
+        for (int k = 0; k < g_fsObjN; ++k) { *(char**)((char*)g_fsObjs[k].o + kBFloorStore) = newS; g_fsHalfObj = k + 1; }
+        step = 3; g_fsHalfObj = 0;
+        for (int k = 0; k < g_fsObjN; ++k)
+        {
+            int at = g_fsObjs[k].first;
+            for (int f = 0; f < kFsFloors; ++f)
+                for (int i = 0; i < g_fsObjs[k].n[f]; ++i) { add(newS, g_fsObjs[k].o, g_fsParts[at++], (unsigned int)f); ++g_fsHalfParts; }
+            g_fsHalfObj = k + 1;
+        }
+        g_fsHalfObj = 0;
+        step = 4;
+        for (int k = 0; k < g_fsObjN; ++k)
+        {
+            if (g_fsObjs[k].hasRec == 0) continue;
+            char* node = (char*)FsFindNode(newS, g_fsObjs[k].o);
+            if (node != 0) *(unsigned char*)(node + kFsNodeByte) = (unsigned char)g_fsObjs[k].byte;
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return step; }
+}
+std::string BdFloorStoreReportText();
+/* one line per move or refusal (capped): the host's key, old / new town, its parts per floor, the inside pieces and their parts */
+void FsLine(void* b, char* oldS, void* t, const char* what, const FsPlan* p)
+{
+    if (g_fsLines >= kFsLineCap) return;
+    ++g_fsLines;
+    char hk[kKeyCap];
+    hk[0] = 0;
+    if (ObjectPositionKey(b, hk, kKeyCap, "", 3, 1) == 0) hk[0] = 0;
+    const int have = (p != 0 && g_fsObjN > 0) ? 1 : 0;
+    const FsObj* h = &g_fsObjs[0];
+    char line[1100];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNLINK] T-1427 floor store key=%.63s '%.60s' -> '%.60s': %s; host record %s, parts per floor %d/%d/%d/%d,"
+                " floor byte %d; inside pieces moving with it %d (their parts %d), in a third store %d; parts not of the group %d; sign highlights %d;%s",
+                hk[0] != 0 ? hk : "(no key)", oldS != 0 ? BdTownName(oldS - kTownFloorStore).c_str() : "none", BdTownName(t).c_str(), what,
+                (have != 0 && p->readOk != 0 && h->hasRec != 0) ? "yes" : "none", have != 0 ? h->n[0] : 0, have != 0 ? h->n[1] : 0,
+                have != 0 ? h->n[2] : 0, have != 0 ? h->n[3] : 0, have != 0 ? h->byte : -1,
+                p != 0 ? p->objN - 1 : 0, p != 0 ? p->parts - p->hostParts : 0, p != 0 ? p->foreign : 0, p != 0 ? p->unknown : 0, p != 0 ? p->signs : 0,
+                BdFloorStoreReportText().c_str());
+    DebugLog(line);
+}
+/* after b's town words were copied to t (BdBuildingSetTownPod, written): its floor-store records follow it to t's store, with the nIn
+   inside pieces read before the copy (g_inPcs). MAIN THREAD */
+void BdFloorStoreFollow(void* b, void* t, int nIn)
+{
+    if (b == 0 || t == 0) return;
+    char* newS = (char*)t + kTownFloorStore;
+    char* oldS = 0;
+    int models = 0;
+    g_fsObjN = 0;
+    if (FsHostPod(b, &oldS, &models) == 0) { ++g_fsReadFault; FsLine(b, 0, t, "NOT moved: its +0x1F8 read FAULTED", 0); return; }
+    const int st = coopbuild::FloorStoreStep(models, (unsigned long long)oldS, (unsigned long long)newS);
+    if (st == coopbuild::kFsSame) { ++g_fsSame; return; }
+    if (st == coopbuild::kFsNoModels) { ++g_fsNoModels; return; }   /* createPhysical points it at the store of its town then */
+    if (st != coopbuild::kFsMove) { ++g_fsNoStore; return; }
+    if (BdOnMain() == 0) { ++g_fsOffMain; FsLine(b, oldS, t, "NOT moved: not on the main thread", 0); return; }
+    if (kFsRemoveRva == 0 || kFsAddRva == 0) { ++g_fsNoAddr; FsLine(b, oldS, t, "NOT moved: TownFloorStoreRemove / TownFloorStoreAddPart is not in the address table", 0); return; }
+    FsPlan p;
+    FsPlanPod(b, oldS, newS, nIn, &p);
+    const int g = coopbuild::FloorStoreGroupStep(p.readOk, p.capped, p.newHolds, p.unknown, p.signs);
+    if (g != coopbuild::kFsGroupGo)
+    {
+        ++g_fsSkipped;
+        if (g == coopbuild::kFsGroupFault) ++g_fsReadFault;
+        if (g == coopbuild::kFsGroupSigns) ++g_fsSkipSigns;
+        if (g == coopbuild::kFsGroupUnknownPart) ++g_fsSkipUnknown;
+        FsLine(b, oldS, t, (std::string("NOT moved (left as it was): ") + coopbuild::FloorStoreGroupWord(g)).c_str(), &p);
+        return;
+    }
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const int fault = FsApplyPod(oldS, newS, (FsRemoveFn)(base + (uintptr_t)kFsRemoveRva), (FsAddFn)(base + (uintptr_t)kFsAddRva));
+    if (fault != 0)
+    {
+        ++g_fsApplyFault;
+        char what[300];
+        _snprintf_s(what, sizeof(what), _TRUNCATE, "%s - HALF MOVED, not undone: %d of %d objects done in that step, %d of %d parts added to the new store (T-1427 fold 1)",
+                    fault == 1 ? "FAULTED in the old store's removal" : fault == 2 ? "FAULTED re-pointing +0x1F8"
+                    : fault == 3 ? "FAULTED adding the parts to the new store" : "FAULTED copying the floor byte", g_fsHalfObj, g_fsObjN, g_fsHalfParts, p.parts);
+        FsLine(b, oldS, t, what, &p);
+        return;
+    }
+    ++g_fsMoved;
+    g_fsInsideMoved += p.objN - 1;
+    g_fsPartsMoved += p.parts;
+    FsLine(b, oldS, t, "moved", &p);
+}
+/* the BUILD report's floor-store token */
+std::string BdFloorStoreReportText()
+{
+    char b[400];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, " floorStore[moved,insideMoved,parts,same,noModels,noStore,skipped,signs,unknownPart,readFault,applyFault,noAddr,offMain]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                g_fsMoved, g_fsInsideMoved, g_fsPartsMoved, g_fsSame, g_fsNoModels, g_fsNoStore, g_fsSkipped, g_fsSkipSigns, g_fsSkipUnknown, g_fsReadFault,
+                g_fsApplyFault, g_fsNoAddr, g_fsOffMain);
+    return std::string(b);
+}
+/* ---- T-1427 (owner decision 1782): EVERY BUILDING'S TOWN ON EACH GAME, LOG ONLY ----
+   One line when a building is placed here, a copy is made of another game's piece, it is finished (by the engine or the mod) or it
+   changes town: its key, the town it is linked to (its town words, BdBuildingTownPod / BdTownReadPod: name and handle words), the town
+   whose floor store holds its floors / roof (+0x1F8 against that town's +0x250; 'none' before its models are made, else the town the
+   store belongs to, +0x1F8 - 0x250) and MATCH / DIFFER / NO STORE. Nothing is written. Capped at kTsLineCap lines; every DIFFER is
+   counted on the BUILD report (townStore[lines,match,differ,noStore]). MAIN THREAD */
+const long long kTsLineCap = 300;
+long long g_tsLines = 0, g_tsMatch = 0, g_tsDiffer = 0, g_tsNoStore = 0;
+void BdTownStoreNote(void* b, const char* key, const char* when)
+{
+    if (b == 0) return;
+    char* store = 0;
+    int models = 0;
+    const int sr = FsHostPod(b, &store, &models);
+    void* t = BdBuildingTownPod(b);
+    float tp[3] = { 0.0f, 0.0f, 0.0f };
+    int th[5] = { 0, 0, 0, 0, 0 };
+    void* tf = 0;
+    const int tr = (t != 0) ? BdTownReadPod(t, tp, th, &tf) : 0;
+    const char* verdict = "DIFFER";
+    std::string storeTown;
+    if (sr == 0) { verdict = "UNREAD"; storeTown = "(its +0x1F8 read FAULTED)"; }
+    else if (store == 0) { verdict = "NO STORE"; storeTown = "none"; ++g_tsNoStore; }
+    else if (t != 0 && store == (char*)t + kTownFloorStore) { verdict = "MATCH"; storeTown = "'" + BdTownName(t) + "' (its own)"; ++g_tsMatch; }
+    else { storeTown = "other: '" + BdTownName(store - kTownFloorStore) + "'"; ++g_tsDiffer; }
+    if (g_tsLines >= kTsLineCap) return;
+    ++g_tsLines;
+    char kb[kKeyCap];
+    kb[0] = 0;
+    if (key == 0 || key[0] == 0) { if (ObjectPositionKey(b, kb, kKeyCap, "", 3, 1) == 0) kb[0] = 0; key = kb; }
+    char line[760];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNSTORE] %s key=%.63s town '%.60s' (words %d/%d/%d/%d/%d%s) floors registered with %.90s: %s (models %s);"
+                " townStore[lines,match,differ,noStore]=%lld,%lld,%lld,%lld%s",
+                when, key[0] != 0 ? key : "(no key)", t != 0 ? BdTownName(t).c_str() : "none", th[0], th[1], th[2], th[3], th[4],
+                (t != 0 && tr == 0) ? ", its reads FAULTED" : "", storeTown.c_str(), verdict, models != 0 ? "made" : "not made yet",
+                g_tsLines, g_tsMatch, g_tsDiffer, g_tsNoStore, g_tsLines >= kTsLineCap ? " - LAST LINE (cap reached; the counts go on in the BUILD report)" : "");
+    DebugLog(line);
+}
+std::string BdTownStoreReportText()
+{
+    char b[160];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, " townStore[lines,match,differ,noStore]=%lld,%lld,%lld,%lld", g_tsLines, g_tsMatch, g_tsDiffer, g_tsNoStore);
+    return std::string(b);
+}
 int BdBuildingSetTownPod(void* b, void* t, int* cycle = 0)
 {
     if (cycle != 0) *cycle = piecerec::kCycleNone;
@@ -18809,8 +24043,11 @@ int BdBuildingSetTownPod(void* b, void* t, int* cycle = 0)
     void* inFrom = nIn > 0 ? BdBuildingTownPod(b) : 0;
     BdInsideLeave(nIn);
     const int wasOn = BdPowerLeaveGrid(b);
+    void* const townBefore = BdBuildingTownPod(b);   /* T-1427 (decision 1782): a line when the town changes */
     const int r = BdTownWordsCopyPod(b, t);
     BdInsideFollow(b, inFrom, t, r, nIn, inListed, inComplete);
+    if (r == 1) BdFloorStoreFollow(b, t, nIn);   /* T-1427: its floor-store records (and its inside pieces') to t's store */
+    if (r == 1 && townBefore != t) BdTownStoreNote(b, 0, "moved to another town");   /* T-1427 (decision 1782) */
     if (wasOn == 0) return r;
     BdPowerSwitchPod(b, 1);   /* a faulted copy: switched back on where it was */
     const int back = BdPowerOnPod(b) == 1 ? 1 : 0;
@@ -19576,6 +24813,23 @@ void BdKtKnownNote(void* t, int how, int pieces)
     k.how = how; k.pieces = pieces; k.removed = 0; k.miss = 0; k.said = 0; k.held = -1;
     g_ktKnown.push_back(k);
 }
+/* T-1442 step 4 (kept road; fold 2): a kept outpost's town founded or newly taken here is an event - that row is OWED a pass over
+   its own loaded kept keys at the next drain (g_townOwed, BdTownsOwedTick), not at the loaded-piece look's 5 s clock. The towns
+   founded or taken since the look began last (g_townFresh; the look takes them as g_townFreshLook): a look link into one of those is
+   work the event road should have done - the 5 s backstop's (townLinkBackstop). g_townRoad: which road links a loaded piece now.
+   MAIN THREAD */
+struct BdTownOwed { long linked, settled, drains; BdTownOwed() : linked(0), settled(0), drains(0) {} };
+std::map<size_t, BdTownOwed> g_townOwed;
+int g_townOwedIn = 0;   /* 1 while BdTownsOwedTick links: a town taken inside it does not start its row's pass over */
+std::set<void*> g_townFresh, g_townFreshLook;
+const int kTownRoadLay = 0, kTownRoadLook = 1, kTownRoadFound = 2;
+int g_townRoad = kTownRoadLay;
+long long g_townLinkAtFound = 0, g_townLinkBackstop = 0, g_townOwedPasses = 0;
+void BdTownOwedMark(size_t idx, void* town)
+{
+    g_townFresh.insert(town);
+    if (g_townOwedIn == 0) g_townOwed[idx] = BdTownOwed();
+}
 /* the town standing for the outpost of a kept piece in this world, taken or founded now (0 = the piece is of no outpost, or none
    could be had: the piece is laid without one; or owner 938's team gate holds it - not this player's or a teammate's, or the team
    table not in yet - and nothing is settled for it). fac: the piece owner's faction here. */
@@ -19627,6 +24881,7 @@ void* BdKeptTownForKey(const std::string& pieceKey, ::Faction* fac)
         std::map<size_t, void*>::const_iterator c = g_townLive.find(idx);
         if (c != g_townLive.end() && c->second == chosen) return chosen;
         g_townLive[idx] = chosen;
+        BdTownOwedMark(idx, chosen);   /* T-1442 step 4: taken - its other loaded pieces linked at the next drain */
         if (how == townkeep::kChoseLinks) ++g_ktChosenLinks; else { ++g_ktChosenRadius; ++g_townStanding; }
         const townkeep::TownCand& pc = cand[(size_t)pick];
         BdKtKnownNote(chosen, how, pc.links);
@@ -19669,6 +24924,7 @@ void* BdKeptTownForKey(const std::string& pieceKey, ::Faction* fac)
     BdTownReadPod(town, lp, h, &f0);
     const int facOk = (f0 == (void*)fac) ? 1 : BdTownSetFactionPod(town, (void*)fac);
     g_townLive[idx] = town; ++g_townFounded;
+    BdTownOwedMark(idx, town);   /* T-1442 step 4: founded - its other loaded pieces linked at the next drain */
     BdKtKnownNote(town, townkeep::kChoseFound, 0);
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] outpost FOUNDED for slot %d: %s (kept '%.80s' at (%.1f, %.1f, %.1f)%s%s) - its %u kept piece(s) are linked to it as they are laid; founded=%lld",
                 t.owner, BdTownText(town).c_str(), t.name.c_str(), t.pos[0], t.pos[1], t.pos[2], named != 0 ? "" : "; the name write FAULTED", facOk != 0 ? "" : "; the faction write FAULTED",
@@ -19747,7 +25003,11 @@ int BdKeptTownLinkKeyDo(long row, const std::string& pieceKey, void* b, void* to
     }
     if (set < 0) { BdKeptTownHostNote(row, pieceKey); return 1; }
     ++g_townLinked; ++g_ktRelinkedDead;   /* only a piece whose link named no live town is written here */
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] %s piece key=%.63s linked to its outpost '%.80s' (its town was %.90s); linked=%lld", who, pieceKey.c_str(), BdTownName(town).c_str(), was.c_str(), g_townLinked);
+    const char* road = "";   /* T-1442 step 4: a loaded piece's link - at its town's founding, or the 5 s look's backstop work */
+    if (g_townRoad == kTownRoadFound) { ++g_townLinkAtFound; road = " - at its town's founding"; }
+    else if (g_townRoad == kTownRoadLook && g_townFreshLook.count(town) != 0) { ++g_townLinkBackstop; road = " - by the 5 s look (backstop: its town was founded or taken before this look)"; }
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] %s piece key=%.63s linked to its outpost '%.80s' (its town was %.90s)%s; linked=%lld townLinkAtFound=%lld townLinkBackstop=%lld", who, pieceKey.c_str(), BdTownName(town).c_str(), was.c_str(), road, g_townLinked,
+                g_townLinkAtFound, g_townLinkBackstop);
     BdKeptLog(line);
     void* now = BdBuildingTownPod(b);   /* read back the engine's way */
     if (now != town)
@@ -19830,6 +25090,8 @@ void BdTownsLoadedTick()
     const DWORD now = ::GetTickCount();
     if (now - g_townLoadedAt < kTownLookMs) return;
     g_townLoadedAt = now;
+    g_townFreshLook.swap(g_townFresh);   /* T-1442 step 4 fold 3: the towns founded or taken before this look */
+    g_townFresh.clear();
     const int mySlot = KeptMySlot();
     if (mySlot < 0 || LocalPlayerFaction() == 0) return;
     /* owner 938: an outpost of an owner neither this player nor a teammate, or with the team table not in yet, is neither walked nor
@@ -19888,7 +25150,9 @@ void BdTownsLoadedTick()
         if (links >= kTownLinksPerLook) { capped = 1; break; }   /* enough links for one frame: the rest at the next look */
         ++links;
         tried.insert(key);
+        g_townRoad = kTownRoadLook;   /* T-1442 step 4 fold 3 */
         if (BdKeptTownPlaceKey(-1, key, b, fac) != 0) g_townLoadedDone.insert(key);   /* linked, already in it, or inside a building: settled for this world */
+        g_townRoad = kTownRoadLay;
     }
     /* a look counts against an open key only when its area's buildings are all loaded here and the look covered it: a capped look covers
        the keys it linked, a whole look (no cap, an untruncated list) every key. Keys of an owner with no faction here wait for it. */
@@ -19912,6 +25176,87 @@ void BdTownsLoadedTick()
             BdKeptLog(line);
         }
         g_townLoadedMiss.erase(ki->first);
+    }
+}
+/* T-1442 step 4 fold 2 (owner principle 'events over timers'): the kept rows whose town was founded or taken here (g_townOwed) - at
+   the next drain, before the 5 s look, ONE walk of the loaded buildings links only those rows' open keys (their owner's faction's
+   pieces, matched as the look matches them) through the look's own step (BdKeptTownPlaceKey); a row with no open key left ends at
+   once, with no walk. At most kTownLinksPerLook pieces a drain; a capped drain that settled a piece goes on at the next for the
+   rows that settled one or were not reached (baseshow::KeptOwedStays), else the row's pass ends - one [KEPT] line - and the 5 s look is the backstop. MAIN THREAD */
+void BdTownsOwedTick()
+{
+    if (g_townOwed.empty() || g_townRows.empty() || kBdTownListRva == 0 || EngineWritesBlocked()) return;
+    const int mySlot = KeptMySlot();
+    if (mySlot < 0 || LocalPlayerFaction() == 0) return;
+    std::map<size_t, ::Faction*> facOf;   /* an owed row with an open key and its owner's faction here */
+    for (std::map<size_t, BdTownOwed>::iterator o = g_townOwed.begin(); o != g_townOwed.end(); ++o)
+    {
+        const size_t r = o->first;
+        ++o->second.drains;
+        if (r >= g_townRows.size() || g_townFailed.count(r) != 0) continue;
+        int open = 0;
+        for (size_t k = 0; k < g_townRows[r].keys.size() && open == 0; ++k) if (g_townLoadedDone.count(g_townRows[r].keys[k]) == 0) open = 1;
+        if (open == 0) continue;
+        ::Faction* fac = (g_townRows[r].owner == mySlot) ? LocalPlayerFaction() : OwnerFactionForSlot(g_townRows[r].owner, false);
+        if (fac != 0) facOf[r] = fac;
+    }
+    std::map<size_t, int> settled0, tried0;   /* re-check fold: per row this drain - pieces settled, pieces reached */
+    int anySettled = 0;
+    int capped = 0, links = 0;
+    if (!facOf.empty())
+    {
+        static void* list[4096];
+        int zones = 0, trunc = 0;
+        const long long gen0 = BoxWalkGen();
+        const int n = LoadedBuildings(list, 4096, &zones, &trunc);
+        g_townOwedIn = 1;
+        for (int i = 0; i < n; ++i)
+        {
+            if (BoxWalkGen() != gen0) { g_townOwedIn = 0; return; }   /* a zone went: the rows stay owed, the next drain */
+            void* b = list[i];
+            if (b == 0) continue;
+            void* own = BdOwnerPod(b);
+            if (own == 0) continue;
+            int ownerOk = 0;
+            for (std::map<size_t, ::Faction*>::const_iterator f = facOf.begin(); f != facOf.end() && ownerOk == 0; ++f) if ((void*)f->second == own) ownerOk = 1;
+            if (ownerOk == 0) continue;   /* no owed row's owner's piece: no key built */
+            char k[kKeyCap];
+            k[0] = 0;
+            if (ObjectPositionKey(b, k, kKeyCap, "", 3, 1) == 0) continue;
+            std::map<std::string, size_t>::const_iterator ki = BdTownKeyOf(std::string(k));
+            if (ki == g_townKeyIdx.end()) continue;
+            const size_t r = ki->second;
+            std::map<size_t, ::Faction*>::const_iterator f = facOf.find(r);
+            if (f == facOf.end() || (void*)f->second != own || g_townLoadedDone.count(ki->first) != 0) continue;
+            float lp = 0, ln = 0;
+            int lc = 0, ld = 0, lx = 0;
+            if (!BdReadState(b, &lp, &ln, &lc, &ld, &lx) || ld != 0) continue;   /* unreadable, or being dismantled */
+            if (links >= kTownLinksPerLook) { capped = 1; break; }   /* the rest at the next drain */
+            ++links;
+            const long long l0 = g_townLinkAtFound;
+            g_townRoad = kTownRoadFound;
+            const int settled = BdKeptTownPlaceKey(-1, ki->first, b, f->second);
+            g_townRoad = kTownRoadLay;
+            ++tried0[r];
+            if (settled != 0) { g_townLoadedDone.insert(ki->first); ++g_townOwed[r].settled; ++settled0[r]; anySettled = 1; }
+            if (g_townLinkAtFound != l0) g_townOwed[r].linked += (long)(g_townLinkAtFound - l0);
+        }
+        g_townOwedIn = 0;
+    }
+    for (std::map<size_t, BdTownOwed>::iterator o = g_townOwed.begin(); o != g_townOwed.end(); )
+    {
+        if (baseshow::KeptOwedStays(capped, anySettled, settled0.count(o->first) != 0 ? 1 : 0, tried0.count(o->first) != 0 ? 1 : 0) != 0) { ++o; continue; }
+        ++g_townOwedPasses;
+        if (g_townOwedPasses <= 40 || g_townOwedPasses % 100 == 0)
+        {
+            const size_t r = o->first;
+            char line[460];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] at the founding: outpost '%.80s' of slot %d - its loaded kept pieces linked into its town now: linked %ld, settled %ld (linked, already in it, or inside a building), %ld drain(s)%s; townLinkAtFound=%lld townLinkBackstop=%lld owedPasses=%lld",
+                        r < g_townRows.size() ? g_townRows[r].name.c_str() : "?", r < g_townRows.size() ? g_townRows[r].owner : -1, o->second.linked, o->second.settled, o->second.drains,
+                        capped != 0 ? " - capped with nothing settled for it: the rest left to the 5 s look" : "", g_townLinkAtFound, g_townLinkBackstop, g_townOwedPasses);
+            BdKeptLog(line);
+        }
+        g_townOwed.erase(o++);
     }
 }
 /* the piece owner's faction here for a kept row: this player's own, else the owner's stand-in (none made) */
@@ -20230,7 +25575,9 @@ int BdTownCopyAt(const int* h, const float* lp) { return baseshow::CopyAt(g_town
 void BdTownsSayTick()
 {
     const DWORD now = ::GetTickCount();
-    if (now - g_townLookAt < kTownLookMs) return;
+    char ev[96]; ev[0] = 0;
+    if (g_townSayEvent[0] != 0) { std::memcpy(ev, g_townSayEvent, sizeof ev); g_townSayEvent[0] = 0; }   /* T-1427: an event looks at once (taken here: a look that stops early leaves it to the 5 s look) */
+    if (ev[0] == 0 && now - g_townLookAt < kTownLookMs) return;
     g_townLookAt = now;
     const int slot = KeptMySlot();
     if (slot < 0 || kBdTownListRva == 0 || EngineWritesBlocked()) return;
@@ -20316,7 +25663,9 @@ void BdTownsSayTick()
                     rows[i].hand[0], rows[i].hand[1], rows[i].hand[2], rows[i].hand[3], rows[i].hand[4], (unsigned)rows[i].keys.size(), rows[i].cut != 0 ? " (list cut)" : "");
         names += t;
     }
-    DebugLog("[KEPT] outposts said to the world server: " + zonekeep::ZkNum((long long)rows.size()) + " of this player's" + std::string(whole != 0 ? "" : " (its town list not read whole)")
+    const bool atEvent = (ev[0] != 0 && g_townSayEventLines < kTownSayEventLineCap);
+    if (atEvent) ++g_townSayEventLines;
+    DebugLog("[KEPT] outposts said to the world server" + (atEvent ? std::string(" at the event '") + ev + "'" : std::string()) + ": " + zonekeep::ZkNum((long long)rows.size()) + " of this player's" + std::string(whole != 0 ? "" : " (its town list not read whole)")
              + " in " + zonekeep::ZkNum((long long)msgs.size()) + " message(s)" + (names.empty() ? std::string() : ": " + names));
 }
 /* ---- T-811 TEAMMATES' BASES ON THE MAP (src/common/baseshow.h). MAIN THREAD (the session dispatch, BuildCopyDrain, the saveGame
@@ -20589,13 +25938,14 @@ void BdTownWake()
     {
         townwake::Entry& e = g_twTake[i];
         void* t = 0;
+        void* tf = 0;   /* T-1427: its faction */
         float p[3] = { 0.0f, 0.0f, 0.0f };
         for (int k = 0; k < tn && t == 0; ++k)
         {
             float lp[3]; int h[5]; void* f = 0;
             const int rd = BdTownReadPod(towns[k], lp, h, &f);
             const bool same = townwake::HandKnown(e.hand) ? (rd != 0 && townwake::HandSame(h, e.hand)) : ((unsigned long long)(uintptr_t)towns[k] == e.ptr);
-            if (same && rd != 0) { t = towns[k]; p[0] = lp[0]; p[1] = lp[1]; p[2] = lp[2]; if (!townwake::HandKnown(e.hand)) std::memcpy(e.hand, h, sizeof e.hand); }
+            if (same && rd != 0) { t = towns[k]; tf = f; p[0] = lp[0]; p[1] = lp[1]; p[2] = lp[2]; if (!townwake::HandKnown(e.hand)) std::memcpy(e.hand, h, sizeof e.hand); }
         }
         const unsigned age = (unsigned)(now - (DWORD)e.queuedAt);
         int active = 0, inList = -1;
@@ -20637,6 +25987,8 @@ void BdTownWake()
             continue;
         }
         if (t != 0 && posOk != 0) TlOwnTownAt(p, "a town founded (the TownFoundPlayer hook)");   /* T-1047 step 5 fold 3: its founder has returned (any relink it made is done) */
+        if (t != 0 && tf != 0 && tf == (void*)LocalPlayerFaction() && BdTownCopyAt(e.hand, p) < 0)
+            BdTownsSayEvent("a town founded (the TownFoundPlayer hook)");   /* T-1427: this player's own outpost - said to the world server at once (below), not at the next 5 s look */
         if (v == townwake::kAlready) { ++g_twAlready; continue; }
         if (v == townwake::kAreaMismatch) { ++g_twAreaMismatch; continue; }
         if (v != townwake::kWake) { ::InterlockedIncrement64(&g_twDropped); continue; }   /* timeout, another world, off the grid */
@@ -20655,6 +26007,7 @@ void BdTownWake()
             DebugLog(std::string(line));
         }
     }
+    if (g_townSayEvent[0] != 0) BdTownsSayTick();   /* T-1427: the founding's SAY in this drain (its own checks; nothing changed = nothing sent) */
 }
 /* the loaded top-level pieces linked to town t: their own town handle words (+0x1D8) are t's - memory reads only, not the engine's
    lookup (its nearest-town fallback would count a piece linked to no town); *unread = 1 when the loaded pieces, or t's handle words,
@@ -20866,6 +26219,169 @@ int BdHandTownKindPod(const int* hand, void* fac, void** town)
         return townkeep::kLinkNone;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+long long g_tfMarkedN = 0, g_tfMarkHeld = 0, g_tfApplied = 0, g_tfNoTownHere = 0, g_tfWorldMissing = 0, g_tfWorldTwice = 0, g_tfUnread = 0;
+std::map<std::string, piecerec::PieceTownFact> g_tfMarked;   /* key -> the town fact a marked write carries (stands while it is owed or flying) */
+/* T-1427 fold 1: the town whose words are `hand` - 1 the wilderness town, 2 a town on the player-town list, 3 another town on the
+   every-town list (*town set); 0 none or a dead town; -1 the lists did not read. Memory reads only */
+int BdTownOfWordsPod(const int* hand, void** town)
+{
+    *town = 0;
+    void* tl = BdTownListPtr();
+    if (tl == 0) return -1;
+    __try
+    {
+        const char* c = (const char*)tl;
+        void* const wild = *(void* const*)(c + kTownListWild);
+        if (wild != 0 && std::memcmp((const char*)wild + kTownHandWords, hand, 20) == 0) { *town = wild; return 1; }
+        const unsigned np = *(const unsigned*)(c + kTownListPlayerN);
+        void* const* pa = *(void* const* const*)(c + kTownListPlayerArr);
+        const unsigned na = *(const unsigned*)(c + kTownListAllN);
+        void* const* aa = *(void* const* const*)(c + kTownListAllArr);
+        if ((na > 0 && aa == 0) || (np > 0 && pa == 0)) return -1;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            const unsigned n = (pass == 0) ? np : na;
+            void* const* arr = (pass == 0) ? pa : aa;
+            for (unsigned i = 0; i < n; ++i)
+            {
+                void* t = arr[i];
+                if (t == 0 || t == wild || std::memcmp((const char*)t + kTownHandWords, hand, 20) != 0) continue;
+                if (*(const int*)((const char*)t + kTownState) == kTownStateDead) return 0;
+                *town = t;
+                return pass == 0 ? 2 : 3;
+            }
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the every-town list's live towns that are on no player-town list and are not the wilderness town (the world's own towns), at most
+   cap; -1 = the lists did not read */
+int BdWorldTownsPod(void** out, int cap)
+{
+    void* tl = BdTownListPtr();
+    if (tl == 0) return -1;
+    __try
+    {
+        const char* c = (const char*)tl;
+        void* const wild = *(void* const*)(c + kTownListWild);
+        const unsigned np = *(const unsigned*)(c + kTownListPlayerN);
+        void* const* pa = *(void* const* const*)(c + kTownListPlayerArr);
+        const unsigned na = *(const unsigned*)(c + kTownListAllN);
+        void* const* aa = *(void* const* const*)(c + kTownListAllArr);
+        if ((na > 0 && aa == 0) || (np > 0 && pa == 0)) return -1;
+        int k = 0;
+        for (unsigned i = 0; i < na && k < cap; ++i)
+        {
+            void* t = aa[i];
+            if (t == 0 || t == wild || *(const int*)((const char*)t + kTownState) == kTownStateDead) continue;
+            int mine = 0;
+            for (unsigned j = 0; j < np && mine == 0; ++j) if (pa[j] == t) mine = 1;
+            if (mine == 0) out[k++] = t;
+        }
+        return k;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1427 fold 1 (owner request 2026-11-18): THE TOWN BUILDING b STANDS IN, AS ITS RECORD CARRIES IT - read from its own town words
+   (+0x1D8, what the engine set; never the engine's name lookup, which gives a building in 'Nowhere' the nearest town's name): the
+   wilderness town -> kPtfNowhere; a world town -> kPtfWorld with its game-data stringID (GameData +0x58 through RootObjectBase::data
+   +0x40, as a building's own key reads it - BdSidOf); a player's town -> kPtfOutpost with id 0 (the outpost id road names it);
+   no or a dead town -> kPtfNone. Returns 1 read, -1 not read. MAIN THREAD */
+int BdBuildingTownFactPod(void* b, piecerec::PieceTownFact* f)
+{
+    *f = piecerec::PieceTownFact();
+    int bh[5] = { 0, 0, 0, 0, 0 };
+    if (b == 0 || BdBuildingTownHandPod(b, bh) == 0) return -1;
+    if (bh[0] == 0xB || !townkeep::HandKnown(bh)) return 1;
+    void* t = 0;
+    const int kind = BdTownOfWordsPod(bh, &t);
+    if (kind < 0) return -1;
+    if (kind == 1) { f->kind = piecerec::kPtfNowhere; return 1; }
+    if (kind == 2) { f->kind = piecerec::kPtfOutpost; return 1; }
+    if (kind != 3) return 1;
+    char sid[96];
+    sid[0] = 0;
+    BdSidOf(t, sid, (int)sizeof sid);
+    const std::string s(sid);
+    if (piecerec::PrTownSidOk(s) == 0) return -1;   /* an unreadable or over-long id: not said (never a guess) */
+    f->kind = piecerec::kPtfWorld;
+    f->sid = s;
+    return 1;
+}
+/* T-1427 fold 2 (re-review SHOULD 1): how many towns the every-town list holds (-1 = not read) */
+int BdTownListAllCountPod()
+{
+    void* tl = BdTownListPtr();
+    if (tl == 0) return -1;
+    __try { return (int)*(const unsigned*)((const char*)tl + kTownListAllN); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+const int kWorldTownsSane = 1 << 20;   /* past it the count is not a town count (a bad read): not read */
+long long g_tfWorldReads = 0, g_tfWorldUnread = 0;
+int g_tfWorldTownsN = -1;   /* the world towns the last read found */
+/* T-1427 fold 2 (re-review SHOULD 1): EVERY live world town and its stringID - the buffer sized from the list's real count (no cap: the
+   builder's own walk, BdBuildingTownFactPod, sees every town, so the joiner's must too). The count of towns, or -1 not read */
+int BdWorldTownIds(std::vector<void*>* towns, std::vector<std::string>* sids)
+{
+    towns->clear();
+    sids->clear();
+    ++g_tfWorldReads;
+    const int na = BdTownListAllCountPod();
+    if (na < 0 || na > kWorldTownsSane) { ++g_tfWorldUnread; return -1; }
+    if (na == 0) { g_tfWorldTownsN = 0; return 0; }
+    towns->resize((size_t)na);
+    const int n = BdWorldTownsPod(&(*towns)[0], na);   /* the world towns are a part of the every-town list: na always holds them */
+    if (n < 0) { towns->clear(); ++g_tfWorldUnread; return -1; }
+    towns->resize((size_t)n);
+    sids->reserve((size_t)n);
+    for (int i = 0; i < n; ++i)
+    {
+        char sid[96];
+        sid[0] = 0;
+        BdSidOf((*towns)[(size_t)i], sid, (int)sizeof sid);
+        sids->push_back(std::string(sid));
+    }
+    g_tfWorldTownsN = n;
+    return n;
+}
+/* T-1427 fold 2 (re-review NIT): during one look (TlTick's record walk) the world towns' ids are read ONCE, at the first fact that
+   needs them, and dropped when the look ends (no town is made or ended inside it: main thread, the walk relinks pieces only) */
+int g_tfLookOn = 0, g_tfLookN = -2;   /* -2: not read this look */
+std::vector<void*> g_tfLookTowns;
+std::vector<std::string> g_tfLookSids;
+void TlFactLookBegin() { g_tfLookOn = 1; g_tfLookN = -2; g_tfLookTowns.clear(); g_tfLookSids.clear(); }
+void TlFactLookEnd() { g_tfLookOn = 0; g_tfLookN = -2; g_tfLookTowns.clear(); g_tfLookSids.clear(); }
+/* T-1427 fold 1: this game's town for a world-town / 'Nowhere' fact - the one live world town whose stringID it is (none, or two:
+   0 and counted - never a guess), or the wilderness town. Fold 2: every world town looked at (coopbuild::WorldTownPick) */
+void* TlFactTownHere(const piecerec::PieceTownFact& f)
+{
+    if (f.kind == piecerec::kPtfNowhere) return BdWildTownPod();
+    if (f.kind != piecerec::kPtfWorld) return 0;
+    std::vector<void*> ownTowns;
+    std::vector<std::string> ownSids;
+    const std::vector<void*>* towns = &ownTowns;
+    const std::vector<std::string>* sids = &ownSids;
+    int n = 0;
+    if (g_tfLookOn != 0)
+    {
+        if (g_tfLookN == -2) g_tfLookN = BdWorldTownIds(&g_tfLookTowns, &g_tfLookSids);
+        n = g_tfLookN; towns = &g_tfLookTowns; sids = &g_tfLookSids;
+    }
+    else n = BdWorldTownIds(&ownTowns, &ownSids);
+    if (n < 0) { ++g_tfUnread; return 0; }   /* the lists did not read: not a missing town */
+    int hits = 0;
+    const int at = coopbuild::WorldTownPick(*sids, f.sid, &hits);
+    if (at >= 0 && (size_t)at < towns->size()) return (*towns)[(size_t)at];
+    if (hits == 0) ++g_tfWorldMissing; else ++g_tfWorldTwice;
+    return 0;
+}
+void* TlRecordFactTown(const std::string& key)
+{
+    std::map<std::string, PcrKept>::const_iterator k = g_pcrKept.find(piecerec::MakePieceRecId(key));
+    if (k == g_pcrKept.end() || (k->second.h.flags & piecerec::kPrFlagRemoved) != 0) return 0;
+    return TlFactTownHere(piecerec::PieceTownFactOf(k->second.b.live));
 }
 /* T-1078 (owner 1475 b): THE [BUILD] town mismatch LINE - a piece of this player's own base (owner = this game's player faction)
    whose town is not one of its owner's own towns: the engine's town lookup (the name the game shows; a piece whose own town link
@@ -21390,6 +26906,7 @@ int TlRelink(const std::string& key, void* b, void* t, const PcrKept& k, const i
 {
     TlRelinkOps ops(b, t, key, k, liveFollows);
     const int r = baseshow::RelinkPiece(&ops, &g_tlFails, kTlMapCap, key, k.h.generation, from, to, &g_tlFailSkip);
+    BdCopyTownJudge(key, t, "the [TOWNLINK] record link", r == baseshow::kRelinkDone ? coopbuild::kSwDone : coopbuild::kSwRefused, 0);   /* T-1427 part 2 / fold 1: its creation town against the builder's; a refused or skipped link stays owed */
     if (r == baseshow::kRelinkFailed)
     {
         ++g_tlRefused; ++g_tlFailedCopy;
@@ -21403,43 +26920,142 @@ int TlRelink(const std::string& key, void* b, void* t, const PcrKept& k, const i
     }
     return r;
 }
+/* T-1427 fold 1: 1 = a record's LIVE part names a town - an outpost, or the builder's world town / 'Nowhere' */
+int TlRecordNamesTown(const piecerec::PieceLive& l)
+{
+    return piecerec::PieceTownDecider(1, 0, l) != piecerec::kTownByShow ? 1 : 0;   /* fold 2: the one decider */
+}
+/* T-1427 fold 2 (re-review SHOULD 2): who sets the town of the copy `key` (piecerec::PieceTownDecider over its kept record) */
+int TlTownDeciderOf(const std::string& key)
+{
+    std::map<std::string, PcrKept>::const_iterator k = g_pcrKept.find(piecerec::MakePieceRecId(key));
+    if (k == g_pcrKept.end()) return piecerec::kTownByShow;
+    return piecerec::PieceTownDecider(1, (k->second.h.flags & piecerec::kPrFlagRemoved) != 0 ? 1 : 0, k->second.b.live);
+}
+long long g_tlShowFactYield = 0;
+std::set<std::string> g_tlShowYieldSaid;   /* keys whose [SHOW] deferral was said (this world; at most kTlShowYieldSaidCap) */
+const size_t kTlShowYieldSaidCap = 4096;
+/* the [SHOW] link step steps aside for a copy whose record names its town (an outpost, or a town fact): counted, said once per key */
+void TlShowYield(const std::string& key, int by)
+{
+    if (by == piecerec::kTownByFact) ++g_tlShowFactYield; else ++g_tlShowLinkYield;
+    if (g_tlShowYieldSaid.size() >= kTlShowYieldSaidCap || !g_tlShowYieldSaid.insert(key).second) return;
+    std::map<std::string, PcrKept>::const_iterator k = g_pcrKept.find(piecerec::MakePieceRecId(key));
+    const piecerec::PieceTownFact f = (k != g_pcrKept.end()) ? piecerec::PieceTownFactOf(k->second.b.live) : piecerec::PieceTownFact();
+    char line[360];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[SHOW] copy key=%.63s: its record names its town (%s %u%s%.60s) - the [SHOW] link step defers to the record link; showLinkYield=%lld showFactYield=%lld",
+                key.c_str(), piecerec::PieceTownFactWord(f.kind), f.id, f.sid.empty() ? "" : " ", f.sid.c_str(), g_tlShowLinkYield, g_tlShowFactYield);
+    DebugLog(line);
+}
+/* T-1427 fold 1: THE OWNER'S GAME WRITES ITS PIECE'S WORLD TOWN / 'NOWHERE' (piecerec::PieceTownFactMarkDue) - on the own-piece check's
+   events (an area's records applied, the team list changed) as the outpost mark is; the write itself carries what PcrTownFill reads
+   then. Not this game's writer now: held, its area's check owed again at the next applied area map (as the outpost mark) */
+void TlFactMark(const std::string& id, const std::string& key, void* b, const PcrKept& k, PcrW& w)
+{
+    piecerec::PieceTownFact eng;
+    if (BdBuildingTownFactPod(b, &eng) < 0) { ++g_tfUnread; return; }
+    if (eng.kind != piecerec::kPtfWorld && eng.kind != piecerec::kPtfNowhere) return;
+    std::map<std::string, piecerec::PieceTownFact>::iterator m = g_tfMarked.find(key);
+    piecerec::PieceTownFact marked;
+    if (m != g_tfMarked.end())
+    {
+        if (piecerec::PieceTownMarkStands(1u, w.marked, w.fly.empty() ? 0 : 1) != 0) marked = m->second;
+        else { g_tfMarked.erase(m); m = g_tfMarked.end(); }   /* its write was answered or lost: marked again below when still owed */
+    }
+    const piecerec::PieceTownFact keptF = piecerec::PieceTownFactOf(k.b.live);
+    const int writerNow = PcrWriterNow(id, w) != 0 ? 1 : 0;
+    if (piecerec::PieceTownFactMarkDue(1, writerNow, 0u, eng, keptF, marked) == 0)
+    {
+        if (writerNow == 0 && piecerec::PieceTownFactSame(eng, keptF) == 0 && piecerec::PieceTownFactSame(eng, marked) == 0)
+        {
+            ++g_tfMarkHeld;
+            int hx = -1, hy = -1;
+            if (BoxKeySector(key.c_str(), &hx, &hy) != 0) g_tlMarkHeldAreas.insert(std::make_pair(hx, hy));
+        }
+        return;
+    }
+    g_tfMarked[key] = eng;
+    ++g_tfMarkedN;
+    PcrMarkW(w, key, piecerec::kPeLive);
+    if (g_tlLines < kTlLineCap)
+    {
+        ++g_tlLines;
+        char line[360];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNLINK] own key=%.63s: the engine has it in %s %.60s, its record says %s %.60s - write marked; townFactMarked=%lld",
+                    key.c_str(), piecerec::PieceTownFactWord(eng.kind), eng.sid.c_str(), piecerec::PieceTownFactWord(keptF.kind), keptF.sid.c_str(), g_tfMarkedN);
+        DebugLog(line);
+    }
+}
+/* T-1442 step 4: which road called TlApplyPiece - the K2 drain (a record came), the 5 s look (the backstop) or the owed pass at an
+   outpost copy's founding (TlOwedTick); set around the look's and the pass's walks. MAIN THREAD */
+const int kTlRoadDrain = 0, kTlRoadLook = 1, kTlRoadFound = 2;
+int g_tlRoad = kTlRoadDrain;
+long long g_tlLinkAtFound = 0, g_tlLinkBackstop = 0;
+/* fold 3: the outpost ids marked owed since the look began last (g_tlOwedSince; the look takes them as g_tlOwedLook) - a look link
+   naming one of those is work the event road should have done: the backstop's. Any other look link is the look's own road (a load,
+   a return, a record that came later) */
+std::set<unsigned> g_tlOwedSince, g_tlOwedLook;
 /* one piece's record link onto the piece standing here (b). 1 = relinked; 0 = nothing done (the step counted). liveFollows: the
    record's LIVE values are written right after (the K2 drain) */
 int TlApplyPiece(const std::string& key, void* b, const PcrKept& k, int mySlot, int liveFollows)
 {
     const unsigned link = piecerec::PieceTownOf(k.b.live);
+    /* T-1427 fold 1: a record that names no outpost may name the builder's world town or 'Nowhere' (its town fact) - the same step,
+       with this game's town for that fact as the record's town (stepLink stands for 'the record names a town') */
+    const piecerec::PieceTownFact fact = piecerec::PieceTownFactOf(k.b.live);
+    const int byFact = (link == 0 && (fact.kind == piecerec::kPtfWorld || fact.kind == piecerec::kPtfNowhere)) ? 1 : 0;
+    const unsigned stepLink = (link != 0) ? link : (byFact != 0 ? 1u : 0u);
     const int removed = (k.h.flags & piecerec::kPrFlagRemoved) != 0 ? 1 : 0;
     const int ownerHere = (k.h.ownerSlot == mySlot) ? 1 : 0;
     const int top = BdBuildingTopLevelPod(b);
+    const int owed = BdCopyTownOwed(key);   /* T-1427 fold 1: this copy's creation town still to be compared - its town is read even when it is not linked */
+    const int linkRoad = (ownerHere == 0 && top == 1) ? 1 : 0;
     int words[5] = { 0, 0, 0, 0, 0 }, bh[5] = { 0, 0, 0, 0, 0 };
     void* t = 0;
     int inThat = 0;
-    if (removed == 0 && link != 0 && ownerHere == 0 && top == 1)
+    if (removed == 0 && stepLink != 0 && top >= 0 && (linkRoad != 0 || owed != 0))
     {
         int ownerBad = 0;
-        t = TlTownOfId(link, k.h.ownerSlot, words, &ownerBad);
-        if (ownerBad != 0) { ++g_tlOwnerBad; return 0; }   /* fold 1: the id names another player's outpost - never linked into it */
-        if (t != 0 && BdBuildingTownHandPod(b, bh) == 0) { ++g_tlRefused; return 0; }
+        if (link != 0) t = TlTownOfId(link, k.h.ownerSlot, words, &ownerBad);
+        else
+        {
+            t = TlFactTownHere(fact);
+            float tp[3]; void* tf = 0;
+            if (t != 0 && BdTownReadPod(t, tp, words, &tf) == 0) t = 0;
+        }
+        if (ownerBad != 0) { if (linkRoad != 0) { ++g_tlOwnerBad; return 0; } t = 0; }   /* fold 1: the id names another player's outpost - never linked into it */
+        if (t != 0 && BdBuildingTownHandPod(b, bh) == 0) { if (linkRoad != 0) { ++g_tlRefused; return 0; } t = 0; }
         if (t != 0) inThat = townkeep::HandSame(bh, words) ? 1 : 0;
     }
-    if (top < 0 && removed == 0 && link != 0 && ownerHere == 0) { ++g_tlRefused; return 0; }   /* the piece does not read */
-    const int step = piecerec::PieceTownApplyStep(removed, ownerHere, link, top == 1 ? 1 : 0, t != 0 ? 1 : 0, inThat);
-    if (step == piecerec::kTlOwn) { ++g_tlOwnSkip; return 0; }
-    if (step == piecerec::kTlInside) { ++g_tlInside; return 0; }
-    if (step == piecerec::kTlNoTown) { ++g_tlUnknownId; return 0; }
-    if (step == piecerec::kTlSame) { ++g_tlSame; BdInsideCheck(b, t); return 0; }   /* T-1001 fold (MED 1): the pieces inside it name its town */
+    if (top < 0 && removed == 0 && stepLink != 0 && ownerHere == 0) { ++g_tlRefused; return 0; }   /* the piece does not read */
+    const int step = piecerec::PieceTownApplyStep(removed, ownerHere, stepLink, top == 1 ? 1 : 0, t != 0 ? 1 : 0, inThat);
+    if (step == piecerec::kTlOwn) { ++g_tlOwnSkip; if (owed != 0 && t != 0) BdCopyTownJudge(key, t, "the [TOWNLINK] record's town (this game's own piece)", coopbuild::kSwNone, 1); return 0; }
+    if (step == piecerec::kTlInside) { ++g_tlInside; if (owed != 0 && t != 0) BdCopyTownJudge(key, t, "the [TOWNLINK] record's town", coopbuild::kSwInside, 0); return 0; }
+    if (step == piecerec::kTlNoTown) { ++g_tlUnknownId; if (byFact != 0) ++g_tfNoTownHere; return 0; }
+    if (step == piecerec::kTlSame)
+    {
+        ++g_tlSame;
+        BdInsideCheck(b, t);   /* T-1001 fold (MED 1): the pieces inside it name its town */
+        BdCopyTownJudge(key, t, "the [TOWNLINK] record's town - already in it", coopbuild::kSwAlready, 0);   /* T-1427 fold 1 */
+        return 0;
+    }
     if (step != piecerec::kTlRelink) return 0;
     const unsigned from = TlIdOfTownWords(bh);
     void* cur = BdBuildingTownPod(b);
     const std::string was = cur != 0 ? BdTownName(cur) : std::string("none");
     if (TlRelink(key, b, t, k, bh, words, liveFollows) != baseshow::kRelinkDone) return 0;   /* fold 2: a failed copy's cycle reported in it */
     ++g_tlApplied;
+    if (byFact != 0) ++g_tfApplied;   /* T-1427 fold 1 */
+    const int backstop = (g_tlRoad == kTlRoadLook && g_tlOwedLook.count(link) != 0) ? 1 : 0;   /* T-1442 step 4 fold 3 */
+    if (backstop != 0) ++g_tlLinkBackstop; else if (g_tlRoad == kTlRoadFound) ++g_tlLinkAtFound;
     if (g_tlLines < kTlLineCap || g_tlApplied % 100 == 0)
     {
         ++g_tlLines;
-        char line[480];
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNLINK] key=%.63s outpost id %u -> %u (town '%.60s' -> '%.60s', words %d/%d/%d/%d/%d) owner slot %d record gen %u writer slot %d; townLinkApplied=%lld",
-                    key.c_str(), from, link, was.c_str(), BdTownName(t).c_str(), words[0], words[1], words[2], words[3], words[4], k.h.ownerSlot, k.h.generation, k.h.writerSlot, g_tlApplied);
+        char line[560];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNLINK] key=%.63s outpost id %u -> %u%s%.60s (town '%.60s' -> '%.60s', words %d/%d/%d/%d/%d) owner slot %d record gen %u writer slot %d%s; townLinkApplied=%lld townLinkAtFound=%lld townLinkBackstop=%lld",
+                    key.c_str(), from, link, byFact != 0 ? " - by its record's town fact: " : "", byFact != 0 ? (fact.kind == piecerec::kPtfWorld ? fact.sid.c_str() : "'Nowhere'") : "",
+                    was.c_str(), BdTownName(t).c_str(), words[0], words[1], words[2], words[3], words[4], k.h.ownerSlot, k.h.generation, k.h.writerSlot,
+                    backstop != 0 ? " - by the 5 s look (backstop: its outpost was owed since the last look)" : g_tlRoad == kTlRoadFound ? " - at its outpost copy's founding" : "", g_tlApplied, g_tlLinkAtFound, g_tlLinkBackstop);
         DebugLog(line);
     }
     return 1;
@@ -21448,7 +27064,7 @@ int TlApplyPiece(const std::string& key, void* b, const PcrKept& k, int mySlot, 
 void TlApplyKey(const std::string& key)
 {
     std::map<std::string, PcrKept>::const_iterator k = g_pcrKept.find(piecerec::MakePieceRecId(key));
-    if (k == g_pcrKept.end() || piecerec::PieceTownOf(k->second.b.live) == 0) return;
+    if (k == g_pcrKept.end() || TlRecordNamesTown(k->second.b.live) == 0) return;   /* T-1427 fold 1: an outpost or a town fact */
     if (BdOnMain() == 0) { ++g_tlNotMain; return; }   /* the next look (TlTick) links it */
     const int mySlot = KeptMySlot();
     if (mySlot < 0) return;
@@ -21539,6 +27155,7 @@ void TlOwnMark(const std::string& id, const std::string& key, void* b, const Pcr
         else if (due == piecerec::kTdWriteNone) { ++g_tlRsDropMarked; PcrMarkW(*w, key, piecerec::kPeLive); return; }   /* PcrTownFill writes no outpost */
         /* kTdEngine: the engine knows a real outpost - the ordinary mark below writes its id */
     }
+    if (engineId == 0 && kept == 0) { TlFactMark(id, key, b, k, *w); return; }   /* T-1427 fold 1: no outpost on either side - its world town / 'Nowhere' */
     const int writerNow = PcrWriterNow(id, *w) != 0 ? 1 : 0;
     if (piecerec::PieceTownMarkDue(1, writerNow, engineId, kept, markedId) == 0)
     {
@@ -22032,6 +27649,72 @@ void TlStandingTick()
         TlHideApply(&g_shown[i], BdShowTownByHand(g_shown[i].hand), 0);
     }
 }
+/* the piece standing here for a record the look links (TlTick) - and the owed pass (TlOwedTick, T-1442 step 4: one filter for both):
+   not removed, its area's records applied here, naming a town, another player's piece (fold 2) or an own copy still to be compared;
+   0 = none (or not standing here now) */
+void* TlRecordPiece(const std::string& recId, const PcrKept& k, int mySlot)
+{
+    if ((k.h.flags & piecerec::kPrFlagRemoved) != 0) return 0;
+    const int c = PcrSecOfId(recId);
+    if (c < 0 || c >= (int)sizeof(g_pcaDone) || g_pcaDone[c] == 0) return 0;   /* after the area's own load choice: its records applied here */
+    if (TlRecordNamesTown(k.b.live) == 0) return 0;   /* T-1427 fold 1: an outpost, or the builder's world town / 'Nowhere' */
+    if (k.h.ownerSlot == mySlot && BdCopyTownOwed(k.h.key) == 0) return 0;   /* fold 2: own pieces on events (TlOwnCheckTick); T-1427 fold 1: an own copy still to be compared is compared here, never switched */
+    std::map<std::string, BdReg>::iterator row = g_reg.find(k.h.key);
+    if (row == g_reg.end() || row->second.removed != 0) return 0;
+    int tv = 0;
+    return BdFindPiece(k.h.key, row->second, &tv);
+}
+/* T-1442 step 4 (F1442 design A; owner principle 'events over timers'): the outpost ids whose copy BdShowApply founded, took or
+   tracks anew (baseshow::OwedOnApply) -> their pass. At the next ready frame (TlTick, the same gates as the look: engine writes open,
+   the main thread, no save held or pending, a slot) the records naming an owed id are linked into its town here through the look's
+   own routine (TlApplyPiece, the town looked up live by id) - a piece already in it is a no-op (kTlSame). At most kTownLinksPerLook
+   relinks a frame over all ids; an id with work left stays owed and goes on from its record the next frame; a finished pass says one
+   [TOWNLINK] line and its id leaves. The 5 s look stays, the backstop. MAIN THREAD */
+std::map<unsigned, baseshow::OwedPass> g_tlOwed;
+long long g_tlOwedPasses = 0, g_tlOwedLines = 0;
+void TlOwedMark(unsigned id)
+{
+    if (id == 0) return;
+    g_tlOwed[id] = baseshow::OwedPass();   /* founded or taken again: the pass starts over */
+    g_tlOwedSince.insert(id);              /* fold 3: a look link naming it before the look begins again is the backstop's */
+}
+/* fold 4: the pass's record step for baseshow::OwedFrame - the look's filter (TlRecordPiece) and routine (TlApplyPiece) */
+struct TlOwedOps
+{
+    int mySlot;
+    unsigned LinkOf(const PcrKept& k) const { return piecerec::PieceTownOf(k.b.live); }
+    int Apply(const std::string& recId, const PcrKept& k)
+    {
+        void* b = TlRecordPiece(recId, k, mySlot);
+        if (b == 0) return baseshow::kOwedAway;   /* not standing here now, or this game's own piece: the look would not link it either */
+        const long long same0 = g_tlSame, inside0 = g_tlInside, own0 = g_tlOwnSkip;
+        const int r = TlApplyPiece(k.h.key, b, k, mySlot, 0);
+        return baseshow::OwedOutcome(r, g_tlSame != same0 ? 1 : 0, (g_tlInside != inside0 || g_tlOwnSkip != own0) ? 1 : 0);
+    }
+};
+void TlOwedTick(int mySlot)
+{
+    if (g_tlOwed.empty() || mySlot < 0) return;
+    TlOwedOps ops;
+    ops.mySlot = mySlot;
+    std::vector<std::pair<unsigned, baseshow::OwedPass> > done;
+    g_tlRoad = kTlRoadFound;
+    baseshow::OwedFrame(&g_tlOwed, g_pcrKept, kTownLinksPerLook, &ops, &done);
+    g_tlRoad = kTlRoadDrain;
+    for (size_t i = 0; i < done.size(); ++i)
+    {
+        const baseshow::OwedPass& p = done[i].second;
+        ++g_tlOwedPasses;
+        if (g_tlOwedLines < kTlLineCap || g_tlOwedPasses % 100 == 0)
+        {
+            ++g_tlOwedLines;
+            char line[480];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNLINK] at the founding: outpost id %u - its pieces standing here linked into its copy now: linked %ld, already in it %ld, left to the 5 s look %ld, not linked here %ld (not standing, inside a building, or this game's own), %ld frame(s); townLinkAtFound=%lld townLinkBackstop=%lld owedPasses=%lld",
+                        done[i].first, p.linked, p.already, p.left, p.away, p.frames, g_tlLinkAtFound, g_tlLinkBackstop, g_tlOwedPasses);
+            DebugLog(line);
+        }
+    }
+}
 /* the look every kTlLookMs: the hidden copies' discovery watched; each other player's piece of an area whose records are applied
 
    here linked by its record (at most kTownLinksPerLook relinks a look; the rest at the next). Fold 2: the own pieces are not looked
@@ -22043,45 +27726,49 @@ void TlTick()
     const int plan = baseshow::TownLinkTickPlan(ready, KeptMySlot(), (unsigned)(now - g_tlAt), (unsigned)kTlLookMs);   /* fold 3 */
     if ((plan & baseshow::kTickOwnCheck) != 0) TlOwnCheckTick(KeptMySlot());   /* every ready frame: an event's check at once */
     if ((plan & baseshow::kTickOwnCheck) != 0) TlStandingTick();   /* T-947: a standing event re-runs the show step at once */
+    if ((plan & baseshow::kTickOwnCheck) != 0 && !g_tlOwed.empty()) TlOwedTick(KeptMySlot());   /* T-1442 step 4: a copy founded or taken - its pieces linked now */
     if ((plan & baseshow::kTickLook) == 0) return;
     g_tlAt = now;
     const int mySlot = KeptMySlot();
     if (mySlot < 0) return;
     TlRestoredTick(mySlot);   /* T-1158 step 6: this game's rebuilt pieces into the outposts the world server sent back */
+    BdCopyTownSweep();        /* T-1427 fold 1: a copy gone before its town was compared leaves the table */
     for (size_t i = 0; i < g_shown.size(); ++i)
     {   /* T-947 (T1925 fix 1): a teammate's copy too - a name mark the apply could not set is set at the next look */
         if (g_shown[i].going != 0 || (g_shown[i].kind != baseshow::kShowOther && g_shown[i].kind != baseshow::kShowMate)) continue;
         TlHideApply(&g_shown[i], BdShowTownByHand(g_shown[i].hand), 0);
     }
+    TlFactLookBegin();   /* T-1427 fold 2: the world towns' ids read once for this record walk */
     int writes = 0;
+    g_tlOwedLook.swap(g_tlOwedSince);   /* T-1442 step 4 fold 3: the ids owed since the last look - a link naming one is the backstop's */
+    g_tlOwedSince.clear();
+    g_tlRoad = kTlRoadLook;
     for (std::map<std::string, PcrKept>::const_iterator it = g_pcrKept.begin(); it != g_pcrKept.end(); ++it)
     {
         const PcrKept& k = it->second;
-        if ((k.h.flags & piecerec::kPrFlagRemoved) != 0) continue;
-        const int c = PcrSecOfId(it->first);
-        if (c < 0 || c >= (int)sizeof(g_pcaDone) || g_pcaDone[c] == 0) continue;   /* after the area's own load choice: its records applied here */
-        const unsigned link = piecerec::PieceTownOf(k.b.live);
-        if (k.h.ownerSlot == mySlot || link == 0) continue;   /* fold 2: own pieces on events (TlOwnCheckTick) */
-        std::map<std::string, BdReg>::iterator row = g_reg.find(k.h.key);
-        if (row == g_reg.end() || row->second.removed != 0) continue;
-        int tv = 0;
-        void* b = BdFindPiece(k.h.key, row->second, &tv);
+        void* b = TlRecordPiece(it->first, k, mySlot);   /* T-1442 step 4: the filter shared with the owed pass */
         if (b == 0) continue;
         if (writes >= kTownLinksPerLook) { g_tlAt = now - kTlLookMs + 200; break; }   /* the rest soon */
         if (TlApplyPiece(k.h.key, b, k, mySlot, 0) != 0) ++writes;
     }
+    g_tlRoad = kTlRoadDrain;
+    TlFactLookEnd();
 }
 /* world teardown (BuildForgetWorld): the link marks and the look's clock belong to the world going away (the own rows stay with
    their link - g_tlOwnRowsLink; the discovered set is the next world's save's, taken at its first apply) */
 void TlForgetWorld()
 {
     g_tlMarked.clear();
+    g_tfMarked.clear();                         /* T-1427 fold 1: the town-fact marks were this world's */
+    g_tlShowYieldSaid.clear();                  /* T-1427 fold 2: the [SHOW] deferrals said were this world's */
+    BdCopyTownForgetWorld();                    /* T-1427 fold 1: the copies awaiting their builder's town were this world's */
     g_tlRestored.clear();                       /* T-1158 step 6: the rebuilt pieces waiting for their outposts were this world's */
     g_tlRsArmed.clear();
     g_tlRsDropped.clear();                      /* D3: the released pieces were this world's */
     g_tlRsDropHeldAreas.clear();
     g_tlMarkHeldAreas.clear();                  /* T-1332 fold 1: this world's held areas */
     g_tlAt = 0;
+    g_tlOwed.clear(); g_tlOwedSince.clear(); g_tlOwedLook.clear();   /* T-1442 step 4: the owed outpost ids were this world's copies */
     g_tlFails.clear();                          /* fold 2: the failed copies were this world's pieces */
     baseshow::OwnCheckForgetWorld(&g_tlOwn);    /* fold 2: the next world's areas owed as their records are applied */
 }
@@ -22216,7 +27903,10 @@ void BdShowLinkTick()
         const int slot = fs->second;
         std::map<std::string, BdReg>::const_iterator r = BdShowCopyRow(b, slot);
         if (r == g_reg.end()) continue;
-        if (TlRecordLinkOf(r->first) != 0) { ++g_tlShowLinkYield; continue; }   /* T-1047 step 5: its record names its outpost - linked by it (TlTick) */
+        {   /* T-1047 step 5 / T-1427 fold 2: its record names its town (its outpost, or the builder's world town / 'Nowhere') - linked by it (TlTick); the record's town wins */
+            const int by = TlTownDeciderOf(r->first);
+            if (by != piecerec::kTownByShow) { TlShowYield(r->first, by); continue; }
+        }
         char w[poskey::kKeyCap];
         if (poskey::WireForm(r->first.c_str(), w, (int)sizeof(w)) == 0) continue;
         char pre[24];
@@ -22244,7 +27934,7 @@ void BdShowLinkTick()
             if (baseshow::EngineLeft(sh.going, kr >= 0 ? 1 : 0, cut, said) != 0) ++engineLeft;   /* the engine put it there at creation: left */
         }
         const int step = baseshow::LinkStep(bi != base.end() ? 1 : 0, townStands, inRowTown, inShown >= 0 ? 1 : 0, unlinkOk);
-        if (step == baseshow::kLinkAlready) { ++already; continue; }
+        if (step == baseshow::kLinkAlready) { ++already; BdCopyTownJudge(r->first, town[row], "the [SHOW] link step - already in it", coopbuild::kSwAlready, 0); continue; }   /* T-1427 part 2 */
         if (step == baseshow::kLinkNoTown) { ++noTown; continue; }
         if (step != baseshow::kLinkDo && step != baseshow::kLinkUndo) continue;
         if (step == baseshow::kLinkDo && pend[row] != 0)
@@ -22264,9 +27954,10 @@ void BdShowLinkTick()
         void* cur = BdBuildingTownPod(b);
         const std::string was = cur != 0 ? BdTownName(cur) : std::string("none");
         const int set = BdBuildingSetTownPod(b, t);
-        if (set == 0) { ++g_slFault; continue; }
-        if (set < 0) { ++inside; continue; }
+        if (set == 0) { ++g_slFault; BdCopyTownJudge(r->first, t, "the [SHOW] link step", coopbuild::kSwFault, 0); continue; }   /* T-1427 fold 1: owed, tried again at the next step */
+        if (set < 0) { ++inside; BdCopyTownJudge(r->first, t, "the [SHOW] link step", coopbuild::kSwInside, 0); continue; }
         ++g_slLinked;
+        BdCopyTownJudge(r->first, t, "the [SHOW] link step - linked to it", coopbuild::kSwDone, 0);   /* T-1427 part 2: its creation town against the builder's */
         if (g_slLines < kShowLinkLineCap || g_slLinked % 100 == 0)
         {
             ++g_slLines;
@@ -22814,6 +28505,7 @@ void BdShowApply()
         }
         float lp[3] = { 0.0f, 0.0f, 0.0f }; void* f1 = 0;
         const int tRead = BdTownReadPod(t, lp, s.hand, &f1);
+        if (baseshow::OwedOnApply(step, moveKind == townmove::kRefound ? 1 : 0, s.id, row.id, s.going) != 0) TlOwedMark(row.id);   /* T-1442 step 4: its pieces linked into it this frame (TlTick) */
         s.id = row.id; s.kind = row.kind;   /* T-1047 step 5 */
         TlHideApply(&s, t, (step != baseshow::kRowKeep || moveKind == townmove::kRefound) ? 1 : 0);   /* another player's copy hidden until discovered here */
         if (baseshow::CopyTownChanged(step, (moveKind == townmove::kMove || moveKind == townmove::kRefound) ? 1 : 0) != 0)
@@ -23067,6 +28759,9 @@ void BdShowSaveGuard()
         g_showSaveHeld = 0;
         g_showDirty = 1;     /* the save ran: founded again */
         g_showLinkDue = 1;   /* review fold 1: the copies linked again (to a base founded again, or one left standing) */
+        /* T-1442 step 4 fold 1: the take-out put every copy's pieces back (BdShowUnlinkTown); a copy it could not take out comes back
+           'kept, same id' (OwedOnApply 0) - so every tracked outpost is owed now, and its pieces go back in at the next ready frame */
+        for (size_t i = 0; i < g_shown.size(); ++i) if (g_shown[i].going == 0) TlOwedMark(g_shown[i].id);
         return;
     }
     if (g_shown.empty() || EngineWritesBlocked() || BdShowSavePending() == 0) return;
@@ -23905,6 +29600,17 @@ static unsigned long long kBdPrevCreateRva = 0;  static AddrReg kBdPrevCreateRva
 static unsigned long long kBdPrevDestroyRva = 0; static AddrReg kBdPrevDestroyRva_reg("BuildPreviewDestroy", &kBdPrevDestroyRva);   /* Steam_1.0.65 0x4D2CC0 */
 static unsigned long long kBdPrevListRva = 0;    static AddrReg kBdPrevListRva_reg("BuildPreviewListGlobal", &kBdPrevListRva);      /* Steam_1.0.65 0x212CE38 (var) */
 static unsigned long long kBdPrevGuardRva = 0;   static AddrReg kBdPrevGuardRva_reg("BuildPreviewListGuard", &kBdPrevGuardRva);     /* Steam_1.0.65 0x212CE44 (var, bit 1) */
+/* T-1408 TEST-ONLY `buildtest cursor <sid> chain <key part|last>` (BdTestCursor): the wall's far end and the preview's own rotate.
+   WallEndPoint (WallBuilding*, Vector3* out) -> out = position + orientation * (0, 0, vt+0x440 length): the END the wall finder
+   0x2AB730 measures against another wall's START (its position) within 20.0 (decomp_4d0580.txt, decomp_2ab730.txt; Read).
+   PreviewRotate (preview, float degrees): preview+0xC0 += degrees, the node yawed, preview+0x118 = the node's orientation - the
+   orientation the placing call 0x4D46A0 hands vt+0xF0 (decomp_4d44f0.txt, decomp_4d46a0.txt; Read). It also writes the engine's
+   remembered build angle (0x14212E6EC), as a player's rotate key does. */
+static unsigned long long kBdWallEndRva = 0;     static AddrReg kBdWallEndRva_reg("WallEndPoint", &kBdWallEndRva);                  /* Steam_1.0.65 0x4D0580 / 1.0.68 0x4D1010 */
+static unsigned long long kBdPrevRotateRva = 0;  static AddrReg kBdPrevRotateRva_reg("PreviewRotate", &kBdPrevRotateRva);           /* Steam_1.0.65 0x4D44F0 / 1.0.68 0x4D4F80 */
+typedef float* (*BdWallEndFn)(void* w, float* out);
+typedef void (*BdPrevRotateFn)(void* p, float degrees);
+const size_t kPrevOrient = 0x118;   /* the preview's orientation (Ogre::Quaternion w, x, y, z) */
 typedef void* (*BdPrevCreateFn)(void* list, void* gd);
 typedef void (*BdPrevDestroyFn)(void* list, void* p);
 typedef void (*BdPrevMoveFn)(void* p, const float* pos);
@@ -24300,6 +30006,191 @@ void* BdOwnTownAt(const float* xz, float* off, int* route)
     if (best != 0) { *off = bd; *route = 2; }
     return best;
 }
+/* ---- T-1427 part 2 (owner request 2026-11-18: 'have the building assigned based on the same logic as the builders ... when the copy
+   of the builders town comes in, it can log the discrepancy if one exists and then switch it to match'): THE TOWN A COPY IS MADE IN.
+   BdCopyTownFor gathers the owning player's towns here - this player's own (slot = this game's: the player-town list, this faction),
+   or the towns shown here for that player's outposts (g_shown rows of that slot whose town stands, not going, no re-found pending) -
+   and the record's town (recordTown, marked), and coopbuild::CopyTownChoose picks. None: the wilderness town 'Nowhere'
+   (TownList+0x180F8 - what 0x9279C0 itself falls back to, 9279c0:55-57), passed EXPLICITLY: createBuilding takes a given town as it is
+   when the area's first-time flag (+0xA8) is clear (57c1e0:360 -> :510-516) and never runs its own pick (:373) or the interior step
+   that hands an interior piece the nearest NON-player town within 10000 (:401-433). With the flag set it may still pick (a given
+   town that is a player's and does not hold the spot, :448-466, or not a player's, :362-370): BdCopyTownMade then writes the chosen
+   town (BdBuildingSetTownPod - its floor store follows) and counts it. MAIN THREAD ---- */
+void* BdWildTownPod()
+{
+    void* tl = BdTownListPtr();
+    if (tl == 0) return 0;
+    __try { return *(void* const*)((const char*)tl + kTownListWild); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+long long g_ctRule[5] = { 0, 0, 0, 0, 0 };   /* copies made per rule (coopbuild::kCt*) */
+long long g_ctNoWild = 0, g_ctOverrode = 0, g_ctOverrideFault = 0, g_ctLines = 0, g_ctGone = 0, g_ctWorld = 0;
+long long g_ctJudge[coopbuild::kCjMax + 1] = { 0, 0, 0, 0, 0, 0 };   /* T-1427 fold 1: comparisons per coopbuild::kCj* */
+const long long kCtLineCap = 300;
+/* T-1427 fold 1: key -> the town its copy was made in here (its own town words then), until the builder's town is compared with it
+   (an entry leaves when compared - MATCH, switched, or this game's own - or when its copy is gone, BdCopyTownSweep); owed: the last
+   kCj* that left it owed (-1 none) - said once per kind. No cap: it holds the copies made and not yet compared */
+struct BdCtMade { int rule; int made; int owed; int hand[5]; std::string name; };
+std::map<std::string, BdCtMade> g_ctMade;
+int BdCopyTownOwed(const std::string& key) { return g_ctMade.count(key) != 0 ? 1 : 0; }
+void BdCopyTownForgetWorld() { g_ctMade.clear(); }
+void BdCopyTownSweep()
+{
+    for (std::map<std::string, BdCtMade>::iterator it = g_ctMade.begin(); it != g_ctMade.end();)
+    {
+        std::map<std::string, BdReg>::const_iterator row = g_reg.find(it->first);
+        if (row == g_reg.end() || row->second.removed != 0) { g_ctMade.erase(it++); ++g_ctGone; }
+        else ++it;
+    }
+}
+/* the name of the town whose words are h ('Nowhere' for the wilderness town; 'none' for none or a dead town) */
+std::string BdWordsTownName(const int* h)
+{
+    void* t = 0;
+    const int k = BdTownOfWordsPod(h, &t);
+    if (k <= 0 || t == 0) return std::string(k < 0 ? "not read" : "none");
+    return BdTownName(t);
+}
+BdCopyTown BdCopyTownFor(int slot, int mySlot, const float* namedXZ, const float* pos, void* recordTown)
+{
+    BdCopyTown r;
+    r.rule = coopbuild::kCtNowhere; r.town = 0; r.dist = -1.0f; r.off = -1.0f;
+    std::vector<void*> tv;
+    std::vector<coopbuild::CopyTownCand> cv;
+    if (recordTown != 0)
+    {
+        coopbuild::CopyTownCand c;
+        float tp[3]; int h[5]; void* f = 0;
+        if (BdTownReadPod(recordTown, tp, h, &f) != 0) { c.cx = tp[0]; c.cz = tp[2]; c.recordNamed = 1; tv.push_back(recordTown); cv.push_back(c); }
+    }
+    const float c3[3] = { namedXZ != 0 ? namedXZ[0] : 0.0f, 0.0f, namedXZ != 0 ? namedXZ[1] : 0.0f };
+    if (slot >= 0 && slot == mySlot)
+    {
+        void* mine = (void*)LocalPlayerFaction();
+        void* towns[kTownWalkCap];
+        const int n = (mine != 0) ? BdPlayerTownsPod(towns, kTownWalkCap) : 0;
+        for (int i = 0; i < n; ++i)
+        {
+            float tp[3]; int h[5]; void* f = 0;
+            if (BdTownReadPod(towns[i], tp, h, &f) == 0 || f != mine) continue;
+            coopbuild::CopyTownCand c;
+            c.cx = tp[0]; c.cz = tp[2];
+            if (namedXZ != 0) c.holdsNamed = (BdContainsRowPod(towns[i], c3, buildnear::kScaleNarrow) == 1) ? 1 : 0;
+            tv.push_back(towns[i]); cv.push_back(c);
+        }
+    }
+    else if (slot >= 0)
+    {
+        for (size_t s = 0; s < g_shown.size(); ++s)
+        {
+            const baseshow::Shown& sh = g_shown[s];
+            if (sh.owner != slot || sh.going != 0 || BdTmRefoundPendingFor(sh) != 0) continue;
+            void* t = BdShowTownByHand(sh.hand);
+            float tp[3]; int h[5]; void* f = 0;
+            if (t == 0 || BdTownReadPod(t, tp, h, &f) == 0) continue;
+            coopbuild::CopyTownCand c;
+            c.cx = tp[0]; c.cz = tp[2]; c.hasList = 1; c.listX = sh.pos[0]; c.listZ = sh.pos[2];
+            if (namedXZ != 0) c.holdsNamed = (BdContainsRowPod(t, c3, buildnear::kScaleNarrow) == 1) ? 1 : 0;
+            tv.push_back(t); cv.push_back(c);
+        }
+    }
+    const float spot[2] = { pos != 0 ? pos[0] : 0.0f, pos != 0 ? pos[2] : 0.0f };
+    int pick = -1;
+    r.rule = coopbuild::CopyTownChoose(cv.empty() ? 0 : &cv[0], (int)cv.size(), namedXZ, pos != 0 ? spot : 0, baseshow::kSameBaseRadius,
+                                       buildnear::kTownKeepRange, &pick);
+    if (pick >= 0)
+    {
+        r.town = tv[(size_t)pick];
+        if (pos != 0) r.dist = BdTownDistXZ(r.town, pos);
+        if (namedXZ != 0) r.off = std::sqrt(coopbuild::CopyTownD2(cv[(size_t)pick].cx, cv[(size_t)pick].cz, namedXZ[0], namedXZ[1]));
+    }
+    else
+    {
+        r.rule = coopbuild::kCtNowhere;
+        r.town = BdWildTownPod();
+        if (r.town == 0) ++g_ctNoWild;   /* the TownList did not read: town 0, the engine's own pick as before */
+    }
+    return r;
+}
+void BdCopyTownMade(const std::string& key, void* b, const BdCopyTown& ct, int fresh)
+{
+    if (b == 0) return;
+    if (ct.rule >= 0 && ct.rule < 5) ++g_ctRule[ct.rule];
+    /* T-1427 fold 1: the copy's town is read from its own town words (what createBuilding set), never the engine's name lookup - that
+       one gives a building in 'Nowhere' the nearest town's name, so 'Nowhere' would never read as taken */
+    int bh[5] = { 0, 0, 0, 0, 0 }, ch[5] = { 0, 0, 0, 0, 0 };
+    const int bhOk = BdBuildingTownHandPod(b, bh);
+    float tp[3]; void* tf = 0;
+    const int chOk = (ct.town != 0) ? BdTownReadPod(ct.town, tp, ch, &tf) : 0;
+    const std::string engine = (bhOk != 0) ? BdWordsTownName(bh) : std::string("not read");
+    int over = 0;
+    if (ct.town != 0 && bhOk != 0 && chOk != 0 && !townkeep::HandSame(bh, ch))
+    {   /* the engine did not take the given town (the area's first-time flag): the chosen one written, as the link step writes it */
+        ++g_ctOverrode;
+        over = (BdBuildingSetTownPod(b, ct.town) == 1) ? 1 : -1;
+        if (over < 0) ++g_ctOverrideFault;   /* owed: the builder's town's arrival switches it (BdCopyTownJudge) */
+        BdBuildingTownHandPod(b, bh);   /* its words after the write */
+    }
+    BdCtMade mk;
+    mk.rule = ct.rule;
+    mk.made = coopbuild::CopyTownMadeStep(ct.town != 0 ? 1 : 0, over == 0 ? 1 : 0, over);
+    mk.owed = -1;
+    for (int i = 0; i < 5; ++i) mk.hand[i] = bh[i];
+    mk.name = BdWordsTownName(bh);
+    g_ctMade[key] = mk;
+    if (g_ctLines >= kCtLineCap) return;
+    ++g_ctLines;
+    const std::string engWas = (over == 0) ? std::string() : " (the engine's: '" + engine.substr(0, 60) + "')";
+    char line[760];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNSTORE] copy key=%.63s created in town '%.60s' - rule: %s (dist %.0f%s)%s%s; area first-time flag %d",
+                key.c_str(), mk.name.c_str(), coopbuild::CopyTownRuleWord(ct.rule), ct.dist, ct.town == 0 ? ", 'Nowhere' did not read - the engine's own pick" : "",
+                over == 0 ? "" : (over > 0 ? " - the engine had put it elsewhere, the chosen town written" : " - the engine had put it elsewhere, the write FAILED"),
+                engWas.c_str(), fresh);
+    DebugLog(line);
+}
+/* T-1427 fold 1: the builder's town for a copy still to be compared (the record's town - outpost or town fact - or the [SHOW] link
+   step's outpost): MATCH / DIFFER said, every DIFFER switched by the caller (sw: what its switch did) - one still owed (refused,
+   faulted, inside a building) keeps its entry and is tried again at the next event that touches that building (its record's next
+   look, the next link step), each kind said and counted once per copy (coopbuild::CopyTownJudgeStep / CopyTownJudgeKeeps) */
+void BdCopyTownJudge(const std::string& key, void* builderTown, const char* road, int sw, int ownerHere)
+{
+    std::map<std::string, BdCtMade>::iterator it = g_ctMade.find(key);
+    if (it == g_ctMade.end() || builderTown == 0) return;
+    float tp[3]; int h[5] = { 0, 0, 0, 0, 0 }; void* tf = 0;
+    if (BdTownReadPod(builderTown, tp, h, &tf) == 0) return;
+    const int same = townkeep::HandSame(it->second.hand, h) ? 1 : 0;
+    const int step = coopbuild::CopyTownJudgeStep(same, ownerHere, sw);
+    const BdCtMade mk = it->second;
+    if (coopbuild::CopyTownJudgeKeeps(step) != 0)
+    {
+        if (it->second.owed == step) return;   /* said once per kind */
+        it->second.owed = step;
+    }
+    else g_ctMade.erase(it);
+    ++g_ctJudge[step];
+    if (g_ctLines >= kCtLineCap && step == coopbuild::kCjMatch) return;   /* a DIFFER is always said */
+    ++g_ctLines;
+    char line[900];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TOWNSTORE] copy key=%.63s: the builder's town '%.60s' (%s) against its creation town '%.60s' (rule: %s; made: %s): %s;%s",
+                key.c_str(), BdTownName(builderTown).c_str(), road, mk.name.c_str(), coopbuild::CopyTownRuleWord(mk.rule),
+                mk.made == coopbuild::kCmTook ? "the given town taken" : mk.made == coopbuild::kCmWritten ? "the engine overrode it, the given town written"
+                : mk.made == coopbuild::kCmWriteFailed ? "the engine overrode it, the write FAILED" : "the engine's own pick",
+                coopbuild::CopyTownJudgeWord(step), BdCopyTownReportText().c_str());
+    DebugLog(line);
+}
+std::string BdCopyTownReportText()
+{
+    char b[600];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, " copyTown[nowhere,record,named,namedArea,near,noWild,engineOverrode,overrideFault,waiting,gone]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                " copyJudge[match,switched,owedRefused,owedFault,owedInside,ownNotSwitched]=%lld,%lld,%lld,%lld,%lld,%lld"
+                " townFact[marked,markHeld,applied,noTownHere,worldMissing,worldTwice,unread]=%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                " townFact2[showFactYield,worldReads,worldTowns,worldUnread]=%lld,%lld,%d,%lld",
+                g_ctRule[0], g_ctRule[1], g_ctRule[2], g_ctRule[3], g_ctRule[4], g_ctNoWild, g_ctOverrode, g_ctOverrideFault, (long long)g_ctMade.size(), g_ctGone,
+                g_ctJudge[0], g_ctJudge[1], g_ctJudge[2], g_ctJudge[3], g_ctJudge[4], g_ctJudge[5],
+                g_tfMarkedN, g_tfMarkHeld, g_tfApplied, g_tfNoTownHere, g_tfWorldMissing, g_tfWorldTwice, g_tfUnread,
+                g_tlShowFactYield, g_tfWorldReads, g_tfWorldTownsN, g_tfWorldUnread);
+    return std::string(b);
+}
 const size_t kPrevListPlacedArr = 0x10;   /* the build list's placed previews' array (its count is kPrevListPlacedN) */
 const int kPrevWalkCap = 1024;
 /* the placed-but-unconfirmed previews of a build list (list+0x8 count, list+0x10 array - the commit 0x4D6810 and the click 0x4DA6F0
@@ -24540,8 +30431,21 @@ struct BdCursorRead
     unsigned regionsN, jobsN;   /* the list's queued regions (+0x48) and interior jobs (+0x60) after the commit */
     /* T-1122 (effort cursorjoin): the height the preview is moved to - the cursor update's own ground height (decomp_4d4990.txt:47-49) */
     float movePos[3]; float groundY; int groundUsed;
+    /* T-1343: the piece's height source (buildnear::kPieceY*) and the building the building-at-point 0x9B1CD0 named at the character's height */
+    int ySource; void* atBuilding; int atRead;
     float boxC[3], boxH[3]; int boxRead;   /* the preview's box (+0xE0: Ogre Aabb centre, half size) just before the commit */
+    /* T-1408 `chain`: the preview turned by the engine's own rotate before its move (1 = turned, -1 = the PreviewRotate row is missing) */
+    int chainRot; float yawBefore, yawAfter, yawTurn;
+    float yawPlaced, yawConfirm;   /* T-1408 chain fold: the preview's heading after the placing call and after the confirm's steps */
+    float prevAt[3]; int prevAtRead;   /* T-1408 fold 4: the preview's start before the click - its scene node's position (Ogre's Node::getPosition, the call the place test 0x4DAFB0 makes), after its turn and test */
+    int held, reused, heldGone; unsigned long heldMs;   /* T-1428 TEST-ONLY: left standing by `preview`; this commit took the held one (made heldMs before); the held one was gone */
 };
+/* T-1408: the heading (degrees, Ogre's yaw about +Y: 0 faces +z, 90 faces +x) of an orientation w, x, y, z - the direction it turns (0, 0, 1) */
+float BdQuatYawDeg(const float* q)
+{
+    const float w = q[0], x = q[1], y = q[2], z = q[3];
+    return (float)(std::atan2(2.0f * (x * z + w * y), 1.0f - 2.0f * (x * x + y * y)) * 57.29577951);
+}
 /* T-1240, MAIN THREAD: the facts the click 0x4E1D50 asks of the cursor's preview before it places it (buildnear::ClickRefusal asks them
    in the click's order, each only when the click would reach it), read and called the way decomp_4e1d50.txt:352-549 shows (Read):
    bytes +0x7C / +0x89 / +0x8B / +0x8C, pointers +0x90 (plVar1[0x12]) / +0xD0 ([0x1a]) / +0xD8 ([0x1b]) / +0x100, the preview's own
@@ -24609,6 +30513,7 @@ static const std::string kConfirmOutpostName("Your Outpost");   /* the name the 
 const size_t kPrevListState = 0x38, kPrevListRegionsN = 0x48, kPrevListJobsN = 0x60, kPrevAabb = 0xE0;
 typedef void* (*BdPieceTownFn)(void* preview);
 typedef float (*BdTerrainAtFn)(const float* pos, char deep, int level);
+typedef void* (*BdBuildingAtFn)(const float* pos);
 typedef void (*BdRegionAddFn)(void* list, void* aabb);
 typedef void* (*BdTownNearPlFn)(void* townList, const float* pos, char any, float range);
 /* T-1122 (effort cursorjoin), MAIN THREAD, inside BdCursorPod's __try: THE PLACEMENT CONFIRM'S STEPS for the one placed preview p, in
@@ -24620,6 +30525,7 @@ typedef void* (*BdTownNearPlFn)(void* townList, const float* pos, char any, floa
    0x4D0DE0 at its end: time speed, GUI, the build mode object deleted, the camera's town) and the destroy of the cursor's own preview
    (list+0x18), which the click's placing call already emptied. It also leaves the commit to the list's update (state 1); the lever
    commits at once and leaves state 2, as that update does. No std::string made here (C2712); the founding's name is file-scope. */
+char g_btAbsWhy[200] = { 0 };   /* T-1408 fold 12: the by-position commit's refusal, with the spot the preview was read at */
 void BdConfirmStepsPod(void* list, void* p, const float* movePos, BdCursorRead* r)
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -24669,7 +30575,7 @@ void BdConfirmStepsPod(void* list, void* p, const float* movePos, BdCursorRead* 
     r->cfTownFinal = *(void* const*)(pc + kPrevTown);
 }
 /* No std::string here (C2712). */
-void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
+void BdCursorPod(void* gd, const float* pos, int haveChar, BdCursorRead* r, int commit, int chain, float chainYaw)
 {
     std::memset(r, 0, sizeof *r);
     r->commit = commit;
@@ -24684,6 +30590,12 @@ void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
         if ((*(const unsigned int*)(base + (uintptr_t)kBdPrevGuardRva) & 1u) == 0) { r->refused = "the build list was never made (the lever does not make it)"; return; }
         list = *(void* const*)(base + (uintptr_t)kBdPrevListRva);
         if (list == 0) { r->refused = "the build list is 0"; return; }
+        if (g_btHeldPreview != 0)   /* T-1428 TEST-ONLY: a held preview (`preview`) is taken by the next `commit` of the same record */
+        {
+            const void* nx = *(void* const*)((const char*)list + kPrevListNext);
+            if (nx != g_btHeldPreview) { g_btHeldPreview = 0; g_btHeldGd = 0; r->heldGone = 1; r->refused = "the held preview is gone (list+0x30 no longer holds it)"; return; }
+            if (commit == 0 || gd != g_btHeldGd) { r->refused = "a held preview waits for its `commit` (the same record)"; return; }
+        }
         if (*(void* const*)((const char*)list + kPrevListCurrent) != 0) { r->refused = "a building preview is already on the cursor"; return; }
         if (*(const unsigned int*)((const char*)list + kPrevListPlacedN) != 0) { r->refused = "placed previews wait for confirmation"; return; }
         if (*(void* const*)((const char*)list + kPrevListMode) != 0) { r->refused = "build mode is active"; return; }
@@ -24696,7 +30608,9 @@ void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
     __try
     {
         r->stage = 1;
-        r->p = ((BdPrevCreateFn)(base + (uintptr_t)kBdPrevCreateRva))(list, gd);
+        if (g_btHeldPreview != 0)   /* T-1428 TEST-ONLY: the held preview `preview` made (checked above: list+0x30, the same record) */
+        { r->p = g_btHeldPreview; r->reused = 1; r->heldMs = ::GetTickCount() - g_btHeldAt; g_btHeldPreview = 0; g_btHeldGd = 0; }
+        else r->p = ((BdPrevCreateFn)(base + (uintptr_t)kBdPrevCreateRva))(list, gd);
         if (r->p == 0) { r->refused = "the engine made no preview (create returned 0)"; return; }
         r->current = (*(void* const*)((const char*)list + kPrevListCurrent) == r->p) ? 1 : 0;
         void** vt = *(void***)r->p;
@@ -24708,11 +30622,34 @@ void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
         r->movePos[0] = pos[0]; r->movePos[1] = pos[1]; r->movePos[2] = pos[2];
         r->groundY = -99.0f;
         if (kBdTerrainAtRva != 0)
-        {
             r->groundY = ((BdTerrainAtFn)(base + (uintptr_t)kBdTerrainAtRva))(r->movePos, 0, 0);
-            if (r->groundY != -99.0f) { r->movePos[1] = r->groundY; r->groundUsed = 1; }
+        /* T-1343: the ground height alone put the piece under a house's floor (the ground there is below the floor), so the place
+           test named no house. The cursor keeps a floor hit (decomp_4d4990.txt:46-48): a building at (x, the character's height, z)
+           is that floor - buildnear::CursorPieceY */
+        if (haveChar != 0 && kBdBuildingAtRva != 0)
+        {
+            const float at[3] = { pos[0], pos[1], pos[2] };
+            r->atBuilding = ((BdBuildingAtFn)(base + (uintptr_t)kBdBuildingAtRva))(at);
+            r->atRead = 1;
         }
+        r->ySource = buildnear::CursorPieceY(haveChar, pos[1], r->atBuilding != 0 ? 1 : 0, r->groundY, &r->movePos[1]);
+        r->groundUsed = (r->ySource == buildnear::kPieceYGround) ? 1 : 0;
         ((BdPrevMoveFn)vt[kVtPrevMove / 8])(r->p, r->movePos);
+        if (chain != 0)
+        {   /* T-1408 chain fold (T2540 VACUOUS, F1240): turned AFTER the move. Turned before it (T2535, T2540) the placed wall faced back toward
+               the first wall's spot whatever the turn (preview yaw 0 and -180 both gave heading -180; Inferred: the move or a later step
+               re-faces a wall preview). Turned as a player's rotate key turns it (0x4D44F0), by the shortest angle to the line's heading */
+            if (kBdPrevRotateRva == 0) r->chainRot = -1;
+            else
+            {
+                r->yawBefore = BdQuatYawDeg((const float*)((const char*)r->p + kPrevOrient));
+                const float d = buildnear::ChainWrapDeg(chainYaw - r->yawBefore);
+                r->yawTurn = d;
+                ((BdPrevRotateFn)(base + (uintptr_t)kBdPrevRotateRva))(r->p, d);
+                r->yawAfter = BdQuatYawDeg((const float*)((const char*)r->p + kPrevOrient));
+                r->chainRot = 1;
+            }
+        }
         r->stage = 3;
         r->houseBefore = PolicyHouseOwnerHits(0);
         ((BdPrevTestFn)vt[kVtPrevTest / 8])(r->p);
@@ -24727,7 +30664,28 @@ void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
         r->hostAsk = *(const unsigned char*)((const char*)r->p + kPrevHostAsk);
         r->valid = ((BdPrevValidFn)vt[kVtPrevValid / 8])(r->p) ? 1 : 0;
         if (r->town != 0) r->faction = ((BdTownGetFn)(*(void***)r->town)[kVtTownFaction / 8])(r->town);
-        if (commit != 0)
+        if (commit == 0 && g_btCursorPreview != 0) { r->held = 1; g_btHeldPreview = r->p; g_btHeldGd = gd; g_btHeldAt = ::GetTickCount(); }   /* T-1428 TEST-ONLY: left standing for the later `commit` */
+        if ((chain != 0 || commit != 0) && g_zoneNodePos != 0 && *(void* const*)((const char*)r->p + kPrevNode) != 0)   /* T-1408 fold 12: a by-position commit reads it too */
+        {   /* T-1408 fold 4 (F1254 / F1256): where the preview really is before the click - its node's position, as the place test reads it */
+            g_zoneNodePos(*(void* const*)((const char*)r->p + kPrevNode), r->prevAt);
+            r->prevAtRead = 1;
+        }
+        if (commit != 0 && chain != 0 && (r->chainRot != 1 || buildnear::ChainForward(r->yawAfter, chainYaw) == 0))
+            r->commitWhy = "chain: the preview's heading after the turn is not the line's (it would not run forward) - not clicked";   /* T-1408 chain fold */
+        else if (commit != 0 && chain != 0 && buildnear::ChainSpotAt(r->prevAtRead, r->prevAt, r->movePos, kBtChainSpotTol) == 0)
+            r->commitWhy = "chain: the preview's start is not within kBtChainSpotTol of the named wall's free end (or its position does not read) - not clicked";   /* T-1408 fold 4 */
+        else if (commit != 0 && chain == 0 && buildnear::ChainSpotAt(r->prevAtRead, r->prevAt, r->movePos, kBtChainSpotTol) == 0)
+        {   /* T-1408 fold 12 (F1383): the engine's own preview test moved the preview off the asked spot (T2583 / T2589: a wall asked at a
+               wall's free end was put on that wall's spot) - never clicked there: a wall on an existing wall's spot is not what was asked.
+               fold 12b (F1384 NIT 2): a spot that does not read is refused too, never clicked unchecked */
+            if (r->prevAtRead == 0)
+                _snprintf_s(g_btAbsWhy, sizeof(g_btAbsWhy), _TRUNCATE, "error buildtest: abs: the preview's spot does not read (its scene node) - not clicked (T-1408 fold 12b)");
+            else
+                _snprintf_s(g_btAbsWhy, sizeof(g_btAbsWhy), _TRUNCATE, "error buildtest: abs: the engine moved the preview off the asked spot to (%.1f,%.1f) - more than %.1f away; not clicked (T-1408 fold 12)",
+                            r->prevAt[0], r->prevAt[2], kBtChainSpotTol);
+            r->commitWhy = g_btAbsWhy;
+        }
+        else if (commit != 0)
         {   /* T-1240: the game's own click and commit, in their order (decomp_4e1d50.txt, decomp_4d6810.txt; Read) */
             r->stage = 7;
             if (*(void* const*)((const char*)list + kPrevListNext) == r->p)   /* the click's first branch: list+0x30 -> list+0x18 */
@@ -24746,6 +30704,7 @@ void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
                     r->stage = 8;
                     r->placing = 1;
                     ((BdPrevTestFn)(*(void***)r->p)[kVtPrevPlace / 8])(r->p);   /* the click's placing call (LAB_1404e2b46) */
+                    if (chain != 0) r->yawPlaced = BdQuatYawDeg((const float*)((const char*)r->p + kPrevOrient));   /* chain fold: still the turn's? */
                     r->placedN = *(const unsigned*)((const char*)list + kPrevListPlacedN);
                     void* const* arr = *(void* const* const*)((const char*)list + kPrevListPlacedArr);
                     if (r->placedN != 1 || arr == 0 || arr[0] != r->p) r->commitWhy = "after the placing call the build list does not hold exactly this preview - not committed (the preview is left to the engine)";
@@ -24753,6 +30712,7 @@ void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
                     {
                         r->stage = 10;
                         BdConfirmStepsPod(list, r->p, r->movePos, r);   /* T-1122 (effort cursorjoin): the confirm 0x4DA6F0's own steps first */
+                        if (chain != 0) r->yawConfirm = BdQuatYawDeg((const float*)((const char*)r->p + kPrevOrient));   /* chain fold */
                         std::memcpy(r->boxC, (const char*)r->p + kPrevAabb, 12);   /* the placed box, read before the commit destroys the preview */
                         std::memcpy(r->boxH, (const char*)r->p + kPrevAabb + 12, 12);
                         r->boxRead = 1;
@@ -24781,6 +30741,8 @@ void BdCursorPod(void* gd, const float* pos, BdCursorRead* r, int commit)
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { r->faulted = 1; }
+    if (r->held != 0 && r->faulted != 0) { g_btHeldPreview = 0; g_btHeldGd = 0; r->held = 0; }   /* T-1428: a fault - destroyed below, not held */
+    if (r->held != 0) return;   /* T-1428 TEST-ONLY: the held preview stands (list+0x30) until its `commit` */
     if (r->p == 0 || r->placing != 0) return;   /* T-1240: a placed preview is the engine's (the commit destroyed it, or it waits in the list) */
     __try
     {
@@ -24821,19 +30783,28 @@ void BdCursorHouseLine(const float* pos, const BdCursorRead& r)
         ml += one;
     }
     if (nm == 0) ml = "none";
-    char facts[1400];
+    /* T-1343: the PIECE's height and where it came from (the character's height is the cursor line's y=) */
+    char ak[kKeyCap];
+    ak[0] = 0;
+    if (r.atRead == 0) std::strcpy(ak, "not asked");
+    else if (r.atBuilding == 0) std::strcpy(ak, "none");
+    else if (ObjectPositionKey(r.atBuilding, ak, kKeyCap, "", 3, 0) == 0) std::strcpy(ak, "?");
+    char py[400];
+    _snprintf_s(py, sizeof(py), _TRUNCATE, "piece y=%.1f (%s; ground call %.1f; building at the character's height=%.63s)",
+                r.movePos[1], buildnear::CursorPieceYText(r.ySource), r.groundY, ak);
+    char facts[1800];
     _snprintf_s(facts, sizeof(facts), _TRUNCATE, "host=%.63s (%p, +0xD0 %p, +0xD8 %p) hostOwner=%p '%.60s' keptTown=%p faction=%p '%.60s' teammates[%d]=[%s]"
-                " b88=%02X b8B=%02X hostLoop(+0x50)=%p nodes(+0x38)=%u hostAsk(+0x109)=%d",
+                " b88=%02X b8B=%02X hostLoop(+0x50)=%p nodes(+0x38)=%u hostAsk(+0x109)=%d %s",
                 hk, host, r.hostD0, r.hostD8, hostFac, hostFac != 0 ? BdFactionName(hostFac).c_str() : "none", r.town, r.faction,
                 r.faction != 0 ? BdFactionName(r.faction).c_str() : "none", nm, ml.c_str(), (unsigned)(r.flags & 0xFF), (unsigned)((r.flags >> 24) & 0xFF),
-                r.hostLoop, r.nodes, r.hostAsk);
+                r.hostLoop, r.nodes, r.hostAsk, py);
     const std::pair<int, int> spot((int)std::floor(pos[0]), (int)std::floor(pos[2]));
     std::map<std::pair<int, int>, std::string>::iterator it = g_bdHouseLineSeen.find(spot);
     if (it != g_bdHouseLineSeen.end() && it->second == facts) { ++g_bdHouseLineSame; return; }
     g_bdHouseLineSeen[spot] = facts;
     const char* hw = "";
     PolicyHouseOwnerHits(&hw);
-    char line[1700];
+    char line[2200];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] cursor house test at (%.1f,%.1f): %s houseRan=%s (stub hits %lld->%lld; %s) sameSkipped=%lld",
                 pos[0], pos[2], facts, r.houseBefore < 0 ? "unknown (not patched)" : (r.houseAfter > r.houseBefore ? "yes (a teammate matched)" : "no teammate match"),
                 r.houseBefore, r.houseAfter, hw != 0 ? hw : "?", g_bdHouseLineSame);
@@ -24861,7 +30832,7 @@ std::string BdConfirmTownText(void* t)
 int GroundTerrainHeightAt(float x, float z, float* out);   /* combat.cpp */
 void BdCursorBoxLine(const float* pos, const BdCursorRead& r)
 {
-    char line[700];
+    char line[900];
     float g = 0.0f;
     const int gr = (r.boxRead != 0) ? GroundTerrainHeightAt(r.boxC[0], r.boxC[2], &g) : -1;
     char gs[40];
@@ -24870,7 +30841,7 @@ void BdCursorBoxLine(const float* pos, const BdCursorRead& r)
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] cursor placed box '%.80s' at (%.1f,%.1f): box unread", g_btArg.c_str(), pos[0], pos[2]);
     else
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] cursor placed box '%.80s' at (%.1f,%.1f): moved to y=%.1f (%s; ground call %.1f) - box x %.1f..%.1f y %.1f..%.1f z %.1f..%.1f; ground at its middle (%.1f,%.1f)=%s; box bottom - ground = %s",
-                    g_btArg.c_str(), pos[0], pos[2], r.movePos[1], r.groundUsed != 0 ? "the cursor update's ground height 0x9B10B0" : "NO ground answer: the character's height", r.groundY,
+                    g_btArg.c_str(), pos[0], pos[2], r.movePos[1], buildnear::CursorPieceYText(r.ySource), r.groundY,
                     r.boxC[0] - r.boxH[0], r.boxC[0] + r.boxH[0], r.boxC[1] - r.boxH[1], r.boxC[1] + r.boxH[1], r.boxC[2] - r.boxH[2], r.boxC[2] + r.boxH[2],
                     r.boxC[0], r.boxC[2], gs, "?");
     if (r.boxRead != 0 && gr == 1)
@@ -24955,6 +30926,101 @@ void BdCursorCommitLines(const float* pos, const BdCursorRead& r)
         DebugLog(line);
     }
 }
+/* ==== T-1408 TEST-ONLY `buildtest cursor <sid> chain <wall key part|last>` ==========================================================
+   The engine joins walls only in 0x29AC10 - from the placement commit 0x4D6810 once every piece of a click exists, and from the area
+   load per wall - and joins a wall to a neighbour whose END (0x4D0580) lies within 20.0 of its START (its position) or the other way
+   round (0x2AB730), when neither's link type (+0x360, the record's "link type") is 0 or 3 and both groups' 'complete' bytes match
+   (0x29A850). A player's drag places each segment starting at the last one's end (0x4D37B0). So the lever: the named wall's start and
+   END read the engine's way, the preview turned to the wall's own heading by the preview's own rotate (0x4D44F0), moved to that END,
+   then the cursor's own test, click, confirm steps and PlacementCommit as `cursor .. commit` - the commit itself groups them. The
+   named wall must be loaded, a wall, not ruined, and its group unfinished. `last` = the first piece of the last cursor commit.
+   Nothing else is changed; one [BUILD] cursor chain line. */
+struct BdChainAt { void* wall; float start[3], end[3], len, yaw; };
+int BdWallEndsPod(void* w, float* start, float* end)   /* MAIN THREAD, POD: 1 = read; the wall's position and WallEndPoint's answer */
+{
+    __try
+    {
+        const float* p = (const float*)((const char*)w + kObjPos);
+        start[0] = p[0]; start[1] = p[1]; start[2] = p[2];
+        ((BdWallEndFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kBdWallEndRva))(w, end);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int BdChainResolve(BdChainAt* ch, std::string* key, std::string* why)
+{
+    const std::string part = (g_btChainArg == "last") ? g_btChainLast : g_btChainArg;
+    void* w = 0;
+    float sp = 0.0f, sn = 0.0f;
+    int sc = 0, sd = 0, sx = 0;
+    if (kBdWallEndRva == 0 || kBdPrevRotateRva == 0) *why = "the WallEndPoint / PreviewRotate address row is missing";
+    else if (part.empty()) *why = "`chain last`: no piece placed by a `buildtest cursor` commit this launch";
+    else if ((w = BdBldPick(part, key)) == 0) *why = "no loaded piece at '" + part + "'" + (g_bdFindWhy.empty() ? std::string() : " (" + g_bdFindWhy + ")");
+    else if (BdIsWall(w) != 1) *why = "the piece " + *key + " is not a wall";
+    else if (BdReadState(w, &sp, &sn, &sc, &sd, &sx) == 0) *why = "the wall " + *key + "'s state does not read";
+    else if (sx != 0) *why = "the wall " + *key + " is a ruin";
+    else if (sc != 0) *why = "the wall " + *key + "'s group record is finished - the engine joins the new unfinished wall only to an unfinished group (0x29A850 compares the 'complete' bytes)";
+    else if (BdWallEndsPod(w, ch->start, ch->end) == 0) *why = "the wall " + *key + "'s ends do not read (FAULTED)";
+    else
+    {
+        /* T-1408 chain fix: FORWARD from the line's free end - of the named wall's two ends, the one farther from the line's first piece
+           (the origin: the named wall's own position when a chain starts - a named key, or the first `last` after a plain commit); the
+           heading runs from the nearer end to it. A spot that is a placed piece's position (or the named wall's own) is refused */
+        if (g_btChainArg != "last" || g_btChainOriginOk == 0)
+        {
+            g_btChainOrigin[0] = ch->start[0]; g_btChainOrigin[1] = ch->start[1]; g_btChainOrigin[2] = ch->start[2];
+            g_btChainOriginOk = 1;
+        }
+        const float wpx = ch->start[0], wpz = ch->start[2];   /* the named wall's own position (its key's spot) */
+        buildnear::ChainFreeEnd(g_btChainOrigin, ch->start, ch->end);   /* chain fold: the rule, tested offline (t1408_chainend) */
+        const float ex = ch->end[0] - ch->start[0], ez = ch->end[2] - ch->start[2];
+        ch->len = std::sqrt(ex * ex + ez * ez);
+        int onPiece = (std::fabs(ch->end[0] - wpx) <= kBtChainSpotTol && std::fabs(ch->end[2] - wpz) <= kBtChainSpotTol) ? 1 : 0;
+        for (size_t i = 0; onPiece == 0 && i + 1 < g_btChainPlacedXZ.size(); i += 2)
+            if (std::fabs(ch->end[0] - g_btChainPlacedXZ[i]) <= kBtChainSpotTol && std::fabs(ch->end[2] - g_btChainPlacedXZ[i + 1]) <= kBtChainSpotTol) onPiece = 1;
+        if (!(ch->len >= 1.0f && ch->len <= 100000.0f)) *why = "the wall " + *key + "'s start-to-end length reads " + zonekeep::ZkNum((long long)ch->len);
+        else if (onPiece != 0)
+            *why = "the line's free end (" + zonekeep::ZkNum((long long)ch->end[0]) + "," + zonekeep::ZkNum((long long)ch->end[2]) + ") of wall " + *key
+                 + " is the position of a piece already placed - the new wall would take that piece's key (the line does not run forward from it)";
+        else { ch->yaw = buildnear::ChainHeadingDeg(ch->start, ch->end); ch->wall = w; return 1; }
+    }
+    return 0;
+}
+void BdCursorChainLine(const BdChainAt& ch, const std::string& key, const BdCursorRead& r, void* placed)
+{
+    char line[1200];
+    if (placed == 0)
+    {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] cursor chain '%.80s' after wall key=%.63s (asked '%.63s'): NOT PLACED (see the cursor lines above) - the wall's start (%.1f,%.1f) end (%.1f,%.1f) length %.1f heading %.1f; preview turned=%d (%.1f -> %.1f by %.1f); the preview's start before the click (%.1f,%.1f) read=%d (spot within %.1f: %s)",
+                    g_btArg.c_str(), key.c_str(), g_btChainArg.c_str(), ch.start[0], ch.start[2], ch.end[0], ch.end[2], ch.len, ch.yaw, r.chainRot, r.yawBefore, r.yawAfter, r.yawTurn,
+                    r.prevAt[0], r.prevAt[2], r.prevAtRead, kBtChainSpotTol, buildnear::ChainSpotAt(r.prevAtRead, r.prevAt, ch.end, kBtChainSpotTol) != 0 ? "yes" : "NO");   /* T-1408 fold 4 */
+        DebugLog(line);
+        return;
+    }
+    char pk[kKeyCap];
+    pk[0] = 0;
+    if (ObjectPositionKey(placed, pk, kKeyCap, "", 3, 0) == 0) std::strcpy(pk, "?");
+    float ps[3] = { 0.0f, 0.0f, 0.0f }, pe[3] = { 0.0f, 0.0f, 0.0f };
+    const int pr = BdWallEndsPod(placed, ps, pe);
+    const float gx = ps[0] - ch.end[0], gz = ps[2] - ch.end[2];
+    const float gap = std::sqrt(gx * gx + gz * gz);
+    const float px = pe[0] - ps[0], pz = pe[2] - ps[2];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] cursor chain '%.80s' after wall key=%.63s (asked '%.63s'): PLACED key=%.63s - the wall's start (%.1f,%.1f) end (%.1f,%.1f) length %.1f heading %.1f; preview turned=%d (%.1f -> %.1f by %.1f); the new wall's start (%.1f,%.1f) end (%.1f,%.1f) heading %.1f%s; gap from the wall's end to the new start %.2f (the engine joins within 20.0: %s)",
+                g_btArg.c_str(), key.c_str(), g_btChainArg.c_str(), pk, ch.start[0], ch.start[2], ch.end[0], ch.end[2], ch.len, ch.yaw, r.chainRot, r.yawBefore, r.yawAfter, r.yawTurn,
+                ps[0], ps[2], pe[0], pe[2], (float)(std::atan2(px, pz) * 57.29577951), pr != 0 ? "" : " (UNREAD)", gap, (pr != 0 && gap < 20.0f) ? "within" : "NOT within");
+    DebugLog(line);
+    {   /* T-1408 chain fix: did it run forward (the new wall's heading within kChainForwardTol degrees of the line's) */
+        const float hd = buildnear::ChainHeadingDeg(ps, pe);
+        const float dh = buildnear::ChainWrapDeg(hd - ch.yaw);
+        const int sameKey = (std::strcmp(pk, key.c_str()) == 0) ? 1 : 0;   /* T-1408 fold 4 (F1254): the new wall on the named wall's own key */
+        const int fwd = buildnear::ChainForwardPlaced((pr != 0 && buildnear::ChainForward(hd, ch.yaw) != 0) ? 1 : 0, pr != 0 ? gap : 3.0e38f, kBtChainSpotTol, sameKey);
+        char fl[600];
+        _snprintf_s(fl, sizeof(fl), _TRUNCATE, "[BUILD] cursor chain key=%.63s forward=%s (heading off the line's by %.1f; gap %.2f, within %.1f: %s; placed key %s the named wall's; the preview turned after its move to the line's heading %.1f + %.0f; its start before the click (%.1f,%.1f) read=%d; its heading after the placing call %.1f, after the confirm's steps %.1f)",
+                    pk, fwd != 0 ? "yes" : "NO", dh, gap, kBtChainSpotTol, (pr != 0 && gap <= kBtChainSpotTol) ? "yes" : "NO", sameKey != 0 ? "IS" : "is not",
+                    ch.yaw, kBtChainYawOffset, r.prevAt[0], r.prevAt[2], r.prevAtRead, r.yawPlaced, r.yawConfirm);
+        DebugLog(fl);
+    }
+}
 void BdTestCursor()
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -24968,12 +31034,25 @@ void BdTestCursor()
     else if ((gd = BdGetData(base + (uintptr_t)rGet, base + (uintptr_t)rCont, &g_btArg)) == 0) why = "no GameData record with stringID '" + g_btArg + "'";
     else if (BdIntAt(gd, kGdType, &type) == 0 || type != 0) why = "the record is not a BUILDING (itemType " + zonekeep::ZkNum((long long)type) + ")";
     if (!why.empty()) { DebugLog("[BUILD] cursor '" + g_btArg + "' FAILED: " + why); return; }
+    /* T-1408 `chain`: the spot is the named wall's END (the engine's own 0x4D0580) and the heading its own, start to end */
+    BdChainAt ch;
+    std::memset(&ch, 0, sizeof ch);
+    std::string chainKey;
+    if (g_btChain != 0)
+    {
+        if (BdChainResolve(&ch, &chainKey, &why) == 0)
+        {
+            DebugLog("[BUILD] cursor chain '" + g_btArg + "' after '" + g_btChainArg + "' REFUSED: " + why + " - nothing placed");
+            return;
+        }
+        g_btDx = ch.end[0]; g_btDz = ch.end[2];
+    }
     const int haveY = (mine != 0 && BdFindMyCharPos(mine, cp)) ? 1 : 0;   /* the height: the first own character's (the town rule measures x and z) */
     const float pos[3] = { g_btDx, haveY ? cp[1] : 0.0f, g_btDz };
     const char* hw = "";
     const long long hitsBefore = PolicyNearTownHits(&hw);
     BdCursorRead r;
-    BdCursorPod(gd, pos, &r, g_btCursorCommit);
+    BdCursorPod(gd, pos, haveY, &r, g_btCursorCommit, g_btChain, ch.yaw + kBtChainYawOffset);   /* T-1408 chain fix: the placed wall's heading is the preview's yaw + kBtChainYawOffset */
     const long long hitsAfter = PolicyNearTownHits(0);
     char line[900];
     if (r.refused != 0)
@@ -24998,8 +31077,29 @@ void BdTestCursor()
                 g_btArg.c_str(), pos[0], pos[2], r.valid ? "VALID" : "INVALID", town.c_str(), fac.c_str(), r.flags, hitsBefore,
                 hitsAfter, r.current, pos[1], haveY ? "" : " (no own character: y 0)", hw != 0 ? hw : "?");
     DebugLog(line);
+    if (r.held != 0 || r.reused != 0)   /* T-1428 TEST-ONLY */
+    {
+        if (r.held != 0)
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] cursor preview HELD '%.80s' at (%.1f,%.1f): the preview stands (list+0x30, current=%d, %s) until `buildtest cursor %.80s abs <x> <z> commit` - as a player's cursor stands before the click",
+                        g_btArg.c_str(), pos[0], pos[2], r.current, r.valid ? "VALID" : "INVALID", g_btArg.c_str());
+        else
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] cursor commit '%.80s' at (%.1f,%.1f): takes the HELD preview made %lu ms before (moved and tested again here)",
+                        g_btArg.c_str(), pos[0], pos[2], r.heldMs);
+        DebugLog(line);
+    }
     BdCursorHouseLine(pos, r);
     if (g_btCursorCommit != 0) BdCursorCommitLines(pos, r);
+    void* placed = (r.committed != 0 && r.lastN >= 1) ? g_commitNew[0] : 0;
+    if (placed != 0)
+    {   /* T-1408: what `chain last` names next - the real key the piece landed on */
+        char k[kKeyCap];
+        k[0] = 0;
+        if (ObjectPositionKey(placed, k, kKeyCap, "", 3, 0) != 0) g_btChainLast = k;
+        float ps[3] = { 0.0f, 0.0f, 0.0f }, pe[3] = { 0.0f, 0.0f, 0.0f };   /* T-1408 chain fix: its position, which no later chain spot may take */
+        if (BdWallEndsPod(placed, ps, pe) != 0 && g_btChainPlacedXZ.size() < kBtChainPlacedCap) { g_btChainPlacedXZ.push_back(ps[0]); g_btChainPlacedXZ.push_back(ps[2]); }
+        if (g_btChain == 0) g_btChainOriginOk = 0;   /* a plain commit starts a new line: the next `chain last` takes its origin from it */
+    }
+    if (g_btChain != 0) BdCursorChainLine(ch, chainKey, r, placed);
 }
 void BdKeptPendDone(BdPending& p)
 {
@@ -25245,6 +31345,7 @@ void BdKeptPieceWork(const keptwire::Row& w, BdKeptLoc& L, int mySlot, int sx, i
         for (int i = 0; i < 4; ++i) p.m.rot[i] = rot[i];
         p.m.complete = (unsigned char)keptComplete; p.m.progress = w.p.progress; p.m.needed = 0.0f;
         p.m.ownerSlot = coopbuild::kBuildOwnerSender; p.m.nonce = BdNewNonce();
+        p.m.groundMark = 1;   /* T-1372: inputs this build measured (BdKeptInputs) */
         if (furn != 0)
         {
             char hk[kKeyCap];
@@ -25274,7 +31375,7 @@ void BdKeptPieceWork(const keptwire::Row& w, BdKeptLoc& L, int mySlot, int sx, i
     }
     void* const town = (furn != 0) ? 0 : BdKeptTownFor(w, to);   /* its outpost first: taken or founded before the piece is made; none for a furniture row (it stands inside a building and keeps its host's town; a town founded for it would have no member, and the engine's player-town refresh destroys such a town) */
     const char* cwhy = 0;
-    void* b = BdKeptCreate(w, furn, host, pos, rot, (void*)to, &cwhy);
+    void* b = BdKeptCreate(w, furn, host, pos, rot, (void*)to, town, &cwhy);
     if (b == 0)
     {
         ++g_keptRefused;
@@ -25283,8 +31384,14 @@ void BdKeptPieceWork(const keptwire::Row& w, BdKeptLoc& L, int mySlot, int sx, i
         return;
     }
     BdKeptApplyState(w, b);
+    {   /* T-1389: the world-reset rebuild is a check road (the key the piece was made at; its row is made by BdOnNewPiece below) */
+        char kr[kKeyCap];
+        kr[0] = 0;
+        PcQueue(ObjectPositionKey(b, kr, kKeyCap, "", 3, 0) != 0 ? std::string(kr) : w.p.key, coopbuild::kPcRoadWorldReset);
+    }
     BdKeptRuinDoors(w);
     BdWalkMapNote(b, coopbuild::kWmKeptMade, w.p.key.c_str());   /* T-1294 design A: as the placement confirm */
+    BdZoneRebuildNote(b, w.p.key.c_str(), 4);   /* T-1428 attempt 2: a world-reset kept row - its area's own rebuild */
     if (furn == 0) BdKeptTownLink(w, b, town, to);   /* a furniture row is linked to no town: its town is its host's */
     BdKeptExtrasNow(w, L, b, "made");
     BdKeptOverlap(w, L, b, furn != 0 ? host : 0);
@@ -25299,6 +31406,7 @@ void BdKeptPieceWork(const keptwire::Row& w, BdKeptLoc& L, int mySlot, int sx, i
     _snprintf_s(line, sizeof(line), _TRUNCATE, "made as the player's own (owner '%.60s'), handed to it (owed until its game confirms)%s%.63s",
                 BdFactionName(BdOwnerPod(b)).c_str(), keySame != 0 ? "" : " KEY MISMATCH live=", keySame != 0 ? "" : (k2ok != 0 ? k2 : "?"));
     BdKeptPieceLaid(w, L, keptwire::kHowMade, k2ok != 0 ? std::string(k2) : w.p.key, line);
+    if (BdIsWall(b) == 1) { BdWgLeadReset(w.p.key); BdWallJoinFromRecord(w.p.key, b, "copy"); }   /* T-1408 fold 13: a kept copy made - joined by its owner's group fact */
 }
 /* THE ITEMS PART: the box's writer lays them into the live piece, in full and once on this game; their LAID goes at once and the world
    server never offers laid box contents to another game. Items made here that no place took wait in no inventory and are tried
@@ -25398,6 +31506,41 @@ void BdKeptWaitTick()
         BdKeptHereSave();
     }
 }
+/* T-36 TEST-ONLY (`buildtest keptruin`): this player's piece made a ruin by the engine's own setDestroyed, as the fresh world ruins a
+   town at load, right before the owner's kept step lays the row's state. 1 = go on (ruined, already a ruin, or given up), 0 = wait
+   (the engine deferred the ruin - message 16 - the next look reads it); bounded at 5 calls. Disarmed once it has run. */
+int BdKeptRuinLever(const keptwire::Row& w, void* live, const std::string& lk)
+{
+    float p = 0, n = 0;
+    int c = 0, d = 0, x = 0;
+    BdReadState(live, &p, &n, &c, &d, &x);
+    char line[400];
+    if (x != 0)
+    {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] T-36 TEST-ONLY keptruin row %u key=%.63s is a ruin here now (%.2f/%.2f complete=%d destroyed=%d, %d ruin call(s)) - the owner's kept step runs next; disarmed",
+                    w.row, lk.c_str(), p, n, c, x, g_keptRuinTries);
+        BdKeptLog(line);
+        g_keptRuinPart.clear();
+        return 1;
+    }
+    if (g_keptRuinTries >= 5)
+    {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] T-36 TEST-ONLY keptruin row %u key=%.63s NOT a ruin after %d ruin calls (the engine deferred each) - given up, the owner's kept step runs on a whole piece; disarmed",
+                    w.row, lk.c_str(), g_keptRuinTries);
+        BdKeptLog(line);
+        g_keptRuinPart.clear();
+        return 1;
+    }
+    ++g_keptRuinTries;
+    DoorsForgetOwner(live);   /* the building's door rows go before its doors do */
+    const int ok = BdDestroyPod(live, true);
+    BdReadState(live, &p, &n, &c, &d, &x);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] T-36 TEST-ONLY keptruin row %u key=%.63s ruin call %d %s: now %.2f/%.2f complete=%d destroyed=%d",
+                w.row, lk.c_str(), g_keptRuinTries, ok != 0 ? "ran" : "FAULTED", p, n, c, x);
+    BdKeptLog(line);
+    if (x != 0) { g_keptRuinPart.clear(); return 1; }
+    return 0;
+}
 /* THE OWNER PART, on the owner's own game: its piece found (never made here by this part), registered as its own, the row's ruin and
    broken flag put on it (BdKeptOwnerState), and LAID owner once pp.build holding it is committed */
 void BdKeptOwner(const keptwire::Row& w, BdKeptLoc& L)
@@ -25453,7 +31596,8 @@ void BdKeptOwner(const keptwire::Row& w, BdKeptLoc& L)
         if (furn != 0) { char hk[kKeyCap]; hk[0] = 0; if (ObjectPositionKey(host, hk, kKeyCap, "", 3, 0) != 0) nr.hostKey = hk; nr.hostForm = coopbuild::kBuildHostPlain; nr.floor = w.p.floor; nr.outside = 0; }
         g_rsOwePlace.push_back(lk);
     }
-    BdKeptOwnerState(w, live, lk);
+    if (!g_keptRuinPart.empty() && lk.find(g_keptRuinPart) != std::string::npos && BdKeptRuinLever(w, live, lk) == 0) { L.nextLook = g_drainNo + kRetryGap; return; }   /* T-36 TEST-ONLY */
+    if (BdKeptOwnerState(w, live, lk, L) == 0) { L.nextLook = g_drainNo + kRetryGap; return; }   /* T-36 fold 1: a deferred repair is looked at again */
     BdKeptTownPlace(w, live, LocalPlayerFaction());   /* this player's own outpost in this world: taken or founded, then linked - a piece inside a building keeps its host's town */
     BdOwnDirty(2);
     L.ownerStep = 1;
@@ -25747,6 +31891,62 @@ void BdDismantleAskDrain()
     }
 }
 
+/* T-1408 fold 8 (F1291), MAIN THREAD (the STATE drain): ONE queue turn for an own wall GROUP, whatever its size - when any of its records is
+   due, every queued own record of the group (due or not) is taken together and applied in coopbuild::BuildGroupApplyOrder's order, the
+   winner first (BdApplyOne adopts its stamp and writes its value through the lead - the engine's wall step draws every loaded member;
+   members not loaded take it when they land, BdOwnGroupCatchUp), each later one judged against the value the winner left (older or the
+   same: materials only, caught up, never written back). A record kept by its own road (BdApplyOne 0: a deferred engine call) stays queued
+   with its own retry; the rest leave the queue now. Owed owner steps are decided with the group (BdGroupStepFor drops them at the
+   winner's adopt; BdGroupOwedTick runs them once no record of the group waits). 1 = the turn was the group's (the caller re-finds its
+   place in the queue), 0 = not a group with two or more records queued here (the record goes its own way) */
+/* T-1408 fold 9: the own records of key's wall group queued here (key's own row an own wall's), with their stamps, shares and retry
+   safe points. Returns how many (0 = not an own wall group) */
+int BdOwnGroupQueue(const std::string& key, std::vector<std::string>& qk, std::vector<unsigned int>& qs, std::vector<float>& qh, std::vector<unsigned int>& qt)
+{
+    qk.clear(); qs.clear(); qh.clear(); qt.clear();
+    std::map<std::string, BdReg>::const_iterator row = g_reg.find(key);
+    if (row == g_reg.end() || row->second.own == 0 || row->second.via == 3 || row->second.removed != 0) return 0;
+    const std::vector<std::string> gk = BdGroupKeysOf(key);
+    if (gk.size() < 2) return 0;
+    for (size_t j = 0; j < gk.size(); ++j)
+    {
+        std::map<std::string, BdStatePend>::const_iterator pq = g_pendState.find(gk[j]);
+        if (pq == g_pendState.end() || pq->second.ownRec == 0) continue;
+        float sh = -1.0f;
+        if (coopbuild::BuildWallRecShare(pq->second.m.progress, pq->second.m.needed, (int)pq->second.m.complete, &sh) == 0) sh = -1.0f;
+        qk.push_back(gk[j]); qs.push_back(pq->second.m.groupStamp); qh.push_back(sh); qt.push_back(pq->second.nextTry);
+    }
+    return (int)qk.size();
+}
+/* fold 9 (F1296 NIT): each record of the turn waits its own retry gap, and none goes before the winner (coopbuild::BuildGroupTurnPick) */
+void BdOwnGroupTurn(const std::string& key, const std::vector<std::string>& qk, const std::vector<unsigned int>& qs, const std::vector<float>& qh, const std::vector<unsigned int>& qt)
+{
+    if (qk.size() < 2) return;
+    std::vector<int> order(qk.size(), 0), pick(qk.size(), 0);
+    const int np = coopbuild::BuildGroupTurnPick(&qs[0], &qh[0], &qt[0], (int)qk.size(), g_drainNo, &order[0], &pick[0]);
+    const int win = order[0];
+    g_gsTurnNp = np;
+    if (np == 0) { ++g_gsTurnWaits; return; }   /* T-1408 fold 10 (F1304 SHOULD 2): the winner waits its retry gap - no turn, no line, no slot */
+    ++g_gsGroupTurns;
+    g_gsGroupTurnRecs += (long long)np;
+    {
+        char gl[400];
+        _snprintf_s(gl, sizeof(gl), _TRUNCATE, "[BUILD] T-1408 fold 8 own wall group turn key=%.63s: %d queued record(s) of its group, %d due decided together, winner key=%.63s stamp %u share %.3f first%s; groupStamp[groupTurns,turnRecords]=%lld,%lld",
+                    key.c_str(), (int)qk.size(), np, qk[win].c_str(), qs[win], qh[win], "", g_gsGroupTurns, g_gsGroupTurnRecs);
+        BdLogGroup(gl);
+    }
+    for (int i = 0; i < np; ++i)
+    {
+        std::map<std::string, BdStatePend>::iterator it = g_pendState.find(qk[pick[i]]);
+        if (it == g_pendState.end()) continue;
+        if (BdApplyOne(it->first, it->second) == 0) continue;   /* kept by its own road (its nextTry set) */
+        const int dn = piecerec::PieceStateDoneNote(it->second.ownRec, it->second.landed);
+        if (dn == 1) PcaOwnStateDone(it->first);
+        else if (dn == 2) ++g_pcaStateDroppedNoLook;
+        if (g_ownRowsHeldNow > 0) BdOwnDirty(1);   /* T-1408 fold 4: a held pp.build row goes now */
+        g_pendState.erase(it);
+    }
+}
 unsigned int BuildSafePointNo() { return g_drainNo; }   /* T-1130 re-check: build.h */
 void PowerDrain();   /* P47: below */
 void BuildCopyDrain()
@@ -25761,7 +31961,7 @@ void BuildCopyDrain()
     PowerDrain();   /* P47: the writers' POWER_STATEs onto copies here, the switches asked of this game, the switches this game asks */
     if (g_copyDiagOwed != 0 && !EngineWritesBlocked()) BdCopyListDiagTick();   /* P87 root (step 5): read-only, before any adopt / reconcile / REMOVE below */
     BdTownsSayTick();   /* this game's own outposts to the world server, every drain whatever is pending (its own checks: the 5 s look, a slot, the town list, engine writes, a faction) */
-    if (!g_townRows.empty()) { BdSelfScope townScope; BdTownsLoadedTick(); }   /* every game: the kept outposts' pieces loaded here linked to their towns, whatever is pending (its own 5 s look and engine-write check) */
+    if (!g_townRows.empty()) { BdSelfScope townScope; BdTownsOwedTick(); BdTownsLoadedTick(); }   /* every game: the kept outposts' pieces loaded here linked to their towns, whatever is pending (its own 5 s look and engine-write check) */
     if (!g_shown.empty() || g_showSaveHeld != 0) BdShowSaveGuard();   /* T-811: a save the engine was asked for - the bases founded here go before it runs (this safe point) */
     if (!g_tmRefoundPending.empty()) BdTmRefoundPendingWake();   /* T-924: a re-found waiting for its area to unload, applied again once a zone is taken apart */
     if (g_showDirty != 0 || StoreWorldGenNow() != g_showWorldGen || g_townRowsGen != g_showKeptSeen || (g_showRetryAt != 0 && (long)(::GetTickCount() - g_showRetryAt) >= 0))
@@ -25818,16 +32018,34 @@ void BuildCopyDrain()
     g_bdKeptDraining = 0;   /* a piece made while the kept rows were laid is not marked as placed here (BdOnNewPiece) */
     /* build1-c: the held STATEs, after the PLACEs, so a copy made just now takes its STATE at this same safe point */
     int handled = 0;
+    std::set<std::string> gTurned;   /* T-1408 fold 9: the records of a group that had its turn at this safe point (one turn per group) */
+    std::vector<std::string> gqk;
+    std::vector<unsigned int> gqs, gqt;
+    std::vector<float> gqh;
     for (std::map<std::string, BdStatePend>::iterator it = g_pendState.begin(); it != g_pendState.end() && handled < kStateApplyPerDrain; )
     {
-        if (it->second.nextTry > g_drainNo) { ++it; continue; }
+        if (!gTurned.empty() && gTurned.find(it->first) != gTurned.end()) { ++it; continue; }
+        const int due = (it->second.nextTry <= g_drainNo) ? 1 : 0;
+        const int gq = (due != 0 && it->second.ownRec != 0) ? BdOwnGroupQueue(it->first, gqk, gqs, gqh, gqt) : 0;
+        const int dStep = coopbuild::BuildStateDrainStep(due, it->second.ownRec, gq);
+        if (dStep == coopbuild::kBuildDrainSkip) { ++it; continue; }
         ++handled;
+        if (dStep == coopbuild::kBuildDrainGroup)
+        {   /* T-1408 fold 8: an own wall group's queued records take ONE turn together (BdOwnGroupTurn) - never a waiting record eating turns */
+            const std::string tk = it->first;
+            gTurned.insert(gqk.begin(), gqk.end());
+            BdOwnGroupTurn(tk, gqk, gqs, gqh, gqt);
+            it = g_pendState.upper_bound(tk);
+            if (g_gsTurnNp == 0) --handled;   /* T-1408 fold 10 (F1304 SHOULD 2): a waiting group takes none of the safe point's slots */
+            continue;
+        }
         if (BdApplyOne(it->first, it->second) != 0)
         {   /* an own record's state that landed marks the piece for its look (what it holds now is written where it differs); a dropped one
                does not - the piece's old state would go over a newer record */
             const int dn = piecerec::PieceStateDoneNote(it->second.ownRec, it->second.landed);
             if (dn == 1) PcaOwnStateDone(it->first);
             else if (dn == 2) ++g_pcaStateDroppedNoLook;
+            if (it->second.ownRec != 0 && g_ownRowsHeldNow > 0) BdOwnDirty(1);   /* T-1408 fold 4: a held pp.build row goes now */
             g_pendState.erase(it++);
         }
         else ++it;
@@ -25868,6 +32086,7 @@ void BuildForgetWorld()
     g_ocQ.clear(); g_ocDepth = 0;   /* P18: the queued keys belong to the world going away */
     g_btPlaced = 0; g_btPlacedKey[0] = 0;   /* TEST-ONLY: the piece buildtest place made belongs to the world going away */
     g_townLoadedDone.clear();   /* the outposts' settled pieces are this world's */
+    g_townFresh.clear(); g_townFreshLook.clear(); g_townOwed.clear();   /* T-1442 step 4: the towns founded or taken and the owed rows were this world's */
     g_townNotMateSaid.clear();  /* owner 938: the not-a-teammate notices are this world's */
     g_townTeamWaitSaid.clear(); /* and the outposts counted waiting for the team table */
     g_showKeysSeen.clear();     /* T1342: the keys the shown rows said are this world's */
@@ -25885,6 +32104,21 @@ void BuildForgetWorld()
     for (size_t i = 0; i < g_pend.size(); ++i) BdRemakeDropped(g_pend[i]);   /* a re-make the world takes with it ends dropped */
     for (size_t i = 0; i < g_wait.size(); ++i) BdRemakeDropped(g_wait[i]);
     g_pend.clear(); g_wait.clear(); g_pendState.clear();
+    g_gsOwed.clear(); g_wrSolo.clear();   /* T-1408 fold 8: owed steps (kept over an area's leaving) and lowered copies go with the world */
+    {   /* T-1408 fold 2: parked HELD grouped-wall work goes with the world (the owner leaves) - one line; its helpers are released (best
+           effort: a helper also clears its mark once this game is known away) */
+        int parked = 0;
+        for (size_t i = 0; i < g_helpIn.size(); ++i)
+            if (g_helpIn[i].wallPark != 0) { ++parked; if (g_helpIn[i].wallTold != 0) BdSendHelpHeld(g_helpIn[i].m.key, coopbuild::kBuildHeldReleased, g_helpIn[i].slot); }
+        if (parked > 0)
+        {
+            g_wallHeldDropped += parked;
+            char wl[200];
+            _snprintf_s(wl, sizeof(wl), _TRUNCATE, "[BUILD] T-1408 world teardown: %d held grouped-wall help entr%s dropped (not confirmed; the helpers send them again); wallHeldDropped=%lld", parked, parked == 1 ? "y" : "ies", g_wallHeldDropped);
+            BdLogHelp(wl);
+        }
+        BdWallHeldForget();
+    }
     g_helpIn.clear(); g_helpAckRestore.clear(); g_placeNonceRestore.clear();   /* help1 fold 4: + the PLACE nonces; help1: that world's received work (the helper re-sends what stays unconfirmed); g_help stays - its file is per world */
     g_helpGoneIn.clear(); g_helpAckAwait.clear(); g_ownGone.clear(); g_goneAwait.clear(); g_ownSwept.clear();   /* help1 fold: that world's answers, confirmations waiting to land (pp.build was flushed first; the next roster STATE carries them) and swept keys; fold 3: its gone records (pp.build holds them) */
     if (g_helpSaveDirty != 0) BdHelpSave();   /* help1 fold (MED 8): the batched owed-file save before the world goes */
@@ -25903,9 +32137,9 @@ void BuildForgetWorld()
     g_dmOweForgot += (long long)coopbuild::BuildOweRemoveForget(&g_dmOweRemove);   /* par13: a dismantle's owed REMOVE belongs to the world it was made in */
     g_clListPending = 1; g_clHoldT0 = 0; g_clFeedAt = 0;   /* P87 rf1: the next world's copy list is still to be read */
     g_copyList.clear(); g_copyRetire.clear(); g_copyDiagOwed = 0; g_handLoad.clear();   /* T-23 fold 5: the hand-over keys come back with the list; P87 root: the copy list is in pp.build (OwnBuildTeardownFlush wrote it first) and read back at the next load */
-    g_tomb.clear(); g_tombRetire.clear(); g_tombSendOwed = 0; g_tombInfo.clear(); g_tombVerifyOwed = 0; g_tombVerifyZone = -1; g_tombVerifyCursor = 0; g_recon.clear(); g_tombKill.clear(); g_tombKillNo.clear(); g_refundSrc.clear(); g_ledgerPend.clear(); /* P14 (+ fold 1) */   /* P87: a world's tombstones are in its pp.build (written first); received REMOVEs belong to that world */
+    g_tomb.clear(); g_tombRetire.clear(); g_tombSendOwed = 0; g_tombInfo.clear(); g_tombVerifyOwed = 0; g_tombVerifyZone = -1; g_tombVerifyCursor = 0; g_recon.clear(); g_tombKill.clear(); g_tombKillNo.clear(); g_tombKillLater.clear(); g_refundSrc.clear(); g_ledgerPend.clear(); /* P14 (+ fold 1) */   /* P87: a world's tombstones are in its pp.build (written first); received REMOVEs belong to that world */
     g_ownRetireOwed.clear(); g_rsOwePlace.clear(); g_rsOweRemove.clear();   /* mmo8a2 (M2, M4), mmo8a3 (C): they go with their world (store.cpp handed pp.build's dirty rows to the writer first - mmo8a3 D1) */
-    g_hitOut.clear(); g_hitIn.clear(); g_hitLocal.clear(); g_hitResIn.clear(); g_hitOwed.clear(); g_wallRepHeld.clear();   /* HITs, owed results and repair markers belong to the world they were made in; g_hitSeenBy and g_hitResSeenBy stay (an ask or a result sent again is not taken twice) */
+    g_hitOut.clear(); g_hitIn.clear(); g_hitLocal.clear(); g_hitResIn.clear(); g_hitOwed.clear(); g_wallRepHeld.clear(); BdRepHeldMirrorClear();   /* HITs, owed results and repair markers belong to the world they were made in; g_hitSeenBy and g_hitResSeenBy stay (an ask or a result sent again is not taken twice) */
     BdKeptForgetWorld();   /* KEPT: this world's table of rows worked here (the rows themselves are the link's, store.cpp) */
     g_scanOwed = 1;   /* mmo8a3 (B): the loaded world is scanned once, link or not */
     memset(g_bdZoneScanned, 0, sizeof(g_bdZoneScanned));   /* T-274: the loaded world's zones are walked again as each finishes loading */
@@ -25928,17 +32162,26 @@ void BuildNoteRecv(const coopbuild::BuildMsg& m, unsigned int fromPeer)
     {
         ++g_helpWorkRecv;
         const int from = net::PlayerSlotOfKey(fromPeer);   /* M7b slice 4 (P106): the sender's own slot - the notebook's stamp, the session peer's on the session link */
+        BdHelpIn was = BdHelpIn();   /* T-1408 fold 3: the entry this re-send replaces */
+        int hadWas = 0;
         for (size_t i = 0; i < g_helpIn.size(); ++i)   /* help1 fold: a resend of an entry still waiting here (held for its gap) - one copy is enough */
             if (g_helpIn[i].slot == from && g_helpIn[i].m.seq == m.seq && g_helpIn[i].m.key == m.key && g_helpIn[i].m.nonce == m.nonce)   /* help1 fold 3: of the same placement */
             {   /* fold 2 (HIGH 1): the latest copy wins, queued at its arrival (a renumbered entry may reuse a held seq with other work) */
                 ++g_helpRecvTwice;
+                was = g_helpIn[i]; hadWas = 1;
                 g_helpIn.erase(g_helpIn.begin() + (std::ptrdiff_t)i);
                 break;
             }
         if ((int)g_helpIn.size() >= kPendCap) { ++g_helpRecvDropped; return; }   /* the helper sends it again (unconfirmed) */
         BdHelpIn in;
-        in.m = m; in.slot = from; in.nextTry = 0; in.waitLogged = 0; in.heldLogged = 0;
+        in.m = m; in.slot = from; in.nextTry = 0; in.waitLogged = 0; in.heldLogged = 0; in.wallLogged = 0; in.wallPark = 0; in.wallWhy = 0; in.wallTold = 0; in.recWaitLogged = 0;
+        if (hadWas != 0) BdHelpWallCarry(in, was, 1);   /* T-1408 fold 3: a re-sent held entry keeps its held state (no HELD again, no HOLD line again; released goes at its apply / drop) */
         g_helpIn.push_back(in);
+        return;
+    }
+    if (m.kind == coopbuild::kBuildHelpHeld)   /* T-1408 fold 2 (protocol 234): the game holding this game's grouped-wall help work says held / released */
+    {
+        BdWallHeldOnRecv(m.key, net::PlayerSlotOfKey(fromPeer), (int)m.reason);
         return;
     }
     if (m.kind == coopbuild::kBuildHelpGone)   /* help1 fold (protocol 91): the owner no longer holds the piece - the K2 safe point drops the work and hands its materials back */
@@ -26073,7 +32316,7 @@ void BdOwnerWordIn(const coopbuild::BuildMsg& m, int fromSlot, int fromAddr)
         }
         if ((int)g_pendState.size() >= kPendCap) { ++g_stateDropped; return; }
         BdStatePend& s = g_pendState[m.key];
-        s.m = m; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0;   /* P15 fold 1 */
+        s.m = m; s.nextTry = 0; s.fromPlace = 0; s.waitLogged = 0; s.deferTries = 0; s.completeTries = 0; s.ruinPutPend = 0; s.ruinPutVal = 0.0f;   /* P15 fold 1 */
         return;
     }
     ++g_placeRecv;
@@ -26143,6 +32386,7 @@ void BuildOwnRows(std::vector<coopown::BuildRow>* rows, std::vector<std::string>
 {
     rows->clear(); retired->clear(); *skipped = 0;
     long long oldWorld = 0;   /* mmo8a2 (H1) */
+    int recHeld = 0;   /* T-1408 fold 4 */
     for (std::map<std::string, BdReg>::iterator it = g_reg.begin(); it != g_reg.end(); ++it)
     {
         BdReg& r = it->second;
@@ -26157,6 +32401,19 @@ void BuildOwnRows(std::vector<coopown::BuildRow>* rows, std::vector<std::string>
             continue;
         }
         BdRestoreNonce(it->first, r, 0);   /* help1 fold 4 (re-check #1): the PLACE record keeps its nonce */
+        if (BdOwnRowRecordWait(it->first) != 0)
+        {   /* T-1408 fold 4 (F1256): the shared record is still to be applied over this piece - pp.build keeps its last row (T2553: the save's 0.03
+               went out before the record's apply); written once it is (BdOwnDirty at the apply) */
+            ++recHeld; ++g_ogRowsHeld;
+            if (g_ogRowsHeld <= 20)
+            {
+                char hl[300];
+                _snprintf_s(hl, sizeof(hl), _TRUNCATE, "[BUILD] T-1408 fold 4 pp.build row key=%.63s HELD at %.3f/%.2f: its shared record is not applied over it here yet - pp.build keeps its last row (the first 20); ownGroupRowsHeld=%lld",
+                            it->first.c_str(), r.progress, r.needed, g_ogRowsHeld);
+                BdLogState(hl);
+            }
+            continue;
+        }
         if (r.placeOk == 0) { ++*skipped; BdHelpAckUnkept(r); continue; }   /* its placement inputs were never read: no PLACE to keep */
         coopbuild::BuildMsg m, st;
         BdOwnRowMsgs(it->first, r, &m, &st);   /* the same PLACE and STATE the piece's world-server record carries */
@@ -26175,6 +32432,7 @@ void BuildOwnRows(std::vector<coopown::BuildRow>* rows, std::vector<std::string>
         rows->push_back(row);
         if (r.helpAckDirty != 0) { r.helpAcksWriting = r.helpAcks; r.helpAckDirty = 0; r.helpAckWait = 1; }   /* help1 fold (MED 4): these acks ride this record */
     }
+    g_ownRowsHeldNow = recHeld;   /* T-1408 fold 4 */
     for (std::map<BdPlKey, BdGoneRec>::iterator og = g_ownGone.begin(); og != g_ownGone.end(); ++og)   /* help1 fold 2 (MED 3) + fold 3: one gone marker per (key, nonce) record */
     {
         BdGoneRec& gr = og->second;
@@ -26443,7 +32701,7 @@ void BuildOwnDirtyClear() { g_ownDirty = 0; }
 void BuildOwnDirtyMark(int level) { BdOwnDirty(level); }
 void BuildOwnRetiredTaken(const std::vector<std::string>& taken) { coopown::BuildRetireTaken(&g_ownRetireOwed, taken, g_bdGen); }
 /* P87 rf1 (HIGH), MAIN THREAD: store.cpp BuildSaveTrackNote - the engine accepted a save request (SaveManager::save 0x47B0B0, after orig) */
-unsigned long BuildSaveAccepted() { return ++g_bdSaveReq; }
+unsigned long BuildSaveAccepted() { PcQueueAll(coopbuild::kPcRoadSave); return ++g_bdSaveReq; }   /* T-1389: a save is a check road */
 /* P87 rf1 (HIGH), MAIN THREAD: store.cpp BuildSaveTrackTick - save request reqNo has landed (its quick.save written after the request): every
    removed mark set before that request and settled in this world retires - the save no longer holds the copy */
 void BuildSaveLanded(unsigned long reqNo, const char* name)
@@ -26550,6 +32808,8 @@ int BuildRestoreQueue(const std::vector<coopown::BuildRow>& rows)
             ar.nonce = (a == coopbuild::kBuildDecodeOk && m.kind == coopbuild::kBuildPlace) ? m.nonce : 0;
         }
         g_pcaOwnRowKeys.insert(rows[i].key);   /* T-1240: a saved own row of this key (read whole or not): its restore keeps the dead-handle hold */
+        if (s == coopbuild::kBuildDecodeOk && st.kind == coopbuild::kBuildState && st.key == rows[i].key && !st.groupLead.empty())
+            (void)WgFactPut(rows[i].key, st.groupLead, st.groupIdx);   /* T-1408 fold 13: the owner's group fact back before its area loads */
         if (a != coopbuild::kBuildDecodeOk || m.kind != coopbuild::kBuildPlace || m.key != rows[i].key)
         {
             ++g_rsFailed;
@@ -28248,7 +34508,7 @@ void ReportPieceLive()
                     g_pcfEv[0], g_pcfEv[1], g_pcfEv[2], g_pcfEv[3], g_pcfEv[4],
                     g_pcfQueued, g_pcfApplied, g_pcfWaits, g_pcfDropped, g_pcfOlder, g_pcfWriterKept, g_pcfFault, g_pcfLaidFull, (unsigned int)g_pcfPend.size(),
                     g_pcfTakeLaid, g_pcfTakeWait, g_pcfNoRow);
-        DebugLog(std::string(fb));
+        DebugLog(std::string(fb) + swfarmstate::CropToken(g_pcfLines, g_pcfLinesQuiet));   /* T-1361 LOG ONLY */
     }
 }
 } // namespace
@@ -28265,6 +34525,17 @@ int PieceRecFarmIsPlayer(const std::string& key)
     if (RoleIsSingle()) return 0;
     std::map<std::string, PcrKept>::const_iterator kept = g_pcrKept.find(piecerec::MakePieceRecId(key));
     return (kept != g_pcrKept.end() && (kept->second.h.flags & piecerec::kPrFlagRemoved) == 0 && kept->second.b.live.hasFarm != 0) ? 1 : 0;
+}
+/* T-1361 (F1083) LOG ONLY, MAIN THREAD (farm.cpp FarmTick's [FARM] state line): PieceRecFarmIsPlayer's test with the record's owner slot,
+   generation and stored crop growth, and this game's slot. Reads the kept record only. */
+int PieceRecFarmStateOf(const std::string& key, int* ownerSlot, unsigned int* gen, float* recGrown, int* mySlot)
+{
+    *ownerSlot = -1; *gen = 0u; *recGrown = 0.0f; *mySlot = StoreMySlot();
+    if (RoleIsSingle()) return 0;
+    std::map<std::string, PcrKept>::const_iterator kept = g_pcrKept.find(piecerec::MakePieceRecId(key));
+    if (kept == g_pcrKept.end() || (kept->second.h.flags & piecerec::kPrFlagRemoved) != 0 || kept->second.b.live.hasFarm == 0) return 0;
+    *ownerSlot = kept->second.h.ownerSlot; *gen = kept->second.h.generation; *recGrown = kept->second.b.live.farmGrowth;
+    return 1;
 }
 /* MAIN THREAD (farm.cpp FarmDrain step 0): 1 = the farm at key waits (piecerec::PieceFarmLayOwed) - its area's records not all here and
    applied yet while the link is up (g_pcaDone: PieceRecApplyTick sets it once StoreAreaDoneSec answers for the area and applies it),
@@ -28327,7 +34598,7 @@ int PieceRecFarmNote(const std::string& key, void* piece, float growth, float de
             {
                 ++g_pcfFault;
                 _snprintf_s(tl, sizeof(tl), _TRUNCATE, "farm %.90s: the stored crop (gen=%u) faulted at the writer's take - its own crop is written; pcfFault=%lld", key.c_str(), keptGen, g_pcfFault);
-                PcrSay(tl);
+                PcfSay(tl);
             }
             else
             {
@@ -28339,7 +34610,7 @@ int PieceRecFarmNote(const std::string& key, void* piece, float growth, float de
                 w->farmNowLoad = g_pcaLoadN[c]; w->farmNowGen = keptGen;
                 _snprintf_s(tl, sizeof(tl), _TRUNCATE, "farm %.90s: this game writes it now - the stored crop laid first (gen=%u) growth=%.3f death=%.3f start=%.3f harvested=%d; pcfTakeLaid=%lld",
                             key.c_str(), keptGen, klv.farmGrowth, klv.farmDeath, klv.farmStart, klv.farmHarvested, g_pcfTakeLaid);
-                PcrSay(tl);
+                PcfSay(tl);
                 return 1;
             }
         }
@@ -28365,7 +34636,7 @@ int PieceRecFarmNote(const std::string& key, void* piece, float growth, float de
     char line[300];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "farm %.90s: crop write marked (%s) growth=%.3f death=%.3f start=%.3f harvested=%d; pcfMarked=%lld",
                 key.c_str(), piecerec::PieceFarmEventName(ev), growth, death, start, harvested, g_pcfMarked);
-    PcrSay(line);
+    PcfSay(line);
     PcrMarkW(*w, key, piecerec::kPeLive);
     return 1;
 }
@@ -28875,6 +35146,14 @@ void ReportPower()
 
 void ReportBuild()
 {
+    BdLogFlush(true);   /* T-1401: every held count first, so a report (and a bug report) carries them */
+    {
+        char cl[400];
+        _snprintf_s(cl, sizeof(cl), _TRUNCATE, "[BUILD] REPORT log caps (T-1401): kinds=%u lines[written,held,summaries]=%llu,%llu,%llu hitLines[pieces,full,alwaysWritten,held,summaries]=%u,%llu,%lld,%llu,%llu (each kind's first %d, each piece's first %d hit lines in full, then one count a minute)",
+                    (unsigned int)g_bdKindCap.rows.size(), g_bdKindCap.full, g_bdKindCap.held, g_bdKindCap.summaries, (unsigned int)g_bdHitCap.rows.size(),
+                    g_bdHitCap.full, g_hitLinesAlways, g_bdHitCap.held, g_bdHitCap.summaries, kLineCap, kHitLinesPerPiece);
+        DebugLog(std::string(cl));
+    }
     char b[3800];   /* build1-d: the remove / refund groups */
     std::sprintf(b, "[BUILD] REPORT build[placeSent,placeRecv,copyCreated,copyAdopted,copyPending,copyDup,copyKeyMismatch,copyFailed,copyOwnerFixed,pendingDropped]"
                  "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
@@ -28935,9 +35214,9 @@ void ReportBuild()
     DebugLog(std::string(b) + t);
     {
         char pl[420];
-        _snprintf_s(pl, sizeof(pl), _TRUNCATE, "[BUILD] REPORT placeFromLive[converted,noGround,retried]=%lld,%lld,%lld",
-                    g_placeFromLive, g_placeFromLiveNoGround, g_placeFromLiveRetried);
-        DebugLog(std::string(pl) + PcReportText());   /* T-988: the piece self-check's counts ride this line */
+        _snprintf_s(pl, sizeof(pl), _TRUNCATE, "[BUILD] REPORT placeFromLive[converted,noGround,retried,terrainBelowFloor]=%lld,%lld,%lld,%lld placeOld[converted,kept,noGround,noKeyY]=%lld,%lld,%lld,%lld removeRefusedOtherRow[remove,reconcile]=%lld,%lld",
+                    g_placeFromLive, g_placeFromLiveNoGround, g_placeFromLiveRetried, g_placeFromLiveFloor, g_placeOldConverted, g_placeOldKept, g_placeOldNoGround, g_placeOldNoKeyY, g_rmOtherRowRemove, g_rmOtherRowRecon);
+        DebugLog(std::string(pl) + BdEngineRemovalReport() + PcReportText() + BdWalkMapHostReportText() + BdFloorStoreReportText() + BdTownStoreReportText() + BdCopyTownReportText() + BdPurchaseHereReportText());   /* T-1430 */   /* T-988: the piece self-check's counts ride this line; T-1372: the engine's removals */
         _snprintf_s(pl, sizeof(pl), _TRUNCATE, "[BUILD] REPORT threads[orderSeen,orderOffMain,buymeSeen,buymeOffMain]=%lld,%lld,%lld,%lld",
                     (long long)g_orderSeen, (long long)g_orderOffMain, (long long)g_buymeSeen, (long long)g_buymeOffMain);
         DebugLog(std::string(pl));
@@ -29020,8 +35299,8 @@ void ReportBuild()
                 g_helpNonceRestored, g_helpNonceHeld, g_helpGoneUnproven, g_bdCopyCollide, g_helpGoneCarried, g_helpOldProbe, g_helpAckKeptUnknown);   /* help1 fold 4 */
     DebugLog(std::string(hp));
     char h9[1200];   /* T-903 */
-    _snprintf_s(h9, sizeof(h9), _TRUNCATE, "[BUILD] REPORT help903[givenBuild,givenMaterials,givenRepair,refusedBuild,refusedMaterials,refusedRepair,refusedOff,repairDamagedHelp,repairWorkRec,repairApplied,repairWhole,repairFaulted,friendHelps,applyRefused,runRefused,applyHeld,deadHandlesIgnored,helpJobEnded]"
-                "=%lld,%lld,%lld,%lld,%lld,%lld,%ld,%lld,%lld,%lld,%lld,%lld,%d,%lld,%lld,%lld,%lld,%lld harvest[done,refused,carried,lost,noBase]=%lld,%lld,%lld,%lld,%lld"
+    _snprintf_s(h9, sizeof(h9), _TRUNCATE, "[BUILD] REPORT help903[givenBuild,givenMaterials,givenRepair,refusedBuild,refusedMaterials,refusedRepair,refusedOff,repairDamagedHelp,repairWorkRec,repairApplied,repairWhole,repairFaulted,friendHelps,applyRefused,runRefused,applyHeld,deadHandlesIgnored,helpJobEnded,copyRowVoided]"
+                "=%lld,%lld,%lld,%lld,%lld,%lld,%ld,%lld,%lld,%lld,%lld,%lld,%d,%lld,%lld,%lld,%lld,%lld,%lld harvest[done,refused,carried,lost,noBase]=%lld,%lld,%lld,%lld,%lld"
                 " helpJob[hookBuild,hookMaterials,endFault,tableFull,rowsLost,noUid,notMine,notAsked,ruleUnknown,stale,standingRemoved,standingOther]"
                 "=%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                 " helpJobDrop[busy,busyUntold,blocked,charGone,pieceGone,notRefused,handFault,noAddr,ordersFault,jobFault,removeFault]"
@@ -29029,7 +35308,7 @@ void ReportBuild()
                 g_helpGivenK[0], g_helpGivenK[1], g_helpGivenK[2], g_helpRefusedK[0], g_helpRefusedK[1], g_helpRefusedK[2],
                 (long)::InterlockedCompareExchange(&g_helpRefusedOff, 0, 0), g_repairDamagedHelp, g_repairWorkRec, g_helpRepairApplied, g_repairWhole,
                 g_repairFaulted, coopbuild::kBuildHelpFriendHelps, g_helpApplyRefused, g_helpRunRefused, g_helpApplyHeld, g_deadHandlesIgnored,
-                (long long)::InterlockedCompareExchange64(&g_helpJobEnded, 0, 0),
+                (long long)::InterlockedCompareExchange64(&g_helpJobEnded, 0, 0), g_copyRowVoided,   /* T-1343 */
                 g_helpHarvested, g_helpHarvestRefused, g_helpHarvestCarried, g_helpHarvestLost, g_helpHarvestNoBase,
                 g_hkTaskBuild, g_hkTaskMats, (long long)::InterlockedCompareExchange64(&g_hjEndFault, 0, 0),
                 (long long)::InterlockedCompareExchange64(&g_hjFull, 0, 0), (long long)::InterlockedCompareExchange64(&g_hjRowsLost, 0, 0),
@@ -29051,6 +35330,35 @@ void ReportBuild()
                 (long long)::InterlockedCompareExchange64(&g_helpOffMainK[0], 0, 0), (long long)::InterlockedCompareExchange64(&g_helpOffMainK[1], 0, 0),
                 (long long)::InterlockedCompareExchange64(&g_helpOffMainK[2], 0, 0), g_helpWallGroupKept);
     DebugLog(std::string(hom));
+    char wgh[300];   /* T-1408 */
+    _snprintf_s(wgh, sizeof(wgh), _TRUNCATE, "[BUILD] REPORT wallGroupHelp[ownerStep,ownerKept,stepRefused,sharesRedrawn,stepNoRate,ownerHeld,scaled,stateRedrawn,jobEnded]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                g_helpWallGroupStep, g_helpWallGroupKept, g_helpWallStepRefused, g_wallSharesRedrawn, g_wallStepNoRate,
+                g_helpWallGroupHeld, g_helpWallScaled, g_wallStateRedrawn, (long long)::InterlockedCompareExchange64(&g_hjWallEnded, 0, 0));
+    DebugLog(std::string(wgh));
+    char wgh2[300];   /* T-1408 fold 2 */
+    _snprintf_s(wgh2, sizeof(wgh2), _TRUNCATE, "[BUILD] REPORT wallHeld[sent,releaseSent,recv,cleared,woken,dropped,stepWait,marks]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%u",
+                g_wallHeldSent, g_wallHeldReleaseSent, g_wallHeldRecv, g_wallHeldCleared, g_wallHeldWoken, g_wallHeldDropped, g_helpWallStepWait, (unsigned int)g_wh.size());
+    DebugLog(std::string(wgh2));
+    char wgh3[800];   /* T-1408 */
+    _snprintf_s(wgh3, sizeof(wgh3), _TRUNCATE, "[BUILD] REPORT groupStamp[steps,applied,same,ignored,notApplied,legacy,catchUp,clock,writerSteps,writerNoted,groupTurns,adopted,noWork,owed,owedRun,owedAdopted,owedGone,owedNow,turnRecords,owedKeptArea,helpBehind,writerSolo]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%u,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%u,%lld,%lld,%lld,%lld ownHold[rowsHeld,recordsHeld,listWall,rowsHeldNow,stateAreaLeft]=%lld,%lld,%lld,%d,%lld",
+                g_gsSteps, g_gsApplied, g_gsSame, g_gsIgnored, g_gsNotApplied, g_gsLegacy, g_gsCatchUp, g_gsClock, g_writerGroupSteps, g_writerGroupNoted,
+                g_gsGroupTurns, g_gsAdopted, g_gsNoWork, g_gsOwedN, g_gsOwedRun, g_gsOwedAdopted, g_gsOwedGone, (unsigned int)g_gsOwed.size(),
+                g_gsGroupTurnRecs, g_gsOwedKeptArea, g_helpBehindRecords, g_writerSolo, g_ogRowsHeld, g_ogRecsHeld, g_ogListWall, g_ownRowsHeldNow, g_ogStateAreaLeft);
+    DebugLog(std::string(wgh3));
+    char wgh4[600];   /* T-1408 fold 10 */
+    _snprintf_s(wgh4, sizeof(wgh4), _TRUNCATE, "[BUILD] REPORT t1408fold10[groupLines,groupSuppressed,fromMember,progressClamped,ruinGroupRestored,ruinGroupRestoreFailed,rebuildExtra,repHeldJobEnded,turnWaits,finishStepped]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                g_grpLines, g_grpSuppressed, g_gsFromMember, g_progKeptClamped, g_ruinGroupRestored, g_ruinGroupRestoreFailed, g_helpRebuildExtra,
+                (long long)::InterlockedCompareExchange64(&g_hjRepHeldEnded, 0, 0), g_gsTurnWaits, g_gsFinishStepped);
+    DebugLog(std::string(wgh4));
+    char wgh5[500];   /* T-1408 fold 13 */
+    _snprintf_s(wgh5, sizeof(wgh5), _TRUNCATE, "[WALLGROUP] REPORT wallGroup[hook,hookCalls,engineJoins,loadJoinHeld,engineOnRecorded,noKey,joined,refused,waits,already,busy,leadElsewhere,leadTookProgress,factsOwner,factsKept,facts,lines,linesCut,factLines,factLinesCut,ownDeferred,leadGone,heldDropped,placeAlone,legacy,engineOnPlayer,heldAlone]"
+                "=%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%u,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                g_hkWallJoin, (long long)::InterlockedCompareExchange64(&g_wgHookCalls, 0, 0), (long long)::InterlockedCompareExchange64(&g_wgHookRun, 0, 0),
+                (long long)::InterlockedCompareExchange64(&g_wgHookHeld, 0, 0), (long long)::InterlockedCompareExchange64(&g_wgEngineOnRecorded, 0, 0),
+                (long long)::InterlockedCompareExchange64(&g_wgHookNoKey, 0, 0), g_wgJoined, g_wgRefused, g_wgWaits, g_wgDone, g_wgBusy, g_wgLeadElse, g_wgLeadTook,
+                g_wgFactsOwner, g_wgFactsKept, (unsigned int)g_wgFact.size(), g_wgLines, g_wgLinesCut, g_wgFactLines, g_wgFactLinesCut, g_wgOwnDeferred, g_wgLeadGone,
+                g_wgHeldDropped, g_wgPlaceHeldN, g_wgLegacy, (long long)::InterlockedCompareExchange64(&g_wgEngineOnPlayer, 0, 0), g_wgHeldAlone);
+    DebugLog(std::string(wgh5));
     char p18[700];   /* P18 */
     _snprintf_s(p18, sizeof(p18), _TRUNCATE, "[BUILD] REPORT p18[hook,seen,queued,offMain,modWrite,nested,notMine,wasMine,noKey,dup,queueFull,registered,notTaken,known,copyRow,notMineNow,gaveUp,walkMoved,applied,applyFaulted,waiting,lines,suppressed,claimSkipped,claimSkipOff,claimSkipBypassed]"
                 "=%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%u,%lld,%lld,%lld,%d,%lld",

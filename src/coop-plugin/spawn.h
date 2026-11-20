@@ -51,7 +51,7 @@ void* SpawnCharacterRecord(const std::string& sid, std::string* name);
 ::Character* SpawnFirstPlayerCharacter();
 // T-556: a new character of this player's own faction (LocalPlayerFaction, passed to the creation core explicitly) made at
 // `pos` into `squad`, owned here, NOT announced (the caller sends CONTEXT + SPAWN). MAIN THREAD.
-bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos, ActivePlatoon* squad, float age, unsigned int* uidOut);
+bool CreateOwnInSquad(const std::string& templateName, const std::string& templateSid, const Ogre::Vector3& pos, ActivePlatoon* squad, float age, unsigned int* uidOut);
 // T-556: a character's current name, cut as MSG_NAME cuts it (false = unreadable / empty); and the engine's setName on a
 // character this game drives (its rename is sent like any other). MAIN THREAD.
 bool NameOf(const void* c, std::string* out);
@@ -281,6 +281,16 @@ unsigned int FindSpawnedUid(const void* obj);
 // SAME INDIVIDUAL, and rules that exist to stop us destroying a copy the peer built do not apply to it.
 // MAIN THREAD (a std::set find over the twin registry).
 bool IsTwinUid(unsigned int uid);
+// PROBE-START: P303 - T-1411 (F1199 / F1200) LOG ONLY, MAIN THREAD: the owner's live carry word naming `body` (its carrier uid,
+// 0 = none; *ageSec = seconds since the latest STATE that named it, -1 none); the registered carrier whose hand names `body` here
+// (0 = none); the engine's being-carried byte (1 / 0). Reads only.
+unsigned int P303OwnerWord(unsigned int body, double* ageSec);
+unsigned int P303CarrierHere(::Character* body, ::Character** carrier);
+int P303Carried(::Character* c);
+// PROBE-END: P303
+// PROBE-START: P306 - T-1411 (F1236) LOG ONLY, MAIN THREAD: the put-down watch's and the carry's [PROBE] P306 lines (spawn.cpp).
+void P306Tick();
+// PROBE-END: P306
 // A copy of another game's character that no longer stands where its owner's character is (src/common/stalecopy.h). MAIN THREAD.
 // RepeatSpawnAct: ApplyRemoteSpawn asks it first, for a uid this game holds a row of - returns stalecopy::kSpawn*: Ignore (a
 // repeat; a far copy its owner's fresh MOVE sample says stands where its owner is - the SPAWN came late; the watched player or a
@@ -487,6 +497,9 @@ void CarryWatchTick();
 // MAIN THREAD, every in-game frame: make each copy carry what its owner's STATE says, through the engine's own
 // pickupObject 0x5CF500 / dropCarriedObject 0x5CD750, once both characters pass CharacterBuilt (R1-a).
 void CarryApplyTick();
+// T-1411 fix attempt 2, fold 2 (F1286; common/carrykeep.h). Once at plugin start: hook the engine's keep-updated test 0x5C6F30
+// (row CharacterKeepUpdatedTest) so it also answers 'keep updated' while a character's being-carried byte +0x3D4 is set.
+void InstallCarryKeep();
 // " carrySent=.. carryApplied=.. ..." for the [P014] REPORT line.
 std::string CarryReportToken();
 // arrest1 (docs/design-arrest.md 3): a decoded MSG_CARRY_BREAK - the game that drives `body` says its carry by `carrier`
@@ -673,6 +686,8 @@ int FreedCageFactsPod(const void* c, unsigned char* hand);
 // answer and hand), read now; when it reads open and openNow (RestraintCheckNow's byte) has no cage, the cage's open request is
 // sent to the owner ahead of the freed message. Returns the freed message's lock byte; *cageAtEvent a cooprison::kFreedCage* value.
 unsigned char FreedCageAtEventSend(unsigned int uid, int cagedAtEvent, const unsigned char* hand, unsigned char openNow, int* cageAtEvent);
+// T-1296, MAIN THREAD (speech.cpp FreedSendDrain): the freed message's freedLeft - 1 the copy was caged at the event and is out now.
+unsigned char FreedCopyLeftCageNow(unsigned int uid, int cagedAtEvent);
 // " arrest2[...]" for the [P014] REPORT line.
 std::string PrisonReportToken();
 // arrest3 TEST-ONLY lever (`crimetest sentence <hours>`): the sentence of every copy THIS game's guard jailed that is still in

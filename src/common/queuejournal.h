@@ -137,7 +137,9 @@ struct QueueEntry
     long long          queuedAtUnix; /* wall clock, whole seconds, for the readout only - it decides nothing */
     std::vector<char>  payload;      /* the family's own saved write; may be empty */
     int                ownAhead;     /* B12-c: 1 when an entry of this same key replayed ahead of this one */
-    QueueEntry() : family(-1), seqSeen(0), queuedAtUnix(0), ownAhead(0) {}
+    unsigned long long base;         /* T-1429 s2 fold 6: an area save's content version (the world server's seq it was made from) */
+    int                hasBase;      /* 1 = base was journaled; 0 = a line from an older build (replayed as base 0) */
+    QueueEntry() : family(-1), seqSeen(0), queuedAtUnix(0), ownAhead(0), base(0), hasBase(0) {}
 };
 
 inline char QueueHexDigit(int v)
@@ -212,7 +214,12 @@ inline int QueueLineFormat(const QueueEntry& e, std::string* out)
     }
     /* B12-c: THE SEVENTH FIELD IS WRITTEN ONLY WHEN IT IS SET. Absent means 0, so a journal written before
        B12-c parses unchanged and the ordinary line does not grow a field that says nothing. */
-    if (e.ownAhead != 0) s += "\t1";
+    if (e.hasBase != 0)
+    {   /* T-1429 s2 fold 6: "\t<ownAhead>\tb<base>" - eight fields; the b keeps it from ever reading as another field */
+        s += (e.ownAhead != 0) ? "\t1\tb" : "\t0\tb";
+        QueueAppendUnsigned(&s, e.base);
+    }
+    else if (e.ownAhead != 0) s += "\t1";
     s += '\n';
     *out = s;
     return 1;
@@ -235,14 +242,20 @@ inline int QueueLineParse(const std::string& line, QueueEntry* out)
         f.push_back(line.substr(at, t - at));
         at = t + 1;
     }
-    if (f.size() != 6 && f.size() != 7) return 0;   /* B12-c: six fields, or seven with ownAhead */
+    if (f.size() != 6 && f.size() != 7 && f.size() != 8) return 0;   /* B12-c: six fields, or seven with ownAhead; fold 6: eight with the base */
     if (f[0] != "q1") return 0;
     {
         std::string& p = f[f.size() - 1];
         while (!p.empty() && (p[p.size() - 1] == '\r' || p[p.size() - 1] == '\n')) p.erase(p.size() - 1);
     }
-    int ownAhead = 0;
-    if (f.size() == 7)
+    int ownAhead = 0, hasBase = 0;
+    unsigned long long base = 0ULL;
+    if (f.size() == 8)
+    {
+        if (f[7].size() < 2 || f[7][0] != 'b' || QueueParseUnsigned(f[7].substr(1), &base) == 0) return 0;
+        hasBase = 1;
+    }
+    if (f.size() >= 7)
     {
         if (f[6] == "1") ownAhead = 1;
         else if (f[6] != "0") return 0;   /* anything else is a line this build does not understand */
@@ -268,7 +281,7 @@ inline int QueueLineParse(const std::string& line, QueueEntry* out)
     e.key = f[2];
     e.seqSeen = seq;
     e.queuedAtUnix = (long long)when;
-    e.ownAhead = ownAhead;
+    e.ownAhead = ownAhead; e.base = base; e.hasBase = hasBase;
     *out = e;
     return 1;
 }

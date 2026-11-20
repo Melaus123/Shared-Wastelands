@@ -60,7 +60,8 @@
 namespace keptwire {
 
 const unsigned kMsgKept = 69;
-const unsigned kProtocol = 153;   /* the world-server protocol that carries KEPT */
+const unsigned kProtocol = 170;   /* the world-server protocol that carries KEPT */
+
 
 
 
@@ -790,6 +791,22 @@ inline void KeptFarmAges(float growth, int harvested, int n, float* out)
         if (i < h) { out[i] = kFarmHarvestedAge; continue; }
         out[i] = growth + (grow > 1 ? kFarmAgeSpread * (float)(i - h) / (float)(grow - 1) : 0.0f);
     }
+}
+
+/* ---- T-36 (F1198): THE OWNER'S KEPT PIECE MATCHED TO ITS OWN ROW BOTH WAYS (build.cpp BdKeptOwnerState). The row is the piece's
+   record from the save before the reset (zonekeep: 'is complete', 'destroyed', 'construction progress'). A row that says a ruin on a
+   piece whole here -> made a ruin; a row that says not destroyed (finished, or unfinished at its progress) on a piece that is a ruin
+   here (the fresh world ruined its town) -> repaired through BdRepairWhole, the road the hand-back takes on the other games; a repair
+   of this step the engine deferred (message 16: `owed`) whose ruin reset has landed -> finished from the row (BdRepairFinish); a
+   finished row on a piece standing here unfinished and not a ruin, with no repair owed -> only named; otherwise nothing. A row that
+   says a ruin is never repaired. */
+const int kOwnKeptNothing = 0, kOwnKeptRuin = 1, kOwnKeptRepair = 2, kOwnKeptBelowFull = 3, kOwnKeptFinish = 4;
+inline int OwnKeptMatch(int rowComplete, int rowDestroyed, int liveComplete, int liveDestroyed, int owed = 0)
+{
+    if (rowDestroyed != 0) return liveDestroyed == 0 ? kOwnKeptRuin : kOwnKeptNothing;
+    if (liveDestroyed != 0) return kOwnKeptRepair;
+    if (owed != 0) return kOwnKeptFinish;
+    return (rowComplete != 0 && liveComplete == 0) ? kOwnKeptBelowFull : kOwnKeptNothing;
 }
 
 /* ---- THE OWN STATE STEP (build.cpp BdKeptExtras): which parts are finished, their names, and whether this game lays any ---- */

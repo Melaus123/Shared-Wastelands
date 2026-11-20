@@ -11,10 +11,11 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 759
+!count 809
 AbstractMovementBase_pathGoal                  code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector             code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed            code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
+AbstractMovementBaseVt                         ptr  016FCBA8 016FCBA8 00032E7F
 Activate                                       code 007EBDF0 007EBDF0 40574883EC7048C7442440FEFFFFFF48
 ActivatePred                                   code 007EBF30 007EBF30 48895C24104889742418574883EC4048
 ActivePlatoon_leader                           code 00792B90 00792B90 40574883EC30488BF9488B89A0000000
@@ -81,6 +82,7 @@ BuildingInterior_toggleLoaded                  code 005621E0 005621E0 40574883EC
 BuildingSwapPick                               code 007F4770 007F4770 48895C2410555657415441554883EC20
 BuildingSquadState                             code 0057F1F0 0057F1F0 4885C90F84BC020000488BC455574154
 BuyItem                                        code 0074A630 0074A630 40555657415441554881EC0001000048
+CarryFollowGateGlobal                          var  02133970 02133970 -
 CageUseStart                                   code 00358040 00358040 48895C2418554883EC40488BEA488BD9
 ChangeSlaveOwner                               code 0032E430 0032E430 40554883EC30488B8128030000488BE9
 CharacterLimit                                 var  02133F50 02133F50 -
@@ -432,6 +434,7 @@ SlaveBuyingConfirm                             code 006ADD20 006ADD20 488BC45541
 StealthKoChance                                code 008852F0 008852F0 48895C24085556574881EC8000000048
 StealthKoChanceRet                             ret  0034D08B 0034D086 E84BD9CEFF
 StealthKoFailAlert                             code 00685660 00685660 48895C240848896C2410488974241857
+CampaignArrivalAnnounce                        code 00685750 00685750 48895C2408574883EC20488BDA488BF9
 StealthKoFailAttack                            code 005CB0A0 005CB0A0 4885D20F849900000048895C24085748
 StealthKoFailReact                             code 005C9290 005C9290 488B8950060000E9D27FA6FFCCCCCCCC
 StealthKoKnockoutRet                           ret  0034D4F3 0034D4EE E85A44CFFF
@@ -443,6 +446,7 @@ SecRemoveItem                                  code 00749A20 00749A20 48895C2420
 SetBedMode                                     code 0032E2F0 0032E2F0 48896C24104889742418574883EC2083
 SetChainedMode                                 code 0032E590 0032E590 405556574881ECB000000048C7442440
 SetCrime                                       code 00852C80 00852C80 48895C240848896C2410488974241857
+SetCrimeTimeLeft                               code 00851F40 00851F40 40534883EC30488BD9488B49400F2974
 SetCurrentSeason                               code 009DC3C0 009DC3C0 488B41088951404863D2488B14D04489
 SetDestroyed                                   code 00557280 00557280 488BC4554154415541564157488D6C24
 SetDoorOpenAmount                              code 00298D10 00298D10 4056415541564883EC70F30F10817C03
@@ -516,6 +520,7 @@ WeatherUpdateBT                                code 009DDE50 009DDE50 40574883EC
 WorldDestroy                                   code 00799AF0 00799AF0 405556574154415541564157488D6C24
 WorldTeardown                                  code 0036BA80 0036BA80 40534883EC20488BD9488B89B8040000
 ZoneDeactivate                                 code 009FE980 009FE980 488BC4554154415541564157488D68A1
+ZoneMapUpdate                                  code 00A0B830 00A0B830 48895C2410574883EC20488B81880000
 ZoneDeactivationCountdown                      code 00A09380 00A09380 F30F1081C40000000F2F81C000000077
 ZoneGetAllActiveZones                          code 00A0A710 00A0A710 48895C2418574883EC204883B9288116
 ZoneIsActivationType                           code 00A08A40 00A08A40 4863C2F30F108481C00000000F2F05E5
@@ -768,6 +773,51 @@ FactionWarMgrUpdate                            code 009CB310 009CB310 488BC45541
 TownsOfFaction                                 code 00928D60 00928D60 48895C2418555741554883EC2033FF4D
 ScythePhysicsJunk                              code 007DCAC0 007DCAC0 48895C240848896C2410488974241848
 ScythePhysicsFirstReady                        code 007D5290 007D5290 405355574883EC504883B9B801000000
+LektorIntPushBack                              code 000EE250 000EE250 48895C2408574883EC208BFA8B510C48
+ContextMenu_orderLabel                         code 0079B2D0 0079B2D0 4055565741544155488DAC2480E1FFFF
+Character_orderPreCheck                        code 005D1940 005D1940 40555657488DAC2460FEFFFF4881ECA0
+TradeRangeSq                                   ro   016888B4 016888B4 00247449
+MouseReleaseNoWindow                           code 007136A0 007136A0 40534883EC404883793000488BD90F84
+RightReleaseItem                               code 00714A20 00714A20 488BC4554154415541564157488DA8E8
 DoorOpenTaskAction                             code 00337000 00337000 48895C2408574883EC20488BD9488B4A
 DoorOpenLockTestTaskAction                     code 003370F0 003370F0 40564883EC4083791800488BF2488D51
 DoorOpenButtonOpenRet                          ret  00547047 00547042 E8F280AFFF
+BuildingPlaceGround                            code 009B3720 009B3720 4883EC380F29742420F30F10351FFBCC
+LevelEditorDeleteSelected                      code 007778A0 007778A0 48895C24084889742410574883EC2048
+PlayerInterfaceToggleEditor                    code 007F3720 007F3720 40574883EC3048C7442420FEFFFFFF48
+KenshiCrashFilter                              code 01373AB0 01373AB0 40554883EC20488BEA488D15A0823900
+KenshiSaveRootText                             var  01F9FE48 01F9FE48 -
+BuildingAtPoint                                code 009B2BA0 009B2BA0 488BC448895808574881EC200100000F
+ShopFallbackRandom                             code 009FC1B0 009FC1B0 40574883EC4048C7442420FEFFFFFF48
+PlayerInterface_newPlayerTask                  code 007FA650 007FA650 48895C240848896C2418565741544883
+StdString_assign                               code 00069D10 00069D10 48895C24084889742410574883EC2049
+ForgottenGui_refreshSelected                   code 006E2050 006E2050 488D91C0020000488B4910E9F91897FF
+WallEndPoint                                   code 004D1010 004D1010 48895C2408574883EC40488B01488BFA
+PreviewRotate                                  code 004D4F80 004D4F80 40534883EC300F28C1488BD9F30F5881
+TownFloorStoreRemove                           code 0092DEC0 0092DEC0 48895C240848896C2418488954241056
+TownFloorStoreAddPart                          code 0092F630 0092F630 4D85C0746E48895C2408488954241057
+CharacterKeepUpdatedTest                       code 005C79C0 005C79C0 40574883EC30488B01488BF9FF505848
+NodeListDestroyByBuilding                      code 0038A720 0038A720 488BC444884018488950104889480853
+TownForgetBuilding                             code 00928EE0 00928EE0 48895C2418555641554883EC4033DB40
+BuildingGetTownStrict                          code 00296940 00296940 40534883EC20488BD90F1F8000000000
+InputHandlerInit                               code 003636C0 003636C0 488BC4554154415541564157488D68A1
+InputHandlerAddCommand                         code 00363440 00363440 40555657415441554881ECA000000048
+InputHandlerFind                               code 00361F50 00361F50 48895C24104889742420574883EC2048
+InputHandlerBind                               code 00362260 00362260 48895C240848896C2410488974242044
+InputHandlerParseKey                           code 00361B90 00361B90 405556574154415541564157488D6C24
+InputHandlerKeyBound                           code 00360FB0 00360FB0 488B4130448BCA4C8BD14C8B4008488B
+InputHandlerKeyName                            code 003612E0 003612E0 405356574881EC8000000048C7442438
+InputHandlerGlobal                             var  02133370 02133370 -
+KeyConfigLineCtor                              code 003E7C60 003E7C60 488BC448894808565741544881EC9000
+DatapanelAddLine                               code 006FF7D0 006FF7D0 448B42184533C9E9C07F91FFCCCCCCCC
+DatapanelAddSpacer                             code 006FE400 006FE400 4055535657415441554156488D6C24D9
+OptionsControlsEndRet                          ret  003FAE4B 003FAE46 E8D921C3FF
+InputHandlerKeyDown                            code 00360B30 00360B30 40534883EC30448BC2488BD983FA2A74
+GameFreeStub                                   code 00ED64F8 00ED64F8 FF2592403701FF2584403701FF257640
+ZoneWalkMapRebuild                             code 003AB840 003AB840 488BC456574154415541564881ECB000
+NavMeshManagerPtr                              var  021345C0 021345C0 -
+NavClosestFaceQuery                            code 003A2FA0 003A2FA0 48895C24084889742410574883EC6048
+HavokCharacterSetPosition                      code 00145E50 00145E50 488BC455574154488D68C84881EC2001
+WallJoinArea                                   code 0029AC50 0029AC50 4885D20F8426010000488BC4574881EC
+WallJoinTo                                     code 0029A890 0029A890 4889742418574883EC40488BF2488BF9
+GuiKeyCommandGuard                             code 006E1FD0 006E1FD0 488B4920E9963A92FFCCCCCCCCCCCCCC

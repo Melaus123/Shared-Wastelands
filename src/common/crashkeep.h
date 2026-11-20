@@ -34,6 +34,7 @@
 #include <vector>
 #include <algorithm>
 #include "bugreport.h"   /* coopbug::BudgetPart, kOrderKeptCrash, kCrashNearSec */
+#include "crashline.h"   /* T-1374: the [CRASH] line's utc= field (swcrash::ParseUtc) */
 
 namespace swcrashkeep {
 
@@ -59,6 +60,59 @@ inline int Judge(int logState, bool hookOkSeen, bool routeSeen)
     if (logState != kLogRead) return kVerdictUnreadable;
     if (!hookOkSeen) return kVerdictNoHook;
     return routeSeen ? kVerdictQuit : kVerdictCrashed;
+}
+/* T-1374: the crash line's start (src/common/crashline.h swcrash::kLineText), looked for in the same newest kRouteTailBytes as a
+   route line. A log that was read and holds it is a crash whatever else it holds - a crash during a quit writes a route line
+   first, and a launch whose quit routes were not all marked can still say it crashed. */
+const char* const kCrashLineText = "[CRASH] ";
+inline int JudgeWithCrash(int logState, bool hookOkSeen, bool routeSeen, bool crashLineSeen)
+{
+    if (logState == kLogRead && crashLineSeen) return kVerdictCrashed;
+    return Judge(logState, hookOkSeen, routeSeen);
+}
+
+/* T-1374 fold (F2): the moment in the kept launch's [CRASH] line - its "utc=" field, seconds since 1601-01-01 UTC (the clock of
+   a file's write time) - from the first [CRASH] line in the n bytes at p; 0 = no [CRASH] line, or one without a readable time
+   (an older build's). */
+inline long long CrashLineUtcSec(const char* p, size_t n)
+{
+    const size_t m = std::strlen(kCrashLineText);
+    if (p == 0 || n < m) return 0;
+    size_t i = 0;
+    for (; i + m <= n; ++i) if (p[i] == kCrashLineText[0] && std::memcmp(p + i, kCrashLineText, m) == 0) break;
+    if (i + m > n) return 0;
+    size_t e = i;
+    while (e < n && p[e] != '\r' && p[e] != '\n') ++e;   /* the line's end */
+    const char* const field = " utc=";
+    const size_t fl = std::strlen(field);
+    for (size_t j = i; j + fl <= e; ++j)
+        if (std::memcmp(p + j, field, fl) == 0) return (long long)swcrash::ParseUtc(p + j + fl, e - (j + fl));
+    return 0;
+}
+/* Kenshi's crash file (.dmp / .zip) has ONE fixed name per game version, so the file left by an older crash is still there
+   when a later launch dies without writing one (abort, a worker's crash). A crash file belongs to the kept launch when
+   coopbug::CrashFromLastLaunch places it there (within kCrashNearSec of its log's end, before this launch began) AND, when
+   that launch's log holds a [CRASH] line with its time (crashLineAt > 0), it was written at or after that time -
+   kCrashLineSlackSec earlier is allowed (a FAT drive keeps write times in 2-second steps). crashLineAt 0 = the rule
+   before the fold: the time window alone. Seconds on one clock (a FILETIME / 10^7). */
+const long long kCrashLineSlackSec = 2;
+/* The bug report's pick (bugreport.cpp FindCrash) for its two kept earlier launches, the same rule: coopbug::CrashLaunch's
+   windows, and a launch whose log holds a [CRASH] line time (crash1At / crash2At > 0) takes only a file written at or after it
+   (kCrashLineSlackSec earlier allowed) - a file refused by one launch can still be the other's. With both times 0 it is
+   coopbug::CrashLaunch exactly. Returns 1, 2 or 0 = neither. */
+inline int CrashLaunchOfLines(long long fileAt, long long thisLaunchStart, long long log1End, long long log2End, long long crash1At, long long crash2At)
+{
+    if (fileAt <= 0 || fileAt > thisLaunchStart) return 0;
+    const long long launch1Bound = log1End > 0 ? log1End : thisLaunchStart;
+    const bool in1 = coopbug::CrashNear(fileAt, log1End) && !(crash1At > 0 && fileAt < crash1At - kCrashLineSlackSec);
+    const bool in2 = fileAt <= launch1Bound && coopbug::CrashNear(fileAt, log2End) && !(crash2At > 0 && fileAt < crash2At - kCrashLineSlackSec);
+    if (in1 && in2) return coopbug::CrashDistance(fileAt, log2End) < coopbug::CrashDistance(fileAt, log1End) ? 2 : 1;
+    return in1 ? 1 : (in2 ? 2 : 0);
+}
+/* the start-up keep's test: the previous launch alone */
+inline bool CrashFileOfKeptLaunch(long long fileAt, long long crashLineAt, long long prevLogEnd, long long thisLaunchStart)
+{
+    return CrashLaunchOfLines(fileAt, thisLaunchStart, prevLogEnd, 0, crashLineAt, 0) == 1;
 }
 
 /* Every source the judgement relies on is installed: the exit hook, the quit byte's address (the window close raises it through
@@ -228,14 +282,17 @@ bool SameFolder(const S& a, const S& b)
     }
     return true;
 }
+/* T-1374: and Kenshi's save root - the folder its crash handling writes crashDump<version>_x64.zip into (the game's global text
+   row KenshiSaveRootText, the same text + "\save\" being the save folder; F1036), read at run time; empty = not known. */
 template <class S>
-std::vector<S> CrashFolders(const S& programFolder, const S& modFolder)
+std::vector<S> CrashFolders(const S& programFolder, const S& modFolder, const S& saveRoot)
 {
     std::vector<S> out;
-    S c[2];
+    S c[3];
     c[0] = FolderWithSlash(programFolder);
     c[1] = modFolder.empty() ? S() : FolderUp(modFolder, 2);
-    for (int i = 0; i < 2; ++i)
+    c[2] = FolderWithSlash(saveRoot);
+    for (int i = 0; i < 3; ++i)
     {
         if (c[i].empty()) continue;
         bool dup = false;
@@ -244,12 +301,19 @@ std::vector<S> CrashFolders(const S& programFolder, const S& modFolder)
     }
     return out;
 }
+template <class S>
+std::vector<S> CrashFolders(const S& programFolder, const S& modFolder)
+{
+    return CrashFolders(programFolder, modFolder, S());
+}
 
 /* THE LOG LINE, written once after the version line. `entry` / `parts` / `crashFile` / `removed` are used by kVerdictCrashed;
    `err` by an unreadable log and a failed copy (copyFailed). The rule in one line: kept when the exit hook's install line is
-   there and no quit route line follows it. */
+   there and no quit route line follows it. sinceCrashLine: the crash file was looked for from the [CRASH] line's time
+   (CrashFileOfKeptLaunch) - said when none was found. */
 inline std::string NoteLine(int verdict, bool copyFailed, unsigned long err, const std::string& entry, unsigned long long logBytes,
-                            const std::string& parts, const std::string& crashFile, int kept, const std::string& removed)
+                            const std::string& parts, const std::string& crashFile, int kept, const std::string& removed,
+                            bool sinceCrashLine = false)
 {
     char b[96];
     if (verdict == kVerdictNoLog) return "[CRASHKEEP] no previous log";
@@ -270,7 +334,11 @@ inline std::string NoteLine(int verdict, bool copyFailed, unsigned long err, con
     std::sprintf(b, "%llu", logBytes);
     std::string s = std::string("[CRASHKEEP] previous launch did not quit normally - kept in ") + kFolder + "\\" + entry + " (log " + b
                     + " bytes, parts " + parts + ", Kenshi crash file ";
-    if (crashFile.empty()) { std::sprintf(b, "none within %u s", coopbug::kCrashNearSec); s += b; }
+    if (crashFile.empty())
+    {
+        std::sprintf(b, sinceCrashLine ? "none written since its [CRASH] line (within %u s)" : "none within %u s", coopbug::kCrashNearSec);
+        s += b;
+    }
     else s += crashFile;
     std::sprintf(b, "); %d of %d kept, removed ", kept, (int)kKeepEntries);
     return s + b + (removed.empty() ? std::string("none") : removed);

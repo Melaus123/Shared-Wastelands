@@ -22,6 +22,11 @@ void MoneyArrive(unsigned type, const std::vector<char>& payload);
 // is on its way (the chat line said so); 0 = refused, nothing changed, *hint = the box's line saying why. MAIN THREAD.
 int MoneyHave(int* money);
 int MoneySend(int slot, const std::string& name, const std::string& typed, std::string* hint);
+// T-1167 piece 3 build 3, MAIN THREAD, only while StoreMoneyReady: a COMMITTED trade's money in ONE pp.money write - this side's held
+// row dropped (its money is the other side's now) and the other side's `cats`, booked into this game's money inbox under `inbox`,
+// added unless the applied number already covers it (its delivery came first); deliveries waiting below that inbox number ride the
+// same write (the applied number never skips one). 1 written (*seq the write; 0 nothing to write - a repeat), 0 not now (tried again).
+int MoneyTradeSettle(unsigned long long tradeId, unsigned long long inbox, int cats, unsigned fromSlot, unsigned long long* seq);
 
 // T-478 (owner 1447 b) TEST-ONLY: the command-file lever `money [<amount>]` - with an amount, this game's player faction's money
 // becomes <amount> through the game's own Ownerships::takeMoney, on this file's road (only when StoreMoneyReady, pp.money written at
