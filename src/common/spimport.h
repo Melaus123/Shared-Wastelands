@@ -422,6 +422,12 @@ inline unsigned int CreatorAsk(bool creatorShown, bool deadTicked, bool relation
     if (!creatorShown) return 0u;
     return (deadTicked ? 1u : 0u) | (relationsTicked ? 2u : 0u);   /* worldhist::kAskDead / kAskRelations (the suite checks they agree) */
 }
+/* T-1452 fold (review S1): the world word of an import taken from the world server's row - the creator bit only when that row carries the
+   claim's parts (Row::creatorAsk), never from another answer's word. Pure. */
+inline unsigned int WordForRowImport(unsigned int answerWord, unsigned int creatorAsk)
+{
+    return creatorAsk != 0u ? (answerWord | kWordPresent | kWordCreator) : (answerWord & ~kWordCreator);
+}
 /* T-1383: this import's switch word - the asked parts only once the world's answer says the profile holds the creator claim */
 inline unsigned int ImportFlagsFor(bool research, unsigned int ask, unsigned int answerWord)
 {

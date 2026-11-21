@@ -235,12 +235,16 @@ const unsigned int kInnerSpotPing = 207;
    and why), route SLOT back to the asker (src/common/bugreport.h). Read by the receiving game's store layer and handed to
    bugreport.cpp; it touches no engine state. (208, not 207: effort/t1393a's SPOT_PING takes 207.) */
 const unsigned int kInnerLogReply = 208;
+/* T-1401 step 2c (game-to-game protocol 236; owner 1784): LOG_THREAD - the reporting game tells each game that answered its
+   LOG_ASK the Discord thread its report went to, route SLOT (src/common/bugreport.h); that game uploads its own logs into it.
+   Read by the receiving game's store layer and handed to bugreport.cpp; it touches no engine state. */
+const unsigned int kInnerLogThread = 209;
 inline bool LiveInnerRoadLocal(unsigned int innerType)
 {
     return innerType == kInnerLiveProbe || innerType == kInnerCatchupEnd
         || innerType == kInnerPing || innerType == kInnerPong || innerType == kInnerHostClosing   /* M11a S3 */
         || innerType == kInnerOwnerMoved   /* M7a2 item 3 [m7a2-lr2] */
-        || innerType == kInnerLogAsk || innerType == kInnerLogPart || innerType == kInnerLogReply   /* T-461; T-1401 2b */
+        || innerType == kInnerLogAsk || innerType == kInnerLogPart || innerType == kInnerLogReply || innerType == kInnerLogThread   /* T-461; T-1401 2b; 2c */
         || innerType == kInnerChat
         || innerType == kInnerMapDots   /* T-930 */
         || innerType == kInnerSpotPing;   /* T-1393 */

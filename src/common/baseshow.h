@@ -62,7 +62,7 @@
 namespace baseshow {
 
 const unsigned kMsgShow = 78;
-const unsigned kProtocol = 170;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+const unsigned kProtocol = 173;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
 
 
 

@@ -47,7 +47,7 @@
 
 namespace tradew {
 
-const unsigned kProtocol = 170u;      /* the world-server protocol that carries TRADE (store_main.cpp and store.cpp check it at compile time); 155: the lock kinds 8-13; 156: LOCK_REFUSED's reason and ABORT's rows (no room, owner 1641) */
+const unsigned kProtocol = 173u;      /* the world-server protocol that carries TRADE (store_main.cpp and store.cpp check it at compile time); 155: the lock kinds 8-13; 156: LOCK_REFUSED's reason and ABORT's rows (no room, owner 1641) */
 const unsigned kMsgTrade = 94u;       /* TRADE: 94 was free (90-93 and 97-103 are taken; 94-96 unused before; no effort branch takes it) */
 
 enum Kind { kAsk = 1, kAsked = 2, kAnswer = 3, kOffer = 4, kAccept = 5, kAccepts = 6, kCancel = 7,

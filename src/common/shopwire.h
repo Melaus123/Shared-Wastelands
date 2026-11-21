@@ -45,6 +45,7 @@ const unsigned int kReqTagV4 = 0x34524853u; /* 'SHR4' (T-619): 'SHR3' + the requ
 const unsigned int kReqTagV2 = 0x32524853u; /* 'SHR2' (fold 2, protocol 96: + u32 epoch after entry; 'SHR1' was 92-94) - still decoded, as a home's stock */
 const unsigned int kReqTagSettle = 0x31534853u; /* 'SHS1': the 'SHR3' layout, a SETTLE-ONLY request (no price legs) */
 const unsigned int kCfTag = 0x31434853u;    /* 'SHC1' little-endian */
+const unsigned int kCfTag2 = 0x32434853u;   /* 'SHC2': T-1451 design 3 (protocol 242) - each piece key followed by u32 before, u32 after (save numbers) */
 const int kMaxStr = 96;                     /* a box key or a record sid; longer is refused */
 const int kMaxPieces = 32;                  /* piece keys a confirm may name */
 const int kMaxUnits = 100000;
@@ -86,6 +87,9 @@ struct ShopCf
     int n;                    /* units moved */
     int price;                /* cats the keeper moved */
     std::vector<std::string> pieces;   /* the holder's piece keys it wrote (the requester re-asks each) */
+    std::vector<unsigned int> seqs;    /* T-1451 design 3: per piece, the holder's save number for that box after the trade's moves were
+                                          sent ('SHC2'); empty = none named ('SHC1': a repeated answer, or nothing numbered) */
+    std::vector<unsigned int> seqsFrom;   /* T-1451 design 3 (review fold): per piece, the number just BEFORE the trade's first move ('SHC2') */
     ShopCf() : has(0), verdict(0), show(0), n(0), price(0) {}
 };
 
@@ -178,6 +182,19 @@ inline int RepeatRoad(int inRecord, int inMemory, int inAcked = 0)
     if (inRecord != 0) return kRepeatFromRecord;
     if (inAcked != 0) return kRepeatAcked;
     return (inMemory != 0) ? kRepeatFromMemory : kRepeatFresh;
+}
+/* T-1451 F1642: EVERY ANSWER THAT SETTLES A TRADE CARRIES ITS COUNTER NUMBERS. The holder's saved answer (the applied record's, the answer
+   memory's) is what a repeat and the reconnect re-send send; it was saved before the numbers were set, so it went in the numberless form
+   'SHC1' and the asker judged its own landing another player's (T2697). RepeatSendNow: waiting 1 = the original still waits for its box
+   moves (its numbers do not exist yet) - nothing is sent, the original goes first, numbered; the asker keeps waiting and asks again.
+   CfTakeNumbers: the numbers the original went with, written onto the saved copy (the same counters, in order) - 1 = written, so every
+   later repeat is the numbered form 'SHC2'; 0 = not the same counters (nothing changed). */
+inline int RepeatSendNow(int waiting) { return (waiting == 0) ? 1 : 0; }
+inline int CfTakeNumbers(ShopCf* saved, const ShopCf& sent)
+{
+    if (saved == 0 || saved->pieces != sent.pieces || sent.pieces.empty() || sent.seqs.size() != sent.pieces.size() || sent.seqsFrom.size() != sent.pieces.size()) return 0;
+    saved->seqs = sent.seqs; saved->seqsFrom = sent.seqsFrom;
+    return 1;
 }
 /* T-1007 (J3): WHO ASKED, as the holder keys its records and answers: the asker's player slot when it is known (whichever road the
    message came on), else the raw sender key marked by the top bit (never equal to a slot). */
@@ -784,29 +801,36 @@ inline int DecodeReq(const char* p, size_t size, size_t* at, ShopReq* r)
     *at = a;
     return 1;
 }
+/* a confirm's shop block of either form starts at `at` */
+inline int CfTagAt(const char* p, size_t size, size_t at) { return (TagAt(p, size, at, kCfTag) != 0 || TagAt(p, size, at, kCfTag2) != 0) ? 1 : 0; }
 inline int EncodeCf(std::vector<char>* b, const ShopCf& c)
 {
     if (c.pieces.size() > (size_t)kMaxPieces || c.n < 0 || c.price < 0 || c.verdict < 0 || c.verdict > 255 || c.show < 0 || c.show > 255) return 0;
     std::vector<char> t;
-    PutU32(&t, kCfTag);
+    const int numbered = (!c.pieces.empty() && c.seqs.size() == c.pieces.size() && c.seqsFrom.size() == c.pieces.size()) ? 1 : 0;   /* T-1451 design 3: 'SHC2' - before, after */
+    PutU32(&t, (numbered != 0) ? kCfTag2 : kCfTag);
     t.push_back((char)(unsigned char)c.verdict); t.push_back((char)(unsigned char)c.show);
     PutU32(&t, (unsigned int)c.n); PutU32(&t, (unsigned int)c.price);
     t.push_back((char)(unsigned char)c.pieces.size());
-    for (size_t i = 0; i < c.pieces.size(); ++i) if (!PutS(&t, c.pieces[i])) return 0;
+    for (size_t i = 0; i < c.pieces.size(); ++i) { if (!PutS(&t, c.pieces[i])) return 0; if (numbered != 0) { PutU32(&t, c.seqsFrom[i]); PutU32(&t, c.seqs[i]); } }
     b->insert(b->end(), t.begin(), t.end());
     return 1;
 }
 inline int DecodeCf(const char* p, size_t size, size_t* at, ShopCf* c)
 {
     size_t a = *at; unsigned int tag = 0, n = 0, pr = 0;
-    if (!GetU32(p, size, &a, &tag) || tag != kCfTag || a + 2 > size) return 0;
+    if (!GetU32(p, size, &a, &tag) || (tag != kCfTag && tag != kCfTag2) || a + 2 > size) return 0;
     c->verdict = (unsigned char)p[a]; c->show = (unsigned char)p[a + 1]; a += 2;
     if (!GetU32(p, size, &a, &n) || !GetU32(p, size, &a, &pr) || a + 1 > size) return 0;
     if (n > (unsigned int)kMaxUnits || pr > 0x7FFFFFFFu) return 0;
     const size_t k = (unsigned char)p[a]; ++a;
     if (k > (size_t)kMaxPieces) return 0;
-    c->pieces.clear();
-    for (size_t i = 0; i < k; ++i) { std::string s; if (!GetS(p, size, &a, &s)) return 0; c->pieces.push_back(s); }
+    c->pieces.clear(); c->seqs.clear(); c->seqsFrom.clear();
+    for (size_t i = 0; i < k; ++i)
+    {
+        std::string s; if (!GetS(p, size, &a, &s)) return 0; c->pieces.push_back(s);
+        if (tag == kCfTag2) { unsigned int f = 0, q = 0; if (!GetU32(p, size, &a, &f) || !GetU32(p, size, &a, &q)) return 0; c->seqsFrom.push_back(f); c->seqs.push_back(q); }
+    }
     c->n = (int)n; c->price = (int)pr; c->has = 1;
     *at = a;
     return 1;

@@ -139,9 +139,26 @@ struct QueueEntry
     int                ownAhead;     /* B12-c: 1 when an entry of this same key replayed ahead of this one */
     unsigned long long base;         /* T-1429 s2 fold 6: an area save's content version (the world server's seq it was made from) */
     int                hasBase;      /* 1 = base was journaled; 0 = a line from an older build (replayed as base 0) */
+    std::vector<long long> sentOwn;        /* T-1391 fold 3: every replay send's stamp of THIS save (oldest first, the last kQueueSentMax) - a
+                                              re-send's refusal whose stored copy has one of them is that send's accept; the last names this entry's send */
+    std::vector<long long> sentInherited;  /* the send stamps of the saves this one superseded - a refusal naming one of them: the stored copy is
+                                              this game's earlier save of the area, so this save is re-based on it and sent again */
     QueueEntry() : family(-1), seqSeen(0), queuedAtUnix(0), ownAhead(0), base(0), hasBase(0) {}
 };
 
+const size_t kQueueSentMax = 16;   /* T-1391 fold 3: send stamps kept per list */
+inline void QueueSentNote(std::vector<long long>* v, long long stamp)
+{
+    if (v == 0 || stamp <= 0) return;
+    v->push_back(stamp);
+    while (v->size() > kQueueSentMax) v->erase(v->begin());
+}
+inline int QueueSentHas(const std::vector<long long>& v, long long stamp)
+{
+    if (stamp <= 0) return 0;
+    for (size_t i = 0; i < v.size(); ++i) if (v[i] == stamp) return 1;
+    return 0;
+}
 inline char QueueHexDigit(int v)
 {
     return (char)((v < 10) ? ('0' + v) : ('a' + (v - 10)));
@@ -214,10 +231,20 @@ inline int QueueLineFormat(const QueueEntry& e, std::string* out)
     }
     /* B12-c: THE SEVENTH FIELD IS WRITTEN ONLY WHEN IT IS SET. Absent means 0, so a journal written before
        B12-c parses unchanged and the ordinary line does not grow a field that says nothing. */
-    if (e.hasBase != 0)
+    if (e.hasBase != 0 || !e.sentOwn.empty() || !e.sentInherited.empty())
     {   /* T-1429 s2 fold 6: "\t<ownAhead>\tb<base>" - eight fields; the b keeps it from ever reading as another field */
         s += (e.ownAhead != 0) ? "\t1\tb" : "\t0\tb";
         QueueAppendUnsigned(&s, e.base);
+        if (!e.sentOwn.empty() || !e.sentInherited.empty())
+        {   /* T-1391 fold 3: "\ts<own>.<own>..[:<inherited>.<inherited>..]" - nine fields */
+            s += "\ts";
+            for (size_t i = 0; i < e.sentOwn.size(); ++i) { if (i != 0) s += '.'; QueueAppendUnsigned(&s, (unsigned long long)(e.sentOwn[i] > 0 ? e.sentOwn[i] : 0)); }
+            if (!e.sentInherited.empty())
+            {
+                s += ':';
+                for (size_t i = 0; i < e.sentInherited.size(); ++i) { if (i != 0) s += '.'; QueueAppendUnsigned(&s, (unsigned long long)(e.sentInherited[i] > 0 ? e.sentInherited[i] : 0)); }
+            }
+        }
     }
     else if (e.ownAhead != 0) s += "\t1";
     s += '\n';
@@ -242,7 +269,7 @@ inline int QueueLineParse(const std::string& line, QueueEntry* out)
         f.push_back(line.substr(at, t - at));
         at = t + 1;
     }
-    if (f.size() != 6 && f.size() != 7 && f.size() != 8) return 0;   /* B12-c: six fields, or seven with ownAhead; fold 6: eight with the base */
+    if (f.size() != 6 && f.size() != 7 && f.size() != 8 && f.size() != 9) return 0;   /* T-1391 fold 2: nine with the replay send stamps */   /* B12-c: six fields, or seven with ownAhead; fold 6: eight with the base */
     if (f[0] != "q1") return 0;
     {
         std::string& p = f[f.size() - 1];
@@ -250,7 +277,31 @@ inline int QueueLineParse(const std::string& line, QueueEntry* out)
     }
     int ownAhead = 0, hasBase = 0;
     unsigned long long base = 0ULL;
-    if (f.size() == 8)
+    std::vector<long long> sentOwn, sentInherited;
+    if (f.size() == 9)
+    {   /* T-1391 fold 3: s<own list>[:<inherited list>], each a '.'-joined list of stamps (either may be empty, not both) */
+        if (f[8].size() < 2 || f[8][0] != 's') return 0;
+        const std::string body = f[8].substr(1);
+        const std::string::size_type colon = body.find(':');
+        for (int part = 0; part < 2; ++part)
+        {
+            const std::string lst = part == 0 ? body.substr(0, colon) : (colon == std::string::npos ? std::string() : body.substr(colon + 1));
+            if (part == 1 && colon != std::string::npos && lst.empty()) return 0;
+            std::string::size_type a = 0;
+            while (!lst.empty() && a <= lst.size())
+            {
+                const std::string::size_type d = lst.find('.', a);
+                const std::string one = lst.substr(a, d == std::string::npos ? std::string::npos : d - a);
+                unsigned long long v = 0ULL;
+                if (QueueParseUnsigned(one, &v) == 0 || v == 0ULL || v > 0x7FFFFFFFFFFFFFFFULL) return 0;
+                QueueSentNote(part == 0 ? &sentOwn : &sentInherited, (long long)v);
+                if (d == std::string::npos) break;
+                a = d + 1;
+            }
+        }
+        if (sentOwn.empty() && sentInherited.empty()) return 0;
+    }
+    if (f.size() >= 8)
     {
         if (f[7].size() < 2 || f[7][0] != 'b' || QueueParseUnsigned(f[7].substr(1), &base) == 0) return 0;
         hasBase = 1;
@@ -282,6 +333,7 @@ inline int QueueLineParse(const std::string& line, QueueEntry* out)
     e.seqSeen = seq;
     e.queuedAtUnix = (long long)when;
     e.ownAhead = ownAhead; e.base = base; e.hasBase = hasBase;
+    e.sentOwn = sentOwn; e.sentInherited = sentInherited;
     *out = e;
     return 1;
 }
@@ -312,6 +364,67 @@ inline std::vector<QueueEntry> QueueMergeOlderFirst(const std::vector<QueueEntry
     }
     if (superseded != 0) *superseded = sup;
     return out;
+}
+
+/* T-1391 (F1565; manager design B, 2026-11-20): AN AREA SAVE IN THE JOURNAL IS REPLAYED AS A VERSION-CHECKED WRITE. It is sent with
+   the base it was made from (the world's copy's seq) and the world server judges it; nothing here asks whether this game holds the area
+   or has it loaded (the replay used to drop an entry on a 'not loaded here' answered while the engine was still loading the areas). The
+   entry stays in the journal until the world server answers: taken (its seq echo carrying this send's stamp) - this game's mirror copy
+   is written then and the entry leaves; refused (staleBase / not the holder / the creation lease / not newer) - dropped and said with
+   that reason; a send that could not go out, or a link lost before the answer - kept and sent again at the next link. The answer
+   numbers 1-4 are areafresh::RecRefusalOf's. */
+const int kZrAnsAccepted = 0, kZrAnsStaleBase = 1, kZrAnsNotHolder = 2, kZrAnsLease = 3, kZrAnsNotNewer = 4, kZrAnsSendFailed = 5, kZrAnsLinkLost = 6, kZrAnsWriteFailed = 7;   /* 7: the world server could not store it (fold 2) - kept for the next link */
+const int kZrActCommit = 0;   /* taken: the mirror copy is written after the accept, the entry leaves the journal */
+const int kZrActDrop   = 1;   /* refused by the world server: dropped and said with its reason */
+const int kZrActKeep   = 2;   /* no answer on this link: stays, sent again at the next link */
+const int kZrActRebase = 3;   /* fold 3: the stored copy is this game's earlier (superseded) save of the area - re-based on its seq and sent again */
+inline int ZoneReplayAnswerAct(int ans)
+{
+    if (ans == kZrAnsAccepted) return kZrActCommit;
+    if (ans == kZrAnsStaleBase || ans == kZrAnsNotHolder || ans == kZrAnsLease || ans == kZrAnsNotNewer) return kZrActDrop;
+    return kZrActKeep;
+}
+/* an area's oldest queued save is sent when the link is up, no send of that area waits for its answer on this link and its send has not
+   failed on this link. There is no area-loaded or holder input on purpose: the world server judges. */
+inline int ZoneReplaySendDecide(int linkUp, int areaWaiting, int failedThisLink)
+{
+    return (linkUp != 0 && areaWaiting == 0 && failedThisLink == 0) ? 1 : 0;
+}
+/* the load (held under the loading screen) waits while any queued area save is unanswered on this link and its send has not failed on it */
+inline int ZoneReplayHoldDecide(int unansweredNotFailed) { return unansweredNotFailed > 0 ? 1 : 0; }
+/* T-1391 fold 2 (review of 2ab363d9c): THE ANSWER JUDGED AGAINST THE SEND IT ANSWERS. Every answer - the seq echo and each refusal - carries
+   the stamp of the upload it answers, and only this link's send with that stamp is answered by it (S1). A staleBase / not-newer refusal
+   whose stored copy has this entry's EARLIER send's stamp is that earlier send's accept (its echo was lost: a link lost, a crash) - taken
+   with the stored copy's stamp and seq (S3). The world server's failed disk write keeps the entry for the next link (S2). A taken copy
+   older than the mirror's present copy is not written over it (S4). */
+struct ZrSent { long long stamp; unsigned long long base; long link; std::vector<long long> prevOwn, prevInherited; ZrSent() : stamp(0), base(0ULL), link(0) {} };   /* fold 3: every earlier send of this save, and of the saves it superseded */
+struct ZrAnswer { int ans; long long uploadStamp; int hasStamp; long long storedStamp; unsigned long long seq; ZrAnswer() : ans(-1), uploadStamp(0), hasStamp(0), storedStamp(0), seq(0ULL) {} };   /* seq: the echo's (accept) or the stored copy's (refusal) */
+struct ZrVerdict { int matched, act, recast, writeMirror, failedThisLink; long long commitStamp; unsigned long long commitSeq; ZrVerdict() : matched(0), act(2), recast(-1), writeMirror(0), failedThisLink(0), commitStamp(0), commitSeq(0ULL) {} };
+inline ZrVerdict ZoneReplayJudge(int haveSent, const ZrSent& s, long linkNow, const ZrAnswer& a, long long mirrorWrittenAt)
+{
+    ZrVerdict v;
+    if (haveSent == 0 || s.link != linkNow || a.hasStamp == 0 || a.uploadStamp != s.stamp) return v;
+    v.matched = 1;
+    int ans = a.ans;
+    const int ourCopy = (ans == kZrAnsStaleBase || ans == kZrAnsNotNewer) && a.storedStamp > 0 ? 1 : 0;
+    if (ourCopy != 0 && QueueSentHas(s.prevOwn, a.storedStamp) != 0)
+    { ans = kZrAnsAccepted; v.commitStamp = a.storedStamp; v.commitSeq = a.seq; }
+    else if (ourCopy != 0 && QueueSentHas(s.prevInherited, a.storedStamp) != 0)
+    {   /* fold 3 (S3 gap b): an earlier save this one superseded is the stored copy - this one builds on it */
+        v.recast = ans; v.act = kZrActRebase; v.commitSeq = a.seq; v.commitStamp = a.storedStamp;
+        return v;
+    }
+    else if (ans == kZrAnsAccepted) { v.commitStamp = s.stamp; v.commitSeq = a.seq; }
+    v.recast = ans;
+    v.failedThisLink = (ans == kZrAnsWriteFailed) ? 1 : 0;
+    v.act = ZoneReplayAnswerAct(ans);
+    if (v.act == kZrActCommit) v.writeMirror = (mirrorWrittenAt > v.commitStamp) ? 0 : 1;
+    return v;
+}
+/* a seq echo answers this replay's send only when it carries the send's stamp (an echo of another write of the area does not) */
+inline int ZoneReplayEchoIsOurs(int sentWaiting, long long sentStamp, int echoHasStamp, long long echoStamp)
+{
+    return (sentWaiting != 0 && echoHasStamp != 0 && echoStamp == sentStamp) ? 1 : 0;
 }
 
 }   /* namespace coopqueue */

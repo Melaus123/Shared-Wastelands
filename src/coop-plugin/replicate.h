@@ -65,6 +65,10 @@ void ApplyRemoteInside(unsigned int uid, int inside, const std::string& key);
 // Hand a gated puppet an ORDER of any TaskType (subject = a character, or the puppet itself when none) and let
 // exactly one decision pass adopt it - InjectAttackOrder generalised. MAIN THREAD ONLY.
 bool InjectOrder(::Character* puppet, int taskType, ::Character* subject, const Ogre::Vector3& loc);
+// T-1416 fix attempt 2 review fold 1: a member this game takes keeps no order from its life as a copy - the engine's own
+// dropAllOrders, the clear the old take's issueOrder ran with 'clear old orders' set. Goals untouched. 1 dropped, 0 no AI / orders.
+// MAIN THREAD (the take's drain).
+int DropOrdersOnTake(::Character* c);
 // `handoff auto <n>`: up to n eligible puppets (have an intent, not attacking, no open window), alternating
 // inject / control; each gets a [VERDICT] handoff record ~30 ticks later. Returns how many were dispatched.
 int  HandoffAuto(int maxCount);

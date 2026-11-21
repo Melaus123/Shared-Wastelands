@@ -1392,12 +1392,15 @@ const unsigned long kAwakeBlockDropMs = kLendAskGapMs;   /* the lend road's wait
 
 /* the carried goal of a member taken by the ordinary hand-over. blockHere: an AWAKE block (or an applied awake row) for the hand-over's
    key uid here; intentType: the member's carried goal (0 none). Skip: the raid's campaign drives the squad (T2094: the carried goal
-   pinned it) */
-enum { kTakeOrderNone = 0, kTakeOrderIssue = 1, kTakeOrderSkip = 2 };
+   pinned it). ReRun (T-1416 fix attempt 2, F1556): on every other take the carried goal is NOT issued either - issued, it became a
+   player-style order that the engine's goal chooser picks first and that never finishes, so a struck member went back to it instead
+   of fighting (F1555); the taker's AI re-chooses from its refilled goals and the squad's package, as the engine does for its own
+   squads. No take issues the carried goal (the old 'issue' answer is gone). */
+enum { kTakeOrderNone = 0, kTakeOrderReRun = 1, kTakeOrderSkip = 2 };
 inline int AwakeTakeOrder(int blockHere, int intentType)
 {
     if (intentType <= 0) return kTakeOrderNone;
-    return blockHere != 0 ? kTakeOrderSkip : kTakeOrderIssue;
+    return blockHere != 0 ? kTakeOrderSkip : kTakeOrderReRun;
 }
 /* the sender: 1 = AWAKE goes before the hand-over message - on the main thread, its campaign made on this game, its id read */
 inline int AwakeHandSends(int onMain, int madeHere, int haveId) { return (onMain == 1 && madeHere == 1 && haveId == 1) ? 1 : 0; }

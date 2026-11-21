@@ -2745,15 +2745,180 @@ inline bool HeadFilled(const SquadHead& h)
         if (h.s[k].first == "squad template") tmpl = !h.s[k].second.empty();
     return file && tmpl;
 }
+/* T-1429 s12 (owner 1788: "everything comes from the server means everything also needs to be saved to the server"): A GONE HEAD -
+   the head record a squad's game writes at the moment the squad is emptied (its last member left it: moved into another squad, merged
+   away, left the faction) so a load after a crash never rebuilds it from the head it had before. It is an ordinary head - the same
+   "osh1" bytes DecodeSquadHead reads, so the world server stores and sends it as any head (no new message, no protocol change) -
+   whose bool map holds only kHeadGoneKey = 1. It names no content file, so a game built before s12 reads it as unfilled
+   (kRestoreHeadUnfilled) and does not rebuild from it either. A squad that gets people again writes its full head over it on its next
+   write (a different CRC). */
+const char* const kHeadGoneKey = "#gone";
+inline SquadHead GoneHead(const std::string& sid)
+{
+    SquadHead h; h.sid = sid; h.type = 0x22;
+    h.b.push_back(std::make_pair(std::string(kHeadGoneKey), 1));
+    return h;
+}
+inline bool HeadGone(const SquadHead& h)
+{
+    for (size_t k = 0; k < h.b.size(); ++k) if (h.b[k].first == kHeadGoneKey) return h.b[k].second != 0;
+    return false;
+}
+/* T-1429 s12 fold 5 (manager decision, parity; T2652 F1523): THE PLAYER'S DEAD-BODY SQUAD. The engine's death step for a player
+   character (declareDead 0x7A5660:244-248) moves the body into the squad 0x7F3DC0 returns: the squad the hand at PlayerInterface+0x2C8
+   names (Hand_getSquad 0x791CF0), or - when it names none - a new empty squad (spawnEmptySquad), named "__DEAD_SQUAD__", made not
+   permanent (setPersistentSquad 0), whose hand is then stored at +0x2C8 (0x7F3DC0:19-35). Single player keeps the bodies there until they
+   rot (corpsedecay.h:5-8). A head written for the squad that hand names carries kHeadDeadSquadKey = 1 (the engine's fact, read at every
+   head write - never a member count, a name or a template); a head without it is an ordinary squad's, so a record written by a build
+   before fold 5 is rebuilt as an ordinary squad, as before. Like the gone key it is an ordinary bool field: the world server stores it as
+   any head, and a game built before fold 5 reads it as a field it does not know. */
+const char* const kHeadDeadSquadKey = "#deadsquad";
+inline bool HeadDeadSquad(const SquadHead& h)
+{
+    for (size_t k = 0; k < h.b.size(); ++k) if (h.b[k].first == kHeadDeadSquadKey) return h.b[k].second != 0;
+    return false;
+}
+/* the mark follows the fact at each write: set when the stored hand names this squad, removed when it does not */
+inline void HeadSetDeadSquad(SquadHead* h, bool dead)
+{
+    for (size_t k = 0; k < h->b.size(); ++k)
+        if (h->b[k].first == kHeadDeadSquadKey) { if (dead) h->b[k].second = 1; else h->b.erase(h->b.begin() + k); return; }
+    if (dead) h->b.push_back(std::make_pair(std::string(kHeadDeadSquadKey), 1));
+}
+/* A REBUILT SQUAD WHOSE HEAD IS MARKED is made the player's real dead squad after its build (store.cpp OwnDeadSquadAdopt), by 0x7F3DC0's
+   own steps: storedRead = the hand at +0x2C8 was read (Hand_getSquad, no fault); storedOther = it names a live squad that is not this
+   one. Returns:
+     kDsOrdinary - not marked: an ordinary squad (and every record written before fold 5);
+     kDsNoRows   - the address table lacks a row the steps call (decided before the build: not built, its records stay owed);
+     kDsUnread   - the hand could not be read: left as built, said;
+     kDsBecome   - the engine has no dead squad (or it is this one): this squad becomes it - named "__DEAD_SQUAD__", not permanent, its
+                   hand stored at +0x2C8 (0x7F3DC0's making steps, on the squad the records rebuilt instead of a new empty one);
+     kDsJoin     - the engine has one: fold 6 (H-T1429-s12-ghost, F1539) - the rebuilt squad is woken with nobody (its people are made
+                   later by the engine's own per-frame load, _NV_loadCharacters via setupCheck 0x4FF040), so at the build it is only
+                   marked pending with its record's people list; each expected body moves into the engine's dead squad at the move
+                   drain that sees it arrive (DeadSquadBodyDecide / DeadSquadPendDecide). */
+const int kDsOrdinary = 0, kDsNoRows = 1, kDsUnread = 2, kDsBecome = 3, kDsJoin = 6;
+inline int DeadSquadRebuildDecide(bool marked, bool rows, bool storedRead, bool storedOther)
+{
+    if (!marked) return kDsOrdinary;
+    if (!rows) return kDsNoRows;
+    if (!storedRead) return kDsUnread;
+    if (!storedOther) return kDsBecome;
+    return kDsJoin;
+}
+inline const char* DeadSquadVerdictName(int v)
+{
+    return v == kDsOrdinary ? "ordinary" : v == kDsNoRows ? "rows-missing" : v == kDsUnread ? "hand-unread" : v == kDsBecome ? "became-the-dead-squad"
+         : v == kDsJoin ? "join-pending" : "?";
+}
+/* T-1429 s12 fold 6: ONE PERSON SEEN IN A PENDING REBUILT DEAD SQUAD at a move drain (store.cpp OwnDsPendDrain). join = the engine had
+   another dead squad at the build (else the squad became it); expected = the person is in the record's people list; alreadySeen = handled
+   at an earlier drain; dead = the person's own dead flag (1 dead, 0 living, -1 unread). Returns:
+     kDsBodyNotExpected - not one of the record's people: left where it is (counted);
+     kDsBodyAlready     - handled at an earlier drain;
+     kDsBodyArrived     - became road: the body is in the squad that is the engine's dead squad (the engine's own load put it there);
+     kDsBodyMove        - join road: a dead expected body - moved into the engine's dead squad (remove, then the dead squad's add);
+     kDsBodyLiving      - join road: a living person in a squad marked dead - never moved (said), counted as handled;
+     kDsBodyUnread      - join road: its dead flag could not be read - not moved, not handled (tried again at the next drain). */
+const int kDsBodyNotExpected = 0, kDsBodyAlready = 1, kDsBodyArrived = 2, kDsBodyMove = 3, kDsBodyLiving = 4, kDsBodyUnread = 5;
+inline int DeadSquadBodyDecide(bool join, bool expected, bool alreadySeen, int dead)
+{
+    if (!expected) return kDsBodyNotExpected;
+    if (alreadySeen) return kDsBodyAlready;
+    if (!join) return kDsBodyArrived;
+    if (dead < 0) return kDsBodyUnread;
+    if (dead == 0) return kDsBodyLiving;
+    return kDsBodyMove;
+}
+/* T-1429 s12 fold 6: THE PENDING SQUAD'S STEP after a drain's moves. squadOk = the squad still reads as itself (its own id); storedOther =
+   the engine's dead-squad hand names a live squad that is not this one (join road: no body is moved while it does not); expected = the
+   record's people; handled = of them, those moved, arrived or kept living; left = the squad's people now (-1 unread). Returns:
+     kDsPendGone    - the squad no longer reads as itself: dropped;
+     kDsPendNoHand  - join road, the engine's dead squad is not another live squad now: nothing moved, still pending;
+     kDsPendWait    - an expected body has not arrived yet: still pending (no timer - a body that never arrives keeps it pending until
+                      the world's teardown, said there);
+     kDsPendDeclare - join road, every expected body handled and the squad empty: declared dead as the engine declares an emptied squad
+                      (declareDead) and its gone head queued;
+     kDsPendDone    - every expected body handled and the squad not empty (a living person kept, or the became road): done;
+     kDsPendNoList  - join road with an empty people list: never armed, never declared dead (nothing says the squad's bodies have come -
+                      review of fold 6, SHOULD 2: handled 0 >= expected 0 would declare the squad dead before any body arrived). */
+const int kDsPendGone = 0, kDsPendNoHand = 1, kDsPendWait = 2, kDsPendDeclare = 3, kDsPendDone = 4, kDsPendNoList = 5;
+inline int DeadSquadPendDecide(bool join, bool squadOk, bool storedOther, int expected, int handled, int left)
+{
+    if (!squadOk) return kDsPendGone;
+    if (join && expected <= 0) return kDsPendNoList;
+    if (join && !storedOther) return kDsPendNoHand;
+    if (handled < expected) return kDsPendWait;
+    if (join && left == 0) return kDsPendDeclare;
+    return kDsPendDone;
+}
+inline const char* DeadSquadPendName(int v)
+{
+    return v == kDsPendGone ? "squad-gone" : v == kDsPendNoHand ? "no-other-dead-squad" : v == kDsPendWait ? "waiting" : v == kDsPendDeclare ? "emptied-declared-dead"
+         : v == kDsPendDone ? "done" : v == kDsPendNoList ? "no-people-list" : "?";
+}
+/* T-1429 s12 fold 1 (review BLOCKER): IS AN OWN SQUAD GONE? Only at one of two positive events - never because it left the live list
+   (a squad the engine puts to sleep or unloads leaves that list with its people still in it):
+     kGoneEvDestroy  - the engine destroyed the squad (Faction's destroy, on the main thread, not the mod's own destroy, a world
+                       teardown or the quit): gone when its own id still reads as the one its records were written under and it has no
+                       living member (people = the living count; -1 unread).
+     kGoneEvLastLeft - a person left it (the remove-member step) and at the next frame it is still awake (its active part there, no
+                       unloaded part) with nobody in it (people = the active part's count).
+   Anything else writes nothing. */
+const int kGoneEvDestroy = 1, kGoneEvLastLeft = 2;
+/* the living count's two markers (store.cpp LivingMembersPod): -1 the members not readable; -2 read whole, no awake members (empty) */
+const int kLivingUnread = -1, kLivingEmpty = -2;
+const int kGoneYes = 0, kGoneUnread = 1, kGoneHasPeople = 2, kGoneOtherSquad = 3, kGoneNoEvent = 4, kGoneAsleep = 5, kGoneLeaverElsewhere = 6;
+/* fold 2 (re-check SHOULD): the last-member event is positive too. people = the active part's count, living = the squad's living
+   members (LivingMembersPod; below 0 = unread). kGoneEvLastLeft is gone only when the squad is awake (its active part, no unloaded
+   part), empty, its living count reads 0, AND the person who left is accounted for (leaverAccounted): dead, or in another squad of
+   this player (a merge, a split). A person who left for no squad of this player (an unload, a region change, a faction change) never
+   makes it gone - the engine's destroy decides then. kGoneEvDestroy is gone when the living count reads 0. */
+inline int SquadGoneDecide(int event, bool read, bool activePlaus, int people, int living, bool unloadedPart, bool leaverAccounted,
+                           const std::string& keyNow, const std::string& keyStored)
+{
+    if (event != kGoneEvDestroy && event != kGoneEvLastLeft) return kGoneNoEvent;
+    if (!read) return kGoneUnread;
+    if (keyNow.empty() || keyNow != keyStored) return kGoneOtherSquad;
+    if (event == kGoneEvLastLeft)
+    {
+        if (!activePlaus || unloadedPart) return kGoneAsleep;
+        if (people != 0) return people > 0 ? kGoneHasPeople : kGoneUnread;
+        if (!leaverAccounted) return kGoneLeaverElsewhere;
+        /* fold 4 (T2652 F1523): the active part read with nobody in it, the leaver dead or in another own squad - the engine's facts.
+           The living count's kLivingEmpty (-2, 'read whole, no awake members') says the same empty squad, so it is not unread here;
+           only kLivingUnread (-1, the members not readable) stays unread */
+        if (living == kLivingEmpty) return kGoneYes;
+    }
+    if (living < 0) return kGoneUnread;
+    if (living > 0) return kGoneHasPeople;
+    return kGoneYes;
+}
+inline const char* GoneVerdictName(int v)
+{
+    return v == kGoneYes ? "gone" : v == kGoneUnread ? "unread" : v == kGoneHasPeople ? "has-people" : v == kGoneOtherSquad ? "other-squad"
+         : v == kGoneNoEvent ? "no-event" : v == kGoneAsleep ? "asleep" : v == kGoneLeaverElsewhere ? "leaver-elsewhere" : "?";
+}
+/* T-1429 s12 fold 1 (review SHOULD 3): a queued gone head's write obeys T-1062's death-wait hold as a squad record does (a death's
+   left note goes to the store first, held at most waitMs); dropped when the squad's key is in the live list again. */
+const int kGoneFlushWrite = 0, kGoneFlushHold = 1, kGoneFlushDrop = 2;
+inline int GoneFlushDecide(bool keyLiveAgain, bool deathsWaiting, unsigned int waitedMs, unsigned int waitMs)
+{
+    if (keyLiveAgain) return kGoneFlushDrop;
+    if (deathsWaiting && waitedMs < waitMs) return kGoneFlushHold;
+    return kGoneFlushWrite;
+}
 /* WHO IS A RESTORE CANDIDATE at a load: a squad record (pp.squad.<part>) the overlay rule takes whose squad the save does not
    have, and whose head record is stored, reads, names a squad of that same key (its state record's own id) and is filled
    (HeadFilled). Any other such record is dropped as before (squadMissing). */
-const int kRestoreYes = 0, kRestoreInSave = 1, kRestoreNoHead = 2, kRestoreHeadBad = 3, kRestoreHeadOther = 4, kRestoreHeadUnfilled = 5;
+const int kRestoreYes = 0, kRestoreInSave = 1, kRestoreNoHead = 2, kRestoreHeadBad = 3, kRestoreHeadOther = 4, kRestoreHeadUnfilled = 5,
+          kRestoreHeadGone = 6;   /* T-1429 s12: the squad was emptied or merged away (GoneHead) */
 inline int RestoreVerdict(bool squadInSave, bool haveHead, bool headRead, const SquadHead& head, const std::string& squadKey)
 {
     if (squadInSave) return kRestoreInSave;
     if (!haveHead) return kRestoreNoHead;
     if (!headRead) return kRestoreHeadBad;
+    if (HeadGone(head)) return kRestoreHeadGone;   /* T-1429 s12: never rebuilt from the head it had before it was emptied */
     if (squadKey.empty() || SquadKey(head.sid) != squadKey) return kRestoreHeadOther;
     if (!HeadFilled(head)) return kRestoreHeadUnfilled;
     return kRestoreYes;
@@ -2762,7 +2927,7 @@ inline const char* RestoreVerdictName(int v)
 {
     return v == kRestoreYes ? "candidate" : v == kRestoreInSave ? "in-save" : v == kRestoreNoHead ? "no-head"
          : v == kRestoreHeadBad ? "head-unreadable" : v == kRestoreHeadOther ? "head-names-another-squad"
-         : v == kRestoreHeadUnfilled ? "head-unfilled" : "?";
+         : v == kRestoreHeadUnfilled ? "head-unfilled" : v == kRestoreHeadGone ? "head-gone" : "?";
 }
 /* a head's string field ("" when it has none) and its vector field (false when it has none) */
 inline std::string HeadString(const SquadHead& h, const std::string& key)

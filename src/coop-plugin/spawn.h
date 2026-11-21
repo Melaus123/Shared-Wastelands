@@ -102,6 +102,21 @@ std::string MirrorTestCapLever(int cap);   // `mirrorcap <n>` - TEST-ONLY
 std::string BedHoldLever(const std::string& arg);   // `bedhold on|off` - TEST-ONLY
 
 ::Character* FindSpawned(unsigned int uid);
+// PROBE-START: P323 - T-1416 squad plan / goals / role lines and watched combat edges (spawn.cpp, LOG ONLY, MAIN THREAD)
+void P323AiLine(unsigned int uid, const char* moment);   // one [PROBE] P323 ai line; the uid joins the combat-edge watch
+void P323AiLater(unsigned int uid, int seconds);         // one more ai line ("later") that many seconds on
+void P323Tick();                                         // the due "later" lines (K2 safe point, from the goal-refill drain)
+void P323CombatEdge(unsigned int uid, int on, int wasOn, unsigned int targetUid);   // combat.cpp: an own character's combat edge
+void P323AiStrike(unsigned int victimUid);   // T2649: the TEST-ONLY attack lever struck it - a `strike` ai line for each test squad member run here
+bool P323IsTestUid(unsigned int uid);         // T2655: a test squad member seen on this game (spawn.cpp)
+std::string P323StateText(unsigned int uid);  // T2655: " test= read= role= goals= curGoalType= squad= plan= curPkg= ap98= pl98=" (spawn.cpp)
+int P323TreatsAsEnemy(::Character* who, ::Character* other);   // T2655: the engine's AI::treatsAsEnemy 1 / 0, -1 not asked (replicate.cpp)
+void P323Blow(unsigned int victimUid, unsigned int attackerUid, int result);   // T2655: a blow on a character this game runs (combat.cpp, the HIT drain)
+void P323BlowTick();                          // T2655: the blow lines' 0.5 s follow-ups (combat.cpp CombatTick)
+void P323TakeOrderBefore(unsigned int uid);   // T2669: the taker's goal lists read just before the take's carried order (handoff.cpp)
+void P323TakeOrder(unsigned int uid, int intentType, unsigned int subjectUid, int outcome);   // T2669: one `takeorder` line (spawn.cpp)
+std::string P323TaskTypeName(int type);       // T2669: replicate.cpp's task-type name (replicate.cpp)
+// PROBE-END: P323
 std::string TemplateSidOf(const void* c);   /* T-922 (templatekey.h): the stringID a SPAWN carries for c's template, "" = none. MAIN THREAD */
 std::string TmplNameLever(const std::string& args);   /* T-922 TEST-ONLY lever `tmplname` (command_channel.cpp): a record's shown name read, or set through the engine's renameRecord, by stringID. MAIN THREAD */
 void TemplateNoteSentByName();              /* counts a SPAWN sent with no stringID (tmplSentByName) */

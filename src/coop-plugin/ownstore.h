@@ -120,6 +120,10 @@ extern long long g_cmdVerbsRun;                   /* command_channel.cpp: verbs 
 unsigned long long OwnStoreOldestPendingSeq();    /* ANY THREAD: the lowest seq queued or being written, 0 = none (fold item 7) */
 
 /* ---- mmo3: money, research, map knowledge and the player faction row (store.cpp) ---- */
+void OwnInstallSquadMoves(unsigned long long base);   /* T-1429 s12, InstallStore: the squad move hooks (ActivePlatoon remove / add member) */
+void OwnSquadDestroyed(void* platoon, int counted, int living);   /* T-1429 s12 fold 1, MAIN THREAD, the engine's squad destroy before its step: gone decision, tracking dropped */
+void OwnSquadDestroyedOff(void* platoon);   /* T-1429 s12 fold 1, ANY THREAD: the same destroy off the main thread - tracking dropped at the next frame */
+int  OwnSquadKillPick(const std::string& which, unsigned int* uid, std::string* label);   /* T-1429 s12 TEST-ONLY, MAIN THREAD: `kill squadof:<sid>|newest` - a living member of an own squad */
 void OwnInstallMmo3(unsigned long long base);    /* InstallStore: the Research::setResearched 0x833680 detour, and Research::setLevel's (the own bench level) */
 void OwnResBenchForget();                         /* the world torn down: this game's own bench level back to 0 */
 void OwnNoteFactionChange();                      /* ANY THREAD: a detoured relation writer touched a pair with this game's player faction */

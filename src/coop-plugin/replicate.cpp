@@ -5900,6 +5900,7 @@ static void GoalRefillQueue(unsigned int uid)
 // K2 safe point (combat.cpp detour_tsRagdollUpdates), MAIN THREAD, the AI worker paused. See the block comment above.
 void GoalRefillSafePointDrain()
 {
+    P323Tick();   // PROBE P323
     if (g_goalRefillQ.empty() || EngineWritesBlocked()) return;   // a world loading or tearing down: the queue waits
     std::vector<GoalRefillDue> q;
     q.swap(g_goalRefillQ);
@@ -5927,6 +5928,7 @@ void GoalRefillSafePointDrain()
             if (now != 0) { after = GoalSetCountPod(now); has32After = GoalHas32Pod(now); }
             act = goalrefill::AfterFill(ran, has32After, d.tries, goalrefill::kMaxTries);
         }
+        if (act != goalrefill::kRetry || d.tries == 0) { P323AiLine(d.uid, act == goalrefill::kDone ? "refill-done" : act == goalrefill::kFail ? "refill-failed" : act == goalrefill::kKeep ? "refill-kept" : act == goalrefill::kDrop ? "refill-dropped" : "refill-retry"); if (act != goalrefill::kRetry) P323AiLater(d.uid, 5); }   // PROBE P323
         if (act == goalrefill::kDrop) { ++g_goalRefillDropped; continue; }
         if (act == goalrefill::kKeep) { ++g_goalRefillKept; continue; }
         if (act == goalrefill::kDone) ++g_goalRefilled;
@@ -6034,6 +6036,25 @@ void ApplyRemoteMoveStop(unsigned int uid, float x, float y, float z, unsigned i
     const double d = followplay::PlaybackDelay(p.moveIntervalSec);   // the owner stands: the delay may be re-read
     if (d != p.followD) { p.followD = d; ++g_followDRecalc; }
     P123CopyStopRecv(uid, p, now);   // PROBE P123
+}
+
+/* T-1416 fix attempt 2 review fold 1: the take no longer issues the carried goal, whose issueOrder ran with 'clear old orders' set -
+   and that clear was the only thing on the take road that emptied the order queue (Read: issueOrder 0x5078F0 calls dropAllOrders
+   0x506A10 only when that argument is set, build/decomp_5078f0.txt:29-30). A copy taken with an order left from its copy life (a
+   fight window's attack order - InjectAttackOrder, taken back only at a normal window close; the fallback drive's Move order) would
+   keep it, and the goal chooser takes the queue first (F1556). So every take empties the queue through that same engine call, at the
+   point the old issueOrder ran. The goal lists are NOT touched (ClearAttackOrder's dropGoals is not run): the take's refill fills
+   them. No fight-window bookkeeping lives in the queue: ClearAttackOrder is dropAllOrders + dropGoals and a counter, the window row
+   (combat.cpp CombatWatch) is not read or written here. */
+int DropOrdersOnTake(::Character* c)
+{
+    if (!PlausibleObj(c)) return 0;
+    void* ai = GetCharacterAI(c);
+    if (!PlausibleObj(ai)) return 0;
+    AITaskSytem* orders = *(AITaskSytem**)((char*)ai + 0x20);
+    if (!PlausibleObj(orders)) return 0;
+    orders->dropAllOrders();
+    return 1;
 }
 
 bool InjectOrder(::Character* puppet, int taskType, ::Character* subject, const Ogre::Vector3& loc)
@@ -8692,5 +8713,23 @@ void ReplicateForgetUids(const unsigned int* uids, int n)
         for (int i = 0; i < g_divergedCount && i < kDivergedSlots; ++i)
             if (g_divergedUids[i] == uids[k]) { g_divergedUids[i] = g_divergedUids[g_divergedCount - 1]; g_divergedUids[--g_divergedCount] = 0; break; }
 }
+
+// PROBE-START: P323 - T-1416 (F1520 (c)): does `who` count `other` as an enemy - the engine's own AI::treatsAsEnemy (1.0.65 0x5993A0,
+// decomp_5993a0: the owner character at AI +0x170, both factions (vtable +0x58), the faction relation below the enemy threshold),
+// the call P010 makes above. A pure read; LOG ONLY. MAIN THREAD (the HIT drain). 1 / 0, -1 not bound / unreadable / faulted.
+static int P323EnemyPod(void* fn, void* ai, void* other)
+{
+    __try { return ((bool (*)(void*, void*))fn)(ai, other) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int P323TreatsAsEnemy(::Character* who, ::Character* other)
+{
+    if (kMig3AiIsEnemy == 0 || who == 0 || other == 0 || !PlausibleObj(who) || !PlausibleObj(other)) return -1;
+    void* ai = GetCharacterAI(who);
+    if (!PlausibleObj(ai)) return -1;
+    return P323EnemyPod((void*)coop::AddrAbs(kMig3AiIsEnemy), ai, other);
+}
+std::string P323TaskTypeName(int type) { return TaskTypeName(type); }   /* T2669: the takeorder line's name (spawn.cpp) */
+// PROBE-END: P323
 
 } // namespace coop

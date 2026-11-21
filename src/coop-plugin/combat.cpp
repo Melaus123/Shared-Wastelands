@@ -226,6 +226,90 @@ volatile LONG g_applyingRemote = 0;
 //
 // A fixed ring, not a std::deque: the producer runs on a thread where an allocation or a
 // lock is how you deadlock the game. Single producer, single consumer, power-of-two mask.
+// PROBE-START: P323 - T2669 (F1543): the victim's fields AI::underMeleeAttack 0x999030 tests, read on the hit's own thread (the AI
+// worker) just before and just after the original melee hit 0x439150. The hit calls 0x999030(victim AI, attacker, 1, 0) only for a
+// landed blow with the victim's CombatClass (Character +0x648 -> +8) +0x130 clear and the attacker's vtable +0x20 answering 1
+// (decomp_439150:115-119). 0x999030 (decomp_999030): remember(attacker, 4), the knowledge mark 0x858070 (AI +0x28; it alerts the
+// squad through AI +0x170's ActivePlatoon +0x68), the threat-list add 0x666390 on AI +0x300 -> +8 (+0x200 count; past 4 it only bumps
+// +0x210 / +0x214 by +0x218), then - only when 0x436270(victim, 1) finds CombatClass +0x130 clear - the task system's vtable +0x18
+// (AI +0x20) unless Character +0x278 is set (getting up) or (CharMovement Character +0x640 +0x24 set AND 0x855CF0 'counts as the
+// player' - its first test: the faction's +0x250, read here through Character +0x10, Inferred to be what vtable +0x58 returns).
+// LOG ONLY: POD reads under __try, plus the attacker's own type getter (vtable +0x20 - the very call the hit makes next); no write.
+struct P323HitSnap
+{
+    signed char rd;          // 1 read, 0 faulted, -1 not read
+    signed char f130;        // CombatClass +0x130 (0/1, -1 unread)
+    int atkType;             // the attacker's vtable +0x20 answer (before only; -1 unread)
+    signed char getUp;       // Character +0x278
+    signed char moving;      // CharMovement (Character +0x640) +0x24
+    signed char facPlayer;   // Character +0x10 faction +0x250 non-null
+    int thrN, thr210, thr214;
+    signed char thr218;      // the threat list (AI +0x300 -> +8): +0x200 count, +0x210, +0x214, +0x218
+    signed char ap68;        // AI +0x170's ActivePlatoon (+0x658) +0x68 non-null; -2 no ActivePlatoon
+    int lists[5];            // AI +0x20 orders: the five goal-list counts (+0xA8 + 0x18k)
+    int curType;             // the current goal's task data (orders +0x1C0) +0x44
+    const void* curTd;       // that task data's address (a change = the current goal was replaced)
+};
+static bool P323HitPtr(const void* p) { const uintptr_t u = (uintptr_t)p; return u >= 0x10000 && u < 0x00007FFFFFFF0000ull && (u & 7) == 0; }
+static void P323HitRead(const void* v, const void* a, P323HitSnap* s, int withType)
+{
+    s->rd = -1; s->f130 = -1; s->atkType = -1; s->getUp = -1; s->moving = -1; s->facPlayer = -1;
+    s->thrN = -1; s->thr210 = -1; s->thr214 = -1; s->thr218 = -1; s->ap68 = -1; s->curType = -1; s->curTd = 0;
+    for (int k = 0; k < 5; ++k) s->lists[k] = -1;
+    if (!P323HitPtr(v)) return;
+    __try
+    {
+        const char* c = (const char*)v;
+        const char* body = *(const char* const*)(c + 0x648);
+        if (P323HitPtr(body)) { const char* cc = *(const char* const*)(body + 8); if (P323HitPtr(cc)) s->f130 = (*(const unsigned char*)(cc + 0x130) != 0) ? 1 : 0; }
+        if (withType != 0 && P323HitPtr(a) && P323HitPtr(*(const void* const*)a))
+        {
+            typedef int (*P323TypeFn)(const void*);
+            const P323TypeFn tf = *(const P323TypeFn*)(*(const char* const*)a + 0x20);
+            s->atkType = tf(a);
+        }
+        s->getUp = (*(const unsigned char*)(c + 0x278) != 0) ? 1 : 0;
+        const char* mv = *(const char* const*)(c + 0x640);
+        if (P323HitPtr(mv)) s->moving = (*(const unsigned char*)(mv + 0x24) != 0) ? 1 : 0;
+        const char* fac = *(const char* const*)(c + 0x10);
+        if (P323HitPtr(fac)) s->facPlayer = (*(const void* const*)(fac + 0x250) != 0) ? 1 : 0;
+        const char* ai = *(const char* const*)(c + 0x650);
+        if (P323HitPtr(ai))
+        {
+            const char* x = *(const char* const*)(ai + 0x300);
+            if (P323HitPtr(x))
+            {
+                const char* thr = *(const char* const*)(x + 8);
+                if (P323HitPtr(thr))
+                {
+                    s->thrN = (int)*(const unsigned int*)(thr + 0x200); s->thr210 = *(const int*)(thr + 0x210);
+                    s->thr214 = *(const int*)(thr + 0x214); s->thr218 = (*(const unsigned char*)(thr + 0x218) != 0) ? 1 : 0;
+                }
+            }
+            const char* own = *(const char* const*)(ai + 0x170);
+            if (P323HitPtr(own))
+            {
+                const char* ap = *(const char* const*)(own + 0x658);
+                s->ap68 = P323HitPtr(ap) ? ((*(const void* const*)(ap + 0x68) != 0) ? 1 : 0) : -2;
+            }
+            const char* orders = *(const char* const*)(ai + 0x20);
+            if (P323HitPtr(orders))
+            {
+                for (int k = 0; k < 5; ++k) s->lists[k] = *(const int*)(orders + 0xA8 + 0x18 * k);
+                const char* td = *(const char* const*)(orders + 0x1C0);
+                s->curTd = td;
+                if (P323HitPtr(td)) s->curType = *(const int*)(td + 0x44);
+            }
+        }
+        s->rd = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { s->rd = 0; }
+}
+/* MAIN THREAD (the HIT drain): the entry's two snapshots for the P323Blow call that follows on the same line; P323Blow takes and clears them */
+const P323HitSnap* g_p323SnapB = 0;
+const P323HitSnap* g_p323SnapA = 0;
+void P323BlowSnap(const P323HitSnap* b, const P323HitSnap* a) { g_p323SnapB = b; g_p323SnapA = a; }
+// PROBE-END: P323
 struct PendingHit
 {
     unsigned int uid;
@@ -257,6 +341,9 @@ struct PendingHit
     char         blowMove[fightlog::kNameBuf];
     char         blowBlock[fightlog::kNameBuf];
     char         blowStumble[fightlog::kNameBuf];
+    // PROBE-START: P323 - T2669: the victim's 0x999030 fields just before / just after the original hit (P323HitRead)
+    P323HitSnap  p323Before, p323After;
+    // PROBE-END: P323
 #ifdef SW_DEV_BUILD
     // PROBE-START: P181 - what the engine's hit returned (2 landed, 5 blocked), for the hit line
     int p181Result;
@@ -1102,6 +1189,7 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
                 && IsUidPlayerCharAnyThread(uid) == 1 && IsUidPlayerCharAnyThread(slot.attackerUid) == 1)
                 FightHitBefore(&fight, self, uid, attacker, slot.attackerUid, fightlog::kSideDecide);
             BlowNoteBefore(&slot, self, attacker);   /* the decided blow, for the HIT */
+            P323HitRead(self, attacker, &slot.p323Before, 1);   // PROBE P323
             FpDecide dec;   /* the stumble the engine picks in this hit */
             FpDecideArm(&dec, self);
             const int arm = KnockArmClaim(self);   // K2: applyDamage marks it on this thread
@@ -1109,6 +1197,7 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
             FpDecideDisarm(&dec);
             slot.knock = KnockArmRelease(arm);
             BlowNoteAfter(&slot, &dec, result);
+            P323HitRead(self, 0, &slot.p323After, 0);   // PROBE P323
             FightHitAfter(&fight, &dec, result);
             ReadyNotePush(attacker, slot.attackerUid, uid, comboId, 0);   /* T-890: our character's real hit on our own character */
 #ifdef SW_DEV_BUILD
@@ -5700,6 +5789,7 @@ void CombatTick()
         P181CopyHit(h.uid, h.attackerUid, h.p181Result, h.knock);
         // PROBE-END: P181
 #endif
+        P323BlowSnap(&h.p323Before, &h.p323After); P323Blow(h.uid, h.attackerUid, h.blowResult);   // PROBE P323
 
         // P012 (F113): log the first few emissions in full so `emitted` can be ATTRIBUTED
         // rather than believed. Bounded, because an ambient world produces these steadily
@@ -5752,6 +5842,7 @@ void CombatTick()
         if (sent && h.knock) ++g_knockSent;   // K2
         InterlockedExchange(&g_hitRead, g_hitRead + 1);
     }
+    P323BlowTick();   // PROBE P323
     PlayerCharTableTick();   /* the player-character table the AI worker's melee hit reads (spawn.cpp), every 0.5 s */
     MeleeDecidedDrain();     /* our landed blows on another game's NPC copies -> MSG_MELEE_DECIDED */
     StanceChangeDrain();     /* T-1101 step 4: a stance button changed on our own player character -> one STATE at once */
@@ -9736,6 +9827,141 @@ void CountSwingGate(int gate)
 
 } // namespace
 
+// PROBE-START: P323 - T-1416 (F1520 (b) (c) (d)): one line per blow on a character THIS game runs - a test squad member, or an NPC
+// struck by a player character - with what the engine decided (h.blowResult: the melee hit 0x439150 asks CombatClass_blockCheck
+// 0x665510 at decomp_439150:60 - 5 blocked (:62), 0 dodged (:103), any other answer landed, the hit returning 2), the victim's goal
+// types, current goal, combat mode and target, whether it counts the attacker an enemy (AI::treatsAsEnemy 0x5993A0, replicate.cpp
+// P323TreatsAsEnemy), its squad plan's package and the squad's live object; then ONE follow-up line for that blow 0.5 s later.
+// LOG ONLY: guarded reads and the engine's own getters (describeCurrentGoal, currentTarget, treatsAsEnemy), no write. MAIN THREAD
+// (CombatTick's HIT drain - the blow was settled on the AI worker a frame or so earlier).
+namespace {
+const long long kP323BlowCap = 400;     // blow + follow-up lines a launch
+const int kP323BlowPerVictim = 8;       // blow lines per victim (each may add its follow-up)
+const int kP323BlowVictims = 128;       // victims tracked; a later new victim is counted only
+const int kP323FollowSlots = 128;   /* T2669: two follow-ups a blow (+0.5 s, +2 s) */
+unsigned int g_p323BvUid[kP323BlowVictims];
+int g_p323BvN[kP323BlowVictims];
+int g_p323BvCount = 0;
+long long g_p323BlowLines = 0, g_p323BlowSkipped = 0;
+struct P323BlowFollow { unsigned int victim; unsigned int attacker; int result; unsigned long long due; long long n; int ms; };   /* T2669: ms = 500 or 2000 */
+P323BlowFollow g_p323Follow[kP323FollowSlots];
+int g_p323FollowCount = 0;
+const char* P323BlowWord(int r) { return r == 2 ? "landed" : r == 5 ? "blocked" : r == 0 ? "dodged" : r == -1 ? "unknown" : "other"; }
+std::string P323BlowState(unsigned int victimUid, unsigned int attackerUid)
+{
+    std::ostringstream ls;
+    ::Character* v = FindSpawned(victimUid);
+    if (v == 0 || !PlausibleObject(v)) { ls << " victim=none"; return ls.str(); }
+    int mode = -1;
+    unsigned int tgt = 0;
+    CombatClass* cc = CombatOf(v);
+    if (cc != 0)
+    {
+        mode = CombatModeOf(cc) ? 1 : 0;
+        if (mode)
+        {
+            hand t = cc->currentTarget();
+            ::Character* tc = t.getCharacter();
+            if (PlausibleObject(tc)) tgt = FindSpawnedUid(tc);
+        }
+    }
+    ::Character* a = (attackerUid != 0) ? FindSpawned(attackerUid) : 0;
+    const int enemy = (a != 0 && PlausibleObject(a)) ? P323TreatsAsEnemy(v, a) : -1;
+    ls << " combat=" << mode << " target=" << tgt << " enemyOfAttacker=" << enemy << " " << BehaviourString(v) << P323StateText(victimUid);
+    return ls.str();
+}
+/* T2669: one P323HitSnap as text */
+std::string P323SnapText(const P323HitSnap& s)
+{
+    std::ostringstream ls;
+    ls << "[rd=" << (int)s.rd << " f130=" << (int)s.f130 << " getUp=" << (int)s.getUp << " moving=" << (int)s.moving << " facPlayer=" << (int)s.facPlayer
+       << " thr=" << s.thrN << "/" << s.thr210 << "/" << s.thr214 << "/" << (int)s.thr218 << " ap68=" << (int)s.ap68 << " lists=";
+    for (int k = 0; k < 5; ++k) ls << (k == 0 ? "" : ",") << s.lists[k];
+    char b[32]; _snprintf(b, 31, "0x%llX", (unsigned long long)(uintptr_t)s.curTd); b[31] = 0;
+    ls << " curType=" << s.curType << " curTd=" << b << "]";
+    return ls.str();
+}
+/* T2669: which road of the hit's 0x999030 call the fields say ran (a word ending '?' rests on a field read after the hit - Inferred) */
+const char* P323HitPath(int result, const P323HitSnap& b, const P323HitSnap& a)
+{
+    if (b.rd != 1) return "unread";
+    if (result != 2) return "no-call:notLanded";
+    if (b.f130 != 0) return "no-call:combat130";
+    if (b.atkType != 1) return "no-call:attackerType";
+    if (a.rd == 1 && a.f130 == 1) return "entered;tail-skipped:inCombat?";
+    if (b.getUp == 1) return "entered;no-interrupt:gettingUp";
+    if (b.moving == 1 && b.facPlayer == 1) return "entered;no-interrupt:movingCountsAsPlayer";
+    if (b.moving == 1) return "entered;interrupt-unless-0x855CF0-rest";
+    return "entered;interrupt";
+}
+std::string P323HitText(int result, const P323HitSnap* b, const P323HitSnap* a)
+{
+    if (b == 0 || a == 0) return " hit=none";
+    std::ostringstream ls;
+    const int thrAdded = (b->rd == 1 && a->rd == 1) ? (a->thrN > b->thrN ? 1 : (a->thr210 > b->thr210 || a->thr214 > b->thr214) ? 2 : 0) : -1;
+    const int taskChanged = (b->rd == 1 && a->rd == 1) ? ((a->curTd != b->curTd || a->curType != b->curType) ? 1 : 0) : -1;
+    ls << " atkType=" << b->atkType << " path=" << P323HitPath(result, *b, *a) << " threatAdded=" << thrAdded << " taskChanged=" << taskChanged
+       << " hitBefore=" << P323SnapText(*b) << " hitAfter=" << P323SnapText(*a);
+    return ls.str();
+}
+}   // namespace (P323 blow)
+
+void P323Blow(unsigned int victimUid, unsigned int attackerUid, int result)
+{
+    const P323HitSnap* hb = g_p323SnapB;   /* T2669: this entry's snapshots (P323BlowSnap), taken and cleared */
+    const P323HitSnap* ha = g_p323SnapA;
+    g_p323SnapB = 0; g_p323SnapA = 0;
+    if (victimUid == 0) return;
+    const bool test = P323IsTestUid(victimUid);
+    if (!test && !(attackerUid != 0 && IsUidPlayerCharAnyThread(victimUid) == 0 && IsUidPlayerCharAnyThread(attackerUid) == 1)) return;
+    int slot = -1;
+    for (int i = 0; i < g_p323BvCount; ++i) if (g_p323BvUid[i] == victimUid) { slot = i; break; }
+    if (slot < 0)
+    {
+        if (g_p323BvCount >= kP323BlowVictims) { ++g_p323BlowSkipped; return; }
+        slot = g_p323BvCount++;
+        g_p323BvUid[slot] = victimUid; g_p323BvN[slot] = 0;
+    }
+    if (g_p323BvN[slot] >= kP323BlowPerVictim || g_p323BlowLines >= kP323BlowCap) { ++g_p323BlowSkipped; return; }
+    ++g_p323BvN[slot];
+    ++g_p323BlowLines;
+    std::ostringstream ls;
+    ls << "[PROBE] P323 blow attacker=" << attackerUid << " victim=" << victimUid << " result=" << result << " " << P323BlowWord(result)
+       << " victimSide=" << (net::IsUidMine(victimUid) ? "own" : "copy") << " k=" << g_p323BvN[slot] << " n=" << g_p323BlowLines
+       << P323BlowState(victimUid, attackerUid) << P323HitText(result, hb, ha) << " skipped=" << g_p323BlowSkipped
+       << (g_p323BvN[slot] == kP323BlowPerVictim ? " (P323 blow cap for this victim reached)" : "")
+       << (g_p323BlowLines == kP323BlowCap ? " (P323 blow line cap reached)" : "");
+    DebugLog(ls.str());
+    for (int w = 0; w < 2 && g_p323FollowCount < kP323FollowSlots; ++w)   /* T2669: +0.5 s and +2 s */
+    {
+        P323BlowFollow& f = g_p323Follow[g_p323FollowCount++];
+        f.victim = victimUid; f.attacker = attackerUid; f.result = result; f.n = g_p323BlowLines; f.ms = (w == 0) ? 500 : 2000;
+        f.due = (unsigned long long)::GetTickCount() + (unsigned long long)f.ms;
+    }
+}
+void P323BlowTick()
+{
+    if (g_p323FollowCount == 0) return;
+    const unsigned long long now = (unsigned long long)::GetTickCount();
+    for (int i = 0; i < g_p323FollowCount; )
+    {
+        if (g_p323Follow[i].due > now) { ++i; continue; }
+        const P323BlowFollow f = g_p323Follow[i];
+        g_p323Follow[i] = g_p323Follow[--g_p323FollowCount];
+        if (g_p323BlowLines >= kP323BlowCap) { ++g_p323BlowSkipped; continue; }
+        ++g_p323BlowLines;
+        std::ostringstream ls;
+        P323HitSnap now;   /* T2669: the same fields as the blow's hitBefore / hitAfter, read now (main thread) */
+        ::Character* fv = FindSpawned(f.victim);
+        P323HitRead((fv != 0 && PlausibleObject(fv)) ? (const void*)fv : 0, 0, &now, 0);
+        ls << "[PROBE] P323 blow" << (f.ms == 500 ? "+0.5s" : "+2s") << " attacker=" << f.attacker << " victim=" << f.victim << " of blow n=" << f.n
+           << " (" << P323BlowWord(f.result) << ") n=" << g_p323BlowLines << P323BlowState(f.victim, f.attacker) << " now=" << P323SnapText(now)
+           << (g_p323BlowLines == kP323BlowCap ? " (P323 blow line cap reached)" : "");
+        DebugLog(ls.str());
+    }
+}
+// PROBE-END: P323
+
 // T-1422 fix 2 - see combat.h. MAIN THREAD (the only writer). A slot is published uid first, then its fight object; it is cleared
 // fight object first, so the worker never matches a slot whose uid is being changed.
 void NativeWindowStopMark(unsigned int uid, void* ch, bool on)
@@ -11225,6 +11451,7 @@ void CombatModeTick()
         // at the wrong one on the peer.
         bool edge = (w->lastOn != on) || (on != 0 && targetUid != w->lastTarget);
         if (!edge) continue;
+        P323CombatEdge(uid, on, w->lastOn, targetUid);   // PROBE P323
 
         if (on == 0 && w->lastOn == 1)
         {

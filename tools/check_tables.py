@@ -13,8 +13,10 @@ d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "..", "src", "coop-
 tables = sorted(f for f in os.listdir(d) if f.endswith(".txt"))
 bad = 0
 names = {}
+optional = {}   # T-1453: {table: {row: 'optional:<feature>'}} - every table must mark the same rows the same way
 for f in tables:
     rows, count = [], None
+    optional[f] = {}
     for line in open(os.path.join(d, f), encoding="utf-8"):
         s = line.strip()
         if not s or s.startswith("#"):
@@ -23,6 +25,8 @@ for f in tables:
             count = int(s.split()[1])
         elif not s.startswith("!"):
             rows.append(s.split()[0])
+            if len(s.split()) > 5:
+                optional[f][s.split()[0]] = s.split()[5]
     names[f] = set(rows)
     if count != len(rows):
         print("TABLE CHECK FAILED: %s declares !count %s but has %d rows" % (f, count, len(rows)))
@@ -32,6 +36,9 @@ for f in tables:
         bad = 1
 ref = tables[0] if tables else None
 for f in tables[1:]:
+    if optional[f] != optional[ref]:
+        print("TABLE CHECK FAILED: %s and %s mark different rows optional (T-1453)" % (ref, f))
+        bad = 1
     only_ref = sorted(names[ref] - names[f])
     only_f = sorted(names[f] - names[ref])
     if only_ref or only_f:

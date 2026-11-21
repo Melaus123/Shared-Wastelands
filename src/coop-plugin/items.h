@@ -117,8 +117,12 @@ struct ItemMoveMsg
     // T-1214 (protocol 203, src/common/spotsync.h): ADD only - the building item spot that holds this item on the area's holder (an
     // 'SPT1' block after GEM1); has 0 = not a spot item, nothing on the wire. The receiver gives the item to its own spot there.
     spotsync::SpotMark spot;
+    // T-1451 design 3 (protocol 242): the writer's SAVE NUMBER of this box move (per box, +1 for each move it sends - ItNetSendMove
+    // stamps it); a 'BSQ1' trailer, last of all, announced by the op byte's bit 6 (shopwin::kMoveSeqFlag). 0 = none.
+    unsigned int boxSeq;
+    unsigned int boxLaunch;   // T-1451 design 3 (review fold): the writer's launch id, beside its number in the 'BSQ1' trailer
     ItemMoveMsg() : uid(0), op(0), x(0), y(0), quantity(0), quality(0.0f), charges(0.0f),
-                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0), made(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); gearLocal = 0; gearLocalUniform = 0; spotsync::SpotMarkClear(&spot); }
+                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0), made(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); gearLocal = 0; gearLocalUniform = 0; spotsync::SpotMarkClear(&spot); boxSeq = 0u; boxLaunch = 0u; }
 };
 
 // E22b / decision 38 part (2). A player touched an inventory this game does NOT own. The local half of the
@@ -398,6 +402,7 @@ std::string GiveCounterOwnerWords(void* piece, const std::string& key);
 bool BuyTestKeeper(const std::string& pick, int sell, int cats, int npc = 0, int stack = 0, int hold = 0);   /* T-608 T1389: npc 1 = the NPC purchase path (stack 1 = one unit of a stack); T-164 B4-1: cats = the purse set first (-1 = not asked) */   // T-164 B4-0: TEST LEVER - `buytest keeper <n|ghost|own> [sell]`: BuyTest aimed at a keeperlist keeper, buyer walked to it first; ghost = home area held by the other game ([BUYTEST] keeper line)   /* T-1120: hold = seconds the window is kept open with nothing bought (0 = the buy as before) */
 int BuyTestHoldBusy();   /* T-1120 TEST LEVER: 1 = a `buytest keeper hold=` window is still held open */
 std::string ShopStaleCommand(int secs);   /* T-1120 TEST LEVER, MAIN THREAD: `shoptest stale <s>` (secs 1-60) | `shoptest stale off` (secs -1) - the holder's pushed shop-counter contents held back here s seconds, then applied in order; one status line */
+std::string ShopWinTest(const std::string& args);   /* T-1451 TEST LEVER, MAIN THREAD: `shoptest win <buy|sell> [sid=<text>] [qual=<1-100>] [stack]` - one trade in the window `buytest keeper ... hold=<s>` holds open; one status line */
 bool BuyTestChar(unsigned int uid, const std::string& nameText, int sell, int cats);   /* TEST LEVER: `buytest char <uid|name=<text>> sell [cats=<n>]` - sell one item to that character, no home or pack test ([STORE] buytest char line) */
 
 // P7i (T232 section 2/section 3) READ-ONLY LEVERS, MAIN THREAD, command channel only. T232's `boxtest rebirth ...` and
@@ -672,6 +677,9 @@ void ItemGearOf(void* item, gearwire::GearMarks* out);   /* MAIN THREAD: a gear 
 int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string& sid);   /* MAIN THREAD: onto a fresh item, gear items only; 1 written */
 void ItemColourKitSay(void* item, const std::string* colorSid, void* holder);   /* T-1413, MAIN THREAD, LOG ONLY: right after ItemColourApplyTo (colorSid 0 = the kit row carried no details) - the capped [COLOUR] line when holder is another player's character */
 int ItemColourApplyTo(void* item, const std::string& colorSid, void* holder);   /* T-1119, MAIN THREAD: onto a fresh kit item, the sent colour (coopgarment::kColour*); holder: the kit's character (T-1382: named on the failure line) */
+void ItemLookInstall();   /* T-1449: once at plugin start - the [ITEMLOOK] watch (the look-maker setupItemMaterial and Ogre's Material::clone, both read-only) */
+void ItemLookTick();      /* T-1449, MAIN THREAD, every pump: the queued [ITEMLOOK] findings and the due follow-ups */
+void ItemLookNoteRedress(void* character);   /* T-1449, MAIN THREAD: a copy's outfit was just redressed - its items are judged ~2 s on */
 void ItemGearNoteSent(int blocks, unsigned int dropped);   /* session.cpp: GEM1 blocks written, fields that went empty */
 void ItemGearNoteBadRecv();   /* session.cpp: a RECEIVED GEM1 block that was malformed */
 void ItemBagNestNoteBadRecv();   /* session.cpp / clothing.cpp: a RECEIVED pack-row BAGN tail that was malformed */
@@ -770,6 +778,11 @@ int  WallWriterDecide(void* b, FarmWriterView* out);
 /* T-853 #5 / #11, MAIN THREAD: ProdStepWriterHere's three-way answer asked fresh (not the 250 ms memo) with the slot of the game a
    kProdWriterOther names (*slot, -1 not known now) - the same ask gives both. */
 int  ProdWriterDecide(void* pb, int* slot);
+/* T-1455 diagnostics, MAIN THREAD: the inputs of ProdWriterDecide's verdict read quietly (no counter booked, nothing changed) - the
+   owner class (src/common/boxowner.h kOwn*) and slot, the owner's bit on the fresh loaded-area map for the piece's sector (*mapLoaded
+   1 has the area, 0 a fresh map without it, -1 no fresh map / no owner slot), the owner rung's reason (coopown::kWhy*; -1 a
+   single-player game) and the slot the area map names the sector's holder (*holderSlot, -1 none named / no fresh map). 0 = unread */
+int  ProdWriterWhy(void* pb, int* cls, int* ownerSlot, int* mapLoaded, int* why, int* holderSlot);
 /* MAIN THREAD: who runs the steps of this production building (a mining node, a machine) - the production gate's writer (the
    owner's game while it is online and holds the area, else the area holder), kept per building key for 250 ms:
    coopfarm::kProdWriterHere 1 this game, kProdWriterOther 2 another game, kProdWriterNone 0 no answer yet. */

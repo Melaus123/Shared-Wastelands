@@ -116,8 +116,22 @@ struct Row
     int         played;       /* T-201 PP6' (owner 175): 1 = a FINISHED save of this profile reached the world (PROFILES kind 4 SAVED or
                                  the operator's WORLD_SAVED). The never-played verdict; being admitted (slot, lastPlayed) is not playing. */
     std::string name, faction;
-    Row() : num(0), slot(-1), created(0), lastPlayed(0), active(1), played(0) {}
+    std::string imports;      /* T-1452 (design B): the single-player save folder this never-played profile's first start imports ("" = none). Kept by
+                                 the world server from the NEW with import (or an attach) until the profile is played (its first finished save -
+                                 the import's own save) or deleted; written as field 11 'imports:<folder>' only while set; sent with every row. */
+    unsigned    creatorAsk;   /* T-1452 fold (review S1): WIRE ONLY, never in profiles.txt - on the row of the world's creator claim (worldhist.h Claim:
+                                 its never-played profile whose import is pending), the parts the claim asked for and has not taken yet
+                                 (kAskDead 1 / kAskRelations 2); 0 on every other row. CreatorAskForRow. */
+    Row() : num(0), slot(-1), created(0), lastPlayed(0), active(1), played(0), creatorAsk(0) {}
 };
+/* T-1452: an 'imports' value - a save folder name as spimport::FolderNameOk takes it (1..200 bytes, no control byte, no back slash, slash or colon). */
+const size_t kImportsMax = 200;
+inline bool ImportsFolderOk(const std::string& f)
+{
+    if (f.empty() || f == "." || f == ".." || f.size() > kImportsMax) return false;
+    for (size_t i = 0; i < f.size(); ++i) { const char c = f[i]; if (c == '\\' || c == '/' || c == ':' || (unsigned char)c < 32) return false; }
+    return true;
+}
 
 /* A ROW'S FACTION FIELD. A faction name is whatever the player typed on Kenshi's FACTION tab (any bytes, 1..24 of them, no space at
    either end once trimmed - FactionForRow). The field keeps a name that passes the display-name rule as it is (every row written
@@ -170,7 +184,8 @@ inline std::string RowFormat(const Row& r)
 {
     return "prof1\t" + r.person + "\t" + PNum((long long)r.num) + "\t" + PNum((long long)r.slot) + "\t" + PNum(r.created)
          + "\t" + PNum(r.lastPlayed) + "\t" + (r.active ? "active" : "deleted") + "\t" + r.name + "\t" + FactionFieldFormat(r.faction)
-         + (r.played ? "\tplayed" : "\tunplayed");   /* T-201 PP6' (owner 175): field 10 */
+         + (r.played ? "\tplayed" : "\tunplayed")   /* T-201 PP6' (owner 175): field 10 */
+         + (r.imports.empty() ? std::string() : "\timports:" + r.imports);   /* T-1452: field 11, only while an import is pending */
 }
 inline int RowParse(const std::string& line, Row* out)
 {
@@ -183,14 +198,16 @@ inline int RowParse(const std::string& line, Row* out)
         if (t == std::string::npos) break;
         at = t + 1;
     }
-    if ((f.size() != 9 && f.size() != 10) || f[0] != "prof1") return 0;
+    if ((f.size() != 9 && f.size() != 10 && f.size() != 11) || f[0] != "prof1") return 0;   /* T-1452: field 11 'imports:<folder>' */
     std::string& tail = f[f.size() - 1];
     if (!tail.empty() && tail[tail.size() - 1] == '\r') tail.erase(tail.size() - 1);
     std::string& fac = f[8];
     /* T-201 PP6' (owner 175): field 10 is played|unplayed. A 9-field line (written before it) is played once it was admitted (its
        slot bound) - the rule the build that wrote it used. */
     int played = -1;
-    if (f.size() == 10) { if (f[9] == "played") played = 1; else if (f[9] == "unplayed") played = 0; else return 0; }
+    if (f.size() >= 10) { if (f[9] == "played") played = 1; else if (f[9] == "unplayed") played = 0; else return 0; }
+    std::string imports;
+    if (f.size() == 11) { if (f[10].compare(0, 8, "imports:") != 0) return 0; imports = f[10].substr(8); if (!ImportsFolderOk(imports)) return 0; }
     if (!coopstore::PlayerIdOk(f[1])) return 0;
     const int n = std::atoi(f[2].c_str());
     if (n < 1 || n > (int)kNumMax) return 0;
@@ -204,6 +221,7 @@ inline int RowParse(const std::string& line, Row* out)
     r.created = (long long)std::atof(f[4].c_str()); r.lastPlayed = (long long)std::atof(f[5].c_str());
     r.active = f[6] == "active" ? 1 : 0; r.name = f[7]; r.faction = facName;
     r.played = played >= 0 ? played : (s >= 0 ? 1 : 0);
+    r.imports = imports;
     *out = r;
     return 1;
 }
@@ -301,6 +319,78 @@ inline int NewDecide(const std::vector<Row>& rows, const std::string& person, co
     *numOut = n;
     return kOk;
 }
+/* T-1452 (design B): NEW PROFILE + IMPORT with a name already in use. The player's OWN never-played active profile under that name (and
+   under the number asked, when one is asked) takes the import - ATTACH: the row index, no new row; any other holder (another person, or
+   a played profile) -> -1, and NewDecide refuses it nameTaken as before. Pure. */
+inline int ImportAttachRow(const std::vector<Row>& rows, const std::string& person, const std::string& name, unsigned wantNum)
+{
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].active && NameSame(rows[i].name, name))
+            return (rows[i].person == person && !rows[i].played && (wantNum == 0 || wantNum == rows[i].num)) ? (int)i : -1;
+    return -1;
+}
+/* NEW with import: kOk with *attachRow >= 0 = attach to that row (*numOut its number); kOk with *attachRow -1 = a new row (NewDecide);
+   else NewDecide's refusal. The name rule (DisplayNameOk) is asked first, as NewDecide asks it. Pure. */
+inline int NewImportDecide(const std::vector<Row>& rows, const std::string& person, const std::string& name, unsigned cap,
+                           unsigned wantNum, unsigned* numOut, int* attachRow)
+{
+    *attachRow = -1;
+    if (!coopworld::DisplayNameOk(name, 0)) return kRefusedName;
+    const int a = ImportAttachRow(rows, person, name, wantNum);
+    if (a >= 0) { *attachRow = a; *numOut = rows[(size_t)a].num; return kOk; }
+    return NewDecide(rows, person, name, cap, wantNum, numOut);
+}
+/* T-1452 fold (review S1): the world's creator claim's choice rides its own row - the claim's asked parts not taken yet, on the holder's
+   active, never-played row with an import pending; 0 for any other row. So a creator whose game left (or restarted) before its import
+   still imports the history it asked for. Pure. */
+inline unsigned CreatorAskForRow(bool held, const std::string& claimPerson, unsigned claimNum, unsigned ask, unsigned done, const Row& r)
+{
+    if (!held || r.person != claimPerson || r.num != claimNum || !r.active || r.played || r.imports.empty()) return 0u;
+    return ask & ~done & 3u;
+}
+/* T-1452 fold (review S3): AT THE WELCOME OF A PICK - does this game take the import from the world server's row? kRowImpLocal: this
+   game's own answered request is for the pick (used as before); kRowImpNone: no pick, no row for it, or no import on it; kRowImpPlayed:
+   the profile is played (by the row, or the pick's never-played mark is off) - its own save loads; kRowImpReset: a world reset's carry
+   is already chosen for this pick; kRowImpBadName: the row names no save folder; kRowImpTake: take it (*rowAt = the row). Pure. */
+enum RowImportVerdict { kRowImpLocal = 0, kRowImpNone = 1, kRowImpPlayed = 2, kRowImpReset = 3, kRowImpBadName = 4, kRowImpTake = 5 };
+inline int ImportFromRowDecide(unsigned pickedNum, const std::vector<Row>& rows, bool localForPick, bool resetChosen, bool neverPlayed, int* rowAt)
+{
+    *rowAt = -1;
+    if (pickedNum == 0) return kRowImpNone;
+    int at = -1;
+    for (size_t i = 0; i < rows.size(); ++i) if (rows[i].num == pickedNum && rows[i].active) at = (int)i;
+    *rowAt = at;   /* T-1452 fold 2: the local road reads the row too (its creator parts - LocalCreatorAsk) */
+    if (localForPick) return kRowImpLocal;
+    if (at < 0 || rows[(size_t)at].imports.empty()) { *rowAt = -1; return kRowImpNone; }
+    if (rows[(size_t)at].played || !neverPlayed) return kRowImpPlayed;
+    if (resetChosen) return kRowImpReset;
+    if (!ImportsFolderOk(rows[(size_t)at].imports)) return kRowImpBadName;
+    return kRowImpTake;
+}
+/* T-1452 fold 2 (re-check SHOULD): this game's own request for the pick (kRowImpLocal) takes the creator claim's parts from the picked
+   row when the row carries them - an attach answer never carries the creator mark (the world is no longer open), so the creator's
+   history choice comes from the row; a row with none leaves the request's own. Pure. */
+inline unsigned LocalCreatorAsk(unsigned localAsk, unsigned rowCreatorAsk) { return rowCreatorAsk != 0u ? (rowCreatorAsk & 3u) : localAsk; }
+inline const char* RowImportVerdictName(int v)
+{
+    switch (v)
+    {
+    case kRowImpLocal: return "this game's own request"; case kRowImpNone: return "none"; case kRowImpPlayed: return "played - its own save loads";
+    case kRowImpReset: return "a world reset's carry is chosen"; case kRowImpBadName: return "not a save folder name"; case kRowImpTake: return "taken";
+    default: return "other";
+    }
+}
+/* T-1452: the pending import's lifecycle on the world server - why a row's 'imports' ends. */
+enum ImportsEnd { kImportsKeep = 0, kImportsPlayed = 1, kImportsDeleted = 2 };
+inline const char* ImportsEndName(int e) { return e == kImportsPlayed ? "played (its first finished save - the import's own save - reached the world)" : e == kImportsDeleted ? "deleted" : "kept"; }
+/* Ends a row's pending import for that reason; true = there was one (the caller writes profiles.txt and logs it). Pure. */
+inline bool ImportsClear(Row* r, int why, std::string* was)
+{
+    if (why == kImportsKeep || r->imports.empty()) return false;
+    if (was != 0) *was = r->imports;
+    r->imports.clear();
+    return true;
+}
 inline int PickDecide(const std::vector<Row>& rows, const std::string& person, unsigned num)
 {
     const int i = FindRow(rows, person, num);
@@ -318,26 +408,32 @@ inline int DeleteDecide(const std::vector<Row>& rows, const std::string& person,
 inline int DeleteApply(std::vector<Row>* rows, const std::string& person, unsigned num, int playingNow)
 {
     const int v = DeleteDecide(*rows, person, num, playingNow);
-    if (v == kOk) (*rows)[(size_t)FindRow(*rows, person, num)].active = 0;
+    if (v == kOk) { Row& r = (*rows)[(size_t)FindRow(*rows, person, num)]; r.active = 0; ImportsClear(&r, kImportsDeleted, 0); }   /* T-1452: a deleted profile imports nothing */
     return v;
 }
 /* T-1280 fold 1 (M4): profiles.txt read at last after another program held it (fileRows), with the rows made in memory meanwhile
-   (memRows). A memory row joins when the file has no row of that person and number and no active row under its name (the world's
+   (memRows). T-1452 fold: a memory row of the same profile as the file's brings its played mark and its pending import. A memory row joins when the file has no row of that person and number and no active row under its name (the world's
    name rule, PlayerNameTaken); a memory row equal to the file's row of that person and number is already there. Any other is a CLASH - one number or one
    name given twice - counted and left out of *out (the caller then keeps memory as it was, read-only, as before). *added = rows
    joined. Returns the clashes. Pure. */
-inline int RowsMergeHeld(const std::vector<Row>& fileRows, const std::vector<Row>& memRows, std::vector<Row>* out, int* added)
+inline int RowsMergeHeld(const std::vector<Row>& fileRows, const std::vector<Row>& memRows, std::vector<Row>* out, int* added, int* changed = 0)
 {
     *out = fileRows;
-    int clash = 0, joined = 0;
+    int clash = 0, joined = 0, moved = 0;   /* T-1452 fold 2: moved = file rows whose played mark or pending import memory changed */
     for (size_t i = 0; i < memRows.size(); ++i)
     {
         const Row& m = memRows[i];
         const int f = FindRow(*out, m.person, m.num);
         if (f >= 0)
         {
-            const Row& r = (*out)[(size_t)f];
-            if (!(r.slot == m.slot && r.created == m.created && r.active == m.active && r.name == m.name && r.faction == m.faction)) ++clash;
+            Row& r = (*out)[(size_t)f];
+            if (!(r.slot == m.slot && r.created == m.created && r.active == m.active && r.name == m.name && r.faction == m.faction)) { ++clash; continue; }
+            /* T-1452 fold (review S2): the same profile - what memory changed while the file was held is kept: the played mark (it only
+               ever goes on) and the pending import (cleared by a played mark, or set by an attach) */
+            const int playedWas = r.played; const std::string importsWas = r.imports;
+            if (m.played) { r.played = 1; r.imports.clear(); }
+            else if (!m.imports.empty()) r.imports = m.imports;
+            if (r.played != playedWas || r.imports != importsWas) ++moved;
             continue;
         }
         if (m.active && PlayerNameTaken(*out, m.name)) { ++clash; continue; }   /* the world's name rule (NewDecide's) */
@@ -345,6 +441,7 @@ inline int RowsMergeHeld(const std::vector<Row>& fileRows, const std::vector<Row
         ++joined;
     }
     if (added != 0) *added = joined;
+    if (changed != 0) *changed = moved;
     return clash;
 }
 /* profiles.txt, line by line, as the notebook reads it (LoadProfiles) and writes it (WriteProfiles): an unreadable line, or a second
@@ -376,7 +473,7 @@ inline std::string RowsFormatFile(const std::vector<Row>& rows)
     for (size_t i = 0; i < rows.size(); ++i) body += RowFormat(rows[i]) + "\n";
     return body;
 }
-/* T-222 (downgrade hazard): a prof1 line with MORE fields than this build knows (10) was written by a newer build. RowParse drops it,
+/* T-222 (downgrade hazard): a prof1 line with MORE fields than this build knows (11 since T-1452) was written by a newer build. RowParse drops it,
    so writing the list back would erase that profile: a file holding one is READ-ONLY to this build (the notebook's WriteProfiles and the
    host's CHANGE DELETE both refuse to rewrite it). */
 inline bool RowLineNewer(const std::string& line)
@@ -384,7 +481,7 @@ inline bool RowLineNewer(const std::string& line)
     if (line.compare(0, 6, "prof1\t") != 0) return false;
     size_t tabs = 0;
     for (size_t i = 0; i < line.size(); ++i) if (line[i] == '\t') ++tabs;
-    return tabs + 1 > 10;
+    return tabs + 1 > 11;   /* T-1452: 11 fields (the pending import) */
 }
 inline int RowsNewerLines(const std::string& text)
 {
@@ -828,6 +925,22 @@ inline std::vector<Row> ActiveRowsOfFile(const std::string& fileText)
     }
     return out;
 }
+/* T-1452 (host's CHANGE, the world not running): NEW + IMPORT's name check against that world's profiles.txt is the world server's own
+   decision, NewImportDecide - one road whatever the player count: the host's OWN never-played active profile under that name is an
+   ATTACH (kOk, *attachRow >= 0), any other active holder nameTaken as before. The cap is not asked here (NEW PROFILE is greyed at it,
+   and the world server asks it at the HOST press, where the profile is made or the import attached). Pure. */
+inline int HostChangeNewImportDecide(const std::vector<Row>& fileRows, const std::string& person, const std::string& name, int* attachRow)
+{
+    unsigned num = 0;
+    return NewImportDecide(fileRows, person, name, 0xFFFFFFFFu, 0u, &num, attachRow);
+}
+/* T-1452: AT THE HOST PRESS after CHANGE's NEW + IMPORT - true = ask the world server for NEW with import (kind 7) under c.name: the
+   new name, or (an attach) the name of one of mine the press found (HostProfileChoose matched chosenNew to it). The world server
+   decides (import permission first, then NewImportDecide) and keeps the import on the row (field 11). Pure. */
+inline bool HostPressAsksImport(const HostProfileChoice& c, const std::string& chosenNew, const std::string& importFolder)
+{
+    return !importFolder.empty() && !chosenNew.empty() && NameSame(c.name, chosenNew);
+}
 /* THE ONE-TIME RENAME (owner 168). None = the folder already has the rule's name (any case, or a " <n>" form the rule made);
    Do = rename it to target; KeepTaken = target is already another entry - the old name stays. */
 enum RenameVerdict { kRenameNone = 0, kRenameDo = 1, kRenameKeepTaken = 2 };
@@ -1109,12 +1222,22 @@ inline bool WGetStr(const std::vector<char>& b, size_t* at, std::string* s)
 
 /* T-1383 (store protocol 159): kind 7 may end with a u32 - the parts the world's creator asks for (worldhist.h kAskDead 1 /
    kAskRelations 2; sent only when not 0, and only on kind 7). */
-inline void EncodeRequest(std::vector<char>* b, int kind, unsigned num, const std::string& name, unsigned ask = 0)
+/* T-1452 (world-server protocol 173): kind 7 ends with {u32 ask, str folder} - the single-player save folder the world server keeps on the
+   profile (Row::imports); sent whenever the folder is given. */
+inline void WPutLong(std::vector<char>* b, const std::string& s, size_t max) { WPutStr(b, s.size() > max ? s.substr(0, max) : s); }
+inline bool WGetLong(const std::vector<char>& b, size_t* at, std::string* s, size_t max)
+{
+    unsigned n = 0;
+    if (!WGetU32(b, at, &n) || n > max || b.size() < *at + n) return false;
+    s->assign(b.begin() + (long)*at, b.begin() + (long)(*at + n)); *at += n; return true;
+}
+inline void EncodeRequest(std::vector<char>* b, int kind, unsigned num, const std::string& name, unsigned ask = 0, const std::string& folder = std::string())
 {
     b->push_back((char)(unsigned char)kind); WPutU32(b, num); WPutStr(b, name.size() > kWireStrMax ? name.substr(0, kWireStrMax) : name);
-    if (kind == kReqNewImport && ask != 0) WPutU32(b, ask);
+    if (kind == kReqNewImport && (ask != 0 || !folder.empty())) WPutU32(b, ask);
+    if (kind == kReqNewImport && !folder.empty()) WPutLong(b, folder, kImportsMax);   /* T-1452 */
 }
-inline bool DecodeRequest(const std::vector<char>& b, int* kind, unsigned* num, std::string* name, unsigned* ask = 0)
+inline bool DecodeRequest(const std::vector<char>& b, int* kind, unsigned* num, std::string* name, unsigned* ask = 0, std::string* folder = 0)
 {
     if (b.empty()) return false;
     size_t at = 1;
@@ -1123,8 +1246,11 @@ inline bool DecodeRequest(const std::vector<char>& b, int* kind, unsigned* num, 
     if (!WGetU32(b, &at, num) || !WGetStr(b, &at, name)) return false;
     unsigned a = 0;
     if (at != b.size() && (k != kReqNewImport || !WGetU32(b, &at, &a) || a > 3u)) return false;   /* T-1383: the creator's ask, kind 7 only */
+    std::string fo;
+    if (at != b.size() && (!WGetLong(b, &at, &fo, kImportsMax) || !ImportsFolderOk(fo))) return false;   /* T-1452: the import's folder, kind 7 only */
     if (at != b.size()) return false;
     if (ask != 0) *ask = a;
+    if (folder != 0) *folder = fo;
     *kind = k; return true;
 }
 
@@ -1150,6 +1276,8 @@ inline void EncodeAnswer(std::vector<char>* b, const Answer& a)
         const Row& r = a.rows[i];
         WPutU32(b, r.num); WPutU32(b, (unsigned)r.slot); WPutU32(b, (unsigned)r.created); WPutU32(b, (unsigned)r.lastPlayed); WPutU32(b, r.played ? 1u : 0u);
         WPutStr(b, r.name); WPutStr(b, r.faction);
+        WPutLong(b, r.imports, kImportsMax);   /* T-1452 (protocol 173): the pending import ("" = none) */
+        WPutU32(b, r.creatorAsk & 3u);          /* T-1452 fold (review S1): the creator claim's parts not taken yet, its own row only */
     }
     if (a.hasWorld) { WPutStr(b, a.world.substr(0, kWireStrMax)); WPutStr(b, a.worldId.substr(0, kWireStrMax)); WPutU32(b, a.worldIdUpgraded ? 1u : 0u); }   /* T-490 */
     if (a.hasWorld && a.importWord != 0) WPutU32(b, a.importWord);   /* T-1096 */
@@ -1166,7 +1294,9 @@ inline bool DecodeAnswer(const std::vector<char>& b, Answer* a)
     {
         Row r; unsigned s = 0, c = 0, l = 0, pl = 0;
         if (!WGetU32(b, &at, &r.num) || !WGetU32(b, &at, &s) || !WGetU32(b, &at, &c) || !WGetU32(b, &at, &l) || !WGetU32(b, &at, &pl)
-            || !WGetStr(b, &at, &r.name) || !WGetStr(b, &at, &r.faction)) return false;
+            || !WGetStr(b, &at, &r.name) || !WGetStr(b, &at, &r.faction) || !WGetLong(b, &at, &r.imports, kImportsMax)) return false;   /* T-1452 */
+        if (!r.imports.empty() && !ImportsFolderOk(r.imports)) return false;
+        if (!WGetU32(b, &at, &r.creatorAsk) || r.creatorAsk > 3u) return false;   /* T-1452 fold (review S1) */
         r.slot = (int)s; r.created = (long long)c; r.lastPlayed = (long long)l; r.active = 1; r.played = pl != 0 ? 1 : 0;
         o.rows.push_back(r);
     }

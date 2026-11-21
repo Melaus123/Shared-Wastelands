@@ -155,19 +155,37 @@ inline int ZoneProvisionalBlocks(int fromRecord, int recordHeld, int heldIsNewer
     if (fromRecord != 0) return (recordHeld != 0 && heldIsNewer != 0) ? 1 : 0;
     return (recordHeld != 0) ? 1 : 0;
 }
+/* T-1391 late writer review fold (store.cpp ZoneNoRecordApply / ZoneFromRecordMarkApply): what a load or read does to the area's kept
+   mark. gen: the link generation of the load (< 0: the record list not known); blocks: ZoneProvisionalBlocks (a record held blocks an
+   area-file read, a NEWER record held blocks a load from a record); provGen: the link a not-yet-complete record list belongs to (>= 1).
+   Set: the mark is made (or renewed) with this load's time and no landed time. Erase: the mark goes - a reload with a newer record
+   held leaves no mark, so no adopt. Provisional: the mark goes and the read is remembered for the list's end (its time with it). */
+const int kZmSet = 0;
+const int kZmErase = 1;
+const int kZmProvisional = 2;
+inline int ZoneKeptMarkOnLoad(long gen, int blocks, long provGen)
+{
+    if (gen >= 0 && blocks == 0) return kZmSet;
+    if (gen < 0 && blocks == 0 && provGen >= 1) return kZmProvisional;
+    return kZmErase;
+}
 /* A, THE GAME: may a zone copy that was NOT loaded from the record now held be saved over it? hasMark: the copy carries the
    kept mark (loaded on this link from a record, or with no record once the record list was known); markGen / linkGen: the
    link generation the mark was taken on / the generation now; holderSlot: the
    area's holder on this game's AREAMAP (< 0 unknown, nobody or frozen); mySlot: this game's slot (-1 unknown); recordSlot: the slot
-   that wrote the record now held (-1 unknown); loadedSince: when this game's own bit last appeared in the area's cell of its map
-   (0 = not set now); sinceLimit: the latest loadedSince that still counts as "stayed loaded" (same clock as loadedSince). The
-   conditions are tested in this order and the first that fails is the answer. */
+   that wrote the record now held (-1 unknown); loadedSince: when this game's own load of the copy ran - the kept mark's loadedAt (0 =
+   unknown); sinceLimit: when a newer record by another slot first landed here while the mark stood (0 = none) - the load must be no
+   later (same clock as loadedSince). The conditions are tested in this order and the first that fails is the answer.
+   T-1391 late writer (owner 1821, F1549, design b): loadedSince was the map's 'loaded here since' (MyMapLoadedSinceTS) until 2026-11-20;
+   the world server lists a loading game only after its loading period, so an old holder's unload save landing in that period refused
+   every later save of the new holder (T2667: loaded seq 733 at 251.999 s, seq 768 landed, map mark 267.135 s). A reload erases or
+   renews the mark, so the load time is this copy's; the holder test (this game holds the area now) is unchanged. */
 const int kZaAdopt = 0;           /* every condition holds: the copy is adopted as loaded from the record now held */
 const int kZaNoMark = 1;          /* no kept mark: not loaded on this link from a record, nor with no record once the record list was known */
 const int kZaLinkDropped = 2;     /* the link dropped (a new generation) since the mark */
 const int kZaNotHolder = 3;       /* this game does not hold the area now (or its slot or the holder is unknown) */
 const int kZaOwnRecord = 4;       /* the record now held was written by this game's own slot, or its writer is unknown */
-const int kZaNotLoadedSince = 5;  /* the area is not loaded here on the map, or its bit appeared after sinceLimit (or sinceLimit is 0: no time to judge by) */
+const int kZaNotLoadedSince = 5;  /* no load time, or this game's load of the copy came after the newer record landed (or sinceLimit is 0: no time to judge by) */
 inline int ZoneKeptAdoptJudge(int hasMark, long markGen, long linkGen, int holderSlot, int mySlot, int recordSlot, double loadedSince, double sinceLimit)
 {
     if (hasMark == 0) return kZaNoMark;
@@ -186,7 +204,7 @@ inline const char* ZoneKeptAdoptWhy(int why)
     case kZaLinkDropped: return "the link dropped since it was loaded";
     case kZaNotHolder: return "this game does not hold the area";
     case kZaOwnRecord: return "the record is this game's own (or its writer is unknown)";
-    case kZaNotLoadedSince: return "the area was not loaded here on the map from before the record landed until now";
+    case kZaNotLoadedSince: return "this game's load of the area was not from before the record landed (or no landed time)";
     }
     return "unknown";
 }
@@ -211,15 +229,38 @@ inline int ZoneRecordLandedSets(int hasFromEntry, long long loadedWrittenAt, uns
 }
 
 /* T-1279 (owner decision 1580, 2026-11-09: "a save of your own area that gets refused will be logged as a fault rather than only
-   counted"; owner rule 1556: a game is in charge of an area it has loaded). A zone save this game refused as a stale copy is a FAULT
-   (an error line naming the area and why) when no other game holds the area: this game holds it, or nobody / an unknown game does -
-   the area is loaded here, so it is this game's own. Refused while another game holds the area is the holder rule working (a debug
-   line, as before). holderSlot: the area's holder on this game's AREAMAP (< 0 unknown, nobody or frozen); mySlot: this game's slot
-   (-1 unknown). 1 = a fault. The counter (zoneStaleCopyRefused) counts both, as before. */
+   counted"; owner rule 1556: a game is in charge of an area it has loaded). Does NO OTHER game hold the area a zone save was refused
+   for: this game holds it, or nobody / an unknown game does? Refused while another game holds the area is the holder rule working (a
+   debug line, as before). holderSlot: the area's holder on this game's AREAMAP (< 0 unknown, nobody or frozen); mySlot: this game's
+   slot (-1 unknown). 1 = no other game holds it. The counter (zoneStaleCopyRefused) counts both, as before.
+   T-1391 (F1577, 2026-11-20): this alone no longer makes a FAULT - ZoneRefusedSaveLabel below decides from the comparison too
+   (T2677: B threw away its own OLD copies after the holder left; all 9 'FAULT' lines compared 'No difference in the kinds compared'). */
 inline int ZoneRefusedSaveIsFault(int holderSlot, int mySlot)
 {
     if (holderSlot < 0) return 1;
     return (mySlot >= 0 && holderSlot == mySlot) ? 1 : 0;
+}
+/* T-1391 (F1577 / F1578): the outcome of comparing a zone copy with a record's copy (zonediff.h CompareLine) */
+const int kZcSame = 0;      /* no difference in the kinds compared */
+const int kZcDiffers = 1;   /* a compared kind differs */
+const int kZcUnread = 2;    /* a copy could not be read (or compared): not known */
+/* T-1391 (F1577): THE LABEL of a refused zone save, from the real fact. compared: the outcome of comparing the refused copy with the
+   record it was refused for (kZc*). A FAULT only when the comparison found a difference in a compared kind and no other game holds
+   the area now; with no difference nothing was lost (a plain line, counted apart); a copy that could not be read is said as not known
+   (an error line of its own - a loss is not ruled out). Another game holding the area is the holder rule, whatever the comparison.
+   T-1391 (F1611, 2026-11-20): `compared` is now the outcome of THIS game's own work since its loaded copy (zonediff.h OwnWorkOf, via
+   store.cpp ZoneOwnWorkSay): kZcDiffers = the refused copy has things added or changed since this game's loaded copy, kZcSame = none,
+   kZcUnread = not known - no longer the comparison with the newest record (T2689: its extra things and engine noise read as a loss). */
+const int kZrlHolderRule = 0;   /* another game holds the area: a debug line, as before */
+const int kZrlFault = 1;        /* no other game holds it and a compared kind differs: the FAULT line */
+const int kZrlNothingLost = 2;  /* no other game holds it and no difference in the kinds compared: nothing was lost */
+const int kZrlUncompared = 3;   /* no other game holds it and a copy could not be read: whether anything was lost is not known */
+inline int ZoneRefusedSaveLabel(int holderSlot, int mySlot, int compared)
+{
+    if (ZoneRefusedSaveIsFault(holderSlot, mySlot) == 0) return kZrlHolderRule;
+    if (compared == kZcDiffers) return kZrlFault;
+    if (compared == kZcSame) return kZrlNothingLost;
+    return kZrlUncompared;
 }
 /* T-1279 fold (review finding 6): the FAULT line is said ONCE PER AREA PER LOAD (the counter keeps counting every refusal). saidBefore
    = this area's line was said before; saidLoad = the load number (the world teardown count) it was said in; loadNow = this one.

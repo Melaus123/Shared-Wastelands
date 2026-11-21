@@ -85,6 +85,9 @@ namespace coop { std::string ItemsKeeperRepairToken(); }   /* T-910: items.cpp (
 #ifndef WINHTTP_OPTION_SECURE_PROTOCOLS
 #define WINHTTP_OPTION_SECURE_PROTOCOLS 84
 #endif
+#ifndef WINHTTP_QUERY_RETRY_AFTER
+#define WINHTTP_QUERY_RETRY_AFTER 36
+#endif
 #ifndef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1
 #define WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 0x00000080
 #endif
@@ -196,6 +199,9 @@ volatile long g_testBusy = 0;   /* 1 while a test pack is being made */
 /* T-1401 2b: the test pack asks nearby games too; the main thread hands their answers over here (g_cs) */
 struct TestNearby { int done; std::vector<NearbyLog> nearby; std::string note; TestNearby() : done(1) {} };
 TestNearby g_testNb;
+/* T-1401 2c: a sent report's thread, from its worker to the main thread (g_cs); ThreadTick takes it (ready -> 0) */
+struct SentThread { long gen; int ready; unsigned long long thread; SentThread() : gen(0), ready(0), thread(0) {} };
+SentThread g_sent;
 
 /* ---- the nearby players' answers to this game's ask: MAIN THREAD ---- */
 struct Collect
@@ -208,10 +214,23 @@ struct Collect
     std::map<unsigned int, coopbug::PartsJoin> joins;   /* by the answering game's slot */
     std::map<unsigned int, coopbug::NearbyReply> replies;   /* T-1401 2b: each asked game's LOG_REPLY codes, by its slot */
     int test;               /* 1 = asked by the TEST-ONLY bugpack lever: answers go to g_testNb, no report generation */
-    Collect() : active(0), gen(0), askId(0), askAt(0), sx(-1), sy(-1), test(0) {}
+    unsigned char label[coopbug::kLogLabelBytes];   /* T-1401 2c: the ask's report label */
+    Collect() : active(0), gen(0), askId(0), askAt(0), sx(-1), sy(-1), test(0) { std::memset(label, 0, sizeof(label)); }
 };
 Collect g_col;
 unsigned int g_askNext = 0;
+/* T-1401 2c: the last player report's ask and the games that answered it (coopbug::ThreadGoesTo), kept until its upload is answered
+   - TRY AGAIN posts the same report, so its friends are told then. A new report's ask replaces it. MAIN THREAD. */
+struct LastAsk
+{
+    int valid;
+    unsigned int askId;
+    unsigned char label[coopbug::kLogLabelBytes];
+    std::vector<unsigned int> slots;
+    unsigned int askAt;     /* GetTickCount when it asked (F1287 review: no LOG_THREAD past the nearby games' 5-minute window) */
+    LastAsk() : valid(0), askId(0), askAt(0) { std::memset(label, 0, sizeof(label)); }
+};
+LastAsk g_lastAsk;
 
 /* ---- this game's answer to another game's ask ---- */
 struct Answer
@@ -231,6 +250,7 @@ long long g_ansRefusedUnlogged = 0;          /* ... of which no log line has spo
 int g_ansRefusalLogged = 0;
 DWORD g_ansRefusalLogAt = 0;
 coopbug::AskQueue g_ansQueue;                /* MAIN THREAD (T-1401 2b): asks that came while this game was busy, oldest first (at most 4) */
+coopbug::AskedList g_askedAbout;             /* MAIN THREAD (T-1401 2c): the reports this game was asked about - a LOG_THREAD is taken only for one */
 
 std::string Num(unsigned long long v) { char b[32]; _snprintf(b, 31, "%llu", v); b[31] = 0; return b; }
 std::string NumI(long long v) { char b[32]; _snprintf(b, 31, "%lld", v); b[31] = 0; return b; }
@@ -366,27 +386,41 @@ void CALLBACK OnSecureFailure(HINTERNET, DWORD_PTR ctx, DWORD status, LPVOID inf
     if (status == WINHTTP_CALLBACK_STATUS_SECURE_FAILURE && ctx != 0 && info != 0 && infoLen >= sizeof(DWORD))
         *(DWORD*)ctx |= *(const DWORD*)info;
 }
-/* 1 sent; 0 failed (*kind, *code as the box says them); -1 stopped by CANCEL. *trace = the step it ended in, its times and the
-   bytes uploaded (coopbug::SendTraceText), for the log line. */
-int Post(long gen, const std::string& boundary, const std::vector<unsigned char>& body, int* kind, int* code, std::string* trace)
+/* T-1401 2c: what one POST got back - the Windows error (0 = an answer came), the answer's status, its Retry-After in seconds (0 =
+   none), its first 4096 bytes of text, and relayErr (coopbug::kErrNoRelay / kErrBadRelay: the address itself was refused). */
+struct PostOut
 {
-    *kind = coopbug::kFailOther; *code = 0;
+    int winErr, status, retryAfterSec, relayErr;
+    std::string reply;
+    PostOut() : winErr(0), status(0), retryAfterSec(0), relayErr(0) {}
+};
+/* 1 answered 2xx; 0 failed (*o says why); -1 stopped by `stop`. *trace = the step it ended in, its times and the bytes uploaded
+   (coopbug::SendTraceText), for the log line. progressGen != 0: a player's report, whose "Sending your report... n%" follows the
+   upload; 0: a friend's thread upload (T-1401 2c), which writes nothing the screen reads. */
+int PostTo(const std::string& url, long progressGen, volatile long* stop, const std::string& boundary, const std::vector<unsigned char>& body,
+           PostOut* o, std::string* trace)
+{
+    o->winErr = 0; o->status = 0; o->retryAfterSec = 0; o->relayErr = 0; o->reply.clear();
     const DWORD t0 = ::GetTickCount();
     DWORD tStep = t0;
     int step = coopbug::kStepOpen;
     size_t sent = 0;
     *trace = coopbug::SendTraceText(step, 0, 0, 0, (unsigned long)body.size());
-    const std::string url = coopbug::kRelayUrl;
-    if (url.empty()) { *code = coopbug::kErrNoRelay; return 0; }
+    if (url.empty()) { o->relayErr = coopbug::kErrNoRelay; return 0; }
     /* HTTPS only: the report carries the players' logs and their words */
     const std::wstring wurl = Widen(url);
     URL_COMPONENTS uc; std::memset(&uc, 0, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
     uc.dwSchemeLength = (DWORD)-1; uc.dwHostNameLength = (DWORD)-1; uc.dwUrlPathLength = (DWORD)-1; uc.dwExtraInfoLength = (DWORD)-1;
-    if (!::WinHttpCrackUrl(wurl.c_str(), (DWORD)wurl.size(), 0, &uc) || uc.lpszHostName == 0 || uc.dwHostNameLength == 0
-        || uc.nScheme != INTERNET_SCHEME_HTTPS)
-    { *code = coopbug::kErrBadRelay; return 0; }
+    if (!::WinHttpCrackUrl(wurl.c_str(), (DWORD)wurl.size(), 0, &uc) || uc.lpszHostName == 0 || uc.dwHostNameLength == 0)
+    { o->relayErr = coopbug::kErrBadRelay; return 0; }
     const std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+    /* T-1401 2c: plain HTTP only to the local TEST service of the bench (bugrelayport=, coopbug::RelayPlainOk) */
+    const int secure = uc.nScheme == INTERNET_SCHEME_HTTPS ? 1 : 0;
+    std::string hostA;   /* the host name in ASCII (anything else becomes '?', never the loopback name) */
+    for (size_t i = 0; i < host.size(); ++i) hostA += (host[i] > 0 && host[i] < 128) ? (char)host[i] : '?';
+    if (secure == 0 && coopbug::RelayPlainOk(uc.nScheme == INTERNET_SCHEME_HTTP ? 1 : 0, hostA) == 0)
+    { o->relayErr = coopbug::kErrBadRelay; return 0; }
     std::wstring path = uc.lpszUrlPath ? std::wstring(uc.lpszUrlPath, uc.dwUrlPathLength) : std::wstring();
     if (uc.lpszExtraInfo) path += std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     if (path.empty()) path = L"/";
@@ -406,7 +440,7 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
     if (c != 0)
     {
         r = ::WinHttpOpenRequest(c, L"POST", path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                 WINHTTP_FLAG_SECURE);
+                                 secure != 0 ? WINHTTP_FLAG_SECURE : 0);   /* 0: the local test service only (above) */
         if (r == 0) winErr = (int)::GetLastError();
     }
     if (r != 0)
@@ -419,12 +453,12 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
         if (winErr == 0) { step = coopbug::kStepUpload; tStep = ::GetTickCount(); }
         while (winErr == 0 && sent < body.size())
         {
-            if (*StopOf(gen) != 0) { stopped = 1; break; }
+            if (*stop != 0) { stopped = 1; break; }
             const DWORD chunk = (DWORD)((body.size() - sent) > 65536u ? 65536u : (body.size() - sent));
             DWORD wrote = 0;
             if (!::WinHttpWriteData(r, &body[sent], chunk, &wrote)) { winErr = (int)::GetLastError(); break; }
             sent += wrote;
-            SetPhase(gen, kPhSending, (int)((unsigned long long)sent * 100ull / (unsigned long long)body.size()));
+            if (progressGen != 0) SetPhase(progressGen, kPhSending, (int)((unsigned long long)sent * 100ull / (unsigned long long)body.size()));
         }
         if (winErr == 0 && !stopped) { step = coopbug::kStepAnswer; tStep = ::GetTickCount(); }
         if (winErr == 0 && !stopped && !::WinHttpReceiveResponse(r, NULL)) winErr = (int)::GetLastError();
@@ -435,12 +469,22 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
             if (::WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz, WINHTTP_NO_HEADER_INDEX))
                 status = (int)st;
             else winErr = (int)::GetLastError();
+            /* T-1401 2c: the service's Retry-After (seconds) on a 503, read as TEXT - WinHTTP refuses WINHTTP_QUERY_FLAG_NUMBER
+               for this header (error 12154; run T2569 waited the 5 s default although the service sent 3) */
+            wchar_t raBuf[64]; DWORD raSz = sizeof(raBuf);
+            if (winErr == 0 && ::WinHttpQueryHeaders(r, WINHTTP_QUERY_RETRY_AFTER, WINHTTP_HEADER_NAME_BY_INDEX, raBuf, &raSz, WINHTTP_NO_HEADER_INDEX))
+            {
+                std::string raText;
+                for (DWORD i = 0; i < raSz / sizeof(wchar_t) && i < 63; ++i) raText += (raBuf[i] > 0 && raBuf[i] < 128) ? (char)raBuf[i] : (char)63;
+                o->retryAfterSec = coopbug::RetryAfterSeconds(raText);
+            }
             char buf[4096];
             DWORD avail = 0, total = 0;
             while (winErr == 0 && total < 65536 && ::WinHttpQueryDataAvailable(r, &avail) && avail != 0)
             {
                 DWORD n = 0;
                 if (!::WinHttpReadData(r, buf, avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail, &n) || n == 0) break;
+                if (o->reply.size() < 4096) o->reply.append(buf, (o->reply.size() + n) > 4096 ? 4096 - o->reply.size() : n);   /* T-1401 2c: the answer's text is kept */
                 total += n;
             }
         }
@@ -451,10 +495,22 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
     const DWORD tEnd = ::GetTickCount();
     *trace = coopbug::SendTraceText(step, (unsigned long)(tEnd - t0), (unsigned long)(tEnd - tStep), (unsigned long)sent, (unsigned long)body.size());
     if (winErr == ERROR_WINHTTP_SECURE_FAILURE) *trace += "; " + coopbug::SecureFailureText((unsigned long)secureFlags);
+    o->winErr = winErr; o->status = status;
     if (stopped) return -1;
-    if (coopbug::SendSucceeded(winErr, status)) return 1;
-    *kind = coopbug::FailKindOf(winErr, status);
-    *code = coopbug::FailCodeOf(winErr, status);
+    return coopbug::SendSucceeded(winErr, status) ? 1 : 0;
+}
+/* A player's report: 1 sent; 0 failed (*kind, *code as the box says them); -1 stopped by CANCEL. *reply = the answer's text. */
+int Post(long gen, const std::string& url, const std::string& boundary, const std::vector<unsigned char>& body, int* kind, int* code,
+         std::string* trace, std::string* reply)
+{
+    *kind = coopbug::kFailOther; *code = 0;
+    PostOut o;
+    const int r = PostTo(url, gen, StopOf(gen), boundary, body, &o, trace);
+    *reply = o.reply;
+    if (r != 0) return r;
+    if (o.relayErr != 0) { *code = o.relayErr; return 0; }
+    *kind = coopbug::FailKindOf(o.winErr, o.status);
+    *code = coopbug::FailCodeOf(o.winErr, o.status);
     return 0;
 }
 
@@ -477,6 +533,8 @@ struct Job
     std::string keeperText;  /* T-910: every [KEEPER] line of this launch (LogKeeperLinesText), for keeper-lines.txt */
     std::wstring crashFolder;   /* <mod folder>\crashes\ (src/common/crashkeep.h); empty = the mod folder could not be read */
     int testPack;               /* 1 = the TEST-ONLY bugpack lever: packed as a report is, listed in the log, never sent */
+    int relayMode;              /* T-1401 2c: coopbug::kRelay* from the TEST-ONLY cfg bugrelay= (0 = the real service) */
+    int relayPort;              /* T-1401 2c: the TEST-ONLY cfg bugrelayport= (0 = none): the bench's local test service */
     /* T-1402 (owner 1740 a): the stored copy of the reporter's map square, named on the main thread (FillJob), read on the worker */
     int haveArea, areaX, areaY;                 /* the square (zones.cpp MyLastPlayerSector); haveArea 0 = none seen this launch */
     std::string areaMirror, areaServerDir;      /* its mirror file; the world server's folder, only on the game that runs it */
@@ -1141,12 +1199,21 @@ void RunJob(Job& j)
     if (body.empty()) { Finish(j.gen, 0, coopbug::kFailOther, 0); return; }
     SetPhase(j.gen, kPhSending, 0);
     int kind = 0, code = 0;
-    std::string trace;
-    const int r = Post(j.gen, boundary, body, &kind, &code, &trace);
+    std::string trace, reply;
+    const int r = Post(j.gen, coopbug::RelayAddress(j.relayMode, j.relayPort), boundary, body, &kind, &code, &trace, &reply);
     if (r < 0) return;
+    const unsigned long long thread = r == 1 ? coopbug::ThreadOfReply(reply) : 0ull;
+    if (r == 1)
+    {   /* T-1401 2c: the thread goes to the main thread (ThreadTick), which tells the nearby games that answered this report's ask */
+        Lock l;
+        g_sent.gen = j.gen; g_sent.ready = 1; g_sent.thread = thread;
+    }
     Finish(j.gen, r == 1 ? 1 : 0, kind, code);
-    DebugLog(r == 1 ? std::string("[BUG] report sent (") + Num(body.size()) + " bytes; " + trace + ")"
-                    : "[BUG] report NOT sent: " + coopbug::FailText(kind, code) + " (kind " + NumI(kind) + ", code " + NumI(code) + "); " + trace);
+    DebugLog(r == 1 ? std::string("[BUG] report sent (") + Num(body.size()) + " bytes; " + trace + ") to the " + coopbug::RelayModeName(j.relayMode)
+                      + " report service; its answer '" + coopbug::ReplyForLog(reply) + "' - "
+                      + (thread != 0 ? "report thread " + coopbug::ThreadText(thread) : std::string("no thread named (a report service from before step 2c)"))
+                    : "[BUG] report NOT sent: " + coopbug::FailText(kind, code) + " (kind " + NumI(kind) + ", code " + NumI(code) + "); " + trace
+                      + (reply.empty() ? std::string() : "; its answer '" + coopbug::ReplyForLog(reply) + "'"));
 }
 unsigned __stdcall JobMain(void* arg)
 {
@@ -1253,6 +1320,7 @@ void AnswerDecide(const coopbug::AskWaiting& w, bool fromQueue)
         AnswerRefused(slot, ("replied 'not loaded here' (5): that sector is only in this game's outer ring (ask " + Num(askId) + ")").c_str());
         return;
     }
+    g_askedAbout.Note(slot, askId, w.ask.label, (unsigned int)w.arrivedMs);   /* T-1401 2c: this report's thread may come later (LOG_THREAD) */
     const std::map<unsigned int, DWORD>::const_iterator last = g_ansBySlot.find(slot);
     if (!coopbug::AskerMayBeAnswered(last != g_ansBySlot.end(), last != g_ansBySlot.end() ? (unsigned int)(now - last->second) : 0u))
     {
@@ -1386,6 +1454,7 @@ int AskNearby(long gen, int test, std::string* note)
         g_testNb.nearby.clear(); g_testNb.note = "asked; cut short by a player's own report"; g_testNb.done = 1;
     }
     g_col = Collect();
+    if (!test) g_lastAsk = LastAsk();   /* T-1401 2c: a new report - the last one's friends are not this one's */
     if (!GameplayRunning()) { *note = "none asked (the report was made at the title screen)"; return 0; }
     if (!StoreLiveReady() || StoreRosterOtherInWorldTS() != 1) { *note = "none asked (no other player was in this world)"; return 0; }
     const Sector s = MyPlayerSector();
@@ -1409,6 +1478,7 @@ int AskNearby(long gen, int test, std::string* note)
     if (!StoreSendLive(cooplive::kRouteArea, cooplive::AreaTarget(key, -1), cooplive::kInnerLogAsk, in, true))
     { *note = "none asked (the world server road is down)"; return 0; }
     g_col.active = 1; g_col.gen = gen; g_col.test = test; g_col.askId = g_askNext; g_col.askAt = ::GetTickCount(); g_col.sx = s.x; g_col.sy = s.y;
+    std::memcpy(g_col.label, ask.label, sizeof(g_col.label));
     DebugLog(std::string("[BUG] nearby players asked for their current logs") + (test ? " (TEST PACK)" : "") + " (ask " + Num(g_askNext) + ", sector "
              + NumI(s.x) + "," + NumI(s.y) + ", report label " + coopbug::LabelHex(ask.label) + ")");
     return 1;
@@ -1449,6 +1519,19 @@ void CollectTick()
         if (one.name.empty()) StoreRosterNameOf((int)one.slot, &one.name);
         said.push_back(one);
     }
+    if (!g_col.test && g_col.gen == g_gen)   /* T-1401 2c: the games this report's thread is sent to once it is uploaded */
+    {
+        g_lastAsk = LastAsk();
+        g_lastAsk.valid = 1; g_lastAsk.askId = g_col.askId; g_lastAsk.askAt = (unsigned int)g_col.askAt;
+        std::memcpy(g_lastAsk.label, g_col.label, sizeof(g_lastAsk.label));
+        for (std::map<unsigned int, int>::const_iterator h = heard.begin(); h != heard.end(); ++h)
+        {
+            const std::map<unsigned int, coopbug::PartsJoin>::const_iterator j = g_col.joins.find(h->first);
+            const std::map<unsigned int, coopbug::NearbyReply>::const_iterator r = g_col.replies.find(h->first);
+            if (coopbug::ThreadGoesTo(r == g_col.replies.end() ? 0u : r->second.lastCode, j != g_col.joins.end() && j->second.parts != 0))
+                g_lastAsk.slots.push_back(h->first);
+        }
+    }
     /* the other players in the world that did not reply are only COUNTED, never named (review LOW, privacy): most were never
        asked (not near this part of the map) */
     const int mine = StoreMySlot();
@@ -1479,14 +1562,21 @@ std::wstring FolderOfPath(const std::wstring& path)
     const std::wstring::size_type k = path.find_last_of(L"\\/");
     return k == std::wstring::npos ? std::wstring() : path.substr(0, k + 1);
 }
+/* The upload's info line: the mod, the game build and fingerprint, the game-to-game protocol, `where` it was made. */
+std::string InfoLine(const std::string& where)
+{
+    const std::string table = AddrTableName(), fp = AddrExeFingerprint();
+    return std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
+           + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + where;
+}
 /* What a report reads, gathered on the main thread: its info line, where it is made, the [KEEPER] lines, every file's path. */
 void FillJob(Job* j)
 {
     j->testPack = 0;
-    const std::string table = AddrTableName(), fp = AddrExeFingerprint();
     j->where = WhereNow();
-    j->info = std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
-              + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
+    j->info = InfoLine(j->where);
+    j->relayMode = ConfigBugRelay();   /* T-1401 2c: TEST-ONLY bugrelay= picks the test service */
+    j->relayPort = ConfigBugRelayPort();   /* ... and TEST-ONLY bugrelayport= its local copy (coopbug::RelayAddress) */
     {
         /* T-910: the empty-shop repairs and every [KEEPER] line of this launch go into the report (report.txt's header, keeper-lines.txt) */
         unsigned long long keeperSeen = 0;
@@ -1565,6 +1655,235 @@ void CancelJob(const char* why)
     g_gen = 0;
     if (!g_col.test) g_col = Collect();   /* a test pack's ask is not the report's */
 }
+
+/* =========================================================================================================================
+   T-1401 STEP 2c: THE REPORT'S THREAD (owner 1784, F1277 design a)
+   ========================================================================================================================= */
+/* THE REPORTER, MAIN THREAD: once its report is answered with a thread, each game that answered its ask gets one LOG_THREAD (route
+   SLOT). Log lines only; the reporter's own screens are those of any sent report. */
+void ThreadTick()
+{
+    unsigned long long thread = 0;
+    long gen = 0;
+    { Lock l; if (!g_sent.ready) return; g_sent.ready = 0; thread = g_sent.thread; gen = g_sent.gen; }
+    if (!g_lastAsk.valid)
+    {
+        DebugLog("[BUG] report " + NumI(gen) + ": no nearby game is told its thread - none was asked (or the wait for their answers did not finish)");
+        return;
+    }
+    const LastAsk la = g_lastAsk;
+    g_lastAsk = LastAsk();   /* told once */
+    if (thread == 0)
+    {
+        DebugLog("[BUG] report " + NumI(gen) + ": the report service's answer named no thread (a service from before step 2c) - the " + Num(la.slots.size())
+                 + " nearby game(s) that answered ask " + Num(la.askId) + " are not told, so their logs are not uploaded");
+        return;
+    }
+    if (la.slots.empty())
+    {
+        DebugLog("[BUG] report " + NumI(gen) + " thread " + coopbug::ThreadText(thread) + ": no nearby game answered ask " + Num(la.askId)
+                 + " (or each said 'not loaded here') - no LOG_THREAD sent");
+        return;
+    }
+    const unsigned int askAge = (unsigned int)::GetTickCount() - la.askAt;
+    if (!coopbug::ThreadAskStillFresh(askAge))
+    {
+        DebugLog("[BUG] report " + NumI(gen) + " thread " + coopbug::ThreadText(thread) + ": its ask " + Num(la.askId) + " was " + Num(askAge / 1000u)
+                 + " s ago (a TRY AGAIN long after the report was made) - past the nearby games' 5-minute window, so no LOG_THREAD is sent to the "
+                 + Num(la.slots.size()) + " game(s) that answered: each would refuse it; their logs are not uploaded");
+        return;
+    }
+    coopbug::LogThread t;
+    t.askId = la.askId; std::memcpy(t.label, la.label, sizeof(t.label)); t.thread = thread;
+    std::vector<char> b;
+    coopbug::LogThreadEncode(&b, t);
+    std::string sentTo, failed;
+    for (size_t i = 0; i < la.slots.size(); ++i)
+    {
+        if (StoreSendLive(cooplive::kRouteSlot, la.slots[i], cooplive::kInnerLogThread, b, true)) sentTo += (sentTo.empty() ? "" : ", ") + Num(la.slots[i]);
+        else failed += (failed.empty() ? "" : ", ") + Num(la.slots[i]);
+    }
+    DebugLog("[BUG] report " + NumI(gen) + " thread " + coopbug::ThreadText(thread) + ": LOG_THREAD sent to slot(s) " + (sentTo.empty() ? std::string("none") : sentTo)
+             + " (ask " + Num(la.askId) + ", report label " + coopbug::LabelHex(la.label) + ")"
+             + (failed.empty() ? std::string() : "; NOT sent to slot(s) " + failed + ": the world server road is down"));
+}
+
+/* ---- FRIEND ROAD BEGIN (T-1401 2c, owner 1784): a friend's game writes its log only - nothing in this part reaches the screen ---- */
+const unsigned long long kThreadCurLogCap = 5000000ull;   /* the current log's share of the upload (compressed); the previous log takes the rest */
+const unsigned long long kThreadSlack = 200000ull;        /* room for report.txt, the zip's own bytes and the form's lines */
+struct ThreadJob
+{
+    std::string name, info, url, labelHex;
+    std::wstring log0, log1;
+    unsigned long long thread;
+    unsigned int askId, fromSlot;
+    int relayMode;
+};
+volatile long g_thrBusy = 0;   /* 1 while an upload into a report's thread runs (one at a time) */
+volatile long g_thrStop = 0;   /* never raised: such an upload runs to its end */
+unsigned int ThreadJitter()
+{
+    LARGE_INTEGER q; q.QuadPart = 0; ::QueryPerformanceCounter(&q);
+    unsigned int x = (unsigned int)q.LowPart ^ (::GetTickCount() * 2654435761u) ^ ((unsigned int)::GetCurrentThreadId() << 11);
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return x;
+}
+/* WORKER THREAD: one try of a thread upload by WinHTTP (PostTo with no progress generation: nothing the screen reads), its log line,
+   and the wait between tries - what coopbug::ThreadUploadLoop drives. */
+struct ThreadPostIo : public coopbug::ThreadUploadIo
+{
+    const ThreadJob* t;                      /* all five set by ThreadUploadRun, which outlives the loop */
+    const std::string* head;
+    const std::string* boundary;
+    const std::string* desc;
+    const std::vector<unsigned char>* zip;
+    coopbug::ThreadTry Try(unsigned int tryNo)
+    {
+        coopbug::FormFields f;
+        f.push_back(std::make_pair(std::string("thread_id"), coopbug::ThreadText(t->thread)));
+        const char* ts = coopbug::TestStatusFor(t->relayMode, tryNo);
+        if (ts != 0) f.push_back(std::make_pair(std::string("test_status"), std::string(ts)));
+        const std::vector<unsigned char> body = coopbug::BuildMultipartWith(*boundary, *desc, t->info, f, *zip);
+        PostOut o;
+        std::string trace;
+        const int r = PostTo(t->url, 0, &g_thrStop, *boundary, body, &o, &trace);
+        DebugLog(*head + " try " + Num(tryNo) + " of " + Num(coopbug::kThreadUploadTries) + ": "
+                 + (o.relayErr != 0 ? "the service address was refused (error " + NumI(o.relayErr) + ")"
+                                    : o.winErr != 0 ? "no answer (Windows error " + NumI(o.winErr) + ")" : "status " + NumI(o.status))
+                 + ", answer '" + coopbug::ReplyForLog(o.reply) + "'" + (ts != 0 ? std::string("; asked the test service to answer ") + ts : std::string()) + "; " + trace);
+        coopbug::ThreadTry y;
+        y.posted = r == 1 ? 1 : 0; y.relayErr = o.relayErr; y.winErr = o.winErr; y.status = o.status; y.retryAfterSec = o.retryAfterSec;
+        return y;
+    }
+    void Wait(unsigned int ms, const coopbug::ThreadTry& last)
+    {
+        DebugLog(*head + ": the service asked to slow down (Retry-After " + NumI(last.retryAfterSec) + " s) - next try in " + Num(ms) + " ms");
+        ::Sleep(ms);
+    }
+    unsigned int Jitter() { return ThreadJitter(); }
+};
+/* WORKER THREAD: pack this game's current and previous logs (scrubbed as every report is), upload them with thread_id, retry on
+   503 / 429 (coopbug::ThreadUploadNext, RetryWaitMs), never on 404 (the thread is gone: no new post either). */
+void ThreadUploadRun(const ThreadJob& t)
+{
+    const std::string head = "[BUG] thread upload (report thread " + coopbug::ThreadText(t.thread) + ", asked by slot " + Num(t.fromSlot) + ", ask " + Num(t.askId) + ")";
+    coopbug::LogPack cur, prev;
+    std::string raw;
+    const bool haveCur = !t.log0.empty() && ReadTail(t.log0, coopbug::kRawLogWindow, &raw, &cur.rawTotal, &cur.rawDropped, 0);
+    if (haveCur) coopbug::PackLogNewest(raw, &cur, kThreadCurLogCap);
+    const unsigned long long curBytes = coopbug::PackBytes(cur, 0) + sizeof(coopbug::kFinalBlock);
+    const unsigned long long room = coopbug::kPackLimit - kThreadSlack - (curBytes < coopbug::kPackLimit - kThreadSlack ? curBytes : coopbug::kPackLimit - kThreadSlack);
+    const bool havePrev = !t.log1.empty() && ReadTail(t.log1, coopbug::kRawLogWindow, &raw, &prev.rawTotal, &prev.rawDropped, 0);
+    if (havePrev) coopbug::PackLogNewest(raw, &prev, room);
+    raw.clear();
+    std::string m = "Logs from a nearby player's game for the bug report in this thread (report label " + t.labelHex + ", ask " + Num(t.askId) + ").\r\n"
+                    + t.info + "\r\n\r\n";
+    std::vector<coopbug::ZipEntry> es;
+    es.push_back(coopbug::ZipEntry());   /* report.txt, filled in below */
+    const coopbug::LogPack* packs[2] = { &cur, &prev };
+    const bool have[2] = { haveCur, havePrev };
+    const char* names[2] = { swnames::kLog, swnames::kLogPrev };
+    const char* whats[2] = { "this launch's mod log", "the previous launch's mod log" };
+    for (int k = 0; k < 2; ++k)
+    {
+        if (!have[k]) { m += std::string(names[k]) + ": " + whats[k] + " could not be read\r\n"; continue; }
+        coopbug::ZipEntry e;
+        e.name = names[k];
+        unsigned long long rawLen = 0;
+        coopbug::JoinPack(*packs[k], 0, &e.data, &rawLen, &e.crc);
+        e.method = 8;
+        e.rawLen = (unsigned int)rawLen;
+        m += LogLine(names[k], whats[k], *packs[k], 0, false);
+        es.push_back(e);
+    }
+    es[0] = coopbug::StoredEntry("report.txt", m);
+    SYSTEMTIME lt; ::GetLocalTime(&lt);
+    const std::vector<unsigned char> zip = coopbug::BuildZip(es, coopbug::DosTime(lt.wHour, lt.wMinute, lt.wSecond), coopbug::DosDate(lt.wYear, lt.wMonth, lt.wDay));
+    const std::string desc = "Logs from a nearby player's game (" + (t.name.empty() ? std::string("name unknown") : t.name) + ")";
+    char seed[64]; _snprintf(seed, 63, "----SharedWastelandsThread%08lX%08X", (unsigned long)::GetTickCount(), t.askId); seed[63] = 0;
+    const std::string boundary = coopbug::PickBoundary(seed, desc, t.info, zip);
+    DebugLog(head + ": packed zip " + Num(zip.size()) + " bytes (" + Num(es.size() - 1) + " log(s)); uploading to the " + coopbug::RelayModeName(t.relayMode) + " report service");
+    ThreadPostIo io;
+    io.t = &t; io.head = &head; io.boundary = &boundary; io.desc = &desc; io.zip = &zip;
+    unsigned int tries = 0;
+    const int outcome = coopbug::ThreadUploadLoop(io, &tries);   /* the retry loop the offline suite runs (t1401c_retry) */
+    if (outcome == coopbug::kUpDone) DebugLog(head + ": UPLOADED into thread " + coopbug::ThreadText(t.thread) + " (" + Num(zip.size()) + " bytes, try " + Num(tries) + ")");
+    else if (outcome == coopbug::kUpThreadGone) DebugLog(head + ": NOT uploaded - the thread is gone (404); not tried again and no new post made");
+    else DebugLog(head + ": NOT uploaded after " + Num(tries) + " tr" + (tries == 1 ? "y" : "ies") + " - see the try lines above");
+}
+unsigned __stdcall ThreadUploadMain(void* arg)
+{
+    ThreadJob* t = (ThreadJob*)arg;
+    try { ThreadUploadRun(*t); }
+    catch (...) { DebugLog("[BUG] thread upload stopped on a C++ exception; nothing more is tried"); }
+    delete t;
+    ::InterlockedExchange(&g_thrBusy, 0);
+    return 0;
+}
+/* MAIN THREAD: LOG_THREADs accepted while an upload ran (F1287 review: queued, not dropped), oldest first, at most
+   coopbug::kThreadQueueMax; ThreadUploadPump starts the next when the running one ends. */
+struct ThreadWaiting { coopbug::LogThread lt; unsigned int fromSlot; };
+std::vector<ThreadWaiting> g_thrWaiting;
+std::string ThreadHead(const coopbug::LogThread& lt, unsigned int fromSlot)
+{
+    return "[BUG] slot " + Num(fromSlot) + " sent its report's thread " + coopbug::ThreadText(lt.thread) + " (ask " + Num(lt.askId)
+           + ", report label " + coopbug::LabelHex(lt.label) + ")";
+}
+/* MAIN THREAD, g_thrBusy already 1 (the caller took it): the upload's worker thread starts. */
+void ThreadUploadLaunch(const coopbug::LogThread& lt, unsigned int fromSlot, const std::string& head)
+{
+    ThreadJob* t = new ThreadJob;
+    t->name = ConfigFilePlayerName();
+    t->info = InfoLine(WhereNow());
+    t->relayMode = ConfigBugRelay();
+    t->url = coopbug::RelayAddress(t->relayMode, ConfigBugRelayPort());
+    t->labelHex = coopbug::LabelHex(lt.label);
+    t->log0 = LogFilePath(0); t->log1 = LogFilePath(1);
+    t->thread = lt.thread; t->askId = lt.askId; t->fromSlot = fromSlot;
+    coop::ReportDoors(); coop::ReportFarm();   /* as an answer does: the door and farm totals go into the log it uploads */
+    const uintptr_t h = _beginthreadex(NULL, 0, &ThreadUploadMain, t, 0, NULL);
+    if (h == 0)
+    {
+        delete t;
+        ::InterlockedExchange(&g_thrBusy, 0);
+        DebugLog(head + " - not uploaded: no worker thread (Windows error " + NumI((long long)::GetLastError()) + ")");
+        return;
+    }
+    ::CloseHandle((HANDLE)h);
+    DebugLog(head + " - accepted: this game's current and previous logs are being uploaded into it; the player is not told");
+}
+/* MAIN THREAD (BugReportLiveIn): a reporter's LOG_THREAD - taken only for a report this game was asked about (coopbug::AskedList),
+   decided when it arrives; while another upload runs it waits its turn (coopbug::ThreadQueueDecide). */
+void ThreadUploadStart(const coopbug::LogThread& lt, unsigned int fromSlot)
+{
+    const std::string head = ThreadHead(lt, fromSlot);
+    const int q = coopbug::ThreadQueueDecide(::InterlockedCompareExchange(&g_thrBusy, 0, 0) != 0, g_thrWaiting.size());
+    if (q == coopbug::kThrQFull)
+    {
+        DebugLog(head + " - not uploaded: an upload into a report's thread is running and " + Num(coopbug::kThreadQueueMax) + " more already wait");
+        return;
+    }
+    const int a = g_askedAbout.Accept(lt, fromSlot, (unsigned int)::GetTickCount());
+    if (a != coopbug::kThrAccept) { DebugLog(head + " - not uploaded: " + coopbug::ThreadRefusalWords(a)); return; }
+    if (q == coopbug::kThrQWait || ::InterlockedCompareExchange(&g_thrBusy, 1, 0) != 0)
+    {
+        ThreadWaiting w; w.lt = lt; w.fromSlot = fromSlot;
+        g_thrWaiting.push_back(w);
+        DebugLog(head + " - accepted: it waits its turn behind the upload that is running (" + Num(g_thrWaiting.size()) + " waiting); the player is not told");
+        return;
+    }
+    ThreadUploadLaunch(lt, fromSlot, head);
+}
+/* MAIN THREAD, every bug-report tick: the next waiting LOG_THREAD's upload starts once none runs. */
+void ThreadUploadPump()
+{
+    if (g_thrWaiting.empty()) return;
+    if (::InterlockedCompareExchange(&g_thrBusy, 1, 0) != 0) return;
+    const ThreadWaiting w = g_thrWaiting.front();
+    g_thrWaiting.erase(g_thrWaiting.begin());
+    ThreadUploadLaunch(w.lt, w.fromSlot, ThreadHead(w.lt, w.fromSlot) + " (its turn came; " + Num(g_thrWaiting.size()) + " still waiting)");
+}
+/* ---- FRIEND ROAD END ---- */
 
 /* =========================================================================================================================
    WIDGETS (MAIN THREAD, inside the SEH frame below)
@@ -2315,7 +2634,7 @@ void BugReportTick(int atTitle)
 {
     if (::InterlockedCompareExchange(&g_off, 0, 0) != 0) return;
     CsInit();
-    try { CollectTick(); AnswerTick(); }
+    try { CollectTick(); AnswerTick(); ThreadTick(); ThreadUploadPump(); }
     catch (...) { DebugLog("[BUG] a C++ exception in the nearby-log step; nothing more done this frame"); }
     if (UiGuarded(atTitle) != 0) Latch(atTitle ? "the title screen" : "a world");
 }
@@ -2357,6 +2676,13 @@ void BugReportLiveIn(unsigned int innerType, unsigned int originSlot, const char
             r.lastCode = code; r.lastDetail = detail;
             DebugLog("[BUG] slot " + Num(originSlot) + " replied to ask " + Num(askId) + " " + Num((unsigned int)(::GetTickCount() - g_col.askAt)) + " ms after it: '"
                      + ReplyWords(code) + "' (code " + Num(code) + ", detail " + Num(detail) + ")");
+            return;
+        }
+        if (innerType == cooplive::kInnerLogThread)   /* T-1401 2c: the reporter's thread - this game's own logs go into it, log only */
+        {
+            coopbug::LogThread t;
+            if (!coopbug::LogThreadDecode(data, len, &t)) { DebugLog("[BUG] a malformed report-thread message from slot " + Num(originSlot) + " (" + Num(len) + " bytes) - dropped"); return; }
+            ThreadUploadStart(t, originSlot);
             return;
         }
         if (innerType == cooplive::kInnerLogPart)

@@ -112,6 +112,7 @@ namespace coop { void P210NoteMade(unsigned int uid, int kind); void P210CopyDes
 #include "farm.h"           // T-1125: FarmWorkerListedPod - the occupant in the torture building's worker list
 #include "policy.h"         // T-1125: PolicyVtableRvaPod / PolicyClassNamePod - the building's class on the [CAGED] lines
 #include "../common/farmwire.h"   // T-1125: coopfarm::CageWatchEvent / TortSayFirst / TortKeyHash
+#include "../common/tplsetup.h"   /* T-1416 fix attempt 1: a copy squad's template setup (sqtpl::Decide) */
 
 #include "coop_log.h"
 namespace { swlogbudget::Gate g_qM1IntoNull, g_qM1IntoRef, g_qM1IntoCtx, g_qCtxRenamed, g_qCtxKeptHire, g_qCtxKeptLoad, g_qCtxSent; }   /* T-910: the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
@@ -1525,6 +1526,10 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
         // adopted the body as its own character - a duplicate no real copy can make.
         ::Character* made = FindSpawned(uid);
         ::Faction* mf = (made != 0 && PlausibleObject(made)) ? made->getOwnerFactionDirect() : 0;
+        /* T-1442 step 6 (F1507): CONTEXT before SPAWN, as every announce road (SpawnAnnounceOwn, resurrect.cpp, worldsync.cpp) - without
+           it the other game made the copy with no squad and its engine put the copy into a squad that game runs (T2646: each game's
+           test NPC became the stand-in leader of the other game's test squad) */
+        if (made != 0 && PlausibleObject(made)) SendContextFor(uid, made);
         net::SendSpawn(uid, templateName, pos.x, pos.y, pos.z,
                        PlausibleObject(mf) ? WireFactionName(mf, true) : g_spawnFactionName, false, made);
 
@@ -16981,6 +16986,48 @@ void CarryPeerPlatoonId(Faction* faction, void* platoon, const std::string& id)
              + " keptNotReloaded=" + S(g_staleKeptNotReloaded) + " keptNoSlot=" + S(g_staleKeptNoSlot));
 }
 
+/* T-1416 fix attempt 1 (H-T1416-squadplan, design (a)): the engine's template setup 0x2715E0 (1.0.68 0x271620), called on a copy squad
+   this game has just made for another game's characters, with the arguments the engine's own callers pass (sqtpl, tplsetup.h): the
+   squad plan (Platoon +0xF8) and the squad template GameData spawnEmptySquad was given. It fills the plan's package list; the plan's own
+   per-tick chooser then picks the active package, as on every squad the engine makes. MAIN THREAD (PrepareContextForSpawn). */
+unsigned long long kTplSetupRva = 0; static coop::AddrReg kTplSetupRva_reg("PlatoonPlanTemplateSetup", &kTplSetupRva);   /* Steam_1.0.65 0x2715E0 (1.0.68 0x271620) */
+long long g_tplSetupRan = 0, g_tplSetupSkipped = 0, g_tplSetupFaulted = 0, g_tplSetupLines = 0;
+const long long kTplSetupLineCap = 60;
+/* the plan (Platoon +0xF8) and its package list count (plan +0x28); 1 read, 0 no plan / not plausible, -1 faulted */
+int TplPlanListPod(void* platoon, void** planOut, long long* countOut)
+{
+    *planOut = 0; *countOut = -1;
+    __try
+    {
+        void* plan = *(void**)((char*)platoon + sqtpl::kPlanOffInPlatoon);
+        if (plan == 0 || !PlausibleObject(plan)) return 0;
+        *planOut = plan;
+        *countOut = *(const long long*)((const char*)plan + sqtpl::kPlanListCount);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *planOut = 0; *countOut = -1; return -1; }
+}
+int TplSetupCallPod(void* plan, void* templateGd)   /* 1 ran, -1 faulted */
+{
+    typedef void (*Fn)(void* plan, void* templateGd);
+    __try { ((Fn)coop::AddrAbs(kTplSetupRva))(plan, templateGd); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the decision and the call; *before / *after the list count around it, *curPkg the plan's active package after it (P323). The verdict. */
+int CopySquadTemplateSetup(void* platoon, void* templateGd, int newlyMade, long long* before, long long* after, void** curPkg)
+{
+    *before = -1; *after = -1; *curPkg = 0;
+    void* plan = 0;
+    if (newlyMade != 0 && PlausibleObject(platoon)) TplPlanListPod(platoon, &plan, before);
+    const int v = sqtpl::Decide(newlyMade, kTplSetupRva != 0 ? 1 : 0, (templateGd != 0 && PlausibleObject(templateGd)) ? 1 : 0, plan != 0 ? *before : -1);
+    if (v != sqtpl::kRun) { ++g_tplSetupSkipped; return v; }
+    if (TplSetupCallPod(plan, templateGd) != 1) { ++g_tplSetupFaulted; return sqtpl::kSkipNoPlan; }
+    ++g_tplSetupRan;
+    void* plan2 = 0;
+    TplPlanListPod(platoon, &plan2, after);
+    if (plan2 != 0) { __try { *curPkg = *(void**)((char*)plan2 + sqtpl::kPlanActivePkg); } __except (EXCEPTION_EXECUTE_HANDLER) { *curPkg = 0; } }
+    return v;
+}
 void* ReadActivePlatoonPod(void* platoon)
 {
     __try { return *(void**)((char*)platoon + 0x1D8); }
@@ -18185,6 +18232,23 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
         void* active = 0;
         const int homePH = (building != 0 && TownGenPlayerHouse(building) != 0) ? 1 : 0;   /* review MED 2: a player's house is never a copy's home - built with no building */
         if (!ConfigurePlatoonPod(platoon, pc.squadType, town, pc.hand, building != 0 && homePH == 0, &active)) { ++g_ctxPlatoonCreateFailed; return false; }
+        {   /* T-1416 fix attempt 1: the engine's template setup, as every squad the engine makes from a template gets it (sqtpl) */
+            long long tplBefore = -1, tplAfter = -1; void* tplCur = 0;
+            const int tv = CopySquadTemplateSetup(platoon, squadGd, 1, &tplBefore, &tplAfter, &tplCur);
+            if (g_tplSetupLines < kTplSetupLineCap || tv == sqtpl::kSkipNoPlan)
+            {
+                ++g_tplSetupLines;
+                char tsid[128]; tsid[0] = 0;
+                if (!ReadGameDataSid(squadGd, tsid, (int)sizeof(tsid))) { tsid[0] = '?'; tsid[1] = 0; }
+                DebugLog("[CTX] platoon " + P(platoon) + " key='" + key + "' template setup " + sqtpl::VerdictWord(tv) + " template='" + tsid
+                         + "' packages " + S(tplBefore) + " -> " + S(tplAfter) + " (T-1416; ran=" + S(g_tplSetupRan) + " skipped=" + S(g_tplSetupSkipped)
+                         + " faulted=" + S(g_tplSetupFaulted) + "; the first 60)");
+                // PROBE-START: P323
+                DebugLog("[PROBE] P323 tplsetup platoon=" + P(platoon) + " verdict=" + sqtpl::VerdictWord(tv) + " pkgsBefore=" + S(tplBefore)
+                         + " pkgsAfter=" + S(tplAfter) + " curPkg=" + P(tplCur) + " template='" + tsid + "'");
+                // PROBE-END: P323
+            }
+        }
         g_ctxPlatoons[key] = platoon; ++g_ctxPlatoonsCreated;
         StoreForgetRunnerWithdrew(coopctx::CtxKeyIdOf(key));   /* a new holder of the squad: a NOT-LIVE note of its earlier holder no longer applies */
         g_ctxPlatoonSlot[key] = net::OwnerSlotOf(uid);   /* the owner OnSpawn recorded before this copy is built: that player leaving retires it */
@@ -19492,4 +19556,283 @@ int SellRowsNotOwnNear(::Character* own, float x, float z, unsigned int* listed,
     }
     return notOwn;
 }
+// PROBE-START: P323 - T-1416 (F1486, H-T1416-squadplan): a character's own goal lists, squad role, squad template / size / leader
+// and its squad plan (package name, contract) at the hand-over moments (made by the squad lever, giver just before the XFER, taker
+// right after the take, right after the goal refill, and ~5 s later), and every combat-mode edge of a character that had such a line.
+// LOG ONLY: guarded reads (SEH POD readers, pointers checked plausible), no write, no engine call, no decision changed. MAIN THREAD.
+// Offsets (Read, 1.0.65 decompiles; 1.0.68 layout assumed equal as for the goal refill):
+//   Character +0x650 AI (setupAI 0x6210E0 param_1[0xca]; setSquadRole 0x620B30); AI +0x20 orders (decomp_620b30, replicate.cpp
+//   kGoalOrdersOff); orders +0x25C squad role (decomp_620b30); orders +0xA8 + 0x18k count / +0xB0 + 0x18k array of goal pointers,
+//   five lists (decomp_5069b0, decomp_509f40); goal +0x70 -> +0x44 its task type (decomp_5069b0); squad plan = Character +0x658
+//   ActivePlatoon -> +0x78 Platoon -> +0xF8 (decomp_791000); plan +0x210 contract (decomp_6210e0:54); plan +0x58 a std::string
+//   assigned from the saved current-package name (decomp_272be0:211, Inferred meaning); plan +0x48 the current package object
+//   (decomp_272be0:216 / 225, Inferred); Platoon +0x108 the squad template GameData (ReadContextPod).
+namespace {
+const long long kP323AiCap = 300;     // ai lines a launch for the test squads' members (T2649: was all characters together)
+const long long kP323OtherCap = 60;   // T2649: ai lines a launch for every other character (T2647: the start-up hand-over spent all 300)
+const long long kP323FlipCap = 400;   // combat-edge lines a launch
+const int kP323PerList = 6;           // goal types printed per list (the count is always printed)
+const size_t kP323WatchCap = 256;
+const size_t kP323PlanCurPkg = 0x48;   // plan +0x48 the current package (decomp_272be0:216 / 225, Inferred)
+const size_t kP323Live = 0x98;         // T2655: the squad's live object, +0x98 of what 0x790F70 returns (decomp_677ed0; F1503) - read on both ActivePlatoon and Platoon
+long long g_p323Ai = 0, g_p323Flip = 0, g_p323Other = 0, g_p323OtherSkipped = 0;
+std::set<unsigned int> g_p323Watch;   // test squads' members with an ai line: their combat edges are lined (T2649: test members only)
+std::set<unsigned int> g_p323Test;    // T2649: the test squads' members seen on this game (the `made` moment, or a lever label name)
+/* T2649: a TEST-ONLY squad lever label (items.cpp TsSquadNameReady: <labels><a..l>) - an upper-case letter, 1..7 more upper-case
+   letters or digits, then one lower-case a..l ('SQa', 'NBl'). The character's own name, Character +0x18 (the [NAME] apply's read),
+   so the other game's copy and the taker know the members by the renames the [NAME] road carried. */
+bool P323LabelName(::Character* c)
+{
+    char nm[32]; nm[0] = 0;
+    if (!ReadStdStringPod((const char*)c + 0x18, nm, (int)sizeof(nm))) return false;
+    const size_t n = std::strlen(nm);
+    if (n < 3 || n > 9 || nm[0] < 'A' || nm[0] > 'Z' || nm[n - 1] < 'a' || nm[n - 1] > 'l') return false;
+    for (size_t i = 1; i + 1 < n; ++i)
+        if (!((nm[i] >= 'A' && nm[i] <= 'Z') || (nm[i] >= '0' && nm[i] <= '9'))) return false;
+    return true;
+}
+struct P323Later { unsigned int uid; unsigned long long due; };
+std::vector<P323Later> g_p323Later;
+struct P323Read
+{
+    int role; int counts[5]; int types[5][kP323PerList];
+    void* ap; void* platoon; void* plan; void* contract; void* curPkg; void* squadGd;
+    long long pkgs;   /* T-1416 fix attempt 1: the plan's package list count (plan +0x28, sqtpl::kPlanListCount; -1 unread) */
+    int curType; void* ap98; void* pl98;   /* T2655: the current goal's type; ActivePlatoon +0x98 / Platoon +0x98 (the squad's live object) */
+    long long queued; int pending;   /* T-1416 fix attempt 2 review fold 1: the order queue's count (orders +0x60, 64-bit) and the pending list's (+0x78) - OrderListsPod's offsets; -1 unread */
+};
+int P323ReadPod(::Character* c, P323Read* r)   // 1 read (fields may be -1 / 0), 0 no AI / orders, -1 faulted
+{
+    __try
+    {
+        r->role = -1; r->ap = 0; r->platoon = 0; r->plan = 0; r->contract = 0; r->curPkg = 0; r->squadGd = 0;
+        r->curType = -1; r->ap98 = 0; r->pl98 = 0; r->pkgs = -1; r->queued = -1; r->pending = -1;
+        for (int k = 0; k < 5; ++k) { r->counts[k] = -1; for (int j = 0; j < kP323PerList; ++j) r->types[k][j] = -1; }
+        r->ap = coop::SquadActivePlatoonOf(c);   /* verified +0x658 (handoff.cpp) */
+        if (r->ap != 0 && PlausibleObject(r->ap))
+        {
+            r->ap98 = *(void**)((char*)r->ap + kP323Live);
+            r->platoon = *(void**)((char*)r->ap + 0x78);
+            if (r->platoon != 0 && PlausibleObject(r->platoon))
+            {
+                r->pl98 = *(void**)((char*)r->platoon + kP323Live);
+                r->squadGd = *(void**)((char*)r->platoon + 0x108);
+                r->plan = *(void**)((char*)r->platoon + 0xF8);
+                if (r->plan != 0 && PlausibleObject(r->plan))
+                {
+                    r->contract = *(void**)((char*)r->plan + 0x210);
+                    r->curPkg = *(void* const*)((const char*)r->plan + kP323PlanCurPkg);   /* a named offset: the t1411 source scan keeps its literal for one read */
+                    r->pkgs = *(const long long*)((const char*)r->plan + sqtpl::kPlanListCount);
+                }
+                else r->plan = 0;
+            }
+            else r->platoon = 0;
+        }
+        void* ai = *(void**)((char*)c + 0x650);
+        if (ai == 0 || !PlausibleObject(ai)) return 0;
+        char* orders = *(char**)((char*)ai + 0x20);
+        if (orders == 0 || !PlausibleObject(orders)) return 0;
+        r->role = *(const int*)(orders + 0x25C);
+        r->queued = *(const long long*)(orders + 0x60); r->pending = *(const int*)(orders + 0x78);
+        {   /* T2655: the current goal - its task data at orders +0x1C0 (replicate.cpp ReadGoalFields), its type at +0x44 */
+            const char* ctd = *(const char* const*)(orders + 0x1C0);
+            if (ctd != 0 && PlausiblePtr(ctd)) r->curType = *(const int*)(ctd + 0x44);
+        }
+        for (int k = 0; k < 5; ++k)
+        {
+            const unsigned int n = *(const unsigned int*)(orders + 0xA8 + 0x18 * k);
+            r->counts[k] = (int)n;
+            if (n == 0 || n > 4096) continue;
+            void* const* arr = *(void* const* const*)(orders + 0xB0 + 0x18 * k);
+            /* T2655 FIX: T2649's types read -1 on every line (log-B:7671, :9191-9201) because the goal-pointer ARRAY and the task
+               data were tested with PlausibleObject, which demands a vtable in the game image: an array's first qword is a goal
+               pointer (a heap address) and the task data has no vtable either, so both were skipped. hasTaskOfType 0x5069B0
+               (decomp_5069b0) reads them as plain memory - a readable, aligned pointer (PlausiblePtr) is the right test. */
+            if (arr == 0 || !PlausiblePtr((const void*)arr)) continue;
+            for (unsigned int j = 0; j < n && j < (unsigned int)kP323PerList; ++j)
+            {
+                const char* g = (const char*)arr[j];
+                if (g == 0 || !PlausiblePtr(g)) continue;
+                const char* td = *(const char* const*)(g + 0x70);
+                if (td == 0 || !PlausiblePtr(td)) continue;
+                r->types[k][j] = *(const int*)(td + 0x44);
+            }
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+std::string P323Hex(const void* p) { char b[32]; _snprintf(b, 31, "0x%llX", (unsigned long long)(uintptr_t)p); b[31] = 0; return b; }
+}   // namespace (P323)
+
+void P323AiLine(unsigned int uid, const char* moment)
+{
+    if (uid == 0) return;
+    ::Character* c = FindSpawned(uid);
+    /* T2649: the test squads' members (the lever's `made`, or a lever label name) have their own cap and the combat-edge watch;
+       every other character gets the first kP323OtherCap lines only (information) and no combat edges */
+    const bool test = std::strcmp(moment, "made") == 0 || g_p323Test.find(uid) != g_p323Test.end()
+                      || (c != 0 && PlausibleObject(c) && P323LabelName(c));
+    if (!test)
+    {
+        if (g_p323Other >= kP323OtherCap) { ++g_p323OtherSkipped; return; }
+        ++g_p323Other;
+    }
+    else
+    {
+        if (g_p323Test.size() < kP323WatchCap) g_p323Test.insert(uid);
+        if (g_p323Watch.size() < kP323WatchCap) g_p323Watch.insert(uid);
+        if (g_p323Ai >= kP323AiCap) return;
+        ++g_p323Ai;
+    }
+    std::ostringstream ls;
+    ls << "[PROBE] P323 ai " << moment << " uid=" << uid << " side=" << (net::IsUidMine(uid) ? "own" : "copy") << " test=" << (test ? 1 : 0);
+    if (c == 0 || !PlausibleObject(c)) { ls << " char=none"; }
+    else
+    {
+        P323Read r;
+        const int rd = P323ReadPod(c, &r);
+        ls << " read=" << rd << " role=" << r.role << " goals=";
+        for (int k = 0; k < 5; ++k)
+        {
+            ls << (k == 0 ? "" : "|") << r.counts[k] << ":";
+            for (int j = 0; j < kP323PerList && j < r.counts[k]; ++j) ls << (j == 0 ? "" : ",") << r.types[k][j];
+            if (r.counts[k] > kP323PerList) ls << ",..";
+        }
+        char tmpl[128]; tmpl[0] = 0;
+        if (r.squadGd != 0 && PlausibleObject(r.squadGd) && !ReadGameDataSid(r.squadGd, tmpl, (int)sizeof(tmpl))) { tmpl[0] = '?'; tmpl[1] = 0; }
+        char pkg[96]; pkg[0] = 0;
+        int pkgOk = 0;
+        if (r.plan != 0) pkgOk = ReadStdStringPod((const char*)r.plan + 0x58, pkg, (int)sizeof(pkg)) ? 1 : 0;
+        SquadView sv;
+        const int sq = (r.ap != 0) ? ReadSquadAt(r.ap, &sv) : 0;
+        ls << " squad=" << P323Hex(r.ap) << " template='" << tmpl << "' members=" << (sq == 1 ? sv.count : -1)
+           << " leaderUid=" << (sq == 1 && sv.leader != 0 ? FindSpawnedUid(sv.leader) : 0)
+           << " actingUid=" << (sq == 1 && sv.acting != 0 ? FindSpawnedUid(sv.acting) : 0)
+           << " plan=" << P323Hex(r.plan) << " pkg=" << (pkgOk != 0 ? "'" + std::string(pkg) + "'" : std::string("unread"))
+           << " curPkg=" << P323Hex(r.curPkg) << " pkgs=" << r.pkgs << " contract=" << P323Hex(r.contract)
+           << " curGoalType=" << r.curType << " ap98=" << P323Hex(r.ap98) << " pl98=" << P323Hex(r.pl98);
+    }
+    if (test && g_p323Ai == kP323AiCap) ls << " (P323 ai line cap reached)";
+    if (!test && g_p323Other == kP323OtherCap) ls << " (P323 other-character line cap reached - later ones are counted only)";
+    DebugLog(ls.str());
+}
+/* T2649: the TEST-ONLY attack lever (command_channel.cpp `attack .. name`) struck `victimUid`: one `strike` ai line for every test
+   squad member this game runs, the victim first - their squad plan (curPkg) at the strike. MAIN THREAD (the command channel). */
+void P323AiStrike(unsigned int victimUid)
+{
+    if (g_p323Test.find(victimUid) != g_p323Test.end()) P323AiLine(victimUid, "strike");
+    else { std::ostringstream ls; ls << "[PROBE] P323 strike victim uid=" << victimUid << " is not a test squad member on this game"; DebugLog(ls.str()); }
+    const std::set<unsigned int> t = g_p323Test;
+    for (std::set<unsigned int>::const_iterator it = t.begin(); it != t.end(); ++it)
+        if (*it != victimUid && net::IsUidMine(*it)) P323AiLine(*it, "strike");
+    std::ostringstream ss; ss << "[PROBE] P323 strike done victim uid=" << victimUid << " testMembers=" << t.size()
+                              << " otherLines=" << g_p323Other << " otherSkipped=" << g_p323OtherSkipped;
+    DebugLog(ss.str());
+}
+/* T2655: for the blow lines (combat.cpp P323Blow) - a test squad member seen here, and the victim's state as the ai line prints it
+   (no cap of its own: P323Blow caps). MAIN THREAD. */
+bool P323IsTestUid(unsigned int uid) { return g_p323Test.find(uid) != g_p323Test.end(); }
+std::string P323StateText(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    const bool test = g_p323Test.find(uid) != g_p323Test.end() || (c != 0 && PlausibleObject(c) && P323LabelName(c));
+    std::ostringstream ls;
+    ls << " test=" << (test ? 1 : 0);
+    if (c == 0 || !PlausibleObject(c)) { ls << " char=none"; return ls.str(); }
+    P323Read r;
+    const int rd = P323ReadPod(c, &r);
+    ls << " read=" << rd << " role=" << r.role << " goals=";
+    for (int k = 0; k < 5; ++k)
+    {
+        ls << (k == 0 ? "" : "|") << r.counts[k] << ":";
+        for (int j = 0; j < kP323PerList && j < r.counts[k]; ++j) ls << (j == 0 ? "" : ",") << r.types[k][j];
+        if (r.counts[k] > kP323PerList) ls << ",..";
+    }
+    ls << " curGoalType=" << r.curType << " squad=" << P323Hex(r.ap) << " plan=" << P323Hex(r.plan) << " curPkg=" << P323Hex(r.curPkg)
+       << " ap98=" << P323Hex(r.ap98) << " pl98=" << P323Hex(r.pl98);
+    return ls.str();
+}
+void P323AiLater(unsigned int uid, int seconds)
+{
+    if (uid == 0 || g_p323Later.size() >= 256) return;
+    P323Later l; l.uid = uid; l.due = (unsigned long long)::GetTickCount() + (unsigned long long)seconds * 1000ULL;
+    g_p323Later.push_back(l);
+}
+void P323Tick()
+{
+    if (g_p323Later.empty()) return;
+    const unsigned long long now = (unsigned long long)::GetTickCount();
+    for (size_t i = 0; i < g_p323Later.size(); )
+    {
+        if (g_p323Later[i].due > now) { ++i; continue; }
+        const unsigned int u = g_p323Later[i].uid;
+        g_p323Later.erase(g_p323Later.begin() + i);
+        P323AiLine(u, "later");
+    }
+}
+void P323CombatEdge(unsigned int uid, int on, int wasOn, unsigned int targetUid)
+{
+    if (g_p323Watch.find(uid) == g_p323Watch.end() || g_p323Flip >= kP323FlipCap) return;
+    ++g_p323Flip;
+    std::ostringstream ls;
+    ls << "[PROBE] P323 combat uid=" << uid << " " << wasOn << "->" << on << " target=" << targetUid
+       << " side=" << (net::IsUidMine(uid) ? "own" : "copy") << " n=" << g_p323Flip
+       << (g_p323Flip == kP323FlipCap ? " (P323 combat line cap reached)" : "");
+    DebugLog(ls.str());
+}
+/* T2669 (F1543), T-1416 fix attempt 2: the giver's carried goal at the take (handoff.cpp TakeMemberFromPeer) - its type and name,
+   subject, what became of it (no take issues it since fix attempt 2: take-reruns-ai, raid-skip or no-intent), and the taker's goal
+   lists, current goal type and order queue / pending counts (q=) just before the take's order clear and right after the take.
+   Test squad members: kP323ToCap lines; every other character: the first kP323ToOtherCap, then counted. MAIN THREAD. */
+namespace {
+const long long kP323ToCap = 150, kP323ToOtherCap = 20;
+long long g_p323ToLines = 0, g_p323ToOther = 0, g_p323ToSkipped = 0;
+P323Read g_p323ToPre;
+unsigned int g_p323ToPreUid = 0;
+int g_p323ToPreRd = -2;
+std::string P323ListsText(const P323Read& r)
+{
+    std::ostringstream ls;
+    for (int k = 0; k < 5; ++k) ls << (k == 0 ? "" : ",") << r.counts[k];
+    ls << " cur=" << r.curType << " q=" << r.queued << "/" << r.pending;
+    return ls.str();
+}
+}   // namespace (P323 takeorder)
+void P323TakeOrderBefore(unsigned int uid)
+{
+    g_p323ToPreUid = uid; g_p323ToPreRd = -2;
+    ::Character* c = FindSpawned(uid);
+    if (c != 0 && PlausibleObject(c)) g_p323ToPreRd = P323ReadPod(c, &g_p323ToPre);
+}
+void P323TakeOrder(unsigned int uid, int intentType, unsigned int subjectUid, int outcome)
+{
+    if (uid == 0) return;
+    const bool test = g_p323Test.find(uid) != g_p323Test.end();
+    if (test) { if (g_p323ToLines >= kP323ToCap) { ++g_p323ToSkipped; return; } ++g_p323ToLines; }
+    else { if (g_p323ToOther >= kP323ToOtherCap) { ++g_p323ToSkipped; return; } ++g_p323ToOther; }
+    static const char* const kWord[6] = { "no-intent", "?", "?", "raid-skip", "?", "take-reruns-ai" };   /* 1 / 2 / 4 (injected / subject-unresolved / inject failed) retired by T-1416 fix attempt 2 - no take issues it */
+    ::Character* c = FindSpawned(uid);
+    P323Read r;
+    const int rd = (c != 0 && PlausibleObject(c)) ? P323ReadPod(c, &r) : -2;
+    const bool pre = (g_p323ToPreUid == uid && g_p323ToPreRd == 1);
+    int sumB = 0, sumA = 0;
+    if (pre) for (int k = 0; k < 5; ++k) sumB += g_p323ToPre.counts[k] > 0 ? g_p323ToPre.counts[k] : 0;
+    if (rd == 1) for (int k = 0; k < 5; ++k) sumA += r.counts[k] > 0 ? r.counts[k] : 0;
+    std::ostringstream ls;
+    ls << "[PROBE] P323 takeorder uid=" << uid << " test=" << (test ? 1 : 0) << " type=" << intentType << " '"
+       << (intentType > 0 ? P323TaskTypeName(intentType) : std::string("none")) << "' subject=" << subjectUid
+       << " outcome=" << ((outcome >= 0 && outcome < 6) ? kWord[outcome] : "?")
+       << " before=" << (pre ? P323ListsText(g_p323ToPre) : std::string("unread"))
+       << " after=" << (rd == 1 ? P323ListsText(r) : std::string("unread"))
+       << " queueGrew=" << ((pre && rd == 1) ? (sumA > sumB ? 1 : 0) : -1)
+       << " curChanged=" << ((pre && rd == 1) ? (r.curType != g_p323ToPre.curType ? 1 : 0) : -1);
+    if (c != 0 && PlausibleObject(c)) ls << " " << BehaviourString(c);
+    ls << " skipped=" << g_p323ToSkipped;
+    if (test && g_p323ToLines == kP323ToCap) ls << " (P323 takeorder line cap reached)";
+    if (!test && g_p323ToOther == kP323ToOtherCap) ls << " (P323 takeorder other-character cap reached - later ones are counted only)";
+    DebugLog(ls.str());
+    g_p323ToPreUid = 0;
+}
+// PROBE-END: P323
 }   /* namespace coop */

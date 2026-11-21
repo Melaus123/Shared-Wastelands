@@ -49,6 +49,7 @@
 #include <cmath>
 
 namespace coop { bool DestroyLocalObject(void* obj); }   /* T-1318 a4 fold 1: worldgen.cpp (worldgen.h) - the mod's own destroy of one object */
+namespace coop { void TraderSpawnNoteAdopted(unsigned int uid, ::Character* c); }   /* T-1416 TEST-ONLY: items.cpp - the traderspawn squad form names a member when this sweep gives it its uid */
 namespace coop {
 
 namespace {
@@ -167,7 +168,7 @@ Adopted g_adoptedRows[kMaxAdopted] = {0};
 // notebook's delivery set, and a game that newly has the area is re-sent the character by the catch-up - cooplive::AnnounceDecide),
 // and to the session peer only while the notebook road is down.
 std::map<unsigned int, int> g_announced;
-long long g_withheld = 0, g_unloadsSent = 0, g_reannouncedOnReload = 0, g_announceTicks = 0, g_announceStale = 0, g_announceSkippedHandover = 0, g_streamGateWithheld = 0;
+long long g_withheld = 0, g_unloadsSent = 0, g_reannouncedOnReload = 0, g_announceTicks = 0, g_announceMapRuns = 0, g_announceStale = 0, g_announceSkippedHandover = 0, g_streamGateWithheld = 0;
 /* announceHeldForHandover = announce passes that held a uid's withdrawal for its hand-over (cooplive::kAnnHoldForHandover, per
    uid per pass); g_annHeld = the uids held now (each logged once when held and once when the hold ends, the first 60 lines) */
 long long g_announceHeldForHandover = 0, g_annHeldLogged = 0;
@@ -658,7 +659,7 @@ static void RetireWithdrawDrain()
         SW_DEVLOG("[P034] retire-withdraw: sent " + S((long long)sent) + " UNLOAD(s) for characters this"
                  " engine no longer has, first uid=" + S(firstUid) + "; " + S(RetireWithdrawPending())
                  + " still pending (P8m)");
-    else if (resolved > 0 && (g_announceTicks % 60) == 0)
+    else if (resolved > 0 && ((g_announceTicks - g_announceMapRuns) % 60) == 0)   /* T-1442 step 6 review nit: the 1 s passes only - once a minute */
         SW_DEVLOG("[P034] retire-withdraw: " + S((long long)resolved) + " retired uid(s) needed no UNLOAD"
                  " (the peer was never told about them); " + S(RetireWithdrawPending()) + " pending (P8m)");
 }
@@ -1251,7 +1252,15 @@ void WorldSyncReannounceAll() { if (g_adoptedCount > 0) g_reannounceAt = 0; SW_D
 void WorldSyncTick()
 {
     AnnounceSquadGenNext();   /* one squad answer per tick: the pass, the link-up drain and the spawn sweep below share it */
-    { static long long s_t = 0; if (++s_t % 118 == 0 && g_mode != 0) AnnouncePass(); }   // M-A step 2, 1 Hz
+    {   /* M-A step 2, 1 Hz. T-1442 step 6 (F1480 b): and on the frame a new area map arrives (AreaMapApplySeqTS), so a character this game
+           runs whose area another game has just loaded or put away is announced or withdrawn then; the 1 s look stays (announceMapRuns) */
+        static long long s_t = 0; static unsigned s_mapSeq = 0;
+        const bool second = (++s_t % 118 == 0);
+        const unsigned mapSeq = AreaMapApplySeqTS();
+        const bool newMap = (mapSeq != s_mapSeq);
+        s_mapSeq = mapSeq;
+        if (g_mode != 0 && (second || newMap)) { if (!second) ++g_announceMapRuns; AnnouncePass(); }
+    }
     // Link-up EDGE, checked before anything else returns early - a re-announce is needed whether
     // or not adoption is currently on, and whether or not this instance is still sweeping.
     bool up = net::LinkIsUp();
@@ -1803,6 +1812,7 @@ void WorldSyncTick()
         }
 
         net::SetLocalOwner(uid);
+        coop::LeadNoteUidGiven(best);   /* T-1442 step 6 fix a: a formal leader's uid - its squad announced the next frame (handoff.cpp) */
         g_sweepAdoptGen[uid] = StoreWorldGenNow();   /* inv7e2 fold: picked up by THIS game's sweep from its own world - stamped with the world-load generation */
 
         // keepContainer = true: F103/T029 measured the null-container variant running away. The
@@ -1851,6 +1861,7 @@ void WorldSyncTick()
         // cannot handle-check is a character this probe is BLIND to, and a blind spot that reads as
         // "no problem found" is the failure mode this project keeps re-learning.
         TrackForLiveness(uid, best, true);   // the sweep: adopted from OUR world - the authorship record (F494)
+        TraderSpawnNoteAdopted(uid, best);   /* T-1416 TEST-ONLY: the traderspawn squad form's member got its uid (pointer compare only) */
 
         ++g_adopted;
         ++done;
@@ -2221,7 +2232,8 @@ void ReportWorldSync()
              + " clientViewDistance=" + (net::SessionIsHost() && net::PeerViewDistance() > 0.0f
                                          ? F1(net::PeerViewDistance())
                                          : std::string("none"))
-             + " skippedTooFar=" + S(g_skippedTooFar));
+             + " skippedTooFar=" + S(g_skippedTooFar)
+             + " announceMapRuns=" + S(g_announceMapRuns));   /* T-1442 step 6 (F1480 b), review fold S1: at the END of the line */
     // PROBE-START: P166
 #ifdef SW_DEV_BUILD
     P166Report();

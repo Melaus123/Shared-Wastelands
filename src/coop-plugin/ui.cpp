@@ -2241,12 +2241,22 @@ static void PanelProfDlgOk()
         const std::string name = coopcfg::CfgTrim(g_fNewWorld);
         std::string why;
         if (!coopworld::DisplayNameOk(name, &why)) { g_dlgText = why; return; }   /* the dialog stays open and says why, as CREATE */
-        if (g_profMode == 1)   /* CHANGE: a name any profile in that world holds is refused now, as CREATE there does */
-        {
+        if (g_profMode == 1)   /* CHANGE: a name another profile in that world holds is refused now, as CREATE there does */
+        {   /* T-1452: the world server's own decision (NewImportDecide) - the host's own never-played profile under that name takes the import */
             std::string text;
             PanelReadProfilesFile(g_hostProfWorld, &text);
-            if (coopprof::PlayerNameTaken(coopprof::ActiveRowsOfFile(text), name))
-            { g_dlgText = "Couldn't do that: " + coopprof::VerdictText(coopprof::kRefusedNameTaken, 0) + "."; return; }
+            const std::vector<coopprof::Row> fileRows = coopprof::ActiveRowsOfFile(text);
+            int attach = -1;
+            const int v = coopprof::HostChangeNewImportDecide(fileRows, StoreWorldPlayerId(g_hostProfWorld), name, &attach);   /* the id through the world's aliases.txt */
+            if (v != coopprof::kOk)
+            {
+                DebugLog("[IMPORT] UI: CHANGE's NEW with import '" + name + "' refused[" + coopprof::VerdictName(v) + "] by that world's profiles.txt (the world not running)");
+                g_dlgText = "Couldn't do that: " + coopprof::VerdictText(v, 0) + ".";
+                return;
+            }
+            if (attach >= 0)
+                DebugLog("[IMPORT] UI: CHANGE's NEW with import '" + name + "' names this player's own never-played profile " + coopui::PanelNum((long long)fileRows[(size_t)attach].num)
+                         + " - ATTACH, not nameTaken: the HOST press asks the world server for the import on it (T-1452)");
         }
         PanelImpOpen(name);
         return;
@@ -4402,10 +4412,13 @@ static void LoadHostPickStep(unsigned select, int verdict, const std::string& sa
         const bool same = r != 0 && r->folder == g_hostProfWorld;
         const coopprof::HostProfileChoice c = coopprof::HostProfileChoose(PanelProfRowsAsProf(), same ? g_hostProfNum : 0u,
                                                                           same ? g_hostProfNew : std::string(), coopcfg::CfgTrim(g_fName));
-        if (c.isNew != 0)
+        const bool imp = coopprof::HostPressAsksImport(c, same ? g_hostProfNew : std::string(), g_hostProfImport);   /* T-1096 part 3: CHANGE's NEW PROFILE with import; T-1452: also on one of mine (attach) */
+        if (c.isNew != 0 || imp)
         {
             if (g_loadNewAsked != 0) return;
-            const bool imp = !g_hostProfImport.empty() && coopprof::NameSame(c.name, g_hostProfNew);   /* T-1096 part 3: CHANGE's NEW PROFILE with import */
+            if (c.isNew == 0)
+                DebugLog("[IMPORT] HOST - CHANGE's NEW with import names this player's own profile " + coopui::PanelNum((long long)c.num) + " '" + c.name
+                         + "' - asking the world server for the import on it (it attaches when never played; T-1452)");
             if (!(imp ? StoreSpImportRequest(c.name, g_hostProfImport, g_hostProfImportAsk) : StoreProfileRequest(kProfReqNew, 0, c.name)))   /* T-1383: the creator's ask */
             {
                 LoadFail(coopui::kPressHostLateText, "CAN'T HOST", imp ? "the import's save is not a single-player save any more, or the world's link went down, before the new profile was asked for"
@@ -4414,7 +4427,7 @@ static void LoadHostPickStep(unsigned select, int verdict, const std::string& sa
             }
             g_loadNewAsked = 1;
             ::InterlockedIncrement64(&g_profNewAsked);
-            DebugLog("[AUTOLOAD] T-201 PP6': HOST - this player has no profile '" + c.name + "' in the world yet - asking the world to make it");
+            if (c.isNew != 0) DebugLog("[AUTOLOAD] T-201 PP6': HOST - this player has no profile '" + c.name + "' in the world yet - asking the world to make it");
             return;
         }
         num = c.num;
@@ -9899,6 +9912,8 @@ static void UiDriveCloseWindowRecheck()
 }
 static bool UiDriveClick(MyGUI::Gui* gui, const std::string& name)
 {
+    if (coopui::UiDriveSendsReport(name) != 0 && ConfigBugRelay() == 0)   /* T-1401 2c (F1287 review): never the real report service */
+        return UiDriveRefuse("uiclick", name, "it would send a bug report to the REAL report service (it posts to Discord): this game's cfg has no TEST-ONLY bugrelay=test / test503 / test404");
     if (coopui::UiDriveFind(name, coopui::kDriveWindowClose) != 0) return UiDriveWindowClose(gui, name);   /* T-220 */
     if (coopui::UiDriveFind(name, coopui::kDriveEscape) != 0) return UiDriveEscape(name);                  /* T-220 */
     if (coopui::UiDriveFind(name, coopui::kDriveTab) != 0) return UiDriveTabClick(gui, name);              /* p47d */
@@ -9919,6 +9934,13 @@ static bool UiDriveClick(MyGUI::Gui* gui, const std::string& name)
         std::string pwhy;
         if (coopui::UiDrivePointName(name, &x, &y) == 0) return UiDriveRefuse("uiclick", name, "not a point:<x>,<y>");
         if (!UiDrivePointOnScreen(x, y, &pwhy)) return UiDriveRefuse("uiclick", name, pwhy);
+        if (ConfigBugRelay() == 0)   /* T-1401 2c (F1287 review): a point on SEND / TRY AGAIN is refused as `uiclick bugsend` is */
+        {
+            MyGUI::LayerManager* lm = MyGUI::LayerManager::getInstancePtr();
+            for (MyGUI::Widget* p = lm != 0 ? lm->getWidgetFromPoint(x, y) : 0; p != 0; p = p->getParent())
+                if (p->getName() == coopui::UiDriveFind("bugsend", coopui::kDriveButton)->w1 || p->getName() == coopui::UiDriveFind("bugretry", coopui::kDriveButton)->w1)
+                    return UiDriveRefuse("uiclick", name, "that point is on the bug report's " + p->getName() + ", which would send to the REAL report service (it posts to Discord): this game's cfg has no TEST-ONLY bugrelay=test / test503 / test404");
+        }
         if (!g_driveEngineQueued.empty()) return UiDriveRefuse("uiclick", name, "an engine click is already queued (" + g_driveEngineQueued + ")");
         g_driveEngineQueued = name;
         DebugLog("[UI] uiclick " + name + " QUEUED (screen " + UiDriveScreen() + ") - the mouse click fires at the end of this frame");

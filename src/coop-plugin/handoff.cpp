@@ -29,6 +29,8 @@
 #include "../common/peergone.h"    /* PlayerGoneTakesRow: a player who leaves takes back only the squads handed to it */
 #include "../common/twinsleep.h"   /* T-761: the withdrawal kinds - a REVOKE with no winner takes a save-born twin only as the last resort */
 #include "../common/raidsquad.h"   /* T-1122 awake hand (owner 1524): AwakeTakeOrder - a taken raid squad's carried goal */
+#include "../common/leadmark.h"   /* T-1442 step 6: the squad-leader change's note list, mark skip and backstop classification - offline-tested */
+#include "hooks.h"   /* T-1442 step 6: coop::AddHook - set-leader 0x790C00 and remove-member 0x794C00 */
 #include "../common/orphanpurge.h"   /* T-1268: AnnounceArea - the sweep's own area answer, so a re-woken squad is judged as the sweep judges it */
 namespace coop { int KeeperPot(void* character, void** ownOut, int* catsOut); int KeeperPotWritePod(void* own, int cats);
                  int KeeperPotsInFlight(std::vector<void*>* pots, int* unresolved); }   /* T-1 B3 restructure: items.cpp - the squad's pot */
@@ -147,6 +149,25 @@ int StayAwakeWritePod(void* ap)
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 unsigned long long kApSetSquadLeaderRva = 0; static coop::AddrReg kApSetSquadLeaderRva_reg("ActivePlatoon_setLeader", &kApSetSquadLeaderRva);   /* T-1 B1: the address table fills this. Steam_1.0.65 0x790C00 */
+unsigned long long kApLeaderGetRva = 0; static coop::AddrReg kApLeaderGetRva_reg("ActivePlatoon_leader", &kApLeaderGetRva);   /* T-1442 step 6 review fold S2: the acting-leader getter 0x791FF0 (the row speech.cpp also registers), hooked */
+unsigned long long kApRemoveMemberRva = 0; static coop::AddrReg kApRemoveMemberRva_reg("ActivePlatoon_removeMember", &kApRemoveMemberRva);   /* T-1442 step 6: ActivePlatoon::removeMember(Character*), Steam_1.0.65 0x794C00 (1.0.68: gen_table_1068) */
+/* T-1442 step 6 fix attempt 3 (F1514): the engine's writers of a character's 'held' (+0x2F8: 1 bed, 2 cage), knocked-down (+0xE0) and
+   carried (+0x3D4) facts - each hooked below (LeadOutHooks). The first four rows are shared with spawn.cpp / build.cpp / gamecalls.cpp, which
+   call them; the last four are this fix's own. Steam_1.0.65 addresses. */
+static unsigned long long kLhBedModeRva = 0;    static coop::AddrReg kLhBedModeRva_reg("SetBedMode", &kLhBedModeRva);               /* 0x32E2B0 Character::setBedMode(bool, UseableStuff*): +0x2F8 0 / 1 */
+static unsigned long long kLhPrisonModeRva = 0; static coop::AddrReg kLhPrisonModeRva_reg("SetPrisonMode", &kLhPrisonModeRva);      /* 0x3305C0 Character::setPrisonMode(bool, UseableStuff*): +0x2F8 0 / 2 (the cage-use start 0x357FE0, the release, the carry) */
+static unsigned long long kLhPoseRva = 0;       static coop::AddrReg kLhPoseRva_reg("Character_setPoseState", &kLhPoseRva);         /* 0x5C7390 the only runtime writer of +0xE0 (03-systems/medical.md) */
+static unsigned long long kLhDroppedRva = 0;    static coop::AddrReg kLhDroppedRva_reg("GetDropped", &kLhDroppedRva);                /* 0x5CC110 Character::getDropped(bool, bool): a carried body put down */
+static unsigned long long kLhPickedUpRva = 0;   static coop::AddrReg kLhPickedUpRva_reg("Character_getPickedUp", &kLhPickedUpRva);   /* 0x5CE300 (carried, carrier): +0x3D4 = 1, the bed and cage left (+0x2F8 = 0) */
+static unsigned long long kLhOutOfBedRva = 0;   static coop::AddrReg kLhOutOfBedRva_reg("TaskGetOutOfBedStep", &kLhOutOfBedRva);     /* 0x3455C0 (task, Character*): Task_GetOutOfBed's step - +0x2F8 = 0 without setBedMode */
+static unsigned long long kLhFloorStopRva = 0;  static coop::AddrReg kLhFloorStopRva_reg("SleepOnFloorStop", &kLhFloorStopRva);      /* 0x347E80 (task, who): Task_SleepOnFloor vtable slot 2 - +0x2F8 = 0 */
+static unsigned long long kLhFloorEndRva = 0;   static coop::AddrReg kLhFloorEndRva_reg("SleepOnFloorEnd", &kLhFloorEndRva);         /* 0x348010 (task, who): Task_SleepOnFloor vtable slot 3 - +0x2F8 = 0 */
+/* review fold (attempt 3): the physics ragdoll's on and off. inRagdoll 0x7D08A0 reads the ragdoll (AnimationClass +0x2E8, getRagdoll
+   0x5C4B00) and its +0x59 / +0x5A; their only writers are the two one-line setters 0x7D0790 / 0x7D07A0, called only from
+   AnimationClass::ragdollModeUT 0x5B8F80 (disassembly sweep + callers, 2026-11-19), which also makes and frees the ragdoll. It is the
+   AnimationClass vtable slot +0x50 (two vtables; a third's slot is 0x5B95C0, which calls it), called by Character::_ragdollMode
+   0x5D0320 with the Character as its 6th argument ([rsp+0x28] = this, 0x5D0600). */
+static unsigned long long kLhRagdollRva = 0;    static coop::AddrReg kLhRagdollRva_reg("AnimationClass_ragdollModeUT", &kLhRagdollRva); /* 0x5B8F80 (anim, on, pos*, mask, bone, Character*) */
 
 typedef std::pair<void*, std::string> HoKey;   /* (faction, the engine's squad id): a squad's key (SquadKeyOf) */
 struct Pending { std::vector<net::XferMember> members; std::map<unsigned int, HoKey> keyOf; /* [a1b2-hc1]: each member's squad key, read at the send */ std::map<unsigned int, std::string> handOf; /* T-1046 leg-N fold 2: each member's hand (cooplo::HandKey), read at the send while the body is whole */ unsigned int reason; double sentAt; int sends; void* ap; int logged; int targetSlot; int awakeWhole; int lentWhole; /* T-1122 lent flag (protocol 224): the message says "lent squad - whole or none" (kept over its resends) */ int worldWhole; /* T-1318 attempt 2 (D3, protocol 226): cooplo::kWholeBitWorld on a forced XFER - "world squad, whole or none" (kept over its resends); 0 on a follow-leader XFER */ coopsquad::FollowAnnounceMark mark; /* T-1239: both announcements of the squad when a follow XFER went */ Pending() : reason(0), sentAt(0.0), sends(0), ap(0), logged(0), targetSlot(-1), awakeWhole(1), lentWhole(0), worldWhole(0) {} };   /* awakeWhole (T-1122 re-check fold 5): 1 = no member was held back from this hand-over (its raid may go on with it) */   /* M7a A1 build 1 [a1b1-hd1] [review F11]: targetSlot - fixed at the first send; every resend and the ACK's sender test use it */   /* protocol 84: reason = coopsquad::kXferReason*. T-1 B1 restructure: ap = my squad the members were read from (the crossing test), logged = its xfer_out line was written (N5: its ACK line is written exactly then) */
@@ -422,11 +443,20 @@ int LeaderDeadOrHeldPod(::Character* c)
     __try { return (*(unsigned char*)((char*)c + 0x5BC) != 0 || *(int*)((char*)c + 0x2F8) != 0) ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* THE can't-lead rule, one copy (T-1442 attempt 3 review fold): LeaderOut and the engine writers' hooks (LeadOutReadPod) both ask it.
+   1 out, 0 not, -1 unreadable. Dead or in a bed or cage (LeaderDeadOrHeldPod), else knocked down or ragdolled - the mod's one downed
+   predicate (replicate.cpp IsDownedCharacter: prone +0xE0, or the engine's inRagdoll 0x7D08A0 - carried +0x3D4 or the physics ragdoll
+   on), for the engine's vt+0x30 test. ANY THREAD: guarded reads and the engine's read-only inRagdoll only. */
+int LeaderOutAnswer(::Character* c)
+{
+    if (!Plaus(c)) return -1;
+    const int dh = LeaderDeadOrHeldPod(c);
+    if (dh != 0) return dh;
+    return IsDownedCharacter(c) ? 1 : 0;
+}
 bool LeaderOut(::Character* c)
 {
-    if (!Plaus(c)) return true;
-    if (LeaderDeadOrHeldPod(c) != 0) return true;   // unreadable fails closed
-    return IsDownedCharacter(c);   // knocked out / ragdolled: the mod's one downed predicate (replicate.cpp), for the engine's vt+0x30 test
+    return LeaderOutAnswer(c) != 0;   // unreadable fails closed
 }
 /* Both books belong to one set of players. The first to see a new epoch - another player entered the world, or the old link went
    down (StorePeerEpoch; the 1-Hz pass, or an arriving announcement) - forgets the others' announcements, forgets what this game
@@ -585,13 +615,13 @@ void BuildMembers(const std::vector<unsigned int>& uids, std::vector<net::XferMe
         m.uid = uids[k];
         ReadPos(c, &m.x, &m.y, &m.z);
         ReadAuthorityFacing(c, &m.fx, &m.fz);
-        ReadAuthorityIntent(c, &m.intentType, &m.intentSubject, &m.ix, &m.iy, &m.iz);
+        ReadAuthorityIntent(c, &m.intentType, &m.intentSubject, &m.ix, &m.iy, &m.iz);   /* T-1416 fix attempt 2: sent, never issued by the taker (counted / probed only) - later clean-up */
         out->push_back(m);
     }
 }
 long long g_nudges = 0, g_keptUntaken = 0, g_xferInOutsideRing = 0;
 long long g_tick = 0, g_squadsSeen = 0, g_xferOut = 0, g_xferResent = 0, g_xferAbandoned = 0, g_ackIn = 0, g_released = 0;
-long long g_xferIn = 0, g_taken = 0, g_intentsGiven = 0, g_intentsSubjectUnresolved = 0, g_ackOut = 0, g_xferInUnknownUid = 0, g_teleports = 0;
+long long g_xferIn = 0, g_taken = 0, g_takeCarriedNotIssued = 0, g_takeOrdersDropped = 0, g_takeOrdersDropUnread = 0, g_ackOut = 0, g_xferInUnknownUid = 0, g_teleports = 0;
 std::set<void*> g_moneyKnown;   /* T-799 D1: the squad pots (Ownerships) whose money is known on this game - see coopsquad::MoneyKnownAfter */
 long long g_moneyKnownMarks = 0, g_catsWithheldNow = 0;
 long long g_moneyEv[coopsquad::kMoneyEvKinds] = { 0, 0, 0, 0, 0, 0, 0, 0 }, g_moneyKnownCleared = 0;   /* T-799 D1: marks asked, by event kind; marks cleared */
@@ -1430,27 +1460,34 @@ static int KeepTakeAt(float x, float z)
 static int PlayerTableFresh() { int a = 0, b = 0, c = 0; return PeerPlayerSectorsTS(&a, &b, &c, 0) >= 0 ? 1 : 0; }
 /* the XFER take path, factored (design 2.5 item 3) - used by the XFER and the RELEASE: one member this game takes from another game -
    owner record at `gen`, the giver's copy announced (its later withdrawal is this game's), not a sweep adoption, the puppet made this
-   game's own, the squad's money snapshot, the intent. MAIN THREAD (the drain - engine writes allowed). */
-static void TakeMemberFromPeer(const net::XferMember& mm, unsigned int gen, int* intents, int* unresolved, int awakeBlock = 0, int* skipped = 0)   /* T-1122 awake hand: awakeBlock / skipped */
+   game's own, the squad's money snapshot; the carried goal never issued (T-1416). MAIN THREAD (the drain - engine writes allowed). */
+static void TakeMemberFromPeer(const net::XferMember& mm, unsigned int gen, int* reRun, int awakeBlock = 0, int* skipped = 0)   /* T-1122 awake hand: awakeBlock / skipped; T-1416: reRun */
 {
-    ::Character* c = FindSpawned(mm.uid);
     net::TakeLocalOwner(mm.uid, gen);
     NoteAnnouncedOnTake(mm.uid);   /* M7a3f3 [m7a3f3-mg1]: the giver keeps a copy - its later withdrawal is owed by this game */
     ForgetSweepAdopt(mm.uid);      /* inv7e2: received by hand-over - never a reloaded copy */
     UnpuppetForOwnership(mm.uid);
+    P323AiLine(mm.uid, "take");   // PROBE P323
     ++g_taken;
     g_catsDue = 1;   /* T-1 B3 restructure (F1): a taken squad's money is adopted at the next safe point */
     {   /* T-1 B3 fold (M2): the giver's newest announcement of this leader, kept for a take-over write held past its n = 0 */
         const coopsquad::PeerLeadEntry* te = g_peerLead.ForLeader(mm.uid);
         if (te != 0 && g_catsAdopt.find(mm.uid) == g_catsAdopt.end()) { CatsAdopt& s = g_catsTakeSnap[mm.uid]; s.seq = te->seq; s.cats = te->cats; }
     }
-    if (raidsq::AwakeTakeOrder(awakeBlock, mm.intentType) == raidsq::kTakeOrderSkip) { if (skipped != 0) ++*skipped; }   /* T-1122 awake hand: the raid's campaign drives the squad - its carried goal is not issued (T2094: it pinned the squad) */
-    else if (mm.intentType > 0 && Plaus(c))
-    {
-        ::Character* subj = mm.intentSubject ? FindSpawned(mm.intentSubject) : 0;
-        if (mm.intentSubject && !Plaus(subj)) { ++*unresolved; ++g_intentsSubjectUnresolved; }
-        else if (InjectOrder(c, mm.intentType, subj, Ogre::Vector3(mm.ix, mm.iy, mm.iz))) { ++*intents; ++g_intentsGiven; }
+    P323TakeOrderBefore(mm.uid);   // PROBE P323
+    {   /* T-1416 fix attempt 2 review fold 1: no order from the member's copy life survives the take (replicate.cpp DropOrdersOnTake) */
+        ::Character* tc = FindSpawned(mm.uid);
+        if (tc != 0 && DropOrdersOnTake(tc) == 1) ++g_takeOrdersDropped; else ++g_takeOrdersDropUnread;
     }
+    /* T-1416 fix attempt 2 (F1556): no take issues the giver's carried goal. Issued, it was a player-style order (InjectOrder, 'clear old
+       orders') that the engine's goal chooser takes first and that never finishes - a struck member went back to it, never fighting
+       (F1555). The raid's campaign drives a squad whose raid came with it (T2094); every other taken member's AI re-chooses from its
+       refilled goals and the squad's package, as the engine does for its own squads. The giver still sends the goal (net::XferMember's
+       intent fields - no protocol change); here it is only counted and probed. */
+    const int carried = raidsq::AwakeTakeOrder(awakeBlock, mm.intentType);
+    if (carried == raidsq::kTakeOrderSkip) { if (skipped != 0) ++*skipped; }   /* T-1122 awake hand: the raid's campaign drives the squad (T2094: the carried goal pinned it) */
+    else if (carried == raidsq::kTakeOrderReRun) { if (reRun != 0) ++*reRun; ++g_takeCarriedNotIssued; }   /* not issued - the take re-runs the AI */
+    P323TakeOrder(mm.uid, mm.intentType, mm.intentSubject, carried == raidsq::kTakeOrderSkip ? 3 : carried == raidsq::kTakeOrderReRun ? 5 : 0);   // PROBE P323
 }
 static void RelLog(const std::string& s) { if (g_relLogged >= kRelLogCap) return; ++g_relLogged; DebugLog(s); }
 static std::string SlotText(int s) { return s >= 0 ? "slot " + N((long long)s) : std::string("no slot"); }
@@ -2545,7 +2582,7 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
     }
     const int squadInRing = (squadKnown != 0 && KeepTakeAt(sqx, sqz) == 1) ? 1 : 0;   /* this game's engine keeps the squad at its spot (live), not the once-a-second loaded list */
     cooplo::ReleaseAckMsg ack; ack.id = msg.id;
-    int intents = 0, unresolved = 0; long long stale = 0;
+    int reRun = 0; long long stale = 0;
     const int awakeBlock = RaidAwakeBlockHas(leader); int awakeSkipped = 0;   /* T-1122 awake hand: the squad's raid came first - no carried goal issued */
     /* T-1122 whole or none (owner 1581 a): every row judged first (no change made), then a lent squad's rows are all adopted or none */
     std::vector<int> verdict(mm.size(), (int)cooplo::kDrop), haveRow(mm.size(), 0);
@@ -2588,7 +2625,7 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
         const int have = haveRow[i];
         int v = verdict[i];
         if (v == cooplo::kAdopt && wholeRefused != 0) v = wholeRefused == 1 ? (int)cooplo::kDrop : (int)cooplo::kDefer;   /* T-1122 whole or none */
-        if (v == cooplo::kAdopt) { TakeMemberFromPeer(mm[i], msg.rows[i].gen, &intents, &unresolved, awakeBlock, &awakeSkipped); ack.adopted.push_back(uid); ++g_relInAdopted; continue; }
+        if (v == cooplo::kAdopt) { TakeMemberFromPeer(mm[i], msg.rows[i].gen, &reRun, awakeBlock, &awakeSkipped); ack.adopted.push_back(uid); ++g_relInAdopted; continue; }
         if (v == cooplo::kAdoptDup)
         {
             if (net::MineGenOf(uid) < msg.rows[i].gen) net::TakeLocalOwner(uid, msg.rows[i].gen);   /* a repeat (or a dual run): run at the offer's gen */
@@ -2611,7 +2648,7 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
                  + N((long long)awakeSkipped) + " member(s) (its raid's plan came with it; runs the key " + N((long long)mine) + ")");
     }
     RelLog("[RELEASE] <- id=" + N((long long)msg.id) + " from " + SlotText(from) + " n=" + N((long long)mm.size()) + " lentWhole=" + N((long long)lentWhole) + " worldWhole=" + N((long long)worldWhole) + " alreadyHere=" + N((long long)nDup) + " adopted=" + N((long long)ack.adopted.size())
-           + " dropped=" + N((long long)ack.dropped.size()) + " (stale " + N(stale) + ") deferred=" + N((long long)ack.deferred.size()) + " intents=" + N((long long)intents)
+           + " dropped=" + N((long long)ack.dropped.size()) + " (stale " + N(stale) + ") deferred=" + N((long long)ack.deferred.size()) + " carriedNotIssued=" + N((long long)reRun)
            + (sent ? std::string() : std::string(" - ACK NOT SENT (no road; the giver resends)")));
 }
 
@@ -2670,6 +2707,379 @@ static void XferUnaccLine(int follow, unsigned int key, const SquadView& sv, int
              + N((long long)sv.count) + " known=" + N((long long)known) + ", " + N((long long)built) + " people could go, " + N((long long)outside) + " living member(s) outside them (never numbered, or this game's and not sent; another game's people not counted - a4 fold 1)"
              + (runHere < 0 ? ", its list over 64" : "") + " - the squad stays here (worldWhole6 xferUnacc=" + N(g_wwXferUnacc) + " followUnacc=" + N(g_wwFollowUnacc) + "; once per squad)");
 }
+/* ---- T-1442 step 6 (F1480 design a): A SQUAD'S LEADER CHANGE GOES OUT WHEN THE ENGINE MAKES IT ------------------------------------
+   The engine's writers note what they changed after their original returns (src/common/leadmark.h): set-leader 0x790C00 and
+   remove-member 0x794C00 the squad (detour_leadSet / detour_leadRemove below), the knock-out calls (medical.cpp) and the death call
+   (worldstate.cpp) the character (LeadNoteChar). Each frame, before HandoffTick's 1 s gate, LeadEventTick takes the notes, finds each
+   one's squad among the squads HandoffTick's pass groups (one mirror walk, the pass's own grouping: a member this game runs, not a
+   player's), and runs SquadPassOne - the pass's own per-squad function - on it: the announcement with live reads and, when it went out
+   (or the other game's announcement for that squad arrived, LeadArrivalNote), the follow-leader hand-over decision. A noted squad
+   stays watched for coopleadmark::kWatchSec: a knock-out's fall (the downed read) and the engine's acting-leader write (+0xA8, the
+   getter 0x791FF0) can land frames after the call; AnnounceLead sends only on change, so a watched frame with nothing new sends
+   nothing. The 1 s pass is the backstop: a send it makes is classified (coopleadmark::LeadBackstopKind) - missed = a leader change no
+   note announced. Squads this game only copies are never found (no member run here) - the other game announces them; the mod's own
+   set-leader call on a copy (SquadLeaderSafePointDrain) is not noted at all (its thread mark, g_leadOwnCallTid). */
+enum { kSqPassTick = 0, kSqPassEvent = 1, kSqPassArrival = 2 };
+static coopleadmark::LeadMarkTable g_leadMarks;   /* zero-initialised static: empty. ANY THREAD adds, the main thread takes */
+struct LeadWatch { double since; int kind; unsigned long tick; };
+static std::map<void*, LeadWatch> g_leadWatch;     /* squad (ActivePlatoon) -> its newest note, while its window holds. MAIN THREAD */
+static std::set<unsigned int> g_leadArrivalUids;   /* uids an arrived announcement named since the last frame (LeadArrivalNote). MAIN THREAD */
+static volatile LONG g_leadOwnCallTid = 0;         /* the thread inside the mod's own set-leader call on a copy squad */
+static volatile LONG g_leadSetHook = 0, g_leadRemoveHook = 0, g_leadGetterHook = 0;   /* 0 not installed, 1 installed, -1 failed / no row */
+static volatile LONG64 g_leadOwnCallSkipped = 0;   /* set-leader calls of the mod's own, not noted */
+static volatile LONG g_leadDrainDue = 0;           /* an announcement arrived: SquadLeaderSafePointDrain runs at the next safe point */
+static long long g_leadDrainEarly = 0;             /* drain runs an arrival brought forward of its 1 s throttle */
+static long long g_leadEvNotRun = 0, g_leadEvRuns = 0, g_leadEvArrivalRuns = 0, g_leadEvSent = 0, g_leadEvDropped = 0;
+static long long g_leadBackstop[coopleadmark::kBsKinds] = { 0, 0, 0, 0, 0 };
+static long long g_leadEvSentBy[coopleadmark::kNoteKinds + 1] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };   /* review fold S3: event-road sends by the note that named the squad (+ arrival) */
+static long long g_leadEvLines = 0, g_leadBsLines = 0, g_leadArrLines = 0;
+static const long long kLeadEvLineCap = 60, kLeadBsLineCap = 30, kLeadArrLineCap = 60;
+
+/* a send SquadPassOne's announcement made: the event road's capped line, or the backstop's classification */
+static void LeadSentNote(void* ap, int mode, int noteKind, unsigned long noteTick, int prevSent, unsigned int prevActing, unsigned int prevFormal,
+                         unsigned int acting, unsigned int formal, ::Character* formalChar)
+{
+    std::map<void*, MyLead>::const_iterator ml = g_myLead.find(ap);
+    const unsigned int key = ml != g_myLead.end() ? ml->second.key : 0u;
+    if (mode != kSqPassTick)
+    {
+        ++g_leadEvSent;
+        ++g_leadEvSentBy[(noteKind >= 0 && noteKind < (int)coopleadmark::kNoteKinds) ? noteKind : (int)coopleadmark::kNoteKinds];
+        if (g_leadEvLines >= kLeadEvLineCap) return;
+        ++g_leadEvLines;
+        const std::string why = noteKind >= 0 ? std::string(coopleadmark::NoteName(noteKind)) : std::string("arrival");
+        const std::string ago = noteKind >= 0 ? ", " + N((long long)(DWORD)(::GetTickCount() - (DWORD)noteTick)) + " ms after the engine call" : std::string();
+        DebugLog("[LEAD] event -> squad=" + N((long long)key) + " lead=" + N((long long)acting) + " formal=" + N((long long)formal) + " (" + why + ") sent" + ago
+                 + " (was lead=" + N((long long)prevActing) + " formal=" + N((long long)prevFormal) + "; leadEvent sent " + N(g_leadEvSent) + ")");
+        return;
+    }
+    const int watched = g_leadWatch.find(ap) != g_leadWatch.end() ? 1 : 0;
+    const int k = coopleadmark::LeadBackstopKind(prevSent, prevActing, prevFormal, acting, formal, watched, (formalChar != 0 && !LeaderOut(formalChar)) ? 1 : 0);
+    ++g_leadBackstop[k];
+    if (k != coopleadmark::kBsMissed && k != coopleadmark::kBsWake && k != coopleadmark::kBsWatched) return;
+    if (g_leadBsLines >= kLeadBsLineCap) return;
+    ++g_leadBsLines;
+    DebugLog("[LEAD] backstop -> squad=" + N((long long)key) + " lead " + N((long long)prevActing) + " -> " + N((long long)acting) + " formal " + N((long long)prevFormal) + " -> " + N((long long)formal)
+             + (k == coopleadmark::kBsMissed ? " MISSED - no note announced it" : (k == coopleadmark::kBsWake ? " (wake: the formal leader stood up - no engine call to note)" : " (watched: its note's send was held back)"))
+             + " (leadBackstop missed " + N(g_leadBackstop[coopleadmark::kBsMissed]) + ")");
+}
+
+/* HandoffTick's per-squad work, one squad: the announcement (with live reads), the follow-leader hand-over decision and, on the 1 s pass
+   only, the position road (the forced hand-over). mode kSqPassTick = the 1 s pass; kSqPassEvent = a noted squad (its decision only when
+   its announcement went out); kSqPassArrival = the other game's announcement for it arrived (the decision always). noteKind / noteTick:
+   the event road's note (-1 none) for its line. leadSeen / xferGate / leadSends: the 1 s pass's own; the event road passes its own. */
+static void SquadPassOne(void* ap, const std::vector<unsigned int>& run, bool solo, double now, const Sector& mine, int mode, int noteKind, unsigned long noteTick,
+                         std::set<void*>* leadSeen, std::map<void*, int>* xferGate, int* leadSends)
+{
+    SquadView sv;
+    const bool isSquad = !solo && ReadSquadAt(ap, &sv) == 1;
+    ::Character* leader = (isSquad && Plaus(sv.leader)) ? sv.leader : 0;
+    const unsigned int leaderUid = leader ? FindSpawnedUid(leader) : 0;
+    const bool leaderMine = leaderUid != 0 && net::IsUidMine(leaderUid);
+    /* T-1 B3 restructure (protocol 89): the squad's money rides this squad's announcement when this game runs its formal leader
+       (KeeperPot: the leader's getOwnerships()->money). Point 3 (F1): a squad this game has just TAKEN is not announced (and not
+       handed on) until SquadCatsSafePointDrain has written the other game's last announced cats into it - the next safe point. */
+    int haveCats = 0, cats = 0, announceCurrent = 1;
+    if (isSquad && leaderMine)
+    {
+        void* potOwn = 0;
+        haveCats = (KeeperPotAnnounced((void*)leader, &potOwn, &cats) == 1) ? 1 : 0;   /* T-1 B3 fold (M2): net of this game's in-flight predictions */
+        if (haveCats == 0) CatsPotUnread(leaderUid, 0);
+        long long adoptDelta = 0; unsigned int adoptSeq = 0; int adoptCats = 0;
+        if (haveCats != 0 && CatsAdoptAction(ap, leaderUid, &adoptDelta, &adoptSeq, &adoptCats) != coopsquad::kCatsNone)
+        { leadSeen->insert(ap); (*xferGate)[ap] = 0; g_catsDue = 1; return; }
+        /* T-799 D1: a pot whose money is not known here goes out with no money - the copies keep their value */
+        if (haveCats != 0 && coopsquad::AnnounceCarriesMoney(1, KeeperMoneyKnown(potOwn)) == 0) { haveCats = 0; cats = 0; if (mode == kSqPassTick) ++g_catsWithheldNow; }
+    }
+    // T-1 B1 restructure (re-check N1-N5 of ff655c5): ONE AUTHORITY, ONE ANNOUNCED VALUE. This game's engine's acting leader of
+    // the squad (EngineLeaderChoice: +0xA0 if standing, else +0xA8 - computed ONCE, here) is announced with the formal leader
+    // (+0xA0) and the members this game runs (MSG_SQUAD_LEAD), and it is the very value this game decides with. The other
+    // game's announced acting leader is used AS IS. Both games so feed AgreedSquadLeader the same pair (named beats none,
+    // differing -> the lower uid), and only the game that does NOT run the agreed leader sends its members (follow-leader
+    // XFER). An agreed leader neither game runs here is "leader unknown": the position rule. SquadFollowLeader's engine-only
+    // fallback is gone - the announced value already names the engine's leader when the other game runs it.
+    unsigned int followUid = 0;
+    coopsquad::FollowAnnounceMark annNow;   /* T-1239: both announcements of this squad as they stand this pass */
+    if (isSquad)
+    {
+        unsigned int uids[kSquadViewCap];
+        for (int k = 0; k < sv.stored; ++k) uids[k] = Plaus(sv.members[k]) ? FindSpawnedUid(sv.members[k]) : 0u;
+        int actingUsable = 0;
+        for (int k = 0; k < sv.stored; ++k) if (Plaus(sv.acting) && sv.members[k] == sv.acting) { actingUsable = LeaderOut(sv.acting) ? 0 : 1; break; }
+        const int choice = coopsquad::EngineLeaderChoice(leader != 0 ? 1 : 0, (leader != 0 && LeaderOut(leader)) ? 1 : 0, actingUsable);
+        ::Character* eng = choice == coopsquad::kEngineLeadA0 ? leader : (choice == coopsquad::kEngineLeadA8 ? sv.acting : 0);
+        if (choice == coopsquad::kEngineLeadA8 && mode == kSqPassTick) ++g_leaderActing;
+        const unsigned int myLead = eng != 0 ? FindSpawnedUid(eng) : 0u;
+        leadSeen->insert(ap);
+        /* T-1442 step 6: what was last announced, so a send is told apart (the event road's line; the backstop's classification) */
+        std::map<void*, MyLead>::const_iterator pv = g_myLead.find(ap);
+        const int prevSent = (pv != g_myLead.end()) ? pv->second.sent : 0;
+        const unsigned int prevActing = prevSent != 0 ? pv->second.acting : 0u, prevFormal = prevSent != 0 ? pv->second.formal : 0u;
+        const int sendsBefore = *leadSends;
+        announceCurrent = AnnounceLead(ap, myLead, leaderUid, run, haveCats, cats, leadSends);   /* T-1 B3 restructure: with the money */
+        const int sentNow = (*leadSends > sendsBefore) ? 1 : 0;
+        if (sentNow != 0) LeadSentNote(ap, mode, noteKind, noteTick, prevSent, prevActing, prevFormal, myLead, leaderUid, leader);
+        /* T-1442 step 6: the event road decides the hand-over only when its announcement went out or the other game's arrived */
+        if (mode != kSqPassTick && coopleadmark::LeadEventDecides(sentNow, mode == kSqPassArrival ? 1 : 0) == 0) return;
+        const coopsquad::PeerLeadEntry* pe = PeerAnnouncedFor(sv, uids);
+        const unsigned int peerLead = pe != 0 ? pe->acting : 0u;
+        if (mode == kSqPassTick && myLead != 0 && peerLead != 0 && myLead != peerLead) ++g_agreedDiffered;
+        followUid = coopsquad::AgreedSquadLeader(myLead, peerLead);
+        if (pe != 0) { annNow.peerSender = pe->sender; annNow.peerSeq = pe->seq; }
+        std::map<void*, MyLead>::const_iterator ml = g_myLead.find(ap);
+        if (ml != g_myLead.end() && ml->second.sent != 0) { annNow.myKey = ml->second.key; annNow.mySeq = ml->second.seq; }
+    }
+    (*xferGate)[ap] = coopsquad::HandoverXferMayGo(haveCats, announceCurrent);   /* T-1 B3 fold (L3) */
+    const bool followMine = followUid != 0 && net::IsUidMine(followUid);
+    const bool followPeer = followUid != 0 && !followMine && HasPuppet(followUid);   // the other game runs it (H1: a live puppet here)
+    std::map<unsigned int, double>::const_iterator bo = g_followBackoff.find(followUid);
+    const int held = (followPeer && (g_pending.find(followUid) != g_pending.end() || bo != g_followBackoff.end())) ? 1 : 0;
+    int act = coopsquad::FollowAction((followMine || followPeer) ? 1 : 0, followMine ? 1 : 0, held);
+    /* T-1239 fix attempt 1: the game running that leader refused a member of this group as not in the leader's group on its engine -
+       the leader is unknown for this group (the position rule below) until either game's announcement for it changes. */
+    std::map<unsigned int, FollowGroupBlock>::iterator gb = followPeer ? g_followGroupBlock.find(followUid) : g_followGroupBlock.end();
+    if (gb != g_followGroupBlock.end())
+    {
+        int refusedHere = 0;
+        for (size_t k = 0; k < run.size() && refusedHere == 0; ++k) if (gb->second.members.count(run[k]) != 0) refusedHere = 1;
+        if (refusedHere != 0 && coopsquad::FollowAnnounceSame(gb->second.mark, annNow) == 0)
+        {
+            ++g_followUnblocked;
+            DebugLog("[XFER] follow leader=" + N(followUid) + " block LIFTED - an announcement for its group changed (other game " + N((long long)gb->second.mark.peerSeq) + " -> " + N((long long)annNow.peerSeq)
+                     + ", this game " + N((long long)gb->second.mark.mySeq) + " -> " + N((long long)annNow.mySeq) + "); follow-leader may send again (followUnblocked " + N(g_followUnblocked) + ")");
+            g_followGroupBlock.erase(gb);
+        }
+        else if (refusedHere != 0)
+        {
+            const int blocked = coopsquad::FollowActionBlocked(act, g_pending.find(followUid) == g_pending.end() ? 1 : 0);
+            if (blocked != act) { if (mode == kSqPassTick) ++g_followBlockedPass; act = blocked; }
+        }
+    }
+    if (act == coopsquad::kFollowWait) { if (mode == kSqPassTick) ++g_waitedLeader; return; }
+    if (coopsquad::HandoverXferMayGo(haveCats, announceCurrent) == 0) return;   /* T-1 B3 restructure (F1): the squad's cats go out before its XFER - next second */
+    if (act == coopsquad::kFollowSend)
+    {
+        Pending p; p.reason = coopsquad::kXferReasonFollowLeader; p.sentAt = now; p.sends = 1; p.ap = ap; p.logged = 0;
+        p.mark = annNow;   /* T-1239: a 'not in the leader's group' refusal blocks until either announcement differs from this */
+        BuildMembers(run, &p.members);
+        const size_t followBuilt = p.members.size();
+        PassHoldElsewhere(followUid, &p.members, "follow-leader");   /* M7a2 fold 3 [m7a2h-hp1] (T807 GAP 1) */
+        p.awakeWhole = p.members.size() == followBuilt ? 1 : 0;   /* T-1122 re-check fold 5: a member held back - a held raid is not sent onward */
+        const int followKept = KeptAsleepOfRun(run);   /* T-1318 attempt 3: people of the squad this game keeps asleep un-offered */
+        int followOutside = 0, followKnown = -1;
+        const int followRunHere = XferRunHereFor(isSquad, sv, run, &followOutside, &followKnown);   /* T-1318 attempt 4 (design A, site 6): the squad's living members, the engine's list */
+        const int followGo = cooplo::WorldXferGo((int)p.members.size(), followRunHere, followKept);
+        if (followGo != cooplo::kWxGo && !p.members.empty() && cooplo::WorldXferGo((int)p.members.size(), (int)run.size(), followKept) == cooplo::kWxGo)
+        { ++g_wwFollowUnacc; XferUnaccLine(1, followUid, sv, (int)p.members.size(), followRunHere, followOutside, followKnown); }
+        if (followGo != cooplo::kWxGo)
+        {   /* T-1318 attempt 2 fold 1 (review HIGH-1 a): the follow-leader XFER also goes whole or not at all - every person this game runs of
+               the squad, or none this pass (counted each pass; one line per squad, review LOW-1). Attempt 3 (owner 1615 a): "whole" also
+               counts the people of the squad kept asleep here - with any, not sent this pass */
+            if (!p.members.empty())
+            {
+                if (followGo == cooplo::kWxKeptAsleep) ++g_wwFollowKeptAsleep; else ++g_wwFollowHeldPart;
+                if (g_wwLines < kWwLineCap && g_wwHeldLogged.size() < 4096 && g_wwHeldLogged.insert(std::make_pair(followGo == cooplo::kWxKeptAsleep ? 3 : 1, followUid)).second)
+                {
+                    ++g_wwLines;
+                    DebugLog("[XFER] follow leader=" + N(followUid) + " NOT SENT (whole or none, T-1318 D3): " + N((long long)p.members.size()) + " of " + N((long long)run.size())
+                             + " people could go, kept asleep here " + N((long long)followKept) + " - the squad stays here (worldWhole2 followHeldPart=" + N(g_wwFollowHeldPart)
+                             + ", worldWhole3 followKeptAsleep=" + N(g_wwFollowKeptAsleep) + "; once per squad)");
+                }
+            }
+            return;
+        }
+        p.worldWhole = cooplo::kWholeBitWorld;   /* T-1318 attempt 2 fold 1: "world squad - whole or none" on the follow-leader XFER too, kept over its resends */
+        PendingKeysRead(&p);   /* [a1b2-hd8]: each member's squad key while whole - the ACK's index entry */
+        if (coopsquad::PassSendAfterHold((int)p.members.size()) != coopsquad::kPassSendGo) return;
+        p.targetSlot = net::OwnerSlotOf(followUid);   /* M7a A1 build 1 [a1b1-hd6]: the game that runs the leader */
+        const int lentGate = RaidAwakeHandSend(ap, 0, std::string(), followUid, p.targetSlot, p.awakeWhole);   /* T-1122 awake hand: the raid's block first, on the same road */
+        if (raidsq::LentGateHolds(lentGate) != 0) { RaidLentWholeNote(raidsq::kLwSendHeld); return; }   /* T-1122 whole or none: a lent squad not sent */
+        p.lentWhole = raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag (protocol 224) */
+        for (size_t p323i = 0; p323i < p.members.size(); ++p323i) P323AiLine(p.members[p323i].uid, "give-follow");   // PROBE P323
+        if (!net::SendXfer(followUid, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot, p.lentWhole | p.worldWhole)) return;
+        ++g_xferOut; ++g_followedLeader; g_xferFollowSent += (long long)p.members.size();
+        p.logged = FollowLogChanged(0, followUid, (long long)p.members.size()) ? 1 : 0;
+        g_pending[followUid] = p;
+        if (p.logged != 0)
+        {
+            const std::string q(1, (char)34);
+            DebugLog("[XFER] -> squad leader=" + N(followUid) + " members=" + N((long long)p.members.size()) + " reason=follow-leader lentWhole=" + N((long long)p.lentWhole) + " worldWhole=" + N((long long)(p.worldWhole != 0 ? 1 : 0)));
+            SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(followUid) + "," + q + "members" + q + ":" + N((long long)p.members.size())
+                     + "," + q + "forced" + q + ":0," + q + "reason" + q + ":" + q + "follow-leader" + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
+        }
+        return;
+    }
+    if (mode != kSqPassTick) return;   /* T-1442 step 6: the position road (the forced hand-over) stays on the 1 s pass */
+    if (act == coopsquad::kFollowByPosition && isSquad) ++g_leaderUnknownFellBack;
+    // N4: the position path's XFER is keyed on a uid this game RUNS - the agreed leader when mine, else +0xA0 when mine, else the
+    // first member run here - never on a character this game does not run.
+    const unsigned int key = followMine ? followUid : (leaderMine ? leaderUid : run[0]);
+    if (g_pending.find(key) != g_pending.end()) return;
+    // T-1 B1 step 2: the SQUAD position decides (the engine sleeps the squad by it); a squad of one, or a squad whose
+    // position is not usable yet, falls back to the leader's (else the first member's) own position.
+    // T-164 B4-3 (M4): a trader squad with a home building by its HOME's position - the one the adoption decided by
+    // (SquadDecisionPosAt), so the keeper is not handed away while its home, stock and restock stay here.
+    float lx = 0, ly = 0, lz = 0;
+    if (isSquad && SquadDecisionPosAt(sv, &lx, &lz) == 1) ly = sv.y;
+    else
+    {
+        ::Character* pc = leader ? leader : FindSpawned(run[0]);
+        if (!Plaus(pc) || !ReadPos(pc, &lx, &ly, &lz)) return;
+    }
+    const Sector s = SectorOf(lx, lz);
+    bool forced = true; const char* reason = "FORCED";
+    // Decision 15 / owner decision 580 (2026-10-09): ownership is STICKY - a squad stays with the game that runs it while this game's
+    // engine keeps it at its spot (EngineKeepsHere). Only once it would not is it offered, and only to an IN_WORLD game the world server's
+    // loaded map shows with the area loaded (the area's holder first when it is one of them, then the lower slot); the receiver's own
+    // loaded-list rule decides the take. Nobody loaded there, or no fresh map: it stays, this game's engine puts it away and the
+    // RELEASE decides. The wire's reason code is 1 (forced) here.
+    /* T-650 fold 2 (T1056 F2): the question is whether THIS game's engine keeps the squad at its spot, read live (EngineKeepsHere: the
+       engine's own +0xB1/+0xB0 flags for the area and its side neighbours) - not the once-a-second loaded list, which still named the
+       area a second after the announce pass had withdrawn the people, and names areas whose edge strip the engine puts away.
+       -1 (unreadable): this pass skips the squad; the next tick decides. */
+    const int keepHere = EngineKeepsHere(lx, lz);
+    if (keepHere < 0) { ++g_keepReadFailForced; return; }
+    if (keepHere == 1) { g_keepNoted.erase(key); g_niwNoted.erase(key); return; }
+    const int listedHere = SectorLoadedHere(s) ? 1 : 0;   /* the loaded list still names the area (the squad stands in its edge strip): logged for the run's check */
+    std::vector<int> rcv; int holderSeen = -1, notInWorld = 0, notKeep = 0;
+    const int nr = ReceiversFor(s, lx, lz, std::vector<int>(), &rcv, &holderSeen, &notInWorld, &notKeep);
+    if (notInWorld > 0 && g_niwNoted.insert(key).second) ++g_holderNotInWorld;   /* a game with the area loaded but not IN_WORLD was passed over */
+    if (nr <= 0)
+    {
+        if (g_keepNoted.insert(key).second)
+        {
+            if (nr == 0) ++g_holderKeep; else ++g_holderKeepUnknown;
+            if (nr == 0 && notKeep > 0) ++g_keepNotKeep;
+            RelLog("[RELEASE] forced XFER leader=" + N((long long)key) + " KEEP: this game's engine would not keep it at " + N((long long)lx) + "," + N((long long)lz) + " (sector " + SectorString(s)
+                   + (listedHere != 0 ? ", still listed" : ", not listed") + "; player " + SectorString(mine) + ") but "
+                   + (nr == 0 ? (notKeep > 0 ? "no other in-world game's engine would keep it there either (" + N((long long)notKeep) + " with the area loaded)" : std::string("no other in-world game has it loaded"))
+                              : std::string("the area map is not fresh (or this game's link is down)"))
+                   + " - it stays here; this game's engine puts it away and the RELEASE decides (holder " + N((long long)holderSeen) + ", loaded but not in the world "
+                   + N((long long)notInWorld) + "; releaseHolder keep " + N(g_holderKeep) + " keepUnknown " + N(g_holderKeepUnknown) + "; once per squad)");
+        }
+        return;
+    }
+    const int target = rcv[0];
+    std::map<unsigned int, ForcedTry>::iterator ftry = g_forcedTry.find(key);
+    if (ftry != g_forcedTry.end() && ftry->second.refused != 0)
+    {
+        if (ftry->second.target == target && ftry->second.x == s.x && ftry->second.y == s.y) return;   /* review MED-1: backed off - that receiver refused it in this sector */
+        g_forcedTry.erase(ftry);   /* the squad's sector or its receiver changed: offered again */
+    }
+    Pending p; p.reason = coopsquad::kXferReasonForced; p.sentAt = now; p.sends = 1; p.ap = ap; p.logged = 1;
+    BuildMembers(run, &p.members);
+    const size_t forcedBuilt = p.members.size();
+    PassHoldElsewhere(key, &p.members, "forced");   /* M7a2 fold 3 [m7a2h-hp2] (T807 GAP 1) */
+    p.awakeWhole = p.members.size() == forcedBuilt ? 1 : 0;   /* T-1122 re-check fold 5 */
+    const int forcedKept = KeptAsleepOfRun(run);   /* T-1318 attempt 3: people of the squad this game keeps asleep un-offered */
+    int forcedOutside = 0, forcedKnown = -1;
+    const int forcedRunHere = XferRunHereFor(isSquad, sv, run, &forcedOutside, &forcedKnown);   /* T-1318 attempt 4 (design A, site 6): the squad's living members, the engine's list */
+    const int forcedGo = cooplo::WorldXferGo((int)p.members.size(), forcedRunHere, forcedKept);
+    if (forcedGo != cooplo::kWxGo && !p.members.empty() && cooplo::WorldXferGo((int)p.members.size(), (int)run.size(), forcedKept) == cooplo::kWxGo)
+    { ++g_wwXferUnacc; XferUnaccLine(0, key, sv, (int)p.members.size(), forcedRunHere, forcedOutside, forcedKnown); }
+    if (forcedGo != cooplo::kWxGo)
+    {   /* T-1318 attempt 2 (D3): a world squad goes whole or not at all - a member held back (or over the 64 cap): not sent this pass; the
+           squad stays here, and its engine's put-away offers it whole (RELEASE) or a later pass sends it whole. Attempt 3 (owner 1615 a;
+           T2324 Traders Guild_1: 7 awake sent as "whole" while 5 were kept asleep here): "whole" also counts the people of the squad kept
+           asleep here - with any, not sent this pass */
+        if (!p.members.empty()) { if (forcedGo == cooplo::kWxKeptAsleep) ++g_wwXferKeptAsleep; else ++g_wwXferHeldPart; }   /* each pass */
+        if (!p.members.empty() && g_wwLines < kWwLineCap && g_wwHeldLogged.size() < 4096 && g_wwHeldLogged.insert(std::make_pair(forcedGo == cooplo::kWxKeptAsleep ? 2 : 0, key)).second)   /* fold 1 (review LOW-1): one line per squad */
+        {
+            ++g_wwLines;
+            DebugLog("[XFER] forced leader=" + N(key) + " NOT SENT (whole or none, T-1318 D3): " + N((long long)p.members.size()) + " of " + N((long long)run.size())
+                     + " people could go, kept asleep here " + N((long long)forcedKept) + " - the squad stays here (worldWhole xferHeldPart=" + N(g_wwXferHeldPart)
+                     + ", worldWhole3 xferKeptAsleep=" + N(g_wwXferKeptAsleep) + "; once per squad)");
+        }
+        return;
+    }
+    p.worldWhole = cooplo::kWholeBitWorld;   /* T-1318 attempt 2 (D3, protocol 226): "world squad - whole or none" on the wire, kept over its resends */
+    PendingKeysRead(&p);   /* [a1b2-hd8] */
+    if (coopsquad::PassSendAfterHold((int)p.members.size()) != coopsquad::kPassSendGo) return;
+    p.targetSlot = target;   /* the first game with the area loaded (the holder first) */
+    const int lentGate = RaidAwakeHandSend(ap, 0, std::string(), key, p.targetSlot, p.awakeWhole);   /* T-1122 awake hand: the raid's block first, on the same road */
+    if (raidsq::LentGateHolds(lentGate) != 0) { RaidLentWholeNote(raidsq::kLwSendHeld); return; }   /* T-1122 whole or none: a lent squad not sent */
+    p.lentWhole = raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag (protocol 224) */
+    for (size_t p323i = 0; p323i < p.members.size(); ++p323i) P323AiLine(p.members[p323i].uid, "give-forced");   // PROBE P323
+    if (!net::SendXfer(key, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot, p.lentWhole | p.worldWhole)) return;
+    ++g_xferOut; ++g_holderLeave; if (listedHere != 0) ++g_keepForcedListed;
+    g_pending[key] = p;
+    { ForcedTry f; f.target = target; f.x = s.x; f.y = s.y; f.refused = 0; g_forcedTry[key] = f; }   /* its ACK says whether to back off */
+    const std::string q(1, (char)34);
+    DebugLog("[XFER] -> squad leader=" + N(key) + " members=" + N((long long)p.members.size()) + " sector=" + SectorString(s) + " (my player sector " + SectorString(mine) + ") " + reason + " to slot " + N((long long)target) + " keepHere=0 listed=" + N((long long)listedHere) + " lentWhole=" + N((long long)p.lentWhole) + " worldWhole=" + N((long long)(p.worldWhole != 0 ? 1 : 0)));
+    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(key) + "," + q + "members" + q + ":" + N((long long)p.members.size())
+             + "," + q + "sector" + q + ":" + q + SectorString(s) + q + "," + q + "forced" + q + ":" + (forced ? "1" : "0") + "," + q + "reason" + q + ":" + q + reason + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
+}
+
+/* MAIN THREAD, every frame (HandoffTick, before its 1 s gate) */
+static void LeadEventTick()
+{
+    const double now = NowSec();
+    if (EngineWritesBlocked())
+    {   /* the world is going: its squads with it */
+        g_leadEvDropped += (long long)coopleadmark::LeadMarkReset(&g_leadMarks);
+        g_leadWatch.clear(); g_leadArrivalUids.clear();
+        return;
+    }
+    unsigned long long addrs[coopleadmark::kLeadMarkSlots]; int kinds[coopleadmark::kLeadMarkSlots]; unsigned long ticks[coopleadmark::kLeadMarkSlots];
+    const int n = coopleadmark::LeadMarkTake(&g_leadMarks, addrs, kinds, ticks, (int)coopleadmark::kLeadMarkSlots);
+    for (std::map<void*, LeadWatch>::iterator w = g_leadWatch.begin(); w != g_leadWatch.end(); ) { if (coopleadmark::LeadWatchHolds(w->second.since, now) == 0) g_leadWatch.erase(w++); else ++w; }
+    if (n == 0 && g_leadWatch.empty() && g_leadArrivalUids.empty()) return;   /* the every-frame fast path */
+    const Sector mine = MyPlayerSector();
+    if (mine.x < 0) { g_leadEvNotRun += (long long)n; g_leadWatch.clear(); g_leadArrivalUids.clear(); return; }   /* HandoffTick's own condition: no squad is grouped */
+    LeadLinkEdge();
+    std::map<void*, LeadWatch> noted;   /* this frame's notes: a squad's own, or a noted character's squad (found by the walk below) */
+    std::map<void*, LeadWatch> charNoted;
+    for (int i = 0; i < n; ++i)
+    {
+        LeadWatch lw; lw.since = now; lw.kind = kinds[i]; lw.tick = ticks[i];
+        std::map<void*, LeadWatch>& into = coopleadmark::NoteIsSquad(kinds[i]) != 0 ? noted : charNoted;
+        if (into.find((void*)(uintptr_t)addrs[i]) == into.end()) into[(void*)(uintptr_t)addrs[i]] = lw;   /* the first note of a frame names it */
+    }
+    /* ONE mirror walk: HandoffTick's grouping (this game's characters, not a player's, by squad - a character with no squad has no leader to
+       announce), each noted character's squad (an address compare, then its squad read as the pass reads it) and each arrived uid's squad */
+    std::map<void*, std::vector<unsigned int> > squads;
+    std::set<void*> arrivalAps;
+    const int cap = MirrorCapacity();
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int uid = 0; ::Character* c = 0;
+        if (!MirrorSlot(i, &uid, &c) || !Plaus(c)) continue;
+        const bool mineRun = net::IsUidMine(uid) && !coop::IsPlayerFaction(c->getOwnerFactionDirect());
+        const std::map<void*, LeadWatch>::iterator cn = charNoted.empty() ? charNoted.end() : charNoted.find((void*)c);
+        const bool arrived = !g_leadArrivalUids.empty() && g_leadArrivalUids.count(uid) != 0;
+        if (!mineRun && cn == charNoted.end() && !arrived) continue;
+        void* ap = SquadActivePlatoonOf(c);
+        if (ap == 0) continue;
+        if (mineRun) squads[ap].push_back(uid);
+        if (cn != charNoted.end()) { if (noted.find(ap) == noted.end()) noted[ap] = cn->second; charNoted.erase(cn); }
+        if (arrived) arrivalAps.insert(ap);
+    }
+    g_leadArrivalUids.clear();
+    g_leadEvNotRun += (long long)charNoted.size();   /* a noted character not in the mirror (never numbered) or with no squad */
+    for (std::map<void*, LeadWatch>::const_iterator t = noted.begin(); t != noted.end(); ++t)
+    {
+        if (coopleadmark::LeadMarkVerdict(0, squads.find(t->first) != squads.end() ? 1 : 0) != coopleadmark::kMarkGo) { ++g_leadEvNotRun; continue; }   /* a squad this game only copies (or a player's): not this game's to announce */
+        g_leadWatch[t->first] = t->second;
+    }
+    for (std::map<unsigned int, double>::iterator b = g_followBackoff.begin(); b != g_followBackoff.end(); ) { if (now >= b->second) g_followBackoff.erase(b++); else ++b; }   /* as the 1 s pass prunes */
+    std::set<void*> seen; std::map<void*, int> gate; int sends = 0;   /* the event road's own: LeadDropUnseen and HandoffResends stay the 1 s pass's */
+    for (std::map<void*, LeadWatch>::iterator w = g_leadWatch.begin(); w != g_leadWatch.end(); )
+    {
+        const std::map<void*, std::vector<unsigned int> >::const_iterator sq = squads.find(w->first);
+        if (sq == squads.end()) { g_leadWatch.erase(w++); continue; }   /* no member run here any more */
+        const int arrival = arrivalAps.erase(w->first) != 0 ? 1 : 0;
+        ++g_leadEvRuns;
+        SquadPassOne(w->first, sq->second, false, now, mine, arrival != 0 ? kSqPassArrival : kSqPassEvent, w->second.kind, w->second.tick, &seen, &gate, &sends);
+        ++w;
+    }
+    for (std::set<void*>::const_iterator a = arrivalAps.begin(); a != arrivalAps.end(); ++a)
+    {
+        const std::map<void*, std::vector<unsigned int> >::const_iterator sq = squads.find(*a);
+        if (sq == squads.end()) continue;   /* a squad this game only copies: SquadLeaderSafePointDrain's (brought forward) */
+        ++g_leadEvArrivalRuns;
+        SquadPassOne(*a, sq->second, false, now, mine, kSqPassArrival, -1, 0, &seen, &gate, &sends);
+    }
+}
 void HandoffTick()
 {
     ReleaseForgetDrain();   /* [a1b2-hd6]: a world teardown's / the other player gone request first */
@@ -2677,6 +3087,7 @@ void HandoffTick()
     ReleaseFlush(NowSec());   /* [a1b2-hd6] design 2.5 item 2: last frame's put-aways become RELEASE offers - every frame, before the 1 Hz gate */
     PartGivenDrain();   /* T-1318 D3 fold 1 (review MEDIUM-1): the tripwire's squads noted since the last frame, judged with a fresh awake-here count */
     P119Flush();   // PROBE P119
+    LeadEventTick();   /* T-1442 step 6: the noted squads announced with live reads, every frame, before the 1 s gate */
     if (++g_tick % kTickEvery != 0) return;
     const double now = NowSec();
     /* 1. resend / abandon pending transfers: T-1 B3 fold (L3) - at the END of this pass (HandoffResends), after the announcements */
@@ -2711,231 +3122,7 @@ void HandoffTick()
     for (std::map<void*, std::vector<unsigned int> >::iterator it = squads.begin(); it != squads.end(); ++it)
     {
         ++g_squadsSeen;
-        SquadView sv;
-        const bool isSquad = solo.count(it->first) == 0 && ReadSquadAt(it->first, &sv) == 1;
-        ::Character* leader = (isSquad && Plaus(sv.leader)) ? sv.leader : 0;
-        const unsigned int leaderUid = leader ? FindSpawnedUid(leader) : 0;
-        const bool leaderMine = leaderUid != 0 && net::IsUidMine(leaderUid);
-        /* T-1 B3 restructure (protocol 89): the squad's money rides this squad's announcement when this game runs its formal leader
-           (KeeperPot: the leader's getOwnerships()->money). Point 3 (F1): a squad this game has just TAKEN is not announced (and not
-           handed on) until SquadCatsSafePointDrain has written the other game's last announced cats into it - the next safe point. */
-        int haveCats = 0, cats = 0, announceCurrent = 1;
-        if (isSquad && leaderMine)
-        {
-            void* potOwn = 0;
-            haveCats = (KeeperPotAnnounced((void*)leader, &potOwn, &cats) == 1) ? 1 : 0;   /* T-1 B3 fold (M2): net of this game's in-flight predictions */
-            if (haveCats == 0) CatsPotUnread(leaderUid, 0);
-            long long adoptDelta = 0; unsigned int adoptSeq = 0; int adoptCats = 0;
-            if (haveCats != 0 && CatsAdoptAction(it->first, leaderUid, &adoptDelta, &adoptSeq, &adoptCats) != coopsquad::kCatsNone)
-            { leadSeen.insert(it->first); xferGate[it->first] = 0; g_catsDue = 1; continue; }
-            /* T-799 D1: a pot whose money is not known here goes out with no money - the copies keep their value */
-            if (haveCats != 0 && coopsquad::AnnounceCarriesMoney(1, KeeperMoneyKnown(potOwn)) == 0) { haveCats = 0; cats = 0; ++g_catsWithheldNow; }
-        }
-        // T-1 B1 restructure (re-check N1-N5 of ff655c5): ONE AUTHORITY, ONE ANNOUNCED VALUE. This game's engine's acting leader of
-        // the squad (EngineLeaderChoice: +0xA0 if standing, else +0xA8 - computed ONCE, here) is announced with the formal leader
-        // (+0xA0) and the members this game runs (MSG_SQUAD_LEAD), and it is the very value this game decides with. The other
-        // game's announced acting leader is used AS IS. Both games so feed AgreedSquadLeader the same pair (named beats none,
-        // differing -> the lower uid), and only the game that does NOT run the agreed leader sends its members (follow-leader
-        // XFER). An agreed leader neither game runs here is "leader unknown": the position rule. SquadFollowLeader's engine-only
-        // fallback is gone - the announced value already names the engine's leader when the other game runs it.
-        unsigned int followUid = 0;
-        coopsquad::FollowAnnounceMark annNow;   /* T-1239: both announcements of this squad as they stand this pass */
-        if (isSquad)
-        {
-            unsigned int uids[kSquadViewCap];
-            for (int k = 0; k < sv.stored; ++k) uids[k] = Plaus(sv.members[k]) ? FindSpawnedUid(sv.members[k]) : 0u;
-            int actingUsable = 0;
-            for (int k = 0; k < sv.stored; ++k) if (Plaus(sv.acting) && sv.members[k] == sv.acting) { actingUsable = LeaderOut(sv.acting) ? 0 : 1; break; }
-            const int choice = coopsquad::EngineLeaderChoice(leader != 0 ? 1 : 0, (leader != 0 && LeaderOut(leader)) ? 1 : 0, actingUsable);
-            ::Character* eng = choice == coopsquad::kEngineLeadA0 ? leader : (choice == coopsquad::kEngineLeadA8 ? sv.acting : 0);
-            if (choice == coopsquad::kEngineLeadA8) ++g_leaderActing;
-            const unsigned int myLead = eng != 0 ? FindSpawnedUid(eng) : 0u;
-            leadSeen.insert(it->first);
-            announceCurrent = AnnounceLead(it->first, myLead, leaderUid, it->second, haveCats, cats, &leadSends);   /* T-1 B3 restructure: with the money */
-            const coopsquad::PeerLeadEntry* pe = PeerAnnouncedFor(sv, uids);
-            const unsigned int peerLead = pe != 0 ? pe->acting : 0u;
-            if (myLead != 0 && peerLead != 0 && myLead != peerLead) ++g_agreedDiffered;
-            followUid = coopsquad::AgreedSquadLeader(myLead, peerLead);
-            if (pe != 0) { annNow.peerSender = pe->sender; annNow.peerSeq = pe->seq; }
-            std::map<void*, MyLead>::const_iterator ml = g_myLead.find(it->first);
-            if (ml != g_myLead.end() && ml->second.sent != 0) { annNow.myKey = ml->second.key; annNow.mySeq = ml->second.seq; }
-        }
-        xferGate[it->first] = coopsquad::HandoverXferMayGo(haveCats, announceCurrent);   /* T-1 B3 fold (L3) */
-        const bool followMine = followUid != 0 && net::IsUidMine(followUid);
-        const bool followPeer = followUid != 0 && !followMine && HasPuppet(followUid);   // the other game runs it (H1: a live puppet here)
-        std::map<unsigned int, double>::const_iterator bo = g_followBackoff.find(followUid);
-        const int held = (followPeer && (g_pending.find(followUid) != g_pending.end() || bo != g_followBackoff.end())) ? 1 : 0;
-        int act = coopsquad::FollowAction((followMine || followPeer) ? 1 : 0, followMine ? 1 : 0, held);
-        /* T-1239 fix attempt 1: the game running that leader refused a member of this group as not in the leader's group on its engine -
-           the leader is unknown for this group (the position rule below) until either game's announcement for it changes. */
-        std::map<unsigned int, FollowGroupBlock>::iterator gb = followPeer ? g_followGroupBlock.find(followUid) : g_followGroupBlock.end();
-        if (gb != g_followGroupBlock.end())
-        {
-            int refusedHere = 0;
-            for (size_t k = 0; k < it->second.size() && refusedHere == 0; ++k) if (gb->second.members.count(it->second[k]) != 0) refusedHere = 1;
-            if (refusedHere != 0 && coopsquad::FollowAnnounceSame(gb->second.mark, annNow) == 0)
-            {
-                ++g_followUnblocked;
-                DebugLog("[XFER] follow leader=" + N(followUid) + " block LIFTED - an announcement for its group changed (other game " + N((long long)gb->second.mark.peerSeq) + " -> " + N((long long)annNow.peerSeq)
-                         + ", this game " + N((long long)gb->second.mark.mySeq) + " -> " + N((long long)annNow.mySeq) + "); follow-leader may send again (followUnblocked " + N(g_followUnblocked) + ")");
-                g_followGroupBlock.erase(gb);
-            }
-            else if (refusedHere != 0)
-            {
-                const int blocked = coopsquad::FollowActionBlocked(act, g_pending.find(followUid) == g_pending.end() ? 1 : 0);
-                if (blocked != act) { ++g_followBlockedPass; act = blocked; }
-            }
-        }
-        if (act == coopsquad::kFollowWait) { ++g_waitedLeader; continue; }
-        if (coopsquad::HandoverXferMayGo(haveCats, announceCurrent) == 0) continue;   /* T-1 B3 restructure (F1): the squad's cats go out before its XFER - next second */
-        if (act == coopsquad::kFollowSend)
-        {
-            Pending p; p.reason = coopsquad::kXferReasonFollowLeader; p.sentAt = now; p.sends = 1; p.ap = it->first; p.logged = 0;
-            p.mark = annNow;   /* T-1239: a 'not in the leader's group' refusal blocks until either announcement differs from this */
-            BuildMembers(it->second, &p.members);
-            const size_t followBuilt = p.members.size();
-            PassHoldElsewhere(followUid, &p.members, "follow-leader");   /* M7a2 fold 3 [m7a2h-hp1] (T807 GAP 1) */
-            p.awakeWhole = p.members.size() == followBuilt ? 1 : 0;   /* T-1122 re-check fold 5: a member held back - a held raid is not sent onward */
-            const int followKept = KeptAsleepOfRun(it->second);   /* T-1318 attempt 3: people of the squad this game keeps asleep un-offered */
-            int followOutside = 0, followKnown = -1;
-            const int followRunHere = XferRunHereFor(isSquad, sv, it->second, &followOutside, &followKnown);   /* T-1318 attempt 4 (design A, site 6): the squad's living members, the engine's list */
-            const int followGo = cooplo::WorldXferGo((int)p.members.size(), followRunHere, followKept);
-            if (followGo != cooplo::kWxGo && !p.members.empty() && cooplo::WorldXferGo((int)p.members.size(), (int)it->second.size(), followKept) == cooplo::kWxGo)
-            { ++g_wwFollowUnacc; XferUnaccLine(1, followUid, sv, (int)p.members.size(), followRunHere, followOutside, followKnown); }
-            if (followGo != cooplo::kWxGo)
-            {   /* T-1318 attempt 2 fold 1 (review HIGH-1 a): the follow-leader XFER also goes whole or not at all - every person this game runs of
-                   the squad, or none this pass (counted each pass; one line per squad, review LOW-1). Attempt 3 (owner 1615 a): "whole" also
-                   counts the people of the squad kept asleep here - with any, not sent this pass */
-                if (!p.members.empty())
-                {
-                    if (followGo == cooplo::kWxKeptAsleep) ++g_wwFollowKeptAsleep; else ++g_wwFollowHeldPart;
-                    if (g_wwLines < kWwLineCap && g_wwHeldLogged.size() < 4096 && g_wwHeldLogged.insert(std::make_pair(followGo == cooplo::kWxKeptAsleep ? 3 : 1, followUid)).second)
-                    {
-                        ++g_wwLines;
-                        DebugLog("[XFER] follow leader=" + N(followUid) + " NOT SENT (whole or none, T-1318 D3): " + N((long long)p.members.size()) + " of " + N((long long)it->second.size())
-                                 + " people could go, kept asleep here " + N((long long)followKept) + " - the squad stays here (worldWhole2 followHeldPart=" + N(g_wwFollowHeldPart)
-                                 + ", worldWhole3 followKeptAsleep=" + N(g_wwFollowKeptAsleep) + "; once per squad)");
-                    }
-                }
-                continue;
-            }
-            p.worldWhole = cooplo::kWholeBitWorld;   /* T-1318 attempt 2 fold 1: "world squad - whole or none" on the follow-leader XFER too, kept over its resends */
-            PendingKeysRead(&p);   /* [a1b2-hd8]: each member's squad key while whole - the ACK's index entry */
-            if (coopsquad::PassSendAfterHold((int)p.members.size()) != coopsquad::kPassSendGo) continue;
-            p.targetSlot = net::OwnerSlotOf(followUid);   /* M7a A1 build 1 [a1b1-hd6]: the game that runs the leader */
-            const int lentGate = RaidAwakeHandSend(it->first, 0, std::string(), followUid, p.targetSlot, p.awakeWhole);   /* T-1122 awake hand: the raid's block first, on the same road */
-            if (raidsq::LentGateHolds(lentGate) != 0) { RaidLentWholeNote(raidsq::kLwSendHeld); continue; }   /* T-1122 whole or none: a lent squad not sent */
-            p.lentWhole = raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag (protocol 224) */
-            if (!net::SendXfer(followUid, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot, p.lentWhole | p.worldWhole)) continue;
-            ++g_xferOut; ++g_followedLeader; g_xferFollowSent += (long long)p.members.size();
-            p.logged = FollowLogChanged(0, followUid, (long long)p.members.size()) ? 1 : 0;
-            g_pending[followUid] = p;
-            if (p.logged != 0)
-            {
-                const std::string q(1, (char)34);
-                DebugLog("[XFER] -> squad leader=" + N(followUid) + " members=" + N((long long)p.members.size()) + " reason=follow-leader lentWhole=" + N((long long)p.lentWhole) + " worldWhole=" + N((long long)(p.worldWhole != 0 ? 1 : 0)));
-                SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(followUid) + "," + q + "members" + q + ":" + N((long long)p.members.size())
-                         + "," + q + "forced" + q + ":0," + q + "reason" + q + ":" + q + "follow-leader" + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
-            }
-            continue;
-        }
-        if (act == coopsquad::kFollowByPosition && isSquad) ++g_leaderUnknownFellBack;
-        // N4: the position path's XFER is keyed on a uid this game RUNS - the agreed leader when mine, else +0xA0 when mine, else the
-        // first member run here - never on a character this game does not run.
-        const unsigned int key = followMine ? followUid : (leaderMine ? leaderUid : it->second[0]);
-        if (g_pending.find(key) != g_pending.end()) continue;
-        // T-1 B1 step 2: the SQUAD position decides (the engine sleeps the squad by it); a squad of one, or a squad whose
-        // position is not usable yet, falls back to the leader's (else the first member's) own position.
-        // T-164 B4-3 (M4): a trader squad with a home building by its HOME's position - the one the adoption decided by
-        // (SquadDecisionPosAt), so the keeper is not handed away while its home, stock and restock stay here.
-        float lx = 0, ly = 0, lz = 0;
-        if (isSquad && SquadDecisionPosAt(sv, &lx, &lz) == 1) ly = sv.y;
-        else
-        {
-            ::Character* pc = leader ? leader : FindSpawned(it->second[0]);
-            if (!Plaus(pc) || !ReadPos(pc, &lx, &ly, &lz)) continue;
-        }
-        const Sector s = SectorOf(lx, lz);
-        bool forced = true; const char* reason = "FORCED";
-        // Decision 15 / owner decision 580 (2026-10-09): ownership is STICKY - a squad stays with the game that runs it while this game's
-        // engine keeps it at its spot (EngineKeepsHere). Only once it would not is it offered, and only to an IN_WORLD game the world server's
-        // loaded map shows with the area loaded (the area's holder first when it is one of them, then the lower slot); the receiver's own
-        // loaded-list rule decides the take. Nobody loaded there, or no fresh map: it stays, this game's engine puts it away and the
-        // RELEASE decides. The wire's reason code is 1 (forced) here.
-        /* T-650 fold 2 (T1056 F2): the question is whether THIS game's engine keeps the squad at its spot, read live (EngineKeepsHere: the
-           engine's own +0xB1/+0xB0 flags for the area and its side neighbours) - not the once-a-second loaded list, which still named the
-           area a second after the announce pass had withdrawn the people, and names areas whose edge strip the engine puts away.
-           -1 (unreadable): this pass skips the squad; the next tick decides. */
-        const int keepHere = EngineKeepsHere(lx, lz);
-        if (keepHere < 0) { ++g_keepReadFailForced; continue; }
-        if (keepHere == 1) { g_keepNoted.erase(key); g_niwNoted.erase(key); continue; }
-        const int listedHere = SectorLoadedHere(s) ? 1 : 0;   /* the loaded list still names the area (the squad stands in its edge strip): logged for the run's check */
-        std::vector<int> rcv; int holderSeen = -1, notInWorld = 0, notKeep = 0;
-        const int nr = ReceiversFor(s, lx, lz, std::vector<int>(), &rcv, &holderSeen, &notInWorld, &notKeep);
-        if (notInWorld > 0 && g_niwNoted.insert(key).second) ++g_holderNotInWorld;   /* a game with the area loaded but not IN_WORLD was passed over */
-        if (nr <= 0)
-        {
-            if (g_keepNoted.insert(key).second)
-            {
-                if (nr == 0) ++g_holderKeep; else ++g_holderKeepUnknown;
-                if (nr == 0 && notKeep > 0) ++g_keepNotKeep;
-                RelLog("[RELEASE] forced XFER leader=" + N((long long)key) + " KEEP: this game's engine would not keep it at " + N((long long)lx) + "," + N((long long)lz) + " (sector " + SectorString(s)
-                       + (listedHere != 0 ? ", still listed" : ", not listed") + "; player " + SectorString(mine) + ") but "
-                       + (nr == 0 ? (notKeep > 0 ? "no other in-world game's engine would keep it there either (" + N((long long)notKeep) + " with the area loaded)" : std::string("no other in-world game has it loaded"))
-                                  : std::string("the area map is not fresh (or this game's link is down)"))
-                       + " - it stays here; this game's engine puts it away and the RELEASE decides (holder " + N((long long)holderSeen) + ", loaded but not in the world "
-                       + N((long long)notInWorld) + "; releaseHolder keep " + N(g_holderKeep) + " keepUnknown " + N(g_holderKeepUnknown) + "; once per squad)");
-            }
-            continue;
-        }
-        const int target = rcv[0];
-        std::map<unsigned int, ForcedTry>::iterator ftry = g_forcedTry.find(key);
-        if (ftry != g_forcedTry.end() && ftry->second.refused != 0)
-        {
-            if (ftry->second.target == target && ftry->second.x == s.x && ftry->second.y == s.y) continue;   /* review MED-1: backed off - that receiver refused it in this sector */
-            g_forcedTry.erase(ftry);   /* the squad's sector or its receiver changed: offered again */
-        }
-        Pending p; p.reason = coopsquad::kXferReasonForced; p.sentAt = now; p.sends = 1; p.ap = it->first; p.logged = 1;
-        BuildMembers(it->second, &p.members);
-        const size_t forcedBuilt = p.members.size();
-        PassHoldElsewhere(key, &p.members, "forced");   /* M7a2 fold 3 [m7a2h-hp2] (T807 GAP 1) */
-        p.awakeWhole = p.members.size() == forcedBuilt ? 1 : 0;   /* T-1122 re-check fold 5 */
-        const int forcedKept = KeptAsleepOfRun(it->second);   /* T-1318 attempt 3: people of the squad this game keeps asleep un-offered */
-        int forcedOutside = 0, forcedKnown = -1;
-        const int forcedRunHere = XferRunHereFor(isSquad, sv, it->second, &forcedOutside, &forcedKnown);   /* T-1318 attempt 4 (design A, site 6): the squad's living members, the engine's list */
-        const int forcedGo = cooplo::WorldXferGo((int)p.members.size(), forcedRunHere, forcedKept);
-        if (forcedGo != cooplo::kWxGo && !p.members.empty() && cooplo::WorldXferGo((int)p.members.size(), (int)it->second.size(), forcedKept) == cooplo::kWxGo)
-        { ++g_wwXferUnacc; XferUnaccLine(0, key, sv, (int)p.members.size(), forcedRunHere, forcedOutside, forcedKnown); }
-        if (forcedGo != cooplo::kWxGo)
-        {   /* T-1318 attempt 2 (D3): a world squad goes whole or not at all - a member held back (or over the 64 cap): not sent this pass; the
-               squad stays here, and its engine's put-away offers it whole (RELEASE) or a later pass sends it whole. Attempt 3 (owner 1615 a;
-               T2324 Traders Guild_1: 7 awake sent as "whole" while 5 were kept asleep here): "whole" also counts the people of the squad kept
-               asleep here - with any, not sent this pass */
-            if (!p.members.empty()) { if (forcedGo == cooplo::kWxKeptAsleep) ++g_wwXferKeptAsleep; else ++g_wwXferHeldPart; }   /* each pass */
-            if (!p.members.empty() && g_wwLines < kWwLineCap && g_wwHeldLogged.size() < 4096 && g_wwHeldLogged.insert(std::make_pair(forcedGo == cooplo::kWxKeptAsleep ? 2 : 0, key)).second)   /* fold 1 (review LOW-1): one line per squad */
-            {
-                ++g_wwLines;
-                DebugLog("[XFER] forced leader=" + N(key) + " NOT SENT (whole or none, T-1318 D3): " + N((long long)p.members.size()) + " of " + N((long long)it->second.size())
-                         + " people could go, kept asleep here " + N((long long)forcedKept) + " - the squad stays here (worldWhole xferHeldPart=" + N(g_wwXferHeldPart)
-                         + ", worldWhole3 xferKeptAsleep=" + N(g_wwXferKeptAsleep) + "; once per squad)");
-            }
-            continue;
-        }
-        p.worldWhole = cooplo::kWholeBitWorld;   /* T-1318 attempt 2 (D3, protocol 226): "world squad - whole or none" on the wire, kept over its resends */
-        PendingKeysRead(&p);   /* [a1b2-hd8] */
-        if (coopsquad::PassSendAfterHold((int)p.members.size()) != coopsquad::kPassSendGo) continue;
-        p.targetSlot = target;   /* the first game with the area loaded (the holder first) */
-        const int lentGate = RaidAwakeHandSend(it->first, 0, std::string(), key, p.targetSlot, p.awakeWhole);   /* T-1122 awake hand: the raid's block first, on the same road */
-        if (raidsq::LentGateHolds(lentGate) != 0) { RaidLentWholeNote(raidsq::kLwSendHeld); continue; }   /* T-1122 whole or none: a lent squad not sent */
-        p.lentWhole = raidsq::LentWholeFlagOf(lentGate);   /* T-1122 lent flag (protocol 224) */
-        if (!net::SendXfer(key, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot, p.lentWhole | p.worldWhole)) continue;
-        ++g_xferOut; ++g_holderLeave; if (listedHere != 0) ++g_keepForcedListed;
-        g_pending[key] = p;
-        { ForcedTry f; f.target = target; f.x = s.x; f.y = s.y; f.refused = 0; g_forcedTry[key] = f; }   /* its ACK says whether to back off */
-        const std::string q(1, (char)34);
-        DebugLog("[XFER] -> squad leader=" + N(key) + " members=" + N((long long)p.members.size()) + " sector=" + SectorString(s) + " (my player sector " + SectorString(mine) + ") " + reason + " to slot " + N((long long)target) + " keepHere=0 listed=" + N((long long)listedHere) + " lentWhole=" + N((long long)p.lentWhole) + " worldWhole=" + N((long long)(p.worldWhole != 0 ? 1 : 0)));
-        SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(key) + "," + q + "members" + q + ":" + N((long long)p.members.size())
-                 + "," + q + "sector" + q + ":" + q + SectorString(s) + q + "," + q + "forced" + q + ":" + (forced ? "1" : "0") + "," + q + "reason" + q + ":" + q + reason + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
+        SquadPassOne(it->first, it->second, solo.count(it->first) != 0, now, mine, kSqPassTick, -1, 0, &leadSeen, &xferGate, &leadSends);   /* T-1442 step 6: one function, the event road's too */
     }
     for (std::map<unsigned int, FollowGroupBlock>::iterator gb = g_followGroupBlock.begin(); gb != g_followGroupBlock.end(); )   /* T-1239: none of its members run here any more */
     {
@@ -2985,7 +3172,7 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
             return;
         }
     }
-    int taken = 0, intents = 0, unresolved = 0, unknown = 0;
+    int taken = 0, reRun = 0, unknown = 0;
     std::vector<unsigned int> takenUids;   // F447: the ACK names exactly these
     std::vector<int> takeIdx;   /* T-1122 whole or none (owner 1581 a): the members this game can take, taken after the whole squad is judged */
     const int awakeBlock = RaidAwakeBlockHas(leader); int awakeSkipped = 0;   /* T-1122 awake hand: the squad's raid came first - no carried goal issued */
@@ -3061,7 +3248,7 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
     {
         const int i = takeIdx[t];
         takenUids.push_back(m[i].uid);
-        TakeMemberFromPeer(m[i], net::GenForTake(m[i].uid, gens != 0 ? gens[i] : 0u), &intents, &unresolved, awakeBlock, &awakeSkipped);   /* [a1b2-hd4] design 2.5 item 3: the take path shared with RELEASE (the giver's gen + 1, or above this game's copy record) */
+        TakeMemberFromPeer(m[i], net::GenForTake(m[i].uid, gens != 0 ? gens[i] : 0u), &reRun, awakeBlock, &awakeSkipped);   /* [a1b2-hd4] design 2.5 item 3: the take path shared with RELEASE (the giver's gen + 1, or above this game's copy record) */
         ++taken;
         if (reason == (unsigned int)coopsquad::kXferReasonFollowLeader) ++g_xferFollowTaken;
     }
@@ -3077,9 +3264,9 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
     if (isFollow && taken > 0) FollowLogReset(2, leader);   // settled: the next refusal logs again
     if (!logIn && taken == 0) return;
     const std::string q(1, (char)34);
-    DebugLog("[XFER] <- squad leader=" + N(leader) + " members=" + N(count) + " taken=" + N(taken) + " intents=" + N(intents) + " unresolvedSubjects=" + N(unresolved) + " unknown=" + N(unknown) + " lentWhole=" + N((long long)lentWhole) + " alreadyHere=" + N((long long)alreadyHere) + " worldWhole=" + N((long long)worldWhole) + (reason == (unsigned int)coopsquad::kXferReasonForced ? std::string(" FORCED") : (reason == (unsigned int)coopsquad::kXferReasonNone ? std::string() : " reason=" + std::string(coopsquad::XferReasonName(reason)))));
+    DebugLog("[XFER] <- squad leader=" + N(leader) + " members=" + N(count) + " taken=" + N(taken) + " carriedNotIssued=" + N(reRun) + " unknown=" + N(unknown) + " lentWhole=" + N((long long)lentWhole) + " alreadyHere=" + N((long long)alreadyHere) + " worldWhole=" + N((long long)worldWhole) + (reason == (unsigned int)coopsquad::kXferReasonForced ? std::string(" FORCED") : (reason == (unsigned int)coopsquad::kXferReasonNone ? std::string() : " reason=" + std::string(coopsquad::XferReasonName(reason)))));
     SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_in" + q + "," + q + "leader" + q + ":" + N(leader) + "," + q + "members" + q + ":" + N(count) + "," + q + "taken" + q + ":" + N(taken)
-             + "," + q + "intents" + q + ":" + N(intents) + "," + q + "unresolved" + q + ":" + N(unresolved) + "," + q + "unknown" + q + ":" + N(unknown) + ",\"tick\":" + N(g_tick) + "}");
+             + "," + q + "carriedNotIssued" + q + ":" + N(reRun) + "," + q + "unknown" + q + ":" + N(unknown) + ",\"tick\":" + N(g_tick) + "}");
 }
 
 static long long g_ackNotMine = 0;   /* fold 1 [a1b1f1-hd3] [F7]: members an ACK named that this game no longer runs (a dual run's yield released them) */
@@ -3216,7 +3403,7 @@ static int PutAwayPlayerPod(::Character* c)
 }
 static int PutAwayFacingIntentPod(::Character* c, net::XferMember* m)
 {
-    __try { ReadAuthorityFacing(c, &m->fx, &m->fz); ReadAuthorityIntent(c, &m->intentType, &m->intentSubject, &m->ix, &m->iy, &m->iz); return 1; }
+    __try { ReadAuthorityFacing(c, &m->fx, &m->fz); ReadAuthorityIntent(c, &m->intentType, &m->intentSubject, &m->ix, &m->iy, &m->iz); return 1; }   /* the intent: sent, never issued by the taker since T-1416 (counted / probed only) - later clean-up */
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 // PROBE-START: P119 (M7a A1 P-a, 2026-10-02) - the engine's put-away condition (squad position vs the loaded edge)
@@ -3830,11 +4017,277 @@ void HandoffTakeGone(unsigned int uid)
     UnpuppetForOwnership(uid);
 }
 
+/* ---- T-1442 step 6: the engine writers' notes and the arrival's ----------------------------------------------------------------------
+   set-leader 0x790C00 (this, Character*) and remove-member 0x794C00 (this, Character*; it returns a value in RAX - decomp_794c00 - kept
+   whole) note their squad AFTER the original, so the main thread's read sees what they wrote. ANY THREAD: interlocked only. */
+typedef void (*LeadSetHookFn)(void* ap, ::Character* c);
+typedef unsigned long long (*LeadRemoveHookFn)(void* ap, ::Character* c);
+static LeadSetHookFn orig_leadSet = 0;
+static LeadRemoveHookFn orig_leadRemove = 0;
+static void detour_leadSet(void* ap, ::Character* c)
+{
+    orig_leadSet(ap, c);
+    const LONG own = g_leadOwnCallTid;
+    if (coopleadmark::LeadMarkVerdict((own != 0 && own == (LONG)::GetCurrentThreadId()) ? 1 : 0, 1) == coopleadmark::kMarkOwnCall) { ::InterlockedIncrement64(&g_leadOwnCallSkipped); return; }
+    coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)ap, coopleadmark::kNoteSetLeader, (unsigned long)::GetTickCount());
+}
+static unsigned long long detour_leadRemove(void* ap, ::Character* c)
+{
+    const unsigned long long r = orig_leadRemove(ap, c);
+    coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)ap, coopleadmark::kNoteRemoveMember, (unsigned long)::GetTickCount());
+    return r;
+}
+/* review fold S2 (the step-5 lesson: every writer): the acting-leader getter 0x791FF0 (this) writes +0xA8 when the formal leader cannot
+   lead (decomp_791ff0:36) - +0xA8 read before and after the original, the squad noted ONLY when it changed. A getter the AI calls
+   often on its worker threads: two guarded reads and a compare, nothing else unless it changed (then the interlocked note). */
+typedef void* (*LeadGetterFn)(void* ap);
+static LeadGetterFn orig_leadGetter = 0;
+static int LeadActingPod(const void* ap, void** out)
+{
+    __try { *out = *(void* const*)((const char*)ap + 0xA8); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return 0; }
+}
+static void* detour_leadGetter(void* ap)
+{
+    void* before = 0;
+    const int okBefore = LeadActingPod(ap, &before);
+    void* const r = orig_leadGetter(ap);
+    void* after = 0;
+    if (okBefore != 0 && LeadActingPod(ap, &after) != 0 && after != before)
+        coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)ap, coopleadmark::kNoteActingGetter, (unsigned long)::GetTickCount());
+    return r;
+}
+/* review fold S3: the death path detaches the character from its squad, so its squad is read BEFORE the death call (Character+0x658,
+   the guarded POD SquadApOfPod - any thread) and noted after it with the character. ANY THREAD: interlocked only. */
+void* LeadDeadSquadOf(const void* character)
+{
+    void* ap = 0;
+    if (character == 0 || SquadApOfPod((::Character*)character, &ap) == 0) return 0;
+    return ap;
+}
+void LeadNoteDeath(const void* character, void* apBefore)
+{
+    const unsigned long tick = (unsigned long)::GetTickCount();
+    coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)character, coopleadmark::kNoteDead, tick);
+    if (apBefore != 0) coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)apBefore, coopleadmark::kNoteDeadSquad, tick);
+}
+void LeadNoteChar(const void* character, int dead)
+{
+    coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)character, dead != 0 ? coopleadmark::kNoteDead : coopleadmark::kNoteKo, (unsigned long)::GetTickCount());
+}
+/* T-1442 step 6 fix a (F1506, cause a Confirmed twice in T2646): the adoption sweep (worldsync.cpp, right after net::SetLocalOwner) gave
+   `c` its mod uid. When `c` is its squad's formal leader (+0xA0), a 1 s pass may have just announced that squad with leader 0 (the
+   uid was not given yet) - the squad is noted on the set-leader hook's road, so the leader goes out the next frame (LeadEventTick;
+   a squad this game does not run is dropped there, LeadMarkVerdict). The 1 s pass stays the backstop. MAIN THREAD. */
+void LeadNoteUidGiven(::Character* c)
+{
+    if (!Plaus(c)) return;
+    SquadView sv;
+    const int have = ReadSquadOf(c, &sv) == 1 ? 1 : 0;
+    if (coopleadmark::LeadUidGivenNotes(have, (have != 0 && sv.leader == c) ? 1 : 0) == 0 || sv.ap == 0) return;
+    coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)sv.ap, coopleadmark::kNoteUidLeader, (unsigned long)::GetTickCount());
+}
+/* T-1442 step 6 fix attempt 3 (F1514: T2648's caged leader - the cage-use start set +0x2F8 0 -> 2 and no note followed). Every engine
+   writer of the facts LeaderOut reads besides death is hooked: the character's can't-lead answer (LeaderOutAnswer - the same function
+   LeaderOut asks, no second copy of the rule) and its squad's +0xA0 / +0xA8 are read before the original and again after it, and the
+   squad is noted (kNoteHeld) when the character leads it and its answer changed - into and out of a bed or cage, down and up, picked
+   up and put down, the physics ragdoll on and off (review fold: ragdollModeUT 0x5B8F80). ANY THREAD: guarded reads, the engine's
+   read-only inRagdoll and the interlocked note only. Every argument register is passed through whole and RAX returned (a void original leaves it unused). */
+struct LeadOutRead { int ok; int out; void* ap; int isFormal; int isActing; };
+static volatile LONG g_leadOutHook[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };   /* bed, prison, pose, dropped, pickedUp, outOfBed, floorStop, floorEnd, ragdoll: 1 / -1 / 0 */
+static volatile LONG64 g_leadOutSeen = 0, g_leadOutChanged = 0;       /* hooked calls on a readable character; of them, 'out' changed */
+static void LeadOutReadPod(const void* c, LeadOutRead* o)
+{
+    o->ok = 0; o->out = 0; o->ap = 0; o->isFormal = o->isActing = 0;
+    if (c == 0 || ((uintptr_t)c & 7) != 0) return;
+    const int out = LeaderOutAnswer((::Character*)c);                  /* THE can't-lead rule - LeaderOut's own answer */
+    if (out < 0) return;
+    o->out = out;
+    __try
+    {
+        const char* p = (const char*)c;
+        void* ap = *(void* const*)(p + 0x658);                         /* ActivePlatoon (SquadApOfPod) */
+        o->ap = ap;
+        if (ap != 0)
+        {
+            o->isFormal = *(void* const*)((const char*)ap + 0xA0) == c ? 1 : 0;
+            o->isActing = *(void* const*)((const char*)ap + 0xA8) == c ? 1 : 0;
+        }
+        o->ok = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { o->ok = 0; }
+}
+/* the squad of `b` (read before the call) and of `a` (after it, when the call moved the character to another squad) */
+static void LeadOutNote(const LeadOutRead& b, const LeadOutRead& a)
+{
+    if (b.ok == 0 || a.ok == 0) return;
+    ::InterlockedIncrement64(&g_leadOutSeen);
+    const int outB = b.out, outA = a.out;
+    if (outB == outA) return;
+    ::InterlockedIncrement64(&g_leadOutChanged);
+    const unsigned long tick = (unsigned long)::GetTickCount();
+    if (coopleadmark::LeadHeldNotes(1, b.ap != 0 ? 1 : 0, b.isFormal, b.isActing, outB, outA) != 0)
+        coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)b.ap, coopleadmark::kNoteHeld, tick);
+    if (a.ap != b.ap && coopleadmark::LeadHeldNotes(1, a.ap != 0 ? 1 : 0, a.isFormal, a.isActing, outB, outA) != 0)
+        coopleadmark::LeadMarkAdd(&g_leadMarks, (unsigned long long)(uintptr_t)a.ap, coopleadmark::kNoteHeld, tick);
+}
+/* the character a task's 'who' names: who->vt+0x48, as the tasks themselves ask it (0x348010 / 0x347E80, decomp_357fe0) */
+typedef void* (*LeadWhoGetFn)(void* who);
+static void* LeadWhoCharPod(void* who)
+{
+    if (who == 0 || ((uintptr_t)who & 7) != 0) return 0;
+    __try { void** vt = *(void***)who; return vt == 0 ? 0 : ((LeadWhoGetFn)vt[0x48 / 8])(who); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+typedef unsigned long long (*LeadOut3Fn)(void* a, unsigned long long b, unsigned long long c);
+typedef unsigned long long (*LeadOut2Fn)(void* a, void* b);
+typedef unsigned long long (*LeadOut6Fn)(void* anim, unsigned long long on, void* pos, unsigned long long mask, void* bone, void* c);
+static LeadOut3Fn orig_lhBed = 0, orig_lhPrison = 0, orig_lhPose = 0, orig_lhDropped = 0;
+static LeadOut2Fn orig_lhPickedUp = 0, orig_lhOutOfBed = 0, orig_lhFloorStop = 0, orig_lhFloorEnd = 0;
+static LeadOut6Fn orig_lhRagdoll = 0;
+/* the physics ragdoll on / off (0x5B8F80): the Character is the 6th argument (Character::_ragdollMode passes this) */
+static unsigned long long detour_lhRagdoll(void* anim, unsigned long long on, void* pos, unsigned long long mask, void* bone, void* c)
+{
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhRagdoll(anim, on, pos, mask, bone, c);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhBed(void* c, unsigned long long on, unsigned long long u)
+{
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhBed(c, on, u);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhPrison(void* c, unsigned long long on, unsigned long long u)
+{
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhPrison(c, on, u);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhPose(void* c, unsigned long long pose, unsigned long long x)
+{
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhPose(c, pose, x);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhDropped(void* c, unsigned long long f1, unsigned long long f2)
+{
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhDropped(c, f1, f2);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhPickedUp(void* c, void* carrier)
+{
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhPickedUp(c, carrier);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhOutOfBed(void* task, void* c)
+{
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhOutOfBed(task, c);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhFloorStop(void* task, void* who)
+{
+    void* const c = LeadWhoCharPod(who);
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhFloorStop(task, who);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static unsigned long long detour_lhFloorEnd(void* task, void* who)
+{
+    void* const c = LeadWhoCharPod(who);
+    LeadOutRead b, a; LeadOutReadPod(c, &b);
+    const unsigned long long r = orig_lhFloorEnd(task, who);
+    LeadOutReadPod(c, &a); LeadOutNote(b, a);
+    return r;
+}
+static LONG LeadOutHookOne(unsigned long long rva, void* detour, void** orig)
+{
+    if (rva == 0) return -1;
+    return coop::AddHook((void*)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)rva), detour, orig) == coop::SUCCESS ? 1 : -1;
+}
+static void LeadOutHooks()
+{
+    g_leadOutHook[0] = LeadOutHookOne(kLhBedModeRva, (void*)&detour_lhBed, (void**)&orig_lhBed);
+    g_leadOutHook[1] = LeadOutHookOne(kLhPrisonModeRva, (void*)&detour_lhPrison, (void**)&orig_lhPrison);
+    g_leadOutHook[2] = LeadOutHookOne(kLhPoseRva, (void*)&detour_lhPose, (void**)&orig_lhPose);
+    g_leadOutHook[3] = LeadOutHookOne(kLhDroppedRva, (void*)&detour_lhDropped, (void**)&orig_lhDropped);
+    g_leadOutHook[4] = LeadOutHookOne(kLhPickedUpRva, (void*)&detour_lhPickedUp, (void**)&orig_lhPickedUp);
+    g_leadOutHook[5] = LeadOutHookOne(kLhOutOfBedRva, (void*)&detour_lhOutOfBed, (void**)&orig_lhOutOfBed);
+    g_leadOutHook[6] = LeadOutHookOne(kLhFloorStopRva, (void*)&detour_lhFloorStop, (void**)&orig_lhFloorStop);
+    g_leadOutHook[7] = LeadOutHookOne(kLhFloorEndRva, (void*)&detour_lhFloorEnd, (void**)&orig_lhFloorEnd);
+    g_leadOutHook[8] = LeadOutHookOne(kLhRagdollRva, (void*)&detour_lhRagdoll, (void**)&orig_lhRagdoll);
+    std::string w;
+    for (int i = 0; i < 9; ++i) w += std::string(i == 0 ? "" : ",") + N((long long)g_leadOutHook[i]);
+    DebugLog("[LEAD] T-1442 step 6 fix attempt 3 hooks [setBedMode 0x32E2B0, setPrisonMode 0x3305C0, setPoseState 0x5C7390, getDropped 0x5CC110, getPickedUp 0x5CE300,"
+             " Task_GetOutOfBed step 0x3455C0, Task_SleepOnFloor 0x347E80 / 0x348010, ragdollModeUT 0x5B8F80]=" + w
+             + " (1 installed, -1 failed or no row): a squad's leader going into / out of a bed or cage, down / up, picked up / put down, ragdolled / not is noted at the engine's call");
+}
+void InstallLeadHooks()
+{
+    LeadOutHooks();
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    if (kApSetSquadLeaderRva != 0)
+        g_leadSetHook = (coop::AddHook((void*)(base + (uintptr_t)kApSetSquadLeaderRva), (void*)&detour_leadSet, (void**)&orig_leadSet) == coop::SUCCESS) ? 1 : -1;
+    else g_leadSetHook = -1;
+    if (kApRemoveMemberRva != 0)
+        g_leadRemoveHook = (coop::AddHook((void*)(base + (uintptr_t)kApRemoveMemberRva), (void*)&detour_leadRemove, (void**)&orig_leadRemove) == coop::SUCCESS) ? 1 : -1;
+    else g_leadRemoveHook = -1;
+    if (kApLeaderGetRva != 0)
+        g_leadGetterHook = (coop::AddHook((void*)(base + (uintptr_t)kApLeaderGetRva), (void*)&detour_leadGetter, (void**)&orig_leadGetter) == coop::SUCCESS) ? 1 : -1;
+    else g_leadGetterHook = -1;
+    DebugLog(std::string("[LEAD] T-1442 step 6 hooks: set-leader 0x790C00 ") + (g_leadSetHook == 1 ? "installed" : (kApSetSquadLeaderRva == 0 ? "NOT IN THE TABLE" : "FAILED"))
+             + ", remove-member 0x794C00 " + (g_leadRemoveHook == 1 ? "installed" : (kApRemoveMemberRva == 0 ? "NOT IN THE TABLE" : "FAILED"))
+             + ", acting-leader getter 0x791FF0 " + (g_leadGetterHook == 1 ? "installed" : (kApLeaderGetRva == 0 ? "NOT IN THE TABLE" : "FAILED"))
+             + " (a squad's leader change is announced the frame after the engine makes it; the 1 s look is the backstop)");
+}
+/* MAIN THREAD (ApplyRemoteSquadLead, an applied announcement): SquadLeaderSafePointDrain runs at the next safe point instead of on its 1 s
+   throttle, and the squads here that hold a person it names run their hand-over decision at the next frame (LeadEventTick) */
+static void LeadArrivalNote(const coopsquad::SquadLeadMsg& m, unsigned int sender)
+{
+    ::InterlockedExchange(&g_leadDrainDue, 1);
+    if (g_leadArrivalUids.size() < 4096)
+    {
+        for (size_t i = 0; i < m.members.size(); ++i) if (m.members[i] != 0) g_leadArrivalUids.insert(m.members[i]);
+        if (m.acting != 0) g_leadArrivalUids.insert(m.acting);
+        if (m.formal != 0) g_leadArrivalUids.insert(m.formal);
+    }
+    if (g_leadArrLines >= kLeadArrLineCap) return;
+    ++g_leadArrLines;
+    DebugLog("[LEAD] arrival <- squad=" + N((long long)m.squadKey) + " lead=" + N((long long)m.acting) + " formal=" + N((long long)m.formal) + " members=" + N((long long)m.members.size())
+             + " seq=" + N((long long)m.seq) + " from=" + N((long long)sender) + " applied (copy leader at the next safe point; the hand-over decision at the next frame)");
+}
+static std::string LeadEventReport()
+{
+    const coopleadmark::LeadMarkTable& t = g_leadMarks;
+    return " leadEvent[notedSetLeader,notedRemoveMember,notedKo,notedDead,notedDeadSquad,notedActingGetter,notedUidLeader,notedHeld,already,overflow,bad,ownCallSkipped,notRun,runs,arrivalRuns,sent,dropped,drainEarly,setHook,removeHook,getterHook]="
+           + N((long long)t.noted[coopleadmark::kNoteSetLeader]) + "," + N((long long)t.noted[coopleadmark::kNoteRemoveMember]) + "," + N((long long)t.noted[coopleadmark::kNoteKo])
+           + "," + N((long long)t.noted[coopleadmark::kNoteDead]) + "," + N((long long)t.noted[coopleadmark::kNoteDeadSquad]) + "," + N((long long)t.noted[coopleadmark::kNoteActingGetter]) + "," + N((long long)t.noted[coopleadmark::kNoteUidLeader]) + "," + N((long long)t.noted[coopleadmark::kNoteHeld]) + "," + N((long long)t.already) + "," + N((long long)t.overflow) + "," + N((long long)t.bad)
+           + "," + N((long long)g_leadOwnCallSkipped) + "," + N(g_leadEvNotRun) + "," + N(g_leadEvRuns) + "," + N(g_leadEvArrivalRuns) + "," + N(g_leadEvSent)
+           + "," + N(g_leadEvDropped) + "," + N(g_leadDrainEarly) + "," + N((long long)g_leadSetHook) + "," + N((long long)g_leadRemoveHook) + "," + N((long long)g_leadGetterHook)
+           + " leadEventSentBy[setLeader,removeMember,ko,dead,deadSquad,actingGetter,uidLeader,held,arrival]=" + N(g_leadEvSentBy[0]) + "," + N(g_leadEvSentBy[1]) + "," + N(g_leadEvSentBy[2])
+           + "," + N(g_leadEvSentBy[3]) + "," + N(g_leadEvSentBy[4]) + "," + N(g_leadEvSentBy[5]) + "," + N(g_leadEvSentBy[6]) + "," + N(g_leadEvSentBy[7]) + "," + N(g_leadEvSentBy[8])
+           + " leadOutHooks[bed,prison,pose,dropped,pickedUp,outOfBed,floorStop,floorEnd]=" + N((long long)g_leadOutHook[0]) + "," + N((long long)g_leadOutHook[1]) + "," + N((long long)g_leadOutHook[2])
+           + "," + N((long long)g_leadOutHook[3]) + "," + N((long long)g_leadOutHook[4]) + "," + N((long long)g_leadOutHook[5]) + "," + N((long long)g_leadOutHook[6]) + "," + N((long long)g_leadOutHook[7])
+           + " leadOut[seen,changed]=" + N((long long)g_leadOutSeen) + "," + N((long long)g_leadOutChanged)
+           + " leadBackstop[first,other,watched,wake,missed]=" + N(g_leadBackstop[coopleadmark::kBsFirst]) + "," + N(g_leadBackstop[coopleadmark::kBsOther])
+           + "," + N(g_leadBackstop[coopleadmark::kBsWatched]) + "," + N(g_leadBackstop[coopleadmark::kBsWake]) + "," + N(g_leadBackstop[coopleadmark::kBsMissed]);
+}
 void ReportHandoff()
 {
     const std::string q(1, (char)34);
     DebugLog("[XFER] REPORT squadsSeen=" + N(g_squadsSeen) + " xferOut=" + N(g_xferOut) + " resent=" + N(g_xferResent) + " abandoned=" + N(g_xferAbandoned) + " ackIn=" + N(g_ackIn) + " released=" + N(g_released)
-             + " | xferIn=" + N(g_xferIn) + " taken=" + N(g_taken) + " intents=" + N(g_intentsGiven) + " unresolvedSubjects=" + N(g_intentsSubjectUnresolved) + " unknownUids=" + N(g_xferInUnknownUid) + " ackOut=" + N(g_ackOut)
+             + " | xferIn=" + N(g_xferIn) + " taken=" + N(g_taken) + " carriedNotIssued=" + N(g_takeCarriedNotIssued) + " takeOrdersDropped=" + N(g_takeOrdersDropped) + " takeOrdersUnread=" + N(g_takeOrdersDropUnread) + " unknownUids=" + N(g_xferInUnknownUid) + " ackOut=" + N(g_ackOut)
              + " pending=" + N((long long)g_pending.size()) + " teleports=" + N(g_teleports)
              + " | nudges=" + N(g_nudges) + " keptUntaken=" + N(g_keptUntaken) + " xferInOutsideRing=" + N(g_xferInOutsideRing)
              + " | squadWriter[followedLeader,leaderUnknownFellBack,waitedLeader,xferFollowSent,xferFollowTaken,leaderSet,leaderSetMiss,keepAwakeRefresh]="
@@ -3848,7 +4301,8 @@ void ReportHandoff()
              + " | squadLead[sent,recv,applied,stale,crossingResolved,crossingRefused]="
              + N(g_squadLeadSent) + "," + N(g_squadLeadRecv) + "," + N(g_squadLeadApplied) + "," + N(g_squadLeadStale) + "," + N(g_crossingResolved) + "," + N(g_crossingRefused)
              + " myLeadSquads=" + N((long long)g_myLead.size()) + " peerLeadSquads=" + N((long long)g_peerLead.Squads()) + " peerLeadFull=" + N(g_squadLeadFull)
-             + SquadCatsReport());   /* T-1 B3 restructure */
+             + SquadCatsReport()   /* T-1 B3 restructure */
+             + LeadEventReport());   /* T-1442 step 6: the event road, then the backstop - missed last */
     /* releaseMore / releaseHolder / releaseSkip ride the [net] REPORT token, which T1056's report lines did not show - printed
        here as well, with the keep counters */
     DebugLog("[XFER] REPORT releaseMore[offers,held,next,lateAccepted,ackWrongSender,ackStale,ackUnknown,dupAck,notMine,worldCleared,logged]=" + N(g_relOffers) + "," + N(g_relHeld)
@@ -3880,6 +4334,7 @@ void ApplyRemoteSquadLead(const coopsquad::SquadLeadMsg& m, unsigned int sender)
     }
     ++g_squadLeadApplied;
     g_catsDue = 1;   /* T-1 B3 restructure: its money is compared with the copy's pot at the next safe point */
+    LeadArrivalNote(m, sender);   /* T-1442 step 6: the copy squad's leader at the next safe point; the hand-over decision at the next frame */
 }
 // T-1 B1 step 5, restructured (protocol 85): at the K2 safe point (worker paused), once a second - each copy squad (no member run
 // here, not a player's or a stand-in's) whose announced FORMAL leader (the other game's newest MSG_SQUAD_LEAD among its members,
@@ -3889,8 +4344,10 @@ void ApplyRemoteSquadLead(const coopsquad::SquadLeadMsg& m, unsigned int sender)
 void SquadLeaderSafePointDrain()
 {
     static DWORD last = 0; const DWORD nowMs = ::GetTickCount();
-    if (nowMs - last < 1000) return;
+    if (nowMs - last < 1000 && g_leadDrainDue == 0) return;   /* T-1442 step 6: an arrived announcement brings it forward */
+    if (nowMs - last < 1000) ++g_leadDrainEarly;
     last = nowMs;
+    ::InterlockedExchange(&g_leadDrainDue, 0);
     if (g_peerLead.Squads() == 0 || kApSetSquadLeaderRva == 0) return;
     const uintptr_t fn = (uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kApSetSquadLeaderRva;
     std::set<void*> seen;
@@ -3927,7 +4384,9 @@ void SquadLeaderSafePointDrain()
             if (g_leaderSetLogged < 32) { ++g_leaderSetLogged; DebugLog("[XFER] copy squad leader NOT set (the named leader's AI [c+0x650] / [[c+0x650]+0x20] is not plausible) leader=" + N(uids[li]) + " was=" + N(was)); }
             continue;
         }
+        ::InterlockedExchange(&g_leadOwnCallTid, (LONG)::GetCurrentThreadId());   /* T-1442 step 6: the set-leader hook does not note the mod's own call */
         const int r = SetSquadLeaderPod(ap, lead, fn);
+        ::InterlockedExchange(&g_leadOwnCallTid, 0);
         if (r == 1) ++g_leaderSet; else ++g_leaderSetMiss;
         if (g_leaderSetLogged < 32)
         {

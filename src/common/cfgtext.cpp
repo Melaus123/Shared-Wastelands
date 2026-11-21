@@ -14,7 +14,7 @@ namespace coopcfg {
 CfgFields::CfgFields()
     : role(kCfgSingle), hostPort(0), storePort(0), slot("s1"), modSalt(0), profileTest(0), ownSave(1), joinViaWorld(0), routerPort(1),
       relayTestMode(kRelayTestNone), relayTestPort(0), relayLagMs(0), relayLossPct(0), relayTestCap(0), relayTestDials(0),
-      relayBridgeMode(kRelayBridgeOn), relayBridgePort(0), relayViaPort(0), relayCap(0), parityHoldSec(0), benchCapKbs(0), netRateLog(0),
+      relayBridgeMode(kRelayBridgeOn), relayBridgePort(0), relayViaPort(0), relayCap(0), parityHoldSec(0), benchCapKbs(0), netRateLog(0), bugRelay(0), bugRelayPort(0),
       steamFakeLagMs(0), steamFakeLossPct(0)
 {
     /* B13: playerId is deliberately EMPTY by default and never invented here. This is a text layer; the
@@ -492,6 +492,29 @@ void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>*
             {
                 ++bad;
                 if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "netratelog='" + val + "' is not 1, on, 0 or off - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "bugrelay")   /* TEST ONLY - see CfgFields::bugRelay; real / test / test503 / test404 */
+        {
+            if (val == "real") f.bugRelay = 0;
+            else if (val == "test") f.bugRelay = 1;
+            else if (val == "test503") f.bugRelay = 2;
+            else if (val == "test404") f.bugRelay = 3;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "bugrelay='" + val + "' is not real, test, test503 or test404 - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "bugrelayport")   /* TEST ONLY - see CfgFields::bugRelayPort; 1..65535 */
+        {
+            long v = 0; bool ok = !val.empty() && val.size() <= 5;
+            for (size_t i = 0; ok && i < val.size(); ++i) { if (val[i] < '0' || val[i] > '9') ok = false; else v = v * 10 + (val[i] - '0'); }
+            if (ok && v >= 1 && v <= 65535) f.bugRelayPort = (int)v;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "bugrelayport='" + val + "' is not a port 1..65535 - ignored"; notes->push_back(nt); }
             }
         }
         else if (key == "hosttoken")   /* TEST ONLY - see CfgFields::hostToken; exactly 64 lowercase hex digits; the value is never put in a note */

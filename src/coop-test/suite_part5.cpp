@@ -758,6 +758,19 @@ void t_t1279_refused_save_fault()
     if (ZoneRefusedSaveIsFault(0, -1) != 0) Fail("t1279: a refused save with this game's slot unknown and a holder named is a fault");
     /* the report's case: loaded from the save file, the game's own record held -> refused (kZaNoMark) -> a fault */
     if (ZoneKeptAdoptJudge(0, -1, 5, 3, 3, 3, 10.0, 20.0) != kZaNoMark || ZoneRefusedSaveIsFault(3, 3) != 1) Fail("t1279: the report's refused save is not a fault");
+    /* T-1391 (F1577): the label from the real fact - a FAULT only with a difference in a compared kind and no other game holding */
+    if (ZoneRefusedSaveLabel(3, 3, kZcDiffers) != kZrlFault || ZoneRefusedSaveLabel(-1, 3, kZcDiffers) != kZrlFault || ZoneRefusedSaveLabel(-1, -1, kZcDiffers) != kZrlFault)
+        Fail("t1391c: a refused save that differs while no other game holds the area is not a FAULT");
+    /* T2677's case: holder nobody, B's own OLD copy refused, 'No difference in the kinds compared' -> nothing lost, not a FAULT */
+    if (ZoneRefusedSaveLabel(-1, 1, kZcSame) != kZrlNothingLost || ZoneRefusedSaveLabel(1, 1, kZcSame) != kZrlNothingLost)
+        Fail("t1391c: a refused save with no difference is labelled other than 'lost nothing' (T2677's false FAULT)");
+    if (ZoneRefusedSaveLabel(-1, 1, kZcUnread) != kZrlUncompared || ZoneRefusedSaveLabel(1, 1, 7) != kZrlUncompared)
+        Fail("t1391c: a refused save that could not be compared is not labelled 'not compared'");
+    for (int c = 0; c < 3; ++c)
+        if (ZoneRefusedSaveLabel(0, 3, c) != kZrlHolderRule || ZoneRefusedSaveLabel(0, -1, c) != kZrlHolderRule)
+            Fail("t1391c: a refused save while another game holds the area is labelled other than the holder rule");
+    if (kZrlFault == kZrlNothingLost || kZrlFault == kZrlUncompared || kZrlFault == kZrlHolderRule || kZcSame == kZcDiffers || kZcSame == kZcUnread)
+        Fail("t1391c: two labels or outcomes share a value");
 }
 /* T-1279 (T2290): the world server's area answers do not wait behind the record stream - the line of each AREA_FRESH kind, the ANSWER
    line in the send queue (ahead of records and REST barriers, never ahead of a WELCOME), the REST marks that keep a CANT behind a
@@ -3696,7 +3709,7 @@ void t_t1401b_nearby_reply()
     if (cooplive::kInnerLogReply != 208u || !cooplive::LiveInnerRoadLocal(cooplive::kInnerLogReply) || cooplive::LiveInnerAccepted(cooplive::kInnerLogReply)
         || cooplive::kInnerLogReply == cooplive::kInnerMapDots || cooplive::kInnerLogReply == cooplive::kInnerLogAsk || cooplive::kInnerLogReply == cooplive::kInnerLogPart)
         Fail("t1401b: LOG_REPLY is not inner type 208, the store layer's own");
-    if (hovrec::kGameProtocol != 237u) Fail("t1401b: the game-to-game protocol is not 237 (T-1401 step 2b took 232, T-1393 233, T-1408 235, T-1429 s10 merge 236)");
+    if (hovrec::kGameProtocol != 242u) Fail("t1401b: the game-to-game protocol is not 242 (T-1401 step 2b took 232, T-1393 233, T-1408 235, T-1429 s10 merge 236)");
     /* the queue: oldest first, at most 4, a slot waiting once */
     AskQueue q;
     AskWaiting w;

@@ -9,9 +9,11 @@
 #   ro    read-only initialised data; <bytes> are the image's own constant bytes
 #   ptr   a relocated pointer in read-only data; <bytes> is the RVA it must point at
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
+#   optional:<feature>  (T-1453 / T-294) an optional 6th field: a row only that minor feature, diagnostic or test lever uses;
+#         not found or not matching, ONLY that feature is off (its address 0) and the mod runs - logged '[ADDR] optional row ...'
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 809
+!count 814
 AbstractMovementBase_pathGoal                  code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector             code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed            code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -20,6 +22,7 @@ Activate                                       code 007EBDF0 007EBDF0 40574883EC
 ActivatePred                                   code 007EBF30 007EBF30 48895C24104889742418574883EC4048
 ActivePlatoon_leader                           code 00792B90 00792B90 40574883EC30488BF9488B89A0000000
 ActivePlatoon_setLeader                        code 007917A0 007917A0 48895C2408574883EC20488BF9488B89
+ActivePlatoon_removeMember                     code 007957A0 007957A0 48895C242055564156488D6C24B94881
 ActivePlatoonVt                                ptr  016E2E08 016E2E08 0001DA2A
 AddConstructionProgress                        code 005595A0 005595A0 488BC45541544155488DA8E8FDFFFF48
 AddDismantleProgress                           code 002A2860 002A2860 488BC4554154415541564157488DA838
@@ -33,7 +36,7 @@ AffectEv                                       code 006B2D20 006B2D20 4885D20F84
 AffectTrust                                    code 006B2560 006B2560 4885D274584883EC48488B010F297424
 AI_treatsAsEnemy                               code 00599E30 00599E30 48895C2408574883EC20488BB9700100
 AI_periodicTick                                code 005112B0 005112B0 48895C240848896C2410488974241848
-AI_frameTick4                                  code 005965B0 005965B0 40534883EC4048837910000F29742430
+AI_frameTick4                                  code 005965B0 005965B0 40534883EC4048837910000F29742430 optional:ai-tick-counter
 AI_beingShotAt                                 code 00999D50 00999D50 48896C2418564883EC30488BEA488BF1
 AI_underMeleeAttack                            code 00999F00 00999F00 48896C2418564883EC30488BEA488BF1
 AI_treatScore                                  code 00998200 00998200 48896C2410488974241848897C242041
@@ -46,6 +49,7 @@ AnimalDropItem                                 code 005CA4A0 005CA4A0 48895C2410
 AnimationClass_blocksWaypointMovement          code 0051C870 0051C870 40534883EC204883B92802000000488B
 AnimationClass_applySpeedCap                   code 0051C960 0051C960 F30F108178010000F30F11899C010000
 AnimationClass_placeAnimationRoot              code 005B1B00 005B1B00 4883EC2880B988000000007412488B89
+AnimationClass_ragdollModeUT                   code 005B9A10 005B9A10 488BC45557415441554156488BEC4883
 AnimClassBase_actionBlendWeight                code 005B32D0 005B32D0 40534883EC20488B99E0000000488B4B
 AnimClassBase_isActionAnimating                code 005B34B0 005B34B0 488B81E0000000488B500833C0448B4A
 Appearance_readLook                            code 005B10E0 005B10E0 488B8148010000C3CCCCCCCCCCCCCCCC
@@ -58,6 +62,7 @@ AppearanceHuman_skinRemoved                    code 005450B0 005450B0 0FB681AC01
 AppearanceHuman_chooseSex                      code 0052DFC0 0052DFC0 40534883EC20488BD9E87001B2FF4533
 AppearanceHuman_rebuildLook                    code 005338F0 005338F0 488BC455574154488D68A14881ECB000
 AppearanceHuman_rebuildShape                   code 0052E6C0 0052E6C0 488BC4554154415541564157488DA8F8
+AppearanceBase_setupItemMaterial               code 00536210 00536210 488BC45556574154415541564157488D optional:itemlook
 ApplyDamage                                    code 0064F300 0064F300 48895C240848896C2410488974241857
 ApplyDamageHitRet                              ret  0065109C 00651097 E822809DFF
 BailoutConfirm                                 code 006AE170 006AE170 488BC4554154415541564157488D68A1
@@ -67,6 +72,7 @@ BountyMapIndex                                 code 005E7EE0 005E7EE0 4056574154
 BountySightTargetTest                          code 0085722D 0085722D 4883B85002000000740EF3440F101D00
 BountyTrespassTargetTest                       code 00859BE3 00859BE3 4883B850020000007451488BD6488BCD
 BuildingSelectedBoxOwnerTest                   code 007FCDE1 007FCDE1 4883B85002000000755F488D154E9DE9
+Character_getPickedUp                          code 005CED90 005CED90 4055565741544155488BEC4883EC7048
 FactionHostileEntry                            code 00855830 00855830 4883EC28483B91480100007507B00148
 FactionMarkHostile                             code 00858F40 00858F40 48895C24104889742418574883EC20F3
 PlayerInterfaceBuildingSelected                code 007FC6E0 007FC6E0 488BC45556574154415541564157488D
@@ -82,7 +88,7 @@ BuildingInterior_toggleLoaded                  code 005621E0 005621E0 40574883EC
 BuildingSwapPick                               code 007F4770 007F4770 48895C2410555657415441554883EC20
 BuildingSquadState                             code 0057F1F0 0057F1F0 4885C90F84BC020000488BC455574154
 BuyItem                                        code 0074A630 0074A630 40555657415441554881EC0001000048
-CarryFollowGateGlobal                          var  02133970 02133970 -
+CarryFollowGateGlobal                          var  02133970 02133970 - optional:carry-gate-probe
 CageUseStart                                   code 00358040 00358040 48895C2418554883EC40488BEA488BD9
 ChangeSlaveOwner                               code 0032E430 0032E430 40554883EC30488B8128030000488BE9
 CharacterLimit                                 var  02133F50 02133F50 -
@@ -91,7 +97,6 @@ Character_getCombat                            code 005C92B0 005C92B0 488B814806
 Character_currentMoveSpeed                     code 005C83D0 005C83D0 40534883EC20488BD9E83126A5FF84C0
 Character_getSquad                             code 00791B10 00791B10 4883EC28488B81580600004885C0750E
 Character_worldPosition                        code 005CE680 005CE680 4055574883EC4883B9F802000000488B
-Character_poseState                            code 005C7E10 005C7E10 8B81E0000000C3CCCCCCCCCCCCCCCCCC
 Character_hasDied                              code 006215B0 006215B0 0FB681BC050000C3CCCCCCCCCCCCCCCC
 Character_isPlayerControlled                   code 007916D0 007916D0 4883EC28488B01FF505833C948398850
 Character_inRagdoll                            code 007D1440 007D1440 4883EC2880B9D4030000007407B00148
@@ -138,7 +143,7 @@ CloseInventories                               code 006E5740 006E5740 4056574154
 CloseInventory                                 code 006E53D0 006E53D0 48895C2420564883EC40837A080B488B
 CombatClass_currentTarget                      code 0033A2E0 0033A2E0 488D05E9AF34014889028B81A0020000
 CombatClass_enterCombat                        code 006659B0 006659B0 48895C24084889742410574883EC3048
-CombatClass_periodicTick                       code 0060D470 0060D470 4055564883EC38488BF14883C108E8B3
+CombatClass_periodicTick                       code 0060D470 0060D470 4055564883EC38488BF14883C108E8B3 optional:combat-tick-counter
 CombatClass_setTarget                          code 00665650 00665650 4889742410574883EC20488BF2488BF9
 CombatClass_setSwordState                      code 0060CCD0 0060CCD0 48895C2408574883EC2083B9F0010000
 CombatClassAI_update                           code 0060D6A0 0060D6A0 40574883EC5080B9E8020000000F2974
@@ -194,7 +199,6 @@ Faction_platoonsHomedIn                        code 006BA570 006BA570 4C89442418
 Faction_renameTo                               code 003857B0 003857B0 4881C1A80100004983C9FF4533C0E9DE
 FactionActivatePlatoon                         code 007F35D0 007F35D0 40534883EC204533C9488BDA4C8BC144
 FactionDeactivatePlatoon                       code 007F3240 007F3240 48895C2408574883EC204533C9488BFA
-FactionDirectory_allFactions                   code 00878980 00878980 488BC1C3CCCCCCCCCCCCCCCCCCCCCCCC
 FactionDirectory_findFactionByName             code 002E7950 002E7950 48895C240848896C2410488974241857
 FactionDirectory_findFactionById               code 002E7A20 002E7A20 48895C240848896C2410488974241848
 FactionDirectory_findOrAddFaction              code 002E7690 002E7690 405741544155415641574883EC3048C7
@@ -214,7 +218,6 @@ ForgottenGuiSetLoading                         code 006E2150 006E2150 40534883EC
 FrontEndScreenPtr                              var  02133320 02133320 -
 GameDataContainer_newRecord                    code 006C0750 006C0750 41544883EC3048C7442420FEFFFFFF48
 GameDataContainer_ctor                         code 00388520 00388520 48894C2408565741544883EC3048C744
-GameDataContainer_allRecords                   code 0036B110 0036B110 488D4150C3CCCCCCCCCCCCCCCCCCCCCC
 GameDataContainer_findRecordByName             code 006BFDA0 006BFDA0 48895C241048896C2420565741544883
 GameDataContainer_listRecordsOfType            code 006C0420 006C0420 48895C2420574883EC20488BFA488D54
 GameDataContainer_renameRecord                 code 006BFB70 006BFB70 405357415441554883EC38488BFA488B
@@ -232,11 +235,10 @@ LockButton                                     code 00547060 00547060 48895C2408
 LockDoor                                       code 002969F0 002969F0 83B98003000000751CF30F1005BB383F
 RandomRange                                    code 009B1C80 009B1C80 4883EC480F297424300F297C24200F28
 SavedObjectState_savedPosition                 code 0037DB40 0037DB40 8B412089028B41248942048B41288942
-SavedObjectState_stateCount                    code 0037F710 0037F710 8B8188000000C3CCCCCCCCCCCCCCCCCC
 GameWorld_activeCharacters                     code 00664360 00664360 488D8150070000C3CCCCCCCCCCCCCCCC
 GameWorld_frameSpeedScale                      code 0066C760 0066C760 F30F108100070000C3CCCCCCCCCCCCCC
 GameWorld_objectsInBox                         code 007862E0 007862E0 488BC448895810488968184889702048
-GameWorld_setupRecords                         code 00870AE0 00870AF0 FCFFFF4881EC8004000048C7442470FE
+GameWorld_setupRecords                         code 00870AE0 00870AF0 FCFFFF4881EC8004000048C7442470FE optional:start-probe
 GameWorld_gamePaused                           code 000DEE00 000DEE00 0FB681B9080000C3CCCCCCCCCCCCCCCC
 GameWorld_gpuFrame                             code 00788A00 00788A00 488BC4565741544883EC7048C7442420
 GameWorldDtor                                  code 0086D650 0086D660 20FEFFFFFF48895C2468488BF9488D05
@@ -319,7 +321,6 @@ MedApplyFirstAid                               code 0064D800 0064D800 48895C2420
 MedTreatParts                                  code 00649A00 00649A00 4056574881EC9800000080B964010000
 MedicalSystem_amputate                         code 0064EDC0 0064EDC0 83FA040F842F050000488BC455535657
 MedicalSystem_partAt                           code 002AA600 002AA600 8B8198010000483BD0730F488B81A001
-MedicalSystem_countBodyParts                   code 002AA5F0 002AA5F0 8B8198010000C3CCCCCCCCCCCCCCCCCC
 MedicalSystem_knockout                         code 00644980 00644980 40534883EC40F30F1005A6F4AE01488B
 MedicalSystem_healthTick                       code 00652000 00652000 488BC4488958205556574881ECD00000
 MedicalSystem_setRobotLimbItem                 code 00645690 00645690 40565741544883EC3048C7442420FEFF
@@ -358,6 +359,7 @@ PickupObject                                   code 005CFF90 005CFF90 48895C2408
 PlacementCommit                                code 004D72A0 004D72A0 488BC4554154415541564157488DA858
 PlatoonSid                                     code 00384C30 00384C30 40534883EC2033C048C742180F000000
 Platoon_findNewHome                            code 0099E6E0 0099E6E0 488BC44154415541574883EC5048C744
+Platoon_declareDead                            code 00797090 00797090 40534881ECB000000048C7442420FEFF
 PlayActionByName                               code 005203B0 005203B0 4053574881EC9800000048C7442430FE
 AnimLayerPlay                                  code 005B7AC0 005B7AC0 48896C2420564883EC704883B9A80000
 AnimCtlIdle                                    code 0051D3B0 0051D3B0 48895C2408574883EC40F30F10818001
@@ -410,7 +412,6 @@ ResearchSetLevel                               code 00834390 00834390 4883EC283B
 ResearchSetResearched                          code 00834550 00834550 488BC45557415441554156488DA838FE
 ResetGame                                      code 0036CB80 0036CB80 488BC455488D68984881EC6001000048
 RootObjectBase_getOwnerFactionDirect           code 00594640 00594640 4883EC6848C7442420FEFFFFFF488B05
-RootObjectBase_getRecordDirect                 code 000D1D70 000D1D70 488B4140C3CCCCCCCCCCCCCCCCCCCCCC
 RootObjectBase_selfHandle                      code 000B8610 000B8610 488D05E11FD8014885C97404488D4158
 RootObjectBase_getShownName                    code 000D3CE0 000D3CE0 40534883EC2033C048C742180F000000
 RootObjectContainer_saveMembers                code 0036DDB0 0036DDB0 4883EC38488B4424604C8BD2488D5150
@@ -431,6 +432,8 @@ SaveManagerNewGame                             code 0047B1A0 0047B1A0 40534883EC
 SaveManagerRequestPump                         code 0047C310 0047C310 488BC455574154488DA868FAFFFF4881
 SaveManagerSave                                code 0047B920 0047B920 40574881EC0001000048C7442420FEFF
 SlaveBuyingConfirm                             code 006ADD20 006ADD20 488BC4554154415541564157488D68A1
+SleepOnFloorEnd                                code 00348070 00348070 48895C24084889742410574883EC2048
+SleepOnFloorStop                               code 00347EE0 00347EE0 4889742418574883EC3080B9A1000000
 StealthKoChance                                code 008852F0 008852F0 48895C24085556574881EC8000000048
 StealthKoChanceRet                             ret  0034D08B 0034D086 E84BD9CEFF
 StealthKoFailAlert                             code 00685660 00685660 48895C240848896C2410488974241857
@@ -482,6 +485,7 @@ SpeedGlobal                                    var  02134810 02134810 -
 StopAction                                     code 0051DFA0 0051DFA0 40534883EC6048C7442420FEFFFFFF48
 TakeOneItemOnly                                code 0074AB30 0074AB30 488974242041544883EC204C8BE2488B
 TaskDataByType                                 code 00283F80 00283F80 894C24084883EC28488D542430488D0D
+TaskGetOutOfBedStep                            code 00345620 00345620 48895C24084889742410574883EC2048
 TaskProcessSlaveBody                           code 0035AA20 0035AA20 405556574154415541564157488D6C24
 TaskStealthKO_update                           code 0034CD80 0034CD80 488BC45556574154415541564157488D
 TaskStripWeaponsBody                           code 0034E7B0 0034E7B0 4C8BDC55565741544155415641574883
@@ -713,11 +717,11 @@ CraftWindowRepeat                              code 002B5000 002B5000 40534883EC
 CraftRecipeList                                code 002BBD20 002BBD20 405556574154415541564157488D6C24
 CraftSelectedBuilding                          code 009F8F20 009F8F20 40534883EC20488B01488BDAFF502048
 CraftSelectionGlobal                           var  02133FB0 02133FB0 -
-MainBarBuildButton                             code 00720F80 00720F80 4883EC3848C7442420FEFFFFFF8B05C1
-BuildModeCancel                                code 004D4320 004D4320 48895C2410564883EC2033D2488BD948
-CraftOpenFor                                   code 002B5090 002B5090 40534883EC3048C7442420FEFFFFFF48
-OverviewShow                                   code 0049C210 0049C210 48895C24084889742410574883EC4048
-OverviewWindowGlobal                           var  0212F4F8 0212F4F8 -
+MainBarBuildButton                             code 00720F80 00720F80 4883EC3848C7442420FEFFFFFF8B05C1 optional:buildmode-lever
+BuildModeCancel                                code 004D4320 004D4320 48895C2410564883EC2033D2488BD948 optional:buildmode-lever
+CraftOpenFor                                   code 002B5090 002B5090 40534883EC3048C7442420FEFFFFFF48 optional:craft-window-lever
+OverviewShow                                   code 0049C210 0049C210 48895C24084889742410574883EC4048 optional:craft-window-lever
+OverviewWindowGlobal                           var  0212F4F8 0212F4F8 - optional:craft-window-lever
 CampSpawnPass                                  code 008F7310 008F7310 488BC455574154488D6C24904881EC70
 CampSpotPick                                   code 008F6350 008F6350 488BC4554154415541564157488D68A1
 GameDataRandomReference                        code 00580310 00580310 48895C240848896C2410488974241857
@@ -785,8 +789,8 @@ DoorOpenButtonOpenRet                          ret  00547047 00547042 E8F280AFFF
 BuildingPlaceGround                            code 009B3720 009B3720 4883EC380F29742420F30F10351FFBCC
 LevelEditorDeleteSelected                      code 007778A0 007778A0 48895C24084889742410574883EC2048
 PlayerInterfaceToggleEditor                    code 007F3720 007F3720 40574883EC3048C7442420FEFFFFFF48
-KenshiCrashFilter                              code 01373AB0 01373AB0 40554883EC20488BEA488D15A0823900
-KenshiSaveRootText                             var  01F9FE48 01F9FE48 -
+KenshiCrashFilter                              code 01373AB0 01373AB0 40554883EC20488BEA488D15A0823900 optional:crash-watch
+KenshiSaveRootText                             var  01F9FE48 01F9FE48 - optional:crash-watch
 BuildingAtPoint                                code 009B2BA0 009B2BA0 488BC448895808574881EC200100000F
 ShopFallbackRandom                             code 009FC1B0 009FC1B0 40574883EC4048C7442420FEFFFFFF48
 PlayerInterface_newPlayerTask                  code 007FA650 007FA650 48895C240848896C2418565741544883
@@ -800,20 +804,20 @@ CharacterKeepUpdatedTest                       code 005C79C0 005C79C0 40574883EC
 NodeListDestroyByBuilding                      code 0038A720 0038A720 488BC444884018488950104889480853
 TownForgetBuilding                             code 00928EE0 00928EE0 48895C2418555641554883EC4033DB40
 BuildingGetTownStrict                          code 00296940 00296940 40534883EC20488BD90F1F8000000000
-InputHandlerInit                               code 003636C0 003636C0 488BC4554154415541564157488D68A1
-InputHandlerAddCommand                         code 00363440 00363440 40555657415441554881ECA000000048
-InputHandlerFind                               code 00361F50 00361F50 48895C24104889742420574883EC2048
-InputHandlerBind                               code 00362260 00362260 48895C240848896C2410488974242044
-InputHandlerParseKey                           code 00361B90 00361B90 405556574154415541564157488D6C24
-InputHandlerKeyBound                           code 00360FB0 00360FB0 488B4130448BCA4C8BD14C8B4008488B
-InputHandlerKeyName                            code 003612E0 003612E0 405356574881EC8000000048C7442438
-InputHandlerGlobal                             var  02133370 02133370 -
-KeyConfigLineCtor                              code 003E7C60 003E7C60 488BC448894808565741544881EC9000
-DatapanelAddLine                               code 006FF7D0 006FF7D0 448B42184533C9E9C07F91FFCCCCCCCC
-DatapanelAddSpacer                             code 006FE400 006FE400 4055535657415441554156488D6C24D9
-OptionsControlsEndRet                          ret  003FAE4B 003FAE46 E8D921C3FF
-InputHandlerKeyDown                            code 00360B30 00360B30 40534883EC30448BC2488BD983FA2A74
-GameFreeStub                                   code 00ED64F8 00ED64F8 FF2592403701FF2584403701FF257640
+InputHandlerInit                               code 003636C0 003636C0 488BC4554154415541564157488D68A1 optional:ping-key
+InputHandlerAddCommand                         code 00363440 00363440 40555657415441554881ECA000000048 optional:ping-key
+InputHandlerFind                               code 00361F50 00361F50 48895C24104889742420574883EC2048 optional:ping-key
+InputHandlerBind                               code 00362260 00362260 48895C240848896C2410488974242044 optional:ping-key
+InputHandlerParseKey                           code 00361B90 00361B90 405556574154415541564157488D6C24 optional:ping-key
+InputHandlerKeyBound                           code 00360FB0 00360FB0 488B4130448BCA4C8BD14C8B4008488B optional:ping-key
+InputHandlerKeyName                            code 003612E0 003612E0 405356574881EC8000000048C7442438 optional:ping-key
+InputHandlerGlobal                             var  02133370 02133370 - optional:ping-key
+KeyConfigLineCtor                              code 003E7C60 003E7C60 488BC448894808565741544881EC9000 optional:ping-key
+DatapanelAddLine                               code 006FF7D0 006FF7D0 448B42184533C9E9C07F91FFCCCCCCCC optional:ping-key
+DatapanelAddSpacer                             code 006FE400 006FE400 4055535657415441554156488D6C24D9 optional:ping-key
+OptionsControlsEndRet                          ret  003FAE4B 003FAE46 E8D921C3FF optional:ping-key
+InputHandlerKeyDown                            code 00360B30 00360B30 40534883EC30448BC2488BD983FA2A74 optional:ping-key
+GameFreeStub                                   code 00ED64F8 00ED64F8 FF2592403701FF2584403701FF257640 optional:ping-key
 ZoneWalkMapRebuild                             code 003AB840 003AB840 488BC456574154415541564881ECB000
 NavMeshManagerPtr                              var  021345C0 021345C0 -
 NavClosestFaceQuery                            code 003A2FA0 003A2FA0 48895C24084889742410574883EC6048
@@ -821,3 +825,6 @@ HavokCharacterSetPosition                      code 00145E50 00145E50 488BC45557
 WallJoinArea                                   code 0029AC50 0029AC50 4885D20F8426010000488BC4574881EC
 WallJoinTo                                     code 0029A890 0029A890 4889742418574883EC40488BF2488BF9
 GuiKeyCommandGuard                             code 006E1FD0 006E1FD0 488B4920E9963A92FFCCCCCCCCCCCCCC
+BuildingPauseToggle                            code 00546F40 00546F40 48895C2408574883EC4033C0488BF948
+BuildingFinishConstruction                     code 00562340 00562340 40534883EC2080B9600100000048897C
+PlatoonPlanTemplateSetup                       code 00271620 00271620 405556574154415541564157488D6C24

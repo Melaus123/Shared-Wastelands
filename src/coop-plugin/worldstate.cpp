@@ -116,6 +116,7 @@
 #include "speech.h"     // T-831: TalkWindowBeforeRemove - a shown conversation naming a removed body ends first
 #include <Windows.h>
 namespace coop { bool AnyPlayersFaction(::Faction* f); }   // playerfaction.cpp: any player's faction - this game's own, a stand-in, a recorded stand-in
+namespace coop { void* LeadDeadSquadOf(const void* character); void LeadNoteDeath(const void* character, void* apBefore); }   /* T-1442 step 6: handoff.cpp - a dead character's squad announced the next frame (interlocked only) */
 #include <map>          // E19: g_wsShadow, the main-thread picture of the state map
 #include <vector>       // the dead set and the elsewhere set
 #include <algorithm>    // std::binary_search over those sets
@@ -972,8 +973,10 @@ void detour_declareDead(void* self)
     const unsigned int deadUid = FindSpawnedUid(self);
     const bool copyDeath = deadUid != 0 && !net::IsUidMineAnyThread(deadUid);
     const int deathMarkWas = copyDeath ? RelationsCopyDeathMark(1) : 0;
+    void* const leadSquadBefore = coop::LeadDeadSquadOf(self);   /* T-1442 step 6 review fold S3: before the original, which detaches it from its squad */
     orig_declareDead(self);
     if (copyDeath) RelationsCopyDeathMark(deathMarkWas);
+    coop::LeadNoteDeath(self, leadSquadBefore);   /* T-1442 step 6: after the original - the character and the squad it was in */
     coop::ResurrectNoteDeath(self, ret, unique != 0 ? 1 : 0);   /* T-556: this game's own dead are snapshotted on the main thread */
     if (!WsApplying()) { coop::StoreNoteSquadEvent(self); coop::StoreNoteDeath(self); }   /* T-1442 step 3: the dead character noted for the wipe-out decision the next frame (store.cpp DeadEventDrainTick; interlocked only, any thread) */   /* T-1084: the world squad this game writes that holds the dead member is marked due on the early road (queued off the main thread); a death this game applies from the shared state is not a change it publishes */
     if (unique == 0) return;

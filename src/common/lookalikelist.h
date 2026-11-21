@@ -21,7 +21,7 @@
 namespace lalist {
 
 const unsigned kMsgLookalike = 90;
-const unsigned kProtocol = 170;          /* the world-server protocol that carries LOOKALIKE */
+const unsigned kProtocol = 173;          /* the world-server protocol that carries LOOKALIKE */
 
 
 const unsigned kOpList = 1, kOpAdd = 2;

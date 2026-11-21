@@ -3519,6 +3519,43 @@ void t_t609_zone_kept_adopt()
     if (ZoneKeptAdoptJudge(0, -1, gen, me, me, other, 120.0, 150.0) != kZaNoMark) Fail("T-609 A: a copy from a record with no mark was adopted");
     for (int w = kZaAdopt; w <= kZaNotLoadedSince; ++w) if (std::string(ZoneKeptAdoptWhy(w)) == "unknown") Fail("T-609 A: a reason has no name");
 }
+/* ---- T-1391 late writer (owner 1821, F1549, design b): the kept-in-step judge takes this game's own load time of the copy (the kept
+   mark's loadedAt), not the map's 'loaded here since'; the holder test stays ---- */
+void t_t1391_latewriter_load_time()
+{
+    using namespace zonerec;
+    const int me = 0, other = 1; const long gen = 2;
+    /* A loaded before the late record landed and holds the area since -> adopted */
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 100.0, 110.0) != kZaAdopt) Fail("T-1391 LW: a copy loaded before the late record landed was not adopted");
+    /* A loaded after the record landed -> refused, as today */
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 120.0, 110.0) != kZaNotLoadedSince) Fail("T-1391 LW: a copy loaded after the record landed was adopted");
+    /* no load time on the mark, or no landed time -> refused, as today */
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 0.0, 110.0) != kZaNotLoadedSince) Fail("T-1391 LW: a mark with no load time was adopted");
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 100.0, 0.0) != kZaNotLoadedSince) Fail("T-1391 LW: a copy was adopted with no landed time");
+    /* A not the holder -> refused (the old holder's own late save, T2659's road) */
+    if (ZoneKeptAdoptJudge(1, gen, gen, other, me, other, 100.0, 110.0) != kZaNotHolder) Fail("T-1391 LW: a copy was adopted by a game that does not hold the area");
+    if (ZoneKeptAdoptJudge(1, gen, gen, -1, me, other, 100.0, 110.0) != kZaNotHolder) Fail("T-1391 LW: a copy was adopted with nobody holding the area");
+    /* a mark present (A loaded from a record at 100 s, the newer record landed at 110 s - adopted, above); then a reload of the area:
+       with a NEWER record held the load erases the mark (store.cpp ZoneFromRecordMarkApply) -> no mark -> refused, as today */
+    if (ZoneKeptMarkOnLoad(gen, ZoneProvisionalBlocks(1, 1, 0), -1) != kZmSet) Fail("T-1391 LW: a load from the record held did not set the mark");
+    if (ZoneKeptMarkOnLoad(gen, ZoneProvisionalBlocks(1, 1, 1), -1) != kZmErase) Fail("T-1391 LW: a reload with a newer record held did not erase the mark");
+    if (ZoneKeptAdoptJudge(0, -1, gen, me, me, other, 100.0, 110.0) != kZaNoMark) Fail("T-1391 LW: a copy whose mark a reload erased was adopted");
+    /* a reload from the record held RENEWS the mark: new load time, no landed time (store.cpp sets recordSeenAt = 0) -> refused until a newer record lands after it */
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 130.0, 0.0) != kZaNotLoadedSince) Fail("T-1391 LW: a renewed mark with no landed time was adopted");
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 130.0, 140.0) != kZaAdopt) Fail("T-1391 LW: a renewed mark with a later landed time was not adopted");
+    /* an area-file read with any record held erases; with the list not complete it is provisional; a read with no link generation and no list erases */
+    if (ZoneKeptMarkOnLoad(gen, ZoneProvisionalBlocks(0, 1, 0), -1) != kZmErase) Fail("T-1391 LW: an area-file read with a record held kept a mark");
+    if (ZoneKeptMarkOnLoad(-1, ZoneProvisionalBlocks(0, 0, 0), 2) != kZmProvisional || ZoneKeptMarkOnLoad(-1, ZoneProvisionalBlocks(1, 1, 0), 2) != kZmProvisional) Fail("T-1391 LW: a read before the list's end was not provisional");
+    if (ZoneKeptMarkOnLoad(-1, ZoneProvisionalBlocks(1, 1, 1), 2) != kZmErase || ZoneKeptMarkOnLoad(-1, 0, -1) != kZmErase) Fail("T-1391 LW: a blocked or unlinked read was kept");
+    /* T2667 zone.20.32 on A (F1549), on the performance clock in seconds: B's seq 768 landed at atMs=579727446 (log-A-life2:2269, 265.275 s)
+       and A's map mark was set at atMs=579729305 (:2351, 267.135 s) - both logged. A's load time on that clock is NOT logged: 579714.170 is
+       derived from its game-log time (the mark at 251.999 s, :1958 LOAD-OVERRIDE 251.974 s) plus the offset between the two clocks at :2269. */
+    if (ZoneRecordLandedSets(1, 1795157374LL, 733ULL, 1795157388LL, 768ULL) != 1) Fail("T-1391 LW: T2667's seq 768 did not set the landed time over seq 733");
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 579729.305, 579727.446) != kZaNotLoadedSince) Fail("T-1391 LW: T2667's old input (the map mark) no longer refuses - the case is not the run's");
+    if (ZoneKeptAdoptJudge(1, gen, gen, me, me, other, 579714.170, 579727.446) != kZaAdopt) Fail("T-1391 LW: T2667's load time (before seq 768 landed) was not adopted");
+    if (ZoneKeptAdoptJudge(1, gen, gen, other, me, other, 579714.170, 579727.446) != kZaNotHolder) Fail("T-1391 LW: T2667's case adopted while B still held the area");
+    if (ZoneKeptAdoptJudge(1, gen, gen + 1, me, me, other, 579714.170, 579727.446) != kZaLinkDropped) Fail("T-1391 LW: T2667's case adopted after a link drop");
+}
 /* ---- T-1351 (run T2381): only a record NEWER than the one the kept copy was loaded from sets the "newer record landed" time; a
    re-publish of the same record, or an older one, does not; no loaded-from entry sets it (as before) ---- */
 void t_t1351_landed_time_sets()
@@ -3669,21 +3706,167 @@ void t_t1351_refused_diff_line()
     const std::string e = zonediff::DiffLine("zone.52.52", (const unsigned char*)&em[0], em.size(), 1, pb, b.size(), 0, zonediff::kLineCap);
     if (e.find("refused copy (writer slot 1, 15 bytes, the EMPTY mark: the area wrote nothing)") == std::string::npos || e.find("buildings 0/1: only in newest 1 [" + k1 + "]") == std::string::npos)
         Fail("T-1351 diff: the EMPTY mark is not read as an empty area: " + e);
-    /* the call: on the FAULT road only (after the once-per-area-per-load limit); all four refusals hand the newest record and the copy */
+    /* T-1391 (t1391c, F1577 / F1578): the comparison's outcome and the kinds that differ, and the adopt road's own names */
+    {
+        int oc = -1; std::string dk = "x";
+        const std::string g2 = zonediff::CompareLine("T-1351", "refused copy", "newest record", "zone.52.52", pa, a.size(), 1, pb, b.size(), 0, zonediff::kLineCap, &oc, &dk);
+        if (g2 != want || oc != zonerec::kZcDiffers || dk != "buildings, box contents") Fail("t1391c: the refusal's comparison outcome is wrong (" + I(oc) + ", '" + dk + "')");
+        oc = -1; dk = "x";
+        zonediff::CompareLine("T-1351", "refused copy", "newest record", "zone.52.52", pb, b.size(), 0, (const unsigned char*)b2.data(), b2.size(), 0, zonediff::kLineCap, &oc, &dk);
+        if (oc != zonerec::kZcSame || !dk.empty()) Fail("t1391c: two copies with no difference in the kinds compared did not read as the same (" + I(oc) + ", '" + dk + "')");
+        oc = -1;
+        const std::string f2 = zonediff::CompareLine("T-1391", "adopted copy", "replaced record", "zone.52.52", pa, a.size(), 1, junk, sizeof junk, 0, zonediff::kLineCap, &oc, &dk);
+        if (oc != zonerec::kZcUnread || !dk.empty() || f2 != "[ZONE] T-1391 adopted copy of zone.52.52 not compared with the replaced record: the replaced record's copy cannot be read - the container's version is 9, this build reads 15")
+            Fail("t1391c: an unreadable copy on the adopt road is wrong (" + I(oc) + "): " + f2);
+        const std::string a2 = zonediff::CompareLine("T-1391", "adopted copy", "replaced record", "zone.52.52", pa, a.size(), 1, pb, b.size(), 0, zonediff::kLineCap, &oc, &dk);
+        if (a2.compare(0, 57, "[ZONE] T-1391 adopted copy differs from replaced record z") != 0 || a2.find(": adopted copy (writer slot 1, ") == std::string::npos
+            || a2.find(" vs replaced record (writer slot 0, ") == std::string::npos || oc != zonerec::kZcDiffers) Fail("t1391c: the adopt road's comparison line is wrong: " + a2);
+    }
+    /* the call: after the once-per-area-per-load limit, the comparison runs first and the label is decided from it (T-1391 F1577);
+       all four refusals hand the newest record and the copy */
     const std::string st = T313ReadFile("../coop-plugin/store.cpp");
     if (st.empty()) { Fail("T-1351 diff: could not read store.cpp"); return; }
     const size_t fs = st.find("void ZoneStaleRefusedSay(const std::string& zoneId, const std::string& text, const Record& newest, const std::string& refusedPath, const std::vector<char>* refusedBytes)");
     const size_t fl = fs == std::string::npos ? fs : st.find("g_zoneOwnRefusedSaid[zoneId] = loadNo;", fs);
-    const size_t fe = fl == std::string::npos ? fl : st.find("ErrorLog(\"[ZONE] FAULT (T-1279): a save of this game's own area ", fl);
-    const size_t fd = fe == std::string::npos ? fe : st.find("ZoneRefusedDiffSay(zoneId, newest, refusedPath, refusedBytes);", fe);
-    const size_t fz = fe == std::string::npos ? fe : st.find("\n}", fe);
-    if (fd == std::string::npos || fz < fd) Fail("T-1351 diff: the difference line is not said after the FAULT line, under its once-per-load limit");
-    if (st.find("ZoneRefusedDiffSay(zoneId,") != st.rfind("ZoneRefusedDiffSay(zoneId,") || st.find("void ZoneRefusedDiffSay(") == std::string::npos)
-        Fail("T-1351 diff: the difference line is said from somewhere other than the FAULT road");
+    const size_t fd = fl == std::string::npos ? fl : st.find("const int compared = ZoneCopyCompareSay(\"T-1351\", \"refused copy\", \"newest record\", zoneId, newest, refusedPath, refusedBytes, &differing);", fl);
+    /* T-1391 (F1611): the label from this game's own work since its loaded copy, not from the newest record */
+    const size_t fo = fd == std::string::npos ? fd : st.find("const int own = ZoneOwnWorkSay(\"refused copy\", zoneId, refusedPath, refusedBytes, &ownKinds);", fd);
+    const size_t fb = fo == std::string::npos ? fo : st.find("const int label = zonerec::ZoneRefusedSaveLabel(holder, g_mySlot, own);", fo);
+    const size_t fe = fb == std::string::npos ? fb : st.find("ErrorLog(\"[ZONE] FAULT (T-1279): a save of \" + zoneId + \" was REFUSED carrying this game's own work since its loaded copy in \" + ownKinds", fb);
+    const size_t fn = fb == std::string::npos ? fb : st.find("DebugLog(\"[ZONE] T-1391 refused save of \" + zoneId + \" lost nothing of this game's: ", fb);
+    const size_t fu = fb == std::string::npos ? fb : st.find("ErrorLog(\"[ZONE] T-1391 refused save of \" + zoneId + \" NOT COMPARED: ", fb);
+    const size_t fz = fs == std::string::npos ? fs : st.find("\n}", fs);
+    if (fe == std::string::npos || fn == std::string::npos || fu == std::string::npos || fz < fe || fz < fn || fz < fu)
+        Fail("t1391c: the refusal is not compared first (under its once-per-load limit) and labelled FAULT / lost nothing / not compared from it");
+    if (st.find("ZoneRefusedDiffSay(") != std::string::npos || st.find("FAULT (T-1279): a save of this game's own area ") != std::string::npos)
+        Fail("t1391c: the old unconditional FAULT line or its comparison call is still there");
+    /* the adopt road compares with the record it replaces, says it on the ADOPTED line, and an error line names the kinds that differ */
+    const size_t ka = st.find("bool ZoneKeptAdopt(const std::string& zoneId, const Record& rec, const std::string& copyPath, const std::vector<char>* copyBytes, const char** whyOut)");
+    const size_t kc = ka == std::string::npos ? ka : st.find("const int adoptCompared = ZoneCopyCompareSay(\"T-1391\", \"adopted copy\", \"replaced record\", zoneId, rec, copyPath, copyBytes, &adoptDiffering);", ka);
+    const size_t kl = kc == std::string::npos ? kc : st.find("+ \"; compared with the record it replaces: \" + (adoptCompared == zonerec::kZcSame ? ", kc);
+    const size_t kx = kl == std::string::npos ? kl : st.find("ErrorLog(\"[ZONE] T-1391 ADOPT DIFFERS: the adopted copy of \" + zoneId + ", kl);
+    const size_t kz = ka == std::string::npos ? ka : st.find("\n}", ka);
+    if (kx == std::string::npos || kz < kx) Fail("t1391c: the adopt road does not compare with the record it replaces and say it");
+    size_t nc = 0, ac = 0;
+    while ((ac = st.find("ZoneCopyCompareSay(\"", ac)) != std::string::npos) { ++nc; ++ac; }
+    if (nc != 2) Fail("t1391c: the comparison is called from other than the refusal and the adopt (" + I((int)nc) + " calls)");
+    if (st.find("ZoneKeptAdopt(w.r.worldId, rit->second, std::string(), &w.bytes, &why)") == std::string::npos || st.find("ZoneKeptAdopt(zoneId, rit->second, path, 0, &why)") == std::string::npos)
+        Fail("t1391c: an adopt caller does not hand the copy it would save");
     size_t n4 = 0, at = 0;
     while ((at = st.find("+ why, rit->second, ", at)) != std::string::npos) { ++n4; ++at; }
     if (n4 != 4 || st.find("+ why, rit->second, std::string(), &w.bytes); continue; }") == std::string::npos || st.find("+ why, rit->second, path, 0); return; }") == std::string::npos)
         Fail("T-1351 diff: the four refusals do not hand the newest record and the refused copy (" + I((int)n4) + " found)");
+}
+/* T-1391 (F1611, 2026-11-20): the refusal's label from THIS game's own work since its loaded copy (zonediff::OwnWorkOf) - only what
+   this game's copy has that its loaded copy had not; ground items paired by the ground road's match (the same key, then the same record
+   within 0.5 flat at any height); a building's inside count only when it rose; nothing of this game's = no FAULT, an own item lost =
+   FAULT; and the adopt line's side words */
+void t_t1391d_own_work()
+{
+    using namespace zonediff;
+    Fields one; one["quantity"] = "1"; one["quality"] = "0.50";
+    /* direction (T2689 log-A:5655): the loaded copy held 7 items the refused copy (the EMPTY mark) has not - nothing of this game's */
+    {
+        Side mine, loaded; mine.empty = 1;
+        for (int i = 0; i < 7; ++i) loaded.ground["52-gamedata.base@19,31@" + I(-569000 - i * 100) + ",-44042,9651"] = one;
+        OwnWork w;
+        const int oc = OwnWorkOf(mine, loaded, &w);
+        if (oc != zonerec::kZcSame || w.added[kKindGround] != 0 || w.gone[kKindGround] != 7) Fail("t1391d: the loaded copy's own items read as this game's work");
+        if (zonerec::ZoneRefusedSaveLabel(-1, 0, oc) != zonerec::kZrlNothingLost || zonerec::ZoneRefusedSaveLabel(0, 0, oc) != zonerec::kZrlNothingLost)
+            Fail("t1391d: a refusal with nothing of this game's is not 'lost nothing'");
+    }
+    /* noise (T2689 log-A:4464): the same item a tenth of a unit lower, or 0.3 flat away, is the same item; 0.6 flat away it is not */
+    {
+        Side mine, loaded;
+        loaded.ground["42317-changes_otto.mod@19,31@-569353,-44042,9651"] = one; mine.ground["42317-changes_otto.mod@19,31@-569353,-44042,9650"] = one;
+        loaded.ground["50-x.mod@19,31@1000,2000,300"] = one; mine.ground["50-x.mod@19,31@1003,2000,310"] = one;
+        loaded.ground["51-x.mod@19,31@1000,2000,300"] = one; mine.ground["51-x.mod@19,31@1006,2000,300"] = one;
+        OwnWork w;
+        const int oc = OwnWorkOf(mine, loaded, &w);
+        if (oc != zonerec::kZcDiffers || w.added[kKindGround] != 1 || w.changed[kKindGround] != 0 || w.gone[kKindGround] != 1
+            || w.show[kKindGround].size() != 1 || w.show[kKindGround][0] != "+51-x.mod@19,31@1006,2000,300")
+            Fail("t1391d: the ground road's match is not used (" + I(w.added[kKindGround]) + " added, " + I(w.gone[kKindGround]) + " gone)");
+        Side m2, l2;
+        l2.ground["53-x.mod@19,31@1000,2000,300"] = one; m2.ground["53-x.mod@19,31@1000,2000,300"] = one;
+        m2.ground["53-x.mod@19,31@1000,2000,300"]["quantity"] = "2";
+        OwnWork w2;
+        if (OwnWorkOf(m2, l2, &w2) != zonerec::kZcDiffers || w2.changed[kKindGround] != 1 || w2.show[kKindGround][0] != "53-x.mod@19,31@1000,2000,300{quantity}")
+            Fail("t1391d: an item whose quantity this game changed is not its work");
+        if (BareKey("a@1,2@3,4,5#2") != "a@1,2@3,4,5" || BareKey("#f345846e@19,31@1,2,3") != "#f345846e@19,31@1,2,3") Fail("t1391d: BareKey");
+    }
+    /* a building's inside count is never this game's work, either way (T2689 log-A:5756, T2691 log-A:6395); another field is */
+    {
+        const std::string k = "1459-gamedata.base@52,52@949500,953000,30770";
+        Side mine, loaded;
+        loaded.pieces[k]["inside count"] = "4"; loaded.pieces[k]["progress"] = "1.00";
+        mine.pieces[k]["inside count"] = "3"; mine.pieces[k]["progress"] = "1.00";
+        OwnWork w1; if (OwnWorkOf(mine, loaded, &w1) != zonerec::kZcSame) Fail("t1391d: a lower inside count reads as this game's work");
+        mine.pieces[k].erase("inside count");
+        OwnWork w2; if (OwnWorkOf(mine, loaded, &w2) != zonerec::kZcSame) Fail("t1391d: an inside count gone reads as this game's work");
+        mine.pieces[k]["inside count"] = "5";
+        OwnWork w3; if (OwnWorkOf(mine, loaded, &w3) != zonerec::kZcSame) Fail("t1391d: a higher inside count reads as this game's work (T2691: the writing game's loaded set)");
+        mine.pieces[k]["inside count"] = "4"; mine.pieces[k]["progress"] = "0.50";
+        OwnWork w4; if (OwnWorkOf(mine, loaded, &w4) != zonerec::kZcDiffers) Fail("t1391d: a building's changed progress is not this game's work");
+    }
+    /* an own item lost: an item this game dropped (not in its loaded copy) in a refused save is a FAULT where no other game holds the area */
+    {
+        Side mine, loaded;
+        loaded.ground["42317-changes_otto.mod@19,31@-569353,-44042,9651"] = one;
+        mine.ground["42317-changes_otto.mod@19,31@-569353,-44042,9651"] = one; mine.ground["52-gamedata.base@19,31@-560000,-44000,9700"] = one;
+        OwnWork w;
+        const int oc = OwnWorkOf(mine, loaded, &w);
+        if (oc != zonerec::kZcDiffers || zonerec::ZoneRefusedSaveLabel(-1, 0, oc) != zonerec::kZrlFault || zonerec::ZoneRefusedSaveLabel(0, 0, oc) != zonerec::kZrlFault
+            || zonerec::ZoneRefusedSaveLabel(1, 0, oc) != zonerec::kZrlHolderRule)
+            Fail("t1391d: an own item in a refused save is not a FAULT");
+    }
+    /* the line from the copies' bytes: record ids and handles are no work; the EMPTY mark against a copy is none; an unreadable loaded
+       copy is not known; this game's extra piece, progress and box item are */
+    {
+        const std::string a = T1351dCopy(100, true, zonekeep::kPlayerFactionSid);
+        const std::string c = T1351dCopy(500, false, zonekeep::kPlayerFactionSid);
+        const std::string d = T1351dCopy(700, false, zonekeep::kPlayerFactionSid);
+        const unsigned char* pa = (const unsigned char*)a.data();
+        const unsigned char* pc = (const unsigned char*)c.data();
+        const unsigned char* pd = (const unsigned char*)d.data();
+        int oc = -1; std::string kinds = "x";
+        const std::string l1 = OwnWorkLine("T-1391", "refused copy", "zone.52.52", "the world's record writtenAt 1 seq 2", pd, d.size(), 1, pc, c.size(), 1, kLineCap, &oc, &kinds);
+        if (oc != zonerec::kZcSame || !kinds.empty() || l1.find("[ZONE] T-1391 own work in the refused copy of zone.52.52 since this game's loaded copy (the world's record writtenAt 1 seq 2; ") != 0
+            || l1.find("): none - nothing added or changed in the kinds compared; gone since the load, never counted as this game's work: none") == std::string::npos)
+            Fail("t1391d: two copies differing only in ids read as this game's work: " + l1);
+        std::vector<char> em; zonerec::ZoneEmptyEncode(&em);
+        const std::string l2 = OwnWorkLine("T-1391", "refused copy", "zone.52.52", "x", (const unsigned char*)&em[0], em.size(), 1, pc, c.size(), 1, kLineCap, &oc, &kinds);
+        if (oc != zonerec::kZcSame || l2.find("gone since the load, never counted as this game's work: buildings 1") == std::string::npos)
+            Fail("t1391d: the EMPTY mark against a loaded copy is not 'none': " + l2);
+        const unsigned char junk[3] = { 1, 2, 3 };
+        const std::string l3 = OwnWorkLine("T-1391", "refused copy", "zone.52.52", "x", pa, a.size(), 1, junk, sizeof junk, 1, kLineCap, &oc, &kinds);
+        if (oc != zonerec::kZcUnread || l3.find("[ZONE] T-1391 own work in the refused copy of zone.52.52 NOT KNOWN: this game's loaded copy (x) cannot be read - ") != 0)
+            Fail("t1391d: an unreadable loaded copy is not 'not known': " + l3);
+        const std::string l4 = OwnWorkLine("T-1391", "refused copy", "zone.52.52", "x", pa, a.size(), 1, pc, c.size(), 1, kLineCap, &oc, &kinds);
+        if (oc != zonerec::kZcDiffers || kinds.compare(0, 9, "buildings") != 0 || l4.find("buildings added 1 changed 1 [1459-gamedata.base@52,52@949500,953000,30770{progress}, +2000-gamedata.base@") == std::string::npos)
+            Fail("t1391d: this game's extra piece and progress are not its work: " + l4 + " / " + kinds);
+    }
+    /* the adopt line's words: side a is the adopting game's copy, side b the record it replaces */
+    {
+        const std::string b = T1351dCopy(900, false, coopslot::StandInId(1));
+        std::vector<char> em; zonerec::ZoneEmptyEncode(&em);
+        int oc = -1; std::string dk;
+        const std::string l = CompareLine("T-1391", "adopted copy", "replaced record", "zone.52.52", (const unsigned char*)&em[0], em.size(), 1, (const unsigned char*)b.data(), b.size(), 0, kLineCap, &oc, &dk);
+        if (l.find("buildings 0/1: only in replaced 1 [") == std::string::npos || l.find("only in newest") != std::string::npos || l.find("only in refused") != std::string::npos)
+            Fail("t1391d: the adopt line's side words are wrong: " + l);
+        if (ShortWord("refused copy") != "refused" || ShortWord("newest record") != "newest" || ShortWord("adopted copy") != "adopted" || ShortWord("x") != "x")
+            Fail("t1391d: ShortWord");
+    }
+    /* the plugin: the read's answer is kept as the loaded copy, an own save replaces it, the adopt line says the own work it keeps */
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp");
+    if (st.empty()) { Fail("t1391d: could not read store.cpp"); return; }
+    const size_t dd = st.find("std::string* detour_sfsReadFile(void* sfs, std::string* out, const std::string* relPath)\n{\n    std::string* r = ZoneSfsReadServe(sfs, out, relPath);\n    ZoneLoadedCopyNote(relPath, r);\n    return r;\n}");
+    const size_t dr = st.find("detour_sfsReadFile(void* sfs, std::string* out, const std::string* relPath)\r\n{\r\n    std::string* r = ZoneSfsReadServe(sfs, out, relPath);");
+    if (dd == std::string::npos && dr == std::string::npos) Fail("t1391d: the read does not keep the copy Kenshi is given");
+    if (st.find("lc.from = \"this game's own save written at writtenAt \" + N(r.writtenAt); ZoneLoadedCopySet(r.worldId, &lc);") == std::string::npos)
+        Fail("t1391d: this game's own save does not become its loaded copy");
+    if (st.find("const int adoptOwnWork = ZoneOwnWorkSay(\"adopted copy\", zoneId, copyPath, copyBytes, &adoptOwn);") == std::string::npos
+        || st.find("+ \"; this game's own work in it since its loaded copy: \" + (adoptOwnWork == zonerec::kZcDiffers ? adoptOwn") == std::string::npos)
+        Fail("t1391d: the adopt line does not say the own work it keeps");
 }
 /* ---- T-609 fold 1 (F4): a dismantle that faulted, or did not take the building down, leaves it in the walk list ---- */
 void t_t609_gone_guard()
@@ -9723,9 +9906,9 @@ void t_t23_wiring()
         if (bc.find(need[i]) == std::string::npos) Fail(std::string("t23 wiring: build.cpp lacks ") + need[i]);
     if (pr.find("(h.flags & kPrFlagHanded) != 0 ? 1 : 0, coopbrec::BrSlotIn(loadedSlots, senderSlot));") == std::string::npos)
         Fail("t23 wiring: the world server's judge does not pass the hand-over flag and the sender's loaded bit");
-    if (se.find("const unsigned int kProtocolVersion = 237;") == std::string::npos || hr.find("const unsigned int kGameProtocol = 237;") == std::string::npos)
-        Fail("t23 wiring: the game-to-game protocol is not 237");
-    if (sm.find("const unsigned int kProtocol = 170;") == std::string::npos || piecerec::kProtocol != 170u) Fail("t23 wiring: the world-server protocol is not 170");
+    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos || hr.find("const unsigned int kGameProtocol = 242;") == std::string::npos)
+        Fail("t23 wiring: the game-to-game protocol is not 242");
+    if (sm.find("const unsigned int kProtocol = 173;") == std::string::npos || piecerec::kProtocol != 173u) Fail("t23 wiring: the world-server protocol is not 173");
 }
 /* T-23 review fold: a refused hand-over seed is a seed again; the seed carries the owner's outpost the piece got; the writer's owed
    work is flushed at its area's unload; the writer's work moves the help baseline (wiring) */
@@ -10294,7 +10477,7 @@ void t_t1077_wiring()
 void t_t1061_lock_record()
 {
     using namespace coopbrec;
-    if (kProtocol != 170u || kBrFlagLock != 16u || kBrLockBytes != 10u) Fail("t1061: the lock block is not flag 16 / 10 bytes of world-server protocol 170");
+    if (kProtocol != 173u || kBrFlagLock != 16u || kBrLockBytes != 10u) Fail("t1061: the lock block is not flag 16 / 10 bytes of world-server protocol 173");
     const std::string key = "12-box.mod@3,41@1003,-205,100";
     std::vector<cooppar::ParityItem> items;
     items.push_back(T823BoxItem("katana", 0, 0, 1));
@@ -10394,7 +10577,7 @@ void t_t1061_lock_rules()
 void t_t1061_lock_msg()
 {
     using namespace coopbrec;
-    if (kMsgBoxLock != 85u || cooplive::kInnerBoxLock != 85u || kGameProtocolBoxLock != 207u || hovrec::kGameProtocol != 237u) Fail("t1061 msg: BOX_LOCK is not message 85 of game-to-game protocol 207");
+    if (kMsgBoxLock != 85u || cooplive::kInnerBoxLock != 85u || kGameProtocolBoxLock != 207u || hovrec::kGameProtocol != 242u) Fail("t1061 msg: BOX_LOCK is not message 85 of game-to-game protocol 207");
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerBoxLock) || !cooplive::LiveInnerWaitsForWorld(cooplive::kInnerBoxLock)) Fail("t1061 msg: BOX_LOCK is refused from the world server or dropped while the world loads");
     if (cooplive::AddrGroupOf(cooplive::kInnerBoxLock) != cooplive::kAddrGroupItem) Fail("t1061 msg: BOX_LOCK is not counted with the item road");
     BoxLockMsg m; m.kind = kBlmAsk; m.key = "12-box.mod@3,41@1003,-205,100"; m.lock.locked = 0; m.lock.level = 40; m.lock.hardness = 1.5f;
@@ -10443,10 +10626,10 @@ void t_t1061_wiring()
     for (size_t i = 0; i < sizeof(goneIt) / sizeof(goneIt[0]); ++i)
         if (it.find(goneIt[i]) != std::string::npos) Fail(std::string("t1061 wiring: items.cpp still uses ") + goneIt[i]);
     if (dr.find("BoxLockPickNote(lock, own);") == std::string::npos) Fail("t1061 wiring: the pick tick does not hand a non-door lock to the box road");
-    if (se.find("case MSG_BOX_LOCK:   OnBoxLock(m);    break;") == std::string::npos || se.find("const unsigned int kProtocolVersion = 237;") == std::string::npos)
+    if (se.find("case MSG_BOX_LOCK:   OnBoxLock(m);    break;") == std::string::npos || se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos)
         Fail("t1061 wiring: the session does not take BOX_LOCK or does not speak protocol 228");
-    if (sm.find("const unsigned int kProtocol = 170;") == std::string::npos || st.find("const unsigned int kStoreProtocol = 170;") == std::string::npos)
-        Fail("t1061 wiring: the world server and the game do not both speak world-server protocol 170");
+    if (sm.find("const unsigned int kProtocol = 173;") == std::string::npos || st.find("const unsigned int kStoreProtocol = 173;") == std::string::npos)
+        Fail("t1061 wiring: the world server and the game do not both speak world-server protocol 173");
 }
 
 /* T-1187: a forwarded conversation's end waits for ANY held line - also one with no NPC-side action (a hire: its contract is made
@@ -10960,7 +11143,7 @@ void t_cursorpiece_y()
 void t_t1242_books_wire()
 {
 
-    if (bookshare::kMsgResearchBook != 88u || cooplive::kInnerResearchBook != 88u || bookshare::kGameProtocolBooks != 211u || hovrec::kGameProtocol != 237u)
+    if (bookshare::kMsgResearchBook != 88u || cooplive::kInnerResearchBook != 88u || bookshare::kGameProtocolBooks != 211u || hovrec::kGameProtocol != 242u)
         Fail("t1242 wire: RESEARCH_BOOK is not message 88 of game-to-game protocol 211");
     if (!cooplive::LiveInnerAccepted(88u) || !cooplive::LiveInnerWaitsForWorld(88u)) Fail("t1242 wire: the relay does not carry RESEARCH_BOOK or does not keep it for the world");
     bookshare::Msg m; m.op = bookshare::kOpAsk; m.reqId = 0x01000007u; m.askerSlot = 1; m.tech = "2025-gamedata.base";
@@ -11142,7 +11325,7 @@ void t_t1242_books_wiring()
     const std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
     const std::string sig = T313ReadFile("../coop-plugin/addresses/signatures.sig");
     if (st.empty() || se.empty() || t65.empty() || t68.empty() || sig.empty()) { Fail("t1242 wiring: a source file is not readable"); return; }
-    if (se.find("const unsigned int kProtocolVersion = 237;") == std::string::npos || se.find("case MSG_RESEARCH_BOOK: OnResearchBook(m); break;") == std::string::npos
+    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos || se.find("case MSG_RESEARCH_BOOK: OnResearchBook(m); break;") == std::string::npos
         || se.find("ItemSendTo(MSG_RESEARCH_BOOK, toSlot, &body[0], body.size(), 0u, 0)") == std::string::npos || tr.find("MSG_RESEARCH_BOOK = 88") == std::string::npos)
         Fail("t1242 wiring: the session does not speak 221 or does not carry RESEARCH_BOOK by slot");
     const char* const need[] = {
@@ -11209,7 +11392,7 @@ void t_t1242_books_wiring()
         if (t65.find(rows65[i]) == std::string::npos) Fail(std::string("t1242 wiring: the 1.0.65 table lacks ") + rows65[i]);
         if (t68.find(rows68[i]) == std::string::npos) Fail(std::string("t1242 wiring: the 1.0.68 table lacks ") + rows68[i]);
     }
-    if (t65.find("!count 809") == std::string::npos || t68.find("!count 809") == std::string::npos) Fail("t1242 wiring: both address tables declare 809 rows (T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction, 2; T-1122 cursorjoin: + the confirm's four rows and TerrainHeightAt, 5; decision 1556: ZoneActivationDefaults, 1; T-1250: - the nine rows only its use-filter probe read; T-1250 fix attempt 2: TownUpdateOwnSearchRet, GetFoodTownGateTest, 2; T-918 (main): Character_setupAI, 1; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1242 + T-1150, 4 each; T-478 buying, 2; T-1260 RClickAutoTradeEnd, 1; T-1122 - the four rows only its assault-start probe read; T-1131 design A: PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet, 4; T-1131 fold 1: TheftCaughtNotifyRet, 1; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: BuildingCreatePhysical, 1; T-1294: WalkMapDeferInterior, 1 (its box queue binds PlacementRegionAdd, the same function); T-1082: UnlockDoorTaskStep, 1; T-1309: TaskObjectMineFactionTest, 1; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady, 2; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet; T-1372: + BuildingPlaceGround; T-1372 removal: + LevelEditorDeleteSelected, PlayerInterfaceToggleEditor; T-1355 attempt 2 (main): + AbstractMovementBaseVt, 1; T-1374 (main): + KenshiCrashFilter, KenshiSaveRootText; T-1379: + CampaignArrivalAnnounce, 1; T-1343: + BuildingAtPoint, 1; T-1381 probe P294: + MayUseRetSpecialFinder, 1; T-1381 P294 removed: - MayUseRetSpecialFinder; T-1381 probe P295: + ShopGoalTargetPick, ShopFindForItem, ShopFallbackRandom, 3; T-1381 P295 removed: - ShopGoalTargetPick, ShopFindForItem, -2 (ShopFallbackRandom kept, the fix's row); T-1167 piece 1: + LektorIntPushBack, ContextMenu_orderLabel, Character_orderPreCheck, TradeRangeSq; T-1167 piece 3 build 4: + MouseReleaseNoWindow; T-1167 v3: + RightReleaseItem; merge of effort/t1167b and main: both sides' rows, 774; T-1406: + PlayerInterface_newPlayerTask, StdString_assign, ForgottenGui_refreshSelected; merge of effort/t1167b into effort/t1406a: 777; T-1411 probe P306 c: + CarryFollowGateGlobal, 1; T-1411 fold 2: + CharacterKeepUpdatedTest, 1; T-1430: + NodeListDestroyByBuilding, TownForgetBuilding: 779; T-1430 fold 2: + BuildingGetTownStrict (0x296900, the purchase's own town lookup): 780; T-1437: + InputHandlerInit, InputHandlerAddCommand, InputHandlerFind, InputHandlerBind, InputHandlerParseKey, InputHandlerKeyBound, InputHandlerKeyName, InputHandlerGlobal, KeyConfigLineCtor, DatapanelAddLine, DatapanelAddSpacer, OptionsControlsEndRet (the Ping key and its Controls row): 792; T-1437 fold 1: + InputHandlerKeyDown (the key-down dispatch, hooked - a quick tap is not lost): 793; merge of main into effort/t1437a: both sides' rows, 795; T-1437 fold 2: + GameFreeStub (the game's own free, for the key word): 796; merge of main into effort/t1437a again (T-1427 fix: + TownFloorStoreRemove, TownFloorStoreAddPart): 798; merge of main into effort/t1437a a third time (T-1428 attempt 2: + ZoneWalkMapRebuild, NavMeshManagerPtr): 800; merge of main into effort/t1408a a fourth time: + WallEndPoint, PreviewRotate (T-1408 chain lever), 802; T-1408 fold 13: + WallJoinArea (0x29AC10, the engine's wall join - hooked: held for a wall whose record carries its owner's group), WallJoinTo (0x29A850, the engine's join of one wall to a lead - called in the owner's order), 804; merge of main into effort/t1408a a fifth time: + ZoneMapUpdate (T-1442 step 1b): 805; T-1422 window floor step: + NavClosestFaceQuery, HavokCharacterSetPosition: 807; merge of main into effort/t1422b again: + GuiKeyCommandGuard (T-1414 editorkey, 0x6E1C80), 808; merge of main into effort/t1422b a third time: + SetCrimeTimeLeft (0x851070, the time-left setter, hooked - T-1442 step 5), both sides' rows, 809)");
+    if (t65.find("!count 814") == std::string::npos || t68.find("!count 814") == std::string::npos) Fail("t1242 wiring: both address tables declare 814 rows (T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction, 2; T-1122 cursorjoin: + the confirm's four rows and TerrainHeightAt, 5; decision 1556: ZoneActivationDefaults, 1; T-1250: - the nine rows only its use-filter probe read; T-1250 fix attempt 2: TownUpdateOwnSearchRet, GetFoodTownGateTest, 2; T-918 (main): Character_setupAI, 1; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1242 + T-1150, 4 each; T-478 buying, 2; T-1260 RClickAutoTradeEnd, 1; T-1122 - the four rows only its assault-start probe read; T-1131 design A: PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet, 4; T-1131 fold 1: TheftCaughtNotifyRet, 1; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: BuildingCreatePhysical, 1; T-1294: WalkMapDeferInterior, 1 (its box queue binds PlacementRegionAdd, the same function); T-1082: UnlockDoorTaskStep, 1; T-1309: TaskObjectMineFactionTest, 1; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady, 2; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet; T-1372: + BuildingPlaceGround; T-1372 removal: + LevelEditorDeleteSelected, PlayerInterfaceToggleEditor; T-1355 attempt 2 (main): + AbstractMovementBaseVt, 1; T-1374 (main): + KenshiCrashFilter, KenshiSaveRootText; T-1379: + CampaignArrivalAnnounce, 1; T-1343: + BuildingAtPoint, 1; T-1381 probe P294: + MayUseRetSpecialFinder, 1; T-1381 P294 removed: - MayUseRetSpecialFinder; T-1381 probe P295: + ShopGoalTargetPick, ShopFindForItem, ShopFallbackRandom, 3; T-1381 P295 removed: - ShopGoalTargetPick, ShopFindForItem, -2 (ShopFallbackRandom kept, the fix's row); T-1167 piece 1: + LektorIntPushBack, ContextMenu_orderLabel, Character_orderPreCheck, TradeRangeSq; T-1167 piece 3 build 4: + MouseReleaseNoWindow; T-1167 v3: + RightReleaseItem; merge of effort/t1167b and main: both sides' rows, 774; T-1406: + PlayerInterface_newPlayerTask, StdString_assign, ForgottenGui_refreshSelected; merge of effort/t1167b into effort/t1406a: 777; T-1411 probe P306 c: + CarryFollowGateGlobal, 1; T-1411 fold 2: + CharacterKeepUpdatedTest, 1; T-1430: + NodeListDestroyByBuilding, TownForgetBuilding: 779; T-1430 fold 2: + BuildingGetTownStrict (0x296900, the purchase's own town lookup): 780; T-1437: + InputHandlerInit, InputHandlerAddCommand, InputHandlerFind, InputHandlerBind, InputHandlerParseKey, InputHandlerKeyBound, InputHandlerKeyName, InputHandlerGlobal, KeyConfigLineCtor, DatapanelAddLine, DatapanelAddSpacer, OptionsControlsEndRet (the Ping key and its Controls row): 792; T-1437 fold 1: + InputHandlerKeyDown (the key-down dispatch, hooked - a quick tap is not lost): 793; merge of main into effort/t1437a: both sides' rows, 795; T-1437 fold 2: + GameFreeStub (the game's own free, for the key word): 796; merge of main into effort/t1437a again (T-1427 fix: + TownFloorStoreRemove, TownFloorStoreAddPart): 798; merge of main into effort/t1437a a third time (T-1428 attempt 2: + ZoneWalkMapRebuild, NavMeshManagerPtr): 800; merge of main into effort/t1408a a fourth time: + WallEndPoint, PreviewRotate (T-1408 chain lever), 802; T-1408 fold 13: + WallJoinArea (0x29AC10, the engine's wall join - hooked: held for a wall whose record carries its owner's group), WallJoinTo (0x29A850, the engine's join of one wall to a lead - called in the owner's order), 804; merge of main into effort/t1408a a fifth time: + ZoneMapUpdate (T-1442 step 1b): 805; T-1422 window floor step: + NavClosestFaceQuery, HavokCharacterSetPosition: 807; merge of main into effort/t1422b again: + GuiKeyCommandGuard (T-1414 editorkey, 0x6E1C80), 808; merge of main into effort/t1422b a third time: + SetCrimeTimeLeft (0x851070, the time-left setter, hooked - T-1442 step 5), both sides' rows, 809; merge of main into effort/t1442g: + ActivePlatoon_removeMember (0x794C00, hooked - T-1442 step 6), both sides' rows, 810; merge of main into effort/t1442g again: + BuildingPauseToggle, BuildingFinishConstruction (T-1429 s3, the construction pause), both sides' rows, 812; T-1442 step 6 fix attempt 3: + Character_getPickedUp, SleepOnFloorStop, SleepOnFloorEnd, TaskGetOutOfBedStep (the engine's other writers of a leader's held / carried facts, hooked), 816; T-1442 attempt 3 review fold: + AnimationClass_ragdollModeUT (0x5B8F80, the physics ragdoll on / off, hooked), 817; merge of main into effort/t1429h: + BuildingPauseToggle, BuildingFinishConstruction (T-1429 s3, the construction pause), both sides' rows, 811; T-1429 s12 fold 5: + Platoon_declareDead (0x7964F0, the dead-body squad's rebuild), 812; merge of main into effort/t1453a: both sides' rows, 818; T-1453 step 3: - FactionDirectory_allFactions, GameDataContainer_allRecords, RootObjectBase_getRecordDirect, Character_poseState, MedicalSystem_countBodyParts, SavedObjectState_stateCount (one-field getters, read as fields now), 812; T-1449: + AppearanceBase_setupItemMaterial (the item look-maker, watched read-only for the [ITEMLOOK] line; optional:itemlook), 819; merge of main into effort/t1449b (T-1453 step 3 had removed six rows): 813; T-1416 fix attempt 1: + PlatoonPlanTemplateSetup (0x2715E0, the squad plan's template setup - a copy squad's package list), 819)");
     if (sig.find("ResearchBenchList ") == std::string::npos || sig.find("ResearchCanPay ") == std::string::npos || sig.find("ResearchHasItems ") == std::string::npos || sig.find("ResearchPay ") == std::string::npos)
         Fail("t1242 wiring: a new row has no signature");
 }
@@ -11648,7 +11831,7 @@ void t_t860_cage_record()
     CageRec sd = w; sd.flags = kCrFlagSeed; std::vector<char> sb; EncodeCageRec(&sb, sd);
     if (CageJudgeWrite(id, &sb[0], sb.size(), 3, 3, 1, 1, 0, 0) != coopbrec::kBrRefuseSeedExists) Fail("t860 cage judge: a seed over a stored record is taken");
     if (CageJudgeRemove(id, 3, 3) != coopbrec::kBrAccept || CageJudgeRemove(id, 2, 3) != coopbrec::kBrRefuseNotWriter) Fail("t860 cage judge: a removal by another game than the holder");
-    if (kProtocol != 170u || coopbrec::kProtocol != 170u || doorrec::kProtocol != 170u) Fail("t860 cage record: the world-server protocol is not 170");
+    if (kProtocol != 173u || coopbrec::kProtocol != 173u || doorrec::kProtocol != 173u) Fail("t860 cage record: the world-server protocol is not 172");
     if (PrisonRoadSendsLock(1) != 0 || PrisonRoadSendsLock(0) != 1) Fail("t860 cage record: the prisoner road still sends a cage's lock (or no longer the shackles')");
 }
 
@@ -11828,7 +12011,7 @@ void t_t860_cage_decide()
         Fail("t860 msg: BOX_LOCK's not-holder answer does not round-trip");
     m.kind = 9;
     if (coopbrec::EncodeBoxLockMsg(&by, m)) Fail("t860 msg: an unknown BOX_LOCK kind encodes");
-    if (coopbrec::kBlmCage != 3 || coopbrec::kBlmCageQuery != 4 || coopbrec::kBlmCageNone != 6 || coopbrec::kBlmCageStale != 8 || hovrec::kGameProtocol != 237u) Fail("t860 msg: the cage kinds are not 3-8 of game-to-game protocol 222");
+    if (coopbrec::kBlmCage != 3 || coopbrec::kBlmCageQuery != 4 || coopbrec::kBlmCageNone != 6 || coopbrec::kBlmCageStale != 8 || hovrec::kGameProtocol != 242u) Fail("t860 msg: the cage kinds are not 3-8 of game-to-game protocol 222");
     {   /* fold 2: a cage kind carries its generation and base lock; a cage message cut before them is refused */
         coopbrec::BoxLockMsg t; t.kind = coopbrec::kBlmCageTaken; t.key = "#0123abcd@12,34@-501,77,30"; t.gen = 41; t.base.locked = 1;
         std::vector<char> tb; coopbrec::BoxLockMsg tr;
@@ -11862,11 +12045,11 @@ void t_t860_cage_wiring()
     if (it.find("CageRecRequestNote(m.key, m.lock.locked, m.lock.broken, m.lock.level,") == std::string::npos || it.find("CageRecRefuseArrive(id, reason, storedGen, sentGen)") == std::string::npos)
         Fail("t860 cage wiring: items.cpp does not route BOX_LOCK's cage kinds or a cage refusal");
     const char* const needSt[] = { "if (cagerec::IsCageRecId(worldId)) { coop::CageRecordArrive(worldId, kindBytes); return; }", "coop::CageRecordGone(worldId)",
-        "coop::CageRecordEcho(worldId", "coop::CageRecMapEvent();", "const unsigned int kStoreProtocol = 170;" };
+        "coop::CageRecordEcho(worldId", "coop::CageRecMapEvent();", "const unsigned int kStoreProtocol = 173;" };
     for (size_t i = 0; i < sizeof(needSt) / sizeof(needSt[0]); ++i)
         if (st.find(needSt[i]) == std::string::npos) Fail(std::string("t860 cage wiring: store.cpp lacks ") + needSt[i]);
     const char* const needSm[] = { "cagerec::CageJudgeWrite(r.worldId,", "cagerec::CageJudgeRemove(wid, sender, CageHolderOf(wid))", "CageLanded(id, j->payload);",
-        "|| cagerec::CageRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 170;" };
+        "|| cagerec::CageRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 173;" };
     for (size_t i = 0; i < sizeof(needSm) / sizeof(needSm[0]); ++i)
         if (sm.find(needSm[i]) == std::string::npos) Fail(std::string("t860 cage wiring: store_main.cpp lacks ") + needSm[i]);
 }
@@ -11905,7 +12088,7 @@ void t_t1296_freed_take_out()
         if (EncodePrison(&nb, bad)) Fail("T-1296: FREED with freedLeft 2 encodes");
         PrisonMsg d; if (d.freedLeft != 0) Fail("T-1296: a new message's freedLeft is not 0");
     }
-    if (hovrec::kGameProtocol != 237u) Fail("T-1296: the game-to-game protocol is not 237 (FREED's freedLeft)");
+    if (hovrec::kGameProtocol != 242u) Fail("T-1296: the game-to-game protocol is not 242 (FREED's freedLeft)");
     const std::string sp = T23NoCr(T313ReadFile("../coop-plugin/spawn.cpp"));
     const std::string sh = T23NoCr(T313ReadFile("../coop-plugin/speech.cpp"));
     const std::string se = T23NoCr(T313ReadFile("../coop-plugin/net/session.cpp"));
@@ -11929,7 +12112,7 @@ void t_t1296_freed_take_out()
     for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i)
         if (sp.find(need[i]) == std::string::npos) Fail(std::string("T-1296 wiring: missing in spawn.cpp: ") + need[i]);
     if (sh.find("m.freedLeft = FreedCopyLeftCageNow(x.uid, x.cagedAtEvent);") == std::string::npos) Fail("T-1296 wiring: FREED's send does not fill freedLeft");
-    if (se.find("const unsigned int kProtocolVersion = 237;") == std::string::npos) Fail("T-1296 wiring: the session does not speak 237");
+    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos) Fail("T-1296 wiring: the session does not speak 242");
     if (sp.find("P290") != std::string::npos) Fail("T-1296: probe P290 is still in spawn.cpp");
     /* the arrest road's release: setPrisonMode off, then the walk-out order (B3:14981-14982, T2403) */
     const size_t a = sp.find("int PrisonReleasePod(::Character* c, void* cage, double pardonUntil, void* relFac, int relMode)");
@@ -12085,7 +12268,7 @@ void t_t1122_roller_fold1()
 void t_t1333_bldg_record()
 {
     using namespace bldgrec;
-    if (kProtocol != 170u || doorrec::kProtocol != 170u || coopbrec::kProtocol != 170u) Fail("t1333 record: the world-server protocol is not 170");
+    if (kProtocol != 173u || doorrec::kProtocol != 173u || coopbrec::kProtocol != 173u) Fail("t1333 record: the world-server protocol is not 172");
     const std::string key = "2939-Walls2.mod@43,11@-1234,567";
     const std::string id = MakeBldgRecId(key);
     int sx = -1, sy = -1;
@@ -12383,16 +12566,16 @@ void t_t1333_bldg_wiring()
     for (size_t i = 0; i < sizeof(needBd) / sizeof(needBd[0]); ++i)
         if (bd.find(needBd[i]) == std::string::npos) Fail(std::string("t1333 wiring: build.cpp lacks ") + needBd[i]);
     const char* const needSt[] = { "if (bldgrec::IsBldgRecId(worldId)) { coop::TownBldgRecordArrive(worldId, kindBytes); return; }", "coop::TownBldgRecordGone(worldId)",
-        "coop::TownBldgRecordEcho(worldId", "coop::TownBldgMapEvent();", "bool StoreSendBldgRecord(", "bool StoreSendBldgGone(", "const unsigned int kStoreProtocol = 170;" };
+        "coop::TownBldgRecordEcho(worldId", "coop::TownBldgMapEvent();", "bool StoreSendBldgRecord(", "bool StoreSendBldgGone(", "const unsigned int kStoreProtocol = 173;" };
     for (size_t i = 0; i < sizeof(needSt) / sizeof(needSt[0]); ++i)
         if (st.find(needSt[i]) == std::string::npos) Fail(std::string("t1333 wiring: store.cpp lacks ") + needSt[i]);
     if (it.find("TownBldgRefuseArrive(id, reason, storedGen, sentGen)") == std::string::npos) Fail("t1333 wiring: items.cpp does not route a building record's refusal");
     if (tv.find("TownBldgAreaRebuilt(ts.x * 64 + ts.y);") == std::string::npos) Fail("t1333 wiring: townver.cpp does not drop a rebuilt town's building records");
     const char* const needSm[] = { "bldgrec::BldgJudgeWrite(r.worldId,", "bldgrec::BldgJudgeRemove(wid, sender, BldgHolderOf(wid))", "BldgLanded(id, j->payload);",
-        "|| bldgrec::BldgRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 170;", "&& !bldgrec::IsBldgRecId(wid)) TownLossFromGone(" };
+        "|| bldgrec::BldgRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 173;", "&& !bldgrec::IsBldgRecId(wid)) TownLossFromGone(" };
     for (size_t i = 0; i < sizeof(needSm) / sizeof(needSm[0]); ++i)
         if (sm.find(needSm[i]) == std::string::npos) Fail(std::string("t1333 wiring: store_main.cpp lacks ") + needSm[i]);
-    if (se.find("const unsigned int kProtocolVersion = 237;") == std::string::npos) Fail("t1333 wiring: the game-to-game protocol is not 237 (T-1333's 225, T-1122's 226, then T-1318's 227 on top)");
+    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos) Fail("t1333 wiring: the game-to-game protocol is not 242 (T-1333's 225, T-1122's 226, then T-1318's 227 on top)");
 }
 /* T-1333 TEST-ONLY lever `buildtest townhit <key> <cut> <blunt> [door|door=<i>] [times]`: its words' parse (bldgrec.h
    BgTownHitLeverParse), and that build.cpp starts only the engine's own hit (vt+0x1F0 through the hooks) - never a record write, never

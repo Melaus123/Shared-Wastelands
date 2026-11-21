@@ -69,6 +69,8 @@ int g_relayTestCap = 0, g_relayTestDials = 0;   /* TEST ONLY: relaytest=many's c
 int g_relayBridgeMode = 0; unsigned short g_relayBridgePort = 0, g_relayViaPort = 0; int g_relayCap = 0;   /* relaybridge= / relayvia= / relaycap= */
 int g_parityHoldSec = 0;                    /* T-734 TEST ONLY: parityholdsec= */
 int g_benchCapKbs = 0, g_netRateLog = 0;    /* TEST ONLY: benchcapkbs= / netratelog= */
+int g_bugRelay = 0;                         /* TEST ONLY: bugrelay= (T-1401 2c) */
+int g_bugRelayPort = 0;                     /* TEST ONLY: bugrelayport= (T-1401 2c, the bench's local test service) */
 int g_steamFakeLagMs = 0, g_steamFakeLossPct = 0;   /* T-1118 f TEST ONLY: steamfakelag= / steamfakeloss= */
 std::string g_sweepSkip;                    /* TEST ONLY: sweepskip= */
 std::string g_slotProfile;                   /* prof1 fold (review-prof1 4): the picked profile's save folder - a re-arm keeps it over the file's slot= */
@@ -470,6 +472,8 @@ int            ConfigParityHoldSec()   { return g_parityHoldSec; }
 std::string    ConfigSweepSkip()       { return g_sweepSkip; }
 int            ConfigBenchCapKbs()     { return g_benchCapKbs; }
 int            ConfigNetRateLog()      { return g_netRateLog; }
+int            ConfigBugRelay()        { return g_bugRelay; }
+int            ConfigBugRelayPort()    { return g_bugRelayPort; }
 int            ConfigSteamFakeLagMs()  { return g_steamFakeLagMs; }
 int            ConfigSteamFakeLossPct() { return g_steamFakeLossPct; }
 void           ConfigSetSlotForProfile(const std::string& slot) { g_slot = slot; g_slotProfile = slot; }
@@ -890,6 +894,15 @@ static int ConfigReadFileInto(std::string* whyOut)
     if (fields.netRateLog != g_netRateLog && fields.netRateLog != 0)
         DebugLog("[CFG] TEST ONLY: netratelog=1 - each Steam link logs a [net] RATE line once a second");
     g_benchCapKbs = fields.benchCapKbs; g_netRateLog = fields.netRateLog;
+    if (fields.bugRelay != g_bugRelay && fields.bugRelay != 0)
+        DebugLog("[CFG] TEST ONLY: bugrelay=" + std::string(fields.bugRelay == 1 ? "test" : fields.bugRelay == 2 ? "test503" : "test404")
+                 + " - bug reports and uploads into a report's thread go to the TEST report service, which never posts to Discord");
+    g_bugRelay = fields.bugRelay;
+    if (fields.bugRelayPort != g_bugRelayPort && fields.bugRelayPort != 0)
+        DebugLog("[CFG] TEST ONLY: bugrelayport=" + N((long long)fields.bugRelayPort) + (fields.bugRelay != 0
+                 ? std::string(" - the TEST report service is the bench's local copy at http://127.0.0.1:") + N((long long)fields.bugRelayPort) + "/"
+                 : std::string(" - ignored: no test bugrelay= value, and the real report service is never redirected")));
+    g_bugRelayPort = fields.bugRelayPort;
     if ((fields.steamFakeLagMs != g_steamFakeLagMs || fields.steamFakeLossPct != g_steamFakeLossPct) && (fields.steamFakeLagMs != 0 || fields.steamFakeLossPct != 0))
         DebugLog("[CFG] TEST ONLY: steamfakelag=" + N((long long)fields.steamFakeLagMs) + " / steamfakeloss=" + N((long long)fields.steamFakeLossPct)
                  + " - Steam's fake lag (ms) / loss (%) on every Steam packet this game sends, if this game has not set them yet: set once"

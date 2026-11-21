@@ -96,9 +96,6 @@ const std::string kNoName;   /* Faction::getName's answer for an unfilled row - 
 const GameHashSet<Character*>::type kNoCharacters;
 /* AbstractMovementBase::headingVector's answer for an unfilled row: the zero vector. */
 const Ogre::Vector3 kNoVector(0.0f, 0.0f, 0.0f);
-/* GameDataContainer::allRecords's answer for an unfilled row: an EMPTY map - like kNoCharacters, it allocates
-   nothing and runs no game code. */
-const GameHashMap<int, GameData*>::type kNoAllData;
 /* RootObjectBase::getHandle's answer for an unfilled row. Plain zeroed storage (no constructor runs at DLL load);
    coop::GcBuildEmptyHand builds the empty handle in it once, from AddrInit. Never destroyed. */
 RawSlot<hand> kNoHandSlot;
@@ -204,7 +201,6 @@ std::string hand::toString() const
 
 /* ---- RootObjectBase -------------------------------------------------------------------------------------- */
 static unsigned long long kGcRobGetFaction = 0; static coop::AddrReg kGcRobGetFaction_reg("RootObjectBase_getOwnerFactionDirect", &kGcRobGetFaction);   /* Steam_1.0.65 0x593BB0 */
-static unsigned long long kGcRobGetGameData = 0; static coop::AddrReg kGcRobGetGameData_reg("RootObjectBase_getRecordDirect", &kGcRobGetGameData);   /* Steam_1.0.65 0x0D1D30 */
 static unsigned long long kGcRobGetName = 0; static coop::AddrReg kGcRobGetName_reg("RootObjectBase_getShownName", &kGcRobGetName);   /* Steam_1.0.65 0x0D3CA0 */
 static unsigned long long kGcRobGetHandle = 0; static coop::AddrReg kGcRobGetHandle_reg("RootObjectBase_selfHandle", &kGcRobGetHandle);   /* Steam_1.0.65 0x0B85D0 */
 
@@ -215,11 +211,11 @@ Faction* RootObjectBase::getOwnerFactionDirect() const
     return a != 0 ? ((Fn)a)(this) : 0;
 }
 
+/* T-1453 (owner 1822 / 1825): the engine's getter is one field read in both Steam builds (mov rax,[rcx+40h] / ret); the field is read here
+   instead of calling it - no address row, so nothing to find on another build. */
 GameData* RootObjectBase::getRecordDirect() const
 {
-    typedef GameData* (*Fn)(const void* self);
-    const unsigned long long a = coop::AddrAbs(kGcRobGetGameData);
-    return a != 0 ? ((Fn)a)(this) : 0;
+    return *(GameData* const*)((const char*)this + 0x40);
 }
 
 /* BY VALUE: RCX = this, RDX = raw storage the game constructs the string in. */
@@ -367,16 +363,15 @@ void Faction::setName(const std::string& _name)
 }
 
 /* ---- FactionDirectory -------------------------------------------------------------------------------------- */
-static unsigned long long kGcFmAllFactions = 0; static coop::AddrReg kGcFmAllFactions_reg("FactionDirectory_allFactions", &kGcFmAllFactions);   /* Steam_1.0.65 0x877AB0 */
 static unsigned long long kGcFmByName = 0; static coop::AddrReg kGcFmByName_reg("FactionDirectory_findFactionByName", &kGcFmByName);   /* Steam_1.0.65 0x2E7910 */
 static unsigned long long kGcFmByStringId = 0; static coop::AddrReg kGcFmByStringId_reg("FactionDirectory_findFactionById", &kGcFmByStringId);   /* Steam_1.0.65 0x2E79E0 */
 static unsigned long long kGcFmGetOrCreate = 0; static coop::AddrReg kGcFmGetOrCreate_reg("FactionDirectory_findOrAddFaction", &kGcFmGetOrCreate);   /* Steam_1.0.65 0x2E7650 */
 
+/* T-1453 (owner 1822 / 1825): the engine's getter is one field read in both Steam builds (mov rax,rcx / ret - the list is the directory object itself); the field is read here
+   instead of calling it - no address row, so nothing to find on another build. */
 const lektor<Faction*>* FactionDirectory::allFactions()
 {
-    typedef const lektor<Faction*>* (*Fn)(void* self);
-    const unsigned long long a = coop::AddrAbs(kGcFmAllFactions);
-    return a != 0 ? ((Fn)a)(this) : 0;
+    return (const lektor<Faction*>*)(const void*)this;
 }
 
 Faction* FactionDirectory::findFactionByName(const std::string& name)
@@ -417,7 +412,6 @@ static unsigned long long kGcChrGetCombatClass = 0; static coop::AddrReg kGcChrG
 static unsigned long long kGcChrGetMoveSpeed = 0; static coop::AddrReg kGcChrGetMoveSpeed_reg("Character_currentMoveSpeed", &kGcChrGetMoveSpeed);   /* Steam_1.0.65 0x5C7940 */
 static unsigned long long kGcChrGetPlatoon = 0; static coop::AddrReg kGcChrGetPlatoon_reg("Character_getSquad", &kGcChrGetPlatoon);   /* Steam_1.0.65 0x790F70 */
 static unsigned long long kGcChrGetPosition = 0; static coop::AddrReg kGcChrGetPosition_reg("Character_worldPosition", &kGcChrGetPosition);   /* Steam_1.0.65 0x5CDBF0 */
-static unsigned long long kGcChrGetProne = 0; static coop::AddrReg kGcChrGetProne_reg("Character_poseState", &kGcChrGetProne);   /* Steam_1.0.65 0x5C7380 */
 static unsigned long long kGcChrIsDead = 0; static coop::AddrReg kGcChrIsDead_reg("Character_hasDied", &kGcChrIsDead);   /* Steam_1.0.65 0x620B20 */
 static unsigned long long kGcChrIsPlayer = 0; static coop::AddrReg kGcChrIsPlayer_reg("Character_isPlayerControlled", &kGcChrIsPlayer);   /* Steam_1.0.65 0x790B30 */
 static unsigned long long kGcChrIsRagdoll = 0; static coop::AddrReg kGcChrIsRagdoll_reg("Character_inRagdoll", &kGcChrIsRagdoll);   /* Steam_1.0.65 0x7D08A0 */
@@ -463,11 +457,11 @@ Ogre::Vector3 Character::worldPosition()
     return *((Fn)a)(this, (Ogre::Vector3*)raw.bytes);
 }
 
+/* T-1453 (owner 1822 / 1825): the engine's getter is one field read in both Steam builds (mov eax,[rcx+0E0h] / ret); the field is read here
+   instead of calling it - no address row, so nothing to find on another build. */
 PoseState Character::poseState() const
 {
-    typedef PoseState (*Fn)(const void* self);
-    const unsigned long long a = coop::AddrAbs(kGcChrGetProne);
-    return a != 0 ? ((Fn)a)(this) : POSE_STANDING;
+    return (PoseState)*(const int*)((const char*)this + 0xE0);
 }
 
 void Character::setPoseState(PoseState p)
@@ -854,7 +848,6 @@ GameData* Item::saveIntoInventoryRecord(GameDataContainer* container, GameData* 
 
 /* ---- GameDataContainer (mig3 C3) ----------------------------------------------------------------------------- */
 static unsigned long long kGcGdcCreateNewData = 0; static coop::AddrReg kGcGdcCreateNewData_reg("GameDataContainer_newRecord", &kGcGdcCreateNewData);   /* Steam_1.0.65 0x6C0400 */
-static unsigned long long kGcGdcGetAllData = 0; static coop::AddrReg kGcGdcGetAllData_reg("GameDataContainer_allRecords", &kGcGdcGetAllData);   /* Steam_1.0.65 0x36AFD0 */
 static unsigned long long kGcGdcGetData = 0; static coop::AddrReg kGcGdcGetData_reg("GdcGetData", &kGcGdcGetData);   /* Steam_1.0.65 0x6BD190 */
 static unsigned long long kGcGdcGetDataByName = 0; static coop::AddrReg kGcGdcGetDataByName_reg("GameDataContainer_findRecordByName", &kGcGdcGetDataByName);   /* Steam_1.0.65 0x6BFA50 */
 static unsigned long long kGcGdcGetDataOfType = 0; static coop::AddrReg kGcGdcGetDataOfType_reg("GameDataContainer_listRecordsOfType", &kGcGdcGetDataOfType);   /* Steam_1.0.65 0x6C00D0 */
@@ -889,12 +882,11 @@ void GameDataContainer::listRecordsOfType(lektor<GameData*>& list, itemType type
     if (a != 0) ((Fn)a)(this, &list, type);
 }
 
-/* A reference return (RAX carries it as a pointer): for an unfilled row, the static empty map. */
+/* T-1453 (owner 1822 / 1825): the engine's getter is one field read in both Steam builds (lea rax,[rcx+50h] / ret - the map lives at +50h); the field is read here
+   instead of calling it - no address row, so nothing to find on another build. */
 const GameHashMap<int, GameData*>::type& GameDataContainer::allRecords() const
 {
-    typedef const GameHashMap<int, GameData*>::type* (*Fn)(const void* self);
-    const unsigned long long a = coop::AddrAbs(kGcGdcGetAllData);
-    return a != 0 ? *((Fn)a)(this) : kNoAllData;
+    return *(const GameHashMap<int, GameData*>::type*)(const void*)((const char*)this + 0x50);
 }
 
 void GameDataContainer::renameRecord(GameData* data, const std::string& n)
@@ -944,7 +936,6 @@ void RootObjectContainer::saveMembers(GameData* outputToInstanceCollectionOfSome
 
 /* ---- MedicalSystem / HealthPartStatus (mig3 C4) -------------------------------------------------------------- */
 static unsigned long long kGcMedGetPart = 0; static coop::AddrReg kGcMedGetPart_reg("MedicalSystem_partAt", &kGcMedGetPart);   /* Steam_1.0.65 0x2AA5C0 */
-static unsigned long long kGcMedGetPartCount = 0; static coop::AddrReg kGcMedGetPartCount_reg("MedicalSystem_countBodyParts", &kGcMedGetPartCount);   /* Steam_1.0.65 0x2AA5B0 */
 static unsigned long long kGcMedValidate = 0; static coop::AddrReg kGcMedValidate_reg("MedicalSystem_clampHealth", &kGcMedValidate);   /* Steam_1.0.65 0x644B10 */
 static unsigned long long kGcHpsUpdateDerived = 0; static coop::AddrReg kGcHpsUpdateDerived_reg("HealthPartStatus_recomputeHealth", &kGcHpsUpdateDerived);   /* Steam_1.0.65 0x643190 */
 
@@ -956,11 +947,11 @@ MedicalSystem::HealthPartStatus* MedicalSystem::partAt(unsigned __int64 index)
     return a != 0 ? ((Fn)a)(this, index) : 0;
 }
 
+/* T-1453 (owner 1822 / 1825): the engine's getter is one field read in both Steam builds (mov eax,[rcx+198h] / ret); the field is read here
+   instead of calling it - no address row, so nothing to find on another build. */
 int MedicalSystem::countBodyParts() const
 {
-    typedef int (*Fn)(const void* self);
-    const unsigned long long a = coop::AddrAbs(kGcMedGetPartCount);
-    return a != 0 ? ((Fn)a)(this) : 0;
+    return *(const int*)((const char*)this + 0x198);
 }
 
 void MedicalSystem::clampHealth()
@@ -979,7 +970,6 @@ void MedicalSystem::HealthPartStatus::recomputeHealth()
 
 /* ---- SavedObjectState (mig3 C4) --------------------------------------------------------------------------------- */
 static unsigned long long kGcGssGetPos = 0; static coop::AddrReg kGcGssGetPos_reg("SavedObjectState_savedPosition", &kGcGssGetPos);   /* Steam_1.0.65 0x37DA00 */
-static unsigned long long kGcGssNumStates = 0; static coop::AddrReg kGcGssNumStates_reg("SavedObjectState_stateCount", &kGcGssNumStates);   /* Steam_1.0.65 0x37F5D0 */
 
 /* BY VALUE: RCX = this, RDX = the slot the game writes the vector in (plain data - nothing to destroy). */
 Ogre::Vector3 SavedObjectState::savedPosition() const
@@ -991,11 +981,11 @@ Ogre::Vector3 SavedObjectState::savedPosition() const
     return *((Fn)a)(this, (Ogre::Vector3*)raw.bytes);
 }
 
+/* T-1453 (owner 1822 / 1825): the engine's getter is one field read in both Steam builds (mov eax,[rcx+88h] / ret); the field is read here
+   instead of calling it - no address row, so nothing to find on another build. */
 int SavedObjectState::stateCount() const
 {
-    typedef int (*Fn)(const void* self);
-    const unsigned long long a = coop::AddrAbs(kGcGssNumStates);
-    return a != 0 ? ((Fn)a)(this) : 0;
+    return *(const int*)((const char*)this + 0x88);
 }
 
 /* ---- SaveManager (mig3 C4) ----------------------------------------------------------------------------------- */

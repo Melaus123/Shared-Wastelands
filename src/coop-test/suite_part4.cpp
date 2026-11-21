@@ -458,8 +458,17 @@ void t_p47_power()
     a.kind = powerwire::kPowerAsk; a.key = "light@1,2@3,4,5"; a.what = powerwire::kAskSwitch; a.value = 1.0f;
     if (!powerwire::EncodePower(&b, a) || b.size() != 2 + a.key.size() + 5) { Fail("P47: a POWER_ASK did not encode"); return; }
     if (powerwire::DecodePower(&b[0], b.size(), &o) != powerwire::kPowerDecodeOk || o.what != 1 || o.value != 1.0f || o.key != a.key) Fail("P47: POWER_ASK round trip");
-    x = b; x[2 + a.key.size()] = (char)2;
+    x = b; x[2 + a.key.size()] = (char)5;
     if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadValue) Fail("P47: an unknown ask taken");
+    x = b; x[2 + a.key.size()] = (char)powerwire::kAskPause;   /* T-1429 s3 review B1: what 2, a building's construction pause */
+    if (powerwire::kAskPause != 2 || powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeOk || o.what != powerwire::kAskPause || o.value != 1.0f)
+        Fail("T-1429 s3: a pause ask (what 2) is not taken");
+    if (powerwire::kAskPauseDone != 3 || powerwire::kAskPauseRefused != 4) Fail("T-1429 s3 fold 2: the answers are what 3 / 4");
+    for (int wv = 3; wv <= 4; ++wv)
+    {
+        x = b; x[2 + a.key.size()] = (char)wv;
+        if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeOk || o.what != wv) Fail("T-1429 s3 fold 2: a pause answer (what 3 / 4) is not taken");
+    }
     a.value = 0.5f;
     if (powerwire::EncodePower(&b, a)) Fail("P47: a switch of 0.5 encoded");
     /* the writer's send rule */
@@ -564,6 +573,38 @@ void t_p47_look_queue()
     if (powerwire::PowerSayKind(0, 1, 0) != powerwire::kPowerSayEvent || powerwire::PowerSayKind(1, 1, 0) != powerwire::kPowerSayEvent
         || powerwire::PowerSayKind(1, 1, 1) != powerwire::kPowerSayEvent) Fail("P47 fold 2: a change did not spend the change budget (or a world piece's change was hidden)");
     if (powerwire::kPowerSayFirst == powerwire::kPowerSayEvent || powerwire::kPowerSayCap < 1) Fail("P47 fold 2: the two line budgets are not separate");
+}
+
+/* T-1455 diagnostics (log only): the frozen-too-long rule, when a freeze starts, and the per-launch line budget */
+void t_t1455_power_diag()
+{
+    const unsigned int Q = powerwire::kPowerFrozenQuietMs;
+    if (Q != 60000u) Fail("T-1455: the frozen-too-long threshold is not 60 s");
+    /* only "another game writes" (2) is a freeze */
+    if (powerwire::PowerFrozenQuiet(1, Q + 5000, 0, 0) != 0 || powerwire::PowerFrozenQuiet(0, Q + 5000, 0, 0) != 0) Fail("T-1455: a piece this game or nobody writes counted frozen");
+    /* frozen long enough with no value ever, or the last value over 60 s ago: say it */
+    if (powerwire::PowerFrozenQuiet(2, Q + 1, 0, 0) != 1) Fail("T-1455: a piece frozen over 60 s with no value ever not said");
+    if (powerwire::PowerFrozenQuiet(2, Q + 1, 1, Q + 1) != 1) Fail("T-1455: a piece frozen over 60 s whose last value is over 60 s old not said");
+    /* not yet: frozen 60 s or less, or a value inside the last 60 s */
+    if (powerwire::PowerFrozenQuiet(2, Q, 0, 0) != 0) Fail("T-1455: a piece frozen exactly 60 s said (over 60 s is the rule)");
+    if (powerwire::PowerFrozenQuiet(2, 1000, 0, 0) != 0) Fail("T-1455: a piece frozen 1 s said");
+    if (powerwire::PowerFrozenQuiet(2, Q * 5, 1, Q) != 0 || powerwire::PowerFrozenQuiet(2, Q * 5, 1, 0) != 0) Fail("T-1455: a frozen piece whose writer's values keep coming said");
+    /* the freeze clock: starts at a turn to 2, at the first sight as 2, and after an unload gap; not while it stays 2 */
+    const unsigned int F = 10000;   /* build.cpp kPwForgetMs */
+    if (powerwire::PowerFreezeStarts(0, 0, 2, 0, F) != 1) Fail("T-1455: a piece first seen frozen did not start its freeze");
+    if (powerwire::PowerFreezeStarts(1, 1, 2, 1000, F) != 1 || powerwire::PowerFreezeStarts(1, 0, 2, 1000, F) != 1) Fail("T-1455: a turn to another game did not start a freeze");
+    if (powerwire::PowerFreezeStarts(1, 2, 2, 1000, F) != 0) Fail("T-1455: a freeze restarted while the verdict stayed another game");
+    if (powerwire::PowerFreezeStarts(1, 2, 2, F + 1, F) != 1) Fail("T-1455: a piece back after an unload kept the old freeze clock");
+    if (powerwire::PowerFreezeStarts(0, 0, 1, 0, F) != 0 || powerwire::PowerFreezeStarts(1, 2, 1, 0, F) != 0 || powerwire::PowerFreezeStarts(1, 2, 0, F + 1, F) != 0)
+        Fail("T-1455: a freeze started for a piece this game or nobody writes");
+    /* the line budget: the first cap lines, then every 100th; line numbers start at 1 */
+    const long long C = powerwire::kPowerDiagVerdictCap, E = powerwire::kPowerDiagEvery;
+    if (C != 40 || E != 100) Fail("T-1455: the verdict line budget is not 40 then every 100th");
+    if (powerwire::PowerDiagSay(0, C, E) != 0) Fail("T-1455: line 0 printed");
+    if (powerwire::PowerDiagSay(1, C, E) != 1 || powerwire::PowerDiagSay(C, C, E) != 1) Fail("T-1455: a line inside the budget not printed");
+    if (powerwire::PowerDiagSay(C + 1, C, E) != 0 || powerwire::PowerDiagSay(C + 99, C, E) != 0) Fail("T-1455: a line past the budget printed before its 100th");
+    if (powerwire::PowerDiagSay(C + 100, C, E) != 1 || powerwire::PowerDiagSay(C + 200, C, E) != 1) Fail("T-1455: the every-100th line past the budget not printed");
+    if (powerwire::PowerDiagSay(powerwire::kPowerDiagFirstCap + 100, powerwire::kPowerDiagFirstCap, 0) != 0) Fail("T-1455: the first-look budget printed past its cap");
 }
 
 /* H-P47a: an off-main step's writer verdict - the live answer when it knows, else the main thread's published one while its row is
@@ -8037,7 +8078,7 @@ void t_m6_road_local_inner_types()
     for (unsigned int t = 0; t < 256; ++t)
     {
         const bool local = cooplive::LiveInnerRoadLocal(t);
-        if (local != (t == 200 || t == 201 || t == 202 || t == 3 || t == 4 || t == 56 || t == 203 || t == 204 || t == 205 || t == 206 || t == 207 || t == 208)) { Fail("the notebook road's own inner types are not exactly 200, 201, OWNER_MOVED 202, PING 3, PONG 4, SESSION_CLOSING 56, LOG_ASK 203, LOG_PART 204, CHAT 205, MAP_DOTS 206, SPOT_PING 207 (T-1393) and LOG_REPLY 208"); break; }
+        if (local != (t == 200 || t == 201 || t == 202 || t == 3 || t == 4 || t == 56 || t == 203 || t == 204 || t == 205 || t == 206 || t == 207 || t == 208 || t == 209)) { Fail("the notebook road's own inner types are not exactly 200, 201, OWNER_MOVED 202, PING 3, PONG 4, SESSION_CLOSING 56, LOG_ASK 203, LOG_PART 204, CHAT 205, MAP_DOTS 206, SPOT_PING 207 (T-1393), LOG_REPLY 208 and LOG_THREAD 209 (T-1401 2c)"); break; }
         if (local && cooplive::LiveInnerAccepted(t)) { Fail("a road-local inner type would also be dispatched to the session layer"); break; }
     }
 }

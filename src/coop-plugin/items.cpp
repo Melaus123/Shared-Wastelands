@@ -73,6 +73,8 @@
 #include "../common/ownrec.h"   /* inv7c: the ledger names (ownstore.h only forward-declares LedgerEntry) */
 #include "../common/tradewinguard.h"   /* T-1230: the trade window never calls through a freed trader */
 #include "../common/humantest.h"   /* T-1120: coophuman::ThunkTarget - a vtable slot's E9 jump stub followed to the function */
+#include "../common/itemlook.h"   /* T-1449: the [ITEMLOOK] line - its verdicts, caps and text */
+#include "../common/shopwin.h"   /* T-1451: an open shop window keeps its goods in place through a sale - the pure decisions */
 #include "relations.h"   /* inv6: RelationsWireSid - the owner's faction as a name both games understand */
 #include <deque>
 #include <set>
@@ -6380,6 +6382,303 @@ int ItGdSidPod(void* gd, char* out, int cap)
     if (gd == 0 || !ItPlaus(gd)) return 0;
     return ItStrPod((const char*)gd + kGdStringId, out, cap);
 }
+/* T-1449 (owner 1826 a, 2026-11-20; F1544 / F1545 / F1553): THE [ITEMLOOK] LINE - a light, permanent watch, every game, release
+   build too, for an item that looks black (../common/itemlook.h holds the verdicts, the caps and the lines' text). Read-only: the
+   look-maker's hook (row AppearanceBase_setupItemMaterial: 1.0.65 0x535780, 1.0.68 0x536210; decomp_535780) calls the original once
+   with its arguments unchanged and only reads after it; the Material::clone hook (OgreMain_x64.dll's export, found by name) calls
+   Ogre's own clone unchanged and only notes the name it made. Every read is SEH-guarded (the It*Pod helpers); the texture /
+   material manager's own getByName is asked (a lookup; the reference it hands back is given back at once).
+   Offsets (Read, the game's OgreMain_x64.dll export disassembly and decomp_535780 / decomp_840b80, as probe P325 used them):
+     the attached item (setupItemMaterial's 2nd argument) +0x78 its item GameData, +0x80 its Ogre::Entity; AppearanceBase +0xF0 its
+     Character, +0x10 its attachments (boost map name -> AttachedEntity*, game/Appearance.h); Character +0x448 its AnimationClass,
+     AnimationClass +0xE8 its AppearanceBase (appearance.cpp GetAppearance); GameData +0x28 name, +0x50 type.
+     Entity +0x188/+0x190 its sub-entities (by value, 344 bytes each); SubEntity +0x68 its MaterialPtr; Material +0x168/+0x170
+     techniques; Technique +0/+8 passes; Pass +0x118/+0x120 texture units; TextureUnitState +0x00 current frame, +0x148/+0x150
+     frame names (40-byte strings), +0x168/+0x170 frame TexturePtrs (16 bytes) - read, never _getTexturePtr (it LOADS the
+     texture); Resource +0x60 name, +0x88 group, +0xD0 loading state (2 = loaded). SharedPtr = {object, info}, the info's use count
+     at +0x20 (the manager's getByName hands back a counted reference; it is given back here).
+   The maker (decomp_840b80 :480-516) asks MaterialManager::getByName for the item's material name and only on a miss clones the
+   base material under that name (the only clone reached from setupItemMaterial), so a clone on a thread inside setupItemMaterial
+   (its TLS mark) is a make; a make under a name already made this session is a re-make (F1553: 39 on the joiner in T2668). */
+const size_t kIlAttItemGd = 0x78, kIlAttEntity = 0x80, kIlAppChar = 0xF0, kIlAppAttach = 0x10, kIlCharAnim = 0x448, kIlAnimApp = 0xE8;
+const size_t kIlGdName = 0x28, kIlGdType = 0x50;
+const size_t kIlEntSubBegin = 0x188, kIlEntSubEnd = 0x190, kIlSubSize = 344, kIlSubMat = 0x68;
+const size_t kIlMatTechBegin = 0x168, kIlMatTechEnd = 0x170, kIlPassTusBegin = 0x118, kIlPassTusEnd = 0x120;
+const size_t kIlTusFrame = 0x00, kIlTusNamesBegin = 0x148, kIlTusNamesEnd = 0x150, kIlTusPtrsBegin = 0x168, kIlTusPtrsEnd = 0x170;
+const size_t kIlStrBytes = 40, kIlResName = 0x60, kIlResGroup = 0x88, kIlResState = 0xD0, kIlSpUseCount = 0x20;
+const int kIlFindRing = 8;
+
+typedef void (*IlSetupFn)(void* app, void* att);
+typedef void* (*IlSingletonFn)();
+typedef void* (*IlGetByNameFn)(void* mgr, void* ret, const void* name, const void* group);   /* member: this, hidden return, name, group */
+typedef void* (*IlCloneFn)(void* self, void* ret, const void* name, bool changeGroup, const void* group);   /* member: this, hidden return */
+unsigned long long kIlSetupRva = 0; static coop::AddrReg kIlSetupRva_reg("AppearanceBase_setupItemMaterial", &kIlSetupRva);   /* Steam_1.0.65 0x535780, 1.0.68 0x536210; optional:itemlook (T-1453) - 0 when not found, the whole watch off */
+IlSetupFn g_ilSetupOrig = 0;
+IlCloneFn g_ilCloneOrig = 0;
+int g_ilSetupHook = 0, g_ilCloneHook = 0;   /* 0 not tried, 1 on, 2 no row / no export / no TLS slot, 3 the hook failed */
+IlSingletonFn g_ilTexMgr = 0, g_ilMatMgr = 0;
+IlGetByNameFn g_ilTexByName = 0, g_ilMatByName = 0;
+DWORD g_ilTls = TLS_OUT_OF_INDEXES;
+CRITICAL_SECTION g_ilLock;   /* initialised by ItemLookInstall before either hook goes on */
+volatile long g_ilChecked = 0, g_ilBlack = 0, g_ilRemade = 0, g_ilStale = 0, g_ilQueueDropped = 0;   /* the REPORT itemLook token (any thread) */
+coopitemlook::LineCap g_ilCap;   /* MAIN THREAD */
+
+struct IlMat { int techs, passes, tus, state; int loaded[coopitemlook::kTexUnits], sameObj[coopitemlook::kTexUnits]; char name[256], group[64], tex[coopitemlook::kTexUnits][128]; };
+struct IlFind { void* holder; int type, techs, unit, loaded, sameObj, why; char item[96], sid[kSidCap], material[256], tex[128]; };
+IlFind g_ilFindRing[kIlFindRing];   /* under the lock: off-main build findings, logged by ItemLookTick */
+volatile long g_ilFindCount = 0;
+struct IlRemade { char name[256], item[96]; };
+IlRemade g_ilRemadeRing[coopitemlook::kRemadeNameCap];   /* under the lock */
+volatile long g_ilRemadeCount = 0;
+long g_ilRemadeLines = 0;   /* MAIN THREAD */
+std::set<std::string> g_ilMadeNames, g_ilRemadeNamed;   /* under the lock: every name made this session; the re-made names taken for a line */
+struct IlFollow { unsigned int uid; DWORD due; };
+std::vector<IlFollow> g_ilFollow;   /* MAIN THREAD: copies redressed, waiting for their follow-up */
+
+/* the n-th element of a vector held at at+offB..offE (elem bytes each): its count, and its first element */
+int IlVecPod(const void* at, size_t offB, size_t offE, size_t elem, int* count, void** first)
+{
+    *count = -1; *first = 0;
+    void* b = 0; void* e = 0;
+    if (at == 0 || !ItPlaus(at) || ItPtrPod(at, offB, &b) == 0 || ItPtrPod(at, offE, &e) == 0) return 0;
+    if (b == 0 || e == 0) { *count = 0; return 1; }
+    if ((char*)e < (char*)b || ((char*)e - (char*)b) % elem != 0 || ((char*)e - (char*)b) / elem > 4096) return 0;
+    *count = (int)(((char*)e - (char*)b) / elem); *first = b;
+    return 1;
+}
+void* IlMgrPod(IlSingletonFn fn)
+{
+    if (fn == 0) return 0;
+    __try { return fn(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the manager's getByName(name, group): *got = the object it hands out now (0 = none by that name); its reference given back.
+   1 asked, -1 not */
+int IlByNamePod(IlGetByNameFn fn, void* mgr, const void* name, const void* group, void** got)
+{
+    *got = 0;
+    if (fn == 0 || mgr == 0 || !ItPlaus(mgr)) return -1;
+    void* sp[2]; sp[0] = 0; sp[1] = 0;
+    __try
+    {
+        fn(mgr, (void*)sp, name, group);
+        *got = sp[0];
+        /* the reference getByName handed back is given back by lowering its count directly, never by Ogre's release: the manager
+           keeps its own reference while the object is listed, so the count never reaches 0 here, and nothing here ever frees - a
+           count left one too high (a leak) is the worst case, never a free */
+        if (sp[1] != 0 && ItPlaus(sp[1])) ::InterlockedDecrement((volatile long*)((char*)sp[1] + kIlSpUseCount));
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *got = 0; return -1; }
+}
+/* one texture unit: its current frame's texture name, and (named only) loaded 1/0 and - askTex - whether the texture manager hands
+   out that same object for that name now (1/0); -1 unread or a unit that names no texture */
+void IlTusRead(void* tus, char* name, int nameCap, int* loaded, int* sameObj, int askTex)
+{
+    name[0] = 0; *loaded = -1; *sameObj = -1;
+    int frame = -1, frames = -1, ptrs = -1;
+    void* names = 0; void* tp = 0; void* tex = 0;
+    if (tus == 0 || !ItPlaus(tus) || ItIntPod(tus, kIlTusFrame, &frame) == 0 || frame < 0) return;
+    if (!IlVecPod(tus, kIlTusNamesBegin, kIlTusNamesEnd, kIlStrBytes, &frames, &names) || frame >= frames || names == 0) return;
+    if (ItStrPod((char*)names + kIlStrBytes * (size_t)frame, name, nameCap) != 1) { name[0] = 0; return; }
+    if (!IlVecPod(tus, kIlTusPtrsBegin, kIlTusPtrsEnd, 16, &ptrs, &tp)) return;
+    if (frame >= ptrs || tp == 0 || ItPtrPod((char*)tp + 16 * (size_t)frame, 0, &tex) == 0 || tex == 0 || !ItPlaus(tex)) { *loaded = 0; return; }
+    int state = -1;
+    if (ItIntPod(tex, kIlResState, &state) != 0) *loaded = state == 2 ? 1 : 0;
+    if (!askTex) return;
+    void* now = 0;
+    if (IlByNamePod(g_ilTexByName, IlMgrPod(g_ilTexMgr), (char*)tex + kIlResName, (char*)tex + kIlResGroup, &now) == 1) *sameObj = now == tex ? 1 : 0;
+}
+/* the material's name, group, state, counts and its technique 0 / pass 0 first texture units */
+void IlMatRead(void* mat, IlMat* m, int askTex)
+{
+    std::memset(m, 0, sizeof *m);
+    m->techs = -1; m->passes = -1; m->tus = -1; m->state = -1;
+    for (int k = 0; k < coopitemlook::kTexUnits; ++k) { m->loaded[k] = -1; m->sameObj[k] = -1; }
+    if (mat == 0 || !ItPlaus(mat)) return;
+    if (ItStrPod((char*)mat + kIlResName, m->name, (int)sizeof m->name) != 1) m->name[0] = 0;
+    if (ItStrPod((char*)mat + kIlResGroup, m->group, (int)sizeof m->group) != 1) m->group[0] = 0;
+    if (ItIntPod(mat, kIlResState, &m->state) == 0) m->state = -1;
+    void* techs = 0; void* tech0 = 0; void* passes = 0; void* pass0 = 0; void* units = 0;
+    if (!IlVecPod(mat, kIlMatTechBegin, kIlMatTechEnd, 8, &m->techs, &techs) || m->techs < 1 || ItPtrPod(techs, 0, &tech0) == 0) return;
+    if (!IlVecPod(tech0, 0, 8, 8, &m->passes, &passes) || m->passes < 1 || ItPtrPod(passes, 0, &pass0) == 0) return;
+    if (!IlVecPod(pass0, kIlPassTusBegin, kIlPassTusEnd, 8, &m->tus, &units)) return;
+    for (int k = 0; k < coopitemlook::kTexUnits && k < m->tus; ++k)
+    {
+        void* u = 0;
+        if (ItPtrPod((char*)units + 8 * (size_t)k, 0, &u) != 0) IlTusRead(u, m->tex[k], (int)sizeof m->tex[k], &m->loaded[k], &m->sameObj[k], askTex);
+    }
+}
+/* the attached item's sub-entity 0 material (0 = none or unread), and its item's name / sid / type into f */
+void* IlAttRead(void* att, IlFind* f)
+{
+    void* gd = 0; void* ent = 0; void* subs = 0; void* mat = 0;
+    int n = -1;
+    if (att == 0 || !ItPlaus(att)) return 0;
+    if (ItPtrPod(att, kIlAttItemGd, &gd) != 0 && gd != 0 && ItPlaus(gd))
+    {
+        if (ItStrPod((char*)gd + kIlGdName, f->item, (int)sizeof f->item) != 1) f->item[0] = 0;
+        if (ItGdSidPod(gd, f->sid, kSidCap) != 1) f->sid[0] = 0;
+        if (ItIntPod(gd, kIlGdType, &f->type) == 0) f->type = -1;
+    }
+    if (ItPtrPod(att, kIlAttEntity, &ent) == 0 || ent == 0 || !ItPlaus(ent)) return 0;
+    if (!IlVecPod(ent, kIlEntSubBegin, kIlEntSubEnd, kIlSubSize, &n, &subs) || n < 1) return 0;
+    if (ItPtrPod(subs, kIlSubMat, &mat) == 0 || mat == 0 || !ItPlaus(mat)) return 0;
+    return mat;
+}
+void IlFindInit(IlFind* f)
+{
+    std::memset(f, 0, sizeof *f);
+    f->type = -1; f->techs = -1; f->loaded = -1; f->sameObj = -1;
+}
+void IlFindFrom(IlFind* f, const IlMat& m, int unit, int why)
+{
+    f->techs = m.techs; f->unit = unit; f->loaded = m.loaded[unit]; f->sameObj = m.sameObj[unit]; f->why = why;
+    std::memcpy(f->material, m.name, sizeof f->material);
+    std::memcpy(f->tex, m.tex[unit], sizeof f->tex);
+}
+/* MAIN THREAD: the holder's kind word and uid */
+std::string IlKindOf(void* holder, char* name, int nameCap, unsigned int* uid)
+{
+    *uid = 0;
+    const int who = ItColourWhoPod(holder, name, nameCap);
+    if (who == coopgarment::kColourWhoMine) return "own-player";
+    if (who == coopgarment::kColourWhoOther) { *uid = FindSpawnedUid(holder); return "other-player"; }
+    if (who == coopgarment::kColourWhoNone) return "none";
+    if (who != coopgarment::kColourWhoNpc) return "unread";
+    *uid = FindSpawnedUid(holder);
+    if (*uid == 0) return "npc-nouid";
+    return net::IsUidMine(*uid) ? "npc-own" : "npc-copy";
+}
+/* MAIN THREAD: one finding - the capped line */
+void IlSay(const IlFind& f)
+{
+    const int step = g_ilCap.Step(f.sid[0] != 0 ? std::string(f.sid) : std::string(f.item));
+    if (step == 0) return;
+    char holderName[128]; unsigned int uid = 0;
+    const std::string kind = IlKindOf(f.holder, holderName, (int)sizeof holderName, &uid);
+    DebugLog(coopitemlook::BlackLine(holderName, kind, uid, f.item, f.type, f.material, f.techs, f.unit, f.tex, f.loaded, f.sameObj, f.why));
+    if (step == 2) DebugLog(coopitemlook::CapLine());
+}
+/* ANY THREAD, right after the original built the look: judged; a black-looking one is logged (main thread) or queued */
+void IlJudgeBuild(void* app, void* att)
+{
+    IlFind f;
+    IlFindInit(&f);
+    void* mat = IlAttRead(att, &f);
+    if (mat == 0) return;
+    ::InterlockedIncrement(&g_ilChecked);
+    IlMat m;
+    IlMatRead(mat, &m, 1);
+    int unit = 0;
+    if (!coopitemlook::BuildBlack(m.techs, m.loaded, m.sameObj, m.tus, &unit)) return;
+    ::InterlockedIncrement(&g_ilBlack);
+    IlFindFrom(&f, m, unit, coopitemlook::kWhyNone);
+    if (app != 0 && ItPlaus(app) && ItPtrPod(app, kIlAppChar, &f.holder) == 0) f.holder = 0;
+    if (ItOnMainThread()) { IlSay(f); return; }
+    ::EnterCriticalSection(&g_ilLock);
+    if (g_ilFindCount < kIlFindRing) g_ilFindRing[g_ilFindCount++] = f;
+    else ::InterlockedIncrement(&g_ilQueueDropped);   /* the 8-slot off-main queue is full: counted on the REPORT token */
+    ::LeaveCriticalSection(&g_ilLock);
+}
+struct IlCtx { void* app; void* att; };   /* what the TLS slot points at while setupItemMaterial runs on a thread */
+void detour_IlSetup(void* app, void* att)
+{
+    IlCtx ctx; ctx.app = app; ctx.att = att;
+    const int tls = g_ilTls != TLS_OUT_OF_INDEXES ? 1 : 0;
+    void* was = tls ? ::TlsGetValue(g_ilTls) : 0;
+    if (tls) ::TlsSetValue(g_ilTls, &ctx);
+    /* the maker can throw (decomp_840b80: 'Could not find material'): the mark is put back on every exit, the throw goes on */
+    __try { g_ilSetupOrig(app, att); }
+    __finally { if (tls) ::TlsSetValue(g_ilTls, was); }
+    IlJudgeBuild(app, att);
+}
+/* ANY THREAD, after the maker's clone: a name made before this session is a re-make (counted; the first names queued for a line) */
+void IlNoteMake(void* ctx, const void* name)
+{
+    char nm[256];
+    if (ItStrPod(name, nm, (int)sizeof nm) != 1) return;
+    char item[96]; item[0] = 0;
+    void* att = 0; void* gd = 0;
+    if (ItPtrPod(ctx, 8, &att) != 0 && att != 0 && ItPlaus(att) && ItPtrPod(att, kIlAttItemGd, &gd) != 0 && gd != 0 && ItPlaus(gd)
+        && ItStrPod((char*)gd + kIlGdName, item, (int)sizeof item) != 1) item[0] = 0;
+    const std::string key(nm);
+    ::EnterCriticalSection(&g_ilLock);
+    const bool again = !g_ilMadeNames.insert(key).second;
+    if (again && (int)g_ilRemadeNamed.size() < coopitemlook::kRemadeNameCap && g_ilRemadeNamed.insert(key).second
+        && g_ilRemadeCount < coopitemlook::kRemadeNameCap)
+    {
+        IlRemade& r = g_ilRemadeRing[g_ilRemadeCount++];
+        std::memcpy(r.name, nm, sizeof r.name);
+        std::memcpy(r.item, item, sizeof r.item);
+    }
+    ::LeaveCriticalSection(&g_ilLock);
+    if (again) ::InterlockedIncrement(&g_ilRemade);
+}
+void* detour_IlClone(void* self, void* ret, const void* name, bool changeGroup, const void* group)
+{
+    void* ctx = g_ilTls != TLS_OUT_OF_INDEXES ? ::TlsGetValue(g_ilTls) : 0;
+    void* r = g_ilCloneOrig(self, ret, name, changeGroup, group);
+    if (ctx != 0) IlNoteMake(ctx, name);
+    return r;
+}
+/* the character's AppearanceBase, or 0 */
+void* IlAppOf(void* c)
+{
+    void* anim = 0; void* app = 0;
+    if (c == 0 || !ItPlaus(c) || ItPtrPod(c, kIlCharAnim, &anim) == 0 || anim == 0 || !ItPlaus(anim)) return 0;
+    if (ItPtrPod(anim, kIlAnimApp, &app) == 0 || app == 0 || !ItPlaus(app)) return 0;
+    return app;
+}
+/* the appearance's attachments: up to cap AttachedEntity pointers; -1 unread */
+int IlAttListPod(void* app, void** out, int cap)
+{
+    if (app == 0 || !ItPlaus(app)) return -1;
+    __try
+    {
+        const GameHashMap<std::string, AttachedEntity*>::type& m = *(const GameHashMap<std::string, AttachedEntity*>::type*)((char*)app + kIlAppAttach);
+        if (m.size() > 256) return -1;
+        int n = 0, steps = 0;   /* a fixed step cap too: a torn map never walks on */
+        for (GameHashMap<std::string, AttachedEntity*>::type::const_iterator it = m.begin(); it != m.end() && n < cap && steps < 256; ++it, ++steps)
+            if (it->second != 0) out[n++] = (void*)it->second;
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* MAIN THREAD: the follow-up of one redressed copy - each attached item judged (stale / empty / unloaded) */
+void IlFollowCheck(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    if (c == 0) return;
+    void* list[coopitemlook::kAttMax];
+    const int na = IlAttListPod(IlAppOf((void*)c), list, coopitemlook::kAttMax);
+    for (int k = 0; k < na; ++k)
+    {
+        IlFind f;
+        IlFindInit(&f);
+        void* mat = IlAttRead(list[k], &f);
+        if (mat == 0) continue;
+        ::InterlockedIncrement(&g_ilChecked);
+        IlMat m;
+        IlMatRead(mat, &m, 0);
+        int mg = -1;
+        if (m.name[0] != 0 && m.group[0] != 0)   /* an empty / unread group: not asked (unread, never a finding) */
+        {
+            const std::string name(m.name), group(m.group);   /* our own copies: the lookup never reads the material's own strings */
+            void* now = 0;
+            if (IlByNamePod(g_ilMatByName, IlMgrPod(g_ilMatMgr), (const void*)&name, (const void*)&group, &now) == 1) mg = now == mat ? 1 : now == 0 ? 2 : 0;
+        }
+        int unit = 0;
+        const int why = coopitemlook::FollowWhy(mg, m.techs, m.passes, m.tus, m.state, m.loaded, m.tus, &unit);
+        if (why == coopitemlook::kWhyNone) continue;
+        ::InterlockedIncrement(&g_ilStale);
+        IlMatRead(mat, &m, 1);   /* again, with the texture manager asked, for the line's sameObj */
+        IlFindFrom(&f, m, unit, why);
+        f.holder = (void*)c;
+        IlSay(f);
+    }
+}
+std::string ItemLookReportToken() { return coopitemlook::ReportToken(g_ilChecked, g_ilBlack, g_ilRemade, g_ilStale, g_ilQueueDropped); }
 /* THE REFUSAL LINE'S OWN INPUTS (lesson 12: a probe reports the inputs it read, not only the answer it
    computed). Three fields, all cheap guarded POD reads of the section the lever is already holding:
    secWxsecH and itemWxitemH make the "no room" half of the printed reason falsifiable, and limitedTo=<n>
@@ -11788,6 +12087,7 @@ struct TwRecord { int open; void* win; void* st; unsigned int hand[5]; };
 TwRecord g_twRec = { 0, 0, 0, { 0, 0, 0, 0, 0 } };
 SRWLOCK g_twLock = SRWLOCK_INIT;
 volatile LONG64 g_twRecorded = 0, g_twNoShop = 0, g_twClosedByEngine = 0;
+volatile LONG g_twOpenGen = 0;   /* T-1451 fold 1 (re-check): the engine's trade-window opens (showTraderInventory returned a window) - a reopen refills the stand-in */
 /* The five id words at obj + off. 1 read, 0 not. No C++ object. */
 int TwHandPod(const void* obj, size_t off, unsigned int* w)
 {
@@ -11827,6 +12127,7 @@ void* detour_showTraderInventory(void* gui, const void* owner)
     if (churnMain != 0) ++g_tradeWinChurnDepth;
     void* w = orig_showTraderInventory(gui, owner);
     if (churnMain != 0) --g_tradeWinChurnDepth;
+    if (w != 0) ::InterlockedIncrement(&g_twOpenGen);   /* T-1451 fold 1 (re-check): the open generation (ANY THREAD) */
     if (w != 0 && orig_closeInventory != 0 && orig_closeAllInventories != 0) TwNoteOpen(w);   /* T-1230: the open trade window's ShopTrader (recorded only while both close hooks are in, which end it) */
     if (!RoleIsSingle() && ItPlaus(owner))
     {
@@ -13422,9 +13723,20 @@ struct ItCfHeld
     unsigned int due;
 };
 std::vector<ItCfHeld> g_cfHeld;
+long long g_cfHeldDup = 0;
 bool ItSendConfirm(const ItemConfirmMsg& cf)
 {
     if (g_cfDelayMs == 0 || g_cfHeld.size() >= 32) return net::SendItemConfirm(cf);
+    /* T-1451 F1657 (T2699: 4 held sends of one answer, each acked as 'no applied record'): the asker's ordinary re-asks during the hold
+       got the same confirm, each held again and sent 16 s later. One copy per confirm (id, addressee) is held - the release sends it once */
+    for (size_t i = 0; i < g_cfHeld.size(); ++i)
+        if (g_cfHeld[i].cf.id == cf.id && g_cfHeld[i].cf.toKey == cf.toKey && g_cfHeld[i].cf.toHave == cf.toHave)
+        {
+            g_cfHeld[i].cf = cf;   /* the newest copy (a saved answer numbered since) goes at the first copy's time */
+            if (++g_cfHeldDup <= 20)
+                DebugLog("[ITEMS] confirmdelay (TEST): item confirm " + N((long long)cf.id) + " is held already - this repeat is not held again (heldDup=" + N(g_cfHeldDup) + ")");
+            return true;
+        }
     ItCfHeld h;
     h.cf = cf;
     h.due = ::GetTickCount() + g_cfDelayMs;
@@ -13448,6 +13760,157 @@ void ItCfHeldDrain()
                  + (sent ? " sent now, after its hold" : " could NOT be sent after its hold (no session)"));
     }
     g_cfHeld.swap(keep);
+}
+/* T-1451 design 3 (protocol 242; review fold d3b): THE HOLDER'S SAVE NUMBERS. Every box move this game sends carries its launch id and its
+   number for the box (ItNetSendMove: BoxSeqNext, +1 per move), noted with the ring ticket it was drained from (the drain's publish loop
+   sets g_sendTicket) or the shop apply it was sent inside (ShopSeqApplyScope). A shop answer naming counters waits here until no ring
+   entry rung before it is left (the drain has sent the sale's moves), then names per counter the number BEFORE the sale's first move and
+   AFTER its last (shopwin::SeqSaleRange) and goes. Events, not timers: released at the first drain that finds no older ring entry; after
+   kShopCfWaitDrains drains it goes anyway (counted forced, logged). MAIN THREAD. */
+std::map<std::string, unsigned int> g_boxSeqOut;
+std::map<std::string, std::vector<shopwin::SeqSent> > g_boxSeqHist;
+unsigned int g_boxSeqLaunch = 0;
+long g_sendTicket = 0;
+int g_sendTicketHave = 0;
+int g_sendNetRoad = 0;   /* re-check F1604 (3): 1 while the safety net (InvNetSendOp) sends - no ring ticket */
+int g_sendNetCounter = 0;   /* F1607 (log only): 1 while the safety net visits a shop counter (InvNetBoxOne) */
+long long g_boxSeqNetRoadHeld = 0, g_boxSeqNetRoadFree = 0;
+unsigned int g_shopApplyId = 0, g_shopApplyActive = 0;
+long g_shopApplyT0 = 0;
+std::map<std::string, unsigned int> g_shopApplySnap;
+long long g_boxSeqSent = 0, g_shopSeqCfHeld = 0, g_shopSeqCfForced = 0, g_shopSeqCfUnsent = 0, g_shopSeqCfLines = 0;
+struct ShopCfWait
+{
+    ItemConfirmMsg cf;
+    LONG t0;                 /* the ring's next ticket at the apply's start */
+    LONG ticket;             /* ... at the answer: entries before it may be the sale's moves */
+    unsigned int applyId;    /* moves sent inside the apply */
+    std::map<std::string, unsigned int> snap;   /* each named counter's number at the apply's start */
+    int drains;
+    unsigned int peerSlot, epoch;   /* T-1451 F1642: the request it answers {asker slot, epoch, cf.id} - its saved copies take the numbers */
+    int resend;                     /* F1643: a reconnect re-send was skipped while it waited - re-sent by the record's road at the release */
+};
+std::vector<ShopCfWait> g_shopCfWait;
+const int kShopCfWaitDrains = 64;
+unsigned int BoxSeqLaunch()
+{
+    if (g_boxSeqLaunch == 0u)
+    {
+        FILETIME ft; ::GetSystemTimeAsFileTime(&ft);
+        g_boxSeqLaunch = ft.dwLowDateTime ^ (ft.dwHighDateTime << 7) ^ (((unsigned int)::GetCurrentProcessId()) << 16);
+        if (g_boxSeqLaunch == 0u) g_boxSeqLaunch = 1u;
+    }
+    return g_boxSeqLaunch;
+}
+unsigned int BoxSeqNext(const std::string& key)
+{
+    const unsigned int n = shopwin::SeqNext(&g_boxSeqOut, key);
+    if (g_boxSeqHist.size() >= 4096 && g_boxSeqHist.count(key) == 0)
+    {   /* re-check F1604 (nit): the full table is cleared, but a held answer's counters keep their history (their ranges are still to name) */
+        std::map<std::string, std::vector<shopwin::SeqSent> > keepHist;
+        for (size_t i = 0; i < g_shopCfWait.size(); ++i)
+            for (size_t k = 0; k < g_shopCfWait[i].cf.shop.pieces.size(); ++k)
+            {
+                std::map<std::string, std::vector<shopwin::SeqSent> >::iterator h = g_boxSeqHist.find(g_shopCfWait[i].cf.shop.pieces[k]);
+                if (h != g_boxSeqHist.end()) keepHist[h->first].swap(h->second);
+            }
+        g_boxSeqHist.swap(keepHist);
+    }
+    unsigned int applyId = (g_shopApplyActive != 0) ? g_shopApplyId : 0u;
+    if (applyId == 0u && g_sendTicketHave == 0 && g_sendNetRoad != 0 && !g_shopCfWait.empty())
+    {   /* re-check F1604 (3): the safety net's move on a counter a held answer names is that sale's (its range counts it) */
+        std::vector<shopwin::SeqHeld> held;
+        for (size_t i = 0; i < g_shopCfWait.size(); ++i)
+        { shopwin::SeqHeld x; x.applyId = g_shopCfWait[i].applyId; x.pieces = &g_shopCfWait[i].cf.shop.pieces; held.push_back(x); }
+        applyId = shopwin::SeqNetRoadApply(held, key);
+        if (applyId != 0u && ++g_boxSeqNetRoadHeld <= 40)
+            DebugLog("[SHOP] seq safety-net move key=" + key + " #" + N((long long)n) + " held=1 - counted with the held answer of apply " + N((long long)applyId)
+                     + " (netRoadHeld=" + N(g_boxSeqNetRoadHeld) + ")");
+    }
+    if (applyId == 0u && g_sendTicketHave == 0 && g_sendNetRoad != 0 && g_sendNetCounter != 0 && ++g_boxSeqNetRoadFree <= 40)
+        DebugLog("[SHOP] seq safety-net move key=" + key + " #" + N((long long)n) + " held=0 - a shop counter's move no hook rang and no answer is held for:"
+                 " no ticket, it lands as a change outside every sale (netRoadFree=" + N(g_boxSeqNetRoadFree) + ")");
+    shopwin::SeqNoteSent(&g_boxSeqHist[key], n, g_sendTicket, g_sendTicketHave, applyId);
+    g_sendTicketHave = 0;   /* one box move per drained entry */
+    return n;
+}
+struct ShopSeqApplyScope   /* the holder's shop apply: the numbers and the ring ticket at its start; moves sent inside it are its own */
+{
+    ShopSeqApplyScope()
+    {
+        ++g_shopApplyId; if (g_shopApplyId == 0u) g_shopApplyId = 1u;
+        g_shopApplyActive = 1; g_sendTicketHave = 0;
+        g_shopApplyT0 = ::InterlockedCompareExchange(&g_ticket, 0, 0);
+        g_shopApplySnap = g_boxSeqOut;
+    }
+    ~ShopSeqApplyScope() { g_shopApplyActive = 0; }
+};
+/* T-1451 F1642: the saved copies of an answer (the applied record's, the answer memory's) take the numbers it was sent with - defined with
+   ShopAnswerNote, the same unnamed namespace (C2668) */
+void ShopSavedTakeNumbers(unsigned int peerSlot, unsigned int epoch, const ItemConfirmMsg& cf);
+void ShopAppliedResendKey(unsigned int peerSlot, unsigned int epoch, unsigned int id);   /* F1643: defined with ShopAppliedResend (C2668) */
+long long g_shopRepeatHeld = 0, g_shopResendHeld = 0, g_shopSavedNumbered = 0;   /* F1642: repeats / re-sends not sent ahead of the original; saved copies numbered */
+/* T-1451 F1642: 1 = the answer to {peerSlot, epoch, id} still waits here for its box moves - its numbers do not exist yet */
+int ShopCfWaiting(unsigned int peerSlot, unsigned int epoch, unsigned int id, int markResend = 0)
+{
+    for (size_t i = 0; i < g_shopCfWait.size(); ++i)
+        if (g_shopCfWait[i].cf.id == id && g_shopCfWait[i].epoch == epoch && g_shopCfWait[i].peerSlot == peerSlot)
+        {
+            if (markResend != 0) g_shopCfWait[i].resend = 1;   /* F1643: the skipped reconnect re-send follows the original at its release */
+            return 1;
+        }
+    return 0;
+}
+void ShopCfAfterMoves(const ItemConfirmMsg& cf, int caravan, unsigned int peerSlot, unsigned int epoch)
+{
+    if (caravan != 0 || cf.shop.has == 0 || cf.shop.pieces.empty()) { if (!ItSendConfirm(cf)) ++g_shopSeqCfUnsent; return; }
+    ShopCfWait w;
+    w.cf = cf;
+    w.ticket = ::InterlockedCompareExchange(&g_ticket, 0, 0);
+    w.t0 = (g_shopApplyActive != 0) ? g_shopApplyT0 : w.ticket;
+    w.applyId = (g_shopApplyActive != 0) ? g_shopApplyId : 0u;
+    for (size_t k = 0; k < cf.shop.pieces.size(); ++k)
+        w.snap[cf.shop.pieces[k]] = shopwin::SeqOf((g_shopApplyActive != 0) ? g_shopApplySnap : g_boxSeqOut, cf.shop.pieces[k]);
+    w.drains = 0;
+    w.peerSlot = peerSlot; w.epoch = epoch; w.resend = 0;
+    g_shopCfWait.push_back(w);
+    ++g_shopSeqCfHeld;
+}
+void ShopCfWaitDrain()   /* MAIN THREAD (ItemsTickDrain, before the ring is drained) */
+{
+    g_sendTicketHave = 0;
+    if (g_shopCfWait.empty()) return;
+    std::vector<ShopCfWait> keep;
+    for (size_t i = 0; i < g_shopCfWait.size(); ++i)
+    {
+        ShopCfWait& w = g_shopCfWait[i];
+        int older = 0;
+        for (int k = 0; k < kRing && older == 0; ++k) if (g_ring[k].ready != 0 && (long)(g_ring[k].seq - (long)w.ticket) < 0) older = 1;
+        ++w.drains;
+        if (older != 0 && w.drains < kShopCfWaitDrains) { keep.push_back(w); continue; }
+        if (older != 0) ++g_shopSeqCfForced;
+        std::string words;
+        w.cf.shop.seqs.clear(); w.cf.shop.seqsFrom.clear();
+        for (size_t k = 0; k < w.cf.shop.pieces.size(); ++k)
+        {
+            const std::string& key = w.cf.shop.pieces[k];
+            static const std::vector<shopwin::SeqSent> s_none;
+            std::map<std::string, std::vector<shopwin::SeqSent> >::const_iterator h = g_boxSeqHist.find(key);
+            unsigned int b = 0, a = 0;
+            shopwin::SeqSaleRange((h != g_boxSeqHist.end()) ? h->second : s_none, w.snap[key], (long)w.t0, (long)w.ticket, w.applyId, &b, &a);
+            w.cf.shop.seqsFrom.push_back(b); w.cf.shop.seqs.push_back(a);
+            words += " " + key + "#" + N((long long)b) + ".." + N((long long)a);
+        }
+        ShopSavedTakeNumbers(w.peerSlot, w.epoch, w.cf);   /* F1642: a repeat or a re-send from now on is this numbered answer */
+        const bool sent = ItSendConfirm(w.cf);
+        if (!sent) ++g_shopSeqCfUnsent;
+        if (w.resend != 0) ShopAppliedResendKey(w.peerSlot, w.epoch, w.cf.id);   /* F1643: the asker's road came back meanwhile - by the record's road too */
+        if (older != 0 || ++g_shopSeqCfLines <= 40)
+            DebugLog("[SHOP] holder answer id=" + N((long long)w.cf.id) + " ok=" + N((long long)w.cf.ok) + " sent after its box moves (" + N((long long)w.drains) + " drain(s)"
+                     + (older != 0 ? std::string(" - FORCED: a move rung before it is still in the ring, cfForced=" + N(g_shopSeqCfForced)) : std::string())
+                     + "): counters[key#before..after]=" + words + (sent ? std::string() : std::string(" - NOT SENT")));
+    }
+    g_shopCfWait.swap(keep);
 }
 
 /* ================ T-164 NON-SHOP ROAD (owner 207 A, 208, 209 A, 212 - 2026-09-29): THE MOVE SHOWS AT ONCE ================
@@ -22829,6 +23292,7 @@ struct BtHold
     int active; int secs; unsigned int at; int announced;
     int town[kTownHandDwords]; int haveTown;
     long long winBefore; long long win;   /* the P160 trade-window count before the open; the window's number (0 = not numbered) */
+    unsigned int buyerUid;                /* T-1451 TEST LEVER: the character the window was opened for (shoptest win trades as it) */
     std::string what;                     /* keeper and counter, for the two lines */
 };
 static BtHold g_btHold;
@@ -22840,8 +23304,9 @@ static std::string BtHoldWin()
     return (g_btHold.win > 0) ? "#" + N(g_btHold.win) : std::string("#?");
 }
 int BuyTestHoldBusy() { return (g_btHold.active != 0) ? 1 : 0; }
-static void BtHoldArm(const int* townSaved, int haveTown, int secs)
+static void BtHoldArm(const int* townSaved, int haveTown, int secs, unsigned int buyerUid)
 {
+    g_btHold.buyerUid = buyerUid;   /* T-1451 */
     g_btHold.active = 1; g_btHold.secs = secs; g_btHold.at = ::GetTickCount(); g_btHold.announced = 0;
     for (int i = 0; i < kTownHandDwords; ++i) g_btHold.town[i] = townSaved[i];
     g_btHold.haveTown = haveTown;
@@ -23286,7 +23751,7 @@ bool BuyTest(const std::string& needleIn, const std::string& sidWanted, int npcP
     /* T-1120 (TEST LEVER): hold=<s> - the window is open; nothing is bought, and ItBtHoldDrive closes it after s seconds */
     if (g_btKeeper.active != 0 && g_btKeeper.hold > 0 && sell == 0 && npcPath == 0)
     {
-        BtHoldArm(townSaved, haveTown, g_btKeeper.hold);
+        BtHoldArm(townSaved, haveTown, g_btKeeper.hold, buyerUid);
         return true;
     }
 
@@ -29407,6 +29872,7 @@ void ItemsTickDrain()
     ItBoxBackTick();       /* T-164 211 fold-1 (F2): parked give-backs into our box, each every 2 s */
     ItOwnerPendExpire();   /* E22b-2: the owner's rollback deadline, re-armed by THIS call and no other */
     ItCfHeldDrain();       /* give1: TEST-ONLY confirmdelay - held confirmations whose time has come (nothing held in normal play) */
+    ShopCfWaitDrain();     /* T-1451 design 3: shop answers whose box moves have left the ring (the drain before this one sent them) */
     ItParityTick();        /* par1: zone arrivals -> PARITY_REQ, the holder's answers, deferred re-asks (before the empty-ring return) */
     /* E22b-3: BEFORE the ring is looked at, and that ordering is load-bearing - a stack drag rings nothing
        at all (F540), so the split would never be seen by a drain that returns early on an empty ring. */
@@ -29937,6 +30403,7 @@ void ItemsTickDrain()
     for (int k = 0; k < n; ++k)
     {
         ItEntry& e = g_ring[idx[k]];
+        g_sendTicket = (long)e.seq; g_sendTicketHave = 1;   /* T-1451 design 3 (review fold): a box move sent for this entry is noted with its ring ticket */
         ItemMoveMsg m;
         void* const ch = e.ch;
         m.op = e.op; m.x = e.x; m.y = e.y; m.quantity = e.quantity;
@@ -30379,6 +30846,7 @@ void ItemsTickDrain()
         if (ItNetSendMove(m)) ++g_sent; else ++g_sendFailed;
         coop::StoreMarkSquadDirtyByUid(uid, coop::kHbCauseItem);   /* E47-S2: the owner's group changed - publish inside the 2 s gap */
     }
+    g_sendTicketHave = 0;   /* re-check F1604 (2): the send loop is over - a later send in this tick has no ring ticket */
     /* review-p6b HIGH-1(b): the swap's second held row, installed now that the send loop has released the
        one it was waiting behind. It is installed BEFORE the release test below, which then finds its object
        still on the cursor and leaves it standing. */
@@ -31272,9 +31740,37 @@ void ItBoxRecvSummary(const swkeycap::Summary& s)
     DebugLog("[ITEMS] box changes from other games on key=" + s.key + ": " + N((long long)s.held) + " more in the last " + N((long long)(s.spanMs / 1000u))
              + " s were not written (each box's first 20 are, then this summary a minute) - " + (s.kinds.empty() ? std::string("no outcome") : s.kinds));
 }
-void ItBoxRecvLine(const std::string& box, int fromSlot, int applied, const char* why, const std::string& what, int before, int after)
+/* T-1451 F1624: WHAT A BOX MOVE LANDING HERE CHANGED (shopwin::SeqLanding: op, type, units), for the open shop window's in-place apply;
+   haveRec: rec describes the units it added (an add's own record, or the cell's item read after a count rise) */
+struct ShopLanding { shopwin::SeqLanding l; int haveRec; ItemMoveMsg rec; ShopLanding() : haveRec(0) {} };
+void ShopAfterSaleLanded(const std::string& key, int fromSlot, unsigned int seq, unsigned int launch, int applied, const ShopLanding* land);   /* T-1451: defined with the shop settle - a counter's change from another game landed */
+/* T-1451 F1624 / F1628 (review blocker): the FULL description of the item at a cell (1 read) - the receive watch's description of a
+   remove / count change, read BEFORE the change (a remove names none on the wire), and a count rise's, read after - and its key
+   (shopwin::DescKey: the fields coopshop::SameDesc compares; two same-type items of another maker, material or grade differ) */
+std::string ItMoveDescKey(const ItemMoveMsg& m)
+{
+    return shopwin::DescKey(m.baseSid, m.companySid, m.materialSid, m.colorSid, m.quality, m.charges, m.functionKind, m.level, m.unique);
+}
+std::string ItEntryDescKey(const ItEntry& e)
+{
+    return shopwin::DescKey(e.baseSid, e.companySid, e.materialSid, e.colorSid, e.quality, e.charges, e.functionKind, e.level, e.unique);
+}
+const int kItFuncMoneyEarly = 14;   /* functionKind ITEM_MONEY (kItemFuncMoney, defined further down) */
+int ItCellDesc(::InventorySection* sec, int x, int y, ItemMoveMsg* m)
+{
+    void* at = 0;
+    if (sec == 0 || !ItObj(sec) || ItSlotInSectionWhy(sec, x, y) != 1 || ItGetAtPod(sec, x, y, &at) == 0 || !ItPlaus(at)) return 0;
+    ItEntry e;
+    ItClear(&e);
+    if (ItReadFields(at, &e) != 1) return 0;
+    ItMsgFromEntry(e, m);
+    return 1;
+}
+void ItBoxRecvLine(const std::string& box, int fromSlot, int applied, const char* why, const std::string& what, int before, int after, unsigned int seq = 0u,
+                   unsigned int launch = 0u, const ShopLanding* land = 0)
 {
     if (applied != 0) ++g_boxRecvApplied; else ++g_boxRecvRefused;
+    ShopAfterSaleLanded(box, fromSlot, seq, launch, applied, land);   /* T-1451 design 3: the writer's save number arrived (applied or refused); F1624: with what it changed */
     const std::string outcome = (applied != 0) ? std::string("APPLIED") : std::string("REFUSED ") + (why != 0 ? why : "?");
     swkeycap::Summary s;
     const int v = swkeycap::Judge(&g_boxRecvCap, box, ::GetTickCount(), outcome, &s);
@@ -31292,18 +31788,24 @@ struct ItMoveRecvWatch
     unsigned int peer;
     int on, stage, ok, before;
     ::InventorySection* sec;
+    ItemMoveMsg descBefore;  /* T-1451 F1628: the cell's item's FULL description before the change (a remove / count names none on the wire) */
+    int descBeforeOk;
     long long c0[kMoveWhyN];
     static void Take(long long* d)
     {
         d[0] = g_itemMoveNotOwner; d[1] = g_keyUnresolved; d[2] = g_boxNoInventory; d[3] = g_boxPosFault; d[4] = g_boxApplyNotHolder;
         d[5] = g_bagApplyNoPath; d[6] = g_applyNoSection; d[7] = g_applyBadOp; d[8] = g_refused;
     }
-    ItMoveRecvWatch(const ItemMoveMsg& mm, unsigned int p) : m(mm), peer(p), on(0), stage(0), ok(0), before(-9), sec(0)
+    ItMoveRecvWatch(const ItemMoveMsg& mm, unsigned int p) : m(mm), peer(p), on(0), stage(0), ok(0), before(-9), sec(0), descBeforeOk(0)
     {
         on = (mm.uid == 0 && !mm.boxKey.empty()) ? 1 : 0;
         Take(c0);
     }
-    void Cell(::InventorySection* s) { stage = 3; sec = s; if (on != 0) before = ItCellQty(s, m.x, m.y); }
+    void Cell(::InventorySection* s)
+    {
+        stage = 3; sec = s;
+        if (on != 0) { before = ItCellQty(s, m.x, m.y); if (m.op != 0) descBeforeOk = ItCellDesc(s, m.x, m.y, &descBefore); }
+    }
     ~ItMoveRecvWatch()
     {
         if (on == 0 || GrIsGroundKey(m.boxKey.c_str()) != 0) return;
@@ -31324,8 +31826,36 @@ struct ItMoveRecvWatch
             else if (stage == 1) why = "hdAbsorb (this game's own HOLD / LAND, shown already)";
         }
         const int after = (sec != 0) ? ItCellQty(sec, m.x, m.y) : -9;
+        /* T-1451 F1624: what the change did - an add's own record; a remove / count's type from the cell before it; a count rise's
+           description from the cell after it (the shop window puts it in place, or marks itself stale when it cannot) */
+        ShopLanding land;
+        land.l.applied = applied; land.l.op = m.op;
+        land.l.known = (stage >= 3) ? shopwin::LandingDelta(m.op, m.quantity, before, after, &land.l.delta) : 0;
+        /* F1628 (review 2): an add that met drift first removed a leftover record from this cell - the window keeps that leftover */
+        land.l.drift = (m.op == 0 && stage >= 4 && g_driftLast.occupants != 0) ? 1 : 0;
+        if (m.op == 0)
+        {
+            land.l.type = m.baseSid; land.l.desc = ItMoveDescKey(m); land.l.money = (m.functionKind == kItFuncMoneyEarly) ? 1 : 0;
+            land.rec = m; land.haveRec = 1;
+        }
+        else
+        {
+            if (descBeforeOk != 0)
+            {
+                land.l.type = descBefore.baseSid; land.l.desc = ItMoveDescKey(descBefore);
+                land.l.money = (descBefore.functionKind == kItFuncMoneyEarly) ? 1 : 0;
+            }
+            if (m.op == 2 && applied != 0 && land.l.delta > 0 && ItCellDesc(sec, m.x, m.y, &land.rec) == 1)
+            {
+                land.haveRec = 1;
+                const std::string afterKey = ItMoveDescKey(land.rec);
+                if (land.l.desc.empty())
+                { land.l.type = land.rec.baseSid; land.l.desc = afterKey; land.l.money = (land.rec.functionKind == kItFuncMoneyEarly) ? 1 : 0; }
+                else if (land.l.desc != afterKey) land.haveRec = 0;   /* another item at the cell now (F1628: by the full description): not this change's */
+            }
+        }
         ItBoxRecvLine(m.boxKey, net::PlayerSlotOfKey(peer), applied, why, "move op=" + N((long long)m.op) + " item='" + m.baseSid + "' at " + m.section + " "
-                      + N((long long)m.x) + "," + N((long long)m.y) + " qty=" + N((long long)m.quantity), before, after);
+                      + N((long long)m.x) + "," + N((long long)m.y) + " qty=" + N((long long)m.quantity), before, after, m.boxSeq, m.boxLaunch, &land);
     }
 private:
     ItMoveRecvWatch& operator=(const ItMoveRecvWatch&);
@@ -32990,7 +33520,35 @@ static void ItLateTakePlace(const ItLapsed* lpIn, const ItemConfirmMsg& cf)
 }
 void ItLootNoteConfirm(unsigned int id, int refused, int removed);   /* loot2c part B (defined with the loot code) */
 extern long long g_openTraderNoHome;   /* ItParityOpenDrain (T-207) - defined below */
-int ItShopFacadeRebuild(void* facade);   /* defined below */
+int ItShopFacadeRebuild(void* facade, const char* caller = "?");   /* defined below; T-1451: caller names the site on the [SHOPWIN] lines */
+int ShopWinDumpDue(int trade);                                  /* T-1451: defined with the rebuild - the [SHOPWIN] caps (fold 3: the first 20 trade changes, the first 20 others) */
+void ShopWinDump(void* facade, const char* caller, const char* phase, int ev);   /* T-1451: the window's items, name x,y count (the first 20) */
+/* T-1451 (design A): the after-sale check (a touched counter is asked of its holder only after the holder's change landed here) and its
+   counts: inPlace = sold units added to the open window in place; fallback = the in-place add could not be used, rebuilt; kept = the
+   window left as it was at a settle; rebuilt = every stand-in rebuild (0x951A00); askNow / askLanded = after-sale asks at the settle /
+   at the landing; wait = settles whose counter waited for its landing; ansAlreadyHere = answers not swapped (the live box held them). */
+/* T-1451 design 3 (save numbers, shopwin::WinSeq): this game's arrived / needed numbers per counter and writer, the waiting after-sale
+   asks and the open window's stale mark. ShopSeqStep (the one rebuild, when due - landing 1 queues it for the tick), ShopSeqMark,
+   ShopSeqRefill and ShopSeqCmpWords (the LOG ONLY window-vs-counters compare) are defined with ItOpenShopFacadeFor. g_shopSeqGen: the
+   trade-window open generation last seen (a reopen refills the window). g_shopSeqExcept: the trade settling now (not counted waiting). */
+shopwin::WinSeq g_shopSeq;
+long g_shopSeqGen = 0;
+unsigned int g_shopSeqExcept = 0;
+long long g_shopSeqStaleN[shopwin::kStaleKinds] = { 0, 0, 0, 0, 0 }, g_shopSeqRebuildN[shopwin::kStaleKinds] = { 0, 0, 0, 0, 0 },
+          g_shopSeqAnswers = 0, g_shopSeqAnsLines = 0, g_shopSeqSettledLines = 0, g_boxSeqIn = 0, g_shopSeqGone = 0;
+int ShopSeqStep(int landing, unsigned int exceptId);
+void ShopSeqMark(void* facade, int why, const std::string& what);
+void ShopSeqRefill(void* facade, const char* caller);
+std::string ShopSeqCmpWords(void* facade);
+int ShopSeqWaiting(void* facade, unsigned int exceptId);   /* T-1451 design 3 (review fold): this game's trades on THAT window waiting */
+void ShopSeqAsks(int writer, unsigned int exceptId);         /* the after-sale asks whose number arrived, once no own trade on that writer waits */
+void ShopSeqRebased(const std::string& key, int step);      /* a parity answer re-based that box: its needed numbers are settled */
+long long g_shopSeqLaunchReset = 0, g_shopSeqRefillCleared = 0, g_shopSeqRebasedN = 0;
+/* T-1451 fold 1 (review): a sale's own full description as this game sent it (the holder's ok carries only the basic fields - no uniform,
+   crafter or owner), by request id, for the window's display copy; taken out at the settle (at most one per pending row) */
+std::map<unsigned int, ItemMoveMsg> g_shopSaleDesc;
+long long g_shopWinInPlace = 0, g_shopWinFallback = 0, g_shopWinKept = 0, g_shopWinRebuilt = 0, g_shopAfterAskNow = 0,
+          g_shopAfterAskLanded = 0, g_shopAfterWait = 0, g_parityAnsAlreadyHere = 0;
 void* ItOpenShopFacadeFor(::Inventory* counterInv);   /* defined below (parity3 fold) */
 int ItParityCursorBusy();                           /* defined below (parity3) */
 namespace {   /* the same unnamed namespace, reopened (T-164 B4-4 intercept: the forward declarations above detour_rclickTrade are in it) */
@@ -33895,6 +34453,9 @@ struct ShopPend
     int saveHeld, saveX, saveY;  /* what a game save holds put back (coopshop::kPs*) and where the escrow went */
     ::InventorySection* saveSec;
     ::Inventory* saveInv;
+    int shownTaken;          /* T-1451: a buy - its display copy left the open window at the click (ShopStandInTakePod answered 1) */
+    long long winRebuiltAt;  /* T-1451 fold 2 (review): g_shopWinRebuilt at the send - a rebuild since re-laid the window from the counters */
+    long winOpenGen;         /* T-1451 fold 1 (re-check): g_twOpenGen at the send - the game's own trade-window open since refilled the window */
 };
 const int kShopPendCap = 16;
 ShopPend g_shopPend[kShopPendCap];
@@ -33913,6 +34474,8 @@ struct ShopKept { unsigned int mineUid; void* item; unsigned int lastTry; unsign
 std::vector<ShopKept> g_shopKept;
 /* B4-4 part 1 fold (review MED 6 / 7): the one trade-window stand-in whose rebuild waits for an empty cursor */
 void* g_shopRebuildDefer = 0;
+const char* g_shopRebuildDeferWhy = 0;   /* T-1451 fold 3 (re-check): the waiting rebuild's reason (a string literal) - a trade's stays in the trade cap */
+long long g_shopWinReopened = 0;      /* T-1451 fold 1 (re-check): settles whose window the player reopened since the send - rebuilt, not added to */
 /* B4-4 part 1 fold (review HIGH 2): THE HOLDER'S RECORD OF EACH APPLIED SHOP ROW, so a revoke (the requester's answer to a late ok)
    can undo exactly what was applied. fold 2 (MED 2): kept until the requester ACKS the ok (the shop tail kind 1 on MSG_ITEM_REVOKE) -
    no time expiry, never evicted; at most 64 rows, and a full table refuses NEW shop trades before anything moves (verdict kVBusy,
@@ -34342,12 +34905,18 @@ int ShopFacadeShown(void* facade)
     void* gui = 0;
     return (ItInventoryGuiPod(facade, &gui) != 0 && gui != 0 && ItSameWindow(gui, facade) != 0) ? 1 : 0;
 }
-void ShopRebuildOrDefer(void* facade)
+void ShopRebuildOrDefer(void* facade, const char* caller = "?")
 {
     if (facade == 0) return;
-    if (ItParityCursorBusy() != 0) { ++g_shopRebuildDeferred; g_shopRebuildDefer = facade; return; }
-    if (g_shopRebuildDefer == facade) g_shopRebuildDefer = 0;
-    ItShopFacadeRebuild(facade);
+    if (ItParityCursorBusy() != 0)
+    {   /* T-1451 fold 3 (re-check): the reason waits with it (a trade's kept over another's for the same window) */
+        ++g_shopRebuildDeferred;
+        g_shopRebuildDeferWhy = (g_shopRebuildDefer == facade) ? shopwin::DeferWhy(g_shopRebuildDeferWhy, caller) : caller;
+        g_shopRebuildDefer = facade;
+        return;
+    }
+    if (g_shopRebuildDefer == facade) { g_shopRebuildDefer = 0; g_shopRebuildDeferWhy = 0; }
+    ItShopFacadeRebuild(facade, caller);
 }
 /* MED 7: THE HOLDER'S OWN OPEN SHOP WINDOW after it took / filed units: the stand-in showing any inventory of the stock it wrote is
    rebuilt (T-1 B5: looked up by inventory, so a caravan's packs too - ItOpenShopFacadeFor walks the stand-in's map by inventory). */
@@ -34359,7 +34928,7 @@ void ShopHolderRefresh(const ShopStock& s, const std::vector<std::string>& touch
         void* facade = ItOpenShopFacadeFor((::Inventory*)s.invs[pi]);
         if (facade == 0) continue;
         ++g_shopHoldRefresh;
-        ShopRebuildOrDefer(facade);
+        ShopRebuildOrDefer(facade, "holderRefresh");
         return;   /* one stand-in: one rebuild re-mirrors every piece */
     }
 }
@@ -34428,19 +34997,168 @@ std::string ShopPendWords(const ShopPend& p)
     return std::string(p.dir == 0 ? "BUY" : "SELL") + " id=" + N((long long)p.id) + " item=" + std::string(p.sid) + " n=" + N((long long)p.n)
            + " unit=" + N((long long)p.unitPrice) + " price=" + N((long long)p.price) + " " + ShopStockWords(p.stock, std::string(p.homeKey), p.keeperUid);
 }
-/* The window re-mirrors its pieces (only when the open trade window is still this shop's), and every piece the holder wrote is
-   asked again (ItParityAskOne), so the non-holder's stock is the holder's answer. */
-void ShopRefreshWindow(const ShopPend& p, const std::vector<std::string>* pieces)
+int ShopWindowAddInPlace(void* facade, const ItemMoveMsg& desc, ::Character* mine, int units, const char* caller);   /* T-1451: defined below (after the guard) */
+/* T-1451 F1624: an outside landing (another player's, an NPC's) put into the open window in place, or the window marked stale with the
+   reason; the descriptions of set-aside adds kept for their answer. Defined with ShopAfterSaleLanded. */
+int ShopOutsideApply(void* facade, const std::string& key, int writer, unsigned int seq, const shopwin::SeqLanding& l, const ItemMoveMsg* rec, int staleWhy,
+                     const char* road);
+const ItemMoveMsg* ShopOutsideRecOf(unsigned int id);
+/* F1628 (review 4) -> T-1451 F1642: the landings put into the open window in place as another player's - at a trade's lapse (by its id),
+   at another trade's answer or as they landed - kept (shopwin::ShownNote, the last 64), so the settle of the trade a landing really was
+   adds only the units its answer does not name as already shown (shopwin::TradeShownUnits). Cleared at the world's teardown. */
+std::vector<shopwin::ShownRec> g_shopShown;
+long long g_shopLapseShownUnits = 0, g_shopLapseShownLines = 0;
+long long g_shopSeqNumberless = 0, g_shopSeqUnsure = 0, g_shopSeqNumberlessLines = 0;   /* F1642: answers naming a counter with no number; landings left unjudged */
+long long g_shopSeqBlind = 0, g_shopSeqBlindLines = 0;   /* F1662 (S2): ok answers naming no counters for a trade on the open window */
+void ShopOutsideRecPurge();
+/* T-1451 (design A; was: the window rebuilt at every settle and every touched piece re-asked at once, with the digest from before the
+   holder's change had landed - F1573). The open trade window, when it is still this shop's, changes only by the trade itself
+   (shopwin::SettleWindowAct): a sale's sold units go in IN PLACE (ShopWindowAddInPlace - the window's own add, as single player's sale;
+   the rebuild only when that cannot be used); an ok buy's units left the window at the click; a refused or short buy (its display copy
+   gone at the click) and a caravan's window are rebuilt from the counters, as before (MED 6: never under a cursor item). Every piece
+   the holder wrote is asked of it only once the holder's change has LANDED here (design 3 save numbers / ShopAfterSaleLanded - an event,
+   never a timer), so the ask carries the after-sale digest and the holder answers equal unless the boxes really differ. */
+/* T-1451 design 3: trades of this game asked of `writer` still waiting for their answer (a home shop's - a caravan's are not numbered) */
+int ShopSeqOwnWaiting(int writer, unsigned int exceptId)
+{
+    int n = 0;
+    for (int i = 0; i < kShopPendCap; ++i)
+        if (g_shopPend[i].used != 0 && g_shopPend[i].id != exceptId && g_shopPend[i].askedSlot == writer && g_shopPend[i].stock != coopshop::kStockCaravan) ++n;
+    return n;
+}
+void ShopRefreshWindow(const ShopPend& p, const ItemConfirmMsg* cf, int ok, ::Character* mine, int forcedRefusal)
 {
     void* side = 0;
+    int same = 0;
     if (ItTradeWindowSide(&side) == 1 && side != 0 && (side == p.shopTrader || side == p.keeper))
     {
         void* nowInv = 0;
-        if (ItPtrPod(p.shopTrader, kShopTraderInv, &nowInv) != 0 && nowInv == p.shopInv) ShopRebuildOrDefer(p.shopInv);   /* MED 6: not under a cursor item */
+        if (ItPtrPod(p.shopTrader, kShopTraderInv, &nowInv) != 0 && nowInv == p.shopInv) same = 1;
     }
+    const int caravan = (p.stock == coopshop::kStockCaravan) ? 1 : 0;
+    const int units = (cf != 0) ? (int)cf->shop.n : 0;
+    const int rebuiltSince = (g_shopWinRebuilt != p.winRebuiltAt) ? 1 : 0;   /* fold 2 (review): the window was re-laid from the counters meanwhile */
+    /* re-check fold 1: the game's own trade-window open ran since the send (the player closed and reopened it) - the game refilled the
+       stand-in from the counters itself, so it is treated as rebuiltSince (the open generation, recorded by detour_showTraderInventory) */
+    const int reopened = shopwin::WindowReopened(p.winOpenGen, (long)::InterlockedCompareExchange(&g_twOpenGen, 0, 0));
+    if (reopened != 0 && ++g_shopWinReopened <= 20)
+        DebugLog("[SHOP] window reopened since the send (" + ShopPendWords(p) + "): the game refilled it from the counters - rebuilt, not added to"
+                 " (reopened=" + N(g_shopWinReopened) + ")");
+    const int act = shopwin::SettleWindowAct(same, caravan, p.dir, ok, units, p.n, p.shownTaken, rebuiltSince, forcedRefusal, reopened);
+    g_shopSeqExcept = p.id;   /* design 3: this trade is settling - a refill now does not count it as waiting */
+    /* T-1451 design 3 (review fold): the answer's ranges per counter - the own range (before, after] it still needs (an ok), the asks
+       (held while another own trade on that writer waits), and the landings set aside while this trade waited, judged against them */
+    std::string seqWords;
+    long long lapseShown = 0;   /* F1628 (review 4) / F1642: units of this trade's own landing already put in place (at its lapse or any road) */
+    if (caravan == 0)
+    {
+        const int others = ShopSeqOwnWaiting(p.askedSlot, p.id);
+        std::map<std::string, std::pair<unsigned int, unsigned int> > named;
+        /* F1642: the counters an ok answer names with NO number (the numberless form, or a road that still lacks them) */
+        std::set<std::string> unnumbered = (cf != 0) ? shopwin::SeqUnnumbered(cf->shop.pieces, cf->shop.seqs, ok) : std::set<std::string>();
+        /* F1662 (S2): an ok answer naming NO counters for a trade on the open window - the whole window cannot tell (one rebuild) */
+        const int blind = (cf != 0) ? shopwin::SeqAnswerBlind(same, caravan, ok, cf->shop.has, cf->shop.pieces.size()) : 0;
+        if (blind != 0) unnumbered = shopwin::SeqBlindCounters(g_shopSeq, g_shopShown);
+        if (cf != 0)
+            for (size_t i = 0; i < cf->shop.pieces.size(); ++i)
+            {
+                const std::string& key = cf->shop.pieces[i];
+                const unsigned int after = (i < cf->shop.seqs.size()) ? cf->shop.seqs[i] : 0u;
+                const unsigned int before = (i < cf->shop.seqsFrom.size()) ? cf->shop.seqsFrom[i] : 0u;
+                const unsigned int had = shopwin::SeqArrivedOf(g_shopSeq, key, p.askedSlot);
+                if (after != 0u) named[key] = std::make_pair(before, after);
+                shopwin::SeqAnswer(&g_shopSeq, key, p.askedSlot, before, after, ok);
+                if (shopwin::SeqAskAtSettle(&g_shopSeq, key, p.askedSlot, after, others) != 0) { ++g_shopAfterAskNow; ItParityAskOne(key); }
+                else ++g_shopAfterWait;
+                seqWords += " " + key + "#" + N((long long)before) + ".." + N((long long)after) + "/" + N((long long)had);
+            }
+        std::vector<shopwin::SeqAside> outs, unsure;
+        const int notOurs = shopwin::SeqJudgeAside(&g_shopSeq, p.askedSlot, named, ShopSeqWaiting(p.shopInv, p.id), &outs, &unnumbered, &unsure);
+        /* F1624: each landing set aside that is not this trade's own goes into the window IN PLACE (stale only when it cannot) */
+        if (notOurs != 0 && same != 0)
+            for (size_t i = 0; i < outs.size(); ++i)
+            {
+                const int shown = ShopOutsideApply(p.shopInv, outs[i].key, outs[i].writer, outs[i].seq, outs[i].land, ShopOutsideRecOf(outs[i].land.rec),
+                                                   shopwin::kStaleLater, (cf == 0) ? "lapse" : "answer");
+                /* F1628 (review 4) / F1642: every landing put in place as another's is kept (at a lapse by this trade's id) - the settle of
+                   the trade it really was never adds it twice */
+                if (shown != 0) shopwin::ShownNote(&g_shopShown, outs[i], (cf == 0) ? p.id : 0u);
+            }
+        ShopOutsideRecPurge();
+        int shownRebuild = 0;
+        if (cf != 0) lapseShown = shopwin::TradeShownUnits(&g_shopShown, p.id, p.askedSlot, named, unnumbered, &shownRebuild);
+        /* F1642: an answer naming a counter with no number cannot tell its own landings (set aside, or still on their way) from another
+           player's - none is put in place as another's; the window is rebuilt once from the counters when due */
+        if (blind != 0)
+        {
+            ++g_shopSeqBlind;
+            if (++g_shopSeqBlindLines <= 20)
+                DebugLog("[SHOP] seq answer " + ShopPendWords(p) + " ok=1 names NO counters (a home shop's trade on the open window): the whole window"
+                         " cannot tell - " + N((long long)unsure.size()) + " landing(s) set aside left unjudged (never shown as another's), the window is"
+                         " rebuilt once when due (blindAnswer=" + N(g_shopSeqBlind) + ")");
+        }
+        if (cf != 0 && (!unnumbered.empty() || shownRebuild != 0 || blind != 0))
+        {
+            ++g_shopSeqNumberless; g_shopSeqUnsure += (long long)unsure.size();
+            if (++g_shopSeqNumberlessLines <= 20)
+                DebugLog("[SHOP] seq answer " + ShopPendWords(p) + " names " + N((long long)unnumbered.size()) + " counter(s) with no number"
+                         + (shownRebuild != 0 ? std::string(" or its own landing was shown before") : std::string()) + ": " + N((long long)unsure.size())
+                         + " landing(s) set aside left unjudged (never shown as another's) - "
+                         + (same != 0 ? std::string("the window is rebuilt once when due") : std::string("not the open window"))
+                         + " (numberless=" + N(g_shopSeqNumberless) + " unsure=" + N(g_shopSeqUnsure) + ")");
+            if (same != 0) ShopSeqMark(p.shopInv, shopwin::kStaleSettle, "settleNumberless " + ShopPendWords(p));
+        }
+    }
+    std::map<unsigned int, ItemMoveMsg>::iterator sd = g_shopSaleDesc.find(p.id);
+    if (act == shopwin::kWinAddInPlace)
+    {
+        ItemMoveMsg desc;
+        if (sd != g_shopSaleDesc.end()) desc = sd->second;
+        else
+        {   /* no description kept (a late ok of a lapsed row): the holder's basic fields */
+            desc.baseSid = cf->baseSid; desc.companySid = cf->companySid; desc.materialSid = cf->materialSid; desc.colorSid = cf->colorSid;
+            desc.quality = cf->quality; desc.charges = cf->charges; desc.functionKind = cf->functionKind; desc.level = cf->level; desc.unique = cf->unique;
+            desc.owner = cf->owner; desc.gear = cf->gear;
+        }
+        /* F1628 (review 4) / F1642: the settle adds only the units its answer does not name as already put in place (a lapse, an earlier answer, a landing) */
+        const long long addN = (long long)units - lapseShown;
+        if (lapseShown > 0)
+        {
+            g_shopLapseShownUnits += lapseShown;
+            if (++g_shopLapseShownLines <= 20)
+                DebugLog("[SHOP] settle " + ShopPendWords(p) + ": " + N(lapseShown) + " of its " + N((long long)units) + " unit(s) were put in place already"
+                         " (its own landing, named by this answer) - " + (addN > 0 ? "adds the other " + N(addN) : std::string("adds nothing")) + " (lapseShown="
+                         + N(g_shopLapseShownUnits) + ")");
+        }
+        if (addN <= 0) ++g_shopWinKept;
+        else if (ShopWindowAddInPlace(p.shopInv, desc, mine, (int)addN, "settle") == 1) ++g_shopWinInPlace;
+        else { ++g_shopWinFallback; ShopSeqMark(p.shopInv, shopwin::kStaleSettle, "settleFallback " + ShopPendWords(p)); }   /* design 3: rebuilt once, when due (ShopSeqStep below) */
+    }
+    else if (act == shopwin::kWinRebuild)
+    {
+        const char* const why = (caravan != 0) ? "settleCaravan" : (forcedRefusal != 0) ? "settleSaveHold"
+                                : (rebuiltSince != 0) ? "settleRebuiltSince" : (reopened != 0) ? "settleReopened" : "settleBuyBack";
+        if (caravan != 0) ShopRebuildOrDefer(p.shopInv, why);   /* a caravan's packs are not numbered: rebuilt now, as before */
+        else ShopSeqMark(p.shopInv, shopwin::kStaleSettle, std::string(why) + " " + ShopPendWords(p));   /* design 3: rebuilt once, when nothing of it is on its way */
+    }
+    else ++g_shopWinKept;
+    /* fold 2 (re-check): the kept sale description is dropped by ShopSettle (kept while a lapsed row waits for a late ok) */
     /* T-1 B5: a caravan's touched names are its packs, not box keys - nothing to ask; its window follows the holder's published pack
        moves as they land (ShopCaravanMoveApplied) */
-    if (pieces != 0 && p.stock != coopshop::kStockCaravan) for (size_t i = 0; i < pieces->size(); ++i) ItParityAskOne((*pieces)[i]);
+    /* T-1451 design 3: one line per answer - named vs arrived per counter, and the window against its counters (LOG ONLY) */
+    if (cf != 0 && caravan == 0)
+    {
+        ++g_shopSeqAnswers;
+        if (++g_shopSeqAnsLines <= 40)
+            DebugLog("[SHOP] seq answer " + ShopPendWords(p) + " ok=" + N((long long)ok) + " writer=slot" + N((long long)p.askedSlot) + " act=" + N((long long)act)
+                     + " counters[key#before..after/arrived]=" + seqWords + " stale=" + N((long long)g_shopSeq.stale) + " neededLeft=" + N((long long)g_shopSeq.needed.size())
+                     + " - " + (same != 0 ? ShopSeqCmpWords(p.shopInv) : std::string("not the open window")) + " (LOG ONLY; answers=" + N(g_shopSeqAnswers) + ")");
+    }
+    /* a reopen this settle saw is accounted for (reopened -> marked above), not a second refill at the next tick */
+    g_shopSeqGen = (long)::InterlockedCompareExchange(&g_twOpenGen, 0, 0);
+    if (caravan == 0) ShopSeqStep(0, p.id);   /* design 3: the one rebuild, when the window is stale and nothing of it is on its way */
+    if (caravan == 0) ShopSeqAsks(p.askedSlot, p.id);   /* review fold (S3): asks held while this trade waited */
+    g_shopSeqExcept = 0;
 }
 /* THE REQUESTER'S SETTLEMENT (coopshop::Settle). ok 1 = the holder applied it; cf the holder's answer (0 on a lapse / send failure). */
 /* fold 2 (LOW 11): returns 1 when a give-back (the buy's refund / the sale's escrow back) FAILED - the lapse keeps that, and the
@@ -34448,9 +35166,11 @@ void ShopRefreshWindow(const ShopPend& p, const std::vector<std::string>* pieces
 int ShopPendSaveTakeOut(ShopPend* p);   /* a save hold taken out first (below) */
 int ShopSettle(ShopPend* p, int ok, const ItemConfirmMsg* cf, const char* why, int lapsed = 0)   /* T-447 fold 2: lapsed 1 = settled with no answer (ShopPendLapse), whose row is kept (g_shopLapsedRow) */
 {
+    int forcedRefusal = 0;   /* T-1451 fold 2 (review): the holder applied it but this game settles it as a refusal - the window shows the holder's result */
     if (p->saveHeld != coopshop::kPsNone && ShopPendSaveTakeOut(p) == 0 && ok != 0)
     {   /* a save hold that could not be taken out: the give-back is in place - settled as a refusal, never a free item or a second payment */
         ok = 0;
+        forcedRefusal = 1;
         ErrorLog("[SHOP] " + ShopPendWords(*p) + ": an ok settled as a refusal - its save hold could not be taken out. Counted shopCancel3 saveLost.");
     }
     const int act = coopshop::Settle(p->dir, ok, p->held);
@@ -34616,7 +35336,10 @@ int ShopSettle(ShopPend* p, int ok, const ItemConfirmMsg* cf, const char* why, i
                      + ". Counted shopCf escrowLost.");
         }
     }
-    ShopRefreshWindow(*p, (cf != 0) ? &cf->shop.pieces : 0);
+    ShopRefreshWindow(*p, cf, ok, mine, forcedRefusal);   /* T-1451: the trade itself into the open window; the after-sale check */
+    /* T-1451 fold 2 (re-check): the kept sale description goes with the settle - except a lapse whose give-back failed, whose row is kept
+       for a late ok (g_shopLapsedRow): it stays with that row and goes when the row goes (ShopPendConfirm's late road, the slot reused) */
+    if (shopwin::SaleDescStays(lapsed, gbf) == 0) g_shopSaleDesc.erase(p->id);
     DebugLog("[SHOP] " + std::string(ok != 0 ? "confirm ok " : "confirm refused ") + ShopPendWords(*p)
              + (cf != 0 ? " verdict=" + N((long long)cf->shop.verdict) + " show=" + N((long long)cf->shop.show) + " pieces=" + N((long long)cf->shop.pieces.size()) : std::string())
              + " settled:" + (did.empty() ? std::string(" nothing") : did) + " (" + std::string(why) + ")");
@@ -34704,6 +35427,7 @@ void ShopPendLapseNow(ShopPend* p, const char* why, int site)
     const ShopCancelInfo info = ShopCancelInfoOf(p);   /* what a cancel of it names, should a late ok come */
     ++g_shopCfLapsed;
     const int slot = g_shopLapsedAt & 15;
+    if (g_shopLapsedIds[slot] != 0) g_shopSaleDesc.erase(g_shopLapsedIds[slot]);   /* T-1451 fold 2 (re-check): the overwritten kept row's description goes with it */
     g_shopLapsedIds[slot] = p->id; ++g_shopLapsedAt;
     DebugLog("[SHOP] lapsed " + ShopPendWords(*p) + " - " + std::string(why) + ": settled as a refusal");
     const int caravan = (p->stock == coopshop::kStockCaravan) ? 1 : 0;
@@ -34766,6 +35490,21 @@ long long g_shopAppliedResent = 0, g_shopAppliedResendFailed = 0;
    linked peer and the link is up, else by the world road while it is in the world. A record filed under a raw session key (its
    slot was never known) is sent only while the session link is up. MAIN THREAD. */
 long long g_shopAppliedResendNoRoad = 0;
+/* F1643 (review SHOULD 2): one record's confirm by its road (the body of ShopAppliedResend) */
+void ShopAppliedResendOne(const ShopApplied& s)
+{
+    ItemConfirmMsg again = s.cf;
+    if (coopshop::AskerIsSlot(s.peerSlot) != 0) again.toKey = cooplive::RelayPeerId(s.peerSlot);
+    else if (!net::SessionLinked()) { ++g_shopAppliedResendNoRoad; return; }
+    if (ItSendConfirm(again)) ++g_shopAppliedResent; else ++g_shopAppliedResendFailed;
+}
+/* F1643: the original answer to {peerSlot, epoch, id} left its box-move wait numbered after a reconnect re-send was skipped for it - the
+   record's confirm goes now by the record's road (the asker lapsed at the drop and no longer asks again). MAIN THREAD. */
+void ShopAppliedResendKey(unsigned int peerSlot, unsigned int epoch, unsigned int id)
+{
+    for (size_t i = 0; i < g_shopApplied.size(); ++i)
+        if (g_shopApplied[i].id == id && g_shopApplied[i].epoch == epoch && g_shopApplied[i].peerSlot == peerSlot) ShopAppliedResendOne(g_shopApplied[i]);
+}
 void ShopAppliedResend(int slot)
 {
     for (size_t i = 0; i < g_shopApplied.size(); ++i)
@@ -34773,6 +35512,8 @@ void ShopAppliedResend(int slot)
         const ShopApplied& s = g_shopApplied[i];
         if (s.stock == coopshop::kStockNpcBuy) continue;   /* an NPC purchase's record keeps no confirm */
         if (slot >= 0 && s.peerSlot != (unsigned int)slot) continue;
+        /* F1642: the original goes first, numbered; F1643: marked, so the drain re-sends this record by its road when it goes */
+        if (coopshop::RepeatSendNow(ShopCfWaiting(s.peerSlot, s.epoch, s.id, 1)) == 0) { ++g_shopResendHeld; continue; }
         ItemConfirmMsg again = s.cf;
         if (coopshop::AskerIsSlot(s.peerSlot) != 0) again.toKey = cooplive::RelayPeerId(s.peerSlot);
         else if (!net::SessionLinked()) { ++g_shopAppliedResendNoRoad; continue; }
@@ -34868,6 +35609,7 @@ int ShopPendSettleElsewhere(ShopPend* p, const char* why)
    asker. A holder applied it - the row settles as the trade from the entry (nothing moves in the shop); no entry - a cancelled marker
    is written, and the row is decided again each second until the record the world server stored carries it (then refused); refused
    for good - the lapse settles it as a refusal; not answerable now - kept pending. Always 1. MAIN THREAD. */
+std::vector<std::string> ShopRecordPieces(int stockKind, const std::vector<std::string>* keys);   /* below, same unnamed namespace (C2668) */
 int ShopPendSettleLocal(ShopPend* p, const char* why)
 {
     const ItemRequestMsg& rq = g_shopPendReq[p - g_shopPend];
@@ -34892,9 +35634,13 @@ int ShopPendSettleLocal(ShopPend* p, const char* why)
         cf.baseSid = rq.baseSid; cf.companySid = rq.companySid; cf.materialSid = rq.materialSid; cf.colorSid = rq.colorSid;
         cf.quality = rq.quality; cf.charges = rq.charges; cf.functionKind = rq.functionKind; cf.level = rq.level; cf.unique = rq.unique;
         cf.owner = rq.owner; cf.gear = rq.gear;
+        /* F1662 (S1): the home's counters with no numbers (numberless, as ShopAnswerFromRecord) - the old holder's landing of this trade,
+           set aside while it waited, is left unjudged (one rebuild), never shown as another player's and added again at the settle */
+        cf.shop.pieces = ShopRecordPieces(p->stock, (found != 0) ? &stock.keys : 0);
         const ShopCancelInfo info = ShopCancelInfoOf(p);
         const unsigned int id = p->id;
-        DebugLog(head + " and its record has it applied (n=" + N((long long)o.n) + " move=" + N((long long)o.move) + ") - settled as the trade");
+        DebugLog(head + " and its record has it applied (n=" + N((long long)o.n) + " move=" + N((long long)o.move) + ") - settled as the trade (names "
+                 + N((long long)cf.shop.pieces.size()) + " counter(s) with no numbers)");
         ShopSettle(p, 1, &cf, "a holder applied it (this game's own record, as the holder of the shop's area)");
         ShopDoneNote(id, 1, &info);
         if (!net::ItemAskedGameGone(id)) ShopSendAck(id);   /* the game asked, still reachable, drops its applied row */
@@ -35149,8 +35895,20 @@ void ShopPendExpire()
     if (g_shopRebuildDefer != 0 && ItParityCursorBusy() == 0)
     {
         void* f = g_shopRebuildDefer;
-        g_shopRebuildDefer = 0;
-        if (ShopFacadeShown(f) != 0) { ++g_shopRebuildLate; ItShopFacadeRebuild(f); } else ++g_shopRebuildDropped;
+        const std::string dc = shopwin::DeferredCaller(g_shopRebuildDeferWhy);   /* T-1451 fold 3 (re-check): "deferred:<its reason>" - a trade's stays in the trade cap */
+        g_shopRebuildDefer = 0; g_shopRebuildDeferWhy = 0;
+        if (ShopFacadeShown(f) != 0) { ++g_shopRebuildLate; ItShopFacadeRebuild(f, dc.c_str()); } else ++g_shopRebuildDropped;
+    }
+    /* T-1451 design 3: the game's own trade-window open since the last look refilled the window (a reopen) - stale if anything of it is
+       on its way; then a closed window clears the needed numbers and the mark */
+    {
+        const long gen = (long)::InterlockedCompareExchange(&g_twOpenGen, 0, 0);
+        if (gen != g_shopSeqGen) { g_shopSeqGen = gen; void* const f = ItShopFacadeInventory(); if (f != 0) ShopSeqRefill(f, "reopen"); }
+        if (g_shopSeq.stale != 0 || !g_shopSeq.needed.empty() || !g_shopSeq.aside.empty())
+        {
+            void* const f = ItShopFacadeInventory();
+            if (f == 0 || ShopFacadeShown(f) == 0) { shopwin::SeqWindowGone(&g_shopSeq); ShopOutsideRecPurge(); ++g_shopSeqGone; }   /* F1628: its kept add records go too */
+        }
     }
     /* HIGH 1 fold: the kept buys into the pack, once a second each */
     for (size_t i = 0; i < g_shopKept.size() && StoreTearingDown() == 0; )
@@ -35278,6 +36036,7 @@ int ShopPendConfirm(const ItemConfirmMsg& cf)
                                  " games are one trade apart. Counted shopLate revokeUnsent.");
                     }
                 }
+                g_shopSaleDesc.erase(cf.id);   /* T-1451 fold 2 (re-check): the kept lapsed row is done - its sale description goes */
                 return 1;
             }
         int doneOk = 0;
@@ -35439,7 +36198,7 @@ int ShopSendTrade(const ShopSendArgs& a, int* mark)
         if (res != coopshop::kResOk) { ++g_shopIcUnreadable; return coopshop::kTrQuiet; }
         p->held = 1;
         if (a.sound != 0) ShopSoundPod(a.soundGui, "Sell_Item", a.item);   /* the original's money-trade sound */
-        ShopStandInTakePod(a.srcInv, a.item, (a.n >= a.q) ? -1 : a.n);   /* the window only; `item` is not used after this */
+        p->shownTaken = (ShopStandInTakePod(a.srcInv, a.item, (a.n >= a.q) ? -1 : a.n) == 1) ? 1 : 0;   /* the window only; `item` is not used after this */
         rq.dir = 0; rq.trade = 1; rq.baseSid = a.sid;
         rq.companySid = be.companySid; rq.materialSid = be.materialSid; rq.colorSid = be.colorSid;   /* MED 4 fold (protocol 93) */
         rq.quality = be.quality; rq.charges = be.charges; rq.functionKind = be.functionKind; rq.level = be.level; rq.unique = be.unique;
@@ -35474,6 +36233,16 @@ int ShopSendTrade(const ShopSendArgs& a, int* mark)
     /* T-1 B5: a caravan's request goes to the game that runs its keeper (the character road, M7b slice 2 - SendItemRequest's owner
        uid), not to a home key's holder; its shop block names the stock kind and no home */
     rq.id = p->id; rq.ownerUid = (a.caravan != 0) ? a.keeperUid : 0; rq.ownerBoxKey = (a.caravan != 0) ? "" : a.hk;
+    p->winOpenGen = (long)::InterlockedCompareExchange(&g_twOpenGen, 0, 0);   /* T-1451 fold 1 (re-check): the trade window's open generation at the send */
+    p->winRebuiltAt = g_shopWinRebuilt;   /* T-1451 fold 2 (review): the window's rebuild count at the send */
+    if (a.dir != 0)
+    {   /* T-1451 fold 1 (review): the sold item's full description, for the window copy at the settle (a full table drops its oldest id) */
+        ItemMoveMsg d;
+        d.baseSid = rq.baseSid; d.companySid = rq.companySid; d.materialSid = rq.materialSid; d.colorSid = rq.colorSid;
+        d.quality = rq.quality; d.charges = rq.charges; d.functionKind = rq.functionKind; d.level = rq.level; d.unique = rq.unique;
+        d.owner = rq.owner; d.gear = rq.gear;
+        shopwin::SaleDescKeep(&g_shopSaleDesc, p->id, d);   /* fold 2 (re-check): at most shopwin::kSaleDescCap (64) */
+    }
     rq.quantity = a.n; rq.takerUid = a.mineUid; rq.price = a.price;
     rq.shop.has = 1; rq.shop.keeperUid = a.keeperUid; rq.shop.homeKey = (a.caravan != 0) ? "" : a.hk; rq.shop.sid = a.sid; rq.shop.n = a.n;
     rq.shop.unitPrice = a.unit; rq.shop.entry = a.entry; rq.shop.stock = p->stock;
@@ -35664,6 +36433,134 @@ void ShopGuardLeave(const ShopGuardSave* sv)
     __try { if (*upd != 1) ++g_shopGuardLost; *upd = sv->upd; }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
     ::InterlockedExchange(&g_itApplyingThread, sv->apply);
+}
+/* T-1451 (design A (1)): THE SOLD UNITS INTO THE OPEN SHOP WINDOW IN PLACE. Single player's sale adds the sold item to the window's
+   first free spot or merges it onto a matching stack, and only mirrors a copy onto a counter (0x951DA0 -> 0x951B10) - no refresh, no
+   arrange. Here the counter has the holder's change already (its box change), so only the window's display copy is added: made from
+   the holder's description of the sold item (cf) with the units it took, and added through the window's own add (Inventory::tryAddItem
+   - ItAddAnywhereCount) under the guard: Updating set, so the stand-in's add callback 0x951DA0 mirrors nothing onto the counters, and
+   the applying-thread mark, so the item hooks ring nothing. No clear, no re-add: every other item keeps its place. 1 = every unit in;
+   0 = not (an item on the cursor, no copy made, the add refused or faulted, no Updating row) - the caller rebuilds as before. A copy the
+   add did not take whole is destroyed (it is this function's own display object). MAIN THREAD. */
+long long g_shopWinInPlaceLines = 0;
+/* T-1451 F1624 (3): THE WINDOW'S EVERY CELL - item, type, x,y, units - read from its section map (no cap: the [SHOPWIN] dump names only
+   the first 20 in add order), and the cells two reads differ in: '+' new, '-' gone, a units change, and MOVED (the same item at another
+   cell - none expected from an in-place change). Read only. */
+struct ShopWinCell { void* item; std::string type; std::string desc; int x, y; long long q; };   /* F1628: desc = the full description (DescKey) */
+const size_t kShopWinCellCap = 4096;
+/* F1628 (review NIT): one section's cells (item, x, y) copied under the crash guard ItSecHoldsSidPod walks a section with (no
+   std::string here - C2712). 1 read, 0 not. MAIN THREAD (the static copy). */
+struct ShopWinCellPod { void* item; int x, y; };
+static ShopWinCellPod s_shopWinPod[kShopWinCellCap];
+int ShopSecCellsPod(void* secv, size_t cap, size_t* n)
+{
+    *n = 0;
+    if (secv == 0) return 0;
+    __try
+    {
+        ::InventorySection* sec = (::InventorySection*)secv;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        const size_t c = si.size();
+        if (c > 4096) return 0;
+        for (size_t k = 0; k < c && *n < cap; ++k)
+        {
+            s_shopWinPod[*n].item = (void*)si[k].item; s_shopWinPod[*n].x = si[k].x; s_shopWinPod[*n].y = si[k].y;
+            ++*n;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *n = 0; return 0; }
+    return 1;
+}
+int ShopWinCells(void* facade, std::vector<ShopWinCell>* out)
+{
+    out->clear();
+    if (!ItObj(facade)) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)facade + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) return 0;
+        size_t n = 0;
+        if (ShopSecCellsPod(sec, kShopWinCellCap - out->size(), &n) == 0) return 0;
+        for (size_t k = 0; k < n; ++k)
+        {
+            ShopWinCell c;
+            c.item = s_shopWinPod[k].item; c.x = s_shopWinPod[k].x; c.y = s_shopWinPod[k].y; c.q = -1;
+            int q = -1;
+            ItEntry e;
+            ItClear(&e);
+            if (ItPlaus(c.item) && ItReadFields(c.item, &e) == 1) { c.type = e.baseSid; c.desc = ItEntryDescKey(e); }
+            if (ItPlaus(c.item) && ItIntPod(c.item, kItemQuantity, &q) != 0) c.q = q;
+            out->push_back(c);
+        }
+        if (out->size() >= kShopWinCellCap) break;
+    }
+    return 1;
+}
+std::string ShopWinCellDiff(const std::vector<ShopWinCell>& a, const std::vector<ShopWinCell>& b)
+{
+    std::string s;
+    int moved = 0, changed = 0;
+    for (size_t i = 0; i < b.size(); ++i)
+    {
+        size_t j = 0;
+        while (j < a.size() && a[j].item != b[i].item) ++j;
+        if (j == a.size()) { s += " +" + b[i].type + "@" + N((long long)b[i].x) + "," + N((long long)b[i].y) + "x" + N(b[i].q); ++changed; continue; }
+        if (a[j].x != b[i].x || a[j].y != b[i].y)
+        { s += " MOVED " + b[i].type + " " + N((long long)a[j].x) + "," + N((long long)a[j].y) + "->" + N((long long)b[i].x) + "," + N((long long)b[i].y); ++moved; }
+        if (a[j].q != b[i].q) { s += " " + b[i].type + "@" + N((long long)b[i].x) + "," + N((long long)b[i].y) + "x" + N(a[j].q) + "->" + N(b[i].q); ++changed; }
+    }
+    for (size_t j = 0; j < a.size(); ++j)
+    {
+        size_t i = 0;
+        while (i < b.size() && b[i].item != a[j].item) ++i;
+        if (i == b.size()) { s += " -" + a[j].type + "@" + N((long long)a[j].x) + "," + N((long long)a[j].y) + "x" + N(a[j].q); ++changed; }
+    }
+    return (s.empty() ? std::string(" none") : s) + " (changed=" + N((long long)changed) + " moved=" + N((long long)moved) + " of " + N((long long)b.size()) + " cells)";
+}
+int ShopWindowAddInPlace(void* facade, const ItemMoveMsg& desc, ::Character* mine, int units, const char* caller)
+{
+    if (facade == 0 || units < 1) return 0;
+    const int busy = ItParityCursorBusy();
+    ::Item* copy = 0;
+    if (busy == 0)
+    {
+        ItemMoveMsg mm = desc;   /* fold 1 (review): the sale's own description - uniform, crafter and owner included */
+        mm.quantity = units;
+        copy = ItCreateItem(mine, mm, 1);
+    }
+    const int ev = (copy != 0) ? ShopWinDumpDue(1) : 0;
+    if (ev != 0) ShopWinDump(facade, caller, "before in-place add", ev);
+    std::vector<ShopWinCell> cellsBefore;   /* F1624: the window's every cell, to name the cells the add changed (and any other that moved) */
+    if (copy != 0) ShopWinCells(facade, &cellsBefore);
+    int added = 0, took = 0, guarded = 0;
+    if (copy != 0)
+    {
+        ShopGuardSave sv;
+        if (ShopGuardEnter(&sv) != 0)
+        {
+            guarded = 1;
+            added = ItAddAnywhereCount((::Inventory*)facade, (void*)copy, &took);
+            ShopGuardLeave(&sv);
+        }
+        if (added == 0 || added == -2)
+            ItDestroyPod((void*)copy, "coop T-1451: a sold item's display copy the shop window's add did not take whole (the window is rebuilt)");
+    }
+    if (ev != 0) ShopWinDump(facade, caller, (added == 1) ? "after in-place add" : "after in-place add NOT TAKEN", ev);
+    const int ok = shopwin::InPlaceOk(busy, (copy != 0) ? 1 : 0, added);
+    if (g_shopWinInPlaceLines < 40)
+    {
+        ++g_shopWinInPlaceLines;
+        std::string cells;
+        if (copy != 0) { std::vector<ShopWinCell> cellsAfter; ShopWinCells(facade, &cellsAfter); cells = " cells:" + ShopWinCellDiff(cellsBefore, cellsAfter); }
+        DebugLog("[SHOP] window in place (" + std::string(caller != 0 ? caller : "?") + "): " + std::string(desc.baseSid) + " n=" + N((long long)units) + cells
+                 + (ok != 0 ? std::string(" added to the open window by its own add - no rebuild")
+                            : std::string(" NOT added in place (") + (busy != 0 ? "an item is on the cursor" : copy == 0 ? "no copy made"
+                              : guarded == 0 ? "no Updating row" : "the add answered " + N((long long)added) + " placed=" + N((long long)took))
+                              + ") - the window is rebuilt as before"));
+    }
+    return ok;
 }
 char ShopGuardedPickup(void* gui, void* sectionStr)
 {
@@ -35888,8 +36785,149 @@ char ShopGuardedPlace(void* gui, void* sectionStr, void* point)
     ShopDragTrackCursor();
     return r;
 }
+/* T-1451 F1624: OUTSIDE CHANGES IN PLACE. A landing on a counter of the open window that is not this game's own (another player's sale,
+   an NPC's buy, the holder's own move) is put into the window IN PLACE from what it changed - an add through the window's own add with
+   the landing's record, a remove as that many units taken from a window stack of the same item type (the window merges every counter:
+   the counter's cell number means nothing there), a count change as its difference. The window is marked stale (one rebuild when due)
+   only when that cannot be done from the real fact (shopwin::OutsidePlan's reasons, each logged). */
+std::map<unsigned int, ItemMoveMsg> g_shopOutsideRec;   /* a set-aside add's description, by id (SeqLanding::rec), until its answer */
+unsigned int g_shopOutsideRecNext = 0;
+long long g_shopOutInPlace = 0, g_shopOutNothing = 0, g_shopOutLines = 0;
+long long g_shopOutStale[shopwin::kOutKinds] = { 0 };
+const char* const kShopOutWhy[shopwin::kOutKinds] = { "inPlace", "refusedHere", "noFacts", "descUnread", "cursorBusy", "noRecord", "noStackHoldsEnough",
+                                                     "addNotTaken", "takeFailed", "caravan", "tooManyToJudge", "charges", "drift", "money", "alreadyStale" };
+const ItemMoveMsg* ShopOutsideRecOf(unsigned int id)
+{
+    if (id == 0u) return 0;
+    std::map<unsigned int, ItemMoveMsg>::const_iterator it = g_shopOutsideRec.find(id);
+    return (it != g_shopOutsideRec.end()) ? &it->second : 0;
+}
+unsigned int ShopOutsideRecKeep(const ItemMoveMsg& m)
+{
+    if (++g_shopOutsideRecNext == 0u) g_shopOutsideRecNext = 1u;
+    if (g_shopOutsideRec.size() >= shopwin::kSeqAsideCap * 2) g_shopOutsideRec.erase(g_shopOutsideRec.begin());
+    g_shopOutsideRec[g_shopOutsideRecNext] = m;
+    return g_shopOutsideRecNext;
+}
+/* the descriptions no set-aside landing names any more go */
+void ShopOutsideRecPurge()
+{
+    for (std::map<unsigned int, ItemMoveMsg>::iterator it = g_shopOutsideRec.begin(); it != g_shopOutsideRec.end(); )
+    {
+        int named = 0;
+        for (size_t i = 0; i < g_shopSeq.aside.size() && named == 0; ++i) if (g_shopSeq.aside[i].land.rec == it->first) named = 1;
+        if (named == 0) g_shopOutsideRec.erase(it++); else ++it;
+    }
+}
+std::string ShopOutsideReportTok()
+{
+    std::string s = " shopOutside[inPlace,nothing";
+    for (int i = 1; i < shopwin::kOutKinds; ++i) s += std::string(",") + kShopOutWhy[i];
+    s += "]=" + N(g_shopOutInPlace) + "," + N(g_shopOutNothing);
+    for (int i = 1; i < shopwin::kOutKinds; ++i) s += "," + N(g_shopOutStale[i]);
+    return s;
+}
+const char* ShopOutKind(int op) { return (op == 0) ? "add" : (op == 1 || op == 3) ? "remove" : (op == 2) ? "count" : (op == 4) ? "charges" : "?"; }
+int ShopOutsideApply(void* facade, const std::string& key, int writer, unsigned int seq, const shopwin::SeqLanding& l, const ItemMoveMsg* rec, int staleWhy,
+                     const char* road)
+{
+    if (facade == 0) return 0;
+    std::vector<ShopWinCell> cells;
+    std::vector<shopwin::WinStack> st;
+    int pick = -1;
+    const int windowStale = (g_shopSeq.stale != 0) ? 1 : 0;   /* F1628 (review NIT): its one rebuild shows this change - nothing in place */
+    if (l.delta < 0 && !l.desc.empty() && l.money == 0 && windowStale == 0 && ShopWinCells(facade, &cells) != 0)
+    {   /* F1628 (review blocker): the window stack of exactly this item - its full description, never its type alone */
+        for (size_t i = 0; i < cells.size(); ++i) { shopwin::WinStack w; w.type = cells[i].type; w.desc = cells[i].desc; w.units = cells[i].q; st.push_back(w); }
+        pick = shopwin::PickStack(st, l.desc, -l.delta);
+    }
+    /* caravan 0: a box key is never a caravan's pack - a caravan's moves go to ShopCaravanMoveApplied, which rebuilds its window as before */
+    int plan = shopwin::OutsidePlan(l, 0, ItParityCursorBusy(), (rec != 0) ? 1 : 0, (pick >= 0) ? 1 : 0, windowStale);
+    std::string cellWords;
+    if (plan == shopwin::kOutInPlace && l.delta > 0)
+    {
+        if (ShopWindowAddInPlace(facade, *rec, 0, (int)l.delta, "outside") != 1) plan = shopwin::kOutAddRefused;
+        else cellWords = " (cells on the 'window in place (outside)' line above)";
+    }
+    else if (plan == shopwin::kOutInPlace && l.delta < 0)
+    {
+        const long long n = -l.delta;
+        const int r = ShopStandInTakePod(facade, cells[(size_t)pick].item, (cells[(size_t)pick].q == n) ? -1 : (int)n);   /* the window only, under the Updating flag */
+        if (r != 1) plan = shopwin::kOutTakeFailed;
+        else { std::vector<ShopWinCell> after; ShopWinCells(facade, &after); cellWords = " cells:" + ShopWinCellDiff(cells, after); }
+    }
+    const std::string words = "key=" + key + " kind=" + ShopOutKind(l.op) + " item=" + (l.type.empty() ? std::string("?") : l.type) + " units=" + N(l.delta < 0 ? -l.delta : l.delta)
+                              + " writer=slot" + N((long long)writer) + " number=" + N((long long)seq) + " at=" + (road != 0 ? road : "?");
+    if (plan == shopwin::kOutInPlace)
+    {
+        if (l.delta == 0) ++g_shopOutNothing; else ++g_shopOutInPlace;
+        if (++g_shopOutLines <= 60)
+            DebugLog("[SHOP] seq outside in place " + words + (l.delta == 0 ? std::string(" - no units changed, nothing to show") : " - no rebuild" + cellWords)
+                     + " (outsideInPlace=" + N(g_shopOutInPlace) + ")");
+        return (l.delta != 0) ? 1 : 0;
+    }
+    ++g_shopOutStale[plan];
+    if (shopwin::OutsideMarks(plan) == 0)
+    {   /* F1628 (review 3 / NIT): money (the window never shows it) or a window stale already (its rebuild shows it): nothing, no mark */
+        if (++g_shopOutLines <= 60)
+            DebugLog("[SHOP] seq outside nothing to show (" + std::string(kShopOutWhy[plan]) + ") " + words + (plan == shopwin::kOutMoney
+                     ? std::string(" - money is never shown in the window") : std::string(" - the window is stale already; its one rebuild shows it")) + " ("
+                     + kShopOutWhy[plan] + "=" + N(g_shopOutStale[plan]) + ")");
+        return 0;
+    }
+    if (++g_shopOutLines <= 60)
+        DebugLog("[SHOP] seq outside STALE (" + std::string(kShopOutWhy[plan]) + ") " + words + " - not put in place; the window is rebuilt once when due (outsideStale="
+                 + N(g_shopOutStale[plan]) + ")");
+    ShopSeqMark(facade, staleWhy, std::string("outside change not put in place (") + kShopOutWhy[plan] + ") " + words);
+    return 0;
+}
 }   /* T-1230: step out of the unnamed namespace for coop::ItTradeWinRead / ItTradeWinClose / ItTradeWinCounts, declared in items.h (the C2668 class) */
-
+/* T-1451 design 3: A BOX CHANGE FROM ANOTHER GAME LANDED ON `key` (ItBoxRecvLine - applied or refused), numbered `seq` by its writer
+   (slot fromSlot, launch id `launch`; 0 = unnumbered). A new launch of that writer clears its numbers; the number is noted; on a counter
+   the open window is built over, a landing while a trade on that window waits is set aside for its answer, and one outside every own
+   range with nothing waiting marks the window stale; the after-sale asks whose number arrived go; the window is rebuilt once if due
+   (queued for the tick - never inside the apply). MAIN THREAD. */
+void ShopAfterSaleLanded(const std::string& key, int fromSlot, unsigned int seq, unsigned int launch, int applied, const ShopLanding* land)
+{
+    if (seq != 0u) ++g_boxSeqIn;
+    const int launchReset = shopwin::SeqLaunch(&g_shopSeq, fromSlot, launch);
+    if (launchReset != 0) shopwin::ShownDropWriter(&g_shopShown, fromSlot);   /* F1643: its kept shown landings go with its numbers */
+    if (launchReset != 0 && ++g_shopSeqLaunchReset <= 20)
+        DebugLog("[SHOP] seq writer slot" + N((long long)fromSlot) + " has a new launch id - its numbers restarted, its entries cleared (launchReset=" + N(g_shopSeqLaunchReset) + ")");
+    int anyPending = 0;
+    for (int i = 0; i < kShopPendCap && anyPending == 0; ++i) if (g_shopPend[i].used != 0) anyPending = 1;
+    void* const b = (ItShopFacadeInventory() != 0) ? ItBoxResolve(key.c_str()) : 0;   /* no shop window open: nothing resolved */
+    ::Inventory* const inv = (b != 0) ? (::Inventory*)ItBoxInventory(b) : 0;
+    void* const facade = (inv != 0) ? ItOpenShopFacadeFor(inv) : 0;
+    const size_t neededBefore = g_shopSeq.needed.size();
+    const int waiting = (facade != 0) ? ShopSeqWaiting(facade, 0) : 0;
+    shopwin::SeqLanding lf;   /* F1624: what it changed (none read: kOutNoFacts) */
+    if (land != 0) lf = land->l;
+    lf.applied = applied;
+    if (land != 0 && land->haveRec != 0 && waiting != 0 && seq != 0u) lf.rec = ShopOutsideRecKeep(land->rec);   /* kept if it is set aside */
+    const int other = shopwin::SeqArrive(&g_shopSeq, key, fromSlot, seq, (facade != 0 || anyPending != 0) ? 1 : 0, waiting, &lf);
+    if (lf.rec != 0u) ShopOutsideRecPurge();
+    if (facade != 0 && other == shopwin::kSeqArriveTooMany)
+    {   /* the aside list is full: it may be this game's own - never put in place */
+        ++g_shopOutStale[shopwin::kOutTooMany];
+        if (++g_shopOutLines <= 60) DebugLog("[SHOP] seq outside STALE (tooManyToJudge) key=" + key + " writer=slot" + N((long long)fromSlot) + " number=" + N((long long)seq));
+        ShopSeqMark(facade, shopwin::kStaleOther, "too many landings set aside to judge key=" + key + " writer=slot" + N((long long)fromSlot) + " number=" + N((long long)seq));
+    }
+    else if (facade != 0 && other != 0)   /* F1624: another player's change goes into the window in place (was: marked stale - a re-lay) */
+    {
+        const int shownNow = ShopOutsideApply(facade, key, fromSlot, seq, lf, (land != 0 && land->haveRec != 0) ? &land->rec : 0, shopwin::kStaleOther, "landing");
+        if (shownNow != 0)
+        {   /* F1642: kept - a late answer of this game's own trade that names it adds it only once */
+            shopwin::SeqAside e; e.key = key; e.writer = fromSlot; e.seq = seq; e.land = lf;
+            shopwin::ShownNote(&g_shopShown, e, 0u);
+        }
+    }
+    ShopSeqAsks(fromSlot, 0);
+    if (facade != 0 && neededBefore != 0 && g_shopSeq.needed.empty() && g_shopSeq.stale == 0 && ++g_shopSeqSettledLines <= 40)
+        DebugLog("[SHOP] seq settled key=" + key + " writer=slot" + N((long long)fromSlot) + " number=" + N((long long)seq) + ": every needed number arrived, the window"
+                 " not stale - " + ShopSeqCmpWords(facade) + " (LOG ONLY; 'equal' expected)");
+    if (facade != 0 || g_shopSeq.stale != 0) ShopSeqStep(1, 0);
+}
 /* T-1230 (src/common/tradewinguard.h). MAIN THREAD. 1 = a trade window is open (recorded at its open, no engine close since):
    *st its ShopTrader, *facade whether it still reads as a shop stand-in (ItIsShopFacadeObj: 1 / 0 / -1), *trader the pointer the
    ShopTrader keeps at +0xC0 - READ AS A VALUE, never dereferenced (0 when the ShopTrader does not read as one); *busy 1 = inside
@@ -36420,6 +37458,18 @@ void ShopAnswerNote(unsigned int fromPeer, unsigned int epoch, unsigned int id, 
     g_shopAnswered[g_shopAnsweredNext] = a;
     g_shopAnsweredNext = (g_shopAnsweredNext + 1) % kShopAnsweredCap;
 }
+/* T-1451 F1642: the answer to {peerSlot, epoch, cf.id} leaves the box-move wait numbered (ShopCfWaitDrain) - the copies saved for its
+   repeats and the reconnect re-send (saved at the apply, before the numbers existed) take the same numbers, so every answer that settles
+   the trade carries them (coopshop::CfTakeNumbers). MAIN THREAD. */
+void ShopSavedTakeNumbers(unsigned int peerSlot, unsigned int epoch, const ItemConfirmMsg& cf)
+{
+    for (size_t i = 0; i < g_shopApplied.size(); ++i)
+        if (g_shopApplied[i].id == cf.id && g_shopApplied[i].epoch == epoch && g_shopApplied[i].peerSlot == peerSlot && coopshop::CfTakeNumbers(&g_shopApplied[i].cf.shop, cf.shop) != 0)
+            ++g_shopSavedNumbered;
+    for (size_t i = 0; i < g_shopAnswered.size(); ++i)
+        if (g_shopAnswered[i].id == cf.id && g_shopAnswered[i].epoch == epoch && g_shopAnswered[i].peerSlot == peerSlot && coopshop::CfTakeNumbers(&g_shopAnswered[i].cf.shop, cf.shop) != 0)
+            ++g_shopSavedNumbered;
+}
 void ShopDropStaleRecords(unsigned int fromPeer, unsigned int epoch)
 {
     for (size_t i = 0; i < g_shopApplied.size(); )
@@ -36437,8 +37487,20 @@ void ApplyNpcBuyRequest(const ItemRequestMsg& r, unsigned int fromPeer);   /* T-
 /* A RESEND OF A REQUEST A HOLDER ALREADY APPLIED (the shop record's entry: n units, `move` on the keeper's pot) that this game has no
    answer of its own for: answered ok with the entry's numbers and the request's own item description, nothing moved here. The row is
    kept as an applied one (when the table has room), so the asker's ack drops it and its cancel undoes the trade here as for a trade
-   applied here (ShopRevokeApplied). */
-void ShopAnswerFromRecord(const ItemRequestMsg& r, unsigned int fromPeer, int n, int move)
+   applied here (ShopRevokeApplied).
+   T-1451 F1657 (F1642's sibling): the record keeps only n and the money (shoprec::ShopReqDone) - no counter names, no save numbers, and
+   the trade's box moves were sent by the holder that applied it (another writer). The answer names the home's counters with NO numbers
+   (the numberless form 'SHC1', ShopRecordPieces), so the asker never takes a landing on them for another player's: one rebuild. */
+std::vector<std::string> ShopRecordPieces(int stockKind, const std::vector<std::string>* keys)
+{
+    std::vector<std::string> v;
+    if (stockKind != coopshop::kStockHome || keys == 0) return v;   /* a caravan's packs are not numbered; an NPC purchase keeps no confirm */
+    v = *keys;
+    if (v.size() > (size_t)coopshop::kMaxPieces) v.resize((size_t)coopshop::kMaxPieces);   /* EncodeCf refuses more */
+    return v;
+}
+long long g_shopRecAnswerNamed = 0;   /* F1657: answers from the record that named counters with no numbers */
+void ShopAnswerFromRecord(const ItemRequestMsg& r, unsigned int fromPeer, int n, int move, const std::vector<std::string>* keys)
 {
     ItemConfirmMsg cf;
     cf.id = r.id; cf.ok = 1; cf.quantity = r.shop.n; cf.trade = r.trade;
@@ -36452,6 +37514,14 @@ void ShopAnswerFromRecord(const ItemRequestMsg& r, unsigned int fromPeer, int n,
     cf.baseSid = r.baseSid; cf.companySid = r.companySid; cf.materialSid = r.materialSid; cf.colorSid = r.colorSid;
     cf.quality = r.quality; cf.charges = r.charges; cf.functionKind = r.functionKind; cf.level = r.level; cf.unique = r.unique;
     cf.owner = r.owner; cf.gear = r.gear;
+    cf.shop.pieces = ShopRecordPieces(r.shop.stock, keys);   /* F1657: numberless - the asker rebuilds once, never shows a landing as another's */
+    if (!cf.shop.pieces.empty())
+    {
+        ++g_shopRecAnswerNamed;
+        if (g_shopRecAnswerNamed <= 20)
+            DebugLog("[SHOP] holder answer id=" + N((long long)r.id) + " from the record: names " + N((long long)cf.shop.pieces.size())
+                     + " counter(s) with no numbers (another holder applied it) - the asker rebuilds once (recAnswerNamed=" + N(g_shopRecAnswerNamed) + ")");
+    }
     if (coopshop::RecordAdmit(g_shopApplied.size(), kShopAppliedCap) != 0)
     {
         ShopApplied a;
@@ -36478,7 +37548,7 @@ void ShopAnswerFromRecord(const ItemRequestMsg& r, unsigned int fromPeer, int n,
    floor, or no record will carry the keeper: refused for good (kVNotApplied, remembered - a repeat gets the same); not answerable here
    now (not the exact holder, the record not arrived, a refused copy): kVNotHolder, not remembered - the asker asks again. noWait 1: the
    world server refused this game's write as not the record's writer - a decision that would wait answers kVNotHolder. MAIN THREAD. */
-void ShopSettleOnlyAnswer(const ItemRequestMsg& r, unsigned int fromPeer, void* keeper, int noWait = 0)
+void ShopSettleOnlyAnswer(const ItemRequestMsg& r, unsigned int fromPeer, void* keeper, int noWait = 0, const std::vector<std::string>* keys = 0)
 {
     ++shopst::g_soRecv;
     const unsigned int asker = ShopPeerSlotKey(fromPeer);
@@ -36495,7 +37565,7 @@ void ShopSettleOnlyAnswer(const ItemRequestMsg& r, unsigned int fromPeer, void* 
     {
         ++shopst::g_soFromRecord;
         DebugLog(head + ": a holder applied it (n=" + N((long long)o.n) + " move=" + N((long long)o.move) + ") - answered ok from the record, nothing moved");
-        ShopAnswerFromRecord(r, fromPeer, o.n, o.move);
+        ShopAnswerFromRecord(r, fromPeer, o.n, o.move, keys);   /* F1657: the home's counters, numberless */
         return;
     }
     shopst::CancelWait w;
@@ -36548,6 +37618,7 @@ void ShopSettleOnlyAnswer(const ItemRequestMsg& r, unsigned int fromPeer, void* 
 }
 void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
 {
+    ShopSeqApplyScope seqScope;   /* T-1451 design 3 (review fold): the numbers and ring ticket before this trade's moves; moves sent inside it are its own */
     if (r.shop.stock == coopshop::kStockNpcBuy) { ApplyNpcBuyRequest(r, fromPeer); return; }   /* T-608 (decision 971 b): an NPC purchase off this player's counter */
     {   /* T-1007 (J2): A REPEAT of a request this game answered already is answered with the SAME confirm, never applied twice */
         const unsigned int asker = ShopPeerSlotKey(fromPeer);
@@ -36563,6 +37634,13 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         if (road == coopshop::kRepeatAcked) { ++g_shopRepeatAcked; return; }   /* acked or revoked already: nothing sent, nothing applied */
         if (road != coopshop::kRepeatFresh)
         {
+            if (coopshop::RepeatSendNow(ShopCfWaiting(asker, r.shop.epoch, r.id)) == 0)
+            {   /* T-1451 F1642: the original still waits for its box moves - nothing ahead of it; the asker keeps waiting and asks again */
+                if (++g_shopRepeatHeld <= 20)
+                    DebugLog("[SHOP] holder repeat id=" + N((long long)r.id) + ": its answer still waits for its box moves (no numbers yet) - not sent ahead of it;"
+                             " the asker asks again (repeatHeld=" + N(g_shopRepeatHeld) + ")");
+                return;
+            }
             ++g_shopRepeatAnswered;
             const ItemConfirmMsg& again = (road == coopshop::kRepeatFromRecord) ? g_shopApplied[(size_t)at].cf : g_shopAnswered[(size_t)mem].cf;
             if (!ItSendConfirm(again)) ++g_reqConfirmSendFailed;
@@ -36585,7 +37663,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     void* const home = stock.home;
     void* const keeper = stock.keeper;
     const int policyOk = (caravan != 0) ? 1 : ((home != 0 && BoxAccessAllowed(home, fromPeer, false)) ? 1 : 0);   /* E36 is a building's; a caravan has none */
-    if (r.shop.settleOnly != 0) { ShopSettleOnlyAnswer(r, fromPeer, keeper); return; }   /* answered from the shop record only */
+    if (r.shop.settleOnly != 0) { ShopSettleOnlyAnswer(r, fromPeer, keeper, 0, &stock.keys); return; }   /* answered from the shop record only */
     if (keeper != 0) PtHolderLegsCheck(r, keeper, fromPeer);   /* T-619: the price legs on the real keeper - counted and said, never refused */
     int belowFloor = 0;
     if (keeper != 0)
@@ -36596,7 +37674,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         int seenN = 0, seenMove = 0;
         const int seen = ShopRequestSeen(keeper, ShopPeerSlotKey(fromPeer), r.shop.epoch, r.id, &seenN, &seenMove);
         if (seen == 2) return;
-        if (seen == 1) { ShopAnswerFromRecord(r, fromPeer, seenN, seenMove); return; }
+        if (seen == 1) { ShopAnswerFromRecord(r, fromPeer, seenN, seenMove, &stock.keys); return; }   /* F1657: numberless, the home's counters */
         if (seen == 3) belowFloor = 1;
     }
     int refuseNext = 0;
@@ -36813,8 +37891,8 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                        + N((long long)stock.wOther) + "/" + N((long long)stock.wUnknown) : "home=" + N((long long)(home != 0 ? 1 : 0)))
              + " held=" + N((long long)heldHere) + " keeper=" + N((long long)keeperOk)
              + " policy=" + N((long long)policyOk) + " block=" + N((long long)blockOk) + ")");
-    if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
-    ShopAnswerNote(fromPeer, r.shop.epoch, r.id, cf);   /* T-1007 (J2): a repeat of this request is answered the same */
+    ShopCfAfterMoves(cf, caravan, ShopPeerSlotKey(fromPeer), r.shop.epoch);   /* T-1451 design 3: sent once the sale's box moves have left, naming each counter's save number */
+    ShopAnswerNote(fromPeer, r.shop.epoch, r.id, cf);   /* T-1007 (J2): a repeat of this request is answered the same - F1642: with the numbers, once they are set */
 }
 
 // ================= T-608 (OWNER DECISION 971 b): AN NPC PURCHASE FROM ANOTHER PLAYER'S SHOP COUNTER =================
@@ -37223,6 +38301,7 @@ void ShopCaravanMoveApplied(void* packInv)
     if (facade == 0) return;
     if (ItTradeWindowChurn() != 0) { ++g_shopCarRefreshChurn; return; }
     ++g_shopCarRefreshQueued;
+    g_shopRebuildDeferWhy = (g_shopRebuildDefer == facade) ? shopwin::DeferWhy(g_shopRebuildDeferWhy, "caravanMove") : "caravanMove";   /* T-1451 fold 3 */
     g_shopRebuildDefer = facade;
 }
 /* T-1 B5 TEST-ONLY: packbuytest's readout - the shop counters one lever call moves, in a fixed order (PackBuyTest prints the deltas):
@@ -37730,7 +38809,7 @@ void ShopWorldTeardown()
         if (g_shopPend[i].soWait != 0) { ++shopst::g_soTeardownDropped; ++waitDropped; }   /* its characters are gone by now: dropped with the world */
         ++g_shopPendAtTeardown;
         if (g_shopPend[i].escrow != 0) ++g_shopEscrowAtTeardown;
-        g_shopPend[i].used = 0; g_shopPend[i].escrow = 0;
+        g_shopPend[i].used = 0; g_shopPend[i].escrow = 0; g_shopSaleDesc.erase(g_shopPend[i].id);   /* T-1451: its kept sale description goes with it */
     }
     if (waitDropped != 0)
         DebugLog("[SHOP] world teardown: " + N((long long)waitDropped) + " shop trade(s) waiting for a holder of the shop's area dropped with the world"
@@ -37761,7 +38840,8 @@ void ShopWorldTeardown()
     g_shopCancel.clear();
     const coopshop::ClickKey none = { 0, 0, 0, 0, 0xFFFFFFFFu };
     g_shopLastClick = none;
-    g_shopRebuildDefer = 0;
+    g_shopRebuildDefer = 0; g_shopRebuildDeferWhy = 0; shopwin::SeqWindowGone(&g_shopSeq);   /* T-1451 design 3: the stale mark names a window of the world that is going */
+    ShopOutsideRecPurge(); g_shopShown.clear();   /* F1628: the kept add records and the lapses' shown landings name that world too */
 }
 
 }   /* namespace (T-164 B4-4 intercept) */
@@ -37956,7 +39036,7 @@ void ShopCancelWaitRedo(const shopst::CancelWait& w, int refused)
     ShopStock stock;
     int heldHere = 0, keeperOk = 0;
     const int found = ShopStockResolve(w.req.shop.stock, w.req.shop.homeKey, w.req.shop.keeperUid, &stock, &heldHere, &keeperOk);
-    ShopSettleOnlyAnswer(w.req, w.fromPeer, (found != 0) ? stock.keeper : 0, refused);
+    ShopSettleOnlyAnswer(w.req, w.fromPeer, (found != 0) ? stock.keeper : 0, refused, (found != 0) ? &stock.keys : 0);
 }
 void ApplyItemConfirm(const ItemConfirmMsg& cf, unsigned int fromPeer)
 {
@@ -38463,6 +39543,77 @@ void ItemColourKitSay(void* item, const std::string* colorSid, void* holder)
 {
     ItColourSeenSay(item, colorSid, 1, holder, colorSid != 0 ? g_itColourLastD : coopgarment::kColourSeenNoDetail, colorSid != 0 ? g_itColourLastWhy : 0);
 }
+/* T-1449 (owner 1826 a): the [ITEMLOOK] watch's install, its main-thread tick and the copy redress's note (the block beside
+   ItGdSidPod holds the rest). Once at plugin start: the lock, the TLS mark, Ogre's managers and lookups found by export name, the
+   look-maker's hook, then - only when that hook is on - the Material::clone hook. A missing export or TLS slot leaves the clone
+   hook off (re-makes are not counted; the look builds are still judged); a missing row leaves both off. One install line. */
+void ItemLookInstall()
+{
+    if (g_ilSetupHook != 0) return;
+    ::InitializeCriticalSection(&g_ilLock);
+    HMODULE og = ::GetModuleHandleA("OgreMain_x64.dll");
+    void* cloneAt = 0;
+    if (og != 0)
+    {
+        g_ilTexMgr = (IlSingletonFn)::GetProcAddress(og, "?getSingletonPtr@TextureManager@Ogre@@SAPEAV12@XZ");
+        g_ilMatMgr = (IlSingletonFn)::GetProcAddress(og, "?getSingletonPtr@MaterialManager@Ogre@@SAPEAV12@XZ");
+        g_ilTexByName = (IlGetByNameFn)::GetProcAddress(og, "?getByName@TextureManager@Ogre@@QEAA?AV?$SharedPtr@VTexture@Ogre@@@2@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0@Z");
+        g_ilMatByName = (IlGetByNameFn)::GetProcAddress(og, "?getByName@MaterialManager@Ogre@@QEAA?AV?$SharedPtr@VMaterial@Ogre@@@2@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0@Z");
+        cloneAt = (void*)::GetProcAddress(og, "?clone@Material@Ogre@@QEBA?AV?$SharedPtr@VMaterial@Ogre@@@2@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N0@Z");
+    }
+    g_ilTls = ::TlsAlloc();
+    if (kIlSetupRva == 0) g_ilSetupHook = 2;
+    else g_ilSetupHook = coop::AddHook((void*)((uintptr_t)::GetModuleHandleA(0) + kIlSetupRva), (void*)&detour_IlSetup, (void**)&g_ilSetupOrig) == coop::SUCCESS ? 1 : 3;
+    if (g_ilSetupHook != 1) g_ilCloneHook = 0;
+    else if (cloneAt == 0 || g_ilTls == TLS_OUT_OF_INDEXES) g_ilCloneHook = 2;
+    else g_ilCloneHook = coop::AddHook(cloneAt, (void*)&detour_IlClone, (void**)&g_ilCloneOrig) == coop::SUCCESS ? 1 : 3;
+    DebugLog(coopitemlook::InstallLine(g_ilSetupHook == 1 ? "on" : g_ilSetupHook == 2 ? "NO ROW" : "FAILED",
+                                       g_ilCloneHook == 1 ? "on" : g_ilCloneHook == 0 ? "off" : g_ilCloneHook == 2 ? (cloneAt == 0 ? "NO EXPORT" : "NO TLS") : "FAILED",
+                                       g_ilTexMgr ? 1 : 0, g_ilMatMgr ? 1 : 0, g_ilTexByName ? 1 : 0, g_ilMatByName ? 1 : 0));
+}
+/* MAIN THREAD, every pump: the queued off-main findings and re-made names, then the follow-ups that are due */
+void ItemLookTick()
+{
+    if (g_ilSetupHook != 1) return;
+    if (g_ilFindCount > 0 || g_ilRemadeCount > 0)
+    {
+        static IlFind finds[kIlFindRing];
+        static IlRemade remade[coopitemlook::kRemadeNameCap];
+        ::EnterCriticalSection(&g_ilLock);
+        const int nf = (int)g_ilFindCount, nr = (int)g_ilRemadeCount;
+        for (int k = 0; k < nf; ++k) finds[k] = g_ilFindRing[k];
+        for (int k = 0; k < nr; ++k) remade[k] = g_ilRemadeRing[k];
+        g_ilFindCount = 0; g_ilRemadeCount = 0;
+        ::LeaveCriticalSection(&g_ilLock);
+        for (int k = 0; k < nf; ++k) IlSay(finds[k]);
+        for (int k = 0; k < nr; ++k) DebugLog(coopitemlook::RemadeLine((int)++g_ilRemadeLines, remade[k].name, remade[k].item));
+    }
+    if (g_ilFollow.empty()) return;
+    const DWORD now = ::GetTickCount();
+    int ran = 0;
+    for (size_t k = 0; k < g_ilFollow.size() && ran < coopitemlook::kFollowPerTick; )
+    {
+        if ((long)(now - g_ilFollow[k].due) < 0) { ++k; continue; }
+        const unsigned int uid = g_ilFollow[k].uid;
+        g_ilFollow.erase(g_ilFollow.begin() + (long)k);
+        ++ran;
+        IlFollowCheck(uid);
+    }
+}
+/* MAIN THREAD, at the end of a copy's redress (clothing.cpp ApplyGarmentsBody): its follow-up ~2 s on (a newer redress of the
+   same copy moves the time; at most kFollowMax copies wait) */
+void ItemLookNoteRedress(void* character)
+{
+    if (g_ilSetupHook != 1) return;
+    const unsigned int uid = FindSpawnedUid(character);
+    if (uid == 0) return;
+    const DWORD due = ::GetTickCount() + coopitemlook::kFollowMs;
+    for (size_t k = 0; k < g_ilFollow.size(); ++k)
+        if (g_ilFollow[k].uid == uid) { g_ilFollow[k].due = due; return; }
+    if ((int)g_ilFollow.size() >= coopitemlook::kFollowMax) return;
+    IlFollow f; f.uid = uid; f.due = due;
+    g_ilFollow.push_back(f);
+}
 void ItemGearNoteSent(int blocks, unsigned int dropped) { g_gearCarried += blocks; g_gearDropped += (long long)dropped; }
 void ItemGearNoteBadRecv() { ++g_gearBadRecv; }
 
@@ -38962,7 +40113,8 @@ std::string ItemsReport()
          + N(g_bagApplied) + "," + N(g_bagUnparented) + "," + N(g_bagNoParent) + "," + N(g_bagGhostReq) + "," + N(g_bagPathMismatch)
          + " bagMore[parentChar,parentBox,applyNoPath,reqNoPath,reqRelocated,pathMiss,parityRows,op0Covered,reqShadowed]=" + N(g_bagParentChar) + ","
          + N(g_bagParentBox) + "," + N(g_bagApplyNoPath) + "," + N(g_bagReqNoPath) + "," + N(g_bagReqRelocated) + ","
-         + N(g_bagPathMiss) + "," + N(g_parityBagRows) + "," + N(g_bagOp0Covered) + "," + N(g_bagReqShadowed);
+         + N(g_bagPathMiss) + "," + N(g_parityBagRows) + "," + N(g_bagOp0Covered) + "," + N(g_bagReqShadowed)
+         + ItemLookReportToken();   /* T-1449: the [ITEMLOOK] watch's counts */
 }
 std::string ItemsDetail()
 {
@@ -39590,6 +40742,21 @@ int ProdWriterDecide(void* pb, int* slot)
     if (slot != 0) *slot = -1;
     if (g_base == 0 || !ItPlaus(pb)) return coopfarm::kProdWriterNone;
     return ItProdWriterSlot(pb, slot);
+}
+/* T-1455 diagnostics (build.cpp PwDiagVerdict): the verdict's inputs, read quietly - ItOwnerRungAt with quiet set books nothing */
+int ProdWriterWhy(void* pb, int* cls, int* ownerSlot, int* mapLoaded, int* why, int* holderSlot)
+{
+    *cls = coopown::kOwnUnreadable; *ownerSlot = -1; *mapLoaded = -1; *why = -1; *holderSlot = -1;
+    if (g_base == 0 || !ItPlaus(pb) || ItOnMainThread() == 0) return 0;
+    float p[3] = { 0.0f, 0.0f, 0.0f };
+    if (ItBoxPosPod(pb, p) == 0) return 0;
+    int via = 0;
+    ItOwnerRungAt(pb, p, cls, ownerSlot, &via, 1);
+    const Sector s = SectorOf(p[0], p[2]);
+    *mapLoaded = (*ownerSlot >= 0) ? SlotMapLoadedTS(s, *ownerSlot) : -1;
+    if (!RoleIsSingle()) { int w = coopown::kWhyNone; coopown::OwnerRung(*cls, *ownerSlot, *mapLoaded, &w); *why = w; }
+    *holderSlot = AreaHolderSlotTS(s);
+    return 1;
 }
 int ProductionBuildingIs(const void* b) { return ItProdSlotIs(b); }
 /* T-1192: which gated step a building's work slot (vt+0x4B0) leads to (coopfarm::WorkStepKind), the incremental-link jump thunk
@@ -40515,6 +41682,188 @@ void* ItOpenShopFacadeFor(::Inventory* counterInv)
     }
     return 0;
 }
+/* F1628 (review blocker): one stack's full description (shopwin::DescKey) and units, for the window-vs-counters compare - so it counts
+   by exactly what makes two items different (maker, material, colour, quality, charges, function, level, unique), never the type
+   alone. 1 read, 2 money (functionKind 14: never in the window - skipped on both sides), 0 not read. */
+int ShopItemDescUnits(void* itm, std::string* key, long long* units)
+{
+    ItEntry e;
+    ItClear(&e);
+    int q = 0;
+    if (!ItPlaus(itm) || ItReadFields(itm, &e) != 1) return 0;
+    if (ItIntPod(itm, kItemQuantity, &q) == 0 || q < 0) return 0;
+    if (e.functionKind == kItemFuncMoney) return 2;
+    *key = ItEntryDescKey(e);
+    *units = (long long)q;
+    return key->empty() ? 0 : 1;
+}
+/* T-1451 re-check fold 1 (third form): the units of every item an inventory holds (every stack in every section - the walk
+   ShopWinDump / ItBoxItemsWords make), added to *out - F1628: by full description (ShopItemDescUnits). 1 read, 0 not (a section,
+   item, description or quantity that does not read). */
+int ShopInvUnitsByType(void* inv, shopwin::UnitsByType* out)
+{
+    if (!ItObj(inv)) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) return 0;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) return 0;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            std::string dk;
+            long long q = 0;
+            const int r = ShopItemDescUnits((void*)si[k].item, &dk, &q);
+            if (r == 0) return 0;
+            if (r == 2) continue;   /* F1624 (3): money (functionKind 14) is never laid into the window by the game's re-lay 0x951A00 - skipped on both sides */
+            (*out)[dk] += q;
+        }
+    }
+    return 1;
+}
+/* the open window's units by type and its counters' - EXACTLY the counter sections the stand-in is built from (the sections its
+   section map names - the walk ItOpenShopFacadeFor makes, to the list's end - each once); *invs: their inventories (each once).
+   1 both read, 0 not (a node that does not read, a list past kShopCmpWalkCap, or a section that does not read). */
+const int kShopCmpWalkCap = 4096;   /* a bound, not an expectation (a corrupt list never spins) */
+int ShopFacadeUnits(void* facade, shopwin::UnitsByType* win, shopwin::UnitsByType* ctr, std::vector<void*>* invs)
+{
+    win->clear(); ctr->clear(); invs->clear();
+    if (ShopInvUnitsByType(facade, win) == 0) return 0;
+    void* size = 0; void* buckets = 0; void* index = 0; void* node = 0;
+    if (ItPtrPod(facade, kShopInvMapSize, &size) == 0 || size == 0) return 0;
+    if (ItPtrPod(facade, kShopInvMapBuckets, &buckets) == 0 || !ItPlaus(buckets)) return 0;
+    if (ItPtrPod(facade, kShopInvMapIndex, &index) == 0 || (uintptr_t)index >= kShopMapIndexCap) return 0;
+    if (ItPtrPod(buckets, (size_t)((uintptr_t)index * 8), &node) == 0) return 0;
+    std::vector<void*> secs;
+    int ended = 0;
+    for (int i = 0; i < kShopCmpWalkCap; ++i)
+    {
+        if (node == 0) { ended = 1; break; }
+        if (!ItPlaus(node)) return 0;
+        void* sec = 0; void* inv = 0;
+        if (ItPtrPod(node, kShopMapNodeSec, &sec) == 0 || !ItPlaus(sec) || ItPtrPod(sec, kSecParentInv, &inv) == 0 || !ItPlaus(inv)) return 0;
+        if (std::find(secs.begin(), secs.end(), sec) == secs.end()) secs.push_back(sec);
+        if (std::find(invs->begin(), invs->end(), inv) == invs->end()) invs->push_back(inv);
+        void* next = 0;
+        if (ItPtrPod(node, kShopMapNodeNext, &next) == 0) return 0;
+        if (next == node) { ended = 1; break; }
+        node = next;
+    }
+    if (ended == 0 || secs.empty()) return 0;
+    for (size_t i = 0; i < secs.size(); ++i)
+    {
+        ::InventorySection* sec = (::InventorySection*)secs[i];
+        if (!ItObj(sec)) return 0;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) return 0;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            std::string dk;
+            long long q = 0;
+            const int r = ShopItemDescUnits((void*)si[k].item, &dk, &q);
+            if (r == 0) return 0;
+            if (r == 2) continue;   /* F1624 (3): the re-lay 0x951A00 skips functionKind 14 (decomp_951a00.txt: +0x124 != 0xe) */
+            (*ctr)[dk] += q;
+        }
+    }
+    return 1;
+}
+long long ShopUnitsTotal(const shopwin::UnitsByType& u) { long long t = 0; for (shopwin::UnitsByType::const_iterator it = u.begin(); it != u.end(); ++it) t += it->second; return t; }
+/* T-1451 design 3: the window against its counter sections, words for a LOG ONLY line (no decision is made from it) */
+std::string ShopSeqCmpWords(void* facade)
+{
+    if (facade == 0) return "no window";
+    shopwin::UnitsByType win, ctr;
+    std::vector<void*> invs;
+    if (ShopFacadeUnits(facade, &win, &ctr, &invs) == 0) return "window-vs-counters did NOT read";
+    return std::string("window-vs-counters ") + (shopwin::SameUnits(win, ctr) != 0 ? "equal" : "DIFFERS") + " (window " + N((long long)win.size()) + " types / "
+           + N(ShopUnitsTotal(win)) + " units, " + N((long long)invs.size()) + " counter(s) " + N((long long)ctr.size()) + " / " + N(ShopUnitsTotal(ctr)) + ")";
+}
+const char* const kShopSeqWhy[shopwin::kStaleKinds] = { "none", "refill", "otherLanding", "notOursWhileWaiting", "settle" };
+/* this game's trades on the window still waiting for their answer (exceptId: one settling now) */
+int ShopSeqWaiting(void* facade, unsigned int exceptId)
+{
+    int n = 0;
+    for (int i = 0; i < kShopPendCap; ++i) if (g_shopPend[i].used != 0 && g_shopPend[i].id != exceptId && g_shopPend[i].shopInv == facade) ++n;
+    return n;
+}
+std::string ShopSeqNeededWords()
+{
+    std::string w;
+    for (std::map<shopwin::SeqId, unsigned int>::const_iterator it = g_shopSeq.needed.begin(); it != g_shopSeq.needed.end(); ++it)
+        w += " " + it->first.first + "@slot" + N((long long)it->first.second) + "#" + N((long long)it->second) + "/"
+             + N((long long)shopwin::SeqArrivedOf(g_shopSeq, it->first.first, it->first.second));
+    return w.empty() ? std::string(" none") : w;
+}
+void ShopSeqMark(void* facade, int why, const std::string& what)
+{
+    if (shopwin::SeqMark(&g_shopSeq, why) == 0) return;
+    ++g_shopSeqStaleN[why];
+    const long long n = g_shopSeqStaleN[1] + g_shopSeqStaleN[2] + g_shopSeqStaleN[3] + g_shopSeqStaleN[4];
+    if (n <= 40)
+        DebugLog("[SHOP] seq STALE (" + std::string(kShopSeqWhy[why]) + "): " + what + " - waiting=" + N((long long)ShopSeqWaiting(facade, g_shopSeqExcept))
+                 + " needed[key@writer#named/arrived]=" + ShopSeqNeededWords() + " (stale marks=" + N(n) + ")");
+}
+/* the window was refilled from the counters (a reopen, a plugin rebuild, a settle rebuild): stale if something of it is on its way;
+   with nothing on its way a stale mark is cleared - the refill shows the counters (review fold S3: no second re-lay) */
+void ShopSeqRefill(void* facade, const char* caller)
+{
+    if (facade == 0 || facade != ItShopFacadeInventory()) return;
+    const int r = shopwin::SeqRefilled(&g_shopSeq, ShopSeqWaiting(facade, g_shopSeqExcept));
+    if (r > 0) ShopSeqMark(facade, shopwin::kStaleRefill, std::string("refilled by ") + (caller != 0 ? caller : "?") + " while something of it is on its way");
+    else if (r < 0 && ++g_shopSeqRefillCleared <= 20)
+        DebugLog("[SHOP] seq refill by " + std::string(caller != 0 ? caller : "?") + " with nothing on its way - the stale mark cleared, no second rebuild (refillCleared="
+                 + N(g_shopSeqRefillCleared) + ")");
+}
+/* the after-sale asks of `writer` whose number arrived, once no own trade on that writer waits (review fold S3) */
+void ShopSeqAsks(int writer, unsigned int exceptId)
+{
+    std::vector<std::string> keys;
+    if (shopwin::SeqAsksDue(&g_shopSeq, writer, ShopSeqOwnWaiting(writer, exceptId), &keys) == 0) return;
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        ++g_shopAfterAskLanded;
+        const int sent = ItParityAskOne(keys[i]);
+        if (g_shopAfterAskLanded <= 20)
+            DebugLog("[SHOP] after-sale check key=" + keys[i] + " - the holder's numbered change arrived and no own trade on that holder waits; asked with the"
+                     " after-sale digest (sent=" + N((long long)sent) + ", askLanded=" + N(g_shopAfterAskLanded) + ")");
+    }
+}
+/* a parity answer re-based `key`: its needed numbers are settled (review fold S1); its set-aside landings stay for the waiting trade's
+   answer (re-check F1604: a landing outside that trade's span still marks the window stale). step 1 = the window is not re-laid by the
+   answer itself (it was already here) - a due rebuild is made */
+void ShopSeqRebased(const std::string& key, int step)
+{
+    if (shopwin::SeqRebased(&g_shopSeq, key) == 0) return;
+    ++g_shopSeqRebasedN;
+    if (g_shopSeqRebasedN <= 20) DebugLog("[SHOP] seq rebased key=" + key + " by a parity answer - its needed numbers settled, " + N((long long)shopwin::SeqAsideOn(g_shopSeq, key))
+                                          + " landing(s) set aside kept for the waiting trade's answer (rebased=" + N(g_shopSeqRebasedN) + ")");
+    if (step != 0) ShopSeqStep(1, 0);
+}
+/* the one rebuild: the window is stale, no trade on it waits, every needed number arrived. landing 1 = inside an apply (queued for the
+   tick, as ShopCaravanMoveApplied); 0 = at a settle (now, or when the cursor is empty). Returns the stale reason, 0 = not now. */
+int ShopSeqStep(int landing, unsigned int exceptId)
+{
+    if (g_shopSeq.stale == 0) return 0;
+    void* const f = ItShopFacadeInventory();
+    if (f == 0 || ShopFacadeShown(f) == 0) return 0;
+    const int why = shopwin::SeqRebuildDue(&g_shopSeq, ShopSeqWaiting(f, exceptId));
+    if (why == 0) return 0;
+    ++g_shopSeqRebuildN[why];
+    const long long n = g_shopSeqRebuildN[1] + g_shopSeqRebuildN[2] + g_shopSeqRebuildN[3] + g_shopSeqRebuildN[4];
+    if (n <= 40)
+        DebugLog("[SHOP] seq REBUILD (" + std::string(kShopSeqWhy[why]) + ", at a " + (landing != 0 ? "landing" : "settle") + "): no trade on the window"
+                 " waiting, every needed number arrived - before it " + ShopSeqCmpWords(f) + " (LOG ONLY); rebuilt once (rebuilds=" + N(n) + ")");
+    if (landing != 0)
+    {
+        g_shopRebuildDeferWhy = (g_shopRebuildDefer == f) ? shopwin::DeferWhy(g_shopRebuildDeferWhy, "settleSeqLanded") : "settleSeqLanded";
+        g_shopRebuildDefer = f;
+    }
+    else ShopRebuildOrDefer(f, "settleSeq");
+    return why;
+}
 /* 1 = this box is on screen now: its own window, or (a counter) the open shop window built over it. */
 int ItParityShown(::Inventory* inv) { return (ItParityWindowOpen(inv) != 0 || ItOpenShopFacadeFor(inv) != 0) ? 1 : 0; }
 /* The stand-in rebuilt through its own vtable +0x70, only when that slot leads to 0x951A00 (T-1120: the slot holds the
@@ -40534,16 +41883,74 @@ void* ItShopFacadeUpdateSlot(void* facade)
     if (fn != (void*)(g_base + kShopFacadeUpdateRva)) { ++g_openFacadeSlotMismatch; return 0; }
     return fn;
 }
-int ItShopFacadeRebuild(void* facade)
+/* T-1451 (5): THE [SHOPWIN] DIAGNOSTIC (permanent, capped): the trade window's items as `name x,y xcount` (the first 20, in its own
+   order), before and after each of the first 20 window changes of a launch - every stand-in rebuild (with its caller) and every in-place
+   add. Read only: the stand-in's section map, the pod reads. */
+int g_shopWinDumpsTrade = 0, g_shopWinDumpsOther = 0;   /* fold 3 (review): a trade's changes (in-place adds, settle rebuilds) have their own cap */
+/* the event's number (trade changes positive, others negative), 0 = past its cap */
+int ShopWinDumpDue(int trade)
+{
+    if (trade != 0) return shopwin::DumpDue(&g_shopWinDumpsTrade) != 0 ? g_shopWinDumpsTrade : 0;
+    return shopwin::DumpDue(&g_shopWinDumpsOther) != 0 ? -g_shopWinDumpsOther : 0;
+}
+const size_t kShopWinGdName = 0x28;   /* GameData::name (kClkGdName below) */
+void ShopWinDump(void* facade, const char* caller, const char* phase, int ev)
+{
+    std::string s;
+    int named = 0, total = 0;
+    if (ItObj(facade))
+    {
+        const ItSecMap& secs = *(const ItSecMap*)((char*)facade + 0x28);
+        if (secs.size() <= 64)
+            for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+            {
+                ::InventorySection* sec = it->second;
+                if (!ItObj(sec)) continue;
+                const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+                if (si.size() > 4096) continue;
+                for (size_t k = 0; k < si.size(); ++k)
+                {
+                    ++total;
+                    if (named >= shopwin::kDumpItems) continue;
+                    void* item = (void*)si[k].item;
+                    char nm[64]; nm[0] = 0;
+                    char sid[kSidCap]; sid[0] = 0;
+                    void* gd = 0; int q = -1;
+                    if (ItPlaus(item) && ItPtrPod(item, kObjData, &gd) != 0 && ItPlaus(gd))
+                    {
+                        if (ItStrPod((const char*)gd + kShopWinGdName, nm, (int)sizeof nm) == 0) nm[0] = 0;
+                        if (ItStrPodWhy((const char*)gd + kGdStringId, sid, kSidCap) != 1) sid[0] = 0;
+                    }
+                    if (ItPlaus(item)) ItIntPod(item, kItemQuantity, &q);
+                    s += std::string(named == 0 ? " " : "; ") + (nm[0] != 0 ? nm : (sid[0] != 0 ? sid : "?")) + " "
+                         + N((long long)si[k].x) + "," + N((long long)si[k].y) + " x" + N((long long)q);
+                    ++named;
+                }
+            }
+    }
+    DebugLog("[SHOPWIN] " + std::string(ev > 0 ? "trade#" : "other#") + N((long long)(ev > 0 ? ev : -ev)) + " " + std::string(caller != 0 ? caller : "?") + " " + std::string(phase)
+             + " items=" + N((long long)total) + ":" + (s.empty() ? std::string(" none read") : s) + (total > named ? std::string(" ...") : std::string()));
+}
+int ItShopFacadeRebuildCall(void* facade, void* fn)
 {
     typedef void (*FacadeUpdateFn)(void* self);
-    void* fn = ItShopFacadeUpdateSlot(facade);
-    if (fn == 0) return 0;
     int ok = 1;
     ::InterlockedExchange(&g_itApplyingThread, (LONG)::GetCurrentThreadId());
     __try { ((FacadeUpdateFn)fn)(facade); }
     __except (EXCEPTION_EXECUTE_HANDLER) { ok = -1; ++g_openFacadeFault; }
     ::InterlockedExchange(&g_itApplyingThread, 0);
+    return ok;
+}
+int ItShopFacadeRebuild(void* facade, const char* caller)
+{
+    void* fn = ItShopFacadeUpdateSlot(facade);
+    if (fn == 0) return 0;
+    ++g_shopWinRebuilt;
+    ShopSeqRefill(facade, caller);   /* T-1451 design 3: a refill while something of the window is on its way leaves it stale */
+    const int ev = ShopWinDumpDue(shopwin::TradeCaller(caller));   /* T-1451 fold 3 (re-check): "deferred:settle..." too */
+    if (ev != 0) ShopWinDump(facade, caller, "before rebuild", ev);
+    const int ok = ItShopFacadeRebuildCall(facade, fn);
+    if (ev != 0) { if (ok == 1) ShopWinDump(facade, caller, "after rebuild", ev); else DebugLog("[SHOPWIN] " + std::string(caller != 0 ? caller : "?") + " rebuild FAULTED - not read after"); }
     return ok;
 }
 /* the ground catch-up, defined with the ground code below (in this namespace) */
@@ -41410,7 +42817,7 @@ int ItResearchApplyPend(const std::string& tkey, ItLiftPend& p)
     if (removed > 0)
     {
         if (win != 0) ItRefreshGuiPod(inv);
-        else if (shop != 0 && noRebuild == 0) ItShopFacadeRebuild(shop);
+        else if (shop != 0 && noRebuild == 0) ItShopFacadeRebuild(shop, "researchLift");
     }
     if (g_lootLiftLines < 400)
     {
@@ -41713,6 +43120,8 @@ void ShopAskerSlotKnown(int slot)
     { const unsigned int k = coopshop::AskerRefile(g_shopAnswered[i].peerSlot, slot); if (k != g_shopAnswered[i].peerSlot) { g_shopAnswered[i].peerSlot = k; ++n; } }
     for (size_t i = 0; i < g_shopAcked.size(); ++i)
     { const unsigned int k = coopshop::AskerRefile(g_shopAcked[i].peerSlot, slot); if (k != g_shopAcked[i].peerSlot) { g_shopAcked[i].peerSlot = k; ++n; } }
+    for (size_t i = 0; i < g_shopCfWait.size(); ++i)   /* F1642: an answer still waiting for its box moves numbers the re-filed records */
+    { const unsigned int k = coopshop::AskerRefile(g_shopCfWait[i].peerSlot, slot); if (k != g_shopCfWait[i].peerSlot) { g_shopCfWait[i].peerSlot = k; ++n; } }
     if (n == 0) return;
     g_shopAskerRefiled += n;
     DebugLog("[SHOP] the session peer's slot " + N((long long)slot) + " is known: " + N(n) + " shop record(s) filed under its link key re-filed under it"
@@ -41874,6 +43283,115 @@ std::string ShopStaleCommand(int secs)
              " (status contents for a shop counter no ask of this game awaits) and applies them in order when the time is up; an open"
              " window's ask and its answers, every other answer and every other message go on as before");
     return "ok shoptest stale " + N((long long)secs) + ": the holder's pushed shop-counter updates are held here " + N((long long)secs) + " s, then applied in order";
+}
+/* T-1451 TEST LEVER: `shoptest win <buy|sell> [sid=<text>] [qual=<1-100>] [stack]` - ONE trade in the trade window `buytest keeper <...> hold=<s>` holds
+   open, through the player's own right-click (RClickAutoTrade 0x713150, BtSellAfterOpen's road), WITHOUT opening or closing the window,
+   so a run can watch the window's items keep their places across trades. buy: the first non-money item of the window's grid; sell: the
+   first non-money item of the held buyer's general grid; sid= keeps only items whose base record id contains the text; a stack
+   (quantity 2+) only with `stack` (the right-click takes what the engine takes); qual= (F1666) keeps only items of at least that quality,
+   so a run can buy one grade of a two-grade counter (the line names the grade taken: quality=, beside q= the stack's quantity). Each call restarts the held window's timer (it stays
+   open another hold period). One status line and one [SHOPTEST] line. MAIN THREAD (the command channel's). */
+std::string ShopWinTest(const std::string& args)
+{
+    std::vector<std::string> tok;
+    {
+        std::string cur;
+        for (size_t i = 0; i <= args.size(); ++i)
+        {
+            const char ch = (i < args.size()) ? args[i] : ' ';
+            if (ch == ' ' || ch == '	') { if (!cur.empty()) { tok.push_back(cur); cur.clear(); } }
+            else cur += ch;
+        }
+    }
+    std::string dir = tok.empty() ? std::string() : tok[0], sidWant;
+    int stack = 0, bad = 0, qualMin = 0;
+    for (size_t ti = 1; ti < tok.size(); ++ti)
+    {
+        const std::string& t = tok[ti];
+        if (t == "stack") stack = 1;
+        else if (t.compare(0, 4, "sid=") == 0 && t.size() > 4) sidWant = t.substr(4);
+        else if (t.compare(0, 5, "qual=") == 0 && t.size() > 5 && t.size() <= 8 && t.find_first_not_of("0123456789", 5) == std::string::npos)
+        {   /* T-1451 F1666 (TEST-ONLY): only items of at least this quality (1-100) - a run can buy one grade of a two-grade counter */
+            qualMin = std::atoi(t.c_str() + 5);
+            if (qualMin < 1 || qualMin > 100) bad = 1;
+        }
+        else bad = 1;
+    }
+    if ((dir != "buy" && dir != "sell") || bad != 0) return "error shoptest win usage: shoptest win <buy|sell> [sid=<text>|sid=lastbuy] [qual=<1-100>] [stack]";
+    if (sidWant == "lastbuy") { if (g_shopLastBuySid.empty()) return "error shoptest win: sid=lastbuy - no buy settled yet"; sidWant = g_shopLastBuySid; }
+    if (g_btHold.active == 0) return "error shoptest win: no trade window is held open - open one with buytest keeper <...> hold=<s>";
+    ::Inventory* facade = (::Inventory*)ItShopFacadeInventory();
+    ::Character* buyer = FindSpawned(g_btHold.buyerUid);
+    if (!ItObj(facade)) return "error shoptest win: no shop window is open";
+    if (buyer == 0 || !ItObj(buyer)) return "error shoptest win: the held window's character is not found";
+    ::Inventory* own = ItInventoryOf(buyer);
+    void* gShop = 0; void* gOwn = 0;
+    ItInventoryGuiPod(facade, &gShop);
+    if (own != 0) ItInventoryGuiPod(own, &gOwn);
+    if (gShop == 0 || ItSameWindow(gShop, facade) == 0 || gOwn == 0 || ItSameWindow(gOwn, own) == 0 || gShop == gOwn)
+        return "error shoptest win: the shop window and the buyer's window are not both open";
+    std::string secName;
+    void* pick = 0; int px = -1, py = -1, pq = 0;
+    float pql = -1.0f;
+    char sid[kSidCap]; sid[0] = 0;
+    long long seen = 0, skipped = 0;
+    std::vector< ::InventorySection*> secs;
+    std::vector<std::string> names;
+    if (dir == "sell")
+    {
+        std::string nm;
+        ::InventorySection* g = ItGeneralSection(own, &nm);
+        if (g != 0) { secs.push_back(g); names.push_back(nm); }
+    }
+    else
+    {
+        const ItSecMap& m = *(const ItSecMap*)((char*)facade + 0x28);
+        if (m.size() <= 64)
+            for (ItSecMap::const_iterator it = m.begin(); it != m.end(); ++it)
+            {
+                char nm[kSecCap]; nm[0] = 0;
+                if (!ItObj(it->second) || ItStrPod(&it->first, nm, kSecCap) == 0 || nm[0] == 0) continue;
+                secs.push_back(it->second); names.push_back(std::string(nm));
+            }
+    }
+    for (size_t si = 0; si < secs.size() && pick == 0; ++si)
+    {
+        const Ogre::vector< ::InventorySection::SectionItem>::type& it = secs[si]->items;
+        for (size_t k = 0; k < it.size() && k < 4096 && pick == 0; ++k)
+        {
+            void* c = (void*)it[k].item;
+            if (!ItObj(c)) continue;
+            ++seen;
+            char cs[kSidCap]; cs[0] = 0;
+            ItBaseSidPod(c, cs, kSidCap);
+            int fn = 0, q = 0;
+            float ql = -1.0f;
+            const int qlRead = (ItFloatPod(c, kItemQuality, &ql) != 0) ? 1 : 0;
+            if ((!sidWant.empty() && std::string(cs).find(sidWant) == std::string::npos) || ItIntPod(c, kItemFunction, &fn) == 0
+                || fn == kItemFunctionMoney || ItIntPod(c, kItemQuantity, &q) == 0 || (q != 1 && stack == 0)
+                || (qualMin > 0 && (qlRead == 0 || !(ql >= (float)qualMin - 0.001f)))) { ++skipped; continue; }
+            pick = c; px = (int)it[k].x; py = (int)it[k].y; pq = q; pql = (qlRead != 0) ? ql : -1.0f; secName = names[si];
+            std::memcpy(sid, cs, kSidCap);
+        }
+    }
+    if (pick == 0)
+        return "error shoptest win " + dir + ": no " + std::string(stack != 0 ? "" : "single ") + "non-money item" + (sidWant.empty() ? std::string() : " with sid " + sidWant)
+               + (qualMin > 0 ? " of quality " + N((long long)qualMin) + "+" : std::string()) + " in the " + (dir == "sell" ? "buyer's general grid" : "shop window") + " (items=" + N(seen) + " skipped=" + N(skipped) + ")";
+    const long long sent0 = g_btShopSent;
+    int res = -1;
+    const int called = (dir == "sell") ? ItRClickAutoTradePod(gOwn, (const void*)&secName, px, py, gShop, &res)
+                                       : ItRClickAutoTradePod(gShop, (const void*)&secName, px, py, gOwn, &res);
+    ItemsTick();   /* drained while the window is still open (BuyTest's reason) */
+    g_btHold.at = ::GetTickCount();   /* the held window stays open another hold period */
+    const unsigned int asked = (called != 0 && g_btShopSent != sent0) ? g_btShopSentId : 0;
+    char qualTxt[24]; std::sprintf(qualTxt, "%.2f", (double)pql);   /* F1666: the grade taken (q= is the stack's quantity) */
+    const std::string line = "shoptest win " + dir + " item=" + std::string(sid) + " q=" + N((long long)pq) + " quality=" + std::string(qualTxt)
+                             + (qualMin > 0 ? " qualMin=" + N((long long)qualMin) : std::string()) + " from=" + secName + " "
+                             + N((long long)px) + "," + N((long long)py) + " called=" + N((long long)called) + " tradeResult=" + N((long long)res)
+                             + " (" + (called != 0 ? std::string(ItTradeResultWords(res)) : std::string("the call faulted")) + ") askedId="
+                             + N((long long)asked) + " heldFor=" + N((long long)g_btHold.secs) + "s";
+    DebugLog("[SHOPTEST] " + line);
+    return std::string(called != 0 ? "ok " : "error ") + line;
 }
 /* ItParityTick: the time is up - every held push goes in, in order */
 void ItShopStaleDrive()
@@ -42319,6 +43837,24 @@ void ItParityApply(const cooppar::ParityBox& a)
         if (owed != 0 && g_parityPull.erase(a.key) != 0) ++g_handbackPullEnded;
         if (cooppar::ParityApplyOverOwn(writerMine, coopown::HandbackPullStands(owed, ItParityPullLive(a.key))) == 0) { ++g_parityAnsSelfHeld; return; }   /* P109: unless it answers this game's own pull */   /* we hold it now: ours stands */
     }
+    {   /* T-1451 (design A (3)): the live box already holds the answer (the holder's change landed here before its answer did) - no
+           swap, and no rebuild of an open shop window; a hand-back waiting, a live pull or rows owed to the safety net keep the swap's
+           own road (each has its bookkeeping there). Counted parityAnsAlreadyHere; read as an equal answer (ItSnapRecvNote). */
+        unsigned int ld = 0; long long lc = 0, lu = 0;
+        const int lr = ItParityDigest(inv, &ld, &lc, &lu);
+        if (shopwin::AnswerAlreadyHere(lr, ld, lc, lu, cooppar::ParityDigestOf(a.items), (long long)a.items.size(), ItHandbackWaiting(a.key),
+                                       (g_parityPull.count(a.key) != 0) ? 1 : 0, ItHandbackNetOwed(a.key)) != 0)
+        {
+            ++g_parityAnsAlreadyHere;
+            ShopSeqRebased(a.key, 1);   /* T-1451 design 3 (review fold S1): the live box is the holder's - needed numbers settled, a due rebuild made */
+            g_openShopHeldKeys.erase(a.key);
+            ItSnapRecvNote(a.key);
+            if (g_parityAnsAlreadyHere <= 20 || (g_parityAnsAlreadyHere % 100) == 0)
+                DebugLog("[PARITY] answer already here key=" + a.key + " items=" + N((long long)a.items.size()) + " - the live box holds the"
+                         " holder's contents: not swapped, no window rebuilt (parityAnsAlreadyHere=" + N(g_parityAnsAlreadyHere) + ")");
+            return;
+        }
+    }
     /* parity3, choice (a): THE ANSWER IS SWAPPED INTO THE OPEN WINDOW. PAR-1 dropped it while the window was open; now the
        window is the reason it was asked. Refused only when an item is on the cursor while the box is on screen (that item
        may be one of this box's, and a close in this GUI can destroy a cursor item; P94 fold 1, review F2: a closed box's
@@ -42375,6 +43911,7 @@ void ItParityApply(const cooppar::ParityBox& a)
         return;
     }
     int swapRan = 0, removeFailed = 0;
+    ShopSeqRebased(a.key, 0);   /* T-1451 design 3 (review fold S1): the box becomes the holder's - its needed numbers are settled (the swap's rebuild refills) */
     const int swapped = ItParitySwap(inv, (merging > 0) ? merged : a, &mergePlaced, &swapRan, (merging > 0) ? &removeFailed : 0);
     if (swapped < 0) { ItParityHoldNoMaker(a); return; }   /* the swap's own gate held it: nothing was removed - no retry, no hand-back */
     if (merging > 0 && swapRan == 0)
@@ -42407,7 +43944,7 @@ void ItParityApply(const cooppar::ParityBox& a)
     else if (shop != 0)
     {
         ++g_openSwappedIntoWindow; ++g_openCounterSwappedIntoShop;
-        const int rebuilt = noRebuild ? -1 : ItShopFacadeRebuild(shop);
+        const int rebuilt = noRebuild ? -1 : ItShopFacadeRebuild(shop, "paritySwap");
         if (rebuilt == 1) ++g_openFacadeRebuilt;
         {   /* T-1120: log only - did the holder's answer reach the open shop window */
             std::map<std::string, char>::iterator hk = g_openShopHeldKeys.find(a.key);
@@ -46194,6 +47731,7 @@ void ItParityWorldTeardown()
     g_parityAskPlKeys.clear();   /* T-823 fold 4: the asked player-box rows name the world that is going */
     g_boxOpenState = 0; g_boxOpenKeys.clear(); g_boxOpenCur.clear(); g_boxOpenIdx = 0; g_boxOpenHaveTown = 0;
     ItBtHoldWorldGone();   /* T-1120: a held trade window names the world that is going */
+    g_shopSeq = shopwin::WinSeq(); g_shopSaleDesc.clear(); g_shopCfWait.clear();   /* T-1451 design 3: held answers name the world that is going */   /* T-1451 fold 3 (review): the after-sale check and kept sale descriptions name the world that is going */
     ItShopStaleWorldGone();   /* T-1120 TEST LEVER: the held shop-counter pushes name the world that is going; the lever goes off */
 }
 /* par2 (docs/design-loot2.md rev 2, 0.5): THE PUSH. MAIN THREAD, after this tick's ring drain and the pull answers, sharing
@@ -46497,7 +48035,12 @@ bool ItNetSendMove(const ItemMoveMsg& mIn)
         BoxLiveMoveDropped();
         return true;
     }
-    const bool ok = net::SendItemMove(m);
+    /* T-1451 design 3 (protocol 242): a box move carries this game's save number for the box (+1 per move sent) */
+    ItemMoveMsg numbered;
+    const ItemMoveMsg* sp = &m;
+    if (m.uid == 0 && !m.boxKey.empty() && m.boxSeq == 0u && GrIsGroundKey(m.boxKey.c_str()) == 0)
+    { numbered = m; numbered.boxSeq = BoxSeqNext(m.boxKey); numbered.boxLaunch = BoxSeqLaunch(); sp = &numbered; ++g_boxSeqSent; }
+    const bool ok = net::SendItemMove(*sp);
 #ifdef SW_DEV_BUILD
     // PROBE-START: P190 - a weapon move, or a move in a weapon section, of a player character as it goes out
     P190MoveSent(m, ok ? 1 : 0);
@@ -46769,7 +48312,10 @@ int InvNetSendOp(::Inventory* inv, unsigned int uid, const std::string& boxKey, 
     else if (o.kind == coopinv::kOpQty) { m.op = 2; m.quantity = o.qtyTo; }
     else if (o.kind == coopinv::kOpCharges) { m.op = 4; m.quantity = o.qtyTo; m.charges = o.chTo; m.baseSid = o.sid; }   /* items9 */
     else return 0;
-    if (!ItNetSendMove(m)) return 0;
+    g_sendTicketHave = 0; g_sendNetRoad = 1;   /* re-check F1604 (3): no ring ticket; a held answer naming the box counts it (BoxSeqNext) */
+    const bool netSent = ItNetSendMove(m);
+    g_sendNetRoad = 0;
+    if (!netSent) return 0;
     ++g_invNetSent; ++g_sent;
     return 1;
 }
@@ -47073,7 +48619,9 @@ int InvNetBoxOne(const InvNetBoxRef& r)
         BoxRecMarkSoft(r.key);
         return 1;
     }
+    g_sendNetCounter = (ItShopPieceKeeper(b) != 0) ? 1 : 0;   /* F1607 (log only): BoxSeqNext's safety-net line names shop counters */
     InvNetVisit(inv, 0, r.key);
+    g_sendNetCounter = 0;
     return 1;
 }
 int InvNetBoxStep(unsigned int now)
@@ -47986,6 +49534,26 @@ const int kTraderSpawnDefaultDist = 300;
 const char* const kTraderSpawnAnimalsTemplateSid = "63537-rebirth.mod";   /* SQUAD_TEMPLATE "Merchant Nomads" */
 const char* const kTraderSpawnAnimalsFactionSid = "42097-rebirth.mod";    /* its "faction" reference: Nomads */
 static int g_traderSpawnAnimals = 0;   /* MAIN THREAD: 1 = the armed spawn is the animal seller's squad */
+/* T-1416 TEST-ONLY (run T2638): `traderspawn <dist> squad <templateSid> <factionSid> <labelPrefix>` makes ONE squad of ANY squad
+   template (e.g. 'Dust Bandit squad' 1302-gamedata.base / Dust Bandits 200-gamedata.base) through the same engine call, so the
+   engine itself builds it with its leader (createRandomSquad 0x582F80 sets the squad roles: first = leader 2, others 0, animals 1 -
+   decomp_582f80:491, 597-601, 846; F1486). dist may be negative here (-2000..-50 = along world -X). Its living members are then
+   renamed <labelPrefix>a, b, c .. (the leader first) through the engine's own setName (NameSetOwn - the rename travels as every
+   rename does), so `attack <uid> name <label>` picks them on both games; they are NOT marked lever-made (the squad stays a native
+   one). One [TRADER] squad member line each.
+   T-1416 fix (after T2638, F1502): two causes, both seen in T2638's logs. (1) The engine's character factory is gated: only the game
+   the world server names the holder of the spot's area makes world characters there (worldgen.cpp detour_createRandomCharacter ->
+   LeafGatedAt -> MayMakeFromView) - on B, which did not hold 52,52, createRandomSquad returned a squad with 0 members (P032
+   leafArea gatedHeld 15 -> 36 across HB / HA). The squad form now refuses on a game that is not the area's named holder, with a MISSED
+   line that says so. (2) On the holder the members exist at once, but a mod uid is given later by the adoption sweep
+   (worldsync.cpp WorldSyncTick, a few per tick: T2638 A made 14 at 251.103 and adopted them at 251.211 / 251.296 / 251.351), and a
+   character without a uid cannot be renamed for both games. So the lever now records each member with its label (the leader first)
+   and names it at the EVENT that gives it its uid (TraderSpawnNoteAdopted, called by the sweep right after the adoption); the rename
+   itself is applied at the next K2 safe point (TraderSpawnDrain), where engine writes are allowed. Lines: `[TRADER] squad read=..
+   count=.. waiting=<n>`, then per member `[TRADER] squad member <i> uid=<u> label='<prefix><letter>' leader=<0|1> - named so (named
+   <k> of <n>)` when its uid arrives, and `[TRADER] squad complete labels='<prefix>' named=<k> of <n> lost=<l>` when none waits. */
+static std::string g_traderSpawnSquadTpl, g_traderSpawnSquadFac, g_traderSpawnSquadLabel;   /* MAIN THREAD: empty = not the squad form */
+const int kTraderSpawnSquadLabelCap = 12;   /* members renamed per squad (a..l) */
 static int g_traderSpawnArmed = 0, g_traderSpawnWaits = 0;
 static float g_traderSpawnDist = 300.0f;
 static long long g_traderSpawnArmedN = 0, g_traderSpawnMade = 0, g_traderSpawnMissed = 0;
@@ -48022,9 +49590,78 @@ static void* TsCreateRandomSquadPod(unsigned long long fn, void* factory, void* 
 }
 static std::string TsF1(float v) { char b[32]; _snprintf(b, 31, "%.1f", v); b[31] = 0; return b; }
 static std::string TsPtr(const void* p) { char b[32]; _snprintf(b, 31, "0x%llX", (unsigned long long)(uintptr_t)p); b[31] = 0; return b; }
+/* T-1416 fix: the squad form's members waiting for their mod uid (TraderSpawnNoteAdopted) and then for the safe point (TraderSpawnDrain).
+   MAIN THREAD (the K2 safe point and WorldSyncTick, both on the main thread). A pointer is matched only together with its squad
+   (SquadActivePlatoonOf at the naming), so a freed member's address reused by another character is not renamed. */
+struct TsSquadWait { ::Character* c; void* ap; unsigned int uid; int index; int leader; int group; };
+struct TsSquadGroup { std::string labels; int total; int named; int lost; int done; };
+static std::vector<TsSquadWait> g_tsSquadWait;
+static std::vector<TsSquadGroup> g_tsSquadGroups;
+static int g_tsSquadReady = 0;   /* entries whose uid arrived and wait for the safe point */
+const size_t kTsSquadWaitCap = 96;
+static void TsSquadGroupCheckDone(int g)
+{
+    if (g < 0 || g >= (int)g_tsSquadGroups.size()) return;
+    TsSquadGroup& gr = g_tsSquadGroups[(size_t)g];
+    if (gr.done != 0 || gr.named + gr.lost < gr.total) return;
+    gr.done = 1;
+    DebugLog("[TRADER] squad complete labels='" + gr.labels + "' named=" + N((long long)gr.named) + " of " + N((long long)gr.total)
+             + " lost=" + N((long long)gr.lost));
+}
+/* the event: the adoption sweep (worldsync.cpp) gave `c` the uid `uid`. Pointer compares only - no engine call, no read. MAIN THREAD. */
+void TraderSpawnNoteAdopted(unsigned int uid, ::Character* c)
+{
+    if (g_tsSquadWait.empty() || uid == 0 || c == 0) return;
+    for (size_t i = 0; i < g_tsSquadWait.size(); ++i)
+        if (g_tsSquadWait[i].c == c && g_tsSquadWait[i].uid == 0) { g_tsSquadWait[i].uid = uid; ++g_tsSquadReady; return; }
+}
+/* the safe point: name every member whose uid arrived. MAIN THREAD, engine writes allowed (TraderSpawnDrain). */
+static void TsSquadNameReady()
+{
+    if (g_tsSquadReady == 0) return;
+    g_tsSquadReady = 0;
+    for (size_t i = 0; i < g_tsSquadWait.size(); )
+    {
+        TsSquadWait w = g_tsSquadWait[i];
+        if (w.uid == 0) { ++i; continue; }
+        g_tsSquadWait.erase(g_tsSquadWait.begin() + (long)i);
+        if (w.group < 0 || w.group >= (int)g_tsSquadGroups.size()) continue;
+        TsSquadGroup& gr = g_tsSquadGroups[(size_t)w.group];
+        const std::string lab = gr.labels + std::string(1, (char)('a' + w.index));
+        const bool same = ItObj(w.c) && FindSpawnedUid(w.c) == w.uid && coop::SquadActivePlatoonOf(w.c) == w.ap;
+        const bool named = same && coop::NameSetOwn(w.c, lab);
+        if (named) ++gr.named; else ++gr.lost;
+        DebugLog("[TRADER] squad member " + N((long long)w.index) + " uid=" + N((long long)w.uid) + " label='" + lab + "' leader="
+                 + N((long long)w.leader) + (named ? " - named so" : (same ? " - NOT named (the rename refused)" : " - NOT named (no longer this squad's member)"))
+                 + " (named " + N((long long)gr.named) + " of " + N((long long)gr.total) + ")");
+        // PROBE P323
+        if (named) coop::P323AiLine(w.uid, "made");
+        TsSquadGroupCheckDone(w.group);
+    }
+}
 std::string TraderSpawnCommand(const std::string& arg)
 {
     int dist = kTraderSpawnDefaultDist, animals = 0;
+    {   /* T-1416 TEST-ONLY: the squad form (see g_traderSpawnSquadTpl) */
+        char w2[16] = { 0 }, tpl[128] = { 0 }, fac[128] = { 0 }, lab[32] = { 0 }; char extra = 0; int d2 = 0;
+        const int n2 = std::sscanf(arg.c_str(), "%d %15s %127s %127s %31s %c", &d2, w2, tpl, fac, lab, &extra);
+        if (n2 >= 2 && std::string(w2) == "squad")
+        {
+            bool labOk = n2 == 5 && std::strlen(lab) >= 1 && std::strlen(lab) <= 12;
+            for (const char* q = lab; labOk && *q != 0; ++q) labOk = (*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9');
+            const int ad = d2 < 0 ? -d2 : d2;
+            if (!labOk || ad < 50 || ad > 2000)
+                return "error traderspawn: usage traderspawn <dist -2000..-50 or 50..2000> squad <templateSid> <factionSid> <labelPrefix 1-12 letters/digits>";
+            if (g_base == 0 || coop::AddrAbs(kCreateRandomSquadRva) == 0)
+                return "error traderspawn: RootObjectFactory::createRandomSquad is not bound in the address table";
+            g_traderSpawnSquadTpl = tpl; g_traderSpawnSquadFac = fac; g_traderSpawnSquadLabel = lab;
+            g_traderSpawnArmed = 1; g_traderSpawnWaits = 0; g_traderSpawnDist = (float)d2; ++g_traderSpawnArmedN; g_traderSpawnAnimals = 0;
+            DebugLog("[TRADER] spawn armed template='" + g_traderSpawnSquadTpl + "' faction='" + g_traderSpawnSquadFac + "' labels='" + g_traderSpawnSquadLabel
+                     + "' dist=" + N((long long)d2) + " kind=squad - runs at the next K2 safe point");
+            return "ok traderspawn armed template='" + g_traderSpawnSquadTpl + "' dist=" + N((long long)d2) + " kind=squad (runs at the next safe point; see [TRADER] spawn)";
+        }
+    }
+    g_traderSpawnSquadTpl.clear(); g_traderSpawnSquadFac.clear(); g_traderSpawnSquadLabel.clear();
     if (arg == "animals") animals = 1;
     else if (!arg.empty())
     {
@@ -48070,8 +49707,9 @@ static void TraderSpawnRun()
     if (me == 0 || !SafeReadPosition(me, &mp)) { TraderSpawnMissed("no player character this game runs, or its position would not read"); return; }
     void* factory = (void*)coop::GameWorldPtr()->objectFactory;
     if (!ItPlaus(factory)) { TraderSpawnMissed("no RootObjectFactory"); return; }
-    const std::string tsid(g_traderSpawnAnimals != 0 ? kTraderSpawnAnimalsTemplateSid : kTraderSpawnTemplateSid);
-    const char* const fsid = (g_traderSpawnAnimals != 0) ? kTraderSpawnAnimalsFactionSid : kTraderSpawnFactionSid;
+    const int sqForm = g_traderSpawnSquadTpl.empty() ? 0 : 1;   /* T-1416 TEST-ONLY squad form */
+    const std::string tsid(sqForm != 0 ? g_traderSpawnSquadTpl : std::string(g_traderSpawnAnimals != 0 ? kTraderSpawnAnimalsTemplateSid : kTraderSpawnTemplateSid));
+    const char* const fsid = sqForm != 0 ? g_traderSpawnSquadFac.c_str() : ((g_traderSpawnAnimals != 0) ? kTraderSpawnAnimalsFactionSid : kTraderSpawnFactionSid);
     void* squad = 0; int type = -1;
     if (TsTemplatePod(&tsid, &squad, &type) == 0) { TraderSpawnMissed("the template lookup faulted"); return; }
     if (!ItPlaus(squad) || type != 0x34)
@@ -48083,6 +49721,21 @@ static void TraderSpawnRun()
     const unsigned long long fn = coop::AddrAbs(kCreateRandomSquadRva);
     if (fn == 0) { TraderSpawnMissed("createRandomSquad is not bound in the address table"); return; }
     Ogre::Vector3 at(mp.x + g_traderSpawnDist, mp.y, mp.z);   /* beside the player, along world +X; the engine takes a copy's address */
+    if (sqForm != 0 && !coop::RoleIsSingle())
+    {   /* T-1416 fix (T2638 HB / HA on B: members=0): the engine's character factory makes world characters only on the area's named holder */
+        const coop::Sector as = coop::SectorOf(at.x, at.z);
+        int aHeld = 0, aMine = 0;
+        coop::AreaViewTS(as, &aHeld, &aMine, 0, 0, 0, 0);
+        const int may = coop::MayMakeFromView(aHeld, aMine);
+        if (may != 1)
+        {
+            TraderSpawnMissed("this game is not the named holder of area " + N((long long)as.x) + "," + N((long long)as.y) + " (held=" + N((long long)aHeld)
+                              + " mine=" + N((long long)aMine) + " may=" + N((long long)may) + ") - the character factory's creation gate would refuse every"
+                              " member; run the squad form on the game that holds the area");
+            g_traderSpawnSquadTpl.clear(); g_traderSpawnSquadFac.clear(); g_traderSpawnSquadLabel.clear();
+            return;
+        }
+    }
     TsNullHand target;
     if (kItHandVtRva == 0) { TraderSpawnMissed("HandVt is not bound in the address table"); return; }
     target.vtbl = (void*)(g_base + kItHandVtRva); target.type = 0xB;
@@ -48112,13 +49765,47 @@ static void TraderSpawnRun()
     }
     ++g_traderSpawnMade;
     coop::ClearNearNoteRunSquad(pl);   /* owner 1205 a: the run's own caravan - kept by the TEST-ONLY clearnear */
-    if (ap != 0 && g_traderSpawnAnimals == 0) g_traderSpawnAp = ap;   /* T-1 B5 fold 2 TEST-ONLY: packbuytest trader=spawned on this game (the caravan only) */
+    if (ap != 0 && g_traderSpawnAnimals == 0 && sqForm == 0) g_traderSpawnAp = ap;   /* T-1 B5 fold 2 TEST-ONLY: packbuytest trader=spawned on this game (the caravan only) */
     DebugLog("[TRADER] spawn template='" + tsid + "'" + (g_traderSpawnAnimals != 0 ? " kind=animals" : "") + " squad=" + TsPtr(pl) + " members=" + N(members) + " wearers=" + N(wearers)
              + " at " + TsF1(at.x) + "," + TsF1(at.y) + "," + TsF1(at.z) + " activePlatoon=" + TsPtr(ap) + " playerUid=" + N((long long)meUid)
-             + " made=" + N(g_traderSpawnMade) + " missed=" + N(g_traderSpawnMissed));
+             + " made=" + N(g_traderSpawnMade) + " missed=" + N(g_traderSpawnMissed) + (sqForm != 0 ? " kind=squad" : ""));
+    if (sqForm != 0 && ap != 0)
+    {   /* T-1416 TEST-ONLY: the squad's members renamed <prefix>a, b, .. - the engine's leader (+0xA0) first, then its member list */
+        coop::SquadView sv;
+        const int rs = coop::ReadSquadAt(ap, &sv);
+        std::vector< ::Character*> order;
+        if (rs == 1)
+        {
+            if (sv.leader != 0) order.push_back(sv.leader);
+            for (int i = 0; i < sv.stored; ++i) if (sv.members[i] != 0 && sv.members[i] != sv.leader) order.push_back(sv.members[i]);
+        }
+        /* T-1416 fix: each member (the leader first, up to 12) waits for the adoption that gives it its uid (TraderSpawnNoteAdopted);
+           one already adopted is named at once (TsSquadNameReady below) */
+        TsSquadGroup gr; gr.labels = g_traderSpawnSquadLabel; gr.total = 0; gr.named = 0; gr.lost = 0; gr.done = 0;
+        g_tsSquadGroups.push_back(gr);
+        const int gi = (int)g_tsSquadGroups.size() - 1;
+        int waiting = 0;
+        for (size_t i = 0; i < order.size() && i < (size_t)kTraderSpawnSquadLabelCap && g_tsSquadWait.size() < kTsSquadWaitCap; ++i)
+        {
+            ::Character* c = order[i];
+            if (!ItObj(c)) continue;
+            TsSquadWait w; w.c = c; w.ap = ap; w.uid = FindSpawnedUid(c); w.index = (int)i; w.leader = (c == sv.leader) ? 1 : 0; w.group = gi;
+            if (w.uid != 0) ++g_tsSquadReady;
+            g_tsSquadWait.push_back(w);
+            ++g_tsSquadGroups[(size_t)gi].total;
+            ++waiting;
+        }
+        DebugLog("[TRADER] squad read=" + N((long long)rs) + " count=" + N((long long)(rs == 1 ? sv.count : -1)) + " leader="
+                 + std::string(rs == 1 && sv.leader != 0 ? "yes" : "no") + " waiting=" + N((long long)waiting) + " labels='" + g_traderSpawnSquadLabel
+                 + "' (each member is named when the adoption gives it its uid)");
+        if (waiting == 0) TsSquadGroupCheckDone(gi);
+        TsSquadNameReady();
+    }
+    g_traderSpawnSquadTpl.clear(); g_traderSpawnSquadFac.clear(); g_traderSpawnSquadLabel.clear();
 }
 void TraderSpawnDrain()
 {
+    if (g_tsSquadReady != 0 && g_base != 0 && StoreTearingDown() == 0 && !EngineWritesBlocked()) TsSquadNameReady();   /* T-1416 fix */
     if (g_traderSpawnArmed == 0) return;
     if (g_base == 0 || StoreTearingDown() != 0 || EngineWritesBlocked())
     {
@@ -48166,6 +49853,14 @@ std::string ItParity3Report()
         + " openShop[counterSwappedIntoShop,facadeRebuilt,slotMismatch,rebuildFault,deferredNoRebuild,swapLines,swapLinesPast,heldNow]=" + N(g_openCounterSwappedIntoShop) + ","
         + N(g_openFacadeRebuilt) + "," + N(g_openFacadeSlotMismatch) + "," + N(g_openFacadeFault) + "," + N(g_openShopDeferred) + ","
         + N((long long)g_openShopSwapLines) + "," + N(g_openShopSwapLinesPast) + "," + N((long long)g_openShopHeldKeys.size())
+        + " shopWin[inPlace,fallback,kept,rebuilt,askNow,askLanded,wait,waitDropped,ansAlreadyHere]=" + N(g_shopWinInPlace) + ","   /* T-1451 */
+        + N(g_shopWinFallback) + "," + N(g_shopWinKept) + "," + N(g_shopWinRebuilt) + "," + N(g_shopAfterAskNow) + "," + N(g_shopAfterAskLanded) + ","
+        + N(g_shopAfterWait) + "," + N(g_shopSeq.askDropped) + "," + N(g_parityAnsAlreadyHere)
+        + " shopSeq[staleRefill,staleOther,staleLater,staleSettle,rebuildRefill,rebuildOther,rebuildLater,rebuildSettle,answers,cfHeld,cfForced,cfUnsent,movesNumbered,movesIn,gone,launchReset,refillCleared,rebased,netRoadHeld,netRoadFree]="   /* T-1451 design 3 */
+        + N(g_shopSeqStaleN[1]) + "," + N(g_shopSeqStaleN[2]) + "," + N(g_shopSeqStaleN[3]) + "," + N(g_shopSeqStaleN[4]) + "," + N(g_shopSeqRebuildN[1]) + ","
+        + N(g_shopSeqRebuildN[2]) + "," + N(g_shopSeqRebuildN[3]) + "," + N(g_shopSeqRebuildN[4]) + "," + N(g_shopSeqAnswers) + "," + N(g_shopSeqCfHeld) + ","
+        + N(g_shopSeqCfForced) + "," + N(g_shopSeqCfUnsent) + "," + N(g_boxSeqSent) + "," + N(g_boxSeqIn) + "," + N(g_shopSeqGone) + "," + N(g_shopSeqLaunchReset) + "," + N(g_shopSeqRefillCleared) + "," + N(g_shopSeqRebasedN) + "," + N(g_boxSeqNetRoadHeld) + "," + N(g_boxSeqNetRoadFree)
+        + ShopOutsideReportTok()   /* T-1451 F1624 */
         + ItShopStaleReportTok()   /* T-1120 TEST LEVER: shoptest stale */
         + " retired[arrivalAsks,fillPushes,fillDirtyDropped]=" + N((long long)kParityArrivalAsks) + "," + N((long long)kParityFillPushes) + "," + N(g_fillDirtyDropped)
         + " boxOpen[armed,calls,opened,noWindow,gone,callFailed,timedOut,aborted,done]=" + N(g_boxOpenArmed) + "," + N(g_boxOpenCalls) + ","
@@ -58788,7 +60483,7 @@ int BoxJrnReapply(const std::string& id, BoxRecW& w, const std::vector<coopbrec:
     if (ran != 0)
     {
         if (win != 0) ItRefreshGuiPod(inv);
-        else if (shop != 0 && noRebuild == 0) ItShopFacadeRebuild(shop);
+        else if (shop != 0 && noRebuild == 0) ItShopFacadeRebuild(shop, "journalRelay");
     }
     if (coopbrec::BoxJrnReapplyStep(0, 1, 1, coopbrec::kSwGo, ran) == coopbrec::kRlUndo) { ++g_bjReapplyFailed; return 0; }   /* the swap did not start: nothing changed in the box */
     for (size_t k = 0; k < d.size(); ++k)
@@ -60974,7 +62669,7 @@ int BoxApplyOne(const std::string& id, const coopbrec::BoxHeader& kh, const std:
     const int swapped = BoxRecLay(inv, (merging > 0) ? merged : a, &mergePlaced, &swapRan, (merging > 0) ? &removeFailed : 0);
     if (swapped < 0) { ++g_baNoMaker; w.applyState = coopbrec::kBasWait; return 1; }   /* nothing was removed */
     if (win != 0) ItRefreshGuiPod(inv);
-    else if (shop != 0 && noRebuild == 0) ItShopFacadeRebuild(shop);
+    else if (shop != 0 && noRebuild == 0) ItShopFacadeRebuild(shop, "storedApply");
     if (merging > 0 && (swapRan == 0 || removeFailed > 0))
     {   /* nothing of the record was laid (the items that had left were put back at their own cells): tried again at the next scan; the
            second time this game's box stands (the swap rule) */

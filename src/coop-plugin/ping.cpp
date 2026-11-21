@@ -594,7 +594,8 @@ long long g_lateAdds = 0;             /* T-1437 fold 3: the title tick had to ad
 bool KeyRowsOk()
 {
     return kIhInitRva != 0 && kIhAddCmdRva != 0 && kIhFindRva != 0 && kIhBindRva != 0 && kIhParseKeyRva != 0 && kIhKeyBoundRva != 0
-        && kIhKeyNameRva != 0 && kIhGlobalRva != 0 && kKeyLineCtorRva != 0 && kDpAddLineRva != 0 && kDpSpacerRva != 0 && kOptCtlEndRet != 0 && kIhKeyDownRva != 0;
+        && kIhKeyNameRva != 0 && kIhGlobalRva != 0 && kKeyLineCtorRva != 0 && kDpAddLineRva != 0 && kDpSpacerRva != 0 && kOptCtlEndRet != 0 && kIhKeyDownRva != 0
+        && kGameFreeRva != 0;   /* T-1453: all fourteen rows are optional:ping-key in the tables - one missing, the Ping key is off */
 }
 void* Ih() { return (void*)AddrAbs(kIhGlobalRva); }
 

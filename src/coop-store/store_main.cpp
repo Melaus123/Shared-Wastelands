@@ -240,7 +240,7 @@ namespace {
 using coopstore::FileProbe;   /* T-1280 fold 1 (H1): here, before the first use (LoadSlots), not beside the definitions further down */
 using coopstore::ProbeFile;
 
-const unsigned int kProtocol = 170;   /* 170 (merge of effort/t1408a and main, 2026-11-19, above both; effort/t1408a's own 165-167, made on its branch, are never reused): main's 169 (below: T-1429's area-upload base, creation lease and settle ask, T-1021's race look-alike id, T-1427's town fact) and T-1408's wall group facts in a piece record's STATE - the group step stamp (buildwire.h kBuildStateStampBit) and fold 13's wall group fact (buildwire.h kBuildStateGroupBit: the owner's group lead key and join index; the world server reads both through piecerec.h DecodeBuild) - a world server of 169 refuses such a record as unreadable and one of effort/t1408a's 167 lacks the lease, so the pair SHIPS TOGETHER. 169 (merge of effort/t1429b and main, above both; T-1429's own 165-168, made on its branch, are never reused): main's 166 (T-1021: LOOKALIKE (90) may carry a race look-alike id, src/common/lookalikelist.h IdOk, which a world server without it drops as malformed), main's 165 (T-1427 fold 1: a piece record's LIVE part may carry the builder's town, piecerec.h kPrLiveFlagTownFact) and T-1429's area-upload base, creation lease and settle ask (its 165-168 below) - a world server of 165 or 166 lacks one set or the other, so the pair SHIPS TOGETHER. 168 (T-1429 s2 fold 3, review F1372): an area RECORD's seq field (sent as 0 by every game until now) carries the seq of the stored copy the upload was made from, and an area record whose base is not the stored copy's (nor this connection's own last accepted upload) is refused and its sender told AREA_FRESH CANT staleBase (21); a world server of 167 ignores the base and takes any newer copy, so the pair SHIPS TOGETHER. 167 (T-1429 s2 fold 2, review F1364 B / C): the settle ask carries the game's whole ordered area list in ONE message (areafresh.h EncodeSettleList: the 20-byte ASK why settle, then u16 n, n * u16 keys) and this process answers each area in order up to the first WAIT; AREA_FRESH gains why worldFirst (20) - a brand-new world's one reserved lease (ASK / LEASE / WAIT / FRESH, x 0 y 0); a world server of 166 refuses the list as malformed and the game's load would wait, so the pair SHIPS TOGETHER. 166 (T-1429 s2 fold 1, review F1337 item 1): AREA_FRESH's ASK gains why settle (19) - a game in its pre-load hold asks every area its world load will read and is answered with the decision only (FRESH / CANT current / LEASE / WAIT); a world server of 165 would take it as a plain ASK and send the record whole, so the pair SHIPS TOGETHER. 165 (T-1429 s2, owner 1788; src/common/areafresh.h): AREA_FRESH (89) gains the CREATION LEASE - down 5 LEASE ("you create it": this process holds no copy of the area and no lease is out) and 6 WAIT (another game holds the lease; the asker is answered with that game's copy when it lands), and an ASK with why loadedOwn is a world-load CLAIM; while a lease is out only its holder's area record is taken. A world server of 164 would answer an unrecorded area CANT current and every game would load its own, differently rolled copy; a game of 164 would drop LEASE / WAIT as malformed and hold its read for ever, so the pair SHIPS TOGETHER. 165 (T-1427 fold 1, owner request 2026-11-18 'the shared building record carries every important fact, town included'): a piece record's LIVE part may carry flag bit 8 (piecerec.h kPrLiveFlagTownFact) - the builder's town when it is no player outpost: a world town by its game-data stringID, or the wilderness town 'Nowhere'; a world server of 164 refuses such a record as an unknown bit, so the builder's town would never reach the other games. 166 (merge of effort/t1021a and main, above main's 165; effort/t1021a's own 165 is never reused): both sets of changes below are in it - T-1021's LOOKALIKE (90) race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk), which a world server of 165 drops as malformed, and main's 165 (T-1427 fold 1, piecerec.h kPrLiveFlagTownFact, the builder's town). 165 (T-1021, its branch only, never reused): LOOKALIKE (90) may carry a race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk) - kept and sent on as an import copy id is (a world server of 164 drops it as malformed). 166 (merge of effort/t1408a and main, the world server's protocol above main's 165; both sides' 165 are in it and 165 is never reused as a merged number): T-1408's group step stamp in a piece record's STATE and T-1427's town fact (LIVE flag bit 8) - a world server of 165 knows only one of them and refuses the other's records as unreadable. 165 (T-1408 group step stamp): a piece record's STATE may carry a wall group step stamp (buildwire.h kBuildStateStampBit) - a world server of 164 refuses such a record as unreadable, a game of 164 such a STATE. 164 (merge of effort/t1167b and main, the world server's protocol above main's 163; effort/t1167b's own 163 is never reused): both sets of changes below are in it - T-1167's TRADE (94) kinds 1-13 (its 154 / 155 / 156, made on its branch, never reused) and main's 157-163; a world server of 163 drops message 94, so no trade window would open. 163 (T-885 piece 2, design docs/design-ownrec.md sections 3 / 6): OWNREC 105 gains INDEX_ASK / GET up and INDEX / REC / END down - before every load the game asks what this process holds for its profile, fetches every copy newer than its own and takes them into its records folder; a deleted profile's own\<profile>\ folder moves into recycle\. A world of 162 would refuse the new kinds as a malformed PUT and the game would wait at its loading screen. 162 (T-885 piece 1, owner 1752 a): message 105 OWNREC (src/common/ownrecwire.h) - up PUT (one record of a player's own records folder), down OK (stored / duplicate / superseded / refused, with a receipt number R from this world's record counter); the copies are kept in <world folder>/own/<profile id>/ and read by nothing yet; a world of 161 logs 105 as unknown and never answers, so a game of 162 would send its records into nothing. 161 (T-1392, owner 1082): the OPTIONS map holds MENUS AND BUILDING (menupause = run / pause, rules.txt's row) - a game of 160 ignores the row and casts its menu pause vote under every Slowest wins world, so a mixed pair would pause differently with no warning; the protocol refusal makes an old game update. 160 (merge of T-1383's 159 and T-938 / T-247's 158, which each moved 157 on its own branch; both sets of changes below are in this protocol, 158 and 159 are never reused). 158 (T-938 / T-247, owner 1679 / 1680 / 1681 / 1686 / 1692): message 104 PLAYER_MODS (src/common/playermods.h) - the world's mod list (none, a list, who set it, DIFFERENT MODS) and every player's verdict, to every game; ADMIN_REQ verb 21 USE MY MODS FOR THIS WORLD with reply 51; a mods REFUSE's fourth word says what a login shown at the door did (playermods / coopstore kModsLogin*); a world of 157 would read a 104 as unknown. 159 (T-1383, decision 1704): PROFILES kind 7 (NEW with import) may end with a u32 - the parts the world's creator asks for (worldhist.h kAskDead / kAskRelations); the answer's import word has bit 4 CREATOR (spimport::kWordCreator: an import now would make the world's creator / the profile just made holds the claim); WORLD_START (95, up only) carries the creator's dead named characters - a world server of 157 refuses kind 7 with the extra word as malformed and does not know 94. 157 (T-1365 stage 2, owner 1675; 154-156 are T-1167's on its branch, never reused): RECORD_FEED's INDEX_ASK may carry aoiVersion 2 - its area field followed by a NEW GAME's start town (a town record id, src/common/starttown.h) - and every INDEX_PAGE ends with {u16 t, t * (u8 x, u8 y)}: on the first page of an ask naming a town, the areas of that town's placements as the "built with" notes in this process's area records place them (none when no note names it); a world server of 153 refuses version 2 as malformed and a game of 153 reads a page's last two bytes as a trailing field. 156 (T-1167 piece 3 build 3, owner 1641 "if no room the trade doesn't happen, the window stays open"): TRADE (94) LOCK_REFUSED carries a reason (missing / NO ROOM) and the other side's offer rows that did not fit, ABORT carries those rows (AbortWhy no-room, 8); on a no-room ABORTED this process puts the trade back on the relay with both accepts cleared (tradewire.h Reopen) - a world server of 155 would refuse both messages as malformed (they are read to their end), so a no-room lock would only end by its 10 s clock and close both windows. 155 (T-1167 piece 3, owner 1635 "the swap's commit through the world server"): TRADE (94) kinds 8-13 - LOCK_NOW / LOCKED / LOCK_REFUSED / COMMIT / ABORT / APPLIED: at READY this process locks the trade, keeps it in trade.txt and writes the ONE decision (COMMITTED or ABORTED) there before it answers; COMMITTED puts each side's money in the other's money inbox under the transfer number its LOCKED reserved (src/common/tradebook.h); a world server of 154 drops kinds 8-13, so no trade would ever lock and both escrows would wait for nothing. 154 (T-1167 piece 2, owner 1633 / 1635): TRADE (94) - the player trade window's ASK / ANSWER / OFFER / ACCEPT / CANCEL go through this process, which relays each to the other player's game and itself decides whether both sides accepted the same offer serials (src/common/tradewire.h); a world server of 153 drops message 94, so the other game's window never opens. 153 (T-1339; 152 is T-1333's, never reused): RECORD_FEED kind 11 AREA_STALE {u32 epoch, u32 n, n * u16 area} - a record write of a named area was NOT forwarded to this game (outside its area of interest: its last AREAS report's areas, the areas it holds, one ring around both); the game reads that area as not done until an AREA_DONE all=0 naming it, which follows the area's catch-up (its records written since) on the same line; a game of 152 would read every area done from its first download on and never learn of a withheld write. 152 (T-1333, design a): bldg.<sx>.<sy>.#<hash8> records (src/common/bldgrec.h) - one town building's ruin flag and wall health, written only by the holder of its area; a world server of 151 would keep one as a squad's record. 151 (T-4): towntime.<sx>.<sy>.<sid> records (src/common/towntime.h) - one town's 5-day rebuild clock, written only by the holder of the town's area with a rising generation; a world server of 150 would keep one as a squad's record. 150 (T-1329, design C): an area record (zone.<x>.<y>) may be EMPTY - the bytes of zonerec::kZoneEmptyMark in place of an area file, published by the game whose one-area save wrote nothing (ZoneMap+0x24 = 0); it is stored, judged and forwarded as any area record (zonecheck::Readable takes it), so it replaces an older copy and answers later askers from the records - a world server of 149 refuses it as unreadable; 149 (T-1279, design B): AREA_FRESH's ASK for an area no live game holds (nobody, a holder not in the world, or the asker) is answered from this process's records - the area's record when newer than the asker's stamp, then FRESH; else CANT current (areafresh.h ServerRecordAnswer) - where 148 answered CANT noHolder and the game loaded an older copy; 148 (decision 1556, on top of T-860's 147): AREAS ends with a flags byte - kAreasFlagLoading marks a report sent while the game's zone manager is loading, on which this process changes no listing and no holder; an unmarked report's pairs are the areas the game's engine KEEPS (areadrop.h, areaclaim.h AreasReportListing); 147 (T-860): cage.<sx>.<sy>.#<hash>.<x10>.<z10> records (src/common/cagerec.h) - a cage's lock, written only by the holder of its area; a world server of 146 would keep one as a squad's record. 146 (T-1269): SQUAD_RELEASE with the id "*" ends a returning game's re-claim batch - the squads it registered before this process started and did not re-claim are released (store_main.cpp SquadReclaimEnd, squadwriterreg.h ReclaimEndStep); 145 (T-1061): a box record may end with its LOCK BLOCK (boxrec.h kBrFlagLock), which a reader of 144 refuses; 144 (T-23): a piece record may be a HAND-OVER SEED (piecerec.h kPrFlagHanded) naming another player the owner; the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 173;   /* 173 (T-1452, design B): PROFILES kind 7 (NEW with import) ends with {u32 ask, str folder} - the single-player save folder, kept on the profile's row (profiles.txt field 11 'imports:<folder>') until the profile is played or deleted - and every PROFILES row carries it (profiles.h Row::imports), so a leave no longer loses the import; a NEW with import naming the asker's own never-played profile ATTACHES the import (coopprof::NewImportDecide) instead of nameTaken. A world server of 172 reads the folder as a malformed request and a game of 172 reads the longer rows as malformed, so the pair SHIPS TOGETHER. 172 (T-1391, F1565): an area record's three silent refusals answer its sender (CANT recNotHolder / recLease / recNotNewer) - a game that holds its load for its queued area saves' answers needs them; 171 (T-1429 s3, owner 1777 / 1788): a piece record's LIVE part may carry a building's CONSTRUCTION PAUSE - flag bits 9 / 10 (piecerec.h kPrLiveFlagPauseKnown / kPrLiveFlagPaused, no bytes), written by the piece's record writer at each engine change of the 'PAUSE CONSTRUCTION' byte; a world server of 170 refuses such a record as an unknown bit, so the pause would never reach the other games or survive a restart - the pair SHIPS TOGETHER (another open effort may also take 171: whichever merges second renumbers). 170 (merge of effort/t1408a and main, 2026-11-19, above both; effort/t1408a's own 165-167, made on its branch, are never reused): main's 169 (below: T-1429's area-upload base, creation lease and settle ask, T-1021's race look-alike id, T-1427's town fact) and T-1408's wall group facts in a piece record's STATE - the group step stamp (buildwire.h kBuildStateStampBit) and fold 13's wall group fact (buildwire.h kBuildStateGroupBit: the owner's group lead key and join index; the world server reads both through piecerec.h DecodeBuild) - a world server of 169 refuses such a record as unreadable and one of effort/t1408a's 167 lacks the lease, so the pair SHIPS TOGETHER. 169 (merge of effort/t1429b and main, above both; T-1429's own 165-168, made on its branch, are never reused): main's 166 (T-1021: LOOKALIKE (90) may carry a race look-alike id, src/common/lookalikelist.h IdOk, which a world server without it drops as malformed), main's 165 (T-1427 fold 1: a piece record's LIVE part may carry the builder's town, piecerec.h kPrLiveFlagTownFact) and T-1429's area-upload base, creation lease and settle ask (its 165-168 below) - a world server of 165 or 166 lacks one set or the other, so the pair SHIPS TOGETHER. 168 (T-1429 s2 fold 3, review F1372): an area RECORD's seq field (sent as 0 by every game until now) carries the seq of the stored copy the upload was made from, and an area record whose base is not the stored copy's (nor this connection's own last accepted upload) is refused and its sender told AREA_FRESH CANT staleBase (21); a world server of 167 ignores the base and takes any newer copy, so the pair SHIPS TOGETHER. 167 (T-1429 s2 fold 2, review F1364 B / C): the settle ask carries the game's whole ordered area list in ONE message (areafresh.h EncodeSettleList: the 20-byte ASK why settle, then u16 n, n * u16 keys) and this process answers each area in order up to the first WAIT; AREA_FRESH gains why worldFirst (20) - a brand-new world's one reserved lease (ASK / LEASE / WAIT / FRESH, x 0 y 0); a world server of 166 refuses the list as malformed and the game's load would wait, so the pair SHIPS TOGETHER. 166 (T-1429 s2 fold 1, review F1337 item 1): AREA_FRESH's ASK gains why settle (19) - a game in its pre-load hold asks every area its world load will read and is answered with the decision only (FRESH / CANT current / LEASE / WAIT); a world server of 165 would take it as a plain ASK and send the record whole, so the pair SHIPS TOGETHER. 165 (T-1429 s2, owner 1788; src/common/areafresh.h): AREA_FRESH (89) gains the CREATION LEASE - down 5 LEASE ("you create it": this process holds no copy of the area and no lease is out) and 6 WAIT (another game holds the lease; the asker is answered with that game's copy when it lands), and an ASK with why loadedOwn is a world-load CLAIM; while a lease is out only its holder's area record is taken. A world server of 164 would answer an unrecorded area CANT current and every game would load its own, differently rolled copy; a game of 164 would drop LEASE / WAIT as malformed and hold its read for ever, so the pair SHIPS TOGETHER. 165 (T-1427 fold 1, owner request 2026-11-18 'the shared building record carries every important fact, town included'): a piece record's LIVE part may carry flag bit 8 (piecerec.h kPrLiveFlagTownFact) - the builder's town when it is no player outpost: a world town by its game-data stringID, or the wilderness town 'Nowhere'; a world server of 164 refuses such a record as an unknown bit, so the builder's town would never reach the other games. 166 (merge of effort/t1021a and main, above main's 165; effort/t1021a's own 165 is never reused): both sets of changes below are in it - T-1021's LOOKALIKE (90) race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk), which a world server of 165 drops as malformed, and main's 165 (T-1427 fold 1, piecerec.h kPrLiveFlagTownFact, the builder's town). 165 (T-1021, its branch only, never reused): LOOKALIKE (90) may carry a race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk) - kept and sent on as an import copy id is (a world server of 164 drops it as malformed). 166 (merge of effort/t1408a and main, the world server's protocol above main's 165; both sides' 165 are in it and 165 is never reused as a merged number): T-1408's group step stamp in a piece record's STATE and T-1427's town fact (LIVE flag bit 8) - a world server of 165 knows only one of them and refuses the other's records as unreadable. 165 (T-1408 group step stamp): a piece record's STATE may carry a wall group step stamp (buildwire.h kBuildStateStampBit) - a world server of 164 refuses such a record as unreadable, a game of 164 such a STATE. 164 (merge of effort/t1167b and main, the world server's protocol above main's 163; effort/t1167b's own 163 is never reused): both sets of changes below are in it - T-1167's TRADE (94) kinds 1-13 (its 154 / 155 / 156, made on its branch, never reused) and main's 157-163; a world server of 163 drops message 94, so no trade window would open. 163 (T-885 piece 2, design docs/design-ownrec.md sections 3 / 6): OWNREC 105 gains INDEX_ASK / GET up and INDEX / REC / END down - before every load the game asks what this process holds for its profile, fetches every copy newer than its own and takes them into its records folder; a deleted profile's own\<profile>\ folder moves into recycle\. A world of 162 would refuse the new kinds as a malformed PUT and the game would wait at its loading screen. 162 (T-885 piece 1, owner 1752 a): message 105 OWNREC (src/common/ownrecwire.h) - up PUT (one record of a player's own records folder), down OK (stored / duplicate / superseded / refused, with a receipt number R from this world's record counter); the copies are kept in <world folder>/own/<profile id>/ and read by nothing yet; a world of 161 logs 105 as unknown and never answers, so a game of 162 would send its records into nothing. 161 (T-1392, owner 1082): the OPTIONS map holds MENUS AND BUILDING (menupause = run / pause, rules.txt's row) - a game of 160 ignores the row and casts its menu pause vote under every Slowest wins world, so a mixed pair would pause differently with no warning; the protocol refusal makes an old game update. 160 (merge of T-1383's 159 and T-938 / T-247's 158, which each moved 157 on its own branch; both sets of changes below are in this protocol, 158 and 159 are never reused). 158 (T-938 / T-247, owner 1679 / 1680 / 1681 / 1686 / 1692): message 104 PLAYER_MODS (src/common/playermods.h) - the world's mod list (none, a list, who set it, DIFFERENT MODS) and every player's verdict, to every game; ADMIN_REQ verb 21 USE MY MODS FOR THIS WORLD with reply 51; a mods REFUSE's fourth word says what a login shown at the door did (playermods / coopstore kModsLogin*); a world of 157 would read a 104 as unknown. 159 (T-1383, decision 1704): PROFILES kind 7 (NEW with import) may end with a u32 - the parts the world's creator asks for (worldhist.h kAskDead / kAskRelations); the answer's import word has bit 4 CREATOR (spimport::kWordCreator: an import now would make the world's creator / the profile just made holds the claim); WORLD_START (95, up only) carries the creator's dead named characters - a world server of 157 refuses kind 7 with the extra word as malformed and does not know 94. 157 (T-1365 stage 2, owner 1675; 154-156 are T-1167's on its branch, never reused): RECORD_FEED's INDEX_ASK may carry aoiVersion 2 - its area field followed by a NEW GAME's start town (a town record id, src/common/starttown.h) - and every INDEX_PAGE ends with {u16 t, t * (u8 x, u8 y)}: on the first page of an ask naming a town, the areas of that town's placements as the "built with" notes in this process's area records place them (none when no note names it); a world server of 153 refuses version 2 as malformed and a game of 153 reads a page's last two bytes as a trailing field. 156 (T-1167 piece 3 build 3, owner 1641 "if no room the trade doesn't happen, the window stays open"): TRADE (94) LOCK_REFUSED carries a reason (missing / NO ROOM) and the other side's offer rows that did not fit, ABORT carries those rows (AbortWhy no-room, 8); on a no-room ABORTED this process puts the trade back on the relay with both accepts cleared (tradewire.h Reopen) - a world server of 155 would refuse both messages as malformed (they are read to their end), so a no-room lock would only end by its 10 s clock and close both windows. 155 (T-1167 piece 3, owner 1635 "the swap's commit through the world server"): TRADE (94) kinds 8-13 - LOCK_NOW / LOCKED / LOCK_REFUSED / COMMIT / ABORT / APPLIED: at READY this process locks the trade, keeps it in trade.txt and writes the ONE decision (COMMITTED or ABORTED) there before it answers; COMMITTED puts each side's money in the other's money inbox under the transfer number its LOCKED reserved (src/common/tradebook.h); a world server of 154 drops kinds 8-13, so no trade would ever lock and both escrows would wait for nothing. 154 (T-1167 piece 2, owner 1633 / 1635): TRADE (94) - the player trade window's ASK / ANSWER / OFFER / ACCEPT / CANCEL go through this process, which relays each to the other player's game and itself decides whether both sides accepted the same offer serials (src/common/tradewire.h); a world server of 153 drops message 94, so the other game's window never opens. 153 (T-1339; 152 is T-1333's, never reused): RECORD_FEED kind 11 AREA_STALE {u32 epoch, u32 n, n * u16 area} - a record write of a named area was NOT forwarded to this game (outside its area of interest: its last AREAS report's areas, the areas it holds, one ring around both); the game reads that area as not done until an AREA_DONE all=0 naming it, which follows the area's catch-up (its records written since) on the same line; a game of 152 would read every area done from its first download on and never learn of a withheld write. 152 (T-1333, design a): bldg.<sx>.<sy>.#<hash8> records (src/common/bldgrec.h) - one town building's ruin flag and wall health, written only by the holder of its area; a world server of 151 would keep one as a squad's record. 151 (T-4): towntime.<sx>.<sy>.<sid> records (src/common/towntime.h) - one town's 5-day rebuild clock, written only by the holder of the town's area with a rising generation; a world server of 150 would keep one as a squad's record. 150 (T-1329, design C): an area record (zone.<x>.<y>) may be EMPTY - the bytes of zonerec::kZoneEmptyMark in place of an area file, published by the game whose one-area save wrote nothing (ZoneMap+0x24 = 0); it is stored, judged and forwarded as any area record (zonecheck::Readable takes it), so it replaces an older copy and answers later askers from the records - a world server of 149 refuses it as unreadable; 149 (T-1279, design B): AREA_FRESH's ASK for an area no live game holds (nobody, a holder not in the world, or the asker) is answered from this process's records - the area's record when newer than the asker's stamp, then FRESH; else CANT current (areafresh.h ServerRecordAnswer) - where 148 answered CANT noHolder and the game loaded an older copy; 148 (decision 1556, on top of T-860's 147): AREAS ends with a flags byte - kAreasFlagLoading marks a report sent while the game's zone manager is loading, on which this process changes no listing and no holder; an unmarked report's pairs are the areas the game's engine KEEPS (areadrop.h, areaclaim.h AreasReportListing); 147 (T-860): cage.<sx>.<sy>.#<hash>.<x10>.<z10> records (src/common/cagerec.h) - a cage's lock, written only by the holder of its area; a world server of 146 would keep one as a squad's record. 146 (T-1269): SQUAD_RELEASE with the id "*" ends a returning game's re-claim batch - the squads it registered before this process started and did not re-claim are released (store_main.cpp SquadReclaimEnd, squadwriterreg.h ReclaimEndStep); 145 (T-1061): a box record may end with its LOCK BLOCK (boxrec.h kBrFlagLock), which a reader of 144 refuses; 144 (T-23): a piece record may be a HAND-OVER SEED (piecerec.h kPrFlagHanded) naming another player the owner; the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_KEPT = 69, MSG_GROUND_REFUSE = 71, MSG_BOX_REFUSE = 72, MSG_MONEY_SEND = 73, MSG_MONEY_SENT_OK = 74, MSG_MONEY_DELIVER = 75, MSG_MONEY_APPLIED = 76, MSG_MONEY_REFUSE = 77, MSG_PIECE_REFUSE = 79, MSG_BOX_TAKEN = 80, MSG_BOX_ASK = 81, MSG_BOX_ASKED = 82 };   /* T-810: MONEY (73-77) - src/common/moneywire.h */
 const int MSG_AREA_RECORDED = 83;   /* T-1084 step 3 (protocol 121): AREA_RECORDED, up MARK / down LIST, MARK - src/common/arearec.h */
 const int MSG_SQUAD_TAKE = 84, MSG_SQUAD_WRITER = 85, MSG_SQUAD_RELEASE = 86;   /* T-1084 step 5 (protocol 122): a take up, the writer register's answer down, the writer's release up - src/common/squadwriterreg.h */
@@ -273,7 +273,7 @@ long long g_afAsks = 0, g_afWritesSent = 0, g_afFresh = 0, g_afCant = 0, g_afMal
 long long g_afSettleAsks = 0, g_afSettleFresh = 0, g_afSettleGrants = 0, g_afSettleWaits = 0, g_afLeaseLostTold = 0, g_afLeaseEndStored = 0;
 long long g_afSettleLists = 0, g_afSettleListStops = 0, g_afWfAsks = 0, g_afWfGrants = 0, g_afWfWaits = 0, g_afWfFresh = 0, g_afWfDone = 0, g_afWfEnded = 0, g_zoneStaleBase = 0, g_zoneSmallerReplaced = 0;   /* T-1429 s2 fold 2 (review F1364 B / C / D): areaFreshList[lists,stops] worldFirst[asks,grants,waits,fresh,done,ended]; fold 3 (F1372): zoneBase[staleRefused,smallerReplaced] on the REPORT line */
 std::map<std::string, unsigned> g_zoneWriterConn;   /* s2 fold 3: an area record id -> the connection whose upload is the stored copy (ServerBaseJudge's own-chain rule) */
-bool AfSend(ENetPeer* to, unsigned kind, unsigned why, int x, int y, long long stamp);   /* defined with AREA_FRESH below */
+bool AfSend(ENetPeer* to, unsigned kind, unsigned why, int x, int y, long long stamp, long long storedStamp = -1, unsigned long long storedSeq = 0ULL);   /* defined with AREA_FRESH below; T-1391 fold 2: storedStamp >= 0 = a record refusal's long form (areafresh::EncodeRecRefusal) */
 void AfStoredStands(int key, int slot);   /* s2 fold 2 (D) / fold 3: defined with AREA_FRESH below - a lease holder's upload refused (stale base) ends its lease (FRESH to its waiters) */   /* T-1429 s2 fold 1: areaFreshSettle[asks,fresh,grants,waits,leaseLostTold,endStored] */
 long long g_afLeaseGrants = 0, g_afLeaseWaits = 0, g_afLeaseDone = 0, g_afLeaseEnded = 0, g_afLeaseGone = 0, g_afLeaseRefused = 0, g_afClaims = 0, g_afClaimNotWorlds = 0;   /* T-1429 s2: areaFreshLease[...] on the REPORT line */
 long long g_afRecUnreadable = 0;   /* T-1279 fold 2 (re-check F): ASKs answered from the records whose file could not be read - no FRESH sent */
@@ -9955,6 +9955,19 @@ void OnAreaRecorded(ENetHost* host, ENetPeer* from, const std::vector<char>& pay
     }
     if (g_arLines < 200) { ++g_arLines; Log("AREA_RECORDED " + where + " from " + PeerName(from) + " (its holder) - marked, kept in recorded_areas.txt and sent to every game (" + ArCounters() + ")"); }
 }
+/* T-1391 (F1565; manager design B, 2026-11-20): EVERY AREA RECORD GETS AN ANSWER. The three roads that refused an area record with nothing
+   sent back (not the holder, the creation-lease rule, not newer) now tell its sender CANT with their own reason (areafresh kWhyRec*), as the
+   stale-base road already did - a game replaying its queued area saves waits for the answer before its load. */
+long long g_zoneRefusalTold = 0, g_zoneRefusalNotTold = 0;
+/* fold 2 (review of 2ab363d9c): the refusal carries the REFUSED UPLOAD's stamp (the game matches it to its send) and the stored copy's stamp
+   and seq (0 when none / not known); a failed disk write of an area record answers too (recWriteFailed) */
+bool AfRecordRefusedTell(ENetPeer* from, unsigned connect, int zx, int zy, unsigned why, long long uploadStamp, long long storedStamp, unsigned long long storedSeq)
+{
+    const bool live = from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect;
+    const bool told = live && AfSend(from, areafresh::kCant, why, zx, zy, uploadStamp < 0 ? 0 : uploadStamp, storedStamp < 0 ? 0 : storedStamp, storedSeq);
+    if (told) ++g_zoneRefusalTold; else ++g_zoneRefusalNotTold;
+    return told;
+}
 void ZoneRefuse(const std::string& fromName, const std::string& id, const std::string& holderId, const std::string& senderId)
 {
     ++g_zoneRefusedNotHolder;
@@ -9964,7 +9977,7 @@ void ZoneRefuse(const std::string& fromName, const std::string& id, const std::s
     g_zoneRefuseLogAt[id] = now;
     Log("ZONE " + SanitizeForLog(id) + " from " + fromName + " (" + SanitizeForLog(senderId) + ") REFUSED - "
         + zonerec::ZoneJudgeWhy(zonerec::kZrRefuseNotHolder) + "; its holder is " + SanitizeForLog(holderId)
-        + " (dropped, nothing sent back; logged once a minute per record: " + ZoneCounters() + ")");
+        + " (dropped, the sender told CANT recNotHolder; logged once a minute per record: " + ZoneCounters() + ")");
 }
 /* T-1243 (owner 1518, 2026-11-05): AN AREA RECORD THIS SERVER CANNOT READ TO ITS END IS NOT KEPT. Run T2079: a game sent an area file
    with 1,180 zero bytes inside a building record; it was stored, and every game entering that area froze in Kenshi's own load. The
@@ -9976,7 +9989,7 @@ void ZoneRefuse(const std::string& fromName, const std::string& id, const std::s
    One line per refusal for the first 100 - the record, its size, where reading stopped and the sender's slot (no address, player id or
    name); the counters ride ZoneCounters(). */
 void AreaFreshRefused(const std::string& id, int slot, unsigned connect);   /* defined with AREA_FRESH below */
-int AfLeaseRecordJudge(int sx, int sy, ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& id, size_t bytes);   /* T-1429 s2: defined with AREA_FRESH below */
+int AfLeaseRecordJudge(int sx, int sy, ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& id, size_t bytes, long long stamp);   /* T-1429 s2: defined with AREA_FRESH below */
 void ZoneUnreadableRefuse(ENetPeer* from, unsigned connect, const std::string& id, size_t bytes, size_t stop)
 {
     ++g_zoneRefusedUnreadable;
@@ -10998,13 +11011,13 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
             /* T-1429 s2 (owner 1788): while a creation lease of the area is out, only its holder's record is taken - the area's first copy,
                whoever the area table names as holder; any other game's is refused, as is one from a connection told its loaded copy is
                not the world's (areafresh::LeaseRecordJudge) */
-            const int lv = AfLeaseRecordJudge(zsx, zsy, from, connect, fromName, r.worldId, bytes.size());
+            const int lv = AfLeaseRecordJudge(zsx, zsy, from, connect, fromName, r.worldId, bytes.size(), r.writtenAt);
             if (areafresh::LeaseRecordTakes(lv) == 0) return;
             const std::string holderId = ZoneHolderIdOf(zsx, zsy);
             const std::string senderId = zonerec::ZoneSenderId(fromId,   /* fold 1 (F3): the id as it arrived, kept with a held message */
                 (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect) ? PeerIdOf(from) : std::string());
             const int zwhy = lv == areafresh::kLrTakeLease ? zonerec::kZrAccept : zonerec::ZoneJudgeWrite(holderId, senderId);
-            if (zonerec::ZoneJudgeTakes(zwhy) == 0) { ZoneRefuse(fromName, r.worldId, holderId, senderId); return; }
+            if (zonerec::ZoneJudgeTakes(zwhy) == 0) { AfRecordRefusedTell(from, connect, zsx, zsy, areafresh::kWhyRecNotHolder, r.writtenAt, 0, 0ULL); ZoneRefuse(fromName, r.worldId, holderId, senderId); return; }   /* T-1391: the sender told */
             {   /* T-1243 (owner 1518): an area record that cannot be read to its end is refused HERE - before the not-newer test, the checksum and the write below (ZoneUnreadableRefuse) */
                 size_t zstop = 0;
                 const int zread = zonecheck::Readable((const unsigned char*)&bytes[0], bytes.size(), &zstop);
@@ -11095,7 +11108,13 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
     }
     else
     {
-        if (it != g_records.end() && it->second.writtenAt >= r.writtenAt) { Log("RECORD " + SanitizeForLog(r.worldId) + " not newer - ignored"); return; }
+        if (it != g_records.end() && it->second.writtenAt >= r.writtenAt)
+        {
+            Log("RECORD " + SanitizeForLog(r.worldId) + " not newer - ignored");
+            int nzx = 0, nzy = 0;   /* T-1391: an area record's sender is told (CANT recNotNewer, with the stored copy's stamp) */
+            if (zonerec::ZoneRecIdParse(r.worldId, &nzx, &nzy) != 0) AfRecordRefusedTell(from, connect, nzx, nzy, areafresh::kWhyRecNotNewer, r.writtenAt, it->second.writtenAt, it->second.seq);
+            return;
+        }
         {   /* T-1429 s2 fold 3 (review F1372 BLOCKER): COMPARE-AND-SET (areafresh::ServerBaseJudge) - an area record made from an older stored
                copy is refused and its sender told CANT staleBase; an open area request of it is answered as for any refused record */
             int zx = 0, zy = 0;
@@ -11110,7 +11129,7 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
                 if (areafresh::ServerBaseJudge(storedFile, storedFile != 0 ? it->second.seq : 0ULL, base, bySender) == areafresh::kBaseStale)
                 {
                     ++g_zoneStaleBase;
-                    const bool told = live && AfSend(from, areafresh::kCant, areafresh::kWhyStaleBase, zx, zy, it->second.writtenAt);
+                    const bool told = live && AfRecordRefusedTell(from, connect, zx, zy, areafresh::kWhyStaleBase, r.writtenAt, it->second.writtenAt, it->second.seq);   /* T-1391 fold 2: the upload's stamp, then the stored copy's stamp and seq */
                     if (g_zoneStaleBase <= 200)
                         Log("[ZONE] STALE BASE zone=" + N((long long)zx) + "." + N((long long)zy) + " from=" + N((long long)fromSlot) + " base=" + N((long long)base) + " stored seq=" + N((long long)it->second.seq) + " (" + N(it->second.len)
                             + " bytes, writtenAt " + N(it->second.writtenAt) + ") - its " + N((long long)bytes.size()) + "-byte copy was made from an older copy: refused, not stored" + (told ? ", the sender told CANT staleBase" : ", the sender NOT told (gone)")
@@ -11421,10 +11440,10 @@ typedef char AfLineNumbersAgree[(livefirst::kTypeAreaFresh == areafresh::kMsgAre
                                  && livefirst::kFreshKindWrite == (unsigned)areafresh::kWrite && livefirst::kFreshKindCant == (unsigned)areafresh::kCant
                                  && livefirst::kFreshKindFresh == (unsigned)areafresh::kFresh && coopsb::kTypeRecordFrame == (unsigned)MSG_RECORD
                                  && livefirst::kFreshKindLease == (unsigned)areafresh::kLease && livefirst::kFreshKindWait == (unsigned)areafresh::kWait) ? 1 : -1];
-bool AfSend(ENetPeer* to, unsigned kind, unsigned why, int x, int y, long long stamp)
+bool AfSend(ENetPeer* to, unsigned kind, unsigned why, int x, int y, long long stamp, long long storedStamp, unsigned long long storedSeq)
 {
     std::vector<char> b;
-    if (to == 0 || !areafresh::Encode(&b, kind, why, x, y, stamp)) return false;
+    if (to == 0 || !(storedStamp >= 0 ? areafresh::EncodeRecRefusal(&b, why, x, y, stamp, storedStamp, storedSeq) : areafresh::Encode(&b, kind, why, x, y, stamp))) return false;
     if (kind != (unsigned)areafresh::kWrite) AoifCatchUpNow(to, cooplive::AreaKey(x, y), "an answer of it is due");   /* T-1339 fold 1 (MED 4): a FRESH / CANT never passes its area's catch-up - a waiting or running one ends first, its DONE ahead of this */
     int onRest = 0, onBulk = 0;
     if (kind != (unsigned)areafresh::kWrite) SbZoneRecordLines(to, areafresh::Key(x, y), &onRest, &onBulk);
@@ -11693,7 +11712,7 @@ void AfClaim(ENetPeer* from, int slot, const areafresh::Msg& m)
         + "): CANT notWorlds; this connection's records of the area are refused until it asks for the area again (claimNotWorlds=" + N(g_afClaimNotWorlds) + ")" + (sent ? std::string() : std::string(" - NOT sent")));
 }
 /* RECORD (OnRecordFrom, an area record with its file): the lease rule (areafresh::LeaseRecordJudge) - logged; the caller returns on a refusal */
-int AfLeaseRecordJudge(int sx, int sy, ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& id, size_t bytes)
+int AfLeaseRecordJudge(int sx, int sy, ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& id, size_t bytes, long long stamp)
 {
     const int key = areafresh::Key(sx, sy);
     std::map<int, AfPending>::iterator lr = g_afPending.find(key);
@@ -11711,10 +11730,11 @@ int AfLeaseRecordJudge(int sx, int sy, ENetPeer* from, unsigned connect, const s
     else if (v != areafresh::kLrNone)
     {
         ++g_afLeaseRefused;
+        AfRecordRefusedTell(from, connect, sx, sy, areafresh::kWhyRecLease, stamp, 0, 0ULL);   /* T-1391: the sender told */
         if (g_afLeaseRefused <= 64)
             Log("AREA_FRESH lease zone=" + AfXy(sx, sy) + " upload " + SanitizeForLog(id) + " (" + N((long long)bytes) + " bytes) from " + fromName + " (slot " + N((long long)slot) + ") REFUSED - "
                 + (v == areafresh::kLrRefuseLease ? "slot " + N((long long)lr->second.holder) + " holds the area's creation lease; its copy is the first" : std::string("this connection was told its loaded copy of the area is not the world's (notWorlds)"))
-                + " (dropped, nothing sent back; leaseRefused=" + N(g_afLeaseRefused) + ", first 64 logged)");
+                + " (dropped, the sender told CANT recLease; leaseRefused=" + N(g_afLeaseRefused) + ", first 64 logged)");
     }
     return v;
 }
@@ -12196,7 +12216,12 @@ void WriterApplyOne(WriteJob* j)
     const std::string& id = j->key;
     if (j->from == kFromSquad)
     {
-        if (!j->ok) { Log("RECORD " + SanitizeForLog(id) + " - could not write " + FileOf(id) + " and " + MetaOf(id) + "; the index in memory is left unchanged"); AreaFreshLanded(id, false, 0); return; }
+        if (!j->ok)
+        {
+            Log("RECORD " + SanitizeForLog(id) + " - could not write " + FileOf(id) + " and " + MetaOf(id) + "; the index in memory is left unchanged");
+            { int fzx = 0, fzy = 0; if (zonerec::ZoneRecIdParse(id, &fzx, &fzy) != 0) AfRecordRefusedTell(j->peer, j->peerConnect, fzx, fzy, areafresh::kWhyRecWriteFailed, j->rec.writtenAt, 0, 0ULL); }   /* T-1391 fold 2: an area record's sender told (recWriteFailed) */
+            AreaFreshLanded(id, false, 0); return;
+        }
         const Record& r = j->rec;
         g_records[id] = r;
         { int wzx = 0, wzy = 0; if (zonerec::ZoneRecIdParse(id, &wzx, &wzy) != 0) g_zoneWriterConn[id] = j->peerConnect; }   /* T-1429 s2 fold 4 (review F1376 SHOULD): the stored copy's writer, once its write has landed (a failed write leaves the earlier writer) */
@@ -15071,8 +15096,8 @@ void ProfilesDeferredRetry()
     LoadProfiles();   /* clears g_profiles, then reads the file - or finds it still held */
     if (g_profLoadDeferred != 0) { g_profiles = mem; return; }   /* still held - look again next second */
     std::vector<coopprof::Row> merged;
-    int added = 0;
-    const int clash = coopprof::RowsMergeHeld(g_profiles, mem, &merged, &added);
+    int added = 0, changed = 0;
+    const int clash = coopprof::RowsMergeHeld(g_profiles, mem, &merged, &added, &changed);   /* T-1452 fold 2: changed - played marks / pending imports kept */
     if (clash > 0)
     {
         const size_t fileRows = g_profiles.size();
@@ -15084,9 +15109,9 @@ void ProfilesDeferredRetry()
         return;
     }
     g_profiles = merged;
-    Log("profiles: READ AT LAST after another program held it - " + N((long long)added) + " profile(s) made meanwhile merged in"
-        + std::string(added > 0 ? " and written" : "") + "." + coopstore::FileLockedToken());
-    if (added > 0) WriteProfiles();
+    Log("profiles: READ AT LAST after another program held it - " + N((long long)added) + " profile(s) made meanwhile merged in, " + N((long long)changed)
+        + " profile(s) whose played mark or pending import changed meanwhile kept" + std::string(added > 0 || changed > 0 ? " and written" : "") + "." + coopstore::FileLockedToken());
+    if (added > 0 || changed > 0) WriteProfiles();
 }
 void WriteProfiles()
 {
@@ -15124,6 +15149,7 @@ std::string SpImportOption(const char* key)
     return it == g_options.end() ? std::string() : it->second;
 }
 long long g_profRefusedImport = 0, g_profImportAllowed = 0;   /* T-1096: NEW with import refused / let through by the host's option */
+long long g_profImportAttached = 0;   /* T-1452: NEW with import attached to the asker's own never-played profile */
 /* T-1383: creatorClaim = this answers the NEW with import whose profile was just given the world's creator claim; any other answer
    carries CREATOR while an import now would make the creator (CreatorOpenNow). */
 void ProfilesAnswer(ENetPeer* to, const std::string& person, int answers, int verdict, unsigned subject, bool creatorClaim = false)
@@ -15134,6 +15160,15 @@ void ProfilesAnswer(ENetPeer* to, const std::string& person, int answers, int ve
                                         spimport::IncludesOf(SpImportOption(spimport::kKeyMoney)), spimport::IncludesOf(SpImportOption(spimport::kKeyResearch)),
                                         creatorClaim || CreatorOpenNow());   /* T-1383 */
     for (size_t i = 0; i < g_profiles.size(); ++i) if (g_profiles[i].person == person && g_profiles[i].active) a.rows.push_back(g_profiles[i]);
+    for (size_t i = 0; i < a.rows.size(); ++i)   /* T-1452: the pending import rides every row of the list */
+    {
+        a.rows[i].creatorAsk = coopprof::CreatorAskForRow(g_creator.held, g_creator.person, g_creator.num, g_creator.ask, g_creator.done, a.rows[i]);   /* T-1452 fold (S1) */
+        if (!a.rows[i].imports.empty())
+            Log("[IMPORT] profiles: the list to " + PeerName(to) + " says profile " + coopprof::ProfileId(person, a.rows[i].num) + " imports single-player save '"
+                + SanitizeForLog(a.rows[i].imports) + "' (" + (a.rows[i].played ? "played - not taken" : "never played") + ")"
+                + (a.rows[i].creatorAsk != 0 ? std::string(" - it holds the world's creator claim, still asking dead=") + worldhist::YesNo((a.rows[i].creatorAsk & worldhist::kAskDead) != 0)
+                                                 + std::string(" relations=") + worldhist::YesNo((a.rows[i].creatorAsk & worldhist::kAskRelations) != 0) : std::string()));
+    }
     std::vector<char> m; coopprof::EncodeAnswer(&m, a);
     SendMsg(to, MSG_PROFILES, m);
     if (verdict == coopprof::kRefusedCap) ++g_profRefusedCap;
@@ -15275,7 +15310,12 @@ void ProfilePlayedMark(ENetPeer* from, unsigned num, const char* why)
         return;
     }
     g_profiles[(size_t)i].played = 1;
+    std::string wasImport;
+    const bool importEnded = coopprof::ImportsClear(&g_profiles[(size_t)i], coopprof::kImportsPlayed, &wasImport);   /* T-1452: the import's own save ends it */
     WriteProfiles();
+    if (importEnded)
+        Log("[IMPORT] profiles: profile " + coopprof::ProfileIdOfKey(key) + "'s pending import of single-player save '" + SanitizeForLog(wasImport)
+            + "' is CLEARED - " + coopprof::ImportsEndName(coopprof::kImportsPlayed));
     ++g_profPlayedMarked;
     Log("profile " + coopprof::ProfileIdOfKey(key) + " '" + g_profiles[(size_t)i].name + "' is PLAYED now - its first finished save reached this notebook ("
         + why + "); HOST / JOIN of it loads its save from here on");
@@ -15290,8 +15330,8 @@ void TeamProfilesReconcile()
 void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
 {
     (void)host;
-    int kind = 0; unsigned num = 0, ask = 0; std::string name;
-    if (!coopprof::DecodeRequest(payload, &kind, &num, &name, &ask))   /* T-1383: kind 7 may end with the creator's ask */
+    int kind = 0; unsigned num = 0, ask = 0; std::string name, impFolder;
+    if (!coopprof::DecodeRequest(payload, &kind, &num, &name, &ask, &impFolder))   /* T-1383: kind 7 may end with the creator's ask; T-1452: then the import's folder */
     {
         ++g_profRefusedOther;
         Log("profiles: malformed PROFILES from " + PeerName(from) + " (" + N((long long)payload.size()) + " bytes) - ignored");
@@ -15339,16 +15379,37 @@ void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload
     if (kind == coopprof::kReqNew || kind == coopprof::kReqNewImport)
     {
         unsigned made = 0;
-        const int v = coopprof::NewDecide(g_profiles, person, name, ProfileCap(), num, &made);
-        const bool claim = kind == coopprof::kReqNewImport && v == coopprof::kOk && CreatorOpenNow();   /* T-1383: asked before the row is added */
-        if (v == coopprof::kOk)
+        int attach = -1;   /* T-1452 (design B): NEW with import naming the player's OWN never-played profile attaches the import to it */
+        const int v = kind == coopprof::kReqNewImport ? coopprof::NewImportDecide(g_profiles, person, name, ProfileCap(), num, &made, &attach)
+                                                      : coopprof::NewDecide(g_profiles, person, name, ProfileCap(), num, &made);
+        const bool claim = kind == coopprof::kReqNewImport && v == coopprof::kOk && attach < 0 && CreatorOpenNow();   /* T-1383: asked before the row is added */
+        if (v == coopprof::kOk && attach >= 0)
+        {   /* T-1452: ATTACH - no new row; the row keeps this import until it is played or deleted */
+            coopprof::Row& r = g_profiles[(size_t)attach];
+            const std::string before = r.imports;
+            if (!impFolder.empty()) r.imports = impFolder;
+            WriteProfiles();
+            ++g_profImportAttached;
+            Log("[IMPORT] profiles: NEW with import '" + SanitizeForLog(name) + "' from " + PeerName(from) + " names its own never-played profile "
+                + coopprof::ProfileId(person, made) + " - ATTACHED, not nameTaken: its first start imports single-player save '" + SanitizeForLog(r.imports) + "'"
+                + (before.empty() ? std::string(" (it had no import)") : before == r.imports ? std::string(" (the same import again)") : " (replacing '" + SanitizeForLog(before) + "')")
+                + (impFolder.empty() ? std::string(" - WARNING: the request named no folder (a game before world-server protocol 173 cannot reach here)") : std::string())
+                + ". profImportAttached=" + N(g_profImportAttached));
+        }
+        else if (v == coopprof::kOk)
         {
             coopprof::Row r; r.person = person; r.num = made; r.slot = -1; r.created = NowUnix(); r.lastPlayed = 0; r.active = 1; r.name = name;
             r.faction = coopprof::NamelessFree(g_profiles, -1);   /* T-368 (owner 472): a new player's faction is the lowest free "Nameless <n>" */
+            if (kind == coopprof::kReqNewImport) r.imports = impFolder;   /* T-1452 (design B): the pending import is the world server's, kept with the row */
             g_profiles.push_back(r);
             WriteProfiles();
             ++g_profMade;
             Log("profiles: made " + coopprof::ProfileId(person, made) + " '" + name + "' (faction '" + SanitizeForLog(r.faction) + "') for " + PeerName(from) + " - it has no slot until it is played");
+            if (!r.imports.empty())
+                Log("[IMPORT] profiles: profile " + coopprof::ProfileId(person, made) + " keeps 'imports " + SanitizeForLog(r.imports) + "' in profiles.txt - sent with every"
+                    " list; any game admitting it never played imports that single-player save; cleared only when it is played or deleted (T-1452)");
+            else if (kind == coopprof::kReqNewImport)
+                Log("[IMPORT] profiles: WARNING - the NEW with import for " + coopprof::ProfileId(person, made) + " named no single-player save folder - nothing is kept on the row");
             TakenSendAll("a new profile holds '" + SanitizeForLog(r.faction) + "'");
             if (claim)
             {   /* T-1383 (decision 1704): the world's first profile, made with import - the world's creator claim, with what it asked for */
@@ -15370,6 +15431,8 @@ void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload
     else
     {
         const std::string key = coopprof::SlotKey(person, num);
+        const int di = coopprof::FindRow(g_profiles, person, num);
+        const std::string hadImport = di >= 0 ? g_profiles[(size_t)di].imports : std::string();   /* T-1452: DeleteApply clears it */
         const int v = coopprof::DeleteApply(&g_profiles, person, num, ProfileBeingPlayed(key) ? 1 : 0);   /* T-201 PP6' (owner 178a): the one delete - the host's CHANGE applies it too */
         if (v == coopprof::kOk)
         {
@@ -15380,6 +15443,9 @@ void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload
                 + " - its number and its slot are never given out again; its buildings stay; the player's game deletes its save folder and records store for good;"
                   " its player name '" + r.name + "' and faction name '" + SanitizeForLog(r.faction) + "' are free again");
             TakenSendAll("a deleted profile's faction name '" + SanitizeForLog(r.faction) + "' is free");
+            if (!hadImport.empty())
+                Log("[IMPORT] profiles: profile " + coopprof::ProfileId(person, num) + "'s pending import of single-player save '" + SanitizeForLog(hadImport)
+                    + "' is CLEARED - " + coopprof::ImportsEndName(coopprof::kImportsDeleted));
             g_facOwed.erase(coopprof::SlotKey(person, num));   /* T-368: nothing is owed to a deleted profile */
             g_facTold.erase(coopprof::SlotKey(person, num));   /* T-717: nor remembered as told */
             TeamProfileDeleted(coopprof::ProfileId(person, num), true);   /* T-546 (owner 482 a): its faction membership */

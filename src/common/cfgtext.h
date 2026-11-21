@@ -148,6 +148,14 @@ struct CfgFields
        0 = absent = off. */
     int            benchCapKbs;
     int            netRateLog;
+    /* T-1401 step 2c (owner 1784) - TEST ONLY, no writer carries it (bugreport.cpp reads it): bugrelay=test - this game's bug reports
+       and its uploads into a report's thread go to the TEST report service (coopbug::kRelayTestUrl), which never posts to Discord;
+       test503 / test404 - the same, and a thread upload asks that service to answer its first tries 503 / its first try 404.
+       Values = coopbug::kRelay*: 0 real (= absent), 1 test, 2 test503, 3 test404. */
+    int            bugRelay;
+    /* T-1401 step 2c (2026-11-19) - TEST ONLY, no writer carries it: bugrelayport=<1..65535> - with a test bugrelay= value, this
+       game posts to the bench's LOCAL test service at http://127.0.0.1:<port>/ (coopbug::RelayAddress); never with the real one. 0 = absent. */
+    int            bugRelayPort;
     /* TEST ONLY, no writer carries it: hosttoken=<64 lowercase hex digits> - the hosting secret the bench started this game's world
        server with, read only from the bench's test file and only by a host (config.cpp), so a bench-started world's own game's Steam
        bridge shows it in each STEAM_ID without the HOST panel. Never logged. Empty = absent = off. */

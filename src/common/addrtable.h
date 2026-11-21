@@ -60,6 +60,7 @@ enum AddrKind
 
 const int kAddrNameMax  = 48;   /* including the terminator */
 const int kAddrBytesMax = 16;
+const int kAddrFeatureMax = 32;   /* T-1453: an optional row's feature name, terminator included: [a-z0-9-], 1..31 */
 const int kAddrMaxEntries = 1024;   /* rows a table may hold; a table with more is refused whole at load (the suite checks every shipped table against it) */
 
 struct AddrEntry
@@ -71,6 +72,10 @@ struct AddrEntry
     unsigned int  ptrRva;                       /* kAddrPtr only */
     unsigned char bytes[kAddrBytesMax];
     int           nbytes;                       /* 0 for kAddrVar and kAddrPtr */
+    char          optional[kAddrFeatureMax];    /* T-1453 / T-294: "" = a REQUIRED row; else the feature a miss switches
+                                                   off (the table's / signature's 'optional:<feature>') */
+    int           missed;                       /* T-1453: 1 = an optional row not found or failing its check -
+                                                   rva 0, so every slot bound to it is 0: its feature off */
     AddrEntry();
 };
 
@@ -132,6 +137,18 @@ void AddrClearSlots(const AddrSlot* slots, int n);
    refusal leaves the slots filled (addresses.h, AddrAbs: a refusal does not mean 0). */
 int AddrSettleSlots(const AddrEntry* entries, int count, const AddrSlot* slots, int n, int mismatched, int byPattern,
                     int* missing, int* firstMissing);
+
+/* T-1453 / T-294 (owner 1823 a) - OPTIONAL ROWS. A table line (or a signature line) may end in 'optional:<feature>': a row only
+   a minor feature, a diagnostic or a test lever uses. When such a row is not found or fails its check against the running
+   game, ONLY that feature is off: AddrOptionalMiss marks the entry missed (rva, verifyAt, bytes all 0 - the bind then gives
+   0 to every slot of it, and every user checks for 0 before any call or hook) and returns 1; the gate does not count it as a
+   mismatch, and the mod runs. A REQUIRED row (no marker) returns 0 and is untouched: it still switches the whole mod off.
+   'feature' is [a-z0-9-], 1..31 characters. */
+int AddrFeatureOk(const char* p, std::size_t n);
+int AddrOptionalMiss(AddrEntry* e);
+/* The one log line for a missed optional row (the owner's 'make sure the log reports it'):
+   "[ADDR] optional row <name> not found - <feature> is off (<why>)" */
+std::string AddrOptionalMissLine(const AddrEntry& e, const std::string& why);
 
 }   /* namespace coopaddr */
 

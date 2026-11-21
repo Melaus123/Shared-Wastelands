@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <utility>
 #include "storemeta.h"   /* coopstore::Crc32 - CRC-32 IEEE, the zip definition */
 
 namespace coopbug {
@@ -41,6 +42,32 @@ namespace coopbug {
    kErrNoRelay. Either way the CAN'T SEND REPORT box says so, as for any other failed send.
    ------------------------------------------------------------------------------------------------------------------ */
 const char* const kRelayUrl = "https://kenshi-bug-relay.allscott16.workers.dev/";
+/* T-1401 step 2c (owner 1784): the TEST copy of the report service (tools/relay/bug-report-test-worker.js). It checks an upload as
+   the real one does and answers in the same form, but it NEVER posts to Discord. A game uses it only under the TEST-ONLY cfg setting
+   bugrelay=test (or test503 / test404, which also ask it, through the form field test_status, to answer a thread upload's first tries
+   with 503 or its first try with 404); no writer carries the setting, so a player's game always uses kRelayUrl. Values = CfgFields::bugRelay. */
+const char* const kRelayTestUrl = "https://kenshi-bug-relay-test.allscott16.workers.dev/";
+enum { kRelayReal = 0, kRelayTest = 1, kRelayTest503 = 2, kRelayTest404 = 3 };
+inline const char* RelayUrlFor(int mode) { return mode == kRelayReal ? kRelayUrl : kRelayTestUrl; }
+inline const char* RelayModeName(int mode)
+{ return mode == kRelayTest ? "test" : mode == kRelayTest503 ? "test503" : mode == kRelayTest404 ? "test404" : "real"; }
+/* T-1401 step 2c (2026-11-19: nothing waits on the owner putting the test service online) - TEST ONLY: bugrelayport=<port> sends a
+   test game's reports and thread uploads to the bench's LOCAL copy of the test service (tools/relay/local_test_service.mjs, which
+   runs bug-report-test-worker.js itself) at http://127.0.0.1:<port>/ instead of kRelayTestUrl. Only under a test bugrelay= value:
+   the real service is never redirected. Plain HTTP is allowed for this one loopback address only (RelayPlainOk); every other
+   address stays HTTPS only. localPort = CfgFields::bugRelayPort (0 = absent). */
+const char* const kRelayLocalHost = "127.0.0.1";
+inline std::string RelayAddress(int mode, int localPort)
+{
+    if (mode == kRelayReal || localPort <= 0 || localPort > 65535) return RelayUrlFor(mode);
+    char d[8]; int n = 0; unsigned int v = (unsigned int)localPort;
+    do { d[n++] = (char)('0' + v % 10u); v /= 10u; } while (v != 0u && n < 7);
+    std::string out = std::string("http://") + kRelayLocalHost + ":";
+    while (n > 0) out += d[--n];
+    return out + "/";
+}
+/* the one address a post may reach without HTTPS: the local test service (isHttp = the address is plain http://) */
+inline int RelayPlainOk(int isHttp, const std::string& host) { return isHttp != 0 && host == kRelayLocalHost ? 1 : 0; }
 
 /* ---------------------------------------------------------------------------------------------------------------------
    LIMITS
@@ -218,6 +245,122 @@ inline std::string SecureFailureText(unsigned long flags)
     return "secure connection refused: " + out + b;
 }
 inline bool SendSucceeded(int winErr, int httpStatus) { return winErr == 0 && httpStatus >= 200 && httpStatus <= 299; }
+/* T-1401 step 2c (owner 1784, F1277 design a). THE SERVICE'S ANSWER names the Discord post (thread) the upload opened or joined:
+   'sent thread=<id>' - <id> 1 to 20 decimal digits, not 0, at most 2^64-1, ended by anything that is not a digit (the test
+   service adds the sizes it received after a space). Any other answer - the plain 'sent' of the service before step 2c - names
+   none: 0. */
+inline unsigned long long ThreadOfReply(const std::string& body)
+{
+    const std::string head = "sent thread=";
+    if (body.compare(0, head.size(), head) != 0) return 0;
+    unsigned long long v = 0;
+    size_t i = head.size(), digits = 0;
+    for (; i < body.size() && body[i] >= '0' && body[i] <= '9'; ++i, ++digits)
+    {
+        const unsigned int d = (unsigned int)(body[i] - '0');
+        if (digits >= 20 || v > (18446744073709551615ull - d) / 10ull) return 0;   /* too long for a 64-bit id */
+        v = v * 10ull + d;
+    }
+    return digits == 0 ? 0 : v;
+}
+/* The answer as one short log-safe line: at most 160 characters, line ends and other control bytes as spaces. */
+inline std::string ReplyForLog(const std::string& body)
+{
+    std::string o = body.substr(0, body.size() > 160 ? 160 : body.size());
+    for (size_t i = 0; i < o.size(); ++i) if ((unsigned char)o[i] < 0x20 || o[i] == 0x7F) o[i] = ' ';
+    while (!o.empty() && o[o.size() - 1] == ' ') o.erase(o.size() - 1);
+    return o;
+}
+/* A FRIEND'S UPLOAD INTO THE THREAD and its retries: the service answers 503 (and passes on Discord's 429 as 503) with Retry-After
+   when Discord asks it to slow down; the upload then waits that long (kRetryAfterDefaultSec when none is given, at most
+   kRetryAfterMaxSec) plus up to kRetryJitterMs, so friends that were told at once do not all try again at once - at most
+   kThreadUploadTries tries in all. 404 = the thread is gone: no retry and never a new post. Anything else ends it. */
+const unsigned int kThreadUploadTries = 4, kRetryAfterDefaultSec = 5, kRetryAfterMaxSec = 60, kRetryJitterMs = 2000;
+enum { kUpDone = 0, kUpRetry = 1, kUpGiveUp = 2, kUpThreadGone = 3 };
+inline int ThreadUploadNext(int winErr, int httpStatus, unsigned int triesDone)
+{
+    if (SendSucceeded(winErr, httpStatus)) return kUpDone;
+    if (winErr == 0 && httpStatus == 404) return kUpThreadGone;
+    if (winErr == 0 && (httpStatus == 503 || httpStatus == 429)) return triesDone < kThreadUploadTries ? kUpRetry : kUpGiveUp;
+    return kUpGiveUp;
+}
+/* TEST ONLY: the test_status field a thread upload's try `tryNo` (1-based) carries - only on the test service: bugrelay=test503 asks
+   for 503 on tries 1 and 2 (the retry is seen, try 3 lands), test404 for 404 on try 1 (thread gone); 0 = none. */
+inline const char* TestStatusFor(int relayMode, unsigned int tryNo)
+{
+    if (relayMode == kRelayTest503 && tryNo >= 1 && tryNo <= 2) return "503";
+    if (relayMode == kRelayTest404 && tryNo == 1) return "404";
+    return 0;
+}
+/* The wait before the next try, in ms: Retry-After (seconds; 0 or less = none given) capped, plus jitterRand % (kRetryJitterMs + 1). */
+inline unsigned int RetryWaitMs(int retryAfterSec, unsigned int jitterRand)
+{
+    unsigned int s = retryAfterSec <= 0 ? kRetryAfterDefaultSec : (unsigned int)retryAfterSec;
+    if (s > kRetryAfterMaxSec) s = kRetryAfterMaxSec;
+    return s * 1000u + jitterRand % (kRetryJitterMs + 1u);
+}
+/* Run T2569 (2026-11-19): the service's Retry-After header, as WinHTTP gives its text - the game reads it as text because WinHTTP
+   refuses WINHTTP_QUERY_FLAG_NUMBER for this header (error 12154, ERROR_WINHTTP_INVALID_QUERY_REQUEST: it may be a date). Seconds
+   (digits, spaces around allowed) capped at 3600; anything else (a date, a sign, empty) = 0 = none given (RetryWaitMs then waits
+   kRetryAfterDefaultSec). */
+inline int RetryAfterSeconds(const std::string& v)
+{
+    size_t a = 0, b = v.size();
+    while (a < b && (v[a] == ' ' || v[a] == '\t')) ++a;
+    while (b > a && (v[b - 1] == ' ' || v[b - 1] == '\t' || v[b - 1] == '\0')) --b;
+    if (a == b) return 0;
+    unsigned long n = 0;
+    for (size_t i = a; i < b; ++i)
+    {
+        if (v[i] < '0' || v[i] > '9') return 0;
+        n = n * 10ul + (unsigned long)(v[i] - '0');
+        if (n > 3600ul) n = 3600ul;
+    }
+    return (int)n;
+}
+/* THE RETRY LOOP ITSELF (F1287 review): the friend's worker (bugreport.cpp ThreadUploadRun) runs exactly this loop, with a
+   ThreadUploadIo that posts by WinHTTP, logs each try and sleeps; the offline suite runs it with a scripted one. One try's outcome:
+   posted = PostTo's 1 (sent), relayErr = the address was refused before any post, winErr = no answer, status = the HTTP status,
+   retryAfterSec = the answer's Retry-After (0 = none). */
+struct ThreadTry
+{
+    int posted, relayErr, winErr, status, retryAfterSec;
+    ThreadTry() : posted(0), relayErr(0), winErr(0), status(0), retryAfterSec(0) {}
+};
+struct ThreadUploadIo
+{
+    virtual ~ThreadUploadIo() {}
+    virtual ThreadTry Try(unsigned int tryNo) = 0;                        /* post try `tryNo` (1-based) and log it */
+    virtual void Wait(unsigned int ms, const ThreadTry& last) = 0;        /* log the wait and sleep `ms` */
+    virtual unsigned int Jitter() = 0;                                    /* a random number for RetryWaitMs */
+};
+/* kUpDone / kUpThreadGone / kUpGiveUp; *triesOut = the tries made. A refused address ends it at once; 503 / 429 wait
+   RetryWaitMs(Retry-After, jitter) and try again, at most kThreadUploadTries tries in all (ThreadUploadNext). */
+inline int ThreadUploadLoop(ThreadUploadIo& io, unsigned int* triesOut)
+{
+    int outcome = kUpGiveUp;
+    unsigned int tries = 0;
+    for (unsigned int tryNo = 1; tryNo <= kThreadUploadTries; ++tryNo)
+    {
+        tries = tryNo;
+        const ThreadTry o = io.Try(tryNo);
+        const int next = o.posted ? kUpDone : (o.relayErr != 0 ? kUpGiveUp : ThreadUploadNext(o.winErr, o.status, tryNo));
+        if (next == kUpRetry) { io.Wait(RetryWaitMs(o.retryAfterSec, io.Jitter()), o); continue; }
+        outcome = next;
+        break;
+    }
+    if (triesOut != 0) *triesOut = tries;
+    return outcome;
+}
+/* A SECOND LOG_THREAD WHILE AN UPLOAD RUNS (F1287 review): it is accepted (the accept rule decides at its arrival) and waits its
+   turn - at most kThreadQueueMax wait; one more is not uploaded (log line). Started at once when no upload runs and none waits. */
+const unsigned int kThreadQueueMax = 4;
+enum { kThrQStartNow = 0, kThrQWait = 1, kThrQFull = 2 };
+inline int ThreadQueueDecide(bool uploadRunning, size_t waiting)
+{
+    if (!uploadRunning && waiting == 0) return kThrQStartNow;
+    return waiting < kThreadQueueMax ? kThrQWait : kThrQFull;
+}
 
 /* ---------------------------------------------------------------------------------------------------------------------
    THE LOG SCRUB (365). Every IPv4 and IPv6 address in a log becomes a tag that says only what kind it was:
@@ -919,14 +1062,22 @@ inline std::string PickBoundary(const std::string& seed, const std::string& desc
     }
     return b;
 }
-inline std::vector<unsigned char> BuildMultipart(const std::string& boundary, const std::string& desc, const std::string& info,
-                                                 const std::vector<unsigned char>& zip)
+/* T-1401 step 2c: `extra` = more text fields after `info`, as name / value pairs (a friend's upload: thread_id, and on the test
+   service only test_status). Names and values are the game's own (digits and words), never the player's text. */
+typedef std::vector<std::pair<std::string, std::string> > FormFields;
+inline std::vector<unsigned char> BuildMultipartWith(const std::string& boundary, const std::string& desc, const std::string& info,
+                                                     const FormFields& extra, const std::vector<unsigned char>& zip)
 {
     std::string head;
     head += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"description\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n";
     head += desc;
     head += "\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"info\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n";
     head += info;
+    for (size_t k = 0; k < extra.size(); ++k)
+    {
+        head += "\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + extra[k].first + "\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n";
+        head += extra[k].second;
+    }
     head += "\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"report\"; filename=\"bug-report.zip\"\r\nContent-Type: application/zip\r\n\r\n";
     const std::string tail = "\r\n--" + boundary + "--\r\n";
     std::vector<unsigned char> body(head.begin(), head.end());
@@ -934,6 +1085,9 @@ inline std::vector<unsigned char> BuildMultipart(const std::string& boundary, co
     body.insert(body.end(), tail.begin(), tail.end());
     return body;
 }
+inline std::vector<unsigned char> BuildMultipart(const std::string& boundary, const std::string& desc, const std::string& info,
+                                                 const std::vector<unsigned char>& zip)
+{ return BuildMultipartWith(boundary, desc, info, FormFields(), zip); }
 
 /* ---------------------------------------------------------------------------------------------------------------------
    KENSHI'S CRASH FILE (367 a, 581). The mod keeps the logs of the two launches before this one (copy 1 = launch 1, the
@@ -1084,6 +1238,92 @@ struct AskQueue
 };
 /* How many parts a bundle of `total` bytes travels in (at least one). */
 inline unsigned int PartCountFor(unsigned int total) { return total == 0 ? 1u : (total + kLogPartMax - 1u) / kLogPartMax; }
+
+/* ---------------------------------------------------------------------------------------------------------------------
+   T-1401 STEP 2c (owner 1784, F1277 design a; game-to-game protocol 236): THE REPORT'S THREAD. Once the reporting game's upload
+   is answered 'sent thread=<id>', it sends LOG_THREAD (route SLOT) to every game that answered its LOG_ASK - except a game that
+   only replied 'not loaded here' (5), which sends nothing (1741 b) - and each of those games uploads its own current and previous
+   logs into that thread, with thread_id. A friend's game shows NOTHING on screen for any of this, success or failure: its log only.
+     LOG_THREAD (cooplive::kInnerLogThread) {u32 ask id, 16-byte report label, u64 thread id}                    28 bytes
+   ------------------------------------------------------------------------------------------------------------------ */
+const size_t kLogThreadBytes = 4 + kLogLabelBytes + 8;
+struct LogThread
+{
+    unsigned int askId;
+    unsigned char label[kLogLabelBytes];
+    unsigned long long thread;
+    LogThread() : askId(0), thread(0) { std::memset(label, 0, sizeof(label)); }
+};
+inline void LogThreadEncode(std::vector<char>* b, const LogThread& t)
+{
+    b->clear(); PutLe32(b, t.askId);
+    b->insert(b->end(), (const char*)t.label, (const char*)t.label + kLogLabelBytes);
+    PutLe32(b, (unsigned int)(t.thread & 0xFFFFFFFFull)); PutLe32(b, (unsigned int)(t.thread >> 32));
+}
+/* false for any other length, ask id 0 or thread 0 */
+inline bool LogThreadDecode(const char* p, size_t n, LogThread* out)
+{
+    if (p == 0 || out == 0 || n != kLogThreadBytes) return false;
+    LogThread t;
+    t.askId = GetLe32(p);
+    std::memcpy(t.label, p + 4, kLogLabelBytes);
+    t.thread = (unsigned long long)GetLe32(p + 4 + kLogLabelBytes) | ((unsigned long long)GetLe32(p + 8 + kLogLabelBytes) << 32);
+    if (t.askId == 0 || t.thread == 0) return false;
+    *out = t;
+    return true;
+}
+/* Which games the reporter tells: every game it heard from, except one whose only word was 'not loaded here' (5) - parts that
+   started arriving count as an answer whatever the reply said. */
+inline bool ThreadGoesTo(unsigned int lastCode, bool partsStarted)
+{
+    return partsStarted || (lastCode != 0 && lastCode != (unsigned int)kReplyNotLoaded);
+}
+/* THE FRIEND'S ACCEPT RULE: a LOG_THREAD is taken only for a report this game was asked about (the same asking slot, ask id and
+   label, noted when the ask arrived and was not answered 'not loaded here') within kThreadAcceptMs, and once per ask. The list
+   keeps the newest kAskedAboutMax asks. */
+const unsigned int kThreadAcceptMs = 5u * 60u * 1000u, kAskedAboutMax = 16;
+/* THE REPORTER'S SIDE OF THAT WINDOW (F1287 review): a report whose upload is answered with a thread only after a TRY AGAIN can be
+   answered long after its ask. The reporter decides from the fact it holds - how long ago it asked (`askAgeMs`, its own clock) -
+   and sends no LOG_THREAD past kThreadAcceptMs: every nearby game would refuse it (the ask came more than 5 minutes ago), so the
+   reporter's log says why and nothing is sent. A TRY AGAIN does not ask the nearby games again (it posts the report packed before). */
+inline bool ThreadAskStillFresh(unsigned int askAgeMs) { return askAgeMs <= kThreadAcceptMs; }
+enum { kThrAccept = 0, kThrNotAsked = 1, kThrTooOld = 2, kThrAlreadyUploaded = 3 };
+inline const char* ThreadRefusalWords(int r)
+{
+    if (r == kThrNotAsked) return "this game was not asked about that report by that player (no matching ask, ask id and label)";
+    if (r == kThrTooOld) return "the ask came more than 5 minutes ago";
+    if (r == kThrAlreadyUploaded) return "this game already uploaded its logs for that report";
+    return "accepted";
+}
+struct AskedAbout { unsigned int slot, askId, atMs; unsigned char label[kLogLabelBytes]; int used; };
+struct AskedList
+{
+    std::vector<AskedAbout> v;   /* oldest first */
+    void Note(unsigned int slot, unsigned int askId, const unsigned char* label, unsigned int nowMs)
+    {
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i].slot == slot && v[i].askId == askId && std::memcmp(v[i].label, label, kLogLabelBytes) == 0) return;   /* a queued ask's second look */
+        AskedAbout a;
+        a.slot = slot; a.askId = askId; a.atMs = nowMs; a.used = 0;
+        std::memcpy(a.label, label, kLogLabelBytes);
+        if (v.size() >= kAskedAboutMax) v.erase(v.begin());
+        v.push_back(a);
+    }
+    int Accept(const LogThread& t, unsigned int fromSlot, unsigned int nowMs)
+    {
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            if (v[i].slot != fromSlot || v[i].askId != t.askId || std::memcmp(v[i].label, t.label, kLogLabelBytes) != 0) continue;
+            if (v[i].used) return kThrAlreadyUploaded;
+            if (nowMs - v[i].atMs > kThreadAcceptMs) return kThrTooOld;
+            v[i].used = 1;
+            return kThrAccept;
+        }
+        return kThrNotAsked;
+    }
+};
+/* The thread id as decimal text (form field, log lines). */
+inline std::string ThreadText(unsigned long long t) { char b[32]; std::sprintf(b, "%llu", t); return b; }
 /* Part `k` of `bundle`. */
 inline void LogPartEncode(std::vector<char>* b, unsigned int askId, const std::vector<char>& bundle, unsigned int k)
 {

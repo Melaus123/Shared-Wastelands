@@ -5089,6 +5089,208 @@ std::string Swap(const std::string& s, const std::string& from, const std::strin
 }
 }   /* namespace sigt */
 
+/* T-1453 (F1542 / F1547): A ROW FROM THE ENGINE'S OWN CALL. Synthetic image (sigt::Image) plus a caller at 0x1700:
+   xor rax,rax / nop / call 0x1400 (a jmp stub to 0x1500) / nop / ret. via-call: the row's own pattern is the call site;
+   from-call: the row has no pattern and takes the call inside another row's match. Both land on 0x1500 through the stub. */
+void t_sig_row_from_a_call()
+{
+    std::vector<unsigned char> img = sigt::Image();
+    const unsigned char caller[] = { 0x48,0x31,0xC0,0x90, 0xE8,0,0,0,0, 0x90, 0xC3, 0xCC,0xCC,0xCC };
+    std::memcpy(&img[sigt::T(0x1700)], caller, sizeof(caller));
+    const unsigned int rel = 0x1400u - 0x1709u;
+    std::memcpy(&img[sigt::T(0x1705)], &rel, 4);
+    const std::string head = "# synthetic\n!sigversion 2\n!source X Y\n!nosigcount 0\n";
+    const std::string rows(std::string(sigt::kGood).substr(std::string(sigt::kGood).find("Fn code")));
+    coopaddr::AddrEntry e[16];
+    coopsigtab::SigOutcome oc;
+    /* via-call */
+    int n = sigt::Resolve(img, head + "!count 6\n" + rows + "Tg code 0 4831C090E8????????90C3 4 0 6 0 - .text 2 via-call\n", e, &oc);
+    if (n != 6 || e[5].rva != 0x1500u || e[5].kind != coopaddr::kAddrCode || e[5].nbytes != 6 || e[5].bytes[0] != 0x40)
+        Fail("via-call: the row is not the call's target through the stub: n=" + I(n) + " rva=" + I((int)e[5].rva)
+             + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+    /* from-call: the source row Caller (0x1700, rank 3) holds the call at offset 4; Tf (0x1500, rank 2) has no pattern */
+    n = sigt::Resolve(img, head + "!count 7\n" + rows + "Caller code 0 4831C090E8????????90C3 0 0 8 0 - .text 3 -\n"
+                           "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:4\n", e, &oc);
+    if (n != 7 || e[6].rva != 0x1500u || e[5].rva != 0x1700u || e[6].nbytes != 6)
+        Fail("from-call: the row is not the call's target in its source row: n=" + I(n) + " rva=" + I((int)e[6].rva)
+             + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+    /* from-call at an offset that is no call: refused (a required row) */
+    n = sigt::Resolve(img, head + "!count 7\n" + rows + "Caller code 0 4831C090E8????????90C3 0 0 8 0 - .text 3 -\n"
+                           "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:5\n", e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "Tf: its source row 'Caller' has no fixed call"))   /* T-1453 review: refused at the source's pattern */
+        Fail("from-call: a call offset that is no call was not refused: n=" + I(n));
+    /* unreadable forms: a pattern-less row without from-call, from-call on a ret row, via-call whose offset is no E8 */
+    coopsigtab::SigFile f;
+    const std::string bad = head + "!count 0\nA code 0 - 0 0 6 0 - .text 9 -\nB ret 0 - 0 5 0 0 E8???????? .text 9 from-call:Fn:0\n"
+                                   "C code 0 4831C090E8????????90C3 0 0 6 0 - .text 9 via-call\n";
+    coopsigtab::SigParseFile(bad.c_str(), bad.size(), &f);
+    if (f.badLines != 3 || !f.rows.empty()) Fail("a malformed from-call / via-call line was read: badLines=" + I(f.badLines));
+}
+
+/* T-1453 / T-294 (owner 1823 a): AN OPTIONAL ROW NOT FOUND SWITCHES OFF ONLY ITS FEATURE, AND THE LOG SAYS SO; a required row
+   not found still switches the mod off. The signature road (SigResolveAll), the bind (AddrSettleSlots), the table road's
+   marker (AddrParseTable) and its miss (AddrOptionalMiss), and the log line (AddrOptionalMissLine). */
+void t_addr_optional_row_miss()
+{
+    const std::vector<unsigned char> img = sigt::Image();
+    const std::string konst = "Konst ro 0 F30F1005????????C3CCCCCC 4 4 0 0 0000803F00000040 .rdata 0 -";
+    const std::string gone = "Konst ro 0 F30F1005????????C3CCCC77 4 4 0 0 0000803F00000040 .rdata 0 ";
+    coopaddr::AddrEntry e[16];
+    coopsigtab::SigOutcome oc;
+    /* optional and missing: the mod resolves, the row is missed with rva 0, its feature named */
+    int n = sigt::Resolve(img, sigt::Swap(sigt::kGood, konst, gone + "optional:test-feature"), e, &oc);
+    if (n != 5 || oc.missedRows.size() != 1 || oc.missedRows[0] != 3 || e[3].missed != 1 || e[3].rva != 0
+        || std::string(e[3].optional) != "test-feature" || std::string(e[3].name) != "Konst" || oc.resolved != 4 || e[0].rva != 0x1100u)
+        Fail("an optional row not found did not leave the rest resolved: n=" + I(n) + " missed=" + I((int)oc.missedRows.size())
+             + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+    const std::string line = coopaddr::AddrOptionalMissLine(e[3], oc.missedWhy.empty() ? std::string("?") : oc.missedWhy[0]);
+    if (line != "[ADDR] optional row Konst not found - test-feature is off (the pattern occurs nowhere)")
+        Fail("the optional-row log line is not the one the owner asked for: '" + line + "'");
+    /* the bind: a missed row's slot is 0, and the set is accepted (mod on) */
+    unsigned long long fn = 7, ko = 7;
+    const coopaddr::AddrSlot two[2] = { { "Fn", &fn }, { "Konst", &ko } };
+    int missing = -1, first = -2;
+    if (coopaddr::AddrSettleSlots(e, n, two, 2, 0, 1, &missing, &first) != 1 || fn != 0x1100u || ko != 0 || missing != 0)
+        Fail("a set with a missed optional row was not bound with that slot 0: fn=" + I((int)fn) + " ko=" + I((int)ko));
+    /* required and missing: refused, the row named */
+    n = sigt::Resolve(img, sigt::Swap(sigt::kGood, konst, gone + "-"), e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "Konst: the pattern occurs nowhere") || !oc.missedRows.empty())
+        Fail("a required row not found did not switch the mod off: n=" + I(n));
+    /* a cross-check naming an optional row misses it: Ret's call must land on Fn; Fn found at Glob's place instead is not
+       possible here, so a CALL TARGET to an optional row found elsewhere is made by moving Ret's recorded call to offset 7
+       (a jz, not a call) - the check names Ret (required) and refuses */
+    n = sigt::Resolve(img, sigt::Swap(sigt::kGood, "k:0:Fn", "k:7:Fn"), e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "CALL TARGET: Ret")) Fail("a cross-check naming only required rows did not refuse: n=" + I(n));
+    n = sigt::Resolve(img, sigt::Swap(sigt::Swap(sigt::kGood, "k:0:Fn", "k:7:Fn"), ".text 1 k:7:Fn", ".text 1 k:7:Fn,optional:ret-feature"), e, &oc);
+    if (n != 5 || e[2].missed != 1 || e[2].rva != 0 || oc.missedRows.size() != 1 || oc.missedWhy[0].find("CALL TARGET: Ret") == std::string::npos)
+        Fail("a cross-check naming an optional row did not miss only that row: n=" + I(n)
+             + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+    /* the table road: the marker read, a bad marker refused, and the miss */
+    const char* tab = "!fingerprint X\n!count 3\nOpt code 00001100 00001100 4889 optional:ping-key\nReq code 00001200 00001200 E8FB\n"
+                      "Bad code 00001300 00001300 4889 optional:Ping\nBad2 code 00001300 00001300 4889 optional:x more\n";
+    coopaddr::AddrEntry t[8];
+    coopaddr::AddrParseResult pr;
+    const int tn = coopaddr::AddrParseTable(tab, std::strlen(tab), t, 8, &pr);
+    if (tn != 2 || pr.badLines != 2 || std::string(t[0].optional) != "ping-key" || t[1].optional[0] != 0 || t[0].missed != 0)
+        Fail("the table's optional marker was not read as written: entries=" + I(tn) + " bad=" + I(pr.badLines));
+    if (coopaddr::AddrOptionalMiss(&t[1]) != 0 || t[1].rva != 0x1200u || t[1].missed != 0)
+        Fail("AddrOptionalMiss touched a required row");
+    if (coopaddr::AddrOptionalMiss(&t[0]) != 1 || t[0].rva != 0 || t[0].nbytes != 0 || t[0].missed != 1)
+        Fail("AddrOptionalMiss did not miss an optional row");
+}
+
+/* T-1453 review folds: (1) a 'no call at this offset' failure is the source row's alone, and a found row's check that named a
+   dropped optional row is not made - logged (SigOutcome::skipped) and counted; (3) a code row's check of the bytes at the row
+   itself; (4) a derived (from-call) row whose source is missing or dropped - required refused, optional dropped; a call
+   check on a derived row is unreadable; a source with no fixed E8 at the offset refuses; the start-up check against the
+   running game (addresses.cpp: optional -> missed, mod on; required -> refused). */
+void t_t1453_review_folds()
+{
+    std::vector<unsigned char> img = sigt::Image();
+    const unsigned char caller[] = { 0x48,0x31,0xC0,0x90, 0xE8,0,0,0,0, 0x90, 0xC3, 0xCC,0xCC,0xCC };
+    std::memcpy(&img[sigt::T(0x1700)], caller, sizeof(caller));
+    const unsigned int rel = 0x1400u - 0x1709u;
+    std::memcpy(&img[sigt::T(0x1705)], &rel, 4);
+    const std::string head = "# synthetic\n!sigversion 2\n!source X Y\n!nosigcount 0\n!count 7\n";
+    const std::string rows(std::string(sigt::kGood).substr(std::string(sigt::kGood).find("Fn code")));
+    coopaddr::AddrEntry e[16];
+    coopsigtab::SigOutcome oc;
+    int n;
+    /* (4) the source row optional and NOT FOUND (its last byte C4, not C3) */
+    const std::string gone = "Caller code 0 4831C090E8????????90C4 0 0 8 0 - .text 3 optional:caller-feature\n";
+    n = sigt::Resolve(img, head + rows + gone + "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:4\n", e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "Tf: its source row 'Caller' was not found"))
+        Fail("a required derived row whose source is missing was not refused: n=" + I(n));
+    n = sigt::Resolve(img, head + rows + gone + "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:4,optional:tf-feature\n", e, &oc);
+    if (n != 7 || oc.missedRows.size() != 2 || e[6].missed != 1 || e[6].rva != 0 || e[5].missed != 1)
+        Fail("an optional derived row whose source is missing was not dropped alone with it: n=" + I(n)
+             + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+    /* (NIT 684) the source FOUND, then dropped by a cross-check (its call at 4 lands on the stub's target, not on Fn) */
+    const std::string dropped = "Caller code 0 4831C090E8????????90C3 0 0 8 0 - .text 3 k:4:Fn,optional:caller-feature\n";
+    n = sigt::Resolve(img, head + rows + dropped + "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:4\n", e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "Tf: its source row 'Caller' was dropped"))
+        Fail("a required derived row whose source a cross-check dropped was not refused: n=" + I(n));
+    n = sigt::Resolve(img, head + rows + dropped + "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:4,optional:tf-feature\n", e, &oc);
+    if (n != 7 || oc.missedRows.size() != 2 || e[5].missed != 1 || e[6].missed != 1 || e[0].rva != 0x1100u
+        || oc.missedWhy[1].find("its source row 'Caller' was dropped") == std::string::npos)
+        Fail("an optional derived row whose source a cross-check dropped was not dropped too: n=" + I(n));
+    /* (NIT 168) a source with no FIXED E8 at the offset (offset 0 is 48; offset 5 is a wildcard) */
+    n = sigt::Resolve(img, head + rows + "Caller code 0 4831C090E8????????90C3 0 0 8 0 - .text 3 -\n"
+                           "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:0\n", e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "Tf: its source row 'Caller' has no fixed call (E8)"))
+        Fail("a from-call offset with no fixed E8 in its source's pattern was not refused: n=" + I(n));
+    /* (NIT 596) a call check on a derived row: an unreadable line */
+    {
+        coopsigtab::SigFile f;
+        const std::string t = head + "Tf code 0 - 0 0 6 0 - .text 2 from-call:Caller:4,k:0:Fn\n";
+        coopsigtab::SigParseFile(t.c_str(), t.size(), &f);
+        if (f.badLines != 1 || !f.rows.empty()) Fail("a call check on a derived row was read: badLines=" + I(f.badLines));
+    }
+    /* (1) 'no call at this offset' is Ret's own failure: Fn optional is NOT dropped for it - refused, Ret named */
+    const std::string fnOpt = "Fn code 0 48895C2408574883EC20488B05????????90C3 0 0 16 0 - .text 0 optional:fn-feature";
+    const std::string fnReq = "Fn code 0 48895C2408574883EC20488B05????????90C3 0 0 16 0 - .text 0 -";
+    n = sigt::Resolve(img, sigt::Swap(sigt::Swap(sigt::kGood, "k:0:Fn", "k:7:Fn"), fnReq, fnOpt), e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "CALL TARGET: Ret: no call at pattern offset") || !oc.missedRows.empty())
+        Fail("a 'no call at this offset' failure was blamed on the row it names: n=" + I(n) + " missed=" + I((int)oc.missedRows.size()));
+    /* (1) Fn optional and missing: Ret's check naming it is not made - one line naming both, counted */
+    n = sigt::Resolve(img, sigt::Swap(sigt::kGood, fnReq, "Fn code 0 48895C2408574883EC20488B05????????90C4 0 0 16 0 - .text 0 optional:fn-feature"), e, &oc);
+    if (n != 5 || oc.missedRows.size() != 1 || oc.skipped.size() != 1 || oc.skipped[0].find("Ret") == std::string::npos
+        || oc.skipped[0].find("Fn") == std::string::npos)
+        Fail("a check naming a dropped optional row was not skipped and logged once: n=" + I(n) + " skipped=" + I((int)oc.skipped.size())
+             + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+    /* (3) a code row's check of its own bytes: Fn's 16 bytes at 0x1100 */
+    n = sigt::Resolve(img, sigt::Swap(sigt::kGood, fnReq, "Fn code 0 48895C2408574883EC20488B05????????90C3 0 0 16 0 48895C2408574883EC20488B05?????? .text 0 -"), e, &oc);
+    if (n != 5 || e[0].rva != 0x1100u) Fail("a code row whose own bytes fit its check was not resolved: n=" + I(n));
+    n = sigt::Resolve(img, sigt::Swap(sigt::kGood, fnReq, "Fn code 0 48895C2408574883EC20488B05????????90C3 0 0 16 0 48895C2408574883EC21488B05?????? .text 0 -"), e, &oc);
+    if (n != 0 || !sigt::Mentions(oc, "Fn: the bytes at the row are not the expected code"))
+        Fail("a code row whose own bytes do not fit its check was not refused: n=" + I(n));
+    /* (step 3) a ref row: its pattern (sub rsp,20h / mov rax,[rip+d] / nop / ret, inside Fn at 0x1106) is the one match whose
+       displacement names the global Glob (0x3010); naming Konst instead (0x2040) finds no match and refuses */
+    {
+        const std::string six = sigt::Swap(sigt::Swap(sigt::kGood, "!count 5", "!count 6"), ".text 1 k:0:Fn", ".text 2 k:0:Fn");
+        n = sigt::Resolve(img, six + "Rf code 0 4883EC20488B05????????90C3 0 0 4 0 - .text 1 ref:Glob:7:11\n", e, &oc);
+        if (n != 6 || e[5].rva != 0x1106u) Fail("a ref row was not the match that names its global: n=" + I(n) + " rva=" + I((int)e[5].rva)
+                                                + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+        n = sigt::Resolve(img, six + "Rf code 0 4883EC20488B05????????90C3 0 0 4 0 - .text 1 ref:Konst:7:11\n", e, &oc);
+        if (n != 0 || !sigt::Mentions(oc, "Rf: no match of its pattern names its global Konst"))
+            Fail("a ref row whose pattern names another global was not refused: n=" + I(n));
+        /* review 2: Glob optional, dropped by its cross-check (its second pattern occurs nowhere) - the ref row goes with it */
+        const std::string globOff = sigt::Swap(six, "g:6:8B0D????????C3CCCCCC:2:4:0", "g:6:8B0D????????C3CCCC77:2:4:0,optional:glob-feature");
+        n = sigt::Resolve(img, globOff + "Rf code 0 4883EC20488B05????????90C3 0 0 4 0 - .text 1 ref:Glob:7:11\n", e, &oc);
+        if (n != 0 || !sigt::Mentions(oc, "Rf: its global 'Glob' was dropped"))
+            Fail("a required ref row whose global was dropped was not refused: n=" + I(n));
+        n = sigt::Resolve(img, globOff + "Rf code 0 4883EC20488B05????????90C3 0 0 4 0 - .text 1 ref:Glob:7:11,optional:rf-feature\n", e, &oc);
+        if (n != 6 || e[1].missed != 1 || e[5].missed != 1 || e[5].rva != 0 || oc.missedRows.size() != 2)
+            Fail("an optional ref row whose global was dropped was not dropped too: n=" + I(n)
+                 + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+    }
+    /* (4) the start-up check against the running game (addresses.cpp): a row whose bytes do not match - optional: missed,
+       its slot 0, the set accepted; required: the set refused */
+    {
+        const char* tab = "!fingerprint X\n!count 2\nOpt code 00001100 00001100 4889 optional:ping-key\nReq code 00001200 00001200 E8FB\n";
+        coopaddr::AddrEntry t[4];
+        coopaddr::AddrParseResult pr;
+        const unsigned char wrong[2] = { 0x90, 0x90 };
+        if (coopaddr::AddrParseTable(tab, std::strlen(tab), t, 4, &pr) != 2) Fail("start-up check: the table was not read");
+        int mism = 0;
+        if (coopaddr::AddrBytesMatch(t[0], wrong) == 0 && coopaddr::AddrOptionalMiss(&t[0]) == 0) ++mism;
+        unsigned long long so = 7, sr = 7;
+        const coopaddr::AddrSlot two[2] = { { "Opt", &so }, { "Req", &sr } };
+        int missing = -1, first = -2;
+        if (mism != 0 || coopaddr::AddrSettleSlots(t, 2, two, 2, mism, 0, &missing, &first) != 1 || so != 0 || sr != 0x1200u)
+            Fail("start-up check: an optional row whose bytes do not match did not leave the mod on with its slot 0");
+        if (coopaddr::AddrBytesMatch(t[1], wrong) != 0 || coopaddr::AddrOptionalMiss(&t[1]) != 0) Fail("start-up check: a required row was missed");
+        if (coopaddr::AddrSettleSlots(t, 2, two, 2, 1, 0, &missing, &first) != 0)
+            Fail("start-up check: a required row whose bytes do not match did not refuse the set");
+        const std::string a = T313ReadFile("../coop-plugin/addresses.cpp");
+        const size_t v0 = a.find("            if (v == 0)\n");
+        const size_t om = v0 == std::string::npos ? v0 : a.find("if (AddrOptionalMiss(&g_entries[i]) != 0)", v0);
+        const size_t mm = v0 == std::string::npos ? v0 : a.find("++g_mismatch;", v0);
+        if (v0 == std::string::npos || om == std::string::npos || mm == std::string::npos || om > mm)
+            Fail("start-up check: addresses.cpp does not miss an optional row before counting a mismatch");
+    }
+}
+
 /* gog1 fold 2: EVERY SLOT CLEARED after a pattern set fails its running-game check (addrtable.cpp AddrSettleSlots, the
    bind AddrInit makes in addresses.cpp). Literal inputs: two entries, slots preset to a marker. */
 void t_addr_pattern_refusal_clears_every_slot()

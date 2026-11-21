@@ -198,6 +198,14 @@ inline const UiDriveName* UiDriveTable(size_t* count)
     return t;
 }
 
+/* T-1401 2c (F1287 review): 1 for a click that SENDS a bug report - SEND, and TRY AGAIN (which posts the report again). The driver
+   refuses it on a game whose cfg has no TEST-ONLY bugrelay=test / test503 / test404, so a test run never posts to the real report
+   service (Discord); the test tools give every bench game bugrelay=test (write-cfg.ps1). A player's own mouse is never refused. */
+inline int UiDriveSendsReport(const std::string& name)
+{
+    return (name == "bugsend" || name == "bugretry") ? 1 : 0;
+}
+
 /* The row for `name` of `kind`, or 0. Exact, case-sensitive: the harness writes lower case. */
 inline const UiDriveName* UiDriveFind(const std::string& name, int kind)
 {

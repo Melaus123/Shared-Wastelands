@@ -75,6 +75,9 @@ long long g_hookedChained = 0;    /* addrHookedChained  - T-1447: a row this mod
 struct ChainedRow { unsigned long long abs; const char* name; int nbytes; unsigned char got[kAddrBytesMax]; std::string module; };
 std::vector<ChainedRow> g_chained;
 long long g_bindMissing = 0;      /* addrBindMissing    - a registered name the table does not carry */
+long long g_optMissed   = 0;      /* addrOptionalMissed - T-1453 / T-294: optional rows not found or failing their check; each
+                                     one's feature is off (its slots 0), the mod runs; NOT in addrMismatch */
+std::string g_optMissedNames;     /* "<row> (<feature>)", comma-separated - the start-up summary names them */
 long long g_badLines    = 0;
 std::string g_firstMismatch;      /* the FIRST mismatching entry, named - a refusal that names nothing is not a measurement */
 std::string g_fingerprint;
@@ -334,6 +337,16 @@ int VerifyEntry(uintptr_t base, const AddrEntry& e, int callOnly /* T-1447: the 
     }
 }
 
+/* T-1453 / T-294 (owner 1823 a, 'make sure the log reports it'): one line per optional row missed, counted for the summary
+   and the periodic report (AddrReportToken). */
+void NoteOptionalMissed(const AddrEntry& e, const std::string& why)
+{
+    ++g_optMissed;
+    if (!g_optMissedNames.empty()) g_optMissedNames += ", ";
+    g_optMissedNames += std::string(e.name) + " (" + e.optional + ")";
+    ErrorLog(AddrOptionalMissLine(e, why));
+}
+
 void SetCaption(const char* s)
 {
     std::strncpy(g_caption, s, sizeof(g_caption) - 1);
@@ -550,7 +563,8 @@ static int PatternResolve(const std::string& exe, std::string* why)
     if (n <= 0)
     {
         *why = "the signature search did not find every row: " + N((long long)sf.rows.size() + (long long)sf.nosig.size())
-             + " rows, " + N(oc.resolved) + " found exactly once, " + N(oc.failed) + " not"
+             + " rows, " + N(oc.resolved) + " found exactly once, " + N(oc.failed) + " not, "
+             + N((long long)oc.missedRows.size()) + " optional dropped"   /* T-1453 review: every row counted */
              + (oc.fails.empty() ? std::string("") : "; the first: " + oc.fails[0]);
         size_t i;
         for (i = 0; i < oc.fails.size() && i < 64; ++i)
@@ -563,9 +577,18 @@ static int PatternResolve(const std::string& exe, std::string* why)
     g_entryCount = n;
     g_version = "pattern:" + g_fingerprint;
     g_tablePath = sigPath;
-    DebugLog("[ADDR] no address table for fingerprint " + g_fingerprint + ": all " + N(n) + " rows found by signature"
-             " in '" + exe + "' (each exactly once, each passing its own check). This build is NOT one the signatures"
-             " were proven on (Steam 1.0.65 / 1.0.68); the per-row verification below still decides.");
+    size_t m;
+    for (m = 0; m < oc.missedRows.size(); ++m)   /* T-1453: an optional row missed - only its feature is off */
+        NoteOptionalMissed(g_entries[oc.missedRows[m]], "signature search: " + oc.missedWhy[m]);
+    for (m = 0; m < oc.skipped.size() && m < 64; ++m)   /* T-1453 review: a found row's check that named a dropped row */
+        ErrorLog("[ADDR] signature cross-check skipped: " + oc.skipped[m]);
+    if (oc.skipped.size() > 64)
+        ErrorLog("[ADDR] ... and " + N((long long)oc.skipped.size() - 64) + " more signature cross-checks skipped");
+    DebugLog("[ADDR] no address table for fingerprint " + g_fingerprint + ": " + N(oc.resolved) + " of " + N(n)
+             + " rows found by signature in '" + exe + "' (each exactly once, each passing its own check; every required"
+             " row found; optional rows not found: " + N((long long)oc.missedRows.size()) + "; cross-checks skipped for them: "
+             + N((long long)oc.skipped.size()) + "). This build is NOT one the"
+             " signatures were proven on (Steam 1.0.65 / 1.0.68); the per-row verification below still decides.");
     return 1;
 }
 
@@ -673,6 +696,7 @@ static int AddrInitBody()
         const uintptr_t base = Base();
         for (i = 0; i < g_entryCount; ++i)
         {
+            if (g_entries[i].missed != 0) continue;   /* T-1453: an optional row the signature search missed (logged there) */
             std::string detail;
             /* rk1: the signature road keeps the strict check for every row (callOnly 0) - its bytes come from the file's
                own signature match, and a hooked row there is refused exactly as before */
@@ -716,6 +740,13 @@ static int AddrInitBody()
             }
             if (v == 0)
             {
+                /* T-1453 / T-294: an OPTIONAL row that does not match this game is missed - its slots get 0 and its users
+                   switch its feature off; only a required row's mismatch switches the mod off */
+                if (AddrOptionalMiss(&g_entries[i]) != 0)
+                {
+                    NoteOptionalMissed(g_entries[i], "its bytes do not match this game: " + detail);
+                    continue;
+                }
                 ++g_mismatch;
                 if (g_firstMismatch.empty())
                     g_firstMismatch = std::string(g_entries[i].name) + " (" + AddrKindName(g_entries[i].kind)
@@ -769,7 +800,8 @@ static int AddrInitBody()
     DebugLog("[ADDR] address table '" + g_version + "' matched this executable: fingerprint " + g_fingerprint
              + ", addrTableLoaded=1 addrEntriesChecked=" + N(g_checked) + " addrMismatch=0 addrVarEntries="
              + N(g_varEntries) + " addrHookedAccepted=" + N(g_hookedAccepted) + " addrHookedChained=" + N(g_hookedChained)
-             + " addrBound=" + N(g_regCount)
+             + " addrBound=" + N(g_regCount) + " addrOptionalMissed=" + N(g_optMissed)
+             + (g_optMissed != 0 ? " (features off: " + g_optMissedNames + ")" : std::string(""))
              + " from '" + g_tablePath + "'."
              " addrVarEntries are writable globals - they have no constant bytes to compare and are NOT part of"
              " addrEntriesChecked; they ride on the other entries and on the fingerprint (build/prep-p8h.md).");
@@ -825,6 +857,7 @@ std::string AddrReportToken()
       << ",hookedAccepted=" << g_hookedAccepted
       << ",hookedChained=" << g_hookedChained
       << ",bindMissing=" << g_bindMissing
+      << ",optMissed=" << g_optMissed   /* T-1453: optional rows missed, their features off */
       << ",bound=" << g_regCount
       << ",badLines=" << g_badLines
       << ",fp=" << g_fingerprint

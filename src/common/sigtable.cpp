@@ -7,7 +7,7 @@
 
 namespace coopsigtab {
 
-SigRow::SigRow() : kind(-1), anchor(0), a(0), b(0), c(0), d(0), rank(-1) {}
+SigRow::SigRow() : kind(-1), anchor(0), a(0), b(0), c(0), d(0), rank(-1), viaCall(0), fromOff(0), refDisp(0), refEnd(0) {}
 
 SigFile::SigFile() : sigversion(0), declaredCount(-1), declaredNosig(-1), badLines(0), firstBadLine(0) {}
 
@@ -174,11 +174,13 @@ int SigParseFile(const char* text, std::size_t n, SigFile* out)
             SigRow r;
             long long anc = 0, rank = -1;
             ok = t.size() == 12 && t[0].size() < (std::size_t)coopaddr::kAddrNameMax;
+            const bool noPat = ok && t[3] == "-";   /* T-1453: a from-call row has no pattern of its own */
             if (ok) { r.name = t[0]; r.kind = KindOf(t[1]); ok = r.kind >= 0; }
-            ok = ok && ParseLL(t[2], &anc) && ParseMasked(t[3], &r.pat, &r.fix)
+            ok = ok && ParseLL(t[2], &anc) && (noPat || ParseMasked(t[3], &r.pat, &r.fix))
                  && ParseLL(t[4], &r.a) && ParseLL(t[5], &r.b) && ParseLL(t[6], &r.c) && ParseLL(t[7], &r.d);
             if (ok && t[8] != "-") ok = ParseMasked(t[8], &r.chk, &r.chkFix) && r.chk.size() <= (std::size_t)coopaddr::kAddrBytesMax;
-            if (ok)
+            if (ok && noPat) ok = anc == 0;
+            else if (ok)
             {
                 ok = anc >= 0 && anc + 4 <= (long long)r.pat.size();
                 if (ok) { r.anchor = (int)anc; ok = AnchorOk(r) != 0; }
@@ -210,6 +212,24 @@ int SigParseFile(const char* text, std::size_t n, SigFile* out)
                         if (ok) { g.anchor = (int)ga; ok = AnchorOk(g) != 0; }
                         if (ok) g2.push_back(g);
                     }
+                    else if (x.size() == 3 && x[0] == "from-call" && r.fromRow.empty())   /* T-1453 */
+                    {
+                        r.fromRow = x[1];
+                        ok = !r.fromRow.empty() && r.fromRow != r.name && ParseLL(x[2], &r.fromOff) && r.fromOff >= 0
+                             && r.fromOff < kSigPatMax;
+                    }
+                    else if (x.size() == 1 && x[0] == "via-call" && r.viaCall == 0) r.viaCall = 1;   /* T-1453 */
+                    else if (x.size() == 4 && x[0] == "ref" && r.refRow.empty())   /* T-1453 step 3 */
+                    {
+                        r.refRow = x[1];
+                        ok = !r.refRow.empty() && r.refRow != r.name && ParseLL(x[2], &r.refDisp) && ParseLL(x[3], &r.refEnd)
+                             && r.refDisp >= 0 && r.refDisp + 4 <= r.refEnd && r.refEnd <= (long long)r.pat.size();
+                    }
+                    else if (x.size() == 2 && x[0] == "optional" && r.optional.empty())            /* T-1453 / T-294 */
+                    {
+                        ok = coopaddr::AddrFeatureOk(x[1].c_str(), x[1].size()) != 0;
+                        if (ok) r.optional = x[1];
+                    }
                     else if (x.size() == 3 && x[0] == "k")
                     {
                         SigCall cl;
@@ -222,6 +242,14 @@ int SigParseFile(const char* text, std::size_t n, SigFile* out)
                 }
             }
             if (ok) ok = g2.size() == (r.kind == coopaddr::kAddrVar ? 1u : 0u);
+            /* T-1453: exactly the from-call rows have no pattern; from-call / via-call are code rows only, never both, and a
+               via-call's E8 lies inside its own pattern */
+            if (ok) ok = noPat == !r.fromRow.empty();
+            if (ok) ok = calls.empty() || !noPat;   /* T-1453 review: a call check needs the row's own pattern */
+            if (ok && !r.refRow.empty()) ok = r.kind == coopaddr::kAddrCode && !noPat && !r.viaCall;   /* T-1453 step 3 */
+            if (ok && (r.viaCall || !r.fromRow.empty())) ok = r.kind == coopaddr::kAddrCode && !(r.viaCall && !r.fromRow.empty());
+            if (ok && r.viaCall)
+                ok = r.a >= 0 && r.a + 5 <= (long long)r.pat.size() && r.fix[(std::size_t)r.a] && r.pat[(std::size_t)r.a] == 0xE8;
             if (ok)   /* gog1 fold 2: a rank repeated within its class is an unreadable line (prove_signatures.py too) */
             {
                 std::size_t k;
@@ -331,6 +359,7 @@ void SigScanAll(const PeView& pe, const SigFile& f, std::vector<int>* counts, st
     for (i = 0; i < nr; ++i)
     {
         const SigRow& ri = i < f.rows.size() ? f.rows[i] : f.g2[i - f.rows.size()];
+        if (ri.pat.empty()) continue;   /* T-1453: a from-call row is not searched (count 0, never in a hash chain) */
         key[i] = U32(&ri.pat[ri.anchor]);
         const unsigned int h = Hash16(key[i]);
         next[i] = head[h];
@@ -363,12 +392,20 @@ int SigRowEntry(const PeView& pe, const SigRow& r, unsigned int patRva, coopaddr
     std::strncpy(e->name, r.name.c_str(), coopaddr::kAddrNameMax - 1);
     e->name[coopaddr::kAddrNameMax - 1] = 0;
     e->kind = r.kind;
+    std::strncpy(e->optional, r.optional.c_str(), coopaddr::kAddrFeatureMax - 1);
+    e->optional[coopaddr::kAddrFeatureMax - 1] = 0;
     const PeSection& text = pe.secs[pe.text];
     const unsigned long long textEnd = (unsigned long long)text.va + (text.vsize > text.rawSize ? text.vsize : text.rawSize);
 
     if (r.kind == coopaddr::kAddrCode || r.kind == coopaddr::kAddrRet)
     {
-        const long long rva = (long long)patRva + r.a;
+        long long rva = (long long)patRva + r.a;
+        if (r.viaCall)   /* T-1453: the pattern is a call site; the row is where the call goes */
+        {
+            unsigned long long tg = 0;
+            if (!SigCallTarget(pe, (unsigned long long)rva, &tg, why)) return 0;
+            rva = (long long)tg;
+        }
         if (rva < (long long)text.va || (unsigned long long)rva >= textEnd) { *why = "resolves outside .text (" + Hx((unsigned long long)rva) + ")"; return 0; }
         if (r.sec != ".text") { *why = "a code row whose section is not .text ('" + r.sec + "')"; return 0; }
         e->rva = (unsigned int)rva;
@@ -389,6 +426,10 @@ int SigRowEntry(const PeView& pe, const SigRow& r, unsigned int patRva, coopaddr
         if (q == 0) { *why = "verify bytes at " + Hx((unsigned long long)at) + " are not in the file"; return 0; }
         if (r.kind == coopaddr::kAddrRet
             && (r.chk.size() != (std::size_t)n || !FitsShape(q, r.chk, r.chkFix))) { *why = "the bytes before the return address are not the expected call"; return 0; }
+        /* T-1453 review: a code row whose pattern does not reach it (a function's END, e.g. ProcessKeysEnd) carries the bytes at
+           the row itself as its check, so another build's pattern match cannot mark the wrong place */
+        if (r.kind == coopaddr::kAddrCode && !r.chk.empty()
+            && (r.chk.size() != (std::size_t)n || !FitsShape(q, r.chk, r.chkFix))) { *why = "the bytes at the row are not the expected code"; return 0; }
         e->verifyAt = (unsigned int)at;
         std::memcpy(e->bytes, q, (std::size_t)n);
         e->nbytes = (int)n;
@@ -452,19 +493,74 @@ int SigRowEntry(const PeView& pe, const SigRow& r, unsigned int patRva, coopaddr
     return 0;
 }
 
+int SigCallTarget(const PeView& pe, unsigned long long at, unsigned long long* target, std::string* why)
+{
+    const unsigned char* q = PeAt(pe, at, 5);
+    if (q == 0 || q[0] != 0xE8) { *why = "no direct call at " + Hx(at); return 0; }
+    unsigned long long d = (unsigned long long)((long long)at + 5 + (long long)(int)U32(q + 1));
+    int hop;
+    for (hop = 0; hop < 4; ++hop)
+    {
+        const unsigned char* jq = PeAt(pe, d, 5);
+        if (jq == 0 || jq[0] != 0xE9) break;
+        d = (unsigned long long)((long long)d + 5 + (long long)(int)U32(jq + 1));
+    }
+    *target = d;
+    return 1;
+}
+
+int SigFromCallEntry(const PeView& pe, const SigRow& r, unsigned int srcStart, coopaddr::AddrEntry* e, std::string* why)
+{
+    unsigned long long tg = 0;
+    if (!SigCallTarget(pe, (unsigned long long)srcStart + (unsigned long long)r.fromOff, &tg, why))
+    {
+        *why = "in its source row " + r.fromRow + ": " + *why;
+        return 0;
+    }
+    if (tg > 0xFFFFFFFFull) { *why = "the call in its source row " + r.fromRow + " lands outside the image"; return 0; }
+    SigRow x = r;   /* the target is the row itself: a code row at that address (its own verify bytes and checks) */
+    x.a = 0;
+    x.viaCall = 0;
+    x.fromRow.clear();
+    return SigRowEntry(pe, x, (unsigned int)tg, e, why);
+}
+
+namespace {
+/* T-1453 step 3: every match of a ref row's pattern in .text whose displacement names `want`; the last one in *at */
+void RefScan(const PeView& pe, const SigRow& r, unsigned long long want, unsigned int* at, int* hits)
+{
+    *hits = 0;
+    const PeSection& t = pe.secs[pe.text];
+    const std::size_t len = (std::size_t)(t.vsize < t.rawSize ? t.vsize : t.rawSize);
+    const unsigned char* base = PeAt(pe, t.va, len);
+    if (base == 0 || len < r.pat.size()) return;
+    const std::size_t an = (std::size_t)r.anchor;
+    std::size_t p;
+    for (p = 0; p + r.pat.size() <= len; ++p)
+    {
+        if (base[p + an] != r.pat[an] || !FitsShape(base + p, r.pat, r.fix)) continue;
+        const long long tg = (long long)t.va + (long long)p + r.refEnd + (long long)(int)U32(base + p + (std::size_t)r.refDisp);
+        if (tg == (long long)want) { ++*hits; *at = (unsigned int)(t.va + p); }
+    }
+}
+bool Skipped(const std::vector<unsigned char>* skip, std::size_t i) { return skip != 0 && i < skip->size() && (*skip)[i] != 0; }
+void Who(std::vector<std::pair<int, int> >* who, int x, int y) { if (who != 0) who->push_back(std::make_pair(x, y)); }
+}
+
 int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry* out, const std::vector<unsigned int>& starts,
-                  const std::vector<int>& counts, const std::vector<unsigned int>& firsts, SigOutcome* oc)
+                  const std::vector<int>& counts, const std::vector<unsigned int>& firsts, SigOutcome* oc,
+                  const std::vector<unsigned char>* skip, std::vector<std::pair<int, int> >* who)
 {
     const std::size_t nr = f.rows.size();
     int bad = 0;
     std::size_t i, j;
     /* (a) ORDER: within each class, sorted by rank, the addresses strictly rise (a repeated rank is already an unreadable
-       line - SigParseFile - and a tie is refused here too) */
+       line - SigParseFile - and a tie is refused here too). T-1453: a skipped (missed optional) row takes no part. */
     int cl;
     for (cl = 0; cl < 3; ++cl)
     {
         std::vector<std::size_t> ix;
-        for (i = 0; i < nr; ++i) if (ClassOf(f.rows[i].kind) == cl) ix.push_back(i);
+        for (i = 0; i < nr; ++i) if (ClassOf(f.rows[i].kind) == cl && !Skipped(skip, i)) ix.push_back(i);
         for (i = 1; i < ix.size(); ++i)   /* insertion sort by rank: a few hundred rows, once */
         {
             const std::size_t v = ix[i];
@@ -481,13 +577,14 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
                 oc->fails.push_back(std::string("ORDER (") + kClassName[cl] + "): " + x.name + " (rank " + Hx((unsigned long long)x.rank)
                                     + ") at " + Hx(out[ix[i - 1]].rva) + " is not below " + y.name + " (rank " + Hx((unsigned long long)y.rank)
                                     + ") at " + Hx(out[ix[i]].rva));
+                Who(who, (int)ix[i - 1], (int)ix[i]);
             }
         }
     }
     /* (b) DISTINCT: no two rows at one address */
     {
         std::vector<unsigned long long> k;
-        for (i = 0; i < nr; ++i) k.push_back(((unsigned long long)out[i].rva << 20) | (unsigned long long)i);
+        for (i = 0; i < nr; ++i) if (!Skipped(skip, i)) k.push_back(((unsigned long long)out[i].rva << 20) | (unsigned long long)i);
         for (i = 1; i < k.size(); ++i)
         {
             const unsigned long long v = k[i];
@@ -500,12 +597,14 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
                 ++bad;
                 oc->fails.push_back("DISTINCT: " + f.rows[(std::size_t)(k[i - 1] & 0xFFFFF)].name + " and "
                                     + f.rows[(std::size_t)(k[i] & 0xFFFFF)].name + " resolve to the same address " + Hx(k[i] >> 20));
+                Who(who, (int)(k[i - 1] & 0xFFFFF), (int)(k[i] & 0xFFFFF));
             }
     }
     /* (c) GLOBALS TWICE: the second referencing instruction is another one, and it names the same address */
     for (j = 0; j < f.g2.size(); ++j)
     {
         const std::size_t o = (std::size_t)f.g2Of[j];
+        if (Skipped(skip, o)) continue;
         const SigRow& g = f.g2[j];
         const int cnt = counts[nr + j];
         long long t2 = 0;
@@ -515,33 +614,60 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
         else if (!DataTarget(pe, firsts[nr + j], g.a, g.b, g.c, &t2)) why = "its second displacement is not readable";
         else if (ins2 == ins1) why = "its second reference is the first one";
         else if (t2 != (long long)out[o].rva) why = "its second reference names " + Hx((unsigned long long)t2) + ", the first " + Hx(out[o].rva);
-        if (!why.empty()) { ++bad; oc->fails.push_back("GLOBAL TWICE: " + f.rows[o].name + ": " + why); }
+        if (!why.empty()) { ++bad; oc->fails.push_back("GLOBAL TWICE: " + f.rows[o].name + ": " + why); Who(who, (int)o, -1); }
     }
-    /* (d) CALL TARGETS: the recorded call, through up to four jmp stubs, lands on its code row */
+    /* (d) CALL TARGETS: the recorded call, through up to four jmp stubs, lands on its code row. T-1453: a check whose row or
+       whose target is a missed optional row is not made (the target has no address to compare). */
     for (j = 0; j < f.calls.size(); ++j)
     {
         const SigCall& c = f.calls[j];
-        const unsigned long long at = (unsigned long long)starts[(std::size_t)c.row] + (unsigned long long)c.off;
-        const unsigned char* q = PeAt(pe, at, 5);
-        const coopaddr::AddrEntry* t = coopaddr::AddrFind(out, (int)nr, c.target.c_str());
-        std::string why;
-        if (q == 0 || q[0] != 0xE8) why = "no call at pattern offset " + Hx((unsigned long long)c.off);
-        else if (t == 0 || t->kind != coopaddr::kAddrCode) why = "'" + c.target + "' is not a resolved code row";
-        else
+        if (Skipped(skip, (std::size_t)c.row)) continue;
+        if (f.rows[(std::size_t)c.row].pat.empty())   /* T-1453 review: a derived row has no pattern to hold the call */
         {
-            unsigned long long d = (unsigned long long)((long long)at + 5 + (long long)(int)U32(q + 1));
-            int hop;
-            for (hop = 0; hop < 4; ++hop)
-            {
-                const unsigned char* jq = PeAt(pe, d, 5);
-                if (jq == 0 || jq[0] != 0xE9) break;
-                d = (unsigned long long)((long long)d + 5 + (long long)(int)U32(jq + 1));
-            }
-            if (d != (unsigned long long)t->rva) why = "the call lands on " + Hx(d) + ", not on " + c.target + " at " + Hx(t->rva);
+            ++bad;
+            oc->fails.push_back("CALL TARGET: " + f.rows[(std::size_t)c.row].name + ": a call check on a row with no pattern of its own");
+            Who(who, c.row, -1);
+            continue;
         }
-        if (!why.empty()) { ++bad; oc->fails.push_back("CALL TARGET: " + f.rows[(std::size_t)c.row].name + ": " + why); }
+        const unsigned long long at = (unsigned long long)starts[(std::size_t)c.row] + (unsigned long long)c.off;
+        const coopaddr::AddrEntry* t = coopaddr::AddrFind(out, (int)nr, c.target.c_str());
+        const int ti = t != 0 ? (int)(t - out) : -1;
+        if (ti >= 0 && Skipped(skip, (std::size_t)ti))   /* T-1453 review: logged and counted (SigOutcome::skipped) */
+        {
+            oc->skipped.push_back("CALL TARGET check of " + f.rows[(std::size_t)c.row].name + " (pattern offset " + Hx((unsigned long long)c.off)
+                                  + ") not made: the row it names, " + c.target + ", is a dropped optional row");
+            continue;
+        }
+        std::string why;
+        unsigned long long d = 0;
+        int blame = ti;   /* T-1453 review: who the failure names */
+        if (t == 0 || t->kind != coopaddr::kAddrCode) { why = "'" + c.target + "' is not a resolved code row"; blame = -1; }
+        else if (!SigCallTarget(pe, at, &d, &why))   /* the source row's own bytes: its failure alone */
+        {
+            why = "no call at pattern offset " + Hx((unsigned long long)c.off);
+            blame = -1;
+        }
+        else if (d != (unsigned long long)t->rva) why = "the call lands on " + Hx(d) + ", not on " + c.target + " at " + Hx(t->rva);
+        if (!why.empty()) { ++bad; oc->fails.push_back("CALL TARGET: " + f.rows[(std::size_t)c.row].name + ": " + why); Who(who, c.row, blame); }
     }
     return bad;
+}
+
+namespace {
+/* T-1453: an optional row missed - its entry written with its name, kind and feature, rva 0 and missed = 1 */
+void MissOptional(const SigFile& f, std::size_t i, const std::string& why, coopaddr::AddrEntry* out, SigOutcome* oc)
+{
+    coopaddr::AddrEntry e;
+    std::strncpy(e.name, f.rows[i].name.c_str(), coopaddr::kAddrNameMax - 1);
+    e.name[coopaddr::kAddrNameMax - 1] = 0;
+    e.kind = f.rows[i].kind;
+    std::strncpy(e.optional, f.rows[i].optional.c_str(), coopaddr::kAddrFeatureMax - 1);
+    e.optional[coopaddr::kAddrFeatureMax - 1] = 0;
+    coopaddr::AddrOptionalMiss(&e);
+    out[i] = e;
+    oc->missedRows.push_back((int)i);
+    oc->missedWhy.push_back(why);
+}
 }
 
 int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, int maxEntries, SigOutcome* oc)
@@ -549,6 +675,9 @@ int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, 
     oc->resolved = 0;
     oc->failed = 0;
     oc->fails.clear();
+    oc->missedRows.clear();
+    oc->missedWhy.clear();
+    oc->skipped.clear();   /* T-1453 review 2 */
     std::size_t i;
     for (i = 0; i < f.nosig.size(); ++i)
     {
@@ -567,23 +696,119 @@ int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, 
     std::vector<int> counts;
     std::vector<unsigned int> firsts;
     SigScanAll(pe, f, &counts, &firsts);
-    std::vector<unsigned int> starts(f.rows.size(), 0u);
-    for (i = 0; i < f.rows.size(); ++i)
-    {
-        std::string why;
-        if (counts[i] != 1)
-            why = counts[i] == 0 ? std::string("the pattern occurs nowhere") : "the pattern occurs " + Hx((unsigned long long)counts[i]) + " times";
-        else if (SigRowEntry(pe, f.rows[i], firsts[i], &out[i], &why))
+    const std::size_t nr = f.rows.size();
+    std::vector<unsigned int> starts(nr, 0u);
+    std::vector<unsigned char> found(nr, 0), skip(nr, 0);
+    /* pass 1: every row with a pattern of its own; pass 2 (T-1453): every from-call row, from its source row's match */
+    int pass;
+    for (pass = 1; pass <= 2; ++pass)
+        for (i = 0; i < nr; ++i)
         {
-            starts[i] = firsts[i];
-            ++oc->resolved;
-            continue;
+            const SigRow& r = f.rows[i];
+            if ((pass == 1) != (!r.pat.empty() && r.refRow.empty())) continue;   /* T-1453 step 3: ref rows after their global */
+            std::string why;
+            int ok = 0;
+            if (pass == 1)
+            {
+                if (counts[i] != 1)
+                    why = counts[i] == 0 ? std::string("the pattern occurs nowhere") : "the pattern occurs " + Hx((unsigned long long)counts[i]) + " times";
+                else ok = SigRowEntry(pe, r, firsts[i], &out[i], &why);
+                if (ok) starts[i] = firsts[i];
+            }
+            else if (!r.refRow.empty())   /* T-1453 step 3: the one match whose displacement names its global */
+            {
+                std::size_t s;
+                for (s = 0; s < nr && f.rows[s].name != r.refRow; ++s) {}
+                unsigned int at = 0;
+                int hits = 0;
+                if (s == nr || (f.rows[s].kind != coopaddr::kAddrVar && f.rows[s].kind != coopaddr::kAddrRo) || f.rows[s].pat.empty())
+                    why = "its global '" + r.refRow + "' is not a var / ro row with a pattern";
+                else if (!found[s]) why = "its global '" + r.refRow + "' was not found";
+                else
+                {
+                    RefScan(pe, r, (unsigned long long)out[s].rva, &at, &hits);
+                    if (hits != 1) why = hits == 0 ? "no match of its pattern names its global " + r.refRow
+                                                   : "its pattern names its global " + r.refRow + " " + Hx((unsigned long long)hits) + " times";
+                    else ok = SigRowEntry(pe, r, at, &out[i], &why);
+                    if (ok) starts[i] = at;
+                }
+            }
+            else
+            {
+                std::size_t s;
+                for (s = 0; s < nr && f.rows[s].name != r.fromRow; ++s) {}
+                if (s == nr || f.rows[s].pat.empty()) why = "its source row '" + r.fromRow + "' is not a row with a pattern of its own";
+                else if (!found[s]) why = "its source row '" + r.fromRow + "' was not found";
+                else if (r.fromOff + 5 > (long long)f.rows[s].pat.size() || !f.rows[s].fix[(std::size_t)r.fromOff]
+                         || f.rows[s].pat[(std::size_t)r.fromOff] != 0xE8)   /* T-1453 review */
+                    why = "its source row '" + r.fromRow + "' has no fixed call (E8) at pattern offset " + Hx((unsigned long long)r.fromOff);
+                else ok = SigFromCallEntry(pe, r, starts[s], &out[i], &why);
+            }
+            if (ok) { found[i] = 1; ++oc->resolved; continue; }
+            if (!r.optional.empty()) { MissOptional(f, i, why, out, oc); skip[i] = 1; continue; }   /* T-1453: only its feature off */
+            ++oc->failed;
+            oc->fails.push_back(r.name + ": " + why);
         }
-        ++oc->failed;
-        oc->fails.push_back(f.rows[i].name + ": " + why);
+    if (oc->failed != 0) return 0;   /* the cross-checks run only over a full set of required rows */
+    std::vector<int> srcOf(nr, -1);   /* T-1453 review: a from-call row's source row; review 2: a ref row's global */
+    for (i = 0; i < nr; ++i)
+    {
+        const std::string& src = !f.rows[i].fromRow.empty() ? f.rows[i].fromRow : f.rows[i].refRow;
+        if (src.empty()) continue;
+        std::size_t s;
+        for (s = 0; s < nr && f.rows[s].name != src; ++s) {}
+        if (s < nr) srcOf[i] = (int)s;
     }
-    if (oc->failed == 0) oc->failed = SigCrossCheck(pe, f, out, starts, counts, firsts, oc);   /* only over a full set */
-    return oc->failed == 0 ? oc->resolved : 0;
+    /* T-1453: a cross-check failure that names an optional row misses that row, and the checks run again without it; a
+       failure naming only required rows refuses. Each round misses at least one more row, so this ends. */
+    for (;;)
+    {
+        SigOutcome tmp;
+        std::vector<std::pair<int, int> > who;
+        if (SigCrossCheck(pe, f, out, starts, counts, firsts, &tmp, &skip, &who) == 0) { oc->skipped = tmp.skipped; break; }
+        std::size_t k;
+        for (k = 0; k < tmp.fails.size(); ++k)
+        {
+            const int x = who[k].first, y = who[k].second;
+            const bool ox = x >= 0 && !f.rows[(std::size_t)x].optional.empty();
+            const bool oy = y >= 0 && !f.rows[(std::size_t)y].optional.empty();
+            if (!ox && !oy) { ++oc->failed; oc->fails.push_back(tmp.fails[k]); }
+        }
+        if (oc->failed != 0) return 0;
+        for (k = 0; k < tmp.fails.size(); ++k)
+        {
+            const int two[2] = { who[k].first, who[k].second };
+            int m;
+            for (m = 0; m < 2; ++m)
+            {
+                const int x = two[m];
+                if (x < 0 || f.rows[(std::size_t)x].optional.empty() || skip[(std::size_t)x] != 0) continue;
+                MissOptional(f, (std::size_t)x, "a cross-check named it: " + tmp.fails[k], out, oc);
+                skip[(std::size_t)x] = 1;
+                --oc->resolved;
+            }
+        }
+        /* T-1453 review: a from-call row was found through its source row's match - a dropped source takes it along
+           (optional: dropped too; required: refused). Repeated until nothing more goes (a chain of sources). */
+        bool more = true;
+        while (more)
+        {
+            more = false;
+            for (i = 0; i < nr; ++i)
+            {
+                if (srcOf[i] < 0 || skip[i] != 0 || skip[(std::size_t)srcOf[i]] == 0) continue;
+                const std::string why = !f.rows[i].fromRow.empty() ? "its source row '" + f.rows[i].fromRow + "' was dropped"
+                                                                   : "its global '" + f.rows[i].refRow + "' was dropped";
+                if (f.rows[i].optional.empty()) { ++oc->failed; oc->fails.push_back(f.rows[i].name + ": " + why); continue; }
+                MissOptional(f, i, why, out, oc);
+                skip[i] = 1;
+                --oc->resolved;
+                more = true;
+            }
+        }
+        if (oc->failed != 0) return 0;
+    }
+    return (int)nr;
 }
 
 }   /* namespace coopsigtab */

@@ -274,6 +274,11 @@ const int kDoorAreaMine         = 1;   /* settled: this game holds the door's pa
 const int kDoorAreaOther        = 2;   /* settled: the other game holds it */
 const int kDoorAreaNobody       = 3;   /* settled: nobody holds it */
 const int kDoorAreaUnanswerable = 4;   /* no row, a row the engine's active-zone walk dropped, or an unreadable position */
+/* T-1391 (manager 2026-11-20): A QUEUED DOOR STATE AT THE REPLAY. No world server judges a door write, so the area verdict is still asked
+   here - but only a settled 'another game holds it' is final: send on mine, drop on other, KEEP on loading / nobody / unanswerable (asked
+   again at this game's next area map). Before, every verdict but mine dropped it, 'loading' included. */
+const int kDoorReplaySend = 0, kDoorReplayDrop = 1, kDoorReplayWait = 2;
+inline int DoorReplayVerdictAct(int verdict) { return verdict == kDoorAreaMine ? kDoorReplaySend : verdict == kDoorAreaOther ? kDoorReplayDrop : kDoorReplayWait; }
 /* kDoorAreaNoNotebook = 5 is the sixth member of this list and is declared with the publish drain above.
    DoorHolderWordDecide below folds it into kDoorWordStore, which is the action it had before B12-a existed:
    a game with no notebook stores the holder's word exactly as one with an unsettled picture does. */

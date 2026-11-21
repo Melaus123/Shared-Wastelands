@@ -43,7 +43,7 @@
 
 namespace doorrec {
 
-const unsigned int kProtocol = 170;            /* the world-server protocol that carries door records */
+const unsigned int kProtocol = 173;            /* the world-server protocol that carries door records */
 
 
 

@@ -18,6 +18,7 @@
 #include "peace.h"
 #include "towngen.h"
 #include "zones.h"   /* T-1442 step 1b: InstallZonesAreaUpdate */
+#include "handoff.h"   /* T-1442 step 6: InstallLeadHooks */
 #include "playerfaction.h"
 #include "worldgen.h"
 #include "worldstate.h"
@@ -248,6 +249,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::PoseWatchTick();    // POSE (read-poses): an owned character's in-place pose changed -> STATE at once
     coop::PoseApplyTick();    // POSE: copies take their owners' bed / replayed action, and are held still while posed
     coop::InteriorKeepTick(); /* P25: a building the other player's copy stands in keeps its inside loaded here (the engine's own keep call) */
+    coop::ItemLookTick();     /* T-1449: the [ITEMLOOK] watch - queued findings and the follow-ups after a copy's redress */
 
 #ifdef SW_DEV_BUILD   /* T-879 A: the [P001] heartbeat is the test build's only (P001 answered, F040/F045); g_frames stays - it is the pump's count */
     // heartbeat: ~every 5s at 60fps, cheap enough to leave in during the probe
@@ -888,9 +890,11 @@ static void startPluginOn(const char* road)
     coop::InstallPing();       /* T-1437: InputHandler::initialise post-hook + the Controls list's spacer - the Ping key, a rebindable 'Ping' row */
     coop::InstallNames();      /* names1: Character::setName 0x5CB840 - an owned character's rename is sent */
     coop::InstallCarryKeep();  /* T-1411 fold 2 (F1286): the keep-updated test 0x5C6F30 keeps every carried character updated */
+    coop::ItemLookInstall();   /* T-1449: the [ITEMLOOK] watch - setupItemMaterial and Ogre's Material::clone, both read-only */
     coop::InstallFactionNameHooks();   /* T-368: the FACTION tab refuses a faction name another player of this world holds (Kenshi's own box) */
     coop::InstallCapture();    /* P11: task bodies 0x35A9C0 / 0x34E750 + the strip / dress / owner / shave hooks */
     coop::InstallSlaves();     /* slave1: setSlaveState 0x5A3EB0 + StateBroadcastData::periodicUpdate 0x5A44C0 */
+    coop::InstallLeadHooks();   /* T-1442 step 6: a squad's leader change noted at set-leader 0x790C00 / remove-member 0x794C00 - announced the next frame */
     coop::InstallHomeWatch();  /* T-1084: Ownerships::setHomeBuilding - a world squad's new home marks its record due */
     coop::InstallPoseLayerStart();   /* T-307: the layer play 0x5B7030 - only a task's layer state is sent as a pose */
     /* PROBE P140 BEGIN */ coop::InstallP140();   /* T-806: who starts the cage-use task (0x357FE0), log only */ /* PROBE P140 END */

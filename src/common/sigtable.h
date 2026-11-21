@@ -23,9 +23,22 @@
  * rank     the row's position in Steam 1.0.68 address order within its class (code+ret, var, ro+ptr);
  *          unique within its class - a repeated one makes the line unreadable (plugin and prover alike)
  * extra    '-' or comma-separated: g:<anchor>:<pattern>:<a>:<b>:<c> (a var row's second referencing instruction),
- *          k:<off>:<row> (a direct CALL at pattern offset off whose target, through up to four jmp stubs, is <row>)
- * EVERY row must match exactly once; a row with no signature ('!nosig') or any row that matches 0 or 2+ times, or
- * fails its check, makes SigResolveAll return 0 and the caller refuses exactly as it does with no table.
+ *          k:<off>:<row> (a direct CALL at pattern offset off whose target, through up to four jmp stubs, is <row>),
+ *          T-1453 (F1542 / F1547: a row found by its neighbourhood is a stand-in; established practice in signature
+ *          scanners is to find a unique pattern at a known call site and follow the call's rel32 to the target):
+ *          from-call:<row>:<off>  a CODE row with NO pattern of its own (pattern '-', anchor 0): its rva is the target,
+ *                                 through up to four jmp stubs, of the direct CALL at offset <off> of <row>'s matched
+ *                                 pattern; <row> is a row with its own pattern (not another from-call row). a = 0,
+ *                                 b = verify offset (0 / 16), c = bytes to verify, as any code row.
+ *          via-call               a CODE row whose own pattern is a call site: rva = the target, through up to four jmp
+ *                                 stubs, of the direct CALL at P + a (b, c as any code row).
+ *          optional:<feature>     T-294 / T-1453: an OPTIONAL row (the tables carry the same marker): when it matches 0
+ *                                 or 2+ times, fails its check or a cross-check names it, it is MISSED - its entry is
+ *                                 written with rva 0 and missed = 1 (only <feature> is off) and the rest resolves.
+ * EVERY REQUIRED row must match exactly once; a row with no signature ('!nosig') or any required row that matches 0 or
+ * 2+ times, or fails its check, makes SigResolveAll return 0 and the caller refuses exactly as it does with no table.
+ * An optional row that does so is only missed (SigOutcome::missedRows), and a cross-check failure that names an
+ * optional row misses that row and the checks run again without it; one naming only required rows refuses.
  * THE CROSS-CHECKS (T-63 gog1 fold; the per-row check against the running process copies its expected bytes from the
  * same file that was searched, so it cannot catch a pattern that found the WRONG place - these can): after every row
  * resolved, (a) ORDER - within each class the addresses rise in rank order (0 inversions between the two Steam builds,
@@ -45,6 +58,7 @@
 
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "addrtable.h"
@@ -65,6 +79,15 @@ struct SigRow
     std::vector<unsigned char> chkFix;     /* empty chk = no check ('-') */
     std::string                sec;        /* the section name the row must resolve into */
     int                        rank;       /* position in 1.0.68 address order within the row's class */
+    int                        viaCall;    /* T-1453: 1 = rva is the target of the CALL at P + a */
+    std::string                fromRow;    /* T-1453: non-empty = no pattern; rva is the target of the CALL at <fromRow>'s */
+    long long                  fromOff;    /*          match + fromOff */
+    std::string                refRow;     /* T-1453: non-empty = the pattern may match several times; the row is the ONE match
+                                              whose RIP-relative displacement at P + refDisp (instruction end P + refEnd)
+                                              names the var / ro row refRow - a function known by the global it writes */
+    long long                  refDisp;
+    long long                  refEnd;
+    std::string                optional;   /* T-1453 / T-294: "" required, else the feature a miss switches off */
     SigRow();
 };
 
@@ -123,22 +146,34 @@ void SigScanAll(const PeView& pe, const SigFile& f, std::vector<int>* counts, st
 /* Turns one row's unique pattern start into its AddrEntry (with the verify bytes read from the file) and applies the
    row's checks. Returns 1, or 0 with *why filled. */
 int SigRowEntry(const PeView& pe, const SigRow& r, unsigned int patRva, coopaddr::AddrEntry* e, std::string* why);
+/* T-1453: a from-call row's entry - the CALL at srcStart + r.fromOff (srcStart = its source row's pattern start). */
+int SigFromCallEntry(const PeView& pe, const SigRow& r, unsigned int srcStart, coopaddr::AddrEntry* e, std::string* why);
+/* T-1453: the target of the direct CALL (E8 rel32) at rva `at`, through up to four jmp (E9) stubs. 1, or 0 with *why. */
+int SigCallTarget(const PeView& pe, unsigned long long at, unsigned long long* target, std::string* why);
 
 struct SigOutcome
 {
     int                      resolved;
     int                      failed;       /* rows that matched 0 or 2+ times or failed a check, plus !nosig rows */
     std::vector<std::string> fails;        /* "<name>: <why>", every one */
+    std::vector<int>         missedRows;   /* T-1453: optional rows missed (index into SigFile::rows), in the order missed */
+    std::vector<std::string> missedWhy;    /*          ... and why, one each */
+    std::vector<std::string> skipped;      /* T-1453 review: a found row's cross-check not made because the row it names
+                                              was dropped (a missed optional row) - one line each, naming both rows */
     SigOutcome();
 };
 /* The four cross-checks over a fully resolved set: out[i] is rows[i]'s entry, starts[i] its pattern start, counts and
    firsts SigScanAll's (for g2). Appends one "<what>: ..." line per failure to oc->fails; returns the number of them. */
 int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry* out, const std::vector<unsigned int>& starts,
-                  const std::vector<int>& counts, const std::vector<unsigned int>& firsts, SigOutcome* oc);
+                  const std::vector<int>& counts, const std::vector<unsigned int>& firsts, SigOutcome* oc,
+                  const std::vector<unsigned char>* skip = 0, std::vector<std::pair<int, int> >* who = 0);
+/* T-1453: skip[i] != 0 leaves rows[i] (a missed optional row) out of every check; who gets, per failure line, the one
+   or two rows it names (-1 for none). */
 
-/* Resolves every row. Returns the number of entries written to out ONLY when every row resolved and every cross-check
-   passed (and the file is !sigversion 2 with no bad lines, no !nosig rows and its !count agrees); otherwise 0 and
-   oc->fails says why, row by row. */
+/* Resolves every row. Returns the number of entries written to out (every row's, a missed optional row's with rva 0 and
+   missed = 1) ONLY when every REQUIRED row resolved and every cross-check over the found rows passed (and the file is
+   !sigversion 2 with no bad lines, no !nosig rows and its !count agrees); otherwise 0 and oc->fails says why, row by
+   row. oc->missedRows / missedWhy name every optional row missed (T-1453). */
 int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, int maxEntries, SigOutcome* oc);
 
 }   /* namespace coopsigtab */

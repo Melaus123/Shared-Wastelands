@@ -1522,11 +1522,11 @@ void CommandChannelTick()
         WriteStatus(coop::ResurrectLever(Trim(rest)));
         finished = true;
     }
-    else if (verb == "kill")   /* par6 (parity P6) TEST verb: kill <uid> | name:<Name> - the engine's death steps; a copy's gate must refuse it */
+    else if (verb == "kill")   /* par6 (parity P6) TEST verb: kill <uid> | name:<Name> | squadof:<squad id>|squadof:newest (T-1429 s12: a living member of this game's own squad, the newest = the own squad found last, e.g. a split's) - the engine's death steps; a copy's gate must refuse it */
     {
         std::string arg; is >> arg;
         unsigned int uid = 0; std::string lab;
-        const int nr = coop::LeverNameUid(arg, &uid, &lab);
+        const int nr = (arg.compare(0, 8, "squadof:") == 0) ? (coop::OwnSquadKillPick(arg.substr(8), &uid, &lab) == 1 ? 1 : -1) : coop::LeverNameUid(arg, &uid, &lab);
         if (nr < 0) WriteStatus("error kill: " + lab);
         else
         {
@@ -2959,6 +2959,8 @@ void CommandChannelTick()
         // bldset <key> doorlock <door> 0|1 locks / unlocks that door through the engine's lock calls; bldset <key> doorpick <door> runs
         // the lock pick's tick on its lock until it opens (at most 200 calls). doorlvl and doorlock note the doors for the piece record
         // on its writer (BldsetDoorVerbs).
+        // T-1429 s3: bldset <key> pausetoggle 1 calls the engine's own construction-pause toggle (Building vt+0x2A8, 0x5464B0 - the
+        // 'PAUSE CONSTRUCTION' button's routine), so the pause reaches the piece record as a player's click does.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuildSetArm(Trim(arg))); finished = true;
     }
@@ -3017,7 +3019,19 @@ void CommandChannelTick()
     // held. [SHOPTEST] stale lines; shopStale[...] on the parity REPORT; cleared at world teardown. Validated strictly (keeperaim::StaleSecs).
     else if (verb == "shoptest")
     {
-        std::string what, val, extra; is >> what >> val >> extra;
+        std::string what, val, extra; is >> what;
+        if (what == "win")
+        {
+            // shoptest win <buy|sell> [sid=<text>] [qual=<1-100>] [stack]   - TEST-ONLY (T-1451, items.cpp ShopWinTest): ONE trade through the player's
+            // right-click in the trade window `buytest keeper <...> hold=<s>` holds open, without opening or closing it (the hold's
+            // timer restarts); the [SHOPWIN] lines show the window's items before / after each change. One `ok|error shoptest win` line.
+            std::string rest; std::getline(is, rest);
+            WriteStatus(coop::ShopWinTest(Trim(rest)));
+            finished = true;
+        }
+        else
+        {
+        is >> val >> extra;
         const int secs = keeperaim::StaleSecs(val.c_str());
         if (what != "stale" || secs == 0 || !extra.empty())
         {
@@ -3026,6 +3040,7 @@ void CommandChannelTick()
         }
         else WriteStatus(coop::ShopStaleCommand(secs));
         finished = true;
+        }
     }
     else if (verb == "money")
     {
@@ -3110,8 +3125,28 @@ void CommandChannelTick()
         // cagetest <copyUid> nearest [faction=<name>] [hours=<n>]   - P43 / T-478 TEST-ONLY lever (spawn.cpp CageTestCommand): this game's engine cages the other game's
         // character's copy in the nearest free cage at the K2 safe point (setPrisonMode, as a guard's task); PrisonWatchCopies then
         // sends the owner MSG_PRISON IN as for a guard's caging. [ARREST] cagetest lines.
+        // T-1442 TEST-ONLY: <copyUid> may also be made:<label>, spawned:<Template>[#k] or name:<Name>[#k] (coop::LeverNameUid, as
+        // capturetest carry resolves its words), so a lever-made NPC's copy can be caged; a uid reads as before.
         std::string arg; std::getline(is, arg);
-        WriteStatus(coop::CageTestCommand(Trim(arg))); finished = true;
+        arg = Trim(arg);
+        const size_t cgSp = arg.find(' ');
+        const std::string cgWord = arg.substr(0, cgSp);
+        unsigned int cgUid = 0;
+        std::string cgLab;
+        const int cgNr = coop::LeverNameUid(cgWord, &cgUid, &cgLab);
+        if (cgNr < 0) WriteStatus("error cagetest: the copy - " + cgLab);
+        else
+        {
+            if (cgNr > 0)
+            {
+                std::ostringstream cgs;
+                cgs << cgUid << (cgSp == std::string::npos ? std::string() : arg.substr(cgSp));
+                DebugLog("[ARREST] cagetest copy " + cgWord + " -> uid=" + cgs.str().substr(0, cgs.str().find(' ')) + " (" + cgLab + ")");
+                arg = cgs.str();
+            }
+            WriteStatus(coop::CageTestCommand(arg));
+        }
+        finished = true;
     }
     else if (verb == "tmplname")
     {
@@ -3672,6 +3707,7 @@ void CommandChannelTick()
                        << " (nearest to attacker uid=" << a << ") taskType=" << type;
                     DebugLog(pk.str());
                     bool ok = coop::AttackLocal(a, vu, type);
+                    if (ok) coop::P323AiStrike(vu);   // PROBE P323
                     WriteStatus(ok ? "ok attack" : "error attack");
                 }
             }

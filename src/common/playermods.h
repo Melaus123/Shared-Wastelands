@@ -26,7 +26,7 @@
 namespace playermods {
 
 const unsigned int kMsgPlayerMods = 104u;   /* down only */
-const unsigned int kProtocol = 170u;        /* the world-server protocol that carries PLAYER_MODS */
+const unsigned int kProtocol = 173u;        /* the world-server protocol that carries PLAYER_MODS */
 const size_t kNameMax = 128, kByMax = 128, kAtMax = 16, kDetailMax = 4096;
 
 enum Kind { kKindWorld = 1, kKindPlayer = 2 };

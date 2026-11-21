@@ -68,11 +68,12 @@ def parse_sig_lines(lines):
             meta[t[0]] = t[1:]
         else:
             assert len(t) == 12, line
-            pat, fix = masked_hex(t[3])
+            pat, fix = masked_hex(t[3]) if t[3] != '-' else (b'', [])   # T-1453: '-' = a from-call row
             chk = masked_hex(t[8]) if t[8] != '-' else (b'', [])
             anc = int(t[2])
-            assert all(fix[anc:anc + 4]) and len(fix[anc:anc + 4]) == 4, t[0]
+            assert (t[3] == '-' and anc == 0) or (all(fix[anc:anc + 4]) and len(fix[anc:anc + 4]) == 4), t[0]
             g2, calls = None, []
+            via, frm, opt, ref = False, None, None, None
             for x in (t[11].split(',') if t[11] != '-' else []):
                 f = x.split(':')
                 if f[0] == 'g':
@@ -81,15 +82,33 @@ def parse_sig_lines(lines):
                     a2 = int(f[1])
                     assert all(x2[a2:a2 + 4]) and len(x2[a2:a2 + 4]) == 4, t[0]
                     g2 = dict(name=t[0], kind='var', anchor=a2, pat=p2, fix=x2, a=int(f[3]), b=int(f[4]), c=int(f[5]))
+                elif f[0] == 'from-call':          # T-1453: the target of the call at <row>'s match + off
+                    assert len(f) == 3 and frm is None and f[1] != t[0], line
+                    frm = (f[1], int(f[2]))
+                elif f[0] == 'ref':                # T-1453 step 3: the one match whose displacement names <row>
+                    assert len(f) == 4 and ref is None and t[1] == 'code' and t[3] != '-', line
+                    ref = (f[1], int(f[2]), int(f[3]))
+                    assert 0 <= ref[1] and ref[1] + 4 <= ref[2] <= len(pat), line
+                elif f[0] == 'via-call':           # T-1453: the target of the call at P + a
+                    assert len(f) == 1 and not via, line
+                    via = True
+                elif f[0] == 'optional':           # T-1453 / T-294
+                    assert len(f) == 2 and opt is None and f[1] and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in f[1]) \
+                        and len(f[1]) < 32, line
+                    opt = f[1]
                 else:
                     assert f[0] == 'k' and len(f) == 3, line
                     calls.append((int(f[1]), f[2]))
             assert (g2 is not None) == (t[1] == 'var'), 'a var row without its second pattern: ' + t[0]
+            assert (t[3] == '-') == (frm is not None), 'a pattern-less row must be a from-call row: ' + t[0]
+            assert not (via or frm) or (t[1] == 'code' and not (via and frm)), line
+            assert not via or (0 <= int(t[4]) and int(t[4]) + 5 <= len(pat) and fix[int(t[4])] and pat[int(t[4])] == 0xE8), line
             key = (CLASS[t[1]], int(t[10]))
             assert key not in ranks, 'rank %s repeated in its class: %s' % (t[10], t[0])
             ranks.add(key)
             rows.append(dict(name=t[0], kind=t[1], anchor=anc, pat=pat, fix=fix, a=int(t[4]), b=int(t[5]),
-                             c=int(t[6]), d=int(t[7]), chk=chk, sec=t[9], rank=int(t[10]), g2=g2, calls=calls))
+                             c=int(t[6]), d=int(t[7]), chk=chk, sec=t[9], rank=int(t[10]), g2=g2, calls=calls,
+                             via=via, frm=frm, opt=opt, ref=ref))
     assert meta['!sigversion'] == ['2'], 'signatures.sig is not !sigversion 2'
     assert int(meta['!count'][0]) == len(rows) and int(meta['!nosigcount'][0]) == len(nosig)
     return rows, nosig
@@ -157,6 +176,20 @@ def scan(pe, row):
     return out
 
 
+def call_target(pe, at):
+    """sigtable.cpp's SigCallTarget: the direct CALL at `at`, through up to four jmp stubs."""
+    q = pe.at(at, 5)
+    if q is None or q[0] != 0xE8:
+        raise ValueError('no direct call at %X' % at)
+    f = at + 5 + struct.unpack('<i', q[1:5])[0]
+    for _ in range(4):
+        jq = pe.at(f, 5)
+        if jq is None or jq[0] != 0xE9:
+            break
+        f = f + 5 + struct.unpack('<i', jq[1:5])[0]
+    return f
+
+
 def entry(pe, r, p):
     """(line fields) or raise ValueError(why) - sigtable.cpp's SigRowEntry."""
     t = pe.text
@@ -164,6 +197,8 @@ def entry(pe, r, p):
     k = r['kind']
     if k in ('code', 'ret'):
         rva = p + r['a']
+        if r.get('via'):                       # T-1453: the pattern is a call site
+            rva = call_target(pe, rva)
         if not (t['va'] <= rva < tend):
             raise ValueError('outside .text')
         if r['sec'] != '.text':
@@ -179,6 +214,8 @@ def entry(pe, r, p):
             raise ValueError('verify bytes not in the file')
         if k == 'ret' and not fits(q, r['chk']):
             raise ValueError('not the expected call')
+        if k == 'code' and r['chk'][0] and not fits(q, r['chk']):   # T-1453 review: the bytes at the row itself
+            raise ValueError('the bytes at the row are not the expected code')
         return (k, rva, at, q.hex().upper())
     dq = pe.at(p + r['a'], 4)
     if dq is None or not (4 <= r['b'] <= 8):
@@ -229,6 +266,17 @@ def read_table(path):
         if not t or t[0][0] in '#!':
             continue
         out[t[0]] = (t[1], int(t[2], 16), int(t[3], 16), t[4])
+    return out
+
+
+def read_optional(path):
+    """T-1453: {row: feature} for every table line ending in 'optional:<feature>'."""
+    out = {}
+    for line in open(path, encoding='ascii'):
+        t = line.split()
+        if t and t[0][0] not in '#!' and len(t) > 5:
+            assert len(t) == 6 and t[5].startswith('optional:'), line
+            out[t[0]] = t[5][len('optional:'):]
     return out
 
 
@@ -291,6 +339,8 @@ def prove(exe, table, rows, nosig):
     tab = read_table(table) if table else None
     got, unresolved, differ, starts = {}, [], [], {}
     for r in rows:
+        if r['frm'] is not None or r['ref'] is not None:
+            continue
         m = scan(pe, r)
         if len(m) != 1:
             unresolved.append('%s: %d matches' % (r['name'], len(m)))
@@ -300,6 +350,45 @@ def prove(exe, table, rows, nosig):
             starts[r['name']] = m[0]
         except ValueError as e:
             unresolved.append('%s: %s' % (r['name'], e))
+    by = dict((r['name'], r) for r in rows)
+    for r in rows:                             # T-1453 step 3: ref rows, after their global
+        if r['ref'] is None:
+            continue
+        g, dp, en = r['ref']
+        try:
+            if g not in by or by[g]['kind'] not in ('var', 'ro'):
+                raise ValueError('global %s is not a var / ro row' % g)
+            if g not in got:
+                raise ValueError('global %s was not found' % g)
+            m = [p for p in scan(pe, r) if p + en + struct.unpack('<i', pe.at(p + dp, 4))[0] == got[g][1]]
+            if len(m) != 1:
+                raise ValueError('%d matches name global %s' % (len(m), g))
+            got[r['name']] = entry(pe, r, m[0])
+            starts[r['name']] = m[0]
+        except ValueError as e:
+            unresolved.append('%s: %s' % (r['name'], e))
+    for r in rows:                             # T-1453: from-call rows, from their source row's match
+        if r['frm'] is None:
+            continue
+        src, off = r['frm']
+        try:
+            if src not in by or by[src]['frm'] is not None:
+                raise ValueError('source row %s has no pattern of its own' % src)
+            if src not in starts:
+                raise ValueError('source row %s was not found' % src)
+            sp = by[src]                       # T-1453 review: a fixed E8 at the offset in the source's pattern
+            if off + 5 > len(sp['pat']) or not sp['fix'][off] or sp['pat'][off] != 0xE8:
+                raise ValueError('source row %s has no fixed call at pattern offset %d' % (src, off))
+            x = dict(r, a=0, via=False)
+            got[r['name']] = entry(pe, x, call_target(pe, starts[src] + off))
+            starts[r['name']] = 0
+        except ValueError as e:
+            unresolved.append('%s: %s' % (r['name'], e))
+    if table:                                  # T-1453: the optional markers agree with the table's
+        opt = read_optional(table)
+        for r in rows:
+            if r['opt'] != opt.get(r['name']):
+                differ.append('%s: optional marker %s in signatures.sig, %s in the table' % (r['name'], r['opt'], opt.get(r['name'])))
     unresolved += ['%s: no signature' % n for n in nosig]
     cross, inv = cross_checks(pe, rows, got, starts)
     matched = 0

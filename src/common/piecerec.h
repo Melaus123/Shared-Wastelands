@@ -43,7 +43,10 @@
        no player outpost: u32 kind (kPrTownFactWorld: a world town, then u32 length + its game-data stringID 1..kPrTownSidMax bytes, no
        control byte; kPrTownFactNowhere: the wilderness town 'Nowhere', nothing more). Never with bit 5 (an outpost is named by bit 5). A
        part with neither bit 5 nor bit 8 leaves the town NOT KNOWN (an older record: the copy keeps part 2's rule). A peer before
-       protocol 165 refuses a part with bit 8 (an unknown bit). A format-1 record carries no LIVE
+       protocol 165 refuses a part with bit 8 (an unknown bit).
+       T-1429 s3 (world-server protocol 171): flags bit 9 (kPrLiveFlagPauseKnown) says the building's CONSTRUCTION PAUSE (+0x161, the
+       'PAUSE CONSTRUCTION' button's byte) is known, and bit 10 (kPrLiveFlagPaused) that it is set; no bytes follow for it. Bit 10 without
+       bit 9 is refused. A part without bit 9 leaves the pause NOT KNOWN. A peer before protocol 171 refuses bits 9-10 (unknown bits). A format-1 record carries no LIVE
  *       part: its live values are NOT KNOWN (never "off"). A removal mark is always format 1.
  *   BODY, a removal mark: u32 reason (buildwire.h kBuildReasonDismantled / kBuildReasonDestroyed) and nothing else.
  *   Nothing may follow the body. The whole record is at most kPrMaxBytes.
@@ -75,7 +78,7 @@
 
 namespace piecerec {
 
-const unsigned int kProtocol = 170;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
+const unsigned int kProtocol = 173;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
 
 
 
@@ -87,10 +90,11 @@ const unsigned int kPrMarker = 0x31454350u;       /* 'P','C','E','1' little-endi
 const unsigned int kPrFormat = 1u;                /* a record with no LIVE part */
 const unsigned int kPrFormatLive = 2u;            /* a live piece's record with its LIVE part (switch, gets battery, battery, input stocks) */
 const unsigned int kPrLiveMaxStocks = 16u;        /* a piece's input records carried (powerwire.h kPowerMaxStocks) */
-const unsigned int kPrLiveFlagOn = 1u, kPrLiveFlagGets = 2u, kPrLiveFlagBar = 4u, kPrLiveFlagDoors = 8u, kPrLiveFlagNoPower = 16u, kPrLiveFlagTown = 32u, kPrLiveFlagFarm = 64u, kPrLiveFlagCraft = 128u, kPrLiveFlagTownFact = 256u, kPrLiveFlagsAll = 511u;   /* bit 2 = the bar and work state follow the stocks; bit 3 = the doors part follows them; bit 4 = no power values (else they are the piece's); bit 5 = the outpost link ends the part (T-1047 step 5) */
+const unsigned int kPrLiveFlagOn = 1u, kPrLiveFlagGets = 2u, kPrLiveFlagBar = 4u, kPrLiveFlagDoors = 8u, kPrLiveFlagNoPower = 16u, kPrLiveFlagTown = 32u, kPrLiveFlagFarm = 64u, kPrLiveFlagCraft = 128u, kPrLiveFlagTownFact = 256u, kPrLiveFlagPauseKnown = 512u, kPrLiveFlagPaused = 1024u, kPrLiveFlagsAll = 2047u;   /* bit 2 = the bar and work state follow the stocks; bit 3 = the doors part follows them; bit 4 = no power values (else they are the piece's); bit 5 = the outpost link ends the part (T-1047 step 5) */
 const unsigned int kPrLiveFlagsBeforeTown = 31u;  /* the bits a peer before T-1047 step 5 (protocol 115) reads: it refuses any other */
 const unsigned int kPrLiveFlagsBeforeFarm = 63u;  /* the bits a peer before protocol 132 reads: it refuses a part with a farm's crop */
 const unsigned int kPrLiveFlagsBeforeTownFact = 255u;   /* T-1427 fold 1: the bits a peer before protocol 165 reads: it refuses a part with the builder's world town / 'Nowhere' */
+const unsigned int kPrLiveFlagsBeforePause = 511u;   /* T-1429 s3: the bits a peer before world-server protocol 171 reads: it refuses a part with a building's construction pause (bits 9-10) */
 const unsigned int kPrTownFactWorld = 1u, kPrTownFactNowhere = 2u;   /* bit 8's kind: a world (NPC) town by its stringID; the wilderness town */
 const unsigned int kPrTownSidMax = 64u;            /* a world town's stringID carried: 1..this bytes */
 const unsigned int kPrLiveFlagsBeforeCraft = 127u; /* T-1192: the bits a peer before protocol 141 reads: it refuses a part with a crafting bench's list */
@@ -192,9 +196,10 @@ struct PieceLive
     unsigned int craftFlags, craftInOn;       /* kPrCraftRepeat | kPrCraftOutOn | kPrCraftOutHas; bit i = input section i switched on */
     int craftIn, craftTotal;                  /* the input sections; the entries the bench holds (the first kPrCraftMax carried) */
     std::vector<PieceCraftEntry> craft;
+    int hasPause, paused;                     /* T-1429 s3 (flag bits 9 / 10): 1 = the building's construction pause (+0x161) is known; then paused 0 / 1 */
     PieceLive() : have(0), hasPower(1), on(0), gets(0), n(0), battery(0.0f), hasBar(0), state(0), bar(0.0f), hasDoors(0), nd(0), hasTown(0), town(0u), townFact(0u),
                   hasFarm(0), farmGrowth(0.0f), farmDeath(0.0f), farmStart(0.0f), farmHarvested(0), farmAt(0u),
-                  hasCraft(0), craftFlags(0u), craftInOn(0u), craftIn(0), craftTotal(0)
+                  hasCraft(0), craftFlags(0u), craftInOn(0u), craftIn(0), craftTotal(0), hasPause(0), paused(0)
     {
         for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) stock[i] = 0.0f;
         for (unsigned int i = 0; i < kPrLiveMaxDoors; ++i) { doorHealth[i] = 0.0f; doorLevel[i] = 0; doorFlags[i] = 0u; }
@@ -285,6 +290,7 @@ inline bool PieceLiveValid(const PieceLive& l)
         if (l.farmHarvested < 0 || l.farmHarvested > kPrLiveFarmMaxHarvested) return false;
     }
     else if (l.farmGrowth != 0.0f || l.farmDeath != 0.0f || l.farmStart != 0.0f || l.farmHarvested != 0 || l.farmAt != 0u) return false;   /* not known: nothing carried */
+    if ((l.hasPause != 0 && l.hasPause != 1) || (l.paused != 0 && l.paused != 1) || (l.hasPause == 0 && l.paused != 0)) return false;   /* T-1429 s3: a pause is carried only when known */
     return PieceCraftValid(l);
 }
 inline void PrPutF32(std::vector<char>* b, float v) { unsigned int u = 0; std::memcpy(&u, &v, 4); coopbrec::BrPutU32(b, u); }
@@ -292,7 +298,8 @@ inline void PieceLivePut(std::vector<char>* out, const PieceLive& l)
 {
     coopbrec::BrPutU32(out, (l.on != 0 ? kPrLiveFlagOn : 0u) | (l.gets != 0 ? kPrLiveFlagGets : 0u) | (l.hasBar != 0 ? kPrLiveFlagBar : 0u)
                             | (l.hasDoors != 0 ? kPrLiveFlagDoors : 0u) | (l.hasPower == 0 ? kPrLiveFlagNoPower : 0u) | (l.hasTown != 0 ? kPrLiveFlagTown : 0u)
-                            | (l.hasFarm != 0 ? kPrLiveFlagFarm : 0u) | (l.hasCraft != 0 ? kPrLiveFlagCraft : 0u) | (l.townFact != 0u ? kPrLiveFlagTownFact : 0u));
+                            | (l.hasFarm != 0 ? kPrLiveFlagFarm : 0u) | (l.hasCraft != 0 ? kPrLiveFlagCraft : 0u) | (l.townFact != 0u ? kPrLiveFlagTownFact : 0u)
+                            | (l.hasPause != 0 ? kPrLiveFlagPauseKnown : 0u) | (l.hasPause != 0 && l.paused != 0 ? kPrLiveFlagPaused : 0u));   /* T-1429 s3: flags only, no bytes */
     PrPutF32(out, l.battery);
     coopbrec::BrPutU32(out, (unsigned int)l.n);
     for (int i = 0; i < l.n; ++i) PrPutF32(out, l.stock[i]);
@@ -417,6 +424,7 @@ inline int PieceLiveGet(const char* p, size_t size, PieceLive* out)
         l.townFact = kind;
     }
     if (at != size) return 0;
+    l.hasPause = (fl & kPrLiveFlagPauseKnown) != 0 ? 1 : 0; l.paused = (fl & kPrLiveFlagPaused) != 0 ? 1 : 0;   /* T-1429 s3 (paused without known: refused by PieceLiveValid) */
     l.have = 1; l.hasPower = (fl & kPrLiveFlagNoPower) != 0 ? 0 : 1; l.on = (fl & kPrLiveFlagOn) != 0 ? 1 : 0; l.gets = (fl & kPrLiveFlagGets) != 0 ? 1 : 0; l.n = (int)n;
     if (!PieceLiveValid(l)) return 0;
     if (out) *out = l;

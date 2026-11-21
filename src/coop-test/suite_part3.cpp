@@ -378,9 +378,10 @@ void t_pp6_one_press_load()
         {
             const std::string known = "prof1\t" + PP + "\t1\t-1\t0\t0\tactive\tNew\tNew\tplayed";
             if (coopprof::RowLineNewer(known) || coopprof::RowLineNewer("prof1\t" + PP + "\t1\t-1\t0\t0\tactive\tNew\tNew")
-                || !coopprof::RowLineNewer(known + "\tsomething") || coopprof::RowLineNewer("junk\ta\tb\tc\td\te\tf\tg\th\ti\tj\tk"))
-                Fail("T-222: a prof1 line with more than 10 fields is a newer build's");
-            if (coopprof::RowsNewerLines(known + "\n" + known + "\tx\r\n\n") != 1 || coopprof::RowsNewerLines(known + "\n") != 0)
+                || coopprof::RowLineNewer(known + "\timports:Save") || !coopprof::RowLineNewer(known + "\timports:Save\tsomething")
+                || coopprof::RowLineNewer("junk\ta\tb\tc\td\te\tf\tg\th\ti\tj\tk\tl"))
+                Fail("T-222: a prof1 line with more than 11 fields (T-1452: 11 since the pending import) is a newer build's");
+            if (coopprof::RowsNewerLines(known + "\n" + known + "\timports:S\tx\r\n\n") != 1 || coopprof::RowsNewerLines(known + "\n" + known + "\timports:S\n") != 0)
                 Fail("T-222: a file holding a newer build's line is counted (read-only to this build)");
         }
         std::vector<coopprof::Row> again = coopprof::RowsParseFile(coopprof::RowsFormatFile(rows), 0);
@@ -1503,7 +1504,7 @@ void t_t247_world_list()
         playermods::World n; n.hasList = 0; n.flags = playermods::kFlagTellAdmin;
         if (playermods::NoticeOfWorld(n, diff) != ModNoListAdminText()) Fail("t247: an admin is told the world has no list");
         n.flags = 0; if (!playermods::NoticeOfWorld(n, diff).empty()) Fail("t247: a player who is not an admin is told nothing about no list");
-        if (playermods::kMsgPlayerMods != 104u || playermods::kProtocol != 170u || playermods::kProtocol != authproof::kProtocol) Fail("t938: PLAYER_MODS is message 104 of world-server protocol 170");
+        if (playermods::kMsgPlayerMods != 104u || playermods::kProtocol != 173u || playermods::kProtocol != authproof::kProtocol) Fail("t938: PLAYER_MODS is message 104 of world-server protocol 173");
     }
 }
 

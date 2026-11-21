@@ -72,6 +72,7 @@ static unsigned long long kMig3MedicalUpdate = 0; static coop::AddrReg kMig3Medi
 #include <set>   // the copies pinned
 #include "playerfaction.h"   /* re-check par6 #1: IsPlayerFaction - an unequip kill only happens to a non-player character */
 
+namespace coop { void LeadNoteChar(const void* character, int dead); }   /* T-1442 step 6: handoff.cpp - a knocked-out character's squad announced the next frame (interlocked only) */
 namespace coop {
 
 namespace {
@@ -510,6 +511,7 @@ void detour_startKnockoutTimer(MedicalSystem* self)
 {
     if (!PuppetKoAllowed(self, 1, 0.0f, 0)) return;   // refused: no clock started on this copy
     orig_startKnockoutTimer(self);
+    coop::LeadNoteChar((const char*)self - kMedicalOffset, 0);   /* T-1442 step 6: after the original - its squad's leader announcement may change */
 }
 
 void detour_knockout(MedicalSystem* self, float skill01)
@@ -517,6 +519,7 @@ void detour_knockout(MedicalSystem* self, float skill01)
     const unsigned long long ret = (unsigned long long)(uintptr_t)_ReturnAddress();   // first: which engine call is knocking out
     if (!PuppetKoAllowed(self, 2, skill01, ret)) return;   // refused: no clock started on this copy
     orig_knockout(self, skill01);
+    coop::LeadNoteChar((const char*)self - kMedicalOffset, 0);   /* T-1442 step 6: after the original - its squad's leader announcement may change */
 }
 
 void InstallPuppetKoGate()

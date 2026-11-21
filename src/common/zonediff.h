@@ -34,6 +34,7 @@
 #include "zonekeep.h"     /* ParseContainer and the piece helpers (and slotwire.h, poskey.h) */
 #include "zonerec.h"      /* ZoneEmptyIsRaw: an area that wrote nothing is held as the EMPTY mark */
 #include "townverwire.h"  /* kTvNoteId, kTvNoteCap: the "built with" note inside an area file */
+#include "groundkey.h"    /* T-1391 (F1611): kGroundNearTenths and GroundNearBetter - the ground road's own item match */
 
 namespace zonediff {
 
@@ -289,8 +290,10 @@ inline std::string KeyList(const std::vector<std::string>& keys)
 }
 /* ONE KIND: "<name> <a>/<b> same", or its counts, the keys on one side only and the changed keys with their differing fields.
    onlyAmong (when given): a key on one side only is listed only when it is among these (the pieces on both sides - a piece on one
-   side only is already listed under buildings). */
-inline std::string CompareKind(const char* name, const Things& a, const Things& b, const std::set<std::string>* onlyAmong)
+   side only is already listed under buildings). T-1391 (F1611): aWord / bWord name the two sides in "only in <word>" - side a is
+   always this game's copy ("refused" on the refusal line, "adopted" on the adopt line), side b the record's ("newest" / "replaced"). */
+inline std::string CompareKind(const char* name, const Things& a, const Things& b, const std::set<std::string>* onlyAmong,
+                               const std::string& aWord = "refused", const std::string& bWord = "newest")
 {
     std::vector<std::string> onlyA, onlyB, changed;
     for (Things::const_iterator i = a.begin(); i != a.end(); ++i)
@@ -310,8 +313,8 @@ inline std::string CompareKind(const char* name, const Things& a, const Things& 
     std::string o = std::string(name) + " " + Num((long long)a.size()) + "/" + Num((long long)b.size());
     if (onlyA.empty() && onlyB.empty() && changed.empty()) return o + " same";
     o += ":";
-    if (!onlyA.empty()) o += " only in refused " + Num((long long)onlyA.size()) + KeyList(onlyA) + ";";
-    if (!onlyB.empty()) o += " only in newest " + Num((long long)onlyB.size()) + KeyList(onlyB) + ";";
+    if (!onlyA.empty()) o += " only in " + aWord + " " + Num((long long)onlyA.size()) + KeyList(onlyA) + ";";
+    if (!onlyB.empty()) o += " only in " + bWord + " " + Num((long long)onlyB.size()) + KeyList(onlyB) + ";";
     if (!changed.empty())
     {
         o += " changed " + Num((long long)changed.size()) + " [";
@@ -321,6 +324,13 @@ inline std::string CompareKind(const char* name, const Things& a, const Things& 
     }
     if (o[o.size() - 1] == ';') o.erase(o.size() - 1);
     return o;
+}
+/* T-1391 (F1611): a copy's name's first word ("refused copy" -> "refused", "replaced record" -> "replaced") - the side's word in "only in" */
+inline std::string ShortWord(const char* name)
+{
+    const std::string n(name != 0 ? name : "");
+    const size_t sp = n.find(' ');
+    return sp == std::string::npos ? n : n.substr(0, sp);
 }
 /* the line cut to `cap` bytes with a note saying so (never inside a UTF-8 character) */
 inline std::string CapLine(const std::string& line, size_t cap)
@@ -337,33 +347,249 @@ inline std::string SideText(const char* name, const Side& s, int writerSlot)
     if (s.empty != 0) return o + "the EMPTY mark: the area wrote nothing)";
     return o + Num(s.records) + " records)";
 }
-/* THE LINE when a copy cannot be compared: which copy, and why */
+/* THE LINE when a copy cannot be compared: which copy, and why. T-1391: tag / aName / bName name the line and the two copies
+   (FailLine: the refusal's "T-1351", "refused copy", "newest record"). */
+inline std::string FailLineAs(const char* tag, const char* aName, const char* bName, const std::string& area, const std::string& which, const std::string& why)
+{
+    return CapLine("[ZONE] " + std::string(tag) + " " + aName + " of " + Clean(area) + " not compared with the " + bName + ": " + which + " cannot be read - " + Clean(why), kLineCap);
+}
 inline std::string FailLine(const std::string& area, const std::string& which, const std::string& why)
 {
-    return CapLine("[ZONE] T-1351 refused copy of " + Clean(area) + " not compared with the newest record: " + which + " cannot be read - " + Clean(why), kLineCap);
+    return FailLineAs("T-1351", "refused copy", "newest record", area, which, why);
+}
+/* T-1391 (F1577 / F1578): THE COMPARISON with its outcome. Copy a (this game's, written by aWriter) against copy b (a record's,
+   written by bWriter), the line named by tag / aName / bName. *outcome (may be 0): zonerec kZcSame (no difference in the kinds
+   compared), kZcDiffers or kZcUnread (a copy could not be read: the failure line). *differing (may be 0): the names of the kinds that
+   differ, in the line's order, ", " between. The line is the same as before for the refusal (DiffLine). */
+inline std::string CompareLine(const char* tag, const char* aName, const char* bName, const std::string& area, const unsigned char* refused, size_t refusedN, int refusedWriter,
+                               const unsigned char* newest, size_t newestN, int newestWriter, size_t cap, int* outcome, std::string* differing)
+{
+    Side a, b;
+    std::string why;
+    if (outcome != 0) *outcome = zonerec::kZcUnread;
+    if (differing != 0) differing->clear();
+    if (!ReadSide(refused, refusedN, refusedWriter, &a, &why)) return FailLineAs(tag, aName, bName, area, "the " + std::string(aName), why);
+    if (!ReadSide(newest, newestN, newestWriter, &b, &why)) return FailLineAs(tag, aName, bName, area, "the " + std::string(bName) + "'s copy", why);
+    std::set<std::string> both;
+    for (Things::const_iterator i = a.pieces.begin(); i != a.pieces.end(); ++i) if (b.pieces.find(i->first) != b.pieces.end()) both.insert(i->first);
+    const std::string aw = ShortWord(aName), bw = ShortWord(bName);   /* T-1391 (F1611): the adopt line said "only in refused / newest" */
+    const std::string kinds[7] = {
+        CompareKind("buildings", a.pieces, b.pieces, 0, aw, bw), CompareKind("state", a.state, b.state, &both, aw, bw), CompareKind("doors", a.doors, b.doors, &both, aw, bw),
+        CompareKind("town link", a.town, b.town, &both, aw, bw), CompareKind("box contents", a.box, b.box, &both, aw, bw), CompareKind("ground items", a.ground, b.ground, 0, aw, bw),
+        CompareKind("town note", a.note, b.note, 0, aw, bw) };
+    static const char* const names[7] = { "buildings", "state", "doors", "town link", "box contents", "ground items", "town note" };
+    bool any = false;
+    for (int k = 0; k < 7; ++k) if (kinds[k].size() < 5 || kinds[k].compare(kinds[k].size() - 5, 5, " same") != 0)
+    {
+        if (differing != 0) { if (any) *differing += ", "; *differing += names[k]; }
+        any = true;
+    }
+    if (outcome != 0) *outcome = any ? zonerec::kZcDiffers : zonerec::kZcSame;
+    std::string o = "[ZONE] " + std::string(tag) + " " + aName + " differs from " + bName + " " + Clean(area) + ": " + SideText(aName, a, refusedWriter) + " vs " + SideText(bName, b, newestWriter)
+                  + "; which game made each change cannot be told (no common base copy is kept); record ids and engine handles are not compared";
+    if (a.noKey != 0 || b.noKey != 0) o += "; entries with no key, not compared " + Num(a.noKey) + "/" + Num(b.noKey);
+    o += any ? std::string(". ") : std::string(". No difference in the kinds compared (the copies differ only in what is not compared). ");
+    for (int k = 0; k < 7; ++k) o += (k ? " | " : "") + kinds[k];
+    return CapLine(o, cap);
 }
 /* THE LINE: the refused copy (this game's save, written by refusedWriter) against the newest record's copy (written by newestWriter).
    A writer slot of -1 = not known (a player's own mark in that copy then reads as "the writer's player (slot not known)"). */
 inline std::string DiffLine(const std::string& area, const unsigned char* refused, size_t refusedN, int refusedWriter,
                             const unsigned char* newest, size_t newestN, int newestWriter, size_t cap)
 {
+    return CompareLine("T-1351", "refused copy", "newest record", area, refused, refusedN, refusedWriter, newest, newestN, newestWriter, cap, 0, 0);
+}
+
+/* ---- T-1391 (F1611, 2026-11-20): THIS GAME'S OWN WORK ----
+   T2689: the FAULT label compared a refused save with the NEWEST record in both directions, so the record's own extra things (another
+   game's items: "0/7 only in newest") and engine noise read as this game's loss. The label now decides from what THIS game's copy
+   (mine: the save refused, or the copy an adopt keeps) has that the copy this game LOADED did not - its own work since its loaded copy
+   (store.cpp ZoneLoadedCopy*: the bytes Kenshi was given at the area's read, or this game's own save written since) - in that direction
+   only:
+     added    a thing (per kind, keyed as above) in mine and not in the loaded copy
+     changed  a thing in both whose fields differ - except a building's 'inside count', never counted. The engine writes a building's
+              inside list from its live set, each listed handle written only when its object is found at that moment
+              (build/decomp_553d60.txt:403-433), and reads the list back from the file at the load (decomp_554bc0.txt:214-240): the count
+              is what THIS game had loaded inside at its save, so two games write different counts for the same untouched building in
+              either direction (T2689 log-A:5756 lower; T2691 log-A:6394-6395 / log-B:3146 higher - town buildings no player touched). A
+              player's own work inside a building is the inside pieces themselves (their keys), counted as buildings above.
+     gone     in the loaded copy and not in mine: said, never counted (another game's or the engine's; never this game's loss)
+   Ground items are paired by the ground road's own match (groundname.h NameLookup): the same key first, then an item of the same record
+   within coopground::kGroundNearTenths measured flat, at any height (the better quantity / quality rank, then the smaller height
+   difference, then the smaller flat distance: coopground::GroundNearBetter) - so an item the engine settled a tenth of a unit lower
+   (T2689 log-A:4464-4468, '... given to the item listed as ... (by key)') is the same item. A paired item whose quantity or quality
+   differs is changed. Pure, as the rest of this header. */
+const int kKinds = 7;
+const int kKindBuildings = 0, kKindGround = 5;
+inline const char* KindName(int k)
+{
+    static const char* const n[kKinds] = { "buildings", "state", "doors", "town link", "box contents", "ground items", "town note" };
+    return (k >= 0 && k < kKinds) ? n[k] : "?";
+}
+struct OwnWork
+{
+    int added[kKinds], changed[kKinds], gone[kKinds];
+    std::vector<std::string> show[kKinds];   /* "+key" for an added thing, "key{fields}" for a changed one, in key order */
+    OwnWork() { for (int k = 0; k < kKinds; ++k) { added[k] = 0; changed[k] = 0; gone[k] = 0; } }
+    int Any() const { for (int k = 0; k < kKinds; ++k) if (added[k] != 0 || changed[k] != 0) return 1; return 0; }
+};
+/* a whole number written by Num (optional '-', digits); anything else reads as 0 */
+inline long long IntOf(const std::string& s)
+{
+    long long v = 0; size_t i = 0; const bool neg = !s.empty() && s[0] == '-';
+    if (neg) i = 1;
+    for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i) v = v * 10 + (s[i] - '0');
+    return neg ? -v : v;
+}
+/* the fields of mine that are this game's work against the loaded copy's (insideRule: a building's 'inside count' is never counted - T2691) */
+inline void OwnFields(const Fields& mine, const Fields& loaded, int insideRule, std::vector<std::string>* out)
+{
+    for (Fields::const_iterator i = mine.begin(); i != mine.end(); ++i)
+    {
+        Fields::const_iterator j = loaded.find(i->first);
+        if (insideRule != 0 && i->first == "inside count") continue;   /* T2691 (F1619): either direction is the writing game's loaded set, not its work */
+        if (j == loaded.end() || j->second != i->second) out->push_back(i->first);
+    }
+    for (Fields::const_iterator j = loaded.begin(); j != loaded.end(); ++j)
+        if (mine.find(j->first) == mine.end() && !(insideRule != 0 && j->first == "inside count")) out->push_back(j->first);
+}
+inline std::string ChangedText(const std::string& key, const std::vector<std::string>& df)
+{
+    std::string t = Clean(key) + "{";
+    for (size_t k = 0; k < df.size() && k < (size_t)kShowFields; ++k) t += (k ? "," : "") + Clean(df[k]);
+    if (df.size() > (size_t)kShowFields) t += ",+" + Num((long long)(df.size() - (size_t)kShowFields));
+    return t + "}";
+}
+/* one kind keyed exactly. onlyAmong: as CompareKind's (a sub-kind's thing on one side only counts only for a piece on both sides) */
+inline void OwnKind(int k, const Things& mine, const Things& loaded, const std::set<std::string>* onlyAmong, OwnWork* w)
+{
+    for (Things::const_iterator i = mine.begin(); i != mine.end(); ++i)
+    {
+        Things::const_iterator j = loaded.find(i->first);
+        if (j == loaded.end()) { if (onlyAmong == 0 || onlyAmong->count(i->first) != 0) { ++w->added[k]; w->show[k].push_back("+" + Clean(i->first)); } continue; }
+        std::vector<std::string> df;
+        OwnFields(i->second, j->second, k == kKindBuildings ? 1 : 0, &df);
+        if (!df.empty()) { ++w->changed[k]; w->show[k].push_back(ChangedText(i->first, df)); }
+    }
+    for (Things::const_iterator j = loaded.begin(); j != loaded.end(); ++j)
+        if (mine.find(j->first) == mine.end() && (onlyAmong == 0 || onlyAmong->count(j->first) != 0)) ++w->gone[k];
+}
+/* a key without FreeKey's "#<n>" (a hashed sid field's leading '#' is left: it stands before the spot) */
+inline std::string BareKey(const std::string& k)
+{
+    const size_t h = k.rfind('#'), at = k.rfind('@');
+    return (h != std::string::npos && at != std::string::npos && h > at) ? k.substr(0, h) : k;
+}
+struct GroundSpot { int ok; char sid[poskey::kSidRoom]; long x10, z10, y10; };
+inline void GroundSpotOf(const std::string& key, GroundSpot* g)
+{
+    int sx = 0, sy = 0;
+    g->x10 = g->z10 = g->y10 = 0;
+    g->ok = poskey::ParseKeySpotH(BareKey(key).c_str(), g->sid, poskey::kSidRoom, &sx, &sy, &g->x10, &g->z10, &g->y10);
+}
+/* coopground::GroundBagRank on the fields as text: 0 = quantity and quality equal, 1 = the quantity, 2 = the quality, 3 = neither */
+inline int GroundRankOf(const Fields& a, const Fields& b)
+{
+    Fields::const_iterator qa = a.find("quantity"), qb = b.find("quantity"), la = a.find("quality"), lb = b.find("quality");
+    const int sq = (qa != a.end() && qb != b.end() && qa->second == qb->second) ? 1 : 0, sl = (la != a.end() && lb != b.end() && la->second == lb->second) ? 1 : 0;
+    return (sq && sl) ? 0 : sq ? 1 : sl ? 2 : 3;
+}
+/* 1 = the loaded copy's item (spot l) may stand for mine's (spot m) by the ground road's near match: the same record, within
+   kGroundNearTenths flat. *d2 / *dy: the flat distance squared and the height difference, in tenths */
+inline int GroundNearPair(const GroundSpot& m, const GroundSpot& l, long long* d2, long long* dy)
+{
+    if (m.ok == 0 || l.ok == 0 || poskey::SidFieldsSame(m.sid, l.sid) == 0) return 0;
+    const long long dx = (long long)m.x10 - l.x10, dz = (long long)m.z10 - l.z10;
+    *d2 = dx * dx + dz * dz;
+    *dy = (long long)m.y10 - l.y10; if (*dy < 0) *dy = -*dy;
+    return *d2 <= (long long)coopground::kGroundNearTenths * coopground::kGroundNearTenths ? 1 : 0;
+}
+/* the ground items: each of mine paired with one of the loaded copy's (the same key, then near), one to one */
+inline void OwnGround(const Things& mine, const Things& loaded, OwnWork* w)
+{
+    std::vector<Things::const_iterator> mi, li;
+    std::vector<std::string> mb, lb;
+    for (Things::const_iterator i = mine.begin(); i != mine.end(); ++i) { mi.push_back(i); mb.push_back(BareKey(i->first)); }
+    for (Things::const_iterator j = loaded.begin(); j != loaded.end(); ++j) { li.push_back(j); lb.push_back(BareKey(j->first)); }
+    std::vector<int> pairOf(mi.size(), -1);
+    std::vector<unsigned char> taken(li.size(), 0);
+    for (size_t a = 0; a < mi.size(); ++a)
+        for (size_t b = 0; b < li.size(); ++b) if (taken[b] == 0 && lb[b] == mb[a]) { pairOf[a] = (int)b; taken[b] = 1; break; }
+    std::vector<GroundSpot> ms(mi.size()), ls(li.size());
+    for (size_t a = 0; a < mi.size(); ++a) GroundSpotOf(mb[a], &ms[a]);
+    for (size_t b = 0; b < li.size(); ++b) GroundSpotOf(lb[b], &ls[b]);
+    for (size_t a = 0; a < mi.size(); ++a)
+    {
+        if (pairOf[a] >= 0) continue;
+        int best = -1, bestRank = 0; long long bestD2 = 0, bestDy = 0;
+        for (size_t b = 0; b < li.size(); ++b)
+        {
+            long long d2 = 0, dy = 0;
+            if (taken[b] != 0 || GroundNearPair(ms[a], ls[b], &d2, &dy) == 0) continue;
+            const int rk = GroundRankOf(mi[a]->second, li[b]->second);
+            if (best < 0 || coopground::GroundNearBetter(rk, dy, d2, bestRank, bestDy, bestD2) != 0) { best = (int)b; bestRank = rk; bestDy = dy; bestD2 = d2; }
+        }
+        if (best >= 0) { pairOf[a] = best; taken[(size_t)best] = 1; }
+    }
+    for (size_t a = 0; a < mi.size(); ++a)
+    {
+        if (pairOf[a] < 0) { ++w->added[kKindGround]; w->show[kKindGround].push_back("+" + Clean(mi[a]->first)); continue; }
+        std::vector<std::string> df;
+        OwnFields(mi[a]->second, li[(size_t)pairOf[a]]->second, 0, &df);
+        if (!df.empty()) { ++w->changed[kKindGround]; w->show[kKindGround].push_back(ChangedText(mi[a]->first, df)); }
+    }
+    for (size_t b = 0; b < li.size(); ++b) if (taken[b] == 0) ++w->gone[kKindGround];
+}
+/* THE RULE: this game's own work in `mine` since `loaded`. zonerec kZcDiffers = some (the kinds in *w), kZcSame = none */
+inline int OwnWorkOf(const Side& mine, const Side& loaded, OwnWork* w)
+{
+    std::set<std::string> both;
+    for (Things::const_iterator i = mine.pieces.begin(); i != mine.pieces.end(); ++i) if (loaded.pieces.find(i->first) != loaded.pieces.end()) both.insert(i->first);
+    OwnKind(0, mine.pieces, loaded.pieces, 0, w);
+    OwnKind(1, mine.state, loaded.state, &both, w);
+    OwnKind(2, mine.doors, loaded.doors, &both, w);
+    OwnKind(3, mine.town, loaded.town, &both, w);
+    OwnKind(4, mine.box, loaded.box, &both, w);
+    OwnGround(mine.ground, loaded.ground, w);
+    OwnKind(6, mine.note, loaded.note, 0, w);
+    return w->Any() != 0 ? zonerec::kZcDiffers : zonerec::kZcSame;
+}
+/* THE OWN-WORK LINE: mine (this game's copy, named mineName, written by mineWriter) against this game's loaded copy (loadedFrom says
+   where it came from; written by loadedWriter). *outcome: kZcDiffers (own work: *kinds names the kinds), kZcSame (none), kZcUnread (a
+   copy could not be read). Per kind with work: added / changed counts and the first kShow keys; then what is gone since the load. */
+inline std::string OwnWorkLine(const char* tag, const char* mineName, const std::string& area, const std::string& loadedFrom,
+                               const unsigned char* mine, size_t mineN, int mineWriter, const unsigned char* loaded, size_t loadedN, int loadedWriter,
+                               size_t cap, int* outcome, std::string* kinds)
+{
     Side a, b;
     std::string why;
-    if (!ReadSide(refused, refusedN, refusedWriter, &a, &why)) return FailLine(area, "the refused copy", why);
-    if (!ReadSide(newest, newestN, newestWriter, &b, &why)) return FailLine(area, "the newest record's copy", why);
-    std::set<std::string> both;
-    for (Things::const_iterator i = a.pieces.begin(); i != a.pieces.end(); ++i) if (b.pieces.find(i->first) != b.pieces.end()) both.insert(i->first);
-    const std::string kinds[7] = {
-        CompareKind("buildings", a.pieces, b.pieces, 0), CompareKind("state", a.state, b.state, &both), CompareKind("doors", a.doors, b.doors, &both),
-        CompareKind("town link", a.town, b.town, &both), CompareKind("box contents", a.box, b.box, &both), CompareKind("ground items", a.ground, b.ground, 0),
-        CompareKind("town note", a.note, b.note, 0) };
-    bool any = false;
-    for (int k = 0; k < 7; ++k) if (kinds[k].size() < 5 || kinds[k].compare(kinds[k].size() - 5, 5, " same") != 0) any = true;
-    std::string o = kLineHead + Clean(area) + ": " + SideText("refused copy", a, refusedWriter) + " vs " + SideText("newest record", b, newestWriter)
-                  + "; which game made each change cannot be told (no common base copy is kept); record ids and engine handles are not compared";
-    if (a.noKey != 0 || b.noKey != 0) o += "; entries with no key, not compared " + Num(a.noKey) + "/" + Num(b.noKey);
-    o += any ? std::string(". ") : std::string(". No difference in the kinds compared (the copies differ only in what is not compared). ");
-    for (int k = 0; k < 7; ++k) o += (k ? " | " : "") + kinds[k];
+    if (outcome != 0) *outcome = zonerec::kZcUnread;
+    if (kinds != 0) kinds->clear();
+    const std::string head = "[ZONE] " + std::string(tag) + " own work in the " + mineName + " of " + Clean(area);
+    if (!ReadSide(mine, mineN, mineWriter, &a, &why)) return CapLine(head + " NOT KNOWN: the " + mineName + " cannot be read - " + Clean(why), cap);
+    if (!ReadSide(loaded, loadedN, loadedWriter, &b, &why)) return CapLine(head + " NOT KNOWN: this game's loaded copy (" + Clean(loadedFrom) + ") cannot be read - " + Clean(why), cap);
+    OwnWork w;
+    const int oc = OwnWorkOf(a, b, &w);
+    if (outcome != 0) *outcome = oc;
+    std::string o = head + " since this game's loaded copy (" + Clean(loadedFrom) + "; " + SideText("loaded copy", b, loadedWriter) + " vs " + SideText(mineName, a, mineWriter) + "): ";
+    if (oc != zonerec::kZcDiffers) o += "none - nothing added or changed in the kinds compared";
+    else
+    {
+        bool first = true;
+        for (int k = 0; k < kKinds; ++k)
+        {
+            if (w.added[k] == 0 && w.changed[k] == 0) continue;
+            if (kinds != 0) { if (!kinds->empty()) *kinds += ", "; *kinds += KindName(k); }
+            o += (first ? "" : " | ") + std::string(KindName(k)) + " added " + Num((long long)w.added[k]) + " changed " + Num((long long)w.changed[k]) + " [";
+            for (size_t i = 0; i < w.show[k].size() && i < (size_t)kShow; ++i) o += (i ? ", " : "") + w.show[k][i];
+            if (w.show[k].size() > (size_t)kShow) o += ", +" + Num((long long)(w.show[k].size() - (size_t)kShow));
+            o += "]";
+            first = false;
+        }
+    }
+    std::string gone;
+    for (int k = 0; k < kKinds; ++k) if (w.gone[k] != 0) gone += (gone.empty() ? "" : ", ") + std::string(KindName(k)) + " " + Num((long long)w.gone[k]);
+    o += "; gone since the load, never counted as this game's work: " + (gone.empty() ? std::string("none") : gone);
     return CapLine(o, cap);
 }
 

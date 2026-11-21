@@ -94,9 +94,10 @@ std::string Snippet(const char* p, std::size_t n)
 }   /* anonymous namespace */
 
 AddrEntry::AddrEntry()
-    : kind(kAddrVar), rva(0), verifyAt(0), ptrRva(0), nbytes(0)
+    : kind(kAddrVar), rva(0), verifyAt(0), ptrRva(0), nbytes(0), missed(0)
 {
     name[0] = 0;
+    optional[0] = 0;
     std::memset(bytes, 0, sizeof(bytes));
 }
 
@@ -184,6 +185,9 @@ int AddrParseTable(const char* text, std::size_t n,
             const std::size_t nr = Field(fk + nk, end, &fr);
             const std::size_t nv = Field(fr + nr, end, &fv);
             const std::size_t nb = Field(fv + nv, end, &fb);
+            const char *fo, *fx;
+            const std::size_t no = Field(fb + nb, end, &fo);   /* T-1453: an optional 6th field 'optional:<feature>' */
+            const std::size_t nx = Field(fo + no, end, &fx);   /* nothing after it */
             AddrEntry e;
             unsigned int rva = 0, vat = 0;
             int kind = KindOf(fk, nk);
@@ -194,6 +198,13 @@ int AddrParseTable(const char* text, std::size_t n,
             if (ok && !ParseHex32(fr, nr, &rva)) ok = 0;
             if (ok && !ParseHex32(fv, nv, &vat)) ok = 0;
             if (ok && nb == 0) ok = 0;
+            /* a 6th field is the marker only when it starts 'optional:' (then it must be well formed and last); any other
+               trailing text is ignored, as it always was */
+            if (ok && no >= 9 && std::memcmp(fo, "optional:", 9) == 0)
+            {
+                if (nx != 0 || !AddrFeatureOk(fo + 9, no - 9)) ok = 0;
+                else { std::memcpy(e.optional, fo + 9, no - 9); e.optional[no - 9] = 0; }
+            }
 
             if (ok)
             {
@@ -265,6 +276,32 @@ const char* AddrKindName(int kind)
         case kAddrVar:  return "var";
         default:        return "??";
     }
+}
+
+int AddrFeatureOk(const char* p, std::size_t n)
+{
+    std::size_t i;
+    if (p == 0 || n == 0 || n >= (std::size_t)kAddrFeatureMax) return 0;
+    for (i = 0; i < n; ++i)
+        if (!((p[i] >= 'a' && p[i] <= 'z') || (p[i] >= '0' && p[i] <= '9') || p[i] == '-')) return 0;
+    return 1;
+}
+
+int AddrOptionalMiss(AddrEntry* e)
+{
+    if (e == 0 || e->optional[0] == 0) return 0;
+    e->missed = 1;
+    e->rva = 0;
+    e->verifyAt = 0;
+    e->ptrRva = 0;
+    e->nbytes = 0;
+    std::memset(e->bytes, 0, sizeof(e->bytes));
+    return 1;
+}
+
+std::string AddrOptionalMissLine(const AddrEntry& e, const std::string& why)
+{
+    return std::string("[ADDR] optional row ") + e.name + " not found - " + e.optional + " is off (" + why + ")";
 }
 
 void AddrClearSlots(const AddrSlot* slots, int n)

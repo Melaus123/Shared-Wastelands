@@ -42,7 +42,7 @@
 
 namespace livefirst {
 
-const unsigned int kProtocol = 170;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
+const unsigned int kProtocol = 173;     /* the world-server protocol that carries CHUNK (store_main.cpp kProtocol, store.cpp kStoreProtocol) */
 
 
 

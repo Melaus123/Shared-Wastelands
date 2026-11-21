@@ -57,7 +57,7 @@
 namespace areafresh {
 
 const unsigned int kMsgAreaFresh = 89u;   /* 28-87 are taken on the world-server link (store_main.cpp's enum and constants); 88 is CHUNK on effort/t1118f / t1118g (part 3) */
-const unsigned int kProtocol = 170u;      /* the world-server protocol that carries AREA_FRESH (127 since part 3 moved it to 89; 149: T-1279 - an ASK no live holder can answer is answered from the world server's records; 165-168 (T-1429 on its branch, never reused): 165: T-1429 s2 - LEASE / WAIT and the world-load claim; 166: s2 fold 1 - the ASK why=settle before the world load; 167: s2 fold 2 - the settle ask carries the whole ordered area list, and why worldFirst; 168: s2 fold 3 - an area RECORD carries its base (the stored copy's seq it was made from) and a stale one is answered CANT staleBase; 169: the merge of those with main's 165, T-1427 - a piece record may carry the builder's town; 170: the merge of 169 with effort/t1408a's wall group facts in a piece record's STATE, T-1408) */
+const unsigned int kProtocol = 173u;      /* the world-server protocol that carries AREA_FRESH (127 since part 3 moved it to 89; 149: T-1279 - an ASK no live holder can answer is answered from the world server's records; 165-168 (T-1429 on its branch, never reused): 165: T-1429 s2 - LEASE / WAIT and the world-load claim; 166: s2 fold 1 - the ASK why=settle before the world load; 167: s2 fold 2 - the settle ask carries the whole ordered area list, and why worldFirst; 168: s2 fold 3 - an area RECORD carries its base (the stored copy's seq it was made from) and a stale one is answered CANT staleBase; 169: the merge of those with main's 165, T-1427 - a piece record may carry the builder's town; 170: the merge of 169 with effort/t1408a's wall group facts in a piece record's STATE, T-1408) */
 
 
 
@@ -68,15 +68,27 @@ const size_t kMsgSize = 20;
 enum { kWhyNone = 0, kWhyNoHolder = 1, kWhyAskerHolds = 2, kWhyHolderNotLive = 3, kWhyNotHolder = 4, kWhyNotLoaded = 5,
        kWhyNoHook = 6, kWhyFault = 7, kWhyNotPublished = 8, kWhyBusy = 9, kWhyServerWrite = 10, kWhyNoWorld = 11,
        kWhySendFailed = 12, kWhyHolderGone = 13, kWhyDropped = 14, kWhyCurrent = 15, kWhyLease = 16, kWhyNotWorlds = 17, kWhyLoadedOwn = 18,
-       kWhySettle = 19, kWhyWorldFirst = 20, kWhyStaleBase = 21, kWhyCount = 22 };   /* s2 fold 3 (review F1372): staleBase - down only, to the sender of an area record made from an older stored copy than the one held (ServerBaseJudge) */   /* s2 fold 2 (review F1364 C): worldFirst - the brand-new world's one reserved lease (x 0, y 0 carry no area): ASK / LEASE / WAIT / FRESH down, FRESH (its start areas are up) / CANT (given back) up */   /* s2 fold 1: settle - an ASK made before the world load (the pre-load), answered with the decision only (FRESH / CANT current / LEASE / WAIT) */   /* T-1429 s2: lease - a wait ended by this game's LEASE (game-side only, never sent); notWorlds - a claimer's loaded copy is not the world's; loadedOwn - an ASK that is a world-load claim */   /* part 3: dropped - a queued WRITE the holder's stopped world dropped; T-1279: current - the world server holds no newer record than the asker's */
+       kWhySettle = 19, kWhyWorldFirst = 20, kWhyStaleBase = 21, kWhyRecNotHolder = 22, kWhyRecLease = 23, kWhyRecNotNewer = 24, kWhyRecWriteFailed = 25, kWhyCount = 26 };   /* T-1391 (protocol 172): recNotHolder / recLease / recNotNewer - down only, to the sender of an area RECORD the world server did not take (not the holder; the creation-lease rule; a stored copy as new or newer) - before, those three were dropped with nothing sent back */   /* s2 fold 3 (review F1372): staleBase - down only, to the sender of an area record made from an older stored copy than the one held (ServerBaseJudge) */   /* s2 fold 2 (review F1364 C): worldFirst - the brand-new world's one reserved lease (x 0, y 0 carry no area): ASK / LEASE / WAIT / FRESH down, FRESH (its start areas are up) / CANT (given back) up */   /* s2 fold 1: settle - an ASK made before the world load (the pre-load), answered with the decision only (FRESH / CANT current / LEASE / WAIT) */   /* T-1429 s2: lease - a wait ended by this game's LEASE (game-side only, never sent); notWorlds - a claimer's loaded copy is not the world's; loadedOwn - an ASK that is a world-load claim */   /* part 3: dropped - a queued WRITE the holder's stopped world dropped; T-1279: current - the world server holds no newer record than the asker's */
 inline const char* WhyName(unsigned int w)
 {
     static const char* const kNames[kWhyCount] = { "none", "noHolder", "askerHolds", "holderNotLive", "notHolder", "notLoaded", "noHook",
-                                                   "fault", "notPublished", "busy", "serverWrite", "noWorld", "sendFailed", "holderGone", "dropped", "current", "lease", "notWorlds", "loadedOwn", "settle", "worldFirst", "staleBase" };
+                                                   "fault", "notPublished", "busy", "serverWrite", "noWorld", "sendFailed", "holderGone", "dropped", "current", "lease", "notWorlds", "loadedOwn", "settle", "worldFirst", "staleBase", "recNotHolder", "recLease", "recNotNewer", "recWriteFailed" };
     return w < (unsigned int)kWhyCount ? kNames[w] : "unknown";
 }
-
-struct Msg { unsigned int kind, why; int x, y; long long stamp; Msg() : kind(0u), why(0u), x(-1), y(-1), stamp(0) {} };
+/* T-1391: an area RECORD's refusal told to its sender (CANT): 0 = not one; 1 staleBase, 2 not the holder, 3 the creation lease, 4 not newer,
+   7 the world server could not store it (its disk write failed) - coopqueue's kZrAns* numbers */
+inline int RecRefusalOf(unsigned int why)
+{
+    return why == (unsigned int)kWhyStaleBase ? 1 : why == (unsigned int)kWhyRecNotHolder ? 2 : why == (unsigned int)kWhyRecLease ? 3 : why == (unsigned int)kWhyRecNotNewer ? 4
+         : why == (unsigned int)kWhyRecWriteFailed ? 7 : 0;
+}
+/* T-1391 fold 2 (protocol 172): a record refusal is the 36-byte form - the 20 bytes with stamp = THE REFUSED UPLOAD'S stamp (the game
+   matches the answer to the send it answers), then the stored copy's stamp and seq (0, 0 = none / not known): a game whose earlier send of
+   the same save is the stored copy takes the refusal of a re-send as its earlier send's accept */
+struct Msg { unsigned int kind, why; int x, y; long long stamp; long long storedStamp; unsigned long long storedSeq; Msg() : kind(0u), why(0u), x(-1), y(-1), stamp(0), storedStamp(0), storedSeq(0ULL) {} };
+/* the world server's mirror version of an area copy this game wrote: the seq the world server stored it with when it is confirmed (a copy
+   received from it, or a queued save written only after its accept), 0 for this game's own unconfirmed save (B1, review of 2ab363d9c) */
+inline unsigned long long MirrorSeqOnWrite(int confirmed, unsigned long long seq) { return confirmed != 0 ? seq : 0ULL; }
 
 inline bool OnGrid(int x, int y) { return x >= 0 && x < 64 && y >= 0 && y < 64; }
 /* one area's row in a 4096-row table: x * 64 + y; -1 off the grid */
@@ -99,15 +111,34 @@ inline bool Encode(std::vector<char>* b, unsigned int kind, unsigned int why, in
     Put32(b, (unsigned int)(s & 0xFFFFFFFFull)); Put32(b, (unsigned int)(s >> 32));
     return true;
 }
+const size_t kRecMsgSize = kMsgSize + 16;   /* T-1391 fold 2: a record refusal's form */
+inline bool EncodeRecRefusal(std::vector<char>* b, unsigned int why, int x, int y, long long uploadStamp, long long storedStamp, unsigned long long storedSeq)
+{
+    if (RecRefusalOf(why) == 0 || storedStamp < 0) return false;
+    std::vector<char> t;
+    if (!Encode(&t, (unsigned int)kCant, why, x, y, uploadStamp)) return false;
+    const unsigned long long ss = (unsigned long long)storedStamp;
+    Put32(&t, (unsigned int)(ss & 0xFFFFFFFFull)); Put32(&t, (unsigned int)(ss >> 32));
+    Put32(&t, (unsigned int)(storedSeq & 0xFFFFFFFFull)); Put32(&t, (unsigned int)(storedSeq >> 32));
+    b->insert(b->end(), t.begin(), t.end());
+    return true;
+}
 inline bool Decode(const char* p, size_t n, Msg* m)
 {
-    if (p == 0 || n != kMsgSize || p[2] != 0 || p[3] != 0) return false;
+    if (p == 0 || (n != kMsgSize && n != kRecMsgSize) || p[2] != 0 || p[3] != 0) return false;
     Msg d;
     d.kind = (unsigned int)(unsigned char)p[0]; d.why = (unsigned int)(unsigned char)p[1];
     d.x = (int)Get32(p + 4); d.y = (int)Get32(p + 8);
     const unsigned long long s = (unsigned long long)Get32(p + 12) | ((unsigned long long)Get32(p + 16) << 32);
     d.stamp = (long long)s;
     if (d.kind < (unsigned int)kAsk || d.kind > (unsigned int)kWait || d.why >= (unsigned int)kWhyCount || !OnGrid(d.x, d.y) || d.stamp < 0) return false;
+    if (n == kRecMsgSize)
+    {   /* T-1391 fold 2: only a record refusal comes in the long form */
+        if (d.kind != (unsigned int)kCant || RecRefusalOf(d.why) == 0) return false;
+        d.storedStamp = (long long)((unsigned long long)Get32(p + 20) | ((unsigned long long)Get32(p + 24) << 32));
+        d.storedSeq = (unsigned long long)Get32(p + 28) | ((unsigned long long)Get32(p + 32) << 32);
+        if (d.storedStamp < 0) return false;
+    }
     *m = d;
     return true;
 }
@@ -704,6 +735,41 @@ inline unsigned long long ContentBaseOnEcho(unsigned long long cur, long long lo
 /* after CANT staleBase: nothing of the area is published until a load of it takes the world's copy - lifted only by a load whose content
    base is known (not 0) */
 inline int StaleBaseLifts(unsigned long long baseAtLoad) { return baseAtLoad != 0 ? 1 : 0; }
+/* ---- T-1391 (owner 1821: no area save is refused or dropped on any road). F1529: the content base was set only on the queued
+   off-main-thread load, a road that never runs; the main-thread load, the adopt of a newer copy and the host's start-up copy of its
+   server's files left it 0, so every such save was refused STALE BASE. Every road where this game takes on a version of an area now
+   records it; where the mirror's version came from is kept beside it (MirrorFrom*), and the road that set the content base (BaseRoad*)
+   goes on the save's BASE line. ---- */
+enum { kMirrorFromOwn = 0, kMirrorFromRecv = 1, kMirrorFromKept = 2, kMirrorFromIndex = 3 };
+enum { kBaseRoadNone = 0, kBaseRoadLoadRecv = 1, kBaseRoadLoadKept = 2, kBaseRoadMirror = 3, kBaseRoadAdopt = 4, kBaseRoadEcho = 5 };
+/* a load: the road is where the mirror's version came from (a received copy, the kept table, the start-up copy); none when no base */
+inline int BaseRoadOnLoad(unsigned long long base, int mirrorFrom)
+{
+    if (base == 0) return kBaseRoadNone;
+    return mirrorFrom == kMirrorFromKept ? (int)kBaseRoadLoadKept : mirrorFrom == kMirrorFromIndex ? (int)kBaseRoadMirror : (int)kBaseRoadLoadRecv;
+}
+/* an ADOPT (T-609 kept-in-step copy): the loaded copy is now marked as the held record - its version is the mirror's seq when the mirror
+   holds that record (same stamp, version known), else none (0). Never the record's own seq: version notes move it without the content
+   (StoreNoteRecordSeq, the own-upload echo), so it can name a version this game does not hold (review of T-1391 b, SHOULD 1) */
+inline unsigned long long ContentBaseOnAdopt(int mirrorKnown, long long mirrorStamp, unsigned long long mirrorSeq, long long recStamp, unsigned long long recSeq)
+{
+    (void)recSeq;
+    return ContentBaseOnLoad(recStamp, mirrorKnown, mirrorStamp, mirrorSeq);
+}
+inline const char* BaseRoadName(int road)
+{
+    switch (road)
+    {
+    case kBaseRoadLoadRecv: return "load (a copy received from the world server)";
+    case kBaseRoadLoadKept: return "load (the kept copy from the last session)";
+    case kBaseRoadMirror:   return "mirror (the start-up copy of the world server's files, loaded)";
+    case kBaseRoadAdopt:    return "adopt (a newer copy taken while loaded)";
+    case kBaseRoadEcho:     return "echo (the world server stored this game's own upload)";
+    default:                return "none (no world copy known - only a first upload is taken)";
+    }
+}
+/* the BASE line: the first 64 sends are logged; the counter keeps counting */
+inline int BaseLineDue(long long nth) { return (nth >= 1 && nth <= 64) ? 1 : 0; }
 /* ... and any area record that replaces a bigger stored one is logged (old -> new size) */
 inline int ServerSmallerReplace(int storedHasFile, long long storedLen, long long newLen) { return (storedHasFile != 0 && newLen < storedLen) ? 1 : 0; }
 

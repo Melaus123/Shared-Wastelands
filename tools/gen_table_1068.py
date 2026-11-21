@@ -559,12 +559,13 @@ def read_table(path):
             header.append(s)
             continue
         f = t.split()
-        rows.append({'name': f[0], 'kind': f[1], 'rva': int(f[2], 16), 'at': int(f[3], 16), 'bytes': f[4]})
+        rows.append({'name': f[0], 'kind': f[1], 'rva': int(f[2], 16), 'at': int(f[3], 16), 'bytes': f[4],
+                     'opt': f[5] if len(f) > 5 else None})   # T-1453: 'optional:<feature>', carried to the 1.0.68 table
     return header, rows
 
 
-def fmt_row(name, kind, rva, at, bytes_field):
-    return '%-46s %-4s %08X %08X %s' % (name, kind, rva, at, bytes_field)
+def fmt_row(name, kind, rva, at, bytes_field, opt=None):
+    return '%-46s %-4s %08X %08X %s' % (name, kind, rva, at, bytes_field) + ((' ' + opt) if opt else '')
 
 
 def resolve_row(M, X, row):
@@ -665,6 +666,11 @@ def resolve_row(M, X, row):
 
 def row68(b, row, rva68, res):
     """The 1.0.68 table line for a row whose 1.0.68 address is known."""
+    line = _row68(b, row, rva68, res)
+    return line + ((' ' + row['opt']) if row.get('opt') else '')   # T-1453: the optional marker, as the 1.0.65 table has it
+
+
+def _row68(b, row, rva68, res):
     k = row['kind']
     if k == 'code':
         at68 = rva68 + (row['at'] - row['rva'])            # the +16 rule survives
@@ -754,7 +760,9 @@ HEADER68 = """# kenshi-coop address table - Kenshi 1.0.68 x64 Steam (the vanilla
 #   ret   an interior return address; <bytes> are the CALL that returns to <rva>
 #   ro    read-only initialised data; <bytes> are the image's own constant bytes
 #   ptr   a relocated pointer in read-only data; <bytes> is the RVA it must point at
-#   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md"""
+#   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
+#   optional:<feature>  (T-1453 / T-294) an optional 6th field: a row only that minor feature, diagnostic or test lever uses;
+#         not found or not matching, ONLY that feature is off (its address 0) and the mod runs - logged '[ADDR] optional row ...'"""
 
 
 def generate(args):

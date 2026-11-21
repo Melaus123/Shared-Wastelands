@@ -784,6 +784,7 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
                           : std::string(" kitCells=absent"))   /* kit2 */
              + (wornOnly ? " wornOnly=1 wornCleared=" + S(wornCleared) + " skippedNotWorn=" + S(skippedNotWorn)
                          : std::string()));
+    coop::ItemLookNoteRedress((void*)c);   /* T-1449: this copy's items judged ~2 s on - the [ITEMLOOK] line (read only) */
     return true;
 }
 

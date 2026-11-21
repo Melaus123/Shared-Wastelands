@@ -30,7 +30,11 @@ namespace powerwire {
 
 const unsigned char kPowerState = 16;        /* pieces no player owns: a player's power piece rides its piece record (piecerec.h format 2) */
 const unsigned char kPowerAsk = 17;
-const unsigned char kAskSwitch = 1;          /* POWER_ASK's what: the only one there is */
+const unsigned char kAskSwitch = 1;          /* POWER_ASK's what: a power piece's switch */
+const unsigned char kAskPause = 2;           /* T-1429 s3 (game-to-game 239): a building's construction pause, asked of its piece record's writer
+                                                (value 0 / 1) by a game that is not the writer - an older game refuses what 2 as a bad value */
+const unsigned char kAskPauseDone = 3;       /* T-1429 s3 fold 2: the writer's answer to every pause ask - done, value = the pause it now holds */
+const unsigned char kAskPauseRefused = 4;    /* T-1429 s3 fold 2: the writer's answer - refused, value = the pause it holds (the asker lays it) */
 /* T-1192 (game-to-game protocol 193): A RECIPE ASKED OF A CRAFTING BENCH'S WRITER. The crafting window's add (0x2B9730 -> CraftQueueAdd
    0x2B5C60) on a game that does not write the bench adds nothing there: it is asked of the writer's game (CRAFT_ASK, to that slot alone),
    which adds it through its own CraftQueueAdd - the list then reaches every game on the bench's piece record (piecerec.h craft part). The
@@ -108,7 +112,7 @@ inline bool PowerEncodable(const PowerMsg& m)
         for (size_t i = 0; i < m.stock.size(); ++i) if (!PowerValueOk(m.stock[i])) return false;
         return true;
     }
-    if (m.kind == kPowerAsk) return m.what == kAskSwitch && (m.value == 0.0f || m.value == 1.0f);
+    if (m.kind == kPowerAsk) return m.what >= kAskSwitch && m.what <= kAskPauseRefused && (m.value == 0.0f || m.value == 1.0f);
     if (m.kind == kCraftAsk) return CraftAskShapeOk(m.op, m.sid.size(), m.extra.size(), m.mode, m.index);
     if (m.kind == kCraftAnswer) return m.verdict <= kCraftVerdictMax;
     return false;
@@ -192,7 +196,7 @@ inline int DecodePower(const char* p, size_t size, PowerMsg* out)
         if (size - off < 5) return kPowerDecodeTooShort;
         if (size - off > 5) return kPowerDecodeBadValue;
         m.what = (unsigned char)p[off]; m.value = PowerGetF(p + off + 1);
-        if (m.what != kAskSwitch || !(m.value == 0.0f || m.value == 1.0f)) return kPowerDecodeBadValue;
+        if (m.what < kAskSwitch || m.what > kAskPauseRefused || !(m.value == 0.0f || m.value == 1.0f)) return kPowerDecodeBadValue;
         *out = m;
         return kPowerDecodeOk;
     }
@@ -362,6 +366,34 @@ inline int PowerSayKind(int first, int changed, int owned)
 {
     if (changed != 0) return kPowerSayEvent;
     return (first != 0 && owned != 0) ? kPowerSayFirst : kPowerSayNone;
+}
+
+/* T-1455 diagnostics (build.cpp PwDiag*, log only - nothing decides on them). Each power piece's writer verdict is followed by its
+   key across row resets. kPowerDiag* = the line budgets per launch: a line kind prints its first `cap` lines, then every `every`th
+   (PowerDiagSay; n = the 1-based number of the line due, counted whether printed or not). */
+const long long kPowerDiagVerdictCap = 40, kPowerDiagFirstCap = 16, kPowerDiagFrozenCap = 40, kPowerDiagEvery = 100;
+inline int PowerDiagSay(long long n, long long cap, long long every)
+{
+    if (n <= 0) return 0;
+    if (n <= cap) return 1;
+    return (every > 0 && (n - cap) % every == 0) ? 1 : 0;
+}
+/* a freeze (the verdict "another game": this game neither burns nor charges the piece) starts anew when the verdict turns to it
+   (had = the piece was followed before, oldWriter its last verdict) or when the piece comes back after unseenMs > forgetMs (an
+   unload: the time away was no freeze). 1 = the freeze clock starts now */
+inline int PowerFreezeStarts(int had, int oldWriter, int newWriter, unsigned int unseenMs, unsigned int forgetMs)
+{
+    if (newWriter != 2) return 0;
+    return (had == 0 || oldWriter != 2 || unseenMs > forgetMs) ? 1 : 0;
+}
+/* THE FROZEN-TOO-LONG RULE: a piece frozen (writer 2) for over kPowerFrozenQuietMs while no value from its writer (a POWER_STATE
+   applied, or its piece record's LIVE values applied or found the same) came in that long - none ever (haveValue 0) or the last
+   sinceValueMs ago. 1 = say it (once per freeze, build.cpp) */
+const unsigned int kPowerFrozenQuietMs = 60000;
+inline int PowerFrozenQuiet(int writer, unsigned int frozenMs, int haveValue, unsigned int sinceValueMs)
+{
+    if (writer != 2 || frozenMs <= kPowerFrozenQuietMs) return 0;
+    return (haveValue == 0 || sinceValueMs > kPowerFrozenQuietMs) ? 1 : 0;
 }
 
 /* the writer verdict (coopfarm::kProdWriter*: 0 none, 1 this game, 2 another game) -> what this game does with one piece */

@@ -283,6 +283,8 @@ static unsigned long long kBdJobFinderTestRva = 0; static AddrReg kBdJobFinderTe
 static unsigned long long kBdSetFactionRva = 0; static AddrReg kBdSetFactionRva_reg("Building_setFaction", &kBdSetFactionRva);  /* Steam_1.0.65 0x556EC0 - P18: the owner-change hook */
 static unsigned long long kBdClaimSetFactionRet = 0; static AddrReg kBdClaimSetFactionRet_reg("JobClaimSetFactionRet", &kBdClaimSetFactionRet);  /* Steam_1.0.65 0x35B9E4, 1.0.68 0x35BA44 - T-1222: the worker job set-up's claim of a foliage building (0x35B3D0, call [rbx+0xA0]), a return address */
 static unsigned long long kBdIsForSaleRva = 0; static AddrReg kBdIsForSaleRva_reg("Building_isForSale", &kBdIsForSaleRva);  /* Steam_1.0.65 0x29C4C0 - P18 fold 1 (item 5): Building vt+0x2C0, hooked */
+static unsigned long long kBdPauseToggleRva = 0; static AddrReg kBdPauseToggleRva_reg("BuildingPauseToggle", &kBdPauseToggleRva);  /* T-1429 s3: Steam_1.0.65 0x5464B0 - Building vt+0x2A8, the 'PAUSE CONSTRUCTION' button's toggle (one function for every building class), hooked */
+static unsigned long long kBdFinishRva = 0; static AddrReg kBdFinishRva_reg("BuildingFinishConstruction", &kBdFinishRva);  /* T-1429 s3: Steam_1.0.65 0x5618B0 - Building vt+0x240, construction finished (+0x160 = 1, +0x161 = 0), hooked */
 static unsigned long long kBdUpgradeRva = 0; static AddrReg kBdUpgradeRva_reg("BuildingUpgrade", &kBdUpgradeRva);  /* Steam_1.0.65 0x2A49A0, 1.0.68 0x2A49E0 - T-609 U: Building::upgrade (vt+0x258), hooked */
 static unsigned long long kBdDowngradeRva = 0; static AddrReg kBdDowngradeRva_reg("BuildingDowngrade", &kBdDowngradeRva);  /* Steam_1.0.65 0x2A4D70, 1.0.68 0x2A4DB0 - T-609 U: Building::downgrade (vt+0x260), hooked */
 static unsigned long long kBdBuyMeRva = 0; static AddrReg kBdBuyMeRva_reg("BuildingBuyMeCallback", &kBdBuyMeRva);  /* Steam_1.0.65 0x7ACB20, 1.0.68 0x7AD6C0 - T-805 b: the buy dialogue's answer, hooked */
@@ -7403,6 +7405,185 @@ void PcdRecordOverLay(void* b, int index)
     ++g_pcdOverLay;
     PcdApplyDoors(key, b, kept->second.b.live, index);
 }
+}   /* T-1429 s3: the pause's class gate and its gated write are defined in namespace coop with the kept lay's power code, outside this unnamed namespace */
+int BdKeptPauseClass(const char* cls);
+int BdPauseWriteGated(void* b, int paused);
+namespace {   /* the same unnamed namespace, reopened (T-1429 s3) */
+/* ---- T-1429 s3 (owner 1777 / 1788; F1491, F1468 s3 A): A BUILDING'S CONSTRUCTION PAUSE ON ITS PIECE RECORD. The byte +0x161 (the
+   'PAUSE CONSTRUCTION' button's; the save's "pause", restored by the load 0x554BC0:165-167) changes only at two engine events: the toggle
+   0x5464B0 (vt+0x2A8; the button's callback 0x313D30 calls it) and the construction finish 0x5618B0 (vt+0x240: +0x160 = 1, +0x161 = 0).
+   Both are hooked (BdPauseEventAny, ANY THREAD - the finish runs inside AddConstructionProgress 0x558B10, which a worker's job may call
+   off the main thread); the event reaches BuildTick on its own small queue (PcpEvDrain; a finish that cleared nothing is not queued),
+   and there the game that writes the piece's record (the box rule, WallWriterDecide - as a door's change) marks one write when the
+   byte differs from the stored record or from its own last write (review S1). A game that is NOT the writer asks the writer by its own
+   slot on POWER_ASK's road (what kAskPause - the road a teammate's switch of a power piece already takes) and puts its byte back to the
+   stored record's; the writer sets the byte and writes the record (PcpDoAsk), whose forward lays it here (review B1).
+   Every write of the piece carries the pause (PcrPauseFill: read from the piece on its writer, else the stored record's), so the record
+   is the pause's one source. Every game lays a record's pause where it lays the piece's other LIVE fields (PcaApplyOne -> PcpQueue ->
+   PcpDrain: the area's first apply after a load, and each newer record from another game - the other game sees a change live on the
+   record's own road, the world server's forward of the write), through the reset restore's class gate (BdPowerWritePod: only a class
+   whose load writes "pause"). Applying a value = writing the byte, as the load does. ---- */
+long long g_pcpEv[2] = { 0, 0 };   /* kind-13 events taken: [toggle, finish] */
+long long g_pcpMarked = 0, g_pcpSame = 0, g_pcpNotWriter = 0, g_pcpNoPiece = 0, g_pcpNotClass = 0, g_pcpFault = 0, g_pcpFilled = 0, g_pcpFilledKept = 0,
+          g_pcpApplied = 0, g_pcpApplySame = 0, g_pcpApplyWaits = 0, g_pcpApplyDropped = 0, g_pcpApplyFault = 0;
+long long g_pcpAskSent = 0, g_pcpAskFail = 0, g_pcpPutBack = 0, g_pcpAskRecv = 0, g_pcpAskDone = 0, g_pcpAskRefused = 0;   /* review B1: the non-writer's ask road */
+long long g_pcpAnswerSent = 0, g_pcpAnswerFail = 0, g_pcpAnswerRecv = 0, g_pcpAnswerLaid = 0;   /* fold 2: the writer's answer to every ask */
+std::set<std::string> g_pcpPend;              /* keys whose kept record's pause waits to be laid on the piece (PcpDrain) */
+std::map<std::string, int> g_pcpLast;         /* record id -> the pause this game's last write of it carried */
+const size_t kPcpCap = 4096u;
+int g_pcpLines = 0;
+const int kPcpLineCap = 60;
+void PcpSay(const char* line)
+{
+    if (g_pcpLines >= kPcpLineCap) return;
+    ++g_pcpLines;
+    DebugLog(std::string(line) + (g_pcpLines == kPcpLineCap ? " (the last pause line this session)" : ""));
+}
+/* the piece's own pause byte +0x161; 1 = read */
+int BdPauseReadPod(const void* b, int* paused)
+{
+    __try { *paused = (*((const unsigned char*)b + 0x161) != 0) ? 1 : 0; return 1; }   /* kBdPause (the kept lay's power code below) */
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* 1 = a class whose load writes "pause" into +0x161 (the reset restore's gate, BdKeptPauseClass) */
+int BdPauseClassOk(void* b)
+{
+    char cls[64];
+    cls[0] = 0;
+    BdClassOf(b, cls, (int)sizeof cls);
+    return BdKeptPauseClass(cls) != 0 ? 1 : 0;
+}
+/* MAIN THREAD (BuildTick, event 13): the engine changed the construction pause of the piece at key (finish 1: the construction finish's
+   clear). Its record's writer marks one write when the byte differs from what this game last wrote, else from the stored record */
+void BdPauseNoted(const std::string& key, int finish, int asked = 0)
+{
+    if (asked == 0) ++g_pcpEv[finish != 0 ? 1 : 0];   /* fold 2: an ask served (PcpDoAsk) is no engine event */
+    const char* by = (finish != 0) ? "construction finish" : (asked != 0 ? "pause set at another game's ask" : "pause toggle");
+    if (RoleIsSingle()) return;
+    std::map<std::string, BdReg>::iterator row = g_reg.find(key);
+    void* b = 0;
+    if (row != g_reg.end() && row->second.removed == 0) { int tv = 0; b = BdFindPiece(row->first, row->second, &tv); }
+    char line[420];
+    if (b == 0) { ++g_pcpNoPiece; return; }   /* no player piece's row here (a town building): no piece record */
+    if (BdPauseClassOk(b) == 0) { ++g_pcpNotClass; return; }
+    int p = 0;
+    if (BdPauseReadPod(b, &p) == 0) { ++g_pcpFault; return; }
+    const int own = (row->second.own != 0 && row->second.via != 3) ? 1 : 0;
+    const std::string id = piecerec::MakePieceRecId(key);
+    std::map<std::string, PcrKept>::const_iterator kept = g_pcrKept.find(id);
+    const int keptV = (kept != g_pcrKept.end() && (kept->second.h.flags & piecerec::kPrFlagRemoved) == 0 && kept->second.b.live.hasPause != 0) ? kept->second.b.live.paused : -1;
+    FarmWriterView fv;
+    if (WallWriterDecide(b, &fv) != 1)
+    {   /* review B1: another game writes this piece's record - a pause set here by the engine's toggle is asked of that writer by its own
+           slot on POWER_ASK's road (what kAskPause; the writer sets it and writes the record, which is laid here) and this game's byte goes
+           back to the stored record's (the record is the one source). The construction finish asks nothing: every game finishes the piece */
+        ++g_pcpNotWriter;
+        int sent = 0;
+        if (finish == 0)
+        {
+            powerwire::PowerMsg m;
+            m.kind = powerwire::kPowerAsk; m.key = key; m.what = powerwire::kAskPause; m.value = p != 0 ? 1.0f : 0.0f;
+            std::vector<char> bytes;
+            sent = (fv.slot >= 0 && net::BuildSlotTarget(fv.slot) == fv.slot && powerwire::EncodePower(&bytes, m) && net::SendPowerToSlot(bytes, fv.slot)) ? 1 : 0;
+            if (sent != 0) ++g_pcpAskSent; else ++g_pcpAskFail;
+        }
+        int back = 0;
+        if (finish == 0 && keptV >= 0 && keptV != p && BdPauseWriteGated(b, keptV) != 0) { back = 1; ++g_pcpPutBack; }
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] pause key=%.90s paused=%d by the engine's %s here - this game is not the piece's record writer: %s%s; pausePc[notWriter,askSent,askFail]=%lld,%lld,%lld",
+                    key.c_str(), p, finish != 0 ? "construction finish" : "pause toggle",
+                    finish != 0 ? "nothing asked (every game finishes the piece)" : (sent != 0 ? "asked of the writer (POWER_ASK pause)" : "NOT asked (no road to the writer by its own slot)"),
+                    "", g_pcpNotWriter, g_pcpAskSent, g_pcpAskFail);
+        PcpSay(line);
+        if (finish == 0)
+        {
+            char l2[260];
+            _snprintf_s(l2, sizeof(l2), _TRUNCATE, "[BUILD] pause key=%.90s ask: writer slot%d, sent %d; the byte here %s", key.c_str(), fv.slot, sent,
+                        back != 0 ? "put back to the stored record's (the writer's record write brings the pause it sets)" : "left (the stored record says the same, or knows no pause)");
+            PcpSay(l2);
+        }
+        return;
+    }
+    PcrW* w = PcrWOf(key);
+    if (w == 0 || w->removed != 0) return;
+    std::map<std::string, int>::const_iterator last = g_pcpLast.find(id);
+    const int lastV = (last != g_pcpLast.end()) ? last->second : -1;
+    /* review S1: unchanged only when the stored record AND this game's own last write (a write still in flight) both say p - a writer
+       handed over and back, or a toggle back before the first write's answer, is written */
+    const int base = keptV;
+    if ((keptV >= 0 || lastV >= 0) && (keptV < 0 || keptV == p) && (lastV < 0 || lastV == p)) { ++g_pcpSame; return; }
+    if (own == 0) { w->liveWall = 1; w->liveHolder = 1; }   /* another player's piece: written over its kept record, this game its writer (PcrWriteOne) */
+    ++g_pcpMarked;
+    PcrMarkW(*w, key, piecerec::kPeLive);
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] pause key=%.90s paused %d -> %d by the engine's %s (%s) - its piece record is written; pausePc[marked]=%lld",
+                key.c_str(), base, p, by, own != 0 ? "own piece" : "another player's piece, this game its writer", g_pcpMarked);
+    PcpSay(line);
+}
+/* the pause a write of the piece carries, into *lv: on its writer the piece's byte read now - unless the stored record's pause still
+   waits to be laid here (the area not applied yet, or queued: the record outranks the save's byte); else the stored record's (a write
+   that does not know it never drops it). Review S3: a piece with no LIVE part yet - a power class too (an unfinished generator has no power
+   look) - gets a part with no power values for it (power values not known: the apply side lays none of them) */
+void PcrPauseFill(const std::string& id, PcrW& w, piecerec::PieceLive* lv)
+{
+    std::map<std::string, PcrKept>::const_iterator kept = g_pcrKept.find(id);
+    const int keptPause = (kept != g_pcrKept.end() && (kept->second.h.flags & piecerec::kPrFlagRemoved) == 0 && kept->second.b.live.hasPause != 0) ? 1 : 0;
+    void* pc = 0;
+    std::map<std::string, BdReg>::iterator row = g_reg.find(w.key);
+    if (row != g_reg.end() && row->second.removed == 0) { int tv = 0; pc = BdFindPiece(w.key, row->second, &tv); }
+    const int c = PcrSecOfId(id);
+    const int layOwed = (keptPause != 0 && (c < 0 || c >= coopbuild::kBuildZoneSectorCells || g_pcaDone[c] == 0 || g_pcpPend.find(w.key) != g_pcpPend.end())) ? 1 : 0;
+    int now = 0, got = 0;
+    if (pc != 0 && layOwed == 0 && BdPauseClassOk(pc) != 0 && WallWriterDecide(pc, 0) == 1 && BdPauseReadPod(pc, &now) != 0) { got = 1; ++g_pcpFilled; }
+    if (got == 0 && keptPause != 0) { now = kept->second.b.live.paused; got = 1; ++g_pcpFilledKept; }
+    if (got == 0) return;
+    if (lv->have == 0)
+    {
+        *lv = piecerec::PieceLive();
+        lv->have = 1; lv->hasPower = 0;   /* the pause only: the part says it carries no power values */
+    }
+    lv->hasPause = 1; lv->paused = now != 0 ? 1 : 0;
+    if (g_pcpLast.size() >= kPcpCap && g_pcpLast.find(id) == g_pcpLast.end()) g_pcpLast.clear();
+    g_pcpLast[id] = lv->paused;
+}
+/* a kept record's pause waits to be laid on the piece (its apply chose to lay its LIVE part here) */
+void PcpQueue(const std::string& key)
+{
+    if (g_pcpPend.size() >= kPcpCap && g_pcpPend.find(key) == g_pcpPend.end()) { ++g_pcpApplyDropped; return; }
+    g_pcpPend.insert(key);
+}
+/* MAIN THREAD, each tick after the record apply: each waiting key's kept record's pause onto its piece (the byte, as the load writes it,
+   through the reset restore's class gate). A piece not here yet waits while its area stays applied; the area unloading (or the record
+   gone) ends the wait - the next load applies the record again */
+void PcpDrain()
+{
+    if (g_pcpPend.empty() || EngineWritesBlocked()) return;
+    for (std::set<std::string>::iterator it = g_pcpPend.begin(); it != g_pcpPend.end(); )
+    {
+        const std::string key = *it;
+        const std::string id = piecerec::MakePieceRecId(key);
+        std::map<std::string, PcrKept>::const_iterator kept = g_pcrKept.find(id);
+        const int c = PcrSecOfId(id);
+        if (kept == g_pcrKept.end() || (kept->second.h.flags & piecerec::kPrFlagRemoved) != 0 || kept->second.b.live.hasPause == 0
+            || c < 0 || c >= coopbuild::kBuildZoneSectorCells || g_pcaDone[c] == 0)
+        { g_pcpPend.erase(it++); ++g_pcpApplyDropped; continue; }
+        void* b = 0;
+        std::map<std::string, BdReg>::iterator row = g_reg.find(key);
+        if (row != g_reg.end() && row->second.removed == 0) { int tv = 0; b = BdFindPiece(key, row->second, &tv); }
+        if (b == 0) b = ObjectByPositionKey(key.c_str());
+        if (b == 0) { ++g_pcpApplyWaits; ++it; continue; }
+        g_pcpPend.erase(it++);
+        const int want = kept->second.b.live.paused != 0 ? 1 : 0;
+        int was = 0;
+        if (BdPauseReadPod(b, &was) == 0) { ++g_pcpApplyFault; continue; }
+        if (was == want) { ++g_pcpApplySame; continue; }
+        const int ok = BdPauseWriteGated(b, want);   /* the class gate: a class whose load does not write "pause" is refused (said once) */
+        if (ok == 0) { ++g_pcpApplyFault; continue; }
+        ++g_pcpApplied;
+        char line[400];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] pause from the record key=%.90s paused %d -> %d (record gen=%u written by slot%d); pausePc[applied]=%lld",
+                    key.c_str(), was, want, kept->second.h.generation, kept->second.h.writerSlot, g_pcpApplied);
+        PcpSay(line);
+    }
+}
 /* ---- A PLAYER FARM'S CROP ON ITS RECORD (piecerec.h PieceFarm*): written by the farm's writer (FarmWriterHere - the box rule's ladder)
    at each clear event and each kPieceLiveFarmBands step (PieceRecFarmNote); laid by every game at its area's first apply after a load,
    and by a game that does not write the farm at each newer record (PcfDrain) ---- */
@@ -7859,6 +8040,7 @@ int PcrWriteOne(const std::string& id, PcrW& w, int slot)
     if (w.removed == 0) PcrDoorsFill(id, w, slot, &b.live);   /* the piece's doors, read at this write */
     if (w.removed == 0) PcrFarmFill(id, w, slot, &b.live);    /* a player farm's crop, read at this write */
     if (w.removed == 0) PcrTownFill(id, w, slot, &b.live);    /* T-1047 step 5: the outpost link */
+    if (w.removed == 0) PcrPauseFill(id, w, &b.live);          /* T-1429 s3: the construction pause */
     std::map<std::string, BdReg>::iterator row = g_reg.find(w.key);
     const int ownRow = (row != g_reg.end() && row->second.own != 0 && row->second.via != 3) ? 1 : 0;
     if (w.removed != 0)
@@ -8765,6 +8947,7 @@ void PieceRecDrain()
     }
     PieceRecApplyTick();   /* each loaded area whose record list is complete: its records applied, once a load and link */
     PcdDrain();            /* the applied records' doors onto their pieces' doors */
+    PcpDrain();            /* T-1429 s3: the applied records' construction pause onto their pieces */
     PieceRecSeedPass();
     PcrHandLoadPass();   /* T-23 review fold 5: the hand-overs pp.build kept */
     if (g_pcrW.empty()) return;
@@ -10463,6 +10646,68 @@ void BdUpgradeCall(void* b, unsigned long long arg, int down)
     DebugLog(l);
 }
 void detour_upgrade(void* b, unsigned long long arg) { BdUpgradeCall(b, arg, 0); }
+/* T-1429 s3: the pause toggle 0x5464B0 and the construction finish 0x5618B0. ANY THREAD (the toggle: the button's GUI callback and the
+   bldset lever, main thread; the finish: inside AddConstructionProgress 0x558B10, which a worker's job may run off it): after the original,
+   one POD event (kind 13) for BuildTick, naming the piece that holds the build record the engine wrote - vt+0x228 returns the piece's
+   own +0x160, or a grouped wall's lead's (0x297FB0), so the record's piece is (record - 0x160). Nothing else is done here */
+typedef void (*BdPauseToggleFn)(void* b);
+typedef void (*BdFinishFn)(void* b);
+BdPauseToggleFn orig_pauseToggle = 0;
+BdFinishFn orig_finish = 0;
+int g_hkPauseToggle = 0, g_hkFinish = 0;
+volatile LONGLONG g_pcpHookSeen[2] = { 0, 0 };
+void* BdPausePiecePod(void* b)
+{
+    __try
+    {
+        char* st = ((BdStateFn)((*(void***)b)[kVtState / 8]))(b);
+        return (st != 0) ? (void*)(st - 0x160) : b;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* review S2: the pause events have their own small queue (an area load fills the shared one), and a finish that cleared nothing (the
+   piece was not paused before it - every building an area load makes finished) is not queued at all */
+struct PcpEv { char key[kKeyCap]; int finish; };
+const int kPcpEvCap = 64;
+PcpEv g_pcpEvQ[kPcpEvCap];
+PcpEv g_pcpEvDrainQ[kPcpEvCap];   /* MAIN THREAD: PcpEvDrain's copy */
+int g_pcpEvN = 0;
+volatile LONG g_pcpEvLock = 0;
+volatile LONGLONG g_pcpEvDropped = 0, g_pcpFinishSkipped = 0, g_pcpEvNoKey = 0;
+void BdPauseEventAny(void* b, int finish, int pausedBefore)
+{
+    ::InterlockedIncrement64(&g_pcpHookSeen[finish != 0 ? 1 : 0]);
+    if (finish != 0 && pausedBefore == 0) { ::InterlockedIncrement64(&g_pcpFinishSkipped); return; }   /* the finish changed no pause */
+    void* piece = (b != 0) ? BdPausePiecePod(b) : 0;
+    if (piece == 0) return;
+    PcpEv e;
+    e.finish = finish != 0 ? 1 : 0;
+    if (ObjectPositionKey(piece, e.key, kKeyCap, "", 3, 0) == 0) { ::InterlockedIncrement64(&g_pcpEvNoKey); return; }
+    while (::InterlockedCompareExchange(&g_pcpEvLock, 1, 0) != 0) YieldProcessor();
+    const int ok = (g_pcpEvN < kPcpEvCap) ? 1 : 0;
+    if (ok != 0) g_pcpEvQ[g_pcpEvN++] = e;
+    ::InterlockedExchange(&g_pcpEvLock, 0);
+    if (ok == 0) ::InterlockedIncrement64(&g_pcpEvDropped);
+}
+/* MAIN THREAD (BuildTick): the queued pause events, each to BdPauseNoted */
+void PcpEvDrain()
+{
+    while (::InterlockedCompareExchange(&g_pcpEvLock, 1, 0) != 0) YieldProcessor();
+    const int n = g_pcpEvN;
+    if (n > 0) std::memcpy(g_pcpEvDrainQ, g_pcpEvQ, sizeof(PcpEv) * (size_t)n);
+    g_pcpEvN = 0;
+    ::InterlockedExchange(&g_pcpEvLock, 0);
+    for (int i = 0; i < n; ++i) BdPauseNoted(std::string(g_pcpEvDrainQ[i].key), g_pcpEvDrainQ[i].finish);
+}
+void detour_pauseToggle(void* b) { orig_pauseToggle(b); BdPauseEventAny(b, 0, 1); }
+void detour_finish(void* b)
+{
+    void* pc = (b != 0) ? BdPausePiecePod(b) : 0;
+    int p0 = 1;   /* not read: queued (BdPauseNoted reads the byte itself) */
+    if (pc != 0 && BdPauseReadPod(pc, &p0) == 0) p0 = 1;
+    orig_finish(b);
+    BdPauseEventAny(b, 1, p0);
+}
 void detour_downgrade(void* b, unsigned long long arg) { BdUpgradeCall(b, arg, 1); }
 
 /* ground5 fold 1 (F7): the refund's original inside __try / __finally, so items.cpp's GroundRefundEnd (the end of its begin/end
@@ -16049,6 +16294,8 @@ int PcaApplyOne(const std::string& id, const PcrKept& k, int mySlot)
         /* a player farm's crop: queued whoever wrote the record - PcfDrain lays it at the area's first lay after a load, else only where
            this game does not write the farm (piecerec::PieceFarmApplyRule) */
         if (piecerec::PieceLiveApplyChoice(removed, body, k.b.live.hasFarm, seenSkip, 0, fresh, ch) != piecerec::kPlaNone) PcfQueue(key, k.h.generation);
+        /* T-1429 s3: the construction pause - laid as the doors are (the writer's own record only at the area's first apply after a load) */
+        if (piecerec::PieceLiveApplyChoice(removed, body, k.b.live.hasPause, seenSkip, writerMine, fresh, ch) != piecerec::kPlaNone) PcpQueue(key);
     }
     const char* why = "";
     int word = ch;
@@ -18119,6 +18366,16 @@ void InstallBuild()
         + ", Building::downgrade " + dgAt + HkWord(g_hkDowngrade) + " (each call logged with the key and record before and after; nothing else is done)";
     if (g_hkUpgrade == 1 && g_hkDowngrade == 1) DebugLog(ugmsg);
     else ErrorLog(ugmsg);
+    /* T-1429 s3: the construction pause's two engine events - the toggle and the finish's clear - reach the piece record */
+    g_hkPauseToggle = BdHook(base, kBdPauseToggleRva, (void*)&detour_pauseToggle, (void**)&orig_pauseToggle);
+    g_hkFinish = BdHook(base, kBdFinishRva, (void*)&detour_finish, (void**)&orig_finish);
+    {
+        char pzl[420];
+        _snprintf_s(pzl, sizeof(pzl), _TRUNCATE, "[BUILD] T-1429 s3 pause hooks: BuildingPauseToggle 0x%llX %s, BuildingFinishConstruction 0x%llX %s (a building's construction pause written to its piece record at each engine change)",
+                    kBdPauseToggleRva, HkWord(g_hkPauseToggle), kBdFinishRva, HkWord(g_hkFinish));
+        if (g_hkPauseToggle == 1 && g_hkFinish == 1) DebugLog(std::string(pzl));
+        else ErrorLog(std::string(pzl));
+    }
     InstallFarm();   /* par16: FarmBuilding::update / operate - one writer per farm */
     InstallPower();   /* P47: the battery charge and the fuel step - one writer per power piece */
     BdInstallTownWake(base);   /* T-936 (owner 936): a newly founded player outpost woken at the next safe point */
@@ -20683,6 +20940,7 @@ void BuildTick()
     FarmTick();   /* par16: farm verdicts, a held game's harvest sent to the writer */
     if (::InterlockedCompareExchange(&g_qInit, 0, 0) == 0) return;
     BdRekeyDrain();   /* T-609 U fix: the re-keys queued off the main thread, before the events that may name their new keys */
+    PcpEvDrain();   /* T-1429 s3 (review S2; fold 2: after the re-keys, as the shared queue's events): the construction pause's engine events, on their own queue */
     ::EnterCriticalSection(&g_qcs);
     const int n = g_qn;
     if (n > 0) std::memcpy(g_drain, g_q, sizeof(BdEvent) * (size_t)n);
@@ -20975,6 +21233,16 @@ int BdPowerWriteRawPod(void* b, const BdPowerPod& v, int setPower, int setPause,
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-1429 s3: the piece record's construction pause onto b (PcpDrain): the pause byte alone, through BdPowerWritePod's class gate. 1 written */
+int BdPowerWritePod(void* b, const BdPowerPod& v, int setPower, int setPause, int* called);   /* below */
+int BdPauseWriteGated(void* b, int paused)
+{
+    BdPowerPod pw;
+    std::memset(&pw, 0, sizeof pw);
+    pw.pause = paused != 0 ? 1 : 0;
+    int called = 0;
+    return BdPowerWritePod(b, pw, 0, 1, &called);
 }
 /* the pause byte +0x161 is written only on a class whose load writes "pause" there (BdKeptPauseClass); on any other it is not written
    (an error line once per class) and a write asked for the pause alone answers 0 */
@@ -21701,7 +21969,7 @@ std::string BuildSetArm(const std::string& arg)
     std::istringstream is(arg);
     std::string key, field, val, val2;
     is >> key >> field >> val >> val2;
-    const char* usage = "error bldset: usage bldset <key-substring|key> pause|power 0|1 | battery|progress|stock <value> | locklvl|doorlvl <0-100>"
+    const char* usage = "error bldset: usage bldset <key-substring|key> pause|power 0|1 | pausetoggle 1 | battery|progress|stock <value> | locklvl|doorlvl <0-100>"
                         " | doorlock <door> 0|1 | doorpick <door>";
     if (key.empty() || field.empty() || val.empty()) return usage;
     float v = (float)std::atof(val.c_str());
@@ -21714,6 +21982,7 @@ std::string BuildSetArm(const std::string& arg)
         else v = 0.0f;
     }
     if (field == "pause" || field == "power") { if (val != "0" && val != "1") return usage; }
+    else if (field == "pausetoggle") { if (val != "1") return "error bldset: usage bldset <key-substring|key> pausetoggle 1"; }   /* T-1429 s3 TEST-ONLY: the engine's own toggle */
     else if (field == "battery" || field == "progress" || field == "stock") { if (!(v >= 0.0f && v <= 1000000.0f)) return "error bldset: the value must be in [0, 1e6]"; }
     else if (field == "locklvl" || field == "doorlvl") { if (!(v >= 0.0f && v <= 100.0f)) return "error bldset: a lock level must be in [0, 100]"; }
     else if (field == "doorlock" || field == "doorpick") { }
@@ -21732,11 +22001,11 @@ std::string BdBldField(void* b, const std::string& field)
 {
     char t[120];
     t[0] = 0;
-    if (field == "pause" || field == "power" || field == "battery")
+    if (field == "pause" || field == "pausetoggle" || field == "power" || field == "battery")
     {
         BdPowerPod pw; std::memset(&pw, 0, sizeof pw);
         if (BdPowerReadPod(b, &pw) == 0) return "unreadable";
-        if (field == "pause") _snprintf_s(t, sizeof(t), _TRUNCATE, "pause=%d", pw.pause);
+        if (field == "pause" || field == "pausetoggle") _snprintf_s(t, sizeof(t), _TRUNCATE, "pause=%d", pw.pause);
         else if (field == "power") _snprintf_s(t, sizeof(t), _TRUNCATE, "power=%d", pw.on);
         else _snprintf_s(t, sizeof(t), _TRUNCATE, "battery=%.6f getsBattery=%d", pw.battery, pw.gets);
     }
@@ -21775,6 +22044,13 @@ int BdCompleteZeroPod(uintptr_t st)
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 #endif
+/* T-1429 s3 TEST-ONLY (bldset pausetoggle): Building vt+0x2A8 on b - the engine's pause toggle; 1 called, 0 faulted */
+const size_t kVtBdPauseToggle = 0x2A8;
+int BdPauseToggleCallPod(void* b)
+{
+    __try { ((void (*)(void*))((*(void***)b)[kVtBdPauseToggle / 8]))(b); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 void BdBldSetDrain()
 {
     if (::InterlockedExchange(&g_bsPending, 0) == 0) return;
@@ -21820,7 +22096,13 @@ void BdBldSetDrain()
     const std::string before = BdBldField(b, f);
     std::string result = "CALLED";
     int ok = 1, called = 0;
-    if (f == "pause" || f == "power" || f == "battery")
+    if (f == "pausetoggle")
+    {   /* T-1429 s3 TEST-ONLY: the engine's own pause toggle - Building vt+0x2A8 (0x5464B0), the routine the 'PAUSE CONSTRUCTION' button's
+           callback 0x313D30 calls - so the hook and the piece record's road run as for a player's click */
+        if (BdKeptPauseClass(cls) == 0) { ok = 0; result = "REFUSED (not a building class with the pause toggle at vt+0x2A8)"; }
+        else ok = BdPauseToggleCallPod(b);
+    }
+    else if (f == "pause" || f == "power" || f == "battery")
     {
         BdPowerPod pw; std::memset(&pw, 0, sizeof pw);
         BdPowerReadPod(b, &pw);
@@ -22987,7 +23269,14 @@ void BdKeptExtras(const keptwire::Row& w, void* b, unsigned* done, unsigned* doo
         BdPowerReadPod(b, &v0);
         k = v0;
         if ((pp & keptwire::kXPower) != 0) { k.gets = p.getsBattery; k.on = p.powerOn; k.battery = p.battery; }
-        if ((pp & keptwire::kXPause) != 0) k.pause = p.pause;
+        int recPause = -1;   /* T-1429 s3 review S4: the piece record's pause when this game holds it - the record is the source; a record that
+                                arrives after this lay is laid after it (PcaApplyOne -> PcpDrain), so the record wins in either order */
+        if ((pp & keptwire::kXPause) != 0)
+        {
+            std::map<std::string, PcrKept>::const_iterator kr = g_pcrKept.find(piecerec::MakePieceRecId(p.key));
+            if (kr != g_pcrKept.end() && (kr->second.h.flags & piecerec::kPrFlagRemoved) == 0 && kr->second.b.live.hasPause != 0) recPause = kr->second.b.live.paused;
+            k.pause = (recPause >= 0) ? recPause : p.pause;
+        }
         int called = 0;
         const int ok = BdPowerWritePod(b, k, (pp & keptwire::kXPower) != 0 ? 1 : 0, (pp & keptwire::kXPause) != 0 ? 1 : 0, &called);
         BdPowerReadPod(b, &v1);
@@ -22998,7 +23287,7 @@ void BdKeptExtras(const keptwire::Row& w, void* b, unsigned* done, unsigned* doo
         if ((pp & keptwire::kXPower) != 0) P165Note(b, std::string(), "switch write", "kept lay", v0.on, "");
         // PROBE-END: P165
 #endif
-        if ((pp & keptwire::kXPause) != 0) { _snprintf_s(t, sizeof(t), _TRUNCATE, "; pause kept %d (was %d, now %d)", p.pause, v0.pause, v1.pause); *did += t; }
+        if ((pp & keptwire::kXPause) != 0) { _snprintf_s(t, sizeof(t), _TRUNCATE, "; pause kept %d (was %d, now %d%s)", k.pause, v0.pause, v1.pause, recPause >= 0 ? ", the piece record's" : ", the kept row's - no piece record pause here"); *did += t; }
         if ((pp & keptwire::kXPower) != 0)
         {
             _snprintf_s(t, sizeof(t), _TRUNCATE, "; power kept getsBattery %d power %d battery %.6f (was %d %d %.6f, now %d %d %.6f%s)", p.getsBattery, p.powerOn, p.battery,
@@ -33470,7 +33759,7 @@ int PwPubSweep(DWORD now, int all)
 }
 struct PwIn { powerwire::PowerMsg m; int from; DWORD at; DWORD tried; PwIn() : from(-1), at(0), tried(0) {} };   /* at = when it arrived; tried = when a kept state was last decided (0 = never) */
 std::map<std::string, PwIn> g_pwIn;       /* MAIN THREAD: the latest POWER_STATE per key, written at K2 */
-struct PwAskIn { std::string key; int from; int on; };
+struct PwAskIn { std::string key; int from; int on; int what; };   /* what: powerwire::kAskSwitch, or kAskPause (T-1429 s3 review B1) */
 std::vector<PwAskIn> g_pwAskIn;           /* MAIN THREAD: switches asked of this game, done at K2 */
 struct PwAskOut { std::string key; int slot; };
 std::vector<PwAskOut> g_pwAskOut;         /* MAIN THREAD: switches changed here on pieces another game writes, asked at K2 */
@@ -33829,6 +34118,129 @@ void PwRecDecide(void* b, PwRow& r)
         else if (g_pclReady.size() < kPclReadyCap) { g_pclLost.erase(r.key); g_pclReady.push_back(r.key); ++g_pclLostRequeued; }
     }
 }
+/* T-1455 diagnostics, MAIN THREAD, log only (nothing decides on them): each power piece's writer verdict followed by its key across
+   PwRow resets, at PwRowFor's decide (every kPwDecideMs while the piece is looked at):
+   (a) one [POWER] verdict line per change of a piece a player owns (owner class not kOwnNone), and one at its first verdict this launch
+       (its own budget) - the old and new verdict, the owner, the owner's bit on the area map for the piece's area, the area's holder,
+       the reason the owner rung took (items.cpp ProdWriterWhy, read quietly) and the road of its values from here (PwRecDecide);
+   (b) one [POWER] frozen line per freeze when the piece has been another game's for over 60 s and no value from its writer came in that
+       time (powerwire::PowerFrozenQuiet; a value = a POWER_STATE applied or a LIVE apply that wrote or found the same - PwDiagValue);
+   (c) the counts on the [POWER] REPORT and the [SAVE] hb line (PowerDiagToken).
+   Budgets per launch: powerwire::kPowerDiag* (the first N lines, then every 100th); every one counted. */
+struct PwDiag
+{
+    int writer, slot, quietSaid, valueHave;
+    DWORD seenAt, frozenAt, valueAt;
+    PwDiag() : writer(0), slot(-1), quietSaid(0), valueHave(0), seenAt(0), frozenAt(0), valueAt(0) {}
+};
+std::map<std::string, PwDiag> g_pwDiag;   /* MAIN THREAD: by piece key */
+const size_t kPwDiagCap = 4096;
+const DWORD kPwDiagPruneMs = 600000;      /* a key not seen this long is dropped when the table is full */
+long long g_pwVerdictChanges = 0, g_pwVerdictOwned = 0, g_pwVerdictFirst = 0, g_pwFrozenStarts = 0, g_pwFrozenQuiet = 0, g_pwDiagFull = 0;
+int g_pwDiagFrozenNow = 0, g_pwDiagQuietNow = 0;   /* PowerDiagToken's last count on the main thread */
+const char* PwDiagWhy(int why)
+{
+    switch (why)
+    {
+    case coopown::kWhyMine: return "owner-is-this-game";
+    case coopown::kWhyHeld: return "owner-game-has-area";
+    case coopown::kWhyAbsent: return "owner-game-lacks-area>area-rule";
+    case coopown::kWhyNone: return "no-owner>area-rule";
+    case coopown::kWhyUnreadable: return "owner-unread>area-rule";
+    case coopown::kWhyShared: return "shared-faction>area-rule";
+    case coopown::kWhyUnresolved: return "owner-slot-unknown>nobody";
+    case coopown::kWhyStale: return "no-fresh-map>nobody";
+    default: return "single-player";
+    }
+}
+std::string PwDiagVerdict(int w, int slot)
+{
+    char t[32];
+    if (w == coopfarm::kProdWriterHere) return std::string("this");
+    if (w != coopfarm::kProdWriterOther) return std::string("none");
+    _snprintf_s(t, sizeof(t), _TRUNCATE, "another slot%d", slot);
+    return std::string(t);
+}
+const char* PwDiagRoad(const PwRow& r) { return r.recBase == 0 ? "state" : (r.rec == kPwRoadRecord ? "record" : (r.rec == kPwRoadHold ? "hold" : "state")); }
+void PwDiagPrune(DWORD now)
+{
+    for (std::map<std::string, PwDiag>::iterator it = g_pwDiag.begin(); it != g_pwDiag.end(); )
+    {
+        if ((DWORD)(now - it->second.seenAt) > kPwDiagPruneMs) g_pwDiag.erase(it++);
+        else ++it;
+    }
+}
+/* PwApplyStates / PwLiveApply: a value from the piece's writer landed here (written or the same) */
+void PwDiagValue(const std::string& key)
+{
+    std::map<std::string, PwDiag>::iterator it = g_pwDiag.find(key);
+    if (it == g_pwDiag.end()) return;
+    it->second.valueAt = ::GetTickCount(); it->second.valueHave = 1;
+}
+/* PwRowFor, after a decide */
+void PwDiagDecided(void* b, const PwRow& r, DWORD now)
+{
+    if (r.power == 0 || r.key.empty() || RoleIsSingle()) return;
+    std::map<std::string, PwDiag>::iterator it = g_pwDiag.find(r.key);
+    int had = 1;
+    if (it == g_pwDiag.end())
+    {
+        if (g_pwDiag.size() >= kPwDiagCap) PwDiagPrune(now);
+        if (g_pwDiag.size() >= kPwDiagCap) { ++g_pwDiagFull; return; }
+        it = g_pwDiag.insert(std::make_pair(r.key, PwDiag())).first;
+        had = 0;
+    }
+    PwDiag& d = it->second;
+    const unsigned int unseen = (had != 0) ? (unsigned int)(now - d.seenAt) : 0u;
+    const int oldW = d.writer, oldSlot = d.slot;
+    if (powerwire::PowerFreezeStarts(had, oldW, r.writer, unseen, kPwForgetMs) != 0) { d.frozenAt = now; d.quietSaid = 0; ++g_pwFrozenStarts; }
+    d.writer = r.writer; d.slot = r.slot; d.seenAt = now;
+    const int changed = (had != 0 && (oldW != r.writer || (r.writer == coopfarm::kProdWriterOther && oldSlot != r.slot))) ? 1 : 0;
+    if (changed != 0) ++g_pwVerdictChanges;
+    if (had == 0 || changed != 0)
+    {
+        int cls = 0, os = -1, ml = -1, why = -1, hs = -1;
+        if (ProdWriterWhy(b, &cls, &os, &ml, &why, &hs) != 0 && cls != coopown::kOwnNone)
+        {
+            const long long n = (had == 0) ? ++g_pwVerdictFirst : ++g_pwVerdictOwned;
+            const long long cap = (had == 0) ? powerwire::kPowerDiagFirstCap : powerwire::kPowerDiagVerdictCap;
+            if (powerwire::PowerDiagSay(n, cap, had == 0 ? 0 : powerwire::kPowerDiagEvery) != 0)
+            {
+                const int me = MySlotForWire();
+                char own[48], hold[48], line[640];
+                if (cls == coopown::kOwnMe) _snprintf_s(own, sizeof(own), _TRUNCATE, "this game's player slot%d", os);
+                else if (cls == coopown::kOwnPeer) _snprintf_s(own, sizeof(own), _TRUNCATE, "slot%d", os);
+                else _snprintf_s(own, sizeof(own), _TRUNCATE, "%s", cls == coopown::kOwnShared ? "shared" : (cls == coopown::kOwnUnknown ? "unknown" : "unread"));
+                if (hs < 0) _snprintf_s(hold, sizeof(hold), _TRUNCATE, "none named");
+                else _snprintf_s(hold, sizeof(hold), _TRUNCATE, "slot%d%s", hs, hs == me ? " (this game)" : "");
+                const std::string from = (had == 0) ? std::string("first look") : PwDiagVerdict(oldW, oldSlot);
+                const std::string to = PwDiagVerdict(r.writer, r.slot);
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[POWER] verdict key=%.63s %s -> %s (owner %s, owner's map %s, area holder %s, why %s, road %s); powerVerdict[changes,owned,first]=%lld,%lld,%lld",
+                            r.key.c_str(), from.c_str(), to.c_str(), own,
+                            ml == 1 ? "has the area" : (ml == 0 ? "fresh, area not loaded" : "not fresh or no owner slot"), hold, PwDiagWhy(why), PwDiagRoad(r),
+                            g_pwVerdictChanges, g_pwVerdictOwned, g_pwVerdictFirst);
+                DebugLog(std::string(line));
+            }
+        }
+    }
+    if (r.writer != coopfarm::kProdWriterOther || d.quietSaid != 0) return;
+    const unsigned int frozenMs = (unsigned int)(now - d.frozenAt);
+    const unsigned int sinceValue = (d.valueHave != 0) ? (unsigned int)(now - d.valueAt) : 0u;
+    if (powerwire::PowerFrozenQuiet(r.writer, frozenMs, d.valueHave, sinceValue) == 0) return;
+    d.quietSaid = 1;
+    ++g_pwFrozenQuiet;
+    if (powerwire::PowerDiagSay(g_pwFrozenQuiet, powerwire::kPowerDiagFrozenCap, powerwire::kPowerDiagEvery) == 0) return;
+    PwPod p;
+    std::memset(&p, 0, sizeof p);
+    const int rd = PwRead(b, r.prod, &p);
+    char last[48], line[640];
+    if (d.valueHave != 0) _snprintf_s(last, sizeof(last), _TRUNCATE, "%u s ago", sinceValue / 1000u);
+    else _snprintf_s(last, sizeof(last), _TRUNCATE, "none this launch");
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[POWER] frozen key=%.63s writer slot%d: not run here for %u s and no value from its writer for over %u s (last value %s; road %s; here %s power=%d getsBattery=%d battery=%.4f stocks=%d stock0=%.4f); powerFrozenQuiet=%lld",
+                r.key.c_str(), r.slot, frozenMs / 1000u, powerwire::kPowerFrozenQuietMs / 1000u, last, PwDiagRoad(r), rd != 0 ? "read" : "unreadable",
+                p.on, p.gets, p.bat, p.n, p.n > 0 ? p.stock[0] : -1.0f, g_pwFrozenQuiet);
+    DebugLog(std::string(line));
+}
 /* MAIN THREAD: the row of a live piece, its key, class and writer asked again every kPwDecideMs; 0 when the table is full */
 PwRow* PwRowFor(void* b)
 {
@@ -33866,6 +34278,7 @@ PwRow* PwRowFor(void* b)
         if (r.power != 0 && !r.key.empty()) PwRecDecide(b, r);
         if (wasRecWriter != 0 && r.writer != coopfarm::kProdWriterHere) PieceRecLiveHandOff(wasRecId);
         if (wasNotHere != 0 && r.writer == coopfarm::kProdWriterHere && r.prod != 0 && r.rec == kPwRoadRecord && !r.recId.empty()) PwBarTakeArm(r.key, r.recId);
+        PwDiagDecided(b, r, now);   /* T-1455 diagnostics: the verdict's change and the frozen-too-long rule */
     }
     PwPublish(b, r.writer, now);   /* H-P47a: the verdict and this look, for the engine's steps off the main thread */
     return &r;
@@ -34206,6 +34619,7 @@ int PwLiveApply(const std::string& key, const piecerec::PieceLive& lv)
     piecerec::PieceDoorsClear(&want);   /* PowerSameNoDoors: the power values alone are compared and applied here (the doors: PcdDrain) */
     piecerec::PieceDoorsClear(&cur);
     piecerec::PieceCraftClear(&want);   /* T-1192: the craft part is written by PwCraftApply above */
+    PwDiagValue(key);   /* T-1455 diagnostics: a value from the writer landed (written below, or the same here) */
     if (piecerec::PieceLiveSame(want, cur) != 0) { ++g_pclSame; r.held = 1; r.hOn = lv.on != 0 ? 1 : 0; return 2; }   /* it shows the record's values: the writer's switch */
     BdPowerPod v = v0;
     v.on = lv.on; v.gets = lv.gets; v.battery = lv.battery;
@@ -34348,6 +34762,7 @@ void PwApplyStates()
         }
         if (ok == 0) { ++g_pwFaulted; continue; }
         ++g_pwApplied;
+        PwDiagValue(i->first);   /* T-1455 diagnostics: a value from the writer landed */
         PwRow& r = PwRowResolved(b, i->first, prod);
         const int firstHere = (r.held == 0) ? 1 : 0;
         r.held = 1; r.hOn = m.on != 0 ? 1 : 0;
@@ -34370,6 +34785,73 @@ void PwApplyStates()
         }
     }
 }
+/* T-1429 s3 review B1, K2, the piece record's writer: a construction pause another game's player set there (POWER_ASK what kAskPause),
+   done when this game writes the piece's record (the box rule) and the asker is the owner's game or a teammate's (POWER_ASK's rule): the
+   byte is set, as the load writes it, and the record written at once (BdPauseNoted marks it) - its forward lays it on every game */
+void PcpDoAsk(const std::string& key, int from, int on)
+{
+    ++g_pcpAskRecv;
+    void* b = PwResolve(key);
+    const int me = MySlotForWire();
+    int os = -1, was = -1;
+    const int oc = (b != 0) ? BuildingOwnerClass(b, &os) : coopown::kOwnUnreadable;
+    const int owner = (oc == coopown::kOwnMe) ? me : ((oc == coopown::kOwnPeer) ? os : -1);
+    const int team = (owner >= 0 && from >= 0 && TeamSameAnyThread(owner, from)) ? 1 : 0;
+    const char* why = 0;
+    if (b == 0) why = "no such piece here";
+    else if (BdPauseClassOk(b) == 0) why = "not a building class whose load writes the pause";
+    else if (WallWriterDecide(b, 0) != 1) why = "this game is not the piece's record writer";
+    else if (powerwire::PowerAskFromOk(from, owner, team) == 0) why = "the asker is not the owner's game or a teammate's";
+    else if (BdPauseReadPod(b, &was) == 0) why = "the pause did not read";
+    else if (was != on && BdPauseWriteGated(b, on) == 0) why = "the write faulted";
+    if (why == 0) { ++g_pcpAskDone; BdPauseNoted(key, 0, 1); } else ++g_pcpAskRefused;
+    /* fold 2: EVERY ask is answered to the asker's slot with the pause the piece now holds here (the writer's) - done or refused - and the
+       asker lays it, so a refused ask never leaves the asker's own flip standing. A game that is not the writer (the writer changed) answers
+       refused with its stored record's pause when it knows one; with no piece and no record here nothing is answered (the asker's byte went
+       back to its stored record's at the ask, and the next record laid there corrects it - PcrArrive -> PcaApplyOne -> PcpDrain) */
+    int now = -1;
+    if (b != 0 && (why == 0 || WallWriterDecide(b, 0) == 1)) { int v = 0; if (BdPauseReadPod(b, &v) != 0) now = v; }
+    if (now < 0)
+    {
+        std::map<std::string, PcrKept>::const_iterator kr = g_pcrKept.find(piecerec::MakePieceRecId(key));
+        if (kr != g_pcrKept.end() && (kr->second.h.flags & piecerec::kPrFlagRemoved) == 0 && kr->second.b.live.hasPause != 0) now = kr->second.b.live.paused;
+    }
+    int answered = 0;
+    if (now >= 0)
+    {
+        powerwire::PowerMsg m;
+        m.kind = powerwire::kPowerAsk; m.key = key; m.what = (why == 0) ? powerwire::kAskPauseDone : powerwire::kAskPauseRefused; m.value = now != 0 ? 1.0f : 0.0f;
+        std::vector<char> bytes;
+        answered = (from >= 0 && net::BuildSlotTarget(from) == from && powerwire::EncodePower(&bytes, m) && net::SendPowerToSlot(bytes, from)) ? 1 : 0;
+        if (answered != 0) ++g_pcpAnswerSent; else ++g_pcpAnswerFail;
+    }
+    char line[520];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- pause ask key=%.90s from slot%d paused %d: %s%s (owner slot%d); answer %s paused %d; pausePc[askDone,askRefused]=%lld,%lld",
+                key.c_str(), from, on, why == 0 ? (was != on ? "DONE (set here; its record is written)" : "DONE (already so)") : "REFUSED - ", why == 0 ? "" : why,
+                owner, now < 0 ? "NONE (no piece and no record here)" : (answered != 0 ? "sent" : "NOT SENT (no road to the asker by its own slot)"), now, g_pcpAskDone, g_pcpAskRefused);
+    PcpSay(line);
+}
+/* T-1429 s3 fold 2, K2, the asker: the writer's answer to this game's pause ask (done or refused) - the pause the writer holds is laid on
+   this game's byte (the reset restore's class gate), unless this game has become the piece's record writer since (its own byte is then the
+   source) */
+void PcpTakeAnswer(const std::string& key, int from, int on, int done)
+{
+    ++g_pcpAnswerRecv;
+    void* b = PwResolve(key);
+    const char* what = 0;
+    int was = -1;
+    if (b == 0) what = "no such piece here";
+    else if (BdPauseClassOk(b) == 0) what = "not a building class whose load writes the pause";
+    else if (WallWriterDecide(b, 0) == 1) what = "this game is the piece's record writer now - its own byte stands";
+    else if (BdPauseReadPod(b, &was) == 0) what = "the pause did not read";
+    else if (was == on) what = "the same here";
+    else if (BdPauseWriteGated(b, on) == 0) what = "the write faulted";
+    if (what == 0) ++g_pcpAnswerLaid;
+    char line[420];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- pause answer key=%.90s from slot%d: %s, paused %d - %s (was %d); pausePc[answerLaid]=%lld",
+                key.c_str(), from, done != 0 ? "DONE" : "REFUSED", on, what == 0 ? "laid here" : what, was, g_pcpAnswerLaid);
+    PcpSay(line);
+}
 /* K2, the writer's side: a switch another game asked for, done once when the asker is the owner's game or a teammate's */
 void PwDoAsks()
 {
@@ -34379,6 +34861,8 @@ void PwDoAsks()
     for (size_t i = 0; i < q.size(); ++i)
     {
         const PwAskIn& a = q[i];
+        if (a.what == powerwire::kAskPause) { PcpDoAsk(a.key, a.from, a.on); continue; }   /* T-1429 s3 review B1 */
+        if (a.what == powerwire::kAskPauseDone || a.what == powerwire::kAskPauseRefused) { PcpTakeAnswer(a.key, a.from, a.on, a.what == powerwire::kAskPauseDone ? 1 : 0); continue; }   /* fold 2 */
         void* b = PwResolve(a.key);
         char cls[64];
         cls[0] = 0;
@@ -34491,6 +34975,19 @@ void ReportPieceLive()
                 g_doorHitQueued, g_doorHitAsked, g_doorHitAnswered, g_doorHitReplayed,
                 g_doorRepairAsked, g_doorRepairSummed, g_doorRepairGained, g_doorRepairSumDropped, g_doorRepairLost);
     DebugLog(std::string(b));
+    {   /* T-1429 s3: the construction pause on its record */
+        char pz[800];
+        _snprintf_s(pz, sizeof(pz), _TRUNCATE, "[BUILD] REPORT pausePc (T-1429 s3): hooks[toggle,finish]=%d,%d hookSeen[toggle,finish]=%lld,%lld events[toggle,finish]=%lld,%lld"
+                    " marked=%lld same=%lld notWriter=%lld noPiece=%lld notClass=%lld fault=%lld filled[read,kept]=%lld,%lld"
+                    " apply[applied,same,waits,dropped,fault]=%lld,%lld,%lld,%lld,%lld pending=%u ask[sent,fail,putBack,recv,done,refused]=%lld,%lld,%lld,%lld,%lld,%lld"
+                    " queue[finishSkipped,dropped,noKey]=%lld,%lld,%lld answer[sent,fail,recv,laid]=%lld,%lld,%lld,%lld",
+                    g_hkPauseToggle, g_hkFinish, (long long)g_pcpHookSeen[0], (long long)g_pcpHookSeen[1], g_pcpEv[0], g_pcpEv[1],
+                    g_pcpMarked, g_pcpSame, g_pcpNotWriter, g_pcpNoPiece, g_pcpNotClass, g_pcpFault, g_pcpFilled, g_pcpFilledKept,
+                    g_pcpApplied, g_pcpApplySame, g_pcpApplyWaits, g_pcpApplyDropped, g_pcpApplyFault, (unsigned int)g_pcpPend.size(),
+                    g_pcpAskSent, g_pcpAskFail, g_pcpPutBack, g_pcpAskRecv, g_pcpAskDone, g_pcpAskRefused,
+                    (long long)g_pcpFinishSkipped, (long long)g_pcpEvDropped, (long long)g_pcpEvNoKey, g_pcpAnswerSent, g_pcpAnswerFail, g_pcpAnswerRecv, g_pcpAnswerLaid);
+        DebugLog(std::string(pz));
+    }
     {   /* T-1192: a crafting bench's craft part on its record */
         char cb[300];
         _snprintf_s(cb, sizeof(cb), _TRUNCATE, "[POWER] craft[kept,rebuilt,made,missing,fault,unread,runnerLeft]=%lld,%lld,%lld,%lld,%lld,%lld,%lld",
@@ -34822,7 +35319,7 @@ void PowerNoteRecv(const powerwire::PowerMsg& m, unsigned int fromPeer)
         ++g_pwAskRecv;
         if (g_pwAskIn.size() >= kPwAskCap) { ++g_pwDropped; return; }   /* the asker asks again when its switch moves again */
         PwAskIn a;
-        a.key = m.key; a.from = from; a.on = m.value > 0.5f ? 1 : 0;
+        a.key = m.key; a.from = from; a.on = m.value > 0.5f ? 1 : 0; a.what = (int)m.what;
         g_pwAskIn.push_back(a);
         return;
     }
@@ -35129,7 +35626,8 @@ void ReportPower()
                 " relinked=%lld waitDropped=%lld askReadFault=%lld rows=%u rowFull=%lld hooks[charge,inputs]=%d,%d"
                 " look[marked,droppedFull,noKey,drained,same,stale,looked,busy,blocked]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                 " said[first,change]=%d,%d offMain[charge,fuel,published,pubBusy]=%lld,%lld,%lld,%lld"
-                " powerOffNet[switchNotWritten,notSent,notAsked,relinkLeft]=%lld,%lld,%lld,%lld",
+                " powerOffNet[switchNotWritten,notSent,notAsked,relinkLeft]=%lld,%lld,%lld,%lld"
+                " verdict[changes,ownedLines,firstLooks,frozenStarts,frozenQuiet,tableFull,followed]=%lld,%lld,%lld,%lld,%lld,%lld,%u",
                 g_pwSent, g_pwSendFail, g_pwRecv, g_pwApplied, g_pwRefused, g_pwNoPiece, g_pwFaulted, g_pwDropped,
                 g_pwAsks, g_pwAskFail, g_pwUndone, g_pwAskRecv, g_pwAskDone, g_pwAskRefused,
                 (long long)g_pwGatedBurn, (long long)g_pwGatedCharge, (long long)g_pwOffMainCharge + (long long)g_pwOffMainFuel,
@@ -35140,8 +35638,31 @@ void ReportPower()
                 g_pwSaidFirst, g_pwSaidEvent,
                 (long long)::InterlockedCompareExchange64(&g_pwOffMainCharge, 0, 0), (long long)::InterlockedCompareExchange64(&g_pwOffMainFuel, 0, 0),
                 (long long)::InterlockedCompareExchange64(&g_pwOffMainPub, 0, 0), g_pwPubBusy,
-                g_pwOffNetSwitch, g_pwOffNetNotSent, g_pwOffNetNoAsk, g_pwOffNetRelink);
-    DebugLog(std::string(b) + InsideFollowReportToken());   /* T-1001 (F1054) */
+                g_pwOffNetSwitch, g_pwOffNetNotSent, g_pwOffNetNoAsk, g_pwOffNetRelink,
+                g_pwVerdictChanges, g_pwVerdictOwned, g_pwVerdictFirst, g_pwFrozenStarts, g_pwFrozenQuiet, g_pwDiagFull, (unsigned int)g_pwDiag.size());
+    DebugLog(std::string(b) + " " + PowerDiagToken() + InsideFollowReportToken());   /* T-1001 (F1054); T-1455 the frozen counts now */
+}
+/* T-1455 diagnostics: the power pieces frozen here now (another game writes them, looked at within kPwForgetMs), those of them past the
+   frozen-too-long rule, and the launch's verdict changes - on the [POWER] REPORT and the [SAVE] hb line (store.cpp HbLineText). The
+   table is walked on the main thread only; a call off it gives the last count made there */
+std::string PowerDiagToken()
+{
+    if (BdOnMain() != 0)
+    {
+        const DWORD now = ::GetTickCount();
+        int fz = 0, qt = 0;
+        for (std::map<std::string, PwDiag>::const_iterator it = g_pwDiag.begin(); it != g_pwDiag.end(); ++it)
+        {
+            if (it->second.writer != coopfarm::kProdWriterOther || (DWORD)(now - it->second.seenAt) > kPwForgetMs) continue;
+            ++fz;
+            if (it->second.quietSaid != 0) ++qt;
+        }
+        g_pwDiagFrozenNow = fz; g_pwDiagQuietNow = qt;
+    }
+    char t[200];
+    _snprintf_s(t, sizeof(t), _TRUNCATE, "powerDiag[frozenNow,frozenQuietNow,verdictChanges,frozenQuiet]=%d,%d,%lld,%lld",
+                g_pwDiagFrozenNow, g_pwDiagQuietNow, g_pwVerdictChanges, g_pwFrozenQuiet);
+    return std::string(t);
 }
 
 void ReportBuild()

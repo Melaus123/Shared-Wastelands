@@ -155,6 +155,11 @@ void P119Flush();
 // PROBE-END: P119
 void SquadLeadReannounce(const std::vector<int>& sectorKeys);
 long long HandoffAckWrongSender();
+void InstallLeadHooks();   /* T-1442 step 6: set-leader 0x790C00 and remove-member 0x794C00 note their squad after the original */
+void* LeadDeadSquadOf(const void* character);   /* T-1442 step 6 review fold S3, ANY THREAD: the squad, read BEFORE the death call */
+void LeadNoteDeath(const void* character, void* apBefore);   /* T-1442 step 6 review fold S3, ANY THREAD: the dead character and its squad noted after the death call */
+void LeadNoteChar(const void* character, int dead);   /* T-1442 step 6, ANY THREAD (interlocked only): a knocked-out (0) / dead (1) character - its squad announced at the next frame */
+void LeadNoteUidGiven(::Character* c);   /* T-1442 step 6 fix a, MAIN THREAD: the adoption sweep gave `c` its uid - its squad noted when `c` is the formal leader */
 void SquadLeaderSafePointDrain();                       // K2 safe point (combat.cpp), 1 Hz inside
 /* T-1 B3 restructure (protocol 89): a squad's money rides MSG_SQUAD_LEAD. MAIN THREAD, all of them. */
 void SquadCatsSafePointDrain();                         // K2 safe point (combat.cpp): copy pots written, taken squads adopted

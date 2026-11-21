@@ -4052,14 +4052,27 @@ int DoorsQueueReplay(const std::vector<char>& payload)
     {
         DoorRow* rr = RowByKey(f[1].c_str());
         const int area = DoorAreaForRow(rr);
-        if (area != coopdoor::kDoorAreaMine)
+        /* T-1391 (manager 2026-11-20; a departure from B12-d above): only a SETTLED 'another game holds it' (verdict 2) drops the entry.
+           'Loading' (0), 'nobody' (3) and 'unanswerable' (4) are not final - the replay ran ~1 s into play while the engine was still
+           loading the areas (F1565) - so the entry is KEPT (-3) and asked again at this game's next area map (StoreQueueReplayTick re-run
+           from the AREAMAP arrival - the event that settles who holds it; no timer). No world server judges a door write, so it is never
+           sent without this verdict. */
+        const int act = coopdoor::DoorReplayVerdictAct(area);
+        if (act != coopdoor::kDoorReplaySend)
         {
             char vb[16]; _snprintf(vb, 15, "%d", area); vb[15] = 0;
-            DebugLog("[DOOR] outage queue: the queued state for '" + f[1] + "' is DROPPED - now that the notebook"
-                     " is back this game's area picture does not say it holds that door (verdict " + std::string(vb)
-                     + ": 0 loading, 2 other, 3 nobody, 4 unanswerable), so the other game's own state stands"
-                     " (decision 40 asked at the write; counted as droppedNotMineNow).");
-            return -2;
+            if (act == coopdoor::kDoorReplayDrop)
+            {
+                DebugLog("[DOOR] outage queue: the queued state for '" + f[1] + "' is DROPPED - now that the notebook"
+                         " is back this game's area picture says another game holds that door (verdict " + std::string(vb)
+                         + "), so the other game's own state stands (decision 40 asked at the write; counted as droppedNotMineNow).");
+                return -2;
+            }
+            static long long s_doorReplayWaitSaid = 0;
+            if (++s_doorReplayWaitSaid <= 16)
+                DebugLog("[DOOR] outage queue: the queued state for '" + f[1] + "' is KEPT - its area is not settled here yet (verdict " + std::string(vb)
+                         + ": 0 loading, 3 nobody, 4 unanswerable); it is asked again at this game's next area map and dropped only when another game holds it (first 16 logged)");
+            return -3;
         }
     }
     if (!net::SendDoorState(f[1], (f[2] == "1") ? coopdoor::kDoorOpen : coopdoor::kDoorClosed,
@@ -4498,7 +4511,7 @@ void DoorsTick()
                         {
                             std::vector<char> pay;
                             if (DoorStateToBytes(key, (int)st, (int)lk, &pay) != 0
-                                && coop::StoreQueueWrite(coopqueue::kQueueFamilyDoor, std::string(key), pay) != 0)
+                                && coop::StoreQueueWrite(coopqueue::kQueueFamilyDoor, doorrec::MakeDoorRecId(std::string(key)).empty() ? std::string(key) : doorrec::MakeDoorRecId(std::string(key)), pay) != 0)   /* T-1391 fold 2 (S5): journaled under the door's RECORD id, so the replay's seq check (QueueReplayDecide) sees another writer's newer state of it and the entry is never sent over it */
                             { ++g_doorQueuedNoNotebook; queued = 1; }
                             else ++g_doorQueuePayloadRefused;
                         }

@@ -51,6 +51,7 @@ int  BuildRowPendingFor(void* building);              // MAIN THREAD: another ga
 int  BuildHomeDropPod(void* platoon, void* building);   // MAIN THREAD, review MED 2: the group's home dropped when it names the building (Ownerships::removeOwnedObject, the engine purchase's first step) - 1 called, 0 no row / nothing, -1 faulted
 int  BuildKeyPlayerPiece(const char* key);            // MAIN THREAD: the build records name a player as the owner of the piece at this P7n key (a live row of this world, an own row waiting to be restored, a copy-list entry) - 1 yes, 0 no, -1 off the main thread or no key
 void ReportBuild();                                   // one [BUILD] REPORT line (the `report` fan-out)
+std::string PowerDiagToken();   /* T-1455 diagnostics: `powerDiag[frozenNow,frozenQuietNow,verdictChanges,frozenQuiet]=..` - on the [POWER] REPORT and the [SAVE] hb line; the count walked on the main thread (off it: the last count) */
 /* T-1372 (H-T1372-removal), ANY THREAD - worldgen.cpp's GameWorld::destroy detour, before the engine's destroy: the engine's own reason
    (and the Level Editor's delete around it) decides whether this game's own building ends for good; such a piece's row is marked
    removed at the next BuildTick as a finished dismantle's is (coopbuild::BuildEngineDestroyDecide).

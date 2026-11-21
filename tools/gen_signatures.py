@@ -24,7 +24,8 @@ Among several referencing instructions (data rows) the shortest unique pattern w
 THE FILE (src/coop-plugin/addresses/signatures.sig, plain text, shipped beside the tables):
     <name> <kind> <anchor> <pattern> <a> <b> <c> <d> <check>
   anchor   offset of 4 fixed pattern bytes the scanner indexes on (the rarest such window in both builds)
-  code     a = rva - pattern start, b = verify offset (0, or 16 where RE_Kenshi hooks the entry), c = bytes to verify
+  code     a = rva - pattern start, b = verify offset (0, or 16 where RE_Kenshi hooks the entry), c = bytes to verify;
+           check = '-', or (T-1453 review) the bytes at the verify place when the pattern does not reach them
   ret      a = rva - pattern start, b = call length;              check = the call's bytes (with ??)
   var      a = displacement offset in the pattern, b = displacement-to-instruction-end, c = target adjustment
   ro       a, b, c as var; d = verify offset;                      check = the constant bytes (with ??)
@@ -37,6 +38,13 @@ THE FILE (src/coop-plugin/addresses/signatures.sig, plain text, shipped beside t
                                               it must resolve to the same address as the first
            k:<off>:<row>                      a direct CALL at pattern offset <off> whose target is code row <row>
                                               in both Steam builds; after resolving it must still land on that row
+           from-call:<row>:<off>              T-1453: a code row with NO pattern ('-'): the target of the CALL at <off> of
+                                              <row>'s match (a row found by a stand-in - own_span / MIN_OWN below)
+           via-call                           T-1453: a code row whose own pattern is a call site: the CALL at P + a
+           ref:<row>:<disp>:<end>             T-1453 step 3: a code row whose pattern may match several times: the ONE
+                                              match whose RIP-relative displacement at P + disp (instruction end P + end)
+                                              names var / ro row <row> (a leaf known by the global it writes)
+           optional:<feature>                 T-1453 / T-294: the tables' marker - a miss switches off only <feature>
 Rows no unique pattern could be made for are named on '!nosig <name>' lines and counted in '!nosigcount'; the build
 refuses any (tools/check_tables.py), and so does the plugin.
 
@@ -45,6 +53,7 @@ Needs: Python 3, capstone 5, numpy.
 """
 import argparse
 import os
+import re
 import struct
 import sys
 
@@ -82,6 +91,7 @@ class Index(object):
     """Every 4-byte window of .text, sorted, so 'where does this u32 occur' is a binary search."""
 
     def __init__(self, img):
+        self.img = img
         self.img = img
         self.lo, self.hi = scan_range(img)
         self.t = img.np[self.lo:self.hi]
@@ -269,6 +279,162 @@ def call_checks(a, b, pat, keep, s65, s68, code65, code68):
     return out
 
 
+# ---- T-1453 (F1542 / F1547): a row is found by ITSELF, never by its neighbourhood -------------------------------------
+# A code / ret row's pattern above is the shortest unique window from the row on; for a tiny function that window is mostly
+# padding and the NEXT function (a stand-in: on a build where the neighbour differs the row is lost, or found wrong - F1542,
+# GameFreeStub on GOG). A pattern counts as the row's own only when at least MIN_OWN of its fixed bytes lie in the row's own
+# code (own_span). A row whose pattern does not is re-made, in this order:
+#   1. own_pattern - a unique window inside its own code only (back into the function and forward to its end);
+#   2. (code) from-call:<row>:<off> - another row, found by its own bytes, whose pattern holds a direct call to it (that
+#      row's k: item) - established practice: a unique pattern at a known call site, the call's rel32 followed;
+#   3. (code) via-call - a unique window, inside the CALLER's own code, around a direct call to it.
+MIN_OWN = 8
+
+
+def own_span(img, x):
+    """[lo, hi) of the code row x belongs to: its exception-table fragment; for a row at a function's END (x in no
+    fragment, the one before it ending exactly at x) that function's fragment; for a leaf with no fragment, x to the end of
+    the first ret / jmp / int3."""
+    fr = img.fragment(x)
+    if fr is not None:
+        return fr
+    p = img.fragment(x - 1)
+    if p is not None and p[1] == x:
+        return p
+    end = x
+    for ins in G.MD.disasm(img.rd(x, 96), x):
+        end = ins.address + ins.size
+        if ins.mnemonic in ('ret', 'int3', 'jmp'):
+            break
+    return (x, end)
+
+
+def own_fixed(pat_start, keep, span):
+    lo, hi = span
+    return int(sum(1 for i in range(len(keep)) if keep[i] and lo <= pat_start + i < hi))
+
+
+def window(a, b, x65, x68, back, fwd):
+    """combined() for any window [x-back, x+fwd), fwd 0 included (a row at a function's end)."""
+    n = back + fwd
+    s65, k65 = mview(a, x65 - back, x65 + fwd)
+    s68, k68 = mview(b, x68 - back, x68 + fwd)
+    if n < 4 or len(s65) < n or len(s68) < n:
+        return None, None
+    v65, v68 = np.frombuffer(s65[:n], dtype=np.uint8), np.frombuffer(s68[:n], dtype=np.uint8)
+    keep = k65[:n] & k68[:n] & (v65 == v68)
+    return bytes(np.where(keep, v65, 0).astype(np.uint8)), keep
+
+
+def own_pattern(a, b, ixs, x65, x68, minfwd):
+    """The shortest unique window that lies wholly inside x's own code in both builds and covers [x, x+minfwd). ->
+    (pat, keep, anc, back) or None"""
+    sp65, sp68 = own_span(a, x65), own_span(b, x68)
+    maxback = min(x65 - sp65[0], x68 - sp68[0])
+    maxfwd = min(sp65[1] - x65, sp68[1] - x68, FWD[-1])
+    if maxfwd < minfwd or maxback < 0:
+        return None
+    backs = sorted(set([0] + [v for v in (8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512) if v <= maxback]
+                       + ([maxback] if maxback <= 512 else [])))
+    fwds = sorted(set([v for v in FWD if minfwd <= v <= maxfwd] + [maxfwd]))
+    for back in backs:
+        for fwd in fwds:
+            pat, keep = window(a, b, x65, x68, back, fwd)
+            if pat is None or int(keep.sum()) < MIN_OWN:
+                continue
+            anc = best_anchor(ixs, pat, keep)
+            if anc is None:
+                continue
+            if ixs[0].matches(pat, keep, anc, 2) == [x65 - back] and ixs[1].matches(pat, keep, anc, 2) == [x68 - back]:
+                return pat, keep, anc, back
+    return None
+
+
+def _rel32(t, idx):
+    r = (t[idx + 1].astype(np.int64) | (t[idx + 2].astype(np.int64) << 8) | (t[idx + 3].astype(np.int64) << 16)
+         | (t[idx + 4].astype(np.int64) << 24))
+    return np.where(r >= 2 ** 31, r - 2 ** 32, r)
+
+
+def call_sites(ix, T):
+    """Every direct CALL in .text whose target, through jmp stubs, is T - a real instruction (the masked view wildcards its
+    rel32) whose final target the resolver would reach is T."""
+    t, lo = ix.t, ix.lo
+    n = len(t) - 5
+    jdx = np.flatnonzero(t[:n] == 0xE9)
+    stubs = (lo + jdx[(lo + jdx + 5 + _rel32(t, jdx)) == T]).tolist()
+    cdx = np.flatnonzero(t[:n] == 0xE8)
+    ct = lo + cdx + 5 + _rel32(t, cdx)
+    out = []
+    for i, tg in zip(cdx[np.isin(ct, np.array([T] + stubs, dtype=np.int64))], ct[np.isin(ct, np.array([T] + stubs, dtype=np.int64))]):
+        site = int(lo + i)
+        _s, k = mview(ix.img, site, site + 5)
+        if len(k) >= 5 and k[0] and not k[1:5].any() and G.final_target(ix.img, int(tg)) == T:
+            out.append(site)
+    return out
+
+
+def via_call(a, b, ixs, T65, T68):
+    """A unique window inside a caller's own code around a direct call to T (the same call in both builds). ->
+    (pat, keep, anc, back) with the E8 at pattern offset back, or None"""
+    s65, s68 = call_sites(ixs[0], T65), call_sites(ixs[1], T68)
+
+    def local(img, i):
+        s, k = mview(img, i, i + 24)
+        return bytes(np.where(k, np.frombuffer(s, dtype=np.uint8), 0).astype(np.uint8)) + k.tobytes()
+    loc68 = [(local(b, i), i) for i in s68[:400]]
+    tried = 0
+    for i65 in s65[:400]:
+        l65 = local(a, i65)
+        for l68, i68 in loc68:
+            if l68 != l65:
+                continue
+            tried += 1
+            r = own_pattern(a, b, ixs, i65, i68, 5)
+            if r is not None:
+                return r
+            if tried >= 40:
+                return None
+    return None
+
+
+def ref_form(a, b, ixs, r65, r68, data65, data68):
+    """T-1453 step 3: a leaf whose own code names a global row RIP-relatively - its own masked bytes as the pattern, the one
+    match in each build whose displacement names that row. -> (pat, keep, anc, 'ref:<row>:<disp>:<end>') or None"""
+    x65, x68 = r65['rva'], r68['rva']
+    s65, s68 = own_span(a, x65), own_span(b, x68)
+    if s65[1] - s65[0] != s68[1] - s68[0] or s65[0] != x65 or s68[0] != x68:
+        return None
+    m65 = G.masked(a, s65[0], s65[1], stop_at_ret=True)
+    m68 = G.masked(b, s68[0], s68[1], stop_at_ret=True)
+    if len(m65.sig) != len(m68.sig):
+        return None
+    pat = bytes(m65.sig)
+    keep = np.array([bool(k1 and k2 and c1 == c2) for k1, k2, c1, c2 in zip(m65.keep, m68.keep, m65.sig, m68.sig)])
+    for off, ins in m65.insns:
+        t = G.rip_target(ins)
+        if t is None or t not in data65:
+            continue
+        name = data65[t]
+        dp, en = off + G.disp_pos(ins), off + ins.size
+        t68 = x68 + en + struct.unpack('<i', b.rd(x68 + dp, 4))[0]
+        if data68.get(t68) != name:
+            continue
+        anc = best_anchor(ixs, pat, keep)
+        if anc is None:
+            return None
+        rx = re.compile(re.escape(pat[:0]) + b''.join(re.escape(bytes([c])) if k else b'.' for c, k in zip(pat, keep)), re.S)
+        for img, x, tg in ((a, x65, t), (b, x68, t68)):
+            lo, hi = scan_range(img)
+            raw = img.rd(lo, hi - lo)
+            hits = [lo + mt.start() for mt in rx.finditer(raw)
+                    if lo + mt.start() + en + struct.unpack('<i', raw[mt.start() + dp:mt.start() + dp + 4])[0] == tg]
+            if hits != [x]:
+                return None
+        return pat, keep, anc, 'ref:%s:%d:%d' % (name, dp, en)
+    return None
+
+
 CLASS = {'code': 'C', 'ret': 'C', 'var': 'G', 'ro': 'R', 'ptr': 'R'}
 
 
@@ -286,11 +452,14 @@ def generate(args):
             rank[n] = i
     code65 = dict((r['rva'], r['name']) for r in rows65 if r['kind'] == 'code')
     code68 = dict((r['rva'], r['name']) for r in rows68 if r['kind'] == 'code')
+    data65 = dict((r['rva'], r['name']) for r in rows65 if r['kind'] in ('var', 'ro'))   # T-1453 step 3: ref rows
+    data68 = dict((r['rva'], r['name']) for r in rows68 if r['kind'] in ('var', 'ro'))
     ixs = (Index(a), Index(b))
     print('indexed', flush=True)
     X65, X68 = G.Xrefs(a), G.Xrefs(b)
     only = set(args.only.split(',')) if args.only else None
     lines, nosig = [], []
+    how = {}                                        # T-1453: row -> how a former stand-in is found now
     for r65 in rows65:
         name, k = r65['name'], r65['kind']
         if only is not None and name not in only:
@@ -316,9 +485,24 @@ def generate(args):
                     why = 'no unique pattern within %d bytes after / %d before' % (FWD[-1], BACK[-1])
                 else:
                     pat, keep, anc, back = r
+                    own = min(own_fixed(x65 - back, keep, own_span(a, x65)), own_fixed(x68 - back, keep, own_span(b, x68)))
+                    if own < MIN_OWN:                       # T-1453: a stand-in - re-made from the row itself
+                        o = own_pattern(a, b, ixs, x65, x68, n if k == 'ret' else (0 if a.fragment(x65) is None
+                                                                                   and own_span(a, x65)[1] == x65 else 1))
+                        if o is not None:
+                            pat, keep, anc, back = o
+                            how[name] = 'own bytes (was %d own fixed bytes)' % own
+                        elif k == 'code':
+                            how[name] = 'PENDING'           # from-call / via-call after every row is made
+                        else:
+                            how[name] = 'STILL A STAND-IN (%d own fixed bytes)' % own
                     extra = call_checks(a, b, pat, keep, x65 - back, x68 - back, code65, code68)
                     if k == 'code':
-                        line = (name, k, anc, pattern_text(pat, keep), back, r65['at'] - r65['rva'], n, 0, '-')
+                        chk = '-'
+                        if r65['at'] + n > x65 - back + len(pat):   # T-1453 review: the pattern does not reach the row's
+                            # own bytes (a function's END) - they become its check, so no other place can pass
+                            chk = shape([(a, r65['at'], code_keep(a, r65['at'], n)), (b, r68['at'], code_keep(b, r68['at'], n))], n)
+                        line = (name, k, anc, pattern_text(pat, keep), back, r65['at'] - r65['rva'], n, 0, chk)
                     else:
                         chk = shape([(a, x65, None), (b, x68, None)], n)
                         if chk[:2] == 'E8':            # a direct call: its rel32 moves with the code
@@ -355,11 +539,53 @@ def generate(args):
             nosig.append((name, why))
             print('%-46s %-4s NO SIGNATURE: %s' % (name, k, why), flush=True)
         else:
+            if r65.get('opt') != r68.get('opt'):
+                sys.exit('%s: the tables mark it optional differently (%s / %s)' % (name, r65.get('opt'), r68.get('opt')))
+            if r65.get('opt'):
+                extra = extra + [r65['opt']]          # T-1453 / T-294: 'optional:<feature>', as both tables have it
             lines.append(line + (sec65, rank[name], ','.join(extra) if extra else '-'))
             fixed = len(line[3]) // 2 - line[3][::2].count('?')
             print('%-46s %-4s %4d bytes (%d fixed)%s%s' % (name, k, len(line[3]) // 2, fixed,
                                                           '  context %d before' % line[4] if (k in ('code',) and line[4]) else '',
                                                           ('  ' + ' '.join(x[:40] for x in extra)) if extra else ''), flush=True)
+    # T-1453: a code row with no own pattern - from-call (another row's pattern holds a call to it), else via-call
+    pos = dict((l[0], i) for i, l in enumerate(lines))
+    for name in [n for n in how if how[n] == 'PENDING']:
+        l = lines[pos[name]]
+        opt = [x for x in l[11].split(',') if x.startswith('optional:')]
+        cands = []
+        for src in lines:
+            if src[3] == '-' or how.get(src[0], '').startswith(('PENDING', 'STILL', 'via-call', 'from-call')):
+                continue
+            for x in (src[11].split(',') if src[11] != '-' else []):
+                f = x.split(':')
+                if f[0] == 'k' and f[2] == name:
+                    cands.append((src[1] != 'code', int(f[1]), src[0]))
+        if cands:
+            _c, off, src = min(cands)
+            lines[pos[name]] = (name, 'code', 0, '-', 0, l[5], l[6], 0, '-', l[9], l[10], ','.join(['from-call:%s:%d' % (src, off)] + opt))
+            how[name] = 'from-call:%s:%d' % (src, off)
+            continue
+        r65, r68 = [r for r in rows65 if r['name'] == name][0], by68[name]
+        rf = ref_form(a, b, ixs, r65, r68, data65, data68)
+        if rf is not None:
+            pat, keep, anc, ref = rf
+            n, own = l[6], len(pat)                 # T-1453 review 2: its own bytes as its check, as every other row's
+            k65 = (code_keep(a, r65['at'], n)[:own] + [False] * n)[:n]
+            k68 = (code_keep(b, r68['at'], n)[:own] + [False] * n)[:n]
+            chk = shape([(a, r65['at'], k65), (b, r68['at'], k68)], n)
+            lines[pos[name]] = (name, 'code', anc, pattern_text(pat, keep), 0, l[5], l[6], 0, chk, l[9], l[10], ','.join([ref] + opt))
+            how[name] = 'ref (its own %d bytes, %d fixed, and the global it names)' % (len(pat), int(keep.sum()))
+            continue
+        v = via_call(a, b, ixs, r65['rva'], r68['rva'])
+        if v is None:
+            how[name] = 'STILL A STAND-IN (no own pattern, no call site found)'
+            continue
+        pat, keep, anc, back = v
+        lines[pos[name]] = (name, 'code', anc, pattern_text(pat, keep), back, l[5], l[6], 0, '-', l[9], l[10], ','.join(['via-call'] + opt))
+        how[name] = 'via-call (a call site, %d bytes, %d fixed)' % (len(pat), int(keep.sum()))
+    for name in sorted(how):
+        print('T-1453 former stand-in %-40s %s' % (name, how[name]), flush=True)
     total = sum(len(l[3]) // 2 for l in lines)
     print('\nrows %d: signature %d, NO SIGNATURE %d; pattern bytes %d; call-target checks %d; second global patterns %d'
           % (len(lines) + len(nosig), len(lines), len(nosig), total,
