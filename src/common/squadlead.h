@@ -397,12 +397,51 @@ inline int KeeperRepairGo(int why, int holdsArea)
 {
     return (holdsArea != 0) ? why : kKeeperRepairNone;
 }
-/* D5 (T-801), A SALE NO COUNTER HAS ROOM FOR: single player takes it - the keeper pays and the item is destroyed. The holder does the
-   same when the shop's counters resolved (resolved > 0), none took a unit (got 0), no add faulted, the quantity was read and the
-   item was made. A caravan's packs are not counters: refused as before. 1 = the sale is taken. */
-inline int SellNoRoomTaken(int resolved, int got, int faulted, int qtyUnread, int itemMade, int caravan)
+/* D5 (T-801), A SALE NO COUNTER HAS ROOM FOR: single player takes it - the keeper pays and the item is destroyed (F1213 / F1881:
+   the trade window's stand-in list grows, the sale pays, a copy no shop container takes is destroyed - for town shops, shop counters
+   and wandering traders alike). The holder does the same when none of the stock took a unit (got 0), no add faulted, the quantity
+   was read and the item was made (resolved < 0: the sale's stock loop never ran - not taken). Owner 1767 a (D5 completion): the road
+   taken - kNoRoomCounters a town shop whose counters resolved (D5), kNoRoomNoCounter a town shop with no counter found (G2: the
+   building has no interior or its contents list could not be read - the engine's stand-in list is empty, it pays and destroys),
+   kNoRoomPacks a wandering trader's packs (G1). kNoRoomNot = not this road. Fold 1 (F1): no counter found is the base game's empty
+   list only when the home's walk read cleanly (stockClean 1: the walk read whole, or the home has no interior - setupstock.h
+   kHomeWalkRead / kHomeWalkNoInterior); a torn or faulted walk is this game's own read failure and keeps the refusal. stockClean is
+   not asked when counters resolved (D5 unchanged) or of a caravan (its request names packs that resolved). */
+const int kNoRoomNot = 0, kNoRoomCounters = 1, kNoRoomNoCounter = 2, kNoRoomPacks = 3;
+inline int SellNoRoomRoad(int resolved, int got, int faulted, int qtyUnread, int itemMade, int caravan, int stockClean)
 {
-    return (resolved > 0 && got == 0 && faulted == 0 && qtyUnread == 0 && itemMade != 0 && caravan == 0) ? 1 : 0;
+    if (resolved < 0 || got != 0 || faulted != 0 || qtyUnread != 0 || itemMade == 0) return kNoRoomNot;
+    if (caravan != 0) return kNoRoomPacks;
+    if (resolved > 0) return kNoRoomCounters;
+    return (stockClean != 0) ? kNoRoomNoCounter : kNoRoomNot;
+}
+/* 1 = the sale is taken with no room (any road above). */
+inline int SellNoRoomTaken(int resolved, int got, int faulted, int qtyUnread, int itemMade, int caravan, int stockClean)
+{
+    return (SellNoRoomRoad(resolved, got, faulted, qtyUnread, itemMade, caravan, stockClean) != kNoRoomNot) ? 1 : 0;
+}
+/* Fold 1 (F1): a home's walk (setupstock.h: 0 torn, 1 read, 2 no interior) is clean when it read whole or found no interior. */
+inline int HomeWalkClean(int walk) { return (walk == 1 || walk == 2) ? 1 : 0; }
+/* Fold 1 (F3): THE UNITS A SALE'S UNDO TAKES BACK OFF THE STOCK (items.cpp ShopUndoRow): a sale taken with no room (destroyed 1)
+   left nothing on the stock - 0, only the price comes back; a stack paid whole (destroyed 2, G3) left keptN units; a plain sale n. */
+inline int SellUndoUnits(int destroyed, int keptN, int n)
+{
+    if (destroyed == 1) return 0;
+    return (destroyed == 2) ? keptN : n;
+}
+/* Fold 1 (F3): G2's money publish with no counter to name the keeper by (items.cpp ShopPotPublish) - announced only by the game that
+   runs the keeper (its uid read and this game's), as KeeperPublishCounter does; a copy here is never announced. */
+inline int NoPieceKeeperAnnounce(int keeperFound, unsigned int keeperUid, int uidMine)
+{
+    return (keeperFound != 0 && keeperUid != 0 && uidMine != 0) ? 1 : 0;
+}
+/* T-801 G3, A STACK THE STOCK TOOK ONLY PART OF: the engine moves one unit per right-click call and shift-click repeats it, so every
+   unit is paid; a unit no container takes is destroyed (F1881). The holder pays the whole count, keeps what fit and destroys the
+   rest when the stock took some but not all (0 < got < n), no add faulted, the quantity was read and the item was made. 1 = taken
+   whole; 0 = not this road (a fault or an unread quantity keeps the partial sale: the rest goes back to the seller). */
+inline int SellRestTaken(int n, int got, int faulted, int qtyUnread, int itemMade)
+{
+    return (got > 0 && got < n && faulted == 0 && qtyUnread == 0 && itemMade != 0) ? 1 : 0;
 }
 /* D4, A RESTOCK ON THE AREA'S HOLDER REACHES THE GAME THAT RUNS THE KEEPER. The engine restocks a shop on the game that holds its
    area (items.cpp ItRestockHolder), whichever game runs the keeper's formal leader. When another game runs it, the holder sends the

@@ -109,6 +109,15 @@ void DoorsRecRuinAfter(void* building, int ruined);
 const int kDoorsPieceKeysMax = 16, kDoorsPieceKeyCap = 64;
 struct DoorsPieceKeys { int n; char key[kDoorsPieceKeysMax][kDoorsPieceKeyCap]; };
 int DoorsRecPieceKeysRead(void* building, DoorsPieceKeys* out, int onMain);   /* the number of keys read */
+// T-1391 fix attempt 2 (F1774 / F1775), MAIN THREAD: build.cpp's placement of an own piece names it here, so each of its doors is seeded
+// at the door's lay under the DOOR's own key (queued with the link down, doorrec::DoorSeedAtPlaceDue). DoorsKeysOfPiece: the door keys
+// of a piece by door index, as noted at their lay (0 = not noted here). DoorsRecContentHere: the state and lock word the door record of
+// a door key holds here (0 = none held).
+void DoorsRecPlacedHere(const std::string& pieceKey, void* building);
+void DoorsRecPieceGone(const std::string& pieceKey);   // re-check fold: an own piece taken down - its door-key / seed entries leave
+int DoorsKeysOfPiece(const std::string& pieceKey, std::vector<std::string>* out);
+int DoorsRecContentHere(const std::string& doorKey, int* state, int* lockWord);
+int DoorStateToBytes(const char* key, int state, int locked, std::vector<char>* out);   // B12: one door change as journal bytes (doors.cpp; declared here for the seed at placement)
 void DoorsRecPieceDismantled(const DoorsPieceKeys* keys, int before, int after, int onMain);
 // T-1082 review MED 2: build.cpp's REMOVE of a copy already gone (no dismantle step ran here): the gate door record its piece key names
 // (the piece key + "gate") is queued for removal as a dismantle's is, sent by the holder of its area. A house door's key cannot be formed
@@ -147,6 +156,9 @@ int DoorsRecApply(void* door, float health, int broken, int hasLock, int level, 
 // MAIN THREAD: a repair's gained health added to the door (up to its max), broken cleared above 0 - as the engine's repair 0x558B10 leaves it. 1 = done.
 int DoorsRecRepair(void* door, float gain);
 void* DoorsKeptDoorAt(void* building, int index);
+// T-1429 v3 TEST-ONLY (statedump): any plausible door of the building's door array (parent not asked), and its door-record key.
+void* DoorsDumpDoorAt(void* building, int index);
+int DoorsDumpKey(void* door, char* out, int cap, int* isGate);
 void* DoorsLockOf(void* door);
 // The record's door applies and the door road around them, for the pieceLive REPORT line (DoorsRecCountsOut): out[0..9] = breaks,
 // mends, lock levels, lock broken flags, health writes, broken keeps, broken doors reopened, mends handed back to the holder's word,

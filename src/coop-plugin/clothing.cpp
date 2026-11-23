@@ -4,6 +4,7 @@
 #include "clothing.h"
 #include "spawn.h"
 #include "../common/copykeep.h"   /* copy1: KitPlacement */
+#include "../common/kitdelta.h"   /* T-1449 fix (design (a)): the copy re-dressed by changes only */
 #include "items.h"   /* inv6 phase 2: ItemOwnerOf / ItemOwnerApplyTo - the worn kit's stolen marks */
 #include "appearance.h"   /* LIMBS: CopyRebuildInFlightAny */
 #include "hooks.h"   /* LIMBS: coop::AddHook - the amputate gate */
@@ -109,8 +110,16 @@ Counters g_c;
 /* bag23 part 1 (inv3 phase 2): the packs' contents on the kit - bagRows[captured,applied,relocated,lost] on the REPORT line */
 long long g_bagRowsCaptured = 0, g_bagRowsApplied = 0, g_bagRowsRelocated = 0, g_bagRowsLost = 0;
 long long g_bagPacksRefused = 0, g_bagKitBad = 0, g_bagKitEncodeRefused = 0;
+/* T-1463: 1 while CaptureGarmentsForDigest reads a kit only to compare it (the character check, items.cpp) - nothing is sent, so the
+   kit's send counters and the refused-pack line (which says the COPY's pack will be empty) are not touched. MAIN THREAD. */
+static int g_captureForDigest = 0;
 /* kit2 (owner 102, protocol 83): the kit's cells block - kitCells[absent,bad,encodeRefused] on the REPORT line */
 long long g_kitCellsAbsent = 0, g_kitCellsBad = 0, g_kitCellsEncodeRefused = 0;
+/* T-1449 fix (design (a), F1799): the re-dress by changes only - kitDelta[...] on the REPORT line (kept counts every kept item;
+   changedInPlace and moved are among them; removeFault = a take-out or destroy that faulted or was refused) */
+long long g_kdKept = 0, g_kdChangedInPlace = 0, g_kdMoved = 0, g_kdRemoved = 0, g_kdAdded = 0, g_kdNotKeptMark = 0, g_kdPacksRefilled = 0,
+          g_kdRemoveFault = 0;
+long long g_kdSameSlot = 0, g_kdSameSlotLines = 0;   /* review fold 1: a removed item and an added row of the same section and base */
 
 bool Ptr(const void* p)
 {
@@ -243,11 +252,11 @@ static coopgarment::GarmentDetail CaptureDetail(Item* item, const std::string& c
     float q = 0.0f, ch = 0.0f; int n = 1, fn = 0; unsigned char un = 0;
     if (ReadItemDetailPod(item, &q, &ch, &n, &fn, &un))
     {
-        ++g_c.detailsRead;
+        if (g_captureForDigest == 0) ++g_c.detailsRead;
         d.quality = q; d.charges = ch; d.quantity = (n >= 1) ? (unsigned int)n : 1u;
         d.functionKind = fn; d.unique = un ? 1 : 0;
     }
-    else ++g_c.detailsReadFault;
+    else if (g_captureForDigest == 0) ++g_c.detailsReadFault;
     d.colorSid = colorSid;
     coop::ItemOwnerOf((void*)item, &d.owner);   /* inv6 phase 2 (R6): MAIN THREAD (appearance.cpp's settle send) */
     coop::ItemGearOf((void*)item, &d.gear);   /* a gear item's uniform and crafter (the kit's GEML tail): MAIN THREAD */
@@ -268,12 +277,13 @@ static void CaptureBag(Item* item, GarmentSet* out)
     if (r == 0 || (r == 1 && kb.rows.empty())) return;
     if (r < 0)
     {
+        if (g_captureForDigest != 0) return;   /* T-1463: a digest read - the pack is left out as the kit's send leaves it out */
         ++g_bagPacksRefused;
         ErrorLog("[P022] kit pack " + out->baseSids.back() + " in '" + out->sections.back() + "': its contents cannot ride the kit ("
                  + coop::ItemBagWhyName(why) + ") - the copy's pack will be EMPTY (bagPacksRefused)");
         return;
     }
-    g_bagRowsCaptured += (long long)kb.rows.size();
+    if (g_captureForDigest == 0) g_bagRowsCaptured += (long long)kb.rows.size();
     out->bags.push_back(kb);
 }
 
@@ -287,7 +297,7 @@ bool CaptureGarments(::Character* c, GarmentSet* out)
     // writes an item-state record (type 0x2A), so whatever the engine considers the item's
     // identity is exactly what comes back - including the `company sid` a weapon needs.
     GameDataContainer* container = GetScratchContainer(c);
-    if (container == 0) { ++g_c.noContainer; return false; }
+    if (container == 0) { if (g_captureForDigest == 0) ++g_c.noContainer; return false; }
 
     const SecMap& secs = *(const SecMap*)((char*)inv + kSectionsOff);
     if (secs.size() > 64) return false;
@@ -332,9 +342,20 @@ bool CaptureGarments(::Character* c, GarmentSet* out)
             CaptureBag(item, out);   /* bag23 part 1 */
         }
     }
-    ++g_c.captured;
-    g_c.itemsCaptured += (int)out->Count();
+    if (g_captureForDigest == 0)
+    {
+        ++g_c.captured;
+        g_c.itemsCaptured += (int)out->Count();
+    }
     return true;
+}
+
+bool CaptureGarmentsForDigest(::Character* c, GarmentSet* out)
+{
+    g_captureForDigest = 1;
+    const bool ok = CaptureGarments(c, out);
+    g_captureForDigest = 0;
+    return ok;
 }
 
 // deadlook1 fold (manager decision 2026-09-25): the WORN sections a dead copy's apply replaces. KEPT: shirt, legs, armour,
@@ -353,40 +374,7 @@ static bool IsWornSection(const std::string& name)
 // deadlook1 fold 3: the same list, for appearance.cpp's looted mark (only a move in a worn section counts).
 bool ClothingIsWornSection(const std::string& name) { return IsWornSection(name); }
 
-// Removes and destroys every item in the WORN sections only, through the same two calls items.cpp's ITEM_MOVE remove
-// makes on a ghost (takeItemOut(item, -1, true), then the engine's destroy). The items are listed
-// first (each once) and removed after, so no section vector is walked while it changes. Returns how many were removed.
-static int ClearWornSections(Inventory* inv)
-{
-    std::vector<Item*> doomed;
-    const SecMap& secs = *(const SecMap*)((char*)inv + kSectionsOff);
-    if (secs.size() > 64) return 0;
-    for (SecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
-    {
-        if (!IsWornSection(it->first)) continue;
-        InventorySection* sec = it->second;
-        if (!Ptr(sec)) continue;
-        const Ogre::vector<InventorySection::SectionItem>::type& si = sec->items;
-        if (si.size() > 256) continue;
-        for (size_t k = 0; k < si.size(); ++k)
-        {
-            Item* item = si[k].item;
-            if (!Obj(item)) continue;
-            bool seen = false;
-            for (size_t j = 0; j < doomed.size(); ++j) if (doomed[j] == item) { seen = true; break; }
-            if (!seen) doomed.push_back(item);
-        }
-    }
-    int removed = 0;
-    for (size_t k = 0; k < doomed.size(); ++k)
-    {
-        Item* gone = inv->takeItemOut(doomed[k], -1, true);
-        if (Obj(gone) && coop::GameWorldPtr() != 0) { coop::GameWorldPtr()->destroy(gone, false, "coop dead-copy clothing (worn slot)"); ++removed; }
-    }
-    return removed;
-}
-
-// copy1 (COPY2): the section of `inv` with exactly this name, or 0. Walked the way ClearWornSections walks the map; the
+// copy1 (COPY2): the section of `inv` with exactly this name, or 0. Walked the way ReadCopyItems walks the map; the
 // names are the ones the owner's CaptureGarments read from the same map on its side.
 static InventorySection* SectionNamed(Inventory* inv, const std::string& name)
 {
@@ -563,6 +551,130 @@ static void FillKitBag(Item* item, const GarmentSet& set, size_t i, ::Character*
     coop::ItemBagFillCopy((void*)item, kb->rows, (void*)c, applied, relocated, lost, "kit");
 }
 
+/* T-1449 fix (design (a), F1799): the guarded take-out of one item (items.cpp's ITEM_MOVE remove on a ghost: takeItemOut(item, -1,
+   true)); the item taken out, 0 when the call faulted or took nothing. No C++ object with a destructor in this frame (C2712). */
+static Item* KitTakeOutPod(Inventory* inv, Item* item)
+{
+    __try { return inv->takeItemOut(item, -1, true); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* T-1449 fix: one of the copy's current items in the apply's scope, read as CaptureGarments reads the owner's - its identity from the
+   engine's own item-state record, its details, stolen mark, uniform and crafter. The pointer is used only inside this one apply. */
+struct KitCurItem { Item* item; coopkitdelta::KitKey key; coopgarment::GarmentDetail detail; };
+
+static void ReadCopyItems(Inventory* inv, GameDataContainer* container, bool wornOnly, std::vector<KitCurItem>* out)
+{
+    const SecMap& secs = *(const SecMap*)((char*)inv + kSectionsOff);
+    if (secs.size() > 64) return;
+    for (SecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        if (wornOnly && !IsWornSection(it->first)) continue;
+        InventorySection* sec = it->second;
+        if (!Ptr(sec)) continue;
+        const Ogre::vector<InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 256) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            Item* item = si[k].item;
+            if (!Obj(item)) continue;
+            bool seen = false;
+            for (size_t j = 0; j < out->size(); ++j) if ((*out)[j].item == item) { seen = true; break; }
+            if (seen) continue;
+            KitCurItem ci;
+            ci.item = item;
+            ci.key.section = it->first;
+            ci.key.x = (unsigned int)si[k].x;
+            ci.key.y = (unsigned int)si[k].y;
+            ::GameData* st = item->saveIntoInventoryRecord(container, 0);
+            if (Obj(st))
+            {
+                ci.key.base = SData(st, kBaseSidKey);
+                ci.key.maker = SData(st, kCompanySidKey);
+                ci.key.material = SData(st, kMaterialSidKey);
+                ci.key.level = IData(st, kLevelKey);
+                ci.key.colour = SData(st, kColorSidKey);
+            }
+            else ci.key.usable = 0;   /* identity unreadable: never kept - rebuilt from the kit as before */
+            float q = 0.0f, ch = 0.0f; int n = 1, fn = 0; unsigned char un = 0;
+            if (ReadItemDetailPod(item, &q, &ch, &n, &fn, &un))
+            {
+                ci.detail.quality = q; ci.detail.charges = ch; ci.detail.quantity = (n >= 1) ? (unsigned int)n : 1u;
+                ci.detail.functionKind = fn; ci.detail.unique = un ? 1 : 0;
+            }
+            else ci.key.usable = 0;
+            coop::ItemOwnerOf((void*)item, &ci.detail.owner);
+            coop::ItemGearPeek((void*)item, &ci.detail.gear);
+            ci.key.ownerMark = (unsigned char)(ci.detail.owner.kind != coopmark::kOwnNone ? 1 : 0);
+            ci.key.gearMark = (unsigned char)(gearwire::GearEmpty(ci.detail.gear) ? 0 : 1);
+            out->push_back(ci);
+        }
+    }
+}
+
+/* T-1449 fix: kit row i as the compare sees it (its colour and marks only when the kit carried details) */
+static coopkitdelta::KitKey KitRowKey(const GarmentSet& set, size_t i, bool haveDetail)
+{
+    coopkitdelta::KitKey r;
+    r.section = i < set.sections.size() ? set.sections[i] : std::string();
+    r.base = set.baseSids[i];
+    r.maker = i < set.companySids.size() ? set.companySids[i] : std::string();
+    r.material = i < set.materialSids.size() ? set.materialSids[i] : std::string();
+    r.level = i < set.levels.size() ? set.levels[i] : 0;
+    if (i < set.cells.size()) { r.x = set.cells[i].x; r.y = set.cells[i].y; }
+    if (haveDetail)
+    {
+        r.colour = set.details[i].colorSid;
+        r.ownerMark = (unsigned char)(set.details[i].owner.kind != coopmark::kOwnNone ? 1 : 0);
+        r.gearMark = (unsigned char)(gearwire::GearEmpty(set.details[i].gear) ? 0 : 1);
+    }
+    return r;
+}
+
+/* T-1449 fix: a KEPT pack's old contents - every item in the pack's own inventory taken out and destroyed (the REMOVE calls); the
+   kit's rows then go in through FillKitBag as into a new pack. false = the item is not a pack (nothing done). */
+static bool EmptyKeptPack(Item* item, int* emptied)
+{
+    *emptied = 0;
+    Inventory* pinv = (Inventory*)coop::ItemBagInventoryOf((void*)item);
+    if (pinv == 0 || !Ptr(pinv)) return false;
+    std::vector<Item*> doomed;
+    const SecMap& secs = *(const SecMap*)((char*)pinv + kSectionsOff);
+    if (secs.size() > 64) return true;
+    for (SecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        InventorySection* sec = it->second;
+        if (!Ptr(sec)) continue;
+        const Ogre::vector<InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 256) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            Item* in = si[k].item;
+            if (!Obj(in)) continue;
+            bool seen = false;
+            for (size_t j = 0; j < doomed.size(); ++j) if (doomed[j] == in) { seen = true; break; }
+            if (!seen) doomed.push_back(in);
+        }
+    }
+    for (size_t k = 0; k < doomed.size(); ++k)
+    {
+        Item* gone = KitTakeOutPod(pinv, doomed[k]);
+        if (Obj(gone) && KitDestroyPod(gone, "coop copy kit: a kept pack's old contents (T-1449)") == 1) ++*emptied;
+    }
+    return true;
+}
+
+/* T-1449 fix: the placement counters of one apply (the added and the moved items) */
+struct KitPlaceTally
+{
+    int addFailed, placedBySection, destroyed, sectionFault, enabledForAdd, destroyRefused, destroyFault, restoreFault;
+    int placedEngineRoute, engineRouteNoCell, kitExact, kitRelocated, kitLost;
+    KitPlaceTally() : addFailed(0), placedBySection(0), destroyed(0), sectionFault(0), enabledForAdd(0), destroyRefused(0), destroyFault(0),
+                      restoreFault(0), placedEngineRoute(0), engineRouteNoCell(0), kitExact(0), kitRelocated(0), kitLost(0) {}
+};
+static void PlaceKitItem(Inventory* inv, const GarmentSet& set, size_t i, Item* item, bool haveCells, bool isAnimal, KitPlaceTally* t,
+                         int* packA, int* packR, int* packL);   /* defined after ApplyGarmentsBody */
+
 static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const GarmentSet& set, bool wornOnly)
 {
     Inventory* inv = GetInventory(c);
@@ -580,31 +692,145 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
     if (coop::GameWorldPtr() == 0 || !Ptr(coop::GameWorldPtr()->objectFactory)) return false;
     RootObjectFactory* factory = coop::GameWorldPtr()->objectFactory;
 
-    // Remove what this instance rolled for itself. `destroy=true` because these items exist
-    // nowhere else and leaving them would leak; `skipUnique=false` because a freshly spawned
-    // NPC has nothing unique worth preserving.
-    // deadlook1 fold: a dead copy empties its WORN sections only; everything else stays where it is.
-    int wornCleared = 0, skippedNotWorn = 0;
-    /* kit2 (owner 102): THE KIT APPLY IS THE MOD'S OWN WRITE. The clear (clearAll -> InventorySection::removeItem, hooked) and
-       the refill (_addItem, hooked) run with items.cpp's applying-thread marker up, so neither is booked as an unpaired request
-       nor published. The marker READ is put back at the end (a caller may already hold it); it is raised again after every
-       call into items.cpp that may lower it (ClearWornSections, FillKitBag). */
+    /* T-1449 fix (design (a), F1799): RE-DRESS BY CHANGES ONLY. The apply no longer empties the copy (clearAll) and builds every
+       item new: an item destroyed while its look still waited for its colour texture left that look on the engine's black stand-in,
+       handed to every later item of that look name (F1782 / F1784; T2741 F1798). The copy's own items are read as CaptureGarments
+       reads the owner's and matched one to one against the kit (src/common/kitdelta.h PlanKit): a match is KEPT - its details
+       written in place, a pack's contents replaced in place, moved when only the cell differs; an item no row keeps is REMOVED; a
+       row no item matches is ADDED, built new exactly as before. A dead copy (deadlook1 fold) works the same inside its WORN
+       sections only - shirt, legs, armour, head, boots; every other item and row is left as it is (skippedNotWorn).
+       Every item pointer below is read in this call and used only in it (MAIN THREAD, one frame). */
+    /* kit2 (owner 102): THE KIT APPLY IS THE MOD'S OWN WRITE. The removals and moves (takeItemOut -> InventorySection::removeItem,
+       hooked) and the adds (_addItem, hooked) run with items.cpp's applying-thread marker up, so none is booked as an unpaired
+       request nor published. The marker READ is put back at the end (a caller may already hold it); it is raised again after every
+       call into items.cpp that may lower it. */
     const long kitPrevApplying = coop::ItemApplyingEnter();
-    if (!wornOnly) inv->clearAll(true, false);
-    else wornCleared = ClearWornSections(inv);
-    coop::ItemApplyingEnter();
-
-    int created = 0, unresolved = 0, addFailed = 0, placedBySection = 0, destroyed = 0, sectionFault = 0;
-    int enabledForAdd = 0, destroyRefused = 0, destroyFault = 0, restoreFault = 0;   /* copy2 */
-    int placedEngineRoute = 0, engineRouteNoCell = 0;   /* copy3 */
-    int bagApplied = 0, bagRelocated = 0, bagLost = 0;   /* bag23 part 1 */
-    int kitExact = 0, kitRelocated = 0, kitLost = 0;   /* kit2 */
     const bool haveCells = set.cells.size() == set.Count() && set.sections.size() == set.Count();   /* kit2: the owner's cells rode the kit */
+    const bool haveDetail = set.details.size() == set.Count();
     float animalAge = 0.0f;
     const bool isAnimal = ReadAnimalAge01(c, &animalAge);   /* copy3: CharacterAnimal (getter offset +0x708), read-only */
+    std::vector<KitCurItem> cur;
+    ReadCopyItems(inv, container, wornOnly, &cur);
+    std::vector<coopkitdelta::KitKey> curKeys, rowKeys;
+    std::vector<unsigned char> inScope;
+    for (size_t k = 0; k < cur.size(); ++k) curKeys.push_back(cur[k].key);
     for (size_t i = 0; i < set.Count(); ++i)
     {
-        if (wornOnly && (i >= set.sections.size() || !IsWornSection(set.sections[i]))) { ++skippedNotWorn; continue; }
+        rowKeys.push_back(KitRowKey(set, i, haveDetail));
+        inScope.push_back((unsigned char)((!wornOnly || (i < set.sections.size() && IsWornSection(set.sections[i]))) ? 1 : 0));
+    }
+    const coopkitdelta::KitPlan plan = coopkitdelta::PlanKit(curKeys, rowKeys, inScope, haveCells);
+    coop::ItemApplyingEnter();   /* the reads above called into items.cpp (the owner and gear readers) */
+    /* review fold 1: a removed item and an added row of the SAME section and base is a real change of that slot - say which part of
+       the identity differed (a joining game that rolled its own variant of the NPC's item, or a failure of the compare); 40 lines a
+       life, every one counted (kitSameSlot on the REPORT) */
+    {
+        const std::vector<std::pair<int, int> > same = coopkitdelta::SameSlotPairs(curKeys, rowKeys, plan);
+        for (size_t q = 0; q < same.size(); ++q)
+        {
+            ++g_kdSameSlot;
+            if (g_kdSameSlotLines >= coopkitdelta::kSameSlotLineCap) continue;
+            ++g_kdSameSlotLines;
+            const coopkitdelta::KitKey& h = curKeys[(size_t)same[q].first];
+            const coopkitdelta::KitKey& w = rowKeys[(size_t)same[q].second];
+            char qb[64];
+            std::sprintf(qb, " quality have=%.3f kit=%.3f", cur[(size_t)same[q].first].detail.quality,
+                         haveDetail ? set.details[(size_t)same[q].second].quality : -1.0f);
+            DebugLog("[P022] kit slot changed uid=" + S((long long)FindSpawnedUid((const void*)c)) + " section=" + w.section + " base=" + w.base
+                     + " differs=" + coopkitdelta::DiffWords(h, w)
+                     + " have[maker=" + h.maker + ",material=" + h.material + ",level=" + S((long long)h.level) + ",colour=" + h.colour + "]"
+                     + " kit[maker=" + w.maker + ",material=" + w.material + ",level=" + S((long long)w.level) + ",colour=" + w.colour + "]" + qb
+                     + " (T-1449 review fold 1; line " + S(g_kdSameSlotLines) + " of " + S((long long)coopkitdelta::kSameSlotLineCap) + " a life, every one counted in kitSameSlot)");
+        }
+    }
+
+    /* 1. REMOVE - every current item no row keeps: taken out and destroyed (takeItemOut(item, -1, true), then the engine's destroy - the
+       two calls items.cpp's ITEM_MOVE remove makes on a ghost and the dead copy's worn-slot clear always made) */
+    int removed = 0, removeFault = 0, removeRefused = 0;
+    for (size_t k = 0; k < cur.size(); ++k)
+    {
+        if (plan.itemRow[k] != coopkitdelta::kRemove) continue;
+        Item* gone = KitTakeOutPod(inv, cur[k].item);
+        if (!Obj(gone)) { ++removeFault; continue; }
+        const int d = KitDestroyPod(gone, wornOnly ? "coop dead-copy clothing (worn slot)" : "coop copy kit: an item not in the owner's kit (T-1449)");
+        if (d == 1) ++removed;
+        else if (d < 0) ++removeFault;
+        else ++removeRefused;
+    }
+    coop::ItemApplyingEnter();
+    const int wornCleared = wornOnly ? removed : 0;
+    const int skippedNotWorn = plan.skipped;
+
+    /* 2. KEEP - the owner's details written onto the kept item in place (only what differs); a kept pack's old contents are destroyed
+       FIRST (so a stolen mark written below cannot spread to them) and the kit's rows filled in, as a new pack is filled */
+    int kept = 0, changedInPlace = 0, packsRefilled = 0;
+    int bagApplied = 0, bagRelocated = 0, bagLost = 0;   /* bag23 part 1 */
+    std::vector<int> keptPackA(set.Count(), 0), keptPackR(set.Count(), 0), keptPackL(set.Count(), 0);
+    for (size_t i = 0; i < set.Count(); ++i)
+    {
+        const int k = plan.rowItem[i];
+        if (k < 0) continue;
+        ++kept;
+        Item* item = cur[(size_t)k].item;
+        const int writes = haveDetail ? coopkitdelta::InPlaceWrites(cur[(size_t)k].detail, set.details[i]) : 0;
+        int emptied = 0;
+        /* review fold 3: a kept pack whose contents are already the kit's rows is left alone (not emptied, not refilled, not counted) */
+        bool pack = false;
+        if (!wornOnly && coop::ItemBagInventoryOf((void*)item) != 0)
+        {
+            std::vector<coopbag::BagRow> have;
+            int why = 0;
+            const coopbag::KitBag* kb = KitBagFor(set, i);
+            const std::vector<coopbag::BagRow> none;
+            const bool same = coop::ItemBagRowsOf((void*)item, &have, &why) == 1 && coopkitdelta::BagRowsSame(have, kb != 0 ? kb->rows : none);
+            if (!same) pack = EmptyKeptPack(item, &emptied);
+        }
+        coop::ItemApplyingEnter();
+        if ((writes & coopkitdelta::kWriteFields) != 0)
+        {
+            float back = 0.0f;
+            const coopgarment::GarmentDetail& d = set.details[i];
+            if (WriteItemDetailPod(item, d.quality, d.charges, (int)d.quantity, d.functionKind, d.unique, &back) && back == d.quality) ++g_c.detailsWritten;
+            else ++g_c.detailsWriteFault;
+        }
+        if ((writes & coopkitdelta::kWriteOwner) != 0) coop::ItemOwnerApplyTo((void*)item, set.details[i].owner, set.baseSids[i]);
+        if ((writes & coopkitdelta::kWriteGear) != 0) coop::ItemGearApplyTo((void*)item, set.details[i].gear, set.baseSids[i]);
+        if (pack)
+        {
+            FillKitBag(item, set, i, c, &keptPackA[i], &keptPackR[i], &keptPackL[i]);
+            ++packsRefilled;
+        }
+        coop::ItemApplyingEnter();
+        if (writes != 0 || emptied != 0 || keptPackA[i] != 0 || keptPackL[i] != 0) ++changedInPlace;
+    }
+
+    /* 3. MOVE - a kept item whose cell alone differs: every mover taken out first (two kept items may swap cells), then each placed at
+       its row's cell exactly as an added item is (that cell refused = the section's first free cell; no room = lost, destroyed) */
+    KitPlaceTally t;
+    int moved = 0, moveFault = 0;
+    std::vector<Item*> movers(set.Count(), (Item*)0);
+    for (size_t i = 0; i < set.Count(); ++i)
+    {
+        if (plan.rowItem[i] < 0 || plan.rowMove[i] == 0) continue;
+        Item* out = KitTakeOutPod(inv, cur[(size_t)plan.rowItem[i]].item);
+        if (Obj(out)) movers[i] = out;
+        else ++moveFault;
+    }
+    coop::ItemApplyingEnter();
+    for (size_t i = 0; i < set.Count(); ++i)
+    {
+        if (movers[i] == 0) continue;
+        PlaceKitItem(inv, set, i, movers[i], haveCells, isAnimal, &t, &keptPackA[i], &keptPackR[i], &keptPackL[i]);
+        coop::ItemApplyingEnter();
+        ++moved;
+    }
+    for (size_t i = 0; i < set.Count(); ++i) { bagApplied += keptPackA[i]; bagRelocated += keptPackR[i]; bagLost += keptPackL[i]; }
+
+    /* 4. ADD - every row no current item matched, built new and placed as every row was before T-1449 */
+    int created = 0, unresolved = 0;
+    for (size_t i = 0; i < set.Count(); ++i)
+    {
+        if (plan.rowItem[i] != coopkitdelta::kAdd) continue;
         // F183: the state record needs one key. Everything else createItem reads is
         // null-checked downstream with a default substituted.
         ::GameData* state = container->newRecord((itemType)kItemStateType, "", "coopitem");
@@ -618,7 +844,6 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
             state->stringFields[kMaterialSidKey] = set.materialSids[i];
         if (i < set.levels.size())
             state->intFields[kLevelKey] = set.levels[i];
-        const bool haveDetail = set.details.size() == set.Count();
         if (haveDetail && !set.details[i].colorSid.empty())
             state->stringFields[kColorSidKey] = set.details[i].colorSid;
 
@@ -660,132 +885,147 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
         int packA = 0, packR = 0, packL = 0;
         if (!wornOnly) FillKitBag(item, set, i, c, &packA, &packR, &packL);
         coop::ItemApplyingEnter();   /* kit2: the pack fill called into items.cpp - the marker is up again for the placement */
-
-        // Placement is left to the engine first: `addItem` finds the slot the garment belongs in.
-        // copy1 (COPY2): when it refuses (an animal's only item section `main` is switched off, so "wherever it
-        // fits" finds nowhere - T378 Skimmer/Garru addFailed), the item goes into the section the owner had it in,
-        // through that section's own add (the kit carries no slot, so the section picks the cell). If that refuses
-        // too, or the section does not exist here, the created item is in no inventory and is destroyed.
-        /* kit2 (owner 102): EXACT PLACEMENT. When the kit carries the owner's cells, the item goes into the OWNER'S section at the
-           OWNER'S cell - never the engine's whole-inventory addItem, which picks its own section and cell. That cell refused here
-           (taken, off the grid, a slot the item does not fit) = that same section's first free cell, counted kitRelocated; no
-           room in that section, or no such section on this copy = kitLost (the created item is destroyed, as copy1 does) - never
-           another section, never a merge. Animals keep copy3's engine route (their `main` has a slot filter the fill predates). */
-        int engineAdd = 0;
-        if (haveCells)
-        {
-            engineAdd = 1;   /* the whole-inventory add is not asked: the rest of this iteration is the exact path */
-            InventorySection* own = SectionNamed(inv, set.sections[i]);
-            int switchedOn = 0, restoreFailed = 0, noCell = 0, got = coopkitcell::kKitCellNone;
-            const int px = (int)set.cells[i].x, py = (int)set.cells[i].y;
-            if (own != 0)
-            {
-                if (coopkeep::KitSectionRoute(isAnimal ? 1 : 0) == coopkeep::kKitRouteAnimalEngine)
-                    got = SectionAddAnimalEnginePod(own, item, px, py, &switchedOn, &restoreFailed, &noCell);
-                else
-                    got = SectionPlaceExactPod(own, item, px, py, &switchedOn, &restoreFailed);
-            }
-            if (switchedOn != 0) ++enabledForAdd;
-            if (restoreFailed != 0) ++restoreFault;
-            if (got == coopkitcell::kKitCellExact) ++kitExact;
-            else if (got == coopkitcell::kKitCellRelocated) ++kitRelocated;
-            else if (got < 0) ++sectionFault;   /* the add faulted or its answer is unknown: the item is never destroyed */
-            else
-            {
-                ++kitLost;
-                ErrorLog("[P022] kit item " + set.baseSids[i] + " has no room in '" + set.sections[i] + "'"
-                         + (own == 0 ? std::string(" (no such section on this copy)") : std::string()) + " - LOST on this copy (kitLost)");
-                const int gone = KitDestroyPod(item, "coop copy kit item: no room in the owner's section (kit2)");
-                const int which = coopkeep::KitDestroyCounter(gone);
-                if (packA > 0)
-                {
-                    ErrorLog("[P022] kit pack " + set.baseSids[i] + " found no place on this copy - its " + S((long long)packA)
-                             + " row(s) are LOST with it (bagRows lost)");
-                    packL += packA; packA = 0; packR = 0;
-                }
-                if (which == coopkeep::kKitCountDestroyed) ++destroyed;
-                else if (which == coopkeep::kKitCountDestroyFault) ++destroyFault;
-                else ++destroyRefused;
-            }
-        }
-        else engineAdd = inv->addItem(item, 1, false, false) ? 1 : 0;
-        if (!haveCells && engineAdd == 0)
-        {
-            ++addFailed;
-            InventorySection* own = i < set.sections.size() ? SectionNamed(inv, set.sections[i]) : 0;
-            int switchedOn = 0, restoreFailed = 0;   /* copy2: the section switched ON for the add, flag restored */
-            int secAdd = 0, noCell = 0;
-            if (own != 0)
-            {
-                if (coopkeep::KitSectionRoute(isAnimal ? 1 : 0) == coopkeep::kKitRouteAnimalEngine)
-                {
-                    secAdd = SectionAddAnimalEnginePod(own, item, -1, -1, &switchedOn, &restoreFailed, &noCell);   /* copy3; kit2: no cell known */
-                    if (secAdd > 1) secAdd = 1;   /* kit2: placed (the first free cell - no owner cell was known) */
-                    if (secAdd == 1) ++placedEngineRoute;
-                    if (noCell != 0) ++engineRouteNoCell;
-                }
-                else secAdd = SectionAddEnabledPod(own, item, &switchedOn, &restoreFailed);
-            }
-            if (switchedOn != 0) ++enabledForAdd;
-            if (restoreFailed != 0) ++restoreFault;
-            const int place = coopkeep::KitPlacement(engineAdd, secAdd);
-            if (place == coopkeep::kKitPlacedBySection) ++placedBySection;
-            else if (place == coopkeep::kKitLeaveFaulted) ++sectionFault;
-            else if (place == coopkeep::kKitDestroy)
-            {
-                const int gone = KitDestroyPod(item, "coop copy kit item refused by the inventory and its own section (copy1)");
-                const int which = coopkeep::KitDestroyCounter(gone);   /* copy2: a refused or faulted destroy is counted */
-                if (packA > 0)   /* bag23 part 1: the rows inside a pack that found no place went with it */
-                {
-                    ErrorLog("[P022] kit pack " + set.baseSids[i] + " found no place on this copy - its " + S((long long)packA)
-                             + " row(s) are LOST with it (bagRows lost)");
-                    packL += packA; packA = 0; packR = 0;
-                }
-                if (which == coopkeep::kKitCountDestroyed) ++destroyed;
-                else if (which == coopkeep::kKitCountDestroyFault) ++destroyFault;
-                else ++destroyRefused;
-            }
-        }
+        PlaceKitItem(inv, set, i, item, haveCells, isAnimal, &t, &packA, &packR, &packL);
+        coop::ItemApplyingEnter();   /* the placement called into items.cpp */
         bagApplied += packA; bagRelocated += packR; bagLost += packL;   /* bag23 part 1 */
     }
 
     g_c.itemsCreated    += created;
     g_bagRowsApplied += bagApplied; g_bagRowsRelocated += bagRelocated; g_bagRowsLost += bagLost;   /* bag23 part 1 */
     g_c.itemsUnresolved += unresolved;
-    g_c.itemsAddFailed  += addFailed;
-    g_c.addPlacedBySection += placedBySection;   /* copy1 */
-    g_c.addFailedDestroyed += destroyed;
-    g_c.addSectionFault    += sectionFault;
-    g_c.addEnabledForAdd   += enabledForAdd;    /* copy2 */
-    g_c.addDestroyRefused  += destroyRefused;
-    g_c.addDestroyFault    += destroyFault;
-    g_c.addEnabledRestoreFault += restoreFault;
-    g_c.addPlacedEngineRoute += placedEngineRoute;   /* copy3 */
-    g_c.addEngineRouteNoCell += engineRouteNoCell;
-    g_c.kitPlacedExact += kitExact; g_c.kitRelocated += kitRelocated; g_c.kitLost += kitLost;   /* kit2 */
+    g_c.itemsAddFailed  += t.addFailed;
+    g_c.addPlacedBySection += t.placedBySection;   /* copy1 */
+    g_c.addFailedDestroyed += t.destroyed;
+    g_c.addSectionFault    += t.sectionFault;
+    g_c.addEnabledForAdd   += t.enabledForAdd;    /* copy2 */
+    g_c.addDestroyRefused  += t.destroyRefused;
+    g_c.addDestroyFault    += t.destroyFault;
+    g_c.addEnabledRestoreFault += t.restoreFault;
+    g_c.addPlacedEngineRoute += t.placedEngineRoute;   /* copy3 */
+    g_c.addEngineRouteNoCell += t.engineRouteNoCell;
+    g_c.kitPlacedExact += t.kitExact; g_c.kitRelocated += t.kitRelocated; g_c.kitLost += t.kitLost;   /* kit2 */
     ++g_c.applied;
+    g_kdKept += kept; g_kdChangedInPlace += changedInPlace; g_kdMoved += moved; g_kdRemoved += removed; g_kdAdded += created;   /* T-1449 fix */
+    g_kdNotKeptMark += plan.notKeptMark; g_kdPacksRefilled += packsRefilled; g_kdRemoveFault += removeFault + removeRefused + moveFault;
     coop::ItemApplyingLeave(kitPrevApplying);   /* kit2: the marker as it was before this apply */
 
     SW_DEVLOG("[P022] applied garments: wanted=" + S((long long)set.Count())
              + " created=" + S(created)
              + " unresolved=" + S(unresolved)
-             + " addFailed=" + S(addFailed)
-             + " addPlacedBySection=" + S(placedBySection) + " addFailedDestroyed=" + S(destroyed)   /* copy1 */
-             + (sectionFault != 0 ? " addSectionFault=" + S(sectionFault) : std::string())
-             + " addEnabledForAdd=" + S(enabledForAdd)   /* copy2 */
-             + (isAnimal ? " animal=1 addPlacedEngineRoute=" + S(placedEngineRoute) + " addEngineRouteNoCell=" + S(engineRouteNoCell)
+             + " addFailed=" + S(t.addFailed)
+             + " addPlacedBySection=" + S(t.placedBySection) + " addFailedDestroyed=" + S(t.destroyed)   /* copy1 */
+             + (t.sectionFault != 0 ? " addSectionFault=" + S(t.sectionFault) : std::string())
+             + " addEnabledForAdd=" + S(t.enabledForAdd)   /* copy2 */
+             + (isAnimal ? " animal=1 addPlacedEngineRoute=" + S(t.placedEngineRoute) + " addEngineRouteNoCell=" + S(t.engineRouteNoCell)
                          : std::string())   /* copy3 */
-             + (destroyRefused != 0 || destroyFault != 0 || restoreFault != 0
-                    ? " addDestroyRefused=" + S(destroyRefused) + " addDestroyFault=" + S(destroyFault) + " addEnabledRestoreFault=" + S(restoreFault)
+             + (t.destroyRefused != 0 || t.destroyFault != 0 || t.restoreFault != 0
+                    ? " addDestroyRefused=" + S(t.destroyRefused) + " addDestroyFault=" + S(t.destroyFault) + " addEnabledRestoreFault=" + S(t.restoreFault)
                     : std::string())
              + (bagApplied != 0 || bagLost != 0 ? " bagRows[applied,relocated,lost]=" + S(bagApplied) + "," + S(bagRelocated) + "," + S(bagLost)
                                                 : std::string())   /* bag23 part 1 */
-             + (haveCells ? " kit[exact,relocated,lost]=" + S(kitExact) + "," + S(kitRelocated) + "," + S(kitLost)
+             + (haveCells ? " kit[exact,relocated,lost]=" + S(t.kitExact) + "," + S(t.kitRelocated) + "," + S(t.kitLost)
                           : std::string(" kitCells=absent"))   /* kit2 */
              + (wornOnly ? " wornOnly=1 wornCleared=" + S(wornCleared) + " skippedNotWorn=" + S(skippedNotWorn)
-                         : std::string()));
+                         : std::string())
+             + coopkitdelta::DeltaToken(kept, changedInPlace, moved, removed, created)   /* T-1449 fix: what the re-dress changed */
+             + (plan.notKeptMark != 0 ? " notKeptMark=" + S(plan.notKeptMark) : std::string())
+             + (packsRefilled != 0 ? " packsRefilled=" + S(packsRefilled) : std::string())
+             + (removeFault + removeRefused + moveFault != 0 ? " removeFault=" + S(removeFault) + " removeRefused=" + S(removeRefused)
+                                                              + " moveFault=" + S(moveFault) : std::string()));
     coop::ItemLookNoteRedress((void*)c);   /* T-1449: this copy's items judged ~2 s on - the [ITEMLOOK] line (read only) */
     return true;
+}
+
+/* T-1449 fix: kit row i's item - a new one (ADD) or a kept one taken out to change its cell (MOVE) - placed in the copy's inventory.
+   The placement every kit item always had (kit2 exact cell, copy1 / copy2 / copy3 fallbacks), moved here unchanged from the loop. */
+static void PlaceKitItem(Inventory* inv, const GarmentSet& set, size_t i, Item* item, bool haveCells, bool isAnimal, KitPlaceTally* t,
+                         int* packA, int* packR, int* packL)
+{
+    // Placement is left to the engine first: `addItem` finds the slot the garment belongs in.
+    // copy1 (COPY2): when it refuses (an animal's only item section `main` is switched off, so "wherever it
+    // fits" finds nowhere - T378 Skimmer/Garru addFailed), the item goes into the section the owner had it in,
+    // through that section's own add (the kit carries no slot, so the section picks the cell). If that refuses
+    // too, or the section does not exist here, the created item is in no inventory and is destroyed.
+    /* kit2 (owner 102): EXACT PLACEMENT. When the kit carries the owner's cells, the item goes into the OWNER'S section at the
+       OWNER'S cell - never the engine's whole-inventory addItem, which picks its own section and cell. That cell refused here
+       (taken, off the grid, a slot the item does not fit) = that same section's first free cell, counted kitRelocated; no
+       room in that section, or no such section on this copy = kitLost (the created item is destroyed, as copy1 does) - never
+       another section, never a merge. Animals keep copy3's engine route (their `main` has a slot filter the fill predates). */
+    int engineAdd = 0;
+    if (haveCells)
+    {
+        engineAdd = 1;   /* the whole-inventory add is not asked: the rest of this iteration is the exact path */
+        InventorySection* own = SectionNamed(inv, set.sections[i]);
+        int switchedOn = 0, restoreFailed = 0, noCell = 0, got = coopkitcell::kKitCellNone;
+        const int px = (int)set.cells[i].x, py = (int)set.cells[i].y;
+        if (own != 0)
+        {
+            if (coopkeep::KitSectionRoute(isAnimal ? 1 : 0) == coopkeep::kKitRouteAnimalEngine)
+                got = SectionAddAnimalEnginePod(own, item, px, py, &switchedOn, &restoreFailed, &noCell);
+            else
+                got = SectionPlaceExactPod(own, item, px, py, &switchedOn, &restoreFailed);
+        }
+        if (switchedOn != 0) ++t->enabledForAdd;
+        if (restoreFailed != 0) ++t->restoreFault;
+        if (got == coopkitcell::kKitCellExact) ++t->kitExact;
+        else if (got == coopkitcell::kKitCellRelocated) ++t->kitRelocated;
+        else if (got < 0) ++t->sectionFault;   /* the add faulted or its answer is unknown: the item is never destroyed */
+        else
+        {
+            ++t->kitLost;
+            ErrorLog("[P022] kit item " + set.baseSids[i] + " has no room in '" + set.sections[i] + "'"
+                     + (own == 0 ? std::string(" (no such section on this copy)") : std::string()) + " - LOST on this copy (kitLost)");
+            const int gone = KitDestroyPod(item, "coop copy kit item: no room in the owner's section (kit2)");
+            const int which = coopkeep::KitDestroyCounter(gone);
+            if (*packA > 0)
+            {
+                ErrorLog("[P022] kit pack " + set.baseSids[i] + " found no place on this copy - its " + S((long long)*packA)
+                         + " row(s) are LOST with it (bagRows lost)");
+                *packL += *packA; *packA = 0; *packR = 0;
+            }
+            if (which == coopkeep::kKitCountDestroyed) ++t->destroyed;
+            else if (which == coopkeep::kKitCountDestroyFault) ++t->destroyFault;
+            else ++t->destroyRefused;
+        }
+    }
+    else engineAdd = inv->addItem(item, 1, false, false) ? 1 : 0;
+    if (!haveCells && engineAdd == 0)
+    {
+        ++t->addFailed;
+        InventorySection* own = i < set.sections.size() ? SectionNamed(inv, set.sections[i]) : 0;
+        int switchedOn = 0, restoreFailed = 0;   /* copy2: the section switched ON for the add, flag restored */
+        int secAdd = 0, noCell = 0;
+        if (own != 0)
+        {
+            if (coopkeep::KitSectionRoute(isAnimal ? 1 : 0) == coopkeep::kKitRouteAnimalEngine)
+            {
+                secAdd = SectionAddAnimalEnginePod(own, item, -1, -1, &switchedOn, &restoreFailed, &noCell);   /* copy3; kit2: no cell known */
+                if (secAdd > 1) secAdd = 1;   /* kit2: placed (the first free cell - no owner cell was known) */
+                if (secAdd == 1) ++t->placedEngineRoute;
+                if (noCell != 0) ++t->engineRouteNoCell;
+            }
+            else secAdd = SectionAddEnabledPod(own, item, &switchedOn, &restoreFailed);
+        }
+        if (switchedOn != 0) ++t->enabledForAdd;
+        if (restoreFailed != 0) ++t->restoreFault;
+        const int place = coopkeep::KitPlacement(engineAdd, secAdd);
+        if (place == coopkeep::kKitPlacedBySection) ++t->placedBySection;
+        else if (place == coopkeep::kKitLeaveFaulted) ++t->sectionFault;
+        else if (place == coopkeep::kKitDestroy)
+        {
+            const int gone = KitDestroyPod(item, "coop copy kit item refused by the inventory and its own section (copy1)");
+            const int which = coopkeep::KitDestroyCounter(gone);   /* copy2: a refused or faulted destroy is counted */
+            if (*packA > 0)   /* bag23 part 1: the rows inside a pack that found no place went with it */
+            {
+                ErrorLog("[P022] kit pack " + set.baseSids[i] + " found no place on this copy - its " + S((long long)*packA)
+                         + " row(s) are LOST with it (bagRows lost)");
+                *packL += *packA; *packA = 0; *packR = 0;
+            }
+            if (which == coopkeep::kKitCountDestroyed) ++t->destroyed;
+            else if (which == coopkeep::kKitCountDestroyFault) ++t->destroyFault;
+            else ++t->destroyRefused;
+        }
+    }
 }
 
 /* kit3 (kit2 review + T522, review D4): THE KIT APPLY ALWAYS PUTS THE APPLYING MARKER BACK. ApplyGarmentsBody raises items.cpp's
@@ -1996,7 +2236,11 @@ void ReportClothingCounters()
              + S(g_bagRowsRelocated) + "," + S(g_bagRowsLost)
              + " bagPacksRefused=" + S(g_bagPacksRefused) + " bagKitBad=" + S(g_bagKitBad) + " bagKitEncodeRefused=" + S(g_bagKitEncodeRefused)
              + " kit[exact,relocated,lost]=" + S(g_c.kitPlacedExact) + "," + S(g_c.kitRelocated) + "," + S(g_c.kitLost)   /* kit2 */
-             + " kitCells[absent,bad,encodeRefused]=" + S(g_kitCellsAbsent) + "," + S(g_kitCellsBad) + "," + S(g_kitCellsEncodeRefused));
+             + " kitCells[absent,bad,encodeRefused]=" + S(g_kitCellsAbsent) + "," + S(g_kitCellsBad) + "," + S(g_kitCellsEncodeRefused)
+             + " kitDelta[kept,changedInPlace,moved,removed,added,notKeptMark,packsRefilled,removeFault]=" + S(g_kdKept) + ","   /* T-1449 fix */
+             + S(g_kdChangedInPlace) + "," + S(g_kdMoved) + "," + S(g_kdRemoved) + "," + S(g_kdAdded) + "," + S(g_kdNotKeptMark) + ","
+             + S(g_kdPacksRefilled) + "," + S(g_kdRemoveFault)
+             + " kitSameSlot[changes,lines]=" + S(g_kdSameSlot) + "," + S(g_kdSameSlotLines));   /* review fold 1 */
     ReportLimbCounters();   /* LIMBS: its own [LIMBS] REPORT line */
 }
 

@@ -32,6 +32,19 @@ inline int InputYFromLive(float liveY, int terrainRead, float terrain, int engin
     return 1;
 }
 
+/* T-1429 F1711: AN OUTDOOR CAMP PIECE'S INPUT HEIGHT. The camp pieces record holds a piece's full (live) height (camp.cpp
+   CpPieceReadPod); createBuilding with no parent building puts the piece at the engine's ground under its (x,z) plus the y it is
+   given (createPhysical 0x55FF50: decomp_55ff50:186, 205 - 0x9B2850 read, the input added), and the camp maker itself passes 0 for
+   an outdoor piece (decomp_92f250:262-270). So the input is the recorded height less the engine's ground there (InputYFromLive's
+   rule) and the piece stands at the recorded height. 1 = *inY that input; 0 = the ground was not read (no terrain answered, a call
+   failed, a NaN): *inY = 0, the camp maker's own input (the piece stands on the ground there). */
+inline int CampOutdoorInputY(float recordY, int terrainRead, float terrain, int engineRead, float engineGround, float* inY)
+{
+    if (InputYFromLive(recordY, terrainRead, terrain, engineRead, engineGround, inY) == 1) return 1;
+    *inY = 0.0f;
+    return 0;
+}
+
 /* T-1372 decisions 1691 + 1694: AN OLD PLACEMENT RECORD, CONVERTED ONLY WHEN IT WAS MEASURED THE OLD WAY. Builds before the fix stored
    SOME free-standing inputs as the live y less the TERRAIN height (getTerrainHeightFast 0x9B2420); createPhysical adds the engine's
    ground (0x9B2850 = the larger of the terrain and 100), so on terrain below 100 such an input lands (engineGround - terrain) too high.

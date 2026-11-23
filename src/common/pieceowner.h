@@ -105,4 +105,57 @@ inline int PieceOwnerSwap(const PieceOwnerMap& byState, const std::string& state
 /* the owner a piece record held here gives: -1 when none is held or it is a removal mark (a deleted piece names no owner) */
 inline int PieceOwnerOfHeld(int heldOwner, int removed) { return (heldOwner >= 0 && heldOwner <= coopslot::kSlotMax && removed == 0) ? heldOwner : -1; }
 
+/* T-1391 fix A2 (F1805 / F1807 / F1830): THE OWNER A STORED PIECE IS MADE WITH. The engine's createBuilding gives a building that is not
+   a player faction's (no player marker, Faction +0x250) the faction of the town it lands in; another player's stand-in carries no marker,
+   so that player's piece loaded inside this game's outpost became this game's own (T2748: A:26995 made in 'Own Yard' -> A's faction;
+   A:33958 made in 'Nowhere' -> the stand-in). In the plain game a player's building keeps its player's faction wherever it stands, so
+   the owner the piece's saved state names (the area file's owner, already translated to this game's stand-in for that player by the
+   owner translation, store.cpp TranslateZoneOwners) is put back right after the engine made it.
+   haveSaved: the engine was given a saved state whose 'owner faction ID' was read; savedSlot: the stand-in slot that id names
+   (coopslot::StandInSlotOfId; -1 = not a stand-in: this game's own player faction, an NPC's, or none); mySlot: this game's slot (-1 not
+   known); madeIsIt: the made building's owner IS that stand-in already; standInHere: that stand-in exists here; onMain: on the main
+   thread. */
+enum { kOrKeep = 0, kOrRestore = 1, kOrNoStandIn = 2, kOrOffMain = 3 };
+const int kOrLegacySlot = -2;   /* fold 1: savedSlot for the old two-player stand-in id (coopslot::IsLegacyPeerId) - put back to that faction too */
+inline int BuiltOwnerRestore(int haveSaved, int savedSlot, int mySlot, int madeIsIt, int standInHere, int onMain)
+{
+    if (haveSaved == 0 || (savedSlot < 0 && savedSlot != kOrLegacySlot) || savedSlot > coopslot::kSlotMax) return kOrKeep;   /* no saved owner, or not another player's: the engine's own rule stands */
+    if (mySlot >= 0 && savedSlot == mySlot) return kOrKeep;   /* this game's own slot is never a stand-in here (the translation writes its own player faction) */
+    if (madeIsIt != 0) return kOrKeep;                         /* made with the saved owner (outside any town, or the rule did not fire) */
+    if (standInHere == 0) return kOrNoStandIn;
+    if (onMain == 0) return kOrOffMain;                        /* engine writes on the main thread only */
+    return kOrRestore;
+}
+inline const char* BuiltOwnerRestoreName(int a)
+{
+    return a == kOrRestore ? "restored" : a == kOrNoStandIn ? "NOT restored - that player has no stand-in here" : a == kOrOffMain ? "NOT restored - off the main thread" : "kept";
+}
+
+/* T-1391 fix A2 fold 1: THIS GAME'S OWNED LIST AROUND AN OWNER PUT BACK. createBuilding adds the building it made to this game's
+   player's owned list (Ownerships, addOwnedObject) only when the made owner carries the player marker (decomp_57c1e0.txt:1163-1167);
+   the engine's setFaction touches no owned list (decomp_556ec0.txt). So an owner put back by the mod after createBuilding takes the
+   list with it as the purchase does: kOlRemove - the engine made it this game's and the owner put back is not; kOlAdd - the owner put
+   back is this game's and the engine made it another's (createBuilding would have added it); kOlNone otherwise (a stand-in's list is
+   never touched - createBuilding never adds a building to a faction without the marker). */
+enum { kOlNone = 0, kOlRemove = 1, kOlAdd = 2 };
+inline int OwnedListStep(int engineOwnerMine, int wantMine)
+{
+    if (engineOwnerMine != 0 && wantMine == 0) return kOlRemove;
+    if (engineOwnerMine == 0 && wantMine != 0) return kOlAdd;
+    return kOlNone;
+}
+
+/* T-1391 fix A2: THE SCAN'S 'MINE'. The zone and roster scans walk the pieces whose live owner is this game's faction (liveMine); such a
+   piece is this game's only when the piece record held here does not name another player (heldOwner: PieceOwnerOfHeld, -1 = none held
+   or a removal mark - then the live owner is all there is). mySlot -1 (not known): no veto. The own-work check asks the same of each
+   piece item of a save (fold 1).
+   1 = mine; 0 = not this game's faction live; 2 = the piece record names another player (never registered as this game's own). */
+enum { kSmNotLive = 0, kSmMine = 1, kSmOtherRecord = 2 };
+inline int ScanMineOf(int liveMine, int heldOwner, int mySlot)
+{
+    if (liveMine == 0) return kSmNotLive;
+    if (heldOwner >= 0 && mySlot >= 0 && heldOwner != mySlot) return kSmOtherRecord;
+    return kSmMine;
+}
+
 }   /* namespace coopowner */

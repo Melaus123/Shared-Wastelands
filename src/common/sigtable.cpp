@@ -811,4 +811,68 @@ int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, 
     return (int)nr;
 }
 
+int SigSubset(const SigFile& f, const char* const* names, const char* const* feature, int n, SigFile* out,
+              std::vector<std::string>* absent)
+{
+    *out = SigFile();
+    out->sigversion = f.sigversion;
+    out->badLines = f.badLines;
+    out->firstBadLine = f.firstBadLine;
+    out->firstBad = f.firstBad;
+    int missing = 0, k;
+    std::vector<int> pick(f.rows.size(), -1);   /* f's row index -> its index in out, or -1 */
+    for (k = 0; k < n; ++k)
+    {
+        const std::string want = names[k] != 0 ? names[k] : "";
+        std::size_t i;
+        for (i = 0; i < f.nosig.size(); ++i)
+            if (f.nosig[i] == want) out->nosig.push_back(want);
+        for (i = 0; i < f.rows.size() && f.rows[i].name != want; ++i) {}
+        if (i == f.rows.size())
+        {
+            bool nosig = false;
+            std::size_t s;
+            for (s = 0; s < f.nosig.size(); ++s) if (f.nosig[s] == want) nosig = true;
+            if (!nosig) { ++missing; if (absent != 0) absent->push_back(want); }
+            continue;
+        }
+        if (pick[i] >= 0) continue;   /* named twice: one row */
+        pick[i] = 0;
+        if (feature != 0 && feature[k] != 0) pick[i] = 1;   /* marked: its feature set below, in f's order */
+    }
+    std::size_t i;
+    std::vector<int> at(f.rows.size(), -1);
+    for (i = 0; i < f.rows.size(); ++i)
+    {
+        if (pick[i] < 0) continue;
+        SigRow r = f.rows[i];
+        if (pick[i] == 1)
+            for (k = 0; k < n; ++k)
+                if (names[k] != 0 && r.name == names[k] && feature[k] != 0) { r.optional = feature[k]; break; }
+        at[i] = (int)out->rows.size();
+        out->rows.push_back(r);
+    }
+    for (i = 0; i < f.g2.size(); ++i)
+    {
+        const int o = f.g2Of[i];
+        if (o < 0 || (std::size_t)o >= at.size() || at[(std::size_t)o] < 0) continue;
+        out->g2.push_back(f.g2[i]);
+        out->g2Of.push_back(at[(std::size_t)o]);
+    }
+    for (i = 0; i < f.calls.size(); ++i)
+    {
+        const SigCall& c = f.calls[i];
+        if (c.row < 0 || (std::size_t)c.row >= at.size() || at[(std::size_t)c.row] < 0) continue;
+        std::size_t t;
+        for (t = 0; t < f.rows.size() && f.rows[t].name != c.target; ++t) {}
+        if (t == f.rows.size() || at[t] < 0) continue;   /* its target is not among the rows: no check to make */
+        SigCall m = c;
+        m.row = at[(std::size_t)c.row];
+        out->calls.push_back(m);
+    }
+    out->declaredCount = (int)out->rows.size();
+    out->declaredNosig = (int)out->nosig.size();
+    return missing;
+}
+
 }   /* namespace coopsigtab */

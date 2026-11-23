@@ -316,7 +316,7 @@ bool CaptureAppearanceRecord(::Character* c, RecordCopy* out)
     return true;
 }
 
-bool ApplyAppearanceRecord(::Character* c, const RecordCopy& rec)
+bool ApplyAppearanceRecord(::Character* c, const RecordCopy& rec, bool runUpdate)
 {
     ::GameData* gd = GetRecord(c);
     if (gd == 0) return false;
@@ -386,7 +386,7 @@ bool ApplyAppearanceRecord(::Character* c, const RecordCopy& rec)
         typedef void (*SetFn)(void*, void*);
         ((SetFn)g_setAppData)(app, gd);
     }
-    if (g_updateApp != 0)
+    if (runUpdate && g_updateApp != 0)   // T-1449 attempt 2: not before the first body build (it returns at once with no body)
     {
         typedef void (*VoidFn)(void*);
         ((VoidFn)g_updateApp)(app);

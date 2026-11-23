@@ -16,7 +16,12 @@
  *     u8 marks (kGrHasOwner | kGrHasGear | kGrHasBag | kGrMade; any other bit refuses the record) |
  *     [OWN1 block, ownerwire.h - the stolen mark] [GEM1 block, gearwire.h - uniform and crafter]
  *     [u32 length + BAG1 block, bagwire.h - a backpack's contents with its OWNL / GEML / BAGN tails; never empty]
- *   Nothing may follow the last row.
+ *   GONE BLOCK (format 3 only - T-1429 s16, F1796 design b): u32 n (<= kGrMaxGone) | n x { str name (as a row's name) | u32 slot
+ *     (the game that noted the item leaving the ground; kGrGoneSlotUnknown = not known) | u32 stamp (unix seconds of that note) }.
+ *     A gone row says 'the item of this name or key left this area's ground in play' - a MAP item (one the engine placed, not made
+ *     during play) is removed by a record apply only when a gone row names it; no row and no gone row means 'untouched', never 'gone'.
+ *   Nothing may follow the last row (format 2) or the gone block (format 3). A format-2 record (before T-1429 s16) reads as one with
+ *   no gone rows: its apply removes no map item.
  *
  * A record that is cut short, carries an unknown marker, format, flag or mark bit, names more rows than the cap, holds a row that is
  * not whole and in range, or has bytes after its last row DECODES TO REFUSED: the caller gets no header and no row - never part of
@@ -40,7 +45,7 @@
 
 namespace coopgrec {
 
-const unsigned int kProtocol = 173;            /* the world-server protocol that carries ground records and GROUND_REFUSE (format-2 rows) */
+const unsigned int kProtocol = 177;            /* the world-server protocol that carries ground records and GROUND_REFUSE (format-3 records: rows and gone rows, T-1429 s16) */
 
 
 
@@ -51,7 +56,10 @@ const unsigned int kProtocol = 173;            /* the world-server protocol that
 const unsigned int kMsgGroundRefuse = 71u;    /* world server -> the writer: its ground record was not taken, and why */
 
 const unsigned int kGrMarker = 0x31445247u;   /* 'G','R','D','1' little-endian */
-const unsigned int kGrFormat = 2u;            /* the row layout above; a record of any other format is refused */
+const unsigned int kGrFormat = 3u;            /* T-1429 s16 (F1796 design b): the rows, then the gone block; the only format written */
+const unsigned int kGrFormatNoGone = 2u;      /* the rows alone (before T-1429 s16): still read, as a record with no gone rows; any other format is refused */
+const unsigned int kGrMaxGone = 1024u;        /* gone rows per area; a list past it drops its oldest (the writer's side) */
+const unsigned int kGrGoneSlotUnknown = 0xFFFFFFFFu;   /* a gone row whose noting game's slot was not known */
 const unsigned int kGrMaxRows = 1024u;        /* rows per area; the rest are counted in the header's cut */
 const unsigned int kGrMaxBytes = 2u << 20;    /* 2 MB per record; rows that would pass it are counted in the cut */
 const unsigned int kGrHeaderBytes = 36u;
@@ -146,10 +154,20 @@ struct GroundRow
     { pos[0] = pos[1] = pos[2] = 0.0f; rot[0] = 1.0f; rot[1] = rot[2] = rot[3] = 0.0f; }
 };
 
+/* T-1429 s16 (F1796 design b): one gone row - an item of this name (or key) left the area's ground in play */
+struct GroundGone
+{
+    std::string name;      /* the item's shared name, or its key when it carried none (GrNameOk) */
+    unsigned int slot;     /* the game that noted it leaving (kGrGoneSlotUnknown = not known) */
+    unsigned int stamp;    /* unix seconds of that note */
+    GroundGone() : slot(kGrGoneSlotUnknown), stamp(0) {}
+};
+
 struct GrEncodeStats
 {
     unsigned int written, cut, invalid, gearDropped;
-    GrEncodeStats() : written(0), cut(0), invalid(0), gearDropped(0) {}
+    unsigned int goneWritten, goneCut;   /* T-1429 s16: gone rows written / left out (over kGrMaxGone or the byte cap, or an invalid name) */
+    GrEncodeStats() : written(0), cut(0), invalid(0), gearDropped(0), goneWritten(0), goneCut(0) {}
 };
 
 /* ---- the record id ---- */
@@ -231,7 +249,7 @@ inline bool GroundRowValid(const GroundRow& r)
 }
 inline bool GroundHeaderValid(const GroundHeader& h)
 {
-    return h.format == kGrFormat && (h.flags & ~kGrFlagSeed) == 0 && h.sx >= 0 && h.sx <= kGrMaxSector && h.sy >= 0 && h.sy <= kGrMaxSector
+    return (h.format == kGrFormat || h.format == kGrFormatNoGone) && (h.flags & ~kGrFlagSeed) == 0 && h.sx >= 0 && h.sx <= kGrMaxSector && h.sy >= 0 && h.sy <= kGrMaxSector
         && h.rows <= kGrMaxRows;
 }
 
@@ -294,10 +312,13 @@ inline bool GrPutRow(std::vector<char>* out, const GroundRow& in, unsigned int* 
     return true;
 }
 
-/* The record for header `h` (its flags, generation, writer slot and sector; h.cut = rows the caller already left out) and `rows`,
-   into *out (replaced). A row that cannot be written whole is left out and counted in st->invalid; rows past kGrMaxRows or
-   kGrMaxBytes are counted in the header's cut. false = nothing written (*out emptied): the header is out of range. */
-inline bool EncodeGroundRecord(std::vector<char>* out, const GroundHeader& h, const std::vector<GroundRow>& rows, GrEncodeStats* st)
+/* The record for header `h` (its flags, generation, writer slot and sector; h.cut = rows the caller already left out), `rows` and
+   `gone` (T-1429 s16), into *out (replaced), always format 3. A row that cannot be written whole is left out and counted in
+   st->invalid; rows past kGrMaxRows or kGrMaxBytes are counted in the header's cut (the gone block's count word is kept room for).
+   Gone rows past kGrMaxGone or the byte cap, or with a name GrNameOk refuses, are left out and counted in st->goneCut.
+   false = nothing written (*out emptied): the header is out of range. */
+inline bool EncodeGroundRecord(std::vector<char>* out, const GroundHeader& h, const std::vector<GroundRow>& rows, const std::vector<GroundGone>& gone,
+                               GrEncodeStats* st)
 {
     GrEncodeStats s;
     if (out == 0) return false;
@@ -322,14 +343,32 @@ inline bool EncodeGroundRecord(std::vector<char>* out, const GroundHeader& h, co
         unsigned int gd = 0;
         if (!GrPutRow(&one, rows[i], &gd)) { ++s.invalid; continue; }
         s.gearDropped += gd;
-        if (out->size() + one.size() > (size_t)kGrMaxBytes) { ++cut; ++s.cut; continue; }
+        if (out->size() + one.size() + 4u > (size_t)kGrMaxBytes) { ++cut; ++s.cut; continue; }
         out->insert(out->end(), one.begin(), one.end());
         ++s.written;
     }
     GrSetU32(out, kGrRowCountAt, s.written);
     GrSetU32(out, kGrCutAt, cut);
+    const size_t goneAt = out->size();   /* T-1429 s16: the gone block */
+    GrPutU32(out, 0u);
+    for (size_t i = 0; i < gone.size(); ++i)
+    {
+        if (s.goneWritten >= kGrMaxGone || !GrNameOk(gone[i].name)) { ++s.goneCut; continue; }
+        std::vector<char> one;
+        GrPutStr(&one, gone[i].name);
+        GrPutU32(&one, gone[i].slot);
+        GrPutU32(&one, gone[i].stamp);
+        if (out->size() + one.size() > (size_t)kGrMaxBytes) { ++s.goneCut; continue; }
+        out->insert(out->end(), one.begin(), one.end());
+        ++s.goneWritten;
+    }
+    GrSetU32(out, goneAt, s.goneWritten);
     if (st) *st = s;
     return true;
+}
+inline bool EncodeGroundRecord(std::vector<char>* out, const GroundHeader& h, const std::vector<GroundRow>& rows, GrEncodeStats* st)
+{
+    return EncodeGroundRecord(out, h, rows, std::vector<GroundGone>(), st);
 }
 
 /* The header alone (the first kGrHeaderBytes bytes) - what the world server reads back from a stored record's file. */
@@ -342,7 +381,7 @@ inline int DecodeGroundHeader(const char* p, size_t size, GroundHeader* out)
     GrGet4(p, size, &off, &marker);
     if (marker != kGrMarker) return kGrBadMarker;
     GrGet4(p, size, &off, &h.format);
-    if (h.format != kGrFormat) return kGrBadFormat;
+    if (h.format != kGrFormat && h.format != kGrFormatNoGone) return kGrBadFormat;   /* T-1429 s16: format 2 still reads (no gone rows) */
     GrGet4(p, size, &off, &h.flags);
     GrGet4(p, size, &off, &h.generation);
     GrGet4(p, size, &off, &h.writerSlot);
@@ -403,8 +442,9 @@ inline bool GrGetRow(const char* p, size_t size, size_t* off, GroundRow* out)
     return true;
 }
 
-/* The whole record. kGrOk: *hOut and *rowsOut hold it; anything else: refused, and neither output is touched. */
-inline int DecodeGroundRecord(const char* p, size_t size, GroundHeader* hOut, std::vector<GroundRow>* rowsOut)
+/* The whole record. kGrOk: *hOut, *rowsOut and *goneOut (T-1429 s16: empty for a format-2 record) hold it; anything else: refused,
+   and no output is touched. A gone row must be whole, with a name GrNameOk takes; more than kGrMaxGone is refused. */
+inline int DecodeGroundRecord(const char* p, size_t size, GroundHeader* hOut, std::vector<GroundRow>* rowsOut, std::vector<GroundGone>* goneOut)
 {
     if (p == 0) return kGrShort;
     if (size > (size_t)kGrMaxBytes) return kGrTooBig;
@@ -419,10 +459,29 @@ inline int DecodeGroundRecord(const char* p, size_t size, GroundHeader* hOut, st
         if (!GrGetRow(p, size, &off, &r)) return kGrBadRow;   /* cut inside a row, or a row out of range */
         rows.push_back(r);
     }
+    std::vector<GroundGone> gone;
+    if (h.format == kGrFormat)
+    {   /* T-1429 s16: the gone block */
+        unsigned int n = 0;
+        if (!GrGet4(p, size, &off, &n)) return kGrShort;
+        if (n > kGrMaxGone) return kGrOverCap;
+        for (unsigned int i = 0; i < n; ++i)
+        {
+            GroundGone g;
+            if (!GrGetStr(p, size, &off, (unsigned int)coopground::kGroundKeyCap - 1u, &g.name) || !GrNameOk(g.name)
+                || !GrGet4(p, size, &off, &g.slot) || !GrGet4(p, size, &off, &g.stamp)) return kGrBadRow;
+            gone.push_back(g);
+        }
+    }
     if (off != size) return kGrTrailing;
     if (hOut) *hOut = h;
     if (rowsOut) rowsOut->swap(rows);
+    if (goneOut) goneOut->swap(gone);
     return kGrOk;
+}
+inline int DecodeGroundRecord(const char* p, size_t size, GroundHeader* hOut, std::vector<GroundRow>* rowsOut)
+{
+    return DecodeGroundRecord(p, size, hOut, rowsOut, 0);
 }
 inline const char* GroundDecodeWhy(int why)
 {

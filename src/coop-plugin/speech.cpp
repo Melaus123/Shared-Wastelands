@@ -11522,6 +11522,7 @@ int g_tcWinSent = 0;
 long long g_tcAsked = 0, g_tcPreloadAsked = 0, g_tcAnswered = 0, g_tcYes = 0, g_tcNo = 0, g_tcUnknown = 0, g_tcCacheUsed = 0,
           g_tcNoAnswerYet = 0, g_tcFilteredNever = 0, g_tcQueuedMax = 0;
 volatile LONG64 g_tcLocalKept = 0;
+volatile LONG64 g_tcPlayerNoTalk = 0;   /* T-1468 (ANY THREAD, in the hover's scope): another player's character answered "no talk", as the click */
 long long g_tcClickEngine = 0, g_tcSendSkipped = 0;   /* MAIN THREAD: a click / menu with no answer yet given the engine's own; an ASK not sent this pass */
 const int kTcLogAsk = 0, kTcLogAnswer = 1, kTcLogAsked = 2, kTcLogOther = 3, kTcLogKinds = 4;
 long long g_tcLogN[kTcLogKinds];
@@ -11864,11 +11865,13 @@ bool TcHover(void* dlg, void* npc)
 }
 
 /* Dialogue 0x679FC0 (ANY THREAD): passed through untouched except inside characterSelected or the order menu's build on this thread
-   for an NPC another game drives (TkS6Owner 0, not a player's character). */
+   for another player's character (T-1468: "no talk", by the speaker test the click's start refuses by - TkPlayerSpeaker,
+   detour_startPlayerConv) and for an NPC another game drives (TkS6Owner 0, not a player's character). */
 bool detour_tcCanTalk(void* dlg)
 {
     if (g_tcCsTid == 0 || g_tcCsTid != ::GetCurrentThreadId() || g_tcCapTid != 0) return orig_tcCanTalk(dlg);
     void* const npc = SayReadPtr(dlg, kDlgMe);
+    if (npc != 0 && cooptalk::TalkCursorPlayerNoTalk(TkPlayerSpeaker(npc))) { ::InterlockedIncrement64(&g_tcPlayerNoTalk); return false; }   /* T-1468: as the click */
     if (npc == 0 || TkS6Owner(npc) != 0 || TkPeerTarget(npc)) return orig_tcCanTalk(dlg);
     if (!g_tcOn || SayOnMainThread() == 0) { ::InterlockedIncrement64(&g_tcLocalKept); return orig_tcCanTalk(dlg); }
     return TcHover(dlg, npc);
@@ -12175,7 +12178,8 @@ std::string TalkCursorShow(const std::string& arg)
     for (size_t i = 0; i < g_tcWaiting.size(); ++i) if (g_tcWaiting[i].npcUid == nu) ++waiting;
     for (size_t i = 0; i < g_tcQueue.size(); ++i) if (g_tcQueue[i].npcUid == nu) ++queued;
     std::string hover;
-    if (own != 0 || player) hover = "the engine's own (not another game's NPC)";
+    if (TkPlayerSpeaker(npc)) hover = "false (another player's character: no talk, as the click - T-1468)";
+    else if (own != 0 || player) hover = "the engine's own (not another game's NPC)";
     else if (!g_tcOn) hover = "the engine's own (the talk cursor is off)";
     else if (!read) hover = "the engine's own (unreadable)";
     else if (tu == 0) hover = "the engine's own (no talker of this game's player)";
@@ -12273,8 +12277,9 @@ std::string TalkCursorCountsString()
                  "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld talkCursorHooks=canTalk:%s,choose:%s,on:%d",
                  g_tcAsked, g_tcPreloadAsked, g_tcAnswered, g_tcYes, g_tcNo, g_tcUnknown, g_tcCacheUsed, g_tcNoAnswerYet,
                  g_tcFilteredNever, (long long)g_tcLocalKept, g_tcQueuedMax, TalkHookState(g_tcCanHook), TalkHookState(g_tcChooseHook), g_tcOn);
-    char c[96];
-    std::sprintf(c, " talkCursor2[clickEngine,sendSkipped]=%lld,%lld", g_tcClickEngine, g_tcSendSkipped);
+    char c[160];
+    std::sprintf(c, " talkCursor2[clickEngine,sendSkipped,playerNoTalk]=%lld,%lld,%lld", g_tcClickEngine, g_tcSendSkipped,
+                 (long long)g_tcPlayerNoTalk);   /* T-1468 */
     char d[200];   /* T-980 */
     std::sprintf(d, " cagedRepick[tried,picked,noStandIn,lineRefused,condSwapped,notForwarded,squadSkip]=%lld,%lld,%lld,%lld,%lld,%lld,%lld",
                  g_tcSubTried, g_tcSubPicked, g_tcSubNoStandIn, g_tcSubLineRefused, (long long)g_tcSubCondSwapped, g_tcSubNotForwarded,

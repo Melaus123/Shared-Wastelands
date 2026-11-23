@@ -58,6 +58,7 @@ static unsigned long long kMig3InitGameData = 0; static coop::AddrReg kMig3InitG
 static unsigned long long kMig3TitleUpdate = 0; static coop::AddrReg kMig3TitleUpdate_reg("TitleScreen_update", &kMig3TitleUpdate);   /* Steam_1.0.65 0x9129B0 */
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
 #include "../common/modsenabled.h"   /* owner 123/124: is this copy switched on in Kenshi's mod list */
+#include "../common/rkcheck.h"   /* T-1476: the [RKCHECK] line - RE_Kenshi / KenshiLib loaded at the mod's start, which game file */
 #include <ogre/OgrePlugin.h>   /* RE_Kenshi's road waits for the launcher's OK as an Ogre plugin object */
 #include <ogre/OgreRoot.h>
 
@@ -273,8 +274,11 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::FallenTabTick();    /* T-556: the FALLEN tab after PLAYERS, kept current while it shows; a confirmed bring-back runs */
     coop::UiEditorResetTick();   /* the Level Editor's Reset Population: greyed with its hover note in a multiplayer world */
     coop::StoreEditorOffTick();  /* T-1414: a Level Editor shown in a multiplayer world is closed, through the engine's own toggle */
+    coop::UiEditorToolTick();    /* T-1462: the mod's Level Editor window - its buttons acted on, the hover note */
+    coop::BdRegenSectorTick();   /* T-1462: a 'Regenerate sector' press waiting for the engine's own job for its area */
 #ifdef SW_DEV_BUILD
     coop::BdEditorKeyTick();     /* T-1414 TEST-ONLY: an armed `editorkey` press - the close above acts on it the frame after */
+    coop::BdNavKeyLeverTick();   /* T-1462 TEST-ONLY: an armed `editorkey rebuildnav` */
 #endif
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
@@ -312,6 +316,28 @@ static void installProbeP001()
     SW_DEVLOG_OR_FAIL(st != coop::SUCCESS, st == coop::SUCCESS ? "[P001] AddHook SUCCESS" : "[P001] AddHook FAILED");   /* T-879 F: a failure in both builds */
 }
 // PROBE-END: P001
+
+/* T-1457 (owner decision 1824, F1707) - THE SWITCHED-OFF GAME'S FRAME: the engine's own frame, then REPORT A BUG's tick (its window
+   over the pause menu) and nothing else - no wait, no link, no other feature. g_frames still counts the in-world frames (the
+   "a world is running" signal the report's window and the TEST-ONLY reader read). The TEST build's switched-off reader rides it too. */
+static void detour_mainLoopReportOnly(GameWorld* thisptr, float time)
+{
+    ++g_frames;
+    orig_mainLoop(thisptr, time);
+    coop::BugReportTick(0);
+#ifdef SW_DEV_BUILD
+    coop::CommandChannelRefusedTick();   /* T-1457 TEST-ONLY: load / uimenu ingame / the REPORT A BUG clicks */
+#endif
+}
+static bool installReportOnlyFrame()
+{
+    const intptr_t target = (intptr_t)coop::AddrAbs(kMig3MainLoopGpu);
+    if (target == 0) { ErrorLog("[BUG] T-1457 report-only frame hook NOT installed: GameWorld_gpuFrame has no address"); return false; }
+    const coop::HookStatus st = coop::AddHook((void*)target, (void*)&detour_mainLoopReportOnly, (void**)&orig_mainLoop);
+    if (st == coop::SUCCESS) DebugLog("[BUG] T-1457 report-only frame hook installed: GameWorld_gpuFrame - REPORT A BUG's tick only");
+    else ErrorLog("[BUG] T-1457 report-only frame hook: AddHook on GameWorld_gpuFrame FAILED");
+    return st == coop::SUCCESS;
+}
 
 // ---------------------------------------------------------------------------
 // PROBE-START: P002 - control hook (does OUR hooking work at all?)
@@ -392,6 +418,7 @@ static bool TitleLineDue()
 #endif
 }
 
+static bool g_reportOnly = false;   /* T-1457: the switched-off game's REPORT A BUG started (StartReportOnly) - set before its hooks */
 static void detour_titleUpdate(TitleScreen* thisptr)
 {
     ++g_titleFrames;
@@ -426,6 +453,10 @@ static void detour_titleUpdate(TitleScreen* thisptr)
     if (coop::AddrOk() == 0)
     {
         coop::UiTitleTick();
+        if (g_reportOnly) coop::BugReportTick(1);   /* T-1457: REPORT A BUG on the title screen of a switched-off game (StartReportOnly) */
+#ifdef SW_DEV_BUILD
+        if (g_reportOnly) coop::CommandChannelRefusedTick();   /* T-1457 TEST-ONLY: the switched-off test build's reader */
+#endif
         orig_titleUpdate(thisptr);
         return;
     }
@@ -580,6 +611,31 @@ static void logHookCounts()
    mods copy and a Workshop copy are two modules with two sets of statics) - the name is the one thing both copies share.
    The handle is kept for the life of the process. If Windows will not create the mutex at all, this copy's own flag is the
    guard and the log says so. */
+/* T-1476 (owner 1874): a player says RE_Kenshi does nothing while this mod is on, and their log could not tell whether RE_Kenshi
+   was loaded when this mod started - this one line, written once at the start, says so (and which game file runs, by name only). */
+static void logReKenshiCheck(const char* road)
+{
+    try
+    {
+        const int rk = (::GetModuleHandleW(L"RE_Kenshi.dll") != 0) ? 1 : 0;
+        const int kl = (::GetModuleHandleW(L"KenshiLib.dll") != 0) ? 1 : 0;
+        const char* cmdLine = ::GetCommandLineA();
+        const int noRk = coopmods::CmdLineHasArg(cmdLine ? std::string(cmdLine) : std::string(), "--norekenshi") ? 1 : 0;
+        std::string exePath;   /* "" = unread: the line then says game file=unknown */
+        wchar_t wbuf[2048];
+        const DWORD n = ::GetModuleFileNameW(0, wbuf, 2048);
+        if (n > 0 && n < 2048)
+        {
+            wbuf[n] = 0;
+            char ubuf[8192];
+            const int u = ::WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, ubuf, (int)sizeof(ubuf), 0, 0);
+            if (u > 0 && u <= (int)sizeof(ubuf)) { ubuf[u - 1] = 0; exePath = ubuf; }
+        }
+        DebugLog(rkcheck::Line(road, rk, kl, noRk, exePath));
+    }
+    catch (...) {}
+}
+
 static HANDLE g_startGuard = 0;
 static volatile LONG g_startedHere = 0;
 
@@ -608,6 +664,7 @@ static bool claimStart(const char* road)
     }
     g_startGuard = h;
     DebugLog(std::string("kenshi-coop: first start in this process (") + road + ") - start-once guard held");
+    logReKenshiCheck(road);   /* T-1476: once per process, only when this copy wins the start */
     return true;
 }
 
@@ -792,9 +849,37 @@ static bool modSwitchedOn(const char* road)
 
 /* The refused road (the address gate said no): ONLY the title-screen hook, so the greyed MULTIPLAYER button carries the
    reason (owner 98). Called from startPluginOn, so both roads use it. */
+/* T-1457 (owner decision 1824, F1707): REPORT A BUG ON A SWITCHED-OFF GAME. Its rows were found and checked (AddrResolveReportRows,
+   before the title hook); the title hook is in. Then: the TEST-ONLY report service from the bench's test file (a player's install has
+   none), the report-only pause-menu hook and the report-only frame hook - and nothing else. Without the title hook the report stays
+   off (its title button and its tick ride that hook). */
+static void StartReportOnly(bool titleHooked)
+{
+    if (!titleHooked)
+    {
+        ErrorLog("kenshi-coop: T-1457 REPORT A BUG stays OFF on this switched-off game: the title screen is not hooked.");
+        return;
+    }
+    coop::ConfigReadBugRelayOnly();
+    g_reportOnly = true;
+    const int pauseHooked = coop::InstallUiPauseMenuReportOnly();
+    const bool frameHooked = installReportOnlyFrame();
+#ifdef SW_DEV_BUILD
+    const char* const reader = " except the TEST build's own (load, uimenu ingame, the REPORT A BUG clicks)";
+#else
+    const char* const reader = "";
+#endif
+    DebugLog(std::string("kenshi-coop: T-1457 REPORT A BUG on this switched-off game: the title screen's button")
+             + (pauseHooked ? " and the pause menu's row" : " (the pause menu's row is NOT: its hook did not go in)")
+             + (frameHooked ? "" : " (the window over the pause menu has no frame tick: its hook did not go in)")
+             + ". Hooks installed: the title screen, the pause menu's show, the in-world frame - REPORT A BUG only; no other hook, no"
+               " link, no command reader" + reader + "; the report sends this game's logs and files only.");
+}
+
 static void startRefused()
 {
     logEnvironment();   /* mig2 fold: after AddrInit, so it carries the fingerprint AddrInit computed */
+    const int reportRows = coop::AddrResolveReportRows();   /* T-1457: before the title hook - its rows are compared unhooked */
     const bool titleHooked = installProbeP005();
     /* T-168: say what actually happened - the button carries the reason only if the title hook went in. */
     if (titleHooked)
@@ -807,6 +892,7 @@ static void startRefused()
                  " The title screen could NOT be hooked either (see the [ADDR] and [P005] lines), so NO button"
                  " shows the reason and this log is the only place it is said. Nothing was installed and this"
                  " game behaves as unmodded Kenshi.");
+    if (reportRows == 1) StartReportOnly(titleHooked);   /* T-1457: REPORT A BUG only (its rows' [ADDR] lines say why not otherwise) */
     logHookCounts();   /* mig2 (T-155): the same totals line on this path too */
 }
 
@@ -891,6 +977,7 @@ static void startPluginOn(const char* road)
     coop::InstallNames();      /* names1: Character::setName 0x5CB840 - an owned character's rename is sent */
     coop::InstallCarryKeep();  /* T-1411 fold 2 (F1286): the keep-updated test 0x5C6F30 keeps every carried character updated */
     coop::ItemLookInstall();   /* T-1449: the [ITEMLOOK] watch - setupItemMaterial and Ogre's Material::clone, both read-only */
+    coop::InstallLoadRaidStandInHook();   /* T-1477 A1: a saved raid's missing stand-in target is made at the raid's load, before the game's lookup */
     coop::InstallFactionNameHooks();   /* T-368: the FACTION tab refuses a faction name another player of this world holds (Kenshi's own box) */
     coop::InstallCapture();    /* P11: task bodies 0x35A9C0 / 0x34E750 + the strip / dress / owner / shave hooks */
     coop::InstallSlaves();     /* slave1: setSlaveState 0x5A3EB0 + StateBroadcastData::periodicUpdate 0x5A44C0 */

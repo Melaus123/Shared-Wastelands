@@ -41,7 +41,7 @@
 
 namespace bldgrec {
 
-const unsigned int kProtocol = 173;            /* the world-server protocol that carries building records */
+const unsigned int kProtocol = 177;            /* the world-server protocol that carries building records */
 
 
 const unsigned int kBgMarker = 0x31444C42u;    /* 'B','L','D','1' little-endian */

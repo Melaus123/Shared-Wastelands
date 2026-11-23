@@ -57,6 +57,7 @@
 #include "zones.h"                         /* MyPlayerSector */
 #include "config.h"                        /* ConfigFilePlayerName */
 #include "addresses.h"                     /* AddrTableName, AddrExeFingerprint */
+#include "../common/reportroad.h"            /* T-1457: which steps of a report run on a switched-off game (ReportStepRuns) */
 #include "../common/logrotate.h"            /* the names of a launch's log parts (.start, .prev) */
 #include "../common/modversion.h"           /* the mod's version: the report's info line and the title screen's version line */
 #include "soak.h"                          /* GameplayRunning */
@@ -1551,8 +1552,13 @@ void CollectTick()
 /* =========================================================================================================================
    STARTING AND STOPPING A REPORT (MAIN THREAD)
    ========================================================================================================================= */
+/* T-1457 (owner decision 1824): a game the address gate switched off asks no other feature of the mod - every step of a report that
+   would is skipped (src/common/reportroad.h ReportStepRuns, kStep*), and only the logs and files are collected. */
+int Runs(int step) { return coopreport::ReportStepRuns(step, AddrOk()); }
+int g_lastAtTitle = 1;   /* T-1457: the pump the report's window last ran on (UiInner) - where a switched-off game's report is made */
 std::string WhereNow()
 {
+    if (!Runs(coopreport::kStepWhereLink)) return g_lastAtTitle ? "the title screen (the mod switched off)" : "a world (the mod switched off)";
     if (!GameplayRunning()) return "the title screen";
     return StoreLiveReady() ? "a multiplayer world" : "a single-player world";
 }
@@ -1566,8 +1572,11 @@ std::wstring FolderOfPath(const std::wstring& path)
 std::string InfoLine(const std::string& where)
 {
     const std::string table = AddrTableName(), fp = AddrExeFingerprint();
-    return std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
-           + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + where;
+    /* T-1457 (T2716): a switched-off game says only THAT it was switched off - the reason the gate gives is far over the 300-character
+       limit of both report services (src/common/reportroad.h InfoLineText) and is in the [ADDR] line of the packed log */
+    return coopreport::InfoLineText(std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint "
+                                    + (fp.empty() ? std::string("unknown") : fp) + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + where,
+                                    Runs(coopreport::kStepRefusalInfo));
 }
 /* What a report reads, gathered on the main thread: its info line, where it is made, the [KEEPER] lines, every file's path. */
 void FillJob(Job* j)
@@ -1577,6 +1586,7 @@ void FillJob(Job* j)
     j->info = InfoLine(j->where);
     j->relayMode = ConfigBugRelay();   /* T-1401 2c: TEST-ONLY bugrelay= picks the test service */
     j->relayPort = ConfigBugRelayPort();   /* ... and TEST-ONLY bugrelayport= its local copy (coopbug::RelayAddress) */
+    if (Runs(coopreport::kStepKeeper))   /* T-1457: not on a switched-off game */
     {
         /* T-910: the empty-shop repairs and every [KEEPER] line of this launch go into the report (report.txt's header, keeper-lines.txt) */
         unsigned long long keeperSeen = 0;
@@ -1586,11 +1596,12 @@ void FillJob(Job* j)
     }
     j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->crashFolders = swcrashkeep::CrashFolders(GameFolder(), FolderOfPath(j->log0), coop::KenshiSaveRoot());   /* T-1374: and Kenshi's save root, where its crash zip goes */
     for (int L = 0; L < 3; ++L) { j->logStart[L] = LogPartPath(L, cooplogrot::kPartStart); j->logMiddle[L] = LogPartPath(L, cooplogrot::kPartPrev); }
-    j->serverLog = Widen(UiServerLogPath());
+    j->serverLog = Runs(coopreport::kStepServerLog) ? Widen(UiServerLogPath()) : std::wstring();   /* T-1457: not on a switched-off game */
     const std::wstring modFolder = FolderOfPath(j->log0);
     j->crashFolder = modFolder.empty() ? std::wstring() : modFolder + swcrashkeep::kFolderW + L"\\";
     /* T-1402: the stored copy of the reporter's map square - its names here, its files read on the worker */
-    const Sector sq = MyLastPlayerSector();
+    Sector sq; sq.x = -1; sq.y = -1;
+    if (Runs(coopreport::kStepArea)) sq = MyLastPlayerSector();   /* T-1457: no map square on a switched-off game - none of its files */
     j->haveArea = (sq.x >= 0 && sq.y >= 0) ? 1 : 0;
     j->areaX = sq.x; j->areaY = sq.y;
     j->areaMirror.clear(); j->areaServerDir.clear(); j->areaStamp.clear(); j->areaServerWhy.clear();
@@ -1621,7 +1632,8 @@ void StartJob(const std::string& desc, int sendOnly)
     *StopOf(gen) = 0;
     g_gen = gen;
     std::string note;
-    const int asked = sendOnly ? 0 : AskNearby(gen, 0, &note);
+    if (!sendOnly && !Runs(coopreport::kStepAskNearby)) note = "none asked (the mod is switched off in this game)";   /* T-1457 */
+    const int asked = (sendOnly || !Runs(coopreport::kStepAskNearby)) ? 0 : AskNearby(gen, 0, &note);
     {
         Lock l;
         g_sh.gen = gen; g_sh.phase = sendOnly ? kPhSending : kPhPreparing; g_sh.pct = 0; g_sh.ok = 0; g_sh.failKind = 0; g_sh.failCode = 0;
@@ -1631,7 +1643,7 @@ void StartJob(const std::string& desc, int sendOnly)
     Job* j = new Job;
     j->gen = gen; j->sendOnly = sendOnly; j->desc = desc;
     FillJob(j);
-    if (!sendOnly) { coop::ReportEverythingForReport(); coop::ReportFarm(); }   /* T-1401: EVERY report counter set (building hits, items, doors, store ... -
+    if (!sendOnly && Runs(coopreport::kStepCounters)) { coop::ReportEverythingForReport(); coop::ReportFarm(); }   /* T-1401: EVERY report counter set (building hits, items, doors, store ... -
                                                                                  what `report` writes, the door totals and reload[...] among them) and the
                                                                                  [FARM] / [MINE] totals go into the log this report packs */
     const uintptr_t t = _beginthreadex(NULL, 0, &JobMain, j, 0, NULL);
@@ -2517,6 +2529,7 @@ __declspec(noinline) void UiInner(int atTitle)
 {
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (gui == 0) return;
+    g_lastAtTitle = atTitle;   /* T-1457 */
     if (atTitle) TitleButtonTick(gui);
     int act = (int)::InterlockedExchange(&g_act, kActNone);
     int esc = (int)::InterlockedExchange(&g_esc, 0);
@@ -2634,7 +2647,7 @@ void BugReportTick(int atTitle)
 {
     if (::InterlockedCompareExchange(&g_off, 0, 0) != 0) return;
     CsInit();
-    try { CollectTick(); AnswerTick(); ThreadTick(); ThreadUploadPump(); }
+    try { if (Runs(coopreport::kStepLiveTicks)) { CollectTick(); AnswerTick(); ThreadTick(); ThreadUploadPump(); } }   /* T-1457: not on a switched-off game */
     catch (...) { DebugLog("[BUG] a C++ exception in the nearby-log step; nothing more done this frame"); }
     if (UiGuarded(atTitle) != 0) Latch(atTitle ? "the title screen" : "a world");
 }

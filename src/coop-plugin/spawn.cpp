@@ -33,6 +33,7 @@
 #include "../common/poselayer.h"  /* T-307: the layer table's held state as a pose - the pick and the settle rule */
 #include "../common/aimstamp.h"   /* T-330: the owner's aim stamp, its word and the copy's step */
 #include "../common/carrykeep.h"  /* T-1411 (F1274): a body copy the copy carry holds is kept updated as if on this game's camera */
+#include "../common/carryhand.h"  /* T-1467: a carried body handed, alone, to its carrier's game - the watcher's trigger and act, OWNER AWAY's keep */
 #include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
 #include "money.h"   // T-478 step 5: MoneyHave - the purse around the selling confirm
@@ -50,7 +51,8 @@ namespace coop { bool EffectBurnOpen(unsigned int body, unsigned int carrier, bo
 namespace coop { void* ItHeldBuildingOf(void* c); }
 namespace coop { int DoorAreaHoldOf(int c); void DoorAreaCentre(int c, float* p); int StoreMySlot(); }   /* T-860: doors.cpp (the holder answer and centre of an area, as a door record is judged), store.cpp */   /* items.cpp: the building a character's held hand names (cage, pole, bed), 0 none */
 #ifdef SW_DEV_BUILD
-namespace coop { void P169NoteCopyDestroy(unsigned int uid); }   /* PROBE P169: combat.cpp - the frame and uid of the mod's last copy destroy */
+namespace coop { void P169NoteCopyDestroy(unsigned int uid); }
+namespace coop { unsigned int LeverLabelTaken(const std::string& label); }   /* items.cpp: the newest lever-made uid named <label> here (T-1467 spawncontainer with:) */   /* PROBE P169: combat.cpp - the frame and uid of the mod's last copy destroy */
 #ifdef SW_DEV_BUILD
 // PROBE-START: P172 - the roster's squad and captivity fields: store.cpp (the squad's id and the registry's verdict), items.cpp (captlist's reads)
 namespace coop { std::string StoreP172SquadRow(void* platoon); std::string ItP172CaptFields(void* c); }
@@ -208,6 +210,9 @@ bool g_spawnKeepContainer = true;
 // TEST-ONLY (`spawncontainer new`): an explicit-faction local spawn goes into a fresh empty squad of that faction, made here
 // by the engine's Faction::spawnEmptySquad - so a test's character is not placed into a nearby squad another game runs.
 bool g_spawnNewSquad = false;
+// T-1467 TEST-ONLY (DEV build, `spawncontainer with:<label>`): an explicit-faction local spawn goes into the NPC squad of the lever-made
+// character <label> this game runs - two or more lever-made people in one NPC squad (a fight's squad). Empty = off.
+std::string g_spawnWithLabel;
 
 coopuid::UidMinter g_uidMint;   // M4 (owner 203, 2026-09-29): the 22-bit counter (last minted; monotonic, never wraps) and the counted refusals; the slot is read at each mint
 long long g_uidRowSkipped = 0, g_uidBlockBadReply = 0, g_uidBlockFailed = 0, g_uidNoSeatAnswers = 0; bool g_uidNoSeatSaid = false;   // M4 fold: minted uids skipped for an existing row (must read 0); UID_BLOCK answers malformed / for another slot; FAILED answers
@@ -1470,6 +1475,31 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
             return false;
         }
     }
+    // T-1467 TEST-ONLY `spawncontainer with:<label>`: the person goes into the squad of the lever-made <label> - only an NPC squad of the
+    // named faction that THIS game runs (its first member made here), so the squad is a fight's enemy squad, never a player's. MAIN THREAD.
+    unsigned int withUid = 0;
+    if (newSquad == 0 && !g_spawnWithLabel.empty() && !g_spawnFactionName.empty())
+    {
+        std::string why;
+        withUid = LeverLabelTaken(g_spawnWithLabel);
+        ::Character* wc = (withUid != 0) ? FindSpawned(withUid) : 0;
+        void* wap = (wc != 0 && PlausibleObject(wc)) ? SquadActivePlatoonOf(wc) : 0;
+        SquadView wv;
+        ::Faction* nf = ResolveWireFaction(g_spawnFactionName);
+        if (EngineWritesBlocked()) why = "a world is loading or tearing down";
+        else if (withUid == 0) why = "no lever-made character is labelled '" + g_spawnWithLabel + "' here";
+        else if (wc == 0 || !PlausibleObject(wc)) why = "its character (uid " + S(withUid) + ") is not loaded here";
+        else if (!net::IsUidMine(withUid)) why = "its character (uid " + S(withUid) + ") is run by the other game";
+        else if (wap == 0 || ReadSquadAt(wap, &wv) != 1) why = "its squad could not be read";
+        else if (wv.playerFlag != 0) why = "its squad is a player squad";
+        else if (!PlausibleObject(nf) || wc->getOwnerFactionDirect() != nf) why = "its faction is not '" + g_spawnFactionName + "'";
+        else newSquad = (RootObjectContainer*)wap;
+        if (newSquad == 0)
+        {
+            ErrorLog("[M1] spawncontainer with:" + g_spawnWithLabel + ": no squad - " + why + "; nothing was created (uid " + S(uid) + " unused)");
+            return false;
+        }
+    }
 
     // The local spawn is where the per-instance modifier state is READ - once, here - and
     // from this point it travels explicitly rather than being re-read on the far side.
@@ -1483,7 +1513,24 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
     net::SetLocalOwner(uid);
     coop::ClearNearNoteRunUid(uid);   /* owner 1205 a: a lever's spawn is the run's own - the TEST-ONLY clearnear keeps its squad */
 
-    if (newSquad != 0)
+    if (newSquad != 0 && withUid != 0)
+    {   /* T-1467 TEST-ONLY `spawncontainer with:<label>`: the person must now be in <label>'s squad, an NPC squad of 2+ run here */
+        ::Character* made = FindSpawned(uid);
+        ::Character* wc = FindSpawned(withUid);
+        SquadView sv;
+        const int read = (made != 0 && PlausibleObject(made)) ? ReadSquadAt((void*)newSquad, &sv) : 0;
+        const int inIt = (made != 0 && SquadActivePlatoonOf(made) == (void*)newSquad) ? 1 : 0;
+        const int labelLeads = (read == 1 && wc != 0 && sv.leader == wc) ? 1 : 0;
+        const int ok = (read == 1 && inIt == 1 && sv.count >= 2 && sv.playerFlag == 0 && net::IsUidMine(uid)) ? 1 : 0;
+        std::ostringstream ls;
+        ls.imbue(std::locale::classic());
+        ls << "[M1] spawncontainer with: uid " << uid << " made into the squad (" << P((const void*)newSquad) << ") of '" << g_spawnWithLabel
+           << "' uid " << withUid << " faction '" << g_spawnFactionName << "' inSquad=" << inIt << " members=" << (read == 1 ? sv.count : -1)
+           << " playerSquad=" << (read == 1 ? sv.playerFlag : -1) << " leaderIs" << g_spawnWithLabel << "=" << labelLeads
+           << " runHere=" << (net::IsUidMine(uid) ? 1 : 0) << (ok ? " - OK" : " - NOT as asked");
+        if (ok) DebugLog(ls.str()); else ErrorLog(ls.str());
+    }
+    else if (newSquad != 0)
     {
         // The new squad must hold only this person, as its leader, and be no player squad; this game runs the person, so the
         // squad's leader is run here and no follow-leader hand-over moves it to another game.
@@ -1787,6 +1834,9 @@ bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName, const s
        has no placement to read - it stands in the squad it was handed over with. Counted (copyJoinSkippedIgnored), never copyJoinGiven. */
     if (createIgnored) CopyJoinSkippedIgnored(uid);
     else CopyJoinedLine(uid, ctxUsed ? 1 : 0, (const void*)ctxContainer, ctxRowStale);   /* T-1318 attempt 5: where the copy went */
+    /* T-1449 attempt 2 (F1829): a copy this SPAWN just made carries the game's random kit and no body yet - its first body build waits
+       for its owner's look and kit (appearance.cpp FirstBuildHoldBegin; released on an event, never a timer) */
+    if (!createIgnored) FirstBuildHoldBegin(uid, FindSpawned(uid));
 
     // F152 - THE LINE THAT WAS MISSING, and it is the whole of that finding.
     //
@@ -2072,8 +2122,14 @@ long long g_proneParkedRebuild     = 0;  // crash1: a knockdown parked because K
 long long g_proneLooksTimeout      = 0;  // crash1: knockdowns let through after waiting coopkolook::kFirstLookWaitMs for the looks
 long long g_latchHeld              = 0;  // crash1: STATEs whose knock-out latch was held back (review-crash1 MEDIUM-2)
 long long g_latchAppliedAfterPark  = 0;  // T-601 D1: held latches ProneParkTick applied with their parked pose
-std::map<unsigned int, bool> g_koPoseLeft;   // copies whose knock-out pose was left to their own engine this knockdown
-long long g_koPoseLeftToEngine     = 0;  // knock-out poses left to the copy's own engine (kolook.h LeaveKoPoseToEngine)
+std::map<unsigned int, bool> g_koPoseLeft;   // copies whose knock-out pose was left to their own engine this knockdown (value unused since T3024: the lines are g_koPoseLogSeen's)
+long long g_koPoseLeftToEngine     = 0;  // knock-out poses left to the copy's own engine, first time this knockdown (kolook.h KoPoseRoad)
+long long g_koPoseLeftAgain        = 0;  // T-540: later STATEs of the same knockdown that still found the ragdoll bit off - left again
+long long g_koPoseWroteOnRagdoll   = 0;  // T-540: a pose left before, written once the copy's ragdoll bit was on
+long long g_koPoseLogged           = 0;  // T-540: "[M4] KO pose" lines so far (first kKoPoseLogCap, then one "cap reached" line)
+const long long kKoPoseLogCap      = 200;
+long long g_koPoseRoadWrite[2]     = { 0, 0 };   // T-540 (T3024, log only): pose-4 writes onto a copy, ragdoll bit on / unreadable (kolook.h KoPoseWriteSlot)
+std::map<unsigned int, unsigned int> g_koPoseLogSeen;   // T-540 (T3024, log only): the [M4] KO pose kinds written this knockdown, per copy (kolook.h KoPoseLogFirst); dropped when the owner's STATE is not pose 4
 long long g_latchParkLogged        = 0;  // T-601 D1: "[M4] knock-out latch applied (parked)" lines so far (first 20, then counted)
 // crash1c (review-crash1b R3c): rebuildSeen/rebuildSince = when the rebuild flag (KnockdownWait 1) was first seen in this
 // hold; stuckNoted = the 10 s "rebuild flag stuck" line was written for this hold. The hold itself never ends on time.
@@ -3683,6 +3739,9 @@ int DropPeerOwnedCopy(unsigned int uid, int departed)
         else ++g_peerGoneAbsent;
         return -1;
     }
+    /* T-1449 fold 2 (review 3): its owner's game is gone (a departure or a link loss) - no look or kit will come from it; a withdrawn copy
+       (below) stays with its row, so its held first build is released here, a destroyed one's mark then goes with it */
+    FirstBuildOwnerGone(uid);
 
     bool player = false;
     if (WithdrawNotDestroy(uid, c, &player))
@@ -3697,6 +3756,7 @@ int DropPeerOwnedCopy(unsigned int uid, int departed)
         if (twinQueued) TwinSleepQueue(uid, twinsleep::kKindNeverTake);
         else UnpuppetForOwnership(uid);   // the local AI has it again, as after a handoff
         GodForgetCopy(uid);   // T-1205 review fold 10: the god mode was the gone game's word - it does not outlive it here
+        CopyKoWordOwnerGone(uid);   // T-540 D1: no awake word will come from the gone game - its knocked-out word and a knockout hold end
         ++g_peerGoneWithdrawn;
         DebugLog("[M1] peer gone: uid=" + S(uid)
                  + (player ? " - the watched player / a player-faction character" : (twinQueued ? " - a shared-save twin, queued for the twin sleep (T-1007 (J2): a departure - put to sleep)" : " - a shared-save twin"))
@@ -3892,6 +3952,7 @@ int RepeatSpawnAct(unsigned int uid, float x, float y, float z)
     return (rebuild && r == 1) ? stalecopy::kSpawnRebuild : stalecopy::kSpawnRetire;
 }
 
+long long g_farUnloadedCarryKept = 0;   /* T-1467: OWNER AWAY retires refused - the copy carries a body this game runs, its hand-over undecided */
 int RetireCopyOwnerUnloaded(unsigned int uid, float x, float y, float z)
 {
     if (net::IsUidMine(uid) || IsTwinUid(uid)) return -2;
@@ -3899,6 +3960,14 @@ int RetireCopyOwnerUnloaded(unsigned int uid, float x, float y, float z)
     if (c == 0) return -2;
     bool player = false;
     if (WithdrawNotDestroy(uid, c, &player)) return -2;
+    if (CarryFarKeepHere(uid) == 1)   /* T-1467: a copy carrier holding a body this game runs stays while the body's hand-over is undecided (read live) */
+    {
+        ++g_farUnloadedCarryKept;
+        if (g_farUnloadedCarryKept <= 40)
+            DebugLog("[M1] uid=" + S(uid) + ": its owner's character is at " + F1(x) + "," + F1(z) + ", in an area not loaded here, but this copy carries a body this game runs"
+                     " whose hand-over to the carrier's game is not decided - NOT retired (T-1467; farUnloadedCarryKept " + S(g_farUnloadedCarryKept) + ", the first 40 logged)");
+        return -2;
+    }
     /* PROBE P143 BEGIN */ const double p143MoveAge = PuppetLastMoveAgeSec(uid); /* PROBE P143 END */
     const int r = RemoveLocalCopy(uid, c, "OWNER AWAY");
     if (r == 1)
@@ -4455,13 +4524,30 @@ void SetSpawnContainerMode(int mode)
 {
     if (mode != coopspawn::kSpawnContainerNew) { SetSpawnContainer(mode != coopspawn::kSpawnContainerNull); return; }
     g_spawnNewSquad = true;
+    g_spawnWithLabel.clear();
     g_spawnKeepContainer = true;   /* overridden by the new squad whenever one is made (CreateAt's forced container) */
     DebugLog("[M1] explicit-faction local spawns will use container=a NEW empty squad of that faction (spawncontainer new, TEST-ONLY)");
+}
+
+bool SetSpawnContainerWith(const std::string& label, std::string* why)
+{   /* T-1467 TEST-ONLY (DEV build): the squad is checked at each spawn (SpawnTemplate), when the label's character must be loaded here */
+#ifdef SW_DEV_BUILD
+    g_spawnNewSquad = false;
+    g_spawnWithLabel = label;
+    g_spawnKeepContainer = true;   /* overridden by <label>'s squad whenever it is found (CreateAt's forced container) */
+    DebugLog("[M1] explicit-faction local spawns will use container=the NPC squad of lever-made '" + label + "' run here (spawncontainer with:, TEST-ONLY)");
+    return true;
+#else
+    (void)label;
+    if (why != 0) *why = "a test lever - DEV build only";
+    return false;
+#endif
 }
 
 void SetSpawnContainer(bool keep)
 {
     g_spawnNewSquad = false;
+    g_spawnWithLabel.clear();
     g_spawnKeepContainer = keep;
     DebugLog(std::string("[M1] explicit-faction spawns will use container=")
              + (keep ? "reference platoon (kept)"
@@ -5060,7 +5146,9 @@ void ReportSpawns()
        << "," << S(KnockHoldCount()) << "," << S(KnockHoldOldestMs())
        << " crash1c[knockHoldStuck]=" << S(g_knockHoldStuck)   // crash1c (R3c)
        << " latchAppliedAfterPark=" << S(g_latchAppliedAfterPark)
-       << " koPoseLeftToEngine=" << S(g_koPoseLeftToEngine);   // T-601 D1
+       << " koPoseLeftToEngine=" << S(g_koPoseLeftToEngine)   // T-601 D1
+       << " t540[koPoseLeftAgain,koPoseWroteOnRagdoll,koPoseRoadWriteBit1,koPoseRoadWriteBitUnreadable]=" << S(g_koPoseLeftAgain) << "," << S(g_koPoseWroteOnRagdoll)
+       << "," << S(g_koPoseRoadWrite[0]) << "," << S(g_koPoseRoadWrite[1]);   // T-540 (T3024): appended at the end; flat names - tools/parity_compare.py TOKEN_RE reads one [...] group
     for (std::map<unsigned int, RootObjectBase*>::const_iterator it = g_spawned.begin();
          it != g_spawned.end(); ++it)
     {
@@ -6357,6 +6445,93 @@ bool OwnBodyInBedMayBeCarried(::Character* body)
 // character carried (the owner). The old review-arrest1 MEDIUM 1 rule (put an own body down 2 s after it woke) is removed:
 // it changed the authority game's behaviour.
 void CarryKeepNote(bool on, unsigned int bodyUid, unsigned int carrierUid, const char* why);   // T-1411 (F1286), defined below
+/* T-1467 attempt 2 (owner 1870; F1964 - the engine puts a copy carrier's squad away 4 s of game time after its stored point leaves this game's
+   loaded area pulled in 160): THE ENGINE'S COUNTDOWN and ITS HOLD (carryhand.h CountdownRuns / GraceHold / GraceFreeze / GraceWriteDue).
+   The copy carrier's squad put-away grace ActivePlatoon+0xB0 is read every watcher pass (the engine's squad update runs after this watcher in
+   the same frame - T3011 A:12632-12636); while this game's offer of the carried body awaits its answer, the value is written back to where the
+   hold froze it. One entry per held body (body uid -> the frozen value). MAIN THREAD. */
+std::map<unsigned int, float> g_carryGraceHeld;
+struct CarryGracePrev { void* ap; float g; };
+std::map<unsigned int, CarryGracePrev> g_carryGracePrev;   /* fold LOW-1: body uid -> the previous pass's read of its copy carrier's squad +0xB0 */
+long long g_carryGraceCountdownOffers = 0, g_carryGraceHoldStarts = 0, g_carryGraceHoldEnds = 0, g_carryGraceWrites = 0, g_carryGraceWriteFails = 0, g_carryGraceLines = 0;
+const long long kCarryGraceLineCap = 200;
+int CarryGraceReadPod(void* ap, float* g)
+{
+    __try { *g = *(const float*)((const char*)ap + 0xB0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int CarryGraceWritePod(void* ap, float v)
+{
+    __try { *(float*)((char*)ap + 0xB0) = v; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the copy carrier's verified squad (ActivePlatoon*, handoff.cpp's reader) and its +0xB0: 1 read, 0 not (no squad / faulted) */
+int CarryGraceRead(::Character* cc, void** apOut, float* grace)
+{
+    *apOut = 0; *grace = -1.0f;
+    void* ap = cc != 0 ? SquadActivePlatoonOf(cc) : 0;
+    if (ap == 0 || CarryGraceReadPod(ap, grace) != 1) return 0;
+    *apOut = ap;
+    return 1;
+}
+std::string CarryGraceF(float v) { char b[32]; _snprintf(b, sizeof(b) - 1, "%.3f", (double)v); b[sizeof(b) - 1] = 0; return std::string(b); }
+void CarryGraceLine(const std::string& s) { if (g_carryGraceLines >= kCarryGraceLineCap) return; ++g_carryGraceLines; DebugLog(s); }
+/* the hold ends here (an event: the answer, the carrier's game gone, the carry's end) - the engine's countdown goes on from the held value */
+void CarryGraceHoldEnd(unsigned int bodyUid, unsigned int carrierUid, const char* why)
+{
+    std::map<unsigned int, float>::iterator h = g_carryGraceHeld.find(bodyUid);
+    if (h == g_carryGraceHeld.end()) return;
+    ++g_carryGraceHoldEnds;
+    CarryGraceLine("[CARRYHAND] countdown hold ENDS body uid=" + S((long long)bodyUid) + " carrier uid=" + S((long long)carrierUid) + " held=" + CarryGraceF(h->second) + " - " + std::string(why)
+                   + "; the engine's countdown goes on from the held value (holdStarts " + S(g_carryGraceHoldStarts) + " holdEnds " + S(g_carryGraceHoldEnds) + " writes " + S(g_carryGraceWrites) + ")");
+    g_carryGraceHeld.erase(h);
+}
+/* fold LOW-2: this game's watch of an own carry ends (any road): its hold ends and its previous countdown read goes */
+void CarryGraceForget(unsigned int bodyUid, unsigned int carrierUid, const char* why)
+{
+    CarryGraceHoldEnd(bodyUid, carrierUid, why);
+    g_carryGracePrev.erase(bodyUid);
+}
+/* fold LOW-1: 1 = the engine is counting this carry's copy carrier squad down - this pass's +0xB0 read is lower than the previous pass's read
+   of the SAME squad (carryhand::CountdownRuns); the read is kept for the next pass */
+int CarryGraceCountdown(unsigned int bodyUid, void* ap, int graceRead, float grace)
+{
+    std::map<unsigned int, CarryGracePrev>::iterator p = g_carryGracePrev.find(bodyUid);
+    const int prevRead = (p != g_carryGracePrev.end() && graceRead != 0 && p->second.ap == ap) ? 1 : 0;
+    const int runs = carryhand::CountdownRuns(prevRead, prevRead != 0 ? p->second.g : 0.0f, graceRead, grace);
+    if (graceRead != 0) { CarryGracePrev n; n.ap = ap; n.g = grace; g_carryGracePrev[bodyUid] = n; }
+    else if (p != g_carryGracePrev.end()) g_carryGracePrev.erase(p);
+    return runs;
+}
+/* one watcher pass of a carry kept here: hold the copy carrier's squad countdown while this game's offer of the body awaits its answer */
+void CarryGraceHoldStep(unsigned int bodyUid, unsigned int carrierUid, ::Character* cc, void* ap, int graceRead, float grace)
+{
+    const int state = HandoffCarryState(bodyUid);
+    const bool flying = HandoffPendingHas(bodyUid);
+    const int slot = net::OwnerSlotOf(carrierUid);
+    Ogre::Vector3 cp(0.0f, 0.0f, 0.0f);
+    const int cSpot = (cc != 0 && SafeReadPosition(cc, &cp)) ? IsPositionLoadedHereTri(cp.x, cp.y, cp.z) : -1;   /* fold LOW-3: the copy carrier's own spot, live */
+    if (carryhand::GraceHold(1, 1, state, flying ? 1 : 0, slot, CarryBodyIsPlayers(bodyUid) != 0 ? 1 : 0, graceRead, cSpot) == 0)
+    {
+        if (g_carryGraceHeld.find(bodyUid) != g_carryGraceHeld.end())
+            CarryGraceHoldEnd(bodyUid, carrierUid, state == carryhand::kHandGiven ? "the carrier's game took the body (ACK)"
+                                                   : (state == carryhand::kHandRefused ? "the hand-over was refused or abandoned unanswered"
+                                                   : (slot < 0 ? "the carrier's game is gone" : (!flying ? "the offer's flight ended"
+                                                   : (cSpot == 0 ? "the copy carrier's own spot left every area this game has loaded" : "the squad's countdown is not readable")))));
+        return;
+    }
+    std::map<unsigned int, float>::iterator h = g_carryGraceHeld.find(bodyUid);
+    const float frozen = carryhand::GraceFreeze(h != g_carryGraceHeld.end() ? h->second : -1.0f, grace);
+    if (h == g_carryGraceHeld.end())
+    {
+        g_carryGraceHeld[bodyUid] = frozen;
+        ++g_carryGraceHoldStarts;
+        CarryGraceLine("[CARRYHAND] countdown hold body uid=" + S((long long)bodyUid) + " carrier uid=" + S((long long)carrierUid) + " grace=" + CarryGraceF(grace) + " held=" + CarryGraceF(frozen)
+                       + " - this game's offer of the body awaits the carrier's game's answer: the copy carrier's squad is not put away meanwhile (holdStarts " + S(g_carryGraceHoldStarts) + ")");
+    }
+    if (carryhand::GraceWriteDue(grace, frozen) == 0) return;
+    if (CarryGraceWritePod(ap, frozen) == 1) ++g_carryGraceWrites; else ++g_carryGraceWriteFails;
+}
 void OwnCarryWatch(DropCarriedObjectFn drop)
 {
     (void)drop;
@@ -6367,7 +6542,35 @@ void OwnCarryWatch(DropCarriedObjectFn drop)
         ::Character* body = FindSpawned(bodyUid);
         ::Character* cc = FindSpawned(carrierUid);
         const bool mine = net::IsUidMine(bodyUid);
-        if (body != 0 && cc != 0 && mine && Carries(cc, body)) { ++it; continue; }   // still carried here: the engine decides (owner 333 a)
+        /* T-1467 (owner 1864 a / 1865 a; carryhand.h): the act is carryhand::WatchAct - keep and break as before; a body this carry's hand-over
+           gave to the carrier's game is forgotten with no carry break */
+        const int hand = HandoffCarryState(bodyUid);
+        const int act = carryhand::WatchAct(body != 0 ? 1 : 0, cc != 0 ? 1 : 0, mine ? 1 : 0, (body != 0 && cc != 0 && mine && Carries(cc, body)) ? 1 : 0, hand == carryhand::kHandGiven ? 1 : 0);
+        if (act == carryhand::kWatchKeep)   // still carried here: the engine decides (owner 333 a)
+        {
+            /* T-1467 THE TRIGGER: the body's own spot, read live from this game's body now (the engine carries it on the copy carrier's
+               shoulder), outside the areas this game has loaded -> the body alone is offered to the carrier's game. Inside them nothing changes. */
+            Ogre::Vector3 bp(0.0f, 0.0f, 0.0f);
+            const int spot = SafeReadPosition(body, &bp) ? IsPositionLoadedHereTri(bp.x, bp.y, bp.z) : -1;
+            /* T-1467 attempt 2 (owner 1870; F1964): the real fact - the engine's own countdown to put the copy carrier's squad away has
+               started (its +0xB0, read live) -> the same offer; while it awaits its answer the countdown is held (CarryGraceHoldStep) */
+            void* gap = 0; float grace = -1.0f;
+            const int gRead = CarryGraceRead(cc, &gap, &grace);
+            const int countdown = CarryGraceCountdown(bodyUid, gap, gRead, grace);   /* fold LOW-1: the engine seen counting down since the last pass */
+            if (carryhand::HandTrigger(1, 1, spot, countdown, hand, HandoffPendingHas(bodyUid) ? 1 : 0, net::OwnerSlotOf(carrierUid), CarryBodyIsPlayers(bodyUid) != 0 ? 1 : 0) != 0
+                && HandoffCarryOffer(bodyUid, carrierUid, countdown) == 1 && countdown != 0) ++g_carryGraceCountdownOffers;
+            CarryGraceHoldStep(bodyUid, carrierUid, cc, gap, gRead, grace);
+            ++it; continue;
+        }
+        if (act == carryhand::kWatchHanded)
+        {
+            CarryKeepNote(false, bodyUid, carrierUid, "this game's own body was handed to the carrier's game (T-1467): no carry break");
+            CarryLog("ended here (handed over: the carrier's game runs the body now - no break sent, T-1467)", carrierUid, bodyUid);
+            CarryGraceForget(bodyUid, carrierUid, "the carrier's game took the body (ACK)");   /* T-1467 attempt 2 */
+            HandoffCarryForget(bodyUid);
+            g_ownCarried.erase(it++);
+            continue;
+        }
         CarryKeepNote(false, bodyUid, carrierUid, "this game's engine ended the copy carrier's carry of this game's own body");   // T-1411 (F1286)
         if (body != 0 && mine) ActOwedNoteCarryEnd(bodyUid, carrierUid);   // T-859 (owner 1551 a): owed until the carrier's owner shows it
         if (body != 0 && mine && net::SendCarryBreak(bodyUid, carrierUid))
@@ -6375,6 +6578,8 @@ void OwnCarryWatch(DropCarriedObjectFn drop)
             ++g_carryBreakSent;
             CarryLog("ended here (engine ended: this game's engine no longer has the copy carrier holding this game's own body; break sent to the carrier's game)", carrierUid, bodyUid);
         }
+        CarryGraceForget(bodyUid, carrierUid, cc == 0 ? "the copy carrier is gone here" : "the carry ended here");   /* T-1467 attempt 2 */
+        HandoffCarryForget(bodyUid);   /* T-1467: the carry ended here - its hand-over state goes */
         g_ownCarried.erase(it++);
     }
 }
@@ -7196,15 +7401,110 @@ bool CopyKnockdownHeld(unsigned int uid)
     return coopkolook::KnockHoldLive(true, h->second.gaveUp, (unsigned long)(DWORD)(GetTickCount() - h->second.since));
 }
 
-// The owner's knock-out pose onto a copy that stands, not a ragdoll, is left to the copy's own engine; the next STATE that still finds it standing writes it
-// (src/common/kolook.h LeaveKoPoseToEngine); a later STATE that finds it still standing writes it. Live reads. MAIN THREAD.
+// T-540 (owner 1873 a): the engine's OWN ragdoll bit, as its posture update tests it (0x5CF620 -> 0x7D0840(Character +0x448):
+// AnimationClass +0x2F8 non-zero with bit 0; build/decomp_7d0840.txt, decomp_5cf620.txt:144; the same bytes in 1.0.65 and
+// 1.0.68). Not inRagdoll 0x7D08A0 (also yes when carried, or from +0x59 / +0x5A - F1982) and not the pose (CopyLimpPod: any
+// pose 2-4). Read only here, by the knock-out pose road; GetupIsRagdoll / CopyLimpPod and their callers are unchanged.
+// 1 on, 0 off, -1 unreadable. SEH read, no C++ object with a destructor in this frame (C2712). Any thread.
+static int KoRagdollBitPod(const void* c)
+{
+    const char* anim = 0;
+    __try { anim = *(const char* const*)((const char*)c + kR3AnimOff); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    if (!PlausibleObject(anim)) return -1;
+    __try
+    {
+        return coopkolook::KoRagdollBit((long long)*(const unsigned int*)(anim + 0x2F8));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// T-540 (T3024, LOG ONLY): the copy's live body task as PROBE P341 read it on effort/t540f (P341TaskOfBodyPod): body =
+// Character +0x648, its running task = body +0x68, the task's record = task +0x70, type = record +0x44 (int), b134 = record +0x134
+// (the byte 0x5C6290 tests before it ends a task). Returns 1 read, 0 no body or no task (*type / *b134 left -1), -1 a read
+// faulted or a pointer was misaligned. SEH reads, no C++ object with a destructor in this frame (C2712). Any thread.
+static int KoBodyTaskPod(const void* c, int* type, int* b134)
+{
+    *type = -1; *b134 = -1;
+    __try
+    {
+        const char* body = *(const char* const*)((const char*)c + 0x648);
+        if (body == 0) return 0;
+        if (((uintptr_t)body & 7) != 0) return -1;
+        const char* task = *(const char* const*)(body + 0x68);
+        if (task == 0) return 0;
+        if (((uintptr_t)task & 7) != 0) return -1;
+        const char* rec = *(const char* const*)(task + 0x70);
+        if (rec == 0 || ((uintptr_t)rec & 3) != 0) return -1;
+        *type = *(const int*)(rec + 0x44);
+        *b134 = (int)*(const unsigned char*)(rec + 0x134);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *type = -1; *b134 = -1; return -1; }
+}
+
+// T-540 (T3024, LOG ONLY): the copy's crippled byte (MedicalSystem::crippled, Character +0x458 +0x160 - P341's 'crip'). 1 / 0,
+// -1 unreadable. SEH read. Any thread.
+static int KoCrippledPod(const void* c)
+{
+    __try { return ((const MedicalSystem*)((const char*)c + 0x458))->crippled ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// T-540 (T3024, LOG ONLY): the task fields as the [M4] KO pose line ends: none (no body or no task), unreadable, or the type in hex
+static std::string KoTaskText(int got, int type, int b134)
+{
+    if (got == 0) return " taskType=none b134=-1";
+    if (got < 0) return " taskType=unreadable b134=-1";
+    char b[24]; _snprintf(b, sizeof(b), "0x%X", (unsigned int)type); b[sizeof(b) - 1] = 0;
+    return std::string(" taskType=") + b + " b134=" + S((long long)b134);
+}
+
+// The owner's knock-out pose onto a copy is written only onto a body whose ragdoll bit (KoRagdollBitPod) is on; while the bit
+// is off it is left to the copy's own engine, which knocks the copy out itself from the unconscious flag / clock the same STATE
+// gave it - the first time and at every later STATE of the knockdown that still finds the bit off (src/common/kolook.h
+// KoPoseRoad). The bit seen on at a later STATE (the copy's engine turned its ragdoll on but has not set 4) writes it then.
+// T-540 (T3024, log only): one [M4] KO pose line for EVERY decision on a pose-4 STATE, one per kind per knockdown per copy
+// (kolook.h KoPoseLogKind / KoPoseLogFirst: written, written after left, left, left again), the first kKoPoseLogCap lines and
+// then one "cap reached" line; koPoseRoadWrite[bit1,bitUnreadable] counts every pose-4 write by its bit. Live reads.
+// MAIN THREAD.
 static bool KoPoseLeftToEngine(unsigned int uid, Character* c, int prone, bool latchDowns)
 {
     const bool leftBefore = g_koPoseLeft.find(uid) != g_koPoseLeft.end();
-    if (!coopkolook::LeaveKoPoseToEngine(prone, latchDowns, GetupIsRagdoll(c), CopyLimpPod(c) != 0 ? 1 : 0, leftBefore))
-    { g_koPoseLeft.erase(uid); return false; }
-    g_koPoseLeft[uid] = true; ++g_koPoseLeftToEngine;
-    return true;
+    const int bit = KoRagdollBitPod(c);
+    const int road = coopkolook::KoPoseRoad(prone, latchDowns, bit, leftBefore);
+    if (road == coopkolook::kKoPoseWrite)
+    {
+        g_koPoseLeft.erase(uid);
+        if (leftBefore && prone == 4 && bit == 1) ++g_koPoseWroteOnRagdoll;
+    }
+    else if (road == coopkolook::kKoPoseLeaveFirst)
+    { g_koPoseLeft[uid] = false; ++g_koPoseLeftToEngine; }
+    else
+        ++g_koPoseLeftAgain;   // a copy that stays up repeats it at every STATE; the counter counts them all
+    const int slot = coopkolook::KoPoseWriteSlot(prone, road, bit);
+    if (slot >= 0) ++g_koPoseRoadWrite[slot];
+    if (prone == 4 && g_koPoseLogged < kKoPoseLogCap)
+    {
+        const int kind = coopkolook::KoPoseLogKind(road, leftBefore);
+        if (coopkolook::KoPoseLogFirst(&g_koPoseLogSeen[uid], kind))
+        {
+            ++g_koPoseLogged;
+            int taskType = -1, b134 = -1;
+            const int gotTask = KoBodyTaskPod(c, &taskType, &b134);
+            // the old pose-road reads beside the bit, log only (inRagdoll, limp = any pose 2-4); the task read last (P341's)
+            DebugLog("[M4] KO pose uid=" + S((long long)uid) + " " + coopkolook::KoPoseLogKindText(kind)
+                     + " poseBefore=" + S((long long)(int)c->poseState()) + " ragBit=" + coopkolook::KoRagBitText(bit)
+                     + " crippled=" + S((long long)KoCrippledPod(c)) + " latch=" + S((long long)(latchDowns ? 1 : 0))
+                     + " inRagdoll=" + S((long long)GetupIsRagdoll(c)) + " limp=" + S((long long)CopyLimpPod(c))
+                     + " (koPoseLeftToEngine=" + S(g_koPoseLeftToEngine) + " koPoseLeftAgain=" + S(g_koPoseLeftAgain)
+                     + " koPoseWroteOnRagdoll=" + S(g_koPoseWroteOnRagdoll) + " koPoseRoadWrite=" + S(g_koPoseRoadWrite[0])
+                     + "," + S(g_koPoseRoadWrite[1]) + ")" + KoTaskText(gotTask, taskType, b134));
+            if (g_koPoseLogged == kKoPoseLogCap)
+                DebugLog("[M4] KO pose cap reached (" + S(kKoPoseLogCap) + " lines); the counters go on in REPORT t540[...]");
+        }
+    }
+    return road != coopkolook::kKoPoseWrite;
 }
 
 static long long KnockHoldCount() { return (long long)g_knockHold.size(); }
@@ -7417,6 +7717,9 @@ bool ApplyState(unsigned int uid, const float* parts, int count, float blood,
 
     Character* c = FindSpawned(uid);
     if (c == 0 || !PlausibleObject(c)) return false;
+    // T-540 D1: the owner's prone for the copy's 'safe to get up' answer (medical.cpp) - every STATE, applied or refused below, as the
+    // knocked-out word is (crash1c R3a), so a refused STATE cannot leave an old 'playing dead' holding the copy.
+    CopyNoteOwnerProne(uid, prone);
     // C2 (read-KO): from here to every return, this thread is applying the owner's STATE - the puppet
     // knockout gate lets startKnockoutTimer / knockout through for it (medical.h ApplyingOwnerState).
     ApplyingOwnerState applyingOwner;
@@ -7447,6 +7750,7 @@ bool ApplyState(unsigned int uid, const float* parts, int count, float blood,
     int before = (int)c->poseState();
     if (outWasProne) *outWasProne = before;
     if (before == prone) g_koPoseLeft.erase(uid);
+    if (prone != 4) g_koPoseLogSeen.erase(uid);   // T-540 (T3024, log only): the owner is not knocked out - the next knockdown logs afresh
     // K1 (read-carry) item 2: the owner's word on what this copy carries; CarryApplyTick acts on it.
     NoteCarryWant(uid, c, carryingUid, fromPeer);
     // R3 (read-ragdoll) item 2: the owner's rest position; RestApplyTick acts on it.
@@ -7592,6 +7896,43 @@ unsigned int CarryingUidOf(unsigned int uid)
     if (!CarryReadHandId(c, kCarryHandIdOff, id)) return 0;
     return UidByHandId(id, 0);
 }
+/* T-1467: the registered character whose carry hand names `bodyUid` here (0 = none) - the carrier's game's live read at a carry hand-over's
+   take and at its refusal's end. Reads only. MAIN THREAD. */
+unsigned int CarrierOfBodyHere(unsigned int bodyUid)
+{
+    if (bodyUid == 0) return 0;
+    for (int i = 0; i < MirrorCapacity(); ++i)
+    {
+        unsigned int u = 0;
+        ::Character* ch = 0;
+        if (!MirrorSlot(i, &u, &ch) || u == 0 || u == bodyUid || !PlausibleObject(ch) || !CarryFlag(ch)) continue;
+        unsigned char id[kHandIdBytes];
+        if (CarryReadHandId(ch, kCarryHandIdOff, id) && UidByHandId(id, 0) == bodyUid) return u;
+    }
+    return 0;
+}
+/* T-1467 OWNER AWAY's keep (carryhand::FarRetireKeep): 1 = this game's copy `carrierUid` carries a body this game runs whose carry hand-over
+   is not refused - read live from what the copy carries now. MAIN THREAD. */
+int CarryFarKeepHere(unsigned int carrierUid)
+{
+    if (carrierUid == 0 || net::IsUidMine(carrierUid)) return 0;
+    const unsigned int body = CarryingUidOf(carrierUid);
+    return carryhand::FarRetireKeep((body != 0 && net::IsUidMine(body)) ? 1 : 0, body != 0 ? HandoffCarryState(body) : (int)carryhand::kHandNone,
+                                    body != 0 && CarryBodyIsPlayers(body) != 0 ? 1 : 0);
+}
+/* T-1467 review fold HIGH-2: 1 = the registered character `uid` is a player's (this game's own player faction - HandoffTick's decision-23
+   test - or another player's stand-in faction), 0 = not, -1 = not here / unread (every caller treats -1 as a player's: no change).
+   T-1467 fold 2: the stand-in table is empty after a world load until faction lookups refill it, so a faction whose RECORD id names a
+   player (StandInRecordSlot: >= 0 a player's slot, -2 the old two-player id) or cannot be read (-3) is a player's too - only -1 (any other id) is not. */
+int CarryBodyIsPlayers(unsigned int uid)
+{
+    ::Character* c = uid != 0 ? FindSpawned(uid) : 0;
+    if (!PlausibleObject(c)) return -1;
+    ::Faction* f = c->getOwnerFactionDirect();
+    if (!PlausibleObject(f)) return -1;
+    if (IsPlayerFaction(f) || IsStandInFaction(f)) return 1;
+    return StandInRecordSlot(f) != -1 ? 1 : 0;
+}
 
 namespace { bool BedPendingFor(unsigned int uid, unsigned int carrierUid); }   // a bed request for an own body from the carrier's game (arrest2 block below)
 namespace { void BedAskAtPutDown(unsigned int uid); }   // the rescuer's bed ask at the carry's end (arrest2 block below)
@@ -7699,6 +8040,7 @@ void CarryWatchTick()
         if (now != 0) ActOwedNotePickup(now);   // T-860 fold 1: a pick-up here is the newest "where it is held" act of that character
         // T-1411 fold 2 (F1286; carrykeep.h): the hook keeps any carried body updated; one keep line per edge
         if (was != 0) CarryKeepNote(false, was, uid, "this game's own carrier let go");
+        if (was != 0 && !net::IsUidMine(was)) CharParityAskOwe(was, "carry ended");   // T-1463: another game's body this carrier held - checked
         if (now != 0) CarryKeepNote(true, now, uid, "this game's own carrier picked it up");
         if (was != 0)   /* T-1262: the let-go memo (BurnCarrierOf) */
         {
@@ -7811,6 +8153,7 @@ int BurnOwnBody(unsigned int bodyUid, unsigned int carrierUid, unsigned int* hel
         if (net::IsUidMine(cu)) OwnDropWhyNote(cu, "burn (the body's game asked: fed into a corpse furnace there)");
     }
     g_ownCarried.erase(bodyUid);   /* arrest1's watch of an own body carried by a copy ends with the body */
+    CarryGraceForget(bodyUid, carrierUid, "the body is removed here (burn)");   /* T-1467 attempt 2 fold LOW-2 */
     ::GameWorld* w = GameWorldPtr();
     if (w == 0) return -1;
     TalkWindowBeforeRemove(body);   /* T-831: a conversation the dialogue window shows that names the body ends first */
@@ -7910,7 +8253,7 @@ void CarryApplyTick()
                 drop(cc, true, false);   // the owner put it down: ragdoll it where it is
                 ++g_carryDropped;
                 if (held != 0) CarryKeepNote(false, held, carrierUid, "put-down (the carrier's game says it carries nothing)");   // T-1411 (F1286)
-                if (held != 0) g_ownCarried.erase(held);   // arrest1 (review MEDIUM 2): the carrier's game ended it - no break
+                if (held != 0) { g_ownCarried.erase(held); CarryGraceForget(held, carrierUid, "the carrier's game put it down"); }   // arrest1 (review MEDIUM 2): the carrier's game ended it - no break; T-1467 attempt 2 fold LOW-2
                 if (heldMine)   // a bed request soon after this put-down has this copy pick it up again
                 {
                     OwnDrop od; od.carrier = carrierUid; od.at = now | 1u;
@@ -7961,7 +8304,7 @@ void CarryApplyTick()
             drop(cc, true, false);
             ++g_carryDropped;
             if (held != 0) CarryKeepNote(false, held, carrierUid, "swap (the carrier's game says it carries another body)");   // T-1411 (F1286)
-            if (held != 0) g_ownCarried.erase(held);   // arrest1 (review MEDIUM 2)
+            if (held != 0) { g_ownCarried.erase(held); CarryGraceForget(held, carrierUid, "the carrier's game carries another body"); }   // arrest1 (review MEDIUM 2); T-1467 attempt 2 fold LOW-2
             CarryLog("drop (swap: the carrier's game says it carries another body)", carrierUid, held);
             ++it;
             continue;
@@ -8140,7 +8483,7 @@ void CarryApplyTick()
         if (BeingCarried(body))
         {
             ++g_carryApplied;
-            if (bodyMine) { ++g_carryOwnApplied; OwnCarry oc; oc.carrier = carrierUid; oc.awakeSince = 0; g_ownCarried[w.body] = oc; }   // arrest1: watched from here on
+            if (bodyMine) { ++g_carryOwnApplied; OwnCarry oc; oc.carrier = carrierUid; oc.awakeSince = 0; g_ownCarried[w.body] = oc; if (!HandoffPendingHas(w.body)) HandoffCarryForget(w.body); }   // arrest1: watched from here on; T-1467 fold: a new carry's hand-over starts afresh - fold 2: not while this game's offer of it awaits its answer (the answer settles that state)
             if (bodyMine) g_ownDroppedBy.erase(w.body);   // carried again: no earlier put-down left to pick it up from
             CarryLog(bodyMine ? "apply (own body)" : "apply", carrierUid, w.body);   // pick-up on the carrier's game's word (owner 1783: 'apply' = picked up)
             CarryKeepNote(true, w.body, carrierUid, bodyMine ? "the copy carrier picked up this game's own body" : "the copy carrier picked up the body");   // T-1411 (F1286)
@@ -8190,6 +8533,8 @@ std::string CarryReportToken()
          // PROBE-START: P158
          + P158ReportToken()
          // PROBE-END: P158
+         + " carryGrace[countdownOffers,holdStarts,holdEnds,writes,writeFails,heldNow]=" + S(g_carryGraceCountdownOffers) + "," + S(g_carryGraceHoldStarts) + "," + S(g_carryGraceHoldEnds)
+         + "," + S(g_carryGraceWrites) + "," + S(g_carryGraceWriteFails) + "," + S((long long)g_carryGraceHeld.size())   /* T-1467 attempt 2 (fold: last in the token) */
          ;
 }
 
@@ -12840,6 +13185,7 @@ void BedHandoffStart(const PrisonOp& op, ::Character* c, ::Character* cc)
         if (Carries(cc, c))
         { BedSendRefused(op.uid, op.peer, std::string(op.bedKey), false, "the rescuer's copy did not let go here"); return; }
         g_ownCarried.erase(op.uid);   // this put-in ends the carry: no carry break to the carrier's game
+        CarryGraceForget(op.uid, FindSpawnedUid(cc), "the body is put into a bed");   /* T-1467 attempt 2 fold LOW-2 */
     }
     if (BedGetDroppedPod(c) < 0) ++g_poseBedFaulted;
     ++g_bedDropPosted;
@@ -16965,21 +17311,37 @@ int PlatoonIdWritePod(void* platoon, const std::string* id)   /* pointer in, no 
     __try { *(std::string*)((char*)platoon + 0x78) = *id; return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* T-1474: every-faction holder search (defined below, beside CollectCopyIdHolders; same namespace - C2668) */
+int SquadIdHeldAnywhere(void* self, const std::string& id, copysq::IdHolder* holder, long long* unread);
+long long g_staleIdSkippedClashElsewhere = 0, g_staleIdWalkUnread = 0;   /* T-1474: clashes found only by the every-faction walk; walks that could not run */
 void CarryPeerPlatoonId(Faction* faction, void* platoon, const std::string& id)
 {
     void* awake = FindAwakePlatoon(faction, id);
-    const int clash = ((awake != 0 && awake != platoon) || FindSleepingPlatoon(faction, id) != 0) ? 1 : 0;
+    const int sameFac = ((awake != 0 && awake != platoon) || FindSleepingPlatoon(faction, id) != 0) ? 1 : 0;
+    /* T-1474 (H-T1474-idclash, owner 1872 a): copying the other game's RAW id is a departure from per-game id spaces (copysquadid.h
+       IdHolder) - kept, but refused when ANY squad here holds the id, in any faction (this game's own player squads included): the
+       save keeps one squad file per id.  The same-faction test runs first, unchanged; the walk only when it found nothing. */
+    copysq::IdHolder holder; long long walkUnread = 0;
+    const int anywhere = (id.empty() || sameFac != 0) ? 0 : SquadIdHeldAnywhere(platoon, id, &holder, &walkUnread);
+    if (anywhere == -1) ++g_staleIdWalkUnread;
+    const int where = copysq::CopiedIdClash(sameFac, anywhere);
+    const int clash = where != copysq::kCopiedIdFree ? 1 : 0;
     GameData* state = (GameData*)PlatoonStatePod(platoon);
     const int d = coopsp::CarryIdDecide(id.empty() ? 1 : 0, PlausibleObject(state) ? 1 : 0, clash);
     if (d == coopsp::kCarrySkipEmpty) return;
     int r = d;
     if (r == coopsp::kCarryYes && PlatoonIdWritePod(platoon, &id) != 1) r = coopsp::kCarrySkipNoState;   /* the live field faulted */
-    if (r == coopsp::kCarrySkipClash) ++g_staleIdSkippedClash;
+    if (r == coopsp::kCarrySkipClash) { ++g_staleIdSkippedClash; if (where == copysq::kCopiedIdHeldElsewhere) ++g_staleIdSkippedClashElsewhere; }
     else if (r == coopsp::kCarrySkipNoState) ++g_staleIdSkippedNoState;
     else { state->stringFields["platoon stringID"] = id; ++g_staleIdCarried; }
+    const std::string clashText = where == copysq::kCopiedIdHeldElsewhere
+        ? "NOT carried - a squad of faction '" + holder.faction + "'" + (holder.own != 0 ? std::string(" (this game's own player faction)") : std::string()) + " platoon " + P((void*)holder.platoon)
+          + " holds that id (one save file per squad id - T-1474)"
+        : std::string("NOT carried - another squad of the faction holds that id");
     DebugLog("[STALE] context squad " + P(platoon) + " id='" + id + "': "
-             + (r == coopsp::kCarryYes ? "carries the other game's id (live field + saved entry)" : (r == coopsp::kCarrySkipClash ? "NOT carried - another squad of the faction holds that id" : "NOT carried - no state record"))
-             + " carried=" + S(g_staleIdCarried) + " skippedClash=" + S(g_staleIdSkippedClash) + " skippedNoState=" + S(g_staleIdSkippedNoState)
+             + (r == coopsp::kCarryYes ? "carries the other game's id (live field + saved entry)" : (r == coopsp::kCarrySkipClash ? clashText : "NOT carried - no state record"))
+             + " carried=" + S(g_staleIdCarried) + " skippedClash=" + S(g_staleIdSkippedClash) + " skippedClashElsewhere=" + S(g_staleIdSkippedClashElsewhere)
+             + " idWalkUnread=" + S(g_staleIdWalkUnread) + " walkUnreadHere=" + S(walkUnread) + " skippedNoState=" + S(g_staleIdSkippedNoState)
              + " | same-id supersede so far: retiredAwake=" + S(g_ctxRetiredAwake) + " supersededAsleep=" + S(g_ctxSupersededAsleep) + " supersedeKeptNotGiven=" + S(g_ctxSupersedeKeptNotGiven)
              + " retireSkippedSession=" + S(g_ctxRetireSkippedSession) + " retireFailed=" + S(g_ctxRetireFailed) + " ownIdRefused=" + S(g_ctxSupersedeOwnIdRefused) + " handedOverSupersede=" + S(g_ctxHandedOverSupersede) + " handedOverKeptMine=" + S(g_ctxHandedOverKeptMine) + " ownIdReloadLifted=" + S(g_ctxOwnIdReloadLifted) + " ownIdLiftWithheldLowerSeat=" + S(g_ctxOwnIdLiftWithheldLowerSeat) /* [m7a3f4-sc2] */ /* [m7a3f3-sc2] */
              + " retiredReloaded=" + S(g_staleRetiredReloaded) + " withdrawnReloaded=" + S(g_staleWithdrawnReloaded) + " keptEarlierGen=" + S(g_staleKeptEarlierGen)
@@ -17087,6 +17449,7 @@ static int FactionActiveListPod(void* faction, void*** items, unsigned* n)   /* 
 struct CopyIdHolders
 {
     std::map<std::string, int> ids;   /* id -> copysq::kHeldOwn / kHeldOther: only the copy's engine id and its fresh candidates */
+    copysq::IdHolder holder;          /* T-1474: who holds the engine id itself (its faction, this game's own named first) */
     int operator()(const std::string& id) const
     {
         std::map<std::string, int>::const_iterator it = ids.find(id);
@@ -17100,11 +17463,13 @@ struct CopyIdWalk
     long long read, unreadSquads, unreadLists;
     CopyIdWalk() : read(0), unreadSquads(0), unreadLists(0) {}
 };
-static void NoteCopyIdHolder(CopyIdHolders* h, void* platoon, bool own, const std::string& engineId, const std::string& freshPrefix, CopyIdWalk* w)
+static void NoteCopyIdHolder(CopyIdHolders* h, void* platoon, Faction* f, bool own, const std::string& engineId, const std::string& freshPrefix, CopyIdWalk* w)
 {
     std::string id;
     if (!PlausibleObject(platoon) || !PlatoonIdPod(platoon, &id) || id.empty()) { ++w->unreadSquads; return; }
     ++w->read;
+    if (id == engineId && (h->holder.found == 0 || (own && h->holder.own == 0)))   /* T-1474: the faction's name read only for a holder kept */
+        copysq::NoteIdHolder(&h->holder, engineId, id, 0, own ? 1 : 0, platoon, f->getName());
     if (copysq::IdConcerns(id, engineId, freshPrefix) == 0) return;   /* an id no answer of this check needs */
     std::map<std::string, int>::iterator it = h->ids.find(id);
     if (it == h->ids.end()) h->ids[id] = own ? copysq::kHeldOwn : copysq::kHeldOther;
@@ -17133,13 +17498,13 @@ static int CollectCopyIdHolders(void* self, const std::string& engineId, CopyIdH
         if (FactionActiveListPod((void*)f, &items, &n) != 1 || n > 4096 || (n != 0 && !PlausiblePtr(items))) ++w->unreadLists;
         else
         {
-            for (unsigned i = 0; i < n; ++i) if (items[i] != self) NoteCopyIdHolder(h, items[i], own, engineId, freshPrefix, w);
+            for (unsigned i = 0; i < n; ++i) if (items[i] != self) NoteCopyIdHolder(h, items[i], f, own, engineId, freshPrefix, w);
         }
         const lektor<Platoon*>* ul = f->unloadedSquads();
         if (ul == 0) ++w->unreadLists;
         else
         {
-            for (unsigned i = 0; i < ul->size() && i < 4096; ++i) if ((void*)(*ul)[i] != self) NoteCopyIdHolder(h, (void*)(*ul)[i], own, engineId, freshPrefix, w);
+            for (unsigned i = 0; i < ul->size() && i < 4096; ++i) if ((void*)(*ul)[i] != self) NoteCopyIdHolder(h, (void*)(*ul)[i], f, own, engineId, freshPrefix, w);
         }
     }
     return 1;
@@ -17230,7 +17595,35 @@ static int CopySquadIdCheck(Faction* faction, void* platoon, const std::string& 
     return d;
 }
 
+/* T-1474 (H-T1474-idclash, owner 1872 a; F1978 design A in one shared helper): DOES ANY SQUAD HERE BUT `self` HOLD THIS ID - every
+   faction (the faction directory, this game's own player faction, the stand-in table), awake and asleep, by the engine's id getter
+   (Platoon+0x78, the value the engine saves as "platoon stringID" and restores on load - the name the save files the squad under).
+   CollectCopyIdHolders' walk, the one CopySquadIdCheck uses.  1 held (*holder names the squad and its faction; this game's own named
+   first), 0 no squad holds it, -1 not walked (no id, or the faction directory unread).  *unread: squads / lists the walk could not
+   read.  Used by CarryPeerPlatoonId and (SquadIdHeldHere) the raid lend build. MAIN THREAD. */
+int SquadIdHeldAnywhere(void* self, const std::string& id, copysq::IdHolder* holder, long long* unread)
+{
+    *holder = copysq::IdHolder();
+    *unread = 0;
+    if (id.empty()) return -1;
+    CopyIdHolders h; CopyIdWalk w;
+    const int walked = CollectCopyIdHolders(self, id, &h, &w);
+    *unread = w.unreadSquads + w.unreadLists;
+    if (walked == 0) return -1;
+    *holder = h.holder;
+    return h.holder.found != 0 ? 1 : 0;
+}
+
 } // namespace
+/* T-1474 (spawn.h): the every-faction holder question for store.cpp (the raid lend build): SquadIdHeldAnywhere with no squad left out.
+   *holderText (may be 0): the holder's faction and address when held. MAIN THREAD. */
+int SquadIdHeldHere(const std::string& id, std::string* holderText)
+{
+    copysq::IdHolder hd; long long unread = 0;
+    const int r = SquadIdHeldAnywhere(0, id, &hd, &unread);
+    if (holderText != 0) *holderText = r == 1 ? "faction '" + hd.faction + "'" + (hd.own != 0 ? std::string(" (this game's own player faction)") : std::string()) + " platoon " + P(hd.platoon) : std::string();
+    return r;
+}
 /* T-1084: the home hook's install and its counts (the hook itself is in the namespace above, beside the home row). */
 void InstallHomeWatch()
 {
@@ -18677,10 +19070,12 @@ void SpawnWorldTeardown()
     g_proneDroppedRetired += (long long)g_proneParkMap.size();
     g_proneParkMap.clear();
     g_koPoseLeft.clear();
+    g_koPoseLogSeen.clear();   // T-540 (T3024, log only)
     // review-k1 item 4: the carry maps are claims about the same characters.
     g_carryWant.clear();
     g_p303Word.clear();   // PROBE P303
     g_ownCarried.clear();     // arrest1 (review-arrest1 LOW 4)
+    g_carryGraceHeld.clear(); g_carryGracePrev.clear();   // T-1467 attempt 2 fold LOW-2: the countdown holds and reads are per world
     g_ownDroppedBy.clear();   // the carrier copies own bodies were last put down from are per world
     g_bedHoldTest = false;    // the TEST-ONLY bedhold lever lasts one world
     g_ownRagBit.clear();      // T-178 crawl1: owned inRagdoll edges are per world

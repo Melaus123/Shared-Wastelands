@@ -378,7 +378,10 @@ bool SendState(unsigned int uid, const float* parts, int partCount,
                const float* rest,           // R3 (read-ragdoll, 48): where its ragdoll settled, 0 = none
                const coopstate::PoseWire* pose,   // POSE (read-poses, 50): the owner's in-place pose, 0 = none
                const float* hunger = 0,    // par5 (parity P5) session 79: the owner's {hunger, fed}, 0 = not carried
-               const cooplimb::LimbsWire* limbs = 0);   // LIMBS (133): the owner's four limbs, 0 = not carried
+               const cooplimb::LimbsWire* limbs = 0,   // LIMBS (133): the owner's four limbs, 0 = not carried
+               bool reliable = false);   // T-540 fold 1 R1: the reliable channel (a prone / dead change); the bytes are the same
+// T-540 fold 3: STATEs asked reliable - sent reliable, and sent unreliable because the direct link had something waiting. MAIN THREAD.
+void StateReliableCounts(long long* sent, long long* skippedBusy);
 
 // H010a (F156): replicate the authority's appearance ROLL. RELIABLE - a dropped roll leaves
 // the peer showing a different person permanently, and unlike a position it never self-heals.
@@ -393,6 +396,8 @@ bool SendState(unsigned int uid, const float* parts, int partCount,
 // fields was measured failing: updateAppearance() re-derives them from this record, so the
 // only write that survives is a write to the record.
 bool SendAppearance(unsigned int uid, const RecordCopy& rec);
+// T-1449 attempt 2: "no look (what 1) / no kit (what 2) will come for uid" - an APPEARANCE carrying the 'NOLK' flag (copybody.h).
+bool SendNoLook(unsigned int uid, int what);
 
 // The authority's WORN ITEMS (F173: item-set parity was 1/4, concentrated in the legs slot).
 // RELIABLE - like the appearance record, a dropped one leaves the peer permanently dressed as

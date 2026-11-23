@@ -50,6 +50,14 @@ bool HandSaveBlocked();
 // T-1414 (owner 1763 / 1764): a Level Editor shown in a multiplayer world is closed here, on the frame after its show, through the
 // engine's own editor toggle; one capped [EDITOR] line per close. Called each frame after the engine loop. MAIN THREAD.
 void StoreEditorOffTick();
+// T-1462 (owner 1838 / 1839): the game's short on-screen message line (ShowHandRefusedLine's road: "shown" / "declined" / "raised");
+// the rebuild_navmesh hooks' TEST-ONLY 'asks as the key step' flag (editorkey rebuildnav), and their refusal counts (hooksOn 1 = both
+// installed). MAIN THREAD.
+const char* StoreShowMessageLine(const char* text);
+#ifdef SW_DEV_BUILD
+void StoreNavKeyAsKey(int on);   /* TEST-ONLY, DEV build */
+#endif
+void StoreNavKeyCounts(long long* fixRefused, long long* rebuildRefused, int* hooksOn);
 // T-927: the game menu's show or hide has just run; `visible` is its panel read then (UiPauseMenuPanelVisible: 1 shown, anything
 // else taken as closed). Under Slowest wins, in a session, in a world, an open game menu is this player's pause vote. MAIN THREAD.
 void ClockGameMenuVisible(int visible);
@@ -428,6 +436,7 @@ std::string StoreLinkWorldId();
 std::string StoreAccessTest(const std::string& args);    // TEST-ONLY `accesstest`: the hosting game writes its world's access.txt
 std::string StoreNetThrottle(const std::string& word);   // T-1168 TEST-ONLY `netthrottle off|on`: this game's ENet links, and (hosting) netthrottle.request for its world server
 int  StoreMySlot();                                      // decision 32: my slot in the relay's order (-1 unknown)
+int  StoreAreaLoadedVersion(const std::string& zoneId, unsigned long long* seq, int* writer, long long* at);   // T-1429 machine age (fold 1: and its writtenAt), MAIN THREAD: the loaded copy's version and writer slot (1 = a load seen)
 void OwnGiveSaveArm(const std::string& why);             // T-1135, MAIN THREAD: a character was given or received - the save after character creation's road is armed (it starts as soon as the leave save is wanted)
 void* StoreLookalikeEnsure(const std::string& copySid);  // T-1096 (owner 1234 e), MAIN THREAD: the look-alike record a copy id ('<original id>~i<slot>') names - found, or made from its original; 0 = none
 void* StoreBackLookalike(const std::string& copySid, std::string* why, bool* made);  // T-1021, MAIN THREAD: a bring-back's race look-alike ('<template id>~r<f|m><race id>') found or made now and put on the world's look-alike list; 0 = none (*why)
@@ -449,6 +458,8 @@ const long long kNoNotebookRefuseMs = 60000;
 // my own echo?" - which a game with no current slot cannot otherwise answer, because the relay broadcasts every
 // row to every game including its author. -1 = no slot has ever been assigned in this process.
 int  StoreLastKnownSlot();
+// T-1391 fix A2, MAIN THREAD: this game's own side - the slot it holds now, else the slot it last held in THIS world (ZoneOwnSideSlot); -1 not known
+int  StoreOwnSideSlot();
 // P6q (review-p6j MEDIUM-1), ANY thread: THE LINK GENERATION. A slot belongs to the numbering that issued it, and
 // every link-up edge is a new numbering. (Since B13 / prof1 the notebook keys slots by PROFILE in slots.txt and never
 // hands a slot to anybody else - the old "first-free index in HELLO order" reason is gone. A slot is still read only for
@@ -823,6 +834,9 @@ bool StoreSendBldgRecord(const std::string& id, float x, float y, float z, const
 bool StoreSendBldgGone(const std::string& id);   /* T-1333, MAIN THREAD: a building record's removal (RECORD_GONE) - a rebuilt town; false = not sent */
 
 bool StoreSendTownTimeRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-4, MAIN THREAD: a town's clock record (towngen.cpp) as a RECORD at the town's position; false = no link */
+bool StoreSendCampLaidRecord(const std::string& id, const std::vector<char>& bytes, long long* stampOut);   /* T-1429 design b, MAIN THREAD: an area's camp mark (camp.cpp) as a RECORD; false = no link */
+unsigned long long StoreZoneContentBase(const std::string& zoneId);   /* T-1429 design b, MAIN THREAD: the stored copy's seq the area loaded here was made from (0 = not known) */
+int AfLeaseHeldHere(int x, int y);   /* T-1429 design b, MAIN THREAD: 1 = this game holds area x.y's creation lease (its LEASE write is queued) */
 bool StoreSendCageRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-860, MAIN THREAD: a cage's lock record (spawn.cpp) as a RECORD at its area's centre; false = no link */
 bool StoreSendDoorGone(const std::string& id);   /* MAIN THREAD: a door record's removal (RECORD_GONE) - a ruined building's doors; false = not a door record id, or not sent */
 bool StoreSendBoxAsk(const std::vector<std::string>& ids);   /* MAIN THREAD: BOX_ASK (81) for the boxes whose writes the link lost; false = not sent */

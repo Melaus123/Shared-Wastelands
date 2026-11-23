@@ -14,6 +14,7 @@
 #include "store.h"        /* stand1: StoreMySlot / StoreLastKnownSlot - my slot for the wire */
 #include "config.h"       /* RoleIsSingle */
 #include "../common/slotwire.h"   /* stand1: coop-p<n>, @slot:<n> */
+#include "../common/loadraidstandin.h"   /* T-1477 A1: the saved raid's stand-in made at its load */
 #include "../common/factionkey.h"   /* an NPC faction travels by its stringID */
 #include "../common/profiles.h"   /* T-368: FactionApplyDecide, kEngineFactionDefault */
 #include "../common/panelstatus.h"   /* T-368: the Faction Name boxes' approved words */
@@ -33,6 +34,7 @@
 #include <stdint.h>   /* mig3: what <core/Functions.h> also brought in */
 #include <Windows.h>
 #include <sstream>
+#include <cstring>   /* T-1477 A1: memcpy in the save-record reads */
 
 namespace {
 const char* const kLegacyWirePrefix = "@player:";   /* stand1: the protocol-67 form - never sent now; a 67 game is refused at HELLO (68) */
@@ -449,6 +451,12 @@ bool LegacyPeerFactionExists()
     if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return false;
     return PlausibleObject(coop::GameWorldPtr()->factionDirectory->findFactionById(std::string(coopslot::kLegacyPeerId)));
 }
+::Faction* LegacyPeerFaction()
+{
+    if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
+    ::Faction* const f = coop::GameWorldPtr()->factionDirectory->findFactionById(std::string(coopslot::kLegacyPeerId));
+    return PlausibleObject(f) ? f : 0;
+}
 bool StandInExistsForSlot(int slot)
 {
     if (slot < 0) return false;
@@ -462,10 +470,15 @@ bool StandInExistsForSlot(int slot)
    name "Player <slot>"; ResolveStandIn finds it when that player's characters or names arrive and renames it - never a second
    one. 1 made; 0 one exists already (in the table, or a coop-p<slot> record the loaded world carries, which the area swap accepts
    and CreatePeer reuses later); -1 not made (*detail says why). */
+static int MakePlaceholderStandIn(int slot, std::string* detail);   /* below: the one placeholder road, after each caller's own gate */
 int MakeAreaWriterStandIn(int slot, std::string* detail)
 {
     const int me = MySlotForWire();
     if (slot < 0 || slot > coopslot::kSlotMax || me < 0 || slot == me) { if (detail) *detail = "not another player's number (mine " + S(me) + ")"; return -1; }
+    return MakePlaceholderStandIn(slot, detail);
+}
+static int MakePlaceholderStandIn(int slot, std::string* detail)
+{
     if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) { if (detail) *detail = "no faction manager"; return -1; }
     if (StandInExistsForSlot(slot)) return 0;
     std::string name = coopslot::PlaceholderName(slot);
@@ -478,7 +491,88 @@ int MakeAreaWriterStandIn(int slot, std::string* detail)
     if (detail) *detail = "'" + g_si[i].name + "' " + S((const void*)f);
     return 1;
 }
-/* THE player number -> this game's faction lookup (pure half: coopslot::OwnerSlotOfId / OwnerIdForSlot). MAIN THREAD. My number ->
+/* T-1477 design A1 (F2019 / F2020; pure half src/common/loadraidstandin.h). The war manager's load 0x9C8EF0 (Read,
+   decomp_9c8ef0:151-157) reads each running raid's target as the saved id "enemy c<i>" and looks it up with 0x2E79E0, which gives
+   0 for an id not in the directory - a stand-in this mod makes only after the load - and the raid keeps the null until its
+   retarget dereferences it (run T3028). Hooked on entry: every "enemy c<i>" the save record holds that names a missing stand-in
+   id gets its placeholder through the one placeholder road (MakePlaceholderStandIn - MakeAreaWriterStandIn's road without its
+   'this game's number known / another player' gate, which a load after a restart cannot pass: the world server has not
+   answered yet), so the engine's own lookup finds it; the player's arrival later takes CreatePeer's reuse branch and renames it.
+   Any other missing name is left exactly as today. */
+typedef void (*PfWarMgrLoadFn)(void* warManager, void* save, void* a3, void* a4);
+typedef void* (*PfSdataIndexFn)(void* stringFields, const std::string* key);
+static unsigned long long kPfWarMgrLoadRva = 0; static coop::AddrReg kPfWarMgrLoadRva_reg("FactionWarMgrLoad", &kPfWarMgrLoadRva);   /* Steam_1.0.65 0x9C8EF0, Steam_1.0.68 0x9C9DC0 (hooked); optional:loadraid - not found, only this repair is off */
+static unsigned long long kPfSdataIndexRva = 0; static coop::AddrReg kPfSdataIndexRva_reg("StringFieldIndex", &kPfSdataIndexRva);   /* Steam_1.0.65 0x6D150: the engine's own field read (value std::string at node+0x28) */
+static PfWarMgrLoadFn orig_pfWarMgrLoad = 0;
+static long long g_lrMade = 0, g_lrFailed = 0, g_lrFaults = 0, g_lrOffMain = 0;
+/* the save record's "enemy c<i>" keys (loadraidstandin.h EnemyKeysOfMap), read only. ANY THREAD; *faults counts a fault (nothing kept then). */
+static int LrEnemyKeysPod(void* save, char (*keys)[16], int cap, int* faults)
+{
+    __try { return loadraid::EnemyKeysOfMap((const char*)save + 0x138, keys, cap); }   /* the walk: loadraidstandin.h (read only) */
+    __except (EXCEPTION_EXECUTE_HANDLER) { ++*faults; return 0; }
+}
+/* the id a key holds, through the engine's own field read (the key exists - just walked - so nothing is added). 1 read; 0 none or
+   too long; -1 no row or a fault. ANY THREAD. */
+static int LrSavedIdPod(void* save, const std::string* key, char* out, int cap)
+{
+    out[0] = 0;
+    if (kPfSdataIndexRva == 0) return -1;
+    __try
+    {
+        const char* node = (const char*)((PfSdataIndexFn)(uintptr_t)coop::AddrAbs(kPfSdataIndexRva))((char*)save + 0x138, key);
+        if (node == 0) return 0;
+        const char* v = node + 0x28;
+        const size_t size = *(const size_t*)(v + 0x10), res = *(const size_t*)(v + 0x18);
+        if (size >= (size_t)cap) return 0;
+        const char* t = res >= 16 ? *(const char* const*)v : v;
+        if (t == 0) return 0;
+        std::memcpy(out, t, size); out[size] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return -1; }
+}
+static void LoadRaidStandIns(void* save)
+{
+    if (save == 0) return;
+    char keys[loadraid::kMaxNames][16]; int faults = 0;
+    const int nk = LrEnemyKeysPod(save, keys, loadraid::kMaxNames, &faults);
+    if (faults != 0) { if (++g_lrFaults <= 4) ErrorLog("[PF] saved raids at load: the war manager's save record was unreadable - no stand-in made (as before)"); return; }
+    if (nk == 0 || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return;
+    const int me = MySlotForWire();
+    const unsigned long mt = coop::StoreMainThreadId();
+    const bool onMain = mt != 0 && ::GetCurrentThreadId() == mt;   /* store.h: 0 (not known yet) is read as not the main thread */
+    const char* const th = mt == 0 ? "unknown" : (onMain ? "main" : "OTHER");
+    int done[loadraid::kMaxNames]; int nd = 0;
+    for (int i = 0; i < nk; ++i)
+    {
+        const std::string key(keys[i]);
+        char buf[96];
+        if (LrSavedIdPod(save, &key, buf, (int)sizeof(buf)) != 1 || buf[0] == 0) continue;
+        const std::string sid(buf);
+        if (coopslot::StandInSlotOfId(sid) < 0) continue;   /* not a stand-in id: no lookup here, the engine's own as today */
+        int slot = -1;
+        const int v = loadraid::Judge(sid, PlausibleObject(coop::GameWorldPtr()->factionDirectory->findFactionById(sid)), me, &slot);
+        if (v == loadraid::kOwnSlot) { DebugLog("[PF] a saved raid names this game's own number: id=" + sid + " key '" + key + "' - no stand-in made (as before)"); continue; }
+        if (v != loadraid::kMake || loadraid::AddUniqueSlot(done, &nd, loadraid::kMaxNames, slot) == 0) continue;
+        if (!onMain) { ++g_lrOffMain; ErrorLog("[PF] stand-in NOT made at load for a saved raid: id=" + sid + " slot=" + S(slot) + " - the load runs off the main thread (thread " + th + "), and a stand-in is made on the main thread only - its target stays empty, as before"); continue; }
+        std::string detail;
+        const int r = MakePlaceholderStandIn(slot, &detail);
+        if (r == 1) { ++g_lrMade; DebugLog("[PF] stand-in made at load for a saved raid: id=" + sid + " slot=" + S(slot) + " " + detail + " (key '" + key + "', mySlot " + S(me) + ", role " + ConfigRoleName() + ", thread " + th + ") - the game's own lookup finds it; the player's arrival reuses it"); }
+        else { ++g_lrFailed; ErrorLog("[PF] stand-in NOT made at load for a saved raid: id=" + sid + " slot=" + S(slot) + " (" + (r == 0 ? std::string("one is in the table already") : detail) + ", thread " + th + ") - its target stays empty, as before"); }
+    }
+}
+static void detour_pfWarMgrLoad(void* warManager, void* save, void* a3, void* a4)
+{
+    LoadRaidStandIns(save);   /* before the engine's own "enemy c<i>" lookups */
+    orig_pfWarMgrLoad(warManager, save, a3, a4);
+}
+void InstallLoadRaidStandInHook()
+{
+    const unsigned long long fn = coop::AddrAbs(kPfWarMgrLoadRva);
+    if (fn == 0 || kPfSdataIndexRva == 0) { ErrorLog("[PF] saved-raid stand-in NOT installed - the address table has no FactionWarMgrLoad / StringFieldIndex row (a saved raid on an offline teammate's base still empties at load)"); return; }
+    if (coop::AddHook((void*)fn, (void*)&detour_pfWarMgrLoad, (void**)&orig_pfWarMgrLoad) != coop::SUCCESS) { ErrorLog("[PF] AddHook war manager load FAILED - a saved raid on an offline teammate's base still empties at load"); return; }
+    DebugLog("[PF] saved-raid stand-in installed: the war manager's load is hooked (T-1477 A1) - a running raid's missing stand-in target gets its placeholder before the game's lookup");
+}/* THE player number -> this game's faction lookup (pure half: coopslot::OwnerSlotOfId / OwnerIdForSlot). MAIN THREAD. My number ->
    my player faction; another -> its stand-in in the table. makePlaceholder (engine writes allowed): a coop-p<slot> record the loaded
    world carries enters the table under its own name, else a placeholder is made through MakeAreaWriterStandIn (the one placeholder
    road) - only on the number THIS link's world server gave, and never in a lone game. 0 = none. */
@@ -951,6 +1045,7 @@ void ReportPlayerFaction()
              + " world[applied,dropped,recordTaken]=" + S(g_worldFacApplied) + "," + S(g_worldFacDropped) + "," + S(g_worldFacRecordTaken)
              + " boxes[shown,failed]=" + S(g_facBoxShown) + "," + S(g_facBoxFailed) + " lines[shown,failed]=" + S(g_facLineShown) + "," + S(g_facLineFailed) + " owed[load,rename]=" + S(g_facLoadPending ? 1 : 0) + "," + S(g_facRenamePending ? 1 : 0) + " standInMoved=" + S(g_worldFacStandInMoved)
              + " taken=" + coop::StoreTakenFactionsText());
+    DebugLog("[PF] REPORT saved raids: loadRaid[made,failed,faults,offMain]=" + S(g_lrMade) + "," + S(g_lrFailed) + "," + S(g_lrFaults) + "," + S(g_lrOffMain));   /* T-1477 A1 */
 }
 }
 

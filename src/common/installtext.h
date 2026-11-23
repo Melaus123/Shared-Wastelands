@@ -212,6 +212,16 @@ inline std::vector<std::string> VdfLibraryPaths(const std::string& vdf)
     return out;
 }
 
+/* THE GAME'S FILE NAMES: a Kenshi folder holds kenshi_x64.exe (Steam) or kenshi_GOG_x64.exe (GOG); either one
+   marks the folder as Kenshi's, and a running process of either name is Kenshi running. */
+inline int GameExeCount() { return 2; }
+inline const char* GameExeName(int i) { return i == 0 ? "kenshi_x64.exe" : (i == 1 ? "kenshi_GOG_x64.exe" : ""); }
+inline bool IsGameExeName(const std::string& name)
+{
+    for (int i = 0; i < GameExeCount(); ++i) if (InstEqualNoCase(name, GameExeName(i))) return true;
+    return false;
+}
+
 /* THE WORKSHOP LAYOUT: a folder <X>\steamapps\workshop\content\233860\<id>[\...] names the game folder
    <X>\steamapps\common\Kenshi.  Returns "" when the folder is not inside that layout.  Either slash. */
 inline std::string WorkshopGameFolder(const std::string& folder)

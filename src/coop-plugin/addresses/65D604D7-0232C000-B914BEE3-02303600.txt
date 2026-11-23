@@ -12,7 +12,7 @@
 #         not found or not matching, ONLY that feature is off (its address 0) and the mod runs - logged '[ADDR] optional row ...'
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 814
+!count 820
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -99,6 +99,7 @@ Character_worldPosition                          code 005CDBF0 005CDBF0 40555748
 Character_hasDied                               code 00620B20 00620B20 0FB681BC050000C3CCCCCCCCCCCCCCCC
 Character_isPlayerControlled                    code 00790B30 00790B30 4883EC28488B01FF505833C948398850
 Character_inRagdoll                            code 007D08A0 007D08A0 4883EC2880B9D4030000007407B00148
+Character_isItSafeToGetUp                      code 005C99C0 005C99C0 40534883EC20488B01488BD9FF506883
 Character_restoreSaveState                    code 006264C0 006264C0 4885D20F84CB0B000055565741544155
 Character_setPoseState                        code 005C7390 005C7390 48895C24084889742410574883EC5033
 Character_setStealthMode                       code 005C9F10 005C9F10 48895C2408574883EC20488BD9488B89
@@ -728,6 +729,8 @@ CampLimitScale                                 var  02132538 02132538 -
 CampViewDistance                               ro   0172F4F0 0172F4F0 CDCCAC44
 CampNestCheckRet                               ret  008F51EB 008F51E6 E8F4E172FF
 CampDebrisPlace                                code 00937570 00937570 488BC455535657415441554156415748
+CampPieceMake                                  code 0092F250 0092F250 488BC455535657415441554156415748 optional:campkeep
+BuildingNeedsSaving                            code 0054F690 0054F690 405556574883EC6048C7442428FEFFFF optional:campkeep
 RaidSquadCreateRet                             ret  009C3489 009C3484 E8AB1E65FF
 JobStartTakeRet                                ret  0035B4AC 0035B4A6 FF93F8040000
 WarCampaignStart                               code 009C8960 009C8960 40555356574154415541564157488DAC
@@ -773,6 +776,7 @@ TerrainHeightAt                                code 009B10B0 009B10B0 48895C2408
 TaskObjectMineFactionTest                      code 005A3341 005A3341 483BC70F94C0488B6C2448488B5C2440
 UnlockDoorTaskStep                             code 0033D3C0 0033D3C0 48895C241048896C2418488974242057
 FactionWarMgrUpdate                            code 009CA440 009CA440 488BC4554154415541564157488D6888
+FactionWarMgrLoad                              code 009C8EF0 009C8EF0 405556574154415541564157488D6C24 optional:loadraid
 TownsOfFaction                                 code 00927E90 00927E90 48895C2418555741554883EC2033FF4D
 ScythePhysicsJunk                              code 007DBF20 007DBF20 48895C240848896C2410488974241848
 ScythePhysicsFirstReady                        code 007D46F0 007D46F0 405355574883EC504883B9B801000000
@@ -819,11 +823,13 @@ InputHandlerKeyDown                            code 00360AD0 00360AD0 40534883EC
 GameFreeStub                                   code 00ED5628 00ED5628 FF25323F3701FF25243F3701FF25163F optional:ping-key
 ZoneWalkMapRebuild                             code 003AB700 003AB700 488BC456574154415541564881ECB000
 NavMeshManagerPtr                              var  02133560 02133560 -
-NavClosestFaceQuery                            code 003A2E60 003A2E60 48895C24084889742410574883EC6048
-HavokCharacterSetPosition                      code 00145E10 00145E10 488BC455574154488D68C84881EC2001
+NavPlaceOnFloor                                code 003A1F70 003A1F70 40555356574154488D6C24D04881EC30
+NavWalkPlaceReach                              ro   0168AF24 0168AF24 0000804000007A4400000000
 WallJoinArea                                   code 0029AC10 0029AC10 4885D20F8426010000488BC4574881EC
 WallJoinTo                                     code 0029A850 0029A850 4889742418574883EC40488BF2488BF9
 GuiKeyCommandGuard                             code 006E1C80 006E1C80 488B4920E9E13D92FFCCCCCCCCCCCCCC
 BuildingPauseToggle                            code 005464B0 005464B0 48895C2408574883EC4033C0488BF948
 BuildingFinishConstruction                     code 005618B0 005618B0 40534883EC2080B9600100000048897C
 PlatoonPlanTemplateSetup                       code 002715E0 002715E0 405556574154415541564157488D6C24
+BuildingSetTown                                code 00926190 00926190 48895C24084889742410574883EC2048
+LevelEditorFixStuff                            code 00771C70 00771C70 488BC4554154415541564157488D6C24 optional:navkey-block

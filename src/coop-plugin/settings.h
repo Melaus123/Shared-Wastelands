@@ -36,6 +36,12 @@ long SettingsWorldValuesGen();
 // The HOST screen's rows the world (worldFolder) has STORED since the last call - an OPTIONS map from it held them at those values -
 // handed out once (stewardrules.h TakeStored). Only these count as rows that already went. MAIN THREAD. Returns how many.
 int SettingsHostRowsStored(const std::string& worldFolder, std::vector<std::pair<std::string, std::string> >* out);
+// T-1399: the HOST screen's rows handed over and not yet seen stored in the world's OPTIONS map (g_hcAwait), copied; refused = 1 once the
+// world server refused an options write while they awaited; rulesAuthority = this game sets the world's rules now; standingKnown = the world
+// server's standing for this game has arrived on this link (rulesAuthority is its word only then). MAIN THREAD. Returns how many.
+// T-1399 fold: the game left the world (store.cpp StoreLeftAtTitle) - the HOST screen's rows still owed to it are dropped. MAIN THREAD.
+void SettingsLeftWorld();
+int SettingsHostRowsAwaiting(std::vector<std::pair<std::string, std::string> >* out, int* refused, int* rulesAuthority, int* standingKnown);
 // mp5: this game's own live value of one gp.* / gt.* key as the notebook would store it ("" = unreadable). MAIN THREAD.
 std::string SettingsLiveValue(const std::string& key);
 // The world's value of one key as this game last had it from that world's OPTIONS map ("" = not known: another world, or no such row). MAIN THREAD.

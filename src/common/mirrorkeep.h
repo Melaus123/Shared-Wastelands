@@ -94,7 +94,11 @@ struct KeptRow
     unsigned int crc;
     unsigned long long mirrorSeq;   /* T-1429 s2 fold 5 (review F1378): the world server's version (seq) of the copy the mirror file holds -
                                        0 = not known (this game's own copy before its echo, or a row from a table written before fold 5) */
-    KeptRow() : x(0), y(0), z(0), writtenAt(0), posAt(0), owner(0), seq(0), birth(-1), size(0), mtime(0), crc(0), mirrorSeq(0) {}
+    int ownBaseKnown;               /* T-1391 F1631 item 1: the row is this game's own save the world server has not confirmed (mirrorSeq 0), and */
+    unsigned long long ownBase;     /* the world version of the copy that save was made from (0 = made from no world copy) - so it survives a quit */
+    std::vector<long long> unechoed;   /* T-1391 F1633 item 1: this game's uploads of the area whose echo had not come (oldest first) - so a refusal after a
+                                          reopen that names one as the stored copy is still known as this game's own (store.cpp g_zoneUnechoed) */
+    KeptRow() : x(0), y(0), z(0), writtenAt(0), posAt(0), owner(0), seq(0), birth(-1), size(0), mtime(0), crc(0), mirrorSeq(0), ownBaseKnown(0), ownBase(0) {}
 };
 
 inline bool FieldOk(const std::string& s) { return s.find_first_of("\t\r\n") == std::string::npos; }
@@ -160,6 +164,32 @@ inline void SplitTabs(const std::string& line, std::vector<std::string>* f)
    written before fold 5) reads with mirrorSeq 0 - its copy's version is not known, never guessed from a time. */
 const size_t kRowFields = 17;
 const size_t kRowFieldsBase = 18;
+const size_t kRowFieldsOwn = 19;   /* T-1391 F1631 item 1: then "<ownBase>" - written only for this game's own unconfirmed area save whose base is known */
+const size_t kRowFieldsUnechoed = 20;   /* T-1391 F1633 item 1: then "<stamp>,<stamp>.." - the unechoed uploads; field 19 is then "-" when no own base is kept */
+const size_t kUnechoedKeptMax = 64;
+inline std::string UnechoedText(const std::vector<long long>& v)
+{
+    std::string t;
+    for (size_t i = 0; i < v.size(); ++i) t += (i != 0 ? "," : "") + I64Text(v[i]);
+    return t;
+}
+/* false = not a list of positive stamps (an empty field is not written, so it is not one either) */
+inline bool UnechoedParse(const std::string& f, std::vector<long long>* out)
+{
+    std::vector<long long> v; size_t at = 0;
+    for (;;)
+    {
+        const size_t c = f.find(',', at);
+        const std::string one = f.substr(at, c == std::string::npos ? std::string::npos : c - at);
+        long long x = 0;
+        if (!ParseI64(one, &x) || x <= 0 || v.size() >= kUnechoedKeptMax) return false;
+        v.push_back(x);
+        if (c == std::string::npos) break;
+        at = c + 1;
+    }
+    out->swap(v);
+    return true;
+}
 inline bool RowFormat(const KeptRow& r, std::string* line)
 {
     if (r.key.empty() || r.writtenAt <= 0) return false;
@@ -167,14 +197,16 @@ inline bool RowFormat(const KeptRow& r, std::string* line)
     *line = "r\t" + r.key + "\t" + I64Text(r.writtenAt) + "\t" + I64Text(r.posAt) + "\t" + U64Text(r.owner)
           + "\t" + Hex8(FloatBits(r.x)) + "\t" + Hex8(FloatBits(r.y)) + "\t" + Hex8(FloatBits(r.z))
           + "\t" + U64Text(r.seq) + "\t" + I64Text(r.birth) + "\t" + U64Text(r.size) + "\t" + U64Text(r.mtime) + "\t" + Hex8(r.crc)
-          + "\t" + r.squadSid + "\t" + r.factionName + "\t" + r.town + "\t" + r.home + "\t" + U64Text(r.mirrorSeq) + "\n";
+          + "\t" + r.squadSid + "\t" + r.factionName + "\t" + r.town + "\t" + r.home + "\t" + U64Text(r.mirrorSeq)
+          + ((r.ownBaseKnown != 0 || !r.unechoed.empty()) ? "\t" + (r.ownBaseKnown != 0 ? U64Text(r.ownBase) : std::string("-")) : std::string())
+          + (!r.unechoed.empty() ? "\t" + UnechoedText(r.unechoed) : std::string()) + "\n";
     return true;
 }
 inline bool RowParse(const std::string& line, KeptRow* out)
 {
     std::vector<std::string> f;
     SplitTabs(line, &f);
-    if ((f.size() != kRowFields && f.size() != kRowFieldsBase) || f[0] != "r" || f[1].empty()) return false;
+    if ((f.size() != kRowFields && f.size() != kRowFieldsBase && f.size() != kRowFieldsOwn && f.size() != kRowFieldsUnechoed) || f[0] != "r" || f[1].empty()) return false;
     KeptRow r;
     unsigned long long owner = 0; unsigned int xb = 0, yb = 0, zb = 0; long long birth = 0;
     r.key = f[1];
@@ -186,18 +218,93 @@ inline bool RowParse(const std::string& line, KeptRow* out)
     r.owner = (unsigned int)owner; r.birth = (int)birth;
     r.x = BitsFloat(xb); r.y = BitsFloat(yb); r.z = BitsFloat(zb);
     r.squadSid = f[13]; r.factionName = f[14]; r.town = f[15]; r.home = f[16];
-    if (f.size() == kRowFieldsBase && !ParseU64(f[17], &r.mirrorSeq)) return false;   /* fold 5: absent = 0 (KeptRow()) */
+    if (f.size() >= kRowFieldsBase && !ParseU64(f[17], &r.mirrorSeq)) return false;   /* fold 5: absent = 0 (KeptRow()) */
+    if (f.size() >= kRowFieldsOwn && f[18] != "-") { if (!ParseU64(f[18], &r.ownBase)) return false; r.ownBaseKnown = 1; }   /* T-1391 F1631 item 1 */
+    if (f.size() == kRowFieldsUnechoed && !UnechoedParse(f[19], &r.unechoed)) return false;   /* T-1391 F1633 item 1 */
     *out = r;
     return true;
 }
 
 /* T-1429 s2 fold 6 (review F1380 BLOCKER a): AN AREA ROW WITH NO VERSION IS REJECTED AT LOAD, as a changed row is - its copy's version is not
    known (a table from before fold 5, or this game's own save written before its echo), so the launch fetches the world's copy instead of
-   loading one whose first save would be refused. A deleted row and an area row while area records are off are left to RowLoad. 1 = reject. */
-inline int RowNoBaseRejects(int isZone, unsigned long long mirrorSeq, int deleted, int zoneOff)
+   loading one whose first save would be refused. A deleted row and an area row while area records are off are left to RowLoad. 1 = reject.
+   T-1391 F1631 item 1: NOT a row that is this game's own save the world server has not confirmed with the base it was made from kept
+   (ownBaseKnown) - a save made with the link down and then quit: it is taken, and the link-up push sends it judged by that base. A row
+   with no version and no own base (a table from before fold 5 or before F1631) is still rejected: nothing says what it was made from. */
+inline int RowNoBaseRejects(int isZone, unsigned long long mirrorSeq, int ownBaseKnown, int deleted, int zoneOff)
 {
-    return (isZone != 0 && deleted == 0 && zoneOff == 0 && mirrorSeq == 0ULL) ? 1 : 0;
+    return (isZone != 0 && deleted == 0 && zoneOff == 0 && mirrorSeq == 0ULL && ownBaseKnown == 0) ? 1 : 0;
 }
+/* T-1391 F1633 item 2: AN OWN AREA SAVE WRITTEN TO ITS MIRROR FILE marks the kept table - else a save after the last full save (an area
+   unload) leaves its row naming the file as it was, and the reopen rejects the row as changed (RowCheck). Sent: the save's last echo
+   writes the table (store.cpp g_zoneEchoWait); not sent (no link): no echo will come, so the table is written now. */
+enum { kOwnSaveTableNone = 0, kOwnSaveTableMark = 1, kOwnSaveTableWriteNow = 2 };
+inline int OwnSaveTableStep(int ownSaveWritten, int sent) { return ownSaveWritten == 0 ? (int)kOwnSaveTableNone : sent != 0 ? (int)kOwnSaveTableMark : (int)kOwnSaveTableWriteNow; }
+/* T-1391 F1635 item 1: kOwnSaveTableWriteNow makes the write DUE, not a write per save (a full save or the quit drain of N areas was N whole
+   rewrites). The table is written ONCE when the batch ends: at the tick, right after the outbox drain (store.cpp StoreTick - every save that
+   drain applied and every main-thread save since the last tick, one write; an area unload's save is on disk in the table by the next frame),
+   unless a full game save is still being written (savePending: a world-key row waits for it) - then that save's end writes it ('a save
+   finished'; a save that never finishes clears its row within 60 s and the next tick writes it). The quit drain and world teardown write it
+   at once (their own MirrorKeepFlush). A write that does not land keeps the table's mark for the next of those events, never a write per frame. */
+inline int OwnSaveTableFlushNow(int due, int savePending) { return (due != 0 && savePending == 0) ? 1 : 0; }
+/* T-1391 (F1653 design 2) .. F1683: THE OLD SIDE FILES - <file>.unsent (an own unconfirmed save's kept row and "b <stamp>" of its base),
+   <file>.ownn, <file>.base / .basev (the kept base and its line "kb1 <key> <seq> <writtenAt> <writer> <empty>"), <file>.basen / .basevn.
+   T-1391 design B (F1706): REPLACED by one state file per area (areastate.h, <file>.area). These readers stay for the MIGRATION only
+   (areastate::MigrateRead reads an area's old files once at the first launch of the new build; the suite writes old-shaped files with the
+   two Format helpers). Nothing writes these files any more. */
+inline bool UnsentSideFormat(const KeptRow& r, long long baseStamp, std::string* out)
+{
+    std::string line;
+    if (!RowFormat(r, &line)) return false;
+    *out = line + "b\t" + I64Text(baseStamp) + "\n";
+    return true;
+}
+inline bool UnsentSideParse(const std::string& text, KeptRow* row, long long* baseStamp)
+{
+    const size_t nl = text.find('\n');
+    if (nl == std::string::npos) return false;
+    std::string first = text.substr(0, nl);
+    if (!first.empty() && first[first.size() - 1] == '\r') first.erase(first.size() - 1);
+    KeptRow r;
+    if (!RowParse(first, &r)) return false;
+    std::string rest = text.substr(nl + 1);
+    while (!rest.empty() && (rest[rest.size() - 1] == '\n' || rest[rest.size() - 1] == '\r')) rest.erase(rest.size() - 1);
+    long long b = 0;
+    if (rest.size() < 3 || rest[0] != 'b' || rest[1] != '\t' || !ParseI64(rest.substr(2), &b) || b < 0) return false;
+    *row = r; *baseStamp = b;
+    return true;
+}
+/* T-1391 F1680 M1: the old row's 'sent' mark - its unechoed list holds the row's own stamp (the migration turns it into the state's sent flag) */
+inline int UnsentSideWasSent(const KeptRow& r)
+{
+    for (size_t i = 0; i < r.unechoed.size(); ++i) if (r.unechoed[i] == r.writtenAt && r.writtenAt > 0) return 1;
+    return 0;
+}
+inline bool KeptBaseFormat(const std::string& key, unsigned long long seq, long long at, int writer, int empty, std::string* out)
+{
+    if (key.empty() || key.find('\t') != std::string::npos || key.find('\n') != std::string::npos || at < 0) return false;
+    *out = "kb1\t" + key + "\t" + U64Text(seq) + "\t" + I64Text(at) + "\t" + I64Text((long long)writer) + "\t" + (empty != 0 ? "1" : "0") + "\n";
+    return true;
+}
+inline bool KeptBaseParse(const std::string& text, std::string* key, unsigned long long* seq, long long* at, int* writer, int* empty)
+{
+    std::string t = text;
+    while (!t.empty() && (t[t.size() - 1] == '\n' || t[t.size() - 1] == '\r')) t.erase(t.size() - 1);
+    std::vector<std::string> f;
+    size_t p = 0;
+    for (;;) { const size_t q = t.find('\t', p); f.push_back(t.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; }
+    unsigned long long s = 0; long long a = 0, w = 0;
+    if (f.size() != 6 || f[0] != "kb1" || f[1].empty() || !ParseU64(f[2], &s) || !ParseI64(f[3], &a) || a < 0 || !ParseI64(f[4], &w) || (f[5] != "0" && f[5] != "1")) return false;
+    *key = f[1]; *seq = s; *at = a; *writer = (int)w; *empty = f[5] == "1" ? 1 : 0;
+    return true;
+}
+/* item 4, THE RELOAD: an area with an own unsent save kept (F1706: its state's pending flag) is loaded from that save - the world server's start-up copy is not
+   copied over its mirror file (LoadIndex), and the first snapshot does not drop it as unnamed (the world server may never have had the
+   area); the link-up push sends it and the world server judges it */
+inline int IndexCopyYields(int ownUnsentKept) { return ownUnsentKept != 0 ? 1 : 0; }
+/* (UnnamedDecideOwn: below UnnamedDecide) */
+/* the own base goes in an area row only while its mirror copy has no version (an echoed copy's version says it all) */
+inline int RowOwnBaseWritten(unsigned long long mirrorSeq, int ownBaseHere) { return (mirrorSeq == 0ULL && ownBaseHere != 0) ? 1 : 0; }
 /* fold 5 / 6: the version MirrorKeepWrite puts in an area row - the mirror's version only for the stamp it was taken for, else 0 */
 inline unsigned long long RowMirrorSeq(int known, long long baseStamp, unsigned long long baseSeq, long long rowStamp)
 {
@@ -360,6 +467,12 @@ inline int UnnamedDecide(int snapshotWhole, int named, int stillHere, long long 
     if (writtenAtNow != writtenAtKept) return kUnnamedChangedHere;
     return kUnnamedDrop;
 }
+/* T-1391 (F1653 item 4): an own unsent area save kept (IndexCopyYields above) is never dropped as unnamed - kept as one changed here */
+inline int UnnamedDecideOwn(int snapshotWhole, int named, int stillHere, long long writtenAtNow, long long writtenAtKept, int ownUnsent)
+{
+    const int v = UnnamedDecide(snapshotWhole, named, stillHere, writtenAtNow, writtenAtKept);
+    return (v == kUnnamedDrop && ownUnsent != 0) ? (int)kUnnamedChangedHere : v;
+}
 
 /* review MED 4: TWO KEYS, ONE FILE. A record's file name turns every unsafe character into '_' (writequeue.h FileName) and Windows
    ignores case, so two keys can name one mirror file, and its size and time would vouch for both. (*clash)[i] = 1 when names[i],
@@ -452,6 +565,13 @@ inline int BesideSwapIn(int stillHere, long long writtenAtNow, long long besideW
 inline int RefuseDrops(int stillHere, long long writtenAtNow, long long writtenAtKept, int namedThisSnapshot)
 {
     return (!namedThisSnapshot && BehindDrops(stillHere, writtenAtNow, writtenAtKept) != 0) ? 1 : 0;
+}
+/* T-1391 (review of e3082c6cc, B1): a row holding this game's own UNSENT area save (.unsent kept) is never dropped by the table's refusal
+   (the world server behind, or not judged) - the same exemption UnnamedDecideOwn gives the snapshot's end: the save stays for the
+   link-up push and the world server judges it there */
+inline int RefuseDropsOwn(int stillHere, long long writtenAtNow, long long writtenAtKept, int namedThisSnapshot, int ownUnsent)
+{
+    return ownUnsent != 0 ? 0 : RefuseDrops(stillHere, writtenAtNow, writtenAtKept, namedThisSnapshot);
 }
 
 }   /* namespace mirrorkeep */

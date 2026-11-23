@@ -19,11 +19,11 @@ namespace coopsquad {
 /* M7a A1 build 2 [a1b2-sw0]: the put-away / owed / hand-back / mark decisions are RETIRED (design 2.2) - their replacements are in
    liveowner.h (AdoptDecide, AreaReceiverOrder, ReleaseStep, GiverSettleOnAck, SquadGivenEffective). */
 
-enum { kXferReasonNone = 0, kXferReasonForced = 1, kXferReasonFollowLeader = 2 };
+enum { kXferReasonNone = 0, kXferReasonForced = 1, kXferReasonFollowLeader = 2, kXferReasonCarry = 3 };   /* T-1467 (protocol 248): kXferReasonCarry - one carried body, offered alone to its carrier's game (src/common/carryhand.h) */
 
 inline const char* XferReasonName(unsigned int r)
 {
-    return r == kXferReasonNone ? "none" : (r == kXferReasonForced ? "forced" : (r == kXferReasonFollowLeader ? "follow-leader" : "unknown"));
+    return r == kXferReasonNone ? "none" : (r == kXferReasonForced ? "forced" : (r == kXferReasonFollowLeader ? "follow-leader" : (r == kXferReasonCarry ? "carry" : "unknown")));
 }
 
 /* What the game that runs some members of a non-player squad does with them in its follow pass.

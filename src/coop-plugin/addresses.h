@@ -105,6 +105,17 @@ std::string AddrReportToken();
    player - the title button reads MULTIPLAYER, greyed, with the hover note (ui.cpp UiRefusedTipTick). */
 const char* AddrRefusalCaption();
 
+/* T-1457 - THE REPORT ROAD OF A SWITCHED-OFF GAME. Called once, on the refused road only (coop.cpp startRefused, before the title
+   hook goes in): the rows REPORT A BUG needs (src/common/reportroad.h ReportRows) are looked for by their OWN signatures in the
+   executable file - each exactly once, passing its own check and the cross-checks over them - and compared with the running game;
+   their slots are written only then (TitleScreen_update only when the title pattern left it 0, and it must agree when not). Returns
+   1 = the report may start (coop.cpp StartReportOnly); 0 = it stays off (one [ADDR] line says why) and the game stays plain. One
+   [ADDR] line per row. Later calls return the first answer. AddrReportRowsOk: that answer. AddrTestLoadRowsOk: 1 when the TEST
+   build's `load` rows were found too (SW_DEV_BUILD only; 0 in a player's build). Start thread, before any hook of the road. */
+int AddrResolveReportRows();
+int AddrReportRowsOk();
+int AddrTestLoadRowsOk();
+
 /* What AddrInit worked out, for the version line: the executable's fingerprint, and the name (its !version)
    of the address table it read. Either is "" when AddrInit has not run or refused before computing it
    (e.g. the executable could not be read, or there is no table for this fingerprint). Startup use only. */

@@ -51,7 +51,7 @@ const wchar_t* const kMsgCopy      = L"The mod's files will be copied into Kensh
 const wchar_t* const kMsgInstalled = SW_NAME_W L" is installed. Turn it on in the Mods tab of Kenshi's launcher.";   /* decision 1668 */
 const wchar_t* const kMsgAlready   = SW_NAME_W L" is already installed.";
 const wchar_t* const kMsgRemoved   = SW_NAME_W L" has been removed from your Kenshi folder. Your saves are not affected.";
-const wchar_t* const kMsgNotFound  = L"Kenshi (kenshi_x64.exe) wasn't found in this folder.";
+const wchar_t* const kMsgNotFound  = L"Kenshi (kenshi_x64.exe or kenshi_GOG_x64.exe) wasn't found in this folder.";
 const wchar_t* const kMsgRunning   = L"Kenshi is running.";
 const wchar_t* const kMsgNoWrite   = L"Setup couldn't change files in the Kenshi folder (administrator rights needed).";
 const wchar_t* const kBtnCancel    = L"Cancel";
@@ -62,7 +62,6 @@ const wchar_t* const kBtnClose     = L"Close";
 const wchar_t* const kBtnBrowse    = L"Browse...";
 const wchar_t* const kBtnTryAgain  = L"Try Again";
 
-const wchar_t* const kGameExe   = L"kenshi_x64.exe";
 const wchar_t* const kLoaderDll = swnames::kLoaderDllW;
 const wchar_t* const kCfgName   = L"Plugins_x64.cfg";
 const wchar_t* const kCfgBackup = L"Plugins_x64.cfg.multiplayer-backup";
@@ -94,7 +93,14 @@ bool FileExists(const std::wstring& path)
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-bool HasGame(const std::wstring& folder) { return !folder.empty() && FileExists(Join(folder, kGameExe)); }
+std::wstring FromUtf8(const std::string& s);
+/* the folder holds the game under either of its names (coopinst::GameExeName: Steam or GOG) */
+bool HasGame(const std::wstring& folder)
+{
+    if (folder.empty()) return false;
+    for (int i = 0; i < coopinst::GameExeCount(); ++i) if (FileExists(Join(folder, FromUtf8(coopinst::GameExeName(i))))) return true;
+    return false;
+}
 
 bool DirExists(const std::wstring& path)
 {
@@ -198,7 +204,7 @@ bool KenshiRunning()
     pe.dwSize = sizeof(pe);
     bool found = false;
     for (BOOL more = Process32FirstW(snap, &pe); more && !found; more = Process32NextW(snap, &pe))
-        if (lstrcmpiW(pe.szExeFile, kGameExe) == 0) found = true;
+        if (coopinst::IsGameExeName(ToUtf8(pe.szExeFile))) found = true;
     CloseHandle(snap);
     return found;
 }
@@ -377,7 +383,7 @@ std::wstring SteamPath()
 
 /* 1. two levels up from Setup's own folder (<Kenshi>\mods\<name>\); 2. the Workshop layout
    (...\steamapps\workshop\content\233860\<id>\ -> ...\steamapps\common\Kenshi); 3. Steam's registry path and
-   every library in its libraryfolders.vdf, each + steamapps\common\Kenshi.  "" when none holds kenshi_x64.exe. */
+   every library in its libraryfolders.vdf, each + steamapps\common\Kenshi.  "" when none holds the game (HasGame). */
 std::wstring FindKenshi(const std::wstring& selfDir)
 {
     const std::wstring up2 = Parent(Parent(selfDir));

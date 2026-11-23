@@ -467,13 +467,100 @@ inline int TieAnswer(AnswerTie* t, bool isNewAnswer)
     t->importAt = 0;
     return 1;
 }
-/* money / research for THIS import: the answer word of the world that made its profile (or, until that answer, the word known when it
-   was asked); with none, the world's OPTIONS map (optSeen) on this connection; else included. */
-inline bool ImportIncludes(unsigned importWord, unsigned bit, bool optSeen, bool optValue)
+/* T-1399 (F1748-F1750): money / research for THIS import - the world's LIVE options list (its last whole OPTIONS map on this link;
+   listArrived, listValue: absent rows read as yes) wins once it has arrived; before that (a line said before the commitment point) the
+   answer word of the world that made its profile, else included. The 2026-10-31 review put the answer word first because the options
+   list then outlived a world; it is now wiped at every link loss and leave (store.cpp SpImportLinkEnded / StoreLeftAtTitle), so the
+   list is always this world's, and it carries the host's later change, which the lobby answer (given before the host's rows reach the
+   world server on a later hosting) does not. The commitment points (CommitStep) never use the answer word. */
+inline bool ImportIncludes(unsigned importWord, unsigned bit, bool listArrived, bool listValue)
 {
+    if (listArrived) return listValue;
     if ((importWord & kWordPresent) != 0) return (importWord & bit) != 0;
-    if (optSeen) return optValue;
     return true;
+}
+/* where that word came from, for the decision's line */
+enum IncludesFrom { kFromLiveList = 0, kFromAnswer = 1, kFromDefault = 2 };
+inline int IncludesSource(unsigned importWord, bool listArrived)
+{
+    return listArrived ? kFromLiveList : (importWord & kWordPresent) != 0 ? kFromAnswer : kFromDefault;
+}
+inline const char* IncludesSourceName(int from)
+{
+    return from == kFromLiveList ? "the world's live options" : from == kFromAnswer ? "the lobby answer" : "no word (included)";
+}
+/* the world's whole OPTIONS map replaces the list: a row it does not name is absent (yes / everyone), never the last map's value.
+   A cut-short map or a refusal reply (complete false) changes nothing. */
+struct OptList
+{
+    std::string mode, money, research;
+    bool arrived;
+    OptList() : arrived(false) {}
+};
+inline void OptListCommit(OptList* live, const OptList& reading, bool complete)
+{
+    if (!complete) return;
+    *live = reading;
+    live->arrived = true;
+}
+/* the host's HOST-screen rows still awaiting the world's store that this decision reads: the money and research rows only - another row
+   that never shows stored must not hold an import under the loading screen */
+inline int ImportRowsAwaiting(const std::vector<std::pair<std::string, std::string> >& awaiting)
+{
+    int n = 0;
+    for (size_t i = 0; i < awaiting.size(); ++i) if (awaiting[i].first == kKeyMoney || awaiting[i].first == kKeyResearch) ++n;
+    return n;
+}
+/* T-1399 fold (F1751 M1): THE HOST-ROWS WAIT, and why it is over. On the hosting game a commitment point waits for its own HOST-screen
+   money / research rows (settings.cpp g_hcAwait) only while they can still come: it ends when this game does not set the world's rules
+   (they are never sent - settings.cpp HostChoicesSend's early return) - only once the world server's standing for this game has arrived
+   on this link (standingKnown; before it "not an admin" is not the world server's word: re-check M2) - when the world server refused an
+   options write while they awaited its store (settings.cpp's '@refused' reply), or when the world's live options list already holds
+   each of them as the decision reads it (an absent row is yes; no world name needed). kHostRowsNone: none of them awaits. Asked again
+   each frame / tick - events, never a timer. */
+enum HostRowsState { kHostRowsNone = 0, kHostRowsAwait = 1, kHostRowsNotAuthority = 2, kHostRowsRefused = 3, kHostRowsListHolds = 4 };
+inline bool ListHoldsRows(const std::vector<std::pair<std::string, std::string> >& awaiting, const OptList& live)
+{
+    if (!live.arrived) return false;
+    for (size_t i = 0; i < awaiting.size(); ++i)
+    {
+        if (awaiting[i].first == kKeyMoney && IncludesOf(awaiting[i].second) != IncludesOf(live.money)) return false;
+        if (awaiting[i].first == kKeyResearch && IncludesOf(awaiting[i].second) != IncludesOf(live.research)) return false;
+    }
+    return true;
+}
+inline int HostRowsWait(const std::vector<std::pair<std::string, std::string> >& awaiting, bool rulesAuthority, bool standingKnown, bool refused, const OptList& live)
+{
+    if (ImportRowsAwaiting(awaiting) == 0) return kHostRowsNone;
+    if (refused) return kHostRowsRefused;
+    if (ListHoldsRows(awaiting, live)) return kHostRowsListHolds;
+    if (!rulesAuthority) return standingKnown ? kHostRowsNotAuthority : kHostRowsAwait;
+    return kHostRowsAwait;
+}
+/* why the host-rows wait is over, for its one line (kHostRowsNone / kHostRowsAwait: no line) */
+inline const char* HostRowsEndName(int state)
+{
+    return state == kHostRowsNotAuthority ? "this game does not set the world's rules, so its HOST-screen rows are never sent"
+         : state == kHostRowsRefused ? "the world server refused the options write they went in"
+         : state == kHostRowsListHolds ? "the world's live options list already holds their values"
+         : "";
+}
+/* T-1399: THE COMMITMENT POINTS - research just before the engine runs the import (the end of the wait for the world server's records,
+   store.cpp SaveRequestPumpBody), money once the crew is in (SpImportMoneyStep). Each waits (asked again each frame / tick - an event,
+   never a timer) until the world's live options list has arrived on this link, and on the hosting game while its own HOST-screen money /
+   research rows can still come (hostRows: HostRowsWait). */
+enum CommitStepResult { kCommitGo = 0, kCommitWaitList = 1, kCommitWaitHostRows = 2 };
+inline int CommitStep(bool listArrived, int hostRows)
+{
+    if (!listArrived) return kCommitWaitList;
+    if (hostRows == kHostRowsAwait) return kCommitWaitHostRows;
+    return kCommitGo;
+}
+/* T-1399 fold (F1751 LOW 2): the pump decides the research bit again and only that bit - the creator's dead / relations bits stay as
+   armed at the post (store.cpp StoreResetCarryPost with CreatorRelArm) */
+inline unsigned int ResearchRedecided(unsigned int postFlags, bool research)
+{
+    return (postFlags & ~kSwitchResearch) | (research ? kSwitchResearch : 0u);
 }
 
 }   /* namespace spimport */

@@ -3709,7 +3709,7 @@ void t_t1401b_nearby_reply()
     if (cooplive::kInnerLogReply != 208u || !cooplive::LiveInnerRoadLocal(cooplive::kInnerLogReply) || cooplive::LiveInnerAccepted(cooplive::kInnerLogReply)
         || cooplive::kInnerLogReply == cooplive::kInnerMapDots || cooplive::kInnerLogReply == cooplive::kInnerLogAsk || cooplive::kInnerLogReply == cooplive::kInnerLogPart)
         Fail("t1401b: LOG_REPLY is not inner type 208, the store layer's own");
-    if (hovrec::kGameProtocol != 242u) Fail("t1401b: the game-to-game protocol is not 242 (T-1401 step 2b took 232, T-1393 233, T-1408 235, T-1429 s10 merge 236)");
+    if (hovrec::kGameProtocol != 248u) Fail("t1401b: the game-to-game protocol is not 248 (T-1401 step 2b took 232, T-1393 233, T-1408 235, T-1429 s10 merge 236)");
     /* the queue: oldest first, at most 4, a slot waiting once */
     AskQueue q;
     AskWaiting w;
@@ -4310,6 +4310,26 @@ void t_t346_place_input_height()
     if (InputYFromLive(nan, 1, 1527.0f, 1, 1527.0f, &y) != 0 || y != 123.0f)               Fail("NaN live");
     /* a piece below the ground height (a cellar floor) keeps a negative input */
     if (InputYFromLive(1500.0f, 1, 1527.0f, 1, 1527.0f, &y) != 1 || y != -27.0f)          Fail("below ground");
+}
+
+void t_t1429_camp_outdoor_y()
+{
+    using namespace placeinput;
+    /* T-1429 F1711 (T2709: B's outdoor camp pieces at about twice A's height, 15418 -> 30837): the record holds the piece's full
+       height; createBuilding adds the engine's ground, so the input is the record height less that ground */
+    float y = 123.0f;
+    if (CampOutdoorInputY(15418.4f, 1, 15418.0f, 1, 15418.0f, &y) != 1 || AbsF(y - 0.4f) > 0.01f)   Fail("record height less the engine's ground");
+    if (AbsF(y + EngineGroundOf(15418.0f, kEngineGroundFloor) - 15418.4f) > 0.01f)                Fail("made at that input, the piece stands at the record height (not twice it)");
+    /* terrain below the engine's floor: the engine's ground is 100, not the terrain */
+    y = 123.0f;
+    if (CampOutdoorInputY(103.0f, 1, 60.0f, 1, EngineGroundOf(60.0f, kEngineGroundFloor), &y) != 1 || y != 3.0f) Fail("measured from the engine's ground (100), not the terrain");
+    /* no ground read: 0, the camp maker's own input (decomp_92f250:262-270) */
+    y = 123.0f; if (CampOutdoorInputY(15418.4f, 0, kNoGround, 1, 100.0f, &y) != 0 || y != 0.0f)   Fail("no terrain answered -> 0");
+    y = 123.0f; if (CampOutdoorInputY(15418.4f, 1, kNoGround, 1, 100.0f, &y) != 0 || y != 0.0f)   Fail("-99 read -> 0");
+    y = 123.0f; if (CampOutdoorInputY(15418.4f, 1, 15418.0f, -1, 0.0f, &y) != 0 || y != 0.0f)    Fail("engine ground not read -> 0");
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    y = 123.0f; if (CampOutdoorInputY(nan, 1, 15418.0f, 1, 15418.0f, &y) != 0 || y != 0.0f)      Fail("NaN record height -> 0");
+    y = 123.0f; if (CampOutdoorInputY(15418.4f, 1, 15418.0f, 1, nan, &y) != 0 || y != 0.0f)      Fail("NaN engine ground -> 0");
 }
 
 void t_t346_record_file_names()

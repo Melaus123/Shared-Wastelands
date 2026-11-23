@@ -32,5 +32,8 @@ void TownVerNoteFailed(const std::string& zoneId, const char* why);             
 void TownVerNoteOffThread();                                                            // ANY THREAD: an area write off the main thread (no note)
 void TownVerNoteOffThreadRead(int sx, int sy);                                         // ANY THREAD: an area file read off the main thread - its notes are forgotten
 void TownVerNoteRead(int sx, int sy, const std::string& zoneId, int loaded, int source, int unreadable, const std::vector<std::pair<std::string, std::string> >& notes, const std::string& path);   // MAIN THREAD: an area file was read - its notes replace that area's
+// T-1391 fold (F1754, the own-work check's town note), MAIN THREAD: placed town key's TOWN_VER record as this game knows it - *held / *heldVer
+// the world server's record held here; *waits / *waitVer this game's own write the world server has not been seen to hold yet
+void TownVerRecordOf(const std::string& key, int* held, std::string* heldVer, int* waits, std::string* waitVer);
 
 }

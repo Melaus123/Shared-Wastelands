@@ -703,7 +703,7 @@ void SoakTick()
         // replicated character, so the detection is free - only the send is new. A knockout that
         // lasts 9 ms is carried by this and by nothing else we have.
         if ((prone != w->lastProne || dead != w->lastDead) && net::IsUidMine(uid))
-            StatePush(uid);
+            StatePushReliable(uid);   // T-540 fold 1 R1: an edge (a wake, a play dead) must reach the copy - its knockout hold waits on it
 
         if (prone != w->lastProne)
         {

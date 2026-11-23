@@ -40,6 +40,7 @@
 #include "addresses.h" /* crash2: AddrReg (the createBody guard's row) */
 #include "store.h"     /* crash2: StoreMainThreadId (the createBody guard skips on the main thread only) */
 #include "../common/copybody.h"   /* crash2: the pure skip rule */
+#include "../common/firsthold.h"  /* T-1449 attempt 2: the first-build hold's book */
 #include "../common/humantest.h"  /* T-293: the human class rule */
 #include "../common/kolook.h"     /* a copy met while its owner says knocked out is dressed before it goes down */
 #include "playerfaction.h"          /* IsStandInFaction: a copy of another player's character (lookKoArrival split) */
@@ -73,6 +74,7 @@ static unsigned long long kHumanVtRva = 0; static coop::AddrReg kHumanVtRva_reg(
 #include <sstream>
 #include <locale>
 #include <cstring>
+#include "../common/charparity.h"   /* T-1463: HeldKitAction - a kit that cannot go on now is dropped and the copy checked again */
 
 namespace coop {
 
@@ -83,6 +85,10 @@ void P210NoteBodyBuild(unsigned int uid);   /* combat.cpp: P091's createBody not
 #endif
 void InvNetNoteAnnounced(void* ch, unsigned int uid);   /* inv2a (items.cpp, declared in items.h) */
 int KitApplyBusy(void* ch, unsigned int uid);            /* T-1 B2 fold (review F2; items.cpp, declared in items.h) */
+void CharParityKitDropped(unsigned int uid, int busy);   /* T-1463 (items.cpp, declared in items.h) */
+void CharParityKitApplied(unsigned int uid, int ok);     /* T-1463 (items.cpp, declared in items.h) */
+void ItemLookNoteRebuild(void* app, unsigned int uid, const char* cls, long long msSinceFirstBuild, int sexRace);   /* T-1449 attempt 2 diagnostic (items.cpp, declared in items.h) */
+int ItemAttHeldPod(void* app, int* withModel, int* withCloth);   /* T-1449 attempt 3 (items.cpp, declared in items.h) */
 
 namespace {
 
@@ -959,6 +965,190 @@ static long CopyBodyHeldCount()
     return n;
 }
 
+// T-1449 attempt 2 (design D1, F1829; src/common/firsthold.h, copybody.h FirstBuildDecide) - A FRESH COPY IS DRAWN FOR THE FIRST TIME
+// ONLY ONCE IT WEARS ITS OWNER'S LOOK AND KIT. A copy made here from a SPAWN (spawn.cpp ApplyRemoteSpawn) carries a first-build mark;
+// the guard below holds its FIRST createBody (no body yet) until the mark is released - on an event only: its owner's kit went on
+// before the build (the look first), the owner said no look / no kit (an APPEARANCE carrying 'NOLK'), a look / kit apply ended without
+// applying, a kit was dropped, a refused record, the owner left or changed (a hand-over), or the early road was refused for any reason
+// but 'a body already' (firsthold::PreBuild - the ordinary road waits for a built body, so a refusal must not keep the build held) -
+// or the copy is this game's own. The mark goes with the copy (CopyBodyForgetUid / CopyBodyForgetAll). Never a timer. MAIN THREAD.
+static firsthold::Book g_fh;
+static LONG g_fhNotBegunBody = 0, g_fhOffMain = 0, g_fhLookSexSkip = 0;
+static LONG g_fhNoLookSent = 0, g_fhNoLookRecv = 0, g_fhNoLookNoHold = 0;
+// fold 1 (review 6): one line cap per kind - held, released, built, dropped / other, no-look
+static LONG g_fhHeldLines = 0, g_fhRelLines = 0, g_fhBuiltLines = 0, g_fhOtherLines = 0, g_fhNoLookLines = 0;
+static const LONG kFhLineCap = 40;
+// the copies' look applies AFTER the first build (the ordinary road) and how many of them set the rebuild byte (+0x143 read 0 before,
+// 1 after) - the not-reached question of F1829, counted
+static LONG g_lookApplyPost = 0, g_lookSet143 = 0, g_lookPre143 = 0;
+// T-1449 attempt 3: ordinary-road look applies (a body exists) that change the copy's sex or race (fold 1) - the sex step drops every item
+// model the body wears (0x5314B0); firstLook = the copy's first look (a fresh copy whose hold did not put it on before the build); lines
+// = the capped per-apply lines written
+static LONG g_lookSexAfterBuild = 0, g_lookSexAfterBuildFirst = 0, g_lookSexAfterBuildLines = 0;
+// T-1449 attempt 2 diagnostic (F1851, log only): each held copy's first build (when, and whether its look was skipped before it for a
+// sex / race change) - for its first look after that build ([FIRSTBUILD] look after first build) and its body rebuilds ([ITEMLOOK]
+// REBUILD, items.cpp). Kept until the copy goes. MAIN THREAD.
+static firsthold::BuiltBook g_fhBuilt;
+static firsthold::AfterCounts g_fhAfter;
+
+static bool FhCap(LONG* n) { if (*n >= kFhLineCap) return false; ++*n; return true; }
+
+// No C++ object with a destructor here (C2712). 1 = read: ent = +0xD8 (the body), ent2 = +0xE0, creating = +0xE8 - both set only inside
+// createBody itself (decomp_539440.txt:123 / 297, decomp_539c50.txt:98 / 336); the deferred build 0x538590 clears +0xE8 at its entry
+// (decomp_538590.txt:131) and +0xE0 when +0xD8 takes the new body (:189-190; a failed build sets +0xE8 again with no body, :258-259):
+// set = a build the hold did not stop is under way (or failed).
+static int PreBuildPod(::Character* c, int* ent, int* ent2, int* creating)
+{
+    *ent = 0; *ent2 = 0; *creating = 0;
+    __try
+    {
+        if (c == 0) return 0;
+        void* app = GetAppearance(c);
+        if (app == 0) return 0;
+        *ent = (*(void**)((char*)app + kAppearanceEntOff) != 0) ? 1 : 0;
+        *ent2 = (*(void**)((char*)app + kAppearanceEntOff + 8) != 0) ? 1 : 0;
+        *creating = (*((unsigned char*)app + kIsCreatingOff) != 0) ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// The appearance's sex byte (+0x140: setAppearanceData compares the record's 'sex female' with it, decomp_5378d0.txt:61-80). -1 = unread.
+static int AppFemalePod(::Character* c)
+{
+    __try
+    {
+        void* app = (c != 0) ? GetAppearance(c) : 0;
+        if (app == 0) return -1;
+        return (*((unsigned char*)app + 0x140) != 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int RecFemale(const RecordCopy& rec)
+{
+    for (size_t i = 0; i < rec.boolKeys.size(); ++i)
+        if (rec.boolKeys[i] == "sex female") return rec.boolVals[i] != 0 ? 1 : 0;
+    return -1;
+}
+
+// fold 2 (review 2): does the owner's look change the copy's race? setAppearanceData looks the race up from the record's 'race' entry
+// (decomp_5378d0.txt:31-36; the key read from the 1.0.65 exe) and on a change calls the character's race-change virtual (vt+0x3B8 =
+// 0x5C8940: the race and the anatomy table, no items - Read, attempt 3) and sets the full-rebuild mark; a race change is judged as the
+// sex change is (firsthold.h SexRaceRoad: before the first build when no item record holds a model). Compared with the copy's own record
+// (its random roll) BEFORE the apply: the string field and the reference list named 'race'. true = changes, or cannot tell.
+static bool RecRaceOf(const RecordCopy& r, std::string* str, std::vector<std::string>* sids)
+{
+    bool any = false;
+    for (size_t i = 0; i < r.strKeys.size() && i < r.strVals.size(); ++i)
+        if (r.strKeys[i] == "race") { *str = r.strVals[i]; any = true; }
+    size_t at = 0;
+    for (size_t k = 0; k < r.refKeys.size() && k < r.refCounts.size(); ++k)
+    {
+        const size_t n = (size_t)(r.refCounts[k] < 0 ? 0 : r.refCounts[k]);
+        if (r.refKeys[k] == "race")
+        {
+            for (size_t j = 0; j < n && at + j < r.refSids.size(); ++j) sids->push_back(r.refSids[at + j]);
+            any = true;
+        }
+        at += n;
+    }
+    return any;
+}
+static bool LookChangesRace(::Character* c, const RecordCopy& rec)
+{
+    RecordCopy cur;
+    if (!CaptureAppearanceRecord(c, &cur)) return true;
+    std::string sa, sb;
+    std::vector<std::string> ra, rb;
+    const bool ha = RecRaceOf(rec, &sa, &ra), hb = RecRaceOf(cur, &sb, &rb);
+    if (!ha && !hb) return false;
+    return ha != hb || sa != sb || ra != rb;
+}
+
+static void FhReleasedLine(unsigned int uid, int why, unsigned long ms)
+{
+    if (!FhCap(&g_fhRelLines)) return;
+    std::map<unsigned int, firsthold::Entry>::const_iterator h = g_fh.m.find(uid);
+    const long calls = (h != g_fh.m.end()) ? h->second.calls : -1;
+    DebugLog("[FIRSTBUILD] uid=" + S((long long)uid) + " first body build RELEASED after ms=" + S((long long)ms) + ": " + firsthold::WhyText(why)
+             + " (heldCalls=" + S((long long)calls) + ") - the engine builds it at its next update; 40 lines at most");
+}
+static void FirstHoldRelease(unsigned int uid, int why)
+{
+    unsigned long ms = 0;
+    if (firsthold::Release(&g_fh, uid, why, ::GetTickCount(), &ms)) FhReleasedLine(uid, why, ms);
+}
+// No kit will come on this road (an owner move dropped it, 'NOLK' what 2, a refused list): released now when the look is done or none
+// waits; else the look's pre-build apply releases it.
+static void FirstHoldNoKit(unsigned int uid, int why)
+{
+    unsigned long ms = 0;
+    const bool lookPending = g_pendingRemote.find(uid) != g_pendingRemote.end() && !firsthold::LookDone(g_fh, uid);
+    if (firsthold::NoKit(&g_fh, uid, why, lookPending, ::GetTickCount(), &ms)) FhReleasedLine(uid, why, ms);
+}
+static void FirstHoldForget(unsigned int uid)
+{
+    unsigned long ms = 0;
+    if (firsthold::Forget(&g_fh, uid, ::GetTickCount(), &ms) == 1 && FhCap(&g_fhOtherLines))
+        DebugLog("[FIRSTBUILD] uid=" + S((long long)uid) + " first-build hold DROPPED unreleased after ms=" + S((long long)ms)
+                 + ": the copy is gone (removed / unloaded / made again); 40 lines at most");
+}
+static void FirstHoldForgetAll() { firsthold::ForgetAll(&g_fh); }
+
+// MAIN THREAD, from AnimalBodyMustWait (both classes). true = hold this createBody (a first build whose mark is not released).
+static bool FirstBuildStep(const CopyBodyRead& r, const char* cls)
+{
+    if (r.uid == 0 || g_fh.m.empty()) return false;
+    firsthold::Entry gone;
+    int firstHeld = 0;
+    const unsigned long now = ::GetTickCount();
+    const int d = firsthold::BuildStep(&g_fh, r.uid, r.owned, r.entity, r.fault, &gone, &firstHeld);
+    if (d == coopbody::kFirstWait)
+    {
+        if (firstHeld != 0 && FhCap(&g_fhHeldLines))
+            DebugLog("[FIRSTBUILD] uid=" + S((long long)r.uid) + cls + " first body build HELD until its owner's look and kit are on"
+                     " (ms since made=" + S((long long)(now - g_fh.m[r.uid].since)) + "); 40 lines at most");
+        return true;
+    }
+    if (d == coopbody::kFirstNone) return false;   // no mark, or a read fault: the ordinary rule decides, the mark stays
+    const unsigned long ms = now - gone.since;
+    if (d == coopbody::kFirstRunReleased || d == coopbody::kFirstRunOwned)
+        firsthold::NoteBuilt(&g_fhBuilt, r.uid, now, gone.lookSkipped ? 1 : 0);   // T-1449 attempt 2 diagnostic (F1851): log only
+    if (d == coopbody::kFirstRunReleased)
+    {
+        if (FhCap(&g_fhBuiltLines))
+            DebugLog("[FIRSTBUILD] uid=" + S((long long)r.uid) + cls + " first BUILT " + (gone.kitPre ? "with its owner's kit" : "WITHOUT its owner's kit")
+                     + " (" + firsthold::WhyText(gone.why) + "; ms since made=" + S((long long)ms) + " heldCalls=" + S((long long)gone.calls)
+                     + " lookBefore=" + S((long long)(gone.lookPre ? 1 : 0)) + " lookSkipped=" + S((long long)(gone.lookSkipped ? 1 : 0))
+                     + " sexRaceBefore=" + S((long long)(gone.sexRacePre ? 1 : 0)) + "); 40 lines at most");
+    }
+    else if (d == coopbody::kFirstRunOwned)
+    {
+        if (FhCap(&g_fhOtherLines))
+            DebugLog("[FIRSTBUILD] uid=" + S((long long)r.uid) + cls + " first body build RUNS: this game owns the character now (released="
+                     + S((long long)(gone.released ? 1 : 0)) + " ms since made=" + S((long long)ms) + ")");
+    }
+    else if (FhCap(&g_fhOtherLines))
+        DebugLog("[FIRSTBUILD] uid=" + S((long long)r.uid) + cls + " first-build mark found a body already - not a first build, the mark goes");
+    return false;
+}
+
+// MAIN THREAD. true = a look / kit for uid goes on before the copy's first build. A refusal other than 'a body already' releases the
+// hold (logged with its reason): the ordinary road waits for a built body, which a held build never becomes.
+static bool FirstPreBuildNow(unsigned int uid, ::Character* c)
+{
+    if (!firsthold::HeldNow(g_fh, uid)) return false;
+    int e = 0, e2 = 0, cr = 0, why = 0;
+    unsigned long ms = 0;
+    const int readOk = PreBuildPod(c, &e, &e2, &cr);
+    const int r = firsthold::PreBuild(&g_fh, uid, readOk, e, e2, cr, ::GetTickCount(), &why, &ms);
+    if (r == firsthold::kPreApply) return true;
+    if (r == firsthold::kPreReleased) FhReleasedLine(uid, why, ms);
+    else if (r == firsthold::kPreHadBody && FhCap(&g_fhOtherLines))
+        DebugLog("[FIRSTBUILD] uid=" + S((long long)uid) + " first-build mark found a body already at a look / kit apply - the mark goes");
+    return false;
+}
+
 // MAIN THREAD. T-293 fold 2 (F3-b): the copy is gone - its guard marks go with it.
 static void CopyBodyForgetUid(unsigned int uid)
 {
@@ -966,6 +1156,8 @@ static void CopyBodyForgetUid(unsigned int uid)
     g_copyBodyUidsEver.erase(uid);
     g_copyBodyModQueued.erase(uid);   // a rebuild the mod queued on the gone body is gone with it
     CopyBodyHeldRemove(uid);
+    FirstHoldForget(uid);   // T-1449 attempt 2: the first-build mark goes with the copy
+    g_fhBuilt.erase(uid);   // T-1449 attempt 2 diagnostic: its first-build note too
 }
 
 // MAIN THREAD. Every copy is gone (world teardown, a world load): every guard mark goes with them.
@@ -974,6 +1166,8 @@ static void CopyBodyForgetAll()
     g_copyBodyEpisodes.clear();
     g_copyBodyUidsEver.clear();
     g_copyBodyModQueued.clear();   // the mod's queued-rebuild marks describe the old world's bodies
+    FirstHoldForgetAll();   // T-1449 attempt 2: the first-build marks describe the old world's copies
+    g_fhBuilt.clear();      // T-1449 attempt 2 diagnostic: and its first-build notes
     for (int i = 0; i < kCopyBodyHeldSlots; ++i) ::InterlockedExchange(&g_copyBodyHeldUid[i], 0);
 }
 
@@ -1269,6 +1463,7 @@ static bool AnimalBodyMustWait(void* app, int human)
     CopyBodyWorldCheck();   // the maps below belong to this world load
     CopyBodyRead r;
     CopyBodyReadPod(app, &r);
+    if (FirstBuildStep(r, cls)) return true;   // T-1449 attempt 2: a fresh copy's first build waits for its owner's look and kit
     const int inPass = (g_ragdollPassDepth > 0) ? 1 : 0;
     const DWORD now = ::GetTickCount();
     std::map<unsigned int, CopyBodyEpisode>::iterator e = (r.uid != 0) ? g_copyBodyEpisodes.find(r.uid) : g_copyBodyEpisodes.end();
@@ -1284,6 +1479,15 @@ static bool AnimalBodyMustWait(void* app, int human)
     BodyTestRagdollOutcome(r.uid, human, decided, r.ragdoll, r.ragdollOffReady, inPass, r.fault);   // TEST-ONLY lever: returns at once unless armed
     if (decided == coopbody::kCopyBodyRun)
     {
+        // T-1449 attempt 2 diagnostic (F1851, log only): a createBody on a body destroys every attached item model
+        // (decomp_539440.txt:233-261) - its young looks are noted before the engine's call
+        if (r.entity != 0 && r.fault == 0 && r.uid != 0)
+        {
+            long long sinceFirst = -1;
+            int sexRace = -1;
+            firsthold::SinceBuilt(g_fhBuilt, r.uid, now, &sinceFirst, &sexRace);
+            ItemLookNoteRebuild(app, r.uid, cls, sinceFirst, sexRace);
+        }
         if (modMarked) g_copyBodyModQueued.erase(mk);   // the rebuild the mod queued runs now
         if (!inEpisode)
         {
@@ -1826,6 +2030,89 @@ void QueueRemoteRecord(unsigned int uid, const RecordCopy& rec)
     ++g_c.queued;
 }
 
+// T-1449 attempt 2. OWNER: the games that made a copy of uid from its SPAWN hold its first build for the look and kit - when the look
+// (kNoLookNone) or the kit (kNoLookNoKit) will not go on this road, they are told, so that hold ends on a fact. MAIN THREAD.
+static void SendNoLookOwned(unsigned int uid, int what, const char* road)
+{
+    if (!net::SendNoLook(uid, what)) return;
+    ++g_fhNoLookSent;
+    if (FhCap(&g_fhNoLookLines))
+        DebugLog("[FIRSTBUILD] -> NOLK uid=" + S((long long)uid) + " what=" + S((long long)what) + " (" + road + "); 40 lines at most");
+}
+
+// T-1449 fold 2 (review 1). OWNER, the settle send: 'settled' = +0x141 and +0x142 both clear (AppearanceSettled), and AppearanceBase::
+// update clears them only when a body exists or is being made (+0xD8 / +0xE0), none is under way (+0xE8 clear), its entity is
+// initialised and no rebuild is pending (+0x143 clear) (decomp_5382a0.txt:19-28, 33-35, 116-118). Two states do not end by
+// themselves: NO BODY AND NO BUILD COMING (+0xD8 / +0xE0 / +0xE8 / +0x143 all clear) and A REBUILD THE GUARD HOLDS (an animal / limp human
+// lying in ragdoll - a dead one may lie there for good). At the first settle check that reads one of them the other games are told
+// 'no look' once (an event, not a timer); the uid stays watched, and if it settles later its look and kit go out (a re-dress then).
+static int CreateBodyPendingPod(::Character* c);   // below (the createBody-pending read)
+static std::map<unsigned int, char> g_settleToldNoLook;
+static LONG g_settleToldNoBody = 0, g_settleToldHeld = 0;
+static void SettleStuckTell(unsigned int uid, ::Character* c)
+{
+    if (g_settleToldNoLook.find(uid) != g_settleToldNoLook.end()) return;
+    int e = 0, e2 = 0, cr = 0;
+    const int readOk = PreBuildPod(c, &e, &e2, &cr);
+    const int pend = CreateBodyPendingPod(c);
+    const bool noBuild = readOk == 1 && e == 0 && e2 == 0 && cr == 0 && pend == 0;
+    const bool held = g_copyBodyEpisodes.find(uid) != g_copyBodyEpisodes.end();
+    if (!noBuild && !held) return;
+    g_settleToldNoLook[uid] = 1;
+    if (noBuild) ++g_settleToldNoBody; else ++g_settleToldHeld;
+    SendNoLookOwned(uid, coopbody::kNoLookNone, noBuild ? "settle send: no body and no build coming - its look cannot settle"
+                                                         : "settle send: its body rebuild is held (ragdoll) - its look cannot settle yet");
+}
+
+// T-1449 attempt 2. RECEIVER (spawn.cpp ApplyRemoteSpawn): a copy just made from a SPAWN with the game's create call - its first
+// body build waits for its owner's look and kit (the guard, FirstBuildStep). Not marked: this game's own uid, or a copy that
+// already has a body or one under way. MAIN THREAD (off it: counted, not marked).
+void FirstBuildHoldBegin(unsigned int uid, ::Character* c)
+{
+    const unsigned long m = StoreMainThreadId();
+    if (m == 0 || ::GetCurrentThreadId() != (DWORD)m) { ++g_fhOffMain; return; }
+    if (uid == 0 || c == 0 || net::IsUidMine(uid)) return;
+    CopyBodyWorldCheck();   // first, so a mark placed early in a new world is not wiped by the guard's first check of that world
+    int e = 0, e2 = 0, cr = 0;
+    if (PreBuildPod(c, &e, &e2, &cr) != 1 || e != 0 || e2 != 0 || cr != 0)
+    {
+        ++g_fhNotBegunBody;
+        if (FhCap(&g_fhOtherLines))
+            DebugLog("[FIRSTBUILD] uid=" + S((long long)uid) + " made from a SPAWN but NOT held: it has a body or one under way (body="
+                     + S((long long)e) + "," + S((long long)e2) + " creating=" + S((long long)cr) + ")");
+        return;
+    }
+    if (firsthold::Begin(&g_fh, uid, ::GetTickCount()) != 0 && FhCap(&g_fhOtherLines))   // fold 1 (review 8)
+        DebugLog("[FIRSTBUILD] uid=" + S((long long)uid) + " a first-build mark of an earlier copy of this uid was still there - replaced by this"
+                 " copy's fresh mark (the old one's look / kit belonged to the old body)");
+}
+
+// T-1449 attempt 2. RECEIVER (net/session.cpp OnAppearance / OnClothing): the owner said no look and no kit (kNoLookNone; also a
+// look record this game refused) or no kit (kNoLookNoKit; also a kit list this game refused) will come for uid. MAIN THREAD.
+void FirstBuildNoLook(unsigned int uid, int what)
+{
+    ++g_fhNoLookRecv;
+    if (!firsthold::HeldNow(g_fh, uid)) { ++g_fhNoLookNoHold; return; }
+    if (FhCap(&g_fhNoLookLines))
+        DebugLog("[FIRSTBUILD] <- NOLK uid=" + S((long long)uid) + " what=" + S((long long)what) + " (a held first build); 40 lines at most");
+    if (what == coopbody::kNoLookNoKit) FirstHoldNoKit(uid, firsthold::kWhyNoKit);
+    else FirstHoldRelease(uid, firsthold::kWhyNoLook);
+}
+
+// T-1449 attempt 2. RECEIVER (net/session.cpp OnPlayerGone): the owner left - no look or kit will come from it. MAIN THREAD.
+void FirstBuildOwnerGone(unsigned int uid)
+{
+    FirstHoldRelease(uid, firsthold::kWhyOwnerGone);
+}
+
+// fold 1 (review minor 1). RECEIVER (net/session.cpp SessionOwnerMovedApply / the ROSTER re-key): another game took the character - the old
+// owner's look / no-look would now be refused by the relay owner check, so the hold ends here and the new owner's look, if it sends one,
+// goes on by the ordinary road. MAIN THREAD.
+void FirstBuildOwnerChanged(unsigned int uid)
+{
+    FirstHoldRelease(uid, firsthold::kWhyOwnerChanged);
+}
+
 void WatchLocalRoll(unsigned int uid)
 {
     g_pendingLocal[uid] = true;
@@ -1985,8 +2272,9 @@ void DeadlookNoteItemTouch(unsigned int uid, const std::string& section)
 
 // T-293 fold 1 (review F1). MAIN THREAD (items.cpp ApplyItemMove, before the copy is found or the move tried). The owner is the
 // authority: its add / remove / split in a WORN section means a clothing list still waiting for this copy describes gear it no
-// longer wears. The list is DROPPED - applied or not, dead or alive - not trimmed: the apply rebuilds every worn slot (clearAll /
-// ClearWornSections), so a list without the moved slot would still undo the owner's move on the copy, and the owner never re-sends
+// longer wears. The list is DROPPED - applied or not, dead or alive - not trimmed: the apply makes every worn slot match the list
+// (clothing.cpp ApplyGarmentsBody: since T-1449 by changes only), so a list without the moved slot would still undo the owner's
+// move on the copy, and the owner never re-sends
 // clothing after a live strip (only at first settle and after a wandering restock). The copy keeps what it wears plus the owner's
 // moves. MSG_CLOTHING and MSG_ITEM_MOVE both ride CH_RELIABLE and are handled as they arrive (session.cpp OnClothing /
 // OnItemMove), so a list queued AFTER this move was sent after it and is applied as usual - no separate "stale" mark is needed.
@@ -2003,6 +2291,7 @@ void GarmentsNoteOwnerMove(unsigned int uid, const std::string& section, int op)
     g_waitKitOpen.erase(uid);
     g_waitKitDownGuard.erase(uid);   // T-1244
     ++g_kitStaleDropped;
+    FirstHoldNoKit(uid, firsthold::kWhyKitDropped);   // T-1449 attempt 2: this kit will not go on - a held first build is not kept for it
     if (++g_kitStaleLines <= 50)
         SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " DROPPED before it was applied - the owner moved an item in its '" + section
                  + "' section (op " + S((long long)op) + ") since the list was sent; the copy keeps its gear plus the owner's"
@@ -2381,6 +2670,32 @@ std::string KoSelfLever(unsigned int uid, float seconds)
 
 unsigned int KoSelfLastUid() { return g_koSelfLastUid; }
 
+#ifdef SW_DEV_BUILD
+// T-540 TEST-ONLY lever (DEV build only - not compiled in a release build, whose command_channel.cpp refuses the form): `koself <uid|made:<label>> short` - on
+// the game that DRIVES <uid>, the engine's own knockout at strength 0, so its clock is the engine's 3 s floor (T633; T3015's
+// koT=3.00 knock-outs), and its STATE pushed as `koself` pushes it. No hold, no check ticks, no koself counter touched: every
+// other koself form is unchanged. One [KOSELF] line. MAIN THREAD.
+static LONG g_koShortCalls = 0;
+std::string KoSelfShortLever(unsigned int uid)
+{
+    if (uid == 0) return "error koself short usage: koself <uid|made:<label>> short";
+    if (!net::IsUidMine(uid))
+    {
+        DebugLog("[KOSELF] TEST-ONLY short knock-out uid=" + S((long long)uid) + " refused: this game does not drive it (run it on the owner)");
+        return "error koself short: uid " + S((long long)uid) + " is not driven by this game";
+    }
+    if (FindSpawned(uid) == 0) return "error koself short: no character with uid " + S((long long)uid) + " on this game";
+    float before = -1.0f, after = -1.0f; int prone = -1;
+    const int unc = KnockOutOwnedShort(uid, &before, &after, &prone);
+    const LONG n = ::InterlockedIncrement(&g_koShortCalls);
+    const std::string line = "uid=" + S((long long)uid) + " koT " + P10F(before) + " -> " + P10F(after) + " prone(before)="
+        + S((long long)prone) + " unc(now)=" + S((long long)unc) + " (engine knockout strength 0 = its 3 s floor; no hold; STATE pushed) calls="
+        + S((long long)n);
+    DebugLog("[KOSELF] TEST-ONLY short knock-out " + line);
+    return std::string(unc >= 0 ? "ok koself short " : "error koself short ") + line;
+}
+#endif
+
 // T-1411 TEST-ONLY: the `koself <uid> <seconds>` hold LASTS. T2533: the hold was one write of the wake-up clock (420 s), and
 // the engine's own put-down (an NPC's order 69) set the clock again to 14.48 s - the body stood up 9 s later, 86 s into a
 // 420 s hold. Now each hold is kept (at most kKoHoldMax uids, a new koself of a held uid re-arms it) until its real-time end:
@@ -2684,15 +2999,20 @@ static void P10LeverTick()
 /* M7a (T-197 piece 7a): THE CATCH-UP'S LOOKS. The settle below sends an owned character's looks ONCE; a game that comes to have
    the area later is sent them again here (worldsync.cpp WorldsyncCatchupAsk, the stream addressed to that game). A character
    still waiting to settle is skipped: its settle sends to everyone who has the area. MAIN THREAD. */
+// T-1449 attempt 2: a game that made a copy from this SPAWN holds its first build for the look and kit - when neither (or no kit) goes,
+// the owner says so ('NOLK', SendNoLookOwned). A character still waiting to settle is watched (WatchLocalRoll): its settle send sends
+// both or says so.
 bool AppearanceResendOwned(unsigned int uid)
 {
     if (g_pendingLocal.find(uid) != g_pendingLocal.end()) return false;
     ::Character* c = FindSpawned(uid);
-    if (c == 0 || !AppearanceSettled(c)) return false;
+    if (c == 0) { SendNoLookOwned(uid, coopbody::kNoLookNone, "catch-up: no character to read"); return false; }
+    if (!AppearanceSettled(c)) { WatchLocalRoll(uid); return false; }   // fold 1 (review 3): its settle send sends the look and kit, or says no
     RecordCopy rec;
-    if (!CaptureAppearanceRecord(c, &rec) || !net::SendAppearance(uid, rec)) return false;
+    if (!CaptureAppearanceRecord(c, &rec) || !net::SendAppearance(uid, rec))
+    { SendNoLookOwned(uid, coopbody::kNoLookNone, "catch-up: its look could not be read or sent"); return false; }
     GarmentSet worn;
-    if (CaptureGarments(c, &worn)) net::SendClothing(uid, worn);
+    if (!(CaptureGarments(c, &worn) && net::SendClothing(uid, worn))) SendNoLookOwned(uid, coopbody::kNoLookNoKit, "catch-up: its kit could not be read or sent");
     return true;
 }
 
@@ -2706,7 +3026,7 @@ bool AppearanceResendOwned(unsigned int uid)
 // character is gone, or at world teardown. Result per uid (given once, at the first of: applied, failed, deadline, gone):
 // 0 waiting, 1 applied and both sent, 2 applied and a send failed, 3 not applied in time (still queued), 4 the apply failed
 // (2-4: handed to the settle send), -1 the character is gone. MAIN THREAD.
-struct OwnLookWait { RecordCopy rec; DWORD at; bool late; };
+struct OwnLookWait { RecordCopy rec; DWORD at; bool late; bool toldNoLook; };
 static std::map<unsigned int, OwnLookWait> g_ownLook;
 static std::map<unsigned int, int> g_ownLookResult;
 static const DWORD kOwnLookWaitMs = 60000;
@@ -2717,6 +3037,7 @@ void OwnLookQueue(unsigned int uid, const RecordCopy& rec)
     w.rec = rec;
     w.at = ::GetTickCount();
     w.late = false;
+    w.toldNoLook = false;
     g_ownLookResult[uid] = 0;
 }
 
@@ -2758,10 +3079,16 @@ static void OwnLookTick()
         OwnBodyHoldPod(c, &ragdoll, &ready, &fault);
         BodyTestRead br;
         const int human = (DeadHumanPod(c) == 1) ? 1 : 0;   // as LookTestTick: unreadable reads as an animal (stricter)
-        if (coopbody::CopyBodyDecide(1, human, 1, 1, 1, 1, ragdoll, ready, 0, fault) == coopbody::kCopyBodyWait) { ++it; continue; }
-        BodyTestReadPod(c, &br);
-        if (br.ok == 0 || (br.blend != 0 && br.running != 0)) { ++it; continue; }
-        if (CopyDownedPod(c) != 0 || !AppearanceSettled(c) || !CharacterBuilt(c, 0)) { ++it; continue; }
+        bool bodyReady = coopbody::CopyBodyDecide(1, human, 1, 1, 1, 1, ragdoll, ready, 0, fault) != coopbody::kCopyBodyWait;
+        if (bodyReady) { BodyTestReadPod(c, &br); bodyReady = !(br.ok == 0 || (br.blend != 0 && br.running != 0)); }
+        if (bodyReady) bodyReady = !(CopyDownedPod(c) != 0 || !AppearanceSettled(c) || !CharacterBuilt(c, 0));
+        if (!bodyReady)
+        {
+            // T-1449 fold 1 (review 2): the other games hold this copy's first build for its look - told once, now, that it cannot be
+            // read yet, so the copy is drawn; the look and kit go out when the body takes the record (a re-dress then)
+            if (!it->second.toldNoLook) { it->second.toldNoLook = true; SendNoLookOwned(uid, coopbody::kNoLookNone, "brought back: its body cannot take its own record yet"); }
+            ++it; continue;
+        }
         int r = 4;
         const bool applied = ApplyAppearanceRecord(c, it->second.rec);
         CopyBodyNoteModApply(uid, c);   // a rebuild this apply queued is held as the mod's own
@@ -2810,8 +3137,9 @@ void AppearanceTick()
         {
             unsigned int uid = it->first;
             ::Character* c = FindSpawned(uid);
-            if (c == 0) { g_pendingLocal.erase(it++); continue; }
-            if (!AppearanceSettled(c)) { ++it; continue; }
+            if (c == 0) { g_settleToldNoLook.erase(uid); g_pendingLocal.erase(it++); continue; }
+            if (!AppearanceSettled(c)) { SettleStuckTell(uid, c); ++it; continue; }   // T-1449 fold 2
+            g_settleToldNoLook.erase(uid);
 
             RecordCopy rec;
             if (CaptureAppearanceRecord(c, &rec) && net::SendAppearance(uid, rec))
@@ -2827,10 +3155,12 @@ void AppearanceTick()
                     SW_DEVLOG("[P022] -> CLOTHING uid=" + S(uid) + " " + GarmentSummary(worn));
                     InvNetNoteAnnounced((void*)c, uid);   /* inv2a: the safety net's baseline for this character is what was just sent */
                 }
+                else SendNoLookOwned(uid, coopbody::kNoLookNoKit, "settle send: its kit could not be read or sent");   // T-1449 attempt 2
             }
             else
             {
                 ++g_c.captureFailed;
+                SendNoLookOwned(uid, coopbody::kNoLookNone, "settle send: its look could not be read or sent");   // T-1449 attempt 2
                 ErrorLog("[P019] capture FAILED for owned uid " + S(uid)
                          + " - the peer will keep its own roll");
             }
@@ -2851,6 +3181,63 @@ void AppearanceTick()
             unsigned int uid = it->first;
             ::Character* c = FindSpawned(uid);
             if (c == 0) { ++it; continue; }              // may arrive before the spawn does
+            // T-1449 attempt 2 (F1829): a fresh copy whose first build is held takes its owner's look BEFORE that build - the record
+            // writes and setAppearanceData only (updateAppearance returns at once with no body, +0xD8 empty, decomp_532a40.txt:31-33,
+            // so it is not called; setAppearanceData's +0x142 / +0x143 marks only steps the first build runs anyway). Down / dead /
+            // knocked-out holds are for a body; there is none yet.
+            if (FirstPreBuildNow(uid, c))
+            {
+                // T-1449 attempt 3 (F1864 + its check; firsthold.h SexRaceRoad): a look that changes the copy's sex or race goes on
+                // before the first build too. Its sex step (appearance vt+0x28 = 0x52D530 -> 0x52D0F0) destroys every attached item
+                // record's model and cloth part (0x5314B0) - after the build that drops the models the build just made and leaves a
+                // look still loading black (T2758). Before the build no record holds either (they are made only by the attach step,
+                // which needs a body) and the step reads only data - body-free (Read, the proof in firsthold.h). Decided here from the
+                // records themselves: one holding a model / cloth part, or an unread walk, leaves the look for after the build
+                // (attempt 2's road, counted; expected 0); the kit still goes on before.
+                if (firsthold::WasSkipped(g_fh, uid)) { ++it; continue; }   // fold 1: decided once - this look goes on after the build
+                const int recF0 = RecFemale(it->second), appF = AppFemalePod(c);
+                const int recF = recF0 < 0 ? 0 : recF0;   // no field: setAppearanceData reads it as false
+                const bool raceChange = LookChangesRace(c, it->second);   // a race change as a sex change (attempt 2 fold 2)
+                const int sexRaceChange = raceChange ? 1 : (appF < 0 ? -1 : (recF != appF ? 1 : 0));
+                int heldModels = 0, heldCloth = 0;
+                const int recsRead = (sexRaceChange != 0) ? ItemAttHeldPod(GetAppearance(c), &heldModels, &heldCloth) : 0;
+                const int sexRaceRoad = firsthold::SexRaceRoad(sexRaceChange, recsRead, heldModels, heldCloth);
+                if (sexRaceRoad == firsthold::kSexRaceAfter)
+                {
+                    if (!firsthold::LookDone(g_fh, uid))
+                    {
+                        ++g_fhLookSexSkip;
+                        unsigned long ms = 0;
+                        if (firsthold::LookSkipped(&g_fh, uid, ::GetTickCount(), &ms)) FhReleasedLine(uid, firsthold::kWhyNoKit, ms);
+                        if (FhCap(&g_fhOtherLines))
+                            DebugLog("[FIRSTBUILD] uid=" + S((long long)uid) + " its owner's look changes its " + (raceChange ? "race" : "sex") + " (sex: record "
+                                     + S((long long)recF) + ", body " + S((long long)appF) + ") but an item record already holds a model / cloth part"
+                                     " (records=" + S((long long)recsRead) + " models=" + S((long long)heldModels) + " cloth=" + S((long long)heldCloth)
+                                     + "; -1 = unread) - not put on before the first build; it goes on after it (the kit still goes on before); 40 lines at most");
+                    }
+                    ++it; continue;
+                }
+                const bool okPre = ApplyAppearanceRecord(c, it->second, false);
+                if (okPre) { ++g_c.applied; g_appearanceDone[uid] = true; g_copyLookApplied[uid] = true; }
+                else ++g_c.applyFailed;
+                coop::SpawnDeathNoteLookApplied(uid, okPre);
+                if (okPre && sexRaceRoad == firsthold::kSexRaceBefore)
+                {
+                    firsthold::SexRaceBefore(&g_fh, uid);
+                    if (FhCap(&g_fhOtherLines))
+                        DebugLog("[FIRSTBUILD] uid=" + S((long long)uid) + " its owner's look changes its " + (raceChange ? "race" : "sex") + " (sex: record "
+                                 + S((long long)recF) + ", body " + S((long long)appF) + ") - put on BEFORE the first build (records="
+                                 + S((long long)recsRead) + ", none holds a model / cloth part); 40 lines at most");
+                }
+                {
+                    int why = 0; unsigned long ms = 0;
+                    if (firsthold::LookPre(&g_fh, uid, okPre, ::GetTickCount(), &why, &ms)) FhReleasedLine(uid, why, ms);
+                }
+                SW_DEVLOG_OR_FAIL(!okPre, "[P019] <- APPEARANCE uid=" + S(uid) + (okPre ? " applied BEFORE its first body build (record + setAppearanceData; T-1449)"
+                                                                                  : " FAILED before its first body build - its first build is released"));
+                g_pendingRemote.erase(it++);
+                continue;
+            }
             if (!AppearanceSettled(c)) { ++it; continue; }
             // R1-a: updateAppearance (0x532A40) reads the body's scene node unchecked, so a
             // settled character whose body is still being built waits too (read-r1 Q4).
@@ -2890,7 +3277,48 @@ void AppearanceTick()
                                                                      lookDeadWanted, lookFirst, lookHeld);
 
             std::string before = AppearanceString(c);
+            const int pre143 = CreateBodyPendingPod(c);   // T-1449 attempt 2: does this apply set the rebuild byte?
+            {
+                // T-1449 attempt 3 (fold 1): an apply on a body that changes the copy's sex or race - the sex step drops every item model
+                // the body wears (0x5314B0) and a look still loading stays black; a race change marks a full rebuild. Counted, with a
+                // capped line per apply (uid, which, ms since its first build, models worn) - the mid-life road; a fresh copy's should
+                // now go before its build
+                const int pf0 = RecFemale(it->second), paf = AppFemalePod(c);
+                const int sexFlip = (paf >= 0 && (pf0 < 0 ? 0 : pf0) != paf) ? 1 : 0;
+                const int raceFlip = LookChangesRace(c, it->second) ? 1 : 0;
+                if (sexFlip != 0 || raceFlip != 0)
+                {
+                    ++g_lookSexAfterBuild;
+                    if (lookFirst) ++g_lookSexAfterBuildFirst;
+                    if (g_lookSexAfterBuildLines < firsthold::kMidLifeLineCap)
+                    {
+                        ++g_lookSexAfterBuildLines;
+                        int mm = 0, mc = 0;
+                        const int nr = ItemAttHeldPod(GetAppearance(c), &mm, &mc);
+                        long long sinceFirst = -1;
+                        int sr0 = -1;
+                        firsthold::SinceBuilt(g_fhBuilt, uid, ::GetTickCount(), &sinceFirst, &sr0);
+                        DebugLog(firsthold::MidLifeLine(uid, sexFlip, raceFlip, sinceFirst, nr < 0 ? -1 : mm, lookFirst ? 1 : 0));
+                    }
+                }
+            }
             bool ok = ApplyAppearanceRecord(c, it->second);
+            ++g_lookApplyPost;
+            if (pre143 != 0) ++g_lookPre143;
+            else if (CreateBodyPendingPod(c) == 1) ++g_lookSet143;
+            {
+                // T-1449 attempt 2 diagnostic (F1851, log only): a held copy's first look after its first build - how soon, and was it
+                // the sex / race road (its look skipped before the build)
+                const int post143 = (pre143 != 0) ? 2 : CreateBodyPendingPod(c);
+                long long sinceFirst = -1;
+                int sexRace = -1;
+                if (firsthold::AfterBuildLook(&g_fhBuilt, &g_fhAfter, uid, ::GetTickCount(), post143 < 0 ? -1 : post143, &sinceFirst, &sexRace)
+                    && g_fhAfter.lines < firsthold::kAfterLineCap)
+                {
+                    ++g_fhAfter.lines;
+                    DebugLog(firsthold::AfterBuildLookLine(uid, sinceFirst, sexRace, post143 < 0 ? -1 : post143));
+                }
+            }
             CopyBodyNoteModApply(uid, c);   // held as a copy's even if the uid becomes this game's own first
             if (ok) { ++g_c.applied; g_appearanceDone[uid] = true; g_copyLookApplied[uid] = true; }
             else    ++g_c.applyFailed;
@@ -3004,6 +3432,34 @@ void ApplyPendingGarments()
             g_waitKitDownGuard.erase(uid);   // T-1244
             g_pendingGarments.erase(it++);
             continue;
+        }
+        // T-1449 attempt 2 (F1829): a fresh copy whose first build is held takes its owner's kit BEFORE that build, once its owner's look
+        // has gone on before it - inventory-only changes (the kit apply queues only +0x141, never a body rebuild); then the build runs.
+        {
+            ::Character* pc = FindSpawned(uid);
+            if (pc != 0 && FirstPreBuildNow(uid, pc))
+            {
+                if (!firsthold::LookDone(g_fh, uid)) { ++it; continue; }   // the look first (before the build, or skipped for a sex change)
+                // fold 2 (review 5): something still holds one of its items (a window / the cursor / a request) - the hold is released
+                // rather than kept for that (the kit then takes the ordinary road after the build: while something still holds one of
+                // its items there it is DROPPED and the character asked again once clear - T-1463, ApplyPendingGarments)
+                if (KitApplyBusy((void*)pc, uid) != 0) { FirstHoldRelease(uid, firsthold::kWhyKitBusy); ++it; continue; }
+                const bool okKit = ApplyGarments(pc, it->second);
+                CopyBodyNoteModApply(uid, pc);
+                SW_DEVLOG_OR_FAIL(!okKit, "[P022] <- CLOTHING uid=" + S(uid) + (okKit ? " applied BEFORE its first body build (inventory only; T-1449) "
+                                                                                 : " FAILED before its first body build - its first build is released ")
+                                          + GarmentSummary(it->second));
+                {
+                    unsigned long ms = 0;
+                    if (firsthold::KitPre(&g_fh, uid, okKit, ::GetTickCount(), &ms)) FhReleasedLine(uid, okKit ? firsthold::kWhyKit : firsthold::kWhyKitFailed, ms);
+                }
+                g_waitClothingForAppearance.erase(uid);
+                g_waitNotBuiltClothing.erase(uid);
+                g_waitDownedClothing.erase(uid);
+                g_waitKitOpen.erase(uid);
+                g_pendingGarments.erase(it++);
+                continue;
+            }
         }
         // deadlook1 (owner decision 2026-09-26): a DEAD HUMAN copy takes its clothing without its appearance - the
         // appearance is never applied to a corpse, so "clothing waits for the appearance" would hold it for good. Only the
@@ -3121,23 +3577,23 @@ void ApplyPendingGarments()
             g_deadHeldReason.erase(uid);
         }
         g_waitDownedClothing.erase(uid);
-        // T-1 B2 fold (review F2): the apply destroys and rebuilds every item the copy and its packs hold (clearAll). Since T-1 B2 a
-        // LIVE pack wearer's kit is resent after the writer's wandering restock, so this can land mid-life: it waits while this game
-        // still holds one of those items by pointer - an inventory window on it or one of its packs, an item from it on the cursor,
-        // a request against it awaiting its answer (items.cpp KitApplyBusy). Re-asked every tick; the entry is never dropped here.
+        // T-1 B2 fold (review F2): the apply takes out, destroys, rewrites and adds items of the copy and its packs (since T-1449 only
+        // what differs from the kit, clothing.cpp ApplyGarmentsBody). Since T-1 B2 a
+        // LIVE pack wearer's kit is resent after the writer's wandering restock, so this can land mid-life. While this game still holds
+        // one of those items by pointer - an inventory window on it or one of its packs, an item from it on the cursor, a request
+        // against it awaiting its answer (items.cpp KitApplyBusy) - the kit is not applied.
+        // T-1463 (3) (charparity.h HeldKitAction): it is DROPPED, not held - applied later it could undo newer single-item changes made
+        // meanwhile; the copy is checked again once nothing holds it (items.cpp CharParityKitDropped -> the character check), and the
+        // runner answers equal or sends its kit as it is then. Counted kitOpen[kitApplyDeferredOpen, window, cursor, request].
         const int busy = KitApplyBusy((void*)c, uid);
-        if (busy != 0)
+        if (coopcharpar::HeldKitAction(busy) == coopcharpar::kKitDropAsk)
         {
-            if (g_waitKitOpen.insert(std::make_pair(uid, true)).second)
-            {
-                ++g_kitApplyDeferredOpen;
-                if (busy >= 1 && busy <= 3) ++g_kitDeferredWhy[busy - 1];
-                if (g_kitApplyDeferredOpen == 1)
-                    SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " HELD - an inventory window, the cursor or a pending request still"
-                             " holds one of its items (reason " + S((long long)busy) + "); applied once clear (T-1 B2 fold; said once,"
-                             " counted as kitOpen[kitApplyDeferredOpen])");
-            }
-            ++it; continue;
+            ++g_kitApplyDeferredOpen;
+            if (busy >= 1 && busy <= 3) ++g_kitDeferredWhy[busy - 1];
+            g_waitKitOpen.erase(uid);
+            CharParityKitDropped(uid, busy);
+            g_pendingGarments.erase(it++);
+            continue;
         }
         g_waitKitOpen.erase(uid);
 
@@ -3145,6 +3601,7 @@ void ApplyPendingGarments()
         // deadlook1 fold 1: a dead copy gets its WORN slots only (clothing.cpp ApplyWornGarments); everything else stays.
         bool ok = deadApply ? ApplyWornGarments(c, it->second) : ApplyGarments(c, it->second);
         CopyBodyNoteModApply(uid, c);   // a rebuild the kit apply queued is held as a copy's whoever owns it
+        CharParityKitApplied(uid, ok ? 1 : 0);   // T-1463: logged when this kit was the runner's answer to a mismatch
         if (deadApply && ok)
         {
             ++g_deadClothingApplied;
@@ -3314,6 +3771,31 @@ void ReportAppearanceCounters()
              + " kitOpen[kitApplyDeferredOpen,window,cursor,request,waitingNow]=" + S(g_kitApplyDeferredOpen)
              + "," + S(g_kitDeferredWhy[0]) + "," + S(g_kitDeferredWhy[1]) + "," + S(g_kitDeferredWhy[2])
              + "," + S((long long)g_waitKitOpen.size()));
+    {   // T-1449 attempt 2: the first-build hold (firsthold.h); built in parts (one long join crashed VC2010, F1746)
+        const firsthold::OpenNow on = firsthold::Open(g_fh, ::GetTickCount());
+        const firsthold::Book& b = g_fh;
+        const long relAll = b.Released();
+        std::string fl = "[FIRSTBUILD] REPORT begun=" + S((long long)b.begun) + " notBegunHadBody=" + S((long long)g_fhNotBegunBody)
+                       + " offMain=" + S((long long)g_fhOffMain) + " overwrote=" + S((long long)b.overwrote) + " heldUids=" + S((long long)b.heldUids)
+                       + " heldCalls=" + S((long long)b.heldCalls);
+        fl += " released[all,kit,noLook,noKit,lookFailed,kitFailed,kitDropped,ownerGone,ownerChanged,buildUnderway,readFault,kitBusy]=" + S((long long)relAll);
+        for (int w = 1; w < firsthold::kWhyCount; ++w) fl += "," + S((long long)b.rel[w]);
+        fl += " waitMs[sum,max,avg]=" + S(b.waitSum) + "," + S((long long)b.waitMax) + "," + S(relAll > 0 ? b.waitSum / relAll : 0LL);
+        fl += " built[withKit,other,ownedRan,hadBody]=" + S((long long)b.builtKit) + "," + S((long long)b.builtOther) + "," + S((long long)b.runOwned)
+            + "," + S((long long)b.hadBody);
+        fl += " now[held,heldLookDone,releasedNotBuilt,oldestHeldMs]=" + S((long long)on.held) + "," + S((long long)on.heldLookDone) + ","
+            + S((long long)on.releasedNotBuilt) + "," + S((long long)on.oldestHeldMs);
+        fl += " dropped[gone,afterRelease,world]=" + S((long long)b.droppedGone) + "," + S((long long)b.droppedReleased) + "," + S((long long)b.droppedWorld);
+        fl += " before[look,lookSkippedSex,kit]=" + S((long long)b.lookPre) + "," + S((long long)b.lookSkipped) + "," + S((long long)b.kitPre)
+            + " noLook[sent,recv,noHold]=" + S((long long)g_fhNoLookSent) + "," + S((long long)g_fhNoLookRecv) + "," + S((long long)g_fhNoLookNoHold)
+            + " settleTold[noBody,held]=" + S((long long)g_settleToldNoBody) + "," + S((long long)g_settleToldHeld);
+        fl += " lookApplyAfterBuild[applies,set143,already143]=" + S((long long)g_lookApplyPost) + "," + S((long long)g_lookSet143) + "," + S((long long)g_lookPre143);
+        fl += firsthold::AfterToken(g_fhAfter);   // T-1449 attempt 2 diagnostic (F1851)
+        fl += firsthold::SexRaceToken(b);   // T-1449 attempt 3: sex / race looks before the first build
+        fl += " lookSexRaceAfterBuild[applies,firstLook,lines]=" + S((long long)g_lookSexAfterBuild) + "," + S((long long)g_lookSexAfterBuildFirst)
+            + "," + S((long long)g_lookSexAfterBuildLines);
+        DebugLog(fl);
+    }
     // PROBE-START: P091 - report line
     P091ReportLine();
     // PROBE-END: P091

@@ -45,7 +45,9 @@
 #include "townver.h"   /* TownVerTick */
 #include "camp.h"      /* T-929: CampTick */
 #include "items.h"
-namespace coop { std::string RangedTestLever(const std::string& args); }   /* P104: combat.cpp */
+#include "../common/givewire.h"   /* T-1463 TEST-ONLY: givetest offer names (OfferNamesToUids) */
+namespace coop { std::string RangedTestLever(const std::string& args); }
+namespace coop { std::string StateDumpCommand(const std::string& tag); }   /* T-1429 step 2: items.cpp - the TEST-ONLY statedump lever */   /* P104: combat.cpp */
 namespace coop { std::string GroundLineLever(const std::string& args); std::string GroundFindLever(const std::string& args); }   /* T-310: combat.cpp */
 namespace coop { bool GroundFindLastPick(bool target, float* x, float* z, long long* id); }   /* T-310: combat.cpp, playerteleport groundpick */
 namespace coop { int CameraReadPod(float* q, float* zoom); int CameraTurnPod(const float* q, float zoom); }   /* T-890 TEST-ONLY lever camturn: handoff.cpp (the engine's camera setter after focusCamera; read back through Ogre). MAIN THREAD */
@@ -68,6 +70,8 @@ namespace coop { int FocusCameraPod(float x, float y, float z); int GroundTerrai
 #include "net/steam_friends.h"   /* the TEST-ONLY steamfriends and steamjoin levers */
 #include "../common/uidrive.h"   /* pp1: the TEST-ONLY UI driver verbs (uiclick / uipick / uitype / uistate) */
 #include "../common/cmdforlog.h"   /* T-247: a command line as the log shows it (CmdForLog) */
+#include "../common/reportroad.h"   /* T-1457: the TEST-ONLY reader of a switched-off test build - the lines it takes */
+#include "addresses.h"   /* T-1457: AddrTestLoadRowsOk */
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -2067,7 +2071,19 @@ void CommandChannelTick()
         // boxtest plainkind <record id | box key>   - TEST-ONLY (T-1130): the named box's next write by this game (its writer) goes
         // through the ordinary record write as a plain box (kind 0, no undo list, its contents as now) - the record a shop counter's
         // first save made before the keeper's home listed it; [BOXREC] TEST-ONLY boxtest plainkind lines
-        if (!tok.empty() && tok[0] == "plainkind") { WriteStatus(coop::BoxTestPlainKind(Trim(rest.substr(9)))); finished = true; }
+        // boxtest fillshop counter=<key text> [sid=<sid>] [room=<units>]   - T-801 TEST-ONLY (DEV build; a release build refuses it): every
+        // storage piece of the town shop whose counter key contains <key text> filled with one record through the engine's own add,
+        // leaving <room> units of room - on the game that holds the shop only (items.cpp BoxFillShopCommand). [STORE] boxtest fillshop lines
+        if (!tok.empty() && tok[0] == "fillshop")
+        {
+#ifdef SW_DEV_BUILD
+            WriteStatus(coop::BoxFillShopCommand(Trim(rest.substr(8))));
+#else
+            WriteStatus("error boxtest fillshop: TEST-ONLY lever - the test build only");
+#endif
+            finished = true;
+        }
+        else if (!tok.empty() && tok[0] == "plainkind") { WriteStatus(coop::BoxTestPlainKind(Trim(rest.substr(9)))); finished = true; }
         // boxtest cantmake <item string id> | off   - TEST-ONLY: this game reads that item template as missing from its data
         else if (!tok.empty() && tok[0] == "cantmake") { WriteStatus(coop::BoxTestCantMake(tok.size() >= 2 ? tok[1] : std::string())); finished = true; }
         else { WriteStatus(coop::BoxTest(nm, sid, cnt) ? "ok boxtest" : "error boxtest"); finished = true; }
@@ -2881,9 +2897,21 @@ void CommandChannelTick()
         /* givetest offer <slot> <uid> [<uid>..] | givetest answer accept|refuse | givetest show [<slot>]   - TEST-ONLY lever (T-1135,
            hire.cpp): the offer the PLAYERS tab's GIVE box sends (the button's own live checks), the offer box's ACCEPT / REFUSE on the
            first offer waiting here, and [GIVE] show lines (the button for <slot>, the offers in and out). Armed here, run at the K2
-           safe point. */
+           safe point. T-1463 TEST-ONLY: an offer's <uid> may also be made:<label>, spawned:<Template>[#k] or name:<Name>[#k]
+           (coop::LeverNameUid, as charpartest and cagetest resolve their words - swgive::OfferNamesToUids); a uid reads as before. */
         std::string arg; std::getline(is, arg);
-        WriteStatus(coop::GiveTestArm(Trim(arg))); finished = true;
+        std::string giveArg, giveSaid;
+        if (swgive::OfferNamesToUids(Trim(arg), &coop::LeverNameUid, &giveArg, &giveSaid) == 0)
+        {
+            DebugLog("[GIVE] givetest offer NOT armed: " + giveSaid);
+            WriteStatus("error givetest offer: " + giveSaid);
+        }
+        else
+        {
+            if (!giveSaid.empty()) DebugLog("[GIVE] givetest offer names: " + giveSaid);
+            WriteStatus(coop::GiveTestArm(giveArg));
+        }
+        finished = true;
     }
     else if (verb == "buildtest")
     {
@@ -2948,7 +2976,10 @@ void CommandChannelTick()
     {
         // editorkey - TEST-ONLY (DEV build), T-1414: on the next game frame, what the Level Editor key (Shift+F12) does after the key
         // read - key command 9's two guards, then the editor toggle on the object the key step passes (build.cpp BdEditorKeyTick).
-        WriteStatus(coop::BdEditorKeyArm()); finished = true;
+        // editorkey rebuildnav - T-1462: on the next game frame, the rebuild_navmesh key action's two calls through their hooked entries,
+        // asked as the key step asks (multiplayer world only; build.cpp BdNavKeyLeverTick).
+        std::string arg; std::getline(is, arg); arg = Trim(arg);
+        WriteStatus(arg.empty() ? coop::BdEditorKeyArm() : (arg == "rebuildnav" ? coop::BdNavKeyLeverArm() : std::string("error editorkey bad-arg ") + arg)); finished = true;
     }
 #endif
     else if (verb == "bldset")
@@ -4006,6 +4037,41 @@ void CommandChannelTick()
 #endif
             finished = true;
         }
+        else if (coopsay::KoSelfShortParse(rest, &nameKey))
+        {
+            // koself <uid|made:<label>|spawned:<Template>> short  - T-540 TEST-ONLY (DEV build; a release build refuses it): the
+            // engine's own knockout at strength 0 on the game that drives it (its 3 s floor; appearance.cpp KoSelfShortLever), no
+            // hold, STATE pushed; [KOSELF] line. Before this form, `koself <uid> short` read as `koself <uid>` (seconds 0).
+#ifdef SW_DEV_BUILD
+            unsigned int su = 0; std::string lab;
+            const int sr = coop::LeverNameUid(nameKey, &su, &lab);
+            if (sr == 0) su = (unsigned int)strtoul(nameKey.c_str(), 0, 10);
+            if (sr < 0)
+            {
+                DebugLog("[KOSELF] TEST-ONLY short knock-out '" + nameKey + "' refused: " + lab);
+                WriteStatus("error koself short: " + lab);
+            }
+            else if (su == 0)
+            {
+                DebugLog("[cmd] usage: koself <uid|made:<label>|spawned:<Template>> short (DEV)");
+                WriteStatus("error koself short usage");
+            }
+            else
+            {
+                if (sr > 0)
+                {
+                    std::ostringstream pk;
+                    pk << "[KOSELF] TEST-ONLY short knock-out " << nameKey << " -> uid=" << su;
+                    DebugLog(pk.str());
+                }
+                WriteStatus(coop::KoSelfShortLever(su));
+            }
+#else
+            DebugLog("[KOSELF] koself .. short refused: a TEST-ONLY form - this is not a test (DEV) build");
+            WriteStatus("error koself short: TEST-ONLY, not a test build");
+#endif
+            finished = true;
+        }
         else if (coopsay::KoSelfNameParse(rest, &nameKey, &nameSeconds))
         {
             unsigned int nu = 0; float nd = -1.0f; std::string nn, why;
@@ -4221,13 +4287,25 @@ void CommandChannelTick()
         // spawncontainer 0  - explicit-faction spawns pass a null container (F103 original)
         // spawncontainer new - TEST-ONLY: explicit-faction local spawns go into a fresh empty squad of that faction
         //                      (spawn.cpp SpawnTemplate), so the engine cannot put them into a nearby squad another game runs
+        // spawncontainer with:<label> - T-1467 TEST-ONLY (DEV build): explicit-faction local spawns go into the NPC squad of the
+        //                      lever-made character <label> this game runs (spawn.cpp SetSpawnContainerWith), so 2+ share one squad
         // Only affects spawns that also have an explicit faction set.
         std::string word;
         is >> word;
         const int mode = coopspawn::SpawnContainerWord(word);
-        coop::SetSpawnContainerMode(mode);
-        WriteStatus(mode == coopspawn::kSpawnContainerNew ? "ok spawncontainer new"
-                    : (mode == coopspawn::kSpawnContainerKeep ? "ok spawncontainer keep" : "ok spawncontainer null"));
+        std::string withWhy;
+        if (mode == coopspawn::kSpawnContainerBad) WriteStatus("error spawncontainer: usage spawncontainer new | 0 | 1 | with:<label>");
+        else if (mode == coopspawn::kSpawnContainerWith)
+        {
+            if (coop::SetSpawnContainerWith(coopspawn::SpawnContainerWithLabel(word), &withWhy)) WriteStatus("ok spawncontainer with " + coopspawn::SpawnContainerWithLabel(word));
+            else WriteStatus("error spawncontainer with: " + withWhy);
+        }
+        else
+        {
+            coop::SetSpawnContainerMode(mode);
+            WriteStatus(mode == coopspawn::kSpawnContainerNew ? "ok spawncontainer new"
+                        : (mode == coopspawn::kSpawnContainerKeep ? "ok spawncontainer keep" : "ok spawncontainer null"));
+        }
         finished = true;
     }
     else if (verb == "factions")
@@ -4546,6 +4624,16 @@ void CommandChannelTick()
         else { std::string rest; std::getline(is, rest); WriteStatus(coop::NpcMoneyCommand(amount, Trim(rest))); }
         finished = true;
     }
+    else if (verb == "statedump")
+    {
+        /* T-1429 step 2 TEST-ONLY lever (DEV build): statedump <tag> - every loaded building, door, furniture piece, box, ground item
+           and squad on this game, one [DUMP] <tag> <kind> <key> f=v .. line each, sorted by key, and a total line per kind
+           (items.cpp StateDumpCommand, src/common/statedump.h). Read only: nothing is written, moved, made or sent. */
+        std::string tag;
+        is >> tag;
+        WriteStatus(coop::StateDumpCommand(tag));
+        finished = true;
+    }
     else if (verb == "crashtest")
     {
         /* T-1374 TEST-ONLY lever (DEV build): crashtest av-main | av-worker | throw-main | throw-worker | purecall | abort - the main
@@ -4617,6 +4705,43 @@ void CommandChannelTick()
         WriteStatus(coop::ZoneOwnNextCommand(Trim(arg))); finished = true;
     }
 #endif
+    else if (verb == "itemlook")
+    {
+        /* T-1449 (owner 1842, F1782): `itemlook now` - read-only, every build (a test command, owner 1837): every look in a black state
+           (A / B / C) on every loaded character at once, [ITEMLOOK] SNAPSHOT lines with the game time (items.cpp IlSnapshot).
+           `itemlook force <uid|nearest> <black|nothing|blank|unload>` - TEST-ONLY lever, DEV build only (a player's build answers an
+           error): one item look put into a black state through Ogre's own setTextureName / Resource::unload, to prove the sweep sees
+           it ([ITEMLOOK] FORCE line; items.cpp IlForce) */
+        std::string sub, who, how;
+        is >> sub;
+        if (sub == "now") WriteStatus(coop::ItemLookNowCommand());
+        else if (sub == "force")
+        {
+#ifdef SW_DEV_BUILD
+            is >> who >> how;
+            WriteStatus(coop::ItemLookForceCommand(who, how));
+#else
+            WriteStatus("error itemlook force: TEST-ONLY lever - the test build only");
+#endif
+        }
+        else WriteStatus("error itemlook: usage itemlook now | itemlook force <uid|nearest> <black|nothing|blank|unload>");
+        finished = true;
+    }
+    else if (verb == "charpartest")
+    {
+        /* T-1463 TEST-ONLY lever (DEV build; a release build refuses it): charpartest owe <uid|made:label|peer> | dropanswer <n 1-20> |
+           waitowner <uid|made:label|peer> - a character check owed for that copy by the real entry; the next n character-check answers
+           discarded here before they are noted; the check owed and set to wait for its owner (items.cpp CharParTestCommand).
+           [CHARPAR] charpartest lines. */
+        std::string arg; std::getline(is, arg);
+#ifdef SW_DEV_BUILD
+        WriteStatus(coop::CharParTestCommand(Trim(arg)));
+#else
+        DebugLog("[CHARPAR] charpartest refused: a TEST-ONLY lever - this is not a test (DEV) build");
+        WriteStatus("error charpartest: TEST-ONLY lever - the test build only");
+#endif
+        finished = true;
+    }
     else if (verb == "aifreeze")
     {
         int v = 0;
@@ -4680,5 +4805,92 @@ int PostLoadChecked(const std::string& saveName)
     sm->load(saveName);
     return StoreSaveRequestCode(sm) == 2 ? 1 : -2;
 }
+
+#ifdef SW_DEV_BUILD
+/* T-1457 (owner decision 1824, F1707) - TEST-ONLY: THE READER OF A SWITCHED-OFF TEST BUILD. The address gate refused this game, so
+   CommandChannelTick never runs here (no link, no session, no other feature); this reader takes only the lines a run needs to reach
+   both REPORT A BUG buttons (src/common/reportroad.h RefusedReaderRefusal): `load <save>` (a world for the pause menu, through the
+   engine's own SaveManager::load - its rows found by their own bytes on the report road, AddrTestLoadRowsOk), `uimenu ingame`,
+   `uiclick` on a REPORT A BUG button and `uitype bugtext`. The same command and status files and the same `[cmd] new command:` line
+   as CommandChannelTick (the harness's ACK), the same poll rate. Compiled into the test build only: a player's build has no reader on
+   this road. MAIN THREAD: the switched-off title pump and the report-only frame hook (coop.cpp). */
+namespace {
+bool RefusedLoad(const std::string& name)   /* true = finished (done or refused), false = retry next poll */
+{
+    if (AddrTestLoadRowsOk() == 0)
+    {
+        DebugLog("[cmd] load '" + name + "' REFUSED (TEST-ONLY reader of a switched-off game): the load rows were not found by their own bytes");
+        WriteStatus("error load refused: no load rows on this switched-off game");
+        return true;
+    }
+    SaveManager* sm = SaveManager::getSingleton();
+    if (sm == 0 || !sm->anySavesExist())
+    {
+        if (++g_deferrals % 20 == 1) DebugLog(std::string("[cmd] load deferred: ") + (sm == 0 ? "SaveManager::getSingleton() is null" : "anySavesExist() is false") + " (retrying)");
+        return false;
+    }
+    std::stringstream ss;
+    ss.imbue(std::locale::classic());
+    ss << "[cmd] loading save '" << name << "' after " << g_deferrals << " deferral(s) (TEST-ONLY reader of a switched-off game)";
+    DebugLog(ss.str());
+    sm->load(name);
+    WriteStatus("ok load " + name);
+    DebugLog("[cmd] SaveManager::load returned for '" + name + "'");
+    g_deferrals = 0;
+    return true;
+}
+std::string g_refPending;
+}   // namespace
+
+void CommandChannelRefusedTick()
+{
+    coop::SoakRefreshRunning();   /* "a world is running" for `uimenu ingame` (the in-world frame hook counts the frames) */
+    if (++g_ticks % kPollInterval != 0) return;
+    const std::string cmdPath = PathNextToDll(swnames::kCmdFile);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!U8GetFileAttributesEx(cmdPath.c_str(), GetFileExInfoStandard, &fad)) return;
+    const unsigned long long writeTime = ((unsigned long long)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+    if (writeTime != g_lastWriteTime)
+    {
+        g_lastWriteTime = writeTime;
+        std::ifstream f(U8W(cmdPath.c_str()).c_str());
+        std::string line;
+        if (f && std::getline(f, line))
+        {
+            const std::string raw = Trim(line);
+            std::string cmd = raw;
+            const std::string::size_type bar = cmd.find('|');   /* F210: the nonce before the bar is the write's identity */
+            if (bar != std::string::npos) cmd = Trim(cmd.substr(bar + 1));
+            if (!cmd.empty() && raw != g_lastRaw)
+            {
+                g_refPending = cmd;
+                g_lastRaw = raw;
+                g_deferrals = 0;
+                DebugLog("[cmd] new command: " + CmdForLog(cmd));
+            }
+        }
+    }
+    if (g_refPending.empty()) return;
+    std::istringstream is(g_refPending);
+    std::string verb, rest;
+    is >> verb;
+    std::getline(is, rest);
+    rest = Trim(rest);
+    const std::string first = rest.substr(0, rest.find(' '));
+    const std::string no = coopreport::RefusedReaderRefusal(verb, first);
+    if (!no.empty())
+    {
+        DebugLog("[cmd] " + verb + " REFUSED (TEST-ONLY reader of a switched-off game): " + no);
+        WriteStatus("error " + verb + " refused: " + no);
+        g_refPending.clear();
+        return;
+    }
+    bool finished = true;
+    if (verb == "load") finished = RefusedLoad(rest);
+    else if (verb == "uimenu") WriteStatus(coop::UiMenuCommand(rest) ? "ok uimenu" : "error uimenu");
+    else WriteStatus((coop::UiDriveCommand(verb, rest) ? "ok " : "error ") + verb);
+    if (finished) g_refPending.clear();
+}
+#endif   /* SW_DEV_BUILD - T-1457 */
 
 } // namespace coop

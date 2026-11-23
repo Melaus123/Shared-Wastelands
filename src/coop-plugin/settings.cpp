@@ -1216,6 +1216,9 @@ int g_hostChoicesSent = 0;
    MAIN THREAD. */
 std::vector<std::pair<std::string, std::string> > g_hcAwait, g_hcStored;
 std::string g_hcStoredWorld;
+int g_hcSentGen = -1;   /* T-1399 fold (re-check LOW 1): the link the HOST screen's rows last went on as the owner's change (KeepsRecord) - owed rows go again once on a later link; -1 = none */
+std::vector<stewardrules::OwedRow> g_hcOwed;   /* T-1399 fold (re-check 2 M1): those rows, each with its world and that world's value at the send (stewardrules.h OwedRow) - MAIN THREAD */
+int g_hcRefused = 0;   /* T-1399 fold (F1751 M1): 1 once the world server refused an options write (an '@refused' reply) while g_hcAwait held rows; a new hand-over clears it. MAIN THREAD. */
 std::map<std::string, std::string> g_worldVals;   /* MAIN THREAD: every value of the last complete OPTIONS map that held a record (stewardrules.h NoteWorldValue) - what g_hcAwait is checked against and what GAME OPTIONS in a world shows */
 std::map<std::string, std::string> g_worldValsReading;   /* MAIN THREAD: the OPTIONS map being read; it replaces g_worldVals only when complete and not a refusal */
 long g_worldValsGen = 0;   /* MAIN THREAD: one more each time a complete OPTIONS map replaces the shown values (GAME OPTIONS in a world follows it) */
@@ -1265,23 +1268,47 @@ int HostChoicesToLive(const char* at)
     return n;
 }
 
+/* T-1399 fold (re-check 2 M1): the owed rows looked at against the world's current map (stewardrules::OwedRowsSettle) - one line per row
+   no longer owed, naming why. MAIN THREAD. */
+void HostRowsOwedSettle(const char* at)
+{
+    if (g_hcOwed.empty()) return;
+    std::vector<std::pair<std::string, int> > dropped;
+    stewardrules::OwedRowsSettle(&g_hcOwed, StoreIndexWorld(), g_worldVals, &dropped);
+    for (size_t k = 0; k < dropped.size(); ++k)
+        DebugLog("[SETTINGS] T-1399: the HOST screen's row '" + dropped[k].first + "' is no longer owed to the world - " + stewardrules::OwedStepName(dropped[k].second) + " (at=" + at + ")");
+}
+/* T-1399 fold (re-check LOW 1, re-check 2 M1): the HOST screen's rows sent as the owner's change on an earlier link and not seen stored -
+   the link went before the world server stored them - are owed again on this link, once: only to the world they were sent to, and only
+   while its value is still the one at the send (HostRowsOwedSettle drops the rest). Not after a refusal reply. 0 = none owed. MAIN THREAD. */
+int HostRowsOwedAgain(std::vector<std::pair<std::string, std::string> >* out)
+{
+    out->clear();
+    if (g_hcOwed.empty() || g_hcRefused != 0 || g_hcSentGen < 0 || g_hcSentGen == StoreLinkGen()) return 0;
+    HostRowsOwedSettle("a later link's send");
+    for (size_t k = 0; k < g_hcOwed.size(); ++k) out->push_back(std::make_pair(g_hcOwed[k].key, g_hcOwed[k].value));
+    return out->empty() ? 0 : 1;
+}
 void HostChoicesSend(const char* at)
 {
     if (g_hostChoicesSent || !RulesAuthority()) return;
     std::vector<std::pair<std::string, std::string> > ch;
-    if (!HostChoicesSnapshot(&ch)) return;
+    const int fresh = HostChoicesSnapshot(&ch);
     std::map<std::string, std::string> rec;
+    if (!fresh && !KeepsRecord()) return;
     if (!RecSnapshot(&rec)) return;   /* no map on this link yet: its arrival runs this again */
     if (KeepsRecord())
     {
         /* a world that already has rules: the rows the owner changed on GAME OPTIONS for this HOST press are the owner's change, sent
            as one - only those rows (the world server writes them into rules.txt and every game says it); the world's other rules stay.
-           Not written over the live values: the stored record comes back in the world server's OPTIONS map and is applied as on any game. */
+           Not written over the live values: the stored record comes back in the world server's OPTIONS map and is applied as on any game.
+           T-1399 fold (re-check LOW 1): with none held, the rows sent on an earlier link and still not stored go again, once per link. */
+        if (!fresh && !HostRowsOwedAgain(&ch)) return;
         const bool ok = StoreSendOptions(ch);
-        if (ok) { { RecLock l; g_hostChoices.clear(); } ++g_hcSends; }
+        if (ok) { { RecLock l; g_hostChoices.clear(); } ++g_hcSends; g_hcSentGen = StoreLinkGen(); if (fresh) stewardrules::OwedRowsAdd(&g_hcOwed, ch, StoreIndexWorld(), g_worldVals); }
         std::string what;
         for (size_t k = 0; k < ch.size(); ++k) what += " " + ch[k].first + "=" + ch[k].second;
-        DebugLog(std::string("[SETTINGS] Game options from the HOST screen while this game sets the rules: ") + (ok ? "sent " : "could NOT send (no world server link) ")
+        DebugLog(std::string("[SETTINGS] Game options from the HOST screen while this game sets the rules") + (fresh ? ": " : " (T-1399: sent on an earlier link, not yet stored - owed again): ") + (ok ? "sent " : "could NOT send (no world server link) ")
                  + I((long long)ch.size()) + " change(s) to the world record at=" + at + ":" + what + (ok ? std::string() : std::string(" - kept; sent at the next OPTIONS arrival")));
         return;
     }
@@ -1482,6 +1509,7 @@ void SettingsWorldOptionsEnd(bool complete)
     static int s_refusedEpisode = 0;
     if (g_recPending.find("@refused") != g_recPending.end())
     {
+        if (!g_hcAwait.empty()) g_hcRefused = 1;   /* T-1399 fold (F1751 M1): the HOST screen's rows awaiting the store will not show stored - store.cpp's import wait reads it (SettingsHostRowsAwaiting) */
         if (!s_refusedEpisode) DebugLog("[SETTINGS] the notebook refused an options write (" + g_recPending["@refused"] + ") - the world record is kept as it was and nothing is re-sent for this reply");
         s_refusedEpisode = 1;
         return;
@@ -1507,6 +1535,7 @@ void SettingsWorldOptionsEnd(bool complete)
        one with no rule (a world whose rules were never set) marks nothing - its first rule-setter's own values become the world's */
     g_followedRecordGen = stewardrules::FollowedRecordGen(g_followedRecordGen, StoreLinkGen(), RulesAuthority(), g_recRules == 1);
     DebugLog(RecordLine() + " at=OPTIONS");
+    HostRowsOwedSettle("OPTIONS arrival");   /* T-1399 fold (re-check 2 M1): owed rows the world stored, someone changed, or that belong to another world end here */
     HostChoicesSend("OPTIONS arrival");   /* mp5: the host's Game options, the first time this game is the authority with the record */
     if (g_hostChoicesSent && GameplayRunning() && !EngineWritesBlocked()) HostChoicesClear("OPTIONS arrival");
     /* review-settings2 D11: ON THE AUTHORITY an arrival never writes the live values - they are the truth, and a
@@ -1601,6 +1630,8 @@ int SettingsHostChoices(const std::vector<std::pair<std::string, std::string> >&
     { RecLock l; had = g_hostChoices.empty() ? 0 : 1; g_hostChoices = keep; }
     g_hostChoicesSent = 0;
     g_hcAwait = keep;
+    g_hcRefused = 0;   /* T-1399 fold: a new hand-over awaits its own store */
+    g_hcOwed.clear();   /* T-1399 fold (re-check 2 M1): and owes only what it sends */
     if (keep.empty())
     {
         if (had) DebugLog("[SETTINGS] host's Game options withdrawn - nothing chosen on that screen is waiting to go into a world");
@@ -1612,7 +1643,7 @@ int SettingsHostChoices(const std::vector<std::pair<std::string, std::string> >&
         /* this game sets the world's rules and keeps its record: a choice made on GAME OPTIONS while it hosts the world is an admin's
            change made in the game - it goes to the world record now (the world server writes it into rules.txt and every game says it) */
         const bool ok = StoreSendOptions(keep);
-        if (ok) { RecLock l; g_hostChoices.clear(); }   /* not sent: held, and HostChoicesSend sends them at the next OPTIONS arrival */
+        if (ok) { { RecLock l; g_hostChoices.clear(); } g_hcSentGen = StoreLinkGen(); stewardrules::OwedRowsAdd(&g_hcOwed, keep, StoreIndexWorld(), g_worldVals); }   /* not sent: held, and HostChoicesSend sends them at the next OPTIONS arrival; T-1399 fold: sent, they stay owed (g_hcOwed) until stored */
         DebugLog(std::string("[SETTINGS] Game options while this game sets the rules: ") + (ok ? "sent " : "could NOT send (no world server link) - held ") + I((long long)keep.size()) + " change(s) to the world record");
         return ok ? 1 : 0;
     }
@@ -1657,6 +1688,19 @@ int SettingsHostRowsStored(const std::string& worldFolder, std::vector<std::pair
     out->clear();
     if (worldFolder.empty() || worldFolder != g_hcStoredWorld) return 0;
     out->swap(g_hcStored);
+    return (int)out->size();
+}
+void SettingsLeftWorld()   /* T-1399 fold (re-check 2 M1): store.cpp StoreLeftAtTitle - the owed rows belong to the world just left */
+{
+    if (!g_hcOwed.empty()) DebugLog("[SETTINGS] T-1399: " + I((long long)g_hcOwed.size()) + " HOST-screen row(s) owed to world '" + g_hcOwed[0].world + "' are dropped - the game left the world");
+    g_hcOwed.clear(); g_hcSentGen = -1;
+}
+int SettingsHostRowsAwaiting(std::vector<std::pair<std::string, std::string> >* out, int* refused, int* rulesAuthority, int* standingKnown)   /* T-1399: store.cpp's import commitment waits on its import rows */
+{
+    *out = g_hcAwait;
+    *refused = g_hcRefused;   /* T-1399 fold (F1751 M1): the wait's ends - a refusal reply, or this game not setting the rules (HostChoicesSend's early return) */
+    *rulesAuthority = RulesAuthority() ? 1 : 0;
+    *standingKnown = AdminStandingKnown() ? 1 : 0;   /* re-check M2: "not the rules authority" ends the wait only once the world server said so on this link */
     return (int)out->size();
 }
 

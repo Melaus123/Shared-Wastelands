@@ -21,6 +21,7 @@
 #include "../common/sigscan.h"    /* owner 97a: TitleScreen::update by its bytes when there is no usable table */
 #include "../common/sigtable.h"   /* T-63 stage 7: every row by its signature when no table matches this executable */
 #include "../common/storemeta.h"   /* coopstore::Crc32 - already offline-tested against the zip/png vectors */
+#include "../common/reportroad.h"   /* T-1457: the report road of a switched-off game - its rows and their verdict */
 
 #include "coop_log.h"
 
@@ -84,6 +85,9 @@ std::string g_fingerprint;
 std::string g_version;
 std::string g_tablePath;
 std::string g_why;                /* the one sentence the log line and the caption both come from */
+int         g_reportRan = 0;      /* T-1457: AddrResolveReportRows ran (once, on the refused road) */
+int         g_reportOk  = 0;      /* T-1457: 1 = the report road's rows found and checked - REPORT A BUG may start */
+int         g_testLoadOk = 0;     /* T-1457 TEST-ONLY: the switched-off test build's `load` rows found and checked */
 char        g_caption[96];
 
 std::string N(long long v) { std::ostringstream o; o.imbue(std::locale::classic()); o << v; return o.str(); }
@@ -271,7 +275,7 @@ std::string ForeignJumpModule(uintptr_t site, std::string* how)
 /* ---- one entry, verified -------------------------------------------------------------------------------- */
 /* Returns 1 matched, 0 mismatched, -1 not applicable (a writable global), 2 ACCEPTED HOOKED (rk1): a code row whose
    first instruction another mod replaced with its 5-byte jump, every later byte matching, and callOnly != 0 (every
-   registration of the row only calls it - RowCallOnly; always 0 on the signature road). Fills `detail` on a mismatch
+   registration of the row only calls it - RowUse; on both roads since T-1476). Fills `detail` on a mismatch
    with what was EXPECTED and what was THERE - the inputs, not only the answer - and on an accepted row with both. */
 int VerifyEntry(uintptr_t base, const AddrEntry& e, int callOnly /* T-1447: the row's use (RowUse): 0 none, 1 call-only, 2 any other */, std::string* detail)
 {
@@ -524,6 +528,26 @@ std::string AddrTableName() { return g_version; }
    with no table. On success g_entries holds the resolved set, named 'pattern:<fingerprint>', and AddrInit runs the
    SAME per-row verification against the running process that a table gets. Proven only on the two Steam builds
    (tools/prove_signatures.py reproduces both tables exactly); any other build is unproven until tested there. */
+/* The executable FILE, whole (at most 256 MB), for a signature search. 1, or 0 with *why. T-1457: shared by the pattern road and
+   the report road of a switched-off game (AddrResolveReportRows). */
+static int ReadExeImage(const std::string& exe, std::vector<unsigned char>* img, std::string* why)
+{
+    std::ifstream f(U8W(exe.c_str()).c_str(), std::ios::binary);   /* UTF-8, from ExePath */
+    if (!f) { *why = "the executable file could not be opened for the signature search"; return 0; }
+    f.seekg(0, std::ios::end);
+    const std::ifstream::pos_type endPos = f.tellg();
+    if (endPos <= 0 || (unsigned long long)endPos > 268435456ull)
+    {
+        *why = "the executable file's size is not one the signature search reads";
+        return 0;
+    }
+    img->resize((size_t)endPos);
+    f.seekg(0, std::ios::beg);
+    f.read((char*)&(*img)[0], (std::streamsize)img->size());
+    if (f.gcount() != (std::streamsize)img->size()) { *why = "the executable file could not be read whole"; return 0; }
+    return 1;
+}
+
 static int PatternResolve(const std::string& exe, std::string* why)
 {
     const std::string sigPath = PathNextToDll("addresses\\signatures.sig");
@@ -537,21 +561,7 @@ static int PatternResolve(const std::string& exe, std::string* why)
     coopsigtab::SigParseFile(sigText.c_str(), sigText.size(), &sf);
 
     std::vector<unsigned char> img;
-    {
-        std::ifstream f(U8W(exe.c_str()).c_str(), std::ios::binary);   /* UTF-8, from ExePath */
-        if (!f) { *why = "the executable file could not be opened for the signature search"; return 0; }
-        f.seekg(0, std::ios::end);
-        const std::ifstream::pos_type endPos = f.tellg();
-        if (endPos <= 0 || (unsigned long long)endPos > 268435456ull)
-        {
-            *why = "the executable file's size is not one the signature search reads";
-            return 0;
-        }
-        img.resize((size_t)endPos);
-        f.seekg(0, std::ios::beg);
-        f.read((char*)&img[0], (std::streamsize)img.size());
-        if (f.gcount() != (std::streamsize)img.size()) { *why = "the executable file could not be read whole"; return 0; }
-    }
+    if (!ReadExeImage(exe, &img, why)) return 0;
     coopsigtab::PeView pe;
     if (!coopsigtab::SigParsePe(&img[0], img.size(), &pe))
     {
@@ -612,6 +622,27 @@ static int HandCtorFaulted()
     TitleByPattern("the game's hand constructor faulted");   /* owner 97a, as on every road without a usable table */
     return 0;
 }
+
+/* T-1457 TEST LEVER (owner decision 1824, F1707): KENSHI_SW_TEST_ADDR_FAIL=<row name> makes that one row of the loaded set fail its
+   check, so a Steam game the tables describe is refused AS A BUILD THIS MOD WAS NOT MADE FOR IS (GOG, F1542): every slot cleared,
+   no entries, the caption, one [ADDR] line, and owner 97a's title pattern - the road a switched-off game's REPORT A BUG starts from
+   (AddrResolveReportRows). Read once, here, in the TEST build only (SW_DEV_BUILD - a player's build has no lever); set by the bench
+   only (tools/run-T102.ps1 -AddrFailRow, for game B's launch only); nothing in the package sets it. A name the set does not carry is logged and changes nothing. */
+#ifdef SW_DEV_BUILD   /* review of 2cfa25778: the lever is the TEST build's only - a player's build never reads it */
+static int AddrTestFailRow(const std::string& row, bool byPattern)
+{
+    AddrClearSlots(g_regs, g_regCount);
+    g_entryCount = 0;
+    ::InterlockedExchange(&g_ok, 0);
+    g_why = "TEST LEVER KENSHI_SW_TEST_ADDR_FAIL: the row " + row + " was made to fail its check against this game (the "
+            + std::string(byPattern ? "signature" : "table") + " road), as on a build this mod was not made for";
+    SetCaption("MOD DISABLED: unsupported game version");
+    ErrorLog("[ADDR] kenshi-coop is DISABLED in this game: " + g_why + ". Every address slot was cleared; nothing was hooked and"
+             " no link was opened; Kenshi runs exactly as it does without this mod.");
+    TitleByPattern("the TEST LEVER failed one row");   /* owner 97a, as on every road without a usable set */
+    return 0;
+}
+#endif   /* SW_DEV_BUILD - T-1457 TEST LEVER */
 
 static int AddrInitBody()
 {
@@ -692,15 +723,34 @@ static int AddrInitBody()
         return 0;
     }
 
+#ifdef SW_DEV_BUILD
+    {   /* T-1457 TEST LEVER: KENSHI_SW_TEST_ADDR_FAIL=<row> - see AddrTestFailRow (the TEST build's only) */
+        char lv[96];
+        const DWORD ln = ::GetEnvironmentVariableA("KENSHI_SW_TEST_ADDR_FAIL", lv, (DWORD)sizeof(lv));
+        if (ln > 0 && ln < (DWORD)sizeof(lv))
+        {
+            if (AddrFind(g_entries, g_entryCount, lv) != 0) return AddrTestFailRow(lv, byPattern);
+            ErrorLog(std::string("[ADDR] TEST LEVER: KENSHI_SW_TEST_ADDR_FAIL=") + lv + " names no row of this set - nothing changed");
+        }
+        else if (ln >= (DWORD)sizeof(lv))
+            ErrorLog("[ADDR] TEST LEVER: KENSHI_SW_TEST_ADDR_FAIL is longer than a row name - nothing changed");
+    }
+#endif   /* SW_DEV_BUILD - T-1457 TEST LEVER */
+
     {
         const uintptr_t base = Base();
+        long long refusedRows = 0;   /* T-1476 review: every refused required row gets its own line, the first kRefusedLogMax */
+        const long long kRefusedLogMax = 16;
         for (i = 0; i < g_entryCount; ++i)
         {
             if (g_entries[i].missed != 0) continue;   /* T-1453: an optional row the signature search missed (logged there) */
             std::string detail;
-            /* rk1: the signature road keeps the strict check for every row (callOnly 0) - its bytes come from the file's
-               own signature match, and a hooked row there is refused exactly as before */
-            const int use = byPattern ? 0 : RowUse(g_entries[i].name);   /* T-1447: 0 strict, 1 call-only, 2 hooks, may chain */
+            /* T-1476 (F2011, owner 1876): BOTH ROADS apply the row's declared use. The signature road places the row from the
+               executable FILE's own bytes (PatternResolve -> ReadExeImage: the file on disk, never the hooked process); another
+               mod's 5-byte jump at the function's start changes only those first bytes in the running game, so the declared
+               use decides, exactly as on the table road (T-1447). Before, the signature road kept every row strict and
+               RE_Kenshi's jump on the call-only SoundPostEvent refused every GOG game. Every other check is unchanged. */
+            const int use = AddrGateUse(RowUse(g_entries[i].name));   /* T-1447: 0 strict, 1 call-only, 2 hooks, may chain; both roads */
             const int v = VerifyEntry(base, g_entries[i], use, &detail);
             if (v < 0) { ++g_varEntries; continue; }
             ++g_checked;
@@ -719,6 +769,10 @@ static int AddrInitBody()
                     if (g_firstMismatch.empty())
                         g_firstMismatch = std::string(g_entries[i].name) + ": another mod's jump at a game function's start,"
                                           " but its bytes could not be read again to keep them - " + detail;
+                    if (++refusedRows <= kRefusedLogMax)
+                        ErrorLog(std::string("[ADDR] row refused: ") + g_entries[i].name + " (" + AddrKindName(g_entries[i].kind)
+                                 + ", rva " + H(g_entries[i].rva) + "): another mod's jump at a game function's start, but its"
+                                 " bytes could not be read again to keep them - " + detail);
                     continue;
                 }
                 std::string how;
@@ -751,8 +805,14 @@ static int AddrInitBody()
                 if (g_firstMismatch.empty())
                     g_firstMismatch = std::string(g_entries[i].name) + " (" + AddrKindName(g_entries[i].kind)
                                     + ", rva " + H(g_entries[i].rva) + "): " + detail;
+                if (++refusedRows <= kRefusedLogMax)   /* T-1476 review: T3027 had addrMismatch=2 with one row unnamed */
+                    ErrorLog(std::string("[ADDR] row refused: ") + g_entries[i].name + " (" + AddrKindName(g_entries[i].kind)
+                             + ", rva " + H(g_entries[i].rva) + "): " + detail);
             }
         }
+        if (refusedRows > kRefusedLogMax)
+            ErrorLog("[ADDR] ... and " + N(refusedRows - kRefusedLogMax) + " more rows refused (the first "
+                     + N(kRefusedLogMax) + " are named above)");
     }
 
     /* Fill every registered slot, and treat a name the table does not carry exactly like a mismatch: a slot
@@ -863,6 +923,140 @@ std::string AddrReportToken()
       << ",fp=" << g_fingerprint
       << "]";
     return o.str();
+}
+
+/* T-1457 (owner decision 1824, F1707) - THE REPORT ROAD OF A SWITCHED-OFF GAME. See addresses.h. Each row the report needs
+   (src/common/reportroad.h ReportRows) is looked for by ITS OWN signature in the executable FILE (the signatures file, SigSubset +
+   SigResolveAll: exactly once, its own check, the cross-checks over these rows), then its bytes are compared with the RUNNING game
+   (VerifyEntry, strict: another mod's jump on one of them is a mismatch), and only then is its slot written. Every row gets one
+   [ADDR] line. A required row that fails leaves the report off (logged) - the game stays plain Kenshi. */
+int AddrReportRowsOk() { return g_reportOk; }
+int AddrTestLoadRowsOk() { return g_testLoadOk; }
+
+static int ReportRowsOff(const std::string& why)
+{
+    ErrorLog("[ADDR] REPORT A BUG stays OFF on this switched-off game: " + why + ". Nothing was hooked for it; Kenshi runs exactly as"
+             " it does without this mod.");
+    return 0;
+}
+
+static int ReportRowsBody()
+{
+#ifdef SW_DEV_BUILD
+    const int dev = 1;
+#else
+    const int dev = 0;
+#endif
+    int rc = 0;
+    const coopreport::ReportRow* rr = coopreport::ReportRows(&rc);
+    std::vector<const char*> names, feats;
+    int i;
+    for (i = 0; i < rc; ++i)
+    {
+        if (rr[i].testOnly != 0 && dev == 0) continue;
+        names.push_back(rr[i].name);
+        feats.push_back(rr[i].feature);
+    }
+    const std::string sigPath = PathNextToDll("addresses\\signatures.sig");
+    std::string sigText;
+    if (!ReadWholeFile(sigPath, &sigText)) return ReportRowsOff("there is no signatures file ('" + sigPath + "')");
+    coopsigtab::SigFile all, sub;
+    coopsigtab::SigParseFile(sigText.c_str(), sigText.size(), &all);
+    std::vector<std::string> absent;
+    coopsigtab::SigSubset(all, &names[0], &feats[0], (int)names.size(), &sub, &absent);
+    int absentRequired = 0;
+    size_t a;
+    for (a = 0; a < absent.size(); ++a)
+    {
+        int optional = 0;
+        for (i = 0; i < (int)names.size(); ++i) if (absent[a] == names[i] && feats[i] != 0) optional = 1;
+        if (!optional) ++absentRequired;
+        ErrorLog("[ADDR] report row " + absent[a] + ": not in the signatures file" + (optional ? " - only its feature is off" : ""));
+    }
+    std::string exe, why;
+    std::vector<unsigned char> img;
+    if (!ExePath(&exe)) return ReportRowsOff("the game executable's path could not be read");
+    if (!ReadExeImage(exe, &img, &why)) return ReportRowsOff(why);
+    coopsigtab::PeView pe;
+    if (!coopsigtab::SigParsePe(&img[0], img.size(), &pe)) return ReportRowsOff("the executable file has no readable .text section");
+    AddrEntry ent[16];
+    coopsigtab::SigOutcome oc;
+    const int got = (int)sub.rows.size() <= 16 ? coopsigtab::SigResolveAll(pe, sub, ent, 16, &oc) : 0;
+    if (got <= 0)
+    {
+        for (a = 0; a < oc.fails.size() && a < 16; ++a) ErrorLog("[ADDR] report row not resolved: " + oc.fails[a]);
+        return ReportRowsOff("the signature search did not find every row the report needs exactly once ("
+                             + N((long long)oc.resolved) + " of " + N((long long)sub.rows.size()) + " found"
+                             + (oc.fails.empty() ? std::string("") : "; the first: " + oc.fails[0]) + ")");
+    }
+    /* the check against the running game - strict for every row (use 0; the start-up signature road applies each row's declared
+       use since T-1476, this report road is unchanged) (VerifyEntry's counters are the gate's: kept) */
+    const long long unreadable = g_unreadable, hookedFirst = g_hookedFirst;
+    const uintptr_t base = Base();
+    int live[16];
+    for (i = 0; i < got; ++i)
+    {
+        live[i] = 0;
+        if (ent[i].missed != 0)
+        {
+            size_t m;
+            std::string mw;
+            for (m = 0; m < oc.missedRows.size(); ++m) if (oc.missedRows[m] == i) mw = oc.missedWhy[m];
+            ErrorLog(std::string("[ADDR] report row ") + ent[i].name + " (optional: " + ent[i].optional + ") not found by its own bytes - "
+                     + ent[i].optional + " is off on this road (" + mw + ")");
+            continue;
+        }
+        std::string detail;
+        live[i] = VerifyEntry(base, ent[i], 0, &detail);
+        const bool ok = live[i] == 1 || live[i] == -1;
+        const std::string line = std::string("[ADDR] report row ") + ent[i].name + " found by its own bytes exactly once at rva "
+                               + H(ent[i].rva) + (live[i] == -1 ? " (a writable global: its second reference names it too)"
+                                                  : ok ? "; its bytes in the running game match" : "; its bytes in the running game do NOT match: " + detail);
+        if (ok) DebugLog(line); else ErrorLog(line);
+        if (!ok && ent[i].optional[0] != 0) AddrOptionalMiss(&ent[i]);   /* only its feature off */
+    }
+    g_unreadable = unreadable; g_hookedFirst = hookedFirst;
+    std::string vwhy;
+    if (!coopreport::ReportRowsVerdict(got, absentRequired, ent, live, got, &vwhy)) return ReportRowsOff(vwhy);
+    /* the title hook's row: owner 97a's title pattern may have placed it already (the loaded image) - the two must agree */
+    const AddrEntry* te = AddrFind(ent, got, "TitleScreen_update");
+    for (i = 0; i < g_regCount; ++i)
+    {
+        if (g_regs[i].name != 0 && std::strcmp(g_regs[i].name, "TitleScreen_update") == 0 && te != 0 && *g_regs[i].slot != 0
+            && *g_regs[i].slot != (unsigned long long)te->rva)
+            return ReportRowsOff("the title screen's row by its signature (rva " + H(te->rva) + ") is not where the title hook's own"
+                                 " search put it (rva " + H(*g_regs[i].slot) + ")");
+    }
+    /* bind: every slot registered under one of these names gets its row's rva, or 0 for a missed optional row */
+    int bound = 0;
+    for (i = 0; i < g_regCount; ++i)
+    {
+        if (g_regs[i].name == 0) continue;
+        const AddrEntry* e = AddrFind(ent, got, g_regs[i].name);
+        if (e == 0) continue;
+        *g_regs[i].slot = e->missed != 0 ? 0ull : (unsigned long long)e->rva;
+        ++bound;
+    }
+    int testLoad = dev;
+    for (i = 0; i < got; ++i) if (std::strcmp(ent[i].optional, "test-load") == 0 && ent[i].missed != 0) testLoad = 0;
+    g_testLoadOk = testLoad;
+    g_reportOk = 1;
+    DebugLog("[ADDR] REPORT A BUG on this switched-off game: its " + N((long long)got) + " rows found by their own bytes, each exactly"
+             " once and matching the running game (" + N((long long)bound) + " slots bound; nothing else bound, nothing hooked yet)"
+             + (dev ? std::string(testLoad ? "; TEST-ONLY load rows found" : "; TEST-ONLY load rows NOT found - the test reader's load is off") : std::string("")));
+    return 1;
+}
+
+int AddrResolveReportRows()
+{
+    if (g_reportRan != 0) return g_reportOk;
+    g_reportRan = 1;
+    if (AddrOk() != 0 || ::InterlockedCompareExchange(&g_ran, 0, 0) == 0) return 0;   /* only after a refusal */
+    try { return ReportRowsBody(); }
+    catch (const std::exception& e) { try { ReportRowsOff(std::string("an exception (") + e.what() + ")"); } catch (...) {} }
+    catch (...) { try { ReportRowsOff("an unknown exception"); } catch (...) {} }
+    g_reportOk = 0;
+    return 0;
 }
 
 }   /* namespace coop */

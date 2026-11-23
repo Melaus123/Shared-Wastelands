@@ -108,6 +108,13 @@ int ZoneWriterDecide(int roleIsSingle, int held, int mine, int loadedHereSector,
     if (mine == 1)         { if (pathOut != 0) *pathOut = kZonePathHolderMine;  return kWrMine; }
     if (held == 1)         { if (pathOut != 0) *pathOut = kZonePathHolderOther; return kWrHeld; }
     if (held == -2)        { if (pathOut != 0) *pathOut = kZonePathHolderOther; return kWrHeld; }   /* a frozen area (its holder is not in the world): its holder's file stands */
+    /* T-1391 (F1653 design 2): THE LINK IS DOWN - ONE ROAD. With no live area map the ladder's rungs (R4 past the grace, R1, the
+       no-slot tie M2-b) cannot name a writer, and each of them used to refuse (journal) or skip the save. The fact decided from is the
+       link itself (notebookDownMs > 0): the area save is written here as this game's own, unsent, and the link-up push, the held wait
+       and the stale road carry it - the world server judges it by its holder and its base. The answers above stay as they are: a
+       fresh map naming another game (or a frozen area) is that game's file; a fresh map naming this game writes it. A box, a door and
+       a shop keep the ladder (WriterLadder) and the outage journal. */
+    if (notebookDownMs > 0) { if (pathOut != 0) *pathOut = kZonePathLinkDown; return kWrMine; }
     if (pathOut != 0) *pathOut = kZonePathLadder;
     return WriterLadder(loadedHereSector, peerSectorLoaded, mySlotLower, slotDecided,
                         notebookDownMs, refuseAfterMs, 1, rungOut, spansOut);

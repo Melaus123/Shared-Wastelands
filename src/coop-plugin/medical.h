@@ -22,7 +22,12 @@ bool CopyOwnerSaysKo(unsigned int uid);   // crash1b: the owner's last STATE sai
 void ApplyOwnerHunger(unsigned int uid, int has, float hunger, float fed);
 // par5 TEST-ONLY lever (`hungerset <uid> <value>`): set a character THIS game drives to that hunger and push its STATE.
 std::string HungerSetOwned(unsigned int uid, float value);
-void CopyNoteOwnerKo(unsigned int uid, bool ko);   // crash1c (R3a): write the owner's word to that table. ANY THREAD.
+void CopyNoteOwnerKo(unsigned int uid, bool ko);   // crash1c (R3a): write the owner's word to that table. MAIN THREAD (T-540 fold 1 R4: it claims a slot and may end a knockout hold - a log line).
+// T-540 D1: the owner's latest STATE prone for this copy - a copy plays dead while its owner does ('safe to get up'). MAIN THREAD.
+void CopyNoteOwnerProne(unsigned int uid, int prone);
+// T-540 D1: the owner's game is gone and its copy was withdrawn, not removed - its knocked-out / playing-dead word (and a knockout
+// hold) end. MAIN THREAD.
+void CopyKoWordOwnerGone(unsigned int uid);
 // The per-copy word tables (the owner's hunger, knocked-out and dead words per copy uid): uid's words are forgotten - its copy
 // was removed here, or its ownership moved to or from this game. MAIN THREAD.
 void MedicalForgetCopy(unsigned int uid);
@@ -71,6 +76,11 @@ std::string DecaySoonLever(unsigned int uid, float hours);
 // the wake-up clock; the lever checks again after a tick), -1 not ours / no character / unreadable / knockout unresolved.
 // MAIN THREAD.
 int KnockOutOwned(unsigned int uid);
+#ifdef SW_DEV_BUILD
+// T-540 TEST-ONLY, DEV build only (`koself <uid> short`): KnockOutOwned at the engine knockout's strength 0 (its own 3 s floor), no hold; STATE
+// pushed. Clocks before / after and the pose before out. Returns `unconcious` read right after, -1 not driven here. MAIN THREAD.
+int KnockOutOwnedShort(unsigned int uid, float* koBefore, float* koAfter, int* proneBefore);
+#endif
 // A sneak knockout's success on a character this game drives: the engine's own knockout(skill01) through the knockout gate, as
 // KnockOutOwned does; the caller pushes STATE. Returns `unconcious` as read right after (-1 not driven here / unreadable);
 // *koTimerOut = the wake-up clock it set.
@@ -127,6 +137,8 @@ std::string LatchString(::Character* c);
 //
 // Returns true if something was actually sent (owned, resolvable, link up).
 bool StatePush(unsigned int uid);
+// T-540 fold 1 R1: the same STATE on the reliable channel - an owned character's prone / dead change (soak.cpp). MAIN THREAD.
+bool StatePushReliable(unsigned int uid);
 
 // T-1205 /god (medical.cpp's god table): god mode for a character this game owns is this game's memory alone; a copy's comes from
 // its owner's STATE. GodOn: ANY THREAD. GodSet: MAIN THREAD, the /god job only - 1 changed, 0 already so, -1 the table is full.

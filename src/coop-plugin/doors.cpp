@@ -2557,6 +2557,95 @@ void DrWriteRow(DoorRow* r, int st, int lk, int tickMoved = 0)
    change moved written over the record (DoorRecHeldMerge) and that laid; or, with no record, the holder's seed from its own door. 1 laid, 2 seeded, 3 its
    own shown (no record and another game or nobody holds the area, a player's piece, no id, a key clash, a send that failed), 4 the
    held change written, 0 not now (the row went, a read faulted, or it waits for the holder answer or a stored record). */
+/* ---- T-1391 fix attempt 2 (F1774 / F1775) ----
+   THE DOORS OF A PIECE BY ITS KEY: a building's doors are kept in the area file inside the BUILDING's record ('state<i>' ...), but each
+   door's record is named by the DOOR's own key (MakeDoorRecId of DoorKeyBuild's key). Every door row laid here notes its building's key
+   (the piece key build.cpp makes: ObjectPositionKey mode 1) and that building's door keys in its door array's order (DoorArrayPod - the
+   order 'state<i>' is saved in), once per door key: the own-work check (store.cpp ZoneOwnWorkCheck) finds door i's record by it, also
+   after the area left. A registry, filled at the lay (an event), never a sweep. MAIN THREAD */
+std::map<std::string, std::vector<std::string> > g_drPieceDoorKeys;   /* piece key -> its door keys by door index */
+std::map<std::string, int> g_drDoorKeyNoted;                         /* door keys whose building was noted */
+std::map<std::string, int> g_drSeedOwed;                             /* T-1391: piece keys placed by this game (DoorsRecPlacedHere) */
+std::map<std::string, int> g_drSeedQueued;                           /* door keys whose seed was queued at the placement */
+std::map<std::string, int> g_drSeedSaid;                             /* review fold: door keys whose 'link up - seeded at the lay' was said */
+std::map<void*, std::string> g_drSeedOwedPtr;                        /* review fold MAJOR 3: the placed buildings by pointer (dropped at DoorsForgetOwner) */
+long long g_drSeedAtPlace = 0, g_drSeedAtPlaceUp = 0, g_drSeedAtPlaceFail = 0, g_drPieceDoorsNoted = 0;
+const size_t kDrPieceDoorKeysCap = 8192;
+std::string DrOwnerKeyOf(DoorRow* r)
+{
+    if (r == 0 || r->owner == 0 || r->gate != 0) return std::string();
+    char k[kDoorKeyCap];
+    k[0] = 0;
+    if (ObjectPositionKey(r->owner, k, kDoorKeyCap, "", 2, 1) == 0 || k[0] == 0) return std::string();
+    return std::string(k);
+}
+void DrPieceDoorsNoteOf(void* owner, const std::string& ownerKey, const char* rowKey)
+{
+    if (owner == 0 || ownerKey.empty() || (rowKey != 0 && g_drDoorKeyNoted.count(rowKey) != 0)) return;
+    if (g_drPieceDoorKeys.size() >= kDrPieceDoorKeysCap && g_drPieceDoorKeys.count(ownerKey) == 0) return;
+    void* elems[kDoorArrayMax];
+    int cnt = 0, raw = 0;
+    if (DoorArrayPod(owner, elems, kDoorArrayMax, &cnt, &raw) == 0 || cnt <= 0) return;
+    std::vector<std::string> keys;
+    for (int i = 0; i < cnt; ++i)
+    {
+        char key[kDoorKeyCap];
+        int gate = 0;
+        key[0] = 0;
+        if (DoorPlausible(elems[i]) == 0 || DoorKeyBuild(elems[i], key, kDoorKeyCap, &gate, 0) == 0) key[0] = 0;
+        keys.push_back(std::string(key));
+        if (key[0] != 0) g_drDoorKeyNoted[std::string(key)] = 1;
+    }
+    g_drPieceDoorKeys[ownerKey] = keys;
+    ++g_drPieceDoorsNoted;
+}
+void DrPieceDoorsNote(DoorRow* r, const std::string& ownerKey) { if (r != 0) DrPieceDoorsNoteOf(r->owner, ownerKey, r->key); }
+/* the seed at placement (doorrec::DoorSeedAtPlaceDue), from the lay's wait: one line per door */
+void DrSeedAtPlace(DoorRow* r, const std::string& ownerKey, const doorrec::DoorRec& live, const float* pos, const std::string& id, int haveRec, int await)
+{
+    if (ownerKey.empty() || g_drSeedOwed.count(ownerKey) == 0) return;
+    const int noNotebook = (AreaVerdictForDoor(pos) == coopdoor::kDoorAreaNoNotebook) ? 1 : 0;
+    const int queuedAlready = g_drSeedQueued.count(r->key) != 0 ? 1 : 0;
+    if (doorrec::DoorSeedAtPlaceDue(1, haveRec, await, noNotebook, queuedAlready) == 0)
+    {
+        if (noNotebook == 0 && queuedAlready == 0 && haveRec == 0 && await == 0 && g_drSeedSaid.count(r->key) == 0)
+        {
+            g_drSeedSaid[r->key] = 1;   /* said once: the lay seeds it (review fold: never blocks a later seed with the link down) */
+            ++g_drSeedAtPlaceUp;
+            DebugLog("[DOORREC] T-1391 door " + id + " key='" + r->key + "' of piece '" + ownerKey + "' placed here: the link is up - seeded at the lay once the area map names its holder");   /* not DrLine: its 60-line session budget is spent by then (T2731 A: 179 lines) */
+        }
+        return;
+    }
+    std::vector<char> pay;
+    const int st = (live.state == coopdoor::kDoorOpen) ? coopdoor::kDoorOpen : coopdoor::kDoorClosed;
+    const int ok = (DoorStateToBytes(r->key, st, live.lockWord, &pay) != 0 && coop::StoreQueueWrite(coopqueue::kQueueFamilyDoor, id, pay) != 0) ? 1 : 0;
+    if (ok != 0) g_drSeedQueued[r->key] = 1;   /* review fold: a failed queue is tried again at the next look */
+    char b[64];
+    _snprintf(b, 63, " (state %d lockWord %d)", st, live.lockWord); b[63] = 0;
+    if (ok != 0) ++g_drSeedAtPlace; else ++g_drSeedAtPlaceFail;
+    if (ok == 0 && g_drSeedSaid.count(r->key) != 0) return;   /* re-check fold: a failed queue said once per key, the rest counted (door REPORT seedAtPlace) */
+    if (ok == 0) g_drSeedSaid[r->key] = 2;
+    DebugLog(std::string("[DOORREC] T-1391 door record SEEDED at placement: ") + id + " key='" + r->key + "' of piece '" + ownerKey + "'" + b
+              + (ok != 0 ? " - queued in the outage journal under the door's record id (the link is down), published when it returns"
+                         : " - could NOT be queued (a defect)"));
+}
+/* review fold MAJOR 3: a placed piece's door seeded NOW from its row - at the placement (its door array read then) and at each tick for a
+   row of a placed building whose area is not laid (an area first loaded in the outage gets no lay); the lay's own road stays for the
+   link-up case, g_drSeedQueued keeps one seed per door. MAIN THREAD */
+void DrSeedRowNow(DoorRow* r, const std::string& ownerKey)
+{
+    if (r == 0 || r->door == 0 || r->ready == 0 || r->gate != 0 || g_drSeedQueued.count(r->key) != 0 || DoorPlausible(r->door) == 0) return;
+    const std::string id = doorrec::MakeDoorRecId(r->key);
+    if (id.empty()) return;
+    doorrec::DoorRec live;
+    float pos[3] = { 0.0f, 0.0f, 0.0f };
+    if (DrReadLive(r, &live) == 0 || DoorPosPod(r->door, pos) == 0) return;
+    DrPieceDoorsNote(r, ownerKey);
+    std::map<std::string, DoorRecKept>::const_iterator k = g_drec.find(id);
+    const int haveRec = (k != g_drec.end() && k->second.have != 0 && k->second.r.key == r->key) ? 1 : 0;
+    const int await = (k != g_drec.end() && doorrec::DoorRecAwaitWrite(k->second.awaitStored, k->second.pending, k->second.r.flags) != 0) ? 1 : 0;
+    DrSeedAtPlace(r, ownerKey, live, pos, id, haveRec, await);
+}
 int DrLayRow(DoorRow* r)
 {
     {
@@ -2596,6 +2685,8 @@ int DrLayRow(DoorRow* r)
     doorrec::DoorRec live;
     float pos[3] = { 0.0f, 0.0f, 0.0f };
     if (DrReadLive(r, &live) == 0 || DoorPosPod(r->door, pos) == 0) { ++g_doorReadFault; ::InterlockedExchange(&r->recLaid, 0); return 0; }
+    const std::string ownerKey = (r->gate == 0) ? DrOwnerKeyOf(r) : std::string();   /* T-1391 fix attempt 2 */
+    DrPieceDoorsNote(r, ownerKey);
     std::map<std::string, DoorRecKept>::const_iterator k = g_drec.find(id);
     const int kept = doorrec::DoorRecKeptFor((k != g_drec.end() && k->second.have != 0) ? 1 : 0, (k != g_drec.end() && k->second.r.key == r->key) ? 1 : 0);
     if (kept == doorrec::kDrKeptClash)
@@ -2620,6 +2711,7 @@ int DrLayRow(DoorRow* r)
     if (what == doorrec::kDrLayWait)
     {
         ++g_drLayWaited;
+        DrSeedAtPlace(r, ownerKey, live, pos, id, haveRec, await);   /* T-1391 fix attempt 2: a new piece's door seeded at its placement */
         ::InterlockedExchange(&r->recLaid, 0);
         ::InterlockedExchange(&r->recWait, (await != 0) ? 1 : 2);   /* laid again by the arrival, or by the area map / the picture settling */
         if (await == 0) DrWaitSay(DrSecOfKey(r->key));
@@ -3094,6 +3186,72 @@ void DoorChurnReArmSweep(unsigned long nowMs)
 
 } // namespace
 
+/* T-1391 fix attempt 2 (doors.h); review fold MAJOR 3: the building's doors read NOW (its door array, as DrPieceDoorsNote), each
+   registered and seeded at once; a door made later registers by itself and is seeded at the tick (DrSeedRowNow) or its lay */
+void DoorsRecPlacedHere(const std::string& pieceKey, void* building)
+{
+    if (pieceKey.empty()) return;
+    if (g_drSeedOwed.size() >= kDrPieceDoorKeysCap) g_drSeedOwed.erase(g_drSeedOwed.begin());
+    g_drSeedOwed[pieceKey] = 1;
+    if (building == 0) return;
+    if (g_drSeedOwedPtr.size() >= kDrPieceDoorKeysCap) g_drSeedOwedPtr.erase(g_drSeedOwedPtr.begin());
+    g_drSeedOwedPtr[building] = pieceKey;
+    DrPieceDoorsNoteOf(building, pieceKey, 0);
+    void* elems[kDoorArrayMax];
+    int cnt = 0, raw = 0;
+    if (DoorArrayPod(building, elems, kDoorArrayMax, &cnt, &raw) == 0) return;
+    for (int i = 0; i < cnt; ++i)
+    {
+        char key[kDoorKeyCap];
+        int gate = 0;
+        void* owner = 0;
+        key[0] = 0;
+        if (DoorPlausible(elems[i]) == 0 || DoorKeyBuild(elems[i], key, kDoorKeyCap, &gate, &owner) == 0 || key[0] == 0 || gate != 0) continue;
+        DoorRow* r = RowFor(elems[i], key, gate, owner);
+        if (r != 0) DrSeedRowNow(r, pieceKey);
+    }
+}
+/* re-check fold nit: an own piece taken down (build.cpp PieceRecRemoved) - its entries leave, whether or not any door was noted */
+void DoorsRecPieceGone(const std::string& pieceKey)
+{
+    g_drSeedOwed.erase(pieceKey);
+    std::map<std::string, std::vector<std::string> >::iterator it = g_drPieceDoorKeys.find(pieceKey);
+    if (it != g_drPieceDoorKeys.end())
+    {
+        for (size_t q = 0; q < it->second.size(); ++q) { g_drDoorKeyNoted.erase(it->second[q]); g_drSeedQueued.erase(it->second[q]); g_drSeedSaid.erase(it->second[q]); }
+        g_drPieceDoorKeys.erase(it);
+    }
+    for (std::map<void*, std::string>::iterator p = g_drSeedOwedPtr.begin(); p != g_drSeedOwedPtr.end();) { if (p->second == pieceKey) g_drSeedOwedPtr.erase(p++); else ++p; }
+}
+/* review fold MAJOR 2: a piece's door keys leave every T-1391 map when its doors' records are removed (dismantle / ruin / gone) */
+void DrPieceDoorKeysForget(const std::string& doorKey)
+{
+    g_drDoorKeyNoted.erase(doorKey); g_drSeedQueued.erase(doorKey); g_drSeedSaid.erase(doorKey);
+    for (std::map<std::string, std::vector<std::string> >::iterator it = g_drPieceDoorKeys.begin(); it != g_drPieceDoorKeys.end();)
+    {
+        bool has = false;
+        for (size_t q = 0; q < it->second.size() && !has; ++q) has = (it->second[q] == doorKey);
+        if (has) { g_drSeedOwed.erase(it->first); g_drPieceDoorKeys.erase(it++); }
+        else ++it;
+    }
+}
+int DoorsKeysOfPiece(const std::string& pieceKey, std::vector<std::string>* out)
+{
+    out->clear();
+    std::map<std::string, std::vector<std::string> >::const_iterator it = g_drPieceDoorKeys.find(pieceKey);
+    if (it == g_drPieceDoorKeys.end()) return 0;
+    *out = it->second;
+    return 1;
+}
+int DoorsRecContentHere(const std::string& doorKey, int* state, int* lockWord)
+{
+    *state = 0; *lockWord = 0;
+    std::map<std::string, DoorRecKept>::const_iterator k = g_drec.find(doorrec::MakeDoorRecId(doorKey));
+    if (k == g_drec.end() || k->second.have == 0 || k->second.r.key != doorKey) return 0;
+    *state = k->second.r.state; *lockWord = k->second.r.lockWord;
+    return 1;
+}
+
 /* T-860: the holder answer of area c as the door road asks it (DrHoldOfArea: 1 this game, 0 another game or nobody, -1 not known
    yet) and the area's centre point - spawn.cpp's cage record road judges and places a cage record as a door record is. */
 int DoorAreaHoldOf(int c) { return DrHoldOfArea(c); }
@@ -3118,6 +3276,7 @@ void DoorsForgetOwner(void* building)
     void* elems[kDoorArrayMax];
     int cnt = 0, raw = 0, i, j;
     if (building == 0) return;
+    g_drSeedOwedPtr.erase(building);   /* T-1391 review fold MAJOR 3: the pointer names no placed building after this */
     if (DoorArrayPod(building, elems, kDoorArrayMax, &cnt, &raw) == 0) cnt = 0;
     for (i = 0; i < kDoorRows; ++i)
     {
@@ -3484,6 +3643,7 @@ int DrPieceGoneQueue(const char (*keys)[kDoorKeyCap], int n, const char* how, in
     {
         const std::string id = doorrec::MakeDoorRecId(keys[i]);
         if (id.empty()) continue;
+        DrPieceDoorKeysForget(keys[i]);   /* T-1391 review fold MAJOR 2 */
         DrGoneQueue(id, DrSecOfKey(keys[i]));
         ++queued; ++g_drPieceGone;
         for (int j = 0; markRows != 0 && j < kDoorRows; ++j)
@@ -4000,6 +4160,7 @@ void DoorsWorldTeardown()
     std::memset(g_drWaitSaid, 0, sizeof(g_drWaitSaid));
     g_drWaitLines = 0;
     DrOwedClearAll();   /* T-1400 review 3: the owed keys name doors of the world being destroyed */
+    g_drPieceDoorKeys.clear(); g_drDoorKeyNoted.clear(); g_drSeedOwed.clear(); g_drSeedQueued.clear(); g_drSeedSaid.clear(); g_drSeedOwedPtr.clear();   /* T-1391 review fold MAJOR 2: the world's door keys */
 }
 
 /* ============ B12 (decision 52): ONE DOOR CHANGE, SAVED AND READ BACK ============
@@ -4324,6 +4485,7 @@ void DoorsTick()
     if (::InterlockedExchange(&g_doorPurgePending, 0) != 0)
     {
         ++g_doorPurgeSweeps;
+        g_drSeedOwedPtr.clear();   /* T-1391 re-check fold MAJOR: a zone went away - no placed building's address is trusted after it (the key check stands too) */
         int purgeUnsure = 0;
         for (int p = 0; p < kDoorRows; ++p)
         {
@@ -4438,6 +4600,16 @@ void DoorsTick()
             {
                 const int c = DrSecOfKey(rq->key);
                 if (c >= 0 && g_drAreaLaid[c] != 0) DrLayRow(rq);
+                else if (!g_drSeedOwedPtr.empty() && rq->owner != 0 && !net::SideRoadOpen())
+                {   /* review fold MAJOR 3: a placed piece's door in an area not laid, the link down - seeded now */
+                    std::map<void*, std::string>::iterator sp = g_drSeedOwedPtr.find(rq->owner);
+                    if (sp != g_drSeedOwedPtr.end() && g_drSeedQueued.count(rq->key) == 0)
+                    {   /* re-check fold MAJOR: the address alone never names the piece - its building's key, read now, must be the placed one */
+                        const std::string nowKey = DrOwnerKeyOf(rq);
+                        if (nowKey != sp->second) g_drSeedOwedPtr.erase(sp);
+                        else DrSeedRowNow(rq, nowKey);
+                    }
+                }
             }
         }
         g_drHealthWaitN = drWaitN; g_drHealthWaitDue = drWaitDue;   /* T-1333 fold 4 */
@@ -4714,7 +4886,8 @@ void ReportDoors()
             " resolve[asked,found,missedNoBuilding,missedNoDoor,refusedChecks,gateMultiLeaf,recycledRow,deferred]"
             "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
             " publishDroppedInactive=%lld firstSighting=%lld"
-            " doorOutageQueue[queued,payloadRefused]=%lld,%lld",
+            " doorOutageQueue[queued,payloadRefused]=%lld,%lld"
+            " seedAtPlace[queued,linkUp,failed]=%lld,%lld,%lld",
             g_on ? "on" : "off", g_hooked, g_setterOk,
             g_doorPublished, g_doorApplied,
             g_doorAppliedOnArrival, g_doorReapplyAfterForcedOpen, g_doorAppliedHolderWord,
@@ -4741,7 +4914,7 @@ void ReportDoors()
             g_doorResolveMissedNoDoor, g_doorResolveRefusedChecks, g_doorResolveGateMultiLeaf,
             g_doorResolveRecycledRow, g_doorResolveDeferred,
             g_doorPublishDroppedInactive, g_doorFirstSighting,
-            g_doorQueuedNoNotebook, g_doorQueuePayloadRefused);
+            g_doorQueuedNoNotebook, g_doorQueuePayloadRefused, g_drSeedAtPlace, g_drSeedAtPlaceUp, g_drSeedAtPlaceFail);
         b[3583] = 0;
         DebugLog(b);
     }
@@ -5402,6 +5575,26 @@ void* DoorsKeptDoorAt(void* building, int index)
     if (DoorPlausible(elems[index]) == 0 || DoorParentPod(elems[index], &parent) == 0 || parent != building) return 0;
     if (DoorReadPod(elems[index], &s, &d, &l, &w, &b) == 0) return 0;
     return elems[index];
+}
+/* T-1429 v3 TEST-ONLY (statedump's door kind): door `index` of the building's door array - a plausible door that reads, WHATEVER its
+   parent names (a gateway's leaves name the gateway; DoorsKeptDoorAt keeps only the building's own) - or 0; and its key as the door
+   records build it (DoorKeyBuild: the house door's own P7n key, a gate's GATEWAY key + "gate") - the key both games share. ANY THREAD
+   (guarded reads). */
+void* DoorsDumpDoorAt(void* building, int index)
+{
+    void* elems[32];
+    int cnt = 0, raw = 0;
+    if (building == 0 || index < 0 || index >= 32 || DoorArrayPod(building, elems, 32, &cnt, &raw) == 0 || index >= cnt) return 0;
+    int s = 0, d = 0, l = 0, w = 0, b = 0;
+    if (DoorPlausible(elems[index]) == 0 || DoorReadPod(elems[index], &s, &d, &l, &w, &b) == 0) return 0;
+    return elems[index];
+}
+int DoorsDumpKey(void* door, char* out, int cap, int* isGate)
+{
+    *isGate = 0;
+    if (door == 0 || cap <= 0) return 0;
+    out[0] = 0;
+    return DoorKeyBuild(door, out, cap, isGate, 0);
 }
 /* a door's state, lock and wants-to-lock as keptlist prints them */
 std::string DoorsKeptRead(void* door)

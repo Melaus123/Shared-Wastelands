@@ -726,4 +726,14 @@ std::string TownVerReportToken()
     return o.str();
 }
 
+/* T-1391 fold (F1754): the own-work check reads a town note against the placed town's TOWN_VER record (zonediff OwnNoteCarried) */
+void TownVerRecordOf(const std::string& key, int* held, std::string* heldVer, int* waits, std::string* waitVer)
+{
+    *held = 0; *waits = 0; heldVer->clear(); waitVer->clear();
+    const std::map<std::string, cooptv::TownVer>::const_iterator c = g_tvCache.find(key);
+    if (c != g_tvCache.end()) { *held = 1; *heldVer = c->second.ver; }
+    const std::map<std::string, cooptv::TownVer>::const_iterator m = g_tvMine.find(key);
+    if (m != g_tvMine.end()) { *waits = 1; *waitVer = m->second.ver; }
+}
+
 }   // namespace coop

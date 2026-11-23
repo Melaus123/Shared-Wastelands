@@ -405,4 +405,33 @@ inline Lever ParseLever(const std::string& arg)
     return l;
 }
 
+/* T-1463 TEST-ONLY: `givetest offer <slot> <who> [<who>..]` - each <who> after the slot may also be a name form (made:<label>,
+   spawned:<Template>[#k], name:<Name>[#k], deadname:<Name>[#k]), turned into its uid by `resolve` (the game passes coop::LeverNameUid,
+   as charpartest and cagetest resolve their words: 1 resolved, 0 not a name form, -1 a name that did not resolve - its words say why).
+   A plain number, and every word the resolver calls no name form, passes unchanged, so ParseLever then reads the line exactly as
+   before; a line that is not an offer is never touched. 1 = *out is the line to parse (*said the resolver's words for each name, '; '
+   joined, empty when there was none); 0 = a name did not resolve (*said says why, *out empty). */
+typedef int (*LeverNameFn)(const std::string& w, unsigned int* uid, std::string* label);
+inline int OfferNamesToUids(const std::string& arg, LeverNameFn resolve, std::string* out, std::string* said)
+{
+    out->clear(); said->clear();
+    std::istringstream is(arg);
+    std::vector<std::string> t; std::string w;
+    while (is >> w) t.push_back(w);
+    if (t.size() < 3 || t[0] != "offer" || resolve == 0) { *out = arg; return 1; }
+    for (size_t i = 2; i < t.size(); ++i)
+    {
+        unsigned int u = 0; std::string lab;
+        const int r = resolve(t[i], &u, &lab);
+        if (r < 0) { *said = lab.empty() ? "the name '" + t[i] + "' did not resolve" : lab; return 0; }
+        if (r == 0) continue;
+        std::ostringstream n; n << u;
+        t[i] = n.str();
+        if (!said->empty()) *said += "; ";
+        *said += lab.empty() ? t[i] : lab;
+    }
+    for (size_t i = 0; i < t.size(); ++i) { if (i) *out += " "; *out += t[i]; }
+    return 1;
+}
+
 } // namespace swgive

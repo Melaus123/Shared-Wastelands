@@ -67,6 +67,9 @@ int UiDialogRectPoll();
 // and the rows below close up (a post-hook on the menu's show 0x913250). Install once, after the address table. Opens in a
 // multiplayer world -> the [SAVE] hb line's handSave[].
 void InstallUiPauseMenuArrange();
+// T-1457 (owner decision 1824): the switched-off game's pause menu - instead of InstallUiPauseMenuArrange, a report-only post-hook on
+// the menu's show: REPORT A BUG on its own row and the menu arranged (never a multiplayer world); nothing of another feature. 1 = hooked.
+int InstallUiPauseMenuReportOnly();
 long long UiHandSaveHiddenOpens();
 /* T-927: the game menu's panel (the object its show 0x913250 and hide 0x916190 take) - 1 shown, 0 hidden, -1 a fault reading
    it, -2 no panel / no widget. MAIN THREAD. */
@@ -116,6 +119,12 @@ void UiEditorPanelShown(int shown);
 void UiEditorResetTick();
 void UiEditorForgetWorld();
 long long UiEditorResetCount(int k);
+// T-1462 (owner 1838): THE LEVEL EDITOR WINDOW in a multiplayer world - opened by store.cpp's close of the real editor (1 built, else not
+// built); UiEditorToolTick each in-world frame acts on its buttons ('Regenerate sector' -> build.cpp BdRegenSectorPress, 'Close') and keeps
+// its hover note; UiEditorToolForget drops it at world teardown. MAIN THREAD.
+int  UiEditorToolShow();
+void UiEditorToolTick();
+void UiEditorToolForget();
 // T-461: Kenshi's in-game pause menu through the engine's own getter and show (the ESC route): Visible 1 open / 0 closed / < 0 not
 // read; Reshow opens it again (1 open now, 0 the engine declined, < 0 not done). MAIN THREAD, in a world.
 int UiPauseMenuVisible();

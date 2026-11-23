@@ -954,6 +954,13 @@ public:
     /* M16 / T-1118 (b): what waits on a world-server link (empty on any other Steam link) - the same sendBound[...] fields as an ENet
        link (netQueued / netBytes = this link's own queue plus what Steam has not sent yet, its packets counted as full 32 KB pieces - smaller pieces count low), then
        liveFirst[...] as the ENet link prints it (budget = 100 ms of the send rate; rateKBs = the send rate set on Steam). */
+    /* T-540 fold 3 (transport.h): no reliable message of this link waits for Steam to take it (queue_), and on a live-first link
+       nothing waits on the lines either. */
+    bool ReliableSendsNow()
+    {
+        return queue_.empty() && (lfDir_ < 0 || box_.Count() == 0);
+    }
+
     std::string SendBoundToken()
     {
         if (lfDir_ < 0) return std::string();

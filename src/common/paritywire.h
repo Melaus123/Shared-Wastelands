@@ -5,7 +5,7 @@
  * plus section / x / y / quantity), which the asker swaps in for its own. Both reliable.
  *
  *   PARITY_REQ  i32 sx | i32 sy | u16 n (<= kParityMaxBoxes) | n x (u8 len + key, u32 digest, u32 itemCount)
- *               | ['PRQK' u8 kind - absent for a plain ask]
+ *               | ['PRQK' u8 kind - absent for a plain ask; 3 = a character check (T-1463, charparity.h)]
  *               | ['PRQG' u16 m (<= kParityMaxGroundKeys) | u16 left | m x (u8 len + ground key, i32 quantity, i32 quality in
  *                  hundredths, u8 road) - the asker's ground items in the sector, for the holder's catch-up (ParityGroundPlan);
  *                  road 1 = an item the ground road put down there, 0 = any other; left = items the asker left out at the cap
@@ -54,6 +54,8 @@ const int kParityStatusMax        = 4;
 const int kParityAskPlain = 0;   /* an arrival listing or a re-ask: only the holder answers it */
 const int kParityAskOpen  = 1;   /* the box is on screen at the asker: the holder may lift research items first (R5) */
 const int kParityAskPull  = 2;   /* the asker HOLDS the box but never had its contents: the previous holder answers it (R1/R4) */
+const int kParityAskChar  = 3;   /* T-1463 (game-to-game protocol 247): a CHARACTER check - one row "C|<uid>" with the asker's kit digest,
+                                    sx = its scope (src/common/charparity.h); the game that runs the character answers it */
 
 const int kParityDecodeOk        = 0;
 const int kParityDecodeTooShort  = 1;   /* the bytes end inside a field */
@@ -418,7 +420,7 @@ inline bool EncodeParityReq(std::vector<char>* b, const ParityReq& r)
     }
     if (r.kind != kParityAskPlain)   /* P109: the PRQK kind tail - absent for a plain ask */
     {
-        if (r.kind != kParityAskOpen && r.kind != kParityAskPull) return false;
+        if (r.kind != kParityAskOpen && r.kind != kParityAskPull && r.kind != kParityAskChar) return false;
         o.push_back('P'); o.push_back('R'); o.push_back('Q'); o.push_back('K'); o.push_back((char)(unsigned char)r.kind);
     }
     if (r.ground != 0)   /* the PRQG ground listing, after the kind tail - absent for an ask that is not a ground ask */
@@ -459,7 +461,7 @@ inline int DecodeParityReq(const char* p, size_t size, ParityReq* out)
     if (c.at < size && size - c.at >= 5 && std::memcmp(p + c.at, "PRQK", 4) == 0)   /* P109: the kind tail (any other trailing bytes stay refused) */
     {
         const int k = (int)(unsigned char)p[c.at + 4];
-        if (k != kParityAskOpen && k != kParityAskPull) return kParityDecodeBadKind;
+        if (k != kParityAskOpen && k != kParityAskPull && k != kParityAskChar) return kParityDecodeBadKind;
         r.kind = k; c.at += 5;
         for (size_t i = 0; i < r.boxes.size(); ++i) r.boxes[i].kind = k;
     }

@@ -29,7 +29,11 @@ std::string BuildListCommand();
 std::string BuildPartsCommand(const std::string& arg);   // T-1372 decision 1690, TEST-ONLY, DEV build, MAIN THREAD, read-only: `bldparts <key-substring|key>` - is a building intact (one [BUILD] bldparts line)
 std::string BdEditorKeyArm();   // T-1414, TEST-ONLY, DEV build, MAIN THREAD: `editorkey` - the Level Editor key's own call runs on the next game frame
 void BdEditorKeyTick();         // T-1414, TEST-ONLY, DEV build: each frame after the engine loop - runs an armed editorkey press (one [EDITOR] line)
+std::string BdNavKeyLeverArm();  // T-1462, TEST-ONLY, DEV build, MAIN THREAD: `editorkey rebuildnav` - the rebuild_navmesh key action's two calls, next frame
+void BdNavKeyLeverTick();         // T-1462, TEST-ONLY, DEV build: each frame after the engine loop - runs an armed rebuildnav (one [EDITOR] line)
 #endif
+void BdRegenSectorPress();        // T-1462 (owner 1838), MAIN THREAD: the Level Editor window's 'Regenerate sector' - the area in view rebuilt on this game
+void BdRegenSectorTick();         // T-1462: each in-world frame - a press that waits for the engine's own job for its area
 std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAIN THREAD, read-only: `bldstate <key-substring|key>` - a piece's own state as the kept lay writes it
 std::string BuildSetArm(const std::string& arg);         // KEPT, TEST-ONLY, MAIN THREAD: `bldset <key-substring|key> <field> <value>` - armed, written at the K2 safe point
 std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | refound <name> <dx> <dz> | link <key-substring> | list` - found / refound / link armed for the K2 safe point, list read now; `found relink <name> [dx dz]` (T-1332) also links the own pieces the new town is now nearest to, as the engine's founding does
@@ -90,9 +94,12 @@ int  BuildRefundHanded(const char* gkey, int qty);   // P14 fold 5, MAIN THREAD 
 int  BuildGroundSource(void* b);                      // P3, MAIN THREAD (ground5 fold 1: LocalPlayerFaction walks the faction list): coopground::kGroundSrc* of a building's spill / refund
 int  BuildPieceRecordOwner(const std::string& id, int* removed);   // T-1443 fold 3, MAIN THREAD: the owner slot a piece record held here names; -2 none; *removed = a removal mark
 long BuildPieceRecordsGen();   // T-1443 fold 3, MAIN THREAD: moves at every change of the piece record table
-void PieceRecordArrive(const std::string& id, const std::vector<char>& bytes);   // MAIN THREAD (store.cpp): a piece record from the world server - kept per id, never applied
+void PieceRecordArrive(const std::string& id, const std::vector<char>& bytes, unsigned long long seq, long long writtenAt);   // MAIN THREAD (store.cpp): a piece record from the world server - kept per id with the seq it arrived with (T-1429 machine age; 0 not known) and its writer's stamp (machine age fold 1), never applied
 void PieceRecordGone(const std::string& id, const char* from);   // MAIN THREAD (store.cpp): a piece record's removal - its kept copy is forgotten
-void PieceRecordEcho(const std::string& id, int hasStamp, long long stamp);   // MAIN THREAD (store.cpp RECORD_SEQ): this game's piece write sent with that stamp is on the world server's disk
+void PieceRecordEcho(const std::string& id, int hasStamp, long long stamp, unsigned long long seq);   // MAIN THREAD (store.cpp RECORD_SEQ): this game's piece write sent with that stamp is on the world server's disk, with that seq (T-1429)
+int  PieceRecLeaveFlush();   // T-1429 machine age (B), MAIN THREAD (store.cpp OwnLeaveSaveBegin): every changed piece of a loaded area marked as an unload marks it; the count
+int  PieceRecLeavePending(int* confirmed, int* held);   // T-1429 (B), MAIN THREAD (the leave save's drain): flushed pieces whose writes are not stored yet; *confirmed stored, *held not this game's to write
+void PieceRecSaveFlush();    // T-1429 machine age, MAIN THREAD (store.cpp detour_saveGame): pending LIVE and door values marked before a plain save
 void PieceRefuseArrive(const std::vector<char>& payload);   // MAIN THREAD (store.cpp): PIECE_REFUSE (79) - counted, the piece marked again or its mark dropped
 /* T-1333 (src/common/bldgrec.h): ONE TOWN BUILDING AS ONE WORLD-SERVER RECORD - a town wall's ruin flag and health, written by the
    holder of its area from the engine's own hit / ruin / repair, laid on every game through the engine's own setDestroyed and the

@@ -138,7 +138,10 @@ enum { kZonePathSingle = 0,      /* a never-co-op save - vanilla, and no ladder 
        kZonePathHolderMine = 1,  /* the notebook named this game the holder of the sector */
        kZonePathHolderOther = 2, /* the notebook named the other game */
        kZonePathLadder = 3,      /* nobody was named: the ladder decided */
-       kZonePathCount = 4 };
+       kZonePathLinkDown = 4,    /* T-1391 (F1653 design 2): the link to the world server is down and no fresh map names another game -
+                                    written here as this game's own save, not sent; the link-up push / held wait / stale roads carry it and
+                                    the world server judges it (holder, then base). Never refused, never journaled. */
+       kZonePathCount = 5 };
 int ZoneWriterDecide(int roleIsSingle, int held, int mine, int loadedHereSector,
                      int peerSectorLoaded, int mySlotLower, int slotDecided,
                      long long notebookDownMs, long long refuseAfterMs,

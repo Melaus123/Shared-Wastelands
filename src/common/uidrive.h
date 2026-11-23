@@ -117,6 +117,9 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "deleteprofile", kDriveButton, "CoopProfDeleteBtn",     0 },
         /* in a world: the host-left window's EXIT GAME */
         { "exitgame",      kDriveButton, "CoopHostLeftExit",      0 },
+        /* T-1462: in a multiplayer world, the Level Editor window's 'Regenerate sector' and 'Close' */
+        { "edregen",       kDriveButton, "SWLevelEditorRegen",    0 },
+        { "edclose",       kDriveButton, "SWLevelEditorClose",    0 },
         /* T-220: GAME OPTIONS - its three tabs (a DIFFICULTY, b WORLD, c CO-OP) and each shown row's < / > (rows a..i = slots 0..8
            of the tab on screen, top to bottom) */
         { "opttaba",       kDriveButton, "CoopOptTab0",           0 },

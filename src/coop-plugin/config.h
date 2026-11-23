@@ -80,6 +80,7 @@ int            ConfigParityHoldSec();        /* T-734 TEST ONLY: parityholdsec= 
 int            ConfigBenchCapKbs();          /* TEST ONLY: benchcapkbs= (KB/s) - ENet's bandwidth limit, in and out, on this game's links; 0 = absent = off */
 int            ConfigBugRelay();             /* TEST ONLY (T-1401 2c): bugrelay= - 0 real (absent), 1 test, 2 test503, 3 test404 (coopbug::kRelay*) */
 int            ConfigBugRelayPort();         /* TEST ONLY (T-1401 2c): bugrelayport= - 0 none; else the local test service's port (coopbug::RelayAddress) */
+void           ConfigReadBugRelayOnly();     /* T-1457: a switched-off game's report road reads bugrelay= / bugrelayport= from the DLL-side test file only (start thread) */
 int            ConfigNetRateLog();           /* TEST ONLY: netratelog=1 - each Steam link logs a [net] RATE line once a second; 0 = absent = off */
 int            ConfigSteamFakeLagMs();       /* T-1118 f TEST ONLY: steamfakelag= (ms, 0-1000) - Steam's fake lag on a real game's Steam link; 0 = absent */
 int            ConfigSteamFakeLossPct();     /* T-1118 f TEST ONLY: steamfakeloss= (percent, 0-50) - Steam's fake loss on it; 0 = absent */

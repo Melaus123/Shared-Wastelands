@@ -132,6 +132,66 @@ inline void TakeStored(OptionRows* awaiting, const std::map<std::string, std::st
         awaiting->erase(awaiting->begin() + k);
     }
 }
+/* T-1399 fold (re-check of e46737473, M1): THE OWED ROWS. A HOST-screen row sent as the owner's change while this game keeps the record
+   stays owed until the world it was sent to shows it stored - a link that went before the store loses it. Each owed row remembers the
+   world it was for and that world's value when it was sent (or that the world had none). On a later look (an OPTIONS map, a later
+   link's send) a row is: STORED - the world holds the host's value; CHANGED BY ANOTHER - the world's value is neither the host's nor
+   the one at the send (an admin changed it, or it was stored and changed since: never sent over it); ANOTHER WORLD - the world now is not
+   the one it was sent to (or has no name); else still owed and sent again. Every outcome but the last ends the debt.
+   KNOWN NARROW LIMIT (re-check of b0e4f7a07): a row with two values (money / research: yes / no) that the world stored, whose
+   confirmation was lost with the link, and that another admin then set back to the value it had at the send, reads as still owed and
+   IS re-sent over that admin's change - the world's value alone cannot tell it apart; closing it needs a version on the world's
+   options list. 'Another world' needs no link identity: a WELCOME naming another world (or the same name with another id) after this
+   game's index has loaded is refused (store.cpp WelcomeWorldDecideId, worlddir.h:174 / 189), so StoreIndexWorld() is this link's world. */
+struct OwedRow
+{
+    std::string key, value, world, atSend;
+    bool hadAtSend;
+    OwedRow() : hadAtSend(false) {}
+};
+enum { kOwedResend = 0, kOwedStored = 1, kOwedChangedByOther = 2, kOwedOtherWorld = 3 };
+inline int OwedRowStep(const OwedRow& r, const std::string& worldNow, const std::map<std::string, std::string>& values)
+{
+    if (worldNow.empty() || worldNow != r.world) return kOwedOtherWorld;
+    std::map<std::string, std::string>::const_iterator it = values.find(r.key);
+    const bool has = it != values.end();
+    if (has && it->second == r.value) return kOwedStored;
+    if (has != r.hadAtSend || (has && it->second != r.atSend)) return kOwedChangedByOther;
+    return kOwedResend;
+}
+inline const char* OwedStepName(int step)
+{
+    return step == kOwedStored ? "the world stored it" : step == kOwedChangedByOther ? "the world's value was changed by someone else since it was sent - never sent over it"
+         : step == kOwedOtherWorld ? "the game is linked to another world (or one with no name)" : "still owed";
+}
+/* rows just sent to `world` (whose map holds `values`) become owed; a row of the same key is replaced. A world with no name: none. */
+inline void OwedRowsAdd(std::vector<OwedRow>* owed, const OptionRows& sent, const std::string& world, const std::map<std::string, std::string>& values)
+{
+    if (world.empty()) return;
+    for (size_t k = 0; k < sent.size(); ++k)
+    {
+        for (size_t o = owed->size(); o-- > 0;) if ((*owed)[o].key == sent[k].first) owed->erase(owed->begin() + o);
+        OwedRow r;
+        r.key = sent[k].first; r.value = sent[k].second; r.world = world;
+        std::map<std::string, std::string>::const_iterator it = values.find(r.key);
+        r.hadAtSend = it != values.end();
+        if (r.hadAtSend) r.atSend = it->second;
+        owed->push_back(r);
+    }
+}
+/* every owed row looked at against the world now: those no longer owed leave the list (dropped: key and OwedRowStep's outcome) */
+inline void OwedRowsSettle(std::vector<OwedRow>* owed, const std::string& worldNow, const std::map<std::string, std::string>& values,
+                           std::vector<std::pair<std::string, int> >* dropped)
+{
+    dropped->clear();
+    for (size_t o = owed->size(); o-- > 0;)
+    {
+        const int step = OwedRowStep((*owed)[o], worldNow, values);
+        if (step == kOwedResend) continue;
+        dropped->push_back(std::make_pair((*owed)[o].key, step));
+        owed->erase(owed->begin() + o);
+    }
+}
 
 }
 

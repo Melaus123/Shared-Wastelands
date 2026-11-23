@@ -37,6 +37,17 @@ inline int TalkCursorCopyMayAsk(int copyHasList, int dead, int playerFaction)
     return (!dead && !playerFaction) ? 1 : 0;
 }
 
+/* T-1468: the hover's and the order menu's talk check (0x679FC0 inside characterSelected or the menu's build) on ANOTHER player's
+   character - a copy here in a player's stand-in faction, as startPlayerConversation's speaker test reads it (speech.cpp
+   TkPlayerSpeaker): 1 = "no talk" here, 0 = the check goes on as before. That start refuses every conversation whose speaker is
+   another player's character (players talk by chat), so a talk cursor there only led to a click that never opens. The copy sits in a
+   stand-in faction without the player marker, so 0x679FC0's own player-faction refusal does not see it (T3000); in single player
+   your own faction's characters show no talk cursor either. */
+inline int TalkCursorPlayerNoTalk(int playerSpeaker)
+{
+    return playerSpeaker != 0 ? 1 : 0;
+}
+
 /* The NPC's game, in 0x679FC0's order: a parked interrupt line first, then the never-talks tests, then the line pick (lineFound). */
 inline int TalkCursorNpcAnswer(int parked, int hasList, int dead, int playerFaction, int lineFound)
 {

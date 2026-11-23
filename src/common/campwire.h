@@ -52,7 +52,7 @@
 namespace campl {
 
 const unsigned int kMsgCamp = 93u;      /* 28-93, 94 (T-1167's TRADE), 95 (T-1383's WORLD_START), 97-103 are taken on the world-server link; 96-103 are admincmd's reserve */
-const unsigned int kProtocol = 173u;    /* the world-server protocol that carries CAMP */
+const unsigned int kProtocol = 177u;    /* the world-server protocol that carries CAMP */
 
 
 const char* const kCampFile = "camps.txt";

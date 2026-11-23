@@ -3927,18 +3927,22 @@ void t_b10_c11_the_zone_file_writer_follows_the_ladder()
                                  " that is a second copy of the rule (audit C11 / design-e46-store 3.4)");
                     }
                     else if (r != coopwriter::kRungNone) Fail("a short-circuited zone save reported a rung");
-                    /* decision 44 reaches a zone file exactly as it reaches a chest */
-                    if (p == coopwriter::kZonePathLadder && downs[dm] > kGrace && v != coopwriter::kWrRefuse)
-                        Fail("the notebook was down past the grace and the zone file was still decided (decision 44)");
+                    /* T-1391 (F1653 design 2): decision 44 no longer reaches a zone file - with the link down a save no fresh map gives
+                       another game is written as this game's own (linkDown) and the push road carries it; never refused or journaled */
+                    if (downs[dm] > 0 && p == coopwriter::kZonePathLadder)
+                        Fail("a link-down zone save went to the ladder (refused / journaled) - T-1391 one road");
+                    if (p == coopwriter::kZonePathLinkDown && (downs[dm] <= 0 || v != coopwriter::kWrMine))
+                        Fail("the linkDown path answered other than 'written as own', or with the link up");
+                    if (downs[dm] > 0 && v == coopwriter::kWrRefuse) Fail("a link-down zone save was refused - T-1391 one road");
                 }
     /* COVERAGE: three of the four paths are reachable with roleIsSingle = 0, and the single path was taken
        by the case above; every rung the ladder can answer with must be reached by this sweep. */
     for (i = 1; i < coopwriter::kZonePathCount; ++i)
         if (!seenPath[i]) Fail("ZoneWriterDecide path " + I(i) + " was never reached by the sweep");
     for (i = 1; i < coopwriter::kRungCount; ++i)
-        if (!seenRung[i]) Fail("ZoneWriterDecide rung " + I(i) + " was never reached by the sweep");
-    if (!seenRung[coopwriter::kRungRefusedNoNotebook])
-        Fail("no zone save was refused for a missing notebook - decision 44 does not reach the zone file");
+        if (!seenRung[i] && i != coopwriter::kRungRefusedNoNotebook) Fail("ZoneWriterDecide rung " + I(i) + " was never reached by the sweep");
+    if (seenRung[coopwriter::kRungRefusedNoNotebook])
+        Fail("a zone save was refused for a missing notebook - T-1391 one road: a link-down area save is written as own, the push carries it");
 }
 
 /* ================= B10-b (review-b10 M-1, M-3, M-7) =================
@@ -5291,6 +5295,225 @@ void t_t1453_review_folds()
     }
 }
 
+/* T-1457 (owner decision 1824, F1707): REPORT A BUG ON A GAME THE ADDRESS GATE SWITCHED OFF. The report road's rows are found by
+   their OWN signatures in a file of just those rows (sigtable.h SigSubset + SigResolveAll): each required row exactly once (two
+   matches or none -> the report off), a feature mark makes a row optional (only that feature off), a var row keeps its second
+   reference, a call check only between two of its rows. The verdict (reportroad.h ReportRowsVerdict), the steps a switched-off
+   report skips (ReportStepRuns), the TEST-ONLY reader's lines (RefusedReaderRefusal), the real signatures file's report rows, and
+   the plugin's wiring (bugreport.cpp FillJob / StartJob / BugReportTick, coop.cpp, ui.cpp, command_channel.cpp, addresses.cpp). */
+void t_t1457_report_road()
+{
+    const std::vector<unsigned char> img = sigt::Image();
+    coopsigtab::PeView pe;
+    if (!coopsigtab::SigParsePe(&img[0], img.size(), &pe)) { Fail("t1457: the synthetic image is not read"); return; }
+    coopsigtab::SigFile f;
+    coopsigtab::SigParseFile(sigt::kGood, std::strlen(sigt::kGood), &f);
+    coopaddr::AddrEntry e[16];
+    coopsigtab::SigOutcome oc;
+    /* (a) two rows and one the file lacks: the lacking one named, the var row keeps its second reference, both found exactly once */
+    {
+        const char* names[3] = { "Glob", "Fn", "Nope" };
+        const char* feats[3] = { 0, 0, 0 };
+        coopsigtab::SigFile sub;
+        std::vector<std::string> absent;
+        const int miss = coopsigtab::SigSubset(f, names, feats, 3, &sub, &absent);
+        if (miss != 1 || absent.size() != 1 || absent[0] != "Nope" || sub.rows.size() != 2 || sub.rows[0].name != "Fn" || sub.g2.size() != 1
+            || sub.g2Of[0] != 1 || !sub.calls.empty() || sub.declaredCount != 2 || sub.declaredNosig != 0 || sub.sigversion != 2)
+            Fail("t1457 (a): the subset is not the two named rows in the file's order with the global's second pattern: miss=" + I(miss)
+                 + " rows=" + I((int)sub.rows.size()) + " g2=" + I((int)sub.g2.size()));
+        const int n = coopsigtab::SigResolveAll(pe, sub, e, 16, &oc);
+        if (n != 2 || e[0].rva != 0x1100u || e[1].rva != 0x3010u || e[0].optional[0] != 0)
+            Fail("t1457 (a): the two rows did not resolve exactly once: n=" + I(n) + (oc.fails.empty() ? std::string("") : " first fail: " + oc.fails[0]));
+        const int liveOk[2] = { 1, -1 }, liveBad[2] = { 0, -1 };
+        std::string why;
+        if (coopreport::ReportRowsVerdict(n, 0, e, liveOk, n, &why) != 1) Fail("t1457 (a): found and matching rows did not start the report: " + why);
+        if (coopreport::ReportRowsVerdict(n, 0, e, liveBad, n, &why) != 0 || why.find("Fn") == std::string::npos)
+            Fail("t1457 (a): a required row whose bytes do not match the running game did not keep the report off: " + why);
+        if (coopreport::ReportRowsVerdict(n, 1, e, liveOk, n, &why) != 0) Fail("t1457 (a): a required row the file lacks did not keep the report off");
+    }
+    /* (b) a call check is kept only when both its rows are in the subset */
+    {
+        const char* both[2] = { "Ret", "Fn" };
+        const char* one[1] = { "Ret" };
+        coopsigtab::SigFile s2, s1;
+        coopsigtab::SigSubset(f, both, 0, 2, &s2, 0);
+        coopsigtab::SigSubset(f, one, 0, 1, &s1, 0);
+        if (s2.calls.size() != 1 || s2.calls[0].row != 1 || s2.calls[0].target != "Fn" || !s1.calls.empty())
+            Fail("t1457 (b): the call check is not kept between two subset rows only");
+        if (coopsigtab::SigResolveAll(pe, s2, e, 16, &oc) != 2 || coopsigtab::SigResolveAll(pe, s1, e, 16, &oc) != 1)
+            Fail("t1457 (b): Ret with and without Fn did not resolve");
+    }
+    /* (c) EXACTLY ONCE: Fn's bytes a second time in .text - the report is off, the row named */
+    {
+        std::vector<unsigned char> twice = img;
+        std::memcpy(&twice[sigt::T(0x1800)], &img[sigt::T(0x1100)], 19);
+        coopsigtab::PeView pe2;
+        coopsigtab::SigParsePe(&twice[0], twice.size(), &pe2);
+        const char* names[1] = { "Fn" };
+        coopsigtab::SigFile sub;
+        coopsigtab::SigSubset(f, names, 0, 1, &sub, 0);
+        const int n = coopsigtab::SigResolveAll(pe2, sub, e, 16, &oc);
+        std::string why;
+        if (n != 0 || !sigt::Mentions(oc, "Fn: the pattern occurs 0x2 times") || coopreport::ReportRowsVerdict(n, 0, e, 0, 1, &why) != 0)
+            Fail("t1457 (c): a row found twice did not keep the report off: n=" + I(n));
+    }
+    /* (d) a feature mark: the marked row missing is only its feature off; a required row missing keeps the report off */
+    {
+        const std::string konst = "Konst ro 0 F30F1005????????C3CCCCCC 4 4 0 0 0000803F00000040 .rdata 0 -";
+        const std::string gone = "Konst ro 0 F30F1005????????C3CCCC77 4 4 0 0 0000803F00000040 .rdata 0 -";
+        const std::string t1 = sigt::Swap(sigt::kGood, konst, gone);
+        coopsigtab::SigFile fk;
+        coopsigtab::SigParseFile(t1.c_str(), t1.size(), &fk);
+        const char* names[2] = { "Fn", "Konst" };
+        const char* feats[2] = { 0, "test-load" };
+        coopsigtab::SigFile sub;
+        coopsigtab::SigSubset(fk, names, feats, 2, &sub, 0);
+        int n = coopsigtab::SigResolveAll(pe, sub, e, 16, &oc);
+        const int live[2] = { 1, 0 };
+        std::string why;
+        if (n != 2 || e[1].missed != 1 || std::string(e[1].optional) != "test-load" || e[0].rva != 0x1100u
+            || coopreport::ReportRowsVerdict(n, 0, e, live, n, &why) != 1)
+            Fail("t1457 (d): a marked row not found did not leave the report on with only its feature off: n=" + I(n) + " " + why);
+        const std::string t2 = sigt::Swap(sigt::kGood, "Fn code 0 48895C2408574883EC20488B05????????90C3", "Fn code 0 48895C2408574883EC20488B05????????90C4");
+        coopsigtab::SigFile ff;
+        coopsigtab::SigParseFile(t2.c_str(), t2.size(), &ff);
+        coopsigtab::SigSubset(ff, names, feats, 2, &sub, 0);
+        n = coopsigtab::SigResolveAll(pe, sub, e, 16, &oc);
+        if (n != 0 || !sigt::Mentions(oc, "Fn: the pattern occurs nowhere") || coopreport::ReportRowsVerdict(n, 0, e, live, 2, &why) != 0)
+            Fail("t1457 (d): a required row not found did not keep the report off: n=" + I(n));
+        /* a damaged file refuses the subset too */
+        coopsigtab::SigFile fb = f;
+        fb.badLines = 1; fb.firstBad = "x";
+        coopsigtab::SigSubset(fb, names, feats, 2, &sub, 0);
+        if (coopsigtab::SigResolveAll(pe, sub, e, 16, &oc) != 0) Fail("t1457 (d): a signatures file with an unreadable line was not refused for the report");
+    }
+    /* (e) the road's rows */
+    {
+        int rc = 0;
+        const coopreport::ReportRow* rr = coopreport::ReportRows(&rc);
+        const char* req[4] = { "TitleScreen_update", "MainMenuPopup_show", "MainMenuPopup_get", "GameWorld_gpuFrame" };
+        int found = 0, tests = 0;
+        for (int i = 0; i < rc; ++i)
+        {
+            for (int k = 0; k < 4; ++k) if (std::string(rr[i].name) == req[k] && rr[i].feature == 0 && rr[i].testOnly == 0) ++found;
+            if (rr[i].testOnly != 0) { ++tests; if (rr[i].feature == 0 || std::string(rr[i].feature) != "test-load") Fail(std::string("t1457 (e): a TEST-ONLY row is required: ") + rr[i].name); }
+        }
+        if (rc != 8 || found != 4 || tests != 3) Fail("t1457 (e): the report road's rows: " + I(rc) + " rows, " + I(found) + " of the 4 required, " + I(tests) + " TEST-ONLY");
+        /* the real signatures file carries every one, the global with its second reference, the file undamaged */
+        std::string sig = T313ReadFile("../coop-plugin/addresses/signatures.sig");
+        coopsigtab::SigFile real, sub;
+        coopsigtab::SigParseFile(sig.c_str(), sig.size(), &real);
+        std::vector<const char*> nm, ft;
+        for (int i = 0; i < rc; ++i) { nm.push_back(rr[i].name); ft.push_back(rr[i].feature); }
+        std::vector<std::string> absent;
+        const int miss = coopsigtab::SigSubset(real, &nm[0], &ft[0], rc, &sub, &absent);
+        if (sig.empty() || miss != 0 || sub.rows.size() != 8 || sub.g2.size() != 1 || sub.badLines != 0 || sub.sigversion != 2 || !sub.nosig.empty())
+            Fail("t1457 (e): signatures.sig does not carry the report road's rows whole: absent=" + I(miss) + " rows=" + I((int)sub.rows.size())
+                 + (absent.empty() ? std::string("") : " first absent: " + absent[0]));
+        for (size_t i = 0; i < sub.rows.size(); ++i)
+            if (sub.rows[i].name == "KenshiSaveRootText" && sub.rows[i].optional != "crash-watch") Fail("t1457 (e): KenshiSaveRootText lost its own optional marker");
+    }
+    /* (f) the steps a switched-off game's report runs: the logs and files and the refusal's reason, nothing that asks another feature */
+    {
+        using namespace coopreport;
+        for (int st = 0; st < kStepCount; ++st)
+        {
+            const int off = ReportStepRuns(st, 0), on = ReportStepRuns(st, 1);
+            const int wantOff = (st == kStepLogs || st == kStepRefusalInfo) ? 1 : 0, wantOn = (st == kStepRefusalInfo) ? 0 : 1;
+            if (off != wantOff || on != wantOn) Fail("t1457 (f): step " + I(st) + " runs " + I(off) + " switched off / " + I(on) + " on");
+        }
+        if (ReportStepRuns(kStepCount, 0) != 0 || ReportStepRuns(-1, 1) != 0) Fail("t1457 (f): an unknown step runs");
+    }
+    /* (g) the TEST-ONLY reader's lines */
+    {
+        using coopreport::RefusedReaderRefusal;
+        if (!RefusedReaderRefusal("load", "s2").empty() || !RefusedReaderRefusal("uimenu", "ingame").empty() || !RefusedReaderRefusal("uiclick", "bugreport").empty()
+            || !RefusedReaderRefusal("uiclick", "bugsend").empty() || !RefusedReaderRefusal("uitype", "bugtext").empty())
+            Fail("t1457 (g): a line the report's run needs is refused");
+        if (RefusedReaderRefusal("load", "").empty() || RefusedReaderRefusal("uimenu", "title").empty() || RefusedReaderRefusal("uiclick", "multiplayer").empty()
+            || RefusedReaderRefusal("uitype", "password").empty() || RefusedReaderRefusal("report", "").empty() || RefusedReaderRefusal("host", "enet").empty()
+            || RefusedReaderRefusal("uistate", "").empty())
+            Fail("t1457 (g): the switched-off reader takes a line it must refuse");
+    }
+    /* (i) T2716: the info line stays within the report services' 300-character limit (tools/relay/bug-report-worker.js MAX_INFO_CHARS).
+       The switched-off road's line built from the longest parts it can have keeps the whole note; any longer line is cut to the limit
+       at a whole UTF-8 character; a running mod's line is unchanged. */
+    {
+        using namespace coopreport;
+        const std::string head = std::string("Shared Wastelands ") + modversion::kName + "; Game: pattern:00000000-00000000-00000000-00000000 (fingerprint "
+                                 "00000000-00000000-00000000-00000000); game-to-game protocol 4294967295; made in the title screen (the mod switched off)";
+        const std::string worst = std::string("Shared Wastelands 999.999.9; Game: pattern:00000000-00000000-00000000-00000000 (fingerprint "
+                                  "00000000-00000000-00000000-00000000); game-to-game protocol 4294967295; made in the title screen (the mod switched off)");
+        const std::string note = SwitchedOffInfoNote();
+        if (kInfoMaxChars != 300) Fail("t1457 (i): the limit is not the services' 300");
+        if (InfoLineText(head, 1) != head + note || (head + note).size() > kInfoMaxChars) Fail("t1457 (i): the switched-off info line is over 300 or not whole: " + I((int)(head + note).size()));
+        if (InfoLineText(worst, 1) != worst + note || (worst + note).size() > kInfoMaxChars) Fail("t1457 (i): the longest switched-off info line is over 300: " + I((int)(worst + note).size()));
+        if (InfoLineText(head, 0) != head) Fail("t1457 (i): a running mod's info line changed");
+        if (note.find("address check") == std::string::npos || note.size() > 100) Fail("t1457 (i): the switched-off note is missing or long");
+        const std::string longHead(400, 'a');
+        if (InfoLineText(longHead, 1).size() != kInfoMaxChars || InfoLineText(longHead, 0).size() != kInfoMaxChars) Fail("t1457 (i): a 400-character line is not cut to 300");
+        std::string mb(299, 'a'); mb += "\xC3\xA9xyz";   /* a 2-byte character across the cut */
+        if (InfoLineText(mb, 0) != std::string(299, 'a')) Fail("t1457 (i): the cut splits a UTF-8 character");
+        const std::string old = head + "; the mod was switched off by its address check: TEST LEVER KENSHI_SW_TEST_ADDR_FAIL: the row GameWorld_setupRecords was made to fail "
+                                "its check against this game (the table road), as on a build this mod was not made for.";
+        if (old.size() <= kInfoMaxChars) Fail("t1457 (i): T2716's refused line is no longer a valid over-limit example");
+    }
+    /* (h) the wiring */
+    {
+        std::string b = T313ReadFile("../coop-plugin/bugreport.cpp"), co = T313ReadFile("../coop-plugin/coop.cpp"), ui = T313ReadFile("../coop-plugin/ui.cpp"),
+                    cc = T313ReadFile("../coop-plugin/command_channel.cpp"), ad = T313ReadFile("../coop-plugin/addresses.cpp");
+        std::string* all[5] = { &b, &co, &ui, &cc, &ad };
+        for (int i = 0; i < 5; ++i) all[i]->erase(std::remove(all[i]->begin(), all[i]->end(), '\r'), all[i]->end());
+        const char* steps[] = { "const int asked = (sendOnly || !Runs(coopreport::kStepAskNearby)) ? 0 : AskNearby(gen, 0, &note);",
+                                "if (!sendOnly && Runs(coopreport::kStepCounters)) { coop::ReportEverythingForReport(); coop::ReportFarm(); }",
+                                "if (Runs(coopreport::kStepArea)) sq = MyLastPlayerSector();",
+                                "if (Runs(coopreport::kStepKeeper))",
+                                "j->serverLog = Runs(coopreport::kStepServerLog) ? Widen(UiServerLogPath()) : std::wstring();",
+                                "return coopreport::InfoLineText(std::string(\"Shared Wastelands \") + modversion::kName",
+                                "Runs(coopreport::kStepRefusalInfo));",
+                                "try { if (Runs(coopreport::kStepLiveTicks)) { CollectTick(); AnswerTick(); ThreadTick(); ThreadUploadPump(); } }",
+                                "if (!Runs(coopreport::kStepWhereLink)) return g_lastAtTitle ?",
+                                "int Runs(int step) { return coopreport::ReportStepRuns(step, AddrOk()); }" };
+        for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i)
+            if (b.find(steps[i]) == std::string::npos) Fail(std::string("t1457 (h): bugreport.cpp does not skip a step on a switched-off game: ") + steps[i]);
+        const size_t f0 = co.find("static void detour_mainLoopReportOnly("), f1 = f0 == std::string::npos ? f0 : co.find("\n}\n", f0);
+        const std::string fb = f1 == std::string::npos ? std::string() : co.substr(f0, f1 - f0);
+        if (fb.empty() || fb.find("orig_mainLoop(thisptr, time);") == std::string::npos || fb.find("coop::BugReportTick(0);") == std::string::npos
+            || fb.find("CommandChannelTick();") != std::string::npos || fb.find("TickWait") != std::string::npos)
+            Fail("t1457 (h): the report-only frame hook does more than the engine's frame and REPORT A BUG's tick (and the TEST reader)");
+        const size_t r0 = co.find("static void startRefused()"), rr = r0 == std::string::npos ? r0 : co.find("coop::AddrResolveReportRows();", r0),
+                     rt = r0 == std::string::npos ? r0 : co.find("installProbeP005();", r0), rs = r0 == std::string::npos ? r0 : co.find("StartReportOnly(titleHooked);", r0);
+        if (rr == std::string::npos || rt == std::string::npos || rs == std::string::npos || rr > rt || rt > rs)
+            Fail("t1457 (h): startRefused does not resolve the report's rows before the title hook and start the report after it");
+        const size_t p0 = ui.find("static void* detour_pauseMenuShowReportOnly("), p1 = p0 == std::string::npos ? p0 : ui.find("\n}\n", p0);
+        const std::string pb = p1 == std::string::npos ? std::string() : ui.substr(p0, p1 - p0);
+        if (pb.empty() || pb.find("BugReportPauseMenuShown(panel);") == std::string::npos || pb.find("UiPauseMenuArrange(panel);") == std::string::npos
+            || pb.find("ChatTakesEscape") != std::string::npos || pb.find("ClockGameMenuVisible") != std::string::npos || pb.find("HandSaveBlocked") != std::string::npos)
+            Fail("t1457 (h): the report-only pause-menu hook asks another feature");
+        if (ui.find("const bool block = g_pmReportOnly != 0 ? false : HandSaveBlocked();") == std::string::npos)
+            Fail("t1457 (h): the menu's arranging asks HandSaveBlocked on a switched-off game");
+        const size_t c0 = cc.find("void CommandChannelRefusedTick()"), cd = c0 == std::string::npos ? c0 : cc.rfind("#ifdef SW_DEV_BUILD", c0),
+                     ce = c0 == std::string::npos ? c0 : cc.rfind("#endif", c0);
+        if (c0 == std::string::npos || cd == std::string::npos || (ce != std::string::npos && ce > cd)
+            || cc.find("const std::string no = coopreport::RefusedReaderRefusal(verb, first);", c0) == std::string::npos)
+            Fail("t1457 (h): the switched-off reader is not TEST-build only, or does not refuse every other line");
+        const size_t l0 = ad.find("GetEnvironmentVariableA(\"KENSHI_SW_TEST_ADDR_FAIL\""), l1 = ad.find("static int AddrTestFailRow(");
+        const size_t l2 = l1 == std::string::npos ? l1 : ad.find("\n}\n", l1);
+        const std::string lb = l2 == std::string::npos ? std::string() : ad.substr(l1, l2 - l1);
+        if (l0 == std::string::npos || lb.find("AddrClearSlots(g_regs, g_regCount);") == std::string::npos || lb.find("TitleByPattern(") == std::string::npos
+            || lb.find("::InterlockedExchange(&g_ok, 0);") == std::string::npos)
+            Fail("t1457 (h): the fail-one-row lever does not refuse as a build the mod was not made for (every slot cleared, the title pattern)");
+        /* review of 2cfa25778: the lever (its read and its function) is the TEST build's only */
+        const size_t at[2] = { l0, l1 };
+        for (int k = 0; k < 2; ++k)
+        {
+            const size_t d = at[k] == std::string::npos ? at[k] : ad.rfind("#ifdef SW_DEV_BUILD", at[k]), x = at[k] == std::string::npos ? at[k] : ad.rfind("#endif", at[k]);
+            if (d == std::string::npos || (x != std::string::npos && x > d) || ad.find("#endif", at[k]) == std::string::npos)
+                Fail(std::string("t1457 (h): the fail-one-row lever's ") + (k == 0 ? "read" : "function") + " is compiled into a player's build (not inside #ifdef SW_DEV_BUILD)");
+        }
+    }
+}
+
 /* gog1 fold 2: EVERY SLOT CLEARED after a pattern set fails its running-game check (addrtable.cpp AddrSettleSlots, the
    bind AddrInit makes in addresses.cpp). Literal inputs: two entries, slots preset to a marker. */
 void t_addr_pattern_refusal_clears_every_slot()
@@ -5477,6 +5700,50 @@ void t_t1447_addr_hook_chain()
     if (std::string(AddrFileNamePart("a/b/other.dll")) != "other.dll") Fail("T-1447: the file name was not cut from a slash path");
     if (std::string(AddrFileNamePart("plain.dll")) != "plain.dll" || std::string(AddrFileNamePart(0)) != "")
         Fail("T-1447: a bare name or no name was changed");
+}
+
+/* T-1476 (F2011, owner 1876): src/common/addrhooked.h AddrGateUse - the signature road (no table: every GOG game) applies each
+   row's declared use exactly as the table road does. SoundPostEvent's own first 16 bytes (addresses/signatures.sig, rva = the
+   pattern's start) with RE_Kenshi's 5-byte jump on them (evidence/T3027/log-B.txt). The road is no input of AddrGateUse (it does
+   not change the rule), so the verdicts below hold on both roads; that the gate applies it on the signature road too is proven
+   by the text pin at the end (the gate's line, and the old 'byPattern ? 0' line gone). */
+void t_t1476_sig_road_declared_use()
+{
+    using namespace coopaddr;
+    unsigned char want[16], got[16];
+    int why = -1;
+    Rk1Hex("48895C240848896C241048897C241841", want, 16);
+    Rk1Hex("E91122334448896C241048897C241841", got, 16);
+    if (AddrGateUse(0) != 0 || AddrGateUse(1) != 1 || AddrGateUse(2) != 2) Fail("T-1476: the gate does not apply the declared use");
+    if (AddrGateUse(7) != 0 || AddrGateUse(-1) != 0) Fail("T-1476: an unknown use is not strict");
+    /* signature road, a call-only row (SoundPostEvent, chat.cpp kAddrUseCallOnly), another mod's jump, the rest matching: accepted */
+    if (AddrForeignVerdict(want, got, 16, 1, AddrGateUse(1), 0, 1, &why) != kHookAccepted || why != kWhyAccepted)
+        Fail("T-1476: the signature road refused a call-only row with another mod's jump (F2011)");
+    /* signature road, a row we hook, at a game function's start: accepted - the gate chains it (v 2 with use 2) */
+    if (AddrGateUse(2) != 2 || AddrForeignVerdict(want, got, 16, 1, AddrGateUse(2), 1, 1, &why) != kHookAccepted)
+        Fail("T-1476: the signature road did not accept a hooked row's jump at a function start (to chain)");
+    if (AddrForeignVerdict(want, got, 16, 1, AddrGateUse(2), 0, 1, &why) != kHookRefuse || why != kWhyNotFunction)
+        Fail("T-1476: the signature road accepted a hooked row's jump away from a function start");
+    /* signature road, a row nobody declared a use for: refused, as before */
+    if (AddrForeignVerdict(want, got, 16, 1, AddrGateUse(0), 1, 1, &why) != kHookRefuse || why != kWhyNoUse)
+        Fail("T-1476: the signature road accepted a strict row (no declared use)");
+    /* signature road, the rest differs: refused */
+    {
+        unsigned char g2[16];
+        Rk1Hex("E91122334448896C241048897C241842", g2, 16);
+        if (AddrForeignVerdict(want, g2, 16, 1, AddrGateUse(1), 0, 1, &why) != kHookRefuse || why != kWhyRestDiffers)
+            Fail("T-1476: the signature road accepted a call-only row whose rest differs");
+    }
+    /* the pin: the gate asks AddrGateUse with RowUse on both roads, and the old strict line is gone */
+    const std::string a = T313ReadFile("../coop-plugin/addresses.cpp");
+    if (a.empty()) { Fail("could not read addresses.cpp"); return; }
+    if (a.find("const int use = AddrGateUse(RowUse(g_entries[i].name));") == std::string::npos)
+        Fail("addresses.cpp: the gate does not take each row's use from AddrGateUse (T-1476)");
+    if (a.find("byPattern ? 0 : RowUse(") != std::string::npos)
+        Fail("addresses.cpp: the signature road still makes every row strict (F2011)");
+    /* T-1476 review: every refused required row is named, not only the first */
+    if (a.find("ErrorLog(std::string(\"[ADDR] row refused: \")") == std::string::npos || a.find("more rows refused (the first ") == std::string::npos)
+        Fail("addresses.cpp: the refused rows are not each named (T-1476 review)");
 }
 
 void t_addr_signatures_resolve_every_kind_and_refuse_anything_less()
@@ -8851,9 +9118,9 @@ void t_p109_parity_pull()
         if (d.kind != k || d.boxes.size() != 1 || d.boxes[0].kind != k || d.boxes[0].key != row.key || d.boxes[0].digest != 9)
             Fail("the kind round-trips and is stamped on every row");
     }
-    r.kind = 3;
+    r.kind = 4;   /* T-1463: 3 is the character check (kParityAskChar) - 4 is the first unknown kind */
     { std::vector<char> b; if (cooppar::EncodeParityReq(&b, r)) Fail("an unknown kind is refused at encode"); }
-    { std::vector<char> b = plain; const char t[5] = { 'P', 'R', 'Q', 'K', 3 }; b.insert(b.end(), t, t + 5);
+    { std::vector<char> b = plain; const char t[5] = { 'P', 'R', 'Q', 'K', 4 }; b.insert(b.end(), t, t + 5);
       cooppar::ParityReq d; if (cooppar::DecodeParityReq(&b[0], b.size(), &d) != cooppar::kParityDecodeBadKind) Fail("an unknown kind on the wire is refused"); }
     { std::vector<char> b = plain; const char t[5] = { 'X', 'R', 'Q', 'K', 1 }; b.insert(b.end(), t, t + 5);
       cooppar::ParityReq d; if (cooppar::DecodeParityReq(&b[0], b.size(), &d) != cooppar::kParityDecodeTrailing) Fail("other trailing bytes stay refused"); }

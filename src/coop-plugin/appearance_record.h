@@ -72,7 +72,9 @@ bool CaptureAppearanceRecord(::Character* c, RecordCopy* out);
 // Write the values onto a character's own appearance record, then make the engine re-derive
 // from them. This is the only write H010b performs: the derived fields are left alone
 // entirely, on purpose (F160).
-bool ApplyAppearanceRecord(::Character* c, const RecordCopy& rec);
+// T-1449 attempt 2: runUpdate false = the record writes and setAppearanceData only, no updateAppearance (which returns at once with
+// no body, decomp_532a40.txt:31-33) - for a copy whose first body build has not run yet (appearance.cpp FirstPreBuildNow).
+bool ApplyAppearanceRecord(::Character* c, const RecordCopy& rec, bool runUpdate = true);
 
 // P10 TEST-ONLY lever (`bodydown`): hand the appearance object its OWN record again through setAppearanceData 0x5378D0 -
 // the engine call our APPEARANCE apply makes - with no value changed and no updateAppearance. setAppearanceData sets

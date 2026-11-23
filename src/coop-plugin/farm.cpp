@@ -156,7 +156,8 @@ struct FmIn { coopfarm::FarmMsg m; DWORD at; unsigned int from; int proven; };  
 std::map<std::string, FmIn> g_inFarm;                   /* MAIN THREAD: the latest FARM per key, applied at K2 */
 struct FmOpIn { std::vector<FmWork> w; DWORD at; unsigned int from; };
 std::map<std::string, FmOpIn> g_inOp;                   /* MAIN THREAD: work per key and worker, run at K2 by the writer */
-struct FmLast { coopfarm::FarmMsg m; DWORD at; int ever; };
+/* at and ever start at 0: VS2010 does not zero plain fields of a map entry made by operator[] */
+struct FmLast { coopfarm::FarmMsg m; DWORD at; int ever; FmLast() : m(), at(0), ever(0) {} };
 std::map<std::string, FmLast> g_last;                   /* MAIN THREAD: what the writer sent last per key */
 std::map<std::string, void*> g_hint;                    /* MAIN THREAD (fold #5): the last pointer per key, re-proved on use */
 DWORD g_tickAt = 0, g_pubAt = 0;

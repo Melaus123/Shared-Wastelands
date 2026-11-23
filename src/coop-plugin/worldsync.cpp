@@ -29,6 +29,7 @@
 
 #include "coop_log.h"
 #include "handoff.h"   /* T-1 B1: SquadDecisionPos - a squad member is decided by its squad's position */
+#include "../common/carryhand.h"   /* T-1467: CarrierHold - a carrier holding a body another game runs is not withdrawn before the hand-over */
 #include "../common/squadwriter.h"   /* M7a3f3 [m7a3f3-ws0]: kAnn* and HandedOverSweepAction */
 #include "../common/lostcopy.h"   /* ResendOwnerVerdict, StaleRowGivesWay */
 #include "game/Character.h"
@@ -1158,6 +1159,7 @@ static void AnnouncePass()
        the withdrawal owes nothing to the peer-zone clock, and routing it through a gate that returns
        early would be exactly the "consumed by a gate deferral" failure this registry exists to avoid. */
     RetireWithdrawDrain();
+    HandoffCarryRefusedSweep();   /* T-1467: refusals and holds whose carry ended go (read live) */
     if (!RelayMapFresh()) { ++g_announceStale; return; }   /* H030 (F445): a silent peer has dropped NOTHING - judge only a fresh set */
     /* review-p5b HIGH-1: the guard reads the clock the ANSWER comes from - PeerHoldsSectorOf -> OtherHasSector answers
        from the notebook's loaded-by map, and that map has its own clock.
@@ -1219,6 +1221,20 @@ static void AnnouncePass()
 #endif
         // PROBE-END: P166
         AnnUnshownNote(uid, c, state == 1, held, mineLoaded);   /* T-1055: the release log's not shown / shown line (log only) */
+        /* T-1467 (owner 1864 a; src/common/carryhand.h CarrierHold): a character this game runs that carries a body another game runs is not
+           withdrawn - its UNLOAD waits for the body's hand-over. Read live here, from what it carries now; the hold ends only on events: the body
+           handed here (then this game's own), this game refusing the hand-over, the carry's end, or the body's game gone (its copy goes) */
+        if (ann == cooplive::kAnnUnload && !ReleasePendingHas(uid))
+        {
+            const unsigned int carried = CarryingUidOf(uid);
+            if (carryhand::CarrierHold(1, carried, (carried != 0 && net::IsUidMine(carried)) ? 1 : 0, carried != 0 ? net::OwnerSlotOf(carried) : -1,
+                                       HandoffCarryRefusedHere(carried, uid), carried != 0 && CarryBodyIsPlayers(carried) != 0 ? 1 : 0) != 0)
+            {
+                if (it == g_announced.end()) g_announced[uid] = 1;   /* stays marked announced: its UNLOAD goes once the hold ends */
+                HandoffCarryHoldNote(uid, carried);
+                continue;
+            }
+        }
         if (ann == cooplive::kAnnHoldForHandover)
         {
             if (it == g_announced.end()) g_announced[uid] = 1;   /* stays marked announced: ReleaseOnPutAway opens its RELEASE and WithdrawHeldUnload sends its UNLOAD */

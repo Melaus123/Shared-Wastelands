@@ -32,6 +32,8 @@ void AdminSafePointDrain();
 // proved the owner password, at its door or by /login) or a logged-in admin. A new link is not an admin until its first standing. Only such a
 // game sets the world's rules (settings.cpp RulesAuthority). MAIN THREAD.
 bool AdminNow();
+// T-1399 fold: true once the world server's standing for this game has arrived on this link (AdminNow is its word only then). MAIN THREAD.
+bool AdminStandingKnown();
 
 // THIS PLAYER LOGGED OUT THIS VISIT (owner 1412 b): a /logout was typed in the world this game is in now. Until this game leaves that
 // world (store.cpp StoreWorldLoadBegan moves the world-load generation) its remembered login is neither tried by itself (AdminTick)

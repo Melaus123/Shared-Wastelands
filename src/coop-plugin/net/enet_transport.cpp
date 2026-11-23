@@ -730,6 +730,14 @@ public:
         DebugLog("[net] TEST ONLY: benchcapkbs=" + N((long long)kbs) + " - ENet's bandwidth limit on this " + std::string(nettally::LinkName(tallyLink_))
                  + " link is " + N((long long)kbs) + " KB/s in and out");
     }
+    /* T-540 fold 3 (transport.h): nothing waits on the line and ENet's queue has room - sendbound.h Direct's own test for a reliable
+       message off the live-first mode (the session link). */
+    bool ReliableSendsNow()
+    {
+        Guard g(this);   /* T-1118 (a): the link's lock */
+        return box_.Count() == 0 && !coopsb::Outbox::NetFull(NetCount(), NetBytes());
+    }
+
     std::string SendBoundToken()
     {
         Guard g(this);   /* T-1118 (a): the link's lock */

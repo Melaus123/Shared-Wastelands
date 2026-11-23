@@ -122,6 +122,14 @@ void CopyBodyNoteModApply(unsigned int uid, ::Character* c);
 // MAIN THREAD (spawn.cpp SpawnWorldTeardown): the world is going - every copy's marks DeadlookForgetCopy forgets one copy at a
 // time are forgotten at once, so a copy met in the next world with the same uid starts with none (its first look is its own).
 void DeadlookForgetAllCopies();
+// T-1449 attempt 2 (F1829, design D1). MAIN THREAD. A copy just made from a SPAWN (spawn.cpp ApplyRemoteSpawn): its first body build
+// waits until its owner's look and kit have gone on before it - or the owner says none will come (FirstBuildNoLook, an APPEARANCE
+// carrying 'NOLK'), or the owner leaves (FirstBuildOwnerGone), or the copy is this game's own; the mark goes with the copy.
+void FirstBuildHoldBegin(unsigned int uid, ::Character* c);
+void FirstBuildNoLook(unsigned int uid, int what);
+void FirstBuildOwnerGone(unsigned int uid);
+// fold 1: another game took the character (OWNER_MOVED / a ROSTER re-key) - the hold ends; the new owner's look goes the ordinary road.
+void FirstBuildOwnerChanged(unsigned int uid);
 
 // R1-a / R1-a-b (review-r1a LOW-3): cumulative count of remote APPEARANCE / CLOTHING entries that
 // ENTERED a wait because the character was settled but not yet built - once per uid per wait, not
@@ -219,6 +227,11 @@ std::string BodyDownLever(unsigned int anchorUid, float radiusM);
 // character out through KnockOutOwned; seconds > 0 holds the wake-up clock at least that long. MAIN THREAD. Returns the
 // command's status line.
 std::string KoSelfLever(unsigned int uid, float seconds);
+#ifdef SW_DEV_BUILD
+// T-540 TEST-ONLY (DEV build verb, DEV build only): `koself <uid|made:<label>> short` - the engine's own knockout at strength 0 (its 3 s floor),
+// no hold, STATE pushed; one [KOSELF] line. MAIN THREAD.
+std::string KoSelfShortLever(unsigned int uid);
+#endif
 // looktest <uid> / looktest restore <uid> - TEST-ONLY lever (appearance.cpp): the driven character's look alternates between its
 // original + 0.1 and its original (restore: back to the original) and is sent to the other games at once; its own apply waits
 // until it stands out of ragdoll and its get-up blend has ended. MAIN THREAD.

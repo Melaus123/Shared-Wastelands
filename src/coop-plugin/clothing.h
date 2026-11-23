@@ -73,6 +73,9 @@ struct GarmentSet
 // Read a character's worn items. Walks the inventory's SECTION map - not `_allItems`, which
 // F173 measured reading 0 on characters that were visibly dressed.
 bool CaptureGarments(::Character* c, GarmentSet* out);
+// T-1463: the same read for the character check's digest only (items.cpp) - nothing is sent, so the kit's send counters and the
+// refused-pack line are left alone. MAIN THREAD.
+bool CaptureGarmentsForDigest(::Character* c, GarmentSet* out);
 
 // Clear the peer's own rolled clothing and rebuild the authority's. Returns false if the
 // inventory could not be reached; individual items that fail to resolve are counted and

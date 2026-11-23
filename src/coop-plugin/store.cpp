@@ -47,9 +47,14 @@
 #include "../common/shoprec.h"    /* a shop.<sx>.<sy>.#<hash>.<x10>.<z10> record is one shop building's restock state (items.cpp keeps it), never a squad */
 #include "../common/doorrec.h"    /* a door.<sx>.<sy>.#<hash> record is one world door's facts (doors.cpp keeps it), never a squad */
 #include "../common/towntime.h"   /* T-4: a towntime.<sx>.<sy>.<sid> record is one town's rebuild clock (towngen.cpp keeps it), never a squad */
+#include "../common/camplaid.h"   /* T-1429 design b: a camplaid.<sx>.<sy> record is an area's camp mark (camp.cpp keeps it), never a squad */
 #include "../common/cagerec.h"    /* T-860: a cage.<sx>.<sy>.#<hash>.<x10>.<z10> record is one cage's lock (spawn.cpp keeps it), never a squad */
 #include "../common/bldgrec.h"    /* T-1333: a bldg.<sx>.<sy>.#<hash> record is one town building's ruin flag and wall health (build.cpp keeps it), never a squad */
 #include "../common/boxrec.h"   /* T-823: a box.<sx>.<sy>.#<hash>.<x10>.<z10> record is one box's contents (items.cpp keeps it), never a squad */
+namespace coop { int PieceRecWaitsHere(const std::string& id); }   /* build.cpp (T-1391 F1653): 1 = a piece record is marked for writing here (waits on its own road). MAIN THREAD */
+namespace coop { int PieceRecTownHere(const std::string& id, piecerec::PieceTownFact* f); }   /* build.cpp (T-1391 F1754): the town a held piece record carries. MAIN THREAD */
+namespace coop { int PieceRecTownOwedHere(const std::string& id, piecerec::PieceTownFact* f, int* owed, int* words); }   /* build.cpp (T-1391 fix attempt 2): the town a piece's OWED write will carry. MAIN THREAD */
+namespace coop { int SavedTownFactHere(const int* hand, piecerec::PieceTownFact* f, std::string* why); }   /* build.cpp (T-1391 F1754): the town a saved link's words name here. MAIN THREAD */
 namespace coop { void SameIdWithdrawMarkClearNear(const unsigned int* uids, int n); void SameIdWithdrawDone(); long long SameIdClearNearUnoffered(); }   /* handoff.cpp (handoff.h): the TEST-ONLY clearnear lever's removed squads are never offered to another game */
 namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); int HandedOverSlot(void* faction, const std::string& id); void HandedOverUnmark(void* faction, const std::string& id, int why); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
 namespace coop { int HandoffKeepReceivers(float px, float pz, int wantSlot, int* namesSlot, int* holderOut); int HandoffSquadKeepPos(void* activePlatoon, float* x, float* z); void HandoffKeepReceiverCounts(long long* skipped, long long* asked); int HandoffSquadHasGiven(void* faction, const std::string& id); int HandoffSquadKeptPart(void* faction, const std::string& id); void HandoffSquadDiscardedId(const std::string& id); int HandoffSquadHasGivenId(const std::string& id); int HandoffMembersTakenBy(void* faction, const std::string& id, void* const* members, int n); int HandoffSquadOpen(void* faction, const std::string& id); int HandoffOpenAny(); long long HandoffOpenSeq(); int HandoffGivenSlotId(const std::string& id); int HandoffSleepersTakenBy(void* faction, const std::string& id, const std::vector<std::string>& hands); long long HandoffIdxSeq(); void HandoffNoteWokeWithGiven(void* faction, const std::string& id); }   /* T-1046 fix 2: handoff.cpp (handoff.h) - the keep question's receiver test is the RELEASE's own (ReceiversFor) */
@@ -193,6 +198,7 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "../common/dirlevels.h"   /* tickwait: EnsureDir makes every missing folder level (pure, offline-tested) */
 #include "../common/recname.h"     /* a record's data file name: the world server's folder and this game's mirror */
 #include "../common/mirrorkeep.h"   /* T-985 C1: the kept mirror folder's name and the kept record table (pure) */
+#include "../common/areastate.h"   /* T-1391 design B (F1706): one state file per area, <mirror>.area - its format, commit, load and migration */
 #include "../common/areafile.h"   /* T-985: this game's area file - where its people are, kept beside the record table (pure) */
 #include "../common/aoi.h"        /* AreaOfPos: a record's area, the same formula the world server's area-of-interest ledger uses */
 #include "../common/owedpop.h"   /* T-581: OWED (63) - the owed town populations; the SAME header the world server and the offline suite compile */
@@ -225,7 +231,7 @@ void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char
 namespace coop {
 int PreloadHoldsTitleLoad(); void PreloadNoRequest(); void PreloadNoteLoad(const std::string& key, int isZone); void PreloadReleased();   /* T-346 slice 1: defined at coop scope beside StoreFeedTick; the pump and the two load detours call them */
 int AfSettleStep(DWORD now, int linkOk); void AfSettleDrop(const char* why); void AfSettleWorldStarted(long world);   /* T-1429 s2 fold 1: the pre-load's area settle (defined with AREA_FRESH); fold 8: its after-load step at the world-started edge (ClockNoteEpoch) */
-int PreloadHoldsNewGame(const std::string& start); int PreloadNewGameGatePassed(); void PreloadNewGameLetGo();   /* T-1365: a NEW GAME held at the pump as a load is (defined beside PreloadHoldsTitleLoad) */
+int PreloadHoldsNewGame(const std::string& start); int PreloadNewGameGatePassed(); void PreloadNewGameLetGo(); int PreloadLinkGoneForGood(); void ImportRefusedCleanup(const char* road);   /* T-1365: a NEW GAME held at the pump as a load is (defined beside PreloadHoldsTitleLoad) */
 int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot);   /* M9 (T-197): the whole AREAMAP payload; 1 applied, 0 malformed (msg 0 = malformed). decision 32: zones.cpp fills the locked grid from the relay's map */
 void StoreDrainCreated(); void StoreCreatedLockInit();   /* P4e: defined at coop scope at the end of the file */
 /* E47-S2: the heartbeat's registry edges, defined at coop scope just above StoreTick - declared HERE, at coop scope, not
@@ -832,7 +838,7 @@ const int kSaveRequestLoad = 2;
 unsigned long long kSaveFileSystemGlobalRva = 0; static coop::AddrReg kSaveFileSystemGlobalRva_reg("SaveFileSystemGlobal", &kSaveFileSystemGlobalRva);   /* P8h: the address table fills this. Steam_1.0.65 0x212DC08 */
 const unsigned int kSfsBusyOff = 0x1E0;
 unsigned long long kResetGameRva = 0; static coop::AddrReg kResetGameRva_reg("ResetGame", &kResetGameRva);   /* P8h: the address table fills this. Steam_1.0.65 0x36CA40 */   // F489: GameWorld::resetGame - what SaveManager::loadGame calls to clear the world mid-session (FactionDirectory::clearAndFree, the global container, the player faction)
-const unsigned int kStoreProtocol = 173;   /* 173 (T-1452, design B): PROFILES kind 7 carries the single-player save folder and every PROFILES row its pending import (profiles.h Row::imports) - the import survives a leave; 172 (T-1391, F1565): an area record's three silent refusals answer its sender (CANT recNotHolder / recLease / recNotNewer) - this game holds its load for its queued area saves' answers; 171 (T-1429 s3, owner 1777 / 1788): a piece record's LIVE part may carry a building's CONSTRUCTION PAUSE - flag bits 9 / 10 (piecerec.h kPrLiveFlagPauseKnown / kPrLiveFlagPaused, no bytes), written by the piece's record writer at each engine change of the 'PAUSE CONSTRUCTION' byte; a world server of 170 refuses such a record as an unknown bit, so the pause would never reach the other games or survive a restart - the pair SHIPS TOGETHER (another open effort may also take 171: whichever merges second renumbers). 170 (merge of effort/t1408a and main, 2026-11-19, above both; effort/t1408a's own 165-167, made on its branch, are never reused): main's 169 (below: T-1429's area-upload base, creation lease and settle ask, T-1021's race look-alike id, T-1427's town fact) and T-1408's wall group facts in a piece record's STATE - the group step stamp (buildwire.h kBuildStateStampBit) and fold 13's wall group fact (buildwire.h kBuildStateGroupBit: the owner's group lead key and join index; the world server reads both through piecerec.h DecodeBuild) - a world server of 169 refuses such a record as unreadable and one of effort/t1408a's 167 lacks the lease, so the pair SHIPS TOGETHER. 169 (merge of effort/t1429b and main, above both; T-1429's own 165-168, made on its branch, are never reused): main's 166 (T-1021: LOOKALIKE (90) may carry a race look-alike id, src/common/lookalikelist.h IdOk, which a world server without it drops as malformed), main's 165 (T-1427 fold 1: a piece record's LIVE part may carry the builder's town, piecerec.h kPrLiveFlagTownFact) and T-1429's area-upload base, creation lease and settle ask (its 165-168 below) - a world server of 165 or 166 lacks one set or the other, so the pair SHIPS TOGETHER. 168 (T-1429 s2 fold 3, review F1372): an area RECORD carries its base - the world server's seq of the stored copy it was made from (areafresh.h ContentBaseOnLoad / ContentBaseOnEcho) - and a copy made from an older one is refused and this game told AREA_FRESH CANT staleBase; a world server of 167 takes any newer copy, so the pair SHIPS TOGETHER. 167 (T-1429 s2 fold 2, review F1364 B / C): the settle ask carries the load's whole ordered area list in one message (areafresh.h EncodeSettleList) and a load with no area list first settles the world-first lease (AREA_FRESH why worldFirst); a world server of 166 refuses the list as malformed, so the pair SHIPS TOGETHER. 166 (T-1429 s2 fold 1, review F1337 item 1): before the world load, every area the load will read is asked with AREA_FRESH why settle and the load stays held until each is settled (FRESH / CANT current / LEASE; WAIT holds until the copy lands); a world server of 165 would send each area's record whole to such an ask, so the pair SHIPS TOGETHER. 165 (T-1429 s2, owner 1788; src/common/areafresh.h): AREA_FRESH (89) gains the CREATION LEASE - LEASE ("you create it": this game loads its own save's copy of an area the world server has no copy of and uploads it at once), WAIT (another game creates it; the read waits for that copy) and the world-load CLAIM (ASK why loadedOwn); a world server of 164 answers an unrecorded area CANT current and each game would load its own, differently rolled copy, so the pair SHIPS TOGETHER. 166 (merge of effort/t1021a and main, above main's 165; effort/t1021a's own 165 is never reused): both sets of changes below are in it - T-1021's LOOKALIKE (90) race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk), which a world server of 165 drops as malformed, and main's 165 (T-1427 fold 1, piecerec.h kPrLiveFlagTownFact, the builder's town). 165 (T-1021, never reused): LOOKALIKE (90) may carry a race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk) - a world server of 164 drops such a message as malformed, so no load would make the bring-back's template ahead of its squad. 166 (merge of effort/t1408a and main, the world server's protocol above main's 165; both sides' 165 are in it and 165 is never reused as a merged number): T-1408's group step stamp in a piece record's STATE and T-1427's town fact (LIVE flag bit 8) - a world server of 165 knows only one of them and refuses the other's records as unreadable. 165 (T-1408 group step stamp): a piece record's STATE may carry a wall group step stamp (buildwire.h kBuildStateStampBit) - a world server of 164 refuses such a record as unreadable, a game of 164 such a STATE. 165 (T-1427 fold 1, owner request 2026-11-18): a piece record's LIVE part may carry flag bit 8 (piecerec.h kPrLiveFlagTownFact) - the builder's town; a world server of 164 refuses such a record as an unknown bit. 164 (merge of effort/t1167b and main, above main's 163; effort/t1167b's own 163 is never reused): main's 163 and T-1167's TRADE (94, src/common/tradewire.h; 154-156 on its branch, never reused) - a game of 163 would not open the trade window and a world server of 163 drops 94. 163 (T-885 piece 2): OWNREC 105 gains INDEX_ASK / GET up and INDEX / REC / END down - before every load the player's records are taken from the world server's copy (ownupload.cpp OwnTakeHold); a world server of 162 reads them as malformed PUTs. 162 (T-885 piece 1, owner 1752 a): OWNREC (message 105, src/common/ownrecwire.h) - every record of a player's own records folder goes to the world server, which keeps it in <world folder>\own\<profile id>\ and answers OK; a world server of 161 would log 105 as unknown and never answer. 161 (T-1392, owner 1082: players must update to keep playing together): the OPTIONS map may hold MENUS AND BUILDING (menupause), which a game of 160 ignores. 160: the merge of T-1383's 159 (import / creator words, WORLD_START) and T-938 / T-247's 158 (PLAYER_MODS, playermods.h). The world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kStoreProtocol = 177;   /* 177 (T-1429 F1796 design b, unreleased): ground record format 3 - after its rows a gone block (u32 n, n x {str name, u32 slot, u32 stamp}); a map item (not made during play) is removed by a record apply only when a gone row names it, an absent row reads 'untouched'; format 2 is still read as no gone rows; a world server of 176 refuses a format-3 record as unreadable, so the pair SHIPS TOGETHER; 176 (T-1429 F1753 design a, unreleased): camplaid record format 3 - each camp piece carries its inside byte (0 made outdoors, 1 made inside the camp's nest building, 2 not known; format 2 still read, its pieces 'not known'); 175 (T-1429 re-check fold F1622, unreleased): AREA_FRESH kind 7 HELD carries the holder-only camp layer rule and waits for the camp pieces record to settle; 174 (T-1429 design b, owner 1777 / 1788, F1600): camplaid.<sx>.<sy> records - which camps' pieces an area's stored copy carries (camplaid.h), and BOX_REFUSE reason 15 (aheadOfArea); 173 (T-1452, design B): PROFILES kind 7 carries the single-player save folder and every PROFILES row its pending import (profiles.h Row::imports) - the import survives a leave; 172 (T-1391, F1565): an area record's three silent refusals answer its sender (CANT recNotHolder / recLease / recNotNewer) - this game holds its load for its queued area saves' answers; 171 (T-1429 s3, owner 1777 / 1788): a piece record's LIVE part may carry a building's CONSTRUCTION PAUSE - flag bits 9 / 10 (piecerec.h kPrLiveFlagPauseKnown / kPrLiveFlagPaused, no bytes), written by the piece's record writer at each engine change of the 'PAUSE CONSTRUCTION' byte; a world server of 170 refuses such a record as an unknown bit, so the pause would never reach the other games or survive a restart - the pair SHIPS TOGETHER (another open effort may also take 171: whichever merges second renumbers). 170 (merge of effort/t1408a and main, 2026-11-19, above both; effort/t1408a's own 165-167, made on its branch, are never reused): main's 169 (below: T-1429's area-upload base, creation lease and settle ask, T-1021's race look-alike id, T-1427's town fact) and T-1408's wall group facts in a piece record's STATE - the group step stamp (buildwire.h kBuildStateStampBit) and fold 13's wall group fact (buildwire.h kBuildStateGroupBit: the owner's group lead key and join index; the world server reads both through piecerec.h DecodeBuild) - a world server of 169 refuses such a record as unreadable and one of effort/t1408a's 167 lacks the lease, so the pair SHIPS TOGETHER. 169 (merge of effort/t1429b and main, above both; T-1429's own 165-168, made on its branch, are never reused): main's 166 (T-1021: LOOKALIKE (90) may carry a race look-alike id, src/common/lookalikelist.h IdOk, which a world server without it drops as malformed), main's 165 (T-1427 fold 1: a piece record's LIVE part may carry the builder's town, piecerec.h kPrLiveFlagTownFact) and T-1429's area-upload base, creation lease and settle ask (its 165-168 below) - a world server of 165 or 166 lacks one set or the other, so the pair SHIPS TOGETHER. 168 (T-1429 s2 fold 3, review F1372): an area RECORD carries its base - the world server's seq of the stored copy it was made from (areafresh.h ContentBaseOnLoad / ContentBaseOnEcho) - and a copy made from an older one is refused and this game told AREA_FRESH CANT staleBase; a world server of 167 takes any newer copy, so the pair SHIPS TOGETHER. 167 (T-1429 s2 fold 2, review F1364 B / C): the settle ask carries the load's whole ordered area list in one message (areafresh.h EncodeSettleList) and a load with no area list first settles the world-first lease (AREA_FRESH why worldFirst); a world server of 166 refuses the list as malformed, so the pair SHIPS TOGETHER. 166 (T-1429 s2 fold 1, review F1337 item 1): before the world load, every area the load will read is asked with AREA_FRESH why settle and the load stays held until each is settled (FRESH / CANT current / LEASE; WAIT holds until the copy lands); a world server of 165 would send each area's record whole to such an ask, so the pair SHIPS TOGETHER. 165 (T-1429 s2, owner 1788; src/common/areafresh.h): AREA_FRESH (89) gains the CREATION LEASE - LEASE ("you create it": this game loads its own save's copy of an area the world server has no copy of and uploads it at once), WAIT (another game creates it; the read waits for that copy) and the world-load CLAIM (ASK why loadedOwn); a world server of 164 answers an unrecorded area CANT current and each game would load its own, differently rolled copy, so the pair SHIPS TOGETHER. 166 (merge of effort/t1021a and main, above main's 165; effort/t1021a's own 165 is never reused): both sets of changes below are in it - T-1021's LOOKALIKE (90) race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk), which a world server of 165 drops as malformed, and main's 165 (T-1427 fold 1, piecerec.h kPrLiveFlagTownFact, the builder's town). 165 (T-1021, never reused): LOOKALIKE (90) may carry a race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk) - a world server of 164 drops such a message as malformed, so no load would make the bring-back's template ahead of its squad. 166 (merge of effort/t1408a and main, the world server's protocol above main's 165; both sides' 165 are in it and 165 is never reused as a merged number): T-1408's group step stamp in a piece record's STATE and T-1427's town fact (LIVE flag bit 8) - a world server of 165 knows only one of them and refuses the other's records as unreadable. 165 (T-1408 group step stamp): a piece record's STATE may carry a wall group step stamp (buildwire.h kBuildStateStampBit) - a world server of 164 refuses such a record as unreadable, a game of 164 such a STATE. 165 (T-1427 fold 1, owner request 2026-11-18): a piece record's LIVE part may carry flag bit 8 (piecerec.h kPrLiveFlagTownFact) - the builder's town; a world server of 164 refuses such a record as an unknown bit. 164 (merge of effort/t1167b and main, above main's 163; effort/t1167b's own 163 is never reused): main's 163 and T-1167's TRADE (94, src/common/tradewire.h; 154-156 on its branch, never reused) - a game of 163 would not open the trade window and a world server of 163 drops 94. 163 (T-885 piece 2): OWNREC 105 gains INDEX_ASK / GET up and INDEX / REC / END down - before every load the player's records are taken from the world server's copy (ownupload.cpp OwnTakeHold); a world server of 162 reads them as malformed PUTs. 162 (T-885 piece 1, owner 1752 a): OWNREC (message 105, src/common/ownrecwire.h) - every record of a player's own records folder goes to the world server, which keeps it in <world folder>\own\<profile id>\ and answers OK; a world server of 161 would log 105 as unknown and never answer. 161 (T-1392, owner 1082: players must update to keep playing together): the OPTIONS map may hold MENUS AND BUILDING (menupause), which a game of 160 ignores. 160: the merge of T-1383's 159 (import / creator words, WORLD_START) and T-938 / T-247's 158 (PLAYER_MODS, playermods.h). The world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 typedef bool (*GdcLoadFn)(void* container, const std::string* file, const std::string* modName, int modIndex, void* serialisable, bool flag);
 GdcLoadFn orig_gdcLoad = 0;
 /* Z1-b (review-z1 item 1): the readFile -> load handshake. It was two bare strings any thread overwrote; it is now a
@@ -846,7 +852,7 @@ GdcSaveFn orig_gdcSave = 0; SfsReadFileFn orig_sfsReadFile = 0;
 // client's own-squad announce (F474); review-aud found no reader of g_zoneOn outside store.cpp, so that claim
 // is NOT made here. A lone (role=single) game is excluded at ZoneSaveApply and at the zone read (AUD-b).
 bool g_zoneOn = true;
-struct ZoneStamp { long long writtenAt; unsigned long long seq; ZoneStamp() : writtenAt(0), seq(0) {} };
+struct ZoneStamp { long long writtenAt; unsigned long long seq; int writer; ZoneStamp() : writtenAt(0), seq(0), writer(-1) {} };   /* T-1429 machine age: writer - the slot whose upload the copy loaded is (-1 not known) */
 /* Z1-b (review-z1 item 1): THE ZONE SWAP TABLE - the only zone state the two load detours read. g_records is main-thread
    only and the engine streams zones on workers, so every place a zone Record enters, changes or leaves g_records
    republishes that one id here (ZoneSwapPublish, main thread), and the detours copy an entry out under g_zoneSwapLock.
@@ -2771,6 +2777,142 @@ std::map<std::string, unsigned long long> g_zoneContentBase;
 unsigned long long g_zoneArrivalSeq = 0;
 std::set<std::string> g_zoneStaleBase;
 long long g_zoneStaleBaseTold = 0, g_zoneStaleBaseHeld = 0, g_zoneStaleBaseLifted = 0;
+/* T-1391 (F1626): THE LINK-UP PUSH AND THE RECONNECT (areafresh RepushAreaDecide / OwnStoredDecide). g_zoneUnechoed: this game's own
+   uploads of each area whose echo has not come (kept across a link drop - an echo lost in the drop leaves its stamp here); dropped at that
+   echo or a later one, at that upload's refusal, at a load of the world's copy (a new line of content) and per world. g_zoneOwnRowBase:
+   the base each own area save was made from, sent or not - the link-up push sends the row with it. g_zoneRepushStamp: the link-up push's
+   stamp per area - its refusal never holds the area's later saves back. */
+std::map<std::string, std::vector<long long> > g_zoneUnechoed;
+/* T-1391 F1631 item 1: g_zoneOwnRowBase keeps the base WITH the stamp of the own save it belongs to (areafresh::OwnBaseFor), and the kept
+   table's row carries it (mirrorkeep ownBase) so a save made with the link down survives a quit and is pushed judged by that base.
+   item 5: g_zonePushHeldWait - own unsent area saves the link-up push did not send because another game holds the area; decided again
+   at each area map (ZonePushHeldRetry). */
+struct ZoneOwnBase { long long at; unsigned long long base; ZoneOwnBase() : at(0), base(0) {} };
+std::map<std::string, ZoneOwnBase> g_zoneOwnRowBase;
+std::map<std::string, long long> g_zoneRepushStamp;
+std::set<std::string> g_zonePushHeldWait;
+long long g_zonePushOwn = 0, g_zonePushSkip[4] = { 0, 0, 0, 0 }, g_zoneOwnStoredEcho = 0, g_zoneOwnStoredRebase = 0, g_zoneOwnStoredResent = 0, g_zonePushRefusedHeld = 0, g_zonePushLines = 0;
+long long g_zonePushHeldSent = 0, g_zonePushHeldDropped = 0, g_zoneOwnBaseLoads = 0, g_mkOwnBaseKept = 0, g_mkOwnBaseWritten = 0;
+long long g_mkUnechoedKept = 0, g_zonePushReadFailed = 0, g_mkOwnSaveWrites = 0;   /* T-1391 F1633 */
+bool g_mkOwnSaveDue = false; long long g_mkOwnSaveMarked = 0;   /* T-1391 F1635 item 1: an own save written with the link down waits for its batch's end (mirrorkeep::OwnSaveTableFlushNow) */
+/* T-1391 (F1653 design 2): THE ONE ROAD FOR AREA SAVES MADE WITH THE LINK DOWN. F1706: an area's own unsent save is marked by its state
+   file's pending flag (AreaStatePending, below) - the .unsent file, the .ownn and its held list are gone. */
+/* T-1391 (F1677 design, 2026-11-20): THE KEPT BASE of each area - the world copy this game loaded (the one whose version is the content
+   base), kept on disk in the area's state file (F1706; was <mirror>.base / .basev) from the moment anything would overwrite the mirror file holding it
+   (ZoneKeptBaseStep), until a newer world version is the content base and the mirror holds it (ZoneKeptBaseOnContentBase). seq: its
+   version; at: its writtenAt (what an own thing's record must be at least as new as, to carry it); writer: its writer slot (-1 not known);
+   empty: the EMPTY area (no world copy was loaded - Kenshi built the area from its game data). Every own-work check reads it
+   (ZoneCheckBaseGet). g_zoneGameDataAt: areas whose last load was not from a record (ZoneContentBaseOnLoad fromRecord false), with the
+   time of that load. Both per world (LoadIndex); F1706: the kept base lives in the area's state file (g_areaState) and this map is its index
+   (AreaStateKeptSync), read back at the start (AreaStateScan). MAIN THREAD. */
+struct ZoneKeptBase { unsigned long long seq; long long at; int writer; int empty; ZoneKeptBase() : seq(0), at(0), writer(-1), empty(0) {} };
+std::map<std::string, ZoneKeptBase> g_zoneKeptBase;
+std::map<std::string, long long> g_zoneGameDataAt;
+/* T-1391 DESIGN B (F1706, 2026-11-20): AN AREA'S OWN STATE IS ONE FILE, <mirror>.area (src/common/areastate.h) - the copy the mirror holds
+   (its save bytes), the pending / sent flags of this game's own unconfirmed save, its row (stamp, world version, own base, unechoed list),
+   and the kept base (version, stamp, writer, EMPTY flag, bytes). Every change is ONE commit of the whole file (AreaStateCommit); the plain
+   mirror the game loads is rebuilt from it. g_areaState: per area with a state, its header (always) and - only while a commit has not landed
+   (due) - its bytes: a commit that fails is NEVER a refused save, the state stays here and is committed again (AreaStateRetryTick, at most
+   once a second per area; also at quit and teardown). mirrorDue: the plain mirror is not rebuilt yet. g_zoneKeptBase (above) is the base
+   fields' index, written ONLY by AreaStateKeptSync. Per world (LoadIndex); read back at the start (AreaStateScan). MAIN THREAD. */
+struct AreaMem
+{
+    areastate::Head h;
+    int due, mirrorDue;
+    std::vector<char> save, base;
+    DWORD lastTry;
+    long long fails;
+    std::vector<std::string> oldFiles;   /* migration: this area's old side files, moved to moved-old\ once a commit of its state landed */
+    AreaMem() : due(0), mirrorDue(0), lastTry(0), fails(0) {}
+};
+std::map<std::string, AreaMem> g_areaState;
+std::vector<mirrorkeep::KeptRow> g_areaScanRows;   /* the states' rows read back at the start (AreaStateScan), merged with the kept table by MirrorKeepLoad */
+long long g_areaCommits = 0, g_areaCommitFailed = 0, g_areaCommitLate = 0, g_areaCommitLines = 0, g_areaMirrorRebuilt = 0, g_areaMirrorFailed = 0, g_areaMirrorLines = 0, g_areaReadBackFailed = 0;
+long long g_areaScanned = 0, g_areaScanTmpTaken = 0, g_areaScanTmpRemoved = 0, g_areaScanNotKnown = 0, g_areaScanMirrorRebuilt = 0, g_areaMigrated = 0, g_areaMigNotKnown = 0, g_areaMovedOld = 0, g_areaScanLines = 0, g_areaScanMirrorAside = 0, g_areaForcedLeft = 0;
+std::set<std::string> g_areaLeftNotKnown;   /* areas whose .area could not be read at the scan: left where it is until it reads (AreaLeftNotKnownClear) */
+int AreaStatePending(const std::string& id)
+{
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(id);
+    return (a != g_areaState.end() && a->second.h.pending != 0) ? 1 : 0;
+}
+long long AreaStatePendingCount()
+{
+    long long n = 0;
+    for (std::map<std::string, AreaMem>::const_iterator a = g_areaState.begin(); a != g_areaState.end(); ++a) if (a->second.h.pending != 0) ++n;
+    return n;
+}
+long long AreaStateDueCount()
+{
+    long long n = 0;
+    for (std::map<std::string, AreaMem>::const_iterator a = g_areaState.begin(); a != g_areaState.end(); ++a) if (a->second.due != 0 || a->second.mirrorDue != 0) ++n;
+    return n;
+}
+void AreaStateKeptSync(const std::string& id, const areastate::Head& h)
+{
+    if (h.baseKept == 0) { g_zoneKeptBase.erase(id); return; }
+    ZoneKeptBase k; k.seq = h.baseSeq; k.at = h.baseAt; k.writer = h.baseWriter; k.empty = h.baseEmpty;
+    g_zoneKeptBase[id] = k;
+}
+bool AreaStateBytes(const std::string& id, std::vector<char>* save, std::vector<char>* base);   /* defined below (after ZoneRecoverSetAside), same namespace */
+bool AreaStateStartupCopy(const Record& r, const std::vector<char>& bytes);   /* the same */
+void AreaStateOnEcho(const std::string& zoneId, long long stamp, unsigned long long seq);   /* the same */
+long long g_zoneKeptBaseEmpty = 0, g_zoneKeptBaseFailed = 0, g_zoneKeptBaseCleared = 0, g_zoneKeptBaseScanned = 0, g_zoneKeptBaseLines = 0, g_zoneCheckBase[3] = { 0, 0, 0 };
+void ZoneKeptBaseOnContentBase(const std::string& zoneId);   /* defined below (after ZoneUnsentSideClear), same namespace */
+void ZoneKeptBaseIdleCheck(const std::string& zoneId, const char* why);   /* T-1391 F1680 L3: defined below (after ZoneKeptBaseClear), same namespace */
+void ZoneUnsentSideClear(const std::string& zoneId);   /* T-1391 F1680 M1: defined below, same namespace */
+struct ZoneHeldAside { std::vector<std::string> files; long long loadSeq; ZoneHeldAside() : loadSeq(0) {} };
+std::map<std::string, ZoneHeldAside> g_zoneStaleAside;   /* review S4 / F1664 M3: per area held STALE, this hold's set-aside files (the last one of the current load is replaced by a newer FAULT save); cleared when the hold lifts or per world - the files stay */
+long long g_zoneHeldChecked = 0, g_zoneHeldAsideReplaced = 0, g_zoneHeldAsideOverflow = 0, g_zoneHeldAsideSkipped = 0;
+long long g_zoneUnsentSideWritten = 0, g_zoneUnsentSideFailed = 0, g_zoneBaseSideWritten = 0, g_zoneUnsentSideKept = 0, g_zoneIndexYielded = 0, g_zonePushNotHolderWait = 0;
+long long g_zoneStaleNotHereLines = 0;   /* T-1391 F1677 */
+long long g_zoneOwnCheck[4] = { 0, 0, 0, 0 }, g_zoneJournalDropSetAside = 0, g_zoneJournalDropEmpty = 0, g_zoneRecoverWritten = 0, g_zoneWrLinkDownLines = 0, g_zoneUnsentSideCleared = 0;
+std::map<std::string, long long> g_zonePushReadFailBy; long long g_zonePushReadFailAreasLogged = 0;   /* T-1391 F1635 item 3: failed reads per area - the first logged, the rest counted */
+void ZoneOwnRowBaseSet(const std::string& id, long long at, unsigned long long base) { ZoneOwnBase o; o.at = at; o.base = base; g_zoneOwnRowBase[id] = o; }
+/* 1 = rowAt is the own save whose base is kept (*base); 0 = none kept for that copy */
+int ZoneOwnBaseHere(const std::string& id, long long rowAt, unsigned long long* base)
+{
+    const std::map<std::string, ZoneOwnBase>::const_iterator o = g_zoneOwnRowBase.find(id);
+    const int here = areafresh::OwnBaseFor(o != g_zoneOwnRowBase.end() ? 1 : 0, o != g_zoneOwnRowBase.end() ? o->second.at : 0, rowAt);
+    if (base != 0) *base = here != 0 ? o->second.base : 0ULL;
+    return here;
+}
+/* F1631 item 4: any answer to the link-up push's stamp (its echo, any refusal) settles it; 1 = this answer was the push's */
+int ZoneRepushAnswered(const std::string& id, long long stamp)
+{
+    const std::map<std::string, long long>::iterator rp = g_zoneRepushStamp.find(id);
+    const int was = areafresh::RepushAnswered(rp != g_zoneRepushStamp.end() ? 1 : 0, rp != g_zoneRepushStamp.end() ? rp->second : 0, stamp);
+    if (was != 0) g_zoneRepushStamp.erase(rp);
+    return was;
+}
+void ZoneUnechoedAdd(const std::string& id, long long stamp) { areafresh::UnechoedAdd(&g_zoneUnechoed[id], stamp); }
+int ZoneUnechoedHas(const std::string& id, long long stamp)
+{
+    const std::map<std::string, std::vector<long long> >::const_iterator u = g_zoneUnechoed.find(id);
+    return u != g_zoneUnechoed.end() ? areafresh::UnechoedHas(u->second, stamp) : 0;
+}
+void ZoneUnechoedSettle(const std::string& id, long long stamp, int upTo)
+{
+    const std::map<std::string, std::vector<long long> >::iterator u = g_zoneUnechoed.find(id);
+    if (u == g_zoneUnechoed.end()) return;
+    if (upTo != 0) areafresh::UnechoedDropUpTo(&u->second, stamp); else areafresh::UnechoedDrop(&u->second, stamp);
+    if (u->second.empty()) { g_zoneUnechoed.erase(u); ZoneKeptBaseIdleCheck(id, "this game's last upload of the area waiting for its echo was settled"); }   /* T-1391 F1680 L3 */
+}
+/* T-1391 F1680 fold: an own save of the area is pending - the mirror holds this game's own save the world server has not confirmed
+   (areafresh::OwnSavePending: its state pending (F1706, was its .unsent) and no version yet, or sent with its stamp still unechoed). MAIN THREAD. */
+int ZoneOwnSavePending(const std::string& id)
+{
+    const std::map<std::string, ZoneMirrorBase>::const_iterator mb = g_zoneMirrorBase.find(id);
+    return areafresh::OwnSavePending(AreaStatePending(id), mb != g_zoneMirrorBase.end() ? 1 : 0, mb != g_zoneMirrorBase.end() ? mb->second.seq : 0ULL,
+                                     (mb != g_zoneMirrorBase.end() && ZoneUnechoedHas(id, mb->second.writtenAt) != 0) ? 1 : 0);
+}
+/* a journaled area save builds on this game's unechoed uploads of the area: their stamps go with it as inherited, so a refusal naming one
+   as the stored copy re-bases the save on it (coopqueue::ZoneReplayJudge, S3 gap b) instead of dropping it */
+void ZoneUnechoedInto(const std::string& id, std::vector<long long>* inherited)
+{
+    const std::map<std::string, std::vector<long long> >::const_iterator u = g_zoneUnechoed.find(id);
+    if (u == g_zoneUnechoed.end() || inherited == 0) return;
+    for (size_t i = 0; i < u->second.size(); ++i) if (coopqueue::QueueSentHas(*inherited, u->second[i]) == 0) coopqueue::QueueSentNote(inherited, u->second[i]);
+}
 bool g_mkBaseDirty = false; long long g_mkBaseWrites = 0, g_mkNoBaseRejected = 0, g_mkBaseDroppedAtLoad = 0;   /* fold 5 / 6: a mirror copy got its version (an echo, a received copy) - the kept table is written at the end of that batch (MirrorKeepFlush) */
 int ZoneStaleSwapServes(const std::string& zoneId, long long heldStamp)
 {
@@ -2783,15 +2925,34 @@ unsigned long long ZoneBaseOf(const std::string& zoneId)
     const std::map<std::string, unsigned long long>::const_iterator b = g_zoneContentBase.find(zoneId);
     return b != g_zoneContentBase.end() ? b->second : 0ULL;
 }
+/* T-1429 machine age (H-T1429-machineprog): THE COPY LOADED - its version (the content base at the load: the world server's seq for it,
+   0 not known) and whose upload it is (the record's writer slot; -1 not known, or this game's own save read with no record). Set at each
+   load of the area and nowhere else; a piece record's machine values are judged against it (build.cpp PwAgeRecordWins) */
+struct ZoneLoadVer { unsigned long long seq; int writer; long long at; ZoneLoadVer() : seq(0), writer(-1), at(0) {} };   /* machine age fold 1: at - the copy's writtenAt (its writer's stamp) */
+std::map<std::string, ZoneLoadVer> g_zoneLoadVer;
 /* a load of the area (ZoneFromRecordDrain): from the mirror's copy (loaded, its stamp) or from this game's own save (not loaded) */
-void ZoneContentBaseOnLoad(const std::string& zoneId, bool fromRecord, long long loadedStamp)
+void ZoneContentBaseOnLoad(const std::string& zoneId, bool fromRecord, long long loadedStamp, const ZoneStamp* st)
 {
     if (zoneId.compare(0, 5, "zone.") != 0) return;
     const std::map<std::string, ZoneMirrorBase>::const_iterator m = g_zoneMirrorBase.find(zoneId);
-    const unsigned long long base = fromRecord ? areafresh::ContentBaseOnLoad(loadedStamp, m != g_zoneMirrorBase.end() ? 1 : 0, m != g_zoneMirrorBase.end() ? m->second.writtenAt : 0, m != g_zoneMirrorBase.end() ? m->second.seq : 0ULL) : 0ULL;
+    const unsigned long long worldBase = fromRecord ? areafresh::ContentBaseOnLoad(loadedStamp, m != g_zoneMirrorBase.end() ? 1 : 0, m != g_zoneMirrorBase.end() ? m->second.writtenAt : 0, m != g_zoneMirrorBase.end() ? m->second.seq : 0ULL) : 0ULL;
+    unsigned long long ownBase = 0ULL;
+    const int ownHere = fromRecord ? ZoneOwnBaseHere(zoneId, loadedStamp, &ownBase) : 0;   /* T-1391 F1631 item 1: this game's own unconfirmed save loaded - the version it was made from */
+    const unsigned long long base = areafresh::ContentBaseOnLoadOwn(worldBase, ownHere, ownBase);
     g_zoneContentBase[zoneId] = base;
-    g_zoneContentBaseRoad[zoneId] = areafresh::BaseRoadOnLoad(base, m != g_zoneMirrorBase.end() ? m->second.from : (int)areafresh::kMirrorFromOwn);   /* T-1391 */
-    if (areafresh::StaleBaseLifts(base) != 0 && g_zoneStaleBase.erase(zoneId) != 0)
+    {   /* T-1429 machine age: the copy loaded - its version (the world server's seq of the copy: worldBase, never ContentBaseOnLoadOwn's own-save base - T-1391 merge), whose upload it is and its stamp (machine age fold 1) */
+        ZoneLoadVer& lv = g_zoneLoadVer[zoneId];
+        lv.seq = worldBase; lv.writer = (fromRecord && st != 0) ? st->writer : -1; lv.at = (fromRecord && st != 0) ? st->writtenAt : 0;
+    }
+    g_zoneContentBaseRoad[zoneId] = areafresh::BaseRoadOnLoadOwn(worldBase, m != g_zoneMirrorBase.end() ? m->second.from : (int)areafresh::kMirrorFromOwn, ownHere);   /* T-1391 */
+    if (fromRecord) g_zoneGameDataAt.erase(zoneId); else g_zoneGameDataAt[zoneId] = (long long)::time(0);   /* T-1391 F1677: no world copy loaded - the empty area is the base */
+    ZoneKeptBaseOnContentBase(zoneId);   /* F1677: a newer world copy loaded - the older kept base goes */
+    if (worldBase == 0 && ownHere != 0 && ++g_zoneOwnBaseLoads <= 20)
+        DebugLog("[ZONE] OWN BASE " + zoneId + " - loaded this game's own save the world server has not confirmed (writtenAt " + N(loadedStamp) + "): its content base is the version it was made from, "
+                 + N((long long)ownBase) + " (ownBaseLoads=" + N(g_zoneOwnBaseLoads) + ", first 20 logged)");
+    if (worldBase != 0) g_zoneUnechoed.erase(zoneId);   /* T-1391 (F1626): the world's copy loaded - this game's earlier uploads are not what the content here builds on */
+    if (areafresh::StaleBaseLifts(worldBase) != 0) g_zoneStaleAside.erase(zoneId);   /* review S4 / F1664 M3: the hold lifts - its set-aside files stay; a later hold starts its own */
+    if (areafresh::StaleBaseLifts(worldBase) != 0 && g_zoneStaleBase.erase(zoneId) != 0)
     {
         ++g_zoneStaleBaseLifted;
         DebugLog("[ZONE] STALE BASE " + zoneId + " - loaded from the world's copy (seq " + N((long long)base) + "): its uploads go up again (staleBaseLifted=" + N(g_zoneStaleBaseLifted) + ")");
@@ -2804,6 +2965,7 @@ void ZoneContentBaseOnEcho(const std::string& zoneId, long long stamp, unsigned 
 {
     std::map<std::string, ZoneMirrorBase>::iterator m = g_zoneMirrorBase.find(zoneId);
     if (m != g_zoneMirrorBase.end() && m->second.writtenAt == stamp && m->second.seq != seq) { m->second.seq = seq; g_mkBaseDirty = true; }   /* fold 5: the version marks the kept table */
+    if (m != g_zoneMirrorBase.end() && m->second.writtenAt == stamp) AreaStateOnEcho(zoneId, stamp, seq);   /* T-1391 F1680 M1 / F1706: the world server stored the save the mirror holds - one commit gives the state's row its version and ends its pending mark (a relaunch may now copy the world's copy: it is that save or newer) */
     {   /* T-1429 s2 fold 7 (review F1381): a save's LAST echo ends its batch - the kept table is written once for all its areas */
         const std::map<std::string, long long>::iterator w = g_zoneEchoWait.find(zoneId);
         if (w != g_zoneEchoWait.end() && w->second == stamp) { g_zoneEchoWait.erase(w); if (g_zoneEchoWait.empty()) MirrorKeepFlush("a save's last echo"); }
@@ -2811,7 +2973,7 @@ void ZoneContentBaseOnEcho(const std::string& zoneId, long long stamp, unsigned 
     if (loadedKnown == 0) return;
     const unsigned long long cur = ZoneBaseOf(zoneId);
     const unsigned long long nb = areafresh::ContentBaseOnEcho(cur, loadedStamp, stamp, seq);
-    if (nb != cur) { g_zoneContentBase[zoneId] = nb; g_zoneContentBaseRoad[zoneId] = areafresh::kBaseRoadEcho; }   /* T-1391: the road on the BASE line */
+    if (nb != cur) { g_zoneContentBase[zoneId] = nb; g_zoneContentBaseRoad[zoneId] = areafresh::kBaseRoadEcho; ZoneKeptBaseOnContentBase(zoneId); }   /* T-1391: the road on the BASE line; F1677: an echo confirming this game's newer own save ends the older kept base */
 }
 void ZoneFromRecordDrain()
 {
@@ -2826,8 +2988,8 @@ void ZoneFromRecordDrain()
     if (clearReq) { ::InterlockedExchangeAdd(&g_teardownLateMarks, (long)g_zoneFromRecord.size()); g_zoneFromRecord.clear(); g_zoneKeptMark.clear(); ZoneProvisionalThrow("a world teardown"); }   /* T-823 fold 2 */
     for (std::map<std::string, ZoneMarkEvent>::const_iterator it = ev.begin(); it != ev.end(); ++it)
     {
-        if (it->second.loaded) { g_zoneFromRecord[it->first] = it->second.stamp; ZoneFromRecordMarkApply(it->first, it->second.stamp, it->second.markGen, it->second.provGen, it->second.listDone, it->second.at); ZoneContentBaseOnLoad(it->first, true, it->second.stamp.writtenAt); }
-        else { g_zoneFromRecord.erase(it->first); ZoneNoRecordApply(it->first, it->second.markGen, it->second.provGen, it->second.listDone, it->second.at); ZoneContentBaseOnLoad(it->first, false, 0); }   /* s2 fold 4: the content base of the copy now loaded */
+        if (it->second.loaded) { g_zoneFromRecord[it->first] = it->second.stamp; ZoneFromRecordMarkApply(it->first, it->second.stamp, it->second.markGen, it->second.provGen, it->second.listDone, it->second.at); ZoneContentBaseOnLoad(it->first, true, it->second.stamp.writtenAt, &it->second.stamp); }
+        else { g_zoneFromRecord.erase(it->first); ZoneNoRecordApply(it->first, it->second.markGen, it->second.provGen, it->second.listDone, it->second.at); ZoneContentBaseOnLoad(it->first, false, 0, 0); }   /* s2 fold 4: the content base of the copy now loaded */
     }
 }
 /* Any thread: a zone read (loaded=false; markGen >= 0 when it found no record with the record list known - see
@@ -2839,8 +3001,8 @@ void ZoneMarkNote(const std::string& zoneId, bool loaded, const ZoneStamp& stamp
     if (OnMainThread())
     {
         ZoneFromRecordDrain();
-        if (loaded) { g_zoneFromRecord[zoneId] = stamp; ZoneFromRecordMarkApply(zoneId, stamp, markGen, provGen, listDone, ZoneNowSec()); ZoneContentBaseOnLoad(zoneId, true, stamp.writtenAt); }   /* T-1391 late writer: the load's own time */
-        else { g_zoneFromRecord.erase(zoneId); ZoneNoRecordApply(zoneId, markGen, provGen, listDone, ZoneNowSec()); ZoneContentBaseOnLoad(zoneId, false, 0); }
+        if (loaded) { g_zoneFromRecord[zoneId] = stamp; ZoneFromRecordMarkApply(zoneId, stamp, markGen, provGen, listDone, ZoneNowSec()); ZoneContentBaseOnLoad(zoneId, true, stamp.writtenAt, &stamp); }   /* T-1391 late writer: the load's own time */
+        else { g_zoneFromRecord.erase(zoneId); ZoneNoRecordApply(zoneId, markGen, provGen, listDone, ZoneNowSec()); ZoneContentBaseOnLoad(zoneId, false, 0, 0); }
         /* T-1391 (owner 1821, F1529): THE CONTENT BASE ON THE MAIN-THREAD LOAD TOO, as the queued road sets it (ZoneFromRecordDrain). Every
            area load runs here (no first area read ran off the main thread in any T26* run), so until now no load recorded its version
            and every later save of the area went up with base 0 - refused STALE BASE whenever another connection made the stored copy. */
@@ -3072,7 +3234,10 @@ bool ReadFileBytesShared(const std::string& path, std::vector<char>* out)
    (no file - Kenshi built the area from its game data; a file that could not be read). writer: the copy's writer slot (-1 not known).
    Under g_zoneSwapLock (a read runs on whatever thread streams the area); at most kZoneLoadedCopyCap bytes kept, other areas' copies let
    go first past it. */
-struct ZoneLoadedCopy { std::vector<char> bytes; int have; int writer; std::string from; ZoneLoadedCopy() : have(0), writer(-1) {} };
+struct ZoneLoadedCopy { std::vector<char> bytes; int have; int writer; std::string from; int road; long long at; long long loadSeq; ZoneLoadedCopy() : have(0), writer(-1), road(0), at(0), loadSeq(0) {} };
+   /* T-1391 review F1664: road - where the copy came from (areafresh::kLcFrom*; decides 'this game's own unconfirmed save', never the text);
+      at - an own save's stamp; loadSeq - which load of the area put it here (a Kenshi read raises it; an own save keeps the load's) */
+long long g_zoneLoadSeq = 0;   /* under g_zoneSwapLock */
 std::map<std::string, ZoneLoadedCopy> g_zoneLoadedCopyTS;
 size_t g_zoneLoadedCopyBytes = 0;
 const size_t kZoneLoadedCopyCap = (size_t)64 << 20;
@@ -3084,7 +3249,8 @@ void ZoneLoadedCopySet(const std::string& zoneId, ZoneLoadedCopy* c)   /* ANY TH
     {
         ZoneLoadedCopy& e = g_zoneLoadedCopyTS[zoneId];
         g_zoneLoadedCopyBytes -= e.bytes.size();
-        e.bytes.swap(c->bytes); e.have = c->have; e.writer = c->writer; e.from.swap(c->from);
+        e.bytes.swap(c->bytes); e.have = c->have; e.writer = c->writer; e.from.swap(c->from); e.road = c->road; e.at = c->at;
+        if (c->road != areafresh::kLcFromOwnSave) e.loadSeq = ++g_zoneLoadSeq;   /* F1664 M3: a read of the area is a load; an own save is not */
         g_zoneLoadedCopyBytes += e.bytes.size();
         for (std::map<std::string, ZoneLoadedCopy>::iterator it = g_zoneLoadedCopyTS.begin(); g_zoneLoadedCopyBytes > kZoneLoadedCopyCap && it != g_zoneLoadedCopyTS.end(); )
         {
@@ -3462,6 +3628,7 @@ int StoreQueueWriteImpl(int family, const std::string& recordKey, const std::vec
     e.queuedAtUnix = (long long)time(0);
     e.payload = payload;
     if (contentBase != ~0ULL) { e.base = contentBase; e.hasBase = 1; }   /* T-1429 s2 fold 6: an area save's content version, journaled with it */
+    if (family == coopqueue::kQueueFamilyZone) ZoneUnechoedInto(recordKey, &e.sentInherited);   /* T-1391 (F1626 B): a save sent before the link fell, its echo lost - this one builds on it */
     e.seqSeen = 0;
     {
         /* THE SEQUENCE NUMBER AS IT STANDS NOW. This is the whole of the conflict rule's memory: at the
@@ -3499,6 +3666,7 @@ int StoreQueueWriteImpl(int family, const std::string& recordKey, const std::vec
                    new save builds on that copy and is re-based on it at its refusal, never dropped */
                 e.sentInherited = g_queue[i].sentInherited;
                 for (size_t k = 0; k < g_queue[i].sentOwn.size(); ++k) coopqueue::QueueSentNote(&e.sentInherited, g_queue[i].sentOwn[k]);
+                if (family == coopqueue::kQueueFamilyZone) ZoneUnechoedInto(recordKey, &e.sentInherited);   /* T-1391 (F1626 B) */
             }
             g_queue[i] = e;
             ++g_queueQueued; ++g_queueFamilyQueued[family]; ++g_queueSuperseded;
@@ -3560,7 +3728,7 @@ bool ZoneIndexMirrorCopy(Record* r)
     const bool readOk = ReadFileBytes(from, &bytes);
     size_t zstop = 0;
     const bool unreadable = readOk && zonecheck::ReadableBytes(bytes, &zstop) == 0;   /* T-1243 (owner 1523) */
-    const bool ok = readOk && !unreadable && WriteFileBytes(r->file, bytes);
+    const bool ok = readOk && !unreadable && (AreaStateStartupCopy(*r, bytes) || WriteFileBytes(r->file, bytes));   /* T-1391 F1706: an area with a state gets the copy in one commit of it (never refused) */
     if (ok) ++g_zoneIndexCopied; else ++g_zoneIndexCopyFailed;
     if (unreadable)
     {
@@ -3616,9 +3784,581 @@ int ZoneHeldAreaFileCheck(const std::string& zoneId, const std::string& road)
     return 0;
 }
 long long g_indexEarlierName = 0;   /* .meta files LoadIndex passed over: under their id's earlier file name */
+bool StoreFileThere(const std::string& p);   /* defined below, same namespace */
+/* T-1391 (F1653): an own area copy no record carries, SET ASIDE for recovery in the world folder's recover\ (never replacing a file);
+   "" = not written. MAIN THREAD. */
+std::string ZoneRecoverSetAside(const std::string& zoneId, const std::vector<char>& bytes, const char* why)
+{
+    if (bytes.empty() || g_dirCanonical.empty()) return std::string();
+    const std::string dir = g_dirCanonical + "\\recover";
+    U8CreateDirectory(dir.c_str(), 0);
+    std::string path = dir + "\\" + Sanitize(zoneId) + "-" + N((long long)::time(0)) + ".zone";
+    for (int i = 1; i < 100 && StoreFileThere(path); ++i) path = dir + "\\" + Sanitize(zoneId) + "-" + N((long long)::time(0)) + "-" + N((long long)i) + ".zone";
+    if (StoreFileThere(path) || !WriteFileBytes(path, bytes)) { ErrorLog("[ZONE] T-1391 recover: the copy of " + zoneId + " (" + std::string(why) + ") could NOT be set aside in " + dir + WriteFailWhy()); return std::string(); }
+    ++g_zoneRecoverWritten;
+    return path;
+}
+/* ---- T-1391 DESIGN B (F1706): THE AREA STATE FILE, the store's side (the file format, commit, load and migration are areastate.h) ---- */
+/* the row an area state carries for record r (as MirrorKeepWrite writes one): its world version, its own base, the unechoed list (and the
+   save's own stamp when its 'sent' mark is guessed before the send); size / time 0 - every load restamps it from the plain mirror */
+mirrorkeep::KeptRow AreaRowOf(const Record& r, unsigned long long mirrorSeq, int ownBaseKnown, unsigned long long ownBase, int sentStamp)
+{
+    mirrorkeep::KeptRow k;
+    k.key = r.worldId; k.squadSid = r.squadSid; k.factionName = r.factionName; k.town = r.town; k.home = r.home;
+    k.x = r.x; k.y = r.y; k.z = r.z; k.writtenAt = r.writtenAt; k.posAt = r.posAt; k.owner = (unsigned int)r.owner; k.seq = r.seq; k.birth = r.birth;
+    k.mirrorSeq = mirrorSeq; k.ownBaseKnown = ownBaseKnown != 0 ? 1 : 0; k.ownBase = ownBaseKnown != 0 ? ownBase : 0ULL;
+    { const std::map<std::string, std::vector<long long> >::const_iterator ue = g_zoneUnechoed.find(r.worldId); if (ue != g_zoneUnechoed.end()) k.unechoed = ue->second; }
+    if (sentStamp != 0) areafresh::UnechoedAdd(&k.unechoed, r.writtenAt);
+    return k;
+}
+/* the state's bytes as they stand: from memory while its commit has not landed, else read back from <mirror>.area (whole, CRC right, and of
+   the generation this session committed or read). false = no state, or its file does not read back (logged, first 8). MAIN THREAD. */
+bool AreaStateBytes(const std::string& id, std::vector<char>* save, std::vector<char>* base)
+{
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(id);
+    if (a == g_areaState.end()) return false;
+    if (a->second.due != 0) { if (save != 0) *save = a->second.save; if (base != 0) *base = a->second.base; return true; }
+    const std::string af = areastate::AreaName(MirrorFile(id));
+    std::vector<char> b, sv, bs; areastate::Head h; int there = 0, res = areastate::kParseNoFile;
+    for (int tryN = 0; tryN < 2; ++tryN)   /* read again once before its bytes are called not known (a kept base is dropped on a failed read-back) */
+    {
+        res = areastate::ReadAll(af, &b, &there) ? areastate::Parse(b, &h, &sv, &bs) : (there != 0 ? (int)areastate::kParseTorn : (int)areastate::kParseNoFile);
+        if (res == areastate::kParseOk && h.gen == a->second.h.gen) break;
+    }
+    if (res != areastate::kParseOk || h.gen != a->second.h.gen)
+    {
+        if (++g_areaReadBackFailed <= 8)
+            ErrorLog("[ZONE] T-1391 AREA STATE " + id + ": " + af + " does not read back (" + (res != areastate::kParseOk ? std::string(areastate::ParseName(res)) : "generation " + N((long long)h.gen) + ", this session's is " + N((long long)a->second.h.gen))
+                     + ") - its bytes are not known here (areaReadBackFailed=" + N(g_areaReadBackFailed) + ", first 8 logged)");
+        return false;
+    }
+    if (save != 0) save->swap(sv);
+    if (base != 0) base->swap(bs);
+    return true;
+}
+/* the plain mirror the game loads, rebuilt from the state's save bytes (flushed while the save is this game's own pending one). MAIN THREAD. */
+int AreaMirrorWrite(const std::string& id, const std::vector<char>& save, int flush)
+{
+    DWORD err = 0;
+    const int st = areastate::MirrorRebuild(MirrorFile(id), save, flush, &err);
+    if (st == areastate::kStepNone) { ++g_areaMirrorRebuilt; return 1; }
+    ++g_areaMirrorFailed;
+    if (++g_areaMirrorLines <= 8)
+        ErrorLog("[ZONE] T-1391 AREA STATE " + id + ": the plain mirror " + MirrorFile(id) + " could NOT be rebuilt from the state (step " + areastate::StepName(st) + ", Windows error " + N((long long)err)
+                 + ") - tried again at the next ticks and before the area's next load (areaMirrorFailed=" + N(g_areaMirrorFailed) + ", first 8 logged)");
+    return 0;
+}
+/* migration: the area's old side files go to moved-old\ once a commit of its state landed (never deleted) */
+void AreaOldFilesMove(const std::string& id, AreaMem* m)
+{
+    if (m->oldFiles.empty()) return;
+    std::string moved, stays;
+    for (size_t i = 0; i < m->oldFiles.size(); ++i)
+    {
+        if (!areastate::There(m->oldFiles[i])) continue;
+        const std::string to = areastate::MoveOld(m->oldFiles[i]);
+        if (!to.empty()) { ++g_areaMovedOld; moved += (moved.empty() ? "" : ", ") + m->oldFiles[i].substr(m->oldFiles[i].find_last_of('.')); }
+        else stays += (stays.empty() ? "" : ", ") + m->oldFiles[i];
+    }
+    const std::string ml = "[STORE] T-1391 AREA STATE " + id + ": its old side files (" + (moved.empty() ? std::string("none") : moved) + ") moved to " + areastate::kMovedOldDir + "\\ beside the mirror files"
+                         + (stays.empty() ? std::string() : " - NOT moved (they stay where they are, never read again while the state exists): " + stays) + " (areaMovedOld=" + N(g_areaMovedOld) + ")";
+    if (!stays.empty()) ErrorLog(ml); else if (g_areaMovedOld <= 64) DebugLog(ml);
+    m->oldFiles.clear();
+}
+/* an area whose .area could not be read at the scan (held by another program - left where it is, NOT KNOWN): before any commit writes over
+   it, its bytes are set aside and the file moved to moved-old\ once it reads (the re-check of 01a710593's review). false = it still cannot
+   be read: nothing is written over it (the commit is kept in memory as one whose rename failed, and tried again). MAIN THREAD. */
+bool AreaLeftNotKnownClear(const std::string& id)
+{
+    if (g_areaLeftNotKnown.empty() || g_areaLeftNotKnown.count(id) == 0) return true;
+    const std::string af = areastate::AreaName(MirrorFile(id));
+    if (!areastate::There(af)) { g_areaLeftNotKnown.erase(id); return true; }
+    std::vector<char> raw;
+    if (!areastate::ReadAll(af, &raw, 0)) return false;
+    const std::string aside = raw.empty() ? std::string() : ZoneRecoverSetAside(id, raw, "an area state file that could not be read at the launch, set aside before this session's first commit of the area (T-1391 F1706)");
+    const std::string to = areastate::MoveOld(af);
+    ErrorLog("[ZONE] T-1391 AREA STATE " + id + ": the .area left at the launch (it could not be read then) reads now - " + (aside.empty() ? std::string(raw.empty() ? "it is empty" : "its bytes could NOT be set aside") : "its bytes are set aside as " + aside)
+             + (to.empty() ? std::string("; it could NOT be moved") : "; moved to " + to) + " - before this session's first commit of the area");
+    if (aside.empty() && !raw.empty() && to.empty()) return false;
+    g_areaLeftNotKnown.erase(id);
+    return true;
+}
+/* THE ONE COMMIT of an area's state (areastate::Commit - crash table there): the whole new file to <mirror>.area.tmp, flushed, moved over
+   <mirror>.area (MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH); then, when the save bytes changed, the plain mirror is rebuilt from
+   them. The new header is this session's state at once. A commit that does not land is NEVER a refused write: the state and its bytes are
+   kept in memory (due) and committed again by AreaStateRetryTick (at most once a second per area; at quit and teardown at once); the plain
+   mirror is still rebuilt from those bytes, so this session's next load of the area reads them. Logged: the first 8 failures and every
+   100th, and the first 16 commits that landed late. Returns 1 = landed. MAIN THREAD.
+   CRASH TABLE - each step, and what the next launch does (AreaStateScan -> areastate::LoadArea, MirrorAtLoad):
+     a. writing <mirror>.area.tmp          -> the temp is torn (length or CRC wrong): deleted; <mirror>.area, the previous state, stands
+     b. flushed, before the rename         -> the temp is whole with a higher generation: taken, and moved over .area at that load
+     c. the rename (WRITE_THROUGH)         -> the old .area with the whole temp beside it (= b), or the new .area alone - never half a file
+     d. after the rename, before the plain mirror is rebuilt -> the mirror is older than .area and differs: rebuilt from the state at that load
+     e. rebuilding the plain mirror        -> a leftover <mirror>.area.rebuild is deleted, the mirror is checked and rebuilt (= d)
+     f. a commit that failed (no crash), then a crash or a quit before its retry -> the whole flushed temp of a failed rename is taken (= b;
+        the retry never writes over it - areastate::CommitBytes moves it into place first, its crash points r0-r6 there); after a failed
+        temp write the previous state stands, and the plain mirror (rebuilt from memory for this session's loads) holds other bytes: at
+        that load they are set aside in recover\ and the mirror is rebuilt from the state (MirrorAtLoad decides from the bytes, never from
+        file times), so the mirror never stands for bytes .area does not hold. Logged at the failure and again at the quit's forced try. */
+int AreaStateCommit(const std::string& id, const areastate::Head& hin, const std::vector<char>& save, const std::vector<char>& base, int saveChanged, const char* why)
+{
+    AreaMem& m = g_areaState[id];
+    areastate::Head h = hin;
+    h.key = id; h.gen = m.h.gen + 1;
+    { std::string probe; if (h.rowKnown != 0 && (h.row.key != id || !mirrorkeep::RowFormat(h.row, &probe))) h.rowKnown = 0; }   /* a row that cannot be written stays out (the kept table's stands) */
+    static const std::vector<char> kNone;
+    const std::vector<char>& sv = h.saveHave != 0 ? save : kNone;
+    const std::vector<char>& bs = h.baseKept != 0 ? base : kNone;
+    m.h = h; AreaStateKeptSync(id, h);
+    DWORD err = 0;
+    const int st = AreaLeftNotKnownClear(id) ? areastate::Commit(MirrorFile(id), h, sv, bs, &err) : (int)areastate::kStepRename;
+    ++g_areaCommits;
+    if (st == areastate::kStepNone)
+    {
+        if (m.fails != 0 && ++g_areaCommitLate <= 16)
+            DebugLog("[ZONE] T-1391 AREA STATE " + id + " committed (generation " + N((long long)h.gen) + ", " + std::string(why) + ") after " + N(m.fails) + " commit(s) that did not land (areaCommitLate=" + N(g_areaCommitLate) + ", first 16 logged)");
+        m.due = 0; m.fails = 0; std::vector<char>().swap(m.save); std::vector<char>().swap(m.base);
+        AreaOldFilesMove(id, &m);
+    }
+    else
+    {
+        m.due = 1; m.save = sv; m.base = bs; ++m.fails; m.lastTry = ::GetTickCount();
+        ++g_areaCommitFailed;
+        if (++g_areaCommitLines <= 8 || g_areaCommitFailed % 100 == 0)
+            ErrorLog("[ZONE] T-1391 AREA STATE " + id + " commit (generation " + N((long long)h.gen) + ", " + std::string(why) + ") did NOT land - step " + areastate::StepName(st) + ", Windows error " + N((long long)err)
+                     + ": the state is kept in memory (nothing refused) and committed again at the next ticks, at most once a second (areaCommitFailed=" + N(g_areaCommitFailed) + "; first 8 and every 100th logged)");
+    }
+    if (saveChanged != 0 && h.saveHave != 0) m.mirrorDue = AreaMirrorWrite(id, sv, h.pending) != 0 ? 0 : 1;
+    return st == areastate::kStepNone ? 1 : 0;
+}
+/* a commit of a new header over the bytes the state already holds (an echo, a mark, a base cleared). Bytes that do not read back: the save
+   is taken from the plain mirror, and a kept base that cannot be carried goes (NOT KNOWN at its checks - logged). MAIN THREAD. */
+int AreaStateCommitHead(const std::string& id, areastate::Head h, const char* why)
+{
+    std::vector<char> save, base;
+    if (!AreaStateBytes(id, &save, &base))
+    {
+        save.clear(); base.clear();
+        if (h.saveHave != 0 && !ReadFileBytes(MirrorFile(id), &save)) { h.saveHave = 0; save.clear(); }
+        if (h.baseKept != 0)
+        {
+            h.baseKept = 0; h.baseSeq = 0; h.baseAt = 0; h.baseWriter = -1; h.baseEmpty = 0; ++g_zoneKeptBaseFailed;
+            ErrorLog("[ZONE] T-1391 KEPT BASE " + id + " LOST at a commit (" + std::string(why) + "): the state's file did not read back, so its base bytes are not known - the area's own-work checks say NOT KNOWN (keptBaseFailed=" + N(g_zoneKeptBaseFailed) + ")");
+        }
+    }
+    return AreaStateCommit(id, h, save, base, 0, why);
+}
+/* the commit retried: a state not landed, a plain mirror not rebuilt (only while no load of that path is in flight - the hidden swap entry is
+   published again after). force: at quit / teardown, whatever the last try's time. MAIN THREAD. */
+long long g_areaRetryLines = 0;
+void AreaStateRetryOne(const std::string& id, AreaMem& m, int force, int hideSwap)
+{
+    const DWORD now = ::GetTickCount();
+    if (force == 0 && (DWORD)(now - m.lastTry) < 1000) return;
+    m.lastTry = now;
+    if (m.due != 0)
+    {
+        DWORD err = 0;
+        const int st = AreaLeftNotKnownClear(id) ? areastate::Commit(MirrorFile(id), m.h, m.save, m.base, &err) : (int)areastate::kStepRename;
+        if (st == areastate::kStepNone)
+        {
+            ++g_areaCommitLate;
+            if (g_areaCommitLate <= 16) DebugLog("[ZONE] T-1391 AREA STATE " + id + " committed (generation " + N((long long)m.h.gen) + ") at a retry, after " + N(m.fails) + " commit(s) that did not land (areaCommitLate=" + N(g_areaCommitLate) + ", first 16 logged)");
+            m.due = 0; m.fails = 0;
+            AreaOldFilesMove(id, &m);
+        }
+        else
+        {
+            ++m.fails; ++g_areaCommitFailed;
+            if (++g_areaRetryLines <= 8 || g_areaCommitFailed % 100 == 0)
+                ErrorLog("[ZONE] T-1391 AREA STATE " + id + " commit retry " + N(m.fails) + " did NOT land - step " + areastate::StepName(st) + ", Windows error " + N((long long)err) + ": still kept in memory (areaCommitFailed=" + N(g_areaCommitFailed) + "; first 8 retries and every 100th failure logged)");
+        }
+    }
+    if (m.mirrorDue != 0)
+    {
+        const std::string mf = MirrorFile(id);
+        if (hideSwap != 0 && !ZoneSwapHideUnlessLoading(id, mf)) return;   /* a load of that path is in flight: the next tick */
+        std::vector<char> sv;
+        const bool have = m.due != 0 ? (sv = m.save, true) : AreaStateBytes(id, &sv, 0);
+        if (have && AreaMirrorWrite(id, sv, m.h.pending) != 0) m.mirrorDue = 0;
+        if (hideSwap != 0) ZoneSwapPublish(id);
+    }
+    if (m.due == 0) { std::vector<char>().swap(m.save); std::vector<char>().swap(m.base); }
+}
+void AreaStateRetryTick(int force, const char* where = 0)
+{
+    if (g_areaState.empty() || !OnMainThread()) return;
+    for (std::map<std::string, AreaMem>::iterator a = g_areaState.begin(); a != g_areaState.end(); ++a)
+        if (a->second.due != 0 || a->second.mirrorDue != 0) AreaStateRetryOne(a->first, a->second, force, 1);
+    if (force == 0) return;
+    /* the forced try (the quit, the world teardown): every state still not landed is named, always (review of 01a710593 item 6) */
+    long long n = 0; std::string left;
+    for (std::map<std::string, AreaMem>::const_iterator a = g_areaState.begin(); a != g_areaState.end(); ++a)
+    {
+        if (a->second.due == 0 && a->second.mirrorDue == 0) continue;
+        if (++n <= 16) left += (left.empty() ? std::string() : std::string(", ")) + a->first + (a->second.due != 0 ? " (its commit, " + N(a->second.fails) + " tries" + (a->second.h.pending != 0 ? std::string(", an own pending save)") : std::string(")")) : std::string(" (its plain mirror)"));
+    }
+    if (n == 0) return;
+    g_areaForcedLeft += n;
+    ErrorLog("[ZONE] T-1391 AREA STATE: " + N(n) + " area state(s) still NOT landed after the forced try at " + std::string(where != 0 ? where : "a forced try") + ": " + left + (n > 16 ? std::string(", ..") : std::string())
+             + " - a commit not landed is lost with the session: its newest bytes are only in memory and, where its rebuild landed, in the plain mirror, which the next launch sets aside in recover\\ before it rebuilds the mirror from the committed state (areaForcedLeft=" + N(g_areaForcedLeft) + ")");
+}
+/* the area-load redirect, right before it hands Kenshi the plain mirror (main thread only): a state whose commit or mirror rebuild has not
+   landed is tried at once, so the read gets the state's bytes */
+void AreaMirrorEnsure(const std::string& zoneId)
+{
+    const std::map<std::string, AreaMem>::iterator a = g_areaState.find(zoneId);
+    if (a == g_areaState.end() || (a->second.due == 0 && a->second.mirrorDue == 0)) return;
+    AreaStateRetryOne(a->first, a->second, 1, 0);
+}
+/* T-1391 F1706: an area record dropped here (DropEntryHere - its mirror file goes) takes its state with it; an own save still pending in it
+   is set aside in recover\ first (never lost unseen). MAIN THREAD. */
+void AreaStateDrop(const std::string& zoneId)
+{
+    const std::map<std::string, AreaMem>::iterator a = g_areaState.find(zoneId);
+    if (a == g_areaState.end()) return;
+    std::string aside;
+    const int pending = a->second.h.pending != 0 ? 1 : 0;
+    if (pending != 0)
+    {
+        std::vector<char> sv;
+        if (AreaStateBytes(zoneId, &sv, 0) && !sv.empty()) aside = ZoneRecoverSetAside(zoneId, sv, "an own pending area save whose record was dropped here (T-1391 F1706)");
+    }
+    const std::string mf = MirrorFile(zoneId);
+    const int keep = areastate::DropKeeps(pending, aside.empty() ? 0 : 1);
+    std::string movedTo, tmpTo;
+    areastate::DropFiles(mf, keep, &movedTo, &tmpTo);   /* review of 01a710593 item 5: a pending own save not set aside is moved to moved-old\, never deleted */
+    if (keep != 0)
+    {
+        ErrorLog("[ZONE] T-1391 AREA STATE " + zoneId + ": its record is dropped here while it holds this game's own pending save - its bytes could NOT be set aside, so its state is NOT deleted: "
+                 + (movedTo.empty() ? std::string(".area left where it is") : ".area moved to " + movedTo) + (tmpTo.empty() ? std::string() : ", .area.tmp moved to " + tmpTo)
+                 + (a->second.due != 0 ? std::string(" (its newest commit had not landed - those bytes were only in memory)") : std::string()));
+    }
+    else if (pending != 0) ErrorLog("[ZONE] T-1391 AREA STATE " + zoneId + ": its record is dropped here while it holds this game's own pending save - its bytes are set aside as " + aside);
+    g_areaState.erase(a);
+    g_zoneKeptBase.erase(zoneId);
+}
+/* T-1391 (F1653): the area's own save is no longer pending (confirmed, or its own-work check has run) - F1706: its state's pending flag
+   goes in one commit (was: the .unsent file removed). The kept base stays: the content loaded here may still build on it. MAIN THREAD. */
+void ZoneUnsentSideClear(const std::string& zoneId)
+{
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(zoneId);
+    if (a == g_areaState.end() || a->second.h.pending == 0) return;
+    areastate::Head h = a->second.h; h.pending = 0; h.sent = 0;
+    AreaStateCommitHead(zoneId, h, "this game's own save of the area is no longer pending");
+    ++g_zoneUnsentSideCleared;
+    ZoneKeptBaseIdleCheck(zoneId, "this game's own save of the area is no longer pending");   /* T-1391 F1680 L3 */
+}
+/* T-1391 F1680 M1 / F1706: the world server's echo of the save the state holds (its stamp): one commit gives the row its world version and
+   ends the pending mark once nothing of this game's is pending (areafresh::OwnSavePending - the mirror's version is set just before) */
+void AreaStateOnEcho(const std::string& zoneId, long long stamp, unsigned long long seq)
+{
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(zoneId);
+    if (a == g_areaState.end() || a->second.h.rowKnown == 0 || a->second.h.row.writtenAt != stamp) return;
+    areastate::Head h = a->second.h;
+    const int clears = (h.pending != 0 && ZoneOwnSavePending(zoneId) == 0) ? 1 : 0;
+    if (h.row.mirrorSeq == seq && clears == 0) return;
+    h.row.mirrorSeq = seq;
+    if (mirrorkeep::RowOwnBaseWritten(seq, h.row.ownBaseKnown) == 0) { h.row.ownBaseKnown = 0; h.row.ownBase = 0; }   /* an echoed copy's version says it all */
+    { const std::map<std::string, std::vector<long long> >::const_iterator ue = g_zoneUnechoed.find(zoneId); h.row.unechoed = ue != g_zoneUnechoed.end() ? ue->second : std::vector<long long>(); }
+    if (clears != 0) { h.pending = 0; h.sent = 0; }
+    AreaStateCommitHead(zoneId, h, "the world server's echo of this game's save");
+    if (clears != 0) { ++g_zoneUnsentSideCleared; ZoneKeptBaseIdleCheck(zoneId, "this game's own save of the area is no longer pending"); }
+}
+/* T-1391 (F1677; F1706): the area's kept base goes - one commit of the state without it. MAIN THREAD. */
+void ZoneKeptBaseClear(const std::string& zoneId, const char* why)
+{
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(zoneId);
+    if (a == g_areaState.end() || a->second.h.baseKept == 0) return;
+    const unsigned long long was = a->second.h.baseSeq;
+    areastate::Head h = a->second.h; h.baseKept = 0; h.baseSeq = 0; h.baseAt = 0; h.baseWriter = -1; h.baseEmpty = 0;
+    AreaStateCommitHead(zoneId, h, "the kept base cleared");
+    ++g_zoneKeptBaseCleared;
+    if (++g_zoneKeptBaseLines <= 64)
+        DebugLog("[ZONE] T-1391 KEPT BASE " + zoneId + " cleared (it was seq " + N((long long)was) + "): " + std::string(why) + " (keptBaseCleared=" + N(g_zoneKeptBaseCleared) + ", base lines first 64)");
+}
+/* T-1391 F1680 L3: A KEPT BASE NOBODY NEEDS GOES (areafresh::KeptBaseIdle) - no own save of the area pending (ZoneOwnSavePending: no
+   unconfirmed .unsent, no unechoed upload the mirror holds), the area not loaded here, and the mirror holding a world version (the copy
+   the next load takes, and so the next base). Asked at the moment the pending set empties (the .unsent goes, the last unechoed upload
+   is settled) and at each area map (an area unloaded since, a base read back at the start for an area never revisited). MAIN THREAD. */
+long long g_zoneKeptBaseIdleCleared = 0;
+void ZoneKeptBaseIdleCheck(const std::string& zoneId, const char* why)
+{
+    if (g_zoneKeptBase.find(zoneId) == g_zoneKeptBase.end()) return;
+    int sx = -1, sy = -1, loaded = 1;   /* an id that names no area reads as loaded: kept */
+    if (zonerec::ZoneRecIdParse(zoneId, &sx, &sy) != 0) { coop::Sector sec; sec.x = sx; sec.y = sy; loaded = coop::SectorLoadedHereTS(sec) == 1 ? 1 : 0; }
+    const std::map<std::string, ZoneMirrorBase>::const_iterator mb = g_zoneMirrorBase.find(zoneId);
+    const int mirrorWorld = (mb != g_zoneMirrorBase.end() && mb->second.seq != 0ULL) ? 1 : 0;
+    if (areafresh::KeptBaseIdle(1, ZoneOwnSavePending(zoneId), loaded, mirrorWorld) == 0) return;
+    ++g_zoneKeptBaseIdleCleared;
+    ZoneKeptBaseClear(zoneId, ("no own save of the area is pending, it is not loaded here and the mirror holds the world's copy seq " + N((long long)mb->second.seq) + " (" + std::string(why)
+                               + ") - its next own save follows a load, which sets the base again (keptBaseIdleCleared=" + N(g_zoneKeptBaseIdleCleared) + ")").c_str());
+}
+void ZoneKeptBaseIdleSweep()
+{
+    std::vector<std::string> ids; ids.reserve(g_zoneKeptBase.size());
+    for (std::map<std::string, ZoneKeptBase>::const_iterator kb = g_zoneKeptBase.begin(); kb != g_zoneKeptBase.end(); ++kb) ids.push_back(kb->first);
+    for (size_t i = 0; i < ids.size(); ++i) ZoneKeptBaseIdleCheck(ids[i], "the area map's sweep");
+}
+/* every change of an area's content base (a load, an echo, an adopt, a replay taken): the kept base goes once a newer world version is the
+   content base and the mirror holds it (areafresh::KeptBaseClears) - the next write over the mirror keeps that one. MAIN THREAD. */
+void ZoneKeptBaseOnContentBase(const std::string& zoneId)
+{
+    const std::map<std::string, ZoneKeptBase>::const_iterator kb = g_zoneKeptBase.find(zoneId);
+    if (kb == g_zoneKeptBase.end()) return;
+    const std::map<std::string, ZoneMirrorBase>::const_iterator mb = g_zoneMirrorBase.find(zoneId);
+    const unsigned long long cb = ZoneBaseOf(zoneId);
+    if (areafresh::KeptBaseClears(1, kb->second.seq, cb, mb != g_zoneMirrorBase.end() ? 1 : 0, mb != g_zoneMirrorBase.end() ? mb->second.seq : 0ULL) != 0)
+        ZoneKeptBaseClear(zoneId, ("a newer world version (seq " + N((long long)cb) + ") is the content base and the mirror file holds it").c_str());
+}
+/* T-1391 (F1677 rule 1; F1706): BEFORE ANYTHING OVERWRITES AN AREA'S MIRROR (an own save, a received copy, a replay): while the mirror holds
+   the world copy that is the content base and it is not kept yet, that copy becomes the kept base (areafresh::KeptBaseStep; the EMPTY area
+   when no world copy was loaded). F1706: nothing is written here - *nk and *bytes go into the SAME commit as the copy that overwrites the
+   mirror (ZoneMirrorFileWrite), so the base and the save change together and every crash point leaves the whole older state or the whole
+   new one. The bytes are the state's save bytes (the copy the mirror holds), or the plain mirror file for an area with no state yet.
+   Returns 1 = keep *nk / *bytes as the area's base. MAIN THREAD. */
+int ZoneKeptBaseStep(const std::string& zoneId, const std::string& mf, const char* before, ZoneKeptBase* nk, std::vector<char>* bytes)
+{
+    if (!IsZoneId(zoneId) || mf.empty()) return 0;
+    const std::map<std::string, ZoneKeptBase>::const_iterator kb = g_zoneKeptBase.find(zoneId);
+    const std::map<std::string, ZoneMirrorBase>::const_iterator mb = g_zoneMirrorBase.find(zoneId);
+    const std::map<std::string, long long>::const_iterator gd = g_zoneGameDataAt.find(zoneId);
+    const unsigned long long cb = ZoneBaseOf(zoneId);
+    const int step = areafresh::KeptBaseStep(kb != g_zoneKeptBase.end() ? 1 : 0, kb != g_zoneKeptBase.end() ? kb->second.seq : 0ULL, mb != g_zoneMirrorBase.end() ? 1 : 0,
+                                             mb != g_zoneMirrorBase.end() ? mb->second.seq : 0ULL, cb, gd != g_zoneGameDataAt.end() ? 1 : 0);
+    if (step == areafresh::kKbNone) return 0;
+    *nk = ZoneKeptBase(); bytes->clear();
+    if (step == areafresh::kKbKeepMirror)
+    {
+        const std::map<std::string, AreaMem>::const_iterator as = g_areaState.find(zoneId);
+        const bool fromState = as != g_areaState.end() && as->second.h.saveHave != 0;
+        const bool got = fromState ? AreaStateBytes(zoneId, bytes, 0) : ReadFileBytes(mf, bytes);
+        if (!got || bytes->empty())
+        {
+            bytes->clear();
+            ++g_zoneKeptBaseFailed;
+            ErrorLog("[ZONE] T-1391 KEPT BASE " + zoneId + ": " + (fromState ? "the state's save bytes (" + areastate::AreaName(mf) + ")" : "the mirror file " + mf) + " (the world's copy seq " + N((long long)cb) + ", the content base) could NOT be read before " + std::string(before)
+                     + " overwrites it - no base is kept; this area's own-work checks say NOT KNOWN until a world copy is kept (keptBaseFailed=" + N(g_zoneKeptBaseFailed) + ")");
+            return 0;
+        }
+        nk->seq = cb; nk->at = mb->second.writtenAt;
+        const std::map<std::string, Record>::const_iterator hr = g_records.find(zoneId);
+        nk->writer = (hr != g_records.end() && hr->second.owner >= 0 && hr->second.owner <= coopslot::kSlotMax) ? hr->second.owner : -1;
+    }
+    else { zonerec::ZoneEmptyEncode(bytes); nk->empty = 1; nk->at = gd->second; }
+    ++g_zoneBaseSideWritten; if (nk->empty != 0) ++g_zoneKeptBaseEmpty;
+    if (++g_zoneKeptBaseLines <= 64)
+        DebugLog("[ZONE] T-1391 KEPT BASE " + zoneId + " kept before " + std::string(before) + " - "
+                 + (nk->empty != 0 ? std::string("the EMPTY area (no world copy was loaded here: Kenshi built it from its game data at ") + N(nk->at) + ")"
+                                   : "the world's copy seq " + N((long long)nk->seq) + " writtenAt " + N(nk->at) + " writer " + N((long long)nk->writer) + " (" + N((long long)bytes->size()) + " bytes), the content base")
+                 + ", in the same commit of the area's state as that write (F1706); every own-work check of the area reads it (keptBaseWritten=" + N(g_zoneBaseSideWritten) + " empty=" + N(g_zoneKeptBaseEmpty) + " failed=" + N(g_zoneKeptBaseFailed) + ", base lines first 64)");
+    return 1;
+}
+/* T-1391 (F1677 rule 3): THE BASE AN OWN-WORK CHECK READS (areafresh::CheckBaseRoad) - the kept base (F1706: its bytes, stamp and writer from
+   the area's state), else the EMPTY area when no world copy was loaded, else NOT KNOWN (*why says why). Returns areafresh kCb*. MAIN THREAD. */
+int ZoneCheckBaseGet(const std::string& zoneId, std::vector<char>* base, long long* at, int* writer, std::string* why)
+{
+    const std::map<std::string, ZoneKeptBase>::const_iterator kb = g_zoneKeptBase.find(zoneId);
+    const std::map<std::string, long long>::const_iterator gd = g_zoneGameDataAt.find(zoneId);
+    const unsigned long long cb = ZoneBaseOf(zoneId);
+    int road = areafresh::CheckBaseRoad(kb != g_zoneKeptBase.end() ? 1 : 0, cb, gd != g_zoneGameDataAt.end() ? 1 : 0);
+    base->clear(); *at = 0; *writer = -1;
+    if (road == areafresh::kCbKept)
+    {
+        if (!AreaStateBytes(zoneId, 0, base) || base->empty()) { base->clear(); road = areafresh::kCbNotKnown; *why = "its kept base copy (in " + areastate::AreaName(MirrorFile(zoneId)) + ") could not be read"; }
+        else { *at = kb->second.at; *writer = kb->second.writer; }
+    }
+    else if (road == areafresh::kCbEmpty) { zonerec::ZoneEmptyEncode(base); *at = gd->second; }
+    else *why = cb != 0 ? "the content base is the world's copy seq " + N((long long)cb) + " but no copy of it was kept (the mirror file did not hold it when it was overwritten, or its keep failed)"
+                        : std::string("no world copy of the area is known to be loaded here, nor that Kenshi built it from its game data");
+    ++g_zoneCheckBase[road];
+    return road;
+}
+/* the start-up copy (LoadIndex, ZoneIndexMirrorCopy) of an area that has a state and no own save pending: committed into the state (its kept
+   base carried) so the state stays the truth for the copy the mirror holds. false = no state (the caller writes the mirror as before). */
+bool AreaStateStartupCopy(const Record& r, const std::vector<char>& bytes)
+{
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(r.worldId);
+    if (a == g_areaState.end()) return false;
+    areastate::Head h = a->second.h;
+    std::vector<char> base;
+    if (h.baseKept != 0 && !AreaStateBytes(r.worldId, 0, &base))
+    {
+        h.baseKept = 0; h.baseSeq = 0; h.baseAt = 0; h.baseWriter = -1; h.baseEmpty = 0; base.clear(); ++g_zoneKeptBaseFailed;
+        ErrorLog("[ZONE] T-1391 KEPT BASE " + r.worldId + " LOST at the start-up copy: the state's file did not read back (keptBaseFailed=" + N(g_zoneKeptBaseFailed) + ")");
+    }
+    h.saveHave = 1; h.pending = 0; h.sent = 0; h.rowKnown = 1; h.row = AreaRowOf(r, r.seq, 0, 0ULL, 0);
+    AreaStateCommit(r.worldId, h, bytes, base, 1, "the world server's start-up copy");
+    for (size_t i = 0; i < g_areaScanRows.size(); ) { if (g_areaScanRows[i].key == r.worldId) g_areaScanRows.erase(g_areaScanRows.begin() + i); else ++i; }   /* the state's older row no longer stands */
+    return true;
+}
+/* ---- T-1391 F1706: THE START - every area state read back, and the old side files migrated once (AreaStateScan). MAIN THREAD. ---- */
+std::string AreaMirrorOf(const std::string& key) { return IsZoneId(key) ? MirrorFile(key) : std::string(); }
+std::string AreaKeyGuess(const std::string& mf)
+{
+    const size_t cut = mf.find_last_of("\\/");
+    std::string n = cut == std::string::npos ? mf : mf.substr(cut + 1);
+    if (n.size() > 5 && _stricmp(n.c_str() + n.size() - 5, ".zone") == 0) n.erase(n.size() - 5);
+    return n;
+}
+/* the plain mirror against a state read back (areastate::MirrorAtLoad - from the bytes): kept when it holds the state's save bytes, else
+   rebuilt from them (other bytes in a mirror written at or after the state's last commit set aside in recover\ first) - then the state's
+   row, restamped with the mirror's size and time, goes to MirrorKeepLoad */
+void AreaScanMirrorAndRow(const std::string& mf, AreaMem* m, const std::vector<char>& save)
+{
+    unsigned long long ms = 0, mt = 0, as = 0, at = 0;
+    const int mThere = areastate::FileStat(mf, &ms, &mt) ? 1 : 0;
+    const int aThere = areastate::FileStat(areastate::AreaName(mf), &as, &at) ? 1 : 0;
+    const int mNewer = (mThere != 0 && (aThere == 0 || mt >= at)) ? 1 : 0;
+    std::vector<char> cur;
+    int d = areastate::MirrorAtLoad(m->h.saveHave, mThere, mNewer, -1);
+    bool curRead = false;
+    if (d == areastate::kMirCompare) { curRead = ReadFileBytes(mf, &cur); const int same = (curRead && cur == save) ? 1 : 0; d = areastate::MirrorAtLoad(m->h.saveHave, mThere, mNewer, same); }
+    if (d == areastate::kMirAsideRebuild && !curRead)
+    {   /* the re-check's LOW a: a mirror newer than its state that cannot be read now - left as it is (never rebuilt over with nothing set aside) */
+        ++g_areaScanMirrorAside;
+        ErrorLog("[STORE] T-1391 AREA STATE " + m->h.key + ": the plain mirror was written after the state's last commit and cannot be read now - left as it is (nothing set aside, not rebuilt over; the state, generation "
+                 + N((long long)m->h.gen) + ", stands for the area) (areaMirrorAsideAtLoad=" + N(g_areaScanMirrorAside) + ")");
+        d = areastate::kMirKeep;
+    }
+    if (d == areastate::kMirAsideRebuild)
+    {   /* the mirror holds bytes its state does not: a save whose commit had not landed before a crash or a quit, or a rebuild a crash cut */
+        ++g_areaScanMirrorAside;
+        const std::string aside = cur.empty() ? std::string() : ZoneRecoverSetAside(m->h.key, cur, "a plain mirror written after its area state's last commit and holding other bytes (T-1391 F1706)");
+        ErrorLog("[STORE] T-1391 AREA STATE " + m->h.key + ": the plain mirror holds other bytes than its state and was written after the state's last commit (a save whose commit had not landed, or a rebuild a crash cut) - "
+                 + (aside.empty() ? std::string(cur.empty() ? "it is empty: nothing to set aside" : "its bytes could NOT be set aside") : "its bytes are set aside as " + aside)
+                 + "; the mirror is rebuilt from the state, generation " + N((long long)m->h.gen) + " (areaMirrorAsideAtLoad=" + N(g_areaScanMirrorAside) + ")");
+        d = areastate::kMirRebuild;
+    }
+    if (d == areastate::kMirRebuild) { if (AreaMirrorWrite(m->h.key, save, m->h.pending) != 0) ++g_areaScanMirrorRebuilt; else m->mirrorDue = 1; }
+    if (m->h.rowKnown != 0)
+    {
+        mirrorkeep::KeptRow r = m->h.row;
+        unsigned long long s2 = 0, t2 = 0;
+        if (areastate::FileStat(mf, &s2, &t2)) mirrorkeep::RowStamp(&r, s2, t2);
+        g_areaScanRows.push_back(r);
+    }
+    if (m->h.pending != 0) ++g_zoneUnsentSideKept;
+}
+void AreaMigrateOne(const std::string& mf);
+void AreaScanOne(const std::string& mf)
+{
+    areastate::Head h; std::vector<char> save, base; areastate::LoadOut o;
+    const int pick = areastate::LoadArea(mf, &h, &save, &base, &o);
+    if (o.finished != 0) ++g_areaScanTmpTaken;
+    if (o.tmpRemoved != 0) ++g_areaScanTmpRemoved;
+    if (pick == areastate::kPickNone || !IsZoneId(h.key) || _stricmp(MirrorFile(h.key).c_str(), mf.c_str()) != 0)
+    {   /* NOT KNOWN, or the migration - areastate::ScanRoad (review of 01a710593 item 4 and its re-check): the migration only when NO .area
+           exists; a .area that reads but is not whole (or names another area) is set aside and moved; one that cannot be read now is left */
+        bool oldThere = false;
+        { size_t ns = 0; const char* const* sfx = areastate::OldSuffixes(&ns); for (size_t i = 0; i < ns && !oldThere; ++i) oldThere = areastate::There(mf + sfx[i]); }
+        const std::string af = areastate::AreaName(mf);
+        std::vector<char> raw; std::string aside, movedTo;
+        const int aThere = areastate::There(af) ? 1 : 0;
+        const int aReads = (aThere != 0 && areastate::ReadAll(af, &raw, 0)) ? 1 : 0;
+        const int road = areastate::ScanRoad(pick, 0, aThere, aReads, oldThere ? 1 : 0);
+        if (road != areastate::kScanMigrate) ++g_areaScanNotKnown;
+        if (road == areastate::kScanNotKnownMove && aThere != 0)
+        {
+            if (!raw.empty()) aside = ZoneRecoverSetAside(AreaKeyGuess(mf), raw, "an area state file that does not read whole, or names another area (T-1391 F1706)");
+            movedTo = areastate::MoveOld(af);
+        }
+        if (road == areastate::kScanNotKnownLeave) g_areaLeftNotKnown.insert(AreaKeyGuess(mf));
+        const std::string oldWords = oldThere ? std::string("; its old side files stay where they are") : std::string();
+        ErrorLog("[STORE] T-1391 AREA STATE " + mf + " NOT KNOWN at the load: .area " + areastate::ParseName(o.areaRes) + ", .area.tmp " + areastate::ParseName(o.tmpRes)
+                 + (pick != areastate::kPickNone ? " (it names another area: " + h.key + ")" : std::string())
+                 + (road == areastate::kScanMigrate ? std::string(" - no .area, and its old side files are still there (a crash during the migration's first commit): the state is built from them now")
+                    : road == areastate::kScanNotKnownLeave ? " - the .area is there but cannot be read now (held by another program?): left where it is - nothing moved, set aside or rebuilt over it; NOT KNOWN for this launch (its own-work checks say NOT KNOWN; the first commit of the area sets its bytes aside once it reads)" + oldWords
+                    : " - no state is taken for it (its own-work checks say NOT KNOWN)" + oldWords)
+                 + "; " + (aside.empty() ? std::string("nothing set aside") : "its bytes are set aside as " + aside) + (movedTo.empty() ? std::string() : "; the file moved to " + movedTo) + " (areaScanNotKnown=" + N(g_areaScanNotKnown) + ")");
+        if (road == areastate::kScanMigrate) AreaMigrateOne(mf);
+        return;
+    }
+    AreaMem& m = g_areaState[h.key];
+    m = AreaMem(); m.h = h; AreaStateKeptSync(h.key, h);
+    if (o.pick == areastate::kPickTmp && o.finished == 0) { m.due = 1; m.save = save; m.base = base; m.lastTry = ::GetTickCount(); }   /* taken from a .area.tmp that could not be moved into place: committed again from memory */
+    {   /* old side files beside a state (a crash between a migration's commit and their move): the state always wins - they go to moved-old\ */
+        size_t ns = 0; const char* const* sfx = areastate::OldSuffixes(&ns);
+        for (size_t i = 0; i < ns; ++i) if (areastate::There(mf + sfx[i])) m.oldFiles.push_back(mf + sfx[i]);
+        AreaOldFilesMove(h.key, &m);
+    }
+    AreaScanMirrorAndRow(mf, &m, save);
+    ++g_areaScanned;
+    if (++g_areaScanLines <= 20 || o.pick == areastate::kPickTmp || h.pending != 0)
+        DebugLog("[STORE] T-1391 AREA STATE " + h.key + " read back: generation " + N((long long)h.gen) + " from " + (o.pick == areastate::kPickTmp ? std::string(".area.tmp (whole and newer - its commit's rename was not made; ") + (o.finished != 0 ? "moved into place now)" : "it could NOT be moved now - taken from it)") : std::string(".area"))
+                 + (o.tmpRemoved != 0 ? std::string(", a torn or older .area.tmp deleted") : std::string()) + "; " + (h.pending != 0 ? (h.sent != 0 ? "an own SENT save (echo not seen)" : "an own unsent save") : std::string("no own save pending"))
+                 + (h.baseKept != 0 ? (h.baseEmpty != 0 ? std::string(", kept base: the EMPTY area") : ", kept base: the world's copy seq " + N((long long)h.baseSeq) + " writtenAt " + N(h.baseAt)) : std::string(", no base kept"))
+                 + " (areaScanned=" + N(g_areaScanned) + ", first 20 and every own or finished one logged)");
+}
+long long g_areaMigLines = 0;
+void AreaMigrateOne(const std::string& mf)
+{
+    areastate::Mig g;
+    areastate::MigrateRead(mf, AreaMirrorOf, &g);
+    if (g.result == areastate::kMigNothing) return;
+    if (g.result == areastate::kMigNotKnown)
+    {
+        ++g_areaMigNotKnown;
+        const std::string aside = g.aside.empty() ? std::string() : ZoneRecoverSetAside(AreaKeyGuess(mf), g.aside, "an area's old files that could not be read at the migration (T-1391 F1706)");
+        ErrorLog("[STORE] T-1391 AREA STATE " + AreaKeyGuess(mf) + " NOT KNOWN at the migration from the old files: " + g.why + " - its old files stay where they are and no state is built for it (its own-work checks say NOT KNOWN); "
+                 + (aside.empty() ? std::string("nothing set aside") : "its save bytes are set aside as " + aside) + " (areaMigNotKnown=" + N(g_areaMigNotKnown) + ")");
+        return;
+    }
+    if (g.result == areastate::kMigDiscardOnly)
+    {   /* strays only (a .ownn with no mark, a .base / .basen with no line): nothing of them is read - moved */
+        AreaMem tmp; tmp.oldFiles = g.oldFiles;
+        AreaOldFilesMove(AreaKeyGuess(mf), &tmp);
+        return;
+    }
+    AreaMem& m = g_areaState[g.h.key];
+    m = AreaMem(); m.oldFiles = g.oldFiles;
+    const int landed = AreaStateCommit(g.h.key, g.h, g.save, g.base, g.saveFrom == areastate::kMigSaveOwnn ? 1 : 0, "the migration from the old side files");
+    ++g_areaMigrated;
+    AreaScanMirrorAndRow(mf, &m, g.save);
+    const bool migSay = ++g_areaMigLines <= 20 || m.h.pending != 0;
+    const std::string gl = "[STORE] T-1391 AREA STATE " + g.h.key + " MIGRATED from the old side files: " + (m.h.pending != 0 ? (m.h.sent != 0 ? "an own SENT save (echo not seen)" : "an own unsent save") : std::string("no own save pending"))
+                 + " from " + (g.saveFrom == areastate::kMigSaveOwnn ? std::string(".ownn (its mark stood for it; the rename over the mirror had not been made - the mirror is rebuilt from it)") : std::string("the mirror file"))
+                 + "; base: " + areastate::MigBaseName(g.baseFrom) + " - " + (landed != 0 ? std::string("committed as generation 1; the old files moved to moved-old\\") : std::string("its commit did NOT land: the state is kept in memory and committed again; the old files stay until it lands"))
+                 + " (areaMigrated=" + N(g_areaMigrated) + ", first 20 and every own one logged)";
+    if (landed == 0) ErrorLog(gl); else if (migSay) DebugLog(gl);
+}
+void AreaStateScan()
+{
+    if (g_dirMirror.empty()) return;
+    static const char* const kSfx[] = { ".area.tmp", ".area.rebuild", ".area", ".unsent", ".ownn", ".basevn", ".basev", ".basen", ".base" };
+    std::set<std::string> mfs; std::vector<std::string> rebuilds;
+    U8FindData fd; HANDLE fh = U8FindFirstFile((g_dirMirror + "\\*").c_str(), &fd);
+    if (fh == INVALID_HANDLE_VALUE) return;
+    do
+    {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        const std::string n = fd.cFileName;
+        for (size_t k = 0; k < sizeof(kSfx) / sizeof(kSfx[0]); ++k)
+        {
+            const size_t sl = std::strlen(kSfx[k]);
+            if (n.size() <= sl || _stricmp(n.c_str() + n.size() - sl, kSfx[k]) != 0) continue;
+            const std::string mf = g_dirMirror + "\\" + n.substr(0, n.size() - sl);
+            if (mf.size() > 5 && _stricmp(mf.c_str() + mf.size() - 5, ".zone") == 0) { if (k == 1) rebuilds.push_back(g_dirMirror + "\\" + n); else mfs.insert(mf); }   /* area mirror files only */
+            break;
+        }
+    } while (U8FindNextFile(fh, &fd));
+    ::FindClose(fh);
+    for (size_t i = 0; i < rebuilds.size(); ++i) U8DeleteFile(rebuilds[i].c_str());   /* a mirror rebuild a crash cut (crash table step 6): the mirror is checked below */
+    for (std::set<std::string>::const_iterator m = mfs.begin(); m != mfs.end(); ++m)
+    {
+        if (areastate::There(areastate::AreaName(*m)) || areastate::There(areastate::TmpName(*m))) AreaScanOne(*m);   /* a state exists: it always wins */
+        else AreaMigrateOne(*m);
+    }
+    if (!mfs.empty())
+        DebugLog("[STORE] T-1391 AREA STATES of " + g_dirMirror + ": " + N(g_areaScanned) + " read back (" + N(g_areaScanTmpTaken) + " from a newer .area.tmp, " + N(g_areaScanTmpRemoved) + " torn or older .area.tmp deleted, "
+                 + N(g_areaScanMirrorRebuilt) + " plain mirrors rebuilt, " + N(g_areaScanNotKnown) + " NOT KNOWN), " + N(g_areaMigrated) + " migrated from the old side files (" + N(g_areaMigNotKnown) + " NOT KNOWN, "
+                 + N(g_areaMovedOld) + " old files moved), " + N(g_zoneUnsentSideKept) + " own save(s) pending (F1706)");
+}
 void LoadIndex()
 {
-    g_zoneMirrorBase.clear(); g_zoneContentBase.clear(); g_zoneStaleBase.clear(); g_zoneContentBaseRoad.clear(); g_zoneSentBase.clear();   /* T-1429 s2 fold 5 / T-1391: per world - moved here from MirrorKeepLoad (StoreArmWorldIndex calls the two in this order, nothing else calls either) */
+    g_zoneMirrorBase.clear(); g_zoneContentBase.clear(); g_zoneLoadVer.clear(); g_zoneStaleBase.clear(); g_zoneContentBaseRoad.clear(); g_zoneSentBase.clear(); g_zoneUnechoed.clear(); g_zoneOwnRowBase.clear(); g_zoneRepushStamp.clear(); g_zonePushReadFailBy.clear(); g_zonePushHeldWait.clear(); g_zoneKeptBase.clear(); g_zoneGameDataAt.clear(); g_zoneStaleAside.clear();   /* T-1429 s2 fold 5 / T-1391: per world - moved here from MirrorKeepLoad (StoreArmWorldIndex calls the two in this order, nothing else calls either) */
+    g_areaState.clear(); g_areaScanRows.clear(); g_areaLeftNotKnown.clear();   /* T-1391 F1706: per world */
+    AreaStateScan();   /* T-1391 F1706: every area state read back (and the old side files migrated) BEFORE the start-up copies below ask whether an own save is pending */
     /* W2-f (review-w2 B): set FIRST, so the journal merge below (QueueLoad -> QueueSave) and the held deleted-bits
        writes reach their files; before this line both only hold in memory. */
     g_indexLoaded = true;
@@ -3665,6 +4405,15 @@ void LoadIndex()
         std::map<std::string, Record>::iterator it = g_records.find(r.worldId);
         if (it == g_records.end() || it->second.writtenAt < r.writtenAt)
         {
+            /* T-1391 (F1653 item 4): an area with this game's own unsent save kept beside its mirror file loads from that save - the start-up
+               copy is not copied over it nor taken; the kept row (MirrorKeepLoad) is the area's record and the link-up push sends it */
+            if (IsZoneId(r.worldId) && mirrorkeep::IndexCopyYields(AreaStatePending(r.worldId)) != 0)
+            {
+                ++g_zoneIndexYielded;
+                if (g_zoneIndexYielded <= 8) DebugLog("[STORE] index: area record " + r.worldId + " (the world's copy writtenAt " + N(r.writtenAt) + ") NOT copied over this game's own unconfirmed save of it (its state pending: unsent, or sent and not echoed - F1680 M1, F1706) -"
+                                                      " the area loads from that save and the link-up push sends it (T-1391 F1653; zoneIndexYielded=" + N(g_zoneIndexYielded) + ", first 8 logged)");
+                continue;
+            }
             /* the swap serves the engine's own area file name; a failed copy never replaces a record this game already holds */
             const bool zoneCopyFailed = IsZoneId(r.worldId) && !ZoneIndexMirrorCopy(&r);
             if (zoneCopyFailed && it != g_records.end())
@@ -4120,8 +4869,11 @@ void MirrorKeepClaim()
              + (err == ERROR_SHARING_VIOLATION ? std::string(": another game of this player on this computer holds it") : std::string())
              + ") - this game uses " + g_dirMirror + " and keeps no records between launches");
 }
+/* T-1391 F1706: the three scans of the old side files (.ownn, .unsent, .basev) are one - AreaStateScan, called from LoadIndex before the
+   start-up copies; its rows wait in g_areaScanRows for MirrorKeepLoad below. */
 /* StoreArmWorldIndex, right after LoadIndex: the kept table back into g_records, each row checked against its file */
 long long g_mkAreaNoBase = 0;   /* fold 5: kept area rows read back with no version (an old table, or an own copy never echoed) */
+long long g_mkOwnStateLines = 0;   /* T-1391 F1706: own pending area states' rows logged at the load (first 20) */
 void MirrorKeepLoad()
 {
     g_mkState = 0;
@@ -4129,19 +4881,22 @@ void MirrorKeepLoad()
     g_mkStaleHold.clear(); g_preStaleHeld.clear();   /* T-985 C2b fold 1: nor held past an earlier index's snapshot */
     if (g_mkBaseDirty) ++g_mkBaseDroppedAtLoad;   /* fold 6: never expected - the index is read once per process (StoreArmWorldIndex returns once g_indexLoaded, which nothing lowers), so nothing is
                                                    pending at this clear; no table is written here: g_records already holds the index LoadIndex just read, and writing it would replace the kept table */
-    g_mkBaseDirty = false;   /* T-1429 s2 fold 5: per world - another world's (or an earlier index's) versions never carry over; T-1391: the versions themselves are cleared at LoadIndex's start (it runs just before this, and now gives the start-up copies theirs) */
+    g_mkBaseDirty = false; g_mkOwnSaveDue = false;   /* T-1429 s2 fold 5: per world - another world's (or an earlier index's) versions never carry over; T-1391: the versions themselves are cleared at LoadIndex's start (it runs just before this, and now gives the start-up copies theirs) */
     g_mkSeqJudged = false; g_mkStoredSeq = 0ULL; g_mkGatedPlaceKeys.clear(); g_mkBeside.clear();   /* this load's table is judged against the world server on its own; nothing held beside from an earlier index */
-    if (!g_mkClaimed) return;
+    const std::vector<mirrorkeep::KeptRow> side(g_areaScanRows);   /* T-1391 (review S1; F1706): the area states' rows, read back by LoadIndex's AreaStateScan - before any early return below */
+    if (!g_mkClaimed && side.empty()) return;
     const std::string path = g_dirMirror + "\\" + mirrorkeep::kTableFile;
-    if (!StoreFileThere(path))
-    {
-        g_mkWhy = mirrorkeep::kWhyNoTable;
-        DebugLog("[STORE] T-985 C1: no kept record table in " + g_dirMirror + " yet - started fresh (it is written when the records before"
-                 " the load are in and when a save finishes)");
-        return;
-    }
     std::vector<char> b;
     std::vector<mirrorkeep::KeptRow> rows; long long bad = 0;
+    if (!g_mkClaimed || !StoreFileThere(path))
+    {
+        if (g_mkClaimed) g_mkWhy = mirrorkeep::kWhyNoTable;
+        DebugLog("[STORE] T-985 C1: no kept record table in " + g_dirMirror + " yet - started fresh (it is written when the records before"
+                 " the load are in and when a save finishes)" + (side.empty() ? std::string() : " - " + N((long long)side.size()) + " area state row(s) are taken (T-1391 F1706)"));
+        if (side.empty()) return;
+    }
+    else
+    {
     const int v = ReadFileBytes(path, &b) ? mirrorkeep::TableParseSeq(std::string(b.begin(), b.end()), g_indexWorldId, g_mkIdHash, &rows, &bad, &g_mkStoredSeq)
                                           : mirrorkeep::kTableTorn;
     g_mkBadLines += bad; g_mkBytesReadLoad += (long long)b.size();
@@ -4149,10 +4904,26 @@ void MirrorKeepLoad()
     if (v != mirrorkeep::kTableOk)
     {
         ErrorLog("[STORE] T-985 C1: the kept record table " + path + " is NOT used (" + mirrorkeep::WhyName(g_mkWhy) + ") - started fresh;"
-                 " every record comes from the world server");
-        return;
+                 " every record comes from the world server" + (side.empty() ? std::string() : " - but " + N((long long)side.size()) + " area state row(s) are taken (T-1391 F1706)"));
+        if (side.empty()) return;
+        rows.clear();
     }
-    g_mkState = 1;
+    else g_mkState = 1;
+    }
+    for (size_t s = 0; s < side.size(); ++s)
+    {   /* T-1391 (F1653 item 2; F1706): an area state's row stands for its area when the table has none or one not newer (the state is committed
+           at every mirror write, the table once per batch) */
+        const mirrorkeep::KeptRow& sr = side[s];
+        size_t at = rows.size();
+        for (size_t q = 0; q < rows.size(); ++q) if (rows[q].key == sr.key) { at = q; break; }
+        const int takes = areastate::AreaRowTakes(at < rows.size() ? 1 : 0, at < rows.size() ? rows[at].writtenAt : 0, sr.writtenAt);
+        if (takes != 0) { if (at < rows.size()) rows[at] = sr; else rows.push_back(sr); }
+        const std::map<std::string, AreaMem>::const_iterator ast = g_areaState.find(sr.key);
+        if (ast != g_areaState.end() && ast->second.h.pending != 0 && ++g_mkOwnStateLines <= 20)
+            DebugLog("[STORE] T-1391: own " + std::string(ast->second.h.sent != 0 ? "SENT (echo not seen)" : "unsent") + " area save " + sr.key + " (writtenAt " + N(sr.writtenAt) + ", its kept base " + (ast->second.h.baseKept != 0 ? "writtenAt " + N(ast->second.h.baseAt) : std::string("none")) + ") found in its area state - "
+                     + (takes != 0 ? std::string("its row is taken (the table's was missing or not newer)") : std::string("the table's row is a later one"))
+                     + "; the link-up push sends it (zoneUnsentSideKept=" + N(g_zoneUnsentSideKept) + ", first 20 logged)");
+    }
     const DWORD t0 = ::GetTickCount();
     long long logged = 0;
     g_publishSuppressed = true;   /* as LoadIndex: one PublishPendingTowns for the whole table */
@@ -4165,13 +4936,13 @@ void MirrorKeepLoad()
         const int rv = (del || zoneOff) ? (int)mirrorkeep::kRowOk : mirrorkeep::RowCheck(k, MkFileStat(file, &size, &mtime) ? 1 : 0, size, mtime);   /* fold 1 (review MED 5): size and time only - no record file is read */
         const std::map<std::string, Record>::const_iterator it = g_records.find(k.key);
         const int lv = mirrorkeep::RowLoad(del, zoneOff, rv, it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, k.writtenAt);
-        if (lv != mirrorkeep::kLoadRejected && mirrorkeep::RowNoBaseRejects(IsZoneId(k.key) ? 1 : 0, k.mirrorSeq, del, zoneOff) != 0)
+        if (lv != mirrorkeep::kLoadRejected && mirrorkeep::RowNoBaseRejects(IsZoneId(k.key) ? 1 : 0, k.mirrorSeq, k.ownBaseKnown, del, zoneOff) != 0)
         {   /* T-1429 s2 fold 6 (review F1380 BLOCKER a): an area row with no version - rejected as a changed row is. A record the index load holds
                for the same file gets stamp 0, so the load's fetch (cooppre::PreWant: held stamp below the world's) brings the world's copy */
             ++g_mkRejected; ++g_mkNoBaseRejected;
             if (it != g_records.end() && it->second.file == file) g_records[k.key].writtenAt = 0;
             if (++logged <= 8) DebugLog("[STORE] T-1429: kept area record " + k.key + " NOT taken - its copy's world version is not known (a table from before"
-                                        " fold 5, or this game's own save before its echo); the world's copy is fetched (keptNoBaseRejected=" + N(g_mkNoBaseRejected) + ")");
+                                        " fold 5, or this game's own save before its echo with no base kept - T-1391 F1631); the world's copy is fetched (keptNoBaseRejected=" + N(g_mkNoBaseRejected) + ")");
             continue;
         }
         if (lv == mirrorkeep::kLoadRejected)
@@ -4223,7 +4994,13 @@ void MirrorKeepLoad()
         Record r;
         r.worldId = k.key; r.squadSid = k.squadSid; r.factionName = k.factionName; r.town = k.town; r.home = k.home; r.file = file;
         r.x = k.x; r.y = k.y; r.z = k.z; r.writtenAt = k.writtenAt; r.posAt = k.posAt; r.owner = (int)k.owner; r.gone = 0; r.seq = k.seq; r.birth = k.birth;
-        if (IsZoneId(k.key)) { ZoneMirrorBase mb; mb.writtenAt = k.writtenAt; mb.seq = k.mirrorSeq; mb.from = areafresh::kMirrorFromKept; g_zoneMirrorBase[k.key] = mb; if (k.mirrorSeq == 0ULL) ++g_mkAreaNoBase; }   /* T-1429 s2 fold 5: the mirror file's version, kept with its stamp (0 = not known: an own copy before its echo, or an old table) */
+        if (IsZoneId(k.key)) { ZoneMirrorBase mb; mb.writtenAt = k.writtenAt; mb.seq = k.mirrorSeq; mb.from = areafresh::kMirrorFromKept; g_zoneMirrorBase[k.key] = mb; if (k.mirrorSeq == 0ULL) ++g_mkAreaNoBase;
+                               if (!k.unechoed.empty()) { std::vector<long long>& ue = g_zoneUnechoed[k.key]; for (size_t q = 0; q < k.unechoed.size(); ++q) areafresh::UnechoedAdd(&ue, k.unechoed[q]); ++g_mkUnechoedKept;   /* T-1391 F1633 item 1 */
+                                   if (g_mkUnechoedKept <= 20) DebugLog("[STORE] T-1391: kept area record " + k.key + " - " + N((long long)k.unechoed.size()) + " upload(s) of it still waiting for their echo when the table was written (newest writtenAt "
+                                                                        + N(k.unechoed.back()) + "): a refusal naming one as the stored copy is this game's own (keptUnechoed=" + N(g_mkUnechoedKept) + ", first 20 logged)"); }
+                               if (k.mirrorSeq == 0ULL && k.ownBaseKnown != 0) { ZoneOwnRowBaseSet(k.key, k.writtenAt, k.ownBase); ++g_mkOwnBaseKept; if (g_mkOwnBaseKept <= 20)   /* T-1391 F1631 item 1: the link-up push sends it with this base */
+                                   DebugLog("[STORE] T-1391: kept area record " + k.key + " is this game's own save the world server has not confirmed (writtenAt " + N(k.writtenAt) + ") - taken with the base it was made from, "
+                                            + N((long long)k.ownBase) + "; the link-up push sends it (keptOwnBase=" + N(g_mkOwnBaseKept) + ", first 20 logged)"); } }   /* T-1429 s2 fold 5: the mirror file's version, kept with its stamp (0 = not known: an own copy before its echo, or an old table) */
         if (place == mirrorkeep::kKeptBeside) { g_mkBeside[k.key] = r; ++g_mkHeldBeside; }   /* the index-load record stays for every road until the world server names the key (MirrorKeepConfirmed swaps this in) */
         else g_records[k.key] = r;
         ++g_mkRead;   /* not published to the area swap table here: area streaming reads that table on worker threads with no hold-back, so a kept area record is published when the world server names it (MirrorKeepConfirmed) or, if it stays, at the first snapshot's end (MirrorKeepSnapshotEnd); until then the table keeps what LoadIndex published */
@@ -4239,6 +5016,7 @@ void MirrorKeepLoad()
              + N(g_mkAreaBytesRead) + " bytes) read to their end (T-1243) in " + N(g_mkVerifyMs) + " ms; the "
              + N((long long)g_mkGate.size()) + " taken are not woken or placed until the world server names them");
 }
+int ZonePushVerdict(const std::string& id, const Record& row);   /* T-1391: defined below, same namespace */
 /* the kept table, written whole by rename - at PreloadFinish and when a save finished. MAIN THREAD. */
 bool MirrorKeepWrite(const char* why)
 {
@@ -4261,6 +5039,12 @@ bool MirrorKeepWrite(const char* why)
         {   /* T-1429 s2 fold 5 (review F1378): the mirror file's world server version, in the same row as its stamp - only for the stamp it was taken for */
             const std::map<std::string, ZoneMirrorBase>::const_iterator mb = g_zoneMirrorBase.find(it->first);
             k.mirrorSeq = mirrorkeep::RowMirrorSeq(mb != g_zoneMirrorBase.end() ? 1 : 0, mb != g_zoneMirrorBase.end() ? mb->second.writtenAt : 0, mb != g_zoneMirrorBase.end() ? mb->second.seq : 0ULL, r.writtenAt);
+            unsigned long long ob = 0ULL;   /* T-1391 F1631 item 1: this game's own unconfirmed save keeps the base it was made from across a quit */
+            if (mirrorkeep::RowOwnBaseWritten(k.mirrorSeq, ZoneOwnBaseHere(it->first, r.writtenAt, &ob)) != 0) { k.ownBaseKnown = 1; k.ownBase = ob; ++g_mkOwnBaseWritten; }
+            {   /* T-1391 F1633 item 1: this game's uploads of the area still waiting for their echo go with the row, so a reopen still knows them as its own */
+                const std::map<std::string, std::vector<long long> >::const_iterator ue = g_zoneUnechoed.find(it->first);
+                if (ue != g_zoneUnechoed.end()) k.unechoed = ue->second;
+            }
         }
         mirrorkeep::RowStamp(&k, size, mtime);   /* its own file's size and time; no CRC - the file is not read, the field stays 00000000 */
         rows.push_back(k); names.push_back(file);   /* rows[i] and names[i] stay paired (mirrorkeep::ListUnclashed) */
@@ -4288,7 +5072,16 @@ bool MirrorKeepWrite(const char* why)
     if (g_mkWritten <= 4 || g_mkWritten % 50 == 0)
         DebugLog("[STORE] T-985 C1: kept record table written (" + std::string(why) + "): " + N(g_mkLastRows) + " records, " + N(refused)
                  + " not writable, " + N(g_mkUnlisted) + " passed over so far (file missing or changing); written " + N(g_mkWritten));
-    g_mkBaseDirty = false;   /* fold 6: every version is on disk now - cleared only by a write that landed */
+    g_mkOwnSaveDue = false; g_mkBaseDirty = false;   /* fold 6: every version is on disk now - cleared only by a write that landed (F1635 item 1: an own save's due write too) */
+    {   /* T-1391 (F1653; F1706): an area's pending mark goes once its row is no longer this game's own unconfirmed save (areafresh::UnsentSideClears) */
+        std::vector<std::string> us;
+        for (std::map<std::string, AreaMem>::const_iterator ast = g_areaState.begin(); ast != g_areaState.end(); ++ast) if (ast->second.h.pending != 0) us.push_back(ast->first);
+        for (size_t q = 0; q < us.size(); ++q)
+        {
+            const std::map<std::string, Record>::const_iterator ur = g_records.find(us[q]);
+            if (areafresh::UnsentSideClears(ur != g_records.end() ? ZonePushVerdict(us[q], ur->second) : (int)areafresh::kPushSkipNotOwn) != 0) ZoneUnsentSideClear(us[q]);
+        }
+    }
     return true;
 }
 /* the REPORT line's keptTable[...] token */
@@ -4997,6 +5790,12 @@ int ZoneRecvTakesNotNewer(const Record& r, const Record& held, const char* road)
     if (zonerec::ZoneRecIdParse(r.worldId, &sx, &sy) != 0) { coop::Sector sec; sec.x = sx; sec.y = sy; holder = coop::AreaHolderSlotTS(sec); }
     const int why = zonerec::ZoneRecvJudge(1, held.writtenAt, held.owner, r.writtenAt, r.owner, holder, g_mySlot);
     if (why != zonerec::kZvTakeHolder) return 0;
+    if (areafresh::NotNewerTakes(ZoneOwnSavePending(r.worldId)) == 0)
+    {   /* T-1391 (review S3; F1680 M2: unsent OR sent and not echoed): this game's own pending save of the area is newer - an older copy never
+           replaces it unchecked; the save's own answer (its echo, or a refusal whose stale road runs the own-work check) or its push decides */
+        DebugLog("[ZONE] " + std::string(road) + " " + r.worldId + " NOT taken over this game's own pending save (" + N(r.writtenAt) + " <= " + N(held.writtenAt) + "; unsent, or sent and not echoed) - the save waits for its answer or its push (T-1391)");
+        return 0;
+    }
     ++g_zoneRecvHolderTaken;
     if (g_zoneRecvHolderTaken <= 20)
         DebugLog("[ZONE] " + std::string(road) + " " + r.worldId + " TAKEN although not newer (" + N(r.writtenAt) + " <= " + N(held.writtenAt)
@@ -5020,6 +5819,13 @@ int ZoneRecvTakesNotNewer(const Record& r, const Record& held, const char* road)
 // world now; a game played alone (role single) applies none.
 int g_lastKnownSlot = -1;
 std::string g_lastKnownSlotWorld, g_lastKnownSlotAddr; unsigned short g_lastKnownSlotPort = 0;
+/* T-1391 F1680 L1: WHO WROTE AN OWN SAVE - this game: the slot it holds now, else the slot it last held in THIS world (written at every
+   WELCOME with the world that named it; areafresh::OwnSideSlot). The own side of an own-work check is read with it. MAIN THREAD. */
+int ZoneOwnSideSlot()
+{
+    const int sameWorld = (g_lastKnownSlot >= 0 && townrefill::SameWorld(g_lastKnownSlotWorld, StoreWorldStamp()) == 1) ? 1 : 0;
+    return areafresh::OwnSideSlot(g_mySlot, g_lastKnownSlot, sameWorld);
+}
 // P6q (review-p6j MEDIUM-1) - THE LINK GENERATION, SO "AFTER THIS LINK'S WELCOME" IS A FACT AND NOT A GUESS.
 // g_linkGen is bumped on every link-UP edge in PumpLink; g_welcomeLinkGen records the generation whose WELCOME has
 // been processed. The two are equal only while this game holds a slot issued by the link it is currently on, which
@@ -5482,7 +6288,7 @@ int NoteQuitting(const char* where)
            review-p5w HIGH-1 asked for still holds - a kOutGone drained here is an unload and deletes nothing - and
            nothing outside these three lines is affected. g_tearingDown is not touched at all now. */
         g_quitDraining = true;
-        took = StoreOutboxDrain();   MirrorKeepFlush("quit");   /* T-1429 s2 fold 6 */   /* E33 (verify-p5v MEDIUM-2): the drain's own count, not a sample taken before it */
+        took = StoreOutboxDrain();   AreaStateRetryTick(1, "the quit");   MirrorKeepFlush("quit");   /* T-1429 s2 fold 6 */   /* E33 (verify-p5v MEDIUM-2): the drain's own count, not a sample taken before it */
         g_quitDraining = false;
         if (took > 0) g_outboxFlushedAtQuit += took;
         /* H053 (T-206): Send only QUEUES (net/enet_transport.cpp), so the drained records are pushed out here, on every
@@ -5808,6 +6614,7 @@ void DropEntryHere(const std::string& worldId, bool townLoss)
     /* B10 (audit C8): THE MIRROR COPY, which is the only file this game owns. The notebook deletes its
        own files on MSG_RECORD_GONE - it already does - and this game is not its second hand. */
     U8DeleteFile(MirrorFile(worldId).c_str());
+    if (IsZoneId(worldId)) AreaStateDrop(worldId);   /* T-1391 F1706: the area's state goes with its mirror file (an own pending save set aside first) */
     ++g_deletedHere;
 }
 /* T-985 C1: THE KEPT TABLE REFUSED WHOLE (a mirrorkeep::SeqJudge refusal). Every key taken from it whose record is still the table's
@@ -5820,7 +6627,8 @@ void MirrorKeepRefuseTable(int verdict, unsigned long long seqHigh)
     for (std::map<std::string, long long>::const_iterator k = g_mkKept.begin(); k != g_mkKept.end(); ++k)
     {
         const std::map<std::string, Record>::const_iterator it = g_records.find(k->first);
-        if (mirrorkeep::RefuseDrops(it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, k->second, g_mkSeen.count(k->first) != 0 ? 1 : 0) != 0) drop.push_back(k->first);
+        if (mirrorkeep::RefuseDropsOwn(it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, k->second, g_mkSeen.count(k->first) != 0 ? 1 : 0,
+                                       AreaStatePending(k->first)) != 0) drop.push_back(k->first);   /* T-1391 B1: an own unsent area save stays for the push */
     }
     for (size_t i = 0; i < drop.size(); ++i) { DropEntryHere(drop[i], false); g_homeOf.erase(drop[i]); }
     for (std::map<std::string, long long>::const_iterator k = g_mkKept.begin(); k != g_mkKept.end(); ++k)   /* a kept area record the refusal keeps (named by the snapshot) is served to area streaming now - the kept list is cleared below, so the snapshot's end cannot publish it */
@@ -5865,8 +6673,8 @@ void MirrorKeepSnapshotEnd(int whole, long long beginTotal, long long sentTotal,
     {
         if (g_mkBeside.count(k->first) != 0) { ++besideDiscarded; continue; }   /* a row still held beside was never confirmed: discarded below, the index-load record stays */
         const std::map<std::string, Record>::const_iterator it = g_records.find(k->first);
-        const int v = mirrorkeep::UnnamedDecide(whole, g_mkSeen.count(k->first) != 0 ? 1 : 0, it != g_records.end() ? 1 : 0,
-                                                it != g_records.end() ? it->second.writtenAt : 0LL, k->second);
+        const int v = mirrorkeep::UnnamedDecideOwn(whole, g_mkSeen.count(k->first) != 0 ? 1 : 0, it != g_records.end() ? 1 : 0,
+                                                   it != g_records.end() ? it->second.writtenAt : 0LL, k->second, AreaStatePending(k->first));   /* T-1391 F1653 item 4 */
         if (v == mirrorkeep::kUnnamedDrop) drop.push_back(k->first);
         else if (v == mirrorkeep::kUnnamedChangedHere) ++changed;
     }
@@ -5914,7 +6722,7 @@ void MirrorKeepStaleHoldEnd(int whole)   /* whole: StoreFeedMarkerApply's judgem
     for (std::map<std::string, long long>::const_iterator k = g_mkStaleHold.begin(); k != g_mkStaleHold.end(); ++k)
     {
         const std::map<std::string, Record>::const_iterator it = g_records.find(k->first);
-        const int v = mirrorkeep::UnnamedDecide(1, 0, it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, k->second);
+        const int v = mirrorkeep::UnnamedDecideOwn(1, 0, it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, k->second, AreaStatePending(k->first));   /* T-1391 F1653 item 4 */
         if (v == mirrorkeep::kUnnamedDrop) drop.push_back(k->first);
         else if (IsZoneId(k->first) && it != g_records.end()) ZoneSwapPublish(k->first);
     }
@@ -6179,7 +6987,7 @@ void StoreApplyRecordSeq(const std::vector<char>& payload)
         const int hasStamp = (GetU32S(payload, at + 8, &slo) && GetU32S(payload, at + 12, &shi)) ? 1 : 0;
         coop::KeptAreaEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));
         ArRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-1084 step 3: an area's recording (R5) waits for this confirm of each group it asked written */   /* KEPT: the world server holds this game's write of that record with this stamp - a lay written into it may settle */
-        if (piecerec::IsPieceRecId(worldId)) coop::PieceRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* this game's piece write sent with that stamp is on the world server's disk */
+        if (piecerec::IsPieceRecId(worldId)) coop::PieceRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo), ((unsigned long long)hi << 32) | lo);   /* T-1429: and the seq it was stored with */   /* this game's piece write sent with that stamp is on the world server's disk */
         if (coopgrec::IsGroundRecId(worldId)) coop::GroundRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-697 step 2 fold 2 (item 7): this game's ground write was taken - the area may be written again */
         if (shoprec::IsShopRecId(worldId)) coop::ShopRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* this game's shop record write sent with that stamp is stored: a cancel's mark in it is answered */
         if (coopbrec::IsBoxRecId(worldId)) coop::BoxRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* a shop counter's undo list in that write is stored */
@@ -6188,11 +6996,14 @@ void StoreApplyRecordSeq(const std::vector<char>& payload)
         if (cagerec::IsCageRecId(worldId)) coop::CageRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-860: this game's cage record write is stored */
         if (IsZoneId(worldId) && hasStamp != 0)
         {   /* T-1429 s2 fold 4 (review F1376): the world server stored this game's upload with this seq - the content base (b) */
+            ZoneUnechoedSettle(worldId, (long long)(((unsigned long long)shi << 32) | slo), 1);   /* T-1391 (F1626): this upload and every earlier one are settled */
+            (void)ZoneRepushAnswered(worldId, (long long)(((unsigned long long)shi << 32) | slo));   /* T-1391 F1631 item 4: the push's echo settles its stamp */
             const std::map<std::string, ZoneStamp>::const_iterator lf = g_zoneFromRecord.find(worldId);
             ZoneContentBaseOnEcho(worldId, (long long)(((unsigned long long)shi << 32) | slo), ((unsigned long long)hi << 32) | lo, lf != g_zoneFromRecord.end() ? lf->second.writtenAt : 0, lf != g_zoneFromRecord.end() ? 1 : 0);
             ZoneReplayAnswer(worldId, coopqueue::kZrAnsAccepted, (long long)(((unsigned long long)shi << 32) | slo), 1, 0, ((unsigned long long)hi << 32) | lo);   /* T-1391: the world server took this game's queued area save - its mirror copy is written now */
         }
         if (towntime::IsTownTimeId(worldId)) coop::TownTimeEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-4 fold 2: this game's town clock write is stored - the accepted record */
+        if (camplaid::IsCampLaidId(worldId)) coop::CampLaidEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-1429 design b: this game's camp mark write is stored - the accepted mark */
     }
     {
         std::map<std::string, Record>::iterator it = g_records.find(worldId);
@@ -6503,7 +7314,7 @@ int ZoneReplayAnswer(const std::string& zoneId, int ans, long long uploadStamp, 
             ZoneMirrorWriteOrPark(kZoneWriteReplay, r, e.payload, std::string());   /* B1: ZoneMirrorCommit records r.seq as the mirror's version (MirrorSeqOnWrite) */
         }
         else ++g_zrMirrorNewer;
-        if (v.writeMirror != 0 && g_zoneFromRecord.count(zoneId) != 0) { g_zoneContentBase[zoneId] = v.commitSeq; g_zoneContentBaseRoad[zoneId] = areafresh::kBaseRoadEcho; }   /* fold 3: follows the mirror write's skip (S4) - the base never moves back */   /* B1: loaded here - the live content is (a successor of) the stored copy, so its next save is made from this version */
+        if (v.writeMirror != 0 && g_zoneFromRecord.count(zoneId) != 0) { g_zoneContentBase[zoneId] = v.commitSeq; g_zoneContentBaseRoad[zoneId] = areafresh::kBaseRoadEcho; ZoneKeptBaseOnContentBase(zoneId); }   /* fold 3: follows the mirror write's skip (S4) - the base never moves back */   /* B1: loaded here - the live content is (a successor of) the stored copy, so its next save is made from this version */
     }
     else
     {
@@ -6515,9 +7326,116 @@ int ZoneReplayAnswer(const std::string& zoneId, int ans, long long uploadStamp, 
             : ans == coopqueue::kZrAnsLease ? std::string("the world server refused it (CANT recLease): another game holds that sector's creation lease, or this game was told its loaded copy is not the world's")
             : "the world server refused it (CANT recNotNewer): superseded - the world already holds a newer write of that sector (writtenAt " + N(storedStamp) + ")";
         DebugLog("[STORE] outage queue: the zone file queued for '" + zoneId + "' is DROPPED AND LOST - " + why + ". Your queued change to it was not written; this line is how you are told.");
+        /* T-1391 (F1653): no area save is journaled any more (one road); an entry left from an older build or earlier in this session is
+           drained here once. It carries no base copy, so its own work cannot be compared: an EMPTY mark held nothing; anything else is a
+           FAULT with its bytes set aside for recovery - never dropped silently */
+        if (zonerec::ZoneEmptyIs(e.payload) != 0) { ++g_zoneJournalDropEmpty; DebugLog("[ZONE] T-1391 journal drop of " + zoneId + " lost nothing: it was an EMPTY area mark (zoneJournalDropEmpty=" + N(g_zoneJournalDropEmpty) + ")"); }
+        else
+        {
+            ++g_zoneJournalDropSetAside;
+            const std::string aside = ZoneRecoverSetAside(zoneId, e.payload, "an outage-journal entry dropped");
+            ErrorLog("[ZONE] FAULT (T-1391): the outage-journal save of " + zoneId + " (" + N((long long)e.payload.size()) + " bytes, an older road) was dropped - " + why + "; its own work is NOT COMPARED (a journal entry keeps no base copy); "
+                     + (aside.empty() ? std::string("its bytes could NOT be set aside") : "its bytes are set aside as " + aside) + " (zoneJournalDropSetAside=" + N(g_zoneJournalDropSetAside) + ")");
+        }
     }
     (void)ZoneReplaySendDue("an answer");   /* the area's next queued save, if any */
     return v.act == coopqueue::kZrActCommit ? 2 : 1;
+}
+/* T-1391 F1848 (run T2752): THIS GAME UPLOADED ITS OWN AREA SAVE (stamp `at`) on a road that is not a save's own (the link-up push, the held
+   push at an area map, an own-stored resend). When the copy loaded here IS that save - noted as loaded from a record, same stamp, a known
+   seq - the note becomes this game's own write (seq 0), as the outage replay does (kZoneWriteReplay): the world server stores the upload
+   under a new seq and echoes it, and the old seq would read that echo as a newer copy and refuse the area's next save (ZoneLoadedCopyOlder).
+   The decision is zonerec::ZoneUploadMakesLoadedOwn. MAIN THREAD; the caller has drained the load facts (ZoneFromRecordDrain) - not drained
+   here, so no load fact lands inside a caller's walk of g_records. */
+long long g_zoneUploadOwnNoted = 0;
+void ZoneUploadLoadedOwnNote(const std::string& id, long long at, const char* road)
+{
+    if (g_tearingDown || g_quitDraining) return;   /* as the save's own mark: nothing is loaded during a teardown */
+    const std::map<std::string, ZoneStamp>::iterator fr = g_zoneFromRecord.find(id);
+    const int has = fr != g_zoneFromRecord.end() ? 1 : 0;
+    if (zonerec::ZoneUploadMakesLoadedOwn(has, has != 0 ? fr->second.writtenAt : 0, has != 0 ? fr->second.seq : 0ULL, at) == 0) return;
+    const unsigned long long was = fr->second.seq;
+    fr->second.seq = 0;
+    if (++g_zoneUploadOwnNoted <= 32)
+        DebugLog("[ZONE] LOADED OWN " + id + " - " + std::string(road) + " sent this game's own save (writtenAt " + N(at) + "), the very copy loaded here (noted as loaded from seq "
+                 + N((long long)was) + "): the note is now this game's own write (seq 0), so the world's echo of it is not taken for a newer copy (zoneUploadOwnNoted=" + N(g_zoneUploadOwnNoted) + ", first 32 logged)");
+}
+/* T-1391 (F1626 B): a refusal of an area upload that names THIS game's own stored copy (areafresh::OwnStoredDecide) - the echo of a save
+   whose own echo was lost (a link drop), or this game's earlier upload the content here builds on: its version is learned (the mirror's,
+   and the loaded content's) and the refused newest copy is sent again on it. 1 = handled (no hold, no ordinary refusal line); 0 = not. */
+/* F1631 item 3: the verdict (pure: areafresh::OwnStoredDecide on this game's state) apart from what it does (ZoneOwnStoredApply) */
+int ZoneOwnStoredVerdict(const std::string& zid, int ans, long long uploadStamp, long long storedStamp, unsigned long long storedSeq, int* resend)
+{
+    const std::map<std::string, Record>::const_iterator rr = g_records.find(zid);
+    return areafresh::OwnStoredDecide(ans, uploadStamp, storedStamp, storedSeq, ZoneUnechoedHas(zid, storedStamp), rr != g_records.end() ? (long long)rr->second.writtenAt : 0, resend);
+}
+/* kOwnStoredNo: the refused upload is not stored - it leaves the unechoed list. Echo / Rebase: the stored copy's version is learned through
+   the echo's own step (ZoneContentBaseOnEcho - the content base is set in no new place; a REBASE is the echo of the earlier upload the
+   content here builds on, areafresh::OwnStoredLoadedStamp) and the refused newest copy is sent again on it */
+void ZoneOwnStoredApply(const std::string& zid, int v, int resend, int ans, long long uploadStamp, long long storedStamp, unsigned long long storedSeq)
+{
+    if (v == areafresh::kOwnStoredNo) { ZoneUnechoedSettle(zid, uploadStamp, 0); return; }   /* that upload is not stored */
+    ZoneFromRecordDrain();   /* T-1391 F1848: a reader of the loaded-from note drains first */
+    const std::map<std::string, Record>::const_iterator rr = g_records.find(zid);
+    const long long rowAt = rr != g_records.end() ? (long long)rr->second.writtenAt : 0;
+    ZoneUnechoedSettle(zid, storedStamp, 1);
+    const std::map<std::string, ZoneStamp>::const_iterator lf = g_zoneFromRecord.find(zid);
+    const unsigned long long before = ZoneBaseOf(zid);
+    if (v == areafresh::kOwnStoredEcho) ++g_zoneOwnStoredEcho; else ++g_zoneOwnStoredRebase;
+    ZoneContentBaseOnEcho(zid, storedStamp, storedSeq, areafresh::OwnStoredLoadedStamp(v, lf != g_zoneFromRecord.end() ? 1 : 0, lf != g_zoneFromRecord.end() ? lf->second.writtenAt : 0, storedStamp), lf != g_zoneFromRecord.end() ? 1 : 0);
+    bool sent = false;
+    if (resend != 0 && rr != g_records.end())
+    {
+        std::vector<char> b;
+        if (!rr->second.file.empty() && ReadFileBytes(rr->second.file, &b) && !b.empty())
+            sent = SendRecordAny(zid, "", "", 0.0f, 0.0f, 0.0f, rr->second.writtenAt, rr->second.owner, b, 0u, storedSeq);
+        if (sent) { ++g_zoneOwnStoredResent; ZoneUnechoedAdd(zid, rr->second.writtenAt); g_zoneSentBase[zid] = storedSeq; ZoneOwnRowBaseSet(zid, rr->second.writtenAt, storedSeq); coop::KeptAreaSent(zid, 1, rr->second.writtenAt); ZoneUploadLoadedOwnNote(zid, rr->second.writtenAt, "the own-stored resend"); }   /* F1848 */
+    }
+    DebugLog("[ZONE] OWN STORED " + zid + " " + std::string(v == areafresh::kOwnStoredEcho ? "ECHO" : "REBASE") + " - the world server's answer to this game's upload (stamp " + N(uploadStamp) + ", CANT "
+             + std::string(ans == 1 ? "staleBase" : "recNotNewer") + ") names " + std::string(v == areafresh::kOwnStoredEcho ? "that very copy" : "this game's earlier upload") + " as stored (writtenAt " + N(storedStamp) + ", seq " + N((long long)storedSeq)
+             + "): its version is learned (content base " + N((long long)before) + " -> " + N((long long)ZoneBaseOf(zid)) + "); the area's later saves are not held"
+             + (resend != 0 ? (sent ? "; this game's newest copy (writtenAt " + N(rowAt) + ") is SENT AGAIN on that version" : std::string("; this game's newest copy could NOT be sent again now - its next save goes on that version")) : std::string())
+             + " (ownStoredEcho=" + N(g_zoneOwnStoredEcho) + ", ownStoredRebase=" + N(g_zoneOwnStoredRebase) + ", ownStoredResent=" + N(g_zoneOwnStoredResent) + ")");
+}
+/* F1631 item 3: the area map's holder of an area record's area (-1: no area, or not known) */
+int ZoneHolderSlotOf(const std::string& id)
+{
+    int zx = 0, zy = 0, slot = -1;
+    const int parsed = zonerec::ZoneRecIdParse(id, &zx, &zy) != 0 ? 1 : 0;
+    if (parsed != 0) { coop::Sector sec; sec.x = zx; sec.y = zy; slot = coop::AreaHolderSlotTS(sec); }
+    return areafresh::HolderSlotOrNone(parsed, slot);
+}
+/* the link-up push's verdict for one area row (areafresh::RepushAreaDecide on this game's state) */
+int ZonePushVerdict(const std::string& id, const Record& row)
+{
+    const std::map<std::string, ZoneMirrorBase>::const_iterator mb = g_zoneMirrorBase.find(id);
+    return areafresh::RepushAreaDecide(mb != g_zoneMirrorBase.end() ? 1 : 0, mb != g_zoneMirrorBase.end() ? mb->second.from : (int)areafresh::kMirrorFromRecv,
+                                       mb != g_zoneMirrorBase.end() ? mb->second.seq : 0ULL, mb != g_zoneMirrorBase.end() ? mb->second.writtenAt : 0, row.writtenAt, ZoneHolderSlotOf(id), g_mySlot);
+}
+/* an own area save pushed: unechoed until its echo, its stamp the push's (any answer to it settles it), its base the one sent */
+void ZonePushSentNote(const std::string& id, long long at, unsigned long long pushBase, const char* road = "the link-up push")
+{
+    ++g_zonePushOwn; ZoneUnechoedAdd(id, at); g_zoneRepushStamp[id] = at;
+    if (pushBase != ~0ULL) g_zoneSentBase[id] = pushBase;
+    ZoneUploadLoadedOwnNote(id, at, road);   /* T-1391 F1848: the copy loaded here may be this very save - its echo is this game's own write */
+}
+/* T-1391 F1635 item 3: a push's failed read of an area file - counted per area; only its first failure is logged (areafresh::PushReadFailLineDue) */
+void ZonePushReadFailNote(const std::string& id, size_t got, const char* road)
+{
+    ++g_zonePushReadFailed;
+    const long long n = ++g_zonePushReadFailBy[id];
+    if (areafresh::PushReadFailLineDue(n, g_zonePushReadFailAreasLogged) == 0) return;
+    ++g_zonePushReadFailAreasLogged;
+    DebugLog("[ZONE] PUSH " + id + " NOT sent" + std::string(road) + " - its file could not be read (" + N((long long)got) + " bytes); it keeps waiting for the next area map - its later failed reads are counted, not logged (pushReadFailed="
+             + N(g_zonePushReadFailed) + ", areas logged " + N(g_zonePushReadFailAreasLogged) + ", first 32)");
+}
+/* the count of an area's failed reads, said once (and forgotten) when its save is sent or its wait ends; empty when none failed */
+std::string ZonePushReadFailTake(const std::string& id)
+{
+    const std::map<std::string, long long>::iterator f = g_zonePushReadFailBy.find(id);
+    if (f == g_zonePushReadFailBy.end()) return std::string();
+    const long long n = f->second; g_zonePushReadFailBy.erase(f);
+    return " after " + N(n) + " failed read(s) of its file";
 }
 void StoreRepushUpTick()
 {
@@ -6548,18 +7466,44 @@ void StoreRepushUpTick()
     }
     long long n = 0, skipped = 0, bytes = 0;
     std::vector<std::string> repushRel;   /* T-1084 step 5: re-pushed squad records this game does not run - a release follows them */
+    ZoneFromRecordDrain();   /* T-1391 F1848: load facts land before the walk - ZonePushSentNote reads the loaded-from note (and never drains inside the walk) */
     for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it)
     {
-        if (g_welcomeGotIds.count(it->first) != 0) continue;   /* the notebook already has this one */
-        if (IsZoneId(it->first) && !g_zoneOn) { ++skipped; continue; }   /* review-p3h H1, as the deleted arm did */
+        const bool zoneRow = IsZoneId(it->first);
+        if (!zoneRow && g_welcomeGotIds.count(it->first) != 0) continue;   /* the notebook already has this one */
+        if (zoneRow && !g_zoneOn) { ++skipped; continue; }   /* review-p3h H1, as the deleted arm did */
+        unsigned long long pushBase = ~0ULL;
+        if (zoneRow)
+        {   /* T-1391 (F1626 A): only this game's own save the world server has not confirmed goes up - carried down or not (the answer
+               confirms its version) - never a copy it received or loaded, never while another game holds the area */
+            const int holder = ZoneHolderSlotOf(it->first);
+            const int pv = ZonePushVerdict(it->first, it->second);
+            unsigned long long ob = 0ULL;
+            const int obHere = ZoneOwnBaseHere(it->first, it->second.writtenAt, &ob);   /* F1631 item 1: the base kept for THIS copy (survives a quit in the kept table) */
+            if (pv == areafresh::kPushOwnUnsent) pushBase = areafresh::PushBaseOf(obHere, ob, ZoneBaseOf(it->first));
+            if (pv == areafresh::kPushSkipHeldElsewhere) g_zonePushHeldWait.insert(it->first); else g_zonePushHeldWait.erase(it->first);   /* F1631 item 5: it waits for the area map that frees the area */
+            if (pv != areafresh::kPushSkipNotOwn && ++g_zonePushLines <= 64)
+                DebugLog("[ZONE] PUSH " + it->first + " " + areafresh::RepushAreaName(pv) + " - writtenAt " + N(it->second.writtenAt)
+                         + (pv == areafresh::kPushOwnUnsent ? " base=" + N((long long)pushBase) + (obHere != 0 ? std::string(" (the base it was made from)") : std::string(" (the content base)")) : std::string())
+                         + ", holder " + N((long long)holder) + ", carried down " + std::string(g_welcomeGotIds.count(it->first) != 0 ? "yes" : "no") + " (zonePushLines=" + N(g_zonePushLines) + ", first 64 logged)");
+            if (pv != areafresh::kPushOwnUnsent) { if (pv >= 0 && pv < 4) ++g_zonePushSkip[pv]; continue; }
+        }
         if (coopbrec::IsBoxRecId(it->first) || piecerec::IsPieceRecId(it->first) || shoprec::IsShopRecId(it->first) || doorrec::IsDoorRecId(it->first) || bldgrec::IsBldgRecId(it->first) || cagerec::IsCageRecId(it->first) || towntime::IsTownTimeId(it->first)) { ++skipped; continue; }   /* a box, piece, shop or door record is written only by its writer (items.cpp, build.cpp, doors.cpp), never re-sent from here */
+        if (camplaid::IsCampLaidId(it->first)) { ++skipped; continue; }   /* T-1429 design b: a camp mark is written only by its area's holder (camp.cpp) */
         SwRefusedForget(it->first);   /* T-1084 step 5: the world server does not have this record (its WELCOME did not list it), so the register that refused it is gone too */
         if (!SwMaySend(it->first, "re-push")) continue;   /* T-1084 step 5: a squad record is re-pushed only by the game that wrote it (or when nobody is known to have) */
         std::vector<char> b;
-        if (!it->second.file.empty()) ReadFileBytes(it->second.file, &b);   /* a position-only note is still worth sending */
+        const bool readOk = !it->second.file.empty() && ReadFileBytes(it->second.file, &b);   /* a position-only note is still worth sending */
+        if (zoneRow && areafresh::AreaPushBytesOk(readOk ? 1 : 0, b.size()) == 0)
+        {   /* T-1391 F1633 item 3: never an empty area record - the save waits for the next area map */
+            g_zonePushHeldWait.insert(it->first); ZonePushReadFailNote(it->first, b.size(), "");   /* F1635 item 3: the first failure logged, the rest counted */
+            continue;
+        }
         if (!SendRecordAny(it->second.worldId, it->second.squadSid, it->second.factionName,
-                           it->second.x, it->second.y, it->second.z, it->second.writtenAt, it->second.owner, b)) continue;
+                           it->second.x, it->second.y, it->second.z, it->second.writtenAt, it->second.owner, b, 0u, pushBase)) continue;
         ++n; bytes += (long long)b.size();
+        if (zoneRow) ZonePushSentNote(it->first, it->second.writtenAt, pushBase);   /* T-1391 (F1626) */
+        if (zoneRow) { const std::string rf = ZonePushReadFailTake(it->first); if (!rf.empty()) DebugLog("[ZONE] PUSH " + it->first + " SENT at the link-up" + rf); }   /* F1635 item 3 */
         if (IsZoneId(it->first)) coop::KeptAreaStampSent(it->first, it->second.writtenAt);   /* KEPT: the re-pushed write's stamp, so its echo is never taken for a later lay's write */
         if (SwRepushReleaseWanted(it->first, it->second)) repushRel.push_back(it->first);   /* T-1084 step 5: the re-push registers this game as its writer, but this game does not run it */
     }
@@ -6569,6 +7513,51 @@ void StoreRepushUpTick()
     DebugLog("[STORE] record feed: the notebook's snapshot is applied - " + N(g_welcomePushDownReceived)
              + " record(s) came DOWN in its pages (T-313) and this game has pushed " + N(n) + " of its own " + N((long long)g_records.size())
              + " UP (" + N(bytes) + " payload bytes, " + N(skipped) + " zone record(s) skipped with zonestate off)");
+    DebugLog("[ZONE] PUSH at the link-up: " + N(g_zonePushOwn) + " own unconfirmed area save(s) pushed; not pushed - received or loaded copies " + N(g_zonePushSkip[areafresh::kPushSkipNotOwn])
+             + ", already stored " + N(g_zonePushSkip[areafresh::kPushSkipConfirmed]) + ", held by another game " + N(g_zonePushSkip[areafresh::kPushSkipHeldElsewhere])
+             + " (waiting for the area map that frees the area: " + N((long long)g_zonePushHeldWait.size()) + ") (T-1391 F1626 / F1631; totals this session)");
+}
+/* T-1391 F1631 item 5: AN OWN UNSENT AREA SAVE WAITING WHILE ANOTHER GAME HOLDS THE AREA. The world server takes an area record only from
+   the area's holder or while nobody holds it (zonerec::ZoneJudgeWrite; a non-holder's is refused recNotHolder and dropped there), so no
+   road carries a non-holder's save to the holder; it waits here and, at each area map (the event that settles who holds an area), is
+   decided again (areafresh::HeldPushStep): sent once no other game holds the area, judged by the base it was made from; kept while one
+   does; dropped from the wait once the row is no longer this game's own unconfirmed save. MAIN THREAD (the AREAMAP handler). */
+void ZonePushHeldRetry()
+{
+    const std::vector<std::string> ids(g_zonePushHeldWait.begin(), g_zonePushHeldWait.end());
+    ZoneFromRecordDrain();   /* T-1391 F1848: load facts land before ZonePushSentNote reads the loaded-from note */
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        const std::string& id = ids[i];
+        const std::map<std::string, Record>::const_iterator it = g_records.find(id);
+        const int pv = it != g_records.end() ? ZonePushVerdict(id, it->second) : (int)areafresh::kPushSkipNotOwn;
+        const int step = areafresh::HeldPushStep(pv);
+        if (step == areafresh::kHeldPushKeep) continue;
+        g_zonePushHeldWait.erase(id);
+        if (step == areafresh::kHeldPushDrop)
+        {
+            ++g_zonePushHeldDropped;
+            DebugLog("[ZONE] PUSH WAIT ended " + id + " - " + areafresh::RepushAreaName(pv) + ZonePushReadFailTake(id) + " (pushHeldDropped=" + N(g_zonePushHeldDropped) + ")");
+            continue;
+        }
+        const Record row = it->second;
+        unsigned long long ob = 0ULL;
+        const int obHere = ZoneOwnBaseHere(id, row.writtenAt, &ob);
+        const unsigned long long pushBase = areafresh::PushBaseOf(obHere, ob, ZoneBaseOf(id));
+        std::vector<char> b;
+        const bool readOk = !row.file.empty() && ReadFileBytes(row.file, &b);
+        if (areafresh::AreaPushBytesOk(readOk ? 1 : 0, b.size()) == 0)
+        {   /* T-1391 F1633 item 3: never an empty area record - it keeps waiting */
+            g_zonePushHeldWait.insert(id); ZonePushReadFailNote(id, b.size(), " at the area map");   /* F1635 item 3: the first failure logged, the rest counted */
+            continue;
+        }
+        if (!SendRecordAny(row.worldId, row.squadSid, row.factionName, row.x, row.y, row.z, row.writtenAt, row.owner, b, 0u, pushBase)) { g_zonePushHeldWait.insert(id); continue; }   /* the next area map tries again */
+        ZonePushSentNote(id, row.writtenAt, pushBase, "the held push at an area map");
+        coop::KeptAreaStampSent(id, row.writtenAt);
+        ++g_zonePushHeldSent;
+        DebugLog("[ZONE] PUSH " + id + " SENT at the area map - no other game holds the area now; this game's own save (writtenAt " + N(row.writtenAt) + ") goes with base=" + N((long long)pushBase)
+                 + ZonePushReadFailTake(id) + " (pushHeldSent=" + N(g_zonePushHeldSent) + ", still waiting " + N((long long)g_zonePushHeldWait.size()) + ")");
+    }
 }
 bool SendOne(const Record& r)
 {
@@ -7249,7 +8238,7 @@ void SwRefusedForget(const std::string& id) { if (g_swRefused.count(id) == 0) re
 bool SwSquadId(const std::string& id)
 {
     std::string fac; unsigned n = 0;
-    return !IsZoneId(id) && !coopgrec::IsGroundRecId(id) && !coopbrec::IsBoxRecId(id) && !piecerec::IsPieceRecId(id) && !shoprec::IsShopRecId(id) && !doorrec::IsDoorRecId(id) && !cagerec::IsCageRecId(id) && !bldgrec::IsBldgRecId(id) && !towntime::IsTownTimeId(id) && SplitGroupId(id, &fac, &n);
+    return !camplaid::IsCampLaidId(id) && !IsZoneId(id) && !coopgrec::IsGroundRecId(id) && !coopbrec::IsBoxRecId(id) && !piecerec::IsPieceRecId(id) && !shoprec::IsShopRecId(id) && !doorrec::IsDoorRecId(id) && !cagerec::IsCageRecId(id) && !bldgrec::IsBldgRecId(id) && !towntime::IsTownTimeId(id) && SplitGroupId(id, &fac, &n);
 }
 void SwLine(const std::string& s) { if (g_swLines < 60) { ++g_swLines; DebugLog("[STORE] SQUAD-WRITER " + s + " (the first 60 lines; squadWriter[...] on the REPORT line)"); } }
 /* THE WRITER NOTES [t1084i-game] (squadwriterreg.h): the squads ANOTHER live game runs now, as the world server last said (RUNS / STOPPED
@@ -12268,6 +13257,9 @@ void* RaidLendBuildImpl(const raidsq::LendMsg& m, const std::string& file, int* 
     ::GameData* squadGd = coop::GameWorldPtr()->gamedata.getData(m.squad);
     if (!Plaus(f) || !Plaus(squadGd)) { *why = 2; return 0; }
     if (FindSleepingPlatoonImpl(f, m.id) != 0 || FindActivePlatoonImpl(f, m.id) != 0) { *why = 3; return 0; }
+    /* T-1474 (H-T1474-idclash, owner 1872 a): the lender's RAW id is written below ("platoon stringID") - a departure from per-game id
+       spaces, kept, but refused (the same step 3) when a squad of ANY faction here holds it: the save keeps one squad file per id */
+    if (SquadIdHeldHere(m.id, 0) == 1) { *why = 3; return 0; }
     GameDataContainer* c = g_lendSpare;   /* engine-owned after addUnloadedSquad */
     g_lendSpare = 0;
     if (c == 0)
@@ -15291,6 +16283,9 @@ bool ZoneWriteIsMine(const std::string& zoneId)
     if (rung >= 0 && rung < coopwriter::kRungCount)     ++g_zoneWrRung[rung];
     if (spans & coopwriter::kSpanPeerUnknown) ++g_zoneWrSpanPeerUnknown;
     if (spans & coopwriter::kSpanGracePass)   ++g_zoneWrSpanGracePass;
+    if (path == coopwriter::kZonePathLinkDown && ++g_zoneWrLinkDownLines <= 32)
+        DebugLog("[ZONE] " + zoneId + " written with the link down (T-1391 one road, F1653): this game's own save, kept and not sent - not journaled; the link-up push, the held wait and the stale road carry it (zoneWr linkDown="
+                 + N(g_zoneWrPath[coopwriter::kZonePathLinkDown]) + ", first 32 logged)");
     if (v == coopwriter::kWrRefuse)
     {
         /* decision 44, said out loud rather than counted silently: past the grace NOTHING is written, and a
@@ -15427,6 +16422,228 @@ long long g_zoneWriteWaitedForLoad = 0, g_zoneWriteWaitDropped = 0; int g_zoneWa
    preWriteFailed, not current for this load; the RECV, the replay and the parked retry ignore it). Counted in zoneMirrorUnreadable=.
    The save's own check (ZoneSaveApply) and the replay's (QueueSendEntry) stay: they stop the SEND, which this does not. MAIN THREAD. */
 long long g_zoneMirrorUnreadable = 0;
+long long g_zoneRecvKeptOwn = 0;   /* T-1391 F1706: received copies not newer than an own pending save, not written over it */
+/* T-1391 (F1653 item 3): THE OWN-WORK CHECK, run before an own area save is dropped (refused stale naming another game's copy, or replaced
+   by a newer copy received - F1677: made with the link up or down). `own`: the save's bytes (0 = could not be read); compared with the
+   copy it was made from - F1677: the area's KEPT BASE, the world copy this game loaded (ZoneCheckBaseGet: its bytes in the area's state, F1706; the EMPTY area when
+   no world copy was loaded) - zonediff::OwnWorkOfAll; each own thing is CARRIED when its own record
+   reached the world (held here at or after the base's stamp) or waits on its own road (zonediff::OwnCarried). Own work no record carries,
+   or a check that cannot be made: a FAULT line naming the area, the kinds and keys and the copy that won, with the save's bytes set aside
+   in the world folder's recover\. No player-facing text. Returns zonediff kOc*. MAIN THREAD. */
+/* F1664 M3: asideOut - the set-aside file's path ("" none); asideSkip - the hold already keeps this area's file and this save never replaces it */
+int ZoneOwnWorkCheck(const std::string& zoneId, const std::vector<char>* own, const std::string& won, const char* road, std::string* asideOut = 0, int asideSkip = 0)
+{
+    std::vector<char> base; long long baseAt = 0; int baseWriter = -1; std::string baseWhy;
+    const int baseRoad = ZoneCheckBaseGet(zoneId, &base, &baseAt, &baseWriter, &baseWhy);   /* F1677: the kept base, never the in-memory loaded copy */
+    const bool baseOk = baseRoad != areafresh::kCbNotKnown;
+    zonediff::OwnWork w; std::string why;
+    int compared = 0;
+    const int ownSlot = ZoneOwnSideSlot();   /* T-1391 F1680 L1: this game's real identity, not g_mySlot (-1 while the link is down) */
+    zonediff::Side a, b;   /* F1754: the save's side is read again below (a town link's words and host, a town note's version) */
+    try
+    {
+        if (own == 0) why = "the save's file could not be read";
+        else if (!baseOk) why = "no base copy: " + baseWhy;
+        else if (!zonediff::ReadSide(own->empty() ? 0 : (const unsigned char*)&(*own)[0], own->size(), ownSlot, &a, &why)) why = "the save cannot be read: " + why;
+        else if (!zonediff::ReadSide((const unsigned char*)&base[0], base.size(), baseWriter, &b, &why)) why = "the base copy cannot be read: " + why;
+        else { zonediff::OwnWorkOfAll(a, b, &w); compared = 1; }
+    }
+    catch (...) { why = "the comparison ran out of memory"; compared = 0; }
+    int sx = -1, sy = -1; (void)zonerec::ZoneRecIdParse(zoneId, &sx, &sy);
+    std::string carried, lost, lostKinds; int anyLost = 0, nCarried = 0, nLost = 0;
+    for (int k = 0; k < zonediff::kKinds; ++k)
+    {
+        const int rd = zonediff::OwnKindRoad(k);
+        bool kindLost = false;
+        for (size_t i = 0; i < w.keys[k].size(); ++i)
+        {
+            const std::string key = zonediff::BareKey(w.keys[k][i]);
+            /* F1754: a town link is judged by its piece record's town part - a piece inside a building by its host's (its town is its host's) */
+            std::string recKey = key;
+            if (rd == zonediff::kRoadTown)
+            {
+                const zonediff::Things::const_iterator pc = a.pieces.find(w.keys[k][i]);
+                const zonediff::Fields::const_iterator hf = pc == a.pieces.end() ? zonediff::Fields::const_iterator() : pc->second.find("host");
+                if (pc != a.pieces.end() && hf != pc->second.end() && hf->second != "not found") recKey = zonediff::BareKey(hf->second);
+            }
+            if (rd == zonediff::kRoadPiece || rd == zonediff::kRoadTown || rd == zonediff::kRoadDoor)
+            {   /* T-1391 fix A2 fold 1 (F1807): a piece's item is this game's own work only when the piece record held here does not name
+                   another player (coopowner::ScanMineOf, as the zone scan asks) - another player's piece changed in this game's save (the
+                   engine's town rule re-owned it, T2748 A:31928) is not this game's to carry */
+                int prm = 0;
+                const int pown = coopowner::PieceOwnerOfHeld(coop::BuildPieceRecordOwner(piecerec::MakePieceRecId(recKey), &prm), prm);
+                if (coopowner::ScanMineOf(1, pown, ownSlot) == coopowner::kSmOtherRecord)
+                {
+                    ++nCarried;
+                    if (nCarried <= 6) carried += (carried.empty() ? "" : ", ") + std::string(zonediff::KindName(k)) + " " + zonediff::Clean(key) + " (not this game's own: its piece record names player " + N((long long)pown) + ")";
+                    continue;
+                }
+            }
+            if (rd == zonediff::kRoadTownVer)
+            {   /* F1754: a town note - the placed town's TOWN_VER record, judged by its version (no stamp) */
+                const zonediff::Things::const_iterator nt = a.note.find(w.keys[k][i]);
+                const zonediff::Fields::const_iterator nv = nt == a.note.end() ? zonediff::Fields::const_iterator() : nt->second.find("value");
+                const std::string noteVal = (nt != a.note.end() && nv != nt->second.end()) ? nv->second : std::string();
+                int tvHeld = 0, tvWaits = 0; std::string tvHeldVer, tvWaitVer;
+                coop::TownVerRecordOf(key, &tvHeld, &tvHeldVer, &tvWaits, &tvWaitVer);
+                const int nc = zonediff::OwnNoteCarried(noteVal, tvHeld, tvHeldVer, tvWaits, tvWaitVer);
+                const std::string nItem = std::string(zonediff::KindName(k)) + " " + zonediff::Clean(key) + " " + zonediff::Clean(noteVal);
+                const std::string nRec = tvWaits != 0 ? "this game's own write '" + zonediff::Clean(tvWaitVer) + "' waits on its road" : tvHeld != 0 ? "held '" + zonediff::Clean(tvHeldVer) + "'" : std::string("none held, none waiting") + (nc != 0 ? " - no record means the normal town" : "");
+                if (nc != 0) { ++nCarried; if (nCarried <= 6) carried += (carried.empty() ? "" : ", ") + nItem + " (" + zonediff::RoadName(rd) + " " + nRec + ")"; }
+                else { ++nLost; anyLost = 1; kindLost = true; if (nLost <= 8) lost += (lost.empty() ? "" : ", ") + nItem + " (" + zonediff::RoadName(rd) + " " + nRec + (tvHeld != 0 || tvWaits != 0 ? std::string(" - another version") : std::string()) + ")"; }
+                continue;
+            }
+            if (rd == zonediff::kRoadDoor)
+            {   /* T-1391 fix attempt 2 (F1774 / F1775): each door of the item by the DOOR's own key (doors.cpp DoorsKeysOfPiece - the area file
+                   files the doors under the building's key), judged by what its record contains: this game's own write waiting in the outage
+                   journal (the newest), else the record held (zonediff::DoorContentMatch) */
+                const zonediff::Things::const_iterator dt = a.doors.find(w.keys[k][i]);
+                std::vector<std::string> dkeys;
+                const int keysKnown = coop::DoorsKeysOfPiece(key, &dkeys);
+                const std::vector<int> idx = (dt == a.doors.end()) ? std::vector<int>() : zonediff::DoorIndexesOf(dt->second);
+                int allOk = idx.empty() ? 0 : 1;
+                std::string dWhy;
+                for (size_t q = 0; q < idx.size(); ++q)
+                {
+                    const int di = idx[q];
+                    const std::string dk = (keysKnown != 0 && di >= 0 && (size_t)di < dkeys.size()) ? dkeys[(size_t)di] : std::string();
+                    const std::string did = dk.empty() ? std::string() : doorrec::MakeDoorRecId(dk);
+                    int have = 0, dst = 0, dlw = 0;
+                    const char* src = "no";
+                    if (!did.empty())
+                    {
+                        for (size_t j = 0; j < g_queue.size(); ++j)
+                            if (g_queue[j].family == coopqueue::kQueueFamilyDoor && g_queue[j].key == did && zonediff::DoorQueuedContent(g_queue[j].payload, &dst, &dlw) != 0) { have = 1; src = "its queued"; }
+                        if (have == 0 && coop::DoorsRecContentHere(dk, &dst, &dlw) != 0) { have = 1; src = "its held"; }
+                    }
+                    const int dm = zonediff::DoorContentMatch(dk.empty() ? 0 : 1, have, dst, dlw, dt->second, di);
+                    if (dm != zonediff::kDmSame) allOk = 0;
+                    dWhy += std::string(dWhy.empty() ? "" : "; ") + "door" + N((long long)di) + " " + (did.empty() ? std::string("-") : did) + " " + zonediff::DoorMatchWhy(dm, src);
+                }
+                if (idx.empty()) dWhy = "no door fields read";
+                const std::string dItem = std::string(zonediff::KindName(k)) + " " + zonediff::Clean(key) + " (door record by the door's key: " + dWhy + ")";
+                if (allOk != 0) { ++nCarried; if (nCarried <= 6) carried += (carried.empty() ? "" : ", ") + dItem; }
+                else { ++nLost; anyLost = 1; kindLost = true; if (nLost <= 8) lost += (lost.empty() ? "" : ", ") + dItem; }
+                continue;
+            }
+            std::vector<std::string> ids;
+            if (rd == zonediff::kRoadTown) ids.push_back(piecerec::MakePieceRecId(recKey));
+            if (rd == zonediff::kRoadPiece) ids.push_back(piecerec::MakePieceRecId(key));
+            if (rd == zonediff::kRoadBox) { ids.push_back(coopbrec::MakeBoxRecIdFor(key, 1)); ids.push_back(coopbrec::MakeBoxRecIdFor(key, 0)); }
+            if (rd == zonediff::kRoadGround) ids.push_back(coopgrec::GroundRecId(sx, sy));
+            int held = 0, waits = 0; long long at = 0; std::string which;
+            for (size_t q = 0; q < ids.size(); ++q)
+            {
+                if (ids[q].empty()) continue;
+                const std::map<std::string, Record>::const_iterator hr = g_records.find(ids[q]);
+                if (hr != g_records.end() && (held == 0 || (long long)hr->second.writtenAt > at)) { held = 1; at = (long long)hr->second.writtenAt; which = ids[q]; }
+                if ((rd == zonediff::kRoadPiece || rd == zonediff::kRoadTown) && coop::PieceRecWaitsHere(ids[q]) != 0) { waits = 1; which = ids[q]; }
+                for (size_t j = 0; j < g_queue.size() && waits == 0; ++j) if (g_queue[j].key == ids[q]) { waits = 1; which = ids[q]; }
+            }
+            int c = zonediff::OwnCarried(rd, held, at, baseAt, waits);
+            std::string townWhy;   /* F1754: the town link's words - what the record carries against what the save has */
+            if (rd == zonediff::kRoadTown)
+            {
+                piecerec::PieceTownFact recT, saveT; std::string saveWhy;
+                const int recRead = (held != 0 && !which.empty()) ? coop::PieceRecTownHere(which, &recT) : 0;
+                const std::map<std::string, zonediff::TownWords>::const_iterator tw = a.townWords.find(w.keys[k][i]);
+                const int saveRead = tw != a.townWords.end() ? coop::SavedTownFactHere(tw->second.h, &saveT, &saveWhy) : 0;
+                if (tw == a.townWords.end()) saveWhy = "the save's town words were not kept";
+                int match = zonediff::TownLinkMatch(recRead, recT, saveRead, saveT);
+                if (waits != 0)
+                {   /* T-1391 fix attempt 2 (F1774): an owed write is judged by the town it WILL carry (its capture), not counted because it waits */
+                    piecerec::PieceTownFact owT; int owedT = 0; int owW[5] = { 0, 0, 0, 0, 0 };
+                    coop::PieceRecTownOwedHere(which, &owT, &owedT, owW);
+                    match = zonediff::TownLinkMatchOwedWords(owedT, owW, tw != a.townWords.end() ? tw->second.h : 0, owT, saveRead, saveT);   /* review fold MAJOR 1 */
+                    recT = owT;
+                }
+                c = zonediff::OwnTownCarried(held, at, baseAt, waits, match);
+                if (held != 0 || waits != 0) townWhy = std::string("; ") + (waits != 0 ? "its owed write " : "") + zonediff::TownLinkWhy(match, recT, saveRead, saveT, saveWhy);
+                if (recKey != key) townWhy += "; its host's record";
+            }
+            const std::string item = std::string(zonediff::KindName(k)) + " " + zonediff::Clean(key);
+            if (c != 0) { ++nCarried; if (nCarried <= 6) carried += (carried.empty() ? "" : ", ") + item + " (" + zonediff::RoadName(rd) + " " + which + (waits != 0 ? " waits on its road" : " written at " + N(at)) + townWhy + ")"; }
+            else { ++nLost; anyLost = 1; kindLost = true; if (nLost <= 8) lost += (lost.empty() ? "" : ", ") + item + " (" + zonediff::RoadName(rd) + (held != 0 ? " " + which + (baseAt > 0 && at >= baseAt ? " written at " + N(at) : " older than the base, written at " + N(at)) : std::string(" - none held, none waiting")) + townWhy + ")"; }
+        }
+        if (kindLost) lostKinds += (lostKinds.empty() ? "" : ", ") + std::string(zonediff::KindName(k));
+    }
+    const int label = zonediff::OwnCheckLabel(compared, w.Any(), anyLost);
+    ++g_zoneOwnCheck[label];
+    const std::string tail = " - the copy that won: " + won + "; base " + (baseRoad == areafresh::kCbKept ? std::string("the kept world copy") : baseRoad == areafresh::kCbEmpty ? std::string("the EMPTY area (no world copy loaded)") : std::string("NOT KNOWN"))
+                             + " writtenAt " + N(baseAt) + " writer " + N((long long)baseWriter) + ", the save read as slot " + N((long long)ownSlot) + " (ownCheck[nothing,carried,fault,unknown]=" + N(g_zoneOwnCheck[0]) + "," + N(g_zoneOwnCheck[1]) + "," + N(g_zoneOwnCheck[2]) + "," + N(g_zoneOwnCheck[3]) + ")";
+    if (label == zonediff::kOcNothing) { DebugLog("[ZONE] T-1391 OWN WORK " + zoneId + " at " + std::string(road) + ": " + zonediff::OwnCheckName(label) + " - the save is dropped, nothing of this game's lost" + tail); return label; }
+    if (label == zonediff::kOcCarried) { DebugLog("[ZONE] T-1391 OWN WORK " + zoneId + " at " + std::string(road) + ": " + zonediff::OwnCheckName(label) + " (" + N((long long)nCarried) + "): " + carried + (nCarried > 6 ? ", +" + N((long long)(nCarried - 6)) + " more not listed" : std::string()) + " - the save is dropped, carried" + tail); return label; }
+    const std::string aside = (own != 0 && asideSkip == 0) ? ZoneRecoverSetAside(zoneId, *own, road) : std::string();
+    if (asideOut != 0) *asideOut = aside;
+    ErrorLog("[ZONE] FAULT (T-1391): own work in the save of " + zoneId + " at " + std::string(road) + " - " + zonediff::OwnCheckName(label)
+             + (label == zonediff::kOcFault ? ": lost in " + lostKinds + " (" + N((long long)nLost) + "): " + lost + (nLost > 8 ? ", +" + N((long long)(nLost - 8)) + " more not listed" : std::string()) + (nCarried > 0 ? "; carried " + N((long long)nCarried) + ": " + carried + (nCarried > 6 ? ", +" + N((long long)(nCarried - 6)) + " more not listed" : std::string()) : std::string()) : ": " + why)
+             + "; " + (aside.empty() ? (asideSkip != 0 ? std::string("this save's bytes are NOT kept (an EMPTY save, or one that cannot be read to its end with the hold's cap of set-aside files reached) - nothing of this save is set aside; the hold's earlier set-aside copies stay")
+                                                       : std::string("the save's bytes could NOT be set aside")) : "the save's bytes are set aside as " + aside) + tail);
+    return label;
+}
+/* T-1391 (F1653 item 2; F1706): an own area save is durable when it lands - its pending mark, its row (with the base it was made from and,
+   sent, its own stamp unechoed - the 'sent' mark) and its kept base are in the area's state file WITH the save, in one commit
+   (ZoneMirrorFileWrite). Counters: unsentSide written= (own saves committed), sent= (of them marked sent), failed= (a commit that did not land
+   at once - kept in memory and committed again, never refused), rewritten= (the 'sent' mark put right after the send). MAIN THREAD. */
+long long g_zoneUnsentSideSent = 0;
+long long g_zoneUnsentSideRewritten = 0;
+void ZoneUnsentSideSay(const Record& r, unsigned long long ownBase, int sent, int again, int landed)
+{
+    if (landed != 0 && (again == 0 ? g_zoneUnsentSideWritten : g_zoneUnsentSideRewritten) > 24) return;
+    const std::map<std::string, ZoneKeptBase>::const_iterator kb = g_zoneKeptBase.find(r.worldId);
+    const std::map<std::string, long long>::const_iterator gd = g_zoneGameDataAt.find(r.worldId);
+    const int baseRoad = areafresh::CheckBaseRoad(kb != g_zoneKeptBase.end() ? 1 : 0, ZoneBaseOf(r.worldId), gd != g_zoneGameDataAt.end() ? 1 : 0);
+    const std::string kl = "[ZONE] T-1391 kept row " + r.worldId + (again != 0 ? std::string(" written again after the send") : std::string(" written at once, in one commit with the save (its area state, F1706)"))
+                         + (landed != 0 ? std::string() : std::string(" - the commit did NOT land yet: kept in memory and committed again (never refused)")) + " (own save writtenAt " + N(r.writtenAt)
+                         + (sent != 0 ? std::string(", SENT - kept until its echo (") + (again != 0 ? "" : "marked before its send, the link being up; ") + "F1680 M1: a lost echo and a quit never let the world's start-up copy replace it unchecked)" : std::string(", not sent - no link")) + "; base=" + N((long long)ownBase)
+                         + (baseRoad == areafresh::kCbKept ? (kb->second.empty != 0 ? std::string("; its base: the kept EMPTY area") : "; its base: the kept world copy seq " + N((long long)kb->second.seq))
+                            : baseRoad == areafresh::kCbEmpty ? std::string("; its base: the EMPTY area (no world copy loaded)") : std::string("; NO base kept (NOT KNOWN at its check)"))
+                         + ") - the link-up push carries it (unsentSide written=" + N(g_zoneUnsentSideWritten) + " sent=" + N(g_zoneUnsentSideSent) + " failed=" + N(g_zoneUnsentSideFailed) + " rewritten=" + N(g_zoneUnsentSideRewritten) + ", first 24 logged)";
+    if (landed != 0) DebugLog(kl); else ErrorLog(kl);
+}
+/* after the send: the 'sent' mark committed with the save guessed the send from the link (up = sent); a wrong guess is put right in one
+   header-only commit (F1683 C1's rule, now one field of the state). MAIN THREAD. */
+void ZoneUnsentSideWrite(const Record& r, unsigned long long ownBase, int sent)
+{
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(r.worldId);
+    if (a == g_areaState.end() || a->second.h.pending == 0 || a->second.h.rowKnown == 0 || a->second.h.row.writtenAt != r.writtenAt) return;
+    areastate::Head h = a->second.h;
+    h.sent = sent != 0 ? 1 : 0; h.row = AreaRowOf(r, 0ULL, 1, ownBase, 0);   /* its unechoed list as it stands after the send */
+    const int landed = AreaStateCommitHead(r.worldId, h, "the own save's sent mark put right after its send");
+    ++g_zoneUnsentSideRewritten;
+    ZoneUnsentSideSay(r, ownBase, sent, 1, landed);
+}
+/* T-1391 DESIGN B (F1706): THE MIRROR WRITE OF ZoneMirrorCommit IS ONE COMMIT OF THE AREA'S STATE (AreaStateCommit) - the copy's bytes, its
+   row, the pending / sent flags (an own save: pending, its 'sent' mark guessed from the link before the send; a received copy or a replay:
+   not pending, with the world's version) and the kept base: the one taken now before this overwrite (ZoneKeptBaseStep, F1677 rule 1) or
+   the one already kept. Then the plain mirror is rebuilt from it. Before F1706 the save went through <mirror>.ownn, its .unsent mark and a
+   rename, and the base through .basen / .basevn - each crash point a separate road (F1700). A commit that does not land keeps the state in
+   memory and is committed again (AreaStateRetryTick): the write is never refused, so this answers true. MAIN THREAD. */
+bool ZoneMirrorFileWrite(int kind, const Record& r, const std::vector<char>& bytes, unsigned long long ownBase, int markSent)
+{
+    const char* before = kind == kZoneWriteSave ? "this game's own save" : kind == kZoneWriteReplay ? "the journal's replay" : "a received copy";
+    const std::map<std::string, AreaMem>::const_iterator a = g_areaState.find(r.worldId);
+    areastate::Head h = a != g_areaState.end() ? a->second.h : areastate::Head();
+    std::vector<char> base;
+    ZoneKeptBase nk;
+    if (ZoneKeptBaseStep(r.worldId, r.file, before, &nk, &base) != 0) { h.baseKept = 1; h.baseSeq = nk.seq; h.baseAt = nk.at; h.baseWriter = nk.writer; h.baseEmpty = nk.empty; }
+    else if (h.baseKept != 0 && !AreaStateBytes(r.worldId, 0, &base))
+    {
+        base.clear(); h.baseKept = 0; h.baseSeq = 0; h.baseAt = 0; h.baseWriter = -1; h.baseEmpty = 0; ++g_zoneKeptBaseFailed;
+        ErrorLog("[ZONE] T-1391 KEPT BASE " + r.worldId + " LOST before " + std::string(before) + ": the state's file did not read back, so its base bytes are not known - the area's own-work checks say NOT KNOWN (keptBaseFailed=" + N(g_zoneKeptBaseFailed) + ")");
+    }
+    h.saveHave = 1; h.rowKnown = 1;
+    if (kind == kZoneWriteSave) { h.pending = 1; h.sent = markSent != 0 ? 1 : 0; h.row = AreaRowOf(r, 0ULL, 1, ownBase, markSent); }
+    else { h.pending = 0; h.sent = 0; h.row = AreaRowOf(r, areafresh::MirrorSeqOnWrite(1, r.seq), 0, 0ULL, 0); }
+    const int landed = AreaStateCommit(r.worldId, h, bytes, base, 1, before);
+    if (kind == kZoneWriteSave)
+    {
+        if (landed != 0) ++g_zoneUnsentSideWritten; else ++g_zoneUnsentSideFailed;
+        if (landed != 0 && markSent != 0) ++g_zoneUnsentSideSent;
+        ZoneUnsentSideSay(r, ownBase, markSent, 0, landed);
+    }
+    return true;
+}
 int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, const std::string& src, bool deferred)
 {
     if (IsZoneId(r.worldId))
@@ -15447,9 +16664,38 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
             return 0;
         }
     }
+    int recvEndsOwn = 0;   /* T-1391 F1706: the received copy's commit ends an own pending save (after its check) */
+    if (kind == kZoneWriteRecv && ZoneOwnSavePending(r.worldId) != 0 && ZoneUnechoedHas(r.worldId, r.writtenAt) == 0
+        && (g_records.find(r.worldId) == g_records.end() || g_records.find(r.worldId)->second.writtenAt != r.writtenAt)
+        && areafresh::RecvEndsUnsent(1, r.writtenAt, g_records.find(r.worldId) != g_records.end() ? (long long)g_records.find(r.worldId)->second.writtenAt : 0) == 0)
+    {   /* T-1391 F1706 (F1680's open question): a received copy NOT newer than this game's own pending save never replaces it - the
+           'taken although not newer' road refuses it before (areafresh::NotNewerTakes); should one still come here, the own save stays in the
+           area's state and keeps waiting for its own answer (review S3), and this copy is not written */
+        ++g_zoneRecvKeptOwn;
+        ZoneSwapPublish(r.worldId);   /* undoes the caller's hide: the record held stays served */
+        if (g_zoneRecvKeptOwn <= 8)
+            ErrorLog("[ZONE] T-1391 " + r.worldId + ": a received copy (writtenAt " + N(r.writtenAt) + ") NOT newer than this game's own pending save is not written over it - the save stays and waits for its answer (zoneRecvKeptOwn=" + N(g_zoneRecvKeptOwn) + ", first 8 logged)");
+        return 0;
+    }
+    if (kind == kZoneWriteRecv && ZoneOwnSavePending(r.worldId) != 0   /* T-1391 F1677 / F1680: the mirror holds this game's own save not yet confirmed (areafresh::RecvChecksOwn = OwnSavePending) */
+        && ZoneUnechoedHas(r.worldId, r.writtenAt) == 0
+        && (g_records.find(r.worldId) == g_records.end() || g_records.find(r.worldId)->second.writtenAt != r.writtenAt)   /* not this game's own copy coming back */
+        && areafresh::RecvEndsUnsent(1, r.writtenAt, g_records.find(r.worldId) != g_records.end() ? (long long)g_records.find(r.worldId)->second.writtenAt : 0) != 0)   /* review S3: only a NEWER copy ends it */
+    {   /* T-1391 (F1653): a newer copy received from the world server replaces this game's own unconfirmed save of the area (F1677: unsent, or
+           sent with the link up and not echoed) - the own-work check first (F1706: the save's bytes read from the area's state; its base is the
+           kept base), then this copy's own commit below ends the save's pending mark in the same write (the kept base stays: the content loaded
+           here may still build on it) */
+        const std::map<std::string, Record>::const_iterator orow = g_records.find(r.worldId);
+        std::vector<char> ob;
+        const bool obOk = (AreaStateBytes(r.worldId, &ob, 0) && !ob.empty()) || (orow != g_records.end() && !orow->second.file.empty() && ReadFileBytes(orow->second.file, &ob));
+        ZoneOwnWorkCheck(r.worldId, obOk ? &ob : 0, "a newer copy received (writtenAt " + N(r.writtenAt) + ", owner " + N((long long)r.owner) + ")", "a received newer copy");
+        recvEndsOwn = 1;
+    }
     if (deferred) g_zoneKeptMark.erase(r.worldId);   /* T-609: a record held back behind a load lands after that load - the copy loaded
                                                          here never took it in step, so it can no longer be adopted (ZoneKeptAdopt) */
-    if (!WriteFileBytes(r.file, bytes))
+    const unsigned long long zoneBase = kind == kZoneWriteSave ? ZoneBaseOf(r.worldId) : 0ULL;   /* s2 fold 3 / 4: the content base the save was made from */
+    const int markSent = LinkUp() ? 1 : 0;   /* T-1391 F1683 C1: an own save's 'sent' mark is committed with it, before its send - the link up guesses it sent */
+    if (!ZoneMirrorFileWrite(kind, r, bytes, zoneBase, markSent))   /* T-1391 F1706: ONE commit of the area's state - the base kept before this overwrite (ZoneKeptBaseStep, F1677 rule 1), the copy, its marks */
     {
         const std::string wfWhy = WriteFailWhy();   /* T-1028: taken before anything else can write on this thread */
         ZoneSwapPublish(r.worldId);
@@ -15458,11 +16704,13 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
         else WriteFailLineLog("[ZONE] RECV could not write " + r.file + wfWhy);
         return 0;
     }
-    const unsigned long long zoneBase = kind == kZoneWriteSave ? ZoneBaseOf(r.worldId) : 0ULL;   /* s2 fold 3 / 4: the content base the save was made from */
     { ZoneMirrorBase mb; mb.writtenAt = r.writtenAt; const int mbConfirmed = (kind == kZoneWriteRecv || kind == kZoneWriteReplay) ? 1 : 0; mb.seq = areafresh::MirrorSeqOnWrite(mbConfirmed, r.seq); mb.from = mbConfirmed != 0 ? (int)areafresh::kMirrorFromRecv : (int)areafresh::kMirrorFromOwn; g_zoneMirrorBase[r.worldId] = mb; if (mbConfirmed != 0) g_mkBaseDirty = true; }   /* T-1391 B1: a replay is written only after the world server took it - r.seq is the echoed seq */   /* s2 fold 4: what the mirror file now holds - a world copy's seq, or this game's own (0 until its echo) */
     g_records[r.worldId] = r; ZoneSwapPublish(r.worldId);
+    if (recvEndsOwn != 0) { ++g_zoneUnsentSideCleared; ZoneKeptBaseIdleCheck(r.worldId, "a received newer copy replaced this game's own save"); }   /* T-1391 F1680 L3, after the mirror's version is set */
     if (kind == kZoneWriteSave)
     {
+    /* T-1391 F1677: the base of this save (link up or down) is the area's kept base, taken before the write above (ZoneKeptBaseStep) - no
+       guess from the in-memory loaded copy or its writer slot here any more */
     /* E33 (verify-p5v LOW-5): the mark asserts that THE COPY CURRENTLY LOADED HERE came from a record, and during a
        teardown nothing is loaded. The record write above is correct and stays (the file on disk is real); this mark
        would outlive the world it describes and answer the F480 stale gate for the next one. */
@@ -15470,7 +16718,7 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
     if (!deferred && !g_tearingDown && !g_quitDraining) { ZoneStamp st; st.writtenAt = r.writtenAt; st.seq = r.seq; g_zoneFromRecord[r.worldId] = st; }   // what is loaded here now IS the record
     if (!deferred && !g_tearingDown && !g_quitDraining)
     {   /* T-1391 (F1611): LOG ONLY - this game's own work is counted from this save on (ZoneOwnWorkSay) */
-        try { ZoneLoadedCopy lc; lc.bytes = bytes; lc.have = 1; lc.writer = g_mySlot; lc.from = "this game's own save written at writtenAt " + N(r.writtenAt); ZoneLoadedCopySet(r.worldId, &lc); }
+        try { ZoneLoadedCopy lc; lc.bytes = bytes; lc.have = 1; lc.writer = g_mySlot; lc.road = areafresh::kLcFromOwnSave; lc.at = r.writtenAt; lc.from = "this game's own save written at writtenAt " + N(r.writtenAt); ZoneLoadedCopySet(r.worldId, &lc); }
         catch (...) {}
     }   /* P6c (p5z HIGH-1): and not during the quit drain either, which is the same "nothing is loaded" situation */
     ++g_zoneWritten;   /* E22c: the line reports the outcome, not the intent */
@@ -15484,6 +16732,9 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
     }
     else sent = SendRecordAny(r.worldId, "", "", 0.0f, 0.0f, 0.0f, r.writtenAt, r.owner, bytes, 0u, zoneBase);
     if (sent) g_zoneEchoWait[r.worldId] = r.writtenAt;   /* T-1429 s2 fold 7: the save's batch waits for this echo (a newer save of the area replaces it) */
+    ZoneOwnRowBaseSet(r.worldId, r.writtenAt, zoneBase);   /* T-1391 (F1626 / F1631): the base this own copy was made from, with its stamp - sent or not (the link-up push sends it with this; the kept table keeps it) */
+    if (sent) ZoneUnechoedAdd(r.worldId, r.writtenAt);   /* T-1391 (F1626 B): unechoed until its echo - a link drop may lose that echo */
+    if ((sent ? 1 : 0) != markSent) ZoneUnsentSideWrite(r, zoneBase, sent ? 1 : 0);   /* T-1391 (F1653 item 2; F1680 M1: sent or not, after its stamp joined the unechoed list - the row carries it as its 'sent' mark; F1683 C1: the mark was written BEFORE the mirror held the save, with the send guessed - written again only when that guess was wrong or the mark did not land) */
     if (sent)
     {   /* T-1391 (owner 1821): the version the save went up with and the road that set it - the world server takes it only when it equals
            the stored copy's seq (or this connection made the stored copy) */
@@ -15494,6 +16745,11 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
                      + " (writtenAt " + N(r.writtenAt) + ", " + N((long long)bytes.size()) + " bytes; zoneBaseLines=" + N(g_zoneBaseLines) + ", first 64 logged)");
     }
     coop::KeptAreaSent(r.worldId, sent ? 1 : 0, r.writtenAt);   /* KEPT: the write's stamp - the echo that answers it carries the same stamp */
+    {   /* T-1391 F1633 item 2: the own save on disk marks the kept table (mirrorkeep::OwnSaveTableStep): sent - its last echo writes it; not sent - written when its batch ends (F1635 item 1: StoreTick after the drain, a save's end, quit, teardown) */
+        const int ts = mirrorkeep::OwnSaveTableStep(1, sent ? 1 : 0);
+        if (ts != mirrorkeep::kOwnSaveTableNone) g_mkBaseDirty = true;
+        if (ts == mirrorkeep::kOwnSaveTableWriteNow) { g_mkOwnSaveDue = true; ++g_mkOwnSaveMarked; }   /* one table write per batch, never one per area */
+    }
     if (zonerec::ZoneEmptyIs(bytes) != 0) ++g_zoneEmptyPublished;   /* T-1329: an EMPTY area record written here (and sent, when the link is up - the WROTE line says) */
     const long long wroteOwner = sent ? (long long)g_zoneLastSentOwner : (long long)r.owner;   /* T-1443: the owner the record went with */
     DebugLog("[ZONE] WROTE " + r.worldId + " bytes=" + N((long long)bytes.size()) + " owner=" + N(wroteOwner) + " from '" + src + "' -> " + r.file + (sent ? " (sent)" : " (not sent - no link)") + (deferred ? " - after waiting for a load of that path" : "")
@@ -15697,6 +16953,7 @@ bool ZoneKeptAdopt(const std::string& zoneId, const Record& rec, const std::stri
         const std::map<std::string, ZoneMirrorBase>::const_iterator mb = g_zoneMirrorBase.find(zoneId);
         const unsigned long long ab = areafresh::ContentBaseOnAdopt(mb != g_zoneMirrorBase.end() ? 1 : 0, mb != g_zoneMirrorBase.end() ? mb->second.writtenAt : 0, mb != g_zoneMirrorBase.end() ? mb->second.seq : 0ULL, rec.writtenAt, rec.seq);
         g_zoneContentBase[zoneId] = ab; g_zoneContentBaseRoad[zoneId] = ab != 0 ? (int)areafresh::kBaseRoadAdopt : (int)areafresh::kBaseRoadNone;
+        ZoneKeptBaseOnContentBase(zoneId);   /* T-1391 F1677 */
     }
     DebugLog("[ZONE] kept-in-step copy ADOPTED " + zoneId + ": loaded " + (nm->second.fromRecord ? "from an older record" : "with no record") + " (link gen " + N((long long)nm->second.gen) + "), loaded here since " + N((long long)since)
              + ", this game holds it, record owner " + N((long long)recSlot) + " writtenAt " + N(rec.writtenAt) + ", base now " + N((long long)ZoneBaseOf(zoneId)) + " (zoneKeptAdopted=" + N(g_zoneKeptAdopted) + "); " + inputs
@@ -15770,6 +17027,40 @@ void ZoneSaveApplyImpl(const std::string& path, const std::string& emptyId)
     {   /* T-1429 s2 fold 3 (review F1372): the world server refused this game's copy of the area as made from an older one - it stays
            unpublished until a load of the area takes the world's copy (ZoneContentBaseOnLoad) */
         ++g_zoneStaleBaseHeld;
+        {   /* T-1391 (review S4; F1664 M2 / M3): EVERY save of an area held STALE is not skipped silently - its own work since this game's
+               loaded copy (what it is not publishing) gets the own-work check: carried by records, or a FAULT with the bytes set aside.
+               M2 / F1677: the base is the area's kept base (ZoneCheckBaseGet); with none it is NOT KNOWN (a FAULT, set aside) - never the save
+               compared with itself. The in-memory loaded copy is read only for its load count (HeldSameLoad).
+               M3: the hold keeps one set-aside file per area per load: a newer FAULT save of the same load replaces it (the newest save holds
+               the latest own work - why that is safe, and why not across a load: areafresh::HeldAsideStep) */
+            ++g_zoneHeldChecked;
+            std::vector<char> sv; const bool svOk = isEmpty ? (zonerec::ZoneEmptyEncode(&sv), true) : ReadFileBytes(path, &sv);
+            size_t svStop = 0; const int svReadable = (svOk && !isEmpty && zonecheck::ReadableBytes(sv, &svStop) != 0) ? 1 : 0;
+            ZoneLoadedCopy slc; const bool slcOk = ZoneLoadedCopyGet(zoneId, &slc) && slc.have != 0;
+            ZoneHeldAside& ha = g_zoneStaleAside[zoneId];
+            const int sameLoad = areafresh::HeldSameLoad(slcOk ? 1 : 0, slc.loadSeq, (int)ha.files.size(), ha.loadSeq);   /* re-check MED: an evicted entry (loadSeq 0) is never the same load */
+            const int step = areafresh::HeldAsideStep(isEmpty ? 1 : 0, svReadable, (int)ha.files.size(), sameLoad, areafresh::kHeldAsideCap);
+            if (step == areafresh::kHaSkip) ++g_zoneHeldAsideSkipped;
+            std::string aside;
+            ZoneOwnWorkCheck(zoneId, svOk ? &sv : 0, "the world's newer copy (STALE BASE hold - not published until a load takes it)", "a save held STALE", &aside, step == areafresh::kHaSkip ? 1 : 0);
+            if (!aside.empty())
+            {
+                if (step == areafresh::kHaReplace && !ha.files.empty())
+                {   /* written first, then the hold's last file goes - never both missing */
+                    if (sameLoad == 0) ++g_zoneHeldAsideOverflow;
+                    const std::string prev = ha.files.back();
+                    if (prev != aside) U8DeleteFile(prev.c_str());
+                    ha.files.back() = aside; ++g_zoneHeldAsideReplaced;
+                    const std::string hl = "[ZONE] T-1391 held STALE " + zoneId + ": the set-aside copy " + prev + " is replaced by this newer save's " + aside
+                             + (sameLoad != 0 ? std::string(" (same load: the newer save holds its own work)")
+                                              : std::string(" (OVERFLOW: the hold's cap of ") + N((long long)areafresh::kHeldAsideCap) + " files per area is reached and the replaced file was set aside under another load - it may be the only copy of work a reload lost)")
+                             + " (heldChecked=" + N(g_zoneHeldChecked) + " replaced=" + N(g_zoneHeldAsideReplaced) + " overflow=" + N(g_zoneHeldAsideOverflow) + " skipped=" + N(g_zoneHeldAsideSkipped) + ")";
+                    if (sameLoad != 0) DebugLog(hl); else ErrorLog(hl);   /* re-check LOW: an overflow can delete the only copy of earlier work */
+                }
+                else ha.files.push_back(aside);
+                ha.loadSeq = slc.loadSeq;
+            }
+        }
         if (g_zoneStaleBaseHeld <= 20) DebugLog("[ZONE] STALE BASE " + zoneId + " - not published: its copy here was made from an older copy than the world's; the next read of the area takes the world's (staleBaseHeld=" + N(g_zoneStaleBaseHeld) + ", first 20 logged)");
         return;
     }
@@ -15902,6 +17193,7 @@ SaveGameFn orig_saveGame = 0;
 SaveLevelDataFn orig_saveLevelData = 0;
 void* detour_saveGame(void* self, void* a, void* b)
 {
+    if (OnMainThread() && coop::OwnEdgeSaveRunning() == 0) coop::PieceRecSaveFlush();   /* T-1429 machine age: pending piece values marked before a save uploads their area (the leave save flushed at its begin) */
     coop::ItemsBoxJrnBeforeSave(OnMainThread() ? 1 : 0);   /* a box change parked for the swap's gates: undone on the character before the save */
     coop::ItemsBoxOwedNote(OnMainThread() ? 1 : 0);   /* the box changes this save holds unresolved, as it is written (beside it once it lands) */
     RaidLentSaveNote(OnMainThread() ? 1 : 0);   /* T-1122 save fold: the lent copies this save is written with (beside it once it lands) */
@@ -15947,6 +17239,23 @@ int ZoneLevelSavePod(void* content, int* x, int* y, int* hasFile, int* readDue, 
 /* T-1329: Kenshi saved nothing for the area (+0x24 = 0) - its EMPTY area record goes out through ZoneSaveApply's road, on every road
    that runs this save (an AREA_FRESH WRITE round, an unload, the full save); off the main thread it is queued for the drain, as a
    file saved there is. The main thread keeps the byte for the WRITE round (AfHolderWrite). */
+/* T-1429 s16 (F1357 'not excluded': the engine had nothing, or the save skipped what it had): what this game had live in the area just
+   before the engine's one-area save - the buildings its zone lists and the ground items lying in the area (how many carry the
+   made-during-play mark the save skips). Read on the main thread while the per-save line still logs; appended to that line. */
+volatile LONG g_zoneSaveCountLines = 0;
+std::string g_zoneLiveSay;
+void* g_zoneLiveBldBuf[4096];
+void ZoneLiveBeforeSave(void* content)
+{
+    g_zoneLiveSay.clear();
+    if (!OnMainThread() || g_zoneSaveCountLines >= 2000 || !Plaus(content)) return;
+    int x = 0, y = 0, hasFile = -1, readDue = -1; long long engineSaved = -1;
+    if (ZoneLevelSavePod(content, &x, &y, &hasFile, &readDue, &engineSaved) != 1) { g_zoneLiveSay = " live before the save: not read"; return; }
+    int trunc = 0;
+    const int b = coop::LoadedBuildingsInSector(x, y, g_zoneLiveBldBuf, 4096, &trunc);
+    int gn = -1;
+    g_zoneLiveSay = " live before the save: buildings listed=" + N((long long)(trunc != 0 ? -1 : b)) + " ground " + coop::GroundAroundSay(0.0f, 0.0f, 0.0f, x, y, 6, &gn);
+}
 void ZoneLevelSaveAfter(void* content)
 {
     const bool onMain = OnMainThread();
@@ -15956,10 +17265,10 @@ void ZoneLevelSaveAfter(void* content)
     if (got != 1) { ::InterlockedIncrement64(&g_zoneLevelSaveReadFail); if (onMain) { g_levelSaveHasFile = -1; g_levelSaveReadDue = -1; } return; }
     if (onMain) { g_levelSaveHasFile = hasFile; g_levelSaveReadDue = readDue; }
     {   /* T-1429 s2 fold 2 (F1357 'needed lines'): every area save's engine count - the total the engine tests; a count by kind would need a walk of the container's item tree, which is not mapped */
-        static volatile LONG s_saveCountLines = 0;
-        if (::InterlockedIncrement(&s_saveCountLines) <= 2000)
+        if (::InterlockedIncrement(&g_zoneSaveCountLines) <= 2000)
             DebugLog("[ZONE] area save zone=" + N((long long)x) + "." + N((long long)y) + " engineSaved=" + N(engineSaved) + " hasFile=" + N((long long)hasFile) + " readDue=" + N((long long)readDue)
-                     + (onMain ? std::string() : std::string(" (off the main thread)")) + " (engineSaved: the save container's +0x70 word, 0 = the engine had nothing to save; first 2000 logged)");
+                     + (onMain ? g_zoneLiveSay : std::string(" (off the main thread)")) + " (engineSaved: the save container's +0x70 word, 0 = the engine had nothing to save; first 2000 logged)");
+        if (onMain) g_zoneLiveSay.clear();
     }
     if (hasFile != 0) return;
     const std::string zoneId = "zone." + N((long long)x) + "." + N((long long)y);
@@ -15983,14 +17292,19 @@ void detour_saveLevelData(void* content, char flag, void* a, void* b)
     coop::ItemsLootBeforeSave(OnMainThread() ? 1 : 0, 1);
     coop::ItemsHoldSave(2, OnMainThread() ? 1 : 0);   /* P105 build 2 (design 15.4): outside a game save this is a zone write - every hold is put back and ended first, so the zone file carries the item */
     const int keep = OnMainThread() ? LinkKeepEnter() : 0;   /* T-1118 (a): an area's write stands the frame still too (inside saveGame it nests in that window) */
+    ZoneLiveBeforeSave(content);   /* T-1429 s16: the area's live buildings and ground, for the per-save line (main thread) */
+    coop::CampAreaSaveBegin();     /* T-1429 A1: the camp pieces this save keeps (camp.cpp detour_cpNeedsSave), one line after it */
     __try { orig_saveLevelData(content, flag, a, b); }
     __finally { if (keep != 0) LinkKeepExit(); }
+    coop::CampAreaSaveEnd(content);
     ZoneLevelSaveAfter(content);   /* T-1329: Kenshi saved nothing for the area -> its EMPTY area record */
 }
 /* the "built with" note inside each area file - defined below, after the container helpers (the same namespace as their definitions) */
 void* TownNoteBeforeSave(void* container, const std::string* absPath);
 void TownNoteAfterSave(void* rec);
 void TownNoteAfterLoad(void* container, const std::string* file, bool ok);
+void* CampNoteBeforeSave(void* container, const std::string* absPath);   /* T-1429 camp note design (camplaid.h): the camp note rides inside the area file beside the town note */
+void CampNoteAfterLoad(void* container, const std::string* file, bool ok);
 /* T-1329: detour_gdcSave's two exits that sent nothing and said nothing - the engine's save returned false (kind 1; counted for every
    file, and apart for area files), or the saved file's path could not be copied out (kind 0). Counted, and one line each (the first 20
    of both together). Any thread. */
@@ -16037,8 +17351,10 @@ bool detour_gdcSave(void* container, const std::string* absPath, void* serialisa
         return okOff;
     }
     void* const townNote = TownNoteBeforeSave(container, absPath);   /* the "built with" note rides inside the area file (townver.cpp) */
+    void* const campNote = CampNoteBeforeSave(container, absPath);   /* T-1429 camp note design: the area's laid camp keys ride in the same file as the pieces the keep saved (main-thread saves only) */
     const bool ok = orig_gdcSave(container, absPath, serialisable);
     TownNoteAfterSave(townNote);
+    TownNoteAfterSave(campNote);   /* the same 'file' = "0" rule: the copy left in memory is never read as one from a file */
     char pbuf[1024]; if (!Plaus(absPath) || !CopyStdStringPod(absPath, pbuf, 1024)) { GdcSilentExit(0, 0); return ok; }   /* T-1329: counted and said */
     if (!ok) { GdcSilentExit(1, pbuf); return ok; }
     ZoneMainSaveNote(ZoneIdOfPath(std::string(pbuf)));   /* T-1329 fold 1 (F4): a main-thread save of this area - a queued EMPTY older than it is dropped */   /* the engine's save failed: there is nothing on disk to record (the old body's `zoneId.empty() || !ok` gate, kept whole); T-1329: counted and said */
@@ -16248,6 +17564,65 @@ void TownNoteAfterLoad(void* container, const std::string* file, bool ok)
         TownNoteSetField(rec, "file", "0");   /* read: the copy in memory rides on in a later write only when that write renews it */
     }
     coop::TownVerNoteRead(sx, sy, zoneId, 1, cooptv::TvNoteSource(cooptv::TvIsBaseAreaPath(path), found), unreadable, notes, path);
+}
+/* T-1429 CAMP NOTE (src/common/camplaid.h; F1608): one record of type 0x1E (the town note's road above - the same newRecord and field
+   writes), id kCampNoteId, fields file / zone / n / k0..k<n-1>: the camp keys laid in the area. WRITE in the main-thread gdcSave pre-hook
+   (the keep saves camp pieces only on main-thread saves, camp.cpp detour_cpNeedsSave, so the note and the pieces are written together);
+   READ after every area file read, any thread (the loading thread's own container) - camp.cpp CampNoteRead replaces the area's note. */
+const std::string kCampNoteId("sw-camp-laid");
+void* CampNoteBeforeSave(void* container, const std::string* absPath)
+{
+    const std::string zoneId = ZoneIdOfPath(TownNotePath(absPath));
+    if (zoneId.empty() || !Plaus(container)) return 0;
+    void* rec = GdcGetDataPod(container, &kCampNoteId);
+    if (rec == (void*)1) { coop::CampNoteSaved(zoneId, -1, 0, "the container lookup failed"); return 0; }
+    const int reused = Plaus(rec) ? 1 : 0;
+    std::vector<std::string> keys; int over = 0;
+    coop::CampNoteKeysForSave(zoneId, &keys, &over);
+    if (!reused && keys.empty()) return 0;   /* no camp laid in this area and no note in its container: nothing to note */
+    if (!reused) rec = TownNoteNewRecordPod(container, &kCampNoteId);
+    if (!Plaus(rec)) { coop::CampNoteSaved(zoneId, -1, 0, "no record made"); return 0; }
+    int ok = TownNoteSetField(rec, "file", "0");
+    ok &= TownNoteSetField(rec, "zone", zoneId);
+    ok &= TownNoteSetField(rec, "n", N((long long)keys.size()));
+    for (size_t i = 0; i < keys.size(); ++i) ok &= TownNoteSetField(rec, "k" + N((long long)i), keys[i]);
+    if (ok) ok &= TownNoteSetField(rec, "file", "1");
+    coop::CampNoteSaved(zoneId, ok ? (int)keys.size() : -1, over, ok ? "" : "a field did not write");
+    return rec;
+}
+void CampNoteAfterLoad(void* container, const std::string* file, bool ok)
+{
+    const std::string path = TownNotePath(file);
+    const std::string zoneId = ZoneIdOfPath(path);
+    if (zoneId.empty()) return;
+    std::vector<std::string> keys;
+    int found = 0, unreadable = 0;
+    if (ok && Plaus(container))
+    {
+        void* rec = GdcGetDataPod(container, &kCampNoteId);
+        std::string mark;
+        if (rec != (void*)1 && Plaus(rec))
+        {
+            if (TownNoteGetField(rec, "file", &mark) && mark == "1")
+            {
+                std::string nText;
+                const int n = TownNoteGetField(rec, "n", &nText) ? camplaid::CampNoteCountParse(nText) : -1;
+                if (n < 0) ++unreadable;
+                else
+                {
+                    found = 1;
+                    for (int i = 0; i < n; ++i)
+                    {
+                        std::string k;
+                        if (!TownNoteGetField(rec, "k" + N((long long)i), &k) || k.empty()) { ++unreadable; continue; }
+                        keys.push_back(k);
+                    }
+                }
+            }
+            TownNoteSetField(rec, "file", "0");   /* read: the copy in memory rides on only when a later write renews it */
+        }
+    }
+    coop::CampNoteRead(zoneId, ok ? 1 : 0, found, unreadable, keys, OnMainThread() ? 1 : 0, path);
 }
 /* stand1: whose record is this, as a slot. The RECORD owner field IS the writer's notebook slot (protocol 43, storemeta.h); an
    unknown writer is read as the one other game on the session link - the two-party case this replaces - T-1443 (F1379 design a):
@@ -18377,6 +19752,7 @@ void TeardownBroadcast(const char* why)
        engine is freeing, and therefore the whole span in which nothing may be invented from it. */
     ::InterlockedIncrement(&g_engineTeardown);   /* P6q (review-p6j LOW-1): interlocked - the readers are worker threads */   /* P6x (review-p6q MEDIUM-2): an INCREMENT - the flag is a depth now, so a nested teardown cannot lower it early */
     g_zoneEchoWait.clear();   /* T-1429 s2 fold 7b: the world is left - no echo of its uploads is waited for */
+    AreaStateRetryTick(1, "the world teardown");   /* T-1391 F1706: an area state not committed yet - one more try before the teardown */
     MirrorKeepFlush("world teardown");   /* T-1429 s2 fold 6: before the teardown */
     ++g_worldTeardowns; g_tearingDown = true; g_worldListedRecv = false; g_worldListedSent = false; g_deadPending.clear(); coopdeadev::DeadEvReset(&g_deadEvNotes); g_deadEarly.clear();   /* T-1442 step 3: the death notes and the decided-early ids are world state */ g_deadShells.clear(); g_deadShellPtrs.clear(); g_refusedWakes.clear(); g_refusedWakeTries.clear(); g_t300Q.clear(); g_t300Queued.clear();   /* T-300: the drop queue is world state */ g_blockDone = false;   /* review-p4k L1 */   /* review-p5l MEDIUM-2 (E18): THE SLOT IS WORLD STATE TOO. g_blockSlot names the block applied for the world that has just been torn down, so it is cleared with g_blockDone; the log latch is world state too, so a slot change in the next world is logged (NumberBlockTick's MISMATCH). All four move together. */   /* review-p5n MEDIUM-2 (E23): THE COUNT IS NOT LATCH STATE - IT IS THE EVIDENCE, AND IT SURVIVES. g_blockSlot and the log latch are world state and are reset (that is P5n's fold and it is right); g_blockSlotMismatch is the number the report is read from, and zeroing it made a session in which a slot re-order really happened read as one in which it did not, as soon as any world was torn down afterwards. It is cumulative over the process now, like every other counter in ReportStore. */ g_blockSlot = -1; g_blockSlotMismatchLogged = false; g_blockRememberedOtherWorldLogged = false; g_loadFloor.clear(); g_loadFloorByName.clear(); g_blockLeftAt.clear(); g_loadFloorDone = false;   // the engine destroys every group now - none of them is "gone" (P4e)
     /* E29 (review-p5r LOW-2): the same separation for the log. Before the first StoreTick this is not evidence of a worker
@@ -18649,11 +20025,35 @@ void GdcLoadChainNote(long long n)
              " loader detour under it " + (other >= 0 ? "has run " + N(other) + " time(s)"
                                                       : std::string("is not in this game (another mod's jump)")));
 }
+/* T-1429 s16 (F1357 'needed lines'): a game-data container's +0x70 word - the count the area save tests (decomp_36dca0.txt:263, the save
+   line's engineSaved) - read on the container an area file is loaded into; -1 not plausible, -2 a read fault (caught). ANY THREAD. */
+long long GdcHeldPod(void* gdc)
+{
+    __try { return Plaus(gdc) ? *(const long long*)((const char*)gdc + 0x70) : -1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+volatile LONG g_zoneLoadCountLines = 0;
 bool detour_gdcLoad(void* container, const std::string* file, const std::string* modName, int modIndex, void* serialisable, bool flag)
 {
     GdcLoadChainNote((long long)::InterlockedIncrement64(&g_gdcLoadCalls));   /* T-1447 */
+    /* T-1429 s16 (F1357): every area file's load - which copy (the world's, served through this game's store mirror, or its own save)
+       and the container's count before and after the engine's read (the records the engine took from the file) */
+    char lbuf[1024]; lbuf[0] = 0;
+    long long held0 = -3;
+    const int areaLoad = (::InterlockedCompareExchange(&g_zoneLoadCountLines, 0, 0) < 2000 && Plaus(file) && CopyStdStringPod(file, lbuf, 1024) && !ZoneIdOfPath(std::string(lbuf)).empty()) ? 1 : 0;
+    if (areaLoad) held0 = GdcHeldPod(container);
     const bool ok = orig_gdcLoad(container, file, modName, modIndex, serialisable, flag);
+    if (areaLoad && ::InterlockedIncrement(&g_zoneLoadCountLines) <= 2000)
+    {
+        const std::string lpath(lbuf);
+        const long long held1 = GdcHeldPod(container);
+        DebugLog("[ZONE] area load " + ZoneIdOfPath(lpath) + " ok=" + N((long long)(ok ? 1 : 0)) + " from "
+                 + (PathUnderDir(lpath, g_dirMirror) ? std::string("the world's copy (this game's store mirror)") : PathUnderDir(lpath, g_dirCanonical) ? std::string("the store folder") : std::string("this game's own save"))
+                 + " engineRecords " + N(held0) + " -> " + N(held1) + " (the container's +0x70 word, the count the area save line calls engineSaved; -1 not plausible, -2 a fault)"
+                 + (OnMainThread() ? std::string() : std::string(" (off the main thread)")) + " (first 2000 logged)");
+    }
     TownNoteAfterLoad(container, file, ok);   /* the "built with" note of the area file just read (townver.cpp), before the swap's early exit */
+    CampNoteAfterLoad(container, file, ok);   /* T-1429 camp note design: the area's camp note is replaced by this read (before 'Town loaded' queues the area's nest entries - camplaid.h) */
     if (ok) { if (OnMainThread()) LookalikeAfterLoad(container, file); else LookalikeOffMainNote(file); }   /* T-1096: the import's own squad files - their named characters become look-alikes (every copy is made at the top of the load and at its member's build) */
     if (::InterlockedCompareExchange(&g_zonePendingCount, 0, 0) == 0) return ok;   /* Z1-b: nothing served by the swap is waiting */
     char fbuf[1024]; if (!Plaus(file) || !CopyStdStringPod(file, fbuf, 1024)) return ok;
@@ -18694,7 +20094,7 @@ bool detour_gdcLoad(void* container, const std::string* file, const std::string*
             ErrorLog("[ZONE] " + pl.zoneId + " was served from its record but LOADED off the main thread - its owners cannot be translated there, so it stays 'not from record' and will not be written back");
             return ok;
         }
-        ZoneStamp st; st.writtenAt = pl.writtenAt; st.seq = pl.seq;
+        ZoneStamp st; st.writtenAt = pl.writtenAt; st.seq = pl.seq; st.writer = pl.writerSlot;   /* T-1429: whose upload this copy is */
         const long lg = ::InterlockedCompareExchange(&g_linkGen, 0, 0);
         /* item 4: the mark names the record it was loaded from; T-609: and the link it was loaded on (the kept mark) - only once this
            link's record feed has ended, so a record another game wrote while this one was away cannot land later as "seen in step" */
@@ -18792,10 +20192,10 @@ void ResetCarryEndIfSaved(const char* why);       /* T-36: defined below, beside
 std::string g_spImportFolder, g_spImportName;   /* the asked import: the single-player save folder and the new profile's name ("" = none) */
 unsigned g_spImportForNum = 0;                  /* the profile the world made for it (0 = not answered yet) */
 int g_spImportCarry = 0;                        /* 1 while the decided carry is this import, not a world reset's */
+int g_spCommitWaitSaid = 0;                     /* T-1399: the commitment wait last said (spimport::CommitStep; 0 = none) - cleared with the request */
 unsigned g_spAnswerGen = 0;   /* T-1383 fold (review item 4): answers carrying an import word so far (the picker's re-ask waits for one) */
 unsigned g_spAnswerWord = 0;                    /* the last PROFILES answer's import word (spimport::AnswerWord; 0 = the world sent none) */
-std::string g_spOptMode, g_spOptMoney, g_spOptResearch;   /* the world's import options from its OPTIONS map */
-int g_spOptSeen = 0;                            /* 1 once the OPTIONS map named any of them */
+spimport::OptList g_spOptLive, g_spOptReading;   /* T-1399: the world's import options - its last WHOLE OPTIONS map on this link (live), and the map being read */
 int g_spImportClashSaid = 0;                    /* the held save's line is said once per import */
 /* T-1096 fold (review 2026-10-31): the import request is tied to ITS answer (spimport::AnswerTie, reset with each connection), never
    matched by the profile's name; its money / research come from that world's own answer word (g_spImportWord); an unanswered request
@@ -18833,22 +20233,67 @@ void SpImportCreatorOwedSend(const char* when)
     }
 }
 long long g_spImportFromWorld = 0;   /* T-1452: imports taken from the world server's row at a WELCOME (no local request for the pick) */
-void SpImportRequestClear() { g_spImportFolder.clear(); g_spImportName.clear(); g_spImportForNum = 0; g_spImportWord = 0; g_spImportAsk = 0; g_spImportDeadSent = 0; }
+void SpImportRequestClear() { g_spImportFolder.clear(); g_spImportName.clear(); g_spImportForNum = 0; g_spImportWord = 0; g_spImportAsk = 0; g_spImportDeadSent = 0; g_spCommitWaitSaid = 0; }
 /* T-1383: this import's switch word - research by the host's option; 0x10 / 0x20 only for what the creator asked, once the world's
    answer to this request says the profile holds the creator claim (spimport::ImportFlagsFor) */
 unsigned int SpImportFlags() { return spimport::ImportFlagsFor(SpImportResearch(), g_spImportAsk, g_spImportWord); }
-void SpImportOptionsForget() { g_spOptMode.clear(); g_spOptMoney.clear(); g_spOptResearch.clear(); g_spOptSeen = 0; }
+void SpImportOptionsForget() { g_spOptLive = spimport::OptList(); g_spOptReading = spimport::OptList(); }
 long long g_spImportAsked = 0, g_spImportMade = 0, g_spImportRefused = 0, g_spImportDecided = 0, g_spImportMoneySet = 0, g_spImportMoneyUnknown = 0, g_spImportClashHeld = 0, g_spImportIdRenamed = 0, g_spImportIdNoFree = 0;   /* T-1096 part 2: ids made unique / no free id */
 void SpImportOptionNote(const std::string& k, const std::string& v)
 {
     if (!spimport::OptionValueOk(k, v)) { DebugLog("[IMPORT] OPTIONS: '" + k + "' = '" + v + "' is not a value this build reads - ignored"); return; }
-    if (k == spimport::kKeyMode) g_spOptMode = v; else if (k == spimport::kKeyMoney) g_spOptMoney = v; else g_spOptResearch = v;
-    g_spOptSeen = 1;
+    if (k == spimport::kKeyMode) g_spOptReading.mode = v; else if (k == spimport::kKeyMoney) g_spOptReading.money = v; else g_spOptReading.research = v;
 }
+/* T-1399: each OPTIONS map is the world's whole map - begun empty, it replaces the live list only when read whole and not a refusal */
+void SpImportOptionsMapBegin() { g_spOptReading = spimport::OptList(); }
+void SpImportOptionsMapEnd(bool complete) { spimport::OptListCommit(&g_spOptLive, g_spOptReading, complete); }
 /* The host's "includes" options: the world's OPTIONS map once it named them, else the PROFILES answer's word (a game in the lobby), else yes. */
-/* T-1096 fold (review 2026-10-31): this import's own world word first (spimport::ImportIncludes), then this connection's OPTIONS map. */
-bool SpImportMoney() { return spimport::ImportIncludes(g_spImportWord, spimport::kWordMoney, g_spOptSeen != 0, spimport::IncludesOf(g_spOptMoney)); }
-bool SpImportResearch() { return spimport::ImportIncludes(g_spImportWord, spimport::kWordResearch, g_spOptSeen != 0, spimport::IncludesOf(g_spOptResearch)); }
+/* T-1399 (F1750): the world's LIVE options list first once it has arrived on this link (spimport::ImportIncludes - the 2026-10-31
+   review's answer-word-first is reversed: the list is wiped at every link loss and leave, so it is always this world's), else this
+   import's own world word (lines said before the commitment point only), else included. The commitment points wait for the list
+   (SpImportCommitWaits). */
+bool SpImportMoney() { return spimport::ImportIncludes(g_spImportWord, spimport::kWordMoney, g_spOptLive.arrived, spimport::IncludesOf(g_spOptLive.money)); }
+bool SpImportResearch() { return spimport::ImportIncludes(g_spImportWord, spimport::kWordResearch, g_spOptLive.arrived, spimport::IncludesOf(g_spOptLive.research)); }
+/* T-1399: a commitment point (research before the engine runs the import, money once the crew is in) may decide now - 0 - or waits for
+   the world's live options list on this link, or, on the hosting game, for its own HOST-screen import rows to show stored (spimport::
+   CommitStep); asked again each frame / tick, so the decision follows an event, never a timer. The wait is said once per step.
+   T-1399 fold (F1751 M1): the host-rows wait ends when this game does not set the world's rules, on a refusal reply, or when the live
+   list already holds the rows' values (spimport::HostRowsWait) - the go that ends it says one line naming why. */
+long long g_spCommitWaits = 0;
+int g_spImportPumpDecided = 0;   /* T-1399: 1 once this posted import's research was decided at the pump */
+int SpImportCommitWaits(const char* what)
+{
+    std::vector<std::pair<std::string, std::string> > awaiting;
+    int refused = 0, authority = 1, standingKnown = 1;
+    if (ConfigRole() == kRoleHost) coop::SettingsHostRowsAwaiting(&awaiting, &refused, &authority, &standingKnown);
+    const int hostRows = spimport::HostRowsWait(awaiting, authority != 0, standingKnown != 0, refused != 0, g_spOptLive);
+    const int step = spimport::CommitStep(g_spOptLive.arrived, hostRows);
+    if (step == spimport::kCommitGo)
+    {
+        if (hostRows != spimport::kHostRowsNone)   /* the go comes once per step (the pump marks it decided; the money step arms the save) */
+            DebugLog(std::string("[IMPORT] T-1399: the import's ") + what + " no longer waits for this hosting game's own HOST-screen money / research rows - "
+                     + spimport::HostRowsEndName(hostRows) + " (" + N((long long)spimport::ImportRowsAwaiting(awaiting)) + " row(s) never shown stored)");
+        return 0;
+    }
+    ++g_spCommitWaits;
+    if (g_spCommitWaitSaid != step)
+    {
+        g_spCommitWaitSaid = step;
+        DebugLog(std::string("[IMPORT] T-1399: the import's ") + what + " WAITS for " + (step == spimport::kCommitWaitList ? "the world's options list on this link"
+                 : "this hosting game's own HOST-screen import rows to show stored in the world's options") + " (never the lobby answer) - asked again each frame");
+    }
+    return 1;
+}
+/* T-1399: the decision's line - where the money / research word came from */
+void SpImportDecidedLine(const char* what, bool included, unsigned flagsWas, unsigned flagsNow)
+{
+    const bool research = std::string(what) == "research";
+    char fx[64]; _snprintf(fx, sizeof(fx), " (flags 0x%02X at the post, 0x%02X now)", flagsWas, flagsNow); fx[63] = 0;
+    DebugLog(std::string("[IMPORT] T-1399 decided: ") + what + (included ? " included" : " NOT included") + " - from "
+             + spimport::IncludesSourceName(spimport::IncludesSource(g_spImportWord, g_spOptLive.arrived))
+             + (g_spCommitWaitSaid != 0 ? " (waited for it)" : "") + (research ? std::string(fx) : std::string()) + ". spCommitWaits=" + N(g_spCommitWaits));
+    g_spCommitWaitSaid = 0;
+}
 /* Every PROFILES answer: its import word kept; the answer to this game's NEW with import names the profile the import is for. */
 void SpImportOnAnswer(const coopprof::Answer& a, const std::vector<coopprof::Row>& listBefore)   /* T-1452: listBefore - the profile list before this answer */
 {
@@ -21852,12 +23297,99 @@ void EditorOffTickBody()   /* StoreEditorOffTick (coop scope, beside HandSaveBlo
     const char* why = "";
     const int r = coop::BdEditorClosePod(ed, &why);
     const char* shown = "not shown (not closed)";
-    if (r == 1) { ++g_editorOffClosed; shown = ShowHandRefusedLine(coopprof::kEditorOffText); }   /* owner 1764: told only once it is closed */
+    int win = -9;   /* T-1462 (owner 1838): the mod's Level Editor window in its place - 1 opened, else not built (-9 not tried) */
+    if (r == 1)
+    {
+        ++g_editorOffClosed;
+        win = coop::UiEditorToolShow();
+        if (coopprof::EditorAfterCloseDecide(true, win == 1) == coopprof::kEditorAfterWindow) shown = "not shown: the Level Editor window opened instead";
+        else shown = ShowHandRefusedLine(coopprof::kEditorOffText);   /* owner 1764: told only once it is closed */
+    }
     if (g_editorOffCount <= kEditorOffLineCap)
         DebugLog(std::string("[EDITOR] T-1414 Level Editor closed: multiplayer world - ")
                  + (r == 1 ? "the engine's toggle closed it" : (r == 0 ? std::string("NOT closed: ") + why : std::string("NOT closed: the close faulted")))
+                 + "; T-1462 window " + (win == 1 ? std::string("OPENED") : (win == -9 ? std::string("not opened (not closed)") : "NOT built (rc=" + N(win) + ") - the T-1414 message instead"))
                  + " (message " + shown + ", opened=" + N(g_editorOffCount) + ", closed=" + N(g_editorOffClosed)
                  + (g_editorOffCount == kEditorOffLineCap ? ", line cap reached - counted only from here" : "") + ")");
+}
+/* T-1462 (owner 1839): THE ENGINE'S HIDDEN rebuild_navmesh KEY ACTION IS REFUSED IN A MULTIPLAYER WORLD, silently (coopprof::NavKeyDecide).
+   Key command 0x386 in processKeys (1.0.65 0x7875C0, decomp_7875c0:217-263) calls the editor's Fix stuff 0x771C70 (row
+   LevelEditorFixStuff) on PlayerInterface+0x298, shows 'Fixed broken save data' when it answers non-zero, then the area rebuild
+   0x3AB700 (row ZoneWalkMapRebuild) for the camera's area. processKeys calls each of the two exactly once, in that branch (both builds,
+   Read from the executables), so a return address inside [ProcessKeys, ProcessKeysEnd) IS that key action. Both entries are hooked;
+   in a multiplayer world a call from there is refused (Fix stuff answers 0 - no message), any other caller runs unchanged - the mod's
+   own rebuilds (T-1428, the T-1462 window) call the hooked 0x3AB700 entry from the mod and pass. One [EDITOR] T-1462 BLOCKED line per
+   refused key action (at the area rebuild, its last call; 20 per launch). MAIN THREAD (processKeys' and the mod's callers). */
+typedef int  (*NavFixFn)(void* editor);
+typedef void (*NavRbFn)(void* nav, void* zoneMap);
+NavFixFn orig_navFix = 0;
+NavRbFn  orig_navRb  = 0;
+int g_navFixHookOn = 0, g_navRbHookOn = 0;
+#ifdef SW_DEV_BUILD
+int g_navKeyAsKey = 0;   /* TEST-ONLY `editorkey rebuildnav` (DEV build): 1 while its own calls ask as the key step does */
+#endif
+long long g_navPassLines = 0;
+long long g_navFixRefused = 0, g_navRbRefused = 0, g_navFixRun = 0, g_navRbRun = 0;
+const long long kNavKeyLineCap = 20;
+unsigned long long kNavFixRva = 0; static coop::AddrReg kNavFixRva_reg("LevelEditorFixStuff", &kNavFixRva);   /* Steam_1.0.65 0x771C70, 1.0.68 0x7727B0: int (LevelEditor*) */
+unsigned long long kNavRbRva = 0;  static coop::AddrReg kNavRbRva_reg("ZoneWalkMapRebuild", &kNavRbRva);      /* Steam_1.0.65 0x3AB700, 1.0.68 0x3AB840: void (NavMeshManager*, zoneMap) */
+/* the real check, always run: the return address inside processKeys (1), not (0) */
+static int NavFromKeyStep(void* ret)
+{
+    if (kProcessKeysRva == 0 || kProcessKeysEndRva == 0) return 0;
+    const uintptr_t b = (uintptr_t)::GetModuleHandleA(0), r = (uintptr_t)ret;
+    return (r >= b + (uintptr_t)kProcessKeysRva && r < b + (uintptr_t)kProcessKeysEndRva) ? 1 : 0;
+}
+/* review fold (1): the TEST-ONLY lever only ADDS 'asked as the key'; the return-address check runs on every call, and on a lever call
+   its verdict and the caller's address are logged (DEV build) */
+static int NavAskedAsKey() {
+#ifdef SW_DEV_BUILD
+    return g_navKeyAsKey;
+#else
+    return 0;
+#endif
+}
+static void NavCheckLine(const char* which, void* ret, int byAddr, int asKey, bool mp)
+{
+    const uintptr_t b = (uintptr_t)::GetModuleHandleA(0), r = (uintptr_t)ret;
+    char rv[40];
+    _snprintf_s(rv, sizeof(rv), _TRUNCATE, (r >= b) ? "exe+0x%llX" : "0x%llX", (unsigned long long)((r >= b) ? r - b : r));
+    if (asKey != 0)
+        DebugLog(std::string("[EDITOR] T-1462 editorkey rebuildnav: ") + which + " called from " + rv + "; the return-address check says "
+                 + (byAddr != 0 ? "INSIDE processKeys (the key step)" : "NOT inside processKeys (another caller)") + "; asked as the key by the TEST-ONLY lever");
+    else if (mp && ++g_navPassLines <= kNavKeyLineCap)
+        DebugLog(std::string("[EDITOR] T-1462 ") + which + " passed in a multiplayer world: called from " + rv + ", NOT inside processKeys (another caller - runs unchanged)"
+                 + (g_navPassLines == kNavKeyLineCap ? " (line cap reached - counted only from here)" : ""));
+}
+int detour_navFix(void* editor)
+{
+    const int byAddr = NavFromKeyStep(_ReturnAddress()), asKey = NavAskedAsKey();
+    const bool mp = HandSaveBlocked();
+    if (asKey != 0 || (mp && byAddr == 0)) NavCheckLine("Fix stuff 0x771C70", _ReturnAddress(), byAddr, asKey, mp);
+    if (coopprof::NavKeyDecide(mp, byAddr != 0 || asKey != 0) == coopprof::kNavKeyRefuse)
+    {
+        ++g_navFixRefused;
+        return 0;   /* nothing fixed: the key step shows no message */
+    }
+    ++g_navFixRun;
+    return orig_navFix(editor);
+}
+void detour_navRb(void* nav, void* zoneMap)
+{
+    const int byAddr = NavFromKeyStep(_ReturnAddress()), asKey = NavAskedAsKey();
+    const bool mp = HandSaveBlocked();
+    if (asKey != 0 || (mp && byAddr == 0)) NavCheckLine("area rebuild 0x3AB700", _ReturnAddress(), byAddr, asKey, mp);
+    if (coopprof::NavKeyDecide(mp, byAddr != 0 || asKey != 0) == coopprof::kNavKeyRefuse)
+    {
+        ++g_navRbRefused;
+        if (g_navRbRefused <= kNavKeyLineCap)
+            DebugLog("[EDITOR] T-1462 rebuild_navmesh key action BLOCKED: multiplayer world - Fix stuff 0x771C70 and the area rebuild 0x3AB700 not run, silently (refused fix="
+                     + N(g_navFixRefused) + " rebuild=" + N(g_navRbRefused) + (byAddr != 0 ? ", from processKeys" : ", asked by the TEST-ONLY editorkey rebuildnav")
+                     + (g_navRbRefused == kNavKeyLineCap ? ", line cap reached - counted only from here" : "") + ")");
+        return;
+    }
+    ++g_navRbRun;
+    orig_navRb(nav, zoneMap);
 }
 /* T-948 b (run T1505, Confirmed): another game's characters (copies) arrive here in ONE squad, as their own game has them; two
    engine roads then split them into new squads numbered as this game's own, so this game's area roster differs from the owner's.
@@ -22180,6 +23712,68 @@ int LoadingScreenOffPod()
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* T-36 S2 / T-1399: the import request's code and its switch word (SaveManager+0xA4, decomp_47aa80.txt) - here, above the pump that
+   rewrites it (T-1399 fold NIT), and read by ResetImportRequestPod below */
+const int kResetLoadRequest = 2, kResetImportRequest = 3;
+const int kResetImportFlagsOff = 0xA4;   /* SaveManager+0xA4: the request's flags (decomp_47aa80.txt) */
+/* T-1399: the posted import's switch word, read and its research bit rewritten (spimport::ResearchRedecided - the creator bits stay as
+   armed at the post: T-1399 fold LOW 2) while the request is still the import (kResetImportRequest) the pump is about to run. 1 = done,
+   0 = not an import request or an implausible object, -1 = raised. MAIN THREAD (the pump). */
+int SpImportPumpFlagsPod(void* saveMgr, bool research, unsigned int* was, unsigned int* now)
+{
+    __try
+    {
+        if (!Plaus(saveMgr)) return 0;
+        if (*(const int*)((const char*)saveMgr + kSaveRequestCodeOff) != kResetImportRequest) return 0;
+        unsigned int* f = (unsigned int*)((char*)saveMgr + kResetImportFlagsOff);
+        *was = *f;
+        *now = spimport::ResearchRedecided(*was, research);
+        *f = *now;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-1399 (F1750): THE RESEARCH DECISION POINT. The single-player import's switch word was written at its post (StoreResetCarryPost) from
+   what was known then; here, once the wait for the world server's records has let it go and the engine is about to run it, it waits
+   for the world's live options list (and, hosting, its own HOST-screen import rows while they can still come - SpImportCommitWaits) and
+   its research bit is decided again from that list. MAIN THREAD (the pump).
+   T-1399 fold (F1751 M2): a wait with the world server's link gone for good (PreloadLinkGoneForGood - the held load's own decision) is
+   refused as a held NEW GAME / load is (the existing CAN'T JOIN box); LOW 1: a switch word that cannot be decided again is refused as
+   the profile gate refuses (SayRefusedOnScreen), never run with its post's word. The pump clears the request either way.
+   T-1399 fold (F1751 LOW 3): an import is posted only under the title screen (StoreResetCarryPost's one caller, ui.cpp's load post), so this decision sits only in the
+   pump's title-screen branch. */
+enum { kSpPumpGo = 0, kSpPumpHold = 1, kSpPumpRefuseLink = 2, kSpPumpRefuseWord = 3 };
+long long g_spPumpFlagsFailed = 0, g_spPumpLinkRefused = 0;
+int SpImportPumpCommit(void* saveMgr)
+{
+    if (g_spImportCarry == 0) return kSpPumpGo;
+    if (SpImportCommitWaits("research (before the engine runs it)") != 0)
+    {
+        if (PreloadLinkGoneForGood() == 0) return kSpPumpHold;
+        if (g_pumpRefusalUncleared == 0)   /* said once per refusal, as the pump's other refusals */
+        {
+            ++g_spPumpLinkRefused;
+            ErrorLog("[IMPORT] T-1399: the import is REFUSED - it waited for the world's options list (or this hosting game's own rows) and the world"
+                     " server's link is gone for good (down with no dial of it pending, or no world server can answer this game); nothing is imported - the request is cleared, the loading screen turned off"
+                     " and the CAN'T JOIN box shown. spPumpLinkRefused=" + N(g_spPumpLinkRefused));
+        }
+        return kSpPumpRefuseLink;
+    }
+    unsigned int was = 0, now = 0;
+    const int w = SpImportPumpFlagsPod(saveMgr, SpImportResearch(), &was, &now);
+    if (w != 1)
+    {
+        if (g_pumpRefusalUncleared == 0)
+        {
+            ++g_spPumpFlagsFailed;
+            ErrorLog("[IMPORT] T-1399: the import's switch word could not be decided again before the engine runs it (" + N((long long)w)
+                     + ") - the import is REFUSED as the profile gate refuses (its post's word is never run). spPumpFlagsFailed=" + N(g_spPumpFlagsFailed));
+        }
+        return kSpPumpRefuseWord;
+    }
+    SpImportDecidedLine("research", SpImportResearch(), was, now);
+    return kSpPumpGo;
+}
 /* The verdict inside the load depth, exactly as detour_loadGame holds it (C2712: no object in this frame). */
 int PumpVerdictInDepth(void* self)
 {
@@ -22249,10 +23843,12 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
         char qb[260]; qb[0] = 0;
         CopyStdStringPod((const char*)self + kSaveRequestNameOff, qb, 260); qb[259] = 0;
         if (reqCode == coopprof::kProfReqImport) ResetCarryEndIfSaved("a load or import asked");   /* as the load gate does before its test */
+        int impHold = 0;   /* T-1399 fold (F1751 M2 sibling): the reset world's import - PreloadHoldsTitleLoad's 1 = hold, 2 = refuse (was held for ever) */
         if (reqCode == coopprof::kProfReqImport
             && coopprof::ProfileResetImportPass(reqCode, std::string(qb), g_profSaveFolder, ResetCarryLive(), g_resetCarryFolder, g_resetCarryForFolder,
-                                                g_resetCarryNewId, HeldWorldId())
-            && PreloadHoldsTitleLoad() != 0)
+                                                g_resetCarryNewId, HeldWorldId()))
+            impHold = PreloadHoldsTitleLoad();
+        if (impHold == 1)
         {   /* T-36: the reset world's import - the one the load gate lets through (the same test) - waits as a load does, so its first
                areas load after the world server's current area records; any other IMPORT GAME is not held and the gate decides it now */
             if (g_resetImportHoldSaid == 0)
@@ -22261,6 +23857,40 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
                 DebugLog("[RESET] the import of '" + std::string(qb) + "' WAITS under the loading screen for the world server's current records (the"
                          " hold a load gets: until they are in - T-1279: with no time bound while the link is up) - asked again every frame");
             }
+            return;
+        }
+        /* T-1399: the records are in - a single-player import's research is decided now from the world's live options (it waits for them) */
+        /* (T-1399 fold LOW 3: the only import post, ui.cpp's StoreResetCarryPost call, runs under the title screen - so this branch is its one road) */
+        int spCommit = kSpPumpGo;
+        if (impHold == 0 && reqCode == coopprof::kProfReqImport && g_spImportCarry != 0 && g_spImportPumpDecided == 0)
+        {
+            spCommit = SpImportPumpCommit(self);
+            if (spCommit == kSpPumpHold) return;
+            if (spCommit == kSpPumpGo) g_spImportPumpDecided = 1;
+        }
+        if (impHold == 2 || spCommit == kSpPumpRefuseLink)
+        {   /* T-1399 fold (F1751 M2): the link is gone for good - an import is refused as a held load is (T-1279 fold): the request cleared,
+               the loading screen off, the existing CAN'T JOIN box (CAN'T HOST for the hosting game); PreloadRefuse / SpImportPumpCommit
+               said why, once; what its post armed is dropped (ImportRefusedCleanup) */
+            ++g_loadRefusedAtPump;
+            const int cleared = ClearSaveRequestCodePod(self);
+            if (cleared != 1) { ++g_pumpClearFailed; g_pumpRefusalUncleared = 1; return; }   /* offered again next frame and refused again, said once - still armed */
+            ImportRefusedCleanup(impHold == 2 ? "the records wait: the link is gone for good" : "the options-list wait: the link is gone for good");   /* re-check 2 M2: only once cleared */
+            g_pumpRefusalUncleared = 0;
+            if (LoadingScreenOffPod() == 1) ++g_loadRefuseLoadingScreenOff; else ++g_loadingScreenOffFailed;   /* 0x6E1E00(&ForgottenGUI, 0) */
+            UiPreloadRefusedBox(ConfigRole() == kRoleClient ? 1 : 0);
+            return;
+        }
+        if (spCommit == kSpPumpRefuseWord)
+        {   /* T-1399 fold (F1751 LOW 1): refused as the profile gate below refuses - once per refusal, with the existing CAN'T LOAD words
+               "Couldn't load your game." (coopui::kLoadFailText - the load could not be posted; re-check NIT: not the gate's generic line) */
+            ++g_loadRefusedAtPump;
+            if (g_pumpRefusalUncleared == 0) { g_loadRefuseLine = coopui::kLoadFailText; SayRefusedOnScreen(); }
+            const int cleared = ClearSaveRequestCodePod(self);
+            if (cleared != 1) { ++g_pumpClearFailed; g_pumpRefusalUncleared = 1; return; }   /* still armed: refused again next frame, said once */
+            ImportRefusedCleanup("the switch word could not be decided again");   /* re-check 2 M2: only once cleared */
+            g_pumpRefusalUncleared = 0;
+            if (LoadingScreenOffPod() == 1) ++g_loadRefuseLoadingScreenOff; else ++g_loadingScreenOffFailed;   /* 0x6E1E00(&ForgottenGUI, 0) */
             return;
         }
         /* T-1365 fold (review H1): a NEW GAME already held asks its hold FIRST - held frames do not ask the gate; the frame the hold lets
@@ -22274,6 +23904,7 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
             if (g_pumpRefusalUncleared == 0) SayRefusedOnScreen();   /* F2: once per refusal */
             const int cleared = ClearSaveRequestCodePod(self);
             if (cleared != 1) { ++g_pumpClearFailed; g_pumpRefusalUncleared = 1; return; }
+            if (reqCode == coopprof::kProfReqImport) ImportRefusedCleanup("the profile gate refused it");   /* T-1399 fold (re-check LOW 2; re-check 2 M2: only once cleared) */
             g_pumpRefusalUncleared = 0;
             if (LoadingScreenOffPod() == 1) ++g_loadRefuseLoadingScreenOff; else ++g_loadingScreenOffFailed;   /* 0x6E1E00(&ForgottenGUI, 0) */
             if (reqCode == coopprof::kProfReqNewGame)
@@ -22464,7 +24095,7 @@ std::string* ZoneSfsReadServe(void* sfs, std::string* out, const std::string* re
                so Kenshi's load fails and it builds the base area (decomp_9fec00.txt:127-148), never a stale local file; its next own save
                of the area deletes that file. The copy is marked as loaded from this record (as a served load is at gdcLoad), so its next
                save is not refused as a stale copy. No owner translation: nothing is loaded. */
-            ZoneStamp est; est.writtenAt = sw.writtenAt; est.seq = sw.seq;
+            ZoneStamp est; est.writtenAt = sw.writtenAt; est.seq = sw.seq; est.writer = ZoneWriterSlot(sw.owner);   /* T-1429 */
             ZoneMarkNote(zoneId, true, est, listDone != 0 ? lgR : -1, (listDone == 0 && lgR >= 1) ? lgR : -1, listDone != 0 ? 1 : 0);
             const std::string none = zonerec::ZoneNoFilePath(sw.file);
             const long long served = ::InterlockedIncrement64(&g_zoneEmptyServed);
@@ -22478,7 +24109,7 @@ std::string* ZoneSfsReadServe(void* sfs, std::string* out, const std::string* re
 #ifdef SW_DEV_BUILD
             if (ZoneOwnNextFires(zoneId))   /* T-1372 TEST-ONLY zoneownnext: this one read loads the save's own file */
             {
-                ZoneStamp est; est.writtenAt = sw.writtenAt; est.seq = sw.seq;
+                ZoneStamp est; est.writtenAt = sw.writtenAt; est.seq = sw.seq; est.writer = ZoneWriterSlot(sw.owner);   /* T-1429 */
                 ZoneMarkNote(zoneId, true, est, listDone != 0 ? lgR : -1, (listDone == 0 && lgR >= 1) ? lgR : -1, listDone != 0 ? 1 : 0);
                 DebugLog("[ZONE] zoneownnext (TEST-ONLY) LOAD-OVERRIDE skipped " + zoneId + " '" + rel + "': the save's own area file is loaded, not the shared world's copy (record writtenAt="
                          + N(sw.writtenAt) + " owner=" + N(sw.owner) + "); marked as from that record, so this game's next save of it is not refused as stale; one-shot, now disarmed"
@@ -22486,6 +24117,7 @@ std::string* ZoneSfsReadServe(void* sfs, std::string* out, const std::string* re
                 return orig_sfsReadFile(sfs, out, relPath);
             }
 #endif
+            if (onMain) AreaMirrorEnsure(zoneId);   /* T-1391 F1706: a state whose commit or plain mirror rebuild has not landed is tried first, so this read gets its bytes */
             if (U8GetFileAttributes(sw.file.c_str()) != INVALID_FILE_ATTRIBUTES)
             {
                 /* Z1-b (review-z1 item 2): THE OWNER VERDICT IS TAKEN HERE, before the swap, from the same entry. A record
@@ -22600,10 +24232,10 @@ void ZoneLoadedCopyNote(const std::string* relPath, const std::string* served)
             const int recWriter = (haveRec && sw.owner >= 0 && sw.owner <= coopslot::kSlotMax) ? sw.owner : -1;
             if (path.empty()) c.from = "no file - the save never wrote this area and Kenshi builds it from its game data";
             else if (haveRec && sw.empty != 0 && path == zonerec::ZoneNoFilePath(sw.file))
-            { zonerec::ZoneEmptyEncode(&c.bytes); c.have = 1; c.writer = recWriter; c.from = "the world's EMPTY record writtenAt " + N(sw.writtenAt) + " seq " + N((long long)sw.seq); }
+            { zonerec::ZoneEmptyEncode(&c.bytes); c.have = 1; c.writer = recWriter; c.road = areafresh::kLcFromRecord; c.from = "the world's EMPTY record writtenAt " + N(sw.writtenAt) + " seq " + N((long long)sw.seq); }
             else if (!ReadFileBytesShared(path, &c.bytes)) c.from = "the file " + path + " could not be read";
-            else if (haveRec && path == sw.file) { c.have = 1; c.writer = recWriter; c.from = "the world's record writtenAt " + N(sw.writtenAt) + " seq " + N((long long)sw.seq); }
-            else { c.have = 1; c.writer = g_mySlot; c.from = "this game's own save file"; }
+            else if (haveRec && path == sw.file) { c.have = 1; c.writer = recWriter; c.road = areafresh::kLcFromRecord; c.from = "the world's record writtenAt " + N(sw.writtenAt) + " seq " + N((long long)sw.seq); }
+            else { c.have = 1; c.writer = g_mySlot; c.road = areafresh::kLcFromKenshiFile; c.from = "this game's own save file"; }   /* F1664 M4: Kenshi's own save file - its writer is this game's slot so owners read right; never 'own unconfirmed' (its road) */
         }
     }
     catch (...) { c.bytes.clear(); c.have = 0; c.from = "the copy could not be kept (out of memory)"; }
@@ -23134,6 +24766,33 @@ void InstallStore()
         if (g_editorShowHookOn == 0)   /* T-1414: its own line - the close needs the setVisible hook whatever the reset hook did */
             ErrorLog(std::string("[EDITOR] T-1414 Level Editor close=not-installed (") + (sAddr == 0 ? "no LevelEditor_setVisible row in this build's table" : "the hook did not take")
                      + ") - the Level Editor stays open in a multiplayer world this run");
+    }
+    /* T-1462 (owner 1839): the rebuild_navmesh key action's two calls, refused in a multiplayer world when processKeys makes them. */
+    {
+        unsigned char npre[8], npost[8];
+        const uintptr_t fAddr = (uintptr_t)coop::AddrAbs(kNavFixRva);
+        if (fAddr != 0)
+        {
+            const int f0 = ReadPrologue((const void*)fAddr, npre);
+            coop::HookStatus hf = coop::AddHook((void*)fAddr, (void*)&detour_navFix, (void**)&orig_navFix);
+            const int f1 = ReadPrologue((const void*)fAddr, npost);
+            g_navFixHookOn = (hf == coop::SUCCESS && orig_navFix != 0 && f0 != 0 && f1 != 0 && std::memcmp(npre, npost, 8) != 0) ? 1 : 0;
+        }
+        const uintptr_t zAddr = (uintptr_t)coop::AddrAbs(kNavRbRva);
+        if (zAddr != 0)
+        {
+            const int z0 = ReadPrologue((const void*)zAddr, npre);
+            coop::HookStatus hz = coop::AddHook((void*)zAddr, (void*)&detour_navRb, (void**)&orig_navRb);
+            const int z1 = ReadPrologue((const void*)zAddr, npost);
+            g_navRbHookOn = (hz == coop::SUCCESS && orig_navRb != 0 && z0 != 0 && z1 != 0 && std::memcmp(npre, npost, 8) != 0) ? 1 : 0;
+        }
+        if (g_navFixHookOn != 0 && g_navRbHookOn != 0 && kProcessKeysRva != 0 && kProcessKeysEndRva != 0)
+            DebugLog("[EDITOR] T-1462 hooks installed: the rebuild_navmesh key action (Fix stuff 0x771C70, then the area rebuild 0x3AB700, called from processKeys)"
+                     " is refused in a multiplayer world; every other caller runs unchanged");
+        else
+            ErrorLog(std::string("[EDITOR] T-1462 rebuild_navmesh block=not-installed (fix hook ") + (g_navFixHookOn != 0 ? "on" : (fAddr == 0 ? "no LevelEditorFixStuff row" : "did not take"))
+                     + ", rebuild hook " + (g_navRbHookOn != 0 ? "on" : (zAddr == 0 ? "no ZoneWalkMapRebuild row" : "did not take"))
+                     + ", processKeys window " + (kProcessKeysRva != 0 && kProcessKeysEndRva != 0 ? "known" : "NOT known") + ") - the hidden key action is not blocked this run");
     }
     /* T-948 b: the two new-squad roads - a squad of copies is not split, a copy is not moved to a new squad. Each table row is
        byte-checked by AddrInit; each hook is judged by the bytes read back. */
@@ -23705,21 +25364,22 @@ void StoreFeedOffAtLoad(const char* why)
    full ask that failed or went unanswered on the old link is asked again on the new one. */
 bool PreloadSend(const std::vector<char>& b);   /* below, beside the records before the load */
 long long g_hoOwnUsed = 0, g_hoOwnUnread = 0, g_hoNoCopy = 0, g_hoAsked = 0, g_hoAskSent = 0, g_hoAskFailed = 0, g_hoAskBatches = 0;
-long long g_hoOwnLines[4] = { 0, 0, 0, 0 }, g_hoNoCopyLines[4] = { 0, 0, 0, 0 };
+long long g_hoOwnLines[5] = { 0, 0, 0, 0, 0 }, g_hoNoCopyLines[5] = { 0, 0, 0, 0, 0 };
 std::set<std::string> g_hoAskedKeys;   /* asked in full once each on this link (cleared at each new link - fold 3; a world server that still cannot send it is not asked again on it) */
 std::vector<std::string> g_hoAskQ;     /* asked at the next StoreFeedTick, one FETCH of up to kHoAskBatch keys */
 const size_t kHoAskBatch = 64;
 const unsigned int kHoFetchToken = 0x14210000u;   /* never a held load's token in practice; its FETCH_END is stale here outside a held load's fetch (cooppre::PreOnFetchEnd) */
-/* the kind index of a record whose receiver needs the whole contents (0 door, 1 building, 2 cage, 3 town clock), -1 any other */
+/* the kind index of a record whose receiver needs the whole contents (0 door, 1 building, 2 cage, 3 town clock, 4 camp mark), -1 any other */
 int HoKindOf(const std::string& id)
 {
     if (doorrec::IsDoorRecId(id)) return 0;
     if (bldgrec::IsBldgRecId(id)) return 1;
     if (cagerec::IsCageRecId(id)) return 2;
     if (towntime::IsTownTimeId(id)) return 3;
+    if (camplaid::IsCampLaidId(id)) return 4;   /* T-1429 design b */
     return -1;
 }
-const char* HoKindName(int k) { return k == 0 ? "door" : k == 1 ? "building" : k == 2 ? "cage" : "town clock"; }
+const char* HoKindName(int k) { return k == 0 ? "door" : k == 1 ? "building" : k == 2 ? "cage" : k == 3 ? "town clock" : "camp mark"; }
 /* fold 2: the generation (and a door's state) of the copy laid, for the own-copy line - read with the kind's own decoder */
 std::string HoGenText(int kind, const std::vector<char>& b)
 {
@@ -23728,6 +25388,7 @@ std::string HoGenText(int kind, const std::vector<char>& b)
     else if (kind == 1) { bldgrec::BldgRec r; if (bldgrec::DecodeBldgRec(p, b.size(), &r) == bldgrec::kBgOk) return "gen " + N((long long)r.generation); }
     else if (kind == 2) { cagerec::CageRec r; if (cagerec::DecodeCageRec(p, b.size(), &r) == cagerec::kCrOk) return "gen " + N((long long)r.generation); }
     else if (kind == 3) { towntime::TownTimeRec r; if (towntime::DecodeTownTimeRec(p, b.size(), &r) == towntime::kTtOk) return "gen " + N((long long)r.generation); }
+    else if (kind == 4) { camplaid::CampLaidRec r; if (camplaid::DecodeCampLaidRec(p, b.size(), &r) == camplaid::kClOk) return "gen " + N((long long)r.generation); }
     return "gen unreadable";
 }
 /* fold 3: a new link (its WELCOME) - the keys asked for in full on the old link may be asked again */
@@ -24100,7 +25761,7 @@ struct PreWantHere
         const int newGame = cooppre::PreSrcIsNewGame(g_preAoiSource);   /* T-1365: a NEW GAME's fetch - every area record when it has no start-town list */
         const int cls = cooppre::PreNewGameClass(cooppre::PreAoiClass(e.ax, e.ay, g_preAoiList, cooppre::kPreRing), IsZoneId(e.key) ? 1 : 0, g_preAoiSource == cooppre::kPreSrcNewGameAll ? 1 : 0);
         if (cls == cooppre::kPreAoiIn) ++g_preAoiRowsIn; else if (cls == cooppre::kPreAoiOut) ++g_preAoiRowsOut; else if (cls == cooppre::kPreAoiNoArea) ++g_preAoiRowsNoArea; else ++g_preAoiRowsNoList;
-        const bool boxOrPiece = coopbrec::IsBoxRecId(e.key) || piecerec::IsPieceRecId(e.key) || shoprec::IsShopRecId(e.key) || doorrec::IsDoorRecId(e.key) || cagerec::IsCageRecId(e.key) || bldgrec::IsBldgRecId(e.key) || towntime::IsTownTimeId(e.key);   /* a shop or door record names its area as a box does */
+        const bool boxOrPiece = coopbrec::IsBoxRecId(e.key) || piecerec::IsPieceRecId(e.key) || shoprec::IsShopRecId(e.key) || doorrec::IsDoorRecId(e.key) || cagerec::IsCageRecId(e.key) || bldgrec::IsBldgRecId(e.key) || towntime::IsTownTimeId(e.key) || camplaid::IsCampLaidId(e.key);   /* a shop or door record names its area as a box does */
         /* T-985 C2b fold 1 (preload.h PreRowChoose): a row is left for the feed only when the world server's copy AND this game's
            own copy lie outside the ring and the asker's player did not write it (review HIGH 1, 2). A kept key the gate still holds
            back that is left outside stays held while the server's copy is newer; a kept row held beside goes into the skipped
@@ -24491,6 +26152,17 @@ void PreloadHoldNote(DWORD now, const char* what)
              + " (link up=" + N((long long)(LinkUp() ? 1 : 0)) + ", can answer=" + N((long long)PreloadLinkCanServe()) + ", phase " + N((long long)g_pre.phase)
              + ", index pages " + N((long long)g_pre.pages) + ", wanted " + N((long long)g_pre.want.size()) + ", answered " + N((long long)g_pre.settled.size())
              + "; no time bound - the loading screen stays until the world's records are in; first 60 logged)");
+}
+/* T-1399 fold (F1751 M2): MAIN THREAD. 1 = the world server's link is gone for good - the held load's own decision
+   (cooppre::PreBeginDecide, as PreloadHoldsTitleLoad asks it below): down with no dial of it pending (kPreBeginRefuse), or no world
+   server can answer this game at all (kPreBeginNotAsked: another world, its password or access list stopped this join, its protocol
+   - re-check M1: the records wait lets a load go then, but the options list was wiped with the link and never comes) - for a wait at
+   the pump that is not the records exchange (an import's wait for the world's options list) */
+int PreloadLinkGoneForGood()
+{
+    const int linkReady = (LinkUp() && g_indexLoaded) ? 1 : 0;
+    const int b = cooppre::PreBeginDecide(linkReady, PreloadLinkCanServe(), PreloadDialPending());
+    return (b == cooppre::kPreBeginRefuse || b == cooppre::kPreBeginNotAsked) ? 1 : 0;
 }
 /* MAIN THREAD, SaveRequestPumpBody, every frame a title load is about to dispatch: 1 = hold it this frame; 2 = refuse it (T-1279 fold:
    the link is down and no dial is pending - the pump clears the request, turns the loading screen off and shows CAN'T JOIN); 0 = go. */
@@ -26645,6 +28317,8 @@ void PumpLink()
                 ::InterlockedExchange(&g_areaMapAtTick, (long)::GetTickCount());   /* P7p (review-p7f M-3): and WHEN, so the term above ages out instead of latching for the life of the world */
                 ApplyRelayAreaMap(&m.payload[0], (int)m.payload.size(), g_mySlot);   /* M9 (T-197): the whole payload; an empty map (n == 0) is applied as no map, as before */
                 if (g_queueDoorWaitArmed != 0 && LinkUp()) { g_queueDoorWaitArmed = 0; ++g_queueDoorReasked; StoreQueueReplayTick(); }   /* T-1391: a door state kept for its area is asked again at this area map - the event that settles who holds it */
+                if (!g_zonePushHeldWait.empty() && g_zoneOn && LinkUp() && g_repushPending == 0) ZonePushHeldRetry();   /* T-1391 F1631 item 5: an own save waiting for its area's holder to leave */
+                if (!g_zoneKeptBase.empty() && g_zoneOn) ZoneKeptBaseIdleSweep();   /* T-1391 F1680 L3: a kept base nobody needs goes (an area unloaded since, or never revisited) */
             }
             else ApplyRelayAreaMap(0, 0, g_mySlot);   /* M9: a malformed map - counted areaMapOdd[malformed], nothing applied */
         }
@@ -26673,7 +28347,7 @@ void PumpLink()
                ending the drain: the next option is meant to cost no protocol bump. */
             unsigned int on = 0; size_t oat = 4;
             if (!GetU32S(m.payload, 0, &on) || on > 64) ErrorLog("[STORE] malformed OPTIONS from the store - ignored");
-            else { coop::SettingsWorldOptionsBegin(); coop::RecruitMultMapBegin(); coop::ResearchModeMapBegin(); coop::ResurrectOptionsMapBegin(); coop::KapiOptionsMapBegin(); bool gpComplete = true, rcRefusal = false;   /* settings2 S2: the gp.* rows of THIS map; a map cut short is not a record */
+            else { SpImportOptionsMapBegin(); coop::SettingsWorldOptionsBegin(); coop::RecruitMultMapBegin(); coop::ResearchModeMapBegin(); coop::ResurrectOptionsMapBegin(); coop::KapiOptionsMapBegin(); bool gpComplete = true, rcRefusal = false;   /* settings2 S2: the gp.* rows of THIS map; a map cut short is not a record */
             bool menusSeen = false;   /* T-1392: MENUS AND BUILDING was in this map */
             for (unsigned int oi = 0; oi < on; ++oi)
             {
@@ -26726,6 +28400,7 @@ void PumpLink()
             }
             if (gpComplete && !rcRefusal && !menusSeen && ::InterlockedExchange(&g_menusPause, (long)coopclock::kMenusPauseAbsent) != (long)coopclock::kMenusPauseAbsent)   /* T-1392: no row = owner 1724 a */
                 DebugLog(std::string("[TIME] T-1392: the world's map holds no MENUS AND BUILDING - it is '") + coopclock::MenusPauseWire(coopclock::kMenusPauseAbsent) + "' (coopclock::kMenusPauseAbsent)");
+            SpImportOptionsMapEnd(gpComplete && !rcRefusal);   /* T-1399: the world's import options are this whole map's (a row it does not name is absent) */
             coop::SettingsWorldOptionsEnd(gpComplete); coop::RecruitMultMapEnd(gpComplete && !rcRefusal); coop::ResearchModeMapEnd(gpComplete && !rcRefusal); coop::ResurrectOptionsMapEnd(gpComplete && !rcRefusal); coop::KapiOptionsMapEnd(gpComplete && !rcRefusal); }   /* settings2 S2: apply the world record now (every game), and let the authority record what is absent */
         }
         else if (m.type == (net::MsgType)kStoreMsgClock)
@@ -36241,6 +37916,8 @@ struct OwnLeaveSave
     long  linkGen, worldReset;       /* fold item 1: the session link generation and the world load/reset count at the begin */
     unsigned long long drainSeq;     /* fold item 7: g_ownSeq at the begin - the drain waits for these records only */
     unsigned long long requestFt;    /* fold item 8: the FILETIME of the accepted request */
+    int holdCp;                      /* T-1429 machine age fold 1: the hold waits for the leave checkpoint (1) - and always for the save's area echoes */
+    int pieceFlushed;                /* T-1429 machine age fold 1: this leave save flushed the pieces (a real leave, quit or host-left) */
     void* holdSender; int holdSenderSet;   /* mmo5 LOW: the confirm sender that raised the held quit */
     char  target[260];   /* T-251: the profile save folder's name */
     char  where[16];
@@ -36309,12 +37986,15 @@ static bool OwnLeaveSaveWantedNow(std::string* target, std::string* detail)
                 + " characterEditorOpen=" + N((long long)(editorOpen ? 1 : 0));
     return wanted;
 }
+long long g_ownLsPieceMarked = 0, g_ownLsPieceLines = 0;   /* T-1429 machine age (B): pieces the leave save's flush marked; its lines */
 bool OwnLeaveSaveBegin(const char* where, int cont)
 {
     OwnLeaveSave& L = g_ownLs;
     if (L.phase != coopown::kLsIdle)
     {
         L.cont |= cont;
+        if (L.pieceFlushed == 0 && (cont & (coopown::kLsContLeave | coopown::kLsContQuit)) != 0 && L.phase == coopown::kLsDrain)   /* machine age fold 1: a leave / quit joining a created save still draining */
+        { g_ownLsPieceMarked = coop::PieceRecLeaveFlush(); L.pieceFlushed = 1; }
         DebugLog("[OWNSAVE] leave save: the " + std::string(where) + " joins the leave save already running for '" + std::string(L.target)
                  + "' (phase " + N((long long)L.phase) + ") - it continues at that save's completion edge");
         return true;
@@ -36335,6 +38015,9 @@ bool OwnLeaveSaveBegin(const char* where, int cont)
     _snprintf(L.target, 259, "%s", target.c_str()); L.target[259] = 0;
     _snprintf(L.where, 15, "%s", where); L.where[15] = 0;
     ++g_ownLsStarted;
+    if ((cont & (coopown::kLsContLeave | coopown::kLsContQuit)) != 0 || std::string(where) == "host-left")   /* machine age fold 1 (review LOW): only when the session ends - the created / given save goes on playing */
+    { g_ownLsPieceMarked = coop::PieceRecLeaveFlush(); L.pieceFlushed = 1; }   /* T-1429 machine age (B): every changed piece marked as an area unload marks it - the drain waits for their writes */
+    else g_ownLsPieceMarked = 0;
     DebugLog("[OWNSAVE] leave save STARTED (" + std::string(where) + "): drain the own-records writer (records up to seq="
              + N((long long)L.drainSeq) + "), then save the profile's own slot '" + target + "' under its own name through the save"
              " verb's door (SaveManager::save); the " + std::string(where) + " continues at the completion edge (give-ups: drain 5 s,"
@@ -36397,7 +38080,12 @@ void OwnLeaveSaveTick()
     int drainDone = 0, req = 0, done = 0;
     std::string dir;
     void* sm = OwnSaveManagerPtr();
-    if (L.phase == coopown::kLsDrain) drainDone = coopown::LeaveDrainDone(OwnStoreOldestPendingSeq(), L.drainSeq) ? 1 : 0;
+    int pfWaits = 0, pfDone = 0, pfHeld = 0;   /* T-1429 machine age (B): the flushed pieces' writes */
+    if (L.phase == coopown::kLsDrain)
+    {
+        if (L.pieceFlushed != 0) pfWaits = coop::PieceRecLeavePending(&pfDone, &pfHeld);   /* machine age fold 1: only a flush this save made */
+        drainDone = (coopown::LeaveDrainDone(OwnStoreOldestPendingSeq(), L.drainSeq) && pfWaits == 0) ? 1 : 0;   /* and every flushed piece's write stored (or held: not this game's) */
+    }
     else if (L.phase == coopown::kLsRequest)
     {
         if (worldSame && !stopping && sm != 0 && GameplayRunning() && !EngineWritesBlocked())
@@ -36412,9 +38100,15 @@ void OwnLeaveSaveTick()
     const bool held = L.phase == coopown::kLsFinished;   /* restore1b1 fold 2 (recheck item 3): the continuation waits for the leave checkpoint */
     if (held)
     {
-        const bool settled = OwnStoreCheckpointSettled();
-        if (!restoreguard::LeaveCheckpointHoldDone(settled, inPhase, 5000u)) return;   /* each tick, never blocking */
-        if (!settled)
+        const bool cpSettled = (L.holdCp == 0) || OwnStoreCheckpointSettled();
+        const bool settled = cpSettled && g_zoneEchoWait.empty();   /* T-1429 machine age fold 1: every area upload of the save confirmed (stored, its seq known and kept: MirrorKeepFlush at the last echo) */
+        if (!restoreguard::LeaveCheckpointHoldDone(settled, inPhase, 5000u)) return;   /* each tick, never blocking - the hold's own 5 s */
+        if (!g_zoneEchoWait.empty())
+            ErrorLog("[OWNSAVE] leave save: " + N((long long)g_zoneEchoWait.size()) + " area upload(s) of the save not confirmed within 5 s - their version is not known here at the"
+                     " next load; a piece record and this game's own copy are then judged by their own stamps (T-1429 machine age fold 1)");
+        else if (L.holdCp != 0 || inPhase > 0)
+            DebugLog("[OWNSAVE] leave save: the save's area uploads confirmed after " + N((long long)inPhase) + " ms of the hold (T-1429 machine age fold 1: their seq is the copy's version at the next load)");
+        if (!cpSettled)
         {
             ++g_ownLsCpHoldTimeout;
             ErrorLog("[OWNSAVE] leave save: the leave checkpoint was not written within 5 s - the " + std::string(L.where) + " continues without"
@@ -36430,6 +38124,10 @@ void OwnLeaveSaveTick()
         ErrorLog("[OWNSAVE] leave save: the own-records writer did not write the records queued before the leave within 5 s - the"
                  " save is requested anyway (those records are newer than its mark and are laid on top at the next load)");
     }
+    if (L.phase == coopown::kLsDrain && next != coopown::kLsDrain && L.pieceFlushed != 0 && ++g_ownLsPieceLines <= 20)   /* T-1429 machine age (B): once per leave save, the first 20 */
+        DebugLog("[PIECEREC] leave save piece flush: marked=" + N(g_ownLsPieceMarked) + " sent and confirmed=" + N((long long)pfDone) + " not confirmed=" + N((long long)pfWaits)
+                 + " held (another game writes it)=" + N((long long)pfHeld) + " after " + N((long long)inPhase) + " ms"
+                 + (pfWaits != 0 ? std::string(" - the drain ended with these unconfirmed (its 5 s limit, or the world changed / the game is stopping): their records may be older than this save, which the next load keeps (PwAgeRecordWins)") : std::string()));
     if (next == coopown::kLsRequest)
         DebugLog("[OWNSAVE] leave save: writer drained=" + N((long long)drainDone) + " (records up to seq=" + N((long long)L.drainSeq)
                  + ") after " + N((long long)inPhase) + " ms - requesting '" + target + "'");
@@ -36464,8 +38162,9 @@ void OwnLeaveSaveTick()
     if (!held)
     {
         OwnMarkSaveTick();   /* the mark lands before a quit takes the process away */
-        if (OwnLeaveCheckpoint(std::string(L.where) == "created"))   /* restore1b1: a leave checkpoint (tagged with nbSeq) and OWN_HIGH, before the link can go; T-251 part 2: the created save's own tag */
-        { L.holdWhy = why; L.phase = coopown::kLsFinished; L.phaseAt = now; return; }   /* fold 2: HOLD the continuation until the writer has written it */
+        const bool cp = OwnLeaveCheckpoint(std::string(L.where) == "created");   /* restore1b1: a leave checkpoint (tagged with nbSeq) and OWN_HIGH, before the link can go; T-251 part 2: the created save's own tag */
+        if (cp || !g_zoneEchoWait.empty())   /* T-1429 machine age fold 1: and the save's area uploads not yet confirmed - their seq is the copy's version at the next load */
+        { L.holdCp = cp ? 1 : 0; L.holdWhy = why; L.phase = coopown::kLsFinished; L.phaseAt = now; return; }   /* fold 2: HOLD the continuation until the writer has written it */
     }
     g_ownLsEndWhy = why; ++g_ownLsEnded;   /* T-251 part 2: the created trigger reads this save's outcome */
     std::memset(&L, 0, sizeof(L));   /* idle BEFORE the continuation: the resumed quit re-enters the menu detour */
@@ -36816,6 +38515,7 @@ void SpImportCreatorDead()
 }
 void SpImportMoneyStep()
 {
+    SpImportDecidedLine("money", SpImportMoney(), 0, 0);   /* T-1399: the money word, from the world's live options */
     if (SpImportMoney()) return;   /* money included: the purse stays as imported */
     int amount = 0;
     std::string why;
@@ -36960,6 +38660,7 @@ void OwnCreatedSaveTick()
             }
         }
         else if (g_spImportCarry != 0 && (SpImportSquadIds() != 0 || LookalikeImportHeld() != 0)) { }   /* T-1096 part 2: an imported squad could not take an id of its own - the save stays held; or a character of the imported squads is still on a named template, a look-alike member is left out, or a look-alike id is not yet sent */
+        else if (g_spImportCarry != 0 && SpImportCommitWaits("money (once the crew is in)") != 0) { }   /* T-1399: money from the world's live options - waits for them, never the lobby answer */   /* T-1399 fold (F1751 M2): no refusal road here - the world already runs; held until the link returns and its list arrives */
         else
         {
             g_resetCarryArmOwed = 0;
@@ -38937,7 +40638,9 @@ void StoreTick()
     ZoneFromRecordDrain();   /* Z1-b (review-z1 item 1): load facts a worker learned, ABOVE the outbox so a queued zone save sees the load before it */
     AreaOwnerScanTick();   /* which players the area records name as building owners */
     ZoneParkedWriteTick();   /* Z1-c (recheck-z1b item 2): zone mirror writes that waited for a load of their path */
+    AreaStateRetryTick(0);   /* T-1391 F1706: area state commits (and plain mirror rebuilds) that did not land - again, at most once a second per area */
     StoreOutboxDrain();   /* E4: whatever a worker queued goes out here, on the main thread, every tick (not once a second) */
+    if (mirrorkeep::OwnSaveTableFlushNow(g_mkOwnSaveDue ? 1 : 0, WorldKeyPendActive() != 0 ? 1 : 0) != 0) { g_mkOwnSaveDue = false; ++g_mkOwnSaveWrites; MirrorKeepFlush("own area save(s) written with the link down"); }   /* T-1391 F1635 item 1: the batch's one write (the due mark is taken here, so a write that fails waits for the next event - quit, teardown, a save's end) */
     StoreDrainCreated();   // P4e: worker-thread creations recorded here, on the main thread
     StoreRedialTick();     /* B12-e (T238): ABOVE PumpLink, and it has to be - PumpLink returns at once when g_link is 0, so a re-dial cannot live inside it. A dial made here is polled by the very next line. */
     PumpLink();            /* P7v: POLLS AND ENQUEUES ONLY - the record-class kinds no longer have a live apply path here */
@@ -41078,6 +42781,7 @@ void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char
     if (coopbrec::IsBoxRecId(worldId)) { coop::BoxRecordGone(worldId, from); return; }   /* T-823: a box record's removal leaves the box table (items.cpp), never the squad path */
     if (shoprec::IsShopRecId(worldId)) return;   /* a shop record is never removed: a removal of one changes nothing here */
     if (towntime::IsTownTimeId(worldId)) return;   /* T-4: a town clock record is never removed: a removal of one changes nothing here */
+    if (camplaid::IsCampLaidId(worldId)) return;   /* T-1429 design b: a camp mark is never removed: a removal of one changes nothing here */
     if (doorrec::IsDoorRecId(worldId)) { coop::DoorRecordGone(worldId); return; }
     if (bldgrec::IsBldgRecId(worldId)) { coop::TownBldgRecordGone(worldId); return; }   /* T-1333: a building record's removal leaves the building table (build.cpp) */
     if (cagerec::IsCageRecId(worldId)) { coop::CageRecordGone(worldId); return; }   /* T-860: a cage record's removal leaves the cage table (spawn.cpp) */   /* a door record's removal leaves the door table (doors.cpp), never the squad path */
@@ -41184,6 +42888,17 @@ bool StoreSendTownTimeRecord(const std::string& id, float x, float y, float z, c
     if (stampOut != 0) *stampOut = stamp;
     return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
 }
+/* T-1429 design b: an area's camp mark (camp.cpp ClWriteNow) as a RECORD - its area is in its id. MAIN THREAD. false = not sent (no link) */
+bool StoreSendCampLaidRecord(const std::string& id, const std::vector<char>& bytes, long long* stampOut)
+{
+    if (!camplaid::IsCampLaidId(id) || !LinkUp() || bytes.empty()) return false;
+    static long long s_last = 0;   /* each write's stamp is its own (its echo names it) */
+    long long stamp = (long long)time(0);
+    if (stamp <= s_last) stamp = s_last + 1;
+    s_last = stamp;
+    if (stampOut != 0) *stampOut = stamp;
+    return SendRecordAny(id, "", "", 0.0f, 0.0f, 0.0f, stamp, (int)StoreOwnerField(), bytes);
+}
 /* T-1333: a building record's removal (RECORD_GONE) - a town rebuilt for a new version; false = not a building record id, or not sent */
 bool StoreSendBldgGone(const std::string& id)
 {
@@ -41206,13 +42921,13 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
 {
     /* T-697 step 2: A GROUND RECORD IS NOT A SQUAD. It is judged by its generation (not the stamp rule below), kept in the ground
        table (items.cpp GroundRecordArrive) and applied by the area's holder at its next safe point - no file, no squad lookup. */
-    if (coopgrec::IsGroundRecId(worldId)) { coop::GroundRecordArrive(worldId, bytes); return; }
+    if (coopgrec::IsGroundRecId(worldId)) { coop::GroundRecordArrive(worldId, bytes, writtenAt); return; }
     /* T-823: A BOX RECORD IS NOT A SQUAD. It is judged by its generation and kept in the box table (items.cpp BoxRecordArrive) - no
        file, no squad lookup, nothing applied to a box here. */
     if (coopbrec::IsBoxRecId(worldId)) { coop::BoxRecordArrive(worldId, bytes); return; }
     /* A PIECE RECORD IS NOT A SQUAD. It is kept in the piece table (build.cpp PieceRecordArrive) - no file, no squad lookup, nothing
        applied to a piece here. */
-    if (piecerec::IsPieceRecId(worldId)) { coop::PieceRecordArrive(worldId, bytes); return; }
+    if (piecerec::IsPieceRecId(worldId)) { coop::PieceRecordArrive(worldId, bytes, g_zoneArrivalSeq, writtenAt); return; }   /* T-1429: the seq it arrived with (0 off the world server's own link) */
     /* A SHOP RECORD IS NOT A SQUAD. It is kept in the shop table (items.cpp ShopRecordArrive) - no file, no squad lookup. */
     if (shoprec::IsShopRecId(worldId)) { coop::ShopRecordArrive(worldId, bytes); return; }
     /* T-1421 (F1215): a door, building, cage or town clock record that came header-only (this game said it holds it) is laid from this
@@ -41233,6 +42948,8 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
     /* T-4: A TOWN CLOCK RECORD IS NOT A SQUAD. It is kept in the town clock table (towngen.cpp TownTimeArrive) and read by the town's
        holder at its check-ups - no file, no squad lookup. */
     if (towntime::IsTownTimeId(worldId)) { coop::TownTimeArrive(worldId, kindBytes); return; }
+    /* T-1429 design b: A CAMP MARK IS NOT A SQUAD. It is kept in camp.cpp's mark table and read by the furniture step - no file, no squad lookup. */
+    if (camplaid::IsCampLaidId(worldId)) { coop::CampLaidArrive(worldId, kindBytes); return; }
     ++g_recv;
     /* B10-b (review-b10 M-2): the opening push's bookkeeping is NOT here. This function is reached from the
        session peer's link as well as the notebook's, and only the notebook's records may count toward the
@@ -41436,7 +43153,8 @@ void ReportStore()
     }
     std::string wkWord("none"); std::string wkTmp;
     if (!ConfigSlot().empty() && ReadWorldKeyFile(JoinPathA(SaveRootDefault(), ConfigSlot()), &wkTmp)) wkWord = "present";
-    DebugLog("[STORE] REPORT role=" + std::string(ConfigRoleName()) + " cfg=" + N(ConfigFileSeen() ? 1 : 0)
+    /* T-1391 F1743: this report is built in four appended parts - one expression of ~1800 joins crashed the VC2010 back end (c2) */
+    std::string storeLine = "[STORE] REPORT role=" + std::string(ConfigRoleName()) + " cfg=" + N(ConfigFileSeen() ? 1 : 0)
              /* B13: generated = this start wrote a new id into shared_wastelands.cfg, loaded = it read the one that
                 was already there, sentInHello = how many HELLOs have carried it. generated should be 1 exactly
                 once in this install's life; a 1 at every start means the settings file is not being written,
@@ -41534,7 +43252,8 @@ void ReportStore()
                 snapshotGone = records the last BEGIN counted that its PAGE_ENDs named as deleted before their page reached them (report only);
                 wholeWithGone = snapshots the world server judged complete (the LAST PAGE_END's complete, T-985 C2b fold 6) with snapshotGone > 0;
                 notComplete = snapshots it judged NOT complete (a cut page, a refused record send, or BEGIN keys no page judged). */
-             + " preload[begun,done,stale,staleLink,staleTimeout,skippedNoLink,abandoned,indexPages,indexRows,wanted,areasFetched,groupsFetched,positions,notNewer,deleted,writeFailed,staleKeys,waitLastMs,waitMaxMs,malformed,answersStale,sendFailed,nonCurrentAreas,nonCurrentGroups,counting,phase,positionOnly,reasked,fetchCuts]=" + PreloadReportValues() + " keptTable[kept,why,read,rejected,noFile,changed,badLines,skipped,written,writeFailed,lastRows,unlisted,bytesReadLoad,bytesReadWrite,verifyMs,offThread,droppedUnnamed,unnamedChanged,droppedDeleted,nameClash,gatedPlace,gatedWake,awaiting,refusedBehind,dropSkipped,refusedUnjudged,gatedKeptHeldBeside,keptUnreadable]=" + MirrorKeepReportValues() + " beside[movedAsleep]=" + N(g_mkBesideMovedAsleep) + " areaFile[readOk,readMissing,readNotKept,readRefused,refusedWhy,filePlayer,fileLoaded,writtenChange,writtenSave,writtenTeardown,writtenQuit,writeFailed,notReady,emptyLists,measured,liveMissing,liveMissingRing2,fileNotLive,ring2InRecs,ring2InBytes,ring2OutRecs,ring2OutBytes,noAreaRecs,noAreaBytes,noFileRecs,liveRing2InBytes,liveRing2OutBytes,measureMs,fileVersion,fileSavePlayer,fileSaveLoaded,savePlayer,saveLoaded,saveCaptured,saveNotOwn,saveNoLists,saveOffMain,startCaptured,startOverlaid,startNotReady,startNotOwn,quitCaptured]=" + AreaFileReportValues() + " areaFresh[asked,fresh,cant,holderGone,waitMaxMs,waitingNow,writes,writeMaxMs,timeout,reasks,holdNoFile,holdNoStandIn,holdOwners,holdLegacy,fallbackTimeout,fallbackUnheld,fallbackOffMain,holdMaxMs,holdingNow,restoreHooks,restoreReads,groundCalls,groundOutside,spotItems,spotUnknown,spotOutside,restoreOffMain,writesDropped,dropUntold,mapHolds,mapTimeout,noRead,noWorldReads,readOffMain,spotStaleRestores,recordWaits,current,noServer,redecided,redecidedMs,redecideKept,leaseGot,leaseWaits,leaseWrites,leaseCant,claims,claimNotWorlds,settleAsks,settleFresh,settleLeases,settleWaits,settleLeaseWrites,settleLeaseCant,leaseLost,settleRefetches,settleLastMs,leaseDropTold,settleLists,worldFirstAsks,worldFirstUps,leaseEmptyHeld,leaseEmptyGiveBack,staleBaseTold,staleBaseHeld,staleBaseLifted,staleSwapHidden,keptAreaNoBase,keptBaseWrites,keptNoBaseRejected,keptBaseDroppedAtLoad]=" + AreaFreshReportValues()
+             + " preload[begun,done,stale,staleLink,staleTimeout,skippedNoLink,abandoned,indexPages,indexRows,wanted,areasFetched,groupsFetched,positions,notNewer,deleted,writeFailed,staleKeys,waitLastMs,waitMaxMs,malformed,answersStale,sendFailed,nonCurrentAreas,nonCurrentGroups,counting,phase,positionOnly,reasked,fetchCuts]=" + PreloadReportValues() + " keptTable[kept,why,read,rejected,noFile,changed,badLines,skipped,written,writeFailed,lastRows,unlisted,bytesReadLoad,bytesReadWrite,verifyMs,offThread,droppedUnnamed,unnamedChanged,droppedDeleted,nameClash,gatedPlace,gatedWake,awaiting,refusedBehind,dropSkipped,refusedUnjudged,gatedKeptHeldBeside,keptUnreadable]=" + MirrorKeepReportValues() + " beside[movedAsleep]=" + N(g_mkBesideMovedAsleep) + " areaFile[readOk,readMissing,readNotKept,readRefused,refusedWhy,filePlayer,fileLoaded,writtenChange,writtenSave,writtenTeardown,writtenQuit,writeFailed,notReady,emptyLists,measured,liveMissing,liveMissingRing2,fileNotLive,ring2InRecs,ring2InBytes,ring2OutRecs,ring2OutBytes,noAreaRecs,noAreaBytes,noFileRecs,liveRing2InBytes,liveRing2OutBytes,measureMs,fileVersion,fileSavePlayer,fileSaveLoaded,savePlayer,saveLoaded,saveCaptured,saveNotOwn,saveNoLists,saveOffMain,startCaptured,startOverlaid,startNotReady,startNotOwn,quitCaptured]=" + AreaFileReportValues() + " areaFresh[asked,fresh,cant,holderGone,waitMaxMs,waitingNow,writes,writeMaxMs,timeout,reasks,holdNoFile,holdNoStandIn,holdOwners,holdLegacy,fallbackTimeout,fallbackUnheld,fallbackOffMain,holdMaxMs,holdingNow,restoreHooks,restoreReads,groundCalls,groundOutside,spotItems,spotUnknown,spotOutside,restoreOffMain,writesDropped,dropUntold,mapHolds,mapTimeout,noRead,noWorldReads,readOffMain,spotStaleRestores,recordWaits,current,noServer,redecided,redecidedMs,redecideKept,leaseGot,leaseWaits,leaseWrites,leaseCant,claims,claimNotWorlds,settleAsks,settleFresh,settleLeases,settleWaits,settleLeaseWrites,settleLeaseCant,leaseLost,settleRefetches,settleLastMs,leaseDropTold,settleLists,worldFirstAsks,worldFirstUps,leaseEmptyHeld,leaseEmptyGiveBack,staleBaseTold,staleBaseHeld,staleBaseLifted,staleSwapHidden,keptAreaNoBase,keptBaseWrites,keptNoBaseRejected,keptBaseDroppedAtLoad]=" + AreaFreshReportValues();
+    storeLine += std::string()
              + " preAoi[source,listAreas,exchanges,exchangesNoList,rowsIn,rowsOut,rowsNoArea,rowsNoList,wantIn,wantNoArea,wantNoList,wantBytes,skipped,skippedBytes,skippedHeld,fetchedBytes,skippedLoadAreas,skippedLoadGroups,wantByLocal,wantOwn,rowsOwn,ownAreasAdded,staleHoldKept,staleHoldReleased,staleHoldDropped,staleHolding,townWaitArmed,townWaits,townWaitNotWhole,townWaitTimedOut,townWaitRefused,townWaitRefusedTowns,fromLive,fromSave,fromLiveTotal,fromSaveTotal]=" + PreloadAoiReportValues()   /* T-346 slice 1: nonCurrentAreas / nonCurrentGroups must read 0 */
              + " recordFeed[asksFirst,asksNext,offs,begins,pages,ends,endsAgain,pageEndsStale,markersStale,malformed,sendFailed,deferredMarked,expected,snapshotSent,snapshotApplied,paging,heldNotebook,heldNotebookEntries,beginsStale,offRetried,offDropped,seqKeptNewer,snapshotGone,wholeWithGone,notComplete]="
              + N(g_feedAsksFirst) + "," + N(g_feedAsksNext) + "," + N(g_feedOffsSent) + "," + N(g_feedBegins) + "," + N(g_feedPagesIn) + "," + N(g_feedEnds)
@@ -41567,7 +43286,8 @@ void ReportStore()
              + " marks[lists,marks,malformed,cleared,listHere,swept,notLoaded,notHeld]=" + N(g_arListsTaken) + "," + N(g_arMarksTaken) + "," + N(g_arDownMalformed) + "," + N(g_arCleared) + "," + N((long long)ArListHere()) + "," + N(g_arMarkSweep[0]) + "," + N(g_arMarkSweep[1]) + "," + N(g_arMarkSweep[2])
              + ArReport()   /* T-1084 step 3: the decision at the wake and R5 */
              + " noteSkip[applied,notNewer,otherKey,notHeld,noRecord,failedBefore,built]=" + N(g_noteSkip[0]) + "," + N(g_noteSkip[1]) + "," + N(g_noteSkip[2]) + "," + N(g_noteSkip[3]) + "," + N(g_noteSkip[4]) + "," + N(g_noteSkip[5]) + "," + N(g_noteSkip[6])
-             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " ownMarkRaise=" + N(g_noteMarkRaised) + " ownRaiseCapped[total,lastScan]=" + N(g_noteRaiseCapped) + "," + N(g_noteRaiseCappedLast) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " blockMove[movedDown,held]=" + N(g_blockMovedDown) + "," + N(g_blockHeld) + " blockRememberedOtherWorld=" + N(g_blockRememberedOtherWorld) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept,alreadyDead]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + "," + N(g_watchAlreadyDead) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " deadEvent[noted,already,overflow,decided,backstop]=" + N((long long)g_deadEvNotes.noted) + "," + N((long long)g_deadEvNotes.already) + "," + N((long long)g_deadEvNotes.overflow) + "," + N(g_deadEvDecided) + "," + N(g_deadEvBackstop) + " deadEventMore[matched,notFound,dropped,alive,unknown,refused,earlySlept,earlyDestroyed,held,undone,atSleep]=" + N(g_deadEvMatched) + "," + N(g_deadEvNotFound) + "," + N(g_deadEvDropped) + "," + N(g_deadEvVerdict[coopdeadev::kWipeAlive]) + "," + N(g_deadEvVerdict[coopdeadev::kWipeUnknown]) + "," + N(g_deadEvVerdict[coopdeadev::kWipeLent] + g_deadEvVerdict[coopdeadev::kWipeNoId] + g_deadEvVerdict[coopdeadev::kWipeAlready] + g_deadEvVerdict[coopdeadev::kWipeOtherBlock] + g_deadEvVerdict[coopdeadev::kWipeNotMine] + g_deadEvVerdict[coopdeadev::kWipeEngineKeeps] + g_deadEvVerdict[coopdeadev::kWipeStray] + g_deadEvVerdict[coopdeadev::kWipeNotFresh]) + "," + N(g_deadEarlySlept) + "," + N(g_deadEarlyDestroyed) + "," + N(g_deadDecideHeld) + "," + N(g_deadDecisionUndone) + "," + N(g_deadDecidedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
+             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " ownMarkRaise=" + N(g_noteMarkRaised) + " ownRaiseCapped[total,lastScan]=" + N(g_noteRaiseCapped) + "," + N(g_noteRaiseCappedLast) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " blockMove[movedDown,held]=" + N(g_blockMovedDown) + "," + N(g_blockHeld) + " blockRememberedOtherWorld=" + N(g_blockRememberedOtherWorld) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept,alreadyDead]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + "," + N(g_watchAlreadyDead) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " deadEvent[noted,already,overflow,decided,backstop]=" + N((long long)g_deadEvNotes.noted) + "," + N((long long)g_deadEvNotes.already) + "," + N((long long)g_deadEvNotes.overflow) + "," + N(g_deadEvDecided) + "," + N(g_deadEvBackstop) + " deadEventMore[matched,notFound,dropped,alive,unknown,refused,earlySlept,earlyDestroyed,held,undone,atSleep]=" + N(g_deadEvMatched) + "," + N(g_deadEvNotFound) + "," + N(g_deadEvDropped) + "," + N(g_deadEvVerdict[coopdeadev::kWipeAlive]) + "," + N(g_deadEvVerdict[coopdeadev::kWipeUnknown]) + "," + N(g_deadEvVerdict[coopdeadev::kWipeLent] + g_deadEvVerdict[coopdeadev::kWipeNoId] + g_deadEvVerdict[coopdeadev::kWipeAlready] + g_deadEvVerdict[coopdeadev::kWipeOtherBlock] + g_deadEvVerdict[coopdeadev::kWipeNotMine] + g_deadEvVerdict[coopdeadev::kWipeEngineKeeps] + g_deadEvVerdict[coopdeadev::kWipeStray] + g_deadEvVerdict[coopdeadev::kWipeNotFresh]) + "," + N(g_deadEarlySlept) + "," + N(g_deadEarlyDestroyed) + "," + N(g_deadDecideHeld) + "," + N(g_deadDecisionUndone) + "," + N(g_deadDecidedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport();
+    storeLine += std::string()
              + " destroyedForgotten=" + N(g_destroyedForgotten) + " recvFoundInList=" + N(g_recvFoundInList) + " recvNotLoadedHere=" + N(g_recvNotLoadedHere) + " recvCacheDisagreed=" + N(g_recvCacheDisagreed)
              + " | faultSid=" + N(g_faultSid) + " faultSleepPod=" + N(g_faultSleepPod) + " faultSleepContainer=" + N(g_faultSleepContainer) + " faultWakePod=" + N(g_faultWakePod) + " | skippedEmpty=" + N(g_skippedEmpty) + " skippedNotMine=" + N(g_skippedNotMine) + " skippedNoUid=" + N(g_skippedNoUid) + " block[writtenByBlock,skippedOtherBlock]=" + N(g_writtenByBlock) + "," + N(g_skippedOtherBlock) + " skippedPlayerFaction=" + N(g_skippedPlayerFaction) + " skippedStandInRecord=" + N(g_sleepSkippedStandInRecord) + " | ZONE saves=" + N(g_zoneSaves) + " zoneSave[applied,notMine,staleCopyRefused,ownStore,readFail,writeFail,skippedOff,skippedSingle;viaFlush]=" + N(g_zoneWritten) + "," + N(g_zoneSkippedNotMine) + "," + N(g_zoneStaleCopyRefused) + "," + N(g_zoneOwnStore) + "," + N(g_zoneReadFail) + "," + N(g_zoneWriteFail) + "," + N(g_zoneSkippedOff) + "," + N(g_zoneSkippedSingle) + ";" + N(g_zoneSaveViaFlush) + "   (P6q: the first EIGHT are ZoneSaveApply's eight counted exits and sum to ZONE saves= above; viaFlush is a SPAN over all eight, not a ninth bucket - saves counted at entry while the post-teardown flush was running, of which zoneWriteAfterTeardownFlush were written) written=" + N(g_zoneWritten) + " skippedNotMine=" + N(g_zoneSkippedNotMine) + " zoneStaleCopyRefused=" + N(g_zoneStaleCopyRefused) + " zoneKeptAdopted=" + N(g_zoneKeptAdopted) + " zoneAdoptCompared[same,differs,notCompared]=" + N(g_zoneAdoptSame) + "," + N(g_zoneAdoptDiffers) + "," + N(g_zoneAdoptUncompared)
              + " zoneRefusedNoOtherHolder[all,lost,nothingLost,notCompared]=" + N(g_zoneOwnSaveRefused) + "," + N(g_zoneRefusedLost) + "," + N(g_zoneRefusedNothingLost) + "," + N(g_zoneRefusedUncompared) + " zoneUnreadableNotSent=" + N(g_zoneUnreadableNotSent) + " zoneDamageApplied=" + N(g_zoneDamageApplied) + " zoneIndexUnreadable=" + N(g_zoneIndexUnreadable) + " zoneHeldDropped=" + N(g_zoneHeldDropped) + " zoneMirrorUnreadable=" + N(g_zoneMirrorUnreadable) + " zoneHeldSetAside=" + N(g_zoneHeldSetAside) + " zoneStampBumped=" + N(g_zoneStampBumped) + " recvOff=" + N(g_zoneRecvOff) + " loadOk=" + N(g_zoneLoadOk) + " loadFailed=" + N(g_zoneLoadFailed) + " zoneReadOffMain=" + N((long long)g_zoneReadOffMain) + " zoneSwapNoPeerFaction=" + N(g_zoneSwapNoPeerFaction) + " areaStandIns[made,failed]=" + N(g_areaStandInsMade) + "," + N(g_areaStandInsFailed)
@@ -41575,9 +43295,18 @@ void ReportStore()
              + " levelSaveReadFail=" + N((long long)g_zoneLevelSaveReadFail) + " savedNotPublished=" + N(g_afSavedNotPublished) + " engineSaveFalse=" + N((long long)g_gdcEngineSaveFalse)
              + " engineSaveFalseArea=" + N((long long)g_gdcEngineSaveFalseArea) + " pathCopyFail=" + N((long long)g_gdcPathCopyFail)   /* T-1329 */
              + " emptyRefusedUnread=" + N((long long)g_zoneEmptyRefusedUnread) + " emptyQueuedStale=" + N(g_zoneEmptyQueuedStale)   /* T-1329 fold 1 */
-             + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " zoneProvRead[made,madeGood,dropRecord,dropLink,dropTeardown,thrown,waitingNow,readLines,readLinesSuppressed,waitingAtSettle]=" + N(g_zoneProvMade) + "," + N(g_zoneProvGood) + "," + N(g_zoneProvDropRecord) + "," + N(g_zoneProvDropLink) + "," + N(g_zoneProvDropTeardown) + "," + N(g_zoneProvThrown) + "," + N((long long)g_zoneProvRead.size()) + "," + N(g_zoneReadLines) + "," + N(g_zoneReadLinesSuppressed) + "," + N(g_zoneProvWaitAtSettle) + " zoneSeenLines[lines,suppressed]=" + N(g_zoneSeenLines) + "," + N(g_zoneSeenLinesSuppressed) + " zoneSeenNotSet=" + N(g_zoneSeenNotSet) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " wakeHeldNobodyYet=" + N((long long)g_wakeHeldNobodyYet) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the THREE zoneWr paths are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " zoneRecvHolderTaken=" + N(g_zoneRecvHolderTaken) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)
+             + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " zoneProvRead[made,madeGood,dropRecord,dropLink,dropTeardown,thrown,waitingNow,readLines,readLinesSuppressed,waitingAtSettle]=" + N(g_zoneProvMade) + "," + N(g_zoneProvGood) + "," + N(g_zoneProvDropRecord) + "," + N(g_zoneProvDropLink) + "," + N(g_zoneProvDropTeardown) + "," + N(g_zoneProvThrown) + "," + N((long long)g_zoneProvRead.size()) + "," + N(g_zoneReadLines) + "," + N(g_zoneReadLinesSuppressed) + "," + N(g_zoneProvWaitAtSettle) + " zoneSeenLines[lines,suppressed]=" + N(g_zoneSeenLines) + "," + N(g_zoneSeenLinesSuppressed) + " zoneSeenNotSet=" + N(g_zoneSeenNotSet) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " wakeHeldNobodyYet=" + N((long long)g_wakeHeldNobodyYet) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder,linkDown]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + "," + N(g_zoneWrPath[coopwriter::kZonePathLinkDown])
+              + " zoneOneRoad[unsentNow,sideWritten,sideFailed,baseWritten,sideKeptAtLoad,sideCleared,indexYielded,notHolderWait,checkNothing,checkCarried,checkFault,checkUnknown,journalDropSetAside,journalDropEmpty,recoverWritten]="
+              + N(AreaStatePendingCount()) + "," + N(g_zoneUnsentSideWritten) + "," + N(g_zoneUnsentSideFailed) + "," + N(g_zoneBaseSideWritten) + "," + N(g_zoneUnsentSideKept) + "," + N(g_zoneUnsentSideCleared) + "," + N(g_zoneIndexYielded)
+              + "," + N(g_zonePushNotHolderWait) + "," + N(g_zoneOwnCheck[0]) + "," + N(g_zoneOwnCheck[1]) + "," + N(g_zoneOwnCheck[2]) + "," + N(g_zoneOwnCheck[3]) + "," + N(g_zoneJournalDropSetAside) + "," + N(g_zoneJournalDropEmpty) + "," + N(g_zoneRecoverWritten)
+              + " zoneKeptBase[now,written,empty,failed,cleared,readBack,checkNotKnown,checkKept,checkEmpty]=" + N((long long)g_zoneKeptBase.size()) + "," + N(g_zoneBaseSideWritten) + "," + N(g_zoneKeptBaseEmpty) + "," + N(g_zoneKeptBaseFailed)
+              + "," + N(g_zoneKeptBaseCleared) + "," + N(g_zoneKeptBaseScanned) + "," + N(g_zoneCheckBase[areafresh::kCbNotKnown]) + "," + N(g_zoneCheckBase[areafresh::kCbKept]) + "," + N(g_zoneCheckBase[areafresh::kCbEmpty])
+              + " areaState[states,pending,due,commits,commitFailed,landedLate,mirrorRebuilt,mirrorFailed,readBackFailed,scanned,tmpTaken,tmpRemoved,scanNotKnown,migrated,migNotKnown,movedOld,mirrorAsideAtLoad,forcedLeft]=" + N((long long)g_areaState.size()) + "," + N(AreaStatePendingCount()) + "," + N(AreaStateDueCount())
+              + "," + N(g_areaCommits) + "," + N(g_areaCommitFailed) + "," + N(g_areaCommitLate) + "," + N(g_areaMirrorRebuilt) + "," + N(g_areaMirrorFailed) + "," + N(g_areaReadBackFailed) + "," + N(g_areaScanned) + "," + N(g_areaScanTmpTaken)
+              + "," + N(g_areaScanTmpRemoved) + "," + N(g_areaScanNotKnown) + "," + N(g_areaMigrated) + "," + N(g_areaMigNotKnown) + "," + N(g_areaMovedOld) + "," + N(g_areaScanMirrorAside) + "," + N(g_areaForcedLeft) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the FOUR zoneWr paths (T-1391 added linkDown: a save made with the link down) are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " zoneRecvHolderTaken=" + N(g_zoneRecvHolderTaken) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)
              + " ourCreate=" + N(g_ourCreate) + " keptPersistent=" + N(g_keptPersistent) + " noId=" + N(g_noId) + " saveFailed=" + N(g_saveFailed) + " loadFailed=" + N(g_loadFailed) + " faults=" + N(g_faults)
-             + " birth[noted,liveRead,capFull,deadRelease,engine,keptBorn,keptUnknown,keptPlayer,keptOtherHolder,hbBound,discardSent,retired,keptHome,keepOffThread,hbBindIdHeld,discardSharedKept,filled,keptNotRead,homeCached,homeCacheHits,roamCached,roamCacheHits]=" + N((long long)g_birthNoted) + "," + N((long long)g_birthLiveRead) + "," + N((long long)g_birthCapFull)
+             + " birth[noted,liveRead,capFull,deadRelease,engine,keptBorn,keptUnknown,keptPlayer,keptOtherHolder,hbBound,discardSent,retired,keptHome,keepOffThread,hbBindIdHeld,discardSharedKept,filled,keptNotRead,homeCached,homeCacheHits,roamCached,roamCacheHits]=" + N((long long)g_birthNoted) + "," + N((long long)g_birthLiveRead) + "," + N((long long)g_birthCapFull);
+    storeLine += std::string()
              + "," + N(g_birthKept[0]) + "," + N(g_birthKept[1]) + "," + N(g_birthKept[2]) + "," + N(g_birthKept[3]) + "," + N(g_birthKept[4]) + "," + N(g_birthKept[5])
              + "," + N(g_hbBound) + "," + N(g_discardSent) + "," + N(g_retiredAtLoad) + "," + N(g_birthKept[6]) + "," + N((long long)g_keepOffThread) + "," + N(g_hbBindIdHeld) + "," + N(g_discardSharedKept) + "," + N(g_birthFilled) + "," + N(g_birthKept[7]) + "," + N((long long)g_liveHomeOf.size()) + "," + N(g_liveHomeHits) + "," + N((long long)g_roamOf.size()) + "," + N(g_roamHits) + " unloadEmptied[noted,offThread,keptMark,discardByIt,capFull,clearedLiving,held]=" + N(g_unloadEmptiedNoted) + "," + N((long long)g_unloadEmptiedOffThread) + "," + N(g_unloadEmptiedKeptMark) + "," + N(g_unloadEmptiedDiscard) + "," + N(g_unloadEmptiedCapFull) + "," + N(g_unloadEmptiedCleared) + "," + N((long long)g_unloadEmptied.size())
              + " otherRun[noted,notedAtGoneDrain,deadSkipped,unbound,capFull,kept,held]=" + N(g_otherRunNoted) + "," + N(g_otherRunNotedDrained) + "," + N(g_otherRunDeadSkipped) + "," + N(g_otherRunUnbound) + "," + N(g_otherRunCapFull) + "," + N(g_otherRunKept) + "," + N((long long)g_otherRunRemoved.size())   /* T-850 */
@@ -41620,7 +43349,8 @@ void ReportStore()
                + "," + N(g_storeAuthExtra) + "," + N(g_storeDoorLoginSent) + "," + N(g_storeLoginRemembered) + "," + N(g_storeLoginRememberFailed) + "," + N(g_storeLoginForgotten)
              + " storeProto[mismatch,ignoredMessages]=" + N((long long)(g_storeProtoMismatch ? 1 : 0)) + "," + N(g_storeMismatchIgnored)
              + " u8AnsiFallback=" + N((long long)g_u8AnsiFallback)   /* paths read in the ANSI code page because they were not UTF-8 (u8file.h) */
-             + coop::BoxRecordReport() + StoreSendBoundToken() + StoreBundleToken() + LinkKeepToken() + OriginReport() + SwReportToken() + coopstore::FileLockedToken() /* T-1280 */ + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)");
+             + coop::BoxRecordReport() + StoreSendBoundToken() + StoreBundleToken() + LinkKeepToken() + OriginReport() + SwReportToken() + coopstore::FileLockedToken() /* T-1280 */ + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)";
+    DebugLog(storeLine);
     ReportClockLines();   /* E40 / decision 45: the [TIME] and [WEATHER] lines, on BOTH games, at every report */
     HbReportLine();   /* E47-S2: the [SAVE] hb[...] line at every report */
     const std::string q(1, (char)34);
@@ -42658,6 +44388,26 @@ void CreatorRelForget(const char* why)
     if (!g_crRelPath.empty() && g_crRelDropSaid < 3) { ++g_crRelDropSaid; DebugLog(std::string("[WREL] T-1383: the creator's save standings for world '") + g_crRelWorld + "' are dropped - " + why); }
     g_crRelPath.clear(); g_crRelFolder.clear(); g_crRelWorld.clear(); g_crRelTable.clear(); g_crRelState = 0; g_crRelBound = -1;
 }
+/* T-1399 fold (re-check LOW 2): THE ONE CLEAN-UP of an import the pump refuses (SaveRequestPumpBody: the records wait or the options-list
+   wait with the link gone for good, a switch word not decided again, the profile gate's refusal) - nothing its post or the gate armed
+   reaches a later load: the single-player import's carry (g_spImportCarry; the next pick decides it again), its pump decision, the
+   creator's save standings (CreatorRelArm), the held-named / look-alike window (WorldStateImportLoad(1)) and the reset folder's save owed
+   (g_resetCarryArmOwed, which a later load's world would else arm), and the reset carry for this pick (g_resetCarryFolder ... - re-check 2
+   LOW: a re-post before the next pick's decision would else post an import again - StoreResetCarryPost posts a plain load without it).
+   The import request stays - the next pick decides from it. MAIN THREAD. */
+long long g_importRefusedCleaned = 0;
+void ImportRefusedCleanup(const char* road)
+{
+    const bool armed = g_spImportCarry != 0 || g_resetCarryArmOwed != 0 || !g_crRelPath.empty() || !g_resetCarryFolder.empty();
+    g_spImportCarry = 0; g_spImportPumpDecided = 0; g_resetCarryArmOwed = 0;
+    g_resetCarryFolder.clear(); g_resetCarryOldId.clear(); g_resetCarryForFolder.clear(); g_resetCarryForPick = 0; g_resetCarryRekeyOwed = 0; g_resetCarryOldKey.clear(); g_resetCarryOldNames.clear();   /* as at a WELCOME */
+    coop::WorldStateImportLoad(0);
+    CreatorRelForget("the import was refused");
+    if (!armed) return;
+    ++g_importRefusedCleaned;
+    DebugLog(std::string("[IMPORT] T-1399: the refused import's arms are dropped (") + road + ") - its carry, the creator's save standings, the"
+             " look-alike window, any reset-folder save owed and this pick's reset carry; the next pick decides again. importRefusedCleaned=" + N(g_importRefusedCleaned));
+}
 int CrRelScratchPod()
 {
     __try
@@ -42731,8 +44481,6 @@ int CreatorRelRead()
    written (SaveManager+0xA0 = 2, its save name at +0xB0 and folder at +0xD8 - 0x47A9A0) becomes the request the import screen's post
    writes (0x47AA80: +0xA0 = 3, the flags at +0xA4, the same two name fields). 1 = written, 0 = declined (implausible object, or no
    load request pending), -1 = raised. */
-const int kResetLoadRequest = 2, kResetImportRequest = 3;
-const int kResetImportFlagsOff = 0xA4;   /* SaveManager+0xA4: the request's flags (decomp_47aa80.txt) */
 int ResetImportRequestPod(void* saveMgr, unsigned int flags)
 {
     __try
@@ -42764,10 +44512,12 @@ int StoreResetCarryPost(const std::string& folder)
         ++g_resetCarryPosted;
         g_resetCarryArmWorld = ::InterlockedCompareExchange(&g_ownWorldReset, 0, 0);   /* T-36: the world load count the import's own load moves (OwnCreatedSaveTick) */
         g_resetImportHoldSaid = 0;   /* this import's wait for the world server's records is said once */
+        g_spImportPumpDecided = 0;   /* T-1399: its research is decided again at the pump, once the records are in */
         if (g_spImportCarry != 0) CreatorRelArm(folder, flags);   /* T-1383 (F1069): the creator's "bring relations" - the walk offers the save's own standings */
         if (g_spImportCarry != 0) coop::WorldStateImportLoad(1);   /* T-1096 part 2: a named character another game holds alive is left out of the crew it loads; the look-alike swap window (LookalikeAfterLoad) opens */
         if (g_spImportCarry != 0)   /* T-1096 fold (review 2026-10-31): the single-player import says its own line */
-            DebugLog("[IMPORT] import posted: Kenshi's IMPORT GAME from single-player save '" + folder + "' with flags " + fx + " for this new profile (research "
+            DebugLog("[IMPORT] import posted: Kenshi's IMPORT GAME from single-player save '" + folder + "' with flags " + fx + " (T-1399: research decided again from"
+                     " the world's live options just before the engine runs it; money once the crew is in) for this new profile (research "
                      + std::string(SpImportResearch() ? "kept" : "not kept") + "; money " + std::string(SpImportMoney() ? "kept" : "set to the new-game amount after the import")
                      + "; buildings not imported; dead named characters " + std::string((flags & spimport::kSwitchDead) != 0 ? "imported (the world's creator)" : "not imported")
                      + "; relations " + std::string((flags & spimport::kSwitchRelations) != 0 ? "imported (the world's creator)" : "not imported")
@@ -43578,6 +45328,17 @@ void StoreNoteCatchupAnswer(bool decoded, bool sent, long long chars)
 }
 long StoreLiveGen() { return LinkUp() ? ::InterlockedCompareExchange(&g_welcomeLinkGen, 0, 0) : 0; }
 int StoreMySlot() { return g_mySlot; }
+/* T-1429 machine age, MAIN THREAD: the copy of zoneId loaded here - its version (the world server's seq, 0 not known) and whose upload it
+   is (-1 not known). 1 = a load of it was seen (the values above), 0 = none */
+int StoreAreaLoadedVersion(const std::string& zoneId, unsigned long long* seq, int* writer, long long* at)
+{
+    ZoneFromRecordDrain();
+    const std::map<std::string, ZoneLoadVer>::const_iterator it = g_zoneLoadVer.find(zoneId);
+    if (seq != 0) *seq = (it != g_zoneLoadVer.end()) ? it->second.seq : 0ULL;
+    if (writer != 0) *writer = (it != g_zoneLoadVer.end()) ? it->second.writer : -1;
+    if (at != 0) *at = (it != g_zoneLoadVer.end()) ? it->second.at : 0;
+    return it != g_zoneLoadVer.end() ? 1 : 0;
+}
 std::string StoreModsRefusal(long long* seq) { if (seq) *seq = g_modsRefusalSeq + g_profNoticeSeq; return g_modsRefusal.empty() ? g_profNotice : g_modsRefusal; }   /* prof1 fold: the profile sentences share the title screen's notice */   /* settings5 S5, MAIN THREAD */
 /* mp1: a WELCOME with the wrong protocol refuses without a reason word, and reads as the version refusal (0). */
 void StoreLeftAtTitle()   /* T-201 N1: the next press starts clean (the next link-up sets the lobby again, :8524) */
@@ -43593,6 +45354,7 @@ void StoreLeftAtTitle()   /* T-201 N1: the next press starts clean (the next lin
     ::InterlockedExchange(&g_menusPause, (long)coopclock::kMenusPauseAbsent);   /* T-1392 review fix 3: the world's MENUS AND BUILDING belongs to the world just left; the next world's OPTIONS map sets it */
     SpImportCreatorOwedForget("the game left the world");   /* T-1383 fold 2 (re-check item 1): and what the creator owed it */
     CreatorRelForget("the game left the world");   /* T-1383 review fold 1: and the creator's save standings armed for it */
+    coop::SettingsLeftWorld();   /* T-1399 fold (re-check 2 M1): and the HOST screen's rows owed to it */
     coop::PlayerFactionWorldAnswerForget();
     g_joinedWorldRoad = coopjoin::JoinRoadStep(g_joinedWorldRoad, coopjoin::kJrTitle);   /* M11a S3 review fold (F1): back at the title - no longer joined through the world road */
     JoinHoldDrop("the player left or cancelled");   /* a load held for the operator is not started after a leave */
@@ -43661,6 +45423,7 @@ long StoreSaveRequestSeq() { return (long)::InterlockedCompareExchange(&g_wkReqS
 long StoreSaveInFlightSeq(long upTo) { long m = 0; for (int i = 0; i < kWkPendCap; ++i) if (g_wkPend[i].active != 0 && g_wkPend[i].reqSeq > m && (upTo <= 0 || g_wkPend[i].reqSeq <= upTo)) m = g_wkPend[i].reqSeq; return m; }   /* MAIN THREAD */
 int StoreWelcomedThisLink() { const long wg = ::InterlockedCompareExchange(&g_welcomeLinkGen, 0, 0); return (::InterlockedCompareExchange(&g_linkGen, 0, 0) == wg) ? 1 : 0; }   /* P6x (review-p6q LOW-2) - THE WELCOME GENERATION IS READ FIRST, AND THAT IS WHAT MAKES THE CLAIM BELOW TRUE. P6q read g_linkGen first and said the only disagreement a race can produce answers 0, the conservative direction. That was wrong in one of the two interleavings: a link-up edge landing AFTER the g_linkGen read left BOTH reads holding the old generation, the two agreed, and the answer was 1 - "welcomed" - for a link whose WELCOME has not arrived. Read this way round, an edge in between makes the second read the NEWER value, the two disagree, and the answer is 0: ignore the table. The claim now holds for every interleaving, which is what store.h advertises to any-thread callers. It cannot bite today - the one caller, ApplyRelayPlayerSectors, runs on the main thread out of PumpLink's drain and g_linkGen is incremented on that same thread in the same function - and it is fixed because the advertised property is what a future worker-thread caller would rely on. */
 int StoreLastKnownSlot() { return g_lastKnownSlot; }   /* P6j (verify-p6c HIGH-2): ANY thread, a plain aligned int the main thread writes at the WELCOME - the same discipline StoreMySlot is read under */
+int StoreOwnSideSlot() { return ZoneOwnSideSlot(); }   /* T-1391 fix A2: build.cpp's stored-piece owner restore and the scan's 'mine' */
 // E36 / decision 40 - the value, its name, and the SET that goes up to the notebook process.
 int BasePolicyValue() { return g_basePolicy; }
 const char* BasePolicyNameOf(int v) { return v == kPolicyShared ? "shared" : v == kPolicyOwner ? "owner" : v == kPolicyLocked ? "locked" : "unknown"; }
@@ -44044,6 +45807,7 @@ std::string StoreGoneTownReport()
 bool StoreRelayLinked() { return g_relayLinkedCached != 0; }   /* review-p5b CRASH-2: ANY THREAD - a flag the main thread writes, never a deref of g_link */
 }
 namespace coop { std::string StoreWorldIdOf(void* platoon) { std::string s; if (PlatoonSidPod(platoon, &s)) return s; ::InterlockedIncrement64((volatile LONGLONG*)&g_faults); ::InterlockedIncrement64((volatile LONGLONG*)&g_faultSid); static volatile LONG g_townIdFaultLogged = 0; if (::InterlockedExchange(&g_townIdFaultLogged, 1) == 0) ErrorLog("[STORE] towngen id read faulted (first only)"); return std::string(); } }   /* review-p4y MEDIUM-1: its own first-fault flag */   /* review-p4w MEDIUM-4: worker threads - atomic */   /* review-p4s MEDIUM-1: a fault is booked */   /* P4p/P4r: the engine's guarded id read only - never g_bind (main-thread map; towngen calls this from worker threads, review-p4p CRASH) */
+namespace coop { std::string StoreBoundIdOf(void* platoon) { return WorldIdOf(platoon); } }   /* T-1429 v2 (statedump): MAIN THREAD - the id the store keys this squad's record by (g_bind: the record id it was made from or bound to; else the engine's own id) */
 namespace coop {
 /* E38 - THE CLIENT'S NOTEBOOK ADDRESS, AS THE HOST NAMED IT. Called from OnWelcome (net/session.cpp) at the
    title screen. SetStoreServer is idempotent for the address already open (see its own guard), so a host whose
@@ -44495,6 +46259,11 @@ int StoreTestSaveDone(const void* saveMgr, const std::string& name, std::string*
 } // namespace coop
 namespace coop { void StoreEditorOffTick() { EditorOffTickBody(); } }   /* T-1414: store.h; the body sits with the editor hooks */
 namespace coop { bool HandSaveBlocked() { return coopprof::HandSaveBlockedDecide(TitleScreenUpPod(), SaveRedirectWanted()); } }   /* T-239 (owner 191 A / 192): store.h */
+namespace coop { const char* StoreShowMessageLine(const char* text) { return ShowHandRefusedLine(text != 0 ? text : ""); } }   /* T-1462: store.h */
+#ifdef SW_DEV_BUILD
+namespace coop { void StoreNavKeyAsKey(int on) { g_navKeyAsKey = (on != 0) ? 1 : 0; } }   /* T-1462 TEST-ONLY lever (DEV build): store.h */
+#endif
+namespace coop { void StoreNavKeyCounts(long long* f, long long* r, int* hooksOn) { *f = g_navFixRefused; *r = g_navRbRefused; *hooksOn = (g_navFixHookOn != 0 && g_navRbHookOn != 0) ? 1 : 0; } }   /* T-1462: store.h */
 namespace coop {
 /* the squad's members other than `gone` (the people the orphan clean-up has just destroyed - compared by address, never read):
    *all = every other one listed, *withUid = those the session knows by a uid. 1 = read, 0 = unreadable. */
@@ -45394,12 +47163,16 @@ void AfDecide(int x, int y, const char* when)
         g_afRow[k] = AfRow(); if (g_afWaitingN > 0) --g_afWaitingN;
         DebugLog("[ZONE] FRESH map zone=" + AfXy(x, y) + " fresh now: holder=" + N((long long)holder) + (verdict == areafresh::kWaitYes ? std::string(" - the read waits for a fresh copy") : std::string(" - no wait")));
     }
+    /* T-1429 re-check fold F1617 item 5: no camp layer from this game's own area map (up to 5 s old - another game may hold the area by now):
+       an owed step of this load is kept and run at the world server's HELD (it is sent on the server's own holder change and when the
+       holder lists the area again), or dropped when the layer's record brings the key */
     if (verdict != areafresh::kWaitYes && verdict != areafresh::kWaitRecord) { g_afRow[k].decided = areafresh::DecidedMark(verdict); return; }   /* T-1365: a no-wait decided during the world load is marked so the read decides again */
     AfRow r; r.state = 1; int have = 0; r.haveStamp = AfSwapStamp(x, y, &have); r.startAt = ZoneNowSec();
     r.recordWait = verdict == areafresh::kWaitRecord ? 1 : 0;   /* T-1279 (design B): nobody else holds it - the world server's record is waited for */
     r.holder = r.recordWait != 0 ? -1 : holder;
     g_afRow[k] = r;
     ++g_afWaitingN; ++g_afAsked; if (r.recordWait != 0) ++g_afRecordWaits;
+    coop::CampLayerAsked(x, y);   /* T-1429 review fold F1612 item 4: this load's first ask - an answer kept from an earlier load is dropped */
     AfAsk(k, when);
 }
 /* T-1279 fold 2 (re-check B; owner decision 1580 a): MAIN THREAD. A wait's CANT (any why but current / fault) or its asked holder gone,
@@ -45754,6 +47527,7 @@ bool AfSendSettleList(const std::vector<int>& keys)
 {
     std::vector<char> b;
     if (keys.empty() || !LinkUp() || !areafresh::EncodeSettleList(&b, &keys[0], (int)keys.size())) return false;
+    for (size_t i = 0; i < keys.size(); ++i) coop::CampLayerAsked(areafresh::KeyX(keys[i]), areafresh::KeyY(keys[i]));   /* T-1429 review fold F1612 item 4: the load's settle asks - earlier answers dropped */
     return g_link->Send(0, (net::MsgType)areafresh::kMsgAreaFresh, &b[0], b.size(), net::CH_RELIABLE);
 }
 long long AfMirrorStamp(int k)
@@ -46120,7 +47894,11 @@ unsigned long long detour_afZoneMapActivate(void* zm, void* a2, long long type, 
     if (pre == 1 && b0 == 0 && b1 == 0 && areafresh::OnGrid(x, y))
     {
         int x2 = -1, y2 = -1, b0n = -1, b1n = -1;
-        if (AfZoneMapPod(zm, &x2, &y2, &b0n, &b1n) == 1 && b0n == 1 && g_afRow[areafresh::Key(x, y)].state == 0) AfDecide(x, y, "load decided");   /* decomp_a0d6a0.txt:28-35 */
+        if (AfZoneMapPod(zm, &x2, &y2, &b0n, &b1n) == 1 && b0n == 1)
+        {
+            if (g_afRow[areafresh::Key(x, y)].state == 0) AfDecide(x, y, "load decided");   /* decomp_a0d6a0.txt:28-35 */
+            coop::CampAreaLoadStart(x, y);   /* T-1429 F1634: this load is in force from now, file read or not - after its ask */
+        }
     }
     return r;
 }
@@ -46216,6 +47994,14 @@ void AfHolderStep()
     g_afWriteQ.swap(keep);
 }
 }   /* namespace */
+/* T-1429 design b (camplaid.h): the content base of the area loaded here, and this game's creation lease (the camp note design reads neither: kept for the lines that name them) */
+unsigned long long StoreZoneContentBase(const std::string& zoneId) { return ZoneBaseOf(zoneId); }
+int AfLeaseHeldHere(int x, int y)
+{
+    const int k = areafresh::Key(x, y);
+    for (size_t i = 0; i < g_afWriteQ.size(); ++i) if (g_afWriteQ[i].key == k && g_afWriteQ[i].lease != 0) return 1;
+    return 0;
+}
 /* MAIN THREAD (PumpLink): a WRITE queued for the next tick; a FRESH / CANT noted on the waiting area */
 void AreaFreshArrive(const std::vector<char>& payload)
 {
@@ -46225,21 +48011,48 @@ void AreaFreshArrive(const std::vector<char>& payload)
         if (++g_afMalformed <= 8) ErrorLog("[ZONE] FRESH malformed AREA_FRESH from the world server - ignored (first 8 logged)");
         return;
     }
+    if (m.kind == (unsigned int)areafresh::kHeld) { coop::CampAreaHeld(m.x, m.y); return; }   /* T-1429 F1617 items 1 / 4: this game holds the area and is its camp layer - nothing else here */
+    if (m.kind != (unsigned int)areafresh::kWrite && m.why != (unsigned int)areafresh::kWhyWorldFirst && areafresh::RecRefusalOf(m.why) == 0)
+        coop::CampLayerAnswer(m.x, m.y, (int)m.layer, (int)m.kind);   /* T-1429 camp note design: the camp layer this answer names (taken at the area's next file read) */
     const int k = areafresh::Key(m.x, m.y);
     if (m.kind == (unsigned int)areafresh::kCant)
     {   /* T-1429 s2 fold 7b: a refusal for the area (staleBase or any other) - its upload gets no echo; if it was the save's last, its batch ends here */
         if (g_zoneEchoWait.erase(AfZoneId(m.x, m.y)) != 0 && g_zoneEchoWait.empty()) MirrorKeepFlush("a save's last upload was refused");
     }
+    int ownV = areafresh::kOwnStoredNo, wasPush = 0;   /* T-1391 F1631: what the refusal road below learned - the stale branch reads both */
     if (m.kind == (unsigned int)areafresh::kCant && areafresh::RecRefusalOf(m.why) != 0)
     {   /* T-1391 (F1565, design B): an area RECORD's refusal told to its sender - a queued area save's answer (dropped, said with this reason) or
            an ordinary save's (said; its next save is judged again). Only staleBase goes on to its own handling below; the other three never
-           reach the area-settling logic. */
-        const int za = ZoneReplayAnswer(AfZoneId(m.x, m.y), areafresh::RecRefusalOf(m.why), m.stamp, 1, m.storedStamp, m.storedSeq);
-        if (za == 2) return;   /* fold 2 / 3 (S3): the refusal named this game's earlier send as the stored copy - taken or re-based; no stale handling */
-        if (za == 0 && m.why != (unsigned int)areafresh::kWhyStaleBase && ++g_zrRecRefusedOther <= 20)
+           reach the area-settling logic. F1631 item 3: the road is areafresh::RefusalRoad - the queued save's answer first (fold 2 / 3, S3:
+           the refusal named this game's earlier send as the stored copy - taken or re-based), then this game's own stored copy (F1626 B:
+           learned, no hold), then the ordinary refusal or the stale branch. */
+        const std::string rz = AfZoneId(m.x, m.y);
+        wasPush = ZoneRepushAnswered(rz, m.stamp);   /* F1631 item 4: any answer to the link-up push's stamp settles it */
+        const int za = ZoneReplayAnswer(rz, areafresh::RecRefusalOf(m.why), m.stamp, 1, m.storedStamp, m.storedSeq);
+        if (areafresh::ReplayAnswerSettles(za) != 0) ZoneUnechoedSettle(rz, m.stamp, 0);   /* T-1391 F1680 L4: the replay road answered - OwnStoredDecide (which settles it on the other road) is not asked; the refused upload is not stored */
+        int resend = 0;
+        if (areafresh::OwnStoredAsked(za) != 0) ownV = ZoneOwnStoredVerdict(rz, areafresh::RecRefusalOf(m.why), m.stamp, m.storedStamp, m.storedSeq, &resend);
+        const int road = areafresh::RefusalRoad(za, ownV, m.why == (unsigned int)areafresh::kWhyStaleBase ? 1 : 0);
+        if (road == areafresh::kRfDone) return;
+        if (areafresh::OwnStoredAsked(za) != 0) ZoneOwnStoredApply(rz, ownV, resend, areafresh::RecRefusalOf(m.why), m.stamp, m.storedStamp, m.storedSeq);
+        if (road == areafresh::kRfOwnStored) return;
+        if (za == 0 && road == areafresh::kRfOrdinary)
+        {   /* T-1391 (F1653, the hand-over rule): this game's own unconfirmed save refused 'not holder' WAITS - decided again at each area map
+               (ZonePushHeldRetry), across a quit (the kept row / .unsent) - never dropped */
+            const std::map<std::string, Record>::const_iterator wr = g_records.find(rz);
+            const int wpv = wr != g_records.end() ? ZonePushVerdict(rz, wr->second) : (int)areafresh::kPushSkipNotOwn;
+            if (areafresh::NotHolderWaits(areafresh::RecRefusalOf(m.why) == coopqueue::kZrAnsNotHolder ? 1 : 0, wpv) != 0)
+            {
+                g_zonePushHeldWait.insert(rz); ++g_zonePushNotHolderWait;
+                DebugLog("[ZONE] PUSH WAIT " + rz + " - this game's own save (writtenAt " + N(wr->second.writtenAt) + ", upload stamp " + N(m.stamp) + ") refused recNotHolder: another game holds the area at the world server - it WAITS and is"
+                         " decided again at each area map (pushNotHolderWait=" + N(g_zonePushNotHolderWait) + ", waiting " + N((long long)g_zonePushHeldWait.size()) + ")");
+                return;
+            }
+        }
+        if (za == 0 && road == areafresh::kRfOrdinary && ++g_zrRecRefusedOther <= 20)
             DebugLog("[ZONE] RECORD REFUSED zone=" + AfXy(m.x, m.y) + " why=" + areafresh::WhyName(m.why) + " - the world server did not take this game's upload of the area (stamp "
                      + N(m.stamp) + "); its next save is judged again (recRefusedOther=" + N(g_zrRecRefusedOther) + ", first 20 logged)");
-        if (m.why != (unsigned int)areafresh::kWhyStaleBase) return;
+        if (road != areafresh::kRfStale) return;
     }
     if (m.kind == (unsigned int)areafresh::kWrite)
     {
@@ -46254,7 +48067,30 @@ void AreaFreshArrive(const std::vector<char>& payload)
            (F-T1279-STALELOAD), so it shows this game's copy until its next load; nothing of it is published from here until that read,
            so this game never keeps writing over the world's copy from its stale one */
         const std::string zid = AfZoneId(m.x, m.y);
-        const bool first = g_zoneStaleBase.insert(zid).second; ++g_zoneStaleBaseTold;
+        /* T-1391 F1631 item 2: held unless the world server's stored copy is this game's own (that road returned above) - a refused link-up
+           push naming ANOTHER game's newer copy holds as any refused save: the content here is stale */
+        const int holdIt = areafresh::StaleHoldApplies(ownV);
+        const std::map<std::string, ZoneMirrorBase>::const_iterator smb = g_zoneMirrorBase.find(zid);
+        if (areafresh::StaleChecksHere(holdIt, smb != g_zoneMirrorBase.end() ? 1 : 0, smb != g_zoneMirrorBase.end() ? smb->second.writtenAt : 0, m.stamp) != 0)
+        {   /* T-1391 (F1653; F1677: made with the link up OR down): an own save refused STALE naming another game's copy - before it is dropped,
+               the own-work check against the area's kept base (the world copy this game loaded): each own thing carried by its own record, or a
+               FAULT with the bytes set aside. The mirror file still holds that upload (its stamp). */
+            std::vector<char> ob; const bool obOk = (AreaStateBytes(zid, &ob, 0) && !ob.empty()) || ReadFileBytes(MirrorFile(zid), &ob);   /* T-1391 F1706: the save's bytes from the area's state */
+            ZoneOwnWorkCheck(zid, obOk ? &ob : 0, "the world's copy writtenAt " + N(m.storedStamp) + " seq " + N((long long)m.storedSeq) + " (another game's)", "a stale-base refusal");
+            ZoneUnsentSideClear(zid);
+        }
+        else if (holdIt != 0 && ++g_zoneStaleNotHereLines <= 20)
+            DebugLog("[ZONE] T-1391 OWN WORK " + zid + " at a stale-base refusal (upload stamp " + N(m.stamp) + "): not checked here - the mirror file no longer holds that upload ("
+                     + (smb != g_zoneMirrorBase.end() ? "it holds writtenAt " + N(smb->second.writtenAt) + (smb->second.seq != 0 ? std::string(", a world copy - the received-copy road checked the save first") : std::string(", a newer own save - judged by its own answer"))
+                                                      : std::string("its version is not known")) + ") (first 20 logged)");
+        if (wasPush != 0)
+        {
+            ++g_zonePushRefusedHeld;
+            DebugLog("[ZONE] PUSH refused " + zid + " (CANT staleBase, stamp " + N(m.stamp) + ", the world's copy writtenAt " + N(m.storedStamp) + " seq " + N((long long)m.storedSeq)
+                     + ") - the link-up push of this game's copy is not taken: the world holds another game's newer copy, so the content here is stale - "
+                     + std::string(holdIt != 0 ? "held as any refused save" : "not held") + " (pushRefusedHeld=" + N(g_zonePushRefusedHeld) + ")");
+        }
+        const bool first = holdIt != 0 && g_zoneStaleBase.insert(zid).second; if (holdIt != 0) ++g_zoneStaleBaseTold;
         std::string baseSaid;   /* T-1391 (owner 1821): the base the refused upload went with, its road, and the stored copy's seq when this game holds that copy */
         {
             const std::map<std::string, unsigned long long>::const_iterator sb = g_zoneSentBase.find(zid);
@@ -46267,8 +48103,8 @@ void AreaFreshArrive(const std::vector<char>& payload)
         {   /* s2 fold 4 (review F1376): this game's mirror copy of the area no longer counts as current - its held record's stamp goes to 0, so
                the next load's ask / exchange fetches the world's copy (ask stamp 0: the world server sends its stored copy) and the RECV takes it */
             std::map<std::string, Record>::iterator hr = g_records.find(zid);
-            if (hr != g_records.end()) { hr->second.writtenAt = 0; ZoneSwapPublish(zid); }
-            g_zoneMirrorBase.erase(zid);
+            if (holdIt != 0 && hr != g_records.end()) { hr->second.writtenAt = 0; ZoneSwapPublish(zid); }   /* F1631 item 3: zeroed with the hold (StaleHoldApplies) */
+            if (holdIt != 0) g_zoneMirrorBase.erase(zid);
         }
         const int loadedHere = ZoneLoadedSectorTri(m.x, m.y) == 1 ? 1 : 0;
         if (first && g_zoneStaleBaseTold <= 20) ErrorLog("[ZONE] STALE BASE zone=" + AfXy(m.x, m.y) + " - the world server refused this game's copy: it was made from an older copy than the stored one (writtenAt " + N(m.storedStamp) + ", its upload's " + N(m.stamp) + "); "

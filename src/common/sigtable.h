@@ -176,6 +176,16 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
    row. oc->missedRows / missedWhy name every optional row missed (T-1453). */
 int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, int maxEntries, SigOutcome* oc);
 
+/* T-1457 (owner 1824, F1707): A FILE OF A FEW ROWS. `out` gets only the rows of `f` named in names[0..n) (in f's order), each with
+   its second pattern (a var row's g:) and the call checks whose row and target are both among them. feature[i] non-0 makes names[i]
+   an OPTIONAL row of that feature in `out` (0 keeps the row's own marker). `out` keeps f's !sigversion, its unreadable lines and its
+   !nosig lines that name one of the rows, and its !count is its own row count - so SigResolveAll on `out` resolves those rows exactly
+   as it resolves the whole file: each required row found EXACTLY ONCE and passing its own check, the cross-checks over them, any
+   damage to the file refusing. A name `f` carries as no row is appended to *absent (may be 0); returns how many there were. Pure.
+   (The report road of a game the address gate switched off: addresses.cpp AddrResolveReportRows.) */
+int SigSubset(const SigFile& f, const char* const* names, const char* const* feature, int n, SigFile* out,
+              std::vector<std::string>* absent);
+
 }   /* namespace coopsigtab */
 
 #endif

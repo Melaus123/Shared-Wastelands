@@ -62,7 +62,7 @@
 
 namespace sqwreg {
 
-const unsigned kProtocol = 173u;          /* the world-server protocol that carries SQUAD_TAKE, SQUAD_WRITER (its answers and its writer notes) and SQUAD_RELEASE (146: its id "*" is the re-claim batch's end mark, T-1269) */
+const unsigned kProtocol = 177u;          /* the world-server protocol that carries SQUAD_TAKE, SQUAD_WRITER (its answers and its writer notes) and SQUAD_RELEASE (146: its id "*" is the re-claim batch's end mark, T-1269) */
 
 
 

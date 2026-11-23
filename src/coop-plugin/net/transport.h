@@ -441,6 +441,10 @@ public:
     virtual unsigned int HostSilenceMs() const { return 0; }
     /* M16 (T-197): what waits to be sent on this link (src/common/sendbound.h) as one REPORT token; empty for a backend without the bound. */
     virtual std::string SendBoundToken() { return std::string(); }
+    /* T-540 fold 3: a reliable message handed to Send NOW would go out at once - nothing waits on this link's own line ahead of it
+       (sendbound.h: a reliable message is Direct only while nothing waits) and the network queue has room. A LIVE read at the moment
+       of the send, main thread. A backend without a waiting line of its own answers true. PROCESS-LOCAL: nothing on the wire. */
+    virtual bool ReliableSendsNow() { return true; }
     /* M16 fold 2: this link is the game's link to the world server - type 53 is a LIVE envelope on it (on the session link
        it is MSG_PARITY_REQ and must-deliver). A no-op for a backend without the bound. */
     virtual void SetStoreLink() {}

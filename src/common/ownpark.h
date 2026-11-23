@@ -55,6 +55,15 @@ inline int Judge(bool found, const std::string& parkedSid, const Place& parkedAt
     return kFoundApply;
 }
 
+/* T-1449 review fold 2: two parked entries name the same item when their engine hands (5 words) are equal - a kept kit item whose
+   owner is not here yet is asked again at every redress; its existing entry is refreshed, never a second one taken. */
+inline bool SameHand(const unsigned int* a, const unsigned int* b)
+{
+    if (a == 0 || b == 0) return false;
+    for (int i = 0; i < 5; ++i) if (a[i] != b[i]) return false;
+    return true;
+}
+
 /* millisecond tick counts; the subtraction is unsigned, so a counter that wrapped still measures right */
 inline bool Expired(unsigned int now, unsigned int since) { return (unsigned int)(now - since) >= kParkLimitMs; }
 inline bool RetryDue(unsigned int now, unsigned int last) { return (unsigned int)(now - last) >= kParkRetryMs; }

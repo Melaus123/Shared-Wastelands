@@ -88,7 +88,7 @@ inline int AddrUsesAllCallOnly(const unsigned char* uses, int n)
        trampoline -> the other mod's code -> the game; coop::AddHook re-reads the bytes first (hooks.cpp);
      - a row this mod reads at its start (a prologue check before a hook) finds the jump and skips that one hook, logged.
    A PATCH SITE (bytes this mod writes) lies inside a function, so it has no .pdata entry and another mod's jump there is
-   refused, exactly as before. The signature road (no table) reads the file on disk and accepts nothing here.
+   refused, exactly as before. The signature road (no table) applies the same rule since T-1476 (AddrGateUse below).
    THE JUMP FORMS ACCEPTED: E9 rel32 (5 bytes) and FF 25 rip-relative with a non-zero distance (6 bytes, jmp [rip+d]); the
    destination (for FF 25, the 8-byte pointer's value) must lie outside the game's image. FF 25 00000000 + an 8-byte address
    (14 bytes) is refused: it overwrites 14 of the 16 bytes a row names, so the rest cannot prove the function (kWhyLongJump).
@@ -156,6 +156,18 @@ inline int AddrForeignVerdict(const unsigned char* expected, const unsigned char
     }
     if (why) *why = w;
     return w == kWhyAccepted ? kHookAccepted : kHookRefuse;
+}
+
+/* T-1476 (F2011, owner 1876): THE USE THE GATE APPLIES TO A ROW, on either road (the road is no input: it does not change the
+   rule). declared: the row's declared use (RowUse: 0 none, 1 call-only, 2 any other).
+   Both roads apply the declared use: the signature road places each row from the executable FILE's own bytes (the file on
+   disk, which no other mod can have hooked), so another mod's jump at a function's start changes only those first bytes in
+   the running game - the same evidence the table road weighs, and AddrForeignVerdict decides it the same way. Before T-1476
+   the signature road gave every row 0 (strict), and RE_Kenshi's jump on a call-only row refused every GOG game (F2011).
+   A value other than 1 or 2 is 0 (strict). Pure. */
+inline int AddrGateUse(int declared)
+{
+    return (declared == 1 || declared == 2) ? declared : 0;
 }
 
 /* THE SET'S USE (registrations of one row name): 1 when there is at least one and every one is call-only; 2 when there is

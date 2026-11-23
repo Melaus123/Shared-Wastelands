@@ -1504,7 +1504,7 @@ void t_t247_world_list()
         playermods::World n; n.hasList = 0; n.flags = playermods::kFlagTellAdmin;
         if (playermods::NoticeOfWorld(n, diff) != ModNoListAdminText()) Fail("t247: an admin is told the world has no list");
         n.flags = 0; if (!playermods::NoticeOfWorld(n, diff).empty()) Fail("t247: a player who is not an admin is told nothing about no list");
-        if (playermods::kMsgPlayerMods != 104u || playermods::kProtocol != 173u || playermods::kProtocol != authproof::kProtocol) Fail("t938: PLAYER_MODS is message 104 of world-server protocol 173");
+        if (playermods::kMsgPlayerMods != 104u || playermods::kProtocol != 177u || playermods::kProtocol != authproof::kProtocol) Fail("t938: PLAYER_MODS is message 104 of world-server protocol 177");
     }
 }
 
@@ -6764,6 +6764,59 @@ void t_t707_copy_squad_id()
         || ContentFileRenamed("platoon/Nameless_01.platoon", "Nameless_0", "Nameless_0-c1", &cf) != 0 || ContentFileRenamed("platoon/Alpha_0.platoon", "Nameless_0", "Nameless_0-c1", &cf) != 0
         || ContentFileRenamed("platoon/Nameless_0.platoon", "", "x-c1", &cf) != 0 || ContentFileRenamed("platoon/Nameless_0.platoon", "Nameless_0", "", &cf) != 0 || cf != "x")
         Fail("t707: a content file naming another file, or nothing, is left alone");
+}
+
+/* T-1474 (H-T1474-idclash): a squad id copied from another game (CarryPeerPlatoonId, the raid lend build) is refused when any squad
+   here holds it, in any faction - the walk's holder note and the clash decision, fed the way spawn.cpp's walk feeds them */
+void t_t1474_copied_id_any_faction()
+{
+    using namespace copysq;
+    int a = 0, b = 0, c = 0, self = 0;   /* stand-ins for squad addresses */
+    /* T3017's scene on the joiner: the copy-squad (faction Drifters) is to carry the host's 'Nameless_0'; the walk meets an
+       unrelated Drifters squad, the joiner's own squad 'Nameless_0' (own player faction), and the copy-squad itself */
+    {
+        IdHolder h;
+        NoteIdHolder(&h, "Nameless_0", "Drifters_3", 0, 0, &a, "Drifters");
+        NoteIdHolder(&h, "Nameless_0", "Nameless_0", 0, 1, &b, "Nameless");
+        NoteIdHolder(&h, "Nameless_0", "Nameless_0", 1, 0, &self, "Drifters");
+        if (h.found != 1 || h.own != 1 || h.platoon != &b || h.faction != "Nameless") Fail("t1474: the joiner's own squad holding the id is found and named");
+        if (CopiedIdClash(0, h.found != 0 ? 1 : 0) != kCopiedIdHeldElsewhere) Fail("t1474: the joiner's own squad id is a clash though the copy's faction holds none");
+        if (coopsp::CarryIdDecide(0, 1, CopiedIdClash(0, 1) != kCopiedIdFree ? 1 : 0) != coopsp::kCarrySkipClash) Fail("t1474: a clash in another faction is not carried");
+    }
+    /* a holder from another (non-player) faction */
+    {
+        IdHolder h;
+        NoteIdHolder(&h, "Shek_12", "Shek_12", 0, 0, &a, "Shek Kingdom Rebels");
+        if (h.found != 1 || h.own != 0 || h.platoon != &a || h.faction != "Shek Kingdom Rebels") Fail("t1474: a holder in another world faction is found and named");
+        if (CopiedIdClash(0, 1) != kCopiedIdHeldElsewhere) Fail("t1474: a holder in another world faction is a clash");
+        /* this game's own squad is named over an earlier holder of another faction; a later other-faction holder never replaces it */
+        NoteIdHolder(&h, "Shek_12", "Shek_12", 0, 1, &b, "Nameless");
+        NoteIdHolder(&h, "Shek_12", "Shek_12", 0, 0, &c, "Drifters");
+        if (h.own != 1 || h.platoon != &b || h.faction != "Nameless") Fail("t1474: this game's own squad is named first");
+        /* a later other-faction holder never replaces the first */
+        IdHolder h2;
+        NoteIdHolder(&h2, "Shek_12", "Shek_12", 0, 0, &a, "Shek Kingdom Rebels");
+        NoteIdHolder(&h2, "Shek_12", "Shek_12", 0, 0, &c, "Drifters");
+        if (h2.platoon != &a || h2.faction != "Shek Kingdom Rebels") Fail("t1474: the first other-faction holder is kept");
+    }
+    /* no clash: nobody else holds it (only the copy itself, other ids) - carried as before */
+    {
+        IdHolder h;
+        NoteIdHolder(&h, "Nameless_0", "Nameless_0", 1, 0, &self, "Drifters");
+        NoteIdHolder(&h, "Nameless_0", "Nameless_1", 0, 1, &b, "Nameless");
+        NoteIdHolder(&h, "Nameless_0", "Nameless_00", 0, 0, &a, "Drifters");
+        NoteIdHolder(&h, "Nameless_0", "Nameless_0-c1", 0, 0, &c, "Nameless 2");
+        if (h.found != 0 || h.platoon != 0 || !h.faction.empty()) Fail("t1474: only an exact id held by another squad is a holder");
+        if (CopiedIdClash(0, 0) != kCopiedIdFree) Fail("t1474: no holder anywhere -> no clash");
+        if (coopsp::CarryIdDecide(0, 1, CopiedIdClash(0, 0) != kCopiedIdFree ? 1 : 0) != coopsp::kCarryYes) Fail("t1474: no clash -> carried as before");
+        IdHolder e;
+        NoteIdHolder(&e, "", "", 0, 1, &b, "Nameless");
+        if (e.found != 0) Fail("t1474: no id, no holder");
+    }
+    /* the same-faction test (before T-1474) still answers first; an unwalked world keeps the same-faction answer */
+    if (CopiedIdClash(1, 0) != kCopiedIdHeldSameFaction || CopiedIdClash(1, 1) != kCopiedIdHeldSameFaction || CopiedIdClash(1, -1) != kCopiedIdHeldSameFaction)
+        Fail("t1474: a same-faction holder is a clash, named as before");
+    if (CopiedIdClash(0, -1) != kCopiedIdFree) Fail("t1474: a walk that could not run leaves the same-faction answer (no clash) as before");
 }
 
 void t_inv7a3_own_id_supersede_and_woken_recheck()

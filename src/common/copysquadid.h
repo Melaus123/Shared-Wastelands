@@ -124,6 +124,42 @@ inline int ContentFileRenamed(const std::string& v, const std::string& engineId,
 
 inline const char* HeldText(int held) { return held == kHeldOwn ? "own" : (held == kHeldOther ? "other" : "no"); }
 
+/* T-1474 (H-T1474-idclash, owner 1872 a) - AN ID COPIED FROM ANOTHER GAME IS CHECKED AGAINST EVERY SQUAD HERE.
+   Established practice is per-game id spaces: each game names its own squads (the engine's "<faction>_<n>", the mod's
+   "<id>-c<k>").  Two roads copy another game's RAW squad id onto a squad of this game - a world squad's copy
+   (spawn.cpp CarryPeerPlatoonId, so a reload finds the saved copy by the other game's id) and a raid squad lent here
+   (store.cpp RaidLendBuildImpl).  That is a departure from per-game ids: kept, but refused when any squad here other
+   than the one being named holds the id - any faction, awake or asleep, this game's own player squads included - since
+   the save keeps one platoon/<id>.platoon per id and the two squads would share it (T3017: a joiner's copy-squad of a
+   Drifters character took 'Nameless_0', the joiner's own squad id; the joiner's squad and character were lost from the
+   save).  Before T-1474 both roads asked only the copy's own faction. */
+struct IdHolder
+{
+    int found;              /* 1 = a squad other than the one being named holds the id */
+    int own;                /* 1 = that squad is one of this game's own player faction's */
+    const void* platoon;    /* the holder - compared and printed, never read here */
+    std::string faction;    /* its faction's name */
+    IdHolder() : found(0), own(0), platoon(0) {}
+};
+/* One squad of the walk over every faction: squadId its id; isSelf 1 = the squad being given the id (never its own
+   holder); own 1 = this game's own player faction.  The first holder is kept, but this game's own squad is named over
+   another faction's. */
+inline void NoteIdHolder(IdHolder* h, const std::string& wantId, const std::string& squadId, int isSelf, int own, const void* platoon, const std::string& faction)
+{
+    if (wantId.empty() || isSelf != 0 || squadId != wantId) return;
+    if (h->found != 0 && (h->own != 0 || own == 0)) return;
+    h->found = 1; h->own = own != 0 ? 1 : 0; h->platoon = platoon; h->faction = faction;
+}
+/* The copied id's clash.  sameFaction: 1 = the copy's own faction's lookups found another squad with the id (the test
+   before T-1474).  anywhere: the every-faction walk - 1 a holder found, 0 none, -1 not walked (no id, or the faction
+   directory unread: the same-faction answer stands, as before T-1474). */
+const int kCopiedIdFree = 0, kCopiedIdHeldSameFaction = 1, kCopiedIdHeldElsewhere = 2;
+inline int CopiedIdClash(int sameFaction, int anywhere)
+{
+    if (sameFaction != 0) return kCopiedIdHeldSameFaction;
+    return anywhere == 1 ? kCopiedIdHeldElsewhere : kCopiedIdFree;
+}
+
 } // namespace copysq
 
 #endif

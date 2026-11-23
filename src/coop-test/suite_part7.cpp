@@ -14,15 +14,20 @@
 #include "../common/raidroll.h"   /* T-1122 roller (owner 1577 c) */
 #include "teamstub.h"   /* T-1250: the teammate list lookup the left-click window asks */
 
+#include "../common/statedump.h"   /* T-1429 step 2 */
 #include "../common/actowed.h"   /* T-860 */
 #include "../common/cagerec.h"   /* T-860: the cage record */
 #include "../common/bldgrec.h"   /* T-1333: the town building record */
 #include "../common/doorrec.h"   /* T-1333 fold 3: a town door's health */
 #include "../common/buildwire.h"   /* T-1333: the HIT ask's wall repair */
+#include "../common/profiles.h"   /* T-1462: the Level Editor window */
+#include "../common/uidrive.h"   /* T-1462: its uiclick rows */
 #include "../common/farmwire.h"   /* T-1408 fold 2: HELP_HELD never a farm kind */
 #include "../common/powerwire.h"   /* T-1408 fold 2: nor a power kind */
 #include "../common/prisonwire.h"   /* T-860 fold 1: FREED's owner rule */
 #include "../common/wallgroup.h"   /* T-1408 fold 13: wall groups shared from the owner */
+#include "../common/camplaid.h"   /* T-1429 F1753: the camp pieces record's inside byte */
+#include "../common/nudgefloor.h"   /* T-1422 (owner 1868 a): the nudge's floor */
 #include <map>
 
 namespace suite {
@@ -240,20 +245,23 @@ void t_t799_keeper_repair()
     if (KeeperRepairGo(kKeeperRepairEmpty, 1) != kKeeperRepairEmpty) Fail("the area holder repairs");
     if (KeeperRepairGo(kKeeperRepairMoneyUnknown, 0) != kKeeperRepairNone) Fail("not the area holder: nothing");
 }
-/* T-801 D5: a sale no counter has room for is taken (keeper pays, item destroyed, verdict OK) only when counters resolved and nothing
-   faulted; no counter resolved, a fault, an unread quantity, no item or a caravan stays refused (kVNoRoom). */
+/* T-801 D5: a sale no counter has room for is taken (keeper pays, item destroyed, verdict OK) when nothing faulted; a fault, an
+   unread quantity or no item stays refused (kVNoRoom). D5 completion (owner 1767 a): no counter found (G2) and a caravan's packs (G1)
+   are taken too (t801_d5_completion). */
 void t_t801_sell_no_room()
 {
     using namespace coopsquad;
-    if (SellNoRoomTaken(2, 0, 0, 0, 1, 0) != 1) Fail("counters resolved, none took it: taken");
-    if (coopshop::HolderSell(coopshop::kVOk, 1, SellNoRoomTaken(2, 0, 0, 0, 1, 0)) != coopshop::kVOk) Fail("the taken sale's verdict is OK");
-    if (SellNoRoomTaken(0, 0, 0, 0, 1, 0) != 0) Fail("no counter resolved: refused");
-    if (coopshop::HolderSell(coopshop::kVOk, 1, SellNoRoomTaken(0, 0, 0, 0, 1, 0)) != coopshop::kVNoRoom) Fail("no counter resolved: verdict 8");
-    if (SellNoRoomTaken(2, 0, 1, 0, 1, 0) != 0) Fail("a faulted add: refused");
-    if (SellNoRoomTaken(2, 0, 0, 1, 1, 0) != 0) Fail("quantity unread: refused");
-    if (SellNoRoomTaken(2, 0, 0, 0, 0, 0) != 0) Fail("no item made: refused");
-    if (SellNoRoomTaken(2, 0, 0, 0, 1, 1) != 0) Fail("a caravan's packs: refused as before");
-    if (SellNoRoomTaken(2, 3, 0, 0, 1, 0) != 0) Fail("a piece took units: the partial path, not this one");
+    if (SellNoRoomTaken(2, 0, 0, 0, 1, 0, 0) != 1) Fail("counters resolved, none took it: taken (whatever the walk)");
+    if (coopshop::HolderSell(coopshop::kVOk, 1, SellNoRoomTaken(2, 0, 0, 0, 1, 0, 0)) != coopshop::kVOk) Fail("the taken sale's verdict is OK");
+    if (SellNoRoomTaken(0, 0, 0, 0, 1, 0, 1) != 1) Fail("no counter resolved, the walk clean: taken (D5 completion G2)");
+    if (coopshop::HolderSell(coopshop::kVOk, 1, SellNoRoomTaken(0, 0, 0, 0, 1, 0, 1)) != coopshop::kVOk) Fail("no counter resolved: verdict OK (G2)");
+    if (SellNoRoomTaken(0, 0, 0, 0, 1, 0, 0) != 0) Fail("no counter resolved, the walk torn: refused (fold 1 F1)");
+    if (coopshop::HolderSell(coopshop::kVOk, 1, SellNoRoomTaken(2, 0, 1, 0, 1, 0, 1)) != coopshop::kVNoRoom) Fail("a faulted add: verdict 8");
+    if (SellNoRoomTaken(2, 0, 1, 0, 1, 0, 1) != 0) Fail("a faulted add: refused");
+    if (SellNoRoomTaken(2, 0, 0, 1, 1, 0, 1) != 0) Fail("quantity unread: refused");
+    if (SellNoRoomTaken(2, 0, 0, 0, 0, 0, 1) != 0) Fail("no item made: refused");
+    if (SellNoRoomTaken(2, 0, 0, 0, 1, 1, 0) != 1) Fail("a caravan's packs: taken (D5 completion G1)");
+    if (SellNoRoomTaken(2, 3, 0, 0, 1, 0, 1) != 0) Fail("a piece took units: the partial path, not this one");
 }
 /* T-799 D1: where a pot's money came from at a load - the engine's own load of a group it loaded by itself: known; a record that
    carries the money and went in: known; a record without it (an older record) or whose money did not go in: cleared, never "0
@@ -710,6 +718,16 @@ void t1170_spawncontainer_word()
     if (SpawnContainerWord("x") != kSpawnContainerKeep) Fail("a non-number: not the reference platoon (as before)");
     if (SpawnContainerWord("NEW") != kSpawnContainerKeep) Fail("NEW: the word is lower case only");
     if (kSpawnContainerNull == kSpawnContainerKeep || kSpawnContainerKeep == kSpawnContainerNew || kSpawnContainerNull == kSpawnContainerNew) Fail("the three modes are not distinct");
+    /* T-1467 TEST-ONLY `spawncontainer with:<label>`: the squad of a lever-made person; "with:" alone refused; the label read whole */
+    if (SpawnContainerWord("with:bodyl") != kSpawnContainerWith) Fail("with:bodyl: not the join-a-squad mode");
+    if (SpawnContainerWithLabel("with:bodyl") != "bodyl") Fail("with:bodyl: the label is not bodyl");
+    if (SpawnContainerWord("with:") != kSpawnContainerBad) Fail("with: (no label): not refused");
+    if (!SpawnContainerWithLabel("with:").empty()) Fail("with: (no label): a label was read");
+    if (!SpawnContainerWithLabel("new").empty() || !SpawnContainerWithLabel("1").empty()) Fail("new / 1: read as a with: label");
+    if (SpawnContainerWord("With:bodyl") != kSpawnContainerKeep) Fail("With:bodyl: the word is lower case only (reads as before)");
+    if (kSpawnContainerWith == kSpawnContainerNull || kSpawnContainerWith == kSpawnContainerKeep || kSpawnContainerWith == kSpawnContainerNew
+        || kSpawnContainerBad == kSpawnContainerNull || kSpawnContainerBad == kSpawnContainerKeep || kSpawnContainerBad == kSpawnContainerNew
+        || kSpawnContainerBad == kSpawnContainerWith) Fail("the five modes are not distinct");
 }
 
 /* `editorstate [watch <N>]` and the editor's per-recruit body test (src/common/editorstate.h). */
@@ -3568,6 +3586,37 @@ void t_t1351_landed_time_sets()
     if (ZoneRecordLandedSets(0, 0, 0, 1000, 7) != 1 || ZoneRecordLandedSets(0, 0, 0, 0, 0) != 1) Fail("T-1351: with no loaded-from entry the landed time was not set (the old behaviour)");
     if (ZoneRecordNewerThanLoaded(1000, 7, 1000, 7) != 0 || ZoneRecordNewerThanLoaded(1000, 7, 1001, 0) != 1) Fail("T-1351: the save gate's newer test changed");
 }
+/* ---- T-1391 F1848 (run T2752): this game uploads its own area save; when the copy loaded here is that very save (same stamp, noted
+   with a known seq) the note becomes this game's own write (seq 0), so the world's echo (same stamp, higher seq) is no newer copy;
+   a different stamp, no note, or a note already seq 0 stay untouched. Then the three roads' wiring in store.cpp. ---- */
+void t_t1391f_upload_loaded_own()
+{
+    using namespace zonerec;
+    /* T2752 log-B: B loaded its own unsent save of 20,32 (stamp 1795266272) as seq 1704, pushed it, the world stored it as seq 1986 */
+    if (ZoneUploadMakesLoadedOwn(1, 1795266272LL, 1704ULL, 1795266272LL) != 1) Fail("F1848: the push of the very save loaded here did not make the note this game's own write");
+    if (ZoneRecordNewerThanLoaded(1795266272LL, 1704ULL, 1795266272LL, 1986ULL) != 1) Fail("F1848: T2752's case is no longer refused without the fix - the test no longer shows the run");
+    if (ZoneRecordNewerThanLoaded(1795266272LL, 0ULL, 1795266272LL, 1986ULL) != 0) Fail("F1848: with the note set to seq 0 the echo of this game's own upload still reads as newer");
+    if (ZoneUploadMakesLoadedOwn(1, 1795266272LL, 1704ULL, 1795266290LL) != 0) Fail("F1848: an upload of a different save changed the note of the copy loaded here");
+    if (ZoneUploadMakesLoadedOwn(1, 1795266290LL, 1704ULL, 1795266272LL) != 0) Fail("F1848: an upload of an older save changed the note of the copy loaded here");
+    if (ZoneUploadMakesLoadedOwn(0, 0, 0ULL, 1795266272LL) != 0 || ZoneUploadMakesLoadedOwn(0, 1795266272LL, 1704ULL, 1795266272LL) != 0) Fail("F1848: with no loaded-from note the upload made one");
+    if (ZoneUploadMakesLoadedOwn(1, 1795266272LL, 0ULL, 1795266272LL) != 0) Fail("F1848: a note already this game's own write was changed again");
+    const std::string s = T313ReadFile("../coop-plugin/store.cpp");
+    if (s.empty()) { Fail("F1848: store.cpp not read"); return; }
+    const char* need[] = {
+        "if (zonerec::ZoneUploadMakesLoadedOwn(has, has != 0 ? fr->second.writtenAt : 0, has != 0 ? fr->second.seq : 0ULL, at) == 0) return;",
+        "fr->second.seq = 0;",
+        "ZoneUploadLoadedOwnNote(id, at, road);   /* T-1391 F1848",
+        "ZonePushSentNote(id, row.writtenAt, pushBase, \"the held push at an area map\");",
+        "ZoneUploadLoadedOwnNote(zid, rr->second.writtenAt, \"the own-stored resend\"); }   /* F1848 */",
+        "\"[ZONE] LOADED OWN \"" };
+    for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i)
+        if (s.find(need[i]) == std::string::npos) Fail(std::string("F1848 wiring: store.cpp lacks ") + need[i]);
+    /* the link-up push drains the load facts before its walk, and the note is set inside the walk (ZonePushSentNote) */
+    const size_t up = s.find("void StoreRepushUpTick()");
+    const size_t dr = s.find("ZoneFromRecordDrain();   /* T-1391 F1848: load facts land before the walk", up);
+    const size_t walk = s.find("for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it)", up);
+    if (up == std::string::npos || dr == std::string::npos || walk == std::string::npos || dr > walk) Fail("F1848 wiring: the link-up push does not drain the load facts before its walk");
+}
 /* ---- T-1351 (owner decision 1664): when a save of an area is refused, the log line listing what differs between the refused copy
    and the newest record's copy (src/common/zonediff.h). Two small hand-built area files: a building whose build progress changed,
    a box item only the refused copy has, a piece only the refused copy has; record ids, handle words and the container id differ
@@ -5943,215 +5992,295 @@ void t_t986f1_close_kind()
     if (CloseLeavesCombat(7) || CloseEndsAction(7)) Fail("T-986 fold 1: an unknown kind undid something");
     if (std::string(CloseReason(kCloseDrift)) != "drift" || std::string(CloseReason(kCloseOwnerOff)) != "authority_off") Fail("T-986 fold 1: the close reasons");
 }
-/* T-1422 fix 2 / 2b / 2c (F1414, owner 1771 a/b; reviews of a68289722, b8a52a4c0): the window follow's step - FLAT toward the
-   route point (gap, deadband and cap on x / z; the height never set), err x (1 - exp(-dt/tau)), capped at (owner speed + the
-   reconcile's rate) x dt and at the absolute ceiling plus the owner's own distance this frame; never a jump; a held dt; unread
-   inputs move nothing; the floor walk's start, end and goal band; the aim as FollowFrame takes it */
-/* T-1422 fold 2g: one walk under a pattern of fight passes ('P' a pass in that frame, '.' none); passFirst: the pass runs before the
-   main thread's step in its frame. A pass cancels the route (F1414), a request sets it. Outputs: frames (after the first) that end
-   with the route cancelled; passes not followed by a request; main-thread frames that differ from 'no pass since its previous step';
-   the requests of each road. */
-static int SimWalkRoads(const char* pat, bool passFirst, int* passNoReq, int* mainWrong, int* mainN, int* workerN)
+/* T-1470 (owner 1858 / 1859): the fight window is back on v0.4.2's road - a copy in a native window is walked by the engine's own fight
+   routine (nothing stops it after the pass; no route step, no floor walk), the drive only nudges it sideways toward the owner's last
+   report, and the close places a copy 2 or more off its owner (SnapPuppetToAuthority), every copy alike. Wiring only: the engine's
+   routine and the placement are not callable offline. */
+static std::string T1470Body(const std::string& s, const char* head)
 {
-    using namespace windowfollow;
-    long long passes = 0, prev = -1;
-    bool live = false;
-    int endCancelled = 0;
-    *passNoReq = 0; *mainWrong = 0; *mainN = 0; *workerN = 0;
-    for (int f = 0; pat[f] != 0; ++f)
-    {
-        const bool pass = pat[f] == 'P';
-        const bool prevPass = f > 0 && pat[f - 1] == 'P';
-        for (int step = 0; step < 2; ++step)
-        {
-            const bool doMain = (step == 0) != passFirst;
-            if (doMain)
-            {
-                const bool expect = f > 0 && (passFirst ? !pass : !prevPass);   /* no pass since the previous main step */
-                const int r = WalkRoadMainFrame(true, false, passes, prev);
-                prev = passes;
-                if ((r == kWalkRoadMain) != expect) ++*mainWrong;
-                if (r == kWalkRoadMain) { live = true; ++*mainN; }
-            }
-            else if (pass)
-            {
-                ++passes; live = false;   /* the pass set the movement mode: the route is cancelled */
-                if (WalkRoadAfterPass(true, false) == kWalkRoadWorker) { live = true; ++*workerN; } else ++*passNoReq;
-            }
-        }
-        if (f > 0 && !live) ++endCancelled;
-    }
-    return endCancelled;
+    const size_t a = s.find(head);
+    if (a == std::string::npos) return std::string();
+    const size_t b = s.find("\n}", a);
+    return b == std::string::npos ? std::string() : s.substr(a, b - a);
 }
-void t_t1422_window_follow_step()
+void t_t1470_window_v042_road()
 {
-    using namespace windowfollow;
-    Tuning t; t.tau = 0.15f; t.baseRate = 20.0f; t.boostErr = 5.0f; t.boostSlope = 4.0f; t.maxRateBoost = 60.0f; t.maxStepAbs = 0.8f; t.deadband = 0.5f; t.maxDt = 0.05;
-    Step s;
-    volatile float zero = 0.0f;
-    if (WfExpNeg(0.0f) != 1.0f || WfExpNeg(-1.0f) != 1.0f) Fail("T-1422 fix 2: e^-0");
-    if (WfExpNeg(1.0f) < 0.367879f - 1e-5f || WfExpNeg(1.0f) > 0.367879f + 1e-5f) Fail("T-1422 fix 2: e^-1");
-    if (WfExpNeg(0.1f) < 0.904837f - 1e-5f || WfExpNeg(0.1f) > 0.904837f + 1e-5f) Fail("T-1422 fix 2: e^-0.1");
-    if (WfExpNeg(100.0f) != 0.0f) Fail("T-1422 fix 2: e^-100");
-    /* flat deadband; a height gap alone moves nothing (the height is the engine's ground check's) */
-    if (StepToward(0, 0, 0, 0.3f, 0.0f, 0.2f, 0.016, 0.0f, t, &s) != kStepDeadband) Fail("T-1422 fix 2b: the flat deadband moved the copy");
-    if (StepToward(0, 0, 0, 0.0f, 95.0f, 0.0f, 0.016, 0.0f, t, &s) != kStepDeadband || s.y != 0.0f) Fail("T-1422 fix 2c: a height gap moved the copy");
-    /* a flat gap with a height gap: x / z move, the height stays the copy's own */
-    if (StepToward(0, 7, 0, 2.0f, 30.0f, 0.0f, 0.016, 0.0f, t, &s) != kStepMoved || s.y != 7.0f) Fail("T-1422 fix 2c: the height was set");
-    {
-        const float want = 2.0f * (1.0f - WfExpNeg(0.016f / 0.15f));
-        if (s.step < want - 1e-4f || s.step > want + 1e-4f || s.sat || s.x < want - 1e-4f || s.x > want + 1e-4f || s.z != 0.0f) Fail("T-1422 fix 2b: the flat blend step");
-    }
-    /* a flat floor-sized gap: capped (smooth, never the jump) */
-    if (StepToward(0, 0, 0, 95.0f, 0.0f, 0.0f, 0.016, 0.0f, t, &s) != kStepMoved || !s.sat || !s.boosted || s.step > 0.8f + 1e-5f) Fail("T-1422 fix 2: a large gap was not capped");
-    /* a dt past maxDt is held (no banked time) */
-    {
-        Step a, b;
-        StepToward(0, 0, 0, 3.0f, 0.0f, 0.0f, 2.0, 0.0f, t, &a); StepToward(0, 0, 0, 3.0f, 0.0f, 0.0f, 0.05, 0.0f, t, &b);
-        if (a.step != b.step) Fail("T-1422 fix 2: a long frame banked its time into one step");
-    }
-    /* a running owner (73 u/s): the rate and the ceiling both carry the owner's speed */
-    if (StepToward(0, 0, 0, 10.0f, 0.0f, 0.0f, 0.016, 73.0f, t, &s) != kStepMoved) Fail("T-1422 fix 2: a running owner's copy did not move");
-    if (!(s.rate > 73.0f + 20.0f - 1e-3f)) Fail("T-1422 fix 2: the owner's speed is not in the rate");
-    if (!(s.step > 0.8f) || s.step > 0.8f + 73.0f * 0.016f + 1e-4f) Fail("T-1422 fix 2: the running owner's ceiling");
-    {
-        Step a, b, c;
-        StepToward(0, 0, 0, 10.0f, 0.0f, 0.0f, 0.016, 0.0f, t, &a);
-        StepToward(0, 0, 0, 10.0f, 0.0f, 0.0f, 0.016, zero / zero, t, &b);
-        StepToward(0, 0, 0, 10.0f, 0.0f, 0.0f, 0.016, -5.0f, t, &c);
-        if (a.step != b.step || a.step != c.step || a.rate != b.rate) Fail("T-1422 fix 2: an unread owner speed changed the step");
-    }
-    if (StepToward(zero / zero, 0, 0, 1, 1, 1, 0.016, 0.0f, t, &s) != kStepBad || StepToward(0, 0, 0, 1.0f / zero, 1, 1, 0.016, 0.0f, t, &s) != kStepBad
-        || StepToward(0, 0, 0, 1, 1, 1, zero / zero, 0.0f, t, &s) != kStepBad || StepToward(0, 0, 0, 2.0e38f, 0, 2.0e38f, 0.016, 0.0f, t, &s) != kStepBad
-        )
-        Fail("T-1422 fix 2: an unread position or frame moved the copy");
-    if (StepToward(0, 0, 0, 3.0f, 0.0f, 0.0f, 0.0, 0.0f, t, &s) != kStepZero || StepToward(0, 0, 0, 3.0f, 0.0f, 0.0f, -1.0, 0.0f, t, &s) != kStepZero)
-        Fail("T-1422 fix 2: a zero or negative frame stepped");
-    /* the flat gap shrinks every frame on the line to the target and closes to the deadband */
-    {
-        float x = 0, z = 0, last = 1e9f;
-        for (int i = 0; i < 400; ++i)
-        {
-            if (StepToward(x, 3.0f, z, 24.0f, 50.0f, -12.0f, 0.016, 0.0f, t, &s) != kStepMoved) break;
-            if (!(s.err < last) || s.y != 3.0f) { Fail("T-1422 fix 2b: the flat gap did not shrink every frame (or the height moved)"); break; }
-            last = s.err; x = s.x; z = s.z;
-            if (x / 24.0f < z / -12.0f - 1e-3f || x / 24.0f > z / -12.0f + 1e-3f || x > 24.0f + 1e-3f) { Fail("T-1422 fix 2b: the step left the line to the target"); break; }
-        }
-        if ((24.0f - x) * (24.0f - x) + (12.0f + z) * (12.0f + z) > 0.25f + 1e-3f) Fail("T-1422 fix 2c: 400 frames did not close a 27-unit flat gap");
-    }
-    /* the floor walk: starts on a fresh report over half a floor; ends within a quarter floor AND the follow's flat reach */
-    if (!FloorWalkStarts(true, 95.0f) || !FloorWalkStarts(true, -60.0f)) Fail("T-1422 fix 2b: a copy a floor apart did not start its walk");
-    if (FloorWalkStarts(false, 95.0f)) Fail("T-1422 fix 2b: a walk started on a stale report");
-    if (FloorWalkStarts(true, 50.0f) || FloorWalkStarts(true, 12.0f) || FloorWalkStarts(true, zero / zero)) Fail("T-1422 fix 2b: a stair-step or unread gap started a walk");
-    if (!FloorWalkEnds(true, 25.0f, 20.0f) || !FloorWalkEnds(true, -3.0f, 0.0f)) Fail("T-1422 fix 2c: a copy on its owner's floor and in reach kept walking");
-    if (FloorWalkEnds(true, 3.0f, 21.0f)) Fail("T-1422 fix 2c: a walk ended out of the follow's reach");
-    if (FloorWalkEnds(true, 40.0f, 0.0f) || FloorWalkEnds(false, 0.0f, 0.0f) || FloorWalkEnds(true, zero / zero, 0.0f) || FloorWalkEnds(true, 0.0f, zero / zero))
-        Fail("T-1422 fix 2c: a walk ended off its owner's floor, on a stale report or an unread gap");
-    if (!(kFloorWalkEnd < kFloorHalf)) Fail("T-1422 fix 2b: the end gap is not below the start gap");
-    /* the goal moves only on another floor band */
-    if (GoalBandChanged(360.0f, 400.0f) || GoalBandChanged(360.0f, 310.0f) || GoalBandChanged(360.0f, zero / zero)) Fail("T-1422 fix 2c: the goal moved within its floor band");
-    if (!GoalBandChanged(360.0f, 455.0f) || !GoalBandChanged(455.0f, 360.0f)) Fail("T-1422 fix 2c: the goal stayed on the old floor");
-    /* fix 2d: the goal also moves when the owner walked off more than twice the reach flat on the same floor */
-    if (GoalMoves(0, 360, 0, 30.0f, 380.0f, 25.0f) || GoalMoves(0, 360, 0, 40.0f, 360.0f, 0.0f)) Fail("T-1422 fix 2d: the goal moved within reach");
-    if (!GoalMoves(0, 360, 0, 40.5f, 360.0f, 0.0f) || !GoalMoves(0, 360, 0, 0.0f, 455.0f, 0.0f)) Fail("T-1422 fix 2d: the goal parked while the owner walked off");
-    if (GoalMoves(0, 360, 0, zero / zero, 360.0f, 0.0f)) Fail("T-1422 fix 2d: an unread owner point moved the goal");
-    /* fix 2f (F1424) / fold 2g: the road - the main thread issues on a frame with no fight pass since its previous one; the worker
-       renews after EVERY pass (a pass cancels the route) */
-    if (WalkRoadMainFrame(true, false, 93, 93) != kWalkRoadMain) Fail("T-1422 fix 2f: a walk with no fight pass was not issued by the main thread");
-    if (WalkRoadMainFrame(true, false, 94, 93) != kWalkRoadNone) Fail("T-1422 fix 2f: the main thread issued while fight passes ran");
-    if (WalkRoadMainFrame(true, false, 5, -1) != kWalkRoadNone) Fail("T-1422 fix 2f: the main thread issued before its first read of the pass count");
-    if (WalkRoadMainFrame(false, false, 3, 3) != kWalkRoadNone || WalkRoadMainFrame(true, true, 3, 3) != kWalkRoadNone) Fail("T-1422 fix 2f: the main thread issued for no walk or a failed one");
-    if (WalkRoadAfterPass(true, false) != kWalkRoadWorker) Fail("T-1422 fold 2g: the worker did not renew after a pass");
-    if (WalkRoadAfterPass(false, false) != kWalkRoadNone || WalkRoadAfterPass(true, true) != kWalkRoadNone) Fail("T-1422 fix 2f: the worker issued for no walk or a failed one");
-    {   /* every pass is followed by a request; the main thread issues exactly on the frames with no pass since its previous step; the
-           route never ends a frame cancelled - passes every frame, on alternate frames, T2602's copy 4194400 (its engine ends its
-           fighting at frame 5, fights again from frame 30), and each with the pass before or after the main thread's step */
-        const char* pats[3] = { "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-                                "P.P.P.P.P.P.P.P.P.P.P.P.P.P.P.P.P.P.P.P.",
-                                "PPPPP.........................PPPPPPPPPPPPPPPPPPPPPPPPPPPPPP" };
-        for (int k = 0; k < 3; ++k)
-            for (int pf = 0; pf < 2; ++pf)
-            {
-                int passNoReq = 0, mainWrong = 0, mainN = 0, workerN = 0;
-                const int cancelled = SimWalkRoads(pats[k], pf != 0, &passNoReq, &mainWrong, &mainN, &workerN);
-                if (passNoReq != 0) Fail("T-1422 fold 2g: a fight pass was not followed by a route request (simulation)");
-                if (mainWrong != 0) Fail("T-1422 fix 2f: the main thread issued on a frame with a pass since its previous step, or missed a frame with none (simulation)");
-                if (cancelled != 0) Fail("T-1422 fold 2g: a frame ended with the walk's route cancelled (simulation)");
-                if (k == 0 && mainN != 0) Fail("T-1422 fix 2f: the main thread issued while passes ran every frame (simulation)");
-                if (k == 2 && mainN < 20) Fail("T-1422 fix 2f: the main thread did not carry the walk while no pass ran (simulation)");
-            }
-    }
-    /* the aim, as FollowFrame takes it */
-    {
-        followplay::Track k; followplay::TrackClear(&k);
-        float x = -1, y = -1, z = -1, v = -1; bool behind = false;
-        if (RouteTarget(k, 1.0, 0.3, false, 0, 0, 0, 7, 8, 9, &behind, &x, &y, &z, &v) != kAimNone || x != -1.0f) Fail("T-1422 fix 2b: an empty route aimed somewhere");
-        if (RouteTarget(k, 1.0, 0.3, true, 4, 5, 6, 7, 8, 9, &behind, &x, &y, &z, &v) != kAimStop || x != 4.0f || y != 5.0f || z != 6.0f || v != 0.0f) Fail("T-1422 fix 2b: the stated stop was not the aim");
-        followplay::Sample a; a.x = 0; a.y = 0; a.z = 0; a.vx = 10.0f; a.vz = 0; a.t = 0.0; a.still = false;
-        followplay::Sample b = a; b.x = 10.0f; b.y = 5.0f; b.t = 1.0;
-        followplay::Push(&k, a); followplay::Push(&k, b);
-        behind = false;
-        if (RouteTarget(k, 1.0, 0.3, false, 0, 0, 0, 10.0f, 5.0f, 0.0f, &behind, &x, &y, &z, &v) != kAimRoute || x != 10.0f || y != 5.0f || behind) Fail("T-1422 fix 2b: the replayed route point (with its height)");
-        if (v < 9.99f || v > 10.01f) Fail("T-1422 fix 2b: the owner's speed at the route point");
-        behind = false;
-        if (RouteTarget(k, 0.0, 0.3, false, 0, 0, 0, 900.0f, 7.0f, 0.0f, &behind, &x, &y, &z, &v) != kAimBehind || x != 900.0f || y != 7.0f || !behind)
-            Fail("T-1422 fix 2b: a route point far behind the newest report was not behind schedule");
-    }
-}
-/* T-1422 fix 3 (F1447, design A): the window step's floor decision (found -> placed on the found piece; nothing found -> held, never the
-   keyless set; no body -> the old call), the [WINFLOOR] sample rule, the sideways pull; and its wiring in the window step */
-void t_t1422_window_floor_step()
-{
-    using namespace windowfollow;
-    if (FloorStepDecide(true, 1, 0x00400012) != kFloorStepPlace) Fail("T-1422 fix 3: a found point and key was not placed");
-    if (FloorStepDecide(true, 1, -1) != kFloorStepHold) Fail("T-1422 fix 3: a found point with no key was not held");
-    if (FloorStepDecide(true, 0, 0x00400012) != kFloorStepHold) Fail("T-1422 fix 3: nothing found was not held");
-    if (FloorStepDecide(true, -1, -1) != kFloorStepHold) Fail("T-1422 fix 3: no walking map (or a faulted query) was not held");
-    if (FloorStepDecide(false, 0, -1) != kFloorStepPlain || FloorStepDecide(false, 1, 5) != kFloorStepPlain) Fail("T-1422 fix 3: no body is the old plain set");
-    if (!WinFloorLineDue(1, true, 0.0f, false) || !WinFloorLineDue(200, true, 0.0f, false) || WinFloorLineDue(201, true, 0.0f, false)) Fail("T-1422 fix 3: the first 200 samples");
-    if (!WinFloorLineDue(500, true, 0.0f, false) || !WinFloorLineDue(1000, true, 0.0f, false) || WinFloorLineDue(999, true, 3.0f, false)) Fail("T-1422 fix 3: every 500th sample");
-    if (!WinFloorLineDue(777, true, 20.5f, false) || !WinFloorLineDue(777, true, -20.5f, false) || WinFloorLineDue(777, true, 20.0f, false)) Fail("T-1422 fix 3: a height gap over 20 is logged");
-    if (!WinFloorLineDue(777, true, 0.0f, true)) Fail("T-1422 fix 3 review S1: a lost piece is logged after the first 200");
-    {
-        volatile float zero = 0.0f;
-        if (!WinFloorLineDue(777, true, zero / zero, false)) Fail("T-1422 fix 3: a height that is not a number is logged");
-        if (!FloorKeyLost(5, 5, zero / zero, 10.0f)) Fail("T-1422 fix 3 review S1: a body height that is not a number is a lost piece");
-    }
-    /* review S1: the piece is lost when the key after differs from the found key, or the body is over 20 from the found point */
-    if (FloorKeyLost(0x00400012, 0x00400012, 109.0f, 100.0f) || FloorKeyLost(7, 7, 80.0f, 100.0f)) Fail("T-1422 fix 3 review S1: a kept piece was called lost");
-    if (!FloorKeyLost(0x00400012, -1, 100.0f, 100.0f) || !FloorKeyLost(0x00400012, 0x00400013, 100.0f, 100.0f)) Fail("T-1422 fix 3 review S1: a changed key is a lost piece");
-    if (!FloorKeyLost(7, 7, 120.5f, 100.0f) || !FloorKeyLost(7, 7, 79.5f, 100.0f)) Fail("T-1422 fix 3 review S1: a body over 20 from the found point is a lost piece");
-    /* review NIT: the query's answer - 0xFFFFFFFF is the busy walking map (held, not found) */
-    if (FloorQueryResult(0xFFFFFFFFu) != kFloorQueryBusy || FloorQueryResult(0u) != kFloorQueryNone || FloorQueryResult(1u) != kFloorQueryFound)
-        Fail("T-1422 fix 3 review NIT: the query's answer (busy / none / found)");
-    if (FloorStepDecide(true, kFloorQueryBusy, 0x00400012) != kFloorStepHold || FloorStepDecide(true, kFloorQueryFault, 0x00400012) != kFloorStepHold)
-        Fail("T-1422 fix 3 review NIT: a busy walking map or a faulted query was not held");
-    {
-        const float p = FlatPull(0.0f, 0.0f, 3.0f, 4.0f);
-        if (p < 4.999f || p > 5.001f || FlatPull(1.0f, 2.0f, 1.0f, 2.0f) != 0.0f) Fail("T-1422 fix 3: the sideways pull");
-    }
-    /* wiring: the window step goes through WindowFloorSet; the keyless setter call is made only on the no-body road inside it */
+    const std::string cb = T313ReadFile("../coop-plugin/combat.cpp");
     const std::string rp = T313ReadFile("../coop-plugin/replicate.cpp");
-    if (rp.empty()) { Fail("T-1422 fix 3: could not read replicate.cpp"); return; }
-    if (rp.find("const int wflAct = WindowFloorSet(setter, mv, np, &wfl, &setOk);") == std::string::npos) Fail("T-1422 fix 3: the window step does not call WindowFloorSet");
-    if (rp.find("if (wflAct == windowfollow::kFloorStepHold) {}") == std::string::npos) Fail("T-1422 fix 3: a held step is counted as moved");
+    if (cb.empty() || rp.empty()) { Fail("T-1470: could not read combat.cpp / replicate.cpp"); return; }
+    const std::string upd = T1470Body(cb, "void detour_ccUpdate(CombatClassAI* self, float frameTIME)");
+    if (upd.empty() || upd.find("    orig_ccUpdate(self, frameTIME);") == std::string::npos) Fail("T-1470: the fight routine is not run as v0.4.2 ran it");
+    if (upd.find("Stop") != std::string::npos || upd.find("Nw") != std::string::npos || upd.find("Route") != std::string::npos)
+        Fail("T-1470: something stops or routes the copy around the fight routine (v0.4.2: the AI walks the copy)");
+    if (cb.find("const float kNcSnapOnlyAbove = 2.0f;") == std::string::npos) Fail("T-1470: the close's placement distance is not v0.4.2's 2");
+    const std::string fin = T1470Body(cb, "void FinishNativeClose(unsigned int uid, CombatWatch* w, const char* reason, bool charResolved)");
+    if (fin.find("const bool snapNeeded = !(driftNow >= 0.0f && driftNow < kNcSnapOnlyAbove);") == std::string::npos
+        || fin.find("snapNeeded ? SnapPuppetToAuthority(uid, &before, &sameCall) : 8") == std::string::npos)
+        Fail("T-1470: the close does not place a copy 2 or more off (v0.4.2)");
+    if (fin.find("Followed") != std::string::npos) Fail("T-1470: the close skips the placement for some copies (0.4.3's fix 2d)");
+    const char* const gone[6] = { "windowfollow", "NativeWindowStopMark", "NativeWindowWalk", "WindowFloorSet", "GroundRayReask", "WindowFollowTick" };
+    for (int i = 0; i < 6; ++i)
+        if (cb.find(gone[i]) != std::string::npos || rp.find(gone[i]) != std::string::npos) Fail(std::string("T-1470: 0.4.3's window road is still in the source: ") + gone[i]);
+    if (rp.find("FloorPendingDrop(uid, p, \"a fight window\");   // T-986 g3: the fight AI walks the copy itself") == std::string::npos
+        || rp.find("const Ogre::Vector3 np(mp.x + (ex / err) * step, mp.y, mp.z + (ez / err) * step);") == std::string::npos)
+        Fail("T-1470: the window step is not v0.4.2's sideways nudge toward the owner's last report");
+}
+/* T-1422: a fake 0x3A1F70 for nudgefloor::PlaceNudge / RefloorTeleport on a fake body - answers in order (found: that call's height
+   and key written), records each call's reach, point and key */
+struct T1422FakeMap { unsigned int ans[4]; float y[4]; int key[4]; int calls; float reach[4]; float at[4][3]; int keyIn[4]; };
+static unsigned int T1422FakePlace(void* ctx, float* pt, int* key, float reach)
+{
+    T1422FakeMap* m = (T1422FakeMap*)ctx;
+    const int i = m->calls < 4 ? m->calls : 3;
+    m->reach[i] = reach; m->at[i][0] = pt[0]; m->at[i][1] = pt[1]; m->at[i][2] = pt[2]; m->keyIn[i] = *key;
+    ++m->calls;
+    if (m->ans[i] == 1u) { pt[1] = m->y[i]; *key = m->key[i]; }
+    return m->ans[i];
+}
+static void T1422MapSet(T1422FakeMap* m, unsigned int a0, float y0, int k0, unsigned int a1, float y1, int k1, unsigned int a2, float y2, int k2)
+{
+    m->ans[0] = a0; m->y[0] = y0; m->key[0] = k0; m->ans[1] = a1; m->y[1] = y1; m->key[1] = k1;
+    m->ans[2] = a2; m->y[2] = y2; m->key[2] = k2; m->ans[3] = 0u; m->y[3] = 0.0f; m->key[3] = -1; m->calls = 0;
+    for (int i = 0; i < 4; ++i) { m->reach[i] = -1.0f; m->keyIn[i] = 0x7777; m->at[i][0] = m->at[i][1] = m->at[i][2] = -1.0f; }
+}
+struct T1422FakeBody { int key; float pt[4]; float last[4]; unsigned char flag; int req; };
+static nudgefloor::NfBody T1422BodyOf(T1422FakeBody* f)
+{
+    nudgefloor::NfBody v; v.key = &f->key; v.pt = f->pt; v.last = f->last; v.flag = &f->flag; v.req = &f->req; return v;
+}
+/* the body as the setter's long search left it: its point at the setter's x / z and the long answer's height, a new key, last copied
+   (any mode but 2) or the request 6 (mode 2); s0 = the body before the nudge */
+static void T1422SetterLeft(T1422FakeBody* f, const nudgefloor::NfSnap& s0, int mode)
+{
+    f->key = 0x04C00099; f->pt[0] = -6147.8f; f->pt[1] = 38.596f; f->pt[2] = 1634.9f; f->pt[3] = 0.0f; f->flag = 0;
+    for (int i = 0; i < 4; ++i) f->last[i] = s0.last[i];
+    f->req = s0.req;
+    if (mode == 2) f->req = 6; else for (int i = 0; i < 4; ++i) f->last[i] = f->pt[i];
+}
+static bool T1422SameAs(const T1422FakeBody& f, const nudgefloor::NfSnap& s)
+{
+    bool same = f.key == s.key && f.req == s.req;
+    for (int i = 0; i < 4; ++i) same = same && f.pt[i] == s.pt[i] && f.last[i] == s.last[i];
+    return same;
+}
+/* the placement on a fake body (body units: the tower's upper floor ~43.3 = 433 game units, the lower ~39.4) */
+static void t_t1422_place_fake_body()
+{
+    using namespace nudgefloor;
+    NfSnap s0; s0.key = 0x04C00043; s0.pt[0] = -6147.79f; s0.pt[1] = 43.30f; s0.pt[2] = 1634.88f; s0.pt[3] = 0.0f;
+    s0.last[0] = -6147.7f; s0.last[1] = 43.29f; s0.last[2] = 1634.8f; s0.last[3] = 0.0f; s0.mode = 2; s0.req = 1;
+    NfSnap sLost = s0; sLost.key = -1;
+    const float x = -6147.8f, z = 1634.9f, ownerLow = ToBody(393.8f);
+    for (int mode = 0; mode <= 2; mode += 2)
     {
-        const size_t a = rp.find("static int WindowFloorSet(");
-        const size_t e = a == std::string::npos ? a : rp.find("\n}", a);
-        const size_t c1 = rp.find("SafeCallSetPos(setter, mv, &np)");
-        if (a == std::string::npos || e == std::string::npos || c1 == std::string::npos || c1 < a || c1 > e
-            || rp.find("SafeCallSetPos(setter, mv, &np)", c1 + 1) != std::string::npos)
-            Fail("T-1422 fix 3: the keyless setter call is made outside WindowFloorSet's no-body road");
-        const std::string body = rp.substr(a, e - a);
-        if (body.find("if (o->act == windowfollow::kFloorStepPlain) *setOk = SafeCallSetPos(setter, mv, &np);") == std::string::npos
-            || body.find("else if (!WinFloorBodySetPod(mv, o->keyFound))") == std::string::npos)
-            Fail("T-1422 fix 3: the place road (setter at the found point, then the body with its key)");
+        T1422FakeBody f; T1422FakeMap m; int p1 = -9, p2 = -9, pb = -9; float fy = -9.0f;
+        /* ownerFloor: found at the owner's height - one call, +-20, at the setter's x / z and the owner's height, the body's old key */
+        T1422SetterLeft(&f, s0, mode); T1422MapSet(&m, 1u, 39.40f, 0x04C000AB, 0u, 0.0f, -1, 0u, 0.0f, -1);
+        int r = PlaceNudge(T1422BodyOf(&f), s0, mode, x, z, ownerLow, 4.0f, T1422FakePlace, &m, &p1, &p2, &pb, &fy);
+        if (r != kNrOwnerFloor || p1 != kPlaceFound || p2 != kPlaceNone || pb != -1 || m.calls != 1 || m.reach[0] != kOwnerReach || m.keyIn[0] != s0.key
+            || m.at[0][0] != x || m.at[0][1] != ownerLow || m.at[0][2] != z || f.pt[0] != x || f.pt[1] != 39.40f || f.pt[2] != z || f.pt[3] != 0.0f
+            || f.key != 0x04C000AB || f.flag != 1)
+            Fail("T-1422: a floor at the owner's height is not taken first (+-20, the setter's x / z, the old key)");
+        if (mode == 2 && (f.req != s0.req || f.last[0] != s0.last[0] || f.last[1] != s0.last[1]))
+            Fail("T-1422: mode 2 - the setter's request for the long search is not undone, or the last point is touched");
+        if (mode != 2 && (f.req != s0.req || f.last[0] != x || f.last[1] != 39.40f || f.last[2] != z))
+            Fail("T-1422: mode 0 - the point is not copied to the last point (0x145E10's else branch)");
+        /* fallback: nothing at the owner's height, the body's own floor within 20 - placed at the setter's x / z with the walk's reach */
+        T1422SetterLeft(&f, s0, mode); T1422MapSet(&m, 0u, 0.0f, -1, 1u, 43.31f, s0.key, 0u, 0.0f, -1);
+        r = PlaceNudge(T1422BodyOf(&f), s0, mode, x, z, ownerLow, 4.0f, T1422FakePlace, &m, &p1, &p2, &pb, &fy);
+        if (r != kNrFallback || p1 != kPlaceMiss || p2 != kPlaceFound || pb != -1 || m.calls != 2 || m.reach[1] != 4.0f || m.at[1][0] != x
+            || m.at[1][1] != s0.pt[1] || m.at[1][2] != z || m.keyIn[1] != s0.key || f.pt[0] != x || f.pt[1] != 43.31f || f.pt[2] != z || f.key != s0.key || f.flag != 1
+            || fy != 43.31f)
+            Fail("T-1422: a miss at the owner's height does not fall back to the body's own height with the walk's reach");
+        if (f.req != s0.req || (mode == 2 && (f.last[0] != s0.last[0] || f.last[1] != s0.last[1])) || (mode != 2 && f.last[1] != 43.31f))
+            Fail("T-1422: the fallback's bookkeeping (mode 2: the setter's request 6 undone, last untouched; else last = the point)");
+        /* rule 2: the fallback found a floor 38 below the body (over 20) - a miss: the body stays, put back short at its own spot */
+        T1422SetterLeft(&f, s0, mode); T1422MapSet(&m, 0u, 0.0f, -1, 1u, 39.50f, 0x04C000AB, 1u, s0.pt[1], s0.key);
+        r = PlaceNudge(T1422BodyOf(&f), s0, mode, x, z, ownerLow, 4.0f, T1422FakePlace, &m, &p1, &p2, &pb, &fy);
+        if (r != kNrMissStay || p2 != kPlaceFound || pb != kPbShort || m.calls != 3 || m.at[2][0] != s0.pt[0] || m.at[2][2] != s0.pt[2] || m.keyIn[2] != s0.key
+            || f.pt[0] != s0.pt[0] || f.pt[1] != s0.pt[1] || f.pt[2] != s0.pt[2] || f.key != s0.key || f.req != s0.req || fy != 39.50f)
+            Fail("T-1422 rule 2: a fallback floor over 20 from the body's height is not a miss (the body must stay; fallbackY names it)");
+        /* missStay: nothing anywhere, a key - written back raw; the map locked - raw */
+        T1422SetterLeft(&f, s0, mode); T1422MapSet(&m, 0u, 0.0f, -1, 0u, 0.0f, -1, 0u, 0.0f, -1);
+        r = PlaceNudge(T1422BodyOf(&f), s0, mode, x, z, ownerLow, 4.0f, T1422FakePlace, &m, &p1, &p2, &pb, &fy);
+        if (r != kNrMissStay || pb != kPbRaw || m.calls != 3 || !T1422SameAs(f, s0) || fy != 0.0f)
+            Fail("T-1422: not found anywhere with a key - the body is not written back raw");
+        T1422SetterLeft(&f, s0, mode); T1422MapSet(&m, 0xFFFFFFFFu, 0.0f, -1, 0xFFFFFFFFu, 0.0f, -1, 0xFFFFFFFFu, 0.0f, -1);
+        r = PlaceNudge(T1422BodyOf(&f), s0, mode, x, z, ownerLow, 4.0f, T1422FakePlace, &m, &p1, &p2, &pb, &fy);
+        if (r != kNrMissStay || p1 != kPlaceLocked || p2 != kPlaceLocked || pb != kPbRaw || !T1422SameAs(f, s0))
+            Fail("T-1422: the map locked - the body is not written back raw");
+        /* rule 1: a body already on no piece (key -1) keeps the setter's x / z at its own height, key -1 - on a miss and on a far find */
+        for (int far = 0; far <= 1; ++far)
+        {
+            T1422SetterLeft(&f, sLost, mode); f.flag = 0;
+            T1422MapSet(&m, 0u, 0.0f, -1, far ? 1u : 0u, 39.50f, 0x04C000AB, 1u, 43.3f, 0x04C00043);
+            r = PlaceNudge(T1422BodyOf(&f), sLost, mode, x, z, ownerLow, 4.0f, T1422FakePlace, &m, &p1, &p2, &pb, &fy);
+            if (r != kNrKeyLostKeepXZ || pb != -1 || m.calls != 2 || fy != (far ? 39.50f : 0.0f) || f.pt[0] != x || f.pt[1] != sLost.pt[1] || f.pt[2] != z || f.pt[3] != 0.0f
+                || f.key != -1 || f.flag != 1 || (mode == 2 && f.req != sLost.req) || (mode != 2 && (f.last[0] != x || f.last[1] != sLost.pt[1])))
+                Fail("T-1422 rule 1: a body on no piece does not keep the setter's x / z at its own height with key -1");
+        }
+        /* the owner's height not a number: no owner-height call, the fallback first */
+        volatile float zero = 0.0f; const float nan = zero / zero;
+        T1422SetterLeft(&f, s0, mode); T1422MapSet(&m, 1u, 43.30f, s0.key, 0u, 0.0f, -1, 0u, 0.0f, -1);
+        r = PlaceNudge(T1422BodyOf(&f), s0, mode, x, z, nan, 4.0f, T1422FakePlace, &m, &p1, &p2, &pb, &fy);
+        if (r != kNrFallback || p1 != kPlaceNone || m.calls != 1 || m.reach[0] != 4.0f)
+            Fail("T-1422: an owner height that is not a number is still searched");
+        /* the teleport's re-placement: found at the owner's height +-20 with the teleport's key (mode 2: the request from before) */
+        NfSnap s1; s1.key = 0x04C00099; s1.pt[0] = x; s1.pt[1] = 38.596f; s1.pt[2] = z; s1.pt[3] = 0.0f; s1.mode = mode; s1.req = mode == 2 ? 6 : 1;
+        for (int i = 0; i < 4; ++i) s1.last[i] = mode == 2 ? s0.last[i] : s1.pt[i];
+        int pl = -9;
+        f.key = s1.key; f.req = s1.req; f.flag = 0; for (int i = 0; i < 4; ++i) { f.pt[i] = s1.pt[i]; f.last[i] = s1.last[i]; }
+        T1422MapSet(&m, 1u, 43.31f, 0x04C00043, 0u, 0.0f, -1, 0u, 0.0f, -1);
+        r = RefloorTeleport(T1422BodyOf(&f), s1, 1, ToBody(433.0f), T1422FakePlace, &m, &pl);
+        if (r != kTrRefloor || pl != kPlaceFound || m.calls != 1 || m.reach[0] != kOwnerReach || m.keyIn[0] != s1.key || m.at[0][0] != x
+            || m.at[0][1] != ToBody(433.0f) || m.at[0][2] != z || f.pt[1] != 43.31f || f.pt[0] != x || f.pt[2] != z || f.key != 0x04C00043 || f.flag != 1
+            || f.req != 1 || (mode != 2 && f.last[1] != 43.31f))
+            Fail("T-1422: a teleport is not re-placed on the floor at its owner's height (+-20, the teleport's x / z and key)");
+        /* not found: the engine's result stays, every field as the teleport left it */
+        f.key = s1.key; f.req = s1.req; for (int i = 0; i < 4; ++i) { f.pt[i] = s1.pt[i]; f.last[i] = s1.last[i]; }
+        T1422MapSet(&m, 0u, 0.0f, -1, 0u, 0.0f, -1, 0u, 0.0f, -1);
+        r = RefloorTeleport(T1422BodyOf(&f), s1, 1, ToBody(433.0f), T1422FakePlace, &m, &pl);
+        if (r != kTrMissKept || pl != kPlaceMiss || !T1422SameAs(f, s1))
+            Fail("T-1422: a teleport whose owner's height has no floor does not keep the engine's result");
+        /* the map locked: the engine's result stays */
+        T1422MapSet(&m, 0xFFFFFFFFu, 0.0f, -1, 0u, 0.0f, -1, 0u, 0.0f, -1);
+        r = RefloorTeleport(T1422BodyOf(&f), s1, 1, ToBody(433.0f), T1422FakePlace, &m, &pl);
+        if (r != kTrMissKept || pl != kPlaceLocked || m.calls != 1 || !T1422SameAs(f, s1))
+            Fail("T-1422: a teleport whose re-placement finds the map locked does not keep the engine's result");
+        T1422MapSet(&m, 1u, 43.31f, 0x04C00043, 0u, 0.0f, -1, 0u, 0.0f, -1);
+        r = RefloorTeleport(T1422BodyOf(&f), s1, 1, nan, T1422FakePlace, &m, &pl);
+        if (r != kTrMissKept || pl != kPlaceNone || m.calls != 0 || !T1422SameAs(f, s1))
+            Fail("T-1422: a teleport with no owner height is re-placed");
     }
-    if (rp.find("o->query = WinFloorQueryPod(q, o->size, f, &key);") == std::string::npos || rp.find("o->size = WinFloorCharSizePod(mv);") == std::string::npos)
-        Fail("T-1422 fix 3 review S2: the query is not given the character's size");
-    if (rp.find("WindowFloorNote(uid, np, wty, wfl);") == std::string::npos) Fail("T-1422 fix 3 review S3/S5: the step line does not carry the owner's height");
-    const char* const rows[3] = { "\"NavMeshManagerPtr\", &kWinFloorNavRva", "\"NavClosestFaceQuery\", &kWinFloorQueryRva", "\"HavokCharacterSetPosition\", &kWinFloorBodySetRva" };
-    for (int i = 0; i < 3; ++i) if (rp.find(rows[i]) == std::string::npos) Fail(std::string("T-1422 fix 3: the address row is not registered: ") + rows[i]);
+}
+/* T-1422: the fight window's nudge puts the copy on its owner's floor - every
+   placement of the nudged copy's body is the engine's own short re-placement at the setter's x / z: the owner's height +-20 first,
+   else the body's own height +-40 (over 20 off = a miss), else key -1 keeps x / z, else the body stays; the copy's teleports re-placed
+   at the owner's height +-20. The pure decisions, then the wiring */
+void t_t1422_nudge_floor()
+{
+    using namespace nudgefloor;
+    volatile float zero = 0.0f; const float nan = zero / zero;
+    t_t1422_place_fake_body();
+    /* the road */
+    if (Road(true, true, true, true) != kRoadPlace) Fail("T-1422: a body with the rows, the reach and the map is not placed");
+    if (Road(false, true, true, true) != kPlainNoBody || Road(true, false, true, true) != kPlainNoRow || Road(true, true, false, true) != kPlainNoRow
+        || Road(true, true, true, false) != kPlainNoMap || Road(false, false, false, false) != kPlainNoBody)
+        Fail("T-1422: no body / no rows / no usable reach / no map is not main's plain call with its reason");
+    for (int r = 0; r < kRoadCount; ++r) if (RoadWord(r)[0] == '?') Fail("T-1422: a road has no word");
+    for (int r = 0; r < kNrCount; ++r) if (NrWord(r)[0] == '?') Fail("T-1422: a placement road has no word");
+    for (int r = 0; r < kTrCount; ++r) if (TrWord(r)[0] == '?') Fail("T-1422: a teleport road has no word");
+    if (!NrStayed(kNrMissStay) || !NrStayed(kNrFault) || NrStayed(kNrOwnerFloor) || NrStayed(kNrFallback) || NrStayed(kNrKeyLostKeepXZ))
+        Fail("T-1422: which roads count as stayed");
+    /* the reach: the walk's 4.0 is used; the setter's 500, 0, negative, not a number, or past +-50 game units is not */
+    if (!ReachUsable(4.0f) || ReachUsable(500.0f) || ReachUsable(0.0f) || ReachUsable(-4.0f) || ReachUsable(nan) || ReachUsable(5.01f))
+        Fail("T-1422: which reach is usable (the walk's 4.0 only up to 5.0 body units)");
+    if (kReachMax / (float)kBodyScale >= 55.0f) Fail("T-1422: the reach limit reaches T3026's floors ~55 apart");
+    /* the owner-height reach and rule 2's limit are 20 game units */
+    if (NfAbs(kOwnerReach / (float)kBodyScale - 20.0f) > 0.01f || NfAbs(kFallbackMaxDy / (float)kBodyScale - 20.0f) > 0.01f)
+        Fail("T-1422: the owner-height reach / the fallback limit is not 20 game units");
+    /* rule 2 alone: 1.99 body units off stays the same floor, 2.1 is another; not a number is another */
+    if (FallbackLeftFloor(41.31f, 43.30f) || FallbackLeftFloor(45.29f, 43.30f) || !FallbackLeftFloor(41.2f, 43.3f) || !FallbackLeftFloor(45.4f, 43.3f)
+        || !FallbackLeftFloor(nan, 43.3f) || !FallbackLeftFloor(43.3f, nan))
+        Fail("T-1422 rule 2: which fallback heights count as another floor");
+    if (!KeyLost(-1) || KeyLost(0x04C00043) || KeyLost(0)) Fail("T-1422 rule 1: which key is 'on no piece'");
+    /* the window counter: the owner over 20 off and nothing found at its height */
+    if (!OwnerOffNoFloor(433.0f, 393.0f, kPlaceMiss) || !OwnerOffNoFloor(393.0f, 433.0f, kPlaceNone) || OwnerOffNoFloor(433.0f, 393.0f, kPlaceFound)
+        || OwnerOffNoFloor(400.0f, 393.0f, kPlaceMiss) || OwnerOffNoFloor(nan, 393.0f, kPlaceMiss))
+        Fail("T-1422: the owner-off-and-no-floor window counter");
+    /* 0x3A1F70's answer: 1 found, 0 nothing within reach, 0xFFFFFFFF the map locked; anything else is not found */
+    if (PlaceResult(1u) != kPlaceFound || PlaceResult(0u) != kPlaceMiss || PlaceResult(0xFFFFFFFFu) != kPlaceLocked || PlaceResult(2u) != kPlaceMiss)
+        Fail("T-1422: the re-placement's answer (found / not found / locked)");
+    /* mode 2 (a computed path): no copy to +0x40 and no request for the long search; any other mode: 0x145E10's copy */
+    if (Book(kModePath) != kBookPath || Book(0) != kBookCommit || Book(1) != kBookCommit || Book(3) != kBookCommit || Book(6) != kBookCommit || kModePath != 2)
+        Fail("T-1422: the mode bookkeeping (mode 2 path, else commit)");
+    if (PutBackKind(kPlaceFound) != kPbShort || PutBackKind(kPlaceMiss) != kPbRaw || PutBackKind(kPlaceLocked) != kPbRaw || PutBackKind(kPlaceFault) != kPbRaw)
+        Fail("T-1422: how the put-back holds (short placement found, else raw)");
+    if (kNrCount != 5 || kTrCount != 5 || kPbCount != 2 || kRoadCount != 4) Fail("T-1422: the count groups' sizes");
+    /* the body's scale is 0x145E10's: (float)((double)v * 0.1) */
+    if (ToBody(43982.7f) != (float)((double)43982.7f * 0.1) || ToBody(-1234.5f) != (float)((double)-1234.5f * 0.1))
+        Fail("T-1422: the body scale is not 0x145E10's double 0.1");
+    /* the floor-move check against the body's own height before (T3012's flip 442 -> 384), the line rule */
+    if (!BigBodyMove(441.8f, 384.6f, 441.8f) || BigBodyMove(441.8f, 442.7f, 441.8f) || !BigBodyMove(nan, 10.0f, 10.0f) || !BigBodyMove(392.6f, 448.0f, 392.6f))
+        Fail("T-1422: a floor move against the body's own height");
+    if (!LineDue(1, false, false) || !LineDue(200, false, false) || LineDue(201, false, false) || !LineDue(500, false, false)
+        || !LineDue(777, true, false) || !LineDue(777, false, true))
+        Fail("T-1422: the line sample (first 200, every 500th, every stayed step or floor move)");
+    /* wiring */
+    const std::string rp = T313ReadFile("../coop-plugin/replicate.cpp");
+    if (rp.empty()) { Fail("T-1422 nudge floor: could not read replicate.cpp"); return; }
+    if (rp.find("const Ogre::Vector3 np(mp.x + (ex / err) * step, mp.y, mp.z + (ez / err) * step);") == std::string::npos
+        || rp.find("NudgeFloorStep nfl; const bool setOk = NudgeFloorSet(setter, mv, np, p.ty, &nfl);") == std::string::npos)
+        Fail("T-1422 nudge floor: the nudge does not go through NudgeFloorSet with main's np");
+    const std::string body = T1470Body(rp, "static bool NudgeFloorSet(");
+    if (body.empty()) { Fail("T-1422 nudge floor: NudgeFloorSet not found"); return; }
+    {
+        const std::string call = "const bool setOk = SafeCallSetPos(setter, mv, &np);   // main's call, unchanged, on every road";
+        const size_t c1 = body.find(call);
+        const size_t c2 = body.find("SafeCallSetPos(", c1 == std::string::npos ? 0 : c1 + call.size());
+        if (c1 == std::string::npos || c2 != std::string::npos || body.find("SafeCallSetPos(") != c1 + 19)
+            Fail("T-1422 nudge floor: main's set-position call is not made once, unconditionally, with np");
+        const size_t s0 = body.find("o->haveBody = NudgeFloorSnapPod(mv, &s0);");
+        const size_t s1 = body.find("if (!NudgeFloorSnapPod(mv, &s1)) o->nr = nudgefloor::kNrFault;");
+        const size_t md = body.find("o->reqSetter = s1.req; o->mode = s1.mode;");
+        const size_t p1 = body.find("o->nr = NudgeFloorPlacePod(mv, nav, s0, s1.mode, s1.pt[0], s1.pt[2], nudgefloor::ToBody(ownerY), reach, &o->place1, &o->place2, &o->pb, &o->fallbackY);");
+        const size_t f3 = body.find("if (o->nr == nudgefloor::kNrFault && nudgefloor::Book(s1.mode) == nudgefloor::kBookPath) NudgeFloorReqPod(mv, s0.req);");
+        if (s0 == std::string::npos || s1 == std::string::npos || md == std::string::npos || p1 == std::string::npos || f3 == std::string::npos
+            || c1 == std::string::npos || !(s0 < c1 && c1 < s1 && s1 < md && md < p1 && p1 < f3))
+            Fail("T-1422 attempt 7: the body is not read before the set-position and placed short right after it (mode after the setter, fault undo), in order");
+        size_t n = 0;
+        for (size_t at = body.find("NudgeFloorPlacePod("); at != std::string::npos; at = body.find("NudgeFloorPlacePod(", at + 1)) ++n;
+        if (n != 1 || body.find("np.y") != std::string::npos || body.find("if (setOk && o->road == nudgefloor::kRoadPlace)") == std::string::npos)
+            Fail("T-1422 attempt 7: the short placement is not made once per nudge, on the place road after main's call");
+    }
+    const std::string place = T1470Body(rp, "static int NudgeFloorPlacePod(");
+    const std::string call = T1470Body(rp, "static unsigned int NudgeFloorCallPod(");
+    if (place.find("return nudgefloor::PlaceNudge(v, s0, mode1, x, z, ownerY, reach, NudgeFloorCallPod, nav, place1, place2, pb, fallbackY);") == std::string::npos
+        || place.find("v.key = (int*)(b + kNfKeyOff); v.pt = (float*)(b + kNfPtOff); v.last = (float*)(b + kNfLastOff);") == std::string::npos
+        || place.find("v.flag = (unsigned char*)(b + kNfFlagOff); v.req = (int*)(b + kNfReqOff);") == std::string::npos
+        || call.find("(g_rcImageBase + (uintptr_t)kNudgeFloorPlaceRva))(nav, p, key, reach);") == std::string::npos
+        || place.find("500") != std::string::npos || call.find("500") != std::string::npos)
+        Fail("T-1422 attempt 7: the game's placement is not nudgefloor::PlaceNudge on the body's live fields through the NavPlaceOnFloor row");
+    const char* const rows[3] = { "\"NavMeshManagerPtr\", &kNudgeFloorNavRva", "\"NavPlaceOnFloor\", &kNudgeFloorPlaceRva", "\"NavWalkPlaceReach\", &kNudgeFloorReachRva" };
+    for (int i = 0; i < 3; ++i) if (rp.find(rows[i]) == std::string::npos) Fail(std::string("T-1422 attempt 7: the address row is not registered: ") + rows[i]);
+    if (rp.find("kNudgeFloorBodySetRva") != std::string::npos || rp.find("kNudgeFloorQueryRva") != std::string::npos)
+        Fail("T-1422 attempt 7: the long-search body placement or the full-map query is still called");
+    const std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt"), t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
+    const std::string sig = T313ReadFile("../coop-plugin/addresses/signatures.sig");
+    if (t65.find("NavPlaceOnFloor                                code 003A1F70 003A1F70 ") == std::string::npos
+        || t68.find("NavPlaceOnFloor                                code 003A20B0 003A20B0 ") == std::string::npos
+        || t65.find("NavWalkPlaceReach                              ro   0168AF24 0168AF24 0000804000007A4400000000") == std::string::npos
+        || t68.find("NavWalkPlaceReach                              ro   0168BF24 0168BF24 0000804000007A4400000000") == std::string::npos
+        || sig.find("\nNavPlaceOnFloor code ") == std::string::npos || sig.find("\nNavWalkPlaceReach ro ") == std::string::npos)
+        Fail("T-1422 attempt 7: the re-placement / reach rows are not in both tables and the signatures");
+    if (t65.find("\nHavokCharacterSetPosition ") != std::string::npos || t68.find("\nNavClosestFaceQuery ") != std::string::npos
+        || sig.find("\nHavokCharacterSetPosition ") != std::string::npos || sig.find("\nNavClosestFaceQuery ") != std::string::npos)
+        Fail("T-1422 attempt 7: the rows nothing reads any more are still in the tables");
+    if (rp.find("[FLOOR] REPORT nudgeFloor[floorSteps,floorPlaced,floorBigDy,floorBodyFaults,floorLines,floorPlainLines]=") == std::string::npos
+        || rp.find(" plain[noBody,noRow,noMap]=") == std::string::npos || rp.find(" plainLift=") == std::string::npos
+        || rp.find(" placeRoad[ownerFloor,fallback,keyLostKeepXZ,missStay,bodyFault]=") == std::string::npos || rp.find(" key[same,new]=") == std::string::npos
+        || rp.find(" ownerOffNoFloor=") == std::string::npos || rp.find(" teleport[refloor,missKept,fault,noRow,noBody]=") == std::string::npos || rp.find(" teleport mode2[n,req6Undone]=") == std::string::npos
+        || rp.find(" fallbackY=%.2f ") == std::string::npos
+        || rp.find(" putback[short,raw]=") == std::string::npos || rp.find(" mode2[placed,req6Undone]=") == std::string::npos)
+        Fail("T-1422: the report counts are missing");
+    /* the copy's four teleportTo(pos, -1) placements go through TeleportOnOwnerFloor, which teleports first and re-places after */
+    {
+        size_t n = 0;
+        for (size_t at = rp.find("TeleportOnOwnerFloor(uid, "); at != std::string::npos; at = rp.find("TeleportOnOwnerFloor(uid, ", at + 1)) ++n;
+        size_t t = 0;
+        for (size_t at = rp.find("mv->teleportTo("); at != std::string::npos; at = rp.find("mv->teleportTo(", at + 1)) ++t;
+        if (n != 4 || t != 3 || rp.find("mv->teleportTo(Ogre::Vector3(plX, ownerY, plZ), -1);") != std::string::npos
+            || rp.find("mv->teleportTo(Ogre::Vector3(plX, p.ty, plZ), -1);") != std::string::npos || rp.find("mv->teleportTo(Ogre::Vector3(p.tx, p.ty, p.tz), -1);") != std::string::npos)
+            Fail("T-1422: the copy's four teleports are not all re-placed on the owner's floor");
+        const std::string tb = T1470Body(rp, "static void TeleportOnOwnerFloor(");
+        const size_t tp = tb.find("mv->teleportTo(pos, -1);");
+        const size_t rf = tb.find("tr = NudgeFloorRefloorPod(mv, nav, s1, have0 ? s0.req : s1.req, nudgefloor::ToBody(pos.y), &place);");
+        if (tp == std::string::npos || rf == std::string::npos || !(tp < rf))
+            Fail("T-1422: the teleport is not made first and re-placed at the owner's height after");
+        const std::string rb = T1470Body(rp, "static int NudgeFloorRefloorPod(");
+        if (rb.find("return nudgefloor::RefloorTeleport(v, s1, req0, ownerY, NudgeFloorCallPod, nav, place);") == std::string::npos)
+            Fail("T-1422: the teleport's re-placement is not nudgefloor::RefloorTeleport on the body's live fields");
+    }
 }
 /* T-937: a kept outpost's town - its pieces' own links first (the majority, a tie to the row's handle, then the nearer), then the
    town held, then a town within the radius; found only when none holds and the links were all read; which pieces may be relinked;
@@ -8079,7 +8208,7 @@ void t_t1047f3_town_event()
     if (s.find("if (t != 0 && posOk != 0) TlOwnTownAt(p, ") == std::string::npos) Fail("t1047f3: a founding the hook saw is no town event");
     if (s.find("if (baseshow::CopyTownChanged(step, (moveKind == townmove::kMove || moveKind == townmove::kRefound) ? 1 : 0) != 0)") == std::string::npos)
         Fail("t1047f3: a copy town made or moved is no town event");
-    if (s.find("if (baseshow::OwnCheckTownAt(&g_tlOwn, sx, sy) == 0) return;") == std::string::npos) Fail("t1047f3: the town event does not owe the areas around it");
+    if (s.find("if (baseshow::OwnCheckTownAt(&g_tlOwn, sx, sy) == 0) return 0;") == std::string::npos || s.find("TlOwnTownArea(sx, sy, why, 1);") == std::string::npos) Fail("t1047f3: the town event does not owe the areas around it");
 }
 /* fix 2: the team-held gate of each engine step (move, mark, the record write's link read) and the town-link tick: the own-piece
    check runs at every ready tick, so an event is checked at once - never only at the 5 s look, never while not ready */
@@ -9906,9 +10035,9 @@ void t_t23_wiring()
         if (bc.find(need[i]) == std::string::npos) Fail(std::string("t23 wiring: build.cpp lacks ") + need[i]);
     if (pr.find("(h.flags & kPrFlagHanded) != 0 ? 1 : 0, coopbrec::BrSlotIn(loadedSlots, senderSlot));") == std::string::npos)
         Fail("t23 wiring: the world server's judge does not pass the hand-over flag and the sender's loaded bit");
-    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos || hr.find("const unsigned int kGameProtocol = 242;") == std::string::npos)
-        Fail("t23 wiring: the game-to-game protocol is not 242");
-    if (sm.find("const unsigned int kProtocol = 173;") == std::string::npos || piecerec::kProtocol != 173u) Fail("t23 wiring: the world-server protocol is not 173");
+    if (se.find("const unsigned int kProtocolVersion = 248;") == std::string::npos || hr.find("const unsigned int kGameProtocol = 248;") == std::string::npos)
+        Fail("t23 wiring: the game-to-game protocol is not 248");
+    if (sm.find("const unsigned int kProtocol = 177;") == std::string::npos || piecerec::kProtocol != 177u) Fail("t23 wiring: the world-server protocol is not 177");
 }
 /* T-23 review fold: a refused hand-over seed is a seed again; the seed carries the owner's outpost the piece got; the writer's owed
    work is flushed at its area's unload; the writer's work moves the help baseline (wiring) */
@@ -10472,12 +10601,39 @@ void t_t1077_wiring()
         Fail("t1077: talkcursor show mirrors the hover's filter");
 }
 
+/* T-1468: the hover's / order menu's talk check answers "no talk" on another player's character, by the click's own speaker test
+   (TkPlayerSpeaker, detour_startPlayerConv), inside the hover's scope only and before every other answer; everything else as before. */
+void t_t1468_player_no_talk()
+{
+    using namespace cooptalk;
+    if (TalkCursorPlayerNoTalk(1) != 1) Fail("T-1468: another player's character answers no talk");
+    if (TalkCursorPlayerNoTalk(0) != 0) Fail("T-1468: any other character goes on as before");
+    const std::string s = T1222NoCr("../coop-plugin/speech.cpp");
+    const size_t d = s.find("bool detour_tcCanTalk(void* dlg)\n{");
+    const size_t dEnd = (d == std::string::npos) ? std::string::npos : s.find("\n}\n", d);
+    if (d == std::string::npos || dEnd == std::string::npos) { Fail("t1468: detour_tcCanTalk not found"); return; }
+    const std::string dv = s.substr(d, dEnd - d);
+    const size_t scope = dv.find("if (g_tcCsTid == 0 || g_tcCsTid != ::GetCurrentThreadId() || g_tcCapTid != 0) return orig_tcCanTalk(dlg);");
+    const size_t no = dv.find("if (npc != 0 && cooptalk::TalkCursorPlayerNoTalk(TkPlayerSpeaker(npc))) { ::InterlockedIncrement64(&g_tcPlayerNoTalk); return false; }");
+    const size_t rest = dv.find("if (npc == 0 || TkS6Owner(npc) != 0 || TkPeerTarget(npc)) return orig_tcCanTalk(dlg);");
+    if (scope == std::string::npos || no == std::string::npos || rest == std::string::npos || !(scope < no && no < rest))
+        Fail("t1468: the scope test, then the player-character no talk, then the old pass-through - in that order");
+    if (dv.find("TkPlayerSpeaker(") != dv.rfind("TkPlayerSpeaker(")) Fail("t1468: one player-character test in the hover hook");
+    const size_t c = s.find("unsigned long long detour_startPlayerConv(void* dlg, void* who, void* line)");
+    if (c == std::string::npos || s.find("if (dlg != 0 && TkPlayerSpeaker(SayReadPtr(dlg, kDlgMe)))", c) == std::string::npos)
+        Fail("t1468: the click refuses by the same test (TkPlayerSpeaker of the Dialogue's character)");
+    if (s.find("talkCursor2[clickEngine,sendSkipped,playerNoTalk]=%lld,%lld,%lld") == std::string::npos)
+        Fail("t1468: the REPORT counts the no-talk answers");
+    if (s.find("if (TkPlayerSpeaker(npc)) hover = \"false (another player's character: no talk, as the click - T-1468)\";") == std::string::npos)
+        Fail("t1468: talkcursor show mirrors the hover");
+}
+
 /* T-1061: A CHEST'S LOCK ON ITS RECORD (boxrec.h A CHEST'S LOCK) - the lock block with and without, an unknown flag, the order of the
    tails, the encoder's refusals; who lays what; where a pick goes; the writer's answer; the BOX_LOCK message; the protocol pins */
 void t_t1061_lock_record()
 {
     using namespace coopbrec;
-    if (kProtocol != 173u || kBrFlagLock != 16u || kBrLockBytes != 10u) Fail("t1061: the lock block is not flag 16 / 10 bytes of world-server protocol 173");
+    if (kProtocol != 177u || kBrFlagLock != 16u || kBrLockBytes != 10u) Fail("t1061: the lock block is not flag 16 / 10 bytes of world-server protocol 177");
     const std::string key = "12-box.mod@3,41@1003,-205,100";
     std::vector<cooppar::ParityItem> items;
     items.push_back(T823BoxItem("katana", 0, 0, 1));
@@ -10577,7 +10733,7 @@ void t_t1061_lock_rules()
 void t_t1061_lock_msg()
 {
     using namespace coopbrec;
-    if (kMsgBoxLock != 85u || cooplive::kInnerBoxLock != 85u || kGameProtocolBoxLock != 207u || hovrec::kGameProtocol != 242u) Fail("t1061 msg: BOX_LOCK is not message 85 of game-to-game protocol 207");
+    if (kMsgBoxLock != 85u || cooplive::kInnerBoxLock != 85u || kGameProtocolBoxLock != 207u || hovrec::kGameProtocol != 248u) Fail("t1061 msg: BOX_LOCK is not message 85 of game-to-game protocol 207");
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerBoxLock) || !cooplive::LiveInnerWaitsForWorld(cooplive::kInnerBoxLock)) Fail("t1061 msg: BOX_LOCK is refused from the world server or dropped while the world loads");
     if (cooplive::AddrGroupOf(cooplive::kInnerBoxLock) != cooplive::kAddrGroupItem) Fail("t1061 msg: BOX_LOCK is not counted with the item road");
     BoxLockMsg m; m.kind = kBlmAsk; m.key = "12-box.mod@3,41@1003,-205,100"; m.lock.locked = 0; m.lock.level = 40; m.lock.hardness = 1.5f;
@@ -10626,10 +10782,10 @@ void t_t1061_wiring()
     for (size_t i = 0; i < sizeof(goneIt) / sizeof(goneIt[0]); ++i)
         if (it.find(goneIt[i]) != std::string::npos) Fail(std::string("t1061 wiring: items.cpp still uses ") + goneIt[i]);
     if (dr.find("BoxLockPickNote(lock, own);") == std::string::npos) Fail("t1061 wiring: the pick tick does not hand a non-door lock to the box road");
-    if (se.find("case MSG_BOX_LOCK:   OnBoxLock(m);    break;") == std::string::npos || se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos)
+    if (se.find("case MSG_BOX_LOCK:   OnBoxLock(m);    break;") == std::string::npos || se.find("const unsigned int kProtocolVersion = 248;") == std::string::npos)
         Fail("t1061 wiring: the session does not take BOX_LOCK or does not speak protocol 228");
-    if (sm.find("const unsigned int kProtocol = 173;") == std::string::npos || st.find("const unsigned int kStoreProtocol = 173;") == std::string::npos)
-        Fail("t1061 wiring: the world server and the game do not both speak world-server protocol 173");
+    if (sm.find("const unsigned int kProtocol = 177;") == std::string::npos || st.find("const unsigned int kStoreProtocol = 177;") == std::string::npos)
+        Fail("t1061 wiring: the world server and the game do not both speak world-server protocol 177");
 }
 
 /* T-1187: a forwarded conversation's end waits for ANY held line - also one with no NPC-side action (a hire: its contract is made
@@ -11143,7 +11299,7 @@ void t_cursorpiece_y()
 void t_t1242_books_wire()
 {
 
-    if (bookshare::kMsgResearchBook != 88u || cooplive::kInnerResearchBook != 88u || bookshare::kGameProtocolBooks != 211u || hovrec::kGameProtocol != 242u)
+    if (bookshare::kMsgResearchBook != 88u || cooplive::kInnerResearchBook != 88u || bookshare::kGameProtocolBooks != 211u || hovrec::kGameProtocol != 248u)
         Fail("t1242 wire: RESEARCH_BOOK is not message 88 of game-to-game protocol 211");
     if (!cooplive::LiveInnerAccepted(88u) || !cooplive::LiveInnerWaitsForWorld(88u)) Fail("t1242 wire: the relay does not carry RESEARCH_BOOK or does not keep it for the world");
     bookshare::Msg m; m.op = bookshare::kOpAsk; m.reqId = 0x01000007u; m.askerSlot = 1; m.tech = "2025-gamedata.base";
@@ -11325,7 +11481,7 @@ void t_t1242_books_wiring()
     const std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
     const std::string sig = T313ReadFile("../coop-plugin/addresses/signatures.sig");
     if (st.empty() || se.empty() || t65.empty() || t68.empty() || sig.empty()) { Fail("t1242 wiring: a source file is not readable"); return; }
-    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos || se.find("case MSG_RESEARCH_BOOK: OnResearchBook(m); break;") == std::string::npos
+    if (se.find("const unsigned int kProtocolVersion = 248;") == std::string::npos || se.find("case MSG_RESEARCH_BOOK: OnResearchBook(m); break;") == std::string::npos
         || se.find("ItemSendTo(MSG_RESEARCH_BOOK, toSlot, &body[0], body.size(), 0u, 0)") == std::string::npos || tr.find("MSG_RESEARCH_BOOK = 88") == std::string::npos)
         Fail("t1242 wiring: the session does not speak 221 or does not carry RESEARCH_BOOK by slot");
     const char* const need[] = {
@@ -11392,7 +11548,7 @@ void t_t1242_books_wiring()
         if (t65.find(rows65[i]) == std::string::npos) Fail(std::string("t1242 wiring: the 1.0.65 table lacks ") + rows65[i]);
         if (t68.find(rows68[i]) == std::string::npos) Fail(std::string("t1242 wiring: the 1.0.68 table lacks ") + rows68[i]);
     }
-    if (t65.find("!count 814") == std::string::npos || t68.find("!count 814") == std::string::npos) Fail("t1242 wiring: both address tables declare 814 rows (T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction, 2; T-1122 cursorjoin: + the confirm's four rows and TerrainHeightAt, 5; decision 1556: ZoneActivationDefaults, 1; T-1250: - the nine rows only its use-filter probe read; T-1250 fix attempt 2: TownUpdateOwnSearchRet, GetFoodTownGateTest, 2; T-918 (main): Character_setupAI, 1; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1242 + T-1150, 4 each; T-478 buying, 2; T-1260 RClickAutoTradeEnd, 1; T-1122 - the four rows only its assault-start probe read; T-1131 design A: PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet, 4; T-1131 fold 1: TheftCaughtNotifyRet, 1; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: BuildingCreatePhysical, 1; T-1294: WalkMapDeferInterior, 1 (its box queue binds PlacementRegionAdd, the same function); T-1082: UnlockDoorTaskStep, 1; T-1309: TaskObjectMineFactionTest, 1; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady, 2; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet; T-1372: + BuildingPlaceGround; T-1372 removal: + LevelEditorDeleteSelected, PlayerInterfaceToggleEditor; T-1355 attempt 2 (main): + AbstractMovementBaseVt, 1; T-1374 (main): + KenshiCrashFilter, KenshiSaveRootText; T-1379: + CampaignArrivalAnnounce, 1; T-1343: + BuildingAtPoint, 1; T-1381 probe P294: + MayUseRetSpecialFinder, 1; T-1381 P294 removed: - MayUseRetSpecialFinder; T-1381 probe P295: + ShopGoalTargetPick, ShopFindForItem, ShopFallbackRandom, 3; T-1381 P295 removed: - ShopGoalTargetPick, ShopFindForItem, -2 (ShopFallbackRandom kept, the fix's row); T-1167 piece 1: + LektorIntPushBack, ContextMenu_orderLabel, Character_orderPreCheck, TradeRangeSq; T-1167 piece 3 build 4: + MouseReleaseNoWindow; T-1167 v3: + RightReleaseItem; merge of effort/t1167b and main: both sides' rows, 774; T-1406: + PlayerInterface_newPlayerTask, StdString_assign, ForgottenGui_refreshSelected; merge of effort/t1167b into effort/t1406a: 777; T-1411 probe P306 c: + CarryFollowGateGlobal, 1; T-1411 fold 2: + CharacterKeepUpdatedTest, 1; T-1430: + NodeListDestroyByBuilding, TownForgetBuilding: 779; T-1430 fold 2: + BuildingGetTownStrict (0x296900, the purchase's own town lookup): 780; T-1437: + InputHandlerInit, InputHandlerAddCommand, InputHandlerFind, InputHandlerBind, InputHandlerParseKey, InputHandlerKeyBound, InputHandlerKeyName, InputHandlerGlobal, KeyConfigLineCtor, DatapanelAddLine, DatapanelAddSpacer, OptionsControlsEndRet (the Ping key and its Controls row): 792; T-1437 fold 1: + InputHandlerKeyDown (the key-down dispatch, hooked - a quick tap is not lost): 793; merge of main into effort/t1437a: both sides' rows, 795; T-1437 fold 2: + GameFreeStub (the game's own free, for the key word): 796; merge of main into effort/t1437a again (T-1427 fix: + TownFloorStoreRemove, TownFloorStoreAddPart): 798; merge of main into effort/t1437a a third time (T-1428 attempt 2: + ZoneWalkMapRebuild, NavMeshManagerPtr): 800; merge of main into effort/t1408a a fourth time: + WallEndPoint, PreviewRotate (T-1408 chain lever), 802; T-1408 fold 13: + WallJoinArea (0x29AC10, the engine's wall join - hooked: held for a wall whose record carries its owner's group), WallJoinTo (0x29A850, the engine's join of one wall to a lead - called in the owner's order), 804; merge of main into effort/t1408a a fifth time: + ZoneMapUpdate (T-1442 step 1b): 805; T-1422 window floor step: + NavClosestFaceQuery, HavokCharacterSetPosition: 807; merge of main into effort/t1422b again: + GuiKeyCommandGuard (T-1414 editorkey, 0x6E1C80), 808; merge of main into effort/t1422b a third time: + SetCrimeTimeLeft (0x851070, the time-left setter, hooked - T-1442 step 5), both sides' rows, 809; merge of main into effort/t1442g: + ActivePlatoon_removeMember (0x794C00, hooked - T-1442 step 6), both sides' rows, 810; merge of main into effort/t1442g again: + BuildingPauseToggle, BuildingFinishConstruction (T-1429 s3, the construction pause), both sides' rows, 812; T-1442 step 6 fix attempt 3: + Character_getPickedUp, SleepOnFloorStop, SleepOnFloorEnd, TaskGetOutOfBedStep (the engine's other writers of a leader's held / carried facts, hooked), 816; T-1442 attempt 3 review fold: + AnimationClass_ragdollModeUT (0x5B8F80, the physics ragdoll on / off, hooked), 817; merge of main into effort/t1429h: + BuildingPauseToggle, BuildingFinishConstruction (T-1429 s3, the construction pause), both sides' rows, 811; T-1429 s12 fold 5: + Platoon_declareDead (0x7964F0, the dead-body squad's rebuild), 812; merge of main into effort/t1453a: both sides' rows, 818; T-1453 step 3: - FactionDirectory_allFactions, GameDataContainer_allRecords, RootObjectBase_getRecordDirect, Character_poseState, MedicalSystem_countBodyParts, SavedObjectState_stateCount (one-field getters, read as fields now), 812; T-1449: + AppearanceBase_setupItemMaterial (the item look-maker, watched read-only for the [ITEMLOOK] line; optional:itemlook), 819; merge of main into effort/t1449b (T-1453 step 3 had removed six rows): 813; T-1416 fix attempt 1: + PlatoonPlanTemplateSetup (0x2715E0, the squad plan's template setup - a copy squad's package list), 819)");
+    if (t65.find("!count 820") == std::string::npos || t68.find("!count 820") == std::string::npos) Fail("t1242 wiring: both address tables declare 820 rows (T-1462: + LevelEditorFixStuff; T-540 D1: + Character_isItSafeToGetUp; T-1429 design b: + DelayedSpawnQueue, optional:campkeep; T-1429 A1: + CampPieceMake, BuildingNeedsSaving, optional:campkeep; T-1122 roller: + FactionWarMgrUpdate, TownsOfFaction, 2; T-1122 cursorjoin: + the confirm's four rows and TerrainHeightAt, 5; decision 1556: ZoneActivationDefaults, 1; T-1250: - the nine rows only its use-filter probe read; T-1250 fix attempt 2: TownUpdateOwnSearchRet, GetFoodTownGateTest, 2; T-918 (main): Character_setupAI, 1; T-1250: - the seven rows only its food-search probe read; T-1250: + FoodStoreSearchOwnerTest, BedCostMayUseRet; T-1242 + T-1150, 4 each; T-478 buying, 2; T-1260 RClickAutoTradeEnd, 1; T-1122 - the four rows only its assault-start probe read; T-1131 design A: PlatoonMemoryNote, TheftCaughtEv2FRet, TheftCaughtEv8Ret, TheftCaughtMemoryRet, 4; T-1131 fold 1: TheftCaughtNotifyRet, 1; T-1145: + DialogueListPlayerReplies; T-1294 fold 2: BuildingCreatePhysical, 1; T-1294: WalkMapDeferInterior, 1 (its box queue binds PlacementRegionAdd, the same function); T-1082: UnlockDoorTaskStep, 1; T-1309: TaskObjectMineFactionTest, 1; T-1046 fix 1: + ScythePhysicsJunk, ScythePhysicsFirstReady, 2; T-1199 fold 1: + DoorOpenTaskAction, DoorOpenLockTestTaskAction, DoorOpenButtonOpenRet; T-1372: + BuildingPlaceGround; T-1372 removal: + LevelEditorDeleteSelected, PlayerInterfaceToggleEditor; T-1355 attempt 2 (main): + AbstractMovementBaseVt, 1; T-1374 (main): + KenshiCrashFilter, KenshiSaveRootText; T-1379: + CampaignArrivalAnnounce, 1; T-1343: + BuildingAtPoint, 1; T-1381 probe P294: + MayUseRetSpecialFinder, 1; T-1381 P294 removed: - MayUseRetSpecialFinder; T-1381 probe P295: + ShopGoalTargetPick, ShopFindForItem, ShopFallbackRandom, 3; T-1381 P295 removed: - ShopGoalTargetPick, ShopFindForItem, -2 (ShopFallbackRandom kept, the fix's row); T-1167 piece 1: + LektorIntPushBack, ContextMenu_orderLabel, Character_orderPreCheck, TradeRangeSq; T-1167 piece 3 build 4: + MouseReleaseNoWindow; T-1167 v3: + RightReleaseItem; merge of effort/t1167b and main: both sides' rows, 774; T-1406: + PlayerInterface_newPlayerTask, StdString_assign, ForgottenGui_refreshSelected; merge of effort/t1167b into effort/t1406a: 777; T-1411 probe P306 c: + CarryFollowGateGlobal, 1; T-1411 fold 2: + CharacterKeepUpdatedTest, 1; T-1430: + NodeListDestroyByBuilding, TownForgetBuilding: 779; T-1430 fold 2: + BuildingGetTownStrict (0x296900, the purchase's own town lookup): 780; T-1437: + InputHandlerInit, InputHandlerAddCommand, InputHandlerFind, InputHandlerBind, InputHandlerParseKey, InputHandlerKeyBound, InputHandlerKeyName, InputHandlerGlobal, KeyConfigLineCtor, DatapanelAddLine, DatapanelAddSpacer, OptionsControlsEndRet (the Ping key and its Controls row): 792; T-1437 fold 1: + InputHandlerKeyDown (the key-down dispatch, hooked - a quick tap is not lost): 793; merge of main into effort/t1437a: both sides' rows, 795; T-1437 fold 2: + GameFreeStub (the game's own free, for the key word): 796; merge of main into effort/t1437a again (T-1427 fix: + TownFloorStoreRemove, TownFloorStoreAddPart): 798; merge of main into effort/t1437a a third time (T-1428 attempt 2: + ZoneWalkMapRebuild, NavMeshManagerPtr): 800; merge of main into effort/t1408a a fourth time: + WallEndPoint, PreviewRotate (T-1408 chain lever), 802; T-1408 fold 13: + WallJoinArea (0x29AC10, the engine's wall join - hooked: held for a wall whose record carries its owner's group), WallJoinTo (0x29A850, the engine's join of one wall to a lead - called in the owner's order), 804; merge of main into effort/t1408a a fifth time: + ZoneMapUpdate (T-1442 step 1b): 805; T-1422 window floor step: + NavClosestFaceQuery, HavokCharacterSetPosition: 807; merge of main into effort/t1422b again: + GuiKeyCommandGuard (T-1414 editorkey, 0x6E1C80), 808; merge of main into effort/t1422b a third time: + SetCrimeTimeLeft (0x851070, the time-left setter, hooked - T-1442 step 5), both sides' rows, 809; merge of main into effort/t1442g: + ActivePlatoon_removeMember (0x794C00, hooked - T-1442 step 6), both sides' rows, 810; merge of main into effort/t1442g again: + BuildingPauseToggle, BuildingFinishConstruction (T-1429 s3, the construction pause), both sides' rows, 812; T-1442 step 6 fix attempt 3: + Character_getPickedUp, SleepOnFloorStop, SleepOnFloorEnd, TaskGetOutOfBedStep (the engine's other writers of a leader's held / carried facts, hooked), 816; T-1442 attempt 3 review fold: + AnimationClass_ragdollModeUT (0x5B8F80, the physics ragdoll on / off, hooked), 817; merge of main into effort/t1429h: + BuildingPauseToggle, BuildingFinishConstruction (T-1429 s3, the construction pause), both sides' rows, 811; T-1429 s12 fold 5: + Platoon_declareDead (0x7964F0, the dead-body squad's rebuild), 812; merge of main into effort/t1453a: both sides' rows, 818; T-1453 step 3: - FactionDirectory_allFactions, GameDataContainer_allRecords, RootObjectBase_getRecordDirect, Character_poseState, MedicalSystem_countBodyParts, SavedObjectState_stateCount (one-field getters, read as fields now), 812; T-1449: + AppearanceBase_setupItemMaterial (the item look-maker, watched read-only for the [ITEMLOOK] line; optional:itemlook), 819; merge of main into effort/t1449b (T-1453 step 3 had removed six rows): 813; T-1416 fix attempt 1: + PlatoonPlanTemplateSetup (0x2715E0, the squad plan's template setup - a copy squad's package list), 819); T-1429 review fold F1612: - DelayedSpawnQueue (nothing reads it since the camp note design); T-1455 (main): + BuildingSetTown (0x926190, the merge's re-town, hooked - the town carry), 817; T-1422 nudge floor (owner 1868 a): + NavClosestFaceQuery, HavokCharacterSetPosition again, 819; T-1422 attempt 7 (owner 1878 a): - NavClosestFaceQuery, HavokCharacterSetPosition, + NavPlaceOnFloor, NavWalkPlaceReach, 819; merge of main into effort/t1422k: both sides' rows (T-1470 revert's removal of NavClosestFaceQuery, HavokCharacterSetPosition; T-1477 A1: + FactionWarMgrLoad), 820");
     if (sig.find("ResearchBenchList ") == std::string::npos || sig.find("ResearchCanPay ") == std::string::npos || sig.find("ResearchHasItems ") == std::string::npos || sig.find("ResearchPay ") == std::string::npos)
         Fail("t1242 wiring: a new row has no signature");
 }
@@ -11831,7 +11987,7 @@ void t_t860_cage_record()
     CageRec sd = w; sd.flags = kCrFlagSeed; std::vector<char> sb; EncodeCageRec(&sb, sd);
     if (CageJudgeWrite(id, &sb[0], sb.size(), 3, 3, 1, 1, 0, 0) != coopbrec::kBrRefuseSeedExists) Fail("t860 cage judge: a seed over a stored record is taken");
     if (CageJudgeRemove(id, 3, 3) != coopbrec::kBrAccept || CageJudgeRemove(id, 2, 3) != coopbrec::kBrRefuseNotWriter) Fail("t860 cage judge: a removal by another game than the holder");
-    if (kProtocol != 173u || coopbrec::kProtocol != 173u || doorrec::kProtocol != 173u) Fail("t860 cage record: the world-server protocol is not 172");
+    if (kProtocol != 177u || coopbrec::kProtocol != 177u || doorrec::kProtocol != 177u) Fail("t860 cage record: the world-server protocol is not 177");
     if (PrisonRoadSendsLock(1) != 0 || PrisonRoadSendsLock(0) != 1) Fail("t860 cage record: the prisoner road still sends a cage's lock (or no longer the shackles')");
 }
 
@@ -12011,7 +12167,7 @@ void t_t860_cage_decide()
         Fail("t860 msg: BOX_LOCK's not-holder answer does not round-trip");
     m.kind = 9;
     if (coopbrec::EncodeBoxLockMsg(&by, m)) Fail("t860 msg: an unknown BOX_LOCK kind encodes");
-    if (coopbrec::kBlmCage != 3 || coopbrec::kBlmCageQuery != 4 || coopbrec::kBlmCageNone != 6 || coopbrec::kBlmCageStale != 8 || hovrec::kGameProtocol != 242u) Fail("t860 msg: the cage kinds are not 3-8 of game-to-game protocol 222");
+    if (coopbrec::kBlmCage != 3 || coopbrec::kBlmCageQuery != 4 || coopbrec::kBlmCageNone != 6 || coopbrec::kBlmCageStale != 8 || hovrec::kGameProtocol != 248u) Fail("t860 msg: the cage kinds are not 3-8 of game-to-game protocol 222");
     {   /* fold 2: a cage kind carries its generation and base lock; a cage message cut before them is refused */
         coopbrec::BoxLockMsg t; t.kind = coopbrec::kBlmCageTaken; t.key = "#0123abcd@12,34@-501,77,30"; t.gen = 41; t.base.locked = 1;
         std::vector<char> tb; coopbrec::BoxLockMsg tr;
@@ -12045,11 +12201,11 @@ void t_t860_cage_wiring()
     if (it.find("CageRecRequestNote(m.key, m.lock.locked, m.lock.broken, m.lock.level,") == std::string::npos || it.find("CageRecRefuseArrive(id, reason, storedGen, sentGen)") == std::string::npos)
         Fail("t860 cage wiring: items.cpp does not route BOX_LOCK's cage kinds or a cage refusal");
     const char* const needSt[] = { "if (cagerec::IsCageRecId(worldId)) { coop::CageRecordArrive(worldId, kindBytes); return; }", "coop::CageRecordGone(worldId)",
-        "coop::CageRecordEcho(worldId", "coop::CageRecMapEvent();", "const unsigned int kStoreProtocol = 173;" };
+        "coop::CageRecordEcho(worldId", "coop::CageRecMapEvent();", "const unsigned int kStoreProtocol = 177;" };
     for (size_t i = 0; i < sizeof(needSt) / sizeof(needSt[0]); ++i)
         if (st.find(needSt[i]) == std::string::npos) Fail(std::string("t860 cage wiring: store.cpp lacks ") + needSt[i]);
     const char* const needSm[] = { "cagerec::CageJudgeWrite(r.worldId,", "cagerec::CageJudgeRemove(wid, sender, CageHolderOf(wid))", "CageLanded(id, j->payload);",
-        "|| cagerec::CageRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 173;" };
+        "|| cagerec::CageRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 177;" };
     for (size_t i = 0; i < sizeof(needSm) / sizeof(needSm[0]); ++i)
         if (sm.find(needSm[i]) == std::string::npos) Fail(std::string("t860 cage wiring: store_main.cpp lacks ") + needSm[i]);
 }
@@ -12088,7 +12244,7 @@ void t_t1296_freed_take_out()
         if (EncodePrison(&nb, bad)) Fail("T-1296: FREED with freedLeft 2 encodes");
         PrisonMsg d; if (d.freedLeft != 0) Fail("T-1296: a new message's freedLeft is not 0");
     }
-    if (hovrec::kGameProtocol != 242u) Fail("T-1296: the game-to-game protocol is not 242 (FREED's freedLeft)");
+    if (hovrec::kGameProtocol != 248u) Fail("T-1296: the game-to-game protocol is not 248 (FREED's freedLeft)");
     const std::string sp = T23NoCr(T313ReadFile("../coop-plugin/spawn.cpp"));
     const std::string sh = T23NoCr(T313ReadFile("../coop-plugin/speech.cpp"));
     const std::string se = T23NoCr(T313ReadFile("../coop-plugin/net/session.cpp"));
@@ -12112,7 +12268,7 @@ void t_t1296_freed_take_out()
     for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i)
         if (sp.find(need[i]) == std::string::npos) Fail(std::string("T-1296 wiring: missing in spawn.cpp: ") + need[i]);
     if (sh.find("m.freedLeft = FreedCopyLeftCageNow(x.uid, x.cagedAtEvent);") == std::string::npos) Fail("T-1296 wiring: FREED's send does not fill freedLeft");
-    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos) Fail("T-1296 wiring: the session does not speak 242");
+    if (se.find("const unsigned int kProtocolVersion = 248;") == std::string::npos) Fail("T-1296 wiring: the session does not speak 242");
     if (sp.find("P290") != std::string::npos) Fail("T-1296: probe P290 is still in spawn.cpp");
     /* the arrest road's release: setPrisonMode off, then the walk-out order (B3:14981-14982, T2403) */
     const size_t a = sp.find("int PrisonReleasePod(::Character* c, void* cage, double pardonUntil, void* relFac, int relMode)");
@@ -12268,7 +12424,7 @@ void t_t1122_roller_fold1()
 void t_t1333_bldg_record()
 {
     using namespace bldgrec;
-    if (kProtocol != 173u || doorrec::kProtocol != 173u || coopbrec::kProtocol != 173u) Fail("t1333 record: the world-server protocol is not 172");
+    if (kProtocol != 177u || doorrec::kProtocol != 177u || coopbrec::kProtocol != 177u) Fail("t1333 record: the world-server protocol is not 177");
     const std::string key = "2939-Walls2.mod@43,11@-1234,567";
     const std::string id = MakeBldgRecId(key);
     int sx = -1, sy = -1;
@@ -12566,16 +12722,16 @@ void t_t1333_bldg_wiring()
     for (size_t i = 0; i < sizeof(needBd) / sizeof(needBd[0]); ++i)
         if (bd.find(needBd[i]) == std::string::npos) Fail(std::string("t1333 wiring: build.cpp lacks ") + needBd[i]);
     const char* const needSt[] = { "if (bldgrec::IsBldgRecId(worldId)) { coop::TownBldgRecordArrive(worldId, kindBytes); return; }", "coop::TownBldgRecordGone(worldId)",
-        "coop::TownBldgRecordEcho(worldId", "coop::TownBldgMapEvent();", "bool StoreSendBldgRecord(", "bool StoreSendBldgGone(", "const unsigned int kStoreProtocol = 173;" };
+        "coop::TownBldgRecordEcho(worldId", "coop::TownBldgMapEvent();", "bool StoreSendBldgRecord(", "bool StoreSendBldgGone(", "const unsigned int kStoreProtocol = 177;" };
     for (size_t i = 0; i < sizeof(needSt) / sizeof(needSt[0]); ++i)
         if (st.find(needSt[i]) == std::string::npos) Fail(std::string("t1333 wiring: store.cpp lacks ") + needSt[i]);
     if (it.find("TownBldgRefuseArrive(id, reason, storedGen, sentGen)") == std::string::npos) Fail("t1333 wiring: items.cpp does not route a building record's refusal");
     if (tv.find("TownBldgAreaRebuilt(ts.x * 64 + ts.y);") == std::string::npos) Fail("t1333 wiring: townver.cpp does not drop a rebuilt town's building records");
     const char* const needSm[] = { "bldgrec::BldgJudgeWrite(r.worldId,", "bldgrec::BldgJudgeRemove(wid, sender, BldgHolderOf(wid))", "BldgLanded(id, j->payload);",
-        "|| bldgrec::BldgRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 173;", "&& !bldgrec::IsBldgRecId(wid)) TownLossFromGone(" };
+        "|| bldgrec::BldgRecIdParse(id, &sx, &sy) != 0", "const unsigned int kProtocol = 177;", "&& !bldgrec::IsBldgRecId(wid)) TownLossFromGone(" };
     for (size_t i = 0; i < sizeof(needSm) / sizeof(needSm[0]); ++i)
         if (sm.find(needSm[i]) == std::string::npos) Fail(std::string("t1333 wiring: store_main.cpp lacks ") + needSm[i]);
-    if (se.find("const unsigned int kProtocolVersion = 242;") == std::string::npos) Fail("t1333 wiring: the game-to-game protocol is not 242 (T-1333's 225, T-1122's 226, then T-1318's 227 on top)");
+    if (se.find("const unsigned int kProtocolVersion = 248;") == std::string::npos) Fail("t1333 wiring: the game-to-game protocol is not 248 (T-1333's 225, T-1122's 226, then T-1318's 227 on top)");
 }
 /* T-1333 TEST-ONLY lever `buildtest townhit <key> <cut> <blunt> [door|door=<i>] [times]`: its words' parse (bldgrec.h
    BgTownHitLeverParse), and that build.cpp starts only the engine's own hit (vt+0x1F0 through the hooks) - never a record write, never
@@ -15234,5 +15390,460 @@ void t_t1408_fold14()
         for (size_t p = a0; a1 != std::string::npos && (p = bc.find("baseFollow.armed = (s.ownRec == 0) ? 1 : 0;", p)) != std::string::npos && p < a1; ++p) ++armedN;
         if (writes != 8 || armedN != 8) Fail("t1408 fold 14b wiring: a materials write in BdApplyOne does not arm the baseline's follow");
     }
+}
+/* T-1429 s15 / s16 (F1356 / F1357 / F1369): the log lines a run needs - a furniture step line around the engine's own step (its town,
+   point and the area's buildings / ground before and after), the ground around a camp before / after its build and 30 s later, the
+   live area and the load count beside each area save / load, and the world server's line for every area copy it takes. Log only:
+   the server's accept rule is unchanged (no new refusal before the taken line). */
+void t_t1429_s15_s16_lines()
+{
+    const std::string camp = T313ReadFile("../coop-plugin/camp.cpp");
+    const std::string store = T313ReadFile("../coop-plugin/store.cpp");
+    const std::string items = T313ReadFile("../coop-plugin/items.cpp");
+    const std::string server = T313ReadFile("../coop-store/store_main.cpp");
+    if (camp.empty() || store.empty() || items.empty() || server.empty()) { Fail("t1429 s15/s16: a source file did not read"); return; }
+    /* s15: the step line wraps the engine's step - read before, the step (forced or not, as before), read after */
+    const size_t d0 = camp.find("void detour_cpDebris(void* town, void* rec, float* pt, unsigned long long hand)");
+    const size_t d1 = d0 == std::string::npos ? d0 : camp.find("\n}", d0);
+    const std::string det = (d0 == std::string::npos || d1 == std::string::npos) ? std::string() : camp.substr(d0, d1 - d0);
+    const size_t b = det.find("bld0 = coop::LoadedBuildingsInSector("), o1 = det.find("if (!forced) orig_cpDebris(town, rec, pt, hand);"),
+                 o2 = det.find("else { ++g_cpDebrisForced; orig_cpDebris(town, rec, use, hand); }"), a = det.find("int bld1 = coop::LoadedBuildingsInSector("),
+                 l = det.find("\"[CAMP] \" + o.str()");
+    if (det.empty() || b == std::string::npos || o1 == std::string::npos || o2 == std::string::npos || a == std::string::npos || l == std::string::npos || !(b < o1 && o1 < o2 && o2 < a && a < l))
+        Fail("t1429 s15: the furniture step line does not read the area before the engine's step and after it");
+    if (det.find("if (!forced) { orig_cpDebris(town, rec, pt, hand); return; }") != std::string::npos) Fail("t1429 s15: the old early return skips the step line");
+    if (camp.find("g_cpStepLogBudget = 150, g_cpGroundLogBudget = 120") == std::string::npos || camp.find("campLines[stepCut,groundCut]=") == std::string::npos)
+        Fail("t1429 s15: the camp lines' caps or their REPORT counters are missing");
+    if (camp.find("d.groundBefore = groundBefore;") == std::string::npos || camp.find("of its list spot - before the build: ") == std::string::npos
+        || camp.find("of its list spot 30 s after its build: ") == std::string::npos)
+        Fail("t1429 s15: a camp build's ground lines (before / after / 30 s) are missing");
+    if (items.find("std::string GroundAroundSay(float x, float z, float r, int sx, int sy, int maxKeys, int* n)") == std::string::npos) Fail("t1429 s15: GroundAroundSay is not defined");
+    /* s16: the live area before the save, the load's count around the engine's read */
+    const size_t s0 = store.find("ZoneLiveBeforeSave(content);"), s1 = store.find("__try { orig_saveLevelData(content, flag, a, b); }");
+    if (s0 == std::string::npos || s1 == std::string::npos || s0 > s1) Fail("t1429 s16: the live area is not read before the engine's area save");
+    const size_t g0 = store.find("if (areaLoad) held0 = GdcHeldPod(container);"), g1 = store.find("const bool ok = orig_gdcLoad(container, file, modName, modIndex, serialisable, flag);"),
+                 g2 = store.find("const long long held1 = GdcHeldPod(container);");
+    if (g0 == std::string::npos || g1 == std::string::npos || g2 == std::string::npos || !(g0 < g1 && g1 < g2)) Fail("t1429 s16: the area load count is not read around the engine's read");
+    /* s16: the server's taken line comes after every refusal of an area copy (stale base, not newer) and before its write; nothing new refuses */
+    const size_t t = server.find("Log(\"[ZONE] area copy taken zone=\""), sb = server.find("Log(\"[ZONE] STALE BASE zone=\""),
+                 w = t == std::string::npos ? t : server.find("WriterQueueCommit(kFromSquad, r, &bytes, kRotateBoth, from, connect, r, fromName);", t);
+    if (t == std::string::npos || sb == std::string::npos || w == std::string::npos || sb > t) Fail("t1429 s16: the server's area copy taken line is missing or out of place");
+    else if (server.substr(t, w - t).find("return;") != std::string::npos) Fail("t1429 s16: a refusal was added between the taken line and the write (log only)");
+}
+/* T-1429 step 2: the TEST-ONLY statedump lever's line format (src/common/statedump.h) - what tools/dump_compare.py reads - and its wiring */
+void t_t1429_statedump_format()
+{
+    using namespace coopdump;
+    if (DumpTagOk("before") != 1 || DumpTagOk("after_2-b") != 1) Fail("t1429: a plain tag refused");
+    if (DumpTagOk("") != 0 || DumpTagOk("a b") != 0 || DumpTagOk("x=y") != 0 || DumpTagOk("abcdefghijklmnopqrstuvwxy") != 0) Fail("t1429: a bad tag taken");
+    if (DumpEsc("Hub Bar 1") != "Hub%20Bar%201") Fail("t1429: a space is not escaped: " + DumpEsc("Hub Bar 1"));
+    if (DumpEsc("a=b%c") != "a%3Db%25c") Fail("t1429: '=' / '%' not escaped: " + DumpEsc("a=b%c"));
+    if (DumpEsc("") != "%00") Fail("t1429: an empty value is not one word");
+    if (DumpEsc("G|stone@3,4@10,20,30") != "G|stone@3,4@10,20,30") Fail("t1429: a key's own characters changed");
+    if (DumpField("name", "Bar Hub") != " name=Bar%20Hub") Fail("t1429: the field form");
+    if (DumpF2(-0.001) != "0.00" || DumpF2(1.234) != "1.23" || DumpF2(1.0e12) != "?") Fail("t1429: the two-decimal form");
+    { const float p[3] = { 1.04f, -2.0f, 3.55f }; if (DumpPos(p) != "1.0,-2.0,3.5" && DumpPos(p) != "1.0,-2.0,3.6") Fail("t1429: the position form " + DumpPos(p)); }
+    { const float p[3] = { 1.0f, 2.0f, 1.0e9f }; if (DumpPos(p) != "?") Fail("t1429: an implausible position printed"); }
+    if (DumpHex(0xABCu) != "00000abc") Fail("t1429: the digest form");
+    /* sorted by key; a repeated key gets #2, #3 in fields order; the line is "[DUMP] tag kind key fields" */
+    std::vector<DumpRow> rows;
+    DumpRow a; a.key = "k2"; a.fields = " f=1"; rows.push_back(a);
+    DumpRow b; b.key = "k1"; b.fields = " f=9"; rows.push_back(b);
+    DumpRow c; c.key = "k1"; c.fields = " f=2"; rows.push_back(c);
+    DumpRow d; d.key = "k1"; d.fields = " f=5"; rows.push_back(d);
+    DumpSortRows(&rows);
+    if (rows.size() != 4 || rows[0].key != "k1" || rows[0].fields != " f=2" || rows[1].key != "k1#2" || rows[1].fields != " f=5"
+        || rows[2].key != "k1#3" || rows[3].key != "k2") Fail("t1429: the sort / repeat marks");
+    if (DumpLine("before", "squad", rows[0]) != "[DUMP] before squad k1 f=2") Fail("t1429: the line: " + DumpLine("before", "squad", rows[0]));
+    DumpRow sp; sp.key = "Hub guards 7"; sp.fields = " type=1";
+    if (DumpLine("after", "squad", sp) != "[DUMP] after squad Hub%20guards%207 type=1") Fail("t1429: a key with spaces is one word");
+    if (DumpTotalLine("after", "box", 3, 2, " keyless=0") != "[DUMP] after total box n=3 printed=2 cap=1500 keyless=0") Fail("t1429: the total line");
+    /* wiring: the lever exists, is DEV-build only, and the items.cpp command emits every kind */
+    const std::string cc = T313ReadFile("../coop-plugin/command_channel.cpp");
+    if (cc.find("else if (verb == \"statedump\")") == std::string::npos || cc.find("WriteStatus(coop::StateDumpCommand(tag));") == std::string::npos) Fail("t1429: the statedump verb");
+    const std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    const size_t s = it.find("std::string StateDumpCommand(const std::string& tag)\r\n{");
+    const size_t s2 = (s != std::string::npos) ? s : it.find("std::string StateDumpCommand(const std::string& tag)\n{");
+    if (s2 == std::string::npos || it.find("#ifdef SW_DEV_BUILD", s2) > it.find("DumpTagOk(tag)", s2)) Fail("t1429: StateDumpCommand is not DEV-build gated");
+    const char* kinds[6] = { "\"building\"", "\"door\"", "\"furniture\"", "\"box\"", "\"ground\"", "\"squad\"" };
+    for (int i = 0; i < 6; ++i) if (it.find(std::string("SdEmit(tag, ") + kinds[i], s2) == std::string::npos) Fail(std::string("t1429: kind not emitted ") + kinds[i]);
+    const std::string bd = T313ReadFile("../coop-plugin/build.cpp");
+    if (bd.find("void StateDumpBuildingRows(") == std::string::npos || bd.find("ObjectPositionKey(b, k, kKeyCap, \"\", 3, 1)", bd.find("void StateDumpBuildingRows(")) == std::string::npos)
+        Fail("t1429: buildings are keyed by the P7n position key");
+}
+
+/* T-1429 v3: the lever's six defects (F1266) and the new kinds - the outline 'unset' form, the 10-unit position, and the wiring
+   (item names, the absolute owner word, every resident squad, one interior route, doors by their record key, characters and cages) */
+void t_t1429_statedump_v3()
+{
+    using namespace coopdump;
+    { const float o[6] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f }; if (DumpOutline(o) != "1.0,2.0,3.0,4.0,5.0,6.0") Fail("t1429v3: a filled outline " + DumpOutline(o)); }
+    { float o[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f }; volatile float z = 0.0f; o[3] = z / z; if (DumpOutline(o) != "unset") Fail("t1429v3: a NaN outline is not 'unset': " + DumpOutline(o)); }
+    { const float p[3] = { 14.9f, -15.0f, -4.0f }; if (DumpPos10(p) != "10,-20,0") Fail("t1429v3: the 10-unit position " + DumpPos10(p)); }
+    { const float p[3] = { -64696.0f, 173.8f, -1579.6f }; if (DumpPos10(p) != "-64700,170,-1580") Fail("t1429v3: the 10-unit position " + DumpPos10(p)); }
+    { const float p[3] = { 1.0f, 2.0f, 1.0e9f }; if (DumpPos10(p) != "?") Fail("t1429v3: an implausible position printed"); }
+    const std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    const size_t s = it.find("std::string StateDumpCommand(const std::string& tag)");
+    if (s == std::string::npos) { Fail("t1429v3: StateDumpCommand not found"); return; }
+    if (it.find("SdEmit(tag, \"character\"", s) == std::string::npos || it.find("SdEmit(tag, \"cage\"", s) == std::string::npos) Fail("t1429v3: characters / cages not emitted");
+    if (it.find("DumpField(\"names\"", s) == std::string::npos) Fail("t1429v3: box item names");
+    if (it.find("(c == coopown::kOwnMe || c == coopown::kOwnPeer) ? \"player\"") == std::string::npos) Fail("t1429v3: the owner word is still relative");
+    if (it.find("SdNumberSameKeys(&squads, &sqPl);", s) == std::string::npos) Fail("t1429v3: a character's squad key is not the numbered one");
+    const std::string bd = T313ReadFile("../coop-plugin/build.cpp");
+    const size_t b = bd.find("void StateDumpBuildingRows(");
+    if (b == std::string::npos || bd.find("InteriorPieceIds(list[i], ids, kBdInteriorCap", b) == std::string::npos) Fail("t1429v3: the interior route");
+    if (bd.find("SdHomedInPod(b, fa, &nh)") == std::string::npos) Fail("t1429v3: every resident squad");
+    if (bd.find("DumpOutline(o)") == std::string::npos) Fail("t1429v3: the outline form");
+    if (bd.find("DoorsDumpKey(door, dk, kKeyCap, &gate)") == std::string::npos) Fail("t1429v3: doors by their record key");
+}
+
+/* T-1429 (F1302): a town's dump name drops the engine's per-launch instance number - the same 19,31 camp read 'Dust Bandit Camp 48'
+   on one game and '29' on the other - and both dump sites (a building's town field, a squad's homeTown / town: key) use it */
+void t_t1429_statedump_town_name()
+{
+    using namespace coopdump;
+    if (DumpTownName("Dust Bandit Camp 48") != "Dust Bandit Camp" || DumpTownName("Dust Bandit Camp 29") != DumpTownName("Dust Bandit Camp 48"))
+        Fail("t1429town: the camp's number kept: " + DumpTownName("Dust Bandit Camp 48"));
+    if (DumpTownName("The Hub") != "The Hub" || DumpTownName("Your Outpost (Profile 1)") != "Your Outpost (Profile 1)") Fail("t1429town: a plain name changed");
+    if (DumpTownName("Stack2") != "Stack2" || DumpTownName("12") != "12" || DumpTownName(" 7") != " 7" || DumpTownName("") != "") Fail("t1429town: a name with no ' <n>' end changed");
+    if (DumpTownName("Camp 4 Ruins") != "Camp 4 Ruins" || DumpTownName("A 5") != "A") Fail("t1429town: only the trailing number goes");
+    const std::string bd = T313ReadFile("../coop-plugin/build.cpp");
+    if (bd.find("DumpField(\"town\", t == 0 ? std::string(\"none\") : DumpTownName(BdTownName(t)))") == std::string::npos) Fail("t1429town: a building's town field");
+    const std::string it = T313ReadFile("../coop-plugin/items.cpp");
+    const size_t w = it.find("static std::string SdTownWords(void* t)");
+    if (w == std::string::npos || it.find("coopdump::DumpTownName(BdTownName(t))", w) > it.find("static std::string SdDataWords(", w)) Fail("t1429town: a squad's town words");
+}
+
+/* ---- T-1429 F1753 design (a): each camp piece carries whether the camp maker put it inside the camp's nest building ---- */
+void t_t1429_f1753_inside()
+{
+    namespace cl = camplaid;
+    /* format 3 round trip: the three inside values */
+    cl::CampLaidRec m; m.generation = 4; m.writerSlot = 1; m.sx = 20; m.sy = 32;
+    cl::CampLaidEntry e; e.key = "t@20,32@1,2,3|16842|5904-shack@20,32@4,5,6";
+    for (int i = 0; i < 3; ++i) { cl::CampPiece pc; pc.sid = "16845-bed.base"; pc.x = 1.0f + i; pc.y = 2.0f; pc.z = 3.0f; pc.inside = i; e.pieces.push_back(pc); }
+    m.laid.push_back(e);
+    std::vector<char> b; cl::CampLaidRec d;
+    if (cl::kClFormat != 3u || cl::kClFormatNoInside != 2u || cl::kClInsideOut != 0 || cl::kClInsideNest != 1 || cl::kClInsideUnknown != 2) Fail("t1429 f1753: format 3 / the inside values 0 1 2");
+    if (!cl::EncodeCampLaidRec(&b, m) || b.size() < 8 || b[4] != 3 || cl::DecodeCampLaidRec(&b[0], b.size(), &d) != cl::kClOk || d.laid.size() != 1 || d.laid[0].pieces.size() != 3
+        || d.laid[0].pieces[0].inside != 0 || d.laid[0].pieces[1].inside != 1 || d.laid[0].pieces[2].inside != 2 || d.laid[0].pieces[2].x != 3.0f)
+        Fail("t1429 f1753: a format 3 record round-trips each piece's inside byte");
+    for (size_t cut = 0; cut < b.size(); ++cut) if (cl::DecodeCampLaidRec(&b[0], cut, &d) == cl::kClOk) { Fail("t1429 f1753: a format 3 record cut short at any byte is refused"); break; }
+    {   /* the last byte is the last piece's inside byte: 3 is out of range */
+        std::vector<char> t = b; t[t.size() - 1] = 3;
+        if (cl::DecodeCampLaidRec(&t[0], t.size(), &d) != cl::kClBadRecord) Fail("t1429 f1753: an inside byte over 2 is refused");
+        cl::CampLaidRec bad = m; bad.laid[0].pieces[0].inside = 3; std::vector<char> nb;
+        if (cl::EncodeCampLaidRec(&nb, bad)) Fail("t1429 f1753: an inside value over 2 does not encode");
+    }
+    {   /* format 2 (no inside byte) is still read: each piece 'not known' */
+        std::vector<char> f2;
+        coopbrec::BrPutU32(&f2, cl::kClMarker); coopbrec::BrPutU32(&f2, 2u); coopbrec::BrPutU32(&f2, 4u); coopbrec::BrPutU32(&f2, 1u);
+        coopbrec::BrPutU32(&f2, 20u); coopbrec::BrPutU32(&f2, 32u); coopbrec::BrPutU32(&f2, 1u);
+        coopbrec::BrPutStr(&f2, e.key); coopbrec::BrPutU32(&f2, 1u); coopbrec::BrPutStr(&f2, "16845-bed.base");
+        const float v[7] = { 1.0f, 2.0f, 3.0f, 1.0f, 0.0f, 0.0f, 0.0f };
+        for (int i = 0; i < 7; ++i) { unsigned int u = 0; std::memcpy(&u, &v[i], 4); coopbrec::BrPutU32(&f2, u); }
+        if (cl::DecodeCampLaidRec(&f2[0], f2.size(), &d) != cl::kClOk || d.laid.size() != 1 || d.laid[0].pieces.size() != 1 || d.laid[0].pieces[0].inside != cl::kClInsideUnknown
+            || d.laid[0].pieces[0].x != 1.0f)
+            Fail("t1429 f1753: a format 2 record is read, its piece's inside 'not known' (2)");
+        std::vector<char> again;
+        if (!cl::EncodeCampLaidRec(&again, d) || again[4] != 3 || again.size() != f2.size() + 1) Fail("t1429 f1753: a format 2 record read is written again as format 3 with one byte a piece");
+        std::vector<char> f4 = f2; f4[4] = 4;
+        if (cl::DecodeCampLaidRec(&f4[0], f4.size(), &d) != cl::kClBadFormat) Fail("t1429 f1753: format 4 is refused");
+    }
+    {   /* the world server's judge reads a format 3 write with its inside bytes */
+        std::vector<char> w; cl::EncodeCampLaidRec(&w, m);
+        cl::CampLaidRec out;
+        if (w.empty() || cl::CampLaidJudgeWrite("camplaid.20.32", &w[0], w.size(), 1, 1, 0, 0u, 0, &out) != coopbrec::kBrAccept || out.laid.size() != 1 || out.laid[0].pieces[1].inside != 1)
+            Fail("t1429 f1753: the world server's judge takes a format 3 write and reads its inside bytes");
+    }
+    {   /* review fold: the world server's merge compares the inside byte - a write that differs only there is 'grown' (its stored entry stands) */
+        std::vector<char> w; cl::EncodeCampLaidRec(&w, m);
+        cl::CampLaidRec out; int grown = -1;
+        if (cl::CampLaidTakeWrite("camplaid.20.32", &w[0], w.size(), 1, 1, 1, &m, 3u, 0, &out, &grown) != coopbrec::kBrAccept || grown != 0)
+            Fail("t1429 f1753 merge: the same record written again (inside bytes equal) is not grown");
+        cl::CampLaidRec m2 = m; m2.laid[0].pieces[0].inside = 1; std::vector<char> w2; cl::EncodeCampLaidRec(&w2, m2);
+        grown = -1;
+        if (cl::CampLaidTakeWrite("camplaid.20.32", &w2[0], w2.size(), 1, 1, 1, &m, 3u, 0, &out, &grown) != coopbrec::kBrAccept || grown != 1
+            || out.laid.size() != 1 || out.laid[0].pieces[0].inside != 0)
+            Fail("t1429 f1753 merge: a write differing only in an inside byte is grown, and the stored entry's inside byte stands (a key keeps its pieces)");
+    }
+    {   /* review fold: a STORED format-2 record merged with a format-3 write - the old entry keeps its 'not known' pieces, the new key carries its bytes, the result writes as format 3 */
+        std::vector<char> f2;
+        coopbrec::BrPutU32(&f2, cl::kClMarker); coopbrec::BrPutU32(&f2, 2u); coopbrec::BrPutU32(&f2, 3u); coopbrec::BrPutU32(&f2, 1u);
+        coopbrec::BrPutU32(&f2, 20u); coopbrec::BrPutU32(&f2, 32u); coopbrec::BrPutU32(&f2, 1u);
+        coopbrec::BrPutStr(&f2, e.key); coopbrec::BrPutU32(&f2, 1u); coopbrec::BrPutStr(&f2, "16845-bed.base");
+        const float v[7] = { 1.0f, 2.0f, 3.0f, 1.0f, 0.0f, 0.0f, 0.0f };
+        for (int i = 0; i < 7; ++i) { unsigned int u = 0; std::memcpy(&u, &v[i], 4); coopbrec::BrPutU32(&f2, u); }
+        cl::CampLaidRec stored;
+        if (cl::DecodeCampLaidRec(&f2[0], f2.size(), &stored) != cl::kClOk) { Fail("t1429 f1753 merge: the stored format 2 record reads"); }
+        else
+        {
+            cl::CampLaidRec w3 = m;   /* format 3: the same key (pieces with bytes 0 1 2) and a new key with an inside piece */
+            cl::CampLaidEntry e2; e2.key = "t@20,32@1,2,3|16842|5904-shack@20,32@9,9,9";
+            cl::CampPiece pn; pn.sid = "16846-chair.base"; pn.x = 5.0f; pn.y = 2.0f; pn.z = 3.0f; pn.inside = 1; e2.pieces.push_back(pn);
+            w3.laid.push_back(e2);
+            std::vector<char> wb; cl::EncodeCampLaidRec(&wb, w3);
+            cl::CampLaidRec out; int grown = -1;
+            const int why = cl::CampLaidTakeWrite("camplaid.20.32", &wb[0], wb.size(), 1, 1, 1, &stored, 3u, 0, &out, &grown);
+            int oldAt = -1, newAt = -1;
+            for (size_t i = 0; i < out.laid.size(); ++i) { if (out.laid[i].key == e.key) oldAt = (int)i; if (out.laid[i].key == e2.key) newAt = (int)i; }
+            if (why != coopbrec::kBrAccept || grown != 1 || out.laid.size() != 2 || oldAt < 0 || newAt < 0 || out.laid[oldAt].pieces.size() != 1
+                || out.laid[oldAt].pieces[0].inside != cl::kClInsideUnknown || out.laid[newAt].pieces.size() != 1 || out.laid[newAt].pieces[0].inside != cl::kClInsideNest)
+                Fail("t1429 f1753 merge: a stored format 2 record merged with a format 3 write - the old key keeps 'not known', the new key carries its inside byte");
+            std::vector<char> ob; cl::CampLaidRec back;
+            if (!cl::EncodeCampLaidRec(&ob, out) || ob[4] != 3 || cl::DecodeCampLaidRec(&ob[0], ob.size(), &back) != cl::kClOk || back.laid.size() != 2)
+                Fail("t1429 f1753 merge: the merged record writes and reads back as format 3");
+        }
+    }
+    /* the fact on the camp's game: top level -> outdoors; inside the nest -> 1; inside another building -> 2, a mismatch; a parent that does not read -> 2 */
+    int mm = -1;
+    if (cl::CampPieceInsideFact(1, 0, &mm) != 0 || mm != 0) Fail("t1429 f1753: a top-level piece is outdoors (0)");
+    if (cl::CampPieceInsideFact(0, 1, &mm) != 1 || mm != 0) Fail("t1429 f1753: a piece whose parent is the nest is inside (1)");
+    if (cl::CampPieceInsideFact(0, 0, &mm) != 2 || mm != 1) Fail("t1429 f1753: a piece inside another building is not known (2), a mismatch - never guessed");
+    if (cl::CampPieceInsideFact(-1, 0, &mm) != 2 || mm != 0) Fail("t1429 f1753: a parent that does not read is not known (2)");
+    /* CampPieceMake's three branches and the wait (the apply's road) */
+    if (cl::CampPieceMakeRoad(0, 0, 0) != cl::kMakeOutdoors || cl::CampPieceMakeRoad(0, 1, 1) != cl::kMakeOutdoors) Fail("t1429 f1753: a piece made outdoors on the camp's game is made outdoors, nest or not");
+    if (cl::CampPieceMakeRoad(1, 1, 0) != cl::kMakeInNest || cl::CampPieceMakeRoad(1, 1, 1) != cl::kMakeInNest) Fail("t1429 f1753: a piece made inside the nest is made inside it when the nest stands here");
+    if (cl::CampPieceMakeRoad(1, 0, 0) != cl::kMakeWaitNest) Fail("t1429 f1753: a piece made inside the nest WAITS while the nest is not here (never outdoors)");
+    if (cl::CampPieceMakeRoad(1, 0, 1) != cl::kMakeNestGone) Fail("t1429 f1753: a piece made inside a GONE nest takes the gone road (not made)");
+    if (cl::CampPieceMakeRoad(2, 0, 0) != cl::kMakeOldGuess || cl::CampPieceMakeRoad(2, 1, 0) != cl::kMakeOldGuess) Fail("t1429 f1753: an old record's piece takes the point lookup");
+    /* review / re-check fold (MEDIUM): THE ONE 'NEST GONE' RULE - gone only when the nest's square is LOADED here, read this load, and the
+       town ran a camp step AFTER that read (its step number above the one stamped at the read), and the nest is not found. No input carries
+       what this game saw earlier (the wiring check below: no 'seen' map in camp.cpp) */
+    if (cl::CampNestGone(0, 0, 1, 9, 5) != 0) Fail("t1429 f1753 gone: the square read but not loaded (buildings not placed) -> wait");
+    if (cl::CampNestGone(0, 1, 1, 5, 5) != 0 || cl::CampNestGone(0, 1, 1, 4, 5) != 0 || cl::CampNestGone(0, 1, 1, 0, 0) != 0) Fail("t1429 f1753 gone: loaded, no town step since the read -> wait");
+    if (cl::CampNestGone(0, 1, 0, 9, 5) != 0) Fail("t1429 f1753 gone: the read not of this load -> wait");
+    if (cl::CampNestGone(0, 1, 1, 6, 5) != 1 || cl::CampNestGone(0, 1, 1, 1, 0) != 1) Fail("t1429 f1753 gone: loaded + read this load + a later town step + no nest -> gone");
+    if (cl::CampNestGone(1, 1, 1, 9, 5) != 0) Fail("t1429 f1753 gone: a nest standing here is never gone");
+    {
+        int nx = -1, ny = -1;
+        if (!cl::CampNestSquareOfKey("5904-shack@20,32@4,5,6", &nx, &ny) || nx != 20 || ny != 32) Fail("t1429 f1753 gone: the nest's square follows from its position key");
+        if (cl::CampNestSquareOfKey("", &nx, &ny) || cl::CampNestSquareOfKey("centre", &nx, &ny) || cl::CampNestSquareOfKey("x@70,3@1,2,3", &nx, &ny)) Fail("t1429 f1753 gone: no square from an empty / non-position / out-of-range key");
+    }
+    {   /* one entry: an outdoor piece, two inside pieces, an old-record piece, and one piece in another square */
+        cl::CampLaidEntry g; g.key = e.key;
+        const int ins[4] = { 0, 1, 1, 2 };
+        for (int i = 0; i < 4; ++i) { cl::CampPiece pc; pc.sid = "16845-bed.base"; pc.x = 1.0f + i; pc.y = 2.0f; pc.z = 3.0f; pc.inside = ins[i]; g.pieces.push_back(pc); }
+        cl::CampPiece far; far.sid = "16845-bed.base"; far.x = 100000.0f; far.y = 0.0f; far.z = 100000.0f; far.inside = 1; g.pieces.push_back(far);
+        const int sq = cl::CampPieceSquare(g.pieces[0]);
+        cl::CampNestPlan p;
+        if (cl::CampEntryNestPlan(g, sq, 0, 0, &p) != 0 || p.wait != 2) Fail("t1429 f1753 plan: nest not here, not gone -> the whole entry waits (only this square's pieces counted)");
+        if (cl::CampEntryNestPlan(g, sq, 1, 0, &p) != 1 || p.outdoors != 1 || p.inNest != 2 || p.dropped != 0 || p.oldGuess != 1) Fail("t1429 f1753 plan: nest here -> inside pieces made in it");
+        /* a gone nest (the one rule; whether it was seen before is no input - the wiring check guards that camp.cpp keeps no 'seen' record) */
+        cl::CampNestPlan gp;
+        if (cl::CampEntryNestPlan(g, sq, 0, cl::CampNestGone(0, 1, 1, 6, 5), &gp) != 1) Fail("t1429 f1753 plan: a gone nest's entry applies (counts settled)");
+        if (gp.outdoors != 1 || gp.dropped != 2 || gp.inNest != 0 || gp.wait != 0 || gp.oldGuess != 1)
+            Fail("t1429 f1753 plan: a gone nest - outdoor pieces made, inside pieces NOT made, the old-record piece by the point lookup");
+        if (cl::CampEntryNestPlan(g, sq, 0, cl::CampNestGone(0, 0, 1, 6, 5), &gp) != 0 || gp.wait != 2) Fail("t1429 f1753 plan: the nest's square not loaded yet -> the entry waits");
+    }
+    /* review fold LOW 1: a nest that did not read (why 5) keeps the key out of the note - the next event tries again */
+    if (cl::CampEntryNoteAfterMake(0) != 1 || cl::CampEntryNoteAfterMake(1) != 0 || cl::CampEntryNoteAfterMake(3) != 0) Fail("t1429 f1753 unread: the key is noted only when no nest read failed");
+    /* wiring: the read on the camp's game, the apply, the make, the event-only retries */
+    const std::string cp = T313ReadFile("../coop-plugin/camp.cpp"), bd = T313ReadFile("../coop-plugin/build.cpp"), it = T313ReadFile("../coop-plugin/items.cpp");
+    if (cp.empty() || bd.empty() || it.empty()) { Fail("t1429 f1753 wiring: a source file not read"); return; }
+    if (cp.find("pc->inside = camplaid::CampPieceInsideFact(top, (parent != 0 && parent == nest) ? 1 : 0, &mismatch);") == std::string::npos
+        || cp.find("void* parent = top == 0 ? coop::LayoutOuterBuilding(b) : 0;") == std::string::npos
+        || cp.find("if (CpPieceReadPod(*q, &pc, nest, countIt)) made->push_back(pc); else ++*unread;") == std::string::npos
+        || cp.find("CpMadeSince(at, before, &made, 0, &unread, nest, 1);") == std::string::npos || cp.find("CpMadeSince(at, before, &made, &objs, &unread, nest, 0);") == std::string::npos
+        || cp.find("if (countIt == 0) return camplaid::CampPieceValid(*pc) ? 1 : 0;") == std::string::npos
+        || cp.find("CpLaidAfter(clAt, keepBefore, clKey, clZone, clId, clSingle, clLink, (void*)(uintptr_t)hand)") == std::string::npos
+        || cp.find("CpLaidAfter(s.pt, before, s.key, zone, s.id, single, link, (void*)(uintptr_t)s.hand)") == std::string::npos)
+        Fail("t1429 f1753 wiring: the camp's game reads each piece's inside fact against the step's own nest building");
+    if (cp.find("if (!camplaid::CampEntryNestPlan(e, sq, nest != 0 ? 1 : 0, nestGone, &plan))") == std::string::npos
+        || cp.find("? CiNestGoneNow(bk, camplaid::CampLaidKeyTown(e.key)) : 0;") == std::string::npos
+        || cp.find("const int loaded = coop::ZoneLoadedSectorTri(x, y) == 1 ? 1 : 0;") == std::string::npos
+        || cp.find("g_cnReadStepSeq[zoneId] = (long)g_ciStepSeq;") == std::string::npos
+        || cp.find("if (nestUnread == 0) ++g_clApplyEntries;") == std::string::npos || cp.find("if (nestUnread == 0) ++g_csNoted;") == std::string::npos
+        || cp.find("if (road == camplaid::kMakeNestGone) { ++gone; continue; }") == std::string::npos
+        || cp.find("if (g_cpKeepOn != 0 && clKeyOk) CiTownStep(camplaid::CampLaidKeyTown(clKey));") == std::string::npos
+        || cp.find("g_ciNestSeen") != std::string::npos || cp.find("CiNestSeen") != std::string::npos
+        || cp.find("coop::CampPieceMake(pc.sid, pos, rot, it.town, nest, fact, &why, &in)") == std::string::npos
+        || cp.find("if (why == 5) ++nestUnread; }") == std::string::npos
+        || cp.find("if (!camplaid::CampEntryNoteAfterMake(nestUnread))") == std::string::npos || cp.find("        else CnNoteAdd(zone, e.key);") == std::string::npos
+        || cp.find("if (nestWaiting > 0 || unreadWaiting > 0) { g_clWaitNest.insert(id); *settledHere = 0; }") == std::string::npos
+        || cp.find("if ((wl > 5 && w->compare(wl - 5, 5, \"|nest\") == 0) || (wl > 7 && w->compare(wl - 7, 7, \"|unread\") == 0)) ++endedNest; else ++ended;") == std::string::npos
+        || cp.find("if (!rs.empty() && !g_clWaitNest.empty())") == std::string::npos
+        || cp.find("if (!g_clWaitNest.empty()) { g_clApplyDue.insert(g_clWaitNest.begin(), g_clWaitNest.end()); g_clWaitNest.clear(); }") == std::string::npos
+        || cp.find("if (sqApplied && !g_clWaitNest.empty())") == std::string::npos || cp.find(" campF1753[") == std::string::npos)
+        Fail("t1429 f1753 wiring: the apply waits for the nest (whole entry), the one gone rule (square read + town step), gone inside pieces not made, a nest read failure keeps the key out of the note, retried at a camp step, an area read or a settled square only");
+    if (bd.find("if (nest == 0 || !CampNestInsidePod(nest, &ny, &v330)) { ++g_cpNestUnread; *why = 5; return 0; }") == std::string::npos
+        || bd.find("    else if (fact != 0)") == std::string::npos)
+        Fail("t1429 f1753 wiring: CampPieceMake makes fact 1 inside its nest without a lookup, fact 2 by the old lookup");
+    if (it.find("void* LayoutOuterBuilding(void* piece)") == std::string::npos) Fail("t1429 f1753 wiring: items.cpp names a piece's outer building");
+}
+/* ---- T-1455 (F1733 / F1734, design (b)): a piece's town change on its owner's game owes the own-piece check ---- */
+void t_t1455_town_carry()
+{
+    using namespace baseshow;
+    /* the mod's own move (BdBuildingSetTownPod's moved branch): an own piece whose stored words changed */
+    if (TownCarryDue(1, 1, 1) != 1) Fail("t1455: an own piece moved to another town owes no check");
+    if (TownCarryDue(1, 0, 1) != 0) Fail("t1455: a piece kept in the same town owes a check");
+    if (TownCarryDue(1, 1, 0) != 0) Fail("t1455: a copy (another player's piece) moved here owes a check");
+    if (TownCarryDue(0, 1, 1) != 0 || TownCarryDue(-1, 1, 1) != 0) Fail("t1455: a copy that faulted or stands inside a building owes a check");
+    /* review L3: the five stored words decide 'moved' (a dead link relinked to the town its lookup already answered is a move) */
+    const int deadLink[5] = { 13, 333, 99, 0, 0 }, nearest[5] = { 13, 511, 7, 0, 0 }, same[5] = { 13, 511, 7, 0, 0 };
+    if (TownCarryWordsChanged(deadLink, nearest) != 1) Fail("t1455 L3: a dead-link piece relinked to its lookup's nearest town is not a move");
+    if (TownCarryWordsChanged(nearest, same) != 0) Fail("t1455: a piece left in its town is a move");
+    for (int i = 0; i < 5; ++i)
+    {
+        int w[5] = { 13, 511, 7, 0, 0 };
+        w[i] += 1;
+        if (TownCarryWordsChanged(nearest, w) != 1) Fail("t1455: a change in one of the five words is not a move");
+    }
+    /* review L1: the hook's queue is area cells - each at most once, nothing dropped however many pieces move */
+    std::vector<unsigned char> cells((size_t)kCarryCells, 0);
+    int any = 0;
+    if (CarryCellMark(&cells[0], &any, 16, 33) != kCarryQueued || any != 1 || cells[(size_t)(16 * kOwnTownGrid + 33)] != 1) Fail("t1455 L1: a moved piece's area is not queued");
+    for (int n = 0; n < 1000; ++n) if (CarryCellMark(&cells[0], &any, 16, 33) != kCarryAlready) Fail("t1455 L1: the same area queued twice");
+    int queued = 1;
+    for (int x = 0; x < kOwnTownGrid; ++x)
+        for (int y = 0; y < kOwnTownGrid; ++y)
+            if (CarryCellMark(&cells[0], &any, x, y) == kCarryQueued) ++queued;
+    if (queued != kCarryCells) Fail("t1455 L1: an area of the grid could not be queued (a cap)");
+    if (CarryCellMark(&cells[0], &any, -1, 3) != kCarryOffGrid || CarryCellMark(&cells[0], &any, 3, kOwnTownGrid) != kCarryOffGrid) Fail("t1455 L1: an area off the grid is queued");
+    /* review L2: a world change clears it */
+    CarryCellsClear(&cells[0], &any);
+    if (any != 0) Fail("t1455 L2: the world clear leaves the queue marked");
+    for (size_t c = 0; c < cells.size(); ++c) if (cells[c] != 0) { Fail("t1455 L2: the world clear leaves an area queued"); break; }
+    if (CarryCellMark(&cells[0], &any, 16, 33) != kCarryQueued) Fail("t1455 L2: an area is not queued again after the clear");
+    /* a queued check is the own-piece check's owed areas: owed once, never lost by a second event */
+    OwnCheck g(kOwnTownGrid * kOwnTownGrid);
+    if (OwnCheckTownAt(&g, 16, 33) != 9 || OwnCheckTownAt(&g, 16, 33) != 9) Fail("t1455: the moved piece's areas are not owed");
+    if (OwnCheckAreasDue(&g, 1) != 1 || g.owed[(size_t)(16 * kOwnTownGrid + 33)] == 0) Fail("t1455: the owed areas are not checked");
+    /* the engine glue (source checks - engine code) */
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1455: build.cpp not read"); return; }
+    const char* need[] = {
+        "const int wbOk = BdBuildingTownHandPod(b, wordsBefore);",
+        "const int wordsChanged = waOk != 0 ? baseshow::TownCarryWordsChanged(wordsBefore, wordsAfter) : 0;",   /* T-1397 review fold 2: computed once, shared with the moved-in wake */
+        "TlOwnCarrySet(b, townBefore, t, r, wordsChanged);",
+        "if (baseshow::TownCarryDue(setResult, wordsChanged, recOwn) == 0) { ++g_tcCopySkip; return; }",
+        "if (TlOwnTownArea(sx, sy, \"a piece moved to another town\", 0) == 0) { ++g_tcOffGrid; return; }",
+        "static AddrReg kBdBuildingSetTownRva_reg(\"BuildingSetTown\", &kBdBuildingSetTownRva);",
+        "orig_buildingSetTown(b, t);",
+        "const int r = baseshow::CarryCellMark(g_tcCells, &g_tcAny, sx, sy);",
+        "if (key[0] == 0 || BoxKeySector(key, &sx, &sy) == 0) { ::InterlockedIncrement64(&g_tcHookNoArea); return; }",
+        "if (r == baseshow::kCarryOffGrid) { ::InterlockedIncrement64(&g_tcHookNoArea); return; }",
+        "::InterlockedCompareExchange(&g_tcPending, 0, 0) == 0) return;",
+        "if ((plan & baseshow::kTickOwnCheck) != 0) TlOwnCarryDrain();",
+        "TlOwnCarryForgetWorld();                    /* T-1455 review L2",
+        "BdInstallTownCarry(base);",
+        "[TOWNCARRY] %.90s: key=%.63s from '%.60s' to '%.60s'" };
+    for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); ++i)
+        if (s.find(need[i]) == std::string::npos) Fail(std::string("t1455 wiring: build.cpp lacks ") + need[i]);
+    const size_t drain = s.find("TlOwnCarryDrain();   /* T-1455");
+    const size_t check = s.find("if ((plan & baseshow::kTickOwnCheck) != 0) TlOwnCheckTick(KeptMySlot());");
+    if (drain == std::string::npos || check == std::string::npos || drain > check) Fail("t1455 wiring: the hook's queue is not drained before the own-piece check runs");
+    const std::string t65 = T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt");
+    if (t65.find("BuildingSetTown                                code 00926190 00926190 48895C24084889742410574883EC2048") == std::string::npos) Fail("t1455: the 1.0.65 table lacks BuildingSetTown at 0x926190");
+    const std::string t68 = T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt");
+    if (t68.find("BuildingSetTown                                code 00927060 00927060 48895C24084889742410574883EC2048") == std::string::npos) Fail("t1455: the 1.0.68 table lacks BuildingSetTown at 0x927060");
+}
+/* T-1462 (owner decisions 1838 / 1839): the Level Editor key in a multiplayer world - the real editor still closed, then the mod's own
+   window (or the T-1414 message when it cannot be built); the rebuild_navmesh key action refused only in a multiplayer world and only
+   from the key step; single player untouched; the 'Regenerate sector' press's outcome on T-1428's acts; the approved words; the wiring. */
+void t_t1462_editor_tool()
+{
+    using namespace coopprof;
+    /* the real editor never stays open in a multiplayer world (F1770); single player is left to the engine */
+    if (EditorOpenDecide(true, true, false) != kEditorOpenClose) Fail("t1462: a multiplayer show of the real editor is still closed");
+    if (EditorOpenDecide(false, true, false) != kEditorOpenLeave) Fail("t1462: single player: the real editor opens as before");
+    if (EditorOpenDecide(HandSaveBlockedDecide(0, false), true, false) != kEditorOpenLeave) Fail("t1462: title down in single player: the real editor opens");
+    struct ARow { bool closed, up; int want; const char* what; };
+    static const ARow a[] = {
+        { true,  true,  kEditorAfterWindow,  "closed, window built: the window (no message)" },
+        { true,  false, kEditorAfterMessage, "closed, window not built: the T-1414 message" },
+        { false, true,  kEditorAfterNothing, "not closed: nothing over the real editor" },
+        { false, false, kEditorAfterNothing, "not closed, no window: nothing" } };
+    for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); ++i)
+        if (EditorAfterCloseDecide(a[i].closed, a[i].up) != a[i].want) Fail(std::string("t1462 after close: ") + a[i].what);
+    struct NRow { bool mp, key; int want; const char* what; };
+    static const NRow n[] = {
+        { true,  true,  kNavKeyRefuse, "multiplayer, from processKeys: refused" },
+        { true,  false, kNavKeyRun,    "multiplayer, the mod's own rebuild (T-1428 / the window): runs" },
+        { false, true,  kNavKeyRun,    "single player, from processKeys: runs (untouched)" },
+        { false, false, kNavKeyRun,    "single player, any other caller: runs" } };
+    for (size_t i = 0; i < sizeof(n) / sizeof(n[0]); ++i)
+        if (NavKeyDecide(n[i].mp, n[i].key) != n[i].want) Fail(std::string("t1462 rebuild_navmesh: ") + n[i].what);
+    if (NavKeyDecide(HandSaveBlockedDecide(0, true), true) != kNavKeyRefuse) Fail("t1462 rebuild_navmesh: fed by HandSaveBlockedDecide - multiplayer world refused");
+    if (NavKeyDecide(HandSaveBlockedDecide(0, false), true) != kNavKeyRun || NavKeyDecide(HandSaveBlockedDecide(1, true), true) != kNavKeyRun
+        || NavKeyDecide(HandSaveBlockedDecide(-1, true), true) != kNavKeyRun)
+        Fail("t1462 rebuild_navmesh: single player, title up or unreadable: runs");
+    /* the press's outcome on T-1428's acts */
+    struct PRow { int act, callOk; unsigned int ms; int want; const char* what; };
+    static const PRow p[] = {
+        { coopbuild::kZrbDoAsk,        1, 0,     coopbuild::kRegenDone,   "asked and returned: done" },
+        { coopbuild::kZrbDoAsk,        0, 0,     coopbuild::kRegenGaveUp, "asked and faulted: given up" },
+        { coopbuild::kZrbDoneQueued,   0, 0,     coopbuild::kRegenDone,   "the engine's queued Full covers it: done" },
+        { coopbuild::kZrbAgainRunning, 0, 0,     coopbuild::kRegenWait,   "the engine's job running: waits" },
+        { coopbuild::kZrbAgainQueued,  0, 29999, coopbuild::kRegenWait,   "a queued non-Full: waits up to the cap" },
+        { coopbuild::kZrbAgainRunning, 0, 30000, coopbuild::kRegenGaveUp, "still busy at the cap: given up" },
+        { coopbuild::kZrbNoArea,       0, 0,     coopbuild::kRegenGaveUp, "area not loaded: given up" },
+        { coopbuild::kZrbNoRows,       0, 0,     coopbuild::kRegenGaveUp, "no rows: given up" } };
+    for (size_t i = 0; i < sizeof(p) / sizeof(p[0]); ++i)
+        if (coopbuild::BuildRegenPressOutcome(p[i].act, p[i].callOk, p[i].ms) != p[i].want) Fail(std::string("t1462 regen press: ") + p[i].what);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    if (coopbuild::BuildRegenViewOk(-20000.0f, 75000.0f) != 1 || coopbuild::BuildRegenViewOk(2.0e7f, 0.0f) != 0 || coopbuild::BuildRegenViewOk(0.0f, -2.0e7f) != 0
+        || coopbuild::BuildRegenViewOk(nan, 0.0f) != 0 || coopbuild::BuildRegenViewOk(0.0f, nan) != 0)
+        Fail("t1462 regen press: the camera point's world-position test");
+    /* the approved words (decision 1838), exactly */
+    if (std::string(kEditorToolTitle) != "Level Editor" || std::string(kEditorToolText) != "In a multiplayer world only this tool is available."
+        || std::string(kEditorToolRegenCaption) != "Regenerate sector" || std::string(kEditorToolRegenHover) != "Rebuild the walking paths for the area in view, on your game only."
+        || std::string(kEditorToolCloseCaption) != "Close" || std::string(kEditorToolDoneText) != "Walking paths rebuilt for this area.")
+        Fail("t1462: the window's words are not the approved text");
+    if (std::string(kEditorOffText) != "The Level Editor is turned off in a multiplayer world.") Fail("t1462: the T-1414 fallback message changed");
+    const coopui::UiDriveName* er = coopui::UiDriveFind("edregen", coopui::kDriveButton);
+    const coopui::UiDriveName* ec = coopui::UiDriveFind("edclose", coopui::kDriveButton);
+    if (er == 0 || ec == 0 || std::string(er->w1) != "SWLevelEditorRegen" || std::string(ec->w1) != "SWLevelEditorClose") Fail("t1462: the uiclick rows edregen / edclose");
+    /* wiring */
+    const std::string st = T23NoCr(T313ReadFile("../coop-plugin/store.cpp"));
+    const std::string ui = T23NoCr(T313ReadFile("../coop-plugin/ui.cpp"));
+    const std::string bd = T23NoCr(T313ReadFile("../coop-plugin/build.cpp"));
+    const std::string t65 = T23NoCr(T313ReadFile("../coop-plugin/addresses/65D604D7-0232C000-B914BEE3-02303600.txt"));
+    const std::string t68 = T23NoCr(T313ReadFile("../coop-plugin/addresses/6602D59D-0232D000-BBA641C8-02304800.txt"));
+    const std::string dec = "if (coopprof::NavKeyDecide(mp, byAddr != 0 || asKey != 0) == coopprof::kNavKeyRefuse)";
+    if (st.find("const int byAddr = NavFromKeyStep(_ReturnAddress()), asKey = NavAskedAsKey();") == std::string::npos || st.find("const bool mp = HandSaveBlocked();") == std::string::npos
+        || st.find("static int NavFromKeyStep(void* ret)\n{\n    if (kProcessKeysRva == 0") == std::string::npos)
+        Fail("t1462 wiring: the return-address check runs on every call (the lever only adds 'asked as the key')");
+    /* review folds (2) / (3): pieces T-1428 still waits for hold the press; the message waits for the area's jobs to finish */
+    if (coopbuild::BuildRegenPiecesWait(0, 0, 0) != 0 || coopbuild::BuildRegenPiecesWait(1, 0, 0) != 1 || coopbuild::BuildRegenPiecesWait(0, 2, 0) != 1 || coopbuild::BuildRegenPiecesWait(0, 0, 1) != 1)
+        Fail("t1462 regen press: waits while T-1428 waits for pieces of the area");
+    if (coopbuild::BuildRegenJobsFinished(0, 0) != 1 || coopbuild::BuildRegenJobsFinished(1, 0) != 0 || coopbuild::BuildRegenJobsFinished(0, 1) != 0 || coopbuild::BuildRegenJobsFinished(1, 3) != 0)
+        Fail("t1462 regen press: finished only with no job of the area running or queued");
+    const size_t d1 = st.find(dec), d2 = (d1 == std::string::npos) ? d1 : st.find(dec, d1 + 1);
+    if (d1 == std::string::npos || d2 == std::string::npos || st.find("int detour_navFix(void* editor)") == std::string::npos || st.find("void detour_navRb(void* nav, void* zoneMap)") == std::string::npos)
+        Fail("t1462 wiring: both rebuild_navmesh detours ask NavKeyDecide with HandSaveBlocked and their own return address");
+    if (st.find("(void*)&detour_navFix, (void**)&orig_navFix") == std::string::npos || st.find("(void*)&detour_navRb, (void**)&orig_navRb") == std::string::npos
+        || st.find("r >= b + (uintptr_t)kProcessKeysRva && r < b + (uintptr_t)kProcessKeysEndRva") == std::string::npos)
+        Fail("t1462 wiring: the two hooks and the processKeys window");
+    const size_t ob = st.find("void EditorOffTickBody()"), oc = st.find("const int r = coop::BdEditorClosePod(ed, &why);", ob == std::string::npos ? 0 : ob);
+    const size_t ow = (oc == std::string::npos) ? oc : st.find("win = coop::UiEditorToolShow();", oc);
+    const size_t om = (ow == std::string::npos) ? ow : st.find("else shown = ShowHandRefusedLine(coopprof::kEditorOffText);", ow);
+    if (ob == std::string::npos || oc == std::string::npos || ow == std::string::npos || om == std::string::npos || st.find("if (r == 1)", oc) > ow)
+        Fail("t1462 wiring: the window opens only after the real editor's close, the T-1414 message only when it is not built");
+    if (ui.find("win->setCaption(MyGUI::UString(coopprof::kEditorToolTitle));") == std::string::npos || ui.find("le->setCaption(MyGUI::UString(text.c_str()));") == std::string::npos
+        || ui.find("const std::string text(coopprof::kEditorToolText);") == std::string::npos
+        || ui.find("rb->setCaption(MyGUI::UString(coopprof::kEditorToolRegenCaption));") == std::string::npos
+        || ui.find("bb->setCaption(MyGUI::UString(coopprof::kEditorToolCloseCaption));") == std::string::npos
+        || ui.find("UiHoverTipFill(gui, tip, W, kEtTipTextName, coopprof::kEditorToolRegenHover)") == std::string::npos
+        || ui.find("    BdRegenSectorPress();\n") == std::string::npos || ui.find("    UiEditorToolForget();   /* T-1462") == std::string::npos)
+        Fail("t1462 wiring: the window's words, its press and its teardown");
+    size_t calls = 0;
+    for (size_t at = bd.find("BdZoneRbCallPod(base + (uintptr_t)kBdZoneRbRva, nav, zmap)"); at != std::string::npos; at = bd.find("BdZoneRbCallPod(base + (uintptr_t)kBdZoneRbRva, nav, zmap)", at + 1)) ++calls;
+    const size_t rp = bd.find("void BdRegenSectorTick()");
+    if (calls < 2 || rp == std::string::npos || bd.find("coopbuild::BuildZoneRebuildAct(rowsOk, area, skipRun, skipQ, qFull)", rp) == std::string::npos
+        || bd.find("BdZoneRbReadPod(nav, zmap, &area, &curType, &qType, &skipRun, &skipQ, &qFull)", rp) == std::string::npos
+        || bd.find("StoreShowMessageLine(coopprof::kEditorToolDoneText)", rp) == std::string::npos
+        || bd.find("const Sector s = SectorOf(x, z);", rp) == std::string::npos || bd.find("kBdViewPointRva_reg(\"PlayerInterfaceViewPoint\"") == std::string::npos)
+        Fail("t1462 wiring: the press rebuilds the camera point's area on T-1428's road and shows the approved message");
+    if (t65.find("LevelEditorFixStuff                            code 00771C70 00771C70 488BC4554154415541564157488D6C24") == std::string::npos
+        || t68.find("LevelEditorFixStuff                            code 007727B0 007727B0 488BC4554154415541564157488D6C24") == std::string::npos)
+        Fail("t1462 wiring: LevelEditorFixStuff on both builds (0x771C70 / 0x7727B0)");
+    if (t65.find("488BC4554154415541564157488D6C24 optional:navkey-block") == std::string::npos || t68.find("007727B0 007727B0 488BC4554154415541564157488D6C24 optional:navkey-block") == std::string::npos)
+        Fail("t1462 wiring: LevelEditorFixStuff is optional (T-1453: a mismatch turns off only this block)");
+    const size_t tk = bd.find("void BdRegenSectorTick()");
+    if (tk == std::string::npos || bd.find("BuildRegenPiecesWait(pz, pb, pd)", tk) == std::string::npos || bd.find("BuildRegenJobsFinished(running, queued) == 0) return;", tk) == std::string::npos
+        || bd.find("    BdRegenAreaEnd(0);         /* T-1462") == std::string::npos || bd.find("    if (n != 0) BdRegenAreaEnd(left);") == std::string::npos)
+        Fail("t1462 wiring: the press waits for pieces, the message for the finished job, and the press ends with its area / the world");
 }
 }   /* namespace suite */

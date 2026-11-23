@@ -38,6 +38,7 @@ unsigned int StandInRegistrations();          // MAIN THREAD: how many times a s
 const int kStandInTableCap = 32;              // T-356: the stand-in table's bound (one per player slot this world has seen)
 int  StandInList(int* slots, ::Faction** out, int cap);   // T-356, MAIN THREAD: every stand-in in the table (slot, faction), at most cap; the count
 bool LegacyPeerFactionExists();              // MAIN THREAD: the loaded world carries a protocol-67 "coop-peer" faction (asked by id)
+::Faction* LegacyPeerFaction();              // T-1391 A2 fold 1, MAIN THREAD: that faction (asked by id), 0 = none
 bool StandInExistsForSlot(int slot);          // MAIN THREAD: ... or a coop-p<slot> record the loaded world already carries
 int  MakeAreaWriterStandIn(int slot, std::string* detail);   // MAIN THREAD, engine writes allowed: a placeholder stand-in "Player <slot>" for a player not seen here yet; 1 made, 0 one exists, -1 not made (*detail why)
 ::Faction* OwnerFactionForSlot(int slot, bool makePlaceholder);   // MAIN THREAD: my number -> my player faction; another -> its stand-in; makePlaceholder: a save's coop-p<slot> enters the table, else a placeholder is made; 0 none
@@ -51,6 +52,7 @@ void NoteHeldForSlot();                        // stand1 fold (1d), ANY THREAD: 
 std::string PeerFactionDisplayName();   /* tags1, MAIN THREAD: the peer faction's name as this game shows it ("" when there is none) */
 void PlayerFactionWorldAnswer(int verdict, unsigned num, const std::string& asked, const std::string& name);   // T-368, MAIN THREAD: the world gave profile num's faction another name (coopprof::kFacBack / kFacMoved / kFacDefault / kFacKeep) - applied (and acknowledged) by PlayerFactionTick
 void PlayerFactionWorldAnswerForget();   // T-368, MAIN THREAD: a new pick or a leave drops an answer not applied yet
+void InstallLoadRaidStandInHook();   // T-1477 A1: the war manager's load is hooked - a running raid's missing stand-in target gets its placeholder before the game's lookup
 void InstallFactionNameHooks();   // T-368: the FACTION tab's name box refuses a name another profile of this world holds (Kenshi's own box)
 bool RenameMyFaction(const std::string& name);              // 'renamemyfaction <name>': Faction::setName + renameRecord on this game's player faction   // the 'peerfaction <name>' verb: create/rename it without a peer (T159)
 }

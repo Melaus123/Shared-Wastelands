@@ -1036,6 +1036,11 @@ bool AdminNow()
     return Linked() && adminwords::AdminBy(adminwords::StandingNow(g_stand, StoreLinkGen()));
 }
 
+bool AdminStandingKnown()   /* T-1399 fold (re-check M2): the world server's standing has arrived on this link (adminwords::StandingKnown) */
+{
+    return Linked() && adminwords::StandingKnown(g_stand, StoreLinkGen());
+}
+
 bool AdminLogoutHolds()
 {
     return adminwords::LogoutHolds(g_logoutHold, StoreWorldGenNow());

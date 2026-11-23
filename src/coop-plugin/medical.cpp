@@ -60,6 +60,8 @@
 static unsigned long long kMig3StartKnockoutTimer = 0; static coop::AddrReg kMig3StartKnockoutTimer_reg("MedicalSystem_beginKnockout", &kMig3StartKnockoutTimer);   /* Steam_1.0.65 0x643D40 */
 static unsigned long long kMig3Knockout = 0; static coop::AddrReg kMig3Knockout_reg("MedicalSystem_knockout", &kMig3Knockout);   /* Steam_1.0.65 0x643EF0 */
 static unsigned long long kMig3MedicalUpdate = 0; static coop::AddrReg kMig3MedicalUpdate_reg("MedicalSystem_healthTick", &kMig3MedicalUpdate);   /* Steam_1.0.65 0x651570 */
+static unsigned long long kT540SafeGetUp = 0; static coop::AddrReg kT540SafeGetUp_reg("Character_isItSafeToGetUp", &kT540SafeGetUp);   /* T-540 D1: Steam_1.0.65 0x5C99C0, 1.0.68 0x5CA450 (called only from 0x5CF620's get-up branch) */
+#include "../common/kohold.h"   /* T-540 D1: the copy's knockout hold and its 'safe to get up' answer - pure decisions */
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
 
 #define WIN32_LEAN_AND_MEAN
@@ -69,6 +71,7 @@ static unsigned long long kMig3MedicalUpdate = 0; static coop::AddrReg kMig3Medi
 #include <locale>
 #include <map>   // T-303: the SPAWN deaths still to land
 #include <stdio.h>   /* _snprintf: the [HEAL] playerorder line */
+#include <string.h>   /* T-540 fold 1 R2: memcpy - a float clock's bits for the compare-exchange */
 #include <set>   // the copies pinned
 #include "playerfaction.h"   /* re-check par6 #1: IsPlayerFaction - an unequip kill only happens to a non-player character */
 
@@ -328,8 +331,11 @@ const float* HungerOfOwned(unsigned int uid, float* hg)
     return hg;
 }
 
+void KoHoldBeforeTick(unsigned int uid, MedicalSystem* self, float frameTime);   // T-540 D1: below, with the owner's knocked-out word
+
 // The detour. MEASURES AND PASSES THROUGH - it must not change a single value, or the
 // drift rate this run exists to measure would be the drift rate of our own interference.
+// (Since then it holds a copy's hunger (par5) and, T-540 D1, keeps a copy's knockout running while its owner says knocked out.)
 void detour_medicalUpdate(MedicalSystem* self, float frameTime)
 {
     InterlockedIncrement64(&g_medCalls);
@@ -380,6 +386,9 @@ void detour_medicalUpdate(MedicalSystem* self, float frameTime)
                 InterlockedIncrement64(&g_medGated);
                 return;      // the authority's STATE is the only thing that moves this character
             }
+            // T-540 D1 (F1882 / F1883): the engine's tick below counts the wake clock down and, at 0, the copy wakes on its own -
+            // before its owner. While the owner's word says knocked out, the clock is raised first so this tick leaves it above 0.
+            KoHoldBeforeTick(uid, self, frameTime);
         }
     }
 
@@ -417,13 +426,49 @@ KnockoutFn     orig_knockout           = 0;
 // answer, since the owner's real knockout arrives by STATE anyway.
 const int kOwnerKoSlots = 4096;   // a power of two
 const int kOwnerKoProbe = 64;     // as the hunger table: a lookup gives up after this many slots
+// T-540 D1: the same slot carries the owner's latest STATE prone (read by the 'safe to get up' detour off the main thread - the
+// get-up watch's own copy, g_getup in spawn.cpp, is a main-thread map) and whether the knockout hold is on for the copy.
 struct OwnerKoSlot
 {
-    volatile LONG uid; volatile LONG ko;
-    void ClearValues() { InterlockedExchange(&ko, 0); }
+    volatile LONG uid; volatile LONG ko; volatile LONG prone; volatile LONG held;
+    void ClearValues() { InterlockedExchange(&ko, 0); InterlockedExchange(&prone, 0); InterlockedExchange(&held, 0); }
 };
 OwnerKoSlot g_ownerKo[kOwnerKoSlots];
 volatile LONG64 g_ownerKoTableFull = 0;
+
+// T-540 D1 counters and the capped hold lines (the first kKoHoldLines starts and ends, together).
+volatile LONG64 g_koHoldTicks = 0;           // ticks whose wake clock the hold raised
+volatile LONG64 g_koHoldStarts = 0;          // holds begun: the copy's own countdown would have ended its knockout while the owner says knocked out
+volatile LONG64 g_koHoldEndAwake = 0;        // ended by the owner's word: awake
+volatile LONG64 g_koHoldEndForgot = 0;       // ended because the copy's words were forgotten (copy removed, or its ownership moved)
+volatile LONG64 g_koHoldEndOwnerGone = 0;    // ended because the owner's game is gone and the copy was withdrawn, not removed
+volatile LONG64 g_koHoldUndone = 0;          // fold 1 R2: a raise taken back - the owner's awake word landed while it was written
+volatile LONG64 g_getupAskedCopy = 0;        // 'safe to get up' asked for a copy
+volatile LONG64 g_getupNotSafe = 0;          // ... answered 'not safe' where the engine said safe: the owner plays dead
+const int kKoHoldLines = 20;
+struct KoHoldStart { volatile LONG ready; unsigned int uid; float clock; float raiseTo; };
+KoHoldStart g_koHoldStart[kKoHoldLines];
+volatile LONG g_koHoldStartTaken = 0;
+int g_koHoldStartDrained = 0;   // main thread only
+int g_koHoldLinesOut = 0;       // main thread only: hold lines printed (starts + ends)
+
+void DrainKoHolds();   // below: main-thread lines for the holds begun on the AI worker
+const char* const kKoHoldEndWhy[] = { "", "the owner's latest word says awake", "its copy words were forgotten (copy removed, or ownership moved)",
+                                      "the owner's game is gone and the copy was withdrawn" };
+
+// MAIN THREAD. A hold on uid ends (why: 1 awake, 2 forgotten, 3 owner gone): counted, and one of the capped lines. ownerKo / ownerProne:
+// the owner's word as the slot held it when the hold ended (fold 1 R5: the real word, not a fixed 0).
+void KoHoldEnded(unsigned int uid, int why, int ownerKo, int ownerProne)
+{
+    if (why == 1) InterlockedIncrement64(&g_koHoldEndAwake);
+    else if (why == 2) InterlockedIncrement64(&g_koHoldEndForgot);
+    else InterlockedIncrement64(&g_koHoldEndOwnerGone);
+    DrainKoHolds();   // its start line first
+    if (g_koHoldLinesOut >= kKoHoldLines) return;
+    ++g_koHoldLinesOut;
+    DebugLog("[KOHOLD] release uid=" + N(uid) + ": " + kKoHoldEndWhy[why] + " (owner's word ko=" + N((long long)ownerKo) + ", owner prone=" + N((long long)ownerProne)
+             + ") - the copy's own engine wakes it from here (line " + N((long long)g_koHoldLinesOut) + " of at most " + N((long long)kKoHoldLines) + ")");
+}
 
 volatile LONG   g_applyingOwnerThread = 0;   // the thread inside ApplyState right now (0 = none)
 
@@ -450,6 +495,100 @@ void NoteOwnerKo(unsigned int uid, bool ko)
     const int at = SlotClaim(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
     if (at < 0) { InterlockedIncrement64(&g_ownerKoTableFull); return; }
     InterlockedExchange(&g_ownerKo[at].ko, ko ? 1 : 0);
+    // T-540 D1: the owner's awake word ends a hold (the next tick raises nothing; the copy's own clock runs out).
+    if (!ko && InterlockedCompareExchange(&g_ownerKo[at].held, 0, 1) == 1) KoHoldEnded(uid, 1, 0, (int)g_ownerKo[at].prone);
+}
+
+// T-540 D1: the owner's latest STATE prone for this copy (ApplyState). MAIN THREAD (the writer of every slot).
+void NoteOwnerProne(unsigned int uid, int prone)
+{
+    if (uid == 0) return;
+    const int at = SlotClaim(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
+    if (at < 0) { InterlockedIncrement64(&g_ownerKoTableFull); return; }
+    InterlockedExchange(&g_ownerKo[at].prone, (LONG)prone);
+}
+
+// T-540 D1: the owner's latest STATE prone; 0 = none heard (or the copy removed). ANY THREAD.
+int OwnerLastProne(unsigned int uid)
+{
+    const int at = SlotOf(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
+    if (at < 0) return 0;
+    const LONG p = g_ownerKo[at].prone;
+    return (unsigned int)g_ownerKo[at].uid == uid ? (int)p : 0;   // released (or reused) while it was read: none
+}
+
+bool OwnerSaysKo(unsigned int uid);   // T-540 D1: below - the owner's latest knocked-out word, ANY THREAD
+
+// T-540 D1 (1) - see kohold.h. AI WORKER (the medical detour), a copy only (the caller decided that with the ownership test
+// PuppetKoAllowed uses). While the owner's latest word says knocked out and the copy is in a running knockout, the wake clock is
+// raised so the engine's tick leaves it above 0 and its collapse check keeps the copy unconscious. It never starts a knockout
+// (a clock at 0 is left alone), so the knockdown waits (KnockdownWaitsNow, the rebuild refusal) stay the only road down. Ends:
+// the owner's awake word (NoteOwnerKo), the copy's words forgotten (MedicalForgetCopy: removed, or ownership moved - and a uid
+// this game drives never reaches here), the owner's game gone (CopyKoWordOwnerGone). Interlocked only; no log here.
+void KoHoldBeforeTick(unsigned int uid, MedicalSystem* self, float frameTime)
+{
+    const int at = SlotOf(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
+    if (at < 0) return;                                        // no word from the owner: the engine's own tick
+    float raiseTo = 0.0f;
+    const float clock = self->knockoutClock;
+    if (!kohold::HoldRaise(true, OwnerSaysKo(uid), self->dead, clock, frameTime, &raiseTo)) return;
+    // fold 1 R2: the main thread's ApplyLatch may lay the owner's awake word (NoteOwnerKo) and then its clock between the read above
+    // and this write. The raise is a compare-exchange against the value read (a clock the main thread wrote meanwhile is kept), and
+    // the word is asked again after it: now awake = the raise is taken back if it still stands (an awake STATE whose clock is spent
+    // writes no clock, ApplyLatch's range guard). An awake word that lands after the last check below leaves the raised clock
+    // standing for one tick at most: the next tick raises nothing, so the copy wakes at most one floor (0.1 s) late.
+    volatile LONG* const clk = (volatile LONG*)&self->knockoutClock;
+    LONG readBits = 0, raiseBits = 0;
+    memcpy(&readBits, &clock, 4);
+    memcpy(&raiseBits, &raiseTo, 4);
+    if (InterlockedCompareExchange(clk, raiseBits, readBits) != readBits) return;   // the main thread wrote the clock meanwhile
+    if (!OwnerSaysKo(uid))
+    {
+        InterlockedCompareExchange(clk, readBits, raiseBits);   // the word turned awake meanwhile: the raise taken back
+        InterlockedIncrement64(&g_koHoldUndone);
+        return;
+    }
+    InterlockedIncrement64(&g_koHoldTicks);
+    if (InterlockedCompareExchange(&g_ownerKo[at].held, 1, 0) != 0) return;   // already held
+    if ((unsigned int)g_ownerKo[at].uid != uid)
+    {   // fold 1 R3: the slot was released (or reused) meanwhile - not this copy's hold; starts stay equal to the ends
+        InterlockedCompareExchange(&g_ownerKo[at].held, 0, 1);
+        return;
+    }
+    InterlockedIncrement64(&g_koHoldStarts);
+    // fold 2 S3: the word asked once more now that the hold is marked - an awake word (or a slot release: ClearValues zeroes the
+    // word before the key goes, medical.cpp SlotRelease) that landed after the check above would otherwise leave this mark with no
+    // end. Awake now: the mark is taken back here and counted as ended by the awake word (no line - this is the AI worker), and
+    // the raise with it. If the main thread's NoteOwnerKo took the mark first, it counted the end itself.
+    if (!OwnerSaysKo(uid))
+    {
+        if (InterlockedCompareExchange(&g_ownerKo[at].held, 0, 1) == 1) InterlockedIncrement64(&g_koHoldEndAwake);
+        InterlockedCompareExchange(clk, readBits, raiseBits);
+        InterlockedIncrement64(&g_koHoldUndone);
+        return;
+    }
+    const LONG slot = InterlockedIncrement(&g_koHoldStartTaken) - 1;
+    if (slot < kKoHoldLines)
+    {
+        KoHoldStart& r = g_koHoldStart[slot];
+        r.uid = uid; r.clock = clock; r.raiseTo = raiseTo;
+        InterlockedExchange(&r.ready, 1);
+    }
+}
+
+// MAIN THREAD. The holds begun since the last call, as capped lines.
+void DrainKoHolds()
+{
+    while (g_koHoldStartDrained < kKoHoldLines && g_koHoldStart[g_koHoldStartDrained].ready)
+    {
+        const KoHoldStart& r = g_koHoldStart[g_koHoldStartDrained];
+        ++g_koHoldStartDrained;
+        if (g_koHoldLinesOut >= kKoHoldLines) continue;
+        ++g_koHoldLinesOut;
+        DebugLog("[KOHOLD] start uid=" + N(r.uid) + ": the owner's latest word says knocked out (ko=1) and the copy's own wake clock ("
+                 + F2(r.clock) + ") was about to run out - held above 0 (" + F2(r.raiseTo) + " before the tick) until the owner's awake word (line "
+                 + N((long long)g_koHoldLinesOut) + " of at most " + N((long long)kKoHoldLines) + ")");
+    }
 }
 
 bool OwnerSaysKo(unsigned int uid)
@@ -505,6 +644,41 @@ bool PuppetKoAllowed(MedicalSystem* self, int fn, float arg, unsigned long long 
         InterlockedExchange(&r.ready, 1);
     }
     return false;
+}
+
+// T-540 D1 (2) - 'SAFE TO GET UP' FOR A COPY COMES FROM ITS OWNER.
+// Character 0x5C99C0 (row Character_isItSafeToGetUp; 1.0.68 0x5CA450) is called only from the get-up branch of
+// threadedUpdatePeriodic 0x5CF620 (decomp_5cf620.txt:185-194): a limp body at prone 3 or 4 with unconscious and dead 0 plays dead
+// (prone 3) on 'no', else stands - and it asks again on every pass while the prone is 3. On a copy that let its engine stand it
+// after every owner STATE that put it to playing dead (F1883). For a copy (the ownership test first) the answer is 'not safe'
+// while its owner's latest STATE prone is 3; otherwise the engine's own answer. OFF THE MAIN THREAD (0x5CF620, world-states.md):
+// the uid lookup, the any-thread word table and interlocked counters only.
+typedef bool (*SafeGetUpFn)(void*);
+SafeGetUpFn orig_isItSafeToGetUp = 0;
+
+bool detour_isItSafeToGetUp(void* character)
+{
+    const unsigned int uid = FindSpawnedUid(character);
+    const bool isCopy = uid != 0 && !net::IsUidMineAnyThread(uid);   // ours, or a lone game's character: the engine's answer
+    const bool engine = orig_isItSafeToGetUp(character);
+    if (!isCopy) return engine;
+    InterlockedIncrement64(&g_getupAskedCopy);
+    const bool answer = kohold::SafeToGetUpAnswer(true, engine, OwnerLastProne(uid));
+    if (answer != engine) InterlockedIncrement64(&g_getupNotSafe);
+    return answer;
+}
+
+void InstallCopyGetupAnswer()
+{
+    intptr_t fn = (intptr_t)coop::AddrAbs(kT540SafeGetUp);
+    if (fn == 0)
+    {
+        ErrorLog("[KOHOLD] isItSafeToGetUp resolved to 0 - a copy's get-up answer is NOT taken from its owner");
+        return;
+    }
+    coop::HookStatus st = coop::AddHook((void*)fn, (void*)&detour_isItSafeToGetUp, (void**)&orig_isItSafeToGetUp);
+    DebugLog(std::string("[KOHOLD] isItSafeToGetUp AddHook ") + (st == coop::SUCCESS ? "SUCCESS" : "FAILED")
+             + " - a copy plays dead while its owner does; its knockout is held while its owner's word says knocked out");
 }
 
 void detour_startKnockoutTimer(MedicalSystem* self)
@@ -847,7 +1021,9 @@ bool OwnerSaysDead(unsigned int uid)
 }
 
 const int kDeathRefusalLog = 16;
-struct DeathRefusal { volatile LONG ready; unsigned int uid; int why; int medDead; float blood; float hunger; unsigned long tid; int cause; };
+// T-1420 (F1878): callerRva = the killing call's return address minus the exe's base (0 = not in the exe); taken from
+// GetModuleHandleA(0), not g_eventKillBase, which stays 0 when a caller-range row is unbound.
+struct DeathRefusal { volatile LONG ready; unsigned int uid; int why; int medDead; float blood; float hunger; unsigned long tid; int cause; unsigned long long callerRva; };
 DeathRefusal g_deathRefusal[kDeathRefusalLog];
 volatile LONG g_deathRefusalTaken  = 0;
 int           g_deathRefusalLogged = 0;   // main thread only
@@ -859,12 +1035,16 @@ void DrainDeathRefusals()
     {
         const DeathRefusal& r = g_deathRefusal[g_deathRefusalLogged];
         ++g_deathRefusalLogged;
+        char rva[32];
+        if (r.callerRva != 0) _snprintf(rva, sizeof(rva), "0x%llX", r.callerRva); else _snprintf(rva, sizeof(rva), "?");
+        rva[sizeof(rva) - 1] = 0;
         DebugLog("[DEATH] copy declareDead REFUSED #" + N(g_deathRefusalLogged) + " uid=" + N(r.uid)
                  + (r.why == 2 ? std::string(" - a body rebuild is in flight on the copy")
                                : std::string(" - the owner's latest STATE does not say dead"))
                  + " medDead=" + N(r.medDead) + " blood=" + F2(r.blood) + " hunger=" + F2(r.hunger)
                  + (r.cause == 1 ? std::string(" caller=deathCheck (death request queued for the owner)")
                     : r.cause == 2 ? std::string(" caller=unequip (death request queued for the owner)") : std::string())
+                 + " callerRva=" + rva
                  + " thread=" + N((long long)r.tid) + (r.tid == (unsigned long)::GetCurrentThreadId() ? " (main)" : " (off-main)"));
     }
 }
@@ -872,6 +1052,7 @@ void DrainDeathRefusals()
 // MAIN THREAD. Logs each of the first kKoRefusalLog refusals once, in the order they were taken.
 void DrainKoRefusals()
 {
+    DrainKoHolds();   // T-540 D1: the hold lines ride the same main-thread drain
     while (g_koRefusalLogged < kKoRefusalLog && g_koRefusal[g_koRefusalLogged].ready)
     {
         const KoRefusal& r = g_koRefusal[g_koRefusalLogged];
@@ -1030,6 +1211,30 @@ int KnockOutOwned(unsigned int uid)
     return unc;
 }
 
+#ifdef SW_DEV_BUILD
+// T-540 TEST-ONLY, DEV build only (`koself <uid> short`, appearance.cpp KoSelfShortLever): KnockOutOwned with the engine's knockout(float) at
+// strength 0 - 0x643EF0 multiplies its computed clock by the argument and floors the result at 3.0 s (T633, build/
+// decomp_643ef0.txt), so the clock is the engine's own 3 s floor; no hold. The STATE is pushed as KnockOutOwned pushes it.
+// *koBefore / *koAfter = the wake-up clock read before / right after. Returns `unconcious` read right after, -1 not driven
+// here / no character / unreadable. MAIN THREAD.
+int KnockOutOwnedShort(unsigned int uid, float* koBefore, float* koAfter, int* proneBefore)
+{
+    *koBefore = -1.0f; *koAfter = -1.0f; *proneBefore = -1;
+    if (!net::IsUidMine(uid)) return -1;
+    ::Character* c = FindSpawned(uid);
+    if (c == 0) return -1;
+    MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
+    if (!PlausiblePtr(med) || orig_knockout == 0) return -1;
+    *koBefore = med->knockoutClock;
+    *proneBefore = (int)c->poseState();
+    detour_knockout(med, 0.0f);
+    *koAfter = med->knockoutClock;
+    const int unc = med->unconcious ? 1 : 0;
+    StatePush(uid);
+    return unc;
+}
+#endif
+
 // See medical.h. The victim's owner applying a sneak knockout's success: the engine's own knockout(float) through the knockout
 // gate (it lets a character this game drives through), as KnockOutOwned does. `unconcious` follows at the medical update.
 int StealthKnockOutOwned(unsigned int uid, float skill01, float* koTimerOut)
@@ -1094,6 +1299,21 @@ bool CopyOwnerSaysKo(unsigned int uid) { return OwnerSaysKo(uid); }
 // "knocked out" entry cannot hold the looks forever. ANY THREAD.
 void CopyNoteOwnerKo(unsigned int uid, bool ko) { NoteOwnerKo(uid, ko); }
 
+// T-540 D1: the owner's latest STATE prone for this copy (spawn.cpp ApplyState, every STATE it applies or refuses). MAIN THREAD.
+void CopyNoteOwnerProne(unsigned int uid, int prone) { NoteOwnerProne(uid, prone); }
+
+// T-540 D1: the owner's game is gone and its copy here was withdrawn, not removed (spawn.cpp DropPeerOwnedCopy) - no awake word will
+// come, so the knocked-out word ends here and a knockout hold with it; the copy's own clock decides from now on. MAIN THREAD.
+void CopyKoWordOwnerGone(unsigned int uid)
+{
+    if (uid == 0) return;
+    const int at = SlotOf(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
+    if (at < 0) return;
+    InterlockedExchange(&g_ownerKo[at].ko, 0);
+    InterlockedExchange(&g_ownerKo[at].prone, 0);   // nor does its playing dead hold the copy any more
+    if (InterlockedCompareExchange(&g_ownerKo[at].held, 0, 1) == 1) KoHoldEnded(uid, 3, 0, 0);
+}
+
 // An owner's death that found no usable copy here (none loaded, or the liveness check refused the copy after the engine changed
 // its handle): one line per uid, the uid kept (at most kDeathMissedMax, then only counted), and the death applied through
 // ApplyOwnerDeath when a copy of the uid is usable again (MedicalCopyUsableAgain, drained by MedicalDrainMissedDeaths).
@@ -1123,6 +1343,11 @@ void MedicalForgetCopy(unsigned int uid)
 {
     if (uid == 0) return;
     SlotRelease(g_ownerHunger, kOwnerHungerSlots, kOwnerHungerProbe, uid);
+    {   // T-540 D1: a knockout hold ends with the copy's words
+        const int at = SlotOf(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
+        if (at >= 0 && InterlockedCompareExchange(&g_ownerKo[at].held, 0, 1) == 1)
+            KoHoldEnded(uid, 2, g_ownerKo[at].ko != 0 ? 1 : 0, (int)g_ownerKo[at].prone);
+    }
     SlotRelease(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
     SlotRelease(g_ownerDead, kOwnerDeadSlots, kOwnerDeadProbe, uid);
     SlotRelease(g_god, kGodSlots, kGodProbe, uid);   /* T-1205 /god: a copy's row, or an own character's whose ownership moved */
@@ -1140,6 +1365,13 @@ void GodForgetCopy(unsigned int uid)
 void MedicalForgetAllCopies()
 {
     SlotClearAll(g_ownerHunger, kOwnerHungerSlots);
+    for (int i = 0; i < kOwnerKoSlots; ++i)   // fold 1 R3: every hold still on ends here, counted (starts stay equal to the ends)
+    {
+        const LONG u = g_ownerKo[i].uid;
+        if (u == 0 || u == (LONG)uidslot::kTomb) continue;
+        if (InterlockedCompareExchange(&g_ownerKo[i].held, 0, 1) == 1)
+            KoHoldEnded((unsigned int)u, 2, g_ownerKo[i].ko != 0 ? 1 : 0, (int)g_ownerKo[i].prone);
+    }
     SlotClearAll(g_ownerKo, kOwnerKoSlots);
     SlotClearAll(g_ownerDead, kOwnerDeadSlots);
     SlotClearAll(g_god, kGodSlots);   /* T-1205 /god: memory only - this game's god modes end when it leaves the world */
@@ -1211,6 +1443,8 @@ bool CopyDeathAllowed(void* character, unsigned long long callerRet, bool worldR
         r.uid = uid; r.why = why; r.medDead = medDead; r.blood = blood; r.hunger = hunger;
         r.tid = (unsigned long)::GetCurrentThreadId();
         r.cause = cause;
+        const unsigned long long exeBase = (unsigned long long)(uintptr_t)::GetModuleHandleA(0);
+        r.callerRva = (exeBase != 0 && callerRet >= exeBase) ? callerRet - exeBase : 0ull;
         InterlockedExchange(&r.ready, 1);
     }
     return false;
@@ -1393,6 +1627,9 @@ void CopyNoteSpawnFlags(unsigned int uid, unsigned int flags)
     if (uid == 0 || net::IsUidMine(uid)) return;   // this game's engine decides the characters it drives
     NoteOwnerDead(uid, dead);
     CopyNoteOwnerKo(uid, ko && !dead);
+    // T-540 fold 1 R6 / fold 2 S4: an earlier life's 'playing dead' does not hold a NEW copy - the owner's next STATE says. A repeat
+    // SPAWN for a copy that is here now (session.cpp calls this before ApplyRemoteSpawn either way) keeps the owner's word.
+    if (FindSpawned(uid) == 0) NoteOwnerProne(uid, 0);
 }
 
 // T-303 fold 1: why a SPAWN death has not landed (SpawnDeathTry's *whyOut).
@@ -1779,6 +2016,7 @@ void InstallMedicalProbe()
                                     " medical-death undo armed: a copy's refused medicalUpdate death (rows MedUpdateDeathRet1/2) has its flag put back"
                                   : "[DEATH] death requests OFF, medical-death undo OFF: a caller-range row is not bound in this address table");
     InstallPuppetKoGate();   // C2 (read-KO): independent of the probe below
+    InstallCopyGetupAnswer();   // T-540 D1: a copy's 'safe to get up' from its owner's latest prone
     InstallCopyDamageSkip();   // C2-b (read-damage): a copy's hit-path applyDamage is skipped
     InstallCopyAmputateGate();   // LIMBS: a copy loses a limb only when its owner's STATE says so
     InstallCopyTreatCatch();   // a medic's per-part treatment of a copy is recorded for spawn.cpp TreatTick
@@ -1896,7 +2134,16 @@ void ApplyLatch(Character* c, unsigned int bits, float nextKnockoutAt, float koT
     if (koTimer >= 0.0f && koTimer < 3600.0f) med->knockoutClock = koTimer;
 }
 
-bool StatePush(unsigned int uid)
+static bool StatePushOn(unsigned int uid, bool reliable);
+
+bool StatePush(unsigned int uid) { return StatePushOn(uid, false); }
+
+// T-540 fold 1 R1: the same STATE on the reliable channel - for an owned character's prone / dead CHANGE (soak.cpp's transition
+// watch, F140): the copy's knockout hold ends only on the owner's awake word, so that word must not be lost to an unreliable send
+// (the periodic resend can be 10-20 s away). The message and its bytes are unchanged; only the channel the caller picks.
+bool StatePushReliable(unsigned int uid) { return StatePushOn(uid, true); }
+
+static bool StatePushOn(unsigned int uid, bool reliable)
 {
     // Only ever for characters WE own. Pushing state for someone else's character is the one
     // thing replication must never do, and the check is cheap enough to keep at the door.
@@ -1915,10 +2162,18 @@ bool StatePush(unsigned int uid)
     if (!net::SendState(uid, rec, nParts, blood, prone, dead, latch, nextKO, koT, CarryingUidOf(uid),
                        RestOfOwned(uid, rest) ? rest : 0,   /* R3 (read-ragdoll): where its ragdoll settled */
                        PoseOfOwned(uid, &pose) ? &pose : 0, HungerOfOwned(uid, hg),
-                       LimbsOfOwned(uid))) return false;   /* LIMBS: also on a pushed / catch-up STATE */
+                       LimbsOfOwned(uid), reliable)) return false;   /* LIMBS: also on a pushed / catch-up STATE; T-540 fold 1 R1: the channel */
     InterlockedIncrement64(&g_stateSent);
     InterlockedIncrement64(&g_statePushed);
     return true;
+}
+
+// T-540 fold 3: the transition STATEs' channel outcomes (net/session.cpp SendState) as one REPORT token.
+static std::string StateReliableToken()
+{
+    long long sent = 0, busy = 0;
+    net::StateReliableCounts(&sent, &busy);
+    return " stateReliable=" + N(sent) + " stateReliableSkippedBusy=" + N(busy);
 }
 
 void ReportMedical()
@@ -1941,6 +2196,11 @@ void ReportMedical()
        << " koRefusedRebuild=" << N(g_puppetKoRefusedRebuild)          // crash1c (R2c)
        << " puppetKoAwaitingOwner=" << N(g_puppetKoAwaitingOwner)   /* a sneak knockout's knockout of a copy, applied by its owner */
        << " ownerKoTableFull=" << N(g_ownerKoTableFull)
+       << " koHold[ticks,starts,endAwake,endForgot,endOwnerGone]=" << N(g_koHoldTicks) << "," << N(g_koHoldStarts) << ","   /* T-540 D1 */
+       << N(g_koHoldEndAwake) << "," << N(g_koHoldEndForgot) << "," << N(g_koHoldEndOwnerGone)
+       << " koHoldUndone=" << N(g_koHoldUndone)   /* T-540 fold 1 R2 */
+       << StateReliableToken()   /* T-540 fold 3 */
+       << " getupCopy[asked,notSafe]=" << N(g_getupAskedCopy) << "," << N(g_getupNotSafe)
        << " hungerCarried=" << N(g_hungerCarried)          /* par5 (parity P5) */
        << " hungerApplied=" << N(g_hungerApplied)
        << " hungerHeld=" << N(g_hungerHeld)

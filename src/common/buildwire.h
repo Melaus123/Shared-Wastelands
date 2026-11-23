@@ -1190,6 +1190,25 @@ inline int BuildDoorHitRoute(int door, int index, int playerPiece, int othersKno
     if (door == 0 || index < 0 || index > kBuildHitMaxDoor || replay != 0 || playerPiece == 0 || othersKnown == 0 || damageRead == 0) return kBuildHitRouteEngine;
     return kBuildHitRouteQueue;
 }
+/* T-1396 (log only): a GATE blow's line - a blow (never a repair's gain) on a door of a player piece, or on a player wall piece that has a
+   door - is written in full on its own launch cap, kBuildGateLineCap, whatever any other cap says; past it the line goes to the per-piece
+   rule every hit line takes. gate 0 = not a gate blow (nothing counted). 1 = write it on the gate cap (*written + 1); 0 = not a gate blow,
+   or the gate cap is spent (*over + 1) */
+const long kBuildGateLineCap = 60;
+inline int BuildGateLineTake(int gate, long long* written, long long* over, long cap)
+{
+    if (gate == 0) return 0;
+    if (*written >= (long long)cap) { ++*over; return 0; }
+    ++*written;
+    return 1;
+}
+/* T-1396: is this hit line a gate blow's? door = the door's index (-1 the piece itself), repair = a repair's gain, pieceHasDoor = the
+   player piece has a door (1), has none (0) or was not read (-1). 1 = a gate blow */
+inline int BuildGateBlow(int door, int repair, int pieceHasDoor)
+{
+    if (repair != 0) return 0;
+    return (door >= 0 || pieceHasDoor == 1) ? 1 : 0;
+}
 /* BuildRepairSumDue: a repair's gains on a door another game writes are summed and asked of that writer at most once every gapMs.
    gain (0 for a look with no new gain; not a number, below 0 or over kBuildHitMax ignored) is added to *sum. 1 = an ask is due now:
    *out = the summed gain (at most kBuildHitMax - the rest stays in *sum for the next ask), *lastAt = now, *haveLast = 1. The first
@@ -4408,6 +4427,31 @@ inline const char* BuildZoneRebuildActWord(int act)
     default: return "?";
     }
 }
+/* T-1462 (owner 1838): the Level Editor window's 'Regenerate sector' press - T-1428's road (BuildZoneRebuildAct on the area's own facts,
+   then 0x3AB700) for the area holding the camera's centre point, asked at once (no piece to wait for). What the press does with the
+   act: asked and returned, or the engine's own queued Full job for the area covers it -> done (the message shows); the engine's own job
+   for the area running, or a queued non-Full (0x3BF360 would skip) -> asked again each frame until kZoneRbRunWaitMs, then given up; the
+   area not loaded, no rows, or the call faulted -> given up (no message). callOk: the engine call returned (only for kZrbDoAsk). */
+const int kRegenDone = 0, kRegenWait = 1, kRegenGaveUp = 2;
+inline int BuildRegenPressOutcome(int act, int callOk, unsigned int waitedMs)
+{
+    if (act == kZrbDoAsk) return (callOk != 0) ? kRegenDone : kRegenGaveUp;
+    if (act == kZrbDoneQueued) return kRegenDone;
+    if (act == kZrbAgainRunning || act == kZrbAgainQueued) return (waitedMs < kZoneRbRunWaitMs) ? kRegenWait : kRegenGaveUp;
+    return kRegenGaveUp;
+}
+/* review fold (3): a press waits while the area has pieces T-1428 still waits for (F1339) - an area rebuild noted for restored pieces
+   (zrb), a piece's walking-map box ask waiting for its box (box) or for its physics body (body); it is asked when the last of them
+   ends (their own arrivals / give-ups, no timer here) */
+inline int BuildRegenPiecesWait(int zrb, int box, int body) { return (zrb > 0 || box > 0 || body > 0) ? 1 : 0; }
+/* review fold (2): the message waits for the engine's own job to finish - after the ask, the area's job is finished when the walking-map
+   manager holds no job of the area: none running (+0xE8) and none queued (+0x88). running / queued: jobs of the area read now */
+inline int BuildRegenJobsFinished(int running, int queued) { return (running == 0 && queued == 0) ? 1 : 0; }
+/* the camera's point is a world position: a number, inside +-1e7 on both axes (resurrect.cpp kViewPointLimit's rule) */
+inline int BuildRegenViewOk(float x, float z)
+{
+    return (x > -1.0e7f && x < 1.0e7f && z > -1.0e7f && z < 1.0e7f) ? 1 : 0;   /* a NaN fails every compare */
+}
 /* fold 2 (H2(b)): a wall whose crossing waited for its body gets it at the arrival when it is still unfinished, not destroyed and at
    or past its line (the mod's write landed there): written to just below the line and crossed with its own vt+0x230, then put back */
 inline int BuildWallCrossReplay(int complete, int destroyed, float progress, float needed, float threshold)
@@ -4885,6 +4929,15 @@ struct CopyTownCand
     CopyTownCand() : cx(0.0f), cz(0.0f), hasList(0), listX(0.0f), listZ(0.0f), holdsNamed(0), recordNamed(0) {}
 };
 inline float CopyTownD2(float ax, float az, float bx, float bz) { const float dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+/* T-1391 fix attempt 2 (F1774 / F1775, the rebuild's fallback): a record that carries NO town leaves the copy to the rules below; a record
+   that carries a town whose outpost id has no town HERE yet (recordId != 0, recordTownHere 0, not another player's outpost - ownerBad 0)
+   WAITS for that id: a copy the near rule would place (only the nearest-town guess - the PLACE's named centre still stands) is made in
+   'Nowhere' and linked to the record's outpost when its town comes here (the record link: build.cpp TlApplyKey / TlOwedTick at the
+   outpost copy's founding). Not a restore (T-1158 step 6's own wait governs the owner's rebuilt pieces). 1 = wait */
+inline int CopyTownRecordWaits(unsigned int recordId, int recordTownHere, int ownerBad, int restore, int rule)
+{
+    return (recordId != 0u && recordTownHere == 0 && ownerBad == 0 && restore == 0 && rule == kCtNear) ? 1 : 0;
+}
 /* the rule that picked (kCt*); *pick = the candidate, -1 = Nowhere. namedXZ / spotXZ 0 = not given */
 inline int CopyTownChoose(const CopyTownCand* c, int n, const float* namedXZ, const float* spotXZ, float sameRadius, float keepRange, int* pick)
 {

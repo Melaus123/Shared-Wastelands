@@ -62,7 +62,7 @@
 namespace baseshow {
 
 const unsigned kMsgShow = 78;
-const unsigned kProtocol = 173;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+const unsigned kProtocol = 177;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
 
 
 
@@ -351,11 +351,21 @@ inline void Match(const std::vector<Shown>& shown, const std::vector<ShowRow>& r
 }
 /* the key row of a shown base: the one of the same owner at exactly its centre (BdShowApply gives a base its row's centre bit for bit,
    and KeyRowsFor copies it the same way - so two outposts of one owner within kSameBaseRadius each find their own); else the first
-   of the same owner within kSameBaseRadius of it (a base taken up at its town's own position) (-1 none) */
+   of the same owner within kSameBaseRadius of it (a base taken up at its town's own position) (-1 none). T-1391 B1 (F1804): between
+   the two, the one key row of the same owner whose handle words are the base's owner handle (ownerHand) - the owner's town centre can
+   move ~400 units onto new buildings, past kSameBaseRadius; taken only when exactly one row of that owner carries those words (a
+   reused handle of an outpost a reset carried is never guessed between) */
 inline int KeyRowOf(const Shown& s, const std::vector<townkeep::TownRow>& keyRows)
 {
     for (size_t k = 0; k < keyRows.size(); ++k)
         if (keyRows[k].owner == s.owner && keyRows[k].pos[0] == s.pos[0] && keyRows[k].pos[1] == s.pos[1] && keyRows[k].pos[2] == s.pos[2]) return (int)k;
+    if (townkeep::HandKnown(s.ownerHand))
+    {
+        int byHand = -1, n = 0;
+        for (size_t k = 0; k < keyRows.size(); ++k)
+            if (keyRows[k].owner == s.owner && townkeep::HandKnown(keyRows[k].hand) && townkeep::HandSame(keyRows[k].hand, s.ownerHand)) { if (n == 0) byHand = (int)k; ++n; }
+        if (n == 1) return byHand;
+    }
     for (size_t k = 0; k < keyRows.size(); ++k)
         if (keyRows[k].owner == s.owner && keptwire::NearXZ(s.pos[0], s.pos[2], keyRows[k].pos[0], keyRows[k].pos[2], kSameBaseRadius) != 0) return (int)k;
     return -1;
@@ -1155,6 +1165,48 @@ inline int OwnCheckTownAt(OwnCheck* g, int sx, int sy)
             ++n;
         }
     return n;
+}
+/* ---- T-1455 (F1733 / F1734, design (b)): A PIECE'S TOWN CHANGED ON ITS OWNER'S GAME ----
+   A move to another town wrote no piece record by itself (a write carries the town of its moment, PcrTownFill, and comes only on a
+   power-value change, a build event or the own-piece check), so the record kept naming the old town and the other games' copies
+   obeyed it (run T2710: a Light Post left in 'Nowhere' off its grid). The change is now an event for the own-piece check: the areas
+   around the piece owe a check (OwnCheckTownAt), which reads the live town, compares it with the record and marks the write through
+   its own gates (this game the piece's writer now, the team list held, own pieces only). Nothing is carried on the wire.
+   TownCarryDue - the mod's own move (BdBuildingSetTownPod): setResult = the town words' copy (1 written); changed = the piece's five
+   stored town words differ before and after (TownCarryWordsChanged - not the engine's town lookup, which answers the nearest town
+   for a dead stored link); recOwn = the piece's record names this game's slot (the own-piece check's own test). 1 = its area owes a
+   check. A copy owes none: its record is its owner's to write, and a copy moved here (a save's take-out and put-back) would only
+   re-check this game's untouched pieces around it. */
+inline int TownCarryDue(int setResult, int changed, int recOwn)
+{
+    return (setResult == 1 && changed != 0 && recOwn != 0) ? 1 : 0;
+}
+/* a piece's five town handle words (Building +0x1D8) before and after a re-town - the mod's copy or the engine's 0x926190 (called
+   only from the merge of two of this player's towns 0x930970): 1 = changed (a piece already in that town owes nothing) */
+inline int TownCarryWordsChanged(const int* before, const int* after)
+{
+    for (int i = 0; i < 5; ++i) if (before[i] != after[i]) return 1;
+    return 0;
+}
+/* the hook's queue (any thread in; the main thread drains it at the town-link tick): AREA CELLS of the 64 x 64 grid, each at most once,
+   so a merge that re-towns hundreds of pieces in one engine call owes each of their areas once and nothing is dropped (the check then
+   looks at this game's own records only, TlOwnCheckTick). kCarryQueued = newly queued, kCarryAlready = queued already, kCarryOffGrid */
+const int kCarryCells = kOwnTownGrid * kOwnTownGrid;
+const int kCarryOffGrid = 0, kCarryQueued = 1, kCarryAlready = 2;
+inline int CarryCellMark(unsigned char* cells, int* any, int sx, int sy)
+{
+    if (sx < 0 || sy < 0 || sx >= kOwnTownGrid || sy >= kOwnTownGrid) return kCarryOffGrid;
+    unsigned char& c = cells[sx * kOwnTownGrid + sy];
+    if (c != 0) return kCarryAlready;
+    c = 1;
+    *any = 1;
+    return kCarryQueued;
+}
+/* a world change (or the drain's take): nothing queued */
+inline void CarryCellsClear(unsigned char* cells, int* any)
+{
+    std::memset(cells, 0, (size_t)kCarryCells);
+    *any = 0;
 }
 /* T-1332: a SHOW's own rows (this player's outposts by id and words) are an event for the own-piece check when they differ from the
    rows held (another link - linkChanged - or a row more or fewer, or a row's id, words or centre changed): the own pieces around each

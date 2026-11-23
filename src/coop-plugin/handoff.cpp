@@ -29,6 +29,7 @@
 #include "../common/peergone.h"    /* PlayerGoneTakesRow: a player who leaves takes back only the squads handed to it */
 #include "../common/twinsleep.h"   /* T-761: the withdrawal kinds - a REVOKE with no winner takes a save-born twin only as the last resort */
 #include "../common/raidsquad.h"   /* T-1122 awake hand (owner 1524): AwakeTakeOrder - a taken raid squad's carried goal */
+#include "../common/carryhand.h"   /* T-1467: a carried body handed, alone, to its carrier's game - offline-tested */
 #include "../common/leadmark.h"   /* T-1442 step 6: the squad-leader change's note list, mark skip and backstop classification - offline-tested */
 #include "hooks.h"   /* T-1442 step 6: coop::AddHook - set-leader 0x790C00 and remove-member 0x794C00 */
 #include "../common/orphanpurge.h"   /* T-1268: AnnounceArea - the sweep's own area answer, so a re-woken squad is judged as the sweep judges it */
@@ -2657,6 +2658,88 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
    announcement went, or is unchanged) - after a reconnect the re-announcements precede the resends on the one ordered channel.
    A pass that did not run its squads (no player sector) resends nothing; nothing is abandoned by waiting (sends count, not time). */
 static void P119KeepSample(const std::map<void*, std::vector<unsigned int> >& squads, double now);   // PROBE P119
+/* T-1467 (owner 1863 a / 1864 a / 1865 a; src/common/carryhand.h): A CARRIED BODY HANDED, ALONE, TO ITS CARRIER'S GAME. The body's game's
+   state of each carry's hand-over (body uid -> carryhand::kHand*; goes when the carry ends here, HandoffCarryForget), the carrier's game's
+   refusals (body uid -> the carrier that held it, 0 = whichever; go when that carry ends, HandoffCarryRefusedSweep) and the carriers the
+   announce pass is holding (their first hold logged). MAIN THREAD, all of it. */
+static std::map<unsigned int, int> g_carryHand;
+static std::map<unsigned int, unsigned int> g_carryRefusedHere;
+static std::set<unsigned int> g_carryHolding;
+static std::map<unsigned int, unsigned int> g_carryTakenBy;   /* the carrier's game: body uid taken by a carry hand-over -> the carrier that held it */
+static long long g_carryKeptOutOfPass = 0, g_carryTakenEnded = 0;
+static long long g_carryOffered = 0, g_carryGiven = 0, g_carryRefused = 0, g_carryAbandoned = 0, g_carryTakenHere = 0, g_carryRefusedHereN = 0;
+static long long g_carryHeld = 0, g_carryHoldStarts = 0, g_carryHoldEnds = 0, g_carryHandLines = 0;
+static const long long kCarryHandLineCap = 200;
+static void CarryHandLine(const std::string& s) { if (g_carryHandLines >= kCarryHandLineCap) return; ++g_carryHandLines; DebugLog(s); }
+/* the body's game: the carrier's game's answer (or none) settles this carry's hand-over */
+static void CarryHandSettle(unsigned int body, int taken, const char* why)
+{
+    std::map<unsigned int, int>::iterator h = g_carryHand.find(body);
+    if (h == g_carryHand.end()) return;
+    h->second = carryhand::HandSettle(taken);
+    if (taken != 0) ++g_carryGiven; else ++g_carryRefused;
+    CarryHandLine("[CARRYHAND] body uid=" + N(body) + " " + std::string(carryhand::HandStateName(h->second)) + " - " + why
+                  + " (carryHand offered " + N(g_carryOffered) + " given " + N(g_carryGiven) + " refused " + N(g_carryRefused) + " abandoned " + N(g_carryAbandoned) + ")");
+}
+int HandoffCarryState(unsigned int body)
+{
+    std::map<unsigned int, int>::const_iterator h = g_carryHand.find(body);
+    return h == g_carryHand.end() ? (int)carryhand::kHandNone : h->second;
+}
+void HandoffCarryForget(unsigned int body) { g_carryHand.erase(body); }
+/* the carrier's game: a body taken by a carry hand-over and still carried by the carrier that held it at the take (carryhand::TakenKeep, read
+   live) - left out of the squad pass; once that carry ends the entry goes and the squad's ordinary roads judge the body again */
+static bool CarryTakenStillCarried(unsigned int uid)
+{
+    if (g_carryTakenBy.empty()) return false;
+    std::map<unsigned int, unsigned int>::iterator t = g_carryTakenBy.find(uid);
+    if (t == g_carryTakenBy.end()) return false;
+    const unsigned int now = CarrierOfBodyHere(uid);
+    if (carryhand::TakenKeep(net::IsUidMine(uid) ? 1 : 0, (now != 0 && now == t->second) ? 1 : 0, net::IsUidMine(t->second) ? 1 : 0) != 0) return true;
+    ++g_carryTakenEnded;
+    CarryHandLine("[CARRYHAND] body uid=" + N(uid) + " taken by carry - its carry by carrier uid=" + N(t->second) + " ended (" + std::string(now == 0 ? "carried by nobody here" : "another carrier") + ", run here "
+                  + N((long long)(net::IsUidMine(uid) ? 1 : 0)) + "): its squad's ordinary roads judge it again (carryTakenEnded " + N(g_carryTakenEnded) + ")");
+    g_carryTakenBy.erase(t);
+    return false;
+}
+int HandoffCarryRefusedHere(unsigned int body, unsigned int carrier)
+{
+    if (body == 0) return 0;
+    std::map<unsigned int, unsigned int>::const_iterator r = g_carryRefusedHere.find(body);
+    return (r != g_carryRefusedHere.end() && (r->second == 0 || r->second == carrier)) ? 1 : 0;
+}
+void HandoffCarryRefusedSweep()
+{
+    for (std::map<unsigned int, unsigned int>::iterator r = g_carryRefusedHere.begin(); r != g_carryRefusedHere.end(); )
+    {
+        const unsigned int now = CarrierOfBodyHere(r->first);
+        if (now == 0 || (r->second != 0 && now != r->second)) g_carryRefusedHere.erase(r++); else ++r;   /* that carry ended: a later carry is judged afresh */
+    }
+    for (std::map<unsigned int, unsigned int>::iterator t = g_carryTakenBy.begin(); t != g_carryTakenBy.end(); )
+        if (FindSpawned(t->first) == 0) g_carryTakenBy.erase(t++); else ++t;   /* fold LOW: the body is gone here - its after-take entry goes */
+    for (std::set<unsigned int>::iterator h = g_carryHolding.begin(); h != g_carryHolding.end(); )
+    {
+        const unsigned int body = CarryingUidOf(*h);
+        const int ended = (body == 0) ? 1 : (net::IsUidMine(body) ? 2 : (HandoffCarryRefusedHere(body, *h) != 0 ? 3 : 0));
+        if (ended != 0)
+        {
+            ++g_carryHoldEnds;
+            CarryHandLine("[CARRYHAND] hold ENDS carrier uid=" + N(*h) + " - " + std::string(ended == 1 ? "it carries nothing now" : (ended == 2 ? "the body it carries is this game's now (handed over)" : "this game refused the body's hand-over"))
+                          + " (carryHoldEnds " + N(g_carryHoldEnds) + ")");
+            g_carryHolding.erase(h++);
+        }
+        else ++h;
+    }
+}
+void HandoffCarryHoldNote(unsigned int carrier, unsigned int body)
+{
+    ++g_carryHeld;
+    if (!g_carryHolding.insert(carrier).second) return;
+    ++g_carryHoldStarts;
+    CarryHandLine("[CARRYHAND] hold carrier uid=" + N(carrier) + " body uid=" + N(body) + " (run by slot " + N((long long)net::OwnerSlotOf(body)) + ") - no other game has the carrier's area loaded,"
+                  " but it carries a body another game runs: its UNLOAD waits for the body's hand-over (carryHoldStarts " + N(g_carryHoldStarts) + ")");
+}
+
 static void HandoffResends(double now, const std::map<void*, int>& gate)
 {
     for (std::map<unsigned int, Pending>::iterator it = g_pending.begin(); it != g_pending.end(); )
@@ -2670,6 +2753,7 @@ static void HandoffResends(double now, const std::map<void*, int>& gate)
                 g_pending.erase(it++); ++g_hoOpenSeq;   /* T-1318 fold 2: the flight ended */
                 ReleaseOpenFromFlight(flownKey, flown, std::vector<unsigned int>(), 1);   /* design 2.5 item 1: members put away while it flew go to a release */
                 for (size_t k = 0; k < ab.size(); ++k) WorldsyncCatchupHandoverSettled(ab[k]);   /* M7a2 item 2 [m7a2-ho3]: the aborted hand-over keeps them here */
+                if (flown.reason == (unsigned int)coopsquad::kXferReasonCarry) { ++g_carryAbandoned; CarryHandSettle(flownKey, 0, "the carrier's game never answered (ABANDONED after its resends): the carry goes on as before this change"); }   /* T-1467 */
                 continue; }
             std::map<void*, int>::const_iterator g = gate.find(p.ap);
             const int seen = (g != gate.end()) ? 1 : 0;
@@ -3044,7 +3128,7 @@ static void LeadEventTick()
     {
         unsigned int uid = 0; ::Character* c = 0;
         if (!MirrorSlot(i, &uid, &c) || !Plaus(c)) continue;
-        const bool mineRun = net::IsUidMine(uid) && !coop::IsPlayerFaction(c->getOwnerFactionDirect());
+        const bool mineRun = net::IsUidMine(uid) && !coop::IsPlayerFaction(c->getOwnerFactionDirect()) && !CarryTakenStillCarried(uid);   /* T-1467: a body taken by carry, still carried here */
         const std::map<void*, LeadWatch>::iterator cn = charNoted.empty() ? charNoted.end() : charNoted.find((void*)c);
         const bool arrived = !g_leadArrivalUids.empty() && g_leadArrivalUids.count(uid) != 0;
         if (!mineRun && cn == charNoted.end() && !arrived) continue;
@@ -3109,6 +3193,7 @@ void HandoffTick()
         if (!MirrorSlot(i, &uid, &c)) continue;
         if (!net::IsUidMine(uid) || !Plaus(c)) continue;
         if (coop::IsPlayerFaction(c->getOwnerFactionDirect())) continue;   // P3: a player's own squad never changes hands (decision 23)
+        if (CarryTakenStillCarried(uid)) { ++g_carryKeptOutOfPass; continue; }   /* T-1467: a body taken by carry, still carried here - no hand-over straight back */
         void* ap = SquadActivePlatoonOf(c);
         if (ap == 0) { ap = (void*)c; solo.insert(ap); }   // no squad: a squad of one, keyed by the character
         squads[ap].push_back(uid);
@@ -3134,9 +3219,63 @@ void HandoffTick()
     HandoffResends(now, xferGate);          /* T-1 B3 fold (L3): after this pass's announcements */
 }
 
+/* T-1467 THE OFFER (the body's game): one XFER naming only the carried body (its squad stays here, owner 1865 a), keyed on the body's uid,
+   to the game that runs its carrier. No squad ap (no follow crossing, no raid block); its ACK and resends are the ordinary flight's. */
+int HandoffCarryOffer(unsigned int body, unsigned int carrier, int byCountdown)
+{
+    if (body == 0 || carrier == 0 || !net::IsUidMine(body) || g_pending.find(body) != g_pending.end() || HandoffPendingHas(body)) return 0;
+    if (CarryBodyIsPlayers(body) != 0) return 0;   /* fold HIGH-2: a player's character never changes hands (decision 23, as HandoffTick) */
+    Pending p;
+    BuildMembers(std::vector<unsigned int>(1, body), &p.members);
+    if (p.members.size() != 1) return 0;
+    p.reason = (unsigned int)coopsquad::kXferReasonCarry; p.ap = 0; p.logged = 1;   /* ap 0: RaidAwakeHandSend (first send none, resends) sends no raid block and holds nothing for it (store.cpp RaidAwakeSendImpl: no ap, no squad id -> 0) */
+    p.targetSlot = net::OwnerSlotOf(carrier);
+    if (p.targetSlot < 0) return 0;
+    PendingKeysRead(&p);   /* the squad key and hand while whole - the ACK's index entry (a split squad: this game keeps the rest) */
+    if (!net::SendXfer(body, p.reason, &p.members[0], 1, p.targetSlot, 0)) return 0;
+    p.sentAt = NowSec(); p.sends = 1;
+    ++g_xferOut; ++g_carryOffered;
+    g_pending[body] = p;
+    g_carryHand[body] = carryhand::kHandOpen;
+    CarryHandLine("[CARRYHAND] OFFER body uid=" + N(body) + " carrier uid=" + N(carrier) + " -> slot " + N((long long)p.targetSlot) + " at " + N((long long)p.members[0].x) + "," + N((long long)p.members[0].z)
+                  + (byCountdown != 0 ? " - this game's engine started its countdown to put the copy carrier's squad away (T-1467 attempt 2): handed alone to the carrier's game, the countdown held until the answer"
+                                      : " - the carried body's own spot left the areas this game has loaded")
+                  + " (its squad stays here; carryHand offered " + N(g_carryOffered) + ")");
+    return 1;
+}
+/* T-1467 THE TAKE (the carrier's game): taken only when this game has a copy of the body, a character this game runs carries that copy here,
+   and this game's engine keeps the body's spot - each read live now. A refusal ends the announce pass's hold for this carry. */
+static void ApplyRemoteCarryXfer(unsigned int body, const net::XferMember* m, int count, unsigned int fromPeer, const unsigned int* gens)
+{
+    const int one = (count == 1 && m[0].uid == body) ? 1 : 0;
+    ::Character* bc = one != 0 ? FindSpawned(body) : 0;
+    const int alreadyMine = (one != 0 && net::IsUidMine(body)) ? 1 : 0;
+    const unsigned int carrier = Plaus(bc) ? CarrierOfBodyHere(body) : 0u;
+    const int carrierMine = (carrier != 0 && net::IsUidMine(carrier)) ? 1 : 0;
+    float bx = 0, by = 0, bz = 0;
+    const int keep = (Plaus(bc) && ReadPos(bc, &bx, &by, &bz) && KeepTakeAt(bx, bz) == 1) ? 1 : 0;
+    const int players = (one != 0 && CarryBodyIsPlayers(body) != 0) ? 1 : 0;   /* fold HIGH-2: a player's character is refused (decision 23) */
+    const int take = carryhand::HandTake(one != 0 ? 1 : (count == 1 ? 2 : count), alreadyMine, Plaus(bc) ? 1 : 0, carrierMine, keep, players);
+    if (take != 0 && alreadyMine == 0)
+    {
+        int reRun = 0;
+        TakeMemberFromPeer(m[0], net::GenForTake(body, gens != 0 ? gens[0] : 0u), &reRun);
+        ++g_carryTakenHere;
+        if (carrier != 0) g_carryTakenBy[body] = carrier;   /* left out of the squad pass while that carrier carries it */
+    }
+    if (take == 0) { ++g_carryRefusedHereN; if (one != 0) g_carryRefusedHere[body] = carrier; }
+    const unsigned int named = body;
+    if (net::SendXferAck(body, take != 0 ? &named : 0, take != 0 ? 1 : 0, fromPeer)) ++g_ackOut;
+    CarryHandLine("[CARRYHAND] <- carry XFER body uid=" + N(body) + " members=" + N((long long)count) + " carrier uid=" + N(carrier) + " carrierMine=" + N((long long)carrierMine)
+                  + " copyHere=" + N((long long)(Plaus(bc) ? 1 : 0)) + " keepHere=" + N((long long)keep) + " alreadyMine=" + N((long long)alreadyMine) + " players=" + N((long long)players)
+                  + (take != 0 ? " - TAKEN: this game runs the body now (its squad stays with its game)" : " - REFUSED: the sender keeps it; this carry's hold ends")
+                  + " (carryTakenHere " + N(g_carryTakenHere) + " carryRefusedHere " + N(g_carryRefusedHereN) + ")");
+}
+
 void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMember* m, int count, unsigned int fromPeer, const unsigned int* gens, int wholeBits)
 {
     ++g_xferIn;
+    if (reason == (unsigned int)coopsquad::kXferReasonCarry) { ApplyRemoteCarryXfer(leader, m, count, fromPeer, gens); return; }   /* T-1467: one carried body, its own take */
     const int lentWhole = (wholeBits & cooplo::kWholeBitLent) != 0 ? 1 : 0, worldWhole = (wholeBits & cooplo::kWholeBitWorld) != 0 ? 1 : 0;   /* T-1122 lent flag; T-1318 attempt 2 (D3, protocol 226): the world bit */
     /* T-1 B1 restructure (point 4): CROSSING follow transfers. A follow-leader XFER arriving while my own follow-leader XFER for the
        SAME squad (my squad holds its leader or one of its members) still waits for its ACK: coopsquad::CrossingTakeIncoming - the
@@ -3362,6 +3501,9 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
        this ACK passed gets the heartbeat's writer re-check now (store.cpp StoreHandOverJudge), so its release goes out. MAIN THREAD. */
     for (std::map<std::string, std::pair<long long, long long> >::const_iterator hs = hoSquads.begin(); hs != hoSquads.end(); ++hs)
         if (hs->second.first > 0) coop::StoreHandOverJudge(hs->first, p.targetSlot, hs->second.first, hs->second.second);
+    if (p.reason == (unsigned int)coopsquad::kXferReasonCarry)   /* T-1467: the carrier's game's answer settles the carry's hand-over */
+        CarryHandSettle(leader, released > 0 ? 1 : 0, released > 0 ? "the carrier's game took it (ACK): it runs the body now; its squad stays here"
+                                                                   : "the carrier's game kept none (ACK): the carry goes on as before this change");
     const Pending flown(p);
     g_pending.erase(it); ++g_hoOpenSeq;   /* T-1318 fold 2: the flight ended (its ACK) */
     { const std::vector<unsigned int> tk(takenUids, takenUids + count); ReleaseOpenFromFlight(leader, flown, tk, 0); }   /* [a1b2-hd11] design 2.5 item 1: a member not taken whose body was put away while it flew goes to a release - after the erase, so an UNLOAD settled at once is not held by this flight */
@@ -4289,6 +4431,8 @@ void ReportHandoff()
     DebugLog("[XFER] REPORT squadsSeen=" + N(g_squadsSeen) + " xferOut=" + N(g_xferOut) + " resent=" + N(g_xferResent) + " abandoned=" + N(g_xferAbandoned) + " ackIn=" + N(g_ackIn) + " released=" + N(g_released)
              + " | xferIn=" + N(g_xferIn) + " taken=" + N(g_taken) + " carriedNotIssued=" + N(g_takeCarriedNotIssued) + " takeOrdersDropped=" + N(g_takeOrdersDropped) + " takeOrdersUnread=" + N(g_takeOrdersDropUnread) + " unknownUids=" + N(g_xferInUnknownUid) + " ackOut=" + N(g_ackOut)
              + " pending=" + N((long long)g_pending.size()) + " teleports=" + N(g_teleports)
+             + " carryHand[offered,given,refused,abandoned,takenHere,refusedHere,heldPasses,holdStarts,holdEnds]=" + N(g_carryOffered) + "," + N(g_carryGiven) + "," + N(g_carryRefused) + "," + N(g_carryAbandoned)
+             + "," + N(g_carryTakenHere) + "," + N(g_carryRefusedHereN) + "," + N(g_carryHeld) + "," + N(g_carryHoldStarts) + "," + N(g_carryHoldEnds) + " carryTaken[keptOutOfPass,ended,open]=" + N(g_carryKeptOutOfPass) + "," + N(g_carryTakenEnded) + "," + N((long long)g_carryTakenBy.size())   /* T-1467 */
              + " | nudges=" + N(g_nudges) + " keptUntaken=" + N(g_keptUntaken) + " xferInOutsideRing=" + N(g_xferInOutsideRing)
              + " | squadWriter[followedLeader,leaderUnknownFellBack,waitedLeader,xferFollowSent,xferFollowTaken,leaderSet,leaderSetMiss,keepAwakeRefresh]="
              + N(g_followedLeader) + "," + N(g_leaderUnknownFellBack) + "," + N(g_waitedLeader) + "," + N(g_xferFollowSent) + "," + N(g_xferFollowTaken)

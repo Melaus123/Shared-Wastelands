@@ -267,6 +267,32 @@ inline int CampDebrisPoint(int onMain, int listCamp, int campCentre, float listX
     return kDebrisForced;
 }
 
+/* T-1429 design A1 (owner 1777 / 1788; F1591 / F1592) - THE CAMP PIECES ARE KEPT IN THE ENGINE'S OWN AREA SAVE. A camp piece (furniture,
+   a small building or a box the camp maker 0x92F250 makes, Building+0x241 = 1, decomp_92f250:293-298) is left out of the engine's
+   one-area save by the buildings' 'needs saving' check 0x54F690 (decomp_54f690:27-40: a stricter path), and the furniture step lays a
+   new random set on every visit - so the area record (that save file) carried none, a joiner got none and every visit laid a
+   different set. Two halves, one switch (both hooks in, or neither):
+   (1) SAVE: in an area save (the save-file name passed in is empty - decomp_36dca0:133-146; the full save calls it so too) a camp
+       piece that is not destroyed (+0x1A1) answers 'yes'; it is written with its flags (bit value 4 = +0x241, 0x551890:174) and comes
+       back as a camp piece on load (0x5520E0:132). Every other answer is the engine's.
+   (2) STEP: design (b) (camplaid.h, F1600) decides each furniture step by its nest entry's key and the area's camp mark - A1's
+       250-unit 'pieces stand near the point' stand-in is gone (review F1597). A step that makes nothing sets only the camp maker's
+       count to 0 (its debris and loot-spawn parts still run; the maker frees its list as usual, decomp_92f250:392-397). */
+/* x / z within r (inclusive) - the step line's count of the pieces a step made around its point */
+inline int CampPieceNear(float px, float pz, float bx, float bz, float r)
+{
+    const float dx = bx - px, dz = bz - pz;
+    return (dx * dx + dz * dz <= r * r) ? 1 : 0;
+}
+/* the 'needs saving' answer: 1 save, 0 not. engine = the engine's own answer (kept whenever it is 'yes'). */
+inline int CampPieceSaveAnswer(int keepOn, int nameEmpty, int campPiece, int destroyed, int engine)
+{
+    if (engine) return 1;
+    return (keepOn && nameEmpty && campPiece && !destroyed) ? 1 : 0;
+}
+/* the camp maker's count during a step: 0 while the step is skipped (main thread, inside that step), else the engine's own */
+inline unsigned long long CampMakeCount(int skipping, unsigned long long engineCount) { return skipping ? 0ULL : engineCount; }
+
 }   // namespace campg
 
 #endif   // COOP_COMMON_CAMPGAME_H

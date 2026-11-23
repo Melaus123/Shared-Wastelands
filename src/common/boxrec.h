@@ -67,7 +67,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 173;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
+const unsigned int kProtocol = 177;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
                                                  list, kBrFlagUndos, and its ledger, kBrFlagLedger) */
 
 
@@ -112,7 +112,9 @@ const int kBrAccept = 0, kBrRefuseBadId = 1, kBrRefuseUnreadable = 2, kBrRefuseW
           kBrRefuseOwnerChange = 10, kBrRefuseOwnerKind = 11, kBrRefuseSameGen = 12,
           kBrRepeat = 13,                  /* not a refusal: the very same bytes again at the stored generation - nothing is written */
           kBrRefuseKindChange = 14,
-          kBrJudgeMax = 14;
+          kBrRefuseHeld = 15,           /* T-1429 review fold F1612 item 2 (protocol 174, unreleased - design b's unused aheadOfArea, never released, gives way): the stored
+                                           camp pieces record's file is held by another program - the writer writes again at its next event */
+          kBrJudgeMax = 15;
 
 /* one cancelled shop trade whose undo a shop's box contents hold: the asker's slot, its process epoch and the request id */
 struct BoxUndoKey { unsigned int asker, epoch, id; };
@@ -1114,6 +1116,7 @@ inline const char* BoxRefuseWhy(int why)
          : why == kBrRefuseSameGen ? "its generation equals the stored record's and its bytes differ"
          : why == kBrRepeat ? "the very same bytes again (taken, nothing written)"
          : why == kBrRefuseKindChange ? "it changes the kind (storage box, shop or cage) of a box a player owns, or drops the stored record's undo list"
+         : why == kBrRefuseHeld ? "the stored record's file is held by another program (written again at the writer's next event)"
          : "refused";
 }
 

@@ -551,6 +551,9 @@ struct Standing { int gen; unsigned standing; Standing() : gen(-1), standing((un
 /* the standing on the link `linkGen`: the server's last word on that link, none before its first */
 inline unsigned StandingNow(const Standing& s, int linkGen) { return (s.gen >= 0 && s.gen == linkGen) ? s.standing : (unsigned)adminauth::kStandNone; }
 /* an admin now: the owner (logged in with the owner password), or a logged-in admin */
+/* T-1399 fold (re-check M2): the world server has given this game its standing on the link `linkGen` (every admitted game gets one at its
+   door - store_main.cpp AdminDoorLogin); before that, "not an admin" is not yet the world server's word. A new link or its end forgets it. */
+inline bool StandingKnown(const Standing& s, int linkGen) { return s.gen >= 0 && s.gen == linkGen; }
 inline bool AdminBy(unsigned standing) { return standing == (unsigned)adminauth::kStandAdmin || standing == (unsigned)adminauth::kStandOwner; }
 /* the server's `standing` for `why`, taken on the link `linkGen`. *line = IdleEndLine() when a logged-in admin is one no longer for any
    reason but its own /logout - by this standing, or by a link that ended before this game saw it end; else empty. True = this game's

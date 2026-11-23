@@ -38,6 +38,9 @@ int LoadPostReady();   /* T-201 PP6' fold: 1 a load can be posted now, 0 a reque
 // Called from the menu pump (TitleScreen::update) on the main thread.
 // Cheap: does real work only every kPollInterval calls.
 void CommandChannelTick();
+#ifdef SW_DEV_BUILD
+void CommandChannelRefusedTick();   /* T-1457 TEST-ONLY: the switched-off test build's reader (load, uimenu ingame, the REPORT A BUG clicks) */
+#endif
 
 // Absolute path of a file sitting next to our DLL, in UTF-8 - open it with the u8file.h calls, never an A-call.
 // `filename` alone when Windows cannot name the DLL's file.

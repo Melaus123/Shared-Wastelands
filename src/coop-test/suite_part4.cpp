@@ -312,6 +312,18 @@ void t_t904_wall_hit()
         if (coopbuild::BuildKeyMarkSet(&mk, "c", 2) != 1 || coopbuild::BuildKeyMarkHas(mk, "a") != 0 || mk.size() != 2) Fail("T-904: the marker table did not drop its oldest past its cap");
         if (coopbuild::BuildKeyMarkClear(&mk, "b") != 1 || coopbuild::BuildKeyMarkHas(mk, "b") != 0 || coopbuild::BuildKeyMarkClear(&mk, "b") != 0) Fail("T-904: a marker was not cleared once");
     }
+    /* T-1396: a gate blow's line on its own launch cap */
+    {
+        long long w = 0, o = 0;
+        if (coopbuild::BuildGateLineTake(0, &w, &o, 2) != 0 || w != 0 || o != 0) Fail("T-1396: a line that is not a gate blow took the gate cap");
+        if (coopbuild::BuildGateLineTake(1, &w, &o, 2) == 0 || coopbuild::BuildGateLineTake(1, &w, &o, 2) == 0 || w != 2 || o != 0) Fail("T-1396: a gate blow under the cap was not written");
+        if (coopbuild::BuildGateLineTake(1, &w, &o, 2) != 0 || w != 2 || o != 1) Fail("T-1396: a gate blow past the cap was written or not counted over");
+        if (coopbuild::kBuildGateLineCap != 60) Fail("T-1396: the gate line cap is not 60");
+        if (coopbuild::BuildGateBlow(0, 0, -1) == 0 || coopbuild::BuildGateBlow(2, 0, 0) == 0) Fail("T-1396: a door blow is not a gate blow");
+        if (coopbuild::BuildGateBlow(0, 1, 1) != 0) Fail("T-1396: a repair's gain is a gate blow");
+        if (coopbuild::BuildGateBlow(-1, 0, 1) == 0) Fail("T-1396: a blow on a wall piece with a door is not a gate blow");
+        if (coopbuild::BuildGateBlow(-1, 0, 0) != 0 || coopbuild::BuildGateBlow(-1, 0, -1) != 0) Fail("T-1396: a blow on a wall with no door read is a gate blow");
+    }
     /* the replayed seqs */
     {
         std::vector<unsigned int> seen;
@@ -1205,6 +1217,10 @@ void t_installer1_steam_paths()
     if (coopinst::WorkshopGameFolder("D:\\SteamLibrary\\steamapps\\workshop\\content\\233860\\") != "") Fail("no item id is not the layout");
     if (coopinst::WorkshopGameFolder("D:\\SteamLibrary\\steamapps\\workshop\\content\\294100\\1") != "") Fail("another game's Workshop folder was taken");
     if (coopinst::WorkshopGameFolder("C:\\Kenshi\\mods\\Shared Wastelands") != "") Fail("a mods folder is not the Workshop layout");
+    if (!coopinst::IsGameExeName("kenshi_x64.exe") || !coopinst::IsGameExeName("kenshi_GOG_x64.exe")) Fail("Steam or GOG game file name not recognised");
+    if (!coopinst::IsGameExeName("KENSHI_GOG_X64.EXE") || !coopinst::IsGameExeName("Kenshi_x64.exe")) Fail("game file name case not ignored");
+    if (coopinst::IsGameExeName("kenshi_x64_vanilla.exe") || coopinst::IsGameExeName("kenshi.exe") || coopinst::IsGameExeName("")) Fail("another file name taken for the game");
+    if (coopinst::GameExeCount() != 2 || std::string(coopinst::GameExeName(2)) != "") Fail("game file name list");
 }
 
 /* T-1364 (owner 1667 / 1668): does Setup copy its own folder into <Kenshi>\mods\?  And when is it installed? */

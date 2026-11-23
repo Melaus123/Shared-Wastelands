@@ -87,6 +87,19 @@ int HandoffGivenSlotId(const std::string& id);   /* T-1318 fold 2: the one slot 
 int HandoffSleepersTakenBy(void* faction, const std::string& id, const std::vector<std::string>& hands);
 long long HandoffIdxSeq();   /* review fold: receiver tests skipped (no other game has the area loaded) / run */
 bool HandoffForcedRefusedFor(unsigned int uid);
+/* T-1467 (owner 1863 a / 1864 a / 1865 a; src/common/carryhand.h): A CARRIED BODY HANDED, ALONE, TO ITS CARRIER'S GAME. MAIN THREAD, all.
+   The body's game: HandoffCarryOffer - one XFER (reason coopsquad::kXferReasonCarry) naming only `body`, to the game that runs `carrier`
+   (1 sent, 0 not); HandoffCarryState - this carry's carryhand::kHand* state for `body`; HandoffCarryForget - the carry ended here (its
+   state goes). The carrier's game: HandoffCarryRefusedHere - this game refused `body`'s carry hand-over and `carrier` still carries it
+   (the announce pass's hold ends); HandoffCarryRefusedSweep - refusals whose carry ended go (the announce pass, each second);
+   HandoffCarryHoldNote - the announce pass held `carrier` for `body` (counted, its first lines logged).
+   T-1467 attempt 2: byCountdown 1 = the offer was triggered by the engine's countdown to put the copy carrier's squad away (its line says so). */
+int HandoffCarryOffer(unsigned int body, unsigned int carrier, int byCountdown);
+int HandoffCarryState(unsigned int body);
+void HandoffCarryForget(unsigned int body);
+int HandoffCarryRefusedHere(unsigned int body, unsigned int carrier);
+void HandoffCarryRefusedSweep();
+void HandoffCarryHoldNote(unsigned int carrier, unsigned int body);
 /* a final leaver's NPC (handoff.cpp): the area receiver order asked in the leaver's place at the squad's decision position, without
    the receivers already passed over (k, first slot), and this game's take */
 int HandoffGoneFirstReceiver(int goneSlot, unsigned int uid, const std::vector<int>& tried, int* firstOut);

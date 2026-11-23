@@ -57,11 +57,16 @@
 namespace areafresh {
 
 const unsigned int kMsgAreaFresh = 89u;   /* 28-87 are taken on the world-server link (store_main.cpp's enum and constants); 88 is CHUNK on effort/t1118f / t1118g (part 3) */
-const unsigned int kProtocol = 173u;      /* the world-server protocol that carries AREA_FRESH (127 since part 3 moved it to 89; 149: T-1279 - an ASK no live holder can answer is answered from the world server's records; 165-168 (T-1429 on its branch, never reused): 165: T-1429 s2 - LEASE / WAIT and the world-load claim; 166: s2 fold 1 - the ASK why=settle before the world load; 167: s2 fold 2 - the settle ask carries the whole ordered area list, and why worldFirst; 168: s2 fold 3 - an area RECORD carries its base (the stored copy's seq it was made from) and a stale one is answered CANT staleBase; 169: the merge of those with main's 165, T-1427 - a piece record may carry the builder's town; 170: the merge of 169 with effort/t1408a's wall group facts in a piece record's STATE, T-1408) */
+const unsigned int kProtocol = 177u;      /* the world-server protocol that carries AREA_FRESH (127 since part 3 moved it to 89; 149: T-1279 - an ASK no live holder can answer is answered from the world server's records; 165-168 (T-1429 on its branch, never reused): 165: T-1429 s2 - LEASE / WAIT and the world-load claim; 166: s2 fold 1 - the ASK why=settle before the world load; 167: s2 fold 2 - the settle ask carries the whole ordered area list, and why worldFirst; 168: s2 fold 3 - an area RECORD carries its base (the stored copy's seq it was made from) and a stale one is answered CANT staleBase; 169: the merge of those with main's 165, T-1427 - a piece record may carry the builder's town; 170: the merge of 169 with effort/t1408a's wall group facts in a piece record's STATE, T-1408; 175 (unreleased): T-1429 F1622 - HELD carries the holder-only camp layer rule; 176 (unreleased): T-1429 F1753 design a - camplaid record format 3, each camp piece carries its inside byte; 177 (unreleased): T-1429 F1796 design b - ground record format 3, gone rows) */
 
 
 
-enum { kAsk = 1, kWrite = 2, kCant = 3, kFresh = 4, kLease = 5, kWait = 6 };   /* T-1429 s2: 5 / 6 down only */
+enum { kAsk = 1, kWrite = 2, kCant = 3, kFresh = 4, kLease = 5, kWait = 6, kHeld = 7 };   /* T-1429 s2: 5 / 6 down only; T-1429 F1617: 7 down only */
+/* T-1429 re-check fold F1617 items 1 / 4: kHeld (world server -> one game, layer byte kLayerAsker) - "you hold this area now and no other
+   game is its camp layer": sent on the world server's own holder change (AreaChargeSweep: an assign or a pass to this game), on a holder's
+   relisting of an area it holds after a report that did not list it, and when a held HELD's camp pieces record settles (F1622: HeldTellDue),
+   right after the area's stored camp pieces record (the same line, so the game has the record first). The game runs its kept owed steps
+   whose keys neither its note nor the record has, and writes its kept camp pieces write now (no timer). */
 const size_t kMsgSize = 20;
 
 /* why (a CANT's reason; kWhyNone = no reason - a WRITE / FRESH, or the world server's "write it") */
@@ -85,7 +90,36 @@ inline int RecRefusalOf(unsigned int why)
 /* T-1391 fold 2 (protocol 172): a record refusal is the 36-byte form - the 20 bytes with stamp = THE REFUSED UPLOAD'S stamp (the game
    matches the answer to the send it answers), then the stored copy's stamp and seq (0, 0 = none / not known): a game whose earlier send of
    the same save is the stored copy takes the refusal of a re-send as its earlier send's accept */
-struct Msg { unsigned int kind, why; int x, y; long long stamp; long long storedStamp; unsigned long long storedSeq; Msg() : kind(0u), why(0u), x(-1), y(-1), stamp(0), storedStamp(0), storedSeq(0ULL) {} };
+struct Msg { unsigned int kind, why; int x, y; long long stamp; long long storedStamp; unsigned long long storedSeq; unsigned int layer; Msg() : kind(0u), why(0u), x(-1), y(-1), stamp(0), storedStamp(0), storedSeq(0ULL), layer(0u) {} };
+/* T-1429 camp note design (F1608; protocol 174 kept - unreleased): THE CAMP LAYER, byte 2 of a FRESH / CANT / LEASE / WAIT the world
+   server sends an ASKER (0 in every other message): which game lays the area's camps for this load (camplaid.h CampNoteStepDecide) - the
+   area's live holder (or the creation lease's holder), else the asker. 1 = the asker (a LEASE; an answer from the records - no live
+   holder; a holder's CANT that says it does not run the area), 2 = another game (a holder's WRITE round answered FRESH; a WAIT; a FRESH of a
+   finished round), 0 = not about the layer (F1612 item 1: a message that is no answer to an area ask - the game keeps the answer it
+   has). Every answer to an asker names 1 or 2 from the real fact (ServerLayerFor). An event: the game takes it at its next file read of the area. */
+enum { kLayerNone = 0, kLayerAsker = 1, kLayerOther = 2 };
+inline unsigned int LayerOfHolderCant(unsigned int why)
+{
+    return (why == (unsigned int)kWhyNotLoaded || why == (unsigned int)kWhyNoWorld || why == (unsigned int)kWhyHolderGone || why == (unsigned int)kWhyDropped
+            || why == (unsigned int)kWhyNotHolder || why == (unsigned int)kWhyHolderNotLive || why == (unsigned int)kWhyNotPublished) ? (unsigned int)kLayerAsker : (unsigned int)kLayerOther;
+}
+/* T-1429 re-check fold F1622 item 1 (THE RULE): ONLY THE AREA'S HOLDER IS EVER ITS CAMP LAYER - one holder at a time is the world
+   server's single fact (AreaChargeSweep), so two games never lay one area. An answer to an asker names the asker (kLayerAsker) only when
+   the asker IS the area's holder now (askerHolds: the area table names its slot on its live connection - a holder that loads the area
+   again, a restored holder at its world load); else another game (kLayerOther) - the asker's owed steps are kept and run at the world
+   server's HELD, which comes when the asker becomes the holder (its report lists the area). A LEASE or a WAIT is judged the same way
+   (askers never lay). Replaces F1612's naming of an asker and F1617's naming end (an end on reports could come early - F1622 item 1). */
+inline unsigned int ServerLayerFor(unsigned int kind, int askerHolds)
+{
+    (void)kind;
+    return askerHolds != 0 ? (unsigned int)kLayerAsker : (unsigned int)kLayerOther;
+}
+/* T-1429 re-check fold F1622 items 1 / 5: the world server tells game `holder` HELD for an area when it holds it and the area's camp
+   pieces record is SETTLED - no write of the record is out to the disk or held behind one (recordSettling 0). While one is, the HELD
+   waits and is told when the last of them lands (store_main.cpp AfHeldSettled) - so a new holder never lays a key the previous layer's
+   write is still carrying. The previous layer's writes reach the world server before the report that passes the holder (the game sends
+   each write when it lays, on the same ordered line as its area reports - camp.cpp ClWriteNow). */
+inline int HeldTellDue(int holder, int recordSettling) { return (holder >= 0 && recordSettling == 0) ? 1 : 0; }
 /* the world server's mirror version of an area copy this game wrote: the seq the world server stored it with when it is confirmed (a copy
    received from it, or a queued save written only after its accept), 0 for this game's own unconfirmed save (B1, review of 2ab363d9c) */
 inline unsigned long long MirrorSeqOnWrite(int confirmed, unsigned long long seq) { return confirmed != 0 ? seq : 0ULL; }
@@ -102,10 +136,10 @@ inline unsigned int Get32(const char* p)
     return (unsigned int)(unsigned char)p[0] | ((unsigned int)(unsigned char)p[1] << 8) | ((unsigned int)(unsigned char)p[2] << 16) | ((unsigned int)(unsigned char)p[3] << 24);
 }
 /* false (nothing appended) for an unknown kind, a why out of range, a square off the grid or a negative stamp */
-inline bool Encode(std::vector<char>* b, unsigned int kind, unsigned int why, int x, int y, long long stamp)
+inline bool Encode(std::vector<char>* b, unsigned int kind, unsigned int why, int x, int y, long long stamp, unsigned int layer = 0u)
 {
-    if (kind < (unsigned int)kAsk || kind > (unsigned int)kWait || why >= (unsigned int)kWhyCount || !OnGrid(x, y) || stamp < 0) return false;
-    b->push_back((char)kind); b->push_back((char)why); b->push_back(0); b->push_back(0);
+    if (kind < (unsigned int)kAsk || kind > (unsigned int)kHeld || why >= (unsigned int)kWhyCount || !OnGrid(x, y) || stamp < 0 || layer > (unsigned int)kLayerOther) return false;
+    b->push_back((char)kind); b->push_back((char)why); b->push_back((char)layer); b->push_back(0);
     Put32(b, (unsigned int)x); Put32(b, (unsigned int)y);
     const unsigned long long s = (unsigned long long)stamp;
     Put32(b, (unsigned int)(s & 0xFFFFFFFFull)); Put32(b, (unsigned int)(s >> 32));
@@ -125,13 +159,14 @@ inline bool EncodeRecRefusal(std::vector<char>* b, unsigned int why, int x, int 
 }
 inline bool Decode(const char* p, size_t n, Msg* m)
 {
-    if (p == 0 || (n != kMsgSize && n != kRecMsgSize) || p[2] != 0 || p[3] != 0) return false;
+    if (p == 0 || (n != kMsgSize && n != kRecMsgSize) || (unsigned char)p[2] > (unsigned char)kLayerOther || p[3] != 0) return false;
     Msg d;
+    d.layer = (unsigned int)(unsigned char)p[2];   /* T-1429 camp note design: the camp layer byte */
     d.kind = (unsigned int)(unsigned char)p[0]; d.why = (unsigned int)(unsigned char)p[1];
     d.x = (int)Get32(p + 4); d.y = (int)Get32(p + 8);
     const unsigned long long s = (unsigned long long)Get32(p + 12) | ((unsigned long long)Get32(p + 16) << 32);
     d.stamp = (long long)s;
-    if (d.kind < (unsigned int)kAsk || d.kind > (unsigned int)kWait || d.why >= (unsigned int)kWhyCount || !OnGrid(d.x, d.y) || d.stamp < 0) return false;
+    if (d.kind < (unsigned int)kAsk || d.kind > (unsigned int)kHeld || d.why >= (unsigned int)kWhyCount || !OnGrid(d.x, d.y) || d.stamp < 0) return false;
     if (n == kRecMsgSize)
     {   /* T-1391 fold 2: only a record refusal comes in the long form */
         if (d.kind != (unsigned int)kCant || RecRefusalOf(d.why) == 0) return false;
@@ -741,7 +776,7 @@ inline int StaleBaseLifts(unsigned long long baseAtLoad) { return baseAtLoad != 
    records it; where the mirror's version came from is kept beside it (MirrorFrom*), and the road that set the content base (BaseRoad*)
    goes on the save's BASE line. ---- */
 enum { kMirrorFromOwn = 0, kMirrorFromRecv = 1, kMirrorFromKept = 2, kMirrorFromIndex = 3 };
-enum { kBaseRoadNone = 0, kBaseRoadLoadRecv = 1, kBaseRoadLoadKept = 2, kBaseRoadMirror = 3, kBaseRoadAdopt = 4, kBaseRoadEcho = 5 };
+enum { kBaseRoadNone = 0, kBaseRoadLoadRecv = 1, kBaseRoadLoadKept = 2, kBaseRoadMirror = 3, kBaseRoadAdopt = 4, kBaseRoadEcho = 5, kBaseRoadOwnSave = 6 };   /* OwnSave: T-1391 F1631 item 1 */
 /* a load: the road is where the mirror's version came from (a received copy, the kept table, the start-up copy); none when no base */
 inline int BaseRoadOnLoad(unsigned long long base, int mirrorFrom)
 {
@@ -765,6 +800,7 @@ inline const char* BaseRoadName(int road)
     case kBaseRoadMirror:   return "mirror (the start-up copy of the world server's files, loaded)";
     case kBaseRoadAdopt:    return "adopt (a newer copy taken while loaded)";
     case kBaseRoadEcho:     return "echo (the world server stored this game's own upload)";
+    case kBaseRoadOwnSave:  return "load (this game's own save the world server has not confirmed - the version it was made from)";
     default:                return "none (no world copy known - only a first upload is taken)";
     }
 }
@@ -772,6 +808,269 @@ inline const char* BaseRoadName(int road)
 inline int BaseLineDue(long long nth) { return (nth >= 1 && nth <= 64) ? 1 : 0; }
 /* ... and any area record that replaces a bigger stored one is logged (old -> new size) */
 inline int ServerSmallerReplace(int storedHasFile, long long storedLen, long long newLen) { return (storedHasFile != 0 && newLen < storedLen) ? 1 : 0; }
+
+/* ---- T-1391 (F1626): THE LINK-UP PUSH AND THE RECONNECT. ----
+   A. At the WELCOME a game pushed up every area row the download did not carry, with its own content version - a copy it merely loaded
+   or received as well as its own unsent work. Now an area row goes up only when it is THIS game's own save the world server has not
+   confirmed (the mirror holds this game's save at the row's stamp with no version: seq 0, from this game's save or its kept copy of one),
+   carried down or not (the answer confirms its version), and never while the area map names another game as the area's holder. A copy
+   received from the world server is never pushed: the world server holds it, or a newer one. */
+enum { kPushOwnUnsent = 0, kPushSkipNotOwn = 1, kPushSkipConfirmed = 2, kPushSkipHeldElsewhere = 3 };
+inline int RepushAreaDecide(int haveMirror, int mirrorFrom, unsigned long long mirrorSeq, long long mirrorAt, long long rowAt, int holderSlot, int mySlot)
+{
+    if (haveMirror == 0 || rowAt <= 0 || mirrorAt != rowAt || (mirrorFrom != kMirrorFromOwn && mirrorFrom != kMirrorFromKept)) return kPushSkipNotOwn;
+    if (mirrorSeq != 0) return kPushSkipConfirmed;
+    if (holderSlot >= 0 && holderSlot != mySlot) return kPushSkipHeldElsewhere;
+    return kPushOwnUnsent;
+}
+inline const char* RepushAreaName(int v)
+{
+    return v == kPushOwnUnsent ? "pushed (this game's own save, not confirmed by the world server)"
+         : v == kPushSkipNotOwn ? "not pushed (a copy this game received or loaded - the world server holds it or a newer one)"
+         : v == kPushSkipConfirmed ? "not pushed (this game's own save, already stored by the world server)"
+         : v == kPushSkipHeldElsewhere ? "not pushed now (another game holds the area - it waits, and goes at the area map that frees the area)" : "unknown";
+}
+/* B. THIS GAME'S OWN UPLOADS WHOSE ECHO HAS NOT COME (stamps, oldest first, at most kUnechoedMax): an echo lost in a link drop leaves its
+   stamp here, so the world server's later answer that names it as the stored copy is known as this game's own work. */
+const size_t kUnechoedMax = 16;
+inline void UnechoedAdd(std::vector<long long>* v, long long stamp)
+{
+    if (v == 0 || stamp <= 0) return;
+    for (size_t i = 0; i < v->size(); ++i) if ((*v)[i] == stamp) return;
+    v->push_back(stamp);
+    while (v->size() > kUnechoedMax) v->erase(v->begin());
+}
+inline int UnechoedHas(const std::vector<long long>& v, long long stamp)
+{
+    if (stamp <= 0) return 0;
+    for (size_t i = 0; i < v.size(); ++i) if (v[i] == stamp) return 1;
+    return 0;
+}
+/* an echo of `stamp` (or the answer naming it stored): it and every earlier send are settled */
+inline void UnechoedDropUpTo(std::vector<long long>* v, long long stamp)
+{
+    if (v == 0) return;
+    std::vector<long long> keep;
+    for (size_t i = 0; i < v->size(); ++i) if ((*v)[i] > stamp) keep.push_back((*v)[i]);
+    v->swap(keep);
+}
+inline void UnechoedDrop(std::vector<long long>* v, long long stamp)
+{
+    if (v == 0) return;
+    std::vector<long long> keep;
+    for (size_t i = 0; i < v->size(); ++i) if ((*v)[i] != stamp) keep.push_back((*v)[i]);
+    v->swap(keep);
+}
+/* A REFUSAL THAT NAMES THIS GAME'S OWN STORED COPY. ans: the refusal (coopqueue kZrAns*: 1 staleBase, 4 recNotNewer); uploadStamp: the
+   refused upload's; storedStamp / storedSeq: the stored copy's; storedIsOwnSend: the stored stamp is one of this game's unechoed uploads;
+   rowAt: the stamp of this game's newest copy of the area. kOwnStoredEcho - the stored copy IS the refused upload (the same save sent again
+   after its echo was lost): its version is learned as an echo. kOwnStoredRebase - the stored copy is this game's earlier upload, which the
+   content here builds on: its version is learned and, when the refused upload is this game's newest copy (*resend), it is sent again on
+   that version. kOwnStoredNo - not this game's copy: the ordinary refusal. Neither own answer holds the area's later saves back. */
+enum { kOwnStoredNo = 0, kOwnStoredEcho = 1, kOwnStoredRebase = 2 };
+inline int OwnStoredDecide(int ans, long long uploadStamp, long long storedStamp, unsigned long long storedSeq, int storedIsOwnSend, long long rowAt, int* resend)
+{
+    if (resend != 0) *resend = 0;
+    if ((ans != 1 && ans != 4) || storedStamp <= 0 || storedSeq == 0ULL) return kOwnStoredNo;
+    if (storedStamp == uploadStamp) return kOwnStoredEcho;
+    if (storedIsOwnSend == 0) return kOwnStoredNo;
+    if (resend != 0 && uploadStamp > storedStamp && rowAt == uploadStamp) *resend = 1;
+    return kOwnStoredRebase;
+}
+/* the content base of this answer goes through the echo's own step (store.cpp ZoneContentBaseOnEcho, ContentBaseOnEcho): an ECHO with the
+   stamp loaded here; a REBASE as the echo of the earlier upload the content here builds on - so the loaded stamp given is the stored
+   copy's when the area is loaded here (the content base moves to the stored seq, never back), else the loaded stamp as it is */
+inline long long OwnStoredLoadedStamp(int verdict, int loadedKnown, long long loadedStamp, long long storedStamp)
+{
+    return (verdict == kOwnStoredRebase && loadedKnown != 0) ? storedStamp : loadedStamp;
+}
+/* F1631 item 2: the CANT staleBase hold (nothing of the area published until a load takes the world's copy) and the zeroing of the held
+   row (the next load fetches the world's copy) are skipped ONLY when the world server's stored copy is this game's own (ownStored, which
+   the refusal road answers before the stale branch). A refused link-up push naming ANOTHER game's newer copy holds as any refused save:
+   the content here is stale, and without the hold the stale file would be served again and the next load would not ask. */
+inline int StaleHoldApplies(int ownStored) { return ownStored == kOwnStoredNo ? 1 : 0; }
+
+/* ---- T-1391 F1631: THE PUSH / RECONNECT DECISIONS store.cpp makes, here so they are driven in tests. ---- */
+/* item 3: THE ROAD OF AN AREA RECORD'S REFUSAL. replayResult: store.cpp ZoneReplayAnswer (0 = not a queued save's answer, 1 = a queued
+   save's answer that was not committed, 2 = committed or re-based on this game's earlier send); ownStored: OwnStoredDecide, asked only
+   when replayResult is 0 (the queued road answers first, it owns its saves' stamps); isStaleBase: the refusal is CANT staleBase. */
+enum { kRfDone = 0, kRfOwnStored = 1, kRfOrdinary = 2, kRfStale = 3 };
+inline int RefusalRoad(int replayResult, int ownStored, int isStaleBase)
+{
+    if (replayResult == 2) return kRfDone;
+    if (replayResult == 0 && ownStored != kOwnStoredNo) return kRfOwnStored;
+    return isStaleBase != 0 ? (int)kRfStale : (int)kRfOrdinary;
+}
+/* OwnStoredDecide is asked only on the road it can change */
+inline int OwnStoredAsked(int replayResult) { return replayResult == 0 ? 1 : 0; }
+/* item 4: the link-up push's stamp per area is settled by ANY answer to that stamp (its echo, any refusal); 1 = this answer is the push's */
+inline int RepushAnswered(int pushKnown, long long pushStamp, long long answerStamp) { return (pushKnown != 0 && pushStamp > 0 && pushStamp == answerStamp) ? 1 : 0; }
+/* the area map's holder of a record's area: -1 when the record id names no area */
+inline int HolderSlotOrNone(int parsedOk, int holderSlot) { return parsedOk != 0 ? holderSlot : -1; }
+/* item 1: THE BASE AN OWN SAVE WAS MADE FROM, kept with the stamp of that save (store.cpp g_zoneOwnRowBase, and the kept table's row so it
+   survives a quit). It belongs to a row only while the row is that save. */
+inline int OwnBaseFor(int ownKnown, long long ownAt, long long rowAt) { return (ownKnown != 0 && rowAt > 0 && ownAt == rowAt) ? 1 : 0; }
+/* the link-up push goes with the base the save was made from; with none kept, the content base (as before) */
+inline unsigned long long PushBaseOf(int ownBaseHere, unsigned long long ownBase, unsigned long long contentBase) { return ownBaseHere != 0 ? ownBase : contentBase; }
+/* a load of the area: the world copy's version when the loaded copy is one (worldBase, ContentBaseOnLoad); a load of this game's own save
+   the world server has not confirmed is made from the version that save was made from - its next save is judged by that copy (before:
+   0, refused STALE BASE wherever the world holds a copy). worldBase alone lifts a STALE BASE hold and ends the unechoed list. */
+inline unsigned long long ContentBaseOnLoadOwn(unsigned long long worldBase, int ownBaseHere, unsigned long long ownBase)
+{
+    return worldBase != 0 ? worldBase : ownBaseHere != 0 ? ownBase : 0ULL;
+}
+inline int BaseRoadOnLoadOwn(unsigned long long worldBase, int mirrorFrom, int ownBaseHere)
+{
+    return worldBase != 0 ? BaseRoadOnLoad(worldBase, mirrorFrom) : ownBaseHere != 0 ? (int)kBaseRoadOwnSave : (int)kBaseRoadNone;
+}
+/* item 5: AN OWN UNSENT SAVE OF AN AREA ANOTHER GAME HOLDS. The world server takes an area record only from the area's holder, or while
+   nobody holds it (zonerec::ZoneJudgeWrite; a non-holder's is refused recNotHolder and dropped) - so the save waits, and at each area map
+   (the event that settles who holds an area) it is decided again: sent once no other game holds the area, kept while one does, dropped
+   from the wait once the row is no longer this game's own unconfirmed save (a newer copy came, or the save went up). */
+enum { kHeldPushSend = 0, kHeldPushKeep = 1, kHeldPushDrop = 2 };
+/* T-1391 F1633 item 3: an area record goes up only with the bytes of its file - a read that failed (or an empty file) never sends an empty
+   area record; the save waits for the next area map (g_zonePushHeldWait) */
+inline int AreaPushBytesOk(int readOk, size_t n) { return (readOk != 0 && n > 0) ? 1 : 0; }
+/* T-1391 F1635 item 3: an area file that keeps failing to read is retried at every area map - only its FIRST failure is logged (areaFails:
+   this area's failures so far, this one counted; at most 32 areas get a line), the rest are counted and the count is said when the area's
+   save is sent or its wait ends */
+inline int PushReadFailLineDue(long long areaFails, long long areasLogged) { return (areaFails == 1 && areasLogged < 32) ? 1 : 0; }
+inline int HeldPushStep(int pushVerdict)
+{
+    return pushVerdict == kPushOwnUnsent ? (int)kHeldPushSend : pushVerdict == kPushSkipHeldElsewhere ? (int)kHeldPushKeep : (int)kHeldPushDrop;
+}
+/* T-1391 (F1653, the hand-over rule): an upload of this game's own unconfirmed save refused recNotHolder (another game holds the area at
+   the world server) is never dropped - it WAITS (g_zonePushHeldWait) and is decided again at each area map (HeldPushStep), across a quit
+   (the kept row and its .unsent file carry it to the next link-up push). isNotHolder: the refusal is recNotHolder; pushVerdict: the
+   area row's RepushAreaDecide now. 1 = wait. */
+inline int NotHolderWaits(int isNotHolder, int pushVerdict)
+{
+    return (isNotHolder != 0 && (pushVerdict == kPushOwnUnsent || pushVerdict == kPushSkipHeldElsewhere)) ? 1 : 0;
+}
+/* the area's pending mark (F1706: the state file's pending flag, was its .unsent file) goes once the area's row is no longer this game's own
+   unconfirmed save: confirmed (the world server stored it) or replaced (after the own-work check, which runs where a copy replaces it) */
+inline int UnsentSideClears(int pushVerdict) { return (pushVerdict == kPushSkipConfirmed || pushVerdict == kPushSkipNotOwn) ? 1 : 0; }
+/* review of e3082c6cc (S3): a copy received from the world server ends this game's own unsent save of the area only when it is NEWER than
+   that save; a copy as old or older (the holder's 'taken although not newer' road) does not replace it - the save keeps waiting ('not
+   holder' waits, the push carries it). ownUnsent: the area has an own unsent save; 1 = the received copy may replace it */
+inline int RecvEndsUnsent(int ownUnsent, long long recvAt, long long ownAt) { return (ownUnsent == 0 || recvAt > ownAt) ? 1 : 0; }
+/* where a loaded copy came from (store.cpp ZoneLoadedCopy.road - the log-only own-work line and the held save's load count read it; F1677:
+   never the base of a check) */
+enum { kLcFromNone = 0, kLcFromOwnSave = 1, kLcFromRecord = 2, kLcFromKenshiFile = 3 };
+/* ---- T-1391 (F1677 design, 2026-11-20): THE BASE OF EVERY OWN AREA SAVE IS THE WORLD COPY THIS GAME LOADED. Established practice: a
+   three-way merge's base is the COMMON ANCESTOR - the last version both sides agree on. Here that is the world copy whose version equals
+   the area's content base (store.cpp ZoneBaseOf), kept on disk as the area's .base / .basev (mirrorkeep KeptBase*) from the moment
+   anything would overwrite the mirror file holding it. Gone: the in-memory loaded copy as a base, the guess about who wrote it, and the
+   'slot not known (-1) = own unconfirmed' rule that refused a base to every first save after a link drop (T2703: 11 NOT KNOWN). ---- */
+/* BEFORE ANY WRITE OVER THE MIRROR FILE (an own save, a received copy, a replay). keptThere / keptSeq: a kept base and its version;
+   mirrorKnown / mirrorSeq: the mirror file's version (store.cpp g_zoneMirrorBase; 0 = this game's own copy not yet confirmed);
+   contentBase: the version of the content loaded here (0 = none); gameData: the area's last load was not from a record - Kenshi built it
+   from its game data or its own save file, so no world copy was loaded.
+   - a world version is the content base and the mirror holds it, not yet kept (or the kept one is another version): keep the mirror's
+     bytes (a newer world copy became the content base: the kept one is replaced);
+   - no world copy loaded (content base 0, built from game data) and nothing kept: keep the EMPTY area - everything counts as own;
+   - else nothing: a kept base stays (an older one is still an ancestor of what is loaded: more counts as own, never less). */
+enum { kKbNone = 0, kKbKeepMirror = 1, kKbKeepEmpty = 2 };
+inline int KeptBaseStep(int keptThere, unsigned long long keptSeq, int mirrorKnown, unsigned long long mirrorSeq, unsigned long long contentBase, int gameData)
+{
+    if (contentBase != 0ULL) return (mirrorKnown != 0 && mirrorSeq == contentBase && (keptThere == 0 || keptSeq != contentBase)) ? (int)kKbKeepMirror : (int)kKbNone;
+    return (gameData != 0 && keptThere == 0) ? (int)kKbKeepEmpty : (int)kKbNone;
+}
+/* AT EACH CHANGE OF THE CONTENT BASE (a load of a world copy, the echo of this game's own upload loaded here, an adopt, a journal replay
+   taken): the kept base goes once a NEWER world version is the content base AND the mirror file holds it (so the next write over the
+   mirror keeps that one) - an echo confirming this game's newer own save, or a newer world copy loaded. A content base of 0 (a load not
+   from a world copy) never clears it; a mirror not holding the new version leaves the older one kept (replaced at the next keep). */
+inline int KeptBaseClears(int keptThere, unsigned long long keptSeq, unsigned long long contentBase, int mirrorKnown, unsigned long long mirrorSeq)
+{
+    return (keptThere != 0 && contentBase != 0ULL && contentBase != keptSeq && mirrorKnown != 0 && mirrorSeq == contentBase) ? 1 : 0;
+}
+/* THE BASE EVERY OWN-WORK CHECK READS (the received-copy road, the stale refusal, the stale hold): the kept base when there is one; with
+   none, the EMPTY area when no world copy was loaded (content base 0 and the last load built from game data: everything in the save is
+   this game's own - chosen over NOT KNOWN because it can only count more as own, never less, and a placed piece's own record still
+   carries it); otherwise NOT KNOWN (a FAULT with the bytes set aside). */
+enum { kCbNotKnown = 0, kCbKept = 1, kCbEmpty = 2 };
+inline int CheckBaseRoad(int keptThere, unsigned long long contentBase, int gameData)
+{
+    if (keptThere != 0) return kCbKept;
+    return (contentBase == 0ULL && gameData != 0) ? (int)kCbEmpty : (int)kCbNotKnown;
+}
+/* THE RECEIVED-COPY ROAD checks the save a received copy replaces when the mirror holds this game's own save the world has not confirmed:
+   an unsent one (link down: .unsent) OR one sent with the link up whose echo has not come (mirror version 0, its stamp still unechoed).
+   Before F1677 only the unsent one - a link-up save replaced by a newer copy before its STALE refusal arrived was never checked (T2703
+   LEG 3: 'the newer copy came first'). */
+/* T-1391 F1680 fold (q7): AN OWN SAVE IS PENDING for an area while the mirror holds this game's own save the world server has not
+   confirmed - one kept as .unsent (made with the link down; since M1 also one sent with the link up, until its echo) or one sent with
+   the link up whose stamp is still unechoed. An .unsent whose save the world confirmed (the mirror has its version) is not pending:
+   it goes at that echo. Read by the received-copy road (RecvChecksOwn), the 'taken although not newer' road (M2) and the kept base's
+   idle clear (L3). */
+inline int OwnSavePending(int unsentHere, int mirrorKnown, unsigned long long mirrorSeq, int mirrorStampUnechoed)
+{
+    const int confirmed = (mirrorKnown != 0 && mirrorSeq != 0ULL) ? 1 : 0;
+    return ((unsentHere != 0 && confirmed == 0) || (mirrorKnown != 0 && mirrorSeq == 0ULL && mirrorStampUnechoed != 0)) ? 1 : 0;
+}
+inline int RecvChecksOwn(int unsentHere, int mirrorKnown, unsigned long long mirrorSeq, int mirrorStampUnechoed)
+{
+    return OwnSavePending(unsentHere, mirrorKnown, mirrorSeq, mirrorStampUnechoed);
+}
+/* M2: a copy the area's holder sent that is NOT newer than the record held here ('taken although not newer') never replaces an own
+   pending save - unsent OR sent and not echoed (before q7 only the unsent one). That save's own answer is still to come (its echo, or a
+   refusal whose stale road runs the own-work check); taking the older copy over it would drop it unchecked, and an echo after would leave
+   the mirror holding the older copy. 1 = take it. */
+inline int NotNewerTakes(int ownPending) { return ownPending == 0 ? 1 : 0; }
+/* L1: THE OWN SIDE OF AN OWN-WORK CHECK is read with this game's real identity in this world: the slot it holds now, else the slot it last
+   held IN THIS WORLD (store.cpp g_lastKnownSlot, written at every WELCOME with the world it was named in) - never -1 merely because the
+   link is down (that read every own piece as 'the writer's player, slot not known' against the base's 'player N': a false FAULT). */
+inline int OwnSideSlot(int mySlot, int lastKnownSlot, int lastKnownSameWorld)
+{
+    if (mySlot >= 0) return mySlot;
+    return (lastKnownSlot >= 0 && lastKnownSameWorld != 0) ? lastKnownSlot : -1;
+}
+/* L2 / F1683 C2 (the base and its version line swapped through .basen / .basevn, and the leftover rules for them): GONE with T-1391 design
+   B (F1706) - the base bytes and their version live in the area's one state file (areastate.h) and change in the same commit; the old
+   leftover rule survives only as the migration's reading of old files (areastate::MigBaseFrom). */
+/* L3: A KEPT BASE NOBODY NEEDS goes: no own save pending for the area (OwnSavePending), the area not loaded here, and the mirror holding
+   a world version (mirrorWorld: its seq known and not 0). The next own save of the area needs a load first, and that load takes the
+   mirror's copy - its version becomes the content base and is kept before the next overwrite. While the area is loaded the base stays
+   (the content here may still build on it: more counts as own, never less), and so it does over a mirror of unknown version (a load of
+   it would give no base to keep). */
+inline int KeptBaseIdle(int keptThere, int ownPending, int loadedHere, int mirrorWorld) { return (keptThere != 0 && ownPending == 0 && loadedHere == 0 && mirrorWorld != 0) ? 1 : 0; }
+/* L4: a refusal the journal replay road answered (store.cpp ZoneReplayAnswer != 0) never reaches OwnStoredDecide, which settles the refused
+   upload's stamp on the other road - so it is settled here: a refused upload is not stored, and left unechoed it would make the mirror
+   copy read as 'own, not echoed' and be checked a second time when a newer copy arrives. */
+inline int ReplayAnswerSettles(int replayResult) { return replayResult != 0 ? 1 : 0; }
+/* THE STALE REFUSAL checks the refused save - link up or down (before F1677 only an unsent one) - when the mirror file still holds that
+   upload (its stamp). Otherwise it is not here to check: a newer own save replaced it (judged by its own answer) or a received copy did
+   (whose road checked it first). */
+inline int StaleChecksHere(int holdIt, int mirrorKnown, long long mirrorAt, long long refusedStamp)
+{
+    return (holdIt != 0 && mirrorKnown != 0 && refusedStamp > 0 && mirrorAt == refusedStamp) ? 1 : 0;
+}
+/* T-1391 review F1664 M3: EVERY SAVE MADE WHILE AN AREA IS HELD STALE IS CHECKED, and the hold keeps few set-aside files per area: a newer
+   FAULT save of the same load REPLACES the hold's last file. That is safe: while the area stays loaded, Kenshi's area save writes the whole
+   area as this game holds it then, so a newer save holds every own thing of the earlier one that is still in the area - one gone since
+   was removed in play here (taken, moved, destroyed: the newer save shows that), not lost by the hold. ACROSS A LOAD it is NOT safe: a held
+   area reloaded from this game's older copy (a load from the world's copy lifts the hold) lost the earlier save's work in the game, so that
+   file is sealed and the next FAULT save starts a new one - capped at kHeldAsideCap files per area per hold; past the cap the newest file
+   is replaced (counted as overflow, and an ErrorLog line: that file may be the only copy of work a reload lost). An EMPTY save (Kenshi wrote no file for the area: it holds no building, item or note) never replaces a
+   kept file, nor does a save that cannot be read to its end (it is set aside as a new file while under the cap). Returns kHa*: kHaNew (a
+   new file), kHaReplace (write, then remove the hold's last file), kHaSkip (not set aside). */
+enum { kHaSkip = 0, kHaNew = 1, kHaReplace = 2 };
+/* re-check of cb8829996 (MED): THE SAME LOAD - only when this game's loaded-copy entry of the area is found and names a load (loadSeq != 0)
+   equal to the one the hold's last file was set aside under. An entry evicted by the 64 MB cap (or never made) reads loadSeq 0: that is
+   'not known', never 'the same load' - so two FAULT saves either side of a reload from an older copy both stay (subject to the cap). */
+inline int HeldSameLoad(int loadedFound, long long loadSeqNow, int filesKept, long long loadSeqKept)
+{
+    return (loadedFound != 0 && loadSeqNow != 0 && filesKept > 0 && loadSeqNow == loadSeqKept) ? 1 : 0;
+}
+const int kHeldAsideCap = 4;
+inline int HeldAsideStep(int isEmpty, int readable, int filesKept, int sameLoad, int cap)
+{
+    if (filesKept <= 0) return kHaNew;
+    if (isEmpty != 0) return kHaSkip;
+    if (readable == 0) return filesKept < cap ? (int)kHaNew : (int)kHaSkip;
+    if (sameLoad != 0) return kHaReplace;
+    return filesKept < cap ? (int)kHaNew : (int)kHaReplace;
+}
 
 }   /* namespace areafresh */
 

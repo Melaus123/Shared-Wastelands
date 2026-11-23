@@ -78,7 +78,7 @@
 
 namespace piecerec {
 
-const unsigned int kProtocol = 173;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
+const unsigned int kProtocol = 177;               /* the world-server protocol that carries piece records and PIECE_REFUSE (116: the LIVE part's outpost link, bit 5; a player farm's crop, bit 6) */
 
 
 
@@ -439,7 +439,7 @@ inline int PieceCraftListSame(const std::vector<PieceCraftEntry>& a, const std::
     return 1;
 }
 /* T-1192: 1 = the craft parts are the same: both not known, or both known with the same switches, repeat, total and list (progress not
-   compared: a change of it alone is no write of its own - it rides the next one) */
+   compared here: T-1429 an order's progress is written on its own band, PieceCraftProgDue) */
 inline int PieceCraftSameOf(const PieceLive& a, const PieceLive& b)
 {
     if ((a.hasCraft != 0) != (b.hasCraft != 0)) return 0;
@@ -969,9 +969,10 @@ inline int PieceEventEndsMoving(int event)
    game reads itself the writer then (its next change tries it too) */
 inline int PieceRetryDue(int newMap, int writerNow) { return (newMap != 0 && writerNow != 0) ? 1 : 0; }
 /* the moments 'build stopped' is asked: 1 = written at this moment. The piece's area unloading here is the build stopping; a game
-   save is not - the build goes on, and a stop and a start would be written for no change. */
-const int kPsmUnload = 0, kPsmSave = 1;
-inline int PieceStopMoment(int moment) { return moment == kPsmUnload ? 1 : 0; }
+   save is not - the build goes on, and a stop and a start would be written for no change. T-1429: the leave save (the session ends -
+   EXIT GAME, leave, the host gone) is a stop as an unload is (kPsmLeave). */
+const int kPsmUnload = 0, kPsmSave = 1, kPsmLeave = 2;
+inline int PieceStopMoment(int moment) { return (moment == kPsmUnload || moment == kPsmLeave) ? 1 : 0; }
 /* another player's piece written here as its writer: only over its kept record when that is live and no removal mark at or above
    its generation is known (a refusal's word) - a write over a removal mark is refused at every hit */
 inline int PieceHolderBaseOk(int haveKept, unsigned int keptGen, int keptRemoved, int haveSrv, unsigned int srvGen, int srvRemoved)
@@ -1522,6 +1523,20 @@ inline int PieceLiveBandLeft(float s, float v, float full) { return PieceLiveBan
 /* T-1047 step 2b: the production bar's band count - fine (kPieceLiveBarBandsWorked) while a worker worked the machine in the MINE_STATE
    window (farm.cpp MineWorkedRecently), else coarse (kPieceLiveBarBandsIdle) */
 inline int PieceLiveBarBands(int worked) { return worked != 0 ? kPieceLiveBarBandsWorked : kPieceLiveBarBandsIdle; }
+/* T-1429 (H-T1429-machineprog, F1721): A BENCH ORDER'S PROGRESS ON ITS OWN BAND. Before, a change of an order's progress alone was never
+   written (it rode the next write), so a crafting bench's work could lag its record by a whole order. Now each carried order whose
+   progress (the engine's 0..1 - its current order slot is open while below 1.0 - the T1884 crash read; Inferred for the list entry) left its written band of kPieceLiveCraftBands (full 1; empty
+   and full at once, any other band half a band past its edge - PieceLiveBandLeftOf) is a change. Both lists must name the same orders
+   (PieceCraftSameOf, asked first); a part not known on either side is no progress change. */
+const int kPieceLiveCraftBands = 20;
+inline int PieceCraftProgDue(const PieceLive& sent, const PieceLive& now)
+{
+    if (sent.hasCraft == 0 || now.hasCraft == 0) return 0;
+    const size_t n = (sent.craft.size() < now.craft.size()) ? sent.craft.size() : now.craft.size();
+    for (size_t i = 0; i < n; ++i)
+        if (PieceLiveBandLeftOf(sent.craft[i].prog, now.craft[i].prog, 1.0f, kPieceLiveCraftBands) != 0) return 1;
+    return 0;
+}
 /* 1 = now is a change to write against what was written (sent): the switch or gets battery changed; the town grid's on-battery flag
    flipped (sentGrid / nowGrid -1 = not read); the battery left its written band of its capacity (PieceLiveBandLeft: full and empty at
    once, any other band half a band past its edge); the number of input records changed; a stock rose (a fuel item taken), reached 0,
@@ -1533,6 +1548,7 @@ inline int PieceLiveDue(const PieceLive& sent, const float* peak, float capacity
     if (now.have == 0 || now.hasPower == 0) return 0;
     if (sent.have == 0 || sent.hasPower == 0) return 1;
     if (now.hasCraft != 0 && PieceCraftSameOf(sent, now) == 0) return 1;   /* T-1192: a bench's list, switches or repeat changed */
+    if (now.hasCraft != 0 && PieceCraftProgDue(sent, now) != 0) return 1;  /* T-1429: an order's progress left its written band */
     if ((sent.on != 0) != (now.on != 0) || (sent.gets != 0) != (now.gets != 0)) return 1;
     if (sentGrid >= 0 && nowGrid >= 0 && (sentGrid != 0) != (nowGrid != 0)) return 1;
     if (now.hasBar != 0)
@@ -1882,6 +1898,47 @@ inline unsigned int PieceTownWriteId(int writerIsOwner, unsigned int engineId, u
 {
     return (writerIsOwner != 0 && engineId != 0u) ? engineId : keptId;
 }
+/* ---- T-1391 fix attempt 2 (F1774 Design 1, F1775): THE TOWN PART IS CAPTURED AT THE CHANGE, while the building stands ----
+   The owner's game reads its own top-level piece's town at every change its piece record tracks (build.cpp PcrMarkW: placement, link
+   up or down, and every later mark) and keeps the latest capture per piece; a write made when the building no longer stands here (its
+   area unloaded before the record could go - the link was down) carries the capture instead of nothing. A player's town whose outpost id
+   is not known here yet is OWED: kept as the town's words, never dropped and never replaced by a guess, and filled when the id becomes
+   known (the SHOW's own rows - build.cpp PcrTownOwedFill). kPtcNone: nothing to capture (not read); kPtcFact: *out is the town (an
+   outpost by its id, a world town, 'Nowhere'); kPtcOwed: a player's town whose id is not known here (*out kPtfNone). */
+const int kPtcNone = 0, kPtcFact = 1, kPtcOwed = 2;
+inline int PieceTownCaptureOf(int wordsRead, unsigned int idNow, const PieceTownFact& engine, int engineRead, int wordsNameTown, PieceTownFact* out)
+{
+    *out = PieceTownFact();
+    if (wordsRead == 0) return kPtcNone;
+    if (idNow != 0u && idNow <= kPrTownIdMax) { out->kind = kPtfOutpost; out->id = idNow; return kPtcFact; }
+    if (engine.kind == kPtfWorld || engine.kind == kPtfNowhere) { *out = engine; return kPtcFact; }
+    if (engineRead == 0 || wordsNameTown == 0) return kPtcNone;   /* review fold: an unreadable town, or words naming no town - no town part (neither owed nor waiting) */
+    if (engine.kind != kPtfOutpost) return kPtcNone;   /* re-check fold: the engine's words name no live town (empty, dead) - no town part */
+    return kPtcOwed;   /* a player's town (the engine reads it as an outpost whose id is not known here): its words are kept until its id is known */
+}
+/* an owed capture at the event of learning ids: 1 = filled (*cap = the outpost, owed cleared) - idNow is the id its words name now */
+inline int PieceTownOwedFill(int* owed, unsigned int idNow, PieceTownFact* cap)
+{
+    if (*owed == 0 || idNow == 0u || idNow > kPrTownIdMax) return 0;
+    cap->kind = kPtfOutpost; cap->id = idNow; cap->sid.clear();
+    *owed = 0;
+    return 1;
+}
+/* what an owed write of a piece will carry as its town (the own-work check's content compare): the capture when there is one (an owed
+   capture whose id is known now: that outpost; still owed: *owedOut = 1, kPtfNone), else the kept record's town (kPtfNone: no part) */
+inline PieceTownFact PieceTownOwedWriteOf(int capHave, int capOwed, const PieceTownFact& cap, unsigned int owedIdNow, const PieceTownFact& kept, int* owedOut)
+{
+    *owedOut = 0;
+    if (capHave != 0 && capOwed == 0) return cap;
+    if (capHave != 0)
+    {
+        PieceTownFact f;
+        if (owedIdNow != 0u && owedIdNow <= kPrTownIdMax) { f.kind = kPtfOutpost; f.id = owedIdNow; return f; }
+        *owedOut = 1;
+        return f;
+    }
+    return kept;
+}
 /* 1 = a write is marked for the link: this is the owner's game, it is the piece's writer now, its engine links the piece to a known
    outpost the stored record does not name (keptId) and no write of that link is marked already (markedId) */
 inline int PieceTownMarkDue(int ownerHere, int writerHere, unsigned int engineId, unsigned int keptId, unsigned int markedId)
@@ -2165,6 +2222,56 @@ inline int PieceFarmLayOwed(int single, int haveSlot, int areaDone, int pending,
     if (areaDone == 0) return (haveSlot != 0) ? 1 : 0;
     if (pending != 0) return 1;
     return (recHasFarm != 0 && laidThisLoad == 0 && listFull == 0) ? 1 : 0;
+}
+
+/* ---- T-1429 (H-T1429-machineprog; F1719 / F1720 / F1721): THE RECORD'S AGE AGAINST THE LOADED SAVE ----
+   A machine's work (a producer's bar and work state, its stocks and battery, a bench order's progress) reaches its record only in bands,
+   so after EXIT GAME the record can be older than the area copy this game saved and loads again - and the apply wrote it over the save,
+   then sent the older value out as the new record (T2712). Both are numbered by the world server's one counter (a piece record's seq: as
+   it arrived, or as this game's own write was stored - RECORD_SEQ; the area copy loaded: its content base). 1 = the record's machine values
+   are taken: its age is not known (recSeq 0 - the rule before), the loaded copy is not this game's own save (areaMine 0: another game's
+   upload, uploaded late, can carry an old bar - F1705 / T-1391 - and its age says nothing of this game's piece), or the record is newer
+   than the loaded copy (recSeq > areaSeq). 0 = the save's are kept. T-1429 machine age fold 1 (review MEDIUM): a seq not known on
+   either side (the copy's upload never confirmed before the process closed - the link down at exit) is no answer by seq; when the
+   copy is this game's own upload AND the record this game's own write, both carry this game's own clock stamp (recAt / areaAt, the
+   writtenAt each was sent with) and the later one wins (a tie keeps the save: the leave save's flush sends before the save is asked);
+   else the record wins (the rule before). */
+inline int PieceLiveRecordWins(unsigned long long recSeq, unsigned long long areaSeq, int areaMine, int recMine = 0, long long recAt = 0, long long areaAt = 0)
+{
+    if (areaMine == 0) return 1;
+    if (recSeq != 0ULL && areaSeq != 0ULL) return recSeq > areaSeq ? 1 : 0;
+    if (recMine != 0 && recAt > 0 && areaAt > 0) return recAt > areaAt ? 1 : 0;   /* the same game's clock */
+    return 1;
+}
+/* 1 = the piece's power, bar and craft values now differ from the kept record's (each within kPrLiveEps; a bench order's progress too) -
+   the doors and a crop are left out (each has its own baseline) */
+inline int PieceLiveSaveDiffers(const PieceLive& kept, const PieceLive& now)
+{
+    PieceLive k = kept, n = now;
+    PieceDoorsClear(&k); PieceDoorsClear(&n); PieceFarmClear(&k); PieceFarmClear(&n);
+    if (PieceLiveSame(k, n) == 0) return 1;
+    for (size_t i = 0; k.hasCraft != 0 && i < k.craft.size() && i < n.craft.size(); ++i)
+        if (std::fabs(k.craft[i].prog - n.craft[i].prog) > kPrLiveEps) return 1;
+    return 0;
+}
+/* the save kept over an older record (PieceLiveRecordWins 0): this game's first look as the machine's runner writes the piece's values once
+   when they differ from that record's at all (differs: PieceLiveSaveDiffers) - never booked from that record as its baseline - so the
+   record catches up with the save. saveKept / saveKeptGen: the save was kept over the record of that generation; keptGen: the generation
+   kept now (a newer record ends it) */
+inline int PieceLiveSaveKeptRewrite(int saveKept, unsigned int saveKeptGen, unsigned int keptGen, int differs)
+{
+    return (saveKept != 0 && saveKeptGen == keptGen && differs != 0) ? 1 : 0;
+}
+/* THE LEAVE SAVE'S PIECE FLUSH (T-1429 B). Each piece the leave save marked (as an area unload marks it - PcrLiveUnload, PcrWorkFlush,
+   PcrDoorsUnload, the build stopped) is, at each drain tick: sent and its write stored (kPlfConfirmed: no mark left, no write unanswered),
+   waiting (kPlfWaits: still marked and not held, or a write in flight - the leave save's drain waits for it), or held (kPlfHeld: still
+   marked but this game is not its writer - it is never sent from here and is not waited for; its record keeps the writer's values) */
+const int kPlfConfirmed = 0, kPlfWaits = 1, kPlfHeld = 2;
+inline int PieceLeaveFlushState(int marked, int held, int inFlight)
+{
+    if (inFlight != 0) return kPlfWaits;
+    if (marked == 0) return kPlfConfirmed;
+    return held != 0 ? kPlfHeld : kPlfWaits;
 }
 
 }   /* namespace piecerec */

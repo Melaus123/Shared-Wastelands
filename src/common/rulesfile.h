@@ -41,7 +41,7 @@
 namespace rulesfile {
 
 const unsigned int kMsgRulesChanged = 92u;   /* down only: {u32 count, [str key, str value]...}, an empty value = the row was removed */
-const unsigned int kProtocol = 173u;          /* the world-server protocol that carries RULES_CHANGED */
+const unsigned int kProtocol = 177u;          /* the world-server protocol that carries RULES_CHANGED */
 
 
 const char* const kFile = "rules.txt";
@@ -553,6 +553,14 @@ inline std::string WriteBack(const std::string& old, const std::map<std::string,
    worldopt::ValueOk, the body of store_main.cpp OptionValueOk; 0 = no rows). A row is written only when it is a GAME OPTIONS row
    (never a hidden rule, a race row or a message's marker), the world server takes its value, and the line written reads back as that
    same value. None otherwise: the world server's defaults, as before. */
+/* T-1399 (F1750 (1)): the rows FirstStartRows writes - a HOST press that starts the world server writes the first hosting's rows
+   (firstHostingRows) and, at a later hosting, the owner-change rows (stewardrules.h HostPressRows kPressSendsOwnerChange: rows changed on
+   GAME OPTIONS for this world that the world has not stored), so the world server answers its lobby from the host's change; a press
+   that rings a running world server writes none. */
+inline bool StartRowsWritten(bool firstHostingRows, bool ownerChangeRows, bool startsServer)
+{
+    return startsServer && (firstHostingRows || ownerChangeRows);
+}
 inline std::map<std::string, std::string> FirstStartRows(bool firstHostingRows, const std::vector<std::pair<std::string, std::string> >& chosen, ValueCheck ok)
 {
     std::map<std::string, std::string> out;

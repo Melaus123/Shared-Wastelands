@@ -188,7 +188,9 @@ struct GsLocal
     std::string name;   /* the name the item carries here, "" = none */
     std::string key;    /* its current key */
     int qty, q100, guard;
-    GsLocal() : qty(1), q100(0), guard(0) {}
+    int made;           /* T-1429 s16 (F1796 design b): 1 = made during play (groundrec.h GrMadeRule), 0 = a MAP item - removed only by a
+                           gone row. Default 1 = the rule before s16 (an unlisted item is removed); the game sets it from the item's read */
+    GsLocal() : qty(1), q100(0), guard(0), made(1) {}
 };
 struct GsRow
 {
@@ -207,9 +209,66 @@ struct GsPlan
     std::vector<int> local;          /* per row: the local item it keeps or takes over, -1 = built or skipped */
     std::vector<int> fixQty;         /* fold 1 (M5): per row, 1 = the kept / taken-over item's quantity is not the row's - set it to the row's */
     std::vector<size_t> remove;      /* local items no row lists, to remove */
+    std::vector<int> removeGone;     /* T-1429 s16: per remove entry, the gone row that removes a map item (-1 = an item made during play) */
+    std::vector<size_t> keptMap;     /* T-1429 s16: unlisted MAP items kept - no gone row names them */
     int kept, taken, built, removeHeld, guarded, skippedGone, skippedMade, qtyFixes, qtyGuarded;   /* removeHeld: unlisted items left alone because the walk or the record was not whole; qtyGuarded: quantity fixes left out on a guarded item */
-    GsPlan() : kept(0), taken(0), built(0), removeHeld(0), guarded(0), skippedGone(0), skippedMade(0), qtyFixes(0), qtyGuarded(0) {}
+    int mapKept, goneRemoved;        /* T-1429 s16: keptMap.size(); map items removed by a gone row */
+    GsPlan() : kept(0), taken(0), built(0), removeHeld(0), guarded(0), skippedGone(0), skippedMade(0), qtyFixes(0), qtyGuarded(0), mapKept(0), goneRemoved(0) {}
 };
+/* T-1429 s16 (F1796 design b): the gone row naming local item l - its name, else its current key - or -1 */
+inline int GsGoneFind(const std::vector<coopgrec::GroundGone>& gone, const GsLocal& l)
+{
+    for (size_t i = 0; i < gone.size(); ++i)
+    {
+        if (!l.name.empty() && gone[i].name == l.name) return (int)i;
+        if (!l.key.empty() && gone[i].name == l.key) return (int)i;
+    }
+    return -1;
+}
+/* T-1429 s16: what an apply does with a local item no row used (not guarded): a MAP item (made 0) is removed only when a gone row
+   names it (goneIdx >= 0) - an absent row means 'untouched', never 'gone'; an item made during play keeps the rule before s16 (removed). */
+/* T-1429 s16 fold (review of ab86b2b6b): THE GONE LIST'S RULES. GsGoneNoteAdd: a name that left the ground is noted unless the record
+   apply itself removed it (applying 1), the item was made during play (madeHint 1: its mark as it lay, read before the pickup; or
+   srvRowMade 1: the kept record's row of that name says made) - an unlisted made item is removed anyway, so its note would only fill
+   the cap - or it is noted already (the first note stands); at kGrMaxGone the OLDEST note is dropped (*capDropped += 1).
+   GsGoneEnd: an ADD of the name here ends its note. GsGoneEndListed: a note whose name is written as a row again ends (counted). */
+const int kGsNoteAdded = 1, kGsNoteSkipApply = 2, kGsNoteSkipMade = 3, kGsNoteDup = 4, kGsNoteBadName = 5;
+inline int GsGoneNoteAdd(std::vector<coopgrec::GroundGone>* list, const std::string& name, unsigned int slot, unsigned int stamp, int applying,
+                         int madeHint, int srvRowMade, unsigned int* capDropped)
+{
+    if (applying != 0) return kGsNoteSkipApply;
+    if (!coopgrec::GrNameOk(name)) return kGsNoteBadName;
+    if (madeHint == 1 || srvRowMade != 0) return kGsNoteSkipMade;
+    for (size_t i = 0; i < list->size(); ++i) if ((*list)[i].name == name) return kGsNoteDup;
+    if (list->size() >= (size_t)coopgrec::kGrMaxGone) { list->erase(list->begin()); if (capDropped) ++*capDropped; }
+    coopgrec::GroundGone g; g.name = name; g.slot = slot; g.stamp = stamp;
+    list->push_back(g);
+    return kGsNoteAdded;
+}
+inline int GsGoneEnd(std::vector<coopgrec::GroundGone>* list, const std::string& name)
+{
+    for (size_t i = 0; i < list->size(); ++i) if ((*list)[i].name == name) { list->erase(list->begin() + (long)i); return 1; }
+    return 0;
+}
+inline unsigned int GsGoneEndListed(std::vector<coopgrec::GroundGone>* list, const std::vector<coopgrec::GroundRow>& rows)
+{
+    std::vector<coopgrec::GroundGone> keep;
+    unsigned int ended = 0;
+    for (size_t g = 0; g < list->size(); ++g)
+    {
+        int listed = 0;
+        for (size_t r = 0; r < rows.size() && listed == 0; ++r) if (rows[r].name == (*list)[g].name) listed = 1;
+        if (listed != 0) ++ended; else keep.push_back((*list)[g]);
+    }
+    list->swap(keep);
+    return ended;
+}
+const int kGsUnlistedRemove = 1, kGsUnlistedKeepMap = 2;
+inline int GsUnlistedRule(int made, int goneIdx)
+{
+    if (made == 0 && goneIdx < 0) return kGsUnlistedKeepMap;
+    return kGsUnlistedRemove;
+}
 /* the candidate among locals[] (not used, matching `want`) best for the row: same quantity and quality, then same quantity, then the
    first. -1 = none. mode 0: carries the row's name; 1: carries no name and its key is the row's name; 2: carries no name, its key is
    the row's key, and it is not guarded. A spill is never a candidate. */
@@ -233,8 +292,11 @@ inline int GsPick(const std::vector<GsLocal>& locals, const std::vector<int>& us
    its name, then an unnamed item whose key is its name, then takes over an unnamed item of its key; the rest are built, except a row
    whose name just left this ground (skipped) and a row whose item was made during play (skipped: the game's own area close drops
    such an item, so it stays gone, as in the normal game). A kept or taken-over item whose quantity is not the row's is marked to be set to the
-   row's. An item no row used is removed only when the walk and the record are whole, and never when guarded (counted in `guarded`). */
-inline void GsApplyPlan(const std::vector<GsRow>& rows, const std::vector<GsLocal>& locals, int wholeWalk, unsigned int recordCut, GsPlan* out)
+   row's. An item no row used is removed only when the walk and the record are whole, and never when guarded (counted in `guarded`).
+   T-1429 s16 (F1796 design b): and a MAP item (locals[i].made 0) only when a row of `gone` (0 = none) names it (GsUnlistedRule) - else it
+   is kept (keptMap, counted before the whole / cut hold). */
+inline void GsApplyPlan(const std::vector<GsRow>& rows, const std::vector<GsLocal>& locals, int wholeWalk, unsigned int recordCut,
+                        const std::vector<coopgrec::GroundGone>* gone, GsPlan* out)
 {
     GsPlan p;
     p.act.assign(rows.size(), kGsBuild);
@@ -271,11 +333,52 @@ inline void GsApplyPlan(const std::vector<GsRow>& rows, const std::vector<GsLoca
     {
         if (used[i] != 0) continue;
         if (locals[i].guard != 0) { ++p.guarded; continue; }
+        const int gi = (gone != 0) ? GsGoneFind(*gone, locals[i]) : -1;
+        if (GsUnlistedRule(locals[i].made, gi) == kGsUnlistedKeepMap) { p.keptMap.push_back(i); ++p.mapKept; continue; }   /* T-1429 s16 */
         if (wholeWalk == 0 || recordCut != 0) { ++p.removeHeld; continue; }
         p.remove.push_back(i);
+        p.removeGone.push_back(locals[i].made == 0 ? gi : -1);
+        if (locals[i].made == 0) ++p.goneRemoved;
     }
     if (out) *out = p;
 }
+inline void GsApplyPlan(const std::vector<GsRow>& rows, const std::vector<GsLocal>& locals, int wholeWalk, unsigned int recordCut, GsPlan* out)
+{
+    GsApplyPlan(rows, locals, wholeWalk, recordCut, 0, out);
+}
+
+/* ---- T-1429 s16 (F1789): log-only helpers for the ground record's write and apply lines (they decide nothing the game does) ----
+   GsRemoveWhy: why the plan removed local item l (an item no row used): the record lists no row at all; no row carries its name or
+   key; or a row carries its name or key but did not take it (another item matched that row first, or the item carries another name).
+   GsFirstWriteSay: 1 = the write gets its one-line timing note - every seed (the area's first record in the world) and the first
+   write of the area in this load. GsCapStep: a per-life line cap - 1 say, 2 say as the LAST line, 0 muted (count it); *said counts.
+   GsSinceMs: ms from `at` to `now` on the tick clock (wrap-safe), -1 = `at` not known (0). */
+const int kGsWhyRecordEmpty = 1, kGsWhyNoRowNamesIt = 2, kGsWhyRowNotMatched = 3;
+inline int GsRemoveWhy(const std::vector<GsRow>& rows, const GsLocal& l)
+{
+    if (rows.empty()) return kGsWhyRecordEmpty;
+    for (size_t r = 0; r < rows.size(); ++r)
+    {
+        if (!l.name.empty() && rows[r].name == l.name) return kGsWhyRowNotMatched;
+        if (!l.key.empty() && (rows[r].name == l.key || rows[r].key == l.key)) return kGsWhyRowNotMatched;
+    }
+    return kGsWhyNoRowNamesIt;
+}
+inline const char* GsRemoveWhyName(int w)
+{
+    if (w == kGsWhyRecordEmpty) return "the record lists no item at all";
+    if (w == kGsWhyNoRowNamesIt) return "no row of the record names it or its key";
+    if (w == kGsWhyRowNotMatched) return "a row names it or its key but another item or name took that row";
+    return "?";
+}
+inline int GsFirstWriteSay(int seed, int writesThisLoad) { return (seed != 0 || writesThisLoad == 0) ? 1 : 0; }
+inline int GsCapStep(int* said, int cap)
+{
+    if (*said >= cap) return 0;
+    ++*said;
+    return (*said == cap) ? 2 : 1;
+}
+inline long long GsSinceMs(unsigned int now, unsigned int at) { return at == 0u ? -1LL : (long long)(unsigned int)(now - at); }
 
 /* ---- T-1129: a shop spot's item has ONE source, the area file the holder writes ----
    The engine's spot load-from-save (0x5562A0) restores the item from that file and links it both ways: item+0x188 = the spot, and the

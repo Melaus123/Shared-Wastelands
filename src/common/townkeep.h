@@ -60,7 +60,7 @@
    anchor: the row's centre at that read becomes its anchor) are still read.
    THE OUTPOST ID (T-1047 step 5, owner 1043 / 1102 a): the world server's own stable number for one player outpost, 1..kOutpostIdMax
    (0 = none yet). Never a town handle (they differ between games) nor a centre (it drifts). Minted in ReplaceSlotTowns: a said row
-   that inherits a row on file (its centre within kTownSameRadius, or a shared key) keeps that row's id; one that inherits none takes
+   that inherits a row on file (T-1391 B1: its own town handle, else a shared key, else - a row with no handle - its centre within kTownSameRadius) keeps that row's id; one that inherits none takes
    the id of an outpost a reset carried for its owner by the same rule (kept-towns.txt), else a new id (NextOutpostId: one past the
    highest on file, or the file's N line when higher - NextIdAtLoad - and never lower afterwards). Sent to every game with the outposts (baseshow.h SHOW); a piece's record names its outpost by it (piecerec.h).
    The TOWNS wire does not carry it.
@@ -560,19 +560,74 @@ inline int GiveMissingIds(std::vector<TownRow>* rows, unsigned* next, std::set<u
     }
     return n;
 }
-/* the outpost a said row of `slot` inherits among rows (only rows of that owner whose used[j] is 0): its centre within
-   kTownSameRadius (TownStands), else one sharing a key (TownKeysSame); -1 none */
-inline int InheritRow(const TownRow& t, int slot, const std::vector<TownRow>& rows, const std::vector<int>& used)
+/* T-1391 B1 (F1804 / F1807): HOW A SAID ROW FINDS ITS ROW ON FILE. First the owner game's own town handle (hand[5]) within the same
+   slot: a player town's handle survives reloads and centre moves (F1804, T-924 notes) but not a re-founding, and the engine moves a
+   player town's centre onto its new buildings (run T2742: ~400 units, past kTownSameRadius) - so a centre is only a stand-in for it.
+   Then a shared piece key (TownKeysSame); then the centre within kTownSameRadius, only for a row with no handle on file (one made
+   from kept pieces, or an older row). A re-founded town (a new handle at the same centre) therefore takes a new id unless it shares a
+   key. Handles of different slots never match (each game numbers its own towns). A said row with NO handle (all five words 0) keeps
+   the old rule: the centre (any row, handled or not), then a shared key. Rows a reset CARRIED (kept-towns.txt, SaidRowId) also keep
+   the old rule and are never matched by a handle: they hold the old world's handles, and a game reuses handle words after a reset
+   (05-findings.md T-924 notes) - as the reset's own match never uses a handle (KeptTownsOf). */
+const int kInheritNone = 0, kInheritHand = 1, kInheritKey = 2, kInheritCentre = 3;
+/* the row of `slot` (used[j] 0) whose handle on file is the said row's own; -1 none (or the said row has no handle) */
+inline int HandRow(const TownRow& t, int slot, const std::vector<TownRow>& rows, const std::vector<int>& used)
+{
+    if (!HandKnown(t.hand)) return -1;
+    for (size_t j = 0; j < rows.size(); ++j)
+        if (rows[j].owner == slot && used[j] == 0 && HandKnown(rows[j].hand) && HandSame(rows[j].hand, t.hand)) return (int)j;
+    return -1;
+}
+/* the row of `slot` (used[j] 0) with NO handle on file whose centre the said row stands at (TownStands); -1 none */
+inline int CentreRowNoHand(const TownRow& t, int slot, const std::vector<TownRow>& rows, const std::vector<int>& used)
+{
+    for (size_t j = 0; j < rows.size(); ++j)
+        if (rows[j].owner == slot && used[j] == 0 && !HandKnown(rows[j].hand) && TownStands(t.pos, rows[j]) != 0) return (int)j;
+    return -1;
+}
+/* the old rule's centre step: the row of `slot` (used[j] 0), handled or not, whose centre the said row stands at; -1 none */
+inline int CentreRowAny(const TownRow& t, int slot, const std::vector<TownRow>& rows, const std::vector<int>& used)
 {
     for (size_t j = 0; j < rows.size(); ++j) if (rows[j].owner == slot && used[j] == 0 && TownStands(t.pos, rows[j]) != 0) return (int)j;
+    return -1;
+}
+/* the outpost a said row of `slot` inherits among rows (only rows of that owner whose used[j] is 0): the same handle (HandRow), else
+   one sharing a key (TownKeysSame), else a row with no handle whose centre is within kTownSameRadius (CentreRowNoHand); -1 none.
+   carriedRule (rows a reset carried) or a said row with no handle: the old rule - its centre within kTownSameRadius (any row), else
+   a shared key; never a handle. *how (when not 0): kInheritHand / kInheritKey / kInheritCentre / kInheritNone */
+inline int InheritRow(const TownRow& t, int slot, const std::vector<TownRow>& rows, const std::vector<int>& used, int* how = 0, int carriedRule = 0)
+{
+    if (how != 0) *how = kInheritNone;
+    const int oldRule = (carriedRule != 0 || !HandKnown(t.hand)) ? 1 : 0;
+    if (oldRule == 0)
+    {
+        const int h = HandRow(t, slot, rows, used);
+        if (h >= 0) { if (how != 0) *how = kInheritHand; return h; }
+    }
+    else
+    {
+        const int c = CentreRowAny(t, slot, rows, used);
+        if (c >= 0) { if (how != 0) *how = kInheritCentre; return c; }
+    }
     for (size_t j = 0; j < rows.size(); ++j)
     {
         if (rows[j].owner != slot || used[j] != 0) continue;
         for (size_t k = 0; k < t.keys.size(); ++k)
-            for (size_t m = 0; m < rows[j].keys.size(); ++m) if (TownKeysSame(t.keys[k], rows[j].keys[m]) != 0) return (int)j;
+            for (size_t m = 0; m < rows[j].keys.size(); ++m) if (TownKeysSame(t.keys[k], rows[j].keys[m]) != 0) { if (how != 0) *how = kInheritKey; return (int)j; }
     }
-    return -1;
+    if (oldRule != 0) return -1;
+    const int c = CentreRowNoHand(t, slot, rows, used);
+    if (c >= 0 && how != 0) *how = kInheritCentre;
+    return c;
 }
+/* T-1391 B1: a row on file a said row took over by its handle although its centre moved past kTownSameRadius (the world server logs it) */
+struct HandMove
+{
+    std::string name;
+    unsigned id;
+    float oldX, oldZ, newX, newZ;
+    HandMove() : id(0), oldX(0.0f), oldZ(0.0f), newX(0.0f), newZ(0.0f) {}
+};
 /* T-1047 step 5: the id a said row takes - the row on file it inherits (at >= 0, its id when it has one), else an outpost a reset
    carried for its owner (carried: kept-towns.txt) by the same rule whose id no row of the slot holds, else a new one (MintOutpostId) */
 /* T-940: *anchor (when not 0; two floats x, z) = the fixed anchor the row takes with it - the inherited row's (at >= 0), the carried
@@ -590,7 +645,7 @@ inline unsigned SaidRowId(const TownRow& t, int slot, int at, const std::vector<
     {
         if (carriedUsed->size() != carried->size()) carriedUsed->assign(carried->size(), 0);
         for (size_t j = 0; j < carried->size(); ++j) if ((*carried)[j].id == 0 || holds.count((*carried)[j].id) != 0) (*carriedUsed)[j] = 1;
-        const int c = InheritRow(t, slot, *carried, *carriedUsed);
+        const int c = InheritRow(t, slot, *carried, *carriedUsed, 0, 1);   /* T-1391 B1 review: carried rows keep the old rule, never a handle */
         if (c >= 0)
         {
             (*carriedUsed)[(size_t)c] = 1;
@@ -604,9 +659,11 @@ inline unsigned SaidRowId(const TownRow& t, int slot, int at, const std::vector<
    0 = no minting: such a row keeps id 0); carried: the outposts a reset carried (kept-towns.txt), whose ids a row of their owner takes
    before a new one is minted. T-1158 step 6 (Lost Post): took (when not 0) gets one flag per row of *all as passed - 1 = a row of the
    slot a said row took over (at its centre or, failing that, by one of its keys); a row a said row only names a key of while taking
-   over another is not taken */
+   over another is not taken. T-1391 B1: a said row takes over the row of its own handle first (every said row's handle before any
+   key or centre, so a key a said row names cannot take another said town's row), else by a key, else a handle-less row at its
+   centre (InheritRow's order; a said row with no handle: its centre at any row, else a key); moved (when not 0) gets each row taken by its handle whose centre moved past kTownSameRadius */
 inline void ReplaceSlotTowns(std::vector<TownRow>* all, int slot, const std::vector<TownRow>& said, int whole = 1, unsigned* nextId = 0,
-                             const std::vector<TownRow>* carried = 0, std::vector<int>* took = 0)
+                             const std::vector<TownRow>* carried = 0, std::vector<int>* took = 0, std::vector<HandMove>* moved = 0)
 {
     std::vector<TownRow> o, old;
     std::vector<size_t> oldAt;   /* old[j]'s place in *all */
@@ -616,14 +673,37 @@ inline void ReplaceSlotTowns(std::vector<TownRow>* all, int slot, const std::vec
     std::vector<int> used(old.size(), 0), carriedUsed;
     std::set<unsigned> holds;   /* T-1047 step 5: the ids the slot's rows hold now (a carried outpost's id is never taken twice) */
     for (size_t j = 0; j < old.size(); ++j) if (old[j].id != 0) holds.insert(old[j].id);
+    if (moved != 0) moved->clear();
+    const size_t nSaid = said.size() < kMaxTownsPerSlot ? said.size() : kMaxTownsPerSlot;
+    std::vector<int> atOf(nSaid, -1), byHand(nSaid, 0);
+    for (size_t i = 0; i < nSaid; ++i)
+    {   /* T-1391 B1, pass 1: the owner game's own town handle */
+        const int j = HandRow(said[i], slot, old, used);
+        if (j >= 0) { atOf[i] = j; byHand[i] = 1; used[(size_t)j] = 1; }
+    }
+    for (size_t i = 0; i < nSaid; ++i)
+    {   /* pass 2: a shared key, else a row with no handle on file at its centre; a said row with no handle: the old rule (its centre at
+           any row, else a shared key) */
+        if (atOf[i] >= 0) continue;
+        const int noHand = HandKnown(said[i].hand) ? 0 : 1;
+        int at = noHand != 0 ? CentreRowAny(said[i], slot, old, used) : -1;
+        for (size_t k = 0; k < said[i].keys.size() && at < 0; ++k) { size_t j = 0; if (oldKeys.Find(slot, said[i].keys[k], &j) != 0 && used[j] == 0) at = (int)j; }
+        if (at < 0 && noHand == 0) at = CentreRowNoHand(said[i], slot, old, used);
+        if (at >= 0) { atOf[i] = at; used[(size_t)at] = 1; }
+    }
     size_t mine = 0;
-    for (size_t i = 0; i < said.size() && mine < kMaxTownsPerSlot; ++i)
+    for (size_t i = 0; i < nSaid; ++i)
     {
         TownRow t = said[i];
         t.owner = slot;
-        int at = -1;
-        for (size_t j = 0; j < old.size() && at < 0; ++j) if (used[j] == 0 && TownStands(t.pos, old[j]) != 0) at = (int)j;
-        for (size_t k = 0; k < t.keys.size() && at < 0; ++k) { size_t j = 0; if (oldKeys.Find(slot, t.keys[k], &j) != 0 && used[j] == 0) at = (int)j; }
+        const int at = atOf[i];
+        if (at >= 0 && byHand[i] != 0 && moved != 0 && TownStands(t.pos, old[(size_t)at]) == 0)
+        {
+            HandMove m;
+            m.name = t.name; m.id = old[(size_t)at].id;
+            m.oldX = old[(size_t)at].pos[0]; m.oldZ = old[(size_t)at].pos[2]; m.newX = t.pos[0]; m.newZ = t.pos[2];
+            moved->push_back(m);
+        }
         float an[2] = { 0.0f, 0.0f };
         t.id = SaidRowId(t, slot, at, old, carried, &carriedUsed, holds, nextId, an);
         SetAnchor(&t, an[0], an[1]);   /* T-940: kept from the row it inherits, else its founding spot - never moved by the centre's drift */
@@ -1437,6 +1517,7 @@ inline std::vector<TownRow> ListWithOwn(const std::vector<TownRow>& kept, const 
 struct SayKeep
 {
     std::vector<TownRow> held, unheld, next, back;
+    std::vector<HandMove> handMoved;   /* T-1391 B1: rows taken over by their handle whose centre moved past kTownSameRadius (logged) */
     std::vector<int> heldN;
     std::set<unsigned> backIds;
     int ignored, send, forget;
@@ -1450,7 +1531,7 @@ inline void SayKeepStep(SayKeep* o, const std::vector<TownRow>& said, int slot, 
     std::vector<TownRow> after(said);
     std::vector<int> took;
     unsigned mint = nextId != 0 ? *nextId : 0;   /* the ids minted count only when the SAY is taken */
-    ReplaceSlotTowns(&after, slot, rows, whole, nextId != 0 ? &mint : 0, carried, &took);
+    ReplaceSlotTowns(&after, slot, rows, whole, nextId != 0 ? &mint : 0, carried, &took, &o->handMoved);   /* T-1391 B1: handMoved */
     if (whole != 0)
     {
         o->held = LostWhileLinked(said, slot, rows, live, &o->heldN, &took);

@@ -221,11 +221,18 @@ inline int DecodeSpawn(const char* p, size_t size, SpawnMsg* out)
    (`spawnfaction`) goes into. "new" = a fresh empty squad of that faction made by the engine (Faction::spawnEmptySquad) and
    given as the container, so the engine does not place the person into a nearby squad another game runs. Any other word
    reads as before: a leading integer, 0 = no container (the engine chooses), non-zero = the reference platoon; no integer
-   (or nothing) = the reference platoon. */
-const int kSpawnContainerNull = 0, kSpawnContainerKeep = 1, kSpawnContainerNew = 2;
+   (or nothing) = the reference platoon.
+   T-1467 (TEST-ONLY): "with:<label>" = the squad of the lever-made character <label> (`spawn .. as <label>`) this game runs, so
+   two or more lever-made people share one NPC squad; "with:" with no label is refused (kSpawnContainerBad). */
+const int kSpawnContainerNull = 0, kSpawnContainerKeep = 1, kSpawnContainerNew = 2, kSpawnContainerWith = 3, kSpawnContainerBad = -1;
+inline std::string SpawnContainerWithLabel(const std::string& w)   /* the label after "with:", "" when w is not that form */
+{
+    return (w.size() > 5 && w.compare(0, 5, "with:") == 0) ? w.substr(5) : std::string();
+}
 inline int SpawnContainerWord(const std::string& w)
 {
     if (w == "new") return kSpawnContainerNew;
+    if (w.compare(0, 5, "with:") == 0) return SpawnContainerWithLabel(w).empty() ? kSpawnContainerBad : kSpawnContainerWith;
     int v = 1;
     if (std::sscanf(w.c_str(), "%d", &v) != 1) v = 1;
     return v != 0 ? kSpawnContainerKeep : kSpawnContainerNull;

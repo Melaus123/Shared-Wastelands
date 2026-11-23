@@ -29,7 +29,7 @@
 namespace townrefill {
 
 const unsigned kMsgTownLoss = 64;
-const unsigned kProtocol = 173;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
+const unsigned kProtocol = 177;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
 
 
 

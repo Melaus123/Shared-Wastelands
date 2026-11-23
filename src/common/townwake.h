@@ -17,8 +17,13 @@ const int kGrid = 64;
 
 // one queued town: its handle words (how the file identifies a town), the address the founding returned (only ever COMPARED with
 // the player-town list, never read on its own), when it was queued, the world it was founded in, and whether it has waited for
-// its area already (counted notLoaded once)
-struct Entry { int hand[5]; unsigned long long ptr; unsigned queuedAt; long gen; int waited; };
+// its area already (counted notLoaded once).
+// T-1397 (F1783 / F1785 design (a)): kind - kKindFounded (0, a town the founding hook queued) or kKindMovedIn (a mod move put a
+// building into a town other than its own - BdBuildingSetTownPod; the game's area-load wake had reached the building's old town,
+// so the new one may sleep); key - the moved building's key, for its log line (empty for a founding)
+enum { kKindFounded = 0, kKindMovedIn = 1 };
+const int kKeyRoom = 64;
+struct Entry { int hand[5]; unsigned long long ptr; unsigned queuedAt; long gen; int waited; int kind; char key[kKeyRoom]; };
 
 inline bool HandKnown(const int* h) { for (int i = 0; i < 5; ++i) if (h[i] != 0) return true; return false; }
 inline bool HandSame(const int* a, const int* b) { for (int i = 0; i < 5; ++i) if (a[i] != b[i]) return false; return true; }
@@ -31,10 +36,17 @@ inline bool SameTown(const Entry& a, const Entry& b)
 enum { kPushFull = 0, kPushQueued = 1, kPushAgain = 2 };
 // kPushQueued = added at the end; kPushAgain = the same town is queued already (nothing changed); kPushFull = no room, or a bad
 // queue / count / cap (nothing changed)
+// T-1397: a founding pushed for a town queued already as 'moved in' REPLACES that entry whole (its marker, world number and queue
+// time are the founding's - an entry queued before a world load never drops the founding as 'another world'; review fold 1)
 inline int Push(Entry* q, int* n, int cap, const Entry& e)
 {
     if (q == 0 || n == 0 || *n < 0 || cap <= 0) return kPushFull;
-    for (int i = 0; i < *n && i < cap; ++i) if (SameTown(q[i], e)) return kPushAgain;
+    for (int i = 0; i < *n && i < cap; ++i)
+        if (SameTown(q[i], e))
+        {
+            if (e.kind == kKindFounded && q[i].kind != kKindFounded) q[i] = e;
+            return kPushAgain;
+        }
     if (*n >= cap) return kPushFull;
     q[*n] = e;
     ++*n;
@@ -68,7 +80,10 @@ enum
     kDropTimeout,       // waited kGiveUpMs: taken out (the game wakes it on an area load)
     kDropWorld,         // founded in another world (a load came between): taken out
     kAreaMismatch,      // the located ZoneMap does not name the town's area: refused, taken out
-    kNoArea             // its position is off the grid or unread: taken out
+    kNoArea,            // its position is off the grid or unread: taken out
+    kDropNotLoaded,     // T-1397: a 'moved in' town whose area is not loaded: taken out at once (the game wakes the town itself when
+                        // the area loads, F1783 / T2736) - no 60 s wait
+    kDropNotPlayer      // T-1397: a 'moved in' town not in the player-town list: taken out at once (only a player town is woken)
 };
 // one look at one queued town. found: 1 = resolved in the player-town list; posOk: its position read and inside the grid;
 // active: its +0x1AC; loaded: ZoneLoadedSectorTri of its area (1 loaded, 0 not, -1 unreadable - waited on as not loaded);
@@ -86,5 +101,18 @@ inline int Verdict(int found, int posOk, int active, int loaded, int areaOk, uns
 }
 // 1 = the verdict takes the entry out of the queue
 inline int TakesOut(int v) { return (v == kWaitTown || v == kWaitArea) ? 0 : 1; }
+// T-1397 (events over timers): the verdict for an entry of this kind - a founding's as Verdict; a 'moved in' entry never waits:
+// its area not loaded = kDropNotLoaded, its town not found = kDropNotPlayer (everything else as Verdict)
+inline int VerdictFor(int kind, int found, int posOk, int active, int loaded, int areaOk, unsigned age, int sameWorld)
+{
+    const int v = Verdict(found, posOk, active, loaded, areaOk, age, sameWorld);
+    if (kind != kKindMovedIn) return v;
+    if (v == kWaitArea) return kDropNotLoaded;
+    if (v == kWaitTown) return kDropNotPlayer;
+    return v;
+}
+// T-1397: 1 = the entry's look says 'a town founded' (the founder's own-town event and the announcement to the world server) - a
+// founding only, never a 'moved in' wake
+inline int AnnouncesFounding(int kind) { return kind == kKindFounded ? 1 : 0; }
 }   // namespace townwake
 #endif

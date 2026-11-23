@@ -213,6 +213,7 @@
 #include "../common/bldgrec.h"    /* T-1333: one town building's ruin flag and wall health as one record, bldg.<sx>.<sy>.#<hash8>: its format and the rules that take and remove it */
 
 #include "../common/towntime.h"   /* T-4: one town's 5-day rebuild clock as one record, towntime.<sx>.<sy>.<sid>: its format and the rule that takes it */
+#include "../common/camplaid.h"   /* T-1429 design b: an area's camp mark, camplaid.<sx>.<sy>: its format and the rule that takes it (compare-and-set on the area copy) */
 #include "../common/cagerec.h"    /* T-860: one cage's lock as one record, cage.<sx>.<sy>.#<hash>.<x10>.<z10>: its format and the rules that take and remove it */
 #include "../common/arearec.h"   /* T-1084 step 3: AREA_RECORDED (83) - the area-recorded marks, their wire and the holder rule */
 #include "../common/townverwire.h"   /* TOWN_VER (87): one town version per placed town, the revision rule */
@@ -240,7 +241,7 @@ namespace {
 using coopstore::FileProbe;   /* T-1280 fold 1 (H1): here, before the first use (LoadSlots), not beside the definitions further down */
 using coopstore::ProbeFile;
 
-const unsigned int kProtocol = 173;   /* 173 (T-1452, design B): PROFILES kind 7 (NEW with import) ends with {u32 ask, str folder} - the single-player save folder, kept on the profile's row (profiles.txt field 11 'imports:<folder>') until the profile is played or deleted - and every PROFILES row carries it (profiles.h Row::imports), so a leave no longer loses the import; a NEW with import naming the asker's own never-played profile ATTACHES the import (coopprof::NewImportDecide) instead of nameTaken. A world server of 172 reads the folder as a malformed request and a game of 172 reads the longer rows as malformed, so the pair SHIPS TOGETHER. 172 (T-1391, F1565): an area record's three silent refusals answer its sender (CANT recNotHolder / recLease / recNotNewer) - a game that holds its load for its queued area saves' answers needs them; 171 (T-1429 s3, owner 1777 / 1788): a piece record's LIVE part may carry a building's CONSTRUCTION PAUSE - flag bits 9 / 10 (piecerec.h kPrLiveFlagPauseKnown / kPrLiveFlagPaused, no bytes), written by the piece's record writer at each engine change of the 'PAUSE CONSTRUCTION' byte; a world server of 170 refuses such a record as an unknown bit, so the pause would never reach the other games or survive a restart - the pair SHIPS TOGETHER (another open effort may also take 171: whichever merges second renumbers). 170 (merge of effort/t1408a and main, 2026-11-19, above both; effort/t1408a's own 165-167, made on its branch, are never reused): main's 169 (below: T-1429's area-upload base, creation lease and settle ask, T-1021's race look-alike id, T-1427's town fact) and T-1408's wall group facts in a piece record's STATE - the group step stamp (buildwire.h kBuildStateStampBit) and fold 13's wall group fact (buildwire.h kBuildStateGroupBit: the owner's group lead key and join index; the world server reads both through piecerec.h DecodeBuild) - a world server of 169 refuses such a record as unreadable and one of effort/t1408a's 167 lacks the lease, so the pair SHIPS TOGETHER. 169 (merge of effort/t1429b and main, above both; T-1429's own 165-168, made on its branch, are never reused): main's 166 (T-1021: LOOKALIKE (90) may carry a race look-alike id, src/common/lookalikelist.h IdOk, which a world server without it drops as malformed), main's 165 (T-1427 fold 1: a piece record's LIVE part may carry the builder's town, piecerec.h kPrLiveFlagTownFact) and T-1429's area-upload base, creation lease and settle ask (its 165-168 below) - a world server of 165 or 166 lacks one set or the other, so the pair SHIPS TOGETHER. 168 (T-1429 s2 fold 3, review F1372): an area RECORD's seq field (sent as 0 by every game until now) carries the seq of the stored copy the upload was made from, and an area record whose base is not the stored copy's (nor this connection's own last accepted upload) is refused and its sender told AREA_FRESH CANT staleBase (21); a world server of 167 ignores the base and takes any newer copy, so the pair SHIPS TOGETHER. 167 (T-1429 s2 fold 2, review F1364 B / C): the settle ask carries the game's whole ordered area list in ONE message (areafresh.h EncodeSettleList: the 20-byte ASK why settle, then u16 n, n * u16 keys) and this process answers each area in order up to the first WAIT; AREA_FRESH gains why worldFirst (20) - a brand-new world's one reserved lease (ASK / LEASE / WAIT / FRESH, x 0 y 0); a world server of 166 refuses the list as malformed and the game's load would wait, so the pair SHIPS TOGETHER. 166 (T-1429 s2 fold 1, review F1337 item 1): AREA_FRESH's ASK gains why settle (19) - a game in its pre-load hold asks every area its world load will read and is answered with the decision only (FRESH / CANT current / LEASE / WAIT); a world server of 165 would take it as a plain ASK and send the record whole, so the pair SHIPS TOGETHER. 165 (T-1429 s2, owner 1788; src/common/areafresh.h): AREA_FRESH (89) gains the CREATION LEASE - down 5 LEASE ("you create it": this process holds no copy of the area and no lease is out) and 6 WAIT (another game holds the lease; the asker is answered with that game's copy when it lands), and an ASK with why loadedOwn is a world-load CLAIM; while a lease is out only its holder's area record is taken. A world server of 164 would answer an unrecorded area CANT current and every game would load its own, differently rolled copy; a game of 164 would drop LEASE / WAIT as malformed and hold its read for ever, so the pair SHIPS TOGETHER. 165 (T-1427 fold 1, owner request 2026-11-18 'the shared building record carries every important fact, town included'): a piece record's LIVE part may carry flag bit 8 (piecerec.h kPrLiveFlagTownFact) - the builder's town when it is no player outpost: a world town by its game-data stringID, or the wilderness town 'Nowhere'; a world server of 164 refuses such a record as an unknown bit, so the builder's town would never reach the other games. 166 (merge of effort/t1021a and main, above main's 165; effort/t1021a's own 165 is never reused): both sets of changes below are in it - T-1021's LOOKALIKE (90) race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk), which a world server of 165 drops as malformed, and main's 165 (T-1427 fold 1, piecerec.h kPrLiveFlagTownFact, the builder's town). 165 (T-1021, its branch only, never reused): LOOKALIKE (90) may carry a race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk) - kept and sent on as an import copy id is (a world server of 164 drops it as malformed). 166 (merge of effort/t1408a and main, the world server's protocol above main's 165; both sides' 165 are in it and 165 is never reused as a merged number): T-1408's group step stamp in a piece record's STATE and T-1427's town fact (LIVE flag bit 8) - a world server of 165 knows only one of them and refuses the other's records as unreadable. 165 (T-1408 group step stamp): a piece record's STATE may carry a wall group step stamp (buildwire.h kBuildStateStampBit) - a world server of 164 refuses such a record as unreadable, a game of 164 such a STATE. 164 (merge of effort/t1167b and main, the world server's protocol above main's 163; effort/t1167b's own 163 is never reused): both sets of changes below are in it - T-1167's TRADE (94) kinds 1-13 (its 154 / 155 / 156, made on its branch, never reused) and main's 157-163; a world server of 163 drops message 94, so no trade window would open. 163 (T-885 piece 2, design docs/design-ownrec.md sections 3 / 6): OWNREC 105 gains INDEX_ASK / GET up and INDEX / REC / END down - before every load the game asks what this process holds for its profile, fetches every copy newer than its own and takes them into its records folder; a deleted profile's own\<profile>\ folder moves into recycle\. A world of 162 would refuse the new kinds as a malformed PUT and the game would wait at its loading screen. 162 (T-885 piece 1, owner 1752 a): message 105 OWNREC (src/common/ownrecwire.h) - up PUT (one record of a player's own records folder), down OK (stored / duplicate / superseded / refused, with a receipt number R from this world's record counter); the copies are kept in <world folder>/own/<profile id>/ and read by nothing yet; a world of 161 logs 105 as unknown and never answers, so a game of 162 would send its records into nothing. 161 (T-1392, owner 1082): the OPTIONS map holds MENUS AND BUILDING (menupause = run / pause, rules.txt's row) - a game of 160 ignores the row and casts its menu pause vote under every Slowest wins world, so a mixed pair would pause differently with no warning; the protocol refusal makes an old game update. 160 (merge of T-1383's 159 and T-938 / T-247's 158, which each moved 157 on its own branch; both sets of changes below are in this protocol, 158 and 159 are never reused). 158 (T-938 / T-247, owner 1679 / 1680 / 1681 / 1686 / 1692): message 104 PLAYER_MODS (src/common/playermods.h) - the world's mod list (none, a list, who set it, DIFFERENT MODS) and every player's verdict, to every game; ADMIN_REQ verb 21 USE MY MODS FOR THIS WORLD with reply 51; a mods REFUSE's fourth word says what a login shown at the door did (playermods / coopstore kModsLogin*); a world of 157 would read a 104 as unknown. 159 (T-1383, decision 1704): PROFILES kind 7 (NEW with import) may end with a u32 - the parts the world's creator asks for (worldhist.h kAskDead / kAskRelations); the answer's import word has bit 4 CREATOR (spimport::kWordCreator: an import now would make the world's creator / the profile just made holds the claim); WORLD_START (95, up only) carries the creator's dead named characters - a world server of 157 refuses kind 7 with the extra word as malformed and does not know 94. 157 (T-1365 stage 2, owner 1675; 154-156 are T-1167's on its branch, never reused): RECORD_FEED's INDEX_ASK may carry aoiVersion 2 - its area field followed by a NEW GAME's start town (a town record id, src/common/starttown.h) - and every INDEX_PAGE ends with {u16 t, t * (u8 x, u8 y)}: on the first page of an ask naming a town, the areas of that town's placements as the "built with" notes in this process's area records place them (none when no note names it); a world server of 153 refuses version 2 as malformed and a game of 153 reads a page's last two bytes as a trailing field. 156 (T-1167 piece 3 build 3, owner 1641 "if no room the trade doesn't happen, the window stays open"): TRADE (94) LOCK_REFUSED carries a reason (missing / NO ROOM) and the other side's offer rows that did not fit, ABORT carries those rows (AbortWhy no-room, 8); on a no-room ABORTED this process puts the trade back on the relay with both accepts cleared (tradewire.h Reopen) - a world server of 155 would refuse both messages as malformed (they are read to their end), so a no-room lock would only end by its 10 s clock and close both windows. 155 (T-1167 piece 3, owner 1635 "the swap's commit through the world server"): TRADE (94) kinds 8-13 - LOCK_NOW / LOCKED / LOCK_REFUSED / COMMIT / ABORT / APPLIED: at READY this process locks the trade, keeps it in trade.txt and writes the ONE decision (COMMITTED or ABORTED) there before it answers; COMMITTED puts each side's money in the other's money inbox under the transfer number its LOCKED reserved (src/common/tradebook.h); a world server of 154 drops kinds 8-13, so no trade would ever lock and both escrows would wait for nothing. 154 (T-1167 piece 2, owner 1633 / 1635): TRADE (94) - the player trade window's ASK / ANSWER / OFFER / ACCEPT / CANCEL go through this process, which relays each to the other player's game and itself decides whether both sides accepted the same offer serials (src/common/tradewire.h); a world server of 153 drops message 94, so the other game's window never opens. 153 (T-1339; 152 is T-1333's, never reused): RECORD_FEED kind 11 AREA_STALE {u32 epoch, u32 n, n * u16 area} - a record write of a named area was NOT forwarded to this game (outside its area of interest: its last AREAS report's areas, the areas it holds, one ring around both); the game reads that area as not done until an AREA_DONE all=0 naming it, which follows the area's catch-up (its records written since) on the same line; a game of 152 would read every area done from its first download on and never learn of a withheld write. 152 (T-1333, design a): bldg.<sx>.<sy>.#<hash8> records (src/common/bldgrec.h) - one town building's ruin flag and wall health, written only by the holder of its area; a world server of 151 would keep one as a squad's record. 151 (T-4): towntime.<sx>.<sy>.<sid> records (src/common/towntime.h) - one town's 5-day rebuild clock, written only by the holder of the town's area with a rising generation; a world server of 150 would keep one as a squad's record. 150 (T-1329, design C): an area record (zone.<x>.<y>) may be EMPTY - the bytes of zonerec::kZoneEmptyMark in place of an area file, published by the game whose one-area save wrote nothing (ZoneMap+0x24 = 0); it is stored, judged and forwarded as any area record (zonecheck::Readable takes it), so it replaces an older copy and answers later askers from the records - a world server of 149 refuses it as unreadable; 149 (T-1279, design B): AREA_FRESH's ASK for an area no live game holds (nobody, a holder not in the world, or the asker) is answered from this process's records - the area's record when newer than the asker's stamp, then FRESH; else CANT current (areafresh.h ServerRecordAnswer) - where 148 answered CANT noHolder and the game loaded an older copy; 148 (decision 1556, on top of T-860's 147): AREAS ends with a flags byte - kAreasFlagLoading marks a report sent while the game's zone manager is loading, on which this process changes no listing and no holder; an unmarked report's pairs are the areas the game's engine KEEPS (areadrop.h, areaclaim.h AreasReportListing); 147 (T-860): cage.<sx>.<sy>.#<hash>.<x10>.<z10> records (src/common/cagerec.h) - a cage's lock, written only by the holder of its area; a world server of 146 would keep one as a squad's record. 146 (T-1269): SQUAD_RELEASE with the id "*" ends a returning game's re-claim batch - the squads it registered before this process started and did not re-claim are released (store_main.cpp SquadReclaimEnd, squadwriterreg.h ReclaimEndStep); 145 (T-1061): a box record may end with its LOCK BLOCK (boxrec.h kBrFlagLock), which a reader of 144 refuses; 144 (T-23): a piece record may be a HAND-OVER SEED (piecerec.h kPrFlagHanded) naming another player the owner; the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 177;   /* 177 (T-1429 F1796 design b, unreleased): ground record format 3 - after its rows a gone block (u32 n, n x {str name, u32 slot, u32 stamp}); a map item (not made during play) is removed by a record apply only when a gone row names it, an absent row reads 'untouched'; format 2 is still read as no gone rows; a world server of 176 refuses a format-3 record as unreadable, so the pair SHIPS TOGETHER; 176 (T-1429 F1753 design a, unreleased): camplaid record format 3 - each camp piece carries its inside byte (0 made outdoors, 1 made inside the camp's nest building, 2 not known; format 2 still read, its pieces 'not known'); 175 (T-1429 re-check fold F1622, unreleased): AREA_FRESH kind 7 HELD carries the holder-only camp layer rule and waits for the camp pieces record to settle; 174 (T-1429 design b, owner 1777 / 1788, F1600): camplaid.<sx>.<sy> records - an area's camp mark, taken only from the area's holder and only when no entry names an area copy newer than the stored one (BOX_REFUSE reason 15 aheadOfArea); 173 (T-1452, design B): PROFILES kind 7 (NEW with import) ends with {u32 ask, str folder} - the single-player save folder, kept on the profile's row (profiles.txt field 11 'imports:<folder>') until the profile is played or deleted - and every PROFILES row carries it (profiles.h Row::imports), so a leave no longer loses the import; a NEW with import naming the asker's own never-played profile ATTACHES the import (coopprof::NewImportDecide) instead of nameTaken. A world server of 172 reads the folder as a malformed request and a game of 172 reads the longer rows as malformed, so the pair SHIPS TOGETHER. 172 (T-1391, F1565): an area record's three silent refusals answer its sender (CANT recNotHolder / recLease / recNotNewer) - a game that holds its load for its queued area saves' answers needs them; 171 (T-1429 s3, owner 1777 / 1788): a piece record's LIVE part may carry a building's CONSTRUCTION PAUSE - flag bits 9 / 10 (piecerec.h kPrLiveFlagPauseKnown / kPrLiveFlagPaused, no bytes), written by the piece's record writer at each engine change of the 'PAUSE CONSTRUCTION' byte; a world server of 170 refuses such a record as an unknown bit, so the pause would never reach the other games or survive a restart - the pair SHIPS TOGETHER (another open effort may also take 171: whichever merges second renumbers). 170 (merge of effort/t1408a and main, 2026-11-19, above both; effort/t1408a's own 165-167, made on its branch, are never reused): main's 169 (below: T-1429's area-upload base, creation lease and settle ask, T-1021's race look-alike id, T-1427's town fact) and T-1408's wall group facts in a piece record's STATE - the group step stamp (buildwire.h kBuildStateStampBit) and fold 13's wall group fact (buildwire.h kBuildStateGroupBit: the owner's group lead key and join index; the world server reads both through piecerec.h DecodeBuild) - a world server of 169 refuses such a record as unreadable and one of effort/t1408a's 167 lacks the lease, so the pair SHIPS TOGETHER. 169 (merge of effort/t1429b and main, above both; T-1429's own 165-168, made on its branch, are never reused): main's 166 (T-1021: LOOKALIKE (90) may carry a race look-alike id, src/common/lookalikelist.h IdOk, which a world server without it drops as malformed), main's 165 (T-1427 fold 1: a piece record's LIVE part may carry the builder's town, piecerec.h kPrLiveFlagTownFact) and T-1429's area-upload base, creation lease and settle ask (its 165-168 below) - a world server of 165 or 166 lacks one set or the other, so the pair SHIPS TOGETHER. 168 (T-1429 s2 fold 3, review F1372): an area RECORD's seq field (sent as 0 by every game until now) carries the seq of the stored copy the upload was made from, and an area record whose base is not the stored copy's (nor this connection's own last accepted upload) is refused and its sender told AREA_FRESH CANT staleBase (21); a world server of 167 ignores the base and takes any newer copy, so the pair SHIPS TOGETHER. 167 (T-1429 s2 fold 2, review F1364 B / C): the settle ask carries the game's whole ordered area list in ONE message (areafresh.h EncodeSettleList: the 20-byte ASK why settle, then u16 n, n * u16 keys) and this process answers each area in order up to the first WAIT; AREA_FRESH gains why worldFirst (20) - a brand-new world's one reserved lease (ASK / LEASE / WAIT / FRESH, x 0 y 0); a world server of 166 refuses the list as malformed and the game's load would wait, so the pair SHIPS TOGETHER. 166 (T-1429 s2 fold 1, review F1337 item 1): AREA_FRESH's ASK gains why settle (19) - a game in its pre-load hold asks every area its world load will read and is answered with the decision only (FRESH / CANT current / LEASE / WAIT); a world server of 165 would take it as a plain ASK and send the record whole, so the pair SHIPS TOGETHER. 165 (T-1429 s2, owner 1788; src/common/areafresh.h): AREA_FRESH (89) gains the CREATION LEASE - down 5 LEASE ("you create it": this process holds no copy of the area and no lease is out) and 6 WAIT (another game holds the lease; the asker is answered with that game's copy when it lands), and an ASK with why loadedOwn is a world-load CLAIM; while a lease is out only its holder's area record is taken. A world server of 164 would answer an unrecorded area CANT current and every game would load its own, differently rolled copy; a game of 164 would drop LEASE / WAIT as malformed and hold its read for ever, so the pair SHIPS TOGETHER. 165 (T-1427 fold 1, owner request 2026-11-18 'the shared building record carries every important fact, town included'): a piece record's LIVE part may carry flag bit 8 (piecerec.h kPrLiveFlagTownFact) - the builder's town when it is no player outpost: a world town by its game-data stringID, or the wilderness town 'Nowhere'; a world server of 164 refuses such a record as an unknown bit, so the builder's town would never reach the other games. 166 (merge of effort/t1021a and main, above main's 165; effort/t1021a's own 165 is never reused): both sets of changes below are in it - T-1021's LOOKALIKE (90) race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk), which a world server of 165 drops as malformed, and main's 165 (T-1427 fold 1, piecerec.h kPrLiveFlagTownFact, the builder's town). 165 (T-1021, its branch only, never reused): LOOKALIKE (90) may carry a race look-alike id ('<template id>~r<f|m><race id>', src/common/spimport.h RaceCopySid; lookalikelist.h IdOk) - kept and sent on as an import copy id is (a world server of 164 drops it as malformed). 166 (merge of effort/t1408a and main, the world server's protocol above main's 165; both sides' 165 are in it and 165 is never reused as a merged number): T-1408's group step stamp in a piece record's STATE and T-1427's town fact (LIVE flag bit 8) - a world server of 165 knows only one of them and refuses the other's records as unreadable. 165 (T-1408 group step stamp): a piece record's STATE may carry a wall group step stamp (buildwire.h kBuildStateStampBit) - a world server of 164 refuses such a record as unreadable, a game of 164 such a STATE. 164 (merge of effort/t1167b and main, the world server's protocol above main's 163; effort/t1167b's own 163 is never reused): both sets of changes below are in it - T-1167's TRADE (94) kinds 1-13 (its 154 / 155 / 156, made on its branch, never reused) and main's 157-163; a world server of 163 drops message 94, so no trade window would open. 163 (T-885 piece 2, design docs/design-ownrec.md sections 3 / 6): OWNREC 105 gains INDEX_ASK / GET up and INDEX / REC / END down - before every load the game asks what this process holds for its profile, fetches every copy newer than its own and takes them into its records folder; a deleted profile's own\<profile>\ folder moves into recycle\. A world of 162 would refuse the new kinds as a malformed PUT and the game would wait at its loading screen. 162 (T-885 piece 1, owner 1752 a): message 105 OWNREC (src/common/ownrecwire.h) - up PUT (one record of a player's own records folder), down OK (stored / duplicate / superseded / refused, with a receipt number R from this world's record counter); the copies are kept in <world folder>/own/<profile id>/ and read by nothing yet; a world of 161 logs 105 as unknown and never answers, so a game of 162 would send its records into nothing. 161 (T-1392, owner 1082): the OPTIONS map holds MENUS AND BUILDING (menupause = run / pause, rules.txt's row) - a game of 160 ignores the row and casts its menu pause vote under every Slowest wins world, so a mixed pair would pause differently with no warning; the protocol refusal makes an old game update. 160 (merge of T-1383's 159 and T-938 / T-247's 158, which each moved 157 on its own branch; both sets of changes below are in this protocol, 158 and 159 are never reused). 158 (T-938 / T-247, owner 1679 / 1680 / 1681 / 1686 / 1692): message 104 PLAYER_MODS (src/common/playermods.h) - the world's mod list (none, a list, who set it, DIFFERENT MODS) and every player's verdict, to every game; ADMIN_REQ verb 21 USE MY MODS FOR THIS WORLD with reply 51; a mods REFUSE's fourth word says what a login shown at the door did (playermods / coopstore kModsLogin*); a world of 157 would read a 104 as unknown. 159 (T-1383, decision 1704): PROFILES kind 7 (NEW with import) may end with a u32 - the parts the world's creator asks for (worldhist.h kAskDead / kAskRelations); the answer's import word has bit 4 CREATOR (spimport::kWordCreator: an import now would make the world's creator / the profile just made holds the claim); WORLD_START (95, up only) carries the creator's dead named characters - a world server of 157 refuses kind 7 with the extra word as malformed and does not know 94. 157 (T-1365 stage 2, owner 1675; 154-156 are T-1167's on its branch, never reused): RECORD_FEED's INDEX_ASK may carry aoiVersion 2 - its area field followed by a NEW GAME's start town (a town record id, src/common/starttown.h) - and every INDEX_PAGE ends with {u16 t, t * (u8 x, u8 y)}: on the first page of an ask naming a town, the areas of that town's placements as the "built with" notes in this process's area records place them (none when no note names it); a world server of 153 refuses version 2 as malformed and a game of 153 reads a page's last two bytes as a trailing field. 156 (T-1167 piece 3 build 3, owner 1641 "if no room the trade doesn't happen, the window stays open"): TRADE (94) LOCK_REFUSED carries a reason (missing / NO ROOM) and the other side's offer rows that did not fit, ABORT carries those rows (AbortWhy no-room, 8); on a no-room ABORTED this process puts the trade back on the relay with both accepts cleared (tradewire.h Reopen) - a world server of 155 would refuse both messages as malformed (they are read to their end), so a no-room lock would only end by its 10 s clock and close both windows. 155 (T-1167 piece 3, owner 1635 "the swap's commit through the world server"): TRADE (94) kinds 8-13 - LOCK_NOW / LOCKED / LOCK_REFUSED / COMMIT / ABORT / APPLIED: at READY this process locks the trade, keeps it in trade.txt and writes the ONE decision (COMMITTED or ABORTED) there before it answers; COMMITTED puts each side's money in the other's money inbox under the transfer number its LOCKED reserved (src/common/tradebook.h); a world server of 154 drops kinds 8-13, so no trade would ever lock and both escrows would wait for nothing. 154 (T-1167 piece 2, owner 1633 / 1635): TRADE (94) - the player trade window's ASK / ANSWER / OFFER / ACCEPT / CANCEL go through this process, which relays each to the other player's game and itself decides whether both sides accepted the same offer serials (src/common/tradewire.h); a world server of 153 drops message 94, so the other game's window never opens. 153 (T-1339; 152 is T-1333's, never reused): RECORD_FEED kind 11 AREA_STALE {u32 epoch, u32 n, n * u16 area} - a record write of a named area was NOT forwarded to this game (outside its area of interest: its last AREAS report's areas, the areas it holds, one ring around both); the game reads that area as not done until an AREA_DONE all=0 naming it, which follows the area's catch-up (its records written since) on the same line; a game of 152 would read every area done from its first download on and never learn of a withheld write. 152 (T-1333, design a): bldg.<sx>.<sy>.#<hash8> records (src/common/bldgrec.h) - one town building's ruin flag and wall health, written only by the holder of its area; a world server of 151 would keep one as a squad's record. 151 (T-4): towntime.<sx>.<sy>.<sid> records (src/common/towntime.h) - one town's 5-day rebuild clock, written only by the holder of the town's area with a rising generation; a world server of 150 would keep one as a squad's record. 150 (T-1329, design C): an area record (zone.<x>.<y>) may be EMPTY - the bytes of zonerec::kZoneEmptyMark in place of an area file, published by the game whose one-area save wrote nothing (ZoneMap+0x24 = 0); it is stored, judged and forwarded as any area record (zonecheck::Readable takes it), so it replaces an older copy and answers later askers from the records - a world server of 149 refuses it as unreadable; 149 (T-1279, design B): AREA_FRESH's ASK for an area no live game holds (nobody, a holder not in the world, or the asker) is answered from this process's records - the area's record when newer than the asker's stamp, then FRESH; else CANT current (areafresh.h ServerRecordAnswer) - where 148 answered CANT noHolder and the game loaded an older copy; 148 (decision 1556, on top of T-860's 147): AREAS ends with a flags byte - kAreasFlagLoading marks a report sent while the game's zone manager is loading, on which this process changes no listing and no holder; an unmarked report's pairs are the areas the game's engine KEEPS (areadrop.h, areaclaim.h AreasReportListing); 147 (T-860): cage.<sx>.<sy>.#<hash>.<x10>.<z10> records (src/common/cagerec.h) - a cage's lock, written only by the holder of its area; a world server of 146 would keep one as a squad's record. 146 (T-1269): SQUAD_RELEASE with the id "*" ends a returning game's re-claim batch - the squads it registered before this process started and did not re-claim are released (store_main.cpp SquadReclaimEnd, squadwriterreg.h ReclaimEndStep); 145 (T-1061): a box record may end with its LOCK BLOCK (boxrec.h kBrFlagLock), which a reader of 144 refuses; 144 (T-23): a piece record may be a HAND-OVER SEED (piecerec.h kPrFlagHanded) naming another player the owner; the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_KEPT = 69, MSG_GROUND_REFUSE = 71, MSG_BOX_REFUSE = 72, MSG_MONEY_SEND = 73, MSG_MONEY_SENT_OK = 74, MSG_MONEY_DELIVER = 75, MSG_MONEY_APPLIED = 76, MSG_MONEY_REFUSE = 77, MSG_PIECE_REFUSE = 79, MSG_BOX_TAKEN = 80, MSG_BOX_ASK = 81, MSG_BOX_ASKED = 82 };   /* T-810: MONEY (73-77) - src/common/moneywire.h */
 const int MSG_AREA_RECORDED = 83;   /* T-1084 step 3 (protocol 121): AREA_RECORDED, up MARK / down LIST, MARK - src/common/arearec.h */
 const int MSG_SQUAD_TAKE = 84, MSG_SQUAD_WRITER = 85, MSG_SQUAD_RELEASE = 86;   /* T-1084 step 5 (protocol 122): a take up, the writer register's answer down, the writer's release up - src/common/squadwriterreg.h */
@@ -293,6 +294,7 @@ typedef char ShopNumbersAgree[(kProtocol == shoprec::kProtocol) ? 1 : -1];   /* 
 typedef char DoorNumbersAgree[(kProtocol == doorrec::kProtocol) ? 1 : -1];   /* a compile error here = doorrec.h and this file disagree */
 typedef char BldgNumbersAgree[(kProtocol == bldgrec::kProtocol) ? 1 : -1];   /* T-1333: a compile error here = bldgrec.h and this file disagree */
 typedef char TownTimeNumbersAgree[(kProtocol == towntime::kProtocol) ? 1 : -1];   /* T-4: a compile error here = towntime.h and this file disagree */
+typedef char CampLaidNumbersAgree[(kProtocol == camplaid::kProtocol) ? 1 : -1];   /* T-1429 design b: a compile error here = camplaid.h and this file disagree */
 typedef char CageNumbersAgree[(kProtocol == cagerec::kProtocol) ? 1 : -1];   /* T-860: a compile error here = cagerec.h and this file disagree */
 typedef char BoxNumbersAgree[(MSG_BOX_REFUSE == (int)coopbrec::kMsgBoxRefuse && MSG_BOX_TAKEN == (int)coopbrec::kMsgBoxTaken && MSG_BOX_ASK == (int)coopbrec::kMsgBoxAsk && MSG_BOX_ASKED == (int)coopbrec::kMsgBoxAsked && kProtocol == coopbrec::kProtocol) ? 1 : -1];   /* a compile error here = boxrec.h and this file disagree */
 typedef char ShowNumbersAgree[(MSG_SHOW == (int)baseshow::kMsgShow && kProtocol == baseshow::kProtocol) ? 1 : -1];   /* T-811: a compile error here = baseshow.h and this file disagree */
@@ -479,6 +481,9 @@ int AreaRowListedBy(const AreaRow& r, int slot, double now)
                                     ls != r.lastSeen.end() ? 1 : 0, ls != r.lastSeen.end() ? ls->second : 0.0, now, kGraceSec);
 }
 void AreaChargeSweep(double now, int reporter, const std::string& goneId, const std::string& event);   /* defined above OnAreas */
+void AfHeldTell(int x, int y, int slot, const char* why);   /* T-1429 re-check fold F1617 items 1 / 4: defined with the camp layer naming (AfLayerFor) */
+void AfHeldSettled(const std::string& id);   /* T-1429 F1622 item 5: likewise - a HELD that waited for the area's camp pieces record to settle */
+std::set<int> g_afHeldBatch;   /* T-1429 F1617: areas told HELD during one AREAS report (one HELD per area per report) */
 void AoifRecompute(ENetPeer* p, int fromReport);   /* T-1339: defined above RecordForward */
 void AoifHoldersChanged();         /* T-1339: likewise */
 void AoifStewardChanged();         /* T-1339 fold 1 (MED 3): likewise */
@@ -1373,6 +1378,7 @@ void AreaChargeSweep(double now, int reporter, const std::string& goneId, const 
            and a step through nobody is not a holder (groundsync.h GsHolderStep) - the game's "holder before me" then names X. */
         r.ownerId = toId; r.owner = to; r.restored = 0; r.keptCounted = 0; r.restoredAtSec = (double)NowUnix();
         changed = 1;
+        if (to >= 0) AfHeldTell(x, y, to, w == coopstore::kChargeAssign ? "assigned" : "passed");   /* T-1429 F1617 items 1 / 4: the holder change is the event - the new holder is told */
         if (g_areaMapDue == 0) g_areaMapDueWhy = event;   /* T-1442: the holder moved - the map is due at once (AreaMapFlush), named by the first event */
         g_areaMapDue = coopstore::AreaMapDueMark(g_areaMapDue, 1);
     }
@@ -1429,6 +1435,8 @@ void OnAreas(ENetPeer* from, const std::vector<char>& payload)
        report. The list replaces the slot's entries whole; an entry off the grid is skipped. An empty list ("I do not know") clears the
        slot's entries now instead of letting them age out. */
     g_playerSecEntriesIn += (long long)coopdrop::AreasPlayerRowsReplace(&g_playerSec, slot, psList, now);
+    std::set<int> afListed, afRelisted;   /* T-1429 F1617: this report's areas (areafresh keys) and those its previous listing did not list */
+    g_afHeldBatch.clear();
     for (unsigned i = 0; i < n; ++i)
     {
         int x = 0, y = 0; memcpy(&x, &payload[4 + i * 8], 4); memcpy(&y, &payload[8 + i * 8], 4);
@@ -1437,6 +1445,8 @@ void OnAreas(ENetPeer* from, const std::vector<char>& payload)
         AreaRow& ar = g_areas[(long long)y * 64 + x];
         const std::map<int, double>::const_iterator se = ar.lastSeen.find(slot), sc = ar.listedSince.find(slot);
         if (se != ar.lastSeen.end() && se->second == now) continue;   /* the same area twice in one report */
+        afListed.insert(areafresh::Key(x, y));
+        if (se == ar.lastSeen.end() || havePrev == 0 || se->second != prevStamp) afRelisted.insert(areafresh::Key(x, y));
         ar.listedSince[slot] = coopstore::AreaListedSince(havePrev, prevStamp, se != ar.lastSeen.end() ? 1 : 0, se != ar.lastSeen.end() ? se->second : 0.0,
                                                           sc != ar.listedSince.end() ? 1 : 0, sc != ar.listedSince.end() ? sc->second : 0.0, now);
         ar.lastSeen[slot] = now;
@@ -1445,6 +1455,17 @@ void OnAreas(ENetPeer* from, const std::vector<char>& payload)
        a game that lists it) - coopstore::AreaChargeDecide. The sweep runs BEFORE LiveAreasReport, so the map it sends ahead of a CATCHUP
        ASK already names the holders this report decided. */
     if (listing != 0) AreaChargeSweep(now, slot, std::string(), "a report");   /* decision 1556: a loading-marked report changes no holder */
+    if (listing != 0 && n > 0)
+    {   /* T-1429 F1617 items 1 / 2: an area this game holds and lists again after a listing that did not list it (its holder did not change,
+           so the sweep told nothing) - it loaded the area again: told HELD; and the layer namings of this game end on its reports */
+        for (std::set<int>::const_iterator k = afRelisted.begin(); k != afRelisted.end(); ++k)
+        {
+            const std::map<long long, AreaRow>::const_iterator a = g_areas.find((long long)areafresh::KeyY(*k) * 64 + areafresh::KeyX(*k));
+            if (a != g_areas.end() && a->second.owner == slot && zonerec::AreaRowHeld(a->second.ownerId, a->second.owner) != 0) AfHeldTell(areafresh::KeyX(*k), areafresh::KeyY(*k), slot, "listed again");
+        }
+        (void)afListed;   /* F1622 item 1: no layer naming ends on reports any more (only the holder lays) */
+    }
+    g_afHeldBatch.clear();
     /* P5t: the trailing player sector (E25) is read at the TOP of this function now, before the area loop. */
     /* M6: this game's delivery set for AREA-routed LIVE, and the catch-up for what is new in it. M7a fold 4 (T760 V1): AFTER the area
        loop, so the map LiveAreasReport sends ahead of each CATCHUP ASK already carries this report's loaded-by marks and player sector. */
@@ -2790,6 +2811,7 @@ std::set<ENetPeer*> g_townsSentTo;             /* the games sent the kept outpos
 townkeep::OutpostPieces g_townPieces;
 std::map<ENetPeer*, std::set<unsigned> > g_townsHeldSent;
 long long g_townsHeldKept = 0, g_townsHeldLists = 0, g_townsLetGo = 0, g_townsHeldCapped = 0, g_townPiecesLoaded = 0, g_townPiecesUnread = 0;
+long long g_townsKeptByHand = 0;   /* T-1391 B1: said rows that kept their row on file by the town handle although its centre moved past kTownSameRadius */
 /* T-811: SHOW - the last list each game was sent (a list that reads the same is not sent again); BasesShowTo / BasesShowAll are beside
    the team code */
 std::map<ENetPeer*, std::vector<char> > g_showSent;   /* the SHOW and its SHOW KEYS messages (protocol 101) side by side: either changing sends both */
@@ -2987,6 +3009,16 @@ void OnTowns(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
     }
     std::vector<townkeep::TownRow> next;
     next.swap(k.next);   /* T-1158 step 6: the said rows, then the kept rows back on file with their ids */
+    for (size_t i = 0; i < k.handMoved.size(); ++i)
+    {   /* T-1391 B1 (F1804): the row was matched by its owner game's own town handle, not by its centre (which moved past kTownSameRadius) */
+        const townkeep::HandMove& m = k.handMoved[i];
+        ++g_townsKeptByHand;
+        if (g_townsKeptByHand > 20 && g_townsKeptByHand % 100 != 0) continue;   /* the first 20, then every 100th (as its neighbours) */
+        char b[360];
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "outposts: slot %d (%s) '%.60s' id %u kept by handle - its centre moved from (%.1f, %.1f) to (%.1f, %.1f), off by (%.1f, %.1f), past %.0f (townsKeptByHand=%lld)",
+                    slot, PeerName(from).c_str(), SanitizeForLog(m.name).c_str(), m.id, m.oldX, m.oldZ, m.newX, m.newZ, m.newX - m.oldX, m.newZ - m.oldZ, townkeep::kTownSameRadius, g_townsKeptByHand);
+        Log(b);
+    }
     for (size_t i = 0; i < k.unheld.size(); ++i)
     {   /* T-1158 step 6: a row the whole SAY does not hold and no live piece names - let go (the player gave it up or removed every building) */
         ++g_townsLetGo;
@@ -4791,7 +4823,7 @@ int RecordAreaOf(const std::string& id, const Record& r, int* named)
     int sx = -1, sy = -1;
     const bool n = zonerec::ZoneRecIdParse(id, &sx, &sy) != 0 || coopgrec::GroundRecIdParse(id, &sx, &sy) != 0
                 || coopbrec::BoxRecIdParse(id, &sx, &sy, 0, 0, 0) != 0 || piecerec::PieceRecIdParse(id, &sx, &sy, 0, 0, 0, 0) != 0
-                || doorrec::DoorRecIdParse(id, &sx, &sy) != 0 || cagerec::CageRecIdParse(id, &sx, &sy) != 0 || bldgrec::BldgRecIdParse(id, &sx, &sy) != 0 || towntime::TownTimeIdParse(id, &sx, &sy, 0) != 0
+                || doorrec::DoorRecIdParse(id, &sx, &sy) != 0 || cagerec::CageRecIdParse(id, &sx, &sy) != 0 || bldgrec::BldgRecIdParse(id, &sx, &sy) != 0 || towntime::TownTimeIdParse(id, &sx, &sy, 0) != 0 || camplaid::CampLaidIdParse(id, &sx, &sy) != 0
                 || shoprec::ShopRecIdParse(id, &sx, &sy) != 0;   /* T-1339 fold 1 (LOW 5): a shop by its key's area, as the game gates it (items.cpp) */
     if (named != 0) *named = n ? 1 : 0;
     if (n) { const int k = cooplive::AreaKey(sx, sy); return k >= 0 ? k : aoi::kNoArea; }
@@ -9678,6 +9710,120 @@ void TownTimeRefuse(ENetPeer* from, unsigned connect, const std::string& fromNam
         + ", sent " + N((long long)sentGen) + "; logged once a minute per record: ttTaken=" + N(g_ttTaken) + " ttRefused=" + N(g_ttRefused)
         + " ttRefuseQuiet=" + N(g_ttRefuseQuiet) + " ttRepeat=" + N(g_ttRepeat) + " ttStoredSent=" + N(g_ttStoredSent) + ")");
 }
+/* T-1429 design b: CAMP MARKS (src/common/camplaid.h), id camplaid.<sx>.<sy>: taken only from the game the area map names as the area's
+   holder, naming that game as its writer, with a generation above the stored one, and only when every entry's area copy seq is no newer
+   than the stored area copy's (compare-and-set, as an area record's base). Never removed. A refusal is answered with BOX_REFUSE; one
+   refused as older or at the stored generation also with the stored record. Logged once a minute per id. */
+std::map<std::string, unsigned int> g_clGen;
+std::map<std::string, camplaid::CampLaidRec> g_clRec;   /* T-1429 F1627 item 1: the stored record itself (the append-only merge reads it) */
+std::map<std::string, double> g_clRefuseLogAt;
+long long g_clTaken = 0, g_clRefused = 0, g_clRefuseQuiet = 0, g_clRepeat = 0, g_clStoredSent = 0, g_clGrown = 0, g_clGrownSent = 0, g_clLateTaken = 0;
+/* T-1429 re-check fold F1627 item 1: WHETHER A WRITE'S SENDER HELD THE AREA WHEN THE WRITE ARRIVED - recorded at its first arrival
+   (OnRecordFrom, before any hold behind an earlier write) by id | connection | generation, taken (once) when it is judged */
+std::map<std::string, int> g_clArrival;
+std::set<std::string> g_clGrownFor;   /* id | seq: a stored record that is not the write as sent - sent back to its writer once landed */
+int CampLaidHolderOf(const std::string& id);
+std::string CampLaidArrivalKey(const std::string& id, unsigned connect, const std::vector<char>& bytes)
+{
+    camplaid::CampLaidRec w;
+    if (bytes.empty() || camplaid::DecodeCampLaidRec(&bytes[0], bytes.size(), &w) != camplaid::kClOk) return std::string();
+    return id + "|" + N((long long)connect) + "|" + N((long long)w.generation);
+}
+void CampLaidArrivalNote(const std::string& id, ENetPeer* from, unsigned connect, const std::vector<char>& bytes)
+{
+    const std::string k = CampLaidArrivalKey(id, connect, bytes);
+    if (k.empty() || g_clArrival.count(k) != 0) return;   /* a held message judged again keeps its arrival fact */
+    const int sender = (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect) ? SlotOf(from) : -1;
+    const int holder = CampLaidHolderOf(id);
+    g_clArrival[k] = (sender >= 0 && sender == holder) ? 1 : 0;
+}
+int CampLaidArrivalTake(const std::string& id, unsigned connect, const std::vector<char>& bytes)
+{
+    const std::string k = CampLaidArrivalKey(id, connect, bytes);
+    const std::map<std::string, int>::iterator a = k.empty() ? g_clArrival.end() : g_clArrival.find(k);
+    if (a == g_clArrival.end()) return -1;
+    const int v = a->second;
+    g_clArrival.erase(a);
+    return v;
+}
+unsigned int CampLaidStoredGen(const std::string& id, bool* locked = 0, camplaid::CampLaidRec* rec = 0, bool* recOk = 0)
+{
+    if (locked != 0) *locked = false;
+    if (recOk != 0) *recOk = false;
+    std::map<std::string, unsigned int>::const_iterator c = g_clGen.find(id);
+    if (c != g_clGen.end())
+    {
+        const std::map<std::string, camplaid::CampLaidRec>::const_iterator sr = g_clRec.find(id);
+        if (sr != g_clRec.end()) { if (rec != 0) *rec = sr->second; if (recOk != 0) *recOk = true; }
+        return c->second;
+    }
+    unsigned int gen = 0;
+    std::vector<char> b;
+    {
+        std::ifstream f(U8W(FileOf(id).c_str()).c_str(), std::ios::binary);
+        if (RecFileHeldNow(FileOf(id), f.is_open(), "CAMPLAID " + SanitizeForLog(id), kRecHeldKeep)) { if (locked != 0) *locked = true; return 0u; }
+        if (f)
+        {
+            std::vector<char> buf(camplaid::kClMaxBytes);
+            f.read(&buf[0], (std::streamsize)buf.size());
+            const std::streamsize got = f.gcount();
+            if (got > 0) b.assign(buf.begin(), buf.begin() + (size_t)got);
+        }
+    }
+    camplaid::CampLaidRec r;
+    if (!b.empty() && camplaid::DecodeCampLaidRec(&b[0], b.size(), &r) == camplaid::kClOk) { gen = r.generation; g_clRec[id] = r; if (rec != 0) *rec = r; if (recOk != 0) *recOk = true; }
+    else Log("CAMPLAID " + SanitizeForLog(id) + ": the stored record could not be read from " + FileOf(id) + " - its generation is taken as 0");
+    g_clGen[id] = gen;
+    return gen;
+}
+void CampLaidLanded(const std::string& id, const std::vector<char>& bytes, ENetPeer* writer, unsigned long long seq)
+{
+    if (!camplaid::IsCampLaidId(id)) return;
+    camplaid::CampLaidRec r;
+    if (!bytes.empty() && camplaid::DecodeCampLaidRec(&bytes[0], bytes.size(), &r) == camplaid::kClOk) { g_clGen[id] = r.generation; g_clRec[id] = r; }
+    else { g_clGen.erase(id); g_clRec.erase(id); }
+    /* F1627 item 1: the stored record is not the write as sent (the append-only merge kept keys the write lacked, or took a late write at
+       a new generation) - its writer gets it, now that it is on disk, so its view is the stored one */
+    if (g_clGrownFor.erase(id + "|" + N((long long)seq)) != 0 && writer != 0 && writer->state == ENET_PEER_STATE_CONNECTED)
+    {
+        const std::map<std::string, Record>::const_iterator sr = g_records.find(id);
+        if (sr != g_records.end() && sr->second.gone == 0 && sr->second.hasFile) { SendRecordTo(writer, sr->second); ++g_clGrownSent; }
+    }
+}
+/* F1630 item 3: a camp mark's write that failed - its grown entry goes (CampLaidLanded runs only on a write that landed) */
+void CampLaidWriteFailed(const std::string& id, unsigned long long seq) { if (camplaid::IsCampLaidId(id)) g_clGrownFor.erase(id + "|" + N((long long)seq)); }
+int CampLaidHolderOf(const std::string& id)
+{
+    int sx = 0, sy = 0;
+    if (camplaid::CampLaidIdParse(id, &sx, &sy) == 0) return -1;
+    const std::map<long long, AreaRow>::const_iterator a = g_areas.find((long long)sy * 64 + sx);
+    return (a == g_areas.end() || zonerec::AreaRowHeld(a->second.ownerId, a->second.owner) == 0) ? -1 : a->second.owner;
+}
+/* the stored area copy (zone.<sx>.<sy>) of camp mark `id`: 1 = one is stored (its seq into *seq) */
+int CampLaidAreaCopy(const std::string& id, unsigned long long* seq)
+{
+    int sx = 0, sy = 0;
+    *seq = 0ULL;
+    if (camplaid::CampLaidIdParse(id, &sx, &sy) == 0) return 0;
+    char z[32]; std::sprintf(z, "zone.%d.%d", sx, sy);
+    const std::map<std::string, Record>::const_iterator r = g_records.find(z);
+    if (r == g_records.end() || r->second.gone != 0 || !r->second.hasFile) return 0;
+    *seq = r->second.seq;
+    return 1;
+}
+void CampLaidRefuse(ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& id, int why, unsigned int storedGen, unsigned int sentGen, unsigned long long areaSeq)
+{
+    ++g_clRefused;
+    if (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect)
+        SendMsg(from, (unsigned char)MSG_BOX_REFUSE, coopbrec::EncodeBoxRefuse(id, why, storedGen, sentGen));
+    const double now = NowSec();
+    std::map<std::string, double>::iterator l = g_clRefuseLogAt.find(id);
+    if (l != g_clRefuseLogAt.end() && now - l->second < 60.0) { ++g_clRefuseQuiet; return; }
+    g_clRefuseLogAt[id] = now;
+    Log("CAMPLAID " + SanitizeForLog(id) + " from " + fromName + " REFUSED - " + coopbrec::BoxRefuseWhy(why) + " (stored generation " + N((long long)storedGen)
+        + ", sent " + N((long long)sentGen) + ", stored area copy seq " + N((long long)areaSeq) + "; logged once a minute per record: clTaken=" + N(g_clTaken) + " clRefused=" + N(g_clRefused)
+        + " clRefuseQuiet=" + N(g_clRefuseQuiet) + " clRepeat=" + N(g_clRepeat) + " clStoredSent=" + N(g_clStoredSent) + ")");
+}
 /* the slot the area map names as the holder of cage record `id`'s area; -1 = nobody, or not a cage record id */
 int CageHolderOf(const std::string& id)
 {
@@ -10161,6 +10307,7 @@ void SquadNoteVerdict(const std::string& id, int verdict, int kind, int basis)
 /* a squad group id the register covers: "<faction>_<n>", not a zone, ground, box, piece, shop or door record */
 bool SquadRegId(const std::string& id)
 {
+    if (camplaid::IsCampLaidId(id)) return false;   /* T-1429 design b: an area's camp mark is not a squad */
     int zx = 0, zy = 0; std::string fac; unsigned n = 0;
     if (coopgrec::IsGroundRecId(id) || coopbrec::IsBoxRecId(id) || piecerec::IsPieceRecId(id) || shoprec::IsShopRecId(id) || doorrec::IsDoorRecId(id) || cagerec::IsCageRecId(id) || bldgrec::IsBldgRecId(id) || towntime::IsTownTimeId(id) || zonerec::ZoneRecIdParse(id, &zx, &zy) != 0) return false;
     return SplitGroupId(id, &fac, &n);
@@ -10638,6 +10785,11 @@ void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const st
         TownTimeRefuse(from, connect, fromName, wid, coopbrec::kBrRefuseNotWriter, 0u, 0u);
         return;
     }
+    if (camplaid::IsCampLaidId(wid))
+    {   /* T-1429 design b: a camp mark is never removed */
+        CampLaidRefuse(from, connect, fromName, wid, coopbrec::kBrRefuseNotWriter, 0u, 0u, 0ULL);
+        return;
+    }
     if (cagerec::IsCageRecId(wid))
     {   /* T-860: a cage record is removed only by the holder of its area (as a door record) */
         const int sender = (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect) ? SlotOf(from) : -1;
@@ -10763,6 +10915,7 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
        write has landed - against what the disk then holds, which is what every decision below reads. So no
        message is ever decided against a write that has not happened yet, and no second job for one file is
        ever queued. */
+    if (camplaid::IsCampLaidId(r.worldId)) CampLaidArrivalNote(r.worldId, from, connect, bytes);   /* T-1429 F1627 item 1: the sender's holding WHEN IT LAID - before any hold */
     if (g_wqGate.Busy(coopwq::GateKey(r.worldId)))
     {
         /* M14 fold (finding 3): a position-only update with a newer stamp REPLACES the position-only update held
@@ -10935,6 +11088,61 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
         WriterQueueCommit(kFromSquad, r, &bytes, kRotateBoth, from, connect, r, fromName);
         return;
     }
+    if (camplaid::IsCampLaidId(r.worldId))
+    {   /* T-1429 design b: a camp mark - towntime's rule plus the compare-and-set on the area copy (camplaid.h CampLaidJudgeWrite) */
+        const int exists = g_records.find(r.worldId) != g_records.end() ? 1 : 0;
+        const int sender = (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect) ? SlotOf(from) : -1;
+        const int arrival = CampLaidArrivalTake(r.worldId, connect, bytes);   /* F1627 item 1: 1 / 0 the sender held the area at arrival, -1 not recorded */
+        bool storedLocked = false, storedOk = false;
+        camplaid::CampLaidRec storedRec;
+        const unsigned int stored = exists != 0 ? CampLaidStoredGen(r.worldId, &storedLocked, &storedRec, &storedOk) : 0u;
+        if (storedLocked)
+        {   /* T-1280: the stored file is held by another program - the write is dropped; T-1429 review fold F1612 item 2: and ANSWERED (reason
+               held), so the writer's write in flight ends and it writes again at its next event (the area's next save, the stored record's arrival) */
+            CampLaidRefuse(from, connect, fromName, r.worldId, coopbrec::kBrRefuseHeld, 0u, 0u, 0ULL);
+            return;
+        }
+        camplaid::CampLaidRec pre;
+        const int same = (exists != 0 && !bytes.empty() && camplaid::DecodeCampLaidRec(&bytes[0], bytes.size(), &pre) == camplaid::kClOk
+                          && pre.generation == stored) ? BoxStoredSame(r.worldId, bytes) : 0;
+        unsigned long long areaSeq = 0ULL;
+        const int areaHas = CampLaidAreaCopy(r.worldId, &areaSeq);
+        camplaid::CampLaidRec cr;
+        int grown = 0;
+        const int holderNow = CampLaidHolderOf(r.worldId);
+        const int why = bytes.empty() ? coopbrec::kBrRefusePosition
+                      : camplaid::CampLaidTakeWrite(r.worldId, &bytes[0], bytes.size(), sender, camplaid::CampLaidHolderForJudge(sender, arrival, holderNow), exists,
+                                                    storedOk ? &storedRec : 0, stored, same, &cr, &grown);   /* F1627 item 1: the holder when it laid; per key the first writer wins */
+        if (why == coopbrec::kBrRepeat) { ++g_clRepeat; return; }
+        if (why != coopbrec::kBrAccept)
+        {
+            CampLaidRefuse(from, connect, fromName, r.worldId, why, stored, cr.generation, areaSeq);
+            if (camplaid::CampLaidRefusalSendsStored(why) != 0 && from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect)
+            {   /* the writer's view is behind the stored record: it is sent the stored one, which it takes */
+                const std::map<std::string, Record>::const_iterator sr = g_records.find(r.worldId);
+                if (sr != g_records.end() && sr->second.gone == 0 && sr->second.hasFile) { SendRecordTo(from, sr->second); ++g_clStoredSent; }
+            }
+            return;
+        }
+        ++g_clTaken;
+        std::vector<char> take(bytes);
+        if (grown != 0)
+        {   /* F1627 item 1: the stored record is the stored keys plus the write's new ones (append-only) - written as such, sent back to the writer once landed */
+            std::vector<char> enc;
+            if (camplaid::EncodeCampLaidRec(&enc, cr)) { take.swap(enc); ++g_clGrown; { camplaid::CampLaidRec sentRec; if (exists != 0 && camplaid::DecodeCampLaidRec(&bytes[0], bytes.size(), &sentRec) == camplaid::kClOk && sentRec.generation <= stored) ++g_clLateTaken; } }
+            else grown = 0;
+        }
+        if (g_clTaken <= 40 || grown != 0) Log("CAMPLAID " + SanitizeForLog(r.worldId) + " taken from " + fromName + " - gen " + N((long long)cr.generation) + ", " + N((long long)cr.laid.size()) + " camps marked (stored area copy seq " + N((long long)areaSeq) + ")"
+                                           + (arrival == 1 && holderNow != sender ? " - its sender held the area when the write arrived (holder now " + N((long long)holderNow) + ")" : std::string())
+                                           + (grown != 0 ? " - per key the first writer wins: stored keys kept, its new keys added (clGrown=" + N(g_clGrown) + " clLateTaken=" + N(g_clLateTaken) + ")" : std::string()));
+        r.town.clear();   /* the record is not a squad of a town (TOWN_LOSS never counts it) */
+        r.posAt = r.writtenAt; r.hasFile = true; r.gone = 0;
+        r.len = (long long)take.size(); r.crc = coopstore::Crc32(&take[0], take.size());
+        r.seq = NextSeq();
+        if (grown != 0) g_clGrownFor.insert(r.worldId + "|" + N((long long)r.seq));
+        WriterQueueCommit(kFromSquad, r, &take, kRotateBoth, from, connect, r, fromName);
+        return;
+    }
     if (cagerec::IsCageRecId(r.worldId))
     {   /* T-860: a cage record: only the holder of the cage's area writes, a seed only while none is stored, else with a rising
            generation (cagerec.h CageJudgeWrite - the door record's rule) */
@@ -11001,6 +11209,7 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
         WriterQueueCommit(kFromSquad, r, &bytes, kRotateBoth, from, connect, r, fromName);
         return;
     }
+    int zTakenWhy = -1, zTakenLease = 0;   /* T-1429 s16: why an area record passed the holder test (zonerec::ZoneJudgeWrite), for the taken line below */
     if (!bytes.empty())
     {
         int zsx = 0, zsy = 0;
@@ -11017,6 +11226,7 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
             const std::string senderId = zonerec::ZoneSenderId(fromId,   /* fold 1 (F3): the id as it arrived, kept with a held message */
                 (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect) ? PeerIdOf(from) : std::string());
             const int zwhy = lv == areafresh::kLrTakeLease ? zonerec::kZrAccept : zonerec::ZoneJudgeWrite(holderId, senderId);
+            zTakenWhy = zwhy; zTakenLease = lv == areafresh::kLrTakeLease ? 1 : 0;
             if (zonerec::ZoneJudgeTakes(zwhy) == 0) { AfRecordRefusedTell(from, connect, zsx, zsy, areafresh::kWhyRecNotHolder, r.writtenAt, 0, 0ULL); ZoneRefuse(fromName, r.worldId, holderId, senderId); return; }   /* T-1391: the sender told */
             {   /* T-1243 (owner 1518): an area record that cannot be read to its end is refused HERE - before the not-newer test, the checksum and the write below (ZoneUnreadableRefuse) */
                 size_t zstop = 0;
@@ -11141,6 +11351,14 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
                 if (it != g_records.end() && areafresh::ServerSmallerReplace(storedFile, it->second.len, (long long)bytes.size()) != 0 && ++g_zoneSmallerReplaced <= 64)
                     Log("[ZONE] smaller copy replaces zone=" + N((long long)zx) + "." + N((long long)zy) + " " + N(it->second.len) + " -> " + N((long long)bytes.size()) + " bytes from=" + N((long long)fromSlot)
                         + " (writtenAt " + N(it->second.writtenAt) + " -> " + N(r.writtenAt) + ", base=" + N((long long)base) + "; smallerReplaced=" + N(g_zoneSmallerReplaced) + ", first 64 logged)");
+                /* T-1429 s16 (F1357: an EMPTY copy replaced a stored one with no line saying so): every area copy taken - the stored copy's size
+                   (or none), the new one's, EMPTY or not, who sent it and why it passed (LOG ONLY: the accept rule is unchanged) */
+                static long long s_zoneTakenLines = 0;
+                if (++s_zoneTakenLines <= 400)
+                    Log("[ZONE] area copy taken zone=" + N((long long)zx) + "." + N((long long)zy) + " old=" + (storedFile != 0 ? N(it->second.len) + " bytes (writtenAt " + N(it->second.writtenAt) + ")" : std::string(it != g_records.end() ? "none (a gone or file-less record)" : "none"))
+                        + " new=" + N((long long)bytes.size()) + " bytes" + (zonerec::ZoneEmptyIs(bytes) != 0 ? std::string(" EMPTY") : std::string()) + " (writtenAt " + N(r.writtenAt) + ") from=" + N((long long)fromSlot)
+                        + " why: " + (zTakenLease != 0 ? std::string("the area's creation lease holder") : zTakenWhy >= 0 ? std::string(zonerec::ZoneJudgeWhy(zTakenWhy)) : std::string("?"))
+                        + (zTakenWhy == zonerec::kZrAcceptNoHolder ? std::string(" - the newer stamp alone decided") : std::string()) + " (first 400 logged)");
             }
         }
         r.posAt = r.writtenAt; r.hasFile = true; r.gone = 0;
@@ -11440,10 +11658,27 @@ typedef char AfLineNumbersAgree[(livefirst::kTypeAreaFresh == areafresh::kMsgAre
                                  && livefirst::kFreshKindWrite == (unsigned)areafresh::kWrite && livefirst::kFreshKindCant == (unsigned)areafresh::kCant
                                  && livefirst::kFreshKindFresh == (unsigned)areafresh::kFresh && coopsb::kTypeRecordFrame == (unsigned)MSG_RECORD
                                  && livefirst::kFreshKindLease == (unsigned)areafresh::kLease && livefirst::kFreshKindWait == (unsigned)areafresh::kWait) ? 1 : -1];
+unsigned g_afLayerNext = 0u;   /* T-1429 camp note design: the camp layer byte of the next AfSend (AfSendL sets it; AfSend takes it and clears it) */
+long long g_afLayerSaid[3] = { 0, 0, 0 };
+bool AfSendL(ENetPeer* to, unsigned kind, unsigned why, int x, int y, long long stamp, unsigned layer)
+{   /* T-1429 camp note design (areafresh.h kLayer*): an answer to an asker that names the area's camp layer */
+    g_afLayerNext = layer <= (unsigned)areafresh::kLayerOther ? layer : 0u;
+    return AfSend(to, kind, why, x, y, stamp);
+}
+unsigned AfLayerFor(unsigned kind, int key, int slot, unsigned connect, int excludeSlot);   /* T-1429 review fold F1612 item 1: defined with the lease below */
+/* T-1429 review fold F1612 item 1: EVERY answer to an asker about an area (FRESH / CANT / LEASE / WAIT - any of them can come before its
+   load of the area) names the layer from the real fact (AfLayerFor); excludeSlot: a round's holder whose CANT says it does not run the area */
+bool AfSendA(ENetPeer* to, unsigned kind, unsigned why, int x, int y, long long stamp, int excludeSlot = -1)
+{
+    if (to == 0) return false;
+    return AfSendL(to, kind, why, x, y, stamp, AfLayerFor(kind, areafresh::Key(x, y), SlotOf(to), to->connectID, excludeSlot));
+}
 bool AfSend(ENetPeer* to, unsigned kind, unsigned why, int x, int y, long long stamp, long long storedStamp, unsigned long long storedSeq)
 {
     std::vector<char> b;
-    if (to == 0 || !(storedStamp >= 0 ? areafresh::EncodeRecRefusal(&b, why, x, y, stamp, storedStamp, storedSeq) : areafresh::Encode(&b, kind, why, x, y, stamp))) return false;
+    const unsigned layer = g_afLayerNext; g_afLayerNext = 0u;
+    if (to == 0 || !(storedStamp >= 0 ? areafresh::EncodeRecRefusal(&b, why, x, y, stamp, storedStamp, storedSeq) : areafresh::Encode(&b, kind, why, x, y, stamp, layer))) return false;
+    ++g_afLayerSaid[layer <= 2u ? layer : 0u];
     if (kind != (unsigned)areafresh::kWrite) AoifCatchUpNow(to, cooplive::AreaKey(x, y), "an answer of it is due");   /* T-1339 fold 1 (MED 4): a FRESH / CANT never passes its area's catch-up - a waiting or running one ends first, its DONE ahead of this */
     int onRest = 0, onBulk = 0;
     if (kind != (unsigned)areafresh::kWrite) SbZoneRecordLines(to, areafresh::Key(x, y), &onRest, &onBulk);
@@ -11492,7 +11727,8 @@ void AfAnswerRow(std::map<int, AfPending>::iterator it, bool fresh, unsigned why
     for (std::set<int>::const_iterator s = it->second.askers.begin(); s != it->second.askers.end(); ++s)
     {
         ENetPeer* p = AfPeerOfSlot(*s);
-        const bool sent = AfSend(p, fresh ? (unsigned)areafresh::kFresh : (unsigned)areafresh::kCant, fresh ? (unsigned)areafresh::kWhyNone : why, x, y, fresh ? stamp : 0);
+        const bool sent = AfSendA(p, fresh ? (unsigned)areafresh::kFresh : (unsigned)areafresh::kCant, fresh ? (unsigned)areafresh::kWhyNone : why, x, y, fresh ? stamp : 0,
+                                  (!fresh && areafresh::LayerOfHolderCant(why) == (unsigned)areafresh::kLayerAsker) ? it->second.holder : -1);   /* F1612 item 1: a holder that does not run the area lays nothing */
         if (sent) { if (fresh) ++g_afFresh; else ++g_afCant; }
         to += (to.empty() ? "" : ",") + N((long long)*s) + (sent ? "" : "(not sent)");
     }
@@ -11569,6 +11805,81 @@ int AfLiveRoundOpen(int key)
     if (hp == 0 || hp->connectID != it->second.holderConnect) return 0;
     return (NowSec() - it->second.sentAt) * 1000.0 < (double)areafresh::kRoundLimitMs ? 1 : 0;
 }
+/* T-1429 re-check fold F1622 item 1: THE CAMP LAYER an answer to asker `slot` (connection `connect`) about area `key` names - the asker
+   only when it IS the area's holder now on that connection (areafresh::ServerLayerFor: only the holder is ever the layer; askers never
+   lay - their owed steps are kept and run at the HELD their holding brings). No naming is remembered (F1612's naming and F1617's naming
+   end are gone: an end decided from reports could come early - two layers). excludeSlot: kept for the callers, no longer read. */
+long long g_afLayerAskerHolds = 0, g_afLayerAskerNot = 0;
+unsigned AfLayerFor(unsigned kind, int key, int slot, unsigned connect, int excludeSlot)
+{
+    (void)excludeSlot;
+    const int x = areafresh::KeyX(key), y = areafresh::KeyY(key);
+    const std::map<long long, AreaRow>::const_iterator a = g_areas.find((long long)y * 64 + x);
+    const int holder = (a == g_areas.end() || zonerec::AreaRowHeld(a->second.ownerId, a->second.owner) == 0) ? -1 : a->second.owner;
+    ENetPeer* hp = holder >= 0 ? AfPeerOfSlot(holder) : 0;
+    const int askerHolds = (holder >= 0 && holder == slot && hp != 0 && hp->connectID == connect) ? 1 : 0;
+    const unsigned layer = areafresh::ServerLayerFor(kind, askerHolds);
+    if (askerHolds != 0) ++g_afLayerAskerHolds; else ++g_afLayerAskerNot;
+    if (askerHolds != 0 && g_afLayerAskerHolds <= 40)
+        Log("AREA_FRESH layer zone=" + AfXy(x, y) + " - slot " + N((long long)slot) + " asks and HOLDS the area: named its camp layer (F1622: only the holder lays; askerHolds="
+            + N(g_afLayerAskerHolds) + ", askerNot=" + N(g_afLayerAskerNot) + ", first 40 logged)");
+    return layer;
+}
+/* T-1429 re-check fold F1617 items 1 / 4, F1622 items 1 / 5: TELL game `slot` it holds area x, y (areafresh.h kHeld) - after its stored
+   camp pieces record on the same line - when the record is SETTLED (areafresh::HeldTellDue): while a write of the record is out to the
+   disk or held behind one, the HELD waits (g_afHeldDeferred) and AfHeldSettled tells the area's holder then (an event - the write landed,
+   no timer). The holder is the only camp layer: no lease, round or naming of another game withholds it. The game runs its kept owed steps
+   the note and the record lack and writes its kept camp pieces write. */
+long long g_afHeldSent = 0, g_afHeldDeferredN = 0, g_afHeldRecSent = 0, g_afHeldSettledN = 0;
+std::map<int, std::string> g_afHeldDeferred;   /* area key -> why the HELD waits for its camp pieces record to settle */
+void AfHeldTell(int x, int y, int slot, const char* why)
+{
+    if (!areafresh::OnGrid(x, y) || slot < 0) return;
+    const int key = areafresh::Key(x, y);
+    ENetPeer* p = AfPeerOfSlot(slot);
+    if (p == 0 || p->state != ENET_PEER_STATE_CONNECTED) return;
+    if (g_afHeldBatch.count(key) != 0) return;   /* told once per report */
+    const std::string cid = camplaid::MakeCampLaidId(x, y);
+    const std::string gk = coopwq::GateKey(cid);
+    const int settling = (!cid.empty() && (g_wqGate.Busy(gk) || g_wqGate.HasHeld(gk))) ? 1 : 0;
+    if (areafresh::HeldTellDue(slot, settling) == 0)
+    {
+        g_afHeldDeferred[key] = why; ++g_afHeldDeferredN;
+        if (g_afHeldDeferredN <= 40) Log("AREA_FRESH held zone=" + AfXy(x, y) + " slot " + N((long long)slot) + " (" + why + ") WAITS - a write of " + cid
+                                         + " is still out to the disk or held behind one: told when it lands (F1622 item 5: the new holder never lays a key the previous layer's write carries; heldDeferred="
+                                         + N(g_afHeldDeferredN) + ", first 40 logged)");
+        return;
+    }
+    g_afHeldDeferred.erase(key);
+    g_afHeldBatch.insert(key);
+    const std::map<std::string, Record>::const_iterator sr = g_records.find(cid);
+    const int rec = (sr != g_records.end() && sr->second.gone == 0 && sr->second.hasFile) ? 1 : 0;
+    if (rec != 0) { SendRecordTo(p, sr->second); ++g_afHeldRecSent; }
+    std::vector<char> b;
+    const bool sent = areafresh::Encode(&b, areafresh::kHeld, areafresh::kWhyNone, x, y, 0, areafresh::kLayerAsker) && SendMsg(p, (unsigned char)MSG_AREA_FRESH, b);
+    if (sent) ++g_afHeldSent;
+    if (g_afHeldSent <= 60 || !sent) Log("AREA_FRESH held zone=" + AfXy(x, y) + " -> slot " + N((long long)slot) + " (" + why + ")" + (rec != 0 ? std::string(" after its camp pieces record") : std::string(" (no camp pieces record stored)"))
+                                         + (sent ? std::string() : std::string(" - NOT sent")) + " (heldSent=" + N(g_afHeldSent) + ", first 60 logged)");
+}
+/* T-1429 re-check fold F1622 item 5: a write of camp pieces record `id` landed (WriterApplyDone, after its held messages were handled) - a
+   HELD that waited for it is told now to the area's holder, once nothing more of the record is out or held */
+void AfHeldSettled(const std::string& id)
+{
+    int sx = -1, sy = -1;
+    if (camplaid::CampLaidIdParse(id, &sx, &sy) == 0) return;
+    const int key = areafresh::Key(sx, sy);
+    const std::map<int, std::string>::iterator d = g_afHeldDeferred.find(key);
+    if (d == g_afHeldDeferred.end()) return;
+    const std::string gk = coopwq::GateKey(id);
+    if (g_wqGate.Busy(gk) || g_wqGate.HasHeld(gk)) return;   /* another write of it is out: told when that one lands */
+    const std::string why = d->second;
+    g_afHeldDeferred.erase(d);
+    const std::map<long long, AreaRow>::const_iterator a = g_areas.find((long long)sy * 64 + sx);
+    const int holder = (a == g_areas.end() || zonerec::AreaRowHeld(a->second.ownerId, a->second.owner) == 0) ? -1 : a->second.owner;
+    ++g_afHeldSettledN;
+    Log("AREA_FRESH held zone=" + AfXy(sx, sy) + " - " + id + " SETTLED (its last write landed); holder now " + N((long long)holder) + " (HELD waited: " + why + "; heldSettled=" + N(g_afHeldSettledN) + ")");
+    if (holder >= 0) { const bool inBatch = g_afHeldBatch.erase(key) != 0; AfHeldTell(sx, sy, holder, "the camp pieces record settled"); if (!inBatch) g_afHeldBatch.erase(key); }
+}
 bool AfLeaseGrant(int key, int slot, ENetPeer* p, const std::string& head, bool loadLease = false)
 {
     const int x = areafresh::KeyX(key), y = areafresh::KeyY(key);
@@ -11583,7 +11894,7 @@ bool AfLeaseGrant(int key, int slot, ENetPeer* p, const std::string& head, bool 
     r.loadLease = loadLease; r.askers.erase(slot); r.settleAskers.erase(slot);   /* s2 fold 1: a load lease (a SETTLE ask's); fold 8c: no lease has an age */
     if (p != 0 && g_afDiverged.erase(std::make_pair(p->connectID, key)) != 0)   /* s2 fold 1 (review F1337 item 7): a claimer kept waiting is granted it - its loaded copy becomes the first */
         Log("AREA_FRESH lease zone=" + AfXy(x, y) + " - slot " + N((long long)slot) + " was told notWorlds for this area; granted the lease, its records of the area are taken again");
-    const bool sent = AfSend(p, areafresh::kLease, areafresh::kWhyNone, x, y, 0);
+    const bool sent = AfSendA(p, areafresh::kLease, areafresh::kWhyNone, x, y, 0);
     if (sent) ++g_afLeaseGrants;
     Log(head + " - LEASE granted to slot " + N((long long)slot) + (loadLease ? std::string(" (a load lease: it is in its pre-load)") : std::string()) + ": it loads its own save's copy and uploads it at once; every other asker waits for that copy (no age: it ends at its upload, its CANT or its game's leaving; waiting " + N((long long)r.askers.size()) + "; leaseGrants=" + N(g_afLeaseGrants) + ")" + (sent ? std::string() : std::string(" - LEASE NOT sent")));
     if (!sent) { AfLeaseEnd(g_afPending.find(key), "the LEASE could not be sent"); return false; }
@@ -11613,7 +11924,7 @@ void AfLeaseEnd(std::map<int, AfPending>::iterator it, const std::string& why, b
         if (areafresh::LeaseLostTell((tellHolder && hp != 0 && hp->connectID == wasConn) ? 1 : 0, 0) != 0)
         {
             g_afDiverged.insert(std::make_pair(wasConn, key)); ++g_afLeaseLostTold;
-            const bool told = AfSend(hp, areafresh::kCant, areafresh::kWhyNotWorlds, areafresh::KeyX(key), areafresh::KeyY(key), 0);
+            const bool told = AfSendA(hp, areafresh::kCant, areafresh::kWhyNotWorlds, areafresh::KeyX(key), areafresh::KeyY(key), 0);   /* F1612 item 1: the layer named */
             Log("AREA_FRESH lease zone=" + AfXy(areafresh::KeyX(key), areafresh::KeyY(key)) + " LOST by slot " + N((long long)was) + " (" + why + "): CANT notWorlds told - its records of the area are refused until it asks for it again (leaseLostTold="
                 + N(g_afLeaseLostTold) + ")" + (told ? std::string() : std::string(" - NOT sent")));
         }
@@ -11658,7 +11969,7 @@ int AfLeaseAsk(ENetPeer* from, int slot, const areafresh::Msg& m)
     const int d = areafresh::ServerLeaseOnAsk(1, (slot == lr->second.holder && from->connectID == lr->second.holderConnect) ? 1 : 0, lp != 0 ? 1 : 0);   /* fold 8c: no age */
     if (d == areafresh::kLsAgain)
     {
-        const bool sent = AfSend(from, areafresh::kLease, areafresh::kWhyNone, m.x, m.y, 0);
+        const bool sent = AfSendA(from, areafresh::kLease, areafresh::kWhyNone, m.x, m.y, 0);
         Log(head + " - it holds this area's creation lease (granted " + F1((float)(NowSec() - lr->second.sentAt)) + "s ago): LEASE again" + (sent ? std::string() : std::string(" - NOT sent")));
         return 1;
     }
@@ -11669,7 +11980,7 @@ int AfLeaseAsk(ENetPeer* from, int slot, const areafresh::Msg& m)
             Log("AREA_FRESH lease zone=" + AfXy(m.x, m.y) + " HELD: slot " + N((long long)lr->second.holder) + " announced its upload (stamp>=" + N(lr->second.holderStamp) + ") and it has not landed "
                 + F1((float)(NowSec() - lr->second.sentAt)) + "s after the grant; " + N((long long)lr->second.askers.size()) + " waiting game(s) held - it ends at its upload, its CANT or its game's closing (first 64 logged)");
     }
-    const bool sent = AfSend(from, areafresh::kWait, areafresh::kWhyNone, m.x, m.y, 0);
+    const bool sent = AfSendA(from, areafresh::kWait, areafresh::kWhyNone, m.x, m.y, 0);
     if (sent) ++g_afLeaseWaits;
     Log(head + " - WAIT: slot " + N((long long)lr->second.holder) + " holds this area's creation lease (granted " + F1((float)(NowSec() - lr->second.sentAt)) + "s ago); this game is answered with that copy when it lands ("
         + N((long long)lr->second.askers.size()) + " waiting; leaseWaits=" + N(g_afLeaseWaits) + ")" + (sent ? std::string() : std::string(" - NOT sent")));
@@ -11694,20 +12005,20 @@ void AfClaim(ENetPeer* from, int slot, const areafresh::Msg& m)
     if (d == areafresh::kClaimGrant) { AfLeaseGrant(key, slot, from, head + " - no copy of it here"); return; }
     if (d == areafresh::kClaimAgain)
     {
-        const bool sent = AfSend(from, areafresh::kLease, areafresh::kWhyNone, m.x, m.y, 0);
+        const bool sent = AfSendA(from, areafresh::kLease, areafresh::kWhyNone, m.x, m.y, 0);
         Log(head + " - it holds this area's creation lease: LEASE again" + (sent ? std::string() : std::string(" - NOT sent")));
         return;
     }
     if (d == areafresh::kClaimCurrent)
     {
-        const bool sent = AfSend(from, areafresh::kCant, areafresh::kWhyCurrent, m.x, m.y, 0);
+        const bool sent = AfSendA(from, areafresh::kCant, areafresh::kWhyCurrent, m.x, m.y, 0);
         Log(head + " - the world's copy (writtenAt " + N(recStamp) + ") is not newer than the one it loaded: CANT current" + (sent ? std::string() : std::string(" - NOT sent")));
         return;
     }
     g_afDiverged.insert(std::make_pair(from->connectID, key));
     ++g_afClaimNotWorlds;
     if (leaseOut != 0 || liveRound != 0) g_afPending[key].askers.insert(slot);   /* fold 1 (review F1337 item 7): kept on the waiter list - the next one granted the lease if its holder fails (its loaded copy then becomes the first) */
-    const bool sent = AfSend(from, areafresh::kCant, areafresh::kWhyNotWorlds, m.x, m.y, 0);
+    const bool sent = AfSendA(from, areafresh::kCant, areafresh::kWhyNotWorlds, m.x, m.y, 0);   /* F1612 item 1: the layer named */
     Log(head + " - NOT the world's copy (" + (leaseOut != 0 ? "slot " + N((long long)g_afPending[key].holder) + " holds the area's creation lease (it waits as the next one)" : liveRound != 0 ? "a live holder's WRITE round of it is open (it waits on it)" : "the world's copy, writtenAt " + N(recStamp) + ", is newer")
         + "): CANT notWorlds; this connection's records of the area are refused until it asks for the area again (claimNotWorlds=" + N(g_afClaimNotWorlds) + ")" + (sent ? std::string() : std::string(" - NOT sent")));
 }
@@ -11770,7 +12081,7 @@ void AfAnswerFromRecords(ENetPeer* from, int slot, const areafresh::Msg& m, unsi
     if (areafresh::ServerRecordOrLease(haveRec, recStamp, m.stamp) == areafresh::kRecLease) { AfLeaseGrant(areafresh::Key(m.x, m.y), slot, from, head + " - no copy of it here"); return; }   /* T-1429 s2 (owner 1788): the first asker creates it */
     if (areafresh::ServerRecordAnswer(haveRec, recStamp, m.stamp) == areafresh::kRecCurrent)
     {
-        const bool sent = AfSend(from, areafresh::kCant, areafresh::kWhyCurrent, m.x, m.y, 0);
+        const bool sent = AfSendA(from, areafresh::kCant, areafresh::kWhyCurrent, m.x, m.y, 0);
         if (sent) { ++g_afCant; ++g_afRecCurrent; }
         Log(head + " - answered from the records: CANT current (" + (haveRec != 0 ? "the record's writtenAt " + N(recStamp) + " is not newer" : std::string("no record of it")) + ")" + (sent ? std::string() : std::string(" - NOT sent")));
         return;
@@ -11789,7 +12100,7 @@ void AfAnswerFromRecords(ENetPeer* from, int slot, const areafresh::Msg& m, unsi
         Log(head + " - answered from the records: the record's file could not be read (it went with its position only, writtenAt " + N(recStamp) + ") - no FRESH; the game asks again in 10 s (recUnreadable=" + N(g_afRecUnreadable) + ")");
         return;
     }
-    const bool sent = AfSend(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, recStamp);
+    const bool sent = AfSendA(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, recStamp);
     if (sent) { ++g_afFresh; ++g_afRecSent; }
     Log(head + " - answered from the records: the record (writtenAt " + N(recStamp) + ", " + N((long long)bytes) + " bytes) sent, then FRESH stamp=" + N(recStamp) + (sent ? std::string() : std::string(" - FRESH NOT sent")));
 }
@@ -11813,7 +12124,7 @@ int AfSettle(ENetPeer* from, int slot, const areafresh::Msg& m)   /* s2 fold 2: 
     const std::string head = "AREA_FRESH settle zone=" + xy + " from slot " + N((long long)slot) + " (before its world load; haveStamp=" + N(m.stamp) + "; settleAsks=" + N(g_afSettleAsks) + ")";
     if (d == areafresh::kStFresh)
     {
-        const bool sent = AfSend(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, r->second.writtenAt);
+        const bool sent = AfSendA(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, r->second.writtenAt);   /* F1612 item 1 (BLOCKER): the joiner's before-load answer names the layer - the live holder, else the asker */
         if (sent) ++g_afSettleFresh;
         Log(head + " - FRESH stamp=" + N(r->second.writtenAt) + ": the world's copy is here (its exchange fetches it)" + (sent ? std::string() : std::string(" - NOT sent")));
         return d;
@@ -11821,13 +12132,13 @@ int AfSettle(ENetPeer* from, int slot, const areafresh::Msg& m)   /* s2 fold 2: 
     if (d == areafresh::kStGrant) { if (AfLeaseGrant(key, slot, from, head + " - no copy of it here", true)) ++g_afSettleGrants; return d; }
     if (d == areafresh::kStAgain)
     {
-        const bool sent = AfSend(from, areafresh::kLease, areafresh::kWhyNone, m.x, m.y, 0);
+        const bool sent = AfSendA(from, areafresh::kLease, areafresh::kWhyNone, m.x, m.y, 0);
         Log(head + " - it holds this area's lease: LEASE again" + (sent ? std::string() : std::string(" - NOT sent")));
         return d;
     }
     AfPending& w = g_afPending[key];
     w.askers.insert(slot); w.settleAskers.insert(slot);
-    const bool sent = AfSend(from, areafresh::kWait, areafresh::kWhyNone, m.x, m.y, 0);
+    const bool sent = AfSendA(from, areafresh::kWait, areafresh::kWhyNone, m.x, m.y, 0);
     if (sent) ++g_afSettleWaits;
     Log(head + " - WAIT: " + (leaseOut != 0 ? "slot " + N((long long)w.holder) + " holds this area's creation lease" : "a live holder's WRITE round of it is open (slot " + N((long long)w.holder) + ")")
         + "; its load stays held until that copy lands (" + N((long long)w.askers.size()) + " waiting; settleWaits=" + N(g_afSettleWaits) + ")" + (sent ? std::string() : std::string(" - NOT sent")));
@@ -12058,7 +12369,7 @@ void OnAreaFresh(ENetPeer* from, const std::vector<char>& payload)
         {   /* T-1320 C: no new WRITE - the asker's answer is on its way. With no FRESH of the area waiting for it (only a RECORD), it is told
                this round's FRESH now, which AfSend puts behind that record; once a FRESH waits, a re-ask sends nothing. Logged once a round. */
             ++g_afRoundJoinedQueued;
-            const bool told = freshQueued == 0 && AfSend(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, p.doneStamp);
+            const bool told = freshQueued == 0 && AfSendA(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, p.doneStamp);
             if (told) { ++g_afFresh; ++g_afFreshReused; }
             if (!p.queuedSaid)
             {
@@ -12071,7 +12382,7 @@ void OnAreaFresh(ENetPeer* from, const std::vector<char>& payload)
         }
         if (round == areafresh::kRoundFreshNow)
         {
-            const bool sent = AfSend(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, p.doneStamp);
+            const bool sent = AfSendA(from, areafresh::kFresh, areafresh::kWhyNone, m.x, m.y, p.doneStamp);
             if (sent) { ++g_afFresh; ++g_afFreshReused; }
             Log("AREA_FRESH ask zone=" + xy + " from slot " + N((long long)slot) + " haveStamp=" + N(m.stamp) + " holder=" + N((long long)holder) + " - told FRESH stamp=" + N(p.doneStamp)
                 + " of the round answered " + F1((float)ageSec) + "s after its WRITE (no new WRITE; freshReused)" + (sent ? std::string() : std::string(" - NOT sent")));
@@ -12220,6 +12531,7 @@ void WriterApplyOne(WriteJob* j)
         {
             Log("RECORD " + SanitizeForLog(id) + " - could not write " + FileOf(id) + " and " + MetaOf(id) + "; the index in memory is left unchanged");
             { int fzx = 0, fzy = 0; if (zonerec::ZoneRecIdParse(id, &fzx, &fzy) != 0) AfRecordRefusedTell(j->peer, j->peerConnect, fzx, fzy, areafresh::kWhyRecWriteFailed, j->rec.writtenAt, 0, 0ULL); }   /* T-1391 fold 2: an area record's sender told (recWriteFailed) */
+            CampLaidWriteFailed(id, j->rec.seq);   /* F1630 item 3 */
             AreaFreshLanded(id, false, 0); return;
         }
         const Record& r = j->rec;
@@ -12242,6 +12554,7 @@ void WriterApplyOne(WriteJob* j)
         CageLanded(id, j->payload);   /* T-860: a cage record: likewise */
         BldgLanded(id, j->payload);   /* T-1333: a building record: likewise */
         TownTimeLanded(id, j->payload);   /* T-4: a town clock record: likewise */
+        CampLaidLanded(id, j->payload, peer, r.seq);   /* T-1429 design b: a camp mark: likewise (F1627 item 1: a grown record goes back to its writer) */
     }
     else if (j->from == kFromPosition)
     {
@@ -12329,7 +12642,7 @@ void WriterApplyDone()
     for (size_t i = 0; i < done.size(); ++i)
     {
         WriteJob* j = done[i];
-        const std::string key = j->gate;
+        const std::string key = j->gate, wid = j->key;
         g_wqGate.Finish(key);
         WriterApplyOne(j);
         SquadNoteCheck(j->key);   /* every landed write of a squad record (a delete's gone mark among them) */
@@ -12344,6 +12657,7 @@ void WriterApplyDone()
             else OnRecordGoneFrom(g_wqHost, m.peer, m.connect, m.peerName, m.payload, m.peerId);
         }
         SwHeldDeleteRejudgeGate(key);   /* T-1084 step 5: a write of this record landed (another game's take among them): its held deletes are judged again */
+        if (camplaid::IsCampLaidId(wid)) AfHeldSettled(wid);   /* T-1429 F1622 item 5: a HELD that waited for this camp pieces record is told now */
     }
 }
 /* rule (2), THE DRAINING HALF: every write out lands and is applied - and every message held behind one is

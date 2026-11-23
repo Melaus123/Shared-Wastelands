@@ -43,7 +43,7 @@
 
 namespace doorrec {
 
-const unsigned int kProtocol = 173;            /* the world-server protocol that carries door records */
+const unsigned int kProtocol = 177;            /* the world-server protocol that carries door records */
 
 
 
@@ -343,6 +343,15 @@ inline int DoorRecWriteDecide(int weHold, int laid, int mask, int awaitStored, i
    row is tried again by the event that ends the wait) while a stored record or this game's seed's confirmation is awaited and the
    door has no record or a held change, or while the holder is not known and the answer decides. */
 const int kDrLayWait = 0, kDrLayRecord = 1, kDrLaySeed = 2, kDrLayOwn = 3, kDrLayWriteHeld = 4;
+/* T-1391 fix attempt 2 (F1774 / F1775): A NEW PIECE'S DOOR IS SEEDED AT ITS PLACEMENT, under the DOOR's own key. A door of a piece this
+   game placed (placedHere) with no record (haveRec 0) and none awaited (await 0) whose lay waits because no holder can be named: with the
+   link down (noNotebook) its record's state is queued in the outage journal under the door's record id, as every own door change
+   with the link down is (doors.cpp's publish), once per door (queuedAlready). With the link up the lay seeds it once the area map names
+   this game its holder (kDrLaySeed) - nothing queued. 1 = queue the seed now */
+inline int DoorSeedAtPlaceDue(int placedHere, int haveRec, int await, int noNotebook, int queuedAlready)
+{
+    return (placedHere != 0 && haveRec == 0 && await == 0 && noNotebook != 0 && queuedAlready == 0) ? 1 : 0;
+}
 inline int DoorRecLayDecide(int haveRec, int weHold, int heldChange, int awaitStored)
 {
     if (awaitStored != 0 && (haveRec == 0 || heldChange != 0)) return kDrLayWait;

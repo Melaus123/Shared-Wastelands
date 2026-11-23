@@ -261,6 +261,16 @@ struct ItemConfirmMsg
 void InstallItems();          // preload, MAIN THREAD: the four hooks
 void ItemsTick();             // MAIN THREAD, every frame: drains the detours' ring, applies the ownership test and sends
 void InvNetNoteAnnounced(void* ch, unsigned int uid);   /* inv2a, MAIN THREAD: an owned character's CLOTHING snapshot went out - the safety net's baseline is its inventory now */
+/* T-1463 (charparity.h), MAIN THREAD: a kit dropped because KitApplyBusy held it (busy = its reason) - the copy is checked again once
+   clear; a kit apply finished on a copy (ok 0 / 1) - logged when it was the runner's answer to a mismatch; a check owed for uid (why:
+   the event, for the log). */
+void CharParityKitDropped(unsigned int uid, int busy);
+void CharParityKitApplied(unsigned int uid, int ok);
+void CharParityAskOwe(unsigned int uid, const char* why);
+/* T-1463 fold, MAIN THREAD (net/session.cpp, at every write of its owner table): uid's owner was recorded or changed - an owed check
+   waiting for an owner (or a link) goes out at the next tick. */
+void CharParityOwnerChanged(unsigned int uid);
+std::string CharParTestCommand(const std::string& arg);   /* T-1463 TEST-ONLY (DEV build only; defined there), MAIN THREAD: `charpartest owe <uid|made:label|peer> | dropanswer <n 1-20> | waitowner <uid|made:label|peer>` */
 int KitApplyBusy(void* ch, unsigned int uid);   /* T-1 B2 fold (review F2), MAIN THREAD: 0 = a pending kit may be applied to this copy; 1 an inventory window shows it or a pack of it, 2 an item from it is on the cursor, 3 a request against it awaits an answer */
 void ItemsWorldTeardown();    // MAIN THREAD, from the store's teardown broadcast: the ring names the world being destroyed
 void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer);   // MAIN THREAD: an ITEM_MOVE from another game; M7b slice 2: refused (itemMoveNotOwner) unless fromPeer owns the character / writes the box
@@ -356,6 +366,7 @@ bool BoxTest(const std::string& needle, const std::string& baseSid, int count);
 /* TEST-ONLY `boxtest cantmake <item string id>` (`off` clears): this game reads that item template as missing from its data, so a box
    whose world copy holds it keeps that row aside and refuses puts here. Only that answer changes. Returns the status line. */
 std::string BoxTestCantMake(const std::string& sid);
+std::string BoxFillShopCommand(const std::string& args);   /* T-801 TEST-ONLY (DEV build only), MAIN THREAD: `boxtest fillshop counter=<key text> [sid=<sid>] [room=<units>]` - fills every storage piece of a town shop this game holds */
 /* T-1130 TEST-ONLY `boxtest plainkind <record id | box key>`: the named box's next write by this game (its writer) goes through the
    ordinary record write as a plain box - kind 0, no undo list, its contents as now - the record the players' first-save race made;
    [BOXREC] TEST-ONLY boxtest plainkind lines (armed, sent, the box's later writes and the world server's answers). Returns the status. */
@@ -499,7 +510,7 @@ void InstallGround();                                       /* preload, MAIN THR
 /* T-697 step 2 (src/common/groundsync.h): the ground records. MAIN THREAD. Arrive: a RECORD ground.<sx>.<sy> from the world server -
    kept per area when its generation is not lower than the kept copy's (never a squad); Gone: its removal; Refuse: GROUND_REFUSE (71) -
    the answer is acted on at the next GroundDrain. */
-void GroundRecordArrive(const std::string& id, const std::vector<char>& bytes);
+void GroundRecordArrive(const std::string& id, const std::vector<char>& bytes, long long writtenAt = 0);   /* T-1429 s16: writtenAt - the writer's stamp (log only) */
 void GroundRecordGone(const std::string& id, const char* from);
 void GroundRefuseArrive(const std::vector<char>& payload);
 void GroundRecordEcho(const std::string& id, int hasStamp, long long stamp);   /* fold 2 (item 7), MAIN THREAD: the world server stored this game's ground write (RECORD_SEQ echo) */
@@ -622,6 +633,7 @@ void GroundUndoTake(void* item, const float* pos, const char* key, int goneTold,
                     unsigned int id, const char* why);   /* MAIN THREAD, from ItRollbackTake: an undone ground TAKE - back on the ground, ADD to the others */
 void GroundPutBack(void* item, const float* pos, const char* why);   /* MAIN THREAD, from ItRollbackTake: a kept ground item goes back */
 void GroundNoteKeptPlaced();                                /* MAIN THREAD, from ApplyItemPlaced */
+std::string GroundAroundSay(float x, float z, float r, int sx, int sy, int maxKeys, int* n);   /* T-1429 s15 / s16: MAIN THREAD - the loaded ground items within r of (x, z), or in area (sx, sy) when sx >= 0, for log lines: count, made-during-play count, top sids */
 void GroundWorldTeardown();                                 /* MAIN THREAD, from ItemsWorldTeardown (inv5p1 fold): the request rows, the unconfirmed drops and the detours' queue name the world that is going */
 std::string ItemTestRefuseNextCommand(const std::string& arg);   /* T-1 B4-1: TEST-ONLY `itemtest refusenext [n] [reason]` - the HOLDER refuses the next n priced shop requests */
 std::string ItemTestBoxMoveCommand(const std::string& arg);   /* T-164 211: TEST-ONLY `itemtest boxmove <fromBoxKey|peer> <toBoxKey> <sid|any>` - one whole stack across the authority line through the engine's own remove + add */
@@ -674,12 +686,20 @@ int ItemPlaceInSection(void* sec, void* item, int x, int y);
 int ItemOwnerApplyTo(void* item, const coopmark::OwnerId& o, const std::string& sid);   /* inv6 phase 2, MAIN THREAD: onto a fresh item; 1 applied */
 void ItemOwnerNoteBadBlock();  /* inv6: session.cpp - an owner that would not encode (the item went clean) */
 void ItemGearOf(void* item, gearwire::GearMarks* out);   /* MAIN THREAD: a gear item's uniform and crafter as they travel (none for any other item) */
+void ItemGearPeek(void* item, gearwire::GearMarks* out);   /* T-1449 fix, MAIN THREAD: ItemGearOf for a comparison - nothing booked, no line */
+void* ItemBagInventoryOf(void* item);   /* T-1449 fix: a pack's own inventory, 0 when the item is not a pack (read only) */
 int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string& sid);   /* MAIN THREAD: onto a fresh item, gear items only; 1 written */
 void ItemColourKitSay(void* item, const std::string* colorSid, void* holder);   /* T-1413, MAIN THREAD, LOG ONLY: right after ItemColourApplyTo (colorSid 0 = the kit row carried no details) - the capped [COLOUR] line when holder is another player's character */
 int ItemColourApplyTo(void* item, const std::string& colorSid, void* holder);   /* T-1119, MAIN THREAD: onto a fresh kit item, the sent colour (coopgarment::kColour*); holder: the kit's character (T-1382: named on the failure line) */
 void ItemLookInstall();   /* T-1449: once at plugin start - the [ITEMLOOK] watch (the look-maker setupItemMaterial and Ogre's Material::clone, both read-only) */
 void ItemLookTick();      /* T-1449, MAIN THREAD, every pump: the queued [ITEMLOOK] findings and the due follow-ups */
 void ItemLookNoteRedress(void* character);   /* T-1449, MAIN THREAD: a copy's outfit was just redressed - its items are judged ~2 s on */
+int ItemAttHeldPod(void* app, int* withModel, int* withCloth);   /* T-1449 attempt 3, MAIN THREAD, reads only: the appearance's attached item records - how many hold a model (+0x80) / a cloth part (+0xF0); -1 unread (appearance.cpp's pre-build sex / race look) */
+void ItemLookNoteRebuild(void* app, unsigned int uid, const char* cls, long long msSinceFirstBuild, int sexRace);   /* T-1449 attempt 2 diagnostic (F1851), MAIN THREAD, LOG ONLY: a copy's createBody with a body is about to run - its young looks' models are destroyed (appearance.cpp) */
+std::string ItemLookNowCommand();   /* T-1449 owner 1842, MAIN THREAD: `itemlook now` - every black look on every loaded character (SNAPSHOT lines; read-only, every build) */
+#ifdef SW_DEV_BUILD
+std::string ItemLookForceCommand(const std::string& who, const std::string& how);   /* T-1449 owner 1842 TEST-ONLY (DEV build), MAIN THREAD: `itemlook force <uid|nearest> <black|nothing|blank|unload>` */
+#endif
 void ItemGearNoteSent(int blocks, unsigned int dropped);   /* session.cpp: GEM1 blocks written, fields that went empty */
 void ItemGearNoteBadRecv();   /* session.cpp: a RECEIVED GEM1 block that was malformed */
 void ItemBagNestNoteBadRecv();   /* session.cpp / clothing.cpp: a RECEIVED pack-row BAGN tail that was malformed */
@@ -876,6 +896,7 @@ int  BoxKeyNearKey(const char* have, const char* want);
    hand::asBuilding - the same thread as the hand resolve its callers already make. 1 = built; 0 = neither road, or no key.
    Guarded POD loads, then ObjectPositionKey (countIt 3, podPos 1). */
 int  LayoutOuterKey(void* piece, char* out, int cap);
+void* LayoutOuterBuilding(void* piece);   /* T-1429 F1753: the building `piece` stands inside (LayoutOuterKey's two roads), the pointer; 0 = none. MAIN THREAD */
 std::string OuterKeyReportToken();   /* T-860: " outerKey[layout,insideHandle,none]=a,b,c" */
 /* BED1: the hands of `outer`'s interior pieces - the boost::unordered_set<hand> at myInterior(+0x1F0)+0xE8 that
    createBuilding fills through 0x54E940 and collectInteriorBuildings 0x54A220 walks. Five u32 per piece into `ids`

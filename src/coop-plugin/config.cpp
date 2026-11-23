@@ -672,6 +672,27 @@ static int ConfigSettingsText(std::string* layered)
     return (hs ? 1 : 0) + ((ht && coopdata::TestCfgKindOf(tx) != coopdata::kTestPanelOld) ? 1 : 0);
 }
 
+/* T-1457 (owner decision 1824) - THE REPORT ROAD OF A SWITCHED-OFF GAME reads only its TEST-ONLY report service: bugrelay= and
+   bugrelayport= from the DLL-side test file (the bench's - write-cfg.ps1 writes bugrelay=test into every cfg it writes; a player's
+   install has no test file, so its reports go to the real service as always). Nothing else of the settings is read or committed:
+   the switched-off game opens no link and keeps no other setting. Logged as ConfigReadFileInto logs them. Start thread, once. */
+void ConfigReadBugRelayOnly()
+{
+    std::string text;
+    if (!ReadCfgTextAt(TestCfgPath(), &text) || coopdata::TestCfgKindOf(text) == coopdata::kTestPanelOld) return;
+    coopcfg::CfgFields fields;
+    coopcfg::CfgParseText(text, &fields, 0, 0, 0, 0);
+    if (fields.bugRelay != 0)
+        DebugLog("[CFG] TEST ONLY: bugrelay=" + std::string(fields.bugRelay == 1 ? "test" : fields.bugRelay == 2 ? "test503" : "test404")
+                 + " - bug reports go to the TEST report service, which never posts to Discord (T-1457: the switched-off game reads this key only)");
+    g_bugRelay = fields.bugRelay;
+    if (fields.bugRelayPort != 0)
+        DebugLog("[CFG] TEST ONLY: bugrelayport=" + N((long long)fields.bugRelayPort) + (fields.bugRelay != 0
+                 ? std::string(" - the TEST report service is the bench's local copy at http://127.0.0.1:") + N((long long)fields.bugRelayPort) + "/"
+                 : std::string(" - ignored: no test bugrelay= value, and the real report service is never redirected")));
+    g_bugRelayPort = fields.bugRelayPort;
+}
+
 /* mp1 / W2-f: THE FIELDS, read and parsed exactly as ConfigReadFileInto does and committed NOWHERE. 0 = neither file exists. */
 static int ConfigPeekFileFields(coopcfg::CfgFields* out)
 {

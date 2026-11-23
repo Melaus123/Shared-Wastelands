@@ -1641,19 +1641,86 @@ void t_t586_stale_row()
 
 /* T-601 D1: a wake-up clock held with a parked knockdown goes on less the time it waited, never below 0; a value ApplyLatch
    does not write (no clock) comes back unchanged. */
-/* T-595: a knock-out pose onto a standing, non-ragdoll copy whose STATE carries the unconscious flag or clock is left to the
-   copy's own engine once; a ragdoll, a limp or an unreadable copy, a second time, no latch, or another pose is written. */
+/* T-595 / T-540 (owner 1873 a): a knock-out pose onto a copy whose ragdoll bit (the engine's own, 0x7D0840) is off, with the
+   unconscious flag or clock in its STATE, is left to the copy's own engine - the first time and again at every later STATE that
+   still finds the bit off; a bit on or unreadable, no latch, or another pose is written. The pose before (a crippled 2) is not
+   an argument: the bit alone decides. */
 void t_t595_ko_pose_left_to_engine()
 {
     using namespace coopkolook;
-    if (!LeaveKoPoseToEngine(4, true, 0, 0, false)) Fail("T-595: standing, latch, first time -> left to the engine");
-    if (LeaveKoPoseToEngine(4, true, 0, 0, true)) Fail("T-595: left once and still standing -> the next STATE writes it");
-    if (LeaveKoPoseToEngine(4, false, 0, 0, false)) Fail("T-595: no unconscious flag or clock -> written");
-    if (LeaveKoPoseToEngine(4, true, 1, 0, false)) Fail("T-595: already a ragdoll -> written");
-    if (LeaveKoPoseToEngine(4, true, 0, 1, false)) Fail("T-595: already limp -> written");
-    if (LeaveKoPoseToEngine(4, true, -1, 0, false)) Fail("T-595: ragdoll unreadable -> written");
-    if (LeaveKoPoseToEngine(2, true, 0, 0, false)) Fail("T-595: a crippled pose (2) -> written");
-    if (LeaveKoPoseToEngine(0, true, 0, 0, false)) Fail("T-595: standing up (0) -> written");
+    if (KoPoseRoad(4, true, 0, false) != kKoPoseLeaveFirst) Fail("T-595: bit off, latch, first time -> left to the engine");
+    if (KoPoseRoad(4, true, 0, true) != kKoPoseLeaveAgain) Fail("T-540: left once and the bit still off -> left again, never a bare write");
+    if (KoPoseRoad(4, true, 1, true) != kKoPoseWrite) Fail("T-540: left once and the bit now on -> written");
+    if (KoPoseRoad(4, true, 1, false) != kKoPoseWrite) Fail("T-595: already a ragdoll (bit on) -> written");
+    if (KoPoseRoad(4, false, 0, false) != kKoPoseWrite) Fail("T-595: no unconscious flag or clock -> written");
+    if (KoPoseRoad(4, false, 0, true) != kKoPoseWrite) Fail("T-595: no unconscious flag or clock, left before -> written");
+    if (KoPoseRoad(4, true, -1, false) != kKoPoseWrite) Fail("T-595: bit unreadable -> written");
+    if (KoPoseRoad(4, true, -1, true) != kKoPoseWrite) Fail("T-595: bit unreadable, left before -> written");
+    if (KoPoseRoad(2, true, 0, false) != kKoPoseWrite) Fail("T-595: a crippled pose (2) -> written");
+    if (KoPoseRoad(3, true, 0, true) != kKoPoseWrite) Fail("T-595: pose 3 -> written");
+    if (KoPoseRoad(0, true, 0, false) != kKoPoseWrite) Fail("T-595: standing up (0) -> written");
+    /* the engine's ragdoll bit as 0x7D0840 tests it (+0x2F8 non-zero with bit 0); -1 = the field could not be read */
+    if (KoRagdollBit(-1) != -1) Fail("T-540: ragdoll field unreadable -> -1");
+    if (KoRagdollBit(0) != 0) Fail("T-540: ragdoll field 0 -> off");
+    if (KoRagdollBit(1) != 1) Fail("T-540: ragdoll field 1 -> on");
+    if (KoRagdollBit(2) != 0) Fail("T-540: ragdoll field 2 (bit 0 clear) -> off");
+    if (KoRagdollBit(3) != 1) Fail("T-540: ragdoll field 3 -> on");
+    if (KoRagdollBit(0xFFFFFFFFLL) != 1) Fail("T-540: ragdoll field 0xFFFFFFFF (a full 32-bit read, not unreadable) -> on");
+    for (int k = 0; k < 64; ++k)
+    {
+        const int prone = k & 7, bit = ((k >> 3) & 3) - 1;   /* bit -1, 0, 1, 2 (any non-zero is not 'off') */
+        for (int ld = 0; ld < 2; ++ld)
+            for (int lb = 0; lb < 2; ++lb)
+            {
+                const int r = KoPoseRoad(prone, ld != 0, bit, lb != 0);
+                const int want = (prone == 4 && ld && bit == 0) ? (lb ? kKoPoseLeaveAgain : kKoPoseLeaveFirst) : kKoPoseWrite;
+                if (r != want) { Fail("T-540: KoPoseRoad leaves only pose 4 with a latch onto a bit-off body"); return; }
+            }
+    }
+}
+
+/* T-540 (T3024, log only): the [M4] KO pose line's kind for each road, once per kind per knockdown; the ragBit text; the
+   koPoseRoadWrite[bit1,bitUnreadable] slot. */
+void t_t540_ko_pose_log()
+{
+    using namespace coopkolook;
+    if (KoPoseLogKind(kKoPoseWrite, false) != kKoLogWrite) Fail("T-540: a first write is its own kind (it wrote no line before)");
+    if (KoPoseLogKind(kKoPoseWrite, true) != kKoLogWriteAfterLeft) Fail("T-540: a write after left");
+    if (KoPoseLogKind(kKoPoseLeaveFirst, false) != kKoLogLeft) Fail("T-540: left the first time");
+    if (KoPoseLogKind(kKoPoseLeaveAgain, true) != kKoLogLeftAgain) Fail("T-540: left again");
+    if (std::string(KoPoseLogKindText(kKoLogLeft)) != "left to the copy's engine") Fail("T-540: the request reads 'left to the copy's engine'");
+    if (std::string(KoPoseLogKindText(kKoLogWrite)) != "written") Fail("T-540: write text");
+    if (std::string(KoPoseLogKindText(kKoLogWriteAfterLeft)) != "written after left") Fail("T-540: write-after-left text");
+    if (std::string(KoPoseLogKindText(kKoLogLeftAgain)) != "left again") Fail("T-540: left-again text");
+    if (std::string(KoPoseLogKindText(9)) != "?") Fail("T-540: no such kind -> ?");
+    unsigned int seen = 0;
+    if (KoPoseLogFirst(&seen, kKoLogLeft) != 1) Fail("T-540: the first 'left' line of a knockdown is written");
+    if (KoPoseLogFirst(&seen, kKoLogLeft) != 0) Fail("T-540: a second 'left' line of the same knockdown is not");
+    if (KoPoseLogFirst(&seen, kKoLogLeftAgain) != 1) Fail("T-540: another kind in the same knockdown is written");
+    if (KoPoseLogFirst(&seen, kKoLogWriteAfterLeft) != 1 || KoPoseLogFirst(&seen, kKoLogWriteAfterLeft) != 0) Fail("T-540: write after left once");
+    if (KoPoseLogFirst(&seen, kKoLogWrite) != 1 || KoPoseLogFirst(&seen, kKoLogWrite) != 0) Fail("T-540: first write once");
+    if (seen != 0xFu) Fail("T-540: four kinds, four bits");
+    if (KoPoseLogFirst(&seen, 4) != 0 || KoPoseLogFirst(&seen, -1) != 0 || seen != 0xFu) Fail("T-540: no such kind -> no line, mask unchanged");
+    seen = 0;   /* a new knockdown */
+    if (KoPoseLogFirst(&seen, kKoLogLeft) != 1) Fail("T-540: a new knockdown writes its 'left' line again");
+    if (std::string(KoRagBitText(1)) != "1" || std::string(KoRagBitText(0)) != "0") Fail("T-540: ragBit 1 / 0");
+    if (std::string(KoRagBitText(-1)) != "-1(unreadable)") Fail("T-540: ragBit -1 named unreadable");
+    if (KoPoseWriteSlot(4, kKoPoseWrite, 1) != 0) Fail("T-540: pose-4 write, bit on -> bit1");
+    if (KoPoseWriteSlot(4, kKoPoseWrite, -1) != 1) Fail("T-540: pose-4 write, bit unreadable -> bitUnreadable");
+    if (KoPoseWriteSlot(4, kKoPoseWrite, 0) != -1) Fail("T-540: pose-4 write with no latch, bit off -> neither");
+    if (KoPoseWriteSlot(4, kKoPoseLeaveFirst, 0) != -1 || KoPoseWriteSlot(4, kKoPoseLeaveAgain, 0) != -1) Fail("T-540: left -> neither");
+    if (KoPoseWriteSlot(2, kKoPoseWrite, 1) != -1 || KoPoseWriteSlot(0, kKoPoseWrite, -1) != -1) Fail("T-540: another pose -> neither");
+    /* the slot never disagrees with the road: every (prone, latch, bit, leftBefore) */
+    for (int prone = 0; prone < 6; ++prone)
+        for (int bit = -1; bit <= 1; ++bit)
+            for (int ld = 0; ld < 2; ++ld)
+                for (int lb = 0; lb < 2; ++lb)
+                {
+                    const int road = KoPoseRoad(prone, ld != 0, bit, lb != 0);
+                    const int slot = KoPoseWriteSlot(prone, road, bit);
+                    const int want = (prone == 4 && bit == 1) ? 0 : (prone == 4 && bit == -1) ? 1 : -1;
+                    if (slot != want) { Fail("T-540: koPoseRoadWrite slot vs road"); return; }
+                }
 }
 
 void t_t601_held_ko_timer()

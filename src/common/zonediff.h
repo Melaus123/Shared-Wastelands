@@ -35,6 +35,7 @@
 #include "zonerec.h"      /* ZoneEmptyIsRaw: an area that wrote nothing is held as the EMPTY mark */
 #include "townverwire.h"  /* kTvNoteId, kTvNoteCap: the "built with" note inside an area file */
 #include "groundkey.h"    /* T-1391 (F1611): kGroundNearTenths and GroundNearBetter - the ground road's own item match */
+#include "piecerec.h"     /* T-1391 (F1754): PieceTownFact - the town a piece record carries, which the town link is judged against */
 
 namespace zonediff {
 
@@ -47,10 +48,14 @@ const char* const kLineHead = "[ZONE] T-1351 refused copy differs from newest re
 typedef std::map<std::string, std::string> Fields;   /* field name -> value as text */
 typedef std::map<std::string, Fields> Things;        /* key -> its fields */
 
+/* T-1391 (F1754): a piece's town words as its copy wrote them (townTYPE, townC, townCS, townI, townS) - never compared (they are this
+   game's handle words); the own-work check names the town they point at here, to judge the town link against the piece record */
+struct TownWords { int h[5]; TownWords() { for (int i = 0; i < 5; ++i) h[i] = 0; } };
 /* One copy, read for comparing. */
 struct Side
 {
     Things pieces, state, doors, town, box, ground, note;
+    std::map<std::string, TownWords> townWords;   /* T-1391 (F1754): by the town link's key; not compared */
     int empty;        /* 1 = the EMPTY mark (the area wrote nothing) */
     int records;
     size_t bytes;
@@ -212,6 +217,8 @@ inline bool ReadSide(const unsigned char* b, size_t n, int writerSlot, Side* s, 
             {
                 int th[5];
                 s->town[key]["linked"] = zonekeep::TownHandOf(r, th) != 0 ? "yes" : "no";
+                TownWords& tw = s->townWords[key];
+                for (int q = 0; q < 5; ++q) tw.h[q] = th[q];
             }
             /* its box: the item templates, its packs' items with them */
             const int inv = zonekeep::InstRecOfType(c, bySid, in, zonekeep::kTypeInventory);
@@ -420,7 +427,7 @@ inline std::string DiffLine(const std::string& area, const unsigned char* refuse
    (T2689 log-A:4464-4468, '... given to the item listed as ... (by key)') is the same item. A paired item whose quantity or quality
    differs is changed. Pure, as the rest of this header. */
 const int kKinds = 7;
-const int kKindBuildings = 0, kKindGround = 5;
+const int kKindBuildings = 0, kKindTown = 3, kKindBox = 4, kKindGround = 5, kKindNote = 6;
 inline const char* KindName(int k)
 {
     static const char* const n[kKinds] = { "buildings", "state", "doors", "town link", "box contents", "ground items", "town note" };
@@ -430,6 +437,7 @@ struct OwnWork
 {
     int added[kKinds], changed[kKinds], gone[kKinds];
     std::vector<std::string> show[kKinds];   /* "+key" for an added thing, "key{fields}" for a changed one, in key order */
+    std::vector<std::string> keys[kKinds];   /* T-1391 (F1653): the same things' keys as they are (the own-work check finds their records by them) */
     OwnWork() { for (int k = 0; k < kKinds; ++k) { added[k] = 0; changed[k] = 0; gone[k] = 0; } }
     int Any() const { for (int k = 0; k < kKinds; ++k) if (added[k] != 0 || changed[k] != 0) return 1; return 0; }
 };
@@ -466,10 +474,11 @@ inline void OwnKind(int k, const Things& mine, const Things& loaded, const std::
     for (Things::const_iterator i = mine.begin(); i != mine.end(); ++i)
     {
         Things::const_iterator j = loaded.find(i->first);
-        if (j == loaded.end()) { if (onlyAmong == 0 || onlyAmong->count(i->first) != 0) { ++w->added[k]; w->show[k].push_back("+" + Clean(i->first)); } continue; }
+        if (j == loaded.end() && k == kKindBox && i->second.empty()) continue;   /* T-1391 (F1754 sibling): an EMPTY box new since the load holds no own work (ReadSide makes a box entry for every inventory record, items or not) */
+        if (j == loaded.end()) { if (onlyAmong == 0 || onlyAmong->count(i->first) != 0) { ++w->added[k]; w->show[k].push_back("+" + Clean(i->first)); w->keys[k].push_back(i->first); } continue; }
         std::vector<std::string> df;
         OwnFields(i->second, j->second, k == kKindBuildings ? 1 : 0, &df);
-        if (!df.empty()) { ++w->changed[k]; w->show[k].push_back(ChangedText(i->first, df)); }
+        if (!df.empty()) { ++w->changed[k]; w->show[k].push_back(ChangedText(i->first, df)); w->keys[k].push_back(i->first); }
     }
     for (Things::const_iterator j = loaded.begin(); j != loaded.end(); ++j)
         if (mine.find(j->first) == mine.end() && (onlyAmong == 0 || onlyAmong->count(j->first) != 0)) ++w->gone[k];
@@ -533,10 +542,10 @@ inline void OwnGround(const Things& mine, const Things& loaded, OwnWork* w)
     }
     for (size_t a = 0; a < mi.size(); ++a)
     {
-        if (pairOf[a] < 0) { ++w->added[kKindGround]; w->show[kKindGround].push_back("+" + Clean(mi[a]->first)); continue; }
+        if (pairOf[a] < 0) { ++w->added[kKindGround]; w->show[kKindGround].push_back("+" + Clean(mi[a]->first)); w->keys[kKindGround].push_back(mi[a]->first); continue; }
         std::vector<std::string> df;
         OwnFields(mi[a]->second, li[(size_t)pairOf[a]]->second, 0, &df);
-        if (!df.empty()) { ++w->changed[kKindGround]; w->show[kKindGround].push_back(ChangedText(mi[a]->first, df)); }
+        if (!df.empty()) { ++w->changed[kKindGround]; w->show[kKindGround].push_back(ChangedText(mi[a]->first, df)); w->keys[kKindGround].push_back(mi[a]->first); }
     }
     for (size_t b = 0; b < li.size(); ++b) if (taken[b] == 0) ++w->gone[kKindGround];
 }
@@ -553,6 +562,204 @@ inline int OwnWorkOf(const Side& mine, const Side& loaded, OwnWork* w)
     OwnGround(mine.ground, loaded.ground, w);
     OwnKind(6, mine.note, loaded.note, 0, w);
     return w->Any() != 0 ? zonerec::kZcDiffers : zonerec::kZcSame;
+}
+/* T-1391 (F1653, THE OWN-WORK CHECK before any drop of an own area save): each kind of own work is CARRIED when its own item record
+   reached the world (held here, written at or after the copy the save was made from) or waits on its own road (a piece record marked
+   for writing, a box / door / ground entry in the outage journal). The road per kind: buildings and their state - the piece record
+   (build.cpp PcrW: a piece placed while this game is not its writer is held and written once it is); doors - the door record or the
+   piece's; box contents - the box record; ground items - the area's ground record; the town link - the piece record's town part, and
+   the town note - the placed town's town version record (F1754, both below: each is carried only when its record names the same town /
+   version as the save). */
+/* review of e3082c6cc (S2): COARSER WHERE SAID. Per record where the record names the thing: a piece and its state (piece record of its
+   key), a door (door record of its key, or its piece's), box contents (the box record of its key). Coarser: ground items - one ground
+   record per area, so any own ground item is carried only by that area's record newer than the base.
+   T-1391 fold (F1754, 2026-11-20; replaces review F1664 M1's 'the town link has no road - never carried', which made every piece placed
+   with the link down a FAULT): THE TOWN LINK IS CARRIED BY THE PIECE RECORD'S TOWN PART, JUDGED AGAINST THE SAVE. Since T-1427 fold 1
+   the piece record names its town by a key every game resolves (piecerec.h: bit 5 an outpost id; bit 8 a world town's stringID or
+   'Nowhere'); the area file's link is this game's handle words (ReadSide: Side::townWords), named here as a record names a town (the
+   game's town lists: store.cpp ZoneOwnWorkCheck). Carried only when the piece record (of the piece's key; a piece inside a building:
+   its host's - its town is its host's, build.cpp PcrTownFill) is held at or after the base AND carries the SAME town as the save, or
+   waits on its road (as the building item does). A record with no town part ('NOT KNOWN', piecerec.h), another town, a save whose town
+   cannot be named here, or no record: NOT carried, and the FAULT line says which (TownLinkWhy). F1664 M1's worry - a lost link logged as
+   carried because the record's town was never compared - is met: it is compared.
+   THE TOWN NOTE ("built with", townverwire.h kTvNoteId: per placed town the version its buildings in the area are built with) is carried
+   by that placed town's TOWN_VER record (the same key; one record per placed town) naming the same version - this game's own write of it
+   still waiting for the world server, else the record held here. A TOWN_VER record has no stamp (its revision rule keeps one truth), so
+   there is no base test. Review fold: no record and no own write waiting, with the note naming the town's own version ('=') - carried:
+   no record already means the normal town (townverwire.h TvPublishRev: no record + the own version = nothing to publish). Another
+   version, or a version other than '=' with no record: NOT carried (OwnNoteCarried). */
+enum { kRoadNone = 0, kRoadPiece = 1, kRoadDoor = 2, kRoadBox = 3, kRoadGround = 4, kRoadTown = 5, kRoadTownVer = 6 };
+inline int OwnKindRoad(int kind)
+{
+    return (kind == 0 || kind == 1) ? (int)kRoadPiece : kind == 2 ? (int)kRoadDoor : kind == kKindTown ? (int)kRoadTown : kind == kKindBox ? (int)kRoadBox
+         : kind == kKindGround ? (int)kRoadGround : kind == kKindNote ? (int)kRoadTownVer : (int)kRoadNone;
+}
+inline const char* RoadName(int road)
+{
+    return road == kRoadPiece ? "piece record" : road == kRoadDoor ? "door record" : road == kRoadBox ? "box record" : road == kRoadGround ? "ground record"
+         : road == kRoadTown ? "piece record's town" : road == kRoadTownVer ? "town version record" : "no record";
+}
+/* recordHeld / recordAt: a record of the thing is held here, with its stamp; baseAt: the stamp of the copy the save was made from (0 =
+   not known: any record held counts); waits: an entry for it waits on its own road */
+inline int OwnCarried(int road, int recordHeld, long long recordAt, long long baseAt, int waits)
+{
+    if (road == kRoadNone || road == kRoadTown || road == kRoadTownVer) return 0;   /* F1754: the town link and note are judged by OwnTownCarried / OwnNoteCarried, which compare the town */
+    if (waits != 0) return 1;
+    return (recordHeld != 0 && baseAt > 0 && recordAt >= baseAt) ? 1 : 0;   /* S2: a base stamp not known never lets a held record carry */
+}
+/* T-1391 fold (F1754): the piece record's town against the save's. recRead: 1 = the held record's town part was read here (rec: its
+   town, kPtfNone = the record carries no town part); saveRead: 1 = the save's town was named here (save: kPtfNone = the save names no
+   town; an outpost with id 0 = a player's town whose outpost id is not known here) */
+enum { kTmSame = 0, kTmNoPart = 1, kTmOther = 2, kTmSaveUnknown = 3, kTmRecUnread = 4, kTmOwed = 5, kTmOwedSame = 6 };
+inline int TownLinkMatch(int recRead, const piecerec::PieceTownFact& rec, int saveRead, const piecerec::PieceTownFact& save)
+{
+    if (recRead == 0) return kTmRecUnread;
+    if (rec.kind == piecerec::kPtfNone) return kTmNoPart;
+    if (saveRead == 0 || (save.kind == piecerec::kPtfOutpost && save.id == 0u)) return kTmSaveUnknown;
+    return piecerec::PieceTownFactSame(rec, save) != 0 ? (int)kTmSame : (int)kTmOther;
+}
+/* T-1391 fix attempt 2 (F1774 / F1775): the town an OWED write will carry against the save's - owed 1: a player's town whose outpost
+   id is not known here yet (the record will carry it once the id is learned - not carried now: kTmOwed); else rec as TownLinkMatch */
+inline int TownLinkMatchOwed(int owed, const piecerec::PieceTownFact& rec, int saveRead, const piecerec::PieceTownFact& save)
+{
+    if (owed != 0) return kTmOwed;
+    return TownLinkMatch(1, rec, saveRead, save);
+}
+/* review fold (MAJOR 1): an owed part (a player's town whose outpost id is not known here) is compared by the TOWN WORDS it was captured
+   with against the save's town words (both this game's handle words for its own towns): the same words = kTmOwedSame (carried - the
+   owed write names that town once its id is learned), other words or none read = kTmOwed (not carried) */
+inline int TownLinkMatchOwedWords(int owed, const int* capWords, const int* saveWords, const piecerec::PieceTownFact& rec, int saveRead, const piecerec::PieceTownFact& save)
+{
+    if (owed == 0) return TownLinkMatch(1, rec, saveRead, save);
+    if (capWords == 0 || saveWords == 0) return kTmOwed;
+    for (int q = 0; q < 5; ++q) if (capWords[q] != saveWords[q]) return kTmOwed;
+    return kTmOwedSame;
+}
+/* the town link: carried when the record carries the save's town (match kTmSame) - an owed write by what it WILL carry (match from
+   TownLinkMatchOwed; T-1391 fix attempt 2, F1774: no longer carried merely because a write waits), else a record held at or after the
+   base (OwnCarried's rule) */
+inline int OwnTownCarried(int recordHeld, long long recordAt, long long baseAt, int waits, int match)
+{
+    if (waits != 0) return (match == kTmSame || match == kTmOwedSame) ? 1 : 0;
+    if (OwnCarried(kRoadPiece, recordHeld, recordAt, baseAt, 0) == 0) return 0;
+    return match == kTmSame ? 1 : 0;
+}
+inline std::string TownFactText(const piecerec::PieceTownFact& f)
+{
+    if (f.kind == piecerec::kPtfOutpost) return f.id != 0u ? "outpost " + Num((long long)f.id) : std::string("a player's town whose outpost id is not known here");
+    if (f.kind == piecerec::kPtfWorld) return "world town " + Clean(f.sid);
+    if (f.kind == piecerec::kPtfNowhere) return "'Nowhere'";
+    return "no town";
+}
+/* the FAULT line's (and the carried list's) words for a town link: what the record carries against what the save has */
+inline std::string TownLinkWhy(int match, const piecerec::PieceTownFact& rec, int saveRead, const piecerec::PieceTownFact& save, const std::string& saveWhy)
+{
+    const std::string sv = saveRead != 0 ? TownFactText(save) : "a town not named here (" + Clean(saveWhy) + ")";
+    if (match == kTmSame) return "carries town " + TownFactText(rec) + ", as the save";
+    if (match == kTmNoPart) return "piece record carries no town, the save has " + sv;
+    if (match == kTmOther) return "carries town " + TownFactText(rec) + ", the save has " + sv;
+    if (match == kTmSaveUnknown) return "carries town " + TownFactText(rec) + ", the save's town cannot be told: " + sv;
+    if (match == kTmOwed) return "its town part is OWED (a player's town whose outpost id is not known here yet), the save has " + sv;
+    if (match == kTmOwedSame) return "its town part is owed (the outpost id not yet known here) - the same town as the save by its town words";
+    return "its town part was not read here (no decoded copy of the record)";
+}
+/* ---- T-1391 fix attempt 2 (F1774 / F1775): A DOOR IS JUDGED BY WHAT ITS OWN RECORD CONTAINS ----
+   The area file keeps a building's doors inside the building's record ('door<i> state', 'door<i> locked', 'door<i> wants lock' - ReadSide
+   files them under the BUILDING's key); each door's record is named by the DOOR's own key (doorrec.h MakeDoorRecId), found by door index
+   (doors.cpp DoorsKeysOfPiece). A door is carried when its record - this game's own write waiting in the outage journal (the newest), else
+   the record held here - contains the save's door: its state (settled: opening counts as open, closing as closed, as the record stores
+   it) and its lock word (locked, wants lock). A door at its starting state is carried by the record seeded at its placement - no
+   'defaults' rule. No door key known here, or no record: NOT carried. */
+enum { kDmSame = 0, kDmNoRecord = 1, kDmOther = 2, kDmKeyUnknown = 3 };
+inline int DoorSettled(int s) { return s == 2 ? 1 : (s == 3 ? 0 : s); }
+/* the door indexes a doors item names (its 'door<i> state' fields) */
+inline std::vector<int> DoorIndexesOf(const Fields& f)
+{
+    std::vector<int> v;
+    for (Fields::const_iterator i = f.begin(); i != f.end(); ++i)
+    {
+        const std::string& n = i->first;
+        if (n.size() < 11 || n.compare(0, 4, "door") != 0 || n.compare(n.size() - 6, 6, " state") != 0) continue;
+        const std::string d = n.substr(4, n.size() - 10);
+        if (d.empty() || d.size() > 3) continue;
+        bool ok = true;
+        for (size_t c = 0; c < d.size(); ++c) if (d[c] < '0' || d[c] > '9') ok = false;
+        if (ok) v.push_back((int)IntOf(d));
+    }
+    return v;
+}
+inline int DoorContentMatch(int keyKnown, int recHave, int recState, int recLockWord, const Fields& save, int index)
+{
+    if (keyKnown == 0) return kDmKeyUnknown;
+    if (recHave == 0) return kDmNoRecord;
+    const std::string p = "door" + Num((long long)index) + " ";
+    Fields::const_iterator st = save.find(p + "state"), lk = save.find(p + "locked"), wl = save.find(p + "wants lock");
+    if (st == save.end()) return kDmOther;
+    const int locked = lk != save.end() ? (IntOf(lk->second) != 0 ? 1 : 0) : 0;
+    const int wants = wl != save.end() ? (IntOf(wl->second) != 0 ? 1 : 0) : 0;
+    const int sameState = DoorSettled((int)IntOf(st->second)) == DoorSettled(recState) ? 1 : 0;
+    const int sameLock = (locked == (recLockWord & 1) && wants == ((recLockWord >> 1) & 1)) ? 1 : 0;
+    return (sameState != 0 && sameLock != 0) ? (int)kDmSame : (int)kDmOther;
+}
+inline std::string DoorMatchWhy(int m, const char* src)
+{
+    if (m == kDmSame) return std::string("(") + src + " record contains the save's door)";
+    if (m == kDmNoRecord) return "(no door record held, none queued)";
+    if (m == kDmOther) return std::string("(") + src + " record holds another state or lock)";
+    return "(its door key is not known here)";
+}
+/* a door change journaled with the link down (doors.cpp DoorStateToBytes: "d1<TAB>key<TAB>state<TAB>lockWord"): 1 = read */
+inline int DoorQueuedContent(const std::vector<char>& pay, int* state, int* lockWord)
+{
+    const std::string s(pay.begin(), pay.end());
+    const size_t t1 = s.find('\t'), t2 = t1 == std::string::npos ? t1 : s.find('\t', t1 + 1), t3 = t2 == std::string::npos ? t2 : s.find('\t', t2 + 1);
+    if (s.compare(0, 3, "d1\t") != 0 || t3 == std::string::npos || t3 + 2 != s.size() || t3 != t2 + 2) return 0;
+    const char a = s[t2 + 1], b = s[t3 + 1];
+    if ((a != '0' && a != '1') || b < '0' || b > '3') return 0;
+    *state = a - '0'; *lockWord = b - '0';
+    return 1;
+}
+/* the town note: noteValue = the note's "=<version>" field; waits / waitVer: this game's own TOWN_VER write for the placed town, not yet
+   seen held by the world server (the world's version once it lands); held / heldVer: the record held here. 1 = carried. No record and
+   none waiting: carried only for the town's own version ('=': no record means the normal town, townverwire.h TvPublishRev) */
+inline int OwnNoteCarried(const std::string& noteValue, int held, const std::string& heldVer, int waits, const std::string& waitVer)
+{
+    std::string ver;
+    if (cooptv::TvNoteVerParse(noteValue, &ver) == 0) return 0;
+    if (waits != 0) return waitVer == ver ? 1 : 0;
+    if (held == 0) return ver.empty() ? 1 : 0;
+    return heldVer == ver ? 1 : 0;
+}
+/* S2: THE CHECK'S OWN-WORK RULE - as OwnWorkOf, but a NEW piece's state, doors, town link and box contents count as own work too (OwnWorkOf
+   counts a sub-kind's thing only for a piece on both sides, which suits a label but would let a new piece's box contents go uncounted) */
+inline int OwnWorkOfAll(const Side& mine, const Side& loaded, OwnWork* w)
+{
+    std::set<std::string> any;
+    for (Things::const_iterator i = mine.pieces.begin(); i != mine.pieces.end(); ++i) any.insert(i->first);
+    for (Things::const_iterator i = loaded.pieces.begin(); i != loaded.pieces.end(); ++i) any.insert(i->first);
+    OwnKind(0, mine.pieces, loaded.pieces, 0, w);
+    OwnKind(1, mine.state, loaded.state, &any, w);
+    OwnKind(2, mine.doors, loaded.doors, &any, w);
+    OwnKind(3, mine.town, loaded.town, &any, w);
+    OwnKind(4, mine.box, loaded.box, &any, w);
+    OwnGround(mine.ground, loaded.ground, w);
+    OwnKind(6, mine.note, loaded.note, 0, w);
+    return w->Any() != 0 ? zonerec::kZcDiffers : zonerec::kZcSame;
+}
+/* the label: kOcNothing - no own work since the base (nothing lost); kOcCarried - every own thing is carried by its record; kOcFault -
+   own work no record carries (a FAULT line, the bytes set aside); kOcUnknown - the base or the copy cannot be read (also a FAULT with
+   the bytes set aside: not knowing is never read as nothing lost) */
+enum { kOcNothing = 0, kOcCarried = 1, kOcFault = 2, kOcUnknown = 3 };
+inline int OwnCheckLabel(int compared, int anyOwn, int anyLost)
+{
+    if (compared == 0) return kOcUnknown;
+    if (anyOwn == 0) return kOcNothing;
+    return anyLost != 0 ? (int)kOcFault : (int)kOcCarried;
+}
+inline const char* OwnCheckName(int label)
+{
+    return label == kOcNothing ? "nothing of this game's own since its base" : label == kOcCarried ? "CARRIED - every own thing by its own record"
+         : label == kOcFault ? "FAULT - own work no record carries" : "NOT KNOWN - the base copy or the save could not be read";
 }
 /* THE OWN-WORK LINE: mine (this game's copy, named mineName, written by mineWriter) against this game's loaded copy (loadedFrom says
    where it came from; written by loadedWriter). *outcome: kZcDiffers (own work: *kinds names the kinds), kZcSame (none), kZcUnread (a

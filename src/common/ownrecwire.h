@@ -46,7 +46,7 @@
 namespace ownrecw {
 
 const unsigned int kMsgOwnRec = 105u;   /* both ways; the next after PLAYER_MODS 104 */
-const unsigned int kProtocol = 173u;    /* the world-server protocol that carries OWNREC (162: PUT / OK; 163: T-885 piece 2's INDEX_ASK / INDEX / GET / REC / END; 164: the merge with effort/t1167b's TRADE) */
+const unsigned int kProtocol = 177u;    /* the world-server protocol that carries OWNREC (162: PUT / OK; 163: T-885 piece 2's INDEX_ASK / INDEX / GET / REC / END; 164: the merge with effort/t1167b's TRADE) */
 enum { kPut = 1, kOk = 2, kIndexAsk = 3, kIndex = 4, kGet = 5, kRec = 6, kEnd = 7 };
 /* the four answers (design section 2) */
 enum { kStored = 1, kDuplicate = 2, kSuperseded = 3, kRefused = 4 };

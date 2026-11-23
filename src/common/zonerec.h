@@ -216,6 +216,17 @@ inline int ZoneRecordNewerThanLoaded(long long loadedWrittenAt, unsigned long lo
     if (curWrittenAt != loadedWrittenAt) return (curWrittenAt > loadedWrittenAt) ? 1 : 0;
     return (loadedSeq != 0 && curSeq > loadedSeq) ? 1 : 0;
 }
+/* T-1391 F1848 (run T2752): this game UPLOADS its own area save (stamp sentWrittenAt) - the link-up push, the held push at an area map,
+   the resend of an own stored answer. Is the copy loaded here that same save, noted as loaded from a record with a known seq? Then the
+   note becomes this game's own write (seq 0), as the outage replay does (store.cpp kZoneWriteReplay): the world server stores the upload
+   under a new, higher seq and echoes it here, and with the old seq kept ZoneRecordNewerThanLoaded would read that echo - same stamp, higher
+   seq - as a newer copy and refuse the area's next save. A different stamp (the loaded copy is not this save), no note, or a note already
+   seq 0: untouched. 1 = set the note's seq to 0. */
+inline int ZoneUploadMakesLoadedOwn(int hasFromEntry, long long loadedWrittenAt, unsigned long long loadedSeq, long long sentWrittenAt)
+{
+    if (hasFromEntry == 0 || loadedSeq == 0) return 0;
+    return (loadedWrittenAt == sentWrittenAt) ? 1 : 0;
+}
 /* T-1351 (run T2381): may a record of a zone with a kept mark, written by ANOTHER slot, set the mark's "a newer record landed" time
    (the sinceLimit ZoneKeptAdoptJudge is given)? hasFromEntry: this game holds a loaded-from-record entry for the zone (the record its
    copy was loaded from, or adopted as); then only a record NEWER than that one sets it - a re-publish of the same record (the

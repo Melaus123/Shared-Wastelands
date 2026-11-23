@@ -581,6 +581,18 @@ inline int KoSelfNameNearParse(const std::string& arg, std::string* name, unsign
     return 1;
 }
 
+/* T-540 TEST-ONLY (DEV build): `koself <uid|made:<label>|spawned:<Template>> short` - arg is what follows `koself`: exactly two
+   words, the character word (not `name`) and the word short. *who = the character word as given (the caller resolves it as the
+   other koself forms do). 1 parsed, 0 not this form. */
+inline int KoSelfShortParse(const std::string& arg, std::string* who)
+{
+    who->clear();
+    std::string tok[3];
+    if (TalkSplit(arg, tok, 3) != 2 || tok[1] != "short" || tok[0] == "name" || tok[0].empty()) return 0;
+    *who = tok[0];
+    return 1;
+}
+
 /* `capturetest carry <carrierUid> name <name> [dead]` - arg is the whole capturetest argument. 1 parsed (carrier non-zero), 0 not
    this form or malformed. *dead (when given) = 1 when the trailing word `dead` is there (T-1262 TEST-ONLY: the body is a DEAD
    character, not a down one), else 0. */

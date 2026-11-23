@@ -3074,6 +3074,7 @@ static int PanelNotebookRunningPort()
    token) was closed by that relay work.
    Returns 1 when a process was created, 0 when it was not, 2 when ours is already running.
    ------------------------------------------------------------------------------------------------ */
+static void PanelOptTakeStored();   /* below: the rows the world stored join g_optHanded (T-1399: the press that starts the server reads them) */
 static int PanelStartNotebook(unsigned short port)
 {
     if (coopdata::IdentityRefusesHostJoin(IdentitySessionOnlyKind()))   /* PP3d: never a world server under a session-only owner id */
@@ -3211,13 +3212,23 @@ static int PanelStartNotebook(unsigned short port)
        the world server's own check takes (rulesfile::FirstStartRows with worldopt::ValueOk, store_main.cpp OptionValueOk's body). The
        world server then decides what it decides before this game's Game options can reach it - a first import asked from the menu,
        NEW PROFILE's answer and its profile cap - from the host's choice. */
+    /* T-1399 (F1750 (1)): at a LATER hosting this press - it starts the world server - writes the host's owner-change rows the same way:
+       the rows changed on GAME OPTIONS for this world and not already stored by it (g_optHanded, as PanelOptHandOver passes it), so the
+       world server's lobby answers (an import's money / research, NEW PROFILE's answer, the profile cap) carry the host's change from its
+       first moment; rows the host did not change are never written (an admin's change and a hand edit stay). */
     std::vector<std::pair<std::string, std::string> > firstRows;
     {
+        PanelOptTakeStored();
         std::vector<std::pair<std::string, std::string> > pressRows;
         const int how = stewardrules::HostPressRows(SettingsFirstHosting(), !g_optChosenWorld.empty() && g_optChosenWorld == g_worldSel, g_optChosen,
-                                                    std::vector<std::pair<std::string, std::string> >(), &pressRows);
-        const std::map<std::string, std::string> chosenRows = rulesfile::FirstStartRows(how == stewardrules::kPressSendsHostSettings, pressRows, worldopt::ValueOk);
+                                                    g_optHandedWorld == g_worldSel ? g_optHanded : std::vector<std::pair<std::string, std::string> >(), &pressRows);
+        const std::map<std::string, std::string> chosenRows = rulesfile::FirstStartRows(rulesfile::StartRowsWritten(how == stewardrules::kPressSendsHostSettings,
+                                                                                         how == stewardrules::kPressSendsOwnerChange, true), pressRows, worldopt::ValueOk);
         for (std::map<std::string, std::string>::const_iterator it = chosenRows.begin(); it != chosenRows.end(); ++it) firstRows.push_back(*it);
+        if (how == stewardrules::kPressSendsOwnerChange)
+            DebugLog("[UI] T-1399 HOST: world '" + g_worldSel + "' (a later hosting) - " + coopui::PanelNum((long long)firstRows.size())
+                     + " GAME OPTIONS row(s) the host changed and the world has not stored go into its rules.txt before the world server starts"
+                     + (pressRows.size() > firstRows.size() ? " (" + coopui::PanelNum((long long)(pressRows.size() - firstRows.size())) + " row(s) the world server would refuse left out)" : std::string()));
         if (SettingsFirstHosting())
             DebugLog("[UI] T-1202 HOST: world '" + g_worldSel + "'s first hosting - " + coopui::PanelNum((long long)firstRows.size())
                      + " GAME OPTIONS row(s) the host chose go into its rules.txt before the world server starts"
@@ -7941,6 +7952,7 @@ void UiEditorResetTick()
 }
 void UiEditorForgetWorld()
 {
+    UiEditorToolForget();   /* T-1462: the mod's Level Editor window goes with the world */
     if (g_edDead) { g_edBtn = 0; return; }
     __try { UiEditorForgetCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { g_edBtn = 0; g_edDead = true; ++g_edCount[4]; }
 }
@@ -8886,6 +8898,219 @@ static int UiResetBoxCloseGuarded()
     __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
 }
 int UiResetBoxClose() { return UiResetBoxCloseGuarded(); }
+/* T-1462 (owner 1838): THE LEVEL EDITOR WINDOW IN A MULTIPLAYER WORLD - what the Level Editor key opens there once store.cpp has closed the
+   real editor (F1770: it is never left open). The reset box's recipe (one root Kenshi_WindowC on "Info", made again on "Popup" when Info
+   is unknown; not movable; the words centred in the message box's colour; Kenshi_Button2 buttons lit by hand) with the approved words
+   (coopprof::kEditorTool*): title 'Level Editor', the line, 'Regenerate sector' bottom-left and 'Close' bottom-right. The hover note on
+   'Regenerate sector' is the Reset Population note's look and road (UiPointerOver each frame; a root Kenshi_FloatingPanelThinSkin note on
+   Info / Popup, filled by UiHoverTipFill). It does not pause and blocks nothing. A click only records; UiEditorToolTick acts on the main
+   thread in a world. [EDITOR] T-1462 lines (40 per launch). */
+static const char* const kEtWinName      = "SWLevelEditorWindow";
+static const char* const kEtLineName     = "SWLevelEditorLine";
+static const char* const kEtRegenName    = "SWLevelEditorRegen";
+static const char* const kEtCloseName    = "SWLevelEditorClose";
+static const char* const kEtTipName      = "SWLevelEditorTip";
+static const char* const kEtTipTextName  = "SWLevelEditorTipText";
+static volatile LONG g_etRegenClicked = 0, g_etCloseClicked = 0;
+static int  g_etUp = 0, g_etTipUp = 0, g_etTipFails = 0;
+static bool g_etDead = false;
+static long long g_etCount[6] = { 0, 0, 0, 0, 0, 0 };   /* opened, 'Regenerate sector' presses, closes, notes shown, faults, not built */
+static long long g_etLines = 0;
+static const long long kEtLineCap = 40;
+void BdRegenSectorPress();   /* build.cpp (build.h) */
+static void OnEditorToolRegen(MyGUI::Widget* /*sender*/) { ::InterlockedExchange(&g_etRegenClicked, 1); }
+static void OnEditorToolClose(MyGUI::Widget* /*sender*/) { ::InterlockedExchange(&g_etCloseClicked, 1); }
+static void UiEtLine(const std::string& s)
+{
+    if (++g_etLines > kEtLineCap) return;
+    DebugLog(s + (g_etLines == kEtLineCap ? " (line cap reached - counted only from here)" : ""));
+}
+static void UiEtTipDrop(MyGUI::Gui* gui)
+{
+    if (g_etTipUp == 0) return;
+    g_etTipUp = 0;
+    MyGUI::Widget* tip = gui->findWidgetT(std::string(kEtTipName), false);
+    if (tip != 0) gui->destroyWidget(tip);
+}
+/* 1 built, 0 refused, 2 the layer is unknown; whatever was made is handed back to be dropped. */
+static int UiEditorToolMake(MyGUI::Gui* gui, const char* layer, int vw, int vh, MyGUI::Widget** winOut)
+{
+    const UiNames& n = NM();
+    const std::string text(coopprof::kEditorToolText);
+    int w = (vw * 34) / 100; if (w < 520) w = 520; if (w > vw - 20) w = vw - 20;
+    int h = coopui::NoticeBoxH(text, w); if (h < 190) h = 190; if (h > vh - 20) h = vh - 20;
+    if (w < 200 || h < 120) return 0;
+    int y = (vh * 14) / 100; if (y > vh - h) y = vh - h; if (y < 0) y = 0;
+    MyGUI::Widget* raw = gui->createWidgetT(n.typeWindow, std::string("Kenshi_WindowC"), MyGUI::IntCoord((vw - w) / 2, y, w, h),
+                                            MyGUI::Align::Default, std::string(layer), std::string(kEtWinName));
+    *winOut = raw;
+    if (raw == 0) { ::InterlockedIncrement64(&g_uiCreateNull); return 0; }
+    if (raw->getLayer() == 0) return 2;
+    MyGUI::Window* win = raw->castType<MyGUI::Window>(false);
+    if (win == 0) return 0;
+    win->setMovable(false);
+    win->setCaption(MyGUI::UString(coopprof::kEditorToolTitle));
+    MyGUI::Widget* c = win->getClientWidget();
+    if (c == 0) return 0;
+    const int W = c->getWidth(), H = c->getHeight();
+    if (W < 200 || H < 60) return 0;
+    const coopui::NoticeLayout lay = coopui::NoticeLayoutIn(H);
+    int btnW = W / 3; if (btnW < 180) btnW = 180; if (btnW > (W - 24) / 2) btnW = (W - 24) / 2;
+    MyGUI::Widget* l = Mk(c, n.typeEdit, n.skinWrap, 8, lay.textY, W - 16, lay.textH, kEtLineName);
+    MyGUI::Widget* r = Mk(c, n.typeButton, n.skinBtn2, 8, lay.btnY, btnW, lay.btnH, kEtRegenName);
+    MyGUI::Widget* b = Mk(c, n.typeButton, n.skinBtn2, W - btnW - 8, lay.btnY, btnW, lay.btnH, kEtCloseName);
+    MyGUI::EditBox* le = (l != 0) ? l->castType<MyGUI::EditBox>(false) : 0;
+    MyGUI::Button* rb = (r != 0) ? r->castType<MyGUI::Button>(false) : 0;
+    MyGUI::Button* bb = (b != 0) ? b->castType<MyGUI::Button>(false) : 0;
+    if (le == 0 || rb == 0 || bb == 0) return 0;
+    le->setEditStatic(true); le->setEditReadOnly(true); le->setEditMultiLine(true); le->setEditWordWrap(true);
+    le->setTextAlign(MyGUI::Align::Center);
+    le->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
+    le->setCaption(MyGUI::UString(text.c_str()));
+    rb->setCaption(MyGUI::UString(coopprof::kEditorToolRegenCaption));
+    rb->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));   /* Kenshi_Button2's own caption colour is dim - lit by hand */
+    rb->eventMouseButtonClick += MyGUI::newDelegate(OnEditorToolRegen);
+    bb->setCaption(MyGUI::UString(coopprof::kEditorToolCloseCaption));
+    bb->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f));
+    bb->eventMouseButtonClick += MyGUI::newDelegate(OnEditorToolClose);
+    return 1;
+}
+static int UiEditorToolShowBody()
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui == 0) return 0;
+    {   /* a window already there (an earlier press) is dropped and built again */
+        MyGUI::Widget* old = gui->findWidgetT(std::string(kEtWinName), false);
+        if (old != 0) { UiEtTipDrop(gui); UiHostLeftDrop(gui, 0, old); }
+    }
+    g_etUp = 0;
+    int vw = 1280, vh = 720;
+    MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
+    if (rm != 0) { const MyGUI::IntSize& vs = rm->getViewSize(); if (vs.width > 0 && vs.height > 0) { vw = vs.width; vh = vs.height; } }
+    const char* layers[2] = { kHlLayer, kHlLayerAlt };
+    for (int k = 0; k < 2; ++k)
+    {
+        MyGUI::Widget* raw = 0;
+        const int rc = UiEditorToolMake(gui, layers[k], vw, vh, &raw);
+        if (rc == 1)
+        {
+            ::InterlockedExchange(&g_etRegenClicked, 0); ::InterlockedExchange(&g_etCloseClicked, 0);
+            raw->setVisible(true);
+            g_etUp = 1;
+            ++g_etCount[0];
+            UiEtLine(std::string("[EDITOR] T-1462 Level Editor window opened (multiplayer world) on layer ") + layers[k]
+                     + ": '" + coopprof::kEditorToolTitle + "' - '" + coopprof::kEditorToolText + "' with '" + coopprof::kEditorToolRegenCaption
+                     + "' and '" + coopprof::kEditorToolCloseCaption + "' (opened=" + coopui::PanelNum(g_etCount[0]) + ")");
+            return 1;
+        }
+        UiHostLeftDrop(gui, 0, raw);
+        if (rc != 2) break;
+    }
+    ++g_etCount[5];
+    return 0;
+}
+/* The note as a root widget on the Info layer (Popup when Info is unknown), filled by UiHoverTipFill. */
+static MyGUI::Widget* UiEtTipBuild(MyGUI::Gui* gui, int vw)
+{
+    static const char* const kLayers[2] = { "Info", "Popup" };
+    const UiNames& n = NM();
+    const int W = vw > 200 ? vw : 200;   /* wide enough that the line is never clipped while measured */
+    for (int k = 0; k < 2; ++k)
+    {
+        MyGUI::Widget* tip = gui->createWidgetT(n.typeWidget, std::string("Kenshi_FloatingPanelThinSkin"), MyGUI::IntCoord(0, 0, W, 60),
+                                                MyGUI::Align::Default, std::string(kLayers[k]), std::string(kEtTipName));
+        if (tip == 0) return 0;
+        if (tip->getLayer() != 0) return UiHoverTipFill(gui, tip, W, kEtTipTextName, coopprof::kEditorToolRegenHover);
+        gui->destroyWidget(tip);
+    }
+    return 0;
+}
+static void UiEditorToolTickBody()
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui == 0) return;
+    MyGUI::Widget* win = gui->findWidgetT(std::string(kEtWinName), false);
+    if (win == 0)
+    {
+        g_etUp = 0;
+        ::InterlockedExchange(&g_etRegenClicked, 0); ::InterlockedExchange(&g_etCloseClicked, 0);
+        UiEtTipDrop(gui);
+        return;
+    }
+    if (::InterlockedExchange(&g_etRegenClicked, 0) != 0)
+    {
+        ++g_etCount[1];
+        UiEtLine("[EDITOR] T-1462 'Regenerate sector' pressed (presses=" + coopui::PanelNum(g_etCount[1]) + ") - the area in view, on this game only");
+        BdRegenSectorPress();
+    }
+    if (::InterlockedExchange(&g_etCloseClicked, 0) != 0)
+    {
+        ++g_etCount[2];
+        UiEtTipDrop(gui);
+        MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+        if (im != 0) im->resetKeyFocusWidget();
+        UiHostLeftDrop(gui, 0, win);
+        g_etUp = 0;
+        UiEtLine("[EDITOR] T-1462 Level Editor window closed by its 'Close' (closes=" + coopui::PanelNum(g_etCount[2]) + ")");
+        return;
+    }
+    MyGUI::Widget* btn = gui->findWidgetT(std::string(kEtRegenName), false);
+    MyGUI::IntPoint m;
+    if (btn == 0 || g_etTipFails >= 3 || !UiPointerOver(btn, &m)) { UiEtTipDrop(gui); return; }
+    int vw = 1280, vh = 720;
+    MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
+    if (rm != 0) { const MyGUI::IntSize& vs = rm->getViewSize(); if (vs.width > 0 && vs.height > 0) { vw = vs.width; vh = vs.height; } }
+    MyGUI::Widget* tip = (g_etTipUp != 0) ? gui->findWidgetT(std::string(kEtTipName), false) : 0;
+    if (tip == 0)
+    {
+        g_etTipUp = 0;
+        tip = UiEtTipBuild(gui, vw);
+        if (tip == 0)
+        {
+            if (++g_etTipFails == 3) ErrorLog("[EDITOR] T-1462 the 'Regenerate sector' hover note could not be built 3 times in a row - given up for this run");
+            return;
+        }
+        g_etTipFails = 0;
+        g_etTipUp = 1;
+        ++g_etCount[3];
+    }
+    /* below-right of the pointer, kept on screen (above the pointer when there is no room below it) */
+    int x = m.left + kHoverTipDx, y = m.top + kHoverTipDy;
+    if (x + tip->getWidth() > vw) x = vw - tip->getWidth();
+    if (y + tip->getHeight() > vh) y = m.top - tip->getHeight() - 4;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (tip->getLeft() != x || tip->getTop() != y) tip->setPosition(MyGUI::IntPoint(x, y));
+}
+static void UiEditorToolForgetBody()
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    g_etUp = 0;
+    ::InterlockedExchange(&g_etRegenClicked, 0); ::InterlockedExchange(&g_etCloseClicked, 0);
+    if (gui == 0) return;
+    UiEtTipDrop(gui);
+    MyGUI::Widget* win = gui->findWidgetT(std::string(kEtWinName), false);
+    if (win != 0) UiHostLeftDrop(gui, 0, win);
+}
+static int UiEditorToolShowCatching() { try { return UiEditorToolShowBody(); } catch (...) { g_etDead = true; ++g_etCount[4]; return -1; } }
+static void UiEditorToolTickCatching() { try { UiEditorToolTickBody(); } catch (...) { g_etDead = true; ++g_etCount[4]; } }
+static void UiEditorToolForgetCatching() { try { UiEditorToolForgetBody(); } catch (...) { g_etDead = true; ++g_etCount[4]; } }
+int UiEditorToolShow()
+{
+    if (g_etDead) return -3;
+    __try { return UiEditorToolShowCatching(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_etDead = true; ++g_etCount[4]; return -2; }
+}
+void UiEditorToolTick()
+{
+    if (g_etDead || (g_etUp == 0 && g_etTipUp == 0 && g_etRegenClicked == 0 && g_etCloseClicked == 0)) return;
+    __try { UiEditorToolTickCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { g_etDead = true; ++g_etCount[4]; }
+}
+void UiEditorToolForget()
+{
+    if (g_etDead) { g_etUp = 0; return; }
+    __try { UiEditorToolForgetCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { g_etDead = true; ++g_etCount[4]; }
+}
 /* CAN'T JOIN IN A RUNNING WORLD - a Steam join request (its "Join Game" or an accepted invite) that came while this game is in a world.
    The MODS DON'T MATCH notice's recipe (one root Kenshi_WindowC on "Info", made again on "Popup" when Info is unknown; not movable; the
    line centred in the message box's colour; OK bottom-right). It does not pause and blocks nothing. OK only records the click;
@@ -10324,13 +10549,15 @@ static pausemenu::KenshiRows g_pmKenshi;
 static pausemenu::Placement g_pmLast;         /* the last placement applied, for the log line */
 static void* (*orig_pauseMenuShow)(void*) = 0;
 static int g_pauseMenuShowHooked = 0;   /* T-927: 1 = AddHook on the menu's show succeeded (UiPauseMenuShowHooked) */
+static int g_pmReportOnly = 0;          /* T-1457: 1 = the switched-off game's report-only hook (InstallUiPauseMenuReportOnly): never a
+                                           multiplayer world, nothing of another feature asked */
 /* Result bits: 1 a multiplayer world (the three hidden), 2 REPORT A BUG on the panel, 4 every row placed, 8 * (found of the three,
    0..3), 32 HOSTING on the panel, 64 MULTIPLAYER on the panel. < 0: -3 the panel holds no widget, -1 a MyGUI throw, -2 a fault. */
 static int UiPauseArrangeBody(void* panel)
 {
     MyGUI::Widget* root = *(MyGUI::Widget**)((char*)panel + 8);
     if (root == 0) return -3;
-    const bool block = HandSaveBlocked();
+    const bool block = g_pmReportOnly != 0 ? false : HandSaveBlocked();   /* T-1457: a switched-off game is never in a multiplayer world */
     static const char* const kSuffix[6] = { "NewGameButton", "SaveGameButton", "LoadGameButton", "OptionsButton", "ExitGameButton", "ResumeButton" };
     MyGUI::Widget* w[6];
     int found = 0;
@@ -10468,6 +10695,34 @@ static void* detour_pauseMenuShow(void* panel)
     BugReportPauseMenuShown(panel);   /* T-461: REPORT A BUG on its own row (its own SEH frame); it arranges the menu when it adds the row */
     UiPauseMenuArrange(panel);
     return ret;
+}
+/* T-1457 (owner decision 1824, F1707): THE SWITCHED-OFF GAME'S PAUSE MENU - the engine's own show, then REPORT A BUG on its own row and
+   the menu arranged around it (Kenshi's rows where Kenshi put them: never a multiplayer world). Nothing else: no chat ESC, no pause
+   vote, no hand-save count. */
+static void* detour_pauseMenuShowReportOnly(void* panel)
+{
+    void* ret = orig_pauseMenuShow(panel);
+    if (panel == 0) return ret;
+    BugReportPauseMenuShown(panel);
+    UiPauseMenuArrange(panel);
+    return ret;
+}
+int InstallUiPauseMenuReportOnly()
+{
+    const uintptr_t target = (uintptr_t)AddrAbs(kT228MenuShow);
+    if (target == 0)
+    {
+        ErrorLog("[UI] T-1457 pause menu REPORT A BUG=not-installed on the switched-off game: MainMenuPopup_show has no address");
+        return 0;
+    }
+    g_pmReportOnly = 1;
+    const coop::HookStatus st = coop::AddHook((void*)target, (void*)&detour_pauseMenuShowReportOnly, (void**)&orig_pauseMenuShow);
+    g_pauseMenuShowHooked = (st == coop::SUCCESS && orig_pauseMenuShow != 0) ? 1 : 0;
+    if (g_pauseMenuShowHooked)
+        DebugLog("[UI] T-1457 report-only hook installed: MainMenuPopup_show - the switched-off game's pause menu gets REPORT A BUG on its own row");
+    else
+        ErrorLog("[UI] T-1457 pause menu REPORT A BUG=not-installed on the switched-off game: AddHook on MainMenuPopup_show FAILED");
+    return g_pauseMenuShowHooked;
 }
 long long UiHandSaveHiddenOpens() { return g_hiddenOpens; }
 void InstallUiPauseMenuArrange()

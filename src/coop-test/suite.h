@@ -23,6 +23,7 @@
 #include "addrtable.h"   /* P8h: the address table format and the executable fingerprint */
 #include "addrhooked.h"  /* rk1: a call-only row another mod has hooked - accepted or refused */
 #include "sigtable.h"    /* T-63 stage 7: every address row by its byte pattern when no table matches */
+#include "reportroad.h"  /* T-1457: REPORT A BUG on a game the address gate switched off - its rows, verdict, steps, reader */
 #include "modlist.h"   /* settings5 S5: the mod list, its diff and its words */
 #include "playermods.h"   /* T-938 / T-247: PLAYER_MODS */
 #include "admincmd.h"   /* T-247: USE MY MODS is admin verb 21 */
@@ -286,7 +287,6 @@
 #include "shoprec.h"   /* one shop building's restock state as one world-server record, and the restock gate's rules */
 #include "setupstock.h"   /* a shop's set-up restock and a keeper's unknown money when the counters hold the world server's stock */
 #include "windowbound.h"   /* T-986 (drift bound): the native combat window's distance bound */
-#include "windowfollow.h"   /* T-1422 fix 2: the native combat window's 3D route follow step */
 #include "townmove.h"   /* T-924 fault 2: a teammate's outpost copy moved to the sent centre */
 #include "squadsplit.h"   /* T-948 b: a squad of copies is not split; a copy is not moved to a new squad */
 #include "sameidpair.h"   /* T-1097: one live platoon per world squad id - the same-id copy yield, its twin step and the pair guard */
@@ -536,9 +536,13 @@ void t_addr_pattern_refusal_clears_every_slot();
 void t_sig_row_from_a_call();
 void t_addr_optional_row_miss();
 void t_t1453_review_folds();
+void t_t1429_s15_s16_lines();
+void t_t1429_f1753_inside();   /* T-1429 F1753 design (a): a camp piece's inside byte */
+void t_t1457_report_road();
 void t_rk1_addr_hooked_call_only_verdict();
 void t_rk1_addr_uses_all_call_only();
 void t_t1447_addr_hook_chain();
+void t_t1476_sig_road_declared_use();   /* T-1476 (F2011, owner 1876): the signature road applies each row's declared use */
 void t_addr_signatures_resolve_every_kind_and_refuse_anything_less();
 void t_addr_fingerprint_is_the_four_numbers_and_a_bad_header_writes_nothing();
 void t_addr_table_parser_reads_every_kind_and_names_what_it_refuses();
@@ -902,6 +906,7 @@ void t_orphan1_orphan_purge();
 void t_inv7a_standin_purge();
 void t_inv7a2_purge_triggers_and_id_carry();
 void t_t707_copy_squad_id();
+void t_t1474_copied_id_any_faction();
 void t_inv7a3_own_id_supersede_and_woken_recheck();
 void t_inv7e2_reloaded_copy_retire();
 void t_restore1b1_ownhigh_checkpoints();
@@ -1427,6 +1432,7 @@ void t_t53_routerport_cfg_key();
 void t_t53_upnp_find_and_existing();
 void t_t510_internet_address();
 void t_t346_place_input_height();
+void t_t1429_camp_outdoor_y();
 void t_t346_record_file_names();
 void t_t53_upnp_worker_steps();
 void t_t597_home_adapter_pick();
@@ -1630,6 +1636,7 @@ void t_t735_lost_book_room();
 void t_t586_lost_arrive();
 void t_t586_stale_row();
 void t_t595_ko_pose_left_to_engine();
+void t_t540_ko_pose_log();
 void t_t601_held_ko_timer();
 void t_t619_town_table_wire();
 void t_t619_town_table_choice();
@@ -1875,6 +1882,7 @@ void t_t609_held_sender();
 void t_t609_zone_kept_adopt();
 void t_t1391_latewriter_load_time();
 void t_t1351_landed_time_sets();
+void t_t1391f_upload_loaded_own();   /* T-1391 F1848: an own upload of the very copy loaded here makes the loaded-from note this game's own write */
 void t_t1351_refused_diff_line();
 void t_t1391d_own_work();
 void t_t609_gone_guard();
@@ -1909,8 +1917,8 @@ void t_t1018_setup_restock();
 void t_t1018_keeper_unknown_money();
 void t_t986_window_drift_bound();
 void t_t986f1_close_kind();
-void t_t1422_window_follow_step();   /* T-1422 fix 2: the window follow's 3D step toward the replayed route */
-void t_t1422_window_floor_step();   /* T-1422 fix 3: the window step's floor (found / held / plain), its line rule and wiring */
+void t_t1470_window_v042_road();   /* T-1470: the fight window back on v0.4.2's road (the AI walks the copy; the close places it 2+ off) */
+void t_t1422_nudge_floor();   /* T-1422 (owner 1868 a): the fight window's nudge keeps the copy on its own floor (attempt 7, owner 1878 a: the engine's short re-placement, the put-back, mode 2, wiring) */
 void t_t937_kept_town_choice();
 void t_t985c1_mirror_name();
 void t_t985c1_table_round_trip();
@@ -1968,6 +1976,7 @@ void t_t1047f2_failed_load_disarmed();
 void t_t1047f3_town_event();
 void t_t1047f3_gate_and_tick();
 void t_t1047f3_load_and_save_wiring();
+void t_t1455_town_carry();   /* T-1455: a piece's town change on its owner's game owes the own-piece check (the mod's move, the engine's merge 0x926190) */
 void t_t940_anchor_fixed();
 void t_t940_zone_verdict();
 void t_t940_cursor_stub();
@@ -2047,6 +2056,7 @@ void t_t1191_beside_spot();
 void t_t1191_bfac_text();
 void t_t1077_copy_may_ask();   /* T-1077: the hover's filter on another game's NPC - the copy's greeting list is not a refusal */
 void t_t1077_wiring();   /* T-1077: TcHover's copy filter, the NPC's game's full test, the preload and the show lever */
+void t_t1468_player_no_talk();   /* T-1468: the hover / menu talk check answers no talk on another player's character, as the click */
 void t_t1187_hold_end();   /* T-1187: the end waits for any held line (as TkHoldEndFor calls it); which held lines a lost answer or a run that did not happen lists as unrun */
 void t_t1235_wander_line();   /* T-1235: the [SPAWN] wander line's distances, cap and wandering-call test, and its wiring in towngen.cpp */
 void t_t1235_keepaway();   /* T-1235 (owner 1478 b): a new wandering group kept 1382.4 on the ground from every live player character and out of other players' bases; the stale snapshot refuses; its wiring */
@@ -2073,6 +2083,10 @@ void t_t860_act_owed_step();    /* T-860: settled / resent once / ended from the
 void t_t860_act_owed_wiring();  /* T-860: the note, the judge, the binding, the clears, the counter and line in the sources */
 void t_t1078_town_mismatch();   /* T-1078: the [BUILD] town mismatch decision, its link word, the session cap, once per piece per state; the line's sites in build.cpp */
 void t_t36_piece_material();   /* T-36 (F1186): the [PIECECHECK] material verdict by each part's own set (own / +0x248 / default / unread); its wiring */
+void t_t1429_statedump_v3();   /* T-1429 v3: the outline / 10-unit position forms and the lever v3 wiring */
+void t_t1429_statedump_town_name();   /* T-1429 (F1302): a town's dump name drops the engine's per-launch number */
+void t_t1429_statedump_format();   /* T-1429 step 2: the TEST-ONLY statedump lever's [DUMP] line format (escape, sort, #n repeats, totals) and its wiring */
+void t_t1462_editor_tool();   /* T-1462: the Level Editor window and the rebuild_navmesh block in a multiplayer world */
 
 }   /* namespace suite */
 

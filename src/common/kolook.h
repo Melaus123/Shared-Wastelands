@@ -105,14 +105,76 @@ inline float HeldKoTimerLeft(float koTimer, unsigned long waitedMs)
     return left > 0.0f ? left : 0.0f;
 }
 
-/* A knock-out pose written onto a copy that stands and is not a ragdoll is stood straight back up by the copy's own engine,
-   which then lays it down itself with the ragdoll, because the same STATE gave it the owner's unconscious flag or wake-up
-   clock. So the pose is left to that engine; when the next STATE still finds the copy standing it is written (leftBefore),
-   so a standing copy is written by every other such STATE. leftBefore: already left once and the copy still stands -
-   the owner's next STATE writes it. ragdoll / limp: 1 yes, 0 no, -1 unreadable (unreadable writes, as before). */
-inline bool LeaveKoPoseToEngine(int prone, bool latchDowns, int ragdoll, int limp, bool leftBefore)
+/* The owner's knock-out pose (4) onto a copy whose STATE carries the unconscious flag or wake-up clock (latchDowns).
+   The copy's engine keeps pose 4 only on a body whose ragdoll bit is on (posture update 0x5CF620, build/decomp_5cf620.txt:
+   144-170); on any other body it puts the pose straight back to 2 (crippled) or 0 at its next posture update - a stand-up
+   while the owner lies knocked out (T-540, F1980 / F1981). The same STATE's flag or clock makes the copy's own engine knock
+   it out itself, ragdoll first. So the pose is written only onto a body whose ragdoll bit is on; while it is off the pose is
+   left to the copy's own engine, the first time and again at every later STATE that still finds the bit off.
+   ragdollBit: the ENGINE's own bit, as 0x5CF620 tests it (Character +0x448 -> +0x2F8 bit 0, 0x7D0840): 1 on, 0 off,
+   -1 unreadable (unreadable writes, as before). NOT the pose (a crippled copy is pose 2 standing, T3019) and NOT inRagdoll
+   0x7D08A0 (also yes when carried or from +0x59 / +0x5A, F1982). leftBefore: already left once this knockdown.
+   T-540 (owner 1873 a): before, a crippled copy (pose 2 counted 'limp') and the second STATE (leftBefore) were written bare. */
+/* The engine's ragdoll bit as 0x7D0840 tests it: AnimationClass +0x2F8 non-zero with bit 0. raw = the 32-bit field read, or -1
+   when it could not be read. 1 on, 0 off, -1 unreadable (KoPoseRoad's ragdollBit). */
+inline int KoRagdollBit(long long raw)
 {
-    return prone == 4 && latchDowns && ragdoll == 0 && limp == 0 && !leftBefore;
+    if (raw < 0) return -1;
+    const unsigned int v = (unsigned int)raw;
+    return (v != 0 && (v & 1) != 0) ? 1 : 0;
+}
+enum { kKoPoseWrite = 0, kKoPoseLeaveFirst = 1, kKoPoseLeaveAgain = 2 };
+inline int KoPoseRoad(int prone, bool latchDowns, int ragdollBit, bool leftBefore)
+{
+    if (prone != 4 || !latchDowns || ragdollBit != 0) return kKoPoseWrite;
+    return leftBefore ? kKoPoseLeaveAgain : kKoPoseLeaveFirst;
+}
+
+/* T-540 (T3024, LOG ONLY - decides nothing): the [M4] KO pose line names every decision KoPoseRoad makes on a copy's knock-out
+   pose (4), one line per kind per knockdown per copy, the first write included (T3023 F1999: a first write wrote no line, so the
+   bit read could not be told from 'unreadable'). Kinds: a write with nothing left before, a write after the pose was left, left
+   to the copy's engine the first time, left again. */
+enum { kKoLogWrite = 0, kKoLogWriteAfterLeft = 1, kKoLogLeft = 2, kKoLogLeftAgain = 3 };
+inline int KoPoseLogKind(int road, bool leftBefore)
+{
+    if (road == kKoPoseLeaveFirst) return kKoLogLeft;
+    if (road == kKoPoseLeaveAgain) return kKoLogLeftAgain;
+    return leftBefore ? kKoLogWriteAfterLeft : kKoLogWrite;
+}
+inline const char* KoPoseLogKindText(int kind)
+{
+    switch (kind)
+    {
+    case kKoLogWrite:          return "written";
+    case kKoLogWriteAfterLeft: return "written after left";
+    case kKoLogLeft:           return "left to the copy's engine";
+    case kKoLogLeftAgain:      return "left again";
+    default:                   return "?";
+    }
+}
+/* 1 = the first line of this kind this knockdown (its bit is set in *seen); 0 = that kind was already written (or no such kind).
+   *seen starts at 0 for each knockdown of each copy. */
+inline int KoPoseLogFirst(unsigned int* seen, int kind)
+{
+    if (kind < kKoLogWrite || kind > kKoLogLeftAgain) return 0;
+    const unsigned int m = 1u << kind;
+    if ((*seen & m) != 0) return 0;
+    *seen |= m;
+    return 1;
+}
+/* the ragBit field as the line writes it: 1, 0, or '-1(unreadable)' */
+inline const char* KoRagBitText(int bit)
+{
+    return bit == 1 ? "1" : bit == 0 ? "0" : "-1(unreadable)";
+}
+/* which koPoseRoadWrite[bit1,bitUnreadable] slot a decision counts in: 0 = a pose-4 write onto a bit-on body, 1 = a pose-4 write
+   with the bit unreadable, -1 = neither (left, another pose, or a write for want of a latch on a bit-off body) */
+inline int KoPoseWriteSlot(int prone, int road, int ragdollBit)
+{
+    if (prone != 4 || road != kKoPoseWrite) return -1;
+    if (ragdollBit == 1) return 0;
+    if (ragdollBit < 0) return 1;
+    return -1;
 }
 
 }   /* namespace coopkolook */

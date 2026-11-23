@@ -507,6 +507,12 @@ bool ApplyState(unsigned int uid, const float* parts, int count, float blood,
 // K1 (read-carry 2026-09-22). The uid of the registered character `uid` carries (Character +0x348 set and its
 // carryingObject hand, +0x380, names that character's own hand), 0 = nothing. Reads only; no engine call.
 unsigned int CarryingUidOf(unsigned int uid);
+// T-1467 (src/common/carryhand.h), MAIN THREAD, reads only: CarrierOfBodyHere - the registered character whose carry hand names `bodyUid`
+// here (0 none); CarryFarKeepHere - 1 = this game's copy `carrierUid` carries a body this game runs whose carry hand-over is not refused
+// (OWNER AWAY leaves such a copy; replicate.cpp's far branch and RetireCopyOwnerUnloaded ask it).
+unsigned int CarrierOfBodyHere(unsigned int bodyUid);
+int CarryFarKeepHere(unsigned int carrierUid);
+int CarryBodyIsPlayers(unsigned int uid);   // T-1467 fold HIGH-2: 1 a player's character (own player faction, a stand-in, or a faction whose record id names a player or is unreadable - fold 2), 0 not, -1 not here / unread
 // MAIN THREAD, every in-game frame: an owned carrier's carry changed -> StatePush at once (carrySent).
 void CarryWatchTick();
 // MAIN THREAD, every in-game frame: make each copy carry what its owner's STATE says, through the engine's own
@@ -835,6 +841,7 @@ void SetSpawnContainer(bool keep);
 // The `spawncontainer` verb: coopspawn::kSpawnContainerNull / Keep (as SetSpawnContainer) or New (TEST-ONLY: an explicit-faction
 // local spawn goes into a fresh empty squad of that faction - SpawnTemplate). MAIN THREAD (the command channel).
 void SetSpawnContainerMode(int mode);
+bool SetSpawnContainerWith(const std::string& label, std::string* why);   /* T-1467 TEST-ONLY (DEV build): `spawncontainer with:<label>` */
 
 // Enumerate factions present in this save, optionally substring-filtered. Enumerating
 // beats guessing a name (F038's lesson, same as templates).
@@ -869,6 +876,10 @@ namespace coop { void CopySquadIdCheckHired(::Faction* faction, void* active); }
    characters are read in. 1 renamed, 0 kept (no other squad holds the id), -1 not a stand-in's squad under `id` any more, -2 the check
    could not rename it. MAIN THREAD. */
 namespace coop { int CopySquadIdCheckAtLoad(void* platoon, const std::string& id); }
+/* T-1474 (store.cpp RaidLendBuildImpl): does any squad on this game hold `id` - every faction (the directory, this game's own player
+   faction, the stand-ins), awake and asleep, by the engine's id.  1 held (*holderText, may be 0: its faction and address), 0 no squad
+   holds it, -1 not walked (no id, or the faction directory unread). MAIN THREAD. */
+namespace coop { int SquadIdHeldHere(const std::string& id, std::string* holderText); }
 /* T-1096 part 2 (store.cpp SpImportSquadIds): every squad id this game holds (every faction's awake and asleep lists, this game's own
    faction, the stand-ins) but the squads in `except`, appended to *out: 1 walked, 2 walked with a list unread, 0 not walked. And an
    imported squad's id written as a copy squad's fresh id is (the live id, the state record's "platoon stringID", the content file):

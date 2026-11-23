@@ -854,6 +854,32 @@ const int kEditorOpenLeave = 0, kEditorOpenClose = 1;
 inline int EditorOpenDecide(bool mpWorld, bool shown, bool leverOpening) { return (mpWorld && shown && !leverOpening) ? kEditorOpenClose : kEditorOpenLeave; }
 /* The short message, word for word as approved (decision 1763 / 1764). */
 const char* const kEditorOffText = "The Level Editor is turned off in a multiplayer world.";
+/* T-1462 (owner decisions 1838 / 1839): THE LEVEL EDITOR KEY IN A MULTIPLAYER WORLD OPENS THE MOD'S OWN SMALL WINDOW. The real editor
+   is still closed the frame after its show (EditorOpenDecide above; F1770: it is never left open); once the close is done the mod's
+   window opens with one tool, 'Regenerate sector' - the engine's own area rebuild for the area in view, on this game only (build.cpp
+   BdRegenSectorPress). closed = the engine's toggle closed the editor; windowUp = the mod's window was built. Not closed: nothing (the
+   editor's own window is still up). Closed but the window could not be built: the T-1414 message as before. Single player never
+   comes here (EditorOpenDecide leaves the editor alone). */
+const int kEditorAfterNothing = 0, kEditorAfterWindow = 1, kEditorAfterMessage = 2;
+inline int EditorAfterCloseDecide(bool closed, bool windowUp)
+{
+    if (!closed) return kEditorAfterNothing;
+    return windowUp ? kEditorAfterWindow : kEditorAfterMessage;
+}
+/* The window's words, word for word as approved (decision 1838). */
+const char* const kEditorToolTitle        = "Level Editor";
+const char* const kEditorToolText         = "In a multiplayer world only this tool is available.";
+const char* const kEditorToolRegenCaption = "Regenerate sector";
+const char* const kEditorToolRegenHover   = "Rebuild the walking paths for the area in view, on your game only.";
+const char* const kEditorToolCloseCaption = "Close";
+const char* const kEditorToolDoneText     = "Walking paths rebuilt for this area.";
+/* Decision 1839: the engine's hidden 'rebuild_navmesh' key action - key command 0x386 in processKeys (1.0.65 0x7875C0; part of the
+   editor's Fix stuff 0x771C70, then the area rebuild 0x3AB700) - is refused in a multiplayer world, silently (a log line only).
+   fromKeyStep = the call's return address lies inside processKeys (both builds call each of the two there once, in that branch only:
+   1.0.65 returns 0x787BA9 / 0x787CF9, 1.0.68 0x788738 / 0x788888 - Read from the executables) or the TEST-ONLY `editorkey rebuildnav`
+   lever asks as the key. Every other caller (the mod's own rebuilds, the editor's own buttons in single player) runs unchanged. */
+const int kNavKeyRun = 0, kNavKeyRefuse = 1;
+inline int NavKeyDecide(bool mpWorld, bool fromKeyStep) { return (mpWorld && fromKeyStep) ? kNavKeyRefuse : kNavKeyRun; }
 /* T-201 PP6' (player-path-plan.md PP6 + the one-press revision): WHAT THE ONE PRESS DOES ONCE THE WORLD HAS ADMITTED THE PICKED
    PROFILE. folderFound = this (world, profile)'s save folder was FOUND by its key file (SaveFolderScanChoose, not the name rule's new
    name - a folder of another world or profile under the rule's name is never found); quickSave = <save root>\<folder>\quick.save

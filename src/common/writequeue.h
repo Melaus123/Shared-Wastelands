@@ -389,6 +389,8 @@ class KeyGate
 public:
     KeyGate() : m_held(0), m_heldMax(0), m_bytes(0), m_merged(0), m_expired(0) {}
     bool Busy(const std::string& key) const { return m_busy.find(key) != m_busy.end(); }
+    /* T-1429 F1622 item 5: a message is held for this key (behind its job out) */
+    bool HasHeld(const std::string& key) const { typename std::map<std::string, std::deque<Entry> >::const_iterator it = m_wait.find(key); return it != m_wait.end() && !it->second.empty(); }
     /* False when the key already has a job out: the caller must HOLD its message instead. A second job for
        one key is never started - that is the whole of the per-file ordering rule on the loop's side. */
     bool Start(const std::string& key) { return m_busy.insert(key).second; }

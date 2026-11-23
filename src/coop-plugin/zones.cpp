@@ -16,6 +16,7 @@
 #include "../common/liveowner.h"   /* EngineKeepsAt - the engine's keep rule, swept by the offline suite */
 #include "../common/townnear.h"   /* T-795 step 4: the townnear reply line, swept by the offline suite */
 #include "../common/groundsync.h"   /* T-1100: GsHolderStep - the holder before this game per area, swept by the offline suite */
+#include "../common/fartown.h"   /* T-1469: the far town model line - its timing, cap and text, swept by the offline suite */
 #include "coop_log.h"
 #include "hooks.h"   /* T-1442 step 1b: coop::AddHook for the area update 0xA0A960 */
 namespace { swlogbudget::Gate g_qZonesPlayer; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
@@ -1042,6 +1043,9 @@ static void ZonesLogLoadedChange(const std::vector<loadedzones::Area>& areas, in
    thread the update's own answer names it; anywhere else it is UNNAMED. An unnamed event is cleared only by a regular report (fold 1b-2,
    review SHOULD 2: an early read racing an off-thread unload must not clear it). Interlocked writes only; nothing is read or sent here. */
 static void ZonesAreaEventUnnamed() { ::InterlockedIncrement64(&g_areaEvUnnamed); ::InterlockedIncrement(&g_areaEvUnnamedSeq); }
+void FarTownQueue(int x, int y);   /* T-1469: below, with the town readers - an area's loaded event queues its far town line */
+void FarTownStep();                /* T-1469: below - ZonesTick, every frame: the lines that are due */
+long long FarTownStuckCount();     /* T-1469: below - the [ZONES] REPORT's farTownStuck */
 /* fold 1b-3: an event is fully recorded (named, or the unnamed count raised) BEFORE g_areaEvSeq moves, so a read between the two can
    never take it as done */
 static void ZonesAreaEventNamed(void* m, int before, int after, int ret)
@@ -1057,6 +1061,7 @@ static void ZonesAreaEventNamed(void* m, int before, int after, int ret)
         void* zm = ZoneManagerPtr();
         if (loadedzones::SectorOfZoneAt((unsigned long long)(uintptr_t)zm, (unsigned long long)(uintptr_t)m, &sx, &sy) == 1) named = 1;
         else if (ReadZoneHeaderSectorPod(m, &hx, &hy) == 1 && loadedzones::InGrid(hx, hy) != 0) { sx = hx; sy = hy; named = 1; }
+        if (named != 0 && kind == loadedzones::kAreaEvLoaded) FarTownQueue(sx, sy);   /* T-1469: the far town line, kFramesAfterLoad ticks from now */
         if (named != 0 && g_areaEvN >= kAreaEvMax) { ::InterlockedIncrement64(&g_areaEvDropped); named = 0; }   /* overflow: owed until a regular report */
     }
     if (named != 0) { g_areaEv[g_areaEvN * 3] = sx; g_areaEv[g_areaEvN * 3 + 1] = sy; g_areaEv[g_areaEvN * 3 + 2] = kind; ++g_areaEvN; }
@@ -1224,6 +1229,7 @@ long long ZonesSecondCount() { return g_zonesSeconds; }
 void ZonesTick()
 {
     ++g_tick;
+    FarTownStep();   /* T-1469: every frame - reads only, and only when an area's line is due */
     static double lastReport = 0.0; const double nowR = NowSec();
     if (nowR - lastReport < 1.0) { ZonesEarlyReport(); return; }   /* P4s: once a second by the clock; T-1442 step 1b: between them, the early report of an area loaded / unloaded (no clock state touched) */
     void* zm = ZoneManagerPtr();
@@ -1606,6 +1612,7 @@ void ReportZones()
              + " areaMapHold[armed,mapsHeld,released,now]=" + N(g_amHoldArmed) + "," + N(g_amHoldMaps) + "," + N(g_amHoldReleased) + "," + N((long long)g_amHoldN)   /* T-1100 TEST-ONLY */
              + " areasEarly[sent,same,reads,cleared,regularSent,lines,linesQuiet]=" + N(g_areasEarlySent) + "," + N(g_areasEarlySame) + "," + N(g_areasEarlyReads) + "," + N(g_areasEarlyCleared) + "," + N(g_areasRegularSent) + "," + N(g_earlyLines) + "," + N(g_earlyLinesQuiet)   /* T-1442 step 1b */
              + " areaEv[loaded,unloaded,unnamed,dropped,owed,hook]=" + N((long long)g_areaEvLoaded) + "," + N((long long)g_areaEvUnloaded) + "," + N((long long)g_areaEvUnnamed) + "," + N((long long)g_areaEvDropped) + "," + N((long long)(g_areaEvSeq != g_areaEvCleared ? 1 : 0)) + "," + N((long long)g_zoneMapUpdateHook) + " areaEvLoadEnd=" + N(g_areaEvLoadEnd)
+             + " farTownStuck=" + N(FarTownStuckCount())   /* T-1469: towns seen with the far model shown while their area is loaded */
              + "   (P8a: areasSent is AREAS messages this game got onto the wire to the NOTEBOOK; areasSentEmpty is"
                " the span of those whose loaded set was empty. A zero here on a linked game is a game never reporting"
                " its areas. M2: mapSent, mapRecv, mapSkippedRelay, sent and recv - the session-link SECTORMAP / ZONES"
@@ -2014,6 +2021,105 @@ bool TownDistances(float x, float z, std::vector<std::pair<std::string, float> >
     }
     return true;
 }
+/* T-1469 (F1904, owner 1854): THE FAR TOWN MODEL LINE (fartown.h) - ships to players, log file only. An area's loaded event
+   (ZonesAreaEventNamed, main thread, named) queues the area; ZonesTick, every frame, writes kFramesAfterLoad ticks later one [FARTOWN]
+   line for each town whose centre lies in that area: its far model (the object at Town +0x4F8, its shown byte +0xC and model +0x10),
+   the loaded test of the town's area (ZoneMap +0xB0 | +0xB1, as 0xA08490) and the camera square loadDistantTowns last worked from
+   (ZoneManager +0x1681C8 / +0x1681CC). Reads only: the town walk is the townlist one (TownRowPod: the position and record getters) plus
+   the town test vt+0x268 the engine's own loop calls on each entry (isTown, a getter - a TownBase that is not a Town ends before
+   +0x4F8); every read guarded. kLineCap lines a session; the [ZONES] REPORT's farTownStuck counts on past it. */
+struct FarTownWait { int x, y; long long tick; double at; };
+static FarTownWait g_farTownQ[fartown::kQueueCap];
+static int g_farTownQN = 0;   /* MAIN THREAD */
+static long long g_farTownLines = 0, g_farTownStuck = 0, g_farTownDropped = 0;
+const size_t kFtTownModel = 0x4F8, kFtModelShown = 0xC, kFtModelMesh = 0x10, kFtVtIsTown = 0x268;
+const size_t kFtZmLoadedA = 0xB0, kFtZmLoadedB = 0xB1, kFtCamSquare = 0x1681C8;
+typedef void* (*FtSelfFn)(void* self);
+void FarTownQueue(int x, int y)
+{
+    for (int i = 0; i < g_farTownQN; ++i) if (g_farTownQ[i].x == x && g_farTownQ[i].y == y) return;   /* already waiting: the first event's line */
+    if (g_farTownQN >= fartown::kQueueCap) { ++g_farTownDropped; return; }
+    FarTownWait w; w.x = x; w.y = y; w.tick = g_tick; w.at = NowSec();
+    g_farTownQ[g_farTownQN++] = w;
+}
+long long FarTownStuckCount() { return g_farTownStuck; }
+/* the entry's isTown (vt+0x268): the Town, or 0 */
+static void* FtIsTownPod(void* t)
+{
+    __try
+    {
+        FtSelfFn f = *(FtSelfFn*)(*(const char* const*)t + kFtVtIsTown);
+        return f != 0 ? f(t) : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the far model: *objRead 0 = the +0x4F8 read faulted; *hasObj; *shown the byte +0xC (-1 unread); *mesh +0x10 set (-1 unread) */
+static void FtModelPod(void* town, int* objRead, int* hasObj, int* shown, int* mesh)
+{
+    *objRead = 0; *hasObj = 0; *shown = -1; *mesh = -1;
+    const char* o = 0;
+    __try { o = *(const char* const*)((const char*)town + kFtTownModel); *objRead = 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (o == 0) return;
+    *hasObj = 1;
+    __try { *shown = *(const unsigned char*)(o + kFtModelShown); *mesh = (*(void* const*)(o + kFtModelMesh) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *shown = -1; *mesh = -1; }
+}
+/* the area's loaded test as 0xA08490 makes it: 1 / 0, -1 unread or off the grid */
+static int FtAreaLoadedPod(void* zm, int x, int y)
+{
+    const unsigned long long m = loadedzones::ZoneMapAddr((unsigned long long)(uintptr_t)zm, x, y);
+    if (m == 0) return -1;
+    __try { const char* c = (const char*)(uintptr_t)m; return (c[kFtZmLoadedA] != 0 || c[kFtZmLoadedB] != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static void FtCamSquarePod(void* zm, int* x, int* y)
+{
+    *x = -1; *y = -1;
+    __try { const char* c = (const char*)zm; *x = *(const int*)(c + kFtCamSquare); *y = *(const int*)(c + kFtCamSquare + 4); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *x = -1; *y = -1; }
+}
+static void FarTownCheck(const FarTownWait& w)
+{
+    void* zm = ZoneManagerPtr();
+    void* countv = 0; void** ptrs = 0;
+    if (!PlausiblePod(zm) || !ReadTownListPod(&countv, &ptrs)) return;
+    int camX = -1, camY = -1;
+    FtCamSquarePod(zm, &camX, &camY);
+    const unsigned n = (unsigned)(size_t)countv;
+    for (unsigned i = 0; i < n; ++i)
+    {
+        TownRow r; void* tp = 0;
+        if (!ReadTownPtrPod(ptrs, i, &tp) || tp == 0 || !TownRowPod(tp, &r)) continue;
+        const Sector s = SectorOf(r.x, r.z);
+        if (s.x != w.x || s.y != w.y) continue;
+        void* const town = FtIsTownPod(tp);
+        if (town == 0) continue;
+        int objRead = 0, hasObj = 0, shown = -1, mesh = -1;
+        FtModelPod(town, &objRead, &hasObj, &shown, &mesh);
+        fartown::Fields f;
+        f.areaX = w.x; f.areaY = w.y; f.frames = g_tick - w.tick; f.secs = NowSec() - w.at;
+        f.name = r.name; f.sid = r.sid; f.townX = s.x; f.townY = s.y;
+        f.state = fartown::ModelState(objRead, hasObj, shown); f.meshMade = mesh;
+        f.townAreaLoaded = FtAreaLoadedPod(zm, s.x, s.y);
+        f.camX = camX; f.camY = camY; f.playerX = g_playerSector.x; f.playerY = g_playerSector.y;
+        f.dropped = g_farTownDropped;
+        if (fartown::Stuck(f.state, f.townAreaLoaded) == 1) ++g_farTownStuck;
+        if (!fartown::MayLog(g_farTownLines)) continue;
+        f.lineNo = ++g_farTownLines;
+        DebugLog(fartown::Line(f));
+    }
+}
+void FarTownStep()
+{
+    int k = 0;
+    for (int i = 0; i < g_farTownQN; ++i)
+    {
+        if (fartown::Due(g_tick, g_farTownQ[i].tick)) FarTownCheck(g_farTownQ[i]);
+        else g_farTownQ[k++] = g_farTownQ[i];
+    }
+    g_farTownQN = k;
+}
 // T-795 step 4: `townnear` (TEST, read-only) - the nearest town to this game's player character (GetTarget, as `towns`) and its
 // distance on the ground, one reply line (townnear.h Reply); the harness's town-far check reads dist=. Nothing is changed.
 std::string TownNearCommand()
@@ -2211,14 +2317,16 @@ void AreaProbeTS(const Sector& s, int* owner, double* heldAge)
 // PROBE-END: P025
 /* M7b slice 2 (T-197): the area's HOLDER for deciding - the same grid AreaProbeTS reports, read under the same lock with the
    freshness every other area answer has (a map no older than 5 s). -1 = unknown. */
-int AreaHolderSlotAgeTS(const Sector& s, int* mapFresh)   /* T-1129 part 3: mapFresh = the same 5 s freshness, read under the same lock */
+int AreaHolderSlotSeqTS(const Sector& s, int* mapFresh, unsigned* mapSeq)   /* T-1129 part 3: mapFresh = the same 5 s freshness, read under the same lock; T-1429 F1630 item 1: mapSeq likewise */
 {
     int o = -1, frozen = 0, fresh = 0;
+    if (mapSeq != 0) *mapSeq = 0;
     if (s.x >= 0 && s.x < 64 && s.y >= 0 && s.y < 64)
     {
         HeldLockInit();
         ::EnterCriticalSection(&g_heldLock);
         fresh = (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) ? 1 : 0;
+        if (mapSeq != 0) *mapSeq = g_areaMapApplySeq;
         if (fresh != 0) o = g_ownerSlot[s.x][s.y];
         if (o >= 0 && g_areaFrozen[s.x][s.y] != 0) { frozen = 1; ++g_areaFrozenAnswers; }
         ::LeaveCriticalSection(&g_heldLock);
@@ -2227,6 +2335,7 @@ int AreaHolderSlotAgeTS(const Sector& s, int* mapFresh)   /* T-1129 part 3: mapF
     if (frozen != 0) return coopdrop::kAreaFrozen;   /* -2 frozen: the holder is a player not in the world */
     return (o >= 0) ? o : -1;
 }
+int AreaHolderSlotAgeTS(const Sector& s, int* mapFresh) { return AreaHolderSlotSeqTS(s, mapFresh, 0); }
 int AreaHolderSlotTS(const Sector& s) { return AreaHolderSlotAgeTS(s, 0); }
 // THE RULE ITSELF, over a view somebody else has already read. One copy, called from the wrapper below AND from every gate
 // that needs the refusal's CAUSE as well as the decision (review-p5g Q5: those gates used to ask a SECOND question through
